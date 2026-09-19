@@ -4935,6 +4935,35 @@ make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
     /// Resident-weight uploads: when an arena is active (LOGSCOPE_ARENA, set up by the loader) the bytes
     /// are packed into a shared slab and returned as an offset view; otherwise a dedicated buffer (the
     /// current behaviour). Used only for resident WEIGHTS — activations always get their own buffers.
+    /// Resident int8 CODES, uploaded as the bytes they already are.
+    ///
+    /// Six loaders quantized into a `Vec<i8>` and then PACKED it, four bytes at a time with shifts,
+    /// into a second `Vec<u32>` of the same size before uploading that. On a little-endian target —
+    /// x86-64 and every AArch64 Linux this engine runs on — `b0 | b1<<8 | b2<<16 | b3<<24` stored as
+    /// a u32 is the four bytes b0 b1 b2 b3 in memory: the packed array is BYTE-FOR-BYTE the i8 array.
+    /// The loop was a copy of every int8 weight in the model into a second buffer, with both alive at
+    /// once, and in five of the six sites it was SINGLE-THREADED over the whole tensor. For a 9B model
+    /// held int8-resident: ~9 GB read, ~9 GB written, and twice the transient memory per tensor, to
+    /// produce bytes it already had. DRAM traffic is a large share of package power on a
+    /// unified-memory SoC; this was all of it for nothing.
+    ///
+    /// The GPU buffer does not care what Rust type its bytes came from. On big-endian the two layouts
+    /// really do differ, so the pack survives there behind the cfg — never compiled by anything this
+    /// project targets, and kept so that stays a build-time fact rather than a silent wrong answer.
+    fn upload_i8_codes_resident(&self, codes: &[i8]) -> Tensor {
+        assert!(codes.len() % 4 == 0, "int8 codes are uploaded as u32 words: {} is not a multiple of 4", codes.len());
+        #[cfg(target_endian = "little")]
+        {
+            let bytes: &[u8] = bytemuck::cast_slice(codes);
+            if self.arena.lock().unwrap().is_some() { return self.arena_place(bytes, 1, codes.len() / 4); }
+            Tensor { buf: self.upload_bytes(bytes, "qw"), rows: 1, cols: codes.len() / 4, pool: None, site: (0, 0), view: None, bid: 0 }
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            let qw: Vec<u32> = codes.chunks_exact(4).map(|c| (c[0] as u8 as u32) | ((c[1] as u8 as u32) << 8) | ((c[2] as u8 as u32) << 16) | ((c[3] as u8 as u32) << 24)).collect();
+            self.upload_u32_resident(&qw)
+        }
+    }
     fn upload_u32_resident(&self, data: &[u32]) -> Tensor {
         if self.arena.lock().unwrap().is_some() { self.arena_place(bytemuck::cast_slice(data), 1, data.len()) }
         else { self.upload_u32(data) }
@@ -5206,24 +5235,8 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                 });
             }
         });
-        let mut qw = vec![0u32; n * k / 4];
-        let wper = qw.len().div_ceil(threads).max(1);
-        std::thread::scope(|s| {
-            let qbytes = &qbytes;
-            for (ci, qw_c) in qw.chunks_mut(wper).enumerate() {
-                s.spawn(move || {
-                    let w0 = ci * wper;
-                    for (li, word) in qw_c.iter_mut().enumerate() {
-                        let i4 = (w0 + li) * 4;
-                        *word = (qbytes[i4] as u8 as u32)
-                            | ((qbytes[i4 + 1] as u8 as u32) << 8)
-                            | ((qbytes[i4 + 2] as u8 as u32) << 16)
-                            | ((qbytes[i4 + 3] as u8 as u32) << 24);
-                    }
-                });
-            }
-        });
-        QWeight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k }
+        // (no pack: the i8 codes ARE the little-endian words — see upload_i8_codes_resident)
+        QWeight { qw: self.upload_i8_codes_resident(&qbytes), qs: self.upload_resident(&qs, n, kb), n, k }
     }
 
     /// Load GGUF q8_0 bytes [n,k] DIRECTLY into the int8-resident `QWeight`, skipping the f32 dequant +
@@ -5302,15 +5315,8 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                 });
             }
         });
-        let mut qw = vec![0u32; n * k / 4];
-        for (li, word) in qw.iter_mut().enumerate() {
-            let i4 = li * 4;
-            *word = (qbytes[i4] as u8 as u32)
-                | ((qbytes[i4 + 1] as u8 as u32) << 8)
-                | ((qbytes[i4 + 2] as u8 as u32) << 16)
-                | ((qbytes[i4 + 3] as u8 as u32) << 24);
-        }
-        Some(QWeight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k })
+        // (no pack: the i8 codes ARE the little-endian words — see upload_i8_codes_resident)
+        Some(QWeight { qw: self.upload_i8_codes_resident(&qbytes), qs: self.upload_resident(&qs, n, kb), n, k })
     }
 
     /// Q6_K straight to int8 residency. The other half of a Q4_K_M file.
@@ -5358,15 +5364,8 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         }
         let n_total: usize = srcs.iter().map(|(_, _, r)| *r).sum();
         if qs.len() != n_total * kb { return None; }
-        let mut qw = vec![0u32; n_total * k / 4];
-        for (li, word) in qw.iter_mut().enumerate() {
-            let i4 = li * 4;
-            *word = (codes[i4] as u8 as u32)
-                | ((codes[i4 + 1] as u8 as u32) << 8)
-                | ((codes[i4 + 2] as u8 as u32) << 16)
-                | ((codes[i4 + 3] as u8 as u32) << 24);
-        }
-        Some(QWeight { qw: self.upload_u32_resident(&qw),
+        // (no pack: the i8 codes ARE the little-endian words — see upload_i8_codes_resident)
+        Some(QWeight { qw: self.upload_i8_codes_resident(&codes),
                        qs: self.upload_resident(&qs, n_total, kb), n: n_total, k })
     }
 
@@ -5424,15 +5423,8 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     pub fn q6_k_to_int8_resident(&self, raw: &[u8], n: usize, k: usize) -> Option<QWeight> {
         let (qs, codes) = self.q6_k_to_int8_parts(raw, n, k)?;
         let kb = k / 32;
-        let mut qw = vec![0u32; n * k / 4];
-        for (li, word) in qw.iter_mut().enumerate() {
-            let i4 = li * 4;
-            *word = (codes[i4] as u8 as u32)
-                | ((codes[i4 + 1] as u8 as u32) << 8)
-                | ((codes[i4 + 2] as u8 as u32) << 16)
-                | ((codes[i4 + 3] as u8 as u32) << 24);
-        }
-        Some(QWeight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k })
+        // (no pack: the i8 codes ARE the little-endian words — see upload_i8_codes_resident)
+        Some(QWeight { qw: self.upload_i8_codes_resident(&codes), qs: self.upload_resident(&qs, n, kb), n, k })
     }
 
 
@@ -5584,29 +5576,15 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     pub fn q5_k_to_int8_resident(&self, raw: &[u8], n: usize, k: usize) -> Option<QWeight> {
         let (qs, codes) = self.q5_k_to_int8_parts(raw, n, k)?;
         let kb = k / 32;
-        let mut qw = vec![0u32; n * k / 4];
-        for (li, word) in qw.iter_mut().enumerate() {
-            let i4 = li * 4;
-            *word = (codes[i4] as u8 as u32)
-                | ((codes[i4 + 1] as u8 as u32) << 8)
-                | ((codes[i4 + 2] as u8 as u32) << 16)
-                | ((codes[i4 + 3] as u8 as u32) << 24);
-        }
-        Some(QWeight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k })
+        // (no pack: the i8 codes ARE the little-endian words — see upload_i8_codes_resident)
+        Some(QWeight { qw: self.upload_i8_codes_resident(&codes), qs: self.upload_resident(&qs, n, kb), n, k })
     }
 
     pub fn q4_k_to_int8_resident(&self, raw: &[u8], n: usize, k: usize) -> Option<QWeight> {
         let (qs, codes) = self.q4_k_to_int8_parts(raw, n, k)?;
         let kb = k / 32;
-        let mut qw = vec![0u32; n * k / 4];
-        for (li, word) in qw.iter_mut().enumerate() {
-            let i4 = li * 4;
-            *word = (codes[i4] as u8 as u32)
-                | ((codes[i4 + 1] as u8 as u32) << 8)
-                | ((codes[i4 + 2] as u8 as u32) << 16)
-                | ((codes[i4 + 3] as u8 as u32) << 24);
-        }
-        Some(QWeight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k })
+        // (no pack: the i8 codes ARE the little-endian words — see upload_i8_codes_resident)
+        Some(QWeight { qw: self.upload_i8_codes_resident(&codes), qs: self.upload_resident(&qs, n, kb), n, k })
     }
 
 
@@ -23113,6 +23091,26 @@ mod q4k_int8_transcode {
 #[cfg(test)]
 mod transcoders_place_their_codes {
     use super::*;
+
+    /// The no-copy upload against the pack loop it replaced, VERBATIM: the GPU buffer must hold the
+    /// same words. Every byte value appears, in every position of a word, so a byte-order or
+    /// sign-extension mistake cannot hide; and a length that is not whole words is refused loudly.
+    #[test]
+    fn int8_codes_upload_as_exactly_the_words_the_pack_loop_made() {
+        let gpu = Gpu::new();
+        let mut x = 0x1234_5678u32;
+        let mut codes: Vec<i8> = (0..4096).map(|_| { x = x.wrapping_mul(1664525).wrapping_add(1013904223); (x >> 24) as u8 as i8 }).collect();
+        for b in 0..=255u8 { for pos in 0..4usize { codes[(b as usize * 4 + pos) * 4 % 4096 / 4 * 4 + pos] = b as i8; } }
+        codes[0] = -128; codes[1] = 127; codes[2] = -1; codes[3] = 0;
+        let packed_before: Vec<u32> = (0..codes.len() / 4).map(|li| { let i4 = li * 4;
+            (codes[i4] as u8 as u32) | ((codes[i4 + 1] as u8 as u32) << 8) | ((codes[i4 + 2] as u8 as u32) << 16) | ((codes[i4 + 3] as u8 as u32) << 24) }).collect();
+        let t = gpu.upload_i8_codes_resident(&codes);
+        assert_eq!((t.rows, t.cols), (1, codes.len() / 4), "the tensor is shaped in WORDS, as upload_u32 shaped it");
+        assert_eq!(gpu.download_words(&t), packed_before);
+        assert_eq!(packed_before[0], 0x00FF_7F80, "-128, 127, -1, 0 little-endian");
+        let short = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu.upload_i8_codes_resident(&codes[..4095])));
+        assert!(short.is_err(), "a code count that is not whole words must be refused, not truncated");
+    }
 
     /// THE CODES, not just the scales. `transcoding_matches_dequantise_then_quantise` and the Q6_K
     /// slice-path test compare `.qs` only — so a transcoder that wrote every block of int8 codes one
