@@ -440,11 +440,24 @@ pub fn run_rig_sheet() -> Result<(), String> {
         shots.push(Shot { name: "rig_in_fern.png", eye: f + Vec3::new(1.6, 5.5, 1.6), look: f + Vec3::Y * 0.5 });
     }
 
+    // Signature frames: every ancestor casting its ultimate, in a file down
+    // the lane, seen from the side. 0..=5 then 6..=12.
+    let file = |k: usize| Vec3::new(0.0, 0.0, -56.0 + k as f32 * 5.2);
+    for (name, count) in [("sig_0_to_5.png", 6usize), ("sig_6_to_12.png", 7)] {
+        let mid = (file(0) + file(count - 1)) * 0.5;
+        shots.push(Shot { name, eye: mid + Vec3::new(-17.0, 13.0, 0.0), look: mid + Vec3::Y * 1.0 });
+    }
+    let sig_first = shots.len() - 2;
+
     for (si, shot) in shots.iter().enumerate() {
-        let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        let mut game = if si == sig_first + 1 {
+            Game::new(6, [7, 8, 9, 10], [11, 12, 0, 1, 2])
+        } else {
+            Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9])
+        };
         game.blockers = scene.blockers.clone();
         let mut vfx = Vfx::default();
-        let cam = Camera { eye: shot.eye, target: shot.look, fov_y: if si == 0 { 1.0 } else { 0.6 } };
+        let cam = Camera { eye: shot.eye, target: shot.look, fov_y: if si == 0 || si >= sig_first { 1.0 } else { 0.6 } };
         const STEPS: usize = 48;
         for step in 0..STEPS {
             let left = STEPS - 1 - step;
@@ -483,6 +496,26 @@ pub fn run_rig_sheet() -> Result<(), String> {
                     let g = &mut game.gods[0];
                     g.yaw = dir.z.atan2(dir.x);
                     g.pos = a - dir * 1.2 + dir * (step as f32 * (2.0 / 60.0));
+                }
+                k if k >= sig_first => {
+                    let count = if k == sig_first { 6 } else { 7 };
+                    let mut casts = Vec::new();
+                    for gi in 0..count {
+                        let g = &mut game.gods[gi];
+                        g.yaw = 0.0;
+                        g.pos = file(gi);
+                        // 0.2 s before the capture: mid-effect, not the first frame of it.
+                        if left == 12 {
+                            casts.push(crate::sim::Event::Cast { god: gi, slot: 3, aim: g.pos + Vec3::X * 7.0 });
+                        }
+                    }
+                    for gi in count..game.gods.len() {
+                        game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
+                    }
+                    vfx.update(1.0 / 60.0, &casts, &game);
+                    renderer.clear_queues();
+                    scene.draw(&mut renderer, &game, &mut vfx, cam);
+                    continue;
                 }
                 _ => {
                     let g = &mut game.gods[0];

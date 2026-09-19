@@ -257,9 +257,17 @@ impl Vfx {
                     }
                     let _ = amount;
                 }
-                Event::Cast { god, slot, .. } => {
+                Event::Cast { god, slot, aim } => {
                     if let Some(a) = game.def(*god).abilities.get(*slot as usize) {
                         self.puppets.on_cast(*god, crate::puppet::cast_style(&a.arch, a.ult));
+                        // The identity read: this ancestor's element, thrown
+                        // the way this archetype throws it. The archetype
+                        // events below stay as the gameplay read.
+                        use crate::signature::{emit, Gesture, Motif, Rng};
+                        let g = &game.gods[*god];
+                        let seed = (self.time * 1000.0) as u32 ^ ((*god as u32) << 16) ^ *slot;
+                        let mut rng = Rng(seed | 1);
+                        self.particles.extend(emit(Motif::of(g.def_id), Gesture::of(&a.arch), g.pos, *aim, a.ult, &mut rng));
                     }
                 }
                 Event::Explosion { pos, radius, color } => {

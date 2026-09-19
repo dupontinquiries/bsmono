@@ -56,6 +56,8 @@ pub mod systems;
 pub mod abilities;
 pub mod ai;
 pub mod vfx;
+/// Per-ancestor elemental motifs thrown on every cast.
+pub mod signature;
 pub mod render;
 pub mod scene;
 pub mod ui;
