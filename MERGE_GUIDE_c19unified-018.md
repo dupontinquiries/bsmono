@@ -1,4 +1,4 @@
-# Merge guide — c19unified-017 (stoat, and the palette canon)
+# Merge guide — c19unified-018 (stoat, the palette canon, the callout)
 
 For whoever merges this drop into another copy of the repo, human or Claude.
 Same purpose as `MERGE_GUIDE_026.md` / `_028.md`: what changed, what was
@@ -6,16 +6,17 @@ verified and how, and where it can collide. The commit messages carry the detail
 this is the map.
 
 Base: `9acc004fe` (main of `c19unified-013-fleet`). Everything here is linear on
-top of it, so against an unmoved main it fast-forwards. 017 supersedes 016, which
-superseded 015. 017 = 016 plus three commits: `palette_surface_check.py`, the CLI
+top of it, so against an unmoved main it fast-forwards. 018 = 017 plus four
+commits: the kit's `callout`, stoat-egui's padding/separation pass on top of it,
+a UI_STRATEGY bullet, and this guide. 017 supersedes 016, which superseded 015. 017 = 016 plus three commits: `palette_surface_check.py`, the CLI
 moved onto the Driver and the shared command vocabulary (with `stoat attach` and
 `stoat core`), and this guide. 016 = 015 plus four commits: the palette surface moving into the kit, stoat and
 vidkit-player ported onto it, and the UI_STRATEGY entry). If 015 was already
 merged, only those four are new.
 
 ```sh
-git bundle verify c19unified-017-*.bundle
-git fetch /path/to/c19unified-017-*.bundle refs/heads/main:incoming-stoat
+git bundle verify c19unified-018-*.bundle
+git fetch /path/to/c19unified-018-*.bundle refs/heads/main:incoming-stoat
 git log --oneline main..incoming-stoat          # review first
 git fetch /path/to/bundle 'refs/notes/toolcalls:refs/notes/incoming-toolcalls'
 git notes --ref=toolcalls merge incoming-toolcalls   # only if you already have notes
@@ -37,8 +38,9 @@ Everything new is under `apps/stoat/` and cannot conflict. Outside it:
 | `tools/rustcheck/rustcheck.py` + `test_resolve_mod_files.py` | files in tests/, examples/, benches/, src/bin/ count as crate roots; 2 new test groups | …edited `_declared_crate_roots`, or appended test groups (the file ends with a hard-coded group count: it is 5 now) |
 | `shared/uikit/crates/uikit-egui/src/command_bar.rs` | the palette SURFACE: `show`, `State`, `Row`, `Outcome`, `Placement`, `placement_for`, `mode_for_rows`, `arrow`; a `surface_tests` module. The existing arithmetic and its tests are untouched | …added anything after `move_cursor` or edited the module header |
 | `apps/vidkit-player/src/palette.rs`, `src/main.rs` | palette state and drawing replaced by the kit surface; 111 -> 109 tests (three removed with reasons in place, two added) | …touched `Palette`, `palette_ui`, or the removed tests. NOTE the behaviour change: its cursor now clamps instead of wrapping |
-| `UI_STRATEGY.md` | one bullet under "New egui app: good defaults" | …added a bullet at the same spot — keep both |
+| `UI_STRATEGY.md` | two bullets under "New egui app: good defaults" (palette; callout/surfaces/spacing) | …added a bullet at the same spot — keep both |
 | `maintenance/tools/palette_surface_check.py` (new) + one line in `CLAUDE.md` §7 | the checker pinning the palette canon | …added a checker line at the same spot in §7 — keep both |
+| `shared/uikit/crates/uikit-egui/src/callout.rs` (new) + one `pub mod` line in `lib.rs` | severity callout: tinted opaque surface, stripe, severity border, chip, tagged lines, foldable | …added a module line right after `pub mod toast;` — keep both |
 | `manifest/projects.toml` | three entries appended: `stoat`, `stoat-egui` (primary), `stoat-gtk` | …appended at the same place — keep both sides |
 | `CLAUDE.md` §3 | GTK4/libadwaita are installable in the sandbox | …edited the same paragraph |
 
@@ -67,7 +69,7 @@ time, x86_64, gdb 15.1, rustc 1.96, egui 0.34:
 | stoat-core | command 5, driver 1, live_gdb 4, replay 4, services 10 |
 | stoat-cli | batch 3 (drives the built binary with a deadline; one prints NOT RUN without gdb) |
 | stoat-egui | unit 5, palette 6, phone 4 |
-| uikit-egui | lib 547 / 0 failed (it was 541 / 1 on arrival), integration 1 + 5 ignored |
+| uikit-egui | lib 551 / 0 failed (it was 541 / 1 on arrival), integration 1 + 5 ignored |
 | vidkit-player | 109 (baseline taken first by stashing the port: 111, same 5 warnings) |
 
 `live_gdb` drives a real gdb: C segfault, Rust panic, a core file written by
@@ -77,7 +79,7 @@ green run on a bare image has not exercised them. Look for the string.
 
 Break-tested (the thing broken, the test confirmed red, the file restored):
 18 breaks, 18 caught - 1 in `5d18e8a56`, 4 in `92efe5cf4`, 7 in `c75364404`,
-6 on the kit surface in `7d0f9311f`. Also 4 of 4 on `palette_surface_check.py`
+6 on the kit surface in `7d0f9311f`, 6 on the callout in `a10c80948`. Also 4 of 4 on `palette_surface_check.py`
 itself and 1 on the CLI's batch fix (the test fails at its deadline, it does not hang).
 Separately, the two kit tests were written first and seen red against the
 unfixed code. NOT break-tested: the core-file and attach live tests.
@@ -113,6 +115,12 @@ arrow/Enter behaviour with it, so each needs its own look. When one is ported th
 checker FAILS until its entry is deleted - that is deliberate.
 
 ## Not verified — do not inherit these as claims
+
+* The callout in any app but stoat, and in any palette but Night on screen. Its
+  colours ARE computed and contrast-checked for all nine palettes in a test; none
+  but Night has been looked at.
+* stoat-egui's Wire page on screen since the spacing pass (Stack open and folded,
+  the 1300pt dashboard, Launch and Caches were looked at).
 
 * vidkit-player's ported palette beyond opening it (400x640: bottom, inverted;
   1300x740: top-centre); nothing was typed into it. stoat-egui's WAS re-looked-at
