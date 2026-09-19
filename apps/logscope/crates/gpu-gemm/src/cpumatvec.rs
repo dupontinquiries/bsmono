@@ -141,7 +141,8 @@ pub fn quantize_act_block(a: &[f32]) -> (f32, [i8; 32]) {
 ///
 /// The activation is quantized once per block and reused across every row in a matvec, so its cost
 /// amortizes over `n_rows` — which is why llama.cpp quantizes the whole activation vector up front.
-pub fn dot_q8_0_iq(raw: &[u8], act_q: &[(f32, [i8; 32])]) -> f32 {
+#[inline(always)]
+fn dot_q8_0_iq_body(raw: &[u8], act_q: &[(f32, [i8; 32])]) -> f32 {
     let mut total = 0f32;
     for (b, (da, qa)) in act_q.iter().enumerate() {
         let off = b * 34;
@@ -210,7 +211,8 @@ pub fn scales_k4(q: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
 ///
 /// One behavioural difference, on MALFORMED input only: a too-short `act_sum` used to panic on an
 /// index; the lockstep walk now stops at the shortest input instead.
-pub fn dot_q4_k(raw: &[u8], act_q: &[(f32, [i8; 32])], act_sum: &[f32]) -> f32 {
+#[inline(always)]
+fn dot_q4_k_body(raw: &[u8], act_q: &[(f32, [i8; 32])], act_sum: &[f32]) -> f32 {
     let nblk = act_q.len() / 8;              // 8 sub-blocks of 32 per super-block
     let mut total = 0f32;
     for ((blk, aq), asum) in raw.chunks_exact(144).zip(act_q.chunks_exact(8)).zip(act_sum.chunks_exact(8)).take(nblk) {
@@ -295,7 +297,8 @@ pub fn dot_q4_k_reference(raw: &[u8], act_q: &[(f32, [i8; 32])], act_sum: &[f32]
 /// per SIXTEEN, activations were quantized per THIRTY-TWO. So each activation block spans two weight
 /// sub-blocks with different scales, and the integer sum must be split at 16 — one sum per 32 with
 /// either scale is wrong by exactly the difference between neighbouring scales.
-pub fn dot_q6_k(raw: &[u8], act_q: &[(f32, [i8; 32])]) -> f32 {
+#[inline(always)]
+fn dot_q6_k_body(raw: &[u8], act_q: &[(f32, [i8; 32])]) -> f32 {
     let nblk = act_q.len() / 8;              // 8 activation blocks of 32 per super-block
     let mut total = 0f32;
     for b in 0..nblk {
@@ -331,6 +334,94 @@ pub fn dot_q6_k(raw: &[u8], act_q: &[(f32, [i8; 32])]) -> f32 {
         }
     }
     total
+}
+
+// ───────────────────────── instruction-set dispatch ─────────────────────────
+//
+// WHAT THE BUILD TELLS THE COMPILER ABOUT THE CPU: nothing. apps/logscope/.cargo/config.toml sets
+// rustflags for x86_64 only (a linker flag), so these dots compile for BASELINE — x86-64 SSE2,
+// AArch64 ARMv8.0. `dot_q8_0_iq`'s own doc says the int8 dot "lowers to SDOT on aarch64"; that is
+// only true if `dotprod` is enabled, and it never was, so on ARM it has been widening multiplies.
+// `target-cpu=native` is the wrong fix for anything that gets packaged: the PinePhone's A53 has no
+// dotprod and would SIGILL.
+//
+// So: each dot is ONE `#[inline(always)]` body, and `isa_dispatch!` compiles that body a second
+// time inside a `#[target_feature]` wrapper, chosen at runtime. No intrinsics and no second
+// implementation — the same source, which is what keeps the results BIT-IDENTICAL across paths
+// (integer sums are exact; the float expressions are untouched, and only `avx2` / `dotprod` are
+// enabled, never `fma`, so nothing can be contracted). Measured on x86-64, whole matvec, -O:
+// Q8_0 0.60 -> 0.38 ms, Q6_K 0.91 -> 0.50 ms with AVX2; Q4_K does not move (it was never
+// SIMD-bound — see dot_q4_k_body).
+//
+// LOGSCOPE_CPU_ISA=baseline forces the baseline copy, for A/B and for blaming this first.
+
+/// 0 = undecided, 1 = baseline, 2 = wide. Decided once; `set_cpu_isa_wide` overrides (tests, levers).
+static ISA: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force (`Some`) or re-detect (`None`) the wide instruction-set path. Returns what is now in force.
+pub fn set_cpu_isa_wide(force: Option<bool>) -> bool {
+    let v = match force { Some(w) => w && isa_detect(), None => isa_detect() && std::env::var("LOGSCOPE_CPU_ISA").as_deref() != Ok("baseline") };
+    ISA.store(if v { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    v
+}
+
+#[inline(always)]
+fn isa_wide() -> bool {
+    match ISA.load(std::sync::atomic::Ordering::Relaxed) { 2 => true, 1 => false, _ => set_cpu_isa_wide(None) }
+}
+
+/// Does THIS CPU have the feature the wide copy was compiled for? False where no wide copy exists.
+fn isa_detect() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    { return std::arch::is_x86_feature_detected!("avx2"); }
+    #[cfg(all(target_arch = "aarch64", feature = "arm-dotprod"))]
+    { return std::arch::is_aarch64_feature_detected!("dotprod"); }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Which copy the dots are running, for a log line: the question "did the fast path engage" should
+/// have an answer that does not involve a profiler.
+pub fn cpu_isa_name() -> &'static str {
+    if !isa_wide() { return "baseline"; }
+    if cfg!(target_arch = "x86_64") { "avx2" } else { "dotprod" }
+}
+
+macro_rules! isa_dispatch {
+    ($(#[$doc:meta])* $name:ident = $body:ident, wide: $wide:ident, ($($arg:ident : $ty:ty),*) -> $ret:ty) => {
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = "avx2")]
+        unsafe fn $wide($($arg: $ty),*) -> $ret { $body($($arg),*) }
+        // NEVER COMPILED by its author (no AArch64 std in the sandbox) — hence the opt-in feature.
+        // It is the x86 arm above with two strings changed.
+        #[cfg(all(target_arch = "aarch64", feature = "arm-dotprod"))]
+        #[target_feature(enable = "dotprod")]
+        unsafe fn $wide($($arg: $ty),*) -> $ret { $body($($arg),*) }
+
+        $(#[$doc])*
+        pub fn $name($($arg: $ty),*) -> $ret {
+            #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "arm-dotprod")))]
+            if isa_wide() {
+                // SAFETY: `isa_wide` is true only after the runtime check for exactly the feature
+                // `$wide` was compiled with (isa_detect), on this CPU.
+                return unsafe { $wide($($arg),*) };
+            }
+            $body($($arg),*)
+        }
+    };
+}
+
+isa_dispatch! {
+    /// Q8_0 row · pre-quantized activation. See `dot_q8_0_iq_body` for the arithmetic; this picks the copy.
+    dot_q8_0_iq = dot_q8_0_iq_body, wide: dot_q8_0_iq_wide, (raw: &[u8], act_q: &[(f32, [i8; 32])]) -> f32
+}
+isa_dispatch! {
+    /// Q4_K row · pre-quantized activation. See `dot_q4_k_body`; bit-identical to `dot_q4_k_reference`.
+    dot_q4_k = dot_q4_k_body, wide: dot_q4_k_wide, (raw: &[u8], act_q: &[(f32, [i8; 32])], act_sum: &[f32]) -> f32
+}
+isa_dispatch! {
+    /// Q6_K row · pre-quantized activation. See `dot_q6_k_body` for the arithmetic; this picks the copy.
+    dot_q6_k = dot_q6_k_body, wide: dot_q6_k_wide, (raw: &[u8], act_q: &[(f32, [i8; 32])]) -> f32
 }
 
 /// Per-block sums of the raw activation, for Q4_K's min term.
@@ -701,6 +792,32 @@ mod tests {
             assert_eq!(got[r], dot_q6_k(&raw[r * rb..(r + 1) * rb], &prep.q), "row {r}");
         }
         assert!(got.iter().any(|v| *v != 0.0) && got.windows(2).any(|w| w[0] != w[1]), "rows are distinct and non-zero");
+    }
+
+    /// BOTH COPIES, SAME BITS. The wide copy is the same source compiled with more instructions
+    /// available; if it ever differs from baseline, a feature that changes float semantics got
+    /// enabled (fma), or the dispatch is calling the wrong thing. Forces each path explicitly —
+    /// relying on detection alone would silently test one copy twice on a CPU without the feature.
+    #[test]
+    fn the_wide_copy_of_every_dot_is_bit_identical_to_baseline() {
+        let blocks = 16usize; let k = blocks * 256;
+        let act: Vec<f32> = (0..k).map(|i| (((i * 37 + 11) % 97) as f32 - 48.0) * 0.21).collect();
+        let prep = ActPrep::new(&act);
+        let q8: Vec<u8> = { let mut v = Vec::new(); let mut x = 99u32; for _ in 0..k / 32 { v.extend_from_slice(&f32_to_half(0.004).to_le_bytes()); for _ in 0..32 { x = x.wrapping_mul(1664525).wrapping_add(1013904223); v.push((x >> 24) as u8); } } v };
+        let (q4, q6) = (q4k_bytes(blocks, 606), q6k_bytes(blocks, 707));
+        let had_wide = set_cpu_isa_wide(Some(true));
+        let wide = (dot_q8_0_iq(&q8, &prep.q), dot_q4_k(&q4, &prep.q, &prep.sums), dot_q6_k(&q6, &prep.q));
+        let name_wide = cpu_isa_name();
+        assert!(!set_cpu_isa_wide(Some(false)));
+        let base = (dot_q8_0_iq(&q8, &prep.q), dot_q4_k(&q4, &prep.q, &prep.sums), dot_q6_k(&q6, &prep.q));
+        assert_eq!(cpu_isa_name(), "baseline");
+        set_cpu_isa_wide(None);
+        assert_eq!((wide.0.to_bits(), wide.1.to_bits(), wide.2.to_bits()), (base.0.to_bits(), base.1.to_bits(), base.2.to_bits()));
+        assert!(base.0 != 0.0 && base.1 != 0.0 && base.2 != 0.0 && base.0.is_finite() && base.1.is_finite() && base.2.is_finite());
+        // and say which case this run actually covered, so a green result is not over-read
+        eprintln!("isa test: wide copy {} on this CPU ({name_wide})", if had_wide { "EXERCISED" } else { "NOT AVAILABLE — baseline compared with itself" });
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(had_wide, std::arch::is_x86_feature_detected!("avx2"));
     }
 
     /// Valid-looking Q4_K rows: random quants and 6-bit scales, `d`/`dmin` set to normal f16s.
