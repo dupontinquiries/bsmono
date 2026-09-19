@@ -1,4 +1,4 @@
-# Merge guide — c19unified-016 (stoat, and the palette canon)
+# Merge guide — c19unified-017 (stoat, and the palette canon)
 
 For whoever merges this drop into another copy of the repo, human or Claude.
 Same purpose as `MERGE_GUIDE_026.md` / `_028.md`: what changed, what was
@@ -6,14 +6,16 @@ verified and how, and where it can collide. The commit messages carry the detail
 this is the map.
 
 Base: `9acc004fe` (main of `c19unified-013-fleet`). Everything here is linear on
-top of it, so against an unmoved main it fast-forwards. 016 supersedes 015 (it is
-015 plus four commits: the palette surface moving into the kit, stoat and
+top of it, so against an unmoved main it fast-forwards. 017 supersedes 016, which
+superseded 015. 017 = 016 plus three commits: `palette_surface_check.py`, the CLI
+moved onto the Driver and the shared command vocabulary (with `stoat attach` and
+`stoat core`), and this guide. 016 = 015 plus four commits: the palette surface moving into the kit, stoat and
 vidkit-player ported onto it, and the UI_STRATEGY entry). If 015 was already
 merged, only those four are new.
 
 ```sh
-git bundle verify c19unified-016-*.bundle
-git fetch /path/to/c19unified-016-*.bundle refs/heads/main:incoming-stoat
+git bundle verify c19unified-017-*.bundle
+git fetch /path/to/c19unified-017-*.bundle refs/heads/main:incoming-stoat
 git log --oneline main..incoming-stoat          # review first
 git fetch /path/to/bundle 'refs/notes/toolcalls:refs/notes/incoming-toolcalls'
 git notes --ref=toolcalls merge incoming-toolcalls   # only if you already have notes
@@ -36,6 +38,7 @@ Everything new is under `apps/stoat/` and cannot conflict. Outside it:
 | `shared/uikit/crates/uikit-egui/src/command_bar.rs` | the palette SURFACE: `show`, `State`, `Row`, `Outcome`, `Placement`, `placement_for`, `mode_for_rows`, `arrow`; a `surface_tests` module. The existing arithmetic and its tests are untouched | …added anything after `move_cursor` or edited the module header |
 | `apps/vidkit-player/src/palette.rs`, `src/main.rs` | palette state and drawing replaced by the kit surface; 111 -> 109 tests (three removed with reasons in place, two added) | …touched `Palette`, `palette_ui`, or the removed tests. NOTE the behaviour change: its cursor now clamps instead of wrapping |
 | `UI_STRATEGY.md` | one bullet under "New egui app: good defaults" | …added a bullet at the same spot — keep both |
+| `maintenance/tools/palette_surface_check.py` (new) + one line in `CLAUDE.md` §7 | the checker pinning the palette canon | …added a checker line at the same spot in §7 — keep both |
 | `manifest/projects.toml` | three entries appended: `stoat`, `stoat-egui` (primary), `stoat-gtk` | …appended at the same place — keep both sides |
 | `CLAUDE.md` §3 | GTK4/libadwaita are installable in the sandbox | …edited the same paragraph |
 
@@ -62,6 +65,7 @@ time, x86_64, gdb 15.1, rustc 1.96, egui 0.34:
 |---|---|
 | stoat-mi | 5 |
 | stoat-core | command 5, driver 1, live_gdb 4, replay 4, services 10 |
+| stoat-cli | batch 3 (drives the built binary with a deadline; one prints NOT RUN without gdb) |
 | stoat-egui | unit 5, palette 6, phone 4 |
 | uikit-egui | lib 547 / 0 failed (it was 541 / 1 on arrival), integration 1 + 5 ignored |
 | vidkit-player | 109 (baseline taken first by stashing the port: 111, same 5 warnings) |
@@ -73,7 +77,8 @@ green run on a bare image has not exercised them. Look for the string.
 
 Break-tested (the thing broken, the test confirmed red, the file restored):
 18 breaks, 18 caught - 1 in `5d18e8a56`, 4 in `92efe5cf4`, 7 in `c75364404`,
-6 on the kit surface in `7d0f9311f`.
+6 on the kit surface in `7d0f9311f`. Also 4 of 4 on `palette_surface_check.py`
+itself and 1 on the CLI's batch fix (the test fails at its deadline, it does not hang).
 Separately, the two kit tests were written first and seen red against the
 unfixed code. NOT break-tested: the core-file and attach live tests.
 
@@ -97,20 +102,25 @@ not from this drop.
 `uikit_egui::command_bar::show` is now THE palette surface: bottom edge and
 inverted (best match directly above the input) on a compact or touch surface,
 the familiar top-centre card on a desk. Consumers: stoat-egui, vidkit-player.
-Still drawing their own, from a grep for "command palette" in egui crates and NOT
-audited one by one: voiceterm-egui, beatspace, studio-egui, logscope-egui,
-snapclone-egui, aperture, tomescope. Each port is mostly deletion (vidkit-player:
-+63 / -176), but each also takes the kit's clamp-not-wrap cursor and its
-arrow/Enter behaviour, so each needs its own look. There is no checker pinning
-this yet; `textedit_id_check.py` is the pattern to copy (a KNOWN_MISSES list with
-a reason per entry).
+Still drawing their own - now a checked list, not a grep:
+`maintenance/tools/palette_surface_check.py` scans 45 egui crates, asserts it
+still finds the two consumers, and carries six KNOWN_MISSES with where each
+palette lives: aperture-egui, beatspace, snapclone-egui, studio-app, tomescope,
+voiceterm-egui. (logscope-egui matched the heuristic and is a completion grid, not
+a palette; it is in NOT_A_PALETTE with the reason.) Each port is mostly deletion
+(vidkit-player: +63 / -176) but takes the kit's clamp-not-wrap cursor and its
+arrow/Enter behaviour with it, so each needs its own look. When one is ported the
+checker FAILS until its entry is deleted - that is deliberate.
 
 ## Not verified — do not inherit these as claims
 
-* The ported palettes on screen beyond opening them: stoat-egui was not
-  re-looked-at after the port (its tests drive the tap, the long press and the
-  speech rule through real egui input and are green); vidkit-player was opened at
-  400x640 (bottom, inverted) and 1300x740 (top-centre) and nothing was typed.
+* vidkit-player's ported palette beyond opening it (400x640: bottom, inverted;
+  1300x740: top-centre); nothing was typed into it. stoat-egui's WAS re-looked-at
+  at 400x780 after the port: inverted with "step over" above the input, Up twice
+  moved the selection upward to "step into", and Enter then produced a stop inside
+  a CALLEE of the stopped function - which is what step-into does and step-over
+  does not. That last step is an inference from the stop location; the MI line
+  itself had scrolled out of the capture.
 
 * Nothing on aarch64, musl or a phone. Frame-marker overhead (~2.3 ms a frame)
   is this sandbox's number.
@@ -122,9 +132,8 @@ a reason per entry).
 * Attach / core / Build / history search from the egui WINDOW (their core paths
   are live-tested; the widgets were laid out and probed, not clicked).
 * Yama `ptrace_scope=1`: this sandbox has no Yama, so the refusal path is untested.
-* stoat-gtk has none of the palette / hold / attach / core work.
-* The CLI still has its own command parser instead of `stoat_core::command`, and
-  the CLI and GTK shells still carry their own vitals glue instead of `Driver`.
+* stoat-gtk still carries its own vitals glue instead of `Driver` and has none of
+  the palette / hold / attach / core work. (The CLI was moved in 017.)
 
 ## Placeholders someone has to decide
 
