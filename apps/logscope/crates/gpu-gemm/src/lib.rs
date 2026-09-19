@@ -26,6 +26,7 @@ use std::collections::HashMap;
 pub mod reverse; // search-based inversion: which token preceded a suffix (c11 experiment)
 pub mod flash_qblock;
 pub mod jsonmask; // byte-level JSON grammar constraint for structured decoding
+pub mod blockquant; // the 32-weight block quantizer every load-time requantization runs: both loops vectorize, output bit-identical
 pub mod topk;     // the per-token full-vocabulary scans: O(n) exact top-k, vectorizable finite check and argmax
 pub mod imrope;   // ggml's multi-section rope, mirrored; decides per FILE whether text collapses to plain NEOX
 pub mod pool_class;
@@ -5184,18 +5185,14 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                         let r = r0 + lr;
                         for b in 0..kb {
                             let base = r * k + b * 32;
-                            let mut amax = 0f32;
-                            for j in 0..32 { amax = amax.max(w[base + j].abs()); }
-                            let scale = if amax > 0.0 { amax * (1.0f32 / 127.0) } else { 1.0 };
-                            let inv_scale = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
-                            qs_c[lr * kb + b] = scale;
-                            for j in 0..32 {
-                                // SAME PAIR AS Q4_K, in the int8 path. QUANT_PACK computes round(x * inv): a
-                            // multiply by the reciprocal, and WGSL's round is half-to-EVEN. Dividing
-                            // and rounding away from zero here disagrees on both counts, and at 127
-                            // levels ties are commoner than at 7.
-                            qb_c[lr * k + b * 32 + j] = (w[base + j] * inv_scale).round().clamp(-127.0, 127.0) as i32 as i8;
-                            }
+                            // The block itself is blockquant::q8_block: the same arithmetic — reciprocal
+                            // multiply, round half AWAY (this driver's round(), measured; see
+                            // quantize_q4_resident) — with both loops in a form the vectorizer takes.
+                            // Bit-identical to the loop that was here, held by blockquant's oracle test;
+                            // 181 -> 66 ns per block at baseline x86-64.
+                            let wb: &[f32; 32] = (&w[base..base + 32]).try_into().unwrap();
+                            let qb: &mut [i8; 32] = (&mut qb_c[lr * k + b * 32..lr * k + b * 32 + 32]).try_into().unwrap();
+                            qs_c[lr * kb + b] = crate::blockquant::q8_block(wb, qb);
                         }
                     }
                 });
@@ -5644,36 +5641,15 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                         let r = r0 + lr;
                         for b in 0..kb {
                             let base = r * k + b * 32;
-                            let mut amax = 0f32;
-                            for j in 0..32 { amax = amax.max(w[base + j].abs()); }
-                            // The GPU cannot divide exactly here — see Q4K_TO_Q4: this driver
-                            // lowers `/` to a multiply by an f32-rounded reciprocal. Matching it is
-                            // the only way the two agree, and the reference is what moves.
-                            let scale = if amax > 0.0 { amax * (1.0f32 / 7.0) } else { 1.0 };
-                            let inv_scale = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
-                            qs_c[lr * kb + b] = scale;
-                            for j in 0..32 {
-                                // Reciprocal, matching the shader: this driver turns `/` into a multiply by an
-                                // f32 reciprocal, and here an ULP crosses a .5 boundary where the two
-                                // round() rules then differ by a whole quantization level.
-                                // ROUND HALF AWAY FROM ZERO — and this was measured, not assumed.
-                                //
-                                // The WGSL spec says round() is ties-to-even, so I switched the CPU
-                                // to round_ties_even() to match. The gate went from 1104 differing
-                                // words to 9680, and the pattern spread from three positions within a
-                                // block to ten. A clean refutation: the change moved the CPU AWAY
-                                // from the GPU.
-                                //
-                                // Metal's round() is ties-AWAY-from-zero, and naga lowers WGSL's
-                                // round() straight onto it. The spec describes one rule and this
-                                // driver implements the other, so Rust's plain .round() was right all
-                                // along.
-                                //
-                                // Reading the spec is what made this wrong. The gate is what made it
-                                // right.
-                                let q = (w[base + j] * inv_scale).round().clamp(-7.0, 7.0) as i32;
-                                nb_c[lr * k + b * 32 + j] = (q + 8) as u8; // 1..=15, symmetric around 8
-                            }
+                            // blockquant::q4_block: the block that was here, in a form whose two loops vectorize.
+                            // SAME arithmetic — reciprocal multiply (the GPU lowers `/` to a multiply by an f32-rounded
+                            // reciprocal) and round half AWAY from zero. That rule was MEASURED, not read: the WGSL spec
+                            // says ties-to-even, this driver's round() is ties-away, and switching the CPU to
+                            // round_ties_even() took the gate from 1104 differing words to 9680. blockquant keeps the
+                            // original loop as its oracle and is held bit-identical to it.
+                            let wb: &[f32; 32] = (&w[base..base + 32]).try_into().unwrap();
+                            let nbk: &mut [u8; 32] = (&mut nb_c[lr * k + b * 32..lr * k + b * 32 + 32]).try_into().unwrap();
+                            qs_c[lr * kb + b] = crate::blockquant::q4_block(wb, nbk);
                         }
                     }
                 });
@@ -6217,21 +6193,15 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                             let r = base_row + rr;
                             for b in 0..kb {
                                 let base = r * k + b * 32;
-                                let mut amax = 0f32;
-                                for j in 0..32 { amax = amax.max(w[base + j].abs()); }
-                                // The GPU cannot divide exactly here — see Q4K_TO_Q4: this driver
-                            // lowers `/` to a multiply by an f32-rounded reciprocal. Matching it is
-                            // the only way the two agree, and the reference is what moves.
-                            let scale = if amax > 0.0 { amax * (1.0f32 / 7.0) } else { 1.0 };
-                            let inv_scale = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
-                                qs_c[rr * kb + b] = scale;
-                                for j in 0..32 {
-                                    // The second q4 quantizer, which I patched the first of and missed this one — the
-                    // same reciprocal-and-tie pair, and no gate exercises it at a scale that would
-                    // have shown either.
-                    let qv = (w[base + j] * inv_scale).round().clamp(-7.0, 7.0) as i32;
-                                    nib_c[rr * k + b * 32 + j] = (qv + 8) as u8;
-                                }
+                                // blockquant::q4_block: the block that was here, in a form whose two loops vectorize.
+                                // SAME arithmetic — reciprocal multiply (the GPU lowers `/` to a multiply by an f32-rounded
+                                // reciprocal) and round half AWAY from zero. That rule was MEASURED, not read: the WGSL spec
+                                // says ties-to-even, this driver's round() is ties-away, and switching the CPU to
+                                // round_ties_even() took the gate from 1104 differing words to 9680. blockquant keeps the
+                                // original loop as its oracle and is held bit-identical to it.
+                                let wb: &[f32; 32] = (&w[base..base + 32]).try_into().unwrap();
+                                let nbk: &mut [u8; 32] = (&mut nib_c[rr * k + b * 32..rr * k + b * 32 + 32]).try_into().unwrap();
+                                qs_c[rr * kb + b] = crate::blockquant::q4_block(wb, nbk);
                             }
                         }
                     });
