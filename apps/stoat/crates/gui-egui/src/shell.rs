@@ -31,6 +31,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use stoat_core::backend::{Backend, Channel, Dir, Event, Request, StepKind};
 use stoat_core::cache::{self, CacheKind, PrunePlan, Usage};
+use stoat_core::command::Command;
+use stoat_core::procs::{self, Proc};
 use stoat_core::diag::{Diagnostic, Severity};
 use stoat_core::discover::{self, Candidate};
 use stoat_core::gdb::{Debuginfod, GdbBackend, GdbConfig};
@@ -57,6 +59,7 @@ pub enum Task {
     MeasureCaches { root: PathBuf },
     PlanPrune { root: PathBuf, unused_for: Duration },
     ApplyPrune(Vec<(PathBuf, PrunePlan)>),
+    ListProcs,
 }
 
 pub enum Msg {
@@ -66,6 +69,7 @@ pub enum Msg {
     CacheUsage(Vec<(CacheKind, PathBuf, Usage)>),
     PrunePlans(Vec<(PathBuf, PrunePlan)>),
     Pruned { freed: u64, failed: usize },
+    Procs(Vec<Proc>),
 }
 
 pub type Repaint = Arc<dyn Fn() + Send + Sync>;
@@ -98,6 +102,7 @@ pub fn worker(tasks: Receiver<Task>, out: Sender<Msg>, repaint: Repaint) {
                 let p = cache::locate(Some(&root)).into_iter().map(|(_, p)| (p.clone(), cache::plan_prune(&p, unused_for))).collect();
                 send(Msg::PrunePlans(p));
             }
+            Task::ListProcs => send(Msg::Procs(procs::list_mine())),
             Task::ApplyPrune(plans) => {
                 let (freed, failed) = plans.iter().map(|(_, p)| cache::apply(p)).fold((0, 0), |(b, f), (freed, bad)| (b + freed, f + bad.len()));
                 send(Msg::Pruned { freed, failed });
@@ -171,6 +176,10 @@ pub struct ShellState {
     pub env_text: String,
     pub marker_text: String,
     pub history_query: String,
+    /// Attach / core: this user's processes, a filter over them, a core path.
+    pub procs: Vec<Proc>,
+    pub proc_query: String,
+    pub core_text: String,
 
     /// Why we are stopped, plus the vitals summary captured at that moment.
     pub diagnostic: Option<(Diagnostic, Vec<String>)>,
@@ -224,6 +233,9 @@ impl ShellState {
             env_text: String::new(),
             marker_text: String::new(),
             history_query: String::new(),
+            procs: Vec::new(),
+            proc_query: String::new(),
+            core_text: String::new(),
             diagnostic: None,
             values: HashMap::new(),
             debuginfod: false,
@@ -326,16 +338,57 @@ impl ShellState {
     }
 
     pub fn start_debug(&mut self, program: PathBuf, args: Vec<String>, env: Vec<(String, String)>, marker: Option<String>, is_rust: bool) {
+        let root = self.root.clone();
+        let label = program.clone();
+        self.launch(&label, move |session, b| {
+            b.submit(Request::Load { program, args, env, cwd: Some(root) });
+            if is_rust {
+                session.break_on_rust_panic(b);
+            }
+            if let Some(m) = &marker {
+                session.insert_frame_marker(m, b);
+            }
+            b.submit(Request::Run);
+        });
+    }
+
+    /// Attach to a running process. gdb finds the executable through
+    /// /proc/<pid>/exe; dropping the session detaches and leaves it running.
+    pub fn start_attach(&mut self, pid: u32) {
+        let exe = self.procs.iter().find(|p| p.pid == pid).and_then(|p| p.exe.clone());
+        let label = exe.clone().unwrap_or_else(|| PathBuf::from(format!("pid {pid}")));
+        let is_rust = exe.as_deref().and_then(discover::inspect).is_some_and(|f| f.is_rust);
+        self.launch(&label, move |session, b| {
+            b.submit(Request::Attach { pid });
+            if is_rust {
+                session.break_on_rust_panic(b);
+            }
+        });
+    }
+
+    /// Open a core file against the chosen binary.
+    pub fn start_core(&mut self, core: PathBuf) {
+        let Some(program) = self.candidates.get(self.chosen).map(|c| c.path.clone()) else {
+            return self.toast("Choose the binary the core came from first", uikit_egui::toast::Severity::Warning);
+        };
+        if !core.is_file() {
+            return self.toast(format!("No such file: {}", core.display()), uikit_egui::toast::Severity::Error);
+        }
+        self.launch(&program.clone(), move |session, b| session.load_core(program, core, b));
+    }
+
+    fn launch(&mut self, label: &Path, init: impl FnOnce(&mut Session, &mut dyn Backend)) {
         let cfg = GdbConfig { debuginfod: if self.debuginfod { Debuginfod::On } else { Debuginfod::Off }, ..Default::default() };
         let (gdb, events) = match GdbBackend::spawn(&cfg) {
             Ok(x) => x,
             Err(e) => return self.toast(format!("Could not start gdb: {e}"), uikit_egui::toast::Severity::Error),
         };
-        // Replacing the driver drops the old backend, which kills its gdb; its
-        // reader threads then close the old channel and the old event thread
-        // ends. Anything it already queued carries the old generation and is
-        // dropped in pump().
-        self.begin_run(Box::new(gdb), &program);
+        // Replacing the driver drops the old backend, which ends its gdb (killing
+        // a program it started, detaching from one it attached to); its reader
+        // threads then close the old channel and the old event thread ends.
+        // Anything already queued carries the old generation and is dropped in
+        // pump().
+        self.begin_run(Box::new(gdb), label);
         let generation = self.generation;
         let driver = self.driver.clone().expect("just set");
         let (tx, rx) = mpsc::channel();
@@ -353,17 +406,8 @@ impl ShellState {
             }
         });
         self.changes = Some(rx);
-
-        let root = self.root.clone();
         self.with_session(|session, b| {
-            b.submit(Request::Load { program, args, env, cwd: Some(root) });
-            if is_rust {
-                session.break_on_rust_panic(b);
-            }
-            if let Some(m) = &marker {
-                session.insert_frame_marker(m, b);
-            }
-            b.submit(Request::Run);
+            init(session, b);
             Vec::new()
         });
     }
@@ -449,6 +493,37 @@ impl ShellState {
         });
     }
 
+    /// Run a command from the palette, the strip, a long press or speech.
+    pub fn execute(&mut self, cmd: &Command) {
+        match cmd {
+            Command::Build => self.run_build(),
+            Command::Attach(pid) => self.start_attach(*pid),
+            Command::OpenCore(p) => self.start_core(p.clone()),
+            Command::Debug(name) => {
+                let best = self.candidates.iter().enumerate().filter_map(|(i, c)| Some((uikit_egui::fuzzy::score(name, c.path.file_name()?.to_str()?)?, i))).max();
+                match best {
+                    Some((_, i)) => {
+                        self.choose(i);
+                        self.debug_chosen();
+                    }
+                    None => self.toast(format!("No binary matches {name:?}"), uikit_egui::toast::Severity::Warning),
+                }
+            }
+            _ => {
+                let Some(d) = self.driver.clone() else {
+                    return self.toast("No debug session. Start one from Launch.", uikit_egui::toast::Severity::Info);
+                };
+                let changes = d.lock().unwrap().execute(cmd).unwrap_or_default();
+                self.apply(changes);
+                self.refresh();
+            }
+        }
+    }
+
+    pub fn refresh_procs(&mut self) {
+        self.send(Task::ListProcs);
+    }
+
     pub fn go_or_interrupt(&mut self) {
         let running = self.session.state == RunState::Running;
         self.submit(if running { Request::Interrupt } else { Request::Continue });
@@ -517,6 +592,7 @@ impl ShellState {
                     }
                 }
                 Msg::CacheUsage(u) => self.usage = u,
+                Msg::Procs(p) => self.procs = p,
                 Msg::PrunePlans(p) => self.plans = p,
                 Msg::Pruned { freed, failed } => {
                     let tail = if failed > 0 { format!(", {failed} files could not be removed") } else { String::new() };

@@ -1,4 +1,5 @@
 use super::{card, row};
+use crate::hold::{self, Target, Targets};
 use crate::shell::ShellState;
 use crate::source;
 use egui::{Rect, RichText, Ui, UiBuilder};
@@ -9,7 +10,31 @@ use uikit_egui::{GestureLayer, PaletteColors};
 
 const BAR_H: f32 = 46.0;
 
-pub fn ui(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors, swipe: &mut GestureLayer) {
+pub fn ui(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors, swipe: &mut GestureLayer, targets: &mut Targets, gestures: &[uikit_egui::touch::Gesture]) {
+    // A long press, against what was drawn LAST frame (immediate mode: this
+    // frame's rects do not exist yet). Tap stays tap; the recogniser reports
+    // nothing while a widget owns the contact.
+    for g in gestures {
+        if let uikit_egui::touch::Gesture::LongPress(p) = g {
+            match targets.hit(egui::pos2(p.x, p.y)).cloned() {
+                Some(Target::SourceLine { file, line }) => {
+                    let loc = format!("{}:{line}", file.display());
+                    st.execute(&stoat_core::command::Command::Break(loc));
+                    st.toast(format!("breakpoint at {}:{line}", file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()), uikit_egui::toast::Severity::Success);
+                }
+                Some(Target::Local { name, value }) => {
+                    ui.ctx().copy_text(format!("{name} = {value}"));
+                    st.toast(format!("copied {name}"), uikit_egui::toast::Severity::Info);
+                }
+                Some(Target::Location(loc)) => {
+                    ui.ctx().copy_text(loc);
+                    st.toast("copied location", uikit_egui::toast::Severity::Info);
+                }
+                None => {}
+            }
+        }
+    }
+    targets.clear();
     let full = ui.available_rect_before_wrap();
     let body = Rect::from_min_max(full.min, egui::pos2(full.max.x, (full.max.y - BAR_H - 6.0).max(full.min.y)));
     let bar = Rect::from_min_max(egui::pos2(full.min.x, body.max.y + 6.0), full.max);
@@ -48,12 +73,12 @@ pub fn ui(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors, swipe: &mut Gestu
     let shifted = body.translate(egui::vec2(drag_px, 0.0));
     ui.scope_builder(UiBuilder::new().max_rect(shifted), |ui| {
         ui.set_clip_rect(body);
-        frame_body(ui, st, c);
+        frame_body(ui, st, c, targets);
     });
     ui.scope_builder(UiBuilder::new().max_rect(bar), |ui| transport(ui, st, c));
 }
 
-fn frame_body(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors) {
+fn frame_body(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors, targets: &mut Targets) {
     let level = st.session.current_frame().map(|f| f.level);
     // Keyed by frame: each frame keeps its own scroll offset instead of
     // inheriting the one you left the previous frame at.
@@ -90,8 +115,9 @@ fn frame_body(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors) {
             return;
         };
 
-        ui.label(RichText::new(f.func.as_deref().unwrap_or("??")).strong().size(17.0));
-        ui.label(RichText::new(format!("#{} · {}", f.level, f.location())).small().color(c.text_weak));
+        let title = ui.label(RichText::new(f.func.as_deref().unwrap_or("??")).strong().size(17.0));
+        let loc = ui.label(RichText::new(format!("#{} · {}", f.level, f.location())).small().color(c.text_weak));
+        targets.add(title.rect.union(loc.rect), Target::Location(f.location()));
         ui.add_space(4.0);
 
         let lines = f.file.as_deref().and_then(|p| st.sources.lines(p));
@@ -99,7 +125,21 @@ fn frame_body(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors) {
             (Some(lines), Some(line)) => {
                 let tints = source::Tints { text: c.text, weak: c.text_weak, current_bg: c.accent_soft };
                 let job = source::layout(&lines, line, 6, &tints, 12.0, ui.available_width());
-                ui.add(egui::Label::new(job).selectable(false));
+                // Laid out here rather than inside the Label so the rows are in
+                // hand: a long press needs to know which SOURCE line a wrapped
+                // row belongs to.
+                let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
+                let r = ui.add(egui::Label::new(galley.clone()).selectable(false));
+                if let (Some(file), Some(first)) = (f.file.clone(), source::window(&lines, line, 6).first().map(|w| w.0)) {
+                    let rows: Vec<(Rect, bool)> = galley.rows.iter().map(|row| (row.rect().translate(r.rect.min.to_vec2()), row.ends_with_newline)).collect();
+                    for (i, (rect, _)) in rows.iter().enumerate() {
+                        if let Some(n) = hold::line_at(&rows, first, rect.center()) {
+                            // One target per row; rows of one wrapped line share its number.
+                            let _ = i;
+                            targets.add(*rect, Target::SourceLine { file: file.clone(), line: n });
+                        }
+                    }
+                }
             }
             (None, Some(_)) => drop(ui.label(RichText::new("source file is not on this machine").small().color(c.text_weak))),
             _ => drop(ui.label(RichText::new("no line info for this frame").small().color(c.text_weak))),
@@ -118,8 +158,9 @@ fn frame_body(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors) {
                         let expanded = st.values.get(&(f.level, v.name.clone()));
                         match v.value.as_ref().or(expanded) {
                             Some(val) => {
-                                ui.label(RichText::new(title).small().color(c.text_weak));
-                                ui.add(egui::Label::new(RichText::new(val).monospace()).wrap());
+                                let a = ui.label(RichText::new(title).small().color(c.text_weak));
+                                let b = ui.add(egui::Label::new(RichText::new(val).monospace()).wrap());
+                                targets.add(a.rect.union(b.rect), Target::Local { name: v.name.clone(), value: val.clone() });
                                 ui.add_space(4.0);
                             }
                             // Aggregates are not fetched at the stop (--simple-values):

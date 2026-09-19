@@ -87,5 +87,35 @@ pub fn ui(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors) {
             }
         });
         ui.add_space(12.0);
+
+        section(ui, c, "OR: A RUNNING PROCESS, OR A CORE FILE");
+        card(ui, c, |ui| {
+            if let Some(why) = stoat_core::procs::attach_caveat(stoat_core::procs::ptrace_scope(std::path::Path::new("/proc"))) {
+                ui.label(RichText::new(why).small().color(c.warning));
+            }
+            ui.horizontal(|ui| {
+                if ui.button("List processes").clicked() {
+                    st.refresh_procs();
+                }
+                ui.add(text_field::edit("launch-proc-filter", &mut st.proc_query).hint_text("filter").desired_width(f32::INFINITY));
+            });
+            let q = st.proc_query.to_lowercase();
+            let mut attach = None;
+            for p in st.procs.iter().filter(|p| q.is_empty() || p.cmdline.to_lowercase().contains(&q) || p.pid.to_string() == q).take(6) {
+                if row(ui, c, false, "", &format!("{}  {}", p.pid, p.name), &format!("{} — tap to attach; closing the session detaches", p.cmdline)) {
+                    attach = Some(p.pid);
+                }
+            }
+            if let Some(pid) = attach {
+                st.start_attach(pid);
+            }
+            ui.add_space(6.0);
+            ui.label(RichText::new("core file — read against the binary chosen above").small().color(c.text_weak));
+            ui.add(text_field::edit("launch-core", &mut st.core_text).hint_text("/path/to/core").desired_width(f32::INFINITY));
+            if ui.add_enabled(!st.core_text.trim().is_empty(), egui::Button::new("Open core")).clicked() {
+                st.start_core(std::path::PathBuf::from(st.core_text.trim()));
+            }
+        });
+        ui.add_space(12.0);
     });
 }

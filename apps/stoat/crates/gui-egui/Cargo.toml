@@ -23,3 +23,9 @@ eframe = { version = "0.34", default-features = false, features = ["glow", "wayl
 # `app` default-on per the house convention for every -egui frontend.
 default = ["app"]
 app = ["dep:eframe"]
+# A microphone for the command palette: pause after Ctrl+P (or hold the ⌘
+# button) and say "step over", "up two", "print counter". Off by default because
+# it pulls whisper-rs (a cmake build of whisper.cpp) and cpal through
+# uikit-egui's voice-popup. Everything that decides what an utterance DOES is
+# compiled and tested without it; the feature adds only the capture.
+voice = ["uikit-egui/voice-popup"]
