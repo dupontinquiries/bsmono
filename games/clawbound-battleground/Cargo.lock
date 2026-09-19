@@ -387,6 +387,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "cpal",
+ "creature-rig",
  "egui",
  "egui-wgpu",
  "egui-winit",
@@ -396,6 +397,7 @@ dependencies = [
  "naga",
  "pollster",
  "wgpu",
+ "wildkit",
  "winit",
 ]
 
@@ -559,6 +561,10 @@ checksum = "8498c871161e1742aaa9d52551b2d6ebdd4c3d45a3be423e3728f33b955be550"
 dependencies = [
  "cfg-if",
 ]
+
+[[package]]
+name = "creature-rig"
+version = "0.1.0"
 
 [[package]]
 name = "crossbeam-utils"
@@ -2890,6 +2896,10 @@ name = "widestring"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
+
+[[package]]
+name = "wildkit"
+version = "0.1.0"
 
 [[package]]
 name = "winapi"
