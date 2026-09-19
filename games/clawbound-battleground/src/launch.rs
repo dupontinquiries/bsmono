@@ -22,6 +22,9 @@ pub struct LaunchOptions {
     pub quick_match: bool,
     /// `--screenshot`: the windowless render harness.
     pub screenshot: bool,
+    /// `--rig-sheet`: windowless close-ups of posed ancestors, through the
+    /// real draw path. Implies `screenshot`.
+    pub rig_sheet: bool,
     /// `--ancestor <name|id>`: pick this one (implies quick match).
     pub ancestor: Option<String>,
     pub handoff: Option<HandoffRole>,
@@ -39,6 +42,10 @@ impl LaunchOptions {
             match a.as_str() {
                 "--quick-match" => o.quick_match = true,
                 "--screenshot" => o.screenshot = true,
+                "--rig-sheet" => {
+                    o.rig_sheet = true;
+                    o.screenshot = true;
+                }
                 "--ancestor" => {
                     o.ancestor = it.next();
                     o.quick_match = true;

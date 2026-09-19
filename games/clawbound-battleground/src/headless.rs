@@ -100,6 +100,9 @@ pub fn run() -> Result<(), String> {
         *e = pool.remove((rng.next_u() % pool.len() as u64) as usize);
     }
     let mut game = Game::new(player, allies, enemies);
+    // As app.rs does. Without this the harness simulated a world with no
+    // props in it, which is not the game anyone plays.
+    game.blockers = scene.blockers.clone();
     // drive the player slot with AI for the demo
     let lane = crate::consts::Lane::Mid;
     game.gods[0].ai = Some(crate::sim::AiBrain {
@@ -383,5 +386,118 @@ fn save_shot(device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::Texture,
     out.save(path).map_err(|e| e.to_string())?;
     let _ = Mat4::IDENTITY;
     let _ = Team::Blue;
+    Ok(())
+}
+
+
+/// `--rig-sheet`: close-ups of ancestors in staged states.
+///
+/// Mirrors `app.rs`'s frame: `vfx.update` then `Scene::draw` then
+/// `render_frame`, with the scene's own blockers handed to the game. The sim
+/// is NOT ticked — states are staged by writing `GodUnit` fields the way the
+/// sim does (`atk_anim = 1.0` on a swing, a `DashState` for a dash), so what
+/// is drawn is what the draw path makes of real sim state, not a pose the
+/// game never produces.
+pub fn run_rig_sheet() -> Result<(), String> {
+    use crate::puppet::CastStyle;
+    use crate::sim::DashState;
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("sheet target"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+
+    // A real fern and a real root, from the scene's own blockers.
+    let fern = scene.blockers.all().iter().find_map(|b| {
+        let c = b.cover;
+        (c.amount > 0.5 && c.amount < 0.6 && c.x.abs() < 60.0 && c.z.abs() < 60.0).then_some(Vec3::new(c.x, 0.0, c.z))
+    });
+    let root = scene.blockers.steps().first().map(|s| match s.shape {
+        crate::blockers::Shape::Segment { x0, z0, x1, z1, .. } => (Vec3::new(x0, 0.0, z0), Vec3::new(x1, 0.0, z1)),
+        crate::blockers::Shape::Circle { x, z, .. } => (Vec3::new(x, 0.0, z), Vec3::new(x + 1.0, 0.0, z)),
+    });
+    println!("fern at {fern:?}; root at {root:?}; {} root steps", scene.blockers.steps().len());
+
+    struct Shot { name: &'static str, eye: Vec3, look: Vec3 }
+    let row = Vec3::new(0.0, 0.0, -40.0);
+    let mut shots = vec![Shot { name: "rig_lineup.png", eye: row + Vec3::new(0.0, 6.5, -12.0), look: row + Vec3::Y * 0.6 }];
+    if let Some((a, b)) = root {
+        let mid = (a + b) * 0.5;
+        let along = (b - a).normalize_or_zero();
+        let side = Vec3::new(-along.z, 0.0, along.x);
+        shots.push(Shot { name: "rig_on_root.png", eye: mid + side * 1.2 + along * 6.5 + Vec3::Y * 2.4, look: mid + Vec3::Y * 1.6 });
+    }
+    if let Some(f) = fern {
+        shots.push(Shot { name: "rig_in_fern.png", eye: f + Vec3::new(1.6, 5.5, 1.6), look: f + Vec3::Y * 0.5 });
+    }
+
+    for (si, shot) in shots.iter().enumerate() {
+        let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        game.blockers = scene.blockers.clone();
+        let mut vfx = Vfx::default();
+        let cam = Camera { eye: shot.eye, target: shot.look, fov_y: if si == 0 { 1.0 } else { 0.6 } };
+        const STEPS: usize = 48;
+        for step in 0..STEPS {
+            let left = STEPS - 1 - step;
+            match si {
+                0 => {
+                    // Six cats in a row facing +X (yaw 0), seen from -Z.
+                    for k in 0..6 {
+                        let g = &mut game.gods[k];
+                        g.yaw = 0.0;
+                        g.pos = row + Vec3::X * (k as f32 * 4.6 - 11.5);
+                    }
+                    // The movers ARRIVE at their slot on the capture frame.
+                    game.gods[0].pos.x -= left as f32 * (5.0 / 60.0); // trotting +X
+                    game.gods[1].pos.x -= left as f32 * (11.0 / 60.0); // bounding
+                    if left == 10 {
+                        game.gods[2].atk_anim = 1.0; // the sim's swing pulse
+                    }
+                    game.gods[2].atk_anim = (game.gods[2].atk_anim - 4.0 / 60.0).max(0.0);
+                    if left == 18 {
+                        vfx.puppets.on_cast(3, CastStyle::Rear);
+                    }
+                    if left == 12 {
+                        vfx.puppets.on_cast(4, CastStyle::Arch);
+                    }
+                    // A dash a third of the way through, as systems.rs poses it.
+                    let from = row + Vec3::X * 9.7;
+                    let to = from + Vec3::X * 6.0;
+                    let a = 0.3;
+                    game.gods[5].dash = Some(DashState { from, to, t: a * 0.4, dur: 0.4, dmg: 0.0 });
+                    game.gods[5].pos = from.lerp(to, a) + Vec3::Y * (a * (1.0 - a) * 4.0 * 0.35);
+                }
+                1 => {
+                    // Walk one cat along a real root, toward the camera.
+                    let (a, b) = root.unwrap();
+                    let dir = (b - a).normalize_or_zero();
+                    let g = &mut game.gods[0];
+                    g.yaw = dir.z.atan2(dir.x);
+                    g.pos = a - dir * 1.2 + dir * (step as f32 * (2.0 / 60.0));
+                }
+                _ => {
+                    let g = &mut game.gods[0];
+                    g.yaw = 0.8;
+                    g.pos = fern.unwrap() + Vec3::new(g.yaw.cos(), 0.0, g.yaw.sin()) * (step as f32 * (0.8 / 60.0) - 0.6);
+                }
+            }
+            vfx.update(1.0 / 60.0, &[], &game);
+            renderer.clear_queues();
+            scene.draw(&mut renderer, &game, &mut vfx, cam);
+        }
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, 1.0);
+        save_shot(&renderer.device, &renderer.queue, &target, shot.name)?;
+        println!("saved {}", shot.name);
+    }
     Ok(())
 }
