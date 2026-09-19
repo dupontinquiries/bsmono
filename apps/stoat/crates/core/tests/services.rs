@@ -197,3 +197,31 @@ fn leak_slope() {
     let slope = vitals::rss_slope_kb_per_s(&samples).unwrap();
     assert!((slope - 10_240.0).abs() < 1.0, "{slope}");
 }
+
+#[test]
+fn attachable_processes_come_from_proc_and_exclude_other_users_and_kernel_threads() {
+    use std::os::unix::fs::MetadataExt;
+    use stoat_core::procs;
+    let root = scratch("procs");
+    let mk = |pid: &str, cmdline: &[u8], comm: &str| {
+        let d = root.join(pid);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("cmdline"), cmdline).unwrap();
+        std::fs::write(d.join("comm"), format!("{comm}\n")).unwrap();
+    };
+    mk("100", b"/usr/bin/tile-viewer\0--zoom\015\0", "tile-viewer");
+    mk("200", b"", "kworker/0:1");
+    mk("300", b"./app\0", "app");
+    std::fs::create_dir_all(root.join("self")).unwrap();
+    let me = std::fs::metadata(&root).unwrap().uid();
+    let got = procs::list(&root, me, 300);
+    assert_eq!(got.len(), 1, "kernel thread, the skipped pid and non-numeric entries are out: {got:?}");
+    assert_eq!((got[0].pid, got[0].name.as_str(), got[0].cmdline.as_str()), (100, "tile-viewer", "/usr/bin/tile-viewer --zoom 15"));
+    assert!(procs::list(&root, me + 1, 0).is_empty(), "another user's processes are not offered");
+
+    std::fs::create_dir_all(root.join("sys/kernel/yama")).unwrap();
+    std::fs::write(root.join("sys/kernel/yama/ptrace_scope"), "1\n").unwrap();
+    assert_eq!(procs::ptrace_scope(&root), Some(1));
+    assert!(procs::attach_caveat(Some(1)).unwrap().contains("ptrace_scope=1"));
+    assert!(procs::attach_caveat(Some(0)).is_none() && procs::attach_caveat(None).is_none());
+}
