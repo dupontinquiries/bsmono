@@ -11,6 +11,10 @@
 /// so unreachable from here -- the audit arrives as data, exactly as the QML
 /// receives it.
 pub mod dep_audit;
+/// The PLAYBACK DIAGNOSTIC card from SettingsPage.qml: the ladder
+/// `diagnose_playback` walks, and what stopping at each rung means. Its value
+/// is naming the LAYER, since "playback is broken" is not actionable.
+pub mod playback_diag;
 pub mod dial_watermark;
 pub mod product_silhouette;
 pub mod transport;
