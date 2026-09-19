@@ -77,6 +77,16 @@ pub struct Feel {
     /// is monotonic, which is the only property the policy needs.
     started: std::time::Instant,
     tray_open: bool,
+    /// Which top-bar features the person switched on.
+    ///
+    /// EMPTY BY DEFAULT, which is the whole rule: the bar carried tray,
+    /// settings, term and dictate on every frame, costing the keys vertical
+    /// space for controls most sessions never touch. Nothing here means the
+    /// panel is not drawn at all — see `chrome::Chrome::top_bar_height`.
+    ///
+    /// A set rather than a count so the bar can draw only what was enabled;
+    /// the height does not depend on how many, but the contents do.
+    topbar_features: std::collections::BTreeSet<crate::chrome::Control>,
     microterm: crate::microterm::Microterm,
     /// The dictation SERVICE, not a bare Dictation: it owns the same state
     /// machine and adds the audio-window bookkeeping the transcriber needs.
@@ -329,6 +339,8 @@ impl Feel {
             focus_reason: crate::focus_policy::Reason::AwaitingFirstActivate,
             started: std::time::Instant::now(),
             tray_open: false,
+            // Nothing enabled: no top bar. A keyboard's job is keys.
+            topbar_features: Default::default(),
             microterm: Default::default(),
             // 16kHz: what the transcriber expects, and what the window maths
             // is computed against.
@@ -488,7 +500,19 @@ impl Feel {
             ctx.request_repaint();
         }
 
-        egui::Panel::top("out").show(ctx, |ui| {
+        // NOT DRAWN AT ALL when no top-bar feature is enabled, which is the
+        // default. Previously this panel was unconditional, so every session
+        // paid vertical space for tray/settings/term/dictate whether or not
+        // the person used any of them -- and on a 380pt phone that space is
+        // the difference between a comfortable key row and a cramped one.
+        //
+        // Skipped rather than drawn at zero height: an egui panel still takes
+        // its frame margins at zero content height, so a "0pt" bar is not
+        // free, and the gesture surface that reaches the options layer needs
+        // no visible handle to exist.
+        let bar_h = crate::chrome::Chrome::top_bar_height(self.topbar_features.len());
+        if bar_h > 0.0 {
+        egui::Panel::top("out").exact_height(bar_h).show(ctx, |ui| {
             // WRAPPED, not `horizontal`. egui's plain horizontal layout does
             // not wrap: it lays every widget on one line and lets the tail run
             // past the panel edge, where nothing can reach it. That is the
@@ -757,6 +781,7 @@ impl Feel {
             }
             ui.add_space(4.0);
         });
+        } // top bar: only when a feature is enabled
 
         // The microterm strip and the minimized tray, drawn above the keyboard.
 

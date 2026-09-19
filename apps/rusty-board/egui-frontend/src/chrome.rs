@@ -64,7 +64,9 @@ pub enum Home {
 }
 
 /// Everything the chrome can offer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Ord` so a `BTreeSet` can hold the enabled set — derived, so the order is
+/// declaration order, which is also the order the bar draws them in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Control {
     /// Open the settings page. On the board because every page needs a way
     /// there and a keyboard has no window chrome to put it in.
@@ -157,6 +159,16 @@ impl Control {
 /// controls off screen rather than merely crowded.
 pub const BOARD_MAX: usize = 3;
 
+/// The top bar's height once any feature is enabled.
+///
+/// 36pt: under the 44pt touch target, deliberately. These are not primary
+/// controls — the primary ones are on the board itself — and a bar that
+/// matched the board's target would claim to be as important as the keys.
+/// A 36pt row is comfortably hittable for something you reach for
+/// occasionally, and costs 8pt less of the keys' budget than a bar that
+/// pretended otherwise.
+pub const BAR_H_COMPACT: f32 = 36.0;
+
 /// What the keyboard surface is currently showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Layer {
@@ -199,6 +211,37 @@ impl Chrome {
     /// way in was.
     pub fn board_controls(&self) -> Vec<Control> {
         Control::ALL.iter().copied().filter(|c| c.home() == Home::Board).collect()
+    }
+
+    /// Height the top bar should take, given how many controls it must carry.
+    ///
+    /// ## Zero by default
+    ///
+    /// A keyboard's job is keys. The bar carried tray / settings / term /
+    /// dictate on every frame, costing vertical space the keys needed, for
+    /// controls most sessions never touch — and on a 380pt phone that space is
+    /// the difference between a comfortable row and a cramped one.
+    ///
+    /// So nothing is enabled by default and the bar is not drawn at all. Not a
+    /// thin strip: a bar with no controls in it is chrome advertising itself,
+    /// and the gesture surface that reaches the options layer does not need a
+    /// visible handle to exist.
+    ///
+    /// ## And SHRUNK, not full-size, once something is enabled
+    ///
+    /// When a feature is turned on the bar appears at [`BAR_H_COMPACT`], not
+    /// at the comfortable height a settings page would use. The reasoning is
+    /// that someone who enabled a top-bar feature wants the feature, not the
+    /// bar: they have already told us the keys matter more, by keeping the
+    /// other controls off.
+    ///
+    /// `enabled` is how many top-bar features the person switched on.
+    pub fn top_bar_height(enabled: usize) -> f32 {
+        if enabled == 0 {
+            0.0
+        } else {
+            BAR_H_COMPACT
+        }
     }
 
     /// Controls on the options layer. Empty while showing keys.
@@ -348,5 +391,34 @@ mod tests {
         assert!(Chrome::new().board_controls().contains(&Control::Settings));
         assert!(Control::Settings.needs_keys_visible(),
                 "the way in must not hide the thing you are configuring");
+    }
+
+    /// A KEYBOARD'S JOB IS KEYS. Nothing enabled means no bar at all -- not a
+    /// thin strip, which would be chrome advertising itself.
+    #[test]
+    fn the_top_bar_is_absent_until_a_feature_is_enabled() {
+        assert_eq!(Chrome::top_bar_height(0), 0.0);
+        assert!(Chrome::top_bar_height(1) > 0.0);
+    }
+
+    /// Someone who enabled a top-bar feature wants the FEATURE, not the bar --
+    /// they already said the keys matter more by leaving the rest off. So it
+    /// appears compact and stays compact however many they enable.
+    #[test]
+    fn the_bar_is_compact_and_does_not_grow_with_the_feature_count() {
+        let one = Chrome::top_bar_height(1);
+        assert_eq!(one, BAR_H_COMPACT);
+        for n in [2, 3, 9] {
+            assert_eq!(Chrome::top_bar_height(n), one, "{n} features changed the height");
+        }
+    }
+
+    /// Under the 44pt touch target on purpose: these are not primary controls,
+    /// and a bar matching the board's target would claim to be as important as
+    /// the keys.
+    #[test]
+    fn the_compact_bar_is_shorter_than_a_primary_touch_target() {
+        assert!(BAR_H_COMPACT < 44.0, "{BAR_H_COMPACT}");
+        assert!(BAR_H_COMPACT >= 32.0, "still hittable: {BAR_H_COMPACT}");
     }
 }
