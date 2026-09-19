@@ -5282,14 +5282,13 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                             let vals = match crate::mxfp4::dequant_mxfp4(src, 32) {
                                 Ok(v) => v, Err(_) => return,
                             };
-                            let amax = vals.iter().fold(0f32, |a, &v| a.max(v.abs()));
-                            let scale = if amax > 0.0 { amax * (1.0f32 / 127.0) } else { 1.0 };
-                            let inv = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
-                            qs_c[lr * kb + b] = scale;
+                            // blockquant::q8_block — the ONE int8 block. This site carried its own copy of the amax fold and the
+                            // round/clamp loop; four transcoders and the resident quantizer kept five copies matching to the
+                            // ULP by hand ("match the expression, not the arithmetic"). Same arithmetic, vectorizable, 2.7x.
                             let base = lr * k + b * 32;
-                            for (j, &v) in vals.iter().enumerate() {
-                                qb_c[base + j] = (v * inv).round().clamp(-127.0, 127.0) as i32 as i8;
-                            }
+                            let wb: &[f32; 32] = (&vals[..32]).try_into().unwrap();
+                            let qb: &mut [i8; 32] = (&mut qb_c[base..base + 32]).try_into().unwrap();
+                            qs_c[lr * kb + b] = crate::blockquant::q8_block(wb, qb);
                         }
                     }
                 });
@@ -5397,15 +5396,14 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                             // int8 residency is per-32, so one Q6_K super-block becomes 8 blocks.
                             for g in 0..8 {
                                 let grp = &vals[g * 32..(g + 1) * 32];
-                                let amax = grp.iter().fold(0f32, |a, &v| a.max(v.abs()));
-                                let scale = if amax > 0.0 { amax * (1.0f32 / 127.0) } else { 1.0 };
-                                let inv = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
+                                // blockquant::q8_block — the ONE int8 block. This site carried its own copy of the amax fold and the
+                                // round/clamp loop; four transcoders and the resident quantizer kept five copies matching to the
+                                // ULP by hand ("match the expression, not the arithmetic"). Same arithmetic, vectorizable, 2.7x.
                                 let blk = sb * 8 + g;
-                                qs_c[lr * kb + blk] = scale;
                                 let base = lr * k + blk * 32;
-                                for (j, &v) in grp.iter().enumerate() {
-                                    qb_c[base + j] = (v * inv).round().clamp(-127.0, 127.0) as i32 as i8;
-                                }
+                                let wb: &[f32; 32] = (&grp[..32]).try_into().unwrap();
+                                let qb: &mut [i8; 32] = (&mut qb_c[base..base + 32]).try_into().unwrap();
+                                qs_c[lr * kb + blk] = crate::blockquant::q8_block(wb, qb);
                             }
                         }
                     }
@@ -5482,20 +5480,18 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                                     let (dd, mm) = if half == 0 { (d1, mm1) } else { (d2, mm2) };
                                     let nibs: &[u8; 32] = q[qoff..qoff + 32].try_into().unwrap();
                                     crate::fmapath::q4k_group(&mut grp, nibs, half == 0, dd, mm);
-                                    let amax = grp.iter().fold(0f32, |a, &v| a.max(v.abs()));
-                                    // MULTIPLY BY THE RECIPROCAL, exactly as quantize_q8_resident
-                                    // does. amax / 127.0 differs from amax * (1/127.0) by one ULP,
-                                    // and the test caught it as 0.36060533 against 0.3606053 — the
-                                    // same one-ULP class gate-q4k found moving 297430 words. Match
-                                    // the expression, not the arithmetic.
-                                    let scale = if amax > 0.0 { amax * (1.0f32 / 127.0) } else { 1.0 };
-                                    let inv = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
+                                    // MULTIPLY BY THE RECIPROCAL, exactly as quantize_q8_resident does: amax / 127.0
+                                    // differs from amax * (1/127.0) by one ULP, and a test caught it as
+                                    // 0.36060533 against 0.3606053 — the one-ULP class gate-q4k found moving 297430
+                                    // words. That lesson now lives in ONE place:
+                                    // blockquant::q8_block — the ONE int8 block. This site carried its own copy of the amax fold and the
+                                    // round/clamp loop; four transcoders and the resident quantizer kept five copies matching to the
+                                    // ULP by hand ("match the expression, not the arithmetic"). Same arithmetic, vectorizable, 2.7x.
                                     let blk = sb * 8 + pair * 2 + half;
-                                    qs_c[lr * kb + blk] = scale;
                                     let base = lr * k + blk * 32;
-                                    for l in 0..32 {
-                                        qb_c[base + l] = (grp[l] * inv).round().clamp(-127.0, 127.0) as i32 as i8;
-                                    }
+                                    let wb: &[f32; 32] = (&grp[..32]).try_into().unwrap();
+                                    let qb: &mut [i8; 32] = (&mut qb_c[base..base + 32]).try_into().unwrap();
+                                    qs_c[lr * kb + blk] = crate::blockquant::q8_block(wb, qb);
                                 }
                                 qoff += 32; is += 2;
                             }
@@ -5558,18 +5554,14 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                                         let (dd, mm) = if half == 0 { (d1, mm1) } else { (d2, mm2) };
                                         grp[l] = dd.mul_add(v as f32, -mm);
                                     }
-                                    let amax = grp.iter().fold(0f32, |a, &v| a.max(v.abs()));
-                                    // Multiply by the reciprocal, matching quantize_q8_resident and
-                                    // the Q4_K path: amax/127.0 and amax*(1/127.0) differ by an ULP,
-                                    // and that ULP has already cost this codebase a gate.
-                                    let scale = if amax > 0.0 { amax * (1.0f32 / 127.0) } else { 1.0 };
-                                    let inv = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
+                                    // blockquant::q8_block — the ONE int8 block. This site carried its own copy of the amax fold and the
+                                    // round/clamp loop; four transcoders and the resident quantizer kept five copies matching to the
+                                    // ULP by hand ("match the expression, not the arithmetic"). Same arithmetic, vectorizable, 2.7x.
                                     let blk = sb * 8 + g * 2 + half;
-                                    qs_c[lr * kb + blk] = scale;
-                                    for l in 0..32 {
-                                        let q8 = (grp[l] * inv).round().clamp(-127.0, 127.0) as i8;
-                                        qb_c[lr * k + blk * 32 + l] = q8;
-                                    }
+                                    let base = lr * k + blk * 32;
+                                    let wb: &[f32; 32] = (&grp[..32]).try_into().unwrap();
+                                    let qb: &mut [i8; 32] = (&mut qb_c[base..base + 32]).try_into().unwrap();
+                                    qs_c[lr * kb + blk] = crate::blockquant::q8_block(wb, qb);
                                 }
                             }
                         }
@@ -23081,6 +23073,52 @@ mod q4k_int8_transcode {
         let raw = q4k(2, 7);
         assert!(gpu.q4_k_to_int8_resident(&raw, 1, 128).is_none(), "k must be a multiple of 256");
         assert!(gpu.q4_k_to_int8_resident(&raw[..16], 1, 256).is_none(), "short buffer must refuse");
+    }
+}
+
+#[cfg(test)]
+mod transcoders_place_their_codes {
+    use super::*;
+
+    /// THE CODES, not just the scales. `transcoding_matches_dequantise_then_quantise` and the Q6_K
+    /// slice-path test compare `.qs` only — so a transcoder that wrote every block of int8 codes one
+    /// block LATE passed the whole suite (a break test did exactly that to q4_k_to_int8_parts). These
+    /// are the main load path for a Q4_K_M file held int8-resident: gate/up through Q4_K, ffn_down
+    /// and the output matrix through Q6_K. Word-for-word against dequantize-then-quantize.
+    fn raw(ty: u32, blocks: usize, seed: u32) -> Vec<u8> {
+        let (bb, scales): (usize, &[usize]) = match ty { 12 => (144, &[0, 2]), 13 => (176, &[0, 2]), 14 => (210, &[208]), _ => unreachable!() };
+        let mut x = seed | 1;
+        let mut v: Vec<u8> = (0..blocks * bb).map(|_| { x = x.wrapping_mul(1664525).wrapping_add(1013904223); (x >> 24) as u8 }).collect();
+        for (b, blk) in v.chunks_mut(bb).enumerate() { for &o in scales { let h = 0x2800u16 + ((b * 37 + o * 5) % 0x0600) as u16; blk[o] = h as u8; blk[o + 1] = (h >> 8) as u8; } }
+        v
+    }
+
+    #[test]
+    fn every_k_quant_transcoder_writes_the_round_trips_codes_and_scales() {
+        let gpu = Gpu::new();
+        for (ty, name) in [(12u32, "Q4_K"), (13, "Q5_K"), (14, "Q6_K")] {
+            for (n, k, seed) in [(2usize, 256usize, 11u32), (3, 512, 22), (5, 768, 33)] {
+                let bytes = raw(ty, n * (k / 256), seed);
+                let f32s = crate::gguf::dequantize(ty, &bytes, n * k).expect("dequant");
+                let want = gpu.quantize_q8_resident(&f32s, n, k);
+                let got = match ty { 12 => gpu.q4_k_to_int8_resident(&bytes, n, k), 13 => gpu.q5_k_to_int8_resident(&bytes, n, k), _ => gpu.q6_k_to_int8_resident(&bytes, n, k) }
+                    .unwrap_or_else(|| panic!("{name} n={n} k={k}: transcoder refused"));
+                let (ws, gs) = (gpu.download(&want.qs), gpu.download(&got.qs));
+                let (ww, gw) = (gpu.download_words(&want.qw), gpu.download_words(&got.qw));
+                assert_eq!(ws.len(), gs.len(), "{name} n={n} k={k}: scale count");
+                assert_eq!(ww.len(), gw.len(), "{name} n={n} k={k}: code word count");
+                let bad_s = ws.iter().zip(&gs).filter(|(a, b)| (**a - **b).abs() > 1e-9 * a.abs().max(1.0)).count();
+                // A code may differ by ONE level where the transcoder's group arithmetic and
+                // gguf::dequantize land an ULP apart on an exact .5 tie; anything else is misplacement.
+                let (mut off_by_one, mut worse) = (0usize, 0usize);
+                for (a, b) in ww.iter().zip(&gw) { for sh in [0, 8, 16, 24] {
+                    let (x, y) = (((a >> sh) & 0xFF) as u8 as i8 as i32, ((b >> sh) & 0xFF) as u8 as i8 as i32);
+                    match (x - y).abs() { 0 => {}, 1 => off_by_one += 1, _ => worse += 1 }
+                } }
+                assert!(bad_s == 0 && worse == 0 && off_by_one * 1000 <= n * k,
+                    "{name} n={n} k={k}: {bad_s} scales differ, {worse} codes differ by more than one level, {off_by_one} by exactly one (of {})", n * k);
+            }
+        }
     }
 }
 
