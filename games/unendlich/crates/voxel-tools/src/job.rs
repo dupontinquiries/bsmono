@@ -450,7 +450,13 @@ mod tests {
         j.record(0, 10, &[id("oak_log")], Some(([0, 0, 0], [4, 10, 4])));
         j.record(1, 10, &[id("leaves")], Some(([-6, 8, -6], [10, 22, 10])));
         let r = j.readback();
-        assert!(r.contains("-6,8,-6 to 10,22,10"), "{r}");
+        // The UNION of both pieces. This expected "-6,8,-6", which is the
+        // second piece's own minimum -- the opposite of what the doc comment
+        // above says and of what `record` (correctly) does. The test had
+        // never run: one untyped literal elsewhere stopped the target
+        // compiling. The code was right; the expectation was not.
+        assert!(r.contains("extent: -6,0,-6 to 10,22,10"), "{r}");
+        assert!(!r.contains("-6,8,-6"), "that would be the LAST piece, not the whole object: {r}");
     }
 
     /// The job's parts and the scheme's roles must be the same list, or a
