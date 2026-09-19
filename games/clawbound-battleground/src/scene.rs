@@ -459,6 +459,8 @@ impl Scene {
         // back through where they were. A stalking cat contributes ~nothing.
         vfx.puppets.trail(dt);
         r.brushes = vfx.puppets.brushes();
+        (r.blast_a, r.blast_b) = vfx.ground.blast_uniform();
+        r.cracks = vfx.ground.crack_uniform();
         vfx.puppet_events(&pevents);
         vfx.puppets.events = pevents;
 

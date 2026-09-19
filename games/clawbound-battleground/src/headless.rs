@@ -465,6 +465,10 @@ pub fn run_rig_sheet() -> Result<(), String> {
     }
     // The authored centre from above: the Hollow, and a run either side of the lane.
     shots.push(Shot { name: "map_centre.png", eye: Vec3::new(0.0, 62.0, -46.0), look: Vec3::new(0.0, 0.0, 8.0) });
+    // A strike in the Hollow, a third of a second on: the front is among the
+    // trees, the ground is freshly broken, and an older crack beside it is
+    // half healed. Gameplay camera distance, so the fitted shadow box is tight.
+    shots.push(Shot { name: "fx_blast.png", eye: Vec3::new(-21.0, 8.0, -1.0), look: Vec3::new(-9.0, 0.6, 10.0) });
     println!("wall at {wall:?}");
     // CLAWBOUND_SHEET=wall,sig_0 renders only the shots whose names match.
     let only: Vec<String> = std::env::var("CLAWBOUND_SHEET").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default();
@@ -519,6 +523,23 @@ pub fn run_rig_sheet() -> Result<(), String> {
                     let g = &mut game.gods[0];
                     g.yaw = dir.z.atan2(dir.x);
                     g.pos = a - dir * 1.2 + dir * (step as f32 * (2.0 / 60.0));
+                }
+                k if shots[k].name == "fx_blast.png" => {
+                    for gi in 1..game.gods.len() {
+                        game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
+                    }
+                    game.gods[0].pos = Vec3::new(-15.5, 0.0, 8.0);
+                    game.gods[0].yaw = 1.9;
+                    if left == 40 {
+                        // an old break, then a downpour's worth of healing
+                        vfx.ground.strike(Vec3::new(-13.0, 0.0, 3.5), 4.0, 1.0);
+                        for _ in 0..36 {
+                            vfx.ground.tick(0.25, 1.0, 1.0);
+                        }
+                    }
+                    if left == 20 {
+                        vfx.quake(Vec3::new(-10.5, 0.0, 12.0), 6.0, 1.0);
+                    }
                 }
                 k if shots[k].name == "map_centre.png" => {
                     for gi in 0..game.gods.len() {
@@ -599,6 +620,14 @@ pub fn run_rig_sheet() -> Result<(), String> {
         if std::env::var("CLAWBOUND_NO_BRUSH").is_ok() {
             renderer.brushes.clear();
         }
+        // CLAWBOUND_NO_FX=1: the same frame with no blast, cracks or shafts.
+        if std::env::var("CLAWBOUND_NO_FX").is_ok() {
+            renderer.blast_a = Default::default();
+            renderer.blast_b = Default::default();
+            renderer.cracks = Default::default();
+            renderer.shaft_steps = 0;
+        }
+        println!("blasts: {:?}  cracks open: {:?}", renderer.blast_b.iter().map(|b| (b[0] * 100.0).round() / 100.0).collect::<Vec<_>>(), renderer.cracks.iter().filter(|c| c[3] > 0.0).map(|c| (c[3] * 100.0).round() / 100.0).collect::<Vec<_>>());
         println!("brushes this frame: {:?}", renderer.brushes.iter().map(|b| (b[3] * 100.0).round() / 100.0).collect::<Vec<_>>());
         renderer.atmosphere = game.weather.atmosphere();
         renderer.render_frame(&view, cam, 1.0);

@@ -42,6 +42,12 @@ pub struct FrameUniform {
     /// the shorter struct, which is legal because no layout sets a
     /// min_binding_size.
     pub brush: [[f32; 4]; crate::puppet::MAX_BRUSHES],
+    /// Blast fronts: a = xyz centre + ring radius, b = strength, width.
+    /// voxel.wgsl (trees shudder as the ring passes).
+    pub blast_a: [[f32; 4]; crate::groundfx::MAX_BLASTS],
+    pub blast_b: [[f32; 4]; crate::groundfx::MAX_BLASTS],
+    /// Broken ground: x, z, radius, how open. terrain.wgsl.
+    pub cracks: [[f32; 4]; crate::groundfx::MAX_CRACKS],
 }
 
 #[repr(C)]
@@ -138,6 +144,14 @@ pub struct Renderer {
     pub atmosphere: crate::weather::Atmosphere,
     /// Set by the scene each frame from `puppet::Troupe::brushes`.
     pub brushes: Vec<[f32; 4]>,
+    /// Set by the scene each frame from `groundfx::GroundFx`.
+    pub blast_a: [[f32; 4]; crate::groundfx::MAX_BLASTS],
+    pub blast_b: [[f32; 4]; crate::groundfx::MAX_BLASTS],
+    pub cracks: [[f32; 4]; crate::groundfx::MAX_CRACKS],
+    /// Shadow-map samples marched per fragment for light shafts through the
+    /// canopy. 0 turns them off: on a handset GPU this is the first thing to
+    /// give up, and the screen-space shafts toward the sun remain.
+    pub shaft_steps: u32,
     /// (flood rise, quake shake, fire glow) — set by the caller (disasters.rs).
     pub event: (f32, f32, f32),
 }
@@ -591,7 +605,7 @@ impl Renderer {
 
         let post_params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("post params"),
-            size: 48,
+            size: 48 + 16 * crate::groundfx::MAX_RINGS as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -648,6 +662,16 @@ impl Renderer {
             exposure: 0.92,
             atmosphere: crate::weather::Weather::new().atmosphere(),
             brushes: Vec::new(),
+            blast_a: Default::default(),
+            blast_b: Default::default(),
+            cracks: Default::default(),
+            // OFF. Both tunings tried so far turned the far field milky rather
+            // than drawing shafts: under this jungle's canopy almost every
+            // view ray is half-occluded, so the term fires everywhere, and 8
+            // jittered samples average to glow. Measured on one frame: top
+            // fifth of the image +19% and then +25% luma against the same
+            // frame without. Kept behind the knob; see TODO.md.
+            shaft_steps: 0,
             event: (0.0, 0.0, 0.0),
         };
         r.resize(width, height);
@@ -792,9 +816,11 @@ impl Renderer {
         // with the weather (night sinks it), so the light matrix follows.
         let atm = self.atmosphere;
         let sun = atm.sun_dir.normalize();
-        let light_view = Mat4::look_at_rh(sun * 130.0 + Vec3::new(0.0, 0.0, 0.0), Vec3::ZERO, Vec3::Y);
-        let light_proj = Mat4::orthographic_rh(-150.0, 150.0, -150.0, 150.0, 1.0, 320.0);
-        let lvp = light_proj * light_view;
+        // The one shadow map used to cover a fixed 300 u box: 0.146 u per
+        // texel, a third of a voxel, so every shadow was a blob. It is now
+        // aimed at what the camera is looking at and sized to the view.
+        let half = crate::groundfx::shadow_half_extent(cam.eye.distance(cam.target));
+        let lvp = crate::groundfx::fit_shadow(cam.target, sun, half, SHADOW_SIZE);
 
         let fog_color = [atm.fog_color[0], atm.fog_color[1], atm.fog_color[2], 1.0];
         let frame = FrameUniform {
@@ -808,8 +834,11 @@ impl Renderer {
             sun_col: [atm.sun_col[0], atm.sun_col[1], atm.sun_col[2], atm.cloud_cover],
             weather: [atm.rain, atm.snow, atm.wetness, atm.lightning],
             wind: [atm.wind.x, atm.wind.y, atm.wind.z, atm.gust],
-            event: [self.event.0, self.event.1, self.event.2, 0.0],
+            event: [self.event.0, self.event.1, self.event.2, self.shaft_steps as f32],
             brush: self.brush_uniform(),
+            blast_a: self.blast_a,
+            blast_b: self.blast_b,
+            cracks: self.cracks,
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 
@@ -834,6 +863,7 @@ impl Renderer {
         if !self.particles.is_empty() {
             self.queue.write_buffer(&self.particle_buf, 0, bytemuck::cast_slice(&self.particles));
         }
+        let mut post_data: Vec<f32> = Vec::with_capacity(12 + 4 * crate::groundfx::MAX_RINGS);
         self.queue.write_buffer(
             &self.post_params,
             0,
@@ -852,7 +882,10 @@ impl Renderer {
                 } else {
                     ([0.5, 0.5], 0.0)
                 };
-                bytemuck::cast_slice(&[
+                let cam_right = (cam.target - cam.eye).cross(Vec3::Y);
+                let rings = crate::groundfx::screen_rings(&self.blast_a, &self.blast_b, vp, cam_right, aspect);
+                post_data.clear();
+                post_data.extend_from_slice(&[
                     self.exposure * (1.0 + atm.night * 0.35),
                     0.55 + atm.night * 0.2,
                     time,
@@ -860,12 +893,17 @@ impl Renderer {
                     0.55 + atm.night * 0.3,
                     atm.night,
                     atm.rain,
-                    0.0f32,
+                    // heat shimmer: fire near the camera (the wildfire's glow)
+                    self.event.2.clamp(0.0, 1.0),
                     sun_uv[0],
                     sun_uv[1],
                     ray,
                     0.22,
-                ])
+                ]);
+                for r in rings {
+                    post_data.extend_from_slice(&r);
+                }
+                bytemuck::cast_slice(&post_data)
             },
         );
 
@@ -1081,6 +1119,9 @@ impl Renderer {
             wind: [0.0; 4],
             event: [0.0; 4],
             brush: self.brush_uniform(),
+            blast_a: self.blast_a,
+            blast_b: self.blast_b,
+            cracks: self.cracks,
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 

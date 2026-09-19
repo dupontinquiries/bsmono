@@ -11,8 +11,11 @@ struct FrameData {
     sun_col: vec4<f32>,  // rgb sun colour*intensity, w cloud cover
     weather: vec4<f32>,  // x rain, y snow, z wetness, w lightning
     wind: vec4<f32>,     // xyz wind (u/s), w gust front 0..1
-    event: vec4<f32>,    // x flood rise, y quake shake, z fire glow, w unused
+    event: vec4<f32>,    // x flood rise, y quake shake, z fire glow, w shaft steps
     brush: array<vec4<f32>, 8>, // xyz where a cat is shouldering through, w how hard (signed)
+    blast_a: array<vec4<f32>, 4>, // xyz centre, w ring radius
+    blast_b: array<vec4<f32>, 4>, // x strength, y width
+    cracks: array<vec4<f32>, 8>,  // x, z, radius, how open
 };
 
 fn hash21(p: vec2<f32>) -> f32 {
@@ -85,6 +88,54 @@ struct VSOut {
     @location(5) emissive: f32,
 };
 
+// Light shafts THROUGH the canopy. The post pass already smears bright pixels
+// toward the sun, which only works with the sun in frame and knows nothing of
+// the trees. This marches the view ray through the shadow map instead: air in
+// a gap is lit, air under a crown is not, and the difference is the shaft.
+// No new bindings -- the shadow map and the light matrix are already here.
+// `frame.event.w` is the step count; 0 is off, for GPUs that cannot afford it.
+fn shaft_light(world: vec3<f32>) -> f32 {
+    let steps = i32(frame.event.w);
+    if (steps <= 0) {
+        return 0.0;
+    }
+    let cam = frame.cam_pos.xyz;
+    let seg = world - cam;
+    let full = length(seg);
+    let len = min(full, 70.0);
+    let dir = seg / max(full, 0.001);
+    // Dither the start so eight steps band as noise, not as stripes.
+    let jitter = hash21(world.xz * 3.7 + vec2(frame.params.x * 5.0, world.y));
+    var lit = 0.0;
+    for (var i = 0; i < steps; i = i + 1) {
+        let p = cam + dir * ((f32(i) + jitter) / f32(steps) * len);
+        let sp = frame.light_view_proj * vec4(p, 1.0);
+        let uv = sp.xy * vec2(0.5, -0.5) + vec2(0.5);
+        var s = 1.0; // outside the map is open sky
+        if (uv.x > 0.0 && uv.x < 1.0 && uv.y > 0.0 && uv.y < 1.0 && sp.z < 1.0) {
+            s = textureSampleCompareLevel(shadow_map, shadow_sampler, uv, sp.z - 0.003);
+        }
+        lit = lit + s;
+    }
+    // Forward scattering: shafts are brightest looking toward the sun.
+    let toward = max(dot(dir, normalize(frame.sun_dir.xyz)), 0.0);
+    let phase = 0.25 + 0.75 * toward * toward * toward;
+    // A shaft is CONTRAST, not light. Returning the lit fraction itself added
+    // glow to every sunlit column of air, which is haze: a with/without split
+    // of one frame showed the whole far field gone milky. Open air (f = 1) and
+    // deep shade (f = 0) both contribute nothing; a column the canopy breaks
+    // up contributes most.
+    let f = lit / f32(steps);
+    return 4.0 * f * (1.0 - f) * (len / 70.0) * phase;
+}
+
+// The fitted shadow box ends somewhere. Fade to "lit" over its last tenth so
+// the edge is a gradient on the ground and not a line.
+fn shadow_edge(uv: vec2<f32>) -> f32 {
+    let m = max(abs(uv.x - 0.5), abs(uv.y - 0.5)) * 2.0;
+    return smoothstep(0.88, 0.99, m);
+}
+
 // A cat going through the flora. Same rule as the wind -- `sway` is the
 // piece's weight, the base stays planted, the tips move most -- but local:
 // leaves lean AWAY from each brush, and only leaves near the cat's own height,
@@ -126,13 +177,45 @@ fn brush_offset(world: vec3<f32>, local_y: f32, sway: f32) -> vec3<f32> {
     return o;
 }
 
+// A blast front going through the forest. Unlike the brush this moves
+// EVERYTHING that sways, trees included -- but by the wind's own rule, height
+// squared, so trunks stay planted and crowns whip. The ring has a leading
+// push and a trailing pull, so a tree leans away and then rocks back as the
+// front passes it, and the wave is seen to travel.
+fn blast_offset(world: vec3<f32>, local_y: f32, sway: f32) -> vec3<f32> {
+    if (sway <= 0.0) {
+        return vec3(0.0);
+    }
+    var o = vec3(0.0);
+    let h = max(local_y, 0.0);
+    for (var i = 0; i < 4; i = i + 1) {
+        let s = frame.blast_b[i].x;
+        if (s < 0.003) {
+            continue;
+        }
+        let c = frame.blast_a[i];
+        let d = world.xz - c.xz;
+        let dist = length(d);
+        let x = (dist - c.w) / frame.blast_b[i].y;
+        if (abs(x) > 3.0) {
+            continue;
+        }
+        // derivative-of-gaussian: out ahead of the front, back behind it
+        let wave = -x * exp(-x * x) * 2.3 + exp(-x * x) * 0.6;
+        let away = d / max(dist, 0.1);
+        let amt = s * wave * min(h * h * 0.035, 1.6) * min(sway, 2.6);
+        o = o + vec3(away.x * amt, -abs(amt) * 0.25, away.y * amt);
+    }
+    return o;
+}
+
 @vertex
 fn vs_main(in: VSIn) -> VSOut {
     let d = draws[0]; // dynamic offset selects this draw
     let voxel = d.params.y * in.misc.x;
     let local = in.pos * voxel + in.off_ao.xyz;
     var world = d.model * vec4<f32>(local, 1.0);
-    world = vec4(world.xyz + wind_offset(world.xyz, in.off_ao.y, in.misc.y) + brush_offset(world.xyz, in.off_ao.y, in.misc.y), 1.0);
+    world = vec4(world.xyz + wind_offset(world.xyz, in.off_ao.y, in.misc.y) + brush_offset(world.xyz, in.off_ao.y, in.misc.y) + blast_offset(world.xyz, in.off_ao.y, in.misc.y), 1.0);
     let nrm = normalize((d.model * vec4<f32>(in.normal, 0.0)).xyz);
     var out: VSOut;
     out.clip = frame.view_proj * world;
@@ -169,7 +252,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     uv + vec2(f32(i), f32(j)) * 0.0012, sp.z - bias);
             }
         }
-        shadow = s / 9.0;
+        shadow = mix(s / 9.0, 1.0, shadow_edge(uv));
     }
 
     // --- lighting model ----------------------------------------------------
@@ -224,6 +307,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let lum = dot(albedo, vec3(0.299, 0.587, 0.114));
     let haze = frame.fog_color.xyz * (0.45 + 0.55 * lum);
     lit = mix(lit, haze, fog * 0.9);
+    lit = lit + frame.sun_col.xyz * shaft_light(in.world) * 0.42 * (1.0 - frame.params.w);
     // emissive glow (crystals, projectiles, VFX)
     lit = lit + albedo * in.emissive * (1.0 - fog * 0.4);
 

@@ -11,7 +11,11 @@ struct FrameData {
     sun_col: vec4<f32>,  // rgb sun colour*intensity, w cloud cover
     weather: vec4<f32>,  // x rain, y snow, z wetness, w lightning
     wind: vec4<f32>,
-    event: vec4<f32>,    // x flood rise, y quake shake, z fire glow, w unused
+    event: vec4<f32>,    // x flood rise, y quake shake, z fire glow, w shaft steps
+    brush: array<vec4<f32>, 8>, // xyz where a cat is shouldering through, w how hard (signed)
+    blast_a: array<vec4<f32>, 4>, // xyz centre, w ring radius
+    blast_b: array<vec4<f32>, 4>, // x strength, y width
+    cracks: array<vec4<f32>, 8>,  // x, z, radius, how open
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameData;
@@ -111,6 +115,101 @@ fn vs_main(in: VSIn) -> VSOut {
     return out;
 }
 
+// Light shafts THROUGH the canopy. The post pass already smears bright pixels
+// toward the sun, which only works with the sun in frame and knows nothing of
+// the trees. This marches the view ray through the shadow map instead: air in
+// a gap is lit, air under a crown is not, and the difference is the shaft.
+// No new bindings -- the shadow map and the light matrix are already here.
+// `frame.event.w` is the step count; 0 is off, for GPUs that cannot afford it.
+fn shaft_light(world: vec3<f32>) -> f32 {
+    let steps = i32(frame.event.w);
+    if (steps <= 0) {
+        return 0.0;
+    }
+    let cam = frame.cam_pos.xyz;
+    let seg = world - cam;
+    let full = length(seg);
+    let len = min(full, 70.0);
+    let dir = seg / max(full, 0.001);
+    // Dither the start so eight steps band as noise, not as stripes.
+    let jitter = hash21(world.xz * 3.7 + vec2(frame.params.x * 5.0, world.y));
+    var lit = 0.0;
+    for (var i = 0; i < steps; i = i + 1) {
+        let p = cam + dir * ((f32(i) + jitter) / f32(steps) * len);
+        let sp = frame.light_view_proj * vec4(p, 1.0);
+        let uv = sp.xy * vec2(0.5, -0.5) + vec2(0.5);
+        var s = 1.0; // outside the map is open sky
+        if (uv.x > 0.0 && uv.x < 1.0 && uv.y > 0.0 && uv.y < 1.0 && sp.z < 1.0) {
+            s = textureSampleCompareLevel(shadow_map, shadow_sampler, uv, sp.z - 0.003);
+        }
+        lit = lit + s;
+    }
+    // Forward scattering: shafts are brightest looking toward the sun.
+    let toward = max(dot(dir, normalize(frame.sun_dir.xyz)), 0.0);
+    let phase = 0.25 + 0.75 * toward * toward * toward;
+    // A shaft is CONTRAST, not light. Returning the lit fraction itself added
+    // glow to every sunlit column of air, which is haze: a with/without split
+    // of one frame showed the whole far field gone milky. Open air (f = 1) and
+    // deep shade (f = 0) both contribute nothing; a column the canopy breaks
+    // up contributes most.
+    let f = lit / f32(steps);
+    return 4.0 * f * (1.0 - f) * (len / 70.0) * phase;
+}
+
+// The fitted shadow box ends somewhere. Fade to "lit" over its last tenth so
+// the edge is a gradient on the ground and not a line.
+fn shadow_edge(uv: vec2<f32>) -> f32 {
+    let m = max(abs(uv.x - 0.5), abs(uv.y - 0.5)) * 2.0;
+    return smoothstep(0.88, 0.99, m);
+}
+
+// Shattered ground: the edges of a cell pattern, strongest at the impact and
+// fading to its rim. `open` runs 1 -> 0 as it heals: the cracks NARROW first
+// (soil swelling shut, fastest in rain -- see groundfx.rs), and what is left
+// behind is darker, damper earth that fades last.
+fn cell_edge(p: vec2<f32>) -> f32 {
+    let ip = floor(p);
+    let fp = fract(p);
+    var d1 = 8.0;
+    var d2 = 8.0;
+    for (var j = -1; j <= 1; j = j + 1) {
+        for (var i = -1; i <= 1; i = i + 1) {
+            let g = vec2(f32(i), f32(j));
+            let o = vec2(hash21(ip + g), hash21(ip + g + vec2(17.3, 5.1)));
+            let d = length(g + o - fp);
+            if (d < d1) {
+                d2 = d1;
+                d1 = d;
+            } else if (d < d2) {
+                d2 = d;
+            }
+        }
+    }
+    return d2 - d1; // ~0 on an edge between two cells
+}
+
+fn cracked(p: vec2<f32>) -> vec2<f32> {
+    var dark = 0.0;
+    var damp = 0.0;
+    for (var i = 0; i < 8; i = i + 1) {
+        let c = frame.cracks[i];
+        if (c.w <= 0.002) {
+            continue;
+        }
+        let d = distance(p, c.xy);
+        if (d >= c.z) {
+            continue;
+        }
+        let fall = 1.0 - d / c.z;
+        let e = cell_edge(p * 0.85 + c.xy * 0.31);
+        let width = (0.015 + 0.11 * c.w) * (0.4 + 0.6 * fall);
+        let line = 1.0 - smoothstep(0.0, width, e);
+        dark = max(dark, line * smoothstep(0.0, 0.3, c.w) * smoothstep(0.0, 0.2, fall));
+        damp = max(damp, (1.0 - c.w) * fall * 0.35 + c.w * fall * fall * 0.25);
+    }
+    return vec2(dark, damp);
+}
+
 @fragment
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let cam_d = distance(in.world, frame.cam_pos.xyz);
@@ -132,7 +231,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     uv + vec2(f32(i), f32(j)) * 0.0010, sp.z - bias);
             }
         }
-        shadow = s / 9.0;
+        shadow = mix(s / 9.0, 1.0, shadow_edge(uv));
     }
 
     let night = frame.params.w;
@@ -157,6 +256,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let pud = smoothstep(0.55, 0.8, hash21(floor(in.world.xz * 0.35)) * 0.5 + 0.5 * hash21(floor(in.world.xz * 0.9 + 3.1)));
     let wetness = wet * (0.55 + 0.45 * pud);
     var albedo = in.color * det.x * (1.0 - 0.32 * wetness);
+    let broken = cracked(in.world.xz);
+    albedo = albedo * (1.0 - 0.45 * broken.y) * (1.0 - 0.9 * broken.x);
     // snow cover settles on up-facing ground, patchy by the same noise as the puddles
     let snow = frame.weather.y;
     let snow_cov = snow * smoothstep(0.35, 0.9, N.y) * (0.6 + 0.4 * (1.0 - pud));
@@ -170,5 +271,6 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let lum = dot(in.color, vec3(0.299, 0.587, 0.114));
     let haze = frame.fog_color.xyz * (0.45 + 0.55 * lum);
     lit = mix(lit, haze, fog * 0.9);
+    lit = lit + frame.sun_col.xyz * shaft_light(in.world) * 0.42 * (1.0 - frame.params.w);
     return vec4(lit, 1.0);
 }

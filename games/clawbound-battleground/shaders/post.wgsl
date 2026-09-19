@@ -5,8 +5,9 @@
 @group(0) @binding(1) var samp: sampler;
 struct PostParams {
     a: vec4<f32>, // exposure, vignette, time, lightning
-    b: vec4<f32>, // bloom strength, night, rain, unused
+    b: vec4<f32>, // bloom strength, night, rain, heat
     c: vec4<f32>, // sun screen x, sun screen y (uv), ray strength, contrast
+    rings: array<vec4<f32>, 8>, // blast fronts on screen: u, v, radius (v-units), strength
 };
 @group(0) @binding(2) var<uniform> pp: PostParams;
 
@@ -47,7 +48,33 @@ fn bright(c: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let params = pp.a;
-    var col = textureSample(hdr, samp, in.uv).rgb;
+    // --- the air moving. A blast front is denser air: it bends what is seen
+    // through it, outward, in a thin band at the ring. Heat does the same
+    // thing gently and everywhere at once, rising. Both are one UV offset
+    // applied before anything is sampled, so bloom and shafts bend with it.
+    var bend = vec2(0.0);
+    let aspect = f32(textureDimensions(hdr).x) / f32(textureDimensions(hdr).y);
+    for (var i = 0; i < 8; i = i + 1) {
+        let r = pp.rings[i];
+        if (r.w <= 0.002) {
+            continue;
+        }
+        let d = (in.uv - r.xy) * vec2(aspect, 1.0);
+        let dist = length(d);
+        let x = (dist - r.z) / (0.018 + r.z * 0.10);
+        if (abs(x) < 3.0) {
+            // push pixels outward ahead of the front, pull behind it
+            bend = bend - (d / max(dist, 0.001)) * vec2(1.0 / aspect, 1.0) * (-x * exp(-x * x)) * r.w * 0.030;
+        }
+    }
+    let heat = pp.b.w;
+    if (heat > 0.002) {
+        let t = pp.a.z;
+        let wob = sin(in.uv.y * 95.0 - t * 6.5 + sin(in.uv.x * 40.0 + t * 2.0) * 1.7);
+        bend = bend + vec2(wob * 0.0022, 0.0) * heat * smoothstep(0.0, 0.5, 1.0 - in.uv.y + 0.2);
+    }
+    let uv0 = clamp(in.uv + bend, vec2(0.001), vec2(0.999));
+    var col = textureSample(hdr, samp, uv0).rgb;
 
     // --- single-pass bloom: a 12-tap ring at two radii, weighted to a soft disc.
     // Cheap enough for a phone GPU; the MSAA resolve already softened the source.
@@ -56,8 +83,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     for (var i: i32 = 0; i < 12; i = i + 1) {
         let a = f32(i) * 0.5236;
         let dir = vec2(cos(a), sin(a));
-        glow = glow + bright(textureSample(hdr, samp, in.uv + dir * texel * 3.0).rgb) * 0.6;
-        glow = glow + bright(textureSample(hdr, samp, in.uv + dir * texel * 7.5).rgb) * 0.4;
+        glow = glow + bright(textureSample(hdr, samp, uv0 + dir * texel * 3.0).rgb) * 0.6;
+        glow = glow + bright(textureSample(hdr, samp, uv0 + dir * texel * 7.5).rgb) * 0.4;
     }
     glow = glow / 12.0;
     col = col + glow * pp.b.x;

@@ -60,6 +60,8 @@ pub struct Vfx {
     /// The ancestors' bodies: gait, posture, strikes, leaps. Advanced by
     /// `Scene::draw`, which is where the rigs and the world probe are.
     pub puppets: crate::puppet::Troupe,
+    /// Blast fronts and broken ground. Ticked here, where the weather is.
+    pub ground: crate::groundfx::GroundFx,
 }
 
 /// A handful of small birds pecking at a jungle spot. When flushed they burst
@@ -130,6 +132,8 @@ impl Vfx {
 
     pub fn update(&mut self, dt: f32, events: &[Event], game: &Game) {
         self.time += dt;
+        let atm = game.weather.atmosphere();
+        self.ground.tick(dt, atm.rain, atm.wetness);
         if !self.seeded {
             self.seed_ambient();
         }
@@ -271,6 +275,7 @@ impl Vfx {
                     }
                 }
                 Event::Explosion { pos, radius, color } => {
+                    self.quake(*pos, *radius, (*radius / 6.0).clamp(0.2, 1.0));
                     let n = (*radius * 10.0).min(90.0) as usize;
                     for i in 0..n {
                         let a = i as f32 / n as f32 * std::f32::consts::TAU;
@@ -291,6 +296,7 @@ impl Vfx {
                     }
                 }
                 Event::NovaFx { pos, radius, color } => {
+                    self.quake(*pos, *radius * 0.6, (*radius / 9.0).clamp(0.2, 0.9));
                     self.rings.push(Ring { pos: *pos, r0: 0.5, r1: *radius, until: 0.55, dur: 0.55, color: *color, thick: 0.45 });
                     for _ in 0..(*radius * 4.0).min(60.0) as usize {
                         self.spawn_spark(*pos + Vec3::Y * 0.8, *color, 3.0);
@@ -494,6 +500,11 @@ impl Vfx {
                     }
                 }
                 Event::FissureOpen { a, b } => {
+                    // An earthquake's fissure breaks the ground along its length.
+                    for k in 0..3 {
+                        let at = a.lerp(*b, (k as f32 + 0.5) / 3.0);
+                        self.ground.strike(at, 5.0, 1.0);
+                    }
                     // dust and shards thrown up along the tear
                     let n = ((*b - *a).length() * 2.0) as usize;
                     for i in 0..n {
@@ -583,6 +594,43 @@ impl Vfx {
         }
     }
 
+    /// Something hit the ground: a blast front through the trees, and if it
+    /// was hard enough, broken earth and the dust that comes off it.
+    pub fn quake(&mut self, pos: Vec3, radius: f32, power: f32) {
+        let broke = self.ground.strike(pos, radius, power);
+        // Dust rides low and hangs; a few stones go up and come straight
+        // down. Sandy on a lane, dark soil in the jungle.
+        let on_lane = crate::consts::lane_clearance(pos.x, pos.z) < 4.5;
+        let soil = if on_lane { [0.62, 0.55, 0.42] } else { [0.30, 0.24, 0.17] };
+        let n = ((8.0 + radius * 5.0) * power) as usize;
+        for i in 0..n.min(48) {
+            let a = i as f32 / n.max(1) as f32 * std::f32::consts::TAU + self.perturb(0.4);
+            let r = radius * (0.35 + self.perturb(0.3).abs());
+            let out = 2.0 + radius * 0.9 * power + self.perturb(1.0).abs();
+            let shade = 0.85 + self.perturb(0.15);
+            let up = 0.5 + self.perturb(0.5).abs();
+            self.particles.push(Particle {
+                pos: Vec3::new(pos.x + a.cos() * r, 0.15, pos.z + a.sin() * r),
+                vel: Vec3::new(a.cos() * out, up, a.sin() * out),
+                life: 1.4, max_life: 1.4, size: 0.34,
+                color: [soil[0] * shade, soil[1] * shade, soil[2] * shade], alpha: 0.5, gravity: 0.4, drag: 2.6,
+            });
+        }
+        if broke {
+            for i in 0..14 {
+                let a = i as f32 * 0.449 * std::f32::consts::TAU;
+                let v = 1.5 + self.perturb(1.5).abs();
+                let up = 5.0 + self.perturb(3.0).abs() * power;
+                self.particles.push(Particle {
+                    pos: Vec3::new(pos.x + a.cos() * radius * 0.4, 0.1, pos.z + a.sin() * radius * 0.4),
+                    vel: Vec3::new(a.cos() * v, up, a.sin() * v),
+                    life: 0.9, max_life: 0.9, size: 0.15,
+                    color: [soil[0] * 0.6, soil[1] * 0.6, soil[2] * 0.6], alpha: 1.0, gravity: 20.0, drag: 0.3,
+                });
+            }
+        }
+    }
+
     /// What the bodies did to the world this frame: leaves knocked loose,
     /// water shaken off, dust from a slammed paw.
     pub fn puppet_events(&mut self, events: &[crate::puppet::PuppetEvent]) {
@@ -618,6 +666,7 @@ impl Vfx {
                     }
                 }
                 E::PawSlam { pos } => {
+                    self.ground.strike(pos, 1.6, 0.5);
                     for i in 0..14 {
                         let a = i as f32 / 14.0 * std::f32::consts::TAU;
                         self.particles.push(Particle {
