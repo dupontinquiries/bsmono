@@ -63,6 +63,8 @@ pub struct LanLobby {
     /// Kept alive while a bsgames handoff session is: dropping it would stop
     /// the DHT announcement.
     mp: Option<netcode::multiplayer::Multiplayer>,
+    /// What the bsgames handoff came to, shown above the status line.
+    pub handoff_note: Option<String>,
     pub rows: Vec<Row>,
     /// One line for the screen's footer: what is going on, or what is wrong.
     pub status: String,
@@ -85,7 +87,7 @@ impl LanLobby {
             }
         });
         let status = browser.as_ref().err().cloned().unwrap_or_else(|| "Searching the local network...".into());
-        LanLobby { my_name: my_name.into(), my_id, browser, announcer: None, hosting: false, game_sock: None, roster: Vec::new(), joined: None, join_sock: None, last_hello: None, mp: None, rows: Vec::new(), status }
+        LanLobby { my_name: my_name.into(), my_id, browser, announcer: None, hosting: false, game_sock: None, roster: Vec::new(), joined: None, join_sock: None, last_hello: None, mp: None, handoff_note: None, rows: Vec::new(), status }
     }
 
     pub fn port(&self) -> Option<u16> {
@@ -138,6 +140,28 @@ impl LanLobby {
         self.mp = Some(mp);
         self.join(addr);
         Ok(addr)
+    }
+
+    /// What a bsgames handoff becomes: a den, hosted or joined, with the
+    /// outcome in `status` either way. It never fails outright -- if the
+    /// friend cannot be resolved, the player is left on the LAN screen with
+    /// the reason in words and can still find the den by browsing, which is
+    /// better than the solo match they used to be dropped into.
+    pub fn open_for_handoff(hosting: bool, peer: Option<&str>, mp: netcode::multiplayer::Multiplayer, port: u16) -> LanLobby {
+        let mut l = LanLobby::open_on(&mp.me.name.clone(), port);
+        let outcome = if hosting {
+            l.host_for_handoff(mp).map(|token| format!("Hosting for your friends as {token}."))
+        } else {
+            match peer {
+                Some(id) => l.join_for_handoff(mp, id).map(|a| format!("Joining {id} at {a}...")),
+                None => Err("bsgames asked to join, but did not say whom.".into()),
+            }
+        };
+        l.handoff_note = Some(match outcome {
+            Ok(s) => s,
+            Err(e) => format!("Could not set that up: {e}. You can still look for the den below."),
+        });
+        l
     }
 
     fn bind_game_sock(&mut self) {
@@ -213,7 +237,13 @@ impl LanLobby {
             .iter()
             .map(|f| {
                 let joinable = b.joinable(f);
-                let note = if f.beacon.proto != PROTO {
+                let here = self.joined.as_ref().is_some_and(|j| j.0 == f.addr);
+                let joinable = joinable && !here;
+                let note = if here {
+                    // Seen in the real window: a friend already in the den was
+                    // still offered JOIN for it.
+                    "you are here"
+                } else if f.beacon.proto != PROTO {
                     "different version"
                 } else if f.beacon.players >= f.beacon.slots {
                     "full"
@@ -294,6 +324,9 @@ mod tests {
         }
         assert_eq!((host.players(), host.roster[0].1.as_str()), (2, "Ash"), "the host has Ash on its roster");
         assert!(seeker.status.contains("in the den (2/10)"), "{}", seeker.status);
+        let mine = &seeker.rows[0];
+        assert_eq!((mine.joinable, mine.note), (false, "you are here"), "the den you are in is not offered again");
+        assert_eq!(seeker.click_join(0), Action::None);
         assert!(host.status.contains("2/10"), "{}", host.status);
         // Stop saying HELLO and the host lets the slot go.
         seeker.leave();
@@ -342,6 +375,39 @@ mod tests {
         assert!(friend.status.contains("in the den (2/10)"), "{}", friend.status);
         let mut stranger = LanLobby::open_on("Nobody", 0);
         assert!(stranger.join_for_handoff(Multiplayer::at_store(GAME, "nobody", "N", store.clone()), "not-a-friend").is_err());
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// The path app.rs takes on a bsgames launch, both roles, and the case
+    /// that used to end in a silent solo match: the friend is not hosting.
+    #[test]
+    fn a_bsgames_handoff_becomes_a_den_or_says_why_not() {
+        use netcode::multiplayer::Multiplayer;
+        let store = std::env::temp_dir().join(format!("cb-open-handoff-{}.store", std::process::id()));
+        let _ = std::fs::remove_file(&store);
+        let mp = |id: &str, name: &str| Multiplayer::at_store(GAME, id, name, store.clone());
+
+        // Joining someone who is not hosting: still a lobby, with a reason.
+        let early = LanLobby::open_for_handoff(false, Some("wren"), mp("fox", "Fox"), 0);
+        let note = early.handoff_note.clone().unwrap();
+        assert!(note.contains("Could not set that up") && note.contains("wren"), "{note}");
+        assert!(early.joined.is_none() && early.port().is_some(), "and the LAN browser is still open to fall back on");
+        assert!(LanLobby::open_for_handoff(false, None, mp("fox", "Fox"), 0).handoff_note.unwrap().contains("did not say whom"));
+
+        let mut host = LanLobby::open_for_handoff(true, None, mp("wren", "Wren"), 0);
+        assert!(host.hosting && host.handoff_note.as_deref().unwrap().contains("clawbound@wren"));
+        let mut friend = LanLobby::open_for_handoff(false, Some("wren"), mp("fox", "Fox"), 0);
+        assert!(friend.handoff_note.as_deref().unwrap().starts_with("Joining wren at "), "{:?}", friend.handoff_note);
+        let now = Instant::now();
+        for _ in 0..60 {
+            friend.tick(now);
+            host.tick(now);
+            if host.players() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        assert_eq!((host.players(), host.roster[0].1.as_str()), (2, "Fox"), "the display name bsgames gave us is the one on the roster");
         let _ = std::fs::remove_file(&store);
     }
 

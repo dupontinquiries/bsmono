@@ -78,11 +78,11 @@ struct AppState {
 
 pub fn run(opts: crate::launch::LaunchOptions) {
     if let Some(role) = &opts.handoff {
-        // The centre handed us a friend session. Online play is not wired
-        // in this game yet, so the honest thing is to say so and still put
-        // the player in a match rather than at a menu.
+        // The centre handed us a friend session: it becomes a den (see the
+        // RESUMED block). This used to log "not wired yet" and start a solo
+        // match. The MATCH is still not networked; the den is.
         eprintln!(
-            "[clawbound] bsgames handoff ({role:?}, me={:?}, peer={:?}): online play is not wired yet — starting a solo quick match",
+            "[clawbound] bsgames handoff ({role:?}, me={:?}, peer={:?}): opening a den",
             opts.player_name, opts.peer_id
         );
     }
@@ -99,7 +99,14 @@ pub fn run(opts: crate::launch::LaunchOptions) {
                             Ok(mut s) => {
                                 eprintln!("RESUMED: init ok — surface configured");
                                 s.launch = opts.clone();
-                                if opts.lan {
+                                if let Some(role) = &opts.handoff {
+                                    let id = opts.player_id.clone().unwrap_or_else(|| format!("cat-{:x}", std::process::id()));
+                                    let name = opts.player_name.clone().unwrap_or_else(|| "Cat".into());
+                                    let mp = netcode::multiplayer::Multiplayer::new(crate::lanlobby::GAME, &id, &name);
+                                    let hosting = matches!(role, crate::launch::HandoffRole::Host);
+                                    s.lan = Some(crate::lanlobby::LanLobby::open_for_handoff(hosting, opts.peer_id.as_deref(), mp, netcode::lan::LAN_PORT));
+                                    s.screen = Screen::Lan; // before the quick match, which only starts from Menu
+                                } else if opts.lan {
                                     let me = opts.player_name.clone().or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "Cat".into());
                                     s.lan = Some(crate::lanlobby::LanLobby::open(&me));
                                     s.screen = Screen::Lan;
