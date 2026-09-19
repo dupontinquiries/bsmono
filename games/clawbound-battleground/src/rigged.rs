@@ -235,6 +235,11 @@ pub struct BodyAdjust {
     pub tail_lash: f32,
     /// Front half vs hind half vertical shear (spine arch in flight).
     pub arch: f32,
+    /// Whole body turned about the vertical, radians, positive to the
+    /// RIGHT. With `sway` this is the slither: a body curving round a stem.
+    pub yaw: f32,
+    /// Whole body shifted sideways, world units, positive to the right.
+    pub sway: f32,
     /// Front half rolled this much FURTHER toward upright than the hind
     /// half, radians. The air-righting reflex is two turns: head and
     /// forelegs come round first, the hindquarters follow.
@@ -328,8 +333,8 @@ pub fn slot_transforms(rig: &QuadRig, posed: &[PosedBox], legs: &[LegAdjust; 4],
         Vec4::W,
     );
     let pivot = Vec3::new(body.pivot[0], body.pivot[1], 0.0);
-    let whole = Mat4::from_translation(Vec3::new(0.0, -body.drop, 0.0) + pivot)
-        * rig_rotation([body.roll, body.pitch, 0.0])
+    let whole = Mat4::from_translation(Vec3::new(0.0, -body.drop, body.sway) + pivot)
+        * rig_rotation([body.roll, body.pitch, body.yaw])
         * Mat4::from_translation(-pivot)
         * arch;
 

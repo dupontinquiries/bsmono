@@ -549,6 +549,25 @@ impl Blockers {
         true
     }
 
+    /// The nearest LIGHT stem within `within` of `(x, z)`: a prop that hides
+    /// and does not block -- fern, bush, hanging vine. These are what a
+    /// stalking cat goes round and a running one goes through
+    /// (`puppet::Probe::stem`). Concealment is flat across a cover disc, so
+    /// the stem cannot be recovered from `concealment_at`; it has to be asked
+    /// for.
+    pub fn nearest_stem(&self, x: f32, z: f32, within: f32) -> Option<(f32, f32)> {
+        let mut scratch = Vec::new();
+        self.near(x, z, within, &mut scratch);
+        scratch
+            .iter()
+            .map(|&i| &self.all[i as usize])
+            .filter(|b| b.top == f32::NEG_INFINITY && b.cover.amount > 0.0)
+            .map(|b| (b.cover.x, b.cover.z, (b.cover.x - x).hypot(b.cover.z - z)))
+            .filter(|s| s.2 < within)
+            .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|s| (s.0, s.1))
+    }
+
     /// Every blocker with whether it can be stood on.
     pub fn with_perch(&self) -> impl Iterator<Item = (&Blocker, Perch)> {
         self.all.iter().zip(self.perches.iter().copied())
@@ -869,6 +888,20 @@ mod tests {
             }
         }
         assert_eq!(checked, 8);
+    }
+
+    /// Stems are the light things only: a rock beside the path is the sim's
+    /// business (it already pushed the cat out), a fern is the body's.
+    #[test]
+    fn only_things_a_cat_could_push_through_count_as_stems() {
+        let mut b = Blockers::new(100.0, 6.0);
+        b.push_prop(PropKind::Rock, 1.0, 0.0, 0.0, 1.0);
+        b.push_prop(PropKind::Fern, 0.0, 0.8, 0.0, 1.0);
+        b.push_prop(PropKind::Bush, 0.0, -3.0, 0.0, 1.0);
+        assert_eq!(b.nearest_stem(0.0, 0.0, 1.2), Some((0.0, 0.8)), "the fern, not the nearer rock");
+        assert_eq!(b.nearest_stem(0.0, -2.6, 1.2), Some((0.0, -3.0)));
+        assert_eq!(b.nearest_stem(0.0, 0.0, 0.5), None, "nothing within reach");
+        assert_eq!(b.nearest_stem(40.0, 40.0, 1.2), None);
     }
 
     /// Standable is about the prop. A pine blocks to 3 u and is not a

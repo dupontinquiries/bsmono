@@ -46,6 +46,13 @@ pub trait Probe {
     fn cover(&self, x: f32, z: f32) -> f32;
     /// Water depth, world units.
     fn water(&self, x: f32, z: f32) -> f32;
+    /// The nearest stem of something LIGHT -- a fern, a bush, a hanging
+    /// vine -- within `within` of the point. Not rocks or trunks: those are
+    /// collision, and the sim has already kept the cat out of them. These
+    /// are the things a cat could push through and, stalking, will not.
+    fn stem(&self, _x: f32, _z: f32, _within: f32) -> Option<(f32, f32)> {
+        None
+    }
 }
 
 /// Where a leap is in its arc, as the sim reports it.
@@ -104,6 +111,9 @@ pub struct PuppetInput {
     pub perched: bool,
     /// ...and that something is a ridge: a wall top, a pillar cap.
     pub narrow: bool,
+    /// How quietly the sim says this cat is carrying itself, `0..=1`:
+    /// stalking, an ability's hush, or wounded. See `Game::quiet`.
+    pub quiet: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -125,6 +135,33 @@ pub struct PuppetPose {
     /// World Y added to the drawn cat (climbing over roots).
     pub lift: f32,
 }
+
+/// How hard a moving cat shoulders what it passes, `0..=1`.
+///
+/// The whole difference between lurking and barrelling, as one number, and
+/// everything that touches foliage reads it: the rustle, the leaves bending
+/// in the shader, whether the body bothers to go round a stem.
+///
+/// A stalking cat threads between stems lighter than itself and leaves them
+/// standing. It is not that it moves slowly and so disturbs a little less:
+/// not disturbing things is what it is DOING. Hence sneak is a multiplier
+/// of a tenth, not a smaller speed fed to the same curve -- which is also
+/// what lets an ability's hush be quiet at a full run.
+pub fn disturbance(speed: f32, quiet: f32) -> f32 {
+    pace(speed) * (1.0 - 0.9 * finite_or(quiet, 0.0).clamp(0.0, 1.0))
+}
+
+/// How fast, `0..=1`, with nothing said about how quietly.
+pub fn pace(speed: f32) -> f32 {
+    ((finite_or(speed, 0.0) - 1.0) / 9.0).clamp(0.0, 1.0).powf(1.2)
+}
+
+/// Rustle below this and there is nothing to see or hear.
+pub const QUIET: f32 = 0.12;
+/// How close a stalking body lets a stem come to its centreline.
+pub const STEM_CLEARANCE: f32 = 0.55;
+/// The most a body will lean out of its line to go round one.
+pub const MAX_SWAY: f32 = 0.42;
 
 const STRIKE_SECS: f32 = 0.30;
 const SHAKE_SECS: f32 = 0.85;
@@ -156,6 +193,12 @@ pub struct Puppet {
     wet: f32,
     shake_t: f32,
     idle_t: f32,
+    sneak: f32,
+    /// Sideways give at the shoulders and at the haunches, smoothed. The
+    /// haunches pass a stem after the shoulders do, so sampling the two
+    /// separately is all it takes for the body to CURVE round it.
+    give: [f32; 2],
+    last_cover: f32,
 }
 
 impl Puppet {
@@ -181,6 +224,9 @@ impl Puppet {
             wet: 0.0,
             shake_t: f32::INFINITY,
             idle_t: 0.0,
+            sneak: 0.0,
+            give: [0.0; 2],
+            last_cover: 0.0,
         }
     }
 
@@ -196,6 +242,16 @@ impl Puppet {
     }
     pub fn crouch(&self) -> f32 {
         self.crouch
+    }
+    /// See [`disturbance`].
+    pub fn disturb(&self) -> f32 {
+        disturbance(self.speed, self.sneak)
+    }
+    /// What this cat is doing to the foliage round it right now: where, and
+    /// how hard. `None` when it is not among any.
+    pub fn brush(&self) -> Option<(Vec3, f32)> {
+        let p = self.last_pos?;
+        (self.last_cover > 0.05 && self.disturb() > 0.01).then(|| (p, self.disturb()))
     }
     pub fn is_shaking(&self) -> bool {
         self.shake_t < SHAKE_SECS
@@ -284,16 +340,60 @@ impl Puppet {
         // ── foliage ───────────────────────────────────────────────────
         let cover = if grounded { finite_or(world.cover(pos.x, pos.z), 0.0).clamp(0.0, 1.0) } else { 0.0 };
         // A cat at a dead run does not stalk; it bursts through.
-        let want_crouch = cover * (1.0 - (self.speed / self.anim.build.trot_to.min(12.0)).clamp(0.0, 1.0) * 0.7);
+        self.sneak += (finite_or(inp.quiet, 0.0).clamp(0.0, 1.0) - self.sneak) * (dt * 10.0).min(1.0);
+        self.last_cover = cover;
+        // Cover invites a crouch, and a run cancels it: a cat at full tilt
+        // through a fern bed is not hiding. A deliberate stalk is a stalk
+        // anywhere, open ground included.
+        let bold = disturbance(self.speed, self.sneak);
+        let want_crouch = (cover * (1.0 - bold)).max(0.9 * self.sneak) * if grounded { 1.0 } else { 0.0 };
         self.crouch += (want_crouch - self.crouch) * (dt * 6.0).min(1.0);
         let now_in = cover > 0.3;
         self.rustle_t -= dt;
-        if now_in && (!self.in_cover || (self.speed > 1.0 && self.rustle_t <= 0.0)) {
-            let strength = if self.in_cover { (self.speed / 8.0).clamp(0.2, 1.0) } else { 1.0 };
-            events.push(PuppetEvent::Rustle { pos, strength });
+        // A rustle is what the cat DID to the leaves, not the fact that it
+        // arrived among them. This fired at full strength on entry whatever
+        // the carriage, so a stalking cat announced itself -- exactly
+        // backwards. Below QUIET there is nothing: no event at all, rather
+        // than a small one for something downstream to round up.
+        let disturb = self.disturb();
+        if now_in && disturb >= QUIET && (!self.in_cover || self.rustle_t <= 0.0) {
+            events.push(PuppetEvent::Rustle { pos, strength: disturb });
             self.rustle_t = RUSTLE_EVERY;
         }
         self.in_cover = now_in;
+
+        // ── the slither ───────────────────────────────────────────────
+        // Shoulders and haunches each give way to the nearest light stem.
+        // Weighted by how much this cat is lurking: at a run the weight is
+        // zero and it goes straight through, which is the other half of the
+        // same behaviour.
+        // By SPEED, not by quietness. A hushed cat is crouched and silent at a
+        // full run, and a body cannot thread stems at 12 u/s: the give lags
+        // and it reads as a wobble. (A break test found this: the factor here
+        // used to be `1 - bold`, which is ~1 under a hush.)
+        let threading = 1.0 - ((self.speed - 4.5) / 4.0).clamp(0.0, 1.0); // full care at a stalk, none by a run
+        let care = self.crouch * threading * if grounded { 1.0 } else { 0.0 };
+        for (k, leg) in [(0usize, 0usize), (1, 2)] {
+            let ahead = rig.hip(leg)[0];
+            let at = pos + fwd * ahead;
+            let mut want = 0.0;
+            if care > 0.02 {
+                if let Some((sx, sz)) = world.stem(at.x, at.z, 1.2) {
+                    let rel = Vec3::new(sx - at.x, 0.0, sz - at.z);
+                    let (along, across) = (rel.dot(fwd), rel.dot(right));
+                    if along.is_finite() && across.is_finite() && across.abs() < STEM_CLEARANCE {
+                        // Dead ahead has no obvious side. Pick by the stem's
+                        // own position so the choice is stable frame to
+                        // frame; a sign that flickers is a cat that shivers.
+                        let side = if across.abs() > 0.04 { across.signum() } else if (sx + sz).fract().abs() > 0.5 { 1.0 } else { -1.0 };
+                        let near = 1.0 - (along.abs() / 0.9).clamp(0.0, 1.0);
+                        want = -side * (STEM_CLEARANCE - across.abs()) * near * near * (3.0 - 2.0 * near) * care;
+                    }
+                }
+            }
+            let want = want.clamp(-MAX_SWAY, MAX_SWAY);
+            self.give[k] += (want - self.give[k]) * (dt * 7.0).min(1.0);
+        }
 
         // ── water ─────────────────────────────────────────────────────
         let depth = finite_or(world.water(pos.x, pos.z), 0.0).max(0.0);
@@ -349,6 +449,17 @@ impl Puppet {
             for l in &mut legs {
                 l.splay += 0.16 * c;
             }
+        }
+
+        // Going round a stem: the body shifts by the mean give and turns by
+        // the difference, the head holds its line, the tail finishes the curve.
+        if self.give[0].abs() + self.give[1].abs() > 1e-4 {
+            let span = (rig.hip(0)[0] - rig.hip(2)[0]).abs().max(0.2);
+            body.sway += (self.give[0] + self.give[1]) * 0.5;
+            let bend = ((self.give[0] - self.give[1]) / span).atan();
+            body.yaw += bend;
+            m.gaze_yaw -= bend * 0.9;
+            body.tail_lash += bend * 1.4;
         }
 
         // Wading: high, deliberate steps.
@@ -582,6 +693,8 @@ impl Puppet {
         body.tail_lash = finite_or(body.tail_lash, 0.0).clamp(-1.3, 1.3);
         body.arch = finite_or(body.arch, 0.0);
         body.twist = finite_or(body.twist, 0.0).clamp(-1.6, 1.6);
+        body.yaw = finite_or(body.yaw, 0.0).clamp(-0.7, 0.7);
+        body.sway = finite_or(body.sway, 0.0).clamp(-MAX_SWAY, MAX_SWAY);
         PuppetPose { motion: m, legs, body, lift: finite_or(lift, 0.0) }
     }
 }
@@ -597,6 +710,32 @@ pub struct Troupe {
     pub events: Vec<PuppetEvent>,
     /// `Vfx::time` at the last advance, so `draw` can derive its own dt.
     pub last_time: f32,
+    /// Where cats have just been, for the leaves to swing back through.
+    pub wake: Vec<Wake>,
+    wake_t: f32,
+}
+
+/// A place a cat shouldered through a moment ago.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Wake {
+    pub pos: Vec3,
+    pub strength: f32,
+    pub age: f32,
+}
+
+/// How many brushes the voxel shader takes (`FrameData::brush`).
+pub const MAX_BRUSHES: usize = 8;
+const WAKE_SECS: f32 = 0.9;
+const WAKE_EVERY: f32 = 0.12;
+
+impl Wake {
+    /// A pushed leaf does not return to rest, it swings back THROUGH it:
+    /// a damped spring, so this goes negative. The shader multiplies its
+    /// push by this, and a negative push is a leaf leaning toward where the
+    /// cat was.
+    pub fn now(&self) -> f32 {
+        self.strength * (-4.5 * self.age).exp() * (15.0 * self.age).cos()
+    }
 }
 
 impl Troupe {
@@ -605,6 +744,42 @@ impl Troupe {
             self.puppets.push(Puppet::new(Build::feline()));
         }
     }
+    /// Age the wake and lay new points behind every cat that is pushing
+    /// through something hard enough to matter.
+    pub fn trail(&mut self, dt: f32) {
+        for w in &mut self.wake {
+            w.age += dt;
+        }
+        self.wake.retain(|w| w.age < WAKE_SECS);
+        self.wake_t -= dt;
+        if self.wake_t <= 0.0 {
+            self.wake_t = WAKE_EVERY;
+            for p in &self.puppets {
+                if let Some((pos, strength)) = p.brush() {
+                    if strength >= QUIET {
+                        self.wake.push(Wake { pos, strength, age: 0.0 });
+                    }
+                }
+            }
+        }
+    }
+
+    /// What the shader should bend leaves away from this frame, strongest
+    /// first: `[x, y, z, strength]`. Live cats, then what they left behind.
+    pub fn brushes(&self) -> Vec<[f32; 4]> {
+        let mut all: Vec<[f32; 4]> = self
+            .puppets
+            .iter()
+            .filter_map(|p| p.brush())
+            .map(|(p, s)| [p.x, p.y, p.z, s])
+            .chain(self.wake.iter().filter(|w| w.age > WAKE_EVERY).map(|w| [w.pos.x, w.pos.y, w.pos.z, w.now()]))
+            .filter(|b| b[3].abs() > 0.004 && b.iter().all(|v| v.is_finite()))
+            .collect();
+        all.sort_by(|a, b| b[3].abs().partial_cmp(&a[3].abs()).unwrap_or(std::cmp::Ordering::Equal));
+        all.truncate(MAX_BRUSHES);
+        all
+    }
+
     pub fn on_cast(&mut self, god: usize, style: CastStyle) {
         self.ensure(god + 1);
         self.puppets[god].begin_cast(style);
@@ -698,7 +873,7 @@ mod tests {
         )
     }
     fn input(pos: Vec3) -> PuppetInput {
-        PuppetInput { pos, yaw: 0.0, hp01: 1.0, atk_pulse: 0.0, strike_style: StrikeStyle::Swipe, leap: None, perched: false, narrow: false }
+        PuppetInput { pos, yaw: 0.0, hp01: 1.0, atk_pulse: 0.0, strike_style: StrikeStyle::Swipe, leap: None, perched: false, narrow: false, quiet: 0.0 }
     }
     fn settle(p: &mut Puppet, inp: &PuppetInput, r: &QuadRig, w: &dyn Probe, secs: f32) -> Vec<PuppetEvent> {
         let mut ev = Vec::new();
@@ -766,22 +941,143 @@ mod tests {
         assert_eq!(checked, 16);
     }
 
-    #[test]
-    fn foliage_means_a_stalk_and_one_rustle_on_entry() {
+    /// A fern bed with one stem in it, for the slither.
+    struct Thicket {
+        stem: (f32, f32),
+    }
+    impl Probe for Thicket {
+        fn ground(&self, _: f32, _: f32) -> f32 { 0.0 }
+        fn step_top(&self, _: f32, _: f32) -> Option<f32> { None }
+        fn cover(&self, _: f32, _: f32) -> f32 { 0.8 }
+        fn water(&self, _: f32, _: f32) -> f32 { 0.0 }
+        fn stem(&self, x: f32, z: f32, within: f32) -> Option<(f32, f32)> {
+            ((x - self.stem.0).hypot(z - self.stem.1) < within).then_some(self.stem)
+        }
+    }
+
+    /// Drive a cat along +x through `w` at `speed`, return what it did.
+    fn cross(w: &dyn Probe, speed: f32, quiet: f32, from: f32, to: f32) -> (Puppet, Vec<PuppetEvent>, Vec<PuppetPose>) {
         let r = rig();
-        let w = World { step: |_, _| None, cover: |x, _| if x > 5.0 { 0.8 } else { 0.0 }, water: |_, _| 0.0 };
         let mut p = Puppet::new(Build::feline());
-        assert!(settle(&mut p, &input(Vec3::ZERO), &r, &w, 0.5).is_empty(), "open ground is silent");
-        assert!(p.crouch() < 0.01);
-        let inside = input(Vec3::new(6.0, 0.0, 0.0));
-        // Standing still inside: exactly one rustle, from the entry.
-        p.last_pos = Some(inside.pos);
-        let ev = settle(&mut p, &inside, &r, &w, 1.0);
-        let rustles = ev.iter().filter(|e| matches!(e, PuppetEvent::Rustle { .. })).count();
-        assert_eq!(rustles, 1, "entry rustles once; standing still must not keep rustling");
-        assert!((0.6..=0.85).contains(&p.crouch()), "crouch tracks cover: {}", p.crouch());
-        let pose = p.pose(&inside, &r);
-        assert!(pose.body.drop > 0.15 && pose.body.tail_lift < -0.1, "chest down, tail low");
+        let (mut ev, mut poses) = (Vec::new(), Vec::new());
+        let mut x = from;
+        while x < to {
+            let inp = PuppetInput { quiet, ..input(Vec3::new(x, 0.0, 0.0)) };
+            p.advance(1.0 / 60.0, &inp, &r, w, &mut ev);
+            poses.push(p.pose(&inp, &r));
+            x += speed / 60.0;
+        }
+        (p, ev, poses)
+    }
+
+    /// This replaces a test that asserted the OPPOSITE: one rustle on entry,
+    /// whatever the cat was doing. A cat standing in a fern, or stalking
+    /// through one, does nothing to it. A cat running through one does.
+    #[test]
+    fn a_stalking_cat_leaves_the_fern_alone_and_a_running_one_does_not() {
+        let fern = World { step: |_, _| None, cover: |x, _| if x > 5.0 { 0.8 } else { 0.0 }, water: |_, _| 0.0 };
+        let rustles = |ev: &[PuppetEvent]| ev.iter().filter_map(|e| if let PuppetEvent::Rustle { strength, .. } = e { Some(*strength) } else { None }).collect::<Vec<f32>>();
+
+        let (p, ev, poses) = cross(&fern, 12.4 * 0.26, 1.0, 0.0, 12.0);
+        assert!(rustles(&ev).is_empty(), "a stalk rustled: {:?}", rustles(&ev));
+        assert!(p.disturb() < 0.05, "stalking disturbance {}", p.disturb());
+        assert!(p.crouch() > 0.7, "and it IS stalking: crouch {}", p.crouch());
+        assert!(poses.last().unwrap().body.drop > 0.15, "chest down");
+
+        let (p, ev, _) = cross(&fern, 12.4, 0.0, 0.0, 30.0);
+        let r = rustles(&ev);
+        assert!((3..=40).contains(&r.len()), "a run through 25 u of fern rustled {} times", r.len());
+        assert!(r.iter().all(|s| *s > 0.8), "and hard: {r:?}");
+        assert!(p.disturb() > 0.9 && p.crouch() < 0.15, "barrelling, upright: {} / {}", p.disturb(), p.crouch());
+
+        // Standing in it: nothing, however long.
+        let (_, ev, _) = cross(&fern, 0.0001, 0.0, 8.0, 8.01);
+        assert!(rustles(&ev).is_empty());
+        // Sneak is not "slow": the same speed un-sneaked brushes harder.
+        assert!(disturbance(3.2, 0.0) > disturbance(3.2, 1.0) * 5.0);
+    }
+
+    /// The slither. A stem just right of the line: the shoulders give LEFT
+    /// first, the haunches after, so the body turns one way coming up to the
+    /// stem and the other way leaving it. A running cat does none of this.
+    #[test]
+    fn a_stalking_body_curves_round_a_stem_and_a_running_one_goes_straight_through() {
+        let w = Thicket { stem: (6.0, 0.2) }; // yaw 0: forward +x, right +z
+        let (_, _, poses) = cross(&w, 3.2, 1.0, 0.0, 12.0);
+        let sway: Vec<f32> = poses.iter().map(|p| p.body.sway).collect();
+        let yaw: Vec<f32> = poses.iter().map(|p| p.body.yaw).collect();
+        let peak = sway.iter().cloned().fold(0.0f32, f32::min);
+        assert!((-MAX_SWAY..-0.12).contains(&peak), "leans LEFT, away from a stem on its right, by a paw's width or so: {peak}");
+        assert!(sway.iter().all(|s| *s < 0.02), "and never toward it");
+        let (lo, hi) = yaw.iter().fold((f32::MAX, f32::MIN), |(a, b), y| (a.min(*y), b.max(*y)));
+        assert!(lo < -0.06 && hi > 0.06, "the body turns away coming in and back going out: {lo}..{hi}");
+        let first_neg = yaw.iter().position(|y| *y < -0.06).unwrap();
+        let first_pos = yaw.iter().position(|y| *y > 0.06).unwrap();
+        assert!(first_neg < first_pos, "shoulders give before haunches");
+        assert!(sway.last().unwrap().abs() < 0.02 && yaw.last().unwrap().abs() < 0.02, "and it straightens out afterwards");
+        let head = poses[first_neg].motion.gaze_yaw;
+        assert!(head > 0.03, "the head holds its line while the body turns: {head}");
+
+        let (_, _, poses) = cross(&w, 12.4, 0.0, 0.0, 12.0);
+        let worst = poses.iter().map(|p| p.body.sway.abs().max(p.body.yaw.abs())).fold(0.0f32, f32::max);
+        assert!(worst < 0.03, "a running cat swerved {worst} for a fern");
+        // Hushed: low and silent, but at a full run -- and so it must NOT try
+        // to go round. Quiet is not slow.
+        let (_, _, hushed) = cross(&w, 12.4, 0.9, 0.0, 12.0);
+        let worst = hushed.iter().map(|p| p.body.sway.abs().max(p.body.yaw.abs())).fold(0.0f32, f32::max);
+        assert!(worst < 0.04, "a hushed RUN does not slither: {worst}");
+        assert!(hushed.last().unwrap().body.drop > 0.15, "though it does stay low");
+    }
+
+    /// Leaves swing back THROUGH rest and settle; and the brush list is
+    /// bounded, strongest first, with nothing in it from a stalking cat.
+    /// The balance idea from review, pinned: stalking is not a key you
+    /// hold, it is what state you are in. Hush is quiet AT A FULL RUN (the
+    /// sneak boost an ability grants costs no speed) and wounded is
+    /// half-quiet. Ranges, because for the middle two both "as loud as a
+    /// run" and "as silent as a stalk" would be wrong.
+    #[test]
+    fn quiet_scales_the_disturbance_at_any_speed() {
+        let (run, hush, hurt, stalk) = (disturbance(12.4, 0.0), disturbance(12.4, 0.9), disturbance(12.4, 0.5), disturbance(3.2, 1.0));
+        assert!(run > 0.95, "{run}");
+        assert!((0.12..0.25).contains(&hush), "hushed at a run: {hush}");
+        assert!((0.45..0.65).contains(&hurt), "wounded at a run: {hurt}");
+        assert!(stalk < 0.03, "{stalk}");
+        assert!(hush < QUIET * 2.0 && run > QUIET * 5.0);
+        assert_eq!(disturbance(0.5, 0.0), 0.0, "a cat picking its way disturbs nothing, unasked");
+        assert_eq!(disturbance(f32::NAN, f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn the_wake_swings_back_and_a_stalk_leaves_none() {
+        let w = Wake { pos: Vec3::ZERO, strength: 1.0, age: 0.0 };
+        let samples: Vec<f32> = (0..90).map(|i| Wake { age: i as f32 / 100.0, ..w }.now()).collect();
+        assert!(samples.iter().any(|s| *s < -0.15), "it overshoots: min {:?}", samples.iter().cloned().fold(f32::MAX, f32::min));
+        assert!(samples.last().unwrap().abs() < 0.03, "and settles");
+
+        let fern = World { step: |_, _| None, cover: |_, _| 0.8, water: |_, _| 0.0 };
+        for (quiet, speed, want_wake) in [(1.0, 3.2, false), (0.0, 12.4, true)] {
+            let r = rig();
+            let mut t = Troupe::default();
+            t.ensure(12);
+            let mut ev = Vec::new();
+            for f in 0..60 {
+                for (k, p) in t.puppets.iter_mut().enumerate() {
+                    let inp = PuppetInput { quiet, ..input(Vec3::new(f as f32 * speed / 60.0, 0.0, k as f32 * 3.0)) };
+                    p.advance(1.0 / 60.0, &inp, &r, &fern, &mut ev);
+                }
+                t.trail(1.0 / 60.0);
+            }
+            let b = t.brushes();
+            assert_eq!(!t.wake.is_empty(), want_wake, "quiet {quiet}: wake {}", t.wake.len());
+            if want_wake {
+                assert_eq!(b.len(), MAX_BRUSHES, "twelve cats and their wakes, capped");
+                assert!(b.windows(2).all(|p| p[0][3].abs() >= p[1][3].abs()), "strongest first");
+                assert!(b[0][3] > 0.9);
+            } else {
+                assert!(b.iter().all(|x| x[3].abs() < 0.05), "a stalk barely registers: {b:?}");
+            }
+        }
     }
 
     #[test]
