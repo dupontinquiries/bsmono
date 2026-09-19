@@ -474,6 +474,12 @@ pub fn run_rig_sheet() -> Result<(), String> {
         let down = Vec3::new(-c.along.z, 0.0, c.along.x);
         shots.push(Shot { name: "log_crossing.png", eye: c.at - down * 15.0 + c.along * 6.0 + Vec3::Y * 9.0, look: c.at });
     }
+    // An enemy tower with the player just inside its line: the ring solid red,
+    // the tether on the player.
+    {
+        let t = consts_tower();
+        shots.push(Shot { name: "tower_line.png", eye: t + Vec3::new(30.0, 26.0, -22.0), look: t + Vec3::new(10.0, 0.0, 0.0) });
+    }
     println!("wall at {wall:?}");
     // CLAWBOUND_SHEET=wall,sig_0 renders only the shots whose names match.
     let only: Vec<String> = std::env::var("CLAWBOUND_SHEET").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default();
@@ -554,6 +560,14 @@ pub fn run_rig_sheet() -> Result<(), String> {
                     // one cat walking the spine
                     game.gods[0].yaw = c.along.z.atan2(c.along.x);
                     game.gods[0].pos = c.at - c.along * (left as f32 * (3.0 / 60.0));
+                }
+                k if shots[k].name == "tower_line.png" => {
+                    let t = consts_tower();
+                    for gi in 1..game.gods.len() {
+                        game.gods[gi].respawn_t = 999.0;
+                    }
+                    game.gods[0].pos = t + Vec3::X * (crate::consts::TOWER_RANGE - 2.0);
+                    game.tick(1.0 / 60.0); // the real sim decides who the tower aims at
                 }
                 k if shots[k].name == "map_centre.png" => {
                     for gi in 0..game.gods.len() {
@@ -649,4 +663,9 @@ pub fn run_rig_sheet() -> Result<(), String> {
         println!("saved {}", shot.name);
     }
     Ok(())
+}
+
+/// The enemy (Red) mid outer tower, for the staged tower shot.
+fn consts_tower() -> Vec3 {
+    crate::consts::tower_pos(crate::consts::Lane::Mid, crate::consts::Team::Red, false)
 }

@@ -16,6 +16,7 @@ struct FrameData {
     blast_a: array<vec4<f32>, 4>, // xyz centre, w ring radius
     blast_b: array<vec4<f32>, 4>, // x strength, y width
     cracks: array<vec4<f32>, 8>,  // x, z, radius, how open
+    towers: array<vec4<f32>, 12>, // x, z, range, state (see Game::tower_rings)
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameData;
@@ -210,6 +211,47 @@ fn cracked(p: vec2<f32>) -> vec2<f32> {
     return vec2(dark, damp);
 }
 
+// Where a tower's line is, and what it means to YOU right now.
+//   1 yours            thin, calm, team-cool
+//   2 theirs           dashed amber: a line you have not crossed
+//   3 you are inside   solid red, with a soft band inside it
+//   4 aiming at you    the same, pulsing fast
+fn tower_ring(p: vec2<f32>) -> vec4<f32> {
+    var col = vec3(0.0);
+    var a = 0.0;
+    for (var i = 0; i < 12; i = i + 1) {
+        let t = frame.towers[i];
+        if (t.w < 0.5) {
+            continue;
+        }
+        let e = distance(p, t.xy) - t.z; // < 0 inside
+        if (e > 0.4 || e < -3.0) {
+            continue;
+        }
+        let line = 1.0 - smoothstep(0.10, 0.24, abs(e));
+        let ang = atan2(p.y - t.y, p.x - t.x);
+        let dash = step(0.45, fract(ang * t.z / 2.4));
+        var c = vec3(0.55, 0.80, 1.0);
+        var k = line * 0.45;
+        if (t.w > 1.5) {
+            c = vec3(1.0, 0.72, 0.20);
+            k = line * dash * 0.75;
+        }
+        if (t.w > 2.5) {
+            let fast = select(3.0, 11.0, t.w > 3.5);
+            let pulse = 0.75 + 0.25 * sin(frame.params.x * fast);
+            c = vec3(1.0, 0.16, 0.10);
+            let band = smoothstep(-3.0, 0.0, e) * step(e, 0.0) * 0.22;
+            k = max(line, band) * pulse;
+        }
+        if (k > a) {
+            a = k;
+            col = c;
+        }
+    }
+    return vec4(col, clamp(a, 0.0, 1.0));
+}
+
 @fragment
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let cam_d = distance(in.world, frame.cam_pos.xyz);
@@ -272,5 +314,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let haze = frame.fog_color.xyz * (0.45 + 0.55 * lum);
     lit = mix(lit, haze, fog * 0.9);
     lit = lit + frame.sun_col.xyz * shaft_light(in.world) * 0.42 * (1.0 - frame.params.w);
+    // Tower lines, last, so neither fog nor night hides them: this is
+    // information, not scenery.
+    let ring = tower_ring(in.world.xz);
+    lit = mix(lit, ring.rgb, ring.a);
     return vec4(lit, 1.0);
 }

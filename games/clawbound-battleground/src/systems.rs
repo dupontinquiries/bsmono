@@ -623,6 +623,7 @@ impl Game {
             }
             // timers
             let atk_timer_next = self.towers[ti].atk_timer - dt;
+            self.towers[ti].aim = target;
             let fire_anim_next = (self.towers[ti].fire_anim - dt * 3.0).max(0.0);
             if atk_timer_next > 0.0 || target.is_none() {
                 let tw = &mut self.towers[ti];
@@ -651,6 +652,13 @@ impl Game {
             tw.fire_anim = 1.0;
             tw.ramp = new_ramp;
             tw.last_target = target;
+            // Applied as it fires rather than on impact: the bolt has no flag to
+            // carry it, and at 34 u/s over <= 24 u it lands a moment later.
+            if let Some(TargetRef::God(gi)) = target {
+                let g = &mut self.gods[gi];
+                g.slow = g.slow.max(TOWER_SLOW);
+                g.slow_t = g.slow_t.max(TOWER_SLOW_SECS);
+            }
             self.projectiles.push(Projectile {
                 team: tteam,
                 pos: from,

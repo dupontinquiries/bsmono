@@ -56,7 +56,11 @@ pub const HOLLOW_RADIUS: f32 = 21.0;
 /// Centreline of each run, and how far along z it goes.
 pub const RUN_X: f32 = 15.5;
 pub const RUN_HALF_WIDTH: f32 = 2.6;
-pub const RUN_Z: (f32, f32) = (HOLLOW_RADIUS + 1.0, 56.0);
+/// Ends where the mid outer tower's cleared ground begins. It ran to 56 --
+/// 15.5 u from a tower at z = 54, INSIDE its range, behind a screen: a lane
+/// built for skimming the tower's edge from cover. Review called that out;
+/// the test here had only checked that nothing stood ON a tower.
+pub const RUN_Z: (f32, f32) = (HOLLOW_RADIUS + 1.0, 36.0);
 /// Where the screen stands, between lane and run.
 pub const SCREEN_X: f32 = 9.6;
 /// Doorways through the screen, as z on the +z side (mirrored for -z).
@@ -64,7 +68,7 @@ pub const SCREEN_X: f32 = 9.6;
 /// Hollow, and out into the jungle behind the far tower line -- so a door
 /// every few units left more gap than screen, and a screen that is mostly
 /// gap hides nobody. This gives two hidden stretches of ~12 u a side.
-pub const DOORS: [f32; 1] = [39.5];
+pub const DOORS: [f32; 0] = [];
 pub const DOOR_HALF: f32 = 2.4;
 
 /// Is `(x, z)` ground the scatter must leave alone? The run floors, the
@@ -155,7 +159,8 @@ fn half() -> Vec<Placement> {
 
 /// Every authored placement: the z >= 0 half and its mirror through the origin.
 pub fn layout() -> Vec<Placement> {
-    let h = half();
+    // Nothing authored inside a tower's cleared ground, whatever half() says.
+    let h: Vec<Placement> = half().into_iter().filter(|p| !crate::consts::in_tower_clearing(p.x, p.z)).collect();
     let mut all = h.clone();
     all.extend(h.iter().map(|p| Placement { x: -p.x, z: -p.z, quarter: (p.quarter + 2) % 4, ..*p }));
     all
@@ -195,7 +200,9 @@ mod tests {
                 steps += 1;
             }
         }
-        assert!(steps > 200, "only {steps} samples: did RUN_Z collapse?");
+        // 4 runs x 14 u at 0.5 u. Was > 200 when the runs were 34 u long; they
+        // stop at the tower clearing now, and are honestly STUBS: see RUN_Z.
+        assert!(steps > 100, "only {steps} samples: did RUN_Z collapse?");
     }
 
     /// The second: you cannot be seen from the lane while you are on it --
@@ -206,19 +213,17 @@ mod tests {
     fn the_screen_hides_the_run_from_the_lane_except_at_its_doorways() {
         let b = blockers();
         for (sx, sz) in sides_and_ends() {
-            let (mut hidden, mut total) = (0, 0);
-            let mut z = RUN_Z.0 + 1.0;
-            while z < RUN_Z.1 - 1.0 {
-                let at_door = DOORS.iter().any(|d| (z - d).abs() < DOOR_HALF + 1.8);
-                if !at_door {
-                    total += 1;
-                    hidden += (b.sight_obstruction((0.0, sz * z), (sx * RUN_X, sz * z)) >= 0.99) as usize;
-                }
-                z += 0.75;
+            // What is left of the screen is a prop or two a side, so a hidden
+            // FRACTION over three samples is noise (it read 0.67 and meant
+            // nothing). The claim that survives the truncation, and does not
+            // depend on length: each screen prop hides what is straight
+            // behind it from the lane.
+            let mut props = 0;
+            for pl in layout().iter().filter(|pl| (pl.x - sx * SCREEN_X).abs() < 0.1 && pl.z * sz > 0.0) {
+                assert!(b.sight_obstruction((0.0, pl.z), (sx * RUN_X, pl.z)) >= 0.99, "{:?} at z = {} does not hide the run behind it", pl.kind, pl.z);
+                props += 1;
             }
-            let frac = hidden as f32 / total as f32;
-            assert!(total > 20, "only {total} screened samples");
-            assert!((0.7..=1.0).contains(&frac), "run ({sx},{sz}): hidden from the lane along {frac:.2} of the screened stretch");
+            assert!(props >= 1, "side ({sx},{sz}) has no screen left at all");
             for d in DOORS {
                 let z = sz * d;
                 assert!(b.sight_obstruction((0.0, z), (sx * RUN_X, z)) < 0.99, "doorway at z = {z} is not a gap in the view");
@@ -292,11 +297,29 @@ mod tests {
         assert_eq!(towers, 12);
     }
 
+    /// The review's point, as a test: no bush to skim a tower's line from,
+    /// and no rock to perch beside it. Everything authored that hides or
+    /// lifts a cat is outside every tower's cleared ground.
+    #[test]
+    fn nothing_that_hides_or_lifts_a_cat_is_inside_a_towers_clearing() {
+        let mut checked = 0;
+        for p in layout() {
+            assert!(!crate::consts::in_tower_clearing(p.x, p.z), "{:?} at ({}, {}) is inside a tower's clearing", p.kind, p.x, p.z);
+            checked += 1;
+        }
+        assert!(checked > 40, "{checked} placements left: did the filter eat the layout?");
+        // And the clearing really is bigger than the range, which is bigger
+        // than anything a cat can auto-attack from.
+        let max_auto = crate::gods::ROSTER.iter().map(|d| d.auto_range).fold(0.0f32, f32::max);
+        assert!(crate::consts::TOWER_RANGE > max_auto + 6.0, "tower {} vs longest auto {max_auto}", crate::consts::TOWER_RANGE);
+        assert!(crate::consts::TOWER_CLEARING > crate::consts::TOWER_RANGE);
+    }
+
     /// What Blue has toward Red, Red has toward Blue.
     #[test]
     fn the_layout_is_the_same_from_either_base() {
         let all = layout();
-        assert!(all.len() > 80, "{} placements", all.len());
+        assert!(all.len() > 40, "{} placements", all.len());
         for p in &all {
             let twin = all.iter().any(|q| q.kind == p.kind && (q.x + p.x).abs() < 1e-3 && (q.z + p.z).abs() < 1e-3);
             assert!(twin, "{:?} at ({}, {}) has no twin through the origin", p.kind, p.x, p.z);

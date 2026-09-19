@@ -292,7 +292,30 @@ pub const MINION_ATK_CD: f32 = 1.4;
 
 pub const TOWER_HP: f32 = 1450.0;
 pub const TOWER_DMG: f32 = 168.0;
-pub const TOWER_RANGE: f32 = 16.0;
+/// Was 16. Measured against what it has to answer: ranged autos reach 14.4
+/// (1.6 u inside the old line), lobs 20, beams 22-32, and at 12.4 u/s a cat
+/// crossed the old 32 u zone in 2.6 s -- two shots. At 24 the zone is 48 u
+/// across: 3.9 s and four ramping shots to run past, and every auto and lob
+/// is answered. Bolts (48-64 u) still out-range it, as they should: that is
+/// poke at the DEFENDER, who now has cleared ground to stand on.
+pub const TOWER_RANGE: f32 = 24.0;
+/// Nothing that hides or lifts a cat -- no bush, fern, vine, rock or log --
+/// grows inside this. The line a tower draws should be crossed in the open,
+/// on purpose, not skimmed from a bush three paces outside it.
+pub const TOWER_CLEARING: f32 = TOWER_RANGE + 4.0;
+/// A tower's shot slows a cat: diving past is a decision, not a jog.
+pub const TOWER_SLOW: f32 = 0.25;
+pub const TOWER_SLOW_SECS: f32 = 1.2;
+
+/// Inside some tower's cleared ground?
+pub fn in_tower_clearing(x: f32, z: f32) -> bool {
+    [Lane::Top, Lane::Mid, Lane::Bot].iter().any(|l| {
+        [Team::Blue, Team::Red].iter().any(|t| [false, true].iter().any(|i| {
+            let p = tower_pos(*l, *t, *i);
+            (p.x - x).hypot(p.z - z) < TOWER_CLEARING
+        }))
+    })
+}
 pub const TOWER_ATK_CD: f32 = 1.1;
 pub const TOWER_RAMP: f32 = 1.25;
 

@@ -11,6 +11,8 @@ use crate::voxel::{CUBE_IDX, CUBE_NORMS, CUBE_VERTS, VoxInst, VoxelMesh};
 
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const SHADOW_SIZE: u32 = 2048;
+/// Three lanes x two teams x inner/outer. terrain.wgsl hard-codes it.
+pub const MAX_TOWER_RINGS: usize = 12;
 pub const MAX_DRAWS: usize = 512;
 pub const MAX_PARTICLES: usize = 48000;
 pub const DYN_ALIGN: u64 = 256;
@@ -48,6 +50,9 @@ pub struct FrameUniform {
     pub blast_b: [[f32; 4]; crate::groundfx::MAX_BLASTS],
     /// Broken ground: x, z, radius, how open. terrain.wgsl.
     pub cracks: [[f32; 4]; crate::groundfx::MAX_CRACKS],
+    /// Tower range rings as the player should see them: x, z, range, state.
+    /// terrain.wgsl. See `Game::tower_rings`.
+    pub towers: [[f32; 4]; MAX_TOWER_RINGS],
 }
 
 #[repr(C)]
@@ -148,6 +153,8 @@ pub struct Renderer {
     pub blast_a: [[f32; 4]; crate::groundfx::MAX_BLASTS],
     pub blast_b: [[f32; 4]; crate::groundfx::MAX_BLASTS],
     pub cracks: [[f32; 4]; crate::groundfx::MAX_CRACKS],
+    /// Set by the scene each frame from `Game::tower_rings`.
+    pub towers: [[f32; 4]; MAX_TOWER_RINGS],
     /// Shadow-map samples marched per fragment for light shafts through the
     /// canopy. 0 turns them off: on a handset GPU this is the first thing to
     /// give up, and the screen-space shafts toward the sun remain.
@@ -665,6 +672,7 @@ impl Renderer {
             blast_a: Default::default(),
             blast_b: Default::default(),
             cracks: Default::default(),
+            towers: Default::default(),
             // OFF. Both tunings tried so far turned the far field milky rather
             // than drawing shafts: under this jungle's canopy almost every
             // view ray is half-occluded, so the term fires everywhere, and 8
@@ -839,6 +847,7 @@ impl Renderer {
             blast_a: self.blast_a,
             blast_b: self.blast_b,
             cracks: self.cracks,
+            towers: self.towers,
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 
@@ -1122,6 +1131,7 @@ impl Renderer {
             blast_a: self.blast_a,
             blast_b: self.blast_b,
             cracks: self.cracks,
+            towers: self.towers,
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 

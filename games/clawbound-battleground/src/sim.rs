@@ -206,6 +206,10 @@ pub struct Tower {
     pub atk_timer: f32,
     pub ramp: u32,
     pub last_target: Option<TargetRef>,
+    /// Who it is looking at RIGHT NOW, updated every tick -- including
+    /// while it reloads, and cleared the moment they leave. `last_target`
+    /// only changes when it fires, so it cannot answer "am I being aimed at".
+    pub aim: Option<TargetRef>,
     pub fire_anim: f32,
 }
 
@@ -382,6 +386,7 @@ impl Game {
                         atk_timer: 0.0,
                         ramp: 0,
                         last_target: None,
+                        aim: None,
                         fire_anim: 0.0,
                     });
                 }
@@ -496,6 +501,39 @@ impl Game {
         g.atk_speed = st.attack_speed;
         g.cdr = st.cdr.min(0.4);
         g.ms_bonus = st.move_speed;
+    }
+
+    /// What `viewer` should be shown about each tower: `[x, z, range, state]`.
+    ///
+    /// States answer the two questions a tower leaves open. WHERE is the
+    /// line: every standing tower draws its range on the ground. WHO is it
+    /// after: the ring changes the moment it matters to you.
+    ///   1  yours: calm, the ground you are safe on
+    ///   2  theirs, and you are outside it: a dashed warning
+    ///   3  theirs, and you are INSIDE it: solid -- it has not picked you yet
+    ///      (minions draw fire first), but it can
+    ///   4  theirs, and it is aiming at YOU
+    ///   0  fallen: nothing drawn
+    pub fn tower_rings(&self, viewer: usize) -> [[f32; 4]; crate::render::MAX_TOWER_RINGS] {
+        let mut out = [[0.0; 4]; crate::render::MAX_TOWER_RINGS];
+        let Some(me) = self.gods.get(viewer) else { return out };
+        for (slot, tw) in out.iter_mut().zip(self.towers.iter()) {
+            if tw.hp <= 0.0 {
+                continue;
+            }
+            let inside = me.respawn_t <= 0.0 && (tw.pos.x - me.pos.x).hypot(tw.pos.z - me.pos.z) < TOWER_RANGE;
+            let state = if tw.team == me.team {
+                1.0
+            } else if tw.aim == Some(TargetRef::God(viewer)) {
+                4.0
+            } else if inside {
+                3.0
+            } else {
+                2.0
+            };
+            *slot = [tw.pos.x, tw.pos.z, TOWER_RANGE, state];
+        }
+        out
     }
 
     /// Is this cat stalking right now? Intent, minus a fight: attacking,

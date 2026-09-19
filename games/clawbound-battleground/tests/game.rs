@@ -376,3 +376,53 @@ fn the_crossing_is_a_log_the_log_can_be_rolled_away_and_then_it_is_a_ford() {
     assert_eq!(game.water_depth_now(l.centre().x, l.centre().z), 0.0);
     assert!(!game.logs[1].free && game.logs[1].x.abs() < 0.01, "the other crossing, 150 u away, never noticed");
 }
+
+
+/// "When is the line crossed, and who is being targeted" -- answered by
+/// state the player is shown, tested as state. And the numbers behind
+/// "indefensible": the tower now out-ranges every auto and every lob.
+#[test]
+fn a_tower_says_where_its_line_is_and_who_it_is_after() {
+    use clawbound::sim::TargetRef;
+    let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    for g in game.gods.iter_mut().skip(1) {
+        g.respawn_t = 999.0;
+    }
+    let me = game.gods[0].team;
+    let ti = game.towers.iter().position(|t| t.team != me && t.hp > 0.0).unwrap();
+    let tpos = game.towers[ti].pos;
+    let mine = game.towers.iter().position(|t| t.team == me).unwrap();
+    let state = |g: &Game, i: usize| g.tower_rings(0)[i][3];
+
+    game.gods[0].pos = tpos + glam::Vec3::X * (TOWER_RANGE + 3.0);
+    game.tick(1.0 / 60.0);
+    assert_eq!(state(&game, mine), 1.0, "my own tower: calm");
+    assert_eq!(state(&game, ti), 2.0, "theirs, and I am outside the line");
+    assert_eq!(game.tower_rings(0)[ti][2], TOWER_RANGE);
+    assert_eq!(game.towers[ti].aim, None);
+
+    // One step over the line. It aims THIS TICK -- before it has fired.
+    game.gods[0].pos = tpos + glam::Vec3::X * (TOWER_RANGE - 0.5);
+    game.towers[ti].atk_timer = 0.8;
+    game.tick(1.0 / 60.0);
+    assert_eq!(game.towers[ti].aim, Some(TargetRef::God(0)), "the tether is live on the tick the line is crossed");
+    assert_eq!(state(&game, ti), 4.0);
+    assert!(game.towers[ti].last_target.is_none(), "and it has not fired yet: last_target could never have shown this");
+
+    // Its shot slows: running past is a decision.
+    let speed = game.move_speed(0);
+    for _ in 0..70 {
+        game.gods[0].pos = tpos + glam::Vec3::X * (TOWER_RANGE - 0.5);
+        game.tick(1.0 / 60.0);
+    }
+    assert!(game.move_speed(0) < speed * 0.8, "a tower shot slows: {} vs {speed}", game.move_speed(0));
+
+    // Step back out: the aim drops at once.
+    game.gods[0].pos = tpos + glam::Vec3::X * (TOWER_RANGE + 3.0);
+    game.tick(1.0 / 60.0);
+    assert_eq!(game.towers[ti].aim, None);
+    assert_eq!(state(&game, ti), 2.0);
+
+    let max_auto = ROSTER.iter().map(|d| d.auto_range).fold(0.0f32, f32::max);
+    assert!(TOWER_RANGE > max_auto + 6.0 && TOWER_RANGE > 20.0, "out-ranges every auto ({max_auto}) and the 20 u lobs");
+}

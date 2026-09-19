@@ -358,6 +358,22 @@ impl Scene {
         // towers
         let pulse = 0.55 + 0.45 * (vfx.time * 2.6).sin();
         for tw in &game.towers {
+            // WHO it is after: a tether from the crystal to whatever it is
+            // aiming at, live -- it appears the tick you cross the line, not
+            // when the first bolt lands. Hot and thick when it is the player.
+            if let (true, Some(aim)) = (tw.hp > 0.0, tw.aim) {
+                let at_me = aim == crate::sim::TargetRef::God(0);
+                let from = tw.pos + Vec3::Y * 5.75;
+                let to = game.target_pos(aim) + Vec3::Y * 1.1;
+                let c = if at_me { [1.0, 0.18, 0.10] } else { [1.0, 0.70, 0.30] };
+                let n = if at_me { 14 } else { 8 };
+                for k in 1..n {
+                    let t = k as f32 / n as f32;
+                    let sag = Vec3::Y * (-(t * (1.0 - t)) * 1.2);
+                    let beat = 1.0 + 0.35 * ((vfx.time * 9.0 - t * 8.0).sin());
+                    r.queue_draw(self.orb, Mat4::from_translation(from.lerp(to, t) + sag), alpha_tint(c, if at_me { 0.9 } else { 0.5 }), 2.2, if at_me { 0.085 * beat } else { 0.05 }, true);
+                }
+            }
             let ti = tw.team as usize;
             let m = Mat4::from_translation(tw.pos);
             r.queue_draw(self.tower_body[ti], m, [1.0; 4], 0.0, 0.16, false);
@@ -474,6 +490,7 @@ impl Scene {
         // back through where they were. A stalking cat contributes ~nothing.
         vfx.puppets.trail(dt);
         r.brushes = vfx.puppets.brushes();
+        r.towers = game.tower_rings(0);
         (r.blast_a, r.blast_b) = vfx.ground.blast_uniform();
         r.cracks = vfx.ground.crack_uniform();
         vfx.puppet_events(&pevents);
@@ -565,7 +582,7 @@ fn jungle_spot(rng: &mut Rng, min_clear: f32) -> Option<(f32, f32)> {
         let z = a.sin() * r;
         // ...and not on the authored centre: a random trunk in a run's
         // floor or a doorway undoes the one part of the map that is designed.
-        if consts::lane_clearance(x, z) > min_clear && consts::river_dist(x, z) > 9.5 && !crate::bosses::in_pit(x, z) && !crate::midjungle::reserved(x, z) {
+        if consts::lane_clearance(x, z) > min_clear && consts::river_dist(x, z) > 9.5 && !crate::bosses::in_pit(x, z) && !crate::midjungle::reserved(x, z) && !consts::in_tower_clearing(x, z) {
             return Some((x, z));
         }
     }
@@ -1000,7 +1017,7 @@ mod plan_tests {
                 }
             }
         }
-        assert!(checked > 250);
+        assert!(checked > 100, "{checked}");
         let mut z = -60.0;
         while z <= 60.0 {
             assert!(!b.blocked(0.0, z, consts::GOD_RADIUS), "mid lane blocked at z = {z}");
