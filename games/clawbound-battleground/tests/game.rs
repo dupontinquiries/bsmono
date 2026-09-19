@@ -428,3 +428,27 @@ fn a_tower_says_where_its_line_is_and_who_it_is_after() {
     let max_auto = ROSTER.iter().map(|d| d.auto_range).fold(0.0f32, f32::max);
     assert!(TOWER_RANGE > max_auto + 6.0 && TOWER_RANGE > 20.0, "out-ranges every auto ({max_auto}) and the 20 u lobs");
 }
+
+
+/// Measure before optimising. What a full 5v5 bot match costs per tick on the
+/// CPU, and a tripwire if it ever gets much worse. This profile is
+/// UNOPTIMISED, so the absolute number is pessimistic by several times; it is
+/// here to be compared with itself.
+#[test]
+fn a_full_match_tick_is_cheap_enough_to_leave_the_frame_to_the_gpu() {
+    let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    // The player slot idles: nine bots, the waves and the towers are the load.
+    for _ in 0..600 {
+        game.tick(1.0 / 60.0); // warm up: minion waves out, bots in lane
+        game.events.clear();
+    }
+    let ticks = 1800;
+    let t0 = std::time::Instant::now();
+    for _ in 0..ticks {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1000.0 / ticks as f64;
+    println!("sim: {ms:.3} ms/tick over {ticks} ticks, {} minions, {} projectiles (unoptimised profile)", game.minions.len(), game.projectiles.len());
+    assert!(ms < 6.0, "a tick costs {ms:.2} ms unoptimised; the budget at 60 Hz is 16.6 for EVERYTHING");
+}

@@ -764,7 +764,7 @@ impl Game {
                 let g = &self.gods[gi];
                 if g.team != p.team && g.respawn_t <= 0.0 {
                     // The body, not a ball over the feet: see `hitbox`.
-                    if crate::hitbox::cat(g.pos, g.yaw, g.sneak && g.hush_t <= 0.0).hit_by_sphere(p.pos, p.radius + 0.2) {
+                    if crate::hitbox::cat(g.pos, g.yaw, g.sneak && g.hush_t <= 0.0).hit_by_moving_sphere(p.pos - p.vel * dt, p.pos, p.radius + 0.2) {
                         hit = Some(TargetRef::God(gi));
                         break;
                     }
@@ -774,8 +774,7 @@ impl Game {
                 for mi in 0..self.minions.len() {
                     let m = &self.minions[mi];
                     if m.team != p.team {
-                        let c = m.pos + Vec3::Y * 0.7;
-                        if (c - p.pos).length() < p.radius + 0.6 {
+                        if crate::hitbox::minion(m.pos, m.yaw).hit_by_moving_sphere(p.pos - p.vel * dt, p.pos, p.radius + 0.2) {
                             hit = Some(TargetRef::Minion(mi));
                             break;
                         }

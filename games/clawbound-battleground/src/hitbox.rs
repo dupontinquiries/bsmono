@@ -34,7 +34,24 @@ pub fn cat(pos: Vec3, yaw: f32, stalking: bool) -> Capsule {
     Capsule { a: pos + f * REAR + up, b: pos + f * FRONT + up, r: GIRTH }
 }
 
+/// A minion: the same animal at about six tenths the size.
+pub fn minion(pos: Vec3, yaw: f32) -> Capsule {
+    let yaw = if yaw.is_finite() { yaw } else { 0.0 };
+    let f = Vec3::new(yaw.cos(), 0.0, yaw.sin());
+    Capsule { a: pos + f * (REAR * 0.6) + Vec3::Y * 0.65, b: pos + f * (FRONT * 0.6) + Vec3::Y * 0.65, r: GIRTH * 0.7 }
+}
+
 impl Capsule {
+    /// A projectile that moved from `prev` to `now` this tick. SWEPT: the
+    /// test is against the whole segment travelled, not the point it ended
+    /// on, so whether a bolt connects does not depend on the tick rate or on
+    /// where in the tick the body happened to be. At 60 Hz today's fastest
+    /// bolt moves 0.67 u a tick and could not skip a 0.96 u body; at the
+    /// 30 Hz a struggling handset runs, or with a faster bolt, it could.
+    pub fn hit_by_moving_sphere(&self, prev: Vec3, now: Vec3, r: f32) -> bool {
+        self.hit_by_beam(prev, now, r)
+    }
+
     pub fn dist_to_point(&self, p: Vec3) -> f32 {
         let ab = self.b - self.a;
         let t = ((p - self.a).dot(ab) / ab.length_squared().max(1e-9)).clamp(0.0, 1.0);
@@ -107,6 +124,25 @@ mod tests {
         let side = cat(Vec3::ZERO, std::f32::consts::FRAC_PI_2, false);
         assert!(!side.hit_by_sphere(head, r), "side-on, that point is beside it");
         assert!(side.hit_by_sphere(Vec3::new(0.0, 1.1, 1.3), r), "and its head is over here");
+    }
+
+    /// The point of sweeping: a fast bolt that starts one side of a cat and
+    /// ends the other side, touching it at NEITHER end of the tick.
+    #[test]
+    fn a_fast_bolt_cannot_step_over_a_cat_between_ticks() {
+        let c = cat(Vec3::ZERO, 0.0, false);
+        let (before, after) = (Vec3::new(0.2, 1.1, -2.0), Vec3::new(0.2, 1.1, 2.0));
+        assert!(!c.hit_by_sphere(before, 0.3) && !c.hit_by_sphere(after, 0.3), "neither endpoint touches");
+        assert!(c.hit_by_moving_sphere(before, after, 0.3), "but it passed straight through the body");
+        let wide = Vec3::new(3.0, 0.0, 0.0);
+        assert!(!c.hit_by_moving_sphere(before + wide, after + wide, 0.3), "and a bolt that passes 3 u ahead of it still misses");
+        // Minions are smaller in every direction.
+        let m = minion(Vec3::ZERO, 0.0);
+        // Muzzle at 0.63 u, girth 0.34: a 0.2 u bolt at 1.3 u is 0.33 u clear.
+        // (I first wrote 1.0 here, which is 0.03 u clear -- a hit. The test
+        // was wrong, not the capsule.)
+        assert!(m.hit_by_sphere(Vec3::new(0.5, 0.65, 0.0), 0.2) && !m.hit_by_sphere(Vec3::new(1.3, 0.65, 0.0), 0.2));
+        assert!(cat(Vec3::ZERO, 0.0, false).hit_by_sphere(Vec3::new(1.3, 1.1, 0.0), 0.2), "where a full-grown cat would be hit");
     }
 
     #[test]
