@@ -243,6 +243,92 @@ pub fn promote_to_dummy(
     })
 }
 
+/// A dummy's provenance, for chains.
+///
+/// ## Why chaining needs this
+///
+/// A dummy freezes what a chain evaluated to. Freeze a SECOND dummy from the
+/// first and its points embed the first's state at that moment — so
+/// re-promoting the upstream dummy leaves every downstream one silently
+/// describing a shape that no longer exists anywhere.
+///
+/// Nothing about the values reveals this: the numbers are plausible, the
+/// curve draws, and the only symptom is that a change upstream does not
+/// arrive. That is the failure a rope UI must be able to draw, which means
+/// the model has to carry it.
+///
+/// `generation` is bumped whenever a dummy is re-promoted. A downstream dummy
+/// records the generation it sampled, and [`stale_against`] compares them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dummy {
+    pub id: CurveId,
+    /// What it was frozen from, and at which generation of that source.
+    pub from: Vec<(CurveId, u32)>,
+    /// Bumped on every re-promotion of THIS dummy.
+    pub generation: u32,
+}
+
+/// Dummies whose sources have moved on since they were frozen.
+///
+/// Returns `(dummy, source)` pairs so a UI can highlight the rope, not just
+/// the node — the stale thing is the RELATIONSHIP, and saying "this dummy is
+/// stale" without saying against what leaves the person hunting.
+pub fn stale_against(dummies: &[Dummy]) -> Vec<(CurveId, CurveId)> {
+    let now: BTreeMap<CurveId, u32> = dummies.iter().map(|d| (d.id, d.generation)).collect();
+    let mut out = Vec::new();
+    for d in dummies {
+        for (src, saw) in &d.from {
+            if now.get(src).is_some_and(|g| g > saw) {
+                out.push((d.id, *src));
+            }
+        }
+    }
+    out
+}
+
+/// A node's column in a rope layout: how far downstream it sits.
+///
+/// LONGEST path from a root, not shortest. With shortest, a node fed by both a
+/// root and a deep chain sits next to the root and its long rope runs
+/// backwards across the whole graph — which is exactly the tangle a rope UI
+/// exists to avoid. Longest path guarantees every rope runs left to right.
+///
+/// Cyclic nodes get the depth they had when the walk met them again rather
+/// than looping: a graph being laid out may well contain the cycle the user is
+/// about to repair, and a layout that hangs on unrepaired input is useless at
+/// the moment it is needed.
+pub fn depths(refs: &Refs, nodes: &[CurveId]) -> BTreeMap<CurveId, usize> {
+    fn go(
+        refs: &Refs,
+        at: CurveId,
+        seen: &mut BTreeSet<CurveId>,
+        memo: &mut BTreeMap<CurveId, usize>,
+    ) -> usize {
+        if let Some(d) = memo.get(&at) {
+            return *d;
+        }
+        if !seen.insert(at) {
+            return 0;
+        }
+        let d = refs
+            .outgoing(at)
+            .iter()
+            .map(|e| go(refs, e.to, seen, memo) + 1)
+            .max()
+            .unwrap_or(0);
+        seen.remove(&at);
+        memo.insert(at, d);
+        d
+    }
+    let mut memo = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    for n in nodes {
+        go(refs, *n, &mut seen, &mut memo);
+    }
+    memo.retain(|k, _| nodes.contains(k));
+    memo
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +471,87 @@ mod tests {
         assert!(promote_to_dummy(&graph(), &Refs::new(), &[], (Ticks(0), Ticks(1)), 120).is_none());
         assert!(promote_to_dummy(&graph(), &Refs::new(), &[CurveId(1)], (Ticks(0), Ticks(1)), 120)
             .is_none());
+    }
+
+    // ── chaining ─────────────────────────────────────────────────────────
+
+    fn dummy(id: u64, from: &[(u64, u32)], gen: u32) -> Dummy {
+        Dummy {
+            id: CurveId(id),
+            from: from.iter().map(|(c, g)| (CurveId(*c), *g)).collect(),
+            generation: gen,
+        }
+    }
+
+    /// THE CHAIN HAZARD. D2 froze from D1 at generation 0; D1 has since been
+    /// re-promoted to 1, so D2 describes a shape that exists nowhere. Nothing
+    /// about its values reveals that -- the numbers are plausible and the
+    /// curve draws.
+    #[test]
+    fn a_dummy_frozen_from_a_re_promoted_dummy_is_stale() {
+        let d1 = dummy(1, &[], 1);
+        let d2 = dummy(2, &[(1, 0)], 0);
+        assert_eq!(stale_against(&[d1, d2]), vec![(CurveId(2), CurveId(1))]);
+    }
+
+    /// Up to date is silent -- a warning that fires on a healthy chain is a
+    /// warning people turn off.
+    #[test]
+    fn a_chain_that_has_not_moved_reports_nothing() {
+        let d1 = dummy(1, &[], 3);
+        let d2 = dummy(2, &[(1, 3)], 0);
+        assert!(stale_against(&[d1, d2]).is_empty());
+    }
+
+    /// The pair names the ROPE, not just the node: "stale" without saying
+    /// against what leaves the person hunting.
+    #[test]
+    fn staleness_names_the_relationship_that_went_bad() {
+        let d1 = dummy(1, &[], 2);
+        let d3 = dummy(3, &[], 5);
+        let d2 = dummy(2, &[(1, 0), (3, 5)], 0);
+        let stale = stale_against(&[d1, d3, d2]);
+        assert_eq!(stale, vec![(CurveId(2), CurveId(1))],
+                   "only the edge that moved, not every edge of a stale node");
+    }
+
+    /// LONGEST PATH, not shortest. A node fed by both a root and a deep chain
+    /// must sit past the chain, or its rope runs backwards across the graph --
+    /// the tangle a rope UI exists to avoid.
+    #[test]
+    fn layout_depth_uses_the_longest_path_so_ropes_run_forward() {
+        let mut r = Refs::new();
+        // 4 -> 3 -> 2 -> 1, and also 4 -> 1 directly.
+        r.link(CurveId(4), CurveId(3), 1.0);
+        r.link(CurveId(3), CurveId(2), 1.0);
+        r.link(CurveId(2), CurveId(1), 1.0);
+        r.link(CurveId(4), CurveId(1), 1.0);
+        let d = depths(&r, &[CurveId(1), CurveId(2), CurveId(3), CurveId(4)]);
+        assert_eq!(d[&CurveId(1)], 0);
+        assert_eq!(d[&CurveId(2)], 1);
+        assert_eq!(d[&CurveId(3)], 2);
+        assert_eq!(d[&CurveId(4)], 3, "the shortcut must not pull 4 forward");
+        // Every rope runs strictly left to right.
+        for e in r.edges() {
+            assert!(d[&e.from] > d[&e.to], "{:?} -> {:?} runs backwards", e.from, e.to);
+        }
+    }
+
+    /// A layout is most needed while the graph is still broken, so it must not
+    /// hang on the cycle the user is about to repair.
+    #[test]
+    fn a_cyclic_graph_still_lays_out() {
+        let mut r = Refs::new();
+        r.link(CurveId(1), CurveId(2), 1.0);
+        r.link(CurveId(2), CurveId(1), 1.0);
+        let d = depths(&r, &[CurveId(1), CurveId(2)]);
+        assert_eq!(d.len(), 2, "both nodes placed rather than hanging");
+    }
+
+    /// An unreferenced curve is a root at column zero, not missing.
+    #[test]
+    fn an_isolated_curve_sits_at_the_start() {
+        let d = depths(&Refs::new(), &[CurveId(7)]);
+        assert_eq!(d[&CurveId(7)], 0);
     }
 }
