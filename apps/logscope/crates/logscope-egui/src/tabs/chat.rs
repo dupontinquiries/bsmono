@@ -1082,7 +1082,10 @@ pub struct Chat {
     /// staff against; `:enlist` grows it when the Queen designs a new one. Session-lifetime only —
     /// not persisted across restarts, since a worker's memory directory (not this roster entry) is
     /// what `docs/12-queen-and-workers.md` says should survive a restart.
-    roster: logscope_fan::roster::Roster,    /// The strongest thing the reply in flight may assert.
+    roster: logscope_fan::roster::Roster,
+    /// Heroes enlisted this session (finite-state workers — `logscope_fan::hero`). Session-lifetime,
+    /// like the roster; handed to every agent run through `AgentConfig::extra_heroes`.
+    heroes: Vec<logscope_fan::hero::Hero>,    /// The strongest thing the reply in flight may assert.
     ///
     /// Set by the routing matrix when a generation starts. Held so the
     /// reply can be recorded at its real epistemic kind rather than
@@ -1254,6 +1257,7 @@ impl Default for Chat {
             expanded_msgs: Default::default(),
             hud: crate::liaisonhud::Hud::new(8), hud_narration: String::new(),
             roster: logscope_fan::roster::seed_roster(),
+            heroes: Vec::new(),
             route_ceiling: None,
             workers: crate::workerroster::WorkerRoster::new(),
             route_persona: None,
@@ -3383,6 +3387,29 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
         let Some(text) = reply else {
             return ":enlist — no assistant reply to parse yet; :queen a task and send it first".into();
         };
+        // A HERO is a spec plus a machine. If the reply has a `State NAME:` line it is one — parse
+        // and validate it as such (against a stable holding the seeds and the heroes already
+        // enlisted, so sub-hero references and duplicate names are checked for real), and put its
+        // spec on the roster too: a hero is a worker, and the Delegator should be able to see it.
+        if text.lines().any(|l| l.trim_start().starts_with("State ")) {
+            return match logscope_fan::hero::Hero::parse(&text) {
+                Err(e) => format!(":enlist — the hero didn't parse: {e}"),
+                Ok(hero) => {
+                    let mut st = logscope_fan::hero::seed_stable(crate::workspace_exec::RUNTIME_TOOLS);
+                    for h in &self.heroes { let _ = st.add(h.clone(), crate::workspace_exec::RUNTIME_TOOLS); }
+                    match st.add(hero.clone(), crate::workspace_exec::RUNTIME_TOOLS) {
+                        Err(e) => format!(":enlist — hero {} refused: {e}", hero.spec.name),
+                        Ok(()) => {
+                            let (name, n_states) = (hero.spec.name.clone(), hero.machine.states.len());
+                            let gate = match &hero.gate { Some(g) => format!("fires {:?}", g.on), None => "called only".into() };
+                            self.roster.add(hero.spec.clone());
+                            self.heroes.push(hero);
+                            format!("🦸 enlisted hero {name} — {n_states} state(s), {gate}; {} hero(es) this session", self.heroes.len())
+                        }
+                    }
+                }
+            };
+        }
         match logscope_fan::queen::WorkerSpec::parse(&text) {
             Err(e) => format!(":enlist — the reply didn't parse as a spec: {}", e.correction()),
             Ok(spec) => match spec.validate(crate::workspace_exec::RUNTIME_TOOLS) {
@@ -3413,6 +3440,11 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
         // to Mid for everything — the harness's "unknown" — so a 1B drowns in reads it cannot hold
         // and a large model gets a transcript bound far below what its window could carry.
         cfg.model_label = self.model_label();
+        // Hero reflexes (logscope_fan::hero): model-free procedures that read the code at a compiler
+        // error / find a failed test BEFORE the model has to ask — one generation saved per firing.
+        // On in the app; LOGSCOPE_REFLEXES=0 is the off switch while this is new.
+        cfg.reflexes = std::env::var("LOGSCOPE_REFLEXES").as_deref() != Ok("0");
+        cfg.extra_heroes = self.heroes.clone();
         // The mode picker records the intent; this is where the intent takes effect. StatefulGuide
         // arms engmode's phase machine (evidence-decided position, claim-gating, stall→blocked) and
         // green-state checkpoints — the long-horizon posture for a big `.gitmind` tree.

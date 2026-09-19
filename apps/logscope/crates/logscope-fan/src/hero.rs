@@ -64,8 +64,11 @@ pub trait ToolPort {
 
 // ───────────────────────────────────── patterns ─────────────────────────────────────
 
-/// What a hole may swallow. Classes are greedy and never backtrack, which is what keeps a match
-/// predictable: a class takes every character it allows, and the next literal must follow.
+/// What a hole may swallow. A hole takes the characters its class allows and STOPS WHERE THE NEXT
+/// LITERAL BEGINS — so `TODO({who:word})` captures `ada` from `TODO(ada)`, not `ada)`. (The first
+/// version was purely greedy: `word` swallowed the `)` and the pattern could never match. The seed
+/// heroes never noticed, because their classes happen to exclude their delimiters; the first hero
+/// enlisted from text did.) A hole at the end of a pattern takes everything its class allows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
     /// Non-whitespace.
@@ -150,7 +153,7 @@ impl Pattern {
     fn match_at(&self, text: &str, start: usize) -> Option<(Vec<(String, String)>, usize)> {
         let mut at = start;
         let mut caps = Vec::new();
-        for seg in &self.segs {
+        for (si, seg) in self.segs.iter().enumerate() {
             match seg {
                 Seg::Lit(l) => { if !text[at..].starts_with(l.as_str()) { return None; } at += l.len(); }
                 Seg::Hole(name, class) => {
@@ -161,7 +164,15 @@ impl Pattern {
                         Class::Path | Class::File => c.is_ascii_alphanumeric() || "_./+-".contains(c),
                         Class::Rest => c != '\n' && c != '\r',
                     };
-                    let len: usize = rest.chars().take_while(|&c| allowed(c)).map(char::len_utf8).sum();
+                    // stop early where the following literal begins (a hole is never empty, so the
+                    // literal may not claim the hole's first character)
+                    let stop_at = match self.segs.get(si + 1) { Some(Seg::Lit(l)) => Some(l.as_str()), _ => None };
+                    let mut len = 0usize;
+                    for c in rest.chars() {
+                        if !allowed(c) { break; }
+                        if len > 0 && stop_at.is_some_and(|l| rest[len..].starts_with(l)) { break; }
+                        len += c.len_utf8();
+                    }
                     if len == 0 { return None; }
                     let got = &rest[..len];
                     if *class == Class::File {
@@ -568,6 +579,163 @@ impl Hero {
     }
 }
 
+// ───────────────────────────────────── the text form ─────────────────────────────────────
+
+/// What the Queen (or the operator) is told when asked to design a hero. The format below is what
+/// [`Hero::parse`] reads; the header is a `WorkerSpec`, so the same `validate` rules apply.
+pub const HERO_FORMAT: &str = r#"A HERO is a worker that is a fixed procedure, not a model. Write one as:
+
+Name: error-locator
+Purpose: show the code at the compiler error the last turn produced
+Tools:
+- read_range
+Success:
+- the output contains the file and line of the first error
+Gate: after-observation
+  contains "error"
+  matches "--> {file:path}:{line:int}:"
+State read: call read_range path=${file} start=${line-8} end=${line+8}
+  ok -> report
+  else -> yield could not read ${file}
+State report: emit the code at ${file}:${line}:\n${obs}
+  not visits>1 and wake-matches "--> {file:path}:{line:int}:" -> read
+  else -> done
+
+Rules. Gate is `task-start` or `after-observation`, then one guard per indented line (all must hold);
+omit Gate for a hero that is only ever called. The FIRST State is the start. An action is one of
+`call TOOL key=value …` (quote a value with spaces), `emit TEXT`, `set SLOT = TEXT`, `sub HERO`, `nop`.
+Each indented line under a State is `GUARD -> TARGET`; the first that holds is taken, and the LAST must
+be `else`. GUARD is terms joined by ` and `: ok, failed, else, contains "T", matches "P",
+wake-matches "P", set SLOT, SLOT == "T", visits>N, and `not TERM`. TARGET is a state name, `done`,
+`fail`, or `yield REASON`. In a pattern P, `{name:class}` captures into ${name}; classes are word, int,
+path, file, rest. In text T, ${name}, ${name+N}, ${name-N}, ${name:last}, ${obs}, ${task} expand.
+Only tools listed under Tools may be called, and a hero that writes needs an Owns lane like any worker."#;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParseError { pub line: usize, pub why: String }
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "line {}: {}", self.line, self.why) }
+}
+
+/// Split on whitespace, keeping "double quoted" runs (with `\"` and `\\`) as one token, quotes removed.
+fn tokens(s: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_q = false; let mut any = false;
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '"' => { in_q = !in_q; any = true; }
+            '\\' if in_q => match it.next() { Some('n') => cur.push('\n'), Some(o) => cur.push(o), None => return Err("dangling `\\`".into()) },
+            c if c.is_whitespace() && !in_q => { if any || !cur.is_empty() { out.push(std::mem::take(&mut cur)); any = false; } }
+            c => cur.push(c),
+        }
+    }
+    if in_q { return Err("unclosed `\"`".into()); }
+    if any || !cur.is_empty() { out.push(cur); }
+    Ok(out)
+}
+
+fn unescape(s: &str) -> String { s.replace("\\n", "\n").replace("\\t", "\t") }
+
+fn parse_term(toks: &[String]) -> Result<Guard, String> {
+    let pat = |s: &String| Pattern::parse(s).map_err(|e| e.to_string());
+    match toks {
+        [n, rest @ ..] if n == "not" && !rest.is_empty() => Ok(Guard::Not(Box::new(parse_term(rest)?))),
+        [t] if t == "ok" => Ok(Guard::Ok),
+        [t] if t == "failed" => Ok(Guard::Failed),
+        [t] if t == "else" || t == "always" => Ok(Guard::Always),
+        [k, v] if k == "contains" => Ok(Guard::Contains(v.clone())),
+        [k, v] if k == "matches" => Ok(Guard::Matches(pat(v)?)),
+        [k, v] if k == "wake-matches" => Ok(Guard::WakeMatches(pat(v)?)),
+        [k, v] if k == "set" => Ok(Guard::SlotSet(v.clone())),
+        [slot, eq, v] if eq == "==" => Ok(Guard::SlotEq(slot.clone(), v.clone())),
+        [t] if t.starts_with("visits>") => t["visits>".len()..].parse().map(Guard::VisitsOver).map_err(|_| format!("`{t}`: visits> needs a number")),
+        other => Err(format!("`{}` is not a guard — see the guard list (ok, failed, else, contains, matches, wake-matches, set, ==, visits>N, not)", other.join(" "))),
+    }
+}
+
+fn parse_guard(s: &str) -> Result<Guard, String> {
+    let toks = tokens(s)?;
+    let mut terms = Vec::new();
+    for part in toks.split(|t| t == "and") {
+        if part.is_empty() { return Err("an `and` with nothing beside it".into()); }
+        terms.push(parse_term(part)?);
+    }
+    Ok(if terms.len() == 1 { terms.pop().unwrap() } else { Guard::All(terms) })
+}
+
+impl Hero {
+    /// Read [`HERO_FORMAT`]. Forgiving about layout, strict about content — and it does NOT
+    /// validate: call [`Hero::validate`] (or [`Stable::add`], which does) with the runtime's tools.
+    pub fn parse(text: &str) -> Result<Hero, ParseError> {
+        let lines: Vec<&str> = text.lines().collect();
+        let body_at = lines.iter().position(|l| { let t = l.trim_start(); t.starts_with("Gate:") || t.starts_with("State ") })
+            .ok_or(ParseError { line: lines.len().max(1), why: "no `State NAME: ACTION` line — a hero needs at least one state".into() })?;
+        let spec = WorkerSpec::parse(&lines[..body_at].join("\n")).map_err(|e| ParseError { line: 1, why: e.correction() })?;
+
+        struct RawState { name: String, action: Action, edges: Vec<(Guard, String, usize)> }
+        let mut gate_on: Option<Trigger> = None;
+        let mut gate_terms: Vec<Guard> = Vec::new();
+        let mut states: Vec<RawState> = Vec::new();
+        let mut in_gate = false;
+        for (i, raw) in lines.iter().enumerate().skip(body_at) {
+            let ln = i + 1;
+            let err = |why: String| ParseError { line: ln, why };
+            let t = raw.trim();
+            if t.is_empty() || t.starts_with('#') { continue; }
+            if let Some(rest) = t.strip_prefix("Gate:") {
+                gate_on = Some(match rest.trim() { "task-start" => Trigger::TaskStart, "after-observation" => Trigger::AfterObservation,
+                    o => return Err(err(format!("`Gate: {o}` — use `task-start` or `after-observation`"))) });
+                in_gate = true; continue;
+            }
+            if let Some(rest) = t.strip_prefix("State ") {
+                in_gate = false;
+                let (name, act) = rest.split_once(':').ok_or_else(|| err("`State NAME: ACTION` — the colon is missing".into()))?;
+                let name = name.trim().to_string();
+                if name.is_empty() || ["done", "fail", "yield"].contains(&name.as_str()) { return Err(err(format!("`{name}` cannot be a state name (done, fail and yield are targets)"))); }
+                if states.iter().any(|s| s.name == name) { return Err(err(format!("state `{name}` is defined twice"))); }
+                let act = act.trim();
+                let (verb, arg) = act.split_once(char::is_whitespace).map(|(v, a)| (v, a.trim())).unwrap_or((act, ""));
+                let action = match verb {
+                    "nop" => Action::Nop,
+                    "emit" => Action::Emit(unescape(arg)),
+                    "sub" if !arg.is_empty() => Action::Sub(arg.to_string()),
+                    "set" => { let (slot, v) = arg.split_once('=').ok_or_else(|| err("`set SLOT = TEXT`".into()))?;
+                               Action::Set { slot: slot.trim().to_string(), value: unescape(v.trim()) } }
+                    "call" => { let toks = tokens(arg).map_err(&err)?;
+                        let (tool, kvs) = toks.split_first().ok_or_else(|| err("`call TOOL key=value …` — no tool named".into()))?;
+                        let mut args = Vec::new();
+                        for kv in kvs { let (k, v) = kv.split_once('=').ok_or_else(|| err(format!("`{kv}` is not key=value")))?; args.push((k.to_string(), v.to_string())); }
+                        Action::Call { tool: tool.clone(), args } }
+                    o => return Err(err(format!("`{o}` is not an action — use call, emit, set, sub or nop"))),
+                };
+                states.push(RawState { name, action, edges: Vec::new() });
+                continue;
+            }
+            if in_gate { gate_terms.push(parse_guard(t).map_err(err)?); continue; }
+            let Some(st) = states.last_mut() else { return Err(err("an edge line before any State".into())) };
+            let (g, target) = t.rsplit_once("->").ok_or_else(|| err("an edge is `GUARD -> TARGET`".into()))?;
+            st.edges.push((parse_guard(g.trim()).map_err(err)?, target.trim().to_string(), ln));
+        }
+        let index: BTreeMap<String, usize> = states.iter().enumerate().map(|(i, s)| (s.name.clone(), i)).collect();
+        let mut out = Vec::with_capacity(states.len());
+        for s in states {
+            let mut edges = Vec::new();
+            for (when, target, ln) in s.edges {
+                let next = if target == "done" { Next::Done(Outcome::Succeeded) }
+                    else if target == "fail" { Next::Done(Outcome::Failed) }
+                    else if let Some(why) = target.strip_prefix("yield") { Next::Yield(unescape(why.trim())) }
+                    else { Next::To(*index.get(&target).ok_or(ParseError { line: ln, why: format!("`-> {target}`: no state has that name (states: {})", index.keys().cloned().collect::<Vec<_>>().join(", ")) })?) };
+                edges.push(Edge { when, next });
+            }
+            out.push(State { name: s.name, action: s.action, edges });
+        }
+        let gate = gate_on.map(|on| Gate { on, when: match gate_terms.len() { 0 => Guard::Always, 1 => gate_terms.pop().unwrap(), _ => Guard::All(gate_terms) } });
+        Ok(Hero { spec, gate, machine: Machine { states: out, start: 0 } })
+    }
+}
+
 /// What a reflex did, for the HUD and the next prompt.
 #[derive(Clone, Debug)]
 pub struct Fired { pub hero: String, pub trace: Trace }
@@ -579,6 +747,9 @@ pub struct Stable {
     /// Per hero: the captures it last fired on. A persisting error would otherwise wake the same
     /// hero on the same site every turn, re-reading what the model already has.
     last: BTreeMap<String, BTreeMap<String, String>>,
+    /// Every firing this stable has made, in order: (hero, how it ended, calls made). The visible
+    /// half of the loop — "did a reflex run, and what happened" is a question with an answer.
+    history: Vec<(String, End, u32)>,
 }
 
 impl Stable {
@@ -586,6 +757,7 @@ impl Stable {
     pub fn len(&self) -> usize { self.heroes.len() }
     pub fn is_empty(&self) -> bool { self.heroes.is_empty() }
     pub fn names(&self) -> Vec<&str> { self.heroes.iter().map(|h| h.spec.name.as_str()).collect() }
+    pub fn history(&self) -> &[(String, End, u32)] { &self.history }
     pub fn get(&self, name: &str) -> Option<&Hero> { self.heroes.iter().find(|h| h.spec.name == name) }
     /// Every hero's spec — so a [`crate::roster::Roster`] can staff a hero by lane like any worker.
     pub fn specs(&self) -> Vec<WorkerSpec> { self.heroes.iter().map(|h| h.spec.clone()).collect() }
@@ -630,6 +802,7 @@ impl Stable {
             let consumed = probe.cur_cursor.max(probe.wake_cursor);
             let trace = h.machine.run_from(task, obs, consumed, obs_ok, seed.clone(), port, &subs, limits);
             self.last.insert(name.clone(), seed);
+            self.history.push((name.clone(), trace.end.clone(), trace.calls));
             return Some(Fired { hero: name, trace });
         }
         None
@@ -752,6 +925,15 @@ error[E0308]: mismatched types\n --> src/model.rs:12:20\n\nerror: could not comp
         for not_a_file in ["make the renderer faster", "use v1.2 of the api", "see ../../etc/passwd.txt", "and/or maybe"] {
             assert!(f.find(not_a_file, 0).is_none(), "{not_a_file:?} is not a file in a tree");
         }
+        // a hole stops where the next literal begins — the natural thing to write must work
+        let todo = Pattern::parse("TODO({who:word})").unwrap();
+        assert_eq!(todo.find("see TODO(ada) and TODO(grace-h), soon", 0).unwrap().0[0].1, "ada");
+        let (_, e) = todo.find("see TODO(ada) and TODO(grace-h), soon", 0).unwrap();
+        assert_eq!(todo.find("see TODO(ada) and TODO(grace-h), soon", e).unwrap().0[0].1, "grace-h");
+        let arrow = Pattern::parse("{from:rest} -> {to:rest}").unwrap();
+        assert_eq!(arrow.find("src/a.rs -> src/b.rs", 0).unwrap().0, [("from".into(), "src/a.rs".into()), ("to".into(), "src/b.rs".into())]);
+        assert!(todo.find("TODO() nobody", 0).is_none(), "a hole is never empty");
+        assert_eq!(Pattern::parse("v{maj:int}.{min:int}").unwrap().find("rustc v1.96", 0).unwrap().0[1].1, "96");
         // refusals say what to change
         for (bad, why) in [("{a}{b}", "two holes"), ("plain", "no hole"), ("{x:regex}", "unknown class"), ("{", "unclosed"), ("{:int}", "needs a name")] {
             let HeroError::BadPattern { why: w, .. } = Pattern::parse(bad).unwrap_err() else { panic!() };
@@ -799,9 +981,12 @@ error[E0308]: mismatched types\n --> src/model.rs:12:20\n\nerror: could not comp
         // a confined worker whose whitelist lacks read_range never gets error-locator …
         let reader_without_range = vec!["read_file".to_string(), "search".to_string()];
         assert!(st.fire(Trigger::AfterObservation, "t", RUSTC, false, &reader_without_range, &mut port, Limits::default()).is_none());
+        assert!(st.history().is_empty() && port.log.is_empty(), "SKIPPED, not fired-and-refused: no history, no call");
         // … and one that has it, does
         let with_range = vec!["read_range".to_string()];
         assert!(st.fire(Trigger::AfterObservation, "t", RUSTC, false, &with_range, &mut port, Limits::default()).is_some());
+        assert_eq!(st.history().len(), 1);
+        assert_eq!(st.history()[0].0, "error-locator");
         // triggers are not interchangeable: a task naming a file does not fire after-observation heroes
         let mut st3 = seed_stable(TOOLS);
         let mut p3 = Script::default().on("read_file path=src/ui.rs", true, "fn draw() {}");
@@ -931,6 +1116,61 @@ error[E0308]: mismatched types\n --> src/model.rs:12:20\n\nerror: could not comp
         // same inputs, same run — there is no RNG to seed
         let mut port2 = Script::default().on("list_dir", true, "src").on("git_log", true, "abc fix");
         assert_eq!(m.run("t", "", true, BTreeMap::new(), &mut port2, &no_subs, Limits::default()), t);
+    }
+
+    /// The format the Queen is shown must PARSE, must VALIDATE, and must be the same machine as
+    /// the hand-built seed hero — otherwise the documentation teaches a hero that does not run.
+    #[test]
+    fn the_documented_format_is_the_seed_hero() {
+        let example = HERO_FORMAT.split_once("Write one as:\n\n").unwrap().1.split_once("\n\nRules.").unwrap().0;
+        let h = Hero::parse(example).expect("the example in HERO_FORMAT parses");
+        assert_eq!(h.validate(TOOLS), Ok(()));
+        let seed = seed_stable(TOOLS);
+        let built = seed.get("error-locator").unwrap();
+        assert_eq!(h.gate, built.gate, "the gate");
+        assert_eq!(h.machine.states[0].action, built.machine.states[0].action, "the call and its window arithmetic");
+        assert_eq!(h.machine.states[1].edges, built.machine.states[1].edges, "the bounded loop to the next site");
+        // and it RUNS the same: both sites read, through a fresh stable holding only the parsed hero
+        let mut st = Stable::new(); st.add(h, TOOLS).unwrap();
+        let mut port = Script::default().on("read_range", true, "code");
+        let f = st.fire(Trigger::AfterObservation, "t", RUSTC, false, &[], &mut port, Limits::default()).unwrap();
+        assert_eq!(port.log, ["read_range path=src/ui.rs start=80 end=96", "read_range path=src/model.rs start=4 end=20"]);
+        assert!(f.trace.succeeded());
+    }
+
+    /// Every refusal names a line and says what to write instead.
+    #[test]
+    fn a_malformed_hero_is_refused_by_line() {
+        let head = "Name: hero-x\nPurpose: p\nTools:\n- read_file\nSuccess:\n- the output contains the file\n";
+        for (body, line, want) in [
+            ("State a: teleport x\n  else -> done", 7, "not an action"),
+            ("State a: nop\n  maybe -> done", 8, "is not a guard"),
+            ("State a: nop\n  else -> nowhere", 8, "no state has that name"),
+            ("State a: nop\n  else done", 8, "GUARD -> TARGET"),
+            ("Gate: sometimes\nState a: nop\n  else -> done", 7, "task-start"),
+            ("State a: call read_file path\n  else -> done", 7, "not key=value"),
+            ("State a: nop\n  matches \"{a}{b}\" -> done\n  else -> done", 8, "two holes"),
+            ("State a: nop\n  else -> done\nState a: nop\n  else -> done", 9, "defined twice"),
+            ("State done: nop\n  else -> done", 7, "cannot be a state name"),
+            ("State a: nop\n  contains \"x -> done", 8, "unclosed"),
+        ] {
+            let e = Hero::parse(&format!("{head}{body}")).unwrap_err();
+            assert!(e.line == line && e.why.contains(want), "{body:?}: got line {} {:?}", e.line, e.why);
+        }
+        assert!(Hero::parse(head).unwrap_err().why.contains("at least one state"));
+        // The header IS a WorkerSpec, read by WorkerSpec::parse — which already refuses a nameless
+        // one (I had assumed that was left to validate). The refusal is the spec's own correction.
+        let e = Hero::parse("Purpose: p\nState a: nop\n  else -> done").unwrap_err();
+        assert!(e.why.contains("name"), "{e}");
+        // what parse does NOT check is the machine against the tools: that is validate's
+        let sneaky = Hero::parse(&format!("{head}State a: call write_file path=x\n  else -> done")).expect("well-formed");
+        assert_eq!(sneaky.validate(TOOLS), Err(HeroError::ToolNotWhitelisted { state: "a".into(), tool: "write_file".into() }));
+        // quoting: a value with spaces, an escaped quote, `\n` in an emit, forward references
+        let h = Hero::parse(&format!("{head}State a: call read_file path=\"my file.rs\"\n  ok and contains \"say \\\"hi\\\"\" -> b\n  else -> fail\nState b: emit one\\ntwo\n  else -> done")).unwrap();
+        assert_eq!(h.machine.states[0].action, call("read_file", &[("path", "my file.rs")]));
+        assert_eq!(h.machine.states[0].edges[0].when, Guard::All(vec![Guard::Ok, Guard::Contains("say \"hi\"".into())]));
+        assert_eq!(h.machine.states[1].action, Action::Emit("one\ntwo".into()));
+        assert_eq!(h.machine.states[0].edges[1].next, Next::Done(Outcome::Failed));
     }
 
     #[test]

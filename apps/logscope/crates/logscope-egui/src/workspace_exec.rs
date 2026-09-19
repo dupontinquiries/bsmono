@@ -1642,6 +1642,16 @@ pub struct AgentConfig {
     /// `Workspace` (enforcement) AND to `system_prompt` (the model is only taught what it has).
     /// Set together with `owns` from one `deploy::Confinement` — see `Chat::stage_lane`.
     pub tools: Vec<String>,
+    /// Run the hero stable's REFLEXES (`logscope_fan::hero`): fixed, model-free procedures that
+    /// fire on a turn's observation — read the code at a compiler error, find a failed test — so
+    /// the model's next turn starts with the evidence instead of asking for it. Off by default
+    /// here so every existing caller and fixture is byte-identical; the app turns it on (see
+    /// `Chat`), and `LOGSCOPE_REFLEXES=0` turns it back off.
+    pub reflexes: bool,
+    /// Heroes enlisted this session (`:enlist` on a hero definition), added to the seed stable at
+    /// run start. Each is re-validated there: a hero that stopped validating is skipped and named
+    /// on stderr, never run.
+    pub extra_heroes: Vec<logscope_fan::hero::Hero>,
     /// Where irreversible actions are recorded. None = no audit (tests, previews).
     pub audit_log: Option<std::path::PathBuf>,
     /// Verify-as-you-go (1): after a turn that WROTE a file whose extension is in `verify_exts`, run this
@@ -1767,6 +1777,8 @@ impl Default for AgentConfig {
             profiles: Vec::new(),
             owns: Vec::new(),
             tools: Vec::new(),
+            reflexes: false,
+            extra_heroes: Vec::new(),
         }
     }
 }
@@ -2969,6 +2981,66 @@ Emit one or a few tool calls per turn, then wait for results.{patch_note}{verify
 }
 
 /// Format a batch of tool results as the observation appended to the prompt for the next turn.
+/// A hero's hands. `logscope_fan::hero` machines act only through `ToolPort`; this is that port
+/// over the run's own `Workspace`.
+///
+/// The call is rendered as the same flat JSON block a model would emit and sent through the same
+/// `parse_one` → `Workspace::apply`. Deliberately not a second dispatch table: `apply` is where
+/// the tool WHITELIST and the LANE are enforced, so a hero firing inside a confined worker's run
+/// is confined exactly as that worker is, by the same code, with no new place to forget a check.
+impl logscope_fan::hero::ToolPort for Workspace {
+    fn call(&mut self, tool: &str, args: &[(String, String)]) -> logscope_fan::hero::Obs {
+        let mut block = format!("{{\"tool\": {}", json_quote(tool));
+        for (k, v) in args {
+            // argv is the one array-typed field; a hero writes it as a command line
+            let key = if k == "argv" { "cmd" } else { k.as_str() };
+            block.push_str(&format!(", {}: {}", json_quote(key), json_quote(v)));
+        }
+        block.push('}');
+        match parse_one(&block) {
+            Some(t) => { let r = self.apply(&t); logscope_fan::hero::Obs { ok: r.ok, text: r.output } }
+            None => logscope_fan::hero::Obs { ok: false, text: format!("`{tool}` with these arguments is not a call this runtime can make: {block}") },
+        }
+    }
+}
+
+/// The run's hero stable: the seed reflexes plus whatever was enlisted this session. `None` when
+/// reflexes are off, so an off run does not even build one.
+fn run_stable(cfg: &AgentConfig) -> Option<logscope_fan::hero::Stable> {
+    if !cfg.reflexes { return None; }
+    let mut st = logscope_fan::hero::seed_stable(RUNTIME_TOOLS);
+    for h in &cfg.extra_heroes {
+        if let Err(e) = st.add(h.clone(), RUNTIME_TOOLS) { eprintln!("agent: hero `{}` not loaded — {e}", h.spec.name); }
+    }
+    Some(st)
+}
+
+/// Show this turn's observation to the hero stable and, if a reflex fires, append what it found.
+///
+/// WHAT THIS SAVES. After a failed check the model's next turn is, overwhelmingly, "read the file
+/// at the line the error named" — a full generation to produce one mechanical tool call, then
+/// another to act on the result. The reflex makes that call now, with no model in the loop, so the
+/// model's next turn starts WITH the code. One turn saved per firing; a shut gate costs a scan.
+///
+/// `turn_obs` is only what THIS turn produced (tool results + the verification block), never the
+/// whole transcript: a gate matching an error from six turns ago would fire forever.
+fn fire_reflexes(stable: &mut logscope_fan::hero::Stable, on: logscope_fan::hero::Trigger, task: &str,
+                 turn_obs: &str, turn_ok: bool, ws: &mut Workspace, cfg: &AgentConfig, prompt: &mut String) -> Option<String> {
+    let limits = logscope_fan::hero::Limits {
+        // A reflex's report competes with the task for a small model's window. An eighth of the
+        // prompt budget, within sane bounds; 0 means "derive from the model class" upstream.
+        max_report_bytes: if cfg.max_prompt_bytes == 0 { 3000 } else { (cfg.max_prompt_bytes / 8).clamp(800, 4000) },
+        max_calls: 4,
+        ..Default::default()
+    };
+    let fired = stable.fire(on, task, turn_obs, turn_ok, &cfg.tools, ws, limits)?;
+    let t = &fired.trace;
+    if !t.report.is_empty() {
+        prompt.push_str(&format!("\n\nREFLEX ({} — a fixed procedure ran these reads for you, no model involved):\n{}\n", fired.hero, t.report));
+    }
+    Some(format!("reflex {}: {} call(s), {:?}", fired.hero, t.calls, t.end))
+}
+
 fn observation(results: &[(Tool, ToolResult)]) -> String {
     let mut s = String::from("\n\nTOOL RESULTS:\n");
     for (t, r) in results {
@@ -2990,6 +3062,7 @@ fn step_turn(
     plan: &mut Plan, verified: &mut bool, step: usize, guard: &mut crate::repetition::LoopGuard,
     ladder: &mut crate::line_calls::RefusalLadder,
     mut guide: Option<&mut crate::phase_guide::Guide>,
+    reflexes: Option<&mut logscope_fan::hero::Stable>,
 ) -> (Vec<(Tool, ToolResult)>, Option<Stop>) {
     // AUTHORISE BEFORE PARSING. Everything below reads `text` for tool calls, so the gate must run
     // first or a quoted call is already through. With ToolGate::Open this is a pass-through, which
@@ -3216,6 +3289,9 @@ cannot be covered by a test, say so explicitly and why.)\n"));
         let res = ws.apply(&tool);
         results.push((tool, res));
     }
+    // Where this turn's observation BEGINS in the prompt — the reflexes below see only what this
+    // turn produced (tool results + verification), never an error from six turns ago.
+    let turn_obs_from = prompt.len();
     prompt.push_str(&observation(&results));
 
     // Verify-as-you-go (1): don't verify on the final step (the model can't act on it).
@@ -3281,6 +3357,18 @@ call — this run cannot be marked complete until they are green.)\n"));
         if all_ok && cfg.checkpoint_on_green {
             if let Some(h) = ws.git_checkpoint(&format!("agent checkpoint: `{}` green", cfg.verify_cmd.join(" "))) {
                 prompt.push_str(&format!("(checkpoint {h} committed — this green state is a restore point)\n"));
+            }
+        }
+    }
+
+    // REFLEXES. After the tools and the verifier have spoken and before the model does again.
+    // Not on the final step: nobody would read what the reflex found.
+    if let Some(stable) = reflexes {
+        if step + 1 < cfg.max_steps {
+            let turn_obs = prompt[turn_obs_from..].to_string();
+            let turn_ok = results.iter().all(|(_, r)| r.ok) && (check_obs.is_none() || *verified);
+            if let Some(line) = fire_reflexes(stable, logscope_fan::hero::Trigger::AfterObservation, "", &turn_obs, turn_ok, ws, cfg, prompt) {
+                eprintln!("agent: {line}");
             }
         }
     }
@@ -3476,6 +3564,11 @@ pub fn run_agent_cfg(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, cfg: &Ag
         // the model sees it before its first reply, not after.
         prompt.push_str(&g.prompt());
     }
+    // One stable per RUN: its "already reported this site" memory must outlive a turn.
+    let mut heroes = run_stable(cfg);
+    if let Some(st) = heroes.as_mut() {
+        if let Some(line) = fire_reflexes(st, logscope_fan::hero::Trigger::TaskStart, task, task, true, ws, cfg, &mut prompt) { eprintln!("agent: {line}"); }
+    }
     let mut turns = Vec::new();
     let mut plan = Plan::default();
     // TWO MEANINGS ON ONE BOOLEAN. This starts true when no verify command is configured, which is
@@ -3501,7 +3594,7 @@ pub fn run_agent_cfg(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, cfg: &Ag
             Ok(t) => t,
             Err(e) => return Session { turns, stop: Stop::ModelError(e), files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier },
         };
-        let (results, stop) = step_turn(&text, &mut prompt, ws, cfg, &mut plan, &mut verified, step, &mut guard, &mut ladder, guide.as_mut());
+        let (results, stop) = step_turn(&text, &mut prompt, ws, cfg, &mut plan, &mut verified, step, &mut guard, &mut ladder, guide.as_mut(), heroes.as_mut());
         turns.push(Turn { model_text: text, results });
         if let Some(stop) = stop {
             return Session { turns, stop, files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier };
@@ -3545,6 +3638,9 @@ pub struct AgentRun {
     ladder: crate::line_calls::RefusalLadder,
     /// StatefulGuide's phase machine, when `cfg.stateful_guide` — the run's evidence-decided position.
     guide: Option<crate::phase_guide::Guide>,
+    /// The hero stable, when `cfg.reflexes`. Per run, because it remembers which sites it has
+    /// already reported (a persisting error must not re-read the same window every turn).
+    heroes: Option<logscope_fan::hero::Stable>,
     /// Turns elided by transcript compaction so far. Surfaced so "the model forgot" has an answer
     /// other than a guess.
     compacted: usize,
@@ -3578,6 +3674,13 @@ impl AgentRun {
             // gating it on the model's allowlist made any non-cargo suite structurally unverifiable.
             .allow_also(cfg.verify_cmd.first().cloned())
             .allow_also(cfg.extra_allow.clone());
+        let mut ws = ws;
+        let mut prompt = prompt;
+        let mut heroes = run_stable(&cfg);
+        if let Some(st) = heroes.as_mut() {
+            // Before `prompt` is cloned into the run AND returned to the caller, so both carry it.
+            if let Some(line) = fire_reflexes(st, logscope_fan::hero::Trigger::TaskStart, task, task, true, &mut ws, &cfg, &mut prompt) { eprintln!("agent: {line}"); }
+        }
         let run = Self {
             ws, prompt: prompt.clone(), reply: String::new(),
             plan: Plan::default(), verified, step: 0, turns: 0, cfg,
@@ -3586,12 +3689,24 @@ impl AgentRun {
             // Mirrors the Session field: a run with no verifier must not read as one that passed.
             had_verifier,
             guide,
+            heroes,
             compacted: 0,
             task: task.to_string(),
             started: std::time::Instant::now(),
             lane_refusals: 0,
         };
         (run, prompt)
+    }
+
+    /// The growing prompt, for tests in OTHER modules that drive a real run (the field is private
+    /// and this module's own tests read it directly).
+    #[cfg(test)]
+    pub(crate) fn prompt_for_test(&self) -> &str { &self.prompt }
+
+    /// Every reflex this run fired: (hero, how it ended, tool calls made). Empty when reflexes are
+    /// off or nothing matched. For the HUD and for anyone asking "why was that turn not needed".
+    pub fn reflex_history(&self) -> &[(String, logscope_fan::hero::End, u32)] {
+        self.heroes.as_ref().map(|s| s.history()).unwrap_or(&[])
     }
 
     /// Append a streamed token to the current turn's reply.
@@ -3606,7 +3721,7 @@ impl AgentRun {
     /// The worker finished a turn: process the accumulated reply and decide the next action.
     pub fn on_done(&mut self) -> AgentStep {
         let text = std::mem::take(&mut self.reply);
-        let (results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step, &mut self.guard, &mut self.ladder, self.guide.as_mut());
+        let (results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step, &mut self.guard, &mut self.ladder, self.guide.as_mut(), self.heroes.as_mut());
         self.turns += 1;
         self.step += 1;
         if let Some(stop) = stop { return AgentStep::Finished(stop); }
@@ -5859,6 +5974,121 @@ mod long_horizon_tests {
             verify_cmd: Vec::new(), verify_exts: Vec::new(), ..Default::default() };
         let (_stop, run2) = drive(&d2, "summarise the crate", open, &script);
         assert!(d2.join("src/sneaky.rs").exists(), "unconfined, the same script writes: {:?}", run2.events());
+    }
+
+    fn run_call(argv: &[&str]) -> String {
+        format!("```tool\n{{\"tool\":\"run\",\"argv\":[{}]}}\n```", argv.iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(","))
+    }
+    const BUILD_LOG: &str = "error[E0425]: cannot find value `total` in this scope\n --> src/ui.rs:6:9\n  |\n6 |         total + 1\n";
+    fn hero_ws(tag: &str) -> std::path::PathBuf {
+        let d = tmp(tag);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(d.join("src/ui.rs"), (1..=12).map(|i| format!("// ui line {i}\n")).collect::<String>()).unwrap();
+        std::fs::write(d.join("build.log"), BUILD_LOG).unwrap();
+        d
+    }
+
+    /// A REFLEX THROUGH THE REAL LOOP. The model's turn surfaces a compiler error; before the model
+    /// speaks again the error-locator hero has read the code at that line — through the run's own
+    /// Workspace, no model involved — and the next prompt carries it. The turn the model would
+    /// have spent asking for `src/ui.rs` near line 6 is not needed.
+    #[test]
+    fn a_reflex_reads_the_error_site_between_model_turns() {
+        let d = hero_ws("hero-reflex");
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6, verify_cmd: Vec::new(), verify_exts: Vec::new(),
+            reflexes: true, ..Default::default() };
+        let (mut run, _first) = AgentRun::start(&d, "fix the build", cfg);
+        run.on_token(&run_call(&["cat", "build.log"]));
+        let _ = run.on_done();
+        assert!(run.prompt.contains("REFLEX (error-locator"), "no reflex block in the next prompt:\n{}", &run.prompt[run.prompt.len().saturating_sub(900)..]);
+        assert!(run.prompt.contains("the code at src/ui.rs:6") && run.prompt.contains("// ui line 6") && run.prompt.contains("// ui line 12"),
+                "the window around line 6 should be in the prompt");
+        assert!(run.ws.events().is_empty(), "a reflex reads; it never writes");
+        // the complement: reflexes off = the same turn, no reflex text — every existing run is unchanged
+        let d2 = hero_ws("hero-reflex-off");
+        let off = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6, verify_cmd: Vec::new(), verify_exts: Vec::new(), ..Default::default() };
+        let (mut run2, _) = AgentRun::start(&d2, "fix the build", off);
+        run2.on_token(&run_call(&["cat", "build.log"]));
+        let _ = run2.on_done();
+        assert!(run2.prompt.contains("cannot find value `total`") && !run2.prompt.contains("REFLEX"), "off must mean off");
+    }
+
+    /// A hero firing inside a CONFINED worker's run is confined as that worker is. A bee whose
+    /// whitelist has no read_range does not get error-locator at all (the stable skips it), and
+    /// one that has it, does — the whitelist decides, not the hero.
+    #[test]
+    fn a_reflex_obeys_the_staffed_workers_whitelist() {
+        for (tools, expect) in [(vec!["run"], false), (vec!["run", "read_range"], true)] {
+            let d = hero_ws(&format!("hero-confined-{}", tools.len()));
+            let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6, verify_cmd: Vec::new(), verify_exts: Vec::new(),
+                reflexes: true, tools: tools.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+            let (mut run, _) = AgentRun::start(&d, "fix the build", cfg);
+            run.on_token(&run_call(&["cat", "build.log"]));
+            let _ = run.on_done();
+            assert_eq!(run.prompt.contains("REFLEX (error-locator"), expect, "whitelist {tools:?}");
+            // SKIPPED, not fired-and-refused. With the prompt alone these look the same — the
+            // Workspace refuses the hero's read_range either way — but a hero that fires and is
+            // refused has also taken the turn from any later hero that WAS eligible.
+            assert_eq!(run.reflex_history().len(), expect as usize, "whitelist {tools:?}: {:?}", run.reflex_history());
+        }
+    }
+
+    /// A reflex sees THIS TURN's observation, not the transcript. Two different errors on two
+    /// turns must both be located. If the gate read the whole prompt it would find turn one's
+    /// site first, again, recognise it as already reported — and never reach turn two's.
+    #[test]
+    fn a_reflex_reads_this_turn_not_the_transcript() {
+        let d = hero_ws("hero-turn-scope");
+        std::fs::write(d.join("build2.log"), "error[E0308]: mismatched types\n --> src/ui.rs:11:1\n").unwrap();
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), reflexes: true, ..Default::default() };
+        let (mut run, _) = AgentRun::start(&d, "fix the build", cfg);
+        run.on_token(&run_call(&["cat", "build.log"]));  let _ = run.on_done();
+        run.on_token(&run_call(&["ls"]));                let _ = run.on_done();   // a quiet turn: nothing fires
+        assert_eq!(run.reflex_history().len(), 1, "a turn with no error must not re-find turn one's: {:?}", run.reflex_history());
+        run.on_token(&run_call(&["cat", "build2.log"])); let _ = run.on_done();
+        assert_eq!(run.reflex_history().len(), 2, "{:?}", run.reflex_history());
+        assert!(run.prompt.contains("the code at src/ui.rs:11"), "turn three's site was never located");
+        // and the SAME error surfacing again is not re-read
+        run.on_token(&run_call(&["cat", "build2.log"])); let _ = run.on_done();
+        assert_eq!(run.reflex_history().len(), 2, "the model already has that window");
+    }
+
+    /// TASK-START: the task names a file, so it is in the FIRST prompt — the one returned to the
+    /// caller and the one the run keeps, which must be the same text. A task naming a file that
+    /// does not exist yet adds nothing (and does not complain).
+    #[test]
+    fn a_task_that_names_a_file_starts_with_it_already_read() {
+        let d = hero_ws("hero-prefetch");
+        let cfg = || AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6, verify_cmd: Vec::new(), verify_exts: Vec::new(), reflexes: true, ..Default::default() };
+        let (run, first) = AgentRun::start(&d, "tidy src/ui.rs please", cfg());
+        assert!(first.contains("REFLEX (path-prefetch") && first.contains("// ui line 3"), "the first prompt should carry the file");
+        assert_eq!(first, run.prompt, "what the caller sends and what the run remembers must not diverge");
+        let (_, fresh) = AgentRun::start(&d, "create src/brand_new.rs with a main", cfg());
+        assert!(!fresh.contains("REFLEX"), "a file that does not exist yet is not an error worth a paragraph");
+        let (_, prose) = AgentRun::start(&d, "make the renderer faster", cfg());
+        assert!(!prose.contains("REFLEX"));
+    }
+
+    /// The port is `parse_one` + `apply` and nothing else: a hero's call is refused by the same
+    /// lane and whitelist checks, with the same words, as a model's.
+    #[test]
+    fn the_hero_port_is_the_model_s_tool_path() {
+        use logscope_fan::hero::ToolPort;
+        let d = hero_ws("hero-port");
+        let mut ws = Workspace::new(&d).with_tools(vec!["read_range".into()]);
+        let arg = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let r = ws.call("read_range", &[arg("path", "src/ui.rs"), arg("start", "2"), arg("end", "3")]);
+        assert!(r.ok && r.text.contains("// ui line 2") && !r.text.contains("// ui line 5"), "{}", r.text);
+        let w = ws.call("write_file", &[arg("path", "src/x.rs"), arg("contents", "x")]);
+        assert!(!w.ok && w.text.contains("not one of this worker's tools"), "{}", w.text);
+        let bad = ws.call("teleport", &[]);
+        assert!(!bad.ok && bad.text.contains("not a call this runtime can make"), "{}", bad.text);
+        // a value with quotes and newlines survives the rendering (json_quote / json_str are inverses)
+        let mut open = Workspace::new(&d);
+        let body = "fn f() { println!(\"a\\nb\"); }\n";
+        assert!(open.call("write_file", &[arg("path", "src/q.rs"), arg("contents", body)]).ok);
+        assert_eq!(std::fs::read_to_string(d.join("src/q.rs")).unwrap(), body);
     }
 
     /// A write that succeeds INSIDE the lane, interleaved with out-of-lane attempts, must reset the

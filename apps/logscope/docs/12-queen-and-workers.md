@@ -228,7 +228,33 @@ As of this pass, the following is real, running code, not just this document:
   its own lane. `hive::Job` gained `turns`, because a tool loop pays the link once per turn and
   `place` was charging it once per job.
 
-**Still not built:** `deploy::plan` is a tested library with **no caller in the app yet** — the
+* **Heroes: workers whose brain is a machine (`logscope-fan/src/hero.rs`).** A model worker pays
+  a full generation for every step, including the steps that carry no judgement ("the compiler
+  named `src/ui.rs:88`, so read there"). A `Hero` has a `WorkerSpec` like any bee — so the lane and
+  whitelist enforcement above applies to it unchanged — but its states are **tool calls** and its
+  edges are **guards on what came back**: `ok`, `failed`, `contains`, `matches` (a `{name:class}`
+  pattern that captures into named slots and advances a cursor), `visits>N` loop bounds, `sub`
+  hero calls with a depth bound, and explicit ends (`done`, `fail`, `yield <reason>`). No RNG: the
+  same observations give the same run. bot-arena's generative FSMs import as the degenerate case
+  (`Machine::from_weighted_graph`).
+  * **Context-gated activation.** A hero with a `Gate` is a reflex: after a model worker's turn the
+    run shows THAT TURN's observation to the stable (`step_turn`), and the first hero whose gate
+    matches — and whose tools the staffed worker's whitelist permits — runs through the run's own
+    `Workspace` and appends its report for the model's next turn. A shut gate costs a string scan.
+    Seeds: `error-locator`, `test-triage`, `path-prefetch` (fires before turn one). On in the app;
+    `LOGSCOPE_REFLEXES=0` turns it off. `AgentRun::reflex_history()` says what fired and how it ended.
+  * **Adding one.** `hero::HERO_FORMAT` is the text form; `:enlist` recognises a reply containing
+    `State NAME:` lines, validates it against the real stable (tools, reachability, a fallthrough
+    edge on every state, sub-hero references), refuses by state/tool/line, and hands it to every
+    later run. Its spec goes on the roster too: a hero is a worker.
+  * **Not measured:** wall-clock saving. What is asserted is structural — the read happened with no
+    model turn, and the next prompt carries it. A live-model A/B (turns to green, with and without)
+    is the number that would justify default-on, and it does not exist yet.
+
+**Still not built:** heroes are not yet STAFFED to whole tasks (a hero with no gate can only be a
+sub-hero today — `deploy::plan` does not know a roster entry may be a machine); there is no
+`:queen-hero` that shows the Queen `HERO_FORMAT`; enlisted heroes, like the roster, do not persist
+across a restart. `deploy::plan` is a tested library with **no caller in the app yet** — the
 runtime half above is wired through `stage_lane`, but width and placement are still not consulted
 by `:agent` / `:fan-agent` (a `:deploy <task>` dry-run that prints the trail is the obvious first
 consumer). `Confinement` also carries the spec's `context`, `constraints` and `success` lists and
