@@ -47,12 +47,32 @@ the single highest-value thing anyone can do with this repo next.
   crest, a cat trotting a log's moss top, a cat mid-tumble with the head
   leading. Four of the thirteen cast signatures (Sunroar, Rake, Rainfall,
   Umbra).
+- Also seen: a stalker and a runner at one fern (runner in a bound with
+  leaf cubes behind it; stalker low and silent), the leaf-bend measured by a
+  with/without frame diff, and the authored centre from above.
 - NOT seen: any of it in motion; the stalk-in-fern posture (the staged
   camera landed inside a trunk, then the re-render was not viewed); a cat on
   an actual RuinWall; the other nine signatures. `CLAWBOUND_SHEET=wall,fern`
   renders named shots only.
 
 ## Known gaps
+
+- **Quiet is not wired to anyone's perception.** `Game::quiet` (stalking,
+  an ability's hush, wounded) drives the body, the rustle and the leaf-bend,
+  and nothing else. `wildkit`'s perception and `Blockers::concealment_at`
+  exist and neither reads it, so stalking cannot yet be exploited or
+  countered. This is the next thing that makes it a mechanic rather than an
+  animation. Bots never stalk. Touch has the gentle-push route to a stalk but
+  no toggle button.
+- **The Runs' canopy hides you from yourself.** It roofs the inner paths
+  against a camera raised over the lane, which is the point, and will do the
+  same to your own camera zoomed out above it. Needs play: fade canopy
+  voxels between the camera and the player's cat, or lower the zoom ceiling
+  under cover.
+- **Only mid is authored.** Top and Bot lanes and the outer jungle are still
+  uniform scatter; bots do not know the runs exist.
+- **A bent fern casts a straight shadow**: the shadow pass does not take the
+  brush uniform.
 
 - **High ground is real and untuned.** Auto-attack range is 3D distance
   (`systems.rs`), so a cat on a 4 u pillar cap is out of reach of a 3.4 u
@@ -136,10 +156,12 @@ the single highest-value thing anyone can do with this repo next.
 ## Verification commands
 
 ```bash
-cargo test --no-default-features   # 209 lib + 12 + 2, no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
+cargo test --no-default-features   # 221 lib + 13 + 2, no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
 cargo test                          # same, plus links cpal (needs libasound2-dev)
 cargo check --features gamepad      # needs libudev-dev
 cargo run --example simdbg <seed>   # headless 12-minute AI match trace
 cargo run -- --screenshot           # headless PNG render (needs a GPU or lavapipe)
-cargo run -- --rig-sheet            # close-ups of posed ancestors, through the real draw path
+cargo run -- --rig-sheet            # close-ups through the real draw path; CLAWBOUND_SHEET=fern,map_centre picks shots,
+                                    # CLAWBOUND_NO_BRUSH=1 renders the same frame without the leaf-bend, for diffing
+cargo test plan_of_the_centre -- --nocapture   # ASCII plan of the real world's blockers
 ```

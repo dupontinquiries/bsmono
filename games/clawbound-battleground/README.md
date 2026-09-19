@@ -174,6 +174,7 @@ input model the monorepo's other games (skydribble, unendlich) use.
 | `LMB` | Basic attack (auto-assist target) |
 | `Space` / pad `A` / touch `^` | Leap: onto the rock, log, wall top or pillar cap you are steering at (up to 5.5 u above your paws), else up to 9 u forward. From a perch the next leap is free |
 | `1 2 3 4` or `Q E R F` | Cast abilities at crosshair ground point (4 = ultimate) |
+| `Z` / pad `LB` / a gentle stick | Stalk: a quarter speed, low, silent, threading between stems. A toggle, and deliberately not a held modifier. Attacking, casting or being hit suspends it for 1.5 s; dashes, blinks and buffs grant a hush at full speed; under 35% HP a cat slinks on its own |
 | `B` | Toggle the 100-item shop |
 | `Tab` / `C` (hold) | Scoreboard |
 | Mouse wheel / `PgUp` `PgDn` | Zoom |
