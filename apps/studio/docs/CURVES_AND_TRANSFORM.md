@@ -198,3 +198,58 @@ deliberately rather than discovering halfway through.
 
 Attempting (4) before (3) produces a key with nothing to reveal, which is the
 kind of feature that ships and then gets reported as broken.
+
+---
+
+## TODO list
+
+Written as tasks rather than prose so someone can pick one up cold. Each says
+what is already there, because in every case so far the surprise was how much
+was.
+
+### T1 — Fit policy as a setting *(small, no new concepts)*
+`edit.rs:127` hardcodes fit-inside-and-pad. Make it `Fit`/`Fill`/`Stretch` on
+the project. `Fill` is `force_original_aspect_ratio=increase` plus a centred
+`crop`; `Stretch` is a plain `scale`. Keep the bars computed — never baked.
+**Test it by the filter string**, the way `render_args` is already tested; no
+frame decode needed.
+
+### T2 — Clip transform *(medium; the details are the work)*
+Normalised coords, settable anchor defaulting to centre, fixed order
+scale→rotate→translate, a clip **property** not an entry in `Clip.effects`,
+composed *after* T1's fit. Sparse map on `Project` like `fades` — there are 221
+`Clip` literals and widening the struct is the rewrite that corrupted
+studio-app once already.
+
+### T3 — Overlay compositing *(large; the real blocker)*
+Video tracks currently switch, not composite: *"the FIRST video track is on
+top, the top one is the picture"* (`edit.rs:13`). Becomes an `overlay` chain,
+and `format=yuv420p` has to stop ending every fit string. **Everything alpha
+depends on this** and nothing else does.
+
+### T4 — Chroma key + spill *(small once T3 exists)*
+`chromakey` filter, keyed at **native resolution before** T2's transform, or
+the tolerance fights interpolated edges. Spill suppression is its own control —
+without it people blame the tolerance, which is the wrong knob. No eyedropper
+without a decode path; type the colour or decide to build decoding.
+
+### T5 — `Refs` in the schema *(blocked on nothing but a decision)*
+`curve_refs` is tested and stores nowhere. Decide: field on `Curve`, or a
+`Project`-level map like `fades`. The map is probably right for the same
+reasons, but this should follow a first real use.
+
+### T6 — `AutoTarget::MixBelow { track }` *(the adjustment layer)*
+`Gate` already has `Window` and `Group`, which scope *when*. There is no target
+meaning "everything below this track", so a modifier layer can scope time but
+not subject. This is the missing half of the adjustment-layer idea and it needs
+T3 to mean anything for picture.
+
+### T7 — Crossfade as an object *(supersedes part of `Op::SetClipFade`)*
+A fade against silence belongs to its clip and should stay. A crossfade is a
+relationship between two clips and drifts when either moves. Keep the per-clip
+op; add a crossfade that references both clip ids and owns the overlap.
+
+### T8 — Rope UI *(needs a surface, not a model)*
+`depths` and `stale_against` are ready. Needs its own tab or popup. Draw the
+stale **rope**, not the stale node — `stale_against` returns pairs for exactly
+that reason.
