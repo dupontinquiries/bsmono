@@ -34,6 +34,8 @@ fn speech_is_matched_by_phrase_with_recogniser_noise_tolerated() {
     assert_eq!(s("print my var"), Some(Command::Print("my_var".into())), "resolved against scope");
     assert_eq!(s("what is counters?"), Some(Command::Print("counter".into())), "one letter off still resolves");
     assert_eq!(s("print tile cache"), Some(Command::Print("tile_cache".into())), "unknown names fall back to snake_case");
+    assert_eq!(s("show doubled"), Some(Command::Print("doubled".into())));
+    assert_eq!(s("show me the vitals page"), None, "'show' is also UI talk; it prints only what is in scope");
     assert_eq!(s("break at main"), Some(Command::Break("main".into())));
     assert_eq!(s("break at line forty"), None, "only number words it knows; a wrong line is worse than none");
     assert_eq!(s("break at line 40"), Some(Command::Break("40".into())));
@@ -77,4 +79,18 @@ fn the_driver_executes_session_commands_and_hands_loaders_back() {
         *rec.0.lock().unwrap(),
         [Request::Step { kind: StepKind::Over, thread: None }, Request::InsertBreakpoint { location: "main".into() }, Request::Raw("info line".into())]
     );
+}
+
+#[test]
+fn the_typed_form_round_trips_for_every_kind_of_command() {
+    let all = [
+        Command::Continue, Command::Interrupt, Command::Run,
+        Command::Step(StepKind::Over), Command::Step(StepKind::Into), Command::Step(StepKind::Out),
+        Command::Up(1), Command::Down(4), Command::Frame(0), Command::Thread(3),
+        Command::Print("a->b + 1".into()), Command::Break("src/main.rs:12".into()), Command::Raw("info line".into()),
+        Command::Build, Command::Debug("tile-viewer".into()), Command::Attach(99), Command::OpenCore("/tmp/core".into()),
+    ];
+    for c in all {
+        assert_eq!(parse(&c.typed()), Some(c.clone()), "{:?} -> {:?}", c, c.typed());
+    }
 }

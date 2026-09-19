@@ -52,6 +52,31 @@ impl Command {
         matches!(self, Command::Build | Command::Debug(_) | Command::Attach(_) | Command::OpenCore(_))
     }
 
+    /// The canonical typed form: `parse(&c.typed()) == Some(c)`. What a recents
+    /// strip stores, so that re-running an entry is parsing it again rather than
+    /// keeping a second table of closures.
+    pub fn typed(&self) -> String {
+        match self {
+            Command::Continue => "continue".into(),
+            Command::Interrupt => "interrupt".into(),
+            Command::Run => "run".into(),
+            Command::Step(StepKind::Over) => "next".into(),
+            Command::Step(StepKind::Into) => "step".into(),
+            Command::Step(StepKind::Out) => "finish".into(),
+            Command::Up(n) => format!("up {n}"),
+            Command::Down(n) => format!("down {n}"),
+            Command::Frame(n) => format!("frame {n}"),
+            Command::Thread(n) => format!("thread {n}"),
+            Command::Print(e) => format!("print {e}"),
+            Command::Break(l) => format!("break {l}"),
+            Command::Raw(l) => format!("! {l}"),
+            Command::Build => "build".into(),
+            Command::Debug(n) => format!("debug {n}"),
+            Command::Attach(pid) => format!("attach {pid}"),
+            Command::OpenCore(p) => format!("core {}", p.display()),
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             Command::Continue => "continue".into(),
@@ -150,18 +175,16 @@ fn edit_distance(a: &str, b: &str) -> usize {
 /// A spoken name resolved against what is in scope: "my var" -> `my_var`,
 /// "counter" heard as "counters" -> `counter`. Falls back to snake_case.
 fn resolve_name(words: &[&str], names_in_scope: &[String]) -> String {
-    let joined = words.join("_");
+    in_scope(words, names_in_scope).unwrap_or_else(|| words.join("_"))
+}
+
+fn in_scope(words: &[&str], names_in_scope: &[String]) -> Option<String> {
     let flat = words.join("");
     let norm = |n: &str| n.to_ascii_lowercase().replace('_', "");
     if let Some(exact) = names_in_scope.iter().find(|n| norm(n) == flat) {
-        return exact.clone();
+        return Some(exact.clone());
     }
-    names_in_scope
-        .iter()
-        .map(|n| (edit_distance(&norm(n), &flat), n))
-        .filter(|(d, n)| *d <= 1 + n.len() / 5)
-        .min_by_key(|(d, _)| *d)
-        .map_or(joined, |(_, n)| n.clone())
+    names_in_scope.iter().map(|n| (edit_distance(&norm(n), &flat), n)).filter(|(d, n)| *d <= 1 + n.len() / 5).min_by_key(|(d, _)| *d).map(|(_, n)| n.clone())
 }
 
 /// What a recogniser heard, as a command. `names_in_scope` are the selected
@@ -189,7 +212,10 @@ pub fn interpret_spoken(utterance: &str, names_in_scope: &[String]) -> Option<Co
         ["frame", ..] => Command::Frame(num_at(1)?),
         ["thread", "number", ..] => Command::Thread(num_at(2)?),
         ["thread", ..] => Command::Thread(num_at(1)?),
-        ["print", ..] | ["show", ..] | ["evaluate", ..] | ["inspect", ..] => Command::Print(name_from(1)?),
+        ["print", ..] | ["evaluate", ..] | ["inspect", ..] => Command::Print(name_from(1)?),
+        // "show" is what people also say to a UI ("show me the vitals page"), so
+        // it only means print when what follows IS something in scope.
+        ["show", ..] => Command::Print(in_scope(w.get(1..).filter(|r| !r.is_empty())?, names_in_scope)?),
         ["what", "is", ..] | ["value", "of", ..] | ["what", "s", ..] => Command::Print(name_from(2)?),
         ["break", "at", "line", ..] | ["break", "on", "line", ..] | ["stop", "at", "line", ..] => Command::Break(num_at(3)?.to_string()),
         ["break", "at", ..] | ["break", "on", ..] | ["break", "in", ..] | ["stop", "at", ..] | ["breakpoint", "at", ..] | ["breakpoint", "on", ..] => Command::Break(w[2..].join("_")).into(),
