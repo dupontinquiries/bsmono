@@ -42,6 +42,15 @@ use voiceterm_egui::App;
 /// A small zettelkasten for `VOICETERM_DEMO`: three sections with notes under them, so the
 /// notes panes and the QR share have something real to show. `[[wiki-links]]` included,
 /// because the backlinks index is one of the things that had nothing to index.
+/// The bottom bar's height, from `qml/main.qml`: topBar carries
+/// `Layout.preferredHeight: (urlBarVisible && tabBar.currentIndex !== 1) ? 50 : 0`
+/// and is reparented into `bottomMountSlot`, whose height tracks it.
+///
+/// A constant rather than a literal at the call site because it is a ported
+/// value with a source, and the next person to think the bar looks wrong
+/// should find the QML line rather than a bare 50.
+const BOTTOM_BAR_H: f32 = 50.0;
+
 const DEMO_NOTES: &str = "\
 # Gardens
 
@@ -1814,7 +1823,22 @@ impl VoicetermApp {
         let live = voiceterm_egui::bar_pages::Live { tabs: tabs.clone(), workspaces: workspaces.clone(), quick: quick.clone() };
         let bar = voiceterm_egui::bar_pages::bar_for(&page, &live);
         let mut event = None;
-        egui::TopBottomPanel::bottom("voiceterm_bottom_bar").show(ctx, |ui| {
+        // 50 pt EXACTLY, which is what the QML gives it: main.qml's topBar
+        // (reparented into the bottom slot) is
+        // `Layout.preferredHeight: urlBarVisible ? 50 : 0`.
+        //
+        // This panel set no height at all, so it took egui's default button
+        // height plus the panel's own margins -- reported as "the bottom bar
+        // is way too thick unlike the -qt version". Nothing was wrong with
+        // the bar's CONTENT; it simply had no size and grew to whatever the
+        // widgets wanted.
+        //
+        // `exact_height` rather than `min_height`: the QML value is a fixed
+        // slot height, and a minimum would let one taller button push the bar
+        // back out again -- the same latch, one badge away from returning.
+        egui::TopBottomPanel::bottom("voiceterm_bottom_bar")
+            .exact_height(BOTTOM_BAR_H)
+            .show(ctx, |ui| {
             event = bar_ui(ui, &bar);
         });
 
@@ -6791,4 +6815,25 @@ impl ZkShareUi {
 /// A brush that is down wants a frame per pointer move.
 fn brushing_repaint(ctx: &egui::Context, brush: voiceterm_egui::zk_share::Brush) -> bool {
     brush != voiceterm_egui::zk_share::Brush::Off && ctx.input(|i| i.pointer.primary_down())
+
+    /// The bottom bar's height is a PORTED value, so it is checked against the
+    /// source it was ported from rather than against itself.
+    ///
+    /// Reported as "the bottom bar is way too thick unlike the -qt version".
+    /// The panel set no height at all and took egui's default button height
+    /// plus panel margins; the QML gives it a fixed slot.
+    #[test]
+    fn the_bottom_bar_matches_the_qml_slot_height() {
+        let qml = include_str!("../../../qml/main.qml");
+        // main.qml: `Layout.preferredHeight: (urlBarVisible && ...) ? 50 : 0`
+        // on topBar, which bottomMountSlot's height tracks.
+        // The FULL topBar line, not just "? 50 : 0" -- that fragment appears
+        // ten times in main.qml and would pass while the bar's own height
+        // changed underneath it.
+        assert!(
+            qml.contains(
+                "Layout.preferredHeight: (urlBarVisible && tabBar.currentIndex !== 1) ? 50 : 0"),
+            "topBar's height line changed; BOTTOM_BAR_H needs re-deriving");
+        assert_eq!(BOTTOM_BAR_H, 50.0);
+    }
 }
