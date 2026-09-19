@@ -17,6 +17,10 @@ pub mod models;
 pub mod props;
 pub mod blockers;
 pub mod anim;
+/// Cut a voxel body into posable parts; posed rig -> per-part matrices.
+pub mod rigged;
+/// What a cat's body does about roots, ferns, rivers, leaps and fights.
+pub mod puppet;
 pub mod camps;
 /// Clan border markers: placed, refreshed on patrol, and lasting days rather
 /// than minutes. The half of the scent system wildkit does not cover, because
