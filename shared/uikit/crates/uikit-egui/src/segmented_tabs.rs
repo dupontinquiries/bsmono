@@ -102,6 +102,15 @@ pub fn strip_ui(ui: &mut egui::Ui, s: &TabStrip, c: &PaletteColors) -> Option<us
     let w = s.tab_width(total);
     let start = ui.cursor().min;
     ui.horizontal(|ui| {
+        // Each button is `w - 4` wide, so the gap has to be exactly 4 for a
+        // segment to be `w` — which is what `underline` assumes. Inheriting the
+        // palette's item spacing (10) made every segment 6pt too wide: the
+        // underline drifted left of its tab and, by the fifth tab, the strip was
+        // 20pt past the right edge. The padding is pinned for the same reason: a
+        // touch-sized button padding makes a short label wider than the width it
+        // was given.
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().button_padding.x = 2.0;
         for (i, t) in s.tabs().iter().enumerate() {
             let sel = i == s.selected();
             let label = match s.badge_text(i) {
@@ -122,4 +131,52 @@ pub fn strip_ui(ui: &mut egui::Ui, s: &TabStrip, c: &PaletteColors) -> Option<us
         [egui::pos2(start.x + x + 2.0, y), egui::pos2(start.x + x + uw - 2.0, y)],
         egui::Stroke::new(2.0_f32, c.accent));
     picked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout_probe;
+
+    /// Lay the strip out headlessly, under the palette every app applies, and
+    /// return each label's horizontal centre plus the surface width.
+    fn label_centres(labels: &[&str], surface_w: f32) -> Vec<(String, f32, f32)> {
+        let strip = TabStrip::new(labels);
+        let mut shapes = Vec::new();
+        let ctx = egui::Context::default();
+        let colors = crate::apply_palette(&ctx, snapclone_theme::palette_for(snapclone_theme::PaletteId::all()[0]));
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(surface_w, 200.0)));
+        for _ in 0..2 {
+            #[allow(deprecated)]
+            let out = ctx.run(input.clone(), |ctx| {
+                #[allow(deprecated)]
+                egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
+                    let _ = strip_ui(ui, &strip, &colors);
+                });
+            });
+            shapes = out.shapes;
+        }
+        layout_probe::texts(&shapes).into_iter().filter(|t| labels.contains(&t.text.as_str())).map(|t| (t.text.clone(), t.rect.center().x, t.rect.right())).collect()
+    }
+
+    /// The strip's arithmetic says "equal segments across the width" and the
+    /// underline is placed by that arithmetic. The buttons have to land where
+    /// the arithmetic says, or the last tab runs off the edge and the underline
+    /// sits under the wrong label. Found on a 5-tab strip at phone width, where
+    /// the palette's 10pt item spacing pushed the fifth tab 20pt past the edge;
+    /// with 3 tabs the same fault is 8pt and easy to miss.
+    #[test]
+    fn every_label_sits_inside_its_own_segment() {
+        for (labels, w) in [(&["Launch", "Stack", "Vitals", "Wire", "Caches"][..], 380.0_f32), (&["One", "Two", "Three"][..], 320.0)] {
+            let got = label_centres(labels, w);
+            assert_eq!(got.len(), labels.len(), "every label was laid out: {got:?}");
+            let seg = w / labels.len() as f32;
+            for (i, (text, cx, right)) in got.iter().enumerate() {
+                assert!(*right <= w + 0.5, "{text:?} runs off a {w}pt surface (right edge {right})");
+                let (lo, hi) = (seg * i as f32, seg * (i + 1) as f32);
+                assert!((lo..=hi).contains(cx), "{text:?} is centred at {cx}, outside its segment {lo}..{hi}");
+            }
+        }
+    }
 }
