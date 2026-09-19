@@ -66,8 +66,9 @@ pub enum Home {
 /// Everything the chrome can offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
-    /// Switch keyboard layout / language.
-    LayoutSwitch,
+    /// Open the settings page. On the board because every page needs a way
+    /// there and a keyboard has no window chrome to put it in.
+    Settings,
     /// Start or stop dictation.
     Dictate,
     /// Open the basic-options layer.
@@ -88,7 +89,7 @@ pub enum Control {
 
 impl Control {
     pub const ALL: [Control; 9] = [
-        Control::LayoutSwitch,
+        Control::Settings,
         Control::Dictate,
         Control::OptionsToggle,
         Control::Tray,
@@ -104,7 +105,20 @@ impl Control {
     /// The whole placement rule, in one predicate, so it can be argued with
     /// once rather than per control.
     pub fn needs_keys_visible(self) -> bool {
-        matches!(self, Control::LayoutSwitch | Control::Dictate | Control::OptionsToggle)
+        // LayoutSwitch is NO LONGER HERE, and that is a reversal worth stating.
+        //
+        // I argued it belonged on the board because switching layout is
+        // answering "this key is missing" mid-typing. That was wrong about
+        // what the control IS. The sidebar it opened was a picker over the
+        // same two choices `settings_model` already exposes as
+        // `layout.letters` and `layout.geometry` -- a second UI for one
+        // setting, costing 64pt of a 380pt screen to duplicate a row in a
+        // page that has to exist anyway.
+        //
+        // Choosing a layout is not a mid-typing act; it is something a person
+        // does once and lives with. The mid-typing case -- one missing key --
+        // is what a symbol layer is for, not a layout swap.
+        matches!(self, Control::Dictate | Control::OptionsToggle | Control::Settings)
     }
 
     pub fn home(self) -> Home {
@@ -122,7 +136,7 @@ impl Control {
 
     pub fn label(self) -> &'static str {
         match self {
-            Control::LayoutSwitch => "layout",
+            Control::Settings => "settings",
             Control::Dictate => "dictate",
             Control::OptionsToggle => "options",
             Control::Tray => "tray",
@@ -157,14 +171,13 @@ pub struct Chrome {
     layer: Layer,
     /// Whether the separate settings window is open.
     settings_window: bool,
-    /// Whether the layout sidebar is expanded.
+    /// The layout sidebar is GONE, not collapsed.
     ///
-    /// COLLAPSED BY DEFAULT, because it is a switcher: you change layout a few
-    /// times a session and it was costing 64 px of a 380 px phone on every
-    /// frame — 17% of the width, permanently, for a control that is idle
-    /// almost always. Its collapsed affordance is `Control::LayoutSwitch`,
-    /// which is already on the board, so nothing new has to be found room for.
-    sidebar: bool,
+    /// It was a 64pt column duplicating `layout.letters` and
+    /// `layout.geometry` from the settings page. Collapsing it by default (the
+    /// previous fix) made it cheap; removing it makes the duplication
+    /// impossible, which is the difference between a tidy screen and one
+    /// setting with one home.
 }
 
 impl Chrome {
@@ -201,33 +214,6 @@ impl Chrome {
         Control::ALL.iter().copied().filter(|c| c.home() == Home::Settings).collect()
     }
 
-    pub fn sidebar_expanded(&self) -> bool {
-        self.sidebar
-    }
-
-    /// Tapping the layout control.
-    pub fn toggle_sidebar(&mut self) {
-        self.sidebar = !self.sidebar;
-    }
-
-    /// A layout was chosen.
-    ///
-    /// Collapses, because you opened the switcher to pick ONE thing and it has
-    /// been picked. Leaving it open would keep the board narrow while you type
-    /// with the layout you just chose, which is the worst of both.
-    pub fn layout_chosen(&mut self) {
-        self.sidebar = false;
-    }
-
-    /// Width the sidebar should occupy, given its expanded width.
-    ///
-    /// Zero when collapsed — not a narrow strip. A 12 px stub is too small to
-    /// hit and still eats width, so it manages to be both useless and costly;
-    /// the board control is the affordance.
-    pub fn sidebar_width(&self, expanded_w: f32) -> f32 {
-        if self.sidebar { expanded_w.max(0.0) } else { 0.0 }
-    }
-
     pub fn toggle_options(&mut self) {
         self.layer = match self.layer {
             Layer::Keys => Layer::Options,
@@ -244,9 +230,6 @@ impl Chrome {
     pub fn open_settings_window(&mut self) {
         self.settings_window = true;
         self.layer = Layer::Keys;
-        // Same reasoning: nothing half-open should be waiting when attention
-        // comes back to the board.
-        self.sidebar = false;
     }
 
     pub fn close_settings_window(&mut self) {
@@ -283,7 +266,7 @@ mod tests {
         }
         // The three that qualify, named, so a change here is deliberate.
         assert_eq!(Chrome::new().board_controls(),
-                   vec![Control::LayoutSwitch, Control::Dictate, Control::OptionsToggle]);
+                   vec![Control::Settings, Control::Dictate, Control::OptionsToggle]);
     }
 
     /// Configuration goes to the window, where it gets a screen instead of a
@@ -349,44 +332,21 @@ mod tests {
         }
     }
 
-    /// COLLAPSED BY DEFAULT. 64 px of a 380 px phone, permanently, for a
-    /// control used a few times a session.
+    /// THE SIDEBAR IS GONE, not collapsed. It duplicated `layout.letters` and
+    /// `layout.geometry`, which the settings page already owns.
     #[test]
-    fn the_sidebar_starts_collapsed_and_costs_nothing() {
-        let c = Chrome::new();
-        assert!(!c.sidebar_expanded());
-        assert_eq!(c.sidebar_width(64.0), 0.0, "collapsed means zero, not a stub");
+    fn no_board_control_opens_a_layout_picker() {
+        let names: Vec<&str> = Chrome::new().board_controls().iter().map(|c| c.label()).collect();
+        assert!(!names.contains(&"layout"),
+                "layout belongs in settings, not on the board: {names:?}");
     }
 
-    /// Zero rather than a narrow strip: a 12 px stub is too small to hit and
-    /// still eats width, which is both useless and costly.
+    /// Every page needs a way to settings, and a keyboard has no window chrome
+    /// to put it in -- so the button is on the board itself.
     #[test]
-    fn expanding_costs_only_while_it_is_open() {
-        let mut c = Chrome::new();
-        c.toggle_sidebar();
-        assert_eq!(c.sidebar_width(64.0), 64.0);
-        c.toggle_sidebar();
-        assert_eq!(c.sidebar_width(64.0), 0.0);
-    }
-
-    /// You opened the switcher to pick one thing. Leaving it open keeps the
-    /// board narrow while you type with the layout you just chose.
-    #[test]
-    fn choosing_a_layout_collapses_the_sidebar() {
-        let mut c = Chrome::new();
-        c.toggle_sidebar();
-        c.layout_chosen();
-        assert!(!c.sidebar_expanded());
-    }
-
-    /// Nothing half-open waits for you when attention comes back.
-    #[test]
-    fn opening_the_settings_window_collapses_everything_on_the_board() {
-        let mut c = Chrome::new();
-        c.toggle_sidebar();
-        c.toggle_options();
-        c.open_settings_window();
-        assert!(!c.sidebar_expanded());
-        assert_eq!(c.layer(), Layer::Keys);
+    fn settings_is_reachable_from_the_board() {
+        assert!(Chrome::new().board_controls().contains(&Control::Settings));
+        assert!(Control::Settings.needs_keys_visible(),
+                "the way in must not hide the thing you are configuring");
     }
 }

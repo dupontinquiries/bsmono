@@ -15,6 +15,10 @@ use uikit_egui::{apply_palette, Adaptive, PaletteColors};
 /// the keyboard on screen while you use it", which is what stops the top bar
 /// growing back.
 pub mod chrome;
+/// The settings model driven by name rather than by thumb: one command grammar
+/// behind the `rusty-board-settings` CLI and the full-page configurator, so
+/// neither can drift into its own idea of what the options are.
+pub mod settings_cli;
 pub mod cardinal_gesture;
 pub mod ngram;
 pub mod swipe_rerank;
