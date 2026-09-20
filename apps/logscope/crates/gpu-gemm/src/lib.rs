@@ -10617,6 +10617,9 @@ impl Model {
     /// Width of one K/V cache row = n_kv_heads × head_dim (== d for plain MHA, but NOT for Qwen3 where
     /// head_dim is decoupled from d/n_heads).
     pub fn kv_dim(&self) -> usize { self.n_kv_heads * self.head_dim }
+    /// Does layer `li` read or write K/V rows? False for Gated DeltaNet layers, whose memory is their
+    /// recurrent state. The ONE predicate the cache allocator and every all-layer K/V loop consult.
+    pub fn layer_holds_kv(&self, li: usize) -> bool { self.layers[li].deltanet.is_none() }
     /// Host bytes the token-embedding table occupies, and whether it is held in the file's format
     /// (one row dequantized per lookup) rather than as a whole f32 table. See embedtable.rs.
     pub fn embed_host_bytes(&self) -> usize { self.embed.host_bytes() }
@@ -14514,6 +14517,13 @@ impl BidirKv {
 }
 
 /// Per-layer key/value cache (resident [max_seq, d] buffers).
+impl KvCache {
+    /// Rows this cache can hold. NOT `k.first()`: layers that hold no K/V get a one-row placeholder
+    /// (see Gpu::new_cache_for), and on a Qwen3.5 hybrid layer 0 is one of them.
+    pub fn capacity(&self) -> usize { self.k.iter().map(|t| t.rows).max().unwrap_or(0) }
+    /// Bytes of K/V this cache actually allocated.
+    pub fn kv_alloc_bytes(&self) -> usize { self.k.iter().chain(&self.v).map(|t| t.rows * t.cols * 4).sum() }
+}
 pub struct KvCache {
     pub k: Vec<Tensor>, pub v: Vec<Tensor>,
     /// Compressed MLA cache, allocated only for MLA models. Held ALONGSIDE k/v rather than replacing
@@ -15279,9 +15289,27 @@ impl Gpu {
     ///
     /// `Model::kv_bytes_per_token` already reports the honest sum, so the
     /// context planner is not fooled by this; only the allocation is wasteful.
+    ///
+    /// K/V ARE NOT ALLOCATED FOR LAYERS THAT NEVER USE THEM. This called `new_cache`, which gives
+    /// EVERY layer a full `[max_seq, kv_dim]` f32 K and V — including Gated DeltaNet layers, whose
+    /// whole memory is the recurrent state below and which never read or write a K/V row. A Qwen3.5 /
+    /// Ornith hybrid is three DeltaNet layers to one attention layer: at 32k context the 9B (24 of 32
+    /// layers, kv_dim 1024) held 24 x 2 x 32768 x 1024 x 4 B = 6.4 GB of GPU memory it never touched;
+    /// the 397B (45 of 60) about 6 GB at 32k and 24 GB at 128k, on the machine it barely fits.
+    /// `Model::kv_bytes_per_token` already reported the honest sum, so the PLANNER believed in memory
+    /// the ALLOCATOR had spent. Such layers now get a one-row placeholder (the vectors stay indexable
+    /// by layer). `Model::layer_holds_kv` is the one predicate; `KvCache::capacity` no longer reads
+    /// layer 0, which on these models is a DeltaNet layer. LOGSCOPE_KV_ALLOC_ALL=1 restores the old
+    /// allocation. MLA layers are NOT trimmed here: a checkpoint may mix them with standard attention
+    /// per layer and that routing has no fixture to hold a change against.
     pub fn new_cache_for(&self, m: &Model, max_seq: usize) -> KvCache {
         self.activate_model(m);
-        let mut c = self.new_cache(m.n_layers, max_seq, m.kv_dim());
+        let all = std::env::var("LOGSCOPE_KV_ALLOC_ALL").as_deref() == Ok("1");
+        let rows_for = |li: usize| if all || m.layer_holds_kv(li) { max_seq } else { 1 };
+        let kv = m.kv_dim();
+        let mut c = KvCache { k: (0..m.n_layers).map(|li| self.alloc(rows_for(li), kv)).collect(),
+                              v: (0..m.n_layers).map(|li| self.alloc(rows_for(li), kv)).collect(),
+                              mla: None, deltanet: None, deltanet_gpu: None };
         if let Some(cfg) = &m.mla {
             let dm = self.mla_dims(cfg, m.d, m.n_heads, m.base, m.eps);
             c.mla = Some(self.mla_new_cache(m.n_layers, max_seq, &dm));
@@ -16001,8 +16029,17 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     pub fn demote_cache(&self, c: &KvCache, len: usize, kv_dim: usize) -> QKvCache {
         let mut q = QKvCache { kq: vec![], ks: vec![], vq: vec![], vs: vec![] };
         for li in 0..c.k.len() {
-            let (qk, sk) = self.quantize_rows(&c.k[li], len, kv_dim); q.kq.push(qk); q.ks.push(sk);
-            let (qv, sv) = self.quantize_rows(&c.v[li], len, kv_dim); q.vq.push(qv); q.vs.push(sv);
+            // A layer with a one-row placeholder (new_cache_for: it holds no K/V) has no `len` rows to
+            // quantize. It still gets a `len`-row entry, from a scratch tensor, so that EVERY layer of a
+            // QKvCache has the same shape and promote_cache needs no special case. (My first version
+            // clamped promote_cache to `q.kq[li].rows` instead — and a quantized buffer that has been to
+            // host RAM and back does not carry its row count there, so a 6-row prefix was restored as
+            // ONE row and seeding overran it. wgpu logged it as non-fatal; the gate said OK. Found by
+            // scanning the validation run's stderr, which is the only place it showed.)
+            let scratch;
+            let (ksrc, vsrc) = if c.k[li].rows >= len { (&c.k[li], &c.v[li]) } else { scratch = self.alloc(len, kv_dim); (&scratch, &scratch) };
+            let (qk, sk) = self.quantize_rows(ksrc, len, kv_dim); q.kq.push(qk); q.ks.push(sk);
+            let (qv, sv) = self.quantize_rows(vsrc, len, kv_dim); q.vq.push(qv); q.vs.push(sv);
         }
         q
     }
@@ -17104,6 +17141,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         self.activate_model(m);
         let kv = m.kv_dim();
         for li in 0..m.n_layers {
+            if !m.layer_holds_kv(li) { continue; }   // one-row placeholders: nothing to copy (new_cache_for)
             self.write_rows(&session.cache.k[li], &prefix.k[li], 0, prefix_len, kv);
             self.write_rows(&session.cache.v[li], &prefix.v[li], 0, prefix_len, kv);
         }
@@ -17265,6 +17303,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         let c = self.new_cache_for(m, total);
         let kv = m.kv_dim();
         for li in 0..m.n_layers {
+            if !m.layer_holds_kv(li) { continue; }   // one-row placeholders: nothing to copy (new_cache_for)
             self.write_rows(&c.k[li], &parent.k[li], 0, parent_len, kv);
             self.write_rows(&c.v[li], &parent.v[li], 0, parent_len, kv);
         }
@@ -17999,6 +18038,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
                 let len = len.min(prompt.len());
                 let kv = target.kv_dim();
                 for li in 0..target.n_layers {
+                    if !target.layer_holds_kv(li) { continue; }   // one-row placeholders: nothing to copy
                     self.write_rows(&tc.k[li], &src.k[li], 0, len, kv);
                     self.write_rows(&tc.v[li], &src.v[li], 0, len, kv);
                 }
@@ -18501,7 +18541,7 @@ LOWER bound — KV and resident weights are not pooled and are covered by baseli
         }
         let rcap = 64usize;
         if s.logits.is_empty() { return 0; }
-        let cache_rows = s.cache.k.first().map(|t| t.rows).unwrap_or(0);
+        let cache_rows = s.cache.capacity();   // was k.first(): layer 0 of a hybrid holds no K/V
         // The window's whole point is ONE submit per k tokens (on Metal, encoder setup — not GPU
         // sync — is the wall: ~36 dispatches/token, each a separate submit if flush fires mid-window).
         // A window is w·(dispatches/token) passes; pin flush above that ceiling so `begin_frame`

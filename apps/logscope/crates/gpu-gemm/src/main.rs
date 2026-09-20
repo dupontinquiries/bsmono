@@ -1645,6 +1645,80 @@ fn main() {
                        gpu_kernels::EMBED_Q8_CHUNK_ROWS, big.vocab, w_new.len()),
                ds == 0 && dw == 0 && !raw_old && raw_new && s_old.len() == s_new.len() && w_old.len() == w_new.len() && w_new.iter().any(|w| *w != 0));
         }
+        // K/V ARE ALLOCATED ONLY WHERE A LAYER USES THEM. The hybrid fixture is one DeltaNet layer and one
+        // attention layer: its cache must hold full K/V for exactly the attention layer, the old
+        // allocation must be what LOGSCOPE_KV_ALLOC_ALL=1 restores, the capacity must not be read off
+        // layer 0 (the DeltaNet one), and decode must be BIT-identical either way — the rows that went
+        // away were never read.
+        {
+            let bytes_h = write_gguf_qwen35moe_hybrid_full(1, None, None, true);
+            let max_seq = 4096usize;
+            let mut measure = |alloc_all: bool| -> (usize, usize, Vec<usize>, Vec<Vec<f32>>) {
+                if alloc_all { std::env::set_var("LOGSCOPE_KV_ALLOC_ALL", "1"); } else { std::env::remove_var("LOGSCOPE_KV_ALLOC_ALL"); }
+                let m = gpu.load_gguf_opt(&bytes_h, true).expect("load hybrid");
+                let c = gpu.new_cache_for(&m, max_seq);
+                std::env::remove_var("LOGSCOPE_KV_ALLOC_ALL");
+                let ids = [3u32, 9, 14, 21, 6, 9, 27];
+                let mut out = vec![gpu.prefill_chunked(&m, &c, &ids[..5], 3)];
+                for p in 5..ids.len() { out.push(gpu.decode_step(&m, &c, ids[p], p)); }
+                gpu.end_frame();
+                (c.kv_alloc_bytes(), c.capacity(), c.k.iter().map(|t| t.rows).collect(), out)
+            };
+            let ((old_bytes, old_cap, old_rows, old_logits), (new_bytes, new_cap, new_rows, new_logits)) = (measure(true), measure(false));
+            let differing: usize = old_logits.iter().zip(&new_logits).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).sum();
+            ck(format!("hybrid K/V allocation: {old_bytes} -> {new_bytes} bytes at max_seq {max_seq} (rows per layer {old_rows:?} -> {new_rows:?})"),
+               new_rows == vec![1, max_seq] && old_rows == vec![max_seq, max_seq] && new_bytes * 2 <= old_bytes + 4 * 64 * 4);
+            ck(format!("capacity is {new_cap} either way, though layer 0 now has {} row", new_rows[0]), new_cap == max_seq && old_cap == max_seq);
+            ck(format!("prefill + decode are BIT-identical with the trimmed cache: {differing} differing logit bits"), differing == 0 && !new_logits.is_empty());
+        }
+        // A HYBRID CANNOT EXTEND A PREFIX — recurrent state cannot fork or seek — and must say so BY NAME.
+        // On the way to that refusal extend_prefix copies the parent's K/V rows for every layer; a
+        // DeltaNet layer's buffer is a one-row placeholder now, so that loop has to skip it. If it does
+        // not, the only symptom is a rejected GPU copy: the device-error count, nothing else.
+        {
+            let bytes_h = write_gguf_qwen35moe_hybrid_full(1, None, None, true);
+            let m = gpu.load_gguf_opt(&bytes_h, true).expect("load hybrid");
+            let de0 = gpu_kernels::DEVICE_ERRORS.load(std::sync::atomic::Ordering::Relaxed);
+            let parent = gpu.prefill_prefix(&m, &[3, 9, 14, 21]);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { let _ = gpu.extend_prefix(&m, &parent, 4, &[6, 9, 27]); }));
+            gpu.end_frame();
+            let msg = r.err().map(|e| e.downcast_ref::<String>().cloned().unwrap_or_default()).unwrap_or_default();
+            let de = gpu_kernels::DEVICE_ERRORS.load(std::sync::atomic::Ordering::Relaxed) - de0;
+            ck(format!("hybrid extend_prefix is refused by name ({}) and rejects no GPU command on the way ({de} device errors)",
+                       if msg.contains("RECURRENT") { "\"...RECURRENT...cannot seek\"" } else { "NOT the named refusal" }),
+               msg.contains("RECURRENT") && de == 0);
+        }
+        // THE APP'S LOOP, on a hybrid. stream_session_window is what backend.rs calls, and it is where
+        // `capacity()` replaced `cache.k.first()` — on a Qwen3.5 hybrid layer 0 is DeltaNet, so with the
+        // trimmed cache the old expression would have read a capacity of ONE row. Sampled (the app's
+        // default sampler), against stream_session with the same seed.
+        {
+            let bytes_h = write_gguf_qwen35moe_hybrid_full(1, None, None, true);
+            let m = gpu.load_gguf_opt(&bytes_h, true).expect("load hybrid");
+            let sp = gpu_kernels::SamplerParams { temperature: 0.8, top_k: 8, top_p: 0.95, repeat_penalty: 1.1, repeat_last_n: 64, min_p: 0.05 };
+            let prompt: Vec<u32> = vec![3, 9, 14, 21, 6];
+            let eq = gpu.embed_q8(&m);
+            let run = |windowed: bool| -> Result<Vec<u32>, String> {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut sess = gpu.session_new(&m, 64, 7);
+                    gpu.session_prefill(&m, &mut sess, &prompt);
+                    let (mut seen, mut rng, mut toks) = (prompt.clone(), 99u64, Vec::new());
+                    let nc = || false;
+                    if windowed { gpu.stream_session_window(&m, &mut sess, &mut seen, 12, None, &sp, &mut rng, 4, &gpu_kernels::EmbedT::Q8(&eq), &nc, |t| { toks.push(t); true }); }
+                    else { gpu.stream_session(&m, &mut sess, &mut seen, 12, None, &sp, &mut rng, &nc, |t| { toks.push(t); true }); }
+                    toks
+                })).map_err(|e| e.downcast_ref::<String>().map(|s| s.chars().take(100).collect::<String>()).unwrap_or_default())
+            };
+            let (w, p1, p2) = (run(true), run(false), run(false));
+            if std::env::var_os("GATE_DEBUG").is_some() { println!("      debug: windowed {w:?}\n      debug: per-token {p1:?}"); }
+            ck(format!("hybrid session: stream_session is reproducible and produces 12 tokens ({})", match &p1 { Ok(v) => format!("{} tokens", v.len()), Err(e) => format!("PANICKED: {e}") }),
+               p1.is_ok() && p1 == p2 && p1.as_ref().map(|v| v.len() == 12).unwrap_or(false));
+            // The windowed path gathers its input from an INT8 embedding, the per-token path from the f32
+            // rows, so the two are not bit-comparable; what must hold is that the windowed loop RUNS a
+            // hybrid session to its full length instead of seeing a one-row cache.
+            ck(format!("hybrid session: stream_session_window (the app's loop) runs to length ({})", match &w { Ok(v) => format!("{} tokens", v.len()), Err(e) => format!("PANICKED: {e}") }),
+               w.as_ref().map(|v| v.len() == 12).unwrap_or(false));
+        }
         // A HYBRID THROUGH THE WINDOWED PATH. generate_kv_window / generate_kv_gpu allocated with
         // new_cache — no recurrent state — so a Gated DeltaNet model could not run through them at all.
         // With new_cache_for it must, and must produce the tokens step-by-step decode produces.
@@ -1731,6 +1805,10 @@ fn main() {
             };
             let (a, b, a2, b2) = (time(true), time(false), time(true), time(false));
             println!("  lavapipe, state 256x256 x 4 heads, whole decode step (1 DeltaNet + 1 attention layer): original {:.2} / {:.2} ms, hoisted {:.2} / {:.2} ms", a, a2, b, b2);
+        }
+        {
+            let de = gpu_kernels::DEVICE_ERRORS.load(std::sync::atomic::Ordering::Relaxed);
+            ck(format!("no GPU command was rejected during this gate ({de} device errors logged) — a shrunken K/V placeholder read out of range would show HERE and nowhere in the logits"), de == 0);
         }
         println!("gate-prefill-parity: {}", if ok { "prefill agrees with decode for every family \u{2713}" } else { "FAIL \u{2717}" });
         std::process::exit(if ok { 0 } else { 1 });
@@ -8232,9 +8310,18 @@ gpu argmax {ga} (margin {gm:.3e}) | cross-impl max|Δlogit| {xe:.3e}{}",
             let base = gpu.new_cache(mdl.n_layers, plen + 24, kvd);
             for (pos, &t) in prompt.iter().enumerate() { let _ = gpu.decode_step(&mdl, &base, t, pos); }
             // (a) HOT reference: seed a fresh session from the f32 cache, decode 16 greedy tokens.
-            let cont = |seed_cache: &gpu_kernels::KvCache| -> Vec<u32> {
+            // POISONED before seeding. session_new's cache comes from the buffer pool, and a recycled
+            // buffer still holds the PREVIOUS run's rows — which here are the very rows seeding would
+            // write. So a seed that silently failed (a copy wgpu rejected and logged as non-fatal: it
+            // happened, see demote_cache) left a cache that was already "right", and this check printed
+            // 16/16 OK. With every row set to 3e3 first, an unseeded cache cannot agree with anything.
+            let cont_opt = |seed_cache: Option<&gpu_kernels::KvCache>| -> Vec<u32> {
                 let mut s = gpu.session_new(&mdl, plen + 24, 7);
-                gpu.seed_from_prefix(&mdl, &mut s, seed_cache, plen);
+                for li in 0..mdl.n_layers {
+                    s.cache.k[li] = gpu.upload(&vec![3.0e3f32; (plen + 24) * kvd], plen + 24, kvd);
+                    s.cache.v[li] = gpu.upload(&vec![3.0e3f32; (plen + 24) * kvd], plen + 24, kvd);
+                }
+                if let Some(sc) = seed_cache { gpu.seed_from_prefix(&mdl, &mut s, sc, plen); }
                 s.pos = plen;
                 s.logits = gpu.decode_step(&mdl, &s.cache, prompt[plen - 1], plen - 1);
                 let sp = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 0, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
@@ -8242,7 +8329,13 @@ gpu argmax {ga} (margin {gm:.3e}) | cross-impl max|Δlogit| {xe:.3e}{}",
                 gpu.stream_session(&mdl, &mut s, &mut seen, 16, None, &sp, &mut rng, &|| false, |t| { out.push(t); true });
                 out
             };
+            let cont = |seed_cache: &gpu_kernels::KvCache| cont_opt(Some(seed_cache));
             let hot = cont(&base);
+            // THE CONTROL: no seeding at all must NOT reproduce the hot continuation. If it does, the
+            // agreement below proves nothing about seeding.
+            let unseeded = cont_opt(None);
+            let unseeded_agree = hot.iter().zip(&unseeded).take_while(|(a, b)| a == b).count();
+            check("kv tier control: an UNSEEDED (poisoned) cache does not reproduce the continuation", if unseeded_agree < 4 { 0.0 } else { 1.0 }, 0.5);
             // (b) COLD path: demote → download to host bytes → upload → promote → seed.
             let q = gpu.demote_cache(&base, plen, kvd);
             let to_bytes = |t: &gpu_kernels::Tensor| -> Vec<u8> {
@@ -9326,6 +9419,17 @@ gpu argmax {ga} (margin {gm:.3e}) | cross-impl max|Δlogit| {xe:.3e}{}",
         check("degraded (safe-kernel) decode == fast-path decode", e, 1e-4);
     }
 
+    // NO REJECTED GPU COMMANDS. The engine logs a validation error as "non-fatal" and carries on, and
+    // every check above judges OUTPUT — which can be right by accident. It was: a promote_cache that
+    // restored a 6-row prefix as ONE row made seeding overrun its source; wgpu rejected the copy, the
+    // seed silently did not happen, the recycled session buffer already held the right rows, and this
+    // run printed "16/16 tokens agree — OK" with exit 0. The only trace was two lines on stderr.
+    // DEVICE_ERRORS already counted them; nothing read it.
+    {
+        let de = gpu_kernels::DEVICE_ERRORS.load(std::sync::atomic::Ordering::Relaxed);
+        println!("  device errors logged during this run: {de}");
+        check("no GPU command was rejected (validation / internal device errors)", de as f32, 0.0);
+    }
     println!();
     println!("  pipeline cache: {} unique compute pipelines built and reused across all dispatches", gpu.pipeline_count());
     if fails == 0 { println!("ALL KERNELS VALIDATED ON GPU ✓"); }
