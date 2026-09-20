@@ -66,6 +66,8 @@ pub mod spoken_slate;
 /// A tiny deterministic shoot (camera takes + recorder files) for tests, here and downstream.
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
+/// Warp stabilization: measure the camera path once, solve it per flavour (still/smooth/dejerk/track).
+pub mod stabilize;
 /// Many camera takes against many recorder files: which sound is whose, by listening.
 pub mod dualsync;
 /// The timeline's video clips cut into one mp4 over the mixdown — ffmpeg's edit list.
