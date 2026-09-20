@@ -43,9 +43,9 @@ pub struct Angle {
 /// A picture's motion energy from its measured camera path
 /// ([`crate::stabilize::measure`]): mean step length per frame. A locked-off
 /// wide is near 0; a handheld chase is large.
-pub fn motion_energy(path: &[(f32, f32)]) -> f32 {
+pub fn motion_energy(path: &[crate::stabilize::Pose]) -> f32 {
     if path.len() < 2 { return 0.0; }
-    path.windows(2).map(|w| ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt())
+    path.windows(2).map(|w| ((w[1].x - w[0].x).powi(2) + (w[1].y - w[0].y).powi(2)).sqrt())
         .sum::<f32>() / (path.len() - 1) as f32
 }
 
@@ -325,8 +325,9 @@ mod tests {
 
     #[test]
     fn motion_energy_ranks_a_locked_shot_below_a_handheld_one() {
-        let locked: Vec<(f32, f32)> = (0..24).map(|_| (0.0, 0.0)).collect();
-        let hand: Vec<(f32, f32)> = (0..24).map(|i| ((i % 3) as f32 * 2.0, (i % 2) as f32)).collect();
+        use crate::stabilize::Pose;
+        let locked: Vec<Pose> = (0..24).map(|_| Pose::default()).collect();
+        let hand: Vec<Pose> = (0..24).map(|i| Pose { x: (i % 3) as f32 * 2.0, y: (i % 2) as f32, rot: 0.0 }).collect();
         assert!(motion_energy(&locked) < 1e-6 && motion_energy(&hand) > 1.0);
     }
 }

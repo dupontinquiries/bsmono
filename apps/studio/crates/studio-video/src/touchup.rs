@@ -204,9 +204,9 @@ pub fn render(t: &Ticket, out: &Path, size: Size, fps: f64) -> Result<Version, S
             let offsets: Vec<(f32, f32)> = if *align && !path.is_empty() {
                 (0..window.len()).map(|k| {
                     let src = i + k - here;
-                    let (a, b) = (path.get(src).copied().unwrap_or((0.0, 0.0)),
-                                  path.get(i).copied().unwrap_or((0.0, 0.0)));
-                    (b.0 - a.0, b.1 - a.1)
+                    let (a, b) = (path.get(src).copied().unwrap_or_default(),
+                                  path.get(i).copied().unwrap_or_default());
+                    (b.x - a.x, b.y - a.y)
                 }).collect()
             } else {
                 Vec::new()
@@ -219,7 +219,7 @@ pub fn render(t: &Ticket, out: &Path, size: Size, fps: f64) -> Result<Version, S
         }
         if let Some(s) = &solution {
             let c = s.corrections[i.min(s.corrections.len() - 1)];
-            frame = frame.warp(c.dx, c.dy, s.zoom);
+            frame = frame.warp_pose(c.dx, c.dy, s.zoom, c.rot);
         }
         frame
     })?;
@@ -337,8 +337,8 @@ mod tests {
         }
         let jitter = |p: &Pipe| -> f32 {
             let path = stabilize::measure(&p.gray().unwrap(), 12);
-            path.windows(3).map(|w| (w[2].0 - 2.0 * w[1].0 + w[0].0).abs()
-                + (w[2].1 - 2.0 * w[1].1 + w[0].1).abs()).sum::<f32>() / (path.len() - 2) as f32
+            path.windows(3).map(|w| (w[2].x - 2.0 * w[1].x + w[0].x).abs()
+                + (w[2].y - 2.0 * w[1].y + w[0].y).abs()).sum::<f32>() / (path.len() - 2) as f32
         };
         let before = jitter(&Pipe { input: shaky.clone(), range: Some(t.range()), size, fps: 12.0 });
         let after = jitter(&Pipe { input: out.clone(), range: None, size, fps: 12.0 });

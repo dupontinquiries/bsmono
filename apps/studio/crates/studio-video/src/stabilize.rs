@@ -47,6 +47,10 @@ use crate::slate_ocr::Gray;
 pub struct Motion {
     pub dx: f32,
     pub dy: f32,
+    /// Rotation between the two frames, radians, positive anticlockwise.
+    /// Zero unless [`estimate_similarity`] measured it: plain [`estimate`]
+    /// does not look for roll.
+    pub rot: f32,
     /// Mean absolute difference at the best match, 0–255. High means the
     /// frames did not really match (a cut, a flash, an object filling frame).
     pub residual: f32,
@@ -150,13 +154,61 @@ pub fn estimate(prev: &Gray, cur: &Gray, max_shift: u32) -> Motion {
     };
     let fx = sub(sad(a, b, bx - 1, by, margin), sad(a, b, bx + 1, by, margin));
     let fy = sub(sad(a, b, bx, by - 1, margin), sad(a, b, bx, by + 1, margin));
-    Motion { dx: bx as f32 + fx, dy: by as f32 + fy, residual: c }
+    Motion { dx: bx as f32 + fx, dy: by as f32 + fy, rot: 0.0, residual: c }
+}
+
+/// Where the camera was at one frame, relative to the first: shift in
+/// pixels and roll in radians.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Pose {
+    pub x: f32,
+    pub y: f32,
+    pub rot: f32,
+}
+
+/// The left or right half of a frame, for the two-point rotation estimate.
+fn half_frame(g: &Gray, right: bool) -> (Gray, f32) {
+    let w = g.w / 2;
+    let x0 = if right { g.w - w } else { 0 };
+    let mut o = Gray::new(w, g.h);
+    for y in 0..g.h {
+        o.px[y * w..(y + 1) * w].copy_from_slice(&g.px[y * g.w + x0..y * g.w + x0 + w]);
+    }
+    (o, x0 as f32 + w as f32 / 2.0)
+}
+
+/// Translation AND roll, by measuring the two halves of the frame
+/// separately: if the right half moves down relative to the left, the
+/// camera rolled. The angle is the difference in vertical shift over the
+/// distance between the halves' centres — small-angle, which is what
+/// handheld roll is; a whip or a Dutch-angle move is not this tool's case.
+///
+/// Costs two extra searches over half-width frames, so roughly double
+/// [`estimate`]. Worth it only when a shot actually rolls, which is why
+/// [`measure`] does not do it and [`measure_similarity`] does.
+pub fn estimate_similarity(prev: &Gray, cur: &Gray, max_shift: u32) -> Motion {
+    let whole = estimate(prev, cur, max_shift);
+    let (pl, cl) = (half_frame(prev, false), half_frame(cur, false));
+    let (pr, cr) = (half_frame(prev, true), half_frame(cur, true));
+    let (l, r) = (estimate(&pl.0, &cl.0, max_shift), estimate(&pr.0, &cr.0, max_shift));
+    let span = pr.1 - pl.1;
+    // A half that did not match (a cut, a moving subject filling it) has a
+    // high residual; trust the whole-frame translation and report no roll
+    // rather than inventing an angle from noise.
+    let bad = l.residual > whole.residual * 2.0 + 4.0 || r.residual > whole.residual * 2.0 + 4.0;
+    let rot = if span > 1.0 && !bad { (r.dy - l.dy) / span } else { 0.0 };
+    Motion { rot, ..whole }
 }
 
 /// The camera's path over a shot: position of frame i relative to frame 0
 /// (the running sum of frame-to-frame motion).
-pub fn measure(frames: &[Gray], max_shift: u32) -> Vec<(f32, f32)> {
+pub fn measure(frames: &[Gray], max_shift: u32) -> Vec<Pose> {
     integrate(&steps(frames, max_shift, 1))
+}
+
+/// [`measure`] with roll: each pair measured by [`estimate_similarity`].
+pub fn measure_similarity(frames: &[Gray], max_shift: u32) -> Vec<Pose> {
+    integrate(&frames.windows(2).map(|w| estimate_similarity(&w[0], &w[1], max_shift)).collect::<Vec<_>>())
 }
 
 /// [`measure`] across `threads` threads. Each frame PAIR is independent —
@@ -166,15 +218,15 @@ pub fn measure(frames: &[Gray], max_shift: u32) -> Vec<(f32, f32)> {
 /// grey frames (≈960 px wide), measure a shot ONCE and keep the path with
 /// the clip (the flavours re-solve it in microseconds), and re-measure only
 /// when the source range changes.
-pub fn measure_threaded(frames: &[Gray], max_shift: u32, threads: usize) -> Vec<(f32, f32)> {
+pub fn measure_threaded(frames: &[Gray], max_shift: u32, threads: usize) -> Vec<Pose> {
     integrate(&steps(frames, max_shift, threads.max(1)))
 }
 
-fn integrate(steps: &[Motion]) -> Vec<(f32, f32)> {
-    let mut path = vec![(0.0f32, 0.0f32)];
+fn integrate(steps: &[Motion]) -> Vec<Pose> {
+    let mut path = vec![Pose::default()];
     for m in steps {
-        let (x, y) = *path.last().unwrap();
-        path.push((x + m.dx, y + m.dy));
+        let p = *path.last().unwrap();
+        path.push(Pose { x: p.x + m.dx, y: p.y + m.dy, rot: p.rot + m.rot });
     }
     path
 }
@@ -230,6 +282,9 @@ pub struct Correction {
     pub dx: f32,
     pub dy: f32,
     pub zoom: f32,
+    /// Roll to apply about the centre, radians. Always 0 unless the path
+    /// was measured with [`measure_similarity`].
+    pub rot: f32,
 }
 
 /// The stabilized result: per-frame corrections, one zoom for the whole shot
@@ -286,9 +341,10 @@ fn dejerk(v: &[f32], threshold: f32) -> Vec<f32> {
 
 /// Where the camera should have been, and the corrections that get it there,
 /// for a frame of `w`×`h` pixels.
-pub fn solve(path: &[(f32, f32)], flavor: &Flavor, budget: Budget, w: u32, h: u32) -> Solution {
-    let xs: Vec<f32> = path.iter().map(|p| p.0).collect();
-    let ys: Vec<f32> = path.iter().map(|p| p.1).collect();
+pub fn solve(path: &[Pose], flavor: &Flavor, budget: Budget, w: u32, h: u32) -> Solution {
+    let xs: Vec<f32> = path.iter().map(|p| p.x).collect();
+    let ys: Vec<f32> = path.iter().map(|p| p.y).collect();
+    let rs: Vec<f32> = path.iter().map(|p| p.rot).collect();
     let n = path.len();
     // wanted: the correction that moves the real camera onto the ideal one.
     let (wx, wy): (Vec<f32>, Vec<f32>) = match flavor {
@@ -314,18 +370,43 @@ pub fn solve(path: &[(f32, f32)], flavor: &Flavor, budget: Budget, w: u32, h: u3
     // A shift of s px at zoom z stays border-free while |s| <= (z − 1)·W/2.
     let lim_x = (budget.max_zoom.max(1.0) - 1.0) * w as f32 / 2.0;
     let lim_y = (budget.max_zoom.max(1.0) - 1.0) * h as f32 / 2.0;
+    // Roll is corrected the same way the shift is: Still cancels it, Smooth
+    // low-passes it, Dejerk despikes it, Track leaves it alone (a tracker
+    // says where a subject is, not which way up the camera was).
+    let rot: Vec<f32> = if rs.iter().all(|r| r.abs() < 1e-6) {
+        vec![0.0; n]
+    } else {
+        match flavor {
+            Flavor::Still => { let m = rs.iter().sum::<f32>() / n.max(1) as f32; rs.iter().map(|r| m - r).collect() }
+            Flavor::Smooth { sigma } => gaussian(&rs, *sigma).iter().zip(&rs).map(|(s, r)| s - r).collect(),
+            Flavor::Dejerk { threshold } => {
+                // the same rule in radians: a jolt is a jolt at any scale,
+                // scaled by the frame's half-width so the threshold stays
+                // "pixels of movement at the edge of frame"
+                let px = (w as f32 / 2.0).max(1.0);
+                dejerk(&rs.iter().map(|r| r * px).collect::<Vec<_>>(), *threshold)
+                    .iter().zip(&rs).map(|(s, r)| s / px - r).collect()
+            }
+            Flavor::Track { .. } => vec![0.0; n],
+        }
+    };
     let mut clamped: f32 = 0.0;
     let corr: Vec<(f32, f32)> = wx.iter().zip(&wy).map(|(&x, &y)| {
         let (cx, cy) = (x.clamp(-lim_x, lim_x), y.clamp(-lim_y, lim_y));
         clamped = clamped.max((x - cx).abs()).max((y - cy).abs());
         (cx, cy)
     }).collect();
-    // one zoom for the shot: just enough for its largest applied shift
+    // one zoom for the shot: just enough for its largest applied shift, plus
+    // what rolling the frame sweeps off the corners
     let need_x = corr.iter().map(|c| c.0.abs()).fold(0.0, f32::max) * 2.0 / w as f32;
     let need_y = corr.iter().map(|c| c.1.abs()).fold(0.0, f32::max) * 2.0 / h as f32;
-    let zoom = 1.0 + need_x.max(need_y);
+    let worst_rot = rot.iter().fold(0.0f32, |a, r| a.max(r.abs()));
+    // rotating by θ about the centre pulls the corners in by about
+    // (|sin θ| · the other dimension) on each side
+    let need_rot = worst_rot.sin().abs() * (w as f32 + h as f32) / w.min(h) as f32;
+    let zoom = 1.0 + need_x.max(need_y).max(need_rot);
     Solution {
-        corrections: corr.into_iter().map(|(dx, dy)| Correction { dx, dy, zoom }).collect(),
+        corrections: corr.into_iter().zip(rot).map(|((dx, dy), rot)| Correction { dx, dy, zoom, rot }).collect(),
         zoom,
         clamped_px: clamped,
     }
@@ -339,7 +420,10 @@ mod tests {
     /// A textured frame of the scene, viewed with the camera at (cx, cy):
     /// the scene is a fixed pseudo-random texture, blurred so it has the
     /// low-frequency structure real pictures have.
-    fn view(w: usize, h: usize, cx: f32, cy: f32) -> Gray {
+    fn view(w: usize, h: usize, cx: f32, cy: f32) -> Gray { view_rot(w, h, cx, cy, 0.0) }
+
+    /// As `view`, with the camera also rolled by `rot` radians.
+    fn view_rot(w: usize, h: usize, cx: f32, cy: f32, rot: f32) -> Gray {
         let scene = |x: i32, y: i32| -> f32 {
             let mut r = Rng::new(((x.div_euclid(6) as i64 * 7919 + y.div_euclid(6) as i64 * 104_729) as u64) ^ 0xABCD);
             (r.next() * 255.0) as f32
@@ -347,8 +431,12 @@ mod tests {
         let mut g = Gray::new(w, h);
         for y in 0..h {
             for x in 0..w {
-                // sample the scene at (x + cx, y + cy), bilinear on the 6-px cells
-                let (sx, sy) = (x as f32 + cx, y as f32 + cy);
+                // sample the scene at (x + cx, y + cy), rolled about the
+                // centre, bilinear on the 6-px cells
+                let (ox, oy) = (x as f32 - w as f32 / 2.0, y as f32 - h as f32 / 2.0);
+                let (co, si) = (rot.cos(), rot.sin());
+                let (sx, sy) = (ox * co - oy * si + w as f32 / 2.0 + cx,
+                                ox * si + oy * co + h as f32 / 2.0 + cy);
                 let (x0, y0) = (sx.floor(), sy.floor());
                 let (fx, fy) = (sx - x0, sy - y0);
                 let v = |dx: i32, dy: i32| scene(x0 as i32 + dx, y0 as i32 + dy);
@@ -379,12 +467,13 @@ mod tests {
         assert!((m.dx + 27.0).abs() < 0.5 && (m.dy - 14.0).abs() < 0.5, "{m:?}");
     }
 
-    fn shaky_pan(n: usize) -> Vec<(f32, f32)> {
+    fn shaky_pan(n: usize) -> Vec<Pose> {
         // a slow pan to the right (0.8 px/frame) with handheld jitter, and one bump at frame 30
         let mut r = Rng::new(3);
         (0..n).map(|i| {
             let bump = if i >= 30 { 12.0 } else { 0.0 };
-            (0.8 * i as f32 + (r.next() as f32 - 0.5) * 3.0 + bump, (r.next() as f32 - 0.5) * 3.0)
+            Pose { x: 0.8 * i as f32 + (r.next() as f32 - 0.5) * 3.0 + bump,
+                   y: (r.next() as f32 - 0.5) * 3.0, rot: 0.0 }
         }).collect()
     }
 
@@ -394,8 +483,8 @@ mod tests {
             .sum::<f32>() / (p.len() - 2) as f32
     }
 
-    fn apply(path: &[(f32, f32)], s: &Solution) -> Vec<(f32, f32)> {
-        path.iter().zip(&s.corrections).map(|(p, c)| (p.0 + c.dx, p.1 + c.dy)).collect()
+    fn apply(path: &[Pose], s: &Solution) -> Vec<(f32, f32)> {
+        path.iter().zip(&s.corrections).map(|(p, c)| (p.x + c.dx, p.y + c.dy)).collect()
     }
 
     const ROOMY: Budget = Budget { max_zoom: 1.3 };
@@ -415,7 +504,8 @@ mod tests {
         let path = shaky_pan(90);
         let s = solve(&path, &Flavor::Smooth { sigma: 8.0 }, ROOMY, 1920, 1080);
         let out = apply(&path, &s);
-        assert!(jitter(&out) < jitter(&path) * 0.25, "{} vs {}", jitter(&out), jitter(&path));
+        let raw: Vec<(f32, f32)> = path.iter().map(|p| (p.x, p.y)).collect();
+        assert!(jitter(&out) < jitter(&raw) * 0.25, "{} vs {}", jitter(&out), jitter(&raw));
         // the pan survives: still travelling right at about 0.8 px/frame mid-shot
         let v = (out[60].0 - out[20].0) / 40.0;
         assert!((0.6..=1.4).contains(&v), "pan speed {v}");
@@ -424,7 +514,7 @@ mod tests {
     #[test]
     fn dejerk_removes_the_bump_and_leaves_the_rest_alone() {
         // clean pan plus a single 12 px bump: only the bump should be corrected
-        let path: Vec<(f32, f32)> = (0..60).map(|i| (0.8 * i as f32 + if i >= 30 { 12.0 } else { 0.0 }, 0.0)).collect();
+        let path: Vec<Pose> = (0..60).map(|i| Pose { x: 0.8 * i as f32 + if i >= 30 { 12.0 } else { 0.0 }, ..Default::default() }).collect();
         let s = solve(&path, &Flavor::Dejerk { threshold: 3.0 }, ROOMY, 1920, 1080);
         let out = apply(&path, &s);
         let steps: Vec<f32> = out.windows(2).map(|w| w[1].0 - w[0].0).collect();
@@ -437,7 +527,7 @@ mod tests {
     fn track_holds_the_subject_on_its_mark() {
         let n = 50;
         let subject: Vec<(f32, f32)> = (0..n).map(|i| (900.0 + 3.0 * i as f32, 500.0 - i as f32)).collect();
-        let s = solve(&vec![(0.0, 0.0); n], &Flavor::Track { subject: subject.clone(), target: (960.0, 540.0), sigma: 0.0 },
+        let s = solve(&vec![Pose::default(); n], &Flavor::Track { subject: subject.clone(), target: (960.0, 540.0), sigma: 0.0 },
                       Budget { max_zoom: 1.5 }, 1920, 1080);
         for (p, c) in subject.iter().zip(&s.corrections) {
             assert!((p.0 + c.dx - 960.0).abs() < 1e-3 && (p.1 + c.dy - 540.0).abs() < 1e-3);
@@ -453,6 +543,42 @@ mod tests {
         assert!(s.clamped_px > 10.0, "it must say it could not lock the shot: {}", s.clamped_px);
         let d = solve(&path, &Flavor::Dejerk { threshold: 3.0 }, tight, 1920, 1080);
         assert!(d.zoom < s.zoom, "dejerk spends less crop than still: {} vs {}", d.zoom, s.zoom);
+    }
+
+    #[test]
+    fn roll_is_measured_when_asked_for_and_not_otherwise() {
+        let a = view(240, 135, 0.0, 0.0);
+        for &deg in &[1.5f32, -2.5, 0.0] {
+            let rad = deg.to_radians();
+            let b = view_rot(240, 135, 3.0, -1.0, rad);
+            let plain = estimate(&a, &b, 16);
+            assert_eq!(plain.rot, 0.0, "estimate() never reports roll");
+            let sim = estimate_similarity(&a, &b, 16);
+            // the camera rolled by `rad`, so the content rolled by -rad
+            assert!((sim.rot + rad).abs() < 0.008, "{deg} deg: measured {} rad ({sim:?})", sim.rot);
+            assert!((sim.dx - plain.dx).abs() < 0.5 && (sim.dy - plain.dy).abs() < 0.5,
+                    "translation is unchanged by looking for roll");
+        }
+    }
+
+    #[test]
+    fn a_rolling_shot_is_levelled_and_pays_for_it_in_zoom() {
+        let frames: Vec<Gray> = (0..24).map(|i| {
+            let t = i as f32;
+            view_rot(240, 135, 0.0, 0.0, (t * 0.5).sin() * 0.03)
+        }).collect();
+        let path = measure_similarity(&frames, 16);
+        assert!(path.iter().any(|p| p.rot.abs() > 0.01), "the fixture rolls: {:?}", path[6]);
+        let s = solve(&path, &Flavor::Still, Budget { max_zoom: 1.3 }, 240, 135);
+        let levelled: Vec<f32> = path.iter().zip(&s.corrections).map(|(p, c)| p.rot + c.rot).collect();
+        let spread = levelled.iter().fold(f32::MIN, |a, r| a.max(*r))
+            - levelled.iter().fold(f32::MAX, |a, r| a.min(*r));
+        assert!(spread < 1e-4, "Still must cancel the roll: {spread}");
+        assert!(s.zoom > 1.0, "levelling sweeps the corners, so it costs crop: {}", s.zoom);
+        // a translation-only path leaves rot alone and costs nothing extra
+        let flat = solve(&measure(&frames, 16), &Flavor::Still, Budget { max_zoom: 1.3 }, 240, 135);
+        assert!(flat.corrections.iter().all(|c| c.rot == 0.0));
+        assert!(flat.zoom < s.zoom, "{} vs {}", flat.zoom, s.zoom);
     }
 
     #[test]
@@ -504,7 +630,7 @@ mod tests {
         let path = measure(&frames, 12);
         // measured path is the negative of the camera path (content moves opposite)
         for (m, c) in path.iter().zip(&cams) {
-            assert!((m.0 + (c.0 - cams[0].0)).abs() < 0.8, "measured {m:?} for camera {c:?}");
+            assert!((m.x + (c.0 - cams[0].0)).abs() < 0.8, "measured {m:?} for camera {c:?}");
         }
     }
 }

@@ -79,6 +79,45 @@ impl Frame {
     /// source x stepping incrementally, hoists the row clamping, and takes
     /// a straight copy when the warp is a whole-pixel shift at zoom 1.
     pub fn warp(&self, dx: f32, dy: f32, zoom: f32) -> Frame {
+        self.warp_pose(dx, dy, zoom, 0.0)
+    }
+
+    /// [`Frame::warp`] with a roll about the centre (radians, positive
+    /// anticlockwise) — what a [`crate::stabilize::Correction`] carries when
+    /// the path was measured with roll. Kept separate so the common,
+    /// rotation-free case keeps its row-stepping fast path.
+    pub fn warp_pose(&self, dx: f32, dy: f32, zoom: f32, rot: f32) -> Frame {
+        if rot.abs() > 1e-6 {
+            let (w, h) = (self.w as usize, self.h as usize);
+            let (cx, cy) = (self.w as f32 / 2.0, self.h as f32 / 2.0);
+            let z = if zoom.abs() < 1e-6 { 1.0 } else { zoom };
+            let (cos, sin) = ((-rot).cos(), (-rot).sin());
+            let mut out = Frame::black(self.w, self.h);
+            for y in 0..h {
+                for x in 0..w {
+                    // destination -> source: unzoom, unrotate, unshift
+                    let (ux, uy) = ((x as f32 + 0.5 - cx) / z, (y as f32 + 0.5 - cy) / z);
+                    let sx = ux * cos - uy * sin - dx + cx - 0.5;
+                    let sy = ux * sin + uy * cos - dy + cy - 0.5;
+                    let (x0f, y0f) = (sx.floor(), sy.floor());
+                    let (fx, fy) = (sx - x0f, sy - y0f);
+                    let cl = |v: f32, hi: usize| (v as isize).clamp(0, hi as isize - 1) as usize;
+                    let (xa, xb) = (cl(x0f, w) * 3, cl(x0f + 1.0, w) * 3);
+                    let (ya, yb) = (cl(y0f, h) * w * 3, cl(y0f + 1.0, h) * w * 3);
+                    let o = (y * w + x) * 3;
+                    for c in 0..3 {
+                        let top = self.px[ya + xa + c] as f32 * (1.0 - fx) + self.px[ya + xb + c] as f32 * fx;
+                        let bot = self.px[yb + xa + c] as f32 * (1.0 - fx) + self.px[yb + xb + c] as f32 * fx;
+                        out.px[o + c] = (top * (1.0 - fy) + bot * fy + 0.5) as u8;
+                    }
+                }
+            }
+            return out;
+        }
+        self.warp_translate(dx, dy, zoom)
+    }
+
+    fn warp_translate(&self, dx: f32, dy: f32, zoom: f32) -> Frame {
         let mut out = Frame::black(self.w, self.h);
         let (w, h) = (self.w as usize, self.h as usize);
         let z = if zoom.abs() < 1e-6 { 1.0 } else { zoom };
@@ -435,7 +474,7 @@ mod tests {
 
         let jitter = |frames: &[Gray]| -> f32 {
             let p = measure(frames, 16);
-            p.windows(3).map(|w| (w[2].0 - 2.0 * w[1].0 + w[0].0).abs() + (w[2].1 - 2.0 * w[1].1 + w[0].1).abs())
+            p.windows(3).map(|w| (w[2].x - 2.0 * w[1].x + w[0].x).abs() + (w[2].y - 2.0 * w[1].y + w[0].y).abs())
                 .sum::<f32>() / (p.len() - 2) as f32
         };
         let before = jitter(&q.gray().unwrap());
