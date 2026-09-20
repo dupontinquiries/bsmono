@@ -251,11 +251,13 @@ pub fn run(draft: &mut MapDraft, author: &mut dyn MapAuthor) -> String {
 // 3. Multi-turn building needs a PLAN with checkable goals and a readback of
 //    what is still unmet, or the model wanders and nothing says when to stop.
 
-/// The same shape as `voxel_tools::llm::Completer::complete_chain`, so an
-/// adapter over the real thing is one line and nothing here depends on it.
-pub trait ChainCompleter {
-    fn complete_chain(&mut self, system: &str, prior: &[(String, String)], user: &str) -> Result<String, String>;
-}
+/// unendlich's own completer and turn control, not copies of them. I first
+/// wrote a `ChainCompleter` trait here "with the same shape" -- which meant
+/// every provider unendlich already has (the command one, the HTTP one, the
+/// in-process `ai-gpu` one) would have needed an adapter before it could
+/// author a map. Taking the real trait means they all work today, and a turn
+/// here can be CANCELLED and reports PROGRESS, which the copy could not.
+pub use voxel_tools::llm::{Completer, TurnControl};
 
 pub const MAX_CALLS_PER_REPLY: usize = 8;
 pub const MAX_TURNS: usize = 40;
@@ -370,20 +372,31 @@ impl Brief {
 /// REFUSAL: later calls in the same reply were written assuming the earlier
 /// ones worked, and building on a placement that never happened is how a
 /// structure goes wrong three steps before anyone notices.
-pub fn run_chain(draft: &mut MapDraft, brief: &Brief, model: &mut dyn ChainCompleter) -> String {
+pub fn run_chain(draft: &mut MapDraft, brief: &Brief, model: &mut dyn Completer, ctl: &TurnControl) -> String {
     let system = format!("{}\n\n{}", tools(), "Reply with tool calls only, one per line, at most 8. Work the TODO goals in order. Say `done` when every goal is done.");
     let mut prior: Vec<(String, String)> = Vec::new();
     let mut transcript = String::new();
     let mut last = String::from("(nothing yet)");
     for turn in 0..MAX_TURNS {
+        if ctl.cancelled() {
+            transcript.push_str(&format!("-- cancelled before turn {turn}; what was built is kept\n"));
+            break;
+        }
         let user = format!("{}LAST RESULTS:\n{last}", brief.readback(draft));
-        let reply = match model.complete_chain(&system, &prior, &user) {
+        let reply = match model.complete_chain(&system, &prior, &user, ctl) {
             Ok(r) => r,
             Err(e) => {
                 transcript.push_str(&format!("-- turn {turn}: the model failed: {e}\n"));
                 break;
             }
         };
+        // NOT voxel_tools::llm::strip_fences. It looks generic and is not: with
+        // no fence present it keeps only lines starting with unendlich's own
+        // build keywords (asset, frame, part, repeat...), so every `place` and
+        // `survey` was filtered out as not-a-program and the loop ran 40 turns
+        // of "no tool call found". The COMPLETER and TURN CONTROL are
+        // protocol-neutral and are reused; reply cleaning belongs to each
+        // grammar. `extract_calls` handles fences for this one.
         let (calls, cut) = extract_calls(&reply);
         let mut results = String::new();
         let mut finished = false;
@@ -406,6 +419,7 @@ pub fn run_chain(draft: &mut MapDraft, brief: &Brief, model: &mut dyn ChainCompl
         if cut {
             results.push_str("your reply was cut off mid-call; the unfinished call was NOT run. Send fewer calls per reply.\n");
         }
+        ctl.report(draft.placements.len(), results.lines().last().unwrap_or(""));
         transcript.push_str(&format!("-- turn {turn}\n{results}"));
         prior.push((user, reply));
         last = results;
@@ -484,16 +498,6 @@ mod tests {
         assert!(d.placements.len() > 40);
     }
 
-    /// A stand-in for a model: canned replies, written the way models write.
-    struct Canned(Vec<&'static str>, Vec<usize>);
-    impl ChainCompleter for Canned {
-        fn complete_chain(&mut self, system: &str, prior: &[(String, String)], user: &str) -> Result<String, String> {
-            assert!(system.contains("survey") && user.contains("BRIEF:"), "the model is always told the tools and the brief");
-            self.1.push(prior.len());
-            self.0.get(prior.len()).map(|s| s.to_string()).ok_or("out of replies".into())
-        }
-    }
-
     #[test]
     fn a_reply_is_prose_fences_several_calls_and_sometimes_half_a_call() {
         let (calls, cut) = extract_calls("Sure! I'll start with the rocks.\n```\nplace Rock -9 3.5\n- place Fern 10 2.5 0\n```\nThen I will survey the area.\nsurvey 0 0 20\n");
@@ -511,22 +515,26 @@ mod tests {
     /// chatty, batches calls, makes a mistake mid-batch, gets cut off once.
     #[test]
     fn a_model_is_driven_through_a_brief_turn_by_turn() {
-        let mut model = Canned(vec![
+        // unendlich's OWN test double: if this drives the loop, so does every
+        // real provider behind the same trait.
+        let mut model = voxel_tools::llm::FakeCompleter::new(vec![
             "Let me look first.\nsurvey 0 0 21\n",
             // the third call is on the lane; the fourth must NOT run
             "```\nplace Rock -9 3.5\nplace BoulderCluster -13.5 9.5\nplace RuinPillar 0 15\nplace StoneHead 14 14\n```\n",
             "place RuinPillar -9.5 15.5\nplace Fern 10 2.5\nplace Fern 16.5 3.5\nplace Fern -15.5 3\nplace Fern -7.5 10\nplace Bush",
             "done",
-        ], Vec::new());
+        ].into_iter().map(String::from).collect());
         let mut d = MapDraft::default();
         let brief = Brief::hollow();
         assert!(brief.readback(&d).contains("[TODO] perches") && brief.readback(&d).contains("0 of 6 perches"));
-        let t = run_chain(&mut d, &brief, &mut model);
+        let ctl = TurnControl::default();
+        let t = run_chain(&mut d, &brief, &mut model, &ctl);
         println!("{t}");
         // Three turns, not four: the loop ends ITSELF once every goal is met and
         // the map validates, without waiting for the model to say `done`. (I
         // first asserted four here, as if it would not.)
-        assert_eq!(model.1, vec![0, 1, 2], "each turn sees exactly the turns before it: pairs, not a growing blob");
+        assert_eq!(model.calls(), 3, "three turns");
+        assert_eq!(ctl.snapshot().0, d.placements.len(), "progress was reported as it went: a UI can show it");
         assert!(t.contains("from a lane's centreline") && t.contains("the rest of that reply was not run"));
         assert!(!d.placements.iter().any(|p| p.kind == PropKind::StoneHead), "the call after a refusal did not run");
         assert!(t.contains("cut off mid-call") && !d.placements.iter().any(|p| p.kind == PropKind::Bush), "half a call is not run");
@@ -534,8 +542,14 @@ mod tests {
         assert!(t.contains("[done] perches -- 6 perches at 3 heights"), "three placements and their mirrors: {t}");
         assert!(t.contains("[done] cover -- 8 beds") && t.contains("[done] room"));
         // A model that dies is a line in the transcript, not a panic.
-        let t = run_chain(&mut MapDraft::default(), &brief, &mut Canned(vec![], Vec::new()));
-        assert!(t.contains("the model failed: out of replies"));
+        let t = run_chain(&mut MapDraft::default(), &brief, &mut voxel_tools::llm::DeadCompleter("no GPU".into()), &TurnControl::default());
+        assert!(t.contains("the model failed") && t.contains("no GPU"), "{t}");
+        // Cancelled before it starts: the model is never called.
+        let stop = TurnControl::default();
+        stop.cancel();
+        let mut never = voxel_tools::llm::FakeCompleter::new(vec!["place Rock -9 3.5".into()]);
+        let t = run_chain(&mut MapDraft::default(), &brief, &mut never, &stop);
+        assert!(t.contains("cancelled before turn 0") && never.calls() == 0, "{t}");
     }
 
     /// The brief is not easier than what I asked of myself: the Hollow I

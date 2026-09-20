@@ -14,6 +14,9 @@ name = "clawbound-battleground"
 path = "src/main.rs"
 
 [dependencies]
+# unendlich's AI authoring layer: Completer, TurnControl, reply hygiene. Pure
+# std. mapgen drives ITS completers rather than keeping a look-alike trait.
+voxel-tools = { path = "../unendlich/crates/voxel-tools" }
 # LAN discovery (and, later, the fleet's friend-id join). std-only.
 netcode = { path = "../shared/netcode" }
 wgpu = "0.19"
