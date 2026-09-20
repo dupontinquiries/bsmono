@@ -124,33 +124,40 @@ pub fn clean(window: &[Frame], center: usize, offsets: &[(f32, f32)], s: &Settin
             }
         }
     }
-    // pass 2: fill, feathered by distance to the edge of the covered region
+    // pass 2: fill. The covered region is filled FULLY — feathering inside
+    // it leaves a ring of the thing being removed (a 10 px block with a 2 px
+    // feather kept 30% of its own pixels). The feather is a ring OUTSIDE it
+    // instead: alpha ramps from 1 at the region's edge to 0 `feather` pixels
+    // away, so the patch has no hard border against the plate.
+    let r = s.feather as i32;
     for y in 0..h {
         for x in 0..w {
             let i = (y * w + x) as usize;
-            if !covered[i] { continue; }
-            let mut a = 1.0f32;
-            if s.feather > 0 {
-                // nearest uncovered pixel within the feather radius
-                let r = s.feather as i32;
+            let a = if covered[i] {
+                1.0f32
+            } else if r > 0 {
+                // distance to the nearest covered pixel, within the ring
                 let mut nearest = r + 1;
                 for dy in -r..=r {
                     for dx in -r..=r {
                         let (nx, ny) = (x as i32 + dx, y as i32 + dy);
-                        let out_of = nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32;
-                        if out_of || !covered[(ny as u32 * w + nx as u32) as usize] {
+                        if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 { continue; }
+                        if covered[(ny as u32 * w + nx as u32) as usize] {
                             nearest = nearest.min(dx.abs().max(dy.abs()));
                         }
                     }
                 }
-                a = (nearest as f32 / (r + 1) as f32).clamp(0.0, 1.0);
-            }
+                if nearest > r { continue; }
+                1.0 - nearest as f32 / (r + 1) as f32
+            } else {
+                continue;
+            };
             let here = cur.at(x, y);
             let m = med[i];
             let mut v = [0u8; 3];
             for c in 0..3 { v[c] = (m[c] as f32 * a + here[c] as f32 * (1.0 - a)).round() as u8; }
             out.set(x, y, v);
-            filled += 1;
+            if covered[i] { filled += 1; }
         }
     }
     Cleaned { frame: out, confidence: conf, unresolved, filled }
@@ -277,16 +284,40 @@ mod tests {
     }
 
     #[test]
-    fn feathering_softens_the_patch_edge() {
+    fn feathering_cleans_up_the_soft_edge_the_threshold_missed() {
         let bg = background(96, 54);
-        let window: Vec<Frame> = (0..5).map(|i| with_block(&bg, 42 + (i as i32 - 2) * 16, 8, [255, 0, 0])).collect();
+        // A block with a motion-blurred edge: the edge columns are a 12%
+        // blend, which is UNDER the threshold, so they are not flagged as
+        // covered. Without a feather they survive as a faint outline of the
+        // thing that was removed — which is what the feather is for. (A
+        // hard-edged block needs no feather at all: outside it the frame and
+        // the median are identical and blending changes nothing, which is
+        // how the first version of this test managed to assert nothing.)
+        let blur = |f: &mut Frame, x: u32, amount: f32| {
+            for y in 6..f.h - 6 {
+                let p = f.at(x, y);
+                let mut v = [0u8; 3];
+                let red = [255u8, 0, 0];
+                for c in 0..3 { v[c] = (p[c] as f32 * (1.0 - amount) + red[c] as f32 * amount) as u8; }
+                f.set(x, y, v);
+            }
+        };
+        let window: Vec<Frame> = (0..5).map(|i| {
+            let x0 = 42 + (i as i32 - 2) * 16;
+            let mut f = with_block(&bg, x0, 8, [255, 0, 0]);
+            if x0 > 0 { blur(&mut f, (x0 - 1) as u32, 0.12); }
+            blur(&mut f, (x0 + 8) as u32, 0.12);
+            f
+        }).collect();
         let hard = clean(&window, 2, &[], &Settings { feather: 0, ..Default::default() });
         let soft = clean(&window, 2, &[], &Settings { feather: 3, ..Default::default() });
-        // with feathering the edge column is a blend, so it is NOT the plain
-        // background the hard fill puts there
-        let edge = (42, 27);
-        let (hp, sp) = (hard.frame.at(edge.0, edge.1), soft.frame.at(edge.0, edge.1));
-        assert_ne!(hp, sp, "the feathered edge blends toward the original");
-        assert!(worst_diff(&hard.frame, &bg, (44, 12, 48, 42)) <= 6.0, "the interior is background either way");
+        let edge = (50u32, 27u32);  // the blurred column just outside the block
+        assert!(worst_diff(&hard.frame, &bg, (edge.0, 20, edge.0 + 1, 34)) > 8.0,
+                "unfeathered, the soft edge survives: {:?}", hard.frame.at(edge.0, edge.1));
+        assert!(worst_diff(&soft.frame, &bg, (edge.0, 20, edge.0 + 1, 34))
+                < worst_diff(&hard.frame, &bg, (edge.0, 20, edge.0 + 1, 34)),
+                "feathered, it is pulled toward the plate");
+        // the interior is filled the same either way
+        assert_eq!(worst_diff(&hard.frame, &soft.frame, (43, 12, 49, 42)), 0.0);
     }
 }

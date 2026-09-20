@@ -68,6 +68,8 @@ pub mod spoken_slate;
 pub mod testkit;
 /// Warp stabilization: measure the camera path once, solve it per flavour (still/smooth/dejerk/track).
 pub mod stabilize;
+/// Touch-up: a ticket for one shot becomes a fixed version of it, with handles and a report.
+pub mod touchup;
 /// Temporal clean plate: remove something that passes through a shot, using the frames around it.
 pub mod cleanplate;
 /// Frames out of ffmpeg, through Rust, back into ffmpeg: the one place per-frame pixel work happens.
