@@ -196,6 +196,41 @@ impl Grid {
     /// Mesh to world-scale instances.
     /// `feet_origin`: x/z centered, y starts at 0 (characters) — otherwise fully centered.
     pub fn mesh(&self, voxel: f32, feet_origin: bool) -> VoxelMesh {
+        // Hull only. This emitted EVERY filled voxel, so a boulder or a
+        // trunk was drawn solid all the way through: instances that cost a
+        // vertex-shader run and a slot in the buffer and can never be seen.
+        // A voxel is dropped only when all six neighbours are OPAQUE, so
+        // anything behind glass or leaves with alpha survives. Wind, brush
+        // and blast offsets are smooth in world position, so neighbours move
+        // together and no gap opens. AO still comes from the full grid.
+        self.mesh_impl(voxel, feet_origin, Some(&|_, _, _| true))
+    }
+
+    /// Every filled voxel, interior included. For measuring what `mesh`
+    /// saves, and for anything that needs the solid.
+    pub fn mesh_solid(&self, voxel: f32, feet_origin: bool) -> VoxelMesh {
+        self.mesh_impl(voxel, feet_origin, None)
+    }
+
+    /// Mesh only the voxels for which `member` is true, as one PART of a
+    /// body that will be posed separately (see `rigged`).
+    ///
+    /// Two things differ from [`Self::mesh`], both because parts move:
+    ///
+    /// * **Hull only.** A voxel whose six neighbours are all opaque members
+    ///   of the SAME part can never be seen, whatever the pose, so it is
+    ///   dropped. A neighbour that is filled but belongs to another part
+    ///   counts as open: that is the cut face, and it is exactly what shows
+    ///   when a leg swings away from the belly.
+    /// * **AO and dither come from the WHOLE grid**, not the part, and
+    ///   positions use the whole grid's origin. A part at rest is therefore
+    ///   pixel-identical to the same voxels in the uncut mesh -- no bright
+    ///   seam at the cut, and identity is the rest transform.
+    pub fn mesh_where(&self, voxel: f32, feet_origin: bool, member: &dyn Fn(i32, i32, i32) -> bool) -> VoxelMesh {
+        self.mesh_impl(voxel, feet_origin, Some(member))
+    }
+
+    fn mesh_impl(&self, voxel: f32, feet_origin: bool, member: Option<&dyn Fn(i32, i32, i32) -> bool>) -> VoxelMesh {
         let cx = self.nx as f32 * 0.5;
         let cz = self.nz as f32 * 0.5;
         let mut inst = Vec::with_capacity(self.cells.len() / 2);
@@ -203,6 +238,21 @@ impl Grid {
             for y in 0..self.ny {
                 for x in 0..self.nx {
                     if let Some(c) = self.cells[x + self.nx * (y + self.ny * z)] {
+                        if let Some(member) = member {
+                            let (xi, yi, zi) = (x as i32, y as i32, z as i32);
+                            if !member(xi, yi, zi) {
+                                continue;
+                            }
+                            let sealed = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+                                .iter()
+                                .all(|&(dx, dy, dz)| {
+                                    let (nx, ny, nz) = (xi + dx, yi + dy, zi + dz);
+                                    matches!(self.get(nx, ny, nz), Some(n) if n[3] >= 1.0) && member(nx, ny, nz)
+                                });
+                            if sealed && c[3] >= 1.0 {
+                                continue;
+                            }
+                        }
                         let ao = self.bake_ao(x as i32, y as i32, z as i32);
                         // subtle deterministic dither for microvoxel texture
                         let d = dither(x as i32, y as i32, z as i32);

@@ -377,7 +377,10 @@ mod tests {
         let mut p = Pile::new();
         let mut trips = 0;
         for _ in 0..4 {
-            while j.take(Kill::new(Prey::Squirrel, 0.0)) {}
+            // Mice, not squirrels: one squirrel is 0.6 of a mouthful, so a
+            // trip of squirrels is a trip of ONE and the pile never outgrows
+            // the trip count. Four mice fit.
+            while j.take(Kill::new(Prey::Mouse, 0.0)) {}
             p.deposit(j.drop_all());
             trips += 1;
         }

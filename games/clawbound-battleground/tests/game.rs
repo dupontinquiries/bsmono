@@ -145,3 +145,310 @@ fn xp_curve_monotonic() {
         prev = x;
     }
 }
+
+
+/// The leap, through the real sim loop: press toward a rock, end up standing
+/// on it; press again toward the next, and the chain skips the cooldown;
+/// walk off, and come back down.
+#[test]
+fn a_cat_leaps_onto_a_rock_bounds_to_the_next_and_steps_off() {
+    use clawbound::blockers::{Blockers, PropKind};
+    use clawbound::leap::{LEAP_COOLDOWN, LEAP_UP};
+    use glam::Vec3;
+    let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    let mut b = Blockers::new(200.0, 6.0);
+    let start = game.gods[0].pos;
+    b.push_prop(PropKind::Rock, start.x + 5.0, start.z, 0.0, 1.0);
+    b.push_prop(PropKind::BoulderCluster, start.x + 10.5, start.z, 0.0, 1.0);
+    game.blockers = std::sync::Arc::new(b);
+    let step = |g: &mut Game, n: usize| for _ in 0..n { g.tick(1.0 / 60.0); };
+
+    game.leap_queue.push((0, Vec3::X));
+    step(&mut game, 5);
+    assert!(game.gods[0].leap.is_some(), "the press was accepted");
+    let mut peak = 0.0f32;
+    for _ in 0..90 {
+        game.tick(1.0 / 60.0);
+        peak = peak.max(game.gods[0].pos.y);
+    }
+    let g = &game.gods[0];
+    assert_eq!(g.perch, Some(1.4), "standing on the rock");
+    assert!((g.pos - Vec3::new(start.x + 5.0, 1.4, start.z)).length() < 0.2, "at {}", g.pos);
+    assert!(peak > 1.8 && peak < LEAP_UP, "arced over it: {peak}");
+    assert!(g.leap_cd > LEAP_COOLDOWN * 0.3, "a ground leap costs a cooldown");
+
+    // Still cooling down -- but from a perch the chain is free.
+    game.leap_queue.push((0, Vec3::X));
+    step(&mut game, 90);
+    assert_eq!(game.gods[0].perch, Some(2.0), "bounded to the boulders while the cooldown was still running");
+
+    // Walk off the edge.
+    game.gods[0].move_dir = Vec3::Z;
+    step(&mut game, 60);
+    assert_eq!(game.gods[0].perch, None);
+    assert!(game.gods[0].pos.y < 0.01, "and came down: y = {}", game.gods[0].pos.y);
+
+    // On open ground with the cooldown running, a press is refused.
+    game.gods[0].move_dir = Vec3::ZERO;
+    game.gods[0].leap_cd = 1.0;
+    game.leap_queue.push((0, Vec3::Z));
+    step(&mut game, 3);
+    assert!(game.gods[0].leap.is_none(), "no back-to-back leaps across open ground");
+}
+
+
+/// What a cat does with a wall: up onto it from the ground, along the top
+/// of it, knocked off it by a solid hit -- and down on its feet, unhurt by
+/// the fall itself.
+#[test]
+fn a_cat_runs_a_wall_top_is_knocked_off_and_lands_on_its_feet() {
+    use clawbound::blockers::{Blockers, PropKind};
+    use clawbound::leap::{Phase, RIGHTING_SECS};
+    use glam::Vec3;
+    let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    let start = game.gods[0].pos;
+    let mut b = Blockers::new(250.0, 6.0);
+    // a wall running along +x, four units ahead in +z
+    b.push_segment(PropKind::RuinWall, start.x - 2.0, start.z + 4.0, start.x + 14.0, start.z + 4.0, 0.0, 1.0);
+    game.blockers = std::sync::Arc::new(b);
+    // Keep everyone else out of it: this is about one cat and one wall.
+    for g in game.gods.iter_mut().skip(1) {
+        g.respawn_t = 999.0;
+    }
+
+    game.leap_queue.push((0, Vec3::Z));
+    for _ in 0..90 {
+        game.tick(1.0 / 60.0);
+    }
+    let g = &game.gods[0];
+    assert_eq!((g.perch, g.perch_narrow), (Some(3.0), true), "up on the wall, three times its own height, and it is a ridge");
+
+    // Along the top. It must STAY on top, and cover real ground.
+    let x0 = game.gods[0].pos.x;
+    game.gods[0].move_dir = Vec3::X;
+    for _ in 0..60 {
+        game.tick(1.0 / 60.0);
+        assert_eq!(game.gods[0].perch, Some(3.0), "fell off a wall it was walking ALONG at x = {}", game.gods[0].pos.x);
+    }
+    let ran = game.gods[0].pos.x - x0;
+    assert!(ran > 5.0, "a second along the ridge covered only {ran} u");
+    game.gods[0].move_dir = Vec3::ZERO;
+    game.tick(1.0 / 60.0);
+
+    // A solid hit. (A scratch must not do it -- both directions.)
+    let max = game.gods[0].max_hp;
+    game.gods[0].hp -= max * 0.04;
+    game.tick(1.0 / 60.0);
+    assert!(game.gods[0].perch.is_some(), "a 4% scratch does not take a cat's footing");
+    game.gods[0].hp -= max * 0.20;
+    let hp_after_hit = game.gods[0].hp;
+    game.tick(1.0 / 60.0);
+    let fall = game.gods[0].fall.expect("a 20% hit on a ridge knocks it off");
+    assert!(fall.tumble.abs() > 2.0, "and it goes over on its back: {}", fall.tumble);
+
+    let (mut t, mut upright_at, mut landed_at) = (0.0f32, None, None);
+    for _ in 0..120 {
+        game.tick(1.0 / 60.0);
+        t += 1.0 / 60.0;
+        let g = &game.gods[0];
+        if let Some(f) = g.fall {
+            if upright_at.is_none() && f.roll().abs() < 0.05 {
+                upright_at = Some(t);
+            }
+        } else if landed_at.is_none() {
+            landed_at = Some(t);
+            assert!(matches!(g.leap, Some(l) if l.phase == Phase::Land), "a fall ends in a landing, not a teleport");
+        }
+    }
+    let (up, down) = (upright_at.expect("never righted"), landed_at.expect("never landed"));
+    assert!(up <= RIGHTING_SECS + 0.04 && up < down, "upright at {up}s, down at {down}s");
+    let g = &game.gods[0];
+    assert!(g.pos.y.abs() < 1e-3 && g.perch.is_none() && g.leap.is_none(), "on the ground and done: {:?}", g.pos);
+    assert!(g.hp >= hp_after_hit - 1e-3, "the FALL cost nothing: {} -> {}", hp_after_hit, g.hp);
+    let off_axis = (g.pos.z - (start.z + 4.0)).abs();
+    assert!(off_axis > 0.9 + 0.5, "and it is beside the wall, not inside it: {off_axis} u from the spine");
+}
+
+/// Stalking is a state, not a key held down (review: a held Ctrl is a
+/// compositor shortcut on Linux and absent on a handset, and tying the stalk
+/// to the fight is better balance anyway). Three sources, one number.
+#[test]
+fn stalking_is_broken_by_a_fight_granted_by_the_kit_and_forced_by_wounds() {
+    use clawbound::consts::{SNEAK_SPEED, STALK_BREAK_SECS, WOUNDED_FRAC};
+    use clawbound::gods::Archetype;
+    // An ancestor with a movement or self-buff ability: the kit's sneak boost.
+    let (def_id, slot) = ROSTER
+        .iter()
+        .find_map(|d| d.abilities.iter().position(|a| matches!(a.arch, Archetype::Dash { .. } | Archetype::Blink { .. } | Archetype::Buff { .. })).map(|s| (d.id, s as u32)))
+        .expect("some ancestor has a dash, blink or buff");
+    let others: Vec<u32> = (0..ROSTER.len() as u32).filter(|i| *i != def_id).collect();
+    let mut game = Game::new(def_id, [others[0], others[1], others[2], others[3]], [others[4], others[5], others[6], others[7], others[8]]);
+    for g in game.gods.iter_mut().skip(1) {
+        g.respawn_t = 999.0;
+    }
+    let tick = |g: &mut Game, secs: f32| for _ in 0..(secs * 60.0) as usize { g.tick(1.0 / 60.0); };
+    tick(&mut game, 0.1);
+
+    // 1. Intent alone: stalking, fully quiet, and a quarter of the speed.
+    let run = game.move_speed(0);
+    game.gods[0].sneak = true;
+    assert!(game.stalking(0) && game.quiet(0) == 1.0);
+    assert!((game.move_speed(0) / run - SNEAK_SPEED).abs() < 1e-4);
+
+    // 2. A hit breaks it -- quiet AND the slow, at once, so a stalking cat
+    //    that is jumped can run -- and it comes back by itself afterwards.
+    game.gods[0].last_dmg_t = game.t;
+    assert!(!game.stalking(0) && game.quiet(0) == 0.0, "a fight is not a stalk");
+    assert_eq!(game.move_speed(0), run, "and the cat has its legs back immediately");
+    tick(&mut game, STALK_BREAK_SECS + 0.2);
+    assert!(game.stalking(0), "the intent was never cleared, so it settles back into the stalk");
+
+    // 3. The kit: a cast breaks the stalk (it is an act) but opens a hush --
+    //    nearly as quiet, at FULL speed.
+    game.gods[0].mana = game.gods[0].max_mana;
+    game.gods[0].cds = [0.0; 4];
+    let aim = game.gods[0].pos + glam::Vec3::Z * 6.0;
+    game.cast_queue.push((0, slot, aim));
+    tick(&mut game, 0.05);
+    assert!(!game.stalking(0), "casting is acting");
+    assert!(game.gods[0].hush_t > 1.0, "but this ability grants a hush: {}", game.gods[0].hush_t);
+    assert!((0.85..1.0).contains(&game.quiet(0)), "quiet {}", game.quiet(0));
+    game.gods[0].sneak = false;
+    let s = game.move_speed(0);
+    assert!(s >= run * 0.99, "hush costs no speed: {s} vs {run}");
+
+    // 4. Wounds. Both sides of the line.
+    game.gods[0].hush_t = 0.0;
+    game.gods[0].hp = game.gods[0].max_hp * (WOUNDED_FRAC + 0.05);
+    assert_eq!(game.quiet(0), 0.0, "hurt but not badly");
+    game.gods[0].hp = game.gods[0].max_hp * (WOUNDED_FRAC - 0.05);
+    assert_eq!(game.quiet(0), 0.5, "a badly hurt cat slinks");
+}
+
+
+/// The bridges are gone: the river runs through the crossings, a log is the
+/// dry way over, and a log can be blown out of its seat and rolled away --
+/// after which the lane fords the river like anywhere else.
+#[test]
+fn the_crossing_is_a_log_the_log_can_be_rolled_away_and_then_it_is_a_ford() {
+    use clawbound::logs::{crossings, LOG_RADIUS};
+    use clawbound::sim::Event;
+    let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    assert_eq!(game.logs.len(), 2);
+    let c = crossings()[0];
+    let log = game.logs[0];
+
+    // There is a river under the crossing now. (Before: a causeway, depth 0.)
+    assert!(water_depth(c.at.x, c.at.z) > 1.0, "no channel under the crossing: depth {}", water_depth(c.at.x, c.at.z));
+    // On the log: dry, full speed. A log's width to the side: wading.
+    assert_eq!(game.water_depth_now(c.at.x, c.at.z), 0.0, "the log is the dry way over");
+    let beside = c.at + log.down * (LOG_RADIUS + 1.5);
+    assert!(game.water_depth_now(beside.x, beside.z) > 0.8, "beside it you wade");
+    game.gods[0].pos = c.at;
+    let dry = game.move_speed(0);
+    game.gods[0].pos = beside;
+    assert!(game.move_speed(0) < dry * 0.85, "and wading is slower: {} vs {dry}", game.move_speed(0));
+
+    // Park everyone far away; a cat rides the log.
+    for g in game.gods.iter_mut() {
+        g.pos = glam::Vec3::new(0.0, 0.0, 120.0);
+    }
+    game.gods[0].pos = c.at;
+    // A blast on the upstream side.
+    let from = c.at - log.down * 3.0;
+    game.events.push(Event::Explosion { pos: from, radius: 6.0, color: [1.0; 3] });
+    let mut thrown = false;
+    for _ in 0..(20 * 60) {
+        game.tick(1.0 / 60.0);
+        game.gods[0].move_dir = glam::Vec3::ZERO;
+        thrown |= game.gods[0].fall.is_some();
+        if game.logs[0].lodged {
+            break;
+        }
+    }
+    let l = game.logs[0];
+    assert!(l.lodged, "the log never came to rest: x = {}, free = {}", l.x, l.free);
+    assert!((l.centre() - c.at).length() > 15.0, "it went {} u", (l.centre() - c.at).length());
+    assert!(thrown, "the cat riding it was never thrown");
+    assert!(game.gods[0].fall.is_none() && game.gods[0].pos.y.abs() < 0.01, "and ended on its feet in the river");
+    // The lane now fords the river; the log is a dry perch downstream.
+    assert!(game.water_depth_now(c.at.x, c.at.z) > 1.0, "the crossing is a ford now");
+    assert_eq!(game.water_depth_now(l.centre().x, l.centre().z), 0.0);
+    assert!(!game.logs[1].free && game.logs[1].x.abs() < 0.01, "the other crossing, 150 u away, never noticed");
+}
+
+
+/// "When is the line crossed, and who is being targeted" -- answered by
+/// state the player is shown, tested as state. And the numbers behind
+/// "indefensible": the tower now out-ranges every auto and every lob.
+#[test]
+fn a_tower_says_where_its_line_is_and_who_it_is_after() {
+    use clawbound::sim::TargetRef;
+    let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    for g in game.gods.iter_mut().skip(1) {
+        g.respawn_t = 999.0;
+    }
+    let me = game.gods[0].team;
+    let ti = game.towers.iter().position(|t| t.team != me && t.hp > 0.0).unwrap();
+    let tpos = game.towers[ti].pos;
+    let mine = game.towers.iter().position(|t| t.team == me).unwrap();
+    let state = |g: &Game, i: usize| g.tower_rings(0)[i][3];
+
+    game.gods[0].pos = tpos + glam::Vec3::X * (TOWER_RANGE + 3.0);
+    game.tick(1.0 / 60.0);
+    assert_eq!(state(&game, mine), if (game.towers[mine].pos - game.gods[0].pos).length() < TOWER_RANGE + TOWER_RING_SHOW { 1.0 } else { 0.0 }, "my own tower: calm when near, not drawn when far");
+    let far = game.towers.iter().position(|t| (t.pos - game.gods[0].pos).length() > TOWER_RANGE + TOWER_RING_SHOW + 5.0).expect("some tower is far away");
+    assert_eq!(state(&game, far), 0.0, "a line I am nowhere near is not drawn");
+    assert_eq!(state(&game, ti), 2.0, "theirs, and I am outside the line");
+    assert_eq!(game.tower_rings(0)[ti][2], TOWER_RANGE);
+    assert_eq!(game.towers[ti].aim, None);
+
+    // One step over the line. It aims THIS TICK -- before it has fired.
+    game.gods[0].pos = tpos + glam::Vec3::X * (TOWER_RANGE - 0.5);
+    game.towers[ti].atk_timer = 0.8;
+    game.tick(1.0 / 60.0);
+    assert_eq!(game.towers[ti].aim, Some(TargetRef::God(0)), "the tether is live on the tick the line is crossed");
+    assert_eq!(state(&game, ti), 4.0);
+    assert!(game.towers[ti].last_target.is_none(), "and it has not fired yet: last_target could never have shown this");
+
+    // Its shot slows: running past is a decision.
+    let speed = game.move_speed(0);
+    for _ in 0..70 {
+        game.gods[0].pos = tpos + glam::Vec3::X * (TOWER_RANGE - 0.5);
+        game.tick(1.0 / 60.0);
+    }
+    assert!(game.move_speed(0) < speed * 0.8, "a tower shot slows: {} vs {speed}", game.move_speed(0));
+
+    // Step back out: the aim drops at once.
+    game.gods[0].pos = tpos + glam::Vec3::X * (TOWER_RANGE + 3.0);
+    game.tick(1.0 / 60.0);
+    assert_eq!(game.towers[ti].aim, None);
+    assert_eq!(state(&game, ti), 2.0);
+
+    let max_auto = ROSTER.iter().map(|d| d.auto_range).fold(0.0f32, f32::max);
+    assert!(TOWER_RANGE > max_auto + 6.0 && TOWER_RANGE > 20.0, "out-ranges every auto ({max_auto}) and the 20 u lobs");
+}
+
+
+/// Measure before optimising. What a full 5v5 bot match costs per tick on the
+/// CPU, and a tripwire if it ever gets much worse. This profile is
+/// UNOPTIMISED, so the absolute number is pessimistic by several times; it is
+/// here to be compared with itself.
+#[test]
+fn a_full_match_tick_is_cheap_enough_to_leave_the_frame_to_the_gpu() {
+    let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    // The player slot idles: nine bots, the waves and the towers are the load.
+    for _ in 0..600 {
+        game.tick(1.0 / 60.0); // warm up: minion waves out, bots in lane
+        game.events.clear();
+    }
+    let ticks = 1800;
+    let t0 = std::time::Instant::now();
+    for _ in 0..ticks {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1000.0 / ticks as f64;
+    println!("sim: {ms:.3} ms/tick over {ticks} ticks, {} minions, {} projectiles (unoptimised profile)", game.minions.len(), game.projectiles.len());
+    assert!(ms < 6.0, "a tick costs {ms:.2} ms unoptimised; the budget at 60 Hz is 16.6 for EVERYTHING");
+}

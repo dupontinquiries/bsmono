@@ -168,7 +168,69 @@ fn setup_style(ctx: &egui::Context) {
 
 // --- main menu ---------------------------------------------------------------
 
-pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool) {
+/// The LAN screen. Paints `LanLobby` and reports clicks; decides nothing.
+pub fn draw_lan(ctx: &egui::Context, lobby: &mut crate::lanlobby::LanLobby) -> crate::lanlobby::Action {
+    use crate::lanlobby::Action;
+    setup_style(ctx);
+    let mut action = Action::None;
+    egui::Area::new(egui::Id::new("lan")).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.heading(egui::RichText::new("LOCAL NETWORK").size(40.0).color(GOLD).strong());
+            ui.add_space(14.0);
+            egui::Frame::none().fill(Color32::from_black_alpha(170)).rounding(8.0).inner_margin(14.0).show(ui, |ui| {
+                ui.set_width(560.0);
+                if lobby.rows.is_empty() {
+                    ui.add_space(26.0);
+                    ui.label(egui::RichText::new("No dens found yet.").size(18.0).color(Color32::from_rgb(170, 168, 160)));
+                    ui.add_space(26.0);
+                }
+                for i in 0..lobby.rows.len() {
+                    let r = lobby.rows[i].clone();
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(&r.name).size(19.0).color(Color32::WHITE));
+                        ui.label(egui::RichText::new(format!("{}/{}", r.players, r.slots)).size(16.0).color(Color32::from_rgb(170, 168, 160)));
+                        if !r.note.is_empty() {
+                            ui.label(egui::RichText::new(r.note).size(14.0).color(Color32::from_rgb(230, 140, 90)));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // 44 px tall: a thumb, not a cursor.
+                            let b = ui.add_enabled(r.joinable, egui::Button::new(egui::RichText::new("JOIN").size(17.0).strong()).min_size(egui::vec2(96.0, 44.0)));
+                            if b.clicked() {
+                                action = lobby.click_join(i);
+                            }
+                        });
+                    });
+                    ui.separator();
+                }
+            });
+            ui.add_space(12.0);
+            // A fixed-size block, so `vertical_centered` can centre it. This was
+            // `ui.horizontal` with a 120 px spacer, which centres nothing: the
+            // row sat at the left edge of an area the long footer line had
+            // stretched. Found by running the real binary under Xvfb.
+            ui.allocate_ui_with_layout(egui::vec2(230.0 + 150.0 + 8.0, 48.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let label = if lobby.hosting { "■  STOP HOSTING" } else { "▶  HOST A DEN" };
+                let host = ui.add_sized([230.0, 48.0], egui::Button::new(egui::RichText::new(label).size(19.0).color(Color32::BLACK).strong()).fill(GOLD));
+                if host.clicked() {
+                    let on = !lobby.hosting;
+                    lobby.set_hosting(on);
+                }
+                if ui.add_sized([150.0, 48.0], egui::Button::new(egui::RichText::new("Back").size(17.0))).clicked() {
+                    action = Action::Back;
+                }
+            });
+            ui.add_space(10.0);
+            if let Some(note) = &lobby.handoff_note {
+                ui.label(egui::RichText::new(note).size(16.0).color(GOLD));
+            }
+            ui.label(egui::RichText::new(&lobby.status).size(15.0).color(Color32::from_rgb(190, 188, 178)));
+            ui.label(egui::RichText::new("Hosting, finding and joining a den work, and the den counts who is in it. Playing a match across machines does not yet.").size(13.0).color(Color32::from_rgb(230, 170, 110)));
+        });
+    });
+    action
+}
+
+pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool, lan: &mut bool) {
     setup_style(ctx);
     egui::Area::new(egui::Id::new("menu")).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
         ui.vertical_centered(|ui| {
@@ -185,6 +247,12 @@ pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool) {
             }
             if play_btn.clicked() {
                 *play = true;
+            }
+            ui.add_space(8.0);
+            let lan_btn = ui.add_sized([260.0, 42.0], egui::Button::new(egui::RichText::new("LOCAL NETWORK").size(18.0)));
+            glow_hover(ui, &lan_btn, GOLD, 5.0);
+            if lan_btn.clicked() {
+                *lan = true;
             }
             ui.add_space(8.0);
             let quit_btn = ui.add_sized([260.0, 34.0], egui::Button::new(egui::RichText::new("Quit").size(16.0)));
@@ -1240,6 +1308,8 @@ pub fn draw_touch_pad(ctx: &egui::Context, pad: &crate::touch::TouchPad, game: &
     // shop / board / menu — press feedback so taps feel acknowledged
     painter.circle(to_px(l.shop), r_px(crate::touch::BTN_R * 0.8), dim, Stroke::new(1.5, ring));
     painter.text(to_px(l.shop), Align2::CENTER_CENTER, "$", FontId::proportional(r_px(0.05)), GOLD);
+    painter.circle(to_px(l.leap), r_px(crate::touch::BTN_R * 0.8), dim, Stroke::new(1.5, ring));
+    painter.text(to_px(l.leap), Align2::CENTER_CENTER, "^", FontId::proportional(r_px(0.06)), GOLD);
     let board_t = ctx.animate_bool(egui::Id::new("touch_board_held"), pad.board_down());
     let board_fill = Color32::from_rgba_premultiplied((20.0 + board_t * 40.0) as u8, 20, 28, (120.0 + board_t * 60.0) as u8);
     painter.circle(to_px(l.board), r_px(crate::touch::BTN_R * 0.8) / pad.scale * (1.0 + board_t * 0.08), board_fill, Stroke::new(1.5, ring));

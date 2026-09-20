@@ -145,6 +145,14 @@ impl Build {
     }
 
     pub fn gait_for(&self, speed: f32) -> Gait {
+        // `top_gait` is a CEILING, not just "what comes after trot". A
+        // colossus is `top_gait: Walk` with `trot_to: INFINITY`, and without
+        // this guard the `<= trot_to` arm below is always true for it, so it
+        // trotted at anything over `walk_to`. The test that says a mammoth
+        // never leaves a walk caught this the first time it was compiled.
+        if self.top_gait == Gait::Walk && speed > self.walk_to {
+            return Gait::Walk;
+        }
         if speed <= self.walk_to {
             if self.can_pace && speed < self.walk_to * 0.45 {
                 Gait::Pace
@@ -191,6 +199,13 @@ impl Build {
             Gait::Bound | Gait::Canter => Gait::Trot,
             other => other,
         }
+    }
+
+    /// The speed at which this animal is "going flat out" for the rig's
+    /// stretch and swing saturation. `trot_to` for most; `walk_to` for an
+    /// animal whose ladder stops at a walk, whose `trot_to` is infinite.
+    pub fn cruise_top(&self) -> f32 {
+        if self.trot_to.is_finite() { self.trot_to } else { self.walk_to }
     }
 
     /// Stride frequency (cycles/sec).
@@ -258,7 +273,7 @@ impl Anim {
             // rig's global constant: otherwise a colossus at its flat-out
             // 3 u/s registers as barely moving and never swings its legs,
             // while a hare pins the scale permanently.
-            max_speed: self.build.trot_to.min(SPEED_SATURATE * 2.0).max(1.0),
+            max_speed: self.build.cruise_top().min(SPEED_SATURATE * 2.0).max(1.0),
             leg_health: 1.0,
             flying: false,
             fly_power: 0.0,

@@ -1764,7 +1764,10 @@ mod canopy_shape_tests {
     /// cut disc. A round crown closes.
     #[test]
     fn the_oak_crown_closes_instead_of_ending_in_a_flat_disc() {
-        for r in [3, 5, 7] {
+        // `i32` spelled out: `.abs()` on an untyped integer literal is E0689, and
+        // this one line stopped the WHOLE test target compiling, so none of
+        // this crate's tests ran until it was found (2026-09-19).
+        for r in [3i32, 5, 7] {
             let old_top = r - r.abs() / 2;
             assert!(old_top >= 2, "the premise: the old top was {old_top} wide at r={r}");
             assert_eq!(oak_radius(r, r), 0, "r={r}: the crown must close");

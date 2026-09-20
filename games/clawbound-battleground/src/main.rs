@@ -1,7 +1,8 @@
 fn main() {
     let opts = clawbound::launch::LaunchOptions::from_process();
     if opts.screenshot {
-        if let Err(e) = clawbound::headless::run() {
+        let res = if opts.rig_sheet { clawbound::headless::run_rig_sheet() } else { clawbound::headless::run() };
+        if let Err(e) = res {
             eprintln!("error: {e}");
             std::process::exit(1);
         }

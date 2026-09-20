@@ -179,7 +179,29 @@ pub fn nearest_known(id: u16) -> Option<Substitute> {
 /// and describing it is enough.
 pub fn suggest(description: &str, n: usize) -> Vec<(&'static Block, String)> {
     let d = description.to_lowercase();
-    let words: Vec<&str> = d.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let mut words: Vec<&str> = d.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    // COMPOUNDS. A model that wants a material it cannot name invents one the
+    // way English does -- adjective + material, run together: `brownwood`,
+    // `darkstone`, `redbrick`. That is ONE word here, and everything below
+    // matches PREFIXES, so "brow" never met "wood" and the refusal came back
+    // with no suggestion: a wall, not a correction. Look inside a long word
+    // for any vocabulary word it starts or ends with, and let those vote too.
+    let vocab: Vec<&'static str> = BLOCKS.iter()
+        .flat_map(|b| b.name.split('_').chain(b.uses.split_whitespace()))
+        .chain(["dark", "black", "pale", "white", "brown", "green", "blue", "grey", "gray", "yellow", "orange", "red"])
+        // FAMILY words are matched by exact equality further down and are in
+        // no block's name or uses, so `wood` was not in this vocabulary and was
+        // never found inside `brownwood`. Kept in step with that list by hand.
+        .chain(["clear", "glass", "metal", "polished", "rough", "shiny", "smooth", "stone", "wood", "wooden"])
+        .filter(|t| t.len() >= 3)
+        .collect();
+    let inside: Vec<&'static str> = words.iter()
+        .filter(|w| w.len() >= 6)
+        .flat_map(|w| vocab.iter().copied().filter(move |t| t.len() < w.len() && (w.starts_with(t) || w.ends_with(t))))
+        .collect();
+    words.extend(inside);
+    words.sort_unstable();
+    words.dedup();
     let has = |w: &str| words.iter().any(|x| *x == w);
     let mut scored: Vec<(f32, &Block, Vec<&str>)> = Vec::new();
     for blk in BLOCKS.iter().filter(|b| b.family != Family::Air) {
@@ -225,6 +247,17 @@ pub fn suggest(description: &str, n: usize) -> Vec<(&'static Block, String)> {
                         ("polished", blk.finish == Finish::Polished), ("shiny", blk.finish == Finish::Polished)] {
             if has(w) && ok { score += 2.5; why.push("what it is"); }
         }
+        // FAMILY DOMINATES -- this module's own rule ("a grey wood is not a
+        // substitute for a grey stone"), which `suggest` did not obey: naming
+        // a family was worth 2.5 and a name hit 3.0, so `darkstone` came back
+        // as dark_oak_planks on the strength of "dark". If the query names a
+        // family, a block of another family is not a candidate at all.
+        let named_family = [("stone", Family::Stone), ("wood", Family::Wood), ("wooden", Family::Wood),
+                            ("metal", Family::Metal), ("glass", Family::Glass)]
+            .iter().filter(|(w, _)| has(w)).map(|(_, f)| *f).collect::<Vec<_>>();
+        if !named_family.is_empty() && !named_family.contains(&blk.family) {
+            continue;
+        }
         if score > 0.0 {
             why.sort_unstable(); why.dedup();
             scored.push((score, blk, why));
@@ -269,6 +302,25 @@ pub fn ids() -> BTreeMap<&'static str, u16> {
 
 #[cfg(test)]
 mod tests {
+    /// A model's invented compound lands in the right FAMILY, not merely on
+    /// "something": a suggestion of glass for `brownwood` would satisfy
+    /// `is_some()` and help nobody. And looking inside long words must not
+    /// disturb a query that already worked.
+    #[test]
+    fn an_invented_compound_is_corrected_to_the_right_family() {
+        let mut checked = 0;
+        for (made_up, family) in [("brownwood", Family::Wood), ("darkstone", Family::Stone), ("woodplank", Family::Wood), ("roughstone", Family::Stone)] {
+            let got = suggest(made_up, 1);
+            let (blk, why) = got.first().unwrap_or_else(|| panic!("nothing at all suggested for {made_up:?}"));
+            assert_eq!(blk.family, family, "{made_up:?} -> {} ({why})", blk.name);
+            checked += 1;
+        }
+        assert_eq!(checked, 4);
+        assert!(suggest("zzqxv", 1).is_empty(), "nonsense still gets nothing, not a guess");
+        let glow = suggest("something that glows", 1);
+        assert!(glow.first().is_some_and(|(b, _)| b.name.contains("glow")), "the stem match it already had still works: {:?}", glow.first().map(|g| g.0.name));
+    }
+
     use super::*;
 
     #[test]

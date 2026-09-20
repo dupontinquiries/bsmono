@@ -27,6 +27,8 @@ enum Screen {
     Menu,
     Select,
     Playing,
+    /// Browsing or hosting on the local network.
+    Lan,
 }
 
 struct AppState {
@@ -54,6 +56,11 @@ struct AppState {
     capturing: Option<Action>,
     /// Walk-to order from a tap (world ground point).
     walk_to: Option<Vec3>,
+    /// Open only while the LAN screen is: it holds a socket.
+    lan: Option<crate::lanlobby::LanLobby>,
+    /// The stalk toggle. App state, not sim state: the sim decides whether
+    /// a cat that WANTS to stalk currently can.
+    stalk_on: bool,
     locked: bool,
     scoreboard: bool,
     cam_yaw: f32,
@@ -71,11 +78,11 @@ struct AppState {
 
 pub fn run(opts: crate::launch::LaunchOptions) {
     if let Some(role) = &opts.handoff {
-        // The centre handed us a friend session. Online play is not wired
-        // in this game yet, so the honest thing is to say so and still put
-        // the player in a match rather than at a menu.
+        // The centre handed us a friend session: it becomes a den (see the
+        // RESUMED block). This used to log "not wired yet" and start a solo
+        // match. The MATCH is still not networked; the den is.
         eprintln!(
-            "[clawbound] bsgames handoff ({role:?}, me={:?}, peer={:?}): online play is not wired yet — starting a solo quick match",
+            "[clawbound] bsgames handoff ({role:?}, me={:?}, peer={:?}): opening a den",
             opts.player_name, opts.peer_id
         );
     }
@@ -92,6 +99,18 @@ pub fn run(opts: crate::launch::LaunchOptions) {
                             Ok(mut s) => {
                                 eprintln!("RESUMED: init ok — surface configured");
                                 s.launch = opts.clone();
+                                if let Some(role) = &opts.handoff {
+                                    let id = opts.player_id.clone().unwrap_or_else(|| format!("cat-{:x}", std::process::id()));
+                                    let name = opts.player_name.clone().unwrap_or_else(|| "Cat".into());
+                                    let mp = netcode::multiplayer::Multiplayer::new(crate::lanlobby::GAME, &id, &name);
+                                    let hosting = matches!(role, crate::launch::HandoffRole::Host);
+                                    s.lan = Some(crate::lanlobby::LanLobby::open_for_handoff(hosting, opts.peer_id.as_deref(), mp, netcode::lan::LAN_PORT));
+                                    s.screen = Screen::Lan; // before the quick match, which only starts from Menu
+                                } else if opts.lan {
+                                    let me = opts.player_name.clone().or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "Cat".into());
+                                    s.lan = Some(crate::lanlobby::LanLobby::open(&me));
+                                    s.screen = Screen::Lan;
+                                }
                                 if let Some(n) = &opts.player_name {
                                     s.ui.player_label = Some(n.clone());
                                 }
@@ -338,6 +357,8 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         controls_open: false,
         capturing: None,
         walk_to: None,
+        lan: None,
+        stalk_on: false,
         locked: false,
         scoreboard: false,
         cam_yaw: std::f32::consts::PI,
@@ -751,7 +772,19 @@ fn render(s: &mut AppState) {
         let aim = if s.game.is_some() { compute_aim(s) } else { Vec3::ZERO };
         let yaw = s.cam_yaw;
         let walk_to = s.walk_to;
+        if c.sneak_toggle {
+            s.stalk_on = !s.stalk_on;
+        }
+        let stalk_on = s.stalk_on;
         if let Some(g) = s.game.as_mut() {
+            // A leap goes where the cat is being steered; standing still,
+            // where the camera looks. `leap::plan` turns that direction into
+            // a place -- the rock ahead, if there is one.
+            if c.leap {
+                let (fwd, right) = input::camera_basis(yaw);
+                let dir = if c.mv.length_squared() > 0.04 { fwd * c.mv.y + right * c.mv.x } else { fwd };
+                g.leap_queue.push((0, dir));
+            }
             // casts are edges: queue them once, outside the step loop
             for slot in 0..4u32 {
                 if c.cast[slot as usize] {
@@ -786,7 +819,12 @@ fn render(s: &mut AppState) {
                         s.walk_to = None;
                     }
                 }
+                // A held stalk, or a stick or touch pad pushed gently: on an
+                // analogue input the magnitude IS the intent, and the sim is
+                // about to throw it away by normalising.
+                let gentle = walk_to.is_none() && c.mv.length() > 0.08 && c.mv.length() < 0.5;
                 let gi = &mut g.gods[0];
+                gi.sneak = stalk_on || c.sneak_held || gentle;
                 gi.move_dir = mv;
                 gi.attack_held = c.attack;
                 g.tick(1.0 / 60.0);
@@ -817,7 +855,7 @@ fn render(s: &mut AppState) {
 
     // camera
     let cam = match s.screen {
-        Screen::Menu | Screen::Select => {
+        Screen::Menu | Screen::Select | Screen::Lan => {
             let t = s.last_frame.elapsed().as_secs_f32() * 0.05;
             let r = 55.0;
             Camera {
@@ -899,6 +937,8 @@ fn render(s: &mut AppState) {
     let raw_input = s.egui_winit.take_egui_input(s.window);
     let mut play = false;
     let mut quit = false;
+    let mut open_lan = false;
+    let mut lan_action = crate::lanlobby::Action::None;
     let mut locked_in = false;
     let mut again = false;
     let mut menu = false;
@@ -907,10 +947,16 @@ fn render(s: &mut AppState) {
     let output = s.egui_ctx.run(raw_input, |ctx| {
         match s.screen {
             Screen::Menu => {
-                ui::draw_menu(ctx, &mut play, &mut quit);
+                ui::draw_menu(ctx, &mut play, &mut quit, &mut open_lan);
                 ui::draw_controls_button(ctx, &mut open_controls);
             }
             Screen::Select => ui::draw_select(ctx, &mut s.ui, &mut locked_in),
+            Screen::Lan => {
+                if let Some(l) = s.lan.as_mut() {
+                    l.tick(Instant::now());
+                    lan_action = ui::draw_lan(ctx, l);
+                }
+            }
             Screen::Playing => {
                 if let Some(g) = s.game.as_mut() {
                     if s.ui.shop_open {
@@ -998,6 +1044,26 @@ fn render(s: &mut AppState) {
     frame.present();
 
     // transitions
+    if open_lan {
+        s.lan = Some(crate::lanlobby::LanLobby::open(&std::env::var("USER").unwrap_or_else(|_| "Cat".into())));
+        s.screen = Screen::Lan;
+    }
+    match lan_action {
+        crate::lanlobby::Action::Back => {
+            s.lan = None; // closes the socket and stops announcing
+            s.screen = Screen::Menu;
+        }
+        crate::lanlobby::Action::Join(addr) => {
+            // Discovery ends here. There is no synchronised match to enter
+            // yet, and the screen's footer says so; do not fake one.
+            // Joins the den's roster for real. It still does not start a
+            // synchronised match -- there is none -- and the footer says so.
+            if let Some(l) = s.lan.as_mut() {
+                l.join(addr);
+            }
+        }
+        crate::lanlobby::Action::None => {}
+    }
     if play {
         s.screen = Screen::Select;
     }

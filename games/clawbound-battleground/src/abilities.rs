@@ -37,6 +37,15 @@ impl Game {
         g.mana -= ab.cost;
         g.cds[slot as usize] = cd;
         g.atk_anim = 1.0;
+        g.last_act_t = self.t;
+        // The sneak boost lives in the kit, not on a key: movement and
+        // self-buff abilities open a window of quiet at FULL speed.
+        g.hush_t = g.hush_t.max(match ab.arch {
+            Archetype::Buff { duration, .. } => duration,
+            Archetype::Blink { .. } => crate::consts::HUSH_BLINK_SECS,
+            Archetype::Dash { .. } => crate::consts::HUSH_DASH_SECS,
+            _ => 0.0,
+        });
 
         self.events.push(Event::Cast { god: gi, slot, aim });
 
@@ -107,8 +116,7 @@ impl Game {
                 for j in 0..self.gods.len() {
                     let e = &self.gods[j];
                     if e.team != team && e.respawn_t <= 0.0 {
-                        let c = e.pos + Vec3::Y * 1.0;
-                        if point_segment_dist(c, pos_y, end) <= width + 0.7 {
+                        if crate::hitbox::cat(e.pos, e.yaw, false).hit_by_beam(pos_y, end, width + 0.2) {
                             hits.push(TargetRef::God(j));
                         }
                     }
@@ -268,7 +276,7 @@ impl Game {
         let mut out = Vec::new();
         for gi in 0..self.gods.len() {
             let g = &self.gods[gi];
-            if g.team != team && g.respawn_t <= 0.0 && g.pos.distance(center) <= radius + 0.7 {
+            if g.team != team && g.respawn_t <= 0.0 && crate::hitbox::cat(g.pos, g.yaw, false).in_disc(center, radius + 0.2) {
                 out.push(TargetRef::God(gi));
             }
         }

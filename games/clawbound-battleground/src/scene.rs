@@ -8,12 +8,19 @@ use crate::consts::{self, Lane, Team, ARENA_RADIUS};
 use crate::gods::{ROSTER, ROSTER_LEN};
 use crate::models;
 use crate::props;
+use crate::puppet::{LeapView, Probe, PuppetInput, StrikeStyle};
 use crate::render::{sphere_in_frustum, terrain_height, Camera, Renderer};
+use crate::rigged::{slot_transforms, QuadRig, Slot, SLOTS};
 use crate::sim::{Game, ProjKind, Rng};
 use crate::vfx::Vfx;
 use crate::voxel::{merge_xform, VoxelMesh};
 
 pub struct Scene {
+    /// Ancestors cut into posable parts: `[ancestor][team][slot]`.
+    pub god_parts: Vec<[[u64; SLOTS]; 2]>,
+    /// One rig per ancestor (teams share anatomy).
+    pub god_rig: Vec<QuadRig>,
+    /// The uncut body. Still what the portrait renderer draws.
     pub god_body: [[u64; 2]; ROSTER_LEN],
     pub god_weapon: [[u64; 2]; ROSTER_LEN],
     pub minion_melee: [u64; 2],
@@ -37,6 +44,8 @@ pub struct Scene {
     pub orb: u64,
     pub arrow: [u64; 2],
     pub boulder: u64,
+    /// The crossing log: `props::fallen_log`, drawn per frame because it rolls.
+    pub river_log: u64,
     pub total_voxels: usize,
     /// Static prop collision, built alongside the meshes in `build_world` so
     /// the two cannot disagree. Handed to `Game` by the app; see
@@ -50,6 +59,40 @@ pub struct PropChunk {
     pub center: Vec3,
     pub radius: f32,
     pub vsize: f32,
+}
+
+/// `puppet::Probe` over the real arena: the terrain height field, the
+/// blockers' walkable humps and cover discs, and the river.
+struct WorldProbe<'a> {
+    blockers: &'a Blockers,
+    logs: &'a [crate::logs::RollingLog],
+}
+
+impl Probe for WorldProbe<'_> {
+    fn ground(&self, x: f32, z: f32) -> f32 {
+        // The sim walks the playable floor at y = 0 and sinks the DRAWN cat
+        // by the water depth, so the river bed is not "ground" here.
+        terrain_height(x, z).max(0.0)
+    }
+    fn step_top(&self, x: f32, z: f32) -> Option<f32> {
+        // A crossing log is rounded footing: highest on the spine.
+        // The exact surface: the voxel face under the paw on a seated log,
+        // the rotated section's top on a turned one.
+        let log = self.logs.iter().find_map(|l| l.surface_y(x, z));
+        match (self.blockers.step_top(x, z), log) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+    fn cover(&self, x: f32, z: f32) -> f32 {
+        self.blockers.concealment_at(x, z)
+    }
+    fn water(&self, x: f32, z: f32) -> f32 {
+        consts::water_depth(x, z)
+    }
+    fn stem(&self, x: f32, z: f32, within: f32) -> Option<(f32, f32)> {
+        self.blockers.nearest_stem(x, z, within)
+    }
 }
 
 fn solid_tint(c: [f32; 3]) -> [f32; 4] {
@@ -66,18 +109,31 @@ impl Scene {
 
         let mut god_body = [[0u64; 2]; ROSTER_LEN];
         let mut god_weapon = [[0u64; 2]; ROSTER_LEN];
+        let mut god_parts = Vec::with_capacity(ROSTER_LEN);
+        let mut god_rig = Vec::with_capacity(ROSTER_LEN);
         for (i, def) in ROSTER.iter().enumerate() {
+            let mut parts = [[0u64; SLOTS]; 2];
             for team in [Team::Blue, Team::Red] {
                 let ti = team as usize;
                 let body = models::build_god(def, team);
                 total += body.inst.len();
                 god_body[i][ti] = r.upload_mesh(&body);
+                let rigged = models::build_god_rigged(def, team);
+                for (s, m) in rigged.meshes.iter().enumerate() {
+                    total += m.inst.len();
+                    parts[ti][s] = r.upload_mesh(m);
+                }
+                if ti == 0 {
+                    god_rig.push(rigged.rig);
+                }
                 if let Some(w) = models::build_weapon(def.weapon, def, team) {
                     total += w.inst.len();
                     god_weapon[i][ti] = r.upload_mesh(&w);
                 }
             }
+            god_parts.push(parts);
         }
+        assert_eq!((god_parts.len(), god_rig.len()), (ROSTER_LEN, ROSTER_LEN), "one cut body and one rig per ancestor");
 
         let mut minion_melee = [0u64; 2];
         let mut minion_caster = [0u64; 2];
@@ -158,8 +214,13 @@ impl Scene {
         let boulder = models::build_boulder();
         total += boulder.inst.len();
         let boulder = r.upload_mesh(&boulder);
+        let river_log_mesh = props::crossing_log();
+        total += river_log_mesh.inst.len();
+        let river_log = r.upload_mesh(&river_log_mesh);
 
         Scene {
+            god_parts,
+            god_rig,
             god_body,
             god_weapon,
             minion_melee,
@@ -183,6 +244,7 @@ impl Scene {
             orb,
             arrow,
             boulder,
+            river_log,
             total_voxels: total,
             blockers: std::sync::Arc::new(blockers),
         }
@@ -295,6 +357,22 @@ impl Scene {
         // towers
         let pulse = 0.55 + 0.45 * (vfx.time * 2.6).sin();
         for tw in &game.towers {
+            // WHO it is after: a tether from the crystal to whatever it is
+            // aiming at, live -- it appears the tick you cross the line, not
+            // when the first bolt lands. Hot and thick when it is the player.
+            if let (true, Some(aim)) = (tw.hp > 0.0, tw.aim) {
+                let at_me = aim == crate::sim::TargetRef::God(0);
+                let from = tw.pos + Vec3::Y * 5.75;
+                let to = game.target_pos(aim) + Vec3::Y * 1.1;
+                let c = if at_me { [1.0, 0.18, 0.10] } else { [1.0, 0.70, 0.30] };
+                let n = if at_me { 14 } else { 8 };
+                for k in 1..n {
+                    let t = k as f32 / n as f32;
+                    let sag = Vec3::Y * (-(t * (1.0 - t)) * 1.2);
+                    let beat = 1.0 + 0.35 * ((vfx.time * 9.0 - t * 8.0).sin());
+                    r.queue_draw(self.orb, Mat4::from_translation(from.lerp(to, t) + sag), alpha_tint(c, if at_me { 0.9 } else { 0.5 }), 2.2, if at_me { 0.085 * beat } else { 0.05 }, true);
+                }
+            }
             let ti = tw.team as usize;
             let m = Mat4::from_translation(tw.pos);
             r.queue_draw(self.tower_body[ti], m, [1.0; 4], 0.0, 0.16, false);
@@ -340,7 +418,15 @@ impl Scene {
             }
         }
 
-        // gods
+        // gods — posed per part. `puppet` decides what the body is doing,
+        // `creature-rig` poses the boxes, `rigged` turns boxes into matrices.
+        let world = WorldProbe { blockers: &game.blockers, logs: &game.logs };
+        let dt = (vfx.time - vfx.puppets.last_time).clamp(0.0, 0.1);
+        vfx.puppets.last_time = vfx.time;
+        vfx.puppets.ensure(game.gods.len());
+        let mut pevents = std::mem::take(&mut vfx.puppets.events);
+        pevents.clear();
+        let mut posed = Vec::new();
         for i in 0..game.gods.len() {
             let g = &game.gods[i];
             if g.respawn_t > 0.0 {
@@ -349,24 +435,49 @@ impl Scene {
             let ti = g.team as usize;
             let def = game.def(i);
             let di = g.def_id as usize;
-            let moving = g.move_dir.length_squared() > 0.01;
-            let bob = if moving { (g.walk_anim * 2.0).sin().abs() * 0.09 } else { (g.walk_anim * 0.7).sin() * 0.02 };
-            let lean = if moving { (g.walk_anim * 2.0).sin() * 0.045 } else { 0.0 };
-            let lunge = g.atk_anim * 0.45;
-            let fwd = Vec3::new(g.yaw.cos(), 0.0, g.yaw.sin());
+            let rig = &self.god_rig[di];
+            let leap = g.leap.as_ref().map(|l| l.view()).or_else(|| g.fall.as_ref().map(|f| f.view())).or_else(|| g.dash.as_ref().map(|d| {
+                // The sim's dash arc is y = 1.4 a (1 - a); its slope over
+                // ground covered is what the body pitches along.
+                let a = (d.t / d.dur.max(1e-3)).clamp(0.0, 1.0);
+                let run = Vec3::new(d.to.x - d.from.x, 0.0, d.to.z - d.from.z).length().max(0.5);
+                LeapView::Flight { t: a, climb: 1.4 * (1.0 - 2.0 * a) / run * 2.0 }
+            }));
+            let inp = PuppetInput {
+                pos: g.pos,
+                yaw: g.yaw,
+                hp01: (g.hp / g.max_hp.max(1.0)).clamp(0.0, 1.0),
+                atk_pulse: g.atk_anim,
+                strike_style: if def.auto_range > 6.0 { StrikeStyle::Snap } else { StrikeStyle::Swipe },
+                leap,
+                perched: g.perch.is_some(),
+                narrow: g.perch.is_some() && g.perch_narrow,
+                quiet: game.quiet(i),
+            };
+            let puppet = &mut vfx.puppets.puppets[i];
+            puppet.advance(dt, &inp, rig, &world, &mut pevents);
+            let pose = puppet.pose(&inp, rig);
+            creature_rig::pose(rig.parts(), rig.torso_half, &pose.motion, None, &mut posed);
+            let mats = slot_transforms(rig, &posed, &pose.legs, &pose.body);
+
             // wading: sink toward the bed (capped so the head stays clear)
             let sink = consts::water_depth(g.pos.x, g.pos.z).min(0.9);
-            let pos = g.pos + fwd * lunge + Vec3::Y * (bob - sink);
-            let base = Mat4::from_translation(pos)
-                * Mat4::from_axis_angle(Vec3::Y, g.yaw - std::f32::consts::FRAC_PI_2)
-                * Mat4::from_axis_angle(Vec3::Z, lean);
-            r.queue_draw(self.god_body[di][ti], base, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
+            // Model faces +Z; glam's rotation_y(t) sends +Z to (sin t, 0,
+            // cos t), so facing (cos yaw, 0, sin yaw) needs t = pi/2 - yaw.
+            // This read `yaw - pi/2`, which mirrors the facing in X: right
+            // on the north-south lanes, backwards on any east-west run.
+            let base = Mat4::from_translation(g.pos + Vec3::Y * (pose.lift - sink))
+                * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - g.yaw);
+            for (s, m) in mats.iter().enumerate() {
+                r.queue_draw(self.god_parts[di][ti][s], base * *m, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
+            }
 
             if self.god_weapon[di][ti] != 0 {
+                // The weapon rides the torso, so it lunges and rears with it.
                 let anchor = models::weapon_anchor(def);
-                let swing = -g.atk_anim * 1.5
-                    + if moving { (g.walk_anim * 2.0).sin() * 0.25 } else { (vfx.time * 1.4).sin() * 0.06 };
+                let swing = -g.atk_anim * 1.5 + (vfx.time * 1.4).sin() * 0.06;
                 let wm = base
+                    * mats[Slot::Torso as usize]
                     * Mat4::from_translation(Vec3::from_array(anchor))
                     * Mat4::from_axis_angle(Vec3::X, swing)
                     * Mat4::from_axis_angle(Vec3::Z, if def.auto_range > 6.0 { -0.5 } else { 0.2 })
@@ -374,13 +485,39 @@ impl Scene {
                 r.queue_draw(self.god_weapon[di][ti], wm, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
             }
         }
+        // Leaves bend away from whoever is pushing through them, and swing
+        // back through where they were. A stalking cat contributes ~nothing.
+        vfx.puppets.trail(dt);
+        r.brushes = vfx.puppets.brushes();
+        r.towers = game.tower_rings(0);
+        (r.blast_a, r.blast_b) = vfx.ground.blast_uniform();
+        r.cracks = vfx.ground.crack_uniform();
+        vfx.puppet_events(&pevents);
+        vfx.puppets.events = pevents;
+
+        // the crossing logs: on the lane, or wherever the river left them
+        for l in &game.logs {
+            use crate::logs::{LOG_RADIUS, LOG_TOP};
+            let c = l.centre();
+            // The mesh's section axis is at the middle of its grid; put that at
+            // the height `logs::surface_y` assumes, and turn about it.
+            let ny = (crate::logs::SECTION_B as usize) * 2 + 3;
+            let mesh_axis = ((ny / 2) as f32 + 0.5) * crate::logs::LOG_VOXEL;
+            let axis_y = LOG_TOP - crate::logs::column_top(0.0);
+            let _ = LOG_RADIUS;
+            let m = Mat4::from_translation(Vec3::new(c.x, axis_y, c.z))
+                * Mat4::from_axis_angle(Vec3::Y, (-l.axis.z).atan2(l.axis.x))
+                * Mat4::from_axis_angle(Vec3::X, l.angle)
+                * Mat4::from_translation(Vec3::new(0.0, -mesh_axis, 0.0));
+            r.queue_draw(self.river_log, m, [1.0; 4], 0.0, crate::logs::LOG_VOXEL, false);
+        }
 
         // minions
         for m in &game.minions {
             let ti = m.team as usize;
             let bob = (m.walk_anim * 2.0).sin().abs() * 0.10;
             let lean = (m.walk_anim * 2.0).sin() * 0.06;
-            let pos = m.pos + Vec3::Y * bob;
+            let pos = m.pos + Vec3::Y * (bob + if game.on_a_log(m.pos.x, m.pos.z) { crate::logs::LOG_TOP } else { 0.0 });
             let base = Mat4::from_translation(pos)
                 * Mat4::from_axis_angle(Vec3::Y, -m.yaw + std::f32::consts::FRAC_PI_2)
                 * Mat4::from_axis_angle(Vec3::Z, lean);
@@ -446,7 +583,9 @@ fn jungle_spot(rng: &mut Rng, min_clear: f32) -> Option<(f32, f32)> {
         let r = 22.0 + rng.f32() * (ARENA_RADIUS - 30.0);
         let x = a.cos() * r;
         let z = a.sin() * r;
-        if consts::lane_clearance(x, z) > min_clear && consts::river_dist(x, z) > 9.5 && !crate::bosses::in_pit(x, z) {
+        // ...and not on the authored centre: a random trunk in a run's
+        // floor or a doorway undoes the one part of the map that is designed.
+        if consts::lane_clearance(x, z) > min_clear && consts::river_dist(x, z) > 9.5 && !crate::bosses::in_pit(x, z) && !crate::midjungle::reserved(x, z) && !consts::in_tower_clearing(x, z) {
             return Some((x, z));
         }
     }
@@ -470,40 +609,6 @@ fn hill_spot(rng: &mut Rng, landmarks: &[Vec3], keep_out: f32) -> Option<(f32, f
         return Some((x, z));
     }
     None
-}
-
-/// Find where a side lane crosses its river (for the wooden bridge).
-fn bridge_crossing(side: f32, lane: Lane) -> Option<Vec3> {
-    let pts = lane.polyline();
-    let mut best: Option<(Vec3, f32)> = None;
-    for w in pts.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        let ab = b - a;
-        for i in 0..=48 {
-            let t = i as f32 / 48.0;
-            let p = a + ab * t;
-            let diff = (p.x - consts::river_x(side, p.z)).abs();
-            if diff > 9.0 {
-                continue;
-            }
-            // keep clear of the lane towers
-            let mut ok = true;
-            for team in [Team::Blue, Team::Red] {
-                for inner in [false, true] {
-                    if (consts::tower_pos(lane, team, inner) - p).length() < 13.0 {
-                        ok = false;
-                    }
-                }
-            }
-            if !ok {
-                continue;
-            }
-            if best.map_or(true, |(_, d)| diff < d) {
-                best = Some((p, diff));
-            }
-        }
-    }
-    best.map(|(p, _)| p)
 }
 
 fn bird_mesh() -> VoxelMesh {
@@ -533,7 +638,7 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
             // what stops the two drifting -- a prop that moves takes its
             // collision with it, and a new prop cannot be added without the
             // compiler asking which PropKind it is.
-            blockers.push_prop(PropKind::$kind, $x, $z, $y, 1.0);
+            blockers.push_placed(PropKind::$kind, $x, $z, $y, $q, 1.0);
             pieces.push(Piece { mesh: $mesh, pos: Vec3::new($x, $y, $z), quarter: $q, vsize: $vs, sway: 0.0 })
         }};
     }
@@ -545,10 +650,38 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
         }};
     }
 
+    // --- the authored centre: the Hollow and the two screened Runs ---
+    // First, so that everything scattered afterwards is placed around it.
+    for (i, a) in crate::midjungle::layout().into_iter().enumerate() {
+        let (x, z, q, vi) = (a.x, a.z, a.quarter, i as i32);
+        match a.kind {
+            PropKind::Rock => put!(Rock; props::rock(a.scale), x, z, 0.0, q, V_MED),
+            PropKind::BoulderCluster => put!(BoulderCluster; props::boulder_cluster(a.scale, vi), x, z, 0.0, q, V_MED),
+            PropKind::RuinPillar => put!(RuinPillar; props::ruin_pillar(a.scale, vi), x, z, 0.0, q, V_MED),
+            PropKind::StoneHead => put!(StoneHead; props::stone_head(a.scale, vi), x, z, 0.0, q, V_MED),
+            PropKind::FallenLog => {
+                blockers.push_placed(PropKind::FallenLog, x, z, 0.0, q, a.scale);
+                pieces.push(Piece { mesh: props::fallen_log(a.scale), pos: Vec3::new(x, 0.0, z), quarter: q, vsize: V_MED, sway: 0.0 });
+            }
+            PropKind::JungleTree => {
+                plant!(JungleTree; props::jungle_tree(a.scale, vi), x, z, 0.0, q, V_MED, 1.0);
+                blockers.push_jungle_roots(x, z, 0.0, vi);
+            }
+            PropKind::StranglerFig => plant!(StranglerFig; props::strangler_fig(a.scale, vi), x, z, 0.0, q, V_MED, 0.8),
+            PropKind::Palm => plant!(Palm; props::palm(a.scale, vi), x, z, 0.0, q, V_MED, 1.6),
+            PropKind::Fern => plant!(Fern; props::fern(vi), x, z, 0.0, 0, V_SM, 2.6),
+            PropKind::Bush => plant!(Bush; props::bush(vi), x, z, 0.0, 0, V_SM, 1.8),
+            // A kind the layout uses and this match does not build would be
+            // a prop that collides and cannot be seen.
+            other => panic!("midjungle::layout places {other:?}, which build_world has no mesh arm for"),
+        }
+    }
+
     // --- playable jungle flora ---
     for _ in 0..56 {
         if let Some((x, z)) = jungle_spot(&mut rng, 8.5) {
             plant!(JungleTree; props::jungle_tree(0.85 + rng.f32() * 0.35, v), x, z, 0.0, (v % 4) as u8, V_MED, 1.0);
+            blockers.push_jungle_roots(x, z, 0.0, v);
         }
         v += 1;
     }
@@ -646,7 +779,11 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
     }
     for _ in 0..11 {
         if let Some((x, z)) = jungle_spot(&mut rng, 7.5) {
-            put!(FallenLog; props::fallen_log(0.85 + rng.f32() * 0.3), x, z, 0.0, (v % 4) as u8, V_MED);
+            // Not `put!`: the log's length is its scale, and the capsule
+            // has to be as long as the mesh.
+            let (ls, q) = (0.85 + rng.f32() * 0.3, (v % 4) as u8);
+            blockers.push_placed(PropKind::FallenLog, x, z, 0.0, q, ls);
+            pieces.push(Piece { mesh: props::fallen_log(ls), pos: Vec3::new(x, 0.0, z), quarter: q, vsize: V_MED, sway: 0.0 });
         }
         v += 1;
     }
@@ -704,12 +841,9 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
         v += 5;
     }
 
-    // --- bridges where the side lanes cross the rivers ---
-    for (side, lane) in [(-1.0f32, Lane::Top), (1.0f32, Lane::Bot)] {
-        if let Some(p) = bridge_crossing(side, lane) {
-            put!(Bridge; props::bridge(32), p.x, p.z, -0.35, 0, V_MED);
-        }
-    }
+    // The bridges that stood here are gone. The crossings are logs now, and
+    // logs move, so they are not part of the static world: see `logs` and
+    // the dynamic draw in `Scene::draw`.
 
     // --- braziers flanking the base gates ---
     for team in [Team::Blue, Team::Red] {
@@ -835,4 +969,91 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
         blockers.len()
     );
     (out, bird_mesh(), blockers)
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use crate::blockers::Perch;
+
+    /// An ASCII plan of the real world's blockers. `cargo test plan_of -- --nocapture`.
+    /// `#` wall (unstandable or tall), `o` perch, `"` cover, `.` lane, ` ` open.
+    pub fn plan(b: &Blockers, half: f32, cell: f32) -> String {
+        let n = (half * 2.0 / cell) as i32;
+        let mut out = String::new();
+        for iz in (0..n).rev() {
+            for ix in 0..n {
+                let (x, z) = (-half + (ix as f32 + 0.5) * cell, -half + (iz as f32 + 0.5) * cell);
+                let solid = b.blocked(x, z, 0.0);
+                let perch = b.with_perch().any(|(k, p)| {
+                    let (ax, az, r) = k.shape.nearest_axis(x, z);
+                    p != Perch::None && (x - ax).hypot(z - az) < r
+                });
+                out.push(if solid && perch { 'o' } else if solid { '#' } else if b.concealment_at(x, z) > 0.3 { '"' } else if consts::lane_clearance(x, z) < 3.5 { '.' } else { ' ' });
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The authored centre, checked in the REAL world: after every scatter
+    /// pass, camp ring and ruin has been placed round it, the runs are still
+    /// open, the doorways still doors, and the lane still clear.
+    #[test]
+    fn scatter_leaves_the_authored_centre_alone() {
+        use crate::midjungle::{DOORS, LANE_KEEP, RUN_X, RUN_Z};
+        let (_, _, b) = build_world();
+        let body = consts::GOD_RADIUS + 0.2;
+        let mut checked = 0;
+        for (sx, sz) in [(1.0f32, 1.0f32), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+            let mut z = RUN_Z.0;
+            while z <= RUN_Z.1 {
+                assert!(!b.blocked(sx * RUN_X, sz * z, body), "run ({sx},{sz}) plugged at z = {}", sz * z);
+                z += 0.5;
+                checked += 1;
+            }
+            for d in DOORS {
+                let mut x = LANE_KEEP - 2.0;
+                while x <= RUN_X {
+                    assert!(!b.blocked(sx * x, sz * d, body), "doorway z = {} plugged at x = {}", sz * d, sx * x);
+                    x += 0.5;
+                }
+            }
+        }
+        assert!(checked > 100, "{checked}");
+        let mut z = -60.0;
+        while z <= 60.0 {
+            assert!(!b.blocked(0.0, z, consts::GOD_RADIUS), "mid lane blocked at z = {z}");
+            z += 0.5;
+        }
+        // And the root steps registered for the screen's trees do not push.
+        assert!(b.steps().len() > 224, "the screen's jungle trees brought their roots: {}", b.steps().len());
+    }
+
+    /// The performance claim, measured on the REAL world rather than argued:
+    /// how many instances the static world uploads. Floors on both sides --
+    /// a big drop, and not so big that visible surface went with it.
+    #[test]
+    fn the_world_uploads_its_hull_not_its_insides() {
+        let (pieces, _, _) = build_world();
+        let hull: usize = pieces.iter().map(|p| p.0.inst.len()).sum();
+        println!("static world: {hull} instances in {} pieces", pieces.len());
+        assert!(hull > 120_000, "{hull}: did the cull eat the surface?");
+        assert!(hull < 520_000, "{hull}: the world is still being uploaded solid (it was ~877k)");
+        // And per shape, against the solid: a boulder is mostly inside.
+        let mut g = crate::voxel::Grid::new(24, 24, 24);
+        g.ellipsoid(12.0, 12.0, 12.0, 10.0, 10.0, 10.0, [0.5, 0.5, 0.5, 1.0]);
+        let (h, s) = (g.mesh(0.5, true).inst.len(), g.mesh_solid(0.5, true).inst.len());
+        assert!((h as f32) < s as f32 * 0.45, "hull {h} of solid {s}");
+        // Leaves with alpha keep what is behind them.
+        let mut a = crate::voxel::Grid::new(5, 5, 5);
+        a.filled_box(0, 0, 0, 4, 4, 4, [0.2, 0.6, 0.2, 0.5]);
+        assert_eq!(a.mesh(0.5, true).inst.len(), 125, "nothing behind a translucent voxel is culled");
+    }
+
+    #[test]
+    fn plan_of_the_centre() {
+        let (_, _, b) = build_world();
+        println!("{}", plan(&b, 62.0, 2.0));
+    }
 }

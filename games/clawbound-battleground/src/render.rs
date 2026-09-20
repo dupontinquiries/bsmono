@@ -11,6 +11,8 @@ use crate::voxel::{CUBE_IDX, CUBE_NORMS, CUBE_VERTS, VoxInst, VoxelMesh};
 
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const SHADOW_SIZE: u32 = 2048;
+/// Three lanes x two teams x inner/outer. terrain.wgsl hard-codes it.
+pub const MAX_TOWER_RINGS: usize = 12;
 pub const MAX_DRAWS: usize = 512;
 pub const MAX_PARTICLES: usize = 48000;
 pub const DYN_ALIGN: u64 = 256;
@@ -36,6 +38,21 @@ pub struct FrameUniform {
     pub wind: [f32; 4],
     /// x flood rise (u), y quake shake, z fire glow near camera, w unused
     pub event: [f32; 4],
+    /// What is shouldering through the flora: xyz where, w how hard (signed:
+    /// a wake swings leaves back through rest). APPENDED, and only
+    /// voxel.wgsl declares it -- the other shaders bind the same buffer with
+    /// the shorter struct, which is legal because no layout sets a
+    /// min_binding_size.
+    pub brush: [[f32; 4]; crate::puppet::MAX_BRUSHES],
+    /// Blast fronts: a = xyz centre + ring radius, b = strength, width.
+    /// voxel.wgsl (trees shudder as the ring passes).
+    pub blast_a: [[f32; 4]; crate::groundfx::MAX_BLASTS],
+    pub blast_b: [[f32; 4]; crate::groundfx::MAX_BLASTS],
+    /// Broken ground: x, z, radius, how open. terrain.wgsl.
+    pub cracks: [[f32; 4]; crate::groundfx::MAX_CRACKS],
+    /// Tower range rings as the player should see them: x, z, range, state.
+    /// terrain.wgsl. See `Game::tower_rings`.
+    pub towers: [[f32; 4]; MAX_TOWER_RINGS],
 }
 
 #[repr(C)]
@@ -130,6 +147,18 @@ pub struct Renderer {
     pub exposure: f32,
     /// Sky state for this frame — set by the caller each frame (see weather.rs).
     pub atmosphere: crate::weather::Atmosphere,
+    /// Set by the scene each frame from `puppet::Troupe::brushes`.
+    pub brushes: Vec<[f32; 4]>,
+    /// Set by the scene each frame from `groundfx::GroundFx`.
+    pub blast_a: [[f32; 4]; crate::groundfx::MAX_BLASTS],
+    pub blast_b: [[f32; 4]; crate::groundfx::MAX_BLASTS],
+    pub cracks: [[f32; 4]; crate::groundfx::MAX_CRACKS],
+    /// Set by the scene each frame from `Game::tower_rings`.
+    pub towers: [[f32; 4]; MAX_TOWER_RINGS],
+    /// Shadow-map samples marched per fragment for light shafts through the
+    /// canopy. 0 turns them off: on a handset GPU this is the first thing to
+    /// give up, and the screen-space shafts toward the sun remain.
+    pub shaft_steps: u32,
     /// (flood rise, quake shake, fire glow) — set by the caller (disasters.rs).
     pub event: (f32, f32, f32),
 }
@@ -328,20 +357,8 @@ impl Renderer {
         let shadow_pl = mk_layout([&shadow_bgl]);
         let post_pl = mk_layout([&post_bgl]);
 
-        let depth_state_write = wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
-            stencil: Default::default(),
-            bias: Default::default(),
-        };
-        let depth_state_ro = wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: false,
-            depth_compare: wgpu::CompareFunction::Always,
-            stencil: Default::default(),
-            bias: Default::default(),
-        };
+        let depth_state_write = depth_state(DepthUse::Opaque);
+        let depth_state_ro = depth_state(DepthUse::Blended);
 
         let msaa = wgpu::MultisampleState { count: 4, ..Default::default() };
         let msaa1 = wgpu::MultisampleState::default();
@@ -595,7 +612,7 @@ impl Renderer {
 
         let post_params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("post params"),
-            size: 48,
+            size: 48 + 16 * crate::groundfx::MAX_RINGS as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -651,6 +668,18 @@ impl Renderer {
             time: 0.0,
             exposure: 0.92,
             atmosphere: crate::weather::Weather::new().atmosphere(),
+            brushes: Vec::new(),
+            blast_a: Default::default(),
+            blast_b: Default::default(),
+            cracks: Default::default(),
+            towers: Default::default(),
+            // OFF. Both tunings tried so far turned the far field milky rather
+            // than drawing shafts: under this jungle's canopy almost every
+            // view ray is half-occluded, so the term fires everywhere, and 8
+            // jittered samples average to glow. Measured on one frame: top
+            // fifth of the image +19% and then +25% luma against the same
+            // frame without. Kept behind the knob; see TODO.md.
+            shaft_steps: 0,
             event: (0.0, 0.0, 0.0),
         };
         r.resize(width, height);
@@ -735,6 +764,14 @@ impl Renderer {
 pub const SUN_DIR: Vec3 = Vec3::new(-0.42, 0.82, 0.32);
 
 impl Renderer {
+    fn brush_uniform(&self) -> [[f32; 4]; crate::puppet::MAX_BRUSHES] {
+        let mut out = [[0.0f32; 4]; crate::puppet::MAX_BRUSHES];
+        for (slot, b) in out.iter_mut().zip(&self.brushes) {
+            *slot = *b;
+        }
+        out
+    }
+
     pub fn clear_queues(&mut self) {
         self.opaque.clear();
         self.transparent.clear();
@@ -765,6 +802,20 @@ impl Renderer {
     pub fn render_frame(&mut self, target: &wgpu::TextureView, cam: Camera, time: f32) {
         self.camera = cam;
         self.time = time;
+        // Depth-testing the blended pipelines fixes blended-vs-opaque
+        // ordering; two blended surfaces still composite in queue order
+        // unless sorted. Painter's order, far to near.
+        let eye = self.camera.eye;
+        let mut order: Vec<(f32, (u64, u32))> = self
+            .transparent
+            .iter()
+            .map(|t| {
+                let c = self.draws[t.1 as usize].model[3];
+                (Vec3::new(c[0], c[1], c[2]).distance_squared(eye), *t)
+            })
+            .collect();
+        sort_far_to_near(&mut order);
+        self.transparent = order.into_iter().map(|(_, t)| t).collect();
         let aspect = self.width as f32 / self.height as f32;
         let vp = cam.view_proj(aspect);
         let inv = vp.inverse();
@@ -773,9 +824,11 @@ impl Renderer {
         // with the weather (night sinks it), so the light matrix follows.
         let atm = self.atmosphere;
         let sun = atm.sun_dir.normalize();
-        let light_view = Mat4::look_at_rh(sun * 130.0 + Vec3::new(0.0, 0.0, 0.0), Vec3::ZERO, Vec3::Y);
-        let light_proj = Mat4::orthographic_rh(-150.0, 150.0, -150.0, 150.0, 1.0, 320.0);
-        let lvp = light_proj * light_view;
+        // The one shadow map used to cover a fixed 300 u box: 0.146 u per
+        // texel, a third of a voxel, so every shadow was a blob. It is now
+        // aimed at what the camera is looking at and sized to the view.
+        let half = crate::groundfx::shadow_half_extent(cam.eye.distance(cam.target));
+        let lvp = crate::groundfx::fit_shadow(cam.target, sun, half, SHADOW_SIZE);
 
         let fog_color = [atm.fog_color[0], atm.fog_color[1], atm.fog_color[2], 1.0];
         let frame = FrameUniform {
@@ -789,7 +842,12 @@ impl Renderer {
             sun_col: [atm.sun_col[0], atm.sun_col[1], atm.sun_col[2], atm.cloud_cover],
             weather: [atm.rain, atm.snow, atm.wetness, atm.lightning],
             wind: [atm.wind.x, atm.wind.y, atm.wind.z, atm.gust],
-            event: [self.event.0, self.event.1, self.event.2, 0.0],
+            event: [self.event.0, self.event.1, self.event.2, self.shaft_steps as f32],
+            brush: self.brush_uniform(),
+            blast_a: self.blast_a,
+            blast_b: self.blast_b,
+            cracks: self.cracks,
+            towers: self.towers,
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 
@@ -814,6 +872,7 @@ impl Renderer {
         if !self.particles.is_empty() {
             self.queue.write_buffer(&self.particle_buf, 0, bytemuck::cast_slice(&self.particles));
         }
+        let mut post_data: Vec<f32> = Vec::with_capacity(12 + 4 * crate::groundfx::MAX_RINGS);
         self.queue.write_buffer(
             &self.post_params,
             0,
@@ -832,7 +891,10 @@ impl Renderer {
                 } else {
                     ([0.5, 0.5], 0.0)
                 };
-                bytemuck::cast_slice(&[
+                let cam_right = (cam.target - cam.eye).cross(Vec3::Y);
+                let rings = crate::groundfx::screen_rings(&self.blast_a, &self.blast_b, vp, cam_right, aspect);
+                post_data.clear();
+                post_data.extend_from_slice(&[
                     self.exposure * (1.0 + atm.night * 0.35),
                     0.55 + atm.night * 0.2,
                     time,
@@ -840,12 +902,17 @@ impl Renderer {
                     0.55 + atm.night * 0.3,
                     atm.night,
                     atm.rain,
-                    0.0f32,
+                    // heat shimmer: fire near the camera (the wildfire's glow)
+                    self.event.2.clamp(0.0, 1.0),
                     sun_uv[0],
                     sun_uv[1],
                     ray,
                     0.22,
-                ])
+                ]);
+                for r in rings {
+                    post_data.extend_from_slice(&r);
+                }
+                bytemuck::cast_slice(&post_data)
             },
         );
 
@@ -1060,6 +1127,11 @@ impl Renderer {
             weather: [0.0; 4],
             wind: [0.0; 4],
             event: [0.0; 4],
+            brush: self.brush_uniform(),
+            blast_a: self.blast_a,
+            blast_b: self.blast_b,
+            cracks: self.cracks,
+            towers: self.towers,
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 
@@ -1232,6 +1304,48 @@ fn lane_distance(x: f32, z: f32) -> f32 {
     best
 }
 
+/// What a pipeline does with the scene depth buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepthUse {
+    /// Terrain, opaque voxels: test and write.
+    Opaque,
+    /// Water, alpha voxels, particles, and the sky triangle: test, never write.
+    Blended,
+}
+
+/// The depth state for a pipeline. A free function on purpose: it needs no
+/// device, so `tests::blended_draws_are_depth_tested` can pin it.
+///
+/// History, because it has now happened twice: `Blended` shipped as
+/// `CompareFunction::Always`, which made the river sheet ignore the depth
+/// buffer and paint over canopies, banks and bridge piers. `3f70d2d7d` fixed
+/// it; the v8 merge `1d46c86c5` replaced this file wholesale and the fix went
+/// with it, because nothing but a screenshot could tell.
+///
+/// `LessEqual`, not `Less`: the sky is a full-screen triangle at NDC depth
+/// exactly 1.0, which is the clear value, and it shares this state. A strict
+/// `Less` would reject every sky fragment.
+pub fn depth_state(usage: DepthUse) -> wgpu::DepthStencilState {
+    let (write, compare) = match usage {
+        DepthUse::Opaque => (true, wgpu::CompareFunction::Less),
+        DepthUse::Blended => (false, wgpu::CompareFunction::LessEqual),
+    };
+    wgpu::DepthStencilState {
+        format: wgpu::TextureFormat::Depth32Float,
+        depth_write_enabled: write,
+        depth_compare: compare,
+        stencil: Default::default(),
+        bias: Default::default(),
+    }
+}
+
+/// Order blended draws far-to-near by squared distance. NaN sorts as
+/// "equal" rather than panicking: a degenerate model matrix costs one
+/// mis-ordered blend, not the frame.
+pub fn sort_far_to_near<T>(items: &mut [(f32, T)]) {
+    items.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+}
+
 /// Shared terrain height field: flat playable floor, rolling jungle hills
 /// beyond the arena bounds, a mountain rim at the horizon, and river valleys
 /// that dip under the lanes (roads stay solid — bridges span the crossings).
@@ -1257,7 +1371,24 @@ pub fn terrain_height(x: f32, z: f32) -> f32 {
     let river_reach = RIVER_HALF_WIDTH + 7.0;
     if rd < river_reach {
         let ld = lane_distance(x, z);
-        let mask = smoothstep(4.0, 9.5, ld);
+        let mut mask = smoothstep(4.0, 9.5, ld);
+        // The lanes used to fill the channel in wherever they came near, so
+        // the "bridges" stood over a causeway with no water under it. At a
+        // crossing the river now runs THROUGH, and a log is the way over.
+        // A SLUICE, not a pond. The lane does not cross the river here, it
+        // grazes it, nearly parallel for ~25 u; opening a disc round the
+        // crossing flooded that whole stretch and left the 13 u log as a raft
+        // in the middle (one screenshot was enough). So the causeway stays,
+        // cut by a channel across it just narrower than the log is long: the
+        // log's ends rest on the road, and water runs through the gap the way
+        // the log will roll.
+        for c in crate::logs::crossings() {
+            let (rx, rz) = (x - c.at.x, z - c.at.z);
+            let along = (rx * c.along.x + rz * c.along.z).abs();
+            let across = (rx * -c.along.z + rz * c.along.x).abs();
+            let gap = (1.0 - smoothstep(crate::logs::SLUICE_HALF, crate::logs::SLUICE_HALF + 2.0, along)) * (1.0 - smoothstep(16.0, 22.0, across));
+            mask = mask.max(gap);
+        }
         // banks slope down past the water line, then the channel bowls out
         let t = (rd / river_reach).clamp(0.0, 1.0);
         let depth = (1.0 - t).powf(1.25) * (RIVER_DEPTH + 0.6) - 0.3;
@@ -1345,16 +1476,21 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
                     mat = 6.0;
                 }
                 // dirt lane with worn edges + subtle checker
-                if ld < 5.4 {
-                    mat = 1.0;
-                    let t = (1.0 - ld / 5.4).clamp(0.0, 1.0);
+                if ld < 7.0 {
+                    // A soft shoulder, and no checker. The lane used to be a
+                    // hard `ld < 5.4` with a 3.2 u checkerboard darkening, both
+                    // evaluated per VERTEX on a 1.6 u grid: that is the
+                    // sawtooth along every road. The edge is now a smooth
+                    // ramp the grid can carry, broken up per-pixel by noise in
+                    // terrain.wgsl; the shader owns all fine pattern.
+                    let t = 1.0 - smoothstep(2.6, 7.0, ld + (n1 - 0.5) * 1.8);
+                    if t > 0.5 {
+                        mat = 1.0;
+                    }
                     let dirt = [0.42, 0.345, 0.26];
                     g = [g[0] + (dirt[0] - g[0]) * t, g[1] + (dirt[1] - g[1]) * t, g[2] + (dirt[2] - g[2]) * t];
-                    if ((x / 3.2).floor() + (z / 3.2).floor()) as i32 % 2 == 0 {
-                        g = [g[0] * 0.93, g[1] * 0.93, g[2] * 0.93];
-                    }
-                } else if ld < 7.0 {
-                    let t = (1.0 - (ld - 5.4) / 1.6) * 0.25;
+                } else if ld < 8.5 {
+                    let t = (1.0 - (ld - 7.0) / 1.5) * 0.25;
                     g = [g[0] * (1.0 - t * 0.4), g[1] * (1.0 - t * 0.25), g[2] * (1.0 - t * 0.5)];
                 }
                 // rivers: a pebbled bed under the water (the surface is its own
@@ -1502,4 +1638,37 @@ fn build_flood_plane() -> (Vec<WaterVert>, Vec<u32>) {
         }
     }
     (verts, idx)
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    /// The river painted over canopies twice (see `depth_state`). This is the
+    /// check that was missing both times: no GPU needed, so it runs anywhere.
+    #[test]
+    fn blended_draws_are_depth_tested() {
+        let d = depth_state(DepthUse::Blended);
+        assert_ne!(d.depth_compare, wgpu::CompareFunction::Always, "water would ignore the depth buffer");
+        assert!(!d.depth_write_enabled, "a blended surface must not occlude what is drawn after it");
+        // The sky shares this state and sits at exactly the clear depth.
+        assert_eq!(d.depth_compare, wgpu::CompareFunction::LessEqual, "strict Less rejects the sky at depth 1.0");
+    }
+
+    #[test]
+    fn opaque_draws_write_depth() {
+        let d = depth_state(DepthUse::Opaque);
+        assert!(d.depth_write_enabled);
+        assert_eq!(d.depth_compare, wgpu::CompareFunction::Less);
+    }
+
+    /// Both directions are failures here: near-to-far blends the far surface
+    /// over the near one.
+    #[test]
+    fn blended_draws_sort_far_to_near() {
+        let mut v = vec![(1.0, 'n'), (9.0, 'f'), (4.0, 'm'), (f32::NAN, 'x')];
+        sort_far_to_near(&mut v);
+        let order: Vec<char> = v.iter().filter(|e| e.1 != 'x').map(|e| e.1).collect();
+        assert_eq!(order, vec!['f', 'm', 'n']);
+    }
 }

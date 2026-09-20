@@ -100,6 +100,9 @@ pub fn run() -> Result<(), String> {
         *e = pool.remove((rng.next_u() % pool.len() as u64) as usize);
     }
     let mut game = Game::new(player, allies, enemies);
+    // As app.rs does. Without this the harness simulated a world with no
+    // props in it, which is not the game anyone plays.
+    game.blockers = scene.blockers.clone();
     // drive the player slot with AI for the demo
     let lane = crate::consts::Lane::Mid;
     game.gods[0].ai = Some(crate::sim::AiBrain {
@@ -384,4 +387,285 @@ fn save_shot(device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::Texture,
     let _ = Mat4::IDENTITY;
     let _ = Team::Blue;
     Ok(())
+}
+
+
+/// `--rig-sheet`: close-ups of ancestors in staged states.
+///
+/// Mirrors `app.rs`'s frame: `vfx.update` then `Scene::draw` then
+/// `render_frame`, with the scene's own blockers handed to the game. The sim
+/// is NOT ticked — states are staged by writing `GodUnit` fields the way the
+/// sim does (`atk_anim = 1.0` on a swing, a `DashState` for a dash), so what
+/// is drawn is what the draw path makes of real sim state, not a pose the
+/// game never produces.
+pub fn run_rig_sheet() -> Result<(), String> {
+    use crate::puppet::CastStyle;
+    use crate::sim::DashState;
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("sheet target"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+
+    // A real fern and a real root, from the scene's own blockers.
+    let fern = scene.blockers.all().iter().find_map(|b| {
+        let c = b.cover;
+        (c.amount > 0.5 && c.amount < 0.6 && c.x.abs() < 60.0 && c.z.abs() < 60.0).then_some(Vec3::new(c.x, 0.0, c.z))
+    });
+    let root = scene.blockers.steps().first().map(|s| match s.shape {
+        crate::blockers::Shape::Segment { x0, z0, x1, z1, .. } => (Vec3::new(x0, 0.0, z0), Vec3::new(x1, 0.0, z1)),
+        crate::blockers::Shape::Circle { x, z, .. } => (Vec3::new(x, 0.0, z), Vec3::new(x + 1.0, 0.0, z)),
+    });
+    println!("fern at {fern:?}; root at {root:?}; {} root steps", scene.blockers.steps().len());
+
+    struct Shot { name: &'static str, eye: Vec3, look: Vec3 }
+    let row = Vec3::new(0.0, 0.0, -40.0);
+    let mut shots = vec![Shot { name: "rig_lineup.png", eye: row + Vec3::new(0.0, 6.5, -12.0), look: row + Vec3::Y * 0.6 }];
+    if let Some((a, b)) = root {
+        let mid = (a + b) * 0.5;
+        let along = (b - a).normalize_or_zero();
+        let side = Vec3::new(-along.z, 0.0, along.x);
+        shots.push(Shot { name: "rig_on_root.png", eye: mid + side * 1.2 + along * 6.5 + Vec3::Y * 2.4, look: mid + Vec3::Y * 1.6 });
+    }
+    if let Some(f) = fern {
+        shots.push(Shot { name: "rig_in_fern.png", eye: f + Vec3::new(-2.2, 6.5, 3.4), look: f + Vec3::Y * 0.4 });
+    }
+
+    // Signature frames: every ancestor casting its ultimate, in a file down
+    // the lane, seen from the side. 0..=5 then 6..=12.
+    let file = |k: usize| Vec3::new(0.0, 0.0, -56.0 + k as f32 * 5.2);
+    for (name, count) in [("sig_0_to_5.png", 6usize), ("sig_6_to_12.png", 7)] {
+        let mid = (file(0) + file(count - 1)) * 0.5;
+        shots.push(Shot { name, eye: mid + Vec3::new(-17.0, 13.0, 0.0), look: mid + Vec3::Y * 1.0 });
+    }
+    let sig_first = shots.len() - 2;
+
+    // A real wall from the scene: one cat trotting its top, one knocked off
+    // it a tenth of a second ago and halfway through righting itself.
+    let wall = scene.blockers.with_perch().find_map(|(b, p)| match (b.shape, p) {
+        (crate::blockers::Shape::Segment { x0, z0, x1, z1, .. }, crate::blockers::Perch::Narrow)
+            if (x1 - x0).hypot(z1 - z0) > 6.0 && x0.hypot(z0) < 120.0 => Some((Vec3::new(x0, b.top, z0), Vec3::new(x1, b.top, z1))),
+        _ => None,
+    });
+    let wall_shot = shots.len();
+    if let Some((a, b)) = wall {
+        let mid = (a + b) * 0.5;
+        let along = (b - a).normalize_or_zero();
+        let side = Vec3::new(-along.z, 0.0, along.x);
+        shots.push(Shot { name: "rig_wall_and_fall.png", eye: mid + side * 8.0 + Vec3::Y * 3.5, look: mid - Vec3::Y * 0.6 });
+    }
+    // The authored centre from above: the Hollow, and a run either side of the lane.
+    shots.push(Shot { name: "map_centre.png", eye: Vec3::new(0.0, 62.0, -46.0), look: Vec3::new(0.0, 0.0, 8.0) });
+    // A strike in the Hollow, a third of a second on: the front is among the
+    // trees, the ground is freshly broken, and an older crack beside it is
+    // half healed. Gameplay camera distance, so the fitted shadow box is tight.
+    shots.push(Shot { name: "fx_blast.png", eye: Vec3::new(-21.0, 8.0, -1.0), look: Vec3::new(-9.0, 0.6, 10.0) });
+    // A crossing: the log in its seat with the river running under it.
+    if let Some(c) = crate::logs::crossings().first() {
+        let down = Vec3::new(-c.along.z, 0.0, c.along.x);
+        shots.push(Shot { name: "log_crossing.png", eye: c.at - down * 15.0 + c.along * 6.0 + Vec3::Y * 9.0, look: c.at });
+    }
+    // An enemy tower with the player just inside its line: the ring solid red,
+    // the tether on the player.
+    {
+        let t = consts_tower();
+        shots.push(Shot { name: "tower_line.png", eye: t + Vec3::new(30.0, 26.0, -22.0), look: t + Vec3::new(10.0, 0.0, 0.0) });
+    }
+    println!("wall at {wall:?}");
+    // CLAWBOUND_SHEET=wall,sig_0 renders only the shots whose names match.
+    let only: Vec<String> = std::env::var("CLAWBOUND_SHEET").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default();
+
+    for (si, shot) in shots.iter().enumerate() {
+        if !only.is_empty() && !only.iter().any(|o| shot.name.contains(o.as_str())) {
+            continue;
+        }
+        let mut game = if si == sig_first + 1 {
+            Game::new(6, [7, 8, 9, 10], [11, 12, 0, 1, 2])
+        } else {
+            Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9])
+        };
+        game.blockers = scene.blockers.clone();
+        let mut vfx = Vfx::default();
+        let cam = Camera { eye: shot.eye, target: shot.look, fov_y: if si == 0 || si >= sig_first { 1.0 } else { 0.6 } };
+        const STEPS: usize = 48;
+        for step in 0..STEPS {
+            let left = STEPS - 1 - step;
+            match si {
+                0 => {
+                    // Six cats in a row facing +X (yaw 0), seen from -Z.
+                    for k in 0..6 {
+                        let g = &mut game.gods[k];
+                        g.yaw = 0.0;
+                        g.pos = row + Vec3::X * (k as f32 * 4.6 - 11.5);
+                    }
+                    // The movers ARRIVE at their slot on the capture frame.
+                    game.gods[0].pos.x -= left as f32 * (5.0 / 60.0); // trotting +X
+                    game.gods[1].pos.x -= left as f32 * (11.0 / 60.0); // bounding
+                    if left == 10 {
+                        game.gods[2].atk_anim = 1.0; // the sim's swing pulse
+                    }
+                    game.gods[2].atk_anim = (game.gods[2].atk_anim - 4.0 / 60.0).max(0.0);
+                    if left == 18 {
+                        vfx.puppets.on_cast(3, CastStyle::Rear);
+                    }
+                    if left == 12 {
+                        vfx.puppets.on_cast(4, CastStyle::Arch);
+                    }
+                    // A dash a third of the way through, as systems.rs poses it.
+                    let from = row + Vec3::X * 9.7;
+                    let to = from + Vec3::X * 6.0;
+                    let a = 0.3;
+                    game.gods[5].dash = Some(DashState { from, to, t: a * 0.4, dur: 0.4, dmg: 0.0 });
+                    game.gods[5].pos = from.lerp(to, a) + Vec3::Y * (a * (1.0 - a) * 4.0 * 0.35);
+                }
+                1 => {
+                    // Walk one cat along a real root, toward the camera.
+                    let (a, b) = root.unwrap();
+                    let dir = (b - a).normalize_or_zero();
+                    let g = &mut game.gods[0];
+                    g.yaw = dir.z.atan2(dir.x);
+                    g.pos = a - dir * 1.2 + dir * (step as f32 * (2.0 / 60.0));
+                }
+                k if shots[k].name == "fx_blast.png" => {
+                    for gi in 1..game.gods.len() {
+                        game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
+                    }
+                    game.gods[0].pos = Vec3::new(-15.5, 0.0, 8.0);
+                    game.gods[0].yaw = 1.9;
+                    if left == 40 {
+                        // an old break, then a downpour's worth of healing
+                        vfx.ground.strike(Vec3::new(-13.0, 0.0, 3.5), 4.0, 1.0);
+                        for _ in 0..36 {
+                            vfx.ground.tick(0.25, 1.0, 1.0);
+                        }
+                    }
+                    if left == 20 {
+                        vfx.quake(Vec3::new(-10.5, 0.0, 12.0), 6.0, 1.0);
+                    }
+                }
+                k if shots[k].name == "log_crossing.png" => {
+                    let c = crate::logs::crossings()[0];
+                    for gi in 1..game.gods.len() {
+                        game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
+                    }
+                    // one cat walking the spine
+                    game.gods[0].yaw = c.along.z.atan2(c.along.x);
+                    game.gods[0].pos = c.at - c.along * (left as f32 * (3.0 / 60.0));
+                }
+                k if shots[k].name == "tower_line.png" => {
+                    let t = consts_tower();
+                    for gi in 1..game.gods.len() {
+                        game.gods[gi].respawn_t = 999.0;
+                    }
+                    game.gods[0].pos = t + Vec3::X * (crate::consts::TOWER_RANGE - 2.0);
+                    game.tick(1.0 / 60.0); // the real sim decides who the tower aims at
+                }
+                k if shots[k].name == "map_centre.png" => {
+                    for gi in 0..game.gods.len() {
+                        game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
+                    }
+                }
+                k if k == wall_shot => {
+                    let (a, b) = wall.unwrap();
+                    let along = (b - a).normalize_or_zero();
+                    let side = Vec3::new(-along.z, 0.0, along.x);
+                    // On the ridge, as the sim holds a perched cat.
+                    let g = &mut game.gods[0];
+                    g.yaw = along.z.atan2(along.x);
+                    g.pos = a + along * (1.0 + step as f32 * (4.0 / 60.0));
+                    g.perch = Some(a.y);
+                    g.perch_narrow = true;
+                    // Knocked off 0.12 s ago: most of the way over, front leading.
+                    let mut fall = crate::leap::Fall::new(a.y, 2.4);
+                    fall.t = 0.12;
+                    fall.vy = -3.6;
+                    let g = &mut game.gods[1];
+                    g.yaw = along.z.atan2(along.x);
+                    g.pos = a + along * 7.5 + side * 2.2 + Vec3::Y * (-a.y * 0.0 - 0.25);
+                    g.fall = Some(fall);
+                    for gi in 2..game.gods.len() {
+                        game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
+                    }
+                }
+                k if k >= sig_first => {
+                    let count = if k == sig_first { 6 } else { 7 };
+                    let mut casts = Vec::new();
+                    for gi in 0..count {
+                        let g = &mut game.gods[gi];
+                        g.yaw = 0.0;
+                        g.pos = file(gi);
+                        // 0.2 s before the capture: mid-effect, not the first frame of it.
+                        if left == 12 {
+                            casts.push(crate::sim::Event::Cast { god: gi, slot: 3, aim: g.pos + Vec3::X * 7.0 });
+                        }
+                    }
+                    for gi in count..game.gods.len() {
+                        game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
+                    }
+                    vfx.update(1.0 / 60.0, &casts, &game);
+                    renderer.clear_queues();
+                    scene.draw(&mut renderer, &game, &mut vfx, cam);
+                    continue;
+                }
+                _ => {
+                    // One real fern, two cats passing it on the capture frame.
+                    // Cat 0 stalks by, a hand's width from the stem: low, and
+                    // bent round it. Cat 1 runs through a unit the other side.
+                    // Both are driven the way the sim drives them: `sneak`
+                    // intent on one, speed on the other.
+                    let f = fern.unwrap();
+                    let yaw = 0.8f32;
+                    let dir = Vec3::new(yaw.cos(), 0.0, yaw.sin());
+                    let side = Vec3::new(-dir.z, 0.0, dir.x);
+                    let g = &mut game.gods[0];
+                    g.yaw = yaw;
+                    g.sneak = true;
+                    g.pos = f - side * 0.3 - dir * (left as f32 * (3.2 / 60.0) + 0.35);
+                    let g = &mut game.gods[1];
+                    g.yaw = yaw;
+                    g.pos = f + side * 1.1 - dir * (left as f32 * (12.4 / 60.0) - 0.6);
+                    for gi in 2..game.gods.len() {
+                        game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
+                    }
+                }
+            }
+            vfx.update(1.0 / 60.0, &[], &game);
+            renderer.clear_queues();
+            scene.draw(&mut renderer, &game, &mut vfx, cam);
+        }
+        // CLAWBOUND_NO_BRUSH=1 renders the same frame with the leaf-bend off,
+        // so the two can be diffed: everything else in the frame is identical,
+        // so any pixel that differs is a leaf that moved.
+        if std::env::var("CLAWBOUND_NO_BRUSH").is_ok() {
+            renderer.brushes.clear();
+        }
+        // CLAWBOUND_NO_FX=1: the same frame with no blast, cracks or shafts.
+        if std::env::var("CLAWBOUND_NO_FX").is_ok() {
+            renderer.blast_a = Default::default();
+            renderer.blast_b = Default::default();
+            renderer.cracks = Default::default();
+            renderer.shaft_steps = 0;
+        }
+        println!("blasts: {:?}  cracks open: {:?}", renderer.blast_b.iter().map(|b| (b[0] * 100.0).round() / 100.0).collect::<Vec<_>>(), renderer.cracks.iter().filter(|c| c[3] > 0.0).map(|c| (c[3] * 100.0).round() / 100.0).collect::<Vec<_>>());
+        println!("brushes this frame: {:?}", renderer.brushes.iter().map(|b| (b[3] * 100.0).round() / 100.0).collect::<Vec<_>>());
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, 1.0);
+        save_shot(&renderer.device, &renderer.queue, &target, shot.name)?;
+        println!("saved {}", shot.name);
+    }
+    Ok(())
+}
+
+/// The enemy (Red) mid outer tower, for the staged tower shot.
+fn consts_tower() -> Vec3 {
+    crate::consts::tower_pos(crate::consts::Lane::Mid, crate::consts::Team::Red, false)
 }

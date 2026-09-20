@@ -172,6 +172,11 @@ impl Disasters {
 impl Game {
     /// Water depth at a point, flood included — what movement and drowning use.
     pub fn water_depth_now(&self, x: f32, z: f32) -> f32 {
+        // On a crossing log is dry, whatever is under it. Not during a flood:
+        // the log is awash along with everything else.
+        if self.disasters.flood_rise <= 0.001 && self.on_a_log(x, z) {
+            return 0.0;
+        }
         if self.disasters.flood_rise > 0.001 { water_depth_rise(x, z, self.disasters.flood_rise) } else { water_depth(x, z) }
     }
 

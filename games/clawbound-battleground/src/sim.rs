@@ -141,9 +141,27 @@ pub struct GodUnit {
     pub respawn_t: f32,
     pub last_dmg_t: f32,
     pub dash: Option<DashState>,
+    /// An aimed leap in progress (see `leap`).
+    pub leap: Option<crate::leap::LeapState>,
+    pub leap_cd: f32,
+    /// Standing on a prop it leapt onto: that prop's top.
+    pub perch: Option<f32>,
+    /// ...and it is a ridge (a wall top, a pillar cap), not a platform.
+    pub perch_narrow: bool,
+    /// HP last tick, to notice a hit big enough to take a cat's footing.
+    pub perch_hp: f32,
+    /// Airborne without a leap: stepped, dragged or knocked off something.
+    pub fall: Option<crate::leap::Fall>,
     pub recent_damagers: Vec<(usize, f32)>, // (god idx, time)
     pub move_dir: Vec3,
     pub attack_held: bool,
+    /// Stalk INTENT: a toggle, pad LB, or a gentle stick. Whether the cat is
+    /// actually stalking is `Game::stalking` -- fighting suspends it.
+    pub sneak: bool,
+    /// Seconds of ability-granted quiet left: full speed, low and silent.
+    pub hush_t: f32,
+    /// When this cat last attacked or cast.
+    pub last_act_t: f32,
     pub ai: Option<AiBrain>,
     // cached derived
     pub prot: f32,
@@ -188,6 +206,10 @@ pub struct Tower {
     pub atk_timer: f32,
     pub ramp: u32,
     pub last_target: Option<TargetRef>,
+    /// Who it is looking at RIGHT NOW, updated every tick -- including
+    /// while it reloads, and cleared the moment they leave. `last_target`
+    /// only changes when it fires, so it cannot answer "am I being aimed at".
+    pub aim: Option<TargetRef>,
     pub fire_anim: f32,
 }
 
@@ -250,6 +272,11 @@ pub struct Game {
     pub over: Option<Team>,
     pub rng: Rng,
     pub cast_queue: Vec<(usize, u32, Vec3)>, // (god idx, slot, aim)
+    /// Leap requests: (god idx, aim direction). Drained by `move_gods`.
+    pub leap_queue: Vec<(usize, Vec3)>,
+    /// The river crossings. See `logs`.
+    pub logs: Vec<crate::logs::RollingLog>,
+    pub(crate) logs_seen: usize,
     pub tower_alive: [usize; 2],
     pub titan_vuln_announced: [bool; 2],
     pub weather: crate::weather::Weather,
@@ -321,9 +348,18 @@ impl Game {
                 respawn_t: 0.0,
                 last_dmg_t: -99.0,
                 dash: None,
+                leap: None,
+                leap_cd: 0.0,
+                perch: None,
+                perch_narrow: false,
+                perch_hp: 0.0,
+                fall: None,
                 recent_damagers: Vec::new(),
                 move_dir: Vec3::ZERO,
                 attack_held: false,
+                sneak: false,
+                hush_t: 0.0,
+                last_act_t: -99.0,
                 ai: if is_player { None } else { Some(AiBrain { lane, aggression: 0.45 + rng.f32() * 0.5, state: AiState::Push, target: None, strafe_dir: 1.0, strafe_t: 0.0, buy_t: 1.5, wp: 0 }) },
                 prot,
                 pen_pct: 0.0,
@@ -350,6 +386,7 @@ impl Game {
                         atk_timer: 0.0,
                         ramp: 0,
                         last_target: None,
+                        aim: None,
                         fire_anim: 0.0,
                     });
                 }
@@ -376,6 +413,9 @@ impl Game {
             over: None,
             rng,
             cast_queue: Vec::new(),
+            leap_queue: Vec::new(),
+            logs: crate::logs::crossings().iter().map(crate::logs::RollingLog::across).collect(),
+            logs_seen: 0,
             tower_alive: [6, 6],
             titan_vuln_announced: [false, false],
             weather: crate::weather::Weather::new(),
@@ -463,6 +503,76 @@ impl Game {
         g.ms_bonus = st.move_speed;
     }
 
+    /// What `viewer` should be shown about each tower: `[x, z, range, state]`.
+    ///
+    /// States answer the two questions a tower leaves open. WHERE is the
+    /// line: every standing tower draws its range on the ground. WHO is it
+    /// after: the ring changes the moment it matters to you.
+    ///   1  yours: calm, the ground you are safe on
+    ///   2  theirs, and you are outside it: a dashed warning
+    ///   3  theirs, and you are INSIDE it: solid -- it has not picked you yet
+    ///      (minions draw fire first), but it can
+    ///   4  theirs, and it is aiming at YOU
+    ///   0  fallen: nothing drawn
+    pub fn tower_rings(&self, viewer: usize) -> [[f32; 4]; crate::render::MAX_TOWER_RINGS] {
+        let mut out = [[0.0; 4]; crate::render::MAX_TOWER_RINGS];
+        let Some(me) = self.gods.get(viewer) else { return out };
+        for (slot, tw) in out.iter_mut().zip(self.towers.iter()) {
+            if tw.hp <= 0.0 {
+                continue;
+            }
+            let dist = (tw.pos.x - me.pos.x).hypot(tw.pos.z - me.pos.z);
+            // A line you are nowhere near is not information, it is a scratch
+            // across the scenery (seen in a render 40 u from an allied tower).
+            if dist > TOWER_RANGE + TOWER_RING_SHOW {
+                continue;
+            }
+            let inside = me.respawn_t <= 0.0 && dist < TOWER_RANGE;
+            let state = if tw.team == me.team {
+                1.0
+            } else if tw.aim == Some(TargetRef::God(viewer)) {
+                4.0
+            } else if inside {
+                3.0
+            } else {
+                2.0
+            };
+            *slot = [tw.pos.x, tw.pos.z, TOWER_RANGE, state];
+        }
+        out
+    }
+
+    /// Is this cat stalking right now? Intent, minus a fight: attacking,
+    /// casting or being hit suspends it for STALK_BREAK_SECS. The intent is
+    /// left alone, so the cat settles back into the stalk when the fight is
+    /// over -- and gets its full speed back the instant one starts.
+    pub fn stalking(&self, i: usize) -> bool {
+        let g = &self.gods[i];
+        let b = crate::consts::STALK_BREAK_SECS;
+        g.sneak && self.t - g.last_dmg_t > b && self.t - g.last_act_t > b
+    }
+
+    /// How quietly this cat carries itself, `0..=1`, from every source.
+    ///
+    /// Deliberately not a key you hold. Stalking is balanced against
+    /// fighting by what it is tied to: intent that a fight interrupts, a
+    /// window some abilities grant (the fast low run before a pounce, at
+    /// full speed), and the way a badly hurt animal slinks.
+    pub fn quiet(&self, i: usize) -> f32 {
+        let g = &self.gods[i];
+        let mut q: f32 = 0.0;
+        if self.stalking(i) {
+            q = 1.0;
+        }
+        if g.hush_t > 0.0 {
+            q = q.max(0.9);
+        }
+        if g.hp < g.max_hp * crate::consts::WOUNDED_FRAC {
+            q = q.max(0.5);
+        }
+        q
+    }
+
     pub fn move_speed(&self, i: usize) -> f32 {
         let g = &self.gods[i];
         let def = self.def(i);
@@ -471,7 +581,8 @@ impl Game {
         // wading: the rivers are slow going unless you were born to them
         let depth = self.water_depth_now(g.pos.x, g.pos.z);
         let wade = if g.blessing_t > 0.0 || crate::wild::is_riverborn(def) { 1.0 } else { wade_speed_mul(depth) };
-        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul()
+        let stalk = if self.stalking(i) { crate::consts::SNEAK_SPEED } else { 1.0 };
+        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk
     }
 
     pub fn auto_interval(&self, i: usize) -> f32 {

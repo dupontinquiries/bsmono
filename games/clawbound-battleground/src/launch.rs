@@ -22,6 +22,13 @@ pub struct LaunchOptions {
     pub quick_match: bool,
     /// `--screenshot`: the windowless render harness.
     pub screenshot: bool,
+    /// `--lan`: open straight onto the LOCAL NETWORK screen. What bsgames
+    /// should launch with for a LAN session, and what the Xvfb check uses so
+    /// it does not have to guess where a button is.
+    pub lan: bool,
+    /// `--rig-sheet`: windowless close-ups of posed ancestors, through the
+    /// real draw path. Implies `screenshot`.
+    pub rig_sheet: bool,
     /// `--ancestor <name|id>`: pick this one (implies quick match).
     pub ancestor: Option<String>,
     pub handoff: Option<HandoffRole>,
@@ -39,6 +46,11 @@ impl LaunchOptions {
             match a.as_str() {
                 "--quick-match" => o.quick_match = true,
                 "--screenshot" => o.screenshot = true,
+                "--lan" => o.lan = true,
+                "--rig-sheet" => {
+                    o.rig_sheet = true;
+                    o.screenshot = true;
+                }
                 "--ancestor" => {
                     o.ancestor = it.next();
                     o.quick_match = true;

@@ -42,6 +42,7 @@ impl Game {
         // 4. movement
         self.move_gods(dt);
         self.move_minions(dt);
+        self.logs_tick(dt);
 
         // 5. auto-attacks
         self.god_autoattacks(dt);
@@ -113,16 +114,56 @@ impl Game {
         // checker will not allow reading `self.blockers` inside it. An Arc
         // clone is a refcount bump, not a copy of the grid.
         let blockers = self.blockers.clone();
+        // Leap requests. Refused silently when the cat cannot leap right
+        // now; the binding is a press, not a promise.
+        for (i, aim) in std::mem::take(&mut self.leap_queue) {
+            let Some(g) = self.gods.get_mut(i) else { continue };
+            if g.respawn_t > 0.0 || g.dash.is_some() || g.fall.is_some() {
+                continue;
+            }
+            // Bounding: from a perch, or buffered during a landing, the next
+            // leap needs no cooldown and barely a gather.
+            let landing = matches!(g.leap, Some(l) if l.phase == crate::leap::Phase::Land);
+            let chained = g.perch.is_some() || landing;
+            if (g.leap.is_some() && !landing) || (!chained && g.leap_cd > 0.0) {
+                continue;
+            }
+            let aim = if aim.length_squared() > 1e-4 { aim } else { Vec3::new(g.yaw.cos(), 0.0, g.yaw.sin()) };
+            if let Some(plan) = crate::leap::plan(g.pos, aim, g.perch, &blockers) {
+                g.yaw = (plan.to.z - g.pos.z).atan2(plan.to.x - g.pos.x);
+                g.leap = Some(crate::leap::LeapState::begin(g.pos, plan, chained));
+                g.perch = None;
+            }
+        }
         for i in 0..self.gods.len() {
             if self.gods[i].respawn_t > 0.0 {
+                // A cat that dies mid-leap respawns on the ground.
+                self.gods[i].leap = None;
+                self.gods[i].perch = None;
+                self.gods[i].fall = None;
                 continue;
             }
             let speed = self.move_speed(i);
             let dir = self.gods[i].move_dir;
             let yaw_cur = self.gods[i].yaw;
             let g = &mut self.gods[i];
-            // dash overrides
-            if let Some(d) = &mut g.dash {
+            g.leap_cd = (g.leap_cd - dt).max(0.0);
+            g.hush_t = (g.hush_t - dt).max(0.0);
+            // A dash (an ability) outranks a leap (a move).
+            if g.dash.is_some() {
+                g.leap = None;
+                g.perch = None;
+                g.fall = None;
+            }
+            if let Some(l) = &mut g.leap {
+                let (p, done) = l.tick(dt);
+                g.pos = p;
+                if done {
+                    g.perch = l.perch;
+                    g.leap = None;
+                    g.leap_cd = crate::leap::LEAP_COOLDOWN;
+                }
+            } else if let Some(d) = &mut g.dash {
                 d.t += dt;
                 let a = (d.t / d.dur).min(1.0);
                 g.pos = d.from.lerp(d.to, a) + Vec3::Y * (a * (1.0 - a) * 4.0 * 0.35);
@@ -132,7 +173,8 @@ impl Game {
                 }
                 g.walk_anim += dt * 12.0;
             } else if dir.length_squared() > 0.0001 {
-                g.pos += dir.normalize() * speed * dt;
+                let on_ridge = g.perch.is_some() && g.perch_narrow;
+                g.pos += dir.normalize() * speed * if on_ridge { crate::leap::NARROW_SPEED } else { 1.0 } * dt;
                 let want = dir.z.atan2(dir.x);
                 let mut d = want - yaw_cur;
                 while d > std::f32::consts::PI {
@@ -154,8 +196,73 @@ impl Game {
             // obstacles -- `resolve_at` skips blockers topping out below the
             // given height, which is what stops a leap over a boulder being
             // yanked sideways mid-flight.
-            let feet = if g.dash.is_some() { g.pos.y } else { f32::NEG_INFINITY };
+            let feet = match (&g.leap, g.perch) {
+                (Some(l), _) => l.feet_y(g.pos.y),
+                // Standing on a prop: that prop is below the feet, so it
+                // does not push; its taller neighbours still do.
+                (None, Some(top)) => top,
+                // Falling: what is below the paws does not push, so a cat
+                // drops past a wall's top and is only then shouldered clear.
+                _ if g.dash.is_some() || g.fall.is_some() => g.pos.y,
+                _ => f32::NEG_INFINITY,
+            };
             g.pos = blockers.resolve_at(g.pos, GOD_RADIUS, feet);
+            // Perch upkeep: still over the thing we are standing on?
+            if let Some(top) = g.perch {
+                use crate::leap::{Fall, KNOCK_OFF_FRAC};
+                // Which way a cat goes over is not a choice it gets; derive
+                // it from state so replays agree.
+                let sign = if (g.hp as i32 + i as i32) % 2 == 0 { 1.0 } else { -1.0 };
+                match blockers.standing_on(g.pos.x, g.pos.z, top) {
+                    Some(kind) => {
+                        g.pos.y = top;
+                        g.perch_narrow = kind == crate::blockers::Perch::Narrow;
+                        // A ridge is a strong place to stand and a poor one
+                        // to be hit: a solid blow takes the footing. The cat
+                        // goes over on its back -- and lands on its feet.
+                        if g.perch_narrow && g.perch_hp - g.hp > KNOCK_OFF_FRAC * g.max_hp {
+                            let side = Vec3::new(-g.yaw.sin(), 0.0, g.yaw.cos()) * sign;
+                            g.pos += side * 0.6;
+                            g.perch = None;
+                            g.fall = Some(Fall::new(top, sign * 2.4));
+                        }
+                    }
+                    None => {
+                        // Off the edge. Walked: a hop down, upright all the
+                        // way. Dragged or shoved with no input: a tumble.
+                        let meant_it = g.move_dir.length_squared() > 0.01;
+                        g.perch = None;
+                        g.fall = Some(Fall::new(top, if meant_it { 0.0 } else { sign * 1.5 }));
+                    }
+                }
+            }
+            g.perch_hp = g.hp;
+            if g.perch.is_none() && g.leap.is_none() && g.dash.is_none() {
+                if g.pos.y > 0.0 && g.fall.is_none() {
+                    g.fall = Some(crate::leap::Fall::new(g.pos.y, 0.0)); // e.g. a dash that ended in the air
+                }
+                if let Some(f) = &mut g.fall {
+                    let y0 = g.pos.y;
+                    let y1 = f.tick(y0, dt);
+                    // Whatever standable thing is under the paws catches
+                    // the fall: the rock below the wall, not the floor
+                    // below the rock.
+                    // ...and strictly BELOW where the fall began. Without
+                    // that, a cat knocked off a ridge "lands" back on it in
+                    // the same tick: a shove of 0.6 u does not clear a wall
+                    // 0.9 u in radius, and the integration test said so.
+                    let from_y = f.from_y;
+                    let under = blockers.landing_under(g.pos.x, g.pos.z, y0).filter(|u| u.0 < from_y - 0.05);
+                    let floor = under.map_or(0.0, |u| u.0);
+                    if y1 <= floor {
+                        g.pos.y = floor;
+                        g.leap = Some(crate::leap::LeapState::landing(g.pos, under, (f.from_y - floor).max(0.0)));
+                        g.fall = None;
+                    } else {
+                        g.pos.y = y1;
+                    }
+                }
+            }
 
             // arena bounds
             let r = Vec3::new(g.pos.x, 0.0, g.pos.z).length();
@@ -323,9 +430,11 @@ impl Game {
             let (pen_pct, pen_flat) = (self.gods[i].pen_pct, self.gods[i].pen_flat);
             let team = self.gods[i].team;
             let from = self.gods[i].pos + Vec3::Y * 1.4;
+            let now_t = self.t;
             let g = &mut self.gods[i];
             g.atk_timer = interval;
             g.atk_anim = 1.0;
+            g.last_act_t = now_t;
             match def.auto {
                 AutoKind::Melee => {
                     let to = self.target_pos(target.unwrap());
@@ -514,6 +623,7 @@ impl Game {
             }
             // timers
             let atk_timer_next = self.towers[ti].atk_timer - dt;
+            self.towers[ti].aim = target;
             let fire_anim_next = (self.towers[ti].fire_anim - dt * 3.0).max(0.0);
             if atk_timer_next > 0.0 || target.is_none() {
                 let tw = &mut self.towers[ti];
@@ -542,6 +652,13 @@ impl Game {
             tw.fire_anim = 1.0;
             tw.ramp = new_ramp;
             tw.last_target = target;
+            // Applied as it fires rather than on impact: the bolt has no flag to
+            // carry it, and at 34 u/s over <= 24 u it lands a moment later.
+            if let Some(TargetRef::God(gi)) = target {
+                let g = &mut self.gods[gi];
+                g.slow = g.slow.max(TOWER_SLOW);
+                g.slow_t = g.slow_t.max(TOWER_SLOW_SECS);
+            }
             self.projectiles.push(Projectile {
                 team: tteam,
                 pos: from,
@@ -646,8 +763,8 @@ impl Game {
             for gi in 0..self.gods.len() {
                 let g = &self.gods[gi];
                 if g.team != p.team && g.respawn_t <= 0.0 {
-                    let c = g.pos + Vec3::Y * 1.1;
-                    if (c - p.pos).length() < p.radius + 0.85 {
+                    // The body, not a ball over the feet: see `hitbox`.
+                    if crate::hitbox::cat(g.pos, g.yaw, g.sneak && g.hush_t <= 0.0).hit_by_moving_sphere(p.pos - p.vel * dt, p.pos, p.radius + 0.2) {
                         hit = Some(TargetRef::God(gi));
                         break;
                     }
@@ -657,8 +774,7 @@ impl Game {
                 for mi in 0..self.minions.len() {
                     let m = &self.minions[mi];
                     if m.team != p.team {
-                        let c = m.pos + Vec3::Y * 0.7;
-                        if (c - p.pos).length() < p.radius + 0.6 {
+                        if crate::hitbox::minion(m.pos, m.yaw).hit_by_moving_sphere(p.pos - p.vel * dt, p.pos, p.radius + 0.2) {
                             hit = Some(TargetRef::Minion(mi));
                             break;
                         }
@@ -720,7 +836,7 @@ impl Game {
         let mut hits: Vec<TargetRef> = Vec::new();
         for gi in 0..self.gods.len() {
             let g = &self.gods[gi];
-            if g.team != team && g.respawn_t <= 0.0 && g.pos.distance(center) <= radius + 0.7 {
+            if g.team != team && g.respawn_t <= 0.0 && crate::hitbox::cat(g.pos, g.yaw, false).in_disc(center, radius + 0.2) {
                 hits.push(TargetRef::God(gi));
             }
         }

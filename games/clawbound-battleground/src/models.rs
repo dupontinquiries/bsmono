@@ -39,9 +39,100 @@ pub fn god_palette(def: &GodDef, team: Team) -> [[f32; 3]; 4] {
 pub const GV: f32 = 0.05;
 /// Cube edge used when drawing ancestor meshes.
 pub const GOD_DRAW_VOXEL: f32 = 0.055;
-const H: i32 = 42; // grid height in voxels
+// Grid: 30 x 50 x 56, body centred at (CX, _, CZ). It was 30 x 42 x 48, which
+// silently clipped two things `Grid::set` drops without a word: the antlers
+// above y = 41 (Stillsmoke lost the top four voxels of each beam) and the
+// tail tip below z = 0. `cz` stays at nz / 2 so the mesh origin is unmoved.
+const H: i32 = 50;
+const NZ: usize = 56;
+const CX: i32 = 15;
+const CZ: i32 = 28;
+
+fn role_bulk(role: Role) -> i32 {
+    match role {
+        Role::Guardian => 2,
+        Role::Warrior => 1,
+        Role::Mage | Role::Hunter => 0,
+        Role::Assassin => -1,
+    }
+}
 
 pub fn build_god(def: &GodDef, team: Team) -> VoxelMesh {
+    god_grid(def, team).mesh(GV, true)
+}
+
+/// An ancestor cut into posable parts, with the rig that poses them.
+pub struct RiggedGod {
+    pub meshes: [VoxelMesh; crate::rigged::SLOTS],
+    pub rig: crate::rigged::QuadRig,
+}
+
+pub fn build_god_rigged(def: &GodDef, team: Team) -> RiggedGod {
+    let bulk = role_bulk(def.role);
+    let plan = feline_cut_plan(bulk, matches!(def.pelt, PeltKind::Antlers));
+    RiggedGod { meshes: plan.cut(&god_grid(def, team), GV), rig: feline_rig(bulk) }
+}
+
+/// Leg column geometry shared by the authoring, the cut and the rig, so the
+/// three cannot disagree about where a leg is.
+/// Returns `(x, z, half_thickness)` per leg in `[FL, FR, HL, HR]` order.
+/// The model faces +Z, which makes its LEFT side +X.
+fn leg_columns(bulk: i32) -> [(i32, i32, i32); 4] {
+    let lt = 1 + (bulk > 0) as i32;
+    let lx = 5 + bulk.max(0);
+    [(CX + lx, CZ + 11, lt), (CX - lx, CZ + 11, lt), (CX + lx, CZ - 10, lt), (CX - lx, CZ - 10, lt)]
+}
+/// Legs are authored 0..=LEG_TOP; the belly starts a little above CUT_Y.
+const LEG_TOP: i32 = 19;
+const LEG_CUT_Y: i32 = 14;
+
+pub fn feline_cut_plan(bulk: i32, antlers: bool) -> crate::rigged::CutPlan {
+    use crate::rigged::{Region, Slot, LEG_SLOTS, TAIL_SLOTS};
+    let mut regions = Vec::new();
+    for (i, (x, z, lt)) in leg_columns(bulk).into_iter().enumerate() {
+        let (x0, x1, z0, z1) = (x - lt - 1, x + lt + 1, z - lt - 1, z + lt + 3);
+        regions.push(Region { slot: LEG_SLOTS[i], min: [x0, 0, z0], max: [x1, LEG_CUT_Y, z1], exclusive: true });
+        // The shoulder: in the leg AND the torso, so neither shows a stump.
+        regions.push(Region { slot: LEG_SLOTS[i], min: [x0, LEG_CUT_Y + 1, z0], max: [x1, LEG_TOP, z1], exclusive: false });
+    }
+    regions.push(Region { slot: Slot::Head, min: [0, 18, CZ + 17], max: [29, H - 1, NZ as i32 - 1], exclusive: true });
+    regions.push(Region { slot: Slot::Head, min: [0, 22, CZ + 14], max: [29, H - 1, CZ + 16], exclusive: false });
+    if antlers {
+        // The beams sweep BACK past the head cut; without this the head
+        // turns and leaves half its antlers behind.
+        regions.push(Region { slot: Slot::Head, min: [0, 36, CZ + 10], max: [29, H - 1, CZ + 16], exclusive: true });
+    }
+    // Tail: four bands matching the rig's four chain segments. The first
+    // voxels of the tail stay buried in the rump as torso.
+    // The authored tail runs z = CZ-17 .. CZ-25 with a 1.6 radius, and the
+    // rump covers it down to CZ-18, so eight voxels show: two per segment.
+    let bands = [(CZ - 20, CZ - 19), (CZ - 22, CZ - 21), (CZ - 24, CZ - 23), (0, CZ - 25)];
+    for (k, (z0, z1)) in bands.into_iter().enumerate() {
+        regions.push(Region { slot: TAIL_SLOTS[k], min: [0, 18, z0], max: [29, H - 1, z1], exclusive: true });
+    }
+    crate::rigged::CutPlan { regions }
+}
+
+pub fn feline_rig(bulk: i32) -> crate::rigged::QuadRig {
+    // voxel -> rig frame (X forward, Y up, Z right; model left is +X).
+    const BODY_Y: f32 = 24.0;
+    let at = |x: f32, y: f32, z: f32| [(z - CZ as f32) * GV, (y - BODY_Y) * GV, -(x - CX as f32) * GV];
+    let cols = leg_columns(bulk);
+    let leg = |i: usize| {
+        let (x, z, lt) = cols[i];
+        let top = LEG_TOP as f32 + 1.0;
+        (at(x as f32 + 0.5, top * 0.5, z as f32 + 0.5), [(lt as f32 + 1.5) * GV, top * 0.5 * GV, (lt as f32 + 0.5) * GV])
+    };
+    crate::rigged::QuadRig::new(
+        glam::Vec3::new(0.0, BODY_Y * GV, 0.0),
+        [18.0 * GV, 7.5 * GV, (7.0 + bulk as f32) * GV],
+        leg(0), leg(1), leg(2), leg(3),
+        (at(CX as f32, 32.5, CZ as f32 + 21.5), [5.5 * GV, 5.0 * GV, 5.0 * GV]),
+        (at(CX as f32, 27.0, CZ as f32 - 22.5), [4.0 * GV, 1.5 * GV, 1.5 * GV]),
+    )
+}
+
+fn god_grid(def: &GodDef, team: Team) -> Grid {
     let pal = god_palette(def, team);
     let pelt = pal[PAL_BODY];
     let collar = pal[PAL_CLOTH];
@@ -49,30 +140,20 @@ pub fn build_god(def: &GodDef, team: Team) -> VoxelMesh {
     let accent = pal[PAL_ACCENT];
     let dark = mix(pelt, [0.05, 0.04, 0.05], 0.7);
 
-    let bulk: i32 = match def.role {
-        Role::Guardian => 2,
-        Role::Warrior => 1,
-        Role::Mage => 0,
-        Role::Hunter => 0,
-        Role::Assassin => -1,
-    };
+    let bulk = role_bulk(def.role);
     let bf = bulk as f32;
     let crag = matches!(def.pelt, PeltKind::Crag);
     let extra = if crag { 1.0 } else { 0.0 };
 
-    let mut g = Grid::new(30, H as usize, 48);
-    let cx = 15;
-    let cz = 24;
+    let mut g = Grid::new(30, H as usize, NZ);
+    let cx = CX;
+    let cz = CZ;
     let (cxf, czf) = (cx as f32, cz as f32);
 
     // ── legs + paws (y 0..18) ────────────────────────────────────────────
-    let lt = 1 + (bulk > 0) as i32; // half-thickness
-    let lx = 5 + bulk.max(0);
     let leg_col = solid(mix(pelt, dark, 0.15));
-    for (sx, sz) in [(-1, 11), (1, 11), (-1, -10), (1, -10)] {
-        let x = cx + sx * lx;
-        let z = cz + sz;
-        g.filled_box(x - lt, 0, z - lt - 1, x + lt, 19, z + lt + 1, leg_col);
+    for (x, z, lt) in leg_columns(bulk) {
+        g.filled_box(x - lt, 0, z - lt - 1, x + lt, LEG_TOP, z + lt + 1, leg_col);
         // paw: wider, flatter, secondary-toned toes
         g.filled_box(x - lt - 1, 0, z - lt - 1, x + lt + 1, 2, z + lt + 3, solid(mix(pelt, second, 0.35)));
         for tx in -1..=1 {
@@ -237,12 +318,98 @@ pub fn build_god(def: &GodDef, team: Team) -> VoxelMesh {
     }
 
     // team war-paint: a band on the front legs
-    for sx in [-1i32, 1] {
-        let x = cx + sx * lx;
-        g.filled_box(x - lt - 1, 9, cz + 11 - lt - 1, x + lt + 1, 10, cz + 11 + lt + 1, solid(team.rgb()));
+    for (x, z, lt) in &leg_columns(bulk)[0..2] {
+        g.filled_box(x - lt - 1, 9, z - lt - 1, x + lt + 1, 10, z + lt + 1, solid(team.rgb()));
     }
 
-    g.mesh(GV, true)
+    g
+}
+
+#[cfg(test)]
+mod rig_tests {
+    use super::*;
+    use crate::gods::ROSTER;
+    use crate::rigged::{Slot, SLOTS};
+
+    /// Every ancestor, both teams: no slot empty, and the cut loses no
+    /// voxel. An empty slot draws a cat with a missing leg; a lost voxel is
+    /// a hole that only shows in one pose.
+    #[test]
+    fn every_ancestor_cuts_into_ten_nonempty_parts_and_loses_nothing() {
+        assert_eq!(ROSTER.len(), 13);
+        for def in ROSTER.iter() {
+            let grid = god_grid(def, Team::Blue);
+            let plan = feline_cut_plan(role_bulk(def.role), matches!(def.pelt, PeltKind::Antlers));
+            let parts = plan.cut(&grid, GV);
+            for (i, m) in parts.iter().enumerate() {
+                assert!(m.inst.len() >= 8, "{}: slot {i} has {} voxels", def.name, m.inst.len());
+            }
+            let mut filled = 0usize;
+            for z in 0..grid.nz as i32 {
+                for y in 0..grid.ny as i32 {
+                    for x in 0..grid.nx as i32 {
+                        if grid.get(x, y, z).is_some() {
+                            filled += 1;
+                            let owners = (0..SLOTS).filter(|s| plan.in_slot(slot(*s), x, y, z)).count();
+                            assert!(owners >= 1, "{}: voxel ({x},{y},{z}) belongs to no part", def.name);
+                        }
+                    }
+                }
+            }
+            assert!(filled > 5000, "{}: only {filled} voxels -- did the grid build?", def.name);
+            // Hull culling should more than pay for the duplicated joints.
+            let cut_total: usize = parts.iter().map(|m| m.inst.len()).sum();
+            assert!(cut_total < filled, "{}: cut {cut_total} vs solid {filled}", def.name);
+        }
+    }
+
+    fn slot(i: usize) -> Slot {
+        [Slot::Torso, Slot::LegFL, Slot::LegFR, Slot::LegHL, Slot::LegHR, Slot::Head, Slot::Tail0, Slot::Tail1, Slot::Tail2, Slot::Tail3][i]
+    }
+
+    /// The legs the cut plan carves and the legs the rig pivots must be the
+    /// same legs: the hip sits on the column's axis at the top of the box,
+    /// and the soles are on the floor.
+    #[test]
+    fn rig_hips_sit_on_the_authored_leg_columns() {
+        for bulk in [-1, 0, 1, 2] {
+            let rig = feline_rig(bulk);
+            let cols = leg_columns(bulk);
+            for i in 0..4 {
+                let hip = rig.hip(i);
+                let world_y = rig.body_centre.y + hip[1];
+                assert!((world_y - (LEG_TOP as f32 + 1.0) * GV).abs() < 1e-4, "hip {i} at y {world_y}");
+                assert!((rig.body_centre.y + rig.sole(i)).abs() < 1e-4, "sole {i} is not on the floor");
+                // FL/HL are LEFT: rig z < 0, model x > CX.
+                assert_eq!(hip[2] < 0.0, cols[i].0 > CX, "leg {i} is on the wrong side");
+                assert_eq!(hip[0] > 0.0, i < 2, "leg {i} is at the wrong end");
+            }
+            let ph = crate::anim::Gait::Walk.leg_phases();
+            assert_eq!(ph.len(), rig.parts().iter().filter(|p| p.role == creature_rig::Role::Leg).count());
+        }
+    }
+
+    /// The grid used to clip the antlers at y = 41 and the tail at z = 0.
+    #[test]
+    fn nothing_is_authored_against_the_grid_wall() {
+        for def in ROSTER.iter() {
+            let g = god_grid(def, Team::Red);
+            let mut top = 0;
+            let mut back = i32::MAX;
+            for z in 0..g.nz as i32 {
+                for y in 0..g.ny as i32 {
+                    for x in 0..g.nx as i32 {
+                        if g.get(x, y, z).is_some() {
+                            top = top.max(y);
+                            back = back.min(z);
+                        }
+                    }
+                }
+            }
+            assert!(top < g.ny as i32 - 1, "{}: touches the ceiling at y {top}", def.name);
+            assert!(back > 0, "{}: touches the back wall", def.name);
+        }
+    }
 }
 
 /// Recolour existing *surface* voxels (any with an empty neighbour) where

@@ -16,7 +16,25 @@ pub mod voxel;
 pub mod models;
 pub mod props;
 pub mod blockers;
+/// The state behind the LAN screen (discovery is `netcode::lan`).
+pub mod lanlobby;
+/// Input-only lockstep: the rule that lets two machines play one match.
+pub mod lockstep;
+/// Oriented capsule hit tests for the cats.
+pub mod hitbox;
+/// The river crossings: fallen logs that can be worked loose and roll.
+pub mod logs;
+/// The authored centre of the map: the Hollow and the two screened Runs.
+pub mod midjungle;
+/// The surface an AI authors a map through: digests in, refusals in words.
+pub mod mapgen;
 pub mod anim;
+/// Cut a voxel body into posable parts; posed rig -> per-part matrices.
+pub mod rigged;
+/// What a cat's body does about roots, ferns, rivers, leaps and fights.
+pub mod puppet;
+/// The aimed leap: onto rocks and logs, chained from perch to perch.
+pub mod leap;
 pub mod camps;
 /// Clan border markers: placed, refreshed on patrol, and lasting days rather
 /// than minutes. The half of the scent system wildkit does not cover, because
@@ -50,6 +68,10 @@ pub mod systems;
 pub mod abilities;
 pub mod ai;
 pub mod vfx;
+/// Per-ancestor elemental motifs thrown on every cast.
+pub mod signature;
+/// Blast fronts, ground cracks that heal in rain, the fitted shadow box.
+pub mod groundfx;
 pub mod render;
 pub mod scene;
 pub mod ui;

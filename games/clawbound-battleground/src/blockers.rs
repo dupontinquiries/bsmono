@@ -55,7 +55,7 @@ impl Shape {
     /// Collapsing both variants to (axis point, radius) is what keeps
     /// [`Blockers::resolve`] from branching per shape: a circle is just a
     /// segment whose endpoints coincide.
-    fn nearest_axis(&self, px: f32, pz: f32) -> (f32, f32, f32) {
+    pub fn nearest_axis(&self, px: f32, pz: f32) -> (f32, f32, f32) {
         match *self {
             Shape::Circle { x, z, r } => (x, z, r),
             Shape::Segment { x0, z0, x1, z1, r } => {
@@ -232,8 +232,12 @@ impl PropKind {
 
             // Long things: radius here is the capsule's thickness; the length
             // comes from the placement, which is why these are Segments.
-            RuinWall => Footprint::solid(0.70, 3.0),
-            FallenLog => Footprint::solid(0.60, 0.9),
+            // Measured from the meshes, which are 0.6 u/voxel: the wall's arms
+            // are three voxels thick and five high, and the "log" is a fallen
+            // jungle giant 4 u across and 3.3 u to the top of its moss. These
+            // read 0.70/3.0 and 0.60/0.9 -- voxel counts taken for world units.
+            RuinWall => Footprint::solid(0.90, 3.0),
+            FallenLog => Footprint::solid(1.90, 3.3),
             Bridge => Footprint::passable(),
             AqueductArch => Footprint::solid(1.20, 7.0),
             // An arch is a doorway. Blocking its centre would wall off the
@@ -260,6 +264,67 @@ impl PropKind {
     }
 }
 
+/// Can a cat STAND on top of this, and how much room is there?
+///
+/// A property of the prop, not of its height. The first leap used
+/// `top <= 2.4` as the test, which was wrong twice: it called a ruin wall
+/// unreachable when a cat clears five times its own shoulder height from a
+/// standstill, and it would have called a young pine a platform, because a
+/// tree's blocker `top` is how high it BLOCKS, not a surface. Whether there
+/// is somewhere to put four paws is a fact about the thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Perch {
+    /// Nowhere to stand: trunks, flames, crystal points, team structures.
+    #[default]
+    None,
+    /// Room to stand and turn: a boulder, a carved head.
+    Flat,
+    /// A ridge a body wide: a wall top, a log, the cap of a pillar. A cat
+    /// walks these without thinking about it; what it costs them is that a
+    /// solid hit takes their footing (see `leap`).
+    Narrow,
+}
+
+impl PropKind {
+    pub const fn perch(self) -> Perch {
+        use PropKind::*;
+        match self {
+            // The log is here and not below: it is a fallen jungle giant 4 u
+            // across. The rig sheet asked the scene for a ridge, was handed a
+            // log, and the picture made the mistake obvious.
+            Rock | BoulderCluster | StoneHead | ColossusHead | FallenLog => Perch::Flat,
+            RuinWall | RuinPillar => Perch::Narrow,
+            // Trees block up to a height; they do not END there.
+            Pine | Oak | JungleTree | Palm | StranglerFig | Bamboo | MegaTree => Perch::None,
+            // Fire, points, and the things each team is there to defend: a
+            // cat on the enemy gate is a balance problem, not a vista.
+            Brazier | Crystal | BaseGate | Fountain | TitanPedestal | Ziggurat | AqueductArch => Perch::None,
+            Bridge | RuinArch | Bush | Fern | VineCurtain | LanePad => Perch::None,
+        }
+    }
+}
+
+/// A hump a cat climbs OVER rather than walks around: a buttress root, a low
+/// slab. It never pushes anyone — `resolve` does not see it — it only answers
+/// "how high is the thing under this paw", which is `puppet::Probe::step_top`.
+///
+/// Why this is not a `Blocker` with a flag: a blocker's job is to say no to
+/// movement, and every consumer of `all` (collision, sight lines, the AI's
+/// `blocked`) would have had to learn to skip the flag. Jungle-tree roots
+/// reach 4.8 u from a trunk whose collision radius is 0.9 u; making them
+/// solid turns every tree into a plus-shaped trap for a bot that paths by
+/// push-out. Making them walkable changes nothing about where anyone can go.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Step {
+    pub shape: Shape,
+    /// Height of the crest above `base_y`.
+    pub top: f32,
+    pub base_y: f32,
+}
+
+/// Taller than this and a cat does not scramble over it, it leaps.
+pub const SCRAMBLE_MAX: f32 = 2.0;
+
 /// A uniform grid of blockers.
 ///
 /// Built once at world construction and queried every movement tick for every
@@ -268,6 +333,12 @@ impl PropKind {
 /// the handful of cells the unit's own radius overlaps.
 #[derive(Debug, Clone, Default)]
 pub struct Blockers {
+    /// Walkable humps standing on the terrain. See [`Step`].
+    steps: Vec<Step>,
+    /// Parallel to `all`. Kept beside it rather than inside `Blocker` so a
+    /// hand-built blocker (the arena rim, every test double) is unstandable
+    /// by default instead of having to say so.
+    perches: Vec<Perch>,
     all: Vec<Blocker>,
     /// cell index -> indices into `all`.
     cells: Vec<Vec<u32>>,
@@ -284,6 +355,8 @@ impl Blockers {
         let cell = cell.max(1.0);
         let dim = ((half_extent * 2.0 / cell).ceil() as i32).max(1);
         Blockers {
+            steps: Vec::new(),
+            perches: Vec::new(),
             all: Vec::new(),
             cells: vec![Vec::new(); (dim * dim) as usize],
             cell,
@@ -305,7 +378,11 @@ impl Blockers {
     fn cell_of(&self, x: f32, z: f32) -> (i32, i32) {
         let gx = ((x + self.half_extent) / self.cell).floor() as i32;
         let gz = ((z + self.half_extent) / self.cell).floor() as i32;
-        (gx.clamp(0, self.dim - 1), gz.clamp(0, self.dim - 1))
+        // `dim` is 0 for a default-constructed set (a Game nobody has handed a
+        // scene's blockers to: every headless match, every server). `clamp`
+        // PANICS when min > max, so the first leap in such a game killed it.
+        let hi = (self.dim - 1).max(0);
+        (gx.clamp(0, hi), gz.clamp(0, hi))
     }
 
     /// Add a blocker, registering it in every cell its bounds touch.
@@ -320,6 +397,7 @@ impl Blockers {
             }
         }
         self.all.push(b);
+        self.perches.push(Perch::None);
     }
 
     /// Add a prop's blocker, if it has one.
@@ -350,7 +428,61 @@ impl Blockers {
                 amount: f.conceal,
             },
         });
+        if solid {
+            *self.perches.last_mut().expect("just pushed") = kind.perch();
+        }
         solid
+    }
+
+    /// Register a walkable hump. Anything taller than [`SCRAMBLE_MAX`] is
+    /// refused: it would lift a cat clean off the ground by walking.
+    pub fn push_step(&mut self, shape: Shape, base_y: f32, top: f32) -> bool {
+        if !(top > 0.0 && top <= SCRAMBLE_MAX) {
+            return false;
+        }
+        self.steps.push(Step { shape, top, base_y });
+        true
+    }
+
+    /// The outer buttress roots of a jungle tree at `(x, z)`.
+    ///
+    /// Mirrors `props::jungle_tree`: four roots at `variant * 0.9 + 0.4 +
+    /// k * 90°`, boxes three voxels wide at 0.6 u/voxel. Only the outer two
+    /// boxes of each root are low enough (1.8 u) to scramble; the inner three
+    /// are 2.4 u and up and are still ghost geometry — see TODO.md. A
+    /// placement's quarter-turn maps the four directions onto themselves, so
+    /// it does not need to be known here.
+    pub fn push_jungle_roots(&mut self, x: f32, z: f32, base_y: f32, variant: i32) -> usize {
+        const VOX: f32 = 0.6;
+        let mut n = 0;
+        for k in 0..4 {
+            let a = variant as f32 * 0.9 + k as f32 * std::f32::consts::FRAC_PI_2 + 0.4;
+            let (dx, dz) = (a.cos(), a.sin());
+            // boxes i = 3, 4 of the mesh: centres at 6.65 and 8.0 voxels.
+            let (r0, r1) = (6.65 * VOX, 8.0 * VOX);
+            let shape = Shape::Segment { x0: x + dx * r0, z0: z + dz * r0, x1: x + dx * r1, z1: z + dz * r1, r: 1.5 * VOX };
+            n += self.push_step(shape, base_y, 3.0 * VOX) as usize;
+        }
+        n
+    }
+
+    /// World Y of the highest hump under `(x, z)`, if any. Rounded off
+    /// toward the rim so a paw rises onto it instead of snapping.
+    pub fn step_top(&self, x: f32, z: f32) -> Option<f32> {
+        let mut best: Option<f32> = None;
+        for s in &self.steps {
+            let (ax, az, br) = s.shape.nearest_axis(x, z);
+            let d2 = (x - ax) * (x - ax) + (z - az) * (z - az);
+            if br > 0.0 && d2 < br * br {
+                let h = s.base_y + s.top * (1.0 - d2 / (br * br)).sqrt();
+                best = Some(best.map_or(h, |b| b.max(h)));
+            }
+        }
+        best
+    }
+
+    pub fn steps(&self) -> &[Step] {
+        &self.steps
     }
 
     /// Add a long prop as a capsule between two points.
@@ -376,11 +508,109 @@ impl Blockers {
             // than guessing a midpoint.
             cover: Cover::NONE,
         });
+        *self.perches.last_mut().expect("just pushed") = kind.perch();
         true
+    }
+
+    /// The spine(s) of a long prop in its mesh's own frame, as
+    /// `(x0, z0, x1, z1)`, before the placement's quarter turns.
+    ///
+    /// From `props::fallen_log` (an ellipsoid 11*s voxels either way along
+    /// x) and `props::ruin_wall` (an L: one arm along x at the grid's z
+    /// edge, one along z at its x edge). `long_props_cover_their_meshes`
+    /// holds these against the real voxels.
+    pub fn long_spines(kind: PropKind, s: f32) -> Vec<(f32, f32, f32, f32)> {
+        let r = kind.footprint().radius;
+        match kind {
+            PropKind::FallenLog => vec![(-6.6 * s + r, 0.0, 6.6 * s - r, 0.0)],
+            PropKind::RuinWall => vec![(-7.2 + r, -5.1, 4.8 - r, -5.1), (-6.3, -4.2 + r, -6.3, 3.6 - r)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Place a prop. Long props become capsules along their real spines;
+    /// everything else is `push_prop`.
+    ///
+    /// This is what the scene's placement macros call. They used to call
+    /// `push_prop` for everything, so `push_segment` had no callers and every
+    /// wall and log in the arena collided as one small disc at its midpoint.
+    pub fn push_placed(&mut self, kind: PropKind, x: f32, z: f32, ground_y: f32, quarter: u8, s: f32) -> bool {
+        let spines = Self::long_spines(kind, s);
+        if spines.is_empty() {
+            return self.push_prop(kind, x, z, ground_y, 1.0);
+        }
+        let turn = |mut px: f32, mut pz: f32| {
+            // the same quarter turn `voxel::merge_xform` gives the mesh
+            for _ in 0..(quarter % 4) {
+                (px, pz) = (pz, -px);
+            }
+            (x + px, z + pz)
+        };
+        for (x0, z0, x1, z1) in spines {
+            let (a, b) = (turn(x0, z0), turn(x1, z1));
+            self.push_segment(kind, a.0, a.1, b.0, b.1, ground_y, 1.0);
+        }
+        true
+    }
+
+    /// The nearest LIGHT stem within `within` of `(x, z)`: a prop that hides
+    /// and does not block -- fern, bush, hanging vine. These are what a
+    /// stalking cat goes round and a running one goes through
+    /// (`puppet::Probe::stem`). Concealment is flat across a cover disc, so
+    /// the stem cannot be recovered from `concealment_at`; it has to be asked
+    /// for.
+    pub fn nearest_stem(&self, x: f32, z: f32, within: f32) -> Option<(f32, f32)> {
+        let mut scratch = Vec::new();
+        self.near(x, z, within, &mut scratch);
+        scratch
+            .iter()
+            .map(|&i| &self.all[i as usize])
+            .filter(|b| b.top == f32::NEG_INFINITY && b.cover.amount > 0.0)
+            .map(|b| (b.cover.x, b.cover.z, (b.cover.x - x).hypot(b.cover.z - z)))
+            .filter(|s| s.2 < within)
+            .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|s| (s.0, s.1))
+    }
+
+    /// Every blocker with whether it can be stood on.
+    pub fn with_perch(&self) -> impl Iterator<Item = (&Blocker, Perch)> {
+        self.all.iter().zip(self.perches.iter().copied())
+    }
+
+    /// What is a cat at `(x, z)` with its paws at height `y` standing on?
+    /// `None` when there is nothing under it at that height.
+    pub fn standing_on(&self, x: f32, z: f32, y: f32) -> Option<Perch> {
+        self.with_perch()
+            .filter(|(b, p)| *p != Perch::None && (b.top - y).abs() < 0.08)
+            .find(|(b, _)| {
+                let (ax, az, r) = b.shape.nearest_axis(x, z);
+                (x - ax).hypot(z - az) < r + 0.15
+            })
+            .map(|(_, p)| p)
+    }
+
+    /// The highest standable top under `(x, z)` that is at or below `y`.
+    /// What a FALLING cat lands on: the rock under the wall, not the floor
+    /// under the rock.
+    pub fn landing_under(&self, x: f32, z: f32, y: f32) -> Option<(f32, Perch)> {
+        self.with_perch()
+            .filter(|(b, p)| *p != Perch::None && b.top <= y + 1e-3)
+            .filter(|(b, _)| {
+                let (ax, az, r) = b.shape.nearest_axis(x, z);
+                (x - ax).hypot(z - az) < r
+            })
+            .map(|(b, p)| (b.top, p))
+            .fold(None, |best: Option<(f32, Perch)>, c| if best.map_or(true, |b| c.0 > b.0) { Some(c) } else { best })
     }
 
     /// Candidate blocker indices near `(x, z)` within `pad`.
     fn near(&self, x: f32, z: f32, pad: f32, out: &mut Vec<u32>) {
+        // An empty grid has no cells to look in. Guarded HERE, at the one door
+        // every query comes through, rather than at each place it used to crash.
+        if self.cells.is_empty() {
+            out.clear();
+            return;
+        }
         out.clear();
         let (x0, z0) = self.cell_of(x - pad, z - pad);
         let (x1, z1) = self.cell_of(x + pad, z + pad);
@@ -470,7 +700,21 @@ impl Blockers {
         self.near(x, z, self.cell * 2.0, &mut scratch);
         let mut best = 0.0f32;
         for &i in &scratch {
-            let c = self.all[i as usize].cover;
+            let b = &self.all[i as usize];
+            // A solid thing hides whatever is inside its footprint, whatever
+            // its SHAPE. Only the cover disc used to be consulted, and
+            // `push_segment` leaves that empty on the stated theory that a
+            // wall's own footprint does the hiding -- which nothing here ever
+            // checked. So when walls and logs became capsules (3e4574e4e)
+            // they also became transparent. The mid-jungle's screen test is
+            // what noticed.
+            if b.top > f32::NEG_INFINITY {
+                let (ax, az, r) = b.shape.nearest_axis(x, z);
+                if (x - ax).hypot(z - az) < r {
+                    return 1.0;
+                }
+            }
+            let c = b.cover;
             if c.amount <= 0.0 {
                 continue;
             }
@@ -498,8 +742,13 @@ impl Blockers {
         if len < 1e-4 {
             return self.concealment_at(a.0, a.1);
         }
-        let step = (self.cell * 0.5).max(0.25);
-        let n = ((len / step).ceil() as usize).clamp(1, 512);
+        // A fixed fine step. This was `cell * 0.5` -- 3 u on the scene's 6 u
+        // grid -- which is wider than most props: a ray straight across a
+        // 1.8 u wall could land a sample either side of it and report a clear
+        // view. The grid pitch is about finding candidates fast, and has
+        // nothing to do with how finely a line must be walked.
+        let step = 0.4;
+        let n = ((len / step).ceil() as usize).clamp(1, 1024);
         let mut worst = 0.0f32;
         for k in 0..=n {
             let t = k as f32 / n as f32;
@@ -538,7 +787,7 @@ mod tests {
 
     fn one(shape: Shape) -> Blockers {
         let mut b = Blockers::new(100.0, 4.0);
-        b.push(Blocker { shape, top: 5.0 });
+        b.push(Blocker { shape, top: 5.0, cover: Cover::NONE });
         b
     }
 
@@ -612,13 +861,146 @@ mod tests {
     #[test]
     fn passable_props_are_not_added() {
         let mut b = Blockers::new(100.0, 4.0);
-        for k in [PropKind::Fern, PropKind::Bush, PropKind::VineCurtain, PropKind::LanePad, PropKind::Bridge] {
+        // Flat or spanning props record nothing at all.
+        for k in [PropKind::LanePad, PropKind::Bridge] {
             assert!(!b.push_prop(k, 0.0, 0.0, 0.0, 1.0), "{k:?} must be passable");
         }
         assert!(b.is_empty());
+        // Cover props DO record an entry (that is how `concealment_at` finds
+        // them) but must never push: this test predates `Footprint::cover`
+        // and asserted `is_empty()` here, which stopped being the design.
+        for k in [PropKind::Fern, PropKind::Bush, PropKind::VineCurtain] {
+            assert!(!b.push_prop(k, 0.0, 0.0, 0.0, 1.0), "{k:?} must be passable");
+        }
+        assert_eq!(b.len(), 3);
+        let at = Vec3::new(0.05, 0.0, 0.0);
+        assert_eq!(b.resolve(at, 0.6), at, "standing in a fern moves nobody");
+        assert!(b.concealment_at(0.0, 0.0) > 0.5);
+        let mut b = Blockers::new(100.0, 4.0);
         // And a solid one does get added.
         assert!(b.push_prop(PropKind::RuinPillar, 5.0, 5.0, 0.0, 1.0));
         assert_eq!(b.len(), 1);
+    }
+
+    /// Held against the REAL voxels, turned the way the scene turns them:
+    /// nearly every column of the mesh is inside a capsule, and the capsules
+    /// do not sprawl far past the mesh.
+    #[test]
+    fn long_props_cover_their_meshes() {
+        let mut checked = 0;
+        for (kind, mesh) in [(PropKind::FallenLog, crate::props::fallen_log(1.0)), (PropKind::RuinWall, crate::props::ruin_wall(1.0, 1))] {
+            for quarter in 0..4u8 {
+                let mut b = Blockers::new(100.0, 6.0);
+                assert!(b.push_placed(kind, 20.0, -30.0, 0.0, quarter, 1.0));
+                let (mut inside, mut total) = (0, 0);
+                let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+                for v in &mesh.inst {
+                    let (mut px, mut pz) = (v.off_ao[0], v.off_ao[2]);
+                    for _ in 0..quarter {
+                        (px, pz) = (pz, -px);
+                    }
+                    let (wx, wz) = (20.0 + px, -30.0 + pz);
+                    lo = [lo[0].min(wx), lo[1].min(wz)];
+                    hi = [hi[0].max(wx), hi[1].max(wz)];
+                    total += 1;
+                    inside += b.blocked(wx, wz, 0.0) as usize;
+                }
+                assert!(total > 200, "{kind:?}: mesh has {total} voxels");
+                let cover = inside as f32 / total as f32;
+                assert!(cover > 0.85, "{kind:?} q{quarter}: capsules cover {cover:.2} of the mesh");
+                for (dx, dz) in [(-2.5, 0.0), (2.5, 0.0), (0.0, -2.5), (0.0, 2.5)] {
+                    let (x, z) = (if dx < 0.0 { lo[0] } else { hi[0] } + dx, if dz < 0.0 { lo[1] } else { hi[1] } + dz);
+                    let (x, z) = (if dx == 0.0 { (lo[0] + hi[0]) * 0.5 } else { x }, if dz == 0.0 { (lo[1] + hi[1]) * 0.5 } else { z });
+                    assert!(!b.blocked(x, z, 0.0), "{kind:?} q{quarter}: blocks ({x},{z}), 2.5 u outside its mesh");
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 8);
+    }
+
+    /// A wall hides what is behind it from EVERY angle, including square-on,
+    /// where the old 3 u sampling step walked straight over it.
+    #[test]
+    fn a_thin_wall_blocks_sight_wherever_the_ray_crosses_it() {
+        let mut b = Blockers::new(100.0, 6.0);
+        b.push_segment(PropKind::RuinWall, 8.0, -20.0, 8.0, 20.0, 0.0, 1.0);
+        let mut crossed = 0;
+        for k in 0..40 {
+            let z = -18.0 + k as f32 * 0.9;
+            let start = (0.13 * k as f32, z); // vary the phase of the samples against the wall
+            assert_eq!(b.sight_obstruction(start, (14.0, z + 1.0)), 1.0, "ray {k} saw through the wall");
+            crossed += 1;
+        }
+        assert_eq!(crossed, 40);
+        assert_eq!(b.sight_obstruction((0.0, 30.0), (14.0, 30.0)), 0.0, "and past its end the view is open");
+    }
+
+    /// An empty world must answer every question with "nothing", not a panic.
+    #[test]
+    fn a_default_set_answers_nothing_instead_of_panicking() {
+        let b = Blockers::default();
+        assert!(!b.blocked(3.0, -7.0, 0.6));
+        assert_eq!(b.concealment_at(1.0, 1.0), 0.0);
+        assert_eq!(b.nearest_stem(0.0, 0.0, 2.0), None);
+        assert_eq!(b.sight_obstruction((0.0, 0.0), (30.0, 5.0)), 0.0);
+        let p = Vec3::new(4.0, 0.0, 4.0);
+        assert_eq!(b.resolve(p, 0.6), p);
+        assert_eq!(b.standing_on(0.0, 0.0, 1.0), None);
+    }
+
+    /// Stems are the light things only: a rock beside the path is the sim's
+    /// business (it already pushed the cat out), a fern is the body's.
+    #[test]
+    fn only_things_a_cat_could_push_through_count_as_stems() {
+        let mut b = Blockers::new(100.0, 6.0);
+        b.push_prop(PropKind::Rock, 1.0, 0.0, 0.0, 1.0);
+        b.push_prop(PropKind::Fern, 0.0, 0.8, 0.0, 1.0);
+        b.push_prop(PropKind::Bush, 0.0, -3.0, 0.0, 1.0);
+        assert_eq!(b.nearest_stem(0.0, 0.0, 1.2), Some((0.0, 0.8)), "the fern, not the nearer rock");
+        assert_eq!(b.nearest_stem(0.0, -2.6, 1.2), Some((0.0, -3.0)));
+        assert_eq!(b.nearest_stem(0.0, 0.0, 0.5), None, "nothing within reach");
+        assert_eq!(b.nearest_stem(40.0, 40.0, 1.2), None);
+    }
+
+    /// Standable is about the prop. A pine blocks to 3 u and is not a
+    /// platform; a pillar is 4 u and is.
+    #[test]
+    fn standing_is_a_property_of_the_prop_not_its_height() {
+        let mut b = Blockers::new(100.0, 6.0);
+        b.push_prop(PropKind::Pine, 0.0, 0.0, 0.0, 1.0);
+        b.push_prop(PropKind::RuinPillar, 10.0, 0.0, 0.0, 1.0);
+        b.push_prop(PropKind::Rock, 20.0, 0.0, 0.0, 1.0);
+        b.push(Blocker { shape: Shape::Circle { x: 30.0, z: 0.0, r: 2.0 }, top: 1.0, cover: Cover::NONE });
+        assert_eq!(b.standing_on(0.0, 0.0, 3.0), None, "nobody stands on a pine");
+        assert_eq!(b.standing_on(10.0, 0.0, 4.0), Some(Perch::Narrow));
+        assert_eq!(b.standing_on(20.0, 0.0, 1.4), Some(Perch::Flat));
+        assert_eq!(b.standing_on(20.0, 0.0, 0.0), None, "beside the rock's top, not on it");
+        assert_eq!(b.standing_on(30.0, 0.0, 1.0), None, "a hand-built blocker is unstandable unless it says otherwise");
+        assert_eq!(b.landing_under(20.0, 0.0, 9.0), Some((1.4, Perch::Flat)), "a falling cat lands on the rock");
+        assert_eq!(b.landing_under(20.0, 0.0, 1.0), None, "not if it is already below the top");
+    }
+
+    /// Roots lift paws and move nobody. Both halves matter: the first is
+    /// the feature, the second is the promise that bots path as before.
+    #[test]
+    fn roots_are_climbed_over_and_never_push() {
+        let mut b = Blockers::new(100.0, 6.0);
+        assert_eq!(b.push_jungle_roots(10.0, 10.0, 0.0, 0), 4);
+        assert!(b.is_empty(), "a root is not a blocker");
+        // variant 0, k 0: direction 0.4 rad, crest between 3.99 and 4.8 u out.
+        let (dx, dz) = (0.4f32.cos(), 0.4f32.sin());
+        let on = (10.0 + dx * 4.4, 10.0 + dz * 4.4);
+        let crest = b.step_top(on.0, on.1).expect("the crest of the root");
+        assert!((1.75..=1.8001).contains(&crest), "crest height {crest}");
+        let rim = b.step_top(on.0 - dz * 0.8, on.1 + dx * 0.8).expect("still on it");
+        assert!(rim < crest * 0.6, "the rim is rounded off, not a cliff: {rim}");
+        assert_eq!(b.step_top(10.0, 10.0), None, "the trunk itself is not a step");
+        assert_eq!(b.step_top(-50.0, -50.0), None);
+        let p = Vec3::new(on.0, 0.0, on.1);
+        assert_eq!(b.resolve(p, 0.6), p, "standing on a root moves nobody");
+        assert!(!b.blocked(on.0, on.1, 0.6));
+        assert!(!b.push_step(Shape::Circle { x: 0.0, z: 0.0, r: 1.0 }, 0.0, SCRAMBLE_MAX + 0.1), "too tall to scramble");
     }
 
     /// An arch is a doorway; walling its centre defeats the prop.

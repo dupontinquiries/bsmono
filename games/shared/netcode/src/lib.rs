@@ -7,6 +7,7 @@ pub mod attest;
 pub mod lobby;
 pub mod tournament;
 pub mod handoff;
+pub mod lan;
 pub mod multiplayer;
 pub mod profile;
 pub mod session;
