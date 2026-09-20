@@ -51,9 +51,18 @@ pub enum AddrClass {
 
 impl AddrClass {
     pub fn of(addr: IpAddr) -> Self {
-        if is_cgnat(addr)    { return AddrClass::Cgnat;    }
-        if is_private(addr)  { return AddrClass::Private;  }
-        if addr.is_loopback(){ return AddrClass::Loopback; }
+        // LOOPBACK BEFORE PRIVATE. `is_private` counts 127/8 as private (its
+        // own comment says "// loopback"), so testing private first made
+        // `AddrClass::Loopback` UNREACHABLE for IPv4 -- 127.0.0.1 classified
+        // as Private and the variant existed for nothing.
+        //
+        // The distinction is not cosmetic here: a caller deciding what to
+        // announce needs "this build has no external address at all" to read
+        // differently from "this is a LAN address, use mDNS". Found by a
+        // presence-crate test asserting the two are distinct.
+        if is_cgnat(addr)     { return AddrClass::Cgnat;    }
+        if addr.is_loopback() { return AddrClass::Loopback; }
+        if is_private(addr)   { return AddrClass::Private;  }
         AddrClass::Public
     }
 

@@ -11,6 +11,11 @@ path = "src/lib.rs"
 # The protocol types only — InfoHash, Value, HASH_LEN. Not an engine: this crate
 # builds records and keys, and something else puts them on a socket.
 dht-kit = { path = "../../../../shared/dht-kit" }
+# Address CLASSIFICATION only (`cgnat::AddrClass`), not the traversal engine.
+# A record that announces an unroutable host is a record every reader wastes a
+# dial on, so the check belongs where the record is built -- and duplicating an
+# RFC range in a second crate is how the two drift.
+snapclone-nat = { path = "../snapclone-nat", default-features = false }
 # The engine behind `dht.rs`. dht-kit stays the TYPES dependency; this is
 # the one that drives a lookup.
 # `wire` on: this crate bootstraps against bootstrap.jami.net, which speaks
