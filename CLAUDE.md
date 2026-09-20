@@ -86,8 +86,17 @@ all install cleanly. `apt-get update` FIRST — the baked lists are stale and ba
 installs 404 — and clear the `deb.nodesource.com` entry, which 403s and makes
 the whole update look failed.
 
-Still genuinely absent: Qt6, GTK4/libadwaita, `/dev/dri` (so lavapipe is the
-only device, CPU and slow). `libssl-dev`/`libudev-dev` are untried since the
+Still genuinely absent: Qt6, `/dev/dri` (so lavapipe is the only device, CPU
+and slow).
+
+**GTK4/libadwaita are NOT absent**, though this section said so until c19:
+`libgtk-4-dev` (4.14.5) and `libadwaita-1-dev` (1.5.0) install from apt, gtk4-rs
+0.11 / libadwaita-rs 0.9 build against them in about a minute, and a GTK app
+runs under `Xvfb` with `GSK_RENDERER=cairo` and can be screenshotted
+(`apps/stoat/crates/gui-gtk` was built and looked at this way). Also install
+`librsvg2-common`: without its gdk-pixbuf loader most symbolic icons draw as the
+missing-image glyph, which reads as an app bug and is not one. What is still
+true: no input under bare Xvfb, so touch gestures cannot be exercised. `libssl-dev`/`libudev-dev` are untried since the
 list was written; try apt before believing them.
 
 A build script failing still takes the whole crate with it, including headless
@@ -300,6 +309,7 @@ python3 maintenance/tools/cfg_feature_check.py .   # cfg(feature="x") where no m
 python3 maintenance/tools/aperture_cmdstrip_check.py . # aperture command-strip pins vs the palette labels they resolve against
 python3 maintenance/tools/textedit_id_check.py .   # TextEdit with no stable id — the one-character input bug
 python3 maintenance/tools/font_install_check.py . # every egui app reaches uikit-egui's fonts::install, or its symbol glyphs are boxes
+python3 maintenance/tools/palette_surface_check.py . # an egui app that draws a command palette draws it with command_bar::show (bottom and inverted on a phone)
 ```
 
 `maintenance/tools/break-test.sh` is for the §5b break test itself. `source` it,

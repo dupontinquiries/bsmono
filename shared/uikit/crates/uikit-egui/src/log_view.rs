@@ -68,7 +68,9 @@ pub fn log_row(ui: &mut Ui, e: &LogEntry) {
     let (label, col) = e.level.badge();
     egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 5)).show(ui, |ui| {
         ui.set_opacity(fade);
-        ui.horizontal(|ui| {
+        // Top-aligned: once the message can wrap, a centred chip would float
+        // beside the middle of a five-line message.
+        ui.horizontal_top(|ui| {
             // level chip
             egui::Frame::new()
                 .fill(col)
@@ -80,7 +82,10 @@ pub fn log_row(ui: &mut Ui, e: &LogEntry) {
             ui.add_space(8.0);
             // errors tint their message; warnings stay default but the chip carries the signal
             let text_col = if e.level == LogLevel::Error { col } else { ui.visuals().text_color() };
-            ui.label(egui::RichText::new(&e.text).color(text_col));
+            // `.wrap()`: a plain label in a horizontal row never wraps, so a long
+            // line ran under the right edge — clipped, and not scrollable to. With
+            // it the label wraps at the width left after the chip.
+            ui.add(egui::Label::new(egui::RichText::new(&e.text).color(text_col)).wrap());
         });
     });
 }
@@ -97,6 +102,21 @@ mod tests {
         // every level has a distinct colour
         let cols: std::collections::HashSet<_> = levels.iter().map(|l| format!("{:?}", l.badge().1)).collect();
         assert_eq!(cols.len(), 4);
+    }
+
+    /// A log line is whatever the tool printed, and tools print long lines: a
+    /// command echo, a path, an MI record. At phone width the row must wrap it,
+    /// not run it under the right edge where it cannot be read or scrolled to.
+    #[test]
+    fn a_long_line_wraps_inside_a_phone_width_instead_of_being_clipped() {
+        let long = "smartctl -a --json=c -d sntjmicron /dev/disk/by-id/usb-Samsung_SSD_980_PRO_2TB_0123456789AB-0:0 exited 4 after 12.5 s";
+        let entries = [LogEntry::new(LogLevel::Warn, long, 1)];
+        let report = crate::layout_probe::probe(egui::vec2(360.0, 400.0), 3, true, |ctx| {
+            #[allow(deprecated)]
+            egui::CentralPanel::default().show(ctx, |ui| log_view(ui, &entries));
+        });
+        assert!(report.texts >= 2, "chip and message were laid out: {}", report.describe());
+        assert!(report.clipped.is_empty() && report.offscreen.is_empty(), "{}", report.describe());
     }
 
     #[test]

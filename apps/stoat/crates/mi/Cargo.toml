@@ -1,0 +1,8 @@
+[package]
+name = "stoat-mi"
+description = "GDB/MI wire format: tolerant record parser and command encoder. No I/O."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

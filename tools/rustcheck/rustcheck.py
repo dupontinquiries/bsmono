@@ -175,6 +175,22 @@ def _declared_crate_roots(manifest_path):
         for entry in data.get(key, []) or []:
             if isinstance(entry, dict) and entry.get("path"):
                 roots.add((root_dir / entry["path"]).resolve())
+    # Roots cargo DISCOVERS rather than reads from the manifest: every .rs file
+    # directly in tests/, examples/, benches/ and src/bin/ is its own crate, so
+    # `mod common;` in tests/a.rs resolves to tests/common.rs or
+    # tests/common/mod.rs - the ordinary way to share helpers between
+    # integration tests - and not to tests/a/common.rs. Without this the shared
+    # helper was reported missing from every test file that used it. Each
+    # discovery can be switched off in [package], and then the files are not roots.
+    pkg = data.get("package") if isinstance(data.get("package"), dict) else {}
+    for sub, switch in (("tests", "autotests"), ("examples", "autoexamples"),
+                        ("benches", "autobenches"), ("src/bin", "autobins")):
+        if pkg.get(switch) is False:
+            continue
+        d = root_dir / sub
+        if d.is_dir():
+            for f in d.glob("*.rs"):
+                roots.add(f.resolve())
     _CRATE_ROOT_CACHE[manifest_path] = roots
     return roots
 
