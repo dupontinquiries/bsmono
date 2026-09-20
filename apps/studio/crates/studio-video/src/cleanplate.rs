@@ -95,32 +95,63 @@ pub fn clean(window: &[Frame], center: usize, offsets: &[(f32, f32)], s: &Settin
     let n = frames.len();
     let mut out = cur.clone();
     let mut conf = Gray::new(w as usize, h as usize);
-    // pass 1: median, difference, confidence
+    // pass 1: median, difference, confidence.
+    //
+    // Written for the hot loop, not for looks: this ran at 10.5 fps on
+    // 960x540 real footage in its first form (a bounds-checked `at()` per
+    // frame per channel, then a SECOND pass over the window to count
+    // agreement). Direct indexing, one pass over the window, and a fast path
+    // for the common case — a pixel no frame in the window disagrees about
+    // is background, and needs no median at all.
     let mut covered = vec![false; (w * h) as usize];
     let mut med = vec![[0u8; 3]; (w * h) as usize];
+    // Which entries of `med` are a real median rather than the fast path's
+    // "this pixel is background" shortcut. A feathered ring pixel takes the
+    // fast path but still needs the true median to blend toward, so pass 2
+    // computes those lazily — without this the ring blended a pixel toward
+    // itself and the feather did nothing.
+    let mut exact = vec![false; (w * h) as usize];
     let mut scratch = vec![0u8; n];
     let (mut filled, mut unresolved) = (0u32, 0u32);
+    let rows: Vec<&[u8]> = frames.iter().map(|f| f.px.as_slice()).collect();
+    let thr3 = s.threshold * 3.0;
     for y in 0..h {
         for x in 0..w {
             let i = (y * w + x) as usize;
+            let o = i * 3;
+            let here = [cur.px[o], cur.px[o + 1], cur.px[o + 2]];
+            // fast path: every frame agrees with this pixel -> background
+            let mut all_agree = true;
+            for f in &rows {
+                let d = (f[o] as i32 - here[0] as i32).abs() + (f[o + 1] as i32 - here[1] as i32).abs()
+                    + (f[o + 2] as i32 - here[2] as i32).abs();
+                if d as f32 > thr3 { all_agree = false; break; }
+            }
+            if all_agree {
+                med[i] = here;
+                conf.px[i] = 255;
+                continue;
+            }
+            exact[i] = true;
             let mut m = [0u8; 3];
             for c in 0..3 {
-                for (k, f) in frames.iter().enumerate() { scratch[k] = f.at(x, y)[c]; }
+                for (k, f) in rows.iter().enumerate() { scratch[k] = f[o + c]; }
                 m[c] = median_of(&mut scratch);
             }
             med[i] = m;
-            let here = cur.at(x, y);
-            let diff = (0..3).map(|c| (here[c] as f32 - m[c] as f32).abs()).sum::<f32>() / 3.0;
-            // how much of the window sits near the median: the share that
-            // agreed is the share that saw background
-            let agree = frames.iter().filter(|f| {
-                let p = f.at(x, y);
-                (0..3).map(|c| (p[c] as f32 - m[c] as f32).abs()).sum::<f32>() / 3.0 <= s.threshold
-            }).count() as f32 / n as f32;
-            conf.px[i] = (agree * 255.0) as u8;
+            let mut agree = 0usize;
+            for f in &rows {
+                let d = (f[o] as i32 - m[0] as i32).abs() + (f[o + 1] as i32 - m[1] as i32).abs()
+                    + (f[o + 2] as i32 - m[2] as i32).abs();
+                if d as f32 <= thr3 { agree += 1; }
+            }
+            let share = agree as f32 / n as f32;
+            conf.px[i] = (share * 255.0) as u8;
+            let diff = ((here[0] as i32 - m[0] as i32).abs() + (here[1] as i32 - m[1] as i32).abs()
+                + (here[2] as i32 - m[2] as i32).abs()) as f32 / 3.0;
             let protected = s.protect.as_ref().map(|p| p.at(x as usize, y as usize) > 127).unwrap_or(false);
             if diff > s.threshold && !protected {
-                if agree >= s.min_confidence { covered[i] = true; } else { unresolved += 1; }
+                if share >= s.min_confidence { covered[i] = true; } else { unresolved += 1; }
             }
         }
     }
@@ -153,6 +184,14 @@ pub fn clean(window: &[Frame], center: usize, offsets: &[(f32, f32)], s: &Settin
                 continue;
             };
             let here = cur.at(x, y);
+            let i3 = i * 3;
+            if !exact[i] {
+                for c in 0..3 {
+                    for (k, f) in frames.iter().enumerate() { scratch[k] = f.px[i3 + c]; }
+                    med[i][c] = median_of(&mut scratch);
+                }
+                exact[i] = true;
+            }
             let m = med[i];
             let mut v = [0u8; 3];
             for c in 0..3 { v[c] = (m[c] as f32 * a + here[c] as f32 * (1.0 - a)).round() as u8; }

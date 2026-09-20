@@ -71,28 +71,54 @@ impl Frame {
 
     /// Shift by (dx, dy) pixels and zoom about the centre, bilinear, edges
     /// held. This is what a [`crate::stabilize::Correction`] means in pixels.
+    ///
+    /// The hot loop of a stabilize render: at 960×540 the naive version
+    /// (a bounds-checked `at()` per corner, per channel) ran the whole
+    /// render at 29 fps against 73 fps for decode-and-encode alone, so the
+    /// warp cost more than the codecs. This walks each output row with the
+    /// source x stepping incrementally, hoists the row clamping, and takes
+    /// a straight copy when the warp is a whole-pixel shift at zoom 1.
     pub fn warp(&self, dx: f32, dy: f32, zoom: f32) -> Frame {
         let mut out = Frame::black(self.w, self.h);
-        let (cx, cy) = (self.w as f32 / 2.0, self.h as f32 / 2.0);
+        let (w, h) = (self.w as usize, self.h as usize);
         let z = if zoom.abs() < 1e-6 { 1.0 } else { zoom };
-        for y in 0..self.h {
-            for x in 0..self.w {
-                // destination -> source
-                let sx = (x as f32 + 0.5 - cx) / z - dx + cx - 0.5;
-                let sy = (y as f32 + 0.5 - cy) / z - dy + cy - 0.5;
-                let (x0, y0) = (sx.floor(), sy.floor());
-                let (fx, fy) = (sx - x0, sy - y0);
-                let clamp = |v: f32, hi: u32| v.clamp(0.0, (hi - 1) as f32) as u32;
-                let (xa, ya) = (clamp(x0, self.w), clamp(y0, self.h));
-                let (xb, yb) = (clamp(x0 + 1.0, self.w), clamp(y0 + 1.0, self.h));
-                let (p00, p10, p01, p11) = (self.at(xa, ya), self.at(xb, ya), self.at(xa, yb), self.at(xb, yb));
-                let mut v = [0u8; 3];
-                for c in 0..3 {
-                    let top = p00[c] as f32 * (1.0 - fx) + p10[c] as f32 * fx;
-                    let bot = p01[c] as f32 * (1.0 - fx) + p11[c] as f32 * fx;
-                    v[c] = (top * (1.0 - fy) + bot * fy).round().clamp(0.0, 255.0) as u8;
+        let (cx, cy) = (self.w as f32 / 2.0, self.h as f32 / 2.0);
+        // whole-pixel shift, no zoom: copy rows
+        if (z - 1.0).abs() < 1e-6 && (dx - dx.round()).abs() < 1e-4 && (dy - dy.round()).abs() < 1e-4 {
+            let (sx, sy) = (dx.round() as isize, dy.round() as isize);
+            for y in 0..h {
+                let src_y = (y as isize - sy).clamp(0, h as isize - 1) as usize;
+                for x in 0..w {
+                    let src_x = (x as isize - sx).clamp(0, w as isize - 1) as usize;
+                    let (a, b) = ((y * w + x) * 3, (src_y * w + src_x) * 3);
+                    out.px[a..a + 3].copy_from_slice(&self.px[b..b + 3]);
                 }
-                out.set(x, y, v);
+            }
+            return out;
+        }
+        let step = 1.0 / z;
+        for y in 0..h {
+            let sy = (y as f32 + 0.5 - cy) / z - dy + cy - 0.5;
+            let y0f = sy.floor();
+            let fy = sy - y0f;
+            let ya = (y0f as isize).clamp(0, h as isize - 1) as usize * w * 3;
+            let yb = ((y0f as isize) + 1).clamp(0, h as isize - 1) as usize * w * 3;
+            let mut sx = (0.5 - cx) / z - dx + cx - 0.5;
+            let row = y * w * 3;
+            for x in 0..w {
+                let x0f = sx.floor();
+                let fx = sx - x0f;
+                let xa = (x0f as isize).clamp(0, w as isize - 1) as usize * 3;
+                let xb = ((x0f as isize) + 1).clamp(0, w as isize - 1) as usize * 3;
+                let (i00, i10) = (ya + xa, ya + xb);
+                let (i01, i11) = (yb + xa, yb + xb);
+                let o = row + x * 3;
+                for c in 0..3 {
+                    let top = self.px[i00 + c] as f32 * (1.0 - fx) + self.px[i10 + c] as f32 * fx;
+                    let bot = self.px[i01 + c] as f32 * (1.0 - fx) + self.px[i11 + c] as f32 * fx;
+                    out.px[o + c] = (top * (1.0 - fy) + bot * fy + 0.5) as u8;
+                }
+                sx += step;
             }
         }
         out
@@ -261,6 +287,47 @@ mod tests {
         let s = Size::analysis(640, 480);
         assert_eq!((s.w, s.h), (640, 480), "never upscales past the source");
         assert_eq!(Size::analysis(3840, 1607).h % 2, 0, "even for the encoder");
+    }
+
+    /// The straightforward version this file's fast path must agree with.
+    fn warp_reference(f: &Frame, dx: f32, dy: f32, zoom: f32) -> Frame {
+        let mut out = Frame::black(f.w, f.h);
+        let (cx, cy) = (f.w as f32 / 2.0, f.h as f32 / 2.0);
+        let z = if zoom.abs() < 1e-6 { 1.0 } else { zoom };
+        for y in 0..f.h {
+            for x in 0..f.w {
+                let sx = (x as f32 + 0.5 - cx) / z - dx + cx - 0.5;
+                let sy = (y as f32 + 0.5 - cy) / z - dy + cy - 0.5;
+                let (x0, y0) = (sx.floor(), sy.floor());
+                let (fx, fy) = (sx - x0, sy - y0);
+                let cl = |v: f32, hi: u32| v.clamp(0.0, (hi - 1) as f32) as u32;
+                let (xa, ya) = (cl(x0, f.w), cl(y0, f.h));
+                let (xb, yb) = (cl(x0 + 1.0, f.w), cl(y0 + 1.0, f.h));
+                let (p00, p10, p01, p11) = (f.at(xa, ya), f.at(xb, ya), f.at(xa, yb), f.at(xb, yb));
+                let mut v = [0u8; 3];
+                for c in 0..3 {
+                    let top = p00[c] as f32 * (1.0 - fx) + p10[c] as f32 * fx;
+                    let bot = p01[c] as f32 * (1.0 - fx) + p11[c] as f32 * fx;
+                    v[c] = (top * (1.0 - fy) + bot * fy).round().clamp(0.0, 255.0) as u8;
+                }
+                out.set(x, y, v);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_fast_warp_agrees_with_the_straightforward_one() {
+        let mut f = Frame::black(40, 24);
+        for y in 0..24 { for x in 0..40 {
+            f.set(x, y, [(x * 6) as u8, (y * 10) as u8, ((x + y) * 4) as u8]);
+        }}
+        for &(dx, dy, z) in &[(3.0f32, -2.0f32, 1.0f32), (1.5, 0.25, 1.0), (0.0, 0.0, 1.2),
+                              (-4.25, 3.75, 1.08), (0.0, 0.0, 1.0)] {
+            let (fast, slow) = (f.warp(dx, dy, z), warp_reference(&f, dx, dy, z));
+            let worst = fast.px.iter().zip(&slow.px).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+            assert!(worst <= 1, "({dx}, {dy}, {z}): off by {worst}");
+        }
     }
 
     #[test]
