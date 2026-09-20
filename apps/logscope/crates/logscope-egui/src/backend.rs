@@ -2207,6 +2207,14 @@ attention dispatches [LOGSCOPE_BG_CACHE]", self.name, bgh as f64 / per);
                 if crate::genguard::runaway_stop(&recent, 0.5) != crate::genguard::StopReason::None { return false; }
                 cont
             };
+            // Captured BEFORE the window runs: it overwrites `s.logits` on
+            // halt, so asking afterwards reads the wrong distribution.
+            let resumed_argmax_is_eos = match eos {
+                Some(e) => s.logits.iter().enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .is_some_and(|(i, _)| i as u32 == e),
+                None => false,
+            };
             let produced = match (sample_win_opt, embed_q8) {
                 (Some(sample_win), Some(eq)) => {
                     let w = gpu.stream_session_window(model, &mut s, &mut seen, n_new, eos, &sp, &mut rng, sample_win,
@@ -2238,6 +2246,24 @@ emitting anything."),
                     (Some(t), None) =>
                         format!("the first token ({t}) was sampled but nothing was emitted — a \
 special token or an incomplete UTF-8 sequence swallowed it."),
+                    // EOS FIRST LOOKS IDENTICAL TO NO SAMPLE AT ALL from here,
+                    // and the difference is the whole point of this match.
+                    // `stream_session_window` compares against eos and BREAKS
+                    // BEFORE calling `on_token` (gpu-gemm lib.rs, the replay
+                    // loop), so a turn that was already finished never sets
+                    // `first_tok` and arrives here as the fault case.
+                    //
+                    // The other diagnostic in this file already knew:
+                    // "uncounted: stream_session breaks on eos before the stop
+                    // callback". This one did not, and reported twenty-four
+                    // finished turns as twenty-four real faults.
+                    //
+                    // So ask the logits directly rather than inferring from a
+                    // callback that was never going to fire.
+                    (None, _) if resumed_argmax_is_eos =>
+                        "the resumed distribution's argmax was already EOS — this turn had \
+finished before the resume was asked for, and the window breaks on eos before the token \
+callback runs, so nothing was reported. Not a fault.".to_string(),
                     (None, _) =>
                         "NO token was sampled at all — the session's logits were empty or the \
 window returned immediately, which is the case that indicates a real fault.".to_string(),
