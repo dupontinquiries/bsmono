@@ -3212,6 +3212,35 @@ pub struct VisionBlock {
 /// 4× smaller on the device than f32 — the decode-time bandwidth win.
 pub struct QWeight { pub qw: Tensor, pub qs: Tensor, pub n: usize, pub k: usize }
 
+/// Where the int8 sidecar's bytes go. Exactly the two calls `save_int8_cache` always made on its
+/// `Vec<u8>`, so the format code reads the same whether it is filling memory or a file.
+pub trait CacheSink {
+    fn extend_from_slice(&mut self, b: &[u8]);
+    fn push(&mut self, b: u8) { self.extend_from_slice(&[b]); }
+}
+impl CacheSink for Vec<u8> {
+    fn extend_from_slice(&mut self, b: &[u8]) { Vec::extend_from_slice(self, b); }
+}
+/// A file behind a BufWriter. Write errors are LATCHED (the format code has no error path, and a
+/// full disk must not become a truncated cache under the real name): `finish` reports the first one.
+pub struct SpillSink { w: std::io::BufWriter<std::fs::File>, err: Option<std::io::Error>, len: u64 }
+impl SpillSink {
+    pub fn create(path: &std::path::Path) -> std::io::Result<Self> {
+        Ok(SpillSink { w: std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?), err: None, len: 0 })
+    }
+    pub fn finish(mut self) -> std::io::Result<u64> {
+        if let Some(e) = self.err.take() { return Err(e); }
+        std::io::Write::flush(&mut self.w)?;
+        Ok(self.len)
+    }
+}
+impl CacheSink for SpillSink {
+    fn extend_from_slice(&mut self, b: &[u8]) {
+        if self.err.is_some() { return; }
+        match std::io::Write::write_all(&mut self.w, b) { Ok(()) => self.len += b.len() as u64, Err(e) => self.err = Some(e) }
+    }
+}
+
 /// A weight kept resident in 4-bit form: per 32-wide block, an f32 scale and 32 symmetric nibbles
 /// (value−8 ∈ [−7,7]). 8× smaller than f32, 2× smaller than int8 — the lever that lets a 70B fit
 /// (~40 GiB). Symmetric f32-scale (not the GGUF q4_0 f16-scale on-disk format) so CPU and GPU dequant
@@ -13542,14 +13571,14 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
         }
         "no weight-level difference found".into()
     }
-    fn dump_tensor(&self, o: &mut Vec<u8>, t: &Tensor) {
+    fn dump_tensor(&self, o: &mut impl CacheSink, t: &Tensor) {
         o.extend_from_slice(&(t.rows as u32).to_le_bytes());
         o.extend_from_slice(&(t.cols as u32).to_le_bytes());
         let v = self.download(t);
         o.extend_from_slice(&(v.len() as u64).to_le_bytes());
         o.extend_from_slice(bytemuck::cast_slice(&v));
     }
-    fn dump_lin(&self, o: &mut Vec<u8>, l: &Lin) {
+    fn dump_lin(&self, o: &mut impl CacheSink, l: &Lin) {
         match &l.kind { // biases are never cached (biased models skip the cache write, see save_int8_cache)
             LinKind::F32(t) => { o.push(0); self.dump_tensor(o, t); }
             // Tag 3. NOT cached: the cache exists to skip requantization, and IQ1_S is never
@@ -13566,13 +13595,40 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
     /// model invalidates the cache.
     /// Returns Ok(true) if a cache was written, Ok(false) if this model isn't cacheable (so the caller
     /// can log honestly — "wrote" was previously printed even on skip).
+    ///
+    /// STREAMED. This used to append every tensor to ONE `Vec<u8>` and `fs::write` it at the end: the
+    /// whole resident model a second time in host RAM — ~10 GB for an 8B at int8, more with Vec growth
+    /// slack — at the moment just after load, when memory is fullest, and on unified memory right on
+    /// top of the weights it was copying. It now goes through a BufWriter one tensor at a time, so
+    /// the peak is the largest single tensor. The bytes are IDENTICAL to the in-memory build
+    /// (`int8_cache_bytes`, kept as the reference; the validation run compares them), so existing
+    /// sidecars stay valid and the loader is untouched. Still tmp + rename: a half-written cache is
+    /// never left under the real name, and a write error removes the tmp file.
     pub fn save_int8_cache(&self, m: &Model, path: &std::path::Path, fp: (u64, u64)) -> std::io::Result<bool> {
+        let tmp = path.with_extension("tmp");
+        let mut o = SpillSink::create(&tmp)?;
+        let wrote = self.write_int8_cache(&mut o, m, fp);
+        match o.finish() {
+            Ok(_) if wrote => { std::fs::rename(&tmp, path)?; Ok(true) }   // never leave a half-written cache
+            Ok(_) => { let _ = std::fs::remove_file(&tmp); Ok(false) }
+            Err(e) => { let _ = std::fs::remove_file(&tmp); Err(e) }
+        }
+    }
+
+    /// The sidecar's bytes, built in memory — what `save_int8_cache` used to do. The reference the
+    /// streamed file is held byte-identical to; fine for a fixture, not for a real model.
+    pub fn int8_cache_bytes(&self, m: &Model, fp: (u64, u64)) -> Option<Vec<u8>> {
+        let mut o: Vec<u8> = Vec::new();
+        if self.write_int8_cache(&mut o, m, fp) { Some(o) } else { None }
+    }
+
+    /// The format, written once, into whatever sink. `false` = this model is not cached (see below).
+    fn write_int8_cache(&self, o: &mut impl CacheSink, m: &Model, fp: (u64, u64)) -> bool {
         self.activate_model(m);
         // Biased (Qwen2), QK-Norm (Qwen3/3.5), MoE (expert weights aren't in the layout), and 4-bit-resident
         // projections aren't in the int8 cache layout, so skip the cache — they reload from the GGUF.
         let q4_mode = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok();
-        if q4_mode || m.layers.iter().any(|b| b.wq.has_bias() || b.wk.has_bias() || b.wv.has_bias() || b.q_norm.is_some() || b.moe.is_some()) { return Ok(false); }
-        let mut o = Vec::new();
+        if q4_mode || m.layers.iter().any(|b| b.wq.has_bias() || b.wk.has_bias() || b.wv.has_bias() || b.q_norm.is_some() || b.moe.is_some()) { return false; }
         o.extend_from_slice(b"LSI8C\x04"); // v4: +trained_ctx after eps. A reload that forgets the
         // trained context would let auto window sizing plan PAST what the checkpoint was trained
         // for — a checkpoint property must survive the sidecar. planned_weight_bytes deliberately
@@ -13582,18 +13638,15 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
         o.extend_from_slice(&m.base.to_le_bytes()); o.extend_from_slice(&m.eps.to_le_bytes());
         o.extend_from_slice(&(m.trained_ctx as u32).to_le_bytes());
         o.extend_from_slice(&(m.embed.len() as u64).to_le_bytes()); o.extend_from_slice(bytemuck::cast_slice(&m.embed.to_f32()));
-        self.dump_tensor(&mut o, &m.rope_factors);
-        self.dump_tensor(&mut o, &m.out_norm);
-        self.dump_lin(&mut o, &m.output);
+        self.dump_tensor(o, &m.rope_factors);
+        self.dump_tensor(o, &m.out_norm);
+        self.dump_lin(o, &m.output);
         for b in &m.layers {
-            self.dump_tensor(&mut o, &b.g1);
-            for l in [&b.wqkv, &b.wq, &b.wk, &b.wv, &b.wo, &b.wgate_up, &b.wdown] { self.dump_lin(&mut o, l); }
-            self.dump_tensor(&mut o, &b.g2);
+            self.dump_tensor(o, &b.g1);
+            for l in [&b.wqkv, &b.wq, &b.wk, &b.wv, &b.wo, &b.wgate_up, &b.wdown] { self.dump_lin(o, l); }
+            self.dump_tensor(o, &b.g2);
         }
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &o)?;
-        std::fs::rename(&tmp, path)?;  // never leave a half-written cache
-        Ok(true)
+        true
     }
     /// Load the resident model from `path` iff it exists and its tag matches `fp`. None on any
     /// mismatch/corruption — the caller falls back to a fresh GGUF load.
@@ -23324,6 +23377,47 @@ mod q4k_int8_transcode {
         let raw = q4k(2, 7);
         assert!(gpu.q4_k_to_int8_resident(&raw, 1, 128).is_none(), "k must be a multiple of 256");
         assert!(gpu.q4_k_to_int8_resident(&raw[..16], 1, 256).is_none(), "short buffer must refuse");
+    }
+}
+
+#[cfg(test)]
+mod cache_sink_tests {
+    use super::{CacheSink, SpillSink};
+
+    /// The same calls into a Vec and into a file must leave the same bytes — every write size around
+    /// the BufWriter's 1 MiB capacity, single-byte tags between them, and an empty write.
+    #[test]
+    fn a_spilled_cache_is_the_bytes_the_vec_would_hold() {
+        let path = std::env::temp_dir().join(format!("ls_spill_{}.bin", std::process::id()));
+        let mut v: Vec<u8> = Vec::new();
+        let mut f = SpillSink::create(&path).unwrap();
+        let mut x = 0x9E37u32;
+        for len in [0usize, 1, 5, 4096, (1 << 20) - 1, 1 << 20, (1 << 20) + 1, 3 << 20, 17] {
+            let chunk: Vec<u8> = (0..len).map(|_| { x = x.wrapping_mul(1664525).wrapping_add(1013904223); (x >> 24) as u8 }).collect();
+            for sink in [&mut v as &mut dyn CacheSinkDyn, &mut f as &mut dyn CacheSinkDyn] { sink.put(&chunk); sink.tag((len % 251) as u8); }
+        }
+        let n = f.finish().unwrap();
+        let on_disk = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(n as usize, v.len());
+        assert!(on_disk == v, "spilled {} bytes, vec holds {}", on_disk.len(), v.len());
+    }
+    // object-safe shim so the two sinks can be driven by one loop
+    trait CacheSinkDyn { fn put(&mut self, b: &[u8]); fn tag(&mut self, b: u8); }
+    impl<T: CacheSink> CacheSinkDyn for T { fn put(&mut self, b: &[u8]) { self.extend_from_slice(b) } fn tag(&mut self, b: u8) { self.push(b) } }
+
+    /// A FULL DISK IS AN ERROR, NOT A SHORT CACHE. /dev/full accepts the open and fails every write
+    /// with ENOSPC. The format code has no error path, so the sink latches the first failure and
+    /// `finish` must report it — which is what stops save_int8_cache renaming a truncated file into
+    /// place. Writes after the failure must not panic or un-latch it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_write_error_is_latched_and_reported_by_finish() {
+        let mut f = SpillSink::create(std::path::Path::new("/dev/full")).expect("/dev/full opens");
+        f.extend_from_slice(&vec![7u8; 3 << 20]);      // past the buffer: forces a real write, which fails
+        f.push(1); f.extend_from_slice(b"more");       // after the failure
+        let r = f.finish();
+        assert!(r.is_err(), "ENOSPC was swallowed: finish returned {r:?}");
     }
 }
 

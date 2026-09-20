@@ -7751,6 +7751,15 @@ still pass, which is why this one exists."
         let path = std::path::Path::new("/tmp/ls_int8_cache_test.bin");
         let fp = (bytes.len() as u64, 12345);
         gpu.save_int8_cache(&fresh, path, fp).expect("save cache");
+        // The save STREAMS now (it used to hold the whole model in one Vec). Same bytes, or existing
+        // sidecars would silently stop loading — and no tmp file left behind.
+        {
+            let on_disk = std::fs::read(path).expect("read sidecar");
+            let in_memory = gpu.int8_cache_bytes(&fresh, fp).expect("in-memory sidecar");
+            println!("  int8 cache: streamed file {} bytes, in-memory build {} bytes", on_disk.len(), in_memory.len());
+            check("int8 cache: streamed file == in-memory build, byte for byte", if on_disk == in_memory && on_disk.len() > 1000 { 0.0 } else { 1.0 }, 0.5);
+            check("int8 cache: no .tmp left behind", if path.with_extension("tmp").exists() { 1.0 } else { 0.0 }, 0.5);
+        }
         let cached = gpu.load_int8_cache(path, fp).expect("load cache");
         // stale fingerprint must be rejected
         assert!(gpu.load_int8_cache(path, (bytes.len() as u64, 99999)).is_none(), "stale cache must be rejected");
