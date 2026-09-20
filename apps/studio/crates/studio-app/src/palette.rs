@@ -186,6 +186,10 @@ pub enum Ask {
     /// pre-fader send, for driving something (a meter, a sidechain, the
     /// multicam switcher) without adding anything to what is heard.
     ControlTapFrom,
+    /// Which camera group to cut, and then how often to cut it — the
+    /// multicam switcher driven by the project's own beat grid.
+    MulticamGroup,
+    MulticamEvery(studio_core::GroupId),
     /// Which bus feeds which — the input side, chosen from the receiver.
     BusInputPick(BusId),
     MuteTrack,
@@ -255,6 +259,8 @@ pub fn root() -> Vec<Choice> {
         // Markers: the one request both the FL Studio and kdenlive
         // communities make in the same words.
         c("drop a marker here", None, Then::Do(Act::Shell(ShellVerb::MarkerHere))),
+        c("cut a camera group on the beat (multicam)",
+          Some("switch angles on the beat grid"), Then::Ask(Ask::MulticamGroup)),
         c("control channel from a bus (dummy channel)",
           Some("a silent tap that drives things without being heard"),
           Then::Ask(Ask::ControlTapFrom)),
@@ -499,6 +505,49 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
             ]))));
             out
         }
+        Ask::MulticamGroup => project.groups.iter()
+            .filter(|(id, _)| studio_video::multicam::from_group(project, **id).is_ok())
+            .map(|(id, g)| plain(g.name.clone(), Then::Ask(Ask::MulticamEvery(*id))))
+            .collect(),
+        Ask::MulticamEvery(group) => {
+            let Ok((angles, start, end)) = studio_video::multicam::from_group(project, group) else {
+                return vec![plain("that group is not cuttable any more".into(), Then::Do(Act::Ops(vec![])))];
+            };
+            // The beat grid: the camera group's own tempo if it has one,
+            // else the project's first song that does, else nothing — and
+            // when there is no grid at all the step says so instead of
+            // inventing 120 BPM and cutting to a beat nobody set.
+            let tempo = project.groups.get(&group).and_then(|g| g.tempo.clone())
+                .or_else(|| project.groups.values().find_map(|g| g.tempo.clone()));
+            let Some(tempo) = tempo else {
+                return vec![plain("no tempo set — set a song tempo first".into(), Then::Do(Act::Ops(vec![])))];
+            };
+            let beats = studio_video::multicam::beats_from_tempo(&tempo, start, end);
+            let span = (end.0 - start.0) as f64 / studio_core::TICKS_PER_SECOND as f64;
+            let track = TrackId(project.tracks.iter().map(|t| t.id.0).max().unwrap_or(0) + 1);
+            let first_clip = project.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1;
+            [1usize, 2, 4, 8].iter().map(|every| {
+                let shots = studio_video::multicam::plan(
+                    &angles,
+                    &studio_video::multicam::Timing::OnBeats { beats: beats.clone(), every: *every },
+                    &studio_video::multicam::Choice::Cycle,
+                    studio_video::multicam::Rules { min_shot: 0.0, hysteresis_db: 0.0, settle: 0.0 },
+                    span);
+                // The new track and every cut land as one group, so one
+                // undo takes the whole switch back — a half-undone multicam
+                // cut is worse than none.
+                let mut ops = vec![Op::AddTrack { track: studio_core::Track {
+                    id: track, kind: studio_core::TrackKind::Video,
+                    name: format!("multicam /{every}"), muted: false, locked: false,
+                    gain: 1.0, route: None }, at: project.tracks.len() }];
+                ops.extend(studio_video::multicam::layout(&shots, &angles, track, start, first_clip));
+                Choice {
+                    label: match every { 1 => "every beat".into(), n => format!("every {n} beats") },
+                    hint: Some(format!("{} cuts", shots.len())),
+                    then: Then::Do(Act::Ops(ops)),
+                }
+            }).collect()
+        }
         Ask::ControlTapFrom => project.busses.iter()
             .filter(|(_, b)| !b.silent)  // tapping a tap is not a thing
             .map(|(id, b)| {
@@ -631,6 +680,50 @@ mod tests {
         let found = filter(&r, "collaborator");
         assert!(found.len() >= 4, "only found {}: {:?}", found.len(),
                 found.iter().map(|c| &c.label).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_multicam_cut_lands_on_the_beat_alternates_angles_and_undoes_whole() {
+        use studio_core::*;
+        let mut p = Project::default();
+        for id in 1..=2u64 {
+            p.apply(&Op::AddTrack { track: Track { id: TrackId(id), kind: TrackKind::Video,
+                name: format!("angle {id}"), muted: false, locked: false, gain: 1.0, route: None },
+                at: (id - 1) as usize }).unwrap();
+            p.apply(&Op::AddSource { source: Source { id: SourceId(id), path: format!("/card/C{id}.mkv"),
+                len: Ticks::from_seconds(120.0), sample_rate: 48_000, channels: 2, has_video: true,
+                kind: SourceKind::File } }).unwrap();
+            p.apply(&Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(id), track: TrackId(id),
+                pos: Ticks::from_seconds(4.0), src_in: Ticks::from_seconds(4.0 + id as f64),
+                len: Ticks::from_seconds(8.0), gain: 1.0, effects: vec![] } }).unwrap();
+        }
+        p.apply(&Op::SetGroup { id: GroupId(1), name: "cam".into(), clips: vec![ClipId(1), ClipId(2)] }).unwrap();
+
+        // No tempo yet: the step says so rather than inventing one.
+        let no_grid = candidates(Ask::MulticamEvery(GroupId(1)), &p);
+        assert!(no_grid[0].label.contains("no tempo"), "{:?}", no_grid[0].label);
+
+        p.apply(&Op::SetGroupTempo { id: GroupId(1), tempo: Some(TempoMap::constant(120.0)) }).unwrap();
+        assert_eq!(candidates(Ask::MulticamGroup, &p).len(), 1, "the camera group is offered");
+        let every = candidates(Ask::MulticamEvery(GroupId(1)), &p);
+        assert_eq!(every.len(), 4, "every 1/2/4/8 beats");
+        let Then::Do(Act::Ops(ops)) = every[1].then.clone() else { panic!() };  // every 2 beats = 1 s
+        let inv = p.apply(&Op::Group { ops }).expect("applies");
+
+        let cuts: Vec<&Clip> = p.clips.values().filter(|c| c.track == TrackId(3)).collect();
+        assert!(cuts.len() >= 7, "8 s at a cut a second: {}", cuts.len());
+        for c in &cuts {
+            assert!((c.pos.to_seconds().fract()).abs() < 1e-6, "on the beat grid: {c:?}");
+            // each cut reads its own moment in its own angle's file
+            let offset = if c.source == SourceId(1) { 1.0 } else { 2.0 };
+            assert!((c.src_in.to_seconds() - c.pos.to_seconds() - offset).abs() < 1e-6, "{c:?}");
+        }
+        let mut by_pos: Vec<&&Clip> = cuts.iter().collect();
+        by_pos.sort_by_key(|c| c.pos);
+        assert!(by_pos.windows(2).all(|w| w[0].source != w[1].source), "angles alternate");
+        p.apply(&inv).expect("undoes");
+        assert!(p.tracks.iter().all(|t| t.id != TrackId(3)), "one undo takes the track too");
+        assert_eq!(p.clips.len(), 2, "and every cut");
     }
 
     #[test]

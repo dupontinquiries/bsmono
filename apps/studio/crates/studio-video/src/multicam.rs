@@ -25,7 +25,7 @@
 //! `AddClip` ops — so a generated cut is undoable, shareable, and editable
 //! by hand afterwards like any other.
 
-use studio_core::{Clip, ClipId, Op, SourceId, Ticks, TrackId};
+use studio_core::{Clip, ClipId, Op, SourceId, Ticks, TrackId, TICKS_PER_SECOND};
 
 /// One angle of the group.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,8 +34,10 @@ pub struct Angle {
     /// How busy the picture is — see [`motion_energy`]. Only the ORDER of
     /// angles by energy matters.
     pub energy: f32,
-    /// The angle's file, and where the group's time zero falls in it (the
-    /// sync offset, seconds).
+    /// The angle's file, and its sync offset: the position IN THE FILE that
+    /// timeline zero corresponds to, in seconds (`src_in - pos` for a clip
+    /// already placed in sync). A cut at timeline `t` therefore reads the
+    /// file at `t + offset`.
     pub source: SourceId,
     pub offset: f64,
 }
@@ -47,6 +49,61 @@ pub fn motion_energy(path: &[crate::stabilize::Pose]) -> f32 {
     if path.len() < 2 { return 0.0; }
     path.windows(2).map(|w| ((w[1].x - w[0].x).powi(2) + (w[1].y - w[0].y).powi(2)).sqrt())
         .sum::<f32>() / (path.len() - 1) as f32
+}
+
+/// The angles of a camera group as the project holds them, plus the span
+/// of timeline they all cover.
+///
+/// A camera group is an ordinary composition ([`studio_core::Group`]) whose
+/// clips are the angles, already synced — each one placed so that the same
+/// moment sits at the same timeline position, which is what
+/// [`crate::dualsync`] and the slate exist to establish. An angle's sync
+/// offset is then just `src_in - pos`: how far into its own file the file
+/// was at timeline zero.
+///
+/// The span is the overlap of every angle, because a plan may only cut
+/// between angles where all of them actually have picture. `Err` when the
+/// group is empty, when a clip's source is missing, or when the angles do
+/// not overlap at all — a "camera group" whose members do not share any
+/// moment is a mistake worth refusing rather than cutting into.
+pub fn from_group(project: &studio_core::Project, group: studio_core::GroupId)
+    -> Result<(Vec<Angle>, Ticks, Ticks), String> {
+    let g = project.groups.get(&group).ok_or("no such group")?;
+    let mut angles = Vec::new();
+    let (mut start, mut end) = (Ticks(i64::MIN), Ticks(i64::MAX));
+    for id in &g.clips {
+        let Some(c) = project.clips.get(id) else { continue };
+        let src = project.sources.get(&c.source).ok_or("an angle's source is missing")?;
+        if !src.has_video { continue; }
+        start = start.max(c.pos);
+        end = end.min(c.pos.saturating_add(c.len));
+        angles.push(Angle {
+            name: src.path.rsplit('/').next().unwrap_or(&src.path).to_string(),
+            energy: 0.0,
+            source: c.source,
+            offset: (c.src_in.0 - c.pos.0) as f64 / TICKS_PER_SECOND as f64,
+        });
+    }
+    if angles.len() < 2 { return Err("a camera group needs at least two angles with picture".into()); }
+    if end <= start { return Err("the angles do not overlap: nothing to cut between".into()); }
+    Ok((angles, start, end))
+}
+
+/// Beat times in seconds over `[from, to)`, from a tempo map — the grid a
+/// [`Timing::OnBeats`] plan cuts on when the music is the project's own
+/// rather than a rendered track.
+pub fn beats_from_tempo(tempo: &studio_core::TempoMap, from: Ticks, to: Ticks) -> Vec<f64> {
+    let first = tempo.tick_to_beat(from).ceil();
+    let mut out = Vec::new();
+    let mut b = first;
+    loop {
+        let t = tempo.beat_to_tick(b);
+        if t >= to { break; }
+        out.push((t.0 - from.0) as f64 / TICKS_PER_SECOND as f64);
+        b += 1.0;
+        if out.len() > 100_000 { break; }
+    }
+    out
 }
 
 /// A control channel's level over time: dB per hop.
@@ -210,7 +267,10 @@ pub fn layout(shots: &[Shot], angles: &[Angle], track: TrackId, at: Ticks, first
             source: a.source,
             track,
             pos: at.saturating_add(Ticks::from_seconds(s.start)),
-            src_in: Ticks::from_seconds(s.start + a.offset),
+            // The shot's TIMELINE position, converted into the angle's own
+            // file time. Using the plan-relative start here read the wrong
+            // moment whenever the cut did not begin at timeline zero.
+            src_in: Ticks::from_seconds(at.to_seconds() + s.start + a.offset),
             len: Ticks::from_seconds(s.end - s.start),
             gain: 1.0,
             effects: Vec::new(),
@@ -308,8 +368,8 @@ mod tests {
         let clips: Vec<&Clip> = ops.iter().map(|o| match o { Op::AddClip { clip } => clip, _ => panic!() }).collect();
         assert_eq!(clips[0].pos, Ticks::from_seconds(10.0));
         assert_eq!(clips[1].pos, Ticks::from_seconds(12.0));
-        assert_eq!(clips[0].src_in, Ticks::from_seconds(0.5), "wide's sync offset");
-        assert_eq!(clips[1].src_in, Ticks::from_seconds(4.0), "handheld: 2 s into the group + 2 s offset");
+        assert_eq!(clips[0].src_in, Ticks::from_seconds(10.5), "timeline 10 s, wide's offset 0.5");
+        assert_eq!(clips[1].src_in, Ticks::from_seconds(14.0), "timeline 12 s, handheld's offset 2");
         assert_eq!((clips[0].id, clips[1].id), (ClipId(100), ClipId(101)));
         // and they apply to a real project without overlap refusals
         let mut p = studio_core::Project::default();
@@ -321,6 +381,73 @@ mod tests {
                 kind: studio_core::SourceKind::File } }).unwrap();
         }
         for o in &ops { p.apply(o).expect("applies"); }
+    }
+
+    fn synced_project() -> (studio_core::Project, studio_core::GroupId) {
+        use studio_core::*;
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video, name: "angles".into(),
+            muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(2), kind: TrackKind::Video, name: "angles 2".into(),
+            muted: false, locked: false, gain: 1.0, route: None }, at: 1 }).unwrap();
+        for (i, off) in [2.0f64, 0.5].iter().enumerate() {
+            let id = i as u64 + 1;
+            p.apply(&Op::AddSource { source: Source { id: SourceId(id), path: format!("/card/C000{id}.mkv"),
+                len: Ticks::from_seconds(120.0), sample_rate: 48_000, channels: 2, has_video: true,
+                kind: SourceKind::File } }).unwrap();
+            // both angles placed so the same moment sits at the same
+            // timeline position; the second starts a second later
+            let pos = if i == 0 { 10.0 } else { 11.0 };
+            p.apply(&Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(id), track: TrackId(id),
+                pos: Ticks::from_seconds(pos), src_in: Ticks::from_seconds(pos + off),
+                len: Ticks::from_seconds(20.0), gain: 1.0, effects: vec![] } }).unwrap();
+        }
+        p.apply(&Op::SetGroup { id: GroupId(1), name: "cam".into(), clips: vec![ClipId(1), ClipId(2)] }).unwrap();
+        (p, GroupId(1))
+    }
+
+    #[test]
+    fn a_camera_group_yields_its_angles_their_offsets_and_the_overlap() {
+        let (p, g) = synced_project();
+        let (angles, start, end) = from_group(&p, g).expect("a group");
+        assert_eq!(angles.len(), 2);
+        assert!((angles[0].offset - 2.0).abs() < 1e-6 && (angles[1].offset - 0.5).abs() < 1e-6,
+                "src_in - pos is the sync offset: {angles:?}");
+        assert_eq!((start, end), (Ticks::from_seconds(11.0), Ticks::from_seconds(30.0)),
+                   "the overlap of both angles, not the union");
+        // a group with one angle, or none that overlap, is refused
+        let mut lonely = p.clone();
+        lonely.apply(&Op::SetGroup { id: g, name: "cam".into(), clips: vec![ClipId(1)] }).unwrap();
+        assert!(from_group(&lonely, g).is_err());
+        let mut apart = p.clone();
+        apart.apply(&Op::MoveClip { id: ClipId(2), pos: Ticks::from_seconds(60.0), track: TrackId(2) }).unwrap();
+        assert!(from_group(&apart, g).unwrap_err().contains("overlap"));
+    }
+
+    #[test]
+    fn beats_come_off_the_tempo_map_in_the_span_asked_for() {
+        let t = studio_core::TempoMap::constant(120.0);  // 0.5 s a beat
+        let b = beats_from_tempo(&t, Ticks::from_seconds(10.0), Ticks::from_seconds(12.0));
+        assert_eq!(b.len(), 4, "{b:?}");
+        for (i, x) in b.iter().enumerate() { assert!((x - i as f64 * 0.5).abs() < 1e-6, "{b:?}"); }
+        // and a plan cut on every second beat lands on whole seconds
+        let (p, g) = synced_project();
+        let (angles, start, end) = from_group(&p, g).unwrap();
+        let span = (end.0 - start.0) as f64 / TICKS_PER_SECOND as f64;
+        let beats = beats_from_tempo(&t, start, end);
+        let shots = plan(&angles, &Timing::OnBeats { beats, every: 2 }, &Choice::Cycle,
+                         Rules { min_shot: 0.0, hysteresis_db: 0.0, settle: 0.0 }, span);
+        assert!(shots.len() > 10, "{} shots over {span}s", shots.len());
+        for s in &shots[1..] { assert!((s.start.fract()).abs() < 1e-6, "on the beat: {s:?}"); }
+        // and laying them out keeps every cut reading the right moment
+        let ops = layout(&shots, &angles, TrackId(9), start, 500);
+        for (op, s) in ops.iter().zip(&shots) {
+            let Op::AddClip { clip } = op else { panic!() };
+            let a = &angles[s.angle];
+            let moment = clip.src_in.to_seconds() - a.offset;
+            assert!((moment - clip.pos.to_seconds()).abs() < 1e-6,
+                    "the clip reads its own timeline moment: {clip:?} for {s:?}");
+        }
     }
 
     #[test]

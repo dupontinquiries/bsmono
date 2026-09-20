@@ -268,7 +268,7 @@ impl Pipe {
         let mut read_count = 0usize;   // frames read so far
         let mut next = 0usize;         // next frame index to write
         let mut written = 0usize;
-        let mut write = |buf: &std::collections::VecDeque<Frame>, base: usize, i: usize,
+        let write = |buf: &std::collections::VecDeque<Frame>, base: usize, i: usize,
                          f: &mut dyn FnMut(usize, &[Frame]) -> Frame,
                          stdin: &mut std::process::ChildStdin| -> Result<(), String> {
             let lo = i.saturating_sub(radius).max(base) - base;
