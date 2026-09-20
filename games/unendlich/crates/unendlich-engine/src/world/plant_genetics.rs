@@ -396,6 +396,9 @@ mod tests {
             drought_threshold: 0.5,
             branchiness: 0.5,
             resonance_gain: 1.0,
+            fire_resistance: 0.5,
+            pigment: 0.5,
+            hue: Hue::Green,
         };
         let r = growth_response(&pheno, 0.0);
         assert_eq!(r.rate_mul, 1.0);
@@ -410,6 +413,9 @@ mod tests {
             drought_threshold: 0.5,
             branchiness: 0.5,
             resonance_gain: 1.0,
+            fire_resistance: 0.5,
+            pigment: 0.5,
+            hue: Hue::Green,
         };
         let base = growth_response(&pheno, 0.0);
         let full = growth_response(&pheno, 1.0);
@@ -428,6 +434,9 @@ mod tests {
             drought_threshold: 0.5,
             branchiness: 0.5,
             resonance_gain: 0.0,
+            fire_resistance: 0.5,
+            pigment: 0.5,
+            hue: Hue::Green,
         };
         let r = growth_response(&deaf, 1.0);
         assert_eq!(r.rate_mul, 1.5);
@@ -442,6 +451,9 @@ mod tests {
             drought_threshold: 0.5,
             branchiness: 0.5,
             resonance_gain: 1.0,
+            fire_resistance: 0.5,
+            pigment: 0.5,
+            hue: Hue::Green,
         };
         let r = growth_response(&pheno, 1.0); // 24 + 8 = 32 = HARD_MAX
         assert!(r.target_height <= HARD_MAX_HEIGHT);

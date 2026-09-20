@@ -4069,6 +4069,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         pointer_touch.release();
                         true
                     }
+                    // FOCUS LOSS EATS THE MOUSE-UP. Alt-tab or click away
+                    // mid-drag and GLFW delivers no Release at all, so the
+                    // held button stayed held -- the stuck mine button.
+                    // `cancel` releases it rather than dropping it, so a
+                    // consumer sees mining STOP instead of never hearing
+                    // again.
+                    WindowEvent::Focus(false) => {
+                        pointer_touch.cancel();
+                        true
+                    }
                     WindowEvent::CursorPos(cx, cy) => {
                         let (ww, wh) = window.get_size();
                         let (fbw, fbh) = window.get_framebuffer_size();

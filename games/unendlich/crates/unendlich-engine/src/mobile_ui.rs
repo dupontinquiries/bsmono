@@ -72,6 +72,23 @@ fn clamp_scale(s: f32) -> f32 {
 }
 
 /// Does the desktop string name a mobile shell?
+/// Is this a shell we KNOW is a desktop?
+///
+/// The inverse of [`is_mobile_shell`] is not this: an unset or unfamiliar
+/// `XDG_CURRENT_DESKTOP` is unknown, not desktop. Naming the desktops
+/// explicitly is what lets a small window on a laptop be treated as a small
+/// window rather than as a phone, without that decision leaking onto a phone
+/// whose shell we have not heard of.
+pub fn is_desktop_shell(desktop: &str) -> bool {
+    let d = desktop.to_ascii_lowercase();
+    ["gnome", "kde", "plasma", "xfce", "sway", "hyprland", "i3", "cinnamon",
+     "mate", "lxqt", "budgie", "unity", "x-cinnamon", "wayfire", "river"]
+        .iter()
+        // `plasma` matches plasma-mobile too, so a mobile shell always wins:
+        // the caller checks `is_mobile_shell` first and this never sees it.
+        .any(|k| d.contains(k))
+}
+
 pub fn is_mobile_shell(desktop: &str) -> bool {
     let d = desktop.to_ascii_lowercase();
     ["phosh", "plasma-mobile", "plasma mobile", "sxmo", "lomiri", "phoc", "gnome-mobile"]
@@ -94,7 +111,24 @@ pub fn detect(h: &Hints) -> Detection {
             // portrait is the strong signal; a landscape phone (2340×1080) is
             // indistinguishable from a 1080p desktop by size, so it needs
             // the shell hint. Tiny landscape panels (handhelds) still count.
-            (portrait && short < PHONE_SHORT_SIDE_PX) || short < 600
+            // A SMALL WINDOW IS NOT A PHONE. `short < 600` fired on any
+            // laptop window under 600px tall, which is how touch controls
+            // appeared "on a small window on my laptop with no touch monitor"
+            // — and with them the stuck mine button, since a mouse cannot
+            // release a touch it never started.
+            //
+            // A framebuffer is a WINDOW on a desktop and a PANEL on a phone,
+            // and nothing about its size tells the two apart. The shell does,
+            // so on a known desktop the size heuristic is skipped entirely.
+            // An unknown shell keeps the old behaviour: a phone we have not
+            // heard of should still get its controls, and a desktop we have
+            // not heard of can set UNENDLICH_TOUCH=0.
+            let known_desktop = h.desktop.as_deref().map_or(false, is_desktop_shell);
+            if known_desktop {
+                false
+            } else {
+                (portrait && short < PHONE_SHORT_SIDE_PX) || short < 600
+            }
         }
         _ => false,
     };
@@ -255,7 +289,17 @@ pub struct PointerTouch {
 impl PointerTouch {
     pub fn press(&mut self, x: f32, y: f32, layout: &TouchLayout) {
         if self.down {
-            return;
+            // A SECOND PRESS PROVES THE RELEASE WAS LOST. Returning early
+            // here made `down` a latch: GLFW delivers no mouse-up if the
+            // window loses focus mid-drag, and after that every press was
+            // ignored and `held_button` stayed held forever. Reported as
+            // "the mine block button was stuck".
+            //
+            // A pointer cannot be pressed twice without an intervening
+            // release, so this is not a state to defend against — it is
+            // evidence that the release happened somewhere we did not see.
+            // Treat it as one and carry on, rather than wedging until restart.
+            self.cancel();
         }
         self.down = true;
         self.last = (x, y);
@@ -292,6 +336,29 @@ impl PointerTouch {
                 y: self.last.1,
                 phase: crate::touch_controls::Phase::End,
             }),
+        }
+    }
+
+    /// Let go of everything, as if the pointer had been released off-window.
+    ///
+    /// For the events that end a drag without a mouse-up: focus loss, a
+    /// window unmap, a modal taking over. The held button is RELEASED rather
+    /// than dropped, so a consumer holding "mine" sees it stop instead of
+    /// mining forever.
+    pub fn cancel(&mut self) {
+        if !self.down {
+            return;
+        }
+        self.down = false;
+        if let Some(b) = self.held_button.take() {
+            self.released.push(b);
+        } else {
+            self.touches.push(crate::touch_controls::Touch {
+                id: 1,
+                x: self.last.0,
+                y: self.last.1,
+                phase: crate::touch_controls::Phase::End,
+            });
         }
     }
 
@@ -426,5 +493,95 @@ mod tests {
             let m = is_mobile_shell(d);
             assert_eq!(m, d != "GNOME", "{d}");
         }
+    }
+
+    /// A SMALL WINDOW IS NOT A PHONE. Reported: touch controls "appeared on a
+    /// small window on my laptop with no touch monitor".
+    #[test]
+    fn a_small_window_on_a_desktop_shell_gets_no_touch_controls() {
+        for shell in ["GNOME", "KDE", "sway", "Hyprland", "XFCE"] {
+            let d = detect(&Hints {
+                fb: Some((900, 540)),           // under the old `short < 600`
+                desktop: Some(shell.to_ascii_lowercase()),
+                ..Default::default()
+            });
+            assert!(!d.touch, "{shell}: a 900x540 window is a window, not a phone");
+        }
+    }
+
+    /// A phone still gets them -- the fix must not cure the false positive by
+    /// creating a false negative.
+    #[test]
+    fn a_phone_still_gets_touch_controls() {
+        let phosh = detect(&Hints {
+            fb: Some((720, 1440)),
+            desktop: Some("phosh".into()),
+            ..Default::default()
+        });
+        assert!(phosh.touch, "a mobile shell must still be a phone");
+        // And an UNKNOWN shell keeps the size heuristic: a phone we have not
+        // heard of should still work out of the box.
+        let unknown = detect(&Hints { fb: Some((720, 1440)), desktop: None, ..Default::default() });
+        assert!(unknown.touch, "portrait and small, on an unnamed shell");
+    }
+
+    /// The env override still wins over all of it, in both directions.
+    #[test]
+    fn the_env_override_beats_the_shell() {
+        let forced_on = detect(&Hints {
+            fb: Some((1920, 1080)), desktop: Some("gnome".into()),
+            env_touch: Some(true), ..Default::default()
+        });
+        assert!(forced_on.touch, "UNENDLICH_TOUCH=1 on a desktop");
+        let forced_off = detect(&Hints {
+            fb: Some((720, 1440)), desktop: Some("phosh".into()),
+            env_touch: Some(false), ..Default::default()
+        });
+        assert!(!forced_off.touch, "UNENDLICH_TOUCH=0 on a phone");
+    }
+
+    /// THE STUCK BUTTON. `press` returned early while `down`, so one lost
+    /// mouse-up latched the button and every later press was ignored.
+    #[test]
+    fn a_lost_release_does_not_wedge_the_pointer() {
+        let l = layout(1080.0, 2340.0, 2.5);
+        let Some((_, c)) = l.buttons.first() else { return };
+        let (bx, by) = (c.cx, c.cy);
+        let mut p = PointerTouch::default();
+        p.press(bx, by, &l);
+        assert!(p.held_button.is_some(), "the press took the button");
+        p.end_frame();
+        // The mouse-up never arrives -- focus went elsewhere mid-drag.
+        // The NEXT press must work rather than being swallowed forever.
+        p.press(bx, by, &l);
+        assert!(p.held_button.is_some(), "the second press was ignored: wedged");
+        assert!(!p.released.is_empty() || !p.tapped.is_empty(),
+                "the recovered press must be observable");
+    }
+
+    /// `cancel` RELEASES the held button rather than dropping it, so a
+    /// consumer holding "mine" sees it stop instead of mining forever.
+    #[test]
+    fn cancelling_a_drag_reports_the_release() {
+        let l = layout(1080.0, 2340.0, 2.5);
+        let Some((_, c)) = l.buttons.first() else { return };
+        let b = (c.cx, c.cy);
+        let mut p = PointerTouch::default();
+        p.press(b.0, b.1, &l);
+        let held = p.held_button;
+        p.end_frame();
+        p.cancel();
+        assert!(!p.down);
+        assert!(p.held_button.is_none(), "nothing is still held");
+        assert_eq!(p.released.first().copied(), held,
+                   "the button must be RELEASED, not silently dropped");
+    }
+
+    /// Cancelling when nothing is down is a no-op, not a spurious release.
+    #[test]
+    fn cancelling_an_idle_pointer_reports_nothing() {
+        let mut p = PointerTouch::default();
+        p.cancel();
+        assert!(p.released.is_empty() && p.touches.is_empty());
     }
 }

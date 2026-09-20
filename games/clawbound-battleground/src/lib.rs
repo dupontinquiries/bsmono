@@ -40,6 +40,10 @@ pub mod camps;
 /// than minutes. The half of the scent system wildkit does not cover, because
 /// a trail answers "who walked here" and a marker answers "whose ground is
 /// this".
+/// What the bot TEAM is doing, as opposed to what each bot is doing: one
+/// quorum-gated objective the individual brains defer to, with
+/// self-preservation outranking it.
+pub mod teamplay;
 pub mod markers;
 /// The clock, and what it does to a cat's senses. `wildkit::sim::climate` says
 /// what the weather is like at a place; this says what time it is, which is
