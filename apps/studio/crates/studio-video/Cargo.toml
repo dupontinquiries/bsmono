@@ -12,5 +12,8 @@ testkit = []
 studio-audio = { path = "../studio-audio" }
 studio-media = { path = "../studio-media" }
 studio-core = { path = "../studio-core" }
+# Clip picture effects (`transform`, `color`) are parsed by studio-fx's own
+# `instantiate`, so the export reads the same params and defaults as the preview.
+studio-fx = { path = "../studio-fx" }
 serde_json = "1"
 sha2 = "0.10"

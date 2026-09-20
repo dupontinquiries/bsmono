@@ -33,16 +33,106 @@ use studio_core::{Project, SourceId, Ticks, TrackKind};
 
 /// One piece of the picture: `len` of `path` from `src_in`, placed at
 /// `at` on the output.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Cut {
     pub path: PathBuf,
     pub src_in: Ticks,
     pub len: Ticks,
     pub at: Ticks,
+    /// The clip's picture effects, as the preview reads them.
+    pub picture: Picture,
+}
+
+/// What the export does to a cut's picture: the clip's `color` and
+/// `transform` effects, parsed by `studio_fx::instantiate` — the same parser
+/// the viewport uses — so the file shows what the preview showed.
+///
+/// Until this existed the export ignored every clip effect: a reframe or a
+/// grade seen in the viewport was simply absent from the rendered file.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Picture {
+    pub transform: Option<studio_fx::Transform>,
+    pub color: Option<studio_fx::Color>,
+    /// Effects that change the picture in the preview but that this export
+    /// cannot yet reproduce, named for the person exporting. Never silently
+    /// dropped: a file that differs from the preview must say so.
+    pub unsupported: Vec<String>,
+}
+
+impl Picture {
+    /// From a clip's effect list, in order (a later effect of the same kind
+    /// wins, as in the viewport).
+    pub fn of(effects: &[studio_core::Effect]) -> Picture {
+        let mut p = Picture::default();
+        for fx in effects.iter().filter(|f| f.enabled) {
+            match studio_fx::instantiate(fx, 48_000.0) {
+                Some(studio_fx::Instance::Transform(t)) => {
+                    p.transform = (!t.is_identity()).then_some(t);
+                    p.unsupported.retain(|u| !u.starts_with("transform"));
+                    if t.rotation.abs() > 1e-4 { p.unsupported.push("transform rotation".into()); }
+                    if (t.opacity - 1.0).abs() > 1e-4 { p.unsupported.push("transform opacity".into()); }
+                }
+                Some(studio_fx::Instance::Color(c)) => p.color = (!c.is_identity()).then_some(c),
+                Some(studio_fx::Instance::Blend(..)) => p.unsupported.push("blend (layer compositing)".into()),
+                Some(studio_fx::Instance::Retime(..)) => p.unsupported.push("retime".into()),
+                _ => {}
+            }
+        }
+        p
+    }
+
+    pub fn is_identity(&self) -> bool { self.transform.is_none() && self.color.is_none() }
+
+    /// The filter chain from a fitted `w`×`h` frame to the finished picture,
+    /// as `(foreground chain, overlay position)`. The foreground chain runs on
+    /// the fitted frame; when there is a transform it ends smaller than the
+    /// canvas and is overlaid on black at the position given.
+    fn filters(&self, w: u32, h: u32) -> (String, Option<(i64, i64)>) {
+        let mut f = String::new();
+        if let Some(c) = &self.color {
+            // Lift, then gamma, then gain, per channel — studio_fx::Color::apply's order.
+            let ch = |i: usize| format!("pow(max(val/255+({:.6}),0),1/{:.6})*{:.6}*255",
+                                        c.lift[i], c.gamma[i].max(1e-3), c.gain[i]);
+            f.push_str(&format!(",lutrgb=r='{}':g='{}':b='{}'", ch(0), ch(1), ch(2)));
+            if (c.saturation - 1.0).abs() > 1e-6 {
+                // y + (c - y)·s with Rec.709 luma, as a 3×3 matrix.
+                let s = c.saturation;
+                let (kr, kg, kb) = (0.2126 * (1.0 - s), 0.7152 * (1.0 - s), 0.0722 * (1.0 - s));
+                f.push_str(&format!(
+                    ",colorchannelmixer=rr={:.6}:rg={kg:.6}:rb={kb:.6}:gr={kr:.6}:gg={:.6}:gb={kb:.6}:br={kr:.6}:bg={kg:.6}:bb={:.6}",
+                    kr + s, kg + s, kb + s));
+            }
+        }
+        let Some(t) = &self.transform else { return (f, None) };
+        // Forward map of the compositor's inverse: a layer point u (0..1)
+        // lands at canvas px = ax + (u·W − ax)·sx + ox. Rotation is not
+        // reproduced (reported in `unsupported`).
+        let (wf, hf) = (w as f64, h as f64);
+        let (cl, ct, cr, cb) = (t.crop.0 as f64, t.crop.1 as f64, t.crop.2 as f64, t.crop.3 as f64);
+        let (sx, sy) = ((t.scale_x as f64).max(1e-4), (t.scale_y as f64).max(1e-4));
+        let (ax, ay) = (t.anchor_x as f64 * wf, t.anchor_y as f64 * hf);
+        let cx = (cl * wf).round().max(0.0);
+        let cy = (ct * hf).round().max(0.0);
+        let cw = (((1.0 - cl - cr) * wf).round()).clamp(1.0, wf - cx);
+        let chh = (((1.0 - ct - cb) * hf).round()).clamp(1.0, hf - cy);
+        // Place by the continuous edges, then cover exactly the canvas pixels
+        // whose CENTRES fall inside — the compositor samples at pixel centres,
+        // and rounding the cropped size first and scaling second was off by a
+        // row or column at each edge (measured: 19 rows where it drew 20).
+        let edge_x = |u: f64| ax + (u * wf - ax) * sx + t.x as f64 * wf;
+        let edge_y = |v: f64| ay + (v * hf - ay) * sy + t.y as f64 * hf;
+        let first = |e: f64| (e - 0.5).ceil();
+        let (px0, px1) = (first(edge_x(cl)), first(edge_x(1.0 - cr)));
+        let (py0, py1) = (first(edge_y(ct)), first(edge_y(1.0 - cb)));
+        let (ow, oh) = ((px1 - px0).max(1.0), (py1 - py0).max(1.0));
+        f.push_str(&format!(",crop={cw}:{chh}:{cx}:{cy},scale={ow}:{oh}:flags=bicubic"));
+        let (x0, y0) = (px0, py0);
+        (f, Some((x0.round() as i64, y0.round() as i64)))
+    }
 }
 
 /// A segment of the output: a cut, or black.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Segment {
     Cut(Cut),
     Black { at: Ticks, len: Ticks },
@@ -92,6 +182,7 @@ pub fn edit_list(project: &Project, paths: &BTreeMap<SourceId, PathBuf>, end: Op
                 src_in: c.src_in.saturating_add(s.saturating_sub(c.pos)),
                 len: e.saturating_sub(s),
                 at: s,
+                picture: Picture::of(&c.effects),
             });
             covered.push((s, e));
         }
@@ -125,11 +216,26 @@ pub fn render_args(segments: &[Segment], audio: Option<&Path>, out: &Path, w: u3
     let audio_index = inputs.len();
     if let Some(a) = audio { args.push("-i".into()); args.push(a.to_string_lossy().into_owned()); }
     let fit = format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p");
+    // A cut with picture effects is processed in RGB — the colour maths is
+    // per RGB channel, and cropping 4:2:0 to odd sizes would shift chroma.
+    let fit_rgb = format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=rgb24");
     let mut filter = String::new();
     let mut labels = Vec::new();
     for (i, s) in segments.iter().enumerate() {
         let label = format!("[s{i}]");
         match s {
+            Segment::Cut(c) if !c.picture.is_identity() => {
+                let input = inputs.iter().position(|p| *p == c.path).expect("collected above");
+                let (chain, at) = c.picture.filters(w, h);
+                let base = format!("[{input}:v]trim=start={:.6}:duration={:.6},setpts=PTS-STARTPTS,{fit_rgb}{chain}",
+                                   c.src_in.to_seconds(), c.len.to_seconds());
+                match at {
+                    None => filter.push_str(&format!("{base},format=yuv420p{label};")),
+                    Some((x, y)) => filter.push_str(&format!(
+                        "{base}[fg{i}];color=c=black:s={w}x{h}:r={fps}:d={:.6},format=rgb24[bg{i}];\
+[bg{i}][fg{i}]overlay=x={x}:y={y}:shortest=1:format=rgb,format=yuv420p{label};", c.len.to_seconds())),
+                }
+            }
             Segment::Cut(c) => {
                 let input = inputs.iter().position(|p| *p == c.path).expect("collected above");
                 filter.push_str(&format!(
@@ -156,6 +262,17 @@ pub fn render_args(segments: &[Segment], audio: Option<&Path>, out: &Path, w: u3
                  "-movflags".into(), "+faststart".into()]);
     args.push(out.to_string_lossy().into_owned());
     args
+}
+
+/// Everything the export will NOT reproduce from the preview, one line per
+/// cut that has any, for the status line. Empty means the file will match.
+pub fn unsupported(segments: &[Segment]) -> Vec<String> {
+    segments.iter().filter_map(|s| match s {
+        Segment::Cut(c) if !c.picture.unsupported.is_empty() => Some(format!(
+            "{} at {:.2}s: {} not rendered", c.path.file_name().map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(), c.at.to_seconds(), c.picture.unsupported.join(", "))),
+        _ => None,
+    }).collect()
 }
 
 /// Render `segments` with `audio` under it to `out`. `segments` must be
@@ -245,9 +362,9 @@ mod tests {
     fn the_command_names_each_file_once_and_concatenates_in_order() {
         let a: PathBuf = "a.mp4".into();
         let segs = vec![
-            Segment::Cut(Cut { path: a.clone(), src_in: s(0.0), len: s(1.0), at: s(0.0) }),
+            Segment::Cut(Cut { path: a.clone(), src_in: s(0.0), len: s(1.0), at: s(0.0), picture: Picture::default() }),
             Segment::Black { at: s(1.0), len: s(0.5) },
-            Segment::Cut(Cut { path: a.clone(), src_in: s(3.0), len: s(1.0), at: s(1.5) }),
+            Segment::Cut(Cut { path: a.clone(), src_in: s(3.0), len: s(1.0), at: s(1.5), picture: Picture::default() }),
         ];
         let args = render_args(&segs, Some(Path::new("mix.wav")), Path::new("out.mp4"), 640, 360, 25);
         let inputs: Vec<&String> = args.windows(2).filter(|w| w[0] == "-i").map(|w| &w[1]).collect();
@@ -336,5 +453,101 @@ mod tests {
         assert!(is(colour_at(1.25), false, false, false), "1.25 s: black, got {:?}", colour_at(1.25));
         assert!(is(colour_at(1.75), true, false, false), "1.75 s: red again, got {:?}", colour_at(1.75));
         for f in [red, blue, out, wav] { let _ = std::fs::remove_file(f); }
+    }
+
+    fn fx(kind: &str, params: &[(&str, f32)]) -> studio_core::Effect {
+        studio_core::Effect { kind: kind.into(), enabled: true,
+            params: params.iter().map(|(k, v)| (k.to_string(), *v)).collect() }
+    }
+
+    #[test]
+    fn picture_effects_reach_the_edit_list_and_unrenderable_ones_are_named() {
+        let paths: BTreeMap<SourceId, PathBuf> = [(SourceId(1), "a.mp4".into())].into();
+        let mut p = project_with(&paths);
+        clip(&mut p, 1, 1, 1, 0.0, 2.0, 0.0);
+        p.apply(&Op::SetEffects { id: ClipId(1), effects: vec![
+            fx("color", &[("gain_r", 0.5)]),
+            fx("transform", &[("scale_x", 0.5), ("scale_y", 0.5), ("rotation", 10.0)]),
+            fx("blend", &[]),
+            fx("eq", &[]),                                     // audio: not the picture's business
+            studio_core::Effect { enabled: false, ..fx("transform", &[("x", 0.3)]) },  // disabled: ignored
+        ] }).unwrap();
+        let list = edit_list(&p, &paths, None);
+        let Segment::Cut(c) = &list[0] else { panic!("{list:?}") };
+        assert_eq!(c.picture.color.unwrap().gain[0], 0.5);
+        assert_eq!(c.picture.transform.unwrap().scale_x, 0.5);
+        assert_eq!(c.picture.transform.unwrap().x, 0.0, "the disabled transform did not win");
+        let warn = unsupported(&list);
+        assert_eq!(warn.len(), 1, "{warn:?}");
+        assert!(warn[0].contains("rotation") && warn[0].contains("blend"), "{warn:?}");
+        // identity effects cost nothing: the cut takes the plain path
+        let plain = Picture::of(&[fx("transform", &[]), fx("color", &[])]);
+        assert!(plain.is_identity());
+        let args = render_args(&[Segment::Cut(Cut { path: "a.mp4".into(), src_in: s(0.0), len: s(1.0),
+            at: s(0.0), picture: plain })], None, Path::new("o.mp4"), 64, 36, 12);
+        assert!(!args.iter().any(|a| a.contains("overlay") || a.contains("lutrgb")), "{args:?}");
+    }
+
+    /// The export must show what the viewport shows. Render a transformed,
+    /// graded cut through ffmpeg and compare every pixel against the
+    /// viewport's own compositor fed the same source frame.
+    #[test]
+    fn the_export_matches_the_viewport_for_transform_and_colour() {
+        if !crate::testkit::ffmpeg_or_skip("the_export_matches_the_viewport_for_transform_and_colour") { return; }
+        let shoot = crate::testkit::shoot(&[1.0], 4.0);
+        let take = &shoot.takes[0];
+        let (w, h) = (64u32, 36u32);
+        let t = studio_fx::Transform { x: 0.1, y: -0.05, scale_x: 0.5, scale_y: 0.6,
+            crop: (0.2, 0.0, 0.0, 0.1), ..Default::default() };
+        let c = studio_fx::Color { lift: [0.0, 0.0, 0.1], gamma: [1.0, 1.6, 1.0],
+            gain: [0.6, 1.0, 1.0], saturation: 0.7 };
+        let picture = Picture { transform: Some(t), color: Some(c), unsupported: vec![] };
+        let seg = Segment::Cut(Cut { path: take.video.clone(), src_in: s(1.0), len: s(1.0), at: s(0.0), picture });
+        let out = shoot.dir.join(format!("fx-{}.mp4", std::process::id()));
+        render(&[seg], None, &out, w, h, 12).expect("render");
+        let got = super::super::frame_rgb(&out, s(0.5), w, h).unwrap();
+        // The viewport's path: the source frame, graded, through the compositor.
+        let src = super::super::frame_rgb(&take.video, s(1.5), w, h).unwrap();
+        let graded: Vec<u8> = src.chunks(3).flat_map(|p| {
+            let o = c.apply([p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0]);
+            o.map(|v| (v * 255.0 + 0.5) as u8)
+        }).collect();
+        let want = studio_fx::compositor::composite(w, h, [0, 0, 0], &[studio_fx::compositor::Layer {
+            rgb: &graded, w, h, transform: t, mode: studio_fx::compositor::BlendMode::Normal, opacity: 1.0 }]);
+        // Coverage: which pixels are picture and which are black must agree
+        // away from edges (bicubic vs nearest disagree on a 1-px border).
+        let lit = |px: &[u8], i: usize| px[i] as u32 + px[i + 1] as u32 + px[i + 2] as u32 > 60;
+        let mut inside = 0;
+        let mut disagree = 0;
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let i = (y * w as usize + x) * 3;
+                if lit(&want, i) { inside += 1; }
+                if lit(&want, i) != lit(&got, i) { disagree += 1; }
+            }
+        }
+        assert!(inside > 200 && inside < (w * h) as usize - 200, "the transform must leave both picture and black: {inside}");
+        let bbox = |px: &[u8]| {
+            let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
+            for y in 0..h as usize { for x in 0..w as usize {
+                if lit(px, (y * w as usize + x) * 3) { x0 = x0.min(x); y0 = y0.min(y); x1 = x1.max(x); y1 = y1.max(y); }
+            }}
+            (x0, y0, x1, y1)
+        };
+        // Placement must be exact: same box, not merely similar. (overlay's
+        // default yuv420 format rounds x/y to even — it put this box one
+        // pixel up and left, which a pixel-count tolerance let through.)
+        assert_eq!(bbox(&got), bbox(&want), "placed box");
+        assert!(disagree <= 40, "{disagree} pixels disagree on coverage");
+        // Colour, at the centre of the placed picture: within codec error.
+        let (cx, cy) = (((0.5 + 0.1) * w as f64) as usize, ((0.5 - 0.05) * h as f64) as usize);
+        let i = (cy * w as usize + cx) * 3;
+        for k in 0..3 {
+            assert!((got[i + k] as i32 - want[i + k] as i32).abs() <= 8,
+                    "channel {k}: export {:?} vs viewport {:?}", &got[i..i + 3], &want[i..i + 3]);
+        }
+        // and the grade actually did something measurable
+        assert!((want[i] as i32 - take.rgb[0] as i32).abs() > 40, "{:?} vs source {:?}", &want[i..i + 3], take.rgb);
+        let _ = std::fs::remove_file(&out);
     }
 }

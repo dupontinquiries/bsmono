@@ -406,6 +406,18 @@ pub fn render_music_video(
     result.map(|()| out.to_path_buf())
 }
 
+/// What the video export will not reproduce from the viewport (rotation,
+/// layer blends, retiming — see `studio_video::edit::Picture`), one line per
+/// affected cut. The export still runs; these go to the tracker as notes so
+/// a file that differs from the preview says so instead of surprising.
+pub fn video_warnings(project: &Project) -> Vec<String> {
+    let paths: std::collections::BTreeMap<studio_core::SourceId, PathBuf> = project.sources.values()
+        .filter(|s| s.has_video)
+        .map(|s| (s.id, PathBuf::from(&s.path)))
+        .collect();
+    studio_video::edit::unsupported(&studio_video::edit::edit_list(project, &paths, None))
+}
+
 /// [`render_music_video`] on a worker, reported through the same `Run`
 /// the audio exports use so the tracker window shows it. Cancel is not
 /// honoured mid-render: ffmpeg is one child process and this crate does
@@ -426,6 +438,9 @@ pub fn start_video(
         if flag.load(Ordering::Relaxed) { let _ = tx.send(Event::Cancelled); return; }
         let _ = tx.send(Event::Progress { done: 0, jobs: 1, frac: 0.0 });
         let _ = tx.send(Event::Note("rendering the video through ffmpeg — this takes a while".into()));
+        for w in video_warnings(&project) {
+            let _ = tx.send(Event::Note(format!("differs from the preview: {w}")));
+        }
         match render_music_video(&project, &audio, &out, rate, width, height, fps) {
             Ok(p) => { let _ = tx.send(Event::File(p)); let _ = tx.send(Event::Done); }
             Err(e) => { let _ = tx.send(Event::Failed(e)); }

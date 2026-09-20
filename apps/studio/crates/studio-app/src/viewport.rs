@@ -60,14 +60,16 @@ pub fn layers_at(project: &Project, playhead: Ticks) -> Vec<LayerSpec> {
                 let mut transform = studio_fx::Transform::default();
                 let mut mode = studio_fx::compositor::BlendMode::Normal;
                 let mut opacity = 1.0;
+                let mut color = None;
                 for fx in c.effects.iter().filter(|f| f.enabled) {
                     match studio_fx::instantiate(fx, 48_000.0) {
                         Some(studio_fx::Instance::Transform(t)) => transform = t,
+                        Some(studio_fx::Instance::Color(g)) => color = (!g.is_identity()).then_some(g),
                         Some(studio_fx::Instance::Blend(m, o)) => { mode = m; opacity = o; }
                         _ => {}
                     }
                 }
-                out.push(LayerSpec { path: src.path.clone(), media, transform, mode, opacity });
+                out.push(LayerSpec { path: src.path.clone(), media, transform, mode, opacity, color });
                 break;
             }
         }
@@ -82,6 +84,22 @@ pub struct LayerSpec {
     pub transform: studio_fx::Transform,
     pub mode: studio_fx::compositor::BlendMode,
     pub opacity: f32,
+    /// The clip's `color` grade — applied to the layer before compositing,
+    /// the same order the export uses (`studio_video::edit::Picture`), so
+    /// the preview no longer shows an ungraded picture the file won't have.
+    pub color: Option<studio_fx::Color>,
+}
+
+impl LayerSpec {
+    /// Grade a fetched frame in place.
+    pub fn grade(&self, px: &mut [u8]) {
+        if let Some(c) = &self.color {
+            for p in px.chunks_mut(3) {
+                let o = c.apply([p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0]);
+                for k in 0..3 { p[k] = (o[k] * 255.0 + 0.5) as u8; }
+            }
+        }
+    }
 }
 
 pub fn coarse(t: Ticks) -> i64 {
@@ -113,13 +131,16 @@ pub fn show(ui: &mut egui::Ui, project: &Project, playhead: Ticks,
     let layers = layers_at(project, playhead);
     // The key names every layer at its coarse time, so a second track
     // appearing or a blend changing re-composites; one track is the old key.
-    let key = (layers.iter().map(|l| format!("{}@{}:{:?}:{:.2}", l.path, coarse(l.media), l.mode, l.opacity)).collect::<Vec<_>>().join("|"), coarse(media));
+    // Transform and grade are in the key: without them, adjusting either left
+    // the old picture on screen until the playhead crossed a half-second.
+    let key = (layers.iter().map(|l| format!("{}@{}:{:?}:{:.2}:{:?}:{:?}", l.path, coarse(l.media), l.mode, l.opacity,
+                                             l.transform, l.color)).collect::<Vec<_>>().join("|"), coarse(media));
     if cache.key.as_ref() != Some(&key) && cache.failed.as_ref() != Some(&key) {
         let mut frames: Vec<(Vec<u8>, &LayerSpec)> = Vec::new();
         let mut err = None;
         for l in &layers {
             match studio_video::frame_rgb(&base.join(&l.path), l.media, W, H) {
-                Ok(px) => frames.push((px, l)),
+                Ok(mut px) => { l.grade(&mut px); frames.push((px, l)) }
                 Err(e) => { err = Some(format!("{e:?}")); break; }
             }
         }
