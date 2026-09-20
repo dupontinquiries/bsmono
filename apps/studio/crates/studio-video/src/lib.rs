@@ -68,6 +68,8 @@ pub mod spoken_slate;
 pub mod testkit;
 /// Warp stabilization: measure the camera path once, solve it per flavour (still/smooth/dejerk/track).
 pub mod stabilize;
+/// Multiview grid geometry: tiles that cover the canvas exactly, and what they cost in detail.
+pub mod grid;
 /// Multicam: cut between synced angles from a control channel's level and/or beats.
 pub mod multicam;
 /// Many camera takes against many recorder files: which sound is whose, by listening.
