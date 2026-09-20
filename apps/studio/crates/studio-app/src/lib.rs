@@ -3075,6 +3075,8 @@ pub struct App {
     export_note: String,
     /// A render in flight, drained once per frame into the tracker.
     export_run: Option<export::Run>,
+    /// The camera group the program monitor is showing as a grid, if any.
+    multiview: Option<studio_core::GroupId>,
     /// A stabilize/clean-plate render in flight, and the clip it belongs to.
     touchup_run: Option<touchup_job::Job>,
     export_done: Vec<std::path::PathBuf>,
@@ -3255,6 +3257,7 @@ impl Default for App {
               export_note: String::new(),
               export_run: None,
               touchup_run: None,
+              multiview: None,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
               upscale_clip: None,
@@ -4769,7 +4772,10 @@ impl eframe::App for App {
                         None => { ui.label(egui::RichText::new("no video under the playhead").weak().small()); }
                     }
                 });
-                viewport::show(ui, project, ph, &base, &mut self.frame_cache, &colors);
+                match self.multiview {
+                    Some(g) => viewport::show_multiview(ui, project, ph, g, &base, &mut self.frame_cache, &colors),
+                    None => viewport::show(ui, project, ph, &base, &mut self.frame_cache, &colors),
+                }
             });
         }
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -5520,6 +5526,18 @@ impl App {
                             if self.lexicon.to_tokens().is_empty() { "common only".into() }
                             else { self.lexicon.to_tokens() });
                     }
+                }
+                palette::ShellVerb::Multiview(group) => {
+                    // Toggling: choosing the group that is already showing
+                    // puts the monitor back on the cut, which is the way out
+                    // without a second command to find.
+                    self.multiview = if self.multiview == group { None } else { group };
+                    self.frame_cache = viewport::FrameCache::default();
+                    self.studio.status = match self.multiview {
+                        Some(g) => format!("multiview: {}", self.studio.session.doc.project.groups
+                            .get(&g).map(|x| x.name.clone()).unwrap_or_default()),
+                        None => "program monitor back on the cut".into(),
+                    };
                 }
                 palette::ShellVerb::TouchUpStabilize(kind) => self.start_stabilize(kind),
                 palette::ShellVerb::TouchUpCleanPlate { radius, moving } =>

@@ -79,6 +79,9 @@ pub enum ShellVerb {
     MulticamLevel { group: studio_core::GroupId, bus: BusId },
     /// Stabilize the selected clip with one of the flavours. A shell verb:
     /// it renders a file in the background and then relinks the clip.
+    /// Show a camera group as a grid in the program monitor, or `None` to
+    /// go back to the cut.
+    Multiview(Option<studio_core::GroupId>),
     TouchUpStabilize(StabilizeKind),
     /// Clean-plate the selected clip: remove something that crosses it,
     /// using `radius` frames each side. `moving` warps the neighbours onto
@@ -212,6 +215,8 @@ pub enum Ask {
     MulticamLevelBus(studio_core::GroupId),
     /// Which stabilizer flavour to run on the selected clip.
     StabilizeFlavor,
+    /// Which camera group to watch as a grid.
+    MultiviewGroup,
     /// Whether the camera moves during the shot being cleaned, then how many
     /// frames each side to look at.
     CleanPlateCamera,
@@ -285,6 +290,8 @@ pub fn root() -> Vec<Choice> {
         // Markers: the one request both the FL Studio and kdenlive
         // communities make in the same words.
         c("drop a marker here", None, Then::Do(Act::Shell(ShellVerb::MarkerHere))),
+        c("multiview a camera group (watch every angle)", Some("or go back to the cut"),
+          Then::Ask(Ask::MultiviewGroup)),
         c("stabilize the selected clip", Some("still / smooth / de-jerk"),
           Then::Ask(Ask::StabilizeFlavor)),
         c("clean plate the selected clip (remove something crossing it)",
@@ -580,6 +587,14 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
                     then: Then::Do(Act::Ops(ops)),
                 }
             }).collect()
+        }
+        Ask::MultiviewGroup => {
+            let mut out: Vec<Choice> = project.groups.iter()
+                .filter(|(id, _)| studio_video::multicam::from_group(project, **id).is_ok())
+                .map(|(id, g)| plain(g.name.clone(), Then::Do(Act::Shell(ShellVerb::Multiview(Some(*id))))))
+                .collect();
+            out.push(plain("back to the cut".into(), Then::Do(Act::Shell(ShellVerb::Multiview(None)))));
+            out
         }
         Ask::StabilizeFlavor => vec![
             Choice { label: "smooth-cam (keep the move, lose the shake)".into(),
