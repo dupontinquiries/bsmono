@@ -112,7 +112,61 @@ pub fn edit_list(project: &Project, paths: &BTreeMap<SourceId, PathBuf>, end: Op
 /// The ffmpeg arguments that render `segments` at `w`×`h`, `fps`, with
 /// `audio` (a WAV of the mixdown) underneath, to `out`. Pure, so the
 /// command is testable without running it.
+/// How a source that is not the output's shape is made to fit.
+///
+/// This was one hardcoded filter string, applied to every cut with no way to
+/// choose otherwise, so letterboxing was not a missing feature but an
+/// unexposed policy.
+///
+/// ## The bars stay COMPUTED
+///
+/// None of these bakes black pixels into the source. The padding is produced
+/// at render time from the fit and the frame size, which is what lets a
+/// project change its aspect later — bake the bars and that change cannot
+/// undo them, and a source that was already letterboxed gets bars inside bars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Fit {
+    /// Fit the whole frame inside, pad the rest. Nothing is cropped.
+    ///
+    /// The default because it is the only one that never destroys picture, and
+    /// because it is what this pipeline has always done — changing the default
+    /// would silently re-render every existing project differently.
+    #[default]
+    Contain,
+    /// Fill the frame, cropping whatever overflows. No bars, edges lost.
+    Cover,
+    /// Stretch to the frame, ignoring aspect. Rarely right, occasionally
+    /// exactly what is wanted for a source with bad metadata.
+    Stretch,
+}
+
+impl Fit {
+    /// The scale/crop/pad chain for this policy, at `w`x`h`.
+    ///
+    /// `force_original_aspect_ratio` does the arithmetic; `crop` and `pad`
+    /// then take the frame to exactly the output size, because `scale` alone
+    /// lands on one axis and leaves the other short or over.
+    pub fn chain(self, w: u32, h: u32) -> String {
+        match self {
+            // Written on one line each. A `\` continuation would strip the
+            // newline and the indent, but a filter string is a place where
+            // "probably strips exactly what I meant" is not good enough --
+            // one stray space and ffmpeg rejects the whole graph.
+            Fit::Contain =>
+                format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"),
+            Fit::Cover =>
+                format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"),
+            Fit::Stretch => format!("scale={w}:{h}"),
+        }
+    }
+}
+
 pub fn render_args(segments: &[Segment], audio: Option<&Path>, out: &Path, w: u32, h: u32, fps: u32) -> Vec<String> {
+    render_args_with(segments, audio, out, w, h, fps, Fit::default())
+}
+
+/// `render_args` with an explicit fit policy.
+pub fn render_args_with(segments: &[Segment], audio: Option<&Path>, out: &Path, w: u32, h: u32, fps: u32, fit: Fit) -> Vec<String> {
     let mut args: Vec<String> = vec!["-y".into(), "-hide_banner".into(), "-loglevel".into(), "error".into()];
     // One input per distinct file, in first-use order.
     let mut inputs: Vec<PathBuf> = Vec::new();
@@ -124,7 +178,10 @@ pub fn render_args(segments: &[Segment], audio: Option<&Path>, out: &Path, w: u3
     for p in &inputs { args.push("-i".into()); args.push(p.to_string_lossy().into_owned()); }
     let audio_index = inputs.len();
     if let Some(a) = audio { args.push("-i".into()); args.push(a.to_string_lossy().into_owned()); }
-    let fit = format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p");
+    // The fit chain, then the invariants every cut needs regardless of it:
+    // square pixels, one frame rate, one pixel format -- concat refuses inputs
+    // that disagree on any of them.
+    let fit = format!("{},setsar=1,fps={fps},format=yuv420p", fit.chain(w, h));
     let mut filter = String::new();
     let mut labels = Vec::new();
     for (i, s) in segments.iter().enumerate() {
@@ -336,5 +393,78 @@ mod tests {
         assert!(is(colour_at(1.25), false, false, false), "1.25 s: black, got {:?}", colour_at(1.25));
         assert!(is(colour_at(1.75), true, false, false), "1.75 s: red again, got {:?}", colour_at(1.75));
         for f in [red, blue, out, wav] { let _ = std::fs::remove_file(f); }
+    }
+
+    /// THE DEFAULT MUST NOT CHANGE. This pipeline has always fit-inside-and-
+    /// padded; a different default would silently re-render every existing
+    /// project.
+    #[test]
+    fn the_default_fit_is_what_the_pipeline_always_did() {
+        assert_eq!(Fit::default(), Fit::Contain);
+        let c = Fit::Contain.chain(1920, 1080);
+        assert!(c.contains("force_original_aspect_ratio=decrease"), "{c}");
+        assert!(c.contains("pad=1920:1080:(ow-iw)/2:(oh-ih)/2"), "centred: {c}");
+        assert!(!c.contains("crop"), "Contain never crops: {c}");
+    }
+
+    /// Cover fills and crops; the distinction from Contain is `increase`
+    /// versus `decrease`, which is one word and the entire difference.
+    #[test]
+    fn cover_fills_the_frame_and_crops_rather_than_padding() {
+        let c = Fit::Cover.chain(1920, 1080);
+        assert!(c.contains("force_original_aspect_ratio=increase"), "{c}");
+        assert!(c.contains("crop=1920:1080"), "{c}");
+        assert!(!c.contains("pad="), "Cover leaves no bars: {c}");
+    }
+
+    /// Stretch ignores aspect entirely -- no ratio flag at all, which is what
+    /// makes it the one that distorts.
+    #[test]
+    fn stretch_does_not_preserve_aspect() {
+        let c = Fit::Stretch.chain(1920, 1080);
+        assert_eq!(c, "scale=1920:1080");
+        assert!(!c.contains("force_original_aspect_ratio"), "{c}");
+    }
+
+    /// THE BARS STAY COMPUTED. No policy writes black pixels into a source --
+    /// bake them and a later aspect change cannot undo them, and an already-
+    /// letterboxed source gets bars inside bars.
+    #[test]
+    fn no_fit_bakes_anything_into_the_source() {
+        for f in [Fit::Contain, Fit::Cover, Fit::Stretch] {
+            let c = f.chain(640, 360);
+            assert!(!c.contains("drawbox"), "{f:?} draws: {c}");
+            assert!(!c.contains("overlay"), "{f:?} composites: {c}");
+        }
+    }
+
+    /// The invariants concat needs ride on every policy, or cuts of different
+    /// shapes refuse to join.
+    #[test]
+    fn every_policy_still_gets_square_pixels_and_one_rate() {
+        for f in [Fit::Contain, Fit::Cover, Fit::Stretch] {
+            let segs = vec![Segment::Cut(Cut {
+                path: PathBuf::from("a.mp4"), src_in: Ticks(0),
+                len: Ticks::from_seconds(1.0), at: Ticks(0),
+            })];
+            let args = render_args_with(&segs, None, Path::new("o.mp4"), 640, 360, 25, f);
+            let filter = args.join(" ");
+            assert!(filter.contains("setsar=1"), "{f:?}");
+            assert!(filter.contains("fps=25"), "{f:?}");
+            assert!(filter.contains("format=yuv420p"), "{f:?}");
+        }
+    }
+
+    /// `render_args` keeps its old behaviour exactly, so existing callers and
+    /// their tests mean the same thing.
+    #[test]
+    fn the_old_entry_point_is_unchanged() {
+        let segs = vec![Segment::Cut(Cut {
+            path: PathBuf::from("a.mp4"), src_in: Ticks(0),
+            len: Ticks::from_seconds(1.0), at: Ticks(0),
+        })];
+        let old = render_args(&segs, None, Path::new("o.mp4"), 640, 360, 25);
+        let new = render_args_with(&segs, None, Path::new("o.mp4"), 640, 360, 25, Fit::Contain);
+        assert_eq!(old, new);
     }
 }
