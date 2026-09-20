@@ -93,6 +93,7 @@ impl Command {
                 Op::RemoveBus { .. } => CommandKind::EditRemoveBus,
                 Op::SetBusGain { .. } => CommandKind::EditSetBusGain,
                 Op::SetBusFlags { .. } => CommandKind::EditSetBusFlags,
+                Op::SetBusSilent { .. } => CommandKind::EditSetBusSilent,
                 Op::SetBusChain { .. } => CommandKind::EditSetBusChain,
                 Op::SetBusSends { .. } => CommandKind::EditSetBusSends,
                 Op::SetRoute { .. } => CommandKind::EditSetRoute,
@@ -195,6 +196,9 @@ pub enum CommandKind {
     EditSetTrackGain,
     EditSetBusGain,
     EditSetBusFlags,
+    /// See `studio_core::Bus::silent`: a bus that renders and then feeds
+    /// nothing, so it can be read as a control signal.
+    EditSetBusSilent,
     EditSetBusChain,
     EditSetBusSends,
     EditSetRoute,
@@ -261,6 +265,7 @@ impl CommandKind {
         CommandKind::EditSetTrackGain,
         CommandKind::EditSetBusGain,
         CommandKind::EditSetBusFlags,
+        CommandKind::EditSetBusSilent,
         CommandKind::EditSetBusChain,
         CommandKind::EditSetBusSends,
         CommandKind::EditSetRoute,
@@ -328,6 +333,7 @@ pub static COMMAND_TABLE: &[CommandSpec] = &[
     CommandSpec { kind: CommandKind::EditSetTrackGain, name: "set track gain", phrases: &["turn up the track", "turn down the track", "fader"], destructive: false },
     CommandSpec { kind: CommandKind::EditSetBusGain, name: "set bus gain", phrases: &["turn up the bus", "turn down the bus"], destructive: false },
     CommandSpec { kind: CommandKind::EditSetBusFlags, name: "set bus flags", phrases: &["mute the bus", "unmute the bus"], destructive: false },
+    CommandSpec { kind: CommandKind::EditSetBusSilent, name: "set bus silent", phrases: &["make this a control channel", "silence this bus but keep it", "use this as a dummy channel"], destructive: false },
     CommandSpec { kind: CommandKind::EditSetBusChain, name: "set bus chain", phrases: &["add a bus effect"], destructive: false },
     CommandSpec { kind: CommandKind::EditSetBusSends, name: "set bus sends", phrases: &["send this to reverb", "send to delay"], destructive: false },
     CommandSpec { kind: CommandKind::EditSetRoute, name: "set route", phrases: &["route this to drums", "route to vocals"], destructive: false },

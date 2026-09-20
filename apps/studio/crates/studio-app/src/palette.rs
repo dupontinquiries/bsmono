@@ -182,6 +182,10 @@ pub enum Ask {
     /// …and then to which bus (this variant carries the chosen track).
     RouteBusPick(TrackId),
     BusGain(i8),
+    /// Which bus to tap with a control channel — a new silent bus fed by a
+    /// pre-fader send, for driving something (a meter, a sidechain, the
+    /// multicam switcher) without adding anything to what is heard.
+    ControlTapFrom,
     /// Which bus feeds which — the input side, chosen from the receiver.
     BusInputPick(BusId),
     MuteTrack,
@@ -251,6 +255,9 @@ pub fn root() -> Vec<Choice> {
         // Markers: the one request both the FL Studio and kdenlive
         // communities make in the same words.
         c("drop a marker here", None, Then::Do(Act::Shell(ShellVerb::MarkerHere))),
+        c("control channel from a bus (dummy channel)",
+          Some("a silent tap that drives things without being heard"),
+          Then::Ask(Ask::ControlTapFrom)),
         c("open project", Some("switch to another project"),
           Then::Do(Act::Shell(ShellVerb::OpenProject))),
         // Collaboration. Grouped together and named with "collaborator"
@@ -487,11 +494,26 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
             out.push(plain("new bus".into(), Then::Do(Act::Ops(vec![
                 Op::AddBus { bus: studio_core::Bus {
                     id: fresh, name: format!("bus {}", fresh.0), parent: None,
-                    gain: 1.0, chain: vec![], sends: vec![], muted: false } },
+                    gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: false } },
                 Op::SetRoute { track, bus: Some(fresh) },
             ]))));
             out
         }
+        Ask::ControlTapFrom => project.busses.iter()
+            .filter(|(_, b)| !b.silent)  // tapping a tap is not a thing
+            .map(|(id, b)| {
+                let fresh = BusId(project.busses.keys().map(|b| b.0).max().unwrap_or(0) + 1);
+                let mut sends = b.sends.clone();
+                sends.push(studio_core::Send { to: fresh, level: 1.0, pre_fader: true });
+                // One group: the tap, its silence and the send land together,
+                // so an undo cannot leave an audible duplicate of the bus.
+                plain(b.name.clone(), Then::Do(Act::Ops(vec![
+                    Op::AddBus { bus: studio_core::Bus {
+                        id: fresh, name: format!("{} ctrl", b.name), parent: None,
+                        gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: true } },
+                    Op::SetBusSends { id: *id, sends },
+                ])))
+            }).collect(),
         Ask::BusGain(delta) => project.busses.iter().map(|(id, b)| {
             plain(b.name.clone(), Then::Do(Act::Ops(vec![
                 Op::SetBusGain { id: *id, gain: db(b.gain, delta) }])))
@@ -609,6 +631,33 @@ mod tests {
         let found = filter(&r, "collaborator");
         assert!(found.len() >= 4, "only found {}: {:?}", found.len(),
                 found.iter().map(|c| &c.label).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_control_tap_is_silent_fed_pre_fader_and_lands_in_one_undo() {
+        let mut p = project();
+        let before = studio_audio::mixdown(&p, &Default::default(), &Default::default(),
+            studio_core::Ticks::ZERO, studio_core::Ticks::from_seconds(0.2), 48_000, &[], &[]);
+        let choices = candidates(Ask::ControlTapFrom, &p);
+        assert!(!choices.is_empty(), "there is a bus to tap");
+        let Then::Do(Act::Ops(ops)) = choices[0].then.clone() else { panic!("{:?}", choices[0].then) };
+        let inv = p.apply(&Op::Group { ops: ops.clone() }).expect("applies");
+        let tap = p.busses.values().find(|b| b.silent).expect("a silent tap");
+        let source = p.busses.values().find(|b| !b.silent && b.sends.iter().any(|s| s.to == tap.id))
+            .expect("fed by a send");
+        assert!(source.sends.iter().find(|s| s.to == tap.id).unwrap().pre_fader,
+                "a control tap hears the bus, not its fader moves");
+        // it changes nothing about what is heard
+        let after = studio_audio::mixdown(&p, &Default::default(), &Default::default(),
+            studio_core::Ticks::ZERO, studio_core::Ticks::from_seconds(0.2), 48_000, &[], &[]);
+        assert_eq!(before, after, "a control channel must be inaudible");
+        // and it is one undo, not two
+        p.apply(&inv).expect("undoes");
+        assert!(p.busses.values().all(|b| !b.silent), "the tap is gone");
+        // tapping a tap is not offered
+        p.apply(&Op::Group { ops }).unwrap();
+        let again = candidates(Ask::ControlTapFrom, &p);
+        assert!(again.iter().all(|c| !c.label.ends_with("ctrl")), "{:?}", again.iter().map(|c| &c.label).collect::<Vec<_>>());
     }
 
     #[test]

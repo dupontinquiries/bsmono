@@ -95,7 +95,12 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
-pub const WIRE_VERSION: u8 = 16;
+/// v17: `Bus` gained `silent: bool` (a measurement tap that feeds nothing —
+/// see `Bus::silent`), and `Op` gained `SetBusSilent` (tag 45). The bus
+/// shape itself changed, so this is a bump and not a quiet tag addition: a
+/// v16 peer reading a v17 bus would take the silent byte for the next
+/// field and desynchronise the whole stream.
+pub const WIRE_VERSION: u8 = 17;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -274,12 +279,13 @@ fn put_bus(o: &mut Vec<u8>, b: &Bus) {
     put_effects(o, &b.chain);
     put_sends(o, &b.sends);
     put_u8(o, b.muted as u8);
+    put_u8(o, b.silent as u8);
 }
 fn get_bus(r: &mut R) -> Option<Bus> {
     Some(Bus {
         id: BusId(r.u64()?), name: r.str()?, parent: get_opt_bus_id(r)?,
         gain: r.f32()?, chain: get_effects(r)?, sends: get_sends(r)?,
-        muted: r.u8()? != 0,
+        muted: r.u8()? != 0, silent: r.u8()? != 0,
     })
 }
 
@@ -487,6 +493,7 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
         Op::RemoveBus { id } => { put_u8(o, 12); put_u64(o, id.0); }
         Op::SetBusGain { id, gain } => { put_u8(o, 13); put_u64(o, id.0); put_f32(o, *gain); }
         Op::SetBusFlags { id, muted } => { put_u8(o, 17); put_u64(o, id.0); put_u8(o, *muted as u8); }
+        Op::SetBusSilent { id, silent } => { put_u8(o, 45); put_u64(o, id.0); put_u8(o, *silent as u8); }
         Op::SetBusChain { id, chain } => { put_u8(o, 14); put_u64(o, id.0); put_effects(o, chain); }
         Op::SetBusSends { id, sends } => { put_u8(o, 15); put_u64(o, id.0); put_sends(o, sends); }
         Op::SetRoute { track, bus } => { put_u8(o, 16); put_u64(o, track.0); put_opt_bus_id(o, *bus); }
@@ -705,6 +712,7 @@ fn get_op(r: &mut R) -> Option<Op> {
             };
             Op::SetGroupWindow { id, window }
         }
+        45 => Op::SetBusSilent { id: BusId(r.u64()?), silent: r.u8()? != 0 },
         44 => Op::SetClipFade {
             id: ClipId(r.u64()?),
             fade_in: Ticks(r.i64()?),
@@ -1258,7 +1266,7 @@ mod tests {
                 id: BusId(5), name: "808 — sub".into(), parent: Some(BusId(1)), gain: 0.9,
                 chain: effects(),
                 sends: vec![Send { to: BusId(2), level: 0.35, pre_fader: false }],
-                muted: false,
+                muted: false, silent: false,
             } },
             Op::AddBus { bus: Bus { id: BusId(1), name: "Master-ish".into(), parent: None, gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: false } },
             Op::RemoveBus { id: BusId(5) },
@@ -1513,7 +1521,27 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 16, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 17, "bump this alongside the next encoding change, not instead of it");
+    }
+
+    #[test]
+    fn a_silent_bus_and_its_op_survive_the_wire() {
+        let bus = Bus { id: BusId(7), name: "Control".into(), parent: None, gain: 1.0,
+            chain: vec![], sends: vec![Send { to: BusId(2), level: 1.0, pre_fader: true }],
+            muted: false, silent: true };
+        for op in [Op::AddBus { bus: bus.clone() }, Op::SetBusSilent { id: BusId(7), silent: true },
+                   Op::SetBusSilent { id: BusId(7), silent: false }] {
+            let p = Packet::Op(StampedOp { stamp: Stamp { lamport: 1, site: SiteId(1) }, op: op.clone() });
+            let back = Packet::decode(&p.encode()).expect("decodes");
+            assert_eq!(back, p, "{op:?}");
+        }
+        // and a peer that predates silent busses is refused rather than
+        // reading the silent byte as the start of the next field
+        let full = Packet::Op(StampedOp { stamp: Stamp { lamport: 1, site: SiteId(1) },
+            op: Op::AddBus { bus } }).encode();
+        let mut stale = full.clone();
+        stale[0] = 16;
+        assert!(Packet::decode(&stale).is_none(), "a v16 peer's packet must be refused");
     }
 
     #[test]

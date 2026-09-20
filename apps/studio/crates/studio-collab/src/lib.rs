@@ -419,7 +419,7 @@ mod tests {
 
         let add = a.local(Op::AddBus { bus: studio_core::Bus {
             id: studio_core::BusId(1), name: "Vocals".into(), parent: None, gain: 1.0,
-            chain: Vec::new(), sends: Vec::new(), muted: false,
+            chain: Vec::new(), sends: Vec::new(), muted: false, silent: false,
         } }).unwrap();
         b.integrate(&add).unwrap();
         assert_eq!(a.project, b.project, "both sites should agree right after the bus is added");

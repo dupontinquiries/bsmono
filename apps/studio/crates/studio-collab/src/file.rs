@@ -279,7 +279,7 @@ mod tests {
         p.apply(&Op::AddBus { bus: studio_core::Bus {
             id: studio_core::BusId(1), name: "Vocals".into(), parent: None, gain: 0.8,
             chain: vec![Effect { kind: "eq".into(), params: Default::default(), enabled: true }],
-            sends: Vec::new(), muted: false,
+            sends: Vec::new(), muted: false, silent: false,
         } }).unwrap();
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
             name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
@@ -335,7 +335,7 @@ mod tests {
         let mut p = built();
         p.apply(&Op::AddBus { bus: studio_core::Bus {
             id: studio_core::BusId(2), name: "Master-ish".into(), parent: None, gain: 1.0,
-            chain: Vec::new(), sends: Vec::new(), muted: false,
+            chain: Vec::new(), sends: Vec::new(), muted: false, silent: false,
         } }).unwrap();
         p.busses.get_mut(&studio_core::BusId(1)).unwrap().parent = Some(studio_core::BusId(2));
 
