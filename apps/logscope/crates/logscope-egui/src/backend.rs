@@ -1486,6 +1486,15 @@ continue, keeping the first {keep_prefix} tokens{}: {why}", self.name,
             let (gp0, gd0) = (gpu_kernels::GPU_PASSES_OPENED.load(AOrd::Relaxed),
                               gpu_kernels::GPU_DISPATCHES.load(AOrd::Relaxed));
             let (bgh0, bgm0) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed), gpu_kernels::BG_MISSES.load(AOrd::Relaxed));
+            // The three WHY counters need the same baseline as the hit/miss
+            // pair above. They are process-global atomics that nothing resets,
+            // and the line that prints them reports a per-turn hit rate beside
+            // them — so on an M2 Max run they read "592 lookups" next to "1587
+            // output / 4220 dims", misses exceeding lookups tenfold in the same
+            // sentence. Session totals printed as if they were this turn's.
+            let (mo0, md0, mi0) = (gpu_kernels::BG_MISS_OUT.load(AOrd::Relaxed),
+                                   gpu_kernels::BG_MISS_DIMS.load(AOrd::Relaxed),
+                                   gpu_kernels::BG_MISS_INPUTS.load(AOrd::Relaxed));
             let enc0 = gpu_kernels::gpu_encode_ns();
             // Windowed SAMPLED decode: the whole sample→embed→decode cycle stays on-device for k
             // tokens per readback — no per-token full-vocab logits sync and no per-token O(v·log v)
@@ -2033,9 +2042,12 @@ than none)", self.name),
                         // reported "none carried a view offset" alongside a 57% rate, which rules
                         // out the KV slices everyone blames and leaves no candidate named. These
                         // three counters name one.
-                        let (mo, md, mi) = (gpu_kernels::BG_MISS_OUT.load(std::sync::atomic::Ordering::Relaxed),
-                                            gpu_kernels::BG_MISS_DIMS.load(std::sync::atomic::Ordering::Relaxed),
-                                            gpu_kernels::BG_MISS_INPUTS.load(std::sync::atomic::Ordering::Relaxed));
+                        // Deltas, matching `bgh`/`bgm` above — see the baseline
+                        // capture for why.
+                        let (mo, md, mi) = (
+                            gpu_kernels::BG_MISS_OUT.load(AOrd::Relaxed).saturating_sub(mo0),
+                            gpu_kernels::BG_MISS_DIMS.load(AOrd::Relaxed).saturating_sub(md0),
+                            gpu_kernels::BG_MISS_INPUTS.load(AOrd::Relaxed).saturating_sub(mi0));
                         let why = if mo + md + mi == 0 { String::new() } else {
                             let worst = if mo >= md && mo >= mi {
                                 "the OUTPUT buffer moved — the pool hands back a different slab for the same dispatch, so the fix is pool reuse per call site, not the attention dispatches"
@@ -2048,10 +2060,20 @@ this is the floor, not a defect"
                             };
                             format!(" Repeat misses: {mo} output / {md} dims / {mi} inputs — {worst}.")
                         };
+                        // PER-TOKEN NEEDS A TOKEN. `per` is `produced.max(1)`,
+                        // which keeps the division safe and silently turns the
+                        // figure into a raw total when nothing was produced --
+                        // the M2 run printed "392/tok saved" on a turn that
+                        // generated zero tokens. Say which it is.
+                        let saved = if produced > 0 {
+                            format!("{:.0}/tok saved", bgh as f64 / produced as f64)
+                        } else {
+                            format!("{bgh} saved (no tokens this turn, so there is no per-token figure)")
+                        };
                         crate::diag!("wgpu-engine: [{}] bind-group cache — {bgh} of {lookups} lookups hit \
-({overall:.0}%), {:.0}/tok saved; {viewed}.{why} A moving view offset is the only genuinely unhittable \
+({overall:.0}%), {saved}; {viewed}.{why} A moving view offset is the only genuinely unhittable \
 kind, so that figure — not the offset-bearing COUNT — is what would justify rebuilding the \
-attention dispatches [LOGSCOPE_BG_CACHE]", self.name, bgh as f64 / per);
+attention dispatches [LOGSCOPE_BG_CACHE]", self.name);
                     }
             }
             // Adapt passes-per-submit: feed this turn's per-token decode time to the tuner, which sweeps
