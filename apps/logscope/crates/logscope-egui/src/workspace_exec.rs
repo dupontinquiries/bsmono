@@ -4573,8 +4573,27 @@ error: could not compile `demo` (lib) due to 3 previous errors
         // tldr needs its cache built at least once to answer instead of erroring — skip rather
         // than fail if this machine's tldr has never been initialised, since that is a machine
         // state question, not a question about whether the allowlist wiring works.
+        //
+        // NOT INSTALLED IS THE SAME KIND OF QUESTION, and the assertion did not
+        // treat it that way: on a box without tldr it failed with "spawn tldr:
+        // No such file or directory" under a message claiming the tool was
+        // BLOCKED. That sends a reader to the allowlist, which is the one thing
+        // the failure proves is fine — the command had to pass policy to reach
+        // a spawn at all.
+        //
+        // What this test is for is the ALLOWLIST WIRING, so assert that and
+        // nothing else: the refusal `Workspace` emits for a disallowed command
+        // is "command not allowed", and its absence is the whole claim.
         let tldr = ws.apply(&Tool::Run { argv: vec!["tldr".into(), "--version".into()] });
-        assert!(tldr.ok, "tldr must at least be launchable (not blocked): {}", tldr.output);
+        assert!(
+            !tldr.output.contains("command not allowed"),
+            "tldr is in the default allowlist and was refused by policy: {}",
+            tldr.output
+        );
+        if !tldr.ok {
+            eprintln!("note: tldr is allowed but did not run here ({}). \
+That is this machine, not the allowlist.", tldr.output.trim());
+        }
     }
 
     /// End-to-end, not just "the tool variant exists": a real program, compiled, then actually
