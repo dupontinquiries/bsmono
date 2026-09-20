@@ -68,6 +68,8 @@ pub mod spoken_slate;
 pub mod testkit;
 /// Warp stabilization: measure the camera path once, solve it per flavour (still/smooth/dejerk/track).
 pub mod stabilize;
+/// Temporal clean plate: remove something that passes through a shot, using the frames around it.
+pub mod cleanplate;
 /// Frames out of ffmpeg, through Rust, back into ffmpeg: the one place per-frame pixel work happens.
 pub mod framepipe;
 /// Multiview grid geometry: tiles that cover the canvas exactly, and what they cost in detail.
