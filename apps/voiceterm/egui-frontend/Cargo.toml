@@ -65,28 +65,42 @@ wayland = ["eframe?/wayland"]
 app-x11 = ["shell", "x11"]
 app-wayland = ["shell", "wayland"]
 
-# ## Static musl cannot use the Wayland backend
+# ## musl is not the problem. STATIC linking is.
 #
-# Reported from aarch64-unknown-linux-musl, at RUN time rather than build:
+# Reported from aarch64-unknown-linux-musl, twice: bindgen could not dlopen
+# libclang at build time, and at run time winit could not dlopen libwayland:
 #
 #     WaylandError(Connection(NoWaylandLib))
 #
-# winit reaches libwayland-client by `dlopen`, and a statically linked musl
-# binary cannot dlopen anything — the same limitation that stops bindgen
-# finding libclang during the build, arriving a second time.
+# I first read that as "musl cannot do Wayland, use X11". That was WRONG, and
+# would have been wrong in the worst place: postmarketOS is musl, and every one
+# of its mobile UIs -- phosh, plasma-mobile, gnome-mobile, sxmo-sway, lomiri,
+# niri -- is Wayland. X11 survives there only on desktop WMs. Checked against
+# pmaports, not assumed.
 #
-# X11 is the usable backend there: winit's x11 path goes through x11rb, which
-# speaks the protocol in Rust over a socket and needs no shared library at all.
-# So on musl:
+# The real split is the TARGET TRIPLE:
 #
-#     --no-default-features --features app-x11
+#   aarch64-unknown-linux-musl   upstream rustup; crt-static ON by default.
+#                                A static binary cannot dlopen anything.
+#   aarch64-alpine-linux-musl    Alpine/pmOS's own toolchain; links DYNAMICALLY.
+#                                pmaports builds Rust with a plain
+#                                `cargo build --release` and no +crt-static
+#                                anywhere except a freestanding bootloader.
 #
-# adding `voice` only if whisper-rs can build, which on musl it cannot. On a
-# glibc target either backend is fine and `app` gives both.
+# The reported error names the upstream triple (BINDGEN_EXTRA_CLANG_ARGS_
+# aarch64-unknown-linux-musl), which is why both dlopens failed. For a phone
+# running postmarketOS, build DYNAMIC musl:
 #
-# This is NOT worked around in the manifest, because it cannot be: a static
-# binary either has the code linked in or it does not, and libwayland has no
-# pure-Rust equivalent to link.
+#     RUSTFLAGS="-C target-feature=-crt-static" \
+#         cargo build --release --target aarch64-unknown-linux-musl
+#
+# That makes the binary match how pmOS itself links: libwayland and libclang
+# both load, Wayland works, and dictation can build. The binary then needs
+# musl and those libraries present at run time -- which on pmOS they are.
+#
+# `app-x11` is still useful for a genuinely static build, and for X11 desktop
+# sessions -- winit's x11 path is pure-Rust x11rb and needs no shared library.
+# It is NOT the answer for pmOS mobile, where there is no X server to talk to.
 
 [dependencies]
 # The raw sysfs accelerometer reader -- was a local iio_accel.rs, extracted
