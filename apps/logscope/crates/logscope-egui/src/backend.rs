@@ -1706,6 +1706,26 @@ continue, keeping the first {keep_prefix} tokens{}: {why}", self.name,
             // that would catch it, which also makes its own premise untestable
             // in the field: the retry that would disprove it never fires.
             //
+            // PROVENANCE, since the obvious suspicion is a recent merge and it
+            // is wrong: the skip came in with 53b564519 on 2026-08-18, before
+            // any of the four bundles merged today, and none of them touch
+            // this file. The retry itself dates to the monorepo skeleton.
+            //
+            // That commit was written FROM THE SAME SYMPTOM ON THE SAME
+            // HARDWARE — "four turns in a row came back empty, each taking
+            // seventeen seconds" on Asahi/M2 Max — and concluded the model was
+            // at fault: "a 4B pruned finetune given a 1626-token system prompt
+            // ... genuinely wants to emit eot immediately on most turns. That
+            // is the model."
+            //
+            // The new report is what that conclusion did not survive. It is
+            // TWO DIFFERENT MODELS, and one of them answered "hi there"
+            // coherently first — so it is not a model that always stops, it is
+            // a turn that stops after a specific kind of preceding turn. The
+            // August reasoning fixed the seventeen seconds and the wrong
+            // explanation, which were both real, and took the model's guilt as
+            // established when only one model had been seen.
+            //
             // REPORTED, and not reproducible here: an M2 Max Asahi run where
             // "hi there" was answered coherently and the next turn — a request
             // for graph algorithms — returned empty, EOS as the first token,
