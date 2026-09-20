@@ -157,6 +157,13 @@ pub fn snapshot(project: &Project) -> Vec<Op> {
             if g.tempo.is_some() {
                 ops.push(Op::SetGroupTempo { id: *id, tempo: g.tempo.clone() });
             }
+            // Same reasoning again for the take bucket's chosen take: it is
+            // its own slot, not part of SetGroup, so without this a saved
+            // project came back with every bucket's choice forgotten —
+            // found by saving an organised camera card and loading it.
+            if g.active.is_some() {
+                ops.push(Op::SetGroupActive { id: *id, active: g.active });
+            }
         }
     }
     ops.extend(relock);
@@ -498,6 +505,36 @@ mod automation_file_tests {
             rebuilt.apply(op).expect("every snapshot op applies cleanly");
         }
         assert_eq!(rebuilt, p, "lanes, lock state and all");
+    }
+
+    #[test]
+    fn a_take_buckets_chosen_take_survives_the_round_trip() {
+        // Found by saving an organised camera card: every bucket came back
+        // with no take chosen, because `active` is its own slot and
+        // `SetGroup` does not carry it — the same trap key and tempo were
+        // already fixed for.
+        use studio_core::{Clip, ClipId, GroupId, Source, SourceId};
+        let mut p = Project { name: "card".into(), ..Default::default() };
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
+            name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "C0057.mkv".into(),
+            len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2, has_video: true,
+            kind: studio_core::SourceKind::File } }).unwrap();
+        for id in 1..=2u64 {
+            p.apply(&Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(1), track: TrackId(1),
+                pos: Ticks::from_seconds(id as f64 * 10.0), src_in: Ticks::ZERO,
+                len: Ticks::from_seconds(5.0), gain: 1.0, effects: vec![] } }).unwrap();
+        }
+        p.apply(&Op::SetGroup { id: GroupId(1), name: "1B".into(),
+                                clips: vec![ClipId(1), ClipId(2)] }).unwrap();
+        p.apply(&Op::SetGroupActive { id: GroupId(1), active: Some(ClipId(2)) }).unwrap();
+
+        let file = SaveFile::from_project(&p, Vec::new(), None);
+        let back = SaveFile::decode(&file.encode()).expect("decodes");
+        let mut rebuilt = Project { name: back.name.clone(), ..Default::default() };
+        for op in &back.snapshot { rebuilt.apply(op).expect("applies"); }
+        assert_eq!(rebuilt.groups[&GroupId(1)].active, Some(ClipId(2)), "the chosen take came back");
+        assert_eq!(rebuilt, p);
     }
 
     #[test]
