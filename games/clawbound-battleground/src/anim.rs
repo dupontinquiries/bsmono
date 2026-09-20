@@ -213,11 +213,53 @@ impl Build {
     /// Derived from stride LENGTH, not picked per gait, so the feet keep up
     /// with the ground instead of skating — and so a colossus takes slow
     /// enormous steps while a hare buzzes, from one rule.
+    /// Cycles per second for this build at `speed`.
+    ///
+    /// ## The stride is BODY LENGTHS, not height
+    ///
+    /// This divided by `height * 1.6`, which for a feline is 0.96 against a
+    /// body length of 1.2 — a shorter stride than the animal is long, so the
+    /// feet cycle faster than they can carry it. `Build` already carries
+    /// `length`, which is the dimension a stride is actually about.
+    ///
+    /// A quadruped's stride — one full cycle of a leg — covers roughly TWO
+    /// body lengths at a trot, because the cycle includes the reach of the
+    /// contralateral pair. `STRIDE_BODY_LENGTHS` is that.
+    ///
+    /// ## Why this was a vibration and not merely fast
+    ///
+    /// Reported on an M2 Max: "the walking animation on animals is at least a
+    /// dozen hz ... the characters vibrate". It was exactly that. A god's
+    /// `move_speed` is 12.4 — MOBA units, not metres per second — so
+    /// `12.4 / 0.96` is 12.9 Hz, pinned by the old clamp at **12 Hz**, which
+    /// at 60 fps is five frames per complete leg cycle.
+    ///
+    /// The clamp turned a units error into a constant buzz: every build moving
+    /// at any speed above walking hit the same ceiling, so they all vibrated
+    /// identically instead of merely being wrong at different rates.
+    ///
+    /// The new ceiling is 6 Hz. A cheetah's stride rate flat out is about
+    /// 3.5 Hz and a small bird's hop is faster than anything here needs, so 6
+    /// is well clear of anything real while still short of a blur — and a
+    /// ceiling that is reached is a bug waiting to look like a feature.
     pub fn stride_hz(&self, speed: f32) -> f32 {
-        let stride_len = (self.height * 1.6).max(0.2);
-        (speed / stride_len).clamp(0.0, 12.0)
+        let stride_len = (self.length * STRIDE_BODY_LENGTHS).max(0.2);
+        (speed / stride_len).clamp(0.0, STRIDE_HZ_MAX)
     }
 }
+
+/// How far a quadruped travels in one full leg cycle, in body lengths.
+///
+/// Two, because the cycle includes the contralateral pair's reach. Measured
+/// gaits put a trotting cat and a trotting horse both near this; it is the
+/// figure that makes a stride a stride rather than a step.
+pub const STRIDE_BODY_LENGTHS: f32 = 2.0;
+
+/// Ceiling on stride frequency, in Hz.
+///
+/// Above a cheetah's ~3.5 Hz flat out, below a blur. See `stride_hz` for why
+/// the old 12.0 was the whole bug rather than a safety net.
+pub const STRIDE_HZ_MAX: f32 = 6.0;
 
 /// Per-creature animation state: the gait phase and the smoothing that keeps
 /// a gait change from snapping.
@@ -319,6 +361,60 @@ mod tests {
         assert_eq!(c.gait_for(2.0), Gait::Walk);
         assert_eq!(c.gait_for(5.0), Gait::Trot);
         assert_eq!(c.gait_for(10.0), Gait::Bound);
+    }
+
+    /// THE REPORTED VIBRATION: "at least a dozen hz ... the characters
+    /// vibrate", on an M2 Max.
+    ///
+    /// A god's `move_speed` is 12.4 — MOBA units, not m/s — and the stride
+    /// basis was `height * 1.6`, which for the big cat is 1.76 against a body
+    /// 2.2 long. The quotient pinned the old 12 Hz clamp, and five frames per
+    /// leg cycle at 60 fps is a buzz rather than a walk.
+    ///
+    /// The clamp is what made it uniform: every build above walking pace hit
+    /// the same ceiling, so they all vibrated identically instead of being
+    /// wrong at their own rates.
+    #[test]
+    fn nothing_vibrates_at_the_real_movement_speed() {
+        // The fastest speed the game actually produces, plus the 30% move
+        // buff some abilities grant.
+        let v = 12.4 * 1.3;
+        for (name, b) in [("hare", Build::hare()), ("mini_cat", Build::mini_cat()),
+                          ("feline", Build::feline()), ("stag", Build::stag()),
+                          ("megafauna", Build::megafauna())] {
+            let hz = b.stride_hz(v);
+            assert!(hz <= STRIDE_HZ_MAX, "{name}: {hz} Hz");
+            // Ten frames per cycle at 60 fps is the floor of reading as a
+            // step rather than a vibration.
+            assert!(60.0 / hz >= 10.0, "{name}: {hz} Hz is {} frames/cycle",
+                    60.0 / hz);
+        }
+    }
+
+    /// The ceiling must not be REACHED by ordinary play, or it is doing the
+    /// animating instead of bounding it — which is exactly how 12.0 hid a
+    /// units error as a constant buzz.
+    #[test]
+    fn the_stride_ceiling_is_not_load_bearing_for_the_big_builds() {
+        let v = 12.4;
+        for (name, b) in [("feline", Build::feline()), ("stag", Build::stag()),
+                          ("megafauna", Build::megafauna())] {
+            assert!(b.stride_hz(v) < STRIDE_HZ_MAX,
+                    "{name} is riding the clamp at the base move speed");
+        }
+    }
+
+    /// Stride length is BODY LENGTHS, and `Build` already carried `length`
+    /// while the frequency was derived from `height`.
+    #[test]
+    fn the_stride_comes_from_length_not_height() {
+        // Two builds with the same height and different lengths must step at
+        // different rates; under the old formula they were identical.
+        let short = Build { length: 1.0, ..Build::feline() };
+        let long = Build { length: 3.0, ..Build::feline() };
+        assert_eq!(short.height, long.height, "same height, by construction");
+        assert!(short.stride_hz(5.0) > long.stride_hz(5.0),
+                "a longer body must take fewer strides for the same distance");
     }
 
     /// Stride frequency from stride length, or the feet skate.
