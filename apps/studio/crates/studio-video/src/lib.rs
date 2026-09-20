@@ -68,6 +68,8 @@ pub mod spoken_slate;
 pub mod testkit;
 /// Warp stabilization: measure the camera path once, solve it per flavour (still/smooth/dejerk/track).
 pub mod stabilize;
+/// Multicam: cut between synced angles from a control channel's level and/or beats.
+pub mod multicam;
 /// Many camera takes against many recorder files: which sound is whose, by listening.
 pub mod dualsync;
 /// The timeline's video clips cut into one mp4 over the mixdown — ffmpeg's edit list.
