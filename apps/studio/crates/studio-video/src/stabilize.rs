@@ -76,9 +76,20 @@ fn half(g: &Gray) -> Gray {
 fn sad(prev: &Gray, cur: &Gray, dx: i32, dy: i32, margin: i32) -> f32 { sad_step(prev, cur, dx, dy, margin, 1) }
 
 fn sad_step(prev: &Gray, cur: &Gray, dx: i32, dy: i32, margin: i32, step: i32) -> f32 {
+    sad_bounded(prev, cur, dx, dy, margin, step, f32::MAX)
+}
+
+/// SAD with an early exit: once the running mean cannot beat `best`, stop.
+/// Most candidate shifts are obviously wrong, and this abandons them after a
+/// few rows instead of scoring every pixel. Measured on the bench below.
+fn sad_bounded(prev: &Gray, cur: &Gray, dx: i32, dy: i32, margin: i32, step: i32, best: f32) -> f32 {
     let (w, h) = (prev.w as i32, prev.h as i32);
     let mut sum = 0u64;
     let mut n = 0u64;
+    // rows between checks: often enough to bail early, rare enough that the
+    // check itself is not the cost
+    let check_every = 8;
+    let mut row = 0;
     let mut y = margin;
     while y < h - margin {
         let mut x = margin;
@@ -90,6 +101,10 @@ fn sad_step(prev: &Gray, cur: &Gray, dx: i32, dy: i32, margin: i32, step: i32) -
             x += step;
         }
         y += step;
+        row += 1;
+        if best < f32::MAX && row % check_every == 0 && n > 0 && sum as f32 / n as f32 > best {
+            return f32::MAX;  // cannot win: whatever is left only adds
+        }
     }
     if n == 0 { f32::MAX } else { sum as f32 / n as f32 }
 }
@@ -116,7 +131,7 @@ pub fn estimate(prev: &Gray, cur: &Gray, max_shift: u32) -> Motion {
             for dx in cx - range..=cx + range {
                 if dx.abs() >= margin || dy.abs() >= margin { continue; }
                 let step = if li > 0 && a.w * a.h > 40_000 { 2 } else { 1 };
-                let s = sad_step(a, b, dx, dy, margin, step);
+                let s = sad_bounded(a, b, dx, dy, margin, step, best.0);
                 if s < best.0 { best = (s, dx, dy); }
             }
         }
@@ -141,13 +156,48 @@ pub fn estimate(prev: &Gray, cur: &Gray, max_shift: u32) -> Motion {
 /// The camera's path over a shot: position of frame i relative to frame 0
 /// (the running sum of frame-to-frame motion).
 pub fn measure(frames: &[Gray], max_shift: u32) -> Vec<(f32, f32)> {
+    integrate(&steps(frames, max_shift, 1))
+}
+
+/// [`measure`] across `threads` threads. Each frame PAIR is independent —
+/// only the running sum at the end is sequential — so this scales almost
+/// linearly, which is most of the answer to "stabilizing is slow". The rest
+/// of the answer is not measuring more than you need: feed analysis-size
+/// grey frames (≈960 px wide), measure a shot ONCE and keep the path with
+/// the clip (the flavours re-solve it in microseconds), and re-measure only
+/// when the source range changes.
+pub fn measure_threaded(frames: &[Gray], max_shift: u32, threads: usize) -> Vec<(f32, f32)> {
+    integrate(&steps(frames, max_shift, threads.max(1)))
+}
+
+fn integrate(steps: &[Motion]) -> Vec<(f32, f32)> {
     let mut path = vec![(0.0f32, 0.0f32)];
-    for w in frames.windows(2) {
-        let m = estimate(&w[0], &w[1], max_shift);
+    for m in steps {
         let (x, y) = *path.last().unwrap();
         path.push((x + m.dx, y + m.dy));
     }
     path
+}
+
+/// Frame-to-frame motion, with the residual kept: a spike in residual is a
+/// cut or a flash, where the "camera path" means nothing.
+pub fn steps(frames: &[Gray], max_shift: u32, threads: usize) -> Vec<Motion> {
+    let pairs: Vec<&[Gray]> = frames.windows(2).collect();
+    if threads <= 1 || pairs.len() < 4 {
+        return pairs.iter().map(|w| estimate(&w[0], &w[1], max_shift)).collect();
+    }
+    let chunk = pairs.len().div_ceil(threads);
+    let mut out: Vec<Motion> = vec![Motion::default(); pairs.len()];
+    std::thread::scope(|scope| {
+        for (slot, part) in out.chunks_mut(chunk).zip(pairs.chunks(chunk)) {
+            scope.spawn(move || {
+                for (o, w) in slot.iter_mut().zip(part) {
+                    *o = estimate(&w[0], &w[1], max_shift);
+                }
+            });
+        }
+    });
+    out
 }
 
 /// What the stabilized camera should have done.
@@ -403,6 +453,48 @@ mod tests {
         assert!(s.clamped_px > 10.0, "it must say it could not lock the shot: {}", s.clamped_px);
         let d = solve(&path, &Flavor::Dejerk { threshold: 3.0 }, tight, 1920, 1080);
         assert!(d.zoom < s.zoom, "dejerk spends less crop than still: {} vs {}", d.zoom, s.zoom);
+    }
+
+    #[test]
+    fn the_early_exit_does_not_change_the_answer() {
+        // The search abandons a candidate as soon as it cannot win. That is
+        // only sound if the winner is identical to an exhaustive search.
+        let a = view(160, 90, 0.0, 0.0);
+        for &(dx, dy) in &[(4.0f32, 3.0f32), (-7.0, 2.0), (1.0, -5.0)] {
+            let b = view(160, 90, dx, dy);
+            let fast = estimate(&a, &b, 12);
+            let margin = 14;
+            let mut brute = (f32::MAX, 0, 0);
+            for y in -12..=12 {
+                for x in -12..=12 {
+                    let s = sad(&a, &b, x, y, margin);
+                    if s < brute.0 { brute = (s, x, y); }
+                }
+            }
+            assert!((fast.dx - brute.1 as f32).abs() <= 0.5 && (fast.dy - brute.2 as f32).abs() <= 0.5,
+                    "fast {fast:?} vs exhaustive ({}, {})", brute.1, brute.2);
+        }
+    }
+
+    #[test]
+    fn threads_give_the_same_path() {
+        let frames: Vec<Gray> = (0..12).map(|i| view(160, 90, 1.7 * i as f32, -0.9 * i as f32)).collect();
+        assert_eq!(measure(&frames, 12), measure_threaded(&frames, 12, 4));
+    }
+
+    /// Not an assertion — a measurement, printed. Run on purpose:
+    /// `cargo test --release -p studio-video -- --ignored --nocapture bench`
+    #[test]
+    #[ignore]
+    fn bench_measure_at_analysis_size() {
+        let frames: Vec<Gray> = (0..24).map(|i| view(960, 540, 2.0 * i as f32, 0.0)).collect();
+        for threads in [1usize, 2, 4] {
+            let t = std::time::Instant::now();
+            let _ = measure_threaded(&frames, 24, threads);
+            let secs = t.elapsed().as_secs_f64();
+            println!("960x540, 24 frames, {threads} thread(s): {:.2} s = {:.1} fps",
+                     secs, (frames.len() - 1) as f64 / secs);
+        }
     }
 
     #[test]
