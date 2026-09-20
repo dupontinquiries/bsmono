@@ -960,4 +960,53 @@ mod shop_tests {
         assert!(MINION_RADIUS < GOD_RADIUS);
         assert!(MINION_RADIUS > 0.0);
     }
+
+    /// THE REPORTED CRASH: "index out of bounds: the len is 10 but the index
+    /// is 10", panicking inside `Scene::draw` on an M2 Max.
+    ///
+    /// A `TargetRef` is an INDEX and `on_minion_death` does
+    /// `minions.remove(mi)`, which shifts every later index down. A ref taken
+    /// before that removal — an AI target held across frames, a beam being
+    /// drawn — then names a different minion, and a ref to the LAST one names
+    /// nothing at all. That last case is the panic.
+    #[test]
+    fn a_target_ref_past_the_end_is_absent_rather_than_a_panic() {
+        let g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        let n = g.minions.len();
+        // Exactly the reported shape: index == len.
+        assert_eq!(g.target_pos_opt(TargetRef::Minion(n)), None);
+        assert_eq!(g.target_pos_opt(TargetRef::Minion(n + 5)), None);
+        // Every variant, because every one of them indexes a Vec that can
+        // shrink and the panic was only ever seen in one.
+        assert_eq!(g.target_pos_opt(TargetRef::God(g.gods.len())), None);
+        assert_eq!(g.target_pos_opt(TargetRef::Tower(g.towers.len())), None);
+        assert_eq!(g.target_pos_opt(TargetRef::Boss(g.bosses.list.len())), None);
+    }
+
+    /// A live target still answers — a guard that returned None for everything
+    /// would pass the test above and silently stop the game working.
+    #[test]
+    fn a_live_target_still_resolves() {
+        let g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        if !g.minions.is_empty() {
+            assert!(g.target_pos_opt(TargetRef::Minion(0)).is_some());
+        }
+        assert!(g.target_pos_opt(TargetRef::God(0)).is_some(), "gods always exist");
+    }
+
+    /// Removing a minion is what invalidates the refs after it, which is the
+    /// mechanism rather than the symptom.
+    #[test]
+    fn removing_a_minion_invalidates_the_last_index() {
+        // `Minion` is not Clone, so the vector is shortened rather than
+        // padded — same mechanism, no fabricated state.
+        let mut g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        if g.minions.is_empty() { return; }
+        let last = g.minions.len() - 1;
+        assert!(g.target_pos_opt(TargetRef::Minion(last)).is_some(),
+                "the last minion resolves before the removal");
+        g.minions.remove(0);
+        assert_eq!(g.target_pos_opt(TargetRef::Minion(last)), None,
+                   "the index that was valid before the removal must now be absent");
+    }
 }

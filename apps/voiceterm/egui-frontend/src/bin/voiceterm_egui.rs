@@ -6687,6 +6687,26 @@ mod doc_markdown_tests {
         assert!(d.html.contains("<pre>let x = 1;\n</pre>"));
         assert!(d.html.contains("<p><b>bold</b> after</p>"));
     }
+    /// The bottom bar's height is a PORTED value, so it is checked against the
+    /// source it was ported from rather than against itself.
+    ///
+    /// Reported as "the bottom bar is way too thick unlike the -qt version".
+    /// The panel set no height at all and took egui's default button height
+    /// plus panel margins; the QML gives it a fixed slot.
+    #[test]
+    fn the_bottom_bar_matches_the_qml_slot_height() {
+        let qml = include_str!("../../../qml/main.qml");
+        // main.qml: `Layout.preferredHeight: (urlBarVisible && ...) ? 50 : 0`
+        // on topBar, which bottomMountSlot's height tracks.
+        // The FULL topBar line, not just "? 50 : 0" -- that fragment appears
+        // ten times in main.qml and would pass while the bar's own height
+        // changed underneath it.
+        assert!(
+            qml.contains(
+                "Layout.preferredHeight: (urlBarVisible && tabBar.currentIndex !== 1) ? 50 : 0"),
+            "topBar's height line changed; BOTTOM_BAR_H needs re-deriving");
+        assert_eq!(BOTTOM_BAR_H, 50.0);
+    }
 }
 
 /// The share's screens over the pure `zk_share::Share`: the picker with the paintbrush,
@@ -6827,25 +6847,4 @@ impl ZkShareUi {
 /// A brush that is down wants a frame per pointer move.
 fn brushing_repaint(ctx: &egui::Context, brush: voiceterm_egui::zk_share::Brush) -> bool {
     brush != voiceterm_egui::zk_share::Brush::Off && ctx.input(|i| i.pointer.primary_down())
-
-    /// The bottom bar's height is a PORTED value, so it is checked against the
-    /// source it was ported from rather than against itself.
-    ///
-    /// Reported as "the bottom bar is way too thick unlike the -qt version".
-    /// The panel set no height at all and took egui's default button height
-    /// plus panel margins; the QML gives it a fixed slot.
-    #[test]
-    fn the_bottom_bar_matches_the_qml_slot_height() {
-        let qml = include_str!("../../../qml/main.qml");
-        // main.qml: `Layout.preferredHeight: (urlBarVisible && ...) ? 50 : 0`
-        // on topBar, which bottomMountSlot's height tracks.
-        // The FULL topBar line, not just "? 50 : 0" -- that fragment appears
-        // ten times in main.qml and would pass while the bar's own height
-        // changed underneath it.
-        assert!(
-            qml.contains(
-                "Layout.preferredHeight: (urlBarVisible && tabBar.currentIndex !== 1) ? 50 : 0"),
-            "topBar's height line changed; BOTTOM_BAR_H needs re-deriving");
-        assert_eq!(BOTTOM_BAR_H, 50.0);
-    }
 }

@@ -418,7 +418,12 @@ impl Game {
             }
             // timers
             let atk_timer_next = self.gods[i].atk_timer - dt;
-            if atk_timer_next > 0.0 || target.is_none() {
+            // A target that no longer EXISTS counts as no target. `target` is
+            // chosen before this tick's deaths are applied, so `is_none()`
+            // alone lets a stale index through to `target_pos` and, before it
+            // returned Option, to a bounds panic.
+            let target_gone = target.is_some_and(|t| self.target_pos_opt(t).is_none());
+            if atk_timer_next > 0.0 || target.is_none() || target_gone {
                 let g = &mut self.gods[i];
                 g.atk_timer = atk_timer_next.max(0.0);
                 g.atk_anim = (g.atk_anim - dt * 4.0).max(0.0);
@@ -464,14 +469,42 @@ impl Game {
         }
     }
 
+    /// Where a target is, or `None` if it is no longer there.
+    ///
+    /// A `TargetRef` is an INDEX, and `on_minion_death` does
+    /// `self.minions.remove(mi)`, which shifts every later index down by one.
+    /// Any ref taken before that removal — an AI's chosen target held across
+    /// frames, a projectile in flight, a beam being drawn — now names a
+    /// different minion, and a ref to the last one names nothing at all.
+    ///
+    /// That is the reported crash, on an M2 Max: "index out of bounds: the len
+    /// is 10 but the index is 10", panicking inside `Scene::draw`. The
+    /// renderer is the victim rather than the culprit; it drew a beam at a
+    /// minion the sim had already removed.
+    ///
+    /// Returning `Option` rather than clamping or holding the last position:
+    /// a clamped index silently retargets onto whichever minion shifted into
+    /// the slot, which is a wrong hit that looks like a right one, and a
+    /// remembered position draws a beam at empty ground. Absent is what the
+    /// target actually is.
+    pub fn target_pos_opt(&self, t: TargetRef) -> Option<Vec3> {
+        Some(match t {
+            TargetRef::God(i) => self.gods.get(i)?.pos,
+            TargetRef::Minion(i) => self.minions.get(i)?.pos,
+            TargetRef::Tower(i) => self.towers.get(i)?.pos,
+            TargetRef::Titan(team) => self.titans.get(team as usize)?.pos,
+            TargetRef::Boss(bi) => self.bosses.list.get(bi)?.pos,
+        })
+    }
+
+    /// Where a target is, falling back to the origin when it has gone.
+    ///
+    /// Kept for the call sites that cannot meaningfully skip — see
+    /// [`Self::target_pos_opt`] for why a missing target is a real state and
+    /// not an error. Prefer the `_opt` form anywhere the work can simply not
+    /// happen.
     pub fn target_pos(&self, t: TargetRef) -> Vec3 {
-        match t {
-            TargetRef::God(i) => self.gods[i].pos,
-            TargetRef::Minion(i) => self.minions[i].pos,
-            TargetRef::Tower(i) => self.towers[i].pos,
-            TargetRef::Titan(team) => self.titans[team as usize].pos,
-            TargetRef::Boss(bi) => self.bosses.list[bi].pos,
-        }
+        self.target_pos_opt(t).unwrap_or(Vec3::ZERO)
     }
 
     fn minion_attacks(&mut self, dt: f32) {
@@ -566,7 +599,10 @@ impl Game {
 
     fn spawn_minion_bolt(&mut self, mi: usize, target: TargetRef) {
         let (pos, team) = (self.minions[mi].pos + Vec3::Y * 1.0, self.minions[mi].team);
-        let to = self.target_pos(target) + Vec3::Y * 1.0;
+        // Skip rather than fire at the origin: the target died between being
+        // chosen and being shot at, which is ordinary in a lane fight.
+        let Some(tp) = self.target_pos_opt(target) else { return };
+        let to = tp + Vec3::Y * 1.0;
         let dir = (to - pos).normalize_or_zero();
         let dmg = MINION_CASTER_DMG * (1.0 + (self.t / 60.0).min(15.0) * 0.08);
         self.projectiles.push(Projectile {
@@ -625,7 +661,12 @@ impl Game {
             let atk_timer_next = self.towers[ti].atk_timer - dt;
             self.towers[ti].aim = target;
             let fire_anim_next = (self.towers[ti].fire_anim - dt * 3.0).max(0.0);
-            if atk_timer_next > 0.0 || target.is_none() {
+            // A target that no longer EXISTS counts as no target. `target` is
+            // chosen before this tick's deaths are applied, so `is_none()`
+            // alone lets a stale index through to `target_pos` and, before it
+            // returned Option, to a bounds panic.
+            let target_gone = target.is_some_and(|t| self.target_pos_opt(t).is_none());
+            if atk_timer_next > 0.0 || target.is_none() || target_gone {
                 let tw = &mut self.towers[ti];
                 tw.atk_timer = atk_timer_next.max(0.0);
                 tw.fire_anim = fire_anim_next;
@@ -644,7 +685,8 @@ impl Game {
             };
             let dmg = TOWER_DMG * TOWER_RAMP.powi(new_ramp as i32);
             let from = self.towers[ti].pos + Vec3::Y * 5.2;
-            let to = self.target_pos(target.unwrap()) + Vec3::Y * 1.0;
+            let Some(tp) = self.target_pos_opt(target.unwrap()) else { continue };
+            let to = tp + Vec3::Y * 1.0;
             let dir = (to - from).normalize_or_zero();
             let tteam = self.towers[ti].team;
             let tw = &mut self.towers[ti];
