@@ -110,6 +110,8 @@ impl Command {
                 Op::SetGroupKey { .. } => CommandKind::EditSetGroupKey,
                 Op::SetGroupTempo { .. } => CommandKind::EditSetGroupTempo,
                 Op::SetGroupActive { .. } => CommandKind::EditSetGroupActive,
+                Op::SetGroupWindow { .. } => CommandKind::EditSetGroupWindow,
+                Op::SetClipFade { .. } => CommandKind::EditSetClipFade,
                 Op::SetMarker { .. } => CommandKind::EditSetMarker,
                 Op::RemoveMarker { .. } => CommandKind::EditRemoveMarker,
                 Op::ClearMarkers => CommandKind::EditClearMarkers,
@@ -210,6 +212,11 @@ pub enum CommandKind {
     EditSetGroupKey,
     EditSetGroupTempo,
     EditSetGroupActive,
+    /// Trimming a folded composition — two windows over one member list.
+    EditSetGroupWindow,
+    /// A clip's fade in/out. Both ends, because dragging a corner is one
+    /// gesture and two commands would let undo leave half a crossfade.
+    EditSetClipFade,
     EditSetMarker,
     EditRemoveMarker,
     EditClearMarkers,

@@ -74,7 +74,20 @@ pub struct Report {
     /// Worst window's 5–9 kHz level relative to the body, in dB.
     pub sibilance_db: f32,
     /// The quietest tenth of windows, in dBFS — the room under the take.
+    ///
+    /// Meaningless without a quiet passage to measure, so it is only reported
+    /// as a FAULT when the take actually has one; see `has_silence`.
     pub noise_floor_db: f32,
+    /// Whether the take contains anything quiet enough to call a gap.
+    ///
+    /// The quietest tenth of CONTINUOUS material is the material. A sustained
+    /// note, a held chord, a loud room tone with no pauses — all report a
+    /// "noise floor" that is really the signal, and a take with no silence in
+    /// it would be flagged as a noisy room purely for being continuous.
+    ///
+    /// Found by running the tests rather than reading them: a 0.3-amplitude
+    /// sine reports a floor of -13.5 dBFS, which is the tone's own RMS.
+    pub has_silence: bool,
     /// Windows analysed. Zero means the take was too short to judge.
     pub windows: usize,
 }
@@ -99,7 +112,11 @@ impl Report {
         let clip = self.clipped * 100.0 * 4.0;
         let plosive = (self.plosive_db - 6.0).max(0.0) * 0.5;
         let sib = (self.sibilance_db + 10.0).max(0.0) * 0.8;
-        let noise = (self.noise_floor_db + 60.0).max(0.0) * 0.6;
+        let noise = if self.has_silence {
+            (self.noise_floor_db + 60.0).max(0.0) * 0.6
+        } else {
+            0.0
+        };
         clip + plosive + sib + noise
     }
 
@@ -115,7 +132,9 @@ impl Report {
         if self.sibilance_db > -10.0 {
             v.push(((self.sibilance_db + 10.0) * 0.8, "sibilance"));
         }
-        if self.noise_floor_db > -60.0 {
+        // Only when there IS a gap to have measured. Without one the number is
+        // the signal's own level and says nothing about the room.
+        if self.has_silence && self.noise_floor_db > -60.0 {
             v.push(((self.noise_floor_db + 60.0) * 0.6, "noisy room"));
         }
         v.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -132,6 +151,7 @@ pub fn analyse(samples: &[f32], rate: f32) -> Report {
             plosive_db: 0.0,
             sibilance_db: f32::NEG_INFINITY,
             noise_floor_db: f32::NEG_INFINITY,
+            has_silence: false,
             windows: 0,
         };
     }
@@ -155,7 +175,8 @@ pub fn analyse(samples: &[f32], rate: f32) -> Report {
     }
     if lows.is_empty() {
         return Report { clipped, plosive_db: 0.0, sibilance_db: f32::NEG_INFINITY,
-                        noise_floor_db: f32::NEG_INFINITY, windows: 0 };
+                        noise_floor_db: f32::NEG_INFINITY, has_silence: false,
+                        windows: 0 };
     }
 
     let median = {
@@ -175,7 +196,23 @@ pub fn analyse(samples: &[f32], rate: f32) -> Report {
         v[..n].iter().sum::<f32>() / n as f32
     };
 
-    Report { clipped, plosive_db, sibilance_db, noise_floor_db, windows: lows.len() }
+    // A GAP IS A DROP, not an absolute level. A take recorded quietly has a
+    // low floor everywhere and no silence; a loud take with pauses has a high
+    // median and real gaps. Comparing the quietest tenth against the MEDIAN
+    // asks the right question -- "does this take ever stop" -- where an
+    // absolute threshold would answer "was it recorded loudly".
+    let median_rms = {
+        let mut v = rms_db.clone();
+        v.sort_by(f32::total_cmp);
+        v[v.len() / 2]
+    };
+    // 12 dB: a quarter of the amplitude. Below that the quiet part is a
+    // dynamic passage rather than a pause, and calling it a gap would measure
+    // the performance instead of the room.
+    let has_silence = median_rms - noise_floor_db >= 12.0;
+
+    Report { clipped, plosive_db, sibilance_db, noise_floor_db, has_silence,
+             windows: lows.len() }
 }
 
 /// Order takes by how much is wrong, cleanest first.
@@ -256,12 +293,22 @@ mod tests {
     }
 
     /// Sibilance is RELATIVE to the body: a loud take is not a sibilant one.
+    ///
+    /// Measured on material that HAS both bands. My first version used a pure
+    /// 300 Hz tone at two amplitudes and failed at -73 vs -95 dB — correctly,
+    /// because a pure tone has no 5–9 kHz content at all, so the ratio was
+    /// comparing FFT noise floors that do not scale with the signal. A test
+    /// whose input cannot exhibit the property is not testing it.
     #[test]
     fn loudness_alone_does_not_read_as_sibilance() {
-        let quiet = analyse(&tone(300.0, 0.05, 1.0), RATE);
-        let loud = analyse(&tone(300.0, 0.7, 1.0), RATE);
+        let body_and_air = |amp: f32| {
+            mix(&tone(300.0, amp, 1.0), &tone(7_000.0, amp * 0.1, 1.0))
+        };
+        let quiet = analyse(&body_and_air(0.05), RATE);
+        let loud = analyse(&body_and_air(0.7), RATE);
         assert!((quiet.sibilance_db - loud.sibilance_db).abs() < 3.0,
-                "{} vs {}", quiet.sibilance_db, loud.sibilance_db);
+                "the ratio must not move with level: {} vs {}",
+                quiet.sibilance_db, loud.sibilance_db);
     }
 
     /// A 7 kHz shriek over a body tone is.
@@ -316,7 +363,7 @@ mod tests {
     #[test]
     fn faults_are_ordered_by_severity() {
         let r = Report { clipped: 0.02, plosive_db: 7.0, sibilance_db: -9.0,
-                         noise_floor_db: -59.0, windows: 50 };
+                         noise_floor_db: -59.0, has_silence: true, windows: 50 };
         let f = r.faults();
         assert_eq!(f.first(), Some(&"clipping"), "{f:?}");
         assert!(f.len() >= 2);
