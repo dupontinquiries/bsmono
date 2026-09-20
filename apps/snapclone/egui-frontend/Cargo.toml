@@ -76,6 +76,7 @@ uikit-gesture = { path = "../../../shared/uikit/crates/uikit-gesture" }
 snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../../shared/settings-kit" }
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+rqrr = { version = "0.11.0", default-features = false }
 
 [dev-dependencies]
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }

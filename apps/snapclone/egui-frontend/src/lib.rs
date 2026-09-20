@@ -49,6 +49,11 @@ pub mod modal;
 pub mod snaps;
 pub mod session;
 pub mod ring;
+/// Camera pixels to a payload string -- the half of the scanner that did not
+/// exist. See its header: the kit's QR is a decorative identicon, so this
+/// decodes REAL codes from other apps, which is what scanning a friend's
+/// screen actually involves.
+pub mod qr_decode;
 pub mod qr;
 pub mod wayfinder;
 pub mod voicebar;
