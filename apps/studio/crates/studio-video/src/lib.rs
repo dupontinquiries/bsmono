@@ -63,6 +63,9 @@ pub mod slate;
 pub mod slate_ocr;
 /// The slate as SPOKEN: scene/shot/take from a transcript's head, into `slate_ocr::Board`.
 pub mod spoken_slate;
+/// A tiny deterministic shoot (camera takes + recorder files) for tests, here and downstream.
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
 /// Many camera takes against many recorder files: which sound is whose, by listening.
 pub mod dualsync;
 /// The timeline's video clips cut into one mp4 over the mixdown — ffmpeg's edit list.

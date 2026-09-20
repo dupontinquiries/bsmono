@@ -69,6 +69,18 @@ impl Onsets {
     pub fn is_empty(&self) -> bool { self.values.is_empty() }
     pub fn seconds(&self) -> f64 { self.values.len() as f64 * HOP_SECS }
 
+    /// One byte per value (0..=4 in steps of 4/255). This is the form
+    /// real-footage regression fixtures are stored in: a take's onset curve
+    /// is 100 bytes a second, cannot be played back as speech, and pairs the
+    /// same as the float curve (checked on the film: identical 47 pairs).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.values.iter().map(|v| (v / 4.0 * 255.0).round().clamp(0.0, 255.0) as u8).collect()
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Onsets {
+        Onsets { values: b.iter().map(|&x| x as f32 * 4.0 / 255.0).collect() }
+    }
+
     /// The onset feature of a take. `None` when it is too short (under a
     /// second) or silent, because neither can be matched and pretending
     /// otherwise produces a confident pairing to nothing.
@@ -141,6 +153,13 @@ pub enum Verdict {
 }
 
 /// z at or above which a peak is a real one (measured, see the module doc).
+///
+/// z grows with the length of the correlation curve, so this bar is a
+/// property of take LENGTH as well as of the match: it was measured on takes
+/// of 30 s to 4 min. A correct 12 s pairing measured z ≈ 11 (testkit's
+/// `a_short_take_pairs_right_but_is_not_sure`), so short inserts come out
+/// Unsure even when right. That errs the safe way — listen, don't cut — and
+/// a length-aware bar is the fix to make against real short takes, not this.
 pub const SURE_Z: f32 = 13.0;
 /// How far the best candidate must lead the runner-up.
 pub const SURE_MARGIN: f32 = 3.0;
