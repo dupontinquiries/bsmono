@@ -57,3 +57,36 @@ commit on top of each branch.
 work off the same `51d8c068` split as the 338 line. Merged into main; the seven
 files both lines touched, the four textual conflicts and the one silent
 theme.rs breakage are written up in `MERGE_492_AUDIT.md`.
+
+## c19unified-016 — four drops merged 2026-09-19
+
+Merged with `git merge`, not replayed. What that means for reading the history,
+and what it cost:
+
+- **Every incoming commit is present.** 161 commits between `2ebb81624` and
+  `af0c8105f`, of which 127 came from the four bundles. `git log` shows them
+  all, individually, with their original messages and hashes.
+- **A first-parent view hides them.** `git log --first-parent` returns 34 —
+  one line per merge instead of the 56/31/36/4 behind it. Most graph UIs
+  default to that, so the history LOOKS collapsed while being intact. Use
+  `git log --oneline --graph` or drop `--first-parent` to see the development.
+- **What a replay would have bought and cost.** Rebasing the four branches onto
+  a line would make the default view read as development, which is the
+  legitimate complaint. It would also change every incoming hash. Three sibling
+  sessions branched off these bundles — `logscope-speed` carries `2ebb81624` as
+  its own `origin/HEAD` — so their bases would stop existing, which is exactly
+  the failure CLAUDE.md §9 cites: "a prerequisite hash stopped existing and 81
+  deltas became unrecoverable".
+
+If a linear history is wanted, the time to replay is BEFORE the sending session
+has branched again, and it should be agreed with them rather than done on
+receipt.
+
+### Author identity
+
+Commits in this repo were being made as `c18unified agent` — a stale
+`git config user.name` inherited from the c18 line. Corrected to
+`c19unified agent` going forward. The 34 commits already made under the old
+name are left alone: fixing them means rewriting the same hashes the point
+above says not to rewrite, to correct a label that is wrong but not
+misleading — the dates and content place them unambiguously.
