@@ -82,6 +82,30 @@ If a linear history is wanted, the time to replay is BEFORE the sending session
 has branched again, and it should be agreed with them rather than done on
 receipt.
 
+### The drops are kept as branches
+
+Each arrives unmodified at its original hashes, so the development reads
+straight without `--first-parent` getting in the way:
+
+| branch | tip | commits |
+|---|---|---|
+| `drop/clawbound-026` | `95b55e105` | 56 |
+| `drop/gdb-017` | `f19fc7c958` | 39 |
+| `drop/gdb-018` | `3e2583f8a` | 43 |
+| `drop/logscope-speed-028` | `936e626e4` | 36 |
+| `drop/forge-playable` | `7c431b962` | 4 |
+
+`git log drop/logscope-speed-028` reads as that session wrote it. `git log
+--graph main` shows how it landed.
+
+`drop/gdb-017` is kept even though `gdb-018` strictly contains it, because
+"this one was superseded" is a fact about the drops worth being able to see
+rather than infer from a missing branch.
+
+These are cheap — a branch is one ref — and they are what makes merging rather
+than replaying an honest choice instead of a lossy one. `export-bundle.sh` uses
+`--all`, so they travel.
+
 ### Author identity
 
 Commits in this repo were being made as `c18unified agent` — a stale
