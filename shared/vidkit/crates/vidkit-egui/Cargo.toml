@@ -19,7 +19,11 @@ egui = "0.34"
 uikit-egui = { path = "../../../uikit/crates/uikit-egui" }
 uikit-gesture = { path = "../../../uikit/crates/uikit-gesture" }
 snapclone-theme = { path = "../../../uikit/crates/snapclone-theme" }
-eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
+# Backends are NOT named here -- see scene-kit/uikit-egui for the same fix. A
+# library that hardcodes both silently overrides the app's choice through
+# feature unification, which on static musl means a binary that dlopens
+# libwayland at startup and dies with NoWaylandLib.
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow"] }
 
 # Off by default so `cargo test` stays light and headless, matching uikit-egui.
 # Backend named explicitly: eframe 0.34's defaults select wgpu, whose default

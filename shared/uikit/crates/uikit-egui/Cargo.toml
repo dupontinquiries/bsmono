@@ -33,7 +33,16 @@ touchkit = { path = "../../../touchkit", features = ["egui"] }
 # voiceterm's frontend all already spell it "glow", "wayland", "x11"; this was
 # the outlier. Found by feature_sweep.sh, which is the reason that tool checks
 # non-default features.
-eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
+# Backends are NOT named here. `wayland` and `x11` were both hardcoded, and
+# because cargo unifies features across the graph that silently overrode the
+# app's choice -- voiceterm asking for x11 only still got wayland linked, which
+# on static musl is a binary that dlopens libwayland at startup and dies with
+# NoWaylandLib.
+#
+# A library crate has no business choosing the display server. The APP picks,
+# via its own `eframe?/x11` / `eframe?/wayland` features; anything that needs
+# both says so itself.
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow"] }
 egui = "0.34"
 uikit-gesture = { path = "../uikit-gesture" }
 

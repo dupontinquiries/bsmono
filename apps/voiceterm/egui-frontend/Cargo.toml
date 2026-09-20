@@ -59,8 +59,34 @@ voice = ["uikit-egui/voice-popup"]
 # repo builds for.
 x11 = ["eframe?/x11"]
 wayland = ["eframe?/wayland"]
-app-x11 = ["dep:eframe", "x11"]
-app-wayland = ["dep:eframe", "wayland"]
+# Via `shell`, not `dep:eframe` directly: the binary gates on `shell`, so a
+# feature that turned on eframe without it produced "requires the features:
+# shell" and looked like the feature was broken.
+app-x11 = ["shell", "x11"]
+app-wayland = ["shell", "wayland"]
+
+# ## Static musl cannot use the Wayland backend
+#
+# Reported from aarch64-unknown-linux-musl, at RUN time rather than build:
+#
+#     WaylandError(Connection(NoWaylandLib))
+#
+# winit reaches libwayland-client by `dlopen`, and a statically linked musl
+# binary cannot dlopen anything — the same limitation that stops bindgen
+# finding libclang during the build, arriving a second time.
+#
+# X11 is the usable backend there: winit's x11 path goes through x11rb, which
+# speaks the protocol in Rust over a socket and needs no shared library at all.
+# So on musl:
+#
+#     --no-default-features --features app-x11
+#
+# adding `voice` only if whisper-rs can build, which on musl it cannot. On a
+# glibc target either backend is fine and `app` gives both.
+#
+# This is NOT worked around in the manifest, because it cannot be: a static
+# binary either has the code linked in or it does not, and libwayland has no
+# pure-Rust equivalent to link.
 
 [dependencies]
 # The raw sysfs accelerometer reader -- was a local iio_accel.rs, extracted
@@ -131,7 +157,15 @@ eframe = { version = "0.34", default-features = false, features = ["glow"], opti
 [workspace]
 
 [dev-dependencies]
-eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }
+# NO BACKENDS HERE EITHER. Cargo unifies features across normal and dev
+# dependencies in the same build, so naming "wayland" in dev-dependencies
+# turned it on for the REAL binary -- `--features app-x11` still produced a
+# wayland-linked build, and on static musl that is NoWaylandLib at startup.
+#
+# Found by `cargo tree -e features -i eframe`, which prints the
+# `[dev-dependencies]` edge; three library crates were fixed first and the
+# feature stayed on, because this was the one enabling it.
+eframe = { version = "0.34", default-features = false, features = ["glow"] }
 
 # Compile-speed policy (monorepo-wide, dev only): full DWARF is the single biggest
 # artifact + link cost in these workspaces, and the sandbox/CI boxes are disk-starved.
