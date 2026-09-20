@@ -120,9 +120,18 @@ pub fn threshold(g: &Gray, r: Rect) -> u8 {
 /// screws, tape, glare and the edge of someone's thumb in it, and every
 /// one of those is a connected component.
 pub fn glyph_boxes(g: &Gray, r: Rect, ink: Ink, t: u8) -> Vec<Rect> {
+    // INCLUSIVE ON THE DARK SIDE. Otsu returns the last value of the LOW
+    // class, so on a clean render -- ink at 0, board at 255 -- it returns 0,
+    // and `< 0` is never true: every glyph box came back empty and the reader
+    // returned a blank Board for a perfectly legible frame.
+    //
+    // Nothing in between moves the answer either: the histogram is empty
+    // between the two modes, so `between > best` is never strictly greater and
+    // the threshold stays at the first mode. That is correct Otsu; the bug was
+    // reading its output as an exclusive bound.
     let is_ink = |x: usize, y: usize| match ink {
-        Ink::DarkOnLight => g.at(x, y) < t,
-        Ink::LightOnDark => g.at(x, y) >= t,
+        Ink::DarkOnLight => g.at(x, y) <= t,
+        Ink::LightOnDark => g.at(x, y) > t,
     };
     let (x0, y0) = (r.x, r.y);
     let (x1, y1) = ((r.x + r.w).min(g.w), (r.y + r.h).min(g.h));
@@ -217,7 +226,11 @@ pub fn normalise(g: &Gray, b: Rect, ink: Ink, t: u8) -> Cell {
             for y in sy0..sy1 { for x in sx0..sx1 {
                 n += 1;
                 let v = g.at(x, y);
-                if match ink { Ink::DarkOnLight => v < t, Ink::LightOnDark => v >= t } { lit += 1; }
+                // Same inclusive bound as `glyph_boxes` -- Otsu returns the
+                // last value of the LOW class, so `< t` with t=0 counted no
+                // ink and every glyph normalised to the same empty cell. The
+                // boxes were found and then all read as the same character.
+                if match ink { Ink::DarkOnLight => v <= t, Ink::LightOnDark => v > t } { lit += 1; }
             }}
             // ANY-INK (`lit > 0`) was tried first and reverted: it fixed
             // '0' vs '8' but fattened every stroke enough that OTHER
