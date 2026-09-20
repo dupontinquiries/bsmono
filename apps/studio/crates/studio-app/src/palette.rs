@@ -80,6 +80,10 @@ pub enum ShellVerb {
     /// Stabilize the selected clip with one of the flavours. A shell verb:
     /// it renders a file in the background and then relinks the clip.
     TouchUpStabilize(StabilizeKind),
+    /// Clean-plate the selected clip: remove something that crosses it,
+    /// using `radius` frames each side. `moving` warps the neighbours onto
+    /// the current frame first, for a shot where the camera travels.
+    TouchUpCleanPlate { radius: usize, moving: bool },
     CallToggle,
     CallMute,
     CallPushToTalk,
@@ -208,6 +212,10 @@ pub enum Ask {
     MulticamLevelBus(studio_core::GroupId),
     /// Which stabilizer flavour to run on the selected clip.
     StabilizeFlavor,
+    /// Whether the camera moves during the shot being cleaned, then how many
+    /// frames each side to look at.
+    CleanPlateCamera,
+    CleanPlateWindow(bool),
     /// Which bus feeds which — the input side, chosen from the receiver.
     BusInputPick(BusId),
     MuteTrack,
@@ -279,6 +287,9 @@ pub fn root() -> Vec<Choice> {
         c("drop a marker here", None, Then::Do(Act::Shell(ShellVerb::MarkerHere))),
         c("stabilize the selected clip", Some("still / smooth / de-jerk"),
           Then::Ask(Ask::StabilizeFlavor)),
+        c("clean plate the selected clip (remove something crossing it)",
+          Some("a car, a passer-by — anything that does not stay"),
+          Then::Ask(Ask::CleanPlateCamera)),
         c("cut a camera group on the beat (multicam)",
           Some("switch angles on the beat grid"), Then::Ask(Ask::MulticamGroup)),
         c("cut a camera group to a control channel (multicam)",
@@ -581,6 +592,26 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
                      hint: Some("a deliberate pan with a bump in it".into()),
                      then: Then::Do(Act::Shell(ShellVerb::TouchUpStabilize(StabilizeKind::Dejerk))) },
         ],
+        Ask::CleanPlateCamera => vec![
+            Choice { label: "the camera is locked off".into(),
+                     hint: Some("tripod, or already stabilized".into()),
+                     then: Then::Ask(Ask::CleanPlateWindow(false)) },
+            Choice { label: "the camera moves".into(),
+                     hint: Some("the neighbouring frames are lined up first".into()),
+                     then: Then::Ask(Ask::CleanPlateWindow(true)) },
+        ],
+        Ask::CleanPlateWindow(moving) => [3usize, 6, 10].iter().map(|r| Choice {
+            // The window has to outlast the thing crossing: a wider one
+            // recovers more, costs more, and is likelier to include a real
+            // change in the background.
+            label: format!("±{r} frames"),
+            hint: Some(match r {
+                3 => "something fast — a car, a cyclist".into(),
+                6 => "a walking passer-by".into(),
+                _ => "something slow; check the report for what it could not fill".to_string(),
+            }),
+            then: Then::Do(Act::Shell(ShellVerb::TouchUpCleanPlate { radius: *r, moving })),
+        }).collect(),
         Ask::MulticamLevelGroup => project.groups.iter()
             .filter(|(id, _)| studio_video::multicam::from_group(project, **id).is_ok())
             .map(|(id, g)| plain(g.name.clone(), Then::Ask(Ask::MulticamLevelBus(*id))))
@@ -749,6 +780,32 @@ mod tests {
         }).collect();
         assert_eq!(kinds, vec![StabilizeKind::Smooth, StabilizeKind::Still, StabilizeKind::Dejerk],
                    "smooth first: it is the one that fits most shots");
+    }
+
+    #[test]
+    fn the_clean_plate_asks_about_the_camera_before_the_window() {
+        let r = root();
+        assert!(!filter(&r, "clean plate").is_empty());
+        let cam = candidates(Ask::CleanPlateCamera, &Project::default());
+        assert_eq!(cam.len(), 2, "locked off, or moving");
+        // The camera question comes FIRST because it changes what the window
+        // means: on a moving shot the neighbours must be lined up before they
+        // can stand in for the covered pixels.
+        let moving: Vec<bool> = cam.iter().map(|c| match c.then {
+            Then::Ask(Ask::CleanPlateWindow(m)) => m,
+            _ => panic!("{:?}", c.label),
+        }).collect();
+        assert_eq!(moving, vec![false, true]);
+        for m in [false, true] {
+            let w = candidates(Ask::CleanPlateWindow(m), &Project::default());
+            assert_eq!(w.len(), 3);
+            let asked: Vec<(usize, bool)> = w.iter().map(|c| match c.then {
+                Then::Do(Act::Shell(ShellVerb::TouchUpCleanPlate { radius, moving })) => (radius, moving),
+                _ => panic!("{:?}", c.label),
+            }).collect();
+            assert_eq!(asked, vec![(3, m), (6, m), (10, m)], "the camera answer is carried through");
+            assert!(w.iter().all(|c| c.hint.is_some()), "each window says what it is for");
+        }
     }
 
     #[test]

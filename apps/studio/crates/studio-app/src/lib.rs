@@ -5522,6 +5522,8 @@ impl App {
                     }
                 }
                 palette::ShellVerb::TouchUpStabilize(kind) => self.start_stabilize(kind),
+                palette::ShellVerb::TouchUpCleanPlate { radius, moving } =>
+                    self.start_clean_plate(radius, moving),
                 palette::ShellVerb::MulticamLevel { group, bus } => {
                     // Defaults chosen to be watchable rather than clever: no
                     // shot under a second, 3 dB of hysteresis so a level
@@ -6421,11 +6423,39 @@ impl App {
             palette::StabilizeKind::Smooth => (Flavor::Smooth { sigma: 12.0 }, Budget { max_zoom: 1.10 }),
             palette::StabilizeKind::Dejerk => (Flavor::Dejerk { threshold: 3.0 }, Budget { max_zoom: 1.04 }),
         };
+        let _ = (path, probe);
+        self.start_touchup(studio_video::touchup::Fix::Stabilize { flavor, budget },
+                           format!("stabilizing ({kind:?})"));
+    }
+
+    /// Raise a ticket for the selected clip and render it on a worker. The
+    /// selection, source and probe checks are the same for every fix, so
+    /// they live here rather than once per flavour of fix.
+    fn start_touchup(&mut self, fix: studio_video::touchup::Fix, what: String) {
+        if self.touchup_run.is_some() {
+            self.studio.status = "a touch-up is already rendering".into();
+            return;
+        }
+        let Some(&id) = self.studio.selection.first() else {
+            self.studio.status = "select the clip to fix first".into();
+            return;
+        };
+        let project = &self.studio.session.doc.project;
+        let Some(clip) = project.clips.get(&id).cloned() else { return };
+        let Some(src) = project.sources.get(&clip.source).cloned() else { return };
+        if !src.has_video {
+            self.studio.status = "that clip has no picture to fix".into();
+            return;
+        }
+        let path = std::path::PathBuf::from(&src.path);
+        let Ok(probe) = studio_video::probe(&path) else {
+            self.studio.status = format!("could not read {}", src.path);
+            return;
+        };
         let ticket = studio_video::touchup::Ticket {
             clip: id, source: clip.source, path: path.clone(),
             src_in: clip.src_in, len: clip.len, handle: 0.5,
-            fixes: vec![studio_video::touchup::Fix::Stabilize { flavor, budget }],
-            note: format!("{kind:?} from the palette"),
+            fixes: vec![fix], note: what.clone(),
         };
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "shot".into());
         let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(std::env::temp_dir);
@@ -6434,7 +6464,17 @@ impl App {
         while out.exists() { out = dir.join(format!("{stem}-touchup-{n}.mp4")); n += 1; }
         let size = studio_video::framepipe::Size { w: probe.width, h: probe.height };
         self.touchup_run = Some(touchup_job::start(ticket, out, size, probe.fps.max(1.0)));
-        self.studio.status = format!("stabilizing ({kind:?}) — this runs in the background");
+        self.studio.status = format!("{what} — this runs in the background");
+    }
+
+    /// Clean-plate the selected clip. Same ticket machinery as the
+    /// stabilizer, a different fix.
+    fn start_clean_plate(&mut self, radius: usize, moving: bool) {
+        let fix = studio_video::touchup::Fix::CleanPlate {
+            settings: studio_video::cleanplate::Settings::default(),
+            radius, align: moving,
+        };
+        self.start_touchup(fix, format!("clean plate ±{radius} frames"));
     }
 
     /// Poll the touch-up worker. Same shape as the export tracker: egui only
