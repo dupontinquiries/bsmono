@@ -8,6 +8,10 @@
 
 #[cfg(feature = "app")]
 mod app;
+/// What Stop, Pause and Resume each promise, and which of them the shell
+/// offers. `d2x_job::checkpoint` could already resume a segmented run and had
+/// no callers; this is the layer that decides when to offer it.
+mod runctl;
 
 use clap::{Parser, Subcommand};
 use d2x_core::pipeline::{Event, FrameSource, MatcherKind};
