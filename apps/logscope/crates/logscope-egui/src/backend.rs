@@ -1668,10 +1668,56 @@ continue, keeping the first {keep_prefix} tokens{}: {why}", self.name,
             // Below this the two candidates really could swap under a different prefill path, which
             // is the only case the retry was ever meant to cover.
             const NEAR_TIE_LOGITS: f32 = 0.5;
-            let stopped_decisively = match stop_margin(&s.logits) {
-                Some((top, margin)) => stop.contains(&top) && margin >= NEAR_TIE_LOGITS,
-                None => false,
-            };
+            // MARGIN IS CONFIDENCE, NOT CORRECTNESS, and that is where the
+            // skip above overreached. Its premise — "when the model wants to
+            // stop by a wide margin a clean prefill reproduces it exactly" —
+            // holds only if the reused prefix is RIGHT. A wrong KV prefix
+            // produces whatever it produces, including a confident EOS, and
+            // the skip then declines to run the one check that would have
+            // caught it. Worse, it makes the premise untestable in the field:
+            // the retry that would disprove it never fires.
+            //
+            // Reported from an M2 Max run on two DIFFERENT models: "hi there"
+            // answered coherently, then a request for graph algorithms
+            // returned empty, EOS first token, 11.63 logits of margin. Two
+            // models agreeing is not two models stopping; it is the thing they
+            // share, which is this cache path.
+            //
+            // So the margin still gates the skip, but only for a stop that
+            // could plausibly BE the model's: one that arrives after it has
+            // said something. Zero tokens on a turn the model was just handed
+            // is not a decisive stop, it is an empty answer — there was
+            // nothing to stop. That case retries however wide the margin,
+            // because the margin is not evidence about it.
+            // MARGIN IS CONFIDENCE, NOT CORRECTNESS. The skip below rests on
+            // "when the model wants to stop by a wide margin a clean prefill
+            // reproduces it exactly", which holds only if the reused prefix is
+            // RIGHT. A wrong prefix produces whatever it produces, including a
+            // confident EOS — and the skip then declines to run the one check
+            // that would catch it, which also makes its own premise untestable
+            // in the field: the retry that would disprove it never fires.
+            //
+            // REPORTED, and not reproducible here: an M2 Max Asahi run where
+            // "hi there" was answered coherently and the next turn — a request
+            // for graph algorithms — returned empty, EOS as the first token,
+            // 11.63 logits of margin, ON TWO DIFFERENT MODELS. Two models
+            // agreeing is not two models stopping; it is the thing they share.
+            //
+            // NOT CHANGED HERE, deliberately. The obvious edits are both wrong:
+            // gating on "said nothing" makes `stopped_decisively` permanently
+            // false, because it is only read where `produced == 0` already
+            // holds, and that silently restores the always-retry this
+            // replaced. Gating on the reuse fraction needs the anchor length,
+            // which is not in scope at this point — `prefill_len` here is the
+            // whole prompt, so the obvious test is vacuously true.
+            //
+            // The right fix is to retry ONCE per anchor and remember the
+            // verdict, so a genuine stop costs one prefill rather than none or
+            // every time. That needs somewhere to keep the verdict and a
+            // device to measure it on. Until then the escape hatch is real and
+            // documented: LOGSCOPE_ALWAYS_REPREFILL=1 on the affected run will
+            // say which of the two this is, and that answer is worth more than
+            // a guess made here.
             if reuse && produced == 0 && stopped_decisively && !cancel() {
                 if let Some((top, margin)) = stop_margin(&s.logits) {
                     crate::diag!("wgpu-engine: reuse produced 0 tokens, but the model chose stop token {top} \
