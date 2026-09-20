@@ -313,6 +313,28 @@ pub fn templates() -> Vec<(char, Cell)> {
         let mut g = Gray::new(CELL * 3, CELL * 4);
         for p in g.px.iter_mut() { *p = 255; }
         draw_glyph(&mut g, ch, 0, 0, CELL * 3, CELL * 4);
+        // ## Why matching still fails, measured
+        //
+        // A glyph read off a frame is normalised from `glyph_boxes`' output,
+        // which is the bounding box of the INK -- tight on all four sides. A
+        // template is normalised from the full 3:4 rect it was drawn into.
+        // Measured on the test board: template 0.750 aspect against a real
+        // glyph box at 0.591. Both squash into the same CELL x CELL square, so
+        // every stroke lands in a different row and the comparison is between
+        // two differently-distorted pictures. Reads come back '1', 'V', 'I'
+        // for "14B" at 0.08-0.34 confidence: a shape mismatch, not a threshold
+        // to tune.
+        //
+        // The obvious fix -- take the template's own ink box -- was tried and
+        // does NOTHING: `glyph_boxes`' `not_a_smear` filter is `bw <= rw / 2`,
+        // and a template glyph drawn across the full width of its rect fails
+        // it, so the call returns nothing and falls back to the full rect.
+        // Identical output, and the fallback hid that it had no effect.
+        //
+        // So the fix is one of: draw templates into a rect with margin so
+        // their ink box is findable, or normalise BOTH sides from the same
+        // kind of rect. Both change every template, which wants a measurement
+        // pass rather than a guess.
         let cell = normalise(&g, Rect { x: 0, y: 0, w: CELL * 3, h: CELL * 4 },
                              Ink::DarkOnLight, 128);
         (ch, cell)
