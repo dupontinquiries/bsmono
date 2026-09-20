@@ -142,7 +142,9 @@ pub mod runcard;    // the ACTIVE THREAD card: what the run is doing, as label/v
 #[cfg(feature = "gui")] pub mod chords;     // keyboard chords for the quick-action chips, with the collision rules as tests
 #[cfg(feature = "gui")] pub mod ctxcard;    // context-card facts: size line and a topic-match figure with its denominator
 #[cfg(feature = "gui")] pub mod context_probe;
-#[cfg(feature = "gui")] pub mod fan_policy;
+// Moved to the egui-free core (logscope-fan) so `deploy` can compose it with staffing and
+// placement; re-exported here so the path every reader knows still resolves.
+pub use logscope_fan::fan_policy;
 #[cfg(feature = "gui")] pub mod probe_exec;
 #[cfg(feature = "gui")] pub mod queen;
 #[cfg(feature = "gui")] pub mod relief_policy;

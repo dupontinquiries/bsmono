@@ -185,9 +185,137 @@ impl Drafter for PromptLookup {
     fn name(&self) -> &'static str { "prompt-lookup" }
 }
 
+/// `PromptLookup` with the scan replaced by an incremental index: O(1) expected per step instead
+/// of O(context).
+///
+/// `PromptLookup::draft` walks the context BACKWARDS from the end on every call and runs all the way
+/// to the start whenever the final n-gram has not occurred before — which, measured on a Zipf-like
+/// stream over a 150k vocabulary, is two steps in three. Per step: 5.7 us at 8k context, 19 us at
+/// 32k, 39 us at 128k, linear as it must be. This keeps, per n-gram, the START of its most recent
+/// earlier occurrence, updated as the context grows: 0.04-0.05 us per step at every length, and the
+/// SAME DRAFT on every step (`the_indexed_drafter_proposes_exactly_what_the_scan_does`).
+///
+/// SIZE OF THE WIN, stated: tens of microseconds against a token that costs tens of milliseconds —
+/// under 0.1% today. It is here because it is exact and free, and because the cost it removes grows
+/// with exactly the thing agents keep growing.
+///
+/// THE CONTRACT: the context is append-only between calls. That cannot be verified in less than
+/// O(n), so it is CHECKED CHEAPLY (length did not shrink; the last 16 tokens seen are still where
+/// they were) and the index is rebuilt when the check fails. A violation the check misses would
+/// yield a stale draft — and a draft is only ever a proposal `accept_prefix` verifies against the
+/// model's own tokens, so the worst case is a wasted verification slot, never a wrong token. That
+/// asymmetry is what makes an unverifiable contract acceptable here and nowhere near a KV cache.
+///
+/// "Most recent EARLIER occurrence" is kept exact by inserting an n-gram only once it is no longer
+/// the context's own suffix: the n-gram starting at `len - ngram` is indexed on the NEXT call.
+pub struct IndexedLookup {
+    ngram: usize,
+    /// n-gram key -> start of its most recent occurrence among starts < `upto`.
+    last: std::collections::HashMap<u64, u32>,
+    /// n-grams with start < upto are indexed.
+    upto: usize,
+    seen_len: usize,
+    seen_tail: Vec<u32>,
+    /// Test-only: collapse every key to a handful of buckets, so the verify-then-fall-back branch
+    /// — unreachable in practice with a 64-bit key, and therefore untested without this — RUNS.
+    #[cfg(test)]
+    weak_keys: bool,
+}
+
+impl IndexedLookup {
+    pub fn new(ngram: usize) -> Self {
+        IndexedLookup { ngram: ngram.max(1), last: Default::default(), upto: 0, seen_len: 0, seen_tail: Vec::new(),
+                        #[cfg(test)] weak_keys: false }
+    }
+    /// Exact for ngram <= 2 (the tokens ARE the key). Longer n-grams hash, and a hit is verified
+    /// against the context before it is used.
+    fn key(&self, g: &[u32]) -> u64 {
+        #[cfg(test)]
+        if self.weak_keys { return (g[0] % 3) as u64; }
+        match g { [a] => *a as u64, [a, b] => (*a as u64) << 32 | *b as u64,
+            _ => g.iter().fold(0xcbf29ce484222325u64, |h, &t| (h ^ t as u64).wrapping_mul(0x100000001b3)) }
+    }
+    fn still_the_same_context(&self, ctx: &[u32]) -> bool {
+        ctx.len() >= self.seen_len && ctx[self.seen_len - self.seen_tail.len()..self.seen_len] == self.seen_tail[..]
+    }
+}
+
+impl Default for IndexedLookup { fn default() -> Self { Self::new(PromptLookup::default().ngram) } }
+
+impl Drafter for IndexedLookup {
+    fn draft(&mut self, ctx: &[u32], n: usize) -> Vec<u32> {
+        if !self.still_the_same_context(ctx) { self.last.clear(); self.upto = 0; }
+        self.seen_len = ctx.len();
+        self.seen_tail = ctx[ctx.len().saturating_sub(16)..].to_vec();
+        if n == 0 || ctx.len() <= self.ngram { return Vec::new(); }
+        let g = self.ngram;
+        let limit = ctx.len() - g;                 // the suffix's own start: NOT indexed yet
+        while self.upto < limit {
+            let k = self.key(&ctx[self.upto..self.upto + g]);
+            self.last.insert(k, self.upto as u32);
+            self.upto += 1;
+        }
+        let tail = &ctx[limit..];
+        match self.last.get(&self.key(tail)) {
+            Some(&st) if &ctx[st as usize..st as usize + g] == tail => {
+                let from = st as usize + g;
+                ctx[from..(from + n).min(ctx.len())].to_vec()
+            }
+            // A hash collision (only possible for ngram > 2) hid the true latest occurrence behind a
+            // different n-gram: fall back to the scan for THIS step, so the answer stays the scan's.
+            Some(_) => PromptLookup { ngram: g }.draft(ctx, n),
+            None => Vec::new(),
+        }
+    }
+    fn name(&self) -> &'static str { "prompt-lookup-indexed" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The indexed drafter against the scan it replaces: the SAME draft at every step of a growing
+    /// context — for the default bigram and for 1/3/4-grams — across a restart (a shorter context), a
+    /// same-length context with different content, and contexts too short to draft from.
+    #[test]
+    fn the_indexed_drafter_proposes_exactly_what_the_scan_does() {
+        let mut s = 0x9E3779B97F4A7C15u64;
+        let mut r = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        // a small vocabulary so n-grams recur constantly, plus copied phrases, plus rare tokens
+        let mut stream = |len: usize| -> Vec<u32> { let mut v: Vec<u32> = Vec::new();
+            while v.len() < len { if r() % 9 == 0 && v.len() > 30 { let st = (r() as usize) % (v.len() - 10); let ph: Vec<u32> = v[st..st + 7].to_vec(); v.extend(ph); }
+                                  else { v.push(if r() % 5 == 0 { (r() % 5000) as u32 } else { (r() % 23) as u32 }); } } v };
+        for ngram in [1usize, 2, 3, 4] {
+            let (a, b) = (stream(900), stream(400));
+            let mut ix = IndexedLookup::new(ngram);
+            let mut scan = PromptLookup { ngram };
+            let (mut hits, mut empties) = (0usize, 0usize);
+            for len in 0..=a.len() {
+                let (got, want) = (ix.draft(&a[..len], 4), scan.draft(&a[..len], 4));
+                assert_eq!(got, want, "ngram {ngram}, context length {len}");
+                if want.is_empty() { empties += 1 } else { hits += 1 }
+            }
+            assert!(hits > 100 && empties > 5, "ngram {ngram}: {hits} drafts / {empties} empties — the stream must exercise both");
+            // RESTART: a different, shorter context. Then the old one again, from the middle.
+            for len in [0usize, 1, 2, 50, 399, 400] { assert_eq!(ix.draft(&b[..len], 4), scan.draft(&b[..len], 4), "after restart, ngram {ngram} len {len}"); }
+            for len in [700usize, 701, 900] { assert_eq!(ix.draft(&a[..len], 4), scan.draft(&a[..len], 4), "back to the first context, ngram {ngram} len {len}"); }
+            // n = 0 and n larger than what follows
+            assert_eq!(ix.draft(&a, 0), Vec::<u32>::new());
+            assert_eq!(ix.draft(&a, 10_000), scan.draft(&a, 10_000));
+
+            // COLLISIONS. With every key squeezed into three buckets almost every lookup lands on the
+            // WRONG n-gram. The answer must still be the scan's — which is what the verification and
+            // the per-step fallback are for. A break test trusting the hit passed until this existed.
+            let mut weak = IndexedLookup::new(ngram); weak.weak_keys = true;
+            let mut differing_hits = 0usize;
+            for len in 0..=300 {
+                let (got, want) = (weak.draft(&a[..len], 4), scan.draft(&a[..len], 4));
+                assert_eq!(got, want, "weak keys, ngram {ngram}, context length {len}");
+                if !want.is_empty() { differing_hits += 1; }
+            }
+            assert!(differing_hits > 30, "the collision run must actually draft");
+        }
+    }
 
     #[test]
     fn a_fully_accepted_draft_commits_one_more_than_it_drafted() {

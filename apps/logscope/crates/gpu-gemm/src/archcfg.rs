@@ -163,13 +163,19 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             supported: true, dense_supported: true,
             note: "per-head QK-Norm (attn_q_norm/attn_k_norm) applied before RoPE; correctness via --gate-qwen3. Bit-exact-vs-real-Qwen3 M2-gated.",
         },
-        // Qwen3.5 (e.g. Ornith-1.0-9B, general.architecture = "qwen3_5"): same forward-pass shape as Qwen3
-        // for our purposes (QK-Norm, no QKV bias, GQA, SwiGLU, RMSNorm). Reads qwen3_5.* metadata.
+        // Qwen3.5 DENSE (Ornith-1.0-9B / Ornith-1.5-9B, general.architecture = "qwen35" or "qwen3_5").
+        // This comment used to say "same forward-pass shape as Qwen3". It is not: Ornith-1.5-9B's
+        // config.json lists 24 linear_attention (Gated DeltaNet) and 8 full_attention layers, gated
+        // attention output, head_dim 256 with 64 rotary dims, and interleaved mrope sections
+        // [11, 11, 10]. What this ENTRY carries is only the attention-side registry facts (QK-Norm, no
+        // QKV bias, NEOX rope); the hybrid is detected per block from the ssm_* tensors, the sections
+        // are checked per file (imrope.rs), and the fused QK-norm rope was wrong for this head shape
+        // until c75ee49ba. Reads qwen3_5.* / qwen35.* metadata.
         "qwen3_5" | "qwen35" => ArchConfig {
             arch: Arch::Qwen35, prefix: "qwen3_5", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: false, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
             supported: true, dense_supported: true,
-            note: "Qwen3.5 dense (Ornith): QK-Norm before RoPE, qwen3_5.* metadata; correctness via --gate-qwen3. M2-gated for bit-exactness.",
+            note: "Qwen3.5 dense (Ornith 9B) is a HYBRID: 3-in-4 layers Gated DeltaNet (per-block ssm_* sniff), 1-in-4 gated attention with QK-Norm, head_dim 256 / 64 rotary dims, multi-section rope checked per file. Gates: --gate-deltanet-load (hybrid + sections), gate-qknorm-envelope (the head shape). --gate-qwen3 covers only the QK-Norm attention math at head_dim 16. Never bit-compared against a real checkpoint.",
         },
         // Qwen3-MoE (general.architecture = "qwen3moe"): the Qwen3 QK-Norm attention base + mixture-of-
         // experts — a router (ffn_gate_inp) selecting top-k of N experts (ffn_{gate,up,down}_exps), NO shared
@@ -200,9 +206,13 @@ positions only — recurrent state cannot seek, so trie/fleet prefix reuse is re
 too (double-width q split per head at load; attn * sigmoid(gate) before wo, the two decode paths \
 cross-checked against each other — which caught the post_attention_norm double-load). The shared expert's own gate \
 (ffn_gate_inp_shexp) is wired too, proven by the sigmoid(0)=0.5-vs-prehalved bit-equality in \
---gate-deltanet-load. What still blocks the REAL checkpoint: IMRoPE sections (named in archfeat, \
-with the ggml-verification recipe in its note) — and `supported` flips only when a real \
-checkpoint produces coherent text. The MoE side is fine: 256 \
+--gate-deltanet-load. Multi-section rope (IMRoPE) is now settled against ggml's source and checked \
+per file (imrope.rs): for text it IS plain NEOX rope unless a rotary pair reads the 4th channel, \
+and [11,11,10] over 64 dims reads none. So NO KNOWN GAP REMAINS — and `supported` still flips only \
+when a real checkpoint produces coherent text, which nobody has seen. To produce that evidence: \
+LOGSCOPE_TRY_UNSUPPORTED_ARCH=1. If the output is wrong, the first suspects are the two things no \
+fixture had until this week: head_dim 256 with 64 rotary dims (gate-qknorm-envelope), and 512 \
+experts / top-10 on the 397B (every MoE fixture is <= 64 experts). The MoE side: 256 \
 experts, shared expert with its own gate, Q4_K/MXFP4 slice since c4-784/c4-805",
             ..for_arch("qwen3moe")
         },

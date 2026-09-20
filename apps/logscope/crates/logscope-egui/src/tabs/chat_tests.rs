@@ -749,11 +749,17 @@ mod stamp_persistence_tests {
         let line = chat.stage_lane(&mut cfg, "update docs/README.md with the finding");
         assert!(line.is_some(), "a docs-path task should staff to the seed doc-writer");
         assert_eq!(cfg.owns, vec!["docs".to_string()]);
+        // and the WHITELIST came with the lane — before this, staffing carried `owns` alone and
+        // the doc-writer ran with a shell and make_tool on its menu
+        assert_eq!(cfg.tools, ["read_file", "read_near", "write_file", "doc"]);
+        let hud = line.unwrap();
+        assert!(hud.contains("doc-writer") && hud.contains("writes only in docs") && hud.contains("tools: read_file"), "{hud}");
 
         let mut cfg2 = crate::workspace_exec::AgentConfig::default();
         let line2 = chat.stage_lane(&mut cfg2, "fix the renderer");
         assert!(line2.is_none(), "prose with no path names nobody, so nothing is staffed");
         assert!(cfg2.owns.is_empty(), "an unstaffed run must stay unrestricted");
+        assert!(cfg2.tools.is_empty(), "… in its tools as well as its lane");
     }
 
     /// A cold `Chat` is never actually cold — the Delegator always has the seed set to staff
@@ -787,10 +793,66 @@ Success:\n- cargo test passes cleanly with no warnings\n";
         assert!(chat.roster.get("rust-ratatui-coder").is_some());
 
         // An uncheckable success criterion — the exact failure `validate` exists to catch.
-        let bad = "Name: vague-bee\nPurpose: make things nice\nSuccess:\n- the code is clean\n";
+        // ONE fault, so the assertion below is about that fault: the fixture used to omit Tools
+        // too, which `validate` now refuses first (an empty whitelist deploys as "every tool").
+        let bad = "Name: vague-bee\nPurpose: make things nice\nTools:\n- read_file\nSuccess:\n- the code is clean\n";
         let bad_spec = logscope_fan::queen::WorkerSpec::parse(bad).expect("parses");
         let err = bad_spec.validate(crate::workspace_exec::RUNTIME_TOOLS).unwrap_err();
         assert!(err.correction().contains("cannot be checked"), "{}", err.correction());
+
+        // and the two refusals that keep a spec from deploying as "everything"
+        let toolless = logscope_fan::queen::WorkerSpec::parse("Name: thinker\nPurpose: think\nSuccess:\n- cargo test passes\n").expect("parses");
+        assert!(toolless.validate(crate::workspace_exec::RUNTIME_TOOLS).unwrap_err().correction().contains("no tools"));
+        let laneless = logscope_fan::queen::WorkerSpec::parse("Name: patcher\nPurpose: patch\nTools:\n- edit\nSuccess:\n- cargo test passes\n").expect("parses");
+        assert!(laneless.validate(crate::workspace_exec::RUNTIME_TOOLS).unwrap_err().correction().contains("owns no paths"));
+    }
+
+    /// `:enlist` on a HERO definition: the same chain-walk, the hero format, the real validation —
+    /// and then the thing that matters, the enlisted hero actually RUNS in an agent run's loop.
+    #[test]
+    fn a_hero_definition_enlists_and_then_fires_in_a_real_run() {
+        let mut c = Chat::default();
+        // a hero the seed stable does not have: on a `TODO(name)` marker in an observation, grep for it
+        let hero = "Name: todo-finder\nPurpose: find where a TODO marker the last turn surfaced lives\n\
+Tools:\n- search\nSuccess:\n- the output contains the file that holds the marker\n\
+Gate: after-observation\n  matches \"TODO({who:word})\"\n\
+State find: call search pattern=\"TODO(${who})\" path=\"\"\n  ok -> say\n  else -> fail\n\
+State say: emit [todo-finder] TODO(${who}) appears here:\\n${obs}\n  else -> done\n";
+        c.msgs.push(Msg::user("design a hero".into()));
+        let mut a = Msg::assistant(); *a.cur_mut() = hero.to_string(); a.parent = Some(0);
+        c.msgs.push(a); c.active_leaf = Some(1);
+        let before = c.roster.len();
+        let r = c.do_enlist();
+        assert!(r.contains("enlisted hero todo-finder") && r.contains("2 state(s)") && r.contains("AfterObservation"), "{r}");
+        assert_eq!((c.heroes.len(), c.roster.len()), (1, before + 1), "a hero is a worker: it is on the roster too");
+
+        // a hero that calls a tool it does not whitelist is refused with the state and the tool, and nothing is added
+        let mut b = Msg::assistant();
+        *b.cur_mut() = hero.replace("todo-finder", "todo-writer").replace("call search pattern", "call write_file path=x contents=y pattern");
+        b.parent = Some(1); c.msgs.push(b); c.active_leaf = Some(2);
+        let r = c.do_enlist();
+        assert!(r.contains("refused") && r.contains("write_file") && r.contains("`find`"), "{r}");
+        assert_eq!(c.heroes.len(), 1);
+        // and a syntax error names its line
+        let mut d = Msg::assistant(); *d.cur_mut() = hero.replace("ok -> say", "ok say"); d.parent = Some(2);
+        c.msgs.push(d); c.active_leaf = Some(3);
+        assert!(c.do_enlist().contains("line 10"), "{}", c.do_enlist()); // Name,Purpose,Tools,-,Success,-,Gate,guard,State,<edge>
+
+        // THE POINT: handed to a run exactly as start_agent_task hands it, the enlisted hero fires.
+        let dir = std::env::temp_dir().join(format!("ls-enlisted-hero-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "// TODO(ada): handle empty input\nfn f() {}\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "remember TODO(ada) before release\n").unwrap();
+        let cfg = crate::workspace_exec::AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 5,
+            verify_cmd: Vec::new(), verify_exts: Vec::new(), reflexes: true, extra_heroes: c.heroes.clone(), ..Default::default() };
+        let (mut run, _) = crate::workspace_exec::AgentRun::start(&dir, "what is left to do", cfg);
+        run.on_token("```tool\n{\"tool\":\"read_file\",\"path\":\"notes.txt\"}\n```");
+        let _ = run.on_done();
+        let p = run.prompt_for_test();
+        assert!(p.contains("REFLEX (todo-finder") && p.contains("src/lib.rs"), "the enlisted hero should have grepped and reported:\n{}", &p[p.len().saturating_sub(700)..]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `do_enlist`, exercised through the ACTUAL chain-walk (not just the parse/validate pieces

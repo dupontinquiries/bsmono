@@ -179,8 +179,58 @@ impl Tokenizer {
     pub fn has_special(&self, text: &str) -> bool { self.special_id(text).is_some() }
     pub fn is_byte_level(&self) -> bool { self.byte_level }
 
-    /// Greedy lowest-rank merge over a symbol-id sequence.
-    fn bpe_merge(&self, mut syms: Vec<u32>) -> Vec<u32> {
+    /// Greedy lowest-rank merge over a symbol-id sequence: repeatedly apply the globally
+    /// lowest-rank adjacent merge, LEFTMOST on ties, until none applies.
+    ///
+    /// O(m log m). The form this replaces (kept below as `bpe_merge_reference`) rescanned every
+    /// adjacent pair to find ONE merge, applied it with a `Vec::remove`, and repeated: O(m) work per
+    /// merge, O(m) merges, O(m^2) per pre-token chunk. `pretokenize` splits on character CLASS, so a
+    /// chunk is as long as any run of one class — and an agent's prompt is full of them: indentation,
+    /// padded tables, `=====` rules, long digit strings. Measured, one chunk, -O:
+    ///
+    ///      1,000 spaces      5.1 ms  ->  0.16 ms
+    ///      8,000 spaces      338 ms  ->  1.8 ms
+    ///     40,000 '='        8,366 ms ->  10 ms        (8.4 SECONDS before the first prompt token)
+    ///
+    /// Ordinary text (chunks of a few symbols) is unchanged. Same rule, so the same tokens:
+    /// symbols live in a doubly-linked list over their ORIGINAL positions (relative order never
+    /// changes, so "leftmost" is "smallest original index"), candidate merges in a min-heap keyed
+    /// (rank, position). A popped candidate is checked against the list before use — the pair it
+    /// names may have been consumed by an earlier merge — and each merge pushes at most two new ones.
+    fn bpe_merge(&self, syms: Vec<u32>) -> Vec<u32> {
+        use std::cmp::Reverse;
+        let n = syms.len();
+        if n < 2 { return syms; }
+        const NONE: usize = usize::MAX;
+        let mut sym = syms;
+        let mut next: Vec<usize> = (0..n).map(|i| if i + 1 < n { i + 1 } else { NONE }).collect();
+        let mut prev: Vec<usize> = (0..n).map(|i| if i > 0 { i - 1 } else { NONE }).collect();
+        let mut alive = vec![true; n];
+        // (rank, left position, left symbol, right symbol): the symbols are what make a stale entry detectable
+        let mut heap: std::collections::BinaryHeap<Reverse<(u32, usize, u32, u32)>> = std::collections::BinaryHeap::new();
+        for i in 0..n - 1 {
+            if let Some(&(rank, _)) = self.merges.get(&(sym[i], sym[i + 1])) { heap.push(Reverse((rank, i, sym[i], sym[i + 1]))); }
+        }
+        while let Some(Reverse((_, i, a, b))) = heap.pop() {
+            if !alive[i] || sym[i] != a { continue; }
+            let j = next[i];
+            if j == NONE || sym[j] != b { continue; }
+            let Some(&(_, mid)) = self.merges.get(&(a, b)) else { continue };
+            sym[i] = mid;
+            alive[j] = false;
+            let k = next[j];
+            next[i] = k;
+            if k != NONE { prev[k] = i; }
+            let p = prev[i];
+            if p != NONE { if let Some(&(rank, _)) = self.merges.get(&(sym[p], sym[i])) { heap.push(Reverse((rank, p, sym[p], sym[i]))); } }
+            if k != NONE { if let Some(&(rank, _)) = self.merges.get(&(sym[i], sym[k])) { heap.push(Reverse((rank, i, sym[i], sym[k]))); } }
+        }
+        (0..n).filter(|&i| alive[i]).map(|i| sym[i]).collect()
+    }
+
+    /// `bpe_merge` as it was: the quadratic form, and the oracle the fast one is held equal to.
+    #[cfg(test)]
+    fn bpe_merge_reference(&self, mut syms: Vec<u32>) -> Vec<u32> {
         loop {
             let mut best: Option<(usize, u32, u32)> = None; // (pos, rank, merged_id)
             for i in 0..syms.len().saturating_sub(1) {
@@ -344,7 +394,9 @@ impl Tokenizer {
             Ok(t) => Ok(t),
             Err(e) => {
                 let Ok(path) = std::env::var("LOGSCOPE_TOKENIZER_GGUF") else { return Err(e) };
-                let bytes = std::fs::read(&path)
+                // Mapped: the donor is a whole model file and only its metadata pages get touched.
+                // (This was fs::read — gigabytes copied in to parse a few MB of vocabulary.)
+                let bytes = crate::file_bytes(&path)
                     .map_err(|io| format!("LOGSCOPE_TOKENIZER_GGUF={path}: {io}"))?;
                 let donor = crate::gguf::parse(&bytes)
                     .map_err(|p| format!("LOGSCOPE_TOKENIZER_GGUF={path}: {p}"))?;
@@ -463,6 +515,48 @@ the vocab size is cross-checked before it is accepted.".into()),
 #[cfg(test)]
 mod control_stop_tests {
     use super::*;
+
+    /// The heap merge against the quadratic one it replaced: IDENTICAL token sequences. The merge
+    /// tables are built to make the tie rule and staleness matter — equal-rank merges competing for
+    /// overlapping pairs, merges whose product immediately enables another, long single-symbol
+    /// runs (every adjacent pair is a candidate at once), and chains where an early merge CONSUMES
+    /// the right half of a pair already sitting in the heap.
+    #[test]
+    fn the_heap_merge_produces_exactly_the_quadratic_merges_tokens() {
+        let tokens: Vec<Vec<u8>> = (0..256u32).map(|b| vec![b as u8]).collect();
+        let mut t = Tokenizer::new_byte_level(tokens, Vec::new());
+        let mut s = 0x9E3779B97F4A7C15u64;
+        let mut r = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        for table in 0..6u32 {
+            t.merges.clear();
+            let mut next_id = 1000u32;
+            // run-merges: x x -> xx -> xxxx ..., at DUPLICATE ranks on even tables so ties are everywhere
+            for (bi, base) in [7u32, 9, 11].into_iter().enumerate() {
+                let mut cur = base;
+                for lvl in 0..5u32 { let rank = if table % 2 == 0 { lvl } else { bi as u32 * 10 + lvl };
+                    t.merges.insert((cur, cur), (rank, next_id)); cur = next_id; next_id += 1; }
+            }
+            // a dense random table over a SMALL alphabet, so merges chain and overlap constantly
+            for _ in 0..(40 + table * 60) {
+                let (a, b) = ((r() % 14) as u32, (r() % 14) as u32);
+                let rank = (r() % (6 + table as u64 * 3)) as u32;        // few distinct ranks -> many ties
+                t.merges.entry((a, b)).or_insert((rank, next_id)); next_id += 1;
+            }
+            // products merge again
+            for _ in 0..30 { let (a, b) = (1000 + (r() % 40) as u32, (r() % 14) as u32);
+                t.merges.entry((a, b)).or_insert(((r() % 9) as u32, next_id)); next_id += 1; }
+            let mut merged_something = 0usize;
+            for case in 0..120usize {
+                let len = [0usize, 1, 2, 3, 5, 17, 64, 200, 777][case % 9];
+                let syms: Vec<u32> = match case % 4 { 0 => vec![7; len], 1 => (0..len).map(|i| if i % 3 == 0 { 9 } else { 11 }).collect(),
+                                                       _ => (0..len).map(|_| (r() % 14) as u32).collect() };
+                let (want, got) = (t.bpe_merge_reference(syms.clone()), t.bpe_merge(syms.clone()));
+                assert_eq!(got, want, "table {table} case {case} (len {len}): {syms:?}");
+                if want.len() < syms.len() { merged_something += 1; }
+            }
+            assert!(merged_something > 60, "table {table}: only {merged_something} cases merged anything — the table must bite");
+        }
+    }
 
     fn tok_with_specials(specials: &[(&str, u32)]) -> Tokenizer {
         // minimal byte-level tokenizer; only the special set matters for this test

@@ -336,7 +336,12 @@ impl Feature {
             Feature::SeparateAttnOutputGate => false,
             Feature::EmbeddingNorm => false,
             Feature::OutputMultiplier => false,
-            Feature::MRopeSections => false,
+            // TEXT ONLY, and conditional on the file: ggml's multi-section rope collapses to plain
+            // NEOX rope iff no rotary pair reads the 4th (e) channel, and the loader checks that for
+            // the file's own sections (imrope::text_is_plain_neox) and REFUSES otherwise. Verified
+            // against ggml-cpu's ggml_mrope_cache_init + llama-graph's text positions — the check
+            // this flag's note used to ask for. Image/video positions remain unimplemented.
+            Feature::MRopeSections => true,
             // Wired at the moe_ffn funnel (one apply site serves decode AND prefill): the loader
             // reads ffn_gate_inp_shexp as a [1, d] f32 row, and the shared expert's output is
             // scaled by sigmoid(w·n2) per token. Proven algebraically by --gate-deltanet-load: a
@@ -390,13 +395,13 @@ positions only — recurrent state cannot seek, so trie/fleet prefix reuse is re
             Feature::GatedAttentionOutput => Some("wired: the double-width q is split per head at \
 load and decode applies attn * sigmoid(gate) before wo (block_decode and _fused, cross-checked \
 against each other; other paths refuse gated layers by name). Never run on a real checkpoint"),
-            Feature::MRopeSections => Some("IMRoPE: position is split across rope sections \
-(rope.dimension_sections — REQUIRED metadata for qwen35moe, so every converted file carries it). \
-For pure-text input with all position components equal, M-RoPE is claimed equivalent to plain 1D \
-rope (Qwen2-VL paper) — but the ggml kernel is not vendored here, so the per-dim frequency \
-mapping of GGML_ROPE_TYPE_IMROPE is UNVERIFIED; check ggml-cpu's rope against ours on a shared \
-input before treating NEOX as sufficient, and do not flip this flag on the equivalence argument \
-alone"),
+            Feature::MRopeSections => Some("TEXT ONLY. Transcribed from ggml-cpu's \
+ggml_mrope_cache_init (imrope.rs): all four channel thetas scale together, and llama.cpp gives \
+text tokens t=h=w=pos, e=0 — so multi-section rope is plain NEOX rope unless a rotary pair reads \
+the e channel, in which case the reference leaves it UNROTATED. That depends on the file's \
+sections, so the loader checks them and refuses by pair index; [11,11,10] over 64 dims (every \
+Qwen3.5 / Ornith-1.5 config) reads none. Image/video positions are NOT implemented. Never run on \
+a real checkpoint"),
             Feature::GatedSharedExpert => Some("wired at the single moe_ffn funnel; families \
 without the tensor (GLM/DeepSeek) add the shared output unscaled, as their references do. Never \
 run on a real checkpoint"),

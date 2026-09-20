@@ -176,3 +176,65 @@ session.
   the fixture-seeding bug, and (separately) tool-call format acceptance. Commits
   `aa9dec1b9`..`f080c720f` plus `d5986ee76`; see those commit messages for the full
   reasoning and verification each carries.
+
+## Prompt processing: hybrids (Qwen3.5 / Ornith), and what prefill was not doing (2026-09)
+
+Validated on lavapipe only — structure and bit-level agreement, never tok/s. No real GPU, no real
+checkpoint. `kernel-validate --gate-prefill-parity` is the gate for everything in this section.
+
+**Prefill and decode were two different models for several families.** `decode_step` routes per
+layer and implements every variant; the batched prefill blocks were an older body nobody held to it,
+and the only block fns with no refuse-by-name guard. Measured on the then-current engine: a Qwen3.5
+hybrid PANICKED on its first decode step (its recurrent state was never advanced — the sequential
+route d297e4df5 added was lost in a merge), Gemma-4's prompt logits were off by 115% of the logit
+scale, MLA's by 100%. Now `Model::prefill_gap` names what the prefill blocks lack and such a model is
+prefilled token by token (`prefill_sequential`); the blocks refuse those layers by name. Still on the
+gap list: MLA, post-attention norm (Gemma 2/3), V-norm / V-from-K (Gemma 4), CPU-routed DeltaNet.
+Left the list, each with a fixture that has it and nothing else: the embedding scale, the attention
+output gate, GPU-resident DeltaNet.
+
+**Chunked DeltaNet prefill.** Of a DeltaNet block's five dispatches, three were never sequential (the
+stacked projection, the output projection, the FFN). The two that carry state take the token loop
+INSIDE the kernel — `DELTANET_CONV_T`, `DELTANET_STEP_T` — where it is bit-identical to running the
+single-token kernels T times (a channel's conv ring and a head's state rows are thread-private; the
+loop bound is a uniform, so the barriers stay legal). Per prompt token, hybrid fixture,
+quantized-resident as the app loads:
+
+| route | dispatches | submits | polls |
+|---|---|---|---|
+| sequential, `decode_step` per token (what came back first) | 30.00 | 2.00 | 1.00 |
+| sequential, layers only, 8-token windows (`LOGSCOPE_PREFILL_SEQ_LOGITS=1` restores the row above) | 28.06 | 1.03 | 0.12 |
+| chunked, one chunk | 1.33 | 0.09 | 0.06 |
+| chunked, chunks of 7 | 6.42 | 0.33 | 0.18 |
+
+Chunked agrees with sequential to ~4e-7 on a logit scale of 1.8 — on the prompt's last token AND on
+the next decode step, which reads the state and ring the prefill left — including across five chunk
+boundaries with a ragged last chunk. `LOGSCOPE_PREFILL_SEQUENTIAL=1` forces the token-by-token route
+for any model: the A/B lever for real hardware, and the first thing to flip if a prompt reads wrong.
+
+The sequential route's layers-only form matters for the models still on the gap list: it skips the
+final norm, the LM head (248,320 x 4096 on Qwen3.5 — about a billion weights) and the logits readback
+for every prompt token but the last. The submits that remain are `flush_every`'s (SUBMIT_BY_PASSES),
+by design.
+
+**A fixture lesson worth keeping.** `main.rs`'s usual weight generator is `u/2^23 - 1`, i.e. [-amp, 0):
+every weight negative, so every token embeds to nearly the same vector. Two break tests passed on it
+that should not have — a chunked kernel reading TOKEN 0's projection, or token 0's decay/beta, for
+every token in the chunk. Anything per-token needs `write_gguf_qwen35moe_hybrid_full(.., centered)`.
+
+**Not done:** real-hardware numbers for any of this; MLA / Gemma prefill variants (each is one entry
+to remove from `prefill_gap`, with a fixture); speculative verify on hybrids (recurrent state cannot
+roll back — refused by name).
+
+## The CPU side of a token (2026-09)
+
+`sample()` — default temperature 0.8, top_k 40 — fully sorted the vocabulary every token: 10.2 ms at
+Qwen3.5's 248,320 entries, -O, x86-64. `topk.rs` is an exact O(n) threshold scan (0.11 ms, same draws
+for the same rng). The idiom used there and in `blockquant.rs` (load-time quantizer, 2.7x): a
+reduction the vectorizer will not take — an early-exit `any`, a max that carries its index, a float
+max (`llvm.maxnum` is not reassociated without fast-math, on ANY architecture) — becomes a
+fixed-width fold with no exit plus a scalar body for the rare hit. `cpumatvec`'s Q4_K dot was starved
+by scalar bookkeeping, not SIMD-bound (2x from a straight-line scale unpack). Its int8 dots are now
+runtime-dispatched: AVX2 on x86 (on, tested), `dotprod` on AArch64 behind the `arm-dotprod` feature —
+which has NEVER BEEN COMPILED (no AArch64 std in the sandbox that wrote it). The logscope build sets
+no AArch64 rustflags at all, so without that feature the dots build for ARMv8.0.

@@ -52,7 +52,22 @@ pub fn dot_q8_0(raw: &[u8], act: &[f32]) -> f32 {
 /// Written out rather than reused across a crate boundary, and therefore a fourth copy of a function
 /// that has already gone wrong once — so the test below asserts it against the reference for every
 /// subnormal, not a sample.
-fn half_to_f32(h: u16) -> f32 {
+/// IEEE half -> f32: `gguf::f16_to_f32`, the ONE implementation.
+///
+/// This module used to carry its own — the branchy form gguf.rs replaced (three branches and a
+/// data-dependent normalising loop, so it neither pipelines nor vectorises), called once per block
+/// per row: 128 times per 4096-wide Q8_0 row. With realistic, VARYING block scales that cost the
+/// Q8_0 dot ~6% (1.205 -> 1.137 ms per 1024x4096, -O). The better reason is gguf.rs's own warning:
+/// that function HAS A HISTORY — decoding subnormal halves 4x small produced word salad from one
+/// model family while another stayed coherent — and two independent copies of it is how that
+/// happens twice. `the_half_decoder_is_the_one_in_gguf` pins the old copy to it over all 65536
+/// inputs: identical everywhere except the PAYLOAD bits of 1022 NaNs, which are NaN either way.
+#[inline(always)]
+fn half_to_f32(h: u16) -> f32 { crate::gguf::f16_to_f32(h) }
+
+/// The copy this module used to decode with. Kept only as the oracle for the test named above.
+#[cfg(test)]
+fn half_to_f32_branchy(h: u16) -> f32 {
     let (sign, exp, mant) = ((h >> 15) as u32, ((h >> 10) & 0x1F) as u32, (h & 0x3FF) as u32);
     let bits = if exp == 0 {
         if mant == 0 { sign << 31 } else {
@@ -141,7 +156,8 @@ pub fn quantize_act_block(a: &[f32]) -> (f32, [i8; 32]) {
 ///
 /// The activation is quantized once per block and reused across every row in a matvec, so its cost
 /// amortizes over `n_rows` — which is why llama.cpp quantizes the whole activation vector up front.
-pub fn dot_q8_0_iq(raw: &[u8], act_q: &[(f32, [i8; 32])]) -> f32 {
+#[inline(always)]
+fn dot_q8_0_iq_body(raw: &[u8], act_q: &[(f32, [i8; 32])]) -> f32 {
     let mut total = 0f32;
     for (b, (da, qa)) in act_q.iter().enumerate() {
         let off = b * 34;
@@ -178,7 +194,69 @@ pub fn quantize_act(act: &[f32]) -> Vec<(f32, [i8; 32])> {
 /// separately. `sum(w*a) = d*sc*sum(nib*a) - dmin*m*sum(a)` — two integer sums per sub-block, one
 /// float combine. The second sum is over the activation alone and is the same for every row, so it is
 /// computed once in `quantize_act` and reused.
-pub fn dot_q4_k(raw: &[u8], act_q: &[(f32, [i8; 32])], act_sum: &[f32]) -> f32 {
+/// All eight (scale6, min6) pairs of a Q4_K super-block, unpacked in one straight line:
+/// `gguf::get_scale_min_k4(j, ..)` for j = 0..8 with its `j < 4` branch resolved at compile time.
+#[inline(always)]
+pub fn scales_k4(q: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
+    let (mut sc, mut mn) = ([0u8; 8], [0u8; 8]);
+    for j in 0..4 { sc[j] = q[j] & 63; mn[j] = q[j + 4] & 63; }
+    for j in 4..8 { sc[j] = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); mn[j] = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+    (sc, mn)
+}
+
+/// Dot a Q4_K weight row with a pre-quantized activation.
+///
+/// THE VECTOR LOOP WAS NEVER THE PROBLEM. This ran at half Q8_0's rate and gained almost nothing
+/// from wider SIMD (1.23 ms at SSE2, 1.05 at AVX2 per 1024x4096 matvec), which is the signature of
+/// scalar work starving the vector work. The disassembly said what: around the packed multiply-adds
+/// sat 32 scalar byte loads, 8 scalar multiplies, 28 branches and 3 bounds-check panic paths PER
+/// SUPER-BLOCK — `get_scale_min_k4` called eight times per 256 weights, each with its own `j < 4`
+/// branch, plus checked indexing into `act_q` and `act_sum` per sub-block. (Q8_0: 2 byte loads, 11
+/// branches.) Now the eight (scale, min) pairs are unpacked once in a straight line, and the three
+/// inputs are walked in lockstep as fixed-size chunks — one length proof per super-block.
+///
+/// What I tried first and did NOT keep: computing the products in i16 and widening only the sum,
+/// on the theory that the i32 multiply was the cost. Bit-identical, and exactly the same speed —
+/// LLVM was already narrowing it to the packed 16-bit form. Measured before editing; no edit.
+///
+/// The float expression and its ORDER are unchanged (low half, then high half, per pair), so this
+/// is BIT-IDENTICAL to `dot_q4_k_reference`, which is the old function verbatim and the oracle.
+/// 1.30 -> 0.64 ms at baseline x86-64, 1.48 -> 0.64 at AVX2. ARM not compiled or measured here; the
+/// gain is from removing scalar bookkeeping, which a narrow-SIMD core pays for at least as dearly.
+///
+/// One behavioural difference, on MALFORMED input only: a too-short `act_sum` used to panic on an
+/// index; the lockstep walk now stops at the shortest input instead.
+#[inline(always)]
+fn dot_q4_k_body(raw: &[u8], act_q: &[(f32, [i8; 32])], act_sum: &[f32]) -> f32 {
+    let nblk = act_q.len() / 8;              // 8 sub-blocks of 32 per super-block
+    let mut total = 0f32;
+    for ((blk, aq), asum) in raw.chunks_exact(144).zip(act_q.chunks_exact(8)).zip(act_sum.chunks_exact(8)).take(nblk) {
+        let blk: &[u8; 144] = blk.try_into().unwrap();
+        let aq: &[(f32, [i8; 32]); 8] = aq.try_into().unwrap();
+        let asum: &[f32; 8] = asum.try_into().unwrap();
+        let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dmin = half_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+        let (sc, mn) = scales_k4(blk[4..16].try_into().unwrap());
+        for pair in 0..4 {
+            // Each 32-byte run holds TWO sub-blocks: low nibbles, then high nibbles.
+            let nibs: &[u8; 32] = blk[16 + pair * 32..16 + pair * 32 + 32].try_into().unwrap();
+            let (lo, hi) = (2 * pair, 2 * pair + 1);
+            let mut acc_lo = 0i32;
+            for (&n, &a) in nibs.iter().zip(aq[lo].1.iter()) { acc_lo += ((n & 0xF) as i32) * (a as i32); }
+            let mut acc_hi = 0i32;
+            for (&n, &a) in nibs.iter().zip(aq[hi].1.iter()) { acc_hi += ((n >> 4) as i32) * (a as i32); }
+            // d*sc*sum(nib*a) - dmin*m*sum(a): the min term uses the activation sum, which does not
+            // depend on the weights and is therefore hoisted out of every row. SAME order as the
+            // reference: low half, then high half.
+            total += d * sc[lo] as f32 * aq[lo].0 * acc_lo as f32 - dmin * mn[lo] as f32 * asum[lo];
+            total += d * sc[hi] as f32 * aq[hi].0 * acc_hi as f32 - dmin * mn[hi] as f32 * asum[hi];
+        }
+    }
+    total
+}
+
+/// `dot_q4_k` as it was. Kept verbatim: it is the oracle the fast one is held bit-identical to.
+pub fn dot_q4_k_reference(raw: &[u8], act_q: &[(f32, [i8; 32])], act_sum: &[f32]) -> f32 {
     let nblk = act_q.len() / 8;              // 8 sub-blocks of 32 per super-block
     let mut total = 0f32;
     for b in 0..nblk {
@@ -217,6 +295,150 @@ pub fn dot_q4_k(raw: &[u8], act_q: &[(f32, [i8; 32])], act_sum: &[f32]) -> f32 {
     total
 }
 
+/// Dot a Q6_K weight row with a pre-quantized activation.
+///
+/// Why this format, and why now: `Q4_K_M` — the GGUF nearly everyone downloads — stores ffn_gate and
+/// ffn_up as Q4_K and **ffn_down as Q6_K**. With only Q4_K here, not one expert of such a file could
+/// be computed on the CPU, which is what stands between this module and computing a streamed MoE's
+/// MISSED experts in place against the mmap instead of copying them into a GPU slot (the GPU-side
+/// fill cannot take Q6_K either: see the LOGSCOPE_Q6K_VIEWS gate in the loader).
+///
+/// 210-byte super-block of 256 weights: 128 bytes `ql` (low nibbles), 64 bytes `qh` (high 2 bits),
+/// 16 int8 sub-block scales, f16 `d` LAST (offset 208 — Q4_K keeps its `d` first). A weight is
+/// `d * sc[j/16] * (q6 - 32)`. No min term: the -32 recentre folds into the integer, so unlike Q4_K
+/// there is one integer sum per sub-block and no activation-sum side channel.
+///
+/// The two granularities do not line up and that is the one thing to get right: weights are scaled
+/// per SIXTEEN, activations were quantized per THIRTY-TWO. So each activation block spans two weight
+/// sub-blocks with different scales, and the integer sum must be split at 16 — one sum per 32 with
+/// either scale is wrong by exactly the difference between neighbouring scales.
+#[inline(always)]
+fn dot_q6_k_body(raw: &[u8], act_q: &[(f32, [i8; 32])]) -> f32 {
+    let nblk = act_q.len() / 8;              // 8 activation blocks of 32 per super-block
+    let mut total = 0f32;
+    for b in 0..nblk {
+        let off = b * 210;
+        if off + 210 > raw.len() { break; }
+        let blk = &raw[off..off + 210];
+        let d = half_to_f32(u16::from_le_bytes([blk[208], blk[209]]));
+        // Unpack the 6-bit quants once into a flat, recentred array. gguf::dequantize's layout, in
+        // integers: two 128-wide halves, each interleaving four 32-runs across ql's nibbles and qh's
+        // bit pairs. Flat i8 is what lets the dot below be 16 identical lanes.
+        let mut q = [0i8; 256];
+        for half in 0..2usize {
+            let ql = &blk[half * 64..half * 64 + 64];
+            let qh = &blk[128 + half * 32..128 + half * 32 + 32];
+            let o = half * 128;
+            for l in 0..32 {
+                q[o + l]      = (((ql[l] & 0xF)      | ((qh[l] & 3) << 4)) as i32 - 32) as i8;
+                q[o + l + 32] = (((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32) as i8;
+                q[o + l + 64] = (((ql[l] >> 4)       | (((qh[l] >> 4) & 3) << 4)) as i32 - 32) as i8;
+                q[o + l + 96] = (((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) as i32 - 32) as i8;
+            }
+        }
+        let sc = &blk[192..208];
+        for a32 in 0..8 {
+            let (da, qa) = &act_q[b * 8 + a32];
+            for sub in 0..2 {
+                let w: &[i8; 16] = q[a32 * 32 + sub * 16..a32 * 32 + sub * 16 + 16].try_into().unwrap();
+                let a: &[i8; 16] = qa[sub * 16..sub * 16 + 16].try_into().unwrap();
+                let mut acc = 0i32;
+                for (&wv, &av) in w.iter().zip(a.iter()) { acc += (wv as i32) * (av as i32); }
+                total += d * (sc[a32 * 2 + sub] as i8) as f32 * da * acc as f32;
+            }
+        }
+    }
+    total
+}
+
+// ───────────────────────── instruction-set dispatch ─────────────────────────
+//
+// WHAT THE BUILD TELLS THE COMPILER ABOUT THE CPU: nothing. apps/logscope/.cargo/config.toml sets
+// rustflags for x86_64 only (a linker flag), so these dots compile for BASELINE — x86-64 SSE2,
+// AArch64 ARMv8.0. `dot_q8_0_iq`'s own doc says the int8 dot "lowers to SDOT on aarch64"; that is
+// only true if `dotprod` is enabled, and it never was, so on ARM it has been widening multiplies.
+// `target-cpu=native` is the wrong fix for anything that gets packaged: the PinePhone's A53 has no
+// dotprod and would SIGILL.
+//
+// So: each dot is ONE `#[inline(always)]` body, and `isa_dispatch!` compiles that body a second
+// time inside a `#[target_feature]` wrapper, chosen at runtime. No intrinsics and no second
+// implementation — the same source, which is what keeps the results BIT-IDENTICAL across paths
+// (integer sums are exact; the float expressions are untouched, and only `avx2` / `dotprod` are
+// enabled, never `fma`, so nothing can be contracted). Measured on x86-64, whole matvec, -O:
+// Q8_0 0.60 -> 0.38 ms, Q6_K 0.91 -> 0.50 ms with AVX2; Q4_K does not move (it was never
+// SIMD-bound — see dot_q4_k_body).
+//
+// LOGSCOPE_CPU_ISA=baseline forces the baseline copy, for A/B and for blaming this first.
+
+/// 0 = undecided, 1 = baseline, 2 = wide. Decided once; `set_cpu_isa_wide` overrides (tests, levers).
+static ISA: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force (`Some`) or re-detect (`None`) the wide instruction-set path. Returns what is now in force.
+pub fn set_cpu_isa_wide(force: Option<bool>) -> bool {
+    let v = match force { Some(w) => w && isa_detect(), None => isa_detect() && std::env::var("LOGSCOPE_CPU_ISA").as_deref() != Ok("baseline") };
+    ISA.store(if v { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    v
+}
+
+#[inline(always)]
+fn isa_wide() -> bool {
+    match ISA.load(std::sync::atomic::Ordering::Relaxed) { 2 => true, 1 => false, _ => set_cpu_isa_wide(None) }
+}
+
+/// Does THIS CPU have the feature the wide copy was compiled for? False where no wide copy exists.
+fn isa_detect() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    { return std::arch::is_x86_feature_detected!("avx2"); }
+    #[cfg(all(target_arch = "aarch64", feature = "arm-dotprod"))]
+    { return std::arch::is_aarch64_feature_detected!("dotprod"); }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Which copy the dots are running, for a log line: the question "did the fast path engage" should
+/// have an answer that does not involve a profiler.
+pub fn cpu_isa_name() -> &'static str {
+    if !isa_wide() { return "baseline"; }
+    if cfg!(target_arch = "x86_64") { "avx2" } else { "dotprod" }
+}
+
+macro_rules! isa_dispatch {
+    ($(#[$doc:meta])* $name:ident = $body:ident, wide: $wide:ident, ($($arg:ident : $ty:ty),*) -> $ret:ty) => {
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = "avx2")]
+        unsafe fn $wide($($arg: $ty),*) -> $ret { $body($($arg),*) }
+        // NEVER COMPILED by its author (no AArch64 std in the sandbox) — hence the opt-in feature.
+        // It is the x86 arm above with two strings changed.
+        #[cfg(all(target_arch = "aarch64", feature = "arm-dotprod"))]
+        #[target_feature(enable = "dotprod")]
+        unsafe fn $wide($($arg: $ty),*) -> $ret { $body($($arg),*) }
+
+        $(#[$doc])*
+        pub fn $name($($arg: $ty),*) -> $ret {
+            #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "arm-dotprod")))]
+            if isa_wide() {
+                // SAFETY: `isa_wide` is true only after the runtime check for exactly the feature
+                // `$wide` was compiled with (isa_detect), on this CPU.
+                return unsafe { $wide($($arg),*) };
+            }
+            $body($($arg),*)
+        }
+    };
+}
+
+isa_dispatch! {
+    /// Q8_0 row · pre-quantized activation. See `dot_q8_0_iq_body` for the arithmetic; this picks the copy.
+    dot_q8_0_iq = dot_q8_0_iq_body, wide: dot_q8_0_iq_wide, (raw: &[u8], act_q: &[(f32, [i8; 32])]) -> f32
+}
+isa_dispatch! {
+    /// Q4_K row · pre-quantized activation. See `dot_q4_k_body`; bit-identical to `dot_q4_k_reference`.
+    dot_q4_k = dot_q4_k_body, wide: dot_q4_k_wide, (raw: &[u8], act_q: &[(f32, [i8; 32])], act_sum: &[f32]) -> f32
+}
+isa_dispatch! {
+    /// Q6_K row · pre-quantized activation. See `dot_q6_k_body` for the arithmetic; this picks the copy.
+    dot_q6_k = dot_q6_k_body, wide: dot_q6_k_wide, (raw: &[u8], act_q: &[(f32, [i8; 32])]) -> f32
+}
+
 /// Per-block sums of the raw activation, for Q4_K's min term.
 ///
 /// Separate from `quantize_act` because it is the sum of the ORIGINAL floats, not the quantized ones —
@@ -232,12 +454,20 @@ pub fn act_block_sums(act: &[f32]) -> Vec<f32> {
 /// `Q8Zero` and `Q4K` would make a grep for the format name miss the enum representing it, and this
 /// codebase cross-references ggml type names constantly.
 #[allow(non_camel_case_types)]
-pub enum Quant { Q8_0, Q4_K }
+pub enum Quant { Q8_0, Q4_K, Q6_K }
 
 impl Quant {
+    /// Weights per quantization block. A row whose width is not a multiple of this has no on-disk
+    /// layout in this format, and `row_bytes` — integer division — would report ZERO bytes for a
+    /// 64-wide Q6_K row, which `matvec` then reads as "every row is empty" and returns zeros for.
+    /// Callers must check `fits` before trusting `row_bytes`.
+    pub fn block(self) -> usize {
+        match self { Quant::Q8_0 => 32, Quant::Q4_K | Quant::Q6_K => 256 }
+    }
+    pub fn fits(self, k: usize) -> bool { k > 0 && k % self.block() == 0 }
     /// Bytes one row of `k` weights occupies.
     pub fn row_bytes(self, k: usize) -> usize {
-        match self { Quant::Q8_0 => (k / 32) * 34, Quant::Q4_K => (k / 256) * 144 }
+        match self { Quant::Q8_0 => (k / 32) * 34, Quant::Q4_K => (k / 256) * 144, Quant::Q6_K => (k / 256) * 210 }
     }
     /// From a GGUF type id, or None for formats this path does not read.
     ///
@@ -245,7 +475,7 @@ impl Quant {
     /// Q4_K and produce plausible-looking garbage, which is the failure mode this project keeps paying
     /// for. Unsupported means fall back to the GPU, not improvise.
     pub fn from_gguf(t: u32) -> Option<Self> {
-        match t { 8 => Some(Quant::Q8_0), 12 => Some(Quant::Q4_K), _ => None }
+        match t { 8 => Some(Quant::Q8_0), 12 => Some(Quant::Q4_K), 14 => Some(Quant::Q6_K), _ => None }
     }
 }
 
@@ -312,6 +542,7 @@ pub fn matvec(pool: &crate::cpupool::Pool, q: Quant, raw: &[u8], n_rows: usize, 
             let v = match q {
                 Quant::Q8_0 => dot_q8_0_iq(&raw[off..off + row_bytes], &act.q),
                 Quant::Q4_K => dot_q4_k(&raw[off..off + row_bytes], &act.q, &act.sums),
+                Quant::Q6_K => dot_q6_k(&raw[off..off + row_bytes], &act.q),
             };
             // SAFETY: spans are disjoint, so no two workers write the same index, and `run` does not
             // return until every worker has finished.
@@ -487,6 +718,184 @@ mod tests {
         assert!(rel < 0.01, "want {want}, got {got}, rel {rel:.4}");
     }
 
+    /// Pseudo-random but VALID Q6_K rows: every byte pattern is a legal ql/qh/scale, and `d` is set to
+    /// a normal f16 so the oracle is not comparing NaNs. `rows` super-blocks per row, seeded.
+    fn q6k_bytes(blocks: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed | 1;
+        let mut v = Vec::with_capacity(blocks * 210);
+        for b in 0..blocks {
+            for _ in 0..208 { x = x.wrapping_mul(1664525).wrapping_add(1013904223); v.push((x >> 24) as u8); }
+            v.extend_from_slice(&f32_to_half(0.004 + 0.001 * b as f32).to_le_bytes());
+        }
+        v
+    }
+
+    /// The sharp oracle. Against the TRUE activation a quantized dot is only ever "within a percent",
+    /// and a percent hides a wrong sub-block scale. So compare against gguf::dequantize dotted with
+    /// the DEQUANTIZED QUANTIZED activation — the same two operands dot_q6_k sees — where the only
+    /// difference left is float summation order.
+    #[test]
+    fn the_q6k_dot_is_dequantize_then_multiply_on_the_same_operands() {
+        for (blocks, seed) in [(1usize, 7u32), (4, 99), (16, 12345)] {
+            let raw = q6k_bytes(blocks, seed);
+            let k = blocks * 256;
+            let w = crate::gguf::dequantize(14, &raw, k).expect("cpu q6_k");
+            let act: Vec<f32> = (0..k).map(|i| (((i * 31 + 7) % 61) as f32 - 30.0) * 0.173).collect();
+            let aq = quantize_act(&act);
+            let act_rt: Vec<f32> = aq.iter().flat_map(|(d, q)| q.iter().map(move |&v| v as f32 * d)).collect();
+            let want: f64 = w.iter().zip(&act_rt).map(|(a, b)| *a as f64 * *b as f64).sum();
+            let got = dot_q6_k(&raw, &aq) as f64;
+            let scale: f64 = w.iter().zip(&act_rt).map(|(a, b)| (*a as f64 * *b as f64).abs()).sum();
+            assert!((want - got).abs() <= 2e-6 * scale, "{blocks} blocks: want {want}, got {got}, |terms| {scale}");
+            // and against the true activation it is the usual percent-class agreement
+            let truth: f64 = w.iter().zip(&act).map(|(a, b)| *a as f64 * *b as f64).sum();
+            assert!((truth - got).abs() <= 0.02 * scale, "{blocks} blocks vs true activation: {truth} vs {got}");
+        }
+    }
+
+    /// Weights scale per 16, activations per 32: each activation block straddles two scales. Make
+    /// exactly ONE of the 16 sub-block scales non-zero and the dot must see exactly that sub-block —
+    /// a sum taken per 32 with either neighbour's scale gets this wrong for 15 of the 16.
+    #[test]
+    fn every_q6k_sub_block_uses_its_own_scale() {
+        let base = q6k_bytes(1, 4242);
+        let act: Vec<f32> = (0..256).map(|i| ((i % 17) as f32 - 8.0) * 0.5 + 0.25).collect();
+        let aq = quantize_act(&act);
+        let act_rt: Vec<f32> = aq.iter().flat_map(|(d, q)| q.iter().map(move |&v| v as f32 * d)).collect();
+        for live in 0..16usize {
+            let mut raw = base.clone();
+            for s in 0..16 { raw[192 + s] = if s == live { 0x51 } else { 0 }; }
+            let w = crate::gguf::dequantize(14, &raw, 256).unwrap();
+            assert!(w.iter().enumerate().all(|(j, v)| (j / 16 == live) || *v == 0.0), "fixture: only sub-block {live} is live");
+            let want: f64 = w.iter().zip(&act_rt).map(|(a, b)| *a as f64 * *b as f64).sum();
+            let got = dot_q6_k(&raw, &aq) as f64;
+            assert!(want.abs() > 1e-3, "sub-block {live}: a zero expectation would prove nothing");
+            assert!((want - got).abs() <= 1e-5 * want.abs(), "sub-block {live}: want {want}, got {got}");
+        }
+    }
+
+    #[test]
+    fn q6k_negative_scales_and_truncation() {
+        // scales are SIGNED int8; reading them unsigned flips the sign of half the model
+        let mut raw = q6k_bytes(1, 5);
+        for s in 0..16 { raw[192 + s] = 0xF0; } // -16
+        let act = vec![0.5f32; 256];
+        let aq = quantize_act(&act);
+        let w = crate::gguf::dequantize(14, &raw, 256).unwrap();
+        let want: f32 = w.iter().map(|v| v * 0.5).sum();
+        let got = dot_q6_k(&raw, &aq);
+        assert!(want.abs() > 1e-3 && (want - got).abs() <= 1e-4 * want.abs().max(1.0), "want {want}, got {got}");
+        raw.truncate(150);
+        assert_eq!(dot_q6_k(&raw, &aq), 0.0, "a truncated block stops rather than reading past the map");
+    }
+
+    /// Through the pool, as the caller will use it: a [rows, k] Q6_K matrix, every row against the
+    /// per-row reference, and the type plumbing (row_bytes, from_gguf) the loader would key on.
+    #[test]
+    fn q6k_matvec_through_the_pool_matches_per_row() {
+        assert_eq!(Quant::from_gguf(14), Some(Quant::Q6_K));
+        assert_eq!(Quant::Q6_K.row_bytes(1024), 4 * 210);
+        let (rows, k) = (37usize, 512usize);
+        let raw = q6k_bytes(rows * k / 256, 31337);
+        let act: Vec<f32> = (0..k).map(|i| ((i * 7 % 23) as f32 - 11.0) * 0.31).collect();
+        let prep = ActPrep::new(&act);
+        let pool = crate::cpupool::Pool::new(3);
+        let got = matvec(&pool, Quant::Q6_K, &raw, rows, k, &prep);
+        assert_eq!(got.len(), rows);
+        let rb = Quant::Q6_K.row_bytes(k);
+        for r in 0..rows {
+            assert_eq!(got[r], dot_q6_k(&raw[r * rb..(r + 1) * rb], &prep.q), "row {r}");
+        }
+        assert!(got.iter().any(|v| *v != 0.0) && got.windows(2).any(|w| w[0] != w[1]), "rows are distinct and non-zero");
+    }
+
+    #[test]
+    fn the_half_decoder_is_the_one_in_gguf() {
+        let (mut differ, mut nan_pairs) = (0u32, 0u32);
+        for h in 0..=u16::MAX {
+            let (a, b) = (half_to_f32_branchy(h), half_to_f32(h));
+            if a.to_bits() != b.to_bits() { differ += 1; if a.is_nan() && b.is_nan() { nan_pairs += 1; } }
+        }
+        assert_eq!(differ, nan_pairs, "a non-NaN half decodes differently");
+        // every SUBNORMAL half, by value — the class the historical bug lived in
+        for m in 1..0x400u16 { for sign in [0u16, 0x8000] {
+            let want = (m as f32) * 2f32.powi(-24) * if sign == 0 { 1.0 } else { -1.0 };
+            assert_eq!(half_to_f32(m | sign), want, "subnormal 0x{:04x}", m | sign);
+        } }
+        assert_eq!((half_to_f32(0x3C00), half_to_f32(0xC000), half_to_f32(0x7BFF), half_to_f32(0x0000).to_bits(), half_to_f32(0x8000).to_bits()),
+                   (1.0, -2.0, 65504.0, 0, 0x8000_0000));
+        assert!(half_to_f32(0x7C00).is_infinite() && half_to_f32(0x7E00).is_nan());
+    }
+
+    /// BOTH COPIES, SAME BITS. The wide copy is the same source compiled with more instructions
+    /// available; if it ever differs from baseline, a feature that changes float semantics got
+    /// enabled (fma), or the dispatch is calling the wrong thing. Forces each path explicitly —
+    /// relying on detection alone would silently test one copy twice on a CPU without the feature.
+    #[test]
+    fn the_wide_copy_of_every_dot_is_bit_identical_to_baseline() {
+        let blocks = 16usize; let k = blocks * 256;
+        let act: Vec<f32> = (0..k).map(|i| (((i * 37 + 11) % 97) as f32 - 48.0) * 0.21).collect();
+        let prep = ActPrep::new(&act);
+        let q8: Vec<u8> = { let mut v = Vec::new(); let mut x = 99u32; for _ in 0..k / 32 { v.extend_from_slice(&f32_to_half(0.004).to_le_bytes()); for _ in 0..32 { x = x.wrapping_mul(1664525).wrapping_add(1013904223); v.push((x >> 24) as u8); } } v };
+        let (q4, q6) = (q4k_bytes(blocks, 606), q6k_bytes(blocks, 707));
+        let had_wide = set_cpu_isa_wide(Some(true));
+        let wide = (dot_q8_0_iq(&q8, &prep.q), dot_q4_k(&q4, &prep.q, &prep.sums), dot_q6_k(&q6, &prep.q));
+        let name_wide = cpu_isa_name();
+        assert!(!set_cpu_isa_wide(Some(false)));
+        let base = (dot_q8_0_iq(&q8, &prep.q), dot_q4_k(&q4, &prep.q, &prep.sums), dot_q6_k(&q6, &prep.q));
+        assert_eq!(cpu_isa_name(), "baseline");
+        set_cpu_isa_wide(None);
+        assert_eq!((wide.0.to_bits(), wide.1.to_bits(), wide.2.to_bits()), (base.0.to_bits(), base.1.to_bits(), base.2.to_bits()));
+        assert!(base.0 != 0.0 && base.1 != 0.0 && base.2 != 0.0 && base.0.is_finite() && base.1.is_finite() && base.2.is_finite());
+        // and say which case this run actually covered, so a green result is not over-read
+        eprintln!("isa test: wide copy {} on this CPU ({name_wide})", if had_wide { "EXERCISED" } else { "NOT AVAILABLE — baseline compared with itself" });
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(had_wide, std::arch::is_x86_feature_detected!("avx2"));
+    }
+
+    /// Valid-looking Q4_K rows: random quants and 6-bit scales, `d`/`dmin` set to normal f16s.
+    fn q4k_bytes(blocks: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed | 1; let mut v = Vec::with_capacity(blocks * 144);
+        for b in 0..blocks {
+            v.extend_from_slice(&f32_to_half(0.003 + 0.0007 * b as f32).to_le_bytes());
+            v.extend_from_slice(&f32_to_half(0.011 + 0.0003 * b as f32).to_le_bytes());
+            for _ in 0..140 { x = x.wrapping_mul(1664525).wrapping_add(1013904223); v.push((x >> 24) as u8); }
+        }
+        v
+    }
+
+    /// The fast Q4_K dot is the old one, bit for bit — every row, several shapes, negative and
+    /// zero activations — and its straight-line scale unpack is `get_scale_min_k4` for every j.
+    #[test]
+    fn the_q4k_dot_is_bit_identical_to_the_function_it_replaced() {
+        let mut x = 12345u32;
+        for (blocks, seed) in [(1usize, 3u32), (4, 77), (16, 4242), (16, 9)] {
+            let raw = q4k_bytes(blocks, seed);
+            let k = blocks * 256;
+            for shape in 0..3 {
+                let act: Vec<f32> = (0..k).map(|i| match shape { 0 => (((i * 31 + 7) % 61) as f32 - 30.0) * 0.173, 1 => if i % 5 == 0 { 0.0 } else { -((i % 13) as f32) * 0.4 }, _ => { x = x.wrapping_mul(1664525).wrapping_add(1013904223); ((x >> 9) as f32 / (1u32 << 23) as f32 - 0.5) * 9.0 } }).collect();
+                let prep = ActPrep::new(&act);
+                let (a, b) = (dot_q4_k_reference(&raw, &prep.q, &prep.sums), dot_q4_k(&raw, &prep.q, &prep.sums));
+                assert!(a.to_bits() == b.to_bits() && a != 0.0 && a.is_finite(), "{blocks} blocks seed {seed} shape {shape}: {a} vs {b}");
+            }
+            for sb in raw.chunks_exact(144) {
+                let (sc, mn) = scales_k4(sb[4..16].try_into().unwrap());
+                for j in 0..8 { assert_eq!(crate::gguf::get_scale_min_k4(j, &sb[4..16]), (sc[j], mn[j]), "j={j}"); }
+            }
+        }
+        // every 6-bit value reaches every slot: the two unpack branches (j<4, j>=4) each see all 64
+        for v in 0..64u8 { for j in 0..8usize {
+            let mut q = [0u8; 12];
+            if j < 4 { q[j] = v; q[j + 4] = 63 - v; } else { q[j + 4] = (v & 0xF) | (((63 - v) & 0xF) << 4); q[j - 4] = (v >> 4) << 6; q[j] = ((63 - v) >> 4) << 6; }
+            let (sc, mn) = scales_k4(&q);
+            assert_eq!((sc[j], mn[j]), (v, 63 - v), "slot {j} value {v}");
+            assert_eq!(crate::gguf::get_scale_min_k4(j, &q), (v, 63 - v));
+        } }
+        // truncated raw: both stop at the last whole super-block
+        let raw = q4k_bytes(4, 5); let act = vec![0.5f32; 1024]; let prep = ActPrep::new(&act);
+        assert_eq!(dot_q4_k(&raw[..400], &prep.q, &prep.sums).to_bits(), dot_q4_k_reference(&raw[..400], &prep.q, &prep.sums).to_bits());
+    }
+
     #[test]
     fn the_q4k_min_term_uses_the_UNQUANTIZED_activation_sum() {
         // sum(w*a) = d*sc*sum(nib*a) - dmin*m*sum(a). The second sum is over the ORIGINAL floats:
@@ -577,7 +986,11 @@ mod tests {
         // failure this project keeps paying for. Unsupported means fall back to the GPU, not improvise.
         assert_eq!(Quant::from_gguf(8), Some(Quant::Q8_0));
         assert_eq!(Quant::from_gguf(12), Some(Quant::Q4_K));
-        for t in [14u32, 19, 0, 1, 99] { assert_eq!(Quant::from_gguf(t), None, "type {t}"); }
+        // 14 (Q6_K) sat in the None list until dot_q6_k existed. It left the list WITH its kernel and
+        // an oracle test, which is the only way a type should ever leave it. Q5_K (13) and Q3_K (11)
+        // are what a Q4_K_S / Q3_K_M file would add next; they are still refused.
+        assert_eq!(Quant::from_gguf(14), Some(Quant::Q6_K));
+        for t in [13u32, 11, 10, 19, 0, 1, 99] { assert_eq!(Quant::from_gguf(t), None, "type {t}"); }
     }
 
     #[test]

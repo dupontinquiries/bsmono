@@ -16,6 +16,8 @@ var<workgroup> ov_v: array<f32,64>;
 var<workgroup> n_over: u32;
 var<workgroup> last_v: f32;
 var<workgroup> last_i: u32;
+var<workgroup> n_clean: u32;   // picks so far that are NOT in the penalty override table
+var<workgroup> n_cand: u32;    // candidates actually collected (<= want)
 @compute @workgroup_size(256,1,1)
 fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let t = lid.x;
@@ -46,6 +48,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       }
     }
     last_v = 3.4028235e38; last_i = 0xffffffffu; // sentinel: nothing picked yet
+    n_clean = 0u; n_cand = 0u;
   }
   workgroupBarrier();
   // ── phase 2: iterate raw maxima in exact (value desc, index asc) order ──
@@ -84,22 +87,35 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     if (t == 0u) {
       cand_v[c] = sv[0]; cand_i[c] = si[0];
       last_v = sv[0]; last_i = si[0];
+      n_cand = c + 1u;
+      // is this pick penalized? (<= 64 entries; thread 0 only)
+      var hit = false;
+      var q2 = 0u;
+      loop { if (q2 >= n_over) { break; } if (ov_i[q2] == si[0]) { hit = true; break; } q2 = q2 + 1u; }
+      if (!hit) { n_clean = n_clean + 1u; }
     }
     workgroupBarrier();
     c = c + 1u;
+    // THE TIGHT BOUND. Picks arrive in raw descending order and a penalty only LOWERS a logit, so once
+    // top_k picks are UNPENALIZED, those k unchanged values outrank everything not yet picked —
+    // penalized or not. The post-penalty top-k is already inside the candidates; every further pass
+    // over the vocabulary would find something that cannot make the cut. `want` (top_k + n_over) stays
+    // as the worst case. Every thread reads the same n_clean after the barrier, so they leave together.
+    if (n_clean >= d.top_k) { break; }
   }
   // ── phase 3 (thread 0, serial): overrides → stable re-sort → the CPU sampler tail verbatim ──
   if (t == 0u) {
     // apply penalty overrides to the candidate set
     var a: u32 = 0u;
-    loop { if (a >= want) { break; }
+    let have = n_cand;   // candidates actually collected; == want only in the worst case
+    loop { if (a >= have) { break; }
       var q = 0u;
       loop { if (q >= n_over) { break; }
         if (ov_i[q] == cand_i[a]) { cand_v[a] = ov_v[q]; break; } q = q + 1u; }
       a = a + 1u; }
     // insertion sort by (value desc, index asc) — the CPU's stable descending order
     a = 1u;
-    loop { if (a >= want) { break; }
+    loop { if (a >= have) { break; }
       let vv = cand_v[a]; let ii = cand_i[a];
       var b = a;
       loop { if (b == 0u) { break; }
@@ -108,7 +124,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         cand_v[b] = pv; cand_i[b] = pi; b = b - 1u; }
       cand_v[b] = vv; cand_i[b] = ii;
       a = a + 1u; }
-    let k = min(d.top_k, want);
+    let k = min(d.top_k, have);
     // temperature softmax over the k picks (same op order as CPU: exp((v-mx)/T), sum, divide)
     let mx = cand_v[0];
     var sum = 0.0;

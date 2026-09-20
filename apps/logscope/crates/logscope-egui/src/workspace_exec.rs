@@ -236,9 +236,21 @@ pub struct Workspace {
     /// CHANGE, and a bee that cannot even look outside its lane cannot tell whether editing inside
     /// it is safe.
     owns: Vec<String>,
+    /// This run's TOOL WHITELIST (wire names). Empty = every tool, matching every caller that
+    /// predates it. Set from a staffed worker's spec (`logscope_fan::deploy::Confinement`): the
+    /// design's first claim is that a small model gets competent by having fewer CHOICES, and
+    /// until this field existed the spec's `tools` list was validated and then dropped — a
+    /// staffed bee ran with all thirteen. Enforced in `apply`, the one place every call passes.
+    tools: Vec<String>,
 }
 
 impl Workspace {
+    /// Confine this run to these tools. See the field doc; empty leaves every tool available.
+    pub fn with_tools(mut self, tools: Vec<String>) -> Self {
+        self.tools = tools;
+        self
+    }
+
     /// Tell the workspace which model is reading it — evidence budgets key on
     /// this (read_harness::ModelClass). Chainable at construction.
     pub fn with_model_label(mut self, label: impl Into<String>) -> Self {
@@ -276,6 +288,7 @@ impl Workspace {
             scratch_last: None,
             last_green: None,
             owns: Vec::new(),
+            tools: Vec::new(),
         }
     }
 
@@ -344,6 +357,15 @@ impl Workspace {
     /// Execute a tool, recording any file change. Never panics; every failure becomes an `err` result the
     /// model can read and recover from.
     pub fn apply(&mut self, tool: &Tool) -> ToolResult {
+        // THE WHITELIST, at the one place every call passes — so no tool, present or future, has
+        // its own chance to forget it (the archfeat lesson: a check on twelve of thirteen arms is
+        // the silent failure). The refusal names what the worker DOES have: a model told only
+        // "no" retries the same call; told its menu, it picks from it.
+        if !self.tools.is_empty() && !self.tools.iter().any(|t| t == tool.wire_name()) {
+            return ToolResult::err(format!(
+                "{}: not one of this worker's tools. You have: {}. If the task cannot be done with \
+those, say so and stop — it belongs to a different worker.", tool.wire_name(), self.tools.join(", ")));
+        }
         match tool {
             Tool::WriteFile { path, contents } => self.write_file(path, contents),
             Tool::ReadFile { path } => self.read_file(path),
@@ -1616,6 +1638,20 @@ pub struct AgentConfig {
     /// model is repeating text that looks like one", which is the failure that turns a hostile
     /// README into an executed command.
     pub gate: crate::taint::ToolGate,
+    /// The staffed worker's tool whitelist (wire names); empty = every tool. Applied to the
+    /// `Workspace` (enforcement) AND to `system_prompt` (the model is only taught what it has).
+    /// Set together with `owns` from one `deploy::Confinement` — see `Chat::stage_lane`.
+    pub tools: Vec<String>,
+    /// Run the hero stable's REFLEXES (`logscope_fan::hero`): fixed, model-free procedures that
+    /// fire on a turn's observation — read the code at a compiler error, find a failed test — so
+    /// the model's next turn starts with the evidence instead of asking for it. Off by default
+    /// here so every existing caller and fixture is byte-identical; the app turns it on (see
+    /// `Chat`), and `LOGSCOPE_REFLEXES=0` turns it back off.
+    pub reflexes: bool,
+    /// Heroes enlisted this session (`:enlist` on a hero definition), added to the seed stable at
+    /// run start. Each is re-validated there: a hero that stopped validating is skipped and named
+    /// on stderr, never run.
+    pub extra_heroes: Vec<logscope_fan::hero::Hero>,
     /// Where irreversible actions are recorded. None = no audit (tests, previews).
     pub audit_log: Option<std::path::PathBuf>,
     /// Verify-as-you-go (1): after a turn that WROTE a file whose extension is in `verify_exts`, run this
@@ -1740,6 +1776,9 @@ impl Default for AgentConfig {
             extra_allow: Vec::new(),
             profiles: Vec::new(),
             owns: Vec::new(),
+            tools: Vec::new(),
+            reflexes: false,
+            extra_heroes: Vec::new(),
         }
     }
 }
@@ -1960,6 +1999,11 @@ pub enum Rejected {
 pub fn parse_tools_reported(text: &str) -> (Vec<Tool>, Vec<Rejected>) {
     let (mut out, mut bad) = (Vec::new(), Vec::new());
     for raw in extract_blocks(text) {
+        if raw.cut_off {
+            bad.push(Rejected::MissingField { tool: raw.name.clone().unwrap_or_default(),
+                field: "closing </parameter> — the reply was cut off mid-value, so nothing was run; send the call again, in smaller pieces if it is a large write" });
+            continue;
+        }
         let block = canonical_block(&raw);
         match parse_one(&block) {
             Some(t) => out.push(t),
@@ -1972,7 +2016,14 @@ pub fn parse_tools_reported(text: &str) -> (Vec<Tool>, Vec<Rejected>) {
 /// A tool call as a model actually wrote it, before the per-tool field logic sees it: the name
 /// may come from a tag (`<function=NAME>`) rather than from the JSON, and the arguments may be
 /// nested under `arguments` / `parameters` (the shapes models are TRAINED on) rather than flat.
-struct RawCall { name: Option<String>, body: String }
+struct RawCall {
+    name: Option<String>,
+    body: String,
+    /// The XML-parameter grammar only: a `<parameter=…>` value never reached its closing tag,
+    /// i.e. the reply was cut off mid-value. Such a call must not RUN — `write_file` defaults a
+    /// missing `contents` to empty, so executing the prefix would truncate the file on disk.
+    cut_off: bool,
+}
 
 /// Rewrite a raw call into the flat `{"tool": NAME, ...args}` shape `parse_one` and `diagnose`
 /// were written against, so every family's native format reaches the same field logic.
@@ -2159,7 +2210,7 @@ fn extract_blocks(text: &str) -> Vec<RawCall> {
     let mut seen_json = |blocks: &mut Vec<RawCall>, body: &str| {
         // Fences of several kinds can wrap the same object; count it once.
         let b = body.trim();
-        if !blocks.iter().any(|r| r.name.is_none() && r.body == b) { blocks.push(RawCall { name: None, body: b.to_string() }); }
+        if !blocks.iter().any(|r| r.name.is_none() && r.body == b) { blocks.push(RawCall { name: None, body: b.to_string(), cut_off: false }); }
     };
     // fenced ```tool … ``` — and ```json … ``` when the object names a tool, which is what a model
     // told "reply with JSON" writes.
@@ -2185,7 +2236,12 @@ fn extract_blocks(text: &str) -> Vec<RawCall> {
     while let Some(start) = rest.find("<tool_call>") {
         let after = &rest[start + "<tool_call>".len()..];
         if let Some(end) = after.find("</tool_call>") {
-            seen_json(&mut blocks, &after[..end]);
+            // `<tool_call>` wraps TWO grammars. JSON (Qwen2.5 / Hermes) is handled here. A body that
+            // opens with `<function=` (Qwen3-Coder / Qwen3.5 / Ornith XML parameters, or Llama's
+            // JSON-bodied tag) is the `<function=` scan's — taking it here too reported every such
+            // call a second time, as a NoToolKey reject, feeding the refusal ladder on a turn that
+            // had called a tool correctly.
+            if !after[..end].trim_start().starts_with("<function=") { seen_json(&mut blocks, &after[..end]); }
             rest = &after[end + "</tool_call>".len()..];
         } else { break; }
     }
@@ -2196,8 +2252,17 @@ fn extract_blocks(text: &str) -> Vec<RawCall> {
         let Some(gt) = after.find('>') else { break };
         let name = after[..gt].trim().to_string();
         let body_from = &after[gt + 1..];
+        if body_from.trim_start().starts_with("<parameter=") || body_from.trim_start().starts_with("</function>") {
+            // XML-PARAMETER grammar (Qwen3-Coder / Qwen3.5 / Ornith-1.5 — their chat template's
+            // own instruction). Values are RAW text, so a value may itself contain `</function>`;
+            // the call closes at the first `</function>` that FOLLOWS a closed parameter list.
+            let (json, used, cut_off) = xml_parameters(body_from);
+            blocks.push(RawCall { name: Some(name), body: json, cut_off });
+            rest = &body_from[used..];
+            continue;
+        }
         let end = body_from.find("</function>").unwrap_or(body_from.len());
-        blocks.push(RawCall { name: Some(name), body: body_from[..end].trim().to_string() });
+        blocks.push(RawCall { name: Some(name), body: body_from[..end].trim().to_string(), cut_off: false });
         rest = &body_from[end..];
     }
     // [TOOL_CALLS][{…}, {…}]   (Mistral) and <|python_tag|>{…}   (Llama 3.1): a JSON array or object
@@ -2223,6 +2288,92 @@ fn extract_blocks(text: &str) -> Vec<RawCall> {
         }
     }
     blocks
+}
+
+/// Read a run of `<parameter=KEY>VALUE</parameter>` blocks into the flat JSON object the per-tool
+/// field logic was written against. Returns (json, bytes consumed, cut_off).
+///
+/// The grammar, from the template that trains it (Ornith-1.5 chat_template.jinja; Qwen3-Coder's is
+/// the same): `<parameter=K>\nV\n</parameter>`, V raw for strings and `tojson` for everything else.
+/// So there is NO escaping in V, and nothing stops V containing `</parameter>` — a model writing
+/// documentation about tool calls does exactly that. The close that counts is the STRUCTURAL one:
+/// a `</parameter>` followed (past whitespace) by the next `<parameter=`, by `</function>`, or by
+/// the end of the text. A mention mid-sentence is followed by more sentence, and is content.
+///
+/// What this cannot recover: a value that embeds a complete `</parameter>\n</function>` sequence.
+/// That closes the call early by construction — the grammar has no escape — and is left as the
+/// documented limit rather than guessed at with a greedy match, which over-reaches into the next
+/// call (the `parse_plan` rfind lesson, CLAUDE.md §5c).
+fn xml_parameters(src: &str) -> (String, usize, bool) {
+    const OPEN: &str = "<parameter=";
+    const CLOSE: &str = "</parameter>";
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut at = 0usize;
+    let mut cut_off = false;
+    loop {
+        let here = &src[at..];
+        let lead = here.len() - here.trim_start().len();
+        if !here[lead..].starts_with(OPEN) { break; }
+        let after_open = at + lead + OPEN.len();
+        let Some(gt) = src[after_open..].find('>') else { cut_off = true; at = src.len(); break };
+        let key = src[after_open..after_open + gt].trim().to_string();
+        let val_from = after_open + gt + 1;
+        // the structural close
+        let mut search = val_from;
+        let mut close = None;
+        while let Some(k) = src[search..].find(CLOSE) {
+            let end = search + k;
+            let tail = src[end + CLOSE.len()..].trim_start();
+            if tail.is_empty() || tail.starts_with(OPEN) || tail.starts_with("</function>") { close = Some(end); break; }
+            search = end + CLOSE.len();
+        }
+        let Some(end) = close else { cut_off = true; at = src.len(); break };
+        // strip exactly the one newline the grammar adds on each side; the rest is the value
+        let mut v = &src[val_from..end];
+        v = v.strip_prefix("\r\n").or_else(|| v.strip_prefix('\n')).unwrap_or(v);
+        v = v.strip_suffix("\r\n").or_else(|| v.strip_suffix('\n')).unwrap_or(v);
+        if !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || c == '_') { fields.push((key, v.to_string())); }
+        at = end + CLOSE.len();
+    }
+    // consume the call's own close when it is next, so the caller's scan resumes past it
+    let here = &src[at..];
+    let lead = here.len() - here.trim_start().len();
+    // A model that closed every parameter and forgot `</function>` still made a complete call:
+    // every VALUE is whole, which is the property `cut_off` protects.
+    if here[lead..].starts_with("</function>") { at += lead + "</function>".len(); }
+    let mut json = String::from("{");
+    for (i, (k, v)) in fields.iter().enumerate() {
+        if i > 0 { json.push_str(", "); }
+        // The one array-typed field any tool takes. The template emits sequences as JSON, so an
+        // argv that IS a JSON array passes through; one written as a command line becomes `cmd`,
+        // the spelling parse_one already splits on whitespace.
+        if k == "argv" {
+            if v.trim_start().starts_with('[') { json.push_str(&format!("\"argv\": {}", v.trim())); continue; }
+            json.push_str(&format!("\"cmd\": {}", json_quote(v))); continue;
+        }
+        json.push_str(&format!("\"{k}\": {}", json_quote(v)));
+    }
+    json.push('}');
+    (json, at, cut_off)
+}
+
+/// `s` as a JSON string literal, escaping exactly what `json_str` unescapes — the two are a pair,
+/// and `xml_values_round_trip_through_the_json_reader` holds them together.
+fn json_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Every top-level `{…}` object in `payload`: the elements of a `[…]` array, or one bare object.
@@ -2601,6 +2752,51 @@ pub fn collect_shared_docs(root: &std::path::Path, budget: usize) -> String {
 }
 
 pub fn system_prompt(task: &str, cfg: &AgentConfig) -> String {
+    confine_prompt(system_prompt_all_tools(task, cfg), &cfg.tools)
+}
+
+/// Paragraphs of the prompt that exist to teach ONE tool, by their opening words. When a worker's
+/// whitelist lacks the tool the paragraph goes with it. A table rather than a guess, and
+/// `the_tool_paragraph_table_matches_the_prompt` fails when the prompt is reworded underneath it.
+const TOOL_PARAGRAPHS: &[(&str, &str)] = &[
+    ("SIDE IDEAS GO IN scratch_code", "scratch_code"),
+    ("CHECK A SECTION BEFORE YOU LAND IT", "propose"),
+    ("HISTORY IS EVIDENCE A FILE READ CANNOT GIVE YOU", "git_log"),
+];
+
+/// Cut the prompt down to a staffed worker's tools. Empty whitelist = unchanged, byte for byte.
+///
+/// docs/12: "a Small-class bee … never sees the JSON fence syntax at all. One shape to hold is
+/// the entire point." The same argument applies to the MENU: thirteen entries and three essays
+/// about tools the bee cannot call are attention spent on refusals. So the menu lines for absent
+/// tools go, the paragraphs that teach only an absent tool go, and the bee is told its list once,
+/// in words, with what to do when the list is not enough — stop, rather than improvise.
+pub fn confine_prompt(prompt: String, tools: &[String]) -> String {
+    if tools.is_empty() { return prompt; }
+    let has = |t: &str| tools.iter().any(|x| x == t);
+    let mut out = String::with_capacity(prompt.len());
+    for para in prompt.split("\n\n") {
+        if TOOL_PARAGRAPHS.iter().any(|(lead, tool)| para.starts_with(lead) && !has(tool)) { continue; }
+        let mut kept = String::new();
+        for line in para.split('\n') {
+            // a menu line is `- name  { "tool":"name", … }`; anything else passes through
+            let menu_tool = line.strip_prefix("- ").and_then(|r| {
+                let name = r.split_whitespace().next()?;
+                (r.contains(&format!("\"tool\":\"{name}\"")) && RUNTIME_TOOLS.contains(&name)).then_some(name)
+            });
+            if menu_tool.is_some_and(|t| !has(t)) { continue; }
+            if !kept.is_empty() { kept.push('\n'); }
+            kept.push_str(line);
+        }
+        if !out.is_empty() { out.push_str("\n\n"); }
+        out.push_str(&kept);
+    }
+    out.push_str(&format!("\n\nYOUR TOOLS: {}. These are ALL of your tools — a call to anything else is refused. \
+If the task cannot be done with them, say which tool is missing and stop; do not work around it.", tools.join(", ")));
+    out
+}
+
+fn system_prompt_all_tools(task: &str, cfg: &AgentConfig) -> String {
     // THE RUN TOKEN, INTO THE PROMPT.
     //
     // The gate has always required `nonce="..."` on the opener and the prompt
@@ -2785,6 +2981,66 @@ Emit one or a few tool calls per turn, then wait for results.{patch_note}{verify
 }
 
 /// Format a batch of tool results as the observation appended to the prompt for the next turn.
+/// A hero's hands. `logscope_fan::hero` machines act only through `ToolPort`; this is that port
+/// over the run's own `Workspace`.
+///
+/// The call is rendered as the same flat JSON block a model would emit and sent through the same
+/// `parse_one` → `Workspace::apply`. Deliberately not a second dispatch table: `apply` is where
+/// the tool WHITELIST and the LANE are enforced, so a hero firing inside a confined worker's run
+/// is confined exactly as that worker is, by the same code, with no new place to forget a check.
+impl logscope_fan::hero::ToolPort for Workspace {
+    fn call(&mut self, tool: &str, args: &[(String, String)]) -> logscope_fan::hero::Obs {
+        let mut block = format!("{{\"tool\": {}", json_quote(tool));
+        for (k, v) in args {
+            // argv is the one array-typed field; a hero writes it as a command line
+            let key = if k == "argv" { "cmd" } else { k.as_str() };
+            block.push_str(&format!(", {}: {}", json_quote(key), json_quote(v)));
+        }
+        block.push('}');
+        match parse_one(&block) {
+            Some(t) => { let r = self.apply(&t); logscope_fan::hero::Obs { ok: r.ok, text: r.output } }
+            None => logscope_fan::hero::Obs { ok: false, text: format!("`{tool}` with these arguments is not a call this runtime can make: {block}") },
+        }
+    }
+}
+
+/// The run's hero stable: the seed reflexes plus whatever was enlisted this session. `None` when
+/// reflexes are off, so an off run does not even build one.
+fn run_stable(cfg: &AgentConfig) -> Option<logscope_fan::hero::Stable> {
+    if !cfg.reflexes { return None; }
+    let mut st = logscope_fan::hero::seed_stable(RUNTIME_TOOLS);
+    for h in &cfg.extra_heroes {
+        if let Err(e) = st.add(h.clone(), RUNTIME_TOOLS) { eprintln!("agent: hero `{}` not loaded — {e}", h.spec.name); }
+    }
+    Some(st)
+}
+
+/// Show this turn's observation to the hero stable and, if a reflex fires, append what it found.
+///
+/// WHAT THIS SAVES. After a failed check the model's next turn is, overwhelmingly, "read the file
+/// at the line the error named" — a full generation to produce one mechanical tool call, then
+/// another to act on the result. The reflex makes that call now, with no model in the loop, so the
+/// model's next turn starts WITH the code. One turn saved per firing; a shut gate costs a scan.
+///
+/// `turn_obs` is only what THIS turn produced (tool results + the verification block), never the
+/// whole transcript: a gate matching an error from six turns ago would fire forever.
+fn fire_reflexes(stable: &mut logscope_fan::hero::Stable, on: logscope_fan::hero::Trigger, task: &str,
+                 turn_obs: &str, turn_ok: bool, ws: &mut Workspace, cfg: &AgentConfig, prompt: &mut String) -> Option<String> {
+    let limits = logscope_fan::hero::Limits {
+        // A reflex's report competes with the task for a small model's window. An eighth of the
+        // prompt budget, within sane bounds; 0 means "derive from the model class" upstream.
+        max_report_bytes: if cfg.max_prompt_bytes == 0 { 3000 } else { (cfg.max_prompt_bytes / 8).clamp(800, 4000) },
+        max_calls: 4,
+        ..Default::default()
+    };
+    let fired = stable.fire(on, task, turn_obs, turn_ok, &cfg.tools, ws, limits)?;
+    let t = &fired.trace;
+    if !t.report.is_empty() {
+        prompt.push_str(&format!("\n\nREFLEX ({} — a fixed procedure ran these reads for you, no model involved):\n{}\n", fired.hero, t.report));
+    }
+    Some(format!("reflex {}: {} call(s), {:?}", fired.hero, t.calls, t.end))
+}
+
 fn observation(results: &[(Tool, ToolResult)]) -> String {
     let mut s = String::from("\n\nTOOL RESULTS:\n");
     for (t, r) in results {
@@ -2806,6 +3062,7 @@ fn step_turn(
     plan: &mut Plan, verified: &mut bool, step: usize, guard: &mut crate::repetition::LoopGuard,
     ladder: &mut crate::line_calls::RefusalLadder,
     mut guide: Option<&mut crate::phase_guide::Guide>,
+    reflexes: Option<&mut logscope_fan::hero::Stable>,
 ) -> (Vec<(Tool, ToolResult)>, Option<Stop>) {
     // AUTHORISE BEFORE PARSING. Everything below reads `text` for tool calls, so the gate must run
     // first or a quoted call is already through. With ToolGate::Open this is a pass-through, which
@@ -3032,6 +3289,9 @@ cannot be covered by a test, say so explicitly and why.)\n"));
         let res = ws.apply(&tool);
         results.push((tool, res));
     }
+    // Where this turn's observation BEGINS in the prompt — the reflexes below see only what this
+    // turn produced (tool results + verification), never an error from six turns ago.
+    let turn_obs_from = prompt.len();
     prompt.push_str(&observation(&results));
 
     // Verify-as-you-go (1): don't verify on the final step (the model can't act on it).
@@ -3097,6 +3357,18 @@ call — this run cannot be marked complete until they are green.)\n"));
         if all_ok && cfg.checkpoint_on_green {
             if let Some(h) = ws.git_checkpoint(&format!("agent checkpoint: `{}` green", cfg.verify_cmd.join(" "))) {
                 prompt.push_str(&format!("(checkpoint {h} committed — this green state is a restore point)\n"));
+            }
+        }
+    }
+
+    // REFLEXES. After the tools and the verifier have spoken and before the model does again.
+    // Not on the final step: nobody would read what the reflex found.
+    if let Some(stable) = reflexes {
+        if step + 1 < cfg.max_steps {
+            let turn_obs = prompt[turn_obs_from..].to_string();
+            let turn_ok = results.iter().all(|(_, r)| r.ok) && (check_obs.is_none() || *verified);
+            if let Some(line) = fire_reflexes(stable, logscope_fan::hero::Trigger::AfterObservation, "", &turn_obs, turn_ok, ws, cfg, prompt) {
+                eprintln!("agent: {line}");
             }
         }
     }
@@ -3292,6 +3564,11 @@ pub fn run_agent_cfg(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, cfg: &Ag
         // the model sees it before its first reply, not after.
         prompt.push_str(&g.prompt());
     }
+    // One stable per RUN: its "already reported this site" memory must outlive a turn.
+    let mut heroes = run_stable(cfg);
+    if let Some(st) = heroes.as_mut() {
+        if let Some(line) = fire_reflexes(st, logscope_fan::hero::Trigger::TaskStart, task, task, true, ws, cfg, &mut prompt) { eprintln!("agent: {line}"); }
+    }
     let mut turns = Vec::new();
     let mut plan = Plan::default();
     // TWO MEANINGS ON ONE BOOLEAN. This starts true when no verify command is configured, which is
@@ -3317,7 +3594,7 @@ pub fn run_agent_cfg(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, cfg: &Ag
             Ok(t) => t,
             Err(e) => return Session { turns, stop: Stop::ModelError(e), files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier },
         };
-        let (results, stop) = step_turn(&text, &mut prompt, ws, cfg, &mut plan, &mut verified, step, &mut guard, &mut ladder, guide.as_mut());
+        let (results, stop) = step_turn(&text, &mut prompt, ws, cfg, &mut plan, &mut verified, step, &mut guard, &mut ladder, guide.as_mut(), heroes.as_mut());
         turns.push(Turn { model_text: text, results });
         if let Some(stop) = stop {
             return Session { turns, stop, files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier };
@@ -3361,6 +3638,9 @@ pub struct AgentRun {
     ladder: crate::line_calls::RefusalLadder,
     /// StatefulGuide's phase machine, when `cfg.stateful_guide` — the run's evidence-decided position.
     guide: Option<crate::phase_guide::Guide>,
+    /// The hero stable, when `cfg.reflexes`. Per run, because it remembers which sites it has
+    /// already reported (a persisting error must not re-read the same window every turn).
+    heroes: Option<logscope_fan::hero::Stable>,
     /// Turns elided by transcript compaction so far. Surfaced so "the model forgot" has an answer
     /// other than a guess.
     compacted: usize,
@@ -3389,10 +3669,18 @@ impl AgentRun {
             .with_model_label(cfg.model_label.clone())
             .with_model_params(cfg.model_params)
             .with_owns(cfg.owns.clone())
+            .with_tools(cfg.tools.clone())
             // The configured verify command is allowed to run: it comes from the operator, and
             // gating it on the model's allowlist made any non-cargo suite structurally unverifiable.
             .allow_also(cfg.verify_cmd.first().cloned())
             .allow_also(cfg.extra_allow.clone());
+        let mut ws = ws;
+        let mut prompt = prompt;
+        let mut heroes = run_stable(&cfg);
+        if let Some(st) = heroes.as_mut() {
+            // Before `prompt` is cloned into the run AND returned to the caller, so both carry it.
+            if let Some(line) = fire_reflexes(st, logscope_fan::hero::Trigger::TaskStart, task, task, true, &mut ws, &cfg, &mut prompt) { eprintln!("agent: {line}"); }
+        }
         let run = Self {
             ws, prompt: prompt.clone(), reply: String::new(),
             plan: Plan::default(), verified, step: 0, turns: 0, cfg,
@@ -3401,12 +3689,24 @@ impl AgentRun {
             // Mirrors the Session field: a run with no verifier must not read as one that passed.
             had_verifier,
             guide,
+            heroes,
             compacted: 0,
             task: task.to_string(),
             started: std::time::Instant::now(),
             lane_refusals: 0,
         };
         (run, prompt)
+    }
+
+    /// The growing prompt, for tests in OTHER modules that drive a real run (the field is private
+    /// and this module's own tests read it directly).
+    #[cfg(test)]
+    pub(crate) fn prompt_for_test(&self) -> &str { &self.prompt }
+
+    /// Every reflex this run fired: (hero, how it ended, tool calls made). Empty when reflexes are
+    /// off or nothing matched. For the HUD and for anyone asking "why was that turn not needed".
+    pub fn reflex_history(&self) -> &[(String, logscope_fan::hero::End, u32)] {
+        self.heroes.as_ref().map(|s| s.history()).unwrap_or(&[])
     }
 
     /// Append a streamed token to the current turn's reply.
@@ -3421,7 +3721,7 @@ impl AgentRun {
     /// The worker finished a turn: process the accumulated reply and decide the next action.
     pub fn on_done(&mut self) -> AgentStep {
         let text = std::mem::take(&mut self.reply);
-        let (results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step, &mut self.guard, &mut self.ladder, self.guide.as_mut());
+        let (results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step, &mut self.guard, &mut self.ladder, self.guide.as_mut(), self.heroes.as_mut());
         self.turns += 1;
         self.step += 1;
         if let Some(stop) = stop { return AgentStep::Finished(stop); }
@@ -4427,6 +4727,179 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let data = "Here is the manifest:\n```json\n{\"name\": \"my-crate\", \"version\": \"0.1.0\"}\n```";
         let (tools, bad) = parse_tools_reported(data);
         assert!(tools.is_empty() && bad.is_empty(), "{tools:?} {bad:?}");
+    }
+
+    /// Qwen3-Coder / Qwen3.5 / Ornith-1.5: the XML-PARAMETER grammar. Transcribed from
+    /// Ornith-1.5's shipped chat_template.jinja, which tells the model to reply in exactly this
+    /// shape and renders its own history in it: the function name in a tag, one `<parameter=K>`
+    /// block per argument, string values RAW (no quoting, no escaping, newlines and all) between
+    /// a leading and a trailing newline, non-strings as JSON.
+    ///
+    /// Before this, one well-formed call produced ZERO tools and TWO rejections: the
+    /// `<tool_call>` scan handed the XML to the JSON path (NoToolKey) and the `<function=` scan
+    /// wrapped the parameter tags in braces (MissingField) — and the refusal ladder then told the
+    /// model its call was invalid, the C13 §57 loop for the one family this engine targets.
+    #[test]
+    fn the_xml_parameter_grammar_is_a_call() {
+        let one = "I'll read it.\n\n<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n</function>\n</tool_call>";
+        let (tools, bad) = parse_tools_reported(one);
+        assert_eq!(tools, vec![Tool::ReadFile { path: "src/main.rs".into() }]);
+        assert!(bad.is_empty(), "one call is one call — not a call plus a rejected shadow of itself: {bad:?}");
+    }
+
+    /// Raw multi-line values survive exactly: quotes, backslashes, braces, blank lines, and
+    /// leading indentation are file CONTENT here, and the only thing stripped is the one newline
+    /// the grammar itself puts on each side of a value.
+    #[test]
+    fn xml_parameter_values_are_raw_text_not_json() {
+        let body = "fn main() {\n    println!(\"a\\\\b {}\", 1);\n\n}\n";
+        let call = format!("<tool_call>\n<function=write_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n<parameter=contents>\n{body}\n</parameter>\n</function>\n</tool_call>");
+        assert_eq!(parse_tools(&call), vec![Tool::WriteFile { path: "src/main.rs".into(), contents: body.into() }]);
+        // inline form, no newlines around the value — models write this too
+        let inline = "<tool_call><function=read_file><parameter=path>a.rs</parameter></function></tool_call>";
+        assert_eq!(parse_tools(inline), vec![Tool::ReadFile { path: "a.rs".into() }]);
+    }
+
+    /// Non-string arguments arrive as JSON text (the template's `tojson` branch): an argv array
+    /// stays an array, a number stays readable as a number. And two calls in one turn are two.
+    #[test]
+    fn xml_parameter_non_strings_and_multiple_calls() {
+        let turn = "<tool_call>\n<function=run>\n<parameter=argv>\n[\"cargo\", \"check\", \"--lib\"]\n</parameter>\n</function>\n</tool_call>\n\
+<tool_call>\n<function=read_range>\n<parameter=path>\nsrc/lib.rs\n</parameter>\n<parameter=start>\n10\n</parameter>\n<parameter=end>\n24\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(parse_tools(turn), vec![
+            Tool::Run { argv: vec!["cargo".into(), "check".into(), "--lib".into()] },
+            Tool::ReadRange { path: "src/lib.rs".into(), start: 10, end: 24 },
+        ]);
+        // an argv written as a plain command line is still a run, via the `cmd` spelling
+        let plain = "<tool_call>\n<function=run>\n<parameter=argv>\ncargo test -q\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(parse_tools(plain), vec![Tool::Run { argv: vec!["cargo".into(), "test".into(), "-q".into()] }]);
+    }
+
+    /// The complement (CLAUDE.md §5c): what the new recognizer must NOT take. A file whose content
+    /// mentions the closing tag mid-line keeps its tail; an unknown function is NAMED; a required
+    /// parameter that is absent is reported as that field; and the JSON-bodied forms that shared
+    /// these tags before still parse, once.
+    #[test]
+    fn xml_parameter_complements() {
+        let tricky = "<tool_call>\n<function=write_file>\n<parameter=path>\nnotes.md\n</parameter>\n<parameter=contents>\nclose a value with </parameter> and a call with </function> — then more text\nlast line\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(parse_tools(tricky), vec![Tool::WriteFile { path: "notes.md".into(),
+            contents: "close a value with </parameter> and a call with </function> — then more text\nlast line".into() }]);
+
+        let (_, bad) = parse_tools_reported("<tool_call>\n<function=send_email>\n<parameter=to>\nx\n</parameter>\n</function>\n</tool_call>");
+        assert_eq!(bad, vec![Rejected::UnknownTool("send_email".into())]);
+
+        let (tools, bad) = parse_tools_reported("<tool_call>\n<function=write_file>\n<parameter=contents>\nx\n</parameter>\n</function>\n</tool_call>");
+        assert!(tools.is_empty());
+        assert_eq!(bad, vec![Rejected::MissingField { tool: "write_file".into(), field: "path" }]);
+
+        // Llama's JSON-bodied <function=…> inside a <tool_call> wrapper: one call, no shadow reject.
+        let (tools, bad) = parse_tools_reported("<tool_call><function=read_file>{\"path\": \"Cargo.toml\"}</function></tool_call>");
+        assert_eq!(tools, vec![Tool::ReadFile { path: "Cargo.toml".into() }]);
+        assert!(bad.is_empty(), "{bad:?}");
+        // Hermes/Qwen2.5 JSON inside <tool_call> is untouched by any of this.
+        assert_eq!(parse_tools("<tool_call>{\"name\": \"list_dir\", \"arguments\": {\"path\": \"src\"}}</tool_call>"),
+                   vec![Tool::ListDir { path: "src".into() }]);
+        // A truncated turn (token budget hit mid-value): nothing is executed from half a file.
+        let cut = "<tool_call>\n<function=write_file>\n<parameter=path>\na.rs\n</parameter>\n<parameter=contents>\nfn main() {";
+        let (tools, _) = parse_tools_reported(cut);
+        assert!(tools.is_empty(), "a write whose value never closed must not run: {tools:?}");
+    }
+
+    /// json_quote and json_str are inverses on everything a file can contain. If they drift, a
+    /// written file differs from what the model sent by exactly the characters hardest to notice.
+    #[test]
+    fn xml_values_round_trip_through_the_json_reader() {
+        for v in ["plain", "", "a\"b", "back\\slash", "trailing\\", "tab\there", "cr\r\nlf", "{\"json\": [1, 2]}",
+                  "\\n is two chars, not a newline", "unicode — ✓ 日本", "\"path\": \"decoy\""] {
+            let block = format!("{{\"tool\": \"x\", \"v\": {}}}", json_quote(v));
+            assert_eq!(json_str(&block, "v").as_deref(), Some(v), "round trip of {v:?} via {block}");
+        }
+        // and a value that LOOKS like another field cannot shadow the real one
+        let call = "<tool_call>\n<function=write_file>\n<parameter=contents>\n\"path\": \"decoy.rs\"\n</parameter>\n<parameter=path>\nreal.rs\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(parse_tools(call), vec![Tool::WriteFile { path: "real.rs".into(), contents: "\"path\": \"decoy.rs\"".into() }]);
+    }
+
+    /// THE WHITELIST IS ENFORCED, at the funnel. A staffed reader asked to write is refused by
+    /// name, told what it has, and the file does not appear — and every tool it DOES have works.
+    #[test]
+    fn a_confined_worker_cannot_call_a_tool_outside_its_whitelist() {
+        let dir = std::env::temp_dir().join(format!("ls-whitelist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let mut ws = Workspace::new(&dir).with_tools(vec!["read_file".into(), "search".into()]);
+        let r = ws.apply(&Tool::WriteFile { path: "src/b.rs".into(), contents: "x".into() });
+        assert!(!r.ok && r.output.contains("write_file: not one of this worker's tools") && r.output.contains("read_file, search"), "{}", r.output);
+        assert!(!dir.join("src/b.rs").exists(), "a refused write must not have happened");
+        for t in [Tool::Edit { path: "src/a.rs".into(), find: "fn a".into(), replace: "fn z".into() },
+                  Tool::Run { argv: vec!["ls".into()] },
+                  Tool::MakeTool { name: "t".into(), source: "fn main(){}".into() },
+                  Tool::Doc { name: "survey".into(), content: "x".into() }] {
+            let r = ws.apply(&t);
+            assert!(!r.ok && r.output.contains("not one of this worker's tools"), "{}: {}", t.wire_name(), r.output);
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("src/a.rs")).unwrap(), "fn a() {}\n", "the refused edit changed nothing");
+        assert!(ws.apply(&Tool::ReadFile { path: "src/a.rs".into() }).ok, "a whitelisted tool still works");
+        // the complement: no whitelist = every tool, exactly as before this field existed
+        let mut open = Workspace::new(&dir);
+        assert!(open.apply(&Tool::WriteFile { path: "src/b.rs".into(), contents: "x".into() }).ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every variant of `Tool` is subject to the whitelist — checked over RUNTIME_TOOLS so a new
+    /// tool cannot be added to the enum and quietly bypass it (it goes through `apply` or nowhere).
+    #[test]
+    fn the_whitelist_covers_every_runtime_tool() {
+        let dir = std::env::temp_dir().join(format!("ls-whitelist-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let samples = vec![
+            Tool::WriteFile { path: "a".into(), contents: String::new() }, Tool::Edit { path: "a".into(), find: "x".into(), replace: "y".into() },
+            Tool::ReadFile { path: "a".into() }, Tool::ReadRange { path: "a".into(), start: 1, end: 2 }, Tool::ReadNear { path: "a".into(), name: "x".into() },
+            Tool::ListDir { path: String::new() }, Tool::Search { pattern: "x".into(), path: String::new() }, Tool::Run { argv: vec!["ls".into()] },
+            Tool::GitLog { n: 1, path: String::new() }, Tool::Doc { name: "d".into(), content: "c".into() },
+            Tool::Propose { path: "a".into(), content: "c".into() }, Tool::Scratch { title: "t".into(), lang: "rust".into(), body: "b".into() },
+            Tool::MakeTool { name: "t".into(), source: "fn main(){}".into() },
+        ];
+        let names: std::collections::BTreeSet<&str> = samples.iter().map(|t| t.wire_name()).collect();
+        assert_eq!(names, RUNTIME_TOOLS.iter().copied().collect(), "one sample per runtime tool");
+        let mut ws = Workspace::new(&dir).with_tools(vec!["no-such-tool".into()]);
+        for t in &samples { assert!(ws.apply(t).output.contains("not one of this worker's tools"), "{} bypassed the whitelist", t.wire_name()); }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The prompt teaches a confined worker ONLY its tools: menu lines and the essays about absent
+    /// tools go, its list is stated, and an unconfined prompt is untouched byte for byte.
+    #[test]
+    fn a_confined_prompt_teaches_only_the_whitelist() {
+        let open = AgentConfig::default();
+        let full = system_prompt("t", &open);
+        assert_eq!(full, confine_prompt(full.clone(), &[]), "no whitelist = the prompt every existing run gets");
+        let cfg = AgentConfig { tools: vec!["read_file".into(), "search".into(), "git_log".into()], ..AgentConfig::default() };
+        let p = system_prompt("t", &cfg);
+        for gone in ["- write_file ", "- edit ", "- run ", "- make_tool ", "- propose ", "- doc ", "- scratch_code ", "- list_dir ",
+                     "SIDE IDEAS GO IN scratch_code", "CHECK A SECTION BEFORE YOU LAND IT"] {
+            assert!(full.contains(gone), "fixture: the full prompt has {gone:?}");
+            assert!(!p.contains(gone), "a reader is still taught {gone:?}");
+        }
+        for kept in ["- read_file ", "- search ", "- git_log ", "HISTORY IS EVIDENCE A FILE READ CANNOT GIVE YOU", "THE CODE IS RIGHT THERE"] {
+            assert!(p.contains(kept), "lost {kept:?}");
+        }
+        assert!(p.contains("YOUR TOOLS: read_file, search, git_log. These are ALL of your tools"));
+        assert!(p.len() < full.len());
+    }
+
+    /// The table of tool-specific paragraphs is matched by opening words. If the prompt is
+    /// reworded, an entry silently stops matching and a confined worker gets the essay back —
+    /// so each entry must match exactly one paragraph of the real prompt.
+    #[test]
+    fn the_tool_paragraph_table_matches_the_prompt() {
+        let full = system_prompt("t", &AgentConfig::default());
+        for (lead, tool) in TOOL_PARAGRAPHS {
+            let hits = full.split("\n\n").filter(|p| p.starts_with(lead)).count();
+            assert_eq!(hits, 1, "{lead:?} should open exactly one paragraph");
+            assert!(RUNTIME_TOOLS.contains(tool), "{tool} is not a runtime tool");
+        }
     }
 
     /// A native-shape call to a tool we do not implement is reported as that tool, not as prose.
@@ -5475,6 +5948,147 @@ mod long_horizon_tests {
         }
         // And nothing was actually written outside the lane — the refusal held every time.
         assert!(run.events().is_empty(), "no write should have landed: {:?}", run.events());
+    }
+
+    /// THE WIRE, end to end: `AgentConfig.tools` set on the config must be what the run's OWN
+    /// Workspace enforces — through the real agent loop, a scripted model, and the disk. Every
+    /// piece of the whitelist had a test (apply refuses, the prompt is cut, stage_lane sets the
+    /// field) and a break test showed nothing covered the one line that joins them: deleting
+    /// `.with_tools(cfg.tools.clone())` left all of those green while a staffed reader wrote files.
+    #[test]
+    fn a_run_enforces_the_whitelist_its_config_carries() {
+        let d = tmp("whitelist-wire");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6,
+            verify_cmd: Vec::new(), verify_exts: Vec::new(),
+            tools: vec!["read_file".into(), "search".into()], ..Default::default() };
+        let script = vec![write_call("src/sneaky.rs", 1), write_call("notes.md", 2)];
+        let (_stop, run) = drive(&d, "summarise the crate", cfg, &script);
+        assert!(run.events().is_empty(), "a reader's run wrote: {:?}", run.events());
+        assert!(!d.join("src/sneaky.rs").exists() && !d.join("notes.md").exists(), "a refused write reached the disk");
+        // the complement, same script, no whitelist: the writes land — so the refusal above is the
+        // whitelist's doing and not some other guard's
+        let d2 = tmp("whitelist-wire-open");
+        std::fs::write(d2.join("Cargo.toml"), "[package]\n").unwrap();
+        let open = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6,
+            verify_cmd: Vec::new(), verify_exts: Vec::new(), ..Default::default() };
+        let (_stop, run2) = drive(&d2, "summarise the crate", open, &script);
+        assert!(d2.join("src/sneaky.rs").exists(), "unconfined, the same script writes: {:?}", run2.events());
+    }
+
+    fn run_call(argv: &[&str]) -> String {
+        format!("```tool\n{{\"tool\":\"run\",\"argv\":[{}]}}\n```", argv.iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(","))
+    }
+    const BUILD_LOG: &str = "error[E0425]: cannot find value `total` in this scope\n --> src/ui.rs:6:9\n  |\n6 |         total + 1\n";
+    fn hero_ws(tag: &str) -> std::path::PathBuf {
+        let d = tmp(tag);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(d.join("src/ui.rs"), (1..=12).map(|i| format!("// ui line {i}\n")).collect::<String>()).unwrap();
+        std::fs::write(d.join("build.log"), BUILD_LOG).unwrap();
+        d
+    }
+
+    /// A REFLEX THROUGH THE REAL LOOP. The model's turn surfaces a compiler error; before the model
+    /// speaks again the error-locator hero has read the code at that line — through the run's own
+    /// Workspace, no model involved — and the next prompt carries it. The turn the model would
+    /// have spent asking for `src/ui.rs` near line 6 is not needed.
+    #[test]
+    fn a_reflex_reads_the_error_site_between_model_turns() {
+        let d = hero_ws("hero-reflex");
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6, verify_cmd: Vec::new(), verify_exts: Vec::new(),
+            reflexes: true, ..Default::default() };
+        let (mut run, _first) = AgentRun::start(&d, "fix the build", cfg);
+        run.on_token(&run_call(&["cat", "build.log"]));
+        let _ = run.on_done();
+        assert!(run.prompt.contains("REFLEX (error-locator"), "no reflex block in the next prompt:\n{}", &run.prompt[run.prompt.len().saturating_sub(900)..]);
+        assert!(run.prompt.contains("the code at src/ui.rs:6") && run.prompt.contains("// ui line 6") && run.prompt.contains("// ui line 12"),
+                "the window around line 6 should be in the prompt");
+        assert!(run.ws.events().is_empty(), "a reflex reads; it never writes");
+        // the complement: reflexes off = the same turn, no reflex text — every existing run is unchanged
+        let d2 = hero_ws("hero-reflex-off");
+        let off = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6, verify_cmd: Vec::new(), verify_exts: Vec::new(), ..Default::default() };
+        let (mut run2, _) = AgentRun::start(&d2, "fix the build", off);
+        run2.on_token(&run_call(&["cat", "build.log"]));
+        let _ = run2.on_done();
+        assert!(run2.prompt.contains("cannot find value `total`") && !run2.prompt.contains("REFLEX"), "off must mean off");
+    }
+
+    /// A hero firing inside a CONFINED worker's run is confined as that worker is. A bee whose
+    /// whitelist has no read_range does not get error-locator at all (the stable skips it), and
+    /// one that has it, does — the whitelist decides, not the hero.
+    #[test]
+    fn a_reflex_obeys_the_staffed_workers_whitelist() {
+        for (tools, expect) in [(vec!["run"], false), (vec!["run", "read_range"], true)] {
+            let d = hero_ws(&format!("hero-confined-{}", tools.len()));
+            let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6, verify_cmd: Vec::new(), verify_exts: Vec::new(),
+                reflexes: true, tools: tools.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+            let (mut run, _) = AgentRun::start(&d, "fix the build", cfg);
+            run.on_token(&run_call(&["cat", "build.log"]));
+            let _ = run.on_done();
+            assert_eq!(run.prompt.contains("REFLEX (error-locator"), expect, "whitelist {tools:?}");
+            // SKIPPED, not fired-and-refused. With the prompt alone these look the same — the
+            // Workspace refuses the hero's read_range either way — but a hero that fires and is
+            // refused has also taken the turn from any later hero that WAS eligible.
+            assert_eq!(run.reflex_history().len(), expect as usize, "whitelist {tools:?}: {:?}", run.reflex_history());
+        }
+    }
+
+    /// A reflex sees THIS TURN's observation, not the transcript. Two different errors on two
+    /// turns must both be located. If the gate read the whole prompt it would find turn one's
+    /// site first, again, recognise it as already reported — and never reach turn two's.
+    #[test]
+    fn a_reflex_reads_this_turn_not_the_transcript() {
+        let d = hero_ws("hero-turn-scope");
+        std::fs::write(d.join("build2.log"), "error[E0308]: mismatched types\n --> src/ui.rs:11:1\n").unwrap();
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), reflexes: true, ..Default::default() };
+        let (mut run, _) = AgentRun::start(&d, "fix the build", cfg);
+        run.on_token(&run_call(&["cat", "build.log"]));  let _ = run.on_done();
+        run.on_token(&run_call(&["ls"]));                let _ = run.on_done();   // a quiet turn: nothing fires
+        assert_eq!(run.reflex_history().len(), 1, "a turn with no error must not re-find turn one's: {:?}", run.reflex_history());
+        run.on_token(&run_call(&["cat", "build2.log"])); let _ = run.on_done();
+        assert_eq!(run.reflex_history().len(), 2, "{:?}", run.reflex_history());
+        assert!(run.prompt.contains("the code at src/ui.rs:11"), "turn three's site was never located");
+        // and the SAME error surfacing again is not re-read
+        run.on_token(&run_call(&["cat", "build2.log"])); let _ = run.on_done();
+        assert_eq!(run.reflex_history().len(), 2, "the model already has that window");
+    }
+
+    /// TASK-START: the task names a file, so it is in the FIRST prompt — the one returned to the
+    /// caller and the one the run keeps, which must be the same text. A task naming a file that
+    /// does not exist yet adds nothing (and does not complain).
+    #[test]
+    fn a_task_that_names_a_file_starts_with_it_already_read() {
+        let d = hero_ws("hero-prefetch");
+        let cfg = || AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6, verify_cmd: Vec::new(), verify_exts: Vec::new(), reflexes: true, ..Default::default() };
+        let (run, first) = AgentRun::start(&d, "tidy src/ui.rs please", cfg());
+        assert!(first.contains("REFLEX (path-prefetch") && first.contains("// ui line 3"), "the first prompt should carry the file");
+        assert_eq!(first, run.prompt, "what the caller sends and what the run remembers must not diverge");
+        let (_, fresh) = AgentRun::start(&d, "create src/brand_new.rs with a main", cfg());
+        assert!(!fresh.contains("REFLEX"), "a file that does not exist yet is not an error worth a paragraph");
+        let (_, prose) = AgentRun::start(&d, "make the renderer faster", cfg());
+        assert!(!prose.contains("REFLEX"));
+    }
+
+    /// The port is `parse_one` + `apply` and nothing else: a hero's call is refused by the same
+    /// lane and whitelist checks, with the same words, as a model's.
+    #[test]
+    fn the_hero_port_is_the_model_s_tool_path() {
+        use logscope_fan::hero::ToolPort;
+        let d = hero_ws("hero-port");
+        let mut ws = Workspace::new(&d).with_tools(vec!["read_range".into()]);
+        let arg = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let r = ws.call("read_range", &[arg("path", "src/ui.rs"), arg("start", "2"), arg("end", "3")]);
+        assert!(r.ok && r.text.contains("// ui line 2") && !r.text.contains("// ui line 5"), "{}", r.text);
+        let w = ws.call("write_file", &[arg("path", "src/x.rs"), arg("contents", "x")]);
+        assert!(!w.ok && w.text.contains("not one of this worker's tools"), "{}", w.text);
+        let bad = ws.call("teleport", &[]);
+        assert!(!bad.ok && bad.text.contains("not a call this runtime can make"), "{}", bad.text);
+        // a value with quotes and newlines survives the rendering (json_quote / json_str are inverses)
+        let mut open = Workspace::new(&d);
+        let body = "fn f() { println!(\"a\\nb\"); }\n";
+        assert!(open.call("write_file", &[arg("path", "src/q.rs"), arg("contents", body)]).ok);
+        assert_eq!(std::fs::read_to_string(d.join("src/q.rs")).unwrap(), body);
     }
 
     /// A write that succeeds INSIDE the lane, interleaved with out-of-lane attempts, must reset the

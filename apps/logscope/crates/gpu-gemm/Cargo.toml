@@ -52,6 +52,13 @@ zerocopy = ["dep:ash", "wgpu/vulkan"]
 # sparse residency: one giant buffer backed by physical blocks via vkQueueBindSparse (the arena's
 # architectural replacement). Gated like zerocopy — pure planner is always on; the binder needs this.
 sparse = ["dep:ash", "wgpu/vulkan"]
+# AArch64 only: compile cpumatvec's int8 dots a second time with `dotprod` enabled and pick that copy
+# at runtime when the CPU reports the feature (Apple M1+, Cortex-A76+; NOT the PinePhone's A53 or the
+# Pro's A72 — which is why this is runtime dispatch and not `target-cpu`). OPT-IN, and honestly so:
+# the sandbox this was written in has no AArch64 std, so this arm has NEVER BEEN COMPILED. Its x86-64
+# twin (AVX2, same macro, same shape) is compiled, tested and on by default. If this fails to build
+# on your machine, turn it back off and nothing else changes.
+arm-dotprod = []
 
 [dev-dependencies]
 serde_json = "1"  # independent oracle for jsonmask tests only

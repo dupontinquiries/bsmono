@@ -81,6 +81,11 @@ pub enum SpecError {
     TooBroad(&'static str),
     /// A tool the runtime does not have.
     UnknownTool(String),
+    /// A lane-governed write tool with no lane to write in. `owns` empty means READ-ONLY here,
+    /// and means UNRESTRICTED to the runtime's `Workspace` — the same value with opposite
+    /// meanings on the two sides of the seam. A spec carrying `write_file` and no lane would
+    /// deploy as a bee that may edit anything: the lane-less patcher `seed_roster` refuses to ship.
+    WriteWithoutLane(String),
 }
 
 impl SpecError {
@@ -105,6 +110,10 @@ impl SpecError {
             SpecError::UnknownTool(t) =>
                 format!("`{t}` is not a tool this runtime offers. Use only the listed tools; a \
                          worker cannot be given a capability that does not exist."),
+            SpecError::WriteWithoutLane(t) =>
+                format!("This worker has `{t}` but owns no paths, so there is nowhere it may \
+                         write. Either give it a lane under `owns` — the few paths it is \
+                         responsible for — or remove `{t}` and let it read and report."),
         }
     }
 }
@@ -112,6 +121,10 @@ impl SpecError {
 /// Upper bounds on one worker's scope. Not arbitrary: each is the point past
 /// which the focusing effect reverses and the worker is back to being a
 /// general agent with extra steps.
+/// The tools the runtime's lane check (`Workspace::check_owned`) governs — the ones that put bytes
+/// into the repository. `run` can write through a shell, but it goes through the command allowlist,
+/// not the lane; `doc` writes the shared crew document; `propose` and `scratch_code` write nothing.
+pub const LANE_GOVERNED_TOOLS: &[&str] = &["write_file", "edit"];
 pub const MAX_OWNED: usize = 6;
 pub const MAX_TOOLS: usize = 6;
 pub const MAX_CONTEXT: usize = 12;
@@ -152,11 +165,20 @@ impl WorkerSpec {
         if self.purpose.trim().is_empty() { return Err(SpecError::MissingField("purpose")); }
         if self.success.is_empty() { return Err(SpecError::MissingField("success criteria")); }
         if self.owns.len() > MAX_OWNED { return Err(SpecError::TooBroad("it owns too many paths")); }
+        // No tools is not "a worker that only thinks": every runtime convention in this codebase
+        // reads an empty restriction as NO restriction, so a tool-less spec would deploy with all
+        // thirteen — the exact Choice failure the whitelist exists to remove.
+        if self.tools.is_empty() { return Err(SpecError::MissingField("tools")); }
         if self.tools.len() > MAX_TOOLS { return Err(SpecError::TooBroad("it has too many tools")); }
         if self.context.len() > MAX_CONTEXT { return Err(SpecError::TooBroad("it names too much context")); }
         for t in &self.tools {
             if !known_tools.contains(&t.as_str()) {
                 return Err(SpecError::UnknownTool(t.clone()));
+            }
+        }
+        if self.owns.iter().all(|o| o.trim().trim_end_matches('/').is_empty()) {
+            if let Some(t) = self.tools.iter().find(|t| LANE_GOVERNED_TOOLS.contains(&t.as_str())) {
+                return Err(SpecError::WriteWithoutLane(t.clone()));
             }
         }
         for s in &self.success {

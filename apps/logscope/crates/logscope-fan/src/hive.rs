@@ -80,6 +80,11 @@ pub struct Job {
     pub prompt_tokens: usize,
     /// Model labels acceptable for this job; empty means any.
     pub models: Vec<String>,
+    /// Round trips this job is expected to make. A thinker makes one. A tool-using worker makes
+    /// one PER TURN — read, observe, edit, verify — and its tools run at the coordinator, so every
+    /// turn crosses the link twice. Scoring the link once made a 24-step agent loop look as cheap
+    /// to send across a 150 ms link as a single reply: 0.15 s counted, 3.6 s paid. 0 is read as 1.
+    pub turns: u32,
 }
 
 /// Why a cell was chosen, so a log line can explain a placement instead of
@@ -116,7 +121,9 @@ pub fn place(job: &Job, matrix: &[Cell]) -> Option<Placement> {
         // 3. warmth, then cost. Score in seconds-ish: prefill dominates.
         let cold = job.prompt_tokens.saturating_sub(c.warm_prefix);
         let prefill_s = cold as f64 / (c.node.tok_s.max(0.1) as f64 * 8.0); // prefill ~8x decode
-        let rtt_s = c.node.rtt_ms as f64 / 1000.0;
+        // Prefill is paid ONCE: after turn one this cell holds the prefix, and each later turn only
+        // extends it. The link is paid every turn.
+        let rtt_s = c.node.rtt_ms as f64 / 1000.0 * job.turns.max(1) as f64;
         let score = prefill_s + rtt_s;
         let saved = c.warm_prefix.min(job.prompt_tokens);
         let reason = if saved > 0 {
@@ -187,7 +194,7 @@ mod tests {
             cell(node("m2ultra", 30, 60.0), "Qwen3-14B", 0),
             cell(node("mini", 30, 20.0), "Qwen3-14B", 1600),
         ];
-        let job = Job { reach: Reach::Lan, partner_node: None, prompt_tokens: 1700, models: vec![] };
+        let job = Job { reach: Reach::Lan, partner_node: None, prompt_tokens: 1700, models: vec![], turns: 1 };
         let p = place(&job, &matrix).expect("a cell must serve this");
         assert_eq!(p.cell.node.id, "mini", "the warm slower node must win: {}", p.reason);
         assert_eq!(p.saved_prefill, 1600);
@@ -202,7 +209,7 @@ mod tests {
             cell(node("m2ultra", 30, 60.0), "Qwen3-14B", 0),
             cell(node("mini", 30, 20.0), "Qwen3-14B", 0),
         ];
-        let job = Job { reach: Reach::Lan, partner_node: None, prompt_tokens: 1700, models: vec![] };
+        let job = Job { reach: Reach::Lan, partner_node: None, prompt_tokens: 1700, models: vec![], turns: 1 };
         let p = place(&job, &matrix).unwrap();
         assert_eq!(p.cell.node.id, "m2ultra", "{}", p.reason);
         assert_eq!(p.saved_prefill, 0);
@@ -222,7 +229,7 @@ mod tests {
             reach: Reach::Colocated,
             partner_node: Some("host".into()),
             prompt_tokens: 1700,
-            models: vec![],
+            models: vec![], turns: 1
         };
         let p = place(&job, &matrix).unwrap();
         assert_eq!(p.cell.node.id, "host",
@@ -240,7 +247,7 @@ mod tests {
             reach: Reach::Lan,
             partner_node: None,
             prompt_tokens: 1700,
-            models: vec!["deepseek-coder-6.7b".into()],
+            models: vec!["deepseek-coder-6.7b".into()], turns: 1
         };
         let p = place(&job, &matrix).unwrap();
         assert_eq!(p.cell.node.id, "c", "the busy warm cell must not be taken: {}", p.reason);
@@ -252,7 +259,7 @@ mod tests {
     #[test]
     fn the_three_empty_causes_are_named_apart() {
         let job = |reach, partner: Option<&str>, models: Vec<String>| Job {
-            reach, partner_node: partner.map(str::to_string), prompt_tokens: 100, models,
+            reach, partner_node: partner.map(str::to_string), prompt_tokens: 100, models, turns: 1,
         };
         assert!(explain_empty(&job(Reach::Lan, None, vec![]), &[]).contains("hive is empty"));
 
@@ -399,7 +406,7 @@ mod assembly_tests {
         let reports = vec![report("mini", 20.0, &[("Qwen3-14B", 1600, false)])];
         let peers = vec![("mini".to_string(), Route::Lan)];
         let m = assemble(Some(&local), &peers, &reports);
-        let job = Job { reach: Reach::Lan, partner_node: None, prompt_tokens: 1700, models: vec![] };
+        let job = Job { reach: Reach::Lan, partner_node: None, prompt_tokens: 1700, models: vec![], turns: 1 };
         let p = place(&job, &m).unwrap();
         assert_eq!(p.cell.node.id, "mini", "{}", p.reason);
         assert_eq!(p.saved_prefill, 1600);
@@ -415,7 +422,7 @@ mod assembly_tests {
         let m = assemble(Some(&local), &peers, &reports);
         assert_eq!(m.len(), 3);
 
-        let job = Job { reach: Reach::Lan, partner_node: None, prompt_tokens: 1000, models: vec![] };
+        let job = Job { reach: Reach::Lan, partner_node: None, prompt_tokens: 1000, models: vec![], turns: 1 };
         let fan = place_fan(&job, &m, 3);
         assert_eq!(fan.len(), 3);
         assert_eq!(fan[0].saved_prefill, 900, "warmest first");

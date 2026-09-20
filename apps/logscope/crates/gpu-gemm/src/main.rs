@@ -255,7 +255,12 @@ fn align32(x: u64) -> u64 { x.div_ceil(32) * 32 }
 /// no `llama.vocab_size` key (must be derived from the embedding), no
 /// `output.weight` tensor (tied to `token_embd`), and exotic metadata value
 /// types (float64, int8) that the parser must tolerate.
-fn write_gguf_llama3(m: &HostModel) -> Vec<u8> {
+fn write_gguf_llama3(m: &HostModel) -> Vec<u8> { write_gguf_llama3_as(m, "llama", "llama") }
+/// The llama-shaped fixture under another architecture NAME and metadata PREFIX. The tensors are
+/// identical; what changes is what the registry turns on for that name — `("gemma3", "gemma3")`
+/// gives the (1+w) norm, GeGLU and the sqrt(d) EMBEDDING SCALE with no other prefill variant, which is the only way to test that scale in isolation (Gemma-4's fixture also has
+/// V-norm, which hides it).
+fn write_gguf_llama3_as(m: &HostModel, arch: &str, pfx: &str) -> Vec<u8> {
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
     let v1 = |n: usize| vec![n as u64];
     let kv = m.n_kv_heads * (m.d / m.n_heads);
@@ -284,14 +289,14 @@ fn write_gguf_llama3(m: &HostModel) -> Vec<u8> {
     let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
     let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
     b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 10);
-    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "llama");
-    s(&mut b, "llama.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
-    s(&mut b, "llama.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
-    s(&mut b, "llama.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
-    s(&mut b, "llama.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
-    s(&mut b, "llama.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
-    s(&mut b, "llama.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, m.base);
-    s(&mut b, "llama.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, arch);
+    s(&mut b, &format!("{pfx}.block_count")); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
+    s(&mut b, &format!("{pfx}.attention.head_count")); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
+    s(&mut b, &format!("{pfx}.attention.head_count_kv")); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
+    s(&mut b, &format!("{pfx}.embedding_length")); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
+    s(&mut b, &format!("{pfx}.feed_forward_length")); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
+    s(&mut b, &format!("{pfx}.rope.freq_base")); u32b(&mut b, 6); f32b(&mut b, m.base);
+    s(&mut b, &format!("{pfx}.attention.layer_norm_rms_epsilon")); u32b(&mut b, 6); f32b(&mut b, m.eps);
     s(&mut b, "test.scaling_factor"); u32b(&mut b, 12); b.extend_from_slice(&8.0f64.to_le_bytes()); // float64
     s(&mut b, "test.signed_byte"); u32b(&mut b, 1); b.push((-7i8) as u8);                          // int8
     // (deliberately no llama.vocab_size)
@@ -421,16 +426,42 @@ fn write_gguf_deepseek2_mla() -> Vec<u8> {
 /// and this fixture exercises the ffn_apply funnel through its richest mix of paths
 /// (DeltaNet block, gated-attention MoE block). Some(1.0) must be an exact no-op.
 fn write_gguf_qwen35moe_hybrid(shexp: u8, out_scale: Option<f32>) -> Vec<u8> {
+    write_gguf_qwen35moe_hybrid_sections(shexp, out_scale, None)
+}
+/// `sections`: when Some, the file carries `qwen35moe.rope.dimension_sections` as an INT32 array —
+/// the width llama.cpp's converter writes — so the loader's per-file multi-section-rope check
+/// (imrope.rs) runs against real metadata bytes. The attention block here rotates 16 dims = 8
+/// pairs: [3, 3, 2, 0] keeps every pair on t/h/w; [4, 2, 2, 0] sends pair 7 to the e channel.
+fn write_gguf_qwen35moe_hybrid_sections(shexp: u8, out_scale: Option<f32>, sections: Option<[i32; 4]>) -> Vec<u8> {
+    write_gguf_qwen35moe_hybrid_full(shexp, out_scale, sections, false)
+}
+/// `centered`: draw the weights from [-amp, amp) instead of this file's usual [-amp, 0).
+///
+/// The usual generator is `u/2^23 - 1`: every weight NEGATIVE, so every token embeds to nearly the
+/// same vector, and everything downstream of the embedding is nearly the same for every token —
+/// each token's conv input, its decay, its beta. On that fixture a chunked DeltaNet kernel that
+/// reads TOKEN 0's projection (or token 0's decay/beta) for every token in the chunk PASSES: two
+/// break tests said so. A fixture for anything per-token has to have tokens that differ. The
+/// existing gates keep the generator they were written against; --gate-prefill-parity asks for this.
+fn write_gguf_qwen35moe_hybrid_full(shexp: u8, out_scale: Option<f32>, sections: Option<[i32; 4]>, centered: bool) -> Vec<u8> {
+    write_gguf_qwen35moe_hybrid_state(shexp, out_scale, sections, centered, 8)
+}
+/// `sst`: the DeltaNet state width. Every other hybrid fixture is 8 — at which 56 of the recurrence
+/// kernel's 64 threads do nothing, no thread owns more than one state row, and nothing indexed by
+/// column goes past 7. Qwen3.5 is 128: two rows per thread, strides that wrap. A kernel whose
+/// striding is wrong is RIGHT at 8.
+fn write_gguf_qwen35moe_hybrid_state(shexp: u8, out_scale: Option<f32>, sections: Option<[i32; 4]>, centered: bool, sst: usize) -> Vec<u8> {
     let (d, vocab, h) = (64usize, 32usize, 128usize);
     let (heads, kvh, hd) = (4usize, 2usize, 16usize);          // blk.1 attention
-    let (sst, hk, hv, dconv) = (8usize, 2usize, 4usize, 4usize); // blk.0 deltanet
+    let (hk, hv, dconv) = (2usize, 4usize, 4usize); // blk.0 deltanet
     let (nexp, nused, ffe, sff) = (2usize, 1usize, 32usize, 32usize); // blk.1 MoE + shared
     let (key_dim, value_dim) = (hk * sst, hv * sst);
     let conv_dim = 2 * key_dim + value_dim;
     let mk = |seed: u32, n: usize| -> Vec<f32> {
         let mut v = Vec::with_capacity(n); let mut x = seed | 1;
         for _ in 0..n { x = x.wrapping_mul(1664525).wrapping_add(1013904223);
-            v.push(((x >> 9) as f32 / (1u32 << 23) as f32 - 1.0) * 0.05); }
+            let u = (x >> 9) as f32 / (1u32 << 23) as f32;                       // [0, 1)
+            v.push(if centered { (u * 2.0 - 1.0) * 0.12 } else { (u - 1.0) * 0.05 }); }
         v };
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
     let v1 = |n: usize| vec![n as u64];
@@ -491,8 +522,12 @@ fn write_gguf_qwen35moe_hybrid(shexp: u8, out_scale: Option<f32>) -> Vec<u8> {
     let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
     let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
     let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
-    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 16);
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 16 + sections.is_some() as u64);
     sput(&mut b, "general.architecture"); u32b(&mut b, 8); sput(&mut b, "qwen35moe");
+    if let Some(sec) = sections {
+        sput(&mut b, "qwen35moe.rope.dimension_sections"); u32b(&mut b, 9); u32b(&mut b, 5); u64b(&mut b, 4);
+        for v in sec { b.extend_from_slice(&v.to_le_bytes()); }
+    }
     sput(&mut b, "qwen35moe.block_count"); u32b(&mut b, 4); u32b(&mut b, 2);
     sput(&mut b, "qwen35moe.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
     sput(&mut b, "qwen35moe.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, kvh as u32);
@@ -653,7 +688,14 @@ fn write_gguf_q8_0(m: &HostModel) -> Vec<u8> {
 /// feeds measures dispatches on the path the app decodes through, and QK-norm plus grouped-query
 /// attention each ADD dispatches per layer. A fixture without them would undercount the very
 /// thing being counted.
-fn write_gguf_qwen3_q8(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) -> Vec<u8> {
+fn write_gguf_qwen3_q8(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) -> Vec<u8> { write_gguf_qwen3_q8_embed(m, q_norm, k_norm, false) }
+/// `q8_embed`: store token_embd.weight as Q8_0 too. Every other fixture in this file keeps the
+/// embedding f32 — the one case where the host table is deliberately NOT held raw — so without this
+/// nothing exercises embedtable's row-at-a-time path end to end.
+fn write_gguf_qwen3_q8_embed(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>], q8_embed: bool) -> Vec<u8> { write_gguf_qwen3_q8_full(m, q_norm, k_norm, q8_embed, false) }
+/// `tied`: omit output.weight, so the loader ties the output projection to the embedding (Llama-3.2's
+/// layout). That is the ONE case where a raw host table still has to be dequantized, once, at load.
+fn write_gguf_qwen3_q8_full(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>], q8_embed: bool, tied: bool) -> Vec<u8> {
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
     let v1 = |n: usize| vec![n as u64];
     let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
@@ -661,7 +703,7 @@ fn write_gguf_qwen3_q8(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) 
     let hd = m.d / m.n_heads;
     let kv = m.n_kv_heads * hd;
     let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
-    let (t, by) = f32t(&m.embed); ts.push(("token_embd.weight".into(), mat(m.vocab, m.d), t, by));
+    let (t, by) = if q8_embed { q8t(&m.embed) } else { f32t(&m.embed) }; ts.push(("token_embd.weight".into(), mat(m.vocab, m.d), t, by));
     for (i, b) in m.layers.iter().enumerate() {
         let (t, by) = f32t(&b.g1); ts.push((format!("blk.{i}.attn_norm.weight"), v1(m.d), t, by));
         let (t, by) = q8t(&b.wq); ts.push((format!("blk.{i}.attn_q.weight"), mat(m.d, m.d), t, by));
@@ -676,7 +718,7 @@ fn write_gguf_qwen3_q8(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) 
         let (t, by) = q8t(&b.wdown); ts.push((format!("blk.{i}.ffn_down.weight"), mat(m.d, m.h), t, by));
     }
     let (t, by) = f32t(&m.out_norm); ts.push(("output_norm.weight".into(), v1(m.d), t, by));
-    let (t, by) = q8t(&m.output); ts.push(("output.weight".into(), mat(m.vocab, m.d), t, by));
+    if !tied { let (t, by) = q8t(&m.output); ts.push(("output.weight".into(), mat(m.vocab, m.d), t, by)); }
 
     let mut offs = Vec::with_capacity(ts.len());
     let mut off = 0u64;
@@ -772,7 +814,9 @@ fn write_gguf_qwen2(m: &HostModel, biases: &[(Vec<f32>, Vec<f32>, Vec<f32>)]) ->
     b
 }
 
-fn write_gguf_qwen3(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) -> Vec<u8> {
+fn write_gguf_qwen3(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) -> Vec<u8> { write_gguf_qwen3_as(m, q_norm, k_norm, "qwen3", "qwen3") }
+/// The QK-norm fixture under another architecture name/prefix — see write_gguf_llama3_as.
+fn write_gguf_qwen3_as(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>], arch: &str, pfx: &str) -> Vec<u8> {
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
     let v1 = |n: usize| vec![n as u64];
     let kv = m.n_kv_heads * (m.d / m.n_heads);
@@ -805,15 +849,15 @@ fn write_gguf_qwen3(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) -> 
     let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
 
     b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 9);
-    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "qwen3");
-    s(&mut b, "qwen3.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
-    s(&mut b, "qwen3.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
-    s(&mut b, "qwen3.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
-    s(&mut b, "qwen3.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
-    s(&mut b, "qwen3.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
-    s(&mut b, "qwen3.vocab_size"); u32b(&mut b, 4); u32b(&mut b, m.vocab as u32);
-    s(&mut b, "qwen3.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, m.base);
-    s(&mut b, "qwen3.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, arch);
+    s(&mut b, &format!("{pfx}.block_count")); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
+    s(&mut b, &format!("{pfx}.attention.head_count")); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
+    s(&mut b, &format!("{pfx}.attention.head_count_kv")); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
+    s(&mut b, &format!("{pfx}.embedding_length")); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
+    s(&mut b, &format!("{pfx}.feed_forward_length")); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
+    s(&mut b, &format!("{pfx}.vocab_size")); u32b(&mut b, 4); u32b(&mut b, m.vocab as u32);
+    s(&mut b, &format!("{pfx}.rope.freq_base")); u32b(&mut b, 6); f32b(&mut b, m.base);
+    s(&mut b, &format!("{pfx}.attention.layer_norm_rms_epsilon")); u32b(&mut b, 6); f32b(&mut b, m.eps);
     for (i, (name, dims, _)) in ts.iter().enumerate() {
         s(&mut b, name); u32b(&mut b, dims.len() as u32);
         for &dd in dims { u64b(&mut b, dd); }
@@ -1384,7 +1428,9 @@ fn main() {
                 }
                 out
             };
-            let mut d = gpu_kernels::spec::PromptLookup { ngram: 2 };
+            // IndexedLookup: PromptLookup's drafts, O(1) per step instead of O(context). Identical
+            // proposals by test, so this run's spec-vs-plain comparison holds it end to end as well.
+            let mut d = gpu_kernels::spec::IndexedLookup::new(2);
             let mut st = gpu_kernels::SpecStats::default();
             let spec = gpu.speculative_generate_drafter(&model, &mut d, prompt, n_new, 4, &mut st);
             let same = spec.len() >= plain.len() && spec[..plain.len()] == plain[..];
@@ -1398,6 +1444,384 @@ fn main() {
             "prompt-lookup decoding is bit-identical to plain decoding ✓"
         } else { "MISMATCH — speculative output diverged from plain decoding ✗" });
         std::process::exit(if fails == 0 { 0 } else { 1 });
+    }
+    if args.iter().any(|a| a == "--gate-prefill-parity") {
+        // PREFILL MUST AGREE WITH DECODE, per architecture family.
+        //
+        // decode_step routes per layer and implements every variant this engine knows: QK-norm,
+        // gated attention output, post-attention norm, V-norm / V-from-K, the embedding scale,
+        // Gated DeltaNet, MLA. The prefill blocks are a separate, older body of code, and nothing
+        // held the two together — so a variant taught to decode and not to prefill gives a model
+        // whose PROMPT is processed wrongly and whose generation then reads as "a bad model".
+        //
+        // For each family: the same tokens through (A) prefill_chunked + decode_step and (B)
+        // decode_step alone from position 0. Same logits at the same positions, or the prompt
+        // path is not running the same model. (B) is the reference because it is the path the
+        // per-family gates already hold against CPU oracles.
+        std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
+        let gpu = Gpu::new();
+        eprintln!("gate-prefill-parity: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: String, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let hm = gen_model(64, 128, 2, 48, 4, 2);
+        let hd = hm.d / hm.n_heads;
+        let qn: Vec<Vec<f32>> = (0..hm.n_layers).map(|i| rnd(hd, 600 + i)).collect();
+        let kn: Vec<Vec<f32>> = (0..hm.n_layers).map(|i| rnd(hd, 700 + i)).collect();
+        let families: Vec<(&str, Vec<u8>)> = vec![
+            ("llama3 (plain)", write_gguf_llama3(&hm)),
+            // gemma3, not gemma/gemma2: the registry refuses those outright (soft-caps unimplemented).
+            // With no post_attention_norm and no q/k-norm tensors in the file, the embedding scale is
+            // the ONLY thing this family has that the prefill blocks used to lack.
+            ("gemma3-shaped (embedding scale and nothing else)", write_gguf_qwen3_as(&hm, &qn, &kn, "gemma3", "gemma3")),
+            ("qwen3 (QK-norm)", write_gguf_qwen3(&hm, &qn, &kn)),
+            ("qwen35moe hybrid (Gated DeltaNet + gated attention + MoE)", write_gguf_qwen35moe_hybrid_full(1, None, None, true)),
+            ("gemma4 alt-V (embed scale, V-norm, V-from-K, post norms)", write_gguf_gemma4_altv(false)),
+            ("deepseek2 (MLA)", write_gguf_deepseek2_mla()),
+        ];
+        let toks: [u32; 7] = [3, 9, 14, 21, 6, 9, 27];
+        let n_prompt = 5;
+        for (name, bytes) in &families {
+            let run = |prefill: bool| -> Result<Vec<Vec<f32>>, String> {
+                let m = gpu.load_gguf_opt(bytes, false)?;
+                let c = gpu.new_cache_for(&m, toks.len() + 2);
+                let ids: Vec<u32> = toks.iter().map(|t| t % m.vocab as u32).collect();
+                let mut out = Vec::new();
+                let from = if prefill { out.push(gpu.prefill_chunked(&m, &c, &ids[..n_prompt], 3)); n_prompt }   // chunk 3: two chunks
+                           else { for p in 0..n_prompt { let l = gpu.decode_step(&m, &c, ids[p], p); if p + 1 == n_prompt { out.push(l); } } n_prompt };
+                for p in from..ids.len() { out.push(gpu.decode_step(&m, &c, ids[p], p)); }
+                gpu.end_frame();
+                Ok(out)
+            };
+            let guarded = |prefill: bool| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(prefill)))
+                .unwrap_or_else(|e| Err(format!("PANICKED: {}", e.downcast_ref::<String>().map(|s| s.chars().take(110).collect::<String>()).unwrap_or_else(|| "(non-string panic)".into()))));
+            let (a, b) = (guarded(true), guarded(false));
+            match (&a, &b) {
+                (Ok(a), Ok(b)) => {
+                    let scale = b.iter().flatten().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+                    let worst = a.iter().zip(b).map(|(x, y)| x.iter().zip(y).map(|(p, q)| if p.is_finite() && q.is_finite() { (p - q).abs() } else { f32::INFINITY }).fold(0f32, f32::max)).fold(0f32, f32::max);
+                    ck(format!("{name}: prefill+decode == decode-only at the prompt's last token and {} decode steps (max |Δ| {worst:.2e}, logit scale {scale:.2e})", a.len() - 1),
+                       a.len() == b.len() && worst <= 2e-4 * scale.max(1.0));
+                }
+                (a, b) => ck(format!("{name}: both paths run (prefill path: {}; decode-only: {})",
+                    a.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| e.clone()), b.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| e.clone())), false),
+            }
+        }
+        // WHAT A PROMPT TOKEN COSTS on the hybrid, three ways, quantized-resident as the app loads:
+        //   (a) sequential, decode_step per token       — what d297e4df5 did, and what came back first
+        //   (b) sequential, layers only, windowed       — no LM head, no readback, one sync per window
+        //   (c) CHUNKED — DeltaNet's token loop inside DELTANET_CONV_T / _STEP_T; five dispatches a
+        //       layer per CHUNK instead of per token
+        // (a) and (b) are the same kernels, so BIT-identical. (c) projects with a GEMM where decode
+        // uses a fused norm+matvec, so it is held to a tolerance — the same one the families above get.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let snap = || [gpu_kernels::GPU_DISPATCHES.load(Relaxed), gpu_kernels::GPU_SUBMITS.load(Relaxed), gpu_kernels::GPU_POLLS.load(Relaxed), gpu_kernels::GPU_COPIES.load(Relaxed)];
+            let bytes = write_gguf_qwen35moe_hybrid_full(1, None, None, true);   // centered: tokens must DIFFER, see the writer
+            let prompt: Vec<u32> = (0..33u32).map(|i| 1 + (i * 7) % 30).collect();
+            let mut measure = |sequential: bool, with_logits: bool, chunk: usize| -> (Vec<f32>, Vec<f32>, [f64; 4]) {
+                for (k, on) in [("LOGSCOPE_PREFILL_SEQUENTIAL", sequential), ("LOGSCOPE_PREFILL_SEQ_LOGITS", with_logits)] {
+                    if on { std::env::set_var(k, "1"); } else { std::env::remove_var(k); }
+                }
+                let m = gpu.load_gguf_opt(&bytes, true).expect("load");
+                let c = gpu.new_cache_for(&m, prompt.len() + 3);
+                let before = snap();
+                let l = gpu.prefill_chunked(&m, &c, &prompt, chunk);
+                gpu.end_frame();
+                let after = snap();
+                // one decode step AFTER the prompt: it reads the recurrent state and the ring the
+                // prefill left behind, so a wrong state shows here even if the prompt's last logits agree
+                let l2 = gpu.decode_step(&m, &c, 5, prompt.len());
+                gpu.end_frame();
+                for k in ["LOGSCOPE_PREFILL_SEQUENTIAL", "LOGSCOPE_PREFILL_SEQ_LOGITS"] { std::env::remove_var(k); }
+                let n = prompt.len() as f64;
+                (l, l2, [(after[0] - before[0]) as f64 / n, (after[1] - before[1]) as f64 / n, (after[2] - before[2]) as f64 / n, (after[3] - before[3]) as f64 / n])
+            };
+            let (la, la2, a) = measure(true, true, 512);
+            let (lb, lb2, b) = measure(true, false, 512);
+            let (lc, lc2, c) = measure(false, false, 512);
+            let (ld, ld2, d) = measure(false, false, 7);      // 33 tokens in chunks of 7: five chunk boundaries, a ragged last one
+            println!("  hybrid, 33-token prompt, per prompt token [dispatches, submits, polls, copies]:");
+            println!("    (a) sequential, decode_step/token : {:>6.2} {:.2} {:.2} {:.2}", a[0], a[1], a[2], a[3]);
+            println!("    (b) sequential, layers only       : {:>6.2} {:.2} {:.2} {:.2}", b[0], b[1], b[2], b[3]);
+            println!("    (c) chunked, one chunk            : {:>6.2} {:.2} {:.2} {:.2}", c[0], c[1], c[2], c[3]);
+            println!("    (d) chunked, chunks of 7          : {:>6.2} {:.2} {:.2} {:.2}", d[0], d[1], d[2], d[3]);
+            let diff = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| if p.is_finite() && q.is_finite() { (p - q).abs() } else { f32::INFINITY }).fold(0f32, f32::max);
+            let scale = la.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            ck("(b) layers-only sequential ends on BIT-identical logits, prompt and next step".to_string(), la == lb && la2 == lb2 && !la.is_empty() && la.iter().all(|v| v.is_finite()));
+            ck(format!("(b) BLOCKS once per window, not once per token (polls/token {:.2} -> {:.2}; submits {:.2} -> {:.2}, the rest are flush_every's)", a[2], b[2], a[1], b[1]), b[2] <= a[2] * 0.25 && b[1] <= a[1] * 0.6);
+            ck(format!("(b) does not run the LM head for discarded logits (dispatches/token {:.2} -> {:.2})", a[0], b[0]), b[0] < a[0] - 1.5);
+            ck(format!("(c) chunked prefill agrees with sequential: prompt max |Δ| {:.2e}, NEXT decode step {:.2e} (logit scale {scale:.2e})", diff(&la, &lc), diff(&la2, &lc2)),
+               diff(&la, &lc) <= 2e-4 * scale.max(1.0) && diff(&la2, &lc2) <= 2e-4 * scale.max(1.0));
+            ck(format!("(d) the state crosses five chunk boundaries intact: prompt {:.2e}, next step {:.2e}", diff(&la, &ld), diff(&la2, &ld2)),
+               diff(&la, &ld) <= 2e-4 * scale.max(1.0) && diff(&la2, &ld2) <= 2e-4 * scale.max(1.0));
+            ck(format!("(c) costs a fraction of the launches: {:.2} -> {:.2} dispatches per prompt token ({:.0}x fewer)", a[0], c[0], a[0] / c[0].max(1e-9)), c[0] * 8.0 <= a[0]);
+        }
+        // THE HOST EMBEDDING TABLE, held raw vs as f32. A file whose token_embd is QUANTIZED, loaded both
+        // ways: every logit of prefill + decode must be BIT-identical (a row dequantized alone is that
+        // row of the whole table), the default must really BE the raw table, and it must be smaller.
+        {
+            let hm_e = gen_model(64, 128, 2, 96, 4, 2);
+            let hde = hm_e.d / hm_e.n_heads;
+            let (qn_e, kn_e): (Vec<Vec<f32>>, Vec<Vec<f32>>) = ((0..hm_e.n_layers).map(|i| rnd(hde, 610 + i)).collect(), (0..hm_e.n_layers).map(|i| rnd(hde, 710 + i)).collect());
+            let bytes = write_gguf_qwen3_q8_embed(&hm_e, &qn_e, &kn_e, true);
+            let ids: Vec<u32> = (0..9u32).map(|i| (i * 37 + 5) % hm_e.vocab as u32).collect();
+            let mut run = |f32_table: bool| -> (Vec<Vec<f32>>, bool, usize) {
+                if f32_table { std::env::set_var("LOGSCOPE_EMBED_F32", "1"); } else { std::env::remove_var("LOGSCOPE_EMBED_F32"); }
+                let m = gpu.load_gguf_opt(&bytes, true).expect("load");
+                std::env::remove_var("LOGSCOPE_EMBED_F32");
+                let c = gpu.new_cache_for(&m, ids.len() + 2);
+                let mut out = vec![gpu.prefill_chunked(&m, &c, &ids[..6], 4)];
+                for p in 6..ids.len() { out.push(gpu.decode_step(&m, &c, ids[p], p)); }
+                gpu.end_frame();
+                (out, m.embed_is_raw(), m.embed_host_bytes())
+            };
+            let ((a, a_raw, a_bytes), (b, b_raw, b_bytes)) = (run(true), run(false));
+            let differing: usize = a.iter().zip(&b).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).sum();
+            let scale = a.iter().flatten().fold(0f32, |m, v| m.max(v.abs()));
+            ck(format!("Q8_0 token_embd: raw host table == f32 host table, {differing} differing logit bits over prefill + {} decode steps (scale {scale:.2e})", a.len() - 1),
+               differing == 0 && a.len() == b.len() && scale > 1e-3 && a.iter().flatten().all(|v| v.is_finite()));
+            ck(format!("the default IS the raw table, and it is smaller: {b_bytes} bytes on the host vs {a_bytes} as f32 ({:.1}x)", a_bytes as f64 / b_bytes.max(1) as f64),
+               !a_raw && b_raw && b_bytes * 3 < a_bytes);
+            // THE GPU-RESIDENT TABLE IS BUILT ONCE. generate_kv_gpu / generate_kv_window used to upload the
+            // whole embedding to a fresh GPU buffer at the start of EVERY call. Five calls, one build —
+            // and the same tokens every time, equal to the plain host-gather path.
+            {
+                let m = gpu.load_gguf_opt(&bytes, true).expect("load");
+                let prompt: Vec<u32> = ids[..5].to_vec();
+                let before = gpu_kernels::resident_embed_builds();
+                let w1 = gpu.generate_kv_window(&m, &prompt, 9, 4);
+                let w2 = gpu.generate_kv_window(&m, &prompt, 9, 4);
+                let g1 = gpu.generate_kv_gpu(&m, &prompt, 9);
+                let g2 = gpu.generate_kv_gpu(&m, &prompt, 9);
+                let w3 = gpu.generate_kv_window(&m, &prompt, 9, 3);
+                let builds = gpu_kernels::resident_embed_builds() - before;
+                let plain = gpu.generate_kv(&m, &prompt, 9);
+                ck(format!("five windowed / GPU-gather generations on one model built the GPU embedding {builds} time(s)"), builds == 1);
+                if std::env::var_os("GATE_DEBUG").is_some() { println!("      debug: w1 {w1:?}\n      debug: g1 {g1:?}\n      debug: w3 {w3:?}\n      debug: plain {plain:?}"); }
+                // These return the NEW tokens only (my first assertion assumed prompt + new).
+                ck(format!("and they agree with each other and with the host-gather path ({} new tokens)", plain.len()),
+                   w1 == w2 && g1 == g2 && w1 == g1 && w3 == w1 && w1 == plain && plain.len() == 9);
+                // a SECOND model gets its own table — the cache is per model, not per process
+                let m2 = gpu.load_gguf_opt(&bytes, true).expect("load again");
+                let _ = gpu.generate_kv_window(&m2, &prompt, 3, 2);
+                ck("a second Model builds its own".to_string(), gpu_kernels::resident_embed_builds() - before == 2);
+            }
+            // TIED OUTPUT: no output.weight, so the loader builds the output projection FROM the embedding —
+            // the one case a raw table is still dequantized (once, then dropped). Same question, same
+            // standard: both ways, every logit bit.
+            {
+                let tied = write_gguf_qwen3_q8_full(&hm_e, &qn_e, &kn_e, true, true);
+                let mut run_t = |f32_table: bool| -> (Vec<Vec<f32>>, bool) {
+                    if f32_table { std::env::set_var("LOGSCOPE_EMBED_F32", "1"); } else { std::env::remove_var("LOGSCOPE_EMBED_F32"); }
+                    let m = gpu.load_gguf_opt(&tied, true).expect("load tied");
+                    std::env::remove_var("LOGSCOPE_EMBED_F32");
+                    let c = gpu.new_cache_for(&m, ids.len() + 2);
+                    let mut out = vec![gpu.prefill_chunked(&m, &c, &ids[..6], 4)];
+                    for p in 6..ids.len() { out.push(gpu.decode_step(&m, &c, ids[p], p)); }
+                    gpu.end_frame();
+                    (out, m.embed_is_raw())
+                };
+                let ((ta, ta_raw), (tb, tb_raw)) = (run_t(true), run_t(false));
+                let dt: usize = ta.iter().zip(&tb).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).sum();
+                let untied_differs = tb.iter().zip(&b).any(|(x, y)| x != y);
+                ck(format!("TIED output + Q8_0 token_embd: raw table == f32 table, {dt} differing logit bits; and the tied model really is a different model from the untied one: {untied_differs}"),
+                   dt == 0 && !ta_raw && tb_raw && untied_differs && ta.iter().flatten().all(|v| v.is_finite()));
+            }
+            // THE GPU-RESIDENT int8 EMBEDDING, built in row chunks from the raw table vs from one whole
+            // f32 table. A vocabulary LARGER than one chunk and not a multiple of it, so the chunk
+            // boundary — the only thing that changed — actually occurs, raggedly.
+            let big = gen_model(64, 128, 1, gpu_kernels::EMBED_Q8_CHUNK_ROWS + 904, 4, 2);
+            let bytes_big = write_gguf_qwen3_q8_embed(&big, &qn_e[..1], &kn_e[..1], true);
+            let mut build = |f32_table: bool| -> (Vec<f32>, Vec<u32>, bool) {
+                if f32_table { std::env::set_var("LOGSCOPE_EMBED_F32", "1"); } else { std::env::remove_var("LOGSCOPE_EMBED_F32"); }
+                let m = gpu.load_gguf_opt(&bytes_big, true).expect("load big-vocab fixture");
+                std::env::remove_var("LOGSCOPE_EMBED_F32");
+                let q = gpu.embed_q8(&m);
+                (gpu.download(&q.qs), gpu.download_words(&q.qw), m.embed_is_raw())
+            };
+            let ((s_old, w_old, raw_old), (s_new, w_new, raw_new)) = (build(true), build(false));
+            let ds = s_old.iter().zip(&s_new).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let dw = w_old.iter().zip(&w_new).filter(|(a, b)| a != b).count();
+            ck(format!("GPU int8 embedding built in {}-row chunks == built from one whole f32 table: {ds} differing scales, {dw} differing code words ({} rows, {} words)",
+                       gpu_kernels::EMBED_Q8_CHUNK_ROWS, big.vocab, w_new.len()),
+               ds == 0 && dw == 0 && !raw_old && raw_new && s_old.len() == s_new.len() && w_old.len() == w_new.len() && w_new.iter().any(|w| *w != 0));
+        }
+        // K/V ARE ALLOCATED ONLY WHERE A LAYER USES THEM. The hybrid fixture is one DeltaNet layer and one
+        // attention layer: its cache must hold full K/V for exactly the attention layer, the old
+        // allocation must be what LOGSCOPE_KV_ALLOC_ALL=1 restores, the capacity must not be read off
+        // layer 0 (the DeltaNet one), and decode must be BIT-identical either way — the rows that went
+        // away were never read.
+        {
+            let bytes_h = write_gguf_qwen35moe_hybrid_full(1, None, None, true);
+            let max_seq = 4096usize;
+            let mut measure = |alloc_all: bool| -> (usize, usize, Vec<usize>, Vec<Vec<f32>>) {
+                if alloc_all { std::env::set_var("LOGSCOPE_KV_ALLOC_ALL", "1"); } else { std::env::remove_var("LOGSCOPE_KV_ALLOC_ALL"); }
+                let m = gpu.load_gguf_opt(&bytes_h, true).expect("load hybrid");
+                let c = gpu.new_cache_for(&m, max_seq);
+                std::env::remove_var("LOGSCOPE_KV_ALLOC_ALL");
+                let ids = [3u32, 9, 14, 21, 6, 9, 27];
+                let mut out = vec![gpu.prefill_chunked(&m, &c, &ids[..5], 3)];
+                for p in 5..ids.len() { out.push(gpu.decode_step(&m, &c, ids[p], p)); }
+                gpu.end_frame();
+                (c.kv_alloc_bytes(), c.capacity(), c.k.iter().map(|t| t.rows).collect(), out)
+            };
+            let ((old_bytes, old_cap, old_rows, old_logits), (new_bytes, new_cap, new_rows, new_logits)) = (measure(true), measure(false));
+            let differing: usize = old_logits.iter().zip(&new_logits).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).sum();
+            ck(format!("hybrid K/V allocation: {old_bytes} -> {new_bytes} bytes at max_seq {max_seq} (rows per layer {old_rows:?} -> {new_rows:?})"),
+               new_rows == vec![1, max_seq] && old_rows == vec![max_seq, max_seq] && new_bytes * 2 <= old_bytes + 4 * 64 * 4);
+            ck(format!("capacity is {new_cap} either way, though layer 0 now has {} row", new_rows[0]), new_cap == max_seq && old_cap == max_seq);
+            ck(format!("prefill + decode are BIT-identical with the trimmed cache: {differing} differing logit bits"), differing == 0 && !new_logits.is_empty());
+        }
+        // A HYBRID CANNOT EXTEND A PREFIX — recurrent state cannot fork or seek — and must say so BY NAME.
+        // On the way to that refusal extend_prefix copies the parent's K/V rows for every layer; a
+        // DeltaNet layer's buffer is a one-row placeholder now, so that loop has to skip it. If it does
+        // not, the only symptom is a rejected GPU copy: the device-error count, nothing else.
+        {
+            let bytes_h = write_gguf_qwen35moe_hybrid_full(1, None, None, true);
+            let m = gpu.load_gguf_opt(&bytes_h, true).expect("load hybrid");
+            let de0 = gpu_kernels::DEVICE_ERRORS.load(std::sync::atomic::Ordering::Relaxed);
+            let parent = gpu.prefill_prefix(&m, &[3, 9, 14, 21]);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { let _ = gpu.extend_prefix(&m, &parent, 4, &[6, 9, 27]); }));
+            gpu.end_frame();
+            let msg = r.err().map(|e| e.downcast_ref::<String>().cloned().unwrap_or_default()).unwrap_or_default();
+            let de = gpu_kernels::DEVICE_ERRORS.load(std::sync::atomic::Ordering::Relaxed) - de0;
+            ck(format!("hybrid extend_prefix is refused by name ({}) and rejects no GPU command on the way ({de} device errors)",
+                       if msg.contains("RECURRENT") { "\"...RECURRENT...cannot seek\"" } else { "NOT the named refusal" }),
+               msg.contains("RECURRENT") && de == 0);
+        }
+        // THE APP'S LOOP, on a hybrid. stream_session_window is what backend.rs calls, and it is where
+        // `capacity()` replaced `cache.k.first()` — on a Qwen3.5 hybrid layer 0 is DeltaNet, so with the
+        // trimmed cache the old expression would have read a capacity of ONE row. Sampled (the app's
+        // default sampler), against stream_session with the same seed.
+        {
+            let bytes_h = write_gguf_qwen35moe_hybrid_full(1, None, None, true);
+            let m = gpu.load_gguf_opt(&bytes_h, true).expect("load hybrid");
+            let sp = gpu_kernels::SamplerParams { temperature: 0.8, top_k: 8, top_p: 0.95, repeat_penalty: 1.1, repeat_last_n: 64, min_p: 0.05 };
+            let prompt: Vec<u32> = vec![3, 9, 14, 21, 6];
+            let eq = gpu.embed_q8(&m);
+            let run = |windowed: bool| -> Result<Vec<u32>, String> {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut sess = gpu.session_new(&m, 64, 7);
+                    gpu.session_prefill(&m, &mut sess, &prompt);
+                    let (mut seen, mut rng, mut toks) = (prompt.clone(), 99u64, Vec::new());
+                    let nc = || false;
+                    if windowed { gpu.stream_session_window(&m, &mut sess, &mut seen, 12, None, &sp, &mut rng, 4, &gpu_kernels::EmbedT::Q8(&eq), &nc, |t| { toks.push(t); true }); }
+                    else { gpu.stream_session(&m, &mut sess, &mut seen, 12, None, &sp, &mut rng, &nc, |t| { toks.push(t); true }); }
+                    toks
+                })).map_err(|e| e.downcast_ref::<String>().map(|s| s.chars().take(100).collect::<String>()).unwrap_or_default())
+            };
+            let (w, p1, p2) = (run(true), run(false), run(false));
+            if std::env::var_os("GATE_DEBUG").is_some() { println!("      debug: windowed {w:?}\n      debug: per-token {p1:?}"); }
+            ck(format!("hybrid session: stream_session is reproducible and produces 12 tokens ({})", match &p1 { Ok(v) => format!("{} tokens", v.len()), Err(e) => format!("PANICKED: {e}") }),
+               p1.is_ok() && p1 == p2 && p1.as_ref().map(|v| v.len() == 12).unwrap_or(false));
+            // The windowed path gathers its input from an INT8 embedding, the per-token path from the f32
+            // rows, so the two are not bit-comparable; what must hold is that the windowed loop RUNS a
+            // hybrid session to its full length instead of seeing a one-row cache.
+            ck(format!("hybrid session: stream_session_window (the app's loop) runs to length ({})", match &w { Ok(v) => format!("{} tokens", v.len()), Err(e) => format!("PANICKED: {e}") }),
+               w.as_ref().map(|v| v.len() == 12).unwrap_or(false));
+        }
+        // A HYBRID THROUGH THE WINDOWED PATH. generate_kv_window / generate_kv_gpu allocated with
+        // new_cache — no recurrent state — so a Gated DeltaNet model could not run through them at all.
+        // With new_cache_for it must, and must produce the tokens step-by-step decode produces.
+        {
+            let bytes_h = write_gguf_qwen35moe_hybrid_full(1, None, None, true);
+            let m = gpu.load_gguf_opt(&bytes_h, true).expect("load hybrid");
+            let prompt: Vec<u32> = vec![3, 9, 14, 21, 6];
+            let reference: Vec<u32> = {
+                let c = gpu.new_cache_for(&m, prompt.len() + 8);
+                let mut out = prompt.clone(); let mut logits = Vec::new();
+                for (p, &t) in prompt.iter().enumerate() { logits = gpu.decode_step(&m, &c, t, p); }
+                for p in prompt.len()..prompt.len() + 7 { let nx = gpu_kernels::argmax(&logits); out.push(nx); logits = gpu.decode_step(&m, &c, nx, p); }
+                out.push(gpu_kernels::argmax(&logits)); gpu.end_frame(); out
+            };
+            let run = |f: &dyn Fn() -> Vec<u32>| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|e| e.downcast_ref::<String>().map(|s| s.chars().take(90).collect::<String>()).unwrap_or_default());
+            let reference: Vec<u32> = reference[prompt.len()..].to_vec();   // the generate_* fns return the NEW tokens only
+            let win = run(&|| gpu.generate_kv_window(&m, &prompt, 8, 3));
+            let gg = run(&|| gpu.generate_kv_gpu(&m, &prompt, 8));
+            if std::env::var_os("GATE_DEBUG").is_some() { println!("      debug: reference {reference:?}\n      debug: window    {win:?}\n      debug: gpu       {gg:?}"); }
+            ck(format!("hybrid: generate_kv_window runs and matches step-by-step decode ({})", match &win { Ok(v) => format!("{} tokens", v.len()), Err(e) => format!("PANICKED: {e}") }),
+               win.as_ref().map(|v| *v == reference).unwrap_or(false));
+            // and the two entry points other code is BUILT on: generate_kv (what the windowed paths are
+            // held bit-exact to) and run_tokens (the unit of work a fan/fabric worker runs). Greedy here.
+            let gk = run(&|| gpu.generate_kv(&m, &prompt, 8));
+            ck(format!("hybrid: generate_kv runs and matches ({})", match &gk { Ok(v) => format!("{} tokens", v.len()), Err(e) => format!("PANICKED: {e}") }),
+               gk.as_ref().map(|v| *v == reference).unwrap_or(false));
+            let greedy = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+            let rt = run(&|| gpu.run_tokens(&m, &prompt, 8, &greedy, &[], 1));
+            ck(format!("hybrid: run_tokens (the fabric worker's unit) runs and matches ({})", match &rt { Ok(v) => format!("{} tokens", v.len()), Err(e) => format!("PANICKED: {e}") }),
+               rt.as_ref().map(|v| *v == reference).unwrap_or(false));
+            if std::env::var_os("GATE_DEBUG").is_some() { println!("      debug: generate_kv {gk:?}\n      debug: run_tokens  {rt:?}"); }
+            ck(format!("hybrid: generate_kv_gpu runs and matches step-by-step decode ({})", match &gg { Ok(v) => format!("{} tokens", v.len()), Err(e) => format!("PANICKED: {e}") }),
+               gg.as_ref().map(|v| *v == reference).unwrap_or(false));
+        }
+        // THE HOISTED RECURRENCE vs THE ORIGINAL, bit for bit, at Qwen3.5's state width (128: two
+        // state rows per thread, strides that wrap) and at 200 (not a multiple of 64: ragged strides)
+        // — decode AND chunked prefill, the prompt's logits AND the step after it, which reads the
+        // state both kernels left. Same operations on the same values in the same order per element,
+        // so on a conforming device the answer must be 0 differing bits.
+        // 300 is PAST the hoisted kernels' envelope (their scratch is DELTANET_HOIST_MAX_S wide): the
+        // predicate must send it to the originals. If the constant ever outgrows the shader's arrays,
+        // this is the width that reads past them — and stops matching.
+        for sst in [128usize, 200, 300] {
+            let bytes = write_gguf_qwen35moe_hybrid_state(1, None, None, true, sst);
+            let prompt: Vec<u32> = (0..19u32).map(|i| 1 + (i * 11) % 30).collect();
+            let mut run = |v1: bool, sequential: bool| -> (Vec<f32>, Vec<f32>) {
+                if v1 { std::env::set_var("LOGSCOPE_DELTANET_STEP_V1", "1"); } else { std::env::remove_var("LOGSCOPE_DELTANET_STEP_V1"); }
+                if sequential { std::env::set_var("LOGSCOPE_PREFILL_SEQUENTIAL", "1"); } else { std::env::remove_var("LOGSCOPE_PREFILL_SEQUENTIAL"); }
+                let m = gpu.load_gguf_opt(&bytes, false).expect("load");
+                let c = gpu.new_cache_for(&m, prompt.len() + 3);
+                let l = gpu.prefill_chunked(&m, &c, &prompt, 7);
+                let l2 = gpu.decode_step(&m, &c, 5, prompt.len());
+                gpu.end_frame();
+                std::env::remove_var("LOGSCOPE_DELTANET_STEP_V1"); std::env::remove_var("LOGSCOPE_PREFILL_SEQUENTIAL");
+                (l, l2)
+            };
+            let bits = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            for (route, seq) in [("decode (single-token kernel)", true), ("chunked prefill (token-looped kernel)", false)] {
+                let ((a1, a2), (b1, b2)) = (run(true, seq), run(false, seq));
+                let scale = a1.iter().fold(0f32, |m, v| m.max(v.abs()));
+                ck(format!("state {sst}x{sst} ({}), {route}: == original, {} + {} differing logit bits (scale {scale:.2e})",
+                           if gpu_kernels::deltanet_step_hoistable(sst) { "hoisted" } else { "past the envelope -> original kernel" }, bits(&a1, &b1), bits(&a2, &b2)),
+                   bits(&a1, &b1) == 0 && bits(&a2, &b2) == 0 && a1.len() == b1.len() && !a1.is_empty() && a1.iter().all(|v| v.is_finite()) && scale > 1e-3);
+            }
+        }
+        // INFORMATIONAL — and what it informs is that THIS ADAPTER CANNOT RESOLVE THE CHANGE. On
+        // lavapipe the two kernels time the same (20.6 vs 20.7 ms at 256x256; 13.8 vs 13.8 at 128),
+        // even though widening the state from 128 to 256 adds ~7 ms to the step, so the recurrence is
+        // a large share of it. A software rasterizer pays robustness clamping on every buffer access;
+        // three divisions per element are small beside that. A native CPU transcription of the same
+        // two loops measures 2.12x. Neither number is a GPU's. LOGSCOPE_DELTANET_STEP_V1=1 is the A/B.
+        {
+            let bytes = write_gguf_qwen35moe_hybrid_state(1, None, None, true, 256);   // the widest hoistable state: the most recurrence per step this fixture can offer
+            let mut time = |v1: bool| -> f64 {
+                if v1 { std::env::set_var("LOGSCOPE_DELTANET_STEP_V1", "1"); } else { std::env::remove_var("LOGSCOPE_DELTANET_STEP_V1"); }
+                let m = gpu.load_gguf_opt(&bytes, true).expect("load");
+                let c = gpu.new_cache_for(&m, 64);
+                for p in 0..4 { let _ = gpu.decode_step(&m, &c, 3 + p as u32, p); }          // warm: pipelines, bind groups
+                let t0 = std::time::Instant::now();
+                for p in 4..28 { let _ = gpu.decode_step(&m, &c, 1 + (p as u32 * 7) % 30, p); }
+                gpu.end_frame();
+                std::env::remove_var("LOGSCOPE_DELTANET_STEP_V1");
+                t0.elapsed().as_secs_f64() * 1000.0 / 24.0
+            };
+            let (a, b, a2, b2) = (time(true), time(false), time(true), time(false));
+            println!("  lavapipe, state 256x256 x 4 heads, whole decode step (1 DeltaNet + 1 attention layer): original {:.2} / {:.2} ms, hoisted {:.2} / {:.2} ms", a, a2, b, b2);
+        }
+        {
+            let de = gpu_kernels::DEVICE_ERRORS.load(std::sync::atomic::Ordering::Relaxed);
+            ck(format!("no GPU command was rejected during this gate ({de} device errors logged) — a shrunken K/V placeholder read out of range would show HERE and nowhere in the logits"), de == 0);
+        }
+        println!("gate-prefill-parity: {}", if ok { "prefill agrees with decode for every family \u{2713}" } else { "FAIL \u{2717}" });
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+    if let Some(i) = args.iter().position(|a| a == "--write-hybrid-fixture") {
+        // The Qwen3.5-MoE hybrid (1 Gated DeltaNet block + 1 gated-attention block, MoE FFN with a
+        // gated shared expert) as a FILE, so decode-census can count what a token costs on the
+        // architecture Ornith actually is. Same bytes --gate-deltanet-load builds in-process.
+        let path = args.get(i + 1).cloned().unwrap_or("/tmp/tiny-qwen35moe-hybrid.gguf".to_string());
+        let bytes = write_gguf_qwen35moe_hybrid(1, None);
+        std::fs::write(&path, &bytes).expect("write fixture");
+        println!("wrote {} ({} bytes): qwen35moe hybrid, blk.0 DeltaNet + blk.1 gated attention, MoE + gated shared expert", path, bytes.len());
+        return;
     }
     if let Some(i) = args.iter().position(|a| a == "--write-fixture") {
         // Write the tiny qwen3 fixture that count-dispatch and spec.rs's Drafter tests read.
@@ -5310,7 +5734,42 @@ reproducible in software and not a fault.", raw_diff - diff);
             let (cpu_blob, _) = gpu.quantize_q4_host_bytes(&f32ref, rows, k);
             let cpu_words: Vec<u32> = bytemuck::cast_slice(&cpu_blob).to_vec();
             let diff = got.iter().zip(&cpu_words).filter(|(a, b)| a != b).count();
-            ck(&format!("chunked conversion is exact across boundaries ({diff} words differ)"), diff == 0);
+            // TWO PROPERTIES, which this check used to report as one. It said "chunked conversion is
+            // exact across boundaries (13 words differ)" on lavapipe, which reads as an off-by-one at a
+            // chunk edge. It is not: the same bytes converted in ONE dispatch differ from the CPU by
+            // the same 13 words, and chunked == unchunked exactly. So:
+            //
+            //   (a) BOUNDARIES — chunked vs unchunked on THIS GPU. Adapter-independent; must be 0.
+            //   (b) GPU vs the CPU reference. The reference's reciprocal-and-round rule was tuned to
+            //       the target driver by measurement (see quantize_q4_resident). Another adapter may
+            //       land an ULP the other side of an exact .5 tie. Measured here: all 13 differing
+            //       nibbles are exact ties, and the GPU did NOT take the even neighbour in any, so it
+            //       is not ties-to-even either — just different arithmetic at a knife edge.
+            //
+            // (b) stays STRICT on real hardware. On the software adapter only, differences that are
+            // ALL exact ties are reported and tolerated; anything else still fails.
+            let one = gpu.alloc_words(total / 8 + total / 32);
+            gpu.q4k_convert_into(&one, &raw, rows, k, 0, total / 8);
+            let got1 = gpu.download_words(&one);
+            let boundary_diff = got.iter().zip(&got1).filter(|(a, b)| a != b).count();
+            ck(&format!("chunked conversion == ONE-dispatch conversion on this GPU ({boundary_diff} words differ) — the boundary logic"), boundary_diff == 0);
+            let (mut nibs, mut ties) = (0usize, 0usize);
+            for (wi, (a, b)) in got.iter().zip(&cpu_words).enumerate().filter(|(i, (a, b))| *i < total / 8 && a != b) {
+                for n_i in 0..8 {
+                    if (a >> (n_i * 4)) & 0xF == (b >> (n_i * 4)) & 0xF { continue; }
+                    nibs += 1;
+                    let j = wi * 8 + n_i; let blk = j / 32;
+                    let amax = f32ref[blk * 32..blk * 32 + 32].iter().fold(0f32, |m, x| m.max(x.abs()));
+                    let v = f32ref[j] * (1.0f32 / (amax * (1.0f32 / 7.0)));
+                    if (v.abs().fract() - 0.5).abs() < 1e-6 { ties += 1; }
+                }
+            }
+            let scale_diff = got.iter().zip(&cpu_words).skip(total / 8).filter(|(a, b)| a != b).count();
+            let software = gpu.adapter_name.contains("llvmpipe");
+            let only_ties = nibs == ties && scale_diff == 0;
+            ck(&format!("GPU == CPU reference ({diff} words differ: {nibs} nibbles, {ties} of them exact .5 ties, {scale_diff} scale words){}",
+                        if diff != 0 && software && only_ties { " — tolerated on the software adapter ONLY: every difference is an exact tie; the reference is tuned to the target driver" } else { "" }),
+               diff == 0 || (software && only_ties));
         }
 
         // CLAIMS ONLY WHAT IT TESTS. This said "the loader can stop requantizing", and I acted on
@@ -5939,6 +6398,28 @@ still pass, which is why this one exists."
                 ck("a position SEEK on the recurrent state is refused", seek.is_err());
             }
         }
+        // MULTI-SECTION ROPE, decided per FILE (imrope.rs). Three fixtures differing only in the
+        // sections key: absent, sections whose every pair reads t/h/w, sections that send a pair to
+        // the e channel. The first two must decode BIT-EQUAL (both are plain NEOX rope, which is the
+        // claim); the third must be REFUSED, naming the pair — ggml leaves it unrotated and we would not.
+        {
+            let l3 = |bytes: &[u8]| -> Result<Vec<f32>, String> {
+                let m = gpu.load_gguf_opt(bytes, false)?;
+                let c = gpu.new_cache_for(&m, 8);
+                let mut last = Vec::new();
+                for (p, &t) in [3u32, 9, 14].iter().enumerate() { last = gpu.decode_step(&m, &c, t, p); }
+                gpu.end_frame();
+                Ok(last)
+            };
+            let none = l3(&write_gguf_qwen35moe_hybrid_sections(1, None, None));
+            let plain = l3(&write_gguf_qwen35moe_hybrid_sections(1, None, Some([3, 3, 2, 0])));
+            let on_e = l3(&write_gguf_qwen35moe_hybrid_sections(1, None, Some([4, 2, 2, 0])));
+            ck("sections [3,3,2,0] (int32 array): loads, and decodes BIT-EQUAL to the file without the key",
+               matches!((&none, &plain), (Ok(a), Ok(b)) if a == b && a.iter().all(|v| v.is_finite())));
+            let msg = on_e.as_ref().err().cloned().unwrap_or_default();
+            ck(&format!("sections [4,2,2,0] are REFUSED, naming pair 7 ({})", if msg.is_empty() { "it LOADED".to_string() } else { msg.chars().take(90).collect::<String>() + "…" }),
+               on_e.is_err() && msg.contains("[7]") && msg.contains("UNROTATED"));
+        }
         println!("gate-deltanet-load: {}", if ok { "hybrid DeltaNet loads + decodes \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
@@ -6254,7 +6735,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-batched-fused  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-gemma4-altv  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rope-kv  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-batched-fused  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-gemma4-altv  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-prefill-parity --gate-qwen3\n  --gate-residency  --gate-rope-kv  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
@@ -7270,7 +7751,31 @@ still pass, which is why this one exists."
         let path = std::path::Path::new("/tmp/ls_int8_cache_test.bin");
         let fp = (bytes.len() as u64, 12345);
         gpu.save_int8_cache(&fresh, path, fp).expect("save cache");
+        // The save STREAMS now (it used to hold the whole model in one Vec). Same bytes, or existing
+        // sidecars would silently stop loading — and no tmp file left behind.
+        {
+            let on_disk = std::fs::read(path).expect("read sidecar");
+            let in_memory = gpu.int8_cache_bytes(&fresh, fp).expect("in-memory sidecar");
+            println!("  int8 cache: streamed file {} bytes, in-memory build {} bytes", on_disk.len(), in_memory.len());
+            check("int8 cache: streamed file == in-memory build, byte for byte", if on_disk == in_memory && on_disk.len() > 1000 { 0.0 } else { 1.0 }, 0.5);
+            check("int8 cache: no .tmp left behind", if path.with_extension("tmp").exists() { 1.0 } else { 0.0 }, 0.5);
+        }
         let cached = gpu.load_int8_cache(path, fp).expect("load cache");
+        // The loader MAPS the sidecar now; LOGSCOPE_NO_MMAP=1 reads it whole, as it always did. Both must
+        // hand back the same model — and a truncated file must be refused, not half-loaded.
+        {
+            std::env::set_var("LOGSCOPE_NO_MMAP", "1");
+            let via_read = gpu.load_int8_cache(path, fp);
+            std::env::remove_var("LOGSCOPE_NO_MMAP");
+            let same = via_read.as_ref().map(|m| gpu.int8_cache_diff(&cached, m)).unwrap_or_else(|| "read() path failed to load".into());
+            println!("  int8 cache: mapped load vs read() load — {same}");
+            check("int8 cache: mapped load == read() load", if via_read.is_some() && gpu.int8_cache_bytes(&cached, fp) == via_read.as_ref().and_then(|m| gpu.int8_cache_bytes(m, fp)) { 0.0 } else { 1.0 }, 0.5);
+            let full = std::fs::read(path).expect("read sidecar");
+            let cut = std::path::Path::new("/tmp/ls_int8_cache_test_truncated.bin");
+            std::fs::write(cut, &full[..full.len() * 2 / 3]).expect("write truncated");
+            check("int8 cache: a truncated sidecar is refused", if gpu.load_int8_cache(cut, fp).is_none() { 0.0 } else { 1.0 }, 0.5);
+            let _ = std::fs::remove_file(cut);
+        }
         // stale fingerprint must be rejected
         assert!(gpu.load_int8_cache(path, (bytes.len() as u64, 99999)).is_none(), "stale cache must be rejected");
         let prompt = [5u32, 9, 1, 7, 3, 2, 8, 4];
@@ -7829,9 +8334,18 @@ gpu argmax {ga} (margin {gm:.3e}) | cross-impl max|Δlogit| {xe:.3e}{}",
             let base = gpu.new_cache(mdl.n_layers, plen + 24, kvd);
             for (pos, &t) in prompt.iter().enumerate() { let _ = gpu.decode_step(&mdl, &base, t, pos); }
             // (a) HOT reference: seed a fresh session from the f32 cache, decode 16 greedy tokens.
-            let cont = |seed_cache: &gpu_kernels::KvCache| -> Vec<u32> {
+            // POISONED before seeding. session_new's cache comes from the buffer pool, and a recycled
+            // buffer still holds the PREVIOUS run's rows — which here are the very rows seeding would
+            // write. So a seed that silently failed (a copy wgpu rejected and logged as non-fatal: it
+            // happened, see demote_cache) left a cache that was already "right", and this check printed
+            // 16/16 OK. With every row set to 3e3 first, an unseeded cache cannot agree with anything.
+            let cont_opt = |seed_cache: Option<&gpu_kernels::KvCache>| -> Vec<u32> {
                 let mut s = gpu.session_new(&mdl, plen + 24, 7);
-                gpu.seed_from_prefix(&mdl, &mut s, seed_cache, plen);
+                for li in 0..mdl.n_layers {
+                    s.cache.k[li] = gpu.upload(&vec![3.0e3f32; (plen + 24) * kvd], plen + 24, kvd);
+                    s.cache.v[li] = gpu.upload(&vec![3.0e3f32; (plen + 24) * kvd], plen + 24, kvd);
+                }
+                if let Some(sc) = seed_cache { gpu.seed_from_prefix(&mdl, &mut s, sc, plen); }
                 s.pos = plen;
                 s.logits = gpu.decode_step(&mdl, &s.cache, prompt[plen - 1], plen - 1);
                 let sp = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 0, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
@@ -7839,7 +8353,13 @@ gpu argmax {ga} (margin {gm:.3e}) | cross-impl max|Δlogit| {xe:.3e}{}",
                 gpu.stream_session(&mdl, &mut s, &mut seen, 16, None, &sp, &mut rng, &|| false, |t| { out.push(t); true });
                 out
             };
+            let cont = |seed_cache: &gpu_kernels::KvCache| cont_opt(Some(seed_cache));
             let hot = cont(&base);
+            // THE CONTROL: no seeding at all must NOT reproduce the hot continuation. If it does, the
+            // agreement below proves nothing about seeding.
+            let unseeded = cont_opt(None);
+            let unseeded_agree = hot.iter().zip(&unseeded).take_while(|(a, b)| a == b).count();
+            check("kv tier control: an UNSEEDED (poisoned) cache does not reproduce the continuation", if unseeded_agree < 4 { 0.0 } else { 1.0 }, 0.5);
             // (b) COLD path: demote → download to host bytes → upload → promote → seed.
             let q = gpu.demote_cache(&base, plen, kvd);
             let to_bytes = |t: &gpu_kernels::Tensor| -> Vec<u8> {
@@ -8406,17 +8926,42 @@ gpu argmax {ga} (margin {gm:.3e}) | cross-impl max|Δlogit| {xe:.3e}{}",
             gpu_kernels::SamplerParams { temperature: 0.4, top_k: 64, top_p: 0.9,  repeat_penalty: 1.1,  repeat_last_n: 64, min_p: 0.1  },
         ];
         let (mut trials, mut agree, mut hard_miss) = (0usize, 0usize, 0usize);
+        let (mut passes_old, mut passes_new, mut plain_old, mut plain_new, mut plain_n) = (0usize, 0usize, 0usize, 0usize, 0usize);
         let mut sd = 0xabcd_1234_u64;
         let mut rf = move || { sd ^= sd << 13; sd ^= sd >> 7; sd ^= sd << 17; ((sd >> 40) as f32 / 16_777_216.0) * 12.0 - 6.0 };
         for trial in 0..60 {
             for sp in &cases {
                 let logits: Vec<f32> = (0..vocab).map(|_| rf()).collect();
                 let hist_len = (trial * 7) % 80;
-                let recent: Vec<u32> = (0..hist_len).map(|j| (((trial + 3) * 131 + j * 17) % vocab) as u32).collect();
+                // ADVERSARIAL HISTORY on odd trials: the recent tokens ARE the raw top logits, so the
+                // penalty reshuffles the head of the distribution and the post-penalty top-k reaches
+                // well past the raw top-k. With arbitrary ids (the even trials) a penalized token is
+                // almost never near the top, and a candidate search that stopped at exactly top_k raw
+                // picks would pass every one of them.
+                let recent: Vec<u32> = if trial % 2 == 1 {
+                    let mut ix: Vec<usize> = (0..vocab).collect();
+                    ix.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+                    ix[..hist_len.min(64)].iter().rev().map(|&i| i as u32).collect()
+                } else { (0..hist_len).map(|j| (((trial + 3) * 131 + j * 17) % vocab) as u32).collect() };
                 let seed = 0x5eed_0000u64 + trial as u64 * 7919;
                 // CPU
                 let mut rc = seed | 1;
                 let want = gpu_kernels::pick(&logits, sp, &recent, &mut rc);
+                // PASSES over the vocabulary the GPU sampler needs for these inputs: the old bound
+                // (top_k + distinct penalized, capped at 128) vs the tight one (raw-descending picks
+                // until top_k of them are unpenalized). Computed here because a pass count inside one
+                // dispatch is not observable from outside it.
+                {
+                    let n_pen = sp.repeat_last_n.min(recent.len()).min(64);
+                    let pen: std::collections::BTreeSet<u32> = if sp.repeat_penalty != 1.0 { recent[recent.len() - n_pen..].iter().copied().collect() } else { Default::default() };
+                    let cap = (sp.top_k + pen.len()).min(128).min(vocab);
+                    let mut ord: Vec<usize> = (0..vocab).collect();
+                    ord.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+                    let (mut clean, mut tight) = (0usize, 0usize);
+                    for &i in ord.iter().take(cap) { tight += 1; if !pen.contains(&(i as u32)) { clean += 1; if clean >= sp.top_k { break; } } }
+                    passes_old += cap; passes_new += tight;
+                    if trial % 2 == 0 { plain_old += cap; plain_new += tight; plain_n += 1; }
+                }
                 // GPU: 1 deposit slot + 64-ring seeded with the same trailing history
                 let rcap = 64usize;
                 let mut o_init = vec![0u32; 1 + rcap];
@@ -8457,6 +9002,8 @@ gpu argmax {ga} (margin {gm:.3e}) | cross-impl max|Δlogit| {xe:.3e}{}",
             }
         }
         println!("  sample-at step-wise: {agree}/{trials} identical picks ({} knife-edge, {} hard)", trials - agree - hard_miss, hard_miss);
+        println!("  sample-at passes over the vocabulary per pick — ordinary histories: {:.1} -> {:.1}; all trials incl. the adversarial half (history = the raw top logits): {:.1} -> {:.1}",
+                 plain_old as f64 / plain_n.max(1) as f64, plain_new as f64 / plain_n.max(1) as f64, passes_old as f64 / trials as f64, passes_new as f64 / trials as f64);
         check("sample-at == cpu pick (step-wise)", if hard_miss == 0 && agree * 1000 >= trials * 995 { 0.0 } else { 1.0 }, 0.5);
     }
     // (b) END-TO-END: windowed GPU-sampled decode vs a CPU-sampled loop over the IDENTICAL
@@ -8896,6 +9443,17 @@ gpu argmax {ga} (margin {gm:.3e}) | cross-impl max|Δlogit| {xe:.3e}{}",
         check("degraded (safe-kernel) decode == fast-path decode", e, 1e-4);
     }
 
+    // NO REJECTED GPU COMMANDS. The engine logs a validation error as "non-fatal" and carries on, and
+    // every check above judges OUTPUT — which can be right by accident. It was: a promote_cache that
+    // restored a 6-row prefix as ONE row made seeding overrun its source; wgpu rejected the copy, the
+    // seed silently did not happen, the recycled session buffer already held the right rows, and this
+    // run printed "16/16 tokens agree — OK" with exit 0. The only trace was two lines on stderr.
+    // DEVICE_ERRORS already counted them; nothing read it.
+    {
+        let de = gpu_kernels::DEVICE_ERRORS.load(std::sync::atomic::Ordering::Relaxed);
+        println!("  device errors logged during this run: {de}");
+        check("no GPU command was rejected (validation / internal device errors)", de as f32, 0.0);
+    }
     println!();
     println!("  pipeline cache: {} unique compute pipelines built and reused across all dispatches", gpu.pipeline_count());
     if fails == 0 { println!("ALL KERNELS VALIDATED ON GPU ✓"); }

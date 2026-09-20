@@ -204,7 +204,61 @@ As of this pass, the following is real, running code, not just this document:
   action), stops the run and names the lane rather than burning the step budget. See
   `AgentRun::lane_refusals` / `Stop::LaneRefused` in `workspace_exec.rs`.
 
-**Still not built:** open question 1 (the focusing-effect measurement) needs an actual run, not
+* **Selection now binds deployment (`logscope-fan/src/deploy.rs`).** Until this pass the list
+  above overstated what staffing did: `stage_lane` copied **only `owns`** from the selected spec.
+  The `tools` whitelist — the first failure this document names — was parsed, validated against
+  the runtime's tool list, and dropped: a staffed bee ran with all thirteen tools and was taught
+  all thirteen. Now:
+  * `deploy::Confinement::of(spec)` carries lane **and** whitelist as one value. It exists
+    because `owns == []` means *read-only* in a `WorkerSpec` and *unrestricted* in a `Workspace`;
+    `Lane { ReadOnly, Paths }` makes that a type instead of a convention.
+  * `Workspace::apply` — the one funnel every tool call passes — refuses a call outside the
+    whitelist, names what the worker *does* have, and tells it to stop rather than work around it.
+  * `system_prompt` goes through `confine_prompt`: menu lines and the essays that teach only an
+    absent tool are removed, and the worker is told its list once. No whitelist = the prompt is
+    unchanged byte for byte.
+  * `validate` refuses the two specs that would deploy as "everything": a write tool with no lane
+    (`WriteWithoutLane`) and no tools at all (empty reads as "all" on the runtime side).
+
+* **The four decisions have one caller.** `deploy::plan` runs WHO (`roster::staff`) → WHAT
+  (`Confinement`) → HOW MANY (`fan_policy::decide`, moved into this crate; it had no caller) →
+  WHERE (`hive::place` / `place_fan`; also no caller) and returns a `Deployment` whose `trail`
+  records each stage's decision and reason in order. Two rules live in the join: an ambiguous WHO
+  stops the pipeline before width or placement, and a worker that can write is never fanned over
+  its own lane. `hive::Job` gained `turns`, because a tool loop pays the link once per turn and
+  `place` was charging it once per job.
+
+* **Heroes: workers whose brain is a machine (`logscope-fan/src/hero.rs`).** A model worker pays
+  a full generation for every step, including the steps that carry no judgement ("the compiler
+  named `src/ui.rs:88`, so read there"). A `Hero` has a `WorkerSpec` like any bee — so the lane and
+  whitelist enforcement above applies to it unchanged — but its states are **tool calls** and its
+  edges are **guards on what came back**: `ok`, `failed`, `contains`, `matches` (a `{name:class}`
+  pattern that captures into named slots and advances a cursor), `visits>N` loop bounds, `sub`
+  hero calls with a depth bound, and explicit ends (`done`, `fail`, `yield <reason>`). No RNG: the
+  same observations give the same run. bot-arena's generative FSMs import as the degenerate case
+  (`Machine::from_weighted_graph`).
+  * **Context-gated activation.** A hero with a `Gate` is a reflex: after a model worker's turn the
+    run shows THAT TURN's observation to the stable (`step_turn`), and the first hero whose gate
+    matches — and whose tools the staffed worker's whitelist permits — runs through the run's own
+    `Workspace` and appends its report for the model's next turn. A shut gate costs a string scan.
+    Seeds: `error-locator`, `test-triage`, `path-prefetch` (fires before turn one). On in the app;
+    `LOGSCOPE_REFLEXES=0` turns it off. `AgentRun::reflex_history()` says what fired and how it ended.
+  * **Adding one.** `hero::HERO_FORMAT` is the text form; `:enlist` recognises a reply containing
+    `State NAME:` lines, validates it against the real stable (tools, reachability, a fallthrough
+    edge on every state, sub-hero references), refuses by state/tool/line, and hands it to every
+    later run. Its spec goes on the roster too: a hero is a worker.
+  * **Not measured:** wall-clock saving. What is asserted is structural — the read happened with no
+    model turn, and the next prompt carries it. A live-model A/B (turns to green, with and without)
+    is the number that would justify default-on, and it does not exist yet.
+
+**Still not built:** heroes are not yet STAFFED to whole tasks (a hero with no gate can only be a
+sub-hero today — `deploy::plan` does not know a roster entry may be a machine); there is no
+`:queen-hero` that shows the Queen `HERO_FORMAT`; enlisted heroes, like the roster, do not persist
+across a restart. `deploy::plan` is a tested library with **no caller in the app yet** — the
+runtime half above is wired through `stage_lane`, but width and placement are still not consulted
+by `:agent` / `:fan-agent` (a `:deploy <task>` dry-run that prints the trail is the obvious first
+consumer). `Confinement` also carries the spec's `context`, `constraints` and `success` lists and
+the run does not use them yet. Open question 1 (the focusing-effect measurement) needs an actual run, not
 code. `hive.rs`'s placement logic (`Reach::Anywhere` vs `Colocated`) is untouched — there is no
 remote/multi-box dispatch path yet to exercise it. Per-branch staffing in a fan-out (today
 `:fan-agent`/`:docs` staff the WHOLE task once, not each branch's sub-task independently) is not
