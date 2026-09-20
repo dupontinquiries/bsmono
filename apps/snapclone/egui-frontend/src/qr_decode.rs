@@ -113,52 +113,84 @@ impl NoCode {
 mod tests {
     use super::*;
 
-    /// A real QR code, encoded by `rqrr`'s own test vector path.
+
+    /// Render a real QR code to a luma plane via the kit's `qrbig`, which is
+    /// Nayuki's `qrcodegen` — a genuine encoder with Reed-Solomon, masking and
+    /// format info.
     ///
-    /// NOT `uikit_egui::qr`, and this is the finding that reshaped the module.
-    /// The kit is explicit in its own header: *"there is no Reed-Solomon
-    /// encoder, no mask evaluation and no format information. A real QR reader
-    /// will not decode it. It is a QR-shaped identicon."*
-    ///
-    /// So a round trip through the app's own renderer would have been
-    /// meaningless — it would have proved the decoder rejects a picture that
-    /// is not a QR code, which is correct behaviour dressed as a failure. The
-    /// vectors below are hand-built module grids for a Version 1 code.
-    fn v1_code() -> (Vec<Vec<bool>>, &'static str) {
-        // A minimal valid Version 1-L code carrying "sc-aabbccdd" would need an
-        // encoder this crate does not have and should not grow. Instead the
-        // test below drives the DECODER's failure paths, which are pure
-        // arithmetic over the input, and the successful-decode path is left to
-        // the device: it needs a real code on a real screen.
-        (Vec::new(), "sc-aabbccdd")
+    /// NOT `uikit_egui::qr`, which its own header calls a "QR-shaped
+    /// identicon": "there is no Reed-Solomon encoder, no mask evaluation and
+    /// no format information. A real QR reader will not decode it." A round
+    /// trip through THAT would assert that a real decoder rejects a decorative
+    /// image — correct behaviour dressed as a passing test.
+    fn render(payload: &str, scale: usize, quiet: usize) -> (Vec<u8>, usize, usize) {
+        let m = uikit_egui::qrbig::encode(payload.as_bytes()).expect("qrcodegen encodes this");
+        let side = (m.size + quiet * 2) * scale;
+        let mut luma = vec![255u8; side * side];
+        for y in 0..m.size {
+            for x in 0..m.size {
+                if !m.get(x, y) {
+                    continue;
+                }
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let px = (x + quiet) * scale + dx;
+                        let py = (y + quiet) * scale + dy;
+                        luma[py * side + px] = 0;
+                    }
+                }
+            }
+        }
+        (luma, side, side)
     }
 
-    /// THE SUCCESSFUL DECODE IS NOT TESTED HERE, and the reason is worth
-    /// stating rather than leaving as a gap.
-    ///
-    /// A round trip needs an ENCODER. `uikit_egui::qr` is not one — its own
-    /// header says so: "there is no Reed-Solomon encoder, no mask evaluation
-    /// and no format information. A real QR reader will not decode it." So
-    /// encoding with the app's renderer and decoding here would assert that a
-    /// real decoder rejects a decorative image, which it should, and would
-    /// prove nothing about scanning.
-    ///
-    /// Adding a real encoder to test the decoder is the wrong trade: it is a
-    /// second dependency and a second implementation of the format, to verify
-    /// a library that ships its own test vectors. What is verified here is
-    /// everything this module ADDS around `rqrr` — the frame validation, the
-    /// three distinguishable failures, and the hints — which is where the bugs
-    /// in a thin wrapper actually live.
-    ///
-    /// `TODO_end_to_end.md` asks "does the camera feed reach the decoder, and
-    /// does a decode actually fire". The first half is now answerable in code;
-    /// the second needs a code on a screen and a camera pointed at it.
+    /// THE ROUND TRIP, now that snapclone encodes a real code. This is the
+    /// question `TODO_end_to_end.md` asks — "does a decode actually fire" —
+    /// and it could not be answered while the app's own code was undecodable.
     #[test]
-    fn the_decode_path_is_reachable_and_typed() {
-        let (grid, payload) = v1_code();
-        assert!(grid.is_empty(), "see this test's docs: no encoder here");
-        assert!(crate::qr::parse_payload(payload).is_some(),
-                "the payload form the scanner will see is one the dialog accepts");
+    fn a_real_encoded_code_decodes_back_to_its_payload() {
+        let (luma, w, h) = render("sc-aabbccdd", 6, 4);
+        let got = decode(&luma, w, h).expect("a clean render of a real code must decode");
+        assert_eq!(got.payload, "sc-aabbccdd");
+    }
+
+    /// Every form the dialog accepts must survive the camera, or the scanner
+    /// works for some codes and not others.
+    #[test]
+    fn every_accepted_payload_form_survives_a_round_trip() {
+        for p in ["sc-aabbccdd", "sc-aabbccdd:9876",
+                  "snapclone://sc-aabbccdd", "snapclone://sc-aabbccdd:9876"] {
+            let (luma, w, h) = render(p, 6, 4);
+            let got = decode(&luma, w, h).unwrap_or_else(|e| panic!("{p} failed: {e:?}"));
+            assert_eq!(got.payload, p);
+            assert!(crate::qr::parse_payload(&got.payload).is_some(),
+                    "{p} decoded but the dialog rejects it");
+        }
+    }
+
+    /// TWO SNAPCLONES CAN NOW SCAN EACH OTHER, which is what "add a friend by
+    /// QR" needs and what the identicon made impossible. The id the app shows
+    /// is the id another instance reads.
+    #[test]
+    fn the_code_this_app_shows_is_one_this_app_can_read() {
+        let id = "sc-0123abcd";
+        let (luma, w, h) = render(id, 5, 4);
+        let got = decode(&luma, w, h).expect("our own code must be scannable");
+        let parsed = crate::qr::parse_payload(&got.payload).expect("and parseable");
+        assert_eq!(got.payload, id);
+        let _ = parsed;
+    }
+
+    /// The bounds are carried so a viewfinder can draw what it latched, and
+    /// must land inside the frame rather than being a placeholder.
+    #[test]
+    fn the_decoded_corners_are_inside_the_frame() {
+        let (luma, w, h) = render("sc-aabbccdd", 6, 4);
+        let got = decode(&luma, w, h).unwrap();
+        for (x, y) in got.corners {
+            assert!(x >= 0 && (x as usize) < w, "x {x} outside 0..{w}");
+            assert!(y >= 0 && (y as usize) < h, "y {y} outside 0..{h}");
+        }
     }
 
     /// AN EMPTY FRAME IS NOT AN ERROR, and says nothing to the user — a

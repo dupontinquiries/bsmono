@@ -71,7 +71,11 @@ crypto-kit = { path = "../../../shared/crypto-kit" }
 share-kit = { path = "../../../shared/share-kit" }
 device-kit = { path = "../../../shared/device-kit" }
 egui = "0.34"
-uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+# `qrbig` for a REAL QR code. The kit's default `qr` is a QR-shaped identicon --
+# its own header says "there is no Reed-Solomon encoder ... A real QR reader
+# will not decode it" -- so snapclone was showing a code that the scanner it
+# ships could not read. voiceterm-egui already turns this on.
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui", features = ["qrbig"] }
 uikit-gesture = { path = "../../../shared/uikit/crates/uikit-gesture" }
 snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../../shared/settings-kit" }
