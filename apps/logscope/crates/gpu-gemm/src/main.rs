@@ -7761,6 +7761,21 @@ still pass, which is why this one exists."
             check("int8 cache: no .tmp left behind", if path.with_extension("tmp").exists() { 1.0 } else { 0.0 }, 0.5);
         }
         let cached = gpu.load_int8_cache(path, fp).expect("load cache");
+        // The loader MAPS the sidecar now; LOGSCOPE_NO_MMAP=1 reads it whole, as it always did. Both must
+        // hand back the same model — and a truncated file must be refused, not half-loaded.
+        {
+            std::env::set_var("LOGSCOPE_NO_MMAP", "1");
+            let via_read = gpu.load_int8_cache(path, fp);
+            std::env::remove_var("LOGSCOPE_NO_MMAP");
+            let same = via_read.as_ref().map(|m| gpu.int8_cache_diff(&cached, m)).unwrap_or_else(|| "read() path failed to load".into());
+            println!("  int8 cache: mapped load vs read() load — {same}");
+            check("int8 cache: mapped load == read() load", if via_read.is_some() && gpu.int8_cache_bytes(&cached, fp) == via_read.as_ref().and_then(|m| gpu.int8_cache_bytes(m, fp)) { 0.0 } else { 1.0 }, 0.5);
+            let full = std::fs::read(path).expect("read sidecar");
+            let cut = std::path::Path::new("/tmp/ls_int8_cache_test_truncated.bin");
+            std::fs::write(cut, &full[..full.len() * 2 / 3]).expect("write truncated");
+            check("int8 cache: a truncated sidecar is refused", if gpu.load_int8_cache(cut, fp).is_none() { 0.0 } else { 1.0 }, 0.5);
+            let _ = std::fs::remove_file(cut);
+        }
         // stale fingerprint must be rejected
         assert!(gpu.load_int8_cache(path, (bytes.len() as u64, 99999)).is_none(), "stale cache must be rejected");
         let prompt = [5u32, 9, 1, 7, 3, 2, 8, 4];

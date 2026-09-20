@@ -13653,7 +13653,16 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
     pub fn load_int8_cache(&self, path: &std::path::Path, fp: (u64, u64)) -> Option<Model> {
         // In q4 mode the int8 cache (keyed only on the GGUF) would hand back q8 weights — bypass it.
         if std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok() { return None; }
-        let data = std::fs::read(path).ok()?;
+        // MAPPED, not read. This was `std::fs::read(path)`: the whole sidecar — model-sized — copied
+        // into anonymous RAM and then uploaded tensor by tensor OUT of that copy, on every reload. On
+        // unified memory that is the model twice at the moment it is being loaded. `Rd` only needs a
+        // byte slice, and `read_tensor` already copies one tensor at a time; a read-only mapping
+        // pages in on demand and is reclaimable file cache rather than our allocation. Same escape
+        // hatch as the GGUF (LOGSCOPE_NO_MMAP=1 reads it whole). If a mapping ever came back as zeros
+        // (the FUSE case file_bytes documents) the magic below fails and the caller falls back to the
+        // GGUF — the safe direction. The save side never truncates in place (tmp + rename), so a
+        // mapped sidecar cannot be pulled out from under this.
+        let data = crate::file_bytes(path.to_str()?).ok()?;
         let mut r = Rd { d: &data, p: 0 };
         if r.take(6)? != b"LSI8C\x04" || (r.u64()?, r.u64()?) != fp { return None; }
         let (d, h, vocab) = (r.u32()? as usize, r.u32()? as usize, r.u32()? as usize);
