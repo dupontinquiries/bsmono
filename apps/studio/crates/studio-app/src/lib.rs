@@ -56,6 +56,7 @@ pub mod looping;
 pub mod midi;
 pub mod mix_assistant;
 pub mod multicam_cut;
+pub mod touchup_job;
 pub mod mixer_panel;
 pub mod morph_pad;
 pub mod program_panel;
@@ -3074,6 +3075,8 @@ pub struct App {
     export_note: String,
     /// A render in flight, drained once per frame into the tracker.
     export_run: Option<export::Run>,
+    /// A stabilize/clean-plate render in flight, and the clip it belongs to.
+    touchup_run: Option<touchup_job::Job>,
     export_done: Vec<std::path::PathBuf>,
     export_progress: (usize, usize, f32),
     /// The clip a bscale bounce belongs to while its run is in flight;
@@ -3251,6 +3254,7 @@ impl Default for App {
               export_dialog: None,
               export_note: String::new(),
               export_run: None,
+              touchup_run: None,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
               upscale_clip: None,
@@ -3894,6 +3898,7 @@ impl eframe::App for App {
         self.archive_window(ctx);
         self.export_dialog_window(ctx);
         self.export_tracker_window(ctx);
+        self.touchup_tracker(ctx);
 
         // ── files dropped on the window ──────────────────────────────────
         //
@@ -5516,6 +5521,7 @@ impl App {
                             else { self.lexicon.to_tokens() });
                     }
                 }
+                palette::ShellVerb::TouchUpStabilize(kind) => self.start_stabilize(kind),
                 palette::ShellVerb::MulticamLevel { group, bus } => {
                     // Defaults chosen to be watchable rather than clever: no
                     // shot under a second, 3 dB of hysteresis so a level
@@ -6382,6 +6388,74 @@ impl App {
 
     /// The render tracker: a bar that moves, the files as they land, and a
     /// cancel that means soon. Repaint is requested while a run is live —
+    /// Raise a stabilize ticket for the selected clip and render it on a
+    /// worker. Handles are half a second each side, so a later nudge of the
+    /// trim still lands inside the fixed picture.
+    fn start_stabilize(&mut self, kind: palette::StabilizeKind) {
+        use studio_video::stabilize::{Budget, Flavor};
+        if self.touchup_run.is_some() {
+            self.studio.status = "a touch-up is already rendering".into();
+            return;
+        }
+        let Some(&id) = self.studio.selection.first() else {
+            self.studio.status = "select the clip to stabilize first".into();
+            return;
+        };
+        let project = &self.studio.session.doc.project;
+        let Some(clip) = project.clips.get(&id).cloned() else { return };
+        let Some(src) = project.sources.get(&clip.source).cloned() else { return };
+        if !src.has_video {
+            self.studio.status = "that clip has no picture to stabilize".into();
+            return;
+        }
+        let path = std::path::PathBuf::from(&src.path);
+        let Ok(probe) = studio_video::probe(&path) else {
+            self.studio.status = format!("could not read {}", src.path);
+            return;
+        };
+        let (flavor, budget) = match kind {
+            // Each flavour gets the crop it actually needs: locking a shot
+            // costs the most, de-jerking the least. A single budget for all
+            // three would either starve Still or overspend Dejerk.
+            palette::StabilizeKind::Still => (Flavor::Still, Budget { max_zoom: 1.15 }),
+            palette::StabilizeKind::Smooth => (Flavor::Smooth { sigma: 12.0 }, Budget { max_zoom: 1.10 }),
+            palette::StabilizeKind::Dejerk => (Flavor::Dejerk { threshold: 3.0 }, Budget { max_zoom: 1.04 }),
+        };
+        let ticket = studio_video::touchup::Ticket {
+            clip: id, source: clip.source, path: path.clone(),
+            src_in: clip.src_in, len: clip.len, handle: 0.5,
+            fixes: vec![studio_video::touchup::Fix::Stabilize { flavor, budget }],
+            note: format!("{kind:?} from the palette"),
+        };
+        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "shot".into());
+        let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(std::env::temp_dir);
+        let mut out = dir.join(format!("{stem}-touchup.mp4"));
+        let mut n = 2;
+        while out.exists() { out = dir.join(format!("{stem}-touchup-{n}.mp4")); n += 1; }
+        let size = studio_video::framepipe::Size { w: probe.width, h: probe.height };
+        self.touchup_run = Some(touchup_job::start(ticket, out, size, probe.fps.max(1.0)));
+        self.studio.status = format!("stabilizing ({kind:?}) — this runs in the background");
+    }
+
+    /// Poll the touch-up worker. Same shape as the export tracker: egui only
+    /// repaints on input, and a render is not input.
+    fn touchup_tracker(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.touchup_run else { return };
+        let mut finished = false;
+        while let Ok(e) = job.rx.try_recv() {
+            match e {
+                touchup_job::Event::Note(m) => self.studio.status = m,
+                touchup_job::Event::Done(v) => { self.studio.land_touchup(&v); finished = true; }
+                touchup_job::Event::Failed(e) => {
+                    self.studio.status = format!("touch-up failed: {e}");
+                    finished = true;
+                }
+            }
+        }
+        if finished { self.touchup_run = None; return; }
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    }
+
     /// egui only redraws on input, and a background render is not input.
     fn export_tracker_window(&mut self, ctx: &egui::Context) {
         let Some(run) = &self.export_run else { return };

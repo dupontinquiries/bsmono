@@ -39,6 +39,11 @@ pub enum Act {
     Shell(ShellVerb),
 }
 
+/// The stabilizer flavours, as something a menu can carry (the engine's own
+/// `Flavor` holds a tracked path and is not `Copy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StabilizeKind { Still, Smooth, Dejerk }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellVerb {
     /// Open a different project. A SHELL verb, not an `Op`: replacing
@@ -72,6 +77,9 @@ pub enum ShellVerb {
     /// an `Op` list, because the plan depends on the MIX: only the shell
     /// holds the decoded audio the control channel is rendered from.
     MulticamLevel { group: studio_core::GroupId, bus: BusId },
+    /// Stabilize the selected clip with one of the flavours. A shell verb:
+    /// it renders a file in the background and then relinks the clip.
+    TouchUpStabilize(StabilizeKind),
     CallToggle,
     CallMute,
     CallPushToTalk,
@@ -198,6 +206,8 @@ pub enum Ask {
     /// channel drives it.
     MulticamLevelGroup,
     MulticamLevelBus(studio_core::GroupId),
+    /// Which stabilizer flavour to run on the selected clip.
+    StabilizeFlavor,
     /// Which bus feeds which — the input side, chosen from the receiver.
     BusInputPick(BusId),
     MuteTrack,
@@ -267,6 +277,8 @@ pub fn root() -> Vec<Choice> {
         // Markers: the one request both the FL Studio and kdenlive
         // communities make in the same words.
         c("drop a marker here", None, Then::Do(Act::Shell(ShellVerb::MarkerHere))),
+        c("stabilize the selected clip", Some("still / smooth / de-jerk"),
+          Then::Ask(Ask::StabilizeFlavor)),
         c("cut a camera group on the beat (multicam)",
           Some("switch angles on the beat grid"), Then::Ask(Ask::MulticamGroup)),
         c("cut a camera group to a control channel (multicam)",
@@ -558,6 +570,17 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
                 }
             }).collect()
         }
+        Ask::StabilizeFlavor => vec![
+            Choice { label: "smooth-cam (keep the move, lose the shake)".into(),
+                     hint: Some("a walk-and-talk or a handheld push".into()),
+                     then: Then::Do(Act::Shell(ShellVerb::TouchUpStabilize(StabilizeKind::Smooth))) },
+            Choice { label: "still-cam (lock it off)".into(),
+                     hint: Some("a locked shot that was handheld by accident".into()),
+                     then: Then::Do(Act::Shell(ShellVerb::TouchUpStabilize(StabilizeKind::Still))) },
+            Choice { label: "punch-in and de-jerk (least crop)".into(),
+                     hint: Some("a deliberate pan with a bump in it".into()),
+                     then: Then::Do(Act::Shell(ShellVerb::TouchUpStabilize(StabilizeKind::Dejerk))) },
+        ],
         Ask::MulticamLevelGroup => project.groups.iter()
             .filter(|(id, _)| studio_video::multicam::from_group(project, **id).is_ok())
             .map(|(id, g)| plain(g.name.clone(), Then::Ask(Ask::MulticamLevelBus(*id))))
@@ -709,6 +732,23 @@ mod tests {
         let found = filter(&r, "collaborator");
         assert!(found.len() >= 4, "only found {}: {:?}", found.len(),
                 found.iter().map(|c| &c.label).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_stabilizer_offers_its_flavours_and_names_what_each_is_for() {
+        let r = root();
+        assert!(!filter(&r, "stabilize").is_empty(), "reachable by its own word");
+        let flavours = candidates(Ask::StabilizeFlavor, &Project::default());
+        assert_eq!(flavours.len(), 3);
+        // Every flavour says what it is FOR, not just what it is called: the
+        // difference between them is a judgement about the shot.
+        assert!(flavours.iter().all(|c| c.hint.is_some()), "{:?}", flavours.iter().map(|c| &c.label).collect::<Vec<_>>());
+        let kinds: Vec<StabilizeKind> = flavours.iter().map(|c| match c.then {
+            Then::Do(Act::Shell(ShellVerb::TouchUpStabilize(k))) => k,
+            _ => panic!("{:?}", c.label),
+        }).collect();
+        assert_eq!(kinds, vec![StabilizeKind::Smooth, StabilizeKind::Still, StabilizeKind::Dejerk],
+                   "smooth first: it is the one that fits most shots");
     }
 
     #[test]
