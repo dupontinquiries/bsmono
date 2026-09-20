@@ -55,6 +55,7 @@ pub mod library;
 pub mod looping;
 pub mod midi;
 pub mod mix_assistant;
+pub mod multicam_cut;
 pub mod mixer_panel;
 pub mod morph_pad;
 pub mod program_panel;
@@ -5513,6 +5514,20 @@ impl App {
                         self.studio.status = format!("voice vocabulary: {}",
                             if self.lexicon.to_tokens().is_empty() { "common only".into() }
                             else { self.lexicon.to_tokens() });
+                    }
+                }
+                palette::ShellVerb::MulticamLevel { group, bus } => {
+                    // Defaults chosen to be watchable rather than clever: no
+                    // shot under a second, 3 dB of hysteresis so a level
+                    // sitting on a threshold does not chatter, and a third of
+                    // a second of settle so a rise through a middle band does
+                    // not cut to the middle angle on its way up.
+                    let rules = studio_video::multicam::Rules {
+                        min_shot: 1.0, hysteresis_db: 3.0, settle: 0.3 };
+                    match multicam_cut::ops(&self.studio.session.doc.project, &self.audio, group, bus, rules) {
+                        Ok((ops, note)) => self.studio.edit(
+                            studio_core::Op::Group { ops }, &format!("multicam: {note}")),
+                        Err(why) => self.studio.status = why,
                     }
                 }
                 palette::ShellVerb::MarkerHere => {

@@ -187,6 +187,10 @@ pub struct Shot {
 pub fn plan(angles: &[Angle], timing: &Timing, choice: &Choice, rules: Rules, length: f64) -> Vec<Shot> {
     if angles.is_empty() || length <= 0.0 { return Vec::new(); }
     // angles from calmest to busiest
+    // Calmest to busiest. A STABLE sort, deliberately: angles that have not
+    // been measured all carry energy 0, and then the caller's own order —
+    // the order the operator put the angles in — is the ranking, rather than
+    // an arbitrary one.
     let mut by_energy: Vec<usize> = (0..angles.len()).collect();
     by_energy.sort_by(|&a, &b| angles[a].energy.partial_cmp(&angles[b].energy).unwrap_or(std::cmp::Ordering::Equal));
     let candidates: Vec<f64> = match (timing, choice) {
@@ -448,6 +452,19 @@ mod tests {
             assert!((moment - clip.pos.to_seconds()).abs() < 1e-6,
                     "the clip reads its own timeline moment: {clip:?} for {s:?}");
         }
+    }
+
+    #[test]
+    fn unmeasured_angles_keep_the_order_they_were_given() {
+        // Every angle at energy 0 (nothing has measured them yet): the
+        // caller's order must survive, because that order is what the app
+        // hands over as the ranking.
+        let mut g = group();
+        for a in g.iter_mut() { a.energy = 0.0; }
+        let c = control(&[(3.0, -40.0), (3.0, -4.0)]);
+        let shots = plan(&g, &Timing::Free, &Choice::ByLevel(c), RULES, 6.0);
+        assert_eq!(shots[0].angle, 0, "quiet -> the first angle given");
+        assert_eq!(shots.last().unwrap().angle, g.len() - 1, "loud -> the last: {shots:?}");
     }
 
     #[test]

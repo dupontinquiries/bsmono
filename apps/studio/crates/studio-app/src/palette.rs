@@ -68,6 +68,10 @@ pub enum ShellVerb {
     /// The voice call over the session's wire: join/leave, mute, and
     /// push-to-talk mode. Shell verbs like the rest of collaboration —
     /// who can hear whom is not a fact about the music.
+    /// Cut a camera group to a control channel's level. A shell verb, not
+    /// an `Op` list, because the plan depends on the MIX: only the shell
+    /// holds the decoded audio the control channel is rendered from.
+    MulticamLevel { group: studio_core::GroupId, bus: BusId },
     CallToggle,
     CallMute,
     CallPushToTalk,
@@ -190,6 +194,10 @@ pub enum Ask {
     /// multicam switcher driven by the project's own beat grid.
     MulticamGroup,
     MulticamEvery(studio_core::GroupId),
+    /// The level-driven variant: which camera group, then which control
+    /// channel drives it.
+    MulticamLevelGroup,
+    MulticamLevelBus(studio_core::GroupId),
     /// Which bus feeds which — the input side, chosen from the receiver.
     BusInputPick(BusId),
     MuteTrack,
@@ -261,6 +269,8 @@ pub fn root() -> Vec<Choice> {
         c("drop a marker here", None, Then::Do(Act::Shell(ShellVerb::MarkerHere))),
         c("cut a camera group on the beat (multicam)",
           Some("switch angles on the beat grid"), Then::Ask(Ask::MulticamGroup)),
+        c("cut a camera group to a control channel (multicam)",
+          Some("loud passages get the busier angle"), Then::Ask(Ask::MulticamLevelGroup)),
         c("control channel from a bus (dummy channel)",
           Some("a silent tap that drives things without being heard"),
           Then::Ask(Ask::ControlTapFrom)),
@@ -547,6 +557,25 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
                     then: Then::Do(Act::Ops(ops)),
                 }
             }).collect()
+        }
+        Ask::MulticamLevelGroup => project.groups.iter()
+            .filter(|(id, _)| studio_video::multicam::from_group(project, **id).is_ok())
+            .map(|(id, g)| plain(g.name.clone(), Then::Ask(Ask::MulticamLevelBus(*id))))
+            .collect(),
+        Ask::MulticamLevelBus(group) => {
+            let taps: Vec<Choice> = project.busses.values().filter(|b| b.silent)
+                .map(|b| plain(b.name.clone(),
+                               Then::Do(Act::Shell(ShellVerb::MulticamLevel { group, bus: b.id }))))
+                .collect();
+            if taps.is_empty() {
+                // Every bus would work as a driver, but a non-silent one is
+                // heard as well as read; pointing at the command that makes
+                // a proper tap is more use than listing busses that would
+                // double the mix.
+                return vec![plain("no control channel yet — make one first".into(),
+                                  Then::Ask(Ask::ControlTapFrom))];
+            }
+            taps
         }
         Ask::ControlTapFrom => project.busses.iter()
             .filter(|(_, b)| !b.silent)  // tapping a tap is not a thing
