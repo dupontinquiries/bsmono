@@ -394,7 +394,9 @@ impl Tokenizer {
             Ok(t) => Ok(t),
             Err(e) => {
                 let Ok(path) = std::env::var("LOGSCOPE_TOKENIZER_GGUF") else { return Err(e) };
-                let bytes = std::fs::read(&path)
+                // Mapped: the donor is a whole model file and only its metadata pages get touched.
+                // (This was fs::read — gigabytes copied in to parse a few MB of vocabulary.)
+                let bytes = crate::file_bytes(&path)
                     .map_err(|io| format!("LOGSCOPE_TOKENIZER_GGUF={path}: {io}"))?;
                 let donor = crate::gguf::parse(&bytes)
                     .map_err(|p| format!("LOGSCOPE_TOKENIZER_GGUF={path}: {p}"))?;

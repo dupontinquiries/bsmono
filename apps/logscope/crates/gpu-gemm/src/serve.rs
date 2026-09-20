@@ -54,7 +54,12 @@ fn main() {
     }
 
     eprintln!("loading model: {model_path}");
-    let bytes = std::fs::read(&model_path).unwrap_or_else(|e| { eprintln!("read {model_path}: {e}"); std::process::exit(1); });
+    // MAPPED, not read. This was `std::fs::read`: the whole GGUF copied into anonymous RAM — and, because
+    // the parsed header below borrows it, held there for the LIFE OF THE SERVER, beside the GPU-resident
+    // model it was loaded into. A permanent doubling, and a hard ceiling at half the machine. The app has
+    // always mapped its GGUF (file_bytes: pages in on demand, reclaimable file cache, LOGSCOPE_NO_MMAP=1
+    // to read it whole on filesystems where mmap misbehaves); the server now does the same.
+    let bytes = gpu_kernels::file_bytes(&model_path).unwrap_or_else(|e| { eprintln!("read {model_path}: {e}"); std::process::exit(1); });
     let g = gguf::parse(&bytes).unwrap_or_else(|e| { eprintln!("parse gguf: {e}"); std::process::exit(1); });
     let tok = Arc::new(Tokenizer::from_gguf(&g).unwrap_or_else(|e| { eprintln!("tokenizer: {e}"); std::process::exit(1); }));
     let gpu = Arc::new(Gpu::new());
