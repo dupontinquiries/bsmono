@@ -11,18 +11,39 @@ path = "src/lib.rs"
 [[bin]]
 name = "voiceterm-egui"
 path = "src/bin/voiceterm_egui.rs"
-required-features = ["app"]
+required-features = ["shell"]
 
 [[bin]]
 name = "terminal-standalone"
 path = "src/bin/terminal_standalone.rs"
-required-features = ["app"]
+required-features = ["shell"]
 
 [features]
 default = ["app"]
 # Default-on so `cargo build --release` (what the build orchestrator runs, no extra flags — see
 # manifest/projects.toml) produces the deploy binary directly, same convention as rusty-board-egui.
-app = ["dep:eframe", "x11", "wayland"]
+app = ["shell", "x11", "wayland", "voice"]
+# `app` without dictation, for targets where whisper-rs cannot build — the
+# static-musl case in `voice` below. Same binary, no listening.
+app-novoice = ["shell", "x11", "wayland"]
+# What the BINARY needs, as opposed to what a full build wants. `required-features`
+# is AND-only, so `app` and `app-novoice` cannot both satisfy a gate naming
+# either of them — they share this one instead.
+shell = ["dep:eframe"]
+
+# Dictation. ON in `app` because it is a voice terminal, and SEPARABLE because
+# it is the only thing here that needs whisper-rs — which needs bindgen, which
+# needs to dlopen libclang at build time.
+#
+# That last step is impossible on a static-musl target: reported from
+# aarch64-unknown-linux-musl as `Unable to find libclang: ... Dynamic loading
+# not supported`. Before this the feature was hardcoded into the uikit-egui
+# dependency line, so `--no-default-features` could not turn it off and there
+# was NO WAY to build this crate on musl at all.
+#
+# With it off, `voice_popup` is a stub with the same API and every voice
+# control is inert. The terminal still works; it just does not listen.
+voice = ["uikit-egui/voice-popup"]
 
 # Display backends, split so a build can pick one.
 #
@@ -75,7 +96,7 @@ peer-handshake = { path = "../../../shared/peer-handshake" }
 # exactly what happened when the model was lifted.
 pane-kit = { path = "../../../shared/pane-kit" }
 egui = "0.34"
-uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui", features = ["qrbig", "voice-popup"] }
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui", features = ["qrbig"] }
 # The Bluetooth transfer half of the acoustic handshake: HandshakePayload
 # now carries bt_addr once trusted, and this is what actually moves bytes
 # once it does. "rfcomm" pulls bluer + tokio — isolated to a single spawned

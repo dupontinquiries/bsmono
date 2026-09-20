@@ -697,7 +697,7 @@ struct VoicetermApp {
     ctrl_p_gesture: uikit_egui::ctrl_p_gesture::GestureTracker,
     /// State for the voice popup Ctrl+P opens (via palette_flow's
     /// SwitchedToVoice transition).
-    voice_popup: uikit_egui::voice_popup::VoicePopup,
+    voice_popup: voiceterm_egui::voice_popup::VoicePopup,
     /// The "about to switch on" / "listening" badge drawn beside the
     /// palette's own query box, with its own hold-to-cancel timer.
     mic_indicator: uikit_egui::mic_indicator::MicIndicator,
