@@ -628,7 +628,7 @@ mod tests {
         }
         p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "drum bus".into(),
             parent: None, gain: 1.0, chain: vec![], sends: vec![],
-            muted: false } }).unwrap();
+            muted: false, silent: false } }).unwrap();
         p
     }
 

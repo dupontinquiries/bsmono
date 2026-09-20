@@ -184,6 +184,19 @@ pub struct Bus {
     /// solo, which keeps the two rules independent rather than needing a
     /// combined truth table.
     pub muted: bool,
+    /// A SILENT bus sums, processes and fades exactly as usual, and then
+    /// feeds nothing: not its parent, not its sends. It is a measurement
+    /// tap — a "dummy channel" in the FL Studio sense. Tracks and busses
+    /// feed it through ordinary sends (the splitter: a send is already a
+    /// parallel copy), it renders like any other bus, and
+    /// `studio_audio::bus_signal` reads its output to drive something —
+    /// a meter, a sidechain, or the multicam switcher's camera choice.
+    ///
+    /// Distinct from `muted`, and deliberately not the same flag: a muted
+    /// bus is DROPPED before its chain runs, so it costs nothing and has no
+    /// output to read. A silent bus is fully rendered and then not mixed.
+    #[serde(default)]
+    pub silent: bool,
 }
 
 /// The project: tracks, clips, the sources they reference, and the bus graph
@@ -861,6 +874,10 @@ pub enum Op {
     /// a listening choice for right now, not an edit worth undoing or
     /// shipping to a collaborator.
     SetBusFlags { id: BusId, muted: bool },
+    /// See [`Bus::silent`]. A separate op rather than another field on
+    /// `SetBusFlags` so journals and macros written before silent busses
+    /// existed still deserialize.
+    SetBusSilent { id: BusId, silent: bool },
     SetBusChain { id: BusId, chain: Vec<Effect> },    /// Replaces the whole sends list, like `SetEffects` does for a clip's
     /// effects — the inverse is then just "the old vector," no per-send
     /// add/remove bookkeeping needed.
@@ -1302,6 +1319,12 @@ impl Project {
                 let b = self.busses.get_mut(id).ok_or(EditError::NoSuchBus(*id))?;
                 let inv = Op::SetBusFlags { id: *id, muted: b.muted };
                 b.muted = *muted;
+                Ok(inv)
+            }
+            Op::SetBusSilent { id, silent } => {
+                let b = self.busses.get_mut(id).ok_or(EditError::NoSuchBus(*id))?;
+                let inv = Op::SetBusSilent { id: *id, silent: b.silent };
+                b.silent = *silent;
                 Ok(inv)
             }
             Op::SetBusChain { id, chain } => {
@@ -2106,7 +2129,7 @@ mod tests {
     }
 
     fn bus(id: u64, name: &str, parent: Option<u64>) -> Bus {
-        Bus { id: BusId(id), name: name.into(), parent: parent.map(BusId), gain: 1.0, chain: Vec::new(), sends: Vec::new(), muted: false }
+        Bus { id: BusId(id), name: name.into(), parent: parent.map(BusId), gain: 1.0, chain: Vec::new(), sends: Vec::new(), muted: false, silent: false }
     }
 
     #[test]
@@ -2265,6 +2288,21 @@ mod tests {
     }
 
     #[test]
+    fn silent_is_its_own_flag_undoes_and_loads_from_a_project_that_predates_it() {
+        let mut p = Project::default();
+        p.apply(&Op::AddBus { bus: bus(1, "Control", None) }).unwrap();
+        let inv = p.apply(&Op::SetBusSilent { id: BusId(1), silent: true }).unwrap();
+        assert!(p.busses[&BusId(1)].silent && !p.busses[&BusId(1)].muted, "silent is not mute");
+        p.apply(&inv).unwrap();
+        assert!(!p.busses[&BusId(1)].silent, "undo restores it");
+        assert!(p.apply(&Op::SetBusSilent { id: BusId(9), silent: true }).is_err());
+        // a bus serialized before silent existed still loads
+        let old = r#"{"id":4,"name":"Drums","parent":null,"gain":1.0,"chain":[],"sends":[],"muted":false}"#;
+        let b: Bus = serde_json::from_str(old).expect("loads");
+        assert!(!b.silent);
+    }
+
+    #[test]
     fn default_route_is_master_and_costs_nothing() {
         // A project with zero busses must still be exactly as valid as
         // before busses existed — the whole point of `route: None` meaning
@@ -2342,8 +2380,8 @@ mod tests {
         // `apply` refuses to create one — simulate that by building the
         // graph directly rather than through ops.
         let mut p = proj();
-        p.busses.insert(BusId(1), Bus { id: BusId(1), name: "A".into(), parent: Some(BusId(2)), gain: 1.0, chain: vec![], sends: vec![], muted: false });
-        p.busses.insert(BusId(2), Bus { id: BusId(2), name: "B".into(), parent: Some(BusId(1)), gain: 1.0, chain: vec![], sends: vec![], muted: false });
+        p.busses.insert(BusId(1), Bus { id: BusId(1), name: "A".into(), parent: Some(BusId(2)), gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: false });
+        p.busses.insert(BusId(2), Bus { id: BusId(2), name: "B".into(), parent: Some(BusId(1)), gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: false });
         assert!(matches!(p.bus_order(), Err(EditError::BusCycle { .. })));
     }
 }
@@ -2489,7 +2527,7 @@ mod group_and_bus_input_tests {
     fn project() -> Project {
         let mut p = Project::default();
         for id in [1u64, 2, 3] {
-            p.apply(&Op::AddBus { bus: Bus { id: BusId(id), name: format!("B{id}"),
+            p.apply(&Op::AddBus { bus: Bus { id: BusId(id), name: format!("B{id}"), silent: false,
                 parent: None, gain: 1.0, chain: vec![], sends: vec![], muted: false } }).unwrap();
         }
         p

@@ -1156,7 +1156,7 @@ mod tests {
         let mut with_bus = project.clone();
         with_bus.apply(&studio_core::Op::AddBus { bus: studio_core::Bus {
             id: studio_core::BusId(4), name: "Drum Buss".into(), parent: None,
-            gain: 1.0, chain: vec![], sends: vec![], muted: false } }).unwrap();
+            gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: false } }).unwrap();
         let s = suggest(SampleKind::Clap, &rack, &with_bus);
         assert!(s.iter().any(|x| matches!(x.act,
             SuggestAct::ClipToBus(Some(studio_core::BusId(4))))),

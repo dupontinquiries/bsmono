@@ -854,6 +854,15 @@ pub fn mixdown_into(
             for s in buf.iter_mut() { *s *= bus.gain; }
         }
 
+        // A silent bus stops here: it has been summed, processed and faded
+        // (so `bus_signal` can read a finished signal), and now feeds
+        // nothing — not its sends, not its parent. Without this a control
+        // tap fed by sends would double every source into master.
+        if bus.silent {
+            scratch.retired.push((id, buf));
+            continue;
+        }
+
         for send in &bus.sends {
             let tap: &[f32] = if send.pre_fader { &scratch.pre } else { &buf };
             if let Some(target) = bus_buf.get_mut(&send.to) {
@@ -883,6 +892,36 @@ pub fn mixdown_into(
     for (id, buf) in scratch.retired.drain(..) {
         scratch.bus_buf.insert(id, buf);
     }
+}
+
+/// Render `project` and return what one bus's output was, interleaved
+/// stereo — after its chain and fader, before it feeds anything.
+///
+/// This is how a "dummy" channel is read: sends copy signal into a
+/// [`Bus`](studio_core::Bus) marked `silent`, the mix is unaffected, and
+/// this returns the tap. Feeding it to `studio_video::multicam::Control`
+/// is what lets a kick drum choose camera angles.
+///
+/// `None` if the bus does not exist, is muted, or is silenced by a solo —
+/// all three mean it was never rendered, which is different from being
+/// rendered silent (an existing, empty bus returns zeros).
+pub fn bus_signal(
+    project: &Project,
+    audio: &BTreeMap<SourceId, SourceAudio>,
+    fades: &BTreeMap<studio_core::ClipId, Fades>,
+    from: Ticks,
+    to: Ticks,
+    rate: u32,
+    bus: studio_core::BusId,
+) -> Option<Vec<f32>> {
+    let b = project.busses.get(&bus)?;
+    if b.muted { return None; }
+    let frames = (to.to_samples(rate) - from.to_samples(rate)).max(0) as usize;
+    let mut cache = EffectCache::new();
+    let mut scratch = RenderScratch::new();
+    let mut out = vec![0.0f32; frames * 2];
+    mixdown_into(project, audio, fades, from, to, rate, &[], &[], &mut cache, &mut scratch, &mut out);
+    scratch.bus_buf.get(&bus).map(|b| b.clone())
 }
 
 /// Peak level of a rendered buffer, in dBFS. `-inf` for silence — reported as
@@ -1039,7 +1078,7 @@ mod tests {
     }
 
     fn bus(id: u64, name: &str, parent: Option<u64>, gain: f32) -> Bus {
-        Bus { id: BusId(id), name: name.into(), parent: parent.map(BusId), gain, chain: Vec::new(), sends: Vec::new(), muted: false }
+        Bus { id: BusId(id), name: name.into(), parent: parent.map(BusId), gain, chain: Vec::new(), sends: Vec::new(), muted: false, silent: false }
     }
 
     #[test]
@@ -1084,6 +1123,70 @@ mod tests {
         p.apply(&Op::SetBusGain { id: BusId(1), gain: 0.0 }).unwrap();
         let silenced = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
         assert!(silenced.iter().all(|s| *s == 0.0), "zeroing the parent bus must silence everything routed through it");
+    }
+
+    #[test]
+    fn a_silent_bus_is_a_tap_that_costs_the_mix_nothing() {
+        // The dummy-channel shape: a Control bus fed by a send from Vocals.
+        // Master must be bit-identical to the project without the send —
+        // otherwise the tap doubles the source into the mix.
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Vocals", None, 1.0) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(2, "Control", None, 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        let end = Ticks::from_seconds(0.5);
+        let before = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, &[], &[]);
+
+        p.apply(&Op::SetBusSilent { id: BusId(2), silent: true }).unwrap();
+        p.apply(&Op::SetBusSends { id: BusId(1), sends: vec![Send { to: BusId(2), level: 1.0, pre_fader: false }] }).unwrap();
+        let after = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, &[], &[]);
+        assert_eq!(before, after, "a silent bus must not reach master");
+
+        // ...and the tap carries the signal, at the send's level.
+        let tap = bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(2)).expect("a tap");
+        assert_eq!(tap.len(), before.len());
+        assert!(peak_dbfs(&tap) > -60.0, "the tap heard something: {}", peak_dbfs(&tap));
+        p.apply(&Op::SetBusSends { id: BusId(1), sends: vec![Send { to: BusId(2), level: 0.5, pre_fader: false }] }).unwrap();
+        let half = bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(2)).unwrap();
+        assert!((peak_dbfs(&tap) - peak_dbfs(&half) - 6.02).abs() < 0.2, "send level rides the tap");
+    }
+
+    #[test]
+    fn a_silent_bus_still_runs_its_own_fader_and_a_muted_one_has_no_tap() {
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Control", None, 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        p.apply(&Op::SetBusSilent { id: BusId(1), silent: true }).unwrap();
+        let end = Ticks::from_seconds(0.5);
+        let mixed = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, &[], &[]);
+        assert!(mixed.iter().all(|s| *s == 0.0), "the only track routes into the silent bus: master is empty");
+        let loud = bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(1)).unwrap();
+        p.apply(&Op::SetBusGain { id: BusId(1), gain: 0.5 }).unwrap();
+        let quiet = bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(1)).unwrap();
+        assert!((peak_dbfs(&loud) - peak_dbfs(&quiet) - 6.02).abs() < 0.2, "the tap is read after the fader");
+
+        // Muted is not silent: a muted bus is dropped before its chain, so
+        // there is nothing to read, and `None` says so rather than zeros.
+        p.apply(&Op::SetBusFlags { id: BusId(1), muted: true }).unwrap();
+        assert!(bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(1)).is_none());
+        assert!(bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(99)).is_none());
+    }
+
+    #[test]
+    fn a_pre_fader_split_hears_the_source_before_its_fader_moves() {
+        // The splitter case: one signal, two destinations, and the tap must
+        // not move when the audible path is ridden down.
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Vocals", None, 1.0) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(2, "Control", None, 1.0) }).unwrap();
+        p.apply(&Op::SetBusSilent { id: BusId(2), silent: true }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        p.apply(&Op::SetBusSends { id: BusId(1), sends: vec![Send { to: BusId(2), level: 1.0, pre_fader: true }] }).unwrap();
+        let end = Ticks::from_seconds(0.5);
+        let open = bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(2)).unwrap();
+        p.apply(&Op::SetBusGain { id: BusId(1), gain: 0.1 }).unwrap();
+        let faded = bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(2)).unwrap();
+        assert_eq!(open, faded, "a pre-fader split is independent of the audible path's fader");
     }
 
     #[test]
@@ -1848,7 +1951,7 @@ mod automation_render_tests {
         // Route the track through a bus and ramp the BUS down: the mix ends
         // quieter than it starts, and a flat lane at unity changes nothing.
         let (mut p, audio) = one_clip_project();
-        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0,
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0, silent: false,
             muted: false, chain: vec![], sends: vec![], parent: None } }).unwrap();
         p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
         let b = AutoTarget::BusGain(BusId(1));
@@ -1881,7 +1984,7 @@ mod automation_render_tests {
         // value is what the lane multiplies — the fader rule, on a knob.
         use studio_core::ParamKey;
         let (mut p, audio) = one_clip_project();
-        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0, muted: false,
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0, silent: false, muted: false,
             // A DISABLED effect first: the instance list skips it, so
             // `effect: 1` proves the index addresses the chain, not the
             // instance list.
@@ -1919,7 +2022,7 @@ mod automation_render_tests {
     fn a_dangling_or_unknown_parameter_target_changes_nothing() {
         use studio_core::ParamKey;
         let (mut p, audio) = one_clip_project();
-        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0, muted: false,
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0, silent: false, muted: false,
             chain: vec![effect("gain", &[("db", -6.0)])], sends: vec![], parent: None } }).unwrap();
         p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
         let plain = render(&p, &audio);
@@ -2037,7 +2140,7 @@ mod binding_render_tests {
         // vocal plays, the drums drop, and nothing else changes.
         let (mut p, a) = fixture();
         p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "drums".into(), parent: None,
-            gain: 1.0, chain: vec![], sends: vec![], muted: false } }).unwrap();
+            gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: false } }).unwrap();
         p.apply(&Op::SetRoute { track: TrackId(2), bus: Some(BusId(1)) }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(2), source: SourceId(1),
             track: TrackId(2), pos: Ticks::ZERO, src_in: Ticks::ZERO,

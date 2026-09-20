@@ -4511,7 +4511,7 @@ impl eframe::App for App {
                             self.studio.edit(studio_core::Op::AddBus {
                                 bus: studio_core::Bus { id: b, name: "Drums".into(),
                                     parent: None, gain: 1.0, chain: vec![],
-                                    sends: vec![], muted: false } }, "drum bus");
+                                    sends: vec![], muted: false, silent: false } }, "drum bus");
                             b
                         }
                     };
@@ -7081,7 +7081,7 @@ mod mixer_tests {
             id: bus, name: "verb".into(), parent: None, gain: 1.0,
             chain: vec![mixer_panel::effect("delay", &[("time", 100.0), ("feedback", 0.4)]),
                         mixer_panel::effect("gain", &[("db", 0.0)])],
-            sends: vec![], muted: false } }, "bus");
+            sends: vec![], muted: false, silent: false } }, "bus");
         let before = s.session.doc.history().len();
         assert_eq!(s.sync_delays_to_tempo(3), 1, "one chain had a delay");
         let chain = &s.session.doc.project.busses[&bus].chain;
@@ -7659,7 +7659,7 @@ mod bus_routing_tests {
         let bus = studio_core::BusId(1);
         s.edit(studio_core::Op::AddBus { bus: studio_core::Bus {
             id: bus, name: "Drums".into(), parent: None, gain: 1.0,
-            chain: Vec::new(), sends: Vec::new(), muted: false } }, "bus");
+            chain: Vec::new(), sends: Vec::new(), muted: false, silent: false } }, "bus");
         s.edit(studio_core::Op::SetRoute { track, bus: Some(bus) }, "routed");
         let mut params = std::collections::BTreeMap::new();
         params.insert("profile".to_string(), 1.0); // tape
@@ -7856,7 +7856,7 @@ mod bus_sends_tests {
         for (id, name) in [(drums, "Drums"), (fx, "FX")] {
             s.edit(studio_core::Op::AddBus { bus: studio_core::Bus {
                 id, name: name.into(), parent: None, gain: 1.0,
-                chain: Vec::new(), sends: Vec::new(), muted: false } }, "bus");
+                chain: Vec::new(), sends: Vec::new(), muted: false, silent: false } }, "bus");
         }
         s.edit(studio_core::Op::SetRoute { track, bus: Some(drums) }, "routed");
         let dry = s.render_arrangement(48_000, &sources);
@@ -7892,7 +7892,7 @@ mod bus_sends_tests {
         for (id, name) in [(a, "A"), (b, "B")] {
             s.edit(studio_core::Op::AddBus { bus: studio_core::Bus {
                 id, name: name.into(), parent: None, gain: 1.0,
-                chain: Vec::new(), sends: Vec::new(), muted: false } }, "bus");
+                chain: Vec::new(), sends: Vec::new(), muted: false, silent: false } }, "bus");
         }
         s.edit(studio_core::Op::SetRoute { track, bus: Some(a) }, "routed");
         let energy = |v: &[f32]| v.iter().map(|x| x.abs()).sum::<f32>();
@@ -8454,7 +8454,7 @@ mod curve_shell_tests {
         let mut s = Studio::demo();
         let bus = BusId(40);
         s.edit(Op::AddBus { bus: studio_core::Bus { id: bus, name: "verb".into(), parent: None, gain: 1.0,
-            chain: vec![mixer_panel::effect("reverb", &[("mix", 1.0)])], sends: vec![], muted: false } }, "bus");
+            chain: vec![mixer_panel::effect("reverb", &[("mix", 1.0)])], sends: vec![], muted: false, silent: false } }, "bus");
         let clip = studio_core::ClipId(1);
         s.selection = vec![clip];
         let target = AutoTarget::BusParam { bus, effect: 0, key: ParamKey::new("mix").unwrap() };
@@ -9113,7 +9113,7 @@ mod mix_pass_tests {
         let mine = Effect { kind: "reverb".into(), params: Default::default(),
                             enabled: true };
         s.edit(Op::AddBus { bus: Bus { id: bus, name: "master".into(), parent: None,
-            gain: 1.0, chain: vec![mine.clone()], sends: vec![], muted: false } }, "bus");
+            gain: 1.0, chain: vec![mine.clone()], sends: vec![], muted: false, silent: false } }, "bus");
         let before_gain = s.session.doc.project.busses[&bus].gain;
 
         let proposed = vec![
@@ -9148,7 +9148,7 @@ mod mix_pass_tests {
         let mut s = Studio::demo();
         let bus = BusId(91);
         s.edit(Op::AddBus { bus: Bus { id: bus, name: "m".into(), parent: None,
-            gain: 1.0, chain: vec![], sends: vec![], muted: false } }, "bus");
+            gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: false } }, "bus");
         s.edit_group(vec![
             Op::SetBusGain { id: bus, gain: 0.5 },
             Op::SetBusGain { id: BusId(999), gain: 0.5 }, // no such bus

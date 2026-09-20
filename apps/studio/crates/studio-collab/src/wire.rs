@@ -1260,7 +1260,7 @@ mod tests {
                 sends: vec![Send { to: BusId(2), level: 0.35, pre_fader: false }],
                 muted: false,
             } },
-            Op::AddBus { bus: Bus { id: BusId(1), name: "Master-ish".into(), parent: None, gain: 1.0, chain: vec![], sends: vec![], muted: false } },
+            Op::AddBus { bus: Bus { id: BusId(1), name: "Master-ish".into(), parent: None, gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: false } },
             Op::RemoveBus { id: BusId(5) },
             Op::SetBusGain { id: BusId(1), gain: 0.6 },
             Op::SetBusFlags { id: BusId(1), muted: true },

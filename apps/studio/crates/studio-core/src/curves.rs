@@ -474,7 +474,7 @@ mod tests {
         let mut p = project();
         let bus = BusId(1);
         p.apply(&Op::AddBus { bus: crate::Bus { id: bus, name: "b".into(), parent: None, gain: 1.0,
-                                                 chain: vec![], sends: vec![], muted: false } }).unwrap();
+                                                 chain: vec![], sends: vec![], muted: false, silent: false } }).unwrap();
         let mix = ParamKey::new("mix").unwrap();
         let on_bus = AutoTarget::BusParam { bus, effect: 0, key: mix };
         let on_clip = AutoTarget::ClipParam { clip: ClipId(1), effect: 2, key: ParamKey::new("freq0").unwrap() };
