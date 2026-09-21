@@ -130,12 +130,29 @@ pub fn rgb_to_yuv420p(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
 /// An opened .fao: bytes, header, frame index, the block dictionary if the file carries
 /// one, and the anchor cache.
 pub struct FaoFile {
-    data: Vec<u8>,
+    src: Source,
     pub header: fao_v1::FaoFileHeader,
-    pub index: Vec<fao_v1::FaoFrameEntry>,
     block_dict: Option<fao_v1::block_dict::BlockDictionary>,
     v8: Option<fao_v1::v8_reconstruction_codec::V8Decoder>,
     cache: RefCell<Vec<(usize, Vec<u8>)>>,
+}
+
+/// Anything a `.fao` can be streamed from.
+pub trait ReadSeek: std::io::Read + std::io::Seek + Send {}
+impl<T: std::io::Read + std::io::Seek + Send> ReadSeek for T {}
+
+/// Where frame bytes come from.
+///
+/// EVERY DECODE PATH READS THROUGH `payload`, and nothing else touches the
+/// storage -- checked: `index`, `header` and `data` had no users outside this
+/// file. So streaming is a second arm here, and repeat resolution, the block
+/// dictionary, the V8 webs and the anchor cache all run unchanged on top of it.
+enum Source {
+    /// The whole file in memory -- what `parse` has always done.
+    Mem { data: Vec<u8>, index: Vec<fao_v1::FaoFrameEntry> },
+    /// Seek-based, constant memory. `RefCell` because seeking mutates the
+    /// reader while `decode_rgb` takes `&self`, the same reason `cache` is one.
+    Stream { reader: RefCell<crate::stream::FaoReader<Box<dyn ReadSeek>>>, frames: usize },
 }
 
 const ANCHOR_CACHE_CAP: usize = 8;
@@ -149,11 +166,47 @@ impl FaoFile {
         let block_dict = read_block_dict(&data, &index);
         let v8 = read_v8mx_trailer(&data, &index)
             .map(|webs| fao_v1::v8_reconstruction_codec::V8Decoder::new(header.width.into(), header.height.into()).with_webs(webs));
-        Some(FaoFile { data, header, index, block_dict, v8, cache: RefCell::new(Vec::new()) })
+        Some(FaoFile { src: Source::Mem { data, index }, header, block_dict, v8, cache: RefCell::new(Vec::new()) })
+    }
+
+    /// Open for streaming: reads the header and the trailers, nothing else.
+    ///
+    /// For files too large to hold -- a 600-hour video is terabytes. Frames are
+    /// read on demand through `stream::FaoReader`; the block dictionary and V8
+    /// webs come from the same shared searches `parse` uses, over just the tail.
+    pub fn open_stream(src: Box<dyn ReadSeek>) -> Option<Self> {
+        let mut r = crate::stream::FaoReader::open(src).ok()?;
+        if r.frame_count == 0 { return None; }
+        let (w, h) = (r.width, r.height);
+        let header = fao_v1::FaoFileHeader {
+            magic: *b"FAO2", version: 1, width: w, height: h,
+            fps_num: r.fps_num, fps_den: r.fps_den,
+            // u32 in the format, and FaoReader read it from a u32, so this
+            // cannot truncate.
+            frame_count: r.frame_count as u32,
+            gop_size: 0, quality: 0, flags: 0, total_compressed: 0,
+        };
+        let block_dict = r.block_dict().ok().flatten();
+        let v8 = r.v8mx().ok().flatten()
+            .map(|webs| fao_v1::v8_reconstruction_codec::V8Decoder::new(w.into(), h.into()).with_webs(webs));
+        let frames = r.frame_count as usize;
+        Some(FaoFile { src: Source::Stream { reader: RefCell::new(r), frames }, header, block_dict, v8,
+                       cache: RefCell::new(Vec::new()) })
+    }
+
+    /// One frame's codec marker, cheaply. Streaming reads ONE byte; `markers`
+    /// (every frame, whole payloads) is what made opening read the whole file.
+    pub fn marker(&self, idx: usize) -> Option<u8> {
+        match &self.src {
+            Source::Stream { reader, .. } => reader.borrow_mut().marker(idx as u64).ok().flatten(),
+            Source::Mem { .. } => self.payload(idx).and_then(|b| b.first().copied()),
+        }
     }
     pub fn width(&self) -> usize { self.header.width as usize }
     pub fn height(&self) -> usize { self.header.height as usize }
-    pub fn frame_count(&self) -> usize { self.index.len() }
+    pub fn frame_count(&self) -> usize {
+        match &self.src { Source::Mem { index, .. } => index.len(), Source::Stream { frames, .. } => *frames }
+    }
     pub fn fps(&self) -> f64 {
         if self.header.fps_den == 0 { 0.0 } else { self.header.fps_num as f64 / self.header.fps_den as f64 }
     }
@@ -162,8 +215,13 @@ impl FaoFile {
 
     /// Payload bytes of frame `idx` (what the markers are read from).
     pub fn payload(&self, idx: usize) -> Option<Vec<u8>> {
-        let entry = self.index.get(idx)?;
-        fao_v1::read_fao_frame(&self.data, entry).map(|(b, _)| b)
+        match &self.src {
+            Source::Mem { data, index } => {
+                let entry = index.get(idx)?;
+                fao_v1::read_fao_frame(data, entry).map(|(b, _)| b)
+            }
+            Source::Stream { reader, .. } => reader.borrow_mut().payload(idx as u64).ok(),
+        }
     }
     /// First payload byte of every frame — the input `player::build_anchor_map` takes.
     pub fn markers(&self) -> Vec<Option<u8>> {
@@ -326,6 +384,43 @@ mod tests {
         let mut out = Vec::new();
         fao_v1::write_fao_container(&mut out, w, h, 30.0, 0.8, &frames).unwrap();
         (out, w, h)
+    }
+
+    /// STREAMED DECODES ARE THE IN-MEMORY DECODES, pixel for pixel, frame for
+    /// frame. Every decode path reads through `payload`, so this is the proof
+    /// that swapping the storage underneath changed nothing above it.
+    #[test]
+    fn a_streamed_file_decodes_identically_to_an_in_memory_one() {
+        let (w, h) = (32usize, 16usize);
+        let frames: Vec<Vec<u8>> = [10u8, 90, 170, 250]
+            .iter().map(|&p| gradient_rgb(w, h, p)).collect();
+        let bytes = crate::export::write_dct_fao(&frames, w, h, 30.0, 80).unwrap();
+        let mem = FaoFile::parse(bytes.clone()).unwrap();
+        let st = FaoFile::open_stream(Box::new(std::io::Cursor::new(bytes))).unwrap();
+        assert_eq!((st.width(), st.height(), st.frame_count()), (mem.width(), mem.height(), mem.frame_count()));
+        assert!((st.fps() - mem.fps()).abs() < 1e-9);
+        for i in 0..mem.frame_count() {
+            assert_eq!(st.marker(i), mem.marker(i), "marker {i}");
+            assert_eq!(st.decode_rgb(i).unwrap(), mem.decode_rgb(i).unwrap(), "frame {i}");
+        }
+        assert_eq!(st.decode_rgb(mem.frame_count()), Err(Gap::OutOfRange));
+    }
+
+    /// And the trailers: a streamed file finds the same block dictionary.
+    #[test]
+    fn a_streamed_file_finds_the_block_dictionary() {
+        let (w, h) = (32usize, 16usize);
+        let mut bytes = crate::export::write_dct_fao(&[gradient_rgb(w, h, 5)], w, h, 30.0, 80).unwrap();
+        let mut dict = fao_v1::block_dict::BlockDictionary::new();
+        for k in 0..4u8 { dict.intern(vec![k; 64]); }
+        let payload = dict.to_bytes();
+        bytes.extend_from_slice(b"FAOBKD01");
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        let mem = FaoFile::parse(bytes.clone()).unwrap();
+        let st = FaoFile::open_stream(Box::new(std::io::Cursor::new(bytes))).unwrap();
+        assert!(mem.has_block_dict(), "fixture must carry a dictionary");
+        assert_eq!(st.has_block_dict(), mem.has_block_dict());
     }
 
     #[test]

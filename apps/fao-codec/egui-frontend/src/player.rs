@@ -44,6 +44,16 @@ impl AnchorMap {
     }
 }
 
+/// Files larger than this are streamed rather than read into memory.
+///
+/// 512 MB: comfortably below the Fairphone's 8 GB even alongside the decoded
+/// frames, and far above any file whose anchor strip is worth drawing in full.
+pub const STREAM_ABOVE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// How far a streamed seek walks looking for an anchor before saying so.
+/// 10,000 frames is over five minutes at 30 fps -- far past any real GOP.
+pub const ANCHOR_WALK_LIMIT: u64 = 10_000;
+
 /// Result of looking for an anchor in one direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Found {
@@ -182,6 +192,9 @@ pub struct Deck {
     pub path: String,
     pub file: Option<crate::decode::FaoFile>,
     pub anchor_map: Option<AnchorMap>,
+    /// Anchors found on demand, for a STREAMED file (see `open`). Exactly one of
+    /// this and `anchor_map` is set once a file is open.
+    pub lazy: Option<LazyAnchors>,
     pub error: Option<String>,
     /// The frame the texture shows, so a scrub only re-decodes on change.
     pub shown: Option<usize>,
@@ -190,21 +203,49 @@ pub struct Deck {
 }
 impl Default for Deck {
     fn default() -> Self {
-        Deck { path: String::new(), file: None, anchor_map: None, error: None, shown: None, gap: None, tex: None }
+        Deck { path: String::new(), file: None, anchor_map: None, lazy: None, error: None, shown: None, gap: None, tex: None }
     }
 }
 impl Deck {
     pub fn open(&mut self) {
-        self.error = None; self.anchor_map = None; self.file = None; self.shown = None; self.gap = None; self.tex = None;
-        match std::fs::read(self.path.trim()) {
-            Err(e) => self.error = Some(format!("open failed: {e}")),
-            Ok(data) => match crate::decode::FaoFile::parse(data) {
-                None => self.error = Some("not a .fao file (header/index parse failed)".into()),
-                Some(f) => {
-                    self.anchor_map = Some(build_anchor_map(&f.markers()));
-                    self.file = Some(f);
-                }
-            },
+        self.error = None; self.anchor_map = None; self.lazy = None; self.file = None;
+        self.shown = None; self.gap = None; self.tex = None;
+        let path = self.path.trim();
+        let len = match std::fs::metadata(path) {
+            Ok(m) => m.len(),
+            Err(e) => { self.error = Some(format!("open failed: {e}")); return; }
+        };
+        // SMALL FILES KEEP THE FULL PATH, exactly as before: read into memory,
+        // build the whole anchor map, draw the anchor strip. The strip shows
+        // every anchor in the file, which inherently needs every marker -- so
+        // it stays where that is cheap rather than being degraded for everyone.
+        //
+        // LARGE FILES STREAM. Reading one into memory is what made a 600-hour
+        // video (terabytes) impossible to open; building its anchor map read
+        // every frame first. Streamed: header and trailers only, anchors found
+        // on demand around each seek.
+        if len <= STREAM_ABOVE_BYTES {
+            match std::fs::read(path) {
+                Err(e) => self.error = Some(format!("open failed: {e}")),
+                Ok(data) => match crate::decode::FaoFile::parse(data) {
+                    None => self.error = Some("not a .fao file (header/index parse failed)".into()),
+                    Some(f) => {
+                        self.anchor_map = Some(build_anchor_map(&f.markers()));
+                        self.file = Some(f);
+                    }
+                },
+            }
+        } else {
+            match std::fs::File::open(path) {
+                Err(e) => self.error = Some(format!("open failed: {e}")),
+                Ok(fh) => match crate::decode::FaoFile::open_stream(Box::new(std::io::BufReader::new(fh))) {
+                    None => self.error = Some("not a .fao file (header/index parse failed)".into()),
+                    Some(f) => {
+                        self.lazy = Some(LazyAnchors::new(f.frame_count() as u64));
+                        self.file = Some(f);
+                    }
+                },
+            }
         }
     }
     /// Decode `idx` into the texture if it is not already the frame on screen. A frame the
@@ -262,6 +303,20 @@ impl State {
     }
     /// ⏮ / ⏭ in fao_app: the previous / next self-contained frame from the anchor map.
     fn step_anchor(&mut self, forward: bool) {
+        // STREAMED: the same answer the eager map gives, found on demand.
+        // Forward = first anchor AFTER this frame; back = last anchor BEFORE it.
+        if let (Some(lazy), Some(file)) = (self.a.lazy.as_mut(), self.a.file.as_ref()) {
+            let mut src = |k: u64| file.marker(k as usize);
+            let found = if forward {
+                lazy.next(self.frame as u64 + 1, ANCHOR_WALK_LIMIT, &mut src)
+            } else if self.frame == 0 {
+                Found::None
+            } else {
+                lazy.prev(self.frame as u64 - 1, ANCHOR_WALK_LIMIT, &mut src)
+            };
+            if let Found::At(t) = found { self.frame = t as usize; }
+            return;
+        }
         let Some(am) = &self.a.anchor_map else { return };
         let pos = am.anchors.partition_point(|&a| (a as usize) < self.frame);
         let target = if forward {
@@ -316,9 +371,20 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
         if ui.button("⏭").on_hover_text("Next I-frame").clicked() { st.step_anchor(true); }
         let mut f = st.frame;
         if ui.add(egui::Slider::new(&mut f, 0..=n - 1).text("frame")).changed() { st.frame = f; }
+        // `marker`, not `payload(..).first()`: this runs every repaint, and the
+        // old form copied the whole current frame to show one character.
+        let marker = st.a.file.as_ref().and_then(|f| f.marker(st.frame)).map(|m| m as char).unwrap_or('·');
+        if let (Some(lazy), Some(file)) = (st.a.lazy.as_mut(), st.a.file.as_ref()) {
+            let mut src = |k: u64| file.marker(k as usize);
+            let prev = match lazy.prev(st.frame as u64, ANCHOR_WALK_LIMIT, &mut src) {
+                Found::At(p) => p.to_string(),
+                Found::None => "none".into(),
+                Found::BeyondLimit => format!("none within {ANCHOR_WALK_LIMIT}"),
+            };
+            ui.label(egui::RichText::new(format!("'{marker}'  anchor {prev}  (streamed)")).monospace().small());
+        }
         if let Some(am) = &st.a.anchor_map {
             let (prev, _) = am.map.get(st.frame).copied().unwrap_or((None, None));
-            let marker = st.a.file.as_ref().and_then(|f| f.payload(st.frame)).and_then(|b| b.first().copied()).map(|m| m as char).unwrap_or('·');
             ui.label(egui::RichText::new(format!("'{marker}'  anchor {}", prev.map(|p| p.to_string()).unwrap_or_else(|| "none".into()))).monospace().small());
         }
     });
@@ -500,6 +566,46 @@ mod lazy_anchor_tests {
         // ...but a real "none" is still reported as none.
         let mut small = LazyAnchors::new(5);
         assert_eq!(small.prev(4, 10_000, &mut |_| Some(b'T')), Found::None);
+    }
+
+    /// A .fao whose frames carry exactly these markers. Stepping reads only
+    /// markers, so the payload after the marker byte need not decode.
+    fn file_with_markers(pattern: &str) -> Vec<u8> {
+        let frames: Vec<_> = pattern.bytes()
+            .map(|m| { let p = vec![m, 0, 0, 0]; let n = p.len();
+                       (Vec::new(), p, 0u8, n, 0.0f64, 0.0f64) })
+            .collect();
+        let mut out = Vec::new();
+        fao_codec_lib::write_fao_container(&mut out, 16, 16, 30.0, 0.8, &frames).unwrap();
+        out
+    }
+
+    /// THE PLAYER'S ⏮/⏭ ON A STREAMED FILE LANDS WHERE THE EAGER ONE DOES, from
+    /// every starting frame, both directions. The lazy branch uses next(f+1) and
+    /// prev(f-1) -- "after" and "before", not "at or after" -- and an off-by-one
+    /// there would step onto the current frame and appear stuck.
+    #[test]
+    fn streamed_stepping_matches_eager_stepping() {
+        for pattern in ["DTTKTTTZTT", "TTTDTTT", "DDDD", "TTTT", "DTTTTTTTTTTTTD"] {
+            let bytes = file_with_markers(pattern);
+            let n = pattern.len();
+            let mut eager = State::default();
+            let f = crate::decode::FaoFile::parse(bytes.clone()).unwrap();
+            eager.a.anchor_map = Some(build_anchor_map(&f.markers()));
+            eager.a.file = Some(f);
+            let mut lazy = State::default();
+            let fs = crate::decode::FaoFile::open_stream(Box::new(std::io::Cursor::new(bytes))).unwrap();
+            lazy.a.lazy = Some(LazyAnchors::new(fs.frame_count() as u64));
+            lazy.a.file = Some(fs);
+            for start in 0..n {
+                for fwd in [true, false] {
+                    eager.frame = start; lazy.frame = start;
+                    eager.step_anchor(fwd); lazy.step_anchor(fwd);
+                    assert_eq!(lazy.frame, eager.frame,
+                               "{pattern:?} from {start} {}", if fwd { "fwd" } else { "back" });
+                }
+            }
+        }
     }
 
     #[test]
