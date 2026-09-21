@@ -114,6 +114,26 @@ impl<R: Read + Seek> FaoReader<R> {
         })
     }
 
+    /// The codec marker of frame `i`: ONE byte, not the whole payload.
+    ///
+    /// `decode::FaoFile::markers` gets each marker by calling `payload(i)` --
+    /// copying the entire frame -- and keeping only byte 0. The player runs that
+    /// for every frame on open, so opening a file read all of it. This seeks to
+    /// the first payload byte and reads just that. `None` for an empty payload,
+    /// matching `payload(i).first()`.
+    pub fn marker(&mut self, i: u64) -> io::Result<Option<u8>> {
+        let e = self.entry(i)?;
+        let mut fh = [0u8; FRAME_HEADER_LEN as usize];
+        self.src.seek(SeekFrom::Start(e.offset))?;
+        self.src.read_exact(&mut fh)?;
+        if u32::from_le_bytes(fh[1..5].try_into().unwrap()) == 0 {
+            return Ok(None);
+        }
+        let mut m = [0u8; 1];
+        self.src.read_exact(&mut m)?;
+        Ok(Some(m[0]))
+    }
+
     /// The payload of frame `i` -- the bytes whose first is the codec marker.
     pub fn payload(&mut self, i: u64) -> io::Result<Vec<u8>> {
         let e = self.entry(i)?;
@@ -343,6 +363,18 @@ mod tests {
         let (tail, from) = r.trailer().unwrap();
         assert_eq!(from, TRAILER_LEAD as usize);
         assert_eq!(&tail[..], &bytes[frames_end - 4..], "tail = the 4 lead bytes + everything after");
+    }
+
+    /// One byte, and the same byte the full payload starts with.
+    #[test]
+    fn marker_matches_the_payloads_first_byte() {
+        let (w, h) = (32usize, 16usize);
+        let bytes = crate::export::write_dct_fao(&frames(3, w, h), w, h, 30.0, 80).unwrap();
+        let mut r = FaoReader::open(Cursor::new(bytes)).unwrap();
+        for i in 0..3u64 {
+            let full = r.payload(i).unwrap();
+            assert_eq!(r.marker(i).unwrap(), full.first().copied(), "frame {i}");
+        }
     }
 
     #[test]

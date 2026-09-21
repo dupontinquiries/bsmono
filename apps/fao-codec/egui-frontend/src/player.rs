@@ -44,6 +44,97 @@ impl AnchorMap {
     }
 }
 
+/// Result of looking for an anchor in one direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Found {
+    At(u64),
+    /// There is no anchor that way: the walk reached the start or end.
+    None,
+    /// Walked `limit` frames without finding one or reaching an end.
+    BeyondLimit,
+}
+
+/// Anchors discovered on demand, for files too long to scan on open.
+///
+/// ## Why not `build_anchor_map`
+///
+/// That builds everything up front, which for a 600-hour, 60 fps file costs:
+///
+///   * reading EVERY frame's marker -- and through `FaoFile::markers`, every
+///     frame's whole payload -- before the first frame shows; and
+///   * `AnchorMap::map`, a `(prev, next)` pair per frame: 129.6 million x 16
+///     bytes = 2 GB, to make a lookup O(1) that binary search already makes
+///     O(log n). `step_anchor` never used it -- it searches `anchors`.
+///
+/// This reads a marker only when a seek needs it and remembers the answer, so
+/// opening costs nothing and a seek costs about one GOP of one-byte reads.
+///
+/// ## Exactly the eager answer
+///
+/// `prev`/`next` WALK until they find an anchor or reach an end; they do not
+/// scan a fixed window. A window that happened to miss the anchor would report
+/// "none" where the eager map found one. With `limit >= frame_count` the result
+/// is identical to `build_anchor_map` for every frame -- tested.
+///
+/// `limit` exists for the pathological file with no keyframe for a very long
+/// stretch, where an eager scan and an unbounded walk would both be O(n).
+/// `BeyondLimit` says so honestly rather than guessing.
+pub struct LazyAnchors {
+    frame_count: u64,
+    known: std::collections::HashMap<u64, bool>,
+    /// Markers actually read -- the cost this type exists to keep small.
+    pub reads: u64,
+}
+
+impl LazyAnchors {
+    pub fn new(frame_count: u64) -> Self {
+        LazyAnchors { frame_count, known: std::collections::HashMap::new(), reads: 0 }
+    }
+
+    fn is_anchor(&mut self, i: u64, marker_of: &mut dyn FnMut(u64) -> Option<u8>) -> bool {
+        if let Some(&a) = self.known.get(&i) {
+            return a;
+        }
+        self.reads += 1;
+        // Same rule as the eager map: an unreadable or empty frame is never an anchor.
+        let a = marker_of(i).is_some_and(is_anchor_marker);
+        self.known.insert(i, a);
+        a
+    }
+
+    /// The last anchor at or before `i`.
+    pub fn prev(&mut self, i: u64, limit: u64, marker_of: &mut dyn FnMut(u64) -> Option<u8>) -> Found {
+        if self.frame_count == 0 || i >= self.frame_count {
+            return Found::None;
+        }
+        let floor = i.saturating_sub(limit);
+        let mut j = i;
+        loop {
+            if self.is_anchor(j, marker_of) {
+                return Found::At(j);
+            }
+            if j == floor {
+                return if floor == 0 { Found::None } else { Found::BeyondLimit };
+            }
+            j -= 1;
+        }
+    }
+
+    /// The first anchor at or after `i`.
+    pub fn next(&mut self, i: u64, limit: u64, marker_of: &mut dyn FnMut(u64) -> Option<u8>) -> Found {
+        if i >= self.frame_count {
+            return Found::None;
+        }
+        let ceil = i.saturating_add(limit).min(self.frame_count - 1);
+        for j in i..=ceil {
+            if self.is_anchor(j, marker_of) {
+                return Found::At(j);
+            }
+        }
+        if ceil == self.frame_count - 1 { Found::None } else { Found::BeyondLimit }
+    }
+}
+
 /// Build the anchor map from per-frame first-payload-byte markers (None = unreadable or
 /// empty payload — never an anchor, counted out of the census exactly as the GTK loop
 /// `continue`s them). Pure over extracted markers so it tests without a .fao file.
@@ -329,4 +420,94 @@ mod tests {
         assert!(s.contains("2 anchors out of 4 frames (50.0%)"), "{s}");
         assert!(s.contains("D=1") && s.contains("T=2") && s.contains("V=1"), "{s}");
     }
+
+#[cfg(test)]
+mod lazy_anchor_tests {
+    use super::*;
+
+    fn m(s: &str) -> Vec<Option<u8>> {
+        s.chars().map(|c| if c == '.' { None } else { Some(c as u8) }).collect()
+    }
+    fn as_opt(f: Found) -> Option<u32> {
+        match f { Found::At(v) => Some(v as u32), _ => None }
+    }
+
+    /// EXACTLY THE EAGER ANSWER, for every frame of every pattern -- including
+    /// unreadable frames, no anchors at all, anchors only at the ends.
+    #[test]
+    fn lazy_matches_the_eager_map_everywhere() {
+        let mut cases: Vec<String> = ["DTTKT.", "VVVVVV", "TTTT", ".D.", "D", "T", "TTTTD",
+            "DTTTT", "..........", "DT.TKTTTTZTTTLTP"].iter().map(|s| s.to_string()).collect();
+        // A longer pseudo-random pattern.
+        let alphabet = b"TTTTTTTDKT.LZPV";
+        let mut x: u32 = 12345;
+        cases.push((0..400).map(|_| { x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            alphabet[(x >> 16) as usize % alphabet.len()] as char }).collect());
+        for case in &cases {
+            let markers = m(case);
+            let eager = build_anchor_map(&markers);
+            let n = markers.len() as u64;
+            let mut lazy = LazyAnchors::new(n);
+            let mut src = |k: u64| markers[k as usize];
+            for i in 0..n {
+                let (ep, en) = eager.map[i as usize];
+                assert_eq!(as_opt(lazy.prev(i, n, &mut src)), ep, "prev({i}) in {case:?}");
+                assert_eq!(as_opt(lazy.next(i, n, &mut src)), en, "next({i}) in {case:?}");
+            }
+        }
+    }
+
+    /// THE COST THIS EXISTS FOR. A million frames, a keyframe every 30: seeking
+    /// to the middle reads about one GOP, not a million markers.
+    #[test]
+    fn a_seek_reads_about_one_gop_not_the_whole_file() {
+        let n = 1_000_000u64;
+        let mut lazy = LazyAnchors::new(n);
+        let mut src = |k: u64| Some(if k % 30 == 0 { b'D' } else { b'T' });
+        // 500_010 is itself a multiple of 30, so it IS the previous anchor; I
+        // first wrote 499_980 here, and 500_010 for `next` -- which is before
+        // 500_017 and cannot be a next anchor. The code was right, the
+        // hand-computed expectations were not.
+        assert_eq!(lazy.prev(500_017, n, &mut src), Found::At(500_010));
+        assert_eq!(lazy.next(500_017, n, &mut src), Found::At(500_040));
+        assert!(lazy.reads <= 64, "read {} markers for one seek in {n} frames", lazy.reads);
+    }
+
+    /// Asked again, it reads nothing new.
+    #[test]
+    fn a_repeated_seek_is_free() {
+        let n = 10_000u64;
+        let mut lazy = LazyAnchors::new(n);
+        let mut src = |k: u64| Some(if k % 30 == 0 { b'K' } else { b'T' });
+        lazy.prev(5_000, n, &mut src);   // caches 4980..=5000
+        let after_first = lazy.reads;
+        lazy.prev(5_000, n, &mut src);
+        // prev(4995) walks down to 4980: entirely cached. My first version used
+        // next(4995), which walks FORWARD past 5000 into frames never read --
+        // its 10 new reads were correct and the test was wrong.
+        lazy.prev(4_995, n, &mut src);
+        assert_eq!(lazy.reads, after_first, "cached frames must not be re-read");
+    }
+
+    /// No keyframe for a very long stretch: bounded, and honest about it.
+    #[test]
+    fn a_keyframe_desert_stops_at_the_limit() {
+        let n = 1_000_000u64;
+        let mut lazy = LazyAnchors::new(n);
+        let mut src = |_k: u64| Some(b'T');
+        assert_eq!(lazy.prev(900_000, 10_000, &mut src), Found::BeyondLimit);
+        assert!(lazy.reads <= 10_001, "{}", lazy.reads);
+        // ...but a real "none" is still reported as none.
+        let mut small = LazyAnchors::new(5);
+        assert_eq!(small.prev(4, 10_000, &mut |_| Some(b'T')), Found::None);
+    }
+
+    #[test]
+    fn out_of_range_and_empty_are_none() {
+        let mut empty = LazyAnchors::new(0);
+        assert_eq!(empty.prev(0, 10, &mut |_| Some(b'D')), Found::None);
+        let mut l = LazyAnchors::new(3);
+        assert_eq!(l.next(3, 10, &mut |_| Some(b'D')), Found::None);
+    }
+}
 }
