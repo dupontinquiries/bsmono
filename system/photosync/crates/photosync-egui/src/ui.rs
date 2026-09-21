@@ -71,7 +71,7 @@ fn rail_body(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColor
     if app.new_album_open {
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            let resp = ui.text_edit_singleline(&mut app.new_album_name);
+            let resp = ui.add(egui::TextEdit::singleline(&mut app.new_album_name).id_salt("photosync-new_album"));
             if ui.button("Add").clicked() || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                 if app.library.create_album(&app.new_album_name) {
                     app.view = View::Album(app.new_album_name.trim().to_string());

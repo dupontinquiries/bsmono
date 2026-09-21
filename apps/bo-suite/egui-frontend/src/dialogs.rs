@@ -208,10 +208,10 @@ pub fn edit_track_ui(ui: &mut egui::Ui, d: &mut EditTrack, c: &uikit_egui::Palet
         .open(&mut still_open)
         .show(ui.ctx(), |ui| {
             egui::Grid::new("edit_track_fields").num_columns(2).show(ui, |ui| {
-                ui.colored_label(c.text_weak, "Title"); ui.text_edit_singleline(&mut d.draft.title); ui.end_row();
-                ui.colored_label(c.text_weak, "Artist"); ui.text_edit_singleline(&mut d.draft.artist); ui.end_row();
-                ui.colored_label(c.text_weak, "Album"); ui.text_edit_singleline(&mut d.draft.album); ui.end_row();
-                ui.colored_label(c.text_weak, "Year"); ui.text_edit_singleline(&mut d.draft.year); ui.end_row();
+                ui.colored_label(c.text_weak, "Title"); ui.add(egui::TextEdit::singleline(&mut d.draft.title).id_salt("tagedit-title")); ui.end_row();
+                ui.colored_label(c.text_weak, "Artist"); ui.add(egui::TextEdit::singleline(&mut d.draft.artist).id_salt("tagedit-artist")); ui.end_row();
+                ui.colored_label(c.text_weak, "Album"); ui.add(egui::TextEdit::singleline(&mut d.draft.album).id_salt("tagedit-album")); ui.end_row();
+                ui.colored_label(c.text_weak, "Year"); ui.add(egui::TextEdit::singleline(&mut d.draft.year).id_salt("tagedit-year")); ui.end_row();
             });
             for p in d.problems() {
                 ui.colored_label(egui::Color32::from_rgb(200, 80, 80), p);
