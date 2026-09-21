@@ -120,7 +120,20 @@ pub struct TranscodeReport {
 /// `FaoStreamWriter`: memory is one frame, whatever the length.
 pub fn transcode_to_writer<W: std::io::Write + std::io::Seek>(
     path: &str, out: W, quality: u8, max_frames: Option<usize>,
-    mut progress: impl FnMut(usize, usize),
+    progress: impl FnMut(usize, usize),
+) -> Result<(W, TranscodeReport), String> {
+    transcode_cancellable(path, out, quality, max_frames, progress, None)
+}
+
+/// [`transcode_to_writer`], stoppable between frames by setting `cancel`.
+///
+/// A folder of matches is hours of work; a job that cannot be stopped holds the
+/// machine hostage. Checked once per frame, so it stops within one frame's
+/// encode, and the partial output is discarded by the caller rather than left
+/// behind looking like a finished file.
+pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
+    path: &str, out: W, quality: u8, max_frames: Option<usize>,
+    mut progress: impl FnMut(usize, usize), cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(W, TranscodeReport), String> {
     use std::io::Read;
     let info = probe(path)?;
@@ -158,6 +171,9 @@ pub fn transcode_to_writer<W: std::io::Write + std::io::Seek>(
     let mut n = 0usize;
     let mut psnr_sum = 0.0;
     let result: Result<(), String> = loop {
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            break Err(CANCELLED.into());
+        }
         match read_frame(&mut stdout, &mut rgb) {
             Ok(false) => break Ok(()),
             Ok(true) => {}
@@ -187,6 +203,9 @@ pub fn transcode_to_writer<W: std::io::Write + std::io::Seek>(
                                mean_psnr: psnr_sum / n as f64 }))
 }
 
+/// The error a cancelled transcode returns, so callers can tell it from a failure.
+pub const CANCELLED: &str = "cancelled";
+
 /// Read exactly one frame. `Ok(false)` at a clean end; a PARTIAL frame is an
 /// error, not a frame padded with the previous one's bytes.
 fn read_frame(r: &mut impl std::io::Read, buf: &mut [u8]) -> Result<bool, String> {
@@ -206,8 +225,17 @@ fn read_frame(r: &mut impl std::io::Read, buf: &mut [u8]) -> Result<bool, String
 /// Transcode to a file on disk -- the path the Media tab uses for real matches.
 pub fn transcode_to_file(path: &str, out_path: &std::path::Path, quality: u8, max_frames: Option<usize>,
                          progress: impl FnMut(usize, usize)) -> Result<TranscodeReport, String> {
+    transcode_to_file_cancellable(path, out_path, quality, max_frames, progress, None)
+}
+
+/// [`transcode_to_file`], stoppable. On any error -- cancellation included --
+/// the partial file is REMOVED, so a half-written match never sits in the
+/// folder looking like a finished one.
+pub fn transcode_to_file_cancellable(path: &str, out_path: &std::path::Path, quality: u8,
+        max_frames: Option<usize>, progress: impl FnMut(usize, usize),
+        cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<TranscodeReport, String> {
     let f = std::fs::File::create(out_path).map_err(|e| format!("creating {}: {e}", out_path.display()))?;
-    let r = transcode_to_writer(path, std::io::BufWriter::new(f), quality, max_frames, progress)
+    let r = transcode_cancellable(path, std::io::BufWriter::new(f), quality, max_frames, progress, cancel)
         .map(|(_, rep)| rep);
     if r.is_err() { let _ = std::fs::remove_file(out_path); }
     r
@@ -329,6 +357,24 @@ mod tests {
         assert_eq!((rep.w, rep.h), (320, 240), "not the 640x480 fao_app would have guessed");
         let f = crate::decode::FaoFile::parse(bytes).unwrap();
         assert_eq!((f.width(), f.height()), (320, 240));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cancelling stops the job AND removes the partial file -- a half-written
+    /// match must not be left looking like a finished one.
+    #[test]
+    fn a_cancelled_transcode_leaves_no_partial_file() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mp4");
+        make_test_video(&src, 64, 48, 30, 30);
+        let out = dir.join("out.fao");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let r = transcode_to_file_cancellable(src.to_str().unwrap(), &out, 80, None,
+            |done, _| if done == 5 { stop.store(true, std::sync::atomic::Ordering::Relaxed) }, Some(&stop));
+        assert_eq!(r.unwrap_err(), CANCELLED);
+        assert!(!out.exists(), "the partial file must be removed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -5,7 +5,40 @@
 //! and is tested there; this file is layout and wiring.
 
 use crate::media::{self, Entry, Kind, Scan, Selection, Source};
-use std::sync::mpsc;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+
+/// One file to encode: where ffmpeg reads it, and where the .fao goes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncodeItem {
+    pub name: String,
+    /// A local path, or a dufs file URL -- ffmpeg reads HTTP directly, using
+    /// the range requests dufs serves.
+    pub input: String,
+    pub output: PathBuf,
+}
+
+/// What the encode thread reports back.
+enum JobEvent {
+    Started(usize, String),
+    Progress(usize, usize),
+    Finished(PathBuf, Result<crate::transcode::TranscodeReport, String>),
+    AllDone,
+}
+
+/// A running encode.
+pub struct EncodeJob {
+    rx: mpsc::Receiver<JobEvent>,
+    cancel: Arc<AtomicBool>,
+    pub total: usize,
+    pub index: usize,
+    pub current: String,
+    pub frames: (usize, usize),
+    pub done: usize,
+    pub log: Vec<String>,
+    pub running: bool,
+}
 
 /// How many folders a dufs walk visits before stopping, so a huge share
 /// reports "stopped" instead of hanging.
@@ -26,6 +59,10 @@ pub struct State {
     rx: Option<mpsc::Receiver<(usize, Scan)>>,
     tx: Option<mpsc::Sender<(usize, Scan)>>,
     pending: usize,
+    /// Where encodes go. Empty = beside each local source file.
+    pub output_dir: String,
+    pub quality: u8,
+    pub job: Option<EncodeJob>,
 }
 
 impl Default for State {
@@ -35,6 +72,7 @@ impl Default for State {
             selection: Selection::default(), new_folder: String::new(), new_server: String::new(),
             include_text: String::new(), exclude_text: String::new(), only_selected: false,
             rx: None, tx: None, pending: 0,
+            output_dir: String::new(), quality: 80, job: None,
         }
     }
 }
@@ -128,6 +166,123 @@ impl State {
     }
 }
 
+impl State {
+    /// Plan an encode of the selected SOURCE videos. Returns the work and, for
+    /// anything skipped, why. Pure over state, so it is tested without ffmpeg.
+    ///
+    /// Skips rather than guesses:
+    ///   * a file whose `.fao` already exists is not re-encoded or overwritten;
+    ///   * a server file with no output folder set has nowhere local to go.
+    pub fn plan_encode(&self) -> (Vec<EncodeItem>, Vec<String>) {
+        let out_dir = self.output_dir.trim();
+        let mut items = Vec::new();
+        let mut skipped = Vec::new();
+        for e in self.entries.iter().filter(|e| e.kind == Kind::SourceVideo && self.selection.selected(e)) {
+            let stem = e.name().rsplit_once('.').map(|(s, _)| s).unwrap_or(e.name()).to_string();
+            let (input, dir) = match self.sources.get(e.source) {
+                Some(Source::Local(root)) => {
+                    let p = root.join(&e.rel);
+                    let dir = if out_dir.is_empty() {
+                        p.parent().map(PathBuf::from).unwrap_or_else(|| root.clone())
+                    } else { PathBuf::from(out_dir) };
+                    (p.display().to_string(), dir)
+                }
+                Some(Source::Dufs(base)) => {
+                    if out_dir.is_empty() {
+                        skipped.push(format!("{}: set an output folder for server files", e.rel));
+                        continue;
+                    }
+                    (media::file_url(base, &e.rel), PathBuf::from(out_dir))
+                }
+                None => continue,
+            };
+            let output = dir.join(format!("{stem}.fao"));
+            if output.exists() || items.iter().any(|i: &EncodeItem| i.output == output) {
+                skipped.push(format!("{}: {} already exists", e.rel, output.display()));
+                continue;
+            }
+            items.push(EncodeItem { name: e.rel.clone(), input, output });
+        }
+        (items, skipped)
+    }
+
+    /// Start encoding `items` on a thread.
+    pub fn start_encode(&mut self, items: Vec<EncodeItem>) {
+        if items.is_empty() || self.job.as_ref().is_some_and(|j| j.running) { return; }
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        let quality = self.quality;
+        let total = items.len();
+        std::thread::spawn(move || {
+            for (i, it) in items.into_iter().enumerate() {
+                if stop.load(Ordering::Relaxed) { break; }
+                let _ = tx.send(JobEvent::Started(i, it.name.clone()));
+                if let Some(parent) = it.output.parent() { let _ = std::fs::create_dir_all(parent); }
+                let ptx = tx.clone();
+                let mut last = std::time::Instant::now();
+                let r = crate::transcode::transcode_to_file_cancellable(&it.input, &it.output, quality, None,
+                    |d, t| {
+                        // A message per frame floods the channel at 144 fps;
+                        // ten a second is plenty for a progress bar.
+                        if last.elapsed().as_millis() >= 100 || d == t {
+                            last = std::time::Instant::now();
+                            let _ = ptx.send(JobEvent::Progress(d, t));
+                        }
+                    }, Some(&stop));
+                let _ = tx.send(JobEvent::Finished(it.output, r));
+            }
+            let _ = tx.send(JobEvent::AllDone);
+        });
+        self.job = Some(EncodeJob { rx, cancel, total, index: 0, current: String::new(),
+                                    frames: (0, 0), done: 0, log: Vec::new(), running: true });
+    }
+
+    /// Collect encode events; add each finished .fao to the collection.
+    pub fn poll_encode(&mut self) {
+        let mut finished: Vec<PathBuf> = Vec::new();
+        if let Some(job) = &mut self.job {
+            while let Ok(ev) = job.rx.try_recv() {
+                match ev {
+                    JobEvent::Started(i, name) => { job.index = i; job.current = name; job.frames = (0, 0); }
+                    JobEvent::Progress(d, t) => job.frames = (d, t),
+                    JobEvent::Finished(out, Ok(rep)) => {
+                        job.done += 1;
+                        job.log.push(format!("✔ {} — {} frames, {:.1} dB", out.display(), rep.frames, rep.mean_psnr));
+                        finished.push(out);
+                    }
+                    JobEvent::Finished(out, Err(e)) => job.log.push(format!("✖ {}: {e}", out.display())),
+                    JobEvent::AllDone => job.running = false,
+                }
+            }
+        }
+        for out in finished { self.add_output(&out); }
+    }
+
+    /// Put a finished .fao into the collection: into the source it lives under
+    /// if there is one, otherwise by adding its folder as a new source.
+    fn add_output(&mut self, out: &std::path::Path) {
+        let size = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+        for (i, s) in self.sources.iter().enumerate() {
+            if let Source::Local(root) = s {
+                if let Ok(rel) = out.strip_prefix(root) {
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    if !self.entries.iter().any(|e| e.source == i && e.rel == rel) {
+                        self.entries.push(Entry { source: i, rel, size, kind: Kind::Fao });
+                        self.entries.sort_by(|a, b| (a.source, &a.rel).cmp(&(b.source, &b.rel)));
+                    }
+                    return;
+                }
+            }
+        }
+        if let Some(dir) = out.parent() { self.add(Source::Local(dir.to_path_buf())); }
+    }
+
+    pub fn cancel_encode(&mut self) {
+        if let Some(j) = &self.job { j.cancel.store(true, Ordering::Relaxed); }
+    }
+}
+
 fn gb(bytes: u64) -> String {
     format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
@@ -135,6 +290,10 @@ fn gb(bytes: u64) -> String {
 pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
     let st = &mut app.media;
     st.poll();
+    st.poll_encode();
+    if st.job.as_ref().is_some_and(|j| j.running) {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    }
     if st.pending > 0 {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
     }
@@ -191,6 +350,36 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
         ui.label(format!("{sel_n} of {all_n} selected · {} of {}", gb(sel_b), gb(all_b)));
         ui.checkbox(&mut st.only_selected, "show selected only");
     });
+
+    // ── encode ──
+    ui.horizontal(|ui| {
+        ui.label("Output");
+        ui.add(egui::TextEdit::singleline(&mut st.output_dir)
+            .hint_text("beside each local file (required for server files)").desired_width(280.0));
+        ui.add(egui::Slider::new(&mut st.quality, 10..=100).text("quality"));
+    });
+    let running = st.job.as_ref().is_some_and(|j| j.running);
+    let (plan, skipped) = st.plan_encode();
+    ui.horizontal(|ui| {
+        let label = format!("⚙ Encode {} selected video(s) to .fao", plan.len());
+        if ui.add_enabled(!running && !plan.is_empty(), egui::Button::new(label)).clicked() {
+            st.start_encode(plan.clone());
+        }
+        if running && ui.button("■ Stop").clicked() { st.cancel_encode(); }
+        if !skipped.is_empty() {
+            ui.label(egui::RichText::new(format!("{} skipped", skipped.len())).weak())
+                .on_hover_text(skipped.join("\n"));
+        }
+    });
+    if let Some(job) = &st.job {
+        if job.running {
+            let (d, t) = job.frames;
+            ui.label(format!("{} of {}: {}", job.index + 1, job.total, job.current));
+            ui.add(egui::ProgressBar::new(if t > 0 { d as f32 / t as f32 } else { 0.0 })
+                .text(format!("frame {d} of ~{t}")));
+        }
+        for line in job.log.iter().rev().take(6) { ui.label(egui::RichText::new(line).small()); }
+    }
 
     if !st.errors.is_empty() {
         egui::CollapsingHeader::new(format!("⚠ {} folder(s) could not be read", st.errors.len()))
@@ -302,6 +491,137 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&root);
+        if let Err(e) = result { std::panic::resume_unwind(e); }
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mp_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Only selected SOURCE videos are planned; an existing .fao is never
+    /// overwritten; a server file needs a local output folder.
+    #[test]
+    fn the_encode_plan_follows_the_rules() {
+        let root = tmpdir("plan");
+        std::fs::write(root.join("done.fao"), b"x").unwrap();
+        let mut st = State::default();
+        st.sources = vec![Source::Local(root.clone()), Source::Dufs("http://nas:5000".into())];
+        st.entries = vec![
+            Entry { source: 0, rel: "a.mkv".into(), size: 1, kind: Kind::SourceVideo },
+            Entry { source: 0, rel: "done.mp4".into(), size: 1, kind: Kind::SourceVideo },
+            Entry { source: 0, rel: "b.fao".into(), size: 1, kind: Kind::Fao },
+            Entry { source: 1, rel: "remote.mp4".into(), size: 1, kind: Kind::SourceVideo },
+            Entry { source: 0, rel: "unselected.mkv".into(), size: 1, kind: Kind::SourceVideo },
+        ];
+        st.include_text = "*".into();
+        st.exclude_text = "unselected*".into();
+        st.sync_patterns();
+        let (items, skipped) = st.plan_encode();
+        let names: Vec<_> = items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["a.mkv"], "{skipped:?}");
+        assert_eq!(items[0].output, root.join("a.fao"), "beside the source by default");
+        assert!(skipped.iter().any(|s| s.contains("done.mp4") && s.contains("already exists")));
+        assert!(skipped.iter().any(|s| s.contains("remote.mp4") && s.contains("output folder")));
+
+        // With an output folder, the server file is planned -- read over HTTP.
+        let out = tmpdir("plan_out");
+        st.output_dir = out.display().to_string();
+        let (items, _) = st.plan_encode();
+        let remote = items.iter().find(|i| i.name == "remote.mp4").expect("planned now");
+        assert_eq!(remote.input, "http://nas:5000/remote.mp4");
+        assert_eq!(remote.output, out.join("remote.fao"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// END TO END: a folder of real video -> Encode -> a .fao that decodes, in
+    /// the collection, ready to Play.
+    #[test]
+    fn encoding_a_real_video_puts_a_playable_fao_in_the_collection() {
+        let ok = std::process::Command::new("ffmpeg").arg("-version").output().map(|o| o.status.success()).unwrap_or(false);
+        if !ok { eprintln!("no ffmpeg; skipping"); return; }
+        let root = tmpdir("e2e");
+        let made = std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i",
+            "testsrc=size=64x48:rate=30:duration=0.3", "-pix_fmt", "yuv420p"])
+            .arg(root.join("match.mp4")).status().unwrap().success();
+        assert!(made);
+        let mut st = State::default();
+        st.add(Source::Local(root.clone()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while st.pending > 0 && std::time::Instant::now() < deadline { st.poll(); std::thread::sleep(std::time::Duration::from_millis(10)); }
+        st.include_text = "*.mp4".into();
+        st.sync_patterns();
+        let (plan, _) = st.plan_encode();
+        assert_eq!(plan.len(), 1);
+        st.start_encode(plan);
+        while st.job.as_ref().is_some_and(|j| j.running) && std::time::Instant::now() < deadline {
+            st.poll_encode();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        st.poll_encode();
+        let job = st.job.as_ref().unwrap();
+        assert!(!job.running, "encode never finished");
+        assert_eq!(job.done, 1, "{:?}", job.log);
+        let out = root.join("match.fao");
+        assert!(out.exists());
+        let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!((f.width(), f.height(), f.frame_count()), (64, 48, 9));
+        assert!(st.entries.iter().any(|e| e.rel == "match.fao" && e.kind == Kind::Fao),
+                "the result is in the collection, ready to Play");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE NETWORKED PATH, end to end: a real dufs serves a real video, and the
+    /// Media tab encodes it -- ffprobe and ffmpeg reading the HTTP URL through
+    /// the range requests dufs serves -- into a local .fao.
+    #[test]
+    #[ignore = "needs a dufs binary: DUFS_BIN=/path/to/dufs cargo test -- --ignored real_dufs"]
+    fn real_dufs_video_encodes_over_http() {
+        let bin = std::env::var("DUFS_BIN").expect("set DUFS_BIN");
+        let served = tmpdir("dufs_enc_src");
+        let made = std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i",
+            "testsrc=size=64x48:rate=30:duration=0.3", "-pix_fmt", "yuv420p"])
+            .arg(served.join("cup #2 final.mp4")).status().unwrap().success();
+        assert!(made);
+        let out = tmpdir("dufs_enc_out");
+        let port = 30_000 + (std::process::id() % 20_000) as u16;
+        let mut child = std::process::Command::new(&bin).arg(&served)
+            .args(["-p", &port.to_string(), "-b", "127.0.0.1"])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let up = (0..50).any(|_| { std::thread::sleep(std::time::Duration::from_millis(100));
+                                    http_fetch(&format!("{base}/?json")).is_ok() });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(up, "dufs never answered");
+            let mut st = State::default();
+            st.add(Source::Dufs(base.clone()));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while st.pending > 0 && std::time::Instant::now() < deadline { st.poll(); std::thread::sleep(std::time::Duration::from_millis(10)); }
+            assert_eq!(st.entries.len(), 1, "{:?}", st.errors);
+            st.include_text = "*.mp4".into();
+            st.output_dir = out.display().to_string();
+            st.sync_patterns();
+            let (plan, skipped) = st.plan_encode();
+            assert_eq!(plan.len(), 1, "{skipped:?}");
+            // '#' in the name: raw, ffmpeg would ask for "cup " -- encode_path's job.
+            assert!(plan[0].input.contains("%23"), "{}", plan[0].input);
+            st.start_encode(plan);
+            while st.job.as_ref().is_some_and(|j| j.running) && std::time::Instant::now() < deadline {
+                st.poll_encode(); std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            st.poll_encode();
+            let job = st.job.as_ref().unwrap();
+            assert_eq!(job.done, 1, "{:?}", job.log);
+            let f = crate::decode::FaoFile::parse(std::fs::read(out.join("cup #2 final.fao")).unwrap()).unwrap();
+            assert_eq!((f.width(), f.height(), f.frame_count()), (64, 48, 9));
+        }));
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&served);
+        let _ = std::fs::remove_dir_all(&out);
         if let Err(e) = result { std::panic::resume_unwind(e); }
     }
 
