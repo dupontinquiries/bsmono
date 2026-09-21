@@ -76,10 +76,15 @@ pub fn load(project: &Project, dir: &Path) -> Loaded {
 /// `C0057.srt`) — found without asking, because that is where whisper
 /// writes them by default and a person who put them there should not have
 /// to point at the folder they are already in.
-pub fn beside_media(project: &Project) -> Loaded {
+/// `base` is the project's folder: a RELATIVE source path is beside the
+/// project, not wherever the app was launched from. Without it, a portable
+/// project with relative paths (the cartoon fixture) lost its transcripts --
+/// the folder of "A001_wide.mp4" is "", the working directory -- while its
+/// media, resolved against the project folder, loaded fine.
+pub fn beside_media(project: &Project, base: &Path) -> Loaded {
     let dirs: std::collections::BTreeSet<std::path::PathBuf> = project.sources.values()
         .filter(|s| s.kind == studio_core::SourceKind::File)
-        .filter_map(|s| Path::new(&s.path).parent().map(|p| p.to_path_buf()))
+        .filter_map(|s| base.join(&s.path).parent().map(|p| p.to_path_buf()))
         .collect();
     let mut all = Loaded::default();
     for d in dirs {
@@ -117,7 +122,7 @@ mod tests {
             d.0.join("C0057.mkv").display().to_string(), Ticks::from_seconds(5.0), 48_000, 2, true) }).unwrap();
         p.apply(&Op::AddSource { source: Source::file(SourceId(2), "/elsewhere/C0099.mkv",
             Ticks::from_seconds(5.0), 48_000, 2, true) }).unwrap();
-        let l = beside_media(&p);
+        let l = beside_media(&p, Path::new("/nowhere"));   // absolute sources: base is irrelevant
         assert_eq!(l.words[&SourceId(1)][0].text, "hello");
         assert_eq!((l.timed, l.missing), (1, 1), "{}", l.summary());
     }

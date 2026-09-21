@@ -55,6 +55,11 @@ fn the_transcripts_load_beside_the_media() {
     let p = project(&d);
     let l = crate::transcripts::load(&p, &d);
     assert_eq!(l.timed, 3, "one per camera: {}", l.summary());
+    // and the way the app finds them on opening: beside each source, and the
+    // fixture's sources are RELATIVE -- they must resolve against the project's
+    // folder, not the working directory (they did not, until this test)
+    let auto = crate::transcripts::beside_media(&p, &d);
+    assert_eq!(auto.timed, 3, "found beside relative sources: {}", auto.summary());
 }
 
 #[test]

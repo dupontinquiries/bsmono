@@ -3422,7 +3422,8 @@ impl Default for App {
             studio.status = format!("{} — midi: {}", studio.status, m.port_name());
         }
         let (provenance_tx, provenance_rx) = std::sync::mpsc::channel();
-        let beside = transcripts::beside_media(&studio.session.doc.project);
+        let beside = transcripts::beside_media(&studio.session.doc.project,
+            project_path.parent().unwrap_or(std::path::Path::new(".")));
         let pending_video = std::mem::take(&mut studio.pending_video_audio);
         let video_audio_left = pending_video.len();
         // The worker wakes the window through this slot; the first frame fills it.
