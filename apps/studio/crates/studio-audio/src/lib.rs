@@ -86,6 +86,84 @@ pub struct Peaks {
     pub frames: usize,
 }
 
+/// What happens to a clip's effects after the clip ends.
+///
+/// A reverb or a delay keeps sounding after its input stops — that is the
+/// effect. An editor needs two things from that, and every tool picks one:
+///
+/// * **Cut**: the tail ends exactly where the clip does. A hard cut to the
+///   next scene, a gag that needs dead air, a narration line that must not
+///   bleed under the next shot's dialogue.
+/// * **Ring out**: the tail keeps going past the clip end for `ring`
+///   seconds, and optionally fades over the last `fade` of them — so a clip
+///   can be trimmed tight to the dry sound while its space decays naturally,
+///   or ring for exactly as long as a transition wants and then stop.
+///
+/// Both, per clip, and switchable without touching the effect: this is a
+/// property of the EDIT, not of the reverb. Carried as an effect of kind
+/// `"tail"` on the clip's own chain (params `ring` and `fade`, seconds)
+/// because a clip's effect list already syncs, undoes, saves and travels
+/// over the wire — and an unknown kind is skipped by the DSP, so a build
+/// that predates this plays the clip exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ClipTail {
+    /// Seconds of tail after the clip end. 0 is Cut.
+    pub ring: f64,
+    /// Seconds, at the END of the ring, over which the tail fades to
+    /// silence. 0 means the ring stops dead at `ring`: a hard cut, just
+    /// later than the clip's own end.
+    pub fade: f64,
+}
+
+/// The effect kind that carries a clip's tail setting.
+pub const TAIL_KIND: &str = "tail";
+
+impl ClipTail {
+    /// Read from a clip's effect list; the last enabled `"tail"` wins.
+    pub fn of(effects: &[studio_core::Effect]) -> ClipTail {
+        effects.iter().filter(|e| e.enabled && e.kind == TAIL_KIND).last().map(|e| {
+            let ring = e.params.get("ring").copied().unwrap_or(0.0).max(0.0) as f64;
+            let fade = (e.params.get("fade").copied().unwrap_or(0.0).max(0.0) as f64).min(ring);
+            ClipTail { ring, fade }
+        }).unwrap_or_default()
+    }
+
+    pub fn ring_ticks(&self) -> Ticks { Ticks::from_seconds(self.ring) }
+
+    /// Gain `past` seconds after the clip end: 1 until the fade starts, a
+    /// linear ramp through it, 0 at and beyond `ring`.
+    pub fn gain_at(&self, past: f64) -> f32 {
+        if past >= self.ring { return 0.0; }
+        let fade_from = self.ring - self.fade;
+        if self.fade <= 0.0 || past < fade_from { return 1.0; }
+        (1.0 - (past - fade_from) / self.fade).clamp(0.0, 1.0) as f32
+    }
+
+    /// The effect entry that sets this tail on a clip.
+    pub fn effect(&self) -> studio_core::Effect {
+        studio_core::Effect {
+            kind: TAIL_KIND.into(),
+            enabled: true,
+            params: [("ring".to_string(), self.ring as f32), ("fade".to_string(), self.fade as f32)]
+                .into_iter().collect(),
+        }
+    }
+}
+
+/// Where a project's sound actually ends: the last clip's end, or later if
+/// a clip's tail rings past it.
+///
+/// `Project::duration` is the end of the last CLIP, which is the right
+/// answer for the timeline and the wrong one for a render: a ring-out on the
+/// final shot would be cut off by the very file that was meant to carry it.
+/// Every render that decides "how long is this" asks here instead.
+pub fn audible_end(project: &Project) -> Ticks {
+    project.clips.values()
+        .map(|c| c.end().saturating_add(ClipTail::of(&c.effects).ring_ticks()))
+        .max()
+        .unwrap_or(Ticks::ZERO)
+}
+
 /// Which part of the spectrum a waveform drawing should show.
 ///
 /// A full-band waveform is a silhouette of LOUDNESS, and for scoring that is
@@ -741,8 +819,11 @@ pub fn mixdown_into(
         // an empty product is 1.0 — bit-identical, pinned below.
         let mut track_sweeps = project.binding_sweeps(AutoTarget::TrackGain(track.id));
         for clip in project.track_clips(track.id) {
+            // A clip's tail rings past its end, so a window that starts
+            // after the dry sound can still owe it audio.
+            let tail = ClipTail::of(&clip.effects);
             // skip clips entirely outside the window
-            if clip.end() <= from || clip.pos >= to { continue; }
+            if clip.end().saturating_add(tail.ring_ticks()) <= from || clip.pos >= to { continue; }
             let Some(src) = audio.get(&clip.source) else { continue };
             if src.channels.is_empty() { continue; }
             // THE PROJECT'S FADE IS THE FADE. The `fades` parameter stays as
@@ -844,6 +925,45 @@ pub fn mixdown_into(
                 }
                 dest[oi] += l * g;
                 dest[oi + 1] += r * g;
+            }
+
+            // ── the tail: the chain keeps running on silence ──────────────
+            // Only meaningful when this window also rendered up to the clip
+            // end — the effect's state (the reverb's energy) comes from
+            // processing the clip. A window that starts INSIDE the tail
+            // without having played the clip has no energy to ring out; that
+            // is a limitation of rendering a slice, named here rather than
+            // papered over with a guess.
+            if tail.ring > 0.0 && clip.end() >= from && clip.end() < to {
+                let t0 = clip.end();
+                let t1 = clip.end().saturating_add(tail.ring_ticks()).min(to);
+                let off = (t0.to_samples(rate) - from.to_samples(rate)).max(0) as usize;
+                let len = (t1.to_samples(rate) - t0.to_samples(rate)).max(0) as usize;
+                let len = len.min(dest.len().saturating_sub(off * 2) / 2);
+                let base = t0.to_samples(rate);
+                for i in 0..len {
+                    let at = Ticks::from_samples(base + i as i64, rate);
+                    let past = i as f64 / rate as f64;
+                    let tg = tail.gain_at(past);
+                    if tg <= 0.0 { break; }
+                    let mut auto = match track_lane {
+                        Some(lane) => studio_core::eval_lane_cursor(lane, at, &mut lane_cursor),
+                        None => 1.0,
+                    };
+                    for sw in track_sweeps.iter_mut() { auto *= sw.value(at); }
+                    // Silence in, the effect's memory out. The clip's own
+                    // fade is NOT applied: the dry sound has ended, and the
+                    // tail's shape is the tail setting's job.
+                    let (mut l, mut r) = (0.0f32, 0.0f32);
+                    for (_, inst) in clip_fx.iter_mut() {
+                        l = inst.process_audio(l);
+                        r = inst.process_audio(r);
+                    }
+                    let g = clip.gain * track.gain * auto * tg;
+                    let oi = (off + i) * 2;
+                    dest[oi] += l * g;
+                    dest[oi + 1] += r * g;
+                }
             }
         }
     }
@@ -1052,6 +1172,72 @@ mod tests {
         let mut audio = BTreeMap::new();
         audio.insert(SourceId(1), tone((len_s * rate as f64) as usize, rate, 440.0, 0.5));
         (p, audio)
+    }
+
+    /// A half-second clip through a big reverb, rendered for three seconds,
+    /// with the tail set as given (`None` = no tail effect at all).
+    fn reverb_render(tail: Option<ClipTail>) -> (Vec<f32>, u32) {
+        let (mut p, audio) = project_with(0.5, 1.0);
+        let mut fx = vec![studio_core::Effect { kind: "reverb".into(), enabled: true,
+            params: [("mix".to_string(), 1.0f32), ("size".to_string(), 0.9), ("damp".to_string(), 0.2),
+                     ("width".to_string(), 1.0)].into_iter().collect() }];
+        if let Some(t) = tail { fx.push(t.effect()); }
+        p.apply(&Op::SetEffects { id: ClipId(1), effects: fx }).unwrap();
+        let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(3.0), 48_000, &[], &[]);
+        (out, 48_000)
+    }
+
+    /// Peak absolute level over [a, b) seconds of an interleaved stereo render.
+    fn peak_between(out: &[f32], rate: u32, a: f64, b: f64) -> f32 {
+        let (i0, i1) = ((a * rate as f64) as usize * 2, ((b * rate as f64) as usize * 2).min(out.len()));
+        out[i0..i1].iter().fold(0.0f32, |m, v| m.max(v.abs()))
+    }
+
+    #[test]
+    fn with_no_tail_setting_the_effect_stops_at_the_clip_end_as_before() {
+        let (out, rate) = reverb_render(None);
+        assert!(peak_between(&out, rate, 0.1, 0.5) > 0.01, "the reverb is audible during the clip");
+        assert_eq!(peak_between(&out, rate, 0.5, 3.0), 0.0,
+                   "no tail effect = the old behaviour, a hard cut at the clip end");
+    }
+
+    #[test]
+    fn a_ring_out_keeps_the_reverb_past_the_clip_and_stops_exactly_when_told() {
+        let (out, rate) = reverb_render(Some(ClipTail { ring: 1.0, fade: 0.0 }));
+        assert!(peak_between(&out, rate, 0.5, 0.7) > 0.005, "the tail rings after the clip ends");
+        assert!(peak_between(&out, rate, 1.3, 1.5) > 0.0, "and is still ringing just before it is cut");
+        assert_eq!(peak_between(&out, rate, 1.5, 3.0), 0.0, "then stops dead at clip end + 1 s");
+    }
+
+    #[test]
+    fn a_fade_shapes_only_the_end_of_the_ring() {
+        let hard = reverb_render(Some(ClipTail { ring: 1.0, fade: 0.0 })).0;
+        let (soft, rate) = reverb_render(Some(ClipTail { ring: 1.0, fade: 0.5 }));
+        // Before the fade starts the two are identical: the fade is a shape
+        // at the END, not a different tail.
+        let i0 = (0.5 * rate as f64) as usize * 2;
+        let i1 = (0.95 * rate as f64) as usize * 2;
+        assert_eq!(&hard[i0..i1], &soft[i0..i1], "untouched until the fade begins");
+        // Inside the fade it is quieter, and it reaches silence at the end
+        // instead of stopping on a non-zero sample.
+        assert!(peak_between(&soft, rate, 1.4, 1.5) < peak_between(&hard, rate, 1.4, 1.5) * 0.5,
+                "the last tenth is well down");
+        let last = ((1.5 * rate as f64) as usize - 1) * 2;
+        assert!(soft[last].abs() < 1e-3, "it ends at silence: {}", soft[last]);
+        assert_eq!(peak_between(&soft, rate, 1.5, 3.0), 0.0);
+    }
+
+    #[test]
+    fn tail_settings_read_back_and_a_fade_never_outlasts_its_ring() {
+        let t = ClipTail::of(&[ClipTail { ring: 2.0, fade: 5.0 }.effect()]);
+        assert_eq!(t, ClipTail { ring: 2.0, fade: 2.0 }, "fade is clamped to the ring");
+        assert_eq!(ClipTail::of(&[]), ClipTail::default(), "no setting = cut");
+        let mut off = ClipTail { ring: 2.0, fade: 0.0 }.effect();
+        off.enabled = false;
+        assert_eq!(ClipTail::of(&[off]).ring, 0.0, "a disabled tail is a cut");
+        assert_eq!(ClipTail { ring: 1.0, fade: 0.5 }.gain_at(0.25), 1.0);
+        assert!((ClipTail { ring: 1.0, fade: 0.5 }.gain_at(0.75) - 0.5).abs() < 1e-6);
+        assert_eq!(ClipTail { ring: 1.0, fade: 0.5 }.gain_at(1.0), 0.0);
     }
 
     #[test]

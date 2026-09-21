@@ -89,6 +89,10 @@ pub enum ShellVerb {
     /// Redraw every waveform from one band of the spectrum. A shell verb:
     /// the peaks are the shell's, built from decoded audio it owns.
     PeakBand(studio_audio::Band),
+    /// What the selected clips' effects do after the clips end: `ring_ms` of
+    /// tail, the last `fade_ms` of it faded. 0 ring is a hard cut at the
+    /// clip end. Milliseconds so the verb stays `Copy + Eq`.
+    ClipTail { ring_ms: u32, fade_ms: u32 },
     TouchUpStabilize(StabilizeKind),
     /// Clean-plate the selected clip: remove something that crosses it,
     /// using `radius` frames each side. `moving` warps the neighbours onto
@@ -226,6 +230,8 @@ pub enum Ask {
     MultiviewGroup,
     /// Which part of the spectrum the waveforms should show.
     PeakBandChoice,
+    /// What should happen to the selected clips' reverb/delay at the clip end.
+    ClipTailChoice,
     /// Whether the camera moves during the shot being cleaned, then how many
     /// frames each side to look at.
     CleanPlateCamera,
@@ -299,6 +305,9 @@ pub fn root() -> Vec<Choice> {
         // Markers: the one request both the FL Studio and kdenlive
         // communities make in the same words.
         c("drop a marker here", None, Then::Do(Act::Shell(ShellVerb::MarkerHere))),
+        c("reverb/delay tail at the clip end (cut or ring out)",
+          Some("hard cut at the edit, or let the space decay past it"),
+          Then::Ask(Ask::ClipTailChoice)),
         c("waveforms: show one band of the spectrum",
           Some("see the low end under a voice, or the sibilance over it"),
           Then::Ask(Ask::PeakBandChoice)),
@@ -603,6 +612,16 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
                 }
             }).collect()
         }
+        Ask::ClipTailChoice => [
+            (0, 0, "cut at the clip end", "the effect stops dead with the clip — a hard cut"),
+            (1_000, 0, "ring 1 s, then cut", "decay past the edit, stop at a known point"),
+            (2_000, 1_000, "ring 2 s, fade the last 1 s", "a natural decay under the next shot"),
+            (4_000, 2_000, "ring 4 s, fade the last 2 s", "a long space: a hall, a stairwell"),
+            (8_000, 0, "ring out fully (8 s)", "let the effect finish on its own"),
+        ].into_iter().map(|(ring_ms, fade_ms, label, what)| Choice {
+            label: label.into(), hint: Some(what.into()),
+            then: Then::Do(Act::Shell(ShellVerb::ClipTail { ring_ms, fade_ms })),
+        }).collect(),
         Ask::PeakBandChoice => [
             (studio_audio::Band::Full, "everything (the usual waveform)"),
             (studio_audio::Band::Low, "low — kick, bass, rumble, room"),
@@ -803,6 +822,22 @@ mod tests {
         let found = filter(&r, "collaborator");
         assert!(found.len() >= 4, "only found {}: {:?}", found.len(),
                 found.iter().map(|c| &c.label).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_tail_chooser_offers_a_hard_cut_first_and_every_ring_says_what_it_is_for() {
+        let r = root();
+        assert!(!filter(&r, "reverb").is_empty() && !filter(&r, "tail").is_empty());
+        let choices = candidates(Ask::ClipTailChoice, &Project::default());
+        let got: Vec<(u32, u32)> = choices.iter().map(|c| match c.then {
+            Then::Do(Act::Shell(ShellVerb::ClipTail { ring_ms, fade_ms })) => (ring_ms, fade_ms),
+            _ => panic!("{:?}", c.label),
+        }).collect();
+        assert_eq!(got[0], (0, 0), "a hard cut is the first answer — it is the way back");
+        assert!(got.iter().any(|(r, f)| *r > 0 && *f == 0), "a ring that ends in a hard cut");
+        assert!(got.iter().any(|(r, f)| *r > 0 && *f > 0), "a ring that fades");
+        assert!(got.iter().all(|(r, f)| f <= r), "no fade outlasts its ring");
+        assert!(choices.iter().all(|c| c.hint.is_some()));
     }
 
     #[test]

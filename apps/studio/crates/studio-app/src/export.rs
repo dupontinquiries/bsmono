@@ -100,7 +100,7 @@ pub fn plan_jobs(plan: &Plan, project: &Project, selection: &[ClipId])
                  -> Result<Vec<Job>, String> {
     let (from, to) = match plan.scope {
         Scope::Full => {
-            let end = project.duration();
+            let end = studio_audio::audible_end(project); // tails ring past the last clip
             if end <= Ticks::ZERO { return Err("the arrangement is empty".into()); }
             (Ticks::ZERO, end)
         }
@@ -387,7 +387,7 @@ pub fn render_music_video(
         .map(|s| (s.id, PathBuf::from(&s.path)))
         .filter(|(_, p)| p.is_file())
         .collect();
-    let end = project.duration();
+    let end = studio_audio::audible_end(project); // tails ring past the last clip
     let list = studio_video::edit::edit_list(project, &paths, Some(end));
     if !list.iter().any(|s| matches!(s, studio_video::edit::Segment::Cut(_))) {
         return Err(if paths.is_empty() {

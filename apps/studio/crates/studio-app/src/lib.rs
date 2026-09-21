@@ -1974,7 +1974,9 @@ impl Studio {
         rate: u32,
         sources: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
     ) -> Vec<f32> {
-        let end = self.session.doc.project.duration();
+        // Where the SOUND ends, not the last clip: a ring-out on the final
+        // clip must not be cut off by the render that plays it.
+        let end = studio_audio::audible_end(&self.session.doc.project);
         if end <= Ticks::ZERO { return Vec::new(); }
         studio_audio::mixdown(
             &self.session.doc.project, sources, &std::collections::BTreeMap::new(),
@@ -2870,6 +2872,26 @@ mod tests {
         assert_eq!(s.session.doc.project.tracks.len(), 3);
         assert!(s.session.doc.project.clips.len() >= 5);
         assert!(s.session.doc.project.duration() > Ticks::ZERO);
+    }
+
+    #[test]
+    fn a_ring_out_on_the_last_clip_is_not_cut_off_by_the_render() {
+        // Project::duration is the end of the last CLIP; a tail on that clip
+        // would be truncated by the very render meant to carry it.
+        let mut s = Studio::demo();
+        let last = s.session.doc.project.clips.values().max_by_key(|c| c.end()).unwrap().clone();
+        let before = s.session.doc.project.duration();
+        s.edit(studio_core::Op::SetEffects { id: last.id, effects: vec![
+            studio_audio::ClipTail { ring: 2.0, fade: 1.0 }.effect()] }, "tail");
+        assert_eq!(s.session.doc.project.duration(), before, "the timeline's extent is unchanged");
+        let end = before.saturating_add(studio_core::Ticks::from_seconds(2.0));
+        assert_eq!(studio_audio::audible_end(&s.session.doc.project), end,
+                   "but the sound ends two seconds later");
+        // And the render the transport plays actually goes that far — the
+        // wiring, not just the helper (a test of the helper alone passed with
+        // render_arrangement still stopping at the last clip).
+        let buf = s.render_arrangement(48_000, &Default::default());
+        assert_eq!(buf.len(), end.to_samples(48_000) as usize * 2, "stereo frames to the audible end");
     }
 
     #[test]
@@ -5698,6 +5720,34 @@ impl App {
                             .get(&g).map(|x| x.name.clone()).unwrap_or_default()),
                         None => "program monitor back on the cut".into(),
                     };
+                }
+                palette::ShellVerb::ClipTail { ring_ms, fade_ms } => {
+                    let tail = studio_audio::ClipTail {
+                        ring: ring_ms as f64 / 1000.0, fade: fade_ms as f64 / 1000.0 };
+                    let project = &self.studio.session.doc.project;
+                    let ops: Vec<studio_core::Op> = self.studio.selection.iter()
+                        .filter_map(|id| project.clips.get(id))
+                        .map(|c| {
+                            // Replace any previous tail setting; leave every
+                            // real effect exactly where it was in the chain.
+                            let mut fx: Vec<studio_core::Effect> = c.effects.iter()
+                                .filter(|e| e.kind != studio_audio::TAIL_KIND).cloned().collect();
+                            if tail.ring > 0.0 { fx.push(tail.effect()); }
+                            studio_core::Op::SetEffects { id: c.id, effects: fx }
+                        }).collect();
+                    if ops.is_empty() {
+                        self.studio.status = "select the clips whose tail to set".into();
+                    } else {
+                        let n = ops.len();
+                        self.studio.edit_group(ops, "clip tail");
+                        self.studio.status = if tail.ring == 0.0 {
+                            format!("{n} clip(s): effects cut at the clip end")
+                        } else {
+                            format!("{n} clip(s): effects ring {:.1} s past the end{}", tail.ring,
+                                    if tail.fade > 0.0 { format!(", fading the last {:.1} s", tail.fade) }
+                                    else { ", then cut".into() })
+                        };
+                    }
                 }
                 palette::ShellVerb::PeakBand(band) => {
                     self.peak_band = band;
