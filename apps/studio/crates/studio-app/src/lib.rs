@@ -57,6 +57,7 @@ pub mod midi;
 pub mod mix_assistant;
 pub mod multicam_cut;
 pub mod relink;
+pub mod transcripts;
 pub mod touchup_job;
 pub mod mixer_panel;
 pub mod morph_pad;
@@ -3114,6 +3115,11 @@ pub struct App {
     /// it is a way of LOOKING at the audio, like a zoom level, not a fact
     /// about the project.
     peak_band: studio_audio::Band,
+    /// What was said in each source — whisper transcripts, loaded from a
+    /// folder of `.srt` files beside the media or picked in the palette.
+    /// Session state: a transcript is a reading of the media, rebuildable,
+    /// and not a fact the project should carry or collaborators should sync.
+    words: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
     /// The camera group the program monitor is showing as a grid, if any.
     multiview: Option<studio_core::GroupId>,
     /// A stabilize/clean-plate render in flight, and the clip it belongs to.
@@ -3257,6 +3263,7 @@ impl Default for App {
             studio.status = format!("{} — midi: {}", studio.status, m.port_name());
         }
         let (provenance_tx, provenance_rx) = std::sync::mpsc::channel();
+        let beside = transcripts::beside_media(&studio.session.doc.project);
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
             provenance_tx, provenance_rx,
             follow: None,
@@ -3308,6 +3315,9 @@ impl Default for App {
               touchup_run: None,
               multiview: None,
               peak_band: studio_audio::Band::Full,
+              // Whisper writes a transcript beside its media by default, so
+              // look there first — no command needed for the common case.
+              words: beside.words,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
               upscale_clip: None,
@@ -3672,6 +3682,12 @@ impl eframe::App for App {
                             "no camera group yet — group the angles of one moment first");
                     }
                     ui.separator();
+                    if ui.button("show transcripts under clips…")
+                        .on_hover_text("load a folder of whisper .srt files; matched to clips by name")
+                        .clicked() {
+                        self.run_palette_act(palette::Act::Shell(palette::ShellVerb::LoadTranscripts));
+                        ui.close();
+                    }
                     if ui.button("relink media to a folder…")
                         .on_hover_text("proxies → camera originals; only the paths move")
                         .clicked() {
@@ -5010,7 +5026,7 @@ impl eframe::App for App {
                         .and_then(|g| g.tempo.as_ref());
                     let tr = studio_egui::timeline(ui, &session.doc,
                                                    view,
-                                                   &colors, ph, &sel, &self.peaks,
+                                                   &colors, ph, &sel, &self.peaks, &self.words,
                                                    *trim_side,
                                                    closed_groups,
                                                    mode, input_mode, &pending,
@@ -5749,6 +5765,14 @@ impl App {
                         };
                     }
                 }
+                palette::ShellVerb::LoadTranscripts => match export::pick_folder() {
+                    None => self.studio.status = "no folder chosen".into(),
+                    Some(dir) => {
+                        let l = transcripts::load(&self.studio.session.doc.project, &dir);
+                        self.studio.status = l.summary();
+                        self.words.extend(l.words);
+                    }
+                },
                 palette::ShellVerb::PeakBand(band) => {
                     self.peak_band = band;
                     // Rebuilt from the audio already in memory — no decoding,

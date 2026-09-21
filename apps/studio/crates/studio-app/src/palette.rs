@@ -89,6 +89,8 @@ pub enum ShellVerb {
     /// Redraw every waveform from one band of the spectrum. A shell verb:
     /// the peaks are the shell's, built from decoded audio it owns.
     PeakBand(studio_audio::Band),
+    /// Load whisper transcripts from a folder and show them under the clips.
+    LoadTranscripts,
     /// What the selected clips' effects do after the clips end: `ring_ms` of
     /// tail, the last `fade_ms` of it faded. 0 ring is a hard cut at the
     /// clip end. Milliseconds so the verb stays `Copy + Eq`.
@@ -305,6 +307,9 @@ pub fn root() -> Vec<Choice> {
         // Markers: the one request both the FL Studio and kdenlive
         // communities make in the same words.
         c("drop a marker here", None, Then::Do(Act::Shell(ShellVerb::MarkerHere))),
+        c("show transcripts under clips (load a folder of .srt)",
+          Some("what is being said, in the gutter under each clip"),
+          Then::Do(Act::Shell(ShellVerb::LoadTranscripts))),
         c("reverb/delay tail at the clip end (cut or ring out)",
           Some("hard cut at the edit, or let the space decay past it"),
           Then::Ask(Ask::ClipTailChoice)),

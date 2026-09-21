@@ -51,6 +51,82 @@ pub struct Segment {
     pub confidence: f32,
 }
 
+/// Parse a whisper `.srt` file into segments (source time).
+///
+/// Tolerant the way a sidecar has to be: blank lines, a missing index line,
+/// `\r\n`, and a stray block with no timing are all skipped rather than
+/// failing the whole file — one damaged cue must not hide the other four
+/// hundred. Confidence is 1.0 because `.srt` does not carry one; speaker is
+/// taken from a leading `[SPEAKER]` or `NAME:` only when whisper wrote one.
+pub fn parse_srt(text: &str) -> Vec<Segment> {
+    fn stamp(s: &str) -> Option<Ticks> {
+        let s = s.trim().replace(',', ".");
+        let mut parts = s.split(':');
+        let (h, m, sec) = (parts.next()?, parts.next()?, parts.next()?);
+        let secs = h.trim().parse::<f64>().ok()? * 3600.0 + m.trim().parse::<f64>().ok()? * 60.0
+            + sec.trim().parse::<f64>().ok()?;
+        Some(Ticks::from_seconds(secs))
+    }
+    let mut out = Vec::new();
+    let text = text.replace("\r\n", "\n");
+    for block in text.split("\n\n") {
+        let lines: Vec<&str> = block.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let Some(ti) = lines.iter().position(|l| l.contains("-->")) else { continue };
+        let Some((a, b)) = lines[ti].split_once("-->") else { continue };
+        let (Some(start), Some(end)) = (stamp(a), stamp(b)) else { continue };
+        let body = lines[ti + 1..].join(" ");
+        if body.trim().is_empty() { continue; }
+        out.push(Segment { start, end: end.max(start), text: body.trim().to_string(),
+                           speaker: None, confidence: 1.0 });
+    }
+    out
+}
+
+/// Words to show under a clip, laid out so they never collide.
+///
+/// A clip's gutter is a thin strip; a transcript is dense. Drawing every
+/// segment would be an unreadable smear at any zoom where a clip is shorter
+/// than its dialogue, so this places a label at each segment's start (in
+/// pixels from the clip's left edge), clipped to the words that fit before
+/// the NEXT label, and drops a segment entirely when it would start within
+/// `min_gap_px` of the previous one. Zoomed out you get an occasional word
+/// per clip; zoomed in, the whole line — the same data, answering "what is
+/// being said here" at whatever scale you are looking.
+///
+/// `char_px` is the width of one character in the gutter font; the caller
+/// knows it, this does not.
+pub fn gutter_words(segments: &[Segment], src_in: Ticks, len: Ticks, px_per_sec: f32,
+                    char_px: f32, min_gap_px: f32) -> Vec<(f32, String)> {
+    let end = src_in.saturating_add(len);
+    let x_of = |t: Ticks| ((t.saturating_sub(src_in)).to_seconds() as f32 * px_per_sec).max(0.0);
+    let width = len.to_seconds() as f32 * px_per_sec;
+    let live: Vec<&Segment> = segments.iter().filter(|s| s.end > src_in && s.start < end).collect();
+    let mut placed: Vec<(f32, &Segment)> = Vec::new();
+    for s in live {
+        let x = x_of(s.start);
+        if placed.last().map(|(px, _)| x - *px < min_gap_px).unwrap_or(false) { continue; }
+        placed.push((x, s));
+    }
+    let mut out = Vec::new();
+    for (i, (x, s)) in placed.iter().enumerate() {
+        let room = placed.get(i + 1).map(|(nx, _)| *nx).unwrap_or(width) - x - char_px;
+        let max_chars = (room / char_px.max(1.0)).floor() as usize;
+        if max_chars < 3 { continue; }
+        // whole words only: a word cut in half reads as a different word
+        let mut shown = String::new();
+        for w in s.text.split_whitespace() {
+            let next = if shown.is_empty() { w.len() } else { shown.len() + 1 + w.len() };
+            if next > max_chars { break; }
+            if !shown.is_empty() { shown.push(' '); }
+            shown.push_str(w);
+        }
+        if shown.is_empty() { continue; }
+        if shown.len() < s.text.len() { shown.push('…'); }
+        out.push((*x, shown));
+    }
+    out
+}
+
 /// A source's transcript plus its search index.
 #[derive(Debug, Clone)]
 pub struct Transcript {
@@ -534,5 +610,57 @@ mod tests {
         let a = rank(&entries, "command", 10);
         let b = rank(&entries, "command", 10);
         assert_eq!(a, b, "equal scores keep source order");
+    }
+}
+
+#[cfg(test)]
+mod gutter_tests {
+    use super::*;
+
+    const SRT: &str = "1\r\n00:00:00,000 --> 00:00:02,000\r\n Good morning, I'm Gloria.\r\n\r\n\
+2\n00:00:02,000 --> 00:00:04,500\nThis is Max.\n\n\
+garbage block with no timing\n\n\
+3\n00:00:05,000 --> 00:00:09,000\nYou will be with other kids and they will take care of you.\n";
+
+    #[test]
+    fn whisper_srt_parses_tolerantly() {
+        let s = parse_srt(SRT);
+        assert_eq!(s.len(), 3, "the untimed block is skipped, not fatal: {s:?}");
+        assert_eq!(s[0].text, "Good morning, I'm Gloria.");
+        assert_eq!(s[1].start, Ticks::from_seconds(2.0));
+        assert_eq!(s[1].end, Ticks::from_seconds(4.5));
+        assert_eq!(s[2].start, Ticks::from_seconds(5.0));
+        assert!(parse_srt("").is_empty() && parse_srt("nonsense").is_empty());
+    }
+
+    #[test]
+    fn zoomed_in_the_whole_line_shows_and_zoomed_out_only_occasional_words() {
+        let s = parse_srt(SRT);
+        // 100 px/s, 7 px per char: plenty of room
+        let wide = gutter_words(&s, Ticks::ZERO, Ticks::from_seconds(10.0), 100.0, 7.0, 40.0);
+        assert_eq!(wide.len(), 3);
+        assert_eq!(wide[0], (0.0, "Good morning, I'm Gloria.".to_string()));
+        // 8 px/s: the whole 10 s clip is 80 px — at most one or two labels,
+        // cut to whole words with an ellipsis, never overlapping
+        let narrow = gutter_words(&s, Ticks::ZERO, Ticks::from_seconds(10.0), 8.0, 7.0, 40.0);
+        assert!(!narrow.is_empty() && narrow.len() < 3, "{narrow:?}");
+        for w in narrow.windows(2) {
+            assert!(w[1].0 - w[0].0 >= 40.0, "labels keep their distance: {narrow:?}");
+        }
+        for (x, t) in &narrow {
+            assert!(x + t.chars().count() as f32 * 7.0 <= 80.0 + 7.0, "{t} overruns the clip");
+            assert!(!t.ends_with(|c: char| c.is_alphabetic()) || s.iter().any(|seg| seg.text.contains(t.as_str())),
+                    "no word is cut in half: {t}");
+        }
+    }
+
+    #[test]
+    fn a_trimmed_clip_shows_only_what_it_plays() {
+        let s = parse_srt(SRT);
+        // clip plays source 4.6..9.0: only the third line is inside it
+        let w = gutter_words(&s, Ticks::from_seconds(4.6), Ticks::from_seconds(4.4), 100.0, 7.0, 40.0);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].1.starts_with("You will be"));
+        assert!((w[0].0 - 40.0).abs() < 1.0, "placed where the line starts inside the clip: {}", w[0].0);
     }
 }

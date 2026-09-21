@@ -370,6 +370,9 @@ pub fn timeline(
     // clip whose audio has not been scanned yet is still editable — analysis
     // must never gate editing.
     peaks: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::Peaks>,
+    // What was said in each source, in source time. Sources without one draw
+    // no words — like peaks, a transcript must never gate editing.
+    words: &std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
     trim_side: TrimSide,
     // Compositions folded CLOSED on this device — view state, passed in
     // because open-or-closed is the workspace sidecar's business while
@@ -522,6 +525,25 @@ pub fn timeline(
                             [Pos2::new(x, mid - hi * half), Pos2::new(x, mid - lo * half)],
                             Stroke::new(1.0_f32, wave));
                     }
+                }
+            }
+            // What is being said, along the clip's bottom edge — the gutter
+            // between this lane and the next. Laid out by
+            // `studio_voice::gutter_words`, so zoomed out it is an occasional
+            // word and zoomed in the whole line, and labels never collide.
+            if let Some(segs) = words.get(&clip.source) {
+                const CHAR_PX: f32 = 6.2;
+                let strip_y = r.max.y - 12.0;
+                if r.height() > 30.0 {
+                    painter.rect_filled(Rect::from_min_max(Pos2::new(r.min.x, strip_y - 1.0), r.max),
+                                        0.0, colors.bg_base.gamma_multiply(0.75));
+                }
+                for (dx, text) in studio_voice::gutter_words(segs, clip.src_in, clip.len,
+                                                              view.px_per_sec, CHAR_PX, 48.0) {
+                    let x = r.min.x + dx + 3.0;
+                    if x < origin.x + view.gutter || x > rect.max.x { continue; }
+                    painter.text(Pos2::new(x, strip_y), Align2::LEFT_TOP, text,
+                                 FontId::proportional(10.0), colors.text_weak);
                 }
             }
             if r.width() > 34.0 {
