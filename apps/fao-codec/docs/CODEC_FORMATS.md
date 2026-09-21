@@ -5,14 +5,27 @@ trailers. Frames have a 1-byte codec marker; trailers have a 4-byte magic.
 
 ## Frame markers
 
-| Byte | Codec | Description |
-|------|-------|-------------|
-| `T`  | v2.1  | Translation residual frame (most common in steady-state) |
-| `K`  | v2.1  | Keyframe — full DCT-coded |
-| `V`  | v3-v5 | Various intermediate codec attempts (mostly retired) |
-| `Z`  | v7/v8 | Reconstruction frame (camera pose + features) |
-| `P`  | v7    | Perception frame (objects + bounding boxes) |
-| `B`  | -     | Boundary marker |
+Codenames are defined in `egui-frontend/src/codec_catalog.rs`, which is the
+source of truth and is tested against the decoder's own marker arms.
+
+| Byte | Codename    | Codec             | Description |
+|------|-------------|-------------------|-------------|
+| `D`  | Keystone    | v1 DCT            | DCT keyframe, 4:2:0 |
+| `P`  | Splitstone  | v1 plane-split    | Luma and chroma planes coded separately |
+| `L`  | Dimglass    | v1 lossy-chroma   | Full luma, heavily quantised chroma |
+| `K`  | Runehoard   | block dictionary  | Frame rebuilt from a FAOBKD01 block dictionary |
+| `T`  | Driftwing   | v2.1 translate    | Translation residual frame (most common in steady-state) |
+| `V`  | Moltshell   | v3-v5             | Intermediate codec attempts (retired) |
+| `Z`  | Worldloom   | v7/v8             | Reconstruction frame (camera pose + features) |
+| `X`  | Conclave    | v10               | Strategy orchestrator, one prediction strategy per frame |
+| `R`  | -           | -                 | Repeat: re-show an earlier renderable frame |
+| `B`  | -           | -                 | Boundary marker |
+
+**Corrected 2026-09.** This table previously gave `P` as a *v7 Perception frame
+(objects + bounding boxes)* and `K` as a *v2.1 keyframe*. Neither matches the
+code: `P` is only ever written as plane-split (`fao_codec_lib/src/lib.rs`, two
+writers), and `K` only by `block_dict.rs` as a dictionary frame. No Perception
+writer exists. v9 (Glowlattice) and v11 (Tectonis) have no container marker.
 
 ## v8 frame layouts
 

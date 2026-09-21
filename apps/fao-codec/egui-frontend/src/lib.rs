@@ -19,6 +19,9 @@ pub mod player;
 pub mod decode;
 /// Write frames as a `.fao`. Uses the v1 DCT path because the V2 encoder's
 /// `FrameResult` returns no bitstream -- see the module notes.
+/// Every codec version by codename -- original names, not version numbers --
+/// with what each can actually encode and decode in this frontend.
+pub mod codec_catalog;
 pub mod export;
 pub mod transcode;
 
