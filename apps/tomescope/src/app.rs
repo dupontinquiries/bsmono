@@ -35,9 +35,15 @@ struct OpenBook {
     active_session: Option<ActiveSession>,
 }
 
+/// eink-kit's page-turn key (`eink_kit::engine::PAGE_TURN_KEY`), written as a
+/// plain bool so tomescope's core needs no eink-kit dependency.
+const EINK_PAGE_TURN: &str = "eink.page_turn";
+
 pub struct TomeApp {
     /// E-ink mode (see `set_eink`).
     eink: bool,
+    /// A page changed last frame; announce it with the frame that draws it.
+    page_turn_pending: bool,
     library: Library,
     textures: TextureCache,
     toasts: Toasts,
@@ -125,6 +131,14 @@ impl TomeApp {
     /// One frame. Both shells call this: eframe's `update`, and eink-kit's
     /// runner through `FromCtx`.
     pub fn update(&mut self, ctx: &egui::Context) {
+        // A page turn is decided while the OLD page is drawn (the tap lands
+        // on it), so the new page's pixels come one frame later. Announce the
+        // turn with that frame, whose damage is the new page. Plain egui
+        // memory: no eink-kit dependency, inert on a desktop.
+        if std::mem::take(&mut self.page_turn_pending) {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new(EINK_PAGE_TURN), true));
+        }
+        let page_before = self.open_book.as_ref().map(|b| (b.id, b.reader.current_page));
         self.adaptive = Adaptive::detect(ctx);
         let colors = palette_colors(&self.app_palette);
 
@@ -167,6 +181,13 @@ impl TomeApp {
         self.draw_command_palette(ctx);
         self.toasts.ui(ctx, 24.0);
 
+        // Any path that changed the page (tap zone, keys, TOC, search jump).
+        let page_after = self.open_book.as_ref().map(|b| (b.id, b.reader.current_page));
+        if self.eink && page_before.is_some() && page_after != page_before && page_before.map(|p| p.0) == page_after.map(|p| p.0) {
+            self.page_turn_pending = true;
+            ctx.request_repaint();
+        }
+
         // The heartbeat drives toast expiry (Toasts schedules no repaint of
         // its own). On a desktop 4 Hz is free. On e-ink every frame is CPU
         // raster work on a battery device, so only tick while a toast is
@@ -200,6 +221,11 @@ impl TomeApp {
     /// applied the settings palette (dark by default), which would otherwise
     /// paint the whole UI dark on paper. A shell may then layer its own
     /// visuals on top (eink-kit's paper-and-ink preset does).
+    /// The open book's current page, if a book is open (for shells/tests).
+    pub fn current_page(&self) -> Option<usize> {
+        self.open_book.as_ref().map(|b| b.reader.current_page)
+    }
+
     pub fn set_eink(&mut self, ctx: &egui::Context, on: bool) {
         self.eink = on;
         if on {
@@ -221,6 +247,7 @@ impl TomeApp {
 
         Self {
             eink: false,
+            page_turn_pending: false,
             library,
             textures: TextureCache::new(64),
             toasts: Toasts::new(),
