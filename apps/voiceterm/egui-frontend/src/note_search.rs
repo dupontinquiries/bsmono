@@ -41,11 +41,13 @@ pub const TITLE_WEIGHT: f32 = 3.0;
 ///
 /// Under three characters, or one of a short stop list, and it is not a query term: "the",
 /// "a" and "is" appear in every note and would rank the corpus by length.
+/// Words too common to be worth searching for, by either path.
+const STOP: &[&str] = &[
+    "the", "and", "for", "was", "were", "this", "that", "with", "from", "into", "then",
+    "have", "has", "are", "but", "not", "you", "its", "it's", "our", "their",
+];
+
 pub fn terms(query: &str) -> Vec<String> {
-    const STOP: &[&str] = &[
-        "the", "and", "for", "was", "were", "this", "that", "with", "from", "into", "then",
-        "have", "has", "are", "but", "not", "you", "its", "it's", "our", "their",
-    ];
     let mut out: Vec<String> = Vec::new();
     for w in query.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
         let w = w.trim_matches('-').to_lowercase();
@@ -149,7 +151,36 @@ pub fn line_at(text: &str, char_index: usize) -> Option<&str> {
 /// list padded to a fixed length with unrelated notes teaches that the suggestions are
 /// unrelated.
 pub fn search(query: &str, corpus: &[(String, String, String)], limit: usize) -> Vec<Hit> {
-    let terms = terms(query);
+    search_terms(&terms(query), corpus, limit)
+}
+
+/// Search for one deliberately TAPPED word.
+///
+/// A tap is not a query. `terms` drops words under three characters because in
+/// a typed sentence they are mostly noise -- "a", "is", "to". But a tap is one
+/// word the user CHOSE, and the short ones that survive being chosen are
+/// exactly the technical terms a notes app is full of: AI, UI, OS, Go, JS, IO,
+/// QA, UX. Routed through `search`, tapping any of them came back with no
+/// related notes, which reads as "nothing links to this" rather than "the
+/// search ignored your word".
+///
+/// Stop words are still skipped -- tapping "the" is not a request to find every
+/// note containing it -- but length is not a reason to ignore a choice.
+pub fn search_tapped(word: &str, corpus: &[(String, String, String)], limit: usize) -> Vec<Hit> {
+    let w = word.trim().to_lowercase();
+    if w.is_empty() || is_stop(&w) {
+        return Vec::new();
+    }
+    search_terms(&[w], corpus, limit)
+}
+
+/// Is this one of `terms`' stop words? Shared so the tap path and the query
+/// path cannot disagree about what counts as noise.
+fn is_stop(w: &str) -> bool {
+    STOP.contains(&w)
+}
+
+fn search_terms(terms: &[String], corpus: &[(String, String, String)], limit: usize) -> Vec<Hit> {
     if terms.is_empty() {
         return Vec::new();
     }
@@ -158,7 +189,7 @@ pub fn search(query: &str, corpus: &[(String, String, String)], limit: usize) ->
         .filter_map(|(name, title, body)| {
             let mut score = 0.0;
             let mut matched = 0;
-            for t in &terms {
+            for t in terms {
                 let in_title = has_word(title, t);
                 let in_body = has_word(body, t);
                 if in_title {
@@ -328,4 +359,60 @@ mod tests {
         // And the limit is a cap, not a target.
         assert_eq!(search("linker", &corpus(), 2).len(), 2);
     }
+
+
+#[cfg(test)]
+mod tapped_tests {
+    use super::*;
+
+    fn corpus() -> Vec<(String, String, String)> {
+        vec![
+            ("n1".into(), "AI notes".into(), "thoughts on AI safety".into()),
+            ("n2".into(), "Groceries".into(), "milk and eggs".into()),
+            ("n3".into(), "UI sketch".into(), "button layout for the UI".into()),
+        ]
+    }
+
+    /// THE BUG. Tapping a short technical term found nothing, because the tap
+    /// went through `search`, which drops words under three characters.
+    #[test]
+    fn tapping_a_two_letter_term_finds_its_notes() {
+        let hits = search_tapped("AI", &corpus(), 3);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].name, "n1");
+        let ui = search_tapped("UI", &corpus(), 3);
+        assert_eq!(ui.first().map(|h| h.name.as_str()), Some("n3"));
+    }
+
+    /// And the typed-query path still ignores them -- unchanged, deliberately.
+    /// In a sentence "ai" is as likely to be noise as signal.
+    #[test]
+    fn a_typed_query_still_drops_short_words() {
+        assert!(search("AI", &corpus(), 3).is_empty(),
+                "typed search behaviour must not change");
+    }
+
+    /// A tap on a stop word is still not a search.
+    #[test]
+    fn tapping_a_stop_word_finds_nothing() {
+        assert!(search_tapped("the", &corpus(), 3).is_empty());
+        assert!(search_tapped("  ", &corpus(), 3).is_empty());
+    }
+
+    /// Case-insensitive, since `word_at` returns the word as it appears.
+    #[test]
+    fn a_tapped_word_matches_regardless_of_case() {
+        assert_eq!(search_tapped("ai", &corpus(), 3).len(), 1);
+        assert_eq!(search_tapped("Ai", &corpus(), 3).len(), 1);
+    }
+
+    /// The two paths share one stop list, so they cannot drift apart.
+    #[test]
+    fn both_paths_agree_on_what_is_noise() {
+        for w in STOP.iter() {
+            assert!(terms(w).is_empty(), "{w} leaked through terms");
+            assert!(search_tapped(w, &corpus(), 3).is_empty(), "{w} leaked through a tap");
+        }
+    }
+}
 }

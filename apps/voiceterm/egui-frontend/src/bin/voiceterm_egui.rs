@@ -5081,7 +5081,10 @@ impl eframe::App for VoicetermApp {
                                 });
                                 if let Some(w) = word_tap {
                                     let corpus = voiceterm_egui::note_store::documents();
-                                    let hits = voiceterm_egui::note_search::search(&w, &corpus, 3);
+                                    // `search_tapped`, not `search`: a tap is one chosen
+                                    // word, and `search` drops anything under three
+                                    // characters -- so tapping "AI" or "UI" found nothing.
+                                    let hits = voiceterm_egui::note_search::search_tapped(&w, &corpus, 3);
                                     // HELD, not toasted. A toast names the related notes and
                                     // then takes them away — the answer to "what does this
                                     // belong with" is only useful if you can go there, and a
