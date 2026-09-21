@@ -824,12 +824,47 @@ pub struct Parser {
     params: Vec<u16>,
     /// True when the current CSI began `CSI ?` — a DEC PRIVATE sequence.
     private: bool,
+    /// The `>` / `=` markers of the current CSI. Tracked because DA1 (`CSI c`),
+    /// DA2 (`CSI > c`) and DA3 (`CSI = c`) share a final byte and differ ONLY
+    /// here -- dropping them as generic intermediates answered DA2 with DA1.
+    gt: bool,
+    eq: bool,
     cur: Option<u16>,
+    /// Bytes the TERMINAL must send back to the program: answers to queries.
+    ///
+    /// ## Why this exists: the helix start-up delay
+    ///
+    /// Reported as "the hx command has a delay in the egui version, fixed in
+    /// the Qt predecessor". It was fixed there in `pty_term.rs` v0.1.784, and
+    /// that comment is the diagnosis: crossterm's
+    /// `supports_keyboard_enhancement()`, called at start-up by helix, gitui
+    /// and other ratatui/crossterm TUIs, sends `CSI ? u` then `CSI c` and BLOCKS
+    /// waiting for the Device Attributes reply as a sync marker. With no reply
+    /// it stalls ~2-3 s before giving up.
+    ///
+    /// This parser had no outbound channel at all, so it could not have
+    /// answered even if it had recognised the query. The host drains this with
+    /// [`Parser::take_replies`] and writes it to the PTY master.
+    replies: Vec<u8>,
 }
 
 impl Default for Parser {
     fn default() -> Self {
-        Parser { state: State::Ground, params: Vec::new(), cur: None, private: false }
+        Parser {
+            state: State::Ground, params: Vec::new(), cur: None, private: false,
+            gt: false, eq: false, replies: Vec::new(),
+        }
+    }
+}
+
+impl Parser {
+    /// Bytes to write back to the PTY: answers to terminal queries, in order.
+    ///
+    /// Must be drained and written after every feed. A reply that is queued
+    /// and never sent is exactly as slow as no reply -- the program is still
+    /// waiting on the other end of the PTY.
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.replies)
     }
 }
 
@@ -871,6 +906,8 @@ impl Parser {
                 '[' => {
                     self.params.clear();
                     self.private = false;
+                    self.gt = false;
+                    self.eq = false;
                     self.cur = None;
                     self.state = State::Csi;
                 }
@@ -921,6 +958,8 @@ impl Parser {
                         self.params.push(self.cur.take().unwrap_or(0));
                     }
                     '?' => { self.private = true; }
+                    '>' => { self.gt = true; }
+                    '=' => { self.eq = true; }
                     '@'..='~' => {
                         let params = self.take_params();
                         if self.private {
@@ -1040,6 +1079,35 @@ impl Parser {
             'J' => grid.erase_in_display(params.first().copied().unwrap_or(0)),
             'K' => grid.erase_in_line(params.first().copied().unwrap_or(0)),
             'm' => self.apply_sgr(params, grid),
+            // DEVICE ATTRIBUTES. Answered exactly as Qt's `pty_term.rs` does:
+            //   DA1 `CSI c` / `CSI 0 c` -> `ESC [ ? 1 ; 2 c` (VT100 + advanced
+            //       video). The content is irrelevant to crossterm, which only
+            //       needs SOME reply as a sync marker; kept conservative so
+            //       programs do not assume features this terminal lacks.
+            //   DA2 `CSI > c`           -> `ESC [ > 0 ; 276 ; 0 c`
+            //   DA3 `CSI = c`           -> left unanswered, as in Qt (rare, no
+            //       known blocker).
+            // NOT answering `CSI ? u` is deliberate and correct: silence there
+            // means "no kitty keyboard protocol", which is true.
+            'c' => {
+                if self.gt {
+                    self.replies.extend_from_slice(b"\x1b[>0;276;0c");
+                } else if !self.eq && params.first().copied().unwrap_or(0) == 0 {
+                    self.replies.extend_from_slice(b"\x1b[?1;2c");
+                }
+            }
+            // DEVICE STATUS REPORT. Tools that ask where the cursor is block
+            // for the answer too (Qt's v0.1.418 names ollama's spinner).
+            //   DSR 5 -> `ESC [ 0 n` (status OK)
+            //   DSR 6 -> `ESC [ row ; col R`, 1-based, as the query expects.
+            'n' => match params.first().copied().unwrap_or(0) {
+                5 => self.replies.extend_from_slice(b"\x1b[0n"),
+                6 => {
+                    let r = format!("\x1b[{};{}R", grid.cur_row + 1, grid.cur_col + 1);
+                    self.replies.extend_from_slice(r.as_bytes());
+                }
+                _ => {}
+            },
             _ => {} // unsupported CSI: ignore
         }
     }
@@ -1134,6 +1202,16 @@ impl Terminal {
     /// Feed already-decoded text.
     pub fn feed(&mut self, text: &str) {
         self.parser.feed(text, &mut self.grid);
+    }
+
+    /// Answers to terminal queries that must be written back to the PTY.
+    ///
+    /// CALL AFTER EVERY FEED AND WRITE THE RESULT TO THE PTY MASTER. See
+    /// `Parser::replies` for why: helix and other crossterm programs block on
+    /// start-up waiting for these, and a reply that is queued but never sent
+    /// is exactly as slow as none.
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        self.parser.take_replies()
     }
 
     /// Place a command on the input line **without running it** — the cross-app action
@@ -3296,4 +3374,69 @@ mod wide_char_tests {
         assert_eq!(Grid::char_width('\u{1F600}'), 2);
         assert_eq!(Grid::char_width('\u{1F9F0}'), 2);
     }
+
+#[cfg(test)]
+mod query_reply_tests {
+    use super::*;
+
+    fn replies_for(input: &str) -> Vec<u8> {
+        let mut t = Terminal::new(80, 24);
+        t.feed(input);
+        t.take_replies()
+    }
+
+    /// THE HELIX DELAY. crossterm sends `CSI c` at start-up and blocks until
+    /// the terminal answers. The answer is Qt's, byte for byte.
+    #[test]
+    fn device_attributes_are_answered() {
+        assert_eq!(replies_for("\x1b[c"), b"\x1b[?1;2c");
+        assert_eq!(replies_for("\x1b[0c"), b"\x1b[?1;2c", "the explicit-zero form too");
+    }
+
+    /// crossterm's exact start-up pair: `CSI ? u` then `CSI c`. The keyboard
+    /// query must stay UNANSWERED -- silence means "no kitty protocol", which
+    /// is true -- and only the DA1 marker comes back.
+    #[test]
+    fn crosstermss_startup_probe_gets_exactly_the_da1_reply() {
+        assert_eq!(replies_for("\x1b[?u\x1b[c"), b"\x1b[?1;2c");
+    }
+
+    /// DA2 differs from DA1 ONLY by the `>` marker. Dropping it as a generic
+    /// intermediate answered DA2 with a DA1 reply.
+    #[test]
+    fn secondary_attributes_get_their_own_reply() {
+        assert_eq!(replies_for("\x1b[>c"), b"\x1b[>0;276;0c");
+        assert_eq!(replies_for("\x1b[=c"), b"", "DA3 left unanswered, as in Qt");
+    }
+
+    /// Where is the cursor? Answered 1-based, as the query expects.
+    #[test]
+    fn a_cursor_position_query_is_answered_one_based() {
+        // Move to row 5, col 10 (1-based), then ask.
+        assert_eq!(replies_for("\x1b[5;10H\x1b[6n"), b"\x1b[5;10R");
+        assert_eq!(replies_for("\x1b[5n"), b"\x1b[0n", "status: OK");
+    }
+
+    /// The marker state must RESET per sequence, or a DA2 would turn the next
+    /// plain DA1 into a DA2 too.
+    #[test]
+    fn markers_do_not_leak_into_the_next_sequence() {
+        assert_eq!(replies_for("\x1b[>c\x1b[c"), b"\x1b[>0;276;0c\x1b[?1;2c");
+    }
+
+    /// Replies are drained, not accumulated -- a second take is empty.
+    #[test]
+    fn replies_are_taken_once() {
+        let mut t = Terminal::new(80, 24);
+        t.feed("\x1b[c");
+        assert!(!t.take_replies().is_empty());
+        assert!(t.take_replies().is_empty(), "must not be sent twice");
+    }
+
+    /// Ordinary output produces no replies at all.
+    #[test]
+    fn plain_output_sends_nothing_back() {
+        assert!(replies_for("hello\r\n\x1b[31mred\x1b[0m\x1b[2J").is_empty());
+    }
+}
 }

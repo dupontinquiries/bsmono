@@ -201,6 +201,24 @@ impl VoicetermApp {
         // while I worked out which one reaches the screen.
         self.app.terminal.feed(&String::from_utf8_lossy(bytes));
 
+        // ANSWER THE PROGRAM'S QUERIES, back down the same PTY, immediately.
+        //
+        // This is the helix start-up delay. crossterm programs -- helix, gitui
+        // -- send `CSI c` at launch and BLOCK ~2-3 s until the terminal answers.
+        // The Qt terminal fixed it in `pty_term.rs` v0.1.784; the egui terminal
+        // parsed the query and had nowhere to put an answer. It now queues one,
+        // and this is the half that sends it: a reply that is queued and not
+        // written is exactly as slow as no reply at all.
+        //
+        // Right after the feed, not batched to the next frame: the program is
+        // already blocked waiting, and every frame of delay is visible as lag.
+        let replies = self.app.terminal.take_replies();
+        if !replies.is_empty() {
+            if let Some(host) = &self.pty {
+                let _ = host.write(&replies);
+            }
+        }
+
         // THE SHELL'S WORKING DIRECTORY, from the stream it is already sending.
         //
         // `uikit_term::blocks` records a cwd per block and its doc says the value comes from
@@ -5761,6 +5779,13 @@ impl eframe::App for VoicetermApp {
                 // the parked half of the same rule.
                 if let Some(app) = self.pane_apps.get_mut(id) {
                     app.terminal.feed(&String::from_utf8_lossy(&out));
+                    // And answer its queries on ITS OWN pty. Without this,
+                    // helix started in a background split still stalls 2-3 s,
+                    // and the fix above would only cover the focused pane.
+                    let replies = app.terminal.take_replies();
+                    if !replies.is_empty() {
+                        let _ = h.write(&replies);
+                    }
                 }
                 // `h.ended()` (shell exited while backgrounded) is intentionally not surfaced
                 // here: the toast path above is keyed to the single focused-pane pty_ended_noted

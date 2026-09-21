@@ -674,6 +674,42 @@ pub enum BlockKind {
 }
 
 impl CommandBlock {
+    /// Classify this block's output. Ordered, not scored -- see the section
+    /// header above.
+    ///
+    /// THIS FUNCTION WAS MISSING. The section says the detection was "ported
+    /// VERBATIM from voiceterm's src/term_blocks.rs", and the enum, both
+    /// predicates and the tests all came across -- but not this, the one
+    /// function that turns them into a `BlockKind`. Nothing in the crate
+    /// produced a BlockKind at all, and the tests calling `detected_kind()`
+    /// never compiled, so `cargo test -p uikit-term` has been failing to build
+    /// since the port. I claimed the port worked without running it. Taken
+    /// verbatim from term_blocks.rs:93 now.
+    pub fn detected_kind(&self) -> BlockKind {
+        // Email: output starts with one of the standard mail
+        // headers (after any leading blank lines).
+        let trimmed_out = self.output.trim_start();
+        if Self::looks_like_email(trimmed_out) {
+            return BlockKind::Email;
+        }
+        // Git: command starts with `git ` (or is exactly `git`).
+        // Output must also exist (some git commands like
+        // `git config --global ...` produce nothing).
+        let cmd = self.command.trim_start();
+        if (cmd == "git" || cmd.starts_with("git "))
+            && !self.output.trim().is_empty()
+        {
+            return BlockKind::Git;
+        }
+        // Table: 3+ lines with consistent column counts (split
+        // on multi-space). Cheap heuristic; future feature ships
+        // can refine.
+        if Self::looks_like_table(&self.output) {
+            return BlockKind::Table;
+        }
+        BlockKind::Plain
+    }
+
     pub fn looks_like_email(text: &str) -> bool {
         let mut has_anchor = false; // From: or Subject:
         let mut total_headers = 0;
@@ -766,7 +802,7 @@ mod kind_tests {
         t.submit_command(cmd, 0);
         t.append_output(out);
         t.finish(Some(0));
-        t.blocks().last().unwrap().clone()
+        t.blocks.last().unwrap().clone()
     }
 
     /// Email is checked FIRST because its signature is nearly conclusive.
