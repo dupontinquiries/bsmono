@@ -107,6 +107,10 @@ pub enum ShellVerb {
     /// Drive `bus` from the selected scene's stage signal through response
     /// preset `preset` (see `stage::PRESETS`).
     StageBind { bus: BusId, preset: u8 },
+    /// Measure the look of the picture under the playhead and hold it.
+    StyleCopy,
+    /// Give the selected clips the held look, at `pct`% strength.
+    StylePaste(u32),
     /// What the selected clips' effects do after the clips end: `ring_ms` of
     /// tail, the last `fade_ms` of it faded. 0 ring is a hard cut at the
     /// clip end. Milliseconds so the verb stays `Copy + Eq`.
@@ -260,6 +264,8 @@ pub enum Ask {
     KaleidoChoice,
     /// Which bus the scene's stage should drive, then how it answers.
     StageBus,
+    /// How strongly to paste the held look.
+    StyleStrength,
     StageResponse(BusId),
     /// How to trim a chosen line before it goes in.
     InsertTrim { source: studio_core::SourceId, start_ms: u64, end_ms: u64 },
@@ -346,6 +352,10 @@ pub fn root() -> Vec<Choice> {
         c("insert a clip at the playhead by what is said (or a time range)",
           Some("search the transcripts, or type C0057 12.5-18"),
           Then::Ask(Ask::InsertFind)),
+        c("style: copy the look under the playhead", Some("then paste it onto other clips"),
+          Then::Do(Act::Shell(ShellVerb::StyleCopy))),
+        c("style: paste the copied look onto the selected clips", Some("each clip is matched from its own look"),
+          Then::Ask(Ask::StyleStrength)),
         c("stage: let the selected scene drive a bus (music / sfx / rhythm)",
           Some("one arc per scene; each bus answers it its own way"),
           Then::Ask(Ask::StageBus)),
@@ -686,6 +696,11 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
             ]
         }
         Ask::InsertFind | Ask::InsertTo { .. } => Vec::new(), // need transcripts: see Palette::choices
+        Ask::StyleStrength => [(100u32, "the full look"), (75, "most of it — keeps some of the clip"), (50, "halfway — a nod to it"), (0, "remove the look")]
+            .into_iter().map(|(p, what)| Choice {
+                label: if p == 0 { "off".into() } else { format!("{p}%") }, hint: Some(what.into()),
+                then: Then::Do(Act::Shell(ShellVerb::StylePaste(p))),
+            }).collect(),
         Ask::StageBus => project.busses.iter().filter(|(_, b)| !b.silent)
             .map(|(id, b)| plain(b.name.clone(), Then::Ask(Ask::StageResponse(*id)))).collect(),
         Ask::StageResponse(bus) => crate::stage::PRESETS.iter().enumerate().map(|(i, p)| Choice {

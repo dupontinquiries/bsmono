@@ -3239,6 +3239,8 @@ pub struct App {
     /// loses what the previous filter hid.
     words_raw: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
     word_filter: studio_voice::WordFilter,
+    /// The look copied by "style: copy", waiting to be pasted.
+    style_ref: Option<studio_video::style::Stats>,
     /// The kaleidoscope gallery, open over the selected clip's frame.
     kaleido_gallery: Option<kaleido_gallery::Gallery>,
     /// Structure view: sections across, lanes down, instead of one row per
@@ -3454,6 +3456,7 @@ impl Default for App {
               word_filter: studio_voice::WordFilter::All,
               structure_view: false,
               kaleido_gallery: None,
+              style_ref: None,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
               upscale_clip: None,
@@ -5991,6 +5994,58 @@ impl App {
                     self.studio.status = if self.words_raw.is_empty() {
                         "no transcripts loaded yet — the filter applies once they are".into()
                     } else { self.refilter_words() };
+                }
+                palette::ShellVerb::StyleCopy => {
+                    let project = &self.studio.session.doc.project;
+                    let ph = self.studio.playhead();
+                    let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                    // the picture actually on screen: the topmost video layer at the playhead
+                    match viewport::video_at(project, ph) {
+                        None => self.studio.status = "no picture under the playhead to copy a look from".into(),
+                        Some((path, media)) => match studio_video::frame_rgb(&base.join(&path), media, 320, 180) {
+                            Ok(px) => {
+                                let st = studio_video::style::stats(&px);
+                                self.studio.status = format!("look copied: median lightness {:.0}, highlights tint a {:+.0} b {:+.0}, shadows a {:+.0} b {:+.0}",
+                                    st.q[4], st.band[2][0], st.band[2][1], st.band[0][0], st.band[0][1]);
+                                self.style_ref = Some(st);
+                            }
+                            Err(e) => self.studio.status = format!("could not read the frame: {e:?}"),
+                        },
+                    }
+                }
+                palette::ShellVerb::StylePaste(pct) => {
+                    let Some(reference) = self.style_ref else {
+                        self.studio.status = "copy a look first (style: copy the look under the playhead)".into();
+                        return;
+                    };
+                    let project = &self.studio.session.doc.project;
+                    let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                    let mut ops = Vec::new();
+                    let mut unread = 0;
+                    for c in self.studio.selection.iter().filter_map(|id| project.clips.get(id)) {
+                        let Some(src) = project.sources.get(&c.source).filter(|s| s.has_video) else { continue };
+                        let mut fx: Vec<studio_core::Effect> = c.effects.iter()
+                            .filter(|e| e.kind != studio_video::style::KIND).cloned().collect();
+                        if pct > 0 {
+                            // each clip is matched from its OWN look, measured mid-clip, so a
+                            // dark take and a bright one both land on the reference
+                            let mid = c.src_in.saturating_add(Ticks(c.len.0 / 2));
+                            match studio_video::frame_rgb(&base.join(&src.path), mid, 320, 180) {
+                                Ok(px) => fx.push(studio_video::style::Transfer::fit(
+                                    &studio_video::style::stats(&px), &reference, pct as f32 / 100.0).effect()),
+                                Err(_) => { unread += 1; continue; }
+                            }
+                        }
+                        ops.push(studio_core::Op::SetEffects { id: c.id, effects: fx });
+                    }
+                    if ops.is_empty() {
+                        self.studio.status = "select the picture clips to give the look to".into();
+                    } else {
+                        let n = ops.len();
+                        self.studio.edit_group(ops, "style");
+                        self.studio.status = format!("{n} clip(s): {} {}", if pct > 0 { format!("look at {pct}%") } else { "look removed".into() },
+                            if unread > 0 { format!("({unread} could not be read)") } else { String::new() });
+                    }
                 }
                 palette::ShellVerb::StageBind { bus, preset } => {
                     match stage::bind_ops(&self.studio.session.doc.project, &self.studio.selection.clone(), bus, preset as usize) {

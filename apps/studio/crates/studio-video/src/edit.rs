@@ -56,6 +56,9 @@ pub struct Picture {
     /// A kaleidoscope fold, run after the grade and before the reframe --
     /// the same order the viewport uses.
     pub kaleido: Option<crate::kaleido::Kaleido>,
+    /// A clip style transfer, run as a 3D LUT after the grade and before the
+    /// kaleidoscope -- the viewport's order.
+    pub style: Option<crate::style::Transfer>,
     /// Effects that change the picture in the preview but that this export
     /// cannot yet reproduce, named for the person exporting. Never silently
     /// dropped: a file that differs from the preview must say so.
@@ -66,7 +69,8 @@ impl Picture {
     /// From a clip's effect list, in order (a later effect of the same kind
     /// wins, as in the viewport).
     pub fn of(effects: &[studio_core::Effect]) -> Picture {
-        let mut p = Picture { kaleido: crate::kaleido::Kaleido::of(effects), ..Picture::default() };
+        let mut p = Picture { kaleido: crate::kaleido::Kaleido::of(effects),
+                              style: crate::style::Transfer::of(effects), ..Picture::default() };
         for fx in effects.iter().filter(|f| f.enabled) {
             match studio_fx::instantiate(fx, 48_000.0) {
                 Some(studio_fx::Instance::Transform(t)) => {
@@ -84,7 +88,9 @@ impl Picture {
         p
     }
 
-    pub fn is_identity(&self) -> bool { self.transform.is_none() && self.color.is_none() && self.kaleido.is_none() }
+    pub fn is_identity(&self) -> bool {
+        self.transform.is_none() && self.color.is_none() && self.kaleido.is_none() && self.style.is_none()
+    }
 
     /// The filter chain from a fitted `w`×`h` frame to the finished picture,
     /// as `(foreground chain, overlay position)`. The foreground chain runs on
@@ -105,6 +111,16 @@ impl Picture {
                     ",colorchannelmixer=rr={:.6}:rg={kg:.6}:rb={kb:.6}:gr={kr:.6}:gg={:.6}:gb={kb:.6}:br={kr:.6}:bg={kg:.6}:bb={:.6}",
                     kr + s, kg + s, kb + s));
             }
+        }
+        if let Some(st) = &self.style {
+            // the LUT as a .cube in the temp dir, named by its content so the
+            // same look is written once however many cuts share it
+            let cube = st.cube(crate::style::LUT_N);
+            let mut hsh = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&cube, &mut hsh);
+            let path = std::env::temp_dir().join(format!("studio-style-{:016x}.cube", std::hash::Hasher::finish(&hsh)));
+            if !path.exists() { let _ = std::fs::write(&path, &cube); }
+            f.push_str(&format!(",lut3d=file='{}':interp=trilinear", path.display()));
         }
         if let Some(k) = &self.kaleido {
             f.push(',');
@@ -508,7 +524,7 @@ mod tests {
             crop: (0.2, 0.0, 0.0, 0.1), ..Default::default() };
         let c = studio_fx::Color { lift: [0.0, 0.0, 0.1], gamma: [1.0, 1.6, 1.0],
             gain: [0.6, 1.0, 1.0], saturation: 0.7 };
-        let picture = Picture { transform: Some(t), color: Some(c), kaleido: None, unsupported: vec![] };
+        let picture = Picture { transform: Some(t), color: Some(c), kaleido: None, style: None, unsupported: vec![] };
         let seg = Segment::Cut(Cut { path: take.video.clone(), src_in: s(1.0), len: s(1.0), at: s(0.0), picture });
         let out = shoot.dir.join(format!("fx-{}.mp4", std::process::id()));
         render(&[seg], None, &out, w, h, 12).expect("render");
@@ -597,5 +613,40 @@ mod tests {
             .filter(|(x, y)| x.iter().zip(y.iter()).all(|(p, q)| (*p as i32 - *q as i32).abs() <= 20)).count();
         assert!((same_as_plain as f32) < 0.8 * (w * h) as f32, "the export is not simply the plain picture");
         for f in [&tex, &plain, &folded] { let _ = std::fs::remove_file(f); }
+    }
+
+    #[test]
+    fn a_styled_cut_exports_what_the_preview_shows() {
+        if !crate::testkit::ffmpeg_or_skip("a_styled_cut_exports_what_the_preview_shows") { return; }
+        use crate::framepipe::{Pipe, Size};
+        let shoot = crate::testkit::shoot(&[1.0], 3.0);
+        let (w, h) = (96u32, 54u32);
+        let tex = shoot.dir.join(format!("sty-src-{}.mp4", std::process::id()));
+        Pipe { input: shoot.takes[0].video.clone(), range: None, size: Size { w, h }, fps: 12.0 }
+            .map(&tex, 12, |_, mut f| {
+                for y in 0..f.h { for x in 0..f.w {
+                    let sky = y < f.h / 2;
+                    let v = if sky { 150 + (y * 4) as u8 } else { 40 + (x * 2) as u8 };
+                    f.set(x, y, if sky { [v - 30, v - 10, v] } else { [v / 2, v, v / 3] });
+                }}
+                f
+            }).expect("source");
+        let a0 = super::super::frame_rgb(&tex, s(1.0), w, h).unwrap();
+        // a look to transfer: the same picture pushed warm and bright
+        let warm: Vec<u8> = a0.chunks(3).flat_map(|p| [p[0].saturating_add(50), p[1].saturating_add(20), p[2]]).collect();
+        let t = crate::style::Transfer::fit(&crate::style::stats(&a0), &crate::style::stats(&warm), 1.0);
+        let cut = |picture: Picture| Segment::Cut(Cut { path: tex.clone(), src_in: s(0.5), len: s(1.0), at: s(0.0), picture });
+        let (plain, styled) = (shoot.dir.join(format!("sty-p-{}.mp4", std::process::id())), shoot.dir.join(format!("sty-s-{}.mp4", std::process::id())));
+        render(&[cut(Picture::default())], None, &plain, w, h, 12).expect("plain");
+        render(&[cut(Picture { style: Some(t), ..Picture::default() })], None, &styled, w, h, 12).expect("styled");
+        let a = super::super::frame_rgb(&plain, s(0.5), w, h).unwrap();
+        let b = super::super::frame_rgb(&styled, s(0.5), w, h).unwrap();
+        let mut want = a.clone();
+        crate::style::apply_lut(&mut want, &t.lut(crate::style::LUT_N), crate::style::LUT_N);
+        let mean = |v: &[u8]| v.iter().map(|x| *x as f64).sum::<f64>() / v.len() as f64;
+        let err = b.iter().zip(&want).map(|(x, y)| (*x as f64 - *y as f64).abs()).sum::<f64>() / b.len() as f64;
+        assert!(err < 6.0, "export differs from the preview's look by {err:.1} levels on average");
+        assert!((mean(&b) - mean(&a)).abs() > 8.0, "and it really changed: {} vs {}", mean(&b), mean(&a));
+        for f in [&tex, &plain, &styled] { let _ = std::fs::remove_file(f); }
     }
 }
