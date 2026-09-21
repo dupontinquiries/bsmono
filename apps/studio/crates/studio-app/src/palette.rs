@@ -39,6 +39,11 @@ pub enum Act {
     Shell(ShellVerb),
 }
 
+/// The transcript gutter's filters, as something a menu can carry (the
+/// dictionary itself is read from a file the shell asks for).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordFilterKind { All, Filler, Unique, Dictionary }
+
 /// The stabilizer flavours, as something a menu can carry (the engine's own
 /// `Flavor` holds a tracked path and is not `Copy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +96,8 @@ pub enum ShellVerb {
     PeakBand(studio_audio::Band),
     /// Load whisper transcripts from a folder and show them under the clips.
     LoadTranscripts,
+    /// Which words the transcript gutter shows.
+    WordFilter(WordFilterKind),
     /// What the selected clips' effects do after the clips end: `ring_ms` of
     /// tail, the last `fade_ms` of it faded. 0 ring is a hard cut at the
     /// clip end. Milliseconds so the verb stays `Copy + Eq`.
@@ -234,6 +241,8 @@ pub enum Ask {
     PeakBandChoice,
     /// What should happen to the selected clips' reverb/delay at the clip end.
     ClipTailChoice,
+    /// Which words to show in the transcript gutter.
+    WordFilterChoice,
     /// Whether the camera moves during the shot being cleaned, then how many
     /// frames each side to look at.
     CleanPlateCamera,
@@ -310,6 +319,9 @@ pub fn root() -> Vec<Choice> {
         c("show transcripts under clips (load a folder of .srt)",
           Some("what is being said, in the gutter under each clip"),
           Then::Do(Act::Shell(ShellVerb::LoadTranscripts))),
+        c("transcript gutter: filter words (fillers / unique / a word list)",
+          Some("find the ums to cut, or skim for the names and key lines"),
+          Then::Ask(Ask::WordFilterChoice)),
         c("reverb/delay tail at the clip end (cut or ring out)",
           Some("hard cut at the edit, or let the space decay past it"),
           Then::Ask(Ask::ClipTailChoice)),
@@ -617,6 +629,15 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
                 }
             }).collect()
         }
+        Ask::WordFilterChoice => [
+            (WordFilterKind::All, "all words", "what is being said — the default"),
+            (WordFilterKind::Filler, "filler words only", "um, uh, you know, o sea — the places to cut"),
+            (WordFilterKind::Unique, "unique words only", "names, places, the words said once or twice"),
+            (WordFilterKind::Dictionary, "words from a list…", "a file, one word per line: names, key terms"),
+        ].into_iter().map(|(k, label, what)| Choice {
+            label: label.into(), hint: Some(what.into()),
+            then: Then::Do(Act::Shell(ShellVerb::WordFilter(k))),
+        }).collect(),
         Ask::ClipTailChoice => [
             (0, 0, "cut at the clip end", "the effect stops dead with the clip — a hard cut"),
             (1_000, 0, "ring 1 s, then cut", "decay past the edit, stop at a known point"),
@@ -827,6 +848,19 @@ mod tests {
         let found = filter(&r, "collaborator");
         assert!(found.len() >= 4, "only found {}: {:?}", found.len(),
                 found.iter().map(|c| &c.label).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_word_filter_offers_every_mode_with_all_first() {
+        let r = root();
+        assert!(!filter(&r, "filler").is_empty(), "reachable by the job's own word");
+        assert!(!filter(&r, "transcript").is_empty());
+        let modes: Vec<WordFilterKind> = candidates(Ask::WordFilterChoice, &Project::default()).iter()
+            .map(|c| match c.then { Then::Do(Act::Shell(ShellVerb::WordFilter(k))) => k, _ => panic!() })
+            .collect();
+        assert_eq!(modes, vec![WordFilterKind::All, WordFilterKind::Filler,
+                               WordFilterKind::Unique, WordFilterKind::Dictionary],
+                   "all first: the way back from a filtered gutter");
     }
 
     #[test]

@@ -519,6 +519,14 @@ pub fn pick_save(suggested: &str) -> Option<PathBuf> {
 #[cfg(not(feature = "picker"))]
 pub fn pick_save(_suggested: &str) -> Option<PathBuf> { None }
 
+/// The native open-file dialog (a word list, say), same fallback contract.
+#[cfg(feature = "picker")]
+pub fn pick_file() -> Option<PathBuf> {
+    rfd::FileDialog::new().set_title("Choose a file…").pick_file()
+}
+#[cfg(not(feature = "picker"))]
+pub fn pick_file() -> Option<PathBuf> { None }
+
 /// The native folder dialog for stems, same fallback contract.
 #[cfg(feature = "picker")]
 pub fn pick_folder() -> Option<PathBuf> {

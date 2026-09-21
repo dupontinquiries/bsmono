@@ -3203,6 +3203,11 @@ pub struct App {
     /// Session state: a transcript is a reading of the media, rebuildable,
     /// and not a fact the project should carry or collaborators should sync.
     words: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
+    /// The transcripts as loaded; `words` is this through `word_filter`.
+    /// Kept apart so switching filters never re-reads a file and never
+    /// loses what the previous filter hid.
+    words_raw: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
+    word_filter: studio_voice::WordFilter,
     /// The camera group the program monitor is showing as a grid, if any.
     multiview: Option<studio_core::GroupId>,
     /// A stabilize/clean-plate render in flight, and the clip it belongs to.
@@ -3408,7 +3413,9 @@ impl Default for App {
               video_audio_rx, video_audio_left,
               // Whisper writes a transcript beside its media by default, so
               // look there first — no command needed for the common case.
-              words: beside.words,
+              words: beside.words.clone(),
+              words_raw: beside.words,
+              word_filter: studio_voice::WordFilter::All,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
               upscale_clip: None,
@@ -5877,12 +5884,31 @@ impl App {
                         };
                     }
                 }
+                palette::ShellVerb::WordFilter(kind) => {
+                    self.word_filter = match kind {
+                        palette::WordFilterKind::All => studio_voice::WordFilter::All,
+                        palette::WordFilterKind::Filler => studio_voice::WordFilter::Filler,
+                        palette::WordFilterKind::Unique => studio_voice::WordFilter::Unique,
+                        palette::WordFilterKind::Dictionary => match export::pick_file() {
+                            Some(p) => match std::fs::read_to_string(&p) {
+                                Ok(t) => studio_voice::WordFilter::Dictionary(studio_voice::parse_dictionary(&t)),
+                                Err(e) => { self.studio.status = format!("could not read {}: {e}", p.display()); return; }
+                            },
+                            None => { self.studio.status = "no word list chosen".into(); return; }
+                        },
+                    };
+                    self.studio.status = if self.words_raw.is_empty() {
+                        "no transcripts loaded yet — the filter applies once they are".into()
+                    } else { self.refilter_words() };
+                }
                 palette::ShellVerb::LoadTranscripts => match export::pick_folder() {
                     None => self.studio.status = "no folder chosen".into(),
                     Some(dir) => {
                         let l = transcripts::load(&self.studio.session.doc.project, &dir);
-                        self.studio.status = l.summary();
-                        self.words.extend(l.words);
+                        let summary = l.summary();
+                        self.words_raw.extend(l.words);
+                        self.refilter_words();
+                        self.studio.status = summary;
                     }
                 },
                 palette::ShellVerb::PeakBand(band) => {
@@ -6132,6 +6158,23 @@ impl App {
     /// Peaks for a freshly decoded source, in whatever band the waveforms
     /// are currently showing — so an import lands looking like everything
     /// else on screen rather than reverting that view one clip at a time.
+    /// Recompute the gutter from the raw transcripts through the current
+    /// filter, and say how much it kept — "fillers: 143 across 55 clips" is
+    /// the number a junk-cutting pass wants before it starts.
+    fn refilter_words(&mut self) -> String {
+        let corpus = studio_voice::corpus_counts(self.words_raw.values());
+        self.words = self.words_raw.iter()
+            .map(|(id, segs)| (*id, studio_voice::filter_words(segs, &self.word_filter, &corpus)))
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
+        let hits: usize = self.words.values().map(|v| v.len()).sum();
+        match &self.word_filter {
+            studio_voice::WordFilter::All => format!("transcript gutter: all words ({} clips)", self.words.len()),
+            f => format!("transcript gutter: {} — {hits} across {} clip(s) (word times are estimated within each line)",
+                         f.label(), self.words.len()),
+        }
+    }
+
     fn build_peaks(&self, audio: &studio_audio::SourceAudio) -> studio_audio::Peaks {
         studio_audio::Peaks::build_band(audio, 256, 256, self.peak_band)
     }
