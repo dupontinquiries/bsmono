@@ -3424,4 +3424,60 @@ mod fade_tests {
             Err(EditError::NoSuchClip(_))));
     }
 }
+
+#[cfg(test)]
+mod abundance_tests {
+    //! A big project in the model itself: many sources, tracks, clips, a big
+    //! group, many bindings -- every edit undoable, nothing quadratic.
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn timed<T>(what: &str, limit: Duration, f: impl FnOnce() -> T) -> T {
+        let t = Instant::now(); let r = f(); let e = t.elapsed();
+        eprintln!("abundance: {what}: {e:?}");
+        assert!(e < limit, "{what} took {e:?} (limit {limit:?})");
+        r
+    }
+
+    #[test]
+    fn twenty_thousand_clips_build_undo_and_stay_consistent() {
+        let mut p = Project::default();
+        let mut undo = Vec::new();
+        timed("build 500 sources, 200 tracks, 20,000 clips", Duration::from_secs(30), || {
+            for s in 0..500u64 {
+                undo.push(p.apply(&Op::AddSource { source: Source::file(SourceId(s + 1), format!("C{s}.mkv"), Ticks::from_seconds(600.0), 48_000, 2, true) }).unwrap());
+            }
+            for t in 0..200u64 {
+                undo.push(p.apply(&Op::AddTrack { track: Track { id: TrackId(t + 1), kind: TrackKind::Audio, name: format!("mic {t}"),
+                    muted: false, locked: false, gain: 1.0, route: None }, at: t as usize }).unwrap());
+            }
+            for c in 0..20_000u64 {
+                undo.push(p.apply(&Op::AddClip { clip: Clip { id: ClipId(c + 1), source: SourceId(c % 500 + 1), track: TrackId(c % 200 + 1),
+                    pos: Ticks::from_seconds((c / 200) as f64 * 3.0), src_in: Ticks::ZERO, len: Ticks::from_seconds(2.5), gain: 1.0, effects: vec![] } }).unwrap());
+            }
+        });
+        assert_eq!(p.clips.len(), 20_000);
+        assert_eq!(p.duration(), Ticks::from_seconds(99.0 * 3.0 + 2.5));
+        // a group of 5,000 members and its hull
+        let members: Vec<ClipId> = (1..=5000).map(ClipId).collect();
+        undo.push(p.apply(&Op::SetGroup { id: GroupId(1), name: "scene".into(), clips: members }).unwrap());
+        let hull = timed("hull of a 5,000-clip group", Duration::from_secs(2), || p.group_hull(GroupId(1)));
+        assert_eq!(hull.map(|h| h.0), Some(Ticks::ZERO));
+        // 200 bindings on one target, read 1,000 times
+        undo.push(p.apply(&Op::SetCurve { id: CurveId(1), name: "ride".into() }).unwrap());
+        undo.push(p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::ZERO, value: 0.5 }).unwrap());
+        for b in 0..200u64 {
+            undo.push(p.apply(&Op::SetBinding { id: BindingId(b + 1), binding: Binding { curve: CurveId(1),
+                target: AutoTarget::TrackGain(TrackId(1)), gate: Gate::Always, response: None, fit_span: false } }).unwrap());
+        }
+        let v = timed("1,000 reads through 200 bindings", Duration::from_secs(5),
+            || (0..1000).map(|i| p.auto_value(AutoTarget::TrackGain(TrackId(1)), Ticks::from_seconds(i as f64 * 0.1))).last());
+        assert!(v.unwrap() < 1e-30, "200 bindings of 0.5 multiply (0.5^200): {v:?}");
+        // and every single edit undoes, in reverse, back to empty
+        timed("undo all of it", Duration::from_secs(30), || {
+            for inv in undo.into_iter().rev() { p.apply(&inv).expect("each inverse applies"); }
+        });
+        assert!(p.clips.is_empty() && p.tracks.is_empty() && p.sources.is_empty() && p.bindings.is_empty() && p.groups.is_empty());
+    }
+}
 }

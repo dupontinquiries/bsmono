@@ -119,22 +119,31 @@ pub fn summarize(project: &Project, fallback_sections: usize) -> Overview {
     }
     lanes.sort_by(|a, b| a.key.cmp(&b.key));
 
+    // One pass to bucket clips by lane, through a track -> lane map. The first
+    // version asked, for every lane x section x clip, whether the clip's track
+    // was in the lane's track LIST: 1.0 s at 1,000 tracks and 20,000 clips --
+    // and the structure view redraws this every frame.
+    let lane_of_track: std::collections::HashMap<studio_core::TrackId, usize> = project.tracks.iter()
+        .filter_map(|t| lanes.iter().position(|l| l.key == lane_of(t)).map(|i| (t.id, i))).collect();
+    let mut by_lane: Vec<Vec<(i64, i64)>> = vec![Vec::new(); lanes.len()];
+    for c in project.clips.values() {
+        if let Some(&li) = lane_of_track.get(&c.track) { by_lane[li].push((c.pos.0, c.end().0)); }
+    }
+    for spans in by_lane.iter_mut() { spans.sort(); }
     let mut cells = vec![vec![Cell::default(); sections.len()]; lanes.len()];
-    for (li, lane) in lanes.iter().enumerate() {
-        let tracks: Vec<studio_core::TrackId> = project.tracks.iter()
-            .filter(|t| lane_of(t) == lane.key).map(|t| t.id).collect();
+    for (li, spans_all) in by_lane.iter().enumerate() {
         for (si, sec) in sections.iter().enumerate() {
-            // intervals of this lane's clips clipped to the section, merged
-            let mut spans: Vec<(i64, i64)> = project.clips.values()
-                .filter(|c| tracks.contains(&c.track))
-                .map(|c| (c.pos.0.max(sec.start.0), c.end().0.min(sec.end.0)))
-                .filter(|(a, b)| b > a)
-                .collect();
-            let clips = spans.len();
-            spans.sort();
+            // the lane's clips are sorted by start, so the walk stops at the
+            // first that starts after this section (no skip at the front: a
+            // long clip that starts early can still reach in)
+            let mut clips = 0usize;
             let mut covered = 0i64;
             let mut cur: Option<(i64, i64)> = None;
-            for (a, b) in spans {
+            for &(a0, b0) in spans_all {
+                if a0 >= sec.end.0 { break; }
+                let (a, b) = (a0.max(sec.start.0), b0.min(sec.end.0));
+                if b <= a { continue; }
+                clips += 1;
                 match cur {
                     Some((ca, cb)) if a <= cb => cur = Some((ca, cb.max(b))),
                     Some((ca, cb)) => { covered += cb - ca; cur = Some((a, b)); }

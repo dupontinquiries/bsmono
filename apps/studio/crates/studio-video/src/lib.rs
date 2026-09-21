@@ -72,6 +72,8 @@ pub mod stabilize;
 pub mod touchup;
 /// Operator signal lanes: weighted inputs, hard marks, cut candidates that say why.
 pub mod signals;
+#[cfg(test)]
+mod abundance_tests;
 /// Particles: dirt, dust and smoke, deterministic and driven by audio.
 pub mod particles;
 /// Match-move rig: track points sharing one rigid transform, surviving points that disappear.

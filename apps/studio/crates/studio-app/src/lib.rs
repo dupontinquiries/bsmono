@@ -63,6 +63,8 @@ pub mod insert_by_content;
 pub mod stage;
 pub mod kaleido_gallery;
 pub mod signals_panel;
+#[cfg(test)]
+mod abundance_tests;
 pub mod touchup_job;
 pub mod mixer_panel;
 pub mod morph_pad;
