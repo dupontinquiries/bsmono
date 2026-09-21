@@ -329,6 +329,16 @@ impl ChannelFx {
         ChannelFx { level: true, ..Default::default() }
     }
 
+    /// How far the leveler is currently turning this contact down, in dB.
+    /// Never positive.
+    ///
+    /// Worth showing next to a contact's name: "this person is being turned
+    /// down 9 dB" tells the listener their level is being managed, and tells
+    /// them WHY someone sounds quieter than they expected.
+    pub fn level_reduction_db(&self) -> f32 {
+        if self.level { self.leveler.broad_gain_db() } else { 0.0 }
+    }
+
     /// Re-design the filters if the EQ changed since the last block, keeping
     /// their history so a drag in the panel does not click.
     fn sync(&mut self) {

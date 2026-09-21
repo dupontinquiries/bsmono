@@ -188,7 +188,13 @@ pub enum HostEvent {
     /// A packet is ready to go out to everyone in the call.
     VoiceOutbound(voice_bridge::Packet),
     /// A decoded frame for the play-out cushion.
-    DecodedAudio(Vec<f32>),
+    /// Decoded PCM, and WHOSE it is.
+    ///
+    /// The peer used to be dropped at the decode boundary: it was known at
+    /// receive and neither this nor `DecodeAudio` carried it, so decoded audio
+    /// could not say whose it was and nothing per-contact -- leveling, EQ,
+    /// individual volume -- could be applied.
+    DecodedAudio { peer: String, samples: Vec<f32> },
     /// The audio device reports how much it still holds; answer with what to
     /// write.
     SinkDepth(usize),
@@ -288,7 +294,7 @@ pub enum HostCommand {
     /// f32 and nothing about how they were packed. Before this the decoded
     /// packet was matched on and DROPPED — inbound audio reached the bridge
     /// and stopped there, so a call was silent in both directions.
-    DecodeAudio(Vec<u8>),
+    DecodeAudio { peer: String, pcm: Vec<u8> },
     /// Show a notification. Only produced when the app decided one is
     /// warranted — an unfocused window and at least one sender.
     Notify(uikit_egui::notify::Rendered),
@@ -519,10 +525,14 @@ impl Snapclone {
                 // The return carries the routed packet; the app has already
                 // applied any floor change to the coordinator by the time it
                 // comes back, so there is nothing for the host to do with it.
+                // `from`, not the raw `sender`: it is the bridge's resolved
+                // identity, the same one its security rule rests on ("the
+                // asserting peer IS the sender"). Per-contact processing keys on
+                // who the bridge says this is, not on a transport address.
                 if let crate::voice_bridge::Inbound::Handled {
-                    packet: crate::voice_bridge::Packet::VoiceFrame(f), ..
+                    from, packet: crate::voice_bridge::Packet::VoiceFrame(f),
                 } = self.voice_receive(&sender, &payload) {
-                    out.push(HostCommand::DecodeAudio(f));
+                    out.push(HostCommand::DecodeAudio { peer: from, pcm: f });
                 }
                 // Arriving voice is what arms the proximity screensaver's
                 // window, and the posture engine is told separately from the
@@ -579,7 +589,12 @@ impl Snapclone {
                 }
             }
             HostEvent::VoiceOutbound(p) => out.push(HostCommand::SendVoice(self.voice_send(&p))),
-            HostEvent::DecodedAudio(frame) => self.sink_push(frame),
+            HostEvent::DecodedAudio { peer, mut samples } => {
+                // Processed BEFORE the sink, per contact, so each speaker's
+                // leveler and EQ see only their own audio.
+                self.voice_fx.process(&peer, &mut samples);
+                self.sink_push(samples);
+            }
             HostEvent::SinkDepth(depth) => {
                 let frames = self.sink_tick(depth);
                 if !frames.is_empty() { out.push(HostCommand::PlayAudio(frames)); }
@@ -1022,7 +1037,7 @@ mod tests {
         let out = s.apply(HostEvent::VoiceReceived {
             sender: "sc-aabbccdd".into(), payload });
         let decoded = out.iter().find_map(|c| match c {
-            HostCommand::DecodeAudio(b) => Some(b.clone()), _ => None });
+            HostCommand::DecodeAudio { pcm, .. } => Some(pcm.clone()), _ => None });
         assert_eq!(decoded, Some(vec![1, 2, 3, 4]),
                    "the frame never left the bridge: {out:?}");
 
@@ -1031,7 +1046,49 @@ mod tests {
             &crate::voice_bridge::Packet::FloorAssert { claim_ts: 1 });
         let out = s.apply(HostEvent::VoiceReceived {
             sender: "sc-aabbccdd".into(), payload: floor });
-        assert!(!out.iter().any(|c| matches!(c, HostCommand::DecodeAudio(_))), "{out:?}");
+        assert!(!out.iter().any(|c| matches!(c, HostCommand::DecodeAudio { .. })), "{out:?}");
+    }
+
+    /// THE BOUNDARY THAT DROPPED THE PEER. Decoded audio must reach the
+    /// processing for the contact who sent it, and ONLY that contact.
+    #[test]
+    fn decoded_audio_is_processed_for_the_contact_who_sent_it() {
+        let mut s = app();
+        let loud: Vec<f32> = (0..16_000 * 5)
+            .map(|i| 0.6 * (std::f32::consts::TAU * 500.0 * i as f32 / 16_000.0).sin())
+            .collect();
+        let quiet: Vec<f32> = loud.iter().map(|x| x * 0.05).collect();
+        // Many frames, as the decoder would deliver them.
+        for chunk in loud.chunks(320) {
+            s.apply(HostEvent::DecodedAudio { peer: "sc-loud".into(), samples: chunk.to_vec() });
+        }
+        for chunk in quiet.chunks(320) {
+            s.apply(HostEvent::DecodedAudio { peer: "sc-quiet".into(), samples: chunk.to_vec() });
+        }
+        let lr = s.voice_fx.channel("sc-loud").level_reduction_db();
+        let qr = s.voice_fx.channel("sc-quiet").level_reduction_db();
+        assert!(lr < -6.0, "the loud contact should be turned down: {lr:.1} dB");
+        assert!(qr > -1.0, "and the quiet one left alone -- routed by peer: {qr:.1} dB");
+    }
+
+    /// ...and the other half: the peer leaves `VoiceReceived` attached to the
+    /// decode request, as the bridge's AUTHENTICATED sender.
+    #[test]
+    fn a_decode_request_carries_the_sender() {
+        let mut s = app();
+        // CONNECTED, or the bridge refuses the frame outright. My first version
+        // skipped this, the frame was refused, `peers` came back EMPTY -- and
+        // the assertion "every peer is the sender" passed VACUOUSLY over an
+        // empty list. It tested nothing. The non-empty check below is what
+        // stops that recurring.
+        s.apply(HostEvent::VoiceLink(true));
+        let frame = crate::voice_bridge::encode(
+            &crate::voice_bridge::Packet::VoiceFrame(vec![0, 0, 1, 0]));
+        let out = s.apply(HostEvent::VoiceReceived { sender: "sc-aabbccdd".into(), payload: frame });
+        let peers: Vec<_> = out.iter().filter_map(|c| match c {
+            HostCommand::DecodeAudio { peer, .. } => Some(peer.clone()), _ => None }).collect();
+        assert_eq!(peers, vec!["sc-aabbccdd".to_string()],
+                   "exactly one decode request, carrying its sender");
     }
 
     /// A snapclone in an Open-mode call with us as a participant.

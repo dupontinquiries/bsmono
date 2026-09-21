@@ -301,6 +301,9 @@ pub struct Snapclone {
     /// skipped" is actionable and a silent difference is not.
     pub import_report: Option<String>,
     pub group_voice: crate::group_voice::GroupVoice,
+    /// Per-contact processing on incoming voice: the leveler and the 4-band
+    /// EQ, keyed by the authenticated sender. See `voice_fx`.
+    pub voice_fx: crate::voice_fx::VoiceFx,
     pub picker: crate::contacts::Picker,
     pub conversation: crate::conversation::Conversation,
     /// Who the open conversation is with. The Conversation model holds the
@@ -820,6 +823,7 @@ impl Snapclone {
             pending_vcard_text: None,
             import_report: None,
             group_voice: Default::default(),
+            voice_fx: Default::default(),
             picker: Default::default(),
             cards: Default::default(),
             add_form: Default::default(),
