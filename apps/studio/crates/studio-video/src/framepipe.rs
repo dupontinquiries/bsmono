@@ -310,6 +310,65 @@ impl Pipe {
     }
 }
 
+/// Several sources decoded in lockstep, one output encoded: for layouts that
+/// show more than one angle at a time (a comic page, a split screen). Each
+/// input is its own decoder, read one frame at a time, so memory is one frame
+/// per input whatever the length. The output's sound is taken from input
+/// `audio_from`, remuxed after the picture is written.
+///
+/// Every input is decoded at `size` and `fps` of the first pipe, so the
+/// closure always gets frames of one shape. A shorter input holds its last
+/// frame rather than ending the render.
+pub fn render_multi(inputs: &[Pipe], out: &Path, crf: u32, audio_from: usize,
+                    mut f: impl FnMut(usize, &[Frame]) -> Frame) -> Result<usize, String> {
+    let first = inputs.first().ok_or("no inputs")?;
+    let size = first.size;
+    let silent = out.with_extension("video-only.mp4");
+    let mut decs = Vec::new();
+    for p in inputs {
+        let p2 = Pipe { size, fps: first.fps, ..p.clone() };
+        decs.push(spawn_decoder(&p2, false).map_err(|e| format!("decode: {e}"))?);
+    }
+    let mut enc = spawn_encoder(first, &silent, crf).map_err(|e| format!("encode: {e}"))?;
+    let mut outs: Vec<_> = decs.iter_mut().map(|d| d.stdout.take().expect("piped")).collect();
+    let mut stdin = enc.stdin.take().expect("piped");
+    let n = (size.w * size.h * 3) as usize;
+    let mut last: Vec<Option<Frame>> = vec![None; inputs.len()];
+    let mut written = 0usize;
+    loop {
+        let mut any = false;
+        let mut frames = Vec::with_capacity(inputs.len());
+        for (k, o) in outs.iter_mut().enumerate() {
+            let mut buf = vec![0u8; n];
+            match o.read_exact(&mut buf) {
+                Ok(()) => { any = true; last[k] = Some(Frame { w: size.w, h: size.h, px: buf }); }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                Err(e) => return Err(format!("decode {k}: {e}")),
+            }
+            frames.push(last[k].clone().unwrap_or_else(|| Frame::black(size.w, size.h)));
+        }
+        if !any { break; }
+        let got = f(written, &frames);
+        if got.w != size.w || got.h != size.h { return Err("closure changed the frame size".into()); }
+        stdin.write_all(&got.px).map_err(|e| format!("encode write: {e}"))?;
+        written += 1;
+    }
+    drop(stdin);
+    for (k, d) in decs.iter_mut().enumerate() { finish(d, &format!("decoder {k}"))?; }
+    finish(&mut enc, "encoder")?;
+    // sound: from the chosen input, over the same range
+    let a = &inputs[audio_from.min(inputs.len() - 1)];
+    let mut c = Command::new("ffmpeg");
+    c.args(["-v", "error", "-y", "-i"]).arg(&silent);
+    if let Some((at, _)) = a.range { c.args(["-ss", &format!("{at}")]); }
+    c.arg("-i").arg(&a.input);
+    c.args(["-map", "0:v", "-map", "1:a?", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest"]).arg(out);
+    let r = c.output().map_err(|e| format!("mux: {e}"))?;
+    let _ = std::fs::remove_file(&silent);
+    if !r.status.success() { return Err(format!("mux: {}", String::from_utf8_lossy(&r.stderr))); }
+    Ok(written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
