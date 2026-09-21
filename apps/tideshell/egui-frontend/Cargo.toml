@@ -1,0 +1,28 @@
+[package]
+name = "tideshell-egui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "egui surfaces for tideshell (drawer, right bar, switcher, hold arc, trackpad pad, settings sheet, trace overlay) plus the executor layer that turns tideshell-core Actions into effects: hatch-core launches and `hatch-egui --toggle`, rusty-board over D-Bus, prefs persisted as flat shell.* keys. The `tideshell-sim` binary runs the whole shell in a phone-sized window over simulated windows, so the loop can be driven and screenshotted without a compositor."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "tideshell-sim"
+path = "src/bin/tideshell_sim.rs"
+required-features = ["app"]
+
+[features]
+default = ["app"]
+app = ["dep:eframe"]
+
+[dependencies]
+tideshell-core = { path = "../crates/tideshell-core" }
+hatch-core = { path = "../../hatch/crates/hatch-core" }
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+settings-kit = { path = "../../../shared/settings-kit" }
+egui = "0.34"
+# Glow chosen explicitly (eframe_backend_check): wgpu's default device asks for
+# more colour attachments than phone GPUs allow. Same reasoning as hatch-egui.
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
