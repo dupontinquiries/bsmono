@@ -126,6 +126,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             );
             if !st.kernel_log.trim().is_empty() {
                 let records = cockpit::klog::parse(&st.kernel_log);
+                crate::show::findings(ui, &c, &cockpit::finding::klog_signatures(&records));
                 ui.label(format!("{} record(s)", records.len()));
                 // Capped: a dmesg is thousands of lines and drawing all
                 // of them would make the page slower than reading the

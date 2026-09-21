@@ -23,6 +23,9 @@ use std::sync::{Arc, Mutex};
 
 pub struct State {
     pub host: String,
+    /// SSH user. Default `root` (every model today); a field because
+    /// reMarkable documents it as "root at the time of writing".
+    pub user: String,
     /// First contact only. Masked, cleared on success, never persisted.
     pub password: String,
     pub bin_path: String,
@@ -54,12 +57,15 @@ pub struct State {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Confirm {
     Activate(ef::Activation),
+    /// `rm-ssh-over-wlan on`.
+    WifiSsh,
 }
 
 impl Default for State {
     fn default() -> Self {
         State {
             host: "10.11.99.1".into(),
+            user: cockpit::eink_fleet::DEFAULT_USER.into(),
             password: String::new(),
             bin_path: String::new(),
             app_name: String::new(),
@@ -102,6 +108,9 @@ fn describe(p: &ef::Probe, d: &ef::Displays) -> Vec<String> {
     if d.etc_overlay {
         v.push("system files reset at boot; gitmind only writes under /home/root".into());
     }
+    if let Some(a) = &d.wlan_addr {
+        v.push(format!("Wi-Fi address: {a}"));
+    }
     v
 }
 
@@ -120,25 +129,31 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     });
     ui.label(egui::RichText::new("USB cable: 10.11.99.1 · or the tablet's Wi-Fi address").weak().small());
     ui.horizontal(|ui| {
+        ui.label("user");
+        ui.add(egui::TextEdit::singleline(&mut s.user).id_salt("tablets-user").desired_width(150.0));
+    });
+    ui.horizontal(|ui| {
         ui.label("SSH password");
         ui.add(egui::TextEdit::singleline(&mut s.password).id_salt("tablets-pw").password(true).desired_width(150.0));
     });
-    ui.label(egui::RichText::new("first time only · shown on the tablet under Settings → Help → Copyrights and licenses").weak().small());
+    ui.label(egui::RichText::new("first time only · on the tablet: Settings → General → Help → About → Copyrights and licenses, \
+        under General information (username and password; needs developer mode)").weak().small());
     ui.horizontal(|ui| {
         if ui.add_enabled(!busy && !s.host.trim().is_empty(), egui::Button::new("Enrol")).clicked() {
             let host = s.host.trim().to_string();
+            let user = s.user.trim().to_string();
             let pw = std::mem::take(&mut s.password); // consumed, not kept
             let found = s.found.clone();
             let changed = s.hostkey_changed.clone();
             s.task.run_logged(move |log| {
-                let mut e = ef::SshEnroller { host: host.clone() };
+                let mut e = ef::SshEnroller { user: user.clone(), host: host.clone() };
                 *changed.lock().unwrap() = false;
                 let pw = Some(pw).filter(|p| !p.is_empty());
                 match ef::enroll(&mut e, pw.as_deref(), &mut |ev| log.push(&format!("{ev:?}"))) {
                     Ok(r) => {
                         let lines = describe(&r.probe, &r.displays).join("\n");
                         *found.lock().unwrap() = Some((r.probe, r.displays));
-                        format!("enrolled root@{host}\n{lines}")
+                        format!("enrolled {user}@{host}\n{lines}")
                     }
                     Err(e) => {
                         if e == ef::HOSTKEY_CHANGED {
@@ -151,9 +166,10 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         }
         if ui.add_enabled(!busy && !s.host.trim().is_empty(), egui::Button::new("Probe")).clicked() {
             let host = s.host.trim().to_string();
+            let user = s.user.trim().to_string();
             let found = s.found.clone();
             s.task.run_logged(move |_| {
-                let mut r = ef::SshRemote { user: "root".into(), host: host.clone() };
+                let mut r = ef::SshRemote { user: user.clone(), host: host.clone() };
                 let probe = ef::Remote::run(&mut r, ef::probe_cmd()).map(|o| ef::parse_probe(&o));
                 let disp = ef::Remote::run(&mut r, ef::displays_probe_cmd()).map(|o| ef::parse_displays(&o));
                 match (probe, disp) {
@@ -188,26 +204,38 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         for line in describe(p, d) {
             ui.label(line);
         }
+        if let Some(a) = d.wlan_addr.clone().filter(|a| *a != s.host.trim()) {
+            if ui.add_enabled(!busy, egui::Button::new(format!("Use Wi-Fi address {a}"))).clicked() {
+                s.host = a;
+            }
+        }
         // Per-boot activation changes the tablet (restarts its UI or
         // switches launcher), so it takes a second, explicit tap.
         let mut actions: Vec<(Confirm, String)> = Vec::new();
         if let Ok((_, Some(a))) = d.readiness() {
             actions.push((Confirm::Activate(a), format!("Activate: {}", a.label())));
         }
+        if d.wlan_ssh_tool {
+            actions.push((Confirm::WifiSsh, "Enable SSH over Wi-Fi".into()));
+        }
         for (c, label) in actions {
             if s.confirm == Some(c) {
                 let warn = match c {
                     Confirm::Activate(ef::Activation::StartXovi) => "The tablet's screen will restart for a few seconds.",
                     Confirm::Activate(_) => "The tablet switches to its launcher.",
+                    Confirm::WifiSsh => "Runs rm-ssh-over-wlan on: the tablet then accepts SSH on its Wi-Fi address (shown under the password in Copyrights and licenses).",
                 };
                 ui.label(egui::RichText::new(warn).small());
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!busy, egui::Button::new("Confirm")).clicked() {
                         let host = s.host.trim().to_string();
+                        let user = s.user.trim().to_string();
                         s.task.run_logged(move |_| {
-                            let mut r = ef::SshRemote { user: "root".into(), host };
-                            let Confirm::Activate(a) = c;
-                            let cmd = ef::activation_cmd(a);
+                            let mut r = ef::SshRemote { user: user.clone(), host };
+                            let cmd = match c {
+                                Confirm::Activate(a) => ef::activation_cmd(a),
+                                Confirm::WifiSsh => ef::WLAN_SSH_ON.to_string(),
+                            };
                             match ef::Remote::run(&mut r, &cmd) {
                                 Ok(out) => format!("{}\n(Probe again to refresh)", out.trim()),
                                 Err(e) => format!("failed: {e}"),
@@ -255,8 +283,15 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             s.task.run_logged(move |log| {
                 let t = ef::build_target(&r, m);
                 let native = ef::native_for(&t);
+                if !native && ef::target_std_installed(t.triple) == Some(false) {
+                    return ef::missing_target_message(t.triple);
+                }
                 let (argv, env) = ef::tablet_build_cmd(&app, &t, std::env::var("RUSTFLAGS").ok().as_deref(), native);
                 log.push(&format!("$ {}  (in {})", argv.join(" "), app.dir.display()));
+                if let Some((_, l)) = env.iter().find(|(k, v)| k.ends_with("_LINKER") && v == "rust-lld") {
+                    log.push(&format!("no musl cross linker on PATH: linking with {l} (self-contained)"));
+                }
+                let mut errors: Vec<String> = Vec::new();
                 let mut cmd = std::process::Command::new(&argv[0]);
                 cmd.args(&argv[1..]).current_dir(&app.dir).envs(env)
                     .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
@@ -265,13 +300,19 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 if let Some(err) = child.stderr.take() {
                     use std::io::BufRead;
                     for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                        let t = line.trim_start();
+                        if t.starts_with("error") || t.starts_with("= note") || t.starts_with("--> ") {
+                            errors.push(line.clone());
+                        }
                         log.push(&line);
                     }
                 }
                 let status = match child.wait() { Ok(s) => s, Err(e) => return format!("cargo: {e}") };
                 if !status.success() {
-                    return format!("build failed (exit {:?}). If std is missing for {}, this machine cannot build that target; \
-                        on an aarch64 postmarketOS phone the AppLoad route builds natively.", status.code(), t.triple);
+                    // cargo's own error lines go into the result, where
+                    // diagnose() turns them into findings.
+                    let first: Vec<String> = errors.into_iter().take(12).collect();
+                    return format!("build failed (exit {:?}) for {}\n{}", status.code(), t.triple, first.join("\n"));
                 }
                 // A workspace member builds into the workspace's target dir.
                 let rel = ef::tablet_build_output(&app.bin, &t, native);
@@ -337,11 +378,12 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         let can = !busy && found.is_some() && !s.bin_path.trim().is_empty() && name_ok;
         if ui.add_enabled(can, egui::Button::new("Deploy")).clicked() {
             let (host, bin, name, choice) = (s.host.trim().to_string(), s.bin_path.trim().to_string(), name.clone(), s.profile);
+            let user = s.user.trim().to_string();
             let title = if s.display_name.trim().is_empty() { name.clone() } else { s.display_name.trim().to_string() };
             let fullscreen = !s.windowed;
             s.task.run_logged(move |log| {
                 // Re-probe: the route may have changed since enrolment.
-                let mut r = ef::SshRemote { user: "root".into(), host: host.clone() };
+                let mut r = ef::SshRemote { user: user.clone(), host: host.clone() };
                 let p = match ef::Remote::run(&mut r, ef::probe_cmd()) { Ok(o) => ef::parse_probe(&o), Err(e) => return format!("probe failed: {e}") };
                 let d = match ef::Remote::run(&mut r, ef::displays_probe_cmd()) { Ok(o) => ef::parse_displays(&o), Err(e) => return format!("probe failed: {e}") };
                 let (route, activation) = match d.readiness() { Ok(r) => r, Err(e) => return e };
@@ -376,8 +418,9 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         for (label, stop) in [("Status", false), ("Stop", true)] {
             if ui.add_enabled(!busy && found.is_some() && name_ok, egui::Button::new(label)).clicked() {
                 let (host, name) = (s.host.trim().to_string(), name.clone());
+                let user = s.user.trim().to_string();
                 s.task.run_logged(move |_| {
-                    let mut r = ef::SshRemote { user: "root".into(), host };
+                    let mut r = ef::SshRemote { user: user.clone(), host };
                     let cmd = if stop { ef::stop_cmd(&name) } else { ef::status_cmd(&name, 0) };
                     match cmd.and_then(|c| ef::Remote::run(&mut r, &c)) {
                         Ok(_) if stop => format!("{name}: stopped"),
@@ -400,8 +443,9 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             ui.label(egui::RichText::new("in the tablet's AppLoad").strong());
             if ui.add_enabled(!busy, egui::Button::new("List")).clicked() {
                 let (host, installed, dir) = (s.host.trim().to_string(), s.installed.clone(), dir.clone());
+                let user = s.user.trim().to_string();
                 s.task.run_logged(move |_| {
-                    let mut r = ef::SshRemote { user: "root".into(), host };
+                    let mut r = ef::SshRemote { user: user.clone(), host };
                     match ef::appload_list_cmd(&dir).and_then(|c| ef::Remote::run(&mut r, &c)) {
                         Ok(out) => {
                             let list = ef::parse_appload_list(&out);
@@ -421,8 +465,9 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 if s.remove_confirm.as_deref() == Some(app.as_str()) {
                     if ui.add_enabled(!busy, egui::Button::new("Confirm remove")).clicked() {
                         let (host, installed, dir, a) = (s.host.trim().to_string(), s.installed.clone(), dir.clone(), app.clone());
+                        let user = s.user.trim().to_string();
                         s.task.run_logged(move |_| {
-                            let mut r = ef::SshRemote { user: "root".into(), host };
+                            let mut r = ef::SshRemote { user: user.clone(), host };
                             match ef::appload_remove_cmd(&a, &dir).and_then(|c| ef::Remote::run(&mut r, &c)) {
                                 Ok(_) => {
                                     installed.lock().unwrap().retain(|(n, _)| n != &a);

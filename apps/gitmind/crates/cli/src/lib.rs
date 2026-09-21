@@ -1393,11 +1393,13 @@ fn iso_now() -> String {
 /// the root filesystem; Oxide/AppLoad get installed or removed).
 fn cmd_eink(rest: &[String]) -> i32 {
     use cockpit::eink_fleet as ef;
-    const USAGE: &str = "usage: gitmind eink <enroll|probe|build|deploy|list|remove|stop|status|activate|retrust> <host> ...\n  \
+    const USAGE: &str = "usage: gitmind eink <enroll|probe|build|deploy|list|remove|stop|status|activate|wifi-ssh|retrust> <host> ...\n  \
         build <host> <bin>                  build an eink-kit app of this checkout for that tablet's route\n  \
         list <host>                         apps gitmind put in the tablet's AppLoad sidebar\n  \
         remove <host> <app>                 take one out again (never touches other apps)\n  \
         activate <host>                     after a reboot: start xovi or the launcher, whichever is needed\n  \
+        wifi-ssh <host>                     turn on SSH over Wi-Fi (Paper Pro family; run over USB)\n  \
+        (every command: --user U, or GITMIND_RM_USER; default root)\n  \
         retrust <host>                      accept the tablet's NEW host key (after an OS update)\n  \
         enroll <host>                       first contact: password (GITMIND_RM_PASSWORD or stdin) → key\n  \
         probe <host>                        model, display servers, route\n  \
@@ -1411,7 +1413,12 @@ fn cmd_eink(rest: &[String]) -> i32 {
         None => (&rest[2..], vec![]),
     };
     let pos: Vec<&String> = flags.iter().filter(|a| !a.starts_with("--")).collect();
-    let mut remote = ef::SshRemote { user: "root".into(), host: host.clone() };
+    // `--user U`, else GITMIND_RM_USER, else root (reMarkable: "root at the
+    // time of writing", so a default, not a constant).
+    let user = opt(flags, "--user").map(str::to_string)
+        .or_else(|| std::env::var("GITMIND_RM_USER").ok().filter(|u| !u.trim().is_empty()))
+        .unwrap_or_else(|| ef::DEFAULT_USER.to_string());
+    let mut remote = ef::SshRemote { user: user.clone(), host: host.clone() };
     let need = |a: Option<ef::Activation>| match a {
         Some(a) => format!("\n          needs, once per boot: {} → `gitmind eink activate {host}`", a.label()),
         None => String::new(),
@@ -1440,15 +1447,15 @@ fn cmd_eink(rest: &[String]) -> i32 {
         "enroll" => {
             let password = std::env::var("GITMIND_RM_PASSWORD").ok().or_else(|| {
                 use std::io::BufRead;
-                eprint!("SSH password for root@{host} (from the tablet's Settings; blank if a key is installed): ");
+                eprint!("SSH password for {user}@{host} (Settings → General → Help → About → Copyrights and licenses; blank if a key is installed): ");
                 let mut line = String::new();
                 std::io::stdin().lock().read_line(&mut line).ok()?;
                 Some(line.trim().to_string()).filter(|s| !s.is_empty())
             });
-            let mut e = ef::SshEnroller { host: host.clone() };
+            let mut e = ef::SshEnroller { user: user.clone(), host: host.clone() };
             match ef::enroll(&mut e, password.as_deref(), &mut |ev| eprintln!("  · {ev:?}")) {
                 Ok(r) => {
-                    println!("enrolled root@{host}{}", if r.used_password { " (key installed; no more passwords)" } else { "" });
+                    println!("enrolled {user}@{host}{}", if r.used_password { " (keys installed; no more passwords)" } else { "" });
                     describe(&r.probe, &r.displays);
                     0
                 }
@@ -1517,8 +1524,14 @@ fn cmd_eink(rest: &[String]) -> i32 {
             };
             let t = ef::build_target(&route, probe.model);
             let native = ef::native_for(&t);
+            if !native && ef::target_std_installed(t.triple) == Some(false) {
+                return eink_err(&ef::missing_target_message(t.triple));
+            }
             let (argv, env) = ef::tablet_build_cmd(&app, &t, std::env::var("RUSTFLAGS").ok().as_deref(), native);
             eprintln!("  $ {}  (in {}; {})", argv.join(" "), app.dir.display(), t.why);
+            if env.iter().any(|(k, v)| k.ends_with("_LINKER") && v == "rust-lld") {
+                eprintln!("  no musl cross linker on PATH: linking with rust-lld (self-contained)");
+            }
             let st = std::process::Command::new(&argv[0]).args(&argv[1..]).current_dir(&app.dir).envs(env).status();
             match st {
                 Ok(s) if s.success() => {}
@@ -1567,6 +1580,16 @@ fn cmd_eink(rest: &[String]) -> i32 {
                         Err(e) => eink_err(&e),
                     }
                 }
+                Err(e) => eink_err(&e),
+            }
+        }
+        "wifi-ssh" => {
+            let (_, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
+            if !d.wlan_ssh_tool {
+                return eink_err("this tablet has no rm-ssh-over-wlan (not a Paper Pro-family OS?); SSH over Wi-Fi may already be on");
+            }
+            match ef::Remote::run(&mut remote, ef::WLAN_SSH_ON) {
+                Ok(out) => { println!("{}\nSSH over Wi-Fi is on; the Wi-Fi address is under the password in Copyrights and licenses", out.trim()); 0 }
                 Err(e) => eink_err(&e),
             }
         }

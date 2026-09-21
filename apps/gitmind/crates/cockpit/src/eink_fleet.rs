@@ -599,6 +599,12 @@ pub struct Displays {
     pub etc_overlay: bool,
     /// xovi's start script exists (AppLoad needs it run once per boot).
     pub xovi_installed: bool,
+    /// `rm-ssh-over-wlan` exists (Paper Pro family: SSH over Wi-Fi is off by
+    /// default and this turns it on).
+    pub wlan_ssh_tool: bool,
+    /// The tablet's Wi-Fi IPv4 address, so a first USB session can hand over
+    /// to Wi-Fi (a postmarketOS phone's USB host mode is unreliable).
+    pub wlan_addr: Option<String>,
     /// Vellum launcherctl: configured launcher, and the one running now.
     pub launcher_current: Option<String>,
     pub launcher_active: Option<String>,
@@ -623,6 +629,11 @@ impl Activation {
 }
 
 pub const XOVI_START: &str = "/home/root/xovi/start";
+
+/// Turn on SSH over Wi-Fi (Paper Pro family; off by default). Run once over
+/// USB; afterwards the tablet answers on its Wi-Fi address (shown under the
+/// password in Copyrights and licenses).
+pub const WLAN_SSH_ON: &str = "rm-ssh-over-wlan on";
 pub const LAUNCHERCTL: &str = "/home/root/.vellum/bin/launcherctl";
 
 /// Run the activation detached (the UI restart can outlive the SSH session),
@@ -709,6 +720,8 @@ pub fn displays_probe_cmd() -> &'static str {
      awk '$2==\"/\" && $4 ~ /(^|,)ro(,|$)/ {print \"rootfs_ro=1\"; exit}' /proc/mounts 2>/dev/null; \
      awk '$1==\"overlay\" && $2==\"/etc\" {print \"etc_overlay=1\"; exit}' /proc/mounts 2>/dev/null; \
      [ -x /home/root/xovi/start ] && echo xovi_installed=1; \
+     command -v rm-ssh-over-wlan >/dev/null 2>&1 && echo wlan_ssh_tool=1; \
+     a=$(ip -4 -o addr show wlan0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1); [ -n \"$a\" ] && echo \"wlan_addr=$a\"; \
      L=/home/root/.vellum/bin/launcherctl; if [ -x $L ]; then \
        echo \"launcher_current=$($L current-launcher 2>/dev/null | head -n1)\"; \
        echo \"launcher_active=$($L active-launcher 2>/dev/null | head -n1)\"; fi; \
@@ -720,7 +733,7 @@ pub fn displays_probe_cmd() -> &'static str {
 /// support fails a test instead of being silently ignored.
 pub const DISPLAY_KEYS: &[&str] = &[
     "qtfb", "appload_dir", "blight_lib", "blight_running", "glibc",
-    "rootfs_ro", "etc_overlay", "xovi_installed", "launcher_current", "launcher_active",
+    "rootfs_ro", "etc_overlay", "xovi_installed", "wlan_ssh_tool", "wlan_addr", "launcher_current", "launcher_active",
 ];
 
 /// A launcherctl name, or None for "none"/empty. Output format unverified:
@@ -742,6 +755,8 @@ pub fn parse_displays(out: &str) -> Displays {
             Some(("rootfs_ro", "1")) => d.rootfs_ro = true,
             Some(("etc_overlay", "1")) => d.etc_overlay = true,
             Some(("xovi_installed", "1")) => d.xovi_installed = true,
+            Some(("wlan_ssh_tool", "1")) => d.wlan_ssh_tool = true,
+            Some(("wlan_addr", v)) if !v.is_empty() => d.wlan_addr = Some(v.to_string()),
             Some(("launcher_current", v)) => d.launcher_current = launcher_name(v),
             Some(("launcher_active", v)) => d.launcher_active = launcher_name(v),
             _ => {}
@@ -801,8 +816,9 @@ pub fn enroll(e: &mut dyn Enroller, password: Option<&str>, on: &mut dyn FnMut(E
         false
     } else {
         let pw = password.filter(|p| !p.is_empty()).ok_or_else(|| {
-            "first contact needs the tablet's SSH password: on the tablet, Settings → Help → \
-             Copyrights and licenses (scroll to the end); developer mode may need enabling first"
+            "first contact needs the tablet's SSH password: on the tablet, Settings → General → Help → \
+             About → Copyrights and licenses, under General information (it lists the username too); \
+             developer mode must be enabled, which factory-resets the tablet"
                 .to_string()
         })?;
         on(EnrollEvent::InstallingKey);
@@ -821,9 +837,29 @@ pub fn enroll(e: &mut dyn Enroller, password: Option<&str>, on: &mut dyn FnMut(E
     Ok(Enrolled { probe, displays, used_password })
 }
 
-/// The real enroller: `root@host` over the hardened ssh options.
+/// The default SSH user on every reMarkable model. reMarkable's own
+/// developer-mode page says the username shown is "root at the time of
+/// writing", so it is a default, never a constant: the Tablets page and
+/// `--user` / `GITMIND_RM_USER` override it.
+pub const DEFAULT_USER: &str = "root";
+
+/// The real enroller over the hardened ssh options.
 pub struct SshEnroller {
+    pub user: String,
     pub host: String,
+}
+
+/// The public keys installed on a tablet: the usual key plus an ECDSA one.
+/// The reMarkable 2's dropbear does not accept ed25519 (the key gitmind
+/// generates by default), and ssh offers every default identity in turn, so
+/// installing both makes one login work on every model.
+pub fn tablet_pubkeys() -> Result<String, String> {
+    let main = crate::deploy::ensure_local_pubkey()?;
+    let ecdsa = crate::deploy::ensure_keypair("ecdsa")?;
+    if main.split_whitespace().next() == ecdsa.split_whitespace().next() {
+        return Ok(main);
+    }
+    Ok(format!("{}\n{}\n", main.trim_end(), ecdsa.trim_end()))
 }
 
 impl Enroller for SshEnroller {
@@ -831,7 +867,7 @@ impl Enroller for SshEnroller {
         crate::deploy::trust_host(&self.host)
     }
     fn key_check(&mut self) -> KeyCheck {
-        match crate::deploy::remote_capture("root", &self.host, "true") {
+        match crate::deploy::remote_capture(&self.user, &self.host, "true") {
             Ok(_) => KeyCheck::Works,
             Err(e) if crate::deploy::ssh_error_reason(&e) == "hostkey" => KeyCheck::HostKeyChanged,
             Err(e) if crate::deploy::ssh_error_reason(&e) == "legacy-hostkey" => KeyCheck::LegacyHostKey,
@@ -839,10 +875,10 @@ impl Enroller for SshEnroller {
         }
     }
     fn install_key(&mut self, password: &str) -> Result<String, String> {
-        crate::deploy::setup_key("root", &self.host, password)
+        crate::deploy::setup_key_with(&self.user, &self.host, password, &tablet_pubkeys()?)
     }
     fn run(&mut self, cmd: &str) -> Result<String, String> {
-        crate::deploy::remote_capture("root", &self.host, cmd)
+        crate::deploy::remote_capture(&self.user, &self.host, cmd)
     }
 }
 
@@ -930,18 +966,63 @@ pub fn build_target(route: &Route, model: Option<RmModel>) -> BuildTarget {
 /// there with "can't find crate for std"; Alpine also makes musl builds
 /// dynamic by default, which `+crt-static` overrides. See [`native_for`].
 pub fn tablet_build_cmd(app: &TabletApp, t: &BuildTarget, inherited_rustflags: Option<&str>, native: bool) -> (Vec<String>, Vec<(String, String)>) {
+    tablet_build_cmd_on_path(app, t, inherited_rustflags, native, &std::env::var("PATH").unwrap_or_default())
+}
+
+/// [`tablet_build_cmd`], probing `path_env` for a cross linker.
+///
+/// Static musl cross builds (a laptop building for the AppLoad route) fall
+/// back to Rust's bundled `rust-lld` with self-contained linking when no
+/// real musl cross linker is on PATH. gitmind's general cross env names
+/// `aarch64-linux-musl-gcc`, which most distros do not package; the tablet
+/// build is pure Rust (no C), and Rust ships musl's crt objects and libc for
+/// its musl targets, so lld can do the static link on its own.
+/// UNVERIFIED here: no aarch64 musl std in the sandbox this was written in.
+pub fn tablet_build_cmd_on_path(app: &TabletApp, t: &BuildTarget, inherited_rustflags: Option<&str>, native: bool, path_env: &str) -> (Vec<String>, Vec<(String, String)>) {
     // `--bin`: works in a single-crate dir and inside a workspace alike.
     let argv = crate::buildflags::cargo_build_argv_kind(&app.bin, if native { "" } else { t.triple }, &app.features, app.no_default, true);
-    let mut env = if native { Vec::new() } else { crate::buildflags::cross_env(t.triple) };
+    let mut env = if native { Vec::new() } else { crate::buildflags::cross_env_on_path(t.triple, path_env) };
+    let mut flags: Vec<&str> = Vec::new();
     if t.static_crt {
-        let flag = "-C target-feature=+crt-static";
+        flags.push("-C target-feature=+crt-static");
+        if !native {
+            let var = crate::buildflags::linker_var(t.triple);
+            let real = env.iter().find(|(k, _)| *k == var).is_some_and(|(_, l)| crate::nixtoolchain::on_path(l, path_env));
+            if !real {
+                env.retain(|(k, _)| *k != var);
+                env.push((var, "rust-lld".into()));
+                flags.push("-C link-self-contained=yes");
+            }
+        }
+    }
+    if !flags.is_empty() {
+        let mine = flags.join(" ");
         let merged = match inherited_rustflags.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(existing) => format!("{existing} {flag}"),
-            None => flag.to_string(),
+            Some(existing) => format!("{existing} {mine}"),
+            None => mine,
         };
         env.push(("RUSTFLAGS".into(), merged));
     }
     (argv, env)
+}
+
+/// Is the standard library for `triple` installed for the `rustc` on PATH?
+/// `None` when rustc cannot be asked. Checked BEFORE a cross build: a
+/// missing target otherwise surfaces as cargo's "can't find crate for
+/// `core`" after a minute of compiling build scripts.
+pub fn target_std_installed(triple: &str) -> Option<bool> {
+    let out = std::process::Command::new("rustc").args(["--print", "sysroot"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sysroot = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Some(std::path::Path::new(&sysroot).join("lib/rustlib").join(triple).join("lib").is_dir())
+}
+
+/// The finding for a missing target std (also produced by `diagnose` from
+/// cargo's own error text).
+pub fn missing_target_message(triple: &str) -> String {
+    format!("the Rust standard library for {triple} is not installed on this machine")
 }
 
 /// A buildable tablet app in the monorepo: an eink-kit binary.
@@ -1302,7 +1383,8 @@ pub fn diagnose(text: &str) -> Vec<crate::finding::Finding> {
     }
     if has("first contact needs the tablet's SSH password") {
         add(Finding::new(Info, "tablet-needs-password", "first contact needs the tablet's SSH password")
-            .help("on the tablet: Settings → Help → Copyrights and licenses, at the end; developer mode may need enabling first"),
+            .help("on the tablet: Settings → General → Help → About → Copyrights and licenses, under General information (username and password)")
+            .note("developer mode must be enabled first; enabling it factory-resets the tablet, and OS updates reset the password"),
             "first contact");
     }
     if has("key auth still fails") {
@@ -1310,11 +1392,29 @@ pub fn diagnose(text: &str) -> Vec<crate::finding::Finding> {
             .help("check /home/root/.ssh/authorized_keys on the tablet contains this phone's key"),
             "key auth still fails");
     }
-    for needle in ["timed out", "No route to host", "Connection refused", "Could not resolve", "Name or service not known"] {
+    // "refused" means the tablet ANSWERED: reachable, nothing listening on
+    // 22. Lumping it with timeouts said "did not answer", which sent a real
+    // debugging session (Paper Pro, developer mode on, Wi-Fi) the wrong way.
+    if has("Connection refused") {
+        add(Finding::new(Error, "tablet-ssh-not-listening", "the tablet answered but is not running SSH on that address")
+            .note("the network path is fine; nothing is listening on port 22 there")
+            .note("Paper Pro family over Wi-Fi: SSH over Wi-Fi is OFF by default, even with developer mode on")
+            .help("connect over USB once (10.11.99.1) and run `rm-ssh-over-wlan on` (Enable SSH over Wi-Fi on the Tablets page)")
+            .help("refused over USB too: developer mode is off (Settings → General → Software → Developer mode; it factory-resets the tablet)"),
+            "Connection refused");
+    }
+    if has("Network unreachable") || has("Network is unreachable") {
+        add(Finding::new(Error, "tablet-no-network-path", "this machine has no network path to that address")
+            .note("no interface on this machine is on that address's network, so nothing was even sent")
+            .help("for 10.11.99.1: the USB network link is not up. Check `ip -br link` for a new interface after plugging in, and `ip -br -4 addr` for a 10.11.99.x address on it")
+            .help("on a postmarketOS phone the USB host stack may need the usbnet drivers loaded (and can crash enumerating the tablet: check dmesg for \"HC died\"); a laptop or Wi-Fi avoids it"),
+            "unreachable");
+    }
+    for needle in ["timed out", "No route to host", "Could not resolve", "Name or service not known"] {
         if has(needle) {
             add(Finding::new(Error, "tablet-unreachable", "the tablet did not answer on SSH")
                 .help("on a USB cable the tablet is 10.11.99.1; check the cable carries data and the tablet is awake and unlocked")
-                .help("over Wi-Fi, SSH may be off on current OS versions: use USB first"),
+                .help("over Wi-Fi: check the address (Copyrights and licenses lists it under the password) and that both are on the same network"),
                 needle);
             break;
         }
@@ -1323,6 +1423,32 @@ pub fn diagnose(text: &str) -> Vec<crate::finding::Finding> {
         add(Finding::new(Error, "tablet-auth", "the tablet refused the login")
             .help("enrol again: the password from Settings installs this phone's key"),
             "Permission denied");
+    }
+
+    // building
+    if has("standard library for") && has("is not installed on this machine")
+        || has("can't find crate for `core`") || has("can't find crate for `std`")
+        || has("target may not be installed")
+    {
+        let triple = ["aarch64-unknown-linux-musl", "armv7-unknown-linux-musleabihf", "aarch64-unknown-linux-gnu", "armv7-unknown-linux-gnueabihf"]
+            .into_iter().find(|t| text.contains(t)).unwrap_or("<target>");
+        add(Finding::new(Error, "build-target-missing", format!("this machine has no Rust standard library for {triple}"))
+            .note("the tablet is a different CPU; building for it needs that target's std")
+            .help("install it (rustup), then build again; or build on an aarch64 postmarketOS phone, where the AppLoad route builds natively")
+            .fix(format!("rustup target add {triple}")),
+            if has("is not installed on this machine") { "is not installed" } else { "can't find crate" });
+    }
+    if has("linker `") && has("` not found") {
+        add(Finding::new(Error, "build-linker-missing", "the cross linker cargo was told to use is not installed")
+            .help("tablet builds fall back to Rust's rust-lld when no musl cross linker is on PATH; an explicit CARGO_TARGET_*_LINKER in your environment overrides that")
+            .help("alternatively `cargo install cargo-zigbuild` and build with zig as the linker"),
+            "linker `");
+    }
+    if let Some(l) = text.lines().find(|l| l.trim_start().starts_with("error[E") || l.trim_start().starts_with("error: could not compile")) {
+        let l = l.to_string();
+        add(Finding::new(Error, "build-compile-error", "the app failed to compile")
+            .help("the first error line is quoted below; the full cargo output is in the log above"),
+            &l);
     }
 
     // the binary
@@ -1835,7 +1961,11 @@ mod tests {
     fn tablet_builds_force_static_even_for_egui_apps_and_keep_existing_rustflags() {
         let t = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
         let demo = TabletApp { dir: ".".into(), bin: "eink-demo".into(), features: vec![], no_default: false };
-        let (argv, env) = tablet_build_cmd(&demo, &t, Some("-C opt-level=s"), false);
+        // a PATH with a musl cross gcc, so the rust-lld fallback stays out of it
+        let dir = std::env::temp_dir().join(format!("xgcc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aarch64-linux-musl-gcc"), "").unwrap();
+        let (argv, env) = tablet_build_cmd_on_path(&demo, &t, Some("-C opt-level=s"), false, &dir.to_string_lossy());
         assert!(argv.windows(2).any(|w| w == ["--bin", "eink-demo"]), "{argv:?}");
         assert!(argv.windows(2).any(|w| w == ["--target", "aarch64-unknown-linux-musl"]), "{argv:?}");
         let rf = env.iter().find(|(k, _)| k == "RUSTFLAGS").map(|(_, v)| v.as_str()).unwrap();
@@ -1998,6 +2128,13 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
         let route = parse_displays("").route().unwrap_err();
         assert_eq!(diagnose(&route)[0].code, "tablet-no-route");
         assert!(diagnose("ssh failed: ssh: connect to host 10.11.99.1 port 22: No route to host")[0].code == "tablet-unreachable");
+        // the real session: Wi-Fi refused (reachable, SSH-over-Wi-Fi off), USB unreachable (no link)
+        let wifi = diagnose("ssh: connect to host 192.168.2.185 port 22: Connection refused");
+        assert_eq!(wifi[0].code, "tablet-ssh-not-listening");
+        assert!(wifi[0].help[0].contains("rm-ssh-over-wlan on"));
+        assert!(!wifi.iter().any(|f| f.code == "tablet-unreachable"), "refused is not 'did not answer'");
+        let usb = diagnose("ssh: connect to host 10.11.99.1 port 22: Network unreachable");
+        assert_eq!(usb[0].code, "tablet-no-network-path");
     }
 
     #[test]
@@ -2012,5 +2149,64 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
         assert!(diagnose("blah\nthread 'main' panicked at src/app.rs:10:5:\nboom").iter().any(|f| f.code == "app-panic"));
         assert!(diagnose("EINK_PROFILE=\"turbo\": want fast-color|fast-mono|quality").iter().any(|f| f.code == "app-bad-setting"));
         assert!(diagnose("completely unrelated text").is_empty(), "unrecognised text yields nothing");
+    }
+
+    #[test]
+    fn tablet_keys_include_an_ecdsa_key_for_the_rm2() {
+        let home = std::env::temp_dir().join(format!("tkeys_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let old = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let keys = tablet_pubkeys();
+        if let Some(o) = old { std::env::set_var("HOME", o); }
+        let keys = keys.expect("ssh-keygen available");
+        let kinds: Vec<&str> = keys.lines().filter_map(|l| l.split_whitespace().next()).collect();
+        assert_eq!(kinds, vec!["ssh-ed25519", "ecdsa-sha2-nistp256"], "{keys}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_user_is_a_default_not_a_constant() {
+        assert_eq!(DEFAULT_USER, "root");
+        let e = SshEnroller { user: "someone".into(), host: "h".into() };
+        assert_eq!(e.user, "someone");
+        assert!(parse_displays("wlan_ssh_tool=1\n").wlan_ssh_tool);
+    }
+
+    #[test]
+    fn a_laptop_without_a_musl_cross_linker_links_with_rust_lld() {
+        let app = TabletApp { dir: ".".into(), bin: "eink-demo".into(), features: vec![], no_default: false };
+        let t = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
+        let (_, env) = tablet_build_cmd_on_path(&app, &t, None, false, "/nonexistent");
+        let get = |k: &str| env.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+        assert_eq!(get("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER").as_deref(), Some("rust-lld"));
+        assert_eq!(get("RUSTFLAGS").as_deref(), Some("-C target-feature=+crt-static -C link-self-contained=yes"));
+        // with a real musl cross gcc on PATH, it is used and lld is not forced
+        let dir = std::env::temp_dir().join(format!("xlink_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aarch64-linux-musl-gcc"), "").unwrap();
+        let (_, env) = tablet_build_cmd_on_path(&app, &t, None, false, &dir.to_string_lossy());
+        assert!(env.iter().any(|(k, v)| k.ends_with("_LINKER") && v == "aarch64-linux-musl-gcc"), "{env:?}");
+        assert!(!env.iter().any(|(_, v)| v.contains("link-self-contained")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_failures_explain_themselves() {
+        // what the laptop build printed
+        let f = diagnose("build failed (exit Some(101)).\nerror[E0463]: can't find crate for `core`\n  = note: the `aarch64-unknown-linux-musl` target may not be installed");
+        assert_eq!(f[0].code, "build-target-missing");
+        assert_eq!(f[0].fix.as_deref(), Some("rustup target add aarch64-unknown-linux-musl"));
+        assert!(diagnose(&missing_target_message("aarch64-unknown-linux-musl"))[0].fix.as_deref().unwrap().contains("rustup target add"));
+        assert!(diagnose("error: linker `aarch64-linux-musl-gcc` not found").iter().any(|f| f.code == "build-linker-missing"));
+        assert!(diagnose("error[E0308]: mismatched types\n --> src/app.rs:3:5").iter().any(|f| f.code == "build-compile-error"));
+    }
+
+    #[test]
+    fn this_hosts_own_target_is_installed() {
+        let host = if cfg!(target_arch = "x86_64") { "x86_64-unknown-linux-gnu" } else { return };
+        assert_eq!(target_std_installed(host), Some(true));
+        assert_eq!(target_std_installed("aarch64-unknown-linux-musl"), Some(false), "not installed in this sandbox");
     }
 }

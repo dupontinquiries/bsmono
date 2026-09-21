@@ -125,6 +125,26 @@ pub fn klog_severity(level: Option<u8>) -> Severity {
     }
 }
 
+/// Known kernel-log signatures worth a finding of their own, beyond the
+/// per-record rows.
+pub fn klog_signatures(records: &[crate::klog::Record]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let hit = |needles: &[&str]| records.iter().find(|r| needles.iter().any(|n| r.message.contains(n)));
+    if let Some(r) = hit(&["HC died", "host controller not responding, assume dead"]) {
+        let enumerating = records.iter().any(|r| r.message.contains("new ") && r.message.contains("USB device number"));
+        let mut f = Finding::new(Severity::Error, "usb-host-controller-died", "this machine's USB host controller crashed")
+            .note(format!("from: {}", r.message));
+        if enumerating {
+            f = f.note("it died while enumerating a newly attached device, so that device never got as far as its drivers");
+        }
+        out.push(f
+            .note("seen on a Fairphone 5 (postmarketOS) plugged into a reMarkable: the phone's dwc3/xHCI host mode, not the tablet")
+            .help("compare with a machine where it works: `lsmod` and `apk info` diffs usually name the missing modules/packages")
+            .help("for a tablet, use Wi-Fi or a laptop for the one USB step instead"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +169,20 @@ mod tests {
     fn render_reads_like_rustc() {
         let r = Finding::new(Severity::Error, "x-y", "it broke").note("because").help("do this").fix("cmd one\ncmd two").render();
         assert_eq!(r, "error[x-y]: it broke\n  = note: because\n  = help: do this\n  = fix:\n      cmd one\n      cmd two\n");
+    }
+
+    #[test]
+    fn the_fairphone_controller_crash_is_named() {
+        // the real dmesg from the session
+        let log = "[57891.424623] usb 1-1: new full-speed USB device number 2 using xhci-hcd\n\
+                   [57901.783888] xhci-hcd xhci-hcd.5.auto: xHCI host not responding to stop endpoint command\n\
+                   [57901.804091] xhci-hcd xhci-hcd.5.auto: xHCI host controller not responding, assume dead\n\
+                   [57901.804154] xhci-hcd xhci-hcd.5.auto: HC died; cleaning up\n";
+        let f = klog_signatures(&crate::klog::parse(log));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].code, "usb-host-controller-died");
+        assert!(f[0].notes.iter().any(|n| n.contains("enumerating")));
+        assert!(klog_signatures(&crate::klog::parse("[1.0] usb 1-1: new high-speed USB device number 3\n")).is_empty());
     }
 
     #[test]

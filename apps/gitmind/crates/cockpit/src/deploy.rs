@@ -1182,19 +1182,46 @@ pub fn unbreak_ssh(user: &str, host: &str) -> Result<String, String> {
 /// "set up SSH key" wizard: you enter the device password *once*, then every later
 /// connection is passwordless (BatchMode key auth works). Returns a status note.
 pub fn setup_key(user: &str, host: &str, password: &str) -> Result<String, String> {
+    setup_key_with(user, host, password, &ensure_local_pubkey()?)
+}
+
+/// Generate `~/.ssh/id_<kind>` (no passphrase) if absent; return its public
+/// key. For devices that refuse the default key type (the reMarkable 2's
+/// dropbear does not accept ed25519).
+pub fn ensure_keypair(kind: &str) -> Result<String, String> {
+    let home = std::env::var("HOME").map_err(|_| "no $HOME set".to_string())?;
+    let ssh_dir = format!("{home}/.ssh");
+    std::fs::create_dir_all(&ssh_dir).map_err(|e| format!("create {ssh_dir}: {e}"))?;
+    let keyp = format!("{ssh_dir}/id_{kind}");
+    if !std::path::Path::new(&format!("{keyp}.pub")).exists() {
+        let mut args = vec!["-t", kind, "-N", "", "-C", "gitmind-fleet", "-f", keyp.as_str()];
+        if kind == "ecdsa" {
+            args.splice(2..2, ["-b", "256"]);
+        }
+        let st = Command::new("ssh-keygen").args(&args).status().map_err(|e| format!("ssh-keygen: {e}"))?;
+        if !st.success() {
+            return Err(format!("ssh-keygen could not create an {kind} key"));
+        }
+    }
+    std::fs::read_to_string(format!("{keyp}.pub")).map_err(|e| format!("read {keyp}.pub: {e}"))
+}
+
+/// [`setup_key`] with the public key text given: one or more key lines,
+/// all installed in the same password login.
+pub fn setup_key_with(user: &str, host: &str, password: &str, pubkeys: &str) -> Result<String, String> {
     if user.trim().is_empty() || host.trim().is_empty() {
         return Err("user and host are required".into());
     }
     if password.is_empty() {
         return Err("enter the device password to install the key".into());
     }
-    let pubkey = ensure_local_pubkey()?;
+    let pubkey = pubkeys.to_string();
     // This is the user's own key on their own interactive account, so install it PLAIN —
     // like ssh-copy-id. It must NOT be `restrict`ed: `restrict` implies `no-pty`, which
     // would break `ssh user@host` ("PTY allocation request failed"). Hardening (restrict +
     // forced command + expiry) is reserved for the dedicated fleet user, which is never
     // used interactively.
-    let key_line = plain_key_line(&pubkey);
+    let key_line: String = pubkey.lines().filter(|l| !l.trim().is_empty()).map(plain_key_line).collect::<Vec<_>>().join("");
     // temp askpass helper (0700, current pid in the name, removed after)
     let script = std::env::temp_dir().join(format!("gm-askpass-{}", std::process::id()));
     std::fs::write(&script, ASKPASS_BODY).map_err(|e| format!("write askpass: {e}"))?;
