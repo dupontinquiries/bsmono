@@ -262,6 +262,7 @@ pub struct AppState {
     /// collided with the REAL, pre-existing Ctrl+P binding
     /// (`state.rs`'s `(P, true) => self.open_palette()`) and bypassed
     /// this mode entirely -- removed once found.
+    #[cfg(feature = "voice")]
     pub voice_popup: uikit_egui::voice_popup::VoicePopup,
     /// The mic button drawn inside `Mode::VoiceCommand`'s row: click to
     /// start, right-click/hold to cancel.
@@ -582,6 +583,7 @@ impl AppState {
             lang,
             syntax: Syntax::new(lang),
             find: None,
+            #[cfg(feature = "voice")]
             voice_popup: Default::default(),
             mic_indicator: Default::default(),
             follow_mode: false,

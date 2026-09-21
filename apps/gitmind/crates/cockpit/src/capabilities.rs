@@ -327,6 +327,17 @@ mod tests {
     }
 
     #[test]
+    fn the_real_aperture_manifest_drops_voice_and_engine_on_the_tablet() {
+        let toml = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../aperture/crates/aperture-egui/Cargo.toml")).unwrap();
+        let keep = vec!["app".to_string()];
+        let s = select_features(&toml, &parse(RMPP), &keep);
+        let dropped: Vec<&str> = s.dropped.iter().map(|d| d.0.as_str()).collect();
+        assert!(dropped.contains(&"voice") && dropped.contains(&"engine"), "{s:?}");
+        assert!(s.features.contains(&"tree-sitter".to_string()));
+        assert!(select_features(&toml, &parse(FP5), &keep).dropped.is_empty(), "the phone keeps everything");
+    }
+
+    #[test]
     fn names_map_to_needs_by_whole_word() {
         assert_eq!(needs_by_name("ble"), vec![Need::Bluetooth]);
         assert_eq!(needs_by_name("gpu-scene"), vec![Need::Gpu]);
