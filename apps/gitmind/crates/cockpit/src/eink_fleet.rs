@@ -1195,6 +1195,9 @@ pub fn appload_remove_cmd(app: &str, appload_dir: &str) -> Result<String, String
 pub fn appload_manifest(opts: &AppLoadOptions, app: &str, model: Option<RmModel>, profile: RefreshProfile) -> String {
     let mut env = serde_json::Map::new();
     env.insert("EINK_BACKEND".into(), "qtfb".into());
+    // AppLoad-launched apps have no terminal: their stderr goes to the same
+    // log `status` tails, so a failure to start is readable from the phone.
+    env.insert("EINK_LOG".into(), log_path(app).into());
     env.insert(PROFILE_ENV.into(), profile.as_env().into());
     if let Some(m) = model {
         env.insert("EINK_MODEL".into(), m.env_id().into());
@@ -1597,6 +1600,7 @@ mod tests {
         assert_eq!(v["environment"]["EINK_MODEL"], "rmppm");
         assert_eq!(v["environment"]["EINK_BACKEND"], "qtfb");
         assert_eq!(v["environment"]["EINK_PROFILE"], "fast-color");
+        assert_eq!(v["environment"]["EINK_LOG"], "/home/root/.local/share/gitmind/log/eink-demo.log");
     }
 
     #[test]

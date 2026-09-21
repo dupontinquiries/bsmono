@@ -459,10 +459,27 @@ pub fn open_backend(cfg: &Config, hub: &InputHub) -> std::io::Result<Box<dyn Pre
 }
 
 /// Run `app` until the display server goes away.
+/// `EINK_LOG=<path>`: append stderr there. An app launched from AppLoad's
+/// sidebar has no terminal, so without this its startup errors (no display
+/// server, wrong model, bad knob) are invisible; gitmind sets it in the
+/// manifest to the log `gitmind eink status` reads.
+fn redirect_stderr() {
+    let Ok(path) = std::env::var("EINK_LOG") else { return };
+    let Ok(c) = std::ffi::CString::new(path) else { return };
+    unsafe {
+        let fd = libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_CLOEXEC, 0o644);
+        if fd >= 0 {
+            libc::dup2(fd, 2);
+            libc::close(fd);
+        }
+    }
+}
+
 pub fn run(mut app: impl EinkApp) -> std::io::Result<()> {
+    redirect_stderr();
     let cfg = Config::from_env().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let hub = InputHub::new()?;
-    let mut present = open_backend(&cfg, &hub)?;
+    let mut present = open_backend(&cfg, &hub).inspect_err(|e| eprintln!("eink: {e}"))?;
     let mut engine = Engine::new(&cfg, present.caps(), present.name());
     let t0 = Instant::now();
     loop {
