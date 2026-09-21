@@ -7,13 +7,14 @@
 //! rather than in `studio_video::multicam`: only the shell holds the decoded
 //! audio.
 //!
-//! **Which angle is "busier"** is the group's own order. Measuring each
-//! angle's motion is the better answer (`studio_video::multicam::motion_energy`
-//! over a decoded path) but it costs a decode per angle, so until something
-//! measures them in the background, the order the operator put the angles in
-//! IS the answer: first is calmest, last is busiest. The status line says so,
-//! because a silent guess about which angle is which would be worse than an
-//! announced convention.
+//! **Which angle is "busier"** is measured, not assumed: a few seconds from
+//! the middle of each angle are decoded and its camera motion measured
+//! (`studio_video::multicam::measure_energy`). That costs one short decode
+//! per angle — seconds, not minutes — and it is the difference between
+//! "the handheld angle gets the loud passage" and "whichever angle you
+//! happened to add first does". If an angle cannot be decoded it keeps the
+//! energy it had, so one unreadable file does not reshuffle the rest, and
+//! angles that all measure the same fall back to the group's own order.
 
 use std::collections::BTreeMap;
 
@@ -25,6 +26,11 @@ use studio_video::multicam::{self, Choice, Control, Rules, Timing};
 /// transient does not move the camera.
 pub const HOP: f64 = 0.05;
 
+/// How much of each angle to decode when measuring how busy it is. Four
+/// seconds is ~96 frames at 24 fps — enough to tell a locked-off wide from a
+/// handheld, and short enough that a six-angle group is seconds of work.
+pub const SAMPLE_SECS: f64 = 4.0;
+
 /// The cut, as ops: a new video track and one clip per shot, ready to apply
 /// as a single `Op::Group` so one undo takes the whole thing back.
 ///
@@ -33,12 +39,11 @@ pub const HOP: f64 = 0.05;
 /// was the problem.
 pub fn ops(project: &Project, audio: &BTreeMap<SourceId, SourceAudio>,
            group: GroupId, bus: BusId, rules: Rules) -> Result<(Vec<Op>, String), String> {
-    // Group order IS the calm-to-busy ranking (see the module note): angles
-    // come out of `from_group` in the group's own order and `plan` ranks
-    // with a stable sort, so equal energies keep it. Assigning energy = index
-    // here would be a no-op -- it was, until a break-check showed the test
-    // could not tell the two apart.
-    let (angles, start, end) = multicam::from_group(project, group)?;
+    let (mut angles, start, end) = multicam::from_group(project, group)?;
+    // Measured ranking, with the group's own order as the tie-break: `plan`
+    // sorts stably, so angles that measure the same keep the order the
+    // operator put them in.
+    multicam::measure_energy(&mut angles, project, start, end, SAMPLE_SECS);
     let signal = studio_audio::bus_signal(project, audio, &BTreeMap::new(), start, end, 48_000, bus)
         .ok_or("that control channel is muted or gone")?;
     if signal.iter().all(|s| *s == 0.0) {
@@ -54,8 +59,11 @@ pub fn ops(project: &Project, audio: &BTreeMap<SourceId, SourceAudio>,
         id: track, kind: studio_core::TrackKind::Video, name: "multicam (level)".into(),
         muted: false, locked: false, gain: 1.0, route: None }, at: project.tracks.len() }];
     out.extend(multicam::layout(&shots, &angles, track, start, first_clip));
-    let note = format!("{} cuts across {} angles, quiet→busy in group order",
-                       shots.len(), angles.len());
+    let note = format!("{} cuts across {} angles, quiet→busy: {}", shots.len(), angles.len(), {
+        let mut by: Vec<&multicam::Angle> = angles.iter().collect();
+        by.sort_by(|a, b| a.energy.partial_cmp(&b.energy).unwrap_or(std::cmp::Ordering::Equal));
+        by.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(" → ")
+    });
     Ok((out, note))
 }
 

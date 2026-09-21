@@ -89,6 +89,47 @@ pub fn from_group(project: &studio_core::Project, group: studio_core::GroupId)
     Ok((angles, start, end))
 }
 
+/// Measure how busy each angle's picture is, by sampling it.
+///
+/// [`Angle::energy`] decides which angle a loud passage gets, and until
+/// something measures it every angle carries 0 and the caller's order stands
+/// in for the answer. This is the measurement: for each angle, decode
+/// `secs` seconds of grey frames from the middle of the cuttable span at
+/// analysis size, measure the camera path, and take its mean step length
+/// ([`motion_energy`]).
+///
+/// Sampled deliberately. Measuring every frame of every angle of a
+/// multi-angle shoot is minutes of decoding to answer a question — "which of
+/// these is the handheld one" — that a few seconds in the middle answers as
+/// well. `secs` should be long enough to include real movement: four seconds
+/// at 24 fps is ~96 frames, which is plenty, and the middle is chosen
+/// because the head of a take is slate and settling.
+///
+/// Angles that cannot be decoded keep the energy they had, so one unreadable
+/// file does not reshuffle the ranking of the others.
+pub fn measure_energy(angles: &mut [Angle], project: &studio_core::Project,
+                      start: Ticks, end: Ticks, secs: f64) {
+    let span = (end.0 - start.0) as f64 / TICKS_PER_SECOND as f64;
+    let take = secs.min(span);
+    let from_timeline = (start.0 as f64 / TICKS_PER_SECOND as f64) + (span - take) / 2.0;
+    for a in angles.iter_mut() {
+        let Some(src) = project.sources.get(&a.source) else { continue };
+        let path = std::path::PathBuf::from(&src.path);
+        let Ok(probe) = crate::probe(&path) else { continue };
+        let pipe = crate::framepipe::Pipe {
+            input: path,
+            // the angle's own file time for that stretch of timeline
+            range: Some((from_timeline + a.offset, take)),
+            size: crate::framepipe::Size::analysis(probe.width, probe.height),
+            fps: probe.fps.clamp(1.0, 60.0),
+        };
+        let Ok(grey) = pipe.gray() else { continue };
+        if grey.len() < 3 { continue; }
+        let max_shift = (grey[0].w as u32 / 20).max(8);
+        a.energy = motion_energy(&crate::stabilize::measure(&grey, max_shift));
+    }
+}
+
 /// Beat times in seconds over `[from, to)`, from a tempo map — the grid a
 /// [`Timing::OnBeats`] plan cuts on when the music is the project's own
 /// rather than a rendered track.
@@ -452,6 +493,67 @@ mod tests {
             assert!((moment - clip.pos.to_seconds()).abs() < 1e-6,
                     "the clip reads its own timeline moment: {clip:?} for {s:?}");
         }
+    }
+
+    /// Two real files: one locked off, one that drifts. Measuring must rank
+    /// them in that order regardless of the order they are given in.
+    #[test]
+    fn measuring_ranks_a_locked_angle_below_a_moving_one() {
+        if !crate::testkit::ffmpeg_or_skip("measuring_ranks_a_locked_angle_below_a_moving_one") { return; }
+        use studio_core::*;
+        let shoot = crate::testkit::shoot(&[1.0], 6.0);
+        let size = crate::framepipe::Size { w: 128, h: 72 };
+        let paint = |f: &mut crate::framepipe::Frame| {
+            for y in 0..f.h { for x in 0..f.w {
+                let (fx, fy) = (x as f32, y as f32);
+                let v = 128.0 + 90.0 * (fx / 9.0).sin() * (fy / 7.0).cos();
+                f.set(x, y, [v as u8, (255.0 - v) as u8, v as u8]);
+            }}
+        };
+        let src = crate::framepipe::Pipe { input: shoot.takes[0].video.clone(), range: None, size, fps: 12.0 };
+        let locked = shoot.dir.join(format!("locked-{}.mp4", std::process::id()));
+        let moving = shoot.dir.join(format!("moving-{}.mp4", std::process::id()));
+        src.map(&locked, 12, |_, mut f| { paint(&mut f); f }).expect("locked angle");
+        src.map(&moving, 12, |i, mut f| {
+            paint(&mut f);
+            f.warp((i as f32 * 0.7).sin() * 6.0, (i as f32 * 0.4).cos() * 5.0, 1.0)
+        }).expect("moving angle");
+
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video, name: "a".into(),
+            muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+        for (i, path) in [&moving, &locked].iter().enumerate() {
+            p.apply(&Op::AddSource { source: Source { id: SourceId(i as u64 + 1),
+                path: path.display().to_string(), len: Ticks::from_seconds(6.0), sample_rate: 48_000,
+                channels: 2, has_video: true, kind: SourceKind::File } }).unwrap();
+        }
+        // given busiest-first, so group order alone would get it backwards
+        let mut angles = vec![
+            Angle { name: "moving".into(), energy: 0.0, source: SourceId(1), offset: 0.0 },
+            Angle { name: "locked".into(), energy: 0.0, source: SourceId(2), offset: 0.0 },
+        ];
+        measure_energy(&mut angles, &p, Ticks::ZERO, Ticks::from_seconds(6.0), 3.0);
+        assert!(angles[0].energy > angles[1].energy * 3.0 + 0.5,
+                "the moving angle must measure busier: {:?}", angles.iter().map(|a| a.energy).collect::<Vec<_>>());
+
+        // and the plan now sends the loud passage to the measured-busy angle
+        let c = control(&[(3.0, -40.0), (3.0, -4.0)]);
+        let shots = plan(&angles, &Timing::Free, &Choice::ByLevel(c), RULES, 6.0);
+        assert_eq!(shots[0].angle, 1, "quiet -> the locked angle");
+        assert_eq!(shots.last().unwrap().angle, 0, "loud -> the moving one: {shots:?}");
+        for f in [&locked, &moving] { let _ = std::fs::remove_file(f); }
+    }
+
+    #[test]
+    fn an_unreadable_angle_keeps_its_energy_rather_than_reshuffling_the_rest() {
+        use studio_core::*;
+        let mut p = Project::default();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "/nowhere/gone.mkv".into(),
+            len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2, has_video: true,
+            kind: SourceKind::File } }).unwrap();
+        let mut angles = vec![Angle { name: "gone".into(), energy: 4.0, source: SourceId(1), offset: 0.0 }];
+        measure_energy(&mut angles, &p, Ticks::ZERO, Ticks::from_seconds(10.0), 2.0);
+        assert_eq!(angles[0].energy, 4.0, "an unreadable file does not zero its own ranking");
     }
 
     #[test]
