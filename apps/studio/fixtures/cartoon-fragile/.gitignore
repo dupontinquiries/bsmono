@@ -1,0 +1,3 @@
+# The root .gitignore excludes *.mp4 (media belongs outside the repo). These three are
+# the exception: a deliberate, tiny (~310 KB) synthetic fixture the film tools test against.
+!*.mp4
