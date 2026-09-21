@@ -196,7 +196,62 @@ impl Transfer {
 
 /// Apply an `n`^3 LUT to an 8-bit RGB frame, trilinear -- the per-frame cost
 /// the preview pays.
+///
+/// Each channel value has only 256 possibilities, so its cell index and
+/// fraction are looked up from a table built once per call rather than
+/// recomputed per pixel with a divide and a floor. Rows are split across
+/// threads when the frame is big enough to be worth it; the result is
+/// identical to a single-threaded pass (pinned by a test), because every
+/// pixel is computed independently.
 pub fn apply_lut(px: &mut [u8], lut: &[[f32; 3]], n: usize) {
+    let d = (n - 1) as f32;
+    let mut idx = [(0usize, 0usize, 0.0f32); 256];
+    for (v, e) in idx.iter_mut().enumerate() {
+        let f = v as f32 / 255.0 * d;
+        let i0 = (f.floor() as usize).min(n - 1);
+        *e = (i0, (i0 + 1).min(n - 1), f - i0 as f32);
+    }
+    let pixels = px.len() / 3;
+    let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(1).min(8);
+    if threads <= 1 || pixels < 200_000 {
+        apply_rows(px, lut, n, &idx);
+        return;
+    }
+    let chunk = pixels.div_ceil(threads) * 3;
+    std::thread::scope(|sc| {
+        for part in px.chunks_mut(chunk) {
+            let idx = &idx;
+            sc.spawn(move || apply_rows(part, lut, n, idx));
+        }
+    });
+}
+
+fn apply_rows(px: &mut [u8], lut: &[[f32; 3]], n: usize, idx: &[(usize, usize, f32); 256]) {
+    let nn = n * n;
+    for p in px.chunks_mut(3) {
+        let (r0, r1, tr) = idx[p[0] as usize];
+        let (g0, g1, tg) = idx[p[1] as usize];
+        let (b0, b1, tb) = idx[p[2] as usize];
+        let (c000, c100) = (lut[b0 * nn + g0 * n + r0], lut[b0 * nn + g0 * n + r1]);
+        let (c010, c110) = (lut[b0 * nn + g1 * n + r0], lut[b0 * nn + g1 * n + r1]);
+        let (c001, c101) = (lut[b1 * nn + g0 * n + r0], lut[b1 * nn + g0 * n + r1]);
+        let (c011, c111) = (lut[b1 * nn + g1 * n + r0], lut[b1 * nn + g1 * n + r1]);
+        for c in 0..3 {
+            let x00 = c000[c] + (c100[c] - c000[c]) * tr;
+            let x10 = c010[c] + (c110[c] - c010[c]) * tr;
+            let x01 = c001[c] + (c101[c] - c001[c]) * tr;
+            let x11 = c011[c] + (c111[c] - c011[c]) * tr;
+            let y0 = x00 + (x10 - x00) * tg;
+            let y1 = x01 + (x11 - x01) * tg;
+            p[c] = ((y0 + (y1 - y0) * tb) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// The straightforward per-pixel version, kept as the reference the fast
+/// path is checked against.
+#[cfg(test)]
+fn apply_lut_reference(px: &mut [u8], lut: &[[f32; 3]], n: usize) {
     let d = (n - 1) as f32;
     let at = |r: usize, g: usize, b: usize| lut[(b * n + g) * n + r];
     for p in px.chunks_mut(3) {
@@ -300,6 +355,21 @@ mod tests {
         let mut out = target.clone();
         apply_lut(&mut out, &zero.lut(LUT_N), LUT_N);
         assert!(target.iter().zip(&out).all(|(a, b)| (*a as i32 - *b as i32).abs() <= 3), "strength 0 is the clip as it was");
+    }
+
+    #[test]
+    fn the_fast_lut_path_matches_the_reference_on_every_colour() {
+        let reference = scene([1.0, 0.78, 1.0], [1.0, 0.8, 0.6], 0.08);
+        let target = scene([1.0, 1.0, 1.0], [1.0, 1.0, 1.0], 0.0);
+        let lut = Transfer::fit(&stats(&target), &stats(&reference), 1.0).lut(LUT_N);
+        // every channel value at least once, and a frame big enough to take
+        // the threaded path where there are cores
+        let mut px: Vec<u8> = (0..700_000u32).flat_map(|i| [(i % 256) as u8, ((i / 7) % 256) as u8, ((i / 49) % 256) as u8]).collect();
+        let mut want = px.clone();
+        apply_lut_reference(&mut want, &lut, LUT_N);
+        apply_lut(&mut px, &lut, LUT_N);
+        let worst = px.iter().zip(&want).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+        assert!(worst <= 1, "fast path differs from the reference by {worst} levels");
     }
 
     #[test]
