@@ -100,6 +100,10 @@ impl Executor for System {
             }
             Action::ShowTrackpad(on) => Outcome::Done(format!("trackpad overlay {}", if *on { "shown" } else { "hidden" })),
             Action::SavePrefs => Outcome::Unwired("caller persists prefs (save_prefs) since the executor does not hold them"),
+            Action::HideSystemCursor(on) => match cosmic_config_home() {
+                Some(base) => hide_system_cursor_in(&base, *on),
+                None => Outcome::Failed("no config home".into()),
+            },
             Action::Activate(_) | Action::Close(_) | Action::SetMaximized(..) => {
                 Outcome::Unwired("zcosmic_toplevel_manager_v1 requests not in systemcompkit yet")
             }
@@ -108,6 +112,96 @@ impl Executor for System {
             Action::SetSlider(..) => Outcome::Unwired("no brightness/volume backend yet"),
         }
     }
+}
+
+// ---- system cursor (cosmic-comp) --------------------------------------------
+
+/// `$XDG_CONFIG_HOME` (or `~/.config`): where cosmic-config keeps user values.
+pub fn cosmic_config_home() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+}
+
+/// cosmic-comp's `cursor_hide_timeout`: seconds of inactivity before it hides
+/// the cursor, live-reloaded from cosmic-config. `Some(0)` hides it right
+/// after any motion, which is how the fat cursor replaces it without a
+/// compositor patch. (cosmic-comp refuses to hide while the pointer is
+/// grabbed, so it shows during a held-button drag.)
+pub fn cursor_hide_path(config_home: &std::path::Path) -> PathBuf {
+    config_home.join("cosmic/com.system76.CosmicComp/v1/cursor_hide_timeout")
+}
+
+/// Where the user's own value is kept while tideshell overrides it. On disk,
+/// not in memory: if tideshell dies with the fat cursor on, `Some(0)` would
+/// otherwise stay in cosmic-comp's config and the system cursor would stay
+/// hidden with nothing left to restore it. `recover_system_cursor` runs at
+/// startup and puts it back. Content: `absent`, or `value:` + the old text.
+pub fn cursor_saved_path(config_home: &std::path::Path) -> PathBuf {
+    config_home.join("tideshell/cursor_hide_timeout.saved")
+}
+
+fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let tmp = path.with_extension("tideshell-tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
+}
+
+fn remove_if_present(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::remove_file(path).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+}
+
+/// Override (on) or restore (off) cosmic-comp's `cursor_hide_timeout`. The
+/// user's own value is saved once, on the first override, and restored
+/// exactly — including "no key at all". Written atomically (write + rename),
+/// as cosmic-config itself does, so the compositor's watcher never reads
+/// half a file.
+pub fn hide_system_cursor_in(config_home: &std::path::Path, on: bool) -> Outcome {
+    let path = cursor_hide_path(config_home);
+    let saved = cursor_saved_path(config_home);
+    let r = (|| -> std::io::Result<()> {
+        if on {
+            if !saved.exists() {
+                let orig = match std::fs::read_to_string(&path) {
+                    Ok(t) => format!("value:{t}"),
+                    Err(_) => "absent".to_string(),
+                };
+                write_atomic(&saved, &orig)?;
+            }
+            write_atomic(&path, "Some(0)")
+        } else {
+            restore_from(&path, &saved)
+        }
+    })();
+    match r {
+        Ok(()) => Outcome::Done(format!("system cursor {} ({})", if on { "hidden" } else { "restored" }, path.display())),
+        Err(e) => Outcome::Failed(format!("{}: {e}", path.display())),
+    }
+}
+
+fn restore_from(path: &std::path::Path, saved: &std::path::Path) -> std::io::Result<()> {
+    let Ok(orig) = std::fs::read_to_string(saved) else {
+        return Ok(()); // never overridden: leave the user's value alone
+    };
+    match orig.strip_prefix("value:") {
+        Some(text) => write_atomic(path, text)?,
+        None => remove_if_present(path)?,
+    }
+    remove_if_present(saved)
+}
+
+/// Startup recovery: a previous run left the cursor overridden (it crashed
+/// or was killed with the fat cursor on). `None` when there was nothing to do.
+pub fn recover_system_cursor(config_home: &std::path::Path) -> Option<Outcome> {
+    let saved = cursor_saved_path(config_home);
+    saved.exists().then(|| match restore_from(&cursor_hide_path(config_home), &saved) {
+        Ok(()) => Outcome::Done("restored system cursor left hidden by a previous run".into()),
+        Err(e) => Outcome::Failed(format!("cursor recovery: {e}")),
+    })
 }
 
 // ---- prefs file ------------------------------------------------------------
@@ -202,6 +296,51 @@ mod tests {
         let a = keyboard_argv(true);
         assert_eq!(&a[3..7], &["io.rustyboard.Keyboard", "/io/rustyboard/Keyboard", "io.rustyboard.Keyboard1", "Show"]);
         assert_eq!(keyboard_argv(false)[6], "Hide");
+    }
+
+    #[test]
+    fn system_cursor_override_restores_exactly_what_was_there() {
+        let base = std::env::temp_dir().join(format!("tideshell-cursor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let path = cursor_hide_path(&base);
+        // Case 1: user had their own value.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "Some(5)").unwrap();
+        assert!(matches!(hide_system_cursor_in(&base, true), Outcome::Done(_)));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "Some(0)");
+        // A second "on" must not overwrite the saved original with our own value.
+        hide_system_cursor_in(&base, true);
+        hide_system_cursor_in(&base, false);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "Some(5)");
+        assert!(!cursor_saved_path(&base).exists(), "sidecar cleared after restore");
+        // Case 2: no key at all -> restored to no key.
+        std::fs::remove_file(&path).unwrap();
+        hide_system_cursor_in(&base, true);
+        assert!(path.exists());
+        hide_system_cursor_in(&base, false);
+        assert!(!path.exists(), "restoring must remove the key we created");
+        // Case 3: "off" without a prior "on" leaves the user's value alone.
+        std::fs::write(&path, "Some(9)").unwrap();
+        hide_system_cursor_in(&base, false);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "Some(9)");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_crashed_run_is_recovered_at_startup() {
+        let base = std::env::temp_dir().join(format!("tideshell-cursor-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let path = cursor_hide_path(&base);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "Some(3)").unwrap();
+        hide_system_cursor_in(&base, true);
+        // ...process dies here: nothing turns the override off...
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "Some(0)");
+        // Next start:
+        assert!(matches!(recover_system_cursor(&base), Some(Outcome::Done(_))));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "Some(3)");
+        assert!(recover_system_cursor(&base).is_none(), "nothing to do the second time");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

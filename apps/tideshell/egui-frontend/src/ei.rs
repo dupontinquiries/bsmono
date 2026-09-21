@@ -43,6 +43,8 @@ pub enum EiOp {
     Motion(f32, f32),
     Button(u32, bool),
     Scroll(f32, f32),
+    /// Absolute position in the compositor's logical space (fat cursor).
+    Absolute(f32, f32),
 }
 
 /// Pure mapping. Scroll is inverted: the trackpad model reports finger
@@ -59,6 +61,7 @@ pub fn to_op(p: PointerOut) -> EiOp {
             pressed,
         ),
         PointerOut::Scroll { dx, dy } => EiOp::Scroll(-dx, -dy),
+        PointerOut::Absolute { x, y } => EiOp::Absolute(x, y),
     }
 }
 
@@ -116,6 +119,7 @@ struct Dev {
     pointer: Option<ei::Pointer>,
     button: Option<ei::Button>,
     scroll: Option<ei::Scroll>,
+    absolute: Option<ei::PointerAbsolute>,
     resumed: bool,
 }
 
@@ -153,16 +157,17 @@ fn run(rx: Receiver<PointerOut>, status: &Mutex<Status>) -> Result<(), String> {
         while let Some(ev) = conv.next_event() {
             match ev {
                 EiEvent::SeatAdded(s) => {
-                    s.seat.bind_capabilities(DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll);
+                    s.seat.bind_capabilities(DeviceCapability::Pointer | DeviceCapability::PointerAbsolute | DeviceCapability::Button | DeviceCapability::Scroll);
                 }
                 EiEvent::DeviceAdded(d) => {
                     let dev = &d.device;
-                    if [DeviceCapability::Pointer, DeviceCapability::Button, DeviceCapability::Scroll].iter().any(|c| dev.has_capability(*c)) {
+                    if [DeviceCapability::Pointer, DeviceCapability::PointerAbsolute, DeviceCapability::Button, DeviceCapability::Scroll].iter().any(|c| dev.has_capability(*c)) {
                         devs.push(Dev {
                             device: dev.device().clone(),
                             pointer: dev.interface::<ei::Pointer>(),
                             button: dev.interface::<ei::Button>(),
                             scroll: dev.interface::<ei::Scroll>(),
+                            absolute: dev.interface::<ei::PointerAbsolute>(),
                             resumed: false,
                         });
                     }
@@ -223,6 +228,7 @@ fn run(rx: Receiver<PointerOut>, status: &Mutex<Status>) -> Result<(), String> {
                     })
                 }),
                 EiOp::Scroll(x, y) => pick(&devs, |d| d.scroll.as_ref().map(|i| i.scroll(x, y))),
+                EiOp::Absolute(x, y) => pick(&devs, |d| d.absolute.as_ref().map(|i| i.motion_absolute(x, y))),
             };
             if done {
                 devs[i].device.frame(serial, now_us + k as u64);
@@ -257,5 +263,6 @@ mod tests {
         assert_eq!(to_op(PointerOut::Motion { dx: 3.0, dy: -2.0 }), EiOp::Motion(3.0, -2.0));
         // Fingers move down (dy > 0): content follows, i.e. scroll UP (EI y < 0).
         assert_eq!(to_op(PointerOut::Scroll { dx: 0.0, dy: 10.0 }), EiOp::Scroll(-0.0, -10.0));
+        assert_eq!(to_op(PointerOut::Absolute { x: 12.5, y: 40.0 }), EiOp::Absolute(12.5, 40.0), "absolute is not inverted or scaled");
     }
 }

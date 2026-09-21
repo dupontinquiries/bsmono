@@ -20,6 +20,18 @@ egui-frontend/           surfaces + executors + tideshell-sim
 | bottom edge | press and hold, slide, lift | toggle Carousel / Keyboard / Trackpad |
 | right edge | swipe in (right-bar layout) | expand / collapse the bar |
 
+`shell.cursor = normal | fat`: with **fat**, while the trackpad drives the
+pointer the shell draws an iPadOS-style translucent disc that eases after
+the finger (exponential ease-out), shrinks on press and fades when idle;
+the disc's position is sent to the compositor as an EI *absolute* pointer
+position, so clicks land on it. cosmic-comp's own cursor is hidden
+meanwhile through its live `cursor_hide_timeout` config (no patch); your
+own value is saved in `~/.config/tideshell/cursor_hide_timeout.saved` and
+restored on exit, or at the next start if tideshell died. Limits: only in
+trackpad mode (a hardware mouse moves a pointer the shell cannot see);
+cosmic-comp shows its cursor during a held-button drag; no magnetic
+snapping onto other apps' buttons (no protocol exposes them).
+
 `shell.layout = pull-down | right-bar` chooses between the drawer and a
 right-hand bar of mixable widgets (`shell.bar.widgets`). Both are editable
 in the settings sheet (drawer bottom, or the bar's `settings` widget).

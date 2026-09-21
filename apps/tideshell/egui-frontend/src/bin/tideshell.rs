@@ -150,6 +150,11 @@ fn main() {
         persist,
     };
     sb.view.show_trace = has("--trace");
+    // A previous run that died with the fat cursor on left cosmic-comp's
+    // cursor hidden; put the user's setting back before anything else.
+    if let Some(o) = effects::cosmic_config_home().and_then(|h| effects::recover_system_cursor(&h)) {
+        sb.shell.note(o.describe());
+    }
     for e in errs {
         sb.shell.note(format!("prefs: {e}"));
     }

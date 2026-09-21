@@ -218,6 +218,15 @@ impl ShellView {
                 p.text(c, Align2::CENTER_CENTER, opt.label(), FontId::proportional(12.0), pal.text);
             }
         }
+        // Fat cursor: drawn last, above everything the shell shows.
+        if let Some(f) = &shell.fat {
+            if f.opacity > 0.0 {
+                let c = to(f.shown.0, f.shown.1);
+                // iPadOS look: neutral translucent disc, faint rim, no arrow.
+                p.circle_filled(c, f.radius, Color32::from_black_alpha((105.0 * f.opacity) as u8));
+                p.circle_stroke(c, f.radius, Stroke::new(1.0, Color32::from_white_alpha((70.0 * f.opacity) as u8)));
+            }
+        }
         // Home indicator: the affordance for every bottom-edge gesture.
         let hw = 110.0 + shell.swipe_up * 40.0;
         let hy = size.y - 9.0 - shell.swipe_up * 30.0;
@@ -229,7 +238,7 @@ impl ShellView {
         if self.show_trace {
             self.trace(&p, shell, pal, origin);
         }
-        if !shell.recognizer.is_idle() || shell.drawer.is_animating() || shell.switcher.is_streaking() {
+        if !shell.recognizer.is_idle() || shell.drawer.is_animating() || shell.switcher.is_streaking() || shell.fat.as_ref().is_some_and(|f| f.is_animating()) {
             ui.ctx().request_repaint();
         }
         out
@@ -608,6 +617,12 @@ impl ShellView {
                 ui.label("Layout");
                 ui.radio_value(&mut draft.layout, Layout::PullDown, "Pull-down control center");
                 ui.radio_value(&mut draft.layout, Layout::RightBar, "Right-hand bar");
+                ui.separator();
+                ui.label("Trackpad cursor");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut draft.fat_cursor, false, "Normal");
+                    ui.radio_value(&mut draft.fat_cursor, true, "Fat (iPad-style, eased)");
+                });
                 ui.separator();
                 ui.label("Switcher");
                 ui.horizontal(|ui| {

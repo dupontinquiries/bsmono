@@ -2,7 +2,7 @@
 //! windows that obey the shell's Actions (activate, close, maximize, launch).
 //!
 //!   cargo run --release -- [--trace] [--live] [--persist] [--layout right-bar]
-//!                          [--demo drawer|switcher|hold|bar|trackpad|settings|swipe]
+//!                          [--demo drawer|switcher|hold|bar|trackpad|fatcursor|settings|swipe]
 //!
 //! * Mouse = one finger. Edge zones are 28 px: pull from the top, swipe or
 //!   hold on the bottom, swipe along the bottom, swipe in from the right
@@ -45,11 +45,13 @@ struct World {
     clicks: u32,
     keyboard: bool,
     toast: Option<(String, f64)>,
+    /// The shell asked to hide the system cursor (fat cursor drawn instead).
+    fat: bool,
 }
 
 impl World {
     fn new() -> World {
-        let mut w = World { wins: vec![], active: None, next: 1, cursor: Pos2::new(200.0, 300.0), clicks: 0, keyboard: false, toast: None };
+        let mut w = World { wins: vec![], active: None, next: 1, cursor: Pos2::new(200.0, 300.0), clicks: 0, keyboard: false, toast: None, fat: false };
         for (t, a) in [("Files", "com.system76.CosmicFiles"), ("Terminal", "com.system76.CosmicTerm"), ("Browser", "org.mozilla.firefox"), ("Notes", "org.gnome.TextEditor")] {
             w.open(t, a);
         }
@@ -112,6 +114,14 @@ impl Executor for SimExec<'_> {
                 let l = live(&mut self.live, a);
                 self.world.keyboard = *on;
                 Outcome::Done(format!("sim: keyboard={on}{}", l.map(|s| format!(" / live {s}")).unwrap_or_default()))
+            }
+            Action::Pointer(PointerOut::Absolute { x, y }) => {
+                self.world.cursor = Pos2::new(*x, *y);
+                Outcome::Done(String::new())
+            }
+            Action::HideSystemCursor(on) => {
+                self.world.fat = *on;
+                Outcome::Done(format!("sim: system cursor hidden={on}"))
             }
             Action::Pointer(PointerOut::Motion { dx, dy }) => {
                 self.world.cursor += Vec2::new(*dx, *dy);
@@ -210,6 +220,28 @@ impl App {
         }
     }
 
+    /// Per-frame part of a demo: the fatcursor finger circles on the pad for
+    /// 5 s of real time, then lifts.
+    fn demo_frame(&mut self, now: f64) {
+        let (Some(which), Some(t0)) = (self.demo.as_deref(), self.demo_started) else { return };
+        if which != "fatcursor" {
+            return;
+        }
+        let e = now - t0;
+        let t = (now * 1000.0) as u64;
+        let pad = ShellView::pad_rect(egui::Vec2::new(self.shell.screen.0, self.shell.screen.1), 0.0);
+        let out = if e < 5.0 {
+            let a = e as f32 * 2.2;
+            let (x, y) = (pad.center().x + 70.0 * a.cos(), pad.center().y + 50.0 * a.sin());
+            self.shell.on_trackpad_touch(TouchEvent::Move { slot: 7, x, y, t })
+        } else if self.demo.take().is_some() {
+            self.shell.on_trackpad_touch(TouchEvent::Up { slot: 7, t })
+        } else {
+            vec![]
+        };
+        self.execute(out, now);
+    }
+
     /// Synthetic touches through the real recognizer. Timestamps start at 0;
     /// the view's own ticks continue from egui's clock afterwards.
     fn run_demo(&mut self, which: &str) {
@@ -240,6 +272,19 @@ impl App {
                 o
             }
             "trackpad" => self.shell.toggle_mode(tideshell_core::hold::HoldOption::Trackpad),
+            "fatcursor" => {
+                let mut p = self.shell.prefs.clone();
+                p.fat_cursor = true;
+                let mut o = self.shell.set_prefs(p);
+                o.extend(self.shell.toggle_mode(tideshell_core::hold::HoldOption::Trackpad));
+                // Drag on the pad: the disc eases up-right from the centre.
+                let pad = ShellView::pad_rect(egui::Vec2::new(w, h), 0.0);
+                let (x0, y0) = (pad.center().x, pad.center().y);
+                // The finger then circles on real time (see demo_frame), so
+                // the disc is seen easing rather than already idle-faded.
+                o.extend(self.shell.on_trackpad_touch(TouchEvent::Down { slot: 7, x: x0, y: y0, t: 0 }));
+                o
+            }
             "bar" | "settings" => {
                 let mut p = self.shell.prefs.clone();
                 p.layout = Layout::RightBar;
@@ -297,6 +342,7 @@ impl eframe::App for App {
                     self.run_demo(&which);
                 }
             }
+            self.demo_frame(now);
             let p = ui.painter_at(area);
             p.rect_filled(area, CornerRadius::ZERO, Color32::from_rgb(28, 32, 44));
             // The active window fills the space beside the bar's exclusive zone.
@@ -323,7 +369,7 @@ impl eframe::App for App {
                 p.rect_filled(kb, CornerRadius::ZERO, Color32::from_gray(38));
                 p.text(kb.center(), Align2::CENTER_CENTER, "rusty-board (simulated)", FontId::proportional(14.0), Color32::from_gray(200));
             }
-            if self.shell.modes.trackpad {
+            if self.shell.modes.trackpad && !self.world.fat {
                 let c = area.min + self.world.cursor.to_vec2();
                 p.circle_filled(c, 6.0, Color32::WHITE);
                 p.text(c + Vec2::new(10.0, -10.0), Align2::LEFT_CENTER, format!("clicks {}", self.world.clicks), FontId::proportional(11.0), Color32::WHITE);
@@ -376,6 +422,9 @@ fn main() -> eframe::Result<()> {
             Ok(mut w) => {
                 w.exclude_app_id = Some(APP_ID.to_string());
                 shell.note("wayland: connected to toplevel list");
+                if let Some(o) = effects::cosmic_config_home().and_then(|h| effects::recover_system_cursor(&h)) {
+                    shell.note(o.describe());
+                }
                 Some(w)
             }
             Err(e) => {
