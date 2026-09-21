@@ -283,10 +283,12 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             s.task.run_logged(move |log| {
                 let t = ef::build_target(&r, m);
                 let native = ef::native_for(&t);
-                if !native && ef::target_std_installed(t.triple) == Some(false) {
-                    return ef::missing_target_message(t.triple);
-                }
-                let (argv, env) = ef::tablet_build_cmd(&app, &t, std::env::var("RUSTFLAGS").ok().as_deref(), native);
+                // Pick the toolchain that HAS the target (distro vs rustup,
+                // and a launcher-started GUI may lack ~/.cargo/bin on PATH).
+                let tc = match ef::pick_toolchain_here(t.triple, native) { Ok(tc) => tc, Err(e) => return e };
+                log.push(&format!("toolchain: {} ({})", tc.cargo.display(), tc.origin));
+                let (mut argv, mut env) = ef::tablet_build_cmd(&app, &t, std::env::var("RUSTFLAGS").ok().as_deref(), native);
+                ef::use_toolchain(&mut argv, &mut env, &tc);
                 log.push(&format!("$ {}  (in {})", argv.join(" "), app.dir.display()));
                 if let Some((_, l)) = env.iter().find(|(k, v)| k.ends_with("_LINKER") && v == "rust-lld") {
                     log.push(&format!("no musl cross linker on PATH: linking with {l} (self-contained)"));

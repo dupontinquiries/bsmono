@@ -1524,10 +1524,10 @@ fn cmd_eink(rest: &[String]) -> i32 {
             };
             let t = ef::build_target(&route, probe.model);
             let native = ef::native_for(&t);
-            if !native && ef::target_std_installed(t.triple) == Some(false) {
-                return eink_err(&ef::missing_target_message(t.triple));
-            }
-            let (argv, env) = ef::tablet_build_cmd(&app, &t, std::env::var("RUSTFLAGS").ok().as_deref(), native);
+            let tc = match ef::pick_toolchain_here(t.triple, native) { Ok(tc) => tc, Err(e) => return eink_err(&e) };
+            eprintln!("  toolchain: {} ({})", tc.cargo.display(), tc.origin);
+            let (mut argv, mut env) = ef::tablet_build_cmd(&app, &t, std::env::var("RUSTFLAGS").ok().as_deref(), native);
+            ef::use_toolchain(&mut argv, &mut env, &tc);
             eprintln!("  $ {}  (in {}; {})", argv.join(" "), app.dir.display(), t.why);
             if env.iter().any(|(k, v)| k.ends_with("_LINKER") && v == "rust-lld") {
                 eprintln!("  no musl cross linker on PATH: linking with rust-lld (self-contained)");

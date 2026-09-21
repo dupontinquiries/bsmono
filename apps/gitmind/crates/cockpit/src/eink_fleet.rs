@@ -1006,17 +1006,97 @@ pub fn tablet_build_cmd_on_path(app: &TabletApp, t: &BuildTarget, inherited_rust
     (argv, env)
 }
 
-/// Is the standard library for `triple` installed for the `rustc` on PATH?
-/// `None` when rustc cannot be asked. Checked BEFORE a cross build: a
-/// missing target otherwise surfaces as cargo's "can't find crate for
-/// `core`" after a minute of compiling build scripts.
-pub fn target_std_installed(triple: &str) -> Option<bool> {
-    let out = std::process::Command::new("rustc").args(["--print", "sysroot"]).output().ok()?;
-    if !out.status.success() {
-        return None;
+/// A Rust toolchain found on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toolchain {
+    pub cargo: std::path::PathBuf,
+    pub rustc: std::path::PathBuf,
+    /// Where it was found, for the log: `$CARGO`, `rustup (~/.cargo/bin)`, a PATH dir.
+    pub origin: String,
+}
+
+/// Every toolchain worth trying, best first: `$CARGO`, rustup's
+/// `~/.cargo/bin`, then each PATH directory with both `cargo` and `rustc`.
+///
+/// Why not just "cargo on PATH": on Fedora (and elsewhere) the distro's
+/// rustc/cargo in /usr/bin coexist with rustup's. `rustup target add`
+/// installs into rustup's toolchain; PATH order decides which one runs; and
+/// a GUI started from the desktop launcher often has no ~/.cargo/bin on PATH
+/// at all (rustup adds it from the shell profile). Found in the first real
+/// device session: the target was installed and gitmind could not see it.
+pub fn toolchains(path_env: &str, home: Option<&str>, cargo_env: Option<&str>) -> Vec<Toolchain> {
+    use std::path::{Path, PathBuf};
+    let mut out: Vec<Toolchain> = Vec::new();
+    let mut push = |cargo: PathBuf, rustc: PathBuf, origin: String| {
+        if cargo.is_file() && rustc.is_file() {
+            let key = std::fs::canonicalize(&cargo).unwrap_or(cargo.clone());
+            if !out.iter().any(|t| std::fs::canonicalize(&t.cargo).unwrap_or(t.cargo.clone()) == key) {
+                out.push(Toolchain { cargo, rustc, origin });
+            }
+        }
+    };
+    if let Some(c) = cargo_env.filter(|c| !c.is_empty()) {
+        let c = PathBuf::from(c);
+        let rustc = c.with_file_name("rustc");
+        push(c, rustc, "$CARGO".into());
     }
-    let sysroot = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Some(std::path::Path::new(&sysroot).join("lib/rustlib").join(triple).join("lib").is_dir())
+    if let Some(h) = home {
+        let bin = Path::new(h).join(".cargo/bin");
+        push(bin.join("cargo"), bin.join("rustc"), "rustup (~/.cargo/bin)".into());
+    }
+    for dir in path_env.split(':').filter(|d| !d.is_empty()) {
+        let d = Path::new(dir);
+        push(d.join("cargo"), d.join("rustc"), format!("PATH ({dir})"));
+    }
+    out
+}
+
+/// Does this toolchain have `triple`'s std? Asks its rustc for the target's
+/// libdir, which is exact for rustup and distro toolchains alike.
+pub fn toolchain_has_target(t: &Toolchain, triple: &str) -> Option<bool> {
+    let out = std::process::Command::new(&t.rustc).args(["--print", "target-libdir", "--target", triple]).output().ok()?;
+    if !out.status.success() {
+        return Some(false);
+    }
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Some(!dir.is_empty() && std::path::Path::new(&dir).is_dir())
+}
+
+/// The toolchain to build `triple` with, or an error that lists every
+/// toolchain checked (so "installed but not found" explains itself).
+/// For a native build any toolchain will do: the first is returned.
+pub fn pick_toolchain(triple: &str, native: bool, path_env: &str, home: Option<&str>, cargo_env: Option<&str>) -> Result<Toolchain, String> {
+    let all = toolchains(path_env, home, cargo_env);
+    if all.is_empty() {
+        return Err(format!("no Rust toolchain found (looked at $CARGO, ~/.cargo/bin and PATH={path_env})"));
+    }
+    if native {
+        return Ok(all[0].clone());
+    }
+    for t in &all {
+        if toolchain_has_target(t, triple) == Some(true) {
+            return Ok(t.clone());
+        }
+    }
+    let checked: Vec<String> = all.iter().map(|t| format!("{} ({})", t.rustc.display(), t.origin)).collect();
+    Err(format!("{}; checked: {}", missing_target_message(triple), checked.join(", ")))
+}
+
+/// [`pick_toolchain`] with this process's environment.
+pub fn pick_toolchain_here(triple: &str, native: bool) -> Result<Toolchain, String> {
+    pick_toolchain(triple, native, &std::env::var("PATH").unwrap_or_default(),
+        std::env::var("HOME").ok().as_deref(), std::env::var("CARGO").ok().as_deref())
+}
+
+/// Point a build at one toolchain: its cargo as argv[0], and RUSTC set to the
+/// matching rustc (cargo otherwise runs `rustc` from PATH, which may be the
+/// OTHER toolchain, the one without the target).
+pub fn use_toolchain(argv: &mut [String], env: &mut Vec<(String, String)>, t: &Toolchain) {
+    if let Some(a0) = argv.first_mut() {
+        *a0 = t.cargo.to_string_lossy().to_string();
+    }
+    env.retain(|(k, _)| k != "RUSTC");
+    env.push(("RUSTC".into(), t.rustc.to_string_lossy().to_string()));
 }
 
 /// The finding for a missing target std (also produced by `diagnose` from
@@ -1437,6 +1517,12 @@ pub fn diagnose(text: &str) -> Vec<crate::finding::Finding> {
             .help("install it (rustup), then build again; or build on an aarch64 postmarketOS phone, where the AppLoad route builds natively")
             .fix(format!("rustup target add {triple}")),
             if has("is not installed on this machine") { "is not installed" } else { "can't find crate" });
+    }
+    if has("no Rust toolchain found") {
+        add(Finding::new(Error, "build-no-toolchain", "gitmind found no Rust toolchain to build with")
+            .note("a GUI started from the desktop launcher often lacks ~/.cargo/bin on PATH (rustup adds it from the shell profile); gitmind also looks there directly, and at $CARGO")
+            .help("install Rust (rustup, or the distro's rust/cargo), or start gitmind with CARGO=/path/to/cargo"),
+            "no Rust toolchain found");
     }
     if has("linker `") && has("` not found") {
         add(Finding::new(Error, "build-linker-missing", "the cross linker cargo was told to use is not installed")
@@ -2203,10 +2289,55 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
         assert!(diagnose("error[E0308]: mismatched types\n --> src/app.rs:3:5").iter().any(|f| f.code == "build-compile-error"));
     }
 
+    /// A fake toolchain: `rustc --print target-libdir --target T` prints a
+    /// dir that exists only for the targets given.
+    fn fake_toolchain(root: &std::path::Path, name: &str, targets: &[&str]) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join(name).join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let lib = root.join(name).join("lib");
+        for t in targets { std::fs::create_dir_all(lib.join(t)).unwrap(); }
+        let rustc = format!("#!/bin/sh\n[ \"$1 $2 $3\" = \"--print target-libdir --target\" ] && echo {}/$4\n", lib.display());
+        std::fs::write(bin.join("rustc"), rustc).unwrap();
+        std::fs::write(bin.join("cargo"), "#!/bin/sh\n").unwrap();
+        for f in ["rustc", "cargo"] { std::fs::set_permissions(bin.join(f), std::fs::Permissions::from_mode(0o755)).unwrap(); }
+        bin
+    }
+
     #[test]
-    fn this_hosts_own_target_is_installed() {
-        let host = if cfg!(target_arch = "x86_64") { "x86_64-unknown-linux-gnu" } else { return };
-        assert_eq!(target_std_installed(host), Some(true));
-        assert_eq!(target_std_installed("aarch64-unknown-linux-musl"), Some(false), "not installed in this sandbox");
+    fn the_toolchain_with_the_target_wins_even_when_it_is_not_first_on_path() {
+        // Fedora: /usr/bin (distro rust, no musl target) first on PATH,
+        // rustup's ~/.cargo/bin (target installed) not on PATH at all (GUI).
+        let root = std::env::temp_dir().join(format!("tc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let distro = fake_toolchain(&root, "usr", &["x86_64-unknown-linux-gnu"]);
+        let home = root.join("home");
+        let rustup = fake_toolchain(&home, ".cargo", &["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-musl"]);
+        assert!(rustup.ends_with(".cargo/bin"));
+        let path = distro.to_string_lossy().to_string();
+        let t = pick_toolchain("aarch64-unknown-linux-musl", false, &path, Some(&home.to_string_lossy()), None).unwrap();
+        assert_eq!(t.origin, "rustup (~/.cargo/bin)");
+        // nobody has it: the error lists what was checked
+        let e = pick_toolchain("armv7-unknown-linux-musleabihf", false, &path, Some(&home.to_string_lossy()), None).unwrap_err();
+        assert!(e.contains("not installed") && e.contains("rustup (~/.cargo/bin)") && e.contains("PATH ("), "{e}");
+        assert_eq!(diagnose(&e)[0].code, "build-target-missing");
+        let none = pick_toolchain("aarch64-unknown-linux-musl", false, "/nonexistent", None, None).unwrap_err();
+        assert_eq!(diagnose(&none)[0].code, "build-no-toolchain");
+        // the build is pointed at that toolchain explicitly
+        let mut argv = vec!["cargo".to_string(), "build".into()];
+        let mut env = vec![];
+        use_toolchain(&mut argv, &mut env, &t);
+        assert!(argv[0].ends_with(".cargo/bin/cargo"));
+        assert!(env.iter().any(|(k, v)| k == "RUSTC" && v.ends_with(".cargo/bin/rustc")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn this_sandboxs_real_toolchain_is_found() {
+        let t = pick_toolchain_here("x86_64-unknown-linux-gnu", false);
+        if cfg!(target_arch = "x86_64") {
+            assert!(t.is_ok(), "{t:?}");
+            assert!(pick_toolchain_here("aarch64-unknown-linux-musl", false).is_err(), "not installed here");
+        }
     }
 }
