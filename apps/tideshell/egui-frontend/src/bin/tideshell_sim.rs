@@ -398,6 +398,7 @@ fn main() -> eframe::Result<()> {
     });
     let demo = val("--demo");
     let show_trace = has("--trace");
+    let wayland_mode = live.is_some();
     eframe::run_native(
         APP_ID,
         opts,
@@ -407,6 +408,9 @@ fn main() -> eframe::Result<()> {
             let palette = uikit_egui::palette_colors_ctx(&cc.egui_ctx, &prefs.palette);
             let mut view = ShellView::default();
             view.show_trace = show_trace;
+            // The fake world's cursor is not the real pointer, so the mouse may
+            // drive the pad there. With --wayland the pad feeds EI: no.
+            view.pointer_pad = !wayland_mode;
             Ok(Box::new(App { shell, view, world, system, persist, palette, apps, demo, demo_started: None, last_cards: vec![], live, ei, ei_status: None, ei_selftest, ei_ready_at: None }))
         }),
     )

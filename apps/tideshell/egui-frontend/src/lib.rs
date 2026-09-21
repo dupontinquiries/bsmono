@@ -17,6 +17,8 @@ pub mod effects;
 pub mod wayland;
 #[cfg(feature = "ei")]
 pub mod ei;
+#[cfg(feature = "layer")]
+pub mod layer;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
 use tideshell_core::bar::{self, BarWidget};
@@ -59,6 +61,12 @@ struct SettingsSheet {
 #[derive(Default)]
 pub struct ShellView {
     pub show_trace: bool,
+    /// Whether the mouse may drive the trackpad pad. Off by default: when the
+    /// pad's output is the real pointer (EI), a mouse on the pad moves the
+    /// pointer it is being read from, and every EI move becomes more drag —
+    /// a feedback loop, seen live in nested cosmic-comp. Only the
+    /// simulator's fake cursor turns this on.
+    pub pointer_pad: bool,
     owners: Vec<(i32, Owner)>,
     touch_seen: bool,
     mouse_down: bool,
@@ -110,6 +118,43 @@ impl ShellView {
             Layout::RightBar => shell.prefs.bar_width,
             Layout::PullDown => 0.0,
         }
+    }
+
+    /// Whether the fullscreen overlay surface has anything to show. When
+    /// false the layer runtime unmaps it: a fullscreen transparent layer that
+    /// stays mapped costs compositing and can block direct scanout.
+    pub fn needs_overlay(&self, shell: &Shell) -> bool {
+        shell.drawer.is_visible()
+            || shell.switcher.open
+            || shell.hold.is_some()
+            || shell.swipe_up > 0.0
+            || shell.peek_dx.abs() > 1.0
+            || shell.modes.trackpad
+            || shell.carousel.is_active()
+            || shell.prefs.layout == Layout::RightBar
+            || self.sheet.open
+            || self.show_trace
+    }
+
+    /// Where the overlay must take input, in screen-local logical px.
+    /// `None` = the whole screen (a modal surface is open: drawer, switcher,
+    /// settings sheet). `Some(rects)` = only these; taps elsewhere fall
+    /// through to the apps underneath (trackpad pad, bar, or nothing at all
+    /// for passive previews and the carousel dots).
+    pub fn input_rects(&self, shell: &Shell) -> Option<Vec<Rect>> {
+        if shell.drawer.is_visible() || shell.switcher.open || self.sheet.open || shell.hold.is_some() {
+            return None;
+        }
+        let size = Vec2::new(shell.screen.0, shell.screen.1);
+        let mut v = Vec::new();
+        if shell.modes.trackpad {
+            v.push(Self::pad_rect(size, Self::bar_width(shell)));
+        }
+        if shell.prefs.layout == Layout::RightBar {
+            let bw = Self::bar_width(shell);
+            v.push(Rect::from_min_size(Pos2::new(size.x - bw, 0.0), Vec2::new(bw, size.y)));
+        }
+        Some(v)
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, shell: &mut Shell, pal: &PaletteColors, info: &FrameInfo) -> Vec<Action> {
@@ -227,7 +272,8 @@ impl ShellView {
             if phase == egui::TouchPhase::Start {
                 let pad = Self::pad_rect(size, Self::bar_width(shell));
                 let modal = shell.drawer.is_visible() || shell.switcher.open || self.sheet.open;
-                let owner = if shell.modes.trackpad && !modal && pad.contains(Pos2::new(x, y)) {
+                let may_pad = slot != MOUSE_SLOT || self.pointer_pad;
+                let owner = if shell.modes.trackpad && !modal && may_pad && pad.contains(Pos2::new(x, y)) {
                     Some(Owner::Pad)
                 } else if shell.recognizer.edge_at(x, y).is_some() && !self.sheet.open {
                     Some(Owner::Edge)
@@ -688,6 +734,74 @@ mod tests {
     fn pad_sits_bottom_and_clear_of_bar() {
         let r = ShellView::pad_rect(Vec2::new(408.0, 900.0), 64.0);
         assert!(r.right() <= 408.0 - 64.0 && r.bottom() < 900.0 && r.height() >= 180.0);
+    }
+
+    #[test]
+    fn overlay_is_unmapped_when_idle_and_input_follows_what_is_shown() {
+        use tideshell_core::prefs::ShellPrefs;
+        let view = ShellView::default();
+        let mut sh = Shell::new(ShellPrefs::default(), (408.0, 900.0));
+        assert!(!view.needs_overlay(&sh), "idle pull-down shell needs no overlay");
+        assert_eq!(view.input_rects(&sh), Some(vec![]), "and takes no input");
+        sh.toggle_mode(tideshell_core::hold::HoldOption::Trackpad);
+        assert!(view.needs_overlay(&sh));
+        let r = view.input_rects(&sh).unwrap();
+        assert_eq!(r.len(), 1, "only the pad takes input");
+        assert!(r[0].contains(Pos2::new(200.0, 800.0)) && !r[0].contains(Pos2::new(200.0, 100.0)));
+        sh.open_switcher();
+        assert_eq!(view.input_rects(&sh), None, "switcher is modal: whole screen");
+    }
+
+    #[test]
+    fn right_bar_keeps_overlay_mapped_with_bar_input_only() {
+        use tideshell_core::prefs::{Layout, ShellPrefs};
+        let view = ShellView::default();
+        let mut p = ShellPrefs::default();
+        p.layout = Layout::RightBar;
+        let sh = Shell::new(p, (408.0, 900.0));
+        assert!(view.needs_overlay(&sh));
+        let r = view.input_rects(&sh).unwrap();
+        assert_eq!(r.len(), 1);
+        assert!(r[0].contains(Pos2::new(400.0, 450.0)) && !r[0].contains(Pos2::new(100.0, 450.0)));
+    }
+
+    /// Drive ShellView through a real egui frame with a mouse press + drag
+    /// on the pad; return the trackpad pointer actions it produced.
+    fn mouse_drag_on_pad(pointer_pad: bool) -> Vec<Action> {
+        use tideshell_core::prefs::ShellPrefs;
+        let mut sh = Shell::new(ShellPrefs::default(), (408.0, 900.0));
+        sh.toggle_mode(tideshell_core::hold::HoldOption::Trackpad);
+        let mut view = ShellView::default();
+        view.pointer_pad = pointer_pad;
+        let pal = uikit_egui::palette_colors("night");
+        let info = FrameInfo { apps: &[], clock: String::new(), battery: None };
+        let ctx = egui::Context::default();
+        let mut out = Vec::new();
+        let frames = [
+            vec![egui::Event::PointerMoved(Pos2::new(200.0, 700.0)),
+                 egui::Event::PointerButton { pos: Pos2::new(200.0, 700.0), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }],
+            vec![egui::Event::PointerMoved(Pos2::new(240.0, 700.0))],
+            vec![egui::Event::PointerMoved(Pos2::new(280.0, 700.0))],
+        ];
+        for (i, events) in frames.into_iter().enumerate() {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(408.0, 900.0))),
+                time: Some(1.0 + i as f64 * 0.016),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(raw, |ui| out.extend(view.ui(ui, &mut sh, &pal, &info)));
+        }
+        out.into_iter().filter(|a| matches!(a, Action::Pointer(_))).collect()
+    }
+
+    #[test]
+    fn mouse_cannot_drive_the_pad_unless_allowed() {
+        // Allowed (simulator fake cursor): the drag reaches the trackpad.
+        let allowed = mouse_drag_on_pad(true);
+        assert!(!allowed.is_empty(), "scan must find pad motion when allowed");
+        // Default (real shell, EI output): no pointer output from the mouse.
+        assert!(mouse_drag_on_pad(false).is_empty(), "mouse on pad must not feed EI");
     }
 
     #[test]

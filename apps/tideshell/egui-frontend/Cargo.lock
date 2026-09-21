@@ -1357,6 +1357,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "khronos-egl"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6aae1df220ece3c0ada96b8153459b67eebe9ae9212258bb0134ae60416fdf76"
+dependencies = [
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2598,12 +2608,19 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "egui_glow",
+ "glow",
  "hatch-core",
+ "khronos-egl",
  "reis",
+ "rustix 1.1.5",
  "settings-kit",
  "systemcompkit",
  "tideshell-core",
  "uikit-egui",
+ "wayland-client",
+ "wayland-egl",
+ "wayland-protocols-wlr",
  "zbus",
 ]
 
@@ -2935,6 +2952,16 @@ dependencies = [
  "rustix 1.1.5",
  "wayland-client",
  "xcursor",
+]
+
+[[package]]
+name = "wayland-egl"
+version = "0.32.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b97bdb7c49e5bd9b7562f38ff84f0dad47079fdc9e926f691a787f6dbc05451"
+dependencies = [
+ "wayland-backend",
+ "wayland-sys",
 ]
 
 [[package]]

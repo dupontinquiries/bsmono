@@ -1,0 +1,282 @@
+//! tideshell — the shell itself, on layer-shell surfaces (no eframe).
+//!
+//!   tideshell [--trace] [--layout right-bar]
+//!
+//! Env: `TIDESHELL_SHOW_STRIPS=1` tints the edge strips so they can be seen.
+//! `TIDESHELL_PERSIST=0` stops it writing ~/.config/tideshell/prefs.
+//! `TIDESHELL_TRACE=stderr` streams the engine trace (gestures, actions,
+//! transport outcomes, EI status) to stderr, for watching it over ssh.
+//!
+//! Loop: wait for Wayland input (16 ms while anything is moving, 250 ms
+//! idle) -> strips feed the engine's recognizer -> the overlay, if needed,
+//! gets an egui frame through ShellView -> Actions go to the verified
+//! transports (zcosmic toplevel requests, EI, hatch, rusty-board).
+
+use std::collections::HashMap;
+use std::time::Instant;
+
+use egui::{Pos2, Rect, Vec2};
+use tideshell_core::prefs::Layout;
+use tideshell_core::{Action, Shell, TouchEvent};
+use tideshell_egui::effects::{self, Executor, Outcome, System};
+use tideshell_egui::layer::{Gl, Input, Io, Role, POINTER_SLOT};
+use tideshell_egui::{AppTile, FrameInfo, ShellView};
+
+const STRIP_PX: u32 = 28;
+
+fn clock() -> String {
+    let s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    format!("{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60)
+}
+
+struct Shellbox {
+    shell: Shell,
+    view: ShellView,
+    system: System,
+    windows: Option<tideshell_egui::wayland::Windows>,
+    ei: Option<tideshell_egui::ei::EiPointer>,
+    ei_status: Option<tideshell_egui::ei::Status>,
+    persist: bool,
+}
+
+impl Shellbox {
+    fn execute(&mut self, actions: Vec<Action>) {
+        for a in actions {
+            let o = match &a {
+                Action::SavePrefs if self.persist => effects::save_prefs(&self.shell.prefs),
+                Action::SavePrefs => Outcome::Done("prefs not persisted (TIDESHELL_PERSIST=0)".into()),
+                Action::Pointer(p) => match &self.ei {
+                    Some(ei) => {
+                        ei.send(*p);
+                        continue;
+                    }
+                    None => Outcome::Unwired("no EI connection"),
+                },
+                // The overlay IS the trackpad surface here; nothing to execute.
+                Action::ShowTrackpad(on) => Outcome::Done(format!("trackpad {}", if *on { "on" } else { "off" })),
+                _ => match self.windows.as_mut() {
+                    Some(w) => tideshell_egui::wayland::Live { windows: w, fallback: &mut self.system }.run(&a),
+                    None => self.system.run(&a),
+                },
+            };
+            self.shell.note(o.describe());
+        }
+    }
+
+    fn poll_world(&mut self) {
+        if let Some(w) = self.windows.as_mut() {
+            if let Some(cards) = w.poll() {
+                let more = self.shell.set_windows(cards);
+                self.execute(more);
+            }
+        }
+        if let Some(ei) = &self.ei {
+            let st = ei.status();
+            if self.ei_status.as_ref() != Some(&st) {
+                self.shell.note(format!("ei: {st:?}"));
+                self.ei_status = Some(st);
+            }
+        }
+    }
+}
+
+/// A contact on the overlay, as egui wants it: a Touch event (ShellView's
+/// input routing, multi-touch) plus the pointer events egui widgets react
+/// to — the same pair egui-winit emits for a touchscreen. The pointer slot is
+/// a mouse and gets pointer events only.
+pub fn contact_events(slot: i32, phase: egui::TouchPhase, pos: Pos2) -> Vec<egui::Event> {
+    let mut v = Vec::new();
+    if slot != POINTER_SLOT {
+        v.push(egui::Event::Touch { device_id: egui::TouchDeviceId(0), id: egui::TouchId(slot as u64), phase, pos, force: None });
+    }
+    let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+    match phase {
+        egui::TouchPhase::Start => {
+            v.push(egui::Event::PointerMoved(pos));
+            v.push(button(true));
+        }
+        egui::TouchPhase::Move => v.push(egui::Event::PointerMoved(pos)),
+        egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+            v.push(button(false));
+            if slot != POINTER_SLOT {
+                v.push(egui::Event::PointerGone);
+            }
+        }
+    }
+    v
+}
+
+/// Print trace lines not printed yet. The trace is a bounded ring, so match
+/// on content: find the last printed line and print what follows it.
+fn print_new_trace(shell: &Shell, printed: &mut Vec<String>) {
+    let lines: Vec<&String> = shell.trace().collect();
+    let start = printed.last().and_then(|last| lines.iter().rposition(|l| *l == last)).map(|i| i + 1).unwrap_or(0);
+    for l in &lines[start..] {
+        eprintln!("trace {l}");
+        printed.push((*l).clone());
+    }
+    if printed.len() > 200 {
+        printed.drain(..100);
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let has = |f: &str| args.iter().any(|a| a == f);
+    let persist = std::env::var("TIDESHELL_PERSIST").map(|v| v != "0").unwrap_or(true);
+    let (mut prefs, errs) = effects::load_prefs();
+    if let Some(v) = args.iter().position(|a| a == "--layout").and_then(|i| args.get(i + 1)) {
+        if let Err(e) = prefs.apply("shell.layout", v) {
+            eprintln!("{e}");
+        }
+    }
+
+    let mut io = Io::connect(STRIP_PX, std::env::var("TIDESHELL_SHOW_STRIPS").is_ok_and(|v| v == "1")).unwrap_or_else(|e| {
+        eprintln!("tideshell: {e}");
+        std::process::exit(1)
+    });
+    let mut gl = Gl::new(io.display_ptr()).unwrap_or_else(|e| {
+        eprintln!("tideshell: EGL: {e}");
+        std::process::exit(1)
+    });
+
+    let mut sb = Shellbox {
+        shell: Shell::new(prefs, (0.0, 0.0)),
+        view: ShellView::default(),
+        system: System::new(),
+        windows: None,
+        ei: Some(tideshell_egui::ei::EiPointer::spawn()),
+        ei_status: None,
+        persist,
+    };
+    sb.view.show_trace = has("--trace");
+    for e in errs {
+        sb.shell.note(format!("prefs: {e}"));
+    }
+    match tideshell_egui::wayland::Windows::connect() {
+        Ok(w) => sb.windows = Some(w),
+        Err(e) => sb.shell.note(format!("wayland toplevels: {e:?}")),
+    }
+    let apps: Vec<AppTile> = sb.system.launcher.as_ref().map(|l| effects::hatch_tiles(l, 8)).unwrap_or_default();
+
+    let ctx = egui::Context::default();
+    let ui_prefs = settings_kit::Prefs::default();
+    uikit_egui::apply_prefs(&ctx, &ui_prefs);
+    let palette = uikit_egui::palette_colors_ctx(&ctx, &ui_prefs.palette);
+    // Transparent panels: the overlay composites over the apps.
+    ctx.global_style_mut(|s| s.visuals.panel_fill = egui::Color32::TRANSPARENT);
+
+    let t0 = Instant::now();
+    let mut overlay_events: Vec<egui::Event> = Vec::new();
+    let mut contact_pos: HashMap<i32, Pos2> = HashMap::new();
+    let mut last_region: Option<Option<Vec<Rect>>> = None;
+    let mut last_poll = 0u64;
+    let trace_stderr = std::env::var("TIDESHELL_TRACE").is_ok_and(|v| v == "stderr");
+    let mut printed: Vec<String> = Vec::new();
+    loop {
+        if trace_stderr {
+            print_new_trace(&sb.shell, &mut printed);
+        }
+        let busy = !sb.shell.recognizer.is_idle() || sb.view.needs_overlay(&sb.shell) || sb.shell.switcher.is_streaking();
+        let input = io.dispatch(if busy { 16 } else { 250 }).unwrap_or_else(|e| {
+            eprintln!("tideshell: wayland: {e}");
+            std::process::exit(1)
+        });
+        let now_ms = t0.elapsed().as_millis() as u64;
+        if let Some(screen) = io.screen() {
+            if screen != sb.shell.screen {
+                sb.shell.set_screen(screen);
+            }
+        }
+        io.set_right_enabled(sb.shell.prefs.layout == Layout::RightBar);
+
+        // Strips -> recognizer (screen coords). Overlay -> egui events.
+        let mut actions = Vec::new();
+        for ev in input {
+            match ev {
+                Input::Down { role: Role::Overlay, slot, x, y, .. } => {
+                    contact_pos.insert(slot, Pos2::new(x, y));
+                    overlay_events.extend(contact_events(slot, egui::TouchPhase::Start, Pos2::new(x, y)));
+                }
+                Input::Move { role: Role::Overlay, slot, x, y, .. } => {
+                    contact_pos.insert(slot, Pos2::new(x, y));
+                    overlay_events.extend(contact_events(slot, egui::TouchPhase::Move, Pos2::new(x, y)));
+                }
+                Input::Up { role: Role::Overlay, slot, .. } => {
+                    let pos = contact_pos.remove(&slot).unwrap_or(Pos2::ZERO);
+                    overlay_events.extend(contact_events(slot, egui::TouchPhase::End, pos));
+                }
+                Input::Hover { role: Role::Overlay, x, y } => overlay_events.push(egui::Event::PointerMoved(Pos2::new(x, y))),
+                Input::Hover { .. } => {}
+                Input::Down { role, slot, x, y, .. } => {
+                    if let Some((sx, sy)) = io.to_screen(role, x, y) {
+                        actions.extend(sb.shell.on_edge_touch(TouchEvent::Down { slot, x: sx, y: sy, t: now_ms }));
+                    }
+                }
+                Input::Move { role, slot, x, y, .. } => {
+                    if let Some((sx, sy)) = io.to_screen(role, x, y) {
+                        actions.extend(sb.shell.on_edge_touch(TouchEvent::Move { slot, x: sx, y: sy, t: now_ms }));
+                    }
+                }
+                Input::Up { slot, .. } => actions.extend(sb.shell.on_edge_touch(TouchEvent::Up { slot, t: now_ms })),
+                Input::Cancel => {
+                    actions.extend(sb.shell.on_edge_touch(TouchEvent::Cancel));
+                    contact_pos.clear();
+                    overlay_events.push(egui::Event::PointerGone);
+                }
+            }
+        }
+        actions.extend(sb.shell.tick(now_ms));
+        sb.execute(actions);
+
+        if now_ms.saturating_sub(last_poll) >= 100 {
+            last_poll = now_ms;
+            sb.poll_world();
+        }
+
+        // Overlay: map/unmap, input region, frame.
+        let want = sb.view.needs_overlay(&sb.shell);
+        if !want {
+            gl.unbind();
+            io.ensure_overlay(false);
+            last_region = None;
+            overlay_events.clear();
+            continue;
+        }
+        io.ensure_overlay(true);
+        let region = sb.view.input_rects(&sb.shell);
+        if last_region.as_ref() != Some(&region) {
+            let rects: Option<Vec<(i32, i32, i32, i32)>> =
+                region.as_ref().map(|v| v.iter().map(|r| (r.left() as i32, r.top() as i32, r.width() as i32, r.height() as i32)).collect());
+            io.set_input_region(Role::Overlay, rects.as_deref());
+            last_region = Some(region);
+        }
+        let Some((surface, (w, h), scale)) = io.overlay().map(|(s, sz, sc)| (s.clone(), sz, sc)) else { continue };
+        surface.set_buffer_scale(scale);
+        let size_px = (w as i32 * scale, h as i32 * scale);
+        if let Err(e) = gl.bind(&surface, size_px) {
+            eprintln!("tideshell: {e}");
+            continue;
+        }
+        let mut raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w as f32, h as f32))),
+            time: Some(t0.elapsed().as_secs_f64()),
+            events: std::mem::take(&mut overlay_events),
+            focused: true,
+            ..Default::default()
+        };
+        raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(scale as f32);
+        let info = FrameInfo { apps: &apps, clock: clock(), battery: None };
+        let mut frame_actions = Vec::new();
+        let out = ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
+                frame_actions = sb.view.ui(ui, &mut sb.shell, &palette, &info);
+            });
+        });
+        sb.execute(frame_actions);
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        if let Err(e) = gl.paint(size_px, out.pixels_per_point, &prims, &out.textures_delta) {
+            eprintln!("tideshell: {e}");
+        }
+    }
+}

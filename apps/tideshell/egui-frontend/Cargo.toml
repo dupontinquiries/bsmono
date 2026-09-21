@@ -9,18 +9,26 @@ description = "egui surfaces for tideshell (drawer, right bar, switcher, hold ar
 path = "src/lib.rs"
 
 [[bin]]
+name = "tideshell"
+path = "src/bin/tideshell.rs"
+required-features = ["layer", "ei"]
+
+[[bin]]
 name = "tideshell-sim"
 path = "src/bin/tideshell_sim.rs"
 required-features = ["app"]
 
 [features]
-default = ["app", "wayland", "ei"]
+default = ["app", "wayland", "ei", "layer"]
 app = ["dep:eframe"]
 # Real windows via systemcompkit (ext-foreign-toplevel-list + zcosmic
 # toplevel info/management). Pure-Rust wayland-client: no libwayland link.
 wayland = ["dep:systemcompkit"]
 # Trackpad output over libei to cosmic-comp (needs cosmic-comp patch 0002).
 ei = ["dep:reis", "dep:zbus"]
+# The real shell: layer-shell edge strips + an egui overlay on EGL (egui_glow).
+# Links libwayland-client and libEGL, unlike the pure-Rust `wayland` feature.
+layer = ["wayland", "dep:wayland-client", "dep:wayland-protocols-wlr", "dep:wayland-egl", "dep:khronos-egl", "dep:egui_glow", "dep:glow", "dep:rustix"]
 
 [dependencies]
 tideshell-core = { path = "../crates/tideshell-core" }
@@ -32,6 +40,13 @@ egui = "0.34"
 # Same reis as cosmic-comp epoch-1.8.0's Cargo.lock (protocol parity).
 reis = { version = "0.7.1", optional = true }
 zbus = { version = "5", optional = true }
+wayland-client = { version = "0.31", features = ["system"], optional = true }
+wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
+wayland-egl = { version = "0.32", optional = true }
+khronos-egl = { version = "6", features = ["static"], optional = true }
+egui_glow = { version = "0.34", optional = true }
+glow = { version = "0.17", optional = true }
+rustix = { version = "1", features = ["event", "fs", "time"], optional = true }
 # Glow chosen explicitly (eframe_backend_check): wgpu's default device asks for
 # more colour attachments than phone GPUs allow. Same reasoning as hatch-egui.
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
