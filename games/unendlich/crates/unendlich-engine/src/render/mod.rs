@@ -4,6 +4,11 @@
 
 pub mod adaptive_upload;
 pub mod camera;
+/// Temporal upscale arithmetic: Halton jitter, reprojection, and when to throw
+/// history away. Anti-aliasing and upscaling are the same machinery here --
+/// jittering and accumulating IS supersampling over time, which is the better
+/// half of the deal on a phone panel.
+pub mod temporal;
 pub mod dynamic_lights;
 pub mod chunk_pipeline;
 pub mod entity_pipeline;
