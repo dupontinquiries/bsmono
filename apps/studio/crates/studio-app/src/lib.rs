@@ -2873,6 +2873,18 @@ mod tests {
     }
 
     #[test]
+    fn the_status_bar_names_which_clock_is_running() {
+        use crate::App;
+        assert_eq!(App::clock_note(false, false, None, true), "", "stopped says nothing");
+        assert_eq!(App::clock_note(true, false, Some(4800), true), "audio clock");
+        // The reported bug's signature: playing, something loaded, and no
+        // clock coming from the device.
+        assert_eq!(App::clock_note(true, false, None, true), "wall clock — nothing rendered to play");
+        assert_eq!(App::clock_note(true, false, None, false), "no clock — nothing loaded");
+        assert_eq!(App::clock_note(false, true, Some(1), true), "audio clock", "the rack loop counts too");
+    }
+
+    #[test]
     fn space_toggles_the_transport_and_says_so() {
         let mut s = Studio::demo();
         assert!(!s.transport.playing);
@@ -3796,6 +3808,11 @@ impl eframe::App for App {
                 ui.label(&self.studio.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("{} clips", self.studio.session.doc.project.clips.len()));
+                    let note = Self::clock_note(self.studio.transport.playing,
+                                                self.studio.rack_playing,
+                                                self.sink.position(),
+                                                self.loaded != SinkContent::Nothing);
+                    if !note.is_empty() { ui.separator(); ui.label(note); }
                     let call = self.call.describe(&*self.mic);
                     if !call.is_empty() { ui.separator(); ui.label(call); }
                 });
@@ -5906,6 +5923,22 @@ impl App {
             SilentFallback::Stop
         } else {
             SilentFallback::WallClock
+        }
+    }
+
+    /// Which clock is driving the playhead right now, in one phrase for the
+    /// status bar.
+    ///
+    /// Written because "play does nothing" is indistinguishable, on screen,
+    /// from "play is running off the wrong clock": both are a playhead that
+    /// does not move the way you expect, and the difference lives in state
+    /// nobody can see. Now the bar says it.
+    fn clock_note(playing: bool, rack: bool, sink_pos: Option<usize>, loaded_anything: bool) -> &'static str {
+        match (playing || rack, sink_pos, loaded_anything) {
+            (false, _, _) => "",
+            (true, Some(_), _) => "audio clock",
+            (true, None, true) => "wall clock — nothing rendered to play",
+            (true, None, false) => "no clock — nothing loaded",
         }
     }
 

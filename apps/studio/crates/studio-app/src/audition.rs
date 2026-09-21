@@ -71,11 +71,30 @@ pub trait PlaybackSink {
     /// tops the stream up against, and what reads zero when it has starved.
     fn stream_queued(&self) -> usize;
     /// Current position in FRAMES into the buffer, if playing.
+    /// Where the device has got to, or `None` when this sink is not
+    /// currently a clock.
+    ///
+    /// `None` is not an error: it means "nothing here is measuring time",
+    /// and the shell answers it by running the playhead off the wall clock
+    /// (`silent_fallback`). **A sink with no frames loaded has no clock**,
+    /// even while `playing()` — see [`clock_position`]. The two sinks
+    /// disagreed about this once and the real one was wrong: `CpalSink`
+    /// answered `Some(0)` forever for an empty buffer, so the shell believed
+    /// the device was keeping time at frame zero and pinned the playhead
+    /// there. It looked like "play does nothing", and it came back to life
+    /// only when something re-rendered the arrangement with audio in it.
     fn position(&self) -> Option<usize>;
     /// The sample rate buffers must be rendered at.
     fn rate(&self) -> u32;
     /// A short human name for the status line ("alsa @ 48000" / "silent").
     fn describe(&self) -> String;
+}
+
+/// Whether a sink is a clock right now, and where it has got to. One rule,
+/// shared by every sink, because the shell's fallback depends on the answer
+/// meaning the same thing from all of them.
+pub fn clock_position(playing: bool, frames: usize, pos: usize) -> Option<usize> {
+    (playing && frames > 0).then_some(pos)
 }
 
 /// The device-less sink: silent, but the clock still runs.
@@ -148,8 +167,7 @@ impl PlaybackSink for NullSink {
         self.epoch = std::time::Instant::now();
     }
     fn position(&self) -> Option<usize> {
-        if !self.playing() || self.frames == 0 { return None; }
-        Some(self.raw_pos())
+        clock_position(self.playing(), self.frames, self.raw_pos())
     }
     fn trigger(&mut self, _samples: Arc<Vec<f32>>) { self.triggered += 1; }
     fn voices(&self) -> usize { self.triggered }
@@ -407,7 +425,8 @@ impl PlaybackSink for CpalSink {
     }
     fn stream_queued(&self) -> usize { self.shared.stream_queued.load(Ordering::Relaxed) }
     fn position(&self) -> Option<usize> {
-        self.playing().then(|| self.shared.pos.load(Ordering::Relaxed))
+        clock_position(self.playing(), self.shared.buf.load().frames(),
+                       self.shared.pos.load(Ordering::Relaxed))
     }
     fn rate(&self) -> u32 { self.rate }
     fn describe(&self) -> String { self.name.clone() }
@@ -495,5 +514,36 @@ mod one_shot_tests {
         let p = s.position().expect("playing");
         assert!((24_000..27_000).contains(&p),
                 "seeked to frame 24000, immediately read {p} — frames, not interleaved samples");
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn a_sink_with_nothing_loaded_is_not_a_clock() {
+        // The reported bug: with a real device and an arrangement that
+        // rendered to nothing, CpalSink answered Some(0) forever. The shell
+        // then believed audio was keeping time, took the sink's zero as the
+        // playhead every frame, and never reached the wall-clock fallback —
+        // "play does nothing" until something re-rendered with audio in it.
+        assert_eq!(clock_position(true, 0, 0), None, "no frames, no clock");
+        assert_eq!(clock_position(true, 0, 99), None, "not even a stale position");
+        assert_eq!(clock_position(false, 48_000, 120), None, "stopped is not a clock");
+        assert_eq!(clock_position(true, 48_000, 120), Some(120));
+    }
+
+    #[test]
+    fn the_deviceless_sink_answers_the_same_way() {
+        // Both sinks must agree: the shell's fallback is written against one
+        // meaning of None, and a disagreement between them is invisible in
+        // every test that runs without a device — which is all of them here.
+        let mut s = NullSink::new(48_000);
+        s.set_playing(true);
+        assert_eq!(s.position(), None, "playing with no buffer");
+        s.set_buffer(std::sync::Arc::new(vec![0.0; 960]), 2, false);
+        s.set_playing(true);
+        assert!(s.position().is_some(), "a loaded buffer is a clock");
     }
 }
