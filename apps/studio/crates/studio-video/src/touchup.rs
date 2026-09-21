@@ -47,7 +47,10 @@ pub enum Fix {
     /// the frame; `drive` is one 0..1 value per output frame (from a control
     /// channel's envelope, say) -- empty means steady. The preset's colour is
     /// fitted to the shot's own brightness at render time.
-    Particles { params: crate::particles::Params, seed: u64, emitter: (f32, f32), drive: Vec<f32> },
+    Particles { params: crate::particles::Params, seed: u64, emitter: (f32, f32), drive: Vec<f32>,
+                /// Ride what is under the emitter: points are picked there in the
+                /// first frame, tracked as one rig, and the emitter moves with it.
+                ride: bool },
 }
 
 /// What to fix, on which range of which source.
@@ -167,9 +170,12 @@ pub fn render(t: &Ticket, out: &Path, size: Size, fps: f64) -> Result<Version, S
 
     // Measurement pass: one grey decode shared by every fix that needs motion.
     let needs_motion = t.fixes.iter().any(|f| matches!(f,
-        Fix::Stabilize { .. } | Fix::CleanPlate { align: true, .. } | Fix::FollowMotion { .. }));
+        Fix::Stabilize { .. } | Fix::CleanPlate { align: true, .. } | Fix::FollowMotion { .. } | Fix::Particles { ride: true, .. }));
+    let ride_at = t.fixes.iter().find_map(|f| match f { Fix::Particles { ride: true, emitter, .. } => Some(*emitter), _ => None });
     let follow_zoom = t.fixes.iter().find_map(|f| match f { Fix::FollowMotion { zoom, smooth } => Some((*zoom, *smooth)), _ => None });
     let mut follow: Vec<(f32, f32)> = Vec::new();
+    // the emitter's path when it rides a rig, in pixels per frame
+    let mut ride_path: Vec<(f32, f32)> = Vec::new();
     let (path, steps) = if needs_motion {
         let grey = pipe.gray()?;
         if grey.len() < 2 { return Err(format!("only {} frame(s) decoded", grey.len())); }
@@ -181,6 +187,21 @@ pub fn render(t: &Ticket, out: &Path, size: Size, fps: f64) -> Result<Version, S
                 warnings.push(format!("follow: movement found in only {found} of {} frames -- the crop mostly holds still", grey.len()));
             }
             follow = crate::action::follow_path(&c, fps, smooth, zoom);
+        }
+        if let Some((ex, ey)) = ride_at {
+            let at = (ex * size.w as f32, ey * size.h as f32);
+            let patch = ((size.w / 80).max(4)) as i32;
+            let pts = crate::tracker::pick_points(&grey[0], at, size.w as f32 * 0.12, 6, patch);
+            if pts.len() < 2 {
+                warnings.push("ride: too little texture under the emitter to track -- the particles stay put".into());
+            } else {
+                let solved = crate::tracker::track(&grey, &pts, patch, (size.w / 40).max(6) as i32, 22.0);
+                let held = solved.iter().filter(|s| s.held).count();
+                if held > solved.len() / 4 {
+                    warnings.push(format!("ride: the rig lost its points for {held} of {} frames and held still there", solved.len()));
+                }
+                ride_path = solved.iter().map(|s| s.rig.apply(at)).collect();
+            }
         }
         (stabilize::measure(&grey, (size.w / 20).max(8)), steps)
     } else {
@@ -222,7 +243,7 @@ pub fn render(t: &Ticket, out: &Path, size: Size, fps: f64) -> Result<Version, S
     // particles: one system for the whole render, stepped once per frame
     let mut particles: Option<(crate::particles::System, (f32, f32), Vec<f32>)> = None;
     for f in &t.fixes {
-        if let Fix::Particles { params, seed, emitter, drive } = f {
+        if let Fix::Particles { params, seed, emitter, drive, .. } = f {
             // fit the colour to the shot: its brightness, from the frame in the middle
             let (from, len) = t.range();
             let luma = crate::frame_rgb(&t.path, studio_core::Ticks::from_seconds(from + len / 2.0), 64, 36)
@@ -274,7 +295,8 @@ pub fn render(t: &Ticket, out: &Path, size: Size, fps: f64) -> Result<Version, S
         }
         if let Some((sys, at, drive)) = particles.as_mut() {
             let d = drive.get(i).copied().unwrap_or(if drive.is_empty() { 0.3 } else { 0.0 });
-            sys.step(1.0 / fps as f32, (at.0 * frame.w as f32, at.1 * frame.h as f32), d);
+            let pos = ride_path.get(i).copied().unwrap_or((at.0 * frame.w as f32, at.1 * frame.h as f32));
+            sys.step(1.0 / fps as f32, pos, d);
             peak_alive = peak_alive.max(sys.parts.len());
             sys.draw(&mut frame);
         }
@@ -420,7 +442,7 @@ mod tests {
             // barely differs from it (the smoke preset is pale and read either
             // way, so a smoke version of this test passed with fitting removed)
             let t = ticket(&plate, vec![Fix::Particles { params: crate::particles::Params::floating_dirt(), seed: 4,
-                emitter: (0.5, 0.8), drive }]);
+                emitter: (0.5, 0.8), drive, ride: false }]);
             let out = s.dir.join(format!("tu-pt-{tag}-{}.mp4", std::process::id()));
             let v = render(&t, &out, size, 12.0).expect("renders");
             let px = crate::frame_rgb(&out, Ticks::from_seconds(2.4), size.w, size.h).unwrap();
@@ -437,6 +459,46 @@ mod tests {
         let (_, loud) = render_with(vec![1.0; 40], "l");
         assert!(loud as f32 > quiet as f32 * 1.4, "a full drive thickens it: {loud} vs {quiet}");
         let _ = std::fs::remove_file(&plate);
+    }
+
+    #[test]
+    fn particles_that_ride_follow_what_is_under_them() {
+        if !ffmpeg_or_skip("particles_that_ride_follow_what_is_under_them") { return; }
+        let s = shoot(&[1.0], 6.0);
+        let size = Size { w: 240, h: 136 };
+        let plate = s.dir.join(format!("tu-ride-{}.mp4", std::process::id()));
+        // a textured "figure" walking right 2 px/frame over a flat dark background
+        Pipe { input: s.takes[0].video.clone(), range: None, size, fps: 12.0 }
+            .map(&plate, 10, |i, mut f| {
+                let fx = 40 + 2 * i as u32;
+                for y in 0..f.h { for x in 0..f.w {
+                    let inside = x >= fx && x < fx + 50 && y > 30 && y < 110;
+                    let v = if inside { (110.0 + 80.0 * (((x - fx) as f32 / 4.0).sin() * (y as f32 / 3.0).cos())) as u8 } else { 20 };
+                    f.set(x, y, [v, v, v]);
+                }}
+                f
+            }).expect("plate");
+        let emit = ((40.0 + 25.0) / 240.0, 70.0 / 136.0);   // on the figure in the first frame
+        let t = ticket(&plate, vec![Fix::Particles { params: crate::particles::Params::space_dust(), seed: 2,
+            emitter: emit, drive: vec![], ride: true }]);
+        let out = s.dir.join(format!("tu-rode-{}.mp4", std::process::id()));
+        let v = render(&t, &out, size, 12.0).expect("renders");
+        assert!(v.report.warnings.iter().all(|w| !w.contains("too little texture")), "{:?}", v.report.warnings);
+        // where is the dust at the end? near the figure's new place, not where it started
+        let px = crate::frame_rgb(&out, Ticks::from_seconds(2.8), size.w, size.h).unwrap();
+        let (mut sx, mut n) = (0.0f32, 0.0f32);
+        for (k, p) in px.chunks(3).enumerate() {
+            let x = (k as u32 % size.w) as f32;
+            // the glow makes dust near-white (not blue-tinted, as a first
+            // version of this check assumed); the figure never exceeds ~190
+            if p[0] > 215 && p[1] > 215 && p[2] > 215 { sx += x; n += 1.0; }
+        }
+        assert!(n > 10.0, "dust visible: {n}");
+        let mean_x = sx / n;
+        // render frame at 2.8 s is ~34 frames from the render start (0.5 s + 2.8 s at 12 fps... the
+        // figure has moved ~2 px/frame); it must be well right of the start
+        assert!(mean_x > 40.0 + 25.0 + 30.0, "the dust moved with the figure: mean x {mean_x}");
+        for f in [&plate, &out] { let _ = std::fs::remove_file(f); }
     }
 
     #[test]

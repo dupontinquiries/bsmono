@@ -128,6 +128,42 @@ pub fn track(frames: &[Gray], points: &[(f32, f32)], patch: i32, search: i32, ma
     out
 }
 
+/// Choose `n` points worth tracking within `radius` of `around`: the most
+/// textured patches (highest local variance -- a flat wall cannot be matched,
+/// an eye or a collar can), kept at least `2 * patch` apart so the rig is
+/// spread across the subject rather than clustered on one feature.
+pub fn pick_points(frame: &Gray, around: (f32, f32), radius: f32, n: usize, patch: i32) -> Vec<(f32, f32)> {
+    let (w, h) = (frame.w as i32, frame.h as i32);
+    let step = (patch / 2).max(2);
+    let mut cand: Vec<(f32, (f32, f32))> = Vec::new();
+    let (cx, cy) = (around.0 as i32, around.1 as i32);
+    let r = radius as i32;
+    let mut y = (cy - r).max(patch + 1);
+    while y < (cy + r).min(h - patch - 1) {
+        let mut x = (cx - r).max(patch + 1);
+        while x < (cx + r).min(w - patch - 1) {
+            if ((x - cx) as f32).hypot((y - cy) as f32) <= radius {
+                let (mut s, mut s2, mut k) = (0.0f32, 0.0f32, 0.0f32);
+                for dy in -patch..=patch { for dx in -patch..=patch {
+                    let v = frame.px[((y + dy) as usize) * frame.w + (x + dx) as usize] as f32;
+                    s += v; s2 += v * v; k += 1.0;
+                }}
+                cand.push((s2 / k - (s / k).powi(2), (x as f32, y as f32)));
+            }
+            x += step;
+        }
+        y += step;
+    }
+    cand.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: Vec<(f32, f32)> = Vec::new();
+    for (var, p) in cand {
+        if var < 60.0 { break; }   // too flat to match reliably
+        if out.iter().all(|q| (q.0 - p.0).hypot(q.1 - p.1) >= 2.0 * patch as f32) { out.push(p); }
+        if out.len() == n { break; }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +230,20 @@ mod tests {
         assert!((c15.0 - (80.0 + 15.0 * 1.2)).abs() < 2.5, "the face centre is still right: {c15:?}");
         // after: the lost points are found again where the rig said they would be
         assert!(t[25].points[0].is_some() && t[25].points[1].is_some(), "re-acquired: {:?}", t[25].points);
+    }
+
+    #[test]
+    fn points_are_picked_on_texture_and_spread_out() {
+        let g = scene(200, 140, Rig::IDENTITY, None);
+        let pts = pick_points(&g, (80.0, 60.0), 45.0, 5, 5);
+        assert!(pts.len() >= 4, "{pts:?}");
+        // all on the textured face (within its radius of 40 around 80,60), none on the flat background
+        assert!(pts.iter().all(|p| (p.0 - 80.0).hypot(p.1 - 60.0) < 42.0), "{pts:?}");
+        for (i, a) in pts.iter().enumerate() { for b in &pts[i + 1..] {
+            assert!((a.0 - b.0).hypot(a.1 - b.1) >= 10.0, "spread apart: {a:?} {b:?}");
+        }}
+        // a flat region offers nothing to track
+        assert!(pick_points(&g, (180.0, 20.0), 12.0, 5, 5).is_empty(), "flat background: no points");
     }
 
     #[test]

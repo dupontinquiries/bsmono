@@ -6133,7 +6133,7 @@ impl App {
                     }
                 }
                 palette::ShellVerb::TouchUpStabilize(kind) => self.start_stabilize(kind),
-                palette::ShellVerb::TouchUpParticles { preset, drive } => self.start_particles(preset, drive),
+                palette::ShellVerb::TouchUpParticles { preset, drive, ride } => self.start_particles(preset, drive, ride),
                 palette::ShellVerb::TouchUpFollow { zoom_pct } => self.start_touchup(
                     studio_video::touchup::Fix::FollowMotion { zoom: zoom_pct as f32 / 100.0, smooth: 0.5 },
                     format!("following the motion at {:.1}x", zoom_pct as f32 / 100.0)),
@@ -7182,7 +7182,7 @@ impl App {
     /// covers -- the clip plus its handles -- so frame i of the render reads
     /// the sound at frame i. A drive computed for the clip alone would run
     /// half a second early against the handled render.
-    fn start_particles(&mut self, preset: u8, drive_bus: Option<studio_core::BusId>) {
+    fn start_particles(&mut self, preset: u8, drive_bus: Option<studio_core::BusId>, ride: bool) {
         use studio_video::particles::Params;
         let params = match preset { 0 => Params::floating_dirt(), 1 => Params::space_dust(), _ => Params::creepy_smoke() };
         let emitter = match preset { 0 => (0.5, 0.95), 1 => (0.5, 0.5), _ => (0.5, 0.75) };
@@ -7212,7 +7212,7 @@ impl App {
             }
         };
         let what = match preset { 0 => "floating dirt", 1 => "spaceship dust", _ => "creepy smoke" };
-        self.start_touchup(studio_video::touchup::Fix::Particles { params, seed: id.0, emitter, drive },
+        self.start_touchup(studio_video::touchup::Fix::Particles { params, seed: id.0, emitter, drive, ride },
                            format!("{what}{}", if drive_bus.is_some() { ", driven by sound" } else { "" }));
     }
 
