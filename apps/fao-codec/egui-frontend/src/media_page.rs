@@ -63,6 +63,16 @@ pub struct State {
     pub output_dir: String,
     pub quality: u8,
     pub job: Option<EncodeJob>,
+    /// Frames sampled per file by Analyze.
+    pub samples: usize,
+    pub analysis: Option<Result<crate::analyze::Report, String>>,
+    analyzing: Option<mpsc::Receiver<AnalyzeEvent>>,
+    pub analyze_progress: (usize, usize),
+}
+
+enum AnalyzeEvent {
+    Progress(usize, usize),
+    Done(Result<crate::analyze::Report, String>),
 }
 
 impl Default for State {
@@ -73,6 +83,8 @@ impl Default for State {
             include_text: String::new(), exclude_text: String::new(), only_selected: false,
             rx: None, tx: None, pending: 0,
             output_dir: String::new(), quality: 80, job: None,
+            samples: crate::analyze::DEFAULT_SAMPLES, analysis: None, analyzing: None,
+            analyze_progress: (0, 0),
         }
     }
 }
@@ -167,6 +179,65 @@ impl State {
 }
 
 impl State {
+    /// Where ffmpeg reads an entry from: a local path, or a dufs file URL.
+    pub fn input_for(&self, e: &Entry) -> Option<String> {
+        match self.sources.get(e.source)? {
+            Source::Local(root) => Some(root.join(&e.rel).display().to_string()),
+            Source::Dufs(base) => Some(media::file_url(base, &e.rel)),
+        }
+    }
+
+    /// The selected SOURCE videos, with where to read each.
+    fn selected_sources(&self) -> Vec<(String, String)> {
+        self.entries.iter()
+            .filter(|e| e.kind == Kind::SourceVideo && self.selection.selected(e))
+            .filter_map(|e| Some((e.rel.clone(), self.input_for(e)?)))
+            .collect()
+    }
+
+    /// Estimate what a SHARED block dictionary would save across the selected
+    /// source videos, on a thread. See `analyze` for the method and its limits.
+    pub fn start_analyze(&mut self) {
+        let files = self.selected_sources();
+        if files.is_empty() || self.analyzing.is_some() { return; }
+        let (tx, rx) = mpsc::channel();
+        let k = self.samples.max(1);
+        let total = files.len();
+        std::thread::spawn(move || {
+            let mut keep = std::collections::HashMap::new();
+            let mut blocks = Vec::new();
+            let mut failed = Vec::new();
+            for (i, (name, input)) in files.into_iter().enumerate() {
+                match crate::analyze::sample_file(&input, &name, k, &mut keep) {
+                    Ok(fb) => blocks.push(fb),
+                    Err(e) => failed.push(e),
+                }
+                let _ = tx.send(AnalyzeEvent::Progress(i + 1, total));
+            }
+            let r = if blocks.is_empty() {
+                Err(format!("nothing could be sampled: {}", failed.join("; ")))
+            } else {
+                Ok(crate::analyze::analyze(&blocks, crate::analyze::bytes_per_block(&keep)))
+            };
+            let _ = tx.send(AnalyzeEvent::Done(r));
+        });
+        self.analyzing = Some(rx);
+        self.analysis = None;
+        self.analyze_progress = (0, total);
+    }
+
+    pub fn poll_analyze(&mut self) {
+        let Some(rx) = &self.analyzing else { return };
+        let mut done = None;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AnalyzeEvent::Progress(d, t) => self.analyze_progress = (d, t),
+                AnalyzeEvent::Done(r) => done = Some(r),
+            }
+        }
+        if let Some(r) = done { self.analysis = Some(r); self.analyzing = None; }
+    }
+
     /// Plan an encode of the selected SOURCE videos. Returns the work and, for
     /// anything skipped, why. Pure over state, so it is tested without ffmpeg.
     ///
@@ -187,12 +258,12 @@ impl State {
                     } else { PathBuf::from(out_dir) };
                     (p.display().to_string(), dir)
                 }
-                Some(Source::Dufs(base)) => {
+                Some(Source::Dufs(_)) => {
                     if out_dir.is_empty() {
                         skipped.push(format!("{}: set an output folder for server files", e.rel));
                         continue;
                     }
-                    (media::file_url(base, &e.rel), PathBuf::from(out_dir))
+                    match self.input_for(e) { Some(u) => (u, PathBuf::from(out_dir)), None => continue }
                 }
                 None => continue,
             };
@@ -291,6 +362,8 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
     let st = &mut app.media;
     st.poll();
     st.poll_encode();
+    st.poll_analyze();
+    if st.analyzing.is_some() { ui.ctx().request_repaint_after(std::time::Duration::from_millis(150)); }
     if st.job.as_ref().is_some_and(|j| j.running) {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
     }
@@ -350,6 +423,56 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
         ui.label(format!("{sel_n} of {all_n} selected · {} of {}", gb(sel_b), gb(all_b)));
         ui.checkbox(&mut st.only_selected, "show selected only");
     });
+
+    // ── analyze ──
+    let n_src = st.selected_sources().len();
+    ui.horizontal(|ui| {
+        let busy = st.analyzing.is_some();
+        let label = format!("🔍 Estimate shared-library savings ({n_src} selected)");
+        if ui.add_enabled(!busy && n_src > 0, egui::Button::new(label))
+            .on_hover_text("Samples a few frames from each file and measures how many 16x16 blocks \
+                            a single shared block dictionary would store once instead of per file.")
+            .clicked() { st.start_analyze(); }
+        ui.add(egui::Slider::new(&mut st.samples, 2..=48).text("frames / file"));
+        if busy { ui.label(format!("sampling {} of {}…", st.analyze_progress.0, st.analyze_progress.1)); }
+    });
+    match &st.analysis {
+        Some(Ok(r)) => {
+            let mb = |b: f64| b / (1024.0 * 1024.0);
+            ui.group(|ui| {
+                ui.label(egui::RichText::new(format!(
+                    "Shared dictionary saves {:.0}% of block storage", r.savings_ratio() * 100.0)).strong());
+                ui.label(format!("One dictionary per file: {} unique blocks ≈ {:.2} MB",
+                                 r.per_file_unique, mb(r.per_file_bytes())));
+                ui.label(format!("One shared dictionary:   {} unique blocks ≈ {:.2} MB",
+                                 r.shared_unique, mb(r.shared_bytes())));
+                ui.label(format!("Blocks repeat {:.1}× inside a file on average; {:.0} bytes per stored block (measured, zstd)",
+                                 r.within_file_reuse(), r.bytes_per_block));
+                if r.shared_overflows() {
+                    ui.colored_label(ui.visuals().warn_fg_color, format!(
+                        "⚠ Even this sample exceeds the dictionary's {} block cap. At the cap the encoder \
+                         skips dictionary frames entirely — split the selection into groups.",
+                        crate::analyze::MAX_BLOCKS));
+                }
+                ui.label(egui::RichText::new(format!(
+                    "Estimate from {} frames across {} files. Unique counts from a sample are a lower \
+                     bound; the percentage is the reliable figure.", r.frames, r.files)).weak().small());
+                if r.missed > 0 {
+                    ui.label(egui::RichText::new(format!(
+                        "{} requested frame(s) could not be sampled, so the estimate rests on fewer.", r.missed))
+                        .weak().small());
+                }
+                egui::CollapsingHeader::new("per file").id_salt("analyze_files").show(ui, |ui| {
+                    for l in &r.lines {
+                        ui.label(egui::RichText::new(format!("{}  —  {} unique, {} shared with others",
+                                                             l.name, l.unique, l.shared_with_others)).small());
+                    }
+                });
+            });
+        }
+        Some(Err(e)) => { ui.colored_label(ui.visuals().error_fg_color, e); }
+        None => {}
+    }
 
     // ── encode ──
     ui.horizontal(|ui| {
@@ -623,6 +746,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&served);
         let _ = std::fs::remove_dir_all(&out);
         if let Err(e) = result { std::panic::resume_unwind(e); }
+    }
+
+    /// END TO END through the tab: two real clips sharing a HUD, selected,
+    /// analysed on the thread, reporting savings. And timed, since "fast" was
+    /// the requirement.
+    #[test]
+    fn analyze_from_the_tab_reports_savings_for_clips_sharing_a_hud() {
+        let ok = std::process::Command::new("ffmpeg").arg("-version").output().map(|o| o.status.success()).unwrap_or(false);
+        if !ok { eprintln!("no ffmpeg; skipping"); return; }
+        let root = tmpdir("analyze_tab");
+        for (name, src) in [("a.mp4", "testsrc=size=256x192:rate=10:duration=2"),
+                            ("b.mp4", "testsrc2=size=256x192:rate=10:duration=2")] {
+            assert!(std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", src,
+                "-vf", "drawbox=x=0:y=0:w=iw:h=64:color=0x2040a0:t=fill", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-qp", "0"])
+                .arg(root.join(name)).status().unwrap().success());
+        }
+        let mut st = State::default();
+        st.add(Source::Local(root.clone()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while st.pending > 0 && std::time::Instant::now() < deadline { st.poll(); std::thread::sleep(std::time::Duration::from_millis(10)); }
+        st.include_text = "*.mp4".into();
+        st.sync_patterns();
+        st.samples = 4;
+        let t = std::time::Instant::now();
+        st.start_analyze();
+        while st.analyzing.is_some() && std::time::Instant::now() < deadline {
+            st.poll_analyze(); std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        eprintln!("analyzed 2 files x 4 frames in {:?}", t.elapsed());
+        let r = st.analysis.clone().expect("finished").expect("ok");
+        assert_eq!(r.files, 2);
+        assert!(r.savings_ratio() > 0.0, "{r:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

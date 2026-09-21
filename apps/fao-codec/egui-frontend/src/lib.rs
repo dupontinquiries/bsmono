@@ -28,6 +28,9 @@ pub mod export;
 pub mod stream;
 /// The media collection: video files from local folders and dufs servers, with
 /// glob patterns and individual selection. Distinct from the mesh Web Library.
+/// Fast sampled estimate of what a SHARED block dictionary would save across a
+/// selection of files, versus one dictionary per file.
+pub mod analyze;
 pub mod media;
 /// The Media tab: the egui shell over `media`.
 pub mod media_page;
