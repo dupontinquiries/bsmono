@@ -56,6 +56,7 @@ pub mod looping;
 pub mod midi;
 pub mod mix_assistant;
 pub mod multicam_cut;
+pub mod relink;
 pub mod touchup_job;
 pub mod mixer_panel;
 pub mod morph_pad;
@@ -5538,6 +5539,26 @@ impl App {
                             .get(&g).map(|x| x.name.clone()).unwrap_or_default()),
                         None => "program monitor back on the cut".into(),
                     };
+                }
+                palette::ShellVerb::RelinkToFolder => {
+                    match export::pick_folder() {
+                        None => self.studio.status = "no folder chosen".into(),
+                        Some(dir) => {
+                            let plan = relink::plan(&self.studio.session.doc.project, &dir);
+                            let line = plan.summary();
+                            if plan.ops.is_empty() {
+                                // Nothing to do is not a failure, but it must
+                                // not look like success either.
+                                self.studio.status = format!("nothing relinked — {line}");
+                            } else {
+                                self.studio.edit(studio_core::Op::Group { ops: plan.ops }, &line);
+                                self.studio.status = line;
+                            }
+                            for (path, found) in &plan.ambiguous {
+                                eprintln!("relink: {path} matches {} files, left alone", found.len());
+                            }
+                        }
+                    }
                 }
                 palette::ShellVerb::TouchUpStabilize(kind) => self.start_stabilize(kind),
                 palette::ShellVerb::TouchUpCleanPlate { radius, moving } =>

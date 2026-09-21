@@ -95,12 +95,17 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
+/// v18: `Op::SetSourcePath` (tag 46). A tag addition only — no existing
+/// encoding changed — but the version still moves, because a v17 peer that
+/// receives one cannot apply it and would silently diverge from everyone
+/// who can.
+///
 /// v17: `Bus` gained `silent: bool` (a measurement tap that feeds nothing —
 /// see `Bus::silent`), and `Op` gained `SetBusSilent` (tag 45). The bus
 /// shape itself changed, so this is a bump and not a quiet tag addition: a
 /// v16 peer reading a v17 bus would take the silent byte for the next
 /// field and desynchronise the whole stream.
-pub const WIRE_VERSION: u8 = 17;
+pub const WIRE_VERSION: u8 = 18;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -494,6 +499,7 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
         Op::SetBusGain { id, gain } => { put_u8(o, 13); put_u64(o, id.0); put_f32(o, *gain); }
         Op::SetBusFlags { id, muted } => { put_u8(o, 17); put_u64(o, id.0); put_u8(o, *muted as u8); }
         Op::SetBusSilent { id, silent } => { put_u8(o, 45); put_u64(o, id.0); put_u8(o, *silent as u8); }
+        Op::SetSourcePath { id, path } => { put_u8(o, 46); put_u64(o, id.0); put_str(o, path); }
         Op::SetBusChain { id, chain } => { put_u8(o, 14); put_u64(o, id.0); put_effects(o, chain); }
         Op::SetBusSends { id, sends } => { put_u8(o, 15); put_u64(o, id.0); put_sends(o, sends); }
         Op::SetRoute { track, bus } => { put_u8(o, 16); put_u64(o, track.0); put_opt_bus_id(o, *bus); }
@@ -713,6 +719,7 @@ fn get_op(r: &mut R) -> Option<Op> {
             Op::SetGroupWindow { id, window }
         }
         45 => Op::SetBusSilent { id: BusId(r.u64()?), silent: r.u8()? != 0 },
+        46 => Op::SetSourcePath { id: SourceId(r.u64()?), path: r.str()? },
         44 => Op::SetClipFade {
             id: ClipId(r.u64()?),
             fade_in: Ticks(r.i64()?),
@@ -1521,7 +1528,14 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 17, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 18, "bump this alongside the next encoding change, not instead of it");
+    }
+
+    #[test]
+    fn a_relink_survives_the_wire() {
+        let p = Packet::Op(StampedOp { stamp: Stamp { lamport: 3, site: SiteId(2) },
+            op: Op::SetSourcePath { id: SourceId(7), path: "/card/A001/C0057.MXF".into() } });
+        assert_eq!(Packet::decode(&p.encode()).expect("decodes"), p);
     }
 
     #[test]

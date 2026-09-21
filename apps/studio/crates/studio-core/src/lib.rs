@@ -859,6 +859,14 @@ pub enum Op {
     /// delivery, not a real undo), which meant recording a source and then
     /// undoing left the source permanently in the project. This is the fix.
     RemoveSource { id: SourceId },
+    /// Point a source at a different file: the same media somewhere else, or
+    /// the camera original in place of the proxy that was cut with.
+    ///
+    /// Only the path moves. Length, rate, channels and `has_video` stay as
+    /// they are, because every clip's trim was validated against them — a
+    /// relink that silently changed the length would move cuts. A file that
+    /// really is a different length is an import, not a relink.
+    SetSourcePath { id: SourceId, path: String },
     /// Refused if `bus.parent` doesn't exist, or is the bus's own id (a
     /// direct self-loop) — see `Project::apply`'s cycle check for why a
     /// longer cycle can never arise from `AddBus` alone.
@@ -1265,6 +1273,12 @@ impl Project {
                 }
                 self.sources.insert(source.id, source.clone());
                 Ok(Op::RemoveSource { id: source.id })
+            }
+            Op::SetSourcePath { id, path } => {
+                let s = self.sources.get_mut(id).ok_or(EditError::NoSuchSource(*id))?;
+                let inv = Op::SetSourcePath { id: *id, path: s.path.clone() };
+                s.path = path.clone();
+                Ok(inv)
             }
             Op::RemoveSource { id } => {
                 if self.clips.values().any(|c| c.source == *id) {
@@ -2285,6 +2299,24 @@ mod tests {
         assert_eq!(p.busses.len(), 1);
         h.undo(&mut p);
         assert_eq!(p, start, "three plain undos should fully revert, same total effect as grouping would have");
+    }
+
+    #[test]
+    fn relinking_a_source_moves_the_path_and_nothing_else() {
+        let mut p = Project::default();
+        p.apply(&Op::AddSource { source: Source::file(SourceId(1), "/proxies/C0057.mkv",
+            Ticks::from_seconds(54.0), 48_000, 2, true) }).unwrap();
+        let before = p.sources[&SourceId(1)].clone();
+        let inv = p.apply(&Op::SetSourcePath { id: SourceId(1),
+            path: "/card/A001/C0057.MXF".into() }).expect("relinks");
+        let now = &p.sources[&SourceId(1)];
+        assert_eq!(now.path, "/card/A001/C0057.MXF");
+        assert_eq!((now.len, now.sample_rate, now.channels, now.has_video),
+                   (before.len, before.sample_rate, before.channels, before.has_video),
+                   "a relink must not move a single cut");
+        p.apply(&inv).unwrap();
+        assert_eq!(p.sources[&SourceId(1)], before, "undo puts the proxy back");
+        assert!(p.apply(&Op::SetSourcePath { id: SourceId(9), path: "/x".into() }).is_err());
     }
 
     #[test]

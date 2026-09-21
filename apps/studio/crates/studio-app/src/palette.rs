@@ -82,6 +82,10 @@ pub enum ShellVerb {
     /// Show a camera group as a grid in the program monitor, or `None` to
     /// go back to the cut.
     Multiview(Option<studio_core::GroupId>),
+    /// Relink every source to a folder of originals, picked with the native
+    /// dialog. A shell verb: it has to ask the desktop for a folder, which
+    /// is not something an `Op` can do.
+    RelinkToFolder,
     TouchUpStabilize(StabilizeKind),
     /// Clean-plate the selected clip: remove something that crosses it,
     /// using `radius` frames each side. `moving` warps the neighbours onto
@@ -290,6 +294,9 @@ pub fn root() -> Vec<Choice> {
         // Markers: the one request both the FL Studio and kdenlive
         // communities make in the same words.
         c("drop a marker here", None, Then::Do(Act::Shell(ShellVerb::MarkerHere))),
+        c("relink media to a folder (proxies → originals)",
+          Some("only the paths move; every cut stays where it is"),
+          Then::Do(Act::Shell(ShellVerb::RelinkToFolder))),
         c("multiview a camera group (watch every angle)", Some("or go back to the cut"),
           Then::Ask(Ask::MultiviewGroup)),
         c("stabilize the selected clip", Some("still / smooth / de-jerk"),
