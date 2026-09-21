@@ -26,6 +26,9 @@ pub mod export;
 /// Seek-based .fao reading in constant memory: 600-hour and 8K files, and
 /// timestamps past the 596.5-hour signed-32-bit overflow.
 pub mod stream;
+/// The media collection: video files from local folders and dufs servers, with
+/// glob patterns and individual selection. Distinct from the mesh Web Library.
+pub mod media;
 pub mod transcode;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
