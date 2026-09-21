@@ -53,6 +53,10 @@ pub mod ring;
 /// exist. See its header: the kit's QR is a decorative identicon, so this
 /// decodes REAL codes from other apps, which is what scanning a friend's
 /// screen actually involves.
+/// Per-speaker processing on incoming voice: de-bass, de-harsh, compressor.
+/// De-bass helps ambient noise; the compressor HURTS it, since it lifts the
+/// quiet parts and between words the quiet part is the room.
+pub mod voice_fx;
 pub mod qr_decode;
 pub mod qr;
 pub mod wayfinder;
