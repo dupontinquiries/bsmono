@@ -1730,6 +1730,12 @@ pub fn diagnose(text: &str) -> Vec<crate::finding::Finding> {
             .help("start xovi: `gitmind eink activate <host>`"),
             "qtfb.sock");
     }
+    if has("AppLoad closed the qtfb connection") {
+        add(Finding::new(Error, "app-qtfb-closed", "AppLoad closed the app's qtfb connection after it started")
+            .note("seen on a Paper Pro when the app sent SET_REFRESH_MODE right after init; eink-kit no longer sends mode messages unless EINK_QTFB_MODES=1")
+            .help("rebuild and redeploy with the current eink-kit; if it persists, run with EINK_TRACE=1 and send the app log plus `journalctl -n 100 | grep QTFB` from the tablet"),
+            "AppLoad closed the qtfb connection");
+    }
     if has("qtfb refused window key") {
         add(Finding::new(Error, "app-qtfb-refused", "AppLoad refused the app's window")
             .help("close the app in AppLoad and open it again from the sidebar"),
@@ -2373,6 +2379,12 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
         assert!(!wifi.iter().any(|f| f.code == "tablet-unreachable"), "refused is not 'did not answer'");
         let usb = diagnose("ssh: connect to host 10.11.99.1 port 22: Network unreachable");
         assert_eq!(usb[0].code, "tablet-no-network-path");
+    }
+
+    #[test]
+    fn the_paper_pro_qtfb_disconnect_is_explained() {
+        let f = diagnose("eink-demo: AppLoad closed the qtfb connection (after 1 message(s) since init, last SET_REFRESH_MODE; this one UPDATE)");
+        assert_eq!(f[0].code, "app-qtfb-closed");
     }
 
     #[test]

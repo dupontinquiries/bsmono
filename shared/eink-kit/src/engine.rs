@@ -442,7 +442,7 @@ pub fn open_backend(cfg: &Config, hub: &InputHub) -> std::io::Result<Box<dyn Pre
         let mode = qtfb::Mode::parse(&fast_name).ok_or_else(|| err(format!("EINK_FAST_WAVEFORM={fast_name:?} unknown")))?;
         let profile = cfg.profile.unwrap_or(if color { Profile::FastColor } else { Profile::FastMono });
         let mode = if profile == Profile::Quality { qtfb::Mode::Ui } else { mode };
-        eprintln!("eink: qtfb window {key}, refresh mode {mode:?} (fixed for the session)");
+        eprintln!("eink: qtfb window {key}");
         return Ok(Box::new(qtfb::QtfbPresent::connect(key, model, mode, hub.sender())?));
     }
     if want == "blight" || want == "auto" {

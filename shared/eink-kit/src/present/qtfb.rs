@@ -31,6 +31,7 @@ const MESSAGE_TERMINATE: u8 = 3;
 const MESSAGE_USERINPUT: u8 = 4;
 const MESSAGE_SET_REFRESH_MODE: u8 = 5;
 const MESSAGE_REQUEST_FULL_REFRESH: u8 = 6;
+const UPDATE_ALL: i32 = 0;
 const UPDATE_PARTIAL: i32 = 1;
 
 const INPUT_TOUCH_PRESS: i32 = 0x10;
@@ -131,6 +132,22 @@ pub struct QtfbPresent {
     shm: *mut u8,
     shm_len: usize,
     caps: Caps,
+    /// Send SET_REFRESH_MODE / REQUEST_FULL_REFRESH (EINK_QTFB_MODES=1).
+    modes: bool,
+    trace: bool,
+    sent: u32,
+    last: &'static str,
+}
+
+fn type_name(t: u8) -> &'static str {
+    match t {
+        MESSAGE_INITIALIZE => "INITIALIZE",
+        MESSAGE_UPDATE => "UPDATE",
+        MESSAGE_TERMINATE => "TERMINATE",
+        MESSAGE_SET_REFRESH_MODE => "SET_REFRESH_MODE",
+        MESSAGE_REQUEST_FULL_REFRESH => "REQUEST_FULL_REFRESH",
+        _ => "?",
+    }
 }
 
 // The shm pointer is only touched from the runner thread.
@@ -139,7 +156,17 @@ unsafe impl Send for QtfbPresent {}
 impl QtfbPresent {
     /// Connect to window `key`, map its buffer, set the refresh mode once,
     /// and start a thread forwarding touch/pen input to `input`.
+    ///
+    /// Refresh-mode and full-refresh messages are OFF by default. AppLoad's
+    /// own shim (the path KOReader uses, working on a Paper Pro) never sends
+    /// them; on a real Paper Pro, a SET_REFRESH_MODE sent right after init was
+    /// followed by the server's recv failing and the connection closing
+    /// within milliseconds (every later UPDATE then failed with EPIPE). So
+    /// this follows the proven path: UPDATEs only, and a full refresh is an
+    /// UPDATE_ALL. `EINK_QTFB_MODES=1` restores the mode messages to test.
     pub fn connect(key: i32, model: Model, mode: Mode, input: InputSender) -> io::Result<QtfbPresent> {
+        let modes = std::env::var("EINK_QTFB_MODES").as_deref() == Ok("1");
+        let trace = std::env::var("EINK_TRACE").as_deref() == Ok("1");
         let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -181,10 +208,11 @@ impl QtfbPresent {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
                 format!("qtfb shm is {} bytes, expected {} for {w}x{h} RGB565 (wrong EINK_MODEL?)", init.shm_size, stride * h as usize)));
         }
-        if mode != Mode::Ui {
+        if modes && mode != Mode::Ui {
             // Costs one second of server-side sleep; done once, here.
             send_msg(fd, &ClientMessage { ty: MESSAGE_SET_REFRESH_MODE, body: ClientBody { refresh_mode: mode as i32 } })?;
         }
+        eprintln!("eink: qtfb refresh mode: {}", if modes { format!("{mode:?} (EINK_QTFB_MODES=1)") } else { "AppLoad's default (mode messages off; EINK_QTFB_MODES=1 to send them)".into() });
         let rfd = unsafe { libc::dup(fd) };
         std::thread::Builder::new().name("qtfb-input".into()).spawn(move || reader(rfd, input))?;
         Ok(QtfbPresent {
@@ -192,7 +220,32 @@ impl QtfbPresent {
             shm: p.cast(),
             shm_len: init.shm_size,
             caps: Caps { width: w, height: h, stride, format: PixelFormat::Rgb565, per_update_waveform: false, color_panel: model.color() },
+            modes,
+            trace,
+            sent: 0,
+            last: "INITIALIZE",
         })
+    }
+
+    /// Send one message, counting and (EINK_TRACE=1) logging it. A broken
+    /// connection is reported with how far it got, so a server that hangs up
+    /// on a particular message shows which one.
+    fn send(&mut self, m: &ClientMessage, what: &str) -> io::Result<()> {
+        let name = type_name(m.ty);
+        if self.trace {
+            eprintln!("eink: qtfb send #{} {name} {what}", self.sent + 1);
+        }
+        match send_msg(self.fd, m) {
+            Ok(()) => {
+                self.sent += 1;
+                self.last = name;
+                Ok(())
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EPIPE) => Err(io::Error::new(io::ErrorKind::BrokenPipe, format!(
+                "AppLoad closed the qtfb connection (after {} message(s) since init, last {}; this one {name})",
+                self.sent, self.last))),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -235,14 +288,22 @@ impl Present for QtfbPresent {
     fn commit(&mut self, updates: &[Update]) -> io::Result<()> {
         for u in updates {
             if u.waveform == Waveform::Full {
-                send_msg(self.fd, &ClientMessage { ty: MESSAGE_REQUEST_FULL_REFRESH, body: ClientBody { refresh_mode: 0 } })?;
+                if self.modes {
+                    self.send(&ClientMessage { ty: MESSAGE_REQUEST_FULL_REFRESH, body: ClientBody { refresh_mode: 0 } }, "")?;
+                } else {
+                    // The shim's path: a whole-screen update.
+                    self.send(&ClientMessage {
+                        ty: MESSAGE_UPDATE,
+                        body: ClientBody { update: UpdateContents { kind: UPDATE_ALL, x: 0, y: 0, w: 0, h: 0 } },
+                    }, "all (full refresh)")?;
+                }
                 continue;
             }
             let r = u.rect;
-            send_msg(self.fd, &ClientMessage {
+            self.send(&ClientMessage {
                 ty: MESSAGE_UPDATE,
                 body: ClientBody { update: UpdateContents { kind: UPDATE_PARTIAL, x: r.x0, y: r.y0, w: r.width(), h: r.height() } },
-            })?;
+            }, &format!("{}x{}+{}+{}", r.width(), r.height(), r.x0, r.y0))?;
         }
         Ok(())
     }
