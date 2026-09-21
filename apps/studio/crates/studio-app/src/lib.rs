@@ -68,6 +68,7 @@ pub mod track_points;
 pub mod wake;
 pub mod open_project;
 pub mod tracks;
+pub mod thumbs;
 #[cfg(test)]
 mod abundance_tests;
 #[cfg(test)]
@@ -3263,6 +3264,8 @@ pub struct App {
     /// loses what the previous filter hid.
     words_raw: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
     word_filter: studio_voice::WordFilter,
+    /// The filmstrip's decoded frames and the worker that decodes them.
+    thumbs: thumbs::Cache,
     /// The project as it was last opened or saved. "Unsaved changes" means
     /// the live project differs from it -- the question asked before
     /// switching to another project, so a switch never loses work and never
@@ -3463,6 +3466,10 @@ impl App {
             }));
             rx
         });
+        let thumb_cache = {
+            let w = ui_waker.clone();
+            thumbs::Cache::new(std::sync::Arc::new(move || { if let Some(c) = w.lock().ok().and_then(|g| g.clone()) { c.request_repaint(); } }))
+        };
         let mut app = App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
             provenance_tx, provenance_rx,
             follow: None,
@@ -3534,7 +3541,8 @@ impl App {
               upscale_settings: upscale::Settings::default(),
               tune_scale: None,
               analog: Box::new(analog),
-              loaded: SinkContent::Nothing, silent_clock: None, saved_project: None, open_pending: None };
+              loaded: SinkContent::Nothing, silent_clock: None, saved_project: None, open_pending: None,
+              thumbs: thumb_cache };
         // the project as opened: "unsaved changes" means different from this
         app.saved_project = Some(app.studio.session.doc.project.clone());
         app
@@ -4290,6 +4298,14 @@ impl eframe::App for App {
         self.kaleido_gallery_window(ctx);
         self.signals_window(ctx);
         self.comic_tracker();
+        // the filmstrip: take in decoded frames, ask for what the timeline lacked
+        // (paths against the project folder -- relative sources are beside it)
+        {
+            let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            let paths: std::collections::HashMap<studio_core::SourceId, std::path::PathBuf> = self.studio.session.doc.project.sources
+                .iter().filter(|(_, s)| s.has_video).map(|(id, s)| (*id, base.join(&s.path))).collect();
+            self.thumbs.pump(ctx, |id| paths.get(&id).cloned());
+        }
         self.comic_setup_window(ctx);
         self.track_points_window(ctx);
 
@@ -5261,6 +5277,7 @@ impl eframe::App for App {
                     let tr = studio_egui::timeline(ui, &session.doc,
                                                    view,
                                                    &colors, ph, &sel, &self.peaks, &self.words,
+                                                   &self.thumbs.thumbs,
                                                    *trim_side,
                                                    closed_groups,
                                                    mode, input_mode, &pending,
