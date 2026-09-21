@@ -379,7 +379,7 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
 
     ui.horizontal(|ui| {
         ui.label("Folder");
-        ui.add(egui::TextEdit::singleline(&mut st.new_folder).hint_text("/home/you/Videos/matches").desired_width(320.0));
+        ui.add(egui::TextEdit::singleline(&mut st.new_folder).id_salt("media-new_folder").hint_text("/home/you/Videos/matches").desired_width(320.0));
         if ui.button("+ Add folder").clicked() && !st.new_folder.trim().is_empty() {
             let p = std::path::PathBuf::from(st.new_folder.trim());
             st.add(Source::Local(p));
@@ -388,7 +388,7 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
     });
     ui.horizontal(|ui| {
         ui.label("dufs");
-        ui.add(egui::TextEdit::singleline(&mut st.new_server).hint_text("http://192.168.1.20:5000/matches").desired_width(320.0));
+        ui.add(egui::TextEdit::singleline(&mut st.new_server).id_salt("media-new_server").hint_text("http://192.168.1.20:5000/matches").desired_width(320.0));
         if ui.button("+ Add server").clicked() && !st.new_server.trim().is_empty() {
             st.add(Source::Dufs(st.new_server.trim().to_string()));
             st.new_server.clear();
@@ -410,9 +410,9 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
     ui.separator();
     ui.columns(2, |cols| {
         cols[0].label("Include (one pattern per line)");
-        cols[0].add(egui::TextEdit::multiline(&mut st.include_text).hint_text("*.fao\nranked/**/*.mkv\n2026-09-*").desired_rows(3));
+        cols[0].add(egui::TextEdit::multiline(&mut st.include_text).id_salt("media-include").hint_text("*.fao\nranked/**/*.mkv\n2026-09-*").desired_rows(3));
         cols[1].label("Exclude");
-        cols[1].add(egui::TextEdit::multiline(&mut st.exclude_text).hint_text("**/scrims/*").desired_rows(3));
+        cols[1].add(egui::TextEdit::multiline(&mut st.exclude_text).id_salt("media-exclude").hint_text("**/scrims/*").desired_rows(3));
     });
     st.sync_patterns();
 
@@ -477,7 +477,7 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
     // ── encode ──
     ui.horizontal(|ui| {
         ui.label("Output");
-        ui.add(egui::TextEdit::singleline(&mut st.output_dir)
+        ui.add(egui::TextEdit::singleline(&mut st.output_dir).id_salt("media-output_dir")
             .hint_text("beside each local file (required for server files)").desired_width(280.0));
         ui.add(egui::Slider::new(&mut st.quality, 10..=100).text("quality"));
     });
