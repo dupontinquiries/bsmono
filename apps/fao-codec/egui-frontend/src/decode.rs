@@ -248,8 +248,21 @@ impl FaoFile {
 /// and V8PT (pose track) are not read by this port (see the module doc — `render_frame_rgb`
 /// never consults either), and V8LR/V8AT/V9DC are not searched for at all.
 fn read_v8mx_trailer(data: &[u8], index: &[fao_v1::FaoFrameEntry]) -> Option<Vec<fao_v1::v8_reconstruction_codec::DecodedWeb>> {
-    let frame_data_end: usize = index.iter().map(|e| (e.offset + e.size as u64) as usize).max().unwrap_or(0);
-    let search_start = frame_data_end.min(data.len());
+    v8mx_from(data, frame_data_end(index).min(data.len()))
+}
+
+/// Where frame data ends: the furthest `offset + size` over the index.
+fn frame_data_end(index: &[fao_v1::FaoFrameEntry]) -> usize {
+    index.iter().map(|e| (e.offset + e.size as u64) as usize).max().unwrap_or(0)
+}
+
+/// The V8MX trailer, searched for from `search_start` in `data`.
+///
+/// SPLIT FROM `read_v8mx_trailer` so the streaming reader runs the SAME search
+/// over just the file's tail. It reads a length prefix from the 4 bytes BEFORE
+/// the magic -- so a caller handing it a tail must include those 4 bytes; see
+/// `stream::FaoReader::trailer`.
+pub(crate) fn v8mx_from(data: &[u8], search_start: usize) -> Option<Vec<fao_v1::v8_reconstruction_codec::DecodedWeb>> {
     if data.len() < search_start + 4 { return None; }
     let pos = (search_start..data.len().saturating_sub(4)).find(|&i| &data[i..i + 4] == b"V8MX")?;
     let mut end = data.len();
@@ -268,9 +281,13 @@ fn read_v8mx_trailer(data: &[u8], index: &[fao_v1::FaoFrameEntry]) -> Option<Vec
 /// fao_app's `read_block_dict`: the dictionary trailer is `FAOBKD01` + u32 LE size + bytes,
 /// searched for after the last frame's data.
 fn read_block_dict(data: &[u8], index: &[fao_v1::FaoFrameEntry]) -> Option<fao_v1::block_dict::BlockDictionary> {
+    block_dict_from(data, frame_data_end(index).min(data.len()))
+}
+
+/// The FAOBKD01 trailer, searched for from `search_start`. Split like
+/// `v8mx_from` so both readers share one search.
+pub(crate) fn block_dict_from(data: &[u8], search_start: usize) -> Option<fao_v1::block_dict::BlockDictionary> {
     let needle = b"FAOBKD01";
-    let frame_data_end: usize = index.iter().map(|e| (e.offset + e.size as u64) as usize).max().unwrap_or(0);
-    let search_start = frame_data_end.min(data.len());
     if data.len() < 12 { return None; }
     let at = (search_start..data.len().saturating_sub(needle.len()))
         .find(|&i| &data[i..i + needle.len()] == needle)? + needle.len();

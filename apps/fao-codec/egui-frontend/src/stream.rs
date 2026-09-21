@@ -128,6 +128,64 @@ impl<R: Read + Seek> FaoReader<R> {
     }
 }
 
+/// Bytes read BEFORE the end of frame data when fetching the trailer.
+///
+/// `decode::v8mx_from` reads a length prefix from the 4 bytes BEFORE the
+/// `V8MX` magic. A tail starting exactly at the end of frame data would put a
+/// trailer that begins there at position 0, skip that check, and disagree with
+/// the in-memory reader -- which reads the last 4 bytes of the final frame. So
+/// the tail starts 4 bytes early and the search starts 4 bytes in: both readers
+/// then see identical bytes around the needle.
+pub const TRAILER_LEAD: u64 = 4;
+
+/// A trailer larger than this is not a trailer but a corrupt index pointing
+/// early into the file; refused rather than read.
+pub const MAX_TRAILER: u64 = 512 * 1024 * 1024;
+
+impl<R: Read + Seek> FaoReader<R> {
+    /// Everything after the last frame, plus `TRAILER_LEAD` bytes before it.
+    /// Returns the bytes and where in them the search should start.
+    ///
+    /// The end of frame data is the LAST index entry's end -- one 16-byte read.
+    /// The in-memory reader takes the max over EVERY entry, which for a 600-hour
+    /// file is 2 GB of index to find one boundary. The last entry is the max for
+    /// any file `write_fao_container` produced: it assigns offsets starting after
+    /// the index and only ever adding, and writes index and frames in that order.
+    pub fn trailer(&mut self) -> io::Result<(Vec<u8>, usize)> {
+        if self.frame_count == 0 {
+            return Ok((Vec::new(), 0));
+        }
+        let last = self.entry(self.frame_count - 1)?;
+        let frames_end = last.offset.saturating_add(last.size as u64);
+        let file_end = self.src.seek(SeekFrom::End(0))?;
+        if frames_end >= file_end {
+            return Ok((Vec::new(), 0));
+        }
+        let lead = TRAILER_LEAD.min(frames_end);
+        let start = frames_end - lead;
+        let len = file_end - start;
+        if len > MAX_TRAILER {
+            return Err(bad("trailer region implausibly large -- corrupt index?"));
+        }
+        let mut buf = vec![0u8; len as usize];
+        self.src.seek(SeekFrom::Start(start))?;
+        self.src.read_exact(&mut buf)?;
+        Ok((buf, lead as usize))
+    }
+
+    /// The block dictionary, via the SAME search the in-memory reader uses.
+    pub fn block_dict(&mut self) -> io::Result<Option<fao_v1::block_dict::BlockDictionary>> {
+        let (tail, from) = self.trailer()?;
+        Ok(crate::decode::block_dict_from(&tail, from))
+    }
+
+    /// The V8MX webs, via the SAME search the in-memory reader uses.
+    pub fn v8mx(&mut self) -> io::Result<Option<Vec<fao_v1::v8_reconstruction_codec::DecodedWeb>>> {
+        let (tail, from) = self.trailer()?;
+        Ok(crate::decode::v8mx_from(&tail, from))
+    }
+}
+
 /// Presentation time of frame `i`, in milliseconds, without overflow.
 ///
 /// THE 596.5-HOUR TRAP. A signed 32-bit millisecond count overflows at
@@ -233,6 +291,58 @@ mod tests {
         assert_eq!(r.entry(last).unwrap().offset, far, "the u64 offset survived");
         assert_eq!(r.payload(last).unwrap(), payload);
         assert!(r.src.biggest_read <= 64, "read {} bytes at once from a 5 TB file", r.src.biggest_read);
+    }
+
+    /// A file carrying a real FAOBKD01 block dictionary trailer.
+    fn file_with_dict() -> (Vec<u8>, Vec<Vec<u8>>) {
+        let (w, h) = (32usize, 16usize);
+        let mut bytes = crate::export::write_dct_fao(&frames(2, w, h), w, h, 30.0, 80).unwrap();
+        let mut dict = fao_v1::block_dict::BlockDictionary::new();
+        let blocks: Vec<Vec<u8>> = (0..5u8).map(|k| vec![k; 64]).collect();
+        for b in &blocks { dict.intern(b.clone()); }
+        let payload = dict.to_bytes();
+        bytes.extend_from_slice(b"FAOBKD01");
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        (bytes, blocks)
+    }
+
+    /// The streaming reader finds the SAME dictionary the in-memory one does,
+    /// with the same blocks in it.
+    #[test]
+    fn the_block_dictionary_is_found_without_the_whole_file() {
+        let (bytes, blocks) = file_with_dict();
+        let mem = crate::decode::FaoFile::parse(bytes.clone()).unwrap();
+        assert!(mem.has_block_dict(), "fixture must actually carry a dictionary");
+        let mut r = FaoReader::open(Cursor::new(bytes)).unwrap();
+        let d = r.block_dict().unwrap().expect("found by streaming");
+        for (id, b) in blocks.iter().enumerate() {
+            assert_eq!(d.get(id as u32), Some(b.as_slice()), "block {id}");
+        }
+    }
+
+    /// No trailer: both readers agree there is nothing.
+    #[test]
+    fn a_file_without_a_trailer_has_none() {
+        let (w, h) = (32usize, 16usize);
+        let bytes = crate::export::write_dct_fao(&frames(2, w, h), w, h, 30.0, 80).unwrap();
+        let mem = crate::decode::FaoFile::parse(bytes.clone()).unwrap();
+        let mut r = FaoReader::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(mem.has_block_dict(), r.block_dict().unwrap().is_some());
+        assert!(r.v8mx().unwrap().is_none());
+    }
+
+    /// The tail includes the 4 bytes before frame data ends, so V8MX's
+    /// length-prefix check sees what the in-memory reader sees.
+    #[test]
+    fn the_trailer_starts_four_bytes_early() {
+        let (bytes, _) = file_with_dict();
+        let mut r = FaoReader::open(Cursor::new(bytes.clone())).unwrap();
+        let last = r.entry(r.frame_count - 1).unwrap();
+        let frames_end = (last.offset + last.size as u64) as usize;
+        let (tail, from) = r.trailer().unwrap();
+        assert_eq!(from, TRAILER_LEAD as usize);
+        assert_eq!(&tail[..], &bytes[frames_end - 4..], "tail = the 4 lead bytes + everything after");
     }
 
     #[test]
