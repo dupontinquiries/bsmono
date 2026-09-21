@@ -15,7 +15,7 @@
 //! that said WHEN, and the motion that said WHICH.
 
 use studio_core::{GroupId, Op, Project, Ticks, TrackId};
-use studio_video::signals::{self, Candidate, Mark, Prefer, Signal};
+use studio_video::signals::{self, AngleInput, Candidate, Mark, Prefer, Signal};
 
 pub const HOP: f64 = 0.02;
 
@@ -48,15 +48,17 @@ pub fn marks(project: &Project, start: Ticks, end: Ticks) -> Vec<Mark> {
 
 /// The cut, as ops: a new video track with a clip per shot, and a marker at
 /// every cut naming why. Applied as one `Op::Group`.
-pub fn plan_ops(project: &Project, group: GroupId, cands: &[Candidate], angle_motion: &[Signal],
+pub fn plan_ops(project: &Project, group: GroupId, cands: &[Candidate], inputs: &[AngleInput],
                 prefer: Prefer, no_repeat: bool) -> Result<(Vec<Op>, usize, Vec<String>), String> {
     let (angles, start, end) = studio_video::multicam::from_group(project, group)?;
     let span = (end.0 - start.0) as f64 / studio_core::TICKS_PER_SECOND as f64;
     let cut_list: Vec<&Candidate> = cands.iter().filter(|c| c.at > 0.0 && c.at < span).collect();
     let times: Vec<f64> = cut_list.iter().map(|c| c.at).collect();
-    // without a lane per angle there is nothing to choose BY: take turns
-    let prefer = if angle_motion.len() < angles.len() { Prefer::RoundRobin } else { prefer };
-    let chosen = signals::choose_angles(&times, span, angle_motion, prefer, no_repeat);
+    // only inputs with a lane for every angle, and some weight, can choose;
+    // with none there is nothing to choose BY: take turns
+    let usable: Vec<AngleInput> = inputs.iter().filter(|i| i.per_angle.len() >= angles.len() && i.weight > 0.0).cloned().collect();
+    let prefer = if usable.is_empty() { Prefer::RoundRobin } else { prefer };
+    let chosen = signals::choose_angles(&times, span, &usable, prefer, no_repeat);
     let shots: Vec<studio_video::multicam::Shot> = chosen.iter()
         .map(|(a, b, k, _)| studio_video::multicam::Shot { angle: (*k).min(angles.len() - 1), start: *a, end: *b }).collect();
     let track = TrackId(project.tracks.iter().map(|t| t.id.0).max().unwrap_or(0) + 1);
@@ -87,8 +89,8 @@ pub struct Panel {
     pub min_gap: f64,
     /// The last plan, one line per cut: when (the lanes) and which (the angle).
     pub planned: Vec<String>,
-    /// One performer-motion lane per angle, in the group's angle order.
-    pub angle_motion: Vec<Signal>,
+    /// Per-angle inputs for WHICH angle: performer motion, who is heard.
+    pub angle_inputs: Vec<AngleInput>,
     pub prefer: Prefer,
     pub no_repeat: bool,
 }
@@ -122,15 +124,24 @@ impl Panel {
             ui.add(egui::Slider::new(&mut self.threshold, 0.05..=0.9).text("threshold"));
             ui.add(egui::Slider::new(&mut self.min_gap, 0.3..=6.0).text("min gap s"));
         });
+        ui.separator();
         ui.horizontal(|ui| {
-            ui.label("angle:");
+            ui.label("which angle:");
             ui.selectable_value(&mut self.prefer, Prefer::RoundRobin, "take turns");
-            ui.add_enabled_ui(!self.angle_motion.is_empty(), |ui| {
-                ui.selectable_value(&mut self.prefer, Prefer::MostMotion, "follow the action");
-                ui.selectable_value(&mut self.prefer, Prefer::LeastMotion, "calmest");
+            ui.add_enabled_ui(!self.angle_inputs.is_empty(), |ui| {
+                ui.selectable_value(&mut self.prefer, Prefer::MostMotion, "highest score");
+                ui.selectable_value(&mut self.prefer, Prefer::LeastMotion, "lowest score");
             });
             ui.checkbox(&mut self.no_repeat, "never cut to the angle on screen");
         });
+        if self.prefer != Prefer::RoundRobin {
+            for inp in self.angle_inputs.iter_mut() {
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 18.0], egui::Label::new(format!("follow {}", inp.name)));
+                    ui.add(egui::Slider::new(&mut inp.weight, 0.0..=3.0).text("weight"));
+                });
+            }
+        }
         let preview = signals::candidates(&self.lanes, &self.marks, self.span, HOP, self.threshold, self.min_gap);
         ui.label(format!("{} cut(s) at these settings", preview.len()));
         if ui.button("plan cuts on a new track").clicked() { go = Some(preview.clone()); }
@@ -172,7 +183,8 @@ mod tests {
         let a2 = Signal::new("motion: a2", HOP, (0..n).map(|i| if (i as f64 * HOP) < 4.0 { 0.1 } else { 0.9 }).collect());
         let kicks = signals::pulses("kick", &[2.0, 4.0, 6.0], 8.0, HOP, 0.1);
         let cands = signals::candidates(&[kicks], &[], 8.0, HOP, 0.3, 0.5);
-        let (ops, _, lines) = plan_ops(&p, g, &cands, &[a1, a2], Prefer::MostMotion, false).unwrap();
+        let motion = AngleInput { name: "motion".into(), per_angle: vec![a1, a2], weight: 1.0 };
+        let (ops, _, lines) = plan_ops(&p, g, &cands, &[motion], Prefer::MostMotion, false).unwrap();
         assert!(lines.iter().any(|l| l.contains("->  angle 2: motion")), "the window shows WHICH as well as WHEN: {lines:?}");
         p.apply(&Op::Group { ops }).unwrap();
         let cut_track = p.tracks.last().unwrap().id;
@@ -180,7 +192,7 @@ mod tests {
         shots.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         assert_eq!(shots.iter().map(|s| s.1 .0).collect::<Vec<_>>(), vec![1, 1, 2, 2], "busy angle each time: {shots:?}");
         let at4 = p.markers.iter().find(|m| m.name.starts_with("why @14.00s")).expect("marker at the 4 s cut");
-        assert!(at4.name.contains("-> angle 2: motion") && at4.name.contains("*0.90"), "{}", at4.name);
+        assert!(at4.name.contains("-> angle 2: motion 0.10/*0.90"), "{}", at4.name);
         // with no motion lanes it falls back to taking turns rather than failing
         let (ops2, _, _) = plan_ops(&p, g, &cands, &[], Prefer::MostMotion, false).unwrap();
         assert!(ops2.iter().any(|o| matches!(o, Op::SetMarker { name, .. } if name.contains("(turns)"))));

@@ -178,12 +178,38 @@ pub enum Prefer {
     LeastMotion,
 }
 
+/// One kind of per-angle input -- performer motion, who is heard -- with a
+/// lane per angle (in the group's angle order) and the operator's weight.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AngleInput { pub name: String, pub per_angle: Vec<Signal>, pub weight: f32 }
+
+/// Each angle's speech loudness relative to the loudest angle at every
+/// moment, 0..1: 1 for the camera that hears the voice best, falling off by
+/// how many dB quieter the others are (`db_range` to reach 0). Whoever is
+/// speaking is loudest on the mic nearest them, so this says which angle is
+/// close to the voice without any speaker labels.
+pub fn relative_voice(envelopes_db: &[Vec<f32>], hop: f64, db_range: f32) -> Vec<Signal> {
+    let n = envelopes_db.iter().map(|e| e.len()).min().unwrap_or(0);
+    (0..envelopes_db.len()).map(|k| {
+        let v: Vec<f32> = (0..n).map(|i| {
+            let loudest = envelopes_db.iter().map(|e| e[i]).fold(f32::MIN, f32::max);
+            // silence everywhere says nothing about who is speaking
+            if loudest < -50.0 { return 0.0; }
+            (1.0 - (loudest - envelopes_db[k][i]) / db_range.max(0.1)).clamp(0.0, 1.0)
+        }).collect();
+        Signal::new(&format!("voice: angle {}", k + 1), hop, v)
+    }).collect()
+}
+
 /// Choose an angle for each shot between consecutive cut times over
-/// [0, length), from one motion lane per angle. With `no_repeat`, a cut never
-/// lands on the angle already on screen -- a cut to the same angle is a jump
-/// cut. Each choice comes with its reason.
-pub fn choose_angles(cuts: &[f64], length: f64, angle_motion: &[Signal], prefer: Prefer, no_repeat: bool) -> Vec<(f64, f64, usize, String)> {
-    let n = angle_motion.len().max(1);
+/// [0, length). Each angle's score over the coming shot is the weighted mean
+/// of its inputs (motion, voice, ...); the rule takes the highest, the lowest,
+/// or turns. With `no_repeat`, a cut never lands on the angle already on
+/// screen -- a cut to the same angle is a jump cut. Each choice comes with its
+/// reason, naming every input's part and saying when no-repeat decided it.
+pub fn choose_angles(cuts: &[f64], length: f64, inputs: &[AngleInput], prefer: Prefer, no_repeat: bool) -> Vec<(f64, f64, usize, String)> {
+    let n = inputs.iter().map(|i| i.per_angle.len()).max().unwrap_or(1).max(1);
+    let total_w: f32 = inputs.iter().map(|i| i.weight.max(0.0)).sum::<f32>().max(1e-6);
     let mut bounds = vec![0.0];
     bounds.extend(cuts.iter().copied().filter(|t| *t > 0.0 && *t < length));
     bounds.push(length);
@@ -191,30 +217,34 @@ pub fn choose_angles(cuts: &[f64], length: f64, angle_motion: &[Signal], prefer:
     let mut prev: Option<usize> = None;
     for (k, w) in bounds.windows(2).enumerate() {
         let (a, b) = (w[0], w[1]);
-        // mean motion of each angle over the shot
         let mean = |s: &Signal| {
             let steps = (((b - a) / s.hop).ceil() as usize).max(1);
             (0..steps).map(|i| s.at(a + i as f64 * s.hop)).sum::<f32>() / steps as f32
         };
-        let m: Vec<f32> = (0..n).map(|i| angle_motion.get(i).map(mean).unwrap_or(0.0)).collect();
+        // per input, per angle: the input's mean over the shot
+        let parts: Vec<Vec<f32>> = inputs.iter().map(|inp| (0..n).map(|ang| inp.per_angle.get(ang).map(mean).unwrap_or(0.0)).collect()).collect();
+        let score: Vec<f32> = (0..n).map(|ang| inputs.iter().zip(&parts).map(|(inp, p)| inp.weight.max(0.0) / total_w * p[ang]).sum()).collect();
         let allowed: Vec<usize> = (0..n).filter(|i| !(no_repeat && Some(*i) == prev && n > 1)).collect();
-        let pick = match prefer {
-            Prefer::RoundRobin => allowed.iter().copied().find(|i| *i == k % n).unwrap_or(allowed[0]),
-            Prefer::MostMotion => allowed.iter().copied().max_by(|x, y| m[*x].partial_cmp(&m[*y]).unwrap_or(std::cmp::Ordering::Equal)).unwrap(),
-            Prefer::LeastMotion => allowed.iter().copied().min_by(|x, y| m[*x].partial_cmp(&m[*y]).unwrap_or(std::cmp::Ordering::Equal)).unwrap(),
+        let best_of = |set: &[usize], most: bool| -> usize {
+            let cmp = |x: &usize, y: &usize| score[*x].partial_cmp(&score[*y]).unwrap_or(std::cmp::Ordering::Equal);
+            if most { *set.iter().max_by(|x, y| cmp(x, y)).unwrap() } else { *set.iter().min_by(|x, y| cmp(x, y)).unwrap() }
         };
-        // the angle the rule would have taken with no restriction: if the pick
-        // differs, the no-repeat rule decided it, and the reason says so
-        let unrestricted = match prefer {
-            Prefer::MostMotion => (0..n).max_by(|x, y| m[*x].partial_cmp(&m[*y]).unwrap_or(std::cmp::Ordering::Equal)),
-            Prefer::LeastMotion => (0..n).min_by(|x, y| m[*x].partial_cmp(&m[*y]).unwrap_or(std::cmp::Ordering::Equal)),
-            Prefer::RoundRobin => Some(pick),
+        let all: Vec<usize> = (0..n).collect();
+        let (pick, unrestricted) = match prefer {
+            Prefer::RoundRobin => { let p = allowed.iter().copied().find(|i| *i == k % n).unwrap_or(allowed[0]); (p, p) }
+            Prefer::MostMotion => (best_of(&allowed, true), best_of(&all, true)),
+            Prefer::LeastMotion => (best_of(&allowed, false), best_of(&all, false)),
         };
         let why = match prefer {
             Prefer::RoundRobin => format!("angle {} (turns)", pick + 1),
-            _ => format!("angle {}: motion {}{}", pick + 1,
-                         m.iter().enumerate().map(|(i, v)| format!("{}{:.2}", if i == pick { "*" } else { "" }, v)).collect::<Vec<_>>().join(" vs "),
-                         if unrestricted != Some(pick) { " (the pick was already on screen)" } else { "" }),
+            _ => {
+                let detail = inputs.iter().zip(&parts).filter(|(inp, _)| inp.weight > 0.0)
+                    .map(|(inp, p)| format!("{} {}", inp.name, p.iter().enumerate()
+                        .map(|(i, v)| format!("{}{:.2}", if i == pick { "*" } else { "" }, v)).collect::<Vec<_>>().join("/")))
+                    .collect::<Vec<_>>().join(", ");
+                format!("angle {}: {detail}{}", pick + 1,
+                        if unrestricted != pick { " (the pick was already on screen)" } else { "" })
+            }
         };
         out.push((a, b, pick, why));
         prev = Some(pick);
@@ -270,10 +300,10 @@ mod tests {
         let n = (8.0 / HOP) as usize;
         let a1 = Signal::new("motion: a1", HOP, (0..n).map(|i| if (i as f64 * HOP) < 4.0 { 0.9 } else { 0.1 }).collect());
         let a2 = Signal::new("motion: a2", HOP, (0..n).map(|i| if (i as f64 * HOP) < 4.0 { 0.1 } else { 0.8 }).collect());
-        let lanes = [a1, a2];
+        let lanes = [AngleInput { name: "motion".into(), per_angle: vec![a1, a2], weight: 1.0 }];
         let shots = choose_angles(&[2.0, 4.0, 6.0], 8.0, &lanes, Prefer::MostMotion, false);
         assert_eq!(shots.iter().map(|s| s.2).collect::<Vec<_>>(), vec![0, 0, 1, 1], "follows the action");
-        assert!(shots[2].3.contains("*0.80"), "and says why: {}", shots[2].3);
+        assert!(shots[2].3.contains("motion 0.10/*0.80"), "and says why: {}", shots[2].3);
         let calm = choose_angles(&[2.0, 4.0, 6.0], 8.0, &lanes, Prefer::LeastMotion, false);
         assert_eq!(calm.iter().map(|s| s.2).collect::<Vec<_>>(), vec![1, 1, 0, 0]);
         // no repeats: a cut never lands on the angle already showing
@@ -284,6 +314,32 @@ mod tests {
         let rr = choose_angles(&[2.0, 4.0, 6.0], 8.0, &lanes, Prefer::RoundRobin, true);
         assert_eq!(rr.iter().map(|s| s.2).collect::<Vec<_>>(), vec![0, 1, 0, 1]);
         assert_eq!((shots[0].0, shots.last().unwrap().1), (0.0, 8.0), "the shots cover the span");
+    }
+
+    #[test]
+    fn the_angle_nearest_the_voice_wins_when_voice_is_weighted() {
+        // two mics: angle 1's is 12 dB louder in the first half (its actor is
+        // speaking), angle 2's in the second half
+        let n = (8.0 / HOP) as usize;
+        let e1: Vec<f32> = (0..n).map(|i| if (i as f64 * HOP) < 4.0 { -12.0 } else { -24.0 }).collect();
+        let e2: Vec<f32> = (0..n).map(|i| if (i as f64 * HOP) < 4.0 { -24.0 } else { -12.0 }).collect();
+        let voice = relative_voice(&[e1, e2], HOP, 12.0);
+        assert!((voice[0].at(1.0) - 1.0).abs() < 1e-6 && voice[1].at(1.0) < 0.01, "the loudest mic reads 1, 12 dB down reads 0");
+        // motion says the opposite (angle 2 busy early): the weights decide who wins
+        let m1 = Signal::new("m1", HOP, (0..n).map(|i| if (i as f64 * HOP) < 4.0 { 0.1 } else { 0.9 }).collect());
+        let m2 = Signal::new("m2", HOP, (0..n).map(|i| if (i as f64 * HOP) < 4.0 { 0.9 } else { 0.1 }).collect());
+        let inputs = |wm: f32, wv: f32| vec![
+            AngleInput { name: "motion".into(), per_angle: vec![m1.clone(), m2.clone()], weight: wm },
+            AngleInput { name: "voice".into(), per_angle: voice.clone(), weight: wv },
+        ];
+        let by_voice = choose_angles(&[4.0], 8.0, &inputs(0.2, 1.0), Prefer::MostMotion, false);
+        assert_eq!(by_voice.iter().map(|s| s.2).collect::<Vec<_>>(), vec![0, 1], "follow the voice: {:?}", by_voice);
+        assert!(by_voice[0].3.contains("voice *1.00/0.00"), "{}", by_voice[0].3);
+        let by_motion = choose_angles(&[4.0], 8.0, &inputs(1.0, 0.2), Prefer::MostMotion, false);
+        assert_eq!(by_motion.iter().map(|s| s.2).collect::<Vec<_>>(), vec![1, 0], "follow the action instead");
+        // silence everywhere is no evidence
+        let quiet = relative_voice(&[vec![-70.0; 10], vec![-65.0; 10]], HOP, 12.0);
+        assert!(quiet.iter().all(|s| s.values.iter().all(|v| *v == 0.0)));
     }
 
     #[test]

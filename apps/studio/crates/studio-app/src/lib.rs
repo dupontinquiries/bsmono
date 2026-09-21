@@ -7225,14 +7225,39 @@ impl App {
             angle_motion.push(signals::Signal::new(&format!("motion: angle {}", k + 1), 1.0 / MFPS,
                 m.iter().map(|v| (v / top).min(1.0)).collect()));
         }
+        let mut angle_inputs = Vec::new();
         if angle_motion.len() == angles.len() && !angle_motion.is_empty() {
             let n = angle_motion.iter().map(|s| s.values.len()).min().unwrap_or(0);
             let any: Vec<f32> = (0..n).map(|i| angle_motion.iter().map(|s| s.values[i]).fold(0.0, f32::max)).collect();
             let mut lane = signals::Signal::new("motion (any angle)", 1.0 / MFPS, any);
             lane.weight = 0.5;   // on, but a soft tendency -- as measured
             lanes.push(lane);
-        } else {
-            angle_motion.clear();
+            angle_inputs.push(signals::AngleInput { name: "motion".into(), per_angle: angle_motion, weight: 1.0 });
+        }
+        // who is heard: each angle's OWN mic in the speech band, relative to the
+        // loudest -- whoever speaks is loudest on the camera nearest them
+        let mut envs = Vec::new();
+        for a in &angles {
+            let Some(au) = self.audio.get(&a.source) else { break };
+            let sr = au.sample_rate as f64;
+            let from = ((start.to_seconds() + a.offset).max(0.0) * sr) as usize;
+            let to = (from as f64 + span * sr) as usize;
+            let chans = au.channels.len().max(1);
+            let mono: Vec<f32> = (from..to.min(au.channels.first().map(|c| c.len()).unwrap_or(0)))
+                .map(|i| au.channels.iter().map(|c| c[i]).sum::<f32>() / chans as f32).collect();
+            // speech band: one-pole high-pass at 300 Hz, low-pass at 3 kHz
+            let (ah, al) = ((-std::f64::consts::TAU * 300.0 / sr).exp() as f32, (-std::f64::consts::TAU * 3000.0 / sr).exp() as f32);
+            let (mut hy, mut hx, mut ly) = (0.0f32, 0.0f32, 0.0f32);
+            let band: Vec<f32> = mono.iter().map(|&x| { hy = ah * (hy + x - hx); hx = x; ly = (1.0 - al) * hy + al * ly; ly }).collect();
+            let hop = (sr / MFPS) as usize;
+            envs.push(band.chunks(hop.max(1)).map(|c| {
+                let rms = (c.iter().map(|v| v * v).sum::<f32>() / c.len() as f32).sqrt();
+                20.0 * rms.max(1e-6).log10()
+            }).collect::<Vec<f32>>());
+        }
+        if envs.len() == angles.len() && !envs.is_empty() {
+            angle_inputs.push(signals::AngleInput { name: "voice".into(),
+                per_angle: signals::relative_voice(&envs, 1.0 / MFPS, 12.0), weight: 0.0 });
         }
         // checked AFTER the motion lanes: a first version gave up here before
         // building them, so pictures with no audio never got their motion lane
@@ -7241,9 +7266,9 @@ impl App {
             return;
         }
         let marks = signals_panel::marks(project, start, end);
-        let prefer = if angle_motion.is_empty() { signals::Prefer::RoundRobin } else { signals::Prefer::MostMotion };
+        let prefer = if angle_inputs.is_empty() { signals::Prefer::RoundRobin } else { signals::Prefer::MostMotion };
         self.signals_panel = Some(signals_panel::Panel { group, lanes, marks, span, threshold: 0.35, min_gap: 1.5,
-            planned: Vec::new(), angle_motion, prefer, no_repeat: true });
+            planned: Vec::new(), angle_inputs, prefer, no_repeat: true });
     }
 
     fn signals_window(&mut self, ctx: &egui::Context) {
@@ -7252,7 +7277,7 @@ impl App {
         let mut go = None;
         egui::Window::new("Signals — when to cut").open(&mut open).default_width(560.0).show(ctx, |ui| { go = p.show(ui); });
         if let Some(cands) = go {
-            match signals_panel::plan_ops(&self.studio.session.doc.project, p.group, &cands, &p.angle_motion, p.prefer, p.no_repeat) {
+            match signals_panel::plan_ops(&self.studio.session.doc.project, p.group, &cands, &p.angle_inputs, p.prefer, p.no_repeat) {
                 Ok((ops, shots, lines)) => {
                     self.studio.edit_group(ops, "multicam by signals");
                     self.studio.status = format!("{shots} shot(s) on a new track, a 'why' marker at each cut");
