@@ -28,6 +28,9 @@ pub enum PointerOut {
     Motion { dx: f32, dy: f32 },
     Button { button: Button, pressed: bool },
     Scroll { dx: f32, dy: f32 },
+    /// Absolute position in screen-logical px (fat cursor mode: the shell
+    /// owns the position, see `cursor`).
+    Absolute { x: f32, y: f32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

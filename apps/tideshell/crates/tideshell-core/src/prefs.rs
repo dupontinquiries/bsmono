@@ -36,6 +36,9 @@ pub struct ShellPrefs {
     pub switcher_style: Style,
     pub hold_ms: u64,
     pub trackpad_speed: f32,
+    /// iPadOS-style eased disc instead of the system cursor while the
+    /// trackpad drives the pointer.
+    pub fat_cursor: bool,
 }
 
 impl Default for ShellPrefs {
@@ -47,12 +50,20 @@ impl Default for ShellPrefs {
             switcher_style: Style::Grid,
             hold_ms: 420,
             trackpad_speed: 1.0,
+            fat_cursor: false,
         }
     }
 }
 
-pub const KEYS: [&str; 6] =
-    ["shell.layout", "shell.bar.widgets", "shell.bar.width", "shell.switcher.style", "shell.hold_ms", "shell.trackpad.speed"];
+pub const KEYS: [&str; 7] = [
+    "shell.layout",
+    "shell.bar.widgets",
+    "shell.bar.width",
+    "shell.switcher.style",
+    "shell.hold_ms",
+    "shell.trackpad.speed",
+    "shell.cursor",
+];
 
 impl ShellPrefs {
     pub fn to_kv(&self) -> Vec<(String, String)> {
@@ -70,6 +81,7 @@ impl ShellPrefs {
             ),
             ("shell.hold_ms".into(), self.hold_ms.to_string()),
             ("shell.trackpad.speed".into(), format!("{}", self.trackpad_speed)),
+            ("shell.cursor".into(), if self.fat_cursor { "fat" } else { "normal" }.into()),
         ]
     }
 
@@ -106,6 +118,13 @@ impl ShellPrefs {
             }
             "shell.hold_ms" => self.hold_ms = parse_range(key, v, 200.0, 1500.0)? as u64,
             "shell.trackpad.speed" => self.trackpad_speed = parse_range(key, v, 0.25, 4.0)?,
+            "shell.cursor" => {
+                self.fat_cursor = match v {
+                    "fat" => true,
+                    "normal" => false,
+                    _ => return Err(format!("shell.cursor: '{v}' is not normal|fat")),
+                }
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -144,6 +163,7 @@ mod tests {
         p.layout = Layout::RightBar;
         p.switcher_style = Style::Deck;
         p.bar_width = 80.0;
+        p.fat_cursor = true;
         p.bar_widgets = bar::parse_widgets("clock,toggle:trackpad,app:org.gnome.Console").0;
         let kv = p.to_kv();
         assert_eq!(kv.len(), KEYS.len());

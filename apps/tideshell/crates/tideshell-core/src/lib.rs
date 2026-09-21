@@ -25,6 +25,7 @@
 pub mod bar;
 pub mod carousel;
 pub mod control_center;
+pub mod cursor;
 pub mod edge;
 pub mod hold;
 pub mod prefs;
@@ -85,4 +86,7 @@ pub enum Action {
     SetSlider(control_center::SliderKind, f32),
     /// Prefs changed; persist `ShellPrefs::to_kv()` through settingsd.
     SavePrefs,
+    /// Hide (or restore) the compositor-drawn cursor while the fat cursor is
+    /// drawn instead. cosmic-comp: its live `cursor_hide_timeout` config.
+    HideSystemCursor(bool),
 }

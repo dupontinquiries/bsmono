@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use crate::bar::BarWidget;
 use crate::carousel::Carousel;
 use crate::control_center::{ControlCenter, QuickKind, SliderKind};
+use crate::cursor::FatCursor;
 use crate::edge::{GestureEvent, Recognizer, SwipeUpTarget};
 use crate::hold::{HoldMenu, HoldOption};
 use crate::prefs::{Layout, ShellPrefs};
@@ -34,6 +35,8 @@ pub struct Shell {
     pub hold: Option<HoldMenu>,
     pub trackpad: Trackpad,
     pub modes: Modes,
+    /// The fat cursor, present while it is in charge of the pointer.
+    pub fat: Option<FatCursor>,
     /// Right-bar layout: collapsed rail vs expanded (right-edge swipe toggles).
     pub bar_expanded: bool,
     /// Live swipe-up progress for the preview (0 when not swiping).
@@ -62,6 +65,7 @@ impl Shell {
             hold: None,
             trackpad,
             modes: Modes::default(),
+            fat: None,
             bar_expanded: false,
             swipe_up: 0.0,
             peek_dx: 0.0,
@@ -109,6 +113,28 @@ impl Shell {
     pub fn set_screen(&mut self, screen: (f32, f32)) {
         self.screen = screen;
         self.recognizer.set_screen(screen);
+        if let Some(f) = &mut self.fat {
+            f.set_screen(screen);
+        }
+    }
+
+    /// Start or stop the fat cursor to match (trackpad on && pref), and hide
+    /// or restore the system cursor with it.
+    fn sync_fat(&mut self) -> Vec<Action> {
+        let want = self.modes.trackpad && self.prefs.fat_cursor;
+        match (want, self.fat.is_some()) {
+            (true, false) => {
+                self.fat = Some(FatCursor::new(self.screen, self.now));
+                self.log("fat cursor on");
+                vec![Action::HideSystemCursor(true)]
+            }
+            (false, true) => {
+                self.fat = None;
+                self.log("fat cursor off");
+                vec![Action::HideSystemCursor(false)]
+            }
+            _ => vec![],
+        }
     }
 
     pub fn set_prefs(&mut self, prefs: ShellPrefs) -> Vec<Action> {
@@ -121,7 +147,9 @@ impl Shell {
         self.switcher.style = prefs.switcher_style;
         self.trackpad.speed = prefs.trackpad_speed;
         self.prefs = prefs;
-        self.emit(vec![Action::SavePrefs])
+        let mut out = vec![Action::SavePrefs];
+        out.extend(self.sync_fat());
+        self.emit(out)
     }
 
     pub fn windows(&self) -> &[WindowCard] {
@@ -180,6 +208,10 @@ impl Shell {
         let events = self.recognizer.tick(now);
         self.drain_recognizer_log();
         let mut out = vec![];
+        // The fat cursor's eased position IS the pointer: send it as it moves.
+        if let Some(p) = self.fat.as_mut().and_then(|f| f.tick(now, dt)) {
+            out.push(Action::Pointer(crate::trackpad::PointerOut::Absolute { x: p.0, y: p.1 }));
+        }
         for g in events {
             out.extend(self.on_gesture(g));
         }
@@ -293,6 +325,7 @@ impl Shell {
                 if !self.modes.trackpad {
                     v.extend(self.trackpad.cancel().into_iter().map(Action::Pointer));
                 }
+                v.extend(self.sync_fat());
                 v
             }
         };
@@ -367,6 +400,9 @@ impl Shell {
 
     /// A touch on the trackpad overlay.
     pub fn on_trackpad_touch(&mut self, ev: TouchEvent) -> Vec<Action> {
+        if let TouchEvent::Down { t, .. } | TouchEvent::Move { t, .. } | TouchEvent::Up { t, .. } = ev {
+            self.now = self.now.max(t);
+        }
         let outs = match ev {
             TouchEvent::Down { slot, x, y, t } => self.trackpad.down(slot, x, y, t),
             TouchEvent::Move { slot, x, y, t } => self.trackpad.motion(slot, x, y, t),
@@ -374,7 +410,23 @@ impl Shell {
             TouchEvent::Cancel => self.trackpad.cancel(),
         };
         // Not logged: motion would flood the trace. Clicks are logged.
-        let out: Vec<Action> = outs.into_iter().map(Action::Pointer).collect();
+        let now = self.now;
+        let out: Vec<Action> = outs
+            .into_iter()
+            .filter_map(|o| match (&mut self.fat, o) {
+                // Fat mode: motion moves the disc's target; the pointer follows
+                // the eased disc from tick(), so nothing is sent here.
+                (Some(f), crate::trackpad::PointerOut::Motion { dx, dy }) => {
+                    f.nudge(dx, dy, now);
+                    None
+                }
+                (Some(f), b @ crate::trackpad::PointerOut::Button { pressed, .. }) => {
+                    f.press(pressed, now);
+                    Some(Action::Pointer(b))
+                }
+                (_, o) => Some(Action::Pointer(o)),
+            })
+            .collect();
         for a in &out {
             if matches!(a, Action::Pointer(crate::trackpad::PointerOut::Button { .. })) {
                 self.log(format!("-> {a:?}"));
@@ -532,6 +584,59 @@ mod tests {
             sh.tick(10_000 + i);
         }
         assert_eq!(sh.trace().count(), TRACE_CAP);
+    }
+
+    #[test]
+    fn fat_cursor_owns_the_pointer_while_trackpad_is_on() {
+        use crate::trackpad::PointerOut;
+        let mut p = ShellPrefs::default();
+        p.fat_cursor = true;
+        let mut sh = Shell::new(p, S);
+        let out = sh.toggle_mode(HoldOption::Trackpad);
+        assert!(out.contains(&Action::HideSystemCursor(true)), "{out:?}");
+        // First tick places the pointer at the disc (screen centre).
+        let t = sh.tick(10);
+        assert_eq!(t, vec![Action::Pointer(PointerOut::Absolute { x: 204.0, y: 450.0 })]);
+        // A drag on the pad sends NO relative motion...
+        sh.on_trackpad_touch(TouchEvent::Down { slot: 0, x: 100.0, y: 700.0, t: 20 });
+        let m = sh.on_trackpad_touch(TouchEvent::Move { slot: 0, x: 140.0, y: 700.0, t: 36 });
+        assert!(m.is_empty(), "fat mode must not send relative motion: {m:?}");
+        // ...the pointer follows the eased disc on ticks instead, moving right.
+        let mut xs = vec![];
+        for i in 1..=20 {
+            for a in sh.tick(36 + 16 * i) {
+                if let Action::Pointer(PointerOut::Absolute { x, .. }) = a {
+                    xs.push(x);
+                }
+            }
+        }
+        assert!(xs.len() >= 3 && xs.windows(2).all(|w| w[1] > w[0]), "{xs:?}");
+        assert!(*xs.last().unwrap() > 230.0);
+        let off = sh.toggle_mode(HoldOption::Trackpad);
+        assert!(off.contains(&Action::HideSystemCursor(false)));
+        assert!(sh.fat.is_none());
+    }
+
+    #[test]
+    fn normal_cursor_mode_keeps_relative_motion_and_never_hides() {
+        let mut sh = Shell::new(ShellPrefs::default(), S);
+        let out = sh.toggle_mode(HoldOption::Trackpad);
+        assert!(!out.iter().any(|a| matches!(a, Action::HideSystemCursor(_))));
+        sh.on_trackpad_touch(TouchEvent::Down { slot: 0, x: 100.0, y: 700.0, t: 20 });
+        let m = sh.on_trackpad_touch(TouchEvent::Move { slot: 0, x: 140.0, y: 700.0, t: 36 });
+        assert!(matches!(m[..], [Action::Pointer(crate::trackpad::PointerOut::Motion { .. })]), "{m:?}");
+    }
+
+    #[test]
+    fn toggling_the_pref_while_trackpad_is_on_switches_live() {
+        let mut sh = Shell::new(ShellPrefs::default(), S);
+        sh.toggle_mode(HoldOption::Trackpad);
+        let mut p = sh.prefs.clone();
+        p.fat_cursor = true;
+        assert!(sh.set_prefs(p).contains(&Action::HideSystemCursor(true)));
+        let mut p = sh.prefs.clone();
+        p.fat_cursor = false;
+        assert!(sh.set_prefs(p).contains(&Action::HideSystemCursor(false)));
     }
 
     #[test]
