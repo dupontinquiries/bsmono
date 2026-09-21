@@ -86,6 +86,9 @@ pub enum ShellVerb {
     /// dialog. A shell verb: it has to ask the desktop for a folder, which
     /// is not something an `Op` can do.
     RelinkToFolder,
+    /// Redraw every waveform from one band of the spectrum. A shell verb:
+    /// the peaks are the shell's, built from decoded audio it owns.
+    PeakBand(studio_audio::Band),
     TouchUpStabilize(StabilizeKind),
     /// Clean-plate the selected clip: remove something that crosses it,
     /// using `radius` frames each side. `moving` warps the neighbours onto
@@ -221,6 +224,8 @@ pub enum Ask {
     StabilizeFlavor,
     /// Which camera group to watch as a grid.
     MultiviewGroup,
+    /// Which part of the spectrum the waveforms should show.
+    PeakBandChoice,
     /// Whether the camera moves during the shot being cleaned, then how many
     /// frames each side to look at.
     CleanPlateCamera,
@@ -294,6 +299,9 @@ pub fn root() -> Vec<Choice> {
         // Markers: the one request both the FL Studio and kdenlive
         // communities make in the same words.
         c("drop a marker here", None, Then::Do(Act::Shell(ShellVerb::MarkerHere))),
+        c("waveforms: show one band of the spectrum",
+          Some("see the low end under a voice, or the sibilance over it"),
+          Then::Ask(Ask::PeakBandChoice)),
         c("relink media to a folder (proxies → originals)",
           Some("only the paths move; every cut stays where it is"),
           Then::Do(Act::Shell(ShellVerb::RelinkToFolder))),
@@ -595,6 +603,16 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
                 }
             }).collect()
         }
+        Ask::PeakBandChoice => [
+            (studio_audio::Band::Full, "everything (the usual waveform)"),
+            (studio_audio::Band::Low, "low — kick, bass, rumble, room"),
+            (studio_audio::Band::Mid, "mid — voices and most instruments"),
+            (studio_audio::Band::High, "high — consonants, cymbals, air"),
+        ].into_iter().map(|(b, what)| Choice {
+            label: b.label().to_string(),
+            hint: Some(what.into()),
+            then: Then::Do(Act::Shell(ShellVerb::PeakBand(b))),
+        }).collect(),
         Ask::MultiviewGroup => {
             let mut out: Vec<Choice> = project.groups.iter()
                 .filter(|(id, _)| studio_video::multicam::from_group(project, **id).is_ok())
@@ -785,6 +803,23 @@ mod tests {
         let found = filter(&r, "collaborator");
         assert!(found.len() >= 4, "only found {}: {:?}", found.len(),
                 found.iter().map(|c| &c.label).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_band_chooser_offers_every_band_and_says_what_each_is_for() {
+        let r = root();
+        assert!(!filter(&r, "waveform").is_empty(), "reachable by the word on screen");
+        assert!(!filter(&r, "band").is_empty());
+        let bands = candidates(Ask::PeakBandChoice, &Project::default());
+        let got: Vec<studio_audio::Band> = bands.iter().map(|c| match c.then {
+            Then::Do(Act::Shell(ShellVerb::PeakBand(b))) => b,
+            _ => panic!("{:?}", c.label),
+        }).collect();
+        assert_eq!(got, vec![studio_audio::Band::Full, studio_audio::Band::Low,
+                             studio_audio::Band::Mid, studio_audio::Band::High],
+                   "full first: the way out of a filtered view is the first thing offered");
+        assert!(bands.iter().all(|c| c.hint.is_some()),
+                "a band name is not self-explanatory to someone who does not mix");
     }
 
     #[test]

@@ -3088,6 +3088,10 @@ pub struct App {
     export_note: String,
     /// A render in flight, drained once per frame into the tracker.
     export_run: Option<export::Run>,
+    /// Which band every waveform is drawn from. Per device and per session:
+    /// it is a way of LOOKING at the audio, like a zoom level, not a fact
+    /// about the project.
+    peak_band: studio_audio::Band,
     /// The camera group the program monitor is showing as a grid, if any.
     multiview: Option<studio_core::GroupId>,
     /// A stabilize/clean-plate render in flight, and the clip it belongs to.
@@ -3281,6 +3285,7 @@ impl Default for App {
               export_run: None,
               touchup_run: None,
               multiview: None,
+              peak_band: studio_audio::Band::Full,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
               upscale_clip: None,
@@ -3557,7 +3562,7 @@ impl eframe::App for App {
                         if let Some((root, mode)) = scale {
                             let scale = studio_fx::retune::Scale { root, mode };
                             if let Some((id, audio)) = self.studio.autotune_selected(&self.audio, scale) {
-                                self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                                self.peaks.insert(id, self.build_peaks(&audio));
                                 if let Ok(bytes) = studio_audio::export::export_wav_dithered_bytes(
                                     &audio.channels[0], audio.channels.len() as u16,
                                     audio.sample_rate, id.0)
@@ -4112,7 +4117,7 @@ impl eframe::App for App {
             if let Some(dir) = f.path.as_ref().filter(|p| p.is_dir()) {
                 match self.studio.import_kit(dir) {
                     Ok(hits) => for (id, audio, raw) in hits {
-                        self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                        self.peaks.insert(id, self.build_peaks(&audio));
                         self.audio.insert(id, audio);
                         self.studio.register_asset(id, &raw);
                     },
@@ -4185,7 +4190,7 @@ impl eframe::App for App {
                         self.studio.import_clip(&name, &path, &audio)
                     };
                     if let Some(id) = id {
-                        self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                        self.peaks.insert(id, self.build_peaks(&audio));
                         self.audio.insert(id, audio);
                         self.studio.register_asset(id, &raw);
                     }
@@ -4347,7 +4352,7 @@ impl eframe::App for App {
 
         // ── media that finished arriving from peers ──────────────────────
         for (id, audio) in std::mem::take(&mut self.studio.incoming_audio) {
-            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+            self.peaks.insert(id, self.build_peaks(&audio));
             self.audio.insert(id, audio);
             // Clips referencing this source were silent until now; racks
             // sampling it were too.
@@ -4372,7 +4377,7 @@ impl eframe::App for App {
             let fresh = self.studio.rerender_pattern_links(rate, &self.audio);
             if !fresh.is_empty() {
                 for (id, audio) in fresh {
-                    self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                    self.peaks.insert(id, self.build_peaks(&audio));
                     self.audio.insert(id, audio);
                 }
                 self.studio.arrangement_dirty = true;
@@ -4391,7 +4396,7 @@ impl eframe::App for App {
             // The timeline's rate, not the sink's: a bounce is project
             // material and must not change length because of the sound card.
             if let Some((id, audio)) = self.studio.place_pattern(index, at, track, 48_000, &self.audio) {
-                self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                self.peaks.insert(id, self.build_peaks(&audio));
                 // The op recorded a path; make it true on disk, so the
                 // project's reference points at a real file rather than a
                 // label. A failed write is a status note, not a lost bounce
@@ -4642,7 +4647,7 @@ impl eframe::App for App {
                                 .unwrap_or("sample").to_owned();
                             let id = self.studio.import_audio(
                                 &name, &p.display().to_string(), &audio);
-                            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                            self.peaks.insert(id, self.build_peaks(&audio));
                             self.audio.insert(id, audio);
                             self.studio.register_asset(id, &raw);
                             let added = self.studio.rack.channels.len().saturating_sub(1);
@@ -4719,7 +4724,7 @@ impl eframe::App for App {
                                     track, pos: self.studio.playhead(),
                                     src_in: studio_core::Ticks::ZERO, len,
                                     gain: 1.0, effects: vec![] } }, "placed");
-                            self.peaks.insert(sid, studio_audio::Peaks::build(&audio, 256, 256));
+                            self.peaks.insert(sid, self.build_peaks(&audio));
                             self.audio.insert(sid, audio);
                             self.studio.register_asset(sid, &raw);
                             self.studio.status = format!(
@@ -4809,7 +4814,7 @@ impl eframe::App for App {
                         if let Some(id) = self.studio.import_video_clip(
                             &name, &path.display().to_string(), pr.duration, meta) {
                             if let Some(a) = audio {
-                                self.peaks.insert(id, studio_audio::Peaks::build(&a, 256, 256));
+                                self.peaks.insert(id, self.build_peaks(&a));
                                 self.audio.insert(id, a);
                             }
                             if let Ok(raw) = std::fs::read(&path) {
@@ -4835,7 +4840,7 @@ impl eframe::App for App {
                                 self.studio.import_clip(&name, &label, &audio)
                             };
                             if let Some(id) = id {
-                                self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                                self.peaks.insert(id, self.build_peaks(&audio));
                                 self.audio.insert(id, audio);
                                 self.studio.register_asset(id, &raw);
                             }
@@ -5400,7 +5405,7 @@ impl App {
                 p.rows.truncate(self.studio.rack.channels.len());
             }
             let ix = self.studio.layer_channel(sel, ch);
-            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+            self.peaks.insert(id, self.build_peaks(&audio));
             self.audio.insert(id, audio);
             self.studio.register_asset(id, &raw);
             self.studio.status = format!(
@@ -5420,7 +5425,7 @@ impl App {
                 self.studio.loop_dirty = true;
                 self.studio.status = format!("channel {} is now '{name}'", sel + 1);
             }
-            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+            self.peaks.insert(id, self.build_peaks(&audio));
             self.audio.insert(id, audio);
             self.studio.register_asset(id, &raw);
         }
@@ -5694,6 +5699,18 @@ impl App {
                         None => "program monitor back on the cut".into(),
                     };
                 }
+                palette::ShellVerb::PeakBand(band) => {
+                    self.peak_band = band;
+                    // Rebuilt from the audio already in memory — no decoding,
+                    // no files, so switching bands is as cheap as a zoom.
+                    for (id, audio) in &self.audio {
+                        self.peaks.insert(*id, studio_audio::Peaks::build_band(audio, 256, 256, band));
+                    }
+                    self.studio.status = match band {
+                        studio_audio::Band::Full => "waveforms: everything".into(),
+                        b => format!("waveforms: {} band only — a way of looking, not an edit", b.label()),
+                    };
+                }
                 palette::ShellVerb::RelinkToFolder => {
                     match export::pick_folder() {
                         None => self.studio.status = "no folder chosen".into(),
@@ -5822,7 +5839,7 @@ impl App {
                                 .and_then(|p| self.studio.import_pattern_pack(p)) {
                                 Ok(landed) => for (id, audio, raw) in landed {
                                     self.peaks.insert(id,
-                                        studio_audio::Peaks::build(&audio, 256, 256));
+                                        self.build_peaks(&audio));
                                     self.audio.insert(id, audio);
                                     self.studio.register_asset(id, &raw);
                                 },
@@ -5924,6 +5941,13 @@ impl App {
         } else {
             SilentFallback::WallClock
         }
+    }
+
+    /// Peaks for a freshly decoded source, in whatever band the waveforms
+    /// are currently showing — so an import lands looking like everything
+    /// else on screen rather than reverting that view one clip at a time.
+    fn build_peaks(&self, audio: &studio_audio::SourceAudio) -> studio_audio::Peaks {
+        studio_audio::Peaks::build_band(audio, 256, 256, self.peak_band)
     }
 
     /// Which clock is driving the playhead right now, in one phrase for the
@@ -6129,7 +6153,7 @@ impl App {
         if let Ok(bytes) = studio_media::flac::encode_flac(&audio, id.0) {
             self.studio.register_asset(id, &bytes);
         }
-        self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+        self.peaks.insert(id, self.build_peaks(&audio));
         self.audio.insert(id, audio);
         self.studio.status = format!("pass {}: {}", self.passes.done, self.studio.status);
         if take.dropped_blocks > 0 {
@@ -6163,7 +6187,7 @@ impl App {
             if let Ok(bytes) = studio_media::flac::encode_flac(&audio, id.0) {
                 self.studio.register_asset(id, &bytes);
             }
-            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+            self.peaks.insert(id, self.build_peaks(&audio));
             self.audio.insert(id, audio);
             if dropped > 0 {
                 // Said, not swallowed: a take with holes must not be

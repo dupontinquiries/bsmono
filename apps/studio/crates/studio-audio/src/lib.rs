@@ -86,20 +86,115 @@ pub struct Peaks {
     pub frames: usize,
 }
 
+/// Which part of the spectrum a waveform drawing should show.
+///
+/// A full-band waveform is a silhouette of LOUDNESS, and for scoring that is
+/// often the least useful thing on screen: a dialogue take and a kick drum
+/// draw the same shape. Looking at one band at a time answers questions the
+/// full waveform cannot — where the low end actually lands, whether a
+/// narration take has room under it, where the sibilance is — before
+/// listening decides anything.
+///
+/// Ranges are deliberately broad and named for what they are used for, not
+/// for round numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Band {
+    #[default]
+    Full,
+    /// Below ~200 Hz: kick, bass, rumble, room.
+    Low,
+    /// ~200 Hz–2 kHz: where voices and most instruments live.
+    Mid,
+    /// Above ~2 kHz: consonants, cymbals, air, sibilance.
+    High,
+}
+
+impl Band {
+    pub fn label(self) -> &'static str {
+        match self { Band::Full => "full", Band::Low => "low", Band::Mid => "mid", Band::High => "high" }
+    }
+
+    /// The corner frequencies this band is made from, in Hz.
+    fn corners(self) -> (Option<f32>, Option<f32>) {
+        match self {
+            Band::Full => (None, None),
+            Band::Low => (None, Some(200.0)),
+            Band::Mid => (Some(200.0), Some(2_000.0)),
+            Band::High => (Some(2_000.0), None),
+        }
+    }
+}
+
+/// A one-pole filter pair, enough to SEE a band with.
+///
+/// Two one-pole stages per side (12 dB/octave), not one.
+///
+/// A single pole was tried first and is not enough to LOOK at: at 200 Hz it
+/// leaves a 900 Hz voice only 13 dB down, so the "low band" of a narration
+/// take was still mostly the voice — the drawing would have answered the
+/// question with the same shape it always shows. Two stages put that voice
+/// 26 dB down, which reads as a different picture. Still not a mixing
+/// decision: judge a crossover by listening through `studio_fx`, not by
+/// reading a waveform.
+struct BandFilter {
+    hp: Option<f32>,
+    lp: Option<f32>,
+    hp_state: [(f32, f32); 2],  // (y, x) per stage
+    lp_state: [f32; 2],
+}
+
+impl BandFilter {
+    fn new(band: Band, rate: u32) -> BandFilter {
+        let k = |f: f32| (-std::f32::consts::TAU * f / rate.max(1) as f32).exp();
+        let (hi, lo) = band.corners();
+        BandFilter { hp: hi.map(k), lp: lo.map(k), hp_state: [(0.0, 0.0); 2], lp_state: [0.0; 2] }
+    }
+    #[inline]
+    fn step(&mut self, x: f32) -> f32 {
+        let mut v = x;
+        if let Some(a) = self.hp {
+            for st in self.hp_state.iter_mut() {
+                st.0 = a * (st.0 + v - st.1);
+                st.1 = v;
+                v = st.0;
+            }
+        }
+        if let Some(a) = self.lp {
+            for y in self.lp_state.iter_mut() {
+                *y = (1.0 - a) * v + a * *y;
+                v = *y;
+            }
+        }
+        v
+    }
+}
+
 impl Peaks {
     /// Build the pyramid. `base` is Audacity's 256; `factor` of 256 gives its
     /// second summary at 65,536 in one more level.
     pub fn build(audio: &SourceAudio, base: usize, factor: usize) -> Peaks {
+        Peaks::build_band(audio, base, factor, Band::Full)
+    }
+
+    /// The pyramid of ONE band of the audio — the same shape, so every
+    /// drawing, hit test and zoom level works unchanged; only what the
+    /// buckets summarise changes. `Band::Full` is the plain build and costs
+    /// nothing extra.
+    pub fn build_band(audio: &SourceAudio, base: usize, factor: usize, band: Band) -> Peaks {
         let base = base.max(1);
         let factor = factor.max(2);
         let frames = audio.frames();
         let mut level0 = Vec::with_capacity(frames.div_ceil(base));
+        let mut filter = BandFilter::new(band, audio.sample_rate);
         let mut i = 0;
         while i < frames {
             let end = (i + base).min(frames);
             let mut mm = MinMax { min: f32::INFINITY, max: f32::NEG_INFINITY };
             for f in i..end {
-                let v = audio.mono(f);
+                // Filtered in one pass, in order — the filter carries its
+                // state across buckets, so the drawing has no seams at
+                // bucket boundaries.
+                let v = filter.step(audio.mono(f));
                 mm.min = mm.min.min(v);
                 mm.max = mm.max.max(v);
             }
@@ -2566,5 +2661,75 @@ mod render_speed_tests {
         let dt = t0.elapsed();
         println!("rendered {} frames of 8x10 clips + dense automation in {dt:?} \
                   ({:.1}x realtime)", out.len() / 2, 10.0 / dt.as_secs_f64());
+    }
+}
+
+#[cfg(test)]
+mod band_peak_tests {
+    use super::*;
+
+    /// A tone at `hz`, full scale, one second.
+    fn tone(hz: f32, rate: u32) -> SourceAudio {
+        let n = rate as usize;
+        let s: Vec<f32> = (0..n).map(|i| (std::f32::consts::TAU * hz * i as f32 / rate as f32).sin()).collect();
+        SourceAudio { sample_rate: rate, channels: vec![s] }
+    }
+
+    fn loudest(p: &Peaks) -> f32 {
+        p.levels[0].iter().map(|m| m.max.abs().max(m.min.abs())).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn each_band_shows_its_own_part_of_the_spectrum() {
+        let rate = 48_000;
+        for (hz, band) in [(60.0, Band::Low), (700.0, Band::Mid), (8_000.0, Band::High)] {
+            let a = tone(hz, rate);
+            let mine = loudest(&Peaks::build_band(&a, 256, 256, band));
+            assert!(mine > 0.3, "{} Hz should survive its own band: {mine}", hz);
+            for other in [Band::Low, Band::Mid, Band::High] {
+                if other == band { continue; }
+                let theirs = loudest(&Peaks::build_band(&a, 256, 256, other));
+                assert!(theirs < mine * 0.5,
+                        "{} Hz in the {} band ({theirs}) must be well under its own ({mine})",
+                        hz, other.label());
+            }
+        }
+    }
+
+    #[test]
+    fn full_band_is_the_plain_build_and_the_shape_never_changes() {
+        let a = tone(440.0, 48_000);
+        let plain = Peaks::build(&a, 256, 256);
+        let full = Peaks::build_band(&a, 256, 256, Band::Full);
+        assert_eq!(plain.levels, full.levels, "Full must cost nothing and change nothing");
+        // Every band keeps the pyramid's shape, so the timeline's drawing,
+        // hit testing and zoom work unchanged.
+        for band in [Band::Low, Band::Mid, Band::High] {
+            let p = Peaks::build_band(&a, 256, 256, band);
+            assert_eq!(p.frames, plain.frames);
+            assert_eq!(p.levels.len(), plain.levels.len());
+            assert_eq!(p.levels[0].len(), plain.levels[0].len());
+        }
+    }
+
+    #[test]
+    fn a_quiet_low_end_under_a_loud_voice_is_visible_in_the_low_band() {
+        // The scoring case: narration at -6 dB with a quiet 50 Hz rumble
+        // under it. The full waveform is the voice; the low band is the
+        // rumble, and that is the point of looking.
+        let rate = 48_000;
+        let n = rate as usize;
+        let mixed: Vec<f32> = (0..n).map(|i| {
+            let t = i as f32 / rate as f32;
+            0.5 * (std::f32::consts::TAU * 900.0 * t).sin()
+                + 0.05 * (std::f32::consts::TAU * 50.0 * t).sin()
+        }).collect();
+        let a = SourceAudio { sample_rate: rate, channels: vec![mixed] };
+        let full = loudest(&Peaks::build(&a, 256, 256));
+        let low = loudest(&Peaks::build_band(&a, 256, 256, Band::Low));
+        let mid = loudest(&Peaks::build_band(&a, 256, 256, Band::Mid));
+        assert!(full > 0.45 && mid > 0.3, "the voice dominates everywhere else: {full} / {mid}");
+        assert!(low < 0.12, "the low band must not just be the voice again: {low}");
+        assert!(low > 0.01, "and the rumble must actually show: {low}");
     }
 }
