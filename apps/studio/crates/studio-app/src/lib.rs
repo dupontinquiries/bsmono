@@ -3012,6 +3012,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "app")]   // App is the window: no window, no test
     fn the_status_bar_names_which_clock_is_running() {
         use crate::App;
         assert_eq!(App::clock_note(false, false, None, true), "", "stopped says nothing");
@@ -3356,6 +3357,7 @@ impl Default for App {
 /// the accident that motivated it). The root is $STUDIO_PROJECTS, else the
 /// last place an archive was written -- a person who archives to an SD card
 /// wants the working copy beside it -- else the freedesktop data directory.
+#[cfg(feature = "app")]
 fn default_project_path() -> std::path::PathBuf {
     // a project named on the command line wins over STUDIO_PROJECT
     // (`studio film.studio`, or `studio fixtures/cartoon-fragile`); `run`
@@ -3371,6 +3373,7 @@ fn default_project_path() -> std::path::PathBuf {
     }
 }
 
+#[cfg(feature = "app")]
 impl App {
     /// The shell, opened on `project_path`: the same path a launch with
     /// STUDIO_PROJECT takes, and what "open project" switches to -- so a
@@ -7841,7 +7844,7 @@ impl studio_egui::playkeys::AnalogSource for WootingAnalog {
     fn active(&self) -> bool { self.0.active() }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "app"))]   // these drive App, which is the window
 mod sink_resync_tests {
     use super::*;
 
