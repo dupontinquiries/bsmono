@@ -29,6 +29,8 @@ pub mod stream;
 /// The media collection: video files from local folders and dufs servers, with
 /// glob patterns and individual selection. Distinct from the mesh Web Library.
 pub mod media;
+/// The Media tab: the egui shell over `media`.
+pub mod media_page;
 pub mod transcode;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -64,6 +66,7 @@ pub enum Tab {
     Lab,
     SeqLab,
     Library,
+    Media,
     Player,
     Settings,
 }
@@ -81,6 +84,7 @@ pub struct App {
     pub lab: lab::State,
     pub seq: seq_page::SeqState,
     pub library: library::State,
+    pub media: media_page::State,
     pub player: player::State,
 }
 
@@ -88,7 +92,7 @@ impl Default for App {
     fn default() -> Self {
         let mut prefs = settings_kit::Prefs::default();
         prefs.palette = "system".to_string();
-        App { a11y: uikit_egui::a11y::A11yScene::new(), tab: Tab::Lab, prefs, lab: lab::State::default(), seq: seq_page::SeqState::default(), library: library::State::default(), player: player::State::default() }
+        App { a11y: uikit_egui::a11y::A11yScene::new(), tab: Tab::Lab, prefs, lab: lab::State::default(), seq: seq_page::SeqState::default(), library: library::State::default(), media: media_page::State::default(), player: player::State::default() }
     }
 }
 
@@ -114,6 +118,7 @@ impl App {
             Tab::Lab => lab::ui(self, ui),
             Tab::SeqLab => seq_page::ui(self, ui),
             Tab::Library => library::ui(self, ui),
+            Tab::Media => media_page::ui(self, ui),
             Tab::Player => player::ui(self, ui),
             Tab::Settings => {
                 ui.heading("Settings");
@@ -124,7 +129,7 @@ impl App {
 
     fn nav(&mut self, ui: &mut egui::Ui) {
         for (t, label) in [(Tab::Lab, "🎞 Encode Lab"), (Tab::SeqLab, "⏱ Seq Lab"),
-                           (Tab::Library, "🔗 Library"),
+                           (Tab::Library, "🔗 Library"), (Tab::Media, "🗂 Media"),
                            (Tab::Player, "▶ Player"), (Tab::Settings, "⚙ Settings")] {
             if ui.selectable_label(self.tab == t, label).clicked() {
                 self.tab = t;

@@ -21,6 +21,8 @@ uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 settings-kit = { path = "../../../shared/settings-kit" }
 # transcode.rs's ffprobe JSON parsing.
 serde_json = "1"
+# LAN dufs listings for the Media tab. The fleet's usual light client, 2.12.
+ureq = "2"
 
 [dev-dependencies]
 # Building a synthetic V8MX trailer for decode.rs's v8 test (the trailer's per-web blobs are

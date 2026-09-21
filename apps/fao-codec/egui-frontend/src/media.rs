@@ -170,9 +170,15 @@ pub fn parse_dufs_listing(json: &str) -> Result<Vec<DufsItem>, String> {
 
 /// Percent-encode each '/'-separated segment, keeping the slashes.
 ///
-/// dufs serves names with emoji, spaces and newlines (its own tests fetch
-/// `%F0%9F%98%80.bin` and `file%0A1.txt`), so a raw name in a URL would request
-/// the wrong file or none. Only RFC 3986 unreserved characters pass through.
+/// WHAT IT IS ACTUALLY FOR, corrected after testing against a real dufs. I first
+/// justified this with spaces and emoji -- and the real-server test passed with
+/// encoding switched OFF, because ureq's URL parser encodes those itself. What
+/// ureq leaves alone are characters that are LEGAL in a URL and MEAN something:
+/// '#' starts a fragment, '?' a query, and a bare '%' is read as an escape. Raw,
+/// `match #3.mkv` asks the server for "match ", and a folder `cup #2` cannot be
+/// listed at all -- the real test shows exactly that. Game captures are named
+/// like that often enough to matter. Only RFC 3986 unreserved characters pass
+/// through, so all of those are escaped.
 pub fn encode_path(path: &str) -> String {
     path.split('/').map(|seg| {
         seg.bytes().map(|b| {
@@ -468,6 +474,10 @@ mod tests {
         assert_eq!(encode_path("😀.bin"), "%F0%9F%98%80.bin");
         assert_eq!(encode_path("file\n1.txt"), "file%0A1.txt");
         assert_eq!(encode_path("ranked/match 1.mkv"), "ranked/match%201.mkv");
+        // The ones that genuinely need it -- ureq does NOT fix these:
+        assert_eq!(encode_path("match #3.mkv"), "match%20%233.mkv", "'#' would start a fragment");
+        assert_eq!(encode_path("r?.mkv"), "r%3F.mkv", "'?' would start a query");
+        assert_eq!(encode_path("100% win.mp4"), "100%25%20win.mp4", "a bare '%' would be read as an escape");
         assert_eq!(file_url("http://h:5000/v/", "a b/c.mkv"), "http://h:5000/v/a%20b/c.mkv");
         assert_eq!(listing_url("http://h:5000", ""), "http://h:5000/?json");
         assert_eq!(listing_url("http://h:5000", "a b"), "http://h:5000/a%20b/?json");
