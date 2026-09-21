@@ -98,16 +98,19 @@ impl Gallery {
         }
         ui.label("across: how many times it repeats · down: straight, or turned half a wedge");
         let mut chosen = None;
+        // as many across as fit: six on a desktop, two on a phone
+        let thumb = TW as f32 * 0.75;
+        let per_row = studio_egui::touch::ToolLayout::columns(ui.available_width(), thumb).min(WEDGES.len());
         egui::Grid::new("kaleido-grid").spacing([6.0, 6.0]).show(ui, |ui| {
             for (i, ((label, k), tex)) in opts.iter().zip(&self.textures).enumerate() {
                 ui.vertical(|ui| {
                     let img = egui::Image::new(tex).fit_to_exact_size(egui::vec2(TW as f32 * 0.75, TH as f32 * 0.75));
-                    if ui.add(egui::Button::image(img)).on_hover_text(format!("{label} · centre {}", self.centre.label())).clicked() {
+                    if ui.add(egui::Button::image(img)).clicked() {
                         chosen = Some(*k);
                     }
                     ui.small(label);
                 });
-                if i % WEDGES.len() == WEDGES.len() - 1 { ui.end_row(); }
+                if i % per_row == per_row - 1 { ui.end_row(); }
             }
         });
         chosen

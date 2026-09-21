@@ -3253,6 +3253,9 @@ pub struct App {
     /// loses what the previous filter hid.
     words_raw: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
     word_filter: studio_voice::WordFilter,
+    /// A finger has touched the screen this session: tool windows grow their
+    /// targets to fingertip size even on a wide screen (a touch laptop).
+    touch_seen: bool,
     /// The comic setup window, open over a camera group.
     comic_setup: Option<comic_job::SetupWindow>,
     /// A comic render in flight.
@@ -3485,6 +3488,7 @@ impl Default for App {
               signals_panel: None,
               comic_run: None,
               comic_setup: None,
+              touch_seen: false,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
               upscale_clip: None,
@@ -3641,7 +3645,11 @@ impl eframe::App for App {
         // it is one frame's fact, recomputed from real width every time.
         let mut pages_mode = false;
         egui::Panel::top("bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            // WRAPPED, not one row: on a phone-width window the single row ran
+            // off the right edge and took `film`, `save`, export and every
+            // tool with it -- and the palette's shortcut needs a keyboard a
+            // phone does not have. Wrapping keeps every control reachable.
+            ui.horizontal_wrapped(|ui| {
                 // Tabs when the labels actually fit, a compact picker when
                 // they don't — decided from a WIDTH FIT via responsive_nav,
                 // not a device-class guess (its module doc explains why the
@@ -3798,7 +3806,10 @@ impl eframe::App for App {
                 // the palette's words cannot search for a command they have
                 // never heard of. Each one is the SAME shell verb the
                 // palette raises, so the two can never drift.
+                let film_layout = studio_egui::touch::ToolLayout::for_screen(ui.ctx().content_rect().width(), self.touch_seen);
                 ui.menu_button("film", |ui| {
+                    // fingertip rows on a phone or wherever a finger has touched
+                    film_layout.apply(ui);
                     let selected = !self.studio.selection.is_empty();
                     let busy = self.touchup_run.is_some();
                     if ui.add_enabled(selected && !busy, egui::Button::new("stabilize — smooth-cam"))
@@ -4594,6 +4605,7 @@ impl eframe::App for App {
         }
 
         if let Ok(mut w) = self.ui_waker.lock() { if w.is_none() { *w = Some(ctx.clone()); } }
+        if !self.touch_seen && ctx.input(|i| i.any_touches()) { self.touch_seen = true; }
         // ── video sources' audio, arriving from the extraction worker ────
         if let Some(rx) = &self.video_audio_rx {
             let mut got = Vec::new();
@@ -7313,11 +7325,27 @@ impl App {
         self.comic_setup = Some(comic_job::SetupWindow::new(group, frames));
     }
 
+    /// How tool windows should present on this screen, and a window built to
+    /// match: a full-screen sheet on a narrow screen (the editor's
+    /// one-thing-at-a-time rule), a floating window elsewhere.
+    fn tool_layout(&self, ctx: &egui::Context) -> studio_egui::touch::ToolLayout {
+        studio_egui::touch::ToolLayout::for_screen(ctx.content_rect().width(), self.touch_seen)
+    }
+    fn tool_window<'a>(ctx: &egui::Context, title: &'a str, layout: studio_egui::touch::ToolLayout, open: &'a mut bool) -> egui::Window<'a> {
+        let w = egui::Window::new(title).open(open).collapsible(false);
+        if layout.sheet {
+            w.fixed_rect(ctx.content_rect().shrink(4.0)).resizable(false).vscroll(true)
+        } else {
+            w.resizable(false)
+        }
+    }
+
     fn comic_setup_window(&mut self, ctx: &egui::Context) {
         let Some(w) = &mut self.comic_setup else { return };
         let mut open = true;
         let mut go = None;
-        egui::Window::new("Comic — who goes where").open(&mut open).resizable(false).show(ctx, |ui| { go = w.show(ui); });
+        let layout = studio_egui::touch::ToolLayout::for_screen(ctx.content_rect().width(), self.touch_seen);
+        Self::tool_window(ctx, "Comic — who goes where", layout, &mut open).show(ctx, |ui| { go = w.show(ui, layout); });
         if let Some(setup) = go {
             let group = w.group;
             self.comic_setup = None;
@@ -7383,7 +7411,8 @@ impl App {
         let Some(p) = &mut self.signals_panel else { return };
         let mut open = true;
         let mut go = None;
-        egui::Window::new("Signals — when to cut").open(&mut open).default_width(560.0).show(ctx, |ui| { go = p.show(ui); });
+        let layout = studio_egui::touch::ToolLayout::for_screen(ctx.content_rect().width(), self.touch_seen);
+        Self::tool_window(ctx, "Signals — when to cut", layout, &mut open).show(ctx, |ui| { layout.apply(ui); go = p.show(ui); });
         if let Some(cands) = go {
             match signals_panel::plan_ops(&self.studio.session.doc.project, p.group, &cands, &p.angle_inputs, p.prefer, p.no_repeat) {
                 Ok((ops, shots, lines)) => {
@@ -7402,7 +7431,8 @@ impl App {
         let Some(g) = &mut self.kaleido_gallery else { return };
         let mut open = true;
         let mut chosen = None;
-        egui::Window::new("Kaleidoscope").open(&mut open).resizable(false).show(ctx, |ui| { chosen = g.show(ui); });
+        let layout = studio_egui::touch::ToolLayout::for_screen(ctx.content_rect().width(), self.touch_seen);
+        Self::tool_window(ctx, "Kaleidoscope", layout, &mut open).show(ctx, |ui| { layout.apply(ui); chosen = g.show(ui); });
         if let Some(k) = chosen {
             let project = &self.studio.session.doc.project;
             let ops: Vec<studio_core::Op> = self.studio.selection.iter().filter_map(|id| project.clips.get(id))

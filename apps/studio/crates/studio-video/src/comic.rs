@@ -180,7 +180,41 @@ impl Default for Style {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Region { pub x0: f32, pub y0: f32, pub x1: f32, pub y1: f32 }
 
-impl Region { pub const WHOLE: Region = Region { x0: 0.0, y0: 0.0, x1: 1.0, y1: 1.0 }; }
+impl Region {
+    pub const WHOLE: Region = Region { x0: 0.0, y0: 0.0, x1: 1.0, y1: 1.0 };
+    /// The smallest a region may be pinched to, as a fraction of the frame:
+    /// a panel of a few pixels shows nothing, and a runaway pinch should
+    /// stop somewhere usable rather than vanish.
+    pub const MIN: f32 = 0.15;
+
+    pub fn w(&self) -> f32 { self.x1 - self.x0 }
+    pub fn h(&self) -> f32 { self.y1 - self.y0 }
+    pub fn centre(&self) -> (f32, f32) { ((self.x0 + self.x1) / 2.0, (self.y0 + self.y1) / 2.0) }
+
+    /// The same size, centred at `c`, kept inside the frame -- a tap on the
+    /// person you want.
+    pub fn centred_at(&self, c: (f32, f32)) -> Region {
+        let (w, h) = (self.w().min(1.0), self.h().min(1.0));
+        let x0 = (c.0 - w / 2.0).clamp(0.0, 1.0 - w);
+        let y0 = (c.1 - h / 2.0).clamp(0.0, 1.0 - h);
+        Region { x0, y0, x1: x0 + w, y1: y0 + h }
+    }
+
+    /// Moved by `d` (fractions of the frame), kept inside -- one finger dragging.
+    pub fn moved(&self, d: (f32, f32)) -> Region {
+        let c = self.centre();
+        self.centred_at((c.0 + d.0, c.1 + d.1))
+    }
+
+    /// Resized by `k` about its centre, no smaller than MIN and no larger than
+    /// the frame -- two fingers pinching.
+    pub fn scaled(&self, k: f32) -> Region {
+        // nonsense (a zero-spread first frame of a pinch) leaves it exactly as it was
+        if !(k.is_finite() && k > 0.0) || k == 1.0 { return *self; }
+        let (w, h) = ((self.w() * k).clamp(Region::MIN, 1.0), (self.h() * k).clamp(Region::MIN, 1.0));
+        Region { x0: 0.0, y0: 0.0, x1: w, y1: h }.centred_at(self.centre())
+    }
+}
 
 fn fill(f: &mut Frame, x0: i64, y0: i64, x1: i64, y1: i64, c: [u8; 3]) {
     for y in y0.max(0)..y1.min(f.h as i64) { for x in x0.max(0)..x1.min(f.w as i64) { f.set(x as u32, y as u32, c); } }
@@ -427,6 +461,27 @@ mod tests {
         assert!(reds(&f, 0, w / 2 - 10, 0, h) > 1000 && blues(&f, w / 2 + 10, w, 0, h) > 1000);
         let f = compose(Layout::Inset { side: Side::Left }, &wide, (&l, Region::WHOLE), (&r, Region::WHOLE), &page, &s, 0.0);
         assert!(reds(&f, 0, w / 2, h / 2, h) > 100 && reds(&f, w / 2, w, 0, h) == 0, "a left inset sits left");
+    }
+
+    #[test]
+    fn a_region_follows_the_finger_and_stays_in_the_frame() {
+        let r = Region { x0: 0.0, y0: 0.05, x1: 0.55, y1: 0.95 };
+        // a tap on the far right: centred there, but never past the edge
+        let t = r.centred_at((0.95, 0.5));
+        assert!((t.x1 - 1.0).abs() < 1e-6 && (t.w() - r.w()).abs() < 1e-6, "{t:?}");
+        // dragging left by a quarter frame moves it a quarter frame
+        let m = t.moved((-0.25, 0.0));
+        assert!((m.centre().0 - (t.centre().0 - 0.25)).abs() < 1e-6, "{m:?}");
+        // a drag past the edge stops at the edge, keeping the size
+        let far = m.moved((-5.0, 5.0));
+        assert!(far.x0.abs() < 1e-6 && (far.y1 - 1.0).abs() < 1e-6 && (far.w() - r.w()).abs() < 1e-6, "{far:?}");
+        // a pinch in halves it about its centre; a runaway pinch stops at MIN
+        let half = r.scaled(0.5);
+        assert!((half.w() - r.w() * 0.5).abs() < 1e-6 && (half.centre().0 - r.centre().0).abs() < 1e-6);
+        let tiny = r.scaled(0.01);
+        assert!((tiny.w() - Region::MIN).abs() < 1e-6 && (tiny.h() - Region::MIN).abs() < 1e-6);
+        // a pinch out never exceeds the frame, and nonsense input changes nothing
+        assert!(r.scaled(10.0).w() <= 1.0 + 1e-6 && r.scaled(f32::NAN) == r);
     }
 
     #[test]

@@ -43,16 +43,18 @@ pub const REGION_PRESETS: &[(&str, Region)] = &[
     ("faces (upper centre)", Region { x0: 0.2, y0: 0.0, x1: 0.8, y1: 0.6 }),
 ];
 
-/// The operator's setup: which angle plays which role, and which region each
-/// panel shows. Indices are into the group's angles and REGION_PRESETS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Setup { pub wide: usize, pub left: usize, pub right: usize, pub left_region: usize, pub right_region: usize }
+/// The operator's setup: which angle plays which role (indices into the
+/// group's angles), and the region each panel shows -- a preset, or wherever a
+/// finger dragged it, so it is a value rather than a preset index.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Setup { pub wide: usize, pub left: usize, pub right: usize, pub left_region: Region, pub right_region: Region }
 
 impl Setup {
     /// The same defaults `roles` uses, as a starting point for the window.
     pub fn default_for(angles: usize) -> Setup {
-        if angles >= 3 { Setup { wide: 0, left: 1, right: 2, left_region: 0, right_region: 0 } }
-        else { Setup { wide: 0, left: 1.min(angles.saturating_sub(1)), right: 1.min(angles.saturating_sub(1)), left_region: 1, right_region: 2 } }
+        if angles >= 3 { Setup { wide: 0, left: 1, right: 2, left_region: Region::WHOLE, right_region: Region::WHOLE } }
+        else { Setup { wide: 0, left: 1.min(angles.saturating_sub(1)), right: 1.min(angles.saturating_sub(1)),
+                       left_region: REGION_PRESETS[1].1, right_region: REGION_PRESETS[2].1 } }
     }
 }
 
@@ -60,13 +62,12 @@ impl Setup {
 pub fn roles_with(project: &Project, group: GroupId, base: &std::path::Path, s: Setup) -> Result<(Roles, Ticks, Ticks), String> {
     let (angles, start, end) = studio_video::multicam::from_group(project, group)?;
     let pick = |k: usize| angles.get(k).ok_or_else(|| format!("no angle {}", k + 1));
-    let region = |i: usize| REGION_PRESETS.get(i).map(|r| r.1).unwrap_or(Region::WHOLE);
     let feed = |k: usize, r: Region| -> Result<Feed, String> {
         let a = pick(k)?;
         let src = project.sources.get(&a.source).ok_or("an angle's source is gone")?;
         Ok(Feed { path: base.join(&src.path), from: (start.to_seconds() + a.offset).max(0.0), region: r })
     };
-    Ok((Roles { wide: feed(s.wide, Region::WHOLE)?, left: feed(s.left, region(s.left_region))?, right: feed(s.right, region(s.right_region))? },
+    Ok((Roles { wide: feed(s.wide, Region::WHOLE)?, left: feed(s.left, s.left_region)?, right: feed(s.right, s.right_region)? },
         start, end))
 }
 
@@ -179,51 +180,79 @@ impl SetupWindow {
     }
 
     /// Draw; returns the setup when "render" is pressed.
-    pub fn show(&mut self, ui: &mut egui::Ui) -> Option<Setup> {
+    ///
+    /// Touch-first: the thumbnail is the control. Tap to centre the region on
+    /// a person, drag to move it, pinch (or Ctrl+scroll) to resize it -- the
+    /// editor's gesture rules, one finger drags and two fingers pinch. The
+    /// presets stay as the quick way to a known framing. On a narrow screen the
+    /// two panels stack instead of sitting side by side, and every control is
+    /// fingertip-sized.
+    pub fn show(&mut self, ui: &mut egui::Ui, layout: studio_egui::touch::ToolLayout) -> Option<Setup> {
+        layout.apply(ui);
         if self.textures.len() != self.frames.len() {
             self.textures = self.frames.iter().enumerate().map(|(i, px)| ui.ctx().load_texture(
                 format!("comic-angle-{i}"), egui::ColorImage::from_rgb([320, 180], px), egui::TextureOptions::LINEAR)).collect();
         }
         let n = self.frames.len();
-        let angle_pick = |ui: &mut egui::Ui, label: &str, v: &mut usize| {
-            ui.horizontal(|ui| {
-                ui.label(label);
-                for k in 0..n { ui.selectable_value(v, k, format!("angle {}", k + 1)); }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("wide:");
+            for k in 0..n { ui.selectable_value(&mut self.setup.wide, k, format!("angle {}", k + 1)); }
+        });
+        let textures = self.textures.clone();
+        let thumb_w = if layout.pair_side_by_side { 256.0 } else { (ui.available_width() - 8.0).min(480.0) };
+        let mut panel = |ui: &mut egui::Ui, title: &str, angle: &mut usize, region: &mut Region| {
+            ui.strong(title);
+            ui.horizontal_wrapped(|ui| { for k in 0..n { ui.selectable_value(angle, k, format!("angle {}", k + 1)); } });
+            if let Some(tex) = textures.get(*angle) {
+                let size = egui::vec2(thumb_w, thumb_w * 9.0 / 16.0);
+                let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                let to_frac = |p: egui::Pos2| (((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0), ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0));
+                if resp.clicked() { if let Some(p) = resp.interact_pointer_pos() { *region = region.centred_at(to_frac(p)); } }
+                if resp.dragged() {
+                    let d = resp.drag_delta();
+                    *region = region.moved((d.x / rect.width(), d.y / rect.height()));
+                }
+                if resp.hovered() || resp.dragged() {
+                    let z = ui.input(|i| i.zoom_delta());
+                    // zoom in (spread fingers) = look closer = a SMALLER region
+                    if (z - 1.0).abs() > 1e-3 { *region = region.scaled(1.0 / z); }
+                }
+                ui.painter().image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                let r = *region;
+                let rr = egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x + r.x0 * rect.width(), rect.min.y + r.y0 * rect.height()),
+                    egui::pos2(rect.min.x + r.x1 * rect.width(), rect.min.y + r.y1 * rect.height()));
+                for out in [egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rr.min.y)),
+                            egui::Rect::from_min_max(egui::pos2(rect.min.x, rr.max.y), rect.max),
+                            egui::Rect::from_min_max(egui::pos2(rect.min.x, rr.min.y), egui::pos2(rr.min.x, rr.max.y)),
+                            egui::Rect::from_min_max(egui::pos2(rr.max.x, rr.min.y), egui::pos2(rect.max.x, rr.max.y))] {
+                    ui.painter().rect_filled(out, 0.0, egui::Color32::from_black_alpha(150));
+                }
+                ui.painter().rect_stroke(rr, 0.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 60, 180)), egui::StrokeKind::Inside);
+                // said on screen, not in a tooltip: there is no hover on a touchscreen
+                ui.small("tap a person to centre on them · drag to move · pinch to resize");
+            }
+            ui.horizontal_wrapped(|ui| {
+                for (name, preset) in REGION_PRESETS.iter() {
+                    if ui.selectable_label(*region == *preset, *name).clicked() { *region = *preset; }
+                }
             });
         };
-        angle_pick(ui, "wide:", &mut self.setup.wide);
-        let mut go = None;
-        ui.columns(2, |cols| {
-            for (col, (title, angle, region)) in cols.iter_mut().zip([
-                ("left panel", &mut self.setup.left, &mut self.setup.left_region),
-                ("right panel", &mut self.setup.right, &mut self.setup.right_region)]) {
-                col.strong(title);
-                col.horizontal_wrapped(|ui| { for k in 0..n { ui.selectable_value(angle, k, format!("angle {}", k + 1)); } });
-                if let Some(tex) = self.textures.get(*angle) {
-                    let size = egui::vec2(256.0, 144.0);
-                    let (rect, _) = col.allocate_exact_size(size, egui::Sense::hover());
-                    col.painter().image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
-                    let r = REGION_PRESETS[*region].1;
-                    let rr = egui::Rect::from_min_max(
-                        egui::pos2(rect.min.x + r.x0 * rect.width(), rect.min.y + r.y0 * rect.height()),
-                        egui::pos2(rect.min.x + r.x1 * rect.width(), rect.min.y + r.y1 * rect.height()));
-                    // dim outside the region, outline it: what the panel will show
-                    for out in [egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rr.min.y)),
-                                egui::Rect::from_min_max(egui::pos2(rect.min.x, rr.max.y), rect.max),
-                                egui::Rect::from_min_max(egui::pos2(rect.min.x, rr.min.y), egui::pos2(rr.min.x, rr.max.y)),
-                                egui::Rect::from_min_max(egui::pos2(rr.max.x, rr.min.y), egui::pos2(rect.max.x, rr.max.y))] {
-                        col.painter().rect_filled(out, 0.0, egui::Color32::from_black_alpha(150));
-                    }
-                    col.painter().rect_stroke(rr, 0.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 60, 180)), egui::StrokeKind::Inside);
-                }
-                col.horizontal_wrapped(|ui| {
-                    for (i, (name, _)) in REGION_PRESETS.iter().enumerate() { ui.selectable_value(region, i, *name); }
-                });
-            }
-        });
+        let (mut la, mut lr, mut ra, mut rr) = (self.setup.left, self.setup.left_region, self.setup.right, self.setup.right_region);
+        if layout.pair_side_by_side {
+            ui.columns(2, |cols| {
+                panel(&mut cols[0], "left panel", &mut la, &mut lr);
+                panel(&mut cols[1], "right panel", &mut ra, &mut rr);
+            });
+        } else {
+            panel(ui, "left panel", &mut la, &mut lr);
+            ui.separator();
+            panel(ui, "right panel", &mut ra, &mut rr);
+        }
+        (self.setup.left, self.setup.left_region, self.setup.right, self.setup.right_region) = (la, lr, ra, rr);
         ui.separator();
-        if ui.button("render the comic").clicked() { go = Some(self.setup); }
-        go
+        if ui.button("render the comic").clicked() { return Some(self.setup); }
+        None
     }
 }
 
@@ -261,7 +290,7 @@ mod tests {
     #[test]
     fn the_operators_setup_decides_roles_and_regions() {
         let (p, g) = project(3);
-        let s = Setup { wide: 2, left: 0, right: 1, left_region: 6, right_region: 5 };
+        let s = Setup { wide: 2, left: 0, right: 1, left_region: REGION_PRESETS[6].1, right_region: REGION_PRESETS[5].1 };
         let (r, _, _) = roles_with(&p, g, std::path::Path::new("/m"), s).unwrap();
         assert_eq!(r.wide.path.to_str().unwrap(), "/m/A3.mkv", "angle 3 as the wide");
         assert_eq!(r.left.region, REGION_PRESETS[6].1, "faces for the left panel");

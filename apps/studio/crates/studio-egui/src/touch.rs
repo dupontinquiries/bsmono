@@ -22,6 +22,60 @@
 use egui::Pos2;
 use studio_core::Ticks;
 
+/// How a tool window should present itself on this screen.
+///
+/// The editor's own rule (see `Panel`): on a narrow screen, one thing at a
+/// time on a solid background -- floating windows over a timeline are
+/// unreadable on a six-inch screen and impossible to hit. Tool windows follow
+/// it: on a narrow screen they become a full-screen SHEET; wherever a finger
+/// has touched the screen, every control grows to a fingertip-sized target;
+/// grids reflow to the columns that fit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ToolLayout {
+    /// Full-screen sheet instead of a floating window.
+    pub sheet: bool,
+    /// Minimum height of anything tappable, in points.
+    pub target: f32,
+    /// Side-by-side columns for paired content (the comic's two panels).
+    pub pair_side_by_side: bool,
+}
+
+/// Screens narrower than this, in points, get sheets.
+pub const SHEET_BELOW_PT: f32 = 600.0;
+/// A fingertip target: ~9 mm, the common 44 pt guideline.
+pub const TOUCH_TARGET_PT: f32 = 44.0;
+/// egui's own default interact height, for mouse use.
+pub const MOUSE_TARGET_PT: f32 = 18.0;
+
+impl ToolLayout {
+    /// `touch_seen`: a finger has touched this screen this session (a phone,
+    /// a touch laptop) -- targets grow even on a wide screen.
+    pub fn for_screen(width_pt: f32, touch_seen: bool) -> ToolLayout {
+        let narrow = width_pt < SHEET_BELOW_PT;
+        ToolLayout {
+            sheet: narrow,
+            target: if touch_seen || narrow { TOUCH_TARGET_PT } else { MOUSE_TARGET_PT },
+            pair_side_by_side: width_pt >= 520.0,
+        }
+    }
+
+    /// How many thumbnails of `thumb_pt` width fit across `width_pt`, at least one.
+    pub fn columns(width_pt: f32, thumb_pt: f32) -> usize {
+        ((width_pt / (thumb_pt + 8.0)).floor() as usize).max(1)
+    }
+
+    /// Grow every control in `ui` to this layout's target size.
+    pub fn apply(&self, ui: &mut egui::Ui) {
+        let sp = ui.spacing_mut();
+        sp.interact_size.y = sp.interact_size.y.max(self.target);
+        if self.target >= TOUCH_TARGET_PT {
+            sp.button_padding = egui::vec2(sp.button_padding.x.max(12.0), sp.button_padding.y.max(10.0));
+            sp.item_spacing = egui::vec2(sp.item_spacing.x.max(10.0), sp.item_spacing.y.max(10.0));
+            sp.slider_width = sp.slider_width.max(200.0);
+        }
+    }
+}
+
 /// What the recognizer decided this gesture is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TouchKind {
@@ -428,5 +482,31 @@ mod panel_nav_tests {
             assert_eq!(nav.on_overscroll(Panel::Rack, 20.0, t), None,
                        "stale progress must not survive a reset");
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_layout_tests {
+    use super::*;
+
+    #[test]
+    fn a_phone_gets_a_sheet_and_fingertip_targets() {
+        let phone = ToolLayout::for_screen(360.0, true);
+        assert!(phone.sheet && phone.target >= 44.0 && !phone.pair_side_by_side);
+        // a desktop with a mouse: a floating window, mouse-sized controls
+        let desk = ToolLayout::for_screen(1280.0, false);
+        assert!(!desk.sheet && desk.target < 44.0 && desk.pair_side_by_side);
+        // a touch laptop: a window (the screen is wide) but fingertip targets
+        let laptop = ToolLayout::for_screen(1280.0, true);
+        assert!(!laptop.sheet && laptop.target >= 44.0);
+        // narrow but never touched (a small desktop window): still a sheet, still big targets
+        assert!(ToolLayout::for_screen(500.0, false).sheet);
+    }
+
+    #[test]
+    fn grids_reflow_to_what_fits() {
+        assert_eq!(ToolLayout::columns(360.0, 144.0), 2);
+        assert_eq!(ToolLayout::columns(1280.0, 144.0), 8);
+        assert_eq!(ToolLayout::columns(100.0, 144.0), 1, "never zero columns");
     }
 }
