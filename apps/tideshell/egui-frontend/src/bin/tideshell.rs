@@ -63,6 +63,13 @@ impl Shellbox {
     }
 
     fn poll_world(&mut self) {
+        for (o, undo) in self.system.reap() {
+            self.shell.note(o.describe());
+            if undo == Some(effects::Undo::KeyboardShown) {
+                self.shell.set_keyboard_visible(false);
+                self.shell.note("keyboard mode off: it never appeared");
+            }
+        }
         if let Some(w) = self.windows.as_mut() {
             if let Some(cards) = w.poll() {
                 let more = self.shell.set_windows(cards);

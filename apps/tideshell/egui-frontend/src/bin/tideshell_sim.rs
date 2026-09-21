@@ -206,6 +206,14 @@ impl App {
                 }
             }
         }
+        if let Some(sys) = self.system.as_mut() {
+            for (o, undo) in sys.reap() {
+                self.shell.note(o.describe());
+                if undo == Some(effects::Undo::KeyboardShown) {
+                    self.shell.set_keyboard_visible(false);
+                }
+            }
+        }
         let cards = match self.live.as_mut() {
             Some(w) => match w.poll() {
                 Some(c) => c,

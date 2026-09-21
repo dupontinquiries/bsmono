@@ -36,12 +36,41 @@ pub trait Executor {
     fn run(&mut self, action: &Action) -> Outcome;
 }
 
-/// Run a command detached, reporting spawn failure (a missing binary is the
-/// common case on a fresh phone and must be visible).
+/// A spawned command whose result is not known yet. `Outcome::Done` from
+/// `run` only means STARTED; the real result comes from `System::reap` —
+/// e.g. `busctl` exiting 1 because rusty-board is not running, which used
+/// to be reported as "ok".
+struct Pending {
+    label: String,
+    child: std::process::Child,
+    /// What the shell should undo if this fails.
+    on_fail: Option<Undo>,
+}
+
+/// A state change the engine made optimistically that a failed command
+/// takes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Undo {
+    /// The keyboard never appeared: the Keyboard mode/tile must go back off.
+    KeyboardShown,
+}
+
+fn spawn_child(argv: &[&str], keep_stderr: bool) -> Result<std::process::Child, Outcome> {
+    Command::new(argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(if keep_stderr { Stdio::piped() } else { Stdio::null() })
+        .spawn()
+        .map_err(|e| Outcome::Failed(format!("{}: {e}", argv[0])))
+}
+
+/// Missing-binary check for tests (spawn failure is immediate).
+#[cfg(test)]
 fn spawn(argv: &[&str]) -> Outcome {
-    match Command::new(argv[0]).args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-        Ok(child) => Outcome::Done(format!("{} (pid {})", argv.join(" "), child.id())),
-        Err(e) => Outcome::Failed(format!("{}: {e}", argv[0])),
+    match spawn_child(argv, false) {
+        Ok(_) => Outcome::Done("started".into()),
+        Err(o) => o,
     }
 }
 
@@ -66,17 +95,69 @@ pub fn keyboard_argv(show: bool) -> [&'static str; 8] {
 /// and report `Unwired` until they exist.
 pub struct System {
     pub launcher: Option<hatch_core::Launcher>,
+    pending: Vec<Pending>,
 }
 
 impl System {
     pub fn new() -> System {
-        System { launcher: Some(hatch_core::Launcher::new(hatch_core::Config::load())) }
+        System { launcher: Some(hatch_core::Launcher::new(hatch_core::Config::load())), pending: Vec::new() }
     }
 }
 
 impl Default for System {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl System {
+    /// Start a command whose exit status matters; its result arrives via `reap`.
+    fn start(&mut self, argv: &[&str], long_running: bool) -> Outcome {
+        self.start_with(argv, long_running, None)
+    }
+
+    fn start_with(&mut self, argv: &[&str], long_running: bool, on_fail: Option<Undo>) -> Outcome {
+        // A long-running program (hatch-egui staying resident) is never
+        // reaped; only short calls whose exit status IS the result are.
+        match spawn_child(argv, !long_running) {
+            Ok(child) => {
+                let label = argv.iter().filter(|a| !a.is_empty()).cloned().collect::<Vec<_>>().join(" ");
+                let msg = format!("started {label} (pid {})", child.id());
+                if !long_running {
+                    self.pending.push(Pending { label, child, on_fail });
+                }
+                Outcome::Done(msg)
+            }
+            Err(o) => o,
+        }
+    }
+
+    /// Non-blocking: results of short commands that have finished since the
+    /// last call. Call once per loop iteration and put them in the trace.
+    pub fn reap(&mut self) -> Vec<(Outcome, Option<Undo>)> {
+        let mut out = Vec::new();
+        self.pending.retain_mut(|p| match p.child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                out.push((Outcome::Done(format!("{} succeeded", p.label)), None));
+                false
+            }
+            Ok(Some(status)) => {
+                let mut err = String::new();
+                if let Some(mut e) = p.child.stderr.take() {
+                    use std::io::Read;
+                    let _ = e.read_to_string(&mut err);
+                }
+                let err = err.trim().lines().last().unwrap_or("").to_string();
+                out.push((Outcome::Failed(format!("{} exited {}{}", p.label, status.code().map_or("by signal".into(), |c| c.to_string()), if err.is_empty() { String::new() } else { format!(": {err}") })), p.on_fail));
+                false
+            }
+            Ok(None) => true,
+            Err(e) => {
+                out.push((Outcome::Failed(format!("{}: {e}", p.label)), p.on_fail));
+                false
+            }
+        });
+        out
     }
 }
 
@@ -93,10 +174,12 @@ impl Executor for System {
                 None => Outcome::Failed("no hatch launcher".into()),
             },
             // One instance, poke-file toggle: starts hatch if it is not running.
-            Action::SummonLauncher => spawn(&["hatch-egui", "--toggle"]),
+            // --toggle pokes a running hatch and exits, or BECOMES the
+            // resident instance when none runs: treat it as long-running.
+            Action::SummonLauncher => self.start(&["hatch-egui", "--toggle"], true),
             Action::ShowKeyboard(on) => {
                 let a = keyboard_argv(*on);
-                spawn(&a[..7])
+                self.start_with(&a[..7], false, on.then_some(Undo::KeyboardShown))
             }
             Action::ShowTrackpad(on) => Outcome::Done(format!("trackpad overlay {}", if *on { "shown" } else { "hidden" })),
             Action::SavePrefs => Outcome::Unwired("caller persists prefs (save_prefs) since the executor does not hold them"),
@@ -344,6 +427,32 @@ mod tests {
     }
 
     #[test]
+    fn short_commands_report_their_real_result() {
+        let mut sys = System { launcher: None, pending: Vec::new() };
+        assert!(matches!(sys.start(&["true"], false), Outcome::Done(ref s) if s.starts_with("started")));
+        assert!(matches!(sys.start_with(&["sh", "-c", "echo nope >&2; exit 3"], false, Some(Undo::KeyboardShown)), Outcome::Done(_)));
+        let mut got = Vec::new();
+        for _ in 0..200 {
+            got.extend(sys.reap());
+            if got.len() == 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.iter().any(|o| matches!(o, (Outcome::Done(s), None) if s == "true succeeded")), "{got:?}");
+        assert!(got.iter().any(|o| matches!(o, (Outcome::Failed(s), Some(Undo::KeyboardShown)) if s.contains("exited 3") && s.contains("nope"))), "{got:?}");
+        assert!(sys.reap().is_empty(), "each result reported once");
+    }
+
+    #[test]
+    fn long_running_commands_are_not_tracked() {
+        let mut sys = System { launcher: None, pending: Vec::new() };
+        sys.start(&["sleep", "5"], true);
+        assert!(sys.pending.is_empty());
+    }
+
+    #[test]
     fn missing_binary_is_a_visible_failure() {
         assert!(matches!(spawn(&["/nonexistent/tideshell-probe"]), Outcome::Failed(_)));
     }
@@ -359,7 +468,7 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("XDG_CONFIG_HOME", &home);
         let entry = hatch_core::AppEntry { id: "t".into(), name: "T".into(), exec: "true".into(), ..Default::default() };
-        let mut sys = System { launcher: Some(hatch_core::Launcher::with_entries(hatch_core::Config::default(), vec![entry])) };
+        let mut sys = System { launcher: Some(hatch_core::Launcher::with_entries(hatch_core::Config::default(), vec![entry])), pending: Vec::new() };
         match sys.run(&Action::LaunchApp("t".into())) {
             Outcome::Done(s) => assert!(s.starts_with("launched t")),
             o => panic!("{o:?}"),
