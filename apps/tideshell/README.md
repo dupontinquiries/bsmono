@@ -44,15 +44,21 @@ windows in the switcher; a click on a card raised that window
 `systemcompkit`'s `toplevel_probe`. cosmic-comp advertises no fullscreen
 capability, which is why carousel mode maximizes.
 
+The trackpad's output is also verified live: with cosmic-comp patch
+`0002-dbus-ei-allow-tideshell`, the shell owns `org.tideshell.Shell`, gets an
+EI socket (a caller without an allowlisted name is refused: "Access
+denied"), and `--ei-selftest -450 0` moved cosmic-comp's pointer 450 px and
+clicked: gtk4-widget-factory's `WAYLAND_DEBUG` log shows the motion and a
+BTN_LEFT press/release, and the click activated that window. Scroll goes
+the same path but was not exercised live.
+
 Wired, not yet exercised live: hatch-core launches (recents shared with
 hatch), `hatch-egui --toggle`, rusty-board `Show`/`Hide` via `busctl`,
 prefs file (`~/.config/tideshell/prefs`, the `shell.*` keys settingsd
 would carry).
 
 Not wired, and reported as `unwired:` in the trace rather than silently
-ignored: the trackpad's EI pointer (needs cosmic-comp patch
-`0002-dbus-ei-allow-tideshell` plus a reis client, as cosmic-osk does),
-quick-toggle backends, brightness/volume, the settingsd transport, and the
+ignored: quick-toggle backends, brightness/volume, the settingsd transport, and the
 layer-shell edge strips and surfaces that replace the simulator window on
 a phone.
 
@@ -64,4 +70,7 @@ export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 XDG_RUNTIME_DIR=/tmp/xdg
 Xvfb :99 -screen 0 1000x1000x24 & cosmic-comp &   # falls back to winit/EGL
 WAYLAND_DISPLAY=wayland-1 DISPLAY= gtk4-demo &    # some real windows
 WAYLAND_DISPLAY=wayland-1 DISPLAY= tideshell-sim --wayland --trace
+# trackpad/EI also needs a session bus shared by both:
+#   dbus-daemon --session --address=unix:path=$XDG_RUNTIME_DIR/bus --fork
+#   export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus   (before cosmic-comp)
 ```

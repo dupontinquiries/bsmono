@@ -15,6 +15,8 @@
 //! * `--wayland` uses the compositor's real windows (cosmic-comp: toplevel
 //!   list + management) instead of simulated ones; window actions are sent
 //!   as zcosmic requests.
+//! * `--ei-selftest DX DY`: once EI is Ready, move the pointer by (DX, DY)
+//!   and left-click, through the same channel the trackpad uses.
 //! * `--demo` drives the real recognizer with synthetic touches at startup, to
 //!   reach a state for a screenshot without input.
 
@@ -137,6 +139,10 @@ struct App {
     demo_started: Option<f64>,
     last_cards: Vec<WindowCard>,
     live: Option<tideshell_egui::wayland::Windows>,
+    ei: Option<tideshell_egui::ei::EiPointer>,
+    ei_status: Option<tideshell_egui::ei::Status>,
+    ei_selftest: Option<(f32, f32)>,
+    ei_ready_at: Option<f64>,
 }
 
 impl App {
@@ -145,6 +151,10 @@ impl App {
             if a == Action::SavePrefs {
                 let o = if self.persist { effects::save_prefs(&self.shell.prefs) } else { Outcome::Done("prefs not persisted (sim without --persist)".into()) };
                 self.shell.note(o.describe());
+                continue;
+            }
+            if let (Action::Pointer(p), Some(ei)) = (&a, &self.ei) {
+                ei.send(*p);
                 continue;
             }
             let mut sim = SimExec { world: &mut self.world, live: self.system.as_mut(), now };
@@ -158,6 +168,31 @@ impl App {
                 }
             }
             self.shell.note(o.describe());
+        }
+        if let Some(ei) = &self.ei {
+            let st = ei.status();
+            if self.ei_status.as_ref() != Some(&st) {
+                self.shell.note(format!("ei: {st:?}"));
+                if st == tideshell_egui::ei::Status::Ready && self.ei_ready_at.is_none() {
+                    self.ei_ready_at = Some(now);
+                }
+                self.ei_status = Some(st);
+            }
+            // Self-test waits 3 s past Ready: EI connects on a thread at
+            // process start, and a click sent before our own window maps is
+            // undone when cosmic-comp activates the newly mapped window (seen
+            // live; it looked like EI clicks never change focus).
+            if self.ei_ready_at.is_some_and(|t| now - t >= 3.0) {
+                {
+                    if let Some((dx, dy)) = self.ei_selftest.take() {
+                        use tideshell_core::trackpad::{Button, PointerOut as P};
+                        ei.send(P::Motion { dx, dy });
+                        ei.send(P::Button { button: Button::Left, pressed: true });
+                        ei.send(P::Button { button: Button::Left, pressed: false });
+                        self.shell.note(format!("ei selftest: moved ({dx}, {dy}) and clicked"));
+                    }
+                }
+            }
         }
         let cards = match self.live.as_mut() {
             Some(w) => match w.poll() {
@@ -356,6 +391,11 @@ fn main() -> eframe::Result<()> {
         viewport: uikit_egui::desktop::viewport(APP_ID, "tideshell sim", [408.0, 900.0]),
         ..Default::default()
     };
+    // Real sessions send trackpad output to the compositor over EI.
+    let ei = live.is_some().then(tideshell_egui::ei::EiPointer::spawn);
+    let ei_selftest = args.iter().position(|a| a == "--ei-selftest").and_then(|i| {
+        Some((args.get(i + 1)?.parse().ok()?, args.get(i + 2)?.parse().ok()?))
+    });
     let demo = val("--demo");
     let show_trace = has("--trace");
     eframe::run_native(
@@ -367,7 +407,7 @@ fn main() -> eframe::Result<()> {
             let palette = uikit_egui::palette_colors_ctx(&cc.egui_ctx, &prefs.palette);
             let mut view = ShellView::default();
             view.show_trace = show_trace;
-            Ok(Box::new(App { shell, view, world, system, persist, palette, apps, demo, demo_started: None, last_cards: vec![], live }))
+            Ok(Box::new(App { shell, view, world, system, persist, palette, apps, demo, demo_started: None, last_cards: vec![], live, ei, ei_status: None, ei_selftest, ei_ready_at: None }))
         }),
     )
 }

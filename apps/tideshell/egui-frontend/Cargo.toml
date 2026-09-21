@@ -14,11 +14,13 @@ path = "src/bin/tideshell_sim.rs"
 required-features = ["app"]
 
 [features]
-default = ["app", "wayland"]
+default = ["app", "wayland", "ei"]
 app = ["dep:eframe"]
 # Real windows via systemcompkit (ext-foreign-toplevel-list + zcosmic
 # toplevel info/management). Pure-Rust wayland-client: no libwayland link.
 wayland = ["dep:systemcompkit"]
+# Trackpad output over libei to cosmic-comp (needs cosmic-comp patch 0002).
+ei = ["dep:reis", "dep:zbus"]
 
 [dependencies]
 tideshell-core = { path = "../crates/tideshell-core" }
@@ -27,6 +29,9 @@ uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 settings-kit = { path = "../../../shared/settings-kit" }
 systemcompkit = { path = "../../../shared/systemcompkit", features = ["wayland_io"], optional = true }
 egui = "0.34"
+# Same reis as cosmic-comp epoch-1.8.0's Cargo.lock (protocol parity).
+reis = { version = "0.7.1", optional = true }
+zbus = { version = "5", optional = true }
 # Glow chosen explicitly (eframe_backend_check): wgpu's default device asks for
 # more colour attachments than phone GPUs allow. Same reasoning as hatch-egui.
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
