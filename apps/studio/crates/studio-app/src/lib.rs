@@ -61,6 +61,7 @@ pub mod transcripts;
 pub mod overview;
 pub mod insert_by_content;
 pub mod stage;
+pub mod kaleido_gallery;
 pub mod touchup_job;
 pub mod mixer_panel;
 pub mod morph_pad;
@@ -3238,6 +3239,8 @@ pub struct App {
     /// loses what the previous filter hid.
     words_raw: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
     word_filter: studio_voice::WordFilter,
+    /// The kaleidoscope gallery, open over the selected clip's frame.
+    kaleido_gallery: Option<kaleido_gallery::Gallery>,
     /// Structure view: sections across, lanes down, instead of one row per
     /// track. View state, per session — a way of looking, like zoom.
     structure_view: bool,
@@ -3450,6 +3453,7 @@ impl Default for App {
               words_raw: beside.words,
               word_filter: studio_voice::WordFilter::All,
               structure_view: false,
+              kaleido_gallery: None,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
               upscale_clip: None,
@@ -3785,6 +3789,18 @@ impl eframe::App for App {
                         .clicked() {
                         self.run_palette_act(palette::Act::Shell(
                             palette::ShellVerb::TouchUpStabilize(palette::StabilizeKind::Dejerk)));
+                        ui.close();
+                    }
+                    if ui.add_enabled(selected, egui::Button::new("kaleidoscope gallery…"))
+                        .on_hover_text("every option drawn on this clip's frame, arranged by wedges, turn and centre")
+                        .clicked() {
+                        self.open_kaleido_gallery();
+                        ui.close();
+                    }
+                    if ui.add_enabled(selected && !busy, egui::Button::new("rescue: follow the motion (1.6x)"))
+                        .on_hover_text("punch in on what moves and follow it — covers a weak take with the gesture")
+                        .clicked() {
+                        self.run_palette_act(palette::Act::Shell(palette::ShellVerb::TouchUpFollow { zoom_pct: 160 }));
                         ui.close();
                     }
                     if ui.add_enabled(selected && !busy, egui::Button::new("clean plate (±6 frames)"))
@@ -4242,6 +4258,7 @@ impl eframe::App for App {
         self.export_dialog_window(ctx);
         self.export_tracker_window(ctx);
         self.touchup_tracker(ctx);
+        self.kaleido_gallery_window(ctx);
 
         // ── files dropped on the window ──────────────────────────────────
         //
@@ -6061,6 +6078,9 @@ impl App {
                     }
                 }
                 palette::ShellVerb::TouchUpStabilize(kind) => self.start_stabilize(kind),
+                palette::ShellVerb::TouchUpFollow { zoom_pct } => self.start_touchup(
+                    studio_video::touchup::Fix::FollowMotion { zoom: zoom_pct as f32 / 100.0, smooth: 0.5 },
+                    format!("following the motion at {:.1}x", zoom_pct as f32 / 100.0)),
                 palette::ShellVerb::TouchUpCleanPlate { radius, moving } =>
                     self.start_clean_plate(radius, moving),
                 palette::ShellVerb::MulticamLevel { group, bus } => {
@@ -7054,6 +7074,51 @@ impl App {
             radius, align: moving,
         };
         self.start_touchup(fix, format!("clean plate ±{radius} frames"));
+    }
+
+    /// Open the gallery on the first selected picture clip's frame at the
+    /// playhead (or its middle, if the playhead is not over it).
+    fn open_kaleido_gallery(&mut self) {
+        let project = &self.studio.session.doc.project;
+        let Some(clip) = self.studio.selection.iter().filter_map(|id| project.clips.get(id))
+            .find(|c| project.sources.get(&c.source).map(|s| s.has_video).unwrap_or(false)).cloned() else {
+            self.studio.status = "select a picture clip for the gallery".into();
+            return;
+        };
+        let src = &project.sources[&clip.source];
+        let ph = self.studio.playhead();
+        let at = if ph >= clip.pos && ph < clip.end() { clip.src_in.saturating_add(ph.saturating_sub(clip.pos)) }
+                 else { clip.src_in.saturating_add(Ticks(clip.len.0 / 2)) };
+        let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        match studio_video::frame_rgb(&base.join(&src.path), at, 320, 180) {
+            Ok(px) => self.kaleido_gallery = Some(kaleido_gallery::Gallery::new(px, 320, 180)),
+            Err(e) => self.studio.status = format!("could not read a frame for the gallery: {e:?}"),
+        }
+    }
+
+    fn kaleido_gallery_window(&mut self, ctx: &egui::Context) {
+        let Some(g) = &mut self.kaleido_gallery else { return };
+        let mut open = true;
+        let mut chosen = None;
+        egui::Window::new("Kaleidoscope").open(&mut open).resizable(false).show(ctx, |ui| { chosen = g.show(ui); });
+        if let Some(k) = chosen {
+            let project = &self.studio.session.doc.project;
+            let ops: Vec<studio_core::Op> = self.studio.selection.iter().filter_map(|id| project.clips.get(id))
+                .filter(|c| project.sources.get(&c.source).map(|s| s.has_video).unwrap_or(false))
+                .map(|c| {
+                    let mut fx: Vec<studio_core::Effect> = c.effects.iter()
+                        .filter(|e| e.kind != studio_video::kaleido::KIND).cloned().collect();
+                    fx.push(k.effect());
+                    studio_core::Op::SetEffects { id: c.id, effects: fx }
+                }).collect();
+            if !ops.is_empty() {
+                self.studio.edit_group(ops, "kaleidoscope");
+                self.studio.status = format!("kaleidoscope: {} wedges, turned {:.0}°, centre at {:.0}% — preview and export",
+                                             k.segments, k.angle, k.cx * 100.0);
+            }
+            open = false;
+        }
+        if !open { self.kaleido_gallery = None; }
     }
 
     /// Poll the touch-up worker. Same shape as the export tracker: egui only

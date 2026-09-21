@@ -116,6 +116,8 @@ pub enum ShellVerb {
     /// using `radius` frames each side. `moving` warps the neighbours onto
     /// the current frame first, for a shot where the camera travels.
     TouchUpCleanPlate { radius: usize, moving: bool },
+    /// Rescue a take: punch in by `zoom_pct`% and follow where the movement is.
+    TouchUpFollow { zoom_pct: u32 },
     CallToggle,
     CallMute,
     CallPushToTalk,
@@ -266,6 +268,8 @@ pub enum Ask {
     /// Whether the camera moves during the shot being cleaned, then how many
     /// frames each side to look at.
     CleanPlateCamera,
+    /// How far to punch in when following the motion.
+    FollowZoom,
     CleanPlateWindow(bool),
     /// Which bus feeds which — the input side, chosen from the receiver.
     BusInputPick(BusId),
@@ -363,6 +367,11 @@ pub fn root() -> Vec<Choice> {
           Then::Ask(Ask::MultiviewGroup)),
         c("stabilize the selected clip", Some("still / smooth / de-jerk"),
           Then::Ask(Ask::StabilizeFlavor)),
+        // "punch in" last: in the middle, "punch in and ... motion" spelled
+        // p-i-a-n-o and outranked the piano roll for anyone typing "piano"
+        c("rescue a take: follow the motion (punch in)",
+          Some("cover a weak take by focusing on what moves — a hand, a turn"),
+          Then::Ask(Ask::FollowZoom)),
         c("clean plate the selected clip (remove something crossing it)",
           Some("a car, a passer-by — anything that does not stay"),
           Then::Ask(Ask::CleanPlateCamera)),
@@ -742,6 +751,11 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
                      hint: Some("a deliberate pan with a bump in it".into()),
                      then: Then::Do(Act::Shell(ShellVerb::TouchUpStabilize(StabilizeKind::Dejerk))) },
         ],
+        Ask::FollowZoom => [(130u32, "1.3x — keep most of the frame"), (160, "1.6x — the gesture fills it"),
+                             (200, "2x — tight on the movement")].into_iter().map(|(z, what)| Choice {
+            label: format!("{:.1}x", z as f32 / 100.0), hint: Some(what.into()),
+            then: Then::Do(Act::Shell(ShellVerb::TouchUpFollow { zoom_pct: z })),
+        }).collect(),
         Ask::CleanPlateCamera => vec![
             Choice { label: "the camera is locked off".into(),
                      hint: Some("tripod, or already stabilized".into()),

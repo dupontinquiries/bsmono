@@ -38,6 +38,11 @@ pub enum Fix {
     Stabilize { flavor: Flavor, budget: Budget },
     /// Remove something crossing the frame, using the frames around each one.
     CleanPlate { settings: Settings, radius: usize, align: bool },
+    /// Rescue a take by punching in on where the movement is and following
+    /// it: the low angle up to the dancing hand that saved a tired take in
+    /// "All My Life". `zoom` is the punch-in; `smooth` seconds is how gently
+    /// the crop follows.
+    FollowMotion { zoom: f32, smooth: f64 },
 }
 
 /// What to fix, on which range of which source.
@@ -70,6 +75,7 @@ impl Ticket {
 pub enum Did {
     Stabilized { zoom: f32, clamped_px: f32, frames: usize },
     Cleaned { frames_touched: usize, pixels_filled: u64, pixels_unresolved: u64 },
+    Followed { zoom: f32, frames: usize },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -155,11 +161,21 @@ pub fn render(t: &Ticket, out: &Path, size: Size, fps: f64) -> Result<Version, S
 
     // Measurement pass: one grey decode shared by every fix that needs motion.
     let needs_motion = t.fixes.iter().any(|f| matches!(f,
-        Fix::Stabilize { .. } | Fix::CleanPlate { align: true, .. }));
+        Fix::Stabilize { .. } | Fix::CleanPlate { align: true, .. } | Fix::FollowMotion { .. }));
+    let follow_zoom = t.fixes.iter().find_map(|f| match f { Fix::FollowMotion { zoom, smooth } => Some((*zoom, *smooth)), _ => None });
+    let mut follow: Vec<(f32, f32)> = Vec::new();
     let (path, steps) = if needs_motion {
         let grey = pipe.gray()?;
         if grey.len() < 2 { return Err(format!("only {} frame(s) decoded", grey.len())); }
         let steps = stabilize::steps(&grey, (size.w / 20).max(8), 1);
+        if let Some((zoom, smooth)) = follow_zoom {
+            let c = crate::action::motion_centroid(&grey, (size.w / 20).max(8));
+            let found = c.iter().flatten().count();
+            if found < grey.len() / 5 {
+                warnings.push(format!("follow: movement found in only {found} of {} frames -- the crop mostly holds still", grey.len()));
+            }
+            follow = crate::action::follow_path(&c, fps, smooth, zoom);
+        }
         (stabilize::measure(&grey, (size.w / 20).max(8)), steps)
     } else {
         (Vec::new(), Vec::new())
@@ -189,6 +205,9 @@ pub fn render(t: &Ticket, out: &Path, size: Size, fps: f64) -> Result<Version, S
             }
             Fix::CleanPlate { settings, radius, align } => {
                 plate = Some((settings.clone(), *radius, *align));
+            }
+            Fix::FollowMotion { zoom, .. } => {
+                did.push(Did::Followed { zoom: *zoom, frames: follow.len() });
             }
         }
     }
@@ -222,6 +241,11 @@ pub fn render(t: &Ticket, out: &Path, size: Size, fps: f64) -> Result<Version, S
         if let Some(s) = &solution {
             let c = s.corrections[i.min(s.corrections.len() - 1)];
             frame = frame.warp_pose(c.dx, c.dy, s.zoom, c.rot);
+        }
+        if let (Some((zoom, _)), Some(p)) = (follow_zoom, follow.get(i.min(follow.len().saturating_sub(1)))) {
+            // centre the punch-in on the followed point: output centre samples it
+            let (w, h) = (frame.w as f32, frame.h as f32);
+            frame = frame.warp(w / 2.0 - p.0 * w, h / 2.0 - p.1 * h, zoom);
         }
         frame
     })?;
@@ -346,6 +370,38 @@ mod tests {
         let after = jitter(&Pipe { input: out.clone(), range: None, size, fps: 12.0 });
         assert!(after < before * 0.5, "{after} vs {before}");
         for f in [&shaky, &out] { let _ = std::fs::remove_file(f); }
+    }
+
+    #[test]
+    fn a_follow_ticket_keeps_the_moving_performer_near_the_centre() {
+        if !ffmpeg_or_skip("a_follow_ticket_keeps_the_moving_performer_near_the_centre") { return; }
+        let s = shoot(&[1.0], 6.0);
+        let size = Size { w: 128, h: 72 };
+        let plate = s.dir.join(format!("tu-follow-{}.mp4", std::process::id()));
+        // textured background, a bright "hand" travelling left to right
+        Pipe { input: s.takes[0].video.clone(), range: None, size, fps: 12.0 }
+            .map(&plate, 12, |i, mut f| {
+                for y in 0..f.h { for x in 0..f.w {
+                    let v = 100.0 + 40.0 * ((x as f32) / 6.0).sin() * ((y as f32) / 5.0).cos();
+                    f.set(x, y, [v as u8, v as u8, v as u8]);
+                }}
+                let hx = 8 + (i as u32 * 3) % 100;
+                for y in 28..44 { for x in hx..(hx + 12).min(f.w) { f.set(x, y, [250, 60, 60]); } }
+                f
+            }).expect("plate");
+        let t = ticket(&plate, vec![Fix::FollowMotion { zoom: 1.6, smooth: 0.3 }]);
+        let out = s.dir.join(format!("tu-followed-{}.mp4", std::process::id()));
+        let v = render(&t, &out, size, 12.0).expect("renders");
+        assert!(matches!(v.report.did[0], Did::Followed { zoom, .. } if (zoom - 1.6).abs() < 1e-6));
+        // where is the red hand in the output? near the centre, not drifting with the plate
+        let offs: Vec<f32> = [1.0f64, 1.5, 2.0].iter().map(|&at| {
+            let px = crate::frame_rgb(&out, Ticks::from_seconds(at - 0.5), size.w, size.h).unwrap();
+            let (mut sx, mut n) = (0.0f32, 0.0f32);
+            for (k, p) in px.chunks(3).enumerate() { if p[0] > 180 && p[1] < 110 { sx += (k as u32 % size.w) as f32; n += 1.0; } }
+            if n > 0.0 { (sx / n - size.w as f32 / 2.0).abs() } else { f32::MAX }
+        }).collect();
+        assert!(offs.iter().all(|o| *o < size.w as f32 * 0.2), "the hand stays near the centre: {offs:?}");
+        for f in [&plate, &out] { let _ = std::fs::remove_file(f); }
     }
 
     #[test]

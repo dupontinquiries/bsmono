@@ -130,6 +130,67 @@ pub fn cut_windows(motion: &[f32], fps: f64, rel: f32) -> Vec<CutWindow> {
     out
 }
 
+/// Where in the frame the movement is, per frame, as fractions of the frame
+/// (`None` where too little moves to say). Camera motion is cancelled first,
+/// like [`body_motion`], then the centre of the pixels that changed most is
+/// taken -- the hand in a dance, the head in a turn.
+pub fn motion_centroid(frames: &[Gray], max_shift: u32) -> Vec<Option<(f32, f32)>> {
+    let mut out = vec![None; frames.len()];
+    for i in 1..frames.len() {
+        let (a, b) = (&frames[i - 1], &frames[i]);
+        let m = estimate(a, b, max_shift);
+        let (dx, dy) = (m.dx.round() as i64, m.dy.round() as i64);
+        let (w, h) = (a.w as i64, a.h as i64);
+        let margin = (max_shift as i64 + 2).min(w / 4).min(h / 4);
+        let mut diffs = Vec::with_capacity(((w - 2 * margin) * (h - 2 * margin)).max(0) as usize);
+        for y in margin..h - margin { for x in margin..w - margin {
+            let (sx, sy) = (x - dx, y - dy);
+            if sx < 0 || sy < 0 || sx >= w || sy >= h { continue; }
+            let d = (a.px[(sy * w + sx) as usize] as i32 - b.px[(y * w + x) as usize] as i32).unsigned_abs() as f32;
+            diffs.push((x, y, d));
+        }}
+        if diffs.is_empty() { continue; }
+        let mean = diffs.iter().map(|d| d.2).sum::<f32>() / diffs.len() as f32;
+        // only what clearly moved counts: grain and compression shimmer do not
+        let thr = (mean * 3.0).max(12.0);
+        let (mut sx, mut sy, mut sw) = (0.0f64, 0.0f64, 0.0f64);
+        for &(x, y, d) in &diffs { if d > thr { let wgt = (d - thr) as f64; sx += x as f64 * wgt; sy += y as f64 * wgt; sw += wgt; } }
+        let moved = diffs.iter().filter(|d| d.2 > thr).count();
+        if moved >= 12 && sw > 0.0 {
+            out[i] = Some(((sx / sw) as f32 / w as f32, (sy / sw) as f32 / h as f32));
+        }
+    }
+    out
+}
+
+/// A crop path that follows the motion: where to centre a punch-in of
+/// `zoom`, per frame, as fractions of the frame.
+///
+/// Gaps (frames with no clear motion) hold the last known centre; the path is
+/// smoothed over `smooth` seconds so the punch-in drifts like an operator
+/// following a move rather than snapping to each gesture; and it is clamped
+/// so the crop never leaves the frame. Before the first motion the path waits
+/// at the first place motion appears.
+pub fn follow_path(centroids: &[Option<(f32, f32)>], fps: f64, smooth: f64, zoom: f32) -> Vec<(f32, f32)> {
+    let n = centroids.len();
+    if n == 0 { return Vec::new(); }
+    let first = centroids.iter().flatten().next().copied().unwrap_or((0.5, 0.5));
+    let mut held = first;
+    let raw: Vec<(f32, f32)> = centroids.iter().map(|c| { if let Some(p) = c { held = *p; } held }).collect();
+    let sigma = (smooth * fps / 2.0).max(0.5) as f32;
+    let r = (3.0 * sigma).ceil() as isize;
+    let k: Vec<f32> = (-r..=r).map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp()).collect();
+    let half = 0.5 / zoom.max(1.0);
+    (0..n as isize).map(|i| {
+        let (mut x, mut y, mut ws) = (0.0f32, 0.0f32, 0.0f32);
+        for (j, kw) in (-r..=r).zip(&k) {
+            let q = (i + j).clamp(0, n as isize - 1) as usize;
+            x += raw[q].0 * kw; y += raw[q].1 * kw; ws += kw;
+        }
+        ((x / ws).clamp(half, 1.0 - half), (y / ws).clamp(half, 1.0 - half))
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +242,25 @@ mod tests {
         let a = accents(&body_motion(&frames, 12), 24.0, 1.5, 0.5);
         assert_eq!(a.len(), 1, "{a:?}");
         assert!((29..38).contains(&a[0].frame), "{a:?}");
+    }
+
+    #[test]
+    fn the_crop_follows_the_moving_hand_and_stays_in_frame() {
+        // the performer block travels left to right across a still camera
+        let frames: Vec<Gray> = (0..48).map(|i| frame(160, 90, 0, 10 + 2 * i as i64)).collect();
+        let c = motion_centroid(&frames, 10);
+        let found = c.iter().flatten().count();
+        assert!(found > 40, "the moving block is located in most frames: {found}");
+        // located where it is: block is 18 px wide starting at x, centre ~x+9
+        let (x10, x40) = (c[10].unwrap().0 * 160.0, c[40].unwrap().0 * 160.0);
+        assert!((x10 - 38.0).abs() < 12.0 && (x40 - 98.0).abs() < 12.0, "{x10} {x40}");
+        let p = follow_path(&c, 24.0, 0.5, 2.0);
+        assert!(p[40].0 > p[10].0 + 0.2, "the crop travels with it: {:?} -> {:?}", p[10], p[40]);
+        assert!(p.iter().all(|(x, y)| (0.25..=0.75).contains(x) && (0.25..=0.75).contains(y)),
+                "a 2x punch-in never leaves the frame");
+        // and a still shot yields no motion to follow
+        let still: Vec<Gray> = (0..20).map(|_| frame(160, 90, 0, 60)).collect();
+        assert!(motion_centroid(&still, 10).iter().all(|c| c.is_none()));
     }
 
     #[test]
