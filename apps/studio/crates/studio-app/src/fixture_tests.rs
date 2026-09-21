@@ -135,3 +135,31 @@ fn the_cut_detector_agrees_with_the_analysis_of_the_real_edit() {
     eprintln!("real edit: {hit}/{} estimated cuts found, {extra} found that the estimate lacks", est.len());
     assert!(hit as f64 >= 0.85 * est.len() as f64, "{hit}/{} of the analysis's cuts", est.len());
 }
+
+#[test]
+fn every_fixture_project_opens_and_finds_its_media() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    if !root.exists() { eprintln!("skip: no fixtures"); return; }
+    let found = crate::open_project::find(&[root.clone()], 3, 100);
+    let names: Vec<String> = found.iter().map(|p| p.strip_prefix(&root).unwrap().display().to_string()).collect();
+    for want in ["cartoon-fragile/fragile-cartoon.studio", "cartoon-allmylife/allmylife-cartoon.studio",
+                 "real-proxies/allmylife.studio", "real-proxies/fragile.studio"] {
+        assert!(names.iter().any(|n| n == want), "{want} is openable: {names:?}");
+    }
+    for p in &found {
+        let bytes = std::fs::read(p).unwrap();
+        let proj = studio_collab::file::SaveFile::decode(&bytes).unwrap_or_else(|| panic!("{} opens", p.display())).to_project();
+        assert!(!proj.clips.is_empty(), "{} has something on it", p.display());
+        let dir = p.parent().unwrap();
+        for s in proj.sources.values() {
+            assert!(!std::path::Path::new(&s.path).is_absolute(), "{}: {} is relative, so it opens anywhere", p.display(), s.path);
+            assert!(dir.join(&s.path).exists(), "{}: {} is beside it", p.display(), s.path);
+        }
+    }
+    // the cartoon's markers are its shots, from the truth
+    let aml = found.iter().find(|p| p.ends_with("cartoon-allmylife/allmylife-cartoon.studio")).unwrap();
+    let proj = studio_collab::file::SaveFile::decode(&std::fs::read(aml).unwrap()).unwrap().to_project();
+    assert_eq!(proj.markers.len(), 11);
+    assert!(proj.markers.iter().any(|m| m.name.contains("kaleido(6)")) && proj.markers.iter().any(|m| m.name.contains("(glitch)")),
+            "{:?}", proj.markers.iter().map(|m| &m.name).collect::<Vec<_>>());
+}

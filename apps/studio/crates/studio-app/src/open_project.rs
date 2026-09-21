@@ -75,6 +75,49 @@ pub fn label(p: &Path) -> (String, String) {
     (name, folder)
 }
 
+/// What the command line asks to open.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Launch {
+    /// Open this project (it may not exist yet: Ctrl+S creates it, as with STUDIO_PROJECT).
+    Project(PathBuf),
+    /// Print the usage and stop.
+    Help,
+    /// Nothing on the command line: STUDIO_PROJECT, or the default.
+    Default,
+    /// Something that is not a project; the message says what was wrong.
+    Refused(String),
+}
+
+pub const USAGE: &str = "usage: studio [PROJECT | FOLDER]
+
+  PROJECT   a .studio project or .studioarch archive to open
+  FOLDER    a folder holding exactly one project, e.g. fixtures/cartoon-fragile
+
+With nothing given, STUDIO_PROJECT is opened if set, else your last untitled project.
+In the app: Ctrl+P (or Shift+Space) -> 'open project' to switch.";
+
+/// Read the command line (without the program name). A project path wins
+/// over STUDIO_PROJECT; a folder with exactly one project opens that project.
+pub fn from_args(args: &[String]) -> Launch {
+    let rest: Vec<&String> = args.iter().filter(|a| !a.is_empty()).collect();
+    if rest.iter().any(|a| *a == "-h" || *a == "--help") { return Launch::Help; }
+    let Some(first) = rest.first() else { return Launch::Default };
+    if rest.len() > 1 { return Launch::Refused(format!("one project at a time; got {} arguments", rest.len())); }
+    let p = PathBuf::from(first);
+    if p.is_dir() {
+        let found: Vec<PathBuf> = std::fs::read_dir(&p).map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path())
+            .filter(|q| q.is_file() && is_project(q)).collect()).unwrap_or_default();
+        return match found.len() {
+            1 => Launch::Project(found.into_iter().next().unwrap()),
+            0 => Launch::Refused(format!("no .studio project in {}", p.display())),
+            n => Launch::Refused(format!("{n} projects in {}; name one", p.display())),
+        };
+    }
+    if is_project(&p) { return Launch::Project(p); }
+    if first.starts_with('-') { return Launch::Refused(format!("unknown option {first}")); }
+    Launch::Refused(format!("not a Studio project (.studio or .studioarch): {first}"))
+}
+
 /// Whether switching away would lose work: the live project differs from the
 /// one last opened or saved.
 pub fn needs_save(current: &studio_core::Project, saved: Option<&studio_core::Project>) -> bool {
@@ -126,6 +169,31 @@ mod tests {
         p.apply(&Op::SetMarker { at: Ticks::from_seconds(1.0), name: "a note".into() }).unwrap();
         assert!(needs_save(&p, Some(&saved)), "an edit since: ask first");
         assert!(needs_save(&p, None), "no record of a save: ask, never assume");
+    }
+
+    #[test]
+    fn the_command_line_opens_a_project_or_a_folder_with_one() {
+        let d = std::env::temp_dir().join(format!("launch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("one")).unwrap();
+        std::fs::create_dir_all(d.join("two")).unwrap();
+        std::fs::create_dir_all(d.join("none")).unwrap();
+        std::fs::write(d.join("one/film.studio"), "x").unwrap();
+        std::fs::write(d.join("one/notes.txt"), "x").unwrap();
+        std::fs::write(d.join("two/a.studio"), "x").unwrap();
+        std::fs::write(d.join("two/b.studioarch"), "x").unwrap();
+        let s = |p: &Path| p.display().to_string();
+        assert_eq!(from_args(&[]), Launch::Default);
+        assert_eq!(from_args(&[s(&d.join("one/film.studio"))]), Launch::Project(d.join("one/film.studio")));
+        assert_eq!(from_args(&[s(&d.join("one"))]), Launch::Project(d.join("one/film.studio")), "a folder with one project");
+        assert_eq!(from_args(&["new-film.studio".into()]), Launch::Project("new-film.studio".into()), "not there yet: Ctrl+S makes it");
+        assert!(matches!(from_args(&[s(&d.join("two"))]), Launch::Refused(m) if m.contains("2 projects")));
+        assert!(matches!(from_args(&[s(&d.join("none"))]), Launch::Refused(m) if m.contains("no .studio")));
+        assert!(matches!(from_args(&["clip.mp4".into()]), Launch::Refused(m) if m.contains("not a Studio project")));
+        assert!(matches!(from_args(&["--fullscreen".into()]), Launch::Refused(m) if m.contains("unknown option")));
+        assert!(matches!(from_args(&["a.studio".into(), "b.studio".into()]), Launch::Refused(_)));
+        assert_eq!(from_args(&["--help".into()]), Launch::Help);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -3353,6 +3353,11 @@ impl Default for App {
 /// last place an archive was written -- a person who archives to an SD card
 /// wants the working copy beside it -- else the freedesktop data directory.
 fn default_project_path() -> std::path::PathBuf {
+    // a project named on the command line wins over STUDIO_PROJECT
+    // (`studio film.studio`, or `studio fixtures/cartoon-fragile`); `run`
+    // has already handled --help and anything it refused
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let open_project::Launch::Project(p) = open_project::from_args(&args) { return p; }
     match std::env::var("STUDIO_PROJECT") {
         Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
         _ => {
@@ -7737,6 +7742,18 @@ impl App {
 /// Open a window and run.
 #[cfg(feature = "app")]
 pub fn run(title: &str) -> eframe::Result<()> {
+    // The command line first, before any window: --help, and anything that is
+    // not a project, are answered on the terminal and stop here -- starting a
+    // demo instead of the file someone named would look like the file was lost.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match open_project::from_args(&args) {
+        open_project::Launch::Help => { println!("{}", open_project::USAGE); return Ok(()); }
+        open_project::Launch::Refused(why) => {
+            eprintln!("studio: {why}\n\n{}", open_project::USAGE);
+            std::process::exit(2);
+        }
+        open_project::Launch::Project(_) | open_project::Launch::Default => {}
+    }
     // Why the window will not open, said before the panic in a dependency does. The main
     // here delegates into this function, so the check belongs at the run entry rather than
     // at `fn main` — see `uikit_egui::backend_check`. Silent when the setup is fine.
