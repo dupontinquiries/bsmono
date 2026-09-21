@@ -167,6 +167,61 @@ pub fn candidates(signals: &[Signal], marks: &[Mark], length: f64, hop: f64, thr
     out
 }
 
+/// How the angle for each shot is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prefer {
+    /// Take turns: the signals decide only when.
+    RoundRobin,
+    /// The angle whose performer moves most over the coming shot.
+    MostMotion,
+    /// The calmest angle over the coming shot.
+    LeastMotion,
+}
+
+/// Choose an angle for each shot between consecutive cut times over
+/// [0, length), from one motion lane per angle. With `no_repeat`, a cut never
+/// lands on the angle already on screen -- a cut to the same angle is a jump
+/// cut. Each choice comes with its reason.
+pub fn choose_angles(cuts: &[f64], length: f64, angle_motion: &[Signal], prefer: Prefer, no_repeat: bool) -> Vec<(f64, f64, usize, String)> {
+    let n = angle_motion.len().max(1);
+    let mut bounds = vec![0.0];
+    bounds.extend(cuts.iter().copied().filter(|t| *t > 0.0 && *t < length));
+    bounds.push(length);
+    let mut out = Vec::new();
+    let mut prev: Option<usize> = None;
+    for (k, w) in bounds.windows(2).enumerate() {
+        let (a, b) = (w[0], w[1]);
+        // mean motion of each angle over the shot
+        let mean = |s: &Signal| {
+            let steps = (((b - a) / s.hop).ceil() as usize).max(1);
+            (0..steps).map(|i| s.at(a + i as f64 * s.hop)).sum::<f32>() / steps as f32
+        };
+        let m: Vec<f32> = (0..n).map(|i| angle_motion.get(i).map(mean).unwrap_or(0.0)).collect();
+        let allowed: Vec<usize> = (0..n).filter(|i| !(no_repeat && Some(*i) == prev && n > 1)).collect();
+        let pick = match prefer {
+            Prefer::RoundRobin => allowed.iter().copied().find(|i| *i == k % n).unwrap_or(allowed[0]),
+            Prefer::MostMotion => allowed.iter().copied().max_by(|x, y| m[*x].partial_cmp(&m[*y]).unwrap_or(std::cmp::Ordering::Equal)).unwrap(),
+            Prefer::LeastMotion => allowed.iter().copied().min_by(|x, y| m[*x].partial_cmp(&m[*y]).unwrap_or(std::cmp::Ordering::Equal)).unwrap(),
+        };
+        // the angle the rule would have taken with no restriction: if the pick
+        // differs, the no-repeat rule decided it, and the reason says so
+        let unrestricted = match prefer {
+            Prefer::MostMotion => (0..n).max_by(|x, y| m[*x].partial_cmp(&m[*y]).unwrap_or(std::cmp::Ordering::Equal)),
+            Prefer::LeastMotion => (0..n).min_by(|x, y| m[*x].partial_cmp(&m[*y]).unwrap_or(std::cmp::Ordering::Equal)),
+            Prefer::RoundRobin => Some(pick),
+        };
+        let why = match prefer {
+            Prefer::RoundRobin => format!("angle {} (turns)", pick + 1),
+            _ => format!("angle {}: motion {}{}", pick + 1,
+                         m.iter().enumerate().map(|(i, v)| format!("{}{:.2}", if i == pick { "*" } else { "" }, v)).collect::<Vec<_>>().join(" vs "),
+                         if unrestricted != Some(pick) { " (the pick was already on screen)" } else { "" }),
+        };
+        out.push((a, b, pick, why));
+        prev = Some(pick);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +262,28 @@ mod tests {
         assert!(forced.forced && forced.explain() == "forced (cut here)");
         assert!(c.iter().all(|c| c.forced || (c.at - 3.6).abs() >= 0.4), "a lane peak too close to a forced cut yields to it: {c:?}");
         assert!(c.iter().any(|c| (c.at - 1.0).abs() < 0.03), "and the rest stand: {c:?}");
+    }
+
+    #[test]
+    fn the_angle_follows_the_action_and_never_jump_cuts() {
+        // angle 1 moves in the first half, angle 2 in the second
+        let n = (8.0 / HOP) as usize;
+        let a1 = Signal::new("motion: a1", HOP, (0..n).map(|i| if (i as f64 * HOP) < 4.0 { 0.9 } else { 0.1 }).collect());
+        let a2 = Signal::new("motion: a2", HOP, (0..n).map(|i| if (i as f64 * HOP) < 4.0 { 0.1 } else { 0.8 }).collect());
+        let lanes = [a1, a2];
+        let shots = choose_angles(&[2.0, 4.0, 6.0], 8.0, &lanes, Prefer::MostMotion, false);
+        assert_eq!(shots.iter().map(|s| s.2).collect::<Vec<_>>(), vec![0, 0, 1, 1], "follows the action");
+        assert!(shots[2].3.contains("*0.80"), "and says why: {}", shots[2].3);
+        let calm = choose_angles(&[2.0, 4.0, 6.0], 8.0, &lanes, Prefer::LeastMotion, false);
+        assert_eq!(calm.iter().map(|s| s.2).collect::<Vec<_>>(), vec![1, 1, 0, 0]);
+        // no repeats: a cut never lands on the angle already showing
+        let nr = choose_angles(&[2.0, 4.0, 6.0], 8.0, &lanes, Prefer::MostMotion, true);
+        assert!(nr.windows(2).all(|w| w[0].2 != w[1].2), "no jump cuts: {:?}", nr.iter().map(|s| s.2).collect::<Vec<_>>());
+        assert!(nr[1].3.contains("already on screen"), "when no-repeat overrides the rule, the reason says so: {}", nr[1].3);
+        assert!(!shots[1].3.contains("already on screen"), "and only then: {}", shots[1].3);
+        let rr = choose_angles(&[2.0, 4.0, 6.0], 8.0, &lanes, Prefer::RoundRobin, true);
+        assert_eq!(rr.iter().map(|s| s.2).collect::<Vec<_>>(), vec![0, 1, 0, 1]);
+        assert_eq!((shots[0].0, shots.last().unwrap().1), (0.0, 8.0), "the shots cover the span");
     }
 
     #[test]

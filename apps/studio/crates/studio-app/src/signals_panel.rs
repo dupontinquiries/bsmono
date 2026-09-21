@@ -8,12 +8,14 @@
 //! a multicam cut on a new track, with a marker at every cut naming the lanes
 //! that put it there. One group, one undo.
 //!
-//! Which ANGLE each cut goes to is round-robin for now: the signals decide
-//! WHEN. Choosing the angle from signals (motion, who is speaking) is the next
-//! lane to add, and it slots in here.
+//! Which ANGLE each shot goes to is the operator's rule over per-angle
+//! performer-motion lanes: round-robin, follow the action (most movement over
+//! the coming shot) or calmest, optionally never cutting to the angle already
+//! on screen. Each cut's marker names both halves of the decision: the lanes
+//! that said WHEN, and the motion that said WHICH.
 
 use studio_core::{GroupId, Op, Project, Ticks, TrackId};
-use studio_video::signals::{self, Candidate, Mark, Signal};
+use studio_video::signals::{self, Candidate, Mark, Prefer, Signal};
 
 pub const HOP: f64 = 0.02;
 
@@ -46,26 +48,33 @@ pub fn marks(project: &Project, start: Ticks, end: Ticks) -> Vec<Mark> {
 
 /// The cut, as ops: a new video track with a clip per shot, and a marker at
 /// every cut naming why. Applied as one `Op::Group`.
-pub fn plan_ops(project: &Project, group: GroupId, cands: &[Candidate]) -> Result<(Vec<Op>, usize), String> {
+pub fn plan_ops(project: &Project, group: GroupId, cands: &[Candidate], angle_motion: &[Signal],
+                prefer: Prefer, no_repeat: bool) -> Result<(Vec<Op>, usize, Vec<String>), String> {
     let (angles, start, end) = studio_video::multicam::from_group(project, group)?;
     let span = (end.0 - start.0) as f64 / studio_core::TICKS_PER_SECOND as f64;
-    let times: Vec<f64> = cands.iter().map(|c| c.at).filter(|t| *t > 0.0 && *t < span).collect();
-    let shots = studio_video::multicam::plan(&angles,
-        &studio_video::multicam::Timing::OnBeats { beats: times, every: 1 },
-        &studio_video::multicam::Choice::Cycle,
-        studio_video::multicam::Rules { min_shot: 0.0, hysteresis_db: 0.0, settle: 0.0 }, span);
+    let cut_list: Vec<&Candidate> = cands.iter().filter(|c| c.at > 0.0 && c.at < span).collect();
+    let times: Vec<f64> = cut_list.iter().map(|c| c.at).collect();
+    // without a lane per angle there is nothing to choose BY: take turns
+    let prefer = if angle_motion.len() < angles.len() { Prefer::RoundRobin } else { prefer };
+    let chosen = signals::choose_angles(&times, span, angle_motion, prefer, no_repeat);
+    let shots: Vec<studio_video::multicam::Shot> = chosen.iter()
+        .map(|(a, b, k, _)| studio_video::multicam::Shot { angle: (*k).min(angles.len() - 1), start: *a, end: *b }).collect();
     let track = TrackId(project.tracks.iter().map(|t| t.id.0).max().unwrap_or(0) + 1);
     let first_clip = project.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1;
     let mut ops = vec![Op::AddTrack { track: studio_core::Track { id: track, kind: studio_core::TrackKind::Video,
         name: "multicam (signals)".into(), muted: false, locked: false, gain: 1.0, route: None }, at: project.tracks.len() }];
     ops.extend(studio_video::multicam::layout(&shots, &angles, track, start, first_clip));
-    for c in cands.iter().filter(|c| c.at > 0.0 && c.at < span) {
+    // chosen[i + 1] is the shot that STARTS at cut i
+    let mut lines = Vec::new();
+    for (i, c) in cut_list.iter().enumerate() {
         // the time is part of the name: markers are unique BY NAME, so three cuts
         // with the same reason ("kick 1.00") collapsed into one marker without it
         let at = start.saturating_add(Ticks::from_seconds(c.at));
-        ops.push(Op::SetMarker { at, name: format!("why @{:.2}s: {}", at.to_seconds(), c.explain()) });
+        let which = chosen.get(i + 1).map(|s| s.3.clone()).unwrap_or_default();
+        ops.push(Op::SetMarker { at, name: format!("why @{:.2}s: {} -> {which}", at.to_seconds(), c.explain()) });
+        lines.push(format!("{:6.2} s  {}  ->  {which}", c.at, c.explain()));
     }
-    Ok((ops, shots.len()))
+    Ok((ops, shots.len(), lines))
 }
 
 /// The window's state for one group.
@@ -76,7 +85,12 @@ pub struct Panel {
     pub span: f64,
     pub threshold: f32,
     pub min_gap: f64,
-    pub planned: Vec<Candidate>,
+    /// The last plan, one line per cut: when (the lanes) and which (the angle).
+    pub planned: Vec<String>,
+    /// One performer-motion lane per angle, in the group's angle order.
+    pub angle_motion: Vec<Signal>,
+    pub prefer: Prefer,
+    pub no_repeat: bool,
 }
 
 impl Panel {
@@ -108,6 +122,15 @@ impl Panel {
             ui.add(egui::Slider::new(&mut self.threshold, 0.05..=0.9).text("threshold"));
             ui.add(egui::Slider::new(&mut self.min_gap, 0.3..=6.0).text("min gap s"));
         });
+        ui.horizontal(|ui| {
+            ui.label("angle:");
+            ui.selectable_value(&mut self.prefer, Prefer::RoundRobin, "take turns");
+            ui.add_enabled_ui(!self.angle_motion.is_empty(), |ui| {
+                ui.selectable_value(&mut self.prefer, Prefer::MostMotion, "follow the action");
+                ui.selectable_value(&mut self.prefer, Prefer::LeastMotion, "calmest");
+            });
+            ui.checkbox(&mut self.no_repeat, "never cut to the angle on screen");
+        });
         let preview = signals::candidates(&self.lanes, &self.marks, self.span, HOP, self.threshold, self.min_gap);
         ui.label(format!("{} cut(s) at these settings", preview.len()));
         if ui.button("plan cuts on a new track").clicked() { go = Some(preview.clone()); }
@@ -115,7 +138,7 @@ impl Panel {
             ui.separator();
             ui.label("last plan — why each cut is there:");
             egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                for c in &self.planned { ui.small(format!("{:6.2} s  {}", c.at, c.explain())); }
+                for line in &self.planned { ui.small(line); }
             });
         }
         go
@@ -141,6 +164,29 @@ mod tests {
     }
 
     #[test]
+    fn following_the_action_puts_each_shot_on_the_busier_angle_and_says_so() {
+        let (mut p, g) = project();
+        let n = (8.0 / HOP) as usize;
+        // angle 1 (clip 1) busy early, angle 2 busy late
+        let a1 = Signal::new("motion: a1", HOP, (0..n).map(|i| if (i as f64 * HOP) < 4.0 { 0.9 } else { 0.1 }).collect());
+        let a2 = Signal::new("motion: a2", HOP, (0..n).map(|i| if (i as f64 * HOP) < 4.0 { 0.1 } else { 0.9 }).collect());
+        let kicks = signals::pulses("kick", &[2.0, 4.0, 6.0], 8.0, HOP, 0.1);
+        let cands = signals::candidates(&[kicks], &[], 8.0, HOP, 0.3, 0.5);
+        let (ops, _, lines) = plan_ops(&p, g, &cands, &[a1, a2], Prefer::MostMotion, false).unwrap();
+        assert!(lines.iter().any(|l| l.contains("->  angle 2: motion")), "the window shows WHICH as well as WHEN: {lines:?}");
+        p.apply(&Op::Group { ops }).unwrap();
+        let cut_track = p.tracks.last().unwrap().id;
+        let mut shots: Vec<(f64, SourceId)> = p.clips.values().filter(|c| c.track == cut_track).map(|c| (c.pos.to_seconds(), c.source)).collect();
+        shots.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert_eq!(shots.iter().map(|s| s.1 .0).collect::<Vec<_>>(), vec![1, 1, 2, 2], "busy angle each time: {shots:?}");
+        let at4 = p.markers.iter().find(|m| m.name.starts_with("why @14.00s")).expect("marker at the 4 s cut");
+        assert!(at4.name.contains("-> angle 2: motion") && at4.name.contains("*0.90"), "{}", at4.name);
+        // with no motion lanes it falls back to taking turns rather than failing
+        let (ops2, _, _) = plan_ops(&p, g, &cands, &[], Prefer::MostMotion, false).unwrap();
+        assert!(ops2.iter().any(|o| matches!(o, Op::SetMarker { name, .. } if name.contains("(turns)"))));
+    }
+
+    #[test]
     fn transcript_lines_become_a_lane_on_the_timeline() {
         let (p, g) = project();
         let seg = |a: f64| studio_voice::Segment { start: Ticks::from_seconds(a), end: Ticks::from_seconds(a + 1.0),
@@ -159,7 +205,8 @@ mod tests {
         let m = marks(&p, Ticks::from_seconds(10.0), Ticks::from_seconds(18.0));
         let cands = signals::candidates(&[kicks], &m, 8.0, HOP, 0.3, 0.5);
         assert!(cands.iter().all(|c| (c.at - 5.0).abs() > 0.4), "the no-cut marker blocked 5.0: {cands:?}");
-        let (ops, shots) = plan_ops(&p, g, &cands).unwrap();
+        let (ops, shots, lines) = plan_ops(&p, g, &cands, &[], Prefer::RoundRobin, false).unwrap();
+        assert_eq!(lines.len(), 3, "a line per cut for the window");
         let before = p.clips.len();
         let inv = p.apply(&Op::Group { ops }).unwrap();
         let cut_track = p.tracks.last().unwrap().id;
@@ -169,7 +216,7 @@ mod tests {
         assert_eq!(cuts, vec![10.0, 11.0, 13.0, 17.0], "cuts at the candidates (1, 3, 7 s into the span)");
         let whys: Vec<&str> = p.markers.iter().filter(|m| m.name.starts_with("why")).map(|m| m.name.as_str()).collect();
         assert_eq!(whys.len(), 3);
-        assert!(whys.iter().all(|w| w.contains("kick")), "{whys:?}");
+        assert!(whys.iter().all(|w| w.contains("kick") && w.contains("(turns)")), "{whys:?}");
         p.apply(&inv).unwrap();
         assert_eq!(p.clips.len(), before, "one undo takes the plan back");
         assert!(p.markers.iter().all(|m| !m.name.starts_with("why")), "including its markers");

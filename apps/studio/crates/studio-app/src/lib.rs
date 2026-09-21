@@ -7206,12 +7206,44 @@ impl App {
         // where lines start, from the loaded transcripts
         let starts = signals_panel::line_starts(project, group, start, &self.words_raw);
         if !starts.is_empty() { lanes.push(signals::pulses("line start", &starts, span, HOP, 0.12)); }
+        // performer motion per angle: each angle's stretch decoded small, the
+        // camera's own motion cancelled -- the one signal that held up in the
+        // "All My Life" analysis. Also combined into a lane for WHEN.
+        let (angles, _, _) = studio_video::multicam::from_group(project, group).unwrap_or((Vec::new(), start, end));
+        let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let mut angle_motion = Vec::new();
+        const MFPS: f64 = 25.0;
+        for (k, a) in angles.iter().enumerate() {
+            let Some(src) = project.sources.get(&a.source) else { continue };
+            let from = start.to_seconds() + a.offset;
+            let pipe = studio_video::framepipe::Pipe { input: base.join(&src.path), range: Some((from.max(0.0), span)),
+                size: studio_video::framepipe::Size { w: 160, h: 90 }, fps: MFPS };
+            let Ok(grey) = pipe.gray() else { continue };
+            let m = studio_video::action::body_motion(&grey, 10);
+            let mut sorted = m.clone(); sorted.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+            let top = sorted.get((sorted.len() as f32 * 0.95) as usize).copied().unwrap_or(1.0).max(1e-3);
+            angle_motion.push(signals::Signal::new(&format!("motion: angle {}", k + 1), 1.0 / MFPS,
+                m.iter().map(|v| (v / top).min(1.0)).collect()));
+        }
+        if angle_motion.len() == angles.len() && !angle_motion.is_empty() {
+            let n = angle_motion.iter().map(|s| s.values.len()).min().unwrap_or(0);
+            let any: Vec<f32> = (0..n).map(|i| angle_motion.iter().map(|s| s.values[i]).fold(0.0, f32::max)).collect();
+            let mut lane = signals::Signal::new("motion (any angle)", 1.0 / MFPS, any);
+            lane.weight = 0.5;   // on, but a soft tendency -- as measured
+            lanes.push(lane);
+        } else {
+            angle_motion.clear();
+        }
+        // checked AFTER the motion lanes: a first version gave up here before
+        // building them, so pictures with no audio never got their motion lane
         if lanes.is_empty() {
-            self.studio.status = "no signals over this group yet: no audio, control channels or transcripts".into();
+            self.studio.status = "no signals over this group yet: no audio, motion, control channels or transcripts".into();
             return;
         }
         let marks = signals_panel::marks(project, start, end);
-        self.signals_panel = Some(signals_panel::Panel { group, lanes, marks, span, threshold: 0.35, min_gap: 1.5, planned: Vec::new() });
+        let prefer = if angle_motion.is_empty() { signals::Prefer::RoundRobin } else { signals::Prefer::MostMotion };
+        self.signals_panel = Some(signals_panel::Panel { group, lanes, marks, span, threshold: 0.35, min_gap: 1.5,
+            planned: Vec::new(), angle_motion, prefer, no_repeat: true });
     }
 
     fn signals_window(&mut self, ctx: &egui::Context) {
@@ -7220,11 +7252,12 @@ impl App {
         let mut go = None;
         egui::Window::new("Signals — when to cut").open(&mut open).default_width(560.0).show(ctx, |ui| { go = p.show(ui); });
         if let Some(cands) = go {
-            match signals_panel::plan_ops(&self.studio.session.doc.project, p.group, &cands) {
-                Ok((ops, shots)) => {
+            match signals_panel::plan_ops(&self.studio.session.doc.project, p.group, &cands, &p.angle_motion, p.prefer, p.no_repeat) {
+                Ok((ops, shots, lines)) => {
                     self.studio.edit_group(ops, "multicam by signals");
                     self.studio.status = format!("{shots} shot(s) on a new track, a 'why' marker at each cut");
-                    p.planned = cands;
+                    p.planned = lines;
+                    let _ = cands;
                 }
                 Err(e) => self.studio.status = e,
             }
