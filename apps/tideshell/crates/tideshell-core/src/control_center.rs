@@ -1,0 +1,373 @@
+//! The swipe-down drawer, shaped after plasma-mobile's action drawer: the first
+//! pull reveals a single row of quick toggles ("peek"), pulling further opens
+//! the full grid with brightness and volume sliders. Release snaps to the
+//! nearest stage the gesture committed to.
+//!
+//! `progress` is the drawn position in `0..=1` (0 closed, [`PEEK`] one row,
+//! 1 full). During a drag it follows the finger 1:1; after release it eases
+//! toward `target` in [`ControlCenter::tick`].
+
+use crate::Action;
+
+/// Progress at which exactly the first row is visible.
+pub const PEEK: f32 = 0.42;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuickKind {
+    Wifi,
+    Bluetooth,
+    MobileData,
+    Airplane,
+    Flashlight,
+    Rotation,
+    DoNotDisturb,
+    /// The next three mirror shell modes rather than system services.
+    Keyboard,
+    Trackpad,
+    Carousel,
+}
+
+impl QuickKind {
+    pub const ALL: [QuickKind; 10] = [
+        QuickKind::Wifi,
+        QuickKind::Bluetooth,
+        QuickKind::MobileData,
+        QuickKind::Airplane,
+        QuickKind::Flashlight,
+        QuickKind::Rotation,
+        QuickKind::DoNotDisturb,
+        QuickKind::Keyboard,
+        QuickKind::Trackpad,
+        QuickKind::Carousel,
+    ];
+
+    pub fn token(self) -> &'static str {
+        match self {
+            QuickKind::Wifi => "wifi",
+            QuickKind::Bluetooth => "bluetooth",
+            QuickKind::MobileData => "mobile-data",
+            QuickKind::Airplane => "airplane",
+            QuickKind::Flashlight => "flashlight",
+            QuickKind::Rotation => "rotation",
+            QuickKind::DoNotDisturb => "dnd",
+            QuickKind::Keyboard => "keyboard",
+            QuickKind::Trackpad => "trackpad",
+            QuickKind::Carousel => "carousel",
+        }
+    }
+
+    pub fn from_token(s: &str) -> Option<QuickKind> {
+        QuickKind::ALL.into_iter().find(|k| k.token() == s)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            QuickKind::Wifi => "Wi-Fi",
+            QuickKind::Bluetooth => "Bluetooth",
+            QuickKind::MobileData => "Mobile data",
+            QuickKind::Airplane => "Airplane",
+            QuickKind::Flashlight => "Flashlight",
+            QuickKind::Rotation => "Auto-rotate",
+            QuickKind::DoNotDisturb => "Do not disturb",
+            QuickKind::Keyboard => "Keyboard",
+            QuickKind::Trackpad => "Trackpad",
+            QuickKind::Carousel => "Carousel",
+        }
+    }
+
+    /// Shell-mode tiles are owned by `Shell::modes`, not by this drawer.
+    pub fn is_mode(self) -> bool {
+        matches!(self, QuickKind::Keyboard | QuickKind::Trackpad | QuickKind::Carousel)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SliderKind {
+    Brightness,
+    Volume,
+}
+
+impl SliderKind {
+    pub fn token(self) -> &'static str {
+        match self {
+            SliderKind::Brightness => "brightness",
+            SliderKind::Volume => "volume",
+        }
+    }
+    pub fn from_token(s: &str) -> Option<SliderKind> {
+        match s {
+            "brightness" => Some(SliderKind::Brightness),
+            "volume" => Some(SliderKind::Volume),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            SliderKind::Brightness => "Brightness",
+            SliderKind::Volume => "Volume",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Closed,
+    Peek,
+    Full,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlCenter {
+    pub progress: f32,
+    target: f32,
+    dragging: bool,
+    /// Where the current pull started from, latched on its first sample.
+    drag_base: f32,
+    /// Tile order; the first `peek_count` show in the peek row.
+    pub tiles: Vec<QuickKind>,
+    pub peek_count: usize,
+    system: Vec<(QuickKind, bool)>,
+    pub brightness: f32,
+    pub volume: f32,
+}
+
+impl Default for ControlCenter {
+    fn default() -> Self {
+        ControlCenter {
+            progress: 0.0,
+            target: 0.0,
+            dragging: false,
+            drag_base: 0.0,
+            tiles: QuickKind::ALL.to_vec(),
+            peek_count: 5,
+            system: Vec::new(),
+            brightness: 0.6,
+            volume: 0.5,
+        }
+    }
+}
+
+impl ControlCenter {
+    pub fn stage(&self) -> Stage {
+        if self.progress < 0.02 {
+            Stage::Closed
+        } else if self.progress < (PEEK + 1.0) / 2.0 {
+            Stage::Peek
+        } else {
+            Stage::Full
+        }
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.progress > 0.001 || self.target > 0.0
+    }
+
+    /// Finger position during a pull. A pull that starts on an already
+    /// peeking (or full) drawer continues from the peek row, so a second pull
+    /// expands rather than restarting from closed.
+    pub fn drag(&mut self, progress: f32) {
+        if !self.dragging {
+            self.dragging = true;
+            self.drag_base = if self.target >= PEEK - 1e-3 { PEEK } else { 0.0 };
+        }
+        self.progress = (self.drag_base + progress).clamp(0.0, 1.0);
+        self.target = self.progress;
+    }
+
+    /// Snap after release. Opening lands on the stage the finger reached:
+    /// short of halfway between peek and full → peek, beyond → full.
+    pub fn release(&mut self, open: bool) {
+        self.dragging = false;
+        self.target = if !open {
+            0.0
+        } else if self.progress < (PEEK + 1.0) / 2.0 {
+            PEEK
+        } else {
+            1.0
+        };
+    }
+
+    pub fn close(&mut self) {
+        self.dragging = false;
+        self.target = 0.0;
+    }
+
+    pub fn expand(&mut self) {
+        self.dragging = false;
+        self.target = 1.0;
+    }
+
+    /// Ease toward target. Critically-damped-ish exponential: frame-rate
+    /// independent because it is a function of `dt`, not of frame count.
+    pub fn tick(&mut self, dt_ms: f32) {
+        if self.dragging {
+            return;
+        }
+        let k = 1.0 - (-dt_ms / 70.0).exp();
+        self.progress += (self.target - self.progress) * k;
+        if (self.progress - self.target).abs() < 0.002 {
+            self.progress = self.target;
+        }
+    }
+
+    pub fn is_animating(&self) -> bool {
+        !self.dragging && self.progress != self.target
+    }
+
+    pub fn system_state(&self, kind: QuickKind) -> bool {
+        self.system.iter().find(|(k, _)| *k == kind).map(|(_, v)| *v).unwrap_or(false)
+    }
+
+    /// Record state reported by a backend (so the tile reflects reality, not
+    /// just the last tap).
+    pub fn set_system_state(&mut self, kind: QuickKind, on: bool) {
+        match self.system.iter_mut().find(|(k, _)| *k == kind) {
+            Some(e) => e.1 = on,
+            None => self.system.push((kind, on)),
+        }
+    }
+
+    /// Tap on a system tile. Mode tiles are routed by the shell instead.
+    pub fn toggle_system(&mut self, kind: QuickKind) -> Option<Action> {
+        if kind.is_mode() {
+            return None;
+        }
+        let on = !self.system_state(kind);
+        self.set_system_state(kind, on);
+        Some(Action::SetQuick(kind, on))
+    }
+
+    pub fn set_slider(&mut self, kind: SliderKind, v: f32) -> Action {
+        let v = v.clamp(0.0, 1.0);
+        match kind {
+            SliderKind::Brightness => self.brightness = v,
+            SliderKind::Volume => self.volume = v,
+        }
+        Action::SetSlider(kind, v)
+    }
+
+    pub fn slider(&self, kind: SliderKind) -> f32 {
+        match kind {
+            SliderKind::Brightness => self.brightness,
+            SliderKind::Volume => self.volume,
+        }
+    }
+
+    /// Tiles visible at the current stage.
+    pub fn visible_tiles(&self) -> &[QuickKind] {
+        match self.stage() {
+            Stage::Closed => &[],
+            Stage::Peek => &self.tiles[..self.peek_count.min(self.tiles.len())],
+            Stage::Full => &self.tiles,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settle(cc: &mut ControlCenter) {
+        for _ in 0..200 {
+            cc.tick(16.0);
+        }
+    }
+
+    #[test]
+    fn short_pull_snaps_to_peek_long_pull_to_full() {
+        let mut cc = ControlCenter::default();
+        cc.drag(0.35);
+        cc.release(true);
+        settle(&mut cc);
+        assert_eq!(cc.progress, PEEK);
+        assert_eq!(cc.stage(), Stage::Peek);
+        assert_eq!(cc.visible_tiles().len(), 5);
+
+        let mut cc = ControlCenter::default();
+        cc.drag(0.9);
+        cc.release(true);
+        settle(&mut cc);
+        assert_eq!(cc.progress, 1.0);
+        assert_eq!(cc.stage(), Stage::Full);
+        assert_eq!(cc.visible_tiles().len(), QuickKind::ALL.len());
+    }
+
+    #[test]
+    fn second_pull_from_peek_continues_to_full() {
+        let mut cc = ControlCenter::default();
+        cc.drag(0.3);
+        cc.release(true);
+        settle(&mut cc);
+        // A pull of 0.4 from peek reaches 0.82 — past the peek/full midpoint.
+        cc.drag(0.4);
+        assert!((cc.progress - (PEEK + 0.4)).abs() < 1e-6);
+        cc.release(true);
+        settle(&mut cc);
+        assert_eq!(cc.stage(), Stage::Full);
+    }
+
+    #[test]
+    fn continuous_pull_tracks_the_finger_without_jumping() {
+        let mut cc = ControlCenter::default();
+        let mut prev = 0.0;
+        for i in 1..=20 {
+            let p = i as f32 * 0.04;
+            cc.drag(p);
+            assert!((cc.progress - p.min(1.0)).abs() < 1e-6, "sample {i}: {} vs {p}", cc.progress);
+            assert!(cc.progress >= prev);
+            prev = cc.progress;
+        }
+    }
+
+    #[test]
+    fn release_closed_goes_to_zero_and_hides() {
+        let mut cc = ControlCenter::default();
+        cc.drag(0.8);
+        cc.release(false);
+        assert!(cc.is_animating());
+        settle(&mut cc);
+        assert_eq!(cc.progress, 0.0);
+        assert!(!cc.is_visible());
+        assert_eq!(cc.stage(), Stage::Closed);
+    }
+
+    #[test]
+    fn tick_is_frame_rate_independent() {
+        let mut a = ControlCenter::default();
+        let mut b = ControlCenter::default();
+        a.expand();
+        b.expand();
+        for _ in 0..6 {
+            a.tick(16.0);
+        }
+        for _ in 0..12 {
+            b.tick(8.0);
+        }
+        assert!((a.progress - b.progress).abs() < 1e-4, "{} vs {}", a.progress, b.progress);
+        assert!(a.progress > 0.5 && a.progress < 1.0);
+    }
+
+    #[test]
+    fn system_toggle_flips_and_emits_but_mode_tiles_do_not() {
+        let mut cc = ControlCenter::default();
+        assert_eq!(cc.toggle_system(QuickKind::Wifi), Some(Action::SetQuick(QuickKind::Wifi, true)));
+        assert!(cc.system_state(QuickKind::Wifi));
+        assert_eq!(cc.toggle_system(QuickKind::Wifi), Some(Action::SetQuick(QuickKind::Wifi, false)));
+        assert_eq!(cc.toggle_system(QuickKind::Keyboard), None);
+    }
+
+    #[test]
+    fn slider_clamps() {
+        let mut cc = ControlCenter::default();
+        assert_eq!(cc.set_slider(SliderKind::Volume, 1.7), Action::SetSlider(SliderKind::Volume, 1.0));
+        assert_eq!(cc.volume, 1.0);
+    }
+
+    #[test]
+    fn tokens_round_trip() {
+        for k in QuickKind::ALL {
+            assert_eq!(QuickKind::from_token(k.token()), Some(k));
+        }
+        assert_eq!(QuickKind::from_token("nope"), None);
+    }
+}
