@@ -239,15 +239,52 @@ fn is_ipv4(t: &str) -> bool {
 /// IPv6: at least two ':' and only hex / ':'; allow '::' compression.
 /// Deliberately loose (full RFC validation is overkill for recall).
 fn is_ipv6(t: &str) -> bool {
-    let colons = t.bytes().filter(|&b| b == b':').count();
-    if colons < 2 {
+    // THE ACTUAL ADDRESS STRUCTURE, not "two colons and some hex". The old
+    // test accepted any token with two colons and only hex digits, so a clock
+    // time -- `12:34:56`, in every `date`, `uptime` and log timestamp -- was an
+    // IPv6 address, and "insert the ipv6" inserted a time of day.
+    //
+    // RFC 4291: eight groups of 1-4 hex digits, or fewer with exactly ONE `::`
+    // standing in for the missing zero groups.
+    if !t.chars().all(|c| is_hex(c) || c == ':') || !t.chars().any(is_hex) {
         return false;
     }
-    if !t.chars().all(|c| is_hex(c) || c == ':') {
+    let doubles = t.matches("::").count();
+    if doubles > 1 || t.contains(":::") {
         return false;
     }
-    // must contain at least one hex digit (":::" alone is not an addr)
-    t.chars().any(is_hex)
+    let groups: Vec<&str> = t.split(':').filter(|g| !g.is_empty()).collect();
+    if groups.iter().any(|g| g.len() > 4) {
+        return false;
+    }
+    if doubles == 1 {
+        groups.len() <= 7
+    } else {
+        // No `::` -- the full form, and a clock's 3 groups is not it.
+        groups.len() == 8
+    }
+}
+
+/// Strip a CIDR prefix length: `192.168.1.42/24` -> `192.168.1.42`.
+///
+/// `ip addr` -- the command people actually run to find their address --
+/// prints every address WITH its prefix. Whole-word classification saw the
+/// `/`, rejected it as an address, and filed it as a Path. Only accepts a
+/// short all-digit suffix, so a real path like `/usr/lib` is untouched.
+fn strip_prefix_len(t: &str) -> Option<&str> {
+    let (addr, len) = t.rsplit_once('/')?;
+    (!len.is_empty() && len.len() <= 3 && len.bytes().all(|b| b.is_ascii_digit())).then_some(addr)
+}
+
+/// Strip a `:port` from an IPv4 `host:port`: `127.0.0.1:8080` -> the address.
+///
+/// The port itself is still found by `extract_ports`; this recovers the IP,
+/// which every classifier used to reject because of the colon -- so a
+/// server's "listening on 127.0.0.1:8080" yielded the port and lost the
+/// address.
+fn strip_v4_port(t: &str) -> Option<&str> {
+    let (addr, port) = t.rsplit_once(':')?;
+    (is_ipv4(addr) && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())).then_some(addr)
 }
 
 /// MAC: six 2-hex-digit groups separated by ':' or '-'.
@@ -298,9 +335,28 @@ pub fn extract_all(text: &str) -> Vec<Fact> {
     let mut out = Vec::new();
     // Lowercased copy for context words like "port"/"pid" lookups is not
     // needed here; per-token classification only.
+    let mut prev_word = "";
     for (off, raw) in tokens(text) {
         let t = trim_token(raw);
         if t.is_empty() {
+            continue;
+        }
+        // THE BROADCAST IS NOT YOUR ADDRESS. `ip addr` prints
+        // `inet 192.168.1.42/24 brd 192.168.1.255`, and `most_recent` takes
+        // the LATER address -- so even with the CIDR form parsed, "insert my
+        // IP" would insert the broadcast. The word `brd` marks it exactly.
+        let after_brd = prev_word == "brd";
+        prev_word = t;
+        if after_brd {
+            continue;
+        }
+        // An address with its prefix length or its port attached.
+        if let Some(a) = strip_prefix_len(t).filter(|a| is_ipv4(a)).or_else(|| strip_v4_port(t)) {
+            out.push(Fact { kind: FactKind::Ipv4, value: a.to_string(), offset: off });
+            continue;
+        }
+        if let Some(a) = strip_prefix_len(t).filter(|a| is_ipv6(a)) {
+            out.push(Fact { kind: FactKind::Ipv6, value: a.to_string(), offset: off });
             continue;
         }
         // Order matters: MAC before IPv6 (both use ':'), IPv4 before
@@ -324,6 +380,44 @@ pub fn extract_all(text: &str) -> Vec<Fact> {
     out
 }
 
+/// Is the `:` at byte `i` the separator of a real `host:port`?
+///
+/// `:digits` alone is not enough, and three kinds of ordinary output proved it:
+///
+///   * a clock, `12:34:56` -- every `date`, `uptime` and log line -- gave
+///     ports 34 and 56;
+///   * a compiler location, `src/main.rs:42:5`, gave ports 42 and 5, so
+///     "insert the port" after a build error inserted a line number;
+///   * an IPv6 address, `fe80::1ff:fe23:4567:890a`, gave ports 4567 and 890
+///     from its own groups.
+///
+/// A real host:port has EXACTLY ONE colon in its word (`127.0.0.1:8080`,
+/// `localhost:3000`), or is the bracketed IPv6 form (`[::1]:8080`). That one
+/// rule rejects all three. Then the host itself must look like a host: not all
+/// digits (the `12` of `12:34`) and not a path (a hostname never has a `/`).
+///
+/// One residual, accepted: a BARE `main.rs:42` with no directory still reads as
+/// a port -- "main.rs" is a plausible hostname by shape. Compilers almost always
+/// print a path, which the `/` rule catches.
+fn is_host_port_colon(text: &str, i: usize) -> bool {
+    let b = text.as_bytes();
+    let mut start = i;
+    while start > 0 && !b[start - 1].is_ascii_whitespace() {
+        start -= 1;
+    }
+    let mut end = i;
+    while end < b.len() && !b[end].is_ascii_whitespace() {
+        end += 1;
+    }
+    let word = &text[start..end];
+    let host = &text[start..i];
+    let bracketed_v6 = host.starts_with('[') && host.ends_with(']');
+    if !bracketed_v6 && word.bytes().filter(|&c| c == b':').count() != 1 {
+        return false;
+    }
+    !host.is_empty() && !host.bytes().all(|c| c.is_ascii_digit()) && !host.contains('/')
+}
+
 /// Ports: a number 1..=65535 immediately after ':' (host:port) or after
 /// the word "port". We scan for ":<digits>" and "port <digits>".
 fn extract_ports(text: &str, out: &mut Vec<Fact>) {
@@ -335,7 +429,7 @@ fn extract_ports(text: &str, out: &mut Vec<Fact>) {
         if bytes[i] == b':' && i > 0 {
             let prev = bytes[i - 1];
             let host_ish = prev.is_ascii_alphanumeric() || prev == b'.' || prev == b']';
-            if host_ish {
+            if host_ish && is_host_port_colon(text, i) {
                 let start = i + 1;
                 let mut j = start;
                 while j < bytes.len() && bytes[j].is_ascii_digit() && j - start < 5 {
@@ -659,4 +753,80 @@ mod tests {
         assert!(extract_all("").is_empty());
         assert!(most_recent("", FactKind::Ipv4).is_none());
     }
+
+#[cfg(test)]
+mod real_output_tests {
+    use super::*;
+
+    fn of(text: &str, kind: FactKind) -> Vec<String> {
+        extract_all(text).into_iter().filter(|f| f.kind == kind).map(|f| f.value).collect()
+    }
+
+    /// THE HEADLINE. `ip addr` is how people find their address, and "insert
+    /// my IP" inserted the BROADCAST: the host address carried its /24 and was
+    /// filed as a Path, leaving `192.168.1.255` the only IPv4 in sight.
+    #[test]
+    fn ip_addr_yields_the_host_address_not_the_broadcast() {
+        let out = "inet 192.168.1.42/24 brd 192.168.1.255 scope global wlan0";
+        assert_eq!(of(out, FactKind::Ipv4), vec!["192.168.1.42"]);
+        assert_eq!(most_recent(out, FactKind::Ipv4).map(|f| f.value).as_deref(), Some("192.168.1.42"));
+        assert!(of(out, FactKind::Path).is_empty(), "the address is not a path");
+    }
+
+    /// A server's "listening on" line lost its address to the colon.
+    #[test]
+    fn host_port_yields_both() {
+        let out = "listening on 127.0.0.1:8080";
+        assert_eq!(of(out, FactKind::Ipv4), vec!["127.0.0.1"]);
+        assert_eq!(of(out, FactKind::Port), vec!["8080"]);
+    }
+
+    /// A clock is not an IPv6 address and has no ports in it.
+    #[test]
+    fn a_time_of_day_is_nothing() {
+        for t in ["12:34:56", "uptime 12:34:56 up 3 days", "2026-09-20 12:34:56", "at 09:05"] {
+            assert!(of(t, FactKind::Ipv6).is_empty(), "{t}");
+            assert!(of(t, FactKind::Port).is_empty(), "{t}");
+        }
+    }
+
+    /// Real IPv6 -- with its prefix length, as `ip addr` prints it -- is found,
+    /// and its own groups are not ports.
+    #[test]
+    fn ipv6_with_a_prefix_is_found_and_has_no_ports() {
+        let out = "inet6 fe80::1ff:fe23:4567:890a/64 scope link";
+        assert_eq!(of(out, FactKind::Ipv6), vec!["fe80::1ff:fe23:4567:890a"]);
+        assert!(of(out, FactKind::Port).is_empty());
+        assert!(!of("::1", FactKind::Ipv6).is_empty(), "loopback");
+        assert!(!of("2001:db8:0:0:0:0:0:1", FactKind::Ipv6).is_empty(), "full form");
+    }
+
+    /// "Insert the port" after a build error must not insert a line number.
+    #[test]
+    fn a_compiler_location_has_no_ports() {
+        assert!(of("error at /home/u/src/main.rs:42:5", FactKind::Port).is_empty());
+    }
+
+    /// Ports that ARE ports still are.
+    #[test]
+    fn real_ports_survive() {
+        assert_eq!(of("connect localhost:3000", FactKind::Port), vec!["3000"]);
+        assert_eq!(of("bound [::1]:8080", FactKind::Port), vec!["8080"]);
+        assert_eq!(of("using port 5432", FactKind::Port), vec!["5432"]);
+    }
+
+    /// Structure, not character set: these are not addresses.
+    #[test]
+    fn malformed_ipv6_is_rejected() {
+        for t in ["1:2:3", "::1::2", "12345::1", ":::"] {
+            assert!(of(t, FactKind::Ipv6).is_empty(), "{t}");
+        }
+    }
+
+    /// A real path keeps its slash-number tail -- only an address sheds it.
+    #[test]
+    fn a_path_ending_in_a_number_stays_a_path() {
+        assert!(of("/usr/lib/64", FactKind::Ipv4).is_empty());
+    }
+}
 }
