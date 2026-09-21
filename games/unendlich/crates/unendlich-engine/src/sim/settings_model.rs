@@ -121,6 +121,16 @@ const RS_MAX: f32 = 2.0;
 const DL_MIN: u32 = 0; // dynamic light budget (count)
 const DL_MAX: u32 = 64;
 
+/// NOT WIRED. This and [`upscale_mode`] have no callers, no shader implements a
+/// network, and no weights exist in the tree -- `render_scale` reaches the
+/// renderer only as `ui_render_scale`, which scales the UI. The slider's
+/// "neural upscale" label promises something that is not there.
+///
+/// Wiring it as-is would be worse than leaving it: the renderer would quietly
+/// draw at quarter resolution and magnify with whatever the sampler does. See
+/// `docs/UPSCALING.md` for what building it would actually involve, and why
+/// the 1080p->4K case is worth it while a 500Hz one is not.
+///
 /// r336-neural-bonus: how much the neural upscaler must magnify the render target,
 /// = 1/render_scale (0.25→4x, 0.5→2x, 1.0→1x). Clamped to the supported floor so a
 /// stray scale can't request an unbounded factor.
