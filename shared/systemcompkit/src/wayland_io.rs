@@ -26,7 +26,8 @@
 use crate::capture::{CaptureEvent, CaptureSession};
 use crate::idle::{IdleEvent, IdleTracker};
 use crate::layer::{KeyboardInteractivity, Layer, LayerEvent, LayerSurfaceIntent, LayerSurfaceState};
-use crate::toplevel::{ToplevelEvent, ToplevelTracker};
+use crate::toplevel::{ManagerCaps, ToplevelEvent, ToplevelRequest, ToplevelTracker};
+use cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1::{self, ZcosmicToplevelManagerV1};
 use std::io::Write;
 use std::os::fd::AsFd;
 use cosmic_protocols::toplevel_info::v1::client::{
@@ -38,7 +39,7 @@ use wayland_client::protocol::{
     wl_buffer::{self, WlBuffer}, wl_compositor::WlCompositor, wl_output::WlOutput, wl_registry, wl_seat::WlSeat,
     wl_shm::{self, WlShm}, wl_shm_pool::{self, WlShmPool}, wl_surface::WlSurface,
 };
-use wayland_client::{event_created_child, Connection, Dispatch, EventQueue, QueueHandle};
+use wayland_client::{event_created_child, Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
     ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
     ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
@@ -188,7 +189,7 @@ impl IdleSession {
     /// frame rather than blocking the render thread on the next idle event,
     /// which might be seconds or hours away.
     pub fn poll(&mut self) -> &IdleTracker {
-        let _ = self.queue.dispatch_pending(&mut self.state);
+        let _ = pump(&mut self.queue, &mut self.state);
         &self.state.tracker
     }
 
@@ -382,7 +383,7 @@ impl LayerSurface {
     /// Non-blocking, same contract as `IdleSession::poll` — call once per
     /// frame rather than blocking on the compositor's next event.
     pub fn poll(&mut self) -> LayerSurfaceState {
-        let _ = self.queue.dispatch_pending(&mut self.io_state);
+        let _ = pump(&mut self.queue, &mut self.io_state);
         self.io_state.state
     }
 
@@ -490,6 +491,29 @@ impl LayerSurface {
     }
 }
 
+/// Read whatever the socket has, then dispatch it. Every session's `poll()`
+/// goes through here.
+///
+/// `EventQueue::dispatch_pending` alone only dispatches events that some
+/// read call already pulled off the socket (wayland-client 0.31's own doc:
+/// "accumulated ... when the Wayland socket is read using the read APIs on
+/// Connection"). The polls used to call it alone, so after the initial
+/// roundtrip in `connect()` nothing new was ever read: a toplevel opened
+/// later never appeared, idle never fired. The read is non-blocking
+/// (wayland-backend: "If no events are available to read from the socket,
+/// this returns a WouldBlock IO error"), so this is safe once per frame.
+fn pump<S: 'static>(queue: &mut EventQueue<S>, state: &mut S) -> Result<usize, String> {
+    queue.flush().map_err(|e| e.to_string())?;
+    if let Some(guard) = queue.prepare_read() {
+        match guard.read() {
+            Ok(_) => {}
+            Err(wayland_client::backend::WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    queue.dispatch_pending(state).map_err(|e| e.to_string())
+}
+
 impl Drop for LayerSurface {
     fn drop(&mut self) {
         // Explicit destroy rather than relying on the connection closing:
@@ -528,6 +552,55 @@ struct TopIoState {
     // life of a long-running shell process, not just until the toplevel closes.
     capture_sources: std::collections::HashMap<u64, ExtImageCaptureSourceV1>,
     copy_sessions: std::collections::HashMap<u64, ExtImageCopyCaptureSessionV1>,
+    // The zcosmic extension handle per id: management requests take THIS
+    // object, not the ext_foreign base handle. It used to be discarded at
+    // creation, which is why no request could be sent.
+    cosmic_handles: std::collections::HashMap<u64, ZcosmicToplevelHandleV1>,
+    // ext handle object id -> our id, so the ext handle's own events (which
+    // carry title/app_id/closed on v2+) can find their toplevel.
+    ext_ids: std::collections::HashMap<wayland_client::backend::ObjectId, u64>,
+    manager: Option<ZcosmicToplevelManagerV1>,
+    // `activate` names the seat doing the activating.
+    seat: Option<WlSeat>,
+    caps: ManagerCaps,
+}
+
+impl Dispatch<ZcosmicToplevelManagerV1, ()> for TopIoState {
+    fn event(state: &mut Self, _: &ZcosmicToplevelManagerV1, event: zcosmic_toplevel_manager_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        if let zcosmic_toplevel_manager_v1::Event::Capabilities { capabilities } = event {
+            state.caps = ManagerCaps::from_wire(&capabilities);
+        }
+    }
+}
+
+impl Dispatch<WlSeat, ()> for TopIoState {
+    fn event(_: &mut Self, _: &WlSeat, _: wayland_client::protocol::wl_seat::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        // Bound only to name it in `activate`; capabilities/name unused.
+    }
+}
+
+/// Why a management request was not sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestError {
+    UnknownToplevel(u64),
+    NoManager,
+    NoSeat,
+    /// The compositor did not advertise this capability, so it would
+    /// silently ignore the request. `caps_received == false` means the
+    /// capabilities event has not arrived yet (poll again).
+    Unsupported { request: ToplevelRequest, caps_received: bool },
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestError::UnknownToplevel(id) => write!(f, "toplevel {id} not tracked"),
+            RequestError::NoManager => write!(f, "compositor has no zcosmic_toplevel_manager_v1"),
+            RequestError::NoSeat => write!(f, "no wl_seat to activate with"),
+            RequestError::Unsupported { request, caps_received: true } => write!(f, "{request:?} not advertised by compositor"),
+            RequestError::Unsupported { request, caps_received: false } => write!(f, "{request:?}: capabilities not received yet"),
+        }
+    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for TopIoState {
@@ -554,8 +627,10 @@ impl Dispatch<ExtForeignToplevelListV1, ()> for TopIoState {
             let id = state.next_id;
             state.next_id += 1;
             if let Some(info) = &state.info {
-                info.get_cosmic_toplevel(&toplevel, qh, id);
+                let h = info.get_cosmic_toplevel(&toplevel, qh, id);
+                state.cosmic_handles.insert(id, h);
             }
+            state.ext_ids.insert(toplevel.id(), id);
             state.handles.insert(id, toplevel);
             state.tracker.apply(ToplevelEvent::New(id));
         }
@@ -567,15 +642,52 @@ impl Dispatch<ExtForeignToplevelListV1, ()> for TopIoState {
 }
 
 impl Dispatch<ExtForeignToplevelHandleV1, ()> for TopIoState {
-    fn event(_: &mut Self, _: &ExtForeignToplevelHandleV1, _: ext_foreign_toplevel_handle_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        // Deliberately a no-op: this tracker's whole model is sourced from
-        // the zcosmic extension handle instead (see the Toplevel event
-        // handler above) since that's the one authoritative source for
-        // title/app_id/state/closed once obtained. Listening to the base
-        // handle's OWN copies of the same events would mean two paths
-        // that could, in principle, disagree about a single toplevel's
-        // state -- avoided by picking one source of truth rather than
-        // reconciling two.
+    fn event(
+        state: &mut Self,
+        proxy: &ExtForeignToplevelHandleV1,
+        event: ext_foreign_toplevel_handle_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // title / app_id / closed come from HERE on current cosmic-comp.
+        // This impl used to be a deliberate no-op on the belief that the
+        // zcosmic extension handle carries them; the XML marks those
+        // zcosmic events deprecated-since="2", and cosmic-comp
+        // (wayland/protocols/toplevel_info.rs) sends them only on the ext
+        // handle once a client uses get_cosmic_toplevel. Observed against a
+        // nested cosmic-comp epoch-1.8.0: titles stayed empty and closed
+        // windows were never removed until this was fixed.
+        let Some(&id) = state.ext_ids.get(&proxy.id()) else { return };
+        match event {
+            ext_foreign_toplevel_handle_v1::Event::Title { title } => state.tracker.apply(ToplevelEvent::Title(id, title)),
+            ext_foreign_toplevel_handle_v1::Event::AppId { app_id } => state.tracker.apply(ToplevelEvent::AppId(id, app_id)),
+            ext_foreign_toplevel_handle_v1::Event::Closed => {
+                state.ext_ids.remove(&proxy.id());
+                proxy.destroy();
+                state.forget(id);
+            }
+            _ => {} // identifier / done: not modeled
+        }
+    }
+}
+
+impl TopIoState {
+    /// Drop everything retained for a closed toplevel, destroying proxies
+    /// explicitly (see the field comments on why a drop alone leaks them).
+    fn forget(&mut self, id: u64) {
+        self.handles.remove(&id);
+        if let Some(h) = self.cosmic_handles.remove(&id) {
+            h.destroy();
+        }
+        self.captures.remove(&id);
+        if let Some(session) = self.copy_sessions.remove(&id) {
+            session.destroy();
+        }
+        if let Some(source) = self.capture_sources.remove(&id) {
+            source.destroy();
+        }
+        self.tracker.apply(ToplevelEvent::Closed(id));
     }
 }
 
@@ -628,22 +740,13 @@ impl Dispatch<ZcosmicToplevelHandleV1, u64> for TopIoState {
                 state.tracker.apply(ToplevelEvent::StateChanged(id, s));
             }
             zcosmic_toplevel_handle_v1::Event::Closed => {
-                // Both the tracker AND everything this session retained
-                // for `id` — a closed toplevel's handle is no longer valid
-                // to request a NEW capture source from, and any capture
-                // negotiation already in flight for it has nothing left to
-                // capture. Explicit destroy on the retained proxies, not
-                // just dropping them from the maps: see this struct's own
-                // field comments for why a drop alone leaks them server-side.
-                state.handles.remove(&id);
-                state.captures.remove(&id);
-                if let Some(session) = state.copy_sessions.remove(&id) {
-                    session.destroy();
+                // v1 compositors only: v2+ send `closed` on the ext handle
+                // (handled above). Guarded so a compositor sending both does
+                // not double-close.
+                if state.cosmic_handles.contains_key(&id) {
+                    state.ext_ids.retain(|_, v| *v != id);
+                    state.forget(id);
                 }
-                if let Some(source) = state.capture_sources.remove(&id) {
-                    source.destroy();
-                }
-                state.tracker.apply(ToplevelEvent::Closed(id));
             }
             _ => {} // geometry/output/workspace events: not modeled by ToplevelTracker's current fields
         }
@@ -746,6 +849,11 @@ impl ToplevelSession {
         let capture_source_mgr: Option<ExtForeignToplevelImageCaptureSourceManagerV1> =
             globals.bind(&qh, 1..=1, ()).ok();
         let copy_capture_mgr: Option<ExtImageCopyCaptureManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+        // Optional like the others: a listing-only compositor still works,
+        // `request()` then reports NoManager instead of sending into a void.
+        // Only v1 requests are used, so any version is fine.
+        let manager: Option<ZcosmicToplevelManagerV1> = globals.bind(&qh, 1..=4, ()).ok();
+        let seat: Option<WlSeat> = globals.bind(&qh, 1..=5, ()).ok();
 
         let state = TopIoState {
             tracker: ToplevelTracker::new(),
@@ -757,6 +865,11 @@ impl ToplevelSession {
             captures: std::collections::HashMap::new(),
             capture_sources: std::collections::HashMap::new(),
             copy_sessions: std::collections::HashMap::new(),
+            cosmic_handles: std::collections::HashMap::new(),
+            ext_ids: std::collections::HashMap::new(),
+            manager,
+            seat,
+            caps: ManagerCaps::default(),
         };
         // `list` is only needed long enough to have been bound above —
         // toplevel events arrive via the registry-bound object automatically,
@@ -767,7 +880,7 @@ impl ToplevelSession {
     }
 
     pub fn poll(&mut self) -> &ToplevelTracker {
-        let _ = self.queue.dispatch_pending(&mut self.state);
+        let _ = pump(&mut self.queue, &mut self.state);
         &self.state.tracker
     }
 
@@ -800,6 +913,38 @@ impl ToplevelSession {
         self.state.copy_sessions.insert(id, session);
         self.state.captures.insert(id, CaptureSession::new());
         Some(())
+    }
+
+    /// What the compositor said it will honour (empty until the manager's
+    /// capabilities event has been read by a `poll`).
+    pub fn capabilities(&self) -> &ManagerCaps {
+        &self.state.caps
+    }
+
+    /// Send a window-management request for a tracked toplevel. Refuses
+    /// (rather than sending) anything the compositor did not advertise,
+    /// because the protocol says unsupported requests are silently ignored.
+    /// Success means SENT; the result arrives later as a state/closed event
+    /// on the next `poll`, which is where callers should look.
+    pub fn request(&mut self, id: u64, req: ToplevelRequest) -> Result<(), RequestError> {
+        let st = &self.state;
+        let h = st.cosmic_handles.get(&id).ok_or(RequestError::UnknownToplevel(id))?;
+        let m = st.manager.as_ref().ok_or(RequestError::NoManager)?;
+        if !st.caps.supports(req) {
+            return Err(RequestError::Unsupported { request: req, caps_received: st.caps.received });
+        }
+        match req {
+            ToplevelRequest::Activate => m.activate(h, st.seat.as_ref().ok_or(RequestError::NoSeat)?),
+            ToplevelRequest::Close => m.close(h),
+            ToplevelRequest::SetMaximized(true) => m.set_maximized(h),
+            ToplevelRequest::SetMaximized(false) => m.unset_maximized(h),
+            ToplevelRequest::SetMinimized(true) => m.set_minimized(h),
+            ToplevelRequest::SetMinimized(false) => m.unset_minimized(h),
+            ToplevelRequest::SetFullscreen(true) => m.set_fullscreen(h, None),
+            ToplevelRequest::SetFullscreen(false) => m.unset_fullscreen(h),
+        }
+        let _ = self.conn.flush();
+        Ok(())
     }
 
     pub fn capture_state(&self, id: u64) -> Option<&CaptureSession> {
@@ -939,7 +1084,7 @@ impl OutputCaptureSession {
     }
 
     pub fn poll(&mut self) -> &CaptureSession {
-        let _ = self.queue.dispatch_pending(&mut self.state);
+        let _ = pump(&mut self.queue, &mut self.state);
         &self.state.session
     }
 

@@ -147,6 +147,80 @@ impl ToplevelTracker {
     }
 }
 
+/// A window-management request, protocol-shaped but wayland-free, so the
+/// capability check below is testable without a compositor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToplevelRequest {
+    Activate,
+    Close,
+    SetMaximized(bool),
+    SetMinimized(bool),
+    SetFullscreen(bool),
+}
+
+/// `zcosmic_toplevel_manager_v1.capabilities`: which requests the compositor
+/// honours. Per the protocol it IGNORES unsupported requests silently, so a
+/// shell must check first or its buttons do nothing with no error anywhere.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagerCaps {
+    caps: Vec<u32>,
+    /// False until the event arrives; the protocol sends it once right after
+    /// the manager is bound, so "unknown" is a short, real state.
+    pub received: bool,
+}
+
+impl ManagerCaps {
+    /// Decode the wire array: native-endian u32s, one capability each
+    /// (a list, not a bitmask — same shape as the handle's `state` array).
+    pub fn from_wire(raw: &[u8]) -> ManagerCaps {
+        let caps = raw.chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
+        ManagerCaps { caps, received: true }
+    }
+
+    pub fn supports(&self, req: ToplevelRequest) -> bool {
+        let want = match req {
+            ToplevelRequest::Close => 1,
+            ToplevelRequest::Activate => 2,
+            ToplevelRequest::SetMaximized(_) => 3,
+            ToplevelRequest::SetMinimized(_) => 4,
+            ToplevelRequest::SetFullscreen(_) => 5,
+        };
+        self.caps.contains(&want)
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    fn wire(v: &[u32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_ne_bytes()).collect()
+    }
+
+    #[test]
+    fn caps_decode_as_a_list_not_a_bitmask() {
+        // [2, 3] = activate + maximize. Read as a bitmask, 3 would also claim
+        // close (bit 0) — exactly the misread this guards against.
+        let c = ManagerCaps::from_wire(&wire(&[2, 3]));
+        assert!(c.received);
+        assert!(c.supports(ToplevelRequest::Activate));
+        assert!(c.supports(ToplevelRequest::SetMaximized(true)));
+        assert!(c.supports(ToplevelRequest::SetMaximized(false)));
+        assert!(!c.supports(ToplevelRequest::Close));
+        assert!(!c.supports(ToplevelRequest::SetFullscreen(true)));
+    }
+
+    #[test]
+    fn unknown_and_trailing_bytes_are_ignored() {
+        let mut raw = wire(&[1, 99]);
+        raw.push(7); // truncated trailing element
+        let c = ManagerCaps::from_wire(&raw);
+        assert!(c.supports(ToplevelRequest::Close));
+        assert!(!c.supports(ToplevelRequest::Activate));
+        assert!(!ManagerCaps::default().received);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

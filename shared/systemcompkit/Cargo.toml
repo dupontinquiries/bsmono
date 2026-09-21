@@ -35,3 +35,8 @@ tempfile = { version = "3", optional = true }
 # default pulls in wayland-server too, which this crate (a client, not a
 # compositor) has no use for.
 cosmic-protocols = { version = "0.2", default-features = false, features = ["client"], optional = true }
+
+[[example]]
+name = "toplevel_probe"
+path = "examples/toplevel_probe.rs"
+required-features = ["wayland_io"]
