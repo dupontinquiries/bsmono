@@ -13,6 +13,7 @@ pub mod build_report;
 pub mod buildsystem;
 pub mod daemons;
 pub mod deploy;
+pub mod alpine_root;
 pub mod eink_fleet;
 pub mod finding;
 pub mod device_firewall;

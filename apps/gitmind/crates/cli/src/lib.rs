@@ -1399,6 +1399,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
         remove <host> <app>                 take one out again (never touches other apps)\n  \
         activate <host>                     after a reboot: start xovi or the launcher, whichever is needed\n  \
         wifi-ssh <host>                     turn on SSH over Wi-Fi (Paper Pro family; run over USB)\n  \
+        pkg <host> runner|bootstrap|add|del|list|update|audio   packages like a laptop (Alpine under /home)\n  \
         (every command: --user U, or GITMIND_RM_USER; default root)\n  \
         retrust <host>                      accept the tablet's NEW host key (after an OS update)\n  \
         enroll <host>                       first contact: password (GITMIND_RM_PASSWORD or stdin) → key\n  \
@@ -1594,6 +1595,42 @@ fn cmd_eink(rest: &[String]) -> i32 {
             }
             match ef::Remote::run(&mut remote, ef::WLAN_SSH_ON) {
                 Ok(out) => { println!("{}\nSSH over Wi-Fi is on; the Wi-Fi address is under the password in Copyrights and licenses", out.trim()); 0 }
+                Err(e) => eink_err(&e),
+            }
+        }
+        // Packages on the tablet, like a laptop: an Alpine userland under /home.
+        //   pkg <host> runner <alpine-run binary>   install the runner (build it with `build <host> alpine-run`)
+        //   pkg <host> bootstrap [--mirror URL] [--branch B]
+        //   pkg <host> add|del <pkg>...   pkg <host> list|update
+        //   pkg <host> audio               install bluez-alsa and start it for this boot
+        "pkg" => {
+            use cockpit::alpine_root as al;
+            let action = pos.first().map(|s| s.as_str()).unwrap_or("");
+            let names: Vec<&str> = pos.iter().skip(1).map(|s| s.as_str()).collect();
+            let mirror = al::Mirror {
+                base: opt(flags, "--mirror").unwrap_or(al::DEFAULT_MIRROR).to_string(),
+                branch: opt(flags, "--branch").unwrap_or(al::DEFAULT_BRANCH).to_string(),
+            };
+            let cmd = match action {
+                "runner" => {
+                    let Some(bin) = names.first() else { return eink_err("pkg runner <path to the built alpine-run>") };
+                    let (probe, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
+                    let route = d.readiness().map(|r| r.0).unwrap_or(ef::Route::AppLoad { dir: String::new() });
+                    if let Err(e) = ef::preflight_binary(bin, &route, probe.model) { return eink_err(&e); }
+                    if let Err(e) = ef::Remote::run(&mut remote, &ef::prepare_cmd()) { return eink_err(&e); }
+                    if let Err(e) = ef::Remote::push(&mut remote, bin, &ef::staging_path("alpine-run")) { return eink_err(&e); }
+                    match ef::install_cmd("alpine-run") { Ok(c) => c, Err(e) => return eink_err(&e) }
+                }
+                "bootstrap" => al::bootstrap_cmd(&mirror),
+                "add" => match al::add_cmd(&names) { Ok(c) => c, Err(e) => return eink_err(&e) },
+                "del" => match al::del_cmd(&names) { Ok(c) => c, Err(e) => return eink_err(&e) },
+                "list" => al::list_cmd(),
+                "update" => al::update_cmd(),
+                "audio" => format!("{} && {}", al::add_cmd(&["bluez-alsa", "bluez-alsa-utils", "alsa-utils"]).unwrap(), al::bluealsa_start_cmd()),
+                _ => return eink_err("pkg <host> runner|bootstrap|add|del|list|update|audio ..."),
+            };
+            match ef::Remote::run(&mut remote, &cmd) {
+                Ok(out) => { println!("{}", out.trim_end()); 0 }
                 Err(e) => eink_err(&e),
             }
         }

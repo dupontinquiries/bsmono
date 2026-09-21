@@ -1267,7 +1267,14 @@ pub fn discover_tablet_apps(root: &std::path::Path) -> Vec<TabletApp> {
     let mut stack: Vec<(std::path::PathBuf, u8)> = ["apps", "shared", "games"].iter().map(|d| (root.join(d), 0)).collect();
     while let Some((dir, depth)) = stack.pop() {
         if let Ok(t) = std::fs::read_to_string(dir.join("Cargo.toml")) {
-            let eink = eink_app_bins(&t);
+            let mut eink = eink_app_bins(&t);
+            // A tablet tool opting in explicitly (alpine-run):
+            // [package.metadata.gitmind] tablet = true
+            if eink.is_empty() && t.contains("[package.metadata.gitmind]") && t.lines().any(|l| l.replace(' ', "") == "tablet=true") {
+                if let Some(pkg) = t.lines().skip_while(|l| l.trim() != "[package]").find_map(|l| l.trim().strip_prefix("name").and_then(|r| r.split('"').nth(1))) {
+                    eink.push((pkg.to_string(), vec![], false));
+                }
+            }
             let had_eink = !eink.is_empty();
             for (bin, features, no_default) in eink {
                 out.push(TabletApp { dir: dir.clone(), bin, features, no_default, via_shim: false });
@@ -2720,6 +2727,7 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
             assert!(a.via_shim, "{want} goes through the shim");
         }
         assert!(apps.iter().any(|a| a.bin == "eink-demo" && !a.via_shim), "eink-kit apps stay native");
+        assert!(apps.iter().any(|a| a.bin == "alpine-run" && !a.via_shim), "tablet tools that opt in are offered");
         assert!(!apps.iter().any(|a| a.bin == "tomescope"), "tomescope has an eink shell; its desktop bin is not offered via the shim");
     }
 

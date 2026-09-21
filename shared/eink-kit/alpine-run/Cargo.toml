@@ -16,3 +16,8 @@ opt-level = "s"
 lto = true
 panic = "abort"
 strip = true
+
+# gitmind offers this in the Tablets build picker: a tablet tool, neither an
+# eink-kit nor an eframe app.
+[package.metadata.gitmind]
+tablet = true
