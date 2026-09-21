@@ -301,10 +301,12 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 log.push(&format!("{}", plan.note));
                 log.push(&format!("$ {}  (in {})", plan.argv.join(" "), plan.cwd.display()));
                 let mut errors: Vec<String> = Vec::new();
+                // The shim patch rewrites Cargo.lock: saved and restored around the build.
+                let status = ef::with_lock_preserved(&plan, || -> Result<std::process::ExitStatus, String> {
                 let mut cmd = std::process::Command::new(&plan.argv[0]);
                 cmd.args(&plan.argv[1..]).current_dir(&plan.cwd).envs(plan.env.clone())
                     .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
-                let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => return format!("could not run {}: {e}", plan.argv[0]) };
+                let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => return Err(format!("could not run {}: {e}", plan.argv[0])) };
                 // cargo (and podman) report progress on stderr; stream it.
                 if let Some(err) = child.stderr.take() {
                     use std::io::BufRead;
@@ -316,7 +318,9 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                         log.push(&line);
                     }
                 }
-                let status = match child.wait() { Ok(s) => s, Err(e) => return format!("cargo: {e}") };
+                    child.wait().map_err(|e| format!("cargo: {e}"))
+                });
+                let status = match status { Ok(s) => s, Err(e) => return e };
                 if !status.success() {
                     // cargo's own error lines go into the result, where
                     // diagnose() turns them into findings.

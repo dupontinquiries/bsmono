@@ -1534,7 +1534,8 @@ fn cmd_eink(rest: &[String]) -> i32 {
             };
             eprintln!("  {}", plan.note);
             eprintln!("  $ {}  (in {}; {})", plan.argv.join(" "), plan.cwd.display(), t.why);
-            let st = std::process::Command::new(&plan.argv[0]).args(&plan.argv[1..]).current_dir(&plan.cwd).envs(plan.env.clone()).status();
+            // The shim patch rewrites Cargo.lock: saved and restored around the build.
+            let st = ef::with_lock_preserved(&plan, || std::process::Command::new(&plan.argv[0]).args(&plan.argv[1..]).current_dir(&plan.cwd).envs(plan.env.clone()).status());
             match st {
                 Ok(s) if s.success() => {}
                 Ok(s) => return eink_err(&format!("build failed ({s})")),

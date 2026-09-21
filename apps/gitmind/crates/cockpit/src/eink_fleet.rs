@@ -1118,6 +1118,75 @@ pub struct TabletApp {
     /// feature, because the defaults are then the DESKTOP shell (eframe,
     /// winit), which must not be compiled into a tablet binary.
     pub no_default: bool,
+    /// An ordinary eframe app, built with eink-kit's eframe shim patched in
+    /// (`shared/eink-kit/eframe-shim`) and `EINK_SHIM=1`: no source changes.
+    pub via_shim: bool,
+}
+
+/// Where the eframe shim lives, relative to the repo root.
+pub const SHIM_REL: &str = "shared/eink-kit/eframe-shim";
+
+/// The cargo argument that swaps eframe for the shim at `shim_path`.
+pub fn shim_config_arg(shim_path: &str) -> String {
+    format!("patch.crates-io.eframe.path=\"{shim_path}\"")
+}
+
+/// Binaries of an ordinary eframe app: crates depending on `eframe` (not as
+/// a dev-dependency). An optional eframe is enabled with the feature that
+/// names it, unless a default feature already does. `(bin, features)`; a
+/// `None` bin means "the package's own binary" (checked against src/main.rs).
+pub fn eframe_app_bins(cargo_toml: &str) -> Vec<(Option<String>, Vec<String>)> {
+    let mut section = String::new();
+    let (mut pkg, mut dep, mut features, mut bins) = (None::<String>, None::<bool>, Vec::<(String, String)>::new(), Vec::<(String, String)>::new());
+    for raw in cargo_toml.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            section = line.to_string();
+            if section == "[[bin]]" {
+                bins.push((String::new(), String::new()));
+            }
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        match section.as_str() {
+            "[package]" if k == "name" => pkg = Some(v.trim_matches('"').to_string()),
+            "[dependencies]" if k == "eframe" => dep = Some(v.contains("optional") && v.contains("true")),
+            "[features]" => features.push((k.to_string(), v.to_string())),
+            "[[bin]]" => {
+                if let Some(last) = bins.last_mut() {
+                    if k == "name" { last.0 = v.trim_matches('"').to_string(); }
+                    if k == "required-features" { last.1 = v.to_string(); }
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(optional) = dep else { return Vec::new() };
+    if pkg.as_deref() == Some("eframe") || pkg.as_deref() == Some("eink-kit") {
+        return Vec::new();
+    }
+    let q = |list: &str, w: &str| list.contains(&format!("\"{w}\""));
+    let default = features.iter().find(|(f, _)| f == "default").map(|(_, l)| l.clone()).unwrap_or_default();
+    let gate = if optional {
+        features.iter().find(|(f, l)| f != "default" && (q(l, "dep:eframe") || q(l, "eframe"))).map(|(f, _)| f.clone())
+    } else {
+        None
+    };
+    let wanted: Vec<String> = match &gate {
+        Some(g) if !q(&default, g) => vec![g.clone()],
+        _ => vec![],
+    };
+    if optional && gate.is_none() {
+        return Vec::new(); // optional eframe no feature enables: not an app
+    }
+    if bins.is_empty() {
+        return vec![(None, wanted)];
+    }
+    bins.into_iter()
+        .filter(|(n, req)| !n.is_empty() && (req.is_empty() || gate.as_ref().is_some_and(|g| q(req, g))))
+        .map(|(n, _)| (Some(n), wanted.clone()))
+        .collect()
 }
 
 /// The tablet binaries a crate offers.
@@ -1198,8 +1267,22 @@ pub fn discover_tablet_apps(root: &std::path::Path) -> Vec<TabletApp> {
     let mut stack: Vec<(std::path::PathBuf, u8)> = ["apps", "shared", "games"].iter().map(|d| (root.join(d), 0)).collect();
     while let Some((dir, depth)) = stack.pop() {
         if let Ok(t) = std::fs::read_to_string(dir.join("Cargo.toml")) {
-            for (bin, features, no_default) in eink_app_bins(&t) {
-                out.push(TabletApp { dir: dir.clone(), bin, features, no_default });
+            let eink = eink_app_bins(&t);
+            let had_eink = !eink.is_empty();
+            for (bin, features, no_default) in eink {
+                out.push(TabletApp { dir: dir.clone(), bin, features, no_default, via_shim: false });
+            }
+            // An ordinary eframe app, unless it already has an eink-kit shell.
+            if !had_eink && dir.join("src").is_dir() {
+                let pkg = t.lines().skip_while(|l| l.trim() != "[package]").find_map(|l| l.trim().strip_prefix("name").and_then(|r| r.split('"').nth(1)).map(str::to_string));
+                for (bin, features) in eframe_app_bins(&t) {
+                    let bin = match bin {
+                        Some(b) => b,
+                        None if dir.join("src/main.rs").is_file() => match &pkg { Some(p) => p.clone(), None => continue },
+                        None => continue,
+                    };
+                    out.push(TabletApp { dir: dir.clone(), bin, features, no_default: false, via_shim: true });
+                }
             }
         }
         if depth >= 3 {
@@ -1320,6 +1403,22 @@ pub fn container_runtime(path_env: &str) -> Option<&'static str> {
     ["podman", "docker"].into_iter().find(|r| crate::nixtoolchain::on_path(r, path_env))
 }
 
+/// The Cargo.lock a build of `dir` will touch: the nearest ancestor with one,
+/// inside the repo. The shim patch rewrites it, so callers save and restore
+/// it around the build (the operator's checkout must not change).
+pub fn workspace_lock(dir: &std::path::Path, repo_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    dir.ancestors().take_while(|d| d.starts_with(repo_root)).map(|d| d.join("Cargo.lock")).find(|p| p.is_file())
+}
+
+/// Alpine packages the container installs for the native libraries eframe
+/// apps pull in (found by compiling them against the shim): OpenSSL
+/// (bo-suite), ALSA (voiceterm, aperture), Opus (studio), D-Bus (voiceterm),
+/// libudev (gamepads), whisper.cpp's C++ build (aperture). `-static` where
+/// Alpine splits static archives out. Package availability UNVERIFIED on a
+/// real run: a missing one fails `apk add` visibly.
+pub const CONTAINER_NATIVE_PKGS: &str = "musl-dev pkgconf linux-headers openssl-dev openssl-libs-static \
+    alsa-lib-dev opus-dev dbus-dev eudev-dev cmake g++ clang-dev";
+
 /// Everything needed to run one build and find its output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildPlan {
@@ -1330,6 +1429,8 @@ pub struct BuildPlan {
     pub output: std::path::PathBuf,
     /// One line for the log: which engine, which toolchain or image.
     pub note: String,
+    /// Save before, restore after (the shim patch rewrites it).
+    pub lockfile: Option<std::path::PathBuf>,
 }
 
 /// A container build of `app` for `t`, mounting `repo_root` (path
@@ -1352,6 +1453,10 @@ pub fn container_plan(runtime: &str, repo_root: &std::path::Path, app: &TabletAp
     let workdir = if rel.is_empty() { "/src".to_string() } else { format!("/src/{rel}") };
     let target_dir = format!("{workdir}/target/tablet-container");
     let mut cargo = vec!["cargo".to_string(), "build".into(), "--release".into(), "--bin".into(), app.bin.clone()];
+    if app.via_shim {
+        cargo.push("--config".into());
+        cargo.push(format!("'{}'", shim_config_arg(&format!("/src/{SHIM_REL}"))));
+    }
     if app.no_default {
         cargo.push("--no-default-features".into());
     }
@@ -1360,7 +1465,12 @@ pub fn container_plan(runtime: &str, repo_root: &std::path::Path, app: &TabletAp
         cargo.push(app.features.join(","));
     }
     let native = t.triple.starts_with("aarch64");
-    let mut script = String::from("apk add --no-cache musl-dev >/dev/null && ");
+    let mut script = if app.via_shim {
+        // eframe apps bring native libraries; musl-dev alone is enough for eink-kit apps
+        format!("apk add --no-cache {} >/dev/null && export EINK_SHIM=1 && ", CONTAINER_NATIVE_PKGS.split_whitespace().collect::<Vec<_>>().join(" "))
+    } else {
+        String::from("apk add --no-cache musl-dev >/dev/null && ")
+    };
     let output_rel;
     if native {
         script += &format!("RUSTFLAGS='-C target-feature=+crt-static' {}", cargo.join(" "));
@@ -1389,17 +1499,39 @@ pub fn container_plan(runtime: &str, repo_root: &std::path::Path, app: &TabletAp
         env: vec![],
         cwd: repo_root.to_path_buf(),
         output: repo_root.join(output_rel.trim_start_matches('/')),
-        note: format!("{runtime} with {CONTAINER_IMAGE}{}", if native { " (linux/arm64, native musl)" } else { " (cross, rust-lld)" }),
+        note: format!("{runtime} with {CONTAINER_IMAGE}{}{}", if native { " (linux/arm64, native musl)" } else { " (cross, rust-lld)" },
+            if app.via_shim { ", eframe via eink-kit's shim" } else { "" }),
+        lockfile: workspace_lock(&app.dir, repo_root),
     })
 }
 
 /// A host-toolchain build (what `tablet_build_cmd` + `use_toolchain` do).
-pub fn host_plan(app: &TabletApp, t: &BuildTarget, tc: &Toolchain, native: bool, inherited_rustflags: Option<&str>) -> BuildPlan {
+pub fn host_plan(app: &TabletApp, t: &BuildTarget, tc: &Toolchain, native: bool, inherited_rustflags: Option<&str>, repo_root: &std::path::Path) -> BuildPlan {
     let (mut argv, mut env) = tablet_build_cmd(app, t, inherited_rustflags, native);
     use_toolchain(&mut argv, &mut env, tc);
+    if app.via_shim {
+        argv.push("--config".into());
+        argv.push(shim_config_arg(&repo_root.join(SHIM_REL).to_string_lossy()));
+        env.push(("EINK_SHIM".into(), "1".into()));
+    }
     let rel = tablet_build_output(&app.bin, t, native);
     let output = app.dir.ancestors().map(|d| d.join(&rel)).find(|p| p.exists()).unwrap_or_else(|| app.dir.join(&rel));
-    BuildPlan { argv, env, cwd: app.dir.clone(), output, note: format!("host toolchain {} ({})", tc.cargo.display(), tc.origin) }
+    BuildPlan { argv, env, cwd: app.dir.clone(), output, lockfile: workspace_lock(&app.dir, repo_root),
+        note: format!("host toolchain {} ({}){}", tc.cargo.display(), tc.origin, if app.via_shim { ", eframe via eink-kit's shim" } else { "" }) }
+}
+
+/// Run `f` with the plan's Cargo.lock saved beforehand and restored after,
+/// whatever `f` does (the shim patch rewrites the lock; the operator's
+/// checkout must come out exactly as it went in).
+pub fn with_lock_preserved<T>(plan: &BuildPlan, f: impl FnOnce() -> T) -> T {
+    let saved = plan.lockfile.as_ref().and_then(|p| std::fs::read(p).ok().map(|b| (p.clone(), b)));
+    let out = f();
+    if let Some((p, bytes)) = saved {
+        if std::fs::read(&p).ok().as_deref() != Some(bytes.as_slice()) {
+            let _ = std::fs::write(&p, bytes);
+        }
+    }
+    out
 }
 
 /// Choose and build the plan for `engine`. Errors explain every engine
@@ -1407,7 +1539,7 @@ pub fn host_plan(app: &TabletApp, t: &BuildTarget, tc: &Toolchain, native: bool,
 pub fn plan_build(engine: Engine, repo_root: &std::path::Path, app: &TabletApp, t: &BuildTarget, path_env: &str, home: Option<&str>, cargo_env: Option<&str>) -> Result<BuildPlan, String> {
     let native = native_for(t);
     let rustflags = std::env::var("RUSTFLAGS").ok();
-    let host = || pick_toolchain(t.triple, native, path_env, home, cargo_env).map(|tc| host_plan(app, t, &tc, native, rustflags.as_deref()));
+    let host = || pick_toolchain(t.triple, native, path_env, home, cargo_env).map(|tc| host_plan(app, t, &tc, native, rustflags.as_deref(), repo_root));
     let container = || match container_runtime(path_env) {
         Some(r) => container_plan(r, repo_root, app, t),
         None => Err("no container runtime found (podman or docker)".into()),
@@ -2212,7 +2344,7 @@ mod tests {
     #[test]
     fn tablet_builds_force_static_even_for_egui_apps_and_keep_existing_rustflags() {
         let t = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
-        let demo = TabletApp { dir: ".".into(), bin: "eink-demo".into(), features: vec![], no_default: false };
+        let demo = TabletApp { dir: ".".into(), bin: "eink-demo".into(), features: vec![], no_default: false, via_shim: false };
         // a PATH with a musl cross gcc, so the rust-lld fallback stays out of it
         let dir = std::env::temp_dir().join(format!("xgcc_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2324,7 +2456,7 @@ eframe = { version = "0.34", optional = true }
 eink-kit = { path = "../../shared/eink-kit", optional = true }
 "#;
         assert_eq!(eink_app_bins(t), vec![("tomescope-eink".to_string(), vec!["eink".to_string()], true)]);
-        let app = TabletApp { dir: ".".into(), bin: "tomescope-eink".into(), features: vec!["eink".into()], no_default: true };
+        let app = TabletApp { dir: ".".into(), bin: "tomescope-eink".into(), features: vec!["eink".into()], no_default: true, via_shim: false };
         let target = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
         let (argv, _) = tablet_build_cmd(&app, &target, None, false);
         for want in ["--no-default-features", "--features", "eink", "--bin", "tomescope-eink"] {
@@ -2435,7 +2567,7 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
 
     #[test]
     fn a_laptop_without_a_musl_cross_linker_links_with_rust_lld() {
-        let app = TabletApp { dir: ".".into(), bin: "eink-demo".into(), features: vec![], no_default: false };
+        let app = TabletApp { dir: ".".into(), bin: "eink-demo".into(), features: vec![], no_default: false, via_shim: false };
         let t = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
         let (_, env) = tablet_build_cmd_on_path(&app, &t, None, false, "/nonexistent");
         let get = |k: &str| env.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
@@ -2517,7 +2649,7 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
     #[test]
     fn a_paper_pro_container_build_is_native_arm64_musl_with_the_repo_mounted() {
         let root = std::path::Path::new("/home/user/mono");
-        let app = TabletApp { dir: root.join("apps/tomescope"), bin: "tomescope-eink".into(), features: vec!["eink".into()], no_default: true };
+        let app = TabletApp { dir: root.join("apps/tomescope"), bin: "tomescope-eink".into(), features: vec!["eink".into()], no_default: true, via_shim: false };
         let t = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
         let p = container_plan("podman", root, &app, &t).unwrap();
         let a = p.argv.join(" ");
@@ -2544,7 +2676,7 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
         let _ = std::fs::remove_dir_all(&root);
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let app = TabletApp { dir: root.join("shared/eink-kit"), bin: "eink-demo".into(), features: vec![], no_default: false };
+        let app = TabletApp { dir: root.join("shared/eink-kit"), bin: "eink-demo".into(), features: vec![], no_default: false, via_shim: false };
         let t = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
         // no toolchain, no runtime: both reasons in one error
         let e = plan_build(Engine::Auto, &root, &app, &t, &bin.to_string_lossy(), None, None).unwrap_err();
@@ -2565,5 +2697,57 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
         assert_eq!(f[0].code, "build-container-no-emulation");
         assert!(diagnose("Error: Cannot connect to Podman. Please verify your connection").iter().any(|f| f.fix.as_deref() == Some("podman machine start")));
         assert_eq!(Engine::parse("podman"), Some(Engine::Container));
+    }
+
+    #[test]
+    fn ordinary_eframe_apps_are_offered_through_the_shim() {
+        let snap = "[package]\nname = \"snapclone-egui\"\n[[bin]]\nname = \"snapclone-egui\"\nrequired-features = [\"app\"]\n[features]\ndefault = [\"app\"]\napp = [\"dep:eframe\"]\n[dependencies]\neframe = { version = \"0.34\", optional = true }\n";
+        assert_eq!(eframe_app_bins(snap), vec![(Some("snapclone-egui".to_string()), vec![])], "default feature already enables eframe");
+        let photo = "[package]\nname = \"photo\"\n[features]\ndefault = []\napp = [\"dep:eframe\"]\n[dependencies]\neframe = { version = \"0.34\", optional = true }\n";
+        assert_eq!(eframe_app_bins(photo), vec![(None, vec!["app".to_string()])], "non-default gate is enabled");
+        let dev_only = "[package]\nname = \"x\"\n[dev-dependencies]\neframe = \"0.34\"\n";
+        assert!(eframe_app_bins(dev_only).is_empty());
+        let shim = "[package]\nname = \"eframe\"\n[dependencies]\neframe = \"0.34\"\n";
+        assert!(eframe_app_bins(shim).is_empty());
+    }
+
+    #[test]
+    fn discovery_offers_the_requested_eframe_apps_in_this_checkout() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../..");
+        let apps = discover_tablet_apps(&root);
+        for want in ["snapclone-egui", "bo-suite-egui", "rusty-board-egui"] {
+            let a = apps.iter().find(|a| a.bin == want).unwrap_or_else(|| panic!("{want} not offered: {:?}", apps.iter().map(|a| &a.bin).collect::<Vec<_>>()));
+            assert!(a.via_shim, "{want} goes through the shim");
+        }
+        assert!(apps.iter().any(|a| a.bin == "eink-demo" && !a.via_shim), "eink-kit apps stay native");
+        assert!(!apps.iter().any(|a| a.bin == "tomescope"), "tomescope has an eink shell; its desktop bin is not offered via the shim");
+    }
+
+    #[test]
+    fn the_lockfile_comes_back_exactly_as_it_was() {
+        let dir = std::env::temp_dir().join(format!("lockp_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("Cargo.lock");
+        std::fs::write(&lock, "original").unwrap();
+        let plan = BuildPlan { argv: vec![], env: vec![], cwd: dir.clone(), output: dir.clone(), note: String::new(), lockfile: Some(lock.clone()) };
+        let r = with_lock_preserved(&plan, || { std::fs::write(&lock, "rewritten by the patch").unwrap(); 7 });
+        assert_eq!(r, 7);
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), "original");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shim_builds_patch_eframe_set_eink_shim_and_track_the_lockfile() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../..").canonicalize().unwrap();
+        let app = TabletApp { dir: root.join("apps/snapclone/egui-frontend"), bin: "snapclone-egui".into(), features: vec![], no_default: false, via_shim: true };
+        let t = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
+        let p = container_plan("podman", &root, &app, &t).unwrap();
+        let a = p.argv.join(" ");
+        assert!(a.contains("patch.crates-io.eframe.path=\"/src/shared/eink-kit/eframe-shim\""), "{a}");
+        assert!(a.contains("export EINK_SHIM=1") && a.contains("openssl-libs-static"), "{a}");
+        assert_eq!(p.lockfile.as_deref(), Some(root.join("apps/snapclone/egui-frontend/Cargo.lock").as_path()));
+        let tc = Toolchain { cargo: "/x/cargo".into(), rustc: "/x/rustc".into(), origin: "t".into() };
+        let h = host_plan(&app, &t, &tc, false, None, &root);
+        assert!(h.argv.iter().any(|x| x.contains("eframe-shim")) && h.env.iter().any(|(k, v)| k == "EINK_SHIM" && v == "1"));
     }
 }

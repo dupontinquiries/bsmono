@@ -1,0 +1,18 @@
+# alpine-run: run a program inside the Alpine userland gitmind keeps under
+# /home on a reMarkable, the way a laptop just runs installed programs.
+# Static (built like every tablet binary), libc only.
+[package]
+name = "alpine-run"
+version = "0.1.0"
+edition = "2021"
+description = "Run a program inside an Alpine root: private mount namespace, bind mounts, chroot, exec"
+publish = false
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true
