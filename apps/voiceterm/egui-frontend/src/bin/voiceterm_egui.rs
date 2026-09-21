@@ -3097,13 +3097,34 @@ impl eframe::App for VoicetermApp {
                 .frame(tabbar_frame)
                 .exact_width(adaptive.min_touch_target)
         };
-        let pinned = self.tabbar_width;
+        // (No `pinned` capture: the content fills the panel instead -- see below.)
         let tabbar_out = tabbar_panel.show(ctx, |ui| {
             if self.tabbar_open && !resizing {
-                // The frame's inner margin is inside the panel rect; the
-                // content min is the rest. This is the line that pins the width.
-                let margin = tabbar_frame.inner_margin.sum().x; // the panel's own margin, not the window's
-                ui.set_min_width((pinned - margin).max(0.0));
+                // FILL THE PANEL -- NEVER EXCEED IT. This used to pin the
+                // content to `pinned`, the REMEMBERED width, and that is the
+                // thin black strip that appeared on shrink and swallowed
+                // terminal scrolling. From egui's own panel.rs (0.34):
+                //
+                //   * the panel's rect comes from its stored width, and its
+                //     content is CLIPPED to that rect ("If we overflow, don't
+                //     do so visibly (#4475)");
+                //   * but the width the panel ALLOCATES is taken from the
+                //     content's response, and the central panel starts at
+                //     that edge (`cursor.min.x = rect.max.x`).
+                //
+                // On the frame a drag ends, `pinned` is still the OLD wider
+                // width (it is only read back after `show`). The content
+                // demanded that width, the panel allocated it, the fill was
+                // clipped short of it -- and the gap between was painted by
+                // nothing, so the window's black showed. Because it belonged to
+                // the sidebar's allocation, the terminal was not under the
+                // pointer there, which is why scrolling over it went nowhere.
+                //
+                // `ui.max_rect()` is the panel's own inner rect, so this is the
+                // idiom egui itself uses for horizontal panels: content fills
+                // exactly the space the panel has, and cannot push its
+                // allocation past its paint.
+                ui.set_min_width(ui.max_rect().width());
             }
             // The chevron points the way the panel will move, which is the
             // convention `rail` already set two panels over.
