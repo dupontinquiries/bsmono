@@ -315,19 +315,15 @@ impl Coordinator {
     /// Always to the bar; to the roster ONLY while we hold the floor, because
     /// the roster's animated ring belongs to the ACTIVE speaker and we have
     /// no level for a remote one.
-    /// ## KNOWN GAP: in Open mode your own ring never lights
+    /// NO PRODUCTION CALLER. The live mic level arrives as
+    /// `HostEvent::MicActivity` in host.rs and is routed there directly; this
+    /// is exercised only by this module's tests.
     ///
-    /// Open is the DEFAULT `TalkMode`, where `GroupVoice::active_speaker` is
-    /// "whoever is loudest", read from `gv.levels`. This function never calls
-    /// `gv.set_level(self_id, level)` -- it takes `&self` and no GroupVoice at
-    /// all -- so the local level never enters that comparison. The result: in
-    /// the default mode you can never be the active speaker, `holder` is never
-    /// you, and the gate below keeps your mic off the roster permanently.
-    ///
-    /// Found while fixing a test that assumed push-to-talk. NOT fixed here,
-    /// because it needs this signature to take the GroupVoice, and every call
-    /// site with it -- a change to the voice pipeline's shape rather than to
-    /// one test, worth doing deliberately.
+    /// That matters for anyone reading this to find why a speaking ring does
+    /// not light: I first documented an Open-mode gap HERE and proposed
+    /// changing this signature, and the fix belonged in host.rs instead --
+    /// this function is not on the path. Fixing it here would have changed a
+    /// signature nothing in the running app calls.
     pub fn mic_level(&self, level: f32, bar: Option<&mut VoiceBar>, roster: Option<&mut Roster>) {
         if let Some(b) = bar {
             b.set_mic_level(level);

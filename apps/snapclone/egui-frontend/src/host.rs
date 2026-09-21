@@ -547,6 +547,27 @@ impl Snapclone {
                 // like confirmation that you are being heard.
                 let mine = if self.sender.is_transmitting() { l } else { 0.0 };
                 self.voicebar.note_level("You", true, mine, MIC_TICK_MS);
+                // AND INTO THE GROUP, the way every REMOTE speaker already
+                // goes (`SpeakerLevel` below calls `group_voice.set_level`).
+                // The local one was simply left out, so in Open mode -- the
+                // default, where the active speaker is whoever is loudest in
+                // `levels` -- you could never be the active speaker and your
+                // own ring never lit.
+                //
+                // `mine`, not `l`: the same gate as the voicebar line above
+                // and for the same reason. Feeding the raw level would make
+                // you "loudest" while muted or not transmitting, and the
+                // roster would say you are speaking to a room that cannot hear
+                // you -- the exact false confirmation that comment warns of.
+                //
+                // Guarded on a known id: before the identity resolves,
+                // `local_id` is empty, and `set_level` ignores ids that are not
+                // participants anyway -- but naming the case beats relying on
+                // a lookup to fail.
+                if !self.local_id.is_empty() {
+                    let me = self.local_id.clone();
+                    self.group_voice.set_level(&me, mine);
+                }
             }
             HostEvent::EncoderReady(ready) => {
                 self.sender.set_encoder_ready(ready);
@@ -1011,6 +1032,65 @@ mod tests {
         let out = s.apply(HostEvent::VoiceReceived {
             sender: "sc-aabbccdd".into(), payload: floor });
         assert!(!out.iter().any(|c| matches!(c, HostCommand::DecodeAudio(_))), "{out:?}");
+    }
+
+    /// A snapclone in an Open-mode call with us as a participant.
+    fn in_open_call(me: &str) -> Snapclone {
+        let mut s = app();
+        s.local_id = me.to_string();
+        s.group_voice.set_participants(vec![
+            crate::group_voice::Participant { id: me.into(), name: "Me".into(), is_self: true },
+            crate::group_voice::Participant { id: "sc-peer".into(), name: "Peer".into(), is_self: false },
+        ]);
+        s.group_voice.mode = crate::group_voice::TalkMode::Open;
+        s
+    }
+
+    /// THE REPORTED GAP. Open is the default mode, where the active speaker is
+    /// whoever is loudest in `levels`. Remote speakers entered `levels` via
+    /// `SpeakerLevel`; the local one never did, so you could never be the
+    /// active speaker and your own ring never lit.
+    #[test]
+    fn in_open_mode_the_local_speaker_can_be_the_active_one() {
+        let mut s = in_open_call("sc-me");
+        s.sender.set_transmitting(true);
+        s.apply(HostEvent::MicActivity(0.8));
+        assert_eq!(s.group_voice.active_speaker(), Some("sc-me"),
+                   "you must be able to be the loudest in an open room");
+    }
+
+    /// ...BUT ONLY WHILE TRANSMITTING. Feeding the raw level would make you
+    /// "loudest" while muted, and the roster would say you are speaking to a
+    /// room that cannot hear you -- the false confirmation host.rs warns of.
+    #[test]
+    fn a_muted_local_speaker_is_not_reported_as_speaking() {
+        let mut s = in_open_call("sc-me");
+        s.sender.set_transmitting(false);
+        s.apply(HostEvent::MicActivity(0.9));
+        assert_ne!(s.group_voice.active_speaker(), Some("sc-me"),
+                   "a loud mic that is not transmitting must not light your ring");
+    }
+
+    /// The local and remote paths now agree: whoever is actually loudest wins,
+    /// whether that is you or them.
+    #[test]
+    fn a_louder_peer_still_takes_the_ring_from_you() {
+        let mut s = in_open_call("sc-me");
+        s.sender.set_transmitting(true);
+        s.apply(HostEvent::MicActivity(0.4));
+        s.apply(HostEvent::SpeakerLevel { peer: "sc-peer".into(), level: 0.9 });
+        assert_eq!(s.group_voice.active_speaker(), Some("sc-peer"));
+    }
+
+    /// Before identity resolves `local_id` is empty; that must not insert a
+    /// phantom "" speaker.
+    #[test]
+    fn no_id_means_no_local_level() {
+        let mut s = in_open_call("sc-me");
+        s.local_id = String::new();
+        s.sender.set_transmitting(true);
+        s.apply(HostEvent::MicActivity(0.9));
+        assert_ne!(s.group_voice.active_speaker(), Some(""));
     }
 
     #[test]
