@@ -28,6 +28,16 @@ pub struct State {
     /// What the last enrol/probe found. Written by the worker thread.
     pub found: Arc<Mutex<Option<(ef::Probe, ef::Displays)>>>,
     pub last_result: String,
+    /// Set when enrolment stopped on a changed host key: shows Re-trust.
+    pub hostkey_changed: Arc<Mutex<bool>>,
+    /// Two-step confirmation for actions that change the tablet itself.
+    pub confirm: Option<Confirm>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Confirm {
+    Activate(ef::Activation),
+    KeepHostKey,
 }
 
 impl Default for State {
@@ -41,6 +51,8 @@ impl Default for State {
             task: Task::default(),
             found: Arc::new(Mutex::new(None)),
             last_result: String::new(),
+            hostkey_changed: Arc::new(Mutex::new(false)),
+            confirm: None,
         }
     }
 }
@@ -54,11 +66,22 @@ fn describe(p: &ef::Probe, d: &ef::Displays) -> Vec<String> {
     if let Some(c) = &p.unknown_codename {
         v.push(format!("  motd names \"{c}\", which gitmind does not know yet"));
     }
-    v.push(match d.route() {
-        Ok(ef::Route::Blight) => "route: Oxide / Blight — gitmind launches apps directly".into(),
-        Ok(ef::Route::AppLoad { .. }) => "route: AppLoad — gitmind installs, you tap the icon on the tablet".into(),
+    v.push(match d.readiness() {
+        Ok((ef::Route::Blight, _)) => "route: Oxide / Blight — gitmind launches apps directly".into(),
+        Ok((ef::Route::AppLoad { .. }, _)) => "route: AppLoad — gitmind installs, you tap the icon on the tablet".into(),
         Err(e) => format!("route: none — {e}"),
     });
+    match d.readiness() {
+        Ok((_, Some(a))) => v.push(format!("since its last boot it needs: {}", a.label())),
+        Ok((_, None)) if !d.screen_ready() => v.push("no display server is running (and none gitmind can start)".into()),
+        _ => {}
+    }
+    if d.etc_overlay {
+        v.push("system files reset at boot; gitmind only writes under /home/root".into());
+    }
+    if d.hostkey_volatile {
+        v.push("its SSH host key changes at every reboot until made permanent".into());
+    }
     v
 }
 
@@ -86,8 +109,10 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             let host = s.host.trim().to_string();
             let pw = std::mem::take(&mut s.password); // consumed, not kept
             let found = s.found.clone();
+            let changed = s.hostkey_changed.clone();
             s.task.run_logged(move |log| {
                 let mut e = ef::SshEnroller { host: host.clone() };
+                *changed.lock().unwrap() = false;
                 let pw = Some(pw).filter(|p| !p.is_empty());
                 match ef::enroll(&mut e, pw.as_deref(), &mut |ev| log.push(&format!("{ev:?}"))) {
                     Ok(r) => {
@@ -95,7 +120,12 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                         *found.lock().unwrap() = Some((r.probe, r.displays));
                         format!("enrolled root@{host}\n{lines}")
                     }
-                    Err(e) => format!("enrol failed: {e}"),
+                    Err(e) => {
+                        if e == ef::HOSTKEY_CHANGED {
+                            *changed.lock().unwrap() = true;
+                        }
+                        format!("enrol failed: {e}")
+                    }
                 }
             });
         }
@@ -118,10 +148,66 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         }
     });
 
+    if *s.hostkey_changed.lock().unwrap() {
+        ui.label(egui::RichText::new("The tablet's host key changed. Re-trust only if you know why \
+            (e.g. you just rebooted it on your own cable).").strong());
+        if ui.add_enabled(!busy, egui::Button::new("Re-trust this tablet")).clicked() {
+            let (host, changed) = (s.host.trim().to_string(), s.hostkey_changed.clone());
+            s.task.run_logged(move |_| match cockpit::deploy::retrust_host(&host) {
+                Ok(m) => {
+                    *changed.lock().unwrap() = false;
+                    format!("{m}\nnow Enrol again, then make the key permanent")
+                }
+                Err(e) => format!("re-trust failed: {e}"),
+            });
+        }
+    }
+
     let found = s.found.lock().unwrap().clone();
     if let Some((p, d)) = &found {
         for line in describe(p, d) {
             ui.label(line);
+        }
+        // Per-boot activation and host-key persistence: both change the
+        // tablet, so each takes a second, explicit tap.
+        let mut actions: Vec<(Confirm, String)> = Vec::new();
+        if let Ok((_, Some(a))) = d.readiness() {
+            actions.push((Confirm::Activate(a), format!("Activate: {}", a.label())));
+        }
+        if d.hostkey_volatile {
+            actions.push((Confirm::KeepHostKey, "Keep this host key across reboots".into()));
+        }
+        for (c, label) in actions {
+            if s.confirm == Some(c) {
+                let warn = match c {
+                    Confirm::Activate(ef::Activation::StartXovi) => "The tablet's screen will restart for a few seconds.",
+                    Confirm::Activate(_) => "The tablet switches to its launcher.",
+                    Confirm::KeepHostKey => "This briefly makes the tablet's system writable and copies its SSH host key into /etc.",
+                };
+                ui.label(egui::RichText::new(warn).small());
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy, egui::Button::new("Confirm")).clicked() {
+                        let host = s.host.trim().to_string();
+                        s.task.run_logged(move |_| {
+                            let mut r = ef::SshRemote { user: "root".into(), host };
+                            let cmd = match c {
+                                Confirm::Activate(a) => ef::activation_cmd(a),
+                                Confirm::KeepHostKey => ef::persist_host_keys_cmd().to_string(),
+                            };
+                            match ef::Remote::run(&mut r, &cmd) {
+                                Ok(out) => format!("{}\n(Probe again to refresh)", out.trim()),
+                                Err(e) => format!("failed: {e}"),
+                            }
+                        });
+                        s.confirm = None;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        s.confirm = None;
+                    }
+                });
+            } else if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                s.confirm = Some(c);
+            }
         }
     }
 
@@ -162,12 +248,17 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 let mut r = ef::SshRemote { user: "root".into(), host: host.clone() };
                 let p = match ef::Remote::run(&mut r, ef::probe_cmd()) { Ok(o) => ef::parse_probe(&o), Err(e) => return format!("probe failed: {e}") };
                 let d = match ef::Remote::run(&mut r, ef::displays_probe_cmd()) { Ok(o) => ef::parse_displays(&o), Err(e) => return format!("probe failed: {e}") };
-                let route = match d.route() { Ok(r) => r, Err(e) => return e };
+                let (route, activation) = match d.readiness() { Ok(r) => r, Err(e) => return e };
+                if let (ef::Route::Blight, Some(a)) = (&route, activation) {
+                    return format!("the tablet needs \"{}\" since its last boot — use Activate above", a.label());
+                }
                 let profile = choice.unwrap_or_else(|| ef::RefreshProfile::fastest(p.model.map(|m| m.panel()).unwrap_or(ef::Panel::Mono)));
                 let env = ef::LaunchEnv { profile, model: p.model, blight_lib: d.blight_lib.clone() };
                 match ef::deliver(&mut r, &route, &name, &bin, &env, &[], &mut |ev| log.push(&format!("{ev:?}"))) {
                     Ok(ef::Delivered::Launched(ef::Outcome::Running { pid })) => format!("{name} running (pid {pid}, {})", profile.as_env()),
                     Ok(ef::Delivered::Launched(ef::Outcome::ExitedEarly { log_tail })) => format!("{name} exited right after launch:\n{log_tail}"),
+                    Ok(ef::Delivered::Registered { .. }) if activation.is_some() =>
+                        format!("{name} installed — activate xovi (above), then open AppLoad on the tablet and tap it"),
                     Ok(ef::Delivered::Registered { .. }) => format!("{name} installed — open AppLoad on the tablet and tap it"),
                     Err(e) => format!("deploy failed: {e}"),
                 }

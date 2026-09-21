@@ -1393,7 +1393,10 @@ fn iso_now() -> String {
 /// the root filesystem; Oxide/AppLoad get installed or removed).
 fn cmd_eink(rest: &[String]) -> i32 {
     use cockpit::eink_fleet as ef;
-    const USAGE: &str = "usage: gitmind eink <enroll|probe|deploy|stop|status> <host> ...\n  \
+    const USAGE: &str = "usage: gitmind eink <enroll|probe|deploy|stop|status|activate|retrust|keep-hostkey> <host> ...\n  \
+        activate <host>                     after a reboot: start xovi or the launcher, whichever is needed\n  \
+        retrust <host>                      accept the tablet's NEW host key (only if you know why it changed)\n  \
+        keep-hostkey <host>                 make a volatile host key survive reboots (writes the tablet's /etc)\n  \
         enroll <host>                       first contact: password (GITMIND_RM_PASSWORD or stdin) → key\n  \
         probe <host>                        model, display servers, route\n  \
         deploy <host> <bin> [--name N] [--profile fast-color|fast-mono|quality] [-- args...]\n  \
@@ -1407,6 +1410,10 @@ fn cmd_eink(rest: &[String]) -> i32 {
     };
     let pos: Vec<&String> = flags.iter().filter(|a| !a.starts_with("--")).collect();
     let mut remote = ef::SshRemote { user: "root".into(), host: host.clone() };
+    let need = |a: Option<ef::Activation>| match a {
+        Some(a) => format!("\n          needs, once per boot: {} → `gitmind eink activate {host}`", a.label()),
+        None => String::new(),
+    };
     let describe = |p: &ef::Probe, d: &ef::Displays| {
         println!("  model   {}", p.model.map(|m| m.label()).unwrap_or("unknown (set it in the roster)"));
         println!("          identified by: {}", p.how);
@@ -1416,10 +1423,18 @@ fn cmd_eink(rest: &[String]) -> i32 {
         println!("  target  {}{}", p.triple.unwrap_or("unknown"), d.glibc.as_ref().map(|g| format!(" (glibc {g}: build with zigbuild .{g})")).unwrap_or_default());
         println!("  displays qtfb={} appload={} blight_lib={} blight_running={}",
             d.qtfb, d.appload_dir.as_deref().unwrap_or("-"), d.blight_lib.as_deref().unwrap_or("-"), d.blight_running);
-        match d.route() {
-            Ok(ef::Route::Blight) => println!("  route   Blight: gitmind can launch apps remotely"),
-            Ok(ef::Route::AppLoad { dir }) => println!("  route   AppLoad ({dir}): gitmind installs, you tap the icon"),
+        match d.readiness() {
+            Ok((ef::Route::Blight, a)) => println!("  route   Blight: gitmind can launch apps remotely{}", need(a)),
+            Ok((ef::Route::AppLoad { dir }, a)) => println!("  route   AppLoad ({dir}): gitmind installs, you tap the icon{}", need(a)),
             Err(e) => println!("  route   none: {e}"),
+        }
+        if d.rootfs_ro || d.etc_overlay {
+            println!("  system  read-only root{}; gitmind writes only under /home/root",
+                if d.etc_overlay { ", /etc resets at boot" } else { "" });
+        }
+        if d.hostkey_volatile {
+            println!("  WARNING the SSH host key lives in the volatile /etc and changes at reboot;");
+            println!("          `gitmind eink keep-hostkey {host}` makes it permanent");
         }
     };
     match sub {
@@ -1438,6 +1453,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
                     describe(&r.probe, &r.displays);
                     0
                 }
+                Err(e) if e == ef::HOSTKEY_CHANGED => err(&format!("{e}\n  → `gitmind eink retrust {host}`, then `gitmind eink keep-hostkey {host}`")),
                 Err(e) => err(&e),
             }
         }
@@ -1453,7 +1469,10 @@ fn cmd_eink(rest: &[String]) -> i32 {
                 std::path::Path::new(bin.as_str()).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
             });
             let (probe, displays) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return err(&e) };
-            let route = match displays.route() { Ok(r) => r, Err(e) => return err(&e) };
+            let (route, activation) = match displays.readiness() { Ok(r) => r, Err(e) => return err(&e) };
+            if let (ef::Route::Blight, Some(a)) = (&route, activation) {
+                return err(&format!("the tablet needs `{}` since its last boot: run `gitmind eink activate {host}`", a.label()));
+            }
             let profile = match opt(flags, "--profile") {
                 Some(p) => match ef::RefreshProfile::parse(p) { Some(p) => p, None => return err("--profile: fast-color|fast-mono|quality") },
                 None => ef::RefreshProfile::fastest(probe.model.map(|m| m.panel()).unwrap_or(ef::Panel::Mono)),
@@ -1471,8 +1490,42 @@ fn cmd_eink(rest: &[String]) -> i32 {
                 }
                 Ok(ef::Delivered::Registered { manifest_dir }) => {
                     println!("{name} installed for AppLoad ({manifest_dir}); open AppLoad on the tablet and tap it");
+                    if activation.is_some() {
+                        println!("  (xovi is not running since the last boot: `gitmind eink activate {host}` first)");
+                    }
                     0
                 }
+                Err(e) => err(&e),
+            }
+        }
+        "activate" => {
+            let (_, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return err(&e) };
+            match d.readiness() {
+                Ok((_, None)) if d.screen_ready() => { println!("{host}: already active, apps can reach the screen"); 0 }
+                Ok((_, None)) => err("no display server is running and none can be started from here \
+                    (AppLoad without xovi's start script, or no launcher configured)"),
+                Ok((_, Some(a))) => {
+                    eprintln!("  · {}", a.label());
+                    match ef::Remote::run(&mut remote, &ef::activation_cmd(a)) {
+                        Ok(out) => { println!("{}", out.trim()); 0 }
+                        Err(e) => err(&e),
+                    }
+                }
+                Err(e) => err(&e),
+            }
+        }
+        "retrust" => match cockpit::deploy::retrust_host(&host) {
+            Ok(m) => { println!("{m}"); 0 }
+            Err(e) => err(&e),
+        },
+        "keep-hostkey" => {
+            let (_, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return err(&e) };
+            if !d.hostkey_volatile {
+                println!("{host}: host key is not in the volatile /etc; nothing to do");
+                return 0;
+            }
+            match ef::Remote::run(&mut remote, ef::persist_host_keys_cmd()) {
+                Ok(out) => { println!("{}", out.trim()); 0 }
                 Err(e) => err(&e),
             }
         }

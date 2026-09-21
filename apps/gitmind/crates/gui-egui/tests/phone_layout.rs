@@ -101,7 +101,11 @@ fn the_populated_tablets_page_fits_a_phone() {
     let mut app = App::default();
     app.tab = Tab::Tablets;
     let probe = ef::parse_probe("machine=reMarkable Ferrari\nmotd=marshmallow\narch=aarch64");
-    let displays = ef::parse_displays("qtfb=1\nappload_dir=/home/root/xovi/exthome/appload\nglibc=2.39\n");
+    // after a reboot: xovi not started, /etc volatile, host key volatile
+    let displays = ef::parse_displays("appload_dir=/home/root/xovi/exthome/appload\nglibc=2.39\nxovi_installed=1\n\
+        rootfs_ro=1\netc_overlay=1\nhostkey_volatile=1\n");
+    *app.tablets.hostkey_changed.lock().unwrap() = true;
+    app.tablets.confirm = Some(gitmind_egui::pages::tablets::Confirm::KeepHostKey);
     *app.tablets.found.lock().unwrap() = Some((probe, displays));
     app.tablets.bin_path = "/home/user/build/aarch64-unknown-linux-gnu/release/eink-demo".into();
     app.tablets.last_result = "eink-demo exited right after launch:\neink: model PaperPro (EINK_MODEL=rmpp)\n\

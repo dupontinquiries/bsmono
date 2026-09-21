@@ -26,6 +26,22 @@
 //!   is a device measurement, and it belongs in the shell's refresh policy
 //!   where it can be observed and changed, not baked into the deploy tool.
 //!
+//! ## The tablet forgets
+//!
+//! On the Paper Pro family the root filesystem is read-only and `/etc` is an
+//! overlay whose writable layer is tmpfs (`/var/volatile/etc`): anything
+//! written there is gone after a reboot. xovi (and so AppLoad/qtfb) must be
+//! started with `/home/root/xovi/start` after each boot, and a Vellum
+//! launcher (Oxide) can be configured but not running. (All from reManager's
+//! handling of the same device.) So this module:
+//! * writes ONLY under `/home/root`, which persists (`assert_persistent`);
+//! * separates "installed" from "active since this boot" and offers the
+//!   activation step ([`Activation`]) instead of just failing;
+//! * detects a host key living in the volatile `/etc` and can make it
+//!   permanent once ([`persist_host_keys_cmd`]), because re-trusting a new
+//!   key after every reboot trains the operator to accept exactly what a
+//!   man-in-the-middle looks like.
+//!
 //! Everything that builds a remote command is a pure function and is tested
 //! as a string. The shell text runs under the device's `/bin/sh`, which may
 //! be busybox, so it sticks to POSIX constructs.
@@ -567,6 +583,58 @@ pub struct Displays {
     pub blight_running: bool,
     /// glibc version, for pinning the gnu build (`zigbuild --target <triple>.<ver>`).
     pub glibc: Option<String>,
+    /// Root filesystem mounted read-only.
+    pub rootfs_ro: bool,
+    /// `/etc` is the tmpfs-backed overlay: writes there vanish at reboot.
+    pub etc_overlay: bool,
+    /// xovi's start script exists (AppLoad needs it run once per boot).
+    pub xovi_installed: bool,
+    /// Vellum launcherctl: configured launcher, and the one running now.
+    pub launcher_current: Option<String>,
+    pub launcher_active: Option<String>,
+    /// The SSH host key lives in the volatile `/etc` layer, so it will be
+    /// regenerated at the next boot unless made permanent.
+    pub hostkey_volatile: bool,
+}
+
+/// A one-per-boot step the tablet needs before apps can reach its screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activation {
+    /// Run `/home/root/xovi/start`. Restarts the tablet's UI (a few seconds).
+    StartXovi,
+    /// `launcherctl start-launcher`: start the configured launcher (Oxide).
+    StartLauncher,
+}
+
+impl Activation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Activation::StartXovi => "start xovi (restarts the tablet's UI)",
+            Activation::StartLauncher => "start the launcher (Oxide)",
+        }
+    }
+}
+
+pub const XOVI_START: &str = "/home/root/xovi/start";
+pub const LAUNCHERCTL: &str = "/home/root/.vellum/bin/launcherctl";
+
+/// Run the activation detached (the UI restart can outlive the SSH session),
+/// then wait up to 30 s for its sign of life: the qtfb socket for xovi, the
+/// launcher reported active for Oxide.
+pub fn activation_cmd(a: Activation) -> String {
+    match a {
+        Activation::StartXovi => format!(
+            "nohup {XOVI_START} </dev/null >/dev/null 2>&1 & \
+             for _ in $(seq 30); do [ -S /tmp/qtfb.sock ] && echo ready && exit 0; sleep 1; done; \
+             echo 'xovi started but no qtfb socket after 30 s (is AppLoad installed?)'; exit 1"
+        ),
+        Activation::StartLauncher => format!(
+            "{LAUNCHERCTL} start-launcher </dev/null >/dev/null 2>&1; \
+             for _ in $(seq 30); do a=$({LAUNCHERCTL} active-launcher 2>/dev/null | head -n1); \
+             case \"$a\" in ''|none) sleep 1;; *) echo \"ready $a\"; exit 0;; esac; done; \
+             echo 'launcher did not report active after 30 s'; exit 1"
+        ),
+    }
 }
 
 /// How an app gets onto this device's screen.
@@ -579,6 +647,30 @@ pub enum Route {
 }
 
 impl Displays {
+    /// Is a display server up right now? (Not "installed": up.)
+    pub fn screen_ready(&self) -> bool {
+        self.blight_running || self.qtfb
+    }
+
+    /// Route plus the per-boot step it still needs, if any. Prefers a route
+    /// that is ready now; otherwise the one that one activation would make
+    /// ready, Blight first.
+    pub fn readiness(&self) -> Result<(Route, Option<Activation>), String> {
+        if let Ok(r) = self.route() {
+            let qtfb_missing = matches!(r, Route::AppLoad { .. }) && !self.qtfb;
+            let oxide_idle = self.launcher_current.is_some() && self.launcher_active.is_none() && self.blight_lib.is_some();
+            return Ok(match (&r, oxide_idle, qtfb_missing) {
+                (Route::AppLoad { .. }, true, _) => (Route::Blight, Some(Activation::StartLauncher)),
+                (Route::AppLoad { .. }, false, true) if self.xovi_installed => (r, Some(Activation::StartXovi)),
+                _ => (r, None),
+            });
+        }
+        if self.launcher_current.is_some() && self.blight_lib.is_some() {
+            return Ok((Route::Blight, Some(Activation::StartLauncher)));
+        }
+        self.route().map(|r| (r, None))
+    }
+
     /// Blight first: it is the only route gitmind can launch remotely, and
     /// the one with per-update waveforms.
     pub fn route(&self) -> Result<Route, String> {
@@ -607,7 +699,30 @@ pub fn displays_probe_cmd() -> &'static str {
      dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ListNames 2>/dev/null \
        | grep -qi blight && echo blight_running=1; \
      v=$(ldd --version 2>&1 | head -n1 | grep -o '[0-9]\\+\\.[0-9]\\+$'); [ -n \"$v\" ] && echo \"glibc=$v\"; \
+     awk '$2==\"/\" && $4 ~ /(^|,)ro(,|$)/ {print \"rootfs_ro=1\"; exit}' /proc/mounts 2>/dev/null; \
+     awk '$1==\"overlay\" && $2==\"/etc\" {print \"etc_overlay=1\"; exit}' /proc/mounts 2>/dev/null; \
+     [ -x /home/root/xovi/start ] && echo xovi_installed=1; \
+     L=/home/root/.vellum/bin/launcherctl; if [ -x $L ]; then \
+       echo \"launcher_current=$($L current-launcher 2>/dev/null | head -n1)\"; \
+       echo \"launcher_active=$($L active-launcher 2>/dev/null | head -n1)\"; fi; \
+     for f in /var/volatile/etc/ssh/ssh_host_* /var/volatile/etc/dropbear/*host*; do \
+       [ -e \"$f\" ] && echo hostkey_volatile=1 && break; done; \
      true"
+}
+
+/// Every key `displays_probe_cmd` can emit. The test that runs the probe
+/// checks its output against this, so a new probe line without parser
+/// support fails a test instead of being silently ignored.
+pub const DISPLAY_KEYS: &[&str] = &[
+    "qtfb", "appload_dir", "blight_lib", "blight_running", "glibc",
+    "rootfs_ro", "etc_overlay", "xovi_installed", "launcher_current", "launcher_active", "hostkey_volatile",
+];
+
+/// A launcherctl name, or None for "none"/empty. Output format unverified:
+/// takes the first word, ignoring a leading `*` marker.
+fn launcher_name(v: &str) -> Option<String> {
+    let w = v.split_whitespace().find(|w| *w != "*")?.trim_start_matches('*');
+    (!w.is_empty() && w != "none").then(|| w.to_string())
 }
 
 pub fn parse_displays(out: &str) -> Displays {
@@ -619,6 +734,12 @@ pub fn parse_displays(out: &str) -> Displays {
             Some(("blight_lib", v)) if !v.is_empty() => d.blight_lib = Some(v.to_string()),
             Some(("blight_running", "1")) => d.blight_running = true,
             Some(("glibc", v)) if !v.is_empty() => d.glibc = Some(v.to_string()),
+            Some(("rootfs_ro", "1")) => d.rootfs_ro = true,
+            Some(("etc_overlay", "1")) => d.etc_overlay = true,
+            Some(("xovi_installed", "1")) => d.xovi_installed = true,
+            Some(("launcher_current", v)) => d.launcher_current = launcher_name(v),
+            Some(("launcher_active", v)) => d.launcher_active = launcher_name(v),
+            Some(("hostkey_volatile", "1")) => d.hostkey_volatile = true,
             _ => {}
         }
     }
@@ -630,7 +751,7 @@ pub fn parse_displays(out: &str) -> Displays {
 pub trait Enroller {
     fn trust_host(&mut self) -> Result<String, String>;
     /// Does key auth already work? (BatchMode, never prompts.)
-    fn key_works(&mut self) -> bool;
+    fn key_check(&mut self) -> KeyCheck;
     fn install_key(&mut self, password: &str) -> Result<String, String>;
     fn run(&mut self, cmd: &str) -> Result<String, String>;
 }
@@ -654,13 +775,22 @@ pub struct Enrolled {
     pub used_password: bool,
 }
 
+pub const HOSTKEY_CHANGED: &str = "the tablet's SSH host key has changed since it was trusted. \
+    After a reboot that is expected if its key lives in the volatile /etc (probe shows hostkey_volatile); \
+    it is also what an interception looks like. If you just rebooted it on a cable you control, \
+    re-trust it, then make the key permanent so this stops happening.";
+
 /// Enrol a tablet. `password` may be `None` when a key is already installed;
 /// if it is needed and missing, the error says where to find it.
 pub fn enroll(e: &mut dyn Enroller, password: Option<&str>, on: &mut dyn FnMut(EnrollEvent)) -> Result<Enrolled, String> {
     on(EnrollEvent::TrustingHost);
     let t = e.trust_host()?;
     on(EnrollEvent::Trusted(t));
-    let used_password = if e.key_works() {
+    let first = e.key_check();
+    if first == KeyCheck::HostKeyChanged {
+        return Err(HOSTKEY_CHANGED.into());
+    }
+    let used_password = if first == KeyCheck::Works {
         on(EnrollEvent::KeyAlreadyWorks);
         false
     } else {
@@ -672,7 +802,7 @@ pub fn enroll(e: &mut dyn Enroller, password: Option<&str>, on: &mut dyn FnMut(E
         on(EnrollEvent::InstallingKey);
         let r = e.install_key(pw)?;
         on(EnrollEvent::KeyInstalled(r));
-        if !e.key_works() {
+        if e.key_check() != KeyCheck::Works {
             return Err("key was installed but key auth still fails (sshd may not read ~/.ssh/authorized_keys)".into());
         }
         true
@@ -694,8 +824,12 @@ impl Enroller for SshEnroller {
     fn trust_host(&mut self) -> Result<String, String> {
         crate::deploy::trust_host(&self.host)
     }
-    fn key_works(&mut self) -> bool {
-        crate::deploy::remote_capture("root", &self.host, "true").is_ok()
+    fn key_check(&mut self) -> KeyCheck {
+        match crate::deploy::remote_capture("root", &self.host, "true") {
+            Ok(_) => KeyCheck::Works,
+            Err(e) if crate::deploy::ssh_error_reason(&e) == "hostkey" => KeyCheck::HostKeyChanged,
+            Err(_) => KeyCheck::Fails,
+        }
     }
     fn install_key(&mut self, password: &str) -> Result<String, String> {
         crate::deploy::setup_key("root", &self.host, password)
@@ -703,6 +837,69 @@ impl Enroller for SshEnroller {
     fn run(&mut self, cmd: &str) -> Result<String, String> {
         crate::deploy::remote_capture("root", &self.host, cmd)
     }
+}
+
+// ───────────────────────── persistence ─────────────────────────
+
+/// Everything gitmind writes on a tablet must live here: the one tree that
+/// survives a reboot on every model (reManager draws the same line).
+pub const PERSISTENT_ROOT: &str = "/home/root/";
+
+/// Refuse a write target outside the persistent tree. A file written to
+/// the volatile `/etc` "works" until the next reboot, which is the worst
+/// kind of working.
+pub fn assert_persistent(path: &str) -> Result<(), String> {
+    let clean = std::path::Path::new(path);
+    let ok = clean.is_absolute()
+        && path.starts_with(PERSISTENT_ROOT)
+        && !clean.components().any(|c| matches!(c, std::path::Component::ParentDir));
+    if ok { Ok(()) } else { Err(format!("{path}: gitmind only writes under {PERSISTENT_ROOT} on a tablet (the rest resets at boot)")) }
+}
+
+/// Make a volatile SSH host key permanent: the reManager unlock sequence
+/// (remount / rw, lazily unmount the /etc overlay so the real /etc shows),
+/// copy the keys from the tmpfs layer into it, then ALWAYS restore (overlay
+/// back, sync, / read-only) via an EXIT trap, even if the copy fails, and
+/// verify the root really is read-only again.
+///
+/// `ETC`/`VOL` default to the real paths; tests point them at temp dirs.
+/// Unverified on hardware: the key directories are the two sshd layouts
+/// (OpenSSH `/etc/ssh`, dropbear `/etc/dropbear`).
+pub fn persist_host_keys_cmd() -> &'static str {
+    r#"ETC=${ETC:-/etc}; VOL=${VOL:-/var/volatile}
+restore() {
+  if [ -d "$VOL/.etc-work" ] && ! awk '$1=="overlay" && $2=="/etc"{f=1} END{exit !f}' /proc/mounts; then
+    rm -rf "$VOL/.etc-work/"*
+    mount -t overlay overlay -o rw,relatime,lowerdir=/etc,upperdir="$VOL/etc",workdir="$VOL/.etc-work" /etc
+  fi
+  sync
+  mount -o remount,ro /
+  echo restored
+}
+trap restore EXIT
+set -e
+mount -o remount,rw /
+if awk '$1=="overlay" && $2=="/etc"{f=1} END{exit !f}' /proc/mounts; then umount -l /etc; fi
+n=0
+for d in ssh dropbear; do
+  if [ -d "$VOL/etc/$d" ]; then
+    mkdir -p "$ETC/$d"
+    for f in "$VOL/etc/$d/"*host*; do [ -e "$f" ] && cp -a "$f" "$ETC/$d/" && n=$((n+1)); done
+  fi
+done
+echo "persisted $n"
+"#
+}
+
+/// How key auth stands, distinguishing a changed host key (never auto-fixed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyCheck {
+    Works,
+    Fails,
+    /// The pinned host key no longer matches. After a reboot of a tablet
+    /// whose key lives in the volatile /etc this is expected; it is also
+    /// exactly what an attacker looks like, so only the operator decides.
+    HostKeyChanged,
 }
 
 // ───────────────────────── AppLoad route ─────────────────────────
@@ -732,6 +929,7 @@ pub fn appload_manifest(display_name: &str, app: &str, model: Option<RmModel>, p
 /// next reloads its library.
 pub fn appload_install_cmd(app: &str, appload_dir: &str, manifest: &str) -> Result<String, String> {
     check(app)?;
+    assert_persistent(appload_dir)?;
     let dir = format!("{appload_dir}/{app}");
     Ok(format!(
         "mkdir -p {d} && printf '%s\\n' {m} > {d}/external.manifest.json && echo manifest-written",
@@ -1003,10 +1201,14 @@ mod tests {
         log: Vec<String>,
         key_ok: bool,
         key_ok_after_install: bool,
+        hostkey_changed: bool,
     }
     impl Enroller for FakeEnroller {
         fn trust_host(&mut self) -> Result<String, String> { self.log.push("trust".into()); Ok("trusted".into()) }
-        fn key_works(&mut self) -> bool { self.log.push("key?".into()); self.key_ok }
+        fn key_check(&mut self) -> KeyCheck {
+            self.log.push("key?".into());
+            if self.hostkey_changed { KeyCheck::HostKeyChanged } else if self.key_ok { KeyCheck::Works } else { KeyCheck::Fails }
+        }
         fn install_key(&mut self, pw: &str) -> Result<String, String> {
             self.log.push(format!("install:{pw}"));
             self.key_ok = self.key_ok_after_install;
@@ -1022,7 +1224,7 @@ mod tests {
 
     #[test]
     fn first_contact_trusts_the_host_before_sending_the_password() {
-        let mut f = FakeEnroller { log: vec![], key_ok: false, key_ok_after_install: true };
+        let mut f = FakeEnroller { log: vec![], key_ok: false, key_ok_after_install: true, hostkey_changed: false };
         let r = enroll(&mut f, Some("hunter2"), &mut |_| {}).unwrap();
         let trust = f.log.iter().position(|l| l == "trust").unwrap();
         let install = f.log.iter().position(|l| l.starts_with("install")).unwrap();
@@ -1035,7 +1237,7 @@ mod tests {
 
     #[test]
     fn re_enrolling_never_asks_for_the_password_or_duplicates_the_key() {
-        let mut f = FakeEnroller { log: vec![], key_ok: true, key_ok_after_install: true };
+        let mut f = FakeEnroller { log: vec![], key_ok: true, key_ok_after_install: true, hostkey_changed: false };
         let r = enroll(&mut f, None, &mut |_| {}).unwrap();
         assert!(!r.used_password);
         assert!(!f.log.iter().any(|l| l.starts_with("install")));
@@ -1043,14 +1245,14 @@ mod tests {
 
     #[test]
     fn a_missing_password_says_where_to_find_it() {
-        let mut f = FakeEnroller { log: vec![], key_ok: false, key_ok_after_install: true };
+        let mut f = FakeEnroller { log: vec![], key_ok: false, key_ok_after_install: true, hostkey_changed: false };
         let e = enroll(&mut f, None, &mut |_| {}).unwrap_err();
         assert!(e.contains("Settings"), "{e}");
     }
 
     #[test]
     fn a_key_that_still_does_not_work_is_an_error_not_a_silent_success() {
-        let mut f = FakeEnroller { log: vec![], key_ok: false, key_ok_after_install: false };
+        let mut f = FakeEnroller { log: vec![], key_ok: false, key_ok_after_install: false, hostkey_changed: false };
         assert!(enroll(&mut f, Some("pw"), &mut |_| {}).is_err());
     }
 
@@ -1079,7 +1281,8 @@ mod tests {
     fn the_manifest_command_survives_the_shell_with_quotes_in_it() {
         let m = appload_manifest("it's \"quoted\"", "demo", None, RefreshProfile::Quality);
         let dir = std::env::temp_dir().join(format!("appload_{}", std::process::id()));
-        let cmd = appload_install_cmd("demo", &dir.to_string_lossy(), &m).unwrap();
+        let real = "/home/root/xovi/exthome/appload";
+        let cmd = appload_install_cmd("demo", real, &m).unwrap().replace(real, &dir.to_string_lossy());
         let out = std::process::Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).contains("manifest-written"));
         let written = std::fs::read_to_string(dir.join("demo/external.manifest.json")).unwrap();
@@ -1096,7 +1299,123 @@ mod tests {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             let key = line.split_once('=').map(|(k, _)| k).unwrap_or(line);
-            assert!(["qtfb", "appload_dir", "blight_lib", "blight_running", "glibc"].contains(&key), "unexpected probe line {line:?}");
+            assert!(DISPLAY_KEYS.contains(&key), "probe emitted {line:?}, which parse_displays does not know");
         }
+    }
+
+    #[test]
+    fn a_changed_host_key_stops_enrolment_before_any_password_is_sent() {
+        let mut f = FakeEnroller { log: vec![], key_ok: false, key_ok_after_install: true, hostkey_changed: true };
+        let e = enroll(&mut f, Some("pw"), &mut |_| {}).unwrap_err();
+        assert!(e.contains("host key has changed"), "{e}");
+        assert!(!f.log.iter().any(|l| l.starts_with("install")), "password must not be sent to a changed key");
+    }
+
+    #[test]
+    fn every_write_target_is_on_the_persistent_tree() {
+        for p in [BASE.to_string(), bin_path("x"), staging_path("x"), pid_path("x"), log_path("x")] {
+            assert_persistent(&p).unwrap();
+        }
+        assert!(assert_persistent("/etc/foo").is_err());
+        assert!(assert_persistent("/home/root/../../etc").is_err());
+        assert!(assert_persistent("home/root/x").is_err());
+        assert!(appload_install_cmd("demo", "/opt/appload", "{}").is_err(), "a probe result outside /home/root is refused");
+    }
+
+    #[test]
+    fn readiness_after_a_reboot_offers_the_right_activation() {
+        // AppLoad installed, xovi not started since boot → start xovi
+        let d = parse_displays("appload_dir=/home/root/xovi/exthome/appload\nxovi_installed=1\n");
+        assert_eq!(d.readiness().unwrap(), (Route::AppLoad { dir: "/home/root/xovi/exthome/appload".into() }, Some(Activation::StartXovi)));
+        // xovi running → ready
+        let d = parse_displays("appload_dir=/a\nxovi_installed=1\nqtfb=1\n");
+        assert_eq!(d.readiness().unwrap().1, None);
+        // Oxide configured but idle beats AppLoad: one step to the better route
+        let d = parse_displays("appload_dir=/a\nqtfb=1\nblight_lib=/home/root/.vellum/lib/libblight_protocol.so\nlauncher_current=oxide\nlauncher_active=none\n");
+        assert_eq!(d.readiness().unwrap(), (Route::Blight, Some(Activation::StartLauncher)));
+        // Oxide running → ready, no step
+        let d = parse_displays("blight_lib=/x\nblight_running=1\nlauncher_current=oxide\nlauncher_active=oxide\n");
+        assert_eq!(d.readiness().unwrap(), (Route::Blight, None));
+        // only Oxide installed, idle
+        let d = parse_displays("blight_lib=/x\nlauncher_current=* oxide\n");
+        assert_eq!(d.launcher_current.as_deref(), Some("oxide"));
+        assert_eq!(d.readiness().unwrap(), (Route::Blight, Some(Activation::StartLauncher)));
+    }
+
+    #[test]
+    fn activation_commands_are_valid_sh() {
+        for a in [Activation::StartXovi, Activation::StartLauncher] {
+            let o = std::process::Command::new("sh").arg("-n").arg("-c").arg(activation_cmd(a)).output().unwrap();
+            assert!(o.status.success(), "{a:?}: {}", String::from_utf8_lossy(&o.stderr));
+        }
+    }
+
+    /// Run the persistence script against temp dirs, with `mount`/`umount`/
+    /// `sync` replaced by loggers on PATH, to check: keys land in the real
+    /// /etc, and the restore (overlay back, remount ro) runs on success AND
+    /// on failure.
+    #[test]
+    fn host_key_persistence_copies_and_always_restores() {
+        let root = std::env::temp_dir().join(format!("persist_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (etc, vol, bin) = (root.join("etc"), root.join("vol"), root.join("bin"));
+        std::fs::create_dir_all(vol.join("etc/ssh")).unwrap();
+        std::fs::create_dir_all(vol.join(".etc-work")).unwrap();
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(vol.join("etc/ssh/ssh_host_ed25519_key"), "secret").unwrap();
+        std::fs::write(vol.join("etc/ssh/ssh_host_ed25519_key.pub"), "public").unwrap();
+        let log = root.join("calls.log");
+        for tool in ["mount", "umount", "sync"] {
+            let p = bin.join(tool);
+            std::fs::write(&p, format!("#!/bin/sh\necho \"{tool} $*\" >> {}\n", log.display())).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let run = || std::process::Command::new("sh").arg("-c").arg(persist_host_keys_cmd())
+            .env("ETC", &etc).env("VOL", &vol)
+            .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+            .output().unwrap();
+        let o = run();
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(out.contains("persisted 2") && out.contains("restored"), "{out}");
+        assert_eq!(std::fs::read_to_string(etc.join("ssh/ssh_host_ed25519_key")).unwrap(), "secret");
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.starts_with("mount -o remount,rw /"), "{calls}");
+        assert!(calls.trim_end().ends_with("mount -o remount,ro /"), "{calls}");
+
+        // failure mid-way (key dir unwritable) must still restore
+        std::fs::remove_file(&log).unwrap();
+        std::fs::remove_dir_all(etc.join("ssh")).unwrap();
+        std::fs::write(etc.join("ssh"), "a file where a dir should be").unwrap();
+        let o = run();
+        assert!(!o.status.success());
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.trim_end().ends_with("mount -o remount,ro /"), "restore skipped on failure: {calls}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_display_key_is_parsed() {
+        // each key, set, must change the parsed value from the default
+        for k in DISPLAY_KEYS {
+            let v = if ["appload_dir", "blight_lib", "glibc", "launcher_current", "launcher_active"].contains(k) { "x" } else { "1" };
+            assert_ne!(parse_displays(&format!("{k}={v}")), Displays::default(), "{k} is not parsed");
+        }
+    }
+
+    #[test]
+    fn installed_is_not_ready() {
+        let d = parse_displays("appload_dir=/home/root/xovi/exthome/appload\n");
+        assert!(!d.screen_ready());
+        assert_eq!(d.readiness().unwrap().1, None, "no start script: nothing gitmind can run");
+        assert!(parse_displays("qtfb=1\n").screen_ready());
+    }
+
+    #[test]
+    fn the_extended_probe_parses_a_paper_pro_after_reboot() {
+        let d = parse_displays("rootfs_ro=1\netc_overlay=1\nxovi_installed=1\nhostkey_volatile=1\nlauncher_current=none\nlauncher_active=\n");
+        assert!(d.rootfs_ro && d.etc_overlay && d.xovi_installed && d.hostkey_volatile);
+        assert_eq!(d.launcher_current, None, "\"none\" is no launcher");
     }
 }
