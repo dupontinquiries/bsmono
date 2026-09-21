@@ -3253,6 +3253,8 @@ pub struct App {
     /// loses what the previous filter hid.
     words_raw: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
     word_filter: studio_voice::WordFilter,
+    /// The comic setup window, open over a camera group.
+    comic_setup: Option<comic_job::SetupWindow>,
     /// A comic render in flight.
     comic_run: Option<comic_job::Job>,
     /// The signals window, open over one camera group.
@@ -3482,6 +3484,7 @@ impl Default for App {
               style_ref: None,
               signals_panel: None,
               comic_run: None,
+              comic_setup: None,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
               upscale_clip: None,
@@ -3867,10 +3870,10 @@ impl eframe::App for App {
                         self.structure_view = !self.structure_view;
                         ui.close();
                     }
-                    if ui.add_enabled(!groups.is_empty() && self.comic_run.is_none(), egui::Button::new("comic: auto layout a camera group"))
+                    if ui.add_enabled(!groups.is_empty() && self.comic_run.is_none(), egui::Button::new("comic: auto layout a camera group…"))
                         .on_hover_text("wide, page, inset and split from the dialogue; sides from who each mic hears; renders then lands on a new track")
                         .clicked() {
-                        if let Some((g, _)) = groups.first() { self.start_comic(*g); }
+                        if let Some((g, _)) = groups.first() { self.open_comic_setup(*g); }
                         ui.close();
                     }
                     if ui.add_enabled(!groups.is_empty(), egui::Button::new("cut a camera group by signals…"))
@@ -4301,6 +4304,7 @@ impl eframe::App for App {
         self.kaleido_gallery_window(ctx);
         self.signals_window(ctx);
         self.comic_tracker();
+        self.comic_setup_window(ctx);
 
         // ── files dropped on the window ──────────────────────────────────
         //
@@ -7289,11 +7293,45 @@ impl App {
 
     /// The comic auto mode on a camera group: plan from its transcripts, sides
     /// from its mics, render on a worker, land when done.
-    fn start_comic(&mut self, group: studio_core::GroupId) {
+    /// Open the comic setup over a camera group: one frame per angle from the
+    /// middle of the group, for choosing roles and regions by looking.
+    fn open_comic_setup(&mut self, group: studio_core::GroupId) {
+        let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let project = &self.studio.session.doc.project;
+        let Ok((angles, start, end)) = studio_video::multicam::from_group(project, group) else {
+            self.studio.status = "that group is not a camera group".into(); return;
+        };
+        let mid = (start.to_seconds() + end.to_seconds()) / 2.0;
+        let mut frames = Vec::new();
+        for a in &angles {
+            let Some(src) = project.sources.get(&a.source) else { continue };
+            match studio_video::frame_rgb(&base.join(&src.path), Ticks::from_seconds((mid + a.offset).max(0.0)), 320, 180) {
+                Ok(px) => frames.push(px),
+                Err(_) => frames.push(vec![20u8; 320 * 180 * 3]),   // unreadable: a dark placeholder, still choosable
+            }
+        }
+        self.comic_setup = Some(comic_job::SetupWindow::new(group, frames));
+    }
+
+    fn comic_setup_window(&mut self, ctx: &egui::Context) {
+        let Some(w) = &mut self.comic_setup else { return };
+        let mut open = true;
+        let mut go = None;
+        egui::Window::new("Comic — who goes where").open(&mut open).resizable(false).show(ctx, |ui| { go = w.show(ui); });
+        if let Some(setup) = go {
+            let group = w.group;
+            self.comic_setup = None;
+            self.start_comic(group, setup);
+            return;
+        }
+        if !open { self.comic_setup = None; }
+    }
+
+    fn start_comic(&mut self, group: studio_core::GroupId, setup: comic_job::Setup) {
         if self.comic_run.is_some() { self.studio.status = "a comic is already rendering".into(); return; }
         let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let project = &self.studio.session.doc.project;
-        let (roles, start, end) = match comic_job::roles(project, group, &base) {
+        let (roles, start, end) = match comic_job::roles_with(project, group, &base, setup) {
             Ok(r) => r, Err(e) => { self.studio.status = e; return; }
         };
         let span = (end.0 - start.0) as f64 / studio_core::TICKS_PER_SECOND as f64;
@@ -7301,10 +7339,12 @@ impl App {
         // different angles (with one angle for both there is no evidence)
         const FPS: f64 = 25.0;
         let (angles, _, _) = studio_video::multicam::from_group(project, group).unwrap_or((Vec::new(), start, end));
-        let (ldb, rdb) = if angles.len() >= 3 {
-            (self.speech_db(angles[1].source, start.to_seconds() + angles[1].offset, span, FPS),
-             self.speech_db(angles[2].source, start.to_seconds() + angles[2].offset, span, FPS))
-        } else { (None, None) };
+        let (ldb, rdb) = match (angles.get(setup.left), angles.get(setup.right)) {
+            (Some(l), Some(r)) if setup.left != setup.right =>
+                (self.speech_db(l.source, start.to_seconds() + l.offset, span, FPS),
+                 self.speech_db(r.source, start.to_seconds() + r.offset, span, FPS)),
+            _ => (None, None),   // one angle for both panels: its mic cannot tell sides apart
+        };
         let side_at = |a: f64, b: f64| -> Option<studio_video::comic::Side> {
             let (l, r) = (ldb.as_ref()?, rdb.as_ref()?);
             let (i0, i1) = ((a * FPS) as usize, ((b * FPS) as usize).max((a * FPS) as usize + 1));

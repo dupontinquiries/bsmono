@@ -66,6 +66,15 @@ pub struct Overview {
     pub flags: Vec<usize>,
 }
 
+/// Whether a marker is a working note -- an operator's "cut here" / "no cut",
+/// or a signals plan's "why @..." -- rather than a chapter or a problem. Seen
+/// on screen: a "no cut" marker became a section of its own, and a signals
+/// plan's dozens of "why" markers would have shattered the view into slivers.
+pub fn is_note(name: &str) -> bool {
+    let n = name.trim_start().to_lowercase();
+    n.starts_with("cut here") || n.starts_with("no cut") || n.starts_with("why @") || n.starts_with("why:")
+}
+
 /// Whether a marker is a problem to look at rather than a chapter.
 pub fn is_flag(name: &str) -> bool {
     let n = name.trim_start().to_lowercase();
@@ -76,7 +85,7 @@ pub fn is_flag(name: &str) -> bool {
 /// when there are no section markers.
 pub fn summarize(project: &Project, fallback_sections: usize) -> Overview {
     let end = project.duration();
-    let mut marks: Vec<&studio_core::Marker> = project.markers.iter().filter(|m| !is_flag(&m.name)).collect();
+    let mut marks: Vec<&studio_core::Marker> = project.markers.iter().filter(|m| !is_flag(&m.name) && !is_note(&m.name)).collect();
     marks.sort_by_key(|m| m.at);
     let mut sections: Vec<Section> = Vec::new();
     if marks.is_empty() || end <= Ticks::ZERO {
@@ -275,6 +284,18 @@ mod tests {
         assert!((ov.cells[dia][1].coverage - 1.0).abs() < 1e-3, "{:?}", ov.cells[dia][1]);
         let pic = ov.lanes.iter().position(|l| l.label == "picture").unwrap();
         assert_eq!(ov.cells[pic][1].clips, 0, "no picture in act two — the thing this view exists to show");
+    }
+
+    #[test]
+    fn working_notes_are_neither_chapters_nor_problems() {
+        let mut p = project(6);
+        p.apply(&Op::SetMarker { at: Ticks::from_seconds(5.0), name: "no cut — hold the look".into() }).unwrap();
+        p.apply(&Op::SetMarker { at: Ticks::from_seconds(7.0), name: "Cut here".into() }).unwrap();
+        for k in 0..12 { p.apply(&Op::SetMarker { at: Ticks::from_seconds(1.0 + k as f64), name: format!("why @{k}.00s: kick 0.5") }).unwrap(); }
+        let ov = summarize(&p, 8);
+        let names: Vec<&str> = ov.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["act one", "act two"], "notes do not become chapters: {names:?}");
+        assert_eq!(ov.flags, vec![0, 1], "nor problems: only the real check marker counts");
     }
 
     #[test]

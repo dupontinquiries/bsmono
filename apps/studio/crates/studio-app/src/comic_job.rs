@@ -30,6 +30,46 @@ pub struct Feed { pub path: PathBuf, pub from: f64, pub region: Region }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Roles { pub wide: Feed, pub left: Feed, pub right: Feed }
 
+/// Where in a panel's angle its people are: a choice made by looking, because
+/// on real night footage no detector found the people who mattered. The
+/// defaults (halves) put a slate in a panel on the first real render.
+pub const REGION_PRESETS: &[(&str, Region)] = &[
+    ("whole", Region::WHOLE),
+    ("left half", Region { x0: 0.0, y0: 0.05, x1: 0.55, y1: 0.95 }),
+    ("right half", Region { x0: 0.45, y0: 0.05, x1: 1.0, y1: 0.95 }),
+    ("left third", Region { x0: 0.0, y0: 0.1, x1: 0.4, y1: 0.9 }),
+    ("centre", Region { x0: 0.3, y0: 0.1, x1: 0.7, y1: 0.9 }),
+    ("right third", Region { x0: 0.6, y0: 0.1, x1: 1.0, y1: 0.9 }),
+    ("faces (upper centre)", Region { x0: 0.2, y0: 0.0, x1: 0.8, y1: 0.6 }),
+];
+
+/// The operator's setup: which angle plays which role, and which region each
+/// panel shows. Indices are into the group's angles and REGION_PRESETS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Setup { pub wide: usize, pub left: usize, pub right: usize, pub left_region: usize, pub right_region: usize }
+
+impl Setup {
+    /// The same defaults `roles` uses, as a starting point for the window.
+    pub fn default_for(angles: usize) -> Setup {
+        if angles >= 3 { Setup { wide: 0, left: 1, right: 2, left_region: 0, right_region: 0 } }
+        else { Setup { wide: 0, left: 1.min(angles.saturating_sub(1)), right: 1.min(angles.saturating_sub(1)), left_region: 1, right_region: 2 } }
+    }
+}
+
+/// Roles as the operator set them.
+pub fn roles_with(project: &Project, group: GroupId, base: &std::path::Path, s: Setup) -> Result<(Roles, Ticks, Ticks), String> {
+    let (angles, start, end) = studio_video::multicam::from_group(project, group)?;
+    let pick = |k: usize| angles.get(k).ok_or_else(|| format!("no angle {}", k + 1));
+    let region = |i: usize| REGION_PRESETS.get(i).map(|r| r.1).unwrap_or(Region::WHOLE);
+    let feed = |k: usize, r: Region| -> Result<Feed, String> {
+        let a = pick(k)?;
+        let src = project.sources.get(&a.source).ok_or("an angle's source is gone")?;
+        Ok(Feed { path: base.join(&src.path), from: (start.to_seconds() + a.offset).max(0.0), region: r })
+    };
+    Ok((Roles { wide: feed(s.wide, Region::WHOLE)?, left: feed(s.left, region(s.left_region))?, right: feed(s.right, region(s.right_region))? },
+        start, end))
+}
+
 /// Assign the panels from the group's angles (see the module note).
 pub fn roles(project: &Project, group: GroupId, base: &std::path::Path) -> Result<(Roles, Ticks, Ticks), String> {
     let (angles, start, end) = studio_video::multicam::from_group(project, group)?;
@@ -122,6 +162,71 @@ pub fn land_ops(project: &Project, path: &std::path::Path, start: Ticks, span: f
     ]
 }
 
+/// The setup window: each angle's real frame, the roles, and a region per
+/// panel drawn over its angle's thumbnail.
+pub struct SetupWindow {
+    pub group: GroupId,
+    pub setup: Setup,
+    /// One 320x180 RGB frame per angle, from the middle of the group.
+    pub frames: Vec<Vec<u8>>,
+    textures: Vec<egui::TextureHandle>,
+}
+
+impl SetupWindow {
+    pub fn new(group: GroupId, frames: Vec<Vec<u8>>) -> SetupWindow {
+        let setup = Setup::default_for(frames.len());
+        SetupWindow { group, setup, frames, textures: Vec::new() }
+    }
+
+    /// Draw; returns the setup when "render" is pressed.
+    pub fn show(&mut self, ui: &mut egui::Ui) -> Option<Setup> {
+        if self.textures.len() != self.frames.len() {
+            self.textures = self.frames.iter().enumerate().map(|(i, px)| ui.ctx().load_texture(
+                format!("comic-angle-{i}"), egui::ColorImage::from_rgb([320, 180], px), egui::TextureOptions::LINEAR)).collect();
+        }
+        let n = self.frames.len();
+        let angle_pick = |ui: &mut egui::Ui, label: &str, v: &mut usize| {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                for k in 0..n { ui.selectable_value(v, k, format!("angle {}", k + 1)); }
+            });
+        };
+        angle_pick(ui, "wide:", &mut self.setup.wide);
+        let mut go = None;
+        ui.columns(2, |cols| {
+            for (col, (title, angle, region)) in cols.iter_mut().zip([
+                ("left panel", &mut self.setup.left, &mut self.setup.left_region),
+                ("right panel", &mut self.setup.right, &mut self.setup.right_region)]) {
+                col.strong(title);
+                col.horizontal_wrapped(|ui| { for k in 0..n { ui.selectable_value(angle, k, format!("angle {}", k + 1)); } });
+                if let Some(tex) = self.textures.get(*angle) {
+                    let size = egui::vec2(256.0, 144.0);
+                    let (rect, _) = col.allocate_exact_size(size, egui::Sense::hover());
+                    col.painter().image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                    let r = REGION_PRESETS[*region].1;
+                    let rr = egui::Rect::from_min_max(
+                        egui::pos2(rect.min.x + r.x0 * rect.width(), rect.min.y + r.y0 * rect.height()),
+                        egui::pos2(rect.min.x + r.x1 * rect.width(), rect.min.y + r.y1 * rect.height()));
+                    // dim outside the region, outline it: what the panel will show
+                    for out in [egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rr.min.y)),
+                                egui::Rect::from_min_max(egui::pos2(rect.min.x, rr.max.y), rect.max),
+                                egui::Rect::from_min_max(egui::pos2(rect.min.x, rr.min.y), egui::pos2(rr.min.x, rr.max.y)),
+                                egui::Rect::from_min_max(egui::pos2(rr.max.x, rr.min.y), egui::pos2(rect.max.x, rr.max.y))] {
+                        col.painter().rect_filled(out, 0.0, egui::Color32::from_black_alpha(150));
+                    }
+                    col.painter().rect_stroke(rr, 0.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 60, 180)), egui::StrokeKind::Inside);
+                }
+                col.horizontal_wrapped(|ui| {
+                    for (i, (name, _)) in REGION_PRESETS.iter().enumerate() { ui.selectable_value(region, i, *name); }
+                });
+            }
+        });
+        ui.separator();
+        if ui.button("render the comic").clicked() { go = Some(self.setup); }
+        go
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +256,23 @@ mod tests {
         let (r2, _, _) = roles(&p2, g2, std::path::Path::new("/m")).unwrap();
         assert_eq!(r2.left.path, r2.right.path, "two angles: both panels from the second");
         assert!(r2.left.region.x1 <= 0.6 && r2.right.region.x0 >= 0.4, "its left and right halves");
+    }
+
+    #[test]
+    fn the_operators_setup_decides_roles_and_regions() {
+        let (p, g) = project(3);
+        let s = Setup { wide: 2, left: 0, right: 1, left_region: 6, right_region: 5 };
+        let (r, _, _) = roles_with(&p, g, std::path::Path::new("/m"), s).unwrap();
+        assert_eq!(r.wide.path.to_str().unwrap(), "/m/A3.mkv", "angle 3 as the wide");
+        assert_eq!(r.left.region, REGION_PRESETS[6].1, "faces for the left panel");
+        assert_eq!(r.right.region, REGION_PRESETS[5].1);
+        assert_eq!(r.wide.region, Region::WHOLE, "the wide is never cropped");
+        assert!(roles_with(&p, g, std::path::Path::new("/m"), Setup { wide: 9, ..s }).is_err(), "a missing angle is refused");
+        // the window's defaults reproduce roles()
+        let (p2, g2) = project(2);
+        let (a, _, _) = roles(&p2, g2, std::path::Path::new("/m")).unwrap();
+        let (b, _, _) = roles_with(&p2, g2, std::path::Path::new("/m"), Setup::default_for(2)).unwrap();
+        assert_eq!(a, b);
     }
 
     #[test]
