@@ -94,6 +94,107 @@ pub fn local_subnet24() -> Option<String> {
     }
 }
 
+/// Every directly-attached private /24 this machine can reach, from
+/// `/proc/net/route`.
+///
+/// ## Why `local_subnet24` is not enough
+///
+/// That function asks the kernel which source address it would use to reach
+/// 8.8.8.8 — the DEFAULT route. Three ways that misses the device you are
+/// trying to deploy to:
+///
+/// * A phone on a USB tether or a second NIC is on a DIFFERENT interface. The
+///   default route goes out the internet-facing one, so the scan sweeps the
+///   wrong /24 and reports no devices — on a machine that is cabled to the
+///   phone.
+/// * A private network with NO default route at all — a laptop plugged into a
+///   phone and nothing else — makes `connect` fail, so it returns `None` and
+///   "Scan LAN" finds nothing with no reason given.
+/// * An IPv6-only default route returns `None` even when IPv4 LANs exist.
+///
+/// This reads the routing table instead: every route with a `/24` mask is a
+/// network attached to some interface, which is exactly the set worth scanning.
+///
+/// ## Private ranges only
+///
+/// A public /24 route belongs to a hosting provider, not a fleet. Scanning it
+/// would port-knock 254 strangers' addresses, which is rude at best.
+/// Loopback is skipped for the same reason it is never the answer here: the
+/// phone is not this machine.
+pub fn local_subnet24s() -> Vec<String> {
+    match std::fs::read_to_string("/proc/net/route") {
+        Ok(t) => parse_route_subnets(&t),
+        Err(_) => local_subnet24().into_iter().collect(),
+    }
+}
+
+/// The /24 prefixes in a `/proc/net/route` table, private ones only.
+///
+/// Pure so it can be tested against a real table without a matching machine —
+/// which matters because the format is little-endian hex and getting the byte
+/// order backwards produces plausible-looking wrong subnets.
+pub fn parse_route_subnets(table: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in table.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 8 {
+            continue;
+        }
+        let (iface, dest, mask) = (f[0], f[1], f[7]);
+        // A /24 and nothing else: a /16 would be 65k hosts to sweep and a
+        // default route names no network at all.
+        if !mask.eq_ignore_ascii_case("00FFFFFF") {
+            continue;
+        }
+        if iface == "lo" {
+            continue;
+        }
+        let Ok(raw) = u32::from_str_radix(dest, 16) else { continue };
+        // LITTLE-ENDIAN. 000200C0 is 192.0.2.0, not 0.2.0.192.
+        let o = raw.to_le_bytes();
+        if !is_private_v4(o[0], o[1]) {
+            continue;
+        }
+        let p = format!("{}.{}.{}", o[0], o[1], o[2]);
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// RFC 1918 plus the link-local range a USB tether often lands in.
+fn is_private_v4(a: u8, b: u8) -> bool {
+    a == 10
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        // 169.254/16: what both ends pick when a direct cable has no DHCP,
+        // which is the ordinary state of a phone on USB.
+        || (a == 169 && b == 254)
+        // RFC 6598 carrier NAT shows up on tethered mobile links.
+        || (a == 100 && (64..=127).contains(&b))
+}
+
+/// Why a scan found nothing, in terms the operator can act on.
+///
+/// "No devices found" is the same sentence whether the phone is off, the
+/// cable is out, or the scan swept a subnet the phone was never on — and
+/// those need different actions.
+pub fn explain_empty_scan(subnets: &[String]) -> String {
+    if subnets.is_empty() {
+        return "no private network found — this machine has no LAN or tether \
+                attached, so there is nothing to scan. Plug the device in, or \
+                join the same network."
+            .to_string();
+    }
+    format!(
+        "scanned {} and found no host with SSH open. The device may be off, \
+         sshd may not be running on it, or it may be on a network this machine \
+         cannot see.",
+        subnets.join(", ")
+    )
+}
+
 /// Scan a /24 prefix for hosts with TCP 22 open. Threaded so a full /24 (254
 /// hosts) finishes in roughly `timeout * 254 / threads`.
 pub fn scan_ssh(prefix: &str, timeout: Duration, threads: usize) -> Vec<Device> {
@@ -1804,4 +1905,100 @@ mod tests {
         assert!(PortOpen::Opened(DeviceFirewall::Nftables).note(1).contains("Nftables"));
     }
 
+
+#[cfg(test)]
+mod subnet_discovery_tests {
+    use super::*;
+
+    /// A real table: a default route out eth0 and two attached /24s, one of
+    /// them the USB tether the phone is actually on.
+    const TABLE: &str = "\
+Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
+eth0\t00000000\t010200C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
+eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0
+usb0\t002A1EAC\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0
+lo\t0000007F\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0
+";
+
+    /// LITTLE-ENDIAN. Getting this backwards yields plausible-looking wrong
+    /// subnets (0.2.0.192 for 192.0.2.0), which would scan nothing forever.
+    #[test]
+    fn the_destination_is_decoded_little_endian() {
+        let got = parse_route_subnets(TABLE);
+        // 192.168.1.0 encodes as 0001A8C0. Read big-endian it would be
+        // 0.1.168.192, which is why this asserts the prefix and not just a
+        // non-empty result.
+        assert!(got.contains(&"192.168.1".to_string()), "{got:?}");
+        assert!(!got.iter().any(|p| p.starts_with("0.1")), "byte order reversed: {got:?}");
+    }
+
+    /// THE WHOLE POINT: a tethered phone is on a SECOND interface, and the
+    /// default route does not go there. `local_subnet24` would return only the
+    /// eth0 subnet and the scan would miss the device entirely.
+    #[test]
+    fn a_second_interfaces_subnet_is_found_too() {
+        let got = parse_route_subnets(TABLE);
+        assert!(got.contains(&"172.30.42".to_string()),
+                "the usb0 tether must be scanned: {got:?}");
+        assert_eq!(got.len(), 2, "both attached /24s, no more: {got:?}");
+    }
+
+    /// Loopback is never the answer -- the phone is not this machine.
+    #[test]
+    fn loopback_is_skipped() {
+        assert!(!parse_route_subnets(TABLE).iter().any(|p| p.starts_with("127.")));
+    }
+
+    /// The default route names no network, and a /16 would be 65k hosts.
+    #[test]
+    fn only_slash_24_routes_are_taken() {
+        let wide = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
+                    eth0\t0000A8C0\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n";
+        assert!(parse_route_subnets(wide).is_empty(), "a /16 must not be swept");
+    }
+
+    /// A PUBLIC /24 belongs to somebody else. Scanning it port-knocks 254
+    /// strangers.
+    #[test]
+    fn public_routes_are_not_scanned() {
+        // 8.8.8.0/24, little-endian.
+        let pubr = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
+                    eth0\t00080808\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+        assert!(parse_route_subnets(pubr).is_empty());
+    }
+
+    /// The ranges a direct cable actually lands in: link-local when there is
+    /// no DHCP, and carrier NAT on a mobile tether.
+    #[test]
+    fn tether_ranges_count_as_private() {
+        assert!(is_private_v4(169, 254), "a DHCP-less direct cable");
+        assert!(is_private_v4(100, 64), "carrier NAT on a mobile tether");
+        assert!(is_private_v4(10, 0));
+        assert!(is_private_v4(172, 16) && is_private_v4(172, 31));
+        assert!(!is_private_v4(172, 15) && !is_private_v4(172, 32), "the /12 edges");
+        assert!(!is_private_v4(8, 8));
+    }
+
+    /// NOTHING FOUND AND WHY ARE DIFFERENT SENTENCES. "No devices" reads the
+    /// same whether the phone is off or the scan swept the wrong network.
+    #[test]
+    fn an_empty_scan_says_which_case_it_was() {
+        let none = explain_empty_scan(&[]);
+        assert!(none.contains("no private network"), "{none}");
+        let some = explain_empty_scan(&["192.168.1".into(), "172.30.42".into()]);
+        assert!(some.contains("192.168.1") && some.contains("172.30.42"),
+                "it must name what it actually swept: {some}");
+        assert_ne!(none, some);
+    }
+
+    /// A garbled table yields nothing rather than a panic -- this parses a
+    /// kernel file whose format could change.
+    #[test]
+    fn a_malformed_table_is_survivable() {
+        assert!(parse_route_subnets("").is_empty());
+        assert!(parse_route_subnets("Iface\n").is_empty());
+        assert!(parse_route_subnets("Iface\nnonsense\n").is_empty());
+        assert!(parse_route_subnets("Iface\neth0\tZZZZ\t0\t0\t0\t0\t0\t00FFFFFF\n").is_empty());
+    }
+}
 }

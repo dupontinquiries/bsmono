@@ -81,15 +81,23 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 app.push.discovering = true;
                 let subnet = app.push.subnet.clone();
                 app.task.run(move || {
-                    let prefix = if subnet.trim().is_empty() {
-                        cockpit::deploy::local_subnet24().unwrap_or_default()
+                    // A typed subnet is an instruction; otherwise EVERY attached
+                    // private /24. Auto-detect used to follow the default route
+                    // only, so a phone on a USB tether -- a second interface --
+                    // was invisible on a machine cabled to it.
+                    let prefixes: Vec<String> = if subnet.trim().is_empty() {
+                        cockpit::deploy::local_subnet24s()
                     } else {
-                        subnet.trim().to_string()
+                        vec![subnet.trim().to_string()]
                     };
-                    if prefix.is_empty() {
-                        return serde_json::json!({"error": "could not detect subnet — type one like 192.168.1"}).to_string();
+                    if prefixes.is_empty() {
+                        return serde_json::json!({
+                            "error": cockpit::deploy::explain_empty_scan(&prefixes)
+                        }).to_string();
                     }
-                    let devs = cockpit::deploy::scan_ssh(&prefix, std::time::Duration::from_millis(300), 64);
+                    let devs: Vec<_> = prefixes.iter()
+                        .flat_map(|p| cockpit::deploy::scan_ssh(p, std::time::Duration::from_millis(300), 64))
+                        .collect();
                     let arr: Vec<_> = devs.iter().map(|d| serde_json::json!({"ip": d.ip, "hostname": d.hostname})).collect();
                     serde_json::json!({"devices": arr}).to_string()
                 });

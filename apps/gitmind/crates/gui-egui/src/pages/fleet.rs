@@ -193,10 +193,15 @@ fn reroll_ui(app: &mut App, ui: &mut egui::Ui) {
             // Real discovery through the code that already exists. The roster
             // absorbs it — a device that moved is updated, one that vanished
             // goes offline, one that was reflashed loses its enrolment.
-            let seen: Vec<roster::Seen> = match cockpit::deploy::local_subnet24() {
-                Some(prefix) => cockpit::deploy::scan_ssh(
-                    &prefix, std::time::Duration::from_millis(300), 64)
-                    .into_iter()
+            // EVERY attached private /24, not just the default route's. A
+            // phone on a USB tether is on a second interface, and scanning
+            // only the internet-facing subnet finds nothing on a machine that
+            // is cabled to the device.
+            let subnets = cockpit::deploy::local_subnet24s();
+            let seen: Vec<roster::Seen> = match subnets.is_empty() {
+                false => subnets.iter()
+                    .flat_map(|prefix| cockpit::deploy::scan_ssh(
+                        prefix, std::time::Duration::from_millis(300), 64))
                     .map(|d| roster::Seen {
                         ip: d.ip,
                         hostname: d.hostname,
@@ -206,7 +211,9 @@ fn reroll_ui(app: &mut App, ui: &mut egui::Ui) {
                         host_key: None,
                     })
                     .collect(),
-                None => Vec::new(),
+                // No private network at all: nothing to scan, and saying so
+                // beats an empty list that looks like "no devices".
+                true => Vec::new(),
             };
             // The SAME scan feeds the picker, so one sweep serves both the
             // roster's bookkeeping and enrolment. Two scan buttons would race
