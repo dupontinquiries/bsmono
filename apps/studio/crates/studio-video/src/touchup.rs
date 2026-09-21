@@ -43,6 +43,11 @@ pub enum Fix {
     /// "All My Life". `zoom` is the punch-in; `smooth` seconds is how gently
     /// the crop follows.
     FollowMotion { zoom: f32, smooth: f64 },
+    /// Composite a particle system into the shot. `emitter` is a fraction of
+    /// the frame; `drive` is one 0..1 value per output frame (from a control
+    /// channel's envelope, say) -- empty means steady. The preset's colour is
+    /// fitted to the shot's own brightness at render time.
+    Particles { params: crate::particles::Params, seed: u64, emitter: (f32, f32), drive: Vec<f32> },
 }
 
 /// What to fix, on which range of which source.
@@ -76,6 +81,7 @@ pub enum Did {
     Stabilized { zoom: f32, clamped_px: f32, frames: usize },
     Cleaned { frames_touched: usize, pixels_filled: u64, pixels_unresolved: u64 },
     Followed { zoom: f32, frames: usize },
+    Particles { frames: usize, peak_alive: usize },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -209,9 +215,28 @@ pub fn render(t: &Ticket, out: &Path, size: Size, fps: f64) -> Result<Version, S
             Fix::FollowMotion { zoom, .. } => {
                 did.push(Did::Followed { zoom: *zoom, frames: follow.len() });
             }
+            Fix::Particles { .. } => {}
         }
     }
 
+    // particles: one system for the whole render, stepped once per frame
+    let mut particles: Option<(crate::particles::System, (f32, f32), Vec<f32>)> = None;
+    for f in &t.fixes {
+        if let Fix::Particles { params, seed, emitter, drive } = f {
+            // fit the colour to the shot: its brightness, from the frame in the middle
+            let (from, len) = t.range();
+            let luma = crate::frame_rgb(&t.path, studio_core::Ticks::from_seconds(from + len / 2.0), 64, 36)
+                .map(|px| px.chunks(3).map(|p| (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32) / 255.0).sum::<f32>() / (px.len() / 3) as f32)
+                .unwrap_or(0.5);
+            // presets are written for a 480-wide frame; scale their pixel sizes
+            let k = size.w as f32 / 480.0;
+            let mut p = params.for_scene(luma);
+            p.size = (p.size.0 * k, p.size.1 * k); p.emit_radius = (p.emit_radius.0 * k, p.emit_radius.1 * k);
+            p.speed *= k; p.gravity = (p.gravity.0 * k, p.gravity.1 * k); p.swirl *= k; p.drive_swirl *= k; p.swirl_scale *= k;
+            particles = Some((crate::particles::System::new(p, *seed), *emitter, drive.clone()));
+        }
+    }
+    let mut peak_alive = 0usize;
     let radius = plate.as_ref().map(|p| p.1).unwrap_or(0);
     let (mut filled, mut unresolved, mut touched) = (0u64, 0u64, 0usize);
     let frames = pipe.map_window(out, 18, radius, |i, window| {
@@ -247,9 +272,18 @@ pub fn render(t: &Ticket, out: &Path, size: Size, fps: f64) -> Result<Version, S
             let (w, h) = (frame.w as f32, frame.h as f32);
             frame = frame.warp(w / 2.0 - p.0 * w, h / 2.0 - p.1 * h, zoom);
         }
+        if let Some((sys, at, drive)) = particles.as_mut() {
+            let d = drive.get(i).copied().unwrap_or(if drive.is_empty() { 0.3 } else { 0.0 });
+            sys.step(1.0 / fps as f32, (at.0 * frame.w as f32, at.1 * frame.h as f32), d);
+            peak_alive = peak_alive.max(sys.parts.len());
+            sys.draw(&mut frame);
+        }
         frame
     })?;
 
+    if particles.is_some() {
+        did.push(Did::Particles { frames, peak_alive });
+    }
     if plate.is_some() {
         did.push(Did::Cleaned { frames_touched: touched, pixels_filled: filled, pixels_unresolved: unresolved });
         if unresolved > 0 {
@@ -370,6 +404,39 @@ mod tests {
         let after = jitter(&Pipe { input: out.clone(), range: None, size, fps: 12.0 });
         assert!(after < before * 0.5, "{after} vs {before}");
         for f in [&shaky, &out] { let _ = std::fs::remove_file(f); }
+    }
+
+    #[test]
+    fn a_particle_ticket_puts_dirt_in_the_shot_that_reads_and_the_drive_thickens_it() {
+        if !ffmpeg_or_skip("a_particle_ticket_puts_dirt_in_the_shot_that_reads_and_the_drive_thickens_it") { return; }
+        let s = shoot(&[1.0], 6.0);
+        let size = Size { w: 320, h: 180 };
+        let plate = s.dir.join(format!("tu-pt-{}.mp4", std::process::id()));
+        // a dark night-ish plate: the smoke must be fitted to read on it
+        Pipe { input: s.takes[0].video.clone(), range: None, size, fps: 12.0 }
+            .map(&plate, 12, |_, mut f| { for y in 0..f.h { for x in 0..f.w { f.set(x, y, [22, 24, 30]); } } f }).expect("plate");
+        let render_with = |drive: Vec<f32>, tag: &str| {
+            // dark-brown dirt: without fitting its colour to this dark plate it
+            // barely differs from it (the smoke preset is pale and read either
+            // way, so a smoke version of this test passed with fitting removed)
+            let t = ticket(&plate, vec![Fix::Particles { params: crate::particles::Params::floating_dirt(), seed: 4,
+                emitter: (0.5, 0.8), drive }]);
+            let out = s.dir.join(format!("tu-pt-{tag}-{}.mp4", std::process::id()));
+            let v = render(&t, &out, size, 12.0).expect("renders");
+            let px = crate::frame_rgb(&out, Ticks::from_seconds(2.4), size.w, size.h).unwrap();
+            // a speck is part-transparent (~53% at its centre mid-life): on this
+            // plate (luma ~24) fitted dirt peaks near 71 and unfitted brown near
+            // 49, so 60 separates reading from vanishing
+            let lit = px.chunks(3).filter(|p| 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32 > 60.0).count();
+            let _ = std::fs::remove_file(&out);
+            (v, lit)
+        };
+        let (v, quiet) = render_with(vec![0.0; 40], "q");
+        assert!(matches!(v.report.did[0], Did::Particles { peak_alive, .. } if peak_alive > 5), "{:?}", v.report.did);
+        assert!(quiet > 20, "the dirt reads on the dark plate: {quiet} lit pixels");
+        let (_, loud) = render_with(vec![1.0; 40], "l");
+        assert!(loud as f32 > quiet as f32 * 1.4, "a full drive thickens it: {loud} vs {quiet}");
+        let _ = std::fs::remove_file(&plate);
     }
 
     #[test]

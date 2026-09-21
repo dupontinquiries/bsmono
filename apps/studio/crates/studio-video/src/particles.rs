@@ -76,6 +76,36 @@ impl Params {
     }
 }
 
+impl Params {
+    /// Fit the preset's colour to the scene it goes into. The first render
+    /// put daylight-brown dirt on a night floor and it vanished: an `Over`
+    /// particle must stand apart from what is behind it to read at all. In a
+    /// dark scene it is lifted toward light -- specks catching the light --
+    /// keeping its hue; in a bright scene the preset's colour stands. `Add`
+    /// particles glow by construction and are left alone.
+    ///
+    /// `scene_luma` is the frame's mean luma, 0..1.
+    pub fn for_scene(mut self, scene_luma: f32) -> Params {
+        if self.blend == Blend::Over {
+            let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+            let l = luma(self.color).max(1e-3);
+            // A particle reads by CONTRAST, lighter or darker. The first version
+            // only ever lightened, and would have turned brown dirt nearly white
+            // against a bright sky, where brown already reads.
+            const NEED: f32 = 0.3;
+            if (l - scene_luma).abs() < NEED {
+                let target = if scene_luma < 0.5 { (scene_luma + NEED + 0.05).min(0.95) } else { (scene_luma - NEED - 0.05).max(0.03) };
+                let k = target / l;
+                let scaled = self.color.map(|c| c * k);
+                let over = scaled.iter().cloned().fold(0.0f32, f32::max);
+                // keep the hue; pull toward white only if scaling alone would clip
+                self.color = if over > 1.0 { scaled.map(|c| (c / over) * 0.7 + 0.3) } else { scaled };
+            }
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Particle { pub x: f32, pub y: f32, pub vx: f32, pub vy: f32, pub age: f32, pub life: f32, pub seed: u32 }
 
@@ -129,7 +159,9 @@ impl System {
         let glow = 1.0 + p.drive_glow * self.drive;
         for q in &self.parts {
             let u = (q.age / q.life).clamp(0.0, 1.0);
-            let rad = p.size.0 + (p.size.1 - p.size.0) * u;
+            // never below about a pixel: scaled to a small render, dirt specks
+            // shrank under half a pixel and vanished in the encode entirely
+            let rad = (p.size.0 + (p.size.1 - p.size.0) * u).max(0.8);
             let fade = (u * 6.0).min(1.0) * (1.0 - u).powf(1.5);
             let a = (p.alpha * fade).clamp(0.0, 1.0);
             if a < 0.004 { continue; }
@@ -247,6 +279,22 @@ mod tests {
         let young: Vec<&Particle> = s.parts.iter().filter(|q| q.age < 0.1).collect();
         let mx = young.iter().map(|q| q.x).sum::<f32>() / young.len().max(1) as f32;
         assert!((mx - (40.0 + 3.0 * 23.0)).abs() < 15.0, "newborns are at the emitter's CURRENT place: {mx}");
+    }
+
+    #[test]
+    fn dirt_is_lifted_to_read_on_a_night_floor_and_left_alone_in_daylight() {
+        let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let night = Params::floating_dirt().for_scene(0.12);
+        assert!(luma(night.color) > 0.12 + 0.3, "stands out from a dark floor: {:?}", night.color);
+        assert!(night.color[0] > night.color[2], "and keeps its warm hue: {:?}", night.color);
+        // against a bright sky brown already reads: unchanged
+        assert_eq!(Params::floating_dirt().for_scene(0.75).color, Params::floating_dirt().color,
+                   "daylight dirt keeps its own colour");
+        // pale smoke on a pale scene is pushed DARKER, not lighter
+        let pale = Params::creepy_smoke().for_scene(0.7);
+        assert!(luma(pale.color) < 0.7 - 0.3, "pale smoke on a pale sky darkens to read: {:?}", pale.color);
+        let dust = Params::space_dust();
+        assert_eq!(dust.for_scene(0.1).color, dust.color, "glowing particles are left alone");
     }
 
     #[test]

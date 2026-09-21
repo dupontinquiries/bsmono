@@ -6133,6 +6133,7 @@ impl App {
                     }
                 }
                 palette::ShellVerb::TouchUpStabilize(kind) => self.start_stabilize(kind),
+                palette::ShellVerb::TouchUpParticles { preset, drive } => self.start_particles(preset, drive),
                 palette::ShellVerb::TouchUpFollow { zoom_pct } => self.start_touchup(
                     studio_video::touchup::Fix::FollowMotion { zoom: zoom_pct as f32 / 100.0, smooth: 0.5 },
                     format!("following the motion at {:.1}x", zoom_pct as f32 / 100.0)),
@@ -7174,6 +7175,45 @@ impl App {
             open = false;
         }
         if !open { self.kaleido_gallery = None; }
+    }
+
+    /// Particles into the selected clip. The drive, if a control channel is
+    /// chosen, is that bus rendered over EXACTLY the stretch the touch-up
+    /// covers -- the clip plus its handles -- so frame i of the render reads
+    /// the sound at frame i. A drive computed for the clip alone would run
+    /// half a second early against the handled render.
+    fn start_particles(&mut self, preset: u8, drive_bus: Option<studio_core::BusId>) {
+        use studio_video::particles::Params;
+        let params = match preset { 0 => Params::floating_dirt(), 1 => Params::space_dust(), _ => Params::creepy_smoke() };
+        let emitter = match preset { 0 => (0.5, 0.95), 1 => (0.5, 0.5), _ => (0.5, 0.75) };
+        let project = &self.studio.session.doc.project;
+        let Some(&id) = self.studio.selection.first() else { self.studio.status = "select the clip first".into(); return };
+        let Some(clip) = project.clips.get(&id).cloned() else { return };
+        let fps = project.sources.get(&clip.source)
+            .and_then(|s| studio_video::probe(&std::path::PathBuf::from(&s.path)).ok()).map(|p| p.fps).unwrap_or(24.0);
+        let drive = match drive_bus {
+            None => Vec::new(),
+            Some(bus) => {
+                let (from, to, pad) = touchup_job::drive_span(&clip, 0.5, fps);   // 0.5 = start_touchup's handle
+                match studio_audio::bus_signal(project, &self.audio, &Default::default(),
+                        Ticks::from_seconds(from), Ticks::from_seconds(to), 48_000, bus) {
+                    Some(st) => {
+                        let mono: Vec<f32> = st.chunks(2).map(|p| (p[0] + p.get(1).copied().unwrap_or(0.0)) * 0.5).collect();
+                        let mut d = vec![0.0; pad];
+                        d.extend(studio_video::particles::envelope(&mono, 48_000, fps));
+                        if d.iter().all(|v| *v < 0.01) {
+                            self.studio.status = "that control channel is silent over this clip — send something into it".into();
+                            return;
+                        }
+                        d
+                    }
+                    None => { self.studio.status = "that control channel is muted or gone".into(); return; }
+                }
+            }
+        };
+        let what = match preset { 0 => "floating dirt", 1 => "spaceship dust", _ => "creepy smoke" };
+        self.start_touchup(studio_video::touchup::Fix::Particles { params, seed: id.0, emitter, drive },
+                           format!("{what}{}", if drive_bus.is_some() { ", driven by sound" } else { "" }));
     }
 
     /// Poll the touch-up worker. Same shape as the export tracker: egui only

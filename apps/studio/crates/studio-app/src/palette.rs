@@ -122,6 +122,9 @@ pub enum ShellVerb {
     TouchUpCleanPlate { radius: usize, moving: bool },
     /// Rescue a take: punch in by `zoom_pct`% and follow where the movement is.
     TouchUpFollow { zoom_pct: u32 },
+    /// Composite particles into the selected clip: preset 0 dirt, 1 dust,
+    /// 2 smoke; driven by a control channel's sound, or steady.
+    TouchUpParticles { preset: u8, drive: Option<BusId> },
     CallToggle,
     CallMute,
     CallPushToTalk,
@@ -276,6 +279,9 @@ pub enum Ask {
     CleanPlateCamera,
     /// How far to punch in when following the motion.
     FollowZoom,
+    /// Which particles, then what drives them.
+    ParticlePreset,
+    ParticleDrive(u8),
     CleanPlateWindow(bool),
     /// Which bus feeds which — the input side, chosen from the receiver.
     BusInputPick(BusId),
@@ -379,6 +385,8 @@ pub fn root() -> Vec<Choice> {
           Then::Ask(Ask::StabilizeFlavor)),
         // "punch in" last: in the middle, "punch in and ... motion" spelled
         // p-i-a-n-o and outranked the piano roll for anyone typing "piano"
+        c("particles: dirt, dust or smoke in the selected clip", Some("moved by a control channel's sound, or steady"),
+          Then::Ask(Ask::ParticlePreset)),
         c("rescue a take: follow the motion (punch in)",
           Some("cover a weak take by focusing on what moves — a hand, a turn"),
           Then::Ask(Ask::FollowZoom)),
@@ -766,6 +774,21 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
                      hint: Some("a deliberate pan with a bump in it".into()),
                      then: Then::Do(Act::Shell(ShellVerb::TouchUpStabilize(StabilizeKind::Dejerk))) },
         ],
+        Ask::ParticlePreset => [(0u8, "floating dirt", "slow upward drift with spin — lifting off"),
+                                 (1, "spaceship dust", "a glowing burst that spreads and slows"),
+                                 (2, "creepy smoke", "soft puffs curling in a swirl")]
+            .into_iter().map(|(k, label, what)| Choice { label: label.into(), hint: Some(what.into()),
+                then: Then::Ask(Ask::ParticleDrive(k)) }).collect(),
+        Ask::ParticleDrive(preset) => {
+            let mut v = vec![Choice { label: "steady (no drive)".into(), hint: Some("the same all the way through".into()),
+                then: Then::Do(Act::Shell(ShellVerb::TouchUpParticles { preset, drive: None })) }];
+            // only control channels: a silent bus is read, not heard, which is
+            // what a drive is -- see Bus::silent
+            v.extend(project.busses.values().filter(|b| b.silent).map(|b| Choice {
+                label: format!("driven by '{}'", b.name), hint: Some("its loudness moves emission, swirl and glow".into()),
+                then: Then::Do(Act::Shell(ShellVerb::TouchUpParticles { preset, drive: Some(b.id) })) }));
+            v
+        }
         Ask::FollowZoom => [(130u32, "1.3x — keep most of the frame"), (160, "1.6x — the gesture fills it"),
                              (200, "2x — tight on the movement")].into_iter().map(|(z, what)| Choice {
             label: format!("{:.1}x", z as f32 / 100.0), hint: Some(what.into()),

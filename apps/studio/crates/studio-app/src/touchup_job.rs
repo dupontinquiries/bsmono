@@ -49,6 +49,23 @@ pub fn start(ticket: Ticket, out: PathBuf, size: Size, fps: f64) -> Job {
     Job { rx, clip }
 }
 
+/// The timeline stretch a touch-up render covers, for lining a drive signal
+/// up with it: the clip plus `handle` seconds each side, where the head handle
+/// is cut short if the clip starts less than `handle` into its source (the
+/// render cannot read before the source's start). Returns (from, to) in
+/// timeline seconds, and how many frames of silence to pad at the front when
+/// `from` falls before timeline zero. Frame i of the render then reads the
+/// drive at frame i -- a drive computed for the clip alone runs half a second
+/// early against the handled render.
+pub fn drive_span(clip: &studio_core::Clip, handle: f64, fps: f64) -> (f64, f64, usize) {
+    let head = (clip.src_in.to_seconds() - handle).max(0.0);
+    let lead = clip.src_in.to_seconds() - head;
+    let from = clip.pos.to_seconds() - lead;
+    let to = clip.end().to_seconds() + handle;
+    let pad = if from < 0.0 { (-from * fps).round() as usize } else { 0 };
+    (from.max(0.0), to, pad)
+}
+
 impl Studio {
     /// Point the clip at its fixed version, as one undoable step, and report
     /// what the fix could not do.
@@ -106,6 +123,28 @@ mod tests {
             size: Size { w: 1920, h: 1080 }, fps: 24.0,
             report: Report { did: vec![], frames: (covers_len * 24.0) as usize, warnings },
         }
+    }
+
+    #[test]
+    fn a_drive_lines_up_with_the_handled_render() {
+        let clip = |pos: f64, src_in: f64| Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1),
+            pos: Ticks::from_seconds(pos), src_in: Ticks::from_seconds(src_in), len: Ticks::from_seconds(4.0),
+            gain: 1.0, effects: vec![] };
+        // a full half-second of handle both sides
+        assert_eq!(drive_span(&clip(10.0, 3.0), 0.5, 24.0), (9.5, 14.5, 0));
+        // the clip starts 0.2 s into its source: only 0.2 s of head handle exists
+        let (from, _, pad) = drive_span(&clip(10.0, 0.2), 0.5, 24.0);
+        assert!((from - 9.8).abs() < 1e-9 && pad == 0, "{from}");
+        // the handled render starts before timeline zero: pad the front with silence
+        let (from, _, pad) = drive_span(&clip(0.2, 3.0), 0.5, 24.0);
+        assert_eq!((from, pad), (0.0, 7), "0.3 s before zero is 7 frames at 24 fps");
+        // and it agrees with the ticket's own range, which is what the render reads
+        let c = clip(10.0, 3.0);
+        let t = studio_video::touchup::Ticket { clip: c.id, source: c.source, path: "x".into(), src_in: c.src_in, len: c.len,
+            handle: 0.5, fixes: vec![], note: String::new() };
+        let (ts, tl) = t.range();
+        let (from, to, _) = drive_span(&c, 0.5, 24.0);
+        assert!(((to - from) - tl).abs() < 1e-9 && (ts - 2.5).abs() < 1e-9, "same span as the render: {from}..{to} vs {ts}+{tl}");
     }
 
     #[test]
