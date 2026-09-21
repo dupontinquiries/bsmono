@@ -163,6 +163,8 @@ pub enum Verdict {
 pub const SURE_Z: f32 = 13.0;
 /// How far the best candidate must lead the runner-up.
 pub const SURE_MARGIN: f32 = 3.0;
+/// The share of `SURE_Z` a match needs when another recording corroborates it.
+pub const CORROBORATED_Z: f32 = 0.75;
 /// The overlap must cover at least this share of the shorter take.
 pub const MIN_OVERLAP_SHARE: f64 = 0.6;
 
@@ -179,8 +181,14 @@ pub struct Match {
     pub ncc: f32,
     /// Peak height in standard deviations of this pair's correlation curve.
     pub z: f32,
-    /// The next-best recorder file and its z, if there was one.
+    /// The next-best recorder file that DISAGREES with the chosen one, and
+    /// its z. Other mics of the same moment are not competitors -- see
+    /// `corroborated_by`.
     pub runner_up: Option<(usize, f32)>,
+    /// Other recordings that line up with the chosen one at exactly the offset
+    /// the picture implies: a boom and two lavs of the same take. They
+    /// confirm the match rather than contest it.
+    pub corroborated_by: Vec<usize>,
     pub verdict: Verdict,
 }
 
@@ -225,15 +233,46 @@ pub fn match_pool(pictures: &[Onsets], sounds: &[Onsets]) -> Vec<Option<Match>> 
             .collect();
         scored.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
         let &(sound, lag, ncc, z) = scored.first()?;
-        let runner_up = scored.get(1).map(|r| (r.0, r.3));
+        // The runner-up is the best recording that DISAGREES with this one.
+        // With several mics on one take (boom plus lavs), the second-best
+        // score is another mic of the SAME moment: ranked plainly, it made
+        // every such take "unsure" -- 0 of 6 in the crowded-shoot test, with
+        // every pairing right. Two recordings of one moment line up with
+        // EACH OTHER at the offset their picture lags imply; those are
+        // corroboration and are skipped. Only the next few are checked:
+        // agreement is decided among the strongest, and it keeps the cost
+        // flat however large the pool.
+        let mut corroborated_by = Vec::new();
+        let mut runner_up = None;
+        for &(i, lag_i, _, z_i) in scored.iter().skip(1).take(6) {
+            // correlate() sizes and time-reverses for THIS pair: the pool's
+            // shared transform is sized for picture + sound and expects a
+            // reversed picture spectrum, and reusing it here computed a
+            // convolution that silently agreed with nothing
+            let agrees = z_i >= SURE_Z * 0.6 && correlate(&sounds[sound], &sounds[i])
+                .map(|(l, _, zz)| zz >= SURE_Z && (l - (lag_i - lag)).abs() <= 2)
+                .unwrap_or(false);
+            if agrees { corroborated_by.push(i); } else { runner_up = Some((i, z_i)); break; }
+        }
+        if runner_up.is_none() {
+            runner_up = scored.iter().skip(1).find(|r| !corroborated_by.contains(&r.0)).map(|r| (r.0, r.3));
+        }
         let lead = runner_up.map(|r| z - r.1).unwrap_or(f32::INFINITY);
-        let verdict = if z >= SURE_Z && lead >= SURE_MARGIN { Verdict::Sure } else { Verdict::Unsure };
+        // A second, independent recording confirming the SAME alignment is
+        // strong evidence: a false match would need two recordings to line up
+        // wrongly in the same way. So a corroborated match is trusted at a
+        // lower peak, still requiring a clear lead over anything that
+        // disagrees. In the crowded-shoot test every take was right, its two
+        // other mics agreed, the nearest decoy sat ~6 z behind -- and four of
+        // six were still "unsure", only for peaks of 11-13 under a fixed 13.
+        let bar = if corroborated_by.is_empty() { SURE_Z } else { SURE_Z * CORROBORATED_Z };
+        let verdict = if z >= bar && lead >= SURE_MARGIN { Verdict::Sure } else { Verdict::Unsure };
         // sound_pos = picture_pos + lag  =>  picture_pos = sound_pos - lag.
         let secs = -(lag as f64) * HOP_SECS;
         Some(Match {
             sound,
             offset: Ticks((secs * TICKS_PER_SECOND as f64).round() as i64),
-            ncc, z, runner_up, verdict,
+            ncc, z, runner_up, corroborated_by, verdict,
         })
     }).collect()
 }
@@ -463,6 +502,58 @@ mod tests {
         assert_eq!(m.verdict, Verdict::Unsure, "{m:?}");
         // and the curve really was flat: nothing near the sure bar
         assert!(m.z < SURE_Z - 3.0, "z {}", m.z);
+    }
+
+    /// Abundance: a crowded shoot. Six camera takes of six performances; for
+    /// each scene THREE mics that all genuinely match (boom plus two lavs,
+    /// each rolled at its own time, so each has its own right offset); and
+    /// thirty decoy recordings of performances nobody filmed. Every take must
+    /// pair with one of its OWN scene's mics, at that mic's offset.
+    #[test]
+    fn abundance_six_takes_eighteen_true_mics_thirty_decoys() {
+        let t0 = std::time::Instant::now();
+        let scenes: Vec<Vec<(f64, f64, f64)>> = (0..6).map(|k| performance(500 + k, 36.0)).collect();
+        let mut pool = Vec::new();
+        let mut owner = Vec::new();       // pool index -> (scene, that mic's start)
+        for (k, sc) in scenes.iter().enumerate() {
+            for (m, (start, gain, noise)) in [(0.0, 0.5, 0.01), (1.2, 0.35, 0.02), (-0.8, 0.3, 0.025)].iter().enumerate() {
+                pool.push(Onsets::of(&record(sc, *start, 36.0, *gain, *noise, 1000 + (k * 10 + m) as u64)).unwrap());
+                owner.push((Some(k), *start));
+            }
+        }
+        for d in 0..30u64 {
+            pool.push(Onsets::of(&record(&performance(900 + d, 36.0), 0.0, 36.0, 0.5, 0.01, 2000 + d)).unwrap());
+            owner.push((None, 0.0));
+        }
+        // shuffle the pool order deterministically so position is no clue
+        let mut order: Vec<usize> = (0..pool.len()).collect();
+        let mut r = Rng::new(42);
+        for i in (1..order.len()).rev() { let j = (r.next() * (i + 1) as f64) as usize; order.swap(i, j.min(i)); }
+        let pool_s: Vec<Onsets> = order.iter().map(|&i| pool[i].clone()).collect();
+        let owner_s: Vec<(Option<usize>, f64)> = order.iter().map(|&i| owner[i]).collect();
+        // each camera rolled 3 s after its scene started, for 28 s
+        let pics: Vec<Onsets> = scenes.iter().enumerate()
+            .map(|(k, sc)| Onsets::of(&record(sc, 3.0, 28.0, 0.2, 0.03, 3000 + k as u64)).unwrap()).collect();
+        let built = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let m = match_pool(&pics, &pool_s);
+        let matched = t1.elapsed();
+        let mut sure = 0;
+        for (k, mm) in m.iter().enumerate() {
+            let mm = mm.as_ref().unwrap_or_else(|| panic!("take {k} found nothing"));
+            let (scene, start) = owner_s[mm.sound];
+            assert_eq!(scene, Some(k), "take {k} paired with a decoy or another scene: {mm:?}");
+            // picture t=0 is scene t=3; this mic's t=0 is scene t=start; so offset = start - 3
+            assert!((mm.offset_seconds() - (start - 3.0)).abs() <= 0.03, "take {k}: offset {} for a mic that rolled at {start}", mm.offset_seconds());
+            if mm.verdict == Verdict::Sure { sure += 1; }
+            // corroboration must come from the SAME scene, never a decoy
+            assert!(mm.corroborated_by.iter().all(|i| owner_s[*i].0 == Some(k)),
+                    "take {k} was 'corroborated' by another scene or a decoy: {:?}", mm.corroborated_by);
+        }
+        assert!(sure >= 5, "most pairings are confident even among 48 candidates: {sure}/6");
+        eprintln!("abundance: 6 takes x {} recordings: built {built:?}, matched {matched:?}", pool_s.len());
+        // cost scales as takes x recordings; guard against a quadratic surprise
+        assert!(matched.as_secs_f64() < 60.0, "matching took {matched:?}");
     }
 
     #[test]
