@@ -1191,11 +1191,11 @@ pub fn eink_app_bins(cargo_toml: &str) -> Vec<(String, Vec<String>, bool)> {
     }
 }
 
-/// Every eink-kit app under `root/{apps,shared}` (two levels of crates deep,
-/// skipping build output).
+/// Every eink-kit app under `root/{apps,shared,games}` (a few levels of
+/// crates deep, skipping build output). `games` holds unendlich-eink.
 pub fn discover_tablet_apps(root: &std::path::Path) -> Vec<TabletApp> {
     let mut out = Vec::new();
-    let mut stack: Vec<(std::path::PathBuf, u8)> = ["apps", "shared"].iter().map(|d| (root.join(d), 0)).collect();
+    let mut stack: Vec<(std::path::PathBuf, u8)> = ["apps", "shared", "games"].iter().map(|d| (root.join(d), 0)).collect();
     while let Some((dir, depth)) = stack.pop() {
         if let Ok(t) = std::fs::read_to_string(dir.join("Cargo.toml")) {
             for (bin, features, no_default) in eink_app_bins(&t) {
@@ -1491,6 +1491,13 @@ pub fn appload_remove_cmd(app: &str, appload_dir: &str) -> Result<String, String
 pub fn appload_manifest(opts: &AppLoadOptions, app: &str, model: Option<RmModel>, profile: RefreshProfile) -> String {
     let mut env = serde_json::Map::new();
     env.insert("EINK_BACKEND".into(), "qtfb".into());
+    // Fast profiles ask AppLoad for the fast waveform once drawing is under
+    // way; eink-kit falls back (reconnects without mode messages) if AppLoad
+    // drops the connection in reply, as it did on a Paper Pro when asked
+    // right after init.
+    if profile != RefreshProfile::Quality {
+        env.insert("EINK_QTFB_MODES".into(), "deferred".into());
+    }
     // AppLoad-launched apps have no terminal: their stderr goes to the same
     // log `status` tails, so a failure to start is readable from the phone.
     env.insert("EINK_LOG".into(), log_path(app).into());
@@ -2109,6 +2116,7 @@ mod tests {
         assert_eq!(v["environment"]["EINK_BACKEND"], "qtfb");
         assert_eq!(v["environment"]["EINK_PROFILE"], "fast-color");
         assert_eq!(v["environment"]["EINK_LOG"], "/home/root/.local/share/gitmind/log/eink-demo.log");
+        assert_eq!(v["environment"]["EINK_QTFB_MODES"], "deferred", "fast profiles request the fast waveform, with fallback");
     }
 
     #[test]
@@ -2333,6 +2341,7 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
         let ts = apps.iter().find(|a| a.bin == "tomescope-eink").expect("tomescope port discovered");
         assert!(ts.no_default && ts.features == ["eink"]);
         assert!(!apps.iter().any(|a| a.bin == "tomescope" || a.bin == "shelfctl"), "desktop bins offered: {apps:?}");
+        assert!(apps.iter().any(|a| a.bin == "unendlich-eink" && a.dir.ends_with("games/unendlich/crates/unendlich-eink")), "{apps:?}");
     }
 
     #[test]
