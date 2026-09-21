@@ -35,8 +35,10 @@ pub struct Job {
 }
 
 /// Render `ticket` into `out` on a worker thread.
-pub fn start(ticket: Ticket, out: PathBuf, size: Size, fps: f64) -> Job {
-    let (tx, rx) = mpsc::channel();
+pub fn start(ticket: Ticket, out: PathBuf, size: Size, fps: f64, wake: crate::wake::Wake) -> Job {
+    // wakes the window on every event: a touch-up that had landed still read
+    // "measuring" four minutes later until the mouse moved, without it
+    let (tx, rx) = crate::wake::channel(wake);
     let clip = ticket.clip;
     std::thread::spawn(move || {
         let _ = tx.send(Event::Note(format!("touch-up: measuring {}",

@@ -50,7 +50,12 @@ pub enum Fix {
     Particles { params: crate::particles::Params, seed: u64, emitter: (f32, f32), drive: Vec<f32>,
                 /// Ride what is under the emitter: points are picked there in the
                 /// first frame, tracked as one rig, and the emitter moves with it.
-                ride: bool },
+                ride: bool,
+                /// Points placed by hand on the first rendered frame (fractions).
+                /// When given, they replace the automatic pick -- which chooses
+                /// the most textured patches, and can choose a patterned wall
+                /// over the person -- and the emitter sits at their centre.
+                points: Vec<(f32, f32)> },
 }
 
 /// What to fix, on which range of which source.
@@ -171,7 +176,7 @@ pub fn render(t: &Ticket, out: &Path, size: Size, fps: f64) -> Result<Version, S
     // Measurement pass: one grey decode shared by every fix that needs motion.
     let needs_motion = t.fixes.iter().any(|f| matches!(f,
         Fix::Stabilize { .. } | Fix::CleanPlate { align: true, .. } | Fix::FollowMotion { .. } | Fix::Particles { ride: true, .. }));
-    let ride_at = t.fixes.iter().find_map(|f| match f { Fix::Particles { ride: true, emitter, .. } => Some(*emitter), _ => None });
+    let ride_at = t.fixes.iter().find_map(|f| match f { Fix::Particles { ride: true, emitter, points, .. } => Some((*emitter, points.clone())), _ => None });
     let follow_zoom = t.fixes.iter().find_map(|f| match f { Fix::FollowMotion { zoom, smooth } => Some((*zoom, *smooth)), _ => None });
     let mut follow: Vec<(f32, f32)> = Vec::new();
     // the emitter's path when it rides a rig, in pixels per frame
@@ -188,10 +193,16 @@ pub fn render(t: &Ticket, out: &Path, size: Size, fps: f64) -> Result<Version, S
             }
             follow = crate::action::follow_path(&c, fps, smooth, zoom);
         }
-        if let Some((ex, ey)) = ride_at {
-            let at = (ex * size.w as f32, ey * size.h as f32);
+        if let Some(((ex, ey), placed)) = ride_at.clone() {
             let patch = ((size.w / 80).max(4)) as i32;
-            let pts = crate::tracker::pick_points(&grey[0], at, size.w as f32 * 0.12, 6, patch);
+            let (at, pts) = if placed.is_empty() {
+                let at = (ex * size.w as f32, ey * size.h as f32);
+                (at, crate::tracker::pick_points(&grey[0], at, size.w as f32 * 0.12, 6, patch))
+            } else {
+                let px: Vec<(f32, f32)> = placed.iter().map(|p| (p.0 * size.w as f32, p.1 * size.h as f32)).collect();
+                let c = (px.iter().map(|p| p.0).sum::<f32>() / px.len() as f32, px.iter().map(|p| p.1).sum::<f32>() / px.len() as f32);
+                (c, px)
+            };
             if pts.len() < 2 {
                 warnings.push("ride: too little texture under the emitter to track -- the particles stay put".into());
             } else {
@@ -442,7 +453,7 @@ mod tests {
             // barely differs from it (the smoke preset is pale and read either
             // way, so a smoke version of this test passed with fitting removed)
             let t = ticket(&plate, vec![Fix::Particles { params: crate::particles::Params::floating_dirt(), seed: 4,
-                emitter: (0.5, 0.8), drive, ride: false }]);
+                emitter: (0.5, 0.8), drive, ride: false, points: vec![] }]);
             let out = s.dir.join(format!("tu-pt-{tag}-{}.mp4", std::process::id()));
             let v = render(&t, &out, size, 12.0).expect("renders");
             let px = crate::frame_rgb(&out, Ticks::from_seconds(2.4), size.w, size.h).unwrap();
@@ -480,7 +491,7 @@ mod tests {
             }).expect("plate");
         let emit = ((40.0 + 25.0) / 240.0, 70.0 / 136.0);   // on the figure in the first frame
         let t = ticket(&plate, vec![Fix::Particles { params: crate::particles::Params::space_dust(), seed: 2,
-            emitter: emit, drive: vec![], ride: true }]);
+            emitter: emit, drive: vec![], ride: true, points: vec![] }]);
         let out = s.dir.join(format!("tu-rode-{}.mp4", std::process::id()));
         let v = render(&t, &out, size, 12.0).expect("renders");
         assert!(v.report.warnings.iter().all(|w| !w.contains("too little texture")), "{:?}", v.report.warnings);
@@ -499,6 +510,52 @@ mod tests {
         // figure has moved ~2 px/frame); it must be well right of the start
         assert!(mean_x > 40.0 + 25.0 + 30.0, "the dust moved with the figure: mean x {mean_x}");
         for f in [&plate, &out] { let _ = std::fs::remove_file(f); }
+    }
+
+    #[test]
+    fn hand_placed_points_ride_the_figure_where_the_automatic_pick_takes_the_wall() {
+        if !ffmpeg_or_skip("hand_placed_points_ride_the_figure_where_the_automatic_pick_takes_the_wall") { return; }
+        let s = shoot(&[1.0], 6.0);
+        let size = Size { w: 240, h: 136 };
+        let plate = s.dir.join(format!("tu-hand-{}.mp4", std::process::id()));
+        // a busy STATIC poster right beside a softer-textured figure walking right
+        Pipe { input: s.takes[0].video.clone(), range: None, size, fps: 12.0 }
+            .map(&plate, 10, |i, mut f| {
+                let fx = 60 + 2 * i as u32;
+                for y in 0..f.h { for x in 0..f.w {
+                    let poster = x >= 20 && x < 70 && y > 30 && y < 100;
+                    let figure = x >= fx && x < fx + 40 && y > 40 && y < 110;
+                    let v = if figure { (120.0 + 45.0 * (((x - fx) as f32 / 5.0).sin() * (y as f32 / 4.0).cos())) as u8 }
+                            else if poster { if (x / 3 + y / 3) % 2 == 0 { 250 } else { 10 } }
+                            else { 20 };
+                    f.set(x, y, [v, v, v]);
+                }}
+                f
+            }).expect("plate");
+        // the emitter between the two: the automatic pick grabs the louder texture -- the poster
+        let emit = (66.0 / 240.0, 70.0 / 136.0);
+        let dust_x = |points: Vec<(f32, f32)>, tag: &str| {
+            let t = ticket(&plate, vec![Fix::Particles { params: crate::particles::Params::space_dust(), seed: 3,
+                emitter: emit, drive: vec![], ride: true, points }]);
+            let out = s.dir.join(format!("tu-hand-{tag}-{}.mp4", std::process::id()));
+            render(&t, &out, size, 12.0).expect("renders");
+            let px = crate::frame_rgb(&out, Ticks::from_seconds(2.8), size.w, size.h).unwrap();
+            let _ = std::fs::remove_file(&out);
+            let (mut sx, mut n) = (0.0f32, 0.0f32);
+            for (k, p) in px.chunks(3).enumerate() {
+                // dust is near-white; poster white is also 250, so only count outside the poster
+                let x = (k as u32 % size.w) as f32;
+                if p[0] > 215 && p[1] > 215 && p[2] > 215 && !(20.0..70.0).contains(&x) { sx += x; n += 1.0; }
+            }
+            if n > 0.0 { sx / n } else { 0.0 }
+        };
+        let auto = dust_x(vec![], "auto");
+        // two points on the figure, in the first rendered frame (plate frame 6: figure at x 72..112)
+        let hand = dust_x(vec![(84.0 / 240.0, 60.0 / 136.0), (100.0 / 240.0, 90.0 / 136.0), (90.0 / 240.0, 75.0 / 136.0)], "hand");
+        // by 2.8 s into the render the figure's middle is near x = 60 + 2*(6+34) + 20 = 160
+        assert!(hand > 125.0, "hand-placed points carried the dust with the figure: mean x {hand}");
+        assert!(hand > auto + 25.0, "the automatic pick rode the static poster instead: auto {auto} vs hand {hand}");
+        let _ = std::fs::remove_file(&plate);
     }
 
     #[test]

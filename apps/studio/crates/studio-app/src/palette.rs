@@ -125,6 +125,8 @@ pub enum ShellVerb {
     /// Composite particles into the selected clip: preset 0 dirt, 1 dust,
     /// 2 smoke; driven by a control channel's sound, or steady.
     TouchUpParticles { preset: u8, drive: Option<BusId>, ride: bool },
+    /// Particles riding points the operator places by hand: opens the window.
+    TouchUpParticlesPlace { preset: u8, drive: Option<BusId> },
     CallToggle,
     CallMute,
     CallPushToTalk,
@@ -796,6 +798,8 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
                      then: Then::Do(Act::Shell(ShellVerb::TouchUpParticles { preset, drive, ride: false })) },
             Choice { label: "riding what's under it".into(), hint: Some("tracks the subject under the emitter and follows it".into()),
                      then: Then::Do(Act::Shell(ShellVerb::TouchUpParticles { preset, drive, ride: true })) },
+            Choice { label: "riding points I place…".into(), hint: Some("tap the subject yourself".into()),
+                     then: Then::Do(Act::Shell(ShellVerb::TouchUpParticlesPlace { preset, drive })) },
         ],
         Ask::FollowZoom => [(130u32, "1.3x — keep most of the frame"), (160, "1.6x — the gesture fills it"),
                              (200, "2x — tight on the movement")].into_iter().map(|(z, what)| Choice {

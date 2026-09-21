@@ -320,13 +320,14 @@ pub fn start_arrangement(
     dest: Dest,
     project: Project,
     audio: std::collections::BTreeMap<studio_core::SourceId, SourceAudio>,
+    wake: crate::wake::Wake,
 ) -> Run {
     // Opus's contract, enforced where it cannot be forgotten; the phone's
     // formats are stereo too.
     let mut plan = plan;
     if plan.format == ExportFormat::Opus { plan.rate = 48_000; }
     if plan.format.stereo_only() { plan.layout = studio_audio::format::ChannelFormat::Stereo; }
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = crate::wake::channel(wake);
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = cancel.clone();
     let n_jobs = jobs.len();
@@ -430,8 +431,9 @@ pub fn start_video(
     width: u32,
     height: u32,
     fps: u32,
+    wake: crate::wake::Wake,
 ) -> Run {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = crate::wake::channel(wake);
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = cancel.clone();
     std::thread::spawn(move || {
@@ -459,13 +461,14 @@ pub fn start_rack(
     pattern: usize,
     audio: std::collections::BTreeMap<studio_core::SourceId, SourceAudio>,
     project_name: String,
+    wake: crate::wake::Wake,
 ) -> Run {
     let mut plan = plan;
     if plan.format == ExportFormat::Opus {
         plan.rate = 48_000;
         plan.layout = studio_audio::format::ChannelFormat::Stereo;
     }
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = crate::wake::channel(wake);
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = cancel.clone();
     let n_jobs = jobs.len();
@@ -765,7 +768,7 @@ mod tests {
         let plan = Plan { format: ExportFormat::Wav, ..Plan::default() };
         let jobs = plan_jobs(&plan, &p, &[]).unwrap();
         let dir = tempdir("wav");
-        let run = start_arrangement(plan, jobs, Dest::File(dir.join("mix.wav")), p, audio);
+        let run = start_arrangement(plan, jobs, Dest::File(dir.join("mix.wav")), p, audio, crate::wake::none());
         let evs = drain(&run);
         assert!(matches!(evs.last(), Some(Event::Done)), "{evs:?}");
         let mut last = -1.0f32;
@@ -792,7 +795,7 @@ mod tests {
                           ..Plan::default() };
         let jobs = plan_jobs(&plan, &p, &[]).unwrap();
         let dir = tempdir("stems");
-        let run = start_arrangement(plan, jobs, Dest::Folder(dir.clone()), p, audio);
+        let run = start_arrangement(plan, jobs, Dest::Folder(dir.clone()), p, audio, crate::wake::none());
         let evs = drain(&run);
         assert!(matches!(evs.last(), Some(Event::Done)), "{evs:?}");
         let files: Vec<_> = evs.iter().filter_map(|e| match e {
@@ -823,7 +826,7 @@ mod tests {
         let jobs = plan_jobs(&plan, &p, &[]).unwrap();
         let dir = tempdir("cancel");
         let dest = dir.join("mix.wav");
-        let run = start_arrangement(plan, jobs, Dest::File(dest.clone()), p, audio);
+        let run = start_arrangement(plan, jobs, Dest::File(dest.clone()), p, audio, crate::wake::none());
         // Cancel before the worker gets anywhere: the flag is checked
         // before every chunk, so the first check already sees it.
         run.cancel.store(true, Ordering::Relaxed);
@@ -841,7 +844,7 @@ mod tests {
         let plan = Plan { format: ExportFormat::Opus, scope: Scope::RackLoop,
                           ..Plan::default() };
         let run = start_rack(plan, jobs, Dest::File(dir.join("loop.opus")), 0,
-                             Default::default(), "cut".into());
+                             Default::default(), "cut".into(), crate::wake::none());
         let evs = drain(&run);
         assert!(matches!(evs.last(), Some(Event::Done)), "{evs:?}");
         let bytes = std::fs::read(dir.join("loop.opus")).unwrap();

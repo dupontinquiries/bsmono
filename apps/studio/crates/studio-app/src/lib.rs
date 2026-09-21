@@ -64,6 +64,8 @@ pub mod stage;
 pub mod kaleido_gallery;
 pub mod signals_panel;
 pub mod comic_job;
+pub mod track_points;
+pub mod wake;
 #[cfg(test)]
 mod abundance_tests;
 pub mod touchup_job;
@@ -307,6 +309,9 @@ pub struct Studio {
     /// carrier keys its records by [`Studio::carrier_key`], so setting this
     /// is what "join" means at the wire.
     pub joined_key: Option<[u8; 20]>,
+    /// Wakes the window when a worker the core started has news. Does
+    /// nothing until the app installs one; headless use and tests keep that.
+    pub waker: wake::Wake,
 }
 
 impl Studio {
@@ -352,6 +357,7 @@ impl Studio {
             transport: Transport::new(48_000),
             fx_editor: None,
             joined_key: None,
+            waker: wake::none(),
             view: studio_egui::View::default(),
             song_views: std::collections::BTreeMap::new(),
             active_song: None,
@@ -3253,6 +3259,8 @@ pub struct App {
     /// loses what the previous filter hid.
     words_raw: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
     word_filter: studio_voice::WordFilter,
+    /// The track-points window, open over the selected clip's first frame.
+    track_points: Option<track_points::Window>,
     /// A finger has touched the screen this session: tool windows grow their
     /// targets to fingertip size even on a wide screen (a touch laptop).
     touch_seen: bool,
@@ -3417,6 +3425,10 @@ impl Default for App {
         let video_audio_left = pending_video.len();
         // The worker wakes the window through this slot; the first frame fills it.
         let ui_waker: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>> = Default::default();
+        {
+            let w = ui_waker.clone();
+            studio.waker = std::sync::Arc::new(move || { if let Some(c) = w.lock().ok().and_then(|g| g.clone()) { c.request_repaint(); } });
+        }
         let video_audio_rx = (!pending_video.is_empty()).then(|| {
             let (tx, rx) = std::sync::mpsc::channel();
             let w = ui_waker.clone();
@@ -3489,6 +3501,7 @@ impl Default for App {
               comic_run: None,
               comic_setup: None,
               touch_seen: false,
+              track_points: None,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
               upscale_clip: None,
@@ -4316,6 +4329,7 @@ impl eframe::App for App {
         self.signals_window(ctx);
         self.comic_tracker();
         self.comic_setup_window(ctx);
+        self.track_points_window(ctx);
 
         // ── files dropped on the window ──────────────────────────────────
         //
@@ -6190,6 +6204,7 @@ impl App {
                 }
                 palette::ShellVerb::TouchUpStabilize(kind) => self.start_stabilize(kind),
                 palette::ShellVerb::TouchUpParticles { preset, drive, ride } => self.start_particles(preset, drive, ride),
+                palette::ShellVerb::TouchUpParticlesPlace { preset, drive } => self.open_track_points(preset, drive),
                 palette::ShellVerb::TouchUpFollow { zoom_pct } => self.start_touchup(
                     studio_video::touchup::Fix::FollowMotion { zoom: zoom_pct as f32 / 100.0, smooth: 0.5 },
                     format!("following the motion at {:.1}x", zoom_pct as f32 / 100.0)),
@@ -6271,7 +6286,7 @@ impl App {
                         self.export_done.clear();
                         self.export_run = Some(export::start_video(
                             self.studio.session.doc.project.clone(), self.audio.clone(), out,
-                            self.sink.rate().max(8_000), 1280, 720, 30));
+                            self.sink.rate().max(8_000), 1280, 720, 30, self.waker()));
                     }
                 }
                 palette::ShellVerb::Settings => { self.settings_open = true; }
@@ -7091,10 +7106,10 @@ impl App {
         self.export_progress = (0, 0, 0.0);
         self.export_run = Some(match planned {
             Planned::Arr(jobs) => export::start_arrangement(
-                *plan, jobs, dest, project.clone(), self.audio.clone()),
+                *plan, jobs, dest, project.clone(), self.audio.clone(), self.waker()),
             Planned::Rack(jobs) => export::start_rack(
                 *plan, jobs, dest, self.studio.current_pattern,
-                self.audio.clone(), project.name.clone()),
+                self.audio.clone(), project.name.clone(), self.waker()),
         });
         true
     }
@@ -7174,7 +7189,7 @@ impl App {
         let mut n = 2;
         while out.exists() { out = dir.join(format!("{stem}-touchup-{n}.mp4")); n += 1; }
         let size = studio_video::framepipe::Size { w: probe.width, h: probe.height };
-        self.touchup_run = Some(touchup_job::start(ticket, out, size, probe.fps.max(1.0)));
+        self.touchup_run = Some(touchup_job::start(ticket, out, size, probe.fps.max(1.0), self.waker()));
         self.studio.status = format!("{what} — this runs in the background");
     }
 
@@ -7325,6 +7340,13 @@ impl App {
         self.comic_setup = Some(comic_job::SetupWindow::new(group, frames));
     }
 
+    /// A wake for background workers: after each message they send, the
+    /// window redraws to show it.
+    fn waker(&self) -> wake::Wake {
+        let w = self.ui_waker.clone();
+        std::sync::Arc::new(move || { if let Some(c) = w.lock().ok().and_then(|g| g.clone()) { c.request_repaint(); } })
+    }
+
     /// How tool windows should present on this screen, and a window built to
     /// match: a full-screen sheet on a narrow screen (the editor's
     /// one-thing-at-a-time rule), a floating window elsewhere.
@@ -7459,6 +7481,44 @@ impl App {
     /// the sound at frame i. A drive computed for the clip alone would run
     /// half a second early against the handled render.
     fn start_particles(&mut self, preset: u8, drive_bus: Option<studio_core::BusId>, ride: bool) {
+        self.start_particles_with(preset, drive_bus, ride, Vec::new());
+    }
+
+    /// Open the track-points window on the selected clip's FIRST RENDERED
+    /// frame -- the render starts half a second (the handle) before the clip,
+    /// and that is the frame the points are tracked from.
+    fn open_track_points(&mut self, preset: u8, drive: Option<studio_core::BusId>) {
+        let project = &self.studio.session.doc.project;
+        let Some(clip) = self.studio.selection.first().and_then(|id| project.clips.get(id)).cloned() else {
+            self.studio.status = "select the clip first".into(); return;
+        };
+        let Some(src) = project.sources.get(&clip.source).filter(|s| s.has_video) else {
+            self.studio.status = "the selected clip has no picture".into(); return;
+        };
+        let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let first = Ticks::from_seconds((clip.src_in.to_seconds() - 0.5).max(0.0));   // 0.5 = start_touchup's handle
+        match studio_video::frame_rgb(&base.join(&src.path), first, 320, 180) {
+            Ok(px) => self.track_points = Some(track_points::Window::new(px, preset, drive)),
+            Err(e) => self.studio.status = format!("could not read the first frame: {e:?}"),
+        }
+    }
+
+    fn track_points_window(&mut self, ctx: &egui::Context) {
+        let Some(w) = &mut self.track_points else { return };
+        let mut open = true;
+        let mut go = None;
+        let layout = studio_egui::touch::ToolLayout::for_screen(ctx.content_rect().width(), self.touch_seen);
+        Self::tool_window(ctx, "Track points", layout, &mut open).show(ctx, |ui| { go = w.show(ui, layout); });
+        if let Some(points) = go {
+            let (preset, drive) = (w.preset, w.drive);
+            self.track_points = None;
+            self.start_particles_with(preset, drive, true, points);
+            return;
+        }
+        if !open { self.track_points = None; }
+    }
+
+    fn start_particles_with(&mut self, preset: u8, drive_bus: Option<studio_core::BusId>, ride: bool, points: Vec<(f32, f32)>) {
         use studio_video::particles::Params;
         let params = match preset { 0 => Params::floating_dirt(), 1 => Params::space_dust(), _ => Params::creepy_smoke() };
         let emitter = match preset { 0 => (0.5, 0.95), 1 => (0.5, 0.5), _ => (0.5, 0.75) };
@@ -7488,8 +7548,10 @@ impl App {
             }
         };
         let what = match preset { 0 => "floating dirt", 1 => "spaceship dust", _ => "creepy smoke" };
-        self.start_touchup(studio_video::touchup::Fix::Particles { params, seed: id.0, emitter, drive, ride },
-                           format!("{what}{}", if drive_bus.is_some() { ", driven by sound" } else { "" }));
+        let placed = points.len();
+        self.start_touchup(studio_video::touchup::Fix::Particles { params, seed: id.0, emitter, drive, ride, points },
+                           format!("{what}{}{}", if drive_bus.is_some() { ", driven by sound" } else { "" },
+                                   if placed > 0 { format!(", riding {placed} placed point(s)") } else { String::new() }));
     }
 
     /// Poll the touch-up worker. Same shape as the export tracker: egui only

@@ -20,6 +20,12 @@
 
 use crate::slate_ocr::Gray;
 
+/// The most a real subject turns between two frames, radians (about 4.5
+/// degrees at 25 fps is already a fast head turn).
+pub const MAX_TURN_PER_FRAME: f32 = 0.08;
+/// The most a real subject grows or shrinks between two frames (6%).
+pub const MAX_SCALE_PER_FRAME: f32 = 0.06;
+
 /// A similarity transform: reference-frame point -> this frame's point.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rig { pub tx: f32, pub ty: f32, pub rot: f32, pub scale: f32 }
@@ -116,6 +122,19 @@ pub fn track(frames: &[Gray], points: &[(f32, f32)], patch: i32, search: i32, ma
                 let q = first.apply(*p); (q.0 - s.0).hypot(q.1 - s.1) < patch as f32
             }).collect();
             if keep.len() >= 2 && keep.len() < pairs.len() { solve(&keep).unwrap_or(first) } else { first }
+        });
+        // A solve is only believed if it is a motion a subject can make. On
+        // the real rooftop shot the woman raised her arm at ~4 s, the points
+        // lost her, and the survivors "solved" a 1-radian turn and a 2x scale
+        // in one frame -- a false match the rig then rode for the rest of the
+        // shot, the dust drifting to the table. Two points cannot catch that
+        // themselves (any two fit a similarity exactly), so with only two they
+        // must also land where the rig predicted them.
+        let plausible = |r: &Rig| {
+            (r.rot - rig.rot).abs() <= MAX_TURN_PER_FRAME && (r.scale / rig.scale).ln().abs() <= MAX_SCALE_PER_FRAME
+        };
+        let solved = solved.filter(|r| plausible(r)).filter(|_| {
+            pairs.len() >= 3 || pairs.iter().all(|(p, s)| { let q = predicted.apply(*p); (q.0 - s.0).hypot(q.1 - s.1) < patch as f32 })
         });
         let held = solved.is_none();
         let new = solved.unwrap_or(predicted);
@@ -244,6 +263,44 @@ mod tests {
         }}
         // a flat region offers nothing to track
         assert!(pick_points(&g, (180.0, 20.0), 12.0, 5, 5).is_empty(), "flat background: no points");
+    }
+
+    #[test]
+    fn perfect_matches_in_an_impossible_arrangement_are_held_not_followed() {
+        // The rooftop failure: matches that LOOK right (low difference) but sit
+        // where no motion could put them. Built literally: from frame 10 each
+        // point's ORIGINAL patch is pasted, unchanged, at the place a 1-radian
+        // turn and 1.6x scale would move it. Every match is perfect; the
+        // arrangement is impossible in one frame. (A face drawn turned would
+        // simply not match and prove nothing -- the first version of this test
+        // did that, and passed with the rule removed.)
+        let pts = [(60.0f32, 45.0f32), (100.0, 45.0), (70.0, 75.0), (95.0, 72.0)];
+        let base = scene(240, 180, Rig::IDENTITY, None);
+        let jump = Rig { tx: 40.0, ty: -20.0, rot: 1.0, scale: 1.6 };
+        let r = 8i32;
+        let frames: Vec<Gray> = (0..16).map(|i| {
+            if i < 10 { return scene(240, 180, Rig { tx: i as f32 * 0.5, ty: 0.0, rot: 0.0, scale: 1.0 }, None); }
+            let mut g = Gray::new(240, 180);
+            for v in g.px.iter_mut() { *v = 40; }
+            for p in &pts {
+                let q = jump.apply(*p);
+                for dy in -r..=r { for dx in -r..=r {
+                    let (sx, sy) = (p.0 as i32 + dx, p.1 as i32 + dy);
+                    let (tx, ty) = (q.0.round() as i32 + dx, q.1.round() as i32 + dy);
+                    if tx >= 0 && ty >= 0 && tx < 240 && ty < 180 {
+                        g.px[ty as usize * 240 + tx as usize] = base.px[sy as usize * 240 + sx as usize];
+                    }
+                }}
+            }
+            g
+        }).collect();
+        // a search wide enough to FIND the pasted patches
+        let t = track(&frames, &pts, 6, 60, 18.0);
+        assert!(!t[8].held, "normal motion is followed");
+        for k in 10..16 {
+            assert!(t[k].rig.rot.abs() < 0.2 && (t[k].rig.scale - 1.0).abs() < 0.15,
+                    "frame {k}: perfect-looking matches in an impossible arrangement were believed: {:?}", t[k].rig);
+        }
     }
 
     #[test]

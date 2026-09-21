@@ -47,8 +47,8 @@ impl Default for Settings {
 }
 
 /// Start the bounce. `[start_s, end_s)` is the clip's source range.
-pub fn start(input: PathBuf, start_s: f64, end_s: f64, out: PathBuf, settings: &Settings) -> Run {
-    let (tx, rx) = mpsc::channel();
+pub fn start(input: PathBuf, start_s: f64, end_s: f64, out: PathBuf, settings: &Settings, wake: crate::wake::Wake) -> Run {
+    let (tx, rx) = crate::wake::channel(wake);
     let cancel = Arc::new(AtomicBool::new(false));
     let mut job = d2x_job::Job::default();
     job.input = input;
@@ -153,7 +153,7 @@ impl Studio {
             .join("upscaled")
             .join(format!("{}-{}-x{}.mkv", input.file_stem().and_then(|s| s.to_str()).unwrap_or("clip"), next_id, settings.scale));
         self.status = format!("upscaling {:.1}s of {} → {}", end_s - start_s, input.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), out.display());
-        Some((clip_id, start(input, start_s, end_s, out, settings)))
+        Some((clip_id, start(input, start_s, end_s, out, settings, self.waker.clone())))
     }
 
     /// Land a finished bounce: a new source for the file and a new clip at
