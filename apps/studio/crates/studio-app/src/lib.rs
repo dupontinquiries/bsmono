@@ -143,6 +143,11 @@ pub struct Studio {
     /// its audio/peaks maps. A queue rather than a callback so the headless
     /// tests can watch the same door the GUI uses.
     pub incoming_audio: Vec<(studio_core::SourceId, studio_audio::SourceAudio)>,
+    /// Video sources whose audio still has to be pulled out with ffmpeg.
+    /// Filled by `load_from`, emptied by the shell onto a worker thread:
+    /// extraction is seconds per file, and doing it inline held the window
+    /// closed for over a minute on a 77-clip card.
+    pub pending_video_audio: Vec<(studio_core::SourceId, std::path::PathBuf)>,
     pub keys: studio_egui::keys::Keymap,
     /// Status line — what just happened, so an action never fails silently.
     pub status: String,
@@ -349,6 +354,7 @@ impl Studio {
             chunk_store: Default::default(),
             pending_assets: Default::default(),
             incoming_audio: Vec::new(),
+            pending_video_audio: Vec::new(),
             keys: studio_egui::keys::Keymap::new(),
             status: "ready".into(),
             rack: studio_live::Rack::trap_kit(),
@@ -666,6 +672,18 @@ impl Studio {
         archive::pack(&save, audio, &originals, meta)
     }
 
+    /// Pull the audio out of queued video sources, one at a time, sending
+    /// each as it lands so the timeline fills in progressively. `None` for
+    /// a file with no audio stream (a picture, not a failure). Blocking: the
+    /// shell runs it on a worker thread; tests run it inline.
+    pub fn extract_video_audio(pending: Vec<(studio_core::SourceId, std::path::PathBuf)>,
+                               tx: std::sync::mpsc::Sender<(studio_core::SourceId, Option<studio_audio::SourceAudio>)>) {
+        for (id, path) in pending {
+            let audio = studio_video::extract_audio(&path).ok().flatten();
+            if tx.send((id, audio)).is_err() { return; } // the shell went away
+        }
+    }
+
     pub fn load_from(path: &std::path::Path, site: SiteId, team: Team)
         -> Result<Studio, String>
     {
@@ -681,28 +699,27 @@ impl Studio {
         let mut missing = 0usize;
         for src in sources {
             let p = base.join(&src.path);
+            // Video is checked for, not READ: reading and content-hashing a
+            // whole card of camera files inline (register_asset chunks and
+            // hashes every byte) was the second thing holding the window
+            // closed, after inline extraction — 77 proxies is 355 MB. The
+            // worker needs only the path.
+            if library::is_video_path(&p) {
+                if p.is_file() { s.pending_video_audio.push((src.id, p)); } else { missing += 1; }
+                continue;
+            }
             let Ok(raw) = std::fs::read(&p) else { missing += 1; continue };
             let hint = p.extension().and_then(|e| e.to_str());
-            // Video takes the ffmpeg door here too. The IMPORT path already
-            // did (symphonia cannot open an mkv), but opening a saved project
-            // went straight to decode_bytes — so a video project opened from a
-            // file reported every source "missing or undecodable" and played
-            // silent with no waveforms until each clip was re-imported. Found
-            // on a screenshot of the organised Fragile Thing card: 77 of 77.
-            let decoded = if library::is_video_path(&p) {
-                studio_video::extract_audio(&p).ok().flatten()
-                    .ok_or_else(|| "no audio stream".to_string())
-            } else {
-                studio_media::decode_bytes(raw.clone(), hint).map_err(|e| e.to_string())
-            };
-            match decoded {
+            // Video takes the ffmpeg door, as the import path already did —
+            // symphonia cannot open an mkv, so decoding it here reported every
+            // source of a reopened video project "missing" (77 of 77 on the
+            // Fragile Thing card) and played it silent. But not HERE: the
+            // first version of this fix extracted inline and the window did
+            // not appear for over a minute. The path is queued; the shell
+            // extracts on a worker and the audio arrives like a peer's does.
+            match studio_media::decode_bytes(raw.clone(), hint) {
                 Ok(audio) => {
                     s.incoming_audio.push((src.id, audio));
-                    s.register_asset(src.id, &raw);
-                }
-                // A video with no audio stream is not missing — it is a
-                // picture, and the timeline draws it as one.
-                Err(_) if library::is_video_path(&p) && src.has_video => {
                     s.register_asset(src.id, &raw);
                 }
                 Err(_) => missing += 1,
@@ -2918,11 +2935,21 @@ mod tests {
         let path = dir.join("reopened.studio");
         std::fs::write(&path, file.encode()).unwrap();
 
+        let t = std::time::Instant::now();
         let s = Studio::load_from(&path, SiteId(1), Team::from_contacts("solo", &["sc-local".into()]))
             .expect("opens");
         assert!(!s.status.contains("missing"), "{}", s.status);
-        let (id, audio) = s.incoming_audio.first().expect("the video's audio came through");
-        assert_eq!(*id, studio_core::SourceId(1));
+        // Opening must not extract: that is ffmpeg per file, and inline it
+        // held a 77-clip project's window closed for over a minute.
+        assert!(s.incoming_audio.is_empty(), "nothing is extracted on the opening path");
+        assert_eq!(s.pending_video_audio.len(), 1, "the video is queued for the worker");
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "opening stays fast: {:?}", t.elapsed());
+        // and the worker delivers it
+        let (tx, rx) = std::sync::mpsc::channel();
+        Studio::extract_video_audio(s.pending_video_audio.clone(), tx);
+        let (id, audio) = rx.recv().expect("one delivery");
+        assert_eq!(id, studio_core::SourceId(1));
+        let audio = audio.expect("the video's audio came through");
         assert!(audio.frames() > 40_000, "about two seconds of it: {}", audio.frames());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3167,6 +3194,10 @@ pub struct App {
     /// it is a way of LOOKING at the audio, like a zoom level, not a fact
     /// about the project.
     peak_band: studio_audio::Band,
+    /// Audio arriving from the background extraction of video sources, and
+    /// how many are still to come — for the status line.
+    video_audio_rx: Option<std::sync::mpsc::Receiver<(studio_core::SourceId, Option<studio_audio::SourceAudio>)>>,
+    video_audio_left: usize,
     /// What was said in each source — whisper transcripts, loaded from a
     /// folder of `.srt` files beside the media or picked in the palette.
     /// Session state: a transcript is a reading of the media, rebuildable,
@@ -3316,6 +3347,13 @@ impl Default for App {
         }
         let (provenance_tx, provenance_rx) = std::sync::mpsc::channel();
         let beside = transcripts::beside_media(&studio.session.doc.project);
+        let pending_video = std::mem::take(&mut studio.pending_video_audio);
+        let video_audio_left = pending_video.len();
+        let video_audio_rx = (!pending_video.is_empty()).then(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || Studio::extract_video_audio(pending_video, tx));
+            rx
+        });
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
             provenance_tx, provenance_rx,
             follow: None,
@@ -3367,6 +3405,7 @@ impl Default for App {
               touchup_run: None,
               multiview: None,
               peak_band: studio_audio::Band::Full,
+              video_audio_rx, video_audio_left,
               // Whisper writes a transcript beside its media by default, so
               // look there first — no command needed for the common case.
               words: beside.words,
@@ -4437,6 +4476,27 @@ impl eframe::App for App {
             if self.studio.transport.recording {
                 let step = self.studio.recording_step();
                 self.studio.play_note_at(n, step);
+            }
+        }
+
+        // ── video sources' audio, arriving from the extraction worker ────
+        if let Some(rx) = &self.video_audio_rx {
+            let mut got = Vec::new();
+            while let Ok(item) = rx.try_recv() { got.push(item); }
+            for (id, audio) in got {
+                self.video_audio_left = self.video_audio_left.saturating_sub(1);
+                if let Some(a) = audio {
+                    self.peaks.insert(id, self.build_peaks(&a));
+                    self.audio.insert(id, a);
+                    self.studio.arrangement_dirty = true;
+                }
+            }
+            if self.video_audio_left == 0 {
+                self.video_audio_rx = None;
+                self.studio.status = "video audio extracted — waveforms and playback complete".into();
+            } else {
+                self.studio.status = format!("extracting audio from video… {} to go", self.video_audio_left);
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
             }
         }
 
