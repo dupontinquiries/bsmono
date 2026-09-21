@@ -2867,6 +2867,45 @@ pub struct FaoFrameHeader {
 /// Reads frames from tmp_file, writes proper .fao container.
 
 /// Simplified: write .fao from raw frame pairs (orig+recon) and stats
+/// A frame rate as the header's `u16 / u16`, choosing the denominator so the
+/// numerator FITS.
+///
+/// THIS WAS `(fps * 1000.0).round() as u16` over a fixed 1000, and `as u16`
+/// WRAPS: anything above 65.535 fps was silently corrupted. 144 fps was stored
+/// as 12928/1000 = 12.9 fps -- playback 11x too slow -- and 120 as 54.5, 240 as
+/// 43.4, 66 as 0.464. Those are exactly the rates games are captured at.
+///
+/// Denominators are tried most-precise first, and the first whose numerator fits
+/// wins, so ordinary rates are unchanged in precision: 1001 keeps NTSC exact
+/// (29.97 = 30000/1001), 1000 keeps anything up to 65.5 fps to a thousandth, and
+/// 100 carries high refresh to 655 fps exactly for whole rates (144 = 14400/100).
+/// Every reader divides num / den, so the choice of denominator is invisible to
+/// them -- checked in fao_app, fao_cli and the egui frontend.
+pub fn fps_ratio(fps: f64) -> (u16, u16) {
+    if !(fps.is_finite() && fps > 0.0) {
+        return (0, 1);
+    }
+    let fits = |den: u32| { let n = (fps * den as f64).round(); (n <= u16::MAX as f64).then_some(n) };
+    // An EXACT representation first. 1000 leads so an ordinary 30 fps stays
+    // 30000/1000 -- existing files' header bytes do not change -- and 1001 then
+    // catches NTSC (30000/1001, 60000/1001, 24000/1001) exactly. Exactness is
+    // not cosmetic at length: a 29.97 approximation of 30000/1001 drifts about
+    // 2 seconds over 600 hours.
+    for den in [1000u32, 1001, 100, 10, 1] {
+        if let Some(n) = fits(den) {
+            if (n / den as f64 - fps).abs() < 1e-9 * fps.max(1.0) {
+                return (n as u16, den as u16);
+            }
+        }
+    }
+    // No exact form: the most precise that fits. 1001 is left out -- it is an
+    // NTSC denominator, not a general-purpose scale.
+    for den in [1000u32, 100, 10, 1] {
+        if let Some(n) = fits(den) { return (n as u16, den as u16); }
+    }
+    (u16::MAX, 1)
+}
+
 pub fn write_fao_container(
     output: &mut dyn std::io::Write,
     w: usize, h: usize, fps: f64, quality: f32,
@@ -2876,13 +2915,13 @@ pub fn write_fao_container(
     let n = frames.len();
 
     // Write header
-    let fps_num = (fps * 1000.0).round() as u16;
+    let (fps_num, fps_den) = fps_ratio(fps);
     let total_comp: u64 = frames.iter().map(|f| f.3 as u64).sum();
     let header = FaoFileHeader {
         magic: *b"FAO2",
         version: 1,
         width: w as u16, height: h as u16,
-        fps_num, fps_den: 1000,
+        fps_num, fps_den,
         frame_count: n as u32,
         gop_size: 30, quality: (quality * 100.0) as u8,
         flags: 0,
@@ -7659,5 +7698,43 @@ mod dct_frame_tests {
         let yuv = decompress_frame_dct(&frame, 16, 8);
         assert!(yuv.is_some(), "a full block followed by a second block must still decode");
     }
+
+#[cfg(test)]
+mod fps_ratio_tests {
+    use super::fps_ratio;
+    fn back(f: f64) -> f64 { let (n, d) = fps_ratio(f); n as f64 / d as f64 }
+
+    /// THE BUG: above 65.535 fps, `as u16` wrapped. 144 read back as 12.9.
+    #[test]
+    fn high_refresh_rates_survive() {
+        for f in [66.0, 120.0, 144.0, 165.0, 240.0, 360.0] {
+            assert!((back(f) - f).abs() < 1e-9, "{f} fps read back as {}", back(f));
+        }
+    }
+
+    /// Ordinary rates keep their old encoding, so existing headers do not change.
+    #[test]
+    fn ordinary_rates_are_unchanged() {
+        assert_eq!(fps_ratio(30.0), (30000, 1000));
+        assert_eq!(fps_ratio(60.0), (60000, 1000));
+        assert_eq!(fps_ratio(25.0), (25000, 1000));
+    }
+
+    /// NTSC is stored exactly, not as a thousandths approximation.
+    #[test]
+    fn ntsc_rates_are_exact() {
+        assert_eq!(fps_ratio(30000.0 / 1001.0), (30000, 1001));
+        assert_eq!(fps_ratio(60000.0 / 1001.0), (60000, 1001));
+        assert_eq!(fps_ratio(24000.0 / 1001.0), (24000, 1001));
+    }
+
+    #[test]
+    fn nonsense_rates_do_not_panic() {
+        assert_eq!(fps_ratio(0.0), (0, 1));
+        assert_eq!(fps_ratio(f64::NAN), (0, 1));
+        assert_eq!(fps_ratio(-5.0), (0, 1));
+        let _ = fps_ratio(1e9);
+    }
+}
 }
 

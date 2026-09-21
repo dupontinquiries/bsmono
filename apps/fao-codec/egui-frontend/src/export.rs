@@ -157,4 +157,5 @@ mod tests {
         assert!(matches!(write_dct_fao(&[vec![0; 33 * 16 * 3]], 33, 16, 30.0, 80),
                          Err(ExportError::OddDimensions { .. })));
     }
+
 }
