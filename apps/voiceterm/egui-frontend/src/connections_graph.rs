@@ -89,10 +89,17 @@ pub fn node_id(kind: NodeKind, key: &str) -> String {
 pub fn preview(text: &str) -> String {
     let clean = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if clean.chars().count() <= PREVIEW_CHARS { return clean; }
-    let cut: String = clean.chars().take(PREVIEW_CHARS).collect();
-    match cut.rfind(' ') {
-        Some(i) if i > PREVIEW_CHARS / 2 => format!("{}…", &cut[..i]),
-        _ => format!("{cut}…"),
+    let cut: Vec<char> = clean.chars().take(PREVIEW_CHARS).collect();
+    // CHARACTERS COMPARED TO CHARACTERS. This used `cut.rfind(' ')`, which
+    // returns a BYTE index, and compared it with `PREVIEW_CHARS / 2`, a
+    // CHARACTER count. For ASCII they agree. For accented text they do not: in
+    // "é"*40 + " " + a long URL, the space is at character 40 but byte 80, so
+    // with a halfway mark of 60 it was wrongly taken as a good cut -- and the
+    // preview kept 40 characters instead of 120. A note title in French
+    // followed by a link lost two thirds of its preview.
+    match cut.iter().rposition(|&c| c == ' ') {
+        Some(i) if i > PREVIEW_CHARS / 2 => format!("{}…", cut[..i].iter().collect::<String>()),
+        _ => format!("{}…", cut.iter().collect::<String>()),
     }
 }
 
@@ -640,4 +647,36 @@ mod build_tests {
         ];
         assert_eq!(Graph::new(&nodes, &edges).edges_for("b").len(), 2);
     }
+
+#[cfg(test)]
+mod preview_units_tests {
+    use super::*;
+
+    /// THE MISMATCH. Accented text then a long unbroken token: the space is
+    /// early in characters but late in bytes, and a byte index compared to a
+    /// character count cut the preview to a third of its length.
+    #[test]
+    fn accented_text_before_a_long_token_keeps_its_full_preview() {
+        let t = format!("{} {}", "é".repeat(40), "x".repeat(200));
+        let p = preview(&t);
+        assert_eq!(p.chars().count(), PREVIEW_CHARS + 1, "{} chars: {p}", p.chars().count());
+    }
+
+    /// A space past halfway is still used, so a preview does not end mid-word.
+    #[test]
+    fn a_late_space_is_still_a_clean_cut() {
+        let t = "word ".repeat(40);
+        let p = preview(&t);
+        assert!(p.ends_with('…'));
+        assert!(!p.trim_end_matches('…').ends_with(' '), "{p:?}");
+    }
+
+    /// Short text and CJK are untouched or cut safely.
+    #[test]
+    fn short_and_multibyte_text_is_safe() {
+        assert_eq!(preview("hi"), "hi");
+        let cjk = "日本語".repeat(80);
+        assert!(preview(&cjk).chars().count() <= PREVIEW_CHARS + 1);
+    }
+}
 }
