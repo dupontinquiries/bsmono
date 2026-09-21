@@ -1,0 +1,66 @@
+//! Runtime knobs, all from the environment so they can be changed on the
+//! device (or in an AppLoad manifest, or by gitmind at launch) without a
+//! rebuild. Every value in effect is printed at startup.
+
+use crate::policy::Profile;
+use crate::touch::Transform;
+use std::time::Duration;
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// `EINK_PROFILE`; `None` = pick from the panel (colour → fast-color).
+    pub profile: Option<Profile>,
+    /// `EINK_BACKEND` = auto | qtfb | blight | mem.
+    pub backend: String,
+    /// `EINK_SCALE`: egui pixels-per-point. The panels are 226–264 dpi, so 2.
+    pub scale: f32,
+    /// `EINK_FEATHER` = 0|1 overrides the profile's anti-aliasing default.
+    pub feather: Option<bool>,
+    /// `EINK_TRACE=1`: print every refresh decision.
+    pub trace: bool,
+    /// `EINK_TOUCH`: calibration flags for raw evdev input.
+    pub touch: Transform,
+    /// `EINK_FAST_WAVEFORM`: what "fast" means on the device (ufast|fast|animate).
+    pub fast_waveform: Option<String>,
+    /// `EINK_SETTLE_MS`: quiet time before the clean-up refresh.
+    pub settle: Duration,
+    /// `EINK_MIN_FRAME_MS`: floor between frames an app's animation can force.
+    pub min_frame: Duration,
+    /// `EINK_THREADS`: raster workers.
+    pub threads: usize,
+    /// mem backend: `EINK_MEM_SIZE=WxH`, `EINK_DUMP=dir`.
+    pub mem_size: (u32, u32),
+    pub dump: Option<String>,
+}
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.trim().is_empty())
+}
+
+impl Config {
+    pub fn from_env() -> Result<Config, String> {
+        let profile = match env("EINK_PROFILE") {
+            Some(s) => Some(Profile::parse(&s).ok_or_else(|| format!("EINK_PROFILE={s:?}: want fast-color|fast-mono|quality"))?),
+            None => None,
+        };
+        let touch = Transform::parse(&env("EINK_TOUCH").unwrap_or_default())?;
+        let num = |k: &str, d: u64| env(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+        let mem_size = env("EINK_MEM_SIZE")
+            .and_then(|s| s.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))))
+            .unwrap_or((702, 936));
+        Ok(Config {
+            profile,
+            backend: env("EINK_BACKEND").unwrap_or_else(|| "auto".into()),
+            scale: env("EINK_SCALE").and_then(|v| v.parse().ok()).unwrap_or(2.0),
+            feather: env("EINK_FEATHER").map(|v| v == "1"),
+            trace: env("EINK_TRACE").as_deref() == Some("1"),
+            touch,
+            fast_waveform: env("EINK_FAST_WAVEFORM"),
+            settle: Duration::from_millis(num("EINK_SETTLE_MS", 450)),
+            min_frame: Duration::from_millis(num("EINK_MIN_FRAME_MS", 120)),
+            threads: num("EINK_THREADS", std::thread::available_parallelism().map(|n| n.get() as u64).unwrap_or(2)) as usize,
+            mem_size,
+            dump: env("EINK_DUMP"),
+        })
+    }
+}
