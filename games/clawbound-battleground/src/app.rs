@@ -560,6 +560,10 @@ fn handle_window_event(s: &mut AppState, event: WindowEvent) {
 /// is applied in the fixed-step loop.
 fn gather_controls(s: &mut AppState, dt: f32) {
     s.pad_state = s.pad.poll();
+    // BEFORE tick, which reads it. `enabled` and `scale` are copied after
+    // tick below and get away with it because tick does not use them; glide
+    // it does, so copying it after would apply a changed setting a frame late.
+    s.touch.glide = s.cfg.settings.touch_glide;
     s.touch.tick(dt);
     s.touch.enabled = s.cfg.settings.touch_enabled;
     s.touch.scale = s.cfg.settings.touch_scale;
