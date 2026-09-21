@@ -68,6 +68,8 @@ pub mod track_points;
 pub mod wake;
 #[cfg(test)]
 mod abundance_tests;
+#[cfg(test)]
+mod fixture_tests;
 pub mod touchup_job;
 pub mod mixer_panel;
 pub mod morph_pad;
