@@ -70,6 +70,8 @@ pub mod testkit;
 pub mod stabilize;
 /// Touch-up: a ticket for one shot becomes a fixed version of it, with handles and a report.
 pub mod touchup;
+/// Match-move rig: track points sharing one rigid transform, surviving points that disappear.
+pub mod tracker;
 /// Clip style transfer: fit one clip's look onto another, baked into a 3D LUT for live use.
 pub mod style;
 /// Cut on action: the performer's movement accents within a shot, camera motion cancelled.
