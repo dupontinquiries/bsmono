@@ -163,7 +163,18 @@ mod tests {
     #[test]
     fn a_claim_naming_nobody_registered_is_unknown_not_an_error() {
         let r = resolve("Hey Zorblax here", &list(), &Acoustic::none());
-        assert_eq!(r, Resolution::UnknownName("Zorblax".into()));
+        // LOWERCASE, because that is `parse_claim`'s documented contract, not
+        // an accident: the shared `src/speaker_claim.rs` matches on the
+        // lowercased utterance and says so -- "i'm Kessler open terminal" ->
+        // name = "kessler" -- keeping original casing only for the REMAINDER.
+        //
+        // I wrote this test expecting "Zorblax" without checking what the
+        // dependency returns, and it had been failing ever since. Fixed here
+        // rather than in the parser because that file is shared verbatim with
+        // the Qt app. If the view wants to DISPLAY a capitalised name, that is
+        // a presentation choice for the view to make, not a reason to change
+        // the parser's matching form under the other frontend.
+        assert_eq!(r, Resolution::UnknownName("zorblax".into()));
     }
 
     /// TWO SPEAKERS SHARING A NAME must not resolve to either — crediting the
@@ -177,6 +188,20 @@ mod tests {
             ("id_2".into(), "Sam".into(), "#000".into()),
         ]);
         let r = resolve("Hey Sam here", &dup, &Acoustic::none());
-        assert_eq!(r, Resolution::UnknownName("Sam".into()));
+        // Lowercase for the same reason as above: parse_claim's contract.
+        assert_eq!(r, Resolution::UnknownName("sam".into()));
+
+        // THE CONTROL. `UnknownName` is also what an unmatched name returns, so
+        // on its own the assertion above cannot tell "ambiguity correctly
+        // refused" from "the name never matched at all". With ONE Sam the same
+        // utterance must resolve -- which pins that it was the DUPLICATE, and
+        // not a matching failure, that produced unknown.
+        let one = SpeakerList::from_entries(vec![
+            ("id_1".into(), "Sam".into(), "#fff".into()),
+        ]);
+        match resolve("Hey Sam here", &one, &Acoustic::none()) {
+            Resolution::Claimed { speaker_id, .. } => assert_eq!(speaker_id, "id_1"),
+            other => panic!("a single Sam must resolve, got {other:?}"),
+        }
     }
 }

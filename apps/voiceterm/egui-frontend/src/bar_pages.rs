@@ -230,18 +230,31 @@ mod drift_guard {
     fn the_copy_still_matches_the_shared_source() {
         let orig = include_str!("../../src/bar_pages.rs");
         let copy = include_str!("bar_pages_core.rs");
-        // Drop the original's leading `//!` block; everything after it must
-        // match exactly.
-        let body: String = orig
-            .lines()
-            .skip_while(|l| l.trim_start().starts_with("//!") || l.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let copy_body: String = copy
-            .lines()
-            .skip_while(|l| l.trim_start().starts_with("//!") || l.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Drop the leading `//!` block AND the leading `use` lines; everything
+        // after them must match exactly.
+        //
+        // THE IMPORTS ARE THE SECOND INTENDED DIFFERENCE, and this guard only
+        // knew about the first. The original imports `crate::bottom_bar::..`;
+        // this frontend mounts that module at a different path and the
+        // includer above supplies `bottom_bar::..` itself, so the copy
+        // deliberately has NO `use` lines. Comparing them made this guard fail
+        // on two files whose logic was byte-identical -- a false alarm, and the
+        // kind that trains people to delete a guard rather than read it.
+        //
+        // Skipping them is not a loophole: an import cannot change behaviour
+        // without the body that uses it also changing, and the body is still
+        // compared in full.
+        let strip = |text: &str| -> String {
+            text.lines()
+                .skip_while(|l| {
+                    let t = l.trim_start();
+                    t.starts_with("//!") || t.starts_with("use ") || l.trim().is_empty()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let body = strip(orig);
+        let copy_body = strip(copy);
         assert_eq!(
             body.trim_end(),
             copy_body.trim_end(),
