@@ -67,6 +67,9 @@ pub struct ShellView {
     /// a feedback loop, seen live in nested cosmic-comp. Only the
     /// simulator's fake cursor turns this on.
     pub pointer_pad: bool,
+    /// The bar is drawn on its own surface (`bar_ui`), not in the overlay.
+    /// The layer runtime sets this; the simulator keeps it off.
+    pub bar_surface: bool,
     owners: Vec<(i32, Owner)>,
     touch_seen: bool,
     mouse_down: bool,
@@ -132,7 +135,7 @@ impl ShellView {
             || shell.peek_dx.abs() > 1.0
             || shell.modes.trackpad
             || shell.carousel.is_active()
-            || shell.prefs.layout == Layout::RightBar
+            || (shell.prefs.layout == Layout::RightBar && !self.bar_surface)
             || self.sheet.open
             || self.show_trace
     }
@@ -151,11 +154,23 @@ impl ShellView {
         if shell.modes.trackpad {
             v.push(Self::pad_rect(size, Self::bar_width(shell)));
         }
-        if shell.prefs.layout == Layout::RightBar {
+        if shell.prefs.layout == Layout::RightBar && !self.bar_surface {
             let bw = Self::bar_width(shell);
             v.push(Rect::from_min_size(Pos2::new(size.x - bw, 0.0), Vec2::new(bw, size.y)));
         }
         Some(v)
+    }
+
+    /// Width the bar's surface should have right now (expanded or not), and
+    /// the exclusive zone it reserves (always the collapsed width).
+    pub fn bar_geometry(shell: &Shell) -> Option<(u32, i32)> {
+        (shell.prefs.layout == Layout::RightBar).then(|| (Self::bar_width(shell).round() as u32, shell.prefs.bar_width.round() as i32))
+    }
+
+    /// Draw the bar filling this `Ui` (its own layer surface).
+    pub fn bar_ui(&mut self, ui: &mut egui::Ui, shell: &mut Shell, pal: &PaletteColors, info: &FrameInfo) -> Vec<Action> {
+        let area = ui.max_rect();
+        self.bar(ui, shell, pal, info, area.min, area.size())
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, shell: &mut Shell, pal: &PaletteColors, info: &FrameInfo) -> Vec<Action> {
@@ -172,7 +187,7 @@ impl ShellView {
         let to = |x: f32, y: f32| origin + Vec2::new(x, y);
 
         // Bottom layer first: bar, then overlays above it.
-        if shell.prefs.layout == Layout::RightBar {
+        if shell.prefs.layout == Layout::RightBar && !self.bar_surface {
             out.extend(self.bar(ui, shell, pal, info, origin, size));
         }
         if shell.modes.trackpad {
@@ -810,6 +825,22 @@ mod tests {
         assert!(r[0].contains(Pos2::new(200.0, 800.0)) && !r[0].contains(Pos2::new(200.0, 100.0)));
         sh.open_switcher();
         assert_eq!(view.input_rects(&sh), None, "switcher is modal: whole screen");
+    }
+
+    #[test]
+    fn bar_on_its_own_surface_frees_the_overlay() {
+        use tideshell_core::prefs::{Layout, ShellPrefs};
+        let mut view = ShellView::default();
+        view.bar_surface = true;
+        let mut p = ShellPrefs::default();
+        p.layout = Layout::RightBar;
+        let mut sh = Shell::new(p, (408.0, 900.0));
+        assert!(!view.needs_overlay(&sh), "idle right-bar shell: bar surface only, no overlay");
+        assert_eq!(view.input_rects(&sh), Some(vec![]));
+        assert_eq!(ShellView::bar_geometry(&sh), Some((64, 64)));
+        sh.set_bar_expanded(true);
+        let (w, reserve) = ShellView::bar_geometry(&sh).unwrap();
+        assert!(w > 64 && reserve == 64, "expanding widens the surface, not the reservation: {w} {reserve}");
     }
 
     #[test]

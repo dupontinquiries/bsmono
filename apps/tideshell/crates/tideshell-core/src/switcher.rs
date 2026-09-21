@@ -237,7 +237,7 @@ mod tests {
     use super::*;
 
     fn win(id: u64, activated: bool) -> WindowCard {
-        WindowCard { id, title: format!("w{id}"), app_id: format!("app{id}"), activated, maximized: false }
+        WindowCard { id, title: format!("w{id}"), app_id: format!("app{id}"), activated, maximized: false, width: None }
     }
 
     /// Three windows, activated in order 1, 2, 3 → MRU [3, 2, 1].

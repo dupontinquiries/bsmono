@@ -149,6 +149,7 @@ fn main() {
         persist,
     };
     sb.view.show_trace = has("--trace");
+    sb.view.bar_surface = true;
     // A previous run that died with the fat cursor on left cosmic-comp's
     // cursor hidden; put the user's setting back before anything else.
     if let Some(o) = effects::cosmic_config_home().and_then(|h| effects::recover_system_cursor(&h)) {
@@ -169,6 +170,12 @@ fn main() {
     let palette = uikit_egui::palette_colors_ctx(&ctx, &ui_prefs.palette);
     // Transparent panels: the overlay composites over the apps.
     ctx.global_style_mut(|s| s.visuals.panel_fill = egui::Color32::TRANSPARENT);
+    // The bar's surface has its own egui context (own textures, own input).
+    let bar_ctx = egui::Context::default();
+    uikit_egui::apply_prefs(&bar_ctx, &ui_prefs);
+    let _ = uikit_egui::palette_colors_ctx(&bar_ctx, &ui_prefs.palette);
+    let mut bar_events: Vec<egui::Event> = Vec::new();
+    let mut bar_pos: HashMap<i32, Pos2> = HashMap::new();
 
     let t0 = Instant::now();
     let mut overlay_events: Vec<egui::Event> = Vec::new();
@@ -198,6 +205,21 @@ fn main() {
         let mut actions = Vec::new();
         for ev in input {
             match ev {
+                // The bar is a widget surface, not an edge: its input goes to
+                // its own egui context (it owns the right edge; see prefs).
+                Input::Down { role: Role::Bar, slot, x, y, .. } => {
+                    bar_pos.insert(slot, Pos2::new(x, y));
+                    bar_events.extend(contact_events(slot, egui::TouchPhase::Start, Pos2::new(x, y)));
+                }
+                Input::Move { role: Role::Bar, slot, x, y, .. } => {
+                    bar_pos.insert(slot, Pos2::new(x, y));
+                    bar_events.extend(contact_events(slot, egui::TouchPhase::Move, Pos2::new(x, y)));
+                }
+                Input::Up { role: Role::Bar, slot, .. } => {
+                    let pos = bar_pos.remove(&slot).unwrap_or(Pos2::ZERO);
+                    bar_events.extend(contact_events(slot, egui::TouchPhase::End, pos));
+                }
+                Input::Hover { role: Role::Bar, x, y } => bar_events.push(egui::Event::PointerMoved(Pos2::new(x, y))),
                 Input::Down { role: Role::Overlay, slot, x, y, .. } => {
                     contact_pos.insert(slot, Pos2::new(x, y));
                     overlay_events.extend(contact_events(slot, egui::TouchPhase::Start, Pos2::new(x, y)));
@@ -238,10 +260,53 @@ fn main() {
             sb.poll_world();
         }
 
+        // Bar: its own surface with an exclusive zone (right-bar layout only).
+        let geom = ShellView::bar_geometry(&sb.shell);
+        io.ensure_bar(geom.is_some(), geom.map_or(0, |g| g.0), geom.map_or(0, |g| g.1));
+        let bar_now = io.bar().map(|(s, sz, sc)| (s.clone(), sz, sc));
+        // Maximized windows still laid out under the bar get re-maximized
+        // (see Shell::reflow_for_zone for why cosmic-comp needs this).
+        if let (Some(_), Some((_, reserve))) = (&bar_now, geom) {
+            let out = sb.shell.reflow_for_zone(reserve as f32);
+            sb.execute(out);
+        }
+        match bar_now {
+            Some((surface, (w, h), scale)) => {
+                surface.set_buffer_scale(scale);
+                let size_px = (w as i32 * scale, h as i32 * scale);
+                if gl.bind(Role::Bar, &surface, size_px).is_ok() {
+                    let mut raw = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w as f32, h as f32))),
+                        time: Some(t0.elapsed().as_secs_f64()),
+                        events: std::mem::take(&mut bar_events),
+                        focused: true,
+                        ..Default::default()
+                    };
+                    raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(scale as f32);
+                    let info = FrameInfo { apps: &apps, clock: clock(), battery: None };
+                    let mut bar_actions = Vec::new();
+                    let out = bar_ctx.run_ui(raw, |ui| {
+                        egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
+                            bar_actions = sb.view.bar_ui(ui, &mut sb.shell, &palette, &info);
+                        });
+                    });
+                    sb.execute(bar_actions);
+                    let prims = bar_ctx.tessellate(out.shapes, out.pixels_per_point);
+                    if let Err(e) = gl.paint(Role::Bar, size_px, out.pixels_per_point, &prims, &out.textures_delta) {
+                        eprintln!("tideshell: bar: {e}");
+                    }
+                }
+            }
+            None => {
+                gl.unbind(Role::Bar);
+                bar_events.clear();
+            }
+        }
+
         // Overlay: map/unmap, input region, frame.
         let want = sb.view.needs_overlay(&sb.shell);
         if !want {
-            gl.unbind();
+            gl.unbind(Role::Overlay);
             io.ensure_overlay(false);
             last_region = None;
             overlay_events.clear();
@@ -258,7 +323,7 @@ fn main() {
         let Some((surface, (w, h), scale)) = io.overlay().map(|(s, sz, sc)| (s.clone(), sz, sc)) else { continue };
         surface.set_buffer_scale(scale);
         let size_px = (w as i32 * scale, h as i32 * scale);
-        if let Err(e) = gl.bind(&surface, size_px) {
+        if let Err(e) = gl.bind(Role::Overlay, &surface, size_px) {
             eprintln!("tideshell: {e}");
             continue;
         }
@@ -291,7 +356,7 @@ fn main() {
             CursorWant::Shape(shape_for(out.platform_output.cursor_icon))
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
-        if let Err(e) = gl.paint(size_px, out.pixels_per_point, &prims, &out.textures_delta) {
+        if let Err(e) = gl.paint(Role::Overlay, size_px, out.pixels_per_point, &prims, &out.textures_delta) {
             eprintln!("tideshell: {e}");
         }
     }

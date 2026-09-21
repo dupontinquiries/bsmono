@@ -89,6 +89,9 @@ pub enum Role {
     Bottom,
     Right,
     Overlay,
+    /// The right-hand bar: its own surface on the Top layer, with an
+    /// exclusive zone so maximized windows are laid out beside it.
+    Bar,
 }
 
 /// Input in surface-local logical coordinates; `Io::to_screen` maps it.
@@ -107,6 +110,7 @@ pub enum Input {
 pub fn strip_to_screen(role: Role, x: f32, y: f32, screen: (f32, f32), strip: (f32, f32)) -> (f32, f32) {
     match role {
         Role::Top | Role::Overlay => (x, y),
+        Role::Bar => (x + screen.0 - strip.0, y),
         Role::Bottom => (x, y + screen.1 - strip.1),
         Role::Right => (x + screen.0 - strip.0, y),
     }
@@ -184,6 +188,8 @@ pub struct Io {
     /// Tint the strips so they can be seen (`TIDESHELL_SHOW_STRIPS=1`).
     pub show_strips: bool,
     right_enabled: bool,
+    /// (surface width, exclusive zone) for the bar.
+    bar_size: (u32, i32),
 }
 
 impl Io {
@@ -211,7 +217,7 @@ impl Io {
             overlay_cursor: CursorWant::Shape(Shape::Default),
             applied: None,
         };
-        let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, strip_px, show_strips, right_enabled: false };
+        let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, strip_px, show_strips, right_enabled: false, bar_size: (0, 0) };
         for r in [Role::Top, Role::Bottom, Role::Right] {
             io.create(r);
         }
@@ -225,19 +231,29 @@ impl Io {
 
     fn create(&mut self, role: Role) {
         let wl = self.compositor.create_surface(&self.qh, ());
-        let layer = self.layer_shell.get_layer_surface(&wl, None, zwlr_layer_shell_v1::Layer::Overlay, "tideshell".into(), &self.qh, ());
+        // Strips and overlay sit above everything (including fullscreen apps);
+        // the bar is ordinary panel furniture on the Top layer.
+        let layer_kind = if role == Role::Bar { zwlr_layer_shell_v1::Layer::Top } else { zwlr_layer_shell_v1::Layer::Overlay };
+        let layer = self.layer_shell.get_layer_surface(&wl, None, layer_kind, "tideshell".into(), &self.qh, ());
         let px = self.strip_px;
         let (anchor, size) = match role {
             Role::Top => (Anchor::Top | Anchor::Left | Anchor::Right, (0, px)),
             Role::Bottom => (Anchor::Bottom | Anchor::Left | Anchor::Right, (0, px)),
             Role::Right => (Anchor::Top | Anchor::Bottom | Anchor::Right, (if self.right_enabled { px } else { 1 }, 0)),
             Role::Overlay => (Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right, (0, 0)),
+            Role::Bar => (Anchor::Top | Anchor::Bottom | Anchor::Right, (self.bar_size.0.max(1), 0)),
         };
         layer.set_anchor(anchor);
         layer.set_size(size.0, size.1);
         // -1: ignore other surfaces' exclusive zones, so strips sit on the
         // true screen edge even under a panel, and the overlay is fullscreen.
-        layer.set_exclusive_zone(-1);
+        if role == Role::Bar {
+            // Reserve the collapsed width only: expanding overlaps windows
+            // (a drawer), it does not reflow them on every expand.
+            layer.set_exclusive_zone(self.bar_size.1);
+        } else {
+            layer.set_exclusive_zone(-1);
+        }
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         wl.commit();
         self.st.surfs.push(Surf { role, wl, layer, size: (0, 0), configured: false, fresh: false, scale: 1, closed: false });
@@ -306,6 +322,36 @@ impl Io {
         }
     }
 
+    /// Map/resize or unmap the bar. `width` is the drawn width (expanded or
+    /// not), `reserve` the exclusive zone (the collapsed width).
+    pub fn ensure_bar(&mut self, on: bool, width: u32, reserve: i32) {
+        let have = self.surf(Role::Bar).is_some();
+        if !on {
+            if let Some(i) = self.st.surfs.iter().position(|s| s.role == Role::Bar) {
+                let s = self.st.surfs.remove(i);
+                s.layer.destroy();
+                s.wl.destroy();
+            }
+            return;
+        }
+        let changed = self.bar_size != (width, reserve);
+        self.bar_size = (width, reserve);
+        if !have {
+            self.create(Role::Bar);
+        } else if changed {
+            if let Some(s) = self.surf(Role::Bar) {
+                s.layer.set_size(width.max(1), 0);
+                s.layer.set_exclusive_zone(reserve);
+                s.wl.commit();
+            }
+        }
+    }
+
+    /// The bar's surface, logical size and buffer scale, once configured.
+    pub fn bar(&self) -> Option<(&WlSurface, (u32, u32), i32)> {
+        self.surf(Role::Bar).filter(|s| s.configured && s.size.0 > 0).map(|s| (&s.wl, s.size, s.scale))
+    }
+
     /// The overlay's surface, logical size and buffer scale, once configured.
     pub fn overlay(&self) -> Option<(&WlSurface, (u32, u32), i32)> {
         self.surf(Role::Overlay).filter(|s| s.configured && s.size.0 > 0).map(|s| (&s.wl, s.size, s.scale))
@@ -353,7 +399,7 @@ impl Io {
             })
             .collect();
         for (role, size) in fresh {
-            if role != Role::Overlay {
+            if !matches!(role, Role::Overlay | Role::Bar) {
                 self.attach_strip_buffer(role, size)?;
             }
         }
@@ -548,15 +594,23 @@ impl Dispatch<WlTouch, ()> for State {
 
 // ---- EGL + egui_glow -------------------------------------------------------------
 
-/// egui painted with egui_glow into an EGL window surface on a wl_surface.
+/// egui through egui_glow on EGL: one EGL context, one window + painter per
+/// surface. Each egui::Context has its own texture ids (font atlas, images),
+/// so two surfaces sharing one Painter would mix up textures; hence a
+/// painter per role, all on the same GL context.
 pub struct Gl {
     egl: egl::Instance<egl::Static>,
     display: egl::Display,
     config: egl::Config,
     context: egl::Context,
     glow: Option<Arc<glow::Context>>,
-    painter: Option<egui_glow::Painter>,
+    surfs: HashMap<Role, GlSurf>,
+}
+
+#[derive(Default)]
+struct GlSurf {
     win: Option<(wayland_egl::WlEglSurface, egl::Surface, (i32, i32))>,
+    painter: Option<egui_glow::Painter>,
 }
 
 impl Gl {
@@ -573,62 +627,66 @@ impl Gl {
         let context = egl
             .create_context(display, config, None, &[egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE])
             .map_err(|e| format!("eglCreateContext: {e}"))?;
-        Ok(Gl { egl, display, config, context, glow: None, painter: None, win: None })
+        Ok(Gl { egl, display, config, context, glow: None, surfs: HashMap::new() })
     }
 
-    /// Bind to a surface of `size_px` physical pixels, (re)creating the EGL
-    /// window if the surface or size changed.
-    pub fn bind(&mut self, surface: &WlSurface, size_px: (i32, i32)) -> Result<(), String> {
-        if let Some((w, _, sz)) = &self.win {
-            if w.ptr().is_null() {
-                self.unbind();
-            } else if *sz != size_px {
+    /// Bind `role`'s surface at `size_px` physical pixels, (re)creating its
+    /// EGL window if needed, and make it current.
+    pub fn bind(&mut self, role: Role, surface: &WlSurface, size_px: (i32, i32)) -> Result<(), String> {
+        let gs = self.surfs.entry(role).or_default();
+        if let Some((w, _, sz)) = &mut gs.win {
+            if *sz != size_px {
                 w.resize(size_px.0, size_px.1, 0, 0);
-                if let Some(win) = &mut self.win {
-                    win.2 = size_px;
-                }
+                *sz = size_px;
             }
         }
-        if self.win.is_none() {
+        if gs.win.is_none() {
             let w = wayland_egl::WlEglSurface::new(surface.id(), size_px.0, size_px.1).map_err(|e| format!("wl_egl_window: {e:?}"))?;
-            let s = unsafe { self.egl.create_window_surface(self.display, self.config, w.ptr() as egl::NativeWindowType, None) }
+            let es = unsafe { self.egl.create_window_surface(self.display, self.config, w.ptr() as egl::NativeWindowType, None) }
                 .map_err(|e| format!("eglCreateWindowSurface: {e}"))?;
-            self.win = Some((w, s, size_px));
+            gs.win = Some((w, es, size_px));
         }
-        let s = self.win.as_ref().unwrap().1;
-        self.egl.make_current(self.display, Some(s), Some(s), Some(self.context)).map_err(|e| format!("eglMakeCurrent: {e}"))?;
+        let es = gs.win.as_ref().unwrap().1;
+        self.egl.make_current(self.display, Some(es), Some(es), Some(self.context)).map_err(|e| format!("eglMakeCurrent: {e}"))?;
         // Never block in swap: the loop paces itself, and a hidden surface
         // would otherwise stall the whole shell waiting for a frame callback.
         let _ = self.egl.swap_interval(self.display, 0);
-        if self.painter.is_none() {
+        if self.glow.is_none() {
             let egl = &self.egl;
             let gl = unsafe {
                 glow::Context::from_loader_function(|name| egl.get_proc_address(name).map_or(std::ptr::null(), |p| p as *const c_void))
             };
-            let gl = Arc::new(gl);
-            let painter = egui_glow::Painter::new(gl.clone(), "", None, false).map_err(|e| format!("egui_glow: {e}"))?;
-            self.glow = Some(gl);
-            self.painter = Some(painter);
+            self.glow = Some(Arc::new(gl));
+        }
+        let gs = self.surfs.get_mut(&role).unwrap();
+        if gs.painter.is_none() {
+            let gl = self.glow.clone().unwrap();
+            gs.painter = Some(egui_glow::Painter::new(gl, "", None, false).map_err(|e| format!("egui_glow: {e}"))?);
         }
         Ok(())
     }
 
-    /// Drop the EGL window (overlay unmapped). The context and painter stay,
-    /// so the next map does not recompile shaders or re-upload the font atlas.
-    pub fn unbind(&mut self) {
-        let _ = self.egl.make_current(self.display, None, None, Some(self.context));
-        if let Some((_w, s, _)) = self.win.take() {
-            let _ = self.egl.destroy_surface(self.display, s);
+    /// Drop `role`'s EGL window (surface unmapped). Its painter stays, so the
+    /// next map does not recompile shaders or re-upload the font atlas.
+    pub fn unbind(&mut self, role: Role) {
+        if let Some(gs) = self.surfs.get_mut(&role) {
+            if let Some((_w, es, _)) = gs.win.take() {
+                let _ = self.egl.make_current(self.display, None, None, Some(self.context));
+                let _ = self.egl.destroy_surface(self.display, es);
+            }
         }
     }
 
-    pub fn paint(&mut self, size_px: (i32, i32), ppp: f32, prims: &[egui::ClippedPrimitive], tex: &egui::TexturesDelta) -> Result<(), String> {
-        let painter = self.painter.as_mut().ok_or("paint before bind")?;
+    /// Paint into `role`'s surface; `bind(role, ..)` must have been called
+    /// this frame (it makes the surface current).
+    pub fn paint(&mut self, role: Role, size_px: (i32, i32), ppp: f32, prims: &[egui::ClippedPrimitive], tex: &egui::TexturesDelta) -> Result<(), String> {
+        let gs = self.surfs.get_mut(&role).ok_or("paint before bind")?;
+        let painter = gs.painter.as_mut().ok_or("paint before bind")?;
         let sz = [size_px.0 as u32, size_px.1 as u32];
         painter.clear(sz, [0.0, 0.0, 0.0, 0.0]);
         painter.paint_and_update_textures(sz, ppp, prims, tex);
-        let s = self.win.as_ref().ok_or("no window")?.1;
-        self.egl.swap_buffers(self.display, s).map_err(|e| format!("eglSwapBuffers: {e}"))
+        let es = gs.win.as_ref().ok_or("no window")?.1;
+        self.egl.swap_buffers(self.display, es).map_err(|e| format!("eglSwapBuffers: {e}"))
     }
 }
 

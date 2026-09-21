@@ -130,7 +130,7 @@ mod tests {
     use super::*;
 
     fn w(id: u64, max: bool) -> WindowCard {
-        WindowCard { id, title: String::new(), app_id: String::new(), activated: false, maximized: max }
+        WindowCard { id, title: String::new(), app_id: String::new(), activated: false, maximized: max, width: None }
     }
 
     #[test]

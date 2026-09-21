@@ -17,6 +17,7 @@ pub fn to_card(t: &ToplevelInfo) -> WindowCard {
         app_id: t.app_id.clone(),
         activated: t.state.activated,
         maximized: t.state.maximized,
+        width: t.geometry.map(|g| g.2),
     }
 }
 

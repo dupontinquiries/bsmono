@@ -3,7 +3,7 @@
 //! from the public fields and calls the `on_*`/tap methods; transports execute
 //! the actions and report window state back through [`Shell::set_windows`].
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::bar::BarWidget;
 use crate::carousel::Carousel;
@@ -44,6 +44,9 @@ pub struct Shell {
     /// Live horizontal offset along the bottom edge (0 when not swiping).
     pub peek_dx: f32,
     windows: Vec<WindowCard>,
+    /// Last reflow request per window, so one the compositor will not
+    /// shrink cannot turn into an unmaximize/maximize loop.
+    reflow_at: HashMap<u64, Millis>,
     now: Millis,
     last_tick: Option<Millis>,
     trace: VecDeque<String>,
@@ -70,6 +73,7 @@ impl Shell {
             swipe_up: 0.0,
             peek_dx: 0.0,
             windows: Vec::new(),
+            reflow_at: HashMap::new(),
             now: 0,
             last_tick: None,
             trace: VecDeque::new(),
@@ -392,6 +396,41 @@ impl Shell {
         self.emit(out)
     }
 
+/// Minimum time between reflow requests for one window.
+    pub const REFLOW_COOLDOWN: Millis = 3000;
+
+    /// Re-maximize maximized windows that are laid out wider than the space
+    /// the right edge leaves (`reserve_right` px), so they move out from
+    /// under the bar. Call on every window update while the bar is mapped;
+    /// it only acts on windows that are actually wrong.
+    ///
+    /// Why: cosmic-comp epoch-1.8.0 does not re-lay-out an ALREADY maximized
+    /// window when a new exclusive zone appears (observed: the window's own
+    /// COSMIC geometry stayed 1280 wide with the 64 px bar up; one maximized
+    /// after the bar appeared got 1216; removing the bar re-grew it). A
+    /// one-shot reflow when the bar mapped was tried first and found nothing:
+    /// the window list and its maximized state arrive over several polls.
+    pub fn reflow_for_zone(&mut self, reserve_right: f32) -> Vec<Action> {
+        let limit = self.screen.0 - reserve_right + 1.0;
+        let now = self.now;
+        let ids: Vec<u64> = self
+            .windows
+            .iter()
+            .filter(|w| w.maximized && w.width.is_some_and(|wd| wd as f32 > limit))
+            .filter(|w| self.reflow_at.get(&w.id).is_none_or(|t| now.saturating_sub(*t) >= Self::REFLOW_COOLDOWN))
+            .map(|w| w.id)
+            .collect();
+        if ids.is_empty() {
+            return vec![];
+        }
+        for id in &ids {
+            self.reflow_at.insert(*id, now);
+        }
+        self.log(format!("reflow {} maximized window(s) wider than the bar leaves", ids.len()));
+        let out = ids.into_iter().flat_map(|id| [Action::SetMaximized(id, false), Action::SetMaximized(id, true)]).collect();
+        self.emit(out)
+    }
+
     /// The bar's own horizontal drag (it owns the right edge).
     pub fn set_bar_expanded(&mut self, on: bool) {
         if self.bar_expanded != on {
@@ -459,7 +498,7 @@ mod tests {
     const S: (f32, f32) = (408.0, 900.0);
 
     fn win(id: u64, activated: bool) -> WindowCard {
-        WindowCard { id, title: format!("w{id}"), app_id: format!("a{id}"), activated, maximized: false }
+        WindowCard { id, title: format!("w{id}"), app_id: format!("a{id}"), activated, maximized: false, width: None }
     }
 
     fn shell_with_three() -> Shell {
@@ -648,6 +687,29 @@ mod tests {
         let mut p = sh.prefs.clone();
         p.fat_cursor = false;
         assert!(sh.set_prefs(p).contains(&Action::HideSystemCursor(false)));
+    }
+
+    #[test]
+    fn reflow_only_touches_maximized_windows_too_wide_and_respects_cooldown() {
+        let mut sh = Shell::new(ShellPrefs::default(), (1280.0, 800.0));
+        let card = |id, maximized, width| WindowCard { maximized, width, ..win(id, false) };
+        sh.set_windows(vec![
+            card(1, true, Some(1280)),  // under the bar: reflow
+            card(2, true, Some(1216)),  // already beside it: leave
+            card(3, false, Some(1280)), // floating: not ours to resize
+            card(4, true, None),        // geometry unknown: wait
+        ]);
+        assert_eq!(sh.reflow_for_zone(64.0), vec![Action::SetMaximized(1, false), Action::SetMaximized(1, true)]);
+        // Compositor has not shrunk it yet: no repeat within the cooldown...
+        sh.tick(1000);
+        assert!(sh.reflow_for_zone(64.0).is_empty());
+        // ...but it is retried after.
+        sh.tick(Shell::REFLOW_COOLDOWN + 10);
+        assert_eq!(sh.reflow_for_zone(64.0).len(), 2);
+        // Once it is laid out right, nothing happens.
+        sh.set_windows(vec![card(1, true, Some(1216))]);
+        sh.tick(2 * Shell::REFLOW_COOLDOWN + 20);
+        assert!(sh.reflow_for_zone(64.0).is_empty());
     }
 
     #[test]

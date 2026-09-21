@@ -68,7 +68,7 @@ impl World {
     fn cards(&self) -> Vec<WindowCard> {
         self.wins
             .iter()
-            .map(|w| WindowCard { id: w.id, title: w.title.clone(), app_id: w.app_id.clone(), activated: self.active == Some(w.id), maximized: w.maximized })
+            .map(|w| WindowCard { id: w.id, title: w.title.clone(), app_id: w.app_id.clone(), activated: self.active == Some(w.id), maximized: w.maximized, width: None })
             .collect()
     }
 }

@@ -58,6 +58,8 @@ pub struct WindowCard {
     pub app_id: String,
     pub activated: bool,
     pub maximized: bool,
+    /// Width the compositor laid the window out at (COSMIC `geometry`), if known.
+    pub width: Option<i32>,
 }
 
 /// What the shell wants done. Transports execute these; the engine never
