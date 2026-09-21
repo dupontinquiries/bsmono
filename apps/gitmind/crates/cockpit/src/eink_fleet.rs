@@ -1663,13 +1663,9 @@ pub fn appload_remove_cmd(app: &str, appload_dir: &str) -> Result<String, String
 pub fn appload_manifest(opts: &AppLoadOptions, app: &str, model: Option<RmModel>, profile: RefreshProfile) -> String {
     let mut env = serde_json::Map::new();
     env.insert("EINK_BACKEND".into(), "qtfb".into());
-    // Fast profiles ask AppLoad for the fast waveform once drawing is under
-    // way; eink-kit falls back (reconnects without mode messages) if AppLoad
-    // drops the connection in reply, as it did on a Paper Pro when asked
-    // right after init.
-    if profile != RefreshProfile::Quality {
-        env.insert("EINK_QTFB_MODES".into(), "deferred".into());
-    }
+    // No EINK_QTFB_MODES: on a Paper Pro, AppLoad answers a refresh-mode
+    // request by closing the connection AND the window (every app vanished
+    // ~2 s in when this was on). AppLoad's own mode it is.
     // AppLoad-launched apps have no terminal: their stderr goes to the same
     // log `status` tails, so a failure to start is readable from the phone.
     env.insert("EINK_LOG".into(), log_path(app).into());
@@ -1706,6 +1702,17 @@ pub fn appload_install_cmd(app: &str, appload_dir: &str, manifest: &str) -> Resu
 pub enum Delivered {
     Launched(Outcome),
     Registered { manifest_dir: String },
+    /// A tool (see [`TOOLS`]): installed, not registered or launched.
+    Installed { path: String },
+}
+
+/// Tablet TOOLS: installed to gitmind's bin/, never registered with AppLoad
+/// or launched (alpine-run is the runner for the Alpine root; launched from
+/// AppLoad's sidebar it only printed its usage).
+pub const TOOLS: &[&str] = &["alpine-run"];
+
+pub fn is_tool(app: &str) -> bool {
+    TOOLS.contains(&app)
 }
 
 pub fn deliver(
@@ -1718,6 +1725,16 @@ pub fn deliver(
     appload: Option<(&AppLoadOptions, Option<&str>)>,
     on: &mut dyn FnMut(Event),
 ) -> Result<Delivered, String> {
+    if is_tool(app) {
+        check(app)?;
+        on(Event::Preparing);
+        remote.run(&prepare_cmd()).map_err(|e| format!("prepare: {e}"))?;
+        on(Event::Pushing { bytes: std::fs::metadata(local_bin).ok().map(|m| m.len()) });
+        remote.push(local_bin, &staging_path(app)).map_err(|e| format!("push: {e}"))?;
+        on(Event::Installing);
+        remote.run(&install_cmd(app)?).map_err(|e| format!("install: {e}"))?;
+        return Ok(Delivered::Installed { path: bin_path(app) });
+    }
     match route {
         Route::Blight => deploy_and_launch(remote, app, local_bin, env, args, 2, on).map(Delivered::Launched),
         Route::AppLoad { dir } => {
@@ -1909,7 +1926,14 @@ pub fn diagnose(text: &str) -> Vec<crate::finding::Finding> {
             .help("start xovi: `gitmind eink activate <host>`"),
             "qtfb.sock");
     }
-    if has("AppLoad closed the qtfb connection") {
+    if has("does not support refresh-mode messages") || has("AppLoad dropped the qtfb connection after SET_REFRESH_MODE") {
+        add(Finding::new(Error, "app-qtfb-modes-unsupported", "AppLoad closed the app's window when it asked for a faster refresh mode")
+            .note("this AppLoad tears down the window along with the connection, so the app cannot recover in place")
+            .help("remove EINK_QTFB_MODES from the app's manifest (redeploying with current gitmind does)")
+            .fix("sed -i 's/\"EINK_QTFB_MODES\": \"deferred\"/\"EINK_QTFB_MODES\": \"off\"/' /home/root/xovi/exthome/appload/*/external.manifest.json"),
+            if has("does not support refresh-mode messages") { "does not support refresh-mode messages" } else { "after SET_REFRESH_MODE" });
+    }
+    if has("AppLoad closed the qtfb connection") && !has("does not support refresh-mode messages") {
         add(Finding::new(Error, "app-qtfb-closed", "AppLoad closed the app's qtfb connection after it started")
             .note("seen on a Paper Pro when the app sent SET_REFRESH_MODE right after init; eink-kit no longer sends mode messages unless EINK_QTFB_MODES=1")
             .help("rebuild and redeploy with the current eink-kit; if it persists, run with EINK_TRACE=1 and send the app log plus `journalctl -n 100 | grep QTFB` from the tablet"),
@@ -2288,7 +2312,7 @@ mod tests {
         assert_eq!(v["environment"]["EINK_BACKEND"], "qtfb");
         assert_eq!(v["environment"]["EINK_PROFILE"], "fast-color");
         assert_eq!(v["environment"]["EINK_LOG"], "/home/root/.local/share/gitmind/log/eink-demo.log");
-        assert_eq!(v["environment"]["EINK_QTFB_MODES"], "deferred", "fast profiles request the fast waveform, with fallback");
+        assert!(v["environment"].get("EINK_QTFB_MODES").is_none(), "no refresh-mode requests: AppLoad closes the window in reply");
     }
 
     #[test]
@@ -2560,6 +2584,19 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
         assert!(!wifi.iter().any(|f| f.code == "tablet-unreachable"), "refused is not 'did not answer'");
         let usb = diagnose("ssh: connect to host 10.11.99.1 port 22: Network unreachable");
         assert_eq!(usb[0].code, "tablet-no-network-path");
+    }
+
+    #[test]
+    fn the_refresh_mode_window_loss_is_explained_with_the_fix() {
+        // the real log line from ambient-learner-egui on the Paper Pro
+        let f = diagnose("eink: AppLoad dropped the qtfb connection after SET_REFRESH_MODE; reconnecting without mode messages");
+        assert_eq!(f[0].code, "app-qtfb-modes-unsupported");
+        assert!(f[0].fix.as_deref().unwrap().contains("\"off\""));
+    }
+
+    #[test]
+    fn tools_are_installed_not_registered() {
+        assert!(is_tool("alpine-run") && !is_tool("eink-demo"));
     }
 
     #[test]

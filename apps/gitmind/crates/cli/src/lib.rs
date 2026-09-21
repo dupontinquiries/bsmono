@@ -1514,6 +1514,10 @@ fn cmd_eink(rest: &[String]) -> i32 {
                     for f in ef::diagnose(&log_tail) { eprint!("\n{}", f.render()); }
                     1
                 }
+                Ok(ef::Delivered::Installed { path }) => {
+                    println!("installed tool {path} (not an app: no AppLoad entry)");
+                    0
+                }
                 Ok(ef::Delivered::Registered { manifest_dir }) => {
                     println!("{name} installed for AppLoad ({manifest_dir}); on the tablet open AppLoad from the sidebar and tap ↻ once");
                     if activation.is_some() {

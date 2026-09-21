@@ -430,6 +430,8 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 match res {
                     Ok(ef::Delivered::Launched(ef::Outcome::Running { pid })) => format!("{name} running (pid {pid}, {})", profile.as_env()),
                     Ok(ef::Delivered::Launched(ef::Outcome::ExitedEarly { log_tail })) => format!("{name} exited right after launch:\n{log_tail}"),
+                    Ok(ef::Delivered::Installed { path }) =>
+                        format!("installed tool {path} (not an app: no AppLoad entry)"),
                     Ok(ef::Delivered::Registered { .. }) if activation.is_some() =>
                         format!("{name} installed — activate xovi (above), then open AppLoad in the tablet's sidebar"),
                     Ok(ef::Delivered::Registered { .. }) =>

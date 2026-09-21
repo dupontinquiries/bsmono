@@ -137,17 +137,9 @@ pub struct QtfbPresent {
     trace: bool,
     sent: u32,
     last: &'static str,
-    // for reconnecting to the same window
-    key: i32,
-    model: Model,
     mode: Mode,
-    input: InputSender,
-    /// Bumped on reconnect so the old reader thread exits quietly instead of
-    /// reporting the (deliberately) closed socket as the display going away.
-    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     plan: ModePlan,
     reset: bool,
-    socket_path: std::ffi::CString,
     /// Set by the reader when AppLoad hung up on the current connection.
     peer_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// A mode request is inside its blame window: the reader must not
@@ -236,20 +228,15 @@ impl QtfbPresent {
             trace,
             sent: 0,
             last: "INITIALIZE",
-            key,
-            model,
             mode,
-            input,
-            generation,
             plan,
             reset: false,
-            socket_path,
             peer_closed,
             in_flight,
         };
         eprintln!("eink: qtfb refresh mode: {}", match plan {
             ModePlan::Off => "AppLoad's default (EINK_QTFB_MODES=deferred to request the fast waveform)".to_string(),
-            ModePlan::Deferred { .. } => format!("{mode:?}, requested {}s after drawing starts; falls back if AppLoad drops the connection", DEFER.as_secs()),
+            ModePlan::Deferred { .. } => format!("{mode:?}, requested {}s after drawing starts (EXPERIMENT: the AppLoad on a Paper Pro closes the window in reply)", DEFER.as_secs()),
             _ => format!("{mode:?} immediately (EINK_QTFB_MODES=immediate)"),
         });
         if plan == ModePlan::Immediate {
@@ -270,28 +257,6 @@ impl QtfbPresent {
         self.send(&m, &format!("{:?}", self.mode))
     }
 
-    /// Reconnect to the same window after AppLoad dropped us, with mode
-    /// messages off for good. The window survives (AppLoad keeps its
-    /// controller); the shared buffer is new, so the next frame redraws all.
-    fn reconnect_without_modes(&mut self) -> io::Result<()> {
-        eprintln!("eink: AppLoad dropped the qtfb connection after SET_REFRESH_MODE; reconnecting without mode messages");
-        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        unsafe {
-            libc::munmap(self.shm.cast(), self.shm_len);
-            libc::close(self.fd);
-        }
-        self.peer_closed.store(false, std::sync::atomic::Ordering::SeqCst);
-        let flags = Flags { generation: self.generation.clone(), peer_closed: self.peer_closed.clone(), in_flight: self.in_flight.clone() };
-        let (fd, shm, shm_len) = open_window(&self.socket_path, self.key, self.model, &self.input, &flags)?;
-        (self.fd, self.shm, self.shm_len) = (fd, shm, shm_len);
-        self.in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
-        self.plan = ModePlan::Failed;
-        self.modes = false;
-        self.sent = 0;
-        self.last = "INITIALIZE";
-        self.reset = true;
-        Ok(())
-    }
 
     /// Send one message, counting and (EINK_TRACE=1) logging it. A broken
     /// connection is reported with how far it got, so a server that hangs up
@@ -309,8 +274,11 @@ impl QtfbPresent {
             }
             Err(e) if e.raw_os_error() == Some(libc::EPIPE)
                 && matches!(self.plan, ModePlan::Sent { at } if at.elapsed() < BLAME_WINDOW) => {
-                // The mode message is the prime suspect: fall back, keep running.
-                self.reconnect_without_modes()
+                // Seen on a Paper Pro: AppLoad destroys the WINDOW along with
+                // the connection, so a reconnect lands on nothing and the app
+                // lingers invisible. Say why and let the app exit.
+                self.plan = ModePlan::Failed;
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "AppLoad closed the window after SET_REFRESH_MODE: this AppLoad does not support refresh-mode messages (it tears the window down with the connection, so there is nothing to reconnect to). Run without EINK_QTFB_MODES."))
             }
             Err(e) if e.raw_os_error() == Some(libc::EPIPE) => Err(io::Error::new(io::ErrorKind::BrokenPipe, format!(
                 "AppLoad closed the qtfb connection (after {} message(s) since init, last {}; this one {name})",
@@ -450,8 +418,8 @@ impl Present for QtfbPresent {
         }
         match self.plan {
             ModePlan::Sent { at } if at.elapsed() < BLAME_WINDOW => {
-                self.reconnect_without_modes()?;
-                Ok(std::mem::take(&mut self.reset))
+                self.plan = ModePlan::Failed;
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "AppLoad closed the window after SET_REFRESH_MODE: this AppLoad does not support refresh-mode messages (it tears the window down with the connection, so there is nothing to reconnect to). Run without EINK_QTFB_MODES."))
             }
             _ => Err(io::Error::new(io::ErrorKind::BrokenPipe, "AppLoad closed the qtfb connection")),
         }
@@ -582,40 +550,41 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_connection_after_the_mode_request_falls_back_and_keeps_drawing() {
+    fn a_dropped_connection_after_the_mode_request_exits_with_the_reason() {
+        // AppLoad on a Paper Pro destroys the window with the connection: no
+        // reconnect (it would land on nothing), a clear error instead.
         if !std::path::Path::new("/dev/shm").is_dir() { return; }
         let f = fake_server(true);
         let hub = crate::present::InputHub::new().unwrap();
         let path = std::ffi::CString::new(f.path.to_string_lossy().as_bytes()).unwrap();
         let mut p = QtfbPresent::connect_with(path, 42, Model::PaperPro, Mode::Animate, hub.sender(), ModePlan::Deferred { after: None }).unwrap();
-        pump(&mut p, 3.2); // first update, 2 s defer, mode sent, server hangs up, reconnect
-        assert_eq!(p.plan, ModePlan::Failed, "mode messages off for good");
-        assert!(p.take_reset(), "the engine is told to redraw everything");
-        assert_eq!(f.connections.load(std::sync::atomic::Ordering::SeqCst), 2, "reconnected to the same window");
-        let before = f.updates.load(std::sync::atomic::Ordering::SeqCst);
-        pump(&mut p, 0.5);
-        assert!(f.updates.load(std::sync::atomic::Ordering::SeqCst) > before, "updates flow on the new connection");
-        assert!(hub.drain().iter().all(|i| !matches!(i, Input::Closed(_))), "the replaced socket is not reported as the display closing");
+        let t = std::time::Instant::now();
+        let mut err = None;
+        while t.elapsed() < std::time::Duration::from_secs(5) && err.is_none() {
+            if let Err(e) = p.commit(&[update(1)]).and_then(|_| p.poll().map(|_| ())) { err = Some(e); }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let e = err.expect("the drop is reported");
+        assert!(e.to_string().contains("does not support refresh-mode messages"), "{e}");
+        assert_eq!(f.connections.load(std::sync::atomic::Ordering::SeqCst), 1, "no reconnect");
+        assert!(hub.drain().iter().all(|i| !matches!(i, Input::Closed(_))), "the reason comes from the backend, not a bare 'closed'");
     }
 
     #[test]
-    fn an_idle_app_still_recovers_through_poll() {
+    fn an_idle_app_also_exits_with_the_reason() {
         if !std::path::Path::new("/dev/shm").is_dir() { return; }
         let f = fake_server(true);
         let hub = crate::present::InputHub::new().unwrap();
         let path = std::ffi::CString::new(f.path.to_string_lossy().as_bytes()).unwrap();
         let mut p = QtfbPresent::connect_with(path, 44, Model::PaperPro, Mode::Animate, hub.sender(), ModePlan::Immediate).unwrap();
-        // no more commits: only the run loop's poll can notice the hang-up
         let t = std::time::Instant::now();
-        let mut healed = false;
-        while t.elapsed() < std::time::Duration::from_secs(2) && !healed {
-            healed = p.poll().expect("poll must heal, not fail, inside the blame window");
+        let mut res = Ok(false);
+        while t.elapsed() < std::time::Duration::from_secs(2) {
+            res = p.poll();
+            if res.is_err() { break; }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(healed, "poll reconnected and asked for a redraw");
-        assert_eq!(p.plan, ModePlan::Failed);
-        assert!(hub.drain().iter().all(|i| !matches!(i, Input::Closed(_))), "no exit on the way");
-        p.commit(&[update(1)]).unwrap();
+        assert!(res.unwrap_err().to_string().contains("does not support refresh-mode messages"));
     }
 
     #[test]
