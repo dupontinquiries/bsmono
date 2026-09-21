@@ -96,6 +96,7 @@ impl Engine {
         let profile = cfg.profile.unwrap_or(if caps.color_panel { Profile::FastColor } else { Profile::FastMono });
         let mut policy = Policy::new(profile, IRect::from_size(caps.width, caps.height), caps.per_update_waveform);
         policy.settle = cfg.settle;
+        policy.full_every_pages = cfg.full_every_pages;
         let motion_color = cfg.motion_color;
         let hz = if motion_color { cfg.motion_color_hz } else { cfg.motion_hz }.max(0.2);
         policy.motion = crate::policy::MotionCfg { interval: Duration::from_secs_f32(1.0 / hz), color: motion_color };
@@ -276,6 +277,9 @@ impl Engine {
         if self.ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new(FULL_REFRESH_KEY))).unwrap_or(false) {
             self.policy.request_full();
         }
+        if self.ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new(PAGE_TURN_KEY))).unwrap_or(false) {
+            self.policy.page_turn();
+        }
 
         self.textures.apply_set(&full.textures_delta);
         let prims = self.ctx.tessellate(full.shapes, full.pixels_per_point);
@@ -365,6 +369,15 @@ impl Engine {
 }
 
 const FULL_REFRESH_KEY: &str = "eink.full_refresh";
+/// Stable key: an app sets `true` here (egui temp memory) in the frame its
+/// page changes. Written as a plain `bool` so apps need no eink-kit
+/// dependency; inert on a desktop.
+pub const PAGE_TURN_KEY: &str = "eink.page_turn";
+
+/// Announce that this frame shows a new page (see `Policy::page_turn`).
+pub fn page_turn(ctx: &Context) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(PAGE_TURN_KEY), true));
+}
 
 /// `EINK_PROBE_PIXEL=x,y`: print every triangle covering that pixel's
 /// centre, in paint order, each frame. For "why is that pixel that colour"

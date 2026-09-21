@@ -110,6 +110,11 @@ pub struct Policy {
     motion_pending_color: bool,
     next_motion_at: Duration,
     motion_region: IRect,
+    /// A page turn was announced for the next damage.
+    page_pending: bool,
+    pages: u32,
+    /// Every Nth page turn is a full refresh (clears accumulated ghosting).
+    pub full_every_pages: u32,
 }
 
 impl Policy {
@@ -130,6 +135,9 @@ impl Policy {
             motion_pending_color: false,
             next_motion_at: Duration::ZERO,
             motion_region: IRect::default(),
+            page_pending: false,
+            pages: 0,
+            full_every_pages: 6,
         }
     }
 
@@ -195,10 +203,31 @@ impl Policy {
         self.deadline.get_or_insert(Duration::ZERO);
     }
 
+    /// The next damage is a page turn: the whole content changes at once
+    /// and should land clean in ONE refresh, not a fast ghosty pass followed
+    /// by a settle 450 ms later. Every `full_every_pages`th turn is a full
+    /// refresh instead, the cadence e-ink readers use to clear ghosting.
+    pub fn page_turn(&mut self) {
+        self.page_pending = true;
+    }
+
     /// New damage from a frame.
     pub fn on_damage(&mut self, now: Duration, damage: &[Damage], interacting: bool) -> Vec<Update> {
         if damage.is_empty() {
             return Vec::new();
+        }
+        if std::mem::take(&mut self.page_pending) {
+            self.pages += 1;
+            // The page supersedes anything drawn fast before it.
+            self.pending = IRect::default();
+            self.pending_color = false;
+            self.deadline = None;
+            if self.full_every_pages > 0 && self.pages % self.full_every_pages == 0 {
+                return vec![Update { rect: self.screen, waveform: Waveform::Full, color: true, reason: "page turn: periodic full refresh" }];
+            }
+            let color = damage.iter().any(|d| d.color);
+            let rect = damage.iter().fold(IRect::default(), |a, d| a.union(&d.rect));
+            return vec![Update { rect, waveform: Waveform::Quality, color, reason: "page turn: one clean refresh" }];
         }
         if !self.per_update_waveform {
             let wf = if self.profile == Profile::Quality { Waveform::Quality } else { Waveform::Fast };
@@ -382,6 +411,31 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert_eq!((s[0].waveform, s[0].color), (Waveform::Quality, true));
         assert_eq!(s[0].rect, dmg(100, true).rect);
+    }
+
+    #[test]
+    fn a_page_turn_is_one_clean_refresh_even_mid_interaction() {
+        let mut p = Policy::new(Profile::FastColor, S, true);
+        // a fast press highlight before the turn
+        p.on_damage(ms(0), &[dmg(0, false)], true);
+        p.page_turn();
+        let u = p.on_damage(ms(50), &[dmg(0, false), dmg(500, true)], true);
+        assert_eq!(u.len(), 1, "one refresh for the page: {u:?}");
+        assert_eq!(u[0].waveform, Waveform::Quality);
+        assert!(u[0].color);
+        assert_eq!(u[0].rect, IRect::new(0, 0, 510, 10));
+        assert!(p.on_tick(ms(2000), false).is_empty(), "no second settle flash after a page turn");
+    }
+
+    #[test]
+    fn every_nth_page_turn_is_a_full_refresh() {
+        let mut p = Policy::new(Profile::FastColor, S, true);
+        p.full_every_pages = 3;
+        let kinds: Vec<Waveform> = (0..6u64).map(|i| {
+            p.page_turn();
+            p.on_damage(ms(i * 1000), &[dmg(0, false)], true)[0].waveform
+        }).collect();
+        assert_eq!(kinds, vec![Waveform::Quality, Waveform::Quality, Waveform::Full, Waveform::Quality, Waveform::Quality, Waveform::Full]);
     }
 
     #[test]

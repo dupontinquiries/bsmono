@@ -38,6 +38,8 @@ pub struct Config {
     pub dither: bool,
     pub mem_size: (u32, u32),
     pub dump: Option<String>,
+    /// `EINK_FULL_EVERY_PAGES`: full refresh every N page turns (0 = never).
+    pub full_every_pages: u32,
     /// `EINK_THEME=egui` keeps egui's own theme instead of the e-ink preset.
     pub eink_theme: bool,
 }
@@ -75,6 +77,7 @@ impl Config {
             mem_size,
             dump: env("EINK_DUMP"),
             eink_theme: env("EINK_THEME").as_deref() != Some("egui"),
+            full_every_pages: num("EINK_FULL_EVERY_PAGES", 6) as u32,
         })
     }
 }

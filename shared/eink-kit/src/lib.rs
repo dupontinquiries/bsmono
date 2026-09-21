@@ -35,4 +35,4 @@ pub mod touch;
 
 pub use egui;
 pub use motion::{hint, motion_interval, Hint};
-pub use engine::{diagnostics, request_full_refresh, run, EinkApp, Engine, FromCtx};
+pub use engine::{diagnostics, page_turn, request_full_refresh, run, EinkApp, Engine, FromCtx};
