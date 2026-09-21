@@ -263,7 +263,7 @@ fn main() {
         // Bar: its own surface with an exclusive zone (right-bar layout only).
         let geom = ShellView::bar_geometry(&sb.shell);
         io.ensure_bar(geom.is_some(), geom.map_or(0, |g| g.0), geom.map_or(0, |g| g.1));
-        let bar_now = io.bar().map(|(s, sz, sc)| (s.clone(), sz, sc));
+        let bar_now = io.bar();
         // Maximized windows still laid out under the bar get re-maximized
         // (see Shell::reflow_for_zone for why cosmic-comp needs this).
         if let (Some(_), Some((_, reserve))) = (&bar_now, geom) {
@@ -271,10 +271,11 @@ fn main() {
             sb.execute(out);
         }
         match bar_now {
-            Some((surface, (w, h), scale)) => {
-                surface.set_buffer_scale(scale);
-                let size_px = (w as i32 * scale, h as i32 * scale);
-                if gl.bind(Role::Bar, &surface, size_px).is_ok() {
+            Some(t) => {
+                t.prepare(&mut io);
+                let size_px = t.size_px();
+                let (w, h) = t.logical;
+                if gl.bind(Role::Bar, &t.surface, size_px).is_ok() {
                     let mut raw = egui::RawInput {
                         screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w as f32, h as f32))),
                         time: Some(t0.elapsed().as_secs_f64()),
@@ -282,7 +283,7 @@ fn main() {
                         focused: true,
                         ..Default::default()
                     };
-                    raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(scale as f32);
+                    raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(t.scale);
                     let info = FrameInfo { apps: &apps, clock: clock(), battery: None };
                     let mut bar_actions = Vec::new();
                     let out = bar_ctx.run_ui(raw, |ui| {
@@ -320,10 +321,11 @@ fn main() {
             io.set_input_region(Role::Overlay, rects.as_deref());
             last_region = Some(region);
         }
-        let Some((surface, (w, h), scale)) = io.overlay().map(|(s, sz, sc)| (s.clone(), sz, sc)) else { continue };
-        surface.set_buffer_scale(scale);
-        let size_px = (w as i32 * scale, h as i32 * scale);
-        if let Err(e) = gl.bind(Role::Overlay, &surface, size_px) {
+        let Some(t) = io.overlay() else { continue };
+        t.prepare(&mut io);
+        let size_px = t.size_px();
+        let (w, h) = t.logical;
+        if let Err(e) = gl.bind(Role::Overlay, &t.surface, size_px) {
             eprintln!("tideshell: {e}");
             continue;
         }
@@ -338,7 +340,7 @@ fn main() {
             focused: true,
             ..Default::default()
         };
-        raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(scale as f32);
+        raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(t.scale);
         let info = FrameInfo { apps: &apps, clock: clock(), battery: None };
         let mut frame_actions = Vec::new();
         let out = ctx.run_ui(raw, |ui| {

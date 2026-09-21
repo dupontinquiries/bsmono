@@ -44,6 +44,11 @@ use wayland_client::protocol::{
     wl_touch::{self, WlTouch},
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+    wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+};
+use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
 use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1},
     wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
@@ -126,6 +131,67 @@ struct Surf {
     fresh: bool,
     scale: i32,
     closed: bool,
+    /// Fractional scaling (EGL surfaces only): the exact scale from
+    /// wp_fractional_scale_v1, and the viewport that maps the
+    /// ceil(logical x scale) buffer back onto the logical size.
+    frac: Option<WpFractionalScaleV1>,
+    frac_scale: Option<f32>,
+    viewport: Option<WpViewport>,
+    /// Last (buffer scale, viewport destination) sent, so per-frame
+    /// prepare() only emits requests when something changed (it was
+    /// sending set_destination on every frame, seen in WAYLAND_DEBUG).
+    sent: Option<(i32, (u32, u32))>,
+}
+
+impl Surf {
+    /// (render scale, uses viewport). Fractional when the compositor offers
+    /// both protocols and has sent a preferred scale; else the integer
+    /// wl_surface.preferred_buffer_scale path.
+    fn render_scale(&self) -> (f32, bool) {
+        match (self.frac_scale, &self.viewport) {
+            (Some(f), Some(_)) => (f, true),
+            _ => (self.scale as f32, false),
+        }
+    }
+}
+
+/// Buffer pixels for a logical size at a (possibly fractional) scale. The
+/// protocol's rule: round up, so the viewport never stretches a short buffer.
+pub fn buffer_px(logical: (u32, u32), scale: f32) -> (i32, i32) {
+    ((logical.0 as f32 * scale).ceil() as i32, (logical.1 as f32 * scale).ceil() as i32)
+}
+
+/// Where and at what scale to render an egui surface this frame.
+pub struct EguiTarget {
+    pub surface: WlSurface,
+    pub logical: (u32, u32),
+    /// egui pixels-per-point; fractional when `viewport` is true.
+    pub scale: f32,
+    pub viewport: bool,
+    int_scale: i32,
+}
+
+impl EguiTarget {
+    pub fn size_px(&self) -> (i32, i32) {
+        buffer_px(self.logical, self.scale)
+    }
+
+    /// Per-frame surface state for this scale path, sent only on change.
+    /// Viewport path: buffer scale 1 and a viewport destination of the
+    /// logical size. Integer path: buffer scale n. Takes effect with the
+    /// frame's commit (eglSwapBuffers).
+    pub fn prepare(&self, io: &mut Io) {
+        let want = (if self.viewport { 1 } else { self.int_scale }, if self.viewport { self.logical } else { (0, 0) });
+        let Some(s) = io.st.surfs.iter_mut().find(|s| s.wl == self.surface) else { return };
+        if s.sent == Some(want) {
+            return;
+        }
+        s.sent = Some(want);
+        self.surface.set_buffer_scale(want.0);
+        if let (true, Some(v)) = (self.viewport, &s.viewport) {
+            v.set_destination(self.logical.0 as i32, self.logical.1 as i32);
+        }
+    }
 }
 
 pub struct State {
@@ -184,6 +250,8 @@ pub struct Io {
     shm: WlShm,
     layer_shell: ZwlrLayerShellV1,
     _seat: Option<WlSeat>,
+    frac_mgr: Option<WpFractionalScaleManagerV1>,
+    viewporter: Option<WpViewporter>,
     pub strip_px: u32,
     /// Tint the strips so they can be seen (`TIDESHELL_SHOW_STRIPS=1`).
     pub show_strips: bool,
@@ -202,6 +270,8 @@ impl Io {
         let shm: WlShm = globals.bind(&qh, 1..=1, ()).map_err(|_| "no wl_shm")?;
         let layer_shell: ZwlrLayerShellV1 = globals.bind(&qh, 1..=4, ()).map_err(|_| "no zwlr_layer_shell_v1")?;
         let seat: Option<WlSeat> = globals.bind(&qh, 1..=7, ()).ok();
+        let frac_mgr: Option<WpFractionalScaleManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+        let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
         let st = State {
             surfs: Vec::new(),
             input: Vec::new(),
@@ -217,7 +287,7 @@ impl Io {
             overlay_cursor: CursorWant::Shape(Shape::Default),
             applied: None,
         };
-        let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, strip_px, show_strips, right_enabled: false, bar_size: (0, 0) };
+        let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, frac_mgr, viewporter, strip_px, show_strips, right_enabled: false, bar_size: (0, 0) };
         for r in [Role::Top, Role::Bottom, Role::Right] {
             io.create(r);
         }
@@ -255,8 +325,18 @@ impl Io {
             layer.set_exclusive_zone(-1);
         }
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        // EGL surfaces get fractional scaling; strips are transparent, so
+        // their scale is irrelevant.
+        let (frac, viewport) = if matches!(role, Role::Overlay | Role::Bar) {
+            match (&self.frac_mgr, &self.viewporter) {
+                (Some(m), Some(v)) => (Some(m.get_fractional_scale(&wl, &self.qh, ())), Some(v.get_viewport(&wl, &self.qh, ()))),
+                _ => (None, None),
+            }
+        } else {
+            (None, None)
+        };
         wl.commit();
-        self.st.surfs.push(Surf { role, wl, layer, size: (0, 0), configured: false, fresh: false, scale: 1, closed: false });
+        self.st.surfs.push(Surf { role, wl, layer, size: (0, 0), configured: false, fresh: false, scale: 1, closed: false, frac, frac_scale: None, viewport, sent: None });
         if role == Role::Right && !self.right_enabled {
             self.set_input_region(Role::Right, Some(&[]));
         }
@@ -316,6 +396,12 @@ impl Io {
         } else if !on && have {
             if let Some(i) = self.st.surfs.iter().position(|s| s.role == Role::Overlay) {
                 let s = self.st.surfs.remove(i);
+                if let Some(f) = &s.frac {
+                    f.destroy();
+                }
+                if let Some(v) = &s.viewport {
+                    v.destroy();
+                }
                 s.layer.destroy();
                 s.wl.destroy();
             }
@@ -329,6 +415,12 @@ impl Io {
         if !on {
             if let Some(i) = self.st.surfs.iter().position(|s| s.role == Role::Bar) {
                 let s = self.st.surfs.remove(i);
+                if let Some(f) = &s.frac {
+                    f.destroy();
+                }
+                if let Some(v) = &s.viewport {
+                    v.destroy();
+                }
                 s.layer.destroy();
                 s.wl.destroy();
             }
@@ -348,18 +440,26 @@ impl Io {
     }
 
     /// The bar's surface, logical size and buffer scale, once configured.
-    pub fn bar(&self) -> Option<(&WlSurface, (u32, u32), i32)> {
-        self.surf(Role::Bar).filter(|s| s.configured && s.size.0 > 0).map(|s| (&s.wl, s.size, s.scale))
+    pub fn bar(&self) -> Option<EguiTarget> {
+        self.egui_target(Role::Bar)
+    }
+
+    fn egui_target(&self, role: Role) -> Option<EguiTarget> {
+        let s = self.surf(role).filter(|s| s.configured && s.size.0 > 0)?;
+        let (scale, viewport) = s.render_scale();
+        Some(EguiTarget { surface: s.wl.clone(), logical: s.size, scale, viewport, int_scale: s.scale })
     }
 
     /// The overlay's surface, logical size and buffer scale, once configured.
-    pub fn overlay(&self) -> Option<(&WlSurface, (u32, u32), i32)> {
-        self.surf(Role::Overlay).filter(|s| s.configured && s.size.0 > 0).map(|s| (&s.wl, s.size, s.scale))
+    pub fn overlay(&self) -> Option<EguiTarget> {
+        self.egui_target(Role::Overlay)
     }
 
     pub fn flush(&self) {
         let _ = self.conn.flush();
     }
+
+
 
     /// The cursor over the overlay (egui's icon, or hidden in fat mode).
     pub fn set_overlay_cursor(&mut self, want: CursorWant) {
@@ -450,6 +550,20 @@ noop!(WlRegion);
 noop!(ZwlrLayerShellV1);
 noop!(WlCallback);
 noop!(WpCursorShapeManagerV1);
+noop!(WpFractionalScaleManagerV1);
+noop!(WpViewporter);
+noop!(WpViewport);
+
+impl Dispatch<WpFractionalScaleV1, ()> for State {
+    fn event(st: &mut Self, f: &WpFractionalScaleV1, e: wp_fractional_scale_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = e {
+            if let Some(s) = st.surfs.iter_mut().find(|s| s.frac.as_ref() == Some(f)) {
+                // The protocol's unit is 1/120.
+                s.frac_scale = Some(scale as f32 / 120.0);
+            }
+        }
+    }
+}
 noop!(WpCursorShapeDeviceV1);
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
@@ -693,6 +807,15 @@ impl Gl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffer_rounds_up_at_fractional_scales() {
+        assert_eq!(buffer_px((853, 533), 1.5), (1280, 800));
+        assert_eq!(buffer_px((432, 960), 2.5), (1080, 2400));
+        // 1/120 steps do not divide evenly: round UP, never short.
+        assert_eq!(buffer_px((100, 100), 121.0 / 120.0), (101, 101));
+        assert_eq!(buffer_px((64, 800), 1.0), (64, 800));
+    }
 
     #[test]
     fn egui_cursor_icons_map_to_shapes() {
