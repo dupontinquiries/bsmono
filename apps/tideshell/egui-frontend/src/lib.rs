@@ -71,6 +71,7 @@ pub struct ShellView {
     touch_seen: bool,
     mouse_down: bool,
     card_drag: f32,
+    bar_drag: f32,
     sheet: SettingsSheet,
 }
 
@@ -166,7 +167,6 @@ impl ShellView {
         }
         let now = (ui.input(|i| i.time) * 1000.0) as u64;
         let mut out = shell.tick(now);
-        out.extend(self.route_input(ui, shell, origin, now));
 
         let p = ui.painter_at(area);
         let to = |x: f32, y: f32| origin + Vec2::new(x, y);
@@ -250,25 +250,47 @@ impl ShellView {
         self.owners.iter().find(|(s, _)| *s == slot).map(|(_, o)| *o)
     }
 
-    fn route_input(&mut self, ui: &egui::Ui, shell: &mut Shell, origin: Pos2, now: u64) -> Vec<Action> {
-        let events = ui.input(|i| i.events.clone());
+    /// Route raw input BEFORE egui sees it. A sequence that starts in an
+    /// edge zone belongs to the recognizer, one that starts on the trackpad
+    /// pad to the trackpad; their events (and the pointer events synthesized
+    /// from an owned touch) are removed from `events`, so no widget under an
+    /// edge swipe reacts to it. Everything else is left for egui.
+    ///
+    /// Routing used to happen inside the egui frame, after egui had already
+    /// seen the events: in the right-bar layout a right-edge swipe also
+    /// dragged the bar's brightness slider (seen live).
+    ///
+    /// Call once per frame with that frame's events: the simulator from
+    /// eframe's `raw_input_hook`, the layer runtime before `run_ui`.
+    pub fn route_raw(&mut self, shell: &mut Shell, events: &mut Vec<egui::Event>, origin: Pos2, now: u64) -> Vec<Action> {
         let mut out = vec![];
         let size = Vec2::new(shell.screen.0, shell.screen.1);
-        for ev in events {
-            let (slot, phase, pos) = match ev {
+        let mut keep = Vec::with_capacity(events.len());
+        for ev in events.drain(..) {
+            let owned_touch_down = self.owners.iter().any(|(s, _)| *s != MOUSE_SLOT);
+            let (slot, phase, pos) = match &ev {
                 egui::Event::Touch { id, phase, pos, .. } => {
                     self.touch_seen = true;
-                    (id.0 as i32, phase, pos)
+                    (id.0 as i32, *phase, *pos)
                 }
-                // egui also synthesizes pointer events from touches; once a
-                // real touch has been seen, those duplicates are ignored.
-                _ if self.touch_seen => continue,
+                // Once real touches exist, pointer events are the copies
+                // synthesized from the first touch: drop them while a touch
+                // is owned, pass them through otherwise.
+                egui::Event::PointerButton { .. } | egui::Event::PointerMoved(_) if self.touch_seen => {
+                    if !owned_touch_down {
+                        keep.push(ev);
+                    }
+                    continue;
+                }
                 egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, .. } => {
-                    self.mouse_down = pressed;
-                    (MOUSE_SLOT, if pressed { egui::TouchPhase::Start } else { egui::TouchPhase::End }, pos)
+                    self.mouse_down = *pressed;
+                    (MOUSE_SLOT, if *pressed { egui::TouchPhase::Start } else { egui::TouchPhase::End }, *pos)
                 }
-                egui::Event::PointerMoved(pos) if self.mouse_down => (MOUSE_SLOT, egui::TouchPhase::Move, pos),
-                _ => continue,
+                egui::Event::PointerMoved(pos) if self.mouse_down => (MOUSE_SLOT, egui::TouchPhase::Move, *pos),
+                _ => {
+                    keep.push(ev);
+                    continue;
+                }
             };
             let l = pos - origin;
             let (x, y) = (l.x, l.y);
@@ -289,12 +311,13 @@ impl ShellView {
                 } else {
                     None
                 };
+                self.owners.retain(|(s, _)| *s != slot);
                 if let Some(o) = owner {
-                    self.owners.retain(|(s, _)| *s != slot);
                     self.owners.push((slot, o));
                 }
             }
-            match (self.owner(slot), te) {
+            let owner = self.owner(slot);
+            match (owner, te) {
                 (Some(Owner::Edge), e) => out.extend(shell.on_edge_touch(e)),
                 (Some(Owner::Pad), e) => out.extend(shell.on_trackpad_touch(e)),
                 (None, TouchEvent::Cancel) => {
@@ -303,10 +326,14 @@ impl ShellView {
                 }
                 _ => {}
             }
+            if owner.is_none() {
+                keep.push(ev);
+            }
             if matches!(phase, egui::TouchPhase::End | egui::TouchPhase::Cancel) {
                 self.owners.retain(|(s, _)| *s != slot);
             }
         }
+        *events = keep;
         out
     }
 
@@ -420,6 +447,24 @@ impl ShellView {
         let rect = Rect::from_min_size(origin + Vec2::new(size.x - bw, 0.0), Vec2::new(bw, size.y));
         let p = ui.painter_at(rect);
         p.rect_filled(rect, cr(0), pal.bg_card);
+        // Background drag, registered before the widgets so a drag that
+        // starts ON a widget (a slider) stays that widget's: left expands,
+        // right collapses. This replaces the right-edge swipe-in.
+        let bg = ui.interact(rect, Id::new("ts-bar-bg"), Sense::drag());
+        if bg.drag_started() {
+            self.bar_drag = 0.0;
+        }
+        if bg.dragged() {
+            self.bar_drag += bg.drag_delta().x;
+        }
+        if bg.drag_stopped() {
+            if self.bar_drag < -30.0 {
+                shell.set_bar_expanded(true);
+            } else if self.bar_drag > 30.0 {
+                shell.set_bar_expanded(false);
+            }
+            self.bar_drag = 0.0;
+        }
         let unit = shell.prefs.bar_width.min(60.0);
         let widgets = shell.prefs.bar_widgets.clone();
         let lay = bar::layout(&widgets, size.y - 28.0, unit);
@@ -798,7 +843,8 @@ mod tests {
             vec![egui::Event::PointerMoved(Pos2::new(240.0, 700.0))],
             vec![egui::Event::PointerMoved(Pos2::new(280.0, 700.0))],
         ];
-        for (i, events) in frames.into_iter().enumerate() {
+        for (i, mut events) in frames.into_iter().enumerate() {
+            out.extend(view.route_raw(&mut sh, &mut events, Pos2::ZERO, 1000 + 16 * i as u64));
             let raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(408.0, 900.0))),
                 time: Some(1.0 + i as f64 * 0.016),
@@ -817,6 +863,47 @@ mod tests {
         assert!(!allowed.is_empty(), "scan must find pad motion when allowed");
         // Default (real shell, EI output): no pointer output from the mouse.
         assert!(mouse_drag_on_pad(false).is_empty(), "mouse on pad must not feed EI");
+    }
+
+    fn touch(id: u64, phase: egui::TouchPhase, x: f32, y: f32) -> egui::Event {
+        egui::Event::Touch { device_id: egui::TouchDeviceId(0), id: egui::TouchId(id), phase, pos: Pos2::new(x, y), force: None }
+    }
+    fn press(x: f32, y: f32, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos: Pos2::new(x, y), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }
+    }
+
+    #[test]
+    fn edge_owned_sequence_never_reaches_egui_other_touches_do() {
+        use tideshell_core::prefs::ShellPrefs;
+        let mut sh = Shell::new(ShellPrefs::default(), (408.0, 900.0));
+        let mut view = ShellView::default();
+        // Bottom-edge swipe: Touch + the pointer copies a touchscreen emits.
+        let mut ev = vec![touch(1, egui::TouchPhase::Start, 200.0, 895.0), egui::Event::PointerMoved(Pos2::new(200.0, 895.0)), press(200.0, 895.0, true)];
+        view.route_raw(&mut sh, &mut ev, Pos2::ZERO, 0);
+        assert!(ev.is_empty(), "owned touch + its pointer copies removed: {ev:?}");
+        let mut ev = vec![touch(1, egui::TouchPhase::Move, 200.0, 700.0), egui::Event::PointerMoved(Pos2::new(200.0, 700.0))];
+        view.route_raw(&mut sh, &mut ev, Pos2::ZERO, 50);
+        assert!(ev.is_empty());
+        assert!(sh.swipe_up > 0.0, "and the recognizer got it");
+        let mut ev = vec![touch(1, egui::TouchPhase::End, 200.0, 700.0)];
+        view.route_raw(&mut sh, &mut ev, Pos2::ZERO, 60);
+        assert!(ev.is_empty());
+        // A touch in the middle of the screen is not the shell's: untouched.
+        let mid = vec![touch(2, egui::TouchPhase::Start, 200.0, 400.0), egui::Event::PointerMoved(Pos2::new(200.0, 400.0)), press(200.0, 400.0, true)];
+        let mut ev = mid.clone();
+        view.route_raw(&mut sh, &mut ev, Pos2::ZERO, 100);
+        assert_eq!(ev, mid, "non-owned events pass through unchanged");
+    }
+
+    #[test]
+    fn mouse_edge_drag_is_removed_too() {
+        use tideshell_core::prefs::ShellPrefs;
+        let mut sh = Shell::new(ShellPrefs::default(), (408.0, 900.0));
+        let mut view = ShellView::default();
+        let mut ev = vec![egui::Event::PointerMoved(Pos2::new(200.0, 4.0)), press(200.0, 4.0, true), egui::Event::PointerMoved(Pos2::new(200.0, 300.0)), press(200.0, 300.0, false)];
+        view.route_raw(&mut sh, &mut ev, Pos2::ZERO, 0);
+        // Only the hover before the press survives; press/drag/release are the recognizer's.
+        assert_eq!(ev, vec![egui::Event::PointerMoved(Pos2::new(200.0, 4.0))]);
     }
 
     #[test]

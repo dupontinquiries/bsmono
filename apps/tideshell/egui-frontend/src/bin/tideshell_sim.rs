@@ -153,6 +153,8 @@ struct App {
     ei_status: Option<tideshell_egui::ei::Status>,
     ei_selftest: Option<(f32, f32)>,
     ei_ready_at: Option<f64>,
+    /// Actions from raw_input_hook, executed in the next ui() call.
+    routed: Vec<Action>,
 }
 
 impl App {
@@ -324,6 +326,14 @@ fn battery() -> Option<f32> {
 }
 
 impl eframe::App for App {
+    /// Route edge/pad-owned input before egui sees it (see ShellView::route_raw).
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        let origin = raw.screen_rect.map(|r| r.min).unwrap_or(Pos2::ZERO);
+        let now = (raw.time.unwrap_or(0.0) * 1000.0) as u64;
+        let out = self.view.route_raw(&mut self.shell, &mut raw.events, origin, now);
+        self.routed.extend(out);
+    }
+
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
         let ctx = &ctx;
@@ -342,6 +352,8 @@ impl eframe::App for App {
                     self.run_demo(&which);
                 }
             }
+            let routed = std::mem::take(&mut self.routed);
+            self.execute(routed, now);
             self.demo_frame(now);
             let p = ui.painter_at(area);
             p.rect_filled(area, CornerRadius::ZERO, Color32::from_rgb(28, 32, 44));
@@ -460,7 +472,7 @@ fn main() -> eframe::Result<()> {
             // The fake world's cursor is not the real pointer, so the mouse may
             // drive the pad there. With --wayland the pad feeds EI: no.
             view.pointer_pad = !wayland_mode;
-            Ok(Box::new(App { shell, view, world, system, persist, palette, apps, demo, demo_started: None, last_cards: vec![], live, ei, ei_status: None, ei_selftest, ei_ready_at: None }))
+            Ok(Box::new(App { shell, view, world, system, persist, palette, apps, demo, demo_started: None, last_cards: vec![], live, ei, ei_status: None, ei_selftest, ei_ready_at: None, routed: vec![] }))
         }),
     )
 }

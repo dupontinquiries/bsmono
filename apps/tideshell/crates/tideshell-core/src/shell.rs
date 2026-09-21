@@ -392,6 +392,14 @@ impl Shell {
         self.emit(out)
     }
 
+    /// The bar's own horizontal drag (it owns the right edge).
+    pub fn set_bar_expanded(&mut self, on: bool) {
+        if self.bar_expanded != on {
+            self.bar_expanded = on;
+            self.log(format!("bar expanded={on}"));
+        }
+    }
+
     /// Tap on empty drawer/switcher backdrop dismisses it.
     pub fn dismiss_overlays(&mut self) {
         self.drawer.close();
@@ -542,7 +550,10 @@ mod tests {
         edge_drag(&mut sh, (200.0, 3.0), (200.0, 400.0), 20, 0);
         assert!(!sh.drawer.is_visible(), "top edge inert in right-bar layout");
         assert!(!sh.bar_widgets().is_empty());
-        edge_drag(&mut sh, (406.0, 450.0), (300.0, 450.0), 10, 2000);
+        // The right edge is the bar's, not the recognizer's.
+        let out = edge_drag(&mut sh, (406.0, 450.0), (300.0, 450.0), 10, 2000);
+        assert!(out.is_empty() && !sh.bar_expanded, "no edge swipe-in over the bar");
+        sh.set_bar_expanded(true);
         assert!(sh.bar_expanded);
     }
 

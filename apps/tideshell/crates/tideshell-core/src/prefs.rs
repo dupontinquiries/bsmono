@@ -139,7 +139,11 @@ impl ShellPrefs {
         EdgeConfig {
             hold_ms: self.hold_ms,
             top_enabled: self.layout == Layout::PullDown,
-            right_enabled: self.layout == Layout::RightBar,
+            // Off in every layout today. It was on in right-bar, but the bar
+            // covers the right edge, so a swipe-in over it competed with the
+            // bar's own widgets (a right-edge swipe dragged its slider, seen
+            // live). The bar takes a horizontal drag to expand instead.
+            right_enabled: false,
             ..EdgeConfig::default()
         }
     }
@@ -202,6 +206,6 @@ mod tests {
         assert!(c.top_enabled && !c.right_enabled);
         p.layout = Layout::RightBar;
         let c = p.edge_config();
-        assert!(!c.top_enabled && c.right_enabled);
+        assert!(!c.top_enabled && !c.right_enabled, "the bar owns the right edge");
     }
 }

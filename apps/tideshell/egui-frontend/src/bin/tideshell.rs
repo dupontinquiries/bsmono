@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use egui::{Pos2, Rect, Vec2};
-use tideshell_core::prefs::Layout;
 use tideshell_core::{Action, Shell, TouchEvent};
 use tideshell_egui::effects::{self, Executor, Outcome, System};
 use tideshell_egui::layer::{Gl, Input, Io, Role, POINTER_SLOT};
@@ -193,7 +192,7 @@ fn main() {
                 sb.shell.set_screen(screen);
             }
         }
-        io.set_right_enabled(sb.shell.prefs.layout == Layout::RightBar);
+        io.set_right_enabled(sb.shell.recognizer.cfg.right_enabled);
 
         // Strips -> recognizer (screen coords). Overlay -> egui events.
         let mut actions = Vec::new();
@@ -263,10 +262,14 @@ fn main() {
             eprintln!("tideshell: {e}");
             continue;
         }
+        // Edge/pad-owned sequences go to the engine and never reach egui.
+        let mut events = std::mem::take(&mut overlay_events);
+        let routed = sb.view.route_raw(&mut sb.shell, &mut events, Pos2::ZERO, t0.elapsed().as_millis() as u64);
+        sb.execute(routed);
         let mut raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w as f32, h as f32))),
             time: Some(t0.elapsed().as_secs_f64()),
-            events: std::mem::take(&mut overlay_events),
+            events,
             focused: true,
             ..Default::default()
         };
