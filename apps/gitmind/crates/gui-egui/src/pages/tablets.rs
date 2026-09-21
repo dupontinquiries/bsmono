@@ -154,8 +154,14 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 let pw = Some(pw).filter(|p| !p.is_empty());
                 match ef::enroll(&mut e, pw.as_deref(), &mut |ev| log.push(&format!("{ev:?}"))) {
                     Ok(r) => {
-                        let lines = describe(&r.probe, &r.displays).join("\n");
+                        let mut lines = describe(&r.probe, &r.displays).join("\n");
                         *found.lock().unwrap() = Some((r.probe, r.displays));
+                        // What the device HAS, stored for builds to pick features from.
+                        let mut rr = ef::SshRemote { user: user.clone(), host: host.clone() };
+                        if let Ok(out) = ef::Remote::run(&mut rr, &cockpit::capabilities::survey_cmd()) {
+                            let _ = cockpit::capabilities::save(&host, &out);
+                            for l in cockpit::capabilities::parse(&out).summary() { lines.push('\n'); lines.push_str(&l); }
+                        }
                         format!("enrolled {user}@{host}\n{lines}")
                     }
                     Err(e) => {
@@ -289,12 +295,16 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             let (r, m) = route.clone().unwrap();
             let app = apps[s.selected].clone();
             let engine = s.engine;
+            let host = s.host.trim().to_string();
             let built = s.built.clone();
             s.task.run_logged(move |log| {
                 let t = ef::build_target(&r, m);
                 let path = std::env::var("PATH").unwrap_or_default();
-                let plan = match ef::plan_build(engine, &cockpit::ops::repo_root(), &app, &t, &path,
-                    std::env::var("HOME").ok().as_deref(), std::env::var("CARGO").ok().as_deref()) {
+                // Features follow the device's surveyed hardware (enrolment stores it).
+                let caps = cockpit::capabilities::load(&host);
+                if caps.is_none() { log.push("no hardware survey for this tablet yet: default features (enrol again, or `gitmind eink survey`)"); }
+                let plan = match ef::plan_build_for(engine, &cockpit::ops::repo_root(), &app, &t, &path,
+                    std::env::var("HOME").ok().as_deref(), std::env::var("CARGO").ok().as_deref(), caps.as_ref()) {
                     Ok(p) => p,
                     Err(e) => return e,
                 };

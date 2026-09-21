@@ -1393,13 +1393,14 @@ fn iso_now() -> String {
 /// the root filesystem; Oxide/AppLoad get installed or removed).
 fn cmd_eink(rest: &[String]) -> i32 {
     use cockpit::eink_fleet as ef;
-    const USAGE: &str = "usage: gitmind eink <enroll|probe|build|deploy|list|remove|stop|status|activate|wifi-ssh|retrust> <host> ...\n  \
+    const USAGE: &str = "usage: gitmind eink <enroll|probe|survey|build|deploy|list|remove|stop|status|activate|wifi-ssh|pkg|retrust> <host> ...\n  \
         build <host> <bin> [--engine auto|host|container]   build an eink-kit app for that tablet (container = podman/docker rust:alpine)\n  \
         list <host>                         apps gitmind put in the tablet's AppLoad sidebar\n  \
         remove <host> <app>                 take one out again (never touches other apps)\n  \
         activate <host>                     after a reboot: start xovi or the launcher, whichever is needed\n  \
         wifi-ssh <host>                     turn on SSH over Wi-Fi (Paper Pro family; run over USB)\n  \
         pkg <host> runner|bootstrap|add|del|list|update|audio   packages like a laptop (Alpine under /home)\n  \
+        survey <host>                       what the device has (run at enrol); builds pick features from it\n  \
         (every command: --user U, or GITMIND_RM_USER; default root)\n  \
         retrust <host>                      accept the tablet's NEW host key (after an OS update)\n  \
         enroll <host>                       first contact: password (GITMIND_RM_PASSWORD or stdin) → key\n  \
@@ -1457,6 +1458,14 @@ fn cmd_eink(rest: &[String]) -> i32 {
             match ef::enroll(&mut e, password.as_deref(), &mut |ev| eprintln!("  · {ev:?}")) {
                 Ok(r) => {
                     println!("enrolled {user}@{host}{}", if r.used_password { " (keys installed; no more passwords)" } else { "" });
+                    // What the device HAS, stored for builds to use.
+                    match ef::Remote::run(&mut remote, &cockpit::capabilities::survey_cmd()) {
+                        Ok(out) => {
+                            let _ = cockpit::capabilities::save(&host, &out);
+                            for l in cockpit::capabilities::parse(&out).summary() { println!("  {l}"); }
+                        }
+                        Err(e) => eprintln!("  (hardware survey failed: {e})"),
+                    }
                     describe(&r.probe, &r.displays);
                     0
                 }
@@ -1528,8 +1537,10 @@ fn cmd_eink(rest: &[String]) -> i32 {
                 Some(e) => match ef::Engine::parse(e) { Some(e) => e, None => return eink_err("--engine: auto|host|container") },
                 None => ef::Engine::Auto,
             };
-            let plan = match ef::plan_build(engine, &root, &app, &t, &std::env::var("PATH").unwrap_or_default(),
-                std::env::var("HOME").ok().as_deref(), std::env::var("CARGO").ok().as_deref()) {
+            let caps = cockpit::capabilities::load(&host);
+            if caps.is_none() { eprintln!("  (no hardware survey for {host}: default features; `gitmind eink survey {host}`)"); }
+            let plan = match ef::plan_build_for(engine, &root, &app, &t, &std::env::var("PATH").unwrap_or_default(),
+                std::env::var("HOME").ok().as_deref(), std::env::var("CARGO").ok().as_deref(), caps.as_ref()) {
                 Ok(p) => p,
                 Err(e) => return eink_err(&e),
             };
@@ -1588,6 +1599,15 @@ fn cmd_eink(rest: &[String]) -> i32 {
                 Err(e) => eink_err(&e),
             }
         }
+        "survey" => match ef::Remote::run(&mut remote, &cockpit::capabilities::survey_cmd()) {
+            Ok(out) => {
+                let _ = cockpit::capabilities::save(&host, &out);
+                for l in cockpit::capabilities::parse(&out).summary() { println!("{l}"); }
+                println!("(saved; builds for {host} use it)");
+                0
+            }
+            Err(e) => eink_err(&e),
+        },
         "wifi-ssh" => {
             let (_, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
             if !d.wlan_ssh_tool {

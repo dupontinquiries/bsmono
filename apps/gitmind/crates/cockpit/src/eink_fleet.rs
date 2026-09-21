@@ -1543,7 +1543,40 @@ pub fn with_lock_preserved<T>(plan: &BuildPlan, f: impl FnOnce() -> T) -> T {
 
 /// Choose and build the plan for `engine`. Errors explain every engine
 /// tried, so "installed but not found" and "no podman" both read plainly.
+/// The app as it should be built for a device with `caps`: its default
+/// features minus those the hardware cannot use (see
+/// `capabilities::select_features`). An app already built with an explicit
+/// feature set (`no_default`, e.g. tomescope's `eink` shell) is left alone.
+/// Returns the adjusted app and the (feature, reason) pairs dropped.
+pub fn app_for_device(app: &TabletApp, caps: Option<&crate::capabilities::Capabilities>) -> (TabletApp, Vec<(String, String)>) {
+    let (Some(caps), false) = (caps, app.no_default) else { return (app.clone(), vec![]) };
+    let Ok(toml) = std::fs::read_to_string(app.dir.join("Cargo.toml")) else { return (app.clone(), vec![]) };
+    let sel = crate::capabilities::select_features(&toml, caps, &app.features);
+    let mut a = app.clone();
+    if sel.no_default {
+        a.features = sel.features;
+        a.no_default = true;
+    }
+    (a, sel.dropped)
+}
+
 pub fn plan_build(engine: Engine, repo_root: &std::path::Path, app: &TabletApp, t: &BuildTarget, path_env: &str, home: Option<&str>, cargo_env: Option<&str>) -> Result<BuildPlan, String> {
+    plan_build_for(engine, repo_root, app, t, path_env, home, cargo_env, None)
+}
+
+/// [`plan_build`] for a surveyed device: features follow its hardware.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_build_for(engine: Engine, repo_root: &std::path::Path, app: &TabletApp, t: &BuildTarget, path_env: &str, home: Option<&str>, cargo_env: Option<&str>, caps: Option<&crate::capabilities::Capabilities>) -> Result<BuildPlan, String> {
+    let (adjusted, dropped) = app_for_device(app, caps);
+    let mut plan = plan_build_inner(engine, repo_root, &adjusted, t, path_env, home, cargo_env)?;
+    if !dropped.is_empty() {
+        let why: Vec<String> = dropped.iter().map(|(f, r)| format!("-{f} ({r})")).collect();
+        plan.note = format!("{}; features for this device: {}", plan.note, why.join(", "));
+    }
+    Ok(plan)
+}
+
+fn plan_build_inner(engine: Engine, repo_root: &std::path::Path, app: &TabletApp, t: &BuildTarget, path_env: &str, home: Option<&str>, cargo_env: Option<&str>) -> Result<BuildPlan, String> {
     let native = native_for(t);
     let rustflags = std::env::var("RUSTFLAGS").ok();
     let host = || pick_toolchain(t.triple, native, path_env, home, cargo_env).map(|tc| host_plan(app, t, &tc, native, rustflags.as_deref(), repo_root));
@@ -2757,5 +2790,24 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
         let tc = Toolchain { cargo: "/x/cargo".into(), rustc: "/x/rustc".into(), origin: "t".into() };
         let h = host_plan(&app, &t, &tc, false, None, &root);
         assert!(h.argv.iter().any(|x| x.contains("eframe-shim")) && h.env.iter().any(|(k, v)| k == "EINK_SHIM" && v == "1"));
+    }
+
+    #[test]
+    fn a_surveyed_tablet_builds_studio_without_audio_and_says_why() {
+        let dir = std::env::temp_dir().join(format!("studioapp_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"studio-app\"\n[features]\ndefault = [\"app\", \"audio\", \"midi\"]\napp = [\"dep:eframe\"]\naudio = []\nmidi = []\n").unwrap();
+        let app = TabletApp { dir: dir.clone(), bin: "studio-app".into(), features: vec![], no_default: false, via_shim: true };
+        let rm = crate::capabilities::parse("arch=aarch64\ncores=4\nmem_mb=1900\nalsa_cards=0\nbluetooth=1\n");
+        let (a, dropped) = app_for_device(&app, Some(&rm));
+        assert!(a.no_default && a.features == ["app"], "{a:?}");
+        assert_eq!(dropped.len(), 2);
+        let t = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
+        let p = container_plan("podman", &std::env::temp_dir(), &a, &t).unwrap();
+        assert!(p.argv.join(" ").contains("--no-default-features --features app"), "{:?}", p.argv);
+        // tomescope-style explicit feature sets are left alone
+        let explicit = TabletApp { no_default: true, features: vec!["eink".into()], ..app.clone() };
+        assert_eq!(app_for_device(&explicit, Some(&rm)).0, explicit);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
