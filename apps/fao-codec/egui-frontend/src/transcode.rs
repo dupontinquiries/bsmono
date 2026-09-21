@@ -21,65 +21,83 @@ pub struct VideoInfo {
     pub w: usize,
     pub h: usize,
     pub fps: f64,
+    /// The rate EXACTLY as the header will store it. From the stream's own
+    /// rational where it fits (30000/1001, 144/1), else `fps_ratio(fps)`. Kept as
+    /// a rational because the float path is where 144 fps used to wrap to 12.9.
+    pub rate: (u16, u16),
     pub duration_s: f64,
     pub codec: String,
+    /// ffprobe's absolute stream index -- handed to ffmpeg as `-map 0:N` so the
+    /// stream decoded is the stream probed.
+    pub stream: usize,
 }
 
-/// `ffprobe -show_streams`, the same call `fao_app::probe_video` makes, parsed with `serde_json`
-/// rather than the ad hoc string slicing this needed anyway once `fps_num`/`fps_den` (an `N/D`
-/// string in ffprobe's own output) had to be split.
+/// Parse `ffprobe -show_streams -show_format` JSON.
+///
+/// Picks the first VIDEO stream that is not cover art. Two traps, both real:
+///   * stream 0 is often AUDIO in an OBS capture -- fao_app's `streams[0]` then
+///     reads no width and silently substitutes 640x480, slicing every 1080p frame
+///     as 640x480 (confirmed on an audio-first MKV);
+///   * an MKV's cover art is a `video` stream with `disposition.attached_pic`, so
+///     "first video stream" can be a 300x300 thumbnail while ffmpeg decodes the
+///     real picture -- a frame-size mismatch on every frame.
+/// No video stream is an ERROR, never a default size.
+pub fn parse_probe(json: &str) -> Result<VideoInfo, String> {
+    let info: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("ffprobe JSON: {e}"))?;
+    let streams = info["streams"].as_array().ok_or("no streams")?;
+    let v = streams.iter()
+        .find(|s| s["codec_type"] == "video" && s["disposition"]["attached_pic"].as_u64() != Some(1))
+        .ok_or("no video stream (only audio or cover art)")?;
+    let w = v["width"].as_u64().ok_or("video stream has no width")? as usize;
+    let h = v["height"].as_u64().ok_or("video stream has no height")? as usize;
+    let stream = v["index"].as_u64().ok_or("video stream has no index")? as usize;
+    let rat = v["avg_frame_rate"].as_str().and_then(parse_ratio).filter(|&(n, d)| n > 0 && d > 0)
+        .or_else(|| v["r_frame_rate"].as_str().and_then(parse_ratio).filter(|&(n, d)| n > 0 && d > 0))
+        .ok_or("no usable frame rate")?;
+    let fps = rat.0 as f64 / rat.1 as f64;
+    let rate = fit_u16(rat).unwrap_or_else(|| fao_v1::fps_ratio(fps));
+    let duration_s = info["format"]["duration"].as_str().and_then(|s| s.parse().ok())
+        .or_else(|| v["duration"].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(0.0);
+    let codec = v["codec_name"].as_str().unwrap_or("?").to_string();
+    Ok(VideoInfo { w, h, fps, rate, duration_s, codec, stream })
+}
+
+/// "30000/1001" -> (30000, 1001), reduced.
+fn parse_ratio(s: &str) -> Option<(u64, u64)> {
+    let (n, d) = s.split_once('/')?;
+    let (n, d): (u64, u64) = (n.trim().parse().ok()?, d.trim().parse().ok()?);
+    if d == 0 { return None; }
+    let g = gcd(n, d).max(1);
+    Some((n / g, d / g))
+}
+
+fn gcd(a: u64, b: u64) -> u64 { if b == 0 { a } else { gcd(b, a % b) } }
+
+fn fit_u16((n, d): (u64, u64)) -> Option<(u16, u16)> {
+    (n <= u16::MAX as u64 && d <= u16::MAX as u64).then(|| (n as u16, d as u16))
+}
+
+/// `ffprobe`, then [`parse_probe`].
 pub fn probe(path: &str) -> Result<VideoInfo, String> {
     let out = Command::new("ffprobe")
         .args(["-v", "quiet", "-print_format", "json", "-show_streams", "-show_format"])
         .arg(path).output().map_err(|e| format!("ffprobe: {e}"))?;
     if !out.status.success() { return Err("ffprobe failed (not a media file?)".into()); }
-    let info: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("ffprobe JSON: {e}"))?;
-    let streams = info["streams"].as_array().ok_or("no streams")?;
-    let v = streams.iter().find(|s| s["codec_type"] == "video").ok_or("no video stream")?;
-    let w = v["width"].as_u64().ok_or("no width")? as usize;
-    let h = v["height"].as_u64().ok_or("no height")? as usize;
-    let fps = v["avg_frame_rate"].as_str().and_then(parse_rational)
-        .filter(|f| *f > 0.0 && *f < 1000.0)
-        .or_else(|| v["r_frame_rate"].as_str().and_then(parse_rational))
-        .unwrap_or(30.0);
-    let duration_s = info["format"]["duration"].as_str().and_then(|s| s.parse().ok())
-        .or_else(|| v["duration"].as_str().and_then(|s| s.parse().ok()))
-        .unwrap_or(0.0);
-    let codec = v["codec_name"].as_str().unwrap_or("?").to_string();
-    Ok(VideoInfo { w, h, fps, duration_s, codec })
+    parse_probe(&String::from_utf8_lossy(&out.stdout))
 }
 
-fn parse_rational(s: &str) -> Option<f64> {
-    let (n, d) = s.split_once('/')?;
-    let (n, d): (f64, f64) = (n.parse().ok()?, d.parse().ok()?);
-    (d != 0.0).then_some(n / d)
-}
-
-/// Decode every frame to packed RGB8 in ONE ffmpeg process (a `rawvideo` pipe to stdout) rather
-/// than fao_app's one-`Command`-per-frame pattern, which is fine for a single still but not for
-/// a sequence. Width/height are rounded down to even numbers — the encoder's chroma planes are
-/// half-size in both axes, the same crop `lab::Source::load` applies to a loaded image.
-/// `max_frames` bounds memory for the egui page (a 1080p minute is ~11 GB uncompressed); `None`
-/// decodes the whole file.
-pub fn decode_frames_rgb(path: &str, w: usize, h: usize, max_frames: Option<usize>) -> Result<Vec<Vec<u8>>, String> {
-    let (w, h) = (w & !1, h & !1);
-    if w < 8 || h < 8 { return Err(format!("{w}x{h} is too small to encode")); }
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-i").arg(path);
-    if let Some(n) = max_frames { cmd.args(["-vframes", &n.to_string()]); }
-    cmd.args(["-vf", &format!("scale={w}:{h}")])
-       .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-v", "error", "-"])
-       .stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd.output().map_err(|e| format!("ffmpeg: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("ffmpeg decode failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+/// Index slots to reserve: duration x rate with a quarter's margin plus a
+/// floor, since variable-rate captures run over their average. Or exactly the
+/// cap, when one is set.
+pub fn reserve_for(info: &VideoInfo, max_frames: Option<usize>) -> u64 {
+    if let Some(n) = max_frames { return n.max(1) as u64; }
+    if info.duration_s > 0.0 && info.fps > 0.0 {
+        (info.duration_s * info.fps * 1.25).ceil() as u64 + 1024
+    } else {
+        // Unknown length: 16 bytes a slot, so 4 MB of index covers ~73 min at 60.
+        262_144
     }
-    let fsz = w * h * 3;
-    if out.stdout.is_empty() { return Err("ffmpeg produced no frames".into()); }
-    if out.stdout.len() % fsz != 0 {
-        return Err(format!("ffmpeg output {} bytes, not a multiple of the {fsz}-byte frame size", out.stdout.len()));
-    }
-    Ok(out.stdout.chunks_exact(fsz).map(|c| c.to_vec()).collect())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -92,36 +110,115 @@ pub struct TranscodeReport {
     pub mean_psnr: f64,
 }
 
-/// Probe, decode, encode every frame intra (see the module doc for why), and return a real
-/// `.fao` file's bytes plus a report. `progress(done, total)` is called after every frame so a
-/// caller on a worker thread can report back to the UI without this module knowing about egui.
-pub fn transcode(path: &str, quality: u8, max_frames: Option<usize>,
-                  mut progress: impl FnMut(usize, usize)) -> Result<(Vec<u8>, TranscodeReport), String> {
+/// Transcode into any `Write + Seek`, ONE FRAME AT A TIME.
+///
+/// The old path called `ffmpeg ... .output()`, which buffers ffmpeg's ENTIRE
+/// decoded output, then copied it into a Vec per frame, kept every payload for
+/// the container, and returned the file as one Vec -- its own doc put a 1080p
+/// minute at ~11 GB, so an hour-long match could not run at all. This reads
+/// frames off ffmpeg's pipe with `read_exact` and writes each straight into a
+/// `FaoStreamWriter`: memory is one frame, whatever the length.
+pub fn transcode_to_writer<W: std::io::Write + std::io::Seek>(
+    path: &str, out: W, quality: u8, max_frames: Option<usize>,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<(W, TranscodeReport), String> {
+    use std::io::Read;
     let info = probe(path)?;
     let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let frames = decode_frames_rgb(path, info.w, info.h, max_frames)?;
     let (w, h) = (info.w & !1, info.h & !1);
-    let n = frames.len();
-    let mut container_frames = Vec::with_capacity(n);
+    if w < 8 || h < 8 { return Err(format!("{w}x{h} is too small to encode")); }
+    let reserve = reserve_for(&info, max_frames);
+    let estimate = reserve.saturating_sub(1024).max(1) as usize;
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error", "-i"]).arg(path)
+       .args(["-map", &format!("0:{}", info.stream)]);
+    if let Some(n) = max_frames { cmd.args(["-frames:v", &n.to_string()]); }
+    // CROP an odd edge, never scale: every even size round-trips through this
+    // codec unchanged (tested down to 18x16 and 1366x768), and a scale filter
+    // would resample every pixel of a frame that needed no change.
+    if (w, h) != (info.w, info.h) { cmd.args(["-vf", &format!("crop={w}:{h}:0:0")]); }
+    cmd.args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+       .stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("ffmpeg: {e}"))?;
+    let mut stdout = child.stdout.take().ok_or("no ffmpeg stdout")?;
+    // DRAIN stderr on a thread: undrained, a chatty decode fills the pipe and
+    // ffmpeg blocks writing to it while we block reading stdout -- deadlock.
+    let mut stderr = child.stderr.take().ok_or("no ffmpeg stderr")?;
+    let err_thread = std::thread::spawn(move || {
+        let mut e = String::new();
+        let _ = stderr.read_to_string(&mut e);
+        e
+    });
+
+    let mut writer = crate::export::FaoStreamWriter::new(out, w, h, info.rate.0, info.rate.1, quality, reserve)
+        .map_err(|e| format!("starting the file: {e}"))?;
+    let fsz = w * h * 3;
+    let mut rgb = vec![0u8; fsz];
+    let mut n = 0usize;
     let mut psnr_sum = 0.0;
-    for (i, rgb) in frames.iter().enumerate() {
-        let yuv = decode_yuv_from_rgb(rgb, w, h);
+    let result: Result<(), String> = loop {
+        match read_frame(&mut stdout, &mut rgb) {
+            Ok(false) => break Ok(()),
+            Ok(true) => {}
+            Err(e) => break Err(e),
+        }
+        let yuv = crate::decode::rgb_to_yuv420p(&rgb, w, h);
         let payload = fao_v1::compress_frame_dct(&yuv, w, h, quality);
-        let recon_yuv = fao_v1::decompress_frame_dct(&payload, w, h).unwrap_or_else(|| yuv.clone());
-        let recon_rgb = crate::decode::yuv_to_rgb(&recon_yuv, w, h);
-        psnr_sum += psnr(rgb, &recon_rgb);
-        let plen = payload.len();
-        container_frames.push((Vec::new(), payload, b'D', plen, 0.0, 0.0));
-        progress(i + 1, n);
-    }
-    let mut out = Vec::new();
-    fao_v1::write_fao_container(&mut out, w, h, info.fps, quality as f32 / 100.0, &container_frames)
-        .map_err(|e| format!("writing the container: {e}"))?;
-    let report = TranscodeReport {
-        frames: n, w, h, input_bytes, output_bytes: out.len() as u64,
-        mean_psnr: if n > 0 { psnr_sum / n as f64 } else { 0.0 },
+        let recon = fao_v1::decompress_frame_dct(&payload, w, h).unwrap_or_else(|| yuv.clone());
+        let p = psnr(&rgb, &crate::decode::yuv_to_rgb(&recon, w, h));
+        psnr_sum += p;
+        if let Err(e) = writer.push(&payload, b'D', p) { break Err(format!("writing frame {n}: {e}")); }
+        n += 1;
+        progress(n, estimate.max(n));
     };
-    Ok((out, report))
+    if result.is_err() { let _ = child.kill(); }
+    let status = child.wait().map_err(|e| format!("ffmpeg wait: {e}"))?;
+    let errtext = err_thread.join().unwrap_or_default();
+    result?;
+    if !status.success() {
+        return Err(format!("ffmpeg decode failed: {}", errtext.trim()));
+    }
+    if n == 0 { return Err("ffmpeg produced no frames".into()); }
+    progress(n, n);
+    let mut out = writer.finish().map_err(|e| format!("finishing the file: {e}"))?;
+    let output_bytes = out.stream_position().unwrap_or(0);
+    Ok((out, TranscodeReport { frames: n, w, h, input_bytes, output_bytes,
+                               mean_psnr: psnr_sum / n as f64 }))
+}
+
+/// Read exactly one frame. `Ok(false)` at a clean end; a PARTIAL frame is an
+/// error, not a frame padded with the previous one's bytes.
+fn read_frame(r: &mut impl std::io::Read, buf: &mut [u8]) -> Result<bool, String> {
+    let mut got = 0;
+    while got < buf.len() {
+        match r.read(&mut buf[got..]) {
+            Ok(0) => return if got == 0 { Ok(false) }
+                            else { Err(format!("ffmpeg stopped mid-frame ({got} of {} bytes)", buf.len())) },
+            Ok(k) => got += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("reading ffmpeg: {e}")),
+        }
+    }
+    Ok(true)
+}
+
+/// Transcode to a file on disk -- the path the Media tab uses for real matches.
+pub fn transcode_to_file(path: &str, out_path: &std::path::Path, quality: u8, max_frames: Option<usize>,
+                         progress: impl FnMut(usize, usize)) -> Result<TranscodeReport, String> {
+    let f = std::fs::File::create(out_path).map_err(|e| format!("creating {}: {e}", out_path.display()))?;
+    let r = transcode_to_writer(path, std::io::BufWriter::new(f), quality, max_frames, progress)
+        .map(|(_, rep)| rep);
+    if r.is_err() { let _ = std::fs::remove_file(out_path); }
+    r
+}
+
+/// The in-memory form, for small previews: the SAME streaming loop into a
+/// Vec, so there is one frame path, not two.
+pub fn transcode(path: &str, quality: u8, max_frames: Option<usize>,
+                 progress: impl FnMut(usize, usize)) -> Result<(Vec<u8>, TranscodeReport), String> {
+    transcode_to_writer(path, std::io::Cursor::new(Vec::new()), quality, max_frames, progress)
+        .map(|(c, r)| (c.into_inner(), r))
 }
 
 fn decode_yuv_from_rgb(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
@@ -137,6 +234,103 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One raw source frame, for tests only. The public in-memory decoder is gone
+    /// -- unbounded, it was how an hour of 1080p became terabytes -- so a test that
+    /// needs a single frame asks ffmpeg for exactly one.
+    fn first_frame(path: &std::path::Path, w: usize, h: usize) -> Vec<u8> {
+        let out = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(path)
+            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .output().expect("ffmpeg");
+        assert_eq!(out.stdout.len(), w * h * 3, "one {w}x{h} frame");
+        out.stdout
+    }
+
+    // ── the probe traps, pure ──
+
+    fn stream(i: u64, kind: &str, w: u64, h: u64, rate: &str, attached: u64) -> String {
+        format!(r#"{{"index":{i},"codec_type":"{kind}","codec_name":"x","width":{w},"height":{h},
+                    "avg_frame_rate":"{rate}","disposition":{{"attached_pic":{attached}}}}}"#)
+    }
+
+    /// Stream 0 is audio in an OBS capture. fao_app took streams[0] and
+    /// substituted 640x480; this must find the video.
+    #[test]
+    fn an_audio_first_file_probes_its_video_stream() {
+        let j = format!(r#"{{"streams":[{{"index":0,"codec_type":"audio"}},{}],"format":{{"duration":"2.0"}}}}"#,
+                        stream(1, "video", 1920, 1080, "60/1", 0));
+        let v = parse_probe(&j).unwrap();
+        assert_eq!((v.w, v.h, v.stream), (1920, 1080, 1));
+    }
+
+    /// MKV cover art is a `video` stream with attached_pic. Taking it would size
+    /// every frame as a thumbnail while ffmpeg decodes the real picture.
+    #[test]
+    fn cover_art_is_skipped() {
+        let j = format!(r#"{{"streams":[{},{}],"format":{{}}}}"#,
+                        stream(0, "video", 300, 300, "0/0", 1), stream(1, "video", 2560, 1440, "144/1", 0));
+        let v = parse_probe(&j).unwrap();
+        assert_eq!((v.w, v.h, v.stream), (2560, 1440, 1));
+    }
+
+    /// No video is an ERROR -- never a made-up size.
+    #[test]
+    fn audio_only_is_an_error_not_640x480() {
+        let j = r#"{"streams":[{"index":0,"codec_type":"audio"}],"format":{}}"#;
+        assert!(parse_probe(j).unwrap_err().contains("no video stream"));
+    }
+
+    /// The rate stays an exact rational: NTSC and 144 fps both survive.
+    #[test]
+    fn rates_are_kept_exact() {
+        let ntsc = parse_probe(&format!(r#"{{"streams":[{}],"format":{{}}}}"#,
+                                        stream(0, "video", 64, 64, "30000/1001", 0))).unwrap();
+        assert_eq!(ntsc.rate, (30000, 1001));
+        let hi = parse_probe(&format!(r#"{{"streams":[{}],"format":{{}}}}"#,
+                                      stream(0, "video", 64, 64, "144/1", 0))).unwrap();
+        assert_eq!(hi.rate, (144, 1));
+    }
+
+    // ── end to end, real ffmpeg ──
+
+    /// A 144 fps capture keeps 144 fps. Through the old float path it was
+    /// written as 12.9 and played eleven times too slow.
+    #[test]
+    fn a_144fps_capture_keeps_its_rate_on_disk() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-144-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mp4");
+        make_test_video(&src, 64, 48, 12, 144);
+        let out = dir.join("out.fao");
+        let rep = transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        assert_eq!(rep.frames, 12);
+        let f = crate::decode::FaoFile::open_stream(Box::new(std::fs::File::open(&out).unwrap())).unwrap();
+        assert!((f.fps() - 144.0).abs() < 1e-6, "stored as {} fps", f.fps());
+        assert_eq!(f.frame_count(), 12);
+        assert!(f.decode_rgb(11).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real bug file: audio first. Transcodes at its true size.
+    #[test]
+    fn an_audio_first_mkv_transcodes_at_its_real_size() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-af-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("af.mkv");
+        let ok = Command::new("ffmpeg").args(["-v", "error", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=0.3",
+            "-map", "0:a", "-map", "1:v", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+            .arg(&src).status().unwrap().success();
+        assert!(ok, "fixture");
+        let (bytes, rep) = transcode(src.to_str().unwrap(), 80, None, |_, _| {}).unwrap();
+        assert_eq!((rep.w, rep.h), (320, 240), "not the 640x480 fao_app would have guessed");
+        let f = crate::decode::FaoFile::parse(bytes).unwrap();
+        assert_eq!((f.width(), f.height()), (320, 240));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn have_ffmpeg() -> bool {
         Command::new("ffmpeg").arg("-version").output().map(|o| o.status.success()).unwrap_or(false)
@@ -224,8 +418,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("in.mp4");
         make_test_video(&path, 64, 48, 1, 10);
-        let frames = decode_frames_rgb(path.to_str().unwrap(), 64, 48, Some(1)).expect("decode");
-        let rgb = &frames[0];
+        let rgb = &first_frame(&path, 64, 48);
         let (w, h) = (64usize, 48usize);
         let yuv = decode_yuv_from_rgb(rgb, w, h);
         for q in [10u8, 50, 80, 95] {

@@ -90,6 +90,118 @@ pub fn write_dct_fao(
     Ok(out)
 }
 
+/// Writes a `.fao` one frame at a time, in constant memory.
+///
+/// ## Why: every existing writer held the whole video
+///
+/// `write_fao_container` takes every frame as a slice, and `transcode` also
+/// returned the finished file as one `Vec<u8>` -- three full copies of a video
+/// in memory at once. For an hour of 1080p60 that is terabytes. This writes each
+/// frame as it arrives and holds only the running counts.
+///
+/// ## The index is at the FRONT, and the frame count is not known in advance
+///
+/// The format puts the index right after the header, so it must be sized before
+/// any frame is written -- and for an MKV the frame count is not in the stream
+/// header (`nb_frames` is absent; checked with ffprobe). So the caller reserves
+/// index slots from duration x rate plus a margin. Unused slots are a harmless
+/// gap before the first frame: every reader reads exactly `frame_count` entries
+/// and follows each entry's offset, never assuming frames start at the index's
+/// end. Over-reserving costs 16 bytes a slot, so be generous; running out is an
+/// error, not a silent truncation.
+pub struct FaoStreamWriter<W: std::io::Write + std::io::Seek> {
+    out: W,
+    reserved: u64,
+    count: u64,
+    next_off: u64,
+    total_comp: u64,
+}
+
+const HEADER: u64 = 30;
+const ENTRY: u64 = 16;
+
+impl<W: std::io::Write + std::io::Seek> FaoStreamWriter<W> {
+    /// Start a file. `fps_num / fps_den` is written as given -- pass the source's
+    /// own rational (e.g. from ffprobe) or `fao_codec_lib::fps_ratio(fps)`.
+    pub fn new(mut out: W, w: usize, h: usize, fps_num: u16, fps_den: u16, quality: u8,
+               reserve: u64) -> std::io::Result<Self> {
+        use std::io::{Error, ErrorKind, SeekFrom};
+        if w == 0 || h == 0 || w % 2 != 0 || h % 2 != 0 || w > u16::MAX as usize || h > u16::MAX as usize {
+            return Err(Error::new(ErrorKind::InvalidInput, format!("{w}x{h}: must be even and <= 65535")));
+        }
+        if reserve == 0 || reserve > u32::MAX as u64 {
+            return Err(Error::new(ErrorKind::InvalidInput, "reserve must be 1..=u32::MAX frames"));
+        }
+        out.seek(SeekFrom::Start(0))?;
+        out.write_all(b"FAO2")?;
+        out.write_all(&1u16.to_le_bytes())?;
+        out.write_all(&(w as u16).to_le_bytes())?;
+        out.write_all(&(h as u16).to_le_bytes())?;
+        out.write_all(&fps_num.to_le_bytes())?;
+        out.write_all(&fps_den.to_le_bytes())?;
+        out.write_all(&0u32.to_le_bytes())?;          // frame_count: patched by `finish`
+        out.write_all(&30u16.to_le_bytes())?;         // gop_size, as write_fao_container
+        out.write_all(&[quality])?;
+        out.write_all(&[0u8])?;                       // flags
+        out.write_all(&0u64.to_le_bytes())?;          // total_compressed: patched
+        // The reserved index, zeroed, written in chunks rather than one huge Vec.
+        let zeros = [0u8; 64 * 1024];
+        let mut left = reserve * ENTRY;
+        while left > 0 {
+            let n = left.min(zeros.len() as u64) as usize;
+            out.write_all(&zeros[..n])?;
+            left -= n as u64;
+        }
+        Ok(FaoStreamWriter { out, reserved: reserve, count: 0, next_off: HEADER + reserve * ENTRY, total_comp: 0 })
+    }
+
+    /// Append one frame: its 13-byte header and payload, then its index entry.
+    /// `psnr` is stored as psnr x 10, as `write_fao_container` does.
+    pub fn push(&mut self, payload: &[u8], frame_type: u8, psnr: f64) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind, SeekFrom};
+        if self.count >= self.reserved {
+            return Err(Error::new(ErrorKind::Other,
+                format!("index full: {} slots reserved -- reserve more", self.reserved)));
+        }
+        let len = payload.len();
+        if len > u32::MAX as usize - 13 {
+            return Err(Error::new(ErrorKind::InvalidInput, "frame over 4 GB"));
+        }
+        let at = self.next_off;
+        self.out.seek(SeekFrom::Start(at))?;
+        // Byte-for-byte the frame layout `write_fao_container` emits.
+        self.out.write_all(&[frame_type])?;
+        self.out.write_all(&(len as u32).to_le_bytes())?;       // compressed_size
+        self.out.write_all(&(len as u32).to_le_bytes())?;       // recon_size
+        self.out.write_all(&((psnr * 10.0) as u16).to_le_bytes())?;
+        self.out.write_all(&[0u8])?;                              // skip_pct
+        self.out.write_all(&[0u8])?;                              // gmx
+        self.out.write_all(payload)?;
+        self.out.seek(SeekFrom::Start(HEADER + self.count * ENTRY))?;
+        self.out.write_all(&at.to_le_bytes())?;
+        self.out.write_all(&((13 + len) as u32).to_le_bytes())?;
+        self.out.write_all(&(len as u32).to_le_bytes())?;
+        self.next_off = at + 13 + len as u64;
+        self.count += 1;
+        self.total_comp += len as u64;
+        Ok(())
+    }
+
+    pub fn frames(&self) -> u64 { self.count }
+
+    /// Patch the frame count and total into the header, and hand back the writer.
+    pub fn finish(mut self) -> std::io::Result<W> {
+        use std::io::SeekFrom;
+        self.out.seek(SeekFrom::Start(14))?;
+        self.out.write_all(&(self.count as u32).to_le_bytes())?;
+        self.out.seek(SeekFrom::Start(22))?;
+        self.out.write_all(&self.total_comp.to_le_bytes())?;
+        self.out.seek(SeekFrom::Start(self.next_off))?;
+        self.out.flush()?;
+        Ok(self.out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +259,69 @@ mod tests {
                 .map(|(a, b)| (*a as i64 - *b as i64).unsigned_abs()).sum()
         };
         assert!(err(95) < err(10), "q95 {} should beat q10 {}", err(95), err(10));
+    }
+
+    fn payloads(frames: &[Vec<u8>], w: usize, h: usize, q: u8) -> Vec<Vec<u8>> {
+        frames.iter().map(|rgb| fao_v1::compress_frame_dct(&rgb_to_yuv420p(rgb, w, h), w, h, q)).collect()
+    }
+
+    /// BYTE-IDENTICAL to the library writer when the reserve is exact. This is
+    /// the proof the streaming writer produces the real format, not a lookalike.
+    #[test]
+    fn streaming_output_is_byte_identical_to_the_library_writer() {
+        let (w, h) = (32usize, 16usize);
+        let frames = vec![gradient(w, h, 10), gradient(w, h, 90), gradient(w, h, 200)];
+        let ps = payloads(&frames, w, h, 80);
+        let entries: Vec<_> = ps.iter().map(|p| (Vec::new(), p.clone(), b'D', p.len(), 0.0f64, 0.0f64)).collect();
+        let mut lib = Vec::new();
+        fao_v1::write_fao_container(&mut lib, w, h, 30.0, 0.8, &entries).unwrap();
+        let (n, d) = fao_v1::fps_ratio(30.0);
+        let mut sw = FaoStreamWriter::new(std::io::Cursor::new(Vec::new()), w, h, n, d, 80, 3).unwrap();
+        for p in &ps { sw.push(p, b'D', 0.0).unwrap(); }
+        let streamed = sw.finish().unwrap().into_inner();
+        assert_eq!(streamed, lib, "streamed file differs from write_fao_container's");
+    }
+
+    /// Over-reserved: a gap before the first frame, and every reader still
+    /// decodes it identically -- in memory AND streamed.
+    #[test]
+    fn an_over_reserved_index_decodes_identically() {
+        let (w, h) = (32usize, 16usize);
+        let frames = vec![gradient(w, h, 1), gradient(w, h, 128), gradient(w, h, 250)];
+        let ps = payloads(&frames, w, h, 80);
+        let exact = write_dct_fao(&frames, w, h, 30.0, 80).unwrap();
+        let (n, d) = fao_v1::fps_ratio(30.0);
+        let mut sw = FaoStreamWriter::new(std::io::Cursor::new(Vec::new()), w, h, n, d, 80, 500).unwrap();
+        for p in &ps { sw.push(p, b'D', 0.0).unwrap(); }
+        let gappy = sw.finish().unwrap().into_inner();
+        assert!(gappy.len() > exact.len() + 400 * 16, "the gap is really there");
+        let a = FaoFile::parse(exact).unwrap();
+        let b = FaoFile::parse(gappy.clone()).unwrap();
+        let c = FaoFile::open_stream(Box::new(std::io::Cursor::new(gappy))).unwrap();
+        assert_eq!(b.frame_count(), 3);
+        for i in 0..3 {
+            assert_eq!(b.decode_rgb(i).unwrap(), a.decode_rgb(i).unwrap(), "in-memory frame {i}");
+            assert_eq!(c.decode_rgb(i).unwrap(), a.decode_rgb(i).unwrap(), "streamed frame {i}");
+        }
+    }
+
+    /// A 144 fps header survives -- the rate game captures actually use.
+    #[test]
+    fn a_high_refresh_rate_is_stored_exactly() {
+        let (n, d) = fao_v1::fps_ratio(144.0);
+        let mut sw = FaoStreamWriter::new(std::io::Cursor::new(Vec::new()), 16, 16, n, d, 80, 1).unwrap();
+        sw.push(&fao_v1::compress_frame_dct(&rgb_to_yuv420p(&vec![0u8; 16*16*3], 16, 16), 16, 16, 80), b'D', 0.0).unwrap();
+        let f = FaoFile::parse(sw.finish().unwrap().into_inner()).unwrap();
+        assert!((f.fps() - 144.0).abs() < 1e-9, "{}", f.fps());
+    }
+
+    /// Running out of reserved slots is an error, not a silent truncation.
+    #[test]
+    fn exceeding_the_reserve_is_an_error() {
+        let mut sw = FaoStreamWriter::new(std::io::Cursor::new(Vec::new()), 16, 16, 30000, 1000, 80, 1).unwrap();
+        sw.push(b"D1", b'D', 0.0).unwrap();
+        assert!(sw.push(b"D2", b'D', 0.0).unwrap_err().to_string().contains("index full"));
+        assert!(FaoStreamWriter::new(std::io::Cursor::new(Vec::new()), 15, 16, 1, 1, 80, 1).is_err(), "odd width");
     }
 
     #[test]
