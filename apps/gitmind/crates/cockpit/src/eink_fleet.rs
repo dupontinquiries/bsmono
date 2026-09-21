@@ -929,9 +929,9 @@ pub fn build_target(route: &Route, model: Option<RmModel>) -> BuildTarget {
 /// ships std only for it, so `--target aarch64-unknown-linux-musl` fails
 /// there with "can't find crate for std"; Alpine also makes musl builds
 /// dynamic by default, which `+crt-static` overrides. See [`native_for`].
-pub fn tablet_build_cmd(bin: &str, t: &BuildTarget, inherited_rustflags: Option<&str>, native: bool) -> (Vec<String>, Vec<(String, String)>) {
+pub fn tablet_build_cmd(app: &TabletApp, t: &BuildTarget, inherited_rustflags: Option<&str>, native: bool) -> (Vec<String>, Vec<(String, String)>) {
     // `--bin`: works in a single-crate dir and inside a workspace alike.
-    let argv = crate::buildflags::cargo_build_argv_kind(bin, if native { "" } else { t.triple }, &[], false, true);
+    let argv = crate::buildflags::cargo_build_argv_kind(&app.bin, if native { "" } else { t.triple }, &app.features, app.no_default, true);
     let mut env = if native { Vec::new() } else { crate::buildflags::cross_env(t.triple) };
     if t.static_crt {
         let flag = "-C target-feature=+crt-static";
@@ -950,33 +950,84 @@ pub struct TabletApp {
     /// Crate directory (where `cargo build` runs).
     pub dir: std::path::PathBuf,
     pub bin: String,
+    /// Features to enable for the tablet build (the one that turns on
+    /// eink-kit, when it is optional).
+    pub features: Vec<String>,
+    /// Build without default features: set when eink-kit is behind a
+    /// feature, because the defaults are then the DESKTOP shell (eframe,
+    /// winit), which must not be compiled into a tablet binary.
+    pub no_default: bool,
 }
 
-/// Binary names a crate declares: every `[[bin]] name`, or the package name
-/// when there are none. Only for crates that ARE eink-kit or depend on it.
-pub fn eink_app_bins(cargo_toml: &str) -> Vec<String> {
+/// The tablet binaries a crate offers.
+///
+/// * eink-kit itself, or a crate depending on it unconditionally: every
+///   binary (or the package name when none are declared).
+/// * eink-kit behind a feature (the tomescope shape: `eink =
+///   ["dep:eink-kit"]`, desktop shell on by default): only the binaries whose
+///   `required-features` include that feature, built with it and without
+///   default features.
+pub fn eink_app_bins(cargo_toml: &str) -> Vec<(String, Vec<String>, bool)> {
     let mut section = String::new();
-    let (mut pkg, mut bins, mut is_eink) = (None, Vec::new(), false);
-    for line in cargo_toml.lines().map(str::trim) {
+    let mut pkg: Option<String> = None;
+    let mut is_kit = false;
+    let mut dep: Option<bool> = None; // Some(optional?)
+    let mut features: Vec<(String, String)> = Vec::new(); // (feature, raw list)
+    let mut bins: Vec<(String, String)> = Vec::new(); // (name, raw required-features)
+    for raw in cargo_toml.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
         if line.starts_with('[') {
             section = line.to_string();
+            if section == "[[bin]]" {
+                bins.push((String::new(), String::new()));
+            }
             continue;
         }
-        let kv = line.split_once('=').map(|(k, v)| (k.trim(), v.trim().trim_matches('"')));
-        match (section.as_str(), kv) {
-            ("[package]", Some(("name", v))) => {
-                is_eink |= v == "eink-kit";
-                pkg = Some(v.to_string());
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        let unq = v.trim_matches('"');
+        match section.as_str() {
+            "[package]" if k == "name" => {
+                is_kit = unq == "eink-kit";
+                pkg = Some(unq.to_string());
             }
-            ("[[bin]]", Some(("name", v))) => bins.push(v.to_string()),
-            (s, Some((k, _))) if s.contains("dependencies") && k == "eink-kit" => is_eink = true,
+            "[[bin]]" => {
+                if let Some(last) = bins.last_mut() {
+                    if k == "name" { last.0 = unq.to_string(); }
+                    if k == "required-features" { last.1 = v.to_string(); }
+                }
+            }
+            "[features]" => features.push((k.to_string(), v.to_string())),
+            s if s.contains("dependencies") && k == "eink-kit" => {
+                dep = Some(v.contains("optional") && v.contains("true"));
+            }
             _ => {}
         }
     }
-    if !is_eink {
-        return Vec::new();
+    let quoted = |list: &str, want: &str| list.contains(&format!("\"{want}\""));
+    match (is_kit, dep) {
+        (true, _) | (false, Some(false)) => {
+            let names: Vec<String> = if bins.is_empty() {
+                pkg.into_iter().filter(|p| p != "eink-kit").collect()
+            } else {
+                bins.into_iter().map(|b| b.0).collect()
+            };
+            names.into_iter().map(|n| (n, vec![], false)).collect()
+        }
+        (false, Some(true)) => {
+            let gates: Vec<String> = features.iter()
+                .filter(|(_, list)| quoted(list, "dep:eink-kit") || quoted(list, "eink-kit"))
+                .map(|(f, _)| f.clone())
+                .collect();
+            bins.into_iter()
+                .filter_map(|(name, req)| {
+                    let f = gates.iter().find(|g| quoted(&req, g))?;
+                    Some((name, vec![f.clone()], true))
+                })
+                .collect()
+        }
+        (false, None) => Vec::new(),
     }
-    if bins.is_empty() { pkg.into_iter().filter(|p| p != "eink-kit").collect() } else { bins }
 }
 
 /// Every eink-kit app under `root/{apps,shared}` (two levels of crates deep,
@@ -986,8 +1037,8 @@ pub fn discover_tablet_apps(root: &std::path::Path) -> Vec<TabletApp> {
     let mut stack: Vec<(std::path::PathBuf, u8)> = ["apps", "shared"].iter().map(|d| (root.join(d), 0)).collect();
     while let Some((dir, depth)) = stack.pop() {
         if let Ok(t) = std::fs::read_to_string(dir.join("Cargo.toml")) {
-            for bin in eink_app_bins(&t) {
-                out.push(TabletApp { dir: dir.clone(), bin });
+            for (bin, features, no_default) in eink_app_bins(&t) {
+                out.push(TabletApp { dir: dir.clone(), bin, features, no_default });
             }
         }
         if depth >= 3 {
@@ -1641,7 +1692,8 @@ mod tests {
     #[test]
     fn tablet_builds_force_static_even_for_egui_apps_and_keep_existing_rustflags() {
         let t = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
-        let (argv, env) = tablet_build_cmd("eink-demo", &t, Some("-C opt-level=s"), false);
+        let demo = TabletApp { dir: ".".into(), bin: "eink-demo".into(), features: vec![], no_default: false };
+        let (argv, env) = tablet_build_cmd(&demo, &t, Some("-C opt-level=s"), false);
         assert!(argv.windows(2).any(|w| w == ["--bin", "eink-demo"]), "{argv:?}");
         assert!(argv.windows(2).any(|w| w == ["--target", "aarch64-unknown-linux-musl"]), "{argv:?}");
         let rf = env.iter().find(|(k, _)| k == "RUSTFLAGS").map(|(_, v)| v.as_str()).unwrap();
@@ -1649,7 +1701,7 @@ mod tests {
         assert!(!rf.contains("-crt-static ") && !rf.starts_with("-C target-feature=-crt-static"));
         assert_eq!(tablet_build_output("eink-demo", &t, false), "target/aarch64-unknown-linux-musl/release/eink-demo");
         // on the phone: native, no --target, still static
-        let (argv, env) = tablet_build_cmd("eink-demo", &t, None, true);
+        let (argv, env) = tablet_build_cmd(&demo, &t, None, true);
         assert!(!argv.iter().any(|a| a == "--target"), "{argv:?}");
         assert_eq!(env, vec![("RUSTFLAGS".to_string(), "-C target-feature=+crt-static".to_string())]);
         assert_eq!(tablet_build_output("eink-demo", &t, true), "target/release/eink-demo");
@@ -1716,11 +1768,44 @@ mod tests {
     #[test]
     fn eink_apps_are_found_by_their_dependency() {
         let kit = "[package]\nname = \"eink-kit\"\n[dependencies]\negui = \"0.34\"\n[[bin]]\nname = \"eink-demo\"\npath = \"x\"\n";
-        assert_eq!(eink_app_bins(kit), vec!["eink-demo"]);
-        let app = "[package]\nname = \"tomescope-eink\"\n[dependencies]\neink-kit = { path = \"../eink-kit\" }\n";
-        assert_eq!(eink_app_bins(app), vec!["tomescope-eink"]);
+        assert_eq!(eink_app_bins(kit), vec![("eink-demo".to_string(), vec![], false)]);
+        let app = "[package]\nname = \"reader-eink\"\n[dependencies]\neink-kit = { path = \"../eink-kit\" }\n";
+        assert_eq!(eink_app_bins(app), vec![("reader-eink".to_string(), vec![], false)]);
         let other = "[package]\nname = \"hatch\"\n[dependencies]\negui = \"0.34\"\n";
         assert!(eink_app_bins(other).is_empty());
+    }
+
+    #[test]
+    fn a_feature_gated_port_offers_only_its_tablet_binary() {
+        // the tomescope shape
+        let t = r#"[package]
+name = "tomescope"
+[[bin]]
+name = "tomescope"
+path = "src/main.rs"
+required-features = ["desktop"]
+[[bin]]
+name = "tomescope-eink"
+path = "src/bin/tomescope_eink.rs"
+required-features = ["eink"]
+[[bin]]
+name = "shelfctl"
+required-features = ["shelfctl"]
+[features]
+default = ["desktop", "shelfctl"]
+desktop = ["dep:eframe"]
+eink = ["dep:eink-kit"]
+[dependencies]
+eframe = { version = "0.34", optional = true }
+eink-kit = { path = "../../shared/eink-kit", optional = true }
+"#;
+        assert_eq!(eink_app_bins(t), vec![("tomescope-eink".to_string(), vec!["eink".to_string()], true)]);
+        let app = TabletApp { dir: ".".into(), bin: "tomescope-eink".into(), features: vec!["eink".into()], no_default: true };
+        let target = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
+        let (argv, _) = tablet_build_cmd(&app, &target, None, false);
+        for want in ["--no-default-features", "--features", "eink", "--bin", "tomescope-eink"] {
+            assert!(argv.iter().any(|a| a == want), "{want} missing from {argv:?}");
+        }
     }
 
     #[test]
@@ -1729,6 +1814,9 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../..");
         let apps = discover_tablet_apps(&root);
         assert!(apps.iter().any(|a| a.bin == "eink-demo" && a.dir.ends_with("shared/eink-kit")), "{apps:?}");
+        let ts = apps.iter().find(|a| a.bin == "tomescope-eink").expect("tomescope port discovered");
+        assert!(ts.no_default && ts.features == ["eink"]);
+        assert!(!apps.iter().any(|a| a.bin == "tomescope" || a.bin == "shelfctl"), "desktop bins offered: {apps:?}");
     }
 
     #[test]

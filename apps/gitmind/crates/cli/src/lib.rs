@@ -1516,7 +1516,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
             };
             let t = ef::build_target(&route, probe.model);
             let native = ef::native_for(&t);
-            let (argv, env) = ef::tablet_build_cmd(bin, &t, std::env::var("RUSTFLAGS").ok().as_deref(), native);
+            let (argv, env) = ef::tablet_build_cmd(&app, &t, std::env::var("RUSTFLAGS").ok().as_deref(), native);
             eprintln!("  $ {}  (in {}; {})", argv.join(" "), app.dir.display(), t.why);
             let st = std::process::Command::new(&argv[0]).args(&argv[1..]).current_dir(&app.dir).envs(env).status();
             match st {

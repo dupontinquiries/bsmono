@@ -255,7 +255,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             s.task.run_logged(move |log| {
                 let t = ef::build_target(&r, m);
                 let native = ef::native_for(&t);
-                let (argv, env) = ef::tablet_build_cmd(&app.bin, &t, std::env::var("RUSTFLAGS").ok().as_deref(), native);
+                let (argv, env) = ef::tablet_build_cmd(&app, &t, std::env::var("RUSTFLAGS").ok().as_deref(), native);
                 log.push(&format!("$ {}  (in {})", argv.join(" "), app.dir.display()));
                 let mut cmd = std::process::Command::new(&argv[0]);
                 cmd.args(&argv[1..]).current_dir(&app.dir).envs(env)

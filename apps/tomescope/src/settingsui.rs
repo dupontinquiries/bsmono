@@ -6,7 +6,7 @@
 
 use crate::layout::{FontFamily, Typography};
 use crate::theme::{ReaderPrefs, ReadingTheme};
-use eframe::egui::{self, RichText, Slider};
+use egui::{self, RichText, Slider};
 use snapclone_theme::PaletteId;
 use uikit_egui::{toggle_grid, PaletteColors};
 
