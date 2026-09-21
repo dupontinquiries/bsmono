@@ -39,8 +39,7 @@ const INPUT_TOUCH_UPDATE: i32 = 0x12;
 const INPUT_PEN_PRESS: i32 = 0x20;
 const INPUT_PEN_RELEASE: i32 = 0x21;
 const INPUT_PEN_UPDATE: i32 = 0x22;
-/// Pen gets an id no finger will use.
-const PEN_ID: u32 = 1000;
+use crate::touch::PEN_ID;
 
 /// qtfb refresh modes (REFRESH_MODE_*).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

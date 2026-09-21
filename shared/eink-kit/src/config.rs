@@ -20,6 +20,9 @@ pub struct Config {
     pub trace: bool,
     /// `EINK_TOUCH`: calibration flags for raw evdev input.
     pub touch: Transform,
+    /// `EINK_PEN`: the same flags for the pen digitizer, whose axes differ
+    /// from the touchscreen's on these devices.
+    pub pen: Transform,
     /// `EINK_FAST_WAVEFORM`: what "fast" means on the device (ufast|fast|animate).
     pub fast_waveform: Option<String>,
     /// `EINK_SETTLE_MS`: quiet time before the clean-up refresh.
@@ -55,6 +58,7 @@ impl Config {
             None => None,
         };
         let touch = Transform::parse(&env("EINK_TOUCH").unwrap_or_default())?;
+        let pen = Transform::parse(&env("EINK_PEN").unwrap_or_default()).map_err(|e| e.replace("EINK_TOUCH", "EINK_PEN"))?;
         let num = |k: &str, d: u64| env(k).and_then(|v| v.parse().ok()).unwrap_or(d);
         let mem_size = env("EINK_MEM_SIZE")
             .and_then(|s| s.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))))
@@ -66,6 +70,7 @@ impl Config {
             feather: env("EINK_FEATHER").map(|v| v == "1"),
             trace: env("EINK_TRACE").as_deref() == Some("1"),
             touch,
+            pen,
             fast_waveform: env("EINK_FAST_WAVEFORM"),
             settle: Duration::from_millis(num("EINK_SETTLE_MS", 450)),
             min_frame: Duration::from_millis(num("EINK_MIN_FRAME_MS", 120)),

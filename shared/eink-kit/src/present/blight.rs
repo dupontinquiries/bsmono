@@ -147,7 +147,8 @@ struct SendPtr<T>(*mut T);
 unsafe impl<T> Send for SendPtr<T> {}
 
 impl BlightPresent {
-    pub fn connect(model: Model, fast: c_int, touch: Transform, input: InputSender) -> io::Result<BlightPresent> {
+    pub fn connect(model: Model, fast: c_int, touch: Transform, pen: Transform, input: InputSender) -> io::Result<BlightPresent> {
+        let input_pen = input.clone();
         let api = std::sync::Arc::new(load()?);
         let mut bus = std::ptr::null_mut();
         if unsafe { (api.bus_connect_system)(&mut bus) } < 0 || bus.is_null() {
@@ -205,6 +206,38 @@ impl BlightPresent {
                 }
             }
             None => eprintln!("eink: no multitouch device found; touch disabled"),
+        }
+        // The pen: the reMarkable's primary input. Same route as touch (the
+        // display server owns input), its own decoder (single tool, BTN_TOUCH).
+        match super::evdev::find_pen() {
+            Some(dev) => {
+                let ib = unsafe { (api.service_input_open)(bus, dev.number) };
+                if ib.is_null() {
+                    eprintln!("eink: blight refused input for event{} (pen); pen disabled", dev.number);
+                } else {
+                    eprintln!("eink: pen = event{} {:?} x{:?} y{:?} (transform {:?})", dev.number, dev.name, dev.x, dev.y, pen);
+                    let api2 = api.clone();
+                    let ib = SendPtr(ib);
+                    let input = input_pen;
+                    let mut dec = crate::touch::PenDecoder::new(dev.x, dev.y, w, h, pen);
+                    std::thread::Builder::new().name("blight-pen".into()).spawn(move || {
+                        let ib = ib;
+                        let mut out = Vec::new();
+                        loop {
+                            let mut ev: *mut libc::input_event = std::ptr::null_mut();
+                            let r = unsafe { (api2.event_from_buffer)(ib.0, &mut ev, true) };
+                            if r < 0 || ev.is_null() {
+                                return; // touch reports Closed; the pen just stops
+                            }
+                            let e = unsafe { *ev };
+                            unsafe { (api2.event_free)(ev) };
+                            dec.feed(e.type_, e.code, e.value, &mut out);
+                            super::evdev::forward_pen(&dec, &mut out, &input);
+                        }
+                    })?;
+                }
+            }
+            None => eprintln!("eink: no pen digitizer found"),
         }
         Ok(BlightPresent {
             api,

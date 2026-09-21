@@ -32,6 +32,15 @@ pub const ABS_MT_SLOT: u16 = 0x2f;
 pub const ABS_MT_POSITION_X: u16 = 0x35;
 pub const ABS_MT_POSITION_Y: u16 = 0x36;
 pub const ABS_MT_TRACKING_ID: u16 = 0x39;
+pub const EV_KEY: u16 = 0x01;
+pub const ABS_X: u16 = 0x00;
+pub const ABS_Y: u16 = 0x01;
+pub const ABS_PRESSURE: u16 = 0x18;
+pub const BTN_TOOL_PEN: u16 = 0x140;
+pub const BTN_TOOL_RUBBER: u16 = 0x141;
+pub const BTN_TOUCH: u16 = 0x14a;
+/// Touch id used for the pen, so it never collides with a finger slot.
+pub const PEN_ID: u32 = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Phase {
@@ -196,6 +205,73 @@ impl MtDecoder {
     }
 }
 
+/// The pen digitizer: one tool, absolute axes, `BTN_TOUCH` for contact.
+///
+/// Emits touch events (id [`PEN_ID`]) only while the tip is DOWN. Hover is
+/// reported by the digitizer continuously; forwarding it would move egui's
+/// pointer on every hover sample and each move can cost a panel refresh, so
+/// hover is tracked (for calibration displays) but never emitted.
+pub struct PenDecoder {
+    pub x_range: AbsRange,
+    pub y_range: AbsRange,
+    pub width: u32,
+    pub height: u32,
+    pub transform: Transform,
+    raw_x: i32,
+    raw_y: i32,
+    touching: bool,
+    was_touching: bool,
+    moved: bool,
+    /// Eraser end in use (BTN_TOOL_RUBBER).
+    pub eraser: bool,
+    pub last_raw: Option<(i32, i32)>,
+}
+
+impl PenDecoder {
+    pub fn new(x_range: AbsRange, y_range: AbsRange, width: u32, height: u32, transform: Transform) -> PenDecoder {
+        PenDecoder { x_range, y_range, width, height, transform, raw_x: 0, raw_y: 0, touching: false, was_touching: false, moved: false, eraser: false, last_raw: None }
+    }
+
+    fn map(&self) -> (f32, f32) {
+        // Same normalise → swap → invert → scale as the touch decoder.
+        let m = MtDecoder::new(self.x_range, self.y_range, self.width, self.height, self.transform);
+        m.map(self.raw_x, self.raw_y)
+    }
+
+    pub fn feed(&mut self, ty: u16, code: u16, value: i32, out: &mut Vec<TouchEvent>) {
+        match (ty, code) {
+            (EV_ABS, ABS_X) => { self.raw_x = value; self.moved = true; }
+            (EV_ABS, ABS_Y) => { self.raw_y = value; self.moved = true; }
+            (EV_KEY, BTN_TOUCH) => self.touching = value != 0,
+            (EV_KEY, BTN_TOOL_RUBBER) => self.eraser = value != 0,
+            (EV_KEY, BTN_TOOL_PEN) if value == 0 => self.touching = false, // tool left range
+            (EV_SYN, SYN_REPORT) => {
+                self.last_raw = Some((self.raw_x, self.raw_y));
+                let (x, y) = self.map();
+                let phase = match (self.was_touching, self.touching) {
+                    (false, true) => Some(Phase::Start),
+                    (true, true) if self.moved => Some(Phase::Move),
+                    (true, false) => Some(Phase::End),
+                    _ => None, // hover, or down and still
+                };
+                if let Some(phase) = phase {
+                    out.push(TouchEvent { id: PEN_ID, phase, x, y });
+                }
+                self.was_touching = self.touching;
+                self.moved = false;
+            }
+            (EV_SYN, SYN_DROPPED) => {
+                if self.was_touching {
+                    out.push(TouchEvent { id: PEN_ID, phase: Phase::End, x: 0.0, y: 0.0 });
+                }
+                self.touching = false;
+                self.was_touching = false;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Touch → egui, with pointer emulation for the first finger.
 #[derive(Default)]
 pub struct TouchToEgui {
@@ -307,6 +383,54 @@ mod tests {
         let e = feed(&mut d, &[(EV_SYN, SYN_DROPPED, 0)]);
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].phase, Phase::End);
+    }
+
+    fn pen() -> PenDecoder {
+        PenDecoder::new(AbsRange { min: 0, max: 20966 }, AbsRange { min: 0, max: 15725 }, 1404, 1872, Transform::default())
+    }
+
+    #[test]
+    fn pen_hover_is_silent_and_contact_is_a_touch() {
+        let mut p = pen();
+        let mut out = vec![];
+        // tool enters range and hovers: nothing
+        for (t, c, v) in [(EV_KEY, BTN_TOOL_PEN, 1), (EV_ABS, ABS_X, 1000), (EV_ABS, ABS_Y, 1000), (EV_SYN, SYN_REPORT, 0),
+                          (EV_ABS, ABS_X, 1200), (EV_SYN, SYN_REPORT, 0)] {
+            p.feed(t, c, v, &mut out);
+        }
+        assert!(out.is_empty(), "hover must not emit: {out:?}");
+        assert!(p.last_raw.is_some(), "hover is still tracked for calibration");
+        // tip down, move, up
+        for (t, c, v) in [(EV_KEY, BTN_TOUCH, 1), (EV_ABS, ABS_PRESSURE, 900), (EV_SYN, SYN_REPORT, 0),
+                          (EV_ABS, ABS_X, 2000), (EV_SYN, SYN_REPORT, 0),
+                          (EV_ABS, ABS_PRESSURE, 400), (EV_SYN, SYN_REPORT, 0), // pressure only: not a move
+                          (EV_KEY, BTN_TOUCH, 0), (EV_SYN, SYN_REPORT, 0)] {
+            p.feed(t, c, v, &mut out);
+        }
+        let phases: Vec<Phase> = out.iter().map(|e| e.phase).collect();
+        assert_eq!(phases, vec![Phase::Start, Phase::Move, Phase::End]);
+        assert!(out.iter().all(|e| e.id == PEN_ID));
+    }
+
+    #[test]
+    fn pen_leaving_range_while_down_ends_the_stroke() {
+        let mut p = pen();
+        let mut out = vec![];
+        for (t, c, v) in [(EV_KEY, BTN_TOOL_PEN, 1), (EV_KEY, BTN_TOUCH, 1), (EV_SYN, SYN_REPORT, 0),
+                          (EV_KEY, BTN_TOOL_PEN, 0), (EV_SYN, SYN_REPORT, 0)] {
+            p.feed(t, c, v, &mut out);
+        }
+        assert_eq!(out.last().map(|e| e.phase), Some(Phase::End));
+    }
+
+    #[test]
+    fn pen_and_finger_share_the_pointer_first_come_first_served() {
+        let mut t = TouchToEgui::default();
+        let mut out = vec![];
+        t.translate(&TouchEvent { id: PEN_ID, phase: Phase::Start, x: 100.0, y: 100.0 }, 2.0, &mut out);
+        t.translate(&TouchEvent { id: 0, phase: Phase::Start, x: 900.0, y: 900.0 }, 2.0, &mut out);
+        let moves: Vec<_> = out.iter().filter_map(|e| if let Event::PointerMoved(p) = e { Some(*p) } else { None }).collect();
+        assert_eq!(moves, vec![Pos2::new(50.0, 50.0)], "the palm/finger must not steal the pointer from the pen");
     }
 
     #[test]

@@ -448,7 +448,7 @@ pub fn open_backend(cfg: &Config, hub: &InputHub) -> std::io::Result<Box<dyn Pre
     if want == "blight" || want == "auto" {
         let fast = blight::fast_waveform(&fast_name).ok_or_else(|| err(format!("EINK_FAST_WAVEFORM={fast_name:?} unknown")))?;
         eprintln!("eink: blight, fast waveform = {fast_name}");
-        return match blight::BlightPresent::connect(model, fast, cfg.touch, hub.sender()) {
+        return match blight::BlightPresent::connect(model, fast, cfg.touch, cfg.pen, hub.sender()) {
             Ok(p) => Ok(Box::new(p)),
             Err(e) if want == "auto" => Err(err(format!(
                 "no display backend: not launched from AppLoad (no QTFB_KEY), and Blight failed: {e}"))),
