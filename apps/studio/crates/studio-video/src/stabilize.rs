@@ -412,6 +412,77 @@ pub fn solve(path: &[Pose], flavor: &Flavor, budget: Budget, w: u32, h: u32) -> 
     }
 }
 
+/// When stabilization is allowed to act at all.
+///
+/// An always-on stabilizer cannot tell the camera moving from people moving:
+/// on a locked-off tripod shot, actors crossing the frame read as camera
+/// motion and get "corrected" into real shake. That happened on the film's
+/// rooftop wide. So correction is gated on the CAMERA path, and opens on
+/// either of two things:
+///
+/// * **travel** — the smoothed path is really going somewhere (a pan, a
+///   tripod swinging loose): `lo`..`hi`, fractions of frame width per frame;
+/// * **shake** — the path jitters around its smoothed self by more than
+///   actors in frame could cause (a handheld shot shaking in place):
+///   `shake_lo`..`shake_hi`, fractions of frame width.
+///
+/// The first version gated on travel alone, and a test with pure handheld
+/// shake and no pan caught it: that shot was left uncorrected. Defaults from
+/// the rooftop prototype (0.35 and 1.2 px/frame at 480 wide for travel; the
+/// actors' wobble there was about 1 px at 480 wide, real shake several).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActivityGate { pub lo: f32, pub hi: f32, pub shake_lo: f32, pub shake_hi: f32 }
+
+impl Default for ActivityGate {
+    fn default() -> ActivityGate {
+        ActivityGate { lo: 0.35 / 480.0, hi: 1.2 / 480.0, shake_lo: 1.5 / 480.0, shake_hi: 4.0 / 480.0 }
+    }
+}
+
+fn ramp(x: f32, lo: f32, hi: f32) -> f32 {
+    let t = ((x - lo) / (hi - lo).max(1e-9)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The gate's openness per frame, 0 (shut) to 1 (open), from the camera path.
+/// Both measures are smoothed over about half a second so the gate opens and
+/// closes gently rather than per frame.
+pub fn gate_values(path: &[Pose], w: u32, g: ActivityGate) -> Vec<f32> {
+    let n = path.len();
+    if n < 3 { return vec![0.0; n]; }
+    let wf = w.max(1) as f32;
+    let xs: Vec<f32> = path.iter().map(|p| p.x).collect();
+    let ys: Vec<f32> = path.iter().map(|p| p.y).collect();
+    let (sx, sy) = (gaussian(&xs, 6.0), gaussian(&ys, 6.0));
+    let speed: Vec<f32> = (0..n).map(|i| {
+        let (a, b) = (i.saturating_sub(1), (i + 1).min(n - 1));
+        let d = (b - a).max(1) as f32;
+        ((sx[b] - sx[a]) / d).hypot((sy[b] - sy[a]) / d) / wf
+    }).collect();
+    let dev2: Vec<f32> = (0..n).map(|i| ((xs[i] - sx[i]).powi(2) + (ys[i] - sy[i]).powi(2)) / (wf * wf)).collect();
+    let (travel, shake) = (gaussian(&speed, 12.0), gaussian(&dev2, 12.0));
+    travel.iter().zip(&shake).map(|(t, d)| ramp(*t, g.lo, g.hi).max(ramp(d.sqrt(), g.shake_lo, g.shake_hi))).collect()
+}
+
+/// [`solve`], with every correction scaled by the activity gate. A shot whose
+/// camera never really moves comes back with zero correction and no zoom --
+/// untouched -- instead of being "stabilized" against its actors. `Track` is
+/// not gated: following a subject is wanted even when the camera is still.
+pub fn solve_gated(path: &[Pose], flavor: &Flavor, budget: Budget, w: u32, h: u32, g: ActivityGate) -> Solution {
+    let mut s = solve(path, flavor, budget, w, h);
+    if matches!(flavor, Flavor::Track { .. }) { return s; }
+    let gv = gate_values(path, w, g);
+    for (c, k) in s.corrections.iter_mut().zip(&gv) { c.dx *= k; c.dy *= k; c.rot *= k; }
+    // the zoom only has to hide what is actually applied now
+    let need_x = s.corrections.iter().map(|c| c.dx.abs()).fold(0.0, f32::max) * 2.0 / w as f32;
+    let need_y = s.corrections.iter().map(|c| c.dy.abs()).fold(0.0, f32::max) * 2.0 / h as f32;
+    let worst_rot = s.corrections.iter().fold(0.0f32, |a, c| a.max(c.rot.abs()));
+    let zoom = 1.0 + need_x.max(need_y).max(worst_rot.sin().abs() * (w as f32 + h as f32) / w.min(h) as f32);
+    for c in s.corrections.iter_mut() { c.zoom = zoom; }
+    s.zoom = zoom;
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,6 +650,51 @@ mod tests {
         let flat = solve(&measure(&frames, 16), &Flavor::Still, Budget { max_zoom: 1.3 }, 240, 135);
         assert!(flat.corrections.iter().all(|c| c.rot == 0.0));
         assert!(flat.zoom < s.zoom, "{} vs {}", flat.zoom, s.zoom);
+    }
+
+    #[test]
+    fn a_locked_off_shot_with_moving_actors_is_left_alone() {
+        // The rooftop's lesson: the measured "camera path" of a tripod shot
+        // wobbles because actors move in frame. Ungated, Smooth corrects that
+        // wobble into shake; gated, it must not touch the shot at all.
+        let mut r = Rng::new(9);
+        let wobble: Vec<Pose> = (0..120).map(|_| Pose { x: (r.next() as f32 - 0.5) * 1.6,
+            y: (r.next() as f32 - 0.5) * 1.2, rot: 0.0 }).collect();
+        let open = solve(&wobble, &Flavor::Smooth { sigma: 8.0 }, ROOMY, 1920, 1080);
+        assert!(open.corrections.iter().any(|c| c.dx.abs() > 0.3), "ungated, the wobble IS corrected");
+        let gated = solve_gated(&wobble, &Flavor::Smooth { sigma: 8.0 }, ROOMY, 1920, 1080, ActivityGate::default());
+        assert!(gated.corrections.iter().all(|c| c.dx == 0.0 && c.dy == 0.0), "gated: untouched");
+        assert_eq!(gated.zoom, 1.0, "and not zoomed either");
+    }
+
+    #[test]
+    fn handheld_shake_without_a_pan_still_opens_the_gate() {
+        // shaking in place, several px at 480 wide, no travel at all
+        let mut r = Rng::new(12);
+        let shake: Vec<Pose> = (0..120).map(|_| Pose { x: (r.next() as f32 - 0.5) * 16.0,
+            y: (r.next() as f32 - 0.5) * 12.0, rot: 0.0 }).collect();
+        let g = gate_values(&shake, 480, ActivityGate::default());
+        assert!(g[30..90].iter().all(|v| *v > 0.9), "real shake opens the gate: {:?}", &g[30..35]);
+    }
+
+    #[test]
+    fn the_gate_opens_for_a_real_swing_and_closes_after_it() {
+        // still for 2 s, a 3-second swing of ~6 px/frame at 1920 wide with shake, still again
+        let mut r = Rng::new(4);
+        let mut x = 0.0f32;
+        let path: Vec<Pose> = (0..168).map(|i| {
+            if (48..120).contains(&i) { x += 6.0 + (r.next() as f32 - 0.5) * 8.0; }
+            Pose { x: x + (r.next() as f32 - 0.5) * 0.8, y: 0.0, rot: 0.0 }
+        }).collect();
+        let g = gate_values(&path, 1920, ActivityGate::default());
+        assert!(g[10] < 0.05 && g[160] < 0.05, "shut while the tripod is still: {} {}", g[10], g[160]);
+        assert!(g[84] > 0.95, "open mid-swing: {}", g[84]);
+        let s = solve_gated(&path, &Flavor::Smooth { sigma: 8.0 }, ROOMY, 1920, 1080, ActivityGate::default());
+        let raw: Vec<(f32, f32)> = path.iter().map(|p| (p.x, p.y)).collect();
+        let fixed = apply(&path, &s);
+        let seg = |v: &[(f32, f32)]| jitter(&v[60..110]);
+        assert!(seg(&fixed) < seg(&raw) * 0.5, "the swing's shake is reduced: {} vs {}", seg(&fixed), seg(&raw));
+        assert!(s.corrections[..20].iter().all(|c| c.dx.abs() < 1e-3), "and the still head is not touched");
     }
 
     #[test]

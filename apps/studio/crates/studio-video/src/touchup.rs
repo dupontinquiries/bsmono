@@ -176,7 +176,9 @@ pub fn render(t: &Ticket, out: &Path, size: Size, fps: f64) -> Result<Version, S
     for f in &t.fixes {
         match f {
             Fix::Stabilize { flavor, budget } => {
-                let s = stabilize::solve(&path, flavor, *budget, size.w, size.h);
+                // gated: a shot whose camera never really moves is left alone,
+                // rather than stabilized against its own actors
+                let s = stabilize::solve_gated(&path, flavor, *budget, size.w, size.h, stabilize::ActivityGate::default());
                 if s.clamped_px > 0.5 {
                     warnings.push(format!(
                         "stabilizer: {:.0} px of correction did not fit in the {:.0}% crop budget — \
