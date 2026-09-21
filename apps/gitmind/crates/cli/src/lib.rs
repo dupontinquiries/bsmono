@@ -1394,7 +1394,7 @@ fn iso_now() -> String {
 fn cmd_eink(rest: &[String]) -> i32 {
     use cockpit::eink_fleet as ef;
     const USAGE: &str = "usage: gitmind eink <enroll|probe|build|deploy|list|remove|stop|status|activate|wifi-ssh|retrust> <host> ...\n  \
-        build <host> <bin>                  build an eink-kit app of this checkout for that tablet's route\n  \
+        build <host> <bin> [--engine auto|host|container]   build an eink-kit app for that tablet (container = podman/docker rust:alpine)\n  \
         list <host>                         apps gitmind put in the tablet's AppLoad sidebar\n  \
         remove <host> <app>                 take one out again (never touches other apps)\n  \
         activate <host>                     after a reboot: start xovi or the launcher, whichever is needed\n  \
@@ -1523,24 +1523,27 @@ fn cmd_eink(rest: &[String]) -> i32 {
                 return eink_err(&format!("{bin}: not an eink-kit app in {}", root.display()));
             };
             let t = ef::build_target(&route, probe.model);
-            let native = ef::native_for(&t);
-            let tc = match ef::pick_toolchain_here(t.triple, native) { Ok(tc) => tc, Err(e) => return eink_err(&e) };
-            eprintln!("  toolchain: {} ({})", tc.cargo.display(), tc.origin);
-            let (mut argv, mut env) = ef::tablet_build_cmd(&app, &t, std::env::var("RUSTFLAGS").ok().as_deref(), native);
-            ef::use_toolchain(&mut argv, &mut env, &tc);
-            eprintln!("  $ {}  (in {}; {})", argv.join(" "), app.dir.display(), t.why);
-            if env.iter().any(|(k, v)| k.ends_with("_LINKER") && v == "rust-lld") {
-                eprintln!("  no musl cross linker on PATH: linking with rust-lld (self-contained)");
-            }
-            let st = std::process::Command::new(&argv[0]).args(&argv[1..]).current_dir(&app.dir).envs(env).status();
+            let engine = match opt(flags, "--engine") {
+                Some(e) => match ef::Engine::parse(e) { Some(e) => e, None => return eink_err("--engine: auto|host|container") },
+                None => ef::Engine::Auto,
+            };
+            let plan = match ef::plan_build(engine, &root, &app, &t, &std::env::var("PATH").unwrap_or_default(),
+                std::env::var("HOME").ok().as_deref(), std::env::var("CARGO").ok().as_deref()) {
+                Ok(p) => p,
+                Err(e) => return eink_err(&e),
+            };
+            eprintln!("  {}", plan.note);
+            eprintln!("  $ {}  (in {}; {})", plan.argv.join(" "), plan.cwd.display(), t.why);
+            let st = std::process::Command::new(&plan.argv[0]).args(&plan.argv[1..]).current_dir(&plan.cwd).envs(plan.env.clone()).status();
             match st {
                 Ok(s) if s.success() => {}
                 Ok(s) => return eink_err(&format!("build failed ({s})")),
-                Err(e) => return eink_err(&format!("cargo: {e}")),
+                Err(e) => return eink_err(&format!("could not run {}: {e}", plan.argv[0])),
             }
+            let native = ef::native_for(&t);
             let rel = ef::tablet_build_output(bin, &t, native);
-            let Some(path) = app.dir.ancestors().map(|d| d.join(&rel)).find(|p| p.exists()) else {
-                return eink_err(&format!("built, but {rel} not found"));
+            let Some(path) = [plan.output.clone()].into_iter().chain(app.dir.ancestors().map(|d| d.join(&rel))).find(|p| p.exists()) else {
+                return eink_err(&format!("built, but {} not found", plan.output.display()));
             };
             let path = path.to_string_lossy().to_string();
             match ef::preflight_binary(&path, &route, probe.model) {

@@ -45,6 +45,8 @@ pub struct State {
     pub selected: usize,
     /// (binary path, bin name) from the last successful build.
     pub built: Arc<Mutex<Option<(String, String)>>>,
+    /// Host toolchain, container (podman/docker), or auto.
+    pub engine: ef::Engine,
     /// AppLoad sidebar title; empty = the app name.
     pub display_name: String,
     /// Allow AppLoad's windowed mode (default off: fullscreen, crisp).
@@ -78,6 +80,7 @@ impl Default for State {
             apps: None,
             selected: 0,
             built: Arc::new(Mutex::new(None)),
+            engine: ef::Engine::Auto,
             display_name: String::new(),
             windowed: false,
             installed: Arc::new(Mutex::new(Vec::new())),
@@ -276,34 +279,38 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             ui.label(egui::RichText::new(format!("{}{}", t.triple, if native { " (native on this phone)" } else { "" })).small());
             ui.label(egui::RichText::new(t.why).weak().small());
         }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("build with");
+            ui.radio_value(&mut s.engine, ef::Engine::Auto, "auto");
+            ui.radio_value(&mut s.engine, ef::Engine::Host, "host toolchain");
+            ui.radio_value(&mut s.engine, ef::Engine::Container, "container (podman)");
+        });
         if ui.add_enabled(!busy && route.is_some(), egui::Button::new("Build for this tablet")).clicked() {
             let (r, m) = route.clone().unwrap();
             let app = apps[s.selected].clone();
+            let engine = s.engine;
             let built = s.built.clone();
             s.task.run_logged(move |log| {
                 let t = ef::build_target(&r, m);
-                let native = ef::native_for(&t);
-                // Pick the toolchain that HAS the target (distro vs rustup,
-                // and a launcher-started GUI may lack ~/.cargo/bin on PATH).
-                let tc = match ef::pick_toolchain_here(t.triple, native) { Ok(tc) => tc, Err(e) => return e };
-                log.push(&format!("toolchain: {} ({})", tc.cargo.display(), tc.origin));
-                let (mut argv, mut env) = ef::tablet_build_cmd(&app, &t, std::env::var("RUSTFLAGS").ok().as_deref(), native);
-                ef::use_toolchain(&mut argv, &mut env, &tc);
-                log.push(&format!("$ {}  (in {})", argv.join(" "), app.dir.display()));
-                if let Some((_, l)) = env.iter().find(|(k, v)| k.ends_with("_LINKER") && v == "rust-lld") {
-                    log.push(&format!("no musl cross linker on PATH: linking with {l} (self-contained)"));
-                }
+                let path = std::env::var("PATH").unwrap_or_default();
+                let plan = match ef::plan_build(engine, &cockpit::ops::repo_root(), &app, &t, &path,
+                    std::env::var("HOME").ok().as_deref(), std::env::var("CARGO").ok().as_deref()) {
+                    Ok(p) => p,
+                    Err(e) => return e,
+                };
+                log.push(&format!("{}", plan.note));
+                log.push(&format!("$ {}  (in {})", plan.argv.join(" "), plan.cwd.display()));
                 let mut errors: Vec<String> = Vec::new();
-                let mut cmd = std::process::Command::new(&argv[0]);
-                cmd.args(&argv[1..]).current_dir(&app.dir).envs(env)
-                    .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-                let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => return format!("could not run cargo: {e}") };
-                // cargo reports progress on stderr; stream it line by line.
+                let mut cmd = std::process::Command::new(&plan.argv[0]);
+                cmd.args(&plan.argv[1..]).current_dir(&plan.cwd).envs(plan.env.clone())
+                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+                let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => return format!("could not run {}: {e}", plan.argv[0]) };
+                // cargo (and podman) report progress on stderr; stream it.
                 if let Some(err) = child.stderr.take() {
                     use std::io::BufRead;
                     for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
-                        let t = line.trim_start();
-                        if t.starts_with("error") || t.starts_with("= note") || t.starts_with("--> ") {
+                        let tl = line.trim_start();
+                        if tl.starts_with("error") || tl.starts_with("= note") || tl.starts_with("--> ") || tl.contains("exec format error") || tl.starts_with("Error:") {
                             errors.push(line.clone());
                         }
                         log.push(&line);
@@ -316,10 +323,10 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                     let first: Vec<String> = errors.into_iter().take(12).collect();
                     return format!("build failed (exit {:?}) for {}\n{}", status.code(), t.triple, first.join("\n"));
                 }
-                // A workspace member builds into the workspace's target dir.
-                let rel = ef::tablet_build_output(&app.bin, &t, native);
-                let path = app.dir.ancestors().map(|d| d.join(&rel)).find(|p| p.exists());
-                let Some(path) = path else { return format!("built, but {rel} was not found") };
+                let Some(path) = [plan.output.clone()].into_iter().chain(
+                    // a host build in a workspace member lands in the workspace's target dir
+                    app.dir.ancestors().map(|d| d.join(ef::tablet_build_output(&app.bin, &t, ef::native_for(&t))))
+                ).find(|p| p.exists()) else { return format!("built, but {} was not found", plan.output.display()) };
                 let path = path.to_string_lossy().to_string();
                 match ef::preflight_binary(&path, &r, m) {
                     Ok(_) => {

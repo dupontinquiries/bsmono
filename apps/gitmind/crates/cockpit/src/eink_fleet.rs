@@ -1284,6 +1284,141 @@ pub fn check_tablet_binary(bytes: &[u8], t: &BuildTarget) -> Result<(), String> 
     Ok(())
 }
 
+// ───────────────────────── build plans: host or container ─────────────────────────
+
+/// How to build a tablet app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    /// A host toolchain that has the target, else a container, else explain.
+    Auto,
+    /// A Rust toolchain on this machine (`pick_toolchain`).
+    Host,
+    /// podman (or docker) with the official `rust:alpine` image: the toolchain
+    /// is the image's, so the host's Rust setup does not matter. The setup
+    /// that worked for Fairphone musl builds on macOS.
+    Container,
+}
+
+impl Engine {
+    pub fn parse(s: &str) -> Option<Engine> {
+        match s.trim() {
+            "auto" => Some(Engine::Auto),
+            "host" => Some(Engine::Host),
+            "container" | "podman" | "docker" => Some(Engine::Container),
+            _ => None,
+        }
+    }
+}
+
+/// The multi-arch official image. musl-native, rustup inside.
+pub const CONTAINER_IMAGE: &str = "docker.io/library/rust:1-alpine";
+/// A named volume for the crates.io cache, so rebuilds do not re-download.
+pub const CONTAINER_CACHE: &str = "gitmind-tablet-cargo";
+
+/// podman if present (rootless: output files stay yours), else docker.
+pub fn container_runtime(path_env: &str) -> Option<&'static str> {
+    ["podman", "docker"].into_iter().find(|r| crate::nixtoolchain::on_path(r, path_env))
+}
+
+/// Everything needed to run one build and find its output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildPlan {
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub cwd: std::path::PathBuf,
+    /// Where the binary lands (absolute).
+    pub output: std::path::PathBuf,
+    /// One line for the log: which engine, which toolchain or image.
+    pub note: String,
+}
+
+/// A container build of `app` for `t`, mounting `repo_root` (path
+/// dependencies such as tomescope → shared/eink-kit must resolve inside).
+///
+/// * aarch64 targets: `--platform linux/arm64`, a NATIVE musl build inside
+///   Alpine (fast on Apple Silicon; qemu-emulated on x86, which needs
+///   qemu-user-static / binfmt on Linux).
+/// * armv7 (rM2): the host-arch image cross-compiles, adding the target and
+///   linking with rust-lld (unverified, like the host rust-lld path).
+///
+/// `:Z` relabels the mount for SELinux (Fedora); a separate target dir keeps
+/// container output from mixing with host builds.
+pub fn container_plan(runtime: &str, repo_root: &std::path::Path, app: &TabletApp, t: &BuildTarget) -> Result<BuildPlan, String> {
+    if !t.static_crt {
+        return Err("container builds cover the AppLoad route (static musl); the Blight route needs a glibc build on the host".into());
+    }
+    let rel = app.dir.strip_prefix(repo_root).map_err(|_| format!("{} is not inside {}", app.dir.display(), repo_root.display()))?;
+    let rel = rel.to_string_lossy().to_string();
+    let workdir = if rel.is_empty() { "/src".to_string() } else { format!("/src/{rel}") };
+    let target_dir = format!("{workdir}/target/tablet-container");
+    let mut cargo = vec!["cargo".to_string(), "build".into(), "--release".into(), "--bin".into(), app.bin.clone()];
+    if app.no_default {
+        cargo.push("--no-default-features".into());
+    }
+    if !app.features.is_empty() {
+        cargo.push("--features".into());
+        cargo.push(app.features.join(","));
+    }
+    let native = t.triple.starts_with("aarch64");
+    let mut script = String::from("apk add --no-cache musl-dev >/dev/null && ");
+    let output_rel;
+    if native {
+        script += &format!("RUSTFLAGS='-C target-feature=+crt-static' {}", cargo.join(" "));
+        output_rel = format!("{rel}/target/tablet-container/release/{}", app.bin);
+    } else {
+        cargo.push("--target".into());
+        cargo.push(t.triple.into());
+        script += &format!(
+            "rustup target add {tr} >/dev/null && {lv}=rust-lld RUSTFLAGS='-C target-feature=+crt-static -C link-self-contained=yes' {c}",
+            tr = t.triple, lv = crate::buildflags::linker_var(t.triple), c = cargo.join(" "));
+        output_rel = format!("{rel}/target/tablet-container/{}/release/{}", t.triple, app.bin);
+    }
+    let mut argv: Vec<String> = vec![runtime.into(), "run".into(), "--rm".into()];
+    if native {
+        argv.extend(["--platform".into(), "linux/arm64".into()]);
+    }
+    argv.extend([
+        "-v".into(), format!("{}:/src:Z", repo_root.display()),
+        "-v".into(), format!("{CONTAINER_CACHE}:/usr/local/cargo/registry"),
+        "-w".into(), workdir,
+        "-e".into(), format!("CARGO_TARGET_DIR={target_dir}"),
+        CONTAINER_IMAGE.into(), "sh".into(), "-c".into(), script,
+    ]);
+    Ok(BuildPlan {
+        argv,
+        env: vec![],
+        cwd: repo_root.to_path_buf(),
+        output: repo_root.join(output_rel.trim_start_matches('/')),
+        note: format!("{runtime} with {CONTAINER_IMAGE}{}", if native { " (linux/arm64, native musl)" } else { " (cross, rust-lld)" }),
+    })
+}
+
+/// A host-toolchain build (what `tablet_build_cmd` + `use_toolchain` do).
+pub fn host_plan(app: &TabletApp, t: &BuildTarget, tc: &Toolchain, native: bool, inherited_rustflags: Option<&str>) -> BuildPlan {
+    let (mut argv, mut env) = tablet_build_cmd(app, t, inherited_rustflags, native);
+    use_toolchain(&mut argv, &mut env, tc);
+    let rel = tablet_build_output(&app.bin, t, native);
+    let output = app.dir.ancestors().map(|d| d.join(&rel)).find(|p| p.exists()).unwrap_or_else(|| app.dir.join(&rel));
+    BuildPlan { argv, env, cwd: app.dir.clone(), output, note: format!("host toolchain {} ({})", tc.cargo.display(), tc.origin) }
+}
+
+/// Choose and build the plan for `engine`. Errors explain every engine
+/// tried, so "installed but not found" and "no podman" both read plainly.
+pub fn plan_build(engine: Engine, repo_root: &std::path::Path, app: &TabletApp, t: &BuildTarget, path_env: &str, home: Option<&str>, cargo_env: Option<&str>) -> Result<BuildPlan, String> {
+    let native = native_for(t);
+    let rustflags = std::env::var("RUSTFLAGS").ok();
+    let host = || pick_toolchain(t.triple, native, path_env, home, cargo_env).map(|tc| host_plan(app, t, &tc, native, rustflags.as_deref()));
+    let container = || match container_runtime(path_env) {
+        Some(r) => container_plan(r, repo_root, app, t),
+        None => Err("no container runtime found (podman or docker)".into()),
+    };
+    match engine {
+        Engine::Host => host(),
+        Engine::Container => container(),
+        Engine::Auto => host().or_else(|he| container().map_err(|ce| format!("{he}\nand the container fallback: {ce}"))),
+    }
+}
+
 // ───────────────────────── AppLoad management ─────────────────────────
 
 /// How an app appears in AppLoad's sidebar (manifest keys from rm-appload
@@ -1517,6 +1652,23 @@ pub fn diagnose(text: &str) -> Vec<crate::finding::Finding> {
             .help("install it (rustup), then build again; or build on an aarch64 postmarketOS phone, where the AppLoad route builds natively")
             .fix(format!("rustup target add {triple}")),
             if has("is not installed on this machine") { "is not installed" } else { "can't find crate" });
+    }
+    if has("no container runtime found") {
+        add(Finding::new(Info, "build-no-container", "no podman or docker on this machine for a container build")
+            .help("Fedora: `sudo dnf install podman qemu-user-static`; macOS: install podman, then `podman machine init && podman machine start`"),
+            "no container runtime");
+    }
+    if has("exec format error") {
+        add(Finding::new(Error, "build-container-no-emulation", "this machine cannot run the arm64 build container")
+            .note("the Paper Pro build runs natively in a linux/arm64 image; on an x86 machine that needs qemu user emulation")
+            .help("Fedora: `sudo dnf install qemu-user-static` (registers binfmt), then build again; on Apple Silicon no emulation is needed")
+            .fix("sudo dnf install qemu-user-static"),
+            "exec format error");
+    }
+    if has("Cannot connect to Podman") || has("podman machine") && has("not running") {
+        add(Finding::new(Error, "build-podman-machine", "podman's VM is not running (macOS)")
+            .fix("podman machine start"),
+            if has("Cannot connect to Podman") { "Cannot connect to Podman" } else { "not running" });
     }
     if has("no Rust toolchain found") {
         add(Finding::new(Error, "build-no-toolchain", "gitmind found no Rust toolchain to build with")
@@ -2339,5 +2491,58 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
             assert!(t.is_ok(), "{t:?}");
             assert!(pick_toolchain_here("aarch64-unknown-linux-musl", false).is_err(), "not installed here");
         }
+    }
+
+    #[test]
+    fn a_paper_pro_container_build_is_native_arm64_musl_with_the_repo_mounted() {
+        let root = std::path::Path::new("/home/user/mono");
+        let app = TabletApp { dir: root.join("apps/tomescope"), bin: "tomescope-eink".into(), features: vec!["eink".into()], no_default: true };
+        let t = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
+        let p = container_plan("podman", root, &app, &t).unwrap();
+        let a = p.argv.join(" ");
+        for want in ["podman run --rm --platform linux/arm64", "-v /home/user/mono:/src:Z", "-w /src/apps/tomescope",
+                     "CARGO_TARGET_DIR=/src/apps/tomescope/target/tablet-container", CONTAINER_IMAGE,
+                     "+crt-static", "--bin tomescope-eink --no-default-features --features eink"] {
+            assert!(a.contains(want), "{want:?} not in {a}");
+        }
+        assert_eq!(p.output, root.join("apps/tomescope/target/tablet-container/release/tomescope-eink"));
+        assert_eq!(p.cwd, root);
+        // the rM2 cross-compiles with rust-lld instead
+        let rm2 = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::Rm2));
+        let p = container_plan("docker", root, &app, &rm2).unwrap();
+        let a = p.argv.join(" ");
+        assert!(!a.contains("--platform") && a.contains("rustup target add armv7-unknown-linux-musleabihf") && a.contains("=rust-lld"), "{a}");
+        assert!(p.output.ends_with("armv7-unknown-linux-musleabihf/release/tomescope-eink"));
+        // Blight (glibc) is not a container job
+        assert!(container_plan("podman", root, &app, &build_target(&Route::Blight, Some(RmModel::PaperPro))).is_err());
+    }
+
+    #[test]
+    fn auto_falls_back_to_the_container_and_explains_both_when_neither_works() {
+        let root = std::env::temp_dir().join(format!("plan_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let app = TabletApp { dir: root.join("shared/eink-kit"), bin: "eink-demo".into(), features: vec![], no_default: false };
+        let t = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
+        // no toolchain, no runtime: both reasons in one error
+        let e = plan_build(Engine::Auto, &root, &app, &t, &bin.to_string_lossy(), None, None).unwrap_err();
+        assert!(e.contains("no Rust toolchain found") && e.contains("no container runtime"), "{e}");
+        let codes: Vec<String> = diagnose(&e).into_iter().map(|f| f.code).collect();
+        assert!(codes.contains(&"build-no-toolchain".to_string()) && codes.contains(&"build-no-container".to_string()), "{codes:?}");
+        // podman appears: auto uses it
+        std::fs::write(bin.join("podman"), "").unwrap();
+        let p = plan_build(Engine::Auto, &root, &app, &t, &bin.to_string_lossy(), None, None).unwrap();
+        assert!(p.note.starts_with("podman"), "{}", p.note);
+        assert_eq!(p.argv[0], "podman");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn container_failures_explain_themselves() {
+        let f = diagnose("exec /bin/sh: exec format error");
+        assert_eq!(f[0].code, "build-container-no-emulation");
+        assert!(diagnose("Error: Cannot connect to Podman. Please verify your connection").iter().any(|f| f.fix.as_deref() == Some("podman machine start")));
+        assert_eq!(Engine::parse("podman"), Some(Engine::Container));
     }
 }
