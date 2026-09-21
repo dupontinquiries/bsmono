@@ -62,6 +62,7 @@ pub mod overview;
 pub mod insert_by_content;
 pub mod stage;
 pub mod kaleido_gallery;
+pub mod signals_panel;
 pub mod touchup_job;
 pub mod mixer_panel;
 pub mod morph_pad;
@@ -687,11 +688,17 @@ impl Studio {
     /// each as it lands so the timeline fills in progressively. `None` for
     /// a file with no audio stream (a picture, not a failure). Blocking: the
     /// shell runs it on a worker thread; tests run it inline.
+    ///
+    /// `wake` is called after every delivery. A timed repaint request alone
+    /// did not reliably wake the window: seen on screen, the status sat at
+    /// "1 to go" with the last clip long extracted, until the mouse moved.
     pub fn extract_video_audio(pending: Vec<(studio_core::SourceId, std::path::PathBuf)>,
-                               tx: std::sync::mpsc::Sender<(studio_core::SourceId, Option<studio_audio::SourceAudio>)>) {
+                               tx: std::sync::mpsc::Sender<(studio_core::SourceId, Option<studio_audio::SourceAudio>)>,
+                               wake: impl Fn()) {
         for (id, path) in pending {
             let audio = studio_video::extract_audio(&path).ok().flatten();
             if tx.send((id, audio)).is_err() { return; } // the shell went away
+            wake();
         }
     }
 
@@ -2960,7 +2967,9 @@ mod tests {
         assert!(t.elapsed() < std::time::Duration::from_millis(500), "opening stays fast: {:?}", t.elapsed());
         // and the worker delivers it
         let (tx, rx) = std::sync::mpsc::channel();
-        Studio::extract_video_audio(s.pending_video_audio.clone(), tx);
+        let woken = std::sync::atomic::AtomicUsize::new(0);
+        Studio::extract_video_audio(s.pending_video_audio.clone(), tx, || { woken.fetch_add(1, std::sync::atomic::Ordering::SeqCst); });
+        assert_eq!(woken.load(std::sync::atomic::Ordering::SeqCst), 1, "the window is woken once per delivery");
         let (id, audio) = rx.recv().expect("one delivery");
         assert_eq!(id, studio_core::SourceId(1));
         let audio = audio.expect("the video's audio came through");
@@ -3229,6 +3238,8 @@ pub struct App {
     /// how many are still to come — for the status line.
     video_audio_rx: Option<std::sync::mpsc::Receiver<(studio_core::SourceId, Option<studio_audio::SourceAudio>)>>,
     video_audio_left: usize,
+    /// Where background workers find the egui context to wake the window.
+    ui_waker: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>>,
     /// What was said in each source — whisper transcripts, loaded from a
     /// folder of `.srt` files beside the media or picked in the palette.
     /// Session state: a transcript is a reading of the media, rebuildable,
@@ -3239,6 +3250,8 @@ pub struct App {
     /// loses what the previous filter hid.
     words_raw: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
     word_filter: studio_voice::WordFilter,
+    /// The signals window, open over one camera group.
+    signals_panel: Option<signals_panel::Panel>,
     /// The look copied by "style: copy", waiting to be pasted.
     style_ref: Option<studio_video::style::Stats>,
     /// The kaleidoscope gallery, open over the selected clip's frame.
@@ -3392,9 +3405,14 @@ impl Default for App {
         let beside = transcripts::beside_media(&studio.session.doc.project);
         let pending_video = std::mem::take(&mut studio.pending_video_audio);
         let video_audio_left = pending_video.len();
+        // The worker wakes the window through this slot; the first frame fills it.
+        let ui_waker: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>> = Default::default();
         let video_audio_rx = (!pending_video.is_empty()).then(|| {
             let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || Studio::extract_video_audio(pending_video, tx));
+            let w = ui_waker.clone();
+            std::thread::spawn(move || Studio::extract_video_audio(pending_video, tx, move || {
+                if let Some(c) = w.lock().ok().and_then(|g| g.clone()) { c.request_repaint(); }
+            }));
             rx
         });
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
@@ -3448,7 +3466,7 @@ impl Default for App {
               touchup_run: None,
               multiview: None,
               peak_band: studio_audio::Band::Full,
-              video_audio_rx, video_audio_left,
+              video_audio_rx, video_audio_left, ui_waker,
               // Whisper writes a transcript beside its media by default, so
               // look there first — no command needed for the common case.
               words: beside.words.clone(),
@@ -3457,6 +3475,7 @@ impl Default for App {
               structure_view: false,
               kaleido_gallery: None,
               style_ref: None,
+              signals_panel: None,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
               upscale_clip: None,
@@ -3840,6 +3859,12 @@ impl eframe::App for App {
                         .on_hover_text("sections across, lanes down — for projects too big to read track by track")
                         .clicked() {
                         self.structure_view = !self.structure_view;
+                        ui.close();
+                    }
+                    if ui.add_enabled(!groups.is_empty(), egui::Button::new("cut a camera group by signals…"))
+                        .on_hover_text("see the lanes — kick, control channels, line starts — weight them, and plan a cut that says why")
+                        .clicked() {
+                        if let Some((g, _)) = groups.first() { self.open_signals(*g); }
                         ui.close();
                     }
                     ui.separator();
@@ -4262,6 +4287,7 @@ impl eframe::App for App {
         self.export_tracker_window(ctx);
         self.touchup_tracker(ctx);
         self.kaleido_gallery_window(ctx);
+        self.signals_window(ctx);
 
         // ── files dropped on the window ──────────────────────────────────
         //
@@ -4550,6 +4576,7 @@ impl eframe::App for App {
             }
         }
 
+        if let Ok(mut w) = self.ui_waker.lock() { if w.is_none() { *w = Some(ctx.clone()); } }
         // ── video sources' audio, arriving from the extraction worker ────
         if let Some(rx) = &self.video_audio_rx {
             let mut got = Vec::new();
@@ -7150,6 +7177,59 @@ impl App {
             Ok(px) => self.kaleido_gallery = Some(kaleido_gallery::Gallery::new(px, 320, 180)),
             Err(e) => self.studio.status = format!("could not read a frame for the gallery: {e:?}"),
         }
+    }
+
+    /// Build the lanes for a camera group's span and open the window.
+    fn open_signals(&mut self, group: studio_core::GroupId) {
+        use studio_video::signals;
+        const HOP: f64 = signals_panel::HOP;
+        let project = &self.studio.session.doc.project;
+        let Ok((_, start, end)) = studio_video::multicam::from_group(project, group) else {
+            self.studio.status = "that group is not a camera group".into(); return;
+        };
+        let span = (end.0 - start.0) as f64 / studio_core::TICKS_PER_SECOND as f64;
+        let mut lanes = Vec::new();
+        // the kick: the low band of the mix over the span
+        let mix = self.studio.render_arrangement_range(16_000, &self.audio, start, end);
+        if !mix.is_empty() {
+            let mono: Vec<f32> = mix.chunks(2).map(|p| (p[0] + p.get(1).copied().unwrap_or(0.0)) * 0.5).collect();
+            lanes.push(signals::onset_lane("kick (mix)", &mono, 16_000, HOP, (20.0, 150.0)));
+        }
+        // every control channel's level
+        for b in project.busses.values().filter(|b| b.silent) {
+            if let Some(st) = studio_audio::bus_signal(project, &self.audio, &Default::default(), start, end, 16_000, b.id) {
+                let mono: Vec<f32> = st.chunks(2).map(|p| (p[0] + p.get(1).copied().unwrap_or(0.0)) * 0.5).collect();
+                lanes.push(signals::Signal::new(&format!("level: {}", b.name), HOP,
+                    studio_video::particles::envelope(&mono, 16_000, 1.0 / HOP)));
+            }
+        }
+        // where lines start, from the loaded transcripts
+        let starts = signals_panel::line_starts(project, group, start, &self.words_raw);
+        if !starts.is_empty() { lanes.push(signals::pulses("line start", &starts, span, HOP, 0.12)); }
+        if lanes.is_empty() {
+            self.studio.status = "no signals over this group yet: no audio, control channels or transcripts".into();
+            return;
+        }
+        let marks = signals_panel::marks(project, start, end);
+        self.signals_panel = Some(signals_panel::Panel { group, lanes, marks, span, threshold: 0.35, min_gap: 1.5, planned: Vec::new() });
+    }
+
+    fn signals_window(&mut self, ctx: &egui::Context) {
+        let Some(p) = &mut self.signals_panel else { return };
+        let mut open = true;
+        let mut go = None;
+        egui::Window::new("Signals — when to cut").open(&mut open).default_width(560.0).show(ctx, |ui| { go = p.show(ui); });
+        if let Some(cands) = go {
+            match signals_panel::plan_ops(&self.studio.session.doc.project, p.group, &cands) {
+                Ok((ops, shots)) => {
+                    self.studio.edit_group(ops, "multicam by signals");
+                    self.studio.status = format!("{shots} shot(s) on a new track, a 'why' marker at each cut");
+                    p.planned = cands;
+                }
+                Err(e) => self.studio.status = e,
+            }
+        }
+        if !open { self.signals_panel = None; }
     }
 
     fn kaleido_gallery_window(&mut self, ctx: &egui::Context) {

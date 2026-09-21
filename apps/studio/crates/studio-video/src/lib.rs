@@ -70,6 +70,8 @@ pub mod testkit;
 pub mod stabilize;
 /// Touch-up: a ticket for one shot becomes a fixed version of it, with handles and a report.
 pub mod touchup;
+/// Operator signal lanes: weighted inputs, hard marks, cut candidates that say why.
+pub mod signals;
 /// Particles: dirt, dust and smoke, deterministic and driven by audio.
 pub mod particles;
 /// Match-move rig: track points sharing one rigid transform, surviving points that disappear.
