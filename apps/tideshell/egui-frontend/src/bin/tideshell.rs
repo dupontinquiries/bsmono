@@ -18,7 +18,7 @@ use std::time::Instant;
 use egui::{Pos2, Rect, Vec2};
 use tideshell_core::{Action, Shell, TouchEvent};
 use tideshell_egui::effects::{self, Executor, Outcome, System};
-use tideshell_egui::layer::{Gl, Input, Io, Role, POINTER_SLOT};
+use tideshell_egui::layer::{shape_for, CursorWant, Gl, Input, Io, Role, POINTER_SLOT};
 use tideshell_egui::{AppTile, FrameInfo, ShellView};
 
 const STRIP_PX: u32 = 28;
@@ -282,6 +282,14 @@ fn main() {
             });
         });
         sb.execute(frame_actions);
+        // Over the overlay: what egui asked for, or nothing in fat mode (the
+        // disc is the cursor; this also hides the system arrow over our
+        // surfaces during a held drag, which cosmic-comp's timeout cannot).
+        io.set_overlay_cursor(if sb.shell.fat.is_some() {
+            CursorWant::Hidden
+        } else {
+            CursorWant::Shape(shape_for(out.platform_output.cursor_icon))
+        });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         if let Err(e) = gl.paint(size_px, out.pixels_per_point, &prims, &out.textures_delta) {
             eprintln!("tideshell: {e}");

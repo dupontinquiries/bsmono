@@ -2620,6 +2620,7 @@ dependencies = [
  "uikit-egui",
  "wayland-client",
  "wayland-egl",
+ "wayland-protocols",
  "wayland-protocols-wlr",
  "zbus",
 ]

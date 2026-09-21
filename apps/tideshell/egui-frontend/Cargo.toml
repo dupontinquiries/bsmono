@@ -28,7 +28,7 @@ wayland = ["dep:systemcompkit"]
 ei = ["dep:reis", "dep:zbus"]
 # The real shell: layer-shell edge strips + an egui overlay on EGL (egui_glow).
 # Links libwayland-client and libEGL, unlike the pure-Rust `wayland` feature.
-layer = ["wayland", "dep:wayland-client", "dep:wayland-protocols-wlr", "dep:wayland-egl", "dep:khronos-egl", "dep:egui_glow", "dep:glow", "dep:rustix"]
+layer = ["wayland", "dep:wayland-client", "dep:wayland-protocols-wlr", "dep:wayland-egl", "dep:khronos-egl", "dep:egui_glow", "dep:glow", "dep:rustix", "dep:wayland-protocols"]
 
 [dependencies]
 tideshell-core = { path = "../crates/tideshell-core" }
@@ -43,6 +43,8 @@ zbus = { version = "5", optional = true }
 wayland-client = { version = "0.31", features = ["system"], optional = true }
 wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
 wayland-egl = { version = "0.32", optional = true }
+# wp_cursor_shape_v1 (needs both staging and unstable: it references tablet v2).
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"], optional = true }
 khronos-egl = { version = "6", features = ["static"], optional = true }
 egui_glow = { version = "0.34", optional = true }
 glow = { version = "0.17", optional = true }

@@ -44,12 +44,43 @@ use wayland_client::protocol::{
     wl_touch::{self, WlTouch},
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_protocols::wp::cursor_shape::v1::client::{
+    wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1},
+    wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1},
 };
 
 pub const BTN_LEFT: u32 = 0x110;
+
+/// What the pointer should look like over a surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorWant {
+    Shape(Shape),
+    /// No cursor image (fat cursor mode: the shell draws its own).
+    Hidden,
+}
+
+/// egui's requested cursor, as a cursor-shape name. Pure.
+pub fn shape_for(icon: egui::CursorIcon) -> Shape {
+    use egui::CursorIcon as C;
+    match icon {
+        C::PointingHand => Shape::Pointer,
+        C::Text | C::VerticalText => Shape::Text,
+        C::Grab => Shape::Grab,
+        C::Grabbing => Shape::Grabbing,
+        C::Move | C::AllScroll => Shape::Move,
+        C::ResizeHorizontal | C::ResizeEast | C::ResizeWest | C::ResizeColumn => Shape::EwResize,
+        C::ResizeVertical | C::ResizeNorth | C::ResizeSouth | C::ResizeRow => Shape::NsResize,
+        C::NotAllowed | C::NoDrop => Shape::NotAllowed,
+        C::Wait => Shape::Wait,
+        C::Progress => Shape::Progress,
+        C::Crosshair => Shape::Crosshair,
+        _ => Shape::Default,
+    }
+}
 pub const POINTER_SLOT: i32 = -1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -102,6 +133,33 @@ pub struct State {
     ptr_pos: (f32, f32),
     ptr_down: bool,
     touch_roles: HashMap<i32, (Role, (f32, f32))>,
+    cursor_mgr: Option<WpCursorShapeManagerV1>,
+    shape_device: Option<WpCursorShapeDeviceV1>,
+    /// Serial of the last pointer enter: set_shape / set_cursor must quote it.
+    enter_serial: Option<u32>,
+    overlay_cursor: CursorWant,
+    applied: Option<(Role, CursorWant)>,
+}
+
+impl State {
+    /// Apply the wanted cursor for the surface the pointer is over. Strips
+    /// get the default arrow; the overlay whatever the view asked for.
+    fn apply_cursor(&mut self) {
+        let (Some(role), Some(serial), Some(pointer)) = (self.ptr_role, self.enter_serial, self.pointer.clone()) else { return };
+        let want = if role == Role::Overlay { self.overlay_cursor } else { CursorWant::Shape(Shape::Default) };
+        if self.applied == Some((role, want)) {
+            return;
+        }
+        match (want, &self.shape_device) {
+            // A null cursor surface hides the pointer over our surface.
+            (CursorWant::Hidden, _) => pointer.set_cursor(serial, None, 0, 0),
+            (CursorWant::Shape(s), Some(dev)) => dev.set_shape(serial, s),
+            // No cursor-shape manager: leave the compositor's choice alone
+            // rather than hide it (the old, invisible-cursor behaviour).
+            (CursorWant::Shape(_), None) => return,
+        }
+        self.applied = Some((role, want));
+    }
 }
 
 impl State {
@@ -147,6 +205,11 @@ impl Io {
             ptr_pos: (0.0, 0.0),
             ptr_down: false,
             touch_roles: HashMap::new(),
+            cursor_mgr: globals.bind(&qh, 1..=1, ()).ok(),
+            shape_device: None,
+            enter_serial: None,
+            overlay_cursor: CursorWant::Shape(Shape::Default),
+            applied: None,
         };
         let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, strip_px, show_strips, right_enabled: false };
         for r in [Role::Top, Role::Bottom, Role::Right] {
@@ -252,6 +315,12 @@ impl Io {
         let _ = self.conn.flush();
     }
 
+    /// The cursor over the overlay (egui's icon, or hidden in fat mode).
+    pub fn set_overlay_cursor(&mut self, want: CursorWant) {
+        self.st.overlay_cursor = want;
+        self.st.apply_cursor();
+    }
+
     /// Wait up to `timeout_ms` for events, dispatch them, act on configures,
     /// and return the input gathered.
     pub fn dispatch(&mut self, timeout_ms: i32) -> Result<Vec<Input>, String> {
@@ -334,6 +403,8 @@ noop!(WlShmPool);
 noop!(WlRegion);
 noop!(ZwlrLayerShellV1);
 noop!(WlCallback);
+noop!(WpCursorShapeManagerV1);
+noop!(WpCursorShapeDeviceV1);
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
     fn event(_: &mut Self, _: &wl_registry::WlRegistry, _: wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
@@ -382,7 +453,9 @@ impl Dispatch<WlSeat, ()> for State {
     fn event(st: &mut Self, seat: &WlSeat, e: wl_seat::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
         if let wl_seat::Event::Capabilities { capabilities: WEnum::Value(c) } = e {
             if c.contains(wl_seat::Capability::Pointer) && st.pointer.is_none() {
-                st.pointer = Some(seat.get_pointer(qh, ()));
+                let p = seat.get_pointer(qh, ());
+                st.shape_device = st.cursor_mgr.as_ref().map(|m| m.get_pointer(&p, qh, ()));
+                st.pointer = Some(p);
             }
             if c.contains(wl_seat::Capability::Touch) && st.touch.is_none() {
                 st.touch = Some(seat.get_touch(qh, ()));
@@ -394,9 +467,14 @@ impl Dispatch<WlSeat, ()> for State {
 impl Dispatch<WlPointer, ()> for State {
     fn event(st: &mut Self, _: &WlPointer, e: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         match e {
-            wl_pointer::Event::Enter { surface, surface_x, surface_y, .. } => {
+            wl_pointer::Event::Enter { serial, surface, surface_x, surface_y } => {
                 st.ptr_role = st.role_of(&surface);
                 st.ptr_pos = (surface_x as f32, surface_y as f32);
+                // Without this, tideshell set no cursor on its surfaces and
+                // the pointer was invisible over them (seen live).
+                st.enter_serial = Some(serial);
+                st.applied = None;
+                st.apply_cursor();
             }
             wl_pointer::Event::Leave { .. } => {
                 // While a button is held the compositor keeps the grab, so a
@@ -557,6 +635,14 @@ impl Gl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egui_cursor_icons_map_to_shapes() {
+        assert_eq!(shape_for(egui::CursorIcon::PointingHand), Shape::Pointer);
+        assert_eq!(shape_for(egui::CursorIcon::Text), Shape::Text);
+        assert_eq!(shape_for(egui::CursorIcon::ResizeVertical), Shape::NsResize);
+        assert_eq!(shape_for(egui::CursorIcon::Default), Shape::Default);
+    }
 
     #[test]
     fn strip_coordinates_map_to_screen_including_outside_the_strip() {

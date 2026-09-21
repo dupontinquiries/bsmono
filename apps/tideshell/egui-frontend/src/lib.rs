@@ -403,7 +403,7 @@ impl ShellView {
             pc.text(r.center() - Vec2::new(0.0, 8.0), Align2::CENTER_CENTER, initial(kind.label()), FontId::proportional(20.0), if on { pal.bg_base } else { pal.text });
             pc.text(r.center_bottom() - Vec2::new(0.0, 13.0), Align2::CENTER_CENTER, short(kind.label()), FontId::proportional(10.0), if on { pal.bg_base } else { pal.text_weak });
             let hit = r.intersect(panel);
-            if visible && hit.height() > 20.0 && ui.interact(hit, Id::new(("ts-tile", i)), Sense::click()).clicked() {
+            if visible && hit.height() > 20.0 && ui.interact(hit, Id::new(("ts-tile", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 out.extend(shell.tap_quick(*kind));
             }
         }
@@ -429,7 +429,7 @@ impl ShellView {
         if r.bottom() <= panel.bottom() {
             pc.rect_filled(r, cr(18), pal.bg_raised);
             pc.text(r.center(), Align2::CENTER_CENTER, "Shell settings", FontId::proportional(13.0), pal.text);
-            if ui.interact(r, Id::new("ts-drawer-settings"), Sense::click()).clicked() {
+            if ui.interact(r, Id::new("ts-drawer-settings"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 self.open_settings(shell);
             }
         }
@@ -493,7 +493,7 @@ impl ShellView {
                     p.circle_filled(c, unit * 0.36, if on { pal.accent } else { pal.bg_raised });
                     p.text(c, Align2::CENTER_CENTER, initial(k.label()), FontId::proportional(14.0), if on { pal.bg_base } else { pal.text });
                     label(&p, r, k.label());
-                    if ui.interact(r, wid, Sense::click()).clicked() {
+                    if ui.interact(r, wid, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         out.extend(shell.tap_quick(*k));
                     }
                 }
@@ -547,7 +547,7 @@ impl ShellView {
                     p.rect_filled(Rect::from_center_size(c, Vec2::splat(unit * 0.72)), cr(12), pal.bg_raised);
                     p.text(c, Align2::CENTER_CENTER, txt, FontId::proportional(11.0), pal.text);
                     label(&p, r, lbl);
-                    if ui.interact(r, wid, Sense::click()).clicked() {
+                    if ui.interact(r, wid, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         match &widgets[pl.index] {
                             BarWidget::Hatch => out.extend(shell.open_launcher()),
                             BarWidget::Switcher => shell.open_switcher(),
@@ -583,10 +583,10 @@ impl ShellView {
             p.rect_filled(r, cr(17), pal.bg_raised);
             p.text(r.center(), Align2::CENTER_CENTER, t, FontId::proportional(13.0), pal.text);
         }
-        if ui.interact(close_r, Id::new("ts-sw-closeall"), Sense::click()).clicked() {
+        if ui.interact(close_r, Id::new("ts-sw-closeall"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             out.extend(shell.switcher_close_all());
         }
-        if ui.interact(apps_r, Id::new("ts-sw-apps"), Sense::click()).clicked() {
+        if ui.interact(apps_r, Id::new("ts-sw-apps"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             out.extend(shell.open_launcher());
         }
         let top = 60.0;
@@ -608,7 +608,7 @@ impl ShellView {
             }
             p.text(rr.center(), Align2::CENTER_CENTER, initial(title), FontId::proportional(34.0), with_alpha(Color32::WHITE, 0.85 * fade));
             p.text(rr.center_bottom() + Vec2::new(0.0, 11.0), Align2::CENTER_CENTER, title, FontId::proportional(12.0), pal.text);
-            let resp = ui.interact(rr, Id::new(("ts-card", *id)), Sense::click_and_drag());
+            let resp = ui.interact(rr, Id::new(("ts-card", *id)), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::PointingHand);
             if resp.drag_started() {
                 self.card_drag = 0.0;
             }
@@ -775,7 +775,7 @@ fn short(label: &str) -> String {
 fn app_button(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, id: Id, name: &str, app_id: &str, c: Pos2, unit: f32, _pal: &PaletteColors) -> bool {
     p.circle_filled(c, unit * 0.36, app_color(app_id));
     p.text(c, Align2::CENTER_CENTER, initial(name), FontId::proportional(14.0), Color32::WHITE);
-    ui.interact(r, id, Sense::click()).clicked()
+    ui.interact(r, id, Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
 #[cfg(test)]
