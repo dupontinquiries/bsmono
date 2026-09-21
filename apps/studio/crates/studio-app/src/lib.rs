@@ -63,6 +63,7 @@ pub mod insert_by_content;
 pub mod stage;
 pub mod kaleido_gallery;
 pub mod signals_panel;
+pub mod comic_job;
 #[cfg(test)]
 mod abundance_tests;
 pub mod touchup_job;
@@ -3252,6 +3253,8 @@ pub struct App {
     /// loses what the previous filter hid.
     words_raw: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
     word_filter: studio_voice::WordFilter,
+    /// A comic render in flight.
+    comic_run: Option<comic_job::Job>,
     /// The signals window, open over one camera group.
     signals_panel: Option<signals_panel::Panel>,
     /// The look copied by "style: copy", waiting to be pasted.
@@ -3478,6 +3481,7 @@ impl Default for App {
               kaleido_gallery: None,
               style_ref: None,
               signals_panel: None,
+              comic_run: None,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
               upscale_clip: None,
@@ -3861,6 +3865,12 @@ impl eframe::App for App {
                         .on_hover_text("sections across, lanes down — for projects too big to read track by track")
                         .clicked() {
                         self.structure_view = !self.structure_view;
+                        ui.close();
+                    }
+                    if ui.add_enabled(!groups.is_empty() && self.comic_run.is_none(), egui::Button::new("comic: auto layout a camera group"))
+                        .on_hover_text("wide, page, inset and split from the dialogue; sides from who each mic hears; renders then lands on a new track")
+                        .clicked() {
+                        if let Some((g, _)) = groups.first() { self.start_comic(*g); }
                         ui.close();
                     }
                     if ui.add_enabled(!groups.is_empty(), egui::Button::new("cut a camera group by signals…"))
@@ -4290,6 +4300,7 @@ impl eframe::App for App {
         self.touchup_tracker(ctx);
         self.kaleido_gallery_window(ctx);
         self.signals_window(ctx);
+        self.comic_tracker();
 
         // ── files dropped on the window ──────────────────────────────────
         //
@@ -7240,22 +7251,7 @@ impl App {
         // loudest -- whoever speaks is loudest on the camera nearest them
         let mut envs = Vec::new();
         for a in &angles {
-            let Some(au) = self.audio.get(&a.source) else { break };
-            let sr = au.sample_rate as f64;
-            let from = ((start.to_seconds() + a.offset).max(0.0) * sr) as usize;
-            let to = (from as f64 + span * sr) as usize;
-            let chans = au.channels.len().max(1);
-            let mono: Vec<f32> = (from..to.min(au.channels.first().map(|c| c.len()).unwrap_or(0)))
-                .map(|i| au.channels.iter().map(|c| c[i]).sum::<f32>() / chans as f32).collect();
-            // speech band: one-pole high-pass at 300 Hz, low-pass at 3 kHz
-            let (ah, al) = ((-std::f64::consts::TAU * 300.0 / sr).exp() as f32, (-std::f64::consts::TAU * 3000.0 / sr).exp() as f32);
-            let (mut hy, mut hx, mut ly) = (0.0f32, 0.0f32, 0.0f32);
-            let band: Vec<f32> = mono.iter().map(|&x| { hy = ah * (hy + x - hx); hx = x; ly = (1.0 - al) * hy + al * ly; ly }).collect();
-            let hop = (sr / MFPS) as usize;
-            envs.push(band.chunks(hop.max(1)).map(|c| {
-                let rms = (c.iter().map(|v| v * v).sum::<f32>() / c.len() as f32).sqrt();
-                20.0 * rms.max(1e-6).log10()
-            }).collect::<Vec<f32>>());
+            match self.speech_db(a.source, start.to_seconds() + a.offset, span, MFPS) { Some(e) => envs.push(e), None => break }
         }
         if envs.len() == angles.len() && !envs.is_empty() {
             angle_inputs.push(signals::AngleInput { name: "voice".into(),
@@ -7271,6 +7267,76 @@ impl App {
         let prefer = if angle_inputs.is_empty() { signals::Prefer::RoundRobin } else { signals::Prefer::MostMotion };
         self.signals_panel = Some(signals_panel::Panel { group, lanes, marks, span, threshold: 0.35, min_gap: 1.5,
             planned: Vec::new(), angle_inputs, prefer, no_repeat: true });
+    }
+
+    /// A source's own speech-band loudness in dB, one value per 1/`fps` s,
+    /// over `span` seconds from `from` in the file: one-pole 300 Hz high-pass
+    /// and 3 kHz low-pass, then RMS. `None` if its audio is not decoded yet.
+    fn speech_db(&self, source: studio_core::SourceId, from: f64, span: f64, fps: f64) -> Option<Vec<f32>> {
+        let au = self.audio.get(&source)?;
+        let sr = au.sample_rate as f64;
+        let a0 = (from.max(0.0) * sr) as usize;
+        let a1 = (a0 as f64 + span * sr) as usize;
+        let chans = au.channels.len().max(1);
+        let len = au.channels.first().map(|c| c.len()).unwrap_or(0);
+        let mono: Vec<f32> = (a0..a1.min(len)).map(|i| au.channels.iter().map(|c| c[i]).sum::<f32>() / chans as f32).collect();
+        let (ah, al) = ((-std::f64::consts::TAU * 300.0 / sr).exp() as f32, (-std::f64::consts::TAU * 3000.0 / sr).exp() as f32);
+        let (mut hy, mut hx, mut ly) = (0.0f32, 0.0f32, 0.0f32);
+        let band: Vec<f32> = mono.iter().map(|&x| { hy = ah * (hy + x - hx); hx = x; ly = (1.0 - al) * hy + al * ly; ly }).collect();
+        let hop = ((sr / fps) as usize).max(1);
+        Some(band.chunks(hop).map(|c| 20.0 * ((c.iter().map(|v| v * v).sum::<f32>() / c.len() as f32).sqrt()).max(1e-6).log10()).collect())
+    }
+
+    /// The comic auto mode on a camera group: plan from its transcripts, sides
+    /// from its mics, render on a worker, land when done.
+    fn start_comic(&mut self, group: studio_core::GroupId) {
+        if self.comic_run.is_some() { self.studio.status = "a comic is already rendering".into(); return; }
+        let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let project = &self.studio.session.doc.project;
+        let (roles, start, end) = match comic_job::roles(project, group, &base) {
+            Ok(r) => r, Err(e) => { self.studio.status = e; return; }
+        };
+        let span = (end.0 - start.0) as f64 / studio_core::TICKS_PER_SECOND as f64;
+        // sides: which side's own mic hears a line louder, when the panels are
+        // different angles (with one angle for both there is no evidence)
+        const FPS: f64 = 25.0;
+        let (angles, _, _) = studio_video::multicam::from_group(project, group).unwrap_or((Vec::new(), start, end));
+        let (ldb, rdb) = if angles.len() >= 3 {
+            (self.speech_db(angles[1].source, start.to_seconds() + angles[1].offset, span, FPS),
+             self.speech_db(angles[2].source, start.to_seconds() + angles[2].offset, span, FPS))
+        } else { (None, None) };
+        let side_at = |a: f64, b: f64| -> Option<studio_video::comic::Side> {
+            let (l, r) = (ldb.as_ref()?, rdb.as_ref()?);
+            let (i0, i1) = ((a * FPS) as usize, ((b * FPS) as usize).max((a * FPS) as usize + 1));
+            let mean = |v: &Vec<f32>| { let s = &v[i0.min(v.len())..i1.min(v.len())]; if s.is_empty() { None } else { Some(s.iter().sum::<f32>() / s.len() as f32) } };
+            let (ml, mr) = (mean(l)?, mean(r)?);
+            if (ml - mr).abs() < 3.0 { None } else if ml > mr { Some(studio_video::comic::Side::Left) } else { Some(studio_video::comic::Side::Right) }
+        };
+        let lines = comic_job::lines(project, group, start, span, &self.words_raw, &side_at);
+        let mut out = base.join(format!("comic-group{}.mp4", group.0));
+        let mut n = 2;
+        while out.exists() { out = base.join(format!("comic-group{}-{n}.mp4", group.0)); n += 1; }
+        let w = self.ui_waker.clone();
+        let nlines = lines.len();
+        self.comic_run = Some(comic_job::start(roles, lines, span, out, group, start, move || {
+            if let Some(c) = w.lock().ok().and_then(|g| g.clone()) { c.request_repaint(); }
+        }));
+        self.studio.status = format!("comic: planning {nlines} line(s) over {span:.1} s — rendering in the background");
+    }
+
+    fn comic_tracker(&mut self) {
+        let Some(job) = &self.comic_run else { return };
+        let Ok(ev) = job.rx.try_recv() else { return };
+        let (start, span) = (job.start, job.span);
+        self.comic_run = None;
+        match ev {
+            comic_job::Event::Done(path, frames) => {
+                let ops = comic_job::land_ops(&self.studio.session.doc.project, &path, start, span);
+                self.studio.edit_group(ops, "comic");
+                self.studio.status = format!("comic landed: {frames} frames on a new 'comic' track");
+            }
+            comic_job::Event::Failed(e) => self.studio.status = format!("comic failed: {e}"),
+        }
     }
 
     fn signals_window(&mut self, ctx: &egui::Context) {
