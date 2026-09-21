@@ -1306,6 +1306,18 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
         features: vec![], no_default: false, target: String::new(), run_flags: String::new(),
         bin_name: Some("hatch-egui".into()),
     };
+    // stoat-egui: the gdb front-end, from the gdb drops. It was registered in
+    // manifest/projects.toml as primary and never added HERE, so it built
+    // from the command line and was invisible in the store -- the same gap the
+    // vidkit-player comment above describes, found this time by
+    // `every_registered_app_is_offered_in_the_store` rather than by a user.
+    // A workspace whose runnable crate is one level down, so it needs a path.
+    let stoat = || crate::suite::SuiteApp {
+        name: "stoat".into(),
+        path: "apps/stoat/crates/gui-egui".into(),
+        features: vec![], no_default: false, target: String::new(), run_flags: String::new(),
+        bin_name: Some("stoat-egui".into()),
+    };
     let drivemind = || crate::suite::SuiteApp {
         name: "drivemind".into(),
         path: "apps/drivemind/crates/gui-egui".into(),
@@ -1379,6 +1391,9 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     all_group.apps.push(aperture());
     all_group.apps.push(cadscope());
     all_group.apps.push(simscope());
+    // Every group member must also be in `all` -- the test that caught this
+    // says so in as many words: "the all-group push was forgotten".
+    all_group.apps.push(stoat());
     all_group.apps.push(unendlich());
     all_group.apps.push(battleground());
     vec![
@@ -1391,6 +1406,8 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
             c.apps.push(aperture());
             c.apps.push(cadscope());
             c.apps.push(simscope());
+            // A debugger is a development tool.
+            c.apps.push(stoat());
             c
         },
         media_group,
@@ -1461,8 +1478,10 @@ mod store_group_tests {
         // `egui-frontend` deliberately. Same exception, different cause, and
         // worth saying so: the next reader will otherwise assume it is another
         // workspace.
-        const EXPLICIT_PATH: [&str; 13] = [
+        const EXPLICIT_PATH: [&str; 14] = [
             "bsettings", "studio", "aperture", "cadscope", "simscope", "ambient-learner",
+            // stoat: a workspace whose runnable crate is crates/gui-egui.
+            "stoat",
             // Five apps the store did not offer at all until they were added;
             // each is a workspace whose runnable crate is a member.
             "hatch", "drivemind", "switcheroo", "dialer", "bscale",

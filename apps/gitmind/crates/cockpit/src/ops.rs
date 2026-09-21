@@ -328,8 +328,15 @@ pub fn build_locally_cancellable(
     // winit Wayland error on the phone, which sends you looking for a missing system
     // library that is already installed.
     let gui = crate::buildflags::is_gui_app_dir(app_dir);
-    let build_env = crate::buildflags::build_env_for(
+    // THE EFFECTIVE TRIPLE, not the `--target` string. For a native build
+    // `cargo_target` is "" -- no --target is passed -- and `gui_env` decides on
+    // `triple.contains("musl")`. "" contains nothing, so on the phone, the exact
+    // case this flag was written for, a native build never got -crt-static and
+    // shipped a static binary that died with NoWaylandLib. Reported as exactly
+    // that, with the build log showing NO environment lines at all.
+    let build_env = crate::buildflags::build_env_for_native(
         &cargo_target,
+        &native,
         gui,
         std::env::var("RUSTFLAGS").ok().as_deref(),
         &path_env,

@@ -397,6 +397,64 @@ pub fn build_env_on_path(
 
 /// [`build_env_on_path`] with the GUI answer already decided — by [`is_gui_app_dir`], when
 /// the caller has a directory rather than one manifest.
+/// [`build_env_for`], knowing the host triple as well as the `--target` one.
+///
+/// TWO DIFFERENT QUESTIONS NEED TWO DIFFERENT TRIPLES, and conflating them is the
+/// bug this exists to fix.
+///
+/// * "Which cross LINKER?" wants the `--target` string. A native build passes
+///   no `--target`, `cargo_target` is "", and `cross_env("")` correctly returns
+///   nothing. Feed it the host triple instead and a native build on the phone
+///   would be told to use `aarch64-linux-musl-gcc` as a CROSS linker.
+/// * "Is this musl, so does a windowed app need -crt-static?" wants the
+///   EFFECTIVE triple. For a native build that is the host. `gui_env` decides
+///   on `triple.contains("musl")`, and "" contains nothing -- so on the phone,
+///   the exact case the flag was written for, a native build never got it and
+///   shipped a static binary that died with NoWaylandLib. The reported log
+///   showed no environment lines at all, which is this.
+pub fn build_env_for_native(
+    cargo_target: &str,
+    native: &str,
+    gui: bool,
+    inherited_rustflags: Option<&str>,
+    path_env: &str,
+) -> Vec<(String, String)> {
+    let mut env = if path_env.is_empty() { cross_env(cargo_target) } else { cross_env_on_path(cargo_target, path_env) };
+    let effective = if cargo_target.is_empty() { native } else { cargo_target };
+    // `RUSTFLAGS` DOES NOT REACH BUILD SCRIPTS UNDER --target. Passing a target
+    // puts cargo in cross mode, where RUSTFLAGS applies to the target only;
+    // build scripts and proc-macros are built for the host without it. So a
+    // cross build targeting static musl got a dynamic BINARY and a static
+    // BUILD SCRIPT -- and whisper-rs-sys's build script is what dlopens
+    // libclang, which is exactly where it failed.
+    //
+    // The per-triple variable is the one that covers both: cargo reads
+    // CARGO_TARGET_<TRIPLE>_RUSTFLAGS for the target, and for a native build
+    // (host == target) it applies to build scripts as well. On a genuine
+    // cross build the host side is a different triple and is correctly left
+    // alone -- a glibc host's build script does not need -crt-static.
+    let triple_var = format!(
+        "CARGO_TARGET_{}_RUSTFLAGS",
+        effective.to_ascii_uppercase().replace('-', "_")
+    );
+    if gui {
+        for (k, v) in gui_env(effective) {
+            let merged = match inherited_rustflags.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(existing) if k == "RUSTFLAGS" => format!("{existing} {v}"),
+                _ => v,
+            };
+            // Both: RUSTFLAGS for tools that read only that, and the
+            // per-triple variable so a static-musl HOST's build scripts get it
+            // too. Same value, so they cannot disagree.
+            if k == "RUSTFLAGS" && effective.contains("musl") {
+                env.push((triple_var.clone(), merged.clone()));
+            }
+            env.push((k, merged));
+        }
+    }
+    env
+}
+
 pub fn build_env_for(
     triple: &str,
     gui: bool,
@@ -1661,4 +1719,67 @@ mod artifact_name_tests {
         assert!(f.all.iter().any(|x| x == "ai-engine"),
                 "ai-engine must stay offered as a toggle, not hidden");
     }
+
+#[cfg(test)]
+mod native_musl_tests {
+    use super::*;
+
+    fn has(env: &[(String, String)], k: &str) -> Option<String> {
+        env.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone())
+    }
+
+    /// THE REPORTED BUG. A native build on the phone passes no --target, so
+    /// `cargo_target` is "", and the flag decision read `"".contains("musl")`.
+    /// The build log showed no environment at all and the binary was static.
+    #[test]
+    fn a_native_musl_gui_build_gets_the_dynamic_flag() {
+        let env = build_env_for_native("", "aarch64-unknown-linux-musl", true, None, "");
+        let rf = has(&env, "RUSTFLAGS").expect("a native musl GUI build must set RUSTFLAGS");
+        assert!(rf.contains("-crt-static"), "{rf}");
+    }
+
+    /// ...and the BUILD SCRIPT gets it too, via the per-triple variable --
+    /// whisper-rs-sys's build script is what dlopens libclang.
+    #[test]
+    fn a_native_musl_build_covers_build_scripts() {
+        let env = build_env_for_native("", "aarch64-unknown-linux-musl", true, None, "");
+        let v = has(&env, "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS")
+            .expect("the per-triple variable must be set for the host's build scripts");
+        assert!(v.contains("-crt-static"), "{v}");
+    }
+
+    /// THE TRAP IN THE OBVIOUS FIX. Passing the host triple to `cross_env`
+    /// would tell a native build to use a CROSS linker. The linker decision
+    /// must still see "" for native.
+    #[test]
+    fn a_native_build_is_not_given_a_cross_linker() {
+        let env = build_env_for_native("", "aarch64-unknown-linux-musl", true, None, "");
+        assert!(!env.iter().any(|(k, _)| k.ends_with("_LINKER")),
+                "native build got a linker variable: {env:?}");
+    }
+
+    /// A glibc host needs none of this.
+    #[test]
+    fn a_native_glibc_build_is_left_alone() {
+        let env = build_env_for_native("", "aarch64-unknown-linux-gnu", true, None, "");
+        assert!(has(&env, "RUSTFLAGS").is_none(), "{env:?}");
+    }
+
+    /// A headless app never needed a window, so it keeps whatever linking it
+    /// had -- the flag is about dlopening display libraries.
+    #[test]
+    fn a_non_gui_musl_build_is_unchanged() {
+        let env = build_env_for_native("", "aarch64-unknown-linux-musl", false, None, "");
+        assert!(has(&env, "RUSTFLAGS").is_none());
+    }
+
+    /// An operator's own RUSTFLAGS is merged, not dropped.
+    #[test]
+    fn existing_rustflags_are_kept() {
+        let env = build_env_for_native("", "aarch64-unknown-linux-musl", true,
+                                       Some("-C opt-level=s"), "");
+        let rf = has(&env, "RUSTFLAGS").unwrap();
+        assert!(rf.contains("opt-level=s") && rf.contains("-crt-static"), "{rf}");
+    }
+}
 }
