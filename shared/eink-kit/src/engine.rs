@@ -105,7 +105,14 @@ impl Engine {
         let feather = cfg.feather.unwrap_or(profile.feathering());
         ctx.tessellation_options_mut(|o| o.feathering = feather);
         // No animation: every animated frame is a panel refresh.
-        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        let color_panel = caps.color_panel;
+        let eink_theme = cfg.eink_theme;
+        ctx.global_style_mut(|s| {
+            if eink_theme {
+                crate::style::apply(s, color_panel);
+            }
+            s.animation_time = 0.0;
+        });
         ctx.options_mut(|o| o.input_options.max_click_duration = 0.8);
         eprintln!(
             "eink: backend={backend} {}x{} {:?} profile={} feather={feather} scale={} threads={} per_update_waveform={} motion={}Hz {} dither={}",
@@ -189,7 +196,13 @@ impl Engine {
         // slow colour path for a few frames (a coloured sliver on a dithered
         // object). Hinted regions are exact and are not dilated.
         let (cols, rows) = (self.heat.cols, self.heat.rows);
-        let measured = |c: usize, r: usize| !touching && self.heat.is_moving(r * cols + c);
+        // Only unhinted measured motion grows: a declared video is exact, and
+        // dilating it dithered its neighbours (a label above a video got
+        // dithered during playback, then needed its own clean-up on pause).
+        let measured = |c: usize, r: usize| {
+            let i = r * cols + c;
+            !touching && self.heat.is_moving(i) && !self.hint_motion[i]
+        };
         (0..self.hint_motion.len())
             .map(|i| {
                 let (c, r) = (i % cols, i / cols);
@@ -263,6 +276,9 @@ impl Engine {
 
         self.textures.apply_set(&full.textures_delta);
         let prims = self.ctx.tessellate(full.shapes, full.pixels_per_point);
+        if let Some((px, py)) = probe_pixel() {
+            debug_probe(&prims, full.pixels_per_point, px, py);
+        }
         let t0 = Instant::now();
         let motion = self.motion_mask(now);
         let dither: Option<Vec<bool>> = self.dither_enabled.then(|| motion.clone());
@@ -346,6 +362,36 @@ impl Engine {
 }
 
 const FULL_REFRESH_KEY: &str = "eink.full_refresh";
+
+/// `EINK_PROBE_PIXEL=x,y`: print every triangle covering that pixel's
+/// centre, in paint order, each frame. For "why is that pixel that colour"
+/// on the device, where there is no debugger.
+fn probe_pixel() -> Option<(f32, f32)> {
+    let v = std::env::var("EINK_PROBE_PIXEL").ok()?;
+    let (x, y) = v.split_once(',')?;
+    Some((x.trim().parse::<f32>().ok()? + 0.5, y.trim().parse::<f32>().ok()? + 0.5))
+}
+
+fn debug_probe(prims: &[egui::epaint::ClippedPrimitive], ppp: f32, cx: f32, cy: f32) {
+    for (i, p) in prims.iter().enumerate() {
+        let egui::epaint::Primitive::Mesh(m) = &p.primitive else { continue };
+        let clip = p.clip_rect;
+        if !(clip.min.x * ppp <= cx && cx < clip.max.x * ppp && clip.min.y * ppp <= cy && cy < clip.max.y * ppp) {
+            continue;
+        }
+        for (ti, t) in m.indices.chunks_exact(3).enumerate() {
+            let q: Vec<_> = t.iter().map(|&k| &m.vertices[k as usize]).collect();
+            let e = |a: &egui::epaint::Vertex, b: &egui::epaint::Vertex| {
+                (b.pos.x - a.pos.x) * ppp * (cy - a.pos.y * ppp) - (b.pos.y - a.pos.y) * ppp * (cx - a.pos.x * ppp)
+            };
+            let (w0, w1, w2) = (e(q[1], q[2]), e(q[2], q[0]), e(q[0], q[1]));
+            if (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0) {
+                eprintln!("eink probe ({cx},{cy}): prim {i} {:?} tri {ti}: {:?}", m.texture_id,
+                    q.iter().map(|v| ((v.pos.x * ppp, v.pos.y * ppp), v.uv, v.color)).collect::<Vec<_>>());
+            }
+        }
+    }
+}
 
 /// Read the engine's diagnostics from inside an app.
 pub fn diagnostics(ctx: &Context) -> Diagnostics {

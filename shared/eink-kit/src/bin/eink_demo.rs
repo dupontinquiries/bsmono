@@ -28,11 +28,6 @@ struct Demo {
 impl eink_kit::EinkApp for Demo {
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        ctx.global_style_mut(|s| {
-            s.spacing.button_padding = Vec2::new(18.0, 12.0);
-            s.spacing.item_spacing = Vec2::new(12.0, 12.0);
-            s.visuals = egui::Visuals::light();
-        });
         let d = eink_kit::diagnostics(&ctx);
         egui::CentralPanel::default().show_inside(ui, |ui| {
             // Under AppLoad the top ~50pt is its drag-down gesture strip.

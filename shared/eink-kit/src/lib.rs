@@ -29,6 +29,7 @@ pub mod motion;
 pub mod policy;
 pub mod present;
 pub mod raster;
+pub mod style;
 pub mod touch;
 
 pub use egui;

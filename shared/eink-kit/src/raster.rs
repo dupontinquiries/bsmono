@@ -272,30 +272,52 @@ pub fn render(
     DirtyTiles { cols, rows, dirty, chroma, width: target.width, height: target.height }
 }
 
-/// One edge function `w = a·x + b·y + c`, positive inside.
+/// Sub-pixel precision for edge evaluation: 1/256 px.
+const SUB: i64 = 256;
+
+/// One edge function in exact fixed-point arithmetic.
+///
+/// `E(a,b,p) = (b.x−a.x)(p.y−a.y) − (b.y−a.y)(p.x−a.x)` on integers is
+/// exactly `−E(b,a,p)`, so two triangles sharing an edge never disagree
+/// about a pixel on it. The first version used f32 and a "== 0.0"
+/// tie-break; float evaluation is not antisymmetric, a pixel centre lying
+/// on a rect's diagonal was rejected by BOTH triangles, and the background
+/// showed through (a white speck on eink-demo's red swatch).
 #[derive(Clone, Copy)]
 struct Edge {
-    a: f32,
-    b: f32,
-    c: f32,
+    /// ∂E/∂x and ∂E/∂y per whole pixel (already × SUB).
+    step_x: i64,
+    step_y: i64,
+    /// Coefficients before scaling, for the tie-break.
+    a: i64,
+    b: i64,
+    ax: i64,
+    ay: i64,
+    dx: i64,
+    dy: i64,
 }
 
 impl Edge {
-    fn new(p: [f32; 2], q: [f32; 2]) -> Edge {
-        let a = -(q[1] - p[1]);
-        let b = q[0] - p[0];
-        Edge { a, b, c: -(a * p[0] + b * p[1]) }
+    fn new(p: [i64; 2], q: [i64; 2]) -> Edge {
+        let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
+        Edge { step_x: -dy * SUB, step_y: dx * SUB, a: -dy, b: dx, ax: p[0], ay: p[1], dx, dy }
     }
+    /// Value at a fixed-point position.
     #[inline]
-    fn at(&self, x: f32, y: f32) -> f32 {
-        self.a * x + self.b * y + self.c
+    fn at(&self, x: i64, y: i64) -> i64 {
+        self.dx * (y - self.ay) - self.dy * (x - self.ax)
     }
     /// Tie-break for pixels exactly on the edge. The neighbouring triangle
-    /// sees the same edge reversed (a, b negated), so exactly one of the two
-    /// claims those pixels.
+    /// sees the same edge reversed (a, b negated, exactly), so exactly one
+    /// of the two claims those pixels.
     fn includes_zero(&self) -> bool {
-        self.a > 0.0 || (self.a == 0.0 && self.b > 0.0)
+        self.a > 0 || (self.a == 0 && self.b > 0)
     }
+}
+
+#[inline]
+fn fixed(v: [f32; 2]) -> [i64; 2] {
+    [(v[0] * SUB as f32).round() as i64, (v[1] * SUB as f32).round() as i64]
 }
 
 #[inline]
@@ -332,25 +354,30 @@ fn sample(t: &Tex, u: f32, v: f32) -> [u8; 4] {
 fn raster_triangle(p: &Prim, ti: usize, tile: IRect, scratch: &mut [[u8; 4]]) {
     let idx = &p.mesh.indices[ti * 3..ti * 3 + 3];
     let (mut i0, mut i1, i2) = (idx[0] as usize, idx[1] as usize, idx[2] as usize);
-    let area = Edge::new(p.pos[i0], p.pos[i1]).at(p.pos[i2][0], p.pos[i2][1]);
-    if area.abs() < 1e-6 {
+    let (f0, f1, f2) = (fixed(p.pos[i0]), fixed(p.pos[i1]), fixed(p.pos[i2]));
+    let area = Edge::new(f0, f1).at(f2[0], f2[1]);
+    if area == 0 {
         return;
     }
-    if area < 0.0 {
+    let (q0, q1, q2) = if area < 0 {
         std::mem::swap(&mut i0, &mut i1);
-    }
+        (f1, f0, f2)
+    } else {
+        (f0, f1, f2)
+    };
     let area = area.abs();
     let (v0, v1, v2) = (&p.mesh.vertices[i0], &p.mesh.vertices[i1], &p.mesh.vertices[i2]);
-    let (q0, q1, q2) = (p.pos[i0], p.pos[i1], p.pos[i2]);
     // w0 weights v0 (edge opposite it is q1→q2), etc.
     let e0 = Edge::new(q1, q2);
     let e1 = Edge::new(q2, q0);
     let e2 = Edge::new(q0, q1);
+    let fl = |v: i64| v.div_euclid(SUB) as i32;
+    let ce = |v: i64| (v + SUB - 1).div_euclid(SUB) as i32;
     let bb = IRect::new(
-        q0[0].min(q1[0]).min(q2[0]).floor() as i32,
-        q0[1].min(q1[1]).min(q2[1]).floor() as i32,
-        q0[0].max(q1[0]).max(q2[0]).ceil() as i32,
-        q0[1].max(q1[1]).max(q2[1]).ceil() as i32,
+        fl(q0[0].min(q1[0]).min(q2[0])),
+        fl(q0[1].min(q1[1]).min(q2[1])),
+        ce(q0[0].max(q1[0]).max(q2[0])),
+        ce(q0[1].max(q1[1]).max(q2[1])),
     )
     .intersect(&p.clip)
     .intersect(&tile);
@@ -362,19 +389,17 @@ fn raster_triangle(p: &Prim, ti: usize, tile: IRect, scratch: &mut [[u8; 4]]) {
     let tex = if white { None } else { p.tex };
     let (c0, c1, c2) = (v0.color.to_array(), v1.color.to_array(), v2.color.to_array());
     let (z0, z1, z2) = (e0.includes_zero(), e1.includes_zero(), e2.includes_zero());
-    let inv_area = 1.0 / area;
+    let inv_area = 1.0 / area as f32;
+    let half = SUB / 2;
 
     for y in bb.y0..bb.y1 {
-        let py = y as f32 + 0.5;
-        let px0 = bb.x0 as f32 + 0.5;
+        let (px0, py) = (bb.x0 as i64 * SUB + half, y as i64 * SUB + half);
         let (mut w0, mut w1, mut w2) = (e0.at(px0, py), e1.at(px0, py), e2.at(px0, py));
         let row = ((y - tile.y0) as usize) * TILE;
         for x in bb.x0..bb.x1 {
-            let inside = (w0 > 0.0 || (w0 == 0.0 && z0))
-                && (w1 > 0.0 || (w1 == 0.0 && z1))
-                && (w2 > 0.0 || (w2 == 0.0 && z2));
+            let inside = (w0 > 0 || (w0 == 0 && z0)) && (w1 > 0 || (w1 == 0 && z1)) && (w2 > 0 || (w2 == 0 && z2));
             if inside {
-                let (l0, l1, l2) = (w0 * inv_area, w1 * inv_area, w2 * inv_area);
+                let (l0, l1, l2) = (w0 as f32 * inv_area, w1 as f32 * inv_area, w2 as f32 * inv_area);
                 let col = if solid {
                     c0
                 } else {
@@ -393,13 +418,13 @@ fn raster_triangle(p: &Prim, ti: usize, tile: IRect, scratch: &mut [[u8; 4]]) {
                         [mul8(col[0], s[0]), mul8(col[1], s[1]), mul8(col[2], s[2]), mul8(col[3], s[3])]
                     }
                 };
-                if src[3] != 0 || src[0] != 0 || src[1] != 0 || src[2] != 0 {
+                if src != [0, 0, 0, 0] {
                     blend(&mut scratch[row + (x - tile.x0) as usize], src);
                 }
             }
-            w0 += e0.a;
-            w1 += e1.a;
-            w2 += e2.a;
+            w0 += e0.step_x;
+            w1 += e1.step_x;
+            w2 += e2.step_x;
         }
     }
 }
@@ -444,6 +469,49 @@ mod tests {
             assert_eq!(px(&buf, w, fmt, i, i), reference, "diagonal pixel {i}");
         }
         assert!(reference[0] > 120 && reference[0] < 135, "{reference:?}");
+    }
+
+    /// Opaque quads must cover every pixel inside them. Found on the demo:
+    /// a pixel centre exactly on a rect's diagonal was dropped by BOTH
+    /// triangles (float edge values are not exact negatives), leaving a
+    /// background-coloured hole. Sweeps many sizes and offsets at ppp 2.
+    #[test]
+    fn opaque_quads_have_no_holes_on_their_diagonal() {
+        let (w, h, fmt) = (420u32, 420u32, PixelFormat::Rgb888);
+        let mut holes = 0;
+        let mut checked = 0;
+        for i in 0..400 {
+            let (x0, y0) = (3.0 + (i % 13) as f32 * 0.37, 3.0 + (i % 7) as f32 * 0.61);
+            let (ww, hh) = (40.0 + (i * 7 % 150) as f32 * 0.4, 20.0 + (i * 11 % 170) as f32 * 0.3);
+            let mut buf = frame(w, h, fmt);
+            render(&[quad(x0, y0, x0 + ww, y0 + hh, Color32::RED)], 2.0, &Textures::default(),
+                   Target { buf: &mut buf, stride: w as usize * 3, width: w, height: h, format: fmt }, [255; 4], 1, true, None);
+            // every pixel whose centre is strictly inside the quad must be red
+            for py in 0..h {
+                for pxx in 0..w {
+                    let (cx, cy) = (pxx as f32 + 0.5, py as f32 + 0.5);
+                    if cx > x0 * 2.0 + 0.01 && cx < (x0 + ww) * 2.0 - 0.01 && cy > y0 * 2.0 + 0.01 && cy < (y0 + hh) * 2.0 - 0.01 {
+                        checked += 1;
+                        if px(&buf, w, fmt, pxx, py) != [255, 0, 0, 255] {
+                            holes += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 1_000_000);
+        assert_eq!(holes, 0, "{holes} uncovered pixels inside opaque quads");
+    }
+
+    /// The exact quad (egui's red swatch in eink-demo) whose diagonal passes
+    /// through pixel centre (68.5, 738.5) at ppp 2.
+    #[test]
+    fn the_quad_found_on_the_demo_has_no_hole() {
+        let (w, h, fmt) = (220u32, 800u32, PixelFormat::Rgb888);
+        let mut buf = frame(w, h, fmt);
+        render(&[quad(7.9999995, 358.4, 98.0, 395.6, Color32::RED)], 2.0, &Textures::default(),
+               Target { buf: &mut buf, stride: w as usize * 3, width: w, height: h, format: fmt }, [255; 4], 1, true, None);
+        assert_eq!(px(&buf, w, fmt, 68, 738), [255, 0, 0, 255]);
     }
 
     #[test]

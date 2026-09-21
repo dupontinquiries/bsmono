@@ -38,6 +38,8 @@ pub struct Config {
     pub dither: bool,
     pub mem_size: (u32, u32),
     pub dump: Option<String>,
+    /// `EINK_THEME=egui` keeps egui's own theme instead of the e-ink preset.
+    pub eink_theme: bool,
 }
 
 fn env(k: &str) -> Option<String> {
@@ -72,6 +74,7 @@ impl Config {
             dither: env("EINK_DITHER").as_deref() != Some("0"),
             mem_size,
             dump: env("EINK_DUMP"),
+            eink_theme: env("EINK_THEME").as_deref() != Some("egui"),
         })
     }
 }
