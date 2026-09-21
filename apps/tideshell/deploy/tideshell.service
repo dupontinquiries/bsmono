@@ -1,0 +1,23 @@
+# systemd USER unit: autostart tideshell with the cosmic session.
+# Install ONLY after a manual run-in-session.sh test passed (DEPLOY-FP5.md, stage 5):
+#   install -Dm644 tideshell.service ~/.config/systemd/user/tideshell.service
+#   systemctl --user daemon-reload && systemctl --user enable --now tideshell.service
+# Undo:
+#   systemctl --user disable --now tideshell.service
+# Logs (engine trace): journalctl --user -u tideshell -f
+[Unit]
+Description=tideshell touch shell (edge gestures, switcher, control center)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/tideshell
+Environment=TIDESHELL_TRACE=stderr
+Restart=on-failure
+RestartSec=3
+# A crash loop must not spin: stop after 5 failures in 60 s.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Install]
+WantedBy=graphical-session.target
