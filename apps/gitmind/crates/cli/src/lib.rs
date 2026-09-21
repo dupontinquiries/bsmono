@@ -96,6 +96,7 @@ pub fn run() -> i32 {
         "apply" => cmd_apply(rest),
         "zip" => cmd_zip(rest),
         "fleet" => cmd_fleet(rest),
+        "eink" => cmd_eink(rest),
         "bridge" => cmd_bridge(rest),
         "watch" => cmd_watch(rest),
         "bundle" => match rest.first() {
@@ -1321,6 +1322,7 @@ fn print_help(prog: &str) {
     println!("{prog} {} — touch-first repo manager (CLI frontend)", gitmind_core::VERSION);
     println!("  (\"gin\" is a short alias for \"gitmind\")\n");
     println!("  status | st                 repo state + changed files");
+    println!("  eink <enroll|probe|deploy|stop|status> <host>   e-ink tablets (reMarkable)");
     println!("  snapshot | snap [label]     checkpoint the worktree (shadow ref, index untouched)");
     println!("  timeline | tl [N] [-f]      list checkpoints (-f: fuzzy select)");
     println!("  diff [<a>] [<b>]            changes in a checkpoint vs worktree, or between two");
@@ -1383,6 +1385,118 @@ fn iso_now() -> String {
 }
 
 // ── fleet: cockpit operations shared with the GUI (import / build / apply / merge / reclaim) ──
+
+/// e-ink tablets (reMarkable): enrol, probe, deploy/launch, stop, status.
+///
+/// Every subcommand re-probes the device rather than trusting saved state:
+/// it is one SSH round-trip, and tablets change under you (OS updates wipe
+/// the root filesystem; Oxide/AppLoad get installed or removed).
+fn cmd_eink(rest: &[String]) -> i32 {
+    use cockpit::eink_fleet as ef;
+    const USAGE: &str = "usage: gitmind eink <enroll|probe|deploy|stop|status> <host> ...\n  \
+        enroll <host>                       first contact: password (GITMIND_RM_PASSWORD or stdin) → key\n  \
+        probe <host>                        model, display servers, route\n  \
+        deploy <host> <bin> [--name N] [--profile fast-color|fast-mono|quality] [-- args...]\n  \
+        stop <host> <app>\n  \
+        status <host> <app>";
+    let sub = match rest.first() { Some(s) => s.as_str(), None => return err(USAGE) };
+    let Some(host) = rest.get(1).cloned() else { return err(USAGE) };
+    let (flags, app_args) = match rest.iter().position(|a| a == "--") {
+        Some(i) => (&rest[2..i], rest[i + 1..].to_vec()),
+        None => (&rest[2..], vec![]),
+    };
+    let pos: Vec<&String> = flags.iter().filter(|a| !a.starts_with("--")).collect();
+    let mut remote = ef::SshRemote { user: "root".into(), host: host.clone() };
+    let describe = |p: &ef::Probe, d: &ef::Displays| {
+        println!("  model   {}", p.model.map(|m| m.label()).unwrap_or("unknown (set it in the roster)"));
+        println!("  target  {}{}", p.triple.unwrap_or("unknown"), d.glibc.as_ref().map(|g| format!(" (glibc {g}: build with zigbuild .{g})")).unwrap_or_default());
+        println!("  displays qtfb={} appload={} blight_lib={} blight_running={}",
+            d.qtfb, d.appload_dir.as_deref().unwrap_or("-"), d.blight_lib.as_deref().unwrap_or("-"), d.blight_running);
+        match d.route() {
+            Ok(ef::Route::Blight) => println!("  route   Blight: gitmind can launch apps remotely"),
+            Ok(ef::Route::AppLoad { dir }) => println!("  route   AppLoad ({dir}): gitmind installs, you tap the icon"),
+            Err(e) => println!("  route   none: {e}"),
+        }
+    };
+    match sub {
+        "enroll" => {
+            let password = std::env::var("GITMIND_RM_PASSWORD").ok().or_else(|| {
+                use std::io::BufRead;
+                eprint!("SSH password for root@{host} (from the tablet's Settings; blank if a key is installed): ");
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line).ok()?;
+                Some(line.trim().to_string()).filter(|s| !s.is_empty())
+            });
+            let mut e = ef::SshEnroller { host: host.clone() };
+            match ef::enroll(&mut e, password.as_deref(), &mut |ev| eprintln!("  · {ev:?}")) {
+                Ok(r) => {
+                    println!("enrolled root@{host}{}", if r.used_password { " (key installed; no more passwords)" } else { "" });
+                    describe(&r.probe, &r.displays);
+                    0
+                }
+                Err(e) => err(&e),
+            }
+        }
+        "probe" => {
+            let p = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return err(&e) };
+            println!("{host}:");
+            describe(&p.0, &p.1);
+            0
+        }
+        "deploy" => {
+            let Some(bin) = pos.first() else { return err(USAGE) };
+            let name = opt(flags, "--name").map(str::to_string).unwrap_or_else(|| {
+                std::path::Path::new(bin.as_str()).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
+            });
+            let (probe, displays) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return err(&e) };
+            let route = match displays.route() { Ok(r) => r, Err(e) => return err(&e) };
+            let profile = match opt(flags, "--profile") {
+                Some(p) => match ef::RefreshProfile::parse(p) { Some(p) => p, None => return err("--profile: fast-color|fast-mono|quality") },
+                None => ef::RefreshProfile::fastest(probe.model.map(|m| m.panel()).unwrap_or(ef::Panel::Mono)),
+            };
+            let args: Vec<&str> = app_args.iter().map(String::as_str).collect();
+            let env = ef::LaunchEnv { profile, model: probe.model, blight_lib: displays.blight_lib.clone() };
+            match ef::deliver(&mut remote, &route, &name, bin, &env, &args, &mut |ev| eprintln!("  · {ev:?}")) {
+                Ok(ef::Delivered::Launched(ef::Outcome::Running { pid })) => {
+                    println!("{name} running on {host} (pid {pid}, {})", profile.as_env());
+                    0
+                }
+                Ok(ef::Delivered::Launched(ef::Outcome::ExitedEarly { log_tail })) => {
+                    eprintln!("{name} exited right after launch. Its last output:\n{log_tail}");
+                    1
+                }
+                Ok(ef::Delivered::Registered { manifest_dir }) => {
+                    println!("{name} installed for AppLoad ({manifest_dir}); open AppLoad on the tablet and tap it");
+                    0
+                }
+                Err(e) => err(&e),
+            }
+        }
+        "stop" | "status" => {
+            let Some(app) = pos.first() else { return err(USAGE) };
+            let cmd = if sub == "stop" { ef::stop_cmd(app) } else { ef::status_cmd(app, 0) };
+            let cmd = match cmd { Ok(c) => c, Err(e) => return err(&e) };
+            match cockpit::eink_fleet::Remote::run(&mut remote, &cmd) {
+                Ok(out) if sub == "status" => {
+                    let st = ef::parse_status(&out);
+                    match st.pid { Some(p) => println!("{app}: running (pid {p})"), None => println!("{app}: stopped") }
+                    if !st.log_tail.is_empty() { println!("{}", st.log_tail); }
+                    0
+                }
+                Ok(_) => { println!("{app}: stopped"); 0 }
+                Err(e) => err(&e),
+            }
+        }
+        _ => err(USAGE),
+    }
+}
+
+fn remote_probe(remote: &mut cockpit::eink_fleet::SshRemote) -> Result<(cockpit::eink_fleet::Probe, cockpit::eink_fleet::Displays), String> {
+    use cockpit::eink_fleet::{self as ef, Remote};
+    let p = ef::parse_probe(&remote.run(ef::probe_cmd())?);
+    let d = ef::parse_displays(&remote.run(ef::displays_probe_cmd())?);
+    Ok((p, d))
+}
 
 fn cmd_fleet(rest: &[String]) -> i32 {
     use cockpit::flow;

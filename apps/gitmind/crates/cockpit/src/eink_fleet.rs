@@ -86,6 +86,17 @@ impl RmModel {
         }
     }
 
+    /// The id eink-kit's `EINK_MODEL` expects (`device::Model::parse`).
+    pub fn env_id(self) -> &'static str {
+        match self {
+            RmModel::Rm1 => "rm1",
+            RmModel::Rm2 => "rm2",
+            RmModel::PaperPro => "rmpp",
+            RmModel::PaperProMove => "rmppm",
+            RmModel::PaperPure => "rmppure",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             RmModel::Rm1 => "reMarkable 1",
@@ -278,23 +289,54 @@ pub fn stop_cmd(app: &str) -> Result<String, String> {
     ))
 }
 
+/// Everything a launch passes to the app's environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchEnv {
+    pub profile: RefreshProfile,
+    pub model: Option<RmModel>,
+    /// The libblight_protocol path the probe found. Passed as
+    /// `EINK_BLIGHT_LIB` so the app loads exactly what was routed on, instead
+    /// of re-searching a list that may not include where Vellum put it.
+    pub blight_lib: Option<String>,
+}
+
+impl LaunchEnv {
+    pub fn new(profile: RefreshProfile) -> LaunchEnv {
+        LaunchEnv { profile, model: None, blight_lib: None }
+    }
+    fn render(&self) -> String {
+        let mut s = format!("{PROFILE_ENV}={} EINK_BACKEND=blight", self.profile.as_env());
+        if let Some(m) = self.model {
+            s += &format!(" EINK_MODEL={}", m.env_id());
+        }
+        if let Some(l) = &self.blight_lib {
+            s += &format!(" EINK_BLIGHT_LIB={}", shell_quote(l));
+        }
+        s
+    }
+}
+
 /// Stop any previous instance, then start detached and print the new pid.
 ///
 /// `nohup env ... BIN &` keeps `$!` equal to the app's pid, because nohup
 /// and env both exec. Every fd is redirected so ssh returns immediately
 /// instead of waiting on the child's stdout. `args` are passed through
 /// individually quoted (e.g. the file `tomescope` should open).
-pub fn launch_cmd(app: &str, profile: RefreshProfile, args: &[&str]) -> Result<String, String> {
+///
+/// An SSH launch can only reach the panel through Blight: AppLoad windows
+/// exist only for processes AppLoad itself starts (it mints `QTFB_KEY`).
+/// So the backend is pinned to blight here, which turns "Oxide missing" into
+/// that exact message in the log tail instead of an ambiguous auto-probe.
+pub fn launch_cmd(app: &str, env: &LaunchEnv, args: &[&str]) -> Result<String, String> {
     let stop = stop_cmd(app)?;
     let args: String = args.iter().map(|a| format!(" {}", shell_quote(a))).collect();
     Ok(format!(
         "{stop}; \
          cd {base} || exit 1; \
-         nohup env {env}={val} {bin}{args} </dev/null >{log} 2>&1 & \
+         nohup env {envs} {bin}{args} </dev/null >{log} 2>&1 & \
          echo $! > {pid}; echo \"started $!\"",
         base = shell_quote(BASE),
-        env = PROFILE_ENV,
-        val = profile.as_env(),
+        envs = env.render(),
         bin = shell_quote(&bin_path(app)),
         log = shell_quote(&log_path(app)),
         pid = shell_quote(&pid_path(app)),
@@ -311,7 +353,7 @@ pub fn status_cmd(app: &str, settle_secs: u32) -> Result<String, String> {
     Ok(format!(
         "sleep {settle_secs}; p=$(cat {pid} 2>/dev/null); \
          if [ -n \"$p\" ] && kill -0 \"$p\" 2>/dev/null; then echo \"running $p\"; else echo stopped; fi; \
-         echo ---; tail -n 20 {log} 2>/dev/null",
+         echo ---; tail -n 20 {log} 2>/dev/null; true",
         log = shell_quote(&log_path(app)),
     ))
 }
@@ -384,11 +426,12 @@ pub fn deploy_and_launch(
     remote: &mut dyn Remote,
     app: &str,
     local_bin: &str,
-    profile: RefreshProfile,
+    env: &LaunchEnv,
     args: &[&str],
     settle_secs: u32,
     on: &mut dyn FnMut(Event),
 ) -> Result<Outcome, String> {
+    let profile = env.profile;
     check(app)?;
     on(Event::Preparing);
     remote.run(&prepare_cmd()).map_err(|e| format!("prepare: {e}"))?;
@@ -397,13 +440,248 @@ pub fn deploy_and_launch(
     on(Event::Installing);
     remote.run(&install_cmd(app)?).map_err(|e| format!("install: {e}"))?;
     on(Event::Launching { profile });
-    remote.run(&launch_cmd(app, profile, args)?).map_err(|e| format!("launch: {e}"))?;
+    remote.run(&launch_cmd(app, env, args)?).map_err(|e| format!("launch: {e}"))?;
     on(Event::Checking);
     let st = parse_status(&remote.run(&status_cmd(app, settle_secs)?).map_err(|e| format!("status: {e}"))?);
     Ok(match st.pid {
         Some(pid) => Outcome::Running { pid },
         None => Outcome::ExitedEarly { log_tail: st.log_tail },
     })
+}
+
+// ───────────────────────── enrolment ─────────────────────────
+//
+// First contact from a phone: the operator reads the root password off the
+// tablet (Settings → Help → Copyrights and licenses, at the bottom, on
+// current OS versions; the location has moved between releases) and types
+// it once. After that every call is key auth.
+//
+// Order matters and is enforced here, not left to callers:
+//   1. pin the host key BEFORE any password is sent (a password to an
+//      unverified host is the one mistake enrolment must not make);
+//   2. try key auth first, so re-enrolling never asks for the password again
+//      and never appends a duplicate authorized_keys line;
+//   3. only then install the key with the password;
+//   4. probe what the device is and which display servers it has;
+//   5. create the app layout.
+
+/// Which display servers the device offers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Displays {
+    /// AppLoad's qtfb socket exists (AppLoad is running inside xochitl).
+    pub qtfb: bool,
+    /// AppLoad's extension directory, where external app manifests go.
+    pub appload_dir: Option<String>,
+    /// Path of Oxide's libblight_protocol, if found.
+    pub blight_lib: Option<String>,
+    /// A D-Bus name containing "blight" is registered (display server up).
+    pub blight_running: bool,
+    /// glibc version, for pinning the gnu build (`zigbuild --target <triple>.<ver>`).
+    pub glibc: Option<String>,
+}
+
+/// How an app gets onto this device's screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// Oxide's display server is up: push, then launch over SSH.
+    Blight,
+    /// AppLoad is installed: push, write a manifest, the operator taps the icon.
+    AppLoad { dir: String },
+}
+
+impl Displays {
+    /// Blight first: it is the only route gitmind can launch remotely, and
+    /// the one with per-update waveforms.
+    pub fn route(&self) -> Result<Route, String> {
+        if self.blight_running && self.blight_lib.is_some() {
+            return Ok(Route::Blight);
+        }
+        if let Some(dir) = &self.appload_dir {
+            return Ok(Route::AppLoad { dir: dir.clone() });
+        }
+        Err(match (self.blight_lib.is_some(), self.blight_running) {
+            (true, false) => "Oxide is installed but its display server is not running, and AppLoad was not found".into(),
+            _ => "no display route: install Oxide (Blight) or AppLoad with Vellum (reManager can do this)".into(),
+        })
+    }
+}
+
+/// One round-trip listing display servers. Paths are best knowledge, not
+/// verified on hardware: AppLoad's directory is xovi's per-extension home,
+/// and Oxide's library location depends on how Vellum packages it, so the
+/// probe also looks under /home/root/.vellum. Each line is `key=value`.
+pub fn displays_probe_cmd() -> &'static str {
+    "[ -S /tmp/qtfb.sock ] && echo qtfb=1; \
+     for d in /home/root/xovi/exthome/appload; do [ -d \"$d\" ] && echo \"appload_dir=$d\"; done; \
+     for f in /opt/lib/libblight_protocol.so* /usr/lib/libblight_protocol.so* /home/root/.vellum/lib/libblight_protocol.so*; do \
+       [ -e \"$f\" ] && echo \"blight_lib=$f\" && break; done; \
+     dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ListNames 2>/dev/null \
+       | grep -qi blight && echo blight_running=1; \
+     v=$(ldd --version 2>&1 | head -n1 | grep -o '[0-9]\\+\\.[0-9]\\+$'); [ -n \"$v\" ] && echo \"glibc=$v\"; \
+     true"
+}
+
+pub fn parse_displays(out: &str) -> Displays {
+    let mut d = Displays::default();
+    for line in out.lines().map(str::trim) {
+        match line.split_once('=') {
+            Some(("qtfb", "1")) => d.qtfb = true,
+            Some(("appload_dir", v)) if !v.is_empty() => d.appload_dir = Some(v.to_string()),
+            Some(("blight_lib", v)) if !v.is_empty() => d.blight_lib = Some(v.to_string()),
+            Some(("blight_running", "1")) => d.blight_running = true,
+            Some(("glibc", v)) if !v.is_empty() => d.glibc = Some(v.to_string()),
+            _ => {}
+        }
+    }
+    d
+}
+
+/// Host-side effects enrolment needs. Real implementation over SSH below;
+/// faked in tests so the ordering rules above are pinned.
+pub trait Enroller {
+    fn trust_host(&mut self) -> Result<String, String>;
+    /// Does key auth already work? (BatchMode, never prompts.)
+    fn key_works(&mut self) -> bool;
+    fn install_key(&mut self, password: &str) -> Result<String, String>;
+    fn run(&mut self, cmd: &str) -> Result<String, String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrollEvent {
+    TrustingHost,
+    Trusted(String),
+    KeyAlreadyWorks,
+    InstallingKey,
+    KeyInstalled(String),
+    Probing,
+    Preparing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Enrolled {
+    pub probe: Probe,
+    pub displays: Displays,
+    /// True if this run used the password (first contact).
+    pub used_password: bool,
+}
+
+/// Enrol a tablet. `password` may be `None` when a key is already installed;
+/// if it is needed and missing, the error says where to find it.
+pub fn enroll(e: &mut dyn Enroller, password: Option<&str>, on: &mut dyn FnMut(EnrollEvent)) -> Result<Enrolled, String> {
+    on(EnrollEvent::TrustingHost);
+    let t = e.trust_host()?;
+    on(EnrollEvent::Trusted(t));
+    let used_password = if e.key_works() {
+        on(EnrollEvent::KeyAlreadyWorks);
+        false
+    } else {
+        let pw = password.filter(|p| !p.is_empty()).ok_or_else(|| {
+            "first contact needs the tablet's SSH password: on the tablet, Settings → Help → \
+             Copyrights and licenses (scroll to the end); developer mode may need enabling first"
+                .to_string()
+        })?;
+        on(EnrollEvent::InstallingKey);
+        let r = e.install_key(pw)?;
+        on(EnrollEvent::KeyInstalled(r));
+        if !e.key_works() {
+            return Err("key was installed but key auth still fails (sshd may not read ~/.ssh/authorized_keys)".into());
+        }
+        true
+    };
+    on(EnrollEvent::Probing);
+    let probe = parse_probe(&e.run(probe_cmd())?);
+    let displays = parse_displays(&e.run(displays_probe_cmd())?);
+    on(EnrollEvent::Preparing);
+    e.run(&prepare_cmd())?;
+    Ok(Enrolled { probe, displays, used_password })
+}
+
+/// The real enroller: `root@host` over the hardened ssh options.
+pub struct SshEnroller {
+    pub host: String,
+}
+
+impl Enroller for SshEnroller {
+    fn trust_host(&mut self) -> Result<String, String> {
+        crate::deploy::trust_host(&self.host)
+    }
+    fn key_works(&mut self) -> bool {
+        crate::deploy::remote_capture("root", &self.host, "true").is_ok()
+    }
+    fn install_key(&mut self, password: &str) -> Result<String, String> {
+        crate::deploy::setup_key("root", &self.host, password)
+    }
+    fn run(&mut self, cmd: &str) -> Result<String, String> {
+        crate::deploy::remote_capture("root", &self.host, cmd)
+    }
+}
+
+// ───────────────────────── AppLoad route ─────────────────────────
+
+/// AppLoad's `external.manifest.json` for an eink-kit app. Schema from
+/// rm-appload `src/libraryexternals.cpp`: `name` and `application` are
+/// required; `qtfb: true` makes AppLoad open a window and pass `QTFB_KEY`;
+/// `environment` is passed through, which is how the model and profile reach
+/// the app without device detection.
+pub fn appload_manifest(display_name: &str, app: &str, model: Option<RmModel>, profile: RefreshProfile) -> String {
+    let mut env = serde_json::Map::new();
+    env.insert("EINK_BACKEND".into(), "qtfb".into());
+    env.insert(PROFILE_ENV.into(), profile.as_env().into());
+    if let Some(m) = model {
+        env.insert("EINK_MODEL".into(), m.env_id().into());
+    }
+    let v = serde_json::json!({
+        "name": display_name,
+        "application": bin_path(app),
+        "qtfb": true,
+        "environment": env,
+    });
+    serde_json::to_string_pretty(&v).expect("json")
+}
+
+/// Write the manifest into `<appload_dir>/<app>/`. AppLoad lists it after it
+/// next reloads its library.
+pub fn appload_install_cmd(app: &str, appload_dir: &str, manifest: &str) -> Result<String, String> {
+    check(app)?;
+    let dir = format!("{appload_dir}/{app}");
+    Ok(format!(
+        "mkdir -p {d} && printf '%s\\n' {m} > {d}/external.manifest.json && echo manifest-written",
+        d = shell_quote(&dir),
+        m = shell_quote(manifest),
+    ))
+}
+
+/// Push + promote, then either launch (Blight) or register with AppLoad.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delivered {
+    Launched(Outcome),
+    Registered { manifest_dir: String },
+}
+
+pub fn deliver(
+    remote: &mut dyn Remote,
+    route: &Route,
+    app: &str,
+    local_bin: &str,
+    env: &LaunchEnv,
+    args: &[&str],
+    on: &mut dyn FnMut(Event),
+) -> Result<Delivered, String> {
+    match route {
+        Route::Blight => deploy_and_launch(remote, app, local_bin, env, args, 2, on).map(Delivered::Launched),
+        Route::AppLoad { dir } => {
+            check(app)?;
+            on(Event::Preparing);
+            remote.run(&prepare_cmd()).map_err(|e| format!("prepare: {e}"))?;
+            on(Event::Pushing { bytes: std::fs::metadata(local_bin).ok().map(|m| m.len()) });
+            remote.push(local_bin, &staging_path(app)).map_err(|e| format!("push: {e}"))?;
+            on(Event::Installing);
+            remote.run(&install_cmd(app)?).map_err(|e| format!("install: {e}"))?;
+            let manifest = appload_manifest(app, app, env.model, env.profile);
+            remote.run(&appload_install_cmd(app, dir, &manifest)?).map_err(|e| format!("manifest: {e}"))?;
+            Ok(Delivered::Registered { manifest_dir: format!("{dir}/{app}") })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -449,7 +727,7 @@ mod tests {
     fn hostile_app_names_never_reach_a_shell() {
         for bad in ["", "a;rm -rf /", "../x", "App", "a b", "$(x)"] {
             assert!(install_cmd(bad).is_err(), "{bad:?}");
-            assert!(launch_cmd(bad, RefreshProfile::FastMono, &[]).is_err(), "{bad:?}");
+            assert!(launch_cmd(bad, &LaunchEnv::new(RefreshProfile::FastMono), &[]).is_err(), "{bad:?}");
         }
         assert!(valid_app_name("tomescope"));
         assert!(valid_app_name("vidkit-player"));
@@ -464,9 +742,10 @@ mod tests {
 
     #[test]
     fn launch_carries_the_profile_and_records_the_pid() {
-        let c = launch_cmd("tomescope", RefreshProfile::FastColor, &["/home/root/a b.epub"]).unwrap();
+        let c = launch_cmd("tomescope", &LaunchEnv { profile: RefreshProfile::FastColor, model: Some(RmModel::PaperPro), blight_lib: Some("/home/root/.vellum/lib/libblight_protocol.so.1".into()) }, &["/home/root/a b.epub"]).unwrap();
         assert!(c.contains("tomescope' '/home/root/a b.epub' </dev/null"));
         assert!(c.contains("EINK_PROFILE=fast-color"));
+        assert!(c.contains("EINK_BACKEND=blight EINK_MODEL=rmpp EINK_BLIGHT_LIB='/home/root/.vellum/lib/libblight_protocol.so.1'"));
         assert!(c.contains("nohup env"));
         assert!(c.contains("</dev/null"));
         assert!(c.contains("echo $! > '/home/root/.local/share/gitmind/run/tomescope.pid'"));
@@ -519,7 +798,7 @@ mod tests {
         sh(&rebase(install_cmd("demo").unwrap()));
         assert!(std::path::Path::new(&rebase(bin_path("demo"))).exists());
 
-        let out = sh(&rebase(launch_cmd("demo", RefreshProfile::FastColor, &["30"]).unwrap()));
+        let out = sh(&rebase(launch_cmd("demo", &LaunchEnv::new(RefreshProfile::FastColor), &["30"]).unwrap()));
         assert!(out.starts_with("started "), "{out}");
         let st = parse_status(&sh(&rebase(status_cmd("demo", 1).unwrap())));
         let pid = st.pid.expect("running");
@@ -527,7 +806,7 @@ mod tests {
         assert!(environ.split(|b| *b == 0).any(|kv| kv == b"EINK_PROFILE=fast-color"));
 
         // relaunch replaces the old instance rather than stacking a second one
-        sh(&rebase(launch_cmd("demo", RefreshProfile::FastMono, &["30"]).unwrap()));
+        sh(&rebase(launch_cmd("demo", &LaunchEnv::new(RefreshProfile::FastMono), &["30"]).unwrap()));
         let st2 = parse_status(&sh(&rebase(status_cmd("demo", 1).unwrap())));
         assert!(st2.pid.is_some());
         assert_ne!(st2.pid, Some(pid));
@@ -535,6 +814,23 @@ mod tests {
 
         sh(&rebase(stop_cmd("demo").unwrap()));
         assert_eq!(parse_status(&sh(&rebase(status_cmd("demo", 0).unwrap()))).pid, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every generated command must EXIT 0 in its normal cases, because
+    /// `remote_capture` turns a non-zero exit into an error. (`status` on a
+    /// never-launched app used to fail: `tail` of a missing log exits 1.)
+    #[test]
+    fn commands_exit_zero_on_a_fresh_device() {
+        let dir = std::env::temp_dir().join(format!("eink_fresh_{}", std::process::id()));
+        let base = dir.to_string_lossy().to_string();
+        for cmd in [prepare_cmd(), status_cmd("never", 0).unwrap(), stop_cmd("never").unwrap()] {
+            let cmd = cmd.replace(BASE, &base);
+            let o = std::process::Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
+            assert!(o.status.success(), "exit {:?} for {cmd}", o.status.code());
+        }
+        let o = std::process::Command::new("sh").arg("-c").arg(status_cmd("never", 0).unwrap().replace(BASE, &base)).output().unwrap();
+        assert_eq!(parse_status(&String::from_utf8_lossy(&o.stdout)).pid, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -557,7 +853,7 @@ mod tests {
     fn flow_order_and_early_exit_reporting() {
         let mut f = Fake { log: vec![], status: "stopped\n---\npanic: no display\n".into() };
         let mut ev = vec![];
-        let out = deploy_and_launch(&mut f, "tomescope", "/nonexistent", RefreshProfile::FastColor, &[], 2, &mut |e| ev.push(e))
+        let out = deploy_and_launch(&mut f, "tomescope", "/nonexistent", &LaunchEnv::new(RefreshProfile::FastColor), &[], 2, &mut |e| ev.push(e))
             .unwrap();
         assert_eq!(out, Outcome::ExitedEarly { log_tail: "panic: no display".into() });
         assert!(f.log[0].starts_with("mkdir -p"));
@@ -566,5 +862,106 @@ mod tests {
         assert!(f.log[3].contains("nohup"));
         assert!(f.log[4].starts_with("sleep 2"));
         assert_eq!(ev.len(), 5);
+    }
+
+    struct FakeEnroller {
+        log: Vec<String>,
+        key_ok: bool,
+        key_ok_after_install: bool,
+    }
+    impl Enroller for FakeEnroller {
+        fn trust_host(&mut self) -> Result<String, String> { self.log.push("trust".into()); Ok("trusted".into()) }
+        fn key_works(&mut self) -> bool { self.log.push("key?".into()); self.key_ok }
+        fn install_key(&mut self, pw: &str) -> Result<String, String> {
+            self.log.push(format!("install:{pw}"));
+            self.key_ok = self.key_ok_after_install;
+            Ok("installed".into())
+        }
+        fn run(&mut self, cmd: &str) -> Result<String, String> {
+            self.log.push("run".into());
+            Ok(if cmd.starts_with("cat /proc") { "reMarkable Ferrari\n\naarch64".into() }
+               else if cmd.contains("qtfb.sock") { "qtfb=1\nappload_dir=/home/root/xovi/exthome/appload\nglibc=2.39\n".into() }
+               else { String::new() })
+        }
+    }
+
+    #[test]
+    fn first_contact_trusts_the_host_before_sending_the_password() {
+        let mut f = FakeEnroller { log: vec![], key_ok: false, key_ok_after_install: true };
+        let r = enroll(&mut f, Some("hunter2"), &mut |_| {}).unwrap();
+        let trust = f.log.iter().position(|l| l == "trust").unwrap();
+        let install = f.log.iter().position(|l| l.starts_with("install")).unwrap();
+        assert!(trust < install);
+        assert!(r.used_password);
+        assert_eq!(r.probe.model, Some(RmModel::PaperPro));
+        assert_eq!(r.displays.glibc.as_deref(), Some("2.39"));
+        assert_eq!(r.displays.route().unwrap(), Route::AppLoad { dir: "/home/root/xovi/exthome/appload".into() });
+    }
+
+    #[test]
+    fn re_enrolling_never_asks_for_the_password_or_duplicates_the_key() {
+        let mut f = FakeEnroller { log: vec![], key_ok: true, key_ok_after_install: true };
+        let r = enroll(&mut f, None, &mut |_| {}).unwrap();
+        assert!(!r.used_password);
+        assert!(!f.log.iter().any(|l| l.starts_with("install")));
+    }
+
+    #[test]
+    fn a_missing_password_says_where_to_find_it() {
+        let mut f = FakeEnroller { log: vec![], key_ok: false, key_ok_after_install: true };
+        let e = enroll(&mut f, None, &mut |_| {}).unwrap_err();
+        assert!(e.contains("Settings"), "{e}");
+    }
+
+    #[test]
+    fn a_key_that_still_does_not_work_is_an_error_not_a_silent_success() {
+        let mut f = FakeEnroller { log: vec![], key_ok: false, key_ok_after_install: false };
+        assert!(enroll(&mut f, Some("pw"), &mut |_| {}).is_err());
+    }
+
+    #[test]
+    fn blight_is_preferred_and_missing_everything_is_explained() {
+        let both = parse_displays("qtfb=1\nappload_dir=/x\nblight_lib=/opt/lib/libblight_protocol.so.1\nblight_running=1\n");
+        assert_eq!(both.route().unwrap(), Route::Blight);
+        let installed_not_running = parse_displays("blight_lib=/opt/lib/libblight_protocol.so\n");
+        assert!(installed_not_running.route().unwrap_err().contains("not running"));
+        assert!(parse_displays("").route().unwrap_err().contains("Vellum"));
+    }
+
+    #[test]
+    fn appload_manifest_matches_the_schema_and_carries_the_env() {
+        let m = appload_manifest("eink demo", "eink-demo", Some(RmModel::PaperProMove), RefreshProfile::FastColor);
+        let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+        assert_eq!(v["name"], "eink demo");
+        assert_eq!(v["application"], "/home/root/.local/share/gitmind/bin/eink-demo");
+        assert_eq!(v["qtfb"], true);
+        assert_eq!(v["environment"]["EINK_MODEL"], "rmppm");
+        assert_eq!(v["environment"]["EINK_BACKEND"], "qtfb");
+        assert_eq!(v["environment"]["EINK_PROFILE"], "fast-color");
+    }
+
+    #[test]
+    fn the_manifest_command_survives_the_shell_with_quotes_in_it() {
+        let m = appload_manifest("it's \"quoted\"", "demo", None, RefreshProfile::Quality);
+        let dir = std::env::temp_dir().join(format!("appload_{}", std::process::id()));
+        let cmd = appload_install_cmd("demo", &dir.to_string_lossy(), &m).unwrap();
+        let out = std::process::Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("manifest-written"));
+        let written = std::fs::read_to_string(dir.join("demo/external.manifest.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(v["name"], "it's \"quoted\"");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_displays_probe_is_valid_sh_and_emits_only_known_keys() {
+        // Whatever this host has installed, the probe must run and every
+        // line must be a key the parser knows (no stray output to misread).
+        let out = std::process::Command::new("sh").arg("-c").arg(displays_probe_cmd()).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let key = line.split_once('=').map(|(k, _)| k).unwrap_or(line);
+            assert!(["qtfb", "appload_dir", "blight_lib", "blight_running", "glibc"].contains(&key), "unexpected probe line {line:?}");
+        }
     }
 }

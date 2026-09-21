@@ -76,7 +76,11 @@ struct Api {
 fn load() -> io::Result<Api> {
     let candidates: Vec<String> = match std::env::var("EINK_BLIGHT_LIB") {
         Ok(p) => vec![p],
-        Err(_) => ["libblight_protocol.so", "libblight_protocol.so.1", "/opt/lib/libblight_protocol.so", "/usr/lib/libblight_protocol.so"]
+        // Same places gitmind's probe looks (cockpit::eink_fleet); gitmind
+        // normally passes the exact path it found as EINK_BLIGHT_LIB.
+        Err(_) => ["libblight_protocol.so", "libblight_protocol.so.1", "/opt/lib/libblight_protocol.so", "/opt/lib/libblight_protocol.so.1",
+                   "/usr/lib/libblight_protocol.so", "/usr/lib/libblight_protocol.so.1",
+                   "/home/root/.vellum/lib/libblight_protocol.so", "/home/root/.vellum/lib/libblight_protocol.so.1"]
             .iter().map(|s| s.to_string()).collect(),
     };
     let mut handle = std::ptr::null_mut();
