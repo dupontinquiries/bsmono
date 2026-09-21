@@ -241,6 +241,25 @@ impl Pipe {
         Ok(out)
     }
 
+    /// Decode every frame in colour at `size`. For analysis at small sizes
+    /// (cut detection, looks): the whole range is held in memory.
+    pub fn rgb(&self) -> Result<Vec<Frame>, String> {
+        let mut dec = spawn_decoder(self, false).map_err(|e| format!("ffmpeg: {e}"))?;
+        let mut stdout = dec.stdout.take().expect("piped");
+        let n = (self.size.w * self.size.h * 3) as usize;
+        let mut buf = vec![0u8; n];
+        let mut out = Vec::new();
+        loop {
+            match stdout.read_exact(&mut buf) {
+                Ok(()) => out.push(Frame { w: self.size.w, h: self.size.h, px: buf.clone() }),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(format!("decode: {e}")),
+            }
+        }
+        finish(&mut dec, "decoder")?;
+        Ok(out)
+    }
+
     /// Decode, hand each frame to `f`, encode what it returns. One frame is
     /// in memory at a time.
     pub fn map(&self, out: &Path, crf: u32, mut f: impl FnMut(usize, Frame) -> Frame) -> Result<usize, String> {

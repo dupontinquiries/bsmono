@@ -70,6 +70,8 @@ pub mod testkit;
 pub mod stabilize;
 /// Touch-up: a ticket for one shot becomes a fixed version of it, with handles and a report.
 pub mod touchup;
+/// Reverse-engineer an edit: its cuts, short transitions and fades.
+pub mod cuts;
 /// Operator signal lanes: weighted inputs, hard marks, cut candidates that say why.
 pub mod signals;
 #[cfg(test)]

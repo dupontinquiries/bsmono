@@ -80,3 +80,58 @@ fn each_close_mic_is_louder_for_its_own_sides_lines() {
     assert!(db(r_men, l_men) > 6.0, "the right mic hears the men louder: {:.1} dB", db(r_men, l_men));
     assert!(db(l_wom, r_wom) > 6.0, "the left mic hears the women louder: {:.1} dB", db(l_wom, r_wom));
 }
+
+fn fixture(name: &str) -> Option<PathBuf> {
+    let d = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures").join(name);
+    d.exists().then_some(d)
+}
+
+fn ffmpeg_here() -> bool { std::process::Command::new("ffmpeg").arg("-version").output().is_ok() }
+
+/// Pull the numbers after `"key": ` for every occurrence (the truth files are
+/// small and written by our own generator; no JSON dependency needed).
+fn json_numbers(text: &str, key: &str) -> Vec<f64> {
+    text.split(&format!("\"{key}\": ")).skip(1)
+        .filter_map(|s| s.split(|c: char| c == ',' || c == '}' || c == '\n').next()?.trim().parse().ok()).collect()
+}
+
+#[test]
+fn the_cut_detector_finds_every_cartoon_cut_on_its_frame() {
+    let Some(d) = fixture("cartoon-allmylife") else { eprintln!("skip: no fixture"); return };
+    if !ffmpeg_here() { eprintln!("skip: no ffmpeg"); return; }
+    let truth = std::fs::read_to_string(d.join("truth.json")).unwrap();
+    let frames_truth: Vec<usize> = json_numbers(&truth, "frame").into_iter().map(|f| f as usize).collect();
+    let kinds: Vec<&str> = truth.split("\"kind\": \"").skip(1).map(|s| s.split('"').next().unwrap()).collect();
+    let pipe = studio_video::framepipe::Pipe { input: d.join("allmylife-cartoon.mp4"), range: None,
+        size: studio_video::framepipe::Size { w: 160, h: 90 }, fps: 24.0 };
+    let ev = studio_video::cuts::detect(&pipe.rgb().unwrap());
+    let found = studio_video::cuts::cut_frames(&ev);
+    for (f, k) in frames_truth.iter().zip(&kinds) {
+        match *k {
+            "fade" => assert!(ev.iter().any(|e| matches!(e, studio_video::cuts::Event::Fade { start, to_black: true, .. } if start.abs_diff(*f) <= 2)),
+                              "the fade at frame {f} is reported as a fade: {ev:?}"),
+            _ => assert!(found.iter().any(|c| c.abs_diff(*f) <= 1), "the {k} cut at frame {f} is found within a frame: {found:?}"),
+        }
+    }
+    let hard_or_glitch = kinds.iter().filter(|k| **k != "fade").count();
+    assert_eq!(found.len(), hard_or_glitch, "no extra cuts -- not in the spinning kaleidoscopes, and the four-frame glitch once: {found:?}");
+}
+
+#[test]
+fn the_cut_detector_agrees_with_the_analysis_of_the_real_edit() {
+    let Some(d) = fixture("real-proxies") else { eprintln!("skip: no fixture"); return };
+    if !ffmpeg_here() { eprintln!("skip: no ffmpeg"); return; }
+    let text = std::fs::read_to_string(d.join("allmylife-analysis.json")).unwrap();
+    let est: Vec<f64> = text.split("\"cuts_estimated\": [").nth(1).unwrap().split(']').next().unwrap()
+        .split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    let pipe = studio_video::framepipe::Pipe { input: d.join("allmylife-256.mp4"), range: None,
+        size: studio_video::framepipe::Size { w: 160, h: 90 }, fps: 30.0 };
+    let found: Vec<f64> = studio_video::cuts::cut_frames(&studio_video::cuts::detect(&pipe.rgb().unwrap()))
+        .into_iter().map(|f| f as f64 / 30.0).collect();
+    // the estimates are estimates (the script's own detector, and the credits fade
+    // together into one "shot"): agreement, not identity, is the bar
+    let hit = est.iter().filter(|t| found.iter().any(|f| (f - *t).abs() <= 2.0 / 30.0)).count();
+    let extra = found.iter().filter(|f| !est.iter().any(|t| (*f - t).abs() <= 2.0 / 30.0)).count();
+    eprintln!("real edit: {hit}/{} estimated cuts found, {extra} found that the estimate lacks", est.len());
+    assert!(hit as f64 >= 0.85 * est.len() as f64, "{hit}/{} of the analysis's cuts", est.len());
+}
