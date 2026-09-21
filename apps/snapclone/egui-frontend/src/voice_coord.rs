@@ -315,6 +315,19 @@ impl Coordinator {
     /// Always to the bar; to the roster ONLY while we hold the floor, because
     /// the roster's animated ring belongs to the ACTIVE speaker and we have
     /// no level for a remote one.
+    /// ## KNOWN GAP: in Open mode your own ring never lights
+    ///
+    /// Open is the DEFAULT `TalkMode`, where `GroupVoice::active_speaker` is
+    /// "whoever is loudest", read from `gv.levels`. This function never calls
+    /// `gv.set_level(self_id, level)` -- it takes `&self` and no GroupVoice at
+    /// all -- so the local level never enters that comparison. The result: in
+    /// the default mode you can never be the active speaker, `holder` is never
+    /// you, and the gate below keeps your mic off the roster permanently.
+    ///
+    /// Found while fixing a test that assumed push-to-talk. NOT fixed here,
+    /// because it needs this signature to take the GroupVoice, and every call
+    /// site with it -- a change to the voice pipeline's shape rather than to
+    /// one test, worth doing deliberately.
     pub fn mic_level(&self, level: f32, bar: Option<&mut VoiceBar>, roster: Option<&mut Roster>) {
         if let Some(b) = bar {
             b.set_mic_level(level);
@@ -479,7 +492,28 @@ mod tests {
     #[test]
     fn the_local_mic_level_reaches_the_roster_only_while_we_hold_the_floor() {
         let (mut c, mut gv) = setup();
+        // PUSH-TO-TALK, which is what "hold the floor" means. `setup()` gives
+        // `GroupVoice::default()`, whose mode is `Open`, and `floor_assert`
+        // returns false outright in Open mode -- so neither the peer nor we
+        // ever held the floor. The first assertion below then passed
+        // VACUOUSLY (nobody held it, so no ring showed our mic) and the second
+        // failed. It was failing before any recent change; verified against
+        // the pre-change group_voice.rs.
+        gv.mode = crate::group_voice::TalkMode::PushToTalk;
+        // AND A POPULATED ROSTER -- the second of two setup gaps, and the one
+        // that kept this failing after the mode was fixed. `set_active_speaker`
+        // deliberately refuses an id that is not one of its people ("the
+        // roster cannot highlight a row it does not have"), and
+        // `Roster::default()` has none. So "me" was rejected as invisible,
+        // `active` stayed empty, and `set_speaker_level` then ignored the
+        // level. Instrumenting showed the FLOOR was won correctly; the loss
+        // was one layer down.
         let mut roster = Roster::default();
+        // Two `Participant` types with identical fields -- group_voice's and
+        // roster's -- so this maps field by field rather than reusing one.
+        roster.set_participants(people().into_iter().map(|p| crate::roster::Participant {
+            id: p.id, name: p.name, is_self: p.is_self,
+        }).collect());
         c.join(&mut gv);
 
         // A peer is talking: our level must not drive their ring.
