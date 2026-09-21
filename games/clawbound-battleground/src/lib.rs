@@ -43,6 +43,11 @@ pub mod camps;
 /// What the bot TEAM is doing, as opposed to what each bot is doing: one
 /// quorum-gated objective the individual brains defer to, with
 /// self-preservation outranking it.
+/// Graphics tiers for mobile. Measured from the shaders: the post pass's
+/// 24-tap bloom ring and 22-tap god rays are the frame, and the 2048² shadow
+/// map is second. Low turns bloom to EXACTLY zero, which is what lets the
+/// shader skip the ring rather than scale it.
+pub mod quality;
 pub mod teamplay;
 pub mod markers;
 /// The clock, and what it does to a cat's senses. `wildkit::sim::climate` says
