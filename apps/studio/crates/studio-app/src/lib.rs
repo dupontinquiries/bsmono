@@ -5974,6 +5974,30 @@ impl App {
                         "no transcripts loaded yet — the filter applies once they are".into()
                     } else { self.refilter_words() };
                 }
+                palette::ShellVerb::Kaleidoscope(segments) => {
+                    let project = &self.studio.session.doc.project;
+                    let ops: Vec<studio_core::Op> = self.studio.selection.iter()
+                        .filter_map(|id| project.clips.get(id))
+                        .filter(|c| project.sources.get(&c.source).map(|s| s.has_video).unwrap_or(false))
+                        .map(|c| {
+                            // replace any previous fold, keep every other effect where it was
+                            let mut fx: Vec<studio_core::Effect> = c.effects.iter()
+                                .filter(|e| e.kind != studio_video::kaleido::KIND).cloned().collect();
+                            if segments >= 2 {
+                                fx.push(studio_video::kaleido::Kaleido { segments, ..Default::default() }.effect());
+                            }
+                            studio_core::Op::SetEffects { id: c.id, effects: fx }
+                        }).collect();
+                    if ops.is_empty() {
+                        self.studio.status = "select the picture clips to fold".into();
+                    } else {
+                        let n = ops.len();
+                        self.studio.edit_group(ops, "kaleidoscope");
+                        self.studio.status = if segments >= 2 {
+                            format!("{n} clip(s): kaleidoscope, {segments} wedges — preview and export")
+                        } else { format!("{n} clip(s): kaleidoscope off") };
+                    }
+                }
                 palette::ShellVerb::InsertRange { source, from_ms, to_ms } => {
                     let at = self.studio.playhead();
                     let (a, b) = (insert_by_content::from_ms(from_ms), insert_by_content::from_ms(to_ms));

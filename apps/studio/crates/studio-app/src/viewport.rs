@@ -69,7 +69,8 @@ pub fn layers_at(project: &Project, playhead: Ticks) -> Vec<LayerSpec> {
                         _ => {}
                     }
                 }
-                out.push(LayerSpec { path: src.path.clone(), media, transform, mode, opacity, color });
+                let kaleido = studio_video::kaleido::Kaleido::of(&c.effects);
+                out.push(LayerSpec { path: src.path.clone(), media, transform, mode, opacity, color, kaleido });
                 break;
             }
         }
@@ -88,6 +89,8 @@ pub struct LayerSpec {
     /// the same order the export uses (`studio_video::edit::Picture`), so
     /// the preview no longer shows an ungraded picture the file won't have.
     pub color: Option<studio_fx::Color>,
+    /// The clip's kaleidoscope, folded after the grade (the export's order).
+    pub kaleido: Option<studio_video::kaleido::Kaleido>,
 }
 
 impl LayerSpec {
@@ -98,6 +101,10 @@ impl LayerSpec {
                 let o = c.apply([p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0]);
                 for k in 0..3 { p[k] = (o[k] * 255.0 + 0.5) as u8; }
             }
+        }
+        if let Some(k) = &self.kaleido {
+            let folded = studio_video::kaleido::apply(px, W, H, k);
+            px.copy_from_slice(&folded);
         }
     }
 }
@@ -240,7 +247,7 @@ pub fn show(ui: &mut egui::Ui, project: &Project, playhead: Ticks,
     // Transform and grade are in the key: without them, adjusting either left
     // the old picture on screen until the playhead crossed a half-second.
     let key = (layers.iter().map(|l| format!("{}@{}:{:?}:{:.2}:{:?}:{:?}", l.path, coarse(l.media), l.mode, l.opacity,
-                                             l.transform, l.color)).collect::<Vec<_>>().join("|"), coarse(media));
+                                             l.transform, (l.color, l.kaleido))).collect::<Vec<_>>().join("|"), coarse(media));
     if cache.key.as_ref() != Some(&key) && cache.failed.as_ref() != Some(&key) {
         let mut frames: Vec<(Vec<u8>, &LayerSpec)> = Vec::new();
         let mut err = None;

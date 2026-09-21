@@ -53,6 +53,9 @@ pub struct Cut {
 pub struct Picture {
     pub transform: Option<studio_fx::Transform>,
     pub color: Option<studio_fx::Color>,
+    /// A kaleidoscope fold, run after the grade and before the reframe --
+    /// the same order the viewport uses.
+    pub kaleido: Option<crate::kaleido::Kaleido>,
     /// Effects that change the picture in the preview but that this export
     /// cannot yet reproduce, named for the person exporting. Never silently
     /// dropped: a file that differs from the preview must say so.
@@ -63,7 +66,7 @@ impl Picture {
     /// From a clip's effect list, in order (a later effect of the same kind
     /// wins, as in the viewport).
     pub fn of(effects: &[studio_core::Effect]) -> Picture {
-        let mut p = Picture::default();
+        let mut p = Picture { kaleido: crate::kaleido::Kaleido::of(effects), ..Picture::default() };
         for fx in effects.iter().filter(|f| f.enabled) {
             match studio_fx::instantiate(fx, 48_000.0) {
                 Some(studio_fx::Instance::Transform(t)) => {
@@ -81,7 +84,7 @@ impl Picture {
         p
     }
 
-    pub fn is_identity(&self) -> bool { self.transform.is_none() && self.color.is_none() }
+    pub fn is_identity(&self) -> bool { self.transform.is_none() && self.color.is_none() && self.kaleido.is_none() }
 
     /// The filter chain from a fitted `w`×`h` frame to the finished picture,
     /// as `(foreground chain, overlay position)`. The foreground chain runs on
@@ -102,6 +105,10 @@ impl Picture {
                     ",colorchannelmixer=rr={:.6}:rg={kg:.6}:rb={kb:.6}:gr={kr:.6}:gg={:.6}:gb={kb:.6}:br={kr:.6}:bg={kg:.6}:bb={:.6}",
                     kr + s, kg + s, kb + s));
             }
+        }
+        if let Some(k) = &self.kaleido {
+            f.push(',');
+            f.push_str(&crate::kaleido::geq_filter(k, w, h));
         }
         let Some(t) = &self.transform else { return (f, None) };
         // Forward map of the compositor's inverse: a layer point u (0..1)
@@ -501,7 +508,7 @@ mod tests {
             crop: (0.2, 0.0, 0.0, 0.1), ..Default::default() };
         let c = studio_fx::Color { lift: [0.0, 0.0, 0.1], gamma: [1.0, 1.6, 1.0],
             gain: [0.6, 1.0, 1.0], saturation: 0.7 };
-        let picture = Picture { transform: Some(t), color: Some(c), unsupported: vec![] };
+        let picture = Picture { transform: Some(t), color: Some(c), kaleido: None, unsupported: vec![] };
         let seg = Segment::Cut(Cut { path: take.video.clone(), src_in: s(1.0), len: s(1.0), at: s(0.0), picture });
         let out = shoot.dir.join(format!("fx-{}.mp4", std::process::id()));
         render(&[seg], None, &out, w, h, 12).expect("render");
@@ -549,5 +556,46 @@ mod tests {
         // and the grade actually did something measurable
         assert!((want[i] as i32 - take.rgb[0] as i32).abs() > 40, "{:?} vs source {:?}", &want[i..i + 3], take.rgb);
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn a_kaleidoscope_cut_exports_what_the_preview_folds() {
+        if !crate::testkit::ffmpeg_or_skip("a_kaleidoscope_cut_exports_what_the_preview_folds") { return; }
+        use crate::framepipe::{Pipe, Size};
+        let shoot = crate::testkit::shoot(&[1.0], 3.0);
+        let (w, h) = (96u32, 54u32);
+        // a textured source: a flat colour folds to itself and would prove nothing
+        let tex = shoot.dir.join(format!("kal-src-{}.mp4", std::process::id()));
+        Pipe { input: shoot.takes[0].video.clone(), range: None, size: Size { w, h }, fps: 12.0 }
+            .map(&tex, 12, |_, mut f| {
+                for y in 0..f.h { for x in 0..f.w {
+                    // big cells: both files are lossy 4:2:0 encodes, which smear
+                    // edges, and "fold then smear" differs from "smear then fold"
+                    // at every edge. An 8x6 checker at this size is ALL edges and
+                    // measured 20.6% "different" with nothing wrong in the export.
+                    let v = if (x / 24 + y / 18) % 2 == 0 { 230 } else { 30 };
+                    f.set(x, y, [v, (x * 255 / f.w) as u8, (y * 255 / f.h) as u8]);
+                }}
+                f
+            }).expect("textured source");
+        let k = crate::kaleido::Kaleido { segments: 6, angle: 15.0, cx: 0.5, cy: 0.5 };
+        let cut = |picture: Picture| Segment::Cut(Cut { path: tex.clone(), src_in: s(0.5), len: s(1.0), at: s(0.0), picture });
+        let plain = shoot.dir.join(format!("kal-plain-{}.mp4", std::process::id()));
+        let folded = shoot.dir.join(format!("kal-fold-{}.mp4", std::process::id()));
+        render(&[cut(Picture::default())], None, &plain, w, h, 12).expect("plain");
+        render(&[cut(Picture { kaleido: Some(k), ..Picture::default() })], None, &folded, w, h, 12).expect("folded");
+        let a = super::super::frame_rgb(&plain, s(0.5), w, h).unwrap();
+        let b = super::super::frame_rgb(&folded, s(0.5), w, h).unwrap();
+        let want = crate::kaleido::apply(&a, w, h, &k);
+        let off = b.chunks(3).zip(want.chunks(3))
+            .filter(|(x, y)| x.iter().zip(y.iter()).any(|(p, q)| (*p as i32 - *q as i32).abs() > 40)).count();
+        let share = off as f32 / (w * h) as f32;
+        // a looser bar than the raw geq parity: two lossy encodes sit between them
+        assert!(share < 0.08, "{:.1}% of the exported frame differs from the preview's fold", share * 100.0);
+        // and it really is folded: not the plain frame
+        let same_as_plain = a.chunks(3).zip(b.chunks(3))
+            .filter(|(x, y)| x.iter().zip(y.iter()).all(|(p, q)| (*p as i32 - *q as i32).abs() <= 20)).count();
+        assert!((same_as_plain as f32) < 0.8 * (w * h) as f32, "the export is not simply the plain picture");
+        for f in [&tex, &plain, &folded] { let _ = std::fs::remove_file(f); }
     }
 }

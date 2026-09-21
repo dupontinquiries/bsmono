@@ -101,6 +101,9 @@ pub enum ShellVerb {
     InsertRange { source: studio_core::SourceId, from_ms: u64, to_ms: u64 },
     /// Which words the transcript gutter shows.
     WordFilter(WordFilterKind),
+    /// Fold the selected clips into a kaleidoscope of `segments` wedges;
+    /// 0 takes it off.
+    Kaleidoscope(u32),
     /// What the selected clips' effects do after the clips end: `ring_ms` of
     /// tail, the last `fade_ms` of it faded. 0 ring is a hard cut at the
     /// clip end. Milliseconds so the verb stays `Copy + Eq`.
@@ -248,6 +251,8 @@ pub enum Ask {
     WordFilterChoice,
     /// Insert by content: search transcript lines (or type `C0057 12-18`).
     InsertFind,
+    /// How many wedges for the kaleidoscope.
+    KaleidoChoice,
     /// How to trim a chosen line before it goes in.
     InsertTrim { source: studio_core::SourceId, start_ms: u64, end_ms: u64 },
     /// From the chosen line to a later line in the same source.
@@ -331,6 +336,8 @@ pub fn root() -> Vec<Choice> {
         c("insert a clip at the playhead by what is said (or a time range)",
           Some("search the transcripts, or type C0057 12.5-18"),
           Then::Ask(Ask::InsertFind)),
+        c("kaleidoscope the selected clip", Some("mirror, 4, 6, 8 or 12 wedges — or off"),
+          Then::Ask(Ask::KaleidoChoice)),
         c("transcript gutter: filter words (fillers / unique / a word list)",
           Some("find the ums to cut, or skim for the names and key lines"),
           Then::Ask(Ask::WordFilterChoice)),
@@ -661,6 +668,17 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
             ]
         }
         Ask::InsertFind | Ask::InsertTo { .. } => Vec::new(), // need transcripts: see Palette::choices
+        Ask::KaleidoChoice => [
+            (0, "off", "back to the plain picture"),
+            (2, "mirror (2)", "one fold down the middle"),
+            (4, "4 wedges", "a cross"),
+            (6, "6 wedges", "the classic kaleidoscope"),
+            (8, "8 wedges", "a rose window"),
+            (12, "12 wedges", "lace — busy, use briefly"),
+        ].into_iter().map(|(n, label, what)| Choice {
+            label: label.into(), hint: Some(what.into()),
+            then: Then::Do(Act::Shell(ShellVerb::Kaleidoscope(n))),
+        }).collect(),
         Ask::WordFilterChoice => [
             (WordFilterKind::All, "all words", "what is being said — the default"),
             (WordFilterKind::Filler, "filler words only", "um, uh, you know, o sea — the places to cut"),

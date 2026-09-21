@@ -70,6 +70,8 @@ pub mod testkit;
 pub mod stabilize;
 /// Touch-up: a ticket for one shot becomes a fixed version of it, with handles and a report.
 pub mod touchup;
+/// Kaleidoscope clip effect: one formula for the preview (Rust) and the export (ffmpeg geq).
+pub mod kaleido;
 /// Temporal clean plate: remove something that passes through a shot, using the frames around it.
 pub mod cleanplate;
 /// Frames out of ffmpeg, through Rust, back into ffmpeg: the one place per-frame pixel work happens.
