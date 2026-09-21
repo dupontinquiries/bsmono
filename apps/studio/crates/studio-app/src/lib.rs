@@ -59,6 +59,7 @@ pub mod multicam_cut;
 pub mod relink;
 pub mod transcripts;
 pub mod overview;
+pub mod insert_by_content;
 pub mod touchup_job;
 pub mod mixer_panel;
 pub mod morph_pad;
@@ -167,6 +168,12 @@ pub struct Studio {
     /// shell syncs the sink to this every frame, so the headless tests below
     /// can drive the space bar without a sound card existing.
     pub rack_playing: bool,
+    /// Set by the keymap's menu keys (Shift+Space, `:`), read and cleared by
+    /// the shell, which owns the palette. The keymap had resolved both keys
+    /// for a long time while nothing handled them: the corner hint said
+    /// "S-space menu" and the key did nothing, leaving Ctrl+P — shown
+    /// nowhere — as the only way in.
+    pub palette_requested: bool,
     /// Set by any rack edit; the shell re-renders the loop and clears it.
     pub loop_dirty: bool,
     /// Set by any PROJECT edit (including undo/redo and a bounce); the shell
@@ -364,6 +371,7 @@ impl Studio {
             lane: studio_egui::lanes::Lane::default(),
             paint: studio_egui::grid::Paint::default(),
             rack_playing: false,
+            palette_requested: false,
             loop_dirty: true,
             arrangement_dirty: true,
             seek_pending: false,
@@ -1569,6 +1577,9 @@ impl Studio {
                             self.rack_playing = false;
                             self.transport.play(); self.status = "playing".into();
                         }
+                    }
+                    Action::LeaderMenu | Action::Command => {
+                        self.palette_requested = true;
                     }
                     Action::Undo => {
                         // The inverse goes back through the SAME stamping
@@ -2988,6 +2999,23 @@ mod tests {
     }
 
     #[test]
+    fn the_menu_keys_the_hint_advertises_actually_open_the_palette() {
+        // The corner hint has said "S-space menu" all along; the keymap
+        // resolved Shift+Space and ':' but no arm handled either, so both
+        // did nothing.
+        use studio_egui::keys::Key;
+        let mut s = Studio::demo();
+        s.key(Key { ch: ' ', shift: true, ctrl: false, alt: false });
+        assert!(s.palette_requested, "Shift+Space asks for the palette");
+        s.palette_requested = false;
+        s.key(Key::c(':'));
+        assert!(s.palette_requested, "':' asks for the palette, as in Helix");
+        s.palette_requested = false;
+        s.key(Key::c(' '));
+        assert!(!s.palette_requested && s.transport.playing, "plain space is still play");
+    }
+
+    #[test]
     fn space_toggles_the_transport_and_says_so() {
         let mut s = Studio::demo();
         assert!(!s.transport.playing);
@@ -3471,10 +3499,13 @@ impl eframe::App for App {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::R)) {
             self.toggle_take();
         }
+        if std::mem::take(&mut self.studio.palette_requested) && self.palette.is_none() {
+            self.palette = Some(palette::Palette::open_with(self.words_raw.clone()));
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
             self.palette = match self.palette {
                 Some(_) => None, // C-p again closes: a toggle, not a stack
-                None => Some(palette::Palette::open()),
+                None => Some(palette::Palette::open_with(self.words_raw.clone())),
             };
         }
         // C-1..C-4: the workspaces. One keypress per room, the kdenlive
@@ -5673,8 +5704,12 @@ impl App {
         }
 
         let width = Self::dialog_width(ctx.content_rect().width(), 420.0);
+        // max_width, not only default_width: a transcript line is as long as
+        // someone talked, and without a cap the window grew to fit the longest
+        // one — anchored at top-centre, it spread off BOTH edges and pushed the
+        // very lines being searched out of view (seen on the Fragile Thing card).
         egui::Window::new("Command palette").open(&mut open).resizable(false)
-            .collapsible(false).default_width(width)
+            .collapsible(false).default_width(width).max_width(width)
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
             .show(ctx, |ui| {
                 if !p.path.is_empty() {
@@ -5693,7 +5728,14 @@ impl App {
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                     for (i, c) in ranked.iter().enumerate() {
                         let row = ui.horizontal(|ui| {
-                            let hit = ui.selectable_label(i == p.selected, &c.label);
+                            // Shortened for DRAWING only: the full label is still what
+                            // the filter matched against, so nothing becomes unfindable.
+                            const MAX_CHARS: usize = 46; // leaves room for the hint column
+                            let shown: std::borrow::Cow<str> = if c.label.chars().count() > MAX_CHARS {
+                                format!("{}…", c.label.chars().take(MAX_CHARS).collect::<String>()).into()
+                            } else { c.label.as_str().into() };
+                            let hit = ui.selectable_label(i == p.selected, shown.as_ref())
+                                .on_hover_text(&c.label);
                             if let Some(h) = &c.hint {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -5931,6 +5973,19 @@ impl App {
                     self.studio.status = if self.words_raw.is_empty() {
                         "no transcripts loaded yet — the filter applies once they are".into()
                     } else { self.refilter_words() };
+                }
+                palette::ShellVerb::InsertRange { source, from_ms, to_ms } => {
+                    let at = self.studio.playhead();
+                    let (a, b) = (insert_by_content::from_ms(from_ms), insert_by_content::from_ms(to_ms));
+                    let ops = insert_by_content::place(&self.studio.session.doc.project, source, a, b, at);
+                    if ops.is_empty() {
+                        self.studio.status = "nothing to insert — the range is empty or the source is gone".into();
+                    } else {
+                        let name = insert_by_content::source_name(&self.studio.session.doc.project, source);
+                        self.studio.edit_group(ops, "insert by content");
+                        self.studio.status = format!("inserted {name} {:.2}–{:.2} s at {:.2} s",
+                            a.to_seconds(), b.to_seconds(), at.to_seconds());
+                    }
                 }
                 palette::ShellVerb::LoadTranscripts => match export::pick_folder() {
                     None => self.studio.status = "no folder chosen".into(),

@@ -96,6 +96,9 @@ pub enum ShellVerb {
     PeakBand(studio_audio::Band),
     /// Load whisper transcripts from a folder and show them under the clips.
     LoadTranscripts,
+    /// Place `source[from_ms..to_ms]` at the playhead. A shell verb because
+    /// the playhead is the shell's, not the project's.
+    InsertRange { source: studio_core::SourceId, from_ms: u64, to_ms: u64 },
     /// Which words the transcript gutter shows.
     WordFilter(WordFilterKind),
     /// What the selected clips' effects do after the clips end: `ring_ms` of
@@ -243,6 +246,12 @@ pub enum Ask {
     ClipTailChoice,
     /// Which words to show in the transcript gutter.
     WordFilterChoice,
+    /// Insert by content: search transcript lines (or type `C0057 12-18`).
+    InsertFind,
+    /// How to trim a chosen line before it goes in.
+    InsertTrim { source: studio_core::SourceId, start_ms: u64, end_ms: u64 },
+    /// From the chosen line to a later line in the same source.
+    InsertTo { source: studio_core::SourceId, start_ms: u64 },
     /// Whether the camera moves during the shot being cleaned, then how many
     /// frames each side to look at.
     CleanPlateCamera,
@@ -319,6 +328,9 @@ pub fn root() -> Vec<Choice> {
         c("show transcripts under clips (load a folder of .srt)",
           Some("what is being said, in the gutter under each clip"),
           Then::Do(Act::Shell(ShellVerb::LoadTranscripts))),
+        c("insert a clip at the playhead by what is said (or a time range)",
+          Some("search the transcripts, or type C0057 12.5-18"),
+          Then::Ask(Ask::InsertFind)),
         c("transcript gutter: filter words (fillers / unique / a word list)",
           Some("find the ums to cut, or skim for the names and key lines"),
           Then::Ask(Ask::WordFilterChoice)),
@@ -629,6 +641,26 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
                 }
             }).collect()
         }
+        Ask::InsertTrim { source, start_ms, end_ms } => {
+            let src_len = project.sources.get(&source)
+                .map(|s| crate::insert_by_content::ms(s.len)).unwrap_or(end_ms);
+            let go = |a: u64, b: u64| Then::Do(Act::Shell(ShellVerb::InsertRange {
+                source, from_ms: a, to_ms: b.min(src_len).max(a + 1) }));
+            vec![
+                Choice { label: "just the line".into(),
+                         hint: Some(format!("{:.2}–{:.2} s", start_ms as f64 / 1e3, end_ms as f64 / 1e3)),
+                         then: go(start_ms, end_ms) },
+                Choice { label: "the line with ½ s either side".into(),
+                         hint: Some("line times are whole lines; a cut needs air".into()),
+                         then: go(start_ms.saturating_sub(500), end_ms + 500) },
+                Choice { label: "from here to a later line…".into(),
+                         hint: Some("pick where it ends".into()),
+                         then: Then::Ask(Ask::InsertTo { source, start_ms }) },
+                Choice { label: "5 s from the line".into(), hint: None, then: go(start_ms, start_ms + 5_000) },
+                Choice { label: "10 s from the line".into(), hint: None, then: go(start_ms, start_ms + 10_000) },
+            ]
+        }
+        Ask::InsertFind | Ask::InsertTo { .. } => Vec::new(), // need transcripts: see Palette::choices
         Ask::WordFilterChoice => [
             (WordFilterKind::All, "all words", "what is being said — the default"),
             (WordFilterKind::Filler, "filler words only", "um, uh, you know, o sea — the places to cut"),
@@ -791,14 +823,81 @@ pub struct Palette {
     pub path: Vec<String>,
     pub query: String,
     pub selected: usize,
+    /// The transcripts, snapshotted when the palette opens — the one input
+    /// the project does not hold. Shared, not copied per keystroke.
+    pub words: std::sync::Arc<std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>>,
+}
+
+/// The find step: a typed time range first (it is exactly what was asked
+/// for), then every transcript line. The palette's own fuzzy filter narrows
+/// the lines by the typed words, so this lists them all and labels each with
+/// its text, source and time.
+fn insert_find(project: &Project, words: &std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
+               query: &str) -> Vec<Choice> {
+    use crate::insert_by_content as ibc;
+    let mut out = Vec::new();
+    if let Some((source, a, b)) = ibc::parse_range(project, query) {
+        out.push(Choice {
+            // the label IS the query, so the fuzzy filter always keeps it
+            label: query.trim().to_string(),
+            hint: Some(format!("insert {} {:.2}–{:.2} s", ibc::source_name(project, source),
+                               a.to_seconds(), b.to_seconds())),
+            then: Then::Do(Act::Shell(ShellVerb::InsertRange { source, from_ms: ibc::ms(a), to_ms: ibc::ms(b) })),
+        });
+    }
+    if words.is_empty() && out.is_empty() {
+        out.push(Choice { label: "no transcripts loaded — type a range like C0057 12.5-18".into(),
+                          hint: None, then: Then::Do(Act::Ops(vec![])) });
+    }
+    // Transcript lines are filtered by WORDS before the palette's fuzzy
+    // ranking sees them. Fuzzy subsequence matching is right for command
+    // names and wrong for dialogue: "gloria" matches any long line that
+    // happens to contain g…l…o…r…i…a in order, and on the Fragile Thing card
+    // that kept dozens of unrelated lines under the real hits.
+    let wanted: Vec<String> = query.split_whitespace().map(studio_voice::normalize)
+        .filter(|w| !w.is_empty()).collect();
+    for l in ibc::lines(words) {
+        if !wanted.is_empty() {
+            let have: Vec<String> = l.text.split_whitespace().map(studio_voice::normalize).collect();
+            if !wanted.iter().all(|w| have.iter().any(|h| h.starts_with(w.as_str()))) { continue; }
+        }
+        out.push(Choice {
+            label: format!("“{}”", l.text),
+            hint: Some(format!("{} {:.1} s", ibc::source_name(project, l.source), l.start.to_seconds())),
+            then: Then::Ask(Ask::InsertTrim { source: l.source, start_ms: ibc::ms(l.start), end_ms: ibc::ms(l.end) }),
+        });
+    }
+    out
+}
+
+/// Later lines of the same source, each ending the range there.
+fn insert_to(project: &Project, words: &std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
+             source: studio_core::SourceId, start_ms: u64) -> Vec<Choice> {
+    use crate::insert_by_content as ibc;
+    let from = ibc::from_ms(start_ms);
+    words.get(&source).map(|segs| segs.iter().filter(|s| s.end > from).map(|s| Choice {
+        label: format!("…to “{}”", s.text),
+        hint: Some(format!("{:.1} s long", (s.end.saturating_sub(from)).to_seconds())),
+        then: Then::Do(Act::Shell(ShellVerb::InsertRange { source, from_ms: start_ms, to_ms: ibc::ms(s.end) })),
+    }).collect()).unwrap_or_else(|| {
+        let _ = project;
+        Vec::new()
+    })
 }
 
 impl Palette {
     pub fn open() -> Palette { Palette::default() }
 
+    /// Open with the transcripts, so insert-by-content can search them.
+    pub fn open_with(words: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>) -> Palette {
+        Palette { words: std::sync::Arc::new(words), ..Palette::default() }
+    }
+
     pub fn choices(&self, project: &Project) -> Vec<Choice> {
         match self.pending {
             None => root(),
+            Some(Ask::InsertFind) => insert_find(project, &self.words, &self.query),
+            Some(Ask::InsertTo { source, start_ms }) => insert_to(project, &self.words, source, start_ms),
             Some(ask) => candidates(ask, project),
         }
     }
@@ -848,6 +947,51 @@ mod tests {
         let found = filter(&r, "collaborator");
         assert!(found.len() >= 4, "only found {}: {:?}", found.len(),
                 found.iter().map(|c| &c.label).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn insert_by_content_finds_a_line_trims_it_and_offers_a_typed_range() {
+        use studio_core::{Op, Source, SourceId, Ticks};
+        let mut p = Project::default();
+        p.apply(&Op::AddSource { source: Source::file(SourceId(1), "/card/2026-09-10_0905_C0057.mkv",
+            Ticks::from_seconds(54.0), 48_000, 2, true) }).unwrap();
+        let seg = |a: f64, b: f64, t: &str| studio_voice::Segment { start: Ticks::from_seconds(a),
+            end: Ticks::from_seconds(b), text: t.into(), speaker: None, confidence: 1.0 };
+        let mut words = std::collections::BTreeMap::new();
+        words.insert(SourceId(1), vec![seg(1.0, 3.0, "Good morning, I'm Gloria."),
+                                       seg(3.0, 5.0, "This is Max."),
+                                       seg(8.0, 12.0, "You will be with other kids.")]);
+        let mut pal = Palette::open_with(words);
+        assert!(!filter(&root(), "insert").is_empty());
+        pal.pending = Some(Ask::InsertFind);
+
+        // words: the fuzzy filter narrows the lines
+        pal.query = "gloria".into();
+        let all = pal.choices(&p);
+        let hits = filter(&all, &pal.query);
+        assert_eq!(hits[0].label, "“Good morning, I'm Gloria.”", "{:?}", hits.iter().map(|c| &c.label).collect::<Vec<_>>());
+        assert_eq!(hits.len(), 1, "only lines that contain the word — no scattered-letter matches");
+        let Then::Ask(trim @ Ask::InsertTrim { start_ms: 1000, end_ms: 3000, .. }) = hits[0].then else { panic!("{:?}", hits[0].then) };
+
+        // trim: just the line, with handles, or to a later line
+        pal.pending = Some(trim);
+        pal.query.clear();
+        let t = pal.choices(&p);
+        let range = |c: &Choice| match c.then { Then::Do(Act::Shell(ShellVerb::InsertRange { from_ms, to_ms, .. })) => (from_ms, to_ms), _ => (0, 0) };
+        assert_eq!(range(&t[0]), (1000, 3000), "just the line");
+        assert_eq!(range(&t[1]), (500, 3500), "half a second either side");
+        let Then::Ask(to @ Ask::InsertTo { start_ms: 1000, .. }) = t[2].then else { panic!() };
+        pal.pending = Some(to);
+        let later = pal.choices(&p);
+        assert_eq!(later.len(), 3, "every line that ends after the start");
+        assert_eq!(range(&later[2]), (1000, 12000), "from Gloria's line to the end of 'other kids'");
+
+        // a typed range is offered first and survives the filter
+        pal.pending = Some(Ask::InsertFind);
+        pal.query = "C0057 12.5-18".into();
+        let r = pal.choices(&p);
+        let kept = filter(&r, &pal.query);
+        assert_eq!(range(kept[0]), (12500, 18000), "{:?}", kept.iter().map(|c| &c.label).collect::<Vec<_>>());
     }
 
     #[test]
