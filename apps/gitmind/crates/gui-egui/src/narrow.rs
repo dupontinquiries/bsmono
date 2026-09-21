@@ -270,4 +270,107 @@ mod tests {
         // inline on a laptop means fewer rows: the description shares the title's line
         assert!(laptop.texts <= phone.texts);
     }
+
+#[cfg(test)]
+mod focus_survives_reflow {
+    use super::*;
+
+    /// Render `field_pair`'s two layouts by hand around the REAL `field`, and
+    /// return field b's response. `narrow` = each field in its own row (phone);
+    /// otherwise both in one row (laptop). This is exactly the parent change a
+    /// width flip causes.
+    fn frame(ctx: &egui::Context, narrow: bool, a: &mut String, b: &mut String,
+             focus_b: bool) -> egui::Response {
+        let mut out = None;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let r = if narrow {
+                    ui.horizontal(|ui| { field(ui, "a", "t-a", a, 0.6); });
+                    ui.horizontal(|ui| field(ui, "b", "t-b", b, 0.6)).inner
+                } else {
+                    ui.horizontal(|ui| { field(ui, "a", "t-a", a, 0.3); field(ui, "b", "t-b", b, 0.3) }).inner
+                };
+                if focus_b { r.request_focus(); }
+                out = Some(r);
+            });
+        });
+        out.unwrap()
+    }
+
+    /// A field keeps its id and focus when its ROW LAYOUT changes.
+    ///
+    /// Written to reproduce the virtual-keyboard bug, on the theory that
+    /// `id_salt` is relative to the parent `Ui` and `field_pair` moves field b
+    /// between parents. IT PASSED ON THE UNFIXED CODE, disproving that: egui's
+    /// anonymous child `Ui`s (`horizontal`) INHERIT their parent's stable id, so
+    /// `id_salt` is relative only to the nearest `Ui` with an EXPLICIT id. Kept
+    /// as a guard, since it asserts a property the phone layout depends on.
+    #[test]
+    fn a_focused_field_keeps_focus_when_its_row_layout_changes() {
+        let ctx = egui::Context::default();
+        let (mut a, mut b) = (String::new(), String::new());
+        let r0 = frame(&ctx, true, &mut a, &mut b, true);   // focus b, phone layout
+        let r1 = frame(&ctx, true, &mut a, &mut b, false);  // steady
+        assert!(r1.has_focus(), "baseline: b holds focus in a steady layout");
+        let r2 = frame(&ctx, false, &mut a, &mut b, false); // layout flips
+        assert_eq!(r2.id, r0.id, "b's id changed when its row changed");
+        assert!(r2.has_focus(), "b lost focus when its row changed");
+    }
+}
+
+#[cfg(test)]
+mod multi_char_input {
+    use super::*;
+
+    /// Feed `events` to the real `field`, focused, and return what it holds.
+    fn type_into(events: Vec<egui::Event>) -> String {
+        let ctx = egui::Context::default();
+        let mut buf = String::new();
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)));
+        let mut run = |events: Vec<egui::Event>, focus: bool, buf: &mut String| {
+            let input = egui::RawInput { screen_rect: screen, events, ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let r = field(ui, "x", "t-mc", buf, 0.5);
+                    if focus { r.request_focus(); }
+                });
+            });
+        };
+        run(vec![], true, &mut buf);   // focus it
+        run(vec![], false, &mut buf);  // settle
+        run(events, false, &mut buf);  // type
+        buf
+    }
+
+    /// Per-key text, as a keycode-based virtual keyboard sends it.
+    #[test]
+    fn one_event_per_character_is_accepted() {
+        let evs = "hello".chars().map(|c| egui::Event::Text(c.to_string())).collect();
+        assert_eq!(type_into(evs), "hello");
+    }
+
+    /// A WHOLE WORD in one event, as swipe typing or a prediction commit sends
+    /// it. The literal reading of the report: "inputs longer than one character".
+    #[test]
+    fn a_multi_character_text_event_is_accepted_whole() {
+        assert_eq!(type_into(vec![egui::Event::Text("hello".into())]), "hello");
+    }
+
+    /// An IME composition committing a word, as a Wayland text-input keyboard
+    /// (squeekboard, and any on-screen keyboard using that protocol) sends it.
+    #[test]
+    fn an_ime_commit_of_a_word_is_accepted_whole() {
+        use egui::{Event, ImeEvent};
+        let evs = vec![
+            Event::Ime(ImeEvent::Enabled),
+            Event::Ime(ImeEvent::Preedit("hel".into())),
+            Event::Ime(ImeEvent::Commit("hello".into())),
+        ];
+        assert_eq!(type_into(evs), "hello");
+    }
+}
 }
