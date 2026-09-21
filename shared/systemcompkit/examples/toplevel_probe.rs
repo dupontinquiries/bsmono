@@ -35,7 +35,10 @@ fn main() {
         let list = s.poll().list().to_vec();
         let now: Vec<String> = list
             .iter()
-            .map(|t| format!("{}:{}:{}{}{}", t.id, t.app_id, t.title, if t.state.activated { " [active]" } else { "" }, if t.state.maximized { " [max]" } else { "" }))
+            .map(|t| {
+                let g = t.geometry.map(|(x, y, w, h)| format!(" {w}x{h}+{x}+{y}")).unwrap_or_default();
+                format!("{}:{}:{}{}{}{g}", t.id, t.app_id, t.title, if t.state.activated { " [active]" } else { "" }, if t.state.maximized { " [max]" } else { "" })
+            })
             .collect();
         let snapshot = now.join(" | ");
         if snapshot != last {

@@ -42,6 +42,9 @@ pub struct ToplevelInfo {
     pub title: String,
     pub app_id: String,
     pub state: ToplevelState,
+    /// Output-relative (x, y, width, height), from COSMIC's `geometry`
+    /// event (v2+). `None` until it arrives or on compositors without it.
+    pub geometry: Option<(i32, i32, i32, i32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +55,7 @@ pub enum ToplevelEvent {
     Title(u64, String),
     AppId(u64, String),
     StateChanged(u64, ToplevelState),
+    Geometry(u64, i32, i32, i32, i32),
     Closed(u64),
 }
 
@@ -89,6 +93,7 @@ impl ToplevelTracker {
                         title: String::new(),
                         app_id: String::new(),
                         state: ToplevelState::default(),
+                        geometry: None,
                     });
                 }
                 // A second New for an id already tracked is a no-op, not a
@@ -109,6 +114,11 @@ impl ToplevelTracker {
             ToplevelEvent::StateChanged(id, state) => {
                 if let Some(i) = self.index_of(id) {
                     self.entries[i].state = state;
+                }
+            }
+            ToplevelEvent::Geometry(id, x, y, w, h) => {
+                if let Some(i) = self.index_of(id) {
+                    self.entries[i].geometry = Some((x, y, w, h));
                 }
             }
             ToplevelEvent::Closed(id) => {
@@ -186,6 +196,22 @@ impl ManagerCaps {
             ToplevelRequest::SetFullscreen(_) => 5,
         };
         self.caps.contains(&want)
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    #[test]
+    fn geometry_is_tracked_and_ignored_for_unknown_ids() {
+        let mut t = ToplevelTracker::new();
+        t.apply(ToplevelEvent::New(1));
+        assert_eq!(t.get(1).unwrap().geometry, None);
+        t.apply(ToplevelEvent::Geometry(1, 0, 0, 1216, 800));
+        t.apply(ToplevelEvent::Geometry(9, 1, 2, 3, 4));
+        assert_eq!(t.get(1).unwrap().geometry, Some((0, 0, 1216, 800)));
+        assert!(t.get(9).is_none());
     }
 }
 

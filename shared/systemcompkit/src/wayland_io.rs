@@ -556,6 +556,8 @@ struct TopIoState {
     // object, not the ext_foreign base handle. It used to be discarded at
     // creation, which is why no request could be sent.
     cosmic_handles: std::collections::HashMap<u64, ZcosmicToplevelHandleV1>,
+    // Held so the geometry events that name them keep arriving.
+    _outputs: Vec<WlOutput>,
     // ext handle object id -> our id, so the ext handle's own events (which
     // carry title/app_id/closed on v2+) can find their toplevel.
     ext_ids: std::collections::HashMap<wayland_client::backend::ObjectId, u64>,
@@ -571,6 +573,10 @@ impl Dispatch<ZcosmicToplevelManagerV1, ()> for TopIoState {
             state.caps = ManagerCaps::from_wire(&capabilities);
         }
     }
+}
+
+impl Dispatch<WlOutput, ()> for TopIoState {
+    fn event(_: &mut Self, _: &WlOutput, _: wayland_client::protocol::wl_output::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
 
 impl Dispatch<WlSeat, ()> for TopIoState {
@@ -720,6 +726,9 @@ impl Dispatch<ZcosmicToplevelHandleV1, u64> for TopIoState {
         match event {
             zcosmic_toplevel_handle_v1::Event::Title { title } => state.tracker.apply(ToplevelEvent::Title(id, title)),
             zcosmic_toplevel_handle_v1::Event::AppId { app_id } => state.tracker.apply(ToplevelEvent::AppId(id, app_id)),
+            zcosmic_toplevel_handle_v1::Event::Geometry { x, y, width, height, .. } => {
+                state.tracker.apply(ToplevelEvent::Geometry(id, x, y, width, height))
+            }
             zcosmic_toplevel_handle_v1::Event::State { state: raw } => {
                 // Wire form per the protocol: a packed array of u32 (native
                 // endian), each a State enum discriminant, present-if-set --
@@ -854,6 +863,15 @@ impl ToplevelSession {
         // Only v1 requests are used, so any version is fine.
         let manager: Option<ZcosmicToplevelManagerV1> = globals.bind(&qh, 1..=4, ()).ok();
         let seat: Option<WlSeat> = globals.bind(&qh, 1..=5, ()).ok();
+        // Bind every output: COSMIC's per-toplevel `geometry` event names a
+        // wl_output, so it is only sent to clients that have bound one.
+        // Without this, geometry never arrived (seen against cosmic-comp).
+        let outputs: Vec<WlOutput> = globals.contents().with_list(|list| {
+            list.iter()
+                .filter(|g| g.interface == "wl_output")
+                .map(|g| globals.registry().bind::<WlOutput, _, _>(g.name, g.version.min(4), &qh, ()))
+                .collect()
+        });
 
         let state = TopIoState {
             tracker: ToplevelTracker::new(),
@@ -866,6 +884,7 @@ impl ToplevelSession {
             capture_sources: std::collections::HashMap::new(),
             copy_sessions: std::collections::HashMap::new(),
             cosmic_handles: std::collections::HashMap::new(),
+            _outputs: outputs,
             ext_ids: std::collections::HashMap::new(),
             manager,
             seat,

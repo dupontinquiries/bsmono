@@ -99,7 +99,7 @@ mod tests {
     }
 
     fn toplevel(id: u64, app_id: &str, title: &str) -> ToplevelInfo {
-        ToplevelInfo { id, title: title.into(), app_id: app_id.into(), state: ToplevelState::default() }
+        ToplevelInfo { id, title: title.into(), app_id: app_id.into(), state: ToplevelState::default(), geometry: None }
     }
 
     #[test]

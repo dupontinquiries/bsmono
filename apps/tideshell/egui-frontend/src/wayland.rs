@@ -104,6 +104,7 @@ mod tests {
             title: String::new(),
             app_id: "cosmic-term".into(),
             state: ToplevelState { activated: true, maximized: true, ..Default::default() },
+            geometry: None,
         };
         let c = to_card(&t);
         assert_eq!((c.id, c.title.as_str(), c.activated, c.maximized), (7, "cosmic-term", true, true));
