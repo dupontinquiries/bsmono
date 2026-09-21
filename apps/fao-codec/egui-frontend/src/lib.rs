@@ -17,6 +17,9 @@ pub mod lab;
 pub mod library;
 pub mod player;
 pub mod decode;
+/// Write frames as a `.fao`. Uses the v1 DCT path because the V2 encoder's
+/// `FrameResult` returns no bitstream -- see the module notes.
+pub mod export;
 pub mod transcode;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
