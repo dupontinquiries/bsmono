@@ -12,6 +12,7 @@ pub mod import;
 pub mod push;
 pub mod timeline;
 pub mod settings;
+pub mod tablets;
 
 /// Every page's source, for the tests that read it.
 ///
@@ -35,4 +36,5 @@ pub const SOURCES: &[(&str, &str)] = &[
     ("push", include_str!("push.rs")),
     ("timeline", include_str!("timeline.rs")),
     ("settings", include_str!("settings.rs")),
+    ("tablets", include_str!("tablets.rs")),
 ];

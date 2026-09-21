@@ -108,60 +108,149 @@ impl RmModel {
     }
 }
 
-/// One shell round-trip that reports what the device is. Each probe is
-/// allowed to fail silently; the parser works with whatever came back.
+/// One shell round-trip that reports what the device is, as `key=value`
+/// lines. Every source is optional; the parser weighs what came back.
+///
+/// * `machine`: `/sys/devices/soc0/machine`. Oxide (liboxide
+///   devicesettings.cpp, libblight_client state.cpp) identifies every model
+///   from this one line, so it is the authoritative source.
+/// * `motd`: the login banner, which carries the device codename.
+/// * `soc`: `/sys/devices/soc0/soc_id` (e.g. `i.MX8MM`), plus panel sizes
+///   from DRM connector modes and fb0: the fallback for a device whose
+///   machine string is new to us.
 pub fn probe_cmd() -> &'static str {
-    "cat /proc/device-tree/model 2>/dev/null; echo; \
-     cat /sys/devices/soc0/machine 2>/dev/null; echo; \
-     uname -m"
+    "echo \"machine=$(head -n1 /sys/devices/soc0/machine 2>/dev/null)\"; \
+     echo \"dtmodel=$(tr -d '\\0' < /proc/device-tree/model 2>/dev/null)\"; \
+     echo \"soc=$(head -n1 /sys/devices/soc0/soc_id 2>/dev/null)\"; \
+     echo \"motd=$(tr '\\n' ' ' < /etc/motd 2>/dev/null | tr -s ' ' | cut -c1-400)\"; \
+     for f in /sys/class/drm/card*-*/modes; do [ -r \"$f\" ] && head -n1 \"$f\" | sed 's/^/size=/'; done 2>/dev/null; \
+     [ -r /sys/class/graphics/fb0/virtual_size ] && sed 's/^/size=/; s/,/x/' /sys/class/graphics/fb0/virtual_size; \
+     echo \"arch=$(uname -m)\""
 }
 
-/// What a probe established.
+/// What a probe established, and how.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probe {
     /// From `uname -m`, which is reliable. Enough to build for the device
     /// even when the model is unknown.
     pub triple: Option<&'static str>,
-    /// Best-effort. `None` means "ask the operator", recorded in the roster
-    /// like every other identity the network cannot report.
+    /// `None` means "ask the operator", recorded in the roster like every
+    /// other identity the network cannot report.
     pub model: Option<RmModel>,
+    /// Which evidence decided the model (or why none did). Shown to the
+    /// operator so a wrong identification is visible, not silent.
+    pub how: String,
+    /// A codename seen in the motd that we do not map to a model. Reported,
+    /// never guessed from.
+    pub unknown_codename: Option<String>,
 }
 
-/// Parse [`probe_cmd`] output.
-///
-/// UNVERIFIED: the model strings matched here are assumptions. The Paper Pro
-/// family is matched on the codenames reManager uses for OS images
-/// (ferrari / chiappa / tatsu); rM1/rM2 on the human-readable model string.
-/// The exact text each device writes to `/proc/device-tree/model` has not
-/// been checked on hardware. A miss degrades to `model: None`, never to a
-/// wrong model, because every arm is a positive match.
+/// Codenames, from Oxide's device table and reManager's OS image names.
+const CODENAMES: &[(&str, RmModel)] = &[
+    ("ferrari", RmModel::PaperPro),
+    ("chiappa", RmModel::PaperProMove),
+    ("tatsu", RmModel::PaperPure),
+];
+
+fn model_from_machine(m: &str) -> Option<RmModel> {
+    // Exact prefixes Oxide matches.
+    let m = m.trim();
+    if m.starts_with("reMarkable 2.0") {
+        Some(RmModel::Rm2)
+    } else if m.starts_with("reMarkable 1.0") || m.starts_with("reMarkable Prototype 1") {
+        Some(RmModel::Rm1)
+    } else {
+        let l = m.to_ascii_lowercase();
+        CODENAMES.iter().find(|(c, _)| l.contains(c)).map(|(_, m)| *m)
+    }
+}
+
+/// SoC family plus panel size, for devices with an unrecognised machine
+/// string. i.MX93 is shared by the Move and the Pure, so it needs the size.
+fn model_from_soc(soc: &str, sizes: &[(u32, u32)]) -> Option<RmModel> {
+    let has = |m: RmModel| {
+        let (w, h) = m.size();
+        sizes.iter().any(|&(a, b)| (a, b) == (w, h) || (a, b) == (h, w))
+    };
+    match soc.trim() {
+        s if s.starts_with("i.MX6SL") => Some(RmModel::Rm1),
+        s if s.starts_with("i.MX7D") => Some(RmModel::Rm2),
+        s if s.starts_with("i.MX8MM") => Some(RmModel::PaperPro),
+        s if s.starts_with("i.MX93") => {
+            if has(RmModel::PaperProMove) {
+                Some(RmModel::PaperProMove)
+            } else if has(RmModel::PaperPure) {
+                Some(RmModel::PaperPure)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Parse [`probe_cmd`] output. Order of trust: machine string, then motd
+/// codename, then SoC + panel size. A candidate whose triple contradicts
+/// `uname -m` is rejected rather than trusted.
 pub fn parse_probe(out: &str) -> Probe {
-    let lower = out.to_ascii_lowercase();
-    let arch = out.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("");
-    let triple = match arch {
+    let mut kv: std::collections::HashMap<&str, &str> = Default::default();
+    let mut sizes = Vec::new();
+    for line in out.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            if k == "size" {
+                if let Some((w, h)) = v.trim().split_once('x') {
+                    if let (Ok(w), Ok(h)) = (w.trim().parse(), h.trim().parse()) {
+                        sizes.push((w, h));
+                    }
+                }
+            } else {
+                kv.insert(k, v.trim());
+            }
+        }
+    }
+    let get = |k: &str| kv.get(k).copied().unwrap_or("");
+    let triple = match get("arch") {
         "aarch64" | "arm64" => Some("aarch64-unknown-linux-gnu"),
         a if a.starts_with("armv7") => Some("armv7-unknown-linux-gnueabihf"),
         _ => None,
     };
-    let model = if lower.contains("ferrari") {
-        Some(RmModel::PaperPro)
-    } else if lower.contains("chiappa") {
-        Some(RmModel::PaperProMove)
-    } else if lower.contains("tatsu") {
-        Some(RmModel::PaperPure)
-    } else if lower.contains("remarkable 2") {
-        Some(RmModel::Rm2)
-    } else if lower.contains("remarkable 1") || lower.contains("remarkable prototype 1") {
-        Some(RmModel::Rm1)
+    let fits = |m: RmModel| triple.is_none_or(|t| m.triple() == t);
+
+    let motd = get("motd").to_ascii_lowercase();
+    let motd_hit = CODENAMES.iter().find(|(c, _)| motd.contains(c)).map(|(_, m)| *m);
+    let mut candidates: Vec<(Option<RmModel>, String)> = vec![
+        (model_from_machine(get("machine")), format!("machine {:?}", get("machine"))),
+        (model_from_machine(get("dtmodel")), format!("device tree {:?}", get("dtmodel"))),
+        (motd_hit, "codename in /etc/motd".into()),
+        (model_from_soc(get("soc"), &sizes), format!("SoC {:?} with panel {sizes:?}", get("soc"))),
+    ];
+    let mut rejected = Vec::new();
+    let mut chosen = None;
+    for (m, why) in candidates.drain(..) {
+        match m {
+            Some(m) if fits(m) => {
+                chosen = Some((m, why));
+                break;
+            }
+            Some(m) => rejected.push(format!("{} from {why} contradicts arch {:?}", m.label(), get("arch"))),
+            None => {}
+        }
+    }
+    // A codename-looking word in the motd we have no mapping for.
+    let unknown_codename = if motd_hit.is_none() && !motd.is_empty() {
+        motd.split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+            .find(|w| w.len() >= 5 && w.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                && !["remarkable", "welcome", "login", "version", "build", "release"].contains(w))
+            .map(str::to_string)
     } else {
         None
     };
-    // A model whose triple contradicts uname is a bad match, not a device.
-    let model = match (model, triple) {
-        (Some(m), Some(t)) if m.triple() != t => None,
-        (m, _) => m,
+    let how = match &chosen {
+        Some((m, why)) => format!("{} from {why}", m.label()),
+        None if rejected.is_empty() => "no identifying evidence; set the model in the roster".into(),
+        None => format!("rejected: {}", rejected.join("; ")),
     };
-    Probe { triple, model }
+    Probe { triple, model: chosen.map(|(m, _)| m), how, unknown_codename }
 }
 
 // ───────────────────────── refresh profile ─────────────────────────
@@ -688,28 +777,74 @@ pub fn deliver(
 mod tests {
     use super::*;
 
-    #[test]
-    fn triple_comes_from_uname_even_without_a_model() {
-        let p = parse_probe("\n\naarch64\n");
-        assert_eq!(p.triple, Some("aarch64-unknown-linux-gnu"));
-        assert_eq!(p.model, None);
-        assert_eq!(parse_probe("x\n\narmv7l").triple, Some("armv7-unknown-linux-gnueabihf"));
+    fn probe(lines: &[&str]) -> Probe {
+        parse_probe(&lines.join("\n"))
     }
 
     #[test]
-    fn codenames_identify_the_paper_pro_family() {
-        assert_eq!(parse_probe("reMarkable Ferrari\n\naarch64").model, Some(RmModel::PaperPro));
-        assert_eq!(parse_probe("chiappa\n\naarch64").model, Some(RmModel::PaperProMove));
-        assert_eq!(parse_probe("\ntatsu\naarch64").model, Some(RmModel::PaperPure));
-        assert_eq!(parse_probe("reMarkable 2.0\n\narmv7l").model, Some(RmModel::Rm2));
+    fn triple_comes_from_uname_even_without_a_model() {
+        let p = probe(&["machine=", "arch=aarch64"]);
+        assert_eq!(p.triple, Some("aarch64-unknown-linux-gnu"));
+        assert_eq!(p.model, None);
+        assert!(p.how.contains("roster"));
+        assert_eq!(probe(&["arch=armv7l"]).triple, Some("armv7-unknown-linux-gnueabihf"));
+    }
+
+    #[test]
+    fn oxides_machine_strings_identify_every_model() {
+        for (m, want, arch) in [
+            ("reMarkable 1.0", RmModel::Rm1, "armv7l"),
+            ("reMarkable Prototype 1", RmModel::Rm1, "armv7l"),
+            ("reMarkable 2.0", RmModel::Rm2, "armv7l"),
+            ("reMarkable Ferrari", RmModel::PaperPro, "aarch64"),
+            ("reMarkable Chiappa", RmModel::PaperProMove, "aarch64"),
+            ("reMarkable Tatsu", RmModel::PaperPure, "aarch64"),
+        ] {
+            let p = probe(&[&format!("machine={m}"), &format!("arch={arch}")]);
+            assert_eq!(p.model, Some(want), "{m}");
+            assert!(p.how.starts_with(want.label()) && p.how.contains("machine"), "{}", p.how);
+        }
+    }
+
+    #[test]
+    fn the_motd_codename_is_used_when_the_machine_string_is_new() {
+        let p = probe(&["machine=reMarkable Something New", "motd=Welcome to ferrari build 3.28", "arch=aarch64"]);
+        assert_eq!(p.model, Some(RmModel::PaperPro));
+        assert!(p.how.contains("motd"));
+    }
+
+    #[test]
+    fn an_unknown_codename_is_reported_not_guessed() {
+        let p = probe(&["machine=", "motd=  marshmallow  ", "arch=aarch64"]);
+        assert_eq!(p.model, None);
+        assert_eq!(p.unknown_codename.as_deref(), Some("marshmallow"));
+    }
+
+    #[test]
+    fn soc_and_panel_size_identify_an_unlisted_device() {
+        assert_eq!(probe(&["soc=i.MX8MM", "arch=aarch64"]).model, Some(RmModel::PaperPro));
+        assert_eq!(probe(&["soc=i.MX7D", "arch=armv7l"]).model, Some(RmModel::Rm2));
+        // i.MX93 is shared: the panel decides, in either orientation
+        assert_eq!(probe(&["soc=i.MX93", "size=1696x954", "arch=aarch64"]).model, Some(RmModel::PaperProMove));
+        assert_eq!(probe(&["soc=i.MX93", "size=1404x1872", "arch=aarch64"]).model, Some(RmModel::PaperPure));
+        let unsure = probe(&["soc=i.MX93", "arch=aarch64"]);
+        assert_eq!(unsure.model, None, "i.MX93 without a panel size is ambiguous");
     }
 
     #[test]
     fn a_model_contradicting_uname_is_dropped_not_trusted() {
-        // "reMarkable 2" text on an aarch64 kernel is a bad match.
-        let p = parse_probe("reMarkable 2.0\n\naarch64");
+        let p = probe(&["machine=reMarkable 2.0", "arch=aarch64"]);
         assert_eq!(p.model, None);
+        assert!(p.how.contains("contradicts"), "{}", p.how);
         assert_eq!(p.triple, Some("aarch64-unknown-linux-gnu"));
+    }
+
+    #[test]
+    fn the_probe_command_is_valid_sh_and_parses_this_host() {
+        let o = std::process::Command::new("sh").arg("-c").arg(probe_cmd()).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let p = parse_probe(&String::from_utf8_lossy(&o.stdout));
+        assert!(p.triple.is_some() || std::env::consts::ARCH == "x86_64");
     }
 
     #[test]
@@ -879,7 +1014,7 @@ mod tests {
         }
         fn run(&mut self, cmd: &str) -> Result<String, String> {
             self.log.push("run".into());
-            Ok(if cmd.starts_with("cat /proc") { "reMarkable Ferrari\n\naarch64".into() }
+            Ok(if cmd.contains("soc0/machine") { "machine=reMarkable Ferrari\narch=aarch64".into() }
                else if cmd.contains("qtfb.sock") { "qtfb=1\nappload_dir=/home/root/xovi/exthome/appload\nglibc=2.39\n".into() }
                else { String::new() })
         }

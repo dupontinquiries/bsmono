@@ -1409,6 +1409,10 @@ fn cmd_eink(rest: &[String]) -> i32 {
     let mut remote = ef::SshRemote { user: "root".into(), host: host.clone() };
     let describe = |p: &ef::Probe, d: &ef::Displays| {
         println!("  model   {}", p.model.map(|m| m.label()).unwrap_or("unknown (set it in the roster)"));
+        println!("          identified by: {}", p.how);
+        if let Some(c) = &p.unknown_codename {
+            println!("          motd names \"{c}\", which gitmind does not know yet");
+        }
         println!("  target  {}{}", p.triple.unwrap_or("unknown"), d.glibc.as_ref().map(|g| format!(" (glibc {g}: build with zigbuild .{g})")).unwrap_or_default());
         println!("  displays qtfb={} appload={} blight_lib={} blight_running={}",
             d.qtfb, d.appload_dir.as_deref().unwrap_or("-"), d.blight_lib.as_deref().unwrap_or("-"), d.blight_running);

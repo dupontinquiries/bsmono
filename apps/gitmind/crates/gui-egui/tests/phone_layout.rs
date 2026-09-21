@@ -91,3 +91,22 @@ fn every_text_field_has_a_stable_id() {
         missing.join("\n")
     );
 }
+
+/// The Tablets page shows most of its content only after a probe, which the
+/// default-state sweep above never reaches. Draw it populated: a found Paper
+/// Pro with an unknown motd codename, a deploy target, and a multi-line result.
+#[test]
+fn the_populated_tablets_page_fits_a_phone() {
+    use cockpit::eink_fleet as ef;
+    let mut app = App::default();
+    app.tab = Tab::Tablets;
+    let probe = ef::parse_probe("machine=reMarkable Ferrari\nmotd=marshmallow\narch=aarch64");
+    let displays = ef::parse_displays("qtfb=1\nappload_dir=/home/root/xovi/exthome/appload\nglibc=2.39\n");
+    *app.tablets.found.lock().unwrap() = Some((probe, displays));
+    app.tablets.bin_path = "/home/user/build/aarch64-unknown-linux-gnu/release/eink-demo".into();
+    app.tablets.last_result = "eink-demo exited right after launch:\neink: model PaperPro (EINK_MODEL=rmpp)\n\
+        eink-demo: libblight_protocol not found (tried [\"libblight_protocol.so\"]; is Oxide installed? set EINK_BLIGHT_LIB)".into();
+    let r = layout_probe::probe(egui::vec2(PHONE[0], PHONE[1]), 3, true, |ctx| app.ui(ctx));
+    assert!(r.overlaps.is_empty() && r.offscreen.is_empty() && r.clipped.is_empty() && r.id_clashes.is_empty(),
+        "populated Tablets page at {}×{}:\n{}", PHONE[0], PHONE[1], r.describe());
+}

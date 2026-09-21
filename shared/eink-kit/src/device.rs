@@ -26,7 +26,15 @@ impl Model {
             _ => None,
         }
     }
+    /// From `/sys/devices/soc0/machine` (what Oxide matches) or the device
+    /// tree model string; the same prefixes/codenames as gitmind's probe.
     pub fn from_device_tree(text: &str) -> Option<Model> {
+        if text.trim_start().starts_with("reMarkable 2.0") {
+            return Some(Model::Rm2);
+        }
+        if text.trim_start().starts_with("reMarkable 1.0") {
+            return Some(Model::Rm1);
+        }
         let l = text.to_ascii_lowercase();
         if l.contains("ferrari") {
             Some(Model::PaperPro)
@@ -64,6 +72,21 @@ impl Model {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn oxides_machine_strings() {
+        assert_eq!(Model::from_device_tree("reMarkable 2.0\n"), Some(Model::Rm2));
+        assert_eq!(Model::from_device_tree("reMarkable 1.0"), Some(Model::Rm1));
+        assert_eq!(Model::from_device_tree("reMarkable Prototype 1"), Some(Model::Rm1));
+        assert_eq!(Model::from_device_tree("reMarkable Ferrari"), Some(Model::PaperPro));
+        assert_eq!(Model::from_device_tree("reMarkable Chiappa"), Some(Model::PaperProMove));
+        assert_eq!(Model::from_device_tree("reMarkable Tatsu"), Some(Model::PaperPure));
+        assert_eq!(Model::from_device_tree("Generic i.MX board"), None);
+    }
+}
+
 /// Detect, with a human-readable note on how.
 pub fn detect() -> (Model, String) {
     if let Ok(s) = std::env::var("EINK_MODEL") {
@@ -71,10 +94,14 @@ pub fn detect() -> (Model, String) {
             return (m, format!("EINK_MODEL={s}"));
         }
     }
-    let dt = std::fs::read_to_string("/proc/device-tree/model").unwrap_or_default();
-    if let Some(m) = Model::from_device_tree(&dt) {
-        return (m, format!("device tree {:?}", dt.trim_end_matches('\0').trim()));
+    // What Oxide reads, then the device tree.
+    for path in ["/sys/devices/soc0/machine", "/proc/device-tree/model"] {
+        let t = std::fs::read_to_string(path).unwrap_or_default();
+        if let Some(m) = Model::from_device_tree(&t) {
+            return (m, format!("{path} {:?}", t.trim_end_matches('\0').trim()));
+        }
     }
+    let dt = std::fs::read_to_string("/proc/device-tree/model").unwrap_or_default();
     let guess = if cfg!(target_arch = "aarch64") { Model::PaperPro } else { Model::Rm2 };
     (guess, format!("GUESS from architecture (device tree said {:?}); set EINK_MODEL", dt.trim_end_matches('\0').trim()))
 }

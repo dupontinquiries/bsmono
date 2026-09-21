@@ -19,13 +19,15 @@ pub enum Tab {
     /// Device bring-up diagnostics: the cockpit toolkit's door.
     Diagnostics,
     Settings,
+    /// e-ink tablets (reMarkable): enrol from the phone, deploy eink-kit apps.
+    Tablets,
 }
 
 impl Tab {
     // Diagnostics sits next to Push and Fleet, not beside Settings: it is
     // what you open when a deploy fails, and the tabs either side of it
     // are the ones that just failed.
-    pub const ALL: [Tab; 12] = [Tab::Fleet, Tab::Push, Tab::Diagnostics, Tab::Network, Tab::Share, Tab::Apps, Tab::Import, Tab::Branches, Tab::Files, Tab::Artifacts, Tab::Timeline, Tab::Settings];
+    pub const ALL: [Tab; 13] = [Tab::Fleet, Tab::Push, Tab::Diagnostics, Tab::Network, Tab::Share, Tab::Apps, Tab::Import, Tab::Branches, Tab::Files, Tab::Artifacts, Tab::Timeline, Tab::Settings, Tab::Tablets];
     /// The grouping, declared once. Compact nav uses it as a section row;
     /// the desktop workspace uses the same sections as columns. Indices are
     /// into `Tab::ALL`, and `sections_cover_every_tab` asserts none is lost
@@ -34,7 +36,7 @@ impl Tab {
         use uikit_egui::sections::Section;
         vec![
             // What you do TO devices.
-            Section::new("Devices", &[0, 3, 4, 1]),
+            Section::new("Devices", &[0, 12, 3, 4, 1]),
             // What you do to the repository's content.
             Section::new("Repository", &[7, 8, 10, 6]),
             // Everything about this machine and the app itself.
@@ -56,6 +58,7 @@ impl Tab {
             Tab::Artifacts => "Artifacts",
             Tab::Timeline => "Timeline",
             Tab::Settings => "Settings",
+            Tab::Tablets => "Tablets",
         }
     }
 
@@ -74,6 +77,7 @@ impl Tab {
             Tab::Artifacts => "🧹",
             Tab::Timeline => "🕘",
             Tab::Settings => "⚙",
+            Tab::Tablets => "📝",
         }
     }
 }
@@ -92,6 +96,7 @@ pub struct App {
     pub task: Task,
     pub net: pages::network::State,
     pub fleet: pages::fleet::State,
+    pub tablets: pages::tablets::State,
     pub push: pages::push::State,
     pub apps: pages::apps::State,
     pub bluetooth: pages::bluetooth::BluetoothState,
@@ -124,6 +129,7 @@ impl Default for App {
             task: Task::default(),
             net: pages::network::State::default(),
             fleet: pages::fleet::State::default(),
+            tablets: pages::tablets::State::default(),
             push: pages::push::State::default(),
             apps: pages::apps::State::default(),
             bluetooth: pages::bluetooth::BluetoothState::default(),
@@ -314,6 +320,7 @@ impl App {
                         Tab::Fleet => pages::fleet::ui(self, ui),
                         Tab::Push => pages::push::ui(self, ui),
                         Tab::Settings => pages::settings::ui(self, ui),
+                        Tab::Tablets => pages::tablets::ui(self, ui),
                     }
                 });
             // Swipe left/right between tabs on the phone, with the shared detent feel. Enabled only in
