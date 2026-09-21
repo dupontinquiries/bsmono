@@ -103,6 +103,129 @@ fn header<'a>(h: &'a [(String, String)], name: &str) -> &'a str {
 }
 
 /// Parse one message.
+/// Decode RFC 2047 encoded-words in a header value.
+///
+/// ANY NON-ASCII HEADER ARRIVES ENCODED. A French subject "été" is sent as
+/// `=?UTF-8?B?w6l0w6k=?=`; Japanese, emoji, a name with an accent -- all of
+/// them. This parser handled CRLF, folding, header case, timezones and quoted
+/// addresses correctly and then displayed every such header as that raw
+/// string, which is most of the non-English mail anyone receives.
+///
+/// Handles B (base64) and Q (quoted-printable) in UTF-8 and ISO-8859-1, which
+/// between them cover almost all real mail. An encoded-word in any OTHER
+/// charset is left exactly as it was rather than decoded as UTF-8 and turned
+/// into mojibake: a visible raw word says "undecoded", a garbled one says
+/// "this is what they wrote".
+///
+/// THE WHITESPACE RULE (RFC 2047 section 6.2): whitespace BETWEEN two adjacent
+/// encoded-words is dropped. Long subjects are split into several words, and
+/// honouring the space would render "hel lo" for "hello". Whitespace between an
+/// encoded-word and ordinary text is kept.
+pub fn decode_words(raw: &str) -> String {
+    let mut out = String::new();
+    let mut rest = raw;
+    let mut prev_was_word = false;
+    while let Some(start) = rest.find("=?") {
+        let (before, tail) = rest.split_at(start);
+        let Some((decoded, used)) = decode_one(tail) else {
+            // Not a well-formed word: emit the "=?" literally and move on.
+            out.push_str(before);
+            out.push_str("=?");
+            rest = &tail[2..];
+            prev_was_word = false;
+            continue;
+        };
+        // Drop pure whitespace sitting between two encoded-words.
+        if !(prev_was_word && before.trim().is_empty()) {
+            out.push_str(before);
+        }
+        out.push_str(&decoded);
+        rest = &tail[used..];
+        prev_was_word = true;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Decode one `=?charset?enc?text?=` at the start of `s`. Returns the decoded
+/// text and how many bytes it consumed, or None if it is not a valid word or
+/// is in a charset this does not handle.
+fn decode_one(s: &str) -> Option<(String, usize)> {
+    let body = s.strip_prefix("=?")?;
+    let q1 = body.find('?')?;
+    let charset = body[..q1].to_ascii_lowercase();
+    let after_cs = &body[q1 + 1..];
+    let q2 = after_cs.find('?')?;
+    let enc = after_cs[..q2].to_ascii_uppercase();
+    let payload_and_end = &after_cs[q2 + 1..];
+    let end = payload_and_end.find("?=")?;
+    let payload = &payload_and_end[..end];
+    let used = 2 + q1 + 1 + q2 + 1 + end + 2;
+    let bytes = match enc.as_str() {
+        "B" => base64_decode(payload)?,
+        "Q" => q_decode(payload),
+        _ => return None,
+    };
+    // Only charsets we can decode HONESTLY. Anything else is left raw.
+    let text = match charset.as_str() {
+        "utf-8" | "utf8" => String::from_utf8(bytes).ok()?,
+        "iso-8859-1" | "latin1" | "us-ascii" => bytes.iter().map(|&b| b as char).collect(),
+        _ => return None,
+    };
+    Some((text, used))
+}
+
+/// RFC 2047 Q-encoding: `_` is a space and `=XX` is a hex byte.
+fn q_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'_' => { out.push(b' '); i += 1; }
+            // `=XX` needs two bytes after the `=`. A trailing `=` or `=X`
+            // with nothing after it is kept literally rather than read past
+            // the end.
+            b'=' if i + 2 < b.len() => {
+                let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok();
+                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(v) => { out.push(v); i += 3; }
+                    None => { out.push(b'='); i += 1; }
+                }
+            }
+            c => { out.push(c); i += 1; }
+        }
+    }
+    out
+}
+
+/// Standard base64, padding optional. None on any invalid character.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a' + 26) as u32,
+            b'0'..=b'9' => (c - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    };
+    let clean: Vec<u8> = s.bytes().filter(|&c| c != b'=' && !c.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+    for chunk in clean.chunks(4) {
+        let mut acc = 0u32;
+        for (k, &c) in chunk.iter().enumerate() {
+            acc |= val(c)? << (18 - 6 * k);
+        }
+        let n = chunk.len();
+        if n >= 2 { out.push((acc >> 16) as u8); }
+        if n >= 3 { out.push((acc >> 8) as u8); }
+        if n >= 4 { out.push(acc as u8); }
+    }
+    Some(out)
+}
+
 pub fn parse_message(text: &str) -> Parsed {
     let (h, body) = headers_and_body(text);
     // `References` before `In-Reply-To`: the first entry of References is
@@ -113,9 +236,11 @@ pub fn parse_message(text: &str) -> Parsed {
     let root = refs.split_whitespace().next().unwrap_or("").to_string();
     Parsed {
         message_id: header(&h, "message-id").to_string(),
-        from: header(&h, "from").to_string(),
-        to: header(&h, "to").to_string(),
-        subject: header(&h, "subject").to_string(),
+        // DECODED: see `decode_words`. Without it any non-ASCII subject or
+        // sender name rendered as raw `=?UTF-8?B?...?=`.
+        from: decode_words(header(&h, "from")),
+        to: decode_words(header(&h, "to")),
+        subject: decode_words(header(&h, "subject")),
         date: header(&h, "date").to_string(),
         in_reply_to: if root.is_empty() {
             header(&h, "in-reply-to").to_string()
@@ -605,4 +730,71 @@ References: <abc@example.com>\n\nagreed\n");
         assert_eq!(m[0].subject, "");
         assert_eq!(m[0].time, 0);
     }
+
+
+#[cfg(test)]
+mod encoded_word_tests {
+    use super::*;
+
+    /// THE BUG. A French subject arrived as raw base64 in the list.
+    #[test]
+    fn a_base64_utf8_subject_is_decoded() {
+        assert_eq!(decode_words("=?UTF-8?B?w6l0w6k=?="), "été");
+        let m = parse_message("Subject: =?UTF-8?B?w6l0w6k=?=\nFrom: a@b.c\n\nb\n");
+        assert_eq!(m.subject, "été");
+    }
+
+    #[test]
+    fn q_encoding_decodes_hex_and_underscore_spaces() {
+        assert_eq!(decode_words("=?ISO-8859-1?Q?Caf=E9_ouvert?="), "Café ouvert");
+    }
+
+    /// THE WHITESPACE RULE: a long subject is split into several words, and the
+    /// space BETWEEN them is dropped, or "hello" renders as "hel lo".
+    #[test]
+    fn whitespace_between_encoded_words_is_dropped() {
+        // "hel" + "lo", as two adjacent B-words.
+        assert_eq!(decode_words("=?UTF-8?B?aGVs?= =?UTF-8?B?bG8=?="), "hello");
+    }
+
+    /// ...but whitespace between a word and ORDINARY text is kept.
+    #[test]
+    fn whitespace_next_to_plain_text_is_kept() {
+        assert_eq!(decode_words("Re: =?UTF-8?B?w6l0w6k=?= plans"), "Re: été plans");
+    }
+
+    /// A sender's display name is decoded too, not just the subject.
+    #[test]
+    fn an_encoded_sender_name_is_decoded() {
+        let m = parse_message("From: =?UTF-8?B?w4lsaXNl?= <e@x.y>\nSubject: s\n\nb\n");
+        assert!(m.from.starts_with("Élise"), "{}", m.from);
+    }
+
+    /// AN UNKNOWN CHARSET IS LEFT RAW rather than decoded as UTF-8 into
+    /// mojibake: a visible raw word says "undecoded", a garbled one lies about
+    /// what they wrote.
+    #[test]
+    fn an_unsupported_charset_is_left_as_it_was() {
+        let raw = "=?KOI8-R?B?5M/C0s/F?=";
+        assert_eq!(decode_words(raw), raw);
+    }
+
+    /// Plain ASCII and malformed input pass through unharmed.
+    #[test]
+    fn plain_and_malformed_headers_are_untouched() {
+        assert_eq!(decode_words("Just a subject"), "Just a subject");
+        assert_eq!(decode_words("a =? not a word"), "a =? not a word");
+        assert_eq!(decode_words("=?UTF-8?X?bad?="), "=?UTF-8?X?bad?=");
+        assert_eq!(decode_words(""), "");
+    }
+
+    /// Invalid base64 or invalid UTF-8 inside a word must not panic.
+    #[test]
+    fn corrupt_payloads_do_not_panic() {
+        let _ = decode_words("=?UTF-8?B?!!!!?=");
+        let _ = decode_words("=?UTF-8?B?/w==?="); // 0xFF: not UTF-8
+        let _ = decode_words("=?UTF-8?Q?=Z?=");   // bad hex
+        let _ = decode_words("=?UTF-8?Q?=?=");    // truncated escape
+    }
+}
 }
