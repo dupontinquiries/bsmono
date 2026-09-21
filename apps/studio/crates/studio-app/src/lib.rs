@@ -683,9 +683,26 @@ impl Studio {
             let p = base.join(&src.path);
             let Ok(raw) = std::fs::read(&p) else { missing += 1; continue };
             let hint = p.extension().and_then(|e| e.to_str());
-            match studio_media::decode_bytes(raw.clone(), hint) {
+            // Video takes the ffmpeg door here too. The IMPORT path already
+            // did (symphonia cannot open an mkv), but opening a saved project
+            // went straight to decode_bytes — so a video project opened from a
+            // file reported every source "missing or undecodable" and played
+            // silent with no waveforms until each clip was re-imported. Found
+            // on a screenshot of the organised Fragile Thing card: 77 of 77.
+            let decoded = if library::is_video_path(&p) {
+                studio_video::extract_audio(&p).ok().flatten()
+                    .ok_or_else(|| "no audio stream".to_string())
+            } else {
+                studio_media::decode_bytes(raw.clone(), hint).map_err(|e| e.to_string())
+            };
+            match decoded {
                 Ok(audio) => {
                     s.incoming_audio.push((src.id, audio));
+                    s.register_asset(src.id, &raw);
+                }
+                // A video with no audio stream is not missing — it is a
+                // picture, and the timeline draws it as one.
+                Err(_) if library::is_video_path(&p) && src.has_video => {
                     s.register_asset(src.id, &raw);
                 }
                 Err(_) => missing += 1,
@@ -2873,6 +2890,41 @@ mod tests {
         assert_eq!(s.session.doc.project.tracks.len(), 3);
         assert!(s.session.doc.project.clips.len() >= 5);
         assert!(s.session.doc.project.duration() > Ticks::ZERO);
+    }
+
+    #[test]
+    fn opening_a_saved_project_hears_its_video_sources() {
+        // load_from went straight to symphonia, which cannot open an mkv, so
+        // every video source of a reopened project was "missing" and silent.
+        let ok = std::process::Command::new("ffmpeg").arg("-version").output()
+            .map(|o| o.status.success()).unwrap_or(false);
+        if !ok {
+            assert!(std::env::var("STUDIO_REQUIRE_FFMPEG").as_deref() != Ok("1"), "ffmpeg required");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("open-video-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("take.mkv");
+        let out = std::process::Command::new("ffmpeg").args(["-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=gray:s=64x36:r=12:d=2",
+            "-f", "lavfi", "-i", "sine=f=440:d=2", "-shortest",
+            "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "pcm_s16le"]).arg(&clip).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        let mut p = studio_core::Project { name: "reopened".into(), ..Default::default() };
+        p.apply(&studio_core::Op::AddSource { source: studio_core::Source::file(studio_core::SourceId(1),
+            "take.mkv", studio_core::Ticks::from_seconds(2.0), 48_000, 1, true) }).unwrap();
+        let file = studio_collab::file::SaveFile::from_project(&p, Vec::new(), None);
+        let path = dir.join("reopened.studio");
+        std::fs::write(&path, file.encode()).unwrap();
+
+        let s = Studio::load_from(&path, SiteId(1), Team::from_contacts("solo", &["sc-local".into()]))
+            .expect("opens");
+        assert!(!s.status.contains("missing"), "{}", s.status);
+        let (id, audio) = s.incoming_audio.first().expect("the video's audio came through");
+        assert_eq!(*id, studio_core::SourceId(1));
+        assert!(audio.frames() > 40_000, "about two seconds of it: {}", audio.frames());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
