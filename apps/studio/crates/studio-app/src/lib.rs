@@ -60,6 +60,7 @@ pub mod relink;
 pub mod transcripts;
 pub mod overview;
 pub mod insert_by_content;
+pub mod stage;
 pub mod touchup_job;
 pub mod mixer_panel;
 pub mod morph_pad;
@@ -1831,7 +1832,7 @@ impl Studio {
         let name = format!("curve {} over {gname}", curve.0);
         self.edit_group(vec![
             Op::SetCurve { id: curve, name: name.clone() },
-            Op::SetBinding { id: bid, binding: Binding { curve, target, gate: Gate::Group(gid) } },
+            Op::SetBinding { id: bid, binding: Binding { curve, target, gate: Gate::Group(gid), response: None, fit_span: false } },
         ], &format!("{name} bound"));
         if self.session.doc.project.bindings.contains_key(&bid) {
             self.auto_target = None;
@@ -1853,13 +1854,13 @@ impl Studio {
                 self.status = "select clips to gate a curve to, or pick a lane to bind one to".into();
                 return;
             };
-            ops.push(Op::SetBinding { id: first_binding, binding: Binding { curve, target, gate: Gate::Always } });
+            ops.push(Op::SetBinding { id: first_binding, binding: Binding { curve, target, gate: Gate::Always, response: None, fit_span: false } });
         } else {
             for id in &self.selection {
                 let Some(c) = p.clips.get(id) else { continue };
                 let target = target.unwrap_or(studio_core::AutoTarget::TrackGain(c.track));
                 ops.push(Op::SetBinding { id: BindingId(next_binding),
-                    binding: Binding { curve, target, gate: Gate::Clip(*id) } });
+                    binding: Binding { curve, target, gate: Gate::Clip(*id), response: None, fit_span: false } });
                 next_binding += 1;
             }
         }
@@ -5974,6 +5975,12 @@ impl App {
                         "no transcripts loaded yet — the filter applies once they are".into()
                     } else { self.refilter_words() };
                 }
+                palette::ShellVerb::StageBind { bus, preset } => {
+                    match stage::bind_ops(&self.studio.session.doc.project, &self.studio.selection.clone(), bus, preset as usize) {
+                        Ok((ops, line)) => { self.studio.edit_group(ops, "stage"); self.studio.status = line; }
+                        Err(why) => self.studio.status = why,
+                    }
+                }
                 palette::ShellVerb::Kaleidoscope(segments) => {
                     let project = &self.studio.session.doc.project;
                     let ops: Vec<studio_core::Op> = self.studio.selection.iter()
@@ -9398,7 +9405,7 @@ mod curve_shell_tests {
         // Share it with clip 2, then make clip 2's binding unique.
         s.edit(Op::SetBinding { id: studio_core::BindingId(2), binding: studio_core::Binding {
             curve, target: AutoTarget::TrackGain(s.session.doc.project.clips[&studio_core::ClipId(2)].track),
-            gate: Gate::Clip(studio_core::ClipId(2)) } }, "bound");
+            gate: Gate::Clip(studio_core::ClipId(2)), response: None, fit_span: false } }, "bound");
         assert_eq!(s.session.doc.project.curve_share_count(curve), 2);
         s.make_unique(studio_core::BindingId(2));
         assert_eq!(s.status, "curve made unique — one undo reverses all 5", "status was: {}", s.status);

@@ -104,6 +104,9 @@ pub enum ShellVerb {
     /// Fold the selected clips into a kaleidoscope of `segments` wedges;
     /// 0 takes it off.
     Kaleidoscope(u32),
+    /// Drive `bus` from the selected scene's stage signal through response
+    /// preset `preset` (see `stage::PRESETS`).
+    StageBind { bus: BusId, preset: u8 },
     /// What the selected clips' effects do after the clips end: `ring_ms` of
     /// tail, the last `fade_ms` of it faded. 0 ring is a hard cut at the
     /// clip end. Milliseconds so the verb stays `Copy + Eq`.
@@ -253,6 +256,9 @@ pub enum Ask {
     InsertFind,
     /// How many wedges for the kaleidoscope.
     KaleidoChoice,
+    /// Which bus the scene's stage should drive, then how it answers.
+    StageBus,
+    StageResponse(BusId),
     /// How to trim a chosen line before it goes in.
     InsertTrim { source: studio_core::SourceId, start_ms: u64, end_ms: u64 },
     /// From the chosen line to a later line in the same source.
@@ -336,6 +342,9 @@ pub fn root() -> Vec<Choice> {
         c("insert a clip at the playhead by what is said (or a time range)",
           Some("search the transcripts, or type C0057 12.5-18"),
           Then::Ask(Ask::InsertFind)),
+        c("stage: let the selected scene drive a bus (music / sfx / rhythm)",
+          Some("one arc per scene; each bus answers it its own way"),
+          Then::Ask(Ask::StageBus)),
         c("kaleidoscope the selected clip", Some("mirror, 4, 6, 8 or 12 wedges — or off"),
           Then::Ask(Ask::KaleidoChoice)),
         c("transcript gutter: filter words (fillers / unique / a word list)",
@@ -668,6 +677,12 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
             ]
         }
         Ask::InsertFind | Ask::InsertTo { .. } => Vec::new(), // need transcripts: see Palette::choices
+        Ask::StageBus => project.busses.iter().filter(|(_, b)| !b.silent)
+            .map(|(id, b)| plain(b.name.clone(), Then::Ask(Ask::StageResponse(*id)))).collect(),
+        Ask::StageResponse(bus) => crate::stage::PRESETS.iter().enumerate().map(|(i, p)| Choice {
+            label: p.label.into(), hint: Some(p.what.into()),
+            then: Then::Do(Act::Shell(ShellVerb::StageBind { bus, preset: i as u8 })),
+        }).collect(),
         Ask::KaleidoChoice => [
             (0, "off", "back to the plain picture"),
             (2, "mirror (2)", "one fold down the middle"),

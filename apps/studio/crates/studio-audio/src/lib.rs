@@ -2334,7 +2334,7 @@ mod automation_render_tests {
         p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::from_seconds(0.5), value: 1.0 }).unwrap();
         p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::from_seconds(0.5).saturating_add(Ticks(1)), value: 0.0 }).unwrap();
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
-            curve: CurveId(1), target, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            curve: CurveId(1), target, gate: Gate::Clip(ClipId(1)), response: None, fit_span: false  } }).unwrap();
         let out = render(&p, &audio);
         assert!((out[1000] - 0.05).abs() < 0.002, "clip time 0: -20 dB: {}", out[1000]);
         assert!((out[out.len() - 1000] - 0.5).abs() < 0.002, "clip time 0.75 s: unity: {}", out[out.len() - 1000]);
@@ -2402,7 +2402,7 @@ mod binding_render_tests {
     fn a_clip_gated_ride_follows_the_clip_through_a_real_render() {
         let (mut p, a) = fixture();
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding { curve: CurveId(1),
-            target: AutoTarget::TrackGain(TrackId(1)), gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            target: AutoTarget::TrackGain(TrackId(1)), gate: Gate::Clip(ClipId(1)), response: None, fit_span: false  } }).unwrap();
         let out = render(&p, &a);
         assert!((left_at(&out, 0.3)).abs() < 1e-3, "the dip lands 0.1 s into the clip, got {}", left_at(&out, 0.3));
         assert!((left_at(&out, 0.25) - 0.25).abs() < 2e-3, "halfway down the ramp");
@@ -2429,7 +2429,7 @@ mod binding_render_tests {
         // Mute track 1 so only the bus's output is measured.
         p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: true, locked: false }).unwrap();
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding { curve: CurveId(1),
-            target: AutoTarget::BusGain(BusId(1)), gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            target: AutoTarget::BusGain(BusId(1)), gate: Gate::Clip(ClipId(1)), response: None, fit_span: false  } }).unwrap();
         let out = render(&p, &a);
         assert!((left_at(&out, 0.1) - 0.5).abs() < 1e-6, "before the vocal: full");
         assert!((left_at(&out, 0.3)).abs() < 1e-3, "under the vocal's dip: ducked, got {}", left_at(&out, 0.3));
@@ -2448,9 +2448,9 @@ mod binding_render_tests {
         p.apply(&Op::SetAutoPoint { target: t, at: Ticks::ZERO, value: 0.5 }).unwrap();
         p.apply(&Op::SetAutoPoint { target: t, at: Ticks::from_seconds(1.0), value: 1.0 }).unwrap();
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding { curve: CurveId(1),
-            target: t, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            target: t, gate: Gate::Clip(ClipId(1)), response: None, fit_span: false  } }).unwrap();
         p.apply(&Op::SetBinding { id: BindingId(2), binding: Binding { curve: CurveId(1),
-            target: t, gate: Gate::Window { start: Ticks::from_seconds(0.3), end: Ticks::from_seconds(0.5) } } }).unwrap();
+            target: t, gate: Gate::Window { start: Ticks::from_seconds(0.3), end: Ticks::from_seconds(0.5) }, response: None, fit_span: false } }).unwrap();
         let out = render(&p, &a);
         let mut checked = 0;
         for f in (0..48_000).step_by(97) {

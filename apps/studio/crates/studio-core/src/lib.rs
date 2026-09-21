@@ -43,7 +43,7 @@ use std::collections::BTreeMap;
 mod curves;
 mod grouping;
 pub use grouping::GroupTangle;
-pub use curves::{Binding, Curve, Gate, Opening, Sweep};
+pub use curves::{Binding, Curve, Gate, Opening, Response, Sweep};
 mod batch;
 mod room;
 pub use room::{Overlap, LANE_SUFFIX};

@@ -26,7 +26,7 @@
 //!   undo survive a restart; omitting it costs nothing and is the default,
 //!   because most people do not want a week of history in every file.
 
-use crate::wire::{Packet, WIRE_VERSION};
+use crate::wire::{Packet, FIRST_FILE_VERSION, WIRE_VERSION};
 use crate::{Stamp, SiteId, StampedOp};
 use studio_core::{Op, Project};
 
@@ -182,7 +182,7 @@ impl SaveFile {
     pub fn encode(&self) -> Vec<u8> {
         let mut o = Vec::with_capacity(1024);
         o.extend_from_slice(MAGIC);
-        o.push(WIRE_VERSION);
+        o.push(crate::wire::current_encode_version());
         let nb = self.name.as_bytes();
         o.extend_from_slice(&(nb.len() as u32).to_le_bytes());
         o.extend_from_slice(nb);
@@ -216,7 +216,9 @@ impl SaveFile {
 
     pub fn decode(b: &[u8]) -> Option<SaveFile> {
         if b.len() < 13 || &b[..8] != MAGIC { return None; }
-        if b[8] != WIRE_VERSION { return None; }
+        // Any version this build knows how to read. Refusing everything but
+        // the current one meant each format bump orphaned every older project.
+        if !(FIRST_FILE_VERSION..=WIRE_VERSION).contains(&b[8]) { return None; }
         let mut i = 9;
         let take_u32 = |b: &[u8], i: &mut usize| -> Option<usize> {
             if *i + 4 > b.len() { return None; }
@@ -230,14 +232,14 @@ impl SaveFile {
         i += n;
         let sl = take_u32(b, &mut i)?;
         if i + sl > b.len() { return None; }
-        let snapshot = match Packet::decode(&b[i..i + sl])? {
+        let snapshot = match Packet::decode_stored(&b[i..i + sl])? {
             Packet::Catchup { ops } => ops.into_iter().map(|s| s.op).collect(),
             _ => return None,
         };
         i += sl;
         let hl = take_u32(b, &mut i)?;
         if i + hl > b.len() { return None; }
-        let history = match Packet::decode(&b[i..i + hl])? {
+        let history = match Packet::decode_stored(&b[i..i + hl])? {
             Packet::Catchup { ops } => ops,
             _ => return None,
         };
@@ -254,7 +256,7 @@ impl SaveFile {
             None
         } else {
             if i + rl > b.len() { return None; }
-            match Packet::decode(&b[i..i + rl])? {
+            match Packet::decode_stored(&b[i..i + rl])? {
                 Packet::Rack(rs) => Some(rs.rack),
                 _ => return None,
             }
@@ -552,9 +554,9 @@ mod automation_file_tests {
         p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks(250), value: 0.2 }).unwrap();
         let t = AutoTarget::TrackGain(TrackId(1));
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
-            curve: CurveId(1), target: t, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            curve: CurveId(1), target: t, gate: Gate::Clip(ClipId(1)), response: None, fit_span: false } }).unwrap();
         p.apply(&Op::SetBinding { id: BindingId(2), binding: Binding {
-            curve: CurveId(1), target: t, gate: Gate::Window { start: Ticks(1_000), end: Ticks(2_000) } } }).unwrap();
+            curve: CurveId(1), target: t, gate: Gate::Window { start: Ticks(1_000), end: Ticks(2_000) }, response: None, fit_span: false } }).unwrap();
         // Locked on purpose, the lane test's reason: the bindings must land
         // before the relock or a locked track's ride vanishes on save.
         p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: false, locked: true }).unwrap();
@@ -577,5 +579,40 @@ mod automation_file_tests {
         assert_eq!(bindings_saved, 1, "the window binding survives, the dangling clip gate does not");
         let mut again = Project { name: p.name.clone(), ..Default::default() };
         for op in &snap { again.apply(op).expect("no refused op in a snapshot"); }
+    }
+
+    #[test]
+    fn projects_saved_by_older_versions_still_open() {
+        // Until this test existed, SaveFile::decode refused any version but
+        // the current one, so every format bump -- three this session --
+        // orphaned every project saved before it. Real old bytes, written by
+        // the encoder at the old version, not a hand-built imitation.
+        use studio_core::{Bus, BusId, CurveId, Binding, BindingId, Gate, AutoTarget};
+        let mut p = Project { name: "old".into(), ..Default::default() };
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "Music".into(), parent: None, gain: 0.8,
+            chain: vec![], sends: vec![], muted: false, silent: false } }).unwrap();
+        p.apply(&Op::SetCurve { id: CurveId(1), name: "stage".into() }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::ZERO, value: 0.0 }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::from_seconds(4.0), value: 1.0 }).unwrap();
+        p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding { curve: CurveId(1),
+            target: AutoTarget::BusGain(BusId(1)), gate: Gate::Always, response: None, fit_span: false } }).unwrap();
+        for v in crate::wire::FIRST_FILE_VERSION..=crate::wire::WIRE_VERSION {
+            crate::wire::ENCODE_AS.with(|c| c.set(v));
+            let bytes = SaveFile::from_project(&p, Vec::new(), None).encode();
+            crate::wire::ENCODE_AS.with(|c| c.set(crate::wire::WIRE_VERSION));
+            assert_eq!(bytes[8], v, "written at v{v}");
+            let back = SaveFile::decode(&bytes).unwrap_or_else(|| panic!("a v{v} file must open"));
+            assert_eq!(back.to_project(), p, "v{v} opens to the same project");
+        }
+        // a file from a NEWER build is still refused, not guessed at
+        let mut future = SaveFile::from_project(&p, Vec::new(), None).encode();
+        future[8] = crate::wire::WIRE_VERSION + 1;
+        assert!(SaveFile::decode(&future).is_none());
+        // and live packets stay exact: an old peer's packet is refused
+        crate::wire::ENCODE_AS.with(|c| c.set(crate::wire::WIRE_VERSION - 1));
+        let old_packet = crate::wire::Packet::Catchup { ops: vec![] }.encode();
+        crate::wire::ENCODE_AS.with(|c| c.set(crate::wire::WIRE_VERSION));
+        assert!(crate::wire::Packet::decode(&old_packet).is_none(), "peers must match exactly");
+        assert!(crate::wire::Packet::decode_stored(&old_packet).is_some(), "a stored one opens");
     }
 }

@@ -1144,7 +1144,7 @@ mod drag_lifecycle_tests {
         // fixture to be wrong.
         ctx.run(input, |ctx| {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
-                out = timeline(ui, doc, view, &colors, Ticks::ZERO, &[], &peaks,
+                out = timeline(ui, doc, view, &colors, Ticks::ZERO, &[], &peaks, &Default::default(),
                                TrimSide::Left, &closed, keys::Mode::Normal,
                                playkeys::InputMode::Motions, "", None);
             });

@@ -91,12 +91,68 @@ pub enum Gate {
     Group(crate::GroupId),
 }
 
+/// How a binding reads its curve: straight (the default), or through a
+/// transfer that turns one SIGNAL into a per-target response.
+///
+/// The case that made this exist: a scene's "stage" — how far into its arc
+/// the scene is, 0 to 1 — should bring music in early, rhythm in late, and
+/// hold sound effects steady. Without a response each target needs its own
+/// curve, and three curves describing one arc drift apart the first time one
+/// is edited without the others. With it there is ONE stage curve and each
+/// binding says how its target answers it.
+///
+/// Below `from` the output is `floor`; above `to` it is `ceil`; in between a
+/// smoothstep. `from > to` inverts it (a target that eases OUT as the stage
+/// rises).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Response {
+    pub from: f32,
+    pub to: f32,
+    pub floor: f32,
+    pub ceil: f32,
+}
+
+impl Response {
+    pub fn apply(&self, x: f32) -> f32 {
+        let span = self.to - self.from;
+        let t = if span.abs() < 1e-6 { if x >= self.to { 1.0 } else { 0.0 } } else { ((x - self.from) / span).clamp(0.0, 1.0) };
+        let t = t * t * (3.0 - 2.0 * t);
+        self.floor + (self.ceil - self.floor) * t
+    }
+}
+
 /// One curve aimed at one target through one gate.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Binding {
     pub curve: CurveId,
     pub target: AutoTarget,
     pub gate: Gate,
+    /// `None` reads the curve as it is — every binding made before this
+    /// existed, bit-identically.
+    #[serde(default)]
+    pub response: Option<Response>,
+    /// Stretch the curve over the gate's span instead of running it in
+    /// seconds from the gate's start. For an arc that belongs to a scene: trim
+    /// the scene shorter and a seconds-based curve no longer ends where the
+    /// scene does; a fitted one always does. Ignored for `Gate::Always`,
+    /// which has no span.
+    #[serde(default)]
+    pub fit_span: bool,
+}
+
+/// The curve's own length: its last point's time.
+fn curve_len(points: &[(Ticks, f32)]) -> Ticks {
+    points.last().map(|p| p.0).unwrap_or(Ticks::ZERO)
+}
+
+/// Gate-relative time -> curve time, honouring `fit_span`.
+fn curve_time(rel: Ticks, opening: &Opening, fit: bool, len: Ticks) -> Ticks {
+    match (fit, opening.span) {
+        (true, Some((s, e))) if e > s && len > Ticks::ZERO => {
+            Ticks(((rel.0 as i128 * len.0 as i128) / (e.0 - s.0) as i128) as i64)
+        }
+        _ => rel,
+    }
 }
 
 /// A binding's gate, resolved against a project into the two facts the
@@ -166,6 +222,9 @@ pub struct Sweep<'a> {
     points: &'a [(Ticks, f32)],
     opening: Opening,
     cursor: usize,
+    response: Option<Response>,
+    fit_span: bool,
+    len: Ticks,
 }
 
 impl<'a> Sweep<'a> {
@@ -173,7 +232,9 @@ impl<'a> Sweep<'a> {
     /// gate-relative time inside it.
     pub fn value(&mut self, at: Ticks) -> f32 {
         if !self.opening.contains(at) { return 1.0; }
-        eval_lane_cursor(self.points, at.saturating_sub(self.opening.origin), &mut self.cursor)
+        let t = curve_time(at.saturating_sub(self.opening.origin), &self.opening, self.fit_span, self.len);
+        let v = eval_lane_cursor(self.points, t, &mut self.cursor);
+        match self.response { Some(r) => r.apply(v), None => v }
     }
 }
 
@@ -192,7 +253,9 @@ impl Project {
         let Some(curve) = self.curves.get(&b.curve) else { return 1.0 };
         let Some(opening) = b.gate.opening(self) else { return 1.0 };
         if !opening.contains(at) { return 1.0; }
-        eval_lane(&curve.points, at.saturating_sub(opening.origin))
+        let t = curve_time(at.saturating_sub(opening.origin), &opening, b.fit_span, curve_len(&curve.points));
+        let v = eval_lane(&curve.points, t);
+        match b.response { Some(r) => r.apply(v), None => v }
     }
 
     /// Everything driving `target` at `at`: the lane times every active
@@ -213,7 +276,8 @@ impl Project {
             .filter_map(|(_, b)| {
                 let curve = self.curves.get(&b.curve)?;
                 let opening = b.gate.opening(self)?;
-                Some(Sweep { points: &curve.points, opening, cursor: 0 })
+                Some(Sweep { points: &curve.points, opening, cursor: 0, response: b.response,
+                             fit_span: b.fit_span, len: curve_len(&curve.points) })
             })
             .collect()
     }
@@ -308,7 +372,7 @@ mod tests {
         let mut p = project();
         curve_with_dip(&mut p, CurveId(1));
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
-            curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(1)), response: None, fit_span: false  } }).unwrap();
         // Outside the clip: transparent, not "the curve's first value".
         assert_eq!(p.auto_value(T, Ticks(0)), 1.0);
         assert_eq!(p.auto_value(T, Ticks(999)), 1.0);
@@ -325,7 +389,7 @@ mod tests {
         let mut p = project();
         curve_with_dip(&mut p, CurveId(1));
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
-            curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(1)), response: None, fit_span: false  } }).unwrap();
         p.apply(&Op::MoveClip { id: ClipId(1), pos: Ticks(5_000), track: TrackId(1) }).unwrap();
         assert_eq!(p.auto_value(T, Ticks(1_500)), 1.0, "nothing left behind at the old place");
         assert!((p.auto_value(T, Ticks(5_500)) - 0.0).abs() < 1e-6, "the dip followed the clip");
@@ -339,7 +403,7 @@ mod tests {
         curve_with_dip(&mut p, CurveId(1));
         for (bid, cid) in [(1, 1), (2, 2)] {
             p.apply(&Op::SetBinding { id: BindingId(bid), binding: Binding {
-                curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(cid)) } }).unwrap();
+                curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(cid)), response: None, fit_span: false  } }).unwrap();
         }
         assert!((p.auto_value(T, Ticks(1_500)) - 0.0).abs() < 1e-6);
         assert!((p.auto_value(T, Ticks(4_500)) - 0.0).abs() < 1e-6);
@@ -354,7 +418,7 @@ mod tests {
         let mut p = project();
         curve_with_dip(&mut p, CurveId(1));
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
-            curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(1)), response: None, fit_span: false  } }).unwrap();
         let mut next = 2;
         let ops = p.duplicate_clip_ops(ClipId(1), ClipId(9), Ticks(7_000), TrackId(1), &mut next).unwrap();
         assert_eq!(ops.len(), 2, "the clip and one re-binding");
@@ -373,9 +437,9 @@ mod tests {
         p.apply(&Op::SetCurve { id: CurveId(1), name: "half".into() }).unwrap();
         p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks(0), value: 0.5 }).unwrap();
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
-            curve: CurveId(1), target: T, gate: Gate::Always } }).unwrap();
+            curve: CurveId(1), target: T, gate: Gate::Always, response: None, fit_span: false } }).unwrap();
         p.apply(&Op::SetBinding { id: BindingId(2), binding: Binding {
-            curve: CurveId(1), target: T, gate: Gate::Window { start: Ticks(100), end: Ticks(200) } } }).unwrap();
+            curve: CurveId(1), target: T, gate: Gate::Window { start: Ticks(100), end: Ticks(200) }, response: None, fit_span: false } }).unwrap();
         assert!((p.auto_value(T, Ticks(50)) - 0.25).abs() < 1e-6, "lane × always-binding");
         assert!((p.auto_value(T, Ticks(150)) - 0.125).abs() < 1e-6, "× the window binding inside it");
         assert!((p.auto_value(T, Ticks(250)) - 0.25).abs() < 1e-6, "the window closed again");
@@ -386,9 +450,9 @@ mod tests {
         let mut p = project();
         curve_with_dip(&mut p, CurveId(1));
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
-            curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(1)), response: None, fit_span: false  } }).unwrap();
         p.apply(&Op::SetBinding { id: BindingId(2), binding: Binding {
-            curve: CurveId(1), target: T, gate: Gate::Window { start: Ticks(1_200), end: Ticks(1_800) } } }).unwrap();
+            curve: CurveId(1), target: T, gate: Gate::Window { start: Ticks(1_200), end: Ticks(1_800) }, response: None, fit_span: false } }).unwrap();
         let mut sweeps = p.binding_sweeps(T);
         assert_eq!(sweeps.len(), 2);
         let mut checked = 0;
@@ -409,7 +473,7 @@ mod tests {
         let mut p = project();
         curve_with_dip(&mut p, CurveId(1));
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
-            curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(1)), response: None, fit_span: false  } }).unwrap();
         let undo = p.apply(&Op::RemoveClip { id: ClipId(1) }).unwrap();
         assert_eq!(p.bindings.len(), 1, "the binding dangles rather than being cleaned up");
         assert_eq!(p.auto_value(T, Ticks(1_500)), 1.0, "and is transparent while it dangles");
@@ -429,7 +493,7 @@ mod tests {
         assert_eq!(add, Op::RemoveCurvePoint { curve: CurveId(1), at: Ticks(10) });
         let restate = p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks(10), value: 0.7 }).unwrap();
         assert_eq!(restate, Op::SetCurvePoint { curve: CurveId(1), at: Ticks(10), value: 0.5 });
-        let b = Binding { curve: CurveId(1), target: T, gate: Gate::Always };
+        let b = Binding { curve: CurveId(1), target: T, gate: Gate::Always, response: None, fit_span: false };
         let bind = p.apply(&Op::SetBinding { id: BindingId(1), binding: b }).unwrap();
         assert!(matches!(bind, Op::RemoveBinding { id: BindingId(1) }));
         // A bound curve refuses removal — the RemoveSource rule.
@@ -450,16 +514,16 @@ mod tests {
         let mut p = project();
         p.apply(&Op::SetCurve { id: CurveId(1), name: "a".into() }).unwrap();
         let err = |p: &mut Project, b: Binding| p.apply(&Op::SetBinding { id: BindingId(1), binding: b }).unwrap_err();
-        assert_eq!(err(&mut p, Binding { curve: CurveId(9), target: T, gate: Gate::Always }),
+        assert_eq!(err(&mut p, Binding { curve: CurveId(9), target: T, gate: Gate::Always, response: None, fit_span: false }),
                    EditError::NoSuchCurve(CurveId(9)));
-        assert_eq!(err(&mut p, Binding { curve: CurveId(1), target: AutoTarget::TrackGain(TrackId(9)), gate: Gate::Always }),
+        assert_eq!(err(&mut p, Binding { curve: CurveId(1), target: AutoTarget::TrackGain(TrackId(9)), gate: Gate::Always, response: None, fit_span: false }),
                    EditError::NoSuchTrack(TrackId(9)));
-        assert_eq!(err(&mut p, Binding { curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(9)) }),
+        assert_eq!(err(&mut p, Binding { curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(9)), response: None, fit_span: false  }),
                    EditError::NoSuchClip(ClipId(9)));
-        assert_eq!(err(&mut p, Binding { curve: CurveId(1), target: T, gate: Gate::Window { start: Ticks(5), end: Ticks(5) } }),
+        assert_eq!(err(&mut p, Binding { curve: CurveId(1), target: T, gate: Gate::Window { start: Ticks(5), end: Ticks(5) }, response: None, fit_span: false }),
                    EditError::EmptyWindow);
         p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: false, locked: true }).unwrap();
-        assert_eq!(err(&mut p, Binding { curve: CurveId(1), target: T, gate: Gate::Always }),
+        assert_eq!(err(&mut p, Binding { curve: CurveId(1), target: T, gate: Gate::Always, response: None, fit_span: false }),
                    EditError::TrackLocked(TrackId(1)), "a ride is a mix edit; a locked track refuses it");
         assert_eq!(p.apply(&Op::RemoveBinding { id: BindingId(1) }), Err(EditError::NoSuchBinding(BindingId(1))));
         assert_eq!(p.apply(&Op::SetCurvePoint { curve: CurveId(9), at: Ticks(0), value: 1.0 }),
@@ -489,7 +553,7 @@ mod tests {
         p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks(0), value: 4.0 }).unwrap();
         let bound = AutoTarget::BusParam { bus, effect: 1, key: ParamKey::new("freq0").unwrap() };
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
-            curve: CurveId(1), target: bound, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            curve: CurveId(1), target: bound, gate: Gate::Clip(ClipId(1)), response: None, fit_span: false  } }).unwrap();
         // The render's question: what is ridden on this bus, and where.
         let targets = p.bus_param_targets(bus);
         assert_eq!(targets.iter().map(|(e, k, _)| (*e, k.as_str())).collect::<Vec<_>>(),
@@ -536,7 +600,7 @@ mod tests {
         p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks(0), value: 0.0 }).unwrap();
         p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks(5_000), value: 1.0 }).unwrap();
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
-            curve: CurveId(1), target: T, gate: Gate::Group(GroupId(1)) } }).unwrap();
+            curve: CurveId(1), target: T, gate: Gate::Group(GroupId(1)), response: None, fit_span: false  } }).unwrap();
         let v = |p: &Project, t: i64| p.auto_value(T, Ticks(t));
         assert!((v(&p, 1_000)).abs() < 1e-6, "hull start: the curve's 0");
         assert!((v(&p, 3_500) - 0.5).abs() < 1e-6, "halfway across the hull — INCLUDING the gap between members");
@@ -554,7 +618,7 @@ mod tests {
         assert!((v(&p, 1_500) - 1.0).abs() < 1e-6, "before the hull: transparent");
         // Validation and the empty case.
         assert_eq!(p.apply(&Op::SetBinding { id: BindingId(2), binding: Binding {
-            curve: CurveId(1), target: T, gate: Gate::Group(GroupId(9)) } }),
+            curve: CurveId(1), target: T, gate: Gate::Group(GroupId(9)), response: None, fit_span: false  } }),
             Err(EditError::NoSuchGroup(GroupId(9))));
         p.apply(&Op::RemoveGroup { id: GroupId(1) }).unwrap();
         assert!((v(&p, 3_500) - 1.0).abs() < 1e-6, "the group is gone: the binding stays, never active");
@@ -566,7 +630,62 @@ mod tests {
         let mut p = project();
         p.apply(&Op::SetCurve { id: CurveId(1), name: "a".into() }).unwrap();
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
-            curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            curve: CurveId(1), target: T, gate: Gate::Clip(ClipId(1)), response: None, fit_span: false  } }).unwrap();
         assert_eq!(p.auto_value(T, Ticks(1_500)), 1.0, "a curve with no points changes nothing");
+    }
+
+    #[test]
+    fn one_stage_signal_drives_each_target_through_its_own_response() {
+        // A scene's stage rises 0 -> 1 across it. Music answers early, rhythm
+        // late, sound effects ease OUT: three responses, one curve.
+        let mut p = Project::default();
+        p.apply(&Op::SetCurve { id: CurveId(1), name: "stage".into() }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::ZERO, value: 0.0 }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::from_seconds(10.0), value: 1.0 }).unwrap();
+        for (i, name) in [(1u64, "music"), (2, "rhythm"), (3, "sfx"), (4, "raw")] {
+            p.apply(&Op::AddBus { bus: crate::Bus { id: crate::BusId(i), name: name.into(), parent: None, gain: 1.0,
+                chain: vec![], sends: vec![], muted: false, silent: false } }).unwrap();
+        }
+        let bind = |target, response| Binding { curve: CurveId(1), target, gate: Gate::Always, response, fit_span: false };
+        let music = bind(AutoTarget::BusGain(crate::BusId(1)), Some(Response { from: 0.1, to: 0.5, floor: 0.0, ceil: 1.0 }));
+        let rhythm = bind(AutoTarget::BusGain(crate::BusId(2)), Some(Response { from: 0.6, to: 0.9, floor: 0.0, ceil: 1.0 }));
+        let sfx = bind(AutoTarget::BusGain(crate::BusId(3)), Some(Response { from: 0.5, to: 1.0, floor: 1.0, ceil: 0.4 }));
+        let at = |p: &Project, b: &Binding, s: f64| p.binding_value(b, Ticks::from_seconds(s));
+        assert!(at(&p, &music, 1.0) < 0.05 && at(&p, &music, 5.0) > 0.99, "music is in by the middle");
+        assert!(at(&p, &rhythm, 5.0) < 0.01 && at(&p, &rhythm, 9.5) > 0.99, "rhythm only near the peak");
+        assert!((at(&p, &sfx, 2.0) - 1.0).abs() < 1e-6 && (at(&p, &sfx, 10.0) - 0.4).abs() < 1e-3, "sfx eases out");
+        // the sweep the render uses agrees with the definition, sample by sample
+        for b in [music, rhythm, sfx] {
+            p.apply(&Op::SetBinding { id: BindingId(9), binding: b }).unwrap();
+            let mut sw = p.binding_sweeps(b.target);
+            for k in 0..=100 {
+                let t = Ticks::from_seconds(k as f64 / 10.0);
+                assert!((sw[0].value(t) - p.binding_value(&b, t)).abs() < 1e-6, "sweep = definition at {k}");
+            }
+            p.apply(&Op::RemoveBinding { id: BindingId(9) }).unwrap();
+        }
+        // no response: the curve's raw value, as before
+        let raw = bind(AutoTarget::BusGain(crate::BusId(4)), None);
+        assert!((at(&p, &raw, 5.0) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_fitted_arc_survives_a_retrim_of_its_scene() {
+        // The stage curve is 10 s long; the scene it is gated to is a window
+        // that gets trimmed from 10 s to 4 s. Fitted, the arc still peaks at
+        // the scene's end; in seconds, it is cut off at 40%.
+        let mut p = Project::default();
+        p.apply(&Op::SetCurve { id: CurveId(1), name: "stage".into() }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::ZERO, value: 0.0 }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::from_seconds(10.0), value: 1.0 }).unwrap();
+        let scene = |len: f64| Gate::Window { start: Ticks::from_seconds(20.0), end: Ticks::from_seconds(20.0 + len) };
+        let b = |gate, fit_span| Binding { curve: CurveId(1), target: AutoTarget::BusGain(crate::BusId(1)), gate, response: None, fit_span };
+        let near_end = |g: Gate, fit| p.binding_value(&b(g, fit), Ticks::from_seconds(20.0 + match g { Gate::Window { start, end } => (end.0 - start.0) as f64 / crate::TICKS_PER_SECOND as f64, _ => 0.0 } - 0.01));
+        assert!(near_end(scene(10.0), true) > 0.99 && near_end(scene(10.0), false) > 0.99, "untrimmed: both reach the peak");
+        assert!(near_end(scene(4.0), true) > 0.99, "fitted: the trimmed scene still ends at the peak");
+        assert!(near_end(scene(4.0), false) < 0.41, "seconds: the arc is cut off at 40% -- the desync fit exists for");
+        // midway is midway, whatever the length
+        let mid = p.binding_value(&b(scene(4.0), true), Ticks::from_seconds(22.0));
+        assert!((mid - 0.5).abs() < 0.01, "{mid}");
     }
 }
