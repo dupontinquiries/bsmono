@@ -13,6 +13,8 @@
 //! they share one window. The painting code does not care which.
 
 pub mod effects;
+#[cfg(feature = "wayland")]
+pub mod wayland;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
 use tideshell_core::bar::{self, BarWidget};

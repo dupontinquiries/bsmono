@@ -36,14 +36,32 @@ cargo run --release -- --live                  # also run real hatch / rusty-boa
 
 ## Wired vs not
 
-Wired: hatch-core launches (recents shared with hatch), `hatch-egui
---toggle`, rusty-board `Show`/`Hide` via `busctl`, prefs file
-(`~/.config/tideshell/prefs`, same `shell.*` keys settingsd would carry).
+Wired and **verified against a real cosmic-comp epoch-1.8.0** (nested under
+Xvfb, see `shared/systemcompkit/STATUS.md`): the live window list and
+window actions. `tideshell-sim --wayland` shows the compositor's real
+windows in the switcher; a click on a card raised that window
+(activate), and close / maximize / unmaximize are each confirmed with
+`systemcompkit`'s `toplevel_probe`. cosmic-comp advertises no fullscreen
+capability, which is why carousel mode maximizes.
+
+Wired, not yet exercised live: hatch-core launches (recents shared with
+hatch), `hatch-egui --toggle`, rusty-board `Show`/`Hide` via `busctl`,
+prefs file (`~/.config/tideshell/prefs`, the `shell.*` keys settingsd
+would carry).
 
 Not wired, and reported as `unwired:` in the trace rather than silently
-ignored: window activate/close/maximize (needs `zcosmic_toplevel_manager_v1`
-requests in systemcompkit), the trackpad's EI pointer (needs cosmic-comp
-patch `0002-dbus-ei-allow-tideshell` plus a reis client, as cosmic-osk
-does), quick-toggle backends, brightness/volume, settingsd transport, and
-the layer-shell edge strips that feed real touches on a phone. Nothing here
-has run on a compositor yet; the simulator is the verification ceiling.
+ignored: the trackpad's EI pointer (needs cosmic-comp patch
+`0002-dbus-ei-allow-tideshell` plus a reis client, as cosmic-osk does),
+quick-toggle backends, brightness/volume, the settingsd transport, and the
+layer-shell edge strips and surfaces that replace the simulator window on
+a phone.
+
+### Running against a nested cosmic-comp
+
+```sh
+# once: build cosmic-comp (pop-os/cosmic-epoch, epoch-1.8.0), ~6 min on one core
+export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 XDG_RUNTIME_DIR=/tmp/xdg
+Xvfb :99 -screen 0 1000x1000x24 & cosmic-comp &   # falls back to winit/EGL
+WAYLAND_DISPLAY=wayland-1 DISPLAY= gtk4-demo &    # some real windows
+WAYLAND_DISPLAY=wayland-1 DISPLAY= tideshell-sim --wayland --trace
+```

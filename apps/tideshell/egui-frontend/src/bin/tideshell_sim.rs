@@ -12,6 +12,9 @@
 //!   --toggle`, rusty-board over busctl. Window actions stay simulated.
 //! * `--persist` loads and saves `~/.config/tideshell/prefs` (off by default so
 //!   poking at the simulator does not rewrite a real config).
+//! * `--wayland` uses the compositor's real windows (cosmic-comp: toplevel
+//!   list + management) instead of simulated ones; window actions are sent
+//!   as zcosmic requests.
 //! * `--demo` drives the real recognizer with synthetic touches at startup, to
 //!   reach a state for a screenshot without input.
 
@@ -133,6 +136,7 @@ struct App {
     demo: Option<String>,
     demo_started: Option<f64>,
     last_cards: Vec<WindowCard>,
+    live: Option<tideshell_egui::wayland::Windows>,
 }
 
 impl App {
@@ -143,7 +147,11 @@ impl App {
                 self.shell.note(o.describe());
                 continue;
             }
-            let o = SimExec { world: &mut self.world, live: self.system.as_mut(), now }.run(&a);
+            let mut sim = SimExec { world: &mut self.world, live: self.system.as_mut(), now };
+            let o = match self.live.as_mut() {
+                Some(windows) => tideshell_egui::wayland::Live { windows, fallback: &mut sim }.run(&a),
+                None => sim.run(&a),
+            };
             if let Outcome::Done(s) = &o {
                 if s.is_empty() {
                     continue;
@@ -151,7 +159,13 @@ impl App {
             }
             self.shell.note(o.describe());
         }
-        let cards = self.world.cards();
+        let cards = match self.live.as_mut() {
+            Some(w) => match w.poll() {
+                Some(c) => c,
+                None => return,
+            },
+            None => self.world.cards(),
+        };
         if cards != self.last_cards {
             self.last_cards = cards.clone();
             let more = self.shell.set_windows(cards);
@@ -252,6 +266,11 @@ impl eframe::App for App {
             p.rect_filled(area, CornerRadius::ZERO, Color32::from_rgb(28, 32, 44));
             // The active window fills the space beside the bar's exclusive zone.
             let win_r = Rect::from_min_max(area.min, area.max - Vec2::new(ShellView::reserved_right(&self.shell), 0.0));
+            if let Some(live) = &self.live {
+                let caps = live.capabilities();
+                let msg = format!("live: {} windows, manager caps {}", self.last_cards.len(), if caps.received { "received" } else { "pending" });
+                p.text(win_r.center(), Align2::CENTER_CENTER, msg, FontId::proportional(14.0), Color32::from_gray(200));
+            } else {
             match self.world.active.and_then(|id| self.world.wins.iter().find(|w| w.id == id)) {
                 Some(w) => {
                     p.rect_filled(win_r, CornerRadius::ZERO, app_color(&w.app_id).gamma_multiply(0.55));
@@ -262,6 +281,7 @@ impl eframe::App for App {
                 None => {
                     p.text(win_r.center(), Align2::CENTER_CENTER, "desktop", FontId::proportional(16.0), Color32::from_gray(140));
                 }
+            }
             }
             if self.world.keyboard {
                 let kb = Rect::from_min_max(Pos2::new(win_r.left(), win_r.bottom() - win_r.height() * 0.33), win_r.max);
@@ -316,6 +336,21 @@ fn main() -> eframe::Result<()> {
             .collect();
     }
     let world = World::new();
+    let live = if has("--wayland") {
+        match tideshell_egui::wayland::Windows::connect() {
+            Ok(mut w) => {
+                w.exclude_app_id = Some(APP_ID.to_string());
+                shell.note("wayland: connected to toplevel list");
+                Some(w)
+            }
+            Err(e) => {
+                shell.note(format!("wayland: {e:?}; using simulated windows"));
+                None
+            }
+        }
+    } else {
+        None
+    };
     let opts = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: uikit_egui::desktop::viewport(APP_ID, "tideshell sim", [408.0, 900.0]),
@@ -332,7 +367,7 @@ fn main() -> eframe::Result<()> {
             let palette = uikit_egui::palette_colors_ctx(&cc.egui_ctx, &prefs.palette);
             let mut view = ShellView::default();
             view.show_trace = show_trace;
-            Ok(Box::new(App { shell, view, world, system, persist, palette, apps, demo, demo_started: None, last_cards: vec![] }))
+            Ok(Box::new(App { shell, view, world, system, persist, palette, apps, demo, demo_started: None, last_cards: vec![], live }))
         }),
     )
 }
