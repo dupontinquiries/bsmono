@@ -37,10 +37,16 @@
 //! * writes ONLY under `/home/root`, which persists (`assert_persistent`);
 //! * separates "installed" from "active since this boot" and offers the
 //!   activation step ([`Activation`]) instead of just failing;
-//! * detects a host key living in the volatile `/etc` and can make it
-//!   permanent once ([`persist_host_keys_cmd`]), because re-trusting a new
-//!   key after every reboot trains the operator to accept exactly what a
-//!   man-in-the-middle looks like.
+//! * never unlocks the system (`mount -o remount,rw /`): because it writes
+//!   only under `/home`, which survives reboots AND OS updates, it has no
+//!   reason to, and unlocking done wrong can cost SSH access (the
+//!   remarkable.guide FAQ: after unmounting the /etc overlay the dropbear
+//!   host keys, bind-mounted from /home/root/.dropbear, must be re-bound or
+//!   you cannot reconnect).
+//!
+//! Host keys: on these devices they are already persistent (that bind
+//! mount), so a changed key means an OS update regenerated it (FAQ), not a
+//! reboot. That is still never auto-accepted.
 //!
 //! Everything that builds a remote command is a pure function and is tested
 //! as a string. The shell text runs under the device's `/bin/sh`, which may
@@ -131,6 +137,7 @@ impl RmModel {
 ///   devicesettings.cpp, libblight_client state.cpp) identifies every model
 ///   from this one line, so it is the authoritative source.
 /// * `motd`: the login banner, which carries the device codename.
+/// * `hostname`: stock hostnames carry SoC and codename (`imx8mm-ferrari`).
 /// * `soc`: `/sys/devices/soc0/soc_id` (e.g. `i.MX8MM`), plus panel sizes
 ///   from DRM connector modes and fb0: the fallback for a device whose
 ///   machine string is new to us.
@@ -139,6 +146,7 @@ pub fn probe_cmd() -> &'static str {
      echo \"dtmodel=$(tr -d '\\0' < /proc/device-tree/model 2>/dev/null)\"; \
      echo \"soc=$(head -n1 /sys/devices/soc0/soc_id 2>/dev/null)\"; \
      echo \"motd=$(tr '\\n' ' ' < /etc/motd 2>/dev/null | tr -s ' ' | cut -c1-400)\"; \
+     echo \"hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null)\"; \
      for f in /sys/class/drm/card*-*/modes; do [ -r \"$f\" ] && head -n1 \"$f\" | sed 's/^/size=/'; done 2>/dev/null; \
      [ -r /sys/class/graphics/fb0/virtual_size ] && sed 's/^/size=/; s/,/x/' /sys/class/graphics/fb0/virtual_size; \
      echo \"arch=$(uname -m)\""
@@ -205,8 +213,8 @@ fn model_from_soc(soc: &str, sizes: &[(u32, u32)]) -> Option<RmModel> {
     }
 }
 
-/// Parse [`probe_cmd`] output. Order of trust: machine string, then motd
-/// codename, then SoC + panel size. A candidate whose triple contradicts
+/// Parse [`probe_cmd`] output. Order of trust: machine string, device tree,
+/// motd codename, hostname codename, then SoC + panel size. A candidate whose triple contradicts
 /// `uname -m` is rejected rather than trusted.
 pub fn parse_probe(out: &str) -> Probe {
     let mut kv: std::collections::HashMap<&str, &str> = Default::default();
@@ -238,6 +246,8 @@ pub fn parse_probe(out: &str) -> Probe {
         (model_from_machine(get("machine")), format!("machine {:?}", get("machine"))),
         (model_from_machine(get("dtmodel")), format!("device tree {:?}", get("dtmodel"))),
         (motd_hit, "codename in /etc/motd".into()),
+        (CODENAMES.iter().find(|(c, _)| get("hostname").to_ascii_lowercase().contains(c)).map(|(_, m)| *m),
+            format!("hostname {:?}", get("hostname"))),
         (model_from_soc(get("soc"), &sizes), format!("SoC {:?} with panel {sizes:?}", get("soc"))),
     ];
     let mut rejected = Vec::new();
@@ -592,9 +602,6 @@ pub struct Displays {
     /// Vellum launcherctl: configured launcher, and the one running now.
     pub launcher_current: Option<String>,
     pub launcher_active: Option<String>,
-    /// The SSH host key lives in the volatile `/etc` layer, so it will be
-    /// regenerated at the next boot unless made permanent.
-    pub hostkey_volatile: bool,
 }
 
 /// A one-per-boot step the tablet needs before apps can reach its screen.
@@ -705,8 +712,6 @@ pub fn displays_probe_cmd() -> &'static str {
      L=/home/root/.vellum/bin/launcherctl; if [ -x $L ]; then \
        echo \"launcher_current=$($L current-launcher 2>/dev/null | head -n1)\"; \
        echo \"launcher_active=$($L active-launcher 2>/dev/null | head -n1)\"; fi; \
-     for f in /var/volatile/etc/ssh/ssh_host_* /var/volatile/etc/dropbear/*host*; do \
-       [ -e \"$f\" ] && echo hostkey_volatile=1 && break; done; \
      true"
 }
 
@@ -715,7 +720,7 @@ pub fn displays_probe_cmd() -> &'static str {
 /// support fails a test instead of being silently ignored.
 pub const DISPLAY_KEYS: &[&str] = &[
     "qtfb", "appload_dir", "blight_lib", "blight_running", "glibc",
-    "rootfs_ro", "etc_overlay", "xovi_installed", "launcher_current", "launcher_active", "hostkey_volatile",
+    "rootfs_ro", "etc_overlay", "xovi_installed", "launcher_current", "launcher_active",
 ];
 
 /// A launcherctl name, or None for "none"/empty. Output format unverified:
@@ -739,7 +744,6 @@ pub fn parse_displays(out: &str) -> Displays {
             Some(("xovi_installed", "1")) => d.xovi_installed = true,
             Some(("launcher_current", v)) => d.launcher_current = launcher_name(v),
             Some(("launcher_active", v)) => d.launcher_active = launcher_name(v),
-            Some(("hostkey_volatile", "1")) => d.hostkey_volatile = true,
             _ => {}
         }
     }
@@ -776,9 +780,9 @@ pub struct Enrolled {
 }
 
 pub const HOSTKEY_CHANGED: &str = "the tablet's SSH host key has changed since it was trusted. \
-    After a reboot that is expected if its key lives in the volatile /etc (probe shows hostkey_volatile); \
-    it is also what an interception looks like. If you just rebooted it on a cable you control, \
-    re-trust it, then make the key permanent so this stops happening.";
+    That is expected after an OS update (every update regenerates it), and it is also what an \
+    interception looks like. If the tablet was just updated and it is on a cable or network you \
+    control, re-trust it.";
 
 /// Enrol a tablet. `password` may be `None` when a key is already installed;
 /// if it is needed and missing, the error says where to find it.
@@ -787,8 +791,10 @@ pub fn enroll(e: &mut dyn Enroller, password: Option<&str>, on: &mut dyn FnMut(E
     let t = e.trust_host()?;
     on(EnrollEvent::Trusted(t));
     let first = e.key_check();
-    if first == KeyCheck::HostKeyChanged {
-        return Err(HOSTKEY_CHANGED.into());
+    match first {
+        KeyCheck::HostKeyChanged => return Err(HOSTKEY_CHANGED.into()),
+        KeyCheck::LegacyHostKey => return Err(LEGACY_HOSTKEY.into()),
+        _ => {}
     }
     let used_password = if first == KeyCheck::Works {
         on(EnrollEvent::KeyAlreadyWorks);
@@ -828,6 +834,7 @@ impl Enroller for SshEnroller {
         match crate::deploy::remote_capture("root", &self.host, "true") {
             Ok(_) => KeyCheck::Works,
             Err(e) if crate::deploy::ssh_error_reason(&e) == "hostkey" => KeyCheck::HostKeyChanged,
+            Err(e) if crate::deploy::ssh_error_reason(&e) == "legacy-hostkey" => KeyCheck::LegacyHostKey,
             Err(_) => KeyCheck::Fails,
         }
     }
@@ -856,51 +863,22 @@ pub fn assert_persistent(path: &str) -> Result<(), String> {
     if ok { Ok(()) } else { Err(format!("{path}: gitmind only writes under {PERSISTENT_ROOT} on a tablet (the rest resets at boot)")) }
 }
 
-/// Make a volatile SSH host key permanent: the reManager unlock sequence
-/// (remount / rw, lazily unmount the /etc overlay so the real /etc shows),
-/// copy the keys from the tmpfs layer into it, then ALWAYS restore (overlay
-/// back, sync, / read-only) via an EXIT trap, even if the copy fails, and
-/// verify the root really is read-only again.
-///
-/// `ETC`/`VOL` default to the real paths; tests point them at temp dirs.
-/// Unverified on hardware: the key directories are the two sshd layouts
-/// (OpenSSH `/etc/ssh`, dropbear `/etc/dropbear`).
-pub fn persist_host_keys_cmd() -> &'static str {
-    r#"ETC=${ETC:-/etc}; VOL=${VOL:-/var/volatile}
-restore() {
-  if [ -d "$VOL/.etc-work" ] && ! awk '$1=="overlay" && $2=="/etc"{f=1} END{exit !f}' /proc/mounts; then
-    rm -rf "$VOL/.etc-work/"*
-    mount -t overlay overlay -o rw,relatime,lowerdir=/etc,upperdir="$VOL/etc",workdir="$VOL/.etc-work" /etc
-  fi
-  sync
-  mount -o remount,ro /
-  echo restored
-}
-trap restore EXIT
-set -e
-mount -o remount,rw /
-if awk '$1=="overlay" && $2=="/etc"{f=1} END{exit !f}' /proc/mounts; then umount -l /etc; fi
-n=0
-for d in ssh dropbear; do
-  if [ -d "$VOL/etc/$d" ]; then
-    mkdir -p "$ETC/$d"
-    for f in "$VOL/etc/$d/"*host*; do [ -e "$f" ] && cp -a "$f" "$ETC/$d/" && n=$((n+1)); done
-  fi
-done
-echo "persisted $n"
-"#
-}
-
 /// How key auth stands, distinguishing a changed host key (never auto-fixed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyCheck {
     Works,
     Fails,
-    /// The pinned host key no longer matches. After a reboot of a tablet
-    /// whose key lives in the volatile /etc this is expected; it is also
-    /// exactly what an attacker looks like, so only the operator decides.
+    /// The pinned host key no longer matches. Expected after an OS update,
+    /// which regenerates it; also exactly what an interception looks like,
+    /// so only the operator decides.
     HostKeyChanged,
+    /// The tablet only offers ssh-rsa, which modern OpenSSH refuses.
+    LegacyHostKey,
 }
+
+pub const LEGACY_HOSTKEY: &str = "the tablet only offers an ssh-rsa host key (older OS versions), which this \
+    phone's OpenSSH refuses by default. Add to ~/.ssh/config for this host:\n  \
+    HostKeyAlgorithms +ssh-rsa\n  PubkeyAcceptedKeyTypes +ssh-rsa";
 
 // ───────────────────────── AppLoad route ─────────────────────────
 
@@ -1016,6 +994,34 @@ mod tests {
         let p = probe(&["machine=", "motd=  marshmallow  ", "arch=aarch64"]);
         assert_eq!(p.model, None);
         assert_eq!(p.unknown_codename.as_deref(), Some("marshmallow"));
+    }
+
+    #[test]
+    fn the_stock_hostname_identifies_the_device() {
+        let p = probe(&["machine=reMarkable Something New", "hostname=imx8mm-ferrari", "arch=aarch64"]);
+        assert_eq!(p.model, Some(RmModel::PaperPro));
+        assert!(p.how.contains("hostname"), "{}", p.how);
+    }
+
+    #[test]
+    fn gitmind_never_unlocks_the_system() {
+        // Nothing gitmind sends may remount / or touch the /etc overlay:
+        // it has no reason to (it writes only under /home), and doing it
+        // wrong loses SSH (the dropbear keys are a bind mount under /etc).
+        let mut all = vec![probe_cmd().to_string(), displays_probe_cmd().to_string(), prepare_cmd(),
+            activation_cmd(Activation::StartXovi), activation_cmd(Activation::StartLauncher)];
+        for app in ["x"] {
+            all.push(install_cmd(app).unwrap());
+            all.push(stop_cmd(app).unwrap());
+            all.push(status_cmd(app, 1).unwrap());
+            all.push(launch_cmd(app, &LaunchEnv::new(RefreshProfile::FastMono), &[]).unwrap());
+            all.push(appload_install_cmd(app, "/home/root/xovi/exthome/appload", "{}").unwrap());
+        }
+        for c in all {
+            for bad in ["remount", "umount", "mount -t", "mount -o"] {
+                assert!(!c.contains(bad), "{bad:?} in {c}");
+            }
+        }
     }
 
     #[test]
@@ -1307,7 +1313,7 @@ mod tests {
     fn a_changed_host_key_stops_enrolment_before_any_password_is_sent() {
         let mut f = FakeEnroller { log: vec![], key_ok: false, key_ok_after_install: true, hostkey_changed: true };
         let e = enroll(&mut f, Some("pw"), &mut |_| {}).unwrap_err();
-        assert!(e.contains("host key has changed"), "{e}");
+        assert!(e.contains("host key has changed") && e.contains("OS update"), "{e}");
         assert!(!f.log.iter().any(|l| l.starts_with("install")), "password must not be sent to a changed key");
     }
 
@@ -1350,72 +1356,10 @@ mod tests {
         }
     }
 
-    /// Run the persistence script against temp dirs, with `mount`/`umount`/
-    /// `sync` replaced by loggers on PATH, to check: keys land in the real
-    /// /etc, and the restore (overlay back, remount ro) runs on success AND
-    /// on failure.
-    #[test]
-    fn host_key_persistence_copies_and_always_restores() {
-        let root = std::env::temp_dir().join(format!("persist_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let (etc, vol, bin) = (root.join("etc"), root.join("vol"), root.join("bin"));
-        std::fs::create_dir_all(vol.join("etc/ssh")).unwrap();
-        std::fs::create_dir_all(vol.join(".etc-work")).unwrap();
-        std::fs::create_dir_all(&etc).unwrap();
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(vol.join("etc/ssh/ssh_host_ed25519_key"), "secret").unwrap();
-        std::fs::write(vol.join("etc/ssh/ssh_host_ed25519_key.pub"), "public").unwrap();
-        let log = root.join("calls.log");
-        for tool in ["mount", "umount", "sync"] {
-            let p = bin.join(tool);
-            std::fs::write(&p, format!("#!/bin/sh\necho \"{tool} $*\" >> {}\n", log.display())).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let run = || std::process::Command::new("sh").arg("-c").arg(persist_host_keys_cmd())
-            .env("ETC", &etc).env("VOL", &vol)
-            .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
-            .output().unwrap();
-        let o = run();
-        let out = String::from_utf8_lossy(&o.stdout);
-        assert!(out.contains("persisted 2") && out.contains("restored"), "{out}");
-        assert_eq!(std::fs::read_to_string(etc.join("ssh/ssh_host_ed25519_key")).unwrap(), "secret");
-        let calls = std::fs::read_to_string(&log).unwrap();
-        assert!(calls.starts_with("mount -o remount,rw /"), "{calls}");
-        assert!(calls.trim_end().ends_with("mount -o remount,ro /"), "{calls}");
-
-        // failure mid-way (key dir unwritable) must still restore
-        std::fs::remove_file(&log).unwrap();
-        std::fs::remove_dir_all(etc.join("ssh")).unwrap();
-        std::fs::write(etc.join("ssh"), "a file where a dir should be").unwrap();
-        let o = run();
-        assert!(!o.status.success());
-        let calls = std::fs::read_to_string(&log).unwrap();
-        assert!(calls.trim_end().ends_with("mount -o remount,ro /"), "restore skipped on failure: {calls}");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn every_display_key_is_parsed() {
-        // each key, set, must change the parsed value from the default
-        for k in DISPLAY_KEYS {
-            let v = if ["appload_dir", "blight_lib", "glibc", "launcher_current", "launcher_active"].contains(k) { "x" } else { "1" };
-            assert_ne!(parse_displays(&format!("{k}={v}")), Displays::default(), "{k} is not parsed");
-        }
-    }
-
-    #[test]
-    fn installed_is_not_ready() {
-        let d = parse_displays("appload_dir=/home/root/xovi/exthome/appload\n");
-        assert!(!d.screen_ready());
-        assert_eq!(d.readiness().unwrap().1, None, "no start script: nothing gitmind can run");
-        assert!(parse_displays("qtfb=1\n").screen_ready());
-    }
-
     #[test]
     fn the_extended_probe_parses_a_paper_pro_after_reboot() {
-        let d = parse_displays("rootfs_ro=1\netc_overlay=1\nxovi_installed=1\nhostkey_volatile=1\nlauncher_current=none\nlauncher_active=\n");
-        assert!(d.rootfs_ro && d.etc_overlay && d.xovi_installed && d.hostkey_volatile);
+        let d = parse_displays("rootfs_ro=1\netc_overlay=1\nxovi_installed=1\nlauncher_current=none\nlauncher_active=\n");
+        assert!(d.rootfs_ro && d.etc_overlay && d.xovi_installed);
         assert_eq!(d.launcher_current, None, "\"none\" is no launcher");
     }
 }

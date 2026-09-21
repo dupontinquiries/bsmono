@@ -1393,10 +1393,9 @@ fn iso_now() -> String {
 /// the root filesystem; Oxide/AppLoad get installed or removed).
 fn cmd_eink(rest: &[String]) -> i32 {
     use cockpit::eink_fleet as ef;
-    const USAGE: &str = "usage: gitmind eink <enroll|probe|deploy|stop|status|activate|retrust|keep-hostkey> <host> ...\n  \
+    const USAGE: &str = "usage: gitmind eink <enroll|probe|deploy|stop|status|activate|retrust> <host> ...\n  \
         activate <host>                     after a reboot: start xovi or the launcher, whichever is needed\n  \
-        retrust <host>                      accept the tablet's NEW host key (only if you know why it changed)\n  \
-        keep-hostkey <host>                 make a volatile host key survive reboots (writes the tablet's /etc)\n  \
+        retrust <host>                      accept the tablet's NEW host key (after an OS update)\n  \
         enroll <host>                       first contact: password (GITMIND_RM_PASSWORD or stdin) → key\n  \
         probe <host>                        model, display servers, route\n  \
         deploy <host> <bin> [--name N] [--profile fast-color|fast-mono|quality] [-- args...]\n  \
@@ -1432,10 +1431,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
             println!("  system  read-only root{}; gitmind writes only under /home/root",
                 if d.etc_overlay { ", /etc resets at boot" } else { "" });
         }
-        if d.hostkey_volatile {
-            println!("  WARNING the SSH host key lives in the volatile /etc and changes at reboot;");
-            println!("          `gitmind eink keep-hostkey {host}` makes it permanent");
-        }
+
     };
     match sub {
         "enroll" => {
@@ -1453,7 +1449,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
                     describe(&r.probe, &r.displays);
                     0
                 }
-                Err(e) if e == ef::HOSTKEY_CHANGED => err(&format!("{e}\n  → `gitmind eink retrust {host}`, then `gitmind eink keep-hostkey {host}`")),
+                Err(e) if e == ef::HOSTKEY_CHANGED => err(&format!("{e}\n  → `gitmind eink retrust {host}`, then enroll again")),
                 Err(e) => err(&e),
             }
         }
@@ -1518,17 +1514,6 @@ fn cmd_eink(rest: &[String]) -> i32 {
             Ok(m) => { println!("{m}"); 0 }
             Err(e) => err(&e),
         },
-        "keep-hostkey" => {
-            let (_, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return err(&e) };
-            if !d.hostkey_volatile {
-                println!("{host}: host key is not in the volatile /etc; nothing to do");
-                return 0;
-            }
-            match ef::Remote::run(&mut remote, ef::persist_host_keys_cmd()) {
-                Ok(out) => { println!("{}", out.trim()); 0 }
-                Err(e) => err(&e),
-            }
-        }
         "stop" | "status" => {
             let Some(app) = pos.first() else { return err(USAGE) };
             let cmd = if sub == "stop" { ef::stop_cmd(app) } else { ef::status_cmd(app, 0) };

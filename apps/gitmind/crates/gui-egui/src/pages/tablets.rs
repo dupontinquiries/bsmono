@@ -37,7 +37,6 @@ pub struct State {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Confirm {
     Activate(ef::Activation),
-    KeepHostKey,
 }
 
 impl Default for State {
@@ -78,9 +77,6 @@ fn describe(p: &ef::Probe, d: &ef::Displays) -> Vec<String> {
     }
     if d.etc_overlay {
         v.push("system files reset at boot; gitmind only writes under /home/root".into());
-    }
-    if d.hostkey_volatile {
-        v.push("its SSH host key changes at every reboot until made permanent".into());
     }
     v
 }
@@ -149,14 +145,14 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     });
 
     if *s.hostkey_changed.lock().unwrap() {
-        ui.label(egui::RichText::new("The tablet's host key changed. Re-trust only if you know why \
-            (e.g. you just rebooted it on your own cable).").strong());
+        ui.label(egui::RichText::new("The tablet's host key changed. That happens after an OS update; \
+            re-trust only if you know it was updated.").strong());
         if ui.add_enabled(!busy, egui::Button::new("Re-trust this tablet")).clicked() {
             let (host, changed) = (s.host.trim().to_string(), s.hostkey_changed.clone());
             s.task.run_logged(move |_| match cockpit::deploy::retrust_host(&host) {
                 Ok(m) => {
                     *changed.lock().unwrap() = false;
-                    format!("{m}\nnow Enrol again, then make the key permanent")
+                    format!("{m}\nnow Enrol again")
                 }
                 Err(e) => format!("re-trust failed: {e}"),
             });
@@ -168,21 +164,17 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         for line in describe(p, d) {
             ui.label(line);
         }
-        // Per-boot activation and host-key persistence: both change the
-        // tablet, so each takes a second, explicit tap.
+        // Per-boot activation changes the tablet (restarts its UI or
+        // switches launcher), so it takes a second, explicit tap.
         let mut actions: Vec<(Confirm, String)> = Vec::new();
         if let Ok((_, Some(a))) = d.readiness() {
             actions.push((Confirm::Activate(a), format!("Activate: {}", a.label())));
-        }
-        if d.hostkey_volatile {
-            actions.push((Confirm::KeepHostKey, "Keep this host key across reboots".into()));
         }
         for (c, label) in actions {
             if s.confirm == Some(c) {
                 let warn = match c {
                     Confirm::Activate(ef::Activation::StartXovi) => "The tablet's screen will restart for a few seconds.",
                     Confirm::Activate(_) => "The tablet switches to its launcher.",
-                    Confirm::KeepHostKey => "This briefly makes the tablet's system writable and copies its SSH host key into /etc.",
                 };
                 ui.label(egui::RichText::new(warn).small());
                 ui.horizontal(|ui| {
@@ -190,10 +182,8 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                         let host = s.host.trim().to_string();
                         s.task.run_logged(move |_| {
                             let mut r = ef::SshRemote { user: "root".into(), host };
-                            let cmd = match c {
-                                Confirm::Activate(a) => ef::activation_cmd(a),
-                                Confirm::KeepHostKey => ef::persist_host_keys_cmd().to_string(),
-                            };
+                            let Confirm::Activate(a) = c;
+                            let cmd = ef::activation_cmd(a);
                             match ef::Remote::run(&mut r, &cmd) {
                                 Ok(out) => format!("{}\n(Probe again to refresh)", out.trim()),
                                 Err(e) => format!("failed: {e}"),

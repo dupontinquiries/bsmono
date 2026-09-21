@@ -1017,6 +1017,10 @@ pub fn ssh_error_reason(stderr: &str) -> &'static str {
         || s.contains("remote host identification has changed")
     {
         "hostkey"
+    } else if s.contains("no matching host key type found") {
+        // Older reMarkable OS versions offer only ssh-rsa host keys, which
+        // OpenSSH >= 8.8 refuses by default (remarkable.guide FAQ).
+        "legacy-hostkey"
     } else if s.contains("could not resolve")
         || s.contains("name or service not known")
         || s.contains("timed out")
@@ -1403,6 +1407,13 @@ mod tests {
         assert_eq!(last_octet("192.168.1.42"), 42);
         assert_eq!(last_octet("10.0.0.1"), 1);
         assert_eq!(last_octet("garbage"), 0);
+    }
+
+    #[test]
+    fn an_ssh_rsa_only_device_is_its_own_error() {
+        // real OpenSSH text; older reMarkable OS versions offer only ssh-rsa
+        let e = "Unable to negotiate with 10.11.99.1 port 22: no matching host key type found. Their offer: ssh-rsa";
+        assert_eq!(ssh_error_reason(e), "legacy-hostkey");
     }
 
     #[test]
