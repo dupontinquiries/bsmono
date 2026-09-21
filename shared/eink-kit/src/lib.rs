@@ -25,6 +25,7 @@ pub mod device;
 pub mod engine;
 pub mod format;
 pub mod geom;
+pub mod icon;
 pub mod motion;
 pub mod policy;
 pub mod present;

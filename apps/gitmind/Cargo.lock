@@ -995,6 +995,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eink-kit"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "libc",
+]
+
+[[package]]
 name = "emath"
 version = "0.34.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1308,6 +1316,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_extras",
+ "eink-kit",
  "gitmind-core",
  "image",
  "peek",

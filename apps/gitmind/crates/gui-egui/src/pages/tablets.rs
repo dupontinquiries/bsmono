@@ -4,7 +4,12 @@
 //! (USB networking answers at 10.11.99.1) or type its Wi-Fi address, type
 //! the SSH password shown in the tablet's Settings ONCE, and gitmind pins
 //! the host key, installs its key, and reports what the tablet is and how
-//! apps reach its screen. After that: pick a built binary, deploy.
+//! apps reach its screen. After that: pick an eink-kit app from this
+//! checkout, build it for that tablet (on a postmarketOS phone the AppLoad
+//! route builds natively), and deploy. On the AppLoad route the app gets a
+//! manifest, a sidebar title and a letter-tile icon, so it appears in
+//! xochitl's sidebar through AppLoad's injected menu; gitmind can list and
+//! remove the apps it put there, and never touches anyone else's.
 //!
 //! All logic is `cockpit::eink_fleet` (the same calls `gitmind eink` uses);
 //! this page only collects input and shows progress. Blocking work runs on
@@ -32,6 +37,18 @@ pub struct State {
     pub hostkey_changed: Arc<Mutex<bool>>,
     /// Two-step confirmation for actions that change the tablet itself.
     pub confirm: Option<Confirm>,
+    /// eink-kit apps in this checkout (discovered on first view).
+    pub apps: Option<Vec<ef::TabletApp>>,
+    pub selected: usize,
+    /// (binary path, bin name) from the last successful build.
+    pub built: Arc<Mutex<Option<(String, String)>>>,
+    /// AppLoad sidebar title; empty = the app name.
+    pub display_name: String,
+    /// Allow AppLoad's windowed mode (default off: fullscreen, crisp).
+    pub windowed: bool,
+    /// gitmind's apps in the tablet's AppLoad: (name, title).
+    pub installed: Arc<Mutex<Vec<(String, String)>>>,
+    pub remove_confirm: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,6 +69,13 @@ impl Default for State {
             last_result: String::new(),
             hostkey_changed: Arc::new(Mutex::new(false)),
             confirm: None,
+            apps: None,
+            selected: 0,
+            built: Arc::new(Mutex::new(None)),
+            display_name: String::new(),
+            windowed: false,
+            installed: Arc::new(Mutex::new(Vec::new())),
+            remove_confirm: None,
         }
     }
 }
@@ -202,17 +226,97 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     }
 
     ui.separator();
+    ui.label(egui::RichText::new("build").strong());
+    // eink-kit apps in this checkout, found once per session.
+    if s.apps.is_none() {
+        s.apps = Some(ef::discover_tablet_apps(&cockpit::ops::repo_root()));
+    }
+    let apps = s.apps.clone().unwrap_or_default();
+    if apps.is_empty() {
+        ui.label(egui::RichText::new("no eink-kit apps found in this checkout (GITMIND_ROOT)").weak().small());
+    } else {
+        s.selected = s.selected.min(apps.len() - 1);
+        egui::ComboBox::from_id_salt("tablets-app").selected_text(&apps[s.selected].bin).show_ui(ui, |ui| {
+            for (i, a) in apps.iter().enumerate() {
+                ui.selectable_value(&mut s.selected, i, &a.bin);
+            }
+        });
+        let route = found.as_ref().and_then(|(p, d)| d.readiness().ok().map(|(r, _)| (r, p.model)));
+        if let Some((r, m)) = &route {
+            let t = ef::build_target(r, *m);
+            let native = ef::native_for(&t);
+            ui.label(egui::RichText::new(format!("{}{}", t.triple, if native { " (native on this phone)" } else { "" })).small());
+            ui.label(egui::RichText::new(t.why).weak().small());
+        }
+        if ui.add_enabled(!busy && route.is_some(), egui::Button::new("Build for this tablet")).clicked() {
+            let (r, m) = route.clone().unwrap();
+            let app = apps[s.selected].clone();
+            let built = s.built.clone();
+            s.task.run_logged(move |log| {
+                let t = ef::build_target(&r, m);
+                let native = ef::native_for(&t);
+                let (argv, env) = ef::tablet_build_cmd(&app.bin, &t, std::env::var("RUSTFLAGS").ok().as_deref(), native);
+                log.push(&format!("$ {}  (in {})", argv.join(" "), app.dir.display()));
+                let mut cmd = std::process::Command::new(&argv[0]);
+                cmd.args(&argv[1..]).current_dir(&app.dir).envs(env)
+                    .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+                let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => return format!("could not run cargo: {e}") };
+                // cargo reports progress on stderr; stream it line by line.
+                if let Some(err) = child.stderr.take() {
+                    use std::io::BufRead;
+                    for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                        log.push(&line);
+                    }
+                }
+                let status = match child.wait() { Ok(s) => s, Err(e) => return format!("cargo: {e}") };
+                if !status.success() {
+                    return format!("build failed (exit {:?}). If std is missing for {}, this machine cannot build that target; \
+                        on an aarch64 postmarketOS phone the AppLoad route builds natively.", status.code(), t.triple);
+                }
+                // A workspace member builds into the workspace's target dir.
+                let rel = ef::tablet_build_output(&app.bin, &t, native);
+                let path = app.dir.ancestors().map(|d| d.join(&rel)).find(|p| p.exists());
+                let Some(path) = path else { return format!("built, but {rel} was not found") };
+                let path = path.to_string_lossy().to_string();
+                match ef::preflight_binary(&path, &r, m) {
+                    Ok(_) => {
+                        *built.lock().unwrap() = Some((path.clone(), app.bin.clone()));
+                        format!("built {path}\nready to deploy")
+                    }
+                    Err(e) => format!("built, but it will not run on the tablet: {e}"),
+                }
+            });
+        }
+    }
+    if let Some((path, bin)) = s.built.lock().unwrap().take() {
+        s.bin_path = path;
+        s.app_name = bin.clone();
+        if s.display_name.is_empty() {
+            s.display_name = bin;
+        }
+    }
+
+    ui.separator();
     ui.label(egui::RichText::new("deploy").strong());
     // Full width and wrapping: build paths are long, and a clipped path
     // hides exactly the part that says which build you are about to push.
     ui.label("binary");
     ui.add(egui::TextEdit::multiline(&mut s.bin_path).id_salt("tablets-bin").desired_rows(2)
-        .desired_width(f32::INFINITY).hint_text("path to an aarch64 / armv7 build"));
+        .desired_width(f32::INFINITY).hint_text("built above, or a path to an aarch64 / armv7 build"));
     ui.horizontal_wrapped(|ui| {
         ui.label("name");
         ui.add(egui::TextEdit::singleline(&mut s.app_name).id_salt("tablets-name").desired_width(140.0)
             .hint_text("defaults to the file name"));
     });
+    let appload_route = matches!(found.as_ref().and_then(|(_, d)| d.readiness().ok()), Some((ef::Route::AppLoad { .. }, _)));
+    if appload_route {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("sidebar title");
+            ui.add(egui::TextEdit::singleline(&mut s.display_name).id_salt("tablets-title").desired_width(140.0)
+                .hint_text("as shown in AppLoad"));
+        });
+        ui.checkbox(&mut s.windowed, "allow windowed mode (scaled down; softer text)");
+    }
     ui.horizontal_wrapped(|ui| {
         ui.label("refresh");
         ui.radio_value(&mut s.profile, None, "fastest for the panel");
@@ -233,6 +337,8 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         let can = !busy && found.is_some() && !s.bin_path.trim().is_empty() && name_ok;
         if ui.add_enabled(can, egui::Button::new("Deploy")).clicked() {
             let (host, bin, name, choice) = (s.host.trim().to_string(), s.bin_path.trim().to_string(), name.clone(), s.profile);
+            let title = if s.display_name.trim().is_empty() { name.clone() } else { s.display_name.trim().to_string() };
+            let fullscreen = !s.windowed;
             s.task.run_logged(move |log| {
                 // Re-probe: the route may have changed since enrolment.
                 let mut r = ef::SshRemote { user: "root".into(), host: host.clone() };
@@ -242,14 +348,27 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 if let (ef::Route::Blight, Some(a)) = (&route, activation) {
                     return format!("the tablet needs \"{}\" since its last boot — use Activate above", a.label());
                 }
+                // Never push something the tablet cannot run.
+                if let Err(e) = ef::preflight_binary(&bin, &route, p.model) {
+                    return format!("not deployed: {e}");
+                }
                 let profile = choice.unwrap_or_else(|| ef::RefreshProfile::fastest(p.model.map(|m| m.panel()).unwrap_or(ef::Panel::Mono)));
                 let env = ef::LaunchEnv { profile, model: p.model, blight_lib: d.blight_lib.clone() };
-                match ef::deliver(&mut r, &route, &name, &bin, &env, &[], &mut |ev| log.push(&format!("{ev:?}"))) {
+                // Sidebar entry: title, fullscreen, and a letter-tile icon.
+                let opts = ef::AppLoadOptions { display_name: title, fullscreen, args: vec![] };
+                let icon = std::env::temp_dir().join(format!("gitmind-icon-{name}.png"));
+                let icon_ok = std::fs::write(&icon, eink_kit::icon::letter_tile_png(&name, 128)).is_ok();
+                let icon_path = icon.to_string_lossy().to_string();
+                let appload = Some((&opts, icon_ok.then_some(icon_path.as_str())));
+                let res = ef::deliver(&mut r, &route, &name, &bin, &env, &[], appload, &mut |ev| log.push(&format!("{ev:?}")));
+                let _ = std::fs::remove_file(&icon);
+                match res {
                     Ok(ef::Delivered::Launched(ef::Outcome::Running { pid })) => format!("{name} running (pid {pid}, {})", profile.as_env()),
                     Ok(ef::Delivered::Launched(ef::Outcome::ExitedEarly { log_tail })) => format!("{name} exited right after launch:\n{log_tail}"),
                     Ok(ef::Delivered::Registered { .. }) if activation.is_some() =>
-                        format!("{name} installed — activate xovi (above), then open AppLoad on the tablet and tap it"),
-                    Ok(ef::Delivered::Registered { .. }) => format!("{name} installed — open AppLoad on the tablet and tap it"),
+                        format!("{name} installed — activate xovi (above), then open AppLoad in the tablet's sidebar"),
+                    Ok(ef::Delivered::Registered { .. }) =>
+                        format!("{name} installed in AppLoad — on the tablet open AppLoad from the sidebar and tap ↻ once to list it"),
                     Err(e) => format!("deploy failed: {e}"),
                 }
             });
@@ -273,6 +392,56 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             }
         }
     });
+
+    // What gitmind has put in AppLoad's sidebar on this tablet.
+    if let Some(dir) = found.as_ref().and_then(|(_, d)| d.appload_dir.clone()) {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("in the tablet's AppLoad").strong());
+            if ui.add_enabled(!busy, egui::Button::new("List")).clicked() {
+                let (host, installed, dir) = (s.host.trim().to_string(), s.installed.clone(), dir.clone());
+                s.task.run_logged(move |_| {
+                    let mut r = ef::SshRemote { user: "root".into(), host };
+                    match ef::appload_list_cmd(&dir).and_then(|c| ef::Remote::run(&mut r, &c)) {
+                        Ok(out) => {
+                            let list = ef::parse_appload_list(&out);
+                            let n = list.len();
+                            *installed.lock().unwrap() = list;
+                            format!("{n} app(s) installed by gitmind")
+                        }
+                        Err(e) => format!("list failed: {e}"),
+                    }
+                });
+            }
+        });
+        let list = s.installed.lock().unwrap().clone();
+        for (app, title) in list {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("{title}  ({app})"));
+                if s.remove_confirm.as_deref() == Some(app.as_str()) {
+                    if ui.add_enabled(!busy, egui::Button::new("Confirm remove")).clicked() {
+                        let (host, installed, dir, a) = (s.host.trim().to_string(), s.installed.clone(), dir.clone(), app.clone());
+                        s.task.run_logged(move |_| {
+                            let mut r = ef::SshRemote { user: "root".into(), host };
+                            match ef::appload_remove_cmd(&a, &dir).and_then(|c| ef::Remote::run(&mut r, &c)) {
+                                Ok(_) => {
+                                    installed.lock().unwrap().retain(|(n, _)| n != &a);
+                                    format!("{a} removed; tap ↻ in AppLoad to update the list")
+                                }
+                                Err(e) => format!("remove failed: {e}"),
+                            }
+                        });
+                        s.remove_confirm = None;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        s.remove_confirm = None;
+                    }
+                } else if ui.add_enabled(!busy, egui::Button::new("Remove")).clicked() {
+                    s.remove_confirm = Some(app.clone());
+                }
+            });
+        }
+    }
 
     if let Some(r) = s.task.take_result() {
         s.last_result = r;

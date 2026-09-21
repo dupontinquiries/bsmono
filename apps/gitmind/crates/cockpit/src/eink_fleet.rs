@@ -880,6 +880,260 @@ pub const LEGACY_HOSTKEY: &str = "the tablet only offers an ssh-rsa host key (ol
     phone's OpenSSH refuses by default. Add to ~/.ssh/config for this host:\n  \
     HostKeyAlgorithms +ssh-rsa\n  PubkeyAcceptedKeyTypes +ssh-rsa";
 
+// ───────────────────────── building for a tablet ─────────────────────────
+
+/// What to build for a device, decided by its ROUTE, not just its CPU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildTarget {
+    pub triple: &'static str,
+    /// Link statically (`+crt-static`). True for the AppLoad route.
+    pub static_crt: bool,
+    /// One line on why, shown next to the build.
+    pub why: &'static str,
+}
+
+/// * AppLoad/qtfb: the app talks to a socket and shared memory and loads no
+///   system library, so a STATIC musl binary runs on any tablet OS version.
+///   On a postmarketOS phone (musl, aarch64) `aarch64-unknown-linux-musl` is
+///   the native target: the phone builds Paper Pro apps with no cross
+///   toolchain.
+/// * Blight: the app dlopens the tablet's glibc `libblight_protocol`, which a
+///   static binary cannot do, so it must be a gnu build pinned to the
+///   tablet's glibc (see `Displays::glibc`).
+pub fn build_target(route: &Route, model: Option<RmModel>) -> BuildTarget {
+    let arm32 = matches!(model, Some(RmModel::Rm1 | RmModel::Rm2));
+    match route {
+        Route::AppLoad { .. } => BuildTarget {
+            triple: if arm32 { "armv7-unknown-linux-musleabihf" } else { "aarch64-unknown-linux-musl" },
+            static_crt: true,
+            why: "AppLoad: static musl, runs on any tablet OS and builds natively on an aarch64 postmarketOS phone",
+        },
+        Route::Blight => BuildTarget {
+            triple: if arm32 { "armv7-unknown-linux-gnueabihf" } else { "aarch64-unknown-linux-gnu" },
+            static_crt: false,
+            why: "Blight: glibc build (loads the tablet's libblight_protocol); pin glibc to the tablet's",
+        },
+    }
+}
+
+/// argv + env for `cargo build` of one package for a tablet.
+///
+/// Deliberately NOT `buildflags::build_env`: that classifies any egui app as
+/// windowed and makes musl builds DYNAMIC so winit can dlopen Wayland. A
+/// dynamic musl binary needs musl's loader, which a reMarkable does not have:
+/// it would be pushed and never start. The tablet env forces `+crt-static`
+/// and merges (never drops) an inherited RUSTFLAGS.
+///
+/// `native`: build for the host with no `--target`. That is the phone case.
+/// postmarketOS's rustc (Alpine's) targets `aarch64-alpine-linux-musl` and
+/// ships std only for it, so `--target aarch64-unknown-linux-musl` fails
+/// there with "can't find crate for std"; Alpine also makes musl builds
+/// dynamic by default, which `+crt-static` overrides. See [`native_for`].
+pub fn tablet_build_cmd(bin: &str, t: &BuildTarget, inherited_rustflags: Option<&str>, native: bool) -> (Vec<String>, Vec<(String, String)>) {
+    // `--bin`: works in a single-crate dir and inside a workspace alike.
+    let argv = crate::buildflags::cargo_build_argv_kind(bin, if native { "" } else { t.triple }, &[], false, true);
+    let mut env = if native { Vec::new() } else { crate::buildflags::cross_env(t.triple) };
+    if t.static_crt {
+        let flag = "-C target-feature=+crt-static";
+        let merged = match inherited_rustflags.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(existing) => format!("{existing} {flag}"),
+            None => flag.to_string(),
+        };
+        env.push(("RUSTFLAGS".into(), merged));
+    }
+    (argv, env)
+}
+
+/// A buildable tablet app in the monorepo: an eink-kit binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletApp {
+    /// Crate directory (where `cargo build` runs).
+    pub dir: std::path::PathBuf,
+    pub bin: String,
+}
+
+/// Binary names a crate declares: every `[[bin]] name`, or the package name
+/// when there are none. Only for crates that ARE eink-kit or depend on it.
+pub fn eink_app_bins(cargo_toml: &str) -> Vec<String> {
+    let mut section = String::new();
+    let (mut pkg, mut bins, mut is_eink) = (None, Vec::new(), false);
+    for line in cargo_toml.lines().map(str::trim) {
+        if line.starts_with('[') {
+            section = line.to_string();
+            continue;
+        }
+        let kv = line.split_once('=').map(|(k, v)| (k.trim(), v.trim().trim_matches('"')));
+        match (section.as_str(), kv) {
+            ("[package]", Some(("name", v))) => {
+                is_eink |= v == "eink-kit";
+                pkg = Some(v.to_string());
+            }
+            ("[[bin]]", Some(("name", v))) => bins.push(v.to_string()),
+            (s, Some((k, _))) if s.contains("dependencies") && k == "eink-kit" => is_eink = true,
+            _ => {}
+        }
+    }
+    if !is_eink {
+        return Vec::new();
+    }
+    if bins.is_empty() { pkg.into_iter().filter(|p| p != "eink-kit").collect() } else { bins }
+}
+
+/// Every eink-kit app under `root/{apps,shared}` (two levels of crates deep,
+/// skipping build output).
+pub fn discover_tablet_apps(root: &std::path::Path) -> Vec<TabletApp> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(std::path::PathBuf, u8)> = ["apps", "shared"].iter().map(|d| (root.join(d), 0)).collect();
+    while let Some((dir, depth)) = stack.pop() {
+        if let Ok(t) = std::fs::read_to_string(dir.join("Cargo.toml")) {
+            for bin in eink_app_bins(&t) {
+                out.push(TabletApp { dir: dir.clone(), bin });
+            }
+        }
+        if depth >= 3 {
+            continue;
+        }
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let n = e.file_name();
+                if e.path().is_dir() && n != "target" && n != "node_modules" && !n.to_string_lossy().starts_with('.') {
+                    stack.push((e.path(), depth + 1));
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.bin.cmp(&b.bin));
+    out
+}
+
+/// Can this machine build `t` natively? True when gitmind itself runs on the
+/// same CPU and libc as the target, i.e. on an aarch64 postmarketOS phone
+/// building for the AppLoad route of a Paper Pro-family tablet.
+pub fn native_for(t: &BuildTarget) -> bool {
+    let arch = if t.triple.starts_with("aarch64") { "aarch64" } else { "arm" };
+    std::env::consts::ARCH == arch && cfg!(target_env = "musl") && t.triple.contains("musl")
+}
+
+/// Where cargo puts the binary for `tablet_build_cmd`, relative to the crate
+/// (or workspace) directory.
+pub fn tablet_build_output(bin: &str, t: &BuildTarget, native: bool) -> String {
+    if native { format!("target/release/{bin}") } else { format!("target/{}/release/{bin}", t.triple) }
+}
+
+/// Read a local binary and check it suits the device's route before any
+/// byte is pushed. Used by the CLI and the Tablets page alike.
+pub fn preflight_binary(path: &str, route: &Route, model: Option<RmModel>) -> Result<BuildTarget, String> {
+    let t = build_target(route, model);
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    check_tablet_binary(&bytes, &t).map_err(|e| format!("{path}: {e}"))?;
+    Ok(t)
+}
+
+/// Is this file something the tablet can run on this route? Checks the ELF
+/// machine (aarch64 / 32-bit ARM) and, for the static AppLoad route, that
+/// there is no dynamic loader (`PT_INTERP`). Catches the likeliest mistake
+/// (pushing a desktop build) and the subtlest (a dynamic musl build).
+pub fn check_tablet_binary(bytes: &[u8], t: &BuildTarget) -> Result<(), String> {
+    if bytes.len() < 52 || &bytes[..4] != b"\x7fELF" {
+        return Err("not an ELF executable".into());
+    }
+    let is64 = match bytes[4] { 1 => false, 2 => true, _ => return Err("unknown ELF class".into()) };
+    if bytes[5] != 1 {
+        return Err("big-endian ELF; tablets are little-endian".into());
+    }
+    let u16at = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+    let u32at = |o: usize| -> Option<u32> { Some(u32::from_le_bytes(bytes.get(o..o + 4)?.try_into().ok()?)) };
+    let u64at = |o: usize| -> Option<u64> { Some(u64::from_le_bytes(bytes.get(o..o + 8)?.try_into().ok()?)) };
+    let machine = u16at(18);
+    let want = if t.triple.starts_with("aarch64") { 183 } else { 40 };
+    let name = |m: u16| match m { 183 => "aarch64", 40 => "32-bit ARM", 62 => "x86_64 (a desktop build?)", 3 => "x86", _ => "another architecture" };
+    if machine != want {
+        return Err(format!("built for {}, the tablet needs {}", name(machine), name(want)));
+    }
+    if is64 != t.triple.starts_with("aarch64") {
+        return Err("ELF class does not match the target".into());
+    }
+    let (phoff, phentsize, phnum) = if is64 {
+        (u64at(0x20).ok_or("truncated ELF")? as usize, u16at(0x36) as usize, u16at(0x38) as usize)
+    } else {
+        (u32at(0x1c).ok_or("truncated ELF")? as usize, u16at(0x2a) as usize, u16at(0x2c) as usize)
+    };
+    let mut dynamic = false;
+    for i in 0..phnum {
+        match u32at(phoff + i * phentsize) {
+            Some(3) => dynamic = true, // PT_INTERP
+            Some(_) => {}
+            None => return Err("truncated program headers".into()),
+        }
+    }
+    if t.static_crt && dynamic {
+        return Err("dynamically linked; the tablet has no musl loader. Rebuild with +crt-static".into());
+    }
+    Ok(())
+}
+
+// ───────────────────────── AppLoad management ─────────────────────────
+
+/// How an app appears in AppLoad's sidebar (manifest keys from rm-appload
+/// `libraryexternals.cpp`; icon is `<dir>/icon.png`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppLoadOptions {
+    pub display_name: String,
+    /// `disablesWindowedMode`: always fullscreen. Default on: in a window
+    /// AppLoad scales the app's full-size framebuffer down, which softens
+    /// e-ink text, and eink-kit renders at native panel resolution.
+    pub fullscreen: bool,
+    pub args: Vec<String>,
+}
+
+impl AppLoadOptions {
+    pub fn named(name: &str) -> AppLoadOptions {
+        AppLoadOptions { display_name: name.to_string(), fullscreen: true, args: vec![] }
+    }
+}
+
+/// Apps gitmind has put in AppLoad: `<name>\t<display name>` per line, for
+/// manifests whose `application` points into gitmind's bin dir. Other apps
+/// in AppLoad (KOReader, ...) are not listed and never touched.
+pub fn appload_list_cmd(appload_dir: &str) -> Result<String, String> {
+    assert_persistent(appload_dir)?;
+    Ok(format!(
+        "for m in {d}/*/external.manifest.json; do [ -f \"$m\" ] || continue; \
+           grep -q '\"{bin}/' \"$m\" || continue; \
+           n=$(basename \"$(dirname \"$m\")\"); \
+           t=$(sed -n 's/.*\"name\": *\"\\([^\"]*\\)\".*/\\1/p' \"$m\" | head -n1); \
+           printf '%s\\t%s\\n' \"$n\" \"$t\"; done; true",
+        d = shell_quote(appload_dir),
+        bin = format!("{BASE}/bin"),
+    ))
+}
+
+pub fn parse_appload_list(out: &str) -> Vec<(String, String)> {
+    out.lines()
+        .filter_map(|l| l.split_once('\t'))
+        .filter(|(n, _)| valid_app_name(n))
+        .map(|(n, t)| (n.to_string(), t.to_string()))
+        .collect()
+}
+
+/// Remove an app from AppLoad and delete its binary. Refuses directories
+/// whose manifest does not point into gitmind's bin dir, so it can never
+/// remove an app it did not install.
+pub fn appload_remove_cmd(app: &str, appload_dir: &str) -> Result<String, String> {
+    check(app)?;
+    assert_persistent(appload_dir)?;
+    let dir = format!("{appload_dir}/{app}");
+    Ok(format!(
+        "m={d}/external.manifest.json; \
+         if ! grep -q '\"{bin}/' \"$m\" 2>/dev/null; then echo 'not installed by gitmind; left alone' >&2; exit 1; fi; \
+         {stop}; rm -rf {d} {b}; echo removed",
+        d = shell_quote(&dir),
+        bin = format!("{BASE}/bin"),
+        stop = stop_cmd(app)?,
+        b = shell_quote(&bin_path(app)),
+    ))
+}
+
 // ───────────────────────── AppLoad route ─────────────────────────
 
 /// AppLoad's `external.manifest.json` for an eink-kit app. Schema from
@@ -887,7 +1141,7 @@ pub const LEGACY_HOSTKEY: &str = "the tablet only offers an ssh-rsa host key (ol
 /// required; `qtfb: true` makes AppLoad open a window and pass `QTFB_KEY`;
 /// `environment` is passed through, which is how the model and profile reach
 /// the app without device detection.
-pub fn appload_manifest(display_name: &str, app: &str, model: Option<RmModel>, profile: RefreshProfile) -> String {
+pub fn appload_manifest(opts: &AppLoadOptions, app: &str, model: Option<RmModel>, profile: RefreshProfile) -> String {
     let mut env = serde_json::Map::new();
     env.insert("EINK_BACKEND".into(), "qtfb".into());
     env.insert(PROFILE_ENV.into(), profile.as_env().into());
@@ -895,9 +1149,11 @@ pub fn appload_manifest(display_name: &str, app: &str, model: Option<RmModel>, p
         env.insert("EINK_MODEL".into(), m.env_id().into());
     }
     let v = serde_json::json!({
-        "name": display_name,
+        "name": opts.display_name,
         "application": bin_path(app),
         "qtfb": true,
+        "disablesWindowedMode": opts.fullscreen,
+        "args": opts.args,
         "environment": env,
     });
     serde_json::to_string_pretty(&v).expect("json")
@@ -930,6 +1186,7 @@ pub fn deliver(
     local_bin: &str,
     env: &LaunchEnv,
     args: &[&str],
+    appload: Option<(&AppLoadOptions, Option<&str>)>,
     on: &mut dyn FnMut(Event),
 ) -> Result<Delivered, String> {
     match route {
@@ -942,8 +1199,15 @@ pub fn deliver(
             remote.push(local_bin, &staging_path(app)).map_err(|e| format!("push: {e}"))?;
             on(Event::Installing);
             remote.run(&install_cmd(app)?).map_err(|e| format!("install: {e}"))?;
-            let manifest = appload_manifest(app, app, env.model, env.profile);
+            let default_opts = AppLoadOptions { args: args.iter().map(|a| a.to_string()).collect(), ..AppLoadOptions::named(app) };
+            let (opts, icon) = appload.unwrap_or((&default_opts, None));
+            let manifest = appload_manifest(opts, app, env.model, env.profile);
             remote.run(&appload_install_cmd(app, dir, &manifest)?).map_err(|e| format!("manifest: {e}"))?;
+            if let Some(icon) = icon {
+                let target = format!("{dir}/{app}/icon.png");
+                assert_persistent(&target)?;
+                remote.push(icon, &target).map_err(|e| format!("icon: {e}"))?;
+            }
             Ok(Delivered::Registered { manifest_dir: format!("{dir}/{app}") })
         }
     }
@@ -1273,11 +1537,12 @@ mod tests {
 
     #[test]
     fn appload_manifest_matches_the_schema_and_carries_the_env() {
-        let m = appload_manifest("eink demo", "eink-demo", Some(RmModel::PaperProMove), RefreshProfile::FastColor);
+        let m = appload_manifest(&AppLoadOptions::named("eink demo"), "eink-demo", Some(RmModel::PaperProMove), RefreshProfile::FastColor);
         let v: serde_json::Value = serde_json::from_str(&m).unwrap();
         assert_eq!(v["name"], "eink demo");
         assert_eq!(v["application"], "/home/root/.local/share/gitmind/bin/eink-demo");
         assert_eq!(v["qtfb"], true);
+        assert_eq!(v["disablesWindowedMode"], true, "fullscreen by default");
         assert_eq!(v["environment"]["EINK_MODEL"], "rmppm");
         assert_eq!(v["environment"]["EINK_BACKEND"], "qtfb");
         assert_eq!(v["environment"]["EINK_PROFILE"], "fast-color");
@@ -1285,7 +1550,7 @@ mod tests {
 
     #[test]
     fn the_manifest_command_survives_the_shell_with_quotes_in_it() {
-        let m = appload_manifest("it's \"quoted\"", "demo", None, RefreshProfile::Quality);
+        let m = appload_manifest(&AppLoadOptions::named("it's \"quoted\""), "demo", None, RefreshProfile::Quality);
         let dir = std::env::temp_dir().join(format!("appload_{}", std::process::id()));
         let real = "/home/root/xovi/exthome/appload";
         let cmd = appload_install_cmd("demo", real, &m).unwrap().replace(real, &dir.to_string_lossy());
@@ -1361,5 +1626,133 @@ mod tests {
         let d = parse_displays("rootfs_ro=1\netc_overlay=1\nxovi_installed=1\nlauncher_current=none\nlauncher_active=\n");
         assert!(d.rootfs_ro && d.etc_overlay && d.xovi_installed);
         assert_eq!(d.launcher_current, None, "\"none\" is no launcher");
+    }
+
+    #[test]
+    fn the_route_decides_the_build() {
+        let appload = Route::AppLoad { dir: "/home/root/xovi/exthome/appload".into() };
+        let t = build_target(&appload, Some(RmModel::PaperPro));
+        assert_eq!((t.triple, t.static_crt), ("aarch64-unknown-linux-musl", true));
+        assert_eq!(build_target(&appload, Some(RmModel::Rm2)).triple, "armv7-unknown-linux-musleabihf");
+        let b = build_target(&Route::Blight, Some(RmModel::PaperPro));
+        assert_eq!((b.triple, b.static_crt), ("aarch64-unknown-linux-gnu", false));
+    }
+
+    #[test]
+    fn tablet_builds_force_static_even_for_egui_apps_and_keep_existing_rustflags() {
+        let t = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
+        let (argv, env) = tablet_build_cmd("eink-demo", &t, Some("-C opt-level=s"), false);
+        assert!(argv.windows(2).any(|w| w == ["--bin", "eink-demo"]), "{argv:?}");
+        assert!(argv.windows(2).any(|w| w == ["--target", "aarch64-unknown-linux-musl"]), "{argv:?}");
+        let rf = env.iter().find(|(k, _)| k == "RUSTFLAGS").map(|(_, v)| v.as_str()).unwrap();
+        assert_eq!(rf, "-C opt-level=s -C target-feature=+crt-static");
+        assert!(!rf.contains("-crt-static ") && !rf.starts_with("-C target-feature=-crt-static"));
+        assert_eq!(tablet_build_output("eink-demo", &t, false), "target/aarch64-unknown-linux-musl/release/eink-demo");
+        // on the phone: native, no --target, still static
+        let (argv, env) = tablet_build_cmd("eink-demo", &t, None, true);
+        assert!(!argv.iter().any(|a| a == "--target"), "{argv:?}");
+        assert_eq!(env, vec![("RUSTFLAGS".to_string(), "-C target-feature=+crt-static".to_string())]);
+        assert_eq!(tablet_build_output("eink-demo", &t, true), "target/release/eink-demo");
+    }
+
+    /// Minimal ELF images: header + one program header of the given type.
+    fn elf(is64: bool, machine: u16, ptype: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 256];
+        b[..4].copy_from_slice(b"\x7fELF");
+        b[4] = if is64 { 2 } else { 1 };
+        b[5] = 1;
+        b[18..20].copy_from_slice(&machine.to_le_bytes());
+        if is64 {
+            b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+            b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+            b[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes());
+            b[64..68].copy_from_slice(&ptype.to_le_bytes());
+        } else {
+            b[0x1c..0x20].copy_from_slice(&52u32.to_le_bytes());
+            b[0x2a..0x2c].copy_from_slice(&32u16.to_le_bytes());
+            b[0x2c..0x2e].copy_from_slice(&1u16.to_le_bytes());
+            b[52..56].copy_from_slice(&ptype.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn binary_check_catches_wrong_arch_and_dynamic_musl() {
+        let pp = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
+        assert!(check_tablet_binary(&elf(true, 183, 1), &pp).is_ok(), "static aarch64");
+        let e = check_tablet_binary(&elf(true, 62, 1), &pp).unwrap_err();
+        assert!(e.contains("x86_64"), "{e}");
+        let e = check_tablet_binary(&elf(true, 183, 3), &pp).unwrap_err();
+        assert!(e.contains("musl loader"), "{e}");
+        let rm2 = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::Rm2));
+        assert!(check_tablet_binary(&elf(false, 40, 1), &rm2).is_ok(), "static 32-bit ARM");
+        assert!(check_tablet_binary(&elf(false, 40, 3), &rm2).is_err());
+        let blight = build_target(&Route::Blight, Some(RmModel::PaperPro));
+        assert!(check_tablet_binary(&elf(true, 183, 3), &blight).is_ok(), "dynamic gnu is right for Blight");
+        assert!(check_tablet_binary(b"#!/bin/sh\necho", &pp).is_err());
+    }
+
+    #[test]
+    fn preflight_refuses_this_hosts_binary_for_a_tablet() {
+        let me = std::env::current_exe().unwrap();
+        let r = preflight_binary(&me.to_string_lossy(), &Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
+        if std::env::consts::ARCH != "aarch64" {
+            assert!(r.is_err());
+        }
+        assert!(preflight_binary("/nonexistent/bin", &Route::Blight, None).is_err());
+    }
+
+    #[test]
+    fn binary_check_on_a_real_host_binary() {
+        // this test binary is an x86_64/aarch64 host ELF: must be refused
+        // for the tablet unless the host happens to be aarch64
+        let me = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let pp = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
+        if std::env::consts::ARCH != "aarch64" {
+            assert!(check_tablet_binary(&me, &pp).unwrap_err().contains("built for"));
+        }
+    }
+
+    #[test]
+    fn eink_apps_are_found_by_their_dependency() {
+        let kit = "[package]\nname = \"eink-kit\"\n[dependencies]\negui = \"0.34\"\n[[bin]]\nname = \"eink-demo\"\npath = \"x\"\n";
+        assert_eq!(eink_app_bins(kit), vec!["eink-demo"]);
+        let app = "[package]\nname = \"tomescope-eink\"\n[dependencies]\neink-kit = { path = \"../eink-kit\" }\n";
+        assert_eq!(eink_app_bins(app), vec!["tomescope-eink"]);
+        let other = "[package]\nname = \"hatch\"\n[dependencies]\negui = \"0.34\"\n";
+        assert!(eink_app_bins(other).is_empty());
+    }
+
+    #[test]
+    fn discovery_finds_eink_demo_in_this_checkout() {
+        // cockpit's crate dir is <root>/apps/gitmind/crates/cockpit
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../..");
+        let apps = discover_tablet_apps(&root);
+        assert!(apps.iter().any(|a| a.bin == "eink-demo" && a.dir.ends_with("shared/eink-kit")), "{apps:?}");
+    }
+
+    #[test]
+    fn appload_list_and_remove_only_touch_gitmind_apps() {
+        let root = std::env::temp_dir().join(format!("apl_{}", std::process::id()));
+        let real = "/home/root/xovi/exthome/appload";
+        let rebase = |c: String| c.replace(real, &root.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("eink-demo")).unwrap();
+        std::fs::create_dir_all(root.join("koreader")).unwrap();
+        let base = root.join("base").to_string_lossy().to_string();
+        std::fs::write(root.join("eink-demo/external.manifest.json"),
+            appload_manifest(&AppLoadOptions::named("Eink Demo"), "eink-demo", None, RefreshProfile::FastColor).replace(BASE, &base)).unwrap();
+        std::fs::write(root.join("koreader/external.manifest.json"),
+            "{\"name\": \"KOReader\", \"application\": \"/home/root/koreader/koreader.sh\"}").unwrap();
+        let sh = |c: &str| std::process::Command::new("sh").arg("-c").arg(c).output().unwrap();
+        let o = sh(&rebase(appload_list_cmd(real).unwrap()).replace(BASE, &base));
+        assert!(o.status.success());
+        assert_eq!(parse_appload_list(&String::from_utf8_lossy(&o.stdout)), vec![("eink-demo".to_string(), "Eink Demo".to_string())]);
+        let o = sh(&rebase(appload_remove_cmd("koreader", real).unwrap()));
+        assert!(!o.status.success() && root.join("koreader").exists(), "someone else's app must be left alone");
+        let o = sh(&rebase(appload_remove_cmd("eink-demo", real).unwrap()).replace(BASE, &base));
+        assert!(String::from_utf8_lossy(&o.stdout).contains("removed"), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(!root.join("eink-demo").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

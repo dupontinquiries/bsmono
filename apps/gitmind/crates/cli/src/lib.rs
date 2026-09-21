@@ -1393,12 +1393,15 @@ fn iso_now() -> String {
 /// the root filesystem; Oxide/AppLoad get installed or removed).
 fn cmd_eink(rest: &[String]) -> i32 {
     use cockpit::eink_fleet as ef;
-    const USAGE: &str = "usage: gitmind eink <enroll|probe|deploy|stop|status|activate|retrust> <host> ...\n  \
+    const USAGE: &str = "usage: gitmind eink <enroll|probe|build|deploy|list|remove|stop|status|activate|retrust> <host> ...\n  \
+        build <host> <bin>                  build an eink-kit app of this checkout for that tablet's route\n  \
+        list <host>                         apps gitmind put in the tablet's AppLoad sidebar\n  \
+        remove <host> <app>                 take one out again (never touches other apps)\n  \
         activate <host>                     after a reboot: start xovi or the launcher, whichever is needed\n  \
         retrust <host>                      accept the tablet's NEW host key (after an OS update)\n  \
         enroll <host>                       first contact: password (GITMIND_RM_PASSWORD or stdin) → key\n  \
         probe <host>                        model, display servers, route\n  \
-        deploy <host> <bin> [--name N] [--profile fast-color|fast-mono|quality] [-- args...]\n  \
+        deploy <host> <bin> [--name N] [--title T] [--icon PNG] [--windowed] [--profile P] [-- args...]\n  \
         stop <host> <app>\n  \
         status <host> <app>";
     let sub = match rest.first() { Some(s) => s.as_str(), None => return err(USAGE) };
@@ -1469,13 +1472,22 @@ fn cmd_eink(rest: &[String]) -> i32 {
             if let (ef::Route::Blight, Some(a)) = (&route, activation) {
                 return err(&format!("the tablet needs `{}` since its last boot: run `gitmind eink activate {host}`", a.label()));
             }
+            if let Err(e) = ef::preflight_binary(bin, &route, probe.model) {
+                return err(&format!("not deployed: {e}"));
+            }
             let profile = match opt(flags, "--profile") {
                 Some(p) => match ef::RefreshProfile::parse(p) { Some(p) => p, None => return err("--profile: fast-color|fast-mono|quality") },
                 None => ef::RefreshProfile::fastest(probe.model.map(|m| m.panel()).unwrap_or(ef::Panel::Mono)),
             };
             let args: Vec<&str> = app_args.iter().map(String::as_str).collect();
             let env = ef::LaunchEnv { profile, model: probe.model, blight_lib: displays.blight_lib.clone() };
-            match ef::deliver(&mut remote, &route, &name, bin, &env, &args, &mut |ev| eprintln!("  · {ev:?}")) {
+            let opts = ef::AppLoadOptions {
+                display_name: opt(flags, "--title").map(str::to_string).unwrap_or_else(|| name.clone()),
+                fullscreen: !flags.iter().any(|f| f == "--windowed"),
+                args: app_args.clone(),
+            };
+            let icon = opt(flags, "--icon");
+            match ef::deliver(&mut remote, &route, &name, bin, &env, &args, Some((&opts, icon)), &mut |ev| eprintln!("  · {ev:?}")) {
                 Ok(ef::Delivered::Launched(ef::Outcome::Running { pid })) => {
                     println!("{name} running on {host} (pid {pid}, {})", profile.as_env());
                     0
@@ -1485,13 +1497,60 @@ fn cmd_eink(rest: &[String]) -> i32 {
                     1
                 }
                 Ok(ef::Delivered::Registered { manifest_dir }) => {
-                    println!("{name} installed for AppLoad ({manifest_dir}); open AppLoad on the tablet and tap it");
+                    println!("{name} installed for AppLoad ({manifest_dir}); on the tablet open AppLoad from the sidebar and tap ↻ once");
                     if activation.is_some() {
                         println!("  (xovi is not running since the last boot: `gitmind eink activate {host}` first)");
                     }
                     0
                 }
                 Err(e) => err(&e),
+            }
+        }
+        "build" => {
+            let Some(bin) = pos.first() else { return err(USAGE) };
+            let (probe, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return err(&e) };
+            let (route, _) = match d.readiness() { Ok(r) => r, Err(e) => return err(&e) };
+            let root = cockpit::ops::repo_root();
+            let Some(app) = ef::discover_tablet_apps(&root).into_iter().find(|a| a.bin == **bin) else {
+                return err(&format!("{bin}: not an eink-kit app in {}", root.display()));
+            };
+            let t = ef::build_target(&route, probe.model);
+            let native = ef::native_for(&t);
+            let (argv, env) = ef::tablet_build_cmd(bin, &t, std::env::var("RUSTFLAGS").ok().as_deref(), native);
+            eprintln!("  $ {}  (in {}; {})", argv.join(" "), app.dir.display(), t.why);
+            let st = std::process::Command::new(&argv[0]).args(&argv[1..]).current_dir(&app.dir).envs(env).status();
+            match st {
+                Ok(s) if s.success() => {}
+                Ok(s) => return err(&format!("build failed ({s})")),
+                Err(e) => return err(&format!("cargo: {e}")),
+            }
+            let rel = ef::tablet_build_output(bin, &t, native);
+            let Some(path) = app.dir.ancestors().map(|d| d.join(&rel)).find(|p| p.exists()) else {
+                return err(&format!("built, but {rel} not found"));
+            };
+            let path = path.to_string_lossy().to_string();
+            match ef::preflight_binary(&path, &route, probe.model) {
+                Ok(_) => { println!("{path}"); 0 }
+                Err(e) => err(&format!("built, but it will not run on the tablet: {e}")),
+            }
+        }
+        "list" | "remove" => {
+            let (_, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return err(&e) };
+            let Some(dir) = d.appload_dir else { return err("AppLoad is not installed on this tablet") };
+            if sub == "list" {
+                match ef::appload_list_cmd(&dir).and_then(|c| ef::Remote::run(&mut remote, &c)) {
+                    Ok(out) => {
+                        for (n, t) in ef::parse_appload_list(&out) { println!("{n}\t{t}"); }
+                        0
+                    }
+                    Err(e) => err(&e),
+                }
+            } else {
+                let Some(app) = pos.first() else { return err(USAGE) };
+                match ef::appload_remove_cmd(app, &dir).and_then(|c| ef::Remote::run(&mut remote, &c)) {
+                    Ok(out) => { println!("{}", out.trim()); 0 }
+                    Err(e) => err(&e),
+                }
             }
         }
         "activate" => {

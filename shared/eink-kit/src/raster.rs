@@ -285,9 +285,8 @@ const SUB: i64 = 256;
 /// showed through (a white speck on eink-demo's red swatch).
 #[derive(Clone, Copy)]
 struct Edge {
-    /// ∂E/∂x and ∂E/∂y per whole pixel (already × SUB).
+    /// ∂E/∂x per whole pixel (already × SUB); rows restart from `at`.
     step_x: i64,
-    step_y: i64,
     /// Coefficients before scaling, for the tie-break.
     a: i64,
     b: i64,
@@ -300,7 +299,7 @@ struct Edge {
 impl Edge {
     fn new(p: [i64; 2], q: [i64; 2]) -> Edge {
         let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
-        Edge { step_x: -dy * SUB, step_y: dx * SUB, a: -dy, b: dx, ax: p[0], ay: p[1], dx, dy }
+        Edge { step_x: -dy * SUB, a: -dy, b: dx, ax: p[0], ay: p[1], dx, dy }
     }
     /// Value at a fixed-point position.
     #[inline]

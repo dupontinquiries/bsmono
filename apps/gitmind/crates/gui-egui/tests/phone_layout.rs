@@ -108,6 +108,14 @@ fn the_populated_tablets_page_fits_a_phone() {
     app.tablets.confirm = Some(gitmind_egui::pages::tablets::Confirm::Activate(ef::Activation::StartXovi));
     *app.tablets.found.lock().unwrap() = Some((probe, displays));
     app.tablets.bin_path = "/home/user/build/aarch64-unknown-linux-gnu/release/eink-demo".into();
+    // AppLoad route shows the sidebar options; a populated installed list
+    // with a pending remove confirmation is the widest state of that part.
+    *app.tablets.installed.lock().unwrap() = vec![
+        ("eink-demo".into(), "eink demo".into()),
+        ("tomescope-eink".into(), "A rather long sidebar title for a reader".into()),
+    ];
+    app.tablets.remove_confirm = Some("tomescope-eink".into());
+    app.tablets.display_name = "eink demo".into();
     app.tablets.last_result = "eink-demo exited right after launch:\neink: model PaperPro (EINK_MODEL=rmpp)\n\
         eink-demo: libblight_protocol not found (tried [\"libblight_protocol.so\"]; is Oxide installed? set EINK_BLIGHT_LIB)".into();
     let r = layout_probe::probe(egui::vec2(PHONE[0], PHONE[1]), 3, true, |ctx| app.ui(ctx));
