@@ -34,6 +34,8 @@ pub enum BarWidget {
     Switcher,
     /// Soaks up spare height, pushing later widgets down.
     Spacer,
+    /// Opens the shell settings sheet (layout, bar editor).
+    Settings,
 }
 
 impl BarWidget {
@@ -49,6 +51,7 @@ impl BarWidget {
             BarWidget::Hatch => "hatch".into(),
             BarWidget::Switcher => "switcher".into(),
             BarWidget::Spacer => "spacer".into(),
+            BarWidget::Settings => "settings".into(),
         }
     }
 
@@ -65,6 +68,7 @@ impl BarWidget {
             ("hatch", None) => BarWidget::Hatch,
             ("switcher", None) => BarWidget::Switcher,
             ("spacer", None) => BarWidget::Spacer,
+            ("settings", None) => BarWidget::Settings,
             ("toggle", Some(a)) => BarWidget::Toggle(QuickKind::from_token(a).ok_or_else(|| format!("unknown toggle '{a}'"))?),
             ("slider", Some(a)) => BarWidget::Slider(SliderKind::from_token(a).ok_or_else(|| format!("unknown slider '{a}'"))?),
             // Desktop ids may contain ':'? They may not (spec: [A-Za-z0-9-_.]),
@@ -86,10 +90,10 @@ impl BarWidget {
             BarWidget::Clock => Some(2),
             BarWidget::Battery => Some(1),
             BarWidget::Toggle(_) => Some(1),
-            BarWidget::Slider(_) => Some(4),
+            BarWidget::Slider(_) => Some(3),
             BarWidget::App(_) => Some(1),
             BarWidget::Favorites(n) => Some(*n as u32),
-            BarWidget::Hatch | BarWidget::Switcher => Some(1),
+            BarWidget::Hatch | BarWidget::Switcher | BarWidget::Settings => Some(1),
             BarWidget::Running | BarWidget::Spacer => None,
         }
     }
@@ -104,7 +108,7 @@ impl BarWidget {
 }
 
 pub const DEFAULT_WIDGETS: &str =
-    "clock,battery,toggle:wifi,toggle:bluetooth,slider:brightness,spacer,running,favorites:3,hatch";
+    "clock,battery,toggle:wifi,toggle:bluetooth,slider:brightness,spacer,running,favorites:2,hatch,settings";
 
 /// Parse a widget list. Returns what parsed plus one message per bad token.
 pub fn parse_widgets(s: &str) -> (Vec<BarWidget>, Vec<String>) {
@@ -208,7 +212,7 @@ pub fn remove_widget(ws: &mut Vec<BarWidget>, at: usize) {
 
 /// The palette a settings editor offers for "add widget".
 pub fn catalog() -> Vec<BarWidget> {
-    let mut v = vec![BarWidget::Clock, BarWidget::Battery, BarWidget::Running, BarWidget::Hatch, BarWidget::Switcher, BarWidget::Spacer, BarWidget::Favorites(4)];
+    let mut v = vec![BarWidget::Clock, BarWidget::Battery, BarWidget::Running, BarWidget::Hatch, BarWidget::Switcher, BarWidget::Spacer, BarWidget::Settings, BarWidget::Favorites(4)];
     v.extend(QuickKind::ALL.into_iter().map(BarWidget::Toggle));
     v.push(BarWidget::Slider(SliderKind::Brightness));
     v.push(BarWidget::Slider(SliderKind::Volume));
@@ -258,16 +262,27 @@ mod tests {
 
     #[test]
     fn overflow_preserves_order_and_keeps_flex_floor() {
-        // 2 + 4 + 4 fixed = 10 units, but only 8 fit after running's 2-unit floor.
+        // 9 units tall; running's 2-unit floor leaves 7 for fixed widgets.
         let (ws, _) = parse_widgets("clock,slider:brightness,running,slider:volume,battery");
-        let l = layout(&ws, 800.0, 80.0);
-        // clock(2)+slider(4) = 6 of 8 usable; slider:volume (4) does not fit, so
-        // it AND the later battery (which would) overflow, in order.
+        let l = layout(&ws, 720.0, 80.0);
+        // clock(2)+slider(3) = 5 of 7; slider:volume (3) does not fit, so it
+        // AND the later battery (which would, at 1) overflow, in order.
         assert_eq!(l.overflow, vec![3, 4]);
         let running = l.placed.iter().find(|p| p.index == 2).unwrap();
         assert!(running.h >= 160.0, "running kept its floor: {}", running.h);
         let total: f32 = l.placed.iter().map(|p| p.h).sum();
         assert!(total <= 800.0 + 0.5, "never taller than the bar: {total}");
+    }
+
+    #[test]
+    fn default_bar_fits_a_small_phone() {
+        // 900 px logical is a small phone (FP5 at 2.5x is 1080). The defaults
+        // end with hatch + settings, the two a user can least afford to lose
+        // to overflow — the simulator showed exactly that happening once.
+        let (ws, _) = parse_widgets(DEFAULT_WIDGETS);
+        let l = layout(&ws, 900.0 - 28.0, 60.0);
+        assert!(l.overflow.is_empty(), "overflow: {:?}", l.overflow);
+        assert_eq!(l.placed.len(), ws.len());
     }
 
     #[test]

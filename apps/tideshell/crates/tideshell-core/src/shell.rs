@@ -85,6 +85,12 @@ impl Shell {
         self.trace.push_back(format!("{:>7} {}", self.now, msg.into()));
     }
 
+    /// Record something from outside the engine (a transport's outcome), so
+    /// the trace shows the whole loop: gesture -> action -> what happened.
+    pub fn note(&mut self, msg: impl Into<String>) {
+        self.log(msg);
+    }
+
     fn emit(&mut self, actions: Vec<Action>) -> Vec<Action> {
         for a in &actions {
             self.log(format!("-> {a:?}"));
