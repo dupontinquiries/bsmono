@@ -58,6 +58,7 @@ pub mod mix_assistant;
 pub mod multicam_cut;
 pub mod relink;
 pub mod transcripts;
+pub mod overview;
 pub mod touchup_job;
 pub mod mixer_panel;
 pub mod morph_pad;
@@ -3208,6 +3209,9 @@ pub struct App {
     /// loses what the previous filter hid.
     words_raw: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
     word_filter: studio_voice::WordFilter,
+    /// Structure view: sections across, lanes down, instead of one row per
+    /// track. View state, per session — a way of looking, like zoom.
+    structure_view: bool,
     /// The camera group the program monitor is showing as a grid, if any.
     multiview: Option<studio_core::GroupId>,
     /// A stabilize/clean-plate render in flight, and the clip it belongs to.
@@ -3416,6 +3420,7 @@ impl Default for App {
               words: beside.words.clone(),
               words_raw: beside.words,
               word_filter: studio_voice::WordFilter::All,
+              structure_view: false,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
               upscale_clip: None,
@@ -3778,6 +3783,13 @@ impl eframe::App for App {
                     if groups.is_empty() {
                         ui.colored_label(egui::Color32::GRAY,
                             "no camera group yet — group the angles of one moment first");
+                    }
+                    ui.separator();
+                    if ui.add(egui::Button::selectable(self.structure_view, "structure view (whole project)"))
+                        .on_hover_text("sections across, lanes down — for projects too big to read track by track")
+                        .clicked() {
+                        self.structure_view = !self.structure_view;
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("show transcripts under clips…")
@@ -5112,11 +5124,30 @@ impl eframe::App for App {
                 Panel::Program => {
                     edge = Some(program_panel::show(ui, &mut self.studio, &colors, playhead_col));
                 }
-                Panel::Timeline => {
+                Panel::Timeline => 'timeline: {
                     // The inspector sits above the arrangement rather than
                     // in a side panel: it is about the thing you just
                     // clicked, so it belongs where your eyes already are,
                     // and it collapses to nothing when nothing is selected.
+                    if self.structure_view {
+                        // The megastructure: the whole project as sections ×
+                        // lanes. Clicking a section drops back to the fine
+                        // timeline at its start — the zoom is a way to find
+                        // where to work, and the work happens in the fine view.
+                        let ov = overview::summarize(&self.studio.session.doc.project, 12);
+                        ui.horizontal(|ui| {
+                            ui.label(format!("structure — {} sections × {} lanes, {} tracks",
+                                ov.sections.len(), ov.lanes.len(), self.studio.session.doc.project.tracks.len()));
+                            if ui.button("back to the timeline").clicked() { self.structure_view = false; }
+                        });
+                        if let Some(t) = overview::show(ui, &ov, self.studio.playhead(), &colors) {
+                            self.studio.seek(t);
+                            self.structure_view = false;
+                        }
+                        // not `return`: that would leave the whole panel closure and
+                        // skip the scroll-edge handling and the workbench below it
+                        break 'timeline;
+                    }
                     clip_inspector::show(ui, &mut self.studio, &colors);
                     let ph = self.studio.playhead();
                     let sel = self.studio.selection.clone();
