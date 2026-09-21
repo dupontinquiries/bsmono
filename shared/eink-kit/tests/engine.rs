@@ -129,3 +129,50 @@ fn a_full_refresh_request_from_the_app_reaches_the_panel() {
     assert_eq!(u.len(), 1);
     assert_eq!(u[0].waveform, Waveform::Full);
 }
+
+/// As `run()` does: render when wanted, tick, then sleep to next_wake.
+fn drive_like_run(e: &mut Engine, app: &mut Counter, p: &mut MemPresent, from: u64, to: u64) {
+    let mut t = from;
+    while t < to {
+        if e.wants_frame(ms(t)) { e.frame(ms(t), app, p).unwrap(); }
+        e.tick(ms(t), p).unwrap();
+        if e.wants_frame(ms(t)) { continue; }
+        match e.next_wake() { Some(w) => t = (w.as_millis() as u64).max(t + 1), None => break }
+    }
+}
+
+/// The Paper Pro incident: a hand resting on the screen for a long time
+/// (AppLoad re-sends stationary points as PRESS and never sends a release)
+/// left every button dead. Both cases must recover, and the palm must never
+/// click what it rested on.
+#[test]
+fn a_resting_palm_never_blocks_the_ui_or_clicks_what_it_covers() {
+    let mut p = MemPresent::new(702, 936, PixelFormat::Rgb565, true, true);
+    let mut e = Engine::new(&cfg(), p.caps(), "mem");
+    let mut app = Counter { taps: 0, button: egui::Rect::NOTHING };
+    drive_like_run(&mut e, &mut app, &mut p, 0, 500);
+    let (bx, by) = button_centre(&app);
+
+    // 1. palm lands ON the button and rests; AppLoad re-sends it as PRESS
+    e.push_touch(ms(1000), &TouchEvent { id: 50, phase: Phase::Start, x: bx, y: by });
+    for i in 1..6 {
+        e.push_touch(ms(1000 + i * 100), &TouchEvent { id: 50, phase: Phase::Start, x: bx, y: by });
+        drive_like_run(&mut e, &mut app, &mut p, 1000 + i * 100, 1000 + i * 100 + 50);
+    }
+    // ...a finger taps the button while the palm is still down
+    e.push_touch(ms(1700), &TouchEvent { id: 51, phase: Phase::Start, x: bx + 4.0, y: by });
+    drive_like_run(&mut e, &mut app, &mut p, 1700, 1760);
+    e.push_touch(ms(1760), &TouchEvent { id: 51, phase: Phase::End, x: bx + 4.0, y: by });
+    drive_like_run(&mut e, &mut app, &mut p, 1760, 1900);
+    assert_eq!(app.taps, 1, "the finger's tap counts; the palm did not click on its way out");
+
+    // 2. the palm is never released: the loop must wake by itself and let it go
+    drive_like_run(&mut e, &mut app, &mut p, 1900, 9000);
+    assert!(!e.touch_debug_any_down(), "palm still held after 7 s of silence");
+    // ...and a later tap works
+    e.push_touch(ms(10_000), &TouchEvent { id: 52, phase: Phase::Start, x: bx, y: by });
+    drive_like_run(&mut e, &mut app, &mut p, 10_000, 10_060);
+    e.push_touch(ms(10_060), &TouchEvent { id: 52, phase: Phase::End, x: bx, y: by });
+    drive_like_run(&mut e, &mut app, &mut p, 10_060, 10_300);
+    assert_eq!(app.taps, 2, "UI dead after a resting palm");
+}

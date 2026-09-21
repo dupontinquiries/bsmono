@@ -23,6 +23,7 @@
 //! coordinates to make finding the right flags a one-minute job.
 
 use egui::{Event, Modifiers, PointerButton, Pos2, TouchDeviceId, TouchId, TouchPhase};
+use std::time::Duration;
 
 pub const EV_SYN: u16 = 0x00;
 pub const EV_ABS: u16 = 0x03;
@@ -272,13 +273,42 @@ impl PenDecoder {
     }
 }
 
-/// Touch → egui, with pointer emulation for the first finger.
+/// A contact released after this long with no event at all. A resting palm
+/// goes silent; so does a touch whose release was never delivered.
+pub const STUCK_TIMEOUT: Duration = Duration::from_millis(2500);
+/// A pointer-holding contact still for this long yields the pointer to a new
+/// contact (palm resting, finger drawing).
+pub const HANDOVER_STILL: Duration = Duration::from_millis(400);
+/// Where a pointer is moved before an involuntary release, so the release
+/// can never be a click on whatever was under the contact.
+const FAR: Pos2 = Pos2::new(-100_000.0, -100_000.0);
+
+#[derive(Debug, Clone, Copy)]
+struct Contact {
+    id: u32,
+    last_event: Duration,
+    last_move: Duration,
+}
+
+/// Touch → egui, with pointer emulation for one contact at a time.
+///
+/// Hardened against what AppLoad actually forwards (rm-appload
+/// FBController::touchEvent, seen on a Paper Pro with a resting hand):
+/// * a STATIONARY point is forwarded as a PRESS, re-sent whenever any other
+///   point moves: a PRESS for a contact already down is treated as a move;
+/// * cancelled / ungrabbed touches produce no RELEASE: a contact silent for
+///   [`STUCK_TIMEOUT`] is released (see [`TouchToEgui::expire`]);
+/// * an UPDATE may arrive for a contact never pressed: treated as a start.
+///
+/// And for multi-hand use: the pen always takes the pointer; a finger takes
+/// it from a contact that has been still for [`HANDOVER_STILL`] (a resting
+/// palm). Every involuntary release moves the pointer far away first, so it
+/// never clicks what was under the palm.
 #[derive(Default)]
 pub struct TouchToEgui {
     primary: Option<u32>,
     last_pos: Pos2,
-    /// Fingers currently down.
-    down: Vec<u32>,
+    down: Vec<Contact>,
 }
 
 impl TouchToEgui {
@@ -286,39 +316,92 @@ impl TouchToEgui {
         !self.down.is_empty()
     }
 
-    /// `ppp` converts panel pixels to egui points.
-    pub fn translate(&mut self, t: &TouchEvent, ppp: f32, out: &mut Vec<Event>) {
+    /// When the next stuck contact would be released, if any are down.
+    pub fn next_expiry(&self) -> Option<Duration> {
+        self.down.iter().map(|c| c.last_event + STUCK_TIMEOUT).min()
+    }
+
+    /// Release contacts silent for [`STUCK_TIMEOUT`]. Returns whether any were.
+    pub fn expire(&mut self, now: Duration, out: &mut Vec<Event>) -> bool {
+        let stale: Vec<u32> = self.down.iter().filter(|c| now.saturating_sub(c.last_event) >= STUCK_TIMEOUT).map(|c| c.id).collect();
+        for id in &stale {
+            out.push(Event::Touch { device_id: TouchDeviceId(0), id: TouchId(*id as u64), phase: TouchPhase::Cancel, pos: FAR, force: None });
+            self.down.retain(|c| c.id != *id);
+            if self.primary == Some(*id) {
+                self.cancel_pointer(out);
+            }
+        }
+        !stale.is_empty()
+    }
+
+    /// Let go of the pointer without a click.
+    fn cancel_pointer(&mut self, out: &mut Vec<Event>) {
+        out.push(Event::PointerMoved(FAR));
+        out.push(Event::PointerButton { pos: FAR, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+        out.push(Event::PointerGone);
+        self.primary = None;
+    }
+
+    fn take_pointer(&mut self, id: u32, pos: Pos2, out: &mut Vec<Event>) {
+        self.primary = Some(id);
+        self.last_pos = pos;
+        out.push(Event::PointerMoved(pos));
+        out.push(Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    }
+
+    /// `ppp` converts panel pixels to egui points; `now` is the engine clock.
+    pub fn translate(&mut self, t: &TouchEvent, ppp: f32, now: Duration, out: &mut Vec<Event>) {
         let pos = Pos2::new(t.x / ppp, t.y / ppp);
-        let phase = match t.phase {
+        let known = self.down.iter().any(|c| c.id == t.id);
+        // Normalise AppLoad's forwarding: a PRESS for a known contact is a
+        // stationary re-send (a move); a MOVE for an unknown one is a start.
+        let phase = match (t.phase, known) {
+            (Phase::Start, true) => Phase::Move,
+            (Phase::Move, false) => Phase::Start,
+            (p, _) => p,
+        };
+        let tphase = match phase {
             Phase::Start => TouchPhase::Start,
             Phase::Move => TouchPhase::Move,
             Phase::End => TouchPhase::End,
         };
-        out.push(Event::Touch { device_id: TouchDeviceId(0), id: TouchId(t.id as u64), phase, pos, force: None });
-        match t.phase {
+        out.push(Event::Touch { device_id: TouchDeviceId(0), id: TouchId(t.id as u64), phase: tphase, pos, force: None });
+        match phase {
             Phase::Start => {
-                if !self.down.contains(&t.id) {
-                    self.down.push(t.id);
-                }
-                if self.primary.is_none() {
-                    self.primary = Some(t.id);
-                    self.last_pos = pos;
-                    out.push(Event::PointerMoved(pos));
-                    out.push(Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+                self.down.push(Contact { id: t.id, last_event: now, last_move: now });
+                let handover = match self.primary {
+                    None => true,
+                    Some(p) if t.id == PEN_ID && p != PEN_ID => true,
+                    Some(p) => p != PEN_ID && self.down.iter().find(|c| c.id == p)
+                        .is_some_and(|c| now.saturating_sub(c.last_move) >= HANDOVER_STILL),
+                };
+                if handover {
+                    if self.primary.is_some() {
+                        self.cancel_pointer(out);
+                    }
+                    self.take_pointer(t.id, pos, out);
                 }
             }
             Phase::Move => {
-                if self.primary == Some(t.id) {
+                let moved = self.primary == Some(t.id) && (pos - self.last_pos).length() > 0.5
+                    || self.primary != Some(t.id);
+                if let Some(c) = self.down.iter_mut().find(|c| c.id == t.id) {
+                    c.last_event = now;
+                    // a stationary re-send (same spot) is not movement
+                    if moved && t.phase == Phase::Move {
+                        c.last_move = now;
+                    }
+                }
+                if self.primary == Some(t.id) && t.phase == Phase::Move {
                     self.last_pos = pos;
                     out.push(Event::PointerMoved(pos));
                 }
             }
             Phase::End => {
-                self.down.retain(|d| *d != t.id);
+                self.down.retain(|c| c.id != t.id);
                 if self.primary == Some(t.id) {
                     self.primary = None;
-                    // Release where the finger last was: an End after
-                    // SYN_DROPPED carries no trustworthy position.
+                    // Release where the contact last was: a real lift.
                     let pos = self.last_pos;
                     out.push(Event::PointerButton { pos, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
                     out.push(Event::PointerGone);
@@ -427,8 +510,8 @@ mod tests {
     fn pen_and_finger_share_the_pointer_first_come_first_served() {
         let mut t = TouchToEgui::default();
         let mut out = vec![];
-        t.translate(&TouchEvent { id: PEN_ID, phase: Phase::Start, x: 100.0, y: 100.0 }, 2.0, &mut out);
-        t.translate(&TouchEvent { id: 0, phase: Phase::Start, x: 900.0, y: 900.0 }, 2.0, &mut out);
+        t.translate(&TouchEvent { id: PEN_ID, phase: Phase::Start, x: 100.0, y: 100.0 }, 2.0, Duration::ZERO, &mut out);
+        t.translate(&TouchEvent { id: 0, phase: Phase::Start, x: 900.0, y: 900.0 }, 2.0, Duration::ZERO, &mut out);
         let moves: Vec<_> = out.iter().filter_map(|e| if let Event::PointerMoved(p) = e { Some(*p) } else { None }).collect();
         assert_eq!(moves, vec![Pos2::new(50.0, 50.0)], "the palm/finger must not steal the pointer from the pen");
     }
@@ -437,17 +520,87 @@ mod tests {
     fn first_finger_drives_the_pointer_and_lift_clears_hover() {
         let mut t = TouchToEgui::default();
         let mut out = vec![];
-        t.translate(&TouchEvent { id: 0, phase: Phase::Start, x: 20.0, y: 40.0 }, 2.0, &mut out);
+        t.translate(&TouchEvent { id: 0, phase: Phase::Start, x: 20.0, y: 40.0 }, 2.0, Duration::ZERO, &mut out);
         assert!(out.contains(&Event::PointerMoved(Pos2::new(10.0, 20.0))));
         assert!(out.iter().any(|e| matches!(e, Event::PointerButton { pressed: true, .. })));
         out.clear();
         // a second finger does not move the pointer
-        t.translate(&TouchEvent { id: 1, phase: Phase::Start, x: 200.0, y: 400.0 }, 2.0, &mut out);
+        t.translate(&TouchEvent { id: 1, phase: Phase::Start, x: 200.0, y: 400.0 }, 2.0, Duration::ZERO, &mut out);
         assert!(!out.iter().any(|e| matches!(e, Event::PointerMoved(_))));
         out.clear();
-        t.translate(&TouchEvent { id: 0, phase: Phase::End, x: 0.0, y: 0.0 }, 2.0, &mut out);
+        t.translate(&TouchEvent { id: 0, phase: Phase::End, x: 0.0, y: 0.0 }, 2.0, Duration::ZERO, &mut out);
         assert!(out.iter().any(|e| matches!(e, Event::PointerButton { pressed: false, pos, .. } if *pos == Pos2::new(10.0, 20.0))));
         assert_eq!(out.last(), Some(&Event::PointerGone));
         assert!(t.any_down(), "finger 1 is still down");
+    }
+
+    fn ms(v: u64) -> Duration { Duration::from_millis(v) }
+    fn ev(id: u32, phase: Phase, x: f32, y: f32) -> TouchEvent { TouchEvent { id, phase, x, y } }
+    fn clicked_at(out: &[Event]) -> Option<Pos2> {
+        out.iter().rev().find_map(|e| match e { Event::PointerButton { pressed: false, pos, .. } => Some(*pos), _ => None })
+    }
+
+    #[test]
+    fn appload_resends_a_resting_palm_as_press_and_that_is_not_a_new_touch() {
+        let mut t = TouchToEgui::default();
+        let mut out = vec![];
+        t.translate(&ev(7, Phase::Start, 100.0, 100.0), 2.0, ms(0), &mut out);
+        out.clear();
+        // palm stationary: AppLoad re-sends it as PRESS each time another point moves
+        for i in 1..5 { t.translate(&ev(7, Phase::Start, 100.0, 100.0), 2.0, ms(i * 50), &mut out); }
+        assert!(!out.iter().any(|e| matches!(e, Event::PointerButton { .. })), "no re-press/release: {out:?}");
+        assert_eq!(t.down.len(), 1);
+    }
+
+    #[test]
+    fn a_lost_release_is_expired_without_a_click() {
+        let mut t = TouchToEgui::default();
+        let mut out = vec![];
+        t.translate(&ev(3, Phase::Start, 200.0, 200.0), 2.0, ms(0), &mut out);
+        assert_eq!(t.next_expiry(), Some(STUCK_TIMEOUT));
+        out.clear();
+        assert!(!t.expire(ms(1000), &mut out));
+        assert!(t.expire(ms(2600), &mut out));
+        assert!(!t.any_down());
+        assert_eq!(clicked_at(&out), Some(FAR), "released far away, never on the widget under it");
+        assert_eq!(out.last(), Some(&Event::PointerGone));
+    }
+
+    #[test]
+    fn a_finger_takes_the_pointer_from_a_resting_palm() {
+        let mut t = TouchToEgui::default();
+        let mut out = vec![];
+        t.translate(&ev(1, Phase::Start, 50.0, 50.0), 2.0, ms(0), &mut out); // palm lands first
+        t.translate(&ev(1, Phase::Start, 50.0, 50.0), 2.0, ms(300), &mut out); // stationary re-send
+        out.clear();
+        t.translate(&ev(2, Phase::Start, 800.0, 800.0), 2.0, ms(600), &mut out); // drawing finger
+        assert_eq!(t.primary, Some(2), "the still palm yields");
+        assert_eq!(clicked_at(&out), Some(FAR), "palm released without a click");
+        assert!(out.contains(&Event::PointerMoved(Pos2::new(400.0, 400.0))));
+        // a moving primary is NOT taken over
+        let mut t2 = TouchToEgui::default();
+        t2.translate(&ev(1, Phase::Start, 50.0, 50.0), 2.0, ms(0), &mut out);
+        t2.translate(&ev(1, Phase::Move, 80.0, 80.0), 2.0, ms(500), &mut out);
+        t2.translate(&ev(2, Phase::Start, 800.0, 800.0), 2.0, ms(600), &mut out);
+        assert_eq!(t2.primary, Some(1));
+    }
+
+    #[test]
+    fn the_pen_always_takes_the_pointer() {
+        let mut t = TouchToEgui::default();
+        let mut out = vec![];
+        t.translate(&ev(1, Phase::Start, 50.0, 50.0), 2.0, ms(0), &mut out);
+        t.translate(&ev(1, Phase::Move, 60.0, 60.0), 2.0, ms(10), &mut out); // palm moving
+        t.translate(&ev(PEN_ID, Phase::Start, 500.0, 500.0), 2.0, ms(20), &mut out);
+        assert_eq!(t.primary, Some(PEN_ID));
+    }
+
+    #[test]
+    fn an_update_for_an_unknown_contact_starts_it() {
+        let mut t = TouchToEgui::default();
+        let mut out = vec![];
+        t.translate(&ev(9, Phase::Move, 10.0, 10.0), 2.0, ms(0), &mut out);
+        assert!(t.any_down());
+        assert!(out.iter().any(|e| matches!(e, Event::PointerButton { pressed: true, .. })));
     }
 }

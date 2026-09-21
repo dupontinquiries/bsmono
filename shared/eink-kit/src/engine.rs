@@ -162,10 +162,18 @@ impl Engine {
     }
 
     pub fn push_touch(&mut self, now: Duration, t: &TouchEvent) {
-        self.touch.translate(t, self.ppp, &mut self.events);
+        if self.trace {
+            eprintln!("eink: t={:>7.3}s touch {:?} id={} ({:.0},{:.0})", now.as_secs_f32(), t.phase, t.id, t.x, t.y);
+        }
+        self.touch.translate(t, self.ppp, now, &mut self.events);
         self.diag.last_touch = Some((t.x, t.y));
         self.last_input = Some(now);
         self.policy.on_input(now);
+    }
+
+    /// Whether any touch contact is considered down (tests, diagnostics).
+    pub fn touch_debug_any_down(&self) -> bool {
+        self.touch.any_down()
     }
 
     pub fn wants_frame(&self, now: Duration) -> bool {
@@ -178,7 +186,8 @@ impl Engine {
         // so the end of motion (and its colour settle) is noticed even if
         // nothing else ever wakes the loop.
         let motion_end = if self.was_moving { self.heat.quiet_deadline() } else { None };
-        [self.repaint_at, self.policy.next_deadline(), motion_end].into_iter().flatten().min()
+        // A contact that never reports its release must still be let go.
+        [self.repaint_at, self.policy.next_deadline(), motion_end, self.touch.next_expiry()].into_iter().flatten().min()
     }
 
     /// Which tiles count as motion right now.
@@ -349,6 +358,10 @@ impl Engine {
 
     /// Timers only: emits the policy's settle refresh when it is due.
     pub fn tick(&mut self, now: Duration, present: &mut dyn Present) -> std::io::Result<Vec<Update>> {
+        // Release silent contacts (a resting palm; a release AppLoad never sent).
+        if self.touch.expire(now, &mut self.events) && self.trace {
+            eprintln!("eink: t={:>7.3}s released silent touch contact(s)", now.as_secs_f32());
+        }
         self.heat.decay(now);
         self.check_motion_end(now);
         let interacting = self.touch.any_down();
