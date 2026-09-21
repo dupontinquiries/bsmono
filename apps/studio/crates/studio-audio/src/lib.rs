@@ -84,6 +84,11 @@ pub struct Peaks {
     pub factor: usize,
     pub levels: Vec<Vec<MinMax>>,
     pub frames: usize,
+    /// The sample rate of the audio these peaks were built from. A waveform
+    /// must read samples at THIS rate, not the rate a project records for the
+    /// source: the cartoon fixture recorded its cameras as 48 kHz over 16 kHz
+    /// audio, and every waveform read the wrong span.
+    pub rate: u32,
 }
 
 /// What happens to a clip's effects after the clip ends.
@@ -296,7 +301,7 @@ impl Peaks {
             }
             levels.push(next);
         }
-        Peaks { base, factor, levels, frames }
+        Peaks { base, factor, levels, frames, rate: audio.sample_rate }
     }
 
     /// Samples covered by one bucket at `level`.
@@ -321,8 +326,13 @@ impl Peaks {
 
     /// Peaks for a span of samples, reduced to `columns` buckets — exactly what
     /// a waveform widget needs for a rectangle `columns` pixels wide.
+    ///
+    /// The scale is the REQUESTED span's, even where it runs past the end of
+    /// the audio: those columns are empty. It used to clamp `to` to the end
+    /// first and spread what was left across every column -- so a clip
+    /// scrolled half off-screen, or longer than its audio, had its waveform
+    /// stretched to fill the width (seen on the cartoon fixture).
     pub fn window(&self, from: usize, to: usize, columns: usize) -> Vec<MinMax> {
-        let (from, to) = (from.min(self.frames), to.min(self.frames));
         if columns == 0 || to <= from { return Vec::new(); }
         let spp = (to - from) as f64 / columns as f64;
         let level = self.for_px(spp);
@@ -331,7 +341,8 @@ impl Peaks {
         (0..columns)
             .map(|c| {
                 let s0 = from + (c as f64 * spp) as usize;
-                let s1 = from + (((c + 1) as f64 * spp) as usize).max(1);
+                if s0 >= self.frames || buckets.is_empty() { return MinMax { min: 0.0, max: 0.0 }; }
+                let s1 = (from + (((c + 1) as f64 * spp) as usize).max(1)).min(self.frames);
                 let b0 = s0 / per;
                 let b1 = ((s1 + per - 1) / per).max(b0 + 1).min(buckets.len());
                 buckets[b0.min(buckets.len().saturating_sub(1))..b1]
@@ -1145,6 +1156,35 @@ pub fn bus_signal(
 pub fn peak_dbfs(samples: &[f32]) -> f32 {
     let peak = samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));
     if peak <= 0.0 { f32::NEG_INFINITY } else { 20.0 * peak.log10() }
+}
+
+#[cfg(test)]
+mod peaks_window_tests {
+    use super::*;
+
+    fn burst_audio() -> SourceAudio {
+        // 2 s at 1 kHz: silence, a loud burst from 0.5 to 0.6 s, silence
+        let mut s = vec![0.0f32; 2000];
+        for v in s.iter_mut().take(600).skip(500) { *v = 0.9; }
+        SourceAudio { sample_rate: 1000, channels: vec![s] }
+    }
+
+    #[test]
+    fn a_window_past_the_end_keeps_its_scale_instead_of_stretching() {
+        let p = Peaks::build(&burst_audio(), 4, 4);
+        assert_eq!(p.rate, 1000, "the peaks know their own rate");
+        // ask for 0..4000 over 400 columns (10 samples a column): the audio ends at column 200
+        let w = p.window(0, 4000, 400);
+        assert_eq!(w.len(), 400);
+        let loud: Vec<usize> = w.iter().enumerate().filter(|(_, m)| m.max > 0.5).map(|(i, _)| i).collect();
+        assert!(loud.iter().all(|c| (49..=61).contains(c)), "the burst stays at 0.5-0.6 s, columns 50-60: {loud:?}");
+        assert!(w[200..].iter().all(|m| m.max == 0.0 && m.min == 0.0), "past the end: empty, not stretched audio");
+        // the same view of the first 2 s agrees column for column
+        let full = p.window(0, 2000, 200);
+        assert_eq!(&w[..200], &full[..], "running past the end changes nothing before it");
+        // entirely past the end: all empty
+        assert!(p.window(3000, 3500, 50).iter().all(|m| m.max == 0.0));
+    }
 }
 
 #[cfg(test)]

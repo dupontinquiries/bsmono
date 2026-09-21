@@ -56,6 +56,8 @@ pub enum ShellVerb {
     /// through the op log would try to send "we are now a different
     /// project" to collaborators of the project being left.
     OpenProject,
+    /// Add a track below the selected clip's track (or at the bottom).
+    AddTrack { video: bool },
     /// Open the native file picker for a project.
     OpenProjectBrowse,
     /// Open the project at this place in `open_project::nearby()`.
@@ -279,6 +281,8 @@ pub enum Ask {
     KaleidoChoice,
     /// Which project to open: the picker, or one found nearby.
     OpenProjectPick,
+    /// Audio or video, for a new track.
+    AddTrackKind,
     /// The live project has unsaved changes: what to do before opening another.
     UnsavedBeforeOpen,
     /// Which bus the scene's stage should drive, then how it answers.
@@ -471,6 +475,7 @@ pub fn root() -> Vec<Choice> {
         c("redo", Some("U"), Then::Do(Act::Key('U'))),
         c("track volume up 3 dB", None, Then::Ask(Ask::TrackGain(3))),
         c("track volume down 3 dB", None, Then::Ask(Ask::TrackGain(-3))),
+        c("add a track below", Some("under the selected clip's track, or at the bottom"), Then::Ask(Ask::AddTrackKind)),
         c("route track to bus", None, Then::Ask(Ask::RouteTrackPick)),
         c("bus volume up 3 dB", None, Then::Ask(Ask::BusGain(3))),
         c("bus volume down 3 dB", None, Then::Ask(Ask::BusGain(-3))),
@@ -733,6 +738,10 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
             label: p.label.into(), hint: Some(p.what.into()),
             then: Then::Do(Act::Shell(ShellVerb::StageBind { bus, preset: i as u8 })),
         }).collect(),
+        Ask::AddTrackKind => vec![
+            Choice { label: "audio track".into(), hint: None, then: Then::Do(Act::Shell(ShellVerb::AddTrack { video: false })) },
+            Choice { label: "video track".into(), hint: None, then: Then::Do(Act::Shell(ShellVerb::AddTrack { video: true })) },
+        ],
         Ask::OpenProjectPick => {
             let mut v = vec![Choice { label: "browse… (file picker)".into(), hint: Some("the desktop's own file dialog".into()),
                 then: Then::Do(Act::Shell(ShellVerb::OpenProjectBrowse)) }];

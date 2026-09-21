@@ -508,7 +508,11 @@ pub fn timeline(
                     Pos2::new(origin.x + view.gutter, r.min.y), r.max));
                 let cols = vis.width().floor() as usize;
                 if cols > 1 && vis.width() > 0.0 {
-                    let rate = doc.project.sources.get(&clip.source).map(|s| s.sample_rate).unwrap_or(48_000);
+                    // the rate the PEAKS were built at, not the one the project
+                    // records for the source -- they can disagree (the cartoon
+                    // fixture recorded 48 kHz over 16 kHz audio)
+                    let rate = if peaks.rate > 0 { peaks.rate }
+                        else { doc.project.sources.get(&clip.source).map(|s| s.sample_rate).unwrap_or(48_000) };
                     // sample range of the VISIBLE part of the clip
                     let skip = Ticks(((vis.min.x - r.min.x) / view.px_per_sec
                         * TICKS_PER_SECOND as f32) as i64);
@@ -550,7 +554,11 @@ pub fn timeline(
                 let name = doc.project.sources.get(&clip.source)
                     .map(|s| s.path.rsplit('/').next().unwrap_or("clip").to_string())
                     .unwrap_or_else(|| "clip".into());
-                painter.text(r.left_top() + Vec2::new(4.0, 3.0), Align2::LEFT_TOP,
+                // pinned to the VISIBLE left edge: drawn at the clip's true edge, a
+                // clip scrolled off the left showed a cut-off fragment of its name
+                // behind the track header
+                let name_x = r.min.x.max(origin.x + view.gutter);
+                painter.text(Pos2::new(name_x, r.min.y) + Vec2::new(4.0, 3.0), Align2::LEFT_TOP,
                              name, FontId::proportional(11.0), colors.text);
             }
         }

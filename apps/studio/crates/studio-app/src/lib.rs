@@ -67,6 +67,7 @@ pub mod comic_job;
 pub mod track_points;
 pub mod wake;
 pub mod open_project;
+pub mod tracks;
 #[cfg(test)]
 mod abundance_tests;
 #[cfg(test)]
@@ -5860,6 +5861,13 @@ impl App {
                 // changes where the view is pointing, and a person who
                 // cannot tell whether an invite went out will send it
                 // twice.
+                palette::ShellVerb::AddTrack { video } => {
+                    let kind = if video { studio_core::TrackKind::Video } else { studio_core::TrackKind::Audio };
+                    let op = tracks::add_below(&self.studio.session.doc.project, self.studio.selection.first().copied(), kind);
+                    let name = if let studio_core::Op::AddTrack { track, .. } = &op { track.name.clone() } else { String::new() };
+                    self.studio.edit(op, "add track");
+                    self.studio.status = format!("added '{name}'{}", if self.studio.selection.is_empty() { " at the bottom" } else { " below the selected clip's track" });
+                }
                 palette::ShellVerb::OpenProject => self.open_palette_at(palette::Ask::OpenProjectPick, "open project"),
                 palette::ShellVerb::OpenProjectBrowse => match open_project::pick() {
                     Some(p) => self.request_open(p),

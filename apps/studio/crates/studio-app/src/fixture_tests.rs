@@ -154,6 +154,14 @@ fn every_fixture_project_opens_and_finds_its_media() {
         for s in proj.sources.values() {
             assert!(!std::path::Path::new(&s.path).is_absolute(), "{}: {} is relative, so it opens anywhere", p.display(), s.path);
             assert!(dir.join(&s.path).exists(), "{}: {} is beside it", p.display(), s.path);
+            // the rate recorded is the rate the audio has: the first fixture
+            // projects wrote 48 kHz over 16 kHz audio, and waveforms read wrong spans
+            if ffmpeg_here() {
+                let out = std::process::Command::new("ffprobe").args(["-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "stream=sample_rate", "-of", "csv=p=0"]).arg(dir.join(&s.path)).output().unwrap();
+                let real: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0);
+                assert_eq!(s.sample_rate, real, "{}: {} records {} Hz, its audio is {real} Hz", p.display(), s.path, s.sample_rate);
+            }
         }
     }
     // the cartoon's markers are its shots, from the truth

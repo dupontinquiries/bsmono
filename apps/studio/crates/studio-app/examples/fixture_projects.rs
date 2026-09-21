@@ -19,6 +19,15 @@ fn probe(p: &Path) -> Ticks {
     studio_video::probe(p).unwrap_or_else(|e| panic!("{}: {e:?}", p.display())).duration
 }
 
+/// The sample rate of a file's first audio stream, as ffprobe reports it. A
+/// project must record the rate the audio really has: the first version of
+/// these projects wrote 48 kHz for everything, and waveforms read wrong spans.
+fn audio_rate(p: &Path) -> u32 {
+    let out = std::process::Command::new("ffprobe").args(["-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=sample_rate", "-of", "csv=p=0"]).arg(p).output().expect("ffprobe");
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or_else(|_| panic!("no audio rate for {}", p.display()))
+}
+
 /// A project with one video track per file (each clip at 0 s, routed to a Mix
 /// bus) and the given markers.
 fn project(name: &str, dir: &Path, files: &[&str], markers: &[(f64, String)]) -> Project {
@@ -30,7 +39,7 @@ fn project(name: &str, dir: &Path, files: &[&str], markers: &[(f64, String)]) ->
         let len = probe(&dir.join(f));
         p.apply(&Op::AddTrack { track: Track { id: TrackId(id), kind: TrackKind::Video,
             name: f.trim_end_matches(".mp4").into(), muted: false, locked: false, gain: 1.0, route: Some(BusId(1)) }, at: i }).unwrap();
-        p.apply(&Op::AddSource { source: Source::file(SourceId(id), f.to_string(), len, 48_000, 1, true) }).unwrap();
+        p.apply(&Op::AddSource { source: Source::file(SourceId(id), f.to_string(), len, audio_rate(&dir.join(f)), 1, true) }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(id), track: TrackId(id), pos: Ticks::ZERO,
             src_in: Ticks::ZERO, len, gain: 1.0, effects: vec![] } }).unwrap();
     }
@@ -54,6 +63,16 @@ fn numbers(text: &str, key: &str) -> Vec<f64> {
 
 fn main() {
     let root = std::path::PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "fixtures".into()));
+
+    // the Fragile Thing cartoon writes its own project; correct the rates it
+    // recorded (without regenerating its media, which would churn the bytes)
+    let fp = root.join("cartoon-fragile/fragile-cartoon.studio");
+    let mut proj = studio_collab::file::SaveFile::decode(&std::fs::read(&fp).unwrap()).unwrap().to_project();
+    for s in proj.sources.values_mut() {
+        let r = audio_rate(&fp.parent().unwrap().join(&s.path));
+        if s.sample_rate != r { println!("  {}: {} Hz -> {r} Hz", s.path, s.sample_rate); s.sample_rate = r; }
+    }
+    write(&proj, &fp);
 
     // the All My Life cartoon: a marker per shot, from the truth
     let d = root.join("cartoon-allmylife");

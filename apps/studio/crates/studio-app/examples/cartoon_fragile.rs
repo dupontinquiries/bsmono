@@ -231,7 +231,9 @@ fn main() {
         let len = Ticks::from_seconds(SCENE - c.roll);
         p.apply(&Op::AddTrack { track: Track { id: TrackId(id), kind: TrackKind::Video, name: c.name.into(), muted: false,
             locked: false, gain: 1.0, route: Some(BusId(1)) }, at: i }).unwrap();
-        p.apply(&Op::AddSource { source: Source::file(SourceId(id), format!("{}.mp4", c.name), len, 48_000, 1, true) }).unwrap();
+        // SR, not 48 kHz: the cameras' audio is encoded at SR, and a wrong rate
+        // here made every waveform read the wrong span of samples
+        p.apply(&Op::AddSource { source: Source::file(SourceId(id), format!("{}.mp4", c.name), len, SR, 1, true) }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(id), track: TrackId(id),
             pos: Ticks::from_seconds(base + c.roll), src_in: Ticks::ZERO, len, gain: 1.0, effects: vec![] } }).unwrap();
     }
