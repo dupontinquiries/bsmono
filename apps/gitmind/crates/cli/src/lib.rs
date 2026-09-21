@@ -1452,12 +1452,12 @@ fn cmd_eink(rest: &[String]) -> i32 {
                     describe(&r.probe, &r.displays);
                     0
                 }
-                Err(e) if e == ef::HOSTKEY_CHANGED => err(&format!("{e}\n  → `gitmind eink retrust {host}`, then enroll again")),
-                Err(e) => err(&e),
+                Err(e) if e == ef::HOSTKEY_CHANGED => eink_err(&format!("{e}\n  → `gitmind eink retrust {host}`, then enroll again")),
+                Err(e) => eink_err(&e),
             }
         }
         "probe" => {
-            let p = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return err(&e) };
+            let p = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
             println!("{host}:");
             describe(&p.0, &p.1);
             0
@@ -1467,16 +1467,16 @@ fn cmd_eink(rest: &[String]) -> i32 {
             let name = opt(flags, "--name").map(str::to_string).unwrap_or_else(|| {
                 std::path::Path::new(bin.as_str()).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
             });
-            let (probe, displays) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return err(&e) };
-            let (route, activation) = match displays.readiness() { Ok(r) => r, Err(e) => return err(&e) };
+            let (probe, displays) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
+            let (route, activation) = match displays.readiness() { Ok(r) => r, Err(e) => return eink_err(&e) };
             if let (ef::Route::Blight, Some(a)) = (&route, activation) {
-                return err(&format!("the tablet needs `{}` since its last boot: run `gitmind eink activate {host}`", a.label()));
+                return eink_err(&format!("the tablet needs `{}` since its last boot: run `gitmind eink activate {host}`", a.label()));
             }
             if let Err(e) = ef::preflight_binary(bin, &route, probe.model) {
-                return err(&format!("not deployed: {e}"));
+                return eink_err(&format!("not deployed: {e}"));
             }
             let profile = match opt(flags, "--profile") {
-                Some(p) => match ef::RefreshProfile::parse(p) { Some(p) => p, None => return err("--profile: fast-color|fast-mono|quality") },
+                Some(p) => match ef::RefreshProfile::parse(p) { Some(p) => p, None => return eink_err("--profile: fast-color|fast-mono|quality") },
                 None => ef::RefreshProfile::fastest(probe.model.map(|m| m.panel()).unwrap_or(ef::Panel::Mono)),
             };
             let args: Vec<&str> = app_args.iter().map(String::as_str).collect();
@@ -1494,6 +1494,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
                 }
                 Ok(ef::Delivered::Launched(ef::Outcome::ExitedEarly { log_tail })) => {
                     eprintln!("{name} exited right after launch. Its last output:\n{log_tail}");
+                    for f in ef::diagnose(&log_tail) { eprint!("\n{}", f.render()); }
                     1
                 }
                 Ok(ef::Delivered::Registered { manifest_dir }) => {
@@ -1503,16 +1504,16 @@ fn cmd_eink(rest: &[String]) -> i32 {
                     }
                     0
                 }
-                Err(e) => err(&e),
+                Err(e) => eink_err(&e),
             }
         }
         "build" => {
             let Some(bin) = pos.first() else { return err(USAGE) };
-            let (probe, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return err(&e) };
-            let (route, _) = match d.readiness() { Ok(r) => r, Err(e) => return err(&e) };
+            let (probe, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
+            let (route, _) = match d.readiness() { Ok(r) => r, Err(e) => return eink_err(&e) };
             let root = cockpit::ops::repo_root();
             let Some(app) = ef::discover_tablet_apps(&root).into_iter().find(|a| a.bin == **bin) else {
-                return err(&format!("{bin}: not an eink-kit app in {}", root.display()));
+                return eink_err(&format!("{bin}: not an eink-kit app in {}", root.display()));
             };
             let t = ef::build_target(&route, probe.model);
             let native = ef::native_for(&t);
@@ -1521,75 +1522,87 @@ fn cmd_eink(rest: &[String]) -> i32 {
             let st = std::process::Command::new(&argv[0]).args(&argv[1..]).current_dir(&app.dir).envs(env).status();
             match st {
                 Ok(s) if s.success() => {}
-                Ok(s) => return err(&format!("build failed ({s})")),
-                Err(e) => return err(&format!("cargo: {e}")),
+                Ok(s) => return eink_err(&format!("build failed ({s})")),
+                Err(e) => return eink_err(&format!("cargo: {e}")),
             }
             let rel = ef::tablet_build_output(bin, &t, native);
             let Some(path) = app.dir.ancestors().map(|d| d.join(&rel)).find(|p| p.exists()) else {
-                return err(&format!("built, but {rel} not found"));
+                return eink_err(&format!("built, but {rel} not found"));
             };
             let path = path.to_string_lossy().to_string();
             match ef::preflight_binary(&path, &route, probe.model) {
                 Ok(_) => { println!("{path}"); 0 }
-                Err(e) => err(&format!("built, but it will not run on the tablet: {e}")),
+                Err(e) => eink_err(&format!("built, but it will not run on the tablet: {e}")),
             }
         }
         "list" | "remove" => {
-            let (_, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return err(&e) };
-            let Some(dir) = d.appload_dir else { return err("AppLoad is not installed on this tablet") };
+            let (_, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
+            let Some(dir) = d.appload_dir else { return eink_err("AppLoad is not installed on this tablet") };
             if sub == "list" {
                 match ef::appload_list_cmd(&dir).and_then(|c| ef::Remote::run(&mut remote, &c)) {
                     Ok(out) => {
                         for (n, t) in ef::parse_appload_list(&out) { println!("{n}\t{t}"); }
                         0
                     }
-                    Err(e) => err(&e),
+                    Err(e) => eink_err(&e),
                 }
             } else {
                 let Some(app) = pos.first() else { return err(USAGE) };
                 match ef::appload_remove_cmd(app, &dir).and_then(|c| ef::Remote::run(&mut remote, &c)) {
                     Ok(out) => { println!("{}", out.trim()); 0 }
-                    Err(e) => err(&e),
+                    Err(e) => eink_err(&e),
                 }
             }
         }
         "activate" => {
-            let (_, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return err(&e) };
+            let (_, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
             match d.readiness() {
                 Ok((_, None)) if d.screen_ready() => { println!("{host}: already active, apps can reach the screen"); 0 }
-                Ok((_, None)) => err("no display server is running and none can be started from here \
+                Ok((_, None)) => eink_err("no display server is running and none can be started from here \
                     (AppLoad without xovi's start script, or no launcher configured)"),
                 Ok((_, Some(a))) => {
                     eprintln!("  · {}", a.label());
                     match ef::Remote::run(&mut remote, &ef::activation_cmd(a)) {
                         Ok(out) => { println!("{}", out.trim()); 0 }
-                        Err(e) => err(&e),
+                        Err(e) => eink_err(&e),
                     }
                 }
-                Err(e) => err(&e),
+                Err(e) => eink_err(&e),
             }
         }
         "retrust" => match cockpit::deploy::retrust_host(&host) {
             Ok(m) => { println!("{m}"); 0 }
-            Err(e) => err(&e),
+            Err(e) => eink_err(&e),
         },
         "stop" | "status" => {
             let Some(app) = pos.first() else { return err(USAGE) };
             let cmd = if sub == "stop" { ef::stop_cmd(app) } else { ef::status_cmd(app, 0) };
-            let cmd = match cmd { Ok(c) => c, Err(e) => return err(&e) };
+            let cmd = match cmd { Ok(c) => c, Err(e) => return eink_err(&e) };
             match cockpit::eink_fleet::Remote::run(&mut remote, &cmd) {
                 Ok(out) if sub == "status" => {
                     let st = ef::parse_status(&out);
                     match st.pid { Some(p) => println!("{app}: running (pid {p})"), None => println!("{app}: stopped") }
                     if !st.log_tail.is_empty() { println!("{}", st.log_tail); }
+                    for f in ef::diagnose(&st.log_tail) { print!("\n{}", f.render()); }
                     0
                 }
                 Ok(_) => { println!("{app}: stopped"); 0 }
-                Err(e) => err(&e),
+                Err(e) => eink_err(&e),
             }
         }
         _ => err(USAGE),
     }
+}
+
+/// An eink error, followed by what gitmind can say about it (stoat's lesson:
+/// a failure is explained, not just reported): rustc-style findings with
+/// notes, help and any fix to copy.
+fn eink_err(msg: &str) -> i32 {
+    let code = err(msg);
+    for f in cockpit::eink_fleet::diagnose(msg) {
+        eprint!("\n{}", f.render());
+    }
+    code
 }
 
 fn remote_probe(remote: &mut cockpit::eink_fleet::SshRemote) -> Result<(cockpit::eink_fleet::Probe, cockpit::eink_fleet::Displays), String> {

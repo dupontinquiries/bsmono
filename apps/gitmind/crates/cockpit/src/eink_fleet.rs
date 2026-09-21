@@ -1267,6 +1267,144 @@ pub fn deliver(
     }
 }
 
+// ───────────────────────── explaining failures ─────────────────────────
+
+/// Turn an error from this module, or an app's log tail, into findings.
+///
+/// The tablet stack produces a known, finite set of failures, and most of
+/// the text that reports them is written in this repo (here and in
+/// eink-kit), so they are recognised by their own wording. Each finding
+/// quotes the line it came from as a note, so a misrecognition is visible.
+/// Unrecognised text yields nothing; callers show it raw.
+pub fn diagnose(text: &str) -> Vec<crate::finding::Finding> {
+    use crate::finding::{Finding, Severity::*};
+    let mut out: Vec<Finding> = Vec::new();
+    let has = |needle: &str| text.contains(needle);
+    let line_of = |needle: &str| text.lines().find(|l| l.contains(needle)).unwrap_or(needle).trim().to_string();
+    let mut add = |f: Finding, needle: &str| {
+        let evidence = line_of(needle);
+        out.push(f.note(format!("from: {evidence}")));
+    };
+
+    // connection and trust
+    if has("host key has changed") {
+        add(Finding::new(Warning, "tablet-hostkey-changed", "the tablet's SSH host key changed since it was trusted")
+            .note("expected after an OS update, which regenerates it; also what an interception looks like")
+            .help("if the tablet was just updated and is on your cable or network: re-trust it (`gitmind eink retrust <host>`), then enrol again"),
+            "host key has changed");
+    }
+    if has("only offers an ssh-rsa host key") || has("no matching host key type found") {
+        add(Finding::new(Error, "tablet-legacy-hostkey", "the tablet only offers an ssh-rsa host key")
+            .note("older reMarkable OS versions; OpenSSH 8.8+ refuses ssh-rsa by default")
+            .help("add the lines below to ~/.ssh/config on this phone")
+            .fix("Host 10.11.99.1\n  HostKeyAlgorithms +ssh-rsa\n  PubkeyAcceptedKeyTypes +ssh-rsa"),
+            "ssh-rsa");
+    }
+    if has("first contact needs the tablet's SSH password") {
+        add(Finding::new(Info, "tablet-needs-password", "first contact needs the tablet's SSH password")
+            .help("on the tablet: Settings → Help → Copyrights and licenses, at the end; developer mode may need enabling first"),
+            "first contact");
+    }
+    if has("key auth still fails") {
+        add(Finding::new(Error, "tablet-key-rejected", "the key was installed but the tablet still refuses it")
+            .help("check /home/root/.ssh/authorized_keys on the tablet contains this phone's key"),
+            "key auth still fails");
+    }
+    for needle in ["timed out", "No route to host", "Connection refused", "Could not resolve", "Name or service not known"] {
+        if has(needle) {
+            add(Finding::new(Error, "tablet-unreachable", "the tablet did not answer on SSH")
+                .help("on a USB cable the tablet is 10.11.99.1; check the cable carries data and the tablet is awake and unlocked")
+                .help("over Wi-Fi, SSH may be off on current OS versions: use USB first"),
+                needle);
+            break;
+        }
+    }
+    if has("Permission denied") && !has("key auth still fails") {
+        add(Finding::new(Error, "tablet-auth", "the tablet refused the login")
+            .help("enrol again: the password from Settings installs this phone's key"),
+            "Permission denied");
+    }
+
+    // the binary
+    if has("built for x86_64") || (has("built for ") && has("the tablet needs")) {
+        add(Finding::new(Error, "tablet-wrong-arch", "that binary is built for a different CPU than the tablet's")
+            .help("build it for the tablet: `gitmind eink build <host> <app>` (or the Build button on the Tablets page)"),
+            "built for");
+    }
+    if has("dynamically linked; the tablet has no musl loader") {
+        add(Finding::new(Error, "tablet-dynamic-musl", "the binary is dynamically linked and the tablet has no musl loader")
+            .note("gitmind's desktop build env makes egui apps dynamic on musl (for winit); tablet builds must not be")
+            .help("rebuild through gitmind's tablet build, which forces +crt-static"),
+            "dynamically linked");
+    }
+    if has("not an ELF executable") {
+        add(Finding::new(Error, "tablet-not-elf", "that file is not a Linux executable").help("point deploy at the built binary, not a script or archive"), "not an ELF");
+    }
+
+    // route and per-boot state
+    if has("no display route") {
+        add(Finding::new(Error, "tablet-no-route", "nothing on the tablet can put an app on its screen")
+            .help("install AppLoad (with xovi) or Oxide via Vellum; reManager can do it from a desktop"),
+            "no display route");
+    }
+    if has("since its last boot") || has("its display server is not running") || has("display server not running") {
+        add(Finding::new(Warning, "tablet-needs-activation", "the tablet needs its once-per-boot step")
+            .note("xovi (AppLoad) and a Vellum launcher (Oxide) do not start by themselves after a reboot")
+            .help("`gitmind eink activate <host>`, or Activate on the Tablets page"),
+            if has("since its last boot") { "since its last boot" } else { "not running" });
+    }
+
+    // the app's own startup messages (eink-kit)
+    if has("no QTFB_KEY") {
+        add(Finding::new(Error, "app-not-from-appload", "the app was started outside AppLoad but asked for a qtfb window")
+            .note("only AppLoad can open a qtfb window: it creates the key the app connects with")
+            .help("open it from AppLoad in the tablet's sidebar"),
+            "no QTFB_KEY");
+    }
+    if has("connect /tmp/qtfb.sock") {
+        add(Finding::new(Error, "app-no-appload", "the app could not reach AppLoad's qtfb socket")
+            .help("start xovi: `gitmind eink activate <host>`"),
+            "qtfb.sock");
+    }
+    if has("qtfb refused window key") {
+        add(Finding::new(Error, "app-qtfb-refused", "AppLoad refused the app's window")
+            .help("close the app in AppLoad and open it again from the sidebar"),
+            "refused window key");
+    }
+    if has("qtfb shm is") {
+        add(Finding::new(Error, "app-wrong-model", "the window size does not match the tablet model the app assumed")
+            .help("`gitmind eink probe <host>` shows the model and how it was identified; redeploy so the manifest carries EINK_MODEL"),
+            "qtfb shm is");
+    }
+    if has("libblight_protocol not found") {
+        add(Finding::new(Error, "app-no-blight", "Oxide's display library is not installed where the app looked")
+            .help("install Oxide via Vellum, or use the AppLoad route"),
+            "libblight_protocol");
+    }
+    if has("GUESS from architecture") {
+        add(Finding::new(Warning, "app-model-guessed", "the app guessed the tablet model from its CPU")
+            .help("redeploy from gitmind so the manifest sets EINK_MODEL; if the probe cannot identify it either, report what /sys/devices/soc0/machine says"),
+            "GUESS from architecture");
+    }
+    if text.lines().any(|l| l.contains("EINK_") && (l.contains("want ") || l.contains("unknown"))) {
+        let l = text.lines().find(|l| l.contains("EINK_") && (l.contains("want ") || l.contains("unknown"))).unwrap_or("").to_string();
+        add(Finding::new(Error, "app-bad-setting", "an EINK_ setting has a value the app does not accept")
+            .help("fix or remove it in the manifest / launch environment"),
+            &l);
+    }
+    if has("panicked at") {
+        add(Finding::new(Error, "app-panic", "the app panicked")
+            .help("the line above is where; send it with the log tail"),
+            "panicked at");
+    }
+    if has("exiting: qtfb socket closed") {
+        add(Finding::new(Info, "app-closed", "AppLoad closed the app's window (a normal exit)"), "qtfb socket closed");
+    }
+
+    out.sort_by_key(|f| match f.severity { Error => 0, Warning => 1, Info => 2, Ok => 3 });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1846,5 +1984,33 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
         assert!(String::from_utf8_lossy(&o.stdout).contains("removed"), "{}", String::from_utf8_lossy(&o.stderr));
         assert!(!root.join("eink-demo").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn diagnose_recognises_this_modules_own_errors() {
+        let hk = diagnose(HOSTKEY_CHANGED);
+        assert_eq!(hk[0].code, "tablet-hostkey-changed");
+        assert!(diagnose(LEGACY_HOSTKEY)[0].fix.as_deref().unwrap().contains("+ssh-rsa"));
+        let pp = build_target(&Route::AppLoad { dir: "/home/root/x".into() }, Some(RmModel::PaperPro));
+        let fake_x86 = { let mut b = vec![0u8; 256]; b[..4].copy_from_slice(b"\x7fELF"); b[4] = 2; b[5] = 1; b[18] = 62; b };
+        let e = check_tablet_binary(&fake_x86, &pp).unwrap_err();
+        assert_eq!(diagnose(&e)[0].code, "tablet-wrong-arch", "{e}");
+        let route = parse_displays("").route().unwrap_err();
+        assert_eq!(diagnose(&route)[0].code, "tablet-no-route");
+        assert!(diagnose("ssh failed: ssh: connect to host 10.11.99.1 port 22: No route to host")[0].code == "tablet-unreachable");
+    }
+
+    #[test]
+    fn diagnose_reads_an_app_log_tail_worst_first_with_evidence() {
+        // eink-kit's own wording (engine.rs / device.rs / present/*.rs)
+        let tail = "eink: model PaperPro (GUESS from architecture (device tree said \"\"); set EINK_MODEL)\n\
+                    eink: EINK_BACKEND=qtfb but no QTFB_KEY: launch from AppLoad\n";
+        let f = diagnose(tail);
+        let codes: Vec<&str> = f.iter().map(|f| f.code.as_str()).collect();
+        assert_eq!(codes, vec!["app-not-from-appload", "app-model-guessed"], "errors first");
+        assert!(f[0].notes.last().unwrap().contains("no QTFB_KEY"), "evidence quoted: {:?}", f[0].notes);
+        assert!(diagnose("blah\nthread 'main' panicked at src/app.rs:10:5:\nboom").iter().any(|f| f.code == "app-panic"));
+        assert!(diagnose("EINK_PROFILE=\"turbo\": want fast-color|fast-mono|quality").iter().any(|f| f.code == "app-bad-setting"));
+        assert!(diagnose("completely unrelated text").is_empty(), "unrecognised text yields nothing");
     }
 }

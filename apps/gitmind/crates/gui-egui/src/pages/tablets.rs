@@ -448,12 +448,25 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     }
     if busy {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
-        uikit_egui::scroll::log(ui, &s.task.log(), 140.0);
+        crate::show::task_log(ui, "tablets", &s.task.log(), 140.0);
     }
     if !s.last_result.is_empty() {
         ui.separator();
-        for line in s.last_result.lines() {
-            ui.label(line);
+        // What went wrong, explained (stoat's lesson): findings first, the
+        // raw text below them, folded once findings have said it.
+        let found = ef::diagnose(&s.last_result);
+        let c = uikit_egui::palette_colors(&app.prefs.palette);
+        crate::show::findings(ui, &c, &found);
+        if found.is_empty() {
+            for line in s.last_result.lines() {
+                ui.add(egui::Label::new(line).wrap());
+            }
+        } else {
+            egui::CollapsingHeader::new("raw output").id_salt("tablets-raw").show(ui, |ui| {
+                for line in s.last_result.lines() {
+                    ui.add(egui::Label::new(egui::RichText::new(line).monospace().small()).wrap());
+                }
+            });
         }
     }
 }
