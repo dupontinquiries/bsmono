@@ -56,6 +56,16 @@ pub enum ShellVerb {
     /// through the op log would try to send "we are now a different
     /// project" to collaborators of the project being left.
     OpenProject,
+    /// Open the native file picker for a project.
+    OpenProjectBrowse,
+    /// Open the project at this place in `open_project::nearby()`.
+    OpenProjectFound(u16),
+    /// With unsaved changes: save, then open the waiting project.
+    OpenSaveThen,
+    /// With unsaved changes: drop them and open the waiting project.
+    OpenDiscard,
+    /// With unsaved changes: stay on this project.
+    OpenCancel,
     /// Collaboration. All shell verbs for the same reason — they change
     /// the TEAM or this device's view, and neither is a `Project` field,
     /// so none of them can be an `Op`.
@@ -267,6 +277,10 @@ pub enum Ask {
     InsertFind,
     /// How many wedges for the kaleidoscope.
     KaleidoChoice,
+    /// Which project to open: the picker, or one found nearby.
+    OpenProjectPick,
+    /// The live project has unsaved changes: what to do before opening another.
+    UnsavedBeforeOpen,
     /// Which bus the scene's stage should drive, then how it answers.
     StageBus,
     /// How strongly to paste the held look.
@@ -404,8 +418,8 @@ pub fn root() -> Vec<Choice> {
         c("control channel from a bus (dummy channel)",
           Some("a silent tap that drives things without being heard"),
           Then::Ask(Ask::ControlTapFrom)),
-        c("open project", Some("switch to another project"),
-          Then::Do(Act::Shell(ShellVerb::OpenProject))),
+        c("open project", Some("the file picker, or a project found nearby"),
+          Then::Ask(Ask::OpenProjectPick)),
         // Collaboration. Grouped together and named with "collaborator"
         // in each label so a fuzzy search for that word finds the whole
         // group — the palette matches on text, so the shared word IS the
@@ -719,6 +733,22 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
             label: p.label.into(), hint: Some(p.what.into()),
             then: Then::Do(Act::Shell(ShellVerb::StageBind { bus, preset: i as u8 })),
         }).collect(),
+        Ask::OpenProjectPick => {
+            let mut v = vec![Choice { label: "browse… (file picker)".into(), hint: Some("the desktop's own file dialog".into()),
+                then: Then::Do(Act::Shell(ShellVerb::OpenProjectBrowse)) }];
+            v.extend(crate::open_project::nearby().iter().enumerate().map(|(i, p)| {
+                let (name, folder) = crate::open_project::label(p);
+                Choice { label: name, hint: Some(folder), then: Then::Do(Act::Shell(ShellVerb::OpenProjectFound(i as u16))) }
+            }));
+            v
+        }
+        Ask::UnsavedBeforeOpen => vec![
+            Choice { label: "save, then open".into(), hint: Some("keeps this project's changes".into()),
+                     then: Then::Do(Act::Shell(ShellVerb::OpenSaveThen)) },
+            Choice { label: "discard changes and open".into(), hint: Some("this project goes back to its last save".into()),
+                     then: Then::Do(Act::Shell(ShellVerb::OpenDiscard)) },
+            Choice { label: "keep working here".into(), hint: None, then: Then::Do(Act::Shell(ShellVerb::OpenCancel)) },
+        ],
         Ask::KaleidoChoice => [
             (0, "off", "back to the plain picture"),
             (2, "mirror (2)", "one fold down the middle"),

@@ -66,6 +66,7 @@ pub mod signals_panel;
 pub mod comic_job;
 pub mod track_points;
 pub mod wake;
+pub mod open_project;
 #[cfg(test)]
 mod abundance_tests;
 #[cfg(test)]
@@ -3261,6 +3262,13 @@ pub struct App {
     /// loses what the previous filter hid.
     words_raw: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
     word_filter: studio_voice::WordFilter,
+    /// The project as it was last opened or saved. "Unsaved changes" means
+    /// the live project differs from it -- the question asked before
+    /// switching to another project, so a switch never loses work and never
+    /// rewrites a file (a demo fixture, say) that was only looked at.
+    saved_project: Option<studio_core::Project>,
+    /// A project waiting to be opened while the unsaved-changes question is asked.
+    open_pending: Option<std::path::PathBuf>,
     /// The track-points window, open over the selected clip's first frame.
     track_points: Option<track_points::Window>,
     /// A finger has touched the screen this session: tool windows grow their
@@ -3336,22 +3344,31 @@ enum SinkContent {
 
 #[cfg(feature = "app")]
 impl Default for App {
-    fn default() -> Self {
+    fn default() -> Self { App::with_project(default_project_path()) }
+}
+
+/// Never `./project.studio` any more: an unnamed project gets its OWN
+/// directory under the projects root (see project_dir's containment rule and
+/// the accident that motivated it). The root is $STUDIO_PROJECTS, else the
+/// last place an archive was written -- a person who archives to an SD card
+/// wants the working copy beside it -- else the freedesktop data directory.
+fn default_project_path() -> std::path::PathBuf {
+    match std::env::var("STUDIO_PROJECT") {
+        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
+        _ => {
+            let root = last_archive_root().unwrap_or_else(project_dir::projects_root);
+            project_dir::project_dir(&root, "untitled").join("project.studio")
+        }
+    }
+}
+
+impl App {
+    /// The shell, opened on `project_path`: the same path a launch with
+    /// STUDIO_PROJECT takes, and what "open project" switches to -- so a
+    /// project opened from the palette is built exactly like one opened at
+    /// start-up, with nothing of the previous project left behind.
+    pub fn with_project(project_path: std::path::PathBuf) -> App {
         let sink = audition::open_sink();
-        // Never `./project.studio` any more: an unnamed project gets its
-        // OWN directory under the projects root (see project_dir's
-        // containment rule and the accident that motivated it). The root
-        // is $STUDIO_PROJECTS, else the last place an archive was written
-        // — a person who archives to an SD card wants the working copy
-        // beside it — else the freedesktop data directory.
-        let project_path = match std::env::var("STUDIO_PROJECT") {
-            Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
-            _ => {
-                let root = last_archive_root()
-                    .unwrap_or_else(project_dir::projects_root);
-                project_dir::project_dir(&root, "untitled").join("project.studio")
-            }
-        };
         // Open the named project when it exists; a demo otherwise. A load
         // FAILURE is neither: overwriting a damaged-but-real file with a
         // demo on the next Ctrl+S would finish what the damage started, so
@@ -3440,7 +3457,7 @@ impl Default for App {
             }));
             rx
         });
-        App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
+        let mut app = App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
             provenance_tx, provenance_rx,
             follow: None,
               carrier, project_path,
@@ -3511,7 +3528,10 @@ impl Default for App {
               upscale_settings: upscale::Settings::default(),
               tune_scale: None,
               analog: Box::new(analog),
-              loaded: SinkContent::Nothing, silent_clock: None }
+              loaded: SinkContent::Nothing, silent_clock: None, saved_project: None, open_pending: None };
+        // the project as opened: "unsaved changes" means different from this
+        app.saved_project = Some(app.studio.session.doc.project.clone());
+        app
     }
 }
 
@@ -3926,74 +3946,7 @@ impl eframe::App for App {
                 if ui.button("save").clicked()
                     || ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S))
                 {
-                    let path = self.project_path.clone();
-                    workspace::save(&path, &workspace::WorkspaceState {
-                        library_audio: self.library_roots.audio.display().to_string(),
-                        library_video: self.library_roots.video.as_ref()
-                            .map(|p| p.display().to_string()).unwrap_or_default(),
-                        combined: self.studio.combined,
-                        panel: self.studio.panel.label().to_string(),
-                        side_slot: match self.side_slot {
-                            SideSlot::Off => "off", SideSlot::Viewport => "viewport",
-                            SideSlot::Mixer => "mixer", SideSlot::Rack => "rack",
-                            SideSlot::Program => "program",
-                        }.to_string(),
-                        px_per_sec: self.studio.current_view().px_per_sec,
-                        scroll_ticks: self.studio.current_view().scroll.0,
-                        closed_groups: self.studio.closed_groups.iter()
-                            .map(|g| g.0).collect(),
-                        bounce_format: self.bounce_format.token().to_string(),
-                        voice_domains: self.lexicon.to_tokens(),
-                        pinned: self.library_prefs.pinned.iter()
-                            .map(|p| p.display().to_string()).collect(),
-                        demoted: self.library_prefs.demoted.iter()
-                            .map(|p| p.display().to_string()).collect(),
-                        library_open: self.library_open,
-                        display_name: self.studio.display_name.clone(),
-                        rebinds: self.rebinds.encode(),
-                        piano_zones: self.zones.encode(),
-                        overlap: self.studio.overlap.name().to_string(),
-                        overlap_tracks: self.studio.overlap_tracks.iter()
-                            .map(|(t, p)| format!("{}:{}", t.0, p.name())).collect::<Vec<_>>().join(","),
-                    });
-                    // The directory must exist (and be ours) BEFORE the
-                    // file is written: a save into a fresh project root
-                    // otherwise fails on the open, and a save into
-                    // someone's source tree must fail here rather than
-                    // after leaving a file in it.
-                    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                        if let Err(e) = project_dir::ensure_project_dir(dir) {
-                            self.studio.status = e;
-                            return;
-                        }
-                    }
-                    if self.studio.save_to(&path).is_ok() {
-                        // The save happened; history is the extra. A missing
-                        // git binary demotes to a note, never a lost save.
-                        let dir = path.parent()
-                            .filter(|p| !p.as_os_str().is_empty())
-                            .map(|p| p.to_path_buf())
-                            .unwrap_or_else(|| std::path::PathBuf::from("."));
-                        let p = &self.studio.session.doc.project;
-                        let meta = project_dir::Meta {
-                            name: p.name.clone(),
-                            bpm: self.studio.rack.tempo_bpm,
-                            tracks: p.tracks.len(),
-                            clips: p.clips.len(),
-                            busses: p.busses.len(),
-                            patterns: self.studio.rack.patterns.len(),
-                            channels: self.studio.rack.channels.len(),
-                        };
-                        match project_dir::save_versioned(
-                            &dir, &meta, project_dir::MediaMode::Committed, "save") {
-                            Ok(Some(id)) => self.studio.status =
-                                format!("{} — commit {id}", self.studio.status),
-                            Ok(None) => {}
-                            Err(e) => self.studio.status =
-                                format!("{} (history skipped: {})",
-                                        self.studio.status, e.lines().next().unwrap_or("git error")),
-                        }
-                    }
+                    let _ = self.save_project();
                 }
                 let mut combined = self.studio.combined;
                 if ui.add(egui::Button::selectable(combined, "workbench"))
@@ -5902,14 +5855,30 @@ impl App {
                 // changes where the view is pointing, and a person who
                 // cannot tell whether an invite went out will send it
                 // twice.
-                palette::ShellVerb::OpenProject => {
-                    // Deliberately NOT loading here. Choosing a project
-                    // is a file-picker step and the palette's own model
-                    // has a shape for that — `Then::Ask` — which this
-                    // verb does not use yet. Saying so beats loading
-                    // some guessed path over unsaved work.
-                    self.studio.status =
-                        "open project: needs a picker step (C90c)".into();
+                palette::ShellVerb::OpenProject => self.open_palette_at(palette::Ask::OpenProjectPick, "open project"),
+                palette::ShellVerb::OpenProjectBrowse => match open_project::pick() {
+                    Some(p) => self.request_open(p),
+                    None => {
+                        // cancelled, or no portal on this desktop: the two look the
+                        // same from here, so offer the list either way
+                        self.open_palette_at(palette::Ask::OpenProjectPick, "open project");
+                        self.studio.status = "no project chosen (or no file picker on this desktop) — here are the ones found nearby".into();
+                    }
+                },
+                palette::ShellVerb::OpenProjectFound(i) => match open_project::nearby().get(i as usize).cloned() {
+                    Some(p) => self.request_open(p),
+                    None => self.studio.status = "that project is no longer where it was — open the list again".into(),
+                },
+                palette::ShellVerb::OpenSaveThen => if let Some(p) = self.open_pending.take() {
+                    match self.save_project() {
+                        Ok(()) => self.switch_to(p),
+                        Err(e) => self.studio.status = format!("could not save, so staying on this project: {e}"),
+                    }
+                },
+                palette::ShellVerb::OpenDiscard => if let Some(p) = self.open_pending.take() { self.switch_to(p) },
+                palette::ShellVerb::OpenCancel => {
+                    self.open_pending = None;
+                    self.studio.status = "kept working on this project".into();
                 }
                 palette::ShellVerb::CollabInvite => {
                     // The roster is what an invite would grow, and it is
@@ -7341,6 +7310,128 @@ impl App {
             }
         }
         self.comic_setup = Some(comic_job::SetupWindow::new(group, frames));
+    }
+
+    /// Open the palette straight at one of its questions.
+    fn open_palette_at(&mut self, ask: palette::Ask, crumb: &str) {
+        self.palette = Some(palette::Palette { pending: Some(ask), path: vec![crumb.to_string()], ..Default::default() });
+    }
+
+    /// Open `path`, asking first if the live project has unsaved changes.
+    fn request_open(&mut self, path: std::path::PathBuf) {
+        if !open_project::is_project(&path) || !path.is_file() {
+            self.studio.status = format!("not a Studio project: {}", path.display());
+            return;
+        }
+        // Load it once BEFORE leaving this project. At start-up a file that
+        // will not load falls back to a demo (there is nothing else to show);
+        // from the palette that would throw away the session you are in and
+        // leave you on a demo pointed at the broken file, where Ctrl+S
+        // overwrites it. Here, a file that will not open changes nothing.
+        let team = Team::from_contacts("solo", &["sc-local".into()]);
+        let probe = if path.extension().and_then(|e| e.to_str()) == Some("studioarch") {
+            Studio::open_archive(&path, SiteId(1), team).map(|_| ())
+        } else {
+            Studio::load_from(&path, SiteId(1), team).map(|_| ())
+        };
+        if let Err(e) = probe {
+            self.studio.status = format!("could not open {}: {e} — still on this project", path.display());
+            return;
+        }
+        if open_project::needs_save(&self.studio.session.doc.project, self.saved_project.as_ref()) {
+            self.studio.status = format!("this project has unsaved changes — before opening {}:",
+                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            self.open_pending = Some(path);
+            self.open_palette_at(palette::Ask::UnsavedBeforeOpen, "open project");
+        } else {
+            self.switch_to(path);
+        }
+    }
+
+    /// Replace the whole shell with one opened on `path` -- exactly what a
+    /// launch with that project builds, so nothing of this one lingers.
+    fn switch_to(&mut self, path: std::path::PathBuf) {
+        let touch = self.touch_seen;
+        *self = App::with_project(path.clone());
+        self.touch_seen = touch;
+        self.studio.status = format!("opened {} — {}", path.display(), self.studio.status);
+    }
+
+    /// Save the project where it lives: the workspace sidecar, the file,
+    /// and a history commit. The toolbar's save and the open flow's "save,
+    /// then open" both come here -- one save, not a second simplified one.
+    fn save_project(&mut self) -> Result<(), String> {
+        let path = self.project_path.clone();
+        workspace::save(&path, &workspace::WorkspaceState {
+            library_audio: self.library_roots.audio.display().to_string(),
+            library_video: self.library_roots.video.as_ref()
+                .map(|p| p.display().to_string()).unwrap_or_default(),
+            combined: self.studio.combined,
+            panel: self.studio.panel.label().to_string(),
+            side_slot: match self.side_slot {
+                SideSlot::Off => "off", SideSlot::Viewport => "viewport",
+                SideSlot::Mixer => "mixer", SideSlot::Rack => "rack",
+                SideSlot::Program => "program",
+            }.to_string(),
+            px_per_sec: self.studio.current_view().px_per_sec,
+            scroll_ticks: self.studio.current_view().scroll.0,
+            closed_groups: self.studio.closed_groups.iter()
+                .map(|g| g.0).collect(),
+            bounce_format: self.bounce_format.token().to_string(),
+            voice_domains: self.lexicon.to_tokens(),
+            pinned: self.library_prefs.pinned.iter()
+                .map(|p| p.display().to_string()).collect(),
+            demoted: self.library_prefs.demoted.iter()
+                .map(|p| p.display().to_string()).collect(),
+            library_open: self.library_open,
+            display_name: self.studio.display_name.clone(),
+            rebinds: self.rebinds.encode(),
+            piano_zones: self.zones.encode(),
+            overlap: self.studio.overlap.name().to_string(),
+            overlap_tracks: self.studio.overlap_tracks.iter()
+                .map(|(t, p)| format!("{}:{}", t.0, p.name())).collect::<Vec<_>>().join(","),
+        });
+        // The directory must exist (and be ours) BEFORE the
+        // file is written: a save into a fresh project root
+        // otherwise fails on the open, and a save into
+        // someone's source tree must fail here rather than
+        // after leaving a file in it.
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Err(e) = project_dir::ensure_project_dir(dir) {
+                self.studio.status = e.clone();
+                return Err(e);
+            }
+        }
+        let saved = self.studio.save_to(&path);
+        if saved.is_ok() {
+            self.saved_project = Some(self.studio.session.doc.project.clone());
+            // The save happened; history is the extra. A missing
+            // git binary demotes to a note, never a lost save.
+            let dir = path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let p = &self.studio.session.doc.project;
+            let meta = project_dir::Meta {
+                name: p.name.clone(),
+                bpm: self.studio.rack.tempo_bpm,
+                tracks: p.tracks.len(),
+                clips: p.clips.len(),
+                busses: p.busses.len(),
+                patterns: self.studio.rack.patterns.len(),
+                channels: self.studio.rack.channels.len(),
+            };
+            match project_dir::save_versioned(
+                &dir, &meta, project_dir::MediaMode::Committed, "save") {
+                Ok(Some(id)) => self.studio.status =
+                    format!("{} — commit {id}", self.studio.status),
+                Ok(None) => {}
+                Err(e) => self.studio.status =
+                    format!("{} (history skipped: {})",
+                            self.studio.status, e.lines().next().unwrap_or("git error")),
+            }
+        }
+        saved
     }
 
     /// A wake for background workers: after each message they send, the
