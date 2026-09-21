@@ -7,8 +7,12 @@
 //!
 //! * pure white surfaces (paper is the panel's natural state and costs
 //!   nothing to hold), pure black text, 2 px black outlines on controls;
-//! * **pressed = inverted** (black fill, white text): the largest possible
-//!   pixel change, so the fast waveform shows the press immediately;
+//! * **pressed = mid-grey fill with a heavier outline**: a large pixel change
+//!   the fast waveform shows at once. Not a full inversion: egui draws
+//!   STRONG text with the pressed widget's text colour
+//!   (`Visuals::strong_text_color`), so white-on-black pressed buttons made
+//!   every bold label white on white (found as a missing title in
+//!   unendlich-eink);
 //! * hover looks identical to rest: the pen digitizer reports hover, and a
 //!   hover highlight would spend a refresh on every pen approach;
 //! * no shadows (grey gradients are ghosting fodder), and bigger hit
@@ -64,9 +68,10 @@ pub fn visuals(color_panel: bool) -> Visuals {
         expansion: 0.0,
     };
     let pressed = egui::style::WidgetVisuals {
-        bg_fill: ink,
-        weak_bg_fill: ink,
-        fg_stroke: Stroke::new(2.0, paper),
+        bg_fill: Color32::from_gray(150),
+        weak_bg_fill: Color32::from_gray(150),
+        bg_stroke: Stroke::new(3.0, ink),
+        fg_stroke: Stroke::new(2.0, ink),
         ..rest
     };
     v.widgets.noninteractive = egui::style::WidgetVisuals { bg_stroke: Stroke::new(1.0, ink), fg_stroke: Stroke::new(1.0, ink), ..rest };
@@ -82,12 +87,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn press_is_an_inversion_and_hover_costs_nothing() {
+    fn strong_text_is_readable_a_press_is_obvious_and_hover_costs_nothing() {
         let v = visuals(false);
+        // egui draws STRONG text in the pressed widget's text colour
+        let strong = v.strong_text_color();
+        assert!(strong.r() < 60 && strong.g() < 60 && strong.b() < 60, "bold labels must be dark on paper: {strong:?}");
+        let (rest, pressed) = (v.widgets.inactive.weak_bg_fill, v.widgets.active.weak_bg_fill);
+        assert!(rest.r() as i32 - pressed.r() as i32 >= 80, "a press must be a big pixel change: {rest:?} -> {pressed:?}");
+        assert!(v.widgets.active.bg_stroke.width > v.widgets.inactive.bg_stroke.width);
         assert_eq!(v.widgets.inactive.weak_bg_fill, Color32::WHITE);
         assert_ne!(v.widgets.inactive.bg_fill, v.panel_fill, "slider rail must be visible on the panel");
-        assert_eq!(v.widgets.active.weak_bg_fill, Color32::BLACK);
-        assert_eq!(v.widgets.active.fg_stroke.color, Color32::WHITE);
         assert_eq!(v.widgets.hovered, v.widgets.inactive);
         assert_eq!(v.override_text_color, Some(Color32::BLACK));
     }

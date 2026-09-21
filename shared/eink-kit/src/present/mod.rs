@@ -37,6 +37,17 @@ pub trait Present {
     /// The live, shared framebuffer. Also the "previous frame" for diffing.
     fn buffer(&mut self) -> &mut [u8];
     fn commit(&mut self, updates: &[Update]) -> io::Result<()>;
+    /// True once after the backend replaced its buffer (e.g. reconnected to
+    /// the display server): the next frame must redraw everything, since the
+    /// new buffer holds none of what was drawn.
+    fn take_reset(&mut self) -> bool {
+        false
+    }
+    /// Called by the run loop every turn. `Ok(true)`: the backend replaced
+    /// its buffer (redraw everything); `Err`: the display is gone.
+    fn poll(&mut self) -> io::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Things input threads report.
@@ -47,6 +58,8 @@ pub enum Input {
     Raw { x: i32, y: i32 },
     /// The display server went away; the runner should exit.
     Closed(String),
+    /// Nothing to deliver; wake the run loop so it polls the backend.
+    Wake,
 }
 
 /// Receiving end, owned by the runner.

@@ -132,12 +132,52 @@ pub struct QtfbPresent {
     shm: *mut u8,
     shm_len: usize,
     caps: Caps,
-    /// Send SET_REFRESH_MODE / REQUEST_FULL_REFRESH (EINK_QTFB_MODES=1).
+    /// Mode messages (SET_REFRESH_MODE / REQUEST_FULL_REFRESH) allowed now.
     modes: bool,
     trace: bool,
     sent: u32,
     last: &'static str,
+    // for reconnecting to the same window
+    key: i32,
+    model: Model,
+    mode: Mode,
+    input: InputSender,
+    /// Bumped on reconnect so the old reader thread exits quietly instead of
+    /// reporting the (deliberately) closed socket as the display going away.
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    plan: ModePlan,
+    reset: bool,
+    socket_path: std::ffi::CString,
+    /// Set by the reader when AppLoad hung up on the current connection.
+    peer_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A mode request is inside its blame window: the reader must not
+    /// report a hang-up as the display closing (the run loop would exit
+    /// before the fallback could reconnect; caught by the fake-server test).
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// When to ask AppLoad for the fast waveform.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ModePlan {
+    /// Never (default): AppLoad's own mode, the path its shim uses.
+    Off,
+    /// Once drawing is under way: after the first update plus a delay.
+    Deferred { after: Option<std::time::Instant> },
+    /// Immediately after init: what failed on a Paper Pro. For testing.
+    Immediate,
+    /// Sent at this time; for a short window a hang-up is blamed on it.
+    Sent { at: std::time::Instant },
+    /// Sent and survived the window: the fast waveform is in use.
+    Accepted,
+    /// AppLoad dropped the connection after a mode message: never again.
+    Failed,
+}
+
+const DEFER: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long after a mode message a hang-up is blamed on it. After this, a
+/// hang-up is AppLoad closing the window: the app exits as before (no
+/// orphaned process reconnecting to a window that is gone).
+const BLAME_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
 
 fn type_name(t: u8) -> &'static str {
     match t {
@@ -165,66 +205,92 @@ impl QtfbPresent {
     /// this follows the proven path: UPDATEs only, and a full refresh is an
     /// UPDATE_ALL. `EINK_QTFB_MODES=1` restores the mode messages to test.
     pub fn connect(key: i32, model: Model, mode: Mode, input: InputSender) -> io::Result<QtfbPresent> {
-        let modes = std::env::var("EINK_QTFB_MODES").as_deref() == Ok("1");
-        let trace = std::env::var("EINK_TRACE").as_deref() == Ok("1");
-        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        for (d, s) in addr.sun_path.iter_mut().zip(SOCKET_PATH) {
-            *d = *s as libc::c_char;
-        }
-        let r = unsafe {
-            libc::connect(fd, (&addr as *const libc::sockaddr_un).cast(), std::mem::size_of::<libc::sockaddr_un>() as u32)
+        Self::connect_at(std::ffi::CString::new(SOCKET_PATH.strip_suffix(b"\0").unwrap()).unwrap(), key, model, mode, input)
+    }
+
+    /// [`connect`](Self::connect) to a given socket path (tests run a fake
+    /// server built from AppLoad's source).
+    pub fn connect_at(socket_path: std::ffi::CString, key: i32, model: Model, mode: Mode, input: InputSender) -> io::Result<QtfbPresent> {
+        let plan = match std::env::var("EINK_QTFB_MODES").as_deref() {
+            Ok("1") | Ok("deferred") => ModePlan::Deferred { after: None },
+            Ok("immediate") => ModePlan::Immediate,
+            _ => ModePlan::Off,
         };
-        if r != 0 {
-            let e = io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(io::Error::new(e.kind(), format!("connect /tmp/qtfb.sock: {e} (is AppLoad running?)")));
-        }
-        let fb_type = model.qtfb_rgb565_type();
-        send_msg(fd, &ClientMessage { ty: MESSAGE_INITIALIZE, body: ClientBody { init: InitContents { key, fb_type } } })?;
-        let mut resp: ServerMessage = unsafe { std::mem::zeroed() };
-        let n = unsafe { libc::recv(fd, (&mut resp as *mut ServerMessage).cast(), std::mem::size_of::<ServerMessage>(), 0) };
-        if n < 1 {
-            return Err(io::Error::new(io::ErrorKind::ConnectionRefused, format!("qtfb refused window key {key}")));
-        }
-        let init = unsafe { resp.body.init };
-        let path = format!("/dev/shm/qtfb_{}\0", init.shm_key);
-        let shm_fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC) };
-        if shm_fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let p = unsafe { libc::mmap(std::ptr::null_mut(), init.shm_size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, shm_fd, 0) };
-        unsafe { libc::close(shm_fd) };
-        if p == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
+        Self::connect_with(socket_path, key, model, mode, input, plan)
+    }
+
+    fn connect_with(socket_path: std::ffi::CString, key: i32, model: Model, mode: Mode, input: InputSender, plan: ModePlan) -> io::Result<QtfbPresent> {
+        let trace = std::env::var("EINK_TRACE").as_deref() == Ok("1");
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let peer_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flags = Flags { generation: generation.clone(), peer_closed: peer_closed.clone(), in_flight: in_flight.clone() };
+        let (fd, shm, shm_len) = open_window(&socket_path, key, model, &input, &flags)?;
         let (w, h) = model.size();
-        let stride = w as usize * 2;
-        if init.shm_size < stride * h as usize {
-            return Err(io::Error::new(io::ErrorKind::InvalidData,
-                format!("qtfb shm is {} bytes, expected {} for {w}x{h} RGB565 (wrong EINK_MODEL?)", init.shm_size, stride * h as usize)));
-        }
-        if modes && mode != Mode::Ui {
-            // Costs one second of server-side sleep; done once, here.
-            send_msg(fd, &ClientMessage { ty: MESSAGE_SET_REFRESH_MODE, body: ClientBody { refresh_mode: mode as i32 } })?;
-        }
-        eprintln!("eink: qtfb refresh mode: {}", if modes { format!("{mode:?} (EINK_QTFB_MODES=1)") } else { "AppLoad's default (mode messages off; EINK_QTFB_MODES=1 to send them)".into() });
-        let rfd = unsafe { libc::dup(fd) };
-        std::thread::Builder::new().name("qtfb-input".into()).spawn(move || reader(rfd, input))?;
-        Ok(QtfbPresent {
+        let mut me = QtfbPresent {
             fd,
-            shm: p.cast(),
-            shm_len: init.shm_size,
-            caps: Caps { width: w, height: h, stride, format: PixelFormat::Rgb565, per_update_waveform: false, color_panel: model.color() },
-            modes,
+            shm,
+            shm_len,
+            caps: Caps { width: w, height: h, stride: w as usize * 2, format: PixelFormat::Rgb565, per_update_waveform: false, color_panel: model.color() },
+            modes: false,
             trace,
             sent: 0,
             last: "INITIALIZE",
-        })
+            key,
+            model,
+            mode,
+            input,
+            generation,
+            plan,
+            reset: false,
+            socket_path,
+            peer_closed,
+            in_flight,
+        };
+        eprintln!("eink: qtfb refresh mode: {}", match plan {
+            ModePlan::Off => "AppLoad's default (EINK_QTFB_MODES=deferred to request the fast waveform)".to_string(),
+            ModePlan::Deferred { .. } => format!("{mode:?}, requested {}s after drawing starts; falls back if AppLoad drops the connection", DEFER.as_secs()),
+            _ => format!("{mode:?} immediately (EINK_QTFB_MODES=immediate)"),
+        });
+        if plan == ModePlan::Immediate {
+            me.request_mode()?;
+        }
+        Ok(me)
+    }
+
+    fn request_mode(&mut self) -> io::Result<()> {
+        if self.mode == Mode::Ui {
+            self.plan = ModePlan::Failed; // nothing to ask for
+            return Ok(());
+        }
+        let m = ClientMessage { ty: MESSAGE_SET_REFRESH_MODE, body: ClientBody { refresh_mode: self.mode as i32 } };
+        self.plan = ModePlan::Sent { at: std::time::Instant::now() };
+        self.in_flight.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.modes = true;
+        self.send(&m, &format!("{:?}", self.mode))
+    }
+
+    /// Reconnect to the same window after AppLoad dropped us, with mode
+    /// messages off for good. The window survives (AppLoad keeps its
+    /// controller); the shared buffer is new, so the next frame redraws all.
+    fn reconnect_without_modes(&mut self) -> io::Result<()> {
+        eprintln!("eink: AppLoad dropped the qtfb connection after SET_REFRESH_MODE; reconnecting without mode messages");
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        unsafe {
+            libc::munmap(self.shm.cast(), self.shm_len);
+            libc::close(self.fd);
+        }
+        self.peer_closed.store(false, std::sync::atomic::Ordering::SeqCst);
+        let flags = Flags { generation: self.generation.clone(), peer_closed: self.peer_closed.clone(), in_flight: self.in_flight.clone() };
+        let (fd, shm, shm_len) = open_window(&self.socket_path, self.key, self.model, &self.input, &flags)?;
+        (self.fd, self.shm, self.shm_len) = (fd, shm, shm_len);
+        self.in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.plan = ModePlan::Failed;
+        self.modes = false;
+        self.sent = 0;
+        self.last = "INITIALIZE";
+        self.reset = true;
+        Ok(())
     }
 
     /// Send one message, counting and (EINK_TRACE=1) logging it. A broken
@@ -241,6 +307,11 @@ impl QtfbPresent {
                 self.last = name;
                 Ok(())
             }
+            Err(e) if e.raw_os_error() == Some(libc::EPIPE)
+                && matches!(self.plan, ModePlan::Sent { at } if at.elapsed() < BLAME_WINDOW) => {
+                // The mode message is the prime suspect: fall back, keep running.
+                self.reconnect_without_modes()
+            }
             Err(e) if e.raw_os_error() == Some(libc::EPIPE) => Err(io::Error::new(io::ErrorKind::BrokenPipe, format!(
                 "AppLoad closed the qtfb connection (after {} message(s) since init, last {}; this one {name})",
                 self.sent, self.last))),
@@ -249,13 +320,90 @@ impl QtfbPresent {
     }
 }
 
-fn reader(fd: RawFd, input: InputSender) {
+/// Connect to AppLoad's socket, initialise window `key`, map its buffer and
+/// start the input reader. Shared by first connect and reconnect.
+fn open_window(
+    socket_path: &std::ffi::CString,
+    key: i32,
+    model: Model,
+    input: &InputSender,
+    flags: &Flags,
+) -> io::Result<(RawFd, *mut u8, usize)> {
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (d, s) in addr.sun_path.iter_mut().zip(socket_path.as_bytes_with_nul()) {
+        *d = *s as libc::c_char;
+    }
+    let r = unsafe { libc::connect(fd, (&addr as *const libc::sockaddr_un).cast(), std::mem::size_of::<libc::sockaddr_un>() as u32) };
+    if r != 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(io::Error::new(e.kind(), format!("connect {}: {e} (is AppLoad running?)", socket_path.to_string_lossy())));
+    }
+    let fb_type = model.qtfb_rgb565_type();
+    send_msg(fd, &ClientMessage { ty: MESSAGE_INITIALIZE, body: ClientBody { init: InitContents { key, fb_type } } })?;
+    let mut resp: ServerMessage = unsafe { std::mem::zeroed() };
+    let n = unsafe { libc::recv(fd, (&mut resp as *mut ServerMessage).cast(), std::mem::size_of::<ServerMessage>(), 0) };
+    if n < 1 {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::new(io::ErrorKind::ConnectionRefused, format!("qtfb refused window key {key}")));
+    }
+    let init = unsafe { resp.body.init };
+    let path = format!("/dev/shm/qtfb_{}\0", init.shm_key);
+    let shm_fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if shm_fd < 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), init.shm_size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, shm_fd, 0) };
+    unsafe { libc::close(shm_fd) };
+    if p == libc::MAP_FAILED {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    let (w, h) = model.size();
+    if init.shm_size < w as usize * 2 * h as usize {
+        unsafe { libc::munmap(p, init.shm_size); libc::close(fd) };
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("qtfb shm is {} bytes, expected {} for {w}x{h} RGB565 (wrong EINK_MODEL?)", init.shm_size, w as usize * 2 * h as usize)));
+    }
+    let rfd = unsafe { libc::dup(fd) };
+    let (inp, fl, mine) = (input.clone(), flags.clone(), flags.generation.load(std::sync::atomic::Ordering::SeqCst));
+    std::thread::Builder::new().name("qtfb-input".into()).spawn(move || reader(rfd, inp, fl, mine))?;
+    Ok((fd, p.cast(), init.shm_size))
+}
+
+/// Connection state shared with the reader thread.
+#[derive(Clone)]
+struct Flags {
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    peer_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn reader(fd: RawFd, input: InputSender, flags: Flags, mine: u64) {
+    use std::sync::atomic::Ordering::SeqCst;
     loop {
         let mut m: ServerMessage = unsafe { std::mem::zeroed() };
         let n = unsafe { libc::recv(fd, (&mut m as *mut ServerMessage).cast(), std::mem::size_of::<ServerMessage>(), 0) };
         if n < 1 {
-            input.send(Input::Closed("qtfb socket closed".into()));
             unsafe { libc::close(fd) };
+            // A reconnect closes the old socket on purpose: not the end.
+            if flags.generation.load(SeqCst) != mine {
+                return;
+            }
+            flags.peer_closed.store(true, SeqCst);
+            if flags.in_flight.load(SeqCst) {
+                input.send(Input::Wake); // the run loop polls; qtfb decides
+            } else {
+                input.send(Input::Closed("qtfb socket closed".into()));
+            }
             return;
         }
         if m.ty != MESSAGE_USERINPUT {
@@ -285,7 +433,45 @@ impl Present for QtfbPresent {
     fn buffer(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.shm, self.shm_len) }
     }
+    fn take_reset(&mut self) -> bool {
+        std::mem::take(&mut self.reset)
+    }
+
+    fn poll(&mut self) -> io::Result<bool> {
+        if !self.peer_closed.load(std::sync::atomic::Ordering::SeqCst) {
+            if let ModePlan::Sent { at } = self.plan {
+                if at.elapsed() >= BLAME_WINDOW {
+                    self.plan = ModePlan::Accepted;
+                    self.in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+                    eprintln!("eink: AppLoad accepted {:?}: fast waveform in use", self.mode);
+                }
+            }
+            return Ok(false);
+        }
+        match self.plan {
+            ModePlan::Sent { at } if at.elapsed() < BLAME_WINDOW => {
+                self.reconnect_without_modes()?;
+                Ok(std::mem::take(&mut self.reset))
+            }
+            _ => Err(io::Error::new(io::ErrorKind::BrokenPipe, "AppLoad closed the qtfb connection")),
+        }
+    }
+
     fn commit(&mut self, updates: &[Update]) -> io::Result<()> {
+        if let ModePlan::Sent { at } = self.plan {
+            if at.elapsed() >= BLAME_WINDOW {
+                self.plan = ModePlan::Accepted;
+                self.in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+                eprintln!("eink: AppLoad accepted {:?}: fast waveform in use", self.mode);
+            }
+        }
+        if let ModePlan::Deferred { after } = self.plan {
+            match after {
+                None if !updates.is_empty() => self.plan = ModePlan::Deferred { after: Some(std::time::Instant::now() + DEFER) },
+                Some(t) if std::time::Instant::now() >= t => self.request_mode()?,
+                _ => {}
+            }
+        }
         for u in updates {
             if u.waveform == Waveform::Full {
                 if self.modes {
@@ -324,6 +510,129 @@ mod tests {
     use super::*;
     /// The server `recv`s exactly sizeof(ClientMessage). These are the C
     /// sizes for the header as read; a mismatch would silently desync.
+
+    /// A fake qtfb server following AppLoad's source (fbmanagement.cpp):
+    /// SEQPACKET, INITIALIZE -> shm + response, UPDATE counted. With
+    /// `drop_on_mode`, it hangs up after SET_REFRESH_MODE the way AppLoad did
+    /// on a Paper Pro.
+    struct Fake {
+        path: std::path::PathBuf,
+        connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        updates: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn fake_server(drop_on_mode: bool) -> Fake {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let path = std::env::temp_dir().join(format!("qtfb-fake-{}-{}.sock", std::process::id(), drop_on_mode));
+        let _ = std::fs::remove_file(&path);
+        let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let srv = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0) };
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (d, s) in addr.sun_path.iter_mut().zip(c.as_bytes_with_nul()) { *d = *s as libc::c_char; }
+        assert_eq!(unsafe { libc::bind(srv, (&addr as *const libc::sockaddr_un).cast(), std::mem::size_of::<libc::sockaddr_un>() as u32) }, 0);
+        assert_eq!(unsafe { libc::listen(srv, 4) }, 0);
+        let (connections, updates) = (std::sync::Arc::new(AtomicUsize::new(0)), std::sync::Arc::new(AtomicUsize::new(0)));
+        let (cn, up) = (connections.clone(), updates.clone());
+        std::thread::spawn(move || loop {
+            let fd = unsafe { libc::accept(srv, std::ptr::null_mut(), std::ptr::null_mut()) };
+            if fd < 0 { return; }
+            let n = cn.fetch_add(1, Ordering::SeqCst) as i32;
+            let up = up.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let mut m: ClientMessage = unsafe { std::mem::zeroed() };
+                    let r = unsafe { libc::recv(fd, (&mut m as *mut ClientMessage).cast(), std::mem::size_of::<ClientMessage>(), 0) };
+                    if r < 1 { break; }
+                    match m.ty {
+                        MESSAGE_INITIALIZE => {
+                            let shm_key = 900_000 + std::process::id() as i32 % 1000 * 10 + n;
+                            let (w, h) = Model::PaperPro.size();
+                            let size = (w * h * 2) as usize;
+                            let name = std::ffi::CString::new(format!("/dev/shm/qtfb_{shm_key}")).unwrap();
+                            let sfd = unsafe { libc::open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600) };
+                            unsafe { libc::ftruncate(sfd, size as i64); libc::close(sfd) };
+                            let resp = ServerMessage { ty: MESSAGE_INITIALIZE, body: ServerBody { init: InitResponse { shm_key, shm_size: size } } };
+                            unsafe { libc::send(fd, (&resp as *const ServerMessage).cast(), std::mem::size_of::<ServerMessage>(), 0) };
+                        }
+                        MESSAGE_UPDATE => { up.fetch_add(1, Ordering::SeqCst); }
+                        MESSAGE_SET_REFRESH_MODE if drop_on_mode => break, // what AppLoad did
+                        MESSAGE_TERMINATE => break,
+                        _ => {}
+                    }
+                }
+                unsafe { libc::close(fd) };
+            });
+        });
+        Fake { path, connections, updates }
+    }
+
+    fn update(x: i32) -> Update {
+        Update { rect: crate::geom::IRect::new(x, 0, x + 10, 10), waveform: Waveform::Fast, color: false, reason: "test" }
+    }
+
+    fn pump(p: &mut QtfbPresent, secs: f32) {
+        let t = std::time::Instant::now();
+        let mut i = 0;
+        while t.elapsed().as_secs_f32() < secs {
+            p.commit(&[update(i % 100)]).expect("commit must not fail: fallback reconnects");
+            i += 1;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn a_dropped_connection_after_the_mode_request_falls_back_and_keeps_drawing() {
+        if !std::path::Path::new("/dev/shm").is_dir() { return; }
+        let f = fake_server(true);
+        let hub = crate::present::InputHub::new().unwrap();
+        let path = std::ffi::CString::new(f.path.to_string_lossy().as_bytes()).unwrap();
+        let mut p = QtfbPresent::connect_with(path, 42, Model::PaperPro, Mode::Animate, hub.sender(), ModePlan::Deferred { after: None }).unwrap();
+        pump(&mut p, 3.2); // first update, 2 s defer, mode sent, server hangs up, reconnect
+        assert_eq!(p.plan, ModePlan::Failed, "mode messages off for good");
+        assert!(p.take_reset(), "the engine is told to redraw everything");
+        assert_eq!(f.connections.load(std::sync::atomic::Ordering::SeqCst), 2, "reconnected to the same window");
+        let before = f.updates.load(std::sync::atomic::Ordering::SeqCst);
+        pump(&mut p, 0.5);
+        assert!(f.updates.load(std::sync::atomic::Ordering::SeqCst) > before, "updates flow on the new connection");
+        assert!(hub.drain().iter().all(|i| !matches!(i, Input::Closed(_))), "the replaced socket is not reported as the display closing");
+    }
+
+    #[test]
+    fn an_idle_app_still_recovers_through_poll() {
+        if !std::path::Path::new("/dev/shm").is_dir() { return; }
+        let f = fake_server(true);
+        let hub = crate::present::InputHub::new().unwrap();
+        let path = std::ffi::CString::new(f.path.to_string_lossy().as_bytes()).unwrap();
+        let mut p = QtfbPresent::connect_with(path, 44, Model::PaperPro, Mode::Animate, hub.sender(), ModePlan::Immediate).unwrap();
+        // no more commits: only the run loop's poll can notice the hang-up
+        let t = std::time::Instant::now();
+        let mut healed = false;
+        while t.elapsed() < std::time::Duration::from_secs(2) && !healed {
+            healed = p.poll().expect("poll must heal, not fail, inside the blame window");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(healed, "poll reconnected and asked for a redraw");
+        assert_eq!(p.plan, ModePlan::Failed);
+        assert!(hub.drain().iter().all(|i| !matches!(i, Input::Closed(_))), "no exit on the way");
+        p.commit(&[update(1)]).unwrap();
+    }
+
+    #[test]
+    fn an_accepted_mode_stays_and_a_later_hangup_is_a_normal_exit() {
+        if !std::path::Path::new("/dev/shm").is_dir() { return; }
+        let f = fake_server(false);
+        let hub = crate::present::InputHub::new().unwrap();
+        let path = std::ffi::CString::new(f.path.to_string_lossy().as_bytes()).unwrap();
+        let mut p = QtfbPresent::connect_with(path, 43, Model::PaperPro, Mode::Animate, hub.sender(), ModePlan::Deferred { after: None }).unwrap();
+        pump(&mut p, 2.5);
+        assert!(matches!(p.plan, ModePlan::Sent { .. }));
+        std::thread::sleep(BLAME_WINDOW);
+        pump(&mut p, 0.2);
+        assert_eq!(p.plan, ModePlan::Accepted, "survived the window: fast waveform in use");
+        assert_eq!(f.connections.load(std::sync::atomic::Ordering::SeqCst), 1, "no reconnect when the mode is accepted");
+    }
+
     #[test]
     fn wire_structs_match_the_c_layout() {
         assert_eq!(std::mem::size_of::<ClientMessage>(), 24);

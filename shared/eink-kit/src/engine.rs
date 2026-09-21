@@ -157,7 +157,7 @@ impl Engine {
         match input {
             Input::Touch(t) => self.push_touch(now, t),
             Input::Raw { x, y } => self.diag.last_raw = Some((*x, *y)),
-            Input::Closed(_) => {}
+            Input::Closed(_) | Input::Wake => {}
         }
     }
 
@@ -169,6 +169,12 @@ impl Engine {
         self.diag.last_touch = Some((t.x, t.y));
         self.last_input = Some(now);
         self.policy.on_input(now);
+    }
+
+    /// The backend's buffer was replaced: redraw every tile on the next frame, now.
+    pub fn force_redraw(&mut self, now: Duration) {
+        self.first = true;
+        self.repaint_at = Some(now);
     }
 
     /// Whether any touch contact is considered down (tests, diagnostics).
@@ -265,6 +271,9 @@ impl Engine {
     }
 
     pub fn frame(&mut self, now: Duration, app: &mut dyn EinkApp, present: &mut dyn Present) -> std::io::Result<FrameReport> {
+        if present.take_reset() {
+            self.first = true; // a new buffer holds nothing we drew
+        }
         let size = egui::vec2(self.caps.width as f32 / self.ppp, self.caps.height as f32 / self.ppp);
         let mut raw = RawInput {
             screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
@@ -329,6 +338,11 @@ impl Engine {
         self.diag.motion_tiles = motion.iter().filter(|m| **m).count();
         self.trace_updates(now, &updates);
         present.commit(&updates)?;
+        if present.take_reset() {
+            // The backend reconnected during this commit: redraw all, now.
+            self.first = true;
+            self.repaint_at = Some(now);
+        }
 
         self.diag.last_raster_ms = raster.as_secs_f32() * 1000.0;
         self.diag.last_dirty_tiles = dirty.count();
@@ -515,6 +529,16 @@ pub fn run(mut app: impl EinkApp) -> std::io::Result<()> {
                 return Ok(());
             }
             engine.push_input(now, &ev);
+        }
+        // Backend housekeeping (qtfb reconnects here if AppLoad dropped us
+        // after a mode request): a replaced buffer means redraw everything.
+        match present.poll() {
+            Ok(true) => engine.force_redraw(now),
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("eink: exiting: {e}");
+                return Ok(());
+            }
         }
     }
 }
