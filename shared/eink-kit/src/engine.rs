@@ -56,6 +56,8 @@ pub struct Diagnostics {
     pub motion_tiles: usize,
     /// Seconds between motion refreshes.
     pub motion_interval: f32,
+    /// The panel shows colour (for shells that re-apply `style::apply`).
+    pub color_panel: bool,
 }
 
 pub struct FrameReport {
@@ -136,7 +138,7 @@ impl Engine {
             min_frame: cfg.min_frame,
             last_frame: Duration::ZERO,
             trace: cfg.trace,
-            diag: Diagnostics { backend, profile: profile.as_str(), motion_interval: 1.0 / hz, ..Default::default() },
+            diag: Diagnostics { backend, profile: profile.as_str(), motion_interval: 1.0 / hz, color_panel: caps.color_panel, ..Default::default() },
             heat: Heat::new(cols, rows),
             hint_motion: vec![false; cols * rows],
             hint_static: vec![false; cols * rows],
@@ -171,10 +173,11 @@ impl Engine {
 
     /// When the loop must wake even without input.
     pub fn next_wake(&self) -> Option<Duration> {
-        match (self.repaint_at, self.policy.next_deadline()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        // While something is moving, also wake when it will have gone quiet,
+        // so the end of motion (and its colour settle) is noticed even if
+        // nothing else ever wakes the loop.
+        let motion_end = if self.was_moving { self.heat.quiet_deadline() } else { None };
+        [self.repaint_at, self.policy.next_deadline(), motion_end].into_iter().flatten().min()
     }
 
     /// Which tiles count as motion right now.

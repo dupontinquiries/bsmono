@@ -161,3 +161,60 @@ fn a_finger_drag_is_interaction_not_motion() {
     assert!(frames >= 35, "{frames} frames: interaction must not be paced");
     assert!(ups.iter().all(|u| u.waveform == Waveform::Fast));
 }
+
+/// Drive the engine exactly as `run()` does: render when a frame is wanted,
+/// tick, then SLEEP until `next_wake()` (or forever: stop). The 5 ms ticker
+/// above hid a real bug: with nothing scheduled, the loop slept forever and
+/// the end of motion was never noticed, leaving the last dithered frame on
+/// the panel indefinitely.
+fn drive_like_run(e: &mut Engine, app: &mut dyn EinkApp, p: &mut MemPresent, from: u64, to: u64) -> (u32, Vec<Update>) {
+    let (mut frames, mut ups) = (0, vec![]);
+    let mut t = from;
+    while t < to {
+        if e.wants_frame(ms(t)) {
+            frames += 1;
+            ups.extend(e.frame(ms(t), app, p).unwrap().updates);
+        }
+        ups.extend(e.tick(ms(t), p).unwrap());
+        if e.wants_frame(ms(t)) {
+            continue;
+        }
+        match e.next_wake() {
+            Some(w) => t = (w.as_millis() as u64).max(t + 1),
+            None => break, // run() would block on input forever here
+        }
+    }
+    (frames, ups)
+}
+
+#[test]
+fn paused_video_settles_even_when_nothing_else_wakes_the_loop() {
+    let mut p = MemPresent::new(702, 936, PixelFormat::Rgb565, true, true);
+    let mut e = Engine::new(&cfg(), p.caps(), "mem");
+    let mut v = Video { playing: true, t: 0, rect: Rect::NOTHING, hinted: true };
+    drive_like_run(&mut e, &mut v, &mut p, 0, 2000);
+    v.playing = false;
+    let (_, ups) = drive_like_run(&mut e, &mut v, &mut p, 2000, 6000);
+    assert!(ups.iter().any(|u| u.waveform == Waveform::Quality && u.color),
+        "the paused frame never settled back to colour: {ups:?}");
+    let colourful = region_pixels(&p, v.rect).iter().filter(|px| is_chromatic(px[0], px[1], px[2])).count();
+    assert!(colourful > 20, "still dithered after pause ({colourful} chromatic samples)");
+}
+
+#[test]
+fn a_few_startup_relayouts_are_not_motion() {
+    // egui settles layout over its first frames: three changes 120 ms apart
+    // must not be classified as motion (they were, dithering the whole top of
+    // tomescope's library screen).
+    struct Settling { n: u32 }
+    impl EinkApp for Settling {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            egui::CentralPanel::default().show_inside(ui, |ui| { ui.heading(format!("pass {}", self.n.min(2))); });
+            if self.n < 2 { self.n += 1; ui.ctx().request_repaint(); }
+        }
+    }
+    let mut p = MemPresent::new(702, 936, PixelFormat::Rgb565, true, true);
+    let mut e = Engine::new(&cfg(), p.caps(), "mem");
+    let (_, ups) = drive_like_run(&mut e, &mut Settling { n: 0 }, &mut p, 0, 3000);
+    assert!(!ups.iter().any(|u| u.reason.starts_with("motion")), "startup churn treated as motion: {ups:?}");
+}

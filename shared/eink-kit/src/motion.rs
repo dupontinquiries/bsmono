@@ -79,6 +79,12 @@ pub struct Heat {
     last: Vec<Option<Duration>>,
     rate: Vec<f32>,
     moving: Vec<bool>,
+    /// Consecutive quick changes (interval under 1/exit_hz) per tile.
+    streak: Vec<u32>,
+    /// Changes needed in a row before a tile can become motion. egui
+    /// re-lays out over its first frames; three quick changes at startup
+    /// are layout settling, not a moving picture.
+    pub min_streak: u32,
     pub enter_hz: f32,
     pub exit_hz: f32,
     pub quiet: Duration,
@@ -92,6 +98,8 @@ impl Heat {
             last: vec![None; cols * rows],
             rate: vec![0.0; cols * rows],
             moving: vec![false; cols * rows],
+            streak: vec![0; cols * rows],
+            min_streak: 4,
             enter_hz: 3.0,
             exit_hz: 1.0,
             quiet: Duration::from_millis(700),
@@ -104,6 +112,7 @@ impl Heat {
             if dirty.dirty[i] {
                 if let Some(t) = self.last[i] {
                     let dt = now.saturating_sub(t).as_secs_f32().max(0.001);
+                    self.streak[i] = if dt < 1.0 / self.exit_hz { self.streak[i] + 1 } else { 0 };
                     // EWMA of instantaneous rate: two or three changes at a
                     // steady cadence are enough to cross enter_hz.
                     self.rate[i] = self.rate[i] * 0.5 + (1.0 / dt) * 0.5;
@@ -122,13 +131,24 @@ impl Heat {
                 // A tile that has not changed for `idle` cannot be changing
                 // faster than 1/idle, whatever the average said.
                 self.rate[i] = self.rate[i].min(1.0 / idle.as_secs_f32().max(0.001));
+                if idle >= self.quiet {
+                    self.streak[i] = 0;
+                }
                 self.moving[i] = if self.moving[i] {
                     self.rate[i] >= self.exit_hz && idle < self.quiet
                 } else {
-                    self.rate[i] >= self.enter_hz
+                    self.rate[i] >= self.enter_hz && self.streak[i] + 1 >= self.min_streak
                 };
             }
         }
+    }
+
+    /// When everything that has changed recently will have been quiet long
+    /// enough for motion to be over. The run loop must wake then: with no
+    /// other timer or input it would otherwise sleep forever and never
+    /// notice that motion ended (leaving a dithered frame on the panel).
+    pub fn quiet_deadline(&self) -> Option<Duration> {
+        self.last.iter().flatten().max().map(|t| *t + self.quiet + Duration::from_millis(1))
     }
 
     /// Changed within `quiet` of `now`.
