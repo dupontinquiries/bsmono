@@ -8,6 +8,8 @@
 
 use crate::config::Config;
 use crate::damage::coalesce;
+use crate::motion::{take_hints, Heat, Hint, BUDGET_KEY};
+use crate::raster::{DirtyTiles, TILE};
 use crate::format::PixelFormat;
 use crate::geom::IRect;
 use crate::policy::{Policy, Profile, Update};
@@ -50,6 +52,10 @@ pub struct Diagnostics {
     pub last_raster_ms: f32,
     pub last_dirty_tiles: usize,
     pub full_refresh_requested: bool,
+    /// Tiles currently classified as motion.
+    pub motion_tiles: usize,
+    /// Seconds between motion refreshes.
+    pub motion_interval: f32,
 }
 
 pub struct FrameReport {
@@ -74,6 +80,13 @@ pub struct Engine {
     last_frame: Duration,
     trace: bool,
     diag: Diagnostics,
+    heat: Heat,
+    /// Hinted tiles from the last frame the app drew (hints are per-frame).
+    hint_motion: Vec<bool>,
+    hint_static: Vec<bool>,
+    dither_enabled: bool,
+    was_moving: bool,
+    dithered: bool,
 }
 
 impl Engine {
@@ -81,6 +94,13 @@ impl Engine {
         let profile = cfg.profile.unwrap_or(if caps.color_panel { Profile::FastColor } else { Profile::FastMono });
         let mut policy = Policy::new(profile, IRect::from_size(caps.width, caps.height), caps.per_update_waveform);
         policy.settle = cfg.settle;
+        let motion_color = cfg.motion_color;
+        let hz = if motion_color { cfg.motion_color_hz } else { cfg.motion_hz }.max(0.2);
+        policy.motion = crate::policy::MotionCfg { interval: Duration::from_secs_f32(1.0 / hz), color: motion_color };
+        let (cols, rows) = ((caps.width as usize).div_ceil(TILE), (caps.height as usize).div_ceil(TILE));
+        // Dither only mono motion, and never in the quality profile (whose
+        // motion lane uses a quality waveform that can show greys).
+        let dither_enabled = cfg.dither && !motion_color && profile != Profile::Quality;
         let ctx = Context::default();
         let feather = cfg.feather.unwrap_or(profile.feathering());
         ctx.tessellation_options_mut(|o| o.feathering = feather);
@@ -88,8 +108,11 @@ impl Engine {
         ctx.global_style_mut(|s| s.animation_time = 0.0);
         ctx.options_mut(|o| o.input_options.max_click_duration = 0.8);
         eprintln!(
-            "eink: backend={backend} {}x{} {:?} profile={} feather={feather} scale={} threads={} per_update_waveform={}",
-            caps.width, caps.height, caps.format, profile.as_str(), cfg.scale, cfg.threads, caps.per_update_waveform
+            "eink: backend={backend} {}x{} {:?} profile={} feather={feather} scale={} threads={} per_update_waveform={} motion={}Hz {} dither={}",
+            caps.width, caps.height, caps.format, profile.as_str(), cfg.scale, cfg.threads, caps.per_update_waveform,
+            if cfg.motion_color { cfg.motion_color_hz } else { cfg.motion_hz },
+            if cfg.motion_color { "colour" } else { "mono" },
+            cfg.dither && !cfg.motion_color && cfg.profile != Some(Profile::Quality)
         );
         Engine {
             ctx,
@@ -106,7 +129,13 @@ impl Engine {
             min_frame: cfg.min_frame,
             last_frame: Duration::ZERO,
             trace: cfg.trace,
-            diag: Diagnostics { backend, profile: profile.as_str(), ..Default::default() },
+            diag: Diagnostics { backend, profile: profile.as_str(), motion_interval: 1.0 / hz, ..Default::default() },
+            heat: Heat::new(cols, rows),
+            hint_motion: vec![false; cols * rows],
+            hint_static: vec![false; cols * rows],
+            dither_enabled,
+            was_moving: false,
+            dithered: false,
         }
     }
 
@@ -141,6 +170,74 @@ impl Engine {
         }
     }
 
+    /// Which tiles count as motion right now.
+    ///
+    /// Measured motion is ignored while a finger is down: dragging a slider
+    /// changes tiles fast, but that is interaction and belongs on the
+    /// unthrottled fast path. Hinted Video/Animation regions are motion as
+    /// soon as they change (no rate warm-up) and stop being motion when they
+    /// go quiet, so a PAUSED video settles to colour even while the app keeps
+    /// declaring the hint. Static hints veto.
+    fn motion_mask(&self, now: Duration) -> Vec<bool> {
+        let touching = self.touch.any_down();
+        // A hinted region is judged as a whole: a video's dithered pixels can
+        // sit still in one tile for a while even though the picture is
+        // playing, and that tile must not drop out of the region.
+        let hinted_live = (0..self.hint_motion.len()).any(|i| self.hint_motion[i] && self.heat.recently_changed(i, now));
+        // Measured motion is dilated by one tile: a moving object enters its
+        // neighbours next, and without this its leading edge is drawn by the
+        // slow colour path for a few frames (a coloured sliver on a dithered
+        // object). Hinted regions are exact and are not dilated.
+        let (cols, rows) = (self.heat.cols, self.heat.rows);
+        let measured = |c: usize, r: usize| !touching && self.heat.is_moving(r * cols + c);
+        (0..self.hint_motion.len())
+            .map(|i| {
+                let (c, r) = (i % cols, i / cols);
+                let near = (r.saturating_sub(1)..=(r + 1).min(rows - 1))
+                    .any(|rr| (c.saturating_sub(1)..=(c + 1).min(cols - 1)).any(|cc| measured(cc, rr)));
+                !self.hint_static[i] && ((self.hint_motion[i] && hinted_live) || near)
+            })
+            .collect()
+    }
+
+    fn apply_hints(&mut self, hints: &[(egui::Rect, Hint)]) {
+        let (cols, rows) = (self.heat.cols, self.heat.rows);
+        self.hint_motion.iter_mut().for_each(|b| *b = false);
+        self.hint_static.iter_mut().for_each(|b| *b = false);
+        for (r, h) in hints {
+            let px = |v: f32| (v * self.ppp) as i64;
+            let (c0, c1) = ((px(r.min.x).max(0) as usize) / TILE, (px(r.max.x).max(1) as usize - 1) / TILE);
+            let (r0, r1) = ((px(r.min.y).max(0) as usize) / TILE, (px(r.max.y).max(1) as usize - 1) / TILE);
+            for row in r0..=r1.min(rows - 1) {
+                for col in c0..=c1.min(cols - 1) {
+                    match h {
+                        Hint::Static => self.hint_static[row * cols + col] = true,
+                        _ => self.hint_motion[row * cols + col] = true,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Motion stopped since the last check: settle it.
+    fn check_motion_end(&mut self, now: Duration) {
+        let moving = self.motion_mask(now).iter().any(|m| *m);
+        if self.was_moving && !moving {
+            // Dithered pixels are re-rendered clean by the next frame, which
+            // yields quality damage on its own; only undithered (colour)
+            // motion needs an explicit settle of the region.
+            self.policy.motion_ended(now, !self.dithered);
+            if self.dithered {
+                self.repaint_at = Some(now);
+            }
+            self.dithered = false;
+            if self.trace {
+                eprintln!("eink: t={:>7.3}s motion ended", now.as_secs_f32());
+            }
+        }
+        self.was_moving = moving;
+    }
+
     pub fn frame(&mut self, now: Duration, app: &mut dyn EinkApp, present: &mut dyn Present) -> std::io::Result<FrameReport> {
         let size = egui::vec2(self.caps.width as f32 / self.ppp, self.caps.height as f32 / self.ppp);
         let mut raw = RawInput {
@@ -153,8 +250,13 @@ impl Engine {
         };
         raw.viewports.insert(ViewportId::ROOT, ViewportInfo { native_pixels_per_point: Some(self.ppp), ..Default::default() });
         self.diag.frames += 1;
-        self.ctx.data_mut(|d| d.insert_temp(egui::Id::NULL, self.diag.clone()));
+        self.ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::NULL, self.diag.clone());
+            d.insert_temp(egui::Id::new(BUDGET_KEY), self.policy.motion.interval.as_secs_f32());
+        });
         let full = self.ctx.run_ui(raw, |ui| app.ui(ui));
+        let hints = take_hints(&self.ctx);
+        self.apply_hints(&hints);
         if self.ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new(FULL_REFRESH_KEY))).unwrap_or(false) {
             self.policy.request_full();
         }
@@ -162,6 +264,11 @@ impl Engine {
         self.textures.apply_set(&full.textures_delta);
         let prims = self.ctx.tessellate(full.shapes, full.pixels_per_point);
         let t0 = Instant::now();
+        let motion = self.motion_mask(now);
+        let dither: Option<Vec<bool>> = self.dither_enabled.then(|| motion.clone());
+        if dither.as_ref().is_some_and(|d| d.iter().any(|b| *b)) {
+            self.dithered = true;
+        }
         let (w, h, stride, format) = (self.caps.width, self.caps.height, self.caps.stride, self.caps.format);
         let dirty = render(
             &prims,
@@ -171,14 +278,23 @@ impl Engine {
             [255, 255, 255, 255],
             self.threads,
             self.first,
+            dither.as_deref(),
         );
         let raster = t0.elapsed();
         self.textures.apply_free(&full.textures_delta);
         self.first = false;
 
-        let damage = coalesce(&dirty, 8);
+        // Split damage into the motion lane and the normal lane.
+        let split = |keep: bool| DirtyTiles {
+            dirty: dirty.dirty.iter().zip(&motion).map(|(d, m)| *d && (*m == keep)).collect(),
+            ..dirty.clone()
+        };
+        let (moving_d, still_d) = (split(true), split(false));
+        self.heat.observe(&dirty, now);
         let interacting = self.interacting(now);
-        let updates = self.policy.on_damage(now, &damage, interacting);
+        let mut updates = self.policy.on_damage(now, &coalesce(&still_d, 8), interacting);
+        updates.extend(self.policy.on_motion_damage(now, &coalesce(&moving_d, 4)));
+        self.diag.motion_tiles = motion.iter().filter(|m| **m).count();
         self.trace_updates(now, &updates);
         present.commit(&updates)?;
 
@@ -187,11 +303,31 @@ impl Engine {
         self.last_frame = now;
         let delay = full.viewport_output.get(&ViewportId::ROOT).map(|v| v.repaint_delay).unwrap_or(Duration::MAX);
         self.repaint_at = if delay == Duration::MAX { None } else { Some(now + delay.max(self.min_frame)) };
+        // Frame pacing: while something is moving, do not render faster than
+        // the motion lane can commit. A video decoder asking for 24 fps gets
+        // ~6 frames rendered per second, and can read `motion_interval` to
+        // stop decoding the rest.
+        if self.diag.motion_tiles > 0 {
+            if let Some(t) = self.repaint_at.as_mut() {
+                // Snap to the first motion slot at or after the requested
+                // time, so every rendered frame is one the panel will show.
+                let (slot, step) = (self.policy.next_motion_at(), self.policy.motion.interval);
+                if *t > slot && !step.is_zero() {
+                    let k = ((*t - slot).as_secs_f64() / step.as_secs_f64()).ceil() as u32;
+                    *t = slot + step * k;
+                } else {
+                    *t = slot.max(*t);
+                }
+            }
+        }
+        self.check_motion_end(now);
         Ok(FrameReport { updates, dirty_tiles: dirty.count(), raster })
     }
 
     /// Timers only: emits the policy's settle refresh when it is due.
     pub fn tick(&mut self, now: Duration, present: &mut dyn Present) -> std::io::Result<Vec<Update>> {
+        self.heat.decay(now);
+        self.check_motion_end(now);
         let interacting = self.touch.any_down();
         let u = self.policy.on_tick(now, interacting);
         self.trace_updates(now, &u);

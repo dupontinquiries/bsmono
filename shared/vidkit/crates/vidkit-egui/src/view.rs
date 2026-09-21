@@ -255,6 +255,8 @@ impl VideoView {
                 }
                 if r.width() > 0.0 && r.height() > 0.0 {
                     paint_rotated(&painter, tex.id(), r, quarter);
+                    // Only the visible picture, not the letterbox bars.
+                    crate::eink_hint::hint_video(ui.ctx(), r.intersect(surface));
                 }
             }
             None => {

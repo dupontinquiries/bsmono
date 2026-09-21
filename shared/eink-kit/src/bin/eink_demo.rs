@@ -20,6 +20,9 @@ struct Demo {
     level: f32,
     strokes: Vec<Vec<Pos2>>,
     corner_hits: [bool; 4],
+    /// Motion test: a colour ball bouncing in the pad at 25 fps requested.
+    animate: bool,
+    ball: (f32, f32, f32, f32),
 }
 
 impl eink_kit::EinkApp for Demo {
@@ -59,7 +62,10 @@ impl eink_kit::EinkApp for Demo {
                 }
             });
             ui.label(egui::RichText::new(format!("taps: {}", self.taps)).size(30.0));
-            ui.checkbox(&mut self.toggle, egui::RichText::new("a checkbox").size(22.0));
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.toggle, egui::RichText::new("a checkbox").size(22.0));
+                ui.checkbox(&mut self.animate, egui::RichText::new("motion test (mono while moving, colour when stopped)").size(22.0));
+            });
             ui.add(egui::Slider::new(&mut self.level, 0.0..=100.0).text("slider"));
 
             ui.horizontal(|ui| {
@@ -74,6 +80,7 @@ impl eink_kit::EinkApp for Demo {
                 }
             });
 
+            ui.label(format!("motion: {} tiles · panel shows motion every {:.0} ms", d.motion_tiles, d.motion_interval * 1000.0));
             ui.label(match (d.last_touch, d.last_raw) {
                 (Some((x, y)), Some((rx, ry))) => format!("last touch: panel ({x:.0}, {y:.0}) px  ·  raw ({rx}, {ry})"),
                 (Some((x, y)), None) => format!("last touch: panel ({x:.0}, {y:.0}) px  (pre-mapped by display server)"),
@@ -104,6 +111,19 @@ impl eink_kit::EinkApp for Demo {
             }
             for s in &self.strokes {
                 p.add(egui::Shape::line(s.clone(), Stroke::new(4.0, Color32::BLACK)));
+            }
+            if self.animate {
+                let (x, y, vx, vy) = &mut self.ball;
+                if *vx == 0.0 { *vx = 9.0; *vy = 6.0; *x = rect.center().x; *y = rect.center().y; }
+                *x += *vx;
+                *y += *vy;
+                if *x < rect.left() + 40.0 || *x > rect.right() - 40.0 { *vx = -*vx; }
+                if *y < rect.top() + 40.0 || *y > rect.bottom() - 40.0 { *vy = -*vy; }
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(40));
+            }
+            if self.ball.2 != 0.0 {
+                p.circle_filled(egui::pos2(self.ball.0, self.ball.1), 36.0, Color32::from_rgb(30, 70, 200));
+                p.circle_filled(egui::pos2(self.ball.0, self.ball.1), 18.0, Color32::from_rgb(235, 200, 20));
             }
         });
     }
@@ -136,11 +156,22 @@ fn snapshot(out: &str) -> std::io::Result<()> {
     let (w, h) = model.size();
     let mut p = MemPresent::new(w, h, eink_kit::format::PixelFormat::Rgb565, true, model.color());
     let mut e = eink_kit::Engine::new(&cfg, p.caps(), "mem");
-    let mut app = Demo { taps: 3, toggle: true, level: 40.0, ..Default::default() };
+    let motion = std::env::var("EINK_SNAPSHOT_MOTION").as_deref() == Ok("1");
+    let mut app = Demo { taps: 3, toggle: true, level: 40.0, animate: motion, ..Default::default() };
     app.strokes.push((0..40).map(|i| Pos2::new(120.0 + i as f32 * 6.0, 700.0 + (i as f32 * 0.4).sin() * 40.0)).collect());
-    // Two frames: fonts are uploaded on the first.
+    // Two frames: fonts are uploaded on the first. With the motion test on,
+    // run a simulated second so the ball is classified and dithered.
     e.frame(std::time::Duration::ZERO, &mut app, &mut p)?;
-    let r = e.frame(std::time::Duration::from_millis(50), &mut app, &mut p)?;
+    let mut r = e.frame(std::time::Duration::from_millis(50), &mut app, &mut p)?;
+    if motion {
+        for t in (100..1200).step_by(5) {
+            let now = std::time::Duration::from_millis(t);
+            if e.wants_frame(now) {
+                r = e.frame(now, &mut app, &mut p)?;
+            }
+            e.tick(now, &mut p)?;
+        }
+    }
     eprintln!("snapshot: {w}x{h}, raster {:.1} ms, {} dirty tiles", r.raster.as_secs_f32() * 1000.0, r.dirty_tiles);
     p.write_ppm(std::path::Path::new(out))
 }

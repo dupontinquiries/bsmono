@@ -74,6 +74,24 @@ pub struct Update {
     pub reason: &'static str,
 }
 
+/// How continuously-changing regions are refreshed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionCfg {
+    /// Minimum time between motion refreshes. Frames in between are never
+    /// committed; the buffer simply holds the newest one when the slot comes.
+    pub interval: Duration,
+    /// Send motion updates with their colour flag. Off by default: the
+    /// colour waveform is the slow one, and a moving picture is what the
+    /// panel can least afford it for. Colour returns when motion stops.
+    pub color: bool,
+}
+
+impl Default for MotionCfg {
+    fn default() -> Self {
+        MotionCfg { interval: Duration::from_millis(166), color: false }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Policy {
     pub profile: Profile,
@@ -87,6 +105,11 @@ pub struct Policy {
     settles: u32,
     full_requested: bool,
     screen: IRect,
+    pub motion: MotionCfg,
+    motion_pending: IRect,
+    motion_pending_color: bool,
+    next_motion_at: Duration,
+    motion_region: IRect,
 }
 
 impl Policy {
@@ -102,12 +125,67 @@ impl Policy {
             settles: 0,
             full_requested: false,
             screen,
+            motion: MotionCfg::default(),
+            motion_pending: IRect::default(),
+            motion_pending_color: false,
+            next_motion_at: Duration::ZERO,
+            motion_region: IRect::default(),
         }
     }
 
     /// Next time `on_tick` has work, if any. The runner sleeps until then.
     pub fn next_deadline(&self) -> Option<Duration> {
-        self.deadline
+        let motion = (!self.motion_pending.is_empty()).then_some(self.next_motion_at);
+        match (self.deadline, motion) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Earliest time the next motion refresh may go out. The engine does not
+    /// render motion frames before this: work the panel cannot show is waste.
+    pub fn next_motion_at(&self) -> Duration {
+        self.next_motion_at
+    }
+
+    /// Damage in regions classified as motion. Rate-capped and coalesced:
+    /// whatever accumulates between slots goes out as one update.
+    pub fn on_motion_damage(&mut self, now: Duration, damage: &[Damage]) -> Vec<Update> {
+        for d in damage {
+            self.motion_pending = self.motion_pending.union(&d.rect);
+            self.motion_pending_color |= d.color;
+        }
+        if now >= self.next_motion_at { self.flush_motion(now) } else { Vec::new() }
+    }
+
+    fn flush_motion(&mut self, now: Duration) -> Vec<Update> {
+        if self.motion_pending.is_empty() {
+            return Vec::new();
+        }
+        let quality = self.profile == Profile::Quality;
+        let u = Update {
+            rect: self.motion_pending,
+            waveform: if quality { Waveform::Quality } else { Waveform::Fast },
+            color: self.motion.color && self.motion_pending_color,
+            reason: if self.motion.color { "motion: capped rate, colour" } else { "motion: capped rate, mono" },
+        };
+        self.motion_region = self.motion_region.union(&self.motion_pending);
+        self.motion_pending = IRect::default();
+        self.motion_pending_color = false;
+        self.next_motion_at = now + self.motion.interval;
+        vec![u]
+    }
+
+    /// Motion stopped. With `settle`, the region drawn in motion gets the
+    /// normal quality clean-up. Without it (the engine re-renders the region
+    /// undithered, which produces its own quality damage) it is just forgotten.
+    pub fn motion_ended(&mut self, now: Duration, settle: bool) {
+        if settle && !self.motion_region.is_empty() {
+            self.pending = self.pending.union(&self.motion_region);
+            self.pending_color = true;
+            self.deadline = Some(self.deadline.map_or(now, |d| d.min(now)));
+        }
+        self.motion_region = IRect::default();
     }
 
     /// Ask for a full refresh at the next settle (e.g. a "clean screen" button).
@@ -167,6 +245,12 @@ impl Policy {
 
     /// Time passed. Emits the settle refresh when due.
     pub fn on_tick(&mut self, now: Duration, interacting: bool) -> Vec<Update> {
+        let mut out = if now >= self.next_motion_at { self.flush_motion(now) } else { Vec::new() };
+        out.extend(self.on_settle(now, interacting));
+        out
+    }
+
+    fn on_settle(&mut self, now: Duration, interacting: bool) -> Vec<Update> {
         match self.deadline {
             Some(t) if now >= t && !interacting => {}
             _ => return Vec::new(),
@@ -262,6 +346,42 @@ mod tests {
         let u = p.on_damage(ms(0), &[dmg(0, true)], true);
         assert_eq!(u[0].waveform, Waveform::Fast);
         assert_eq!(p.next_deadline(), None);
+    }
+
+    #[test]
+    fn motion_is_rate_capped_and_coalesced() {
+        let mut p = Policy::new(Profile::FastColor, S, true);
+        p.motion.interval = ms(200);
+        let mut sent = 0;
+        // 30 fps of damage for one second
+        for f in 0..30u64 {
+            let now = ms(f * 33);
+            sent += p.on_motion_damage(now, &[dmg((f % 3) as i32 * 20, true)]).len();
+            sent += p.on_tick(now, false).len();
+        }
+        assert!(sent >= 4 && sent <= 6, "{sent} motion updates in 1 s at a 200 ms cap");
+        let last = p.on_tick(ms(2000), false);
+        assert_eq!(last.len(), 1, "the tail flushes");
+        assert!(!last[0].color, "mono while moving by default");
+        assert_eq!(last[0].waveform, Waveform::Fast);
+    }
+
+    #[test]
+    fn motion_colour_is_opt_in() {
+        let mut p = Policy::new(Profile::FastColor, S, true);
+        p.motion.color = true;
+        assert!(p.on_motion_damage(ms(0), &[dmg(0, true)])[0].color);
+    }
+
+    #[test]
+    fn when_motion_ends_its_region_settles_in_colour() {
+        let mut p = Policy::new(Profile::FastColor, S, true);
+        p.on_motion_damage(ms(0), &[dmg(100, true)]);
+        p.motion_ended(ms(500), true);
+        let s = p.on_tick(ms(500), false);
+        assert_eq!(s.len(), 1);
+        assert_eq!((s[0].waveform, s[0].color), (Waveform::Quality, true));
+        assert_eq!(s[0].rect, dmg(100, true).rect);
     }
 
     #[test]

@@ -144,6 +144,7 @@ pub fn render(
     clear: [u8; 4],
     threads: usize,
     force_all: bool,
+    dither: Option<&[bool]>,
 ) -> DirtyTiles {
     let (w, h) = (target.width as usize, target.height as usize);
     let cols = w.div_ceil(TILE);
@@ -210,6 +211,7 @@ pub fn render(
             .enumerate()
         {
             let (bins, prepared) = (&bins, &prepared);
+            let dither = dither;
             handles.push(s.spawn(move || {
                 let mut scratch = vec![[0u8; 4]; TILE * TILE];
                 let mut rowbuf = vec![0u8; TILE * bpp];
@@ -233,11 +235,21 @@ pub fn render(
                         // encode + diff against the live buffer
                         let mut changed = force_all;
                         let mut col = false;
+                        // Motion tiles are dithered HERE, at encode, so an
+                        // unchanged dithered image compares equal to what is
+                        // already in the buffer (no phantom damage).
+                        let dith = dither.is_some_and(|m| m[r * cols + c]);
                         for y in 0..tr.height() as usize {
                             let src = &scratch[y * TILE..y * TILE + tw];
                             for (x, p) in src.iter().enumerate() {
-                                encode(fmt, *p, &mut rowbuf[x * bpp..(x + 1) * bpp]);
-                                col |= is_chromatic(p[0], p[1], p[2]);
+                                if dith {
+                                    let l = crate::format::luma(p[0], p[1], p[2]);
+                                    let v = crate::motion::dither_bw(l, c * TILE + x, r * TILE + y);
+                                    encode(fmt, [v, v, v, 255], &mut rowbuf[x * bpp..(x + 1) * bpp]);
+                                } else {
+                                    encode(fmt, *p, &mut rowbuf[x * bpp..(x + 1) * bpp]);
+                                    col |= is_chromatic(p[0], p[1], p[2]);
+                                }
                             }
                             let off = (lr * TILE + y) * stride + c * TILE * bpp;
                             let dst = &mut buf[off..off + tw * bpp];
@@ -426,7 +438,7 @@ mod tests {
         let half = Color32::from_rgba_premultiplied(0, 0, 0, 128);
         render(&[quad(0.0, 0.0, 32.0, 32.0, half)], 1.0, &Textures::default(),
                Target { buf: &mut buf, stride: w as usize * 3, width: w, height: h, format: fmt },
-               [255, 255, 255, 255], 1, false);
+               [255, 255, 255, 255], 1, false, None);
         let reference = px(&buf, w, fmt, 3, 20);
         for i in 0..32 {
             assert_eq!(px(&buf, w, fmt, i, i), reference, "diagonal pixel {i}");
@@ -440,7 +452,7 @@ mod tests {
         let mut buf = frame(w, h, fmt);
         let prims = [quad(10.0, 10.0, 50.0, 40.0, Color32::BLACK)];
         let mk = |b: &mut Vec<u8>, force| render(&prims, 1.0, &Textures::default(),
-            Target { buf: b, stride: w as usize, width: w, height: h, format: fmt }, [255; 4], 4, force);
+            Target { buf: b, stride: w as usize, width: w, height: h, format: fmt }, [255; 4], 4, force, None);
         let first = mk(&mut buf, true);
         assert_eq!(first.count(), first.cols * first.rows);
         let second = mk(&mut buf, false);
@@ -452,7 +464,7 @@ mod tests {
         let (w, h, fmt) = (256, 256, PixelFormat::Rgb565);
         let mut buf = frame(w, h, fmt);
         let run = |b: &mut Vec<u8>, prims: &[ClippedPrimitive], force| render(prims, 1.0, &Textures::default(),
-            Target { buf: b, stride: w as usize * 2, width: w, height: h, format: fmt }, [255; 4], 3, force);
+            Target { buf: b, stride: w as usize * 2, width: w, height: h, format: fmt }, [255; 4], 3, force, None);
         run(&mut buf, &[], true);
         // a small red square entirely inside tile (1,1)
         let d = run(&mut buf, &[quad(70.0, 70.0, 90.0, 90.0, Color32::RED)], false);
@@ -470,7 +482,7 @@ mod tests {
         let mut q = quad(0.0, 0.0, 32.0, 32.0, Color32::BLACK); // 64x64 px at ppp 2
         q.clip_rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(16.0, 32.0)); // left half only
         render(&[q], 2.0, &Textures::default(),
-               Target { buf: &mut buf, stride: w as usize, width: w, height: h, format: fmt }, [255; 4], 2, true);
+               Target { buf: &mut buf, stride: w as usize, width: w, height: h, format: fmt }, [255; 4], 2, true, None);
         assert_eq!(px(&buf, w, fmt, 10, 60)[0], 0);
         assert_eq!(px(&buf, w, fmt, 40, 10)[0], 255);
     }
@@ -484,8 +496,8 @@ mod tests {
             .collect();
         let mut a = frame(w, h, fmt);
         let mut b = frame(w, h, fmt);
-        render(&prims, 1.0, &Textures::default(), Target { buf: &mut a, stride: w as usize * 3, width: w, height: h, format: fmt }, [255; 4], 1, true);
-        render(&prims, 1.0, &Textures::default(), Target { buf: &mut b, stride: w as usize * 3, width: w, height: h, format: fmt }, [255; 4], 7, true);
+        render(&prims, 1.0, &Textures::default(), Target { buf: &mut a, stride: w as usize * 3, width: w, height: h, format: fmt }, [255; 4], 1, true, None);
+        render(&prims, 1.0, &Textures::default(), Target { buf: &mut b, stride: w as usize * 3, width: w, height: h, format: fmt }, [255; 4], 7, true, None);
         assert!(a == b);
     }
 }

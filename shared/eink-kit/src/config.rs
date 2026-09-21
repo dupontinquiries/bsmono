@@ -29,6 +29,13 @@ pub struct Config {
     /// `EINK_THREADS`: raster workers.
     pub threads: usize,
     /// mem backend: `EINK_MEM_SIZE=WxH`, `EINK_DUMP=dir`.
+    /// `EINK_MOTION_HZ`: refresh cap for moving regions drawn mono (default 6).
+    pub motion_hz: f32,
+    /// `EINK_MOTION_COLOR=1`: keep colour while moving (then `EINK_MOTION_COLOR_HZ`, default 2).
+    pub motion_color: bool,
+    pub motion_color_hz: f32,
+    /// `EINK_DITHER=0` disables ordered dithering of mono motion.
+    pub dither: bool,
     pub mem_size: (u32, u32),
     pub dump: Option<String>,
 }
@@ -59,6 +66,10 @@ impl Config {
             settle: Duration::from_millis(num("EINK_SETTLE_MS", 450)),
             min_frame: Duration::from_millis(num("EINK_MIN_FRAME_MS", 120)),
             threads: num("EINK_THREADS", std::thread::available_parallelism().map(|n| n.get() as u64).unwrap_or(2)) as usize,
+            motion_hz: env("EINK_MOTION_HZ").and_then(|v| v.parse().ok()).unwrap_or(6.0),
+            motion_color: env("EINK_MOTION_COLOR").as_deref() == Some("1"),
+            motion_color_hz: env("EINK_MOTION_COLOR_HZ").and_then(|v| v.parse().ok()).unwrap_or(2.0),
+            dither: env("EINK_DITHER").as_deref() != Some("0"),
             mem_size,
             dump: env("EINK_DUMP"),
         })

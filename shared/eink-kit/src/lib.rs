@@ -6,7 +6,8 @@
 //!   engine::Engine                         ── headless core, fake-clock testable
 //!     ├─ raster     egui meshes → pixels, tiled, diffed into the live buffer
 //!     ├─ damage     dirty tiles → few rects (+ colour flag)
-//!     ├─ policy     rects → waveform per update, deferred ghost clean-up
+//!     ├─ motion     per-tile change rate + app hints → which regions are "moving"
+//!     ├─ policy     rects → waveform per update, capped motion lane, deferred clean-up
 //!     └─ touch      evdev MT-B → touch events → egui (pointer emulation)
 //!     │
 //!   present::Present                       ── who owns the panel (varies per device)
@@ -24,10 +25,12 @@ pub mod device;
 pub mod engine;
 pub mod format;
 pub mod geom;
+pub mod motion;
 pub mod policy;
 pub mod present;
 pub mod raster;
 pub mod touch;
 
 pub use egui;
+pub use motion::{hint, motion_interval, Hint};
 pub use engine::{diagnostics, request_full_refresh, run, EinkApp, Engine, FromCtx};
