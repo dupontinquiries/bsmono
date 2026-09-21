@@ -3222,7 +3222,17 @@ impl Default for App {
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
             provenance_tx, provenance_rx,
             follow: None,
-              carrier, project_path, library_roots: library::Roots::from_env(library_root.clone()),
+              carrier, project_path,
+              // The sidecar wins over the environment when it has an answer:
+              // a person who set the libraries in Settings expects them to
+              // still be set next launch, and a launcher script's env var is
+              // the DEFAULT, not an override of what they chose.
+              library_roots: {
+                  let mut r = library::Roots::from_env(library_root.clone());
+                  if !ws.library_audio.is_empty() { r.audio = ws.library_audio.clone().into(); }
+                  if !ws.library_video.is_empty() { r.video = Some(ws.library_video.clone().into()); }
+                  r
+              },
               library_root, library_tree, library_prefs,
               morph: morph_pad::PadState::default(),
               bounce_format,
@@ -3564,11 +3574,80 @@ impl eframe::App for App {
                         }
                     }
                 }
+                // Film: the ingest and touch-up verbs the palette already
+                // carries, as buttons, because a person who does not know
+                // the palette's words cannot search for a command they have
+                // never heard of. Each one is the SAME shell verb the
+                // palette raises, so the two can never drift.
+                ui.menu_button("film", |ui| {
+                    let selected = !self.studio.selection.is_empty();
+                    let busy = self.touchup_run.is_some();
+                    if ui.add_enabled(selected && !busy, egui::Button::new("stabilize — smooth-cam"))
+                        .on_hover_text("keep the camera move, lose the shake")
+                        .clicked() {
+                        self.run_palette_act(palette::Act::Shell(
+                            palette::ShellVerb::TouchUpStabilize(palette::StabilizeKind::Smooth)));
+                        ui.close();
+                    }
+                    if ui.add_enabled(selected && !busy, egui::Button::new("stabilize — still-cam"))
+                        .on_hover_text("lock off a shot that was handheld by accident")
+                        .clicked() {
+                        self.run_palette_act(palette::Act::Shell(
+                            palette::ShellVerb::TouchUpStabilize(palette::StabilizeKind::Still)));
+                        ui.close();
+                    }
+                    if ui.add_enabled(selected && !busy, egui::Button::new("stabilize — punch-in and de-jerk"))
+                        .on_hover_text("a deliberate pan with a bump in it; the least crop")
+                        .clicked() {
+                        self.run_palette_act(palette::Act::Shell(
+                            palette::ShellVerb::TouchUpStabilize(palette::StabilizeKind::Dejerk)));
+                        ui.close();
+                    }
+                    if ui.add_enabled(selected && !busy, egui::Button::new("clean plate (±6 frames)"))
+                        .on_hover_text("remove something crossing the shot, using the frames around it")
+                        .clicked() {
+                        self.run_palette_act(palette::Act::Shell(
+                            palette::ShellVerb::TouchUpCleanPlate { radius: 6, moving: false }));
+                        ui.close();
+                    }
+                    ui.separator();
+                    let groups: Vec<(studio_core::GroupId, String)> = self.studio.session.doc.project
+                        .groups.iter()
+                        .filter(|(id, _)| studio_video::multicam::from_group(
+                            &self.studio.session.doc.project, **id).is_ok())
+                        .map(|(id, g)| (*id, g.name.clone())).collect();
+                    ui.add_enabled_ui(!groups.is_empty(), |ui| {
+                        ui.menu_button("multiview a camera group", |ui| {
+                            for (id, name) in &groups {
+                                let on = self.multiview == Some(*id);
+                                if ui.add(egui::Button::selectable(on, name)).clicked() {
+                                    self.run_palette_act(palette::Act::Shell(
+                                        palette::ShellVerb::Multiview(if on { None } else { Some(*id) })));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
+                    if groups.is_empty() {
+                        ui.colored_label(egui::Color32::GRAY,
+                            "no camera group yet — group the angles of one moment first");
+                    }
+                    ui.separator();
+                    if ui.button("relink media to a folder…")
+                        .on_hover_text("proxies → camera originals; only the paths move")
+                        .clicked() {
+                        self.run_palette_act(palette::Act::Shell(palette::ShellVerb::RelinkToFolder));
+                        ui.close();
+                    }
+                });
                 if ui.button("save").clicked()
                     || ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S))
                 {
                     let path = self.project_path.clone();
                     workspace::save(&path, &workspace::WorkspaceState {
+                        library_audio: self.library_roots.audio.display().to_string(),
+                        library_video: self.library_roots.video.as_ref()
+                            .map(|p| p.display().to_string()).unwrap_or_default(),
                         combined: self.studio.combined,
                         panel: self.studio.panel.label().to_string(),
                         side_slot: match self.side_slot {
@@ -3792,6 +3871,64 @@ impl eframe::App for App {
                     ui.colored_label(egui::Color32::GRAY,
                         "several keys can share one note — wide regions like real \
                          piano-key spacing. Uncalibrated keys keep the tracker rows.");
+                    ui.separator();
+                    // Libraries: until now these were STUDIO_LIBRARY and
+                    // STUDIO_VIDEO_LIB only, which means "edit your launcher
+                    // script" — fine for the person who wrote it, invisible
+                    // to everyone else. The field shows what is in use and
+                    // what is actually there, because a typo and a real
+                    // folder look identical in a text box.
+                    ui.label("libraries — where sound and picture are browsed from:");
+                    let mut audio = self.library_roots.audio.display().to_string();
+                    let mut video = self.library_roots.video.as_ref()
+                        .map(|p| p.display().to_string()).unwrap_or_default();
+                    let mut changed = false;
+                    ui.horizontal(|ui| {
+                        ui.label("sound");
+                        if ui.add(egui::TextEdit::singleline(&mut audio).desired_width(260.0)
+                            .id_salt("lib-root-audio")).changed() { changed = true; }
+                        if ui.button("browse…").clicked() {
+                            if let Some(d) = export::pick_folder() {
+                                audio = d.display().to_string();
+                                changed = true;
+                            }
+                        }
+                        let state = library::inspect(std::path::Path::new(&audio), false);
+                        ui.colored_label(if state.usable() { colors.text_weak } else { colors.danger },
+                                         state.describe());
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("picture");
+                        if ui.add(egui::TextEdit::singleline(&mut video).desired_width(260.0)
+                            .hint_text("optional — proxies, takes").id_salt("lib-root-video")).changed() {
+                            changed = true;
+                        }
+                        if ui.button("browse…").clicked() {
+                            if let Some(d) = export::pick_folder() {
+                                video = d.display().to_string();
+                                changed = true;
+                            }
+                        }
+                        if !video.is_empty() {
+                            let state = library::inspect(std::path::Path::new(&video), true);
+                            ui.colored_label(if state.usable() { colors.text_weak } else { colors.danger },
+                                             state.describe());
+                        }
+                    });
+                    if changed {
+                        self.library_roots.audio = audio.clone().into();
+                        self.library_roots.video =
+                            (!video.trim().is_empty()).then(|| std::path::PathBuf::from(&video));
+                        self.library_root = self.library_roots.audio.clone();
+                        // The sidebar walks from the root each frame, so resetting its
+                        // open-folder state is all a root change needs.
+                        self.library_tree = library::TreeState::default();
+                        self.studio.status = "library — saved with the workspace on next save".into();
+                    }
+                    ui.colored_label(egui::Color32::GRAY,
+                        "set here, these override STUDIO_LIBRARY / STUDIO_VIDEO_LIB and are \
+                         kept per device with the workspace — a sample drive is not mounted \
+                         in the same place on two machines.");
                     ui.separator();
                     ui.label("your name, as peers see it beside your playhead:");
                     let hint = format!("site {}", self.studio.session.doc.site.0);
