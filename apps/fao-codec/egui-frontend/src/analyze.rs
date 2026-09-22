@@ -311,7 +311,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("gop.mp4");
         assert!(std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i",
-            "testsrc2=size=128x96:rate=30:duration=20", "-c:v", "libx264", "-g", "60", "-pix_fmt", "yuv420p"])
+            "testsrc2=size=128x96:rate=30:duration=20", "-c:v", "mpeg4", "-g", "60", "-pix_fmt", "yuv420p"])
             .arg(&f).status().unwrap().success());
         let mut keep = HashMap::new();
         let fb = sample_file(f.to_str().unwrap(), "gop", 12, &mut keep).unwrap();
@@ -329,17 +329,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Same solid HUD bar over different moving backgrounds.
+        // NATIVE ENCODERS ONLY. These fixtures used libx264, which Fedora's
+        // ffmpeg-free leaves out (patents): fleet_build.sh on Fedora failed with
+        // "Unknown encoder 'libx264'". ffv1 is ffmpeg's own LOSSLESS codec --
+        // needed here, since the analysis counts byte-identical blocks -- and it
+        // is in every build. It does not go in MP4, hence .mkv.
         let make = |name: &str, src: &str| {
             let ok = std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", src,
-                "-vf", "drawbox=x=0:y=0:w=iw:h=64:color=0x2040a0:t=fill", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-qp", "0"])
+                "-vf", "drawbox=x=0:y=0:w=iw:h=64:color=0x2040a0:t=fill", "-pix_fmt", "yuv420p", "-c:v", "ffv1"])
                 .arg(dir.join(name)).status().unwrap().success();
             assert!(ok, "{name}");
         };
-        make("m1.mp4", "testsrc=size=256x192:rate=10:duration=2");
-        make("m2.mp4", "testsrc2=size=256x192:rate=10:duration=2");
+        make("m1.mkv", "testsrc=size=256x192:rate=10:duration=2");
+        make("m2.mkv", "testsrc2=size=256x192:rate=10:duration=2");
         let mut keep = HashMap::new();
-        let a = sample_file(dir.join("m1.mp4").to_str().unwrap(), "m1", 4, &mut keep).unwrap();
-        let b = sample_file(dir.join("m2.mp4").to_str().unwrap(), "m2", 4, &mut keep).unwrap();
+        let a = sample_file(dir.join("m1.mkv").to_str().unwrap(), "m1", 4, &mut keep).unwrap();
+        let b = sample_file(dir.join("m2.mkv").to_str().unwrap(), "m2", 4, &mut keep).unwrap();
         assert_eq!((a.frames, b.frames), (4, 4));
         let r = analyze(&[a, b], bytes_per_block(&keep));
         assert!(r.savings_ratio() > 0.0, "the shared HUD must show up: {r:?}");

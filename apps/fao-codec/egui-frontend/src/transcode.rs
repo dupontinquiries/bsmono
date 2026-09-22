@@ -350,7 +350,10 @@ mod tests {
         let ok = Command::new("ffmpeg").args(["-v", "error", "-y",
             "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
             "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=0.3",
-            "-map", "0:a", "-map", "1:v", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+            "-map", "0:a", "-map", "1:v", "-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-c:a", "flac"])
+            // Native encoders only: libx264 is absent from Fedora's ffmpeg-free, and
+            // flac sidesteps whether a build has AAC. The test needs only an audio
+            // stream FIRST, not a particular codec.
             .arg(&src).status().unwrap().success();
         assert!(ok, "fixture");
         let (bytes, rep) = transcode(src.to_str().unwrap(), 80, None, |_, _| {}).unwrap();

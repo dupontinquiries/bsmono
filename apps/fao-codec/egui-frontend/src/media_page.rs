@@ -756,17 +756,22 @@ mod tests {
         let ok = std::process::Command::new("ffmpeg").arg("-version").output().map(|o| o.status.success()).unwrap_or(false);
         if !ok { eprintln!("no ffmpeg; skipping"); return; }
         let root = tmpdir("analyze_tab");
-        for (name, src) in [("a.mp4", "testsrc=size=256x192:rate=10:duration=2"),
-                            ("b.mp4", "testsrc2=size=256x192:rate=10:duration=2")] {
+        // NATIVE ENCODERS ONLY. These fixtures used libx264, which Fedora's
+        // ffmpeg-free leaves out (patents): fleet_build.sh on Fedora failed with
+        // "Unknown encoder 'libx264'". ffv1 is ffmpeg's own LOSSLESS codec --
+        // needed here, since the analysis counts byte-identical blocks -- and it
+        // is in every build. It does not go in MP4, hence .mkv.
+        for (name, src) in [("a.mkv", "testsrc=size=256x192:rate=10:duration=2"),
+                            ("b.mkv", "testsrc2=size=256x192:rate=10:duration=2")] {
             assert!(std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", src,
-                "-vf", "drawbox=x=0:y=0:w=iw:h=64:color=0x2040a0:t=fill", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-qp", "0"])
+                "-vf", "drawbox=x=0:y=0:w=iw:h=64:color=0x2040a0:t=fill", "-pix_fmt", "yuv420p", "-c:v", "ffv1"])
                 .arg(root.join(name)).status().unwrap().success());
         }
         let mut st = State::default();
         st.add(Source::Local(root.clone()));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while st.pending > 0 && std::time::Instant::now() < deadline { st.poll(); std::thread::sleep(std::time::Duration::from_millis(10)); }
-        st.include_text = "*.mp4".into();
+        st.include_text = "*.mkv".into();
         st.sync_patterns();
         st.samples = 4;
         let t = std::time::Instant::now();
