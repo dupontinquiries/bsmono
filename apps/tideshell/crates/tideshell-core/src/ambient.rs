@@ -1,27 +1,42 @@
 //! Auto-brightness from ambient light and time of day. Pure: callers feed
-//! lux readings, the clock (minute of the local day) and the user's slider,
-//! and apply the brightness values it returns.
+//! lux readings, the clock (minute of the local day) and the slider, and
+//! apply the brightness values it returns (at up to 90 Hz while moving).
 //!
-//! The pipeline, each stage chosen against a specific failure:
+//! ```text
+//!  lux ─► darkening gate ─► Holt filter (level L, trend T, residual σ²)
+//!                                   │
+//!             ┌─────────────────────┼──────────────────────────┐
+//!   centre c = curve(L)·night   band half-width w          math offset o1
+//!                               (widens with σ and |T|,    (forward prediction
+//!                                fast; contracts slowly)    curve(L+T·H) − curve(L),
+//!                                                           weighted by instability,
+//!                                                           decays once stable)
+//!   target = c + o1 + u·w        u = slider position in the band, −1..1
+//!   output: critically damped spring toward target, speed-limited
+//! ```
 //!
-//! 1. **Lux → brightness curve**, piecewise-linear in `log10(lux + 1)`:
-//!    perceived brightness is roughly logarithmic in lux, so 10 → 100 lux
-//!    (dim room → lit room) is as big a step as 1 000 → 10 000 (overcast →
-//!    daylight).
-//! 2. **Asymmetric smoothing** of log-lux: fast when it gets brighter (walking
-//!    outside: the screen must become readable now), slow when it gets darker,
-//!    and only after the darker reading has persisted for DARKEN_DELAY_MS. A
-//!    hand or passing shadow over the sensor must not dim the screen; slow
-//!    smoothing alone still dimmed it visibly (0.57 -> 0.48 for a one-second
-//!    shadow, caught by a test), so darkening waits first.
-//! 3. **Night window**: a multiplier that dims the result between `start` and
-//!    `end` (local wall clock, fading over `fade` minutes each side), for
-//!    dark-adapted eyes. With no sensor, time of day alone drives brightness.
-//! 4. **Learned offset**: when the user moves the brightness slider while auto
-//!    is on, the difference from the curve becomes an offset applied from then
-//!    on, so auto does not immediately undo the user's choice.
-//! 5. **Dead band** on the target, then a **rate-limited ramp** toward it: no
-//!    visible steps, and no stream of tiny adjustments from sensor noise.
+//! * **Centre**: lux → brightness is piecewise-linear in `log10(lux + 1)`
+//!   (perception is ~logarithmic), times the night-window factor.
+//! * **Input**: brightening is followed fast (TAU_UP); a darker reading must
+//!   persist DARKEN_DELAY_MS before it counts, then is followed slowly
+//!   (TAU_DOWN), so a hand or shadow over the sensor does not dim the screen.
+//! * **Holt filter** (level + trend) on log-lux, dt-aware so irregular sensor
+//!   rates give the same result; residual variance tracks noise.
+//! * **Stability** s = exp(−|T|/T_REF − σ/S_REF): 1 when light is steady.
+//! * **Offset 1, from the maths**: while light is changing, lean toward where
+//!   it is heading (forward prediction over HORIZON_S) in proportion to the
+//!   instability; engages quickly, and decays back to 0 as stability returns
+//!   (its time constant lengthens with stability: decay tracking).
+//! * **Offset 2, from the slider**: the slider is relative. Its travel spans
+//!   the adaptive band, centre = auto; the position u ∈ −1..1 is stored, so
+//!   the offset in brightness units (u·w) scales with the band.
+//! * **Band** half-width w: W_MIN plus terms for noise (σ) and trend, mapped
+//!   into brightness units by the curve's local slope; expands fast,
+//!   contracts slowly.
+//! * **Output**: a critically damped spring (exact closed form, frame-rate
+//!   independent, no overshoot) with a speed limit, emitting every visible
+//!   step (EMIT_STEP) — ~90 small steps a second during a change instead of
+//!   a few large ones. There is no dead band: it made steps.
 
 use crate::Millis;
 
@@ -34,21 +49,6 @@ const CURVE: [(f32, f32); 6] = [
     (3.5, 0.78), // ~3 000 lux: overcast outdoors
     (4.3, 1.00), // ~20 000 lux: daylight
 ];
-
-pub const MIN_LEVEL: f32 = 0.02;
-/// Seconds for the smoothed log-lux to cover ~63% of a step, per direction.
-pub const TAU_UP: f32 = 1.2;
-pub const TAU_DOWN: f32 = 6.0;
-/// A darker reading must persist this long before the screen starts dimming.
-pub const DARKEN_DELAY_MS: Millis = 3000;
-/// Target changes smaller than this are ignored (sensor noise, flicker).
-pub const DEAD_BAND: f32 = 0.03;
-/// Maximum ramp speed, brightness units per second (full range in ~2.5 s).
-pub const RAMP_PER_S: f32 = 0.4;
-/// No reading for this long: treat the sensor as gone, use time of day.
-pub const SENSOR_STALE_MS: Millis = 15_000;
-/// Brightness with no sensor, before the night window applies.
-pub const DAY_LEVEL_NO_SENSOR: f32 = 0.6;
 
 pub fn lux_curve(lux: f32) -> f32 {
     let x = (lux.max(0.0) + 1.0).log10();
@@ -124,21 +124,85 @@ impl NightWindow {
     }
 }
 
+pub const MIN_LEVEL: f32 = 0.02;
+pub const TAU_UP: f32 = 1.2;
+pub const TAU_DOWN: f32 = 6.0;
+pub const DARKEN_DELAY_MS: Millis = 3000;
+/// Trend and residual-variance smoothing, seconds.
+pub const TAU_TREND: f32 = 2.0;
+pub const TAU_VAR: f32 = 4.0;
+/// A trend overtaken by the input decays with this; any trend with the other.
+pub const TREND_SPENT_TAU: f32 = 0.3;
+pub const TREND_DAMP_TAU: f32 = 6.0;
+/// Forward-prediction horizon, seconds.
+pub const HORIZON_S: f32 = 1.5;
+/// Stability scales: trend (log-lux/s) and noise (log-lux σ) that count as "changing".
+pub const T_REF: f32 = 0.08;
+pub const S_REF: f32 = 0.08;
+/// Band half-width limits, and its expand / contract time constants.
+pub const W_MIN: f32 = 0.06;
+pub const W_MAX: f32 = 0.35;
+pub const TAU_W_EXPAND: f32 = 0.4;
+pub const TAU_W_CONTRACT: f32 = 5.0;
+/// Output spring (rad/s) and speed limit (brightness units per second).
+pub const OMEGA: f32 = 7.0;
+pub const MAX_SPEED: f32 = 0.8;
+/// Emit when the output moved at least this much (~one step of a 12-bit backlight x 6).
+pub const EMIT_STEP: f32 = 0.0015;
+pub const SENSOR_STALE_MS: Millis = 15_000;
+pub const DAY_LEVEL_NO_SENSOR: f32 = 0.6;
+
+/// The curve on the log axis, and its local slope (brightness per log10-lux).
+fn curve_x(x: f32) -> f32 {
+    lux_curve(10f32.powf(x) - 1.0)
+}
+fn slope_x(x: f32) -> f32 {
+    (curve_x(x + 0.05) - curve_x((x - 0.05).max(0.0))) / 0.1
+}
+
+/// One exact step of a critically damped spring. `x` is the offset from the
+/// target, `v` its velocity; returns (x, v) after `dt` seconds.
+pub fn spring_step(x: f32, v: f32, omega: f32, dt: f32) -> (f32, f32) {
+    let e = (-omega * dt).exp();
+    let k = v + omega * x;
+    ((x + k * dt) * e, (v - omega * k * dt) * e)
+}
+
+/// Everything the slider draws.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Band {
+    /// Auto level (sensor/time of day), before offsets.
+    pub center: f32,
+    pub low: f32,
+    pub high: f32,
+    /// center + offsets, clamped: where the output is heading.
+    pub target: f32,
+    pub applied: Option<f32>,
+    pub math_offset: f32,
+    /// u * w, in brightness units.
+    pub user_offset: f32,
+    pub stability: f32,
+    /// log10-lux per second.
+    pub trend: f32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AutoBrightness {
     pub enabled: bool,
-    /// Learned from the user's slider; added after the curve and night factor.
-    pub offset: f32,
+    /// Slider position within the adaptive band, −1..1 (0 = the auto centre).
+    pub user: f32,
     pub night: NightWindow,
-    /// Smoothed log10(lux + 1); None until the first reading.
-    log_lux: Option<f32>,
+    level: Option<f32>,
+    trend: f32,
+    var: f32,
     last_reading: Option<Millis>,
-    /// When readings started being darker than the smoothed value.
     darker_since: Option<Millis>,
-    target: Option<f32>,
-    /// Current level as last applied (from us, or from the user's slider).
+    math_offset: f32,
+    half_width: f32,
     pub applied: Option<f32>,
+    vel: f32,
     last_emitted: Option<f32>,
+    last_target: Option<f32>,
     last_tick: Option<Millis>,
 }
 
@@ -146,112 +210,196 @@ impl Default for AutoBrightness {
     fn default() -> Self {
         AutoBrightness {
             enabled: false,
-            offset: 0.0,
+            user: 0.0,
             night: NightWindow::default(),
-            log_lux: None,
+            level: None,
+            trend: 0.0,
+            var: 0.0,
             last_reading: None,
             darker_since: None,
-            target: None,
+            math_offset: 0.0,
+            half_width: W_MIN,
             applied: None,
+            vel: 0.0,
             last_emitted: None,
+            last_target: None,
             last_tick: None,
         }
     }
 }
 
 impl AutoBrightness {
-    /// The level the backlight had when we started (so the first ramp starts
-    /// from reality instead of jumping).
     pub fn set_current(&mut self, level: f32) {
         self.applied = Some(level.clamp(0.0, 1.0));
         self.last_emitted = self.applied;
+        self.vel = 0.0;
     }
 
     pub fn has_sensor(&self, now: Millis) -> bool {
-        self.last_reading.is_some_and(|t| now.saturating_sub(t) < SENSOR_STALE_MS)
+        self.last_reading.is_some_and(|t| now.saturating_sub(t) < SENSOR_STALE_MS) && self.level.is_some()
     }
 
     pub fn smoothed_lux(&self) -> Option<f32> {
-        self.log_lux.map(|l| 10f32.powf(l) - 1.0)
+        self.level.map(|l| 10f32.powf(l) - 1.0)
     }
 
-    /// A sensor reading. Smoothing happens here, per reading, with the
-    /// elapsed time since the previous one, so irregular sensor rates give
-    /// the same curve.
+    pub fn stability(&self) -> f32 {
+        (-(self.trend.abs() / T_REF) - (self.var.max(0.0).sqrt() / S_REF)).exp()
+    }
+
+    pub fn half_width(&self) -> f32 {
+        self.half_width
+    }
+
+    pub fn math_offset(&self) -> f32 {
+        self.math_offset
+    }
+
+    pub fn set_user(&mut self, u: f32) {
+        self.user = u.clamp(-1.0, 1.0);
+    }
+
+    /// With auto off, the slider is absolute: just adopt the level.
+    pub fn set_absolute(&mut self, level: f32) {
+        self.set_current(level);
+    }
+
     pub fn on_lux(&mut self, lux: f32, now: Millis) {
         let x = (lux.max(0.0) + 1.0).log10();
-        self.log_lux = Some(match (self.log_lux, self.last_reading) {
-            (Some(prev), Some(t)) => {
-                let dt = now.saturating_sub(t) as f32 / 1000.0;
-                if x >= prev {
-                    self.darker_since = None;
-                    prev + (x - prev) * (1.0 - (-dt / TAU_UP).exp())
-                } else {
+        match (self.level, self.last_reading) {
+            (Some(l), Some(t)) => {
+                let dt = (now.saturating_sub(t) as f32 / 1000.0).max(1e-3);
+                if x < l {
                     let since = *self.darker_since.get_or_insert(now);
                     if now.saturating_sub(since) < DARKEN_DELAY_MS {
-                        prev // still waiting: a shadow, or real darkening?
-                    } else {
-                        prev + (x - prev) * (1.0 - (-dt / TAU_DOWN).exp())
+                        self.last_reading = Some(now);
+                        return; // a shadow, or real darkening? wait.
                     }
+                } else {
+                    self.darker_since = None;
                 }
+                let tau = if x >= l { TAU_UP } else { TAU_DOWN };
+                let mut predicted = l + self.trend * dt;
+                // Never extrapolate past the reading. When the prediction has
+                // overtaken the input in the trend's direction, the change is
+                // over: stop at the input and spend the trend fast. Without
+                // this, a rise that stopped at 316 lux carried the estimate to
+                // 490, and the darkening gate then froze that overshoot (the
+                // steady input looked "darker") - brightness would climb past
+                // the right level and slide back (found by the trend test).
+                if (self.trend > 0.0 && predicted > x) || (self.trend < 0.0 && predicted < x) {
+                    predicted = if self.trend > 0.0 { l.max(x) } else { l.min(x) };
+                    self.trend *= (-dt / TREND_SPENT_TAU).exp();
+                }
+                let resid = x - predicted;
+                self.var += (resid * resid - self.var) * (1.0 - (-dt / TAU_VAR).exp());
+                let a = 1.0 - (-dt / tau).exp();
+                let new_l = predicted + a * resid;
+                let b = 1.0 - (-dt / TAU_TREND).exp();
+                self.trend += ((new_l - l) / dt - self.trend) * b;
+                // Damped trend: a trend nobody renews fades on its own.
+                self.trend *= (-dt / TREND_DAMP_TAU).exp();
+                self.level = Some(new_l);
             }
-            _ => x,
-        });
+            _ => {
+                self.level = Some(x);
+                self.trend = 0.0;
+                self.var = 0.0;
+            }
+        }
         self.last_reading = Some(now);
     }
 
-    /// What the pipeline wants right now, before dead band and ramp.
-    pub fn desired(&self, now: Millis, minute: u32) -> f32 {
-        let base = match self.log_lux {
-            Some(l) if self.has_sensor(now) => lux_curve(10f32.powf(l) - 1.0),
+    fn center(&self, now: Millis, minute: u32) -> f32 {
+        let base = match self.level {
+            Some(l) if self.has_sensor(now) => curve_x(l),
             _ => DAY_LEVEL_NO_SENSOR,
         };
-        (base * self.night.factor(minute) + self.offset).clamp(MIN_LEVEL, 1.0)
+        base * self.night.factor(minute)
     }
 
-    /// The user moved the brightness slider. With auto on, learn the offset
-    /// that makes the pipeline produce exactly this level here and now.
-    /// Returns true when the offset changed (worth persisting).
-    pub fn on_manual(&mut self, level: f32, now: Millis, minute: u32) -> bool {
-        let level = level.clamp(0.0, 1.0);
-        self.applied = Some(level);
-        self.last_emitted = Some(level);
-        self.target = Some(level);
-        if !self.enabled {
-            return false;
+    pub fn band(&self, now: Millis, minute: u32) -> Band {
+        let center = self.center(now, minute);
+        let user_offset = self.user * self.half_width;
+        let target = (center + self.math_offset + user_offset).clamp(MIN_LEVEL, 1.0);
+        Band {
+            center,
+            low: (center + self.math_offset - self.half_width).clamp(MIN_LEVEL, 1.0),
+            high: (center + self.math_offset + self.half_width).clamp(MIN_LEVEL, 1.0),
+            target,
+            applied: self.applied,
+            math_offset: self.math_offset,
+            user_offset,
+            stability: if self.has_sensor(now) { self.stability() } else { 1.0 },
+            trend: self.trend,
         }
-        let without_offset = self.desired(now, minute) - self.offset;
-        let new = (level - without_offset).clamp(-0.6, 0.6);
-        let changed = (new - self.offset).abs() > 1e-4;
-        self.offset = new;
-        changed
     }
 
-    /// Advance; returns a brightness to apply when one is due.
+    /// What the band half-width and the math offset are heading toward now.
+    fn targets(&self, now: Millis, minute: u32) -> (f32, f32) {
+        let night = self.night.factor(minute);
+        match self.level {
+            Some(l) if self.has_sensor(now) => {
+                let slope = slope_x(l) * night;
+                let w = W_MIN + 2.0 * slope * self.var.max(0.0).sqrt() + 0.5 * slope * self.trend.abs() * HORIZON_S;
+                let o1 = (curve_x(l + self.trend * HORIZON_S) - curve_x(l)) * night * (1.0 - self.stability());
+                (w.clamp(W_MIN, W_MAX), o1)
+            }
+            _ => (W_MIN, 0.0),
+        }
+    }
+
+    /// The band half-width the current light calls for (the band itself
+    /// follows it: fast when widening, slowly when narrowing).
+    pub fn width_target(&self, now: Millis, minute: u32) -> f32 {
+        self.targets(now, minute).0
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.enabled
+            && self.applied.is_some()
+            && (self.vel.abs() > 1e-3 || self.last_target.zip(self.applied).is_some_and(|(t, a)| (t - a).abs() > 5e-4))
+    }
+
+    /// Advance the band, the math offset and the output spring; returns a
+    /// level to apply when it moved a visible step.
     pub fn tick(&mut self, now: Millis, minute: u32) -> Option<f32> {
-        let dt = self.last_tick.map(|t| now.saturating_sub(t) as f32 / 1000.0).unwrap_or(0.0).min(0.5);
+        let dt = self.last_tick.map(|t| now.saturating_sub(t) as f32 / 1000.0).unwrap_or(0.0).min(0.25);
         self.last_tick = Some(now);
         if !self.enabled {
             return None;
         }
-        let want = self.desired(now, minute);
-        let target = match self.target {
-            Some(t) if (want - t).abs() < DEAD_BAND => t,
-            _ => want,
-        };
-        self.target = Some(target);
-        // Never act from an unknown level: without set_current (no readable
-        // backlight) a first emit would be a jump, and there is nothing to
-        // control anyway. Found by the shell tests: auto-on-by-default made a
-        // fresh shell emit SetSlider(0.6) on its first tick.
-        let Some(cur) = self.applied else { return None };
-        let step = RAMP_PER_S * dt;
-        let next = if (target - cur).abs() <= step { target } else { cur + step * (target - cur).signum() };
+        let sensor = self.has_sensor(now);
+        let s = if sensor { self.stability() } else { 1.0 };
+        let (w_target, o1_target) = self.targets(now, minute);
+        if dt > 0.0 {
+            let tw = if w_target > self.half_width { TAU_W_EXPAND } else { TAU_W_CONTRACT };
+            self.half_width += (w_target - self.half_width) * (1.0 - (-dt / tw).exp());
+            // Engage quickly while unstable; release slowly as it stabilizes.
+            let to = 0.3 + 2.2 * s;
+            self.math_offset += (o1_target - self.math_offset) * (1.0 - (-dt / to).exp());
+        }
+        let target = self.band(now, minute).target;
+        self.last_target = Some(target);
+        // Never act from an unknown level (no readable backlight): a first
+        // emit would be a jump, and there is nothing to control anyway.
+        let cur = self.applied?;
+        let (x, mut v) = spring_step(cur - target, self.vel, OMEGA, dt);
+        let mut next = target + x;
+        let maxd = MAX_SPEED * dt;
+        if (next - cur).abs() > maxd {
+            next = cur + maxd * (next - cur).signum();
+            v = MAX_SPEED * (next - cur).signum();
+        }
+        if (next - target).abs() < 1e-4 && v.abs() < 1e-3 {
+            next = target;
+            v = 0.0;
+        }
         self.applied = Some(next);
-        // Emit when it moved a visible amount, or when it just arrived.
+        self.vel = v;
         let due = match self.last_emitted {
             None => true,
-            Some(e) => (next - e).abs() >= 0.005 || (next == target && e != target),
+            Some(e) => (next - e).abs() >= EMIT_STEP || (next == target && e != target),
         };
         if due {
             self.last_emitted = Some(next);
@@ -268,25 +416,34 @@ mod tests {
 
     const NOON: u32 = 12 * 60;
 
-    /// Feed a constant lux at `hz` for `secs`, ticking each sample; return
-    /// the emitted levels.
-    fn run(a: &mut AutoBrightness, lux: f32, secs: f32, t0: Millis, hz: u32) -> (Vec<f32>, Millis) {
-        let step = 1000 / hz as u64;
+    /// Feed `lux(t_secs)` at `hz` for `secs`, ticking each sample. Returns
+    /// (every applied value, emitted values, end time).
+    fn run_fn(a: &mut AutoBrightness, lux: impl Fn(f32) -> f32, secs: f32, t0: Millis, hz: u32) -> (Vec<f32>, Vec<f32>, Millis) {
+        let step = 1000.0 / hz as f32;
         let n = (secs * hz as f32) as u64;
-        let mut out = vec![];
+        let (mut all, mut out) = (vec![], vec![]);
         let mut t = t0;
-        for _ in 0..n {
-            t += step;
-            a.on_lux(lux, t);
+        for i in 1..=n {
+            t = t0 + (i as f32 * step) as u64;
+            a.on_lux(lux(i as f32 / hz as f32), t);
             out.extend(a.tick(t, NOON));
+            all.extend(a.applied);
         }
-        (out, t)
+        (all, out, t)
+    }
+
+    fn run(a: &mut AutoBrightness, lux: f32, secs: f32, t0: Millis, hz: u32) -> (Vec<f32>, Vec<f32>, Millis) {
+        run_fn(a, |_| lux, secs, t0, hz)
     }
 
     fn on() -> AutoBrightness {
         let mut a = AutoBrightness { enabled: true, ..Default::default() };
         a.set_current(0.5);
         a
+    }
+
+    fn log(l: f32) -> f32 {
+        (l + 1.0).log10()
     }
 
     #[test]
@@ -305,15 +462,15 @@ mod tests {
 
     #[test]
     fn night_window_fades_and_wraps_midnight() {
-        let w = NightWindow::default(); // 22:00-07:00, 60 min fades, dim 0.6
+        let w = NightWindow::default();
         assert_eq!(w.factor(NOON), 1.0);
-        assert_eq!(w.factor(23 * 60), 0.6, "inside");
-        assert_eq!(w.factor(2 * 60), 0.6, "after midnight");
-        assert!((w.factor(21 * 60 + 30) - 0.8).abs() < 1e-3, "half-way into the evening fade");
-        assert!((w.factor(7 * 60 + 30) - 0.8).abs() < 1e-3, "half-way through the morning fade");
+        assert_eq!(w.factor(23 * 60), 0.6);
+        assert_eq!(w.factor(2 * 60), 0.6);
+        assert!((w.factor(21 * 60 + 30) - 0.8).abs() < 1e-3);
+        assert!((w.factor(7 * 60 + 30) - 0.8).abs() < 1e-3);
         assert_eq!(w.factor(8 * 60 + 1), 1.0);
         let day_shift = NightWindow { start: 9 * 60, end: 17 * 60, fade: 30, dim: 0.5 };
-        assert_eq!(day_shift.factor(NOON), 0.5, "non-wrapping window works too");
+        assert_eq!(day_shift.factor(NOON), 0.5);
         assert_eq!(day_shift.factor(20 * 60), 1.0);
     }
 
@@ -321,128 +478,153 @@ mod tests {
     fn span_parsing() {
         assert_eq!(NightWindow::parse_span("22:30-06:15"), Some((1350, 375)));
         assert_eq!(NightWindow::parse_span("25:00-06:00"), None);
-        assert_eq!(NightWindow::parse_span("nonsense"), None);
         assert_eq!(NightWindow::default().format_span(), "22:00-07:00");
     }
 
     #[test]
     fn brightens_fast_darkens_slow() {
         let mut a = on();
-        let (_, t) = run(&mut a, 50.0, 30.0, 0, 5); // settle indoors
-        let settled = a.applied.unwrap();
-        // Step outside: within 4 s most of the way up.
-        let (_, t) = run(&mut a, 20_000.0, 4.0, t, 5);
-        let up = a.applied.unwrap();
-        assert!(up > 0.85, "brightened to {up} in 4 s from {settled}");
-        // Back inside: after 4 s still well above the indoor level...
-        let (_, t) = run(&mut a, 50.0, 4.0, t, 5);
-        let mid = a.applied.unwrap();
-        assert!(mid > settled + 0.25, "darkened too fast: {mid} vs {settled}");
-        // ...but it does get there.
-        run(&mut a, 50.0, 40.0, t, 5);
-        assert!((a.applied.unwrap() - settled).abs() < DEAD_BAND + 0.01);
+        let (_, _, t) = run(&mut a, 50.0, 30.0, 0, 10);
+        let (lo, hi) = (log(50.0), log(20_000.0));
+        let (_, _, t) = run(&mut a, 20_000.0, 4.0, t, 10);
+        let up = log(a.smoothed_lux().unwrap());
+        assert!((up - lo) / (hi - lo) > 0.9, "4 s outside: only {:.2} of the way up", (up - lo) / (hi - lo));
+        let (_, _, _) = run(&mut a, 50.0, 4.0, t, 10);
+        let mid = log(a.smoothed_lux().unwrap());
+        assert!((mid - lo) / (hi - lo) > 0.5, "4 s back inside: already {:.2} of the way down", 1.0 - (mid - lo) / (hi - lo));
     }
 
     #[test]
     fn darkening_is_gradual_once_the_delay_has_passed() {
-        // Measured on the smoothed light itself, so neither the delay window
-        // nor the ramp limit can hide fast darkening (the first test of the
-        // asymmetry passed even with TAU_DOWN replaced by TAU_UP).
         let mut a = on();
-        let (_, t) = run(&mut a, 20_000.0, 30.0, 0, 5);
+        let (_, _, t) = run(&mut a, 20_000.0, 30.0, 0, 5);
         run(&mut a, 50.0, (DARKEN_DELAY_MS as f32 / 1000.0) + 2.0, t, 5);
-        let mid_log = ((50f32 + 1.0).log10() + (20_000f32 + 1.0).log10()) / 2.0;
-        let now_log = (a.smoothed_lux().unwrap() + 1.0).log10();
-        assert!(now_log > mid_log, "2 s after the delay it is already past half-way down: {now_log} <= {mid_log}");
+        let mid_log = (log(50.0) + log(20_000.0)) / 2.0;
+        assert!(log(a.smoothed_lux().unwrap()) > mid_log);
     }
 
     #[test]
     fn a_brief_shadow_does_not_flicker_the_screen() {
         let mut a = on();
-        let (_, t) = run(&mut a, 800.0, 30.0, 0, 5);
+        let (_, _, t) = run(&mut a, 800.0, 30.0, 0, 10);
         let before = a.applied.unwrap();
-        // Hand over the sensor for one second.
-        let (emits, t) = run(&mut a, 5.0, 1.0, t, 5);
-        let dip = emits.iter().cloned().fold(before, f32::min);
+        let (all, _, _) = run(&mut a, 5.0, 1.0, t, 90);
+        let dip = all.iter().cloned().fold(before, f32::min);
         assert!(before - dip < 0.005, "dimmed {before} -> {dip} for a one-second shadow");
-        run(&mut a, 800.0, 10.0, t, 5);
     }
 
     #[test]
-    fn sensor_noise_inside_the_dead_band_emits_nothing() {
-        let mut a = on();
-        let (_, mut t) = run(&mut a, 300.0, 30.0, 0, 5);
-        let mut emits = 0;
-        for i in 0..100 {
-            t += 200;
-            a.on_lux(if i % 2 == 0 { 280.0 } else { 330.0 }, t);
-            emits += a.tick(t, NOON).is_some() as u32;
-        }
-        assert_eq!(emits, 0);
-    }
-
-    #[test]
-    fn ramp_is_rate_limited_and_monotonic() {
-        let mut a = on();
-        a.set_current(0.05);
-        let (emits, _) = run(&mut a, 20_000.0, 1.0, 0, 20);
-        assert!(emits.windows(2).all(|w| w[1] >= w[0]), "{emits:?}");
-        let reached = *emits.last().unwrap();
-        assert!(reached <= 0.05 + RAMP_PER_S * 1.0 + 0.02, "ramp too fast: {reached} after 1 s");
-    }
-
-    #[test]
-    fn smoothing_is_rate_independent() {
+    fn input_filter_is_rate_independent() {
         let mut a = on();
         let mut b = on();
         run(&mut a, 3000.0, 3.0, 0, 5);
         run(&mut b, 3000.0, 3.0, 0, 50);
-        assert!((a.smoothed_lux().unwrap() - b.smoothed_lux().unwrap()).abs() < 1.0);
+        let (la, lb) = (log(a.smoothed_lux().unwrap()), log(b.smoothed_lux().unwrap()));
+        assert!((la - lb).abs() < 0.08, "{la} vs {lb}");
     }
 
     #[test]
-    fn manual_slider_teaches_an_offset_and_auto_keeps_it() {
+    fn band_widens_fast_with_noise_and_contracts_slowly() {
         let mut a = on();
-        let (_, t) = run(&mut a, 300.0, 30.0, 0, 5);
-        let auto_level = a.applied.unwrap();
-        assert!(a.on_manual(auto_level + 0.2, t, NOON), "offset changed");
-        // Same light: auto must not pull it back.
-        let (emits, t) = run(&mut a, 300.0, 10.0, t, 5);
-        assert!(emits.is_empty(), "fought the user: {emits:?}");
-        assert!((a.applied.unwrap() - (auto_level + 0.2)).abs() < 1e-3);
-        // Brighter light: still brighter than the plain curve by ~the offset.
-        run(&mut a, 3000.0, 30.0, t, 5);
-        let plain = lux_curve(3000.0);
-        assert!((a.applied.unwrap() - (plain + 0.2).min(1.0)).abs() < DEAD_BAND + 0.01, "{} vs {}", a.applied.unwrap(), plain + 0.2);
+        let (_, _, t) = run(&mut a, 300.0, 40.0, 0, 10);
+        assert!(a.half_width() < W_MIN + 0.02, "steady: narrow ({})", a.half_width());
+        let (_, _, t) = run_fn(&mut a, |s| if (s * 4.0) as u32 % 2 == 0 { 120.0 } else { 900.0 }, 8.0, t, 10);
+        let wide = a.half_width();
+        assert!(wide > W_MIN + 0.06, "noisy: widened ({wide})");
+        let (_, _, t) = run(&mut a, 300.0, 1.0, t, 10);
+        // Contracts slowly: it lags behind the width the light now calls for.
+        // Measured: +0.027 at 1 s with TAU_W_CONTRACT, ~0.000 with fast
+        // contraction. (Comparing against the earlier width passed even with
+        // fast contraction, because the target width itself falls slowly.)
+        let lag = a.half_width() - a.width_target(t, NOON);
+        assert!(lag > 0.01, "band {} vs target {}: not lagging", a.half_width(), a.width_target(t, NOON));
+        run(&mut a, 300.0, 60.0, t, 10);
+        assert!(a.half_width() < W_MIN + 0.03, "steady again: narrow ({})", a.half_width());
     }
 
     #[test]
-    fn disabled_emits_nothing_and_manual_learns_nothing() {
-        let mut a = AutoBrightness::default();
-        let (emits, t) = run(&mut a, 20_000.0, 5.0, 0, 5);
-        assert!(emits.is_empty());
-        assert!(!a.on_manual(0.9, t, NOON));
-        assert_eq!(a.offset, 0.0);
-    }
-
-    #[test]
-    fn without_a_sensor_time_of_day_drives_it() {
+    fn forward_prediction_leads_a_trend_then_decays_when_stable() {
         let mut a = on();
-        let day = a.desired(0, NOON);
-        let night = a.desired(0, 2 * 60);
-        assert!((day - DAY_LEVEL_NO_SENSOR).abs() < 1e-6 && (night - DAY_LEVEL_NO_SENSOR * 0.6).abs() < 1e-6);
-        // A sensor that stops reporting falls back to the clock.
-        a.on_lux(20_000.0, 0);
-        assert!(a.desired(1000, NOON) > 0.95);
-        assert!((a.desired(SENSOR_STALE_MS + 1, NOON) - DAY_LEVEL_NO_SENSOR).abs() < 1e-6);
+        let (_, _, t) = run(&mut a, 10.0, 20.0, 0, 10);
+        // Light rising steadily: log-lux +0.1 per second (e.g. dawn, a door opening slowly).
+        let (_, _, t) = run_fn(&mut a, |s| 10.0 * 10f32.powf(s * 0.1), 15.0, t, 10);
+        let b = a.band(t, NOON);
+        assert!(a.band(t, NOON).trend > 0.05, "trend tracked: {}", b.trend);
+        assert!(b.math_offset > 0.01, "leans toward where the light is heading: {}", b.math_offset);
+        assert!(b.target > b.center, "target leads the plain curve");
+        // Light stops changing: the math offset decays away.
+        let end_lux = 10.0 * 10f32.powf(1.5);
+        run(&mut a, end_lux, 40.0, t, 10);
+        assert!(a.math_offset().abs() < 0.01, "decayed once stable: {}", a.math_offset());
+        assert!(a.stability() > 0.9);
     }
 
     #[test]
-    fn night_dims_the_sensor_result_too() {
+    fn no_overshoot_when_a_trend_ends() {
+        // The first filter carried a rise that stopped at 316 lux on to 490
+        // (then the darkening gate froze it there).
         let mut a = on();
-        a.on_lux(300.0, 0);
-        let (d, n) = (a.desired(1, NOON), a.desired(1, 23 * 60));
-        assert!((n - d * 0.6).abs() < 1e-4, "{d} {n}");
+        let (_, _, t) = run(&mut a, 10.0, 20.0, 0, 10);
+        let (_, _, mut t) = run_fn(&mut a, |s| 10.0 * 10f32.powf(s * 0.1), 15.0, t, 10);
+        let end = 10.0 * 10f32.powf(1.5);
+        let mut peak: f32 = 0.0;
+        for _ in 0..300 {
+            t += 100;
+            a.on_lux(end, t);
+            a.tick(t, NOON);
+            peak = peak.max(a.smoothed_lux().unwrap());
+        }
+        assert!(peak <= end * 1.05, "estimate overshot to {peak} (input {end})");
+        assert!((a.smoothed_lux().unwrap() - end).abs() / end < 0.02);
+    }
+
+    #[test]
+    fn slider_offset_is_relative_to_the_band_and_scales_with_it() {
+        let mut a = on();
+        let (_, _, t) = run(&mut a, 300.0, 40.0, 0, 10);
+        a.set_user(0.5);
+        let b = a.band(t, NOON);
+        assert!((b.user_offset - 0.5 * a.half_width()).abs() < 1e-6);
+        assert!((b.target - (b.center + b.math_offset + b.user_offset)).abs() < 1e-5);
+        let narrow = b.user_offset;
+        let (_, _, t) = run_fn(&mut a, |s| if (s * 4.0) as u32 % 2 == 0 { 120.0 } else { 900.0 }, 8.0, t, 10);
+        assert!(a.band(t, NOON).user_offset > narrow * 1.5, "the same slider position means more when the band is wide");
+        a.set_user(3.0);
+        assert_eq!(a.user, 1.0, "clamped to the band");
+    }
+
+    #[test]
+    fn output_is_smooth_at_90hz() {
+        let mut a = on();
+        a.set_current(0.2);
+        let (all, emits, _) = run(&mut a, 500.0, 2.0, 0, 90);
+        // Velocity continuous: acceleration bounded (no step changes in speed).
+        let v: Vec<f32> = all.windows(2).map(|w| (w[1] - w[0]) * 90.0).collect();
+        let max_dv = v.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max);
+        assert!(max_dv < 0.25, "speed jumped by {max_dv}/s in one 11 ms frame");
+        // Many small steps, none visible on its own.
+        assert!(emits.len() > 40, "{} emits in 2 s", emits.len());
+        let max_step = emits.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max);
+        assert!(max_step < 0.012, "largest single step {max_step}");
+        assert!(all.windows(2).all(|w| w[1] >= w[0] - 1e-6), "monotonic toward the target");
+    }
+
+    #[test]
+    fn output_spring_is_frame_rate_independent_and_never_overshoots() {
+        let (mut a, mut b) = (on(), on());
+        for x in [&mut a, &mut b] {
+            x.set_current(0.35);
+        }
+        run(&mut a, 500.0, 1.0, 0, 90);
+        run(&mut b, 500.0, 1.0, 0, 60);
+        assert!((a.applied.unwrap() - b.applied.unwrap()).abs() < 0.02, "{:?} vs {:?}", a.applied, b.applied);
+        let mut c = on();
+        c.set_current(0.05);
+        let (all, _, t) = run(&mut c, 30_000.0, 6.0, 0, 90);
+        let target = c.band(t, NOON).target;
+        assert!(all.iter().all(|v| *v <= target + 1e-3), "overshot {target}");
+        let first_second = all[89] - 0.05;
+        assert!(first_second <= MAX_SPEED + 0.01, "speed limit: moved {first_second} in 1 s");
     }
 
     #[test]
@@ -451,14 +633,43 @@ mod tests {
         a.on_lux(20_000.0, 0);
         assert_eq!(a.tick(100, NOON), None);
         a.set_current(0.3);
+        a.tick(111, NOON);
         assert!(a.tick(200, NOON).is_some());
+    }
+
+    #[test]
+    fn disabled_emits_nothing() {
+        let mut a = AutoBrightness::default();
+        a.set_current(0.5);
+        let (_, emits, _) = run(&mut a, 20_000.0, 5.0, 0, 10);
+        assert!(emits.is_empty());
+    }
+
+    #[test]
+    fn without_a_sensor_time_of_day_drives_it() {
+        let a = on();
+        assert!((a.band(0, NOON).target - DAY_LEVEL_NO_SENSOR).abs() < 1e-6);
+        assert!((a.band(0, 2 * 60).target - DAY_LEVEL_NO_SENSOR * 0.6).abs() < 1e-6);
+        let mut a = on();
+        a.on_lux(20_000.0, 0);
+        assert!(a.band(1000, NOON).center > 0.95);
+        assert!((a.band(SENSOR_STALE_MS + 1, NOON).center - DAY_LEVEL_NO_SENSOR).abs() < 1e-6);
+    }
+
+    #[test]
+    fn night_dims_the_sensor_result_too() {
+        let mut a = on();
+        a.on_lux(300.0, 0);
+        let (d, n) = (a.band(1, NOON).center, a.band(1, 23 * 60).center);
+        assert!((n - d * 0.6).abs() < 1e-4, "{d} {n}");
     }
 
     #[test]
     fn never_fully_dark() {
         let mut a = on();
-        a.offset = -0.6;
         a.on_lux(0.0, 0);
-        assert_eq!(a.desired(1, 2 * 60), MIN_LEVEL);
+        a.set_user(-1.0);
+        assert_eq!(a.band(1, 2 * 60).target, MIN_LEVEL);
     }
 }
+

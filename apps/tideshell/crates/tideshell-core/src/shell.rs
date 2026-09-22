@@ -68,7 +68,7 @@ impl Shell {
         trackpad.speed = prefs.trackpad_speed;
         let mut ambient = AutoBrightness::default();
         ambient.enabled = prefs.auto_brightness;
-        ambient.offset = prefs.brightness_offset;
+        ambient.user = prefs.brightness_offset;
         ambient.night = prefs.night;
         Shell {
             recognizer: Recognizer::new(prefs.edge_config(), screen),
@@ -166,7 +166,7 @@ impl Shell {
         self.switcher.style = prefs.switcher_style;
         self.trackpad.speed = prefs.trackpad_speed;
         self.ambient.enabled = prefs.auto_brightness;
-        self.ambient.offset = prefs.brightness_offset;
+        self.ambient.user = prefs.brightness_offset;
         self.ambient.night = prefs.night;
         self.prefs = prefs;
         let mut out = vec![Action::SavePrefs];
@@ -239,8 +239,8 @@ impl Shell {
         // Persist a learned offset once the slider has been still for a while.
         if self.offset_dirty_at.is_some_and(|t| now.saturating_sub(t) >= 1500) {
             self.offset_dirty_at = None;
-            self.prefs.brightness_offset = self.ambient.offset;
-            self.log(format!("auto brightness: learned offset {:+.2}", self.ambient.offset));
+            self.prefs.brightness_offset = self.ambient.user;
+            self.log(format!("auto brightness: slider at {:+.2} of the band", self.ambient.user));
             out.push(Action::SavePrefs);
         }
         // The fat cursor's eased position IS the pointer: send it as it moves.
@@ -388,12 +388,35 @@ impl Shell {
         }
     }
 
+    /// A slider moved to fraction `v` of its travel. With auto brightness on,
+    /// the brightness slider is RELATIVE: its travel spans the adaptive band
+    /// around the auto level, so `v` sets the position in the band and the
+    /// output spring does the rest (no direct SetSlider). Otherwise absolute.
     pub fn set_slider(&mut self, kind: SliderKind, v: f32) -> Vec<Action> {
-        let a = self.drawer.set_slider(kind, v);
-        if kind == SliderKind::Brightness && self.ambient.on_manual(self.drawer.brightness, self.now, self.clock_minute) {
+        if kind == SliderKind::Brightness && self.ambient.enabled {
+            self.ambient.set_user(v.clamp(0.0, 1.0) * 2.0 - 1.0);
             self.offset_dirty_at = Some(self.now);
+            return vec![];
+        }
+        let a = self.drawer.set_slider(kind, v);
+        if kind == SliderKind::Brightness {
+            self.ambient.set_absolute(self.drawer.brightness);
         }
         vec![a]
+    }
+
+    /// Slider position to draw for brightness: the band position when auto
+    /// is on, the absolute level otherwise.
+    pub fn brightness_slider_pos(&self) -> f32 {
+        if self.ambient.enabled {
+            (self.ambient.user + 1.0) / 2.0
+        } else {
+            self.drawer.brightness
+        }
+    }
+
+    pub fn brightness_band(&self) -> crate::ambient::Band {
+        self.ambient.band(self.now, self.clock_minute)
     }
 
     /// Local minute of the day (0..1440), for the night window.
@@ -809,7 +832,8 @@ mod tests {
             saves += sh.tick(t).iter().filter(|a| **a == Action::SavePrefs).count();
         }
         assert_eq!(saves, 1, "one save after the drag, not one per event");
-        assert!((sh.prefs.brightness_offset - sh.ambient.offset).abs() < 1e-6 && sh.ambient.offset > 0.0);
+        assert!((sh.prefs.brightness_offset - sh.ambient.user).abs() < 1e-6 && sh.ambient.user > 0.0);
+        assert_eq!(sh.brightness_slider_pos(), (sh.ambient.user + 1.0) / 2.0);
     }
 
     #[test]

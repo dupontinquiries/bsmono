@@ -41,7 +41,8 @@ pub struct ShellPrefs {
     pub fat_cursor: bool,
     /// Ambient light + time of day brightness.
     pub auto_brightness: bool,
-    /// Learned from the user's slider while auto is on.
+    /// The brightness slider's position within the adaptive band, −1..1,
+    /// while auto brightness is on (the slider is relative then).
     pub brightness_offset: f32,
     /// Night window for the time-of-day dimming.
     pub night: crate::ambient::NightWindow,
@@ -140,7 +141,7 @@ impl ShellPrefs {
                     _ => return Err(format!("shell.brightness.auto: '{v}' is not on|off")),
                 }
             }
-            "shell.brightness.offset" => self.brightness_offset = parse_range(key, v, -0.6, 0.6)?,
+            "shell.brightness.offset" => self.brightness_offset = parse_range(key, v, -1.0, 1.0)?,
             "shell.brightness.night" => {
                 let (start, end) = crate::ambient::NightWindow::parse_span(v).ok_or_else(|| format!("shell.brightness.night: '{v}' is not HH:MM-HH:MM"))?;
                 self.night.start = start;
