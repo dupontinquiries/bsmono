@@ -76,6 +76,7 @@ impl Shellbox {
                     self.backlight.set(*v);
                     continue;
                 }
+                Action::DisplayPower(_) => Outcome::Unwired("display power: zwlr_output_power transport not wired yet"),
                 // The overlay IS the trackpad surface here; nothing to execute.
                 Action::ShowTrackpad(on) => Outcome::Done(format!("trackpad {}", if *on { "on" } else { "off" })),
                 _ => match self.windows.as_mut() {

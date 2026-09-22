@@ -119,6 +119,7 @@ impl Executor for SimExec<'_> {
                 self.world.cursor = Pos2::new(*x, *y);
                 Outcome::Done(String::new())
             }
+            Action::DisplayPower(on) => Outcome::Done(format!("sim: display {}", if *on { "on" } else { "off" })),
             Action::HideSystemCursor(on) => {
                 self.world.fat = *on;
                 Outcome::Done(format!("sim: system cursor hidden={on}"))
@@ -289,6 +290,13 @@ impl App {
                 o
             }
             "trackpad" => self.shell.toggle_mode(tideshell_core::hold::HoldOption::Trackpad),
+            "sleep" => self.shell.power_key(),
+            "lock" => {
+                // Mid-drag: the cover follows the finger 30% of the way.
+                self.shell.lock_now();
+                self.shell.lock.drag_reveal(0.3, 0);
+                vec![]
+            }
             "fatcursor" => {
                 let mut p = self.shell.prefs.clone();
                 p.fat_cursor = true;
@@ -354,6 +362,11 @@ impl eframe::App for App {
         let now = ctx.input(|i| i.time);
         if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
             self.view.show_trace = !self.view.show_trace;
+        }
+        // P = the power key.
+        if ctx.input(|i| i.key_pressed(egui::Key::P)) {
+            let a = self.shell.power_key();
+            self.execute(a, now);
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(root, |ui| {
             let area = ui.max_rect();
@@ -482,6 +495,9 @@ fn main() -> eframe::Result<()> {
     let fake_lux: Option<f32> = val("--lux").and_then(|v| v.parse().ok());
     let lux_noise: f32 = val("--lux-noise").and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let fake_clock: Option<u32> = val("--clock").and_then(|v| tideshell_core::ambient::NightWindow::parse_span(&format!("{v}-00:00")).map(|(s, _)| s));
+    if has("--locked") {
+        shell.lock_now();
+    }
     // The fake display starts at half brightness, so auto has a level to ramp from.
     shell.set_current_brightness(0.5);
     let demo = val("--demo");

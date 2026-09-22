@@ -76,6 +76,8 @@ pub struct ShellView {
     touch_seen: bool,
     mouse_down: bool,
     card_drag: f32,
+    /// Cover drag in progress: (slot, start y).
+    cover_drag: Option<(i32, f32)>,
     bar_drag: f32,
     sheet: SettingsSheet,
 }
@@ -140,6 +142,8 @@ impl ShellView {
             || (shell.prefs.layout == Layout::RightBar && !self.bar_surface)
             || self.sheet.open
             || self.show_trace
+            || shell.lock.is_locked()
+            || shell.sleep.phase != tideshell_core::sleep::Phase::Awake
     }
 
     /// Where the overlay must take input, in screen-local logical px.
@@ -148,7 +152,7 @@ impl ShellView {
     /// through to the apps underneath (trackpad pad, bar, or nothing at all
     /// for passive previews and the carousel dots).
     pub fn input_rects(&self, shell: &Shell) -> Option<Vec<Rect>> {
-        if shell.drawer.is_visible() || shell.switcher.open || self.sheet.open || shell.hold.is_some() {
+        if shell.drawer.is_visible() || shell.switcher.open || self.sheet.open || shell.hold.is_some() || shell.lock.is_locked() || shell.sleep.captures_input() {
             return None;
         }
         let size = Vec2::new(shell.screen.0, shell.screen.1);
@@ -249,13 +253,26 @@ impl ShellView {
         let hy = size.y - 9.0 - shell.swipe_up * 30.0;
         p.rect_filled(Rect::from_center_size(to(size.x / 2.0 + shell.peek_dx * 0.3, hy), Vec2::new(hw, 5.0)), cr(3), with_alpha(pal.text, 0.75));
 
+        if shell.lock.is_locked() {
+            self.cover(&p, shell, info, origin, size);
+        }
+        // Screen fade to black (sleep), above everything.
+        if shell.sleep.black > 0.0 {
+            p.rect_filled(Rect::from_min_size(origin, size), cr(0), Color32::from_black_alpha((shell.sleep.black * 255.0) as u8));
+        }
         if let Some(prefs) = self.settings_sheet(ui.ctx(), shell) {
             out.extend(shell.set_prefs(prefs));
         }
         if self.show_trace {
             self.trace(&p, shell, pal, origin);
         }
-        if !shell.recognizer.is_idle() || shell.drawer.is_animating() || shell.switcher.is_streaking() || shell.fat.as_ref().is_some_and(|f| f.is_animating()) {
+        if !shell.recognizer.is_idle()
+            || shell.drawer.is_animating()
+            || shell.switcher.is_streaking()
+            || shell.fat.as_ref().is_some_and(|f| f.is_animating())
+            || shell.sleep.is_animating()
+            || (shell.lock.is_locked() && !shell.lock.reveal.is_settled())
+        {
             ui.ctx().request_repaint();
         }
         out
@@ -280,6 +297,9 @@ impl ShellView {
     /// Call once per frame with that frame's events: the simulator from
     /// eframe's `raw_input_hook`, the layer runtime before `run_ui`.
     pub fn route_raw(&mut self, shell: &mut Shell, events: &mut Vec<egui::Event>, origin: Pos2, now: u64) -> Vec<Action> {
+        if shell.sleep.captures_input() || shell.lock.is_locked() {
+            return self.route_covered(shell, events, origin, now);
+        }
         let mut out = vec![];
         let size = Vec2::new(shell.screen.0, shell.screen.1);
         let mut keep = Vec::with_capacity(events.len());
@@ -352,6 +372,82 @@ impl ShellView {
         }
         *events = keep;
         out
+    }
+
+    /// Covered or asleep: every event is swallowed (nothing reaches egui or
+    /// the apps). Asleep, touches go to the triple-tap detector; covered, a
+    /// vertical drag moves the cover with the finger.
+    fn route_covered(&mut self, shell: &mut Shell, events: &mut Vec<egui::Event>, origin: Pos2, now: u64) -> Vec<Action> {
+        let mut out = vec![];
+        let h = shell.screen.1.max(1.0);
+        for ev in events.drain(..) {
+            let (slot, phase, pos) = match ev {
+                egui::Event::Touch { id, phase, pos, .. } => {
+                    self.touch_seen = true;
+                    (id.0 as i32, phase, pos)
+                }
+                _ if self.touch_seen => continue,
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, .. } => {
+                    self.mouse_down = pressed;
+                    (MOUSE_SLOT, if pressed { egui::TouchPhase::Start } else { egui::TouchPhase::End }, pos)
+                }
+                egui::Event::PointerMoved(pos) if self.mouse_down => (MOUSE_SLOT, egui::TouchPhase::Move, pos),
+                _ => continue,
+            };
+            let l = pos - origin;
+            if shell.sleep.captures_input() {
+                let te = match phase {
+                    egui::TouchPhase::Start => TouchEvent::Down { slot, x: l.x, y: l.y, t: now },
+                    egui::TouchPhase::Move => TouchEvent::Move { slot, x: l.x, y: l.y, t: now },
+                    egui::TouchPhase::End => TouchEvent::Up { slot, t: now },
+                    egui::TouchPhase::Cancel => TouchEvent::Cancel,
+                };
+                out.extend(shell.on_sleep_touch(te));
+                continue;
+            }
+            match phase {
+                egui::TouchPhase::Start => self.cover_drag = Some((slot, l.y)),
+                egui::TouchPhase::Move => {
+                    if let Some((s, y0)) = self.cover_drag {
+                        if s == slot {
+                            // Full reveal after 55% of the screen height.
+                            shell.lock.drag_reveal(((y0 - l.y) / (h * 0.55)).clamp(0.0, 1.0), now);
+                        }
+                    }
+                }
+                egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                    if self.cover_drag.is_some_and(|(s, _)| s == slot) {
+                        self.cover_drag = None;
+                        shell.lock.release_reveal();
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn cover(&self, p: &egui::Painter, shell: &Shell, info: &FrameInfo, origin: Pos2, size: Vec2) {
+        let prog = shell.lock.reveal.progress;
+        let alpha = (1.0 - prog * 0.8).clamp(0.0, 1.0);
+        let top = origin + Vec2::new(0.0, -prog * size.y);
+        // Background: a vertical gradient (the camera layer replaces it later).
+        let bands = 32;
+        for i in 0..bands {
+            let t = i as f32 / (bands - 1) as f32;
+            let lerp = |a: f32, b: f32| (a + (b - a) * t) as u8;
+            let c = Color32::from_rgba_unmultiplied(lerp(14.0, 46.0), lerp(22.0, 30.0), lerp(40.0, 64.0), (alpha * 255.0) as u8);
+            let band_h = size.y / bands as f32;
+            p.rect_filled(Rect::from_min_size(top + Vec2::new(0.0, i as f32 * band_h), Vec2::new(size.x, band_h + 1.0)), cr(0), c);
+        }
+        let white = |a: f32| Color32::from_white_alpha((a * alpha * 255.0) as u8);
+        p.text(top + Vec2::new(size.x / 2.0, size.y * 0.24), Align2::CENTER_CENTER, &info.clock, FontId::proportional(72.0), white(1.0));
+        // Hint and chevron travel with the cover (the first version added the
+        // drag back in and left them pinned over the revealed app).
+        let c = top + Vec2::new(size.x / 2.0, size.y - 90.0);
+        let chev = Stroke::new(2.5, white(0.8));
+        p.line_segment([c + Vec2::new(-14.0, -22.0), c + Vec2::new(0.0, -34.0)], chev);
+        p.line_segment([c + Vec2::new(0.0, -34.0), c + Vec2::new(14.0, -22.0)], chev);
+        p.text(c, Align2::CENTER_CENTER, "Swipe up to unlock", FontId::proportional(15.0), white(0.75));
     }
 
     // ---- previews --------------------------------------------------------------
