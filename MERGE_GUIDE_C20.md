@@ -40,8 +40,11 @@ likely conflict points are `manifest/projects.toml` (one appended entry),
 - **blackstar-rs rig integration** -- `rigmotion`'s 5 tests pass under
   `maintenance/tools/cargo-ailite test --no-default-features --bins rigmotion`.
   boneforge's 39 tests pass on their own (`cd games/shared/boneforge && cargo test`).
-  The rest of the engine suite was 1,789 of 1,790 passing; the one failure is
-  the vocabulary census, which **already fails at the base** (see C20_TODO).
+  The vocabulary census had been broken by this session's own `3bb74dcfd` (an
+  `IP_MARKS` list in `main.rs`); the list moved to `vocab.rs`, the file the
+  census exempts, and the counts are back to the base values. An earlier note
+  said the census already failed at the base -- that was measured after
+  `3bb74dcfd` and was wrong.
 - **rigkit** -- builds all four viewers from inside the repo (`python3
   build_viewer.py`, `VEHICLE=falcon|flyer|hover`). Two consecutive builds are
   byte-identical, and the decoded content matches the pages built before the

@@ -61,6 +61,20 @@
 //! in-fiction vocabulary, and deleting it removes the reasoning that makes the
 //! module reviewable.
 
+/// Filename fragments that mark a model as belonging to a rights holder, so
+/// the catalogue can show those models as their own family (`main.rs`
+/// `model_family`) instead of scattering them. They live HERE because this is
+/// the one file the census below exempts: in `main.rs` each raised its count by
+/// one and failed `the_licensed_vocabulary_census_only_goes_down`.
+pub const IP_MARKS: &[&str] = &[
+    "transformer", "decepticon", "autobot", "optimus", "bumblebee",
+    "megatron", "starscream", "grimlock", "cybertron", "gundam", "sazabi",
+    "halo", "master_chief", "star_wars", "marvel", "spider", "octopus",
+    "ferrari", "lamborghini", "porsche", "chevrolet", "camaro", "alfa_romeo",
+    "bugatti", "mclaren", "bmw", "audi", "toyota", "nissan", "benelli",
+    "call_of_duty", "pacific_rim", "ben_10", "wuthering",
+    ];
+
 #[cfg(test)]
 mod tests {
     use std::fs;

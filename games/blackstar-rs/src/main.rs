@@ -796,14 +796,9 @@ struct CarModels {
 ///   IP     filename matches a rights holder — visible, deliberately, rather
 ///          than scattered through eleven hundred entries
 fn model_family(name: &str, forge: &HashSet<String>, fixed: &HashSet<String>) -> &'static str {
-    const IP_MARKS: &[&str] = &[
-        "transformer", "decepticon", "autobot", "optimus", "bumblebee",
-        "megatron", "starscream", "grimlock", "cybertron", "gundam", "sazabi",
-        "halo", "master_chief", "star_wars", "marvel", "spider", "octopus",
-        "ferrari", "lamborghini", "porsche", "chevrolet", "camaro", "alfa_romeo",
-        "bugatti", "mclaren", "bmw", "audi", "toyota", "nissan", "benelli",
-        "call_of_duty", "pacific_rim", "ben_10", "wuthering",
-    ];
+    // the marks live in vocab.rs, the one file the licensed-vocabulary census
+    // exempts: listed here, each raised its count by one and failed the census
+    use vocab::IP_MARKS;
     let n = name.to_ascii_lowercase().replace([' ', '-'], "_");
     // IP wins over everything: a model that is both re-exported and
     // rights-holder material is still unshippable.

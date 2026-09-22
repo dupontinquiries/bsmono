@@ -51,13 +51,17 @@ the next session does not have to re-derive them. Details:
 - **assumed** -- coursekit's notes would make a useful tomescope import too; not
   checked against tomescope's formats.
 
-## blackstar-rs -- found, not fixed (all present at the base commit)
+## blackstar-rs -- fixed in C20
 - **verified** -- `vocab::tests::the_licensed_vocabulary_census_only_goes_down`
-  fails at the base. The committed counts exceed `CENSUS` by one each (cybertron
-  4/3, optimus 2/1, megatron 2/1, decepticon 3/2, autobot 2/1). The sources are
-  a roster name at `census.rs:324`, and the ban lists at `main.rs:799` and
-  `saga.rs:933`, which contain the very words they ban. Either update `CENSUS`
-  or exempt the ban-list literals.
+  passes at the base and was broken by this session's own `3bb74dcfd` ("group the
+  catalogue"). It added an `IP_MARKS` list to `main.rs` that raised five counts
+  by one each. The list is legitimate -- it shows licensed models as their own
+  catalogue family -- so it moved to `vocab.rs`, the one file the census exempts,
+  and the counts are back to the base values. (A session note first said the
+  census failed at the base: that was measured after `3bb74dcfd`, not at
+  `aa5482537`. Wrong, and corrected here.)
+
+## blackstar-rs -- found, not fixed (present at the base commit)
 - **verified** -- `src/rig.rs:96` is corrupted: `Transform::the Charge { matrix }`
   should be `Transform::Matrix`. Only the `rigpose` example includes it, so
   `cargo test` without `--bins --tests` fails to compile that example.
