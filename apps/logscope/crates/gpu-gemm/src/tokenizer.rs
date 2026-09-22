@@ -188,9 +188,11 @@ impl Tokenizer {
     /// chunk is as long as any run of one class — and an agent's prompt is full of them: indentation,
     /// padded tables, `=====` rules, long digit strings. Measured, one chunk, -O:
     ///
-    ///      1,000 spaces      5.1 ms  ->  0.16 ms
-    ///      8,000 spaces      338 ms  ->  1.8 ms
-    ///     40,000 '='        8,366 ms ->  10 ms        (8.4 SECONDS before the first prompt token)
+    /// ```text
+    ///  1,000 spaces      5.1 ms  ->  0.16 ms
+    ///  8,000 spaces      338 ms  ->  1.8 ms
+    /// 40,000 '='        8,366 ms ->  10 ms        (8.4 SECONDS before the first prompt token)
+    /// ```
     ///
     /// Ordinary text (chunks of a few symbols) is unchanged. Same rule, so the same tokens:
     /// symbols live in a doubly-linked list over their ORIGINAL positions (relative order never
