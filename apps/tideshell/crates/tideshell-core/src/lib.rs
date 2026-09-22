@@ -23,14 +23,17 @@
 //!   phone.
 
 pub mod ambient;
+pub mod anim;
 pub mod bar;
 pub mod carousel;
 pub mod control_center;
 pub mod cursor;
 pub mod edge;
 pub mod hold;
+pub mod lock;
 pub mod prefs;
 pub mod shell;
+pub mod sleep;
 pub mod switcher;
 pub mod trackpad;
 

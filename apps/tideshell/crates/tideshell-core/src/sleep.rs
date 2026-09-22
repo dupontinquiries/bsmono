@@ -1,0 +1,283 @@
+//! Screen sleep: power key -> fade to black -> panel off (system stays awake,
+//! so touches still arrive) -> a deliberate triple tap, or the power key,
+//! wakes it with a fade back in.
+//!
+//! While fading out or off, every touch belongs to the wake detector and
+//! never reaches an app: the caller maps a fullscreen, fully opaque,
+//! input-taking surface for that. Waking optionally lands on the lock screen
+//! (`lock_on_sleep`), the phone convention.
+//!
+//! The triple-tap detector is strict because a pocket produces touches: a tap
+//! is short (TAP_MAX_MS) and still (TAP_SLOP); three must land within
+//! TRIPLE_WINDOW_MS of the first touch and within CLUSTER px of the first
+//! tap. A long press, a swipe, taps spread across the screen or a slow
+//! sequence never wake it.
+
+use crate::Millis;
+
+pub const FADE_OUT_MS: f32 = 250.0;
+pub const FADE_IN_MS: f32 = 180.0;
+pub const TAP_MAX_MS: Millis = 200;
+pub const TAP_SLOP: f32 = 24.0;
+pub const TRIPLE_WINDOW_MS: Millis = 700;
+pub const CLUSTER: f32 = 90.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Awake,
+    FadingOut,
+    Off,
+    FadingIn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepAction {
+    /// zwlr_output_power_v1.set_mode(on/off).
+    DisplayPower(bool),
+    /// Engage the lock screen (on sleep, when lock_on_sleep).
+    Lock,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sleep {
+    pub phase: Phase,
+    /// 0 = fully visible, 1 = black.
+    pub black: f32,
+    pub lock_on_sleep: bool,
+    /// Completed taps in the current sequence: (time of touch-down, x, y).
+    taps: Vec<(Millis, f32, f32)>,
+    /// The touch currently down: (slot, down time, x, y, moved too far).
+    down: Option<(i32, Millis, f32, f32, bool)>,
+}
+
+impl Default for Sleep {
+    fn default() -> Self {
+        Sleep { phase: Phase::Awake, black: 0.0, lock_on_sleep: true, taps: Vec::new(), down: None }
+    }
+}
+
+impl Sleep {
+    /// Whether touches must be swallowed (opaque input surface mapped).
+    pub fn captures_input(&self) -> bool {
+        matches!(self.phase, Phase::FadingOut | Phase::Off)
+    }
+
+    pub fn is_animating(&self) -> bool {
+        matches!(self.phase, Phase::FadingOut | Phase::FadingIn)
+    }
+
+    pub fn power_key(&mut self) -> Vec<SleepAction> {
+        match self.phase {
+            Phase::Awake | Phase::FadingIn => {
+                self.phase = Phase::FadingOut;
+                self.reset_taps();
+                if self.lock_on_sleep {
+                    vec![SleepAction::Lock]
+                } else {
+                    vec![]
+                }
+            }
+            Phase::FadingOut | Phase::Off => self.wake(),
+        }
+    }
+
+    fn wake(&mut self) -> Vec<SleepAction> {
+        let was_off = self.phase == Phase::Off;
+        self.phase = Phase::FadingIn;
+        self.reset_taps();
+        if was_off {
+            vec![SleepAction::DisplayPower(true)]
+        } else {
+            vec![] // still fading out: the panel never went off
+        }
+    }
+
+    fn reset_taps(&mut self) {
+        self.taps.clear();
+        self.down = None;
+    }
+
+    pub fn tick(&mut self, dt_ms: f32) -> Vec<SleepAction> {
+        match self.phase {
+            Phase::FadingOut => {
+                self.black = (self.black + dt_ms / FADE_OUT_MS).min(1.0);
+                if self.black >= 1.0 {
+                    self.phase = Phase::Off;
+                    return vec![SleepAction::DisplayPower(false)];
+                }
+            }
+            Phase::FadingIn => {
+                self.black = (self.black - dt_ms / FADE_IN_MS).max(0.0);
+                if self.black <= 0.0 {
+                    self.phase = Phase::Awake;
+                }
+            }
+            _ => {}
+        }
+        vec![]
+    }
+
+    /// Touch input while captured (fading out or off). Returns wake actions.
+    pub fn touch_down(&mut self, slot: i32, x: f32, y: f32, now: Millis) -> Vec<SleepAction> {
+        if !self.captures_input() {
+            return vec![];
+        }
+        // A second finger means "not a deliberate tap sequence".
+        if self.down.is_some() {
+            self.reset_taps();
+            return vec![];
+        }
+        if self.taps.first().is_some_and(|f| now.saturating_sub(f.0) > TRIPLE_WINDOW_MS) {
+            self.taps.clear();
+        }
+        self.down = Some((slot, now, x, y, false));
+        vec![]
+    }
+
+    pub fn touch_move(&mut self, slot: i32, x: f32, y: f32) {
+        if let Some((s, _, x0, y0, moved)) = &mut self.down {
+            if *s == slot && (x - *x0).hypot(y - *y0) > TAP_SLOP {
+                *moved = true;
+            }
+        }
+    }
+
+    pub fn touch_up(&mut self, slot: i32, now: Millis) -> Vec<SleepAction> {
+        let Some((s, t0, x, y, moved)) = self.down else { return vec![] };
+        if s != slot {
+            return vec![];
+        }
+        self.down = None;
+        let is_tap = !moved && now.saturating_sub(t0) <= TAP_MAX_MS;
+        let clustered = self.taps.first().is_none_or(|f| (x - f.1).hypot(y - f.2) <= CLUSTER);
+        let in_window = self.taps.first().is_none_or(|f| now.saturating_sub(f.0) <= TRIPLE_WINDOW_MS);
+        if !(is_tap && clustered && in_window) {
+            // Anything else restarts the sequence; a valid tap can start a new one.
+            self.taps.clear();
+            if is_tap {
+                self.taps.push((t0, x, y));
+            }
+            return vec![];
+        }
+        self.taps.push((t0, x, y));
+        if self.taps.len() >= 3 {
+            return self.wake();
+        }
+        vec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asleep() -> Sleep {
+        let mut s = Sleep::default();
+        s.power_key();
+        for _ in 0..30 {
+            s.tick(11.1);
+        }
+        assert_eq!(s.phase, Phase::Off);
+        s
+    }
+
+    fn tap(s: &mut Sleep, x: f32, y: f32, t: Millis, dur: Millis) -> Vec<SleepAction> {
+        s.touch_down(0, x, y, t);
+        s.touch_up(0, t + dur)
+    }
+
+    #[test]
+    fn power_key_locks_fades_then_turns_the_panel_off() {
+        let mut s = Sleep::default();
+        assert_eq!(s.power_key(), vec![SleepAction::Lock]);
+        assert!(s.captures_input(), "touches swallowed from the first frame of the fade");
+        let mut off = vec![];
+        let mut t = 0.0;
+        while s.phase == Phase::FadingOut {
+            off.extend(s.tick(11.1));
+            t += 11.1;
+            assert!(t < 400.0);
+        }
+        assert_eq!(off, vec![SleepAction::DisplayPower(false)]);
+        assert!((t - FADE_OUT_MS).abs() < 12.0, "fade took {t} ms");
+        assert_eq!(s.black, 1.0);
+    }
+
+    #[test]
+    fn triple_tap_wakes_and_fades_in() {
+        let mut s = asleep();
+        assert!(tap(&mut s, 200.0, 500.0, 1000, 80).is_empty());
+        assert!(tap(&mut s, 210.0, 505.0, 1200, 80).is_empty());
+        assert_eq!(tap(&mut s, 195.0, 498.0, 1400, 80), vec![SleepAction::DisplayPower(true)]);
+        assert_eq!(s.phase, Phase::FadingIn);
+        for _ in 0..30 {
+            s.tick(11.1);
+        }
+        assert_eq!((s.phase, s.black), (Phase::Awake, 0.0));
+        assert!(!s.captures_input());
+    }
+
+    #[test]
+    fn pocket_touches_do_not_wake() {
+        // Double tap: no.
+        let mut s = asleep();
+        tap(&mut s, 200.0, 500.0, 0, 80);
+        tap(&mut s, 200.0, 500.0, 200, 80);
+        assert_eq!(s.phase, Phase::Off);
+        // Too slow: three taps over 1.5 s.
+        let mut s = asleep();
+        for i in 0..3 {
+            assert!(tap(&mut s, 200.0, 500.0, i * 500, 80).is_empty());
+        }
+        assert_eq!(s.phase, Phase::Off, "slow sequence");
+        // Spread across the screen.
+        let mut s = asleep();
+        tap(&mut s, 50.0, 100.0, 0, 80);
+        tap(&mut s, 350.0, 600.0, 150, 80);
+        tap(&mut s, 200.0, 850.0, 300, 80);
+        assert_eq!(s.phase, Phase::Off, "spread out");
+        // Long presses.
+        let mut s = asleep();
+        for i in 0..3 {
+            tap(&mut s, 200.0, 500.0, i * 200, 400);
+        }
+        assert_eq!(s.phase, Phase::Off, "presses, not taps");
+        // A swipe in the middle breaks the sequence.
+        let mut s = asleep();
+        tap(&mut s, 200.0, 500.0, 0, 80);
+        s.touch_down(0, 200.0, 500.0, 150);
+        s.touch_move(0, 200.0, 580.0);
+        s.touch_up(0, 220);
+        tap(&mut s, 200.0, 500.0, 300, 80);
+        assert_eq!(s.phase, Phase::Off, "swipe broke it");
+    }
+
+    #[test]
+    fn a_failed_sequence_can_restart_cleanly() {
+        let mut s = asleep();
+        tap(&mut s, 200.0, 500.0, 0, 80);
+        tap(&mut s, 200.0, 500.0, 2000, 80); // too late: starts a new sequence
+        tap(&mut s, 200.0, 500.0, 2200, 80);
+        assert_eq!(tap(&mut s, 200.0, 500.0, 2400, 80), vec![SleepAction::DisplayPower(true)]);
+    }
+
+    #[test]
+    fn power_key_wakes_too_and_mid_fade_cancels_without_a_power_cycle() {
+        let mut s = asleep();
+        assert_eq!(s.power_key(), vec![SleepAction::DisplayPower(true)]);
+        let mut s = Sleep::default();
+        s.power_key();
+        s.tick(100.0); // part-way through the fade
+        assert!(s.power_key().is_empty(), "panel never went off: nothing to turn on");
+        assert_eq!(s.phase, Phase::FadingIn);
+    }
+
+    #[test]
+    fn awake_touches_are_not_captured() {
+        let mut s = Sleep::default();
+        assert!(s.touch_down(0, 1.0, 1.0, 0).is_empty());
+        assert!(!s.captures_input());
+        s.lock_on_sleep = false;
+        assert!(s.power_key().is_empty(), "no Lock when lock_on_sleep is off");
+    }
+}
