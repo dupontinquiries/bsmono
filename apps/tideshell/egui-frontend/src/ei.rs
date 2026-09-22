@@ -23,7 +23,13 @@ use reis::event::{DeviceCapability, EiEvent, EiEventConverter};
 use tideshell_core::trackpad::{Button, PointerOut};
 
 pub const BUS_NAME: &str = "org.tideshell.Shell";
+const DEVICE_TYPE_KEYBOARD: u32 = 1;
 const DEVICE_TYPE_POINTER: u32 = 2;
+/// evdev KEY_LEFTCTRL: held during a pinch (EI has no gesture interface, so
+/// pinch zoom goes out as Ctrl + wheel, the zoom convention of apps).
+pub const KEY_LEFTCTRL: u32 = 29;
+/// One wheel notch in EI's discrete scroll units.
+pub const NOTCH: i32 = 120;
 /// linux/input-event-codes.h
 pub const BTN_LEFT: u32 = 0x110;
 pub const BTN_RIGHT: u32 = 0x111;
@@ -45,6 +51,9 @@ pub enum EiOp {
     Scroll(f32, f32),
     /// Absolute position in the compositor's logical space (fat cursor).
     Absolute(f32, f32),
+    Key(u32, bool),
+    /// Discrete wheel scroll in 1/120 notches (EI scroll_discrete).
+    ScrollDiscrete(i32, i32),
 }
 
 /// Pure mapping. Scroll is inverted: the trackpad model reports finger
@@ -62,6 +71,10 @@ pub fn to_op(p: PointerOut) -> EiOp {
         ),
         PointerOut::Scroll { dx, dy } => EiOp::Scroll(-dx, -dy),
         PointerOut::Absolute { x, y } => EiOp::Absolute(x, y),
+        PointerOut::ZoomBegin => EiOp::Key(KEY_LEFTCTRL, true),
+        // Zoom in (fingers apart) = Ctrl + wheel up (negative y).
+        PointerOut::Zoom { steps } => EiOp::ScrollDiscrete(0, -NOTCH * steps),
+        PointerOut::ZoomEnd => EiOp::Key(KEY_LEFTCTRL, false),
     }
 }
 
@@ -104,7 +117,7 @@ fn socket_from_cosmic_comp() -> Result<UnixStream, String> {
             "/com/system76/CosmicComp/Ei",
             Some("com.system76.CosmicComp.Ei"),
             "GetSenderSocket",
-            &(DEVICE_TYPE_POINTER,),
+            &(DEVICE_TYPE_POINTER | DEVICE_TYPE_KEYBOARD,),
         )
         .map_err(|e| format!("GetSenderSocket: {e}"))?;
     let fd: zbus::zvariant::OwnedFd = reply.body().deserialize().map_err(|e| format!("reply: {e}"))?;
@@ -120,6 +133,7 @@ struct Dev {
     button: Option<ei::Button>,
     scroll: Option<ei::Scroll>,
     absolute: Option<ei::PointerAbsolute>,
+    keyboard: Option<ei::Keyboard>,
     resumed: bool,
 }
 
@@ -157,17 +171,18 @@ fn run(rx: Receiver<PointerOut>, status: &Mutex<Status>) -> Result<(), String> {
         while let Some(ev) = conv.next_event() {
             match ev {
                 EiEvent::SeatAdded(s) => {
-                    s.seat.bind_capabilities(DeviceCapability::Pointer | DeviceCapability::PointerAbsolute | DeviceCapability::Button | DeviceCapability::Scroll);
+                    s.seat.bind_capabilities(DeviceCapability::Pointer | DeviceCapability::PointerAbsolute | DeviceCapability::Button | DeviceCapability::Scroll | DeviceCapability::Keyboard);
                 }
                 EiEvent::DeviceAdded(d) => {
                     let dev = &d.device;
-                    if [DeviceCapability::Pointer, DeviceCapability::PointerAbsolute, DeviceCapability::Button, DeviceCapability::Scroll].iter().any(|c| dev.has_capability(*c)) {
+                    if [DeviceCapability::Pointer, DeviceCapability::PointerAbsolute, DeviceCapability::Button, DeviceCapability::Scroll, DeviceCapability::Keyboard].iter().any(|c| dev.has_capability(*c)) {
                         devs.push(Dev {
                             device: dev.device().clone(),
                             pointer: dev.interface::<ei::Pointer>(),
                             button: dev.interface::<ei::Button>(),
                             scroll: dev.interface::<ei::Scroll>(),
                             absolute: dev.interface::<ei::PointerAbsolute>(),
+                            keyboard: dev.interface::<ei::Keyboard>(),
                             resumed: false,
                         });
                     }
@@ -229,6 +244,10 @@ fn run(rx: Receiver<PointerOut>, status: &Mutex<Status>) -> Result<(), String> {
                 }),
                 EiOp::Scroll(x, y) => pick(&devs, |d| d.scroll.as_ref().map(|i| i.scroll(x, y))),
                 EiOp::Absolute(x, y) => pick(&devs, |d| d.absolute.as_ref().map(|i| i.motion_absolute(x, y))),
+                EiOp::Key(code, down) => pick(&devs, |d| {
+                    d.keyboard.as_ref().map(|i| i.key(code, if down { ei::keyboard::KeyState::Press } else { ei::keyboard::KeyState::Released }))
+                }),
+                EiOp::ScrollDiscrete(x, y) => pick(&devs, |d| d.scroll.as_ref().map(|i| i.scroll_discrete(x, y))),
             };
             if done {
                 devs[i].device.frame(serial, now_us + k as u64);
@@ -264,5 +283,13 @@ mod tests {
         // Fingers move down (dy > 0): content follows, i.e. scroll UP (EI y < 0).
         assert_eq!(to_op(PointerOut::Scroll { dx: 0.0, dy: 10.0 }), EiOp::Scroll(-0.0, -10.0));
         assert_eq!(to_op(PointerOut::Absolute { x: 12.5, y: 40.0 }), EiOp::Absolute(12.5, 40.0), "absolute is not inverted or scaled");
+    }
+
+    #[test]
+    fn pinch_maps_to_ctrl_and_wheel_notches() {
+        assert_eq!(to_op(PointerOut::ZoomBegin), EiOp::Key(KEY_LEFTCTRL, true));
+        assert_eq!(to_op(PointerOut::Zoom { steps: 2 }), EiOp::ScrollDiscrete(0, -240), "zoom in = wheel up");
+        assert_eq!(to_op(PointerOut::Zoom { steps: -1 }), EiOp::ScrollDiscrete(0, 120));
+        assert_eq!(to_op(PointerOut::ZoomEnd), EiOp::Key(KEY_LEFTCTRL, false));
     }
 }

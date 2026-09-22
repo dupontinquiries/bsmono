@@ -626,7 +626,15 @@ impl Shell {
             })
             .collect();
         for a in &out {
-            if matches!(a, Action::Pointer(crate::trackpad::PointerOut::Button { .. })) {
+            if matches!(
+                a,
+                Action::Pointer(
+                    crate::trackpad::PointerOut::Button { .. }
+                        | crate::trackpad::PointerOut::ZoomBegin
+                        | crate::trackpad::PointerOut::Zoom { .. }
+                        | crate::trackpad::PointerOut::ZoomEnd
+                )
+            ) {
                 self.log(format!("-> {a:?}"));
             }
         }
