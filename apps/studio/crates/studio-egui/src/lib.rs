@@ -580,8 +580,11 @@ pub fn timeline(
                 }
             }
             if r.width() > 34.0 {
+                // a pattern clip names its pattern ("Trap A"): it has no file, and
+                // labelled by path it showed no name at all
                 let name = doc.project.sources.get(&clip.source)
-                    .map(|s| s.path.rsplit('/').next().unwrap_or("clip").to_string())
+                    .map(|s| if s.is_generator() { s.display_name().to_string() }
+                             else { s.path.rsplit('/').next().unwrap_or("clip").to_string() })
                     .unwrap_or_else(|| "clip".into());
                 // pinned to the VISIBLE left edge: drawn at the clip's true edge, a
                 // clip scrolled off the left showed a cut-off fragment of its name

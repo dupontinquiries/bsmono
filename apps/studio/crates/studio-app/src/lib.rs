@@ -69,6 +69,7 @@ pub mod wake;
 pub mod open_project;
 pub mod tracks;
 pub mod thumbs;
+pub mod pattern_clips;
 #[cfg(test)]
 mod abundance_tests;
 #[cfg(test)]
@@ -730,6 +731,9 @@ impl Studio {
         let sources: Vec<_> = s.session.doc.project.sources.values().cloned().collect();
         let mut missing = 0usize;
         for src in sources {
+            // a pattern source has no file by design: the rack renders it
+            // (pattern_clips), so it is neither read here nor counted missing
+            if src.is_generator() { continue; }
             let p = base.join(&src.path);
             // Video is checked for, not READ: reading and content-hashing a
             // whole card of camera files inline (register_asset chunks and
@@ -3265,6 +3269,8 @@ pub struct App {
     /// loses what the previous filter hid.
     words_raw: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
     word_filter: studio_voice::WordFilter,
+    /// What each pattern clip's cache was rendered from (pattern_clips).
+    pattern_stamps: std::collections::BTreeMap<studio_core::SourceId, pattern_clips::Stamp>,
     /// The filmstrip's decoded frames and the worker that decodes them.
     thumbs: thumbs::Cache,
     /// The project as it was last opened or saved. "Unsaved changes" means
@@ -3545,7 +3551,7 @@ impl App {
               tune_scale: None,
               analog: Box::new(analog),
               loaded: SinkContent::Nothing, silent_clock: None, saved_project: None, open_pending: None,
-              thumbs: thumb_cache };
+              thumbs: thumb_cache, pattern_stamps: Default::default() };
         // the project as opened: "unsaved changes" means different from this
         app.saved_project = Some(app.studio.session.doc.project.clone());
         app
@@ -4655,6 +4661,20 @@ impl eframe::App for App {
                 self.studio.arrangement_dirty = true;
             }
         }
+        // LINKED PATTERN CLIPS: any pattern source whose rack changed, or whose
+        // clips now need more than was rendered, is rendered again -- the link is
+        // the source kind itself, saved and synced with the project.
+        let redone = pattern_clips::refresh(&self.studio.session.doc.project, &self.studio.rack,
+                                            &mut self.audio, &mut self.pattern_stamps);
+        if !redone.is_empty() {
+            for sid in redone {
+                match self.audio.get(&sid) {
+                    Some(a) => { let pk = self.build_peaks(a); self.peaks.insert(sid, pk); }
+                    None => { self.peaks.remove(&sid); }
+                }
+            }
+            self.studio.arrangement_dirty = true;
+        }
         if self.studio.pending_bounce {
             self.studio.pending_bounce = false;
             let first_audio = self.studio.session.doc.project.tracks.iter()
@@ -5008,47 +5028,11 @@ impl eframe::App for App {
                     return;
                 }
                 library::LibraryAction::PatternToTimeline(i) => {
-                    // Bounds-checked rather than indexed: the action was
-                    // produced from last frame's rack, and the rack can have
-                    // shrunk since (a pattern deleted in the same frame the
-                    // send button was pressed). An out-of-date index is a
-                    // status line, not a panic.
-                    match self.studio.rack.patterns.get(i) {
-                        Some(pat) => {
-                            let name = if pat.name.trim().is_empty() {
-                                format!("pattern {}", i + 1)
-                            } else {
-                                pat.name.clone()
-                            };
-                            // NOT WIRED to a real timeline insert yet, and
-                            // deliberately not faked: placing a pattern needs
-                            // a decision about what a pattern IS on the
-                            // timeline (a clip referencing the rack? a bounced
-                            // audio region? a MIDI-ish region the renderer
-                            // expands?), and each answer implies a different
-                            // studio_core::Op. Guessing one here would put a
-                            // wrong shape into the undo log, which is the one
-                            // structure in this app that must not accumulate
-                            // junk. The sidebar half of the report — patterns
-                            // being invisible — is fixed; this half is
-                            // reported honestly rather than half-built.
-                            let at = self.studio.playhead();
-                            let project = &self.studio.session.doc.project;
-                            let track = project.tracks.iter()
-                                .filter(|t| t.kind == studio_core::TrackKind::Audio)
-                                .find(|t| !project.clips.values().any(|c| c.track == t.id && c.pos <= at && c.end() > at))
-                                .or_else(|| project.tracks.iter().find(|t| t.kind == studio_core::TrackKind::Audio))
-                                .map(|t| t.id);
-                            match track {
-                                Some(track) => self.studio.pending_place = Some((i, at, track)),
-                                None => self.studio.status = format!("\"{name}\" needs an audio track to land on"),
-                            }
-                        }
-                        None => {
-                            self.studio.status =
-                                "that pattern no longer exists".into();
-                        }
-                    }
+                    // A LINKED clip: the pattern source names the rack pattern, and
+                    // the audio is a cache kept current from the rack. (Rendering
+                    // to a file stays the bounce command's job.)
+                    let at = self.studio.playhead();
+                    self.pattern_to_timeline(i, at, None);
                     return;
                 }
                 library::LibraryAction::Preview(p) => {
@@ -5292,7 +5276,8 @@ impl eframe::App for App {
                         self.studio.seek(t);
                     }
                     if let Some((index, at, track)) = tr.pattern_dropped {
-                        self.studio.pending_place = Some((index, at, track));
+                        // linked, not bounced: a pattern clip follows the rack (pattern_clips)
+                        self.pattern_to_timeline(index, at, Some(track));
                     }
                     if let Some(g) = tr.toggled_group {
                         if !self.studio.closed_groups.remove(&g) {
@@ -7343,6 +7328,21 @@ impl App {
             }
         }
         self.comic_setup = Some(comic_job::SetupWindow::new(group, frames));
+    }
+
+    /// Put rack pattern `ix` on the timeline as a LINKED clip at `at`: on
+    /// `on` (a track it was dropped on) or the selected clip's audio track if
+    /// it fits, else a new audio track below. One undo.
+    fn pattern_to_timeline(&mut self, ix: usize, at: Ticks, on: Option<studio_core::TrackId>) {
+        match pattern_clips::place_ops(&self.studio.session.doc.project, &self.studio.rack, ix, at,
+                                       self.studio.selection.first().copied(), on) {
+            Ok(ops) => {
+                let name = self.studio.rack.patterns.get(ix).map(|p| p.name.clone()).unwrap_or_default();
+                self.studio.edit_group(ops, "pattern to timeline");
+                self.studio.status = format!("'{name}' on the timeline, linked to the rack — edit the pattern and the clip follows");
+            }
+            Err(e) => self.studio.status = e,
+        }
     }
 
     /// Open the palette straight at one of its questions.
