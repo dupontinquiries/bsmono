@@ -17,6 +17,7 @@ pub mod alpine_root;
 pub mod capabilities;
 pub mod tablet_identity;
 pub mod eink_fleet;
+pub mod elf_deps;
 pub mod finding;
 pub mod device_firewall;
 pub mod fleet;

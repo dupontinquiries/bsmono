@@ -163,7 +163,8 @@ pub fn check_mirror(m: &Mirror, arch: &str, wanted: &[&str]) -> Option<Result<De
 }
 
 fn valid_pkg(p: &str) -> bool {
-    !p.is_empty() && p.len() <= 128 && p.chars().all(|c| c.is_ascii_alphanumeric() || "+-._".contains(c))
+    // plain names plus apk provider names (so:libasound.so.2, cmd:aplay)
+    !p.is_empty() && p.len() <= 128 && !p.starts_with(':') && p.chars().all(|c| c.is_ascii_alphanumeric() || "+-._:".contains(c))
 }
 
 fn check_pkgs(pkgs: &[&str]) -> Result<String, String> {
@@ -365,6 +366,8 @@ mod tests {
     fn package_commands_validate_names_and_need_a_root() {
         assert!(add_cmd(&["bluez-alsa", "alsa-utils"]).unwrap().contains("add bluez-alsa alsa-utils"));
         assert!(add_cmd(&["x; rm -rf /"]).is_err());
+        assert!(add_cmd(&["so:libasound.so.2", "cmd:aplay"]).unwrap().contains("add so:libasound.so.2 cmd:aplay"), "apk provider names");
+        assert!(add_cmd(&[":x"]).is_err() && add_cmd(&["so:a;b"]).is_err());
         assert!(add_cmd(&[]).is_err());
         assert!(del_cmd(&["pipewire"]).unwrap().contains("del pipewire"));
         // without a root the command says so (runs under sh against an empty tree)

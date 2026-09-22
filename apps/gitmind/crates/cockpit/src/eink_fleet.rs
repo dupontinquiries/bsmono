@@ -936,6 +936,8 @@ pub struct BuildTarget {
     pub triple: &'static str,
     /// Link statically (`+crt-static`). True for the AppLoad route.
     pub static_crt: bool,
+    /// Where the app runs: the tablet's own system, or the Alpine root.
+    pub userland: Userland,
     /// One line on why, shown next to the build.
     pub why: &'static str,
 }
@@ -948,17 +950,53 @@ pub struct BuildTarget {
 /// * Blight: the app dlopens the tablet's glibc `libblight_protocol`, which a
 ///   static binary cannot do, so it must be a gnu build pinned to the
 ///   tablet's glibc (see `Displays::glibc`).
+/// Where a tablet app runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Userland {
+    /// On the tablet's own system: a static binary, no system libraries.
+    #[default]
+    Static,
+    /// Inside the Alpine root gitmind keeps under /home (alpine_root),
+    /// launched through alpine-run: a DYNAMIC musl build that links the
+    /// root's libraries, which is what runtime-loaded plugins need (ALSA's
+    /// bluez-alsa plugin: Bluetooth audio; D-Bus for BLE).
+    AlpineRoot,
+}
+
+impl Userland {
+    pub fn parse(s: &str) -> Option<Userland> {
+        match s {
+            "static" | "system" => Some(Userland::Static),
+            "alpine" | "alpine-root" => Some(Userland::AlpineRoot),
+            _ => None,
+        }
+    }
+}
+
+/// [`build_target`] for a chosen userland.
+pub fn build_target_for(route: &Route, model: Option<RmModel>, userland: Userland) -> BuildTarget {
+    let mut t = build_target(route, model);
+    if userland == Userland::AlpineRoot && matches!(route, Route::AppLoad { .. }) {
+        t.static_crt = false;
+        t.userland = Userland::AlpineRoot;
+        t.why = "Alpine root: dynamic musl linking the root's libraries (ALSA plugins, Bluetooth audio, D-Bus), launched through alpine-run";
+    }
+    t
+}
+
 pub fn build_target(route: &Route, model: Option<RmModel>) -> BuildTarget {
     let arm32 = matches!(model, Some(RmModel::Rm1 | RmModel::Rm2));
     match route {
         Route::AppLoad { .. } => BuildTarget {
             triple: if arm32 { "armv7-unknown-linux-musleabihf" } else { "aarch64-unknown-linux-musl" },
             static_crt: true,
+            userland: Userland::Static,
             why: "AppLoad: static musl, runs on any tablet OS and builds natively on an aarch64 postmarketOS phone",
         },
         Route::Blight => BuildTarget {
             triple: if arm32 { "armv7-unknown-linux-gnueabihf" } else { "aarch64-unknown-linux-gnu" },
             static_crt: false,
+            userland: Userland::Static,
             why: "Blight: glibc build (loads the tablet's libblight_protocol); pin glibc to the tablet's",
         },
     }
@@ -1337,7 +1375,13 @@ pub fn tablet_build_output(bin: &str, t: &BuildTarget, native: bool) -> String {
 /// Read a local binary and check it suits the device's route before any
 /// byte is pushed. Used by the CLI and the Tablets page alike.
 pub fn preflight_binary(path: &str, route: &Route, model: Option<RmModel>) -> Result<BuildTarget, String> {
-    let t = build_target(route, model);
+    preflight_binary_for(path, route, model, Userland::Static)
+}
+
+/// [`preflight_binary`] for a chosen userland (the Alpine root accepts a
+/// musl-dynamic binary; the tablet's own system needs a static one).
+pub fn preflight_binary_for(path: &str, route: &Route, model: Option<RmModel>, userland: Userland) -> Result<BuildTarget, String> {
+    let t = build_target_for(route, model, userland);
     let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     check_tablet_binary(&bytes, &t).map_err(|e| format!("{path}: {e}"))?;
     Ok(t)
@@ -1382,6 +1426,12 @@ pub fn check_tablet_binary(bytes: &[u8], t: &BuildTarget) -> Result<(), String> 
     }
     if t.static_crt && dynamic {
         return Err("dynamically linked; the tablet has no musl loader. Rebuild with +crt-static".into());
+    }
+    if t.userland == Userland::AlpineRoot && dynamic {
+        let info = crate::elf_deps::elf_info(bytes)?;
+        if !info.is_musl_dynamic() {
+            return Err(format!("dynamically linked against {} (not musl); the Alpine root runs musl binaries", info.interp.unwrap_or_default()));
+        }
     }
     Ok(())
 }
@@ -1464,8 +1514,11 @@ pub struct BuildPlan {
 /// `:Z` relabels the mount for SELinux (Fedora); a separate target dir keeps
 /// container output from mixing with host builds.
 pub fn container_plan(runtime: &str, repo_root: &std::path::Path, app: &TabletApp, t: &BuildTarget) -> Result<BuildPlan, String> {
-    if !t.static_crt {
-        return Err("container builds cover the AppLoad route (static musl); the Blight route needs a glibc build on the host".into());
+    if t.triple.contains("-gnu") {
+        return Err("container builds are musl (Alpine); the Blight route needs a glibc build on the host".into());
+    }
+    if !t.static_crt && !t.triple.starts_with("aarch64") {
+        return Err("the Alpine-root route builds natively in the arm64 container; armv7 (rM1/rM2) is not wired yet".into());
     }
     let rel = app.dir.strip_prefix(repo_root).map_err(|_| format!("{} is not inside {}", app.dir.display(), repo_root.display()))?;
     let rel = rel.to_string_lossy().to_string();
@@ -1492,7 +1545,10 @@ pub fn container_plan(runtime: &str, repo_root: &std::path::Path, app: &TabletAp
     };
     let output_rel;
     if native {
-        script += &format!("RUSTFLAGS='-C target-feature=+crt-static' {}", cargo.join(" "));
+        // Static for the tablet's own system; dynamic for the Alpine root
+        // (links the same Alpine libraries the root has installed).
+        let crt = if t.static_crt { "+crt-static" } else { "-crt-static" };
+        script += &format!("RUSTFLAGS='-C target-feature={crt}' {}", cargo.join(" "));
         output_rel = format!("{rel}/target/tablet-container/release/{}", app.bin);
     } else {
         cargo.push("--target".into());
@@ -1615,11 +1671,13 @@ pub struct AppLoadOptions {
     /// e-ink text, and eink-kit renders at native panel resolution.
     pub fullscreen: bool,
     pub args: Vec<String>,
+    /// Launch inside the Alpine root through alpine-run.
+    pub userland: Userland,
 }
 
 impl AppLoadOptions {
     pub fn named(name: &str) -> AppLoadOptions {
-        AppLoadOptions { display_name: name.to_string(), fullscreen: true, args: vec![] }
+        AppLoadOptions { display_name: name.to_string(), fullscreen: true, args: vec![], userland: Userland::Static }
     }
 }
 
@@ -1687,10 +1745,18 @@ pub fn appload_manifest(opts: &AppLoadOptions, app: &str, model: Option<RmModel>
     }
     let v = serde_json::json!({
         "name": opts.display_name,
-        "application": bin_path(app),
+        "application": match opts.userland {
+            Userland::Static => bin_path(app),
+            Userland::AlpineRoot => crate::alpine_root::RUNNER.to_string(),
+        },
         "qtfb": true,
         "disablesWindowedMode": opts.fullscreen,
-        "args": opts.args,
+        // Inside the root: alpine-run <root> <binary> <args...>. /home is
+        // bound into the root at the same path, so the binary is where it is.
+        "args": match opts.userland {
+            Userland::Static => opts.args.clone(),
+            Userland::AlpineRoot => [crate::alpine_root::ROOT.to_string(), bin_path(app)].into_iter().chain(opts.args.iter().cloned()).collect::<Vec<_>>(),
+        },
         "environment": env,
     });
     serde_json::to_string_pretty(&v).expect("json")
@@ -1799,6 +1865,16 @@ pub fn deliver(
             remote.run(&install_cmd(app)?).map_err(|e| format!("install: {e}"))?;
             let default_opts = AppLoadOptions { args: args.iter().map(|a| a.to_string()).collect(), ..AppLoadOptions::named(app) };
             let (opts, icon) = appload.unwrap_or((&default_opts, None));
+            if opts.userland == Userland::AlpineRoot {
+                // Its libraries into the root, by what the binary itself
+                // names (DT_NEEDED -> so:<lib>, which apk resolves).
+                let bytes = std::fs::read(local_bin).map_err(|e| format!("read {local_bin}: {e}"))?;
+                let provides = crate::elf_deps::elf_info(&bytes)?.apk_provides();
+                if !provides.is_empty() {
+                    let names: Vec<&str> = provides.iter().map(String::as_str).collect();
+                    remote.run(&crate::alpine_root::add_cmd(&names)?).map_err(|e| format!("installing its libraries into the Alpine root: {e}"))?;
+                }
+            }
             let manifest = appload_manifest(opts, app, env.model, env.profile);
             let written = remote.run(&appload_install_cmd(app, dir, &manifest)?).map_err(|e| format!("manifest: {e}"))?;
             let change = ManifestChange::from_output(&written);
@@ -2917,5 +2993,66 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
         let explicit = TabletApp { no_default: true, features: vec!["eink".into()], ..app.clone() };
         assert_eq!(app_for_device(&explicit, Some(&rm)).0, explicit);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_alpine_root_app_launches_through_the_runner_with_its_binary() {
+        let opts = AppLoadOptions { userland: Userland::AlpineRoot, args: vec!["--x".into()], ..AppLoadOptions::named("voiceterm") };
+        let v: serde_json::Value = serde_json::from_str(&appload_manifest(&opts, "voiceterm-egui", Some(RmModel::PaperPro), RefreshProfile::FastColor)).unwrap();
+        assert_eq!(v["application"], crate::alpine_root::RUNNER);
+        let args: Vec<&str> = v["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
+        assert_eq!(args, vec![crate::alpine_root::ROOT, "/home/root/.local/share/gitmind/bin/voiceterm-egui", "--x"]);
+        assert_eq!(v["environment"]["EINK_BACKEND"], "qtfb", "the app still talks to AppLoad (qtfb socket bound into the root)");
+    }
+
+    #[test]
+    fn the_alpine_root_route_builds_dynamic_musl_in_the_arm64_container() {
+        let r = Route::AppLoad { dir: "/home/root/x".into() };
+        let t = build_target_for(&r, Some(RmModel::PaperPro), Userland::AlpineRoot);
+        assert!(!t.static_crt && t.triple == "aarch64-unknown-linux-musl" && t.userland == Userland::AlpineRoot);
+        let app = TabletApp { dir: "/r/apps/x".into(), bin: "x".into(), features: vec![], no_default: false, via_shim: false };
+        let p = container_plan("podman", std::path::Path::new("/r"), &app, &t).unwrap();
+        let a = p.argv.join(" ");
+        assert!(a.contains("--platform linux/arm64") && a.contains("-crt-static") && !a.contains("+crt-static"), "{a}");
+        let rm2 = build_target_for(&r, Some(RmModel::Rm2), Userland::AlpineRoot);
+        assert!(container_plan("podman", std::path::Path::new("/r"), &app, &rm2).unwrap_err().contains("armv7"));
+        assert_eq!(build_target_for(&Route::Blight, Some(RmModel::PaperPro), Userland::AlpineRoot).userland, Userland::Static, "Blight is not an AppLoad route");
+    }
+
+    #[test]
+    fn preflight_accepts_musl_dynamic_for_the_root_and_refuses_glibc() {
+        // a minimal aarch64 ELF64 with a PT_INTERP naming the given loader
+        let elf = |interp: &str| {
+            let mut b = vec![0u8; 0x100];
+            b[..4].copy_from_slice(b"\x7fELF"); b[4] = 2; b[5] = 1; b[18] = 183;
+            b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // phoff
+            b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // phentsize
+            b[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes());  // phnum
+            b[64..68].copy_from_slice(&3u32.to_le_bytes());      // PT_INTERP
+            b[64 + 8..64 + 16].copy_from_slice(&0xc0u64.to_le_bytes());
+            b[0xc0..0xc0 + interp.len()].copy_from_slice(interp.as_bytes());
+            b
+        };
+        let t = build_target_for(&Route::AppLoad { dir: "/x".into() }, Some(RmModel::PaperPro), Userland::AlpineRoot);
+        assert!(check_tablet_binary(&elf("/lib/ld-musl-aarch64.so.1"), &t).is_ok());
+        assert!(check_tablet_binary(&elf("/lib/ld-linux-aarch64.so.1"), &t).unwrap_err().contains("not musl"));
+        let static_t = build_target(&Route::AppLoad { dir: "/x".into() }, Some(RmModel::PaperPro));
+        assert!(check_tablet_binary(&elf("/lib/ld-musl-aarch64.so.1"), &static_t).is_err(), "the system route still needs static");
+    }
+
+    #[test]
+    fn deploying_into_the_alpine_root_installs_the_binarys_libraries_then_registers_through_the_runner() {
+        let Ok(_) = std::fs::metadata("/bin/ls") else { return };
+        let mut r = Fake { log: vec![], status: String::new() };
+        let env = LaunchEnv { profile: RefreshProfile::FastColor, model: Some(RmModel::PaperPro), blight_lib: None };
+        let opts = AppLoadOptions { userland: Userland::AlpineRoot, ..AppLoadOptions::named("demo") };
+        let route = Route::AppLoad { dir: "/home/root/xovi/exthome/appload".into() };
+        let d = deliver(&mut r, &route, "demo", "/bin/ls", &env, &[], Some((&opts, None)), &mut |_| {}).unwrap();
+        assert!(matches!(d, Delivered::Registered { .. }));
+        let apk = r.log.iter().position(|c| c.contains("apk.static") && c.contains(" add so:")).expect("libraries installed into the root");
+        let manifest = r.log.iter().position(|c| c.contains("external.manifest.json")).unwrap();
+        assert!(apk < manifest, "libraries before the app is offered in AppLoad");
+        assert!(r.log[apk].contains("so:libc.so.6"), "named from the binary's own DT_NEEDED: {}", r.log[apk]);
+        assert!(r.log[manifest].contains("alpine-run"), "launched through the runner");
     }
 }

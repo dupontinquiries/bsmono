@@ -1406,7 +1406,8 @@ fn cmd_eink(rest: &[String]) -> i32 {
         retrust <host>                      accept the tablet's NEW host key (after an OS update)\n  \
         enroll <host>                       first contact: password (GITMIND_RM_PASSWORD or stdin) → key\n  \
         probe <host>                        model, display servers, route\n  \
-        deploy <host> <bin> [--name N] [--title T] [--icon PNG] [--windowed] [--profile P] [-- args...]\n  \
+        deploy <host> <bin> [--name N] [--title T] [--icon PNG] [--windowed] [--profile P] [--userland alpine] [-- args...]\n  \
+        (--userland alpine on build/deploy: dynamic, inside the Alpine root; needs `pkg bootstrap` and the runner)\n  \
         stop <host> <app>\n  \
         status <host> <app>";
     let sub = match rest.first() { Some(s) => s.as_str(), None => return err(USAGE) };
@@ -1421,6 +1422,11 @@ fn cmd_eink(rest: &[String]) -> i32 {
     let user = opt(flags, "--user").map(str::to_string)
         .or_else(|| std::env::var("GITMIND_RM_USER").ok().filter(|u| !u.trim().is_empty()))
         .unwrap_or_else(|| ef::DEFAULT_USER.to_string());
+    // `--userland alpine`: build dynamic and run inside the Alpine root.
+    let userland = match opt(flags, "--userland") {
+        Some(u) => match ef::Userland::parse(u) { Some(u) => u, None => { eprintln!("--userland: static|alpine"); return 2; } },
+        None => ef::Userland::Static,
+    };
     let mut remote = ef::SshRemote { user: user.clone(), host: host.clone() };
     let need = |a: Option<ef::Activation>| match a {
         Some(a) => format!("\n          needs, once per boot: {} → `gitmind eink activate {host}`", a.label()),
@@ -1496,7 +1502,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
             if let (ef::Route::Blight, Some(a)) = (&route, activation) {
                 return eink_err(&format!("the tablet needs `{}` since its last boot: run `gitmind eink activate {host}`", a.label()));
             }
-            if let Err(e) = ef::preflight_binary(bin, &route, probe.model) {
+            if let Err(e) = ef::preflight_binary_for(bin, &route, probe.model, userland) {
                 return eink_err(&format!("not deployed: {e}"));
             }
             let profile = match opt(flags, "--profile") {
@@ -1509,6 +1515,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
                 display_name: opt(flags, "--title").map(str::to_string).unwrap_or_else(|| name.clone()),
                 fullscreen: !flags.iter().any(|f| f == "--windowed"),
                 args: app_args.clone(),
+                userland,
             };
             let icon = opt(flags, "--icon");
             match ef::deliver(&mut remote, &route, &name, bin, &env, &args, Some((&opts, icon)), &mut |ev| eprintln!("  · {ev:?}")) {
@@ -1544,7 +1551,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
             let Some(app) = ef::discover_tablet_apps(&root).into_iter().find(|a| a.bin == **bin) else {
                 return eink_err(&format!("{bin}: not an eink-kit app in {}", root.display()));
             };
-            let t = ef::build_target(&route, probe.model);
+            let t = ef::build_target_for(&route, probe.model, userland);
             let engine = match opt(flags, "--engine") {
                 Some(e) => match ef::Engine::parse(e) { Some(e) => e, None => return eink_err("--engine: auto|host|container") },
                 None => ef::Engine::Auto,
@@ -1571,7 +1578,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
                 return eink_err(&format!("built, but {} not found", plan.output.display()));
             };
             let path = path.to_string_lossy().to_string();
-            match ef::preflight_binary(&path, &route, probe.model) {
+            match ef::preflight_binary_for(&path, &route, probe.model, userland) {
                 Ok(_) => { println!("{path}"); 0 }
                 Err(e) => eink_err(&format!("built, but it will not run on the tablet: {e}")),
             }
@@ -1727,7 +1734,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
 }
 
 /// `gitmind eink` flags that take a value (the next argument).
-const EINK_VALUE_FLAGS: &[&str] = &["--user", "--name", "--title", "--icon", "--profile", "--engine", "--mirror", "--branch"];
+const EINK_VALUE_FLAGS: &[&str] = &["--user", "--name", "--title", "--icon", "--profile", "--engine", "--mirror", "--branch", "--userland"];
 
 /// Positional arguments: everything that is neither a flag nor a value
 /// flag's value. (Dropping only the `--x` tokens kept their values, so

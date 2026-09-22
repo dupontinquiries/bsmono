@@ -47,6 +47,8 @@ pub struct State {
     pub built: Arc<Mutex<Option<(String, String)>>>,
     /// Host toolchain, container (podman/docker), or auto.
     pub engine: ef::Engine,
+    /// Build dynamic and run inside the Alpine root (alpine-run).
+    pub alpine_root: bool,
     /// AppLoad sidebar title; empty = the app name.
     pub display_name: String,
     /// Allow AppLoad's windowed mode (default off: fullscreen, crisp).
@@ -83,6 +85,7 @@ impl Default for State {
             selected: 0,
             built: Arc::new(Mutex::new(None)),
             engine: ef::Engine::Auto,
+            alpine_root: false,
             display_name: String::new(),
             windowed: false,
             installed: Arc::new(Mutex::new(Vec::new())),
@@ -302,14 +305,17 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             ui.radio_value(&mut s.engine, ef::Engine::Host, "host toolchain");
             ui.radio_value(&mut s.engine, ef::Engine::Container, "container (podman)");
         });
+        ui.checkbox(&mut s.alpine_root, "run inside the Alpine root (system libraries: Bluetooth audio, D-Bus)")
+            .on_hover_text("builds a dynamic binary that uses the Alpine root's libraries; needs the root (Packages) and alpine-run installed");
         if ui.add_enabled(!busy && route.is_some(), egui::Button::new("Build for this tablet")).clicked() {
             let (r, m) = route.clone().unwrap();
             let app = apps[s.selected].clone();
             let engine = s.engine;
+            let userland = if s.alpine_root { ef::Userland::AlpineRoot } else { ef::Userland::Static };
             let host = s.host.trim().to_string();
             let built = s.built.clone();
             s.task.run_logged(move |log| {
-                let t = ef::build_target(&r, m);
+                let t = ef::build_target_for(&r, m, userland);
                 let path = std::env::var("PATH").unwrap_or_default();
                 // Features follow the device's surveyed hardware (enrolment stores it).
                 let caps = cockpit::capabilities::load(&cockpit::tablet_identity::device_key(&host));
@@ -353,7 +359,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                     app.dir.ancestors().map(|d| d.join(ef::tablet_build_output(&app.bin, &t, ef::native_for(&t))))
                 ).find(|p| p.exists()) else { return format!("built, but {} was not found", plan.output.display()) };
                 let path = path.to_string_lossy().to_string();
-                match ef::preflight_binary(&path, &r, m) {
+                match ef::preflight_binary_for(&path, &r, m, userland) {
                     Ok(_) => {
                         *built.lock().unwrap() = Some((path.clone(), app.bin.clone()));
                         format!("built {path}\nready to deploy")
@@ -412,6 +418,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         let can = !busy && found.is_some() && !s.bin_path.trim().is_empty() && name_ok;
         if ui.add_enabled(can, egui::Button::new("Deploy")).clicked() {
             let (host, bin, name, choice) = (s.host.trim().to_string(), s.bin_path.trim().to_string(), name.clone(), s.profile);
+            let userland = if s.alpine_root { ef::Userland::AlpineRoot } else { ef::Userland::Static };
             let user = s.user.trim().to_string();
             let title = if s.display_name.trim().is_empty() { name.clone() } else { s.display_name.trim().to_string() };
             let fullscreen = !s.windowed;
@@ -425,13 +432,13 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                     return format!("the tablet needs \"{}\" since its last boot — use Activate above", a.label());
                 }
                 // Never push something the tablet cannot run.
-                if let Err(e) = ef::preflight_binary(&bin, &route, p.model) {
+                if let Err(e) = ef::preflight_binary_for(&bin, &route, p.model, userland) {
                     return format!("not deployed: {e}");
                 }
                 let profile = choice.unwrap_or_else(|| ef::RefreshProfile::fastest(p.model.map(|m| m.panel()).unwrap_or(ef::Panel::Mono)));
                 let env = ef::LaunchEnv { profile, model: p.model, blight_lib: d.blight_lib.clone() };
                 // Sidebar entry: title, fullscreen, and a letter-tile icon.
-                let opts = ef::AppLoadOptions { display_name: title, fullscreen, args: vec![] };
+                let opts = ef::AppLoadOptions { display_name: title, fullscreen, args: vec![], userland };
                 let icon = std::env::temp_dir().join(format!("gitmind-icon-{name}.png"));
                 let icon_ok = std::fs::write(&icon, eink_kit::icon::letter_tile_png(&name, 128)).is_ok();
                 let icon_path = icon.to_string_lossy().to_string();
