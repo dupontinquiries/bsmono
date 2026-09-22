@@ -13,6 +13,11 @@
 //! * Input is ignored while authenticating and during backoff; backoff
 //!   escalates with consecutive failures.
 //!
+//! **Cover mode** (`require_auth == false`, the current default): no PIN, no
+//! PAM. The swipe itself dismisses: a committed drag slides the cover away and
+//! `Unlock` follows once it has settled. It is a visual cover, not security;
+//! the PIN/PAM path is kept for when authentication arrives.
+//!
 //! Interaction: swipe up to reveal the PIN pad (a `DragTransition` that
 //! follows the finger), type, submit; on success the lock slides away
 //! (another transition) and only then is the session released.
@@ -62,6 +67,8 @@ pub struct LockScreen {
     pub failures: u32,
     backoff_until: Option<Millis>,
     pub message: Option<String>,
+    /// false = cover mode: the swipe dismisses, no PIN (see module docs).
+    pub require_auth: bool,
 }
 
 impl Default for LockScreen {
@@ -74,6 +81,7 @@ impl Default for LockScreen {
             failures: 0,
             backoff_until: None,
             message: None,
+            require_auth: false,
         }
     }
 }
@@ -109,7 +117,7 @@ impl LockScreen {
     }
 
     fn accepting_input(&self, now: Millis) -> bool {
-        self.phase == LockPhase::Locked && self.reveal.target() >= 1.0 && !self.in_backoff(now)
+        self.require_auth && self.phase == LockPhase::Locked && self.reveal.target() >= 1.0 && !self.in_backoff(now)
     }
 
     pub fn drag_reveal(&mut self, progress: f32, now: Millis) {
@@ -175,6 +183,11 @@ impl LockScreen {
             self.backoff_until = None;
             self.message = None;
         }
+        // Cover mode: the committed swipe IS the unlock, once it has settled.
+        if !self.require_auth && self.phase == LockPhase::Locked && self.reveal.is_settled() && self.reveal.progress >= 1.0 {
+            self.phase = LockPhase::Unlocked;
+            return vec![LockAction::Unlock];
+        }
         if self.phase == LockPhase::Unlocking && self.exit.is_settled() && self.exit.progress >= 1.0 {
             self.phase = LockPhase::Unlocked;
             return vec![LockAction::Unlock];
@@ -187,8 +200,35 @@ impl LockScreen {
 mod tests {
     use super::*;
 
-    fn revealed() -> LockScreen {
+    #[test]
+    fn cover_mode_swipe_dismisses_short_swipe_springs_back_no_auth_ever() {
         let mut l = LockScreen::default();
+        assert!(!l.require_auth, "cover mode is the default for now");
+        l.lock();
+        for i in 0..=5 {
+            l.drag_reveal(i as f32 * 0.03, i * 60); // short, slow
+        }
+        l.release_reveal();
+        let mut acts = vec![];
+        for i in 0..80 {
+            acts.extend(l.tick(11.1, 1000 + i * 11));
+        }
+        assert!(acts.is_empty() && l.is_locked() && l.reveal.progress == 0.0, "sprang back: {acts:?}");
+        for i in 0..=10 {
+            l.drag_reveal(i as f32 * 0.06, 3000 + i * 11); // flick
+        }
+        l.release_reveal();
+        type_pin(&mut l, "1234", 3200);
+        assert!(l.submit(3200).is_empty(), "no PIN path in cover mode");
+        for i in 0..80 {
+            acts.extend(l.tick(11.1, 3200 + i * 11));
+        }
+        assert_eq!(acts, vec![LockAction::Unlock]);
+        assert!(!l.is_locked());
+    }
+
+    fn revealed() -> LockScreen {
+        let mut l = LockScreen { require_auth: true, ..LockScreen::default() };
         assert_eq!(l.lock(), vec![LockAction::Engage]);
         for i in 0..=10 {
             l.drag_reveal(i as f32 / 10.0, i * 20);
@@ -280,7 +320,7 @@ mod tests {
 
     #[test]
     fn input_needs_the_pad_revealed_and_hiding_it_drops_partial_input() {
-        let mut l = LockScreen::default();
+        let mut l = LockScreen { require_auth: true, ..LockScreen::default() };
         l.lock();
         type_pin(&mut l, "12", 0);
         assert_eq!(l.pin_len(), 0, "pad not revealed");

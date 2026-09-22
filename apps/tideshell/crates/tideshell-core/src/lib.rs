@@ -95,4 +95,6 @@ pub enum Action {
     /// Hide (or restore) the compositor-drawn cursor while the fat cursor is
     /// drawn instead. cosmic-comp: its live `cursor_hide_timeout` config.
     HideSystemCursor(bool),
+    /// Panel on/off without suspending (zwlr_output_power_v1.set_mode).
+    DisplayPower(bool),
 }

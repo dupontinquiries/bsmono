@@ -10,6 +10,8 @@ use crate::carousel::Carousel;
 use crate::control_center::{ControlCenter, QuickKind, SliderKind};
 use crate::ambient::AutoBrightness;
 use crate::cursor::FatCursor;
+use crate::lock::{LockAction, LockScreen};
+use crate::sleep::{Sleep, SleepAction};
 use crate::edge::{GestureEvent, Recognizer, SwipeUpTarget};
 use crate::hold::{HoldMenu, HoldOption};
 use crate::prefs::{Layout, ShellPrefs};
@@ -40,6 +42,10 @@ pub struct Shell {
     pub fat: Option<FatCursor>,
     /// Ambient light + time of day brightness.
     pub ambient: AutoBrightness,
+    /// The lock cover (cover mode for now: swipe dismisses, no auth).
+    pub lock: LockScreen,
+    /// Power key -> fade -> panel off; triple tap wakes.
+    pub sleep: Sleep,
     /// Local minute of the day, set by the runtime (the engine has no clock).
     clock_minute: u32,
     /// The learned offset changed and is waiting to be saved once the user
@@ -82,6 +88,8 @@ impl Shell {
             modes: Modes::default(),
             fat: None,
             ambient,
+            lock: LockScreen::default(),
+            sleep: Sleep::default(),
             clock_minute: 12 * 60,
             offset_dirty_at: None,
             bar_expanded: false,
@@ -203,8 +211,62 @@ impl Shell {
 
     // ---- input ------------------------------------------------------------
 
+    fn on_sleep_action(&mut self, a: SleepAction) -> Vec<Action> {
+        match a {
+            SleepAction::Lock => {
+                self.lock_now();
+                vec![]
+            }
+            SleepAction::DisplayPower(on) => {
+                self.log(format!("display {}", if on { "on" } else { "off" }));
+                vec![Action::DisplayPower(on)]
+            }
+        }
+    }
+
+    /// Engage the cover (at startup, on sleep, or on request).
+    pub fn lock_now(&mut self) {
+        if !self.lock.lock().is_empty() {
+            self.drawer.close();
+            self.switcher.hide();
+            self.hold = None;
+            self.log("cover shown");
+        }
+    }
+
+    /// The power key: awake -> sleep (and cover); asleep -> wake.
+    pub fn power_key(&mut self) -> Vec<Action> {
+        self.log("power key");
+        let acts = self.sleep.power_key();
+        let out: Vec<Action> = acts.into_iter().flat_map(|a| self.on_sleep_action(a)).collect();
+        self.emit(out)
+    }
+
+    /// A touch while the screen sleeps (all touches go here then).
+    pub fn on_sleep_touch(&mut self, ev: TouchEvent) -> Vec<Action> {
+        let acts = match ev {
+            TouchEvent::Down { slot, x, y, t } => self.sleep.touch_down(slot, x, y, t),
+            TouchEvent::Move { slot, x, y, .. } => {
+                self.sleep.touch_move(slot, x, y);
+                vec![]
+            }
+            TouchEvent::Up { slot, t } => self.sleep.touch_up(slot, t),
+            TouchEvent::Cancel => vec![],
+        };
+        if !acts.is_empty() {
+            self.log("triple tap: wake");
+        }
+        let out: Vec<Action> = acts.into_iter().flat_map(|a| self.on_sleep_action(a)).collect();
+        self.emit(out)
+    }
+
     /// A touch sample from an edge strip.
     pub fn on_edge_touch(&mut self, ev: TouchEvent) -> Vec<Action> {
+        // Covered or asleep: no shell gestures (the cover and the sleep
+        // capture take the touches instead).
+        if self.lock.is_locked() || self.sleep.captures_input() {
+            return vec![];
+        }
         if let TouchEvent::Down { t, .. } | TouchEvent::Move { t, .. } | TouchEvent::Up { t, .. } = ev {
             self.now = self.now.max(t);
         }
@@ -231,6 +293,14 @@ impl Shell {
         let events = self.recognizer.tick(now);
         self.drain_recognizer_log();
         let mut out = vec![];
+        for a in self.sleep.tick(dt) {
+            out.extend(self.on_sleep_action(a));
+        }
+        for a in self.lock.tick(dt, now) {
+            if a == LockAction::Unlock {
+                self.log("cover dismissed");
+            }
+        }
         // Auto-brightness ramp steps: not logged (a ramp is many steps).
         if let Some(v) = self.ambient.tick(now, self.clock_minute) {
             self.drawer.brightness = v;
@@ -834,6 +904,32 @@ mod tests {
         assert_eq!(saves, 1, "one save after the drag, not one per event");
         assert!((sh.prefs.brightness_offset - sh.ambient.user).abs() < 1e-6 && sh.ambient.user > 0.0);
         assert_eq!(sh.brightness_slider_pos(), (sh.ambient.user + 1.0) / 2.0);
+    }
+
+    #[test]
+    fn power_key_covers_sleeps_and_triple_tap_wakes_to_the_cover() {
+        let mut sh = shell_with_three();
+        sh.open_switcher();
+        assert!(sh.power_key().is_empty(), "the fade comes first; the panel goes off at its end");
+        assert!(sh.lock.is_locked() && !sh.switcher.open, "cover engaged, overlays closed");
+        let mut t = 1000u64;
+        let mut off = vec![];
+        for _ in 0..30 {
+            t += 11;
+            off.extend(sh.tick(t));
+        }
+        assert!(off.contains(&Action::DisplayPower(false)));
+        // Edge gestures are dead while asleep/covered.
+        assert!(edge_drag(&mut sh, (200.0, 895.0), (200.0, 600.0), 20, t).is_empty());
+        assert!(!sh.switcher.open);
+        let mut wake = vec![];
+        for i in 0..3u64 {
+            let tt = t + 2000 + i * 200;
+            sh.on_sleep_touch(TouchEvent::Down { slot: 0, x: 200.0, y: 500.0, t: tt });
+            wake.extend(sh.on_sleep_touch(TouchEvent::Up { slot: 0, t: tt + 80 }));
+        }
+        assert_eq!(wake, vec![Action::DisplayPower(true)]);
+        assert!(sh.lock.is_locked(), "wakes to the cover");
     }
 
     #[test]
