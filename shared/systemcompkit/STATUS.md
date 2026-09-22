@@ -24,7 +24,7 @@ only whatever becomes the actual shell needs the real thing.
 | `capture` | `ext-image-copy-capture-v1` + `ext-image-capture-source-v1` | confirmed correct at the time `layer`/`toplevel` were built (the earlier "not yet implemented" note was for this exact protocol pair) |
 | (not `toplevel`) | `wlr-foreign-toplevel-management` | deliberately **not** used — confirmed non-interoperable with `cosmic-comp`, which speaks the `ext-`/`zcosmic` family instead. This is the same protocol-family lesson the phosh-vs-KWin research surfaced earlier; recorded here so it isn't re-litigated by someone who only reads this crate in isolation |
 | (not `capture`) | `wlr-screencopy-unstable-v1` | deliberately **not** used — `cosmic-comp` has moved to the newer standardized protocol above |
-| `wayland_io::LayerSurface::paint_argb8888` | `wl_shm` (core protocol) | this crate's own `examples/paint_probe.rs`-then-`ldd` check (see below) — not a doc claim, an actual link-time verification |
+| `wayland_io::LayerSurface::paint_argb8888` | `wl_shm` (core protocol) | described as an `examples/paint_probe.rs`-then-`ldd` check, but **no such example exists in the tree** (found c19; the claim may predate a lost file). Treat as unverified until re-run |
 
 ## The Vulkan/EGL vs. wl_shm finding, recorded here since it shapes `wayland_io`'s own dependency shape
 
@@ -114,3 +114,24 @@ avoided layer-shell entirely (a poke-file-toggled plain window, sidestepping
 the whole surface-role question) and that was the right call for what it
 was at the time. Revisiting it is a real choice about what `hatch` is *for*
 now, not a natural continuation this crate should assume for anyone.
+
+## Verified against a real cosmic-comp (c19)
+
+cosmic-comp epoch-1.8.0 runs nested in this sandbox: build it (`cargo build`,
+~6 min, debuginfo off), start it under Xvfb (the X11 backend fails on DRI3,
+it falls back to winit/EGL on llvmpipe), point clients at `wayland-1`.
+`examples/toplevel_probe.rs` against it established, and fixed:
+
+1. **Every `poll()` was deaf after connect.** They called
+   `EventQueue::dispatch_pending` alone, which never reads the socket. Now
+   `pump()`: flush, non-blocking read guard, dispatch. Probe saw a window
+   opened 3 s after connecting.
+2. **Title, app_id and closed come from the ext handle, not zcosmic, on v2+.**
+   The zcosmic copies are `deprecated-since="2"` and cosmic-comp does not send
+   them. Titles were empty and closed windows never left the list; both fixed.
+3. **Management requests** (`ToplevelSession::request`) were missing because
+   the zcosmic handle was discarded at creation. Close, activate, maximize,
+   unmaximize all confirmed honoured. Advertised caps: `[1,2,3,4,6]` —
+   close, activate, maximize, minimize, move_to_workspace. **No fullscreen.**
+
+Still not exercised live: layer-shell surfaces, idle, capture.

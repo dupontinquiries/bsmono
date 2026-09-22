@@ -1,0 +1,101 @@
+//! tideshell-core — the touch shell as a headless engine.
+//!
+//! Layering (each seam isolates something that actually varies):
+//!
+//! ```text
+//!   touch samples ──► edge::Recognizer ──► GestureEvent ─┐
+//!   overlay taps  ─────────────────────────────────────── ┼─► shell::Shell ──► Vec<Action>
+//!   window list   ─────────────────────────────────────── ┘        │
+//!                                                     state for painting
+//! ```
+//!
+//! * **Input** arrives as plain [`TouchEvent`]s. In production they come from
+//!   thin layer-shell edge strips (the Wayland implicit touch grab keeps
+//!   delivering motion after the finger leaves the strip), in the simulator
+//!   from egui. The recognizer does not care which.
+//! * **Output** is [`Action`]: what should happen in the world. Executing it is
+//!   a transport's job — zcosmic toplevel management, cosmic-comp's EI socket,
+//!   rusty-board's D-Bus, hatch-core. Nothing here links any of them, so every
+//!   decision is testable with plain values.
+//! * **Observability**: [`shell::Shell::trace`] is a bounded log of every
+//!   recognizer transition and emitted action, drawn by the frontend's debug
+//!   overlay, so "why didn't my swipe open the switcher" is answerable on the
+//!   phone.
+
+pub mod ambient;
+pub mod anim;
+pub mod bar;
+pub mod carousel;
+pub mod clock;
+pub mod control_center;
+pub mod cursor;
+pub mod edge;
+pub mod hold;
+pub mod lock;
+pub mod prefs;
+pub mod shell;
+pub mod sleep;
+pub mod switcher;
+pub mod trackpad;
+
+pub use shell::Shell;
+
+/// Monotonic milliseconds. The caller's clock; tests pass literals.
+pub type Millis = u64;
+
+/// One touch sample in screen-logical pixels, origin top-left, y down.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TouchEvent {
+    Down { slot: i32, x: f32, y: f32, t: Millis },
+    Move { slot: i32, x: f32, y: f32, t: Millis },
+    Up { slot: i32, t: Millis },
+    /// The compositor took the sequence away (e.g. a grab started).
+    Cancel,
+}
+
+/// A toplevel as the shell needs it. Built from
+/// `systemcompkit::toplevel::ToplevelInfo` by the transport layer, so this
+/// crate stays free of the protocol crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowCard {
+    pub id: u64,
+    pub title: String,
+    pub app_id: String,
+    pub activated: bool,
+    pub maximized: bool,
+    /// Width the compositor laid the window out at (COSMIC `geometry`), if known.
+    pub width: Option<i32>,
+}
+
+/// What the shell wants done. Transports execute these; the engine never
+/// assumes an action succeeded (window state comes back via `set_windows`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    /// zcosmic_toplevel_manager_v1.activate
+    Activate(u64),
+    /// zcosmic_toplevel_manager_v1.close
+    Close(u64),
+    /// zcosmic_toplevel_manager_v1.set_maximized / unset_maximized
+    SetMaximized(u64, bool),
+    /// Launch a desktop entry by id through hatch-core (so recents stay shared).
+    LaunchApp(String),
+    /// Summon hatch's full app grid (`hatch-egui --toggle`).
+    SummonLauncher,
+    /// rusty-board `io.rustyboard.Keyboard1.Show` / `Hide`.
+    ShowKeyboard(bool),
+    /// Map or unmap the trackpad overlay surface.
+    ShowTrackpad(bool),
+    /// Virtual pointer output, sent over cosmic-comp's EI socket.
+    Pointer(trackpad::PointerOut),
+    /// A quick-settings toggle changed. Backends (NetworkManager, BlueZ, ...)
+    /// are per-kind transports.
+    SetQuick(control_center::QuickKind, bool),
+    SetSlider(control_center::SliderKind, f32),
+    /// Prefs changed; persist `ShellPrefs::to_kv()` through settingsd.
+    SavePrefs,
+    /// Hide (or restore) the compositor-drawn cursor while the fat cursor is
+    /// drawn instead. cosmic-comp: its live `cursor_hide_timeout` config.
+    HideSystemCursor(bool),
+    /// Panel on/off without suspending (zwlr_output_power_v1.set_mode).
+    DisplayPower(bool),
+}

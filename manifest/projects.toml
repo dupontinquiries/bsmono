@@ -38,6 +38,17 @@ targets = ["desktop", "phone"]
 primary = true            # the egui shell over crates/hatch-core; the QML plasmoid in apps/hatch/qml is the Plasma-native surface, installed with kpackagetool6, not built here
 notes = "fullscreen app launcher: hatch-core (std-only: .desktop scan, Exec spawn, icon-theme resolve, fuzzy rank, favorites/recents via config-kit) under an egui grid shell. Single-instance with a poke-file toggle so a global shortcut summons the running window (`hatch-egui --toggle`). `svg` feature (default on) pulls resvg for breeze system icons; drop it for a min-size musl build and svg-only icons fall back to letter tiles."
 
+[apps.tideshell-egui]
+path = "apps/tideshell/egui-frontend"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # pure egui/glow; the shell engine (crates/tideshell-core) is std-only
+targets = ["desktop", "phone"]
+primary = true
+notes = "touch shell for cosmic-comp: pull-down control center or right-hand bar of mixable widgets (shell.layout), MRU multitask switcher on swipe-up, hatch on long swipe-up, press-and-hold for carousel/keyboard/trackpad. Currently the tideshell-sim binary (simulated windows); window management, EI trackpad and layer-shell edge strips are not wired yet. The trackpad needs cosmic-comp patch 0002 (EI allowlist)."
+
 [apps.snapclone-egui]
 path = "apps/snapclone/egui-frontend"
 kind = "cargo"

@@ -1,0 +1,11 @@
+[package]
+name = "tideshell-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Headless engine for tideshell, a touch shell over cosmic-comp: edge-gesture recognizer (top pull, bottom swipe-up / hold / horizontal quick-switch, right swipe-in), plasma-mobile-style control-center drawer, right-hand bar of mixable widgets, MRU multitask switcher, press-and-hold mode chooser, carousel focus mode, virtual-trackpad pointer math, and flat key/value prefs. std-only: every surface is paint and input over this, and it emits Actions that transports (Wayland, EI, D-Bus, hatch) execute."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
