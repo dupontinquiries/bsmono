@@ -16,7 +16,7 @@ required-features = ["layer", "ei"]
 [[bin]]
 name = "tideshell-sim"
 path = "src/bin/tideshell_sim.rs"
-required-features = ["app"]
+required-features = ["app", "sensors"]
 
 [features]
 default = ["app", "wayland", "ei", "layer"]
@@ -26,9 +26,11 @@ app = ["dep:eframe"]
 wayland = ["dep:systemcompkit"]
 # Trackpad output over libei to cosmic-comp (needs cosmic-comp patch 0002).
 ei = ["dep:reis", "dep:zbus"]
+# Ambient light (iio-sensor-proxy / IIO sysfs) + backlight (logind / sysfs).
+sensors = ["dep:zbus", "dep:libc"]
 # The real shell: layer-shell edge strips + an egui overlay on EGL (egui_glow).
 # Links libwayland-client and libEGL, unlike the pure-Rust `wayland` feature.
-layer = ["wayland", "dep:wayland-client", "dep:wayland-protocols-wlr", "dep:wayland-egl", "dep:khronos-egl", "dep:egui_glow", "dep:glow", "dep:rustix", "dep:wayland-protocols"]
+layer = ["wayland", "dep:wayland-client", "dep:wayland-protocols-wlr", "dep:wayland-egl", "dep:khronos-egl", "dep:egui_glow", "dep:glow", "dep:rustix", "dep:wayland-protocols", "sensors"]
 
 [dependencies]
 tideshell-core = { path = "../crates/tideshell-core" }
@@ -48,6 +50,7 @@ wayland-protocols = { version = "0.32", features = ["client", "staging", "unstab
 khronos-egl = { version = "6", features = ["static"], optional = true }
 egui_glow = { version = "0.34", optional = true }
 glow = { version = "0.17", optional = true }
+libc = { version = "0.2", optional = true }
 rustix = { version = "1", features = ["event", "fs", "time"], optional = true }
 # Glow chosen explicitly (eframe_backend_check): wgpu's default device asks for
 # more colour attachments than phone GPUs allow. Same reasoning as hatch-egui.

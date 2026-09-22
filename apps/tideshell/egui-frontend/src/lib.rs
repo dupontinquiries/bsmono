@@ -19,6 +19,8 @@ pub mod wayland;
 pub mod ei;
 #[cfg(feature = "layer")]
 pub mod layer;
+#[cfg(feature = "sensors")]
+pub mod sensors;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
 use tideshell_core::bar::{self, BarWidget};
@@ -433,7 +435,8 @@ impl ShellView {
             let v = shell.drawer.slider(kind);
             pc.rect_filled(r, cr(20), pal.bg_raised);
             pc.rect_filled(Rect::from_min_size(r.min, Vec2::new(r.width() * v, r.height())), cr(20), with_alpha(pal.accent, 0.45));
-            pc.text(r.left_center() + Vec2::new(16.0, 0.0), Align2::LEFT_CENTER, kind.label(), FontId::proportional(13.0), pal.text);
+            let label = if kind == SliderKind::Brightness && shell.ambient.enabled { format!("{} (auto)", kind.label()) } else { kind.label().to_string() };
+            pc.text(r.left_center() + Vec2::new(16.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(13.0), pal.text);
             let resp = ui.interact(r.intersect(panel), Id::new(("ts-slider", kind.token())), Sense::click_and_drag());
             if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.clicked()) {
                 out.extend(shell.set_slider(kind, (pos.x - r.left()) / r.width()));

@@ -132,6 +132,8 @@ impl Executor for SimExec<'_> {
                 Outcome::Done(format!("sim: click #{}", self.world.clicks))
             }
             Action::Pointer(_) => Outcome::Done(String::new()),
+            // Auto-brightness ramps: silent (the fake display dims instead).
+            Action::SetSlider(..) => Outcome::Done(String::new()),
             other => Outcome::Done(format!("sim: {other:?}")),
         }
     }
@@ -153,6 +155,9 @@ struct App {
     ei_status: Option<tideshell_egui::ei::Status>,
     ei_selftest: Option<(f32, f32)>,
     ei_ready_at: Option<f64>,
+    /// --lux N: a constant fake ambient reading; --clock HH:MM overrides the time.
+    fake_lux: Option<f32>,
+    fake_clock: Option<u32>,
     /// Actions from raw_input_hook, executed in the next ui() call.
     routed: Vec<Action>,
 }
@@ -316,9 +321,8 @@ impl App {
 }
 
 fn clock() -> String {
-    // UTC: no timezone database dependency in the simulator.
-    let s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    format!("{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60)
+    let (h, m) = tideshell_egui::sensors::local_hm();
+    format!("{h:02}:{m:02}")
 }
 
 fn battery() -> Option<f32> {
@@ -363,6 +367,10 @@ impl eframe::App for App {
             let routed = std::mem::take(&mut self.routed);
             self.execute(routed, now);
             self.demo_frame(now);
+            self.shell.set_clock(self.fake_clock.unwrap_or_else(tideshell_egui::sensors::local_minute));
+            if let Some(l) = self.fake_lux {
+                self.shell.on_lux(l, (now * 1000.0) as u64);
+            }
             let p = ui.painter_at(area);
             p.rect_filled(area, CornerRadius::ZERO, Color32::from_rgb(28, 32, 44));
             // The active window fills the space beside the bar's exclusive zone.
@@ -384,6 +392,9 @@ impl eframe::App for App {
                 }
             }
             }
+            // The fake display dims with the brightness level (auto or slider).
+            let dim = ((1.0 - self.shell.drawer.brightness) * 0.85 * 255.0) as u8;
+            p.rect_filled(win_r, CornerRadius::ZERO, Color32::from_black_alpha(dim));
             if self.world.keyboard {
                 let kb = Rect::from_min_max(Pos2::new(win_r.left(), win_r.bottom() - win_r.height() * 0.33), win_r.max);
                 p.rect_filled(kb, CornerRadius::ZERO, Color32::from_gray(38));
@@ -465,6 +476,10 @@ fn main() -> eframe::Result<()> {
     let ei_selftest = args.iter().position(|a| a == "--ei-selftest").and_then(|i| {
         Some((args.get(i + 1)?.parse().ok()?, args.get(i + 2)?.parse().ok()?))
     });
+    let fake_lux: Option<f32> = val("--lux").and_then(|v| v.parse().ok());
+    let fake_clock: Option<u32> = val("--clock").and_then(|v| tideshell_core::ambient::NightWindow::parse_span(&format!("{v}-00:00")).map(|(s, _)| s));
+    // The fake display starts at half brightness, so auto has a level to ramp from.
+    shell.set_current_brightness(0.5);
     let demo = val("--demo");
     let show_trace = has("--trace");
     let wayland_mode = live.is_some();
@@ -480,7 +495,7 @@ fn main() -> eframe::Result<()> {
             // The fake world's cursor is not the real pointer, so the mouse may
             // drive the pad there. With --wayland the pad feeds EI: no.
             view.pointer_pad = !wayland_mode;
-            Ok(Box::new(App { shell, view, world, system, persist, palette, apps, demo, demo_started: None, last_cards: vec![], live, ei, ei_status: None, ei_selftest, ei_ready_at: None, routed: vec![] }))
+            Ok(Box::new(App { shell, view, world, system, persist, palette, apps, demo, demo_started: None, last_cards: vec![], live, ei, ei_status: None, ei_selftest, ei_ready_at: None, routed: vec![], fake_lux, fake_clock }))
         }),
     )
 }

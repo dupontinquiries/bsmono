@@ -2612,6 +2612,7 @@ dependencies = [
  "glow",
  "hatch-core",
  "khronos-egl",
+ "libc",
  "reis",
  "rustix 1.1.5",
  "settings-kit",

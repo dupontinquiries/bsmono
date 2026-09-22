@@ -32,6 +32,14 @@ trackpad mode (a hardware mouse moves a pointer the shell cannot see);
 cosmic-comp shows its cursor during a held-button drag; no magnetic
 snapping onto other apps' buttons (no protocol exposes them).
 
+Auto brightness (`shell.brightness.auto`, on by default; the drawer's Auto
+bright tile toggles it): ambient light from iio-sensor-proxy or IIO sysfs,
+dimmed by a night window (`shell.brightness.night`, default 22:00-07:00),
+brightening fast and darkening only after 3 s, learning an offset when you
+move the slider. Applied through logind SetBrightness on your graphical
+session (sysfs fallback). With no sensor, time of day alone drives it.
+Verified here against mock D-Bus services and fake sysfs; not yet on the FP5.
+
 `shell.layout = pull-down | right-bar` chooses between the drawer and a
 right-hand bar of mixable widgets (`shell.bar.widgets`). Both are editable
 in the settings sheet (drawer bottom, or the bar's `settings` widget).

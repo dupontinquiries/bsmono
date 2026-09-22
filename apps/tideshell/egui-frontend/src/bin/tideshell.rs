@@ -24,8 +24,8 @@ use tideshell_egui::{AppTile, FrameInfo, ShellView};
 const STRIP_PX: u32 = 28;
 
 fn clock() -> String {
-    let s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    format!("{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60)
+    let (h, m) = tideshell_egui::sensors::local_hm();
+    format!("{h:02}:{m:02}")
 }
 
 struct Shellbox {
@@ -36,6 +36,9 @@ struct Shellbox {
     ei: Option<tideshell_egui::ei::EiPointer>,
     ei_status: Option<tideshell_egui::ei::Status>,
     persist: bool,
+    ambient: tideshell_egui::sensors::Ambient,
+    backlight: tideshell_egui::sensors::BacklightOut,
+    sensor_status: (String, String),
 }
 
 impl Shellbox {
@@ -51,6 +54,12 @@ impl Shellbox {
                     }
                     None => Outcome::Unwired("no EI connection"),
                 },
+                // Auto-brightness ramps send many of these: silent. Which
+                // backlight path works (or none) is in the status lines.
+                Action::SetSlider(tideshell_core::control_center::SliderKind::Brightness, v) => {
+                    self.backlight.set(*v);
+                    continue;
+                }
                 // The overlay IS the trackpad surface here; nothing to execute.
                 Action::ShowTrackpad(on) => Outcome::Done(format!("trackpad {}", if *on { "on" } else { "off" })),
                 _ => match self.windows.as_mut() {
@@ -75,6 +84,16 @@ impl Shellbox {
                 let more = self.shell.set_windows(cards);
                 self.execute(more);
             }
+        }
+        let st = (self.ambient.status(), self.backlight.status());
+        if st != self.sensor_status {
+            if st.0 != self.sensor_status.0 {
+                self.shell.note(st.0.clone());
+            }
+            if st.1 != self.sensor_status.1 {
+                self.shell.note(st.1.clone());
+            }
+            self.sensor_status = st;
         }
         if let Some(ei) = &self.ei {
             let st = ei.status();
@@ -154,7 +173,14 @@ fn main() {
         ei: Some(tideshell_egui::ei::EiPointer::spawn()),
         ei_status: None,
         persist,
+        ambient: tideshell_egui::sensors::Ambient::spawn("/sys".into(), zbus::blocking::Connection::system().ok()),
+        backlight: tideshell_egui::sensors::BacklightOut::spawn(std::path::Path::new("/sys"), zbus::blocking::Connection::system().ok()),
+        sensor_status: (String::new(), String::new()),
     };
+    // Auto-brightness ramps from the real current level, or not at all.
+    if let Some(l) = sb.backlight.initial {
+        sb.shell.set_current_brightness(l);
+    }
     sb.view.show_trace = has("--trace");
     sb.view.bar_surface = true;
     // A previous run that died with the fat cursor on left cosmic-comp's
@@ -201,6 +227,10 @@ fn main() {
             std::process::exit(1)
         });
         let now_ms = t0.elapsed().as_millis() as u64;
+        sb.shell.set_clock(tideshell_egui::sensors::local_minute());
+        while let Ok(lux) = sb.ambient.rx.try_recv() {
+            sb.shell.on_lux(lux, now_ms);
+        }
         if let Some(screen) = io.screen() {
             if screen != sb.shell.screen {
                 sb.shell.set_screen(screen);

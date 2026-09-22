@@ -146,13 +146,14 @@ Try each, and for each note what happened on screen **and** the trace lines:
 | 7 | press and hold on the bottom edge, slide onto Keyboard, lift | `edge pending -> hold`, `hold release -> Some(Keyboard)`, then `succeeded` or `FAILED ... exited N` (+ `keyboard mode off`) |
 | 8 | hold -> Trackpad; drag on the pad; tap | pointer moves; tap clicks (needs `ei: Ready`) |
 | 9 | drawer -> Shell settings -> Right-hand bar -> Apply | bar appears on the right; maximized windows narrow beside it (`reflow ... maximized window(s)`) |
+| 10 | at start: read the `ambient:` and `backlight:` lines; then cover the light sensor (top bezel) for 5 s, uncover | ideally `ambient: iio-sensor-proxy (lux)` and `backlight: <name> (max N) via logind ...`; screen dims ~3 s after covering, brightens quickly after uncovering. `no light sensor found` = time of day only (report it); `cannot set` = neither logind nor sysfs worked (report the line) |
 
 Also capture screenshots if `grim` is available
 (`WAYLAND_DISPLAY=... grim ~/ts-N.png`) for #2, #5, #9.
 
 **Gate:** tideshell stays running, strips visible, #2 and #5 work.
 
-**Report:** `~/tideshell-run.log`, the table filled in, screenshots.
+**Report:** `~/tideshell-run.log`, the table filled in, screenshots, and for row 10 the output of `busctl --system list | grep -i sensorproxy` and `ls /sys/class/backlight/`.
 
 If a gesture does nothing, the trace says why: no `edge pending` line = the
 touch never reached the strip (edge dead zone / cosmic-panel on top); an
