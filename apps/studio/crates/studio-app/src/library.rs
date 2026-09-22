@@ -155,6 +155,49 @@ pub struct Roots {
     pub video: Option<PathBuf>,
 }
 
+/// What a library root looks like on disk right now: how many files of its
+/// kind are under it, or why it is not usable. Shown beside the field in
+/// Settings, because a path that is a typo and a path that is a real folder
+/// look identical in a text box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootState {
+    /// Usable, with this many files of the right kind found.
+    Found(usize),
+    /// The folder exists but holds nothing this app can use.
+    Empty,
+    NotAFolder,
+    Missing,
+}
+
+impl RootState {
+    pub fn describe(&self) -> String {
+        match self {
+            RootState::Found(n) => format!("{n} file(s)"),
+            RootState::Empty => "no usable files in it".into(),
+            RootState::NotAFolder => "not a folder".into(),
+            RootState::Missing => "no such folder".into(),
+        }
+    }
+    pub fn usable(&self) -> bool { matches!(self, RootState::Found(_)) }
+}
+
+/// Look at `path` and say what it is. `video` chooses which extensions
+/// count.
+pub fn inspect(path: &std::path::Path, video: bool) -> RootState {
+    if path.as_os_str().is_empty() { return RootState::Missing; }
+    if !path.exists() { return RootState::Missing; }
+    if !path.is_dir() { return RootState::NotAFolder; }
+    // One level deep: a library root usually holds folders of packs, and a
+    // person pointing at the parent should not be told it is empty.
+    let mut found = 0usize;
+    let listing = scan_dir(path);
+    let counts = |l: &DirListing| l.files.iter()
+        .filter(|f| is_video_path(&f.path) == video).count();
+    found += counts(&listing);
+    for (_, d) in listing.dirs.iter().take(64) { found += counts(&scan_dir(d)); }
+    if found == 0 { RootState::Empty } else { RootState::Found(found) }
+}
+
 impl Roots {
     pub fn from_env(audio: PathBuf) -> Roots {
         let video = std::env::var("STUDIO_VIDEO_LIB").ok()
@@ -1156,7 +1199,7 @@ mod tests {
         let mut with_bus = project.clone();
         with_bus.apply(&studio_core::Op::AddBus { bus: studio_core::Bus {
             id: studio_core::BusId(4), name: "Drum Buss".into(), parent: None,
-            gain: 1.0, chain: vec![], sends: vec![], muted: false } }).unwrap();
+            gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: false } }).unwrap();
         let s = suggest(SampleKind::Clap, &rack, &with_bus);
         assert!(s.iter().any(|x| matches!(x.act,
             SuggestAct::ClipToBus(Some(studio_core::BusId(4))))),
@@ -1324,5 +1367,45 @@ mod tests {
     fn a_missing_library_is_an_empty_listing_not_a_crash() {
         assert_eq!(scan_dir(Path::new("/definitely/not/real")), DirListing::default());
         assert!(search(Path::new("/definitely/not/real"), "x", 10).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+
+    struct Dir(std::path::PathBuf);
+    impl Dir {
+        fn new(files: &[&str]) -> Dir {
+            let p = std::env::temp_dir().join(format!("libroot-{}-{:?}", std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            for f in files {
+                let q = p.join(f);
+                std::fs::create_dir_all(q.parent().unwrap()).unwrap();
+                std::fs::write(q, b"x").unwrap();
+            }
+            std::fs::create_dir_all(&p).unwrap();
+            Dir(p)
+        }
+    }
+    impl Drop for Dir { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+
+    #[test]
+    fn a_root_says_whether_it_is_usable_and_why_not() {
+        let d = Dir::new(&["kick.wav", "packs/snare.wav", "notes.txt"]);
+        assert_eq!(inspect(&d.0, false), RootState::Found(2), "one level deep counts");
+        assert_eq!(inspect(&d.0, true), RootState::Empty, "no video under it");
+        assert_eq!(inspect(&d.0.join("kick.wav"), false), RootState::NotAFolder);
+        assert_eq!(inspect(&d.0.join("nope"), false), RootState::Missing);
+        assert_eq!(inspect(std::path::Path::new(""), false), RootState::Missing);
+        assert!(RootState::Found(2).usable() && !RootState::Empty.usable());
+        assert!(RootState::Missing.describe().contains("no such"));
+    }
+
+    #[test]
+    fn a_video_root_counts_only_picture() {
+        let d = Dir::new(&["a.mkv", "b.mp4", "c.wav"]);
+        assert_eq!(inspect(&d.0, true), RootState::Found(2));
+        assert_eq!(inspect(&d.0, false), RootState::Found(1));
     }
 }

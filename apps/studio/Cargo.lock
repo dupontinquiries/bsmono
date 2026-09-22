@@ -3612,6 +3612,7 @@ dependencies = [
  "sha2",
  "studio-audio",
  "studio-core",
+ "studio-fx",
  "studio-media",
 ]
 

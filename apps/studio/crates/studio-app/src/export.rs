@@ -100,7 +100,7 @@ pub fn plan_jobs(plan: &Plan, project: &Project, selection: &[ClipId])
                  -> Result<Vec<Job>, String> {
     let (from, to) = match plan.scope {
         Scope::Full => {
-            let end = project.duration();
+            let end = studio_audio::audible_end(project); // tails ring past the last clip
             if end <= Ticks::ZERO { return Err("the arrangement is empty".into()); }
             (Ticks::ZERO, end)
         }
@@ -320,13 +320,14 @@ pub fn start_arrangement(
     dest: Dest,
     project: Project,
     audio: std::collections::BTreeMap<studio_core::SourceId, SourceAudio>,
+    wake: crate::wake::Wake,
 ) -> Run {
     // Opus's contract, enforced where it cannot be forgotten; the phone's
     // formats are stereo too.
     let mut plan = plan;
     if plan.format == ExportFormat::Opus { plan.rate = 48_000; }
     if plan.format.stereo_only() { plan.layout = studio_audio::format::ChannelFormat::Stereo; }
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = crate::wake::channel(wake);
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = cancel.clone();
     let n_jobs = jobs.len();
@@ -387,7 +388,7 @@ pub fn render_music_video(
         .map(|s| (s.id, PathBuf::from(&s.path)))
         .filter(|(_, p)| p.is_file())
         .collect();
-    let end = project.duration();
+    let end = studio_audio::audible_end(project); // tails ring past the last clip
     let list = studio_video::edit::edit_list(project, &paths, Some(end));
     if !list.iter().any(|s| matches!(s, studio_video::edit::Segment::Cut(_))) {
         return Err(if paths.is_empty() {
@@ -406,6 +407,18 @@ pub fn render_music_video(
     result.map(|()| out.to_path_buf())
 }
 
+/// What the video export will not reproduce from the viewport (rotation,
+/// layer blends, retiming — see `studio_video::edit::Picture`), one line per
+/// affected cut. The export still runs; these go to the tracker as notes so
+/// a file that differs from the preview says so instead of surprising.
+pub fn video_warnings(project: &Project) -> Vec<String> {
+    let paths: std::collections::BTreeMap<studio_core::SourceId, PathBuf> = project.sources.values()
+        .filter(|s| s.has_video)
+        .map(|s| (s.id, PathBuf::from(&s.path)))
+        .collect();
+    studio_video::edit::unsupported(&studio_video::edit::edit_list(project, &paths, None))
+}
+
 /// [`render_music_video`] on a worker, reported through the same `Run`
 /// the audio exports use so the tracker window shows it. Cancel is not
 /// honoured mid-render: ffmpeg is one child process and this crate does
@@ -418,14 +431,18 @@ pub fn start_video(
     width: u32,
     height: u32,
     fps: u32,
+    wake: crate::wake::Wake,
 ) -> Run {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = crate::wake::channel(wake);
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = cancel.clone();
     std::thread::spawn(move || {
         if flag.load(Ordering::Relaxed) { let _ = tx.send(Event::Cancelled); return; }
         let _ = tx.send(Event::Progress { done: 0, jobs: 1, frac: 0.0 });
         let _ = tx.send(Event::Note("rendering the video through ffmpeg — this takes a while".into()));
+        for w in video_warnings(&project) {
+            let _ = tx.send(Event::Note(format!("differs from the preview: {w}")));
+        }
         match render_music_video(&project, &audio, &out, rate, width, height, fps) {
             Ok(p) => { let _ = tx.send(Event::File(p)); let _ = tx.send(Event::Done); }
             Err(e) => { let _ = tx.send(Event::Failed(e)); }
@@ -444,13 +461,14 @@ pub fn start_rack(
     pattern: usize,
     audio: std::collections::BTreeMap<studio_core::SourceId, SourceAudio>,
     project_name: String,
+    wake: crate::wake::Wake,
 ) -> Run {
     let mut plan = plan;
     if plan.format == ExportFormat::Opus {
         plan.rate = 48_000;
         plan.layout = studio_audio::format::ChannelFormat::Stereo;
     }
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = crate::wake::channel(wake);
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = cancel.clone();
     let n_jobs = jobs.len();
@@ -503,6 +521,14 @@ pub fn pick_save(suggested: &str) -> Option<PathBuf> {
 }
 #[cfg(not(feature = "picker"))]
 pub fn pick_save(_suggested: &str) -> Option<PathBuf> { None }
+
+/// The native open-file dialog (a word list, say), same fallback contract.
+#[cfg(feature = "picker")]
+pub fn pick_file() -> Option<PathBuf> {
+    rfd::FileDialog::new().set_title("Choose a file…").pick_file()
+}
+#[cfg(not(feature = "picker"))]
+pub fn pick_file() -> Option<PathBuf> { None }
 
 /// The native folder dialog for stems, same fallback contract.
 #[cfg(feature = "picker")]
@@ -742,7 +768,7 @@ mod tests {
         let plan = Plan { format: ExportFormat::Wav, ..Plan::default() };
         let jobs = plan_jobs(&plan, &p, &[]).unwrap();
         let dir = tempdir("wav");
-        let run = start_arrangement(plan, jobs, Dest::File(dir.join("mix.wav")), p, audio);
+        let run = start_arrangement(plan, jobs, Dest::File(dir.join("mix.wav")), p, audio, crate::wake::none());
         let evs = drain(&run);
         assert!(matches!(evs.last(), Some(Event::Done)), "{evs:?}");
         let mut last = -1.0f32;
@@ -769,7 +795,7 @@ mod tests {
                           ..Plan::default() };
         let jobs = plan_jobs(&plan, &p, &[]).unwrap();
         let dir = tempdir("stems");
-        let run = start_arrangement(plan, jobs, Dest::Folder(dir.clone()), p, audio);
+        let run = start_arrangement(plan, jobs, Dest::Folder(dir.clone()), p, audio, crate::wake::none());
         let evs = drain(&run);
         assert!(matches!(evs.last(), Some(Event::Done)), "{evs:?}");
         let files: Vec<_> = evs.iter().filter_map(|e| match e {
@@ -800,7 +826,7 @@ mod tests {
         let jobs = plan_jobs(&plan, &p, &[]).unwrap();
         let dir = tempdir("cancel");
         let dest = dir.join("mix.wav");
-        let run = start_arrangement(plan, jobs, Dest::File(dest.clone()), p, audio);
+        let run = start_arrangement(plan, jobs, Dest::File(dest.clone()), p, audio, crate::wake::none());
         // Cancel before the worker gets anywhere: the flag is checked
         // before every chunk, so the first check already sees it.
         run.cancel.store(true, Ordering::Relaxed);
@@ -818,7 +844,7 @@ mod tests {
         let plan = Plan { format: ExportFormat::Opus, scope: Scope::RackLoop,
                           ..Plan::default() };
         let run = start_rack(plan, jobs, Dest::File(dir.join("loop.opus")), 0,
-                             Default::default(), "cut".into());
+                             Default::default(), "cut".into(), crate::wake::none());
         let evs = drain(&run);
         assert!(matches!(evs.last(), Some(Event::Done)), "{evs:?}");
         let bytes = std::fs::read(dir.join("loop.opus")).unwrap();

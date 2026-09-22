@@ -84,22 +84,200 @@ pub struct Peaks {
     pub factor: usize,
     pub levels: Vec<Vec<MinMax>>,
     pub frames: usize,
+    /// The sample rate of the audio these peaks were built from. A waveform
+    /// must read samples at THIS rate, not the rate a project records for the
+    /// source: the cartoon fixture recorded its cameras as 48 kHz over 16 kHz
+    /// audio, and every waveform read the wrong span.
+    pub rate: u32,
+}
+
+/// What happens to a clip's effects after the clip ends.
+///
+/// A reverb or a delay keeps sounding after its input stops — that is the
+/// effect. An editor needs two things from that, and every tool picks one:
+///
+/// * **Cut**: the tail ends exactly where the clip does. A hard cut to the
+///   next scene, a gag that needs dead air, a narration line that must not
+///   bleed under the next shot's dialogue.
+/// * **Ring out**: the tail keeps going past the clip end for `ring`
+///   seconds, and optionally fades over the last `fade` of them — so a clip
+///   can be trimmed tight to the dry sound while its space decays naturally,
+///   or ring for exactly as long as a transition wants and then stop.
+///
+/// Both, per clip, and switchable without touching the effect: this is a
+/// property of the EDIT, not of the reverb. Carried as an effect of kind
+/// `"tail"` on the clip's own chain (params `ring` and `fade`, seconds)
+/// because a clip's effect list already syncs, undoes, saves and travels
+/// over the wire — and an unknown kind is skipped by the DSP, so a build
+/// that predates this plays the clip exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ClipTail {
+    /// Seconds of tail after the clip end. 0 is Cut.
+    pub ring: f64,
+    /// Seconds, at the END of the ring, over which the tail fades to
+    /// silence. 0 means the ring stops dead at `ring`: a hard cut, just
+    /// later than the clip's own end.
+    pub fade: f64,
+}
+
+/// The effect kind that carries a clip's tail setting.
+pub const TAIL_KIND: &str = "tail";
+
+impl ClipTail {
+    /// Read from a clip's effect list; the last enabled `"tail"` wins.
+    pub fn of(effects: &[studio_core::Effect]) -> ClipTail {
+        effects.iter().filter(|e| e.enabled && e.kind == TAIL_KIND).last().map(|e| {
+            let ring = e.params.get("ring").copied().unwrap_or(0.0).max(0.0) as f64;
+            let fade = (e.params.get("fade").copied().unwrap_or(0.0).max(0.0) as f64).min(ring);
+            ClipTail { ring, fade }
+        }).unwrap_or_default()
+    }
+
+    pub fn ring_ticks(&self) -> Ticks { Ticks::from_seconds(self.ring) }
+
+    /// Gain `past` seconds after the clip end: 1 until the fade starts, a
+    /// linear ramp through it, 0 at and beyond `ring`.
+    pub fn gain_at(&self, past: f64) -> f32 {
+        if past >= self.ring { return 0.0; }
+        let fade_from = self.ring - self.fade;
+        if self.fade <= 0.0 || past < fade_from { return 1.0; }
+        (1.0 - (past - fade_from) / self.fade).clamp(0.0, 1.0) as f32
+    }
+
+    /// The effect entry that sets this tail on a clip.
+    pub fn effect(&self) -> studio_core::Effect {
+        studio_core::Effect {
+            kind: TAIL_KIND.into(),
+            enabled: true,
+            params: [("ring".to_string(), self.ring as f32), ("fade".to_string(), self.fade as f32)]
+                .into_iter().collect(),
+        }
+    }
+}
+
+/// Where a project's sound actually ends: the last clip's end, or later if
+/// a clip's tail rings past it.
+///
+/// `Project::duration` is the end of the last CLIP, which is the right
+/// answer for the timeline and the wrong one for a render: a ring-out on the
+/// final shot would be cut off by the very file that was meant to carry it.
+/// Every render that decides "how long is this" asks here instead.
+pub fn audible_end(project: &Project) -> Ticks {
+    project.clips.values()
+        .map(|c| c.end().saturating_add(ClipTail::of(&c.effects).ring_ticks()))
+        .max()
+        .unwrap_or(Ticks::ZERO)
+}
+
+/// Which part of the spectrum a waveform drawing should show.
+///
+/// A full-band waveform is a silhouette of LOUDNESS, and for scoring that is
+/// often the least useful thing on screen: a dialogue take and a kick drum
+/// draw the same shape. Looking at one band at a time answers questions the
+/// full waveform cannot — where the low end actually lands, whether a
+/// narration take has room under it, where the sibilance is — before
+/// listening decides anything.
+///
+/// Ranges are deliberately broad and named for what they are used for, not
+/// for round numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Band {
+    #[default]
+    Full,
+    /// Below ~200 Hz: kick, bass, rumble, room.
+    Low,
+    /// ~200 Hz–2 kHz: where voices and most instruments live.
+    Mid,
+    /// Above ~2 kHz: consonants, cymbals, air, sibilance.
+    High,
+}
+
+impl Band {
+    pub fn label(self) -> &'static str {
+        match self { Band::Full => "full", Band::Low => "low", Band::Mid => "mid", Band::High => "high" }
+    }
+
+    /// The corner frequencies this band is made from, in Hz.
+    fn corners(self) -> (Option<f32>, Option<f32>) {
+        match self {
+            Band::Full => (None, None),
+            Band::Low => (None, Some(200.0)),
+            Band::Mid => (Some(200.0), Some(2_000.0)),
+            Band::High => (Some(2_000.0), None),
+        }
+    }
+}
+
+/// A one-pole filter pair, enough to SEE a band with.
+///
+/// Two one-pole stages per side (12 dB/octave), not one.
+///
+/// A single pole was tried first and is not enough to LOOK at: at 200 Hz it
+/// leaves a 900 Hz voice only 13 dB down, so the "low band" of a narration
+/// take was still mostly the voice — the drawing would have answered the
+/// question with the same shape it always shows. Two stages put that voice
+/// 26 dB down, which reads as a different picture. Still not a mixing
+/// decision: judge a crossover by listening through `studio_fx`, not by
+/// reading a waveform.
+struct BandFilter {
+    hp: Option<f32>,
+    lp: Option<f32>,
+    hp_state: [(f32, f32); 2],  // (y, x) per stage
+    lp_state: [f32; 2],
+}
+
+impl BandFilter {
+    fn new(band: Band, rate: u32) -> BandFilter {
+        let k = |f: f32| (-std::f32::consts::TAU * f / rate.max(1) as f32).exp();
+        let (hi, lo) = band.corners();
+        BandFilter { hp: hi.map(k), lp: lo.map(k), hp_state: [(0.0, 0.0); 2], lp_state: [0.0; 2] }
+    }
+    #[inline]
+    fn step(&mut self, x: f32) -> f32 {
+        let mut v = x;
+        if let Some(a) = self.hp {
+            for st in self.hp_state.iter_mut() {
+                st.0 = a * (st.0 + v - st.1);
+                st.1 = v;
+                v = st.0;
+            }
+        }
+        if let Some(a) = self.lp {
+            for y in self.lp_state.iter_mut() {
+                *y = (1.0 - a) * v + a * *y;
+                v = *y;
+            }
+        }
+        v
+    }
 }
 
 impl Peaks {
     /// Build the pyramid. `base` is Audacity's 256; `factor` of 256 gives its
     /// second summary at 65,536 in one more level.
     pub fn build(audio: &SourceAudio, base: usize, factor: usize) -> Peaks {
+        Peaks::build_band(audio, base, factor, Band::Full)
+    }
+
+    /// The pyramid of ONE band of the audio — the same shape, so every
+    /// drawing, hit test and zoom level works unchanged; only what the
+    /// buckets summarise changes. `Band::Full` is the plain build and costs
+    /// nothing extra.
+    pub fn build_band(audio: &SourceAudio, base: usize, factor: usize, band: Band) -> Peaks {
         let base = base.max(1);
         let factor = factor.max(2);
         let frames = audio.frames();
         let mut level0 = Vec::with_capacity(frames.div_ceil(base));
+        let mut filter = BandFilter::new(band, audio.sample_rate);
         let mut i = 0;
         while i < frames {
             let end = (i + base).min(frames);
             let mut mm = MinMax { min: f32::INFINITY, max: f32::NEG_INFINITY };
             for f in i..end {
-                let v = audio.mono(f);
+                // Filtered in one pass, in order — the filter carries its
+                // state across buckets, so the drawing has no seams at
+                // bucket boundaries.
+                let v = filter.step(audio.mono(f));
                 mm.min = mm.min.min(v);
                 mm.max = mm.max.max(v);
             }
@@ -123,7 +301,7 @@ impl Peaks {
             }
             levels.push(next);
         }
-        Peaks { base, factor, levels, frames }
+        Peaks { base, factor, levels, frames, rate: audio.sample_rate }
     }
 
     /// Samples covered by one bucket at `level`.
@@ -148,8 +326,13 @@ impl Peaks {
 
     /// Peaks for a span of samples, reduced to `columns` buckets — exactly what
     /// a waveform widget needs for a rectangle `columns` pixels wide.
+    ///
+    /// The scale is the REQUESTED span's, even where it runs past the end of
+    /// the audio: those columns are empty. It used to clamp `to` to the end
+    /// first and spread what was left across every column -- so a clip
+    /// scrolled half off-screen, or longer than its audio, had its waveform
+    /// stretched to fill the width (seen on the cartoon fixture).
     pub fn window(&self, from: usize, to: usize, columns: usize) -> Vec<MinMax> {
-        let (from, to) = (from.min(self.frames), to.min(self.frames));
         if columns == 0 || to <= from { return Vec::new(); }
         let spp = (to - from) as f64 / columns as f64;
         let level = self.for_px(spp);
@@ -158,7 +341,8 @@ impl Peaks {
         (0..columns)
             .map(|c| {
                 let s0 = from + (c as f64 * spp) as usize;
-                let s1 = from + (((c + 1) as f64 * spp) as usize).max(1);
+                if s0 >= self.frames || buckets.is_empty() { return MinMax { min: 0.0, max: 0.0 }; }
+                let s1 = (from + (((c + 1) as f64 * spp) as usize).max(1)).min(self.frames);
                 let b0 = s0 / per;
                 let b1 = ((s1 + per - 1) / per).max(b0 + 1).min(buckets.len());
                 buckets[b0.min(buckets.len().saturating_sub(1))..b1]
@@ -646,8 +830,11 @@ pub fn mixdown_into(
         // an empty product is 1.0 — bit-identical, pinned below.
         let mut track_sweeps = project.binding_sweeps(AutoTarget::TrackGain(track.id));
         for clip in project.track_clips(track.id) {
+            // A clip's tail rings past its end, so a window that starts
+            // after the dry sound can still owe it audio.
+            let tail = ClipTail::of(&clip.effects);
             // skip clips entirely outside the window
-            if clip.end() <= from || clip.pos >= to { continue; }
+            if clip.end().saturating_add(tail.ring_ticks()) <= from || clip.pos >= to { continue; }
             let Some(src) = audio.get(&clip.source) else { continue };
             if src.channels.is_empty() { continue; }
             // THE PROJECT'S FADE IS THE FADE. The `fades` parameter stays as
@@ -749,6 +936,45 @@ pub fn mixdown_into(
                 }
                 dest[oi] += l * g;
                 dest[oi + 1] += r * g;
+            }
+
+            // ── the tail: the chain keeps running on silence ──────────────
+            // Only meaningful when this window also rendered up to the clip
+            // end — the effect's state (the reverb's energy) comes from
+            // processing the clip. A window that starts INSIDE the tail
+            // without having played the clip has no energy to ring out; that
+            // is a limitation of rendering a slice, named here rather than
+            // papered over with a guess.
+            if tail.ring > 0.0 && clip.end() >= from && clip.end() < to {
+                let t0 = clip.end();
+                let t1 = clip.end().saturating_add(tail.ring_ticks()).min(to);
+                let off = (t0.to_samples(rate) - from.to_samples(rate)).max(0) as usize;
+                let len = (t1.to_samples(rate) - t0.to_samples(rate)).max(0) as usize;
+                let len = len.min(dest.len().saturating_sub(off * 2) / 2);
+                let base = t0.to_samples(rate);
+                for i in 0..len {
+                    let at = Ticks::from_samples(base + i as i64, rate);
+                    let past = i as f64 / rate as f64;
+                    let tg = tail.gain_at(past);
+                    if tg <= 0.0 { break; }
+                    let mut auto = match track_lane {
+                        Some(lane) => studio_core::eval_lane_cursor(lane, at, &mut lane_cursor),
+                        None => 1.0,
+                    };
+                    for sw in track_sweeps.iter_mut() { auto *= sw.value(at); }
+                    // Silence in, the effect's memory out. The clip's own
+                    // fade is NOT applied: the dry sound has ended, and the
+                    // tail's shape is the tail setting's job.
+                    let (mut l, mut r) = (0.0f32, 0.0f32);
+                    for (_, inst) in clip_fx.iter_mut() {
+                        l = inst.process_audio(l);
+                        r = inst.process_audio(r);
+                    }
+                    let g = clip.gain * track.gain * auto * tg;
+                    let oi = (off + i) * 2;
+                    dest[oi] += l * g;
+                    dest[oi + 1] += r * g;
+                }
             }
         }
     }
@@ -854,6 +1080,15 @@ pub fn mixdown_into(
             for s in buf.iter_mut() { *s *= bus.gain; }
         }
 
+        // A silent bus stops here: it has been summed, processed and faded
+        // (so `bus_signal` can read a finished signal), and now feeds
+        // nothing — not its sends, not its parent. Without this a control
+        // tap fed by sends would double every source into master.
+        if bus.silent {
+            scratch.retired.push((id, buf));
+            continue;
+        }
+
         for send in &bus.sends {
             let tap: &[f32] = if send.pre_fader { &scratch.pre } else { &buf };
             if let Some(target) = bus_buf.get_mut(&send.to) {
@@ -885,12 +1120,71 @@ pub fn mixdown_into(
     }
 }
 
+/// Render `project` and return what one bus's output was, interleaved
+/// stereo — after its chain and fader, before it feeds anything.
+///
+/// This is how a "dummy" channel is read: sends copy signal into a
+/// [`Bus`](studio_core::Bus) marked `silent`, the mix is unaffected, and
+/// this returns the tap. Feeding it to `studio_video::multicam::Control`
+/// is what lets a kick drum choose camera angles.
+///
+/// `None` if the bus does not exist, is muted, or is silenced by a solo —
+/// all three mean it was never rendered, which is different from being
+/// rendered silent (an existing, empty bus returns zeros).
+pub fn bus_signal(
+    project: &Project,
+    audio: &BTreeMap<SourceId, SourceAudio>,
+    fades: &BTreeMap<studio_core::ClipId, Fades>,
+    from: Ticks,
+    to: Ticks,
+    rate: u32,
+    bus: studio_core::BusId,
+) -> Option<Vec<f32>> {
+    let b = project.busses.get(&bus)?;
+    if b.muted { return None; }
+    let frames = (to.to_samples(rate) - from.to_samples(rate)).max(0) as usize;
+    let mut cache = EffectCache::new();
+    let mut scratch = RenderScratch::new();
+    let mut out = vec![0.0f32; frames * 2];
+    mixdown_into(project, audio, fades, from, to, rate, &[], &[], &mut cache, &mut scratch, &mut out);
+    scratch.bus_buf.get(&bus).map(|b| b.clone())
+}
+
 /// Peak level of a rendered buffer, in dBFS. `-inf` for silence — reported as
 /// f32::NEG_INFINITY rather than a magic -100.0, so a caller cannot mistake
 /// "very quiet" for "nothing".
 pub fn peak_dbfs(samples: &[f32]) -> f32 {
     let peak = samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));
     if peak <= 0.0 { f32::NEG_INFINITY } else { 20.0 * peak.log10() }
+}
+
+#[cfg(test)]
+mod peaks_window_tests {
+    use super::*;
+
+    fn burst_audio() -> SourceAudio {
+        // 2 s at 1 kHz: silence, a loud burst from 0.5 to 0.6 s, silence
+        let mut s = vec![0.0f32; 2000];
+        for v in s.iter_mut().take(600).skip(500) { *v = 0.9; }
+        SourceAudio { sample_rate: 1000, channels: vec![s] }
+    }
+
+    #[test]
+    fn a_window_past_the_end_keeps_its_scale_instead_of_stretching() {
+        let p = Peaks::build(&burst_audio(), 4, 4);
+        assert_eq!(p.rate, 1000, "the peaks know their own rate");
+        // ask for 0..4000 over 400 columns (10 samples a column): the audio ends at column 200
+        let w = p.window(0, 4000, 400);
+        assert_eq!(w.len(), 400);
+        let loud: Vec<usize> = w.iter().enumerate().filter(|(_, m)| m.max > 0.5).map(|(i, _)| i).collect();
+        assert!(loud.iter().all(|c| (49..=61).contains(c)), "the burst stays at 0.5-0.6 s, columns 50-60: {loud:?}");
+        assert!(w[200..].iter().all(|m| m.max == 0.0 && m.min == 0.0), "past the end: empty, not stretched audio");
+        // the same view of the first 2 s agrees column for column
+        let full = p.window(0, 2000, 200);
+        assert_eq!(&w[..200], &full[..], "running past the end changes nothing before it");
+        // entirely past the end: all empty
+        assert!(p.window(3000, 3500, 50).iter().all(|m| m.max == 0.0));
+    }
 }
 
 #[cfg(test)]
@@ -918,6 +1212,72 @@ mod tests {
         let mut audio = BTreeMap::new();
         audio.insert(SourceId(1), tone((len_s * rate as f64) as usize, rate, 440.0, 0.5));
         (p, audio)
+    }
+
+    /// A half-second clip through a big reverb, rendered for three seconds,
+    /// with the tail set as given (`None` = no tail effect at all).
+    fn reverb_render(tail: Option<ClipTail>) -> (Vec<f32>, u32) {
+        let (mut p, audio) = project_with(0.5, 1.0);
+        let mut fx = vec![studio_core::Effect { kind: "reverb".into(), enabled: true,
+            params: [("mix".to_string(), 1.0f32), ("size".to_string(), 0.9), ("damp".to_string(), 0.2),
+                     ("width".to_string(), 1.0)].into_iter().collect() }];
+        if let Some(t) = tail { fx.push(t.effect()); }
+        p.apply(&Op::SetEffects { id: ClipId(1), effects: fx }).unwrap();
+        let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(3.0), 48_000, &[], &[]);
+        (out, 48_000)
+    }
+
+    /// Peak absolute level over [a, b) seconds of an interleaved stereo render.
+    fn peak_between(out: &[f32], rate: u32, a: f64, b: f64) -> f32 {
+        let (i0, i1) = ((a * rate as f64) as usize * 2, ((b * rate as f64) as usize * 2).min(out.len()));
+        out[i0..i1].iter().fold(0.0f32, |m, v| m.max(v.abs()))
+    }
+
+    #[test]
+    fn with_no_tail_setting_the_effect_stops_at_the_clip_end_as_before() {
+        let (out, rate) = reverb_render(None);
+        assert!(peak_between(&out, rate, 0.1, 0.5) > 0.01, "the reverb is audible during the clip");
+        assert_eq!(peak_between(&out, rate, 0.5, 3.0), 0.0,
+                   "no tail effect = the old behaviour, a hard cut at the clip end");
+    }
+
+    #[test]
+    fn a_ring_out_keeps_the_reverb_past_the_clip_and_stops_exactly_when_told() {
+        let (out, rate) = reverb_render(Some(ClipTail { ring: 1.0, fade: 0.0 }));
+        assert!(peak_between(&out, rate, 0.5, 0.7) > 0.005, "the tail rings after the clip ends");
+        assert!(peak_between(&out, rate, 1.3, 1.5) > 0.0, "and is still ringing just before it is cut");
+        assert_eq!(peak_between(&out, rate, 1.5, 3.0), 0.0, "then stops dead at clip end + 1 s");
+    }
+
+    #[test]
+    fn a_fade_shapes_only_the_end_of_the_ring() {
+        let hard = reverb_render(Some(ClipTail { ring: 1.0, fade: 0.0 })).0;
+        let (soft, rate) = reverb_render(Some(ClipTail { ring: 1.0, fade: 0.5 }));
+        // Before the fade starts the two are identical: the fade is a shape
+        // at the END, not a different tail.
+        let i0 = (0.5 * rate as f64) as usize * 2;
+        let i1 = (0.95 * rate as f64) as usize * 2;
+        assert_eq!(&hard[i0..i1], &soft[i0..i1], "untouched until the fade begins");
+        // Inside the fade it is quieter, and it reaches silence at the end
+        // instead of stopping on a non-zero sample.
+        assert!(peak_between(&soft, rate, 1.4, 1.5) < peak_between(&hard, rate, 1.4, 1.5) * 0.5,
+                "the last tenth is well down");
+        let last = ((1.5 * rate as f64) as usize - 1) * 2;
+        assert!(soft[last].abs() < 1e-3, "it ends at silence: {}", soft[last]);
+        assert_eq!(peak_between(&soft, rate, 1.5, 3.0), 0.0);
+    }
+
+    #[test]
+    fn tail_settings_read_back_and_a_fade_never_outlasts_its_ring() {
+        let t = ClipTail::of(&[ClipTail { ring: 2.0, fade: 5.0 }.effect()]);
+        assert_eq!(t, ClipTail { ring: 2.0, fade: 2.0 }, "fade is clamped to the ring");
+        assert_eq!(ClipTail::of(&[]), ClipTail::default(), "no setting = cut");
+        let mut off = ClipTail { ring: 2.0, fade: 0.0 }.effect();
+        off.enabled = false;
+        assert_eq!(ClipTail::of(&[off]).ring, 0.0, "a disabled tail is a cut");
+        assert_eq!(ClipTail { ring: 1.0, fade: 0.5 }.gain_at(0.25), 1.0);
+        assert!((ClipTail { ring: 1.0, fade: 0.5 }.gain_at(0.75) - 0.5).abs() < 1e-6);
+        assert_eq!(ClipTail { ring: 1.0, fade: 0.5 }.gain_at(1.0), 0.0);
     }
 
     #[test]
@@ -1039,7 +1399,7 @@ mod tests {
     }
 
     fn bus(id: u64, name: &str, parent: Option<u64>, gain: f32) -> Bus {
-        Bus { id: BusId(id), name: name.into(), parent: parent.map(BusId), gain, chain: Vec::new(), sends: Vec::new(), muted: false }
+        Bus { id: BusId(id), name: name.into(), parent: parent.map(BusId), gain, chain: Vec::new(), sends: Vec::new(), muted: false, silent: false }
     }
 
     #[test]
@@ -1084,6 +1444,70 @@ mod tests {
         p.apply(&Op::SetBusGain { id: BusId(1), gain: 0.0 }).unwrap();
         let silenced = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
         assert!(silenced.iter().all(|s| *s == 0.0), "zeroing the parent bus must silence everything routed through it");
+    }
+
+    #[test]
+    fn a_silent_bus_is_a_tap_that_costs_the_mix_nothing() {
+        // The dummy-channel shape: a Control bus fed by a send from Vocals.
+        // Master must be bit-identical to the project without the send —
+        // otherwise the tap doubles the source into the mix.
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Vocals", None, 1.0) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(2, "Control", None, 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        let end = Ticks::from_seconds(0.5);
+        let before = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, &[], &[]);
+
+        p.apply(&Op::SetBusSilent { id: BusId(2), silent: true }).unwrap();
+        p.apply(&Op::SetBusSends { id: BusId(1), sends: vec![Send { to: BusId(2), level: 1.0, pre_fader: false }] }).unwrap();
+        let after = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, &[], &[]);
+        assert_eq!(before, after, "a silent bus must not reach master");
+
+        // ...and the tap carries the signal, at the send's level.
+        let tap = bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(2)).expect("a tap");
+        assert_eq!(tap.len(), before.len());
+        assert!(peak_dbfs(&tap) > -60.0, "the tap heard something: {}", peak_dbfs(&tap));
+        p.apply(&Op::SetBusSends { id: BusId(1), sends: vec![Send { to: BusId(2), level: 0.5, pre_fader: false }] }).unwrap();
+        let half = bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(2)).unwrap();
+        assert!((peak_dbfs(&tap) - peak_dbfs(&half) - 6.02).abs() < 0.2, "send level rides the tap");
+    }
+
+    #[test]
+    fn a_silent_bus_still_runs_its_own_fader_and_a_muted_one_has_no_tap() {
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Control", None, 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        p.apply(&Op::SetBusSilent { id: BusId(1), silent: true }).unwrap();
+        let end = Ticks::from_seconds(0.5);
+        let mixed = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, &[], &[]);
+        assert!(mixed.iter().all(|s| *s == 0.0), "the only track routes into the silent bus: master is empty");
+        let loud = bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(1)).unwrap();
+        p.apply(&Op::SetBusGain { id: BusId(1), gain: 0.5 }).unwrap();
+        let quiet = bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(1)).unwrap();
+        assert!((peak_dbfs(&loud) - peak_dbfs(&quiet) - 6.02).abs() < 0.2, "the tap is read after the fader");
+
+        // Muted is not silent: a muted bus is dropped before its chain, so
+        // there is nothing to read, and `None` says so rather than zeros.
+        p.apply(&Op::SetBusFlags { id: BusId(1), muted: true }).unwrap();
+        assert!(bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(1)).is_none());
+        assert!(bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(99)).is_none());
+    }
+
+    #[test]
+    fn a_pre_fader_split_hears_the_source_before_its_fader_moves() {
+        // The splitter case: one signal, two destinations, and the tap must
+        // not move when the audible path is ridden down.
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Vocals", None, 1.0) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(2, "Control", None, 1.0) }).unwrap();
+        p.apply(&Op::SetBusSilent { id: BusId(2), silent: true }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        p.apply(&Op::SetBusSends { id: BusId(1), sends: vec![Send { to: BusId(2), level: 1.0, pre_fader: true }] }).unwrap();
+        let end = Ticks::from_seconds(0.5);
+        let open = bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(2)).unwrap();
+        p.apply(&Op::SetBusGain { id: BusId(1), gain: 0.1 }).unwrap();
+        let faded = bus_signal(&p, &audio, &BTreeMap::new(), Ticks::ZERO, end, 48_000, BusId(2)).unwrap();
+        assert_eq!(open, faded, "a pre-fader split is independent of the audible path's fader");
     }
 
     #[test]
@@ -1848,7 +2272,7 @@ mod automation_render_tests {
         // Route the track through a bus and ramp the BUS down: the mix ends
         // quieter than it starts, and a flat lane at unity changes nothing.
         let (mut p, audio) = one_clip_project();
-        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0,
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0, silent: false,
             muted: false, chain: vec![], sends: vec![], parent: None } }).unwrap();
         p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
         let b = AutoTarget::BusGain(BusId(1));
@@ -1881,7 +2305,7 @@ mod automation_render_tests {
         // value is what the lane multiplies — the fader rule, on a knob.
         use studio_core::ParamKey;
         let (mut p, audio) = one_clip_project();
-        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0, muted: false,
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0, silent: false, muted: false,
             // A DISABLED effect first: the instance list skips it, so
             // `effect: 1` proves the index addresses the chain, not the
             // instance list.
@@ -1919,7 +2343,7 @@ mod automation_render_tests {
     fn a_dangling_or_unknown_parameter_target_changes_nothing() {
         use studio_core::ParamKey;
         let (mut p, audio) = one_clip_project();
-        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0, muted: false,
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0, silent: false, muted: false,
             chain: vec![effect("gain", &[("db", -6.0)])], sends: vec![], parent: None } }).unwrap();
         p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
         let plain = render(&p, &audio);
@@ -1950,7 +2374,7 @@ mod automation_render_tests {
         p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::from_seconds(0.5), value: 1.0 }).unwrap();
         p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::from_seconds(0.5).saturating_add(Ticks(1)), value: 0.0 }).unwrap();
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
-            curve: CurveId(1), target, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            curve: CurveId(1), target, gate: Gate::Clip(ClipId(1)), response: None, fit_span: false  } }).unwrap();
         let out = render(&p, &audio);
         assert!((out[1000] - 0.05).abs() < 0.002, "clip time 0: -20 dB: {}", out[1000]);
         assert!((out[out.len() - 1000] - 0.5).abs() < 0.002, "clip time 0.75 s: unity: {}", out[out.len() - 1000]);
@@ -2018,7 +2442,7 @@ mod binding_render_tests {
     fn a_clip_gated_ride_follows_the_clip_through_a_real_render() {
         let (mut p, a) = fixture();
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding { curve: CurveId(1),
-            target: AutoTarget::TrackGain(TrackId(1)), gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            target: AutoTarget::TrackGain(TrackId(1)), gate: Gate::Clip(ClipId(1)), response: None, fit_span: false  } }).unwrap();
         let out = render(&p, &a);
         assert!((left_at(&out, 0.3)).abs() < 1e-3, "the dip lands 0.1 s into the clip, got {}", left_at(&out, 0.3));
         assert!((left_at(&out, 0.25) - 0.25).abs() < 2e-3, "halfway down the ramp");
@@ -2037,7 +2461,7 @@ mod binding_render_tests {
         // vocal plays, the drums drop, and nothing else changes.
         let (mut p, a) = fixture();
         p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "drums".into(), parent: None,
-            gain: 1.0, chain: vec![], sends: vec![], muted: false } }).unwrap();
+            gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: false } }).unwrap();
         p.apply(&Op::SetRoute { track: TrackId(2), bus: Some(BusId(1)) }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(2), source: SourceId(1),
             track: TrackId(2), pos: Ticks::ZERO, src_in: Ticks::ZERO,
@@ -2045,7 +2469,7 @@ mod binding_render_tests {
         // Mute track 1 so only the bus's output is measured.
         p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: true, locked: false }).unwrap();
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding { curve: CurveId(1),
-            target: AutoTarget::BusGain(BusId(1)), gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            target: AutoTarget::BusGain(BusId(1)), gate: Gate::Clip(ClipId(1)), response: None, fit_span: false  } }).unwrap();
         let out = render(&p, &a);
         assert!((left_at(&out, 0.1) - 0.5).abs() < 1e-6, "before the vocal: full");
         assert!((left_at(&out, 0.3)).abs() < 1e-3, "under the vocal's dip: ducked, got {}", left_at(&out, 0.3));
@@ -2064,9 +2488,9 @@ mod binding_render_tests {
         p.apply(&Op::SetAutoPoint { target: t, at: Ticks::ZERO, value: 0.5 }).unwrap();
         p.apply(&Op::SetAutoPoint { target: t, at: Ticks::from_seconds(1.0), value: 1.0 }).unwrap();
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding { curve: CurveId(1),
-            target: t, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            target: t, gate: Gate::Clip(ClipId(1)), response: None, fit_span: false  } }).unwrap();
         p.apply(&Op::SetBinding { id: BindingId(2), binding: Binding { curve: CurveId(1),
-            target: t, gate: Gate::Window { start: Ticks::from_seconds(0.3), end: Ticks::from_seconds(0.5) } } }).unwrap();
+            target: t, gate: Gate::Window { start: Ticks::from_seconds(0.3), end: Ticks::from_seconds(0.5) }, response: None, fit_span: false } }).unwrap();
         let out = render(&p, &a);
         let mut checked = 0;
         for f in (0..48_000).step_by(97) {
@@ -2463,5 +2887,75 @@ mod render_speed_tests {
         let dt = t0.elapsed();
         println!("rendered {} frames of 8x10 clips + dense automation in {dt:?} \
                   ({:.1}x realtime)", out.len() / 2, 10.0 / dt.as_secs_f64());
+    }
+}
+
+#[cfg(test)]
+mod band_peak_tests {
+    use super::*;
+
+    /// A tone at `hz`, full scale, one second.
+    fn tone(hz: f32, rate: u32) -> SourceAudio {
+        let n = rate as usize;
+        let s: Vec<f32> = (0..n).map(|i| (std::f32::consts::TAU * hz * i as f32 / rate as f32).sin()).collect();
+        SourceAudio { sample_rate: rate, channels: vec![s] }
+    }
+
+    fn loudest(p: &Peaks) -> f32 {
+        p.levels[0].iter().map(|m| m.max.abs().max(m.min.abs())).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn each_band_shows_its_own_part_of_the_spectrum() {
+        let rate = 48_000;
+        for (hz, band) in [(60.0, Band::Low), (700.0, Band::Mid), (8_000.0, Band::High)] {
+            let a = tone(hz, rate);
+            let mine = loudest(&Peaks::build_band(&a, 256, 256, band));
+            assert!(mine > 0.3, "{} Hz should survive its own band: {mine}", hz);
+            for other in [Band::Low, Band::Mid, Band::High] {
+                if other == band { continue; }
+                let theirs = loudest(&Peaks::build_band(&a, 256, 256, other));
+                assert!(theirs < mine * 0.5,
+                        "{} Hz in the {} band ({theirs}) must be well under its own ({mine})",
+                        hz, other.label());
+            }
+        }
+    }
+
+    #[test]
+    fn full_band_is_the_plain_build_and_the_shape_never_changes() {
+        let a = tone(440.0, 48_000);
+        let plain = Peaks::build(&a, 256, 256);
+        let full = Peaks::build_band(&a, 256, 256, Band::Full);
+        assert_eq!(plain.levels, full.levels, "Full must cost nothing and change nothing");
+        // Every band keeps the pyramid's shape, so the timeline's drawing,
+        // hit testing and zoom work unchanged.
+        for band in [Band::Low, Band::Mid, Band::High] {
+            let p = Peaks::build_band(&a, 256, 256, band);
+            assert_eq!(p.frames, plain.frames);
+            assert_eq!(p.levels.len(), plain.levels.len());
+            assert_eq!(p.levels[0].len(), plain.levels[0].len());
+        }
+    }
+
+    #[test]
+    fn a_quiet_low_end_under_a_loud_voice_is_visible_in_the_low_band() {
+        // The scoring case: narration at -6 dB with a quiet 50 Hz rumble
+        // under it. The full waveform is the voice; the low band is the
+        // rumble, and that is the point of looking.
+        let rate = 48_000;
+        let n = rate as usize;
+        let mixed: Vec<f32> = (0..n).map(|i| {
+            let t = i as f32 / rate as f32;
+            0.5 * (std::f32::consts::TAU * 900.0 * t).sin()
+                + 0.05 * (std::f32::consts::TAU * 50.0 * t).sin()
+        }).collect();
+        let a = SourceAudio { sample_rate: rate, channels: vec![mixed] };
+        let full = loudest(&Peaks::build(&a, 256, 256));
+        let low = loudest(&Peaks::build_band(&a, 256, 256, Band::Low));
+        let mid = loudest(&Peaks::build_band(&a, 256, 256, Band::Mid));
+        assert!(full > 0.45 && mid > 0.3, "the voice dominates everywhere else: {full} / {mid}");
+        assert!(low < 0.12, "the low band must not just be the voice again: {low}");
+        assert!(low > 0.01, "and the rumble must actually show: {low}");
     }
 }

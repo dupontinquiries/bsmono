@@ -57,7 +57,7 @@ impl Mode {
     /// but `;` (collapse) and `C` (add selection) are not guessable at all.
     pub fn hints(self) -> &'static [&'static str] {
         match self {
-            Mode::Normal => &["x select", "d delete", "s split", "v select mode", "S-space menu"],
+            Mode::Normal => &["x select", "d delete", "s split", "v select mode", "S-space / C-p menu"],
             Mode::Select => &["w/b extend", "; collapse", "d delete", "Esc back to normal"],
             Mode::Insert => &["Esc back to normal"],
         }

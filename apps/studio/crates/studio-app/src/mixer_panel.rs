@@ -282,7 +282,7 @@ fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
                 s.session.doc.project.busses.keys().map(|b| b.0).max().unwrap_or(0) + 1);
             s.edit(studio_core::Op::AddBus { bus: studio_core::Bus {
                 id, name: format!("Bus {}", id.0), parent: None,
-                gain: 1.0, chain: Vec::new(), sends: Vec::new(), muted: false,
+                gain: 1.0, chain: Vec::new(), sends: Vec::new(), muted: false, silent: false,
             } }, "bus added");
         }
     });
@@ -293,6 +293,16 @@ fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
             let mut audible = !b.muted;
             if ui.checkbox(&mut audible, "M").changed() {
                 s.edit(studio_core::Op::SetBusFlags { id: b.id, muted: !audible }, "bus mute");
+            }
+            // A silent bus still sums, processes and fades — it just feeds
+            // nothing. That is a different control from mute (which drops
+            // the bus before its chain), and it is the one that makes a
+            // control/dummy channel: send into it, read it, hear nothing.
+            let mut silent = b.silent;
+            if ui.checkbox(&mut silent, "ctrl")
+                .on_hover_text("control channel: renders, feeds nothing. Send into it to drive something.")
+                .changed() {
+                s.edit(studio_core::Op::SetBusSilent { id: b.id, silent }, "bus control tap");
             }
             // Same commit-on-release discipline as the track faders.
             let mut shown = match s.bus_drag {
@@ -440,7 +450,7 @@ mod send_defaults_tests {
         Bus {
             id: BusId(id), name: format!("bus {id}"), parent: None, gain: 1.0, chain: vec![],
             sends: sends_to.iter().map(|&t| Send { to: BusId(t), level: 0.5, pre_fader: false }).collect(),
-            muted: false,
+            muted: false, silent: false,
         }
     }
 

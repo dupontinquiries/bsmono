@@ -1,0 +1,16 @@
+1
+00:00:01,100 --> 00:00:03,300
+Yeah, I found something I like more than that.
+
+2
+00:00:04,100 --> 00:00:06,100
+You like acting, come on.
+
+3
+00:00:07,100 --> 00:00:08,300
+Partying is great.
+
+4
+00:00:09,600 --> 00:00:11,600
+Hi guys, mind if we join the party?
+

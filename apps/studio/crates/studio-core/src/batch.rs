@@ -349,7 +349,7 @@ mod tests {
         p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks(1000), value: 1.0 }).unwrap();
         let t = AutoTarget::TrackGain(TrackId(1));
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding { curve: CurveId(1), target: t,
-            gate: Gate::Clip(ClipId(2)) } }).unwrap();
+            gate: Gate::Clip(ClipId(2)), response: None, fit_span: false  } }).unwrap();
         let before: Vec<f32> = (900..2100).step_by(10).map(|x| p.auto_value(t, Ticks(x))).collect();
         let mut next = 10;
         for op in p.split_on_grid_ops(&[ClipId(2)], Ticks(250), Ticks::ZERO, &mut next).unwrap() { p.apply(&op).unwrap(); }
@@ -366,7 +366,7 @@ mod tests {
         let t = AutoTarget::TrackGain(TrackId(1));
         for (bid, cid) in [(1, 1), (2, 2), (3, 3)] {
             p.apply(&Op::SetBinding { id: BindingId(bid), binding: Binding { curve: CurveId(1), target: t,
-                gate: Gate::Clip(ClipId(cid)) } }).unwrap();
+                gate: Gate::Clip(ClipId(cid)), response: None, fit_span: false  } }).unwrap();
         }
         assert_eq!(p.curve_share_count(CurveId(1)), 3);
         for op in p.make_curve_unique_ops(BindingId(2), CurveId(7)).unwrap() { p.apply(&op).unwrap(); }

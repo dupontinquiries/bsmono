@@ -95,7 +95,19 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
-pub const WIRE_VERSION: u8 = 16;
+/// v18: `Op::SetSourcePath` (tag 46). A tag addition only — no existing
+/// encoding changed — but the version still moves, because a v17 peer that
+/// receives one cannot apply it and would silently diverge from everyone
+/// who can.
+///
+/// v17: `Bus` gained `silent: bool` (a measurement tap that feeds nothing —
+/// see `Bus::silent`), and `Op` gained `SetBusSilent` (tag 45). The bus
+/// shape itself changed, so this is a bump and not a quiet tag addition: a
+/// v16 peer reading a v17 bus would take the silent byte for the next
+/// field and desynchronise the whole stream.
+/// v19: `Binding` gained `response` and `fit_span` (a scene's stage signal
+/// driving several targets differently, and surviving a re-trim).
+pub const WIRE_VERSION: u8 = 19;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -145,9 +157,29 @@ fn put_str(o: &mut Vec<u8>, s: &str) {
 }
 fn put_ticks(o: &mut Vec<u8>, t: Ticks) { put_i64(o, t.0); }
 
-struct R<'a> { b: &'a [u8], i: usize }
+/// The oldest version a SAVE FILE may be and still open. Live packets
+/// between peers stay exact-version (peers upgrade together); a file is
+/// read years later, so it is decoded with the version it was written at.
+/// Every bump this session (16 -> 17 silent busses, 18 relink, 19 binding
+/// response) had, until this existed, silently stopped every older project
+/// from opening.
+pub const FIRST_FILE_VERSION: u8 = 16;
+
+/// The version the encoder writes. Always WIRE_VERSION in the product; tests
+/// can write an OLDER version to prove old files still open, which needs real
+/// old bytes and not a hand-built imitation of them.
+#[cfg(test)]
+thread_local! { pub(crate) static ENCODE_AS: std::cell::Cell<u8> = const { std::cell::Cell::new(WIRE_VERSION) }; }
+/// The version the encoder is writing (the product always writes the newest).
+pub(crate) fn current_encode_version() -> u8 { enc_v() }
+fn enc_v() -> u8 {
+    #[cfg(test)] { return ENCODE_AS.with(|c| c.get()); }
+    #[allow(unreachable_code)] WIRE_VERSION
+}
+
+struct R<'a> { b: &'a [u8], i: usize, v: u8 }
 impl<'a> R<'a> {
-    fn new(b: &'a [u8]) -> Self { R { b, i: 0 } }
+    fn new(b: &'a [u8]) -> Self { R { b, i: 0, v: WIRE_VERSION } }
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         if self.i + n > self.b.len() { return None; }
         let s = &self.b[self.i..self.i + n];
@@ -274,12 +306,15 @@ fn put_bus(o: &mut Vec<u8>, b: &Bus) {
     put_effects(o, &b.chain);
     put_sends(o, &b.sends);
     put_u8(o, b.muted as u8);
+    if enc_v() >= 17 { put_u8(o, b.silent as u8); }
 }
 fn get_bus(r: &mut R) -> Option<Bus> {
     Some(Bus {
         id: BusId(r.u64()?), name: r.str()?, parent: get_opt_bus_id(r)?,
         gain: r.f32()?, chain: get_effects(r)?, sends: get_sends(r)?,
         muted: r.u8()? != 0,
+        // v17 added it; a bus from an older file was never silent
+        silent: if r.v >= 17 { r.u8()? != 0 } else { false },
     })
 }
 
@@ -343,9 +378,26 @@ fn get_gate(r: &mut R) -> Option<Gate> {
 }
 fn put_binding(o: &mut Vec<u8>, b: &Binding) {
     put_u64(o, b.curve.0); put_auto_target(o, b.target); put_gate(o, b.gate);
+    if enc_v() >= 19 {
+        match b.response {
+            None => put_u8(o, 0),
+            Some(rsp) => { put_u8(o, 1); put_f32(o, rsp.from); put_f32(o, rsp.to); put_f32(o, rsp.floor); put_f32(o, rsp.ceil); }
+        }
+        put_u8(o, b.fit_span as u8);
+    }
 }
 fn get_binding(r: &mut R) -> Option<Binding> {
-    Some(Binding { curve: CurveId(r.u64()?), target: get_auto_target(r)?, gate: get_gate(r)? })
+    let (curve, target, gate) = (CurveId(r.u64()?), get_auto_target(r)?, get_gate(r)?);
+    // v19 added the response and fit; an older binding read its curve straight
+    let (response, fit_span) = if r.v >= 19 {
+        let response = match r.u8()? {
+            0 => None,
+            1 => Some(studio_core::Response { from: r.f32()?, to: r.f32()?, floor: r.f32()?, ceil: r.f32()? }),
+            _ => return None,
+        };
+        (response, r.u8()? != 0)
+    } else { (None, false) };
+    Some(Binding { curve, target, gate, response, fit_span })
 }
 
 fn put_track(o: &mut Vec<u8>, t: &Track) {
@@ -487,6 +539,8 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
         Op::RemoveBus { id } => { put_u8(o, 12); put_u64(o, id.0); }
         Op::SetBusGain { id, gain } => { put_u8(o, 13); put_u64(o, id.0); put_f32(o, *gain); }
         Op::SetBusFlags { id, muted } => { put_u8(o, 17); put_u64(o, id.0); put_u8(o, *muted as u8); }
+        Op::SetBusSilent { id, silent } => { put_u8(o, 45); put_u64(o, id.0); put_u8(o, *silent as u8); }
+        Op::SetSourcePath { id, path } => { put_u8(o, 46); put_u64(o, id.0); put_str(o, path); }
         Op::SetBusChain { id, chain } => { put_u8(o, 14); put_u64(o, id.0); put_effects(o, chain); }
         Op::SetBusSends { id, sends } => { put_u8(o, 15); put_u64(o, id.0); put_sends(o, sends); }
         Op::SetRoute { track, bus } => { put_u8(o, 16); put_u64(o, track.0); put_opt_bus_id(o, *bus); }
@@ -705,6 +759,8 @@ fn get_op(r: &mut R) -> Option<Op> {
             };
             Op::SetGroupWindow { id, window }
         }
+        45 => Op::SetBusSilent { id: BusId(r.u64()?), silent: r.u8()? != 0 },
+        46 => Op::SetSourcePath { id: SourceId(r.u64()?), path: r.str()? },
         44 => Op::SetClipFade {
             id: ClipId(r.u64()?),
             fade_in: Ticks(r.i64()?),
@@ -951,7 +1007,7 @@ fn get_rack(r: &mut R) -> Option<Rack> {
 impl Packet {
     pub fn encode(&self) -> Vec<u8> {
         let mut o = Vec::with_capacity(64);
-        put_u8(&mut o, WIRE_VERSION);
+        put_u8(&mut o, enc_v());
         match self {
             Packet::Op(s) => { put_u8(&mut o, 1); put_stamped(&mut o, s); }
             Packet::Presence(p) => {
@@ -1021,8 +1077,20 @@ impl Packet {
     /// Decode, or `None` for anything malformed, truncated, or from a version
     /// or op kind this build does not know. Never a partial result.
     pub fn decode(b: &[u8]) -> Option<Packet> {
+        Packet::decode_in(b, WIRE_VERSION..=WIRE_VERSION)
+    }
+
+    /// Decode a packet stored in a SAVE FILE: any version from
+    /// FIRST_FILE_VERSION up, each read with the fields its version had.
+    pub fn decode_stored(b: &[u8]) -> Option<Packet> {
+        Packet::decode_in(b, FIRST_FILE_VERSION..=WIRE_VERSION)
+    }
+
+    fn decode_in(b: &[u8], accept: std::ops::RangeInclusive<u8>) -> Option<Packet> {
         let mut r = R::new(b);
-        if r.u8()? != WIRE_VERSION { return None; }
+        let v = r.u8()?;
+        if !accept.contains(&v) { return None; }
+        r.v = v;
         let p = match r.u8()? {
             1 => Packet::Op(get_stamped(&mut r)?),
             2 => {
@@ -1258,9 +1326,9 @@ mod tests {
                 id: BusId(5), name: "808 — sub".into(), parent: Some(BusId(1)), gain: 0.9,
                 chain: effects(),
                 sends: vec![Send { to: BusId(2), level: 0.35, pre_fader: false }],
-                muted: false,
+                muted: false, silent: false,
             } },
-            Op::AddBus { bus: Bus { id: BusId(1), name: "Master-ish".into(), parent: None, gain: 1.0, chain: vec![], sends: vec![], muted: false } },
+            Op::AddBus { bus: Bus { id: BusId(1), name: "Master-ish".into(), parent: None, gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: false } },
             Op::RemoveBus { id: BusId(5) },
             Op::SetBusGain { id: BusId(1), gain: 0.6 },
             Op::SetBusFlags { id: BusId(1), muted: true },
@@ -1282,14 +1350,15 @@ mod tests {
             Op::SetCurvePoint { curve: CurveId(4), at: Ticks::from_seconds(0.5), value: 0.0 },
             Op::RemoveCurvePoint { curve: CurveId(4), at: Ticks::from_seconds(0.5) },
             Op::SetBinding { id: BindingId(1), binding: Binding { curve: CurveId(4),
-                target: AutoTarget::TrackGain(TrackId(2)), gate: Gate::Always } },
+                target: AutoTarget::TrackGain(TrackId(2)), gate: Gate::Always, response: None, fit_span: false } },
             Op::SetBinding { id: BindingId(2), binding: Binding { curve: CurveId(4),
-                target: AutoTarget::BusGain(BusId(1)), gate: Gate::Clip(ClipId(9)) } },
+                target: AutoTarget::BusGain(BusId(1)), gate: Gate::Clip(ClipId(9)), response: None, fit_span: false } },
             Op::SetBinding { id: BindingId(3), binding: Binding { curve: CurveId(4),
                 target: AutoTarget::TrackGain(TrackId(2)),
-                gate: Gate::Window { start: Ticks::from_seconds(8.0), end: Ticks::from_seconds(16.0) } } },
+                gate: Gate::Window { start: Ticks::from_seconds(8.0), end: Ticks::from_seconds(16.0) }, response: None, fit_span: false } },
             Op::SetBinding { id: BindingId(3), binding: Binding { curve: CurveId(4),
-                target: AutoTarget::TrackGain(TrackId(1)), gate: Gate::Group(GroupId(7)) } },
+                target: AutoTarget::TrackGain(TrackId(1)), gate: Gate::Group(GroupId(7)),
+                response: Some(studio_core::Response { from: 0.5, to: 0.9, floor: 0.0, ceil: 1.0 }), fit_span: true } },
             Op::RemoveBinding { id: BindingId(3) },
             Op::SetProvenance { source: SourceId(5), provenance: studio_core::Provenance {
                 content_hash: [7u8; 32], file_size: 123_456_789,
@@ -1513,7 +1582,34 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 16, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 19, "bump this alongside the next encoding change, not instead of it");
+    }
+
+    #[test]
+    fn a_relink_survives_the_wire() {
+        let p = Packet::Op(StampedOp { stamp: Stamp { lamport: 3, site: SiteId(2) },
+            op: Op::SetSourcePath { id: SourceId(7), path: "/card/A001/C0057.MXF".into() } });
+        assert_eq!(Packet::decode(&p.encode()).expect("decodes"), p);
+    }
+
+    #[test]
+    fn a_silent_bus_and_its_op_survive_the_wire() {
+        let bus = Bus { id: BusId(7), name: "Control".into(), parent: None, gain: 1.0,
+            chain: vec![], sends: vec![Send { to: BusId(2), level: 1.0, pre_fader: true }],
+            muted: false, silent: true };
+        for op in [Op::AddBus { bus: bus.clone() }, Op::SetBusSilent { id: BusId(7), silent: true },
+                   Op::SetBusSilent { id: BusId(7), silent: false }] {
+            let p = Packet::Op(StampedOp { stamp: Stamp { lamport: 1, site: SiteId(1) }, op: op.clone() });
+            let back = Packet::decode(&p.encode()).expect("decodes");
+            assert_eq!(back, p, "{op:?}");
+        }
+        // and a peer that predates silent busses is refused rather than
+        // reading the silent byte as the start of the next field
+        let full = Packet::Op(StampedOp { stamp: Stamp { lamport: 1, site: SiteId(1) },
+            op: Op::AddBus { bus } }).encode();
+        let mut stale = full.clone();
+        stale[0] = 16;
+        assert!(Packet::decode(&stale).is_none(), "a v16 peer's packet must be refused");
     }
 
     #[test]
@@ -1653,7 +1749,7 @@ mod automation_wire_tests {
     fn an_unknown_gate_kind_refuses_the_packet_and_every_binding_prefix_fails() {
         let p = Packet::Op(StampedOp { stamp: Stamp { lamport: 7, site: SiteId(2) },
             op: Op::SetBinding { id: BindingId(5), binding: Binding { curve: CurveId(1),
-                target: AutoTarget::BusGain(BusId(2)), gate: Gate::Clip(ClipId(3)) } } });
+                target: AutoTarget::BusGain(BusId(2)), gate: Gate::Clip(ClipId(3)), response: None, fit_span: false } } });
         let full = p.encode();
         assert_eq!(Packet::decode(&full).expect("decodes"), p);
         for cut in 1..full.len() {

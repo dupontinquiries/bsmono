@@ -26,7 +26,7 @@
 //!   undo survive a restart; omitting it costs nothing and is the default,
 //!   because most people do not want a week of history in every file.
 
-use crate::wire::{Packet, WIRE_VERSION};
+use crate::wire::{Packet, FIRST_FILE_VERSION, WIRE_VERSION};
 use crate::{Stamp, SiteId, StampedOp};
 use studio_core::{Op, Project};
 
@@ -157,6 +157,13 @@ pub fn snapshot(project: &Project) -> Vec<Op> {
             if g.tempo.is_some() {
                 ops.push(Op::SetGroupTempo { id: *id, tempo: g.tempo.clone() });
             }
+            // Same reasoning again for the take bucket's chosen take: it is
+            // its own slot, not part of SetGroup, so without this a saved
+            // project came back with every bucket's choice forgotten —
+            // found by saving an organised camera card and loading it.
+            if g.active.is_some() {
+                ops.push(Op::SetGroupActive { id: *id, active: g.active });
+            }
         }
     }
     ops.extend(relock);
@@ -175,7 +182,7 @@ impl SaveFile {
     pub fn encode(&self) -> Vec<u8> {
         let mut o = Vec::with_capacity(1024);
         o.extend_from_slice(MAGIC);
-        o.push(WIRE_VERSION);
+        o.push(crate::wire::current_encode_version());
         let nb = self.name.as_bytes();
         o.extend_from_slice(&(nb.len() as u32).to_le_bytes());
         o.extend_from_slice(nb);
@@ -209,7 +216,9 @@ impl SaveFile {
 
     pub fn decode(b: &[u8]) -> Option<SaveFile> {
         if b.len() < 13 || &b[..8] != MAGIC { return None; }
-        if b[8] != WIRE_VERSION { return None; }
+        // Any version this build knows how to read. Refusing everything but
+        // the current one meant each format bump orphaned every older project.
+        if !(FIRST_FILE_VERSION..=WIRE_VERSION).contains(&b[8]) { return None; }
         let mut i = 9;
         let take_u32 = |b: &[u8], i: &mut usize| -> Option<usize> {
             if *i + 4 > b.len() { return None; }
@@ -223,14 +232,14 @@ impl SaveFile {
         i += n;
         let sl = take_u32(b, &mut i)?;
         if i + sl > b.len() { return None; }
-        let snapshot = match Packet::decode(&b[i..i + sl])? {
+        let snapshot = match Packet::decode_stored(&b[i..i + sl])? {
             Packet::Catchup { ops } => ops.into_iter().map(|s| s.op).collect(),
             _ => return None,
         };
         i += sl;
         let hl = take_u32(b, &mut i)?;
         if i + hl > b.len() { return None; }
-        let history = match Packet::decode(&b[i..i + hl])? {
+        let history = match Packet::decode_stored(&b[i..i + hl])? {
             Packet::Catchup { ops } => ops,
             _ => return None,
         };
@@ -247,7 +256,7 @@ impl SaveFile {
             None
         } else {
             if i + rl > b.len() { return None; }
-            match Packet::decode(&b[i..i + rl])? {
+            match Packet::decode_stored(&b[i..i + rl])? {
                 Packet::Rack(rs) => Some(rs.rack),
                 _ => return None,
             }
@@ -279,7 +288,7 @@ mod tests {
         p.apply(&Op::AddBus { bus: studio_core::Bus {
             id: studio_core::BusId(1), name: "Vocals".into(), parent: None, gain: 0.8,
             chain: vec![Effect { kind: "eq".into(), params: Default::default(), enabled: true }],
-            sends: Vec::new(), muted: false,
+            sends: Vec::new(), muted: false, silent: false,
         } }).unwrap();
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
             name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
@@ -335,7 +344,7 @@ mod tests {
         let mut p = built();
         p.apply(&Op::AddBus { bus: studio_core::Bus {
             id: studio_core::BusId(2), name: "Master-ish".into(), parent: None, gain: 1.0,
-            chain: Vec::new(), sends: Vec::new(), muted: false,
+            chain: Vec::new(), sends: Vec::new(), muted: false, silent: false,
         } }).unwrap();
         p.busses.get_mut(&studio_core::BusId(1)).unwrap().parent = Some(studio_core::BusId(2));
 
@@ -501,6 +510,36 @@ mod automation_file_tests {
     }
 
     #[test]
+    fn a_take_buckets_chosen_take_survives_the_round_trip() {
+        // Found by saving an organised camera card: every bucket came back
+        // with no take chosen, because `active` is its own slot and
+        // `SetGroup` does not carry it — the same trap key and tempo were
+        // already fixed for.
+        use studio_core::{Clip, ClipId, GroupId, Source, SourceId};
+        let mut p = Project { name: "card".into(), ..Default::default() };
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
+            name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "C0057.mkv".into(),
+            len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2, has_video: true,
+            kind: studio_core::SourceKind::File } }).unwrap();
+        for id in 1..=2u64 {
+            p.apply(&Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(1), track: TrackId(1),
+                pos: Ticks::from_seconds(id as f64 * 10.0), src_in: Ticks::ZERO,
+                len: Ticks::from_seconds(5.0), gain: 1.0, effects: vec![] } }).unwrap();
+        }
+        p.apply(&Op::SetGroup { id: GroupId(1), name: "1B".into(),
+                                clips: vec![ClipId(1), ClipId(2)] }).unwrap();
+        p.apply(&Op::SetGroupActive { id: GroupId(1), active: Some(ClipId(2)) }).unwrap();
+
+        let file = SaveFile::from_project(&p, Vec::new(), None);
+        let back = SaveFile::decode(&file.encode()).expect("decodes");
+        let mut rebuilt = Project { name: back.name.clone(), ..Default::default() };
+        for op in &back.snapshot { rebuilt.apply(op).expect("applies"); }
+        assert_eq!(rebuilt.groups[&GroupId(1)].active, Some(ClipId(2)), "the chosen take came back");
+        assert_eq!(rebuilt, p);
+    }
+
+    #[test]
     fn curves_and_bindings_survive_the_round_trip_and_a_dangling_gate_is_dropped() {
         use studio_core::{Binding, BindingId, Clip, ClipId, CurveId, Gate, Source, SourceId};
         let mut p = Project { name: "bound".into(), ..Default::default() };
@@ -515,9 +554,9 @@ mod automation_file_tests {
         p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks(250), value: 0.2 }).unwrap();
         let t = AutoTarget::TrackGain(TrackId(1));
         p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
-            curve: CurveId(1), target: t, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+            curve: CurveId(1), target: t, gate: Gate::Clip(ClipId(1)), response: None, fit_span: false } }).unwrap();
         p.apply(&Op::SetBinding { id: BindingId(2), binding: Binding {
-            curve: CurveId(1), target: t, gate: Gate::Window { start: Ticks(1_000), end: Ticks(2_000) } } }).unwrap();
+            curve: CurveId(1), target: t, gate: Gate::Window { start: Ticks(1_000), end: Ticks(2_000) }, response: None, fit_span: false } }).unwrap();
         // Locked on purpose, the lane test's reason: the bindings must land
         // before the relock or a locked track's ride vanishes on save.
         p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: false, locked: true }).unwrap();
@@ -540,5 +579,40 @@ mod automation_file_tests {
         assert_eq!(bindings_saved, 1, "the window binding survives, the dangling clip gate does not");
         let mut again = Project { name: p.name.clone(), ..Default::default() };
         for op in &snap { again.apply(op).expect("no refused op in a snapshot"); }
+    }
+
+    #[test]
+    fn projects_saved_by_older_versions_still_open() {
+        // Until this test existed, SaveFile::decode refused any version but
+        // the current one, so every format bump -- three this session --
+        // orphaned every project saved before it. Real old bytes, written by
+        // the encoder at the old version, not a hand-built imitation.
+        use studio_core::{Bus, BusId, CurveId, Binding, BindingId, Gate, AutoTarget};
+        let mut p = Project { name: "old".into(), ..Default::default() };
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "Music".into(), parent: None, gain: 0.8,
+            chain: vec![], sends: vec![], muted: false, silent: false } }).unwrap();
+        p.apply(&Op::SetCurve { id: CurveId(1), name: "stage".into() }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::ZERO, value: 0.0 }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::from_seconds(4.0), value: 1.0 }).unwrap();
+        p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding { curve: CurveId(1),
+            target: AutoTarget::BusGain(BusId(1)), gate: Gate::Always, response: None, fit_span: false } }).unwrap();
+        for v in crate::wire::FIRST_FILE_VERSION..=crate::wire::WIRE_VERSION {
+            crate::wire::ENCODE_AS.with(|c| c.set(v));
+            let bytes = SaveFile::from_project(&p, Vec::new(), None).encode();
+            crate::wire::ENCODE_AS.with(|c| c.set(crate::wire::WIRE_VERSION));
+            assert_eq!(bytes[8], v, "written at v{v}");
+            let back = SaveFile::decode(&bytes).unwrap_or_else(|| panic!("a v{v} file must open"));
+            assert_eq!(back.to_project(), p, "v{v} opens to the same project");
+        }
+        // a file from a NEWER build is still refused, not guessed at
+        let mut future = SaveFile::from_project(&p, Vec::new(), None).encode();
+        future[8] = crate::wire::WIRE_VERSION + 1;
+        assert!(SaveFile::decode(&future).is_none());
+        // and live packets stay exact: an old peer's packet is refused
+        crate::wire::ENCODE_AS.with(|c| c.set(crate::wire::WIRE_VERSION - 1));
+        let old_packet = crate::wire::Packet::Catchup { ops: vec![] }.encode();
+        crate::wire::ENCODE_AS.with(|c| c.set(crate::wire::WIRE_VERSION));
+        assert!(crate::wire::Packet::decode(&old_packet).is_none(), "peers must match exactly");
+        assert!(crate::wire::Packet::decode_stored(&old_packet).is_some(), "a stored one opens");
     }
 }
