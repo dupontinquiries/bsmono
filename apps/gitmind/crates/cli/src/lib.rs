@@ -96,6 +96,7 @@ pub fn run() -> i32 {
         "apply" => cmd_apply(rest),
         "zip" => cmd_zip(rest),
         "fleet" => cmd_fleet(rest),
+        "eink" => cmd_eink(rest),
         "bridge" => cmd_bridge(rest),
         "watch" => cmd_watch(rest),
         "bundle" => match rest.first() {
@@ -1321,6 +1322,7 @@ fn print_help(prog: &str) {
     println!("{prog} {} — touch-first repo manager (CLI frontend)", gitmind_core::VERSION);
     println!("  (\"gin\" is a short alias for \"gitmind\")\n");
     println!("  status | st                 repo state + changed files");
+    println!("  eink <enroll|probe|deploy|stop|status> <host>   e-ink tablets (reMarkable)");
     println!("  snapshot | snap [label]     checkpoint the worktree (shadow ref, index untouched)");
     println!("  timeline | tl [N] [-f]      list checkpoints (-f: fuzzy select)");
     println!("  diff [<a>] [<b>]            changes in a checkpoint vs worktree, or between two");
@@ -1383,6 +1385,422 @@ fn iso_now() -> String {
 }
 
 // ── fleet: cockpit operations shared with the GUI (import / build / apply / merge / reclaim) ──
+
+/// e-ink tablets (reMarkable): enrol, probe, deploy/launch, stop, status.
+///
+/// Every subcommand re-probes the device rather than trusting saved state:
+/// it is one SSH round-trip, and tablets change under you (OS updates wipe
+/// the root filesystem; Oxide/AppLoad get installed or removed).
+fn cmd_eink(rest: &[String]) -> i32 {
+    use cockpit::eink_fleet as ef;
+    const USAGE: &str = "usage: gitmind eink <enroll|probe|survey|build|deploy|list|remove|stop|status|activate|wifi-ssh|pkg|retrust> <host> ...\n  \
+        build <host> <bin> [--engine auto|host|container]   build an eink-kit app for that tablet (container = podman/docker rust:alpine)\n  \
+        list <host>                         apps gitmind put in the tablet's AppLoad sidebar\n  \
+        remove <host> <app>                 take one out again (never touches other apps)\n  \
+        activate <host>                     after a reboot: start xovi or the launcher, whichever is needed\n  \
+        wifi-ssh <host>                     turn on SSH over Wi-Fi (Paper Pro family; run over USB)\n  \
+        pkg <host> runner|bootstrap|add|del|list|update|audio   packages like a laptop (Alpine under /home)\n  \
+        survey <host>                       what the device has (run at enrol); builds pick features from it\n  \
+        restart-ui <host>                   restart xochitl so AppLoad re-reads changed app settings\n  \
+        (every command: --user U, or GITMIND_RM_USER; default root)\n  \
+        retrust <host>                      accept the tablet's NEW host key (after an OS update)\n  \
+        enroll <host>                       first contact: password (GITMIND_RM_PASSWORD or stdin) → key\n  \
+        probe <host>                        model, display servers, route\n  \
+        deploy <host> <bin> [--name N] [--title T] [--icon PNG] [--windowed] [--profile P] [--userland alpine] [-- args...]\n  \
+        (--userland alpine on build/deploy: dynamic, inside the Alpine root; needs `pkg bootstrap` and the runner)\n  \
+        stop <host> <app>\n  \
+        status <host> <app>";
+    let sub = match rest.first() { Some(s) => s.as_str(), None => return err(USAGE) };
+    let Some(host) = rest.get(1).cloned() else { return err(USAGE) };
+    let (flags, app_args) = match rest.iter().position(|a| a == "--") {
+        Some(i) => (&rest[2..i], rest[i + 1..].to_vec()),
+        None => (&rest[2..], vec![]),
+    };
+    let pos: Vec<&String> = eink_positionals(flags);
+    // `--user U`, else GITMIND_RM_USER, else root (reMarkable: "root at the
+    // time of writing", so a default, not a constant).
+    let user = opt(flags, "--user").map(str::to_string)
+        .or_else(|| std::env::var("GITMIND_RM_USER").ok().filter(|u| !u.trim().is_empty()))
+        .unwrap_or_else(|| ef::DEFAULT_USER.to_string());
+    // `--userland alpine`: build dynamic and run inside the Alpine root.
+    let userland = match opt(flags, "--userland") {
+        Some(u) => match ef::Userland::parse(u) { Some(u) => u, None => { eprintln!("--userland: static|alpine"); return 2; } },
+        None => ef::Userland::Static,
+    };
+    let mut remote = ef::SshRemote { user: user.clone(), host: host.clone() };
+    let need = |a: Option<ef::Activation>| match a {
+        Some(a) => format!("\n          needs, once per boot: {} → `gitmind eink activate {host}`", a.label()),
+        None => String::new(),
+    };
+    let describe = |p: &ef::Probe, d: &ef::Displays| {
+        println!("  model   {}", p.model.map(|m| m.label()).unwrap_or("unknown (set it in the roster)"));
+        println!("          identified by: {}", p.how);
+        if let Some(c) = &p.unknown_codename {
+            println!("          motd names \"{c}\", which gitmind does not know yet");
+        }
+        println!("  target  {}{}", p.triple.unwrap_or("unknown"), d.glibc.as_ref().map(|g| format!(" (glibc {g}: build with zigbuild .{g})")).unwrap_or_default());
+        println!("  displays qtfb={} appload={} blight_lib={} blight_running={}",
+            d.qtfb, d.appload_dir.as_deref().unwrap_or("-"), d.blight_lib.as_deref().unwrap_or("-"), d.blight_running);
+        match d.readiness() {
+            Ok((ef::Route::Blight, a)) => println!("  route   Blight: gitmind can launch apps remotely{}", need(a)),
+            Ok((ef::Route::AppLoad { dir }, a)) => println!("  route   AppLoad ({dir}): gitmind installs, you tap the icon{}", need(a)),
+            Err(e) => println!("  route   none: {e}"),
+        }
+        if d.rootfs_ro || d.etc_overlay {
+            println!("  system  read-only root{}; gitmind writes only under /home/root",
+                if d.etc_overlay { ", /etc resets at boot" } else { "" });
+        }
+
+    };
+    match sub {
+        "enroll" => {
+            let password = std::env::var("GITMIND_RM_PASSWORD").ok().or_else(|| {
+                use std::io::BufRead;
+                eprint!("SSH password for {user}@{host} (Settings → General → Help → About → Copyrights and licenses; blank if a key is installed): ");
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line).ok()?;
+                Some(line.trim().to_string()).filter(|s| !s.is_empty())
+            });
+            let mut e = ef::SshEnroller { user: user.clone(), host: host.clone() };
+            match ef::enroll(&mut e, password.as_deref(), &mut |ev| eprintln!("  · {ev:?}")) {
+                Ok(r) => {
+                    println!("enrolled {user}@{host}{}", if r.used_password { " (keys installed; no more passwords)" } else { "" });
+                    // Which tablet this is (cookie, SoC serial; USB identity if on a cable).
+                    if let Some(l) = cockpit::tablet_identity::usb_link_for(&host) { println!("  on {}", l.describe()); }
+                    if let Ok(out) = ef::Remote::run(&mut remote, &cockpit::tablet_identity::identity_cmd()) {
+                        let id = cockpit::tablet_identity::parse_identity(&out);
+                        println!("  device id {} · soc {} · {}", id.device_id, id.soc_serial.as_deref().unwrap_or("-"), id.dt_model.as_deref().unwrap_or("-"));
+                    }
+                    // What the device HAS, stored for builds to use.
+                    match ef::Remote::run(&mut remote, &cockpit::capabilities::survey_cmd()) {
+                        Ok(out) => {
+                            let _ = cockpit::capabilities::save(&cockpit::tablet_identity::device_key(&host), &out);
+                            for l in cockpit::capabilities::parse(&out).summary() { println!("  {l}"); }
+                        }
+                        Err(e) => eprintln!("  (hardware survey failed: {e})"),
+                    }
+                    describe(&r.probe, &r.displays);
+                    0
+                }
+                Err(e) if e == ef::HOSTKEY_CHANGED => eink_err(&format!("{e}\n  → `gitmind eink retrust {host}`, then enroll again")),
+                Err(e) => eink_err(&e),
+            }
+        }
+        "probe" => {
+            let p = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
+            println!("{host}:");
+            describe(&p.0, &p.1);
+            0
+        }
+        "deploy" => {
+            let Some(bin) = pos.first() else { return err(USAGE) };
+            let name = opt(flags, "--name").map(str::to_string).unwrap_or_else(|| {
+                std::path::Path::new(bin.as_str()).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
+            });
+            let (probe, displays) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
+            let (route, activation) = match displays.readiness() { Ok(r) => r, Err(e) => return eink_err(&e) };
+            if let (ef::Route::Blight, Some(a)) = (&route, activation) {
+                return eink_err(&format!("the tablet needs `{}` since its last boot: run `gitmind eink activate {host}`", a.label()));
+            }
+            if let Err(e) = ef::preflight_binary_for(bin, &route, probe.model, userland) {
+                return eink_err(&format!("not deployed: {e}"));
+            }
+            if userland == ef::Userland::AlpineRoot {
+                match ef::Remote::run(&mut remote, &cockpit::alpine_root::probe_cmd()) {
+                    Ok(o) => if let Some(why) = cockpit::alpine_root::parse_probe(&o).not_ready() { return eink_err(&format!("not deployed: {why}")); },
+                    Err(e) => return eink_err(&e),
+                }
+            }
+            let profile = match opt(flags, "--profile") {
+                Some(p) => match ef::RefreshProfile::parse(p) { Some(p) => p, None => return eink_err("--profile: fast-color|fast-mono|quality") },
+                None => ef::RefreshProfile::fastest(probe.model.map(|m| m.panel()).unwrap_or(ef::Panel::Mono)),
+            };
+            let args: Vec<&str> = app_args.iter().map(String::as_str).collect();
+            let env = ef::LaunchEnv { profile, model: probe.model, blight_lib: displays.blight_lib.clone() };
+            let opts = ef::AppLoadOptions {
+                display_name: opt(flags, "--title").map(str::to_string).unwrap_or_else(|| name.clone()),
+                fullscreen: !flags.iter().any(|f| f == "--windowed"),
+                args: app_args.clone(),
+                userland,
+            };
+            let icon = opt(flags, "--icon");
+            match ef::deliver(&mut remote, &route, &name, bin, &env, &args, Some((&opts, icon)), &mut |ev| eprintln!("  · {ev:?}")) {
+                Ok(ef::Delivered::Launched(ef::Outcome::Running { pid })) => {
+                    println!("{name} running on {host} (pid {pid}, {})", profile.as_env());
+                    0
+                }
+                Ok(ef::Delivered::Launched(ef::Outcome::ExitedEarly { log_tail })) => {
+                    eprintln!("{name} exited right after launch. Its last output:\n{log_tail}");
+                    for f in ef::diagnose(&log_tail) { eprint!("\n{}", f.render()); }
+                    1
+                }
+                Ok(ef::Delivered::Installed { path }) => {
+                    println!("installed tool {path} (not an app: no AppLoad entry)");
+                    0
+                }
+                Ok(ef::Delivered::Registered { manifest_dir, change }) => {
+                    if let Some(n) = change.note() { eprintln!("  {n}"); }
+                    println!("{name} installed for AppLoad ({manifest_dir}); on the tablet open AppLoad from the sidebar and tap ↻ once");
+                    if activation.is_some() {
+                        println!("  (xovi is not running since the last boot: `gitmind eink activate {host}` first)");
+                    }
+                    0
+                }
+                Err(e) => eink_err(&e),
+            }
+        }
+        "build" => {
+            let Some(bin) = pos.first() else { return err(USAGE) };
+            let (probe, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
+            let (route, _) = match d.readiness() { Ok(r) => r, Err(e) => return eink_err(&e) };
+            let root = cockpit::ops::repo_root();
+            let Some(app) = ef::discover_tablet_apps(&root).into_iter().find(|a| a.bin == **bin) else {
+                return eink_err(&format!("{bin}: not an eink-kit app in {}", root.display()));
+            };
+            let mut t = ef::build_target_for(&route, probe.model, userland);
+            if userland == ef::Userland::AlpineRoot {
+                // Built against the SAME Alpine release as the root it runs in.
+                let st = match ef::Remote::run(&mut remote, &cockpit::alpine_root::probe_cmd()) {
+                    Ok(o) => cockpit::alpine_root::parse_probe(&o), Err(e) => return eink_err(&e) };
+                if !st.root { return eink_err(&st.not_ready().unwrap_or_default()); }
+                t.container_image = st.release.as_deref().and_then(cockpit::alpine_root::image_for_release);
+                eprintln!("  Alpine root {}: building with {}", st.release.as_deref().unwrap_or("?"), t.container_image.as_deref().unwrap_or("the default image"));
+            }
+            let engine = match opt(flags, "--engine") {
+                Some(e) => match ef::Engine::parse(e) { Some(e) => e, None => return eink_err("--engine: auto|host|container") },
+                None => ef::Engine::Auto,
+            };
+            let caps = cockpit::capabilities::load(&cockpit::tablet_identity::device_key(&host));
+            if caps.is_none() { eprintln!("  (no hardware survey for {host}: default features; `gitmind eink survey {host}`)"); }
+            let plan = match ef::plan_build_for(engine, &root, &app, &t, &std::env::var("PATH").unwrap_or_default(),
+                std::env::var("HOME").ok().as_deref(), std::env::var("CARGO").ok().as_deref(), caps.as_ref()) {
+                Ok(p) => p,
+                Err(e) => return eink_err(&e),
+            };
+            eprintln!("  {}", plan.note);
+            eprintln!("  $ {}  (in {}; {})", plan.argv.join(" "), plan.cwd.display(), t.why);
+            // The shim patch rewrites Cargo.lock: saved and restored around the build.
+            let st = ef::with_lock_preserved(&plan, || std::process::Command::new(&plan.argv[0]).args(&plan.argv[1..]).current_dir(&plan.cwd).envs(plan.env.clone()).status());
+            match st {
+                Ok(s) if s.success() => {}
+                Ok(s) => return eink_err(&format!("build failed ({s})")),
+                Err(e) => return eink_err(&format!("could not run {}: {e}", plan.argv[0])),
+            }
+            let native = ef::native_for(&t);
+            let rel = ef::tablet_build_output(bin, &t, native);
+            let Some(path) = [plan.output.clone()].into_iter().chain(app.dir.ancestors().map(|d| d.join(&rel))).find(|p| p.exists()) else {
+                return eink_err(&format!("built, but {} not found", plan.output.display()));
+            };
+            let path = path.to_string_lossy().to_string();
+            match ef::preflight_binary_for(&path, &route, probe.model, userland) {
+                Ok(_) => { println!("{path}"); 0 }
+                Err(e) => eink_err(&format!("built, but it will not run on the tablet: {e}")),
+            }
+        }
+        "list" | "remove" => {
+            let (_, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
+            let Some(dir) = d.appload_dir else { return eink_err("AppLoad is not installed on this tablet") };
+            if sub == "list" {
+                match ef::appload_list_cmd(&dir).and_then(|c| ef::Remote::run(&mut remote, &c)) {
+                    Ok(out) => {
+                        for (n, t) in ef::parse_appload_list(&out) { println!("{n}\t{t}"); }
+                        0
+                    }
+                    Err(e) => eink_err(&e),
+                }
+            } else {
+                let Some(app) = pos.first() else { return err(USAGE) };
+                match ef::appload_remove_cmd(app, &dir).and_then(|c| ef::Remote::run(&mut remote, &c)) {
+                    Ok(out) => { println!("{}", out.trim()); 0 }
+                    Err(e) => eink_err(&e),
+                }
+            }
+        }
+        "activate" => {
+            let (_, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
+            match d.readiness() {
+                Ok((_, None)) if d.screen_ready() => { println!("{host}: already active, apps can reach the screen"); 0 }
+                Ok((_, None)) => eink_err("no display server is running and none can be started from here \
+                    (AppLoad without xovi's start script, or no launcher configured)"),
+                Ok((_, Some(a))) => {
+                    eprintln!("  · {}", a.label());
+                    match ef::Remote::run(&mut remote, &ef::activation_cmd(a)) {
+                        Ok(out) => { println!("{}", out.trim()); 0 }
+                        Err(e) => eink_err(&e),
+                    }
+                }
+                Err(e) => eink_err(&e),
+            }
+        }
+        "restart-ui" => match ef::Remote::run(&mut remote, ef::RESTART_UI_CMD) {
+            Ok(out) => { println!("tablet UI restarted ({}): AppLoad has re-read every manifest", out.trim()); 0 }
+            Err(e) => eink_err(&e),
+        },
+        "survey" => match ef::Remote::run(&mut remote, &cockpit::capabilities::survey_cmd()) {
+            Ok(out) => {
+                let _ = cockpit::capabilities::save(&cockpit::tablet_identity::device_key(&host), &out);
+                for l in cockpit::capabilities::parse(&out).summary() { println!("{l}"); }
+                println!("(saved; builds for {host} use it)");
+                0
+            }
+            Err(e) => eink_err(&e),
+        },
+        "wifi-ssh" => {
+            let (_, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
+            if !d.wlan_ssh_tool {
+                return eink_err("this tablet has no rm-ssh-over-wlan (not a Paper Pro-family OS?); SSH over Wi-Fi may already be on");
+            }
+            match ef::Remote::run(&mut remote, ef::WLAN_SSH_ON) {
+                Ok(out) => { println!("{}\nSSH over Wi-Fi is on; the Wi-Fi address is under the password in Copyrights and licenses", out.trim()); 0 }
+                Err(e) => eink_err(&e),
+            }
+        }
+        // Packages on the tablet, like a laptop: an Alpine userland under /home.
+        //   pkg <host> runner <alpine-run binary>   install the runner (build it with `build <host> alpine-run`)
+        //   pkg <host> bootstrap [--mirror URL] [--branch B]
+        //   pkg <host> add|del <pkg>...   pkg <host> list|update
+        //   pkg <host> audio               install bluez-alsa and start it for this boot
+        "pkg" => {
+            use cockpit::alpine_root as al;
+            let action = pos.first().map(|s| s.as_str()).unwrap_or("");
+            let names: Vec<&str> = pos.iter().skip(1).map(|s| s.as_str()).collect();
+            let mirror = al::Mirror {
+                base: opt(flags, "--mirror").unwrap_or(al::DEFAULT_MIRROR).to_string(),
+                branch: opt(flags, "--branch").unwrap_or(al::DEFAULT_BRANCH).to_string(),
+            };
+            // A depot mirror is asked first whether it can satisfy the whole
+            // install (dependency closure vs what was ingested); a partial
+            // mirror otherwise fails halfway with a bare 404.
+            let wanted: Vec<&str> = match action {
+                "bootstrap" => ["apk-tools-static", "alpine-keys"].into_iter().chain(al::BASE_PACKAGES.iter().copied()).collect(),
+                "add" | "check" => names.clone(),
+                "audio" => vec!["bluez-alsa", "bluez-alsa-utils", "alsa-utils"],
+                _ => vec![],
+            };
+            if !wanted.is_empty() && !cli_flag(flags, "--force") {
+                let arch = match ef::Remote::run(&mut remote, "uname -m") { Ok(a) => a.trim().to_string(), Err(e) => return eink_err(&e) };
+                match al::check_mirror(&mirror, &arch, &wanted) {
+                    Some(Ok(c)) if c.ok() => eprintln!("depot has everything: {} package(s) for {arch}", c.needed),
+                    Some(Ok(c)) => {
+                        eprintln!("the depot cannot satisfy this install for {arch}:");
+                        for k in &c.absent_repos { eprintln!("  no repository {k}"); }
+                        for (k, f) in &c.missing { eprintln!("  missing {k}/{f}"); }
+                        for u in &c.unresolved { eprintln!("  nothing provides {u}"); }
+                        eprintln!("\n{}", c.fetch_script());
+                        eprintln!("(--force to try anyway)");
+                        return 1;
+                    }
+                    Some(Err(e)) => return eink_err(&format!("asking the depot: {e}")),
+                    None => {} // not a depot: apk reports as usual
+                }
+                if action == "check" { return 0; }
+            }
+            let cmd = match action {
+                "check" => return eink_err("pkg check <host> <package>... --mirror <depot>/alpine (only a depot can be asked)"),
+                "runner" => {
+                    let Some(bin) = names.first() else { return eink_err("pkg runner <path to the built alpine-run>") };
+                    let (probe, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
+                    let route = d.readiness().map(|r| r.0).unwrap_or(ef::Route::AppLoad { dir: String::new() });
+                    if let Err(e) = ef::preflight_binary(bin, &route, probe.model) { return eink_err(&e); }
+                    if let Err(e) = ef::Remote::run(&mut remote, &ef::prepare_cmd()) { return eink_err(&e); }
+                    if let Err(e) = ef::Remote::push(&mut remote, bin, &ef::staging_path("alpine-run")) { return eink_err(&e); }
+                    match ef::install_cmd("alpine-run") { Ok(c) => c, Err(e) => return eink_err(&e) }
+                }
+                "bootstrap" => al::bootstrap_cmd(&mirror),
+                "add" => match al::add_cmd(&names) { Ok(c) => c, Err(e) => return eink_err(&e) },
+                "del" => match al::del_cmd(&names) { Ok(c) => c, Err(e) => return eink_err(&e) },
+                "list" => al::list_cmd(),
+                "update" => al::update_cmd(),
+                "audio" => format!("{} && {}", al::add_cmd(&["bluez-alsa", "bluez-alsa-utils", "alsa-utils"]).unwrap(), al::bluealsa_start_cmd()),
+                _ => return eink_err("pkg <host> runner|bootstrap|add|del|list|update|audio|check ..."),
+            };
+            match ef::Remote::run(&mut remote, &cmd) {
+                Ok(out) => { println!("{}", out.trim_end()); 0 }
+                Err(e) => eink_err(&e),
+            }
+        }
+        "retrust" if cockpit::tablet_identity::usb_link_for(&host).is_some() => {
+            let l = cockpit::tablet_identity::usb_link_for(&host).unwrap();
+            match cockpit::tablet_identity::untrust(&l) { Ok(m) => { println!("{m}; enrol again to trust its new key"); 0 } Err(e) => eink_err(&e) }
+        }
+        "retrust" => match cockpit::deploy::retrust_host(&host) {
+            Ok(m) => { println!("{m}"); 0 }
+            Err(e) => eink_err(&e),
+        },
+        "stop" | "status" => {
+            let Some(app) = pos.first() else { return err(USAGE) };
+            let cmd = if sub == "stop" { ef::stop_cmd(app) } else { ef::status_cmd(app, 0) };
+            let cmd = match cmd { Ok(c) => c, Err(e) => return eink_err(&e) };
+            match cockpit::eink_fleet::Remote::run(&mut remote, &cmd) {
+                Ok(out) if sub == "status" => {
+                    let st = ef::parse_status(&out);
+                    match st.pid { Some(p) => println!("{app}: running (pid {p})"), None => println!("{app}: stopped") }
+                    if !st.log_tail.is_empty() { println!("{}", st.log_tail); }
+                    for f in ef::diagnose(&st.log_tail) { print!("\n{}", f.render()); }
+                    0
+                }
+                Ok(_) => { println!("{app}: stopped"); 0 }
+                Err(e) => eink_err(&e),
+            }
+        }
+        _ => err(USAGE),
+    }
+}
+
+/// `gitmind eink` flags that take a value (the next argument).
+const EINK_VALUE_FLAGS: &[&str] = &["--user", "--name", "--title", "--icon", "--profile", "--engine", "--mirror", "--branch", "--userland"];
+
+/// Positional arguments: everything that is neither a flag nor a value
+/// flag's value. (Dropping only the `--x` tokens kept their values, so
+/// `pkg add bluez-alsa --mirror URL` tried to install a package named URL.)
+fn eink_positionals(flags: &[String]) -> Vec<&String> {
+    let mut out = Vec::new();
+    let mut skip = false;
+    for a in flags {
+        if skip {
+            skip = false;
+        } else if a.starts_with("--") {
+            skip = EINK_VALUE_FLAGS.contains(&a.as_str());
+        } else {
+            out.push(a);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod eink_args_tests {
+    #[test]
+    fn value_flags_do_not_leak_into_positionals() {
+        let v: Vec<String> = ["add", "bluez-alsa", "--mirror", "http://d/alpine", "--force", "alsa-utils", "--user", "root"].iter().map(|s| s.to_string()).collect();
+        let p: Vec<&str> = super::eink_positionals(&v).iter().map(|s| s.as_str()).collect();
+        assert_eq!(p, vec!["add", "bluez-alsa", "alsa-utils"]);
+        let d: Vec<String> = ["--name", "X", "./bin/app"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(super::eink_positionals(&d), vec!["./bin/app"], "deploy <host> --name X <bin>");
+    }
+}
+
+fn cli_flag(flags: &[String], name: &str) -> bool {
+    flags.iter().any(|f| f == name)
+}
+
+/// An eink error, followed by what gitmind can say about it (stoat's lesson:
+/// a failure is explained, not just reported): rustc-style findings with
+/// notes, help and any fix to copy.
+fn eink_err(msg: &str) -> i32 {
+    let code = err(msg);
+    for f in cockpit::eink_fleet::diagnose(msg) {
+        eprint!("\n{}", f.render());
+    }
+    code
+}
+
+fn remote_probe(remote: &mut cockpit::eink_fleet::SshRemote) -> Result<(cockpit::eink_fleet::Probe, cockpit::eink_fleet::Displays), String> {
+    use cockpit::eink_fleet::{self as ef, Remote};
+    let p = ef::parse_probe(&remote.run(ef::probe_cmd())?);
+    let d = ef::parse_displays(&remote.run(ef::displays_probe_cmd())?);
+    Ok((p, d))
+}
 
 fn cmd_fleet(rest: &[String]) -> i32 {
     use cockpit::flow;

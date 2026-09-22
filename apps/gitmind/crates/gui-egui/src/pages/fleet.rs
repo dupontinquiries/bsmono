@@ -620,7 +620,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     }
     let log = app.task.log();
     if !log.is_empty() {
-        uikit_egui::scroll::log(ui, &log, 200.0);
+        crate::show::task_log(ui, "fleet", &log, 200.0);
     }
     if !app.fleet.note.is_empty() {
         ui.add_space(6.0);

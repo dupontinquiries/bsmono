@@ -13,6 +13,12 @@ pub mod build_report;
 pub mod buildsystem;
 pub mod daemons;
 pub mod deploy;
+pub mod alpine_root;
+pub mod capabilities;
+pub mod tablet_identity;
+pub mod eink_fleet;
+pub mod elf_deps;
+pub mod finding;
 pub mod device_firewall;
 pub mod fleet;
 /// A LAN apk mirror: what may be cached forever, and what must not be.

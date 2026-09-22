@@ -17,7 +17,12 @@ required-features = ["app"]
 # Default-on so `cargo build --release` (what the build orchestrator runs — see
 # manifest/projects.toml) produces the deploy binary directly, same convention
 # as bo-suite-egui / rusty-board-egui.
-default = ["app", "tree-sitter", "engine"]
+default = ["app", "tree-sitter", "engine", "voice"]
+# Spoken input in the voice-command mode (uikit's voice popup: microphone
+# capture + whisper transcription). A feature so a device without a mic or
+# the memory for a speech model builds without it (whisper.cpp is a C++
+# build); the mode still works by typing. Default-on for desktops.
+voice = ["uikit-egui/voice-popup"]
 # The IN-PROCESS wgpu inference engine (aperture-engine + gpu-gemm).
 #
 # DEFAULT-ON, and that is the requirement rather than a preference: aperture
@@ -48,10 +53,16 @@ aperture-complete = { workspace = true }
 aperture-lsp = { workspace = true }
 aperture-engine = { workspace = true }
 egui = { workspace = true }
-uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui", features = ["voice-popup"] }
+uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
 snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../../../shared/settings-kit" }
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
 
 [dev-dependencies]
 egui_kittest = { version = "0.34", features = ["wgpu", "snapshot"] }
+
+# What gitmind's per-device feature selection needs to know: builds for a
+# device without these drop the feature (see cockpit::capabilities).
+[package.metadata.gitmind.needs]
+voice = ["audio-in", "memory:3000"]
+engine = ["gpu"]

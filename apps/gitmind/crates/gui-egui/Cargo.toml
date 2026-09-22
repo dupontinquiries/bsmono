@@ -36,6 +36,9 @@ egui_extras = { version = "0.34", features = ["image", "file"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
 cockpit = { path = "../cockpit" }
+# Letter-tile icons for AppLoad's sidebar, drawn with the same rasterizer the
+# tablet uses. Same egui 0.34 as this crate.
+eink-kit = { path = "../../../../shared/eink-kit" }
 # The peek engine, same as the Qt gui links. PeekViewer's whole job is calling
 # peek::view::read_to_string — the spec grammar (5xx, 5k, @symbol, A-B) is
 # parsed there, so the port is a viewer over an existing call rather than a

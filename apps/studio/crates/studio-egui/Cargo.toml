@@ -6,7 +6,7 @@ description = "Studio's timeline UI on uikit-egui: tracks, clips, ruler, and the
 
 [dependencies]
 # For SMPTE ruler labels — see `ruler_label`.
-studio-video = { path = "../studio-video" }
+studio-video = { path = "../studio-video", default-features = false }
 # The live rack model. A dependency rather than a copy: the grid is a VIEW of
 # the pattern, and a second definition of what a step is would drift from the
 # one the audio thread reads.
@@ -30,3 +30,6 @@ uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
 # uikit-egui's PaletteColors is constructed from a snapclone-theme Palette and
 # has no Default, so a test that drives the real widget needs the source type.
 snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
+
+[features]
+opus = ["studio-video/opus"]

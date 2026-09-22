@@ -84,6 +84,14 @@ pub fn bounce(dir: &Path, state: &PadState, format: BounceFormat)
         format!("morph-{}", state.anchors.iter()
             .map(|(n, _)| sanitize_stem(n)).collect::<Vec<_>>().join("-"))
     };
+    // Resolve what will actually be written BEFORE naming the file: a build
+    // without Opus used to fall back to FLAC bytes inside a `.opus` file,
+    // which the library then failed to decode as Opus.
+    let format = match format {
+        BounceFormat::Wav | BounceFormat::Flac => format,
+        _ if !crate::OPUS_BUILT => BounceFormat::Flac,
+        f => f,
+    };
     let ext = format.ext();
     let mut path = out_dir.join(format!("{stem}.{ext}"));
     let mut n = 1u32;
@@ -215,9 +223,12 @@ mod tests {
         (pad.x, pad.y) = (0.3, 1.0);
         let first = bounce(&dir, &pad, BounceFormat::Opus192).expect("bounces");
         assert!(first.starts_with(dir.join("morphs")));
-        assert_eq!(first.extension().unwrap(), "opus",
-                   "the default is high-quality opus, not a phone-filling wav");
-        let back = studio_media::decode_bytes(std::fs::read(&first).unwrap(), Some("opus"))
+        // With Opus: high-quality opus. Without: FLAC, named .flac (never
+        // FLAC bytes in a .opus file), still smaller than a wav.
+        let want = if crate::OPUS_BUILT { "opus" } else { "flac" };
+        assert_eq!(first.extension().unwrap(), want,
+                   "the default is compressed, not a phone-filling wav");
+        let back = studio_media::decode_bytes(std::fs::read(&first).unwrap(), Some(want))
             .expect("the library can decode its own bounce");
         assert_eq!(back.sample_rate, 48_000);
         assert!(back.frames() >= 20_000);
@@ -236,6 +247,7 @@ mod tests {
                 "an empty pad refuses out loud");
     }
 
+    #[cfg(feature = "audio")] // compares Opus bitrates
     #[test]
     fn voice_bitrate_rungs_bounce_smaller_than_music_ones() {
         let dir = std::env::temp_dir()

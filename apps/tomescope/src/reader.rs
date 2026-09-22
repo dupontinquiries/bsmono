@@ -5,7 +5,7 @@
 
 use crate::content::{BookContent, Locus, LocusRange};
 use crate::layout::{ApproxMeasurer, Page, Pagination, PaginationCache, Typography};
-use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2};
+use egui::{self, Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use uikit_egui::{motion, palette_colors, tokens, PaletteColors};
 use uikit_egui::{Direction, GestureConfig};
 use uikit_egui::GestureLayer;
@@ -481,7 +481,7 @@ pub fn page_turn_offset(ctx: &egui::Context, anim: &PageTurnAnim, page_width: f3
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eframe::egui::{Pos2, Rect};
+    use egui::{Pos2, Rect};
 
     #[test]
     fn tap_zones_split_thirds() {

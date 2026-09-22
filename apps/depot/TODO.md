@@ -37,7 +37,7 @@ Unverified or unbuilt, in the order they matter.
       (Anaconda environment picker needs comps).
 - [ ] rustup dist-server layout (channel manifest + dated paths) so
       `RUSTUP_DIST_SERVER` works unchanged — MANUAL §10.
-- [ ] apk repositories for postmarketOS/Alpine (fifth projection:
+- [x] apk repositories for postmarketOS/Alpine (fifth projection:
       `APKINDEX.tar.gz` from `.apk` control segments).
 - [ ] HTTPS listener behind `depot_httpd::Handler` if a fleet wants it.
 - [ ] Terminal: a websocket/SSE transport for lower latency (the `Terminals`

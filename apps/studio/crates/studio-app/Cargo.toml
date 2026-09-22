@@ -15,14 +15,14 @@ required-features = ["app"]
 studio-core = { path = "../studio-core" }
 studio-collab = { path = "../studio-collab" }
 studio-audio = { path = "../studio-audio" }
-studio-egui = { path = "../studio-egui" }
+studio-egui = { path = "../studio-egui", default-features = false }
 studio-live = { path = "../studio-live" }
 voice-engine-kit = { path = "../../../../shared/voice-engine-kit", features = ["voice"] }
 studio-fx = { path = "../studio-fx" }
 studio-voice = { path = "../studio-voice" }
-studio-media = { path = "../studio-media" }
+studio-media = { path = "../studio-media", default-features = false }
 audio-kit = { path = "../../../../shared/audio-kit" }
-studio-video = { path = "../studio-video" }
+studio-video = { path = "../studio-video", default-features = false }
 # bscale as a library job (GPU via wgpu 29 behind its default-on `gpu` feature).
 d2x-job = { path = "../../../bscale/crates/d2x-job" }
 serde = { version = "1", features = ["derive"] }
@@ -50,9 +50,16 @@ app = ["dep:eframe"]
 # Loop audition through cpal. Off => NullSink: the app still runs, silently,
 # with a wall-clock playhead — a build box without ALSA headers must not lose
 # the ability to build the editor.
-audio = ["dep:cpal"]
+# Sound: cpal output, and Opus decode through the media stack (libopus, C).
+# Off, studio builds codec-free with no audio device (a Paper Pro without
+# Bluetooth audio running; see [package.metadata.gitmind.needs]).
+audio = ["dep:cpal", "studio-media/opus", "studio-video/opus", "studio-egui/opus"]
 # The native file dialog (XDG portal on Linux). Off => the export flow falls
 # back to ./exports and the status line says so — a headless build must not
 # lose the exporter, the audio feature's own reasoning.
 picker = ["dep:rfd"]
 midi = ["dep:midir"]
+
+[package.metadata.gitmind.needs]
+audio = ["audio-out"]
+midi = ["audio-out"]

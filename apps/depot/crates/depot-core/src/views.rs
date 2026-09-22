@@ -31,6 +31,7 @@ impl Views<'_> {
             self.rebuild_rpm_repo(repo)?;
         }
         self.rebuild_nix()?;
+        self.rebuild_alpine()?;
         self.rebuild_toolchains()?;
         Ok(())
     }
@@ -145,6 +146,24 @@ impl Views<'_> {
             let info = std::fs::read(self.store.object_path(&e.narinfo))?;
             write_atomic(&base.join(format!("{}.narinfo", e.hash_part)), &info)?;
             self.store.link_into(&e.nar_hash, &base.join(&e.nar_url))?;
+        }
+        Ok(())
+    }
+
+    // ── alpine ───────────────────────────────────────────────────────────────
+
+    /// The signed index and every ingested package, hardlinked byte-for-byte.
+    pub fn rebuild_alpine(&self) -> Result<()> {
+        for (key, repo) in &self.catalog.alpine {
+            crate::alpine::check_key(key)?;
+            let base = self.pub_dir().join("alpine").join(key);
+            std::fs::create_dir_all(&base)?;
+            let idx = base.join("APKINDEX.tar.gz");
+            let _ = std::fs::remove_file(&idx); // the index is replaced by a newer one
+            self.store.link_into(&repo.index, &idx)?;
+            for p in &repo.packages {
+                self.store.link_into(&p.hash, &base.join(&p.filename))?;
+            }
         }
         Ok(())
     }

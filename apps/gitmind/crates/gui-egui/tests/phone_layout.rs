@@ -91,3 +91,54 @@ fn every_text_field_has_a_stable_id() {
         missing.join("\n")
     );
 }
+
+/// The Tablets page shows most of its content only after a probe, which the
+/// default-state sweep above never reaches. Draw it populated: a found Paper
+/// Pro with an unknown motd codename, a deploy target, and a multi-line result.
+#[test]
+fn the_populated_tablets_page_fits_a_phone() {
+    use cockpit::eink_fleet as ef;
+    let mut app = App::default();
+    app.tab = Tab::Tablets;
+    let probe = ef::parse_probe("machine=reMarkable Ferrari\nmotd=marshmallow\narch=aarch64");
+    // after a reboot: xovi not started, /etc volatile; host key changed by an OS update
+    let displays = ef::parse_displays("appload_dir=/home/root/xovi/exthome/appload\nglibc=2.39\nxovi_installed=1\n\
+        rootfs_ro=1\netc_overlay=1\n");
+    *app.tablets.hostkey_changed.lock().unwrap() = true;
+    app.tablets.confirm = Some(gitmind_egui::pages::tablets::Confirm::Activate(ef::Activation::StartXovi));
+    *app.tablets.found.lock().unwrap() = Some((probe, displays));
+    app.tablets.bin_path = "/home/user/build/aarch64-unknown-linux-gnu/release/eink-demo".into();
+    // AppLoad route shows the sidebar options; a populated installed list
+    // with a pending remove confirmation is the widest state of that part.
+    *app.tablets.installed.lock().unwrap() = vec![
+        ("eink-demo".into(), "eink demo".into()),
+        ("tomescope-eink".into(), "A rather long sidebar title for a reader".into()),
+    ];
+    app.tablets.remove_confirm = Some("tomescope-eink".into());
+    app.tablets.display_name = "eink demo".into();
+    // Two findings (a guessed model and a missing library): two callouts on
+    // one page clashed widget ids before they were scoped by code.
+    app.tablets.last_result = "eink-demo exited right after launch:\neink: model PaperPro (GUESS from architecture (device tree said \"\"); set EINK_MODEL)\n\
+        eink-demo: libblight_protocol not found (tried [\"libblight_protocol.so\"]; is Oxide installed? set EINK_BLIGHT_LIB)".into();
+    let r = layout_probe::probe(egui::vec2(PHONE[0], PHONE[1]), 3, true, |ctx| app.ui(ctx));
+    assert!(r.overlaps.is_empty() && r.offscreen.is_empty() && r.clipped.is_empty() && r.id_clashes.is_empty(),
+        "populated Tablets page at {}×{}:\n{}", PHONE[0], PHONE[1], r.describe());
+}
+
+/// The Diagnostics page shows its verdicts only once output is pasted in:
+/// draw it with all three analysers populated (a vendor-only udev verdict
+/// with its copyable fix, the fastboot bulk-transfer signature, kernel
+/// records at several levels) and check it still fits a phone.
+#[test]
+fn the_populated_diagnostics_page_fits_a_phone() {
+    let mut app = App::default();
+    app.tab = Tab::Diagnostics;
+    app.diagnostics.udev_vid = "18d1".into();
+    app.diagnostics.udev_pid = "4ee0".into();
+    app.diagnostics.udev_rules = "SUBSYSTEM!=\"usb\", GOTO=\"end\"\nATTR{idVendor}==\"18d1\", GOTO=\"google\"\nGOTO=\"end\"\nLABEL=\"google\"\nATTR{idProduct}==\"4ee7\", MODE=\"0660\"\nLABEL=\"end\"\n".into();
+    app.diagnostics.fastboot_out = "getvar:all   FAILED (Write to device failed (No such file or directory))\n".into();
+    app.diagnostics.kernel_log = "<3>[    1.234567] dwc3 a600000.usb: failed to enable ep0out\n<4>[    2.000001] thermal: sensor 5 not ready\n<6>[    3.141592] usb 1-1: new high-speed USB device number 2 using xhci_hcd\n".into();
+    let r = layout_probe::probe(egui::vec2(PHONE[0], PHONE[1]), 3, true, |ctx| app.ui(ctx));
+    assert!(r.overlaps.is_empty() && r.offscreen.is_empty() && r.clipped.is_empty() && r.id_clashes.is_empty(),
+        "populated Diagnostics page at {}×{}:\n{}", PHONE[0], PHONE[1], r.describe());
+}

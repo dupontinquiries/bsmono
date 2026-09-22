@@ -183,13 +183,13 @@ pub struct Chrome {
     layer: Layer,
     /// Whether the separate settings window is open.
     settings_window: bool,
-    /// The layout sidebar is GONE, not collapsed.
-    ///
-    /// It was a 64pt column duplicating `layout.letters` and
-    /// `layout.geometry` from the settings page. Collapsing it by default (the
-    /// previous fix) made it cheap; removing it makes the duplication
-    /// impossible, which is the difference between a tidy screen and one
-    /// setting with one home.
+    // The layout sidebar is GONE, not collapsed.
+    //
+    // It was a 64pt column duplicating `layout.letters` and
+    // `layout.geometry` from the settings page. Collapsing it by default (the
+    // previous fix) made it cheap; removing it makes the duplication
+    // impossible, which is the difference between a tidy screen and one
+    // setting with one home.
 }
 
 impl Chrome {

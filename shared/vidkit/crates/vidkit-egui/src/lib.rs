@@ -25,6 +25,8 @@
 
 pub mod bar;
 pub mod chrome;
+/// Declares the video picture to an e-ink runtime (eink-kit); inert elsewhere.
+pub mod eink_hint;
 pub mod fit;
 pub mod glass;
 pub mod palette;

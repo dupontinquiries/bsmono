@@ -234,14 +234,17 @@ fn run(cli: &Cli) -> Result<(), String> {
             if cli.flag("toolchains") {
                 sel.toolchains = true;
             }
+            if cli.flag("alpine") {
+                sel.alpine = true;
+            }
             let repos = cli.opt_all("rpm");
             if repos.iter().any(|r| *r == "*") {
                 sel.rpm = Some(Vec::new());
             } else if !repos.is_empty() {
                 sel.rpm = Some(repos.iter().map(|s| s.to_string()).collect());
             }
-            if !sel.crates && sel.rpm.is_none() && !sel.nix && !sel.toolchains {
-                return Err("nothing selected: --all, or any of --crates --rpm ID --nix --toolchains".into());
+            if !sel.crates && sel.rpm.is_none() && !sel.nix && !sel.toolchains && !sel.alpine {
+                return Err("nothing selected: --all, or any of --crates --rpm ID --nix --toolchains --alpine".into());
             }
             let rep = d.pack(&sel, &have, Path::new(out), cli.flag("unsigned")).map_err(|e| e.to_string())?;
             let size = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
@@ -254,7 +257,7 @@ fn run(cli: &Cli) -> Result<(), String> {
             let rep = d.unpack(Path::new(f), cli.flag("allow-unsigned")).map_err(|e| e.to_string())?;
             println!("{f}: signed by {}", rep.signer.as_deref().unwrap_or("NOBODY (allowed by --allow-unsigned)"));
             println!("  objects: {} new, {} already here ({})", rep.objects_new, rep.objects_present, human(rep.bytes));
-            println!("  catalog: {} crate versions, {} rpms, {} nix paths, {} toolchain files new", rep.crates_new, rep.rpm_new, rep.nix_new, rep.toolchain_new);
+            println!("  catalog: {} crate versions, {} rpms, {} nix paths, {} toolchain files, {} alpine repos new", rep.crates_new, rep.rpm_new, rep.nix_new, rep.toolchain_new, rep.alpine_new);
             Ok(())
         }
         "inspect" => {
@@ -341,7 +344,7 @@ fn ingest(cli: &Cli, args: &[&str]) -> Result<(), String> {
     let mut d = open(cli)?;
     let (kind, files) = match args {
         [k, rest @ ..] if !rest.is_empty() => (*k, rest),
-        _ => return Err("usage: depot ingest (crate|rpm --repo ID|nix|toolchain) PATH...".into()),
+        _ => return Err("usage: depot ingest (crate|rpm --repo ID|nix|toolchain|alpine) PATH...".into()),
     };
     match kind {
         "crate" => {
@@ -372,6 +375,19 @@ fn ingest(cli: &Cli, args: &[&str]) -> Result<(), String> {
             for f in files {
                 let rep = d.ingest_nix_dir(Path::new(f)).map_err(|e| e.to_string())?;
                 println!("{f}: {} store paths ({} new NARs)", rep.paths, rep.new_nars);
+                for e in rep.errors {
+                    eprintln!("SKIP {e}");
+                }
+            }
+        }
+        // A tree laid out like an Alpine mirror: <branch>/<repo>/<arch>/
+        // with APKINDEX.tar.gz and any subset of its .apk files. Served at
+        // /alpine/... byte-for-byte (clients keep verifying Alpine's keys).
+        "alpine" | "apk" => {
+            for f in files {
+                let rep = d.ingest_alpine_dir(Path::new(f)).map_err(|e| e.to_string())?;
+                println!("{f}: {} repo(s), {} package(s) ({} new), {} named by an index but not ingested",
+                    rep.repos, rep.packages, rep.new_packages, rep.not_ingested);
                 for e in rep.errors {
                     eprintln!("SKIP {e}");
                 }

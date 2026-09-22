@@ -3,7 +3,7 @@
 //! illustrations or diagrams in a textbook.
 
 use crate::content::{BookContent, Locus, TocEntry};
-use eframe::egui::{self, RichText, ScrollArea};
+use egui::{self, RichText, ScrollArea};
 use uikit_egui::PaletteColors;
 
 /// Draw a hierarchical table of contents. Returns `Some(locus)` if an
