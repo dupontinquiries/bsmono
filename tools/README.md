@@ -1,7 +1,8 @@
 # tools
 
 Standalone helper binaries used across the monorepo: `astfind`, `drift`,
-`health`, `kbm3`, `kitfinder`, `peek`, `rustcheck`, `sanity`.
+`health`, `kbm3`, `kitfinder`, `peek`, `rustcheck`, `sanity` -- and the Python
+helpers `gitsweep`, `chunkup`, `chatgrep` and `coursekit` (C20).
 
 ## `cargo-ailite` is NOT here
 

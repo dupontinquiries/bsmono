@@ -1,0 +1,162 @@
+# exclude-ip.txt — units matching any line are left out of the upload entirely.
+#
+# One regex per line, case-insensitive, matched against the unit's relative
+# path. '#' starts a comment. This is a FILE and not baked into chunkup on
+# purpose: what belongs here is a judgement call that is yours, and it needs
+# to be reviewable and diffable rather than buried in a tool.
+#
+# Derived from the 1,012 names in model_tuning.json and the folder names in
+# the navigation log. Matching is by NAME ONLY, which has two consequences
+# worth stating plainly:
+#
+#   * A rip named neutrally does not match. "bot_lucifer", "flyer_valkyrie",
+#     "spaceship_nemesis" and ~430 others matched nothing, and that is not
+#     evidence they are clean — only that the filename does not say.
+#   * A match is not a legal conclusion. Some lines below are copyright in a
+#     mesh (a ripped game asset); others are trademark or trade dress (a model
+#     of a real car or aircraft), which is a different question with different
+#     answers depending on use. They are grouped so you can take the sections
+#     separately. I am not a lawyer and this list is a starting point for your
+#     review, not a ruling.
+
+# ── Ripped game / film assets — the clearest category ────────────────────
+# 512 of 1,012 model_tuning entries match this block alone.
+transformer
+cybertron
+optimus
+megatron
+bumblebee|bumble.?bee
+starscream
+soundwave
+shockwave
+grimlock
+\bjazz\b
+ratchet
+ironhide
+jetfire
+devastator
+scorponok|scorponok
+laserbeak
+ravage
+barricade
+sideswipe
+skywarp
+arcee
+zeta.?prime
+wheel.?jack|wheeljack
+insecticon
+combaticon
+menasor
+motormaster
+dragstrip
+deadend|dead.?end
+breakdown
+cliffjumper
+\bhound\b
+sludge
+snarl
+swoop
+\bslug\b
+warpath
+perceptor
+scattershot
+ultra.?magnus
+trypticon
+jhiaxus
+unicron
+autobot
+decepticon
+mixmaster
+demolishor
+\bjolt\b
+crosshairs
+hot.?rod
+elita
+omega
+slipstream
+blastoff
+airraid|air.?raid
+\brotf\b
+\bwfc\b
+\bfoc\b
+\btf[0-9]\b
+
+# Halo
+\bhalo\b
+\bunsc\b
+gravity.?hammer
+vorpal.?blade
+
+# Call of Duty
+call.?of.?duty
+advanced.?warfare
+mw2019
+razorback.?vtol
+
+# Star Wars
+star.?wars
+tatooine
+dc.?17m
+att.?multi.?troop
+
+# Marvel / DC / other film + comic
+doom.?2099
+doctor.?octopus
+moon.?knight
+marvel
+rivals
+batwing
+deathstroke
+cherno.?alpha
+
+# Other games / anime
+omnitrix|ben.?ten
+wuthering.?waves|sigillum
+sazabi
+gundam
+godzilla|mechagodzilla
+starcraft
+mad.?max
+speed.?racer
+hot.?wheels
+fast.?furious
+death.?race.?2000
+
+# ── Real-world vehicles: trademark / trade dress, NOT the same question ──
+# Review this block separately. A model of a real car is not automatically
+# the same problem as a ripped game asset, but a rip OF a licensed racing
+# game's car is both. Comment the block out if you want it kept.
+ferrari
+porsche
+lamborghini|murcielago
+alfa.?romeo
+chevrolet|camaro
+dodge.?charger
+plymouth|barracuda
+renault|alpine.?a442
+peugeot
+bac.?mono
+ford.?falcon
+benelli
+
+# ── Real military hardware: same caveat as above ─────────────────────────
+f.?14b?.?tomcat
+f.?16c?
+f.?117|nighthawk
+mig.?25
+kfir.?c10
+harrier|av.?8b
+comanche|rah.?66
+c.?130j
+m270|mlrs
+btr.?80
+maz.?543
+bmd.?4
+spz.?puma
+ariete.?c1
+\bt.?35\b
+\bt.?70\b
+lynx.?6x6
+akdas|sa.?9
+sentoku.?i.?400
+lim.?6bis
