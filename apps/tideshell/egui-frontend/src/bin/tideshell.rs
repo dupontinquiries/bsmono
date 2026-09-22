@@ -39,6 +39,8 @@ struct Shellbox {
     ambient: tideshell_egui::sensors::Ambient,
     backlight: tideshell_egui::sensors::BacklightOut,
     sensor_status: (String, String),
+    /// A dropped-pointer-output notice was already written for the current EI state.
+    ei_drop_noted: bool,
 }
 
 impl Shellbox {
@@ -47,12 +49,26 @@ impl Shellbox {
             let o = match &a {
                 Action::SavePrefs if self.persist => effects::save_prefs(&self.shell.prefs),
                 Action::SavePrefs => Outcome::Done("prefs not persisted (TIDESHELL_PERSIST=0)".into()),
-                Action::Pointer(p) => match &self.ei {
-                    Some(ei) => {
-                        ei.send(*p);
+                // Only a Ready EI connection moves the pointer. Output sent to a
+                // failed one used to vanish silently (seen on the FP5: the
+                // trace showed clicks while ei was Failed(AccessDenied)); now
+                // the first dropped output per failure says so.
+                Action::Pointer(p) => match self.ei.as_ref().map(|e| e.status()) {
+                    Some(tideshell_egui::ei::Status::Ready) => {
+                        self.ei.as_ref().unwrap().send(*p);
                         continue;
                     }
-                    None => Outcome::Unwired("no EI connection"),
+                    other => {
+                        if self.ei_drop_noted {
+                            continue;
+                        }
+                        self.ei_drop_noted = true;
+                        Outcome::Unwired(match other {
+                            Some(tideshell_egui::ei::Status::Failed(_)) => "trackpad output dropped: EI failed (see the ei: line; cosmic-comp needs patch 0002)",
+                            Some(_) => "trackpad output dropped: EI not ready yet",
+                            None => "trackpad output dropped: no EI connection",
+                        })
+                    }
                 },
                 // Auto-brightness ramps send many of these: silent. Which
                 // backlight path works (or none) is in the status lines.
@@ -100,6 +116,7 @@ impl Shellbox {
             if self.ei_status.as_ref() != Some(&st) {
                 self.shell.note(format!("ei: {st:?}"));
                 self.ei_status = Some(st);
+                self.ei_drop_noted = false;
             }
         }
     }
@@ -176,6 +193,7 @@ fn main() {
         ambient: tideshell_egui::sensors::Ambient::spawn("/sys".into(), zbus::blocking::Connection::system().ok()),
         backlight: tideshell_egui::sensors::BacklightOut::spawn(std::path::Path::new("/sys"), zbus::blocking::Connection::system().ok()),
         sensor_status: (String::new(), String::new()),
+        ei_drop_noted: false,
     };
     // Auto-brightness ramps from the real current level, or not at all.
     if let Some(l) = sb.backlight.initial {
