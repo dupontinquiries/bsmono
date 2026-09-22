@@ -63,18 +63,35 @@ TEST_PIDS=()       # tests running in the background while the next crate builds
 # no tests to run, and reporting "0 tests" for it would hide the build error
 # behind a green number.
 TEST_JOBS="${FLEET_TEST_JOBS:-2}"
+
+# MACOS SHIPS BASH 3.2 (2007; Apple stopped at the last GPLv2 release), and
+# `#!/usr/bin/env bash` finds it unless a newer bash is earlier in PATH. Two
+# things below need more than 3.2, and both were hit on a Mac:
+#
+#   * `"${arr[@]}"` on an EMPTY array under `set -u` is "unbound variable"
+#     before bash 4.4. It killed the run in reap_tests once every test had
+#     finished. Every expansion that can be empty uses ${arr[@]+"${arr[@]}"},
+#     which expands to nothing when empty on every version.
+#   * `wait -n` is bash 4.3+. On 3.2 it fails at once, and the `|| true` hid
+#     that -- so the reaper became a busy loop burning a core until a test
+#     exited. Below 4.3 it sleeps briefly instead.
+if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
+    HAVE_WAIT_N=1
+else
+    HAVE_WAIT_N=0
+fi
 RUN_TESTS="${FLEET_TEST:-1}"
 
 reap_tests() {
     # Collect finished test runs. `wait -n` blocks for ANY of them, which is
     # what keeps the build moving rather than waiting on the slowest.
     while [ "${#TEST_PIDS[@]}" -ge "$1" ]; do
-        wait -n 2>/dev/null || true
+        if [ "$HAVE_WAIT_N" = 1 ]; then wait -n 2>/dev/null || true; else sleep 0.3; fi
         local live=()
-        for pid in "${TEST_PIDS[@]}"; do
+        for pid in ${TEST_PIDS[@]+"${TEST_PIDS[@]}"}; do
             kill -0 "$pid" 2>/dev/null && live+=("$pid")
         done
-        TEST_PIDS=("${live[@]}")
+        TEST_PIDS=(${live[@]+"${live[@]}"})
         # No progress possible — everything already exited.
         [ "${#live[@]}" -ge "$1" ] || break
     done
@@ -403,7 +420,7 @@ fi
     fi
     echo
     if [ "$RUN_TESTS" = "1" ]; then
-        total=$(printf '%s\n' "${TESTED[@]}" | awk '{s+=$3} END{print s+0}')
+        total=$(printf '%s\n' ${TESTED[@]+"${TESTED[@]}"} | awk '{s+=$3} END{print s+0}')
         echo "TESTS: ${#TESTED[@]} crate(s) green, $total test(s) passed, ${#TEST_FAIL[@]} crate(s) failing"
         [ ${#TEST_FAIL[@]} -gt 0 ] && printf '  %s\n' "${TEST_FAIL[@]}"
     else
