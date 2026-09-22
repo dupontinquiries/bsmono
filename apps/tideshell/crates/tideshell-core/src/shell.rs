@@ -8,6 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use crate::bar::BarWidget;
 use crate::carousel::Carousel;
 use crate::control_center::{ControlCenter, QuickKind, SliderKind};
+use crate::ambient::AutoBrightness;
 use crate::cursor::FatCursor;
 use crate::edge::{GestureEvent, Recognizer, SwipeUpTarget};
 use crate::hold::{HoldMenu, HoldOption};
@@ -37,6 +38,13 @@ pub struct Shell {
     pub modes: Modes,
     /// The fat cursor, present while it is in charge of the pointer.
     pub fat: Option<FatCursor>,
+    /// Ambient light + time of day brightness.
+    pub ambient: AutoBrightness,
+    /// Local minute of the day, set by the runtime (the engine has no clock).
+    clock_minute: u32,
+    /// The learned offset changed and is waiting to be saved once the user
+    /// lets go of the slider: (time of the last change).
+    offset_dirty_at: Option<Millis>,
     /// Right-bar layout: collapsed rail vs expanded (right-edge swipe toggles).
     pub bar_expanded: bool,
     /// Live swipe-up progress for the preview (0 when not swiping).
@@ -58,6 +66,10 @@ impl Shell {
         switcher.style = prefs.switcher_style;
         let mut trackpad = Trackpad::default();
         trackpad.speed = prefs.trackpad_speed;
+        let mut ambient = AutoBrightness::default();
+        ambient.enabled = prefs.auto_brightness;
+        ambient.offset = prefs.brightness_offset;
+        ambient.night = prefs.night;
         Shell {
             recognizer: Recognizer::new(prefs.edge_config(), screen),
             prefs,
@@ -69,6 +81,9 @@ impl Shell {
             trackpad,
             modes: Modes::default(),
             fat: None,
+            ambient,
+            clock_minute: 12 * 60,
+            offset_dirty_at: None,
             bar_expanded: false,
             swipe_up: 0.0,
             peek_dx: 0.0,
@@ -150,6 +165,9 @@ impl Shell {
         self.recognizer.cfg = prefs.edge_config();
         self.switcher.style = prefs.switcher_style;
         self.trackpad.speed = prefs.trackpad_speed;
+        self.ambient.enabled = prefs.auto_brightness;
+        self.ambient.offset = prefs.brightness_offset;
+        self.ambient.night = prefs.night;
         self.prefs = prefs;
         let mut out = vec![Action::SavePrefs];
         out.extend(self.sync_fat());
@@ -178,6 +196,7 @@ impl Shell {
             QuickKind::Keyboard => self.modes.keyboard,
             QuickKind::Trackpad => self.modes.trackpad,
             QuickKind::Carousel => self.carousel.is_active(),
+            QuickKind::AutoBrightness => self.ambient.enabled,
             k => self.drawer.system_state(k),
         }
     }
@@ -212,6 +231,18 @@ impl Shell {
         let events = self.recognizer.tick(now);
         self.drain_recognizer_log();
         let mut out = vec![];
+        // Auto-brightness ramp steps: not logged (a ramp is many steps).
+        if let Some(v) = self.ambient.tick(now, self.clock_minute) {
+            self.drawer.brightness = v;
+            out.push(Action::SetSlider(SliderKind::Brightness, v));
+        }
+        // Persist a learned offset once the slider has been still for a while.
+        if self.offset_dirty_at.is_some_and(|t| now.saturating_sub(t) >= 1500) {
+            self.offset_dirty_at = None;
+            self.prefs.brightness_offset = self.ambient.offset;
+            self.log(format!("auto brightness: learned offset {:+.2}", self.ambient.offset));
+            out.push(Action::SavePrefs);
+        }
         // The fat cursor's eased position IS the pointer: send it as it moves.
         if let Some(p) = self.fat.as_mut().and_then(|f| f.tick(now, dt)) {
             out.push(Action::Pointer(crate::trackpad::PointerOut::Absolute { x: p.0, y: p.1 }));
@@ -344,6 +375,12 @@ impl Shell {
             QuickKind::Keyboard => self.toggle_mode(HoldOption::Keyboard),
             QuickKind::Trackpad => self.toggle_mode(HoldOption::Trackpad),
             QuickKind::Carousel => self.toggle_mode(HoldOption::Carousel),
+            QuickKind::AutoBrightness => {
+                self.ambient.enabled = !self.ambient.enabled;
+                self.prefs.auto_brightness = self.ambient.enabled;
+                self.log(format!("auto brightness {}", if self.ambient.enabled { "on" } else { "off" }));
+                self.emit(vec![Action::SavePrefs])
+            }
             k => {
                 let out = self.drawer.toggle_system(k).into_iter().collect();
                 self.emit(out)
@@ -352,7 +389,28 @@ impl Shell {
     }
 
     pub fn set_slider(&mut self, kind: SliderKind, v: f32) -> Vec<Action> {
-        vec![self.drawer.set_slider(kind, v)]
+        let a = self.drawer.set_slider(kind, v);
+        if kind == SliderKind::Brightness && self.ambient.on_manual(self.drawer.brightness, self.now, self.clock_minute) {
+            self.offset_dirty_at = Some(self.now);
+        }
+        vec![a]
+    }
+
+    /// Local minute of the day (0..1440), for the night window.
+    pub fn set_clock(&mut self, minute: u32) {
+        self.clock_minute = minute % 1440;
+    }
+
+    /// An ambient light reading in lux.
+    pub fn on_lux(&mut self, lux: f32, now: Millis) {
+        self.now = self.now.max(now);
+        self.ambient.on_lux(lux, now);
+    }
+
+    /// The backlight level found at startup, so auto ramps from reality.
+    pub fn set_current_brightness(&mut self, level: f32) {
+        self.drawer.brightness = level.clamp(0.0, 1.0);
+        self.ambient.set_current(level);
     }
 
     pub fn launch(&mut self, desktop_id: &str) -> Vec<Action> {
@@ -710,6 +768,48 @@ mod tests {
         sh.set_windows(vec![card(1, true, Some(1216))]);
         sh.tick(2 * Shell::REFLOW_COOLDOWN + 20);
         assert!(sh.reflow_for_zone(64.0).is_empty());
+    }
+
+    #[test]
+    fn auto_brightness_ramps_from_the_current_level_and_the_tile_toggles_it() {
+        let mut sh = Shell::new(ShellPrefs::default(), S);
+        sh.set_current_brightness(0.2);
+        sh.set_clock(12 * 60);
+        let mut last = None;
+        for i in 0..60u64 {
+            sh.on_lux(20_000.0, i * 100);
+            for a in sh.tick(i * 100) {
+                if let Action::SetSlider(SliderKind::Brightness, v) = a {
+                    assert!(last.is_none_or(|l| v >= l), "ramp not monotonic");
+                    last = Some(v);
+                }
+            }
+        }
+        assert!(last.unwrap() > 0.95, "daylight reached: {last:?}");
+        assert_eq!(sh.drawer.brightness, last.unwrap(), "slider shows what auto applied");
+        assert!(sh.quick_state(QuickKind::AutoBrightness));
+        assert_eq!(sh.tap_quick(QuickKind::AutoBrightness), vec![Action::SavePrefs]);
+        assert!(!sh.quick_state(QuickKind::AutoBrightness) && !sh.prefs.auto_brightness);
+        assert!(!sh.tick(10_000).iter().any(|a| matches!(a, Action::SetSlider(..))), "off: no more changes");
+    }
+
+    #[test]
+    fn slider_offset_is_saved_once_after_the_user_lets_go() {
+        let mut sh = Shell::new(ShellPrefs::default(), S);
+        sh.set_current_brightness(0.5);
+        sh.on_lux(300.0, 0);
+        sh.tick(0);
+        // A drag: many slider events in quick succession.
+        let mut saves = 0;
+        for i in 0..10u64 {
+            sh.tick(100 + i * 50);
+            sh.set_slider(SliderKind::Brightness, 0.6 + i as f32 * 0.01);
+        }
+        for t in (700..4000).step_by(100) {
+            saves += sh.tick(t).iter().filter(|a| **a == Action::SavePrefs).count();
+        }
+        assert_eq!(saves, 1, "one save after the drag, not one per event");
+        assert!((sh.prefs.brightness_offset - sh.ambient.offset).abs() < 1e-6 && sh.ambient.offset > 0.0);
     }
 
     #[test]

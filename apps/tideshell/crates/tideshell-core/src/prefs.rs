@@ -39,6 +39,12 @@ pub struct ShellPrefs {
     /// iPadOS-style eased disc instead of the system cursor while the
     /// trackpad drives the pointer.
     pub fat_cursor: bool,
+    /// Ambient light + time of day brightness.
+    pub auto_brightness: bool,
+    /// Learned from the user's slider while auto is on.
+    pub brightness_offset: f32,
+    /// Night window for the time-of-day dimming.
+    pub night: crate::ambient::NightWindow,
 }
 
 impl Default for ShellPrefs {
@@ -51,11 +57,14 @@ impl Default for ShellPrefs {
             hold_ms: 420,
             trackpad_speed: 1.0,
             fat_cursor: false,
+            auto_brightness: true,
+            brightness_offset: 0.0,
+            night: crate::ambient::NightWindow::default(),
         }
     }
 }
 
-pub const KEYS: [&str; 7] = [
+pub const KEYS: [&str; 10] = [
     "shell.layout",
     "shell.bar.widgets",
     "shell.bar.width",
@@ -63,6 +72,9 @@ pub const KEYS: [&str; 7] = [
     "shell.hold_ms",
     "shell.trackpad.speed",
     "shell.cursor",
+    "shell.brightness.auto",
+    "shell.brightness.offset",
+    "shell.brightness.night",
 ];
 
 impl ShellPrefs {
@@ -82,6 +94,9 @@ impl ShellPrefs {
             ("shell.hold_ms".into(), self.hold_ms.to_string()),
             ("shell.trackpad.speed".into(), format!("{}", self.trackpad_speed)),
             ("shell.cursor".into(), if self.fat_cursor { "fat" } else { "normal" }.into()),
+            ("shell.brightness.auto".into(), if self.auto_brightness { "on" } else { "off" }.into()),
+            ("shell.brightness.offset".into(), format!("{:.3}", self.brightness_offset)),
+            ("shell.brightness.night".into(), self.night.format_span()),
         ]
     }
 
@@ -118,6 +133,19 @@ impl ShellPrefs {
             }
             "shell.hold_ms" => self.hold_ms = parse_range(key, v, 200.0, 1500.0)? as u64,
             "shell.trackpad.speed" => self.trackpad_speed = parse_range(key, v, 0.25, 4.0)?,
+            "shell.brightness.auto" => {
+                self.auto_brightness = match v {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(format!("shell.brightness.auto: '{v}' is not on|off")),
+                }
+            }
+            "shell.brightness.offset" => self.brightness_offset = parse_range(key, v, -0.6, 0.6)?,
+            "shell.brightness.night" => {
+                let (start, end) = crate::ambient::NightWindow::parse_span(v).ok_or_else(|| format!("shell.brightness.night: '{v}' is not HH:MM-HH:MM"))?;
+                self.night.start = start;
+                self.night.end = end;
+            }
             "shell.cursor" => {
                 self.fat_cursor = match v {
                     "fat" => true,
@@ -168,6 +196,10 @@ mod tests {
         p.switcher_style = Style::Deck;
         p.bar_width = 80.0;
         p.fat_cursor = true;
+        p.auto_brightness = false;
+        p.brightness_offset = 0.125;
+        p.night.start = 23 * 60 + 30;
+        p.night.end = 6 * 60;
         p.bar_widgets = bar::parse_widgets("clock,toggle:trackpad,app:org.gnome.Console").0;
         let kv = p.to_kv();
         assert_eq!(kv.len(), KEYS.len());

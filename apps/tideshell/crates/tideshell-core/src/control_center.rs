@@ -25,10 +25,12 @@ pub enum QuickKind {
     Keyboard,
     Trackpad,
     Carousel,
+    /// Ambient light + time of day brightness (shell-owned, see `ambient`).
+    AutoBrightness,
 }
 
 impl QuickKind {
-    pub const ALL: [QuickKind; 10] = [
+    pub const ALL: [QuickKind; 11] = [
         QuickKind::Wifi,
         QuickKind::Bluetooth,
         QuickKind::MobileData,
@@ -39,6 +41,7 @@ impl QuickKind {
         QuickKind::Keyboard,
         QuickKind::Trackpad,
         QuickKind::Carousel,
+        QuickKind::AutoBrightness,
     ];
 
     pub fn token(self) -> &'static str {
@@ -53,6 +56,7 @@ impl QuickKind {
             QuickKind::Keyboard => "keyboard",
             QuickKind::Trackpad => "trackpad",
             QuickKind::Carousel => "carousel",
+            QuickKind::AutoBrightness => "auto-brightness",
         }
     }
 
@@ -72,12 +76,13 @@ impl QuickKind {
             QuickKind::Keyboard => "Keyboard",
             QuickKind::Trackpad => "Trackpad",
             QuickKind::Carousel => "Carousel",
+            QuickKind::AutoBrightness => "Auto bright",
         }
     }
 
     /// Shell-mode tiles are owned by `Shell::modes`, not by this drawer.
     pub fn is_mode(self) -> bool {
-        matches!(self, QuickKind::Keyboard | QuickKind::Trackpad | QuickKind::Carousel)
+        matches!(self, QuickKind::Keyboard | QuickKind::Trackpad | QuickKind::Carousel | QuickKind::AutoBrightness)
     }
 }
 

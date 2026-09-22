@@ -22,6 +22,7 @@
 //!   overlay, so "why didn't my swipe open the switcher" is answerable on the
 //!   phone.
 
+pub mod ambient;
 pub mod bar;
 pub mod carousel;
 pub mod control_center;
