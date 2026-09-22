@@ -19,6 +19,11 @@ gamepad = ["dep:gilrs", "shellkit/gamepad"]
 analog = ["dep:libloading", "shellkit/analog"]
 
 [dependencies]
+# THE RIG (src/rigmotion.rs): the robot-form motion core -- walk/run by Froude
+# number, jumps from leg force and gravity, IK that keeps feet planted and
+# knees from bending back, aimed arms, weapon hands, ranged fire. A shared
+# crate like the others here, with no dependencies of its own.
+boneforge = { path = "../shared/boneforge" }
 # handheld detection, shared with the other game (games/shared/handheld-detect).
 # Detection only -- this game keeps its own Profile::apply tuning.
 handheld-detect = { path = "../shared/handheld-detect" }

@@ -10,6 +10,7 @@ use shellkit::{academy, analog, custom, gamepad, net, partdata, replay, stream, 
 
 mod align;
 mod anim;
+mod rigmotion;
 mod approach;
 mod actuator;
 mod aboard;
@@ -904,6 +905,10 @@ struct Game {
     loco: anim::Locomotion,
     /// the pose it produced this frame
     loco_pose: anim::Pose,
+    /// the 22-bone rig the gait drives (rigmotion.rs): what the limb channels
+    /// were waiting for
+    rig: rigmotion::RigMotion,
+    rig_frame: Option<rigmotion::Frame>,
     ball_model: model::Model,
     decor_model: model::Model,
     fx: fx::Fx,
@@ -2420,6 +2425,8 @@ fn main() {
         sight: chord::Sight::new(),
         loco: anim::Locomotion::new(),
         loco_pose: anim::Pose::default(),
+        rig: rigmotion::RigMotion::new(3.9),
+        rig_frame: None,
         ball_model,
         decor_model,
         fx: fx::Fx::new(seed),
@@ -4530,6 +4537,12 @@ impl Game {
         self.loco_pose = self
             .loco
             .update(dt, horiz, vert, self.car.on_ground, boosting, self.car.climbing > 0.5);
+        // THE RIG, driven by the same truth: the gait the machine chose, the
+        // ground speed, the gravity where the body is, and the damage -- with
+        // limp()'s SIGN (the gait machine above clamps it to 0..1, which drops
+        // a hurt LEFT leg entirely; the rig reads the side from the sign).
+        let (_gd, gmul) = self.world.gravity_field(self.car.pos);
+        self.rig_frame = Some(self.rig.update(dt, self.loco.gait, horiz, gmul * self.cfg.arena.gravity, hurt));
         // element movement also belongs here: Air runs, Rock does not
         let _ = self.wep.move_mul();
 

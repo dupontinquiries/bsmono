@@ -254,6 +254,7 @@ name = "blackstar"
 version = "1.117.0"
 dependencies = [
  "aperture-complete",
+ "boneforge",
  "bytemuck",
  "cpal",
  "env_logger",
@@ -301,6 +302,10 @@ dependencies = [
  "block-sys",
  "objc2",
 ]
+
+[[package]]
+name = "boneforge"
+version = "0.1.0"
 
 [[package]]
 name = "bumpalo"
