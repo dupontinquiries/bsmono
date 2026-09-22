@@ -1283,7 +1283,15 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     let rusty_board = || crate::suite::SuiteApp {
         name: "rusty-board".into(),
         path: "apps/rusty-board/egui-frontend".into(),
-        features: vec!["layer".into()],
+        // `wayland` AND `layer`. This was `layer` alone: a docked surface with no
+        // input method. The dock maps itself on its first paint and then follows the
+        // input method's Activate/Deactivate -- which only `wayland` provides -- so a
+        // layer-only build never hid, typed into nothing, and kept its exclusive zone
+        // reserved at the bottom of the screen. Seen on a Fairphone 5 under COSMIC as
+        // "not showing up like a virtual keyboard" plus an empty band at the bottom.
+        // cosmic-comp (epoch-1.8.0) offers input-method-v2 and virtual-keyboard to any
+        // unsandboxed client, so this is enough there too.
+        features: vec!["wayland".into(), "layer".into()],
         no_default: false, target: String::new(), run_flags: String::new(),
         bin_name: Some("rusty-board-egui".into()),
     };
