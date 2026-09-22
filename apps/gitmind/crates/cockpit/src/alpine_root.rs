@@ -273,6 +273,57 @@ pub fn probe_cmd() -> String {
     )
 }
 
+/// What `probe_cmd` found on a tablet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RootState {
+    pub root: bool,
+    pub runner: bool,
+    /// `/etc/alpine-release` inside the root, e.g. `3.22.1`.
+    pub release: Option<String>,
+    pub bluealsa: bool,
+}
+
+pub fn parse_probe(text: &str) -> RootState {
+    let mut s = RootState::default();
+    for l in text.lines() {
+        match l.trim().split_once('=') {
+            Some(("alpine_root", "1")) => s.root = true,
+            Some(("alpine_runner", "1")) => s.runner = true,
+            Some(("alpine_release", v)) if !v.trim().is_empty() => s.release = Some(v.trim().to_string()),
+            Some(("bluealsa_running", "1")) => s.bluealsa = true,
+            _ => {}
+        }
+    }
+    s
+}
+
+impl RootState {
+    /// Why an app cannot be deployed into the root yet, if it cannot.
+    pub fn not_ready(&self) -> Option<String> {
+        if !self.root {
+            Some("no Alpine root on this tablet yet: `gitmind eink pkg <host> bootstrap` (Packages on the Tablets page)".into())
+        } else if !self.runner {
+            Some("alpine-run is not installed: build it (`gitmind eink build <host> alpine-run`) and install it (`gitmind eink pkg <host> runner <binary>`)".into())
+        } else {
+            None
+        }
+    }
+}
+
+/// The build image for a root at `release`: a dynamically linked app must be
+/// built against the SAME Alpine release as the root it runs in (a newer
+/// musl or library soname in the build than in the root fails at start).
+/// Docker Hub's official rust image is tagged per Alpine minor release.
+pub fn image_for_release(release: &str) -> Option<String> {
+    let mut it = release.trim().split('.');
+    let (maj, min) = (it.next()?, it.next()?);
+    if maj.chars().all(|c| c.is_ascii_digit()) && min.chars().all(|c| c.is_ascii_digit()) && !maj.is_empty() && !min.is_empty() {
+        Some(format!("docker.io/library/rust:1-alpine{maj}.{min}"))
+    } else {
+        None
+    }
+}
+
 /// Start the Bluetooth audio bridge (bluez-alsa) inside the root, detached,
 /// for this boot: A2DP to a headset and HFP for calls. Needs `bluez-alsa`
 /// installed in the root and the tablet's BlueZ running.
@@ -413,6 +464,21 @@ mod tests {
     fn only_depot_mirrors_have_an_api() {
         assert_eq!(depot_api(&Mirror { base: "http://depot.lan:8000/alpine/".into(), branch: "v3.22".into() }).as_deref(), Some("http://depot.lan:8000/api/alpine"));
         assert!(depot_api(&Mirror::default()).is_none(), "Alpine's CDN is not asked");
+    }
+
+    #[test]
+    fn the_root_state_decides_readiness_and_the_build_image() {
+        let s = parse_probe("alpine_root=1\nalpine_runner=1\nalpine_release=3.22.1\n");
+        assert!(s.not_ready().is_none());
+        assert_eq!(image_for_release(s.release.as_deref().unwrap()).as_deref(), Some("docker.io/library/rust:1-alpine3.22"));
+        assert!(parse_probe("alpine_runner=1\n").not_ready().unwrap().contains("bootstrap"));
+        assert!(parse_probe("alpine_root=1\n").not_ready().unwrap().contains("alpine-run"));
+        assert_eq!(image_for_release("edge"), None);
+        assert_eq!(image_for_release("3"), None);
+        // the probe runs under sh against an empty tree
+        let o = std::process::Command::new("sh").arg("-c").arg(probe_cmd().replace(ROOT, "/nonexistent-root")).output().unwrap();
+        assert!(o.status.success());
+        assert_eq!(parse_probe(&String::from_utf8_lossy(&o.stdout)), RootState::default());
     }
 
     #[test]

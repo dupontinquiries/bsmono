@@ -1505,6 +1505,12 @@ fn cmd_eink(rest: &[String]) -> i32 {
             if let Err(e) = ef::preflight_binary_for(bin, &route, probe.model, userland) {
                 return eink_err(&format!("not deployed: {e}"));
             }
+            if userland == ef::Userland::AlpineRoot {
+                match ef::Remote::run(&mut remote, &cockpit::alpine_root::probe_cmd()) {
+                    Ok(o) => if let Some(why) = cockpit::alpine_root::parse_probe(&o).not_ready() { return eink_err(&format!("not deployed: {why}")); },
+                    Err(e) => return eink_err(&e),
+                }
+            }
             let profile = match opt(flags, "--profile") {
                 Some(p) => match ef::RefreshProfile::parse(p) { Some(p) => p, None => return eink_err("--profile: fast-color|fast-mono|quality") },
                 None => ef::RefreshProfile::fastest(probe.model.map(|m| m.panel()).unwrap_or(ef::Panel::Mono)),
@@ -1551,7 +1557,15 @@ fn cmd_eink(rest: &[String]) -> i32 {
             let Some(app) = ef::discover_tablet_apps(&root).into_iter().find(|a| a.bin == **bin) else {
                 return eink_err(&format!("{bin}: not an eink-kit app in {}", root.display()));
             };
-            let t = ef::build_target_for(&route, probe.model, userland);
+            let mut t = ef::build_target_for(&route, probe.model, userland);
+            if userland == ef::Userland::AlpineRoot {
+                // Built against the SAME Alpine release as the root it runs in.
+                let st = match ef::Remote::run(&mut remote, &cockpit::alpine_root::probe_cmd()) {
+                    Ok(o) => cockpit::alpine_root::parse_probe(&o), Err(e) => return eink_err(&e) };
+                if !st.root { return eink_err(&st.not_ready().unwrap_or_default()); }
+                t.container_image = st.release.as_deref().and_then(cockpit::alpine_root::image_for_release);
+                eprintln!("  Alpine root {}: building with {}", st.release.as_deref().unwrap_or("?"), t.container_image.as_deref().unwrap_or("the default image"));
+            }
             let engine = match opt(flags, "--engine") {
                 Some(e) => match ef::Engine::parse(e) { Some(e) => e, None => return eink_err("--engine: auto|host|container") },
                 None => ef::Engine::Auto,

@@ -313,9 +313,20 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             let engine = s.engine;
             let userland = if s.alpine_root { ef::Userland::AlpineRoot } else { ef::Userland::Static };
             let host = s.host.trim().to_string();
+            let user = s.user.trim().to_string();
             let built = s.built.clone();
             s.task.run_logged(move |log| {
-                let t = ef::build_target_for(&r, m, userland);
+                let mut t = ef::build_target_for(&r, m, userland);
+                if userland == ef::Userland::AlpineRoot {
+                    // Built against the SAME Alpine release as the root it runs in.
+                    let mut rr = ef::SshRemote { user: user.clone(), host: host.clone() };
+                    let st = match ef::Remote::run(&mut rr, &cockpit::alpine_root::probe_cmd()) {
+                        Ok(o) => cockpit::alpine_root::parse_probe(&o), Err(e) => return e };
+                    if !st.root { return st.not_ready().unwrap_or_default(); }
+                    t.container_image = st.release.as_deref().and_then(cockpit::alpine_root::image_for_release);
+                    log.push(&format!("Alpine root {}: building with {}", st.release.as_deref().unwrap_or("?"),
+                        t.container_image.as_deref().unwrap_or("the default image")));
+                }
                 let path = std::env::var("PATH").unwrap_or_default();
                 // Features follow the device's surveyed hardware (enrolment stores it).
                 let caps = cockpit::capabilities::load(&cockpit::tablet_identity::device_key(&host));
@@ -434,6 +445,11 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 // Never push something the tablet cannot run.
                 if let Err(e) = ef::preflight_binary_for(&bin, &route, p.model, userland) {
                     return format!("not deployed: {e}");
+                if userland == ef::Userland::AlpineRoot {
+                    if let Ok(o) = ef::Remote::run(&mut r, &cockpit::alpine_root::probe_cmd()) {
+                        if let Some(why) = cockpit::alpine_root::parse_probe(&o).not_ready() { return format!("not deployed: {why}"); }
+                    }
+                }
                 }
                 let profile = choice.unwrap_or_else(|| ef::RefreshProfile::fastest(p.model.map(|m| m.panel()).unwrap_or(ef::Panel::Mono)));
                 let env = ef::LaunchEnv { profile, model: p.model, blight_lib: d.blight_lib.clone() };

@@ -938,6 +938,9 @@ pub struct BuildTarget {
     pub static_crt: bool,
     /// Where the app runs: the tablet's own system, or the Alpine root.
     pub userland: Userland,
+    /// Container image override (the Alpine root's release; see
+    /// `alpine_root::image_for_release`). None: CONTAINER_IMAGE.
+    pub container_image: Option<String>,
     /// One line on why, shown next to the build.
     pub why: &'static str,
 }
@@ -991,12 +994,14 @@ pub fn build_target(route: &Route, model: Option<RmModel>) -> BuildTarget {
             triple: if arm32 { "armv7-unknown-linux-musleabihf" } else { "aarch64-unknown-linux-musl" },
             static_crt: true,
             userland: Userland::Static,
+            container_image: None,
             why: "AppLoad: static musl, runs on any tablet OS and builds natively on an aarch64 postmarketOS phone",
         },
         Route::Blight => BuildTarget {
             triple: if arm32 { "armv7-unknown-linux-gnueabihf" } else { "aarch64-unknown-linux-gnu" },
             static_crt: false,
             userland: Userland::Static,
+            container_image: None,
             why: "Blight: glibc build (loads the tablet's libblight_protocol); pin glibc to the tablet's",
         },
     }
@@ -1567,14 +1572,14 @@ pub fn container_plan(runtime: &str, repo_root: &std::path::Path, app: &TabletAp
         "-v".into(), format!("{CONTAINER_CACHE}:/usr/local/cargo/registry"),
         "-w".into(), workdir,
         "-e".into(), format!("CARGO_TARGET_DIR={target_dir}"),
-        CONTAINER_IMAGE.into(), "sh".into(), "-c".into(), script,
+        t.container_image.clone().unwrap_or_else(|| CONTAINER_IMAGE.into()), "sh".into(), "-c".into(), script,
     ]);
     Ok(BuildPlan {
         argv,
         env: vec![],
         cwd: repo_root.to_path_buf(),
         output: repo_root.join(output_rel.trim_start_matches('/')),
-        note: format!("{runtime} with {CONTAINER_IMAGE}{}{}", if native { " (linux/arm64, native musl)" } else { " (cross, rust-lld)" },
+        note: format!("{runtime} with {}{}{}", t.container_image.as_deref().unwrap_or(CONTAINER_IMAGE), if native { " (linux/arm64, native musl)" } else { " (cross, rust-lld)" },
             if app.via_shim { ", eframe via eink-kit's shim" } else { "" }),
         lockfile: workspace_lock(&app.dir, repo_root),
     })
@@ -3003,6 +3008,16 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
         let args: Vec<&str> = v["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
         assert_eq!(args, vec![crate::alpine_root::ROOT, "/home/root/.local/share/gitmind/bin/voiceterm-egui", "--x"]);
         assert_eq!(v["environment"]["EINK_BACKEND"], "qtfb", "the app still talks to AppLoad (qtfb socket bound into the root)");
+    }
+
+    #[test]
+    fn an_alpine_root_build_uses_the_image_of_the_roots_release() {
+        let mut t = build_target_for(&Route::AppLoad { dir: "/x".into() }, Some(RmModel::PaperPro), Userland::AlpineRoot);
+        t.container_image = crate::alpine_root::image_for_release("3.22.1");
+        let app = TabletApp { dir: "/r/apps/x".into(), bin: "x".into(), features: vec![], no_default: false, via_shim: false };
+        let p = container_plan("podman", std::path::Path::new("/r"), &app, &t).unwrap();
+        assert!(p.argv.iter().any(|a| a == "docker.io/library/rust:1-alpine3.22"), "{:?}", p.argv);
+        assert!(p.note.contains("alpine3.22"));
     }
 
     #[test]
