@@ -174,6 +174,8 @@ impl App {
     }
 
     fn api(&self, method: &str, rest: &str, req: &mut Request<'_>) -> Response {
+        // Answer from the catalog on disk, not the one loaded at startup.
+        let _ = self.depot.lock().unwrap().refresh();
         let segs: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
         match (method, segs.as_slice()) {
             ("GET", ["tutorials"]) => {
@@ -326,11 +328,7 @@ impl App {
             // packages ingested (a partial mirror names fewer than its index).
             ("GET", ["alpine"]) => {
                 let d = self.depot.lock().unwrap();
-                let repos: Vec<_> = d.catalog.alpine.iter().map(|(k, r)| json!({
-                    "repo": k, "url": format!("/alpine/{k}/"), "index_size": r.index_size,
-                    "packages": r.packages.iter().map(|p| json!({"name": p.name, "version": p.version, "size": p.size})).collect::<Vec<_>>(),
-                })).collect();
-                ok_json(&json!({"repos": repos}))
+                ok_json(&serde_json::to_value(depot_core::api::AlpineListing::from_catalog(&d.catalog)).unwrap_or_default())
             }
             ("GET", ["toolchains"]) => {
                 let d = self.depot.lock().unwrap();

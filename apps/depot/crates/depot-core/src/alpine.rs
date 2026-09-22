@@ -30,11 +30,23 @@ use std::io::Read;
 use std::path::Path;
 
 /// One package as the index describes it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IndexPkg {
     pub name: String,
     pub version: String,
     pub size: u64,
+    /// `D:` dependencies, version constraints stripped (`so:libc.musl...`,
+    /// `cmd:sh`, plain names). Conflicts (`!name`) are left out.
+    pub depends: Vec<String>,
+    /// `p:` what it provides besides its own name, versions stripped.
+    pub provides: Vec<String>,
+}
+
+/// A dependency or provides token without its version constraint
+/// (`so:libfoo.so.1=1.2.3` -> `so:libfoo.so.1`, `busybox>=1.36` -> `busybox`).
+pub fn strip_version(tok: &str) -> &str {
+    let end = tok.find(|c: char| "<>=~".contains(c)).unwrap_or(tok.len());
+    &tok[..end]
 }
 
 impl IndexPkg {
@@ -65,17 +77,59 @@ pub fn parse_index_text(text: &str) -> Vec<IndexPkg> {
     text.split("\n\n")
         .filter_map(|block| {
             let (mut n, mut v, mut s) = (None, None, 0u64);
+            let (mut d, mut p) = (Vec::new(), Vec::new());
+            let toks = |x: &str| x.split_whitespace().filter(|t| !t.starts_with('!')).map(|t| strip_version(t).to_string()).collect::<Vec<_>>();
             for l in block.lines() {
                 match l.split_once(':') {
                     Some(("P", x)) => n = Some(x.to_string()),
                     Some(("V", x)) => v = Some(x.to_string()),
                     Some(("S", x)) => s = x.parse().unwrap_or(0),
+                    Some(("D", x)) => d = toks(x),
+                    Some(("p", x)) => p = toks(x),
                     _ => {}
                 }
             }
-            Some(IndexPkg { name: n?, version: v?, size: s })
+            Some(IndexPkg { name: n?, version: v?, size: s, depends: d, provides: p })
         })
         .collect()
+}
+
+/// What installing `wanted` needs from `index`: every package in the
+/// dependency closure (by name or by a `p:` provide, the way apk resolves
+/// `so:` and `cmd:` dependencies), and the dependencies nothing provides.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Closure {
+    pub needed: Vec<IndexPkg>,
+    pub unresolved: Vec<String>,
+}
+
+pub fn closure(index: &[IndexPkg], wanted: &[&str]) -> Closure {
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    let by_name: BTreeMap<&str, &IndexPkg> = index.iter().map(|p| (p.name.as_str(), p)).collect();
+    let mut provider: BTreeMap<&str, &str> = BTreeMap::new();
+    for p in index {
+        for t in &p.provides {
+            provider.entry(t.as_str()).or_insert(p.name.as_str());
+        }
+    }
+    let (mut seen, mut unresolved) = (BTreeSet::new(), BTreeSet::new());
+    let mut queue: VecDeque<String> = wanted.iter().map(|w| w.to_string()).collect();
+    while let Some(dep) = queue.pop_front() {
+        let name = by_name.get(dep.as_str()).map(|p| p.name.as_str()).or_else(|| provider.get(dep.as_str()).copied());
+        let Some(name) = name else {
+            unresolved.insert(dep);
+            continue;
+        };
+        if seen.insert(name.to_string()) {
+            for d in &by_name[name].depends {
+                queue.push_back(d.clone());
+            }
+        }
+    }
+    Closure {
+        needed: seen.iter().map(|n| by_name[n.as_str()].clone()).collect(),
+        unresolved: unresolved.into_iter().collect(),
+    }
 }
 
 /// `branch/repo/arch`, each segment a plain name.
@@ -188,11 +242,28 @@ pub(crate) mod tests {
     fn the_index_is_read_past_the_signature_segment() {
         let t = "C:Q1abc\nP:bluez-alsa\nV:4.3.1-r0\nS:123\n\nC:Q1def\nP:busybox\nV:1.37.0-r18\nS:456\n\n";
         let l = parse_index(&apkindex(t)).unwrap();
-        assert_eq!(l, vec![
-            IndexPkg { name: "bluez-alsa".into(), version: "4.3.1-r0".into(), size: 123 },
-            IndexPkg { name: "busybox".into(), version: "1.37.0-r18".into(), size: 456 },
-        ]);
+        assert_eq!(l.iter().map(|p| (p.name.as_str(), p.version.as_str(), p.size)).collect::<Vec<_>>(),
+            vec![("bluez-alsa", "4.3.1-r0", 123), ("busybox", "1.37.0-r18", 456)]);
         assert_eq!(l[0].filename(), "bluez-alsa-4.3.1-r0.apk");
+    }
+
+    #[test]
+    fn the_closure_follows_names_and_provides_like_apk() {
+        let idx = parse_index_text(concat!(
+            "P:bluez-alsa\nV:4-r0\nD:so:libasound.so.2 so:libsbc.so.1 dbus-libs>=1.14 !pulseaudio-bluez\n\n",
+            "P:alsa-lib\nV:1-r0\np:so:libasound.so.2=2.0.0\nD:so:libc.musl-aarch64.so.1\n\n",
+            "P:sbc\nV:2-r0\np:so:libsbc.so.1=1.3\n\n",
+            "P:dbus-libs\nV:1.14-r0\n\n",
+            "P:musl\nV:1.2-r0\np:so:libc.musl-aarch64.so.1=1\n\n",
+            "P:unrelated\nV:1-r0\n\n",
+        ));
+        assert_eq!(idx[0].depends, vec!["so:libasound.so.2", "so:libsbc.so.1", "dbus-libs"], "constraints stripped, conflicts dropped");
+        let c = closure(&idx, &["bluez-alsa"]);
+        let names: Vec<&str> = c.needed.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["alsa-lib", "bluez-alsa", "dbus-libs", "musl", "sbc"]);
+        assert!(c.unresolved.is_empty());
+        let c = closure(&idx, &["bluez-alsa", "nope"]);
+        assert_eq!(c.unresolved, vec!["nope"]);
     }
 
     #[test]

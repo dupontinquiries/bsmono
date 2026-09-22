@@ -26,6 +26,7 @@
 //! a temp dir and a handful of reference files.
 
 pub mod alpine;
+pub mod api;
 pub mod catalog;
 pub mod config;
 pub mod crates;
