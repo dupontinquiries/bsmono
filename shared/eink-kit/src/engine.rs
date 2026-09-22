@@ -448,9 +448,8 @@ pub fn request_full_refresh(ctx: &Context) {
 
 /// Pick and connect a backend per `cfg.backend`.
 pub fn open_backend(cfg: &Config, hub: &InputHub) -> std::io::Result<Box<dyn Present>> {
-    use crate::present::{blight, mem::MemPresent, qtfb};
+    use crate::present::mem::MemPresent;
     let want = cfg.backend.as_str();
-    let err = |m: String| std::io::Error::new(std::io::ErrorKind::NotFound, m);
     if want == "mem" {
         let (w, h) = cfg.mem_size;
         let p = MemPresent::new(w, h, PixelFormat::Rgb888, true, true);
@@ -459,6 +458,26 @@ pub fn open_backend(cfg: &Config, hub: &InputHub) -> std::io::Result<Box<dyn Pre
             None => p,
         }));
     }
+    #[cfg(target_os = "linux")]
+    {
+        open_tablet_backend(cfg, hub, want)
+    }
+    // Off Linux there is no tablet to drive. Say so, rather than the backend
+    // silently not existing.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = hub;
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, format!(
+            "EINK_BACKEND={want:?}: the tablet backends (qtfb, blight) need Linux -- a reMarkable. \
+             On this platform only `mem` is available.")))
+    }
+}
+
+/// The reMarkable backends: qtfb under AppLoad, else Blight.
+#[cfg(target_os = "linux")]
+fn open_tablet_backend(cfg: &Config, hub: &InputHub, want: &str) -> std::io::Result<Box<dyn Present>> {
+    use crate::present::{blight, qtfb};
+    let err = |m: String| std::io::Error::new(std::io::ErrorKind::NotFound, m);
     let (model, how) = crate::device::detect();
     eprintln!("eink: model {model:?} ({how})");
     let color = model.color();
