@@ -205,6 +205,10 @@ impl Shell {
             QuickKind::Trackpad => self.modes.trackpad,
             QuickKind::Carousel => self.carousel.is_active(),
             QuickKind::AutoBrightness => self.ambient.enabled,
+            // Always "on": there is no off state to distinguish, only which
+            // of the three modes is current -- the tile's own label carries
+            // that (see the drawer's rendering).
+            QuickKind::CpuGovernor => true,
             k => self.drawer.system_state(k),
         }
     }
@@ -451,6 +455,11 @@ impl Shell {
                 self.log(format!("auto brightness {}", if self.ambient.enabled { "on" } else { "off" }));
                 self.emit(vec![Action::SavePrefs])
             }
+            QuickKind::CpuGovernor => {
+                let a = self.drawer.cycle_governor();
+                self.log(format!("cpu governor -> {}", self.drawer.governor.label()));
+                self.emit(vec![a])
+            }
             k => {
                 let out = self.drawer.toggle_system(k).into_iter().collect();
                 self.emit(out)
@@ -653,6 +662,15 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tapping_the_cpu_governor_tile_cycles_and_the_tile_always_reads_on() {
+        let mut sh = Shell::new(ShellPrefs::default(), S);
+        assert!(sh.quick_state(QuickKind::CpuGovernor), "no off state, only which mode");
+        let acts = sh.tap_quick(QuickKind::CpuGovernor);
+        assert_eq!(acts, vec![Action::SetGovernor(crate::control_center::CpuGovernor::Conservative)]);
+        assert_eq!(sh.tap_quick(QuickKind::CpuGovernor), vec![Action::SetGovernor(crate::control_center::CpuGovernor::Performance)]);
+    }
 
     const S: (f32, f32) = (408.0, 900.0);
 

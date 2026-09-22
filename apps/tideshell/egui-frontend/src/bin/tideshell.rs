@@ -33,6 +33,8 @@ struct Shellbox {
     persist: bool,
     ambient: tideshell_egui::sensors::Ambient,
     backlight: tideshell_egui::sensors::BacklightOut,
+    power_key: tideshell_egui::power_key::PowerKey,
+    output_power: tideshell_egui::output_power::OutputPower,
     sensor_status: (String, String),
     /// A dropped-pointer-output notice was already written for the current EI state.
     ei_drop_noted: bool,
@@ -71,7 +73,17 @@ impl Shellbox {
                     self.backlight.set(*v);
                     continue;
                 }
-                Action::DisplayPower(_) => Outcome::Unwired("display power: zwlr_output_power transport not wired yet"),
+                Action::DisplayPower(on) => {
+                    self.output_power.set(*on);
+                    Outcome::Done(format!("display power {}", if *on { "on" } else { "off" }))
+                }
+                Action::SetGovernor(wanted) => match tideshell_egui::cpu_governor::apply(*wanted) {
+                    Ok(chosen) if chosen == *wanted => Outcome::Done(format!("cpu governor: {}", chosen.label())),
+                    // The kernel skipped forward past what was asked for (see
+                    // `next_available`) -- worth saying, not worth failing over.
+                    Ok(chosen) => Outcome::Done(format!("cpu governor: {} (kernel lacks {}, used the next available)", chosen.label(), wanted.label())),
+                    Err(e) => Outcome::Failed(format!("cpu governor: {e}")),
+                },
                 // The overlay IS the trackpad surface here; nothing to execute.
                 Action::ShowTrackpad(on) => Outcome::Done(format!("trackpad {}", if *on { "on" } else { "off" })),
                 _ => match self.windows.as_mut() {
@@ -188,6 +200,8 @@ fn main() {
         persist,
         ambient: tideshell_egui::sensors::Ambient::spawn("/sys".into(), zbus::blocking::Connection::system().ok()),
         backlight: tideshell_egui::sensors::BacklightOut::spawn(std::path::Path::new("/sys"), zbus::blocking::Connection::system().ok()),
+        power_key: tideshell_egui::power_key::PowerKey::spawn(zbus::blocking::Connection::system().ok().as_ref()),
+        output_power: tideshell_egui::output_power::OutputPower::spawn(),
         sensor_status: (String::new(), String::new()),
         ei_drop_noted: false,
     };
@@ -247,6 +261,10 @@ fn main() {
         while let Ok(lux) = sb.ambient.rx.try_recv() {
             sb.shell.on_lux(lux, now_ms);
         }
+        // Collected before `actions` exists yet (declared below, once the
+        // frame's real input is in hand) and replayed into it there -- one
+        // path, one set of tests, whichever button triggered it.
+        let power_presses = sb.power_key.drain().count();
         if let Some(screen) = io.screen() {
             if screen != sb.shell.screen {
                 sb.shell.set_screen(screen);
@@ -256,6 +274,12 @@ fn main() {
 
         // Strips -> recognizer (screen coords). Overlay -> egui events.
         let mut actions = Vec::new();
+        // Each press asks the SAME question `Shell::power_key` already answers
+        // for the on-screen button (lock, fade, wake) -- one path, one set of
+        // tests, whichever button triggered it.
+        for _ in 0..power_presses {
+            actions.extend(sb.shell.power_key());
+        }
         for ev in input {
             match ev {
                 // The bar is a widget surface, not an edge: its input goes to

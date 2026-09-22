@@ -193,7 +193,8 @@ impl Executor for System {
             Action::Pointer(_) => Outcome::Unwired("EI sender not wired (needs cosmic-comp patch 0002 + reis client)"),
             Action::SetQuick(..) => Outcome::Unwired("no system backend for quick toggles yet"),
             Action::SetSlider(..) => Outcome::Unwired("no brightness/volume backend yet"),
-            Action::DisplayPower(_) => Outcome::Unwired("display power is handled by the layer runtime"),
+            Action::SetGovernor(_) => Outcome::Unwired("cpu governor: no system backend for this executor"),
+            Action::DisplayPower(_) => Outcome::Unwired("display power: needs the layer runtime's OutputPower (see bin/tideshell.rs), not this generic executor"),
         }
     }
 }

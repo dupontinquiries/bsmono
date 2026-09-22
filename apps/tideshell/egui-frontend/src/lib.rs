@@ -21,6 +21,17 @@ pub mod ei;
 pub mod layer;
 #[cfg(feature = "sensors")]
 pub mod sensors;
+/// The hardware power button: an evdev reader plus a logind inhibitor. Needs
+/// only libc and zbus, like `sensors`, so it shares that feature gate.
+#[cfg(feature = "sensors")]
+pub mod power_key;
+/// Screen power via wlr-output-power-management-v1, on its own connection.
+/// Shares `layer`'s wayland-client + wayland-protocols-wlr, though it needs
+/// neither EGL nor a layer surface itself.
+#[cfg(feature = "layer")]
+pub mod output_power;
+/// cpupower's scaling governor, over sysfs. Pure std, no feature gate needed.
+pub mod cpu_governor;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
 use tideshell_core::bar::{self, BarWidget};
@@ -557,7 +568,10 @@ impl ShellView {
             let on = shell.quick_state(*kind);
             pc.rect_filled(r, cr(16), if on { pal.accent } else { pal.bg_raised });
             pc.text(r.center() - Vec2::new(0.0, 8.0), Align2::CENTER_CENTER, initial(kind.label()), FontId::proportional(20.0), if on { pal.bg_base } else { pal.text });
-            pc.text(r.center_bottom() - Vec2::new(0.0, 13.0), Align2::CENTER_CENTER, short(kind.label()), FontId::proportional(10.0), if on { pal.bg_base } else { pal.text_weak });
+            // CpuGovernor has no off state -- ITS label is which mode is
+            // current, not a fixed short name every other tile uses.
+            let sub = if *kind == QuickKind::CpuGovernor { shell.drawer.governor.label().to_string() } else { short(kind.label()).to_string() };
+            pc.text(r.center_bottom() - Vec2::new(0.0, 13.0), Align2::CENTER_CENTER, sub, FontId::proportional(10.0), if on { pal.bg_base } else { pal.text_weak });
             let hit = r.intersect(panel);
             if visible && hit.height() > 20.0 && ui.interact(hit, Id::new(("ts-tile", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 out.extend(shell.tap_quick(*kind));
