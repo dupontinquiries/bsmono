@@ -3492,3 +3492,75 @@ renders the same frost as a scalar fallback.
 ## Not yet documented
 
 R26–R44 built single-threaded (~486 cores over 44 rounds). Dragon AI + weather render + weather fronts added.
+
+
+## ── Rejected alternatives and supersessions ──
+
+Recovered from chat history and git archaeology in a later session, not
+written at the time. All four are cases where the *decision* got built but
+the *reasoning* — or the fact that something was discarded — was never
+recorded, so each one cost a re-investigation to recover. Rejections are
+the entries that go missing: a design doc describes what you are building,
+not the three things you decided against on the way.
+
+## Chunk store: rolled our own, not fjall
+**Status**: considered
+**Location**: `world/chunk_manager.rs`, chunk wire format in `docs/COMPRESSION_DECISION.md`
+Persistent disk-backed chunk storage with on-demand load — the working set in
+RAM stays small (near the player / visible), everything else on disk. The
+precedent is Minecraft's Anvil region files and Veloren's sled; the target is
+**state and rollback for multiplayer, not throughput**, which is where this
+diverges from Anvil.
+
+`fjall` was evaluated and rejected: it describes itself as a building block
+rather than a finished store, so we would write as much code on top of it as
+it saved. An earlier in-RAM model ("keep 50,000 chunks resident") was also
+considered and dropped as simply wrong for the chunk counts involved.
+
+Revisit only if the rollback requirement changes — the throughput-first
+stores become attractive the moment you stop needing cheap state rewind.
+
+## Vulkan on Asahi is known-good
+**Status**: anchored
+**Location**: platform assumption behind the Vulkan renderer on aarch64 Macs
+Sodium-Vulkan running on Beryl is the existence proof. This is load-bearing
+for Asahi as a target and was never written down anywhere in the tree, so it
+read as an untested assumption rather than a checked fact.
+
+## Biome generation is field-queried, not table-driven
+**Status**: considered
+**Location**: `world/biome_loader.rs` (see its head comment), `world/entity.rs` spawning
+The head comment says the loader "future-proofs us toward AI/storytelling
+biome generation." The *reason* it is shaped that way, which the comment does
+not give: the intent is to work with unstructured data rather than fit
+everything into predefined boxes, because the boxes are what make added
+content expensive.
+
+The same principle is already applied to entities and written down under
+mobs — "as material/growth processes, not surface vs underground", spawning
+queried from WorldModel fields rather than biome enums. It is one principle
+with two applications and it had no single name, so each application looked
+like a local choice. Name it here: **prefer a queryable field to an
+enumerated table wherever content volume is the constraint.**
+
+## perf-final6.bundle is superseded, not unmerged
+**Status**: anchored
+**Location**: `d849a5d29` "unendlich: apply the perf snapshot"
+`perf-final6.bundle` (370 MB, 32 commits, 2026-08-23) carries mobile/ARM
+performance work — DeviceCaps from `/proc/meminfo`, Vulkan device-type GPU
+classification, per-preset mesh caches, the Ultra shadow-map cap at 4096,
+the `gpu_mesher_mode` force-off revert. **All of it is already in the tree**,
+delivered instead as the 2,311-file tree snapshot applied on 2026-08-25.
+
+Checked two ways, because the first is insufficient on its own:
+  - `git patch-id --stable` on all 32 against all 6,424 c19 commits: **zero
+    matches**. That proves they are not rewritten duplicates — and proves
+    nothing about supersession, because a squashed tree-diff is one large
+    diff, not 32 matching small ones.
+  - State comparison per change against HEAD: every one present, including
+    `gpu_class_from_vk_device_type` **called** at the Vulkan init site
+    (`bin/unendlich_fullgame.rs`), not merely defined.
+
+The bundle can be deleted. Without this entry the 32 commits read as
+unmerged work — they have no counterpart by subject *or* by patch-id — and
+the check costs an hour to redo.
