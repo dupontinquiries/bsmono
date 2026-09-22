@@ -829,3 +829,14 @@ runtime = "none"            # pure egui/glow (wayland/x11), same convention as t
 targets = ["desktop", "phone"]
 primary = true              # egui-first from birth; no Qt/GTK surface exists to archive
 notes = "phone calls over ModemManager (zbus blocking, poll loop) with a simulated-modem fallback for desktop/demo, plus a Matrix signalling backend (incoming m.call.invite rings, decline sends m.call.hangup; no media engine yet) on the same Command/Event link. Setup wizard: carrier APN suggestion from mobile-broadband-provider-info (system XML > downloaded XML > builtin snapshot) keyed by the modem's OperatorCode, applied as a NetworkManager GSM connection over D-Bus; Matrix sign-in with .well-known discovery. Headless dialer-core (19 unit tests) under crates/, dialer-egui on uikit-egui. `cargo build --release -p dialer-egui` = deployable bin (`app`+`mm`+`matrix` default-on); features peel off individually."
+
+
+[games.speedrace]
+path = "games/speedrace"
+kind = "cargo"
+role = "library"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop"]
+notes = "speedrace-core: a headless race engine -- you against a pace car, on hard coding problems. No GPU, no dependencies; 24 tests. The shell is not built yet (C20)."
