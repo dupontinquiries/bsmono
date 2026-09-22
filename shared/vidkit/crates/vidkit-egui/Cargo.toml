@@ -33,6 +33,28 @@ eframe = { version = "0.34", optional = true, default-features = false, features
 # maintenance/tools/eframe_backend_check.py.
 
 [dev-dependencies]
+# A BACKEND FOR THIS CRATE'S `demo` EXAMPLE, and only for it.
+#
+# Here it is the example, not the tests: eframe is optional and off by default,
+# so the unit tests never compile winit. But `--features demo` enables eframe to
+# run the `video_demo` example, which needs a window -- and examples, unlike
+# binaries, receive dev-dependencies.
+#
+# The normal `eframe` dependency above names no windowing backend, on purpose:
+# a library that names one forces it onto every app through feature
+# unification (see 70895dc53 -- voiceterm on static musl could not exclude
+# Wayland). But built STANDALONE, eframe with no backend makes winit refuse to
+# compile ("platform not supported"), so a standalone demo build broke.
+#
+# That standalone break was fixed once before (097fe78aa9, by putting the
+# backends on the normal dependency) and then UNDONE by 70895dc53, which moved
+# them off again without reading that history. Both goals are right; they
+# only collided because they shared one line.
+#
+# A dev-dependency serves both. It is active when THIS crate's tests build,
+# and is never passed on to crates that depend on this one -- so apps still
+# choose their own backend, and this crate still builds alone.
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }
 # The cross-crate pipeline test drives the real demuxer through the real
 # player; `fixtures` exposes the same MP4 writer the demuxer's own tests use.
 vidkit-mp4 = { path = "../vidkit-mp4", features = ["fixtures"] }

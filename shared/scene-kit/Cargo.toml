@@ -28,3 +28,22 @@ font8x8 = "0.3"
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow"] }
 
 [workspace]
+
+[dev-dependencies]
+# A BACKEND FOR THIS CRATE'S OWN TESTS, and only for them.
+#
+# The normal `eframe` dependency above names no windowing backend, on purpose:
+# a library that names one forces it onto every app through feature
+# unification (see 70895dc53 -- voiceterm on static musl could not exclude
+# Wayland). But built STANDALONE, eframe with no backend makes winit refuse to
+# compile ("platform not supported"), so this crate's own `cargo test` broke.
+#
+# That standalone break was fixed once before (097fe78aa9, by putting the
+# backends on the normal dependency) and then UNDONE by 70895dc53, which moved
+# them off again without reading that history. Both goals are right; they
+# only collided because they shared one line.
+#
+# A dev-dependency serves both. It is active when THIS crate's tests build,
+# and is never passed on to crates that depend on this one -- so apps still
+# choose their own backend, and this crate still builds alone.
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }
