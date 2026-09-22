@@ -88,7 +88,10 @@ if [ -x "$R/.gitmind/apk.static" ] && [ -f "$R/lib/apk/db/installed" ]; then ech
 mkdir -p "$R/.gitmind" "$R/etc/apk"
 cd "$R/.gitmind"
 curl -fsSL "$M/$A/APKINDEX.tar.gz" -o APKINDEX.tar.gz
-python3 -c 'import tarfile;tarfile.open("APKINDEX.tar.gz").extract("APKINDEX",".",filter="data")'
+# The index, like every .apk, is a signature segment then the content: read
+# past the first segment (plain tarfile.open stops at it; real Alpine indexes
+# ALWAYS have one, which an unsigned test index hid until depot served one).
+python3 -c 'import tarfile;t=tarfile.open("APKINDEX.tar.gz","r:gz",ignore_zeros=True);t.extract("APKINDEX",".",filter="data")'
 ver() {{ python3 - "$1" <<'PY'
 import sys
 want=sys.argv[1]
@@ -226,7 +229,11 @@ mod tests {
         std::fs::create_dir_all(&main).unwrap();
         // APKINDEX with the two packages bootstrap needs
         let index = "C:Q1x\nP:apk-tools-static\nV:2.14.9-r2\nA:x\n\nC:Q1y\nP:alpine-keys\nV:2.5-r0\nA:x\n\n";
-        std::fs::write(main.join("APKINDEX.tar.gz"), tgz(&[("APKINDEX", index.as_bytes(), 0o644)])).unwrap();
+        // Realistic: a signature segment FIRST, then the index (the unsigned
+        // single-segment index this test used to build hid a real bug).
+        let mut signed_index = tgz(&[(".SIGN.RSA.alpine-devel@lists.alpinelinux.org.rsa.pub", b"sig", 0o644)]);
+        signed_index.extend(tgz(&[("APKINDEX", index.as_bytes(), 0o644)]));
+        std::fs::write(main.join("APKINDEX.tar.gz"), signed_index).unwrap();
         // a fake apk.static that records its arguments and lays down the db
         let fake = b"#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/apk-args\"\nmkdir -p \"$2/lib/apk/db\"; touch \"$2/lib/apk/db/installed\"\n";
         std::fs::write(main.join("apk-tools-static-2.14.9-r2.apk"), apk_file(&[("sbin/apk.static", fake, 0o755)])).unwrap();
