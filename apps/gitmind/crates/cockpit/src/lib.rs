@@ -15,6 +15,7 @@ pub mod daemons;
 pub mod deploy;
 pub mod alpine_root;
 pub mod capabilities;
+pub mod tablet_identity;
 pub mod eink_fleet;
 pub mod finding;
 pub mod device_firewall;

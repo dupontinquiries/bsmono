@@ -161,7 +161,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                         // What the device HAS, stored for builds to pick features from.
                         let mut rr = ef::SshRemote { user: user.clone(), host: host.clone() };
                         if let Ok(out) = ef::Remote::run(&mut rr, &cockpit::capabilities::survey_cmd()) {
-                            let _ = cockpit::capabilities::save(&host, &out);
+                            let _ = cockpit::capabilities::save(&cockpit::tablet_identity::device_key(&host), &out);
                             for l in cockpit::capabilities::parse(&out).summary() { lines.push('\n'); lines.push_str(&l); }
                         }
                         format!("enrolled {user}@{host}\n{lines}")
@@ -200,7 +200,11 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             re-trust only if you know it was updated.").strong());
         if ui.add_enabled(!busy, egui::Button::new("Re-trust this tablet")).clicked() {
             let (host, changed) = (s.host.trim().to_string(), s.hostkey_changed.clone());
-            s.task.run_logged(move |_| match cockpit::deploy::retrust_host(&host) {
+            // Per device when the tablet is on a USB cable (its key is filed
+            // under a per-device alias), per address otherwise.
+            s.task.run_logged(move |_| match cockpit::tablet_identity::usb_link_for(&host)
+                .map(|l| cockpit::tablet_identity::untrust(&l))
+                .unwrap_or_else(|| cockpit::deploy::retrust_host(&host)) {
                 Ok(m) => {
                     *changed.lock().unwrap() = false;
                     format!("{m}\nnow Enrol again")
@@ -308,7 +312,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 let t = ef::build_target(&r, m);
                 let path = std::env::var("PATH").unwrap_or_default();
                 // Features follow the device's surveyed hardware (enrolment stores it).
-                let caps = cockpit::capabilities::load(&host);
+                let caps = cockpit::capabilities::load(&cockpit::tablet_identity::device_key(&host));
                 if caps.is_none() { log.push("no hardware survey for this tablet yet: default features (enrol again, or `gitmind eink survey`)"); }
                 let plan = match ef::plan_build_for(engine, &cockpit::ops::repo_root(), &app, &t, &path,
                     std::env::var("HOME").ok().as_deref(), std::env::var("CARGO").ok().as_deref(), caps.as_ref()) {

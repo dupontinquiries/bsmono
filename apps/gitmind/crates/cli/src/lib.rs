@@ -1459,10 +1459,16 @@ fn cmd_eink(rest: &[String]) -> i32 {
             match ef::enroll(&mut e, password.as_deref(), &mut |ev| eprintln!("  · {ev:?}")) {
                 Ok(r) => {
                     println!("enrolled {user}@{host}{}", if r.used_password { " (keys installed; no more passwords)" } else { "" });
+                    // Which tablet this is (cookie, SoC serial; USB identity if on a cable).
+                    if let Some(l) = cockpit::tablet_identity::usb_link_for(&host) { println!("  on {}", l.describe()); }
+                    if let Ok(out) = ef::Remote::run(&mut remote, &cockpit::tablet_identity::identity_cmd()) {
+                        let id = cockpit::tablet_identity::parse_identity(&out);
+                        println!("  device id {} · soc {} · {}", id.device_id, id.soc_serial.as_deref().unwrap_or("-"), id.dt_model.as_deref().unwrap_or("-"));
+                    }
                     // What the device HAS, stored for builds to use.
                     match ef::Remote::run(&mut remote, &cockpit::capabilities::survey_cmd()) {
                         Ok(out) => {
-                            let _ = cockpit::capabilities::save(&host, &out);
+                            let _ = cockpit::capabilities::save(&cockpit::tablet_identity::device_key(&host), &out);
                             for l in cockpit::capabilities::parse(&out).summary() { println!("  {l}"); }
                         }
                         Err(e) => eprintln!("  (hardware survey failed: {e})"),
@@ -1543,7 +1549,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
                 Some(e) => match ef::Engine::parse(e) { Some(e) => e, None => return eink_err("--engine: auto|host|container") },
                 None => ef::Engine::Auto,
             };
-            let caps = cockpit::capabilities::load(&host);
+            let caps = cockpit::capabilities::load(&cockpit::tablet_identity::device_key(&host));
             if caps.is_none() { eprintln!("  (no hardware survey for {host}: default features; `gitmind eink survey {host}`)"); }
             let plan = match ef::plan_build_for(engine, &root, &app, &t, &std::env::var("PATH").unwrap_or_default(),
                 std::env::var("HOME").ok().as_deref(), std::env::var("CARGO").ok().as_deref(), caps.as_ref()) {
@@ -1611,7 +1617,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
         },
         "survey" => match ef::Remote::run(&mut remote, &cockpit::capabilities::survey_cmd()) {
             Ok(out) => {
-                let _ = cockpit::capabilities::save(&host, &out);
+                let _ = cockpit::capabilities::save(&cockpit::tablet_identity::device_key(&host), &out);
                 for l in cockpit::capabilities::parse(&out).summary() { println!("{l}"); }
                 println!("(saved; builds for {host} use it)");
                 0
@@ -1663,6 +1669,10 @@ fn cmd_eink(rest: &[String]) -> i32 {
                 Ok(out) => { println!("{}", out.trim_end()); 0 }
                 Err(e) => eink_err(&e),
             }
+        }
+        "retrust" if cockpit::tablet_identity::usb_link_for(&host).is_some() => {
+            let l = cockpit::tablet_identity::usb_link_for(&host).unwrap();
+            match cockpit::tablet_identity::untrust(&l) { Ok(m) => { println!("{m}; enrol again to trust its new key"); 0 } Err(e) => eink_err(&e) }
         }
         "retrust" => match cockpit::deploy::retrust_host(&host) {
             Ok(m) => { println!("{m}"); 0 }

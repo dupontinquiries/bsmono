@@ -37,9 +37,38 @@ pub const SSH_OPTS: [&str; 12] = [
     "-o", "ControlMaster=no",
 ];
 
+/// Extra ssh options for particular hosts, appended by every argv builder
+/// here. Empty for almost every host. The one user so far: reMarkable tablets
+/// all answer on 10.11.99.1 over USB, so their host keys are filed under a
+/// per-DEVICE alias (from the USB identity, see `tablet_identity`) in
+/// gitmind's own known_hosts; otherwise plugging in a second tablet looks
+/// exactly like a man-in-the-middle on the first.
+static HOST_OPTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>> = std::sync::OnceLock::new();
+
+/// Set (or, with an empty list, clear) the extra ssh options for `host`.
+pub fn set_host_opts(host: &str, opts: Vec<String>) {
+    let m = HOST_OPTS.get_or_init(Default::default);
+    let mut m = m.lock().unwrap();
+    if opts.is_empty() {
+        m.remove(host);
+    } else {
+        m.insert(host.to_string(), opts);
+    }
+}
+
+pub fn host_opts(host: &str) -> Vec<String> {
+    HOST_OPTS.get().and_then(|m| m.lock().unwrap().get(host).cloned()).unwrap_or_default()
+}
+
+fn base_opts(host: &str) -> Vec<String> {
+    let mut a: Vec<String> = SSH_OPTS.iter().map(|s| (*s).to_string()).collect();
+    a.extend(host_opts(host));
+    a
+}
+
 /// `ssh <SSH_OPTS> user@host <remote_cmd>` as an argv (no shell).
 pub(crate) fn ssh_argv(user: &str, host: &str, remote_cmd: &str) -> Vec<String> {
-    let mut a: Vec<String> = SSH_OPTS.iter().map(|s| (*s).to_string()).collect();
+    let mut a = base_opts(host);
     a.push(format!("{user}@{host}"));
     a.push(remote_cmd.to_string());
     a
@@ -48,6 +77,13 @@ pub(crate) fn ssh_argv(user: &str, host: &str, remote_cmd: &str) -> Vec<String> 
 /// The ssh command (with opts) as one string, for rsync `-e` / `GIT_SSH_COMMAND`.
 fn ssh_command_str() -> String {
     format!("ssh {}", SSH_OPTS.join(" "))
+}
+
+/// [`ssh_command_str`] plus `host`'s extra options, shell-quoted (rsync
+/// splits `-e` like a shell).
+fn ssh_command_str_for(host: &str) -> String {
+    let extra: Vec<String> = host_opts(host).iter().map(|o| shell_quote(o)).collect();
+    if extra.is_empty() { ssh_command_str() } else { format!("{} {}", ssh_command_str(), extra.join(" ")) }
 }
 
 /// One discovered host on the LAN with TCP 22 reachable.
@@ -241,7 +277,7 @@ pub fn bootstrap_rustup_remote(user: &str, host: &str, target: &str) -> Result<S
 /// binary) from the server to this device. Reuses SSH_OPTS so the same defence-in-
 /// depth (no agent/tunnel) applies. Pure — unit-tested.
 pub fn scp_pull_argv(user: &str, host: &str, remote: &str, local: &str) -> Vec<String> {
-    let mut a: Vec<String> = SSH_OPTS.iter().map(|s| (*s).to_string()).collect();
+    let mut a = base_opts(host);
     a.push(format!("{user}@{host}:{remote}"));
     a.push(local.to_string());
     a
@@ -427,7 +463,7 @@ pub fn remote_feed(user: &str, host: &str, cmd: &str, stdin: &str) -> Result<Str
 /// `scp <hardened opts> <local> user@host:<remote>` argv — push a file (a freshly
 /// built binary) out to a device. Pure — unit-tested.
 pub fn scp_push_argv(local: &str, user: &str, host: &str, remote: &str) -> Vec<String> {
-    let mut a: Vec<String> = SSH_OPTS.iter().map(|s| (*s).to_string()).collect();
+    let mut a = base_opts(host);
     a.push(local.to_string());
     a.push(format!("{user}@{host}:{remote}"));
     a
@@ -448,7 +484,7 @@ pub fn rsync_push_argv(local: &str, user: &str, host: &str, remote: &str) -> Vec
     vec![
         "-az".to_string(),
         "-e".to_string(),
-        ssh_command_str(),
+        ssh_command_str_for(host),
         local.to_string(),
         format!("{user}@{host}:{remote}"),
     ]
@@ -1064,13 +1100,15 @@ const ASKPASS_BODY: &str = "#!/bin/sh\nprintf '%s\\n' \"$GM_SSH_PW\"\n";
 /// *password* auth: force password (the key isn't on the device yet) and
 /// auto-trust the host key. Pure — unit-tested.
 fn setup_key_argv(user: &str, host: &str) -> Vec<String> {
-    vec![
+    let mut a: Vec<String> = vec![
         "-o".into(), "PubkeyAuthentication=no".into(),
         "-o".into(), "PreferredAuthentications=password".into(),
         "-o".into(), "ConnectTimeout=8".into(),
         "-o".into(), "StrictHostKeyChecking=accept-new".into(),
-        format!("{user}@{host}"),
-    ]
+    ];
+    a.extend(host_opts(host));
+    a.push(format!("{user}@{host}"));
+    a
 }
 
 /// Derive the /24 the fleet lives on from a target IPv4 (e.g. `192.168.1.7` →
@@ -1401,6 +1439,27 @@ impl Job {
             // keep g.log so the finished build output stays on screen
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod host_opts_tests {
+    use super::*;
+
+    #[test]
+    fn per_host_options_reach_every_argv_and_only_that_host() {
+        let h = "10.254.99.7"; // unique to this test (the registry is process-wide)
+        set_host_opts(h, vec!["-o".into(), "HostKeyAlias=gitmind-t".into()]);
+        for argv in [ssh_argv("root", h, "true"), scp_push_argv("a", "root", h, "/b"), scp_pull_argv("root", h, "/b", "a"), setup_key_argv("root", h)] {
+            assert!(argv.iter().any(|x| x == "HostKeyAlias=gitmind-t"), "{argv:?}");
+            let alias = argv.iter().position(|x| x == "HostKeyAlias=gitmind-t").unwrap();
+            let dest = argv.iter().position(|x| x.contains(h)).unwrap();
+            assert!(alias < dest, "options before the destination: {argv:?}");
+        }
+        assert!(rsync_push_argv("a", "root", h, "/b")[2].contains("'HostKeyAlias=gitmind-t'"));
+        assert!(!ssh_argv("root", "10.254.99.8", "true").iter().any(|x| x.contains("HostKeyAlias")), "other hosts untouched");
+        set_host_opts(h, vec![]);
+        assert!(!ssh_argv("root", h, "true").iter().any(|x| x.contains("HostKeyAlias")), "cleared");
     }
 }
 

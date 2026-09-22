@@ -508,9 +508,12 @@ pub struct SshRemote {
 
 impl Remote for SshRemote {
     fn run(&mut self, cmd: &str) -> Result<String, String> {
+        // Over USB every tablet is 10.11.99.1: file its key per device.
+        crate::tablet_identity::prepare(&self.host);
         crate::deploy::remote_capture(&self.user, &self.host, cmd)
     }
     fn push(&mut self, local: &str, remote: &str) -> Result<(), String> {
+        crate::tablet_identity::prepare(&self.host);
         crate::deploy::scp_push(local, &self.user, &self.host, remote)
     }
 }
@@ -864,9 +867,16 @@ pub fn tablet_pubkeys() -> Result<String, String> {
 
 impl Enroller for SshEnroller {
     fn trust_host(&mut self) -> Result<String, String> {
-        crate::deploy::trust_host(&self.host)
+        // A tablet on a USB cable: pin its key per DEVICE (every reMarkable
+        // is 10.11.99.1; per-address trust made a second tablet look like
+        // an interception of the first).
+        match crate::tablet_identity::prepare(&self.host) {
+            Some(link) => crate::tablet_identity::trust(&self.host, &link),
+            None => crate::deploy::trust_host(&self.host),
+        }
     }
     fn key_check(&mut self) -> KeyCheck {
+        crate::tablet_identity::prepare(&self.host);
         match crate::deploy::remote_capture(&self.user, &self.host, "true") {
             Ok(_) => KeyCheck::Works,
             Err(e) if crate::deploy::ssh_error_reason(&e) == "hostkey" => KeyCheck::HostKeyChanged,
@@ -875,9 +885,11 @@ impl Enroller for SshEnroller {
         }
     }
     fn install_key(&mut self, password: &str) -> Result<String, String> {
+        crate::tablet_identity::prepare(&self.host);
         crate::deploy::setup_key_with(&self.user, &self.host, password, &tablet_pubkeys()?)
     }
     fn run(&mut self, cmd: &str) -> Result<String, String> {
+        crate::tablet_identity::prepare(&self.host);
         crate::deploy::remote_capture(&self.user, &self.host, cmd)
     }
 }
