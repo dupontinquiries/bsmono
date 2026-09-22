@@ -432,10 +432,30 @@ impl ShellView {
             if r.top() > panel.bottom() {
                 continue;
             }
-            let v = shell.drawer.slider(kind);
+            let relative = kind == SliderKind::Brightness && shell.ambient.enabled;
+            let v = if kind == SliderKind::Brightness { shell.brightness_slider_pos() } else { shell.drawer.slider(kind) };
             pc.rect_filled(r, cr(20), pal.bg_raised);
             pc.rect_filled(Rect::from_min_size(r.min, Vec2::new(r.width() * v, r.height())), cr(20), with_alpha(pal.accent, 0.45));
-            let label = if kind == SliderKind::Brightness && shell.ambient.enabled { format!("{} (auto)", kind.label()) } else { kind.label().to_string() };
+            let band = shell.brightness_band();
+            if relative {
+                // Centre tick = the auto level; the travel spans the band.
+                let cx = r.center().x;
+                pc.line_segment([Pos2::new(cx, r.top() + 8.0), Pos2::new(cx, r.bottom() - 8.0)], Stroke::new(1.5, with_alpha(pal.text, 0.5)));
+                // Absolute 0..100% track under the slider: where the band sits.
+                let t = Rect::from_min_size(Pos2::new(r.left() + 14.0, r.bottom() + 3.0), Vec2::new(r.width() - 28.0, 4.0));
+                let at = |x: f32| t.left() + t.width() * x.clamp(0.0, 1.0);
+                pc.rect_filled(t, cr(2), with_alpha(pal.text_weak, 0.25));
+                pc.rect_filled(Rect::from_min_max(Pos2::new(at(band.low), t.top()), Pos2::new(at(band.high), t.bottom())), cr(2), with_alpha(pal.accent, 0.8));
+                pc.line_segment([Pos2::new(at(band.center), t.top() - 2.0), Pos2::new(at(band.center), t.bottom() + 2.0)], Stroke::new(1.5, pal.text));
+                if let Some(a) = band.applied {
+                    pc.circle_filled(Pos2::new(at(a), t.center().y), 3.5, pal.text);
+                }
+            }
+            let label = if relative {
+                format!("{} (auto \u{b1}{:.0}%)", kind.label(), (band.high - band.low) * 50.0)
+            } else {
+                kind.label().to_string()
+            };
             pc.text(r.left_center() + Vec2::new(16.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(13.0), pal.text);
             let resp = ui.interact(r.intersect(panel), Id::new(("ts-slider", kind.token())), Sense::click_and_drag());
             if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.clicked()) {
@@ -517,7 +537,7 @@ impl ShellView {
                 }
                 BarWidget::Slider(k) => {
                     let track = Rect::from_center_size(r.center(), Vec2::new(unit * 0.5, r.height() - 12.0));
-                    let v = shell.drawer.slider(*k);
+                    let v = if *k == SliderKind::Brightness { shell.brightness_slider_pos() } else { shell.drawer.slider(*k) };
                     p.rect_filled(track, cr(12), pal.bg_raised);
                     let fill = Rect::from_min_max(Pos2::new(track.left(), track.bottom() - track.height() * v), track.max);
                     p.rect_filled(fill, cr(12), with_alpha(pal.accent, 0.45));

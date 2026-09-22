@@ -222,7 +222,9 @@ fn main() {
             print_new_trace(&sb.shell, &mut printed);
         }
         let busy = !sb.shell.recognizer.is_idle() || sb.view.needs_overlay(&sb.shell) || sb.shell.switcher.is_streaking();
-        let input = io.dispatch(if busy { 16 } else { 250 }).unwrap_or_else(|e| {
+        // 90 Hz while brightness is moving: one step per panel frame.
+        let timeout = if sb.shell.ambient.is_animating() { 11 } else if busy { 16 } else { 250 };
+        let input = io.dispatch(timeout).unwrap_or_else(|e| {
             eprintln!("tideshell: wayland: {e}");
             std::process::exit(1)
         });

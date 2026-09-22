@@ -303,6 +303,8 @@ pub enum Method {
 /// Minimum spacing between writes: brightnessctl is a process per call and
 /// a ramp produces many steps; coalescing keeps only the newest value.
 pub const MIN_WRITE_INTERVAL: Duration = Duration::from_millis(50);
+/// logind / sysfs: one frame of a 90 Hz panel.
+pub const FAST_WRITE_INTERVAL: Duration = Duration::from_micros(11_111);
 
 /// `brightnessctl` on PATH, if installed.
 pub fn find_brightnessctl() -> Option<PathBuf> {
@@ -355,10 +357,13 @@ fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>,
     set(note(cur, &skipped));
     let mut last_write: Option<std::time::Instant> = None;
     while let Ok(mut level) = rx.recv() {
+        // 90 Hz on the cheap paths (logind is one D-Bus call, sysfs one
+        // write); brightnessctl is a process per call, so 20 Hz.
+        let interval = if methods[cur] == Method::Brightnessctl { MIN_WRITE_INTERVAL } else { FAST_WRITE_INTERVAL };
         if let Some(t) = last_write {
             let since = t.elapsed();
-            if since < MIN_WRITE_INTERVAL {
-                std::thread::sleep(MIN_WRITE_INTERVAL - since);
+            if since < interval {
+                std::thread::sleep(interval - since);
             }
         }
         // Coalesce: a ramp sends many values; only the newest matters.
