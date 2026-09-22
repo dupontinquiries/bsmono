@@ -48,12 +48,16 @@ pub const DEPTH: usize = 3;
 /// Opus at this rate survives a phone's uplink.
 pub const BITRATE: i32 = 24_000;
 
-/// Opus, adapted to the link's codec seam.
+/// Opus, adapted to the link's codec seam. Only in builds with the `audio`
+/// feature (libopus); without it calls speak 16-bit PCM, the same fallback
+/// used when libopus is unusable at run time.
+#[cfg(feature = "audio")]
 struct OpusCodec {
     enc: Option<studio_media::voice::VoiceEncoder>,
     dec: Option<studio_media::voice::VoiceDecoder>,
 }
 
+#[cfg(feature = "audio")]
 impl OpusCodec {
     /// The tag every Opus build stamps its frames with; a PCM build's
     /// frames carry `PcmCodec::TAG` and the two conceal each other.
@@ -69,6 +73,7 @@ impl OpusCodec {
     }
 }
 
+#[cfg(feature = "audio")]
 impl Codec for OpusCodec {
     fn tag(&self) -> u8 { Self::TAG }
     fn encode(&mut self, pcm: &[f32]) -> Vec<u8> {
@@ -125,11 +130,11 @@ impl Call {
     /// the status line says which, because a PCM peer and an Opus peer
     /// conceal each other.
     pub fn new() -> Call {
-        match OpusCodec::encoder() {
-            Some(enc) => Call::with_link(
-                Link::new(DEPTH, enc, Box::new(OpusCodec::decoder)), "opus"),
-            None => Call::with_link(Link::pcm(DEPTH), "pcm"),
+        #[cfg(feature = "audio")]
+        if let Some(enc) = OpusCodec::encoder() {
+            return Call::with_link(Link::new(DEPTH, enc, Box::new(OpusCodec::decoder)), "opus");
         }
+        Call::with_link(Link::pcm(DEPTH), "pcm")
     }
 
     /// PCM both ways: the tests' constructor, so what goes in comes out

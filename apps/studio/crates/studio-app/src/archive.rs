@@ -468,16 +468,18 @@ mod tests {
         assert_eq!(u.save, save, "ALL state: mixer, rack, patterns, rolls, automation");
         assert_eq!(u.meta, meta(Level::Demo));
         assert_eq!(u.media.len(), 1);
-        assert_eq!(u.media[0].kind, MediaKind::OpusProxy);
-        // The proxy is a real Opus this repo's own decoder reads at 48k —
-        // an archive must PLAY everywhere, that is its whole point.
-        let back = studio_media::decode_bytes(u.media[0].bytes.clone(), Some("opus"))
+        // Opus proxy when the build has Opus; lossless FLAC otherwise. Either
+        // way it must PLAY everywhere, that is an archive's whole point.
+        let (kind, ext) = if crate::OPUS_BUILT { (MediaKind::OpusProxy, "opus") } else { (MediaKind::Flac, "flac") };
+        assert_eq!(u.media[0].kind, kind);
+        let back = studio_media::decode_bytes(u.media[0].bytes.clone(), Some(ext))
             .expect("the proxy decodes");
         assert_eq!(back.sample_rate, 48_000);
         let secs = back.frames() as f64 / 48_000.0;
         assert!((secs - 1.0).abs() < 0.05, "one second in, one second out: {secs}");
     }
 
+    #[cfg(feature = "audio")] // the slider sets an Opus bitrate
     #[test]
     fn the_fidelity_slider_actually_moves_the_size() {
         let save = save_with_sources(1);
