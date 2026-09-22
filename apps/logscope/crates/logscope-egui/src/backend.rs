@@ -1677,6 +1677,16 @@ continue, keeping the first {keep_prefix} tokens{}: {why}", self.name,
             // Below this the two candidates really could swap under a different prefill path, which
             // is the only case the retry was ever meant to cover.
             const NEAR_TIE_LOGITS: f32 = 0.5;
+            // RESTORED. f7fb925314 replaced these four lines with the comment
+            // below, whose own words are "NOT CHANGED HERE, deliberately" -- it
+            // meant to document, not to change behaviour, and left both uses of
+            // `stopped_decisively` pointing at nothing. Unseen because this path
+            // compiles only with `wgpu-engine`; found by fleet_build.sh's
+            // logscope+features build ("cannot find value `stopped_decisively`").
+            let stopped_decisively = match stop_margin(&s.logits) {
+                Some((top, margin)) => stop.contains(&top) && margin >= NEAR_TIE_LOGITS,
+                None => false,
+            };
             // MARGIN IS CONFIDENCE, NOT CORRECTNESS, and that is where the
             // skip above overreached. Its premise — "when the model wants to
             // stop by a wide margin a clean prefill reproduces it exactly" —
