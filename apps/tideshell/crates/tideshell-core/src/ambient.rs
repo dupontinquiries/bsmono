@@ -269,6 +269,13 @@ impl AutoBrightness {
         match (self.level, self.last_reading) {
             (Some(l), Some(t)) => {
                 let dt = (now.saturating_sub(t) as f32 / 1000.0).max(1e-3);
+                // The noise estimate sees EVERY reading, including darker ones
+                // the gate holds back: the gate stops the level following a
+                // dip, but flicker must still widen the band. (With the update
+                // after the gate, light flickering below its level - 480/120
+                // lux - left the band at its minimum; seen in the simulator.)
+                let resid0 = x - (l + self.trend * dt);
+                self.var += (resid0 * resid0 - self.var) * (1.0 - (-dt / TAU_VAR).exp());
                 if x < l {
                     let since = *self.darker_since.get_or_insert(now);
                     if now.saturating_sub(since) < DARKEN_DELAY_MS {
@@ -292,7 +299,6 @@ impl AutoBrightness {
                     self.trend *= (-dt / TREND_SPENT_TAU).exp();
                 }
                 let resid = x - predicted;
-                self.var += (resid * resid - self.var) * (1.0 - (-dt / TAU_VAR).exp());
                 let a = 1.0 - (-dt / tau).exp();
                 let new_l = predicted + a * resid;
                 let b = 1.0 - (-dt / TAU_TREND).exp();
@@ -528,18 +534,42 @@ mod tests {
         let mut a = on();
         let (_, _, t) = run(&mut a, 300.0, 40.0, 0, 10);
         assert!(a.half_width() < W_MIN + 0.02, "steady: narrow ({})", a.half_width());
-        let (_, _, t) = run_fn(&mut a, |s| if (s * 4.0) as u32 % 2 == 0 { 120.0 } else { 900.0 }, 8.0, t, 10);
+        // Mild noise: widens the band without pinning it at W_MAX (strong
+        // noise saturates both band and target, leaving no lag to measure).
+        let (_, _, t) = run_fn(&mut a, |s| if (s * 4.0) as u32 % 2 == 0 { 200.0 } else { 450.0 }, 8.0, t, 10);
         let wide = a.half_width();
-        assert!(wide > W_MIN + 0.06, "noisy: widened ({wide})");
-        let (_, _, t) = run(&mut a, 300.0, 1.0, t, 10);
-        // Contracts slowly: it lags behind the width the light now calls for.
-        // Measured: +0.027 at 1 s with TAU_W_CONTRACT, ~0.000 with fast
-        // contraction. (Comparing against the earlier width passed even with
-        // fast contraction, because the target width itself falls slowly.)
-        let lag = a.half_width() - a.width_target(t, NOON);
-        assert!(lag > 0.01, "band {} vs target {}: not lagging", a.half_width(), a.width_target(t, NOON));
+        assert!(wide > W_MIN + 0.04 && wide < W_MAX - 0.02, "noisy: widened, not saturated ({wide})");
+        // Contracts slowly, tested as a STEP: clear the noise and trend state
+        // so the target width drops to W_MIN at once, then see how much of
+        // the band's excess remains after 1 s: exp(-1/5) ~ 82% with slow
+        // contraction, exp(-2.5) ~ 8% if it contracted fast. (Measuring lag
+        // against a gradually falling target was marginal: the noise
+        // estimate itself falls almost as slowly as the band.)
+        a.var = 0.0;
+        a.trend = 0.0;
+        let excess = a.half_width() - W_MIN;
+        let steady = a.smoothed_lux().unwrap();
+        let (_, _, t) = run(&mut a, steady, 1.0, t, 10);
+        assert!(a.width_target(t, NOON) < W_MIN + 0.01, "target stepped down");
+        let remain = (a.half_width() - W_MIN) / excess;
+        assert!(remain > 0.7, "band narrowed too fast: {remain:.2} of the excess left after 1 s");
         run(&mut a, 300.0, 60.0, t, 10);
         assert!(a.half_width() < W_MIN + 0.03, "steady again: narrow ({})", a.half_width());
+    }
+
+    #[test]
+    fn flicker_below_the_level_widens_the_band_without_dimming() {
+        // Bright light with short dark flickers: the gate keeps brightness up,
+        // but the band must still widen (the simulator caught it staying at
+        // its minimum when the gate hid the dark samples from the variance).
+        let mut a = on();
+        let (_, _, t) = run(&mut a, 480.0, 40.0, 0, 20);
+        let steady_w = a.half_width();
+        let before = a.applied.unwrap();
+        let (all, _, _) = run_fn(&mut a, |s| if (s * 4.0) as u32 % 2 == 0 { 480.0 } else { 120.0 }, 8.0, t, 20);
+        assert!(a.half_width() > steady_w + 0.04, "band did not widen: {} -> {}", steady_w, a.half_width());
+        let dip = all.iter().cloned().fold(before, f32::min);
+        assert!(before - dip < 0.01, "brightness dipped {before} -> {dip}");
     }
 
     #[test]
