@@ -1,0 +1,6 @@
+{
+  "name": "rigkit-harness",
+  "private": true,
+  "description": "Headless checks on the built viewers: boots a page's own script in node with the real three.js.",
+  "dependencies": { "three": "0.128.0" }
+}
