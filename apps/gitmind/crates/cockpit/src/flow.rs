@@ -1312,6 +1312,26 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     // vidkit-player comment above describes, found this time by
     // `every_registered_app_is_offered_in_the_store` rather than by a user.
     // A workspace whose runnable crate is one level down, so it needs a path.
+    // tideshell: a touch shell over cosmic-comp (merged drop/tideshell).
+    // Registered in the manifest as primary and never added HERE -- its session
+    // branched from a base where this very test already failed on stoat, so it
+    // could not see it had added a second. Found by
+    // `every_registered_app_is_offered_in_the_store` after the merge.
+    //
+    // THE SIMULATOR, not the shell. The crate builds two binaries and the
+    // defaults satisfy both, but `tideshell` does not open a window -- it
+    // BECOMES the shell, putting layer-shell strips over cosmic-comp, and ships
+    // its own deployment kit (launcher + systemd unit) to run as a session
+    // shell. Launching that from a store on a desktop would take over the
+    // session. `tideshell-sim` is the phone-sized simulator: the safe way to try
+    // it. Point this at "tideshell" instead if the store should drive the real
+    // deployment.
+    let tideshell = || crate::suite::SuiteApp {
+        name: "tideshell".into(),
+        path: "apps/tideshell/egui-frontend".into(),
+        features: vec![], no_default: false, target: String::new(), run_flags: String::new(),
+        bin_name: Some("tideshell-sim".into()),
+    };
     let stoat = || crate::suite::SuiteApp {
         name: "stoat".into(),
         path: "apps/stoat/crates/gui-egui".into(),
@@ -1362,6 +1382,8 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     work_group.apps.push(ambient_learner());
     work_group.apps.push(dialer());
     work_group.apps.push(switcheroo());
+    // A shell is input and daily-use surface: work, not media or coding.
+    work_group.apps.push(tideshell());
     work_group.apps.push(hatch());
     work_group.apps.push(drivemind());
     // clawbound-battleground: a plain package at games/clawbound-battleground
@@ -1394,6 +1416,7 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     // Every group member must also be in `all` -- the test that caught this
     // says so in as many words: "the all-group push was forgotten".
     all_group.apps.push(stoat());
+    all_group.apps.push(tideshell());
     all_group.apps.push(unendlich());
     all_group.apps.push(battleground());
     vec![
@@ -1478,10 +1501,12 @@ mod store_group_tests {
         // `egui-frontend` deliberately. Same exception, different cause, and
         // worth saying so: the next reader will otherwise assume it is another
         // workspace.
-        const EXPLICIT_PATH: [&str; 14] = [
+        const EXPLICIT_PATH: [&str; 15] = [
             "bsettings", "studio", "aperture", "cadscope", "simscope", "ambient-learner",
             // stoat: a workspace whose runnable crate is crates/gui-egui.
             "stoat",
+            // tideshell: the runnable crate is egui-frontend, not the workspace root.
+            "tideshell",
             // Five apps the store did not offer at all until they were added;
             // each is a workspace whose runnable crate is a member.
             "hatch", "drivemind", "switcheroo", "dialer", "bscale",
