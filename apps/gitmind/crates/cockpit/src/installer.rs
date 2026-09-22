@@ -45,6 +45,64 @@ pub fn desktop_entry(name: &str, exec: &str, icon: &str) -> String {
 /// into the target user's ~/.local/bin, mark it executable, and write a .desktop
 /// launcher. `$HOME` expands on the target (unquoted heredoc). If `has_icon`, the icon
 /// was pushed to /tmp too and is moved into the per-user cache. Pure — unit-tested.
+/// Up to two initials for a letter tile: words split on `-_. `, frontend suffixes
+/// dropped (`gitmind-egui` is gitmind, and every tile ending in E would say nothing),
+/// first letter of each of two words, else the first two letters of one.
+pub fn tile_initials(app: &str) -> String {
+    const SUFFIXES: [&str; 6] = ["egui", "gtk", "qt", "app", "frontend", "gui"];
+    let words: Vec<String> = app.split(|c: char| c == '-' || c == '_' || c == '.' || c == ' ')
+        .map(|w| w.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>())
+        .filter(|w| !w.is_empty() && !SUFFIXES.contains(&w.to_ascii_lowercase().as_str()))
+        .collect();
+    let s: String = match words.as_slice() {
+        [] => "?".into(),
+        [one] => one.chars().take(2).collect(),
+        [a, b, ..] => a.chars().take(1).chain(b.chars().take(1)).collect(),
+    };
+    let mut c = s.chars();
+    match c.next() {
+        Some(_) if words.len() >= 2 => s.to_ascii_uppercase(),
+        Some(f) => f.to_ascii_uppercase().to_string() + &c.as_str().to_ascii_lowercase(),
+        None => "?".into(),
+    }
+}
+
+/// A colour per app, stable across pushes: hue from an FNV hash of the name, at a
+/// saturation and lightness white text stays readable on. Hex, not `hsl()`, so no
+/// icon renderer has to support CSS colour functions.
+fn tile_colour(app: &str) -> String {
+    let mut h: u32 = 0x811c9dc5;
+    for b in app.bytes() { h = (h ^ b as u32).wrapping_mul(0x01000193); }
+    let hue = (h % 360) as f32;
+    let (s, l) = (0.55f32, 0.42f32);
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((hue / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match hue as u32 / 60 {
+        0 => (c, x, 0.0), 1 => (x, c, 0.0), 2 => (0.0, c, x),
+        3 => (0.0, x, c), 4 => (x, 0.0, c), _ => (c, 0.0, x),
+    };
+    let to = |v: f32| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    format!("#{:02x}{:02x}{:02x}", to(r), to(g), to(b))
+}
+
+/// A letter-tile icon as SVG, for an app pushed without one.
+///
+/// SVG, not PNG: a few hundred bytes of text, so it rides inside the install script as
+/// a heredoc -- no encoder, no base64, no second upload -- and it scales to whatever
+/// size a launcher asks for from `hicolor/scalable/apps`, which every desktop reads.
+pub fn letter_tile_svg(app: &str) -> String {
+    let initials = tile_initials(app);
+    let size = if initials.chars().count() >= 2 { 104 } else { 128 };
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"256\" height=\"256\" viewBox=\"0 0 256 256\">\
+         <rect width=\"256\" height=\"256\" rx=\"56\" fill=\"{bg}\"/>\
+         <text x=\"128\" y=\"128\" dy=\"0.35em\" text-anchor=\"middle\" font-family=\"sans-serif\" \
+         font-weight=\"700\" font-size=\"{size}\" fill=\"#ffffff\">{initials}</text></svg>",
+        bg = tile_colour(app),
+    )
+}
+
 pub fn push_install_script(app: &str, has_icon: bool) -> String {
     // THE ICON GOES IN THE ICON THEME, not the cache.
     //
@@ -63,7 +121,22 @@ pub fn push_install_script(app: &str, has_icon: bool) -> String {
             format!("Icon={app}\n"),
         )
     } else {
-        (String::new(), String::new())
+        // EVERY APP GETS AN ICON. This branch used to write no `Icon=` line at all --
+        // and every production caller passes `has_icon = false` (gui, gui-egui's
+        // ssh_runner, both flow.rs paths); only tests passed true. So no app pushed to a
+        // phone ever had an icon. COSMIC's launcher lays out by icon: each entry drew as
+        // an empty cell that still launched on tap, so "I can't see how many are there".
+        // Seen on a Fairphone 5 under COSMIC.
+        (
+            format!(
+                "mkdir -p \"$HOME/.local/share/icons/hicolor/scalable/apps\"\n\
+                 cat > \"$HOME/.local/share/icons/hicolor/scalable/apps/{app}.svg\" <<'SVG'\n\
+                 {svg}\n\
+                 SVG\n",
+                svg = letter_tile_svg(app),
+            ),
+            format!("Icon={app}\n"),
+        )
     };
     format!(
         "set -e\n\
@@ -232,12 +305,59 @@ mod tests {
     }
 
     #[test]
+    fn tile_initials_skip_frontend_suffixes() {
+        assert_eq!(tile_initials("gitmind-egui"), "Gi");
+        assert_eq!(tile_initials("clawbound-battleground"), "CB");
+        assert_eq!(tile_initials("snapclone-egui"), "Sn");
+        assert_eq!(tile_initials("rusty-board-egui"), "RB");
+        assert_eq!(tile_initials("depot"), "De");
+        assert_eq!(tile_initials("egui"), "?", "all suffix: still an icon, never empty");
+        assert_eq!(tile_initials("tideshell"), "Ti");
+    }
+
+    #[test]
+    fn tiles_differ_by_app_and_are_stable() {
+        let a = letter_tile_svg("gitmind-egui");
+        assert_eq!(a, letter_tile_svg("gitmind-egui"), "stable across pushes");
+        let colours: std::collections::BTreeSet<String> = ["gitmind-egui", "snapclone-egui", "depot",
+            "switcheroo", "voiceterm-egui", "clawbound-battleground"].iter().map(|n| tile_colour(n)).collect();
+        assert!(colours.len() >= 5, "six apps should not collapse to one colour: {colours:?}");
+        for c in &colours { assert!(c.len() == 7 && c.starts_with('#'), "hex colour: {c}"); }
+        assert!(a.starts_with("<svg") && a.ends_with("</svg>") && a.contains(">Gi<"));
+    }
+
+    /// THE PATH EVERY PRODUCTION CALLER TAKES, run for real: no icon pushed, and the
+    /// launcher still gets one -- an SVG in the icon theme and `Icon=` in the entry.
+    #[test]
+    fn an_app_pushed_without_an_icon_still_gets_one_when_the_script_runs() {
+        let root = std::env::temp_dir().join(format!("gm-noicon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tmp = root.join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("tideshell"), b"#!/bin/sh\ntrue\n").unwrap();
+        let script = push_install_script("tideshell", false)
+            .replace("/tmp/tideshell", tmp.join("tideshell").to_str().unwrap());
+        let out = std::process::Command::new("sh").arg("-c").arg(&script).env("HOME", &root).output().expect("sh");
+        assert!(out.status.success(), "script failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("gitmind-pushed"));
+        let desk = std::fs::read_to_string(root.join(".local/share/applications/tideshell.desktop")).unwrap();
+        assert!(desk.contains("Icon=tideshell\n"), "entry names its icon:\n{desk}");
+        let svg = std::fs::read_to_string(root.join(".local/share/icons/hicolor/scalable/apps/tideshell.svg")).unwrap();
+        assert!(svg.trim_start().starts_with("<svg") && svg.trim_end().ends_with("</svg>"), "a whole SVG:\n{svg}");
+        assert!(svg.contains(">Ti<"), "with its initials");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn push_install_script_installs_and_launches() {
         let s = push_install_script("peek", false);
         assert!(s.contains("mv /tmp/peek \"$HOME/.local/bin/peek\""), "moves into ~/.local/bin");
         assert!(s.contains("chmod +x"), "executable");
         assert!(s.contains("[Desktop Entry]") && s.contains("Exec=$HOME/.local/bin/peek"), "launcher");
-        assert!(!s.contains("Icon="), "no icon when none pushed");
+        // Formerly `!s.contains("Icon=")` -- "no icon when none pushed" -- which pinned
+        // the bug: every production caller takes this branch, so no pushed app had one.
+        assert!(s.contains("Icon=peek\n"), "every app gets an icon, pushed or not");
+        assert!(s.contains("hicolor/scalable/apps/peek.svg") && s.contains("<svg"), "a letter tile");
         assert!(s.contains("echo gitmind-pushed"), "completion marker");
         // with icon → installed into the icon theme and referenced BY NAME
         let si = push_install_script("peek", true);
