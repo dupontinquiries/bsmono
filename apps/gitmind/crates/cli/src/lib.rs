@@ -1415,7 +1415,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
         Some(i) => (&rest[2..i], rest[i + 1..].to_vec()),
         None => (&rest[2..], vec![]),
     };
-    let pos: Vec<&String> = flags.iter().filter(|a| !a.starts_with("--")).collect();
+    let pos: Vec<&String> = eink_positionals(flags);
     // `--user U`, else GITMIND_RM_USER, else root (reMarkable: "root at the
     // time of writing", so a default, not a constant).
     let user = opt(flags, "--user").map(str::to_string)
@@ -1647,7 +1647,35 @@ fn cmd_eink(rest: &[String]) -> i32 {
                 base: opt(flags, "--mirror").unwrap_or(al::DEFAULT_MIRROR).to_string(),
                 branch: opt(flags, "--branch").unwrap_or(al::DEFAULT_BRANCH).to_string(),
             };
+            // A depot mirror is asked first whether it can satisfy the whole
+            // install (dependency closure vs what was ingested); a partial
+            // mirror otherwise fails halfway with a bare 404.
+            let wanted: Vec<&str> = match action {
+                "bootstrap" => ["apk-tools-static", "alpine-keys"].into_iter().chain(al::BASE_PACKAGES.iter().copied()).collect(),
+                "add" | "check" => names.clone(),
+                "audio" => vec!["bluez-alsa", "bluez-alsa-utils", "alsa-utils"],
+                _ => vec![],
+            };
+            if !wanted.is_empty() && !cli_flag(flags, "--force") {
+                let arch = match ef::Remote::run(&mut remote, "uname -m") { Ok(a) => a.trim().to_string(), Err(e) => return eink_err(&e) };
+                match al::check_mirror(&mirror, &arch, &wanted) {
+                    Some(Ok(c)) if c.ok() => eprintln!("depot has everything: {} package(s) for {arch}", c.needed),
+                    Some(Ok(c)) => {
+                        eprintln!("the depot cannot satisfy this install for {arch}:");
+                        for k in &c.absent_repos { eprintln!("  no repository {k}"); }
+                        for (k, f) in &c.missing { eprintln!("  missing {k}/{f}"); }
+                        for u in &c.unresolved { eprintln!("  nothing provides {u}"); }
+                        eprintln!("\n{}", c.fetch_script());
+                        eprintln!("(--force to try anyway)");
+                        return 1;
+                    }
+                    Some(Err(e)) => return eink_err(&format!("asking the depot: {e}")),
+                    None => {} // not a depot: apk reports as usual
+                }
+                if action == "check" { return 0; }
+            }
             let cmd = match action {
+                "check" => return eink_err("pkg check <host> <package>... --mirror <depot>/alpine (only a depot can be asked)"),
                 "runner" => {
                     let Some(bin) = names.first() else { return eink_err("pkg runner <path to the built alpine-run>") };
                     let (probe, d) = match remote_probe(&mut remote) { Ok(p) => p, Err(e) => return eink_err(&e) };
@@ -1663,7 +1691,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
                 "list" => al::list_cmd(),
                 "update" => al::update_cmd(),
                 "audio" => format!("{} && {}", al::add_cmd(&["bluez-alsa", "bluez-alsa-utils", "alsa-utils"]).unwrap(), al::bluealsa_start_cmd()),
-                _ => return eink_err("pkg <host> runner|bootstrap|add|del|list|update|audio ..."),
+                _ => return eink_err("pkg <host> runner|bootstrap|add|del|list|update|audio|check ..."),
             };
             match ef::Remote::run(&mut remote, &cmd) {
                 Ok(out) => { println!("{}", out.trim_end()); 0 }
@@ -1696,6 +1724,43 @@ fn cmd_eink(rest: &[String]) -> i32 {
         }
         _ => err(USAGE),
     }
+}
+
+/// `gitmind eink` flags that take a value (the next argument).
+const EINK_VALUE_FLAGS: &[&str] = &["--user", "--name", "--title", "--icon", "--profile", "--engine", "--mirror", "--branch"];
+
+/// Positional arguments: everything that is neither a flag nor a value
+/// flag's value. (Dropping only the `--x` tokens kept their values, so
+/// `pkg add bluez-alsa --mirror URL` tried to install a package named URL.)
+fn eink_positionals(flags: &[String]) -> Vec<&String> {
+    let mut out = Vec::new();
+    let mut skip = false;
+    for a in flags {
+        if skip {
+            skip = false;
+        } else if a.starts_with("--") {
+            skip = EINK_VALUE_FLAGS.contains(&a.as_str());
+        } else {
+            out.push(a);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod eink_args_tests {
+    #[test]
+    fn value_flags_do_not_leak_into_positionals() {
+        let v: Vec<String> = ["add", "bluez-alsa", "--mirror", "http://d/alpine", "--force", "alsa-utils", "--user", "root"].iter().map(|s| s.to_string()).collect();
+        let p: Vec<&str> = super::eink_positionals(&v).iter().map(|s| s.as_str()).collect();
+        assert_eq!(p, vec!["add", "bluez-alsa", "alsa-utils"]);
+        let d: Vec<String> = ["--name", "X", "./bin/app"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(super::eink_positionals(&d), vec!["./bin/app"], "deploy <host> --name X <bin>");
+    }
+}
+
+fn cli_flag(flags: &[String], name: &str) -> bool {
+    flags.iter().any(|f| f == name)
 }
 
 /// An eink error, followed by what gitmind can say about it (stoat's lesson:

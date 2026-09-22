@@ -60,6 +60,108 @@ impl Mirror {
     }
 }
 
+/// Where depot's API would be for a mirror URL of depot's shape
+/// (`<depot>/alpine`). Alpine's own mirrors ALSO end in `/alpine`, so they
+/// are excluded by host; anything else is confirmed by the listing itself
+/// (`check_mirror` treats a non-listing answer as "not a depot").
+pub fn depot_api(m: &Mirror) -> Option<String> {
+    let base = m.base.trim_end_matches('/');
+    let host = base.split("://").nth(1).unwrap_or(base).split('/').next().unwrap_or("");
+    if host.ends_with("alpinelinux.org") {
+        return None;
+    }
+    base.strip_suffix("/alpine").map(|b| format!("{b}/api/alpine"))
+}
+
+/// What a depot can and cannot satisfy for an install.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DepotCheck {
+    /// Packages in the dependency closure.
+    pub needed: usize,
+    /// (repo key, file name) named by the closure but not ingested.
+    pub missing: Vec<(String, String)>,
+    /// Dependencies no package in the depot's indexes provides.
+    pub unresolved: Vec<String>,
+    /// Repos the tablet needs that the depot does not have at all.
+    pub absent_repos: Vec<String>,
+}
+
+impl DepotCheck {
+    pub fn ok(&self) -> bool {
+        self.missing.is_empty() && self.unresolved.is_empty() && self.absent_repos.is_empty()
+    }
+
+    /// Commands for the ONLINE side to fetch exactly what is missing from
+    /// Alpine's CDN, laid out for `depot ingest alpine`.
+    pub fn fetch_script(&self) -> String {
+        let mut s = String::from("# on a machine with internet access:\n");
+        for (key, file) in &self.missing {
+            s += &format!("mkdir -p {key} && curl -fsSLo {key}/{file} {DEFAULT_MIRROR}/{key}/{file}\n");
+        }
+        for key in &self.absent_repos {
+            s += &format!("mkdir -p {key} && curl -fsSLo {key}/APKINDEX.tar.gz {DEFAULT_MIRROR}/{key}/APKINDEX.tar.gz\n");
+        }
+        s += "depot ingest alpine .   # then move it to the depot, or pack it: depot pack --alpine\n";
+        s
+    }
+}
+
+/// Pure: can the depot described by `listing`, whose repos' indexes are
+/// `indexes` ((key, packages)), satisfy installing `wanted`?
+pub fn check_depot(listing: &depot_core::api::AlpineListing, indexes: &[(String, Vec<depot_core::alpine::IndexPkg>)], wanted: &[&str], needed_repos: &[String]) -> DepotCheck {
+    let mut all = Vec::new();
+    let mut repo_of = std::collections::BTreeMap::new();
+    for (key, pkgs) in indexes {
+        for p in pkgs {
+            repo_of.entry(p.name.clone()).or_insert_with(|| key.clone());
+            all.push(p.clone());
+        }
+    }
+    let c = depot_core::alpine::closure(&all, wanted);
+    let mut missing = Vec::new();
+    for p in &c.needed {
+        let key = &repo_of[&p.name];
+        let have = listing.repo(key).is_some_and(|r| r.packages.iter().any(|x| x.name == p.name && x.version == p.version));
+        if !have {
+            missing.push((key.clone(), p.filename()));
+        }
+    }
+    DepotCheck {
+        needed: c.needed.len(),
+        missing,
+        unresolved: c.unresolved,
+        absent_repos: needed_repos.iter().filter(|k| listing.repo(k).is_none()).cloned().collect(),
+    }
+}
+
+fn curl(url: &str) -> Result<Vec<u8>, String> {
+    let o = std::process::Command::new("curl").args(["-fsS", "--max-time", "20", url]).output().map_err(|e| format!("curl: {e}"))?;
+    if !o.status.success() {
+        return Err(format!("{url}: {}", String::from_utf8_lossy(&o.stderr).trim()));
+    }
+    Ok(o.stdout)
+}
+
+/// Ask the depot behind `m` whether it can satisfy installing `wanted` on a
+/// tablet of `arch`. None when `m` is not a depot.
+pub fn check_mirror(m: &Mirror, arch: &str, wanted: &[&str]) -> Option<Result<DepotCheck, String>> {
+    let api = depot_api(m)?;
+    // Not answering with a depot listing = not a depot (a plain mirror
+    // behind some other URL): no check, apk reports as usual.
+    let listing: depot_core::api::AlpineListing = serde_json::from_slice(&curl(&api).ok()?).ok()?;
+    Some((|| {
+        let needed_repos: Vec<String> = ["main", "community"].iter().map(|r| format!("{}/{r}/{arch}", m.branch)).collect();
+        let mut indexes = Vec::new();
+        for key in needed_repos.iter().filter(|k| listing.repo(k).is_some()) {
+            let bytes = curl(&format!("{}/{key}/APKINDEX.tar.gz", m.base.trim_end_matches('/')))?;
+            indexes.push((key.clone(), depot_core::alpine::parse_index(&bytes).map_err(|e| format!("{key}: {e}"))?));
+        }
+        // community is optional: only main must exist
+        let must: Vec<String> = needed_repos.into_iter().take(1).collect();
+        Ok(check_depot(&listing, &indexes, wanted, &must))
+    })())
+}
+
 fn valid_pkg(p: &str) -> bool {
     !p.is_empty() && p.len() <= 128 && p.chars().all(|c| c.is_ascii_alphanumeric() || "+-._".contains(c))
 }
@@ -279,6 +381,35 @@ mod tests {
         assert!(b.contains("a2dp-source") && b.contains("hfp-ag") && b.contains(RUNNER));
         let o = std::process::Command::new("sh").arg("-n").arg("-c").arg(&b).output().unwrap();
         assert!(o.status.success());
+    }
+
+    #[test]
+    fn a_depot_check_names_every_missing_dependency_and_how_to_fetch_it() {
+        use depot_core::api::{AlpineListing, AlpinePkgListing, AlpineRepoListing};
+        let idx = depot_core::alpine::parse_index_text(concat!(
+            "P:bluez-alsa\nV:4-r0\nD:so:libasound.so.2 dbus-libs\n\n",
+            "P:alsa-lib\nV:1-r0\np:so:libasound.so.2=2\n\n",
+            "P:dbus-libs\nV:1.14-r0\n\n"));
+        let key = "latest-stable/main/aarch64".to_string();
+        let pkg = |n: &str, v: &str| AlpinePkgListing { name: n.into(), version: v.into(), size: 1 };
+        let listing = AlpineListing { repos: vec![AlpineRepoListing { repo: key.clone(), url: String::new(), index_size: 1,
+            packages: vec![pkg("bluez-alsa", "4-r0"), pkg("dbus-libs", "1.14-r0")] }] };
+        let c = check_depot(&listing, &[(key.clone(), idx)], &["bluez-alsa"], &[key.clone()]);
+        assert_eq!(c.needed, 3);
+        assert_eq!(c.missing, vec![(key.clone(), "alsa-lib-1-r0.apk".to_string())], "found through the so: provide");
+        assert!(!c.ok());
+        let script = c.fetch_script();
+        assert!(script.contains("curl -fsSLo latest-stable/main/aarch64/alsa-lib-1-r0.apk https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/aarch64/alsa-lib-1-r0.apk"), "{script}");
+        assert!(script.contains("depot ingest alpine ."));
+        // a depot without the tablet's repo at all
+        let empty = AlpineListing::default();
+        assert_eq!(check_depot(&empty, &[], &["x"], &[key.clone()]).absent_repos, vec![key]);
+    }
+
+    #[test]
+    fn only_depot_mirrors_have_an_api() {
+        assert_eq!(depot_api(&Mirror { base: "http://depot.lan:8000/alpine/".into(), branch: "v3.22".into() }).as_deref(), Some("http://depot.lan:8000/api/alpine"));
+        assert!(depot_api(&Mirror::default()).is_none(), "Alpine's CDN is not asked");
     }
 
     #[test]
