@@ -486,6 +486,32 @@ pub fn open_backend(cfg: &Config, hub: &InputHub) -> std::io::Result<Box<dyn Pre
 }
 
 /// Run `app` until the display server goes away.
+/// `YYYY-MM-DD HH:MM:SS UTC` from unix seconds (no date crate for one line).
+fn utc(secs: u64) -> String {
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // civil-from-days (Howard Hinnant's algorithm)
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+#[cfg(test)]
+mod launch_line_tests {
+    #[test]
+    fn utc_formats_known_instants() {
+        assert_eq!(super::utc(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(super::utc(1_790_000_000), "2026-09-21 14:13:20 UTC"); // checked against Python
+        assert_eq!(super::utc(951_782_400), "2000-02-29 00:00:00 UTC"); // leap day
+    }
+}
+
 /// `EINK_LOG=<path>`: append stderr there. An app launched from AppLoad's
 /// sidebar has no terminal, so without this its startup errors (no display
 /// server, wrong model, bad knob) are invisible; gitmind sets it in the
@@ -504,6 +530,13 @@ fn redirect_stderr() {
 
 pub fn run(mut app: impl EinkApp) -> std::io::Result<()> {
     redirect_stderr();
+    // One line per launch that identifies it: when, which process, and the
+    // settings as the process actually received them (a log appended over
+    // many launches was otherwise impossible to attribute: a manifest edit
+    // and a cached launcher environment look identical without this).
+    let since_epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let seen: Vec<String> = std::env::vars().filter(|(k, _)| k.starts_with("EINK_") || k == "QTFB_KEY").map(|(k, v)| format!("{k}={v}")).collect();
+    eprintln!("eink: ---- launch pid={} unix={since_epoch} ({}) {}", std::process::id(), utc(since_epoch), seen.join(" "));
     let cfg = Config::from_env().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let hub = InputHub::new()?;
     let mut present = open_backend(&cfg, &hub).inspect_err(|e| eprintln!("eink: {e}"))?;
