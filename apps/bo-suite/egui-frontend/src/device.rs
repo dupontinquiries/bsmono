@@ -124,6 +124,21 @@ pub fn view_requires(view: &str) -> Option<&'static str> {
 /// pages on an unrecognised device makes a new speaker look broken, while
 /// showing a page that turns out to do nothing is the lesser failure.
 pub fn views_for(profile: &Profile, all: &[&'static str]) -> Vec<&'static str> {
+    // THE BUILT-IN FALLBACK IS A GUESS, NOT KNOWLEDGE: it is what a product
+    // nothing describes resolves to. Gating pages on a guess hides them from a
+    // speaker merely because it is new -- which is what 919ccdf27 ("a product
+    // without a control should not get its page") did by gating the Mixer on
+    // `eq`: this fallback's controls, ported verbatim from the QML, have no `eq`,
+    // so every unrecognised product lost its Mixer. That broke 870daf6fc's
+    // "an unrecognised product ... still shows every view" (6 expected, 5 got),
+    // plus three view-reconcile tests -- found by fleet_build.sh.
+    //
+    // Only the BUILT-IN default is exempt. A map that describes "Unknown Type"
+    // itself is its author's deliberate claim and still gates. And the control
+    // list is untouched, so the widgets that read it keep the QML's set.
+    if *profile == Profile::default() {
+        return all.to_vec();
+    }
     all.iter()
         .copied()
         .filter(|v| view_requires(v).is_none_or(|c| profile.has_control(c)))
