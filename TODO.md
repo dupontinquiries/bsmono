@@ -6,6 +6,9 @@ Living checklist. Companion to `maintenance/SCRATCHPAD.md` (design log),
 lines in place, so it is current). Each item in both is marked with how it was
 established — verified, read, or assumed.
 
+**C20** (after c19unified-003): `maintenance/C20_TODO.md` -- the rig work, blackstar-rs
+findings, and the voiceterm / aperture / tomescope investigations that changed no code.
+
 `maintenance/journal.txt` was referenced here as the session catalog and does
 not exist in the tree; tracked as C9-7c rather than silently dropped.
 

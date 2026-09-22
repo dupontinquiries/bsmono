@@ -1,8 +1,8 @@
 //! MENU SIM — the consoles and their motion, without a window.
 //!
-//!     skydribble --menu                      walk the stations (list)
-//!     skydribble --menu armory               open one console, watch it deploy
-//!     skydribble --menu armory --tape d,d,a  then play an input tape
+//!      blackstar --menu                      walk the stations (list)
+//!      blackstar --menu armory               open one console, watch it deploy
+//!      blackstar --menu armory --tape d,d,a  then play an input tape
 //!
 //! ## The tape wraps, and I blamed it twice for that
 //!
@@ -16,7 +16,7 @@
 //! headings, gaps and disabled rows are skipped — is the whole trick, and
 //! `--menu <station>` with no tape prints them in order so the count is
 //! there to read.
-//!     skydribble --menu motion               the fx kit's dials, demonstrated
+//!      blackstar --menu motion               the fx kit's dials, demonstrated
 //!
 //! Every animation in `menufx.rs` is a pure function of time, which
 //! means it can be photographed in text: this harness ticks the same

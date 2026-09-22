@@ -10614,3 +10614,11 @@ the user better. Decision needed: restrict sub-path stitching to an allowlist of
 platform sites (and route the rest to SearchWeb), or keep the current broad
 behavior. Test `narration_open_tail_not_searched` currently asserts only the
 weaker invariant (navigate OR search) pending this call.
+
+
+## From C20 (investigated, not built -- see maintenance/C20_TODO.md)
+
+- **Paste image into markdown.** `.assets/` and `manpages::resolve_one_img_src`
+  exist; only the clipboard read is missing. Shared with aperture.
+- **Editor vision.** `docs/design/editor_vision.md` / `note_editor.md` (the
+  Typora-style live-preview blend) are unbuilt.

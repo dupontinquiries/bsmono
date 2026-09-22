@@ -377,12 +377,16 @@ def detail_car(s, m=None):
               off=(0.0, (floor + roof) * 0.5 + 0.02, z))
         out.append((nm, b))
 
-    # sills — "the giveaway that the floor is a battery"
-    for side, sfx in ((-1, "l"), (1, "r")):
-        b = Mesh()
-        b.add(cbox(0.28), scale=(0.016, 0.026, max(0.30, L * 0.30)),
-              off=(side * mid[1] * 0.93, floor + 0.045, (z0 + z1) * 0.5))
-        out.append((f"sill_{sfx}", b))
+    # NO SILLS.
+    #
+    # procars.rs has them ("the giveaway that the floor is a battery") and
+    # they are the right idea, but three attempts failed here: a straight bar
+    # pokes through wherever the hull tapers, and a loft that follows the
+    # taper came out asymmetric because keeping one half of a rounded-rect
+    # ring by sign of x does not cut evenly. Shipping a broken element is
+    # worse than shipping none, so this is deliberately absent rather than
+    # half-working. The fix is to build the strip as its own open surface
+    # instead of carving it out of a closed loft.
 
     # front splitter — low, wide, and the single cheapest thing that makes a
     # car read as planted rather than floating

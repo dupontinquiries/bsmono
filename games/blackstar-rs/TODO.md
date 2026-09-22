@@ -873,3 +873,15 @@ Repro: `cargo run --bin skydribble --no-default-features -- --sim planets`.
   reading the real number instead of guessing a third time. Left
   `--sim planets` unfixed for the same reason rather than repeat it once
   more — see the section directly above.
+
+
+## C20 -- the rig, and what was found on the way
+
+See `maintenance/C20_TODO.md` for the full list with provenance. In short:
+`src/rigmotion.rs` drives a 22-bone rig (`games/shared/boneforge`) each frame
+from the gait machine, the gravity at the body, and the signed `limp()`; the
+renderer does not consume it yet. The vocabulary census, broken by this
+session's catalogue grouping (`IP_MARKS` in `main.rs`), is fixed: the list moved
+to `vocab.rs`. Found and not fixed, present at the base: `src/rig.rs:96` is
+corrupted, and the gait machine drops left-leg damage by clamping a signed value. `rigkit/` builds the
+transform viewers reproducibly.

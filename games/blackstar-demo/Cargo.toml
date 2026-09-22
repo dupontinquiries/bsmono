@@ -1,0 +1,15 @@
+[package]
+name = "blackstar-demo"
+version = "0.1.0"
+edition = "2021"
+description = "A small, testable slice of blackstar: one car, one bot, one fold, one walk."
+
+# No dependencies at all in the core. That is the point: the whole model,
+# fold and drive layer builds and tests in under a second with no GPU, no
+# window and no audio stack, which is what makes it possible to change
+# something and know whether it worked.
+[dependencies]
+
+[[bin]]
+name = "demo"
+path = "src/main.rs"

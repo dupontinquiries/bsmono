@@ -871,3 +871,13 @@ flatpak = false
 runtime = "gnome"           # GTK4 4.12+ / libadwaita 1.5+
 targets = ["desktop", "phone"]
 notes = "the GTK4/libadwaita shell stoat-egui was ported from; archived tier, kept building (gtk4-rs 0.11 / libadwaita-rs 0.9, no templates, subclassing or clone!). Not primary. Does not use stoat-core's Driver; it wakes on event arrival so it does not need to."
+
+[games.speedrace]
+path = "games/speedrace"
+kind = "cargo"
+role = "library"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop"]
+notes = "speedrace-core: a headless race engine -- you against a pace car, on hard coding problems. No GPU, no dependencies; 24 tests. The shell is not built yet (C20)."

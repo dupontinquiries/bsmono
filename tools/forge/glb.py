@@ -121,6 +121,42 @@ class Glb:
         self.nodes.append(n)
         return len(self.nodes) - 1
 
+    def write_gltf(self, dir_path, asset_name="forge"):
+        """glTF + external .bin, which is the form blackstar-rs discovers.
+
+        The loader checks <dir>.glb, then <dir>/slim.glb, then opens
+        <dir>/scene.gltf and reads whatever URI its first buffer names -- but
+        the DISCOVERY filter upstream requires scene.gltf to exist regardless.
+        Writing the pair satisfies both without a marker file or the bots.pack
+        machinery (pack_bots.py exists to quantise a whole fold strip against
+        one shared box; a generated strip does not need it, since nothing here
+        is quantised)."""
+        import os
+        os.makedirs(dir_path, exist_ok=True)
+        bn = bytes(self.bin)
+        gltf = {
+            "asset": {"version": "2.0", "generator": f"forge/{asset_name}"},
+            "scene": 0,
+            "scenes": [{"nodes": list(range(len(self.nodes)))}],
+            "nodes": self.nodes,
+            "meshes": self.meshes,
+            "accessors": self.accessors,
+            "bufferViews": self.buffer_views,
+            "buffers": [{"byteLength": len(bn), "uri": "scene.bin"}],
+        }
+        with open(os.path.join(dir_path, "scene.gltf"), "w") as f:
+            json.dump(gltf, f, separators=(",", ":"))
+        with open(os.path.join(dir_path, "scene.bin"), "wb") as f:
+            f.write(bn)
+        # Orientation, stated rather than inferred. model.rs runs
+        # find_orientation/find_upright when this is absent; a generated model
+        # knows which way it stands, so saying so skips the search AND removes
+        # its failure mode (models arriving rolled or nose-aft).
+        with open(os.path.join(dir_path, "orient.json"), "w") as f:
+            json.dump({"up": [0.0, 1.0, 0.0], "forward": [0.0, 0.0, -1.0],
+                       "source": "forge_generated"}, f)
+        return len(bn)
+
     def write(self, path, asset_name="forge"):
         gltf = {
             "asset": {"version": "2.0", "generator": f"forge/{asset_name}"},
