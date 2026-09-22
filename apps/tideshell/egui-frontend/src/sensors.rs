@@ -257,6 +257,11 @@ pub struct BacklightOut {
 
 impl BacklightOut {
     pub fn spawn(sys: &Path, bus: Option<Connection>) -> BacklightOut {
+        Self::spawn_with(sys, bus, find_brightnessctl())
+    }
+
+    /// `spawn` with an explicit brightnessctl path (tests pass a fake one).
+    pub fn spawn_with(sys: &Path, bus: Option<Connection>, tool: Option<PathBuf>) -> BacklightOut {
         let status = Arc::new(Mutex::new(String::new()));
         let Some(bl) = find_backlight(sys) else {
             *status.lock().unwrap() = "backlight: none found under /sys/class/backlight".into();
@@ -267,7 +272,7 @@ impl BacklightOut {
         let st = status.clone();
         std::thread::Builder::new()
             .name("tideshell-backlight".into())
-            .spawn(move || backlight_loop(bl, bus, rx, st))
+            .spawn(move || backlight_loop(bl, bus, tool, rx, st))
             .expect("spawn backlight thread");
         BacklightOut { tx: Some(tx), status, initial }
     }
@@ -283,29 +288,107 @@ impl BacklightOut {
     }
 }
 
-fn backlight_loop(bl: Backlight, bus: Option<Connection>, rx: Receiver<f32>, st: Arc<Mutex<String>>) {
+/// How a brightness value gets applied, in the order tried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    /// logind Session.SetBrightness on the graphical session (no root).
+    Logind,
+    /// The brightnessctl tool (known to work on the FP5 image; it itself
+    /// uses logind or a udev-granted sysfs permission).
+    Brightnessctl,
+    /// Writing /sys/class/backlight/<name>/brightness directly.
+    Sysfs,
+}
+
+/// Minimum spacing between writes: brightnessctl is a process per call and
+/// a ramp produces many steps; coalescing keeps only the newest value.
+pub const MIN_WRITE_INTERVAL: Duration = Duration::from_millis(50);
+
+/// `brightnessctl` on PATH, if installed.
+pub fn find_brightnessctl() -> Option<PathBuf> {
+    std::env::var_os("PATH")?.to_str()?.split(':').map(|d| Path::new(d).join("brightnessctl")).find(|p| p.is_file())
+}
+
+fn brightnessctl_set(tool: &Path, name: &str, raw: u32) -> Result<(), String> {
+    let out = std::process::Command::new(tool)
+        .args(["-q", "-d", name, "set", &raw.to_string()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("brightnessctl: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("brightnessctl exited {}: {}", out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
+fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>, rx: Receiver<f32>, st: Arc<Mutex<String>>) {
     let set = |s: String| *st.lock().unwrap() = s;
     let session = bus.as_ref().map(logind_graphical_session);
-    set(match &session {
-        Some(Ok(p)) => format!("backlight: {} (max {}) via logind {}", bl.name, bl.max, p.as_str()),
-        Some(Err(e)) => format!("backlight: {} (max {}); logind unusable ({e}), trying sysfs", bl.name, bl.max),
-        None => format!("backlight: {} (max {}); no system bus, trying sysfs", bl.name, bl.max),
-    });
+    // Candidate methods in order; the first that works stays in use, and a
+    // failure moves on to the next (with the reason kept for the status).
+    let mut methods: Vec<Method> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    match &session {
+        Some(Ok(_)) => methods.push(Method::Logind),
+        Some(Err(e)) => skipped.push(format!("logind: {e}")),
+        None => skipped.push("logind: no system bus".into()),
+    }
+    match &tool {
+        Some(_) => methods.push(Method::Brightnessctl),
+        None => skipped.push("brightnessctl: not installed".into()),
+    }
+    methods.push(Method::Sysfs);
+    let describe = |m: Method| match (m, &session, &tool) {
+        (Method::Logind, Some(Ok(p)), _) => format!("logind {}", p.as_str()),
+        (Method::Brightnessctl, _, Some(t)) => format!("brightnessctl ({})", t.display()),
+        _ => "sysfs".to_string(),
+    };
+    let mut cur = 0usize;
+    let note = |cur: usize, extra: &[String]| {
+        let mut s = format!("backlight: {} (max {}) via {}", bl.name, bl.max, describe(methods[cur]));
+        if !extra.is_empty() {
+            s.push_str(&format!(" [{}]", extra.join("; ")));
+        }
+        s
+    };
+    set(note(cur, &skipped));
+    let mut last_write: Option<std::time::Instant> = None;
     while let Ok(mut level) = rx.recv() {
+        if let Some(t) = last_write {
+            let since = t.elapsed();
+            if since < MIN_WRITE_INTERVAL {
+                std::thread::sleep(MIN_WRITE_INTERVAL - since);
+            }
+        }
         // Coalesce: a ramp sends many values; only the newest matters.
         while let Ok(newer) = rx.try_recv() {
             level = newer;
         }
         let raw = level_to_raw(level, bl.max);
-        let via_logind = match (&bus, &session) {
-            (Some(b), Some(Ok(p))) => logind_set_brightness(b, p, &bl.name, raw),
-            _ => Err("no logind session".into()),
-        };
-        if let Err(e) = via_logind {
-            if let Err(e2) = bl.write_sysfs(raw) {
-                set(format!("backlight: cannot set {} ({e}; sysfs: {e2})", bl.name));
+        loop {
+            let r = match methods[cur] {
+                Method::Logind => match (&bus, &session) {
+                    (Some(b), Some(Ok(p))) => logind_set_brightness(b, p, &bl.name, raw),
+                    _ => Err("no logind session".into()),
+                },
+                Method::Brightnessctl => brightnessctl_set(tool.as_deref().unwrap(), &bl.name, raw),
+                Method::Sysfs => bl.write_sysfs(raw).map_err(|e| format!("sysfs: {e}")),
+            };
+            match r {
+                Ok(()) => break,
+                Err(e) if cur + 1 < methods.len() => {
+                    skipped.push(e);
+                    cur += 1;
+                    set(note(cur, &skipped));
+                }
+                Err(e) => {
+                    set(format!("backlight: cannot set {} (all methods failed; last: {e}) [{}]", bl.name, skipped.join("; ")));
+                    break;
+                }
             }
         }
+        last_write = Some(std::time::Instant::now());
     }
 }
 
@@ -386,6 +469,64 @@ mod tests {
             assert_eq!(level_to_raw(1.0, max), max);
         }
         assert!(level_to_raw(0.5, 4095) < 4095 / 2, "gamma: half perceived is well under half raw");
+    }
+
+    fn fake_sys(tag: &str) -> PathBuf {
+        let sys = tmp(tag);
+        put(&sys.join("class/backlight/panel/max_brightness"), "4095");
+        put(&sys.join("class/backlight/panel/brightness"), "1000");
+        sys
+    }
+
+    fn fake_tool(dir: &Path, exit: i32) -> PathBuf {
+        let tool = dir.join("brightnessctl");
+        let log = dir.join("calls");
+        put(&tool, &format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit {exit}\n", log.display()));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        tool
+    }
+
+    fn wait_for(mut f: impl FnMut() -> bool) -> bool {
+        (0..150).any(|_| {
+            let ok = f();
+            if !ok {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            ok
+        })
+    }
+
+    #[test]
+    fn without_logind_brightnessctl_is_used_and_sysfs_left_alone() {
+        let sys = fake_sys("bctl");
+        let tool = fake_tool(&sys, 0);
+        let out = BacklightOut::spawn_with(&sys, None, Some(tool));
+        for i in 0..=30 {
+            out.set(0.4 + i as f32 * 0.02);
+        }
+        let want = format!("-q -d panel set {}", level_to_raw(1.0, 4095));
+        let calls = sys.join("calls");
+        assert!(wait_for(|| std::fs::read_to_string(&calls).unwrap_or_default().lines().last() == Some(want.as_str())), "last call: {:?}", std::fs::read_to_string(&calls).ok());
+        let n = std::fs::read_to_string(&calls).unwrap().lines().count();
+        assert!(n < 31, "coalesced and throttled: {n} calls for 31 values");
+        assert!(out.status().contains("via brightnessctl"), "{}", out.status());
+        assert!(out.status().contains("logind: no system bus"), "the reason logind was skipped is shown: {}", out.status());
+        assert_eq!(std::fs::read_to_string(sys.join("class/backlight/panel/brightness")).unwrap(), "1000");
+        let _ = std::fs::remove_dir_all(&sys);
+    }
+
+    #[test]
+    fn a_failing_brightnessctl_falls_through_to_sysfs_and_says_why() {
+        let sys = fake_sys("bctl-fail");
+        let tool = fake_tool(&sys, 1);
+        let out = BacklightOut::spawn_with(&sys, None, Some(tool));
+        out.set(1.0);
+        let path = sys.join("class/backlight/panel/brightness");
+        assert!(wait_for(|| std::fs::read_to_string(&path).unwrap_or_default() == "4095"));
+        let st = out.status();
+        assert!(st.contains("via sysfs") && st.contains("brightnessctl exited 1"), "{st}");
+        let _ = std::fs::remove_dir_all(&sys);
     }
 
     #[test]
@@ -517,7 +658,7 @@ mod dbus_tests {
         std::fs::write(sys.join("class/backlight/panel/max_brightness"), "1000").unwrap();
         std::fs::write(sys.join("class/backlight/panel/brightness"), "250").unwrap();
         calls.lock().unwrap().clear();
-        let out = BacklightOut::spawn(&sys, Some(client()));
+        let out = BacklightOut::spawn_with(&sys, Some(client()), None);
         assert!((out.initial.unwrap() - raw_to_level(250, 1000)).abs() < 1e-6);
         // A ramp: many values in a burst. Coalescing may drop middle ones,
         // but the LAST value must arrive, via logind, not sysfs.
