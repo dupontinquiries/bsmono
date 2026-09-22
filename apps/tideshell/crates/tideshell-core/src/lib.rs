@@ -26,6 +26,7 @@ pub mod ambient;
 pub mod anim;
 pub mod bar;
 pub mod carousel;
+pub mod clock;
 pub mod control_center;
 pub mod cursor;
 pub mod edge;

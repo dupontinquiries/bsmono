@@ -42,7 +42,8 @@ pub struct AppTile {
 pub struct FrameInfo<'a> {
     /// hatch favorites (or top-ranked entries), for bar app widgets.
     pub apps: &'a [AppTile],
-    pub clock: String,
+    /// Local time; the clock's style and fuzziness come from the prefs.
+    pub time: tideshell_core::clock::LocalTime,
     pub battery: Option<f32>,
 }
 
@@ -440,7 +441,7 @@ impl ShellView {
             p.rect_filled(Rect::from_min_size(top + Vec2::new(0.0, i as f32 * band_h), Vec2::new(size.x, band_h + 1.0)), cr(0), c);
         }
         let white = |a: f32| Color32::from_white_alpha((a * alpha * 255.0) as u8);
-        p.text(top + Vec2::new(size.x / 2.0, size.y * 0.24), Align2::CENTER_CENTER, &info.clock, FontId::proportional(72.0), white(1.0));
+        self.clock_face(p, shell, info, top + Vec2::new(size.x / 2.0, size.y * 0.24), alpha);
         // Hint and chevron travel with the cover (the first version added the
         // drag back in and left them pinned over the revealed app).
         let c = top + Vec2::new(size.x / 2.0, size.y - 90.0);
@@ -448,6 +449,48 @@ impl ShellView {
         p.line_segment([c + Vec2::new(-14.0, -22.0), c + Vec2::new(0.0, -34.0)], chev);
         p.line_segment([c + Vec2::new(0.0, -34.0), c + Vec2::new(14.0, -22.0)], chev);
         p.text(c, Align2::CENTER_CENTER, "Swipe up to unlock", FontId::proportional(15.0), white(0.75));
+    }
+
+    /// The cover clock at `c`: digital (exact digits, or words when fuzzy) or
+    /// analog (hands snapped to the precision; weekday mode shows the day
+    /// inside the face; words underneath when fuzzy).
+    fn clock_face(&self, p: &egui::Painter, shell: &Shell, info: &FrameInfo, c: Pos2, alpha: f32) {
+        use tideshell_core::clock::{hands, weekday_name, words, ClockStyle, Fuzzy};
+        let white = |a: f32| Color32::from_white_alpha((a * alpha * 255.0) as u8);
+        let f = shell.prefs.clock_fuzzy;
+        match shell.prefs.clock_style {
+            ClockStyle::Digital => {
+                let (txt, font) = if f == Fuzzy::Exact { (format!("{:02}:{:02}", info.time.hour, info.time.minute), 72.0) } else { (words(info.time, f), 34.0) };
+                p.text(c, Align2::CENTER_CENTER, txt, FontId::proportional(font), white(1.0));
+            }
+            ClockStyle::Analog => {
+                let r = 84.0;
+                p.circle_stroke(c, r, Stroke::new(2.0, white(0.85)));
+                for i in 0..12 {
+                    let a = i as f32 / 12.0 * std::f32::consts::TAU;
+                    let (s, co) = (a.sin(), -a.cos());
+                    let major = i % 3 == 0;
+                    let inner = if major { r - 14.0 } else { r - 8.0 };
+                    p.line_segment([c + Vec2::new(s, co) * inner, c + Vec2::new(s, co) * (r - 3.0)], Stroke::new(if major { 3.0 } else { 1.5 }, white(0.8)));
+                }
+                match hands(info.time, f) {
+                    Some((ha, ma)) => {
+                        let dir = |a: f32| Vec2::new(a.sin(), -a.cos());
+                        p.line_segment([c, c + dir(ha) * r * 0.5], Stroke::new(5.0, white(1.0)));
+                        if let Some(ma) = ma {
+                            p.line_segment([c, c + dir(ma) * r * 0.8], Stroke::new(3.0, white(1.0)));
+                        }
+                        p.circle_filled(c, 5.0, white(1.0));
+                    }
+                    None => {
+                        p.text(c, Align2::CENTER_CENTER, weekday_name(info.time.weekday), FontId::proportional(20.0), white(1.0));
+                    }
+                }
+                if f != Fuzzy::Exact && f != Fuzzy::Weekday {
+                    p.text(c + Vec2::new(0.0, r + 28.0), Align2::CENTER_CENTER, words(info.time, f), FontId::proportional(18.0), white(0.8));
+                }
+            }
+        }
     }
 
     // ---- previews --------------------------------------------------------------
@@ -615,7 +658,8 @@ impl ShellView {
             let wid = Id::new(("ts-bar", pl.index));
             match &widgets[pl.index] {
                 BarWidget::Clock => {
-                    p.text(r.center(), Align2::CENTER_CENTER, &info.clock, FontId::proportional(if expanded { 22.0 } else { 15.0 }), pal.text);
+                    let txt = tideshell_core::clock::short_text(info.time, shell.prefs.clock_fuzzy);
+                    p.text(r.center(), Align2::CENTER_CENTER, txt, FontId::proportional(if expanded { 22.0 } else { 15.0 }), pal.text);
                 }
                 BarWidget::Battery => {
                     let s = info.battery.map(|b| format!("{:.0}%", b * 100.0)).unwrap_or_else(|| "--".into());
@@ -796,6 +840,17 @@ impl ShellView {
                 ui.label("Layout");
                 ui.radio_value(&mut draft.layout, Layout::PullDown, "Pull-down control center");
                 ui.radio_value(&mut draft.layout, Layout::RightBar, "Right-hand bar");
+                ui.separator();
+                ui.label("Clock");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut draft.clock_style, tideshell_core::clock::ClockStyle::Digital, "Digital");
+                    ui.radio_value(&mut draft.clock_style, tideshell_core::clock::ClockStyle::Analog, "Analog");
+                });
+                ui.horizontal_wrapped(|ui| {
+                    for f in tideshell_core::clock::Fuzzy::ALL {
+                        ui.radio_value(&mut draft.clock_fuzzy, f, f.label());
+                    }
+                });
                 ui.separator();
                 ui.label("Trackpad cursor");
                 ui.horizontal(|ui| {
@@ -984,7 +1039,7 @@ mod tests {
         let mut view = ShellView::default();
         view.pointer_pad = pointer_pad;
         let pal = uikit_egui::palette_colors("night");
-        let info = FrameInfo { apps: &[], clock: String::new(), battery: None };
+        let info = FrameInfo { apps: &[], time: tideshell_core::clock::LocalTime { hour: 12, minute: 0, weekday: 1 }, battery: None };
         let ctx = egui::Context::default();
         let mut out = Vec::new();
         let frames = [

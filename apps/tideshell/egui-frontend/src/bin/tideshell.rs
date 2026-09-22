@@ -23,11 +23,6 @@ use tideshell_egui::{AppTile, FrameInfo, ShellView};
 
 const STRIP_PX: u32 = 28;
 
-fn clock() -> String {
-    let (h, m) = tideshell_egui::sensors::local_hm();
-    format!("{h:02}:{m:02}")
-}
-
 struct Shellbox {
     shell: Shell,
     view: ShellView,
@@ -342,7 +337,7 @@ fn main() {
                         ..Default::default()
                     };
                     raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(t.scale);
-                    let info = FrameInfo { apps: &apps, clock: clock(), battery: None };
+                    let info = FrameInfo { apps: &apps, time: tideshell_egui::sensors::local_time(), battery: None };
                     let mut bar_actions = Vec::new();
                     let out = bar_ctx.run_ui(raw, |ui| {
                         egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
@@ -399,7 +394,7 @@ fn main() {
             ..Default::default()
         };
         raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(t.scale);
-        let info = FrameInfo { apps: &apps, clock: clock(), battery: None };
+        let info = FrameInfo { apps: &apps, time: tideshell_egui::sensors::local_time(), battery: None };
         let mut frame_actions = Vec::new();
         let out = ctx.run_ui(raw, |ui| {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {

@@ -46,6 +46,9 @@ pub struct ShellPrefs {
     pub brightness_offset: f32,
     /// Night window for the time-of-day dimming.
     pub night: crate::ambient::NightWindow,
+    /// Cover clock: digital or analog, and how fuzzy.
+    pub clock_style: crate::clock::ClockStyle,
+    pub clock_fuzzy: crate::clock::Fuzzy,
 }
 
 impl Default for ShellPrefs {
@@ -61,11 +64,13 @@ impl Default for ShellPrefs {
             auto_brightness: true,
             brightness_offset: 0.0,
             night: crate::ambient::NightWindow::default(),
+            clock_style: crate::clock::ClockStyle::Digital,
+            clock_fuzzy: crate::clock::Fuzzy::Exact,
         }
     }
 }
 
-pub const KEYS: [&str; 10] = [
+pub const KEYS: [&str; 12] = [
     "shell.layout",
     "shell.bar.widgets",
     "shell.bar.width",
@@ -76,6 +81,8 @@ pub const KEYS: [&str; 10] = [
     "shell.brightness.auto",
     "shell.brightness.offset",
     "shell.brightness.night",
+    "shell.clock.style",
+    "shell.clock.fuzzy",
 ];
 
 impl ShellPrefs {
@@ -98,6 +105,15 @@ impl ShellPrefs {
             ("shell.brightness.auto".into(), if self.auto_brightness { "on" } else { "off" }.into()),
             ("shell.brightness.offset".into(), format!("{:.3}", self.brightness_offset)),
             ("shell.brightness.night".into(), self.night.format_span()),
+            (
+                "shell.clock.style".into(),
+                match self.clock_style {
+                    crate::clock::ClockStyle::Digital => "digital",
+                    crate::clock::ClockStyle::Analog => "analog",
+                }
+                .into(),
+            ),
+            ("shell.clock.fuzzy".into(), self.clock_fuzzy.token().into()),
         ]
     }
 
@@ -146,6 +162,16 @@ impl ShellPrefs {
                 let (start, end) = crate::ambient::NightWindow::parse_span(v).ok_or_else(|| format!("shell.brightness.night: '{v}' is not HH:MM-HH:MM"))?;
                 self.night.start = start;
                 self.night.end = end;
+            }
+            "shell.clock.style" => {
+                self.clock_style = match v {
+                    "digital" => crate::clock::ClockStyle::Digital,
+                    "analog" => crate::clock::ClockStyle::Analog,
+                    _ => return Err(format!("shell.clock.style: '{v}' is not digital|analog")),
+                }
+            }
+            "shell.clock.fuzzy" => {
+                self.clock_fuzzy = crate::clock::Fuzzy::from_token(v).ok_or_else(|| format!("shell.clock.fuzzy: '{v}' is not exact|15|30|hour|weekday"))?
             }
             "shell.cursor" => {
                 self.fat_cursor = match v {
@@ -201,6 +227,8 @@ mod tests {
         p.brightness_offset = 0.125;
         p.night.start = 23 * 60 + 30;
         p.night.end = 6 * 60;
+        p.clock_style = crate::clock::ClockStyle::Analog;
+        p.clock_fuzzy = crate::clock::Fuzzy::Quarter;
         p.bar_widgets = bar::parse_widgets("clock,toggle:trackpad,app:org.gnome.Console").0;
         let kv = p.to_kv();
         assert_eq!(kv.len(), KEYS.len());

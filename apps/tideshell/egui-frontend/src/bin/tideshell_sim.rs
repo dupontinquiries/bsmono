@@ -330,9 +330,14 @@ impl App {
     }
 }
 
-fn clock() -> String {
-    let (h, m) = tideshell_egui::sensors::local_hm();
-    format!("{h:02}:{m:02}")
+/// Local time, with --clock HH:MM overriding hour and minute.
+fn sim_time(fake: Option<u32>) -> tideshell_core::clock::LocalTime {
+    let mut t = tideshell_egui::sensors::local_time();
+    if let Some(m) = fake {
+        t.hour = m / 60;
+        t.minute = m % 60;
+    }
+    t
 }
 
 fn battery() -> Option<f32> {
@@ -429,7 +434,7 @@ impl eframe::App for App {
                     ctx.request_repaint();
                 }
             }
-            let info = FrameInfo { apps: &self.apps, clock: clock(), battery: battery() };
+            let info = FrameInfo { apps: &self.apps, time: sim_time(self.fake_clock), battery: battery() };
             let actions = self.view.ui(ui, &mut self.shell, &self.palette, &info);
             self.execute(actions, now);
         });
@@ -444,6 +449,16 @@ fn main() -> eframe::Result<()> {
     let val = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
     let persist = has("--persist");
     let (mut prefs, errs) = if persist { effects::load_prefs() } else { (ShellPrefs::default(), vec![]) };
+    // --pref key=value (repeatable): any shell.* setting, e.g. shell.clock.style=analog.
+    for (i, a) in args.iter().enumerate() {
+        if a == "--pref" {
+            if let Some((k, v)) = args.get(i + 1).and_then(|kv| kv.split_once('=')) {
+                if let Err(e) = prefs.apply(k, v) {
+                    eprintln!("{e}");
+                }
+            }
+        }
+    }
     if let Some(l) = val("--layout") {
         if let Err(e) = prefs.apply("shell.layout", &l) {
             eprintln!("{e}");

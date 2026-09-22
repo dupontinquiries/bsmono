@@ -29,6 +29,19 @@ pub fn local_minute() -> u32 {
     h * 60 + m
 }
 
+/// Local hour, minute and weekday (0 = Sunday).
+pub fn local_time() -> tideshell_core::clock::LocalTime {
+    // SAFETY: as local_hm.
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return tideshell_core::clock::LocalTime { hour: 12, minute: 0, weekday: 0 };
+        }
+        tideshell_core::clock::LocalTime { hour: tm.tm_hour as u32, minute: tm.tm_min as u32, weekday: tm.tm_wday as u32 }
+    }
+}
+
 /// Local (hour, minute). Falls back to noon if the time cannot be read.
 pub fn local_hm() -> (u32, u32) {
     // SAFETY: time(NULL) and localtime_r with valid pointers to owned values.
