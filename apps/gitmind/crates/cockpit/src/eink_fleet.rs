@@ -1690,18 +1690,58 @@ pub fn appload_install_cmd(app: &str, appload_dir: &str, manifest: &str) -> Resu
     check(app)?;
     assert_persistent(appload_dir)?;
     let dir = format!("{appload_dir}/{app}");
+    // Compare before replacing: AppLoad caches a manifest's environment until
+    // xochitl restarts (seen on a Paper Pro: an edited EINK_QTFB_MODES was
+    // ignored across many launches until a restart), so the caller must know
+    // whether the running AppLoad now disagrees with the file.
     Ok(format!(
-        "mkdir -p {d} && printf '%s\\n' {m} > {d}/external.manifest.json && echo manifest-written",
+        "mkdir -p {d} && f={d}/external.manifest.json && printf '%s\\n' {m} > \"$f.new\" && \
+         if [ ! -f \"$f\" ]; then s=manifest-new; elif cmp -s \"$f\" \"$f.new\"; then s=manifest-unchanged; else s=manifest-updated; fi && \
+         mv \"$f.new\" \"$f\" && echo $s",
         d = shell_quote(&dir),
         m = shell_quote(manifest),
     ))
 }
 
+/// What writing an AppLoad manifest changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestChange {
+    New,
+    Updated,
+    Unchanged,
+}
+
+impl ManifestChange {
+    pub fn from_output(out: &str) -> ManifestChange {
+        if out.contains("manifest-updated") {
+            ManifestChange::Updated
+        } else if out.contains("manifest-unchanged") {
+            ManifestChange::Unchanged
+        } else {
+            ManifestChange::New
+        }
+    }
+
+    /// What the operator needs to know, if anything.
+    pub fn note(&self) -> Option<&'static str> {
+        match self {
+            ManifestChange::Updated => Some("the app's settings changed, and AppLoad keeps the old ones until the tablet's UI restarts (tapping reload is not enough): restart it with `gitmind eink restart-ui <host>` (or Restart UI on the Tablets page)"),
+            ManifestChange::New => Some("new in AppLoad: tap reload in AppLoad's sidebar to see it"),
+            ManifestChange::Unchanged => None,
+        }
+    }
+}
+
+/// Restart the tablet's UI (xochitl) so AppLoad re-reads every manifest.
+/// Closes whatever is open. xovi and AppLoad stay loaded: xovi's systemd
+/// drop-in lives in a tmpfs until reboot, and a restart keeps it.
+pub const RESTART_UI_CMD: &str = "systemctl restart xochitl && sleep 3 && systemctl is-active xochitl";
+
 /// Push + promote, then either launch (Blight) or register with AppLoad.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Delivered {
     Launched(Outcome),
-    Registered { manifest_dir: String },
+    Registered { manifest_dir: String, change: ManifestChange },
     /// A tool (see [`TOOLS`]): installed, not registered or launched.
     Installed { path: String },
 }
@@ -1748,13 +1788,14 @@ pub fn deliver(
             let default_opts = AppLoadOptions { args: args.iter().map(|a| a.to_string()).collect(), ..AppLoadOptions::named(app) };
             let (opts, icon) = appload.unwrap_or((&default_opts, None));
             let manifest = appload_manifest(opts, app, env.model, env.profile);
-            remote.run(&appload_install_cmd(app, dir, &manifest)?).map_err(|e| format!("manifest: {e}"))?;
+            let written = remote.run(&appload_install_cmd(app, dir, &manifest)?).map_err(|e| format!("manifest: {e}"))?;
+            let change = ManifestChange::from_output(&written);
             if let Some(icon) = icon {
                 let target = format!("{dir}/{app}/icon.png");
                 assert_persistent(&target)?;
                 remote.push(icon, &target).map_err(|e| format!("icon: {e}"))?;
             }
-            Ok(Delivered::Registered { manifest_dir: format!("{dir}/{app}") })
+            Ok(Delivered::Registered { manifest_dir: format!("{dir}/{app}"), change })
         }
     }
 }
@@ -2322,7 +2363,7 @@ mod tests {
         let real = "/home/root/xovi/exthome/appload";
         let cmd = appload_install_cmd("demo", real, &m).unwrap().replace(real, &dir.to_string_lossy());
         let out = std::process::Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
-        assert!(String::from_utf8_lossy(&out.stdout).contains("manifest-written"));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("manifest-new"), "{}", String::from_utf8_lossy(&out.stderr));
         let written = std::fs::read_to_string(dir.join("demo/external.manifest.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&written).unwrap();
         assert_eq!(v["name"], "it's \"quoted\"");
@@ -2592,6 +2633,24 @@ eink-kit = { path = "../../shared/eink-kit", optional = true }
         let f = diagnose("eink: AppLoad dropped the qtfb connection after SET_REFRESH_MODE; reconnecting without mode messages");
         assert_eq!(f[0].code, "app-qtfb-modes-unsupported");
         assert!(f[0].fix.as_deref().unwrap().contains("\"off\""));
+    }
+
+    #[test]
+    fn manifest_writes_say_whether_the_running_appload_is_now_stale() {
+        let dir = std::env::temp_dir().join(format!("mfst_{}", std::process::id()));
+        let base = format!("/home/root/tmp-mfst-{}", std::process::id());
+        let run = |m: &str| {
+            let cmd = appload_install_cmd("demo", &base, m).unwrap().replace(&base, &dir.to_string_lossy());
+            let o = std::process::Command::new("sh").arg("-c").arg(cmd).output().unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            ManifestChange::from_output(&String::from_utf8_lossy(&o.stdout))
+        };
+        assert_eq!(run("{\"a\":1}"), ManifestChange::New);
+        assert_eq!(run("{\"a\":1}"), ManifestChange::Unchanged);
+        assert_eq!(run("{\"a\":2}"), ManifestChange::Updated);
+        assert!(ManifestChange::Updated.note().unwrap().contains("restart"));
+        assert!(!dir.join("demo/external.manifest.json.new").exists(), "no temp file left behind");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

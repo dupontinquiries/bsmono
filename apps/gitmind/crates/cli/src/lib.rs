@@ -1401,6 +1401,7 @@ fn cmd_eink(rest: &[String]) -> i32 {
         wifi-ssh <host>                     turn on SSH over Wi-Fi (Paper Pro family; run over USB)\n  \
         pkg <host> runner|bootstrap|add|del|list|update|audio   packages like a laptop (Alpine under /home)\n  \
         survey <host>                       what the device has (run at enrol); builds pick features from it\n  \
+        restart-ui <host>                   restart xochitl so AppLoad re-reads changed app settings\n  \
         (every command: --user U, or GITMIND_RM_USER; default root)\n  \
         retrust <host>                      accept the tablet's NEW host key (after an OS update)\n  \
         enroll <host>                       first contact: password (GITMIND_RM_PASSWORD or stdin) → key\n  \
@@ -1518,7 +1519,8 @@ fn cmd_eink(rest: &[String]) -> i32 {
                     println!("installed tool {path} (not an app: no AppLoad entry)");
                     0
                 }
-                Ok(ef::Delivered::Registered { manifest_dir }) => {
+                Ok(ef::Delivered::Registered { manifest_dir, change }) => {
+                    if let Some(n) = change.note() { eprintln!("  {n}"); }
                     println!("{name} installed for AppLoad ({manifest_dir}); on the tablet open AppLoad from the sidebar and tap ↻ once");
                     if activation.is_some() {
                         println!("  (xovi is not running since the last boot: `gitmind eink activate {host}` first)");
@@ -1603,6 +1605,10 @@ fn cmd_eink(rest: &[String]) -> i32 {
                 Err(e) => eink_err(&e),
             }
         }
+        "restart-ui" => match ef::Remote::run(&mut remote, ef::RESTART_UI_CMD) {
+            Ok(out) => { println!("tablet UI restarted ({}): AppLoad has re-read every manifest", out.trim()); 0 }
+            Err(e) => eink_err(&e),
+        },
         "survey" => match ef::Remote::run(&mut remote, &cockpit::capabilities::survey_cmd()) {
             Ok(out) => {
                 let _ = cockpit::capabilities::save(&host, &out);

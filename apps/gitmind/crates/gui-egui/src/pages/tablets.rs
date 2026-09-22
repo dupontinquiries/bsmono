@@ -61,6 +61,8 @@ pub enum Confirm {
     Activate(ef::Activation),
     /// `rm-ssh-over-wlan on`.
     WifiSsh,
+    /// Restart xochitl so AppLoad re-reads changed manifests.
+    RestartUi,
 }
 
 impl Default for State {
@@ -227,11 +229,15 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         if d.wlan_ssh_tool {
             actions.push((Confirm::WifiSsh, "Enable SSH over Wi-Fi".into()));
         }
+        if d.appload_dir.is_some() {
+            actions.push((Confirm::RestartUi, "Restart UI (apply changed app settings)".into()));
+        }
         for (c, label) in actions {
             if s.confirm == Some(c) {
                 let warn = match c {
                     Confirm::Activate(ef::Activation::StartXovi) => "The tablet's screen will restart for a few seconds.",
                     Confirm::Activate(_) => "The tablet switches to its launcher.",
+                    Confirm::RestartUi => "Restarts xochitl: whatever is open on the tablet closes; AppLoad re-reads every app's settings.",
                     Confirm::WifiSsh => "Runs rm-ssh-over-wlan on: the tablet then accepts SSH on its Wi-Fi address (shown under the password in Copyrights and licenses).",
                 };
                 ui.label(egui::RichText::new(warn).small());
@@ -244,6 +250,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                             let cmd = match c {
                                 Confirm::Activate(a) => ef::activation_cmd(a),
                                 Confirm::WifiSsh => ef::WLAN_SSH_ON.to_string(),
+                                Confirm::RestartUi => ef::RESTART_UI_CMD.to_string(),
                             };
                             match ef::Remote::run(&mut r, &cmd) {
                                 Ok(out) => format!("{}\n(Probe again to refresh)", out.trim()),
@@ -432,6 +439,8 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                     Ok(ef::Delivered::Launched(ef::Outcome::ExitedEarly { log_tail })) => format!("{name} exited right after launch:\n{log_tail}"),
                     Ok(ef::Delivered::Installed { path }) =>
                         format!("installed tool {path} (not an app: no AppLoad entry)"),
+                    Ok(ef::Delivered::Registered { change: ef::ManifestChange::Updated, .. }) =>
+                        format!("{name} updated. AppLoad keeps the old settings until the tablet's UI restarts (reload is not enough): use Restart UI above"),
                     Ok(ef::Delivered::Registered { .. }) if activation.is_some() =>
                         format!("{name} installed — activate xovi (above), then open AppLoad in the tablet's sidebar"),
                     Ok(ef::Delivered::Registered { .. }) =>
