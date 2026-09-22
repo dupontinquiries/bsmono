@@ -168,6 +168,18 @@ impl Depot {
         Ok(rep)
     }
 
+    /// An Alpine repository tree (`<branch>/<repo>/<arch>/APKINDEX.tar.gz`
+    /// plus any subset of its packages); see alpine.rs.
+    pub fn ingest_alpine_dir(&mut self, dir: &Path) -> Result<crate::alpine::IngestReport> {
+        let (repos, rep) = crate::alpine::ingest_dir(&self.store, dir)?;
+        for (key, repo) in repos {
+            self.catalog.upsert_alpine(&key, repo);
+        }
+        self.catalog.save(&self.root)?;
+        self.views().rebuild_alpine()?;
+        Ok(rep)
+    }
+
     pub fn ingest_toolchain(&mut self, path: &Path) -> Result<(Vec<Ingested>, Vec<String>)> {
         let mut out = Vec::new();
         let errors;

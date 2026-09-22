@@ -153,7 +153,7 @@ impl App {
         if method != "GET" && method != "HEAD" {
             return Response::text(405, "method not allowed\n");
         }
-        let top_ok = ["crates/", "rpm/", "nix/", "toolchains/"].iter().any(|p| path.trim_start_matches('/').starts_with(p));
+        let top_ok = ["crates/", "rpm/", "nix/", "toolchains/", "alpine/"].iter().any(|p| path.trim_start_matches('/').starts_with(p));
         if !top_ok {
             return Response::not_found();
         }
@@ -322,6 +322,16 @@ impl App {
                 let items: Vec<_> = d.catalog.nix.iter().take(2000).map(|e| json!({"store_path": e.store_path, "narinfo": format!("/nix/{}.narinfo", e.hash_part), "nar": format!("/nix/{}", e.nar_url), "nar_size": e.nar_size})).collect();
                 ok_json(&json!({"paths": items, "total": d.catalog.nix.len()}))
             }
+            // What an Alpine client can install from here: per repo, the
+            // packages ingested (a partial mirror names fewer than its index).
+            ("GET", ["alpine"]) => {
+                let d = self.depot.lock().unwrap();
+                let repos: Vec<_> = d.catalog.alpine.iter().map(|(k, r)| json!({
+                    "repo": k, "url": format!("/alpine/{k}/"), "index_size": r.index_size,
+                    "packages": r.packages.iter().map(|p| json!({"name": p.name, "version": p.version, "size": p.size})).collect::<Vec<_>>(),
+                })).collect();
+                ok_json(&json!({"repos": repos}))
+            }
             ("GET", ["toolchains"]) => {
                 let d = self.depot.lock().unwrap();
                 let items: Vec<_> = d.catalog.toolchains.iter().map(|t| json!({"version": t.version, "triple": t.triple, "component": t.component, "size": t.size, "path": format!("/toolchains/{}", depot_core::toolchain::served_path(t))})).collect();
@@ -407,7 +417,7 @@ impl App {
                 let res = self.depot.lock().unwrap().unpack(&tmp, allow_unsigned);
                 let _ = std::fs::remove_file(&tmp);
                 match res {
-                    Ok(rep) => ok_json(&json!({"signer": rep.signer, "objects_new": rep.objects_new, "objects_present": rep.objects_present, "bytes": rep.bytes, "crates_new": rep.crates_new, "rpm_new": rep.rpm_new, "nix_new": rep.nix_new, "toolchain_new": rep.toolchain_new})),
+                    Ok(rep) => ok_json(&json!({"signer": rep.signer, "objects_new": rep.objects_new, "objects_present": rep.objects_present, "bytes": rep.bytes, "crates_new": rep.crates_new, "rpm_new": rep.rpm_new, "nix_new": rep.nix_new, "toolchain_new": rep.toolchain_new, "alpine_new": rep.alpine_new})),
                     Err(e) => {
                         let code = if matches!(e, depot_core::Error::Untrusted(_)) { 403 } else { 422 };
                         err(code, e)
@@ -520,7 +530,7 @@ fn want_from_query(req: &Request<'_>) -> Want {
     Want { crates: all || req.query_param("crates").as_deref() == Some("1"), rpm, nix: all || req.query_param("nix").as_deref() == Some("1"), toolchain: all || req.query_param("toolchain").as_deref() == Some("1") }
 }
 
-/// `crates,nix,toolchains,rpm:fedora-42,rpm:*` or `all`.
+/// `crates,nix,toolchains,alpine,rpm:fedora-42,rpm:*` or `all`.
 pub fn select_from_query(s: &str) -> Select {
     if s == "all" || s.is_empty() {
         return Select::all();
@@ -533,6 +543,7 @@ pub fn select_from_query(s: &str) -> Select {
             "crates" => sel.crates = true,
             "nix" => sel.nix = true,
             "toolchains" | "toolchain" => sel.toolchains = true,
+            "alpine" | "apk" => sel.alpine = true,
             "rpm:*" | "rpm" => any_rpm = true,
             p if p.starts_with("rpm:") => repos.push(p[4..].to_string()),
             _ => {}

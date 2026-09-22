@@ -1,6 +1,6 @@
 //! depot-core — the headless mirror.
 //!
-//! One object store, four projections, one sync format:
+//! One object store, five projections, one sync format:
 //!
 //! ```text
 //! <root>/
@@ -13,6 +13,7 @@
 //!     rpm/<repo>/      dnf repository with repodata/       (rpm.rs)
 //!     nix/             nix binary cache                    (nix.rs)
 //!     toolchains/      rust toolchain bundles              (toolchain.rs)
+//!     alpine/<b>/<r>/<a>/  Alpine apk repos, served as signed (alpine.rs)
 //!   tmp/               staging (same filesystem, so rename is atomic)
 //! ```
 //!
@@ -24,6 +25,7 @@
 //! (crates/depot) are the only callers, which is what keeps this testable with
 //! a temp dir and a handful of reference files.
 
+pub mod alpine;
 pub mod catalog;
 pub mod config;
 pub mod crates;

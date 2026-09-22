@@ -65,11 +65,12 @@ pub struct Select {
     pub rpm: Option<Vec<String>>,
     pub nix: bool,
     pub toolchains: bool,
+    pub alpine: bool,
 }
 
 impl Select {
     pub fn all() -> Select {
-        Select { crates: true, rpm: Some(Vec::new()), nix: true, toolchains: true }
+        Select { crates: true, rpm: Some(Vec::new()), nix: true, toolchains: true, alpine: true }
     }
     fn wants_repo(&self, id: &str) -> bool {
         match &self.rpm {
@@ -92,6 +93,9 @@ pub fn subset(full: &Catalog, sel: &Select) -> Catalog {
     }
     if sel.toolchains {
         c.toolchains = full.toolchains.clone();
+    }
+    if sel.alpine {
+        c.alpine = full.alpine.clone();
     }
     c
 }
@@ -170,6 +174,7 @@ pub struct ReadReport {
     pub crates_new: usize,
     pub rpm_new: usize,
     pub nix_new: usize,
+    pub alpine_new: usize,
     pub toolchain_new: usize,
 }
 
@@ -280,6 +285,12 @@ pub fn read(root: &Path, store: &Store, catalog: &mut Catalog, pack: &Path, allo
     for t in &manifest.catalog.toolchains {
         if catalog.upsert_toolchain(t.clone()) {
             rep.toolchain_new += 1;
+        }
+    }
+    for (key, repo) in &manifest.catalog.alpine {
+        crate::alpine::check_key(key)?;
+        if catalog.upsert_alpine(key, repo.clone()) {
+            rep.alpine_new += 1;
         }
     }
     Ok(rep)
