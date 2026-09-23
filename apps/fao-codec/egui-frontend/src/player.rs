@@ -211,6 +211,24 @@ impl Deck {
         self.error = None; self.anchor_map = None; self.lazy = None; self.file = None;
         self.shown = None; self.gap = None; self.tex = None;
         let path = self.path.trim();
+        // A URL -- a .fao on a dufs server -- ALWAYS streams, whatever its size.
+        // The in-memory path below reads every frame's marker up front to draw
+        // the anchor strip; over the network that is the whole file pulled just
+        // to open it. Streamed, only the header, trailers and what is watched
+        // come across, through http_range's block cache.
+        if crate::http_range::is_url(path) {
+            match crate::http_range::open_http(path) {
+                Err(e) => self.error = Some(format!("open failed: {e}")),
+                Ok(r) => match crate::decode::FaoFile::open_stream(Box::new(r)) {
+                    None => self.error = Some("not a .fao file (header/index parse failed)".into()),
+                    Some(f) => {
+                        self.lazy = Some(LazyAnchors::new(f.frame_count() as u64));
+                        self.file = Some(f);
+                    }
+                },
+            }
+            return;
+        }
         let len = match std::fs::metadata(path) {
             Ok(m) => m.len(),
             Err(e) => { self.error = Some(format!("open failed: {e}")); return; }

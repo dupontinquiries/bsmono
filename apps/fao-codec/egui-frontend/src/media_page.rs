@@ -514,7 +514,8 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
     }
 
     let mut toggle: Option<Entry> = None;
-    let mut play: Option<std::path::PathBuf> = None;
+    // A local path OR a dufs URL: the player streams URLs over HTTP ranges.
+    let mut play: Option<String> = None;
     egui::ScrollArea::vertical().id_salt("media_list").auto_shrink([false, false]).show(ui, |ui| {
         for e in &st.entries {
             let on = st.selection.selected(e);
@@ -526,7 +527,10 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
                 ui.label(format!("{icon} {}", e.rel));
                 ui.label(egui::RichText::new(gb(e.size)).weak().small());
                 if e.kind == Kind::Fao {
-                    if let Some(p) = st.local_path(e) {
+                    // Local files and server files alike -- `input_for` gives a
+                    // path or a percent-encoded dufs URL, the same one encoding
+                    // reads, and the player streams a URL without downloading it.
+                    if let Some(p) = st.input_for(e) {
                         if ui.small_button("Play").clicked() { play = Some(p); }
                     }
                 }
@@ -535,7 +539,7 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
     });
     if let Some(e) = toggle { st.selection.toggle(&e); }
     if let Some(p) = play {
-        app.player.a.path = p.display().to_string();
+        app.player.a.path = p;
         app.player.a.open();
         app.tab = crate::Tab::Player;
     }
