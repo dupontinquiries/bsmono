@@ -216,7 +216,8 @@ fn main() {
     let apps: Vec<AppTile> = sb.system.launcher.as_ref().map(|l| effects::hatch_tiles(l, 8)).unwrap_or_default();
 
     let ctx = egui::Context::default();
-    let ui_prefs = settings_kit::Prefs::default();
+    let mut ui_prefs = settings_kit::Prefs::default();
+    ui_prefs.palette = sb.shell.prefs.theme.clone();
     uikit_egui::apply_prefs(&ctx, &ui_prefs);
     let palette = uikit_egui::palette_colors_ctx(&ctx, &ui_prefs.palette);
     // Transparent panels: the overlay composites over the apps.

@@ -31,6 +31,10 @@ pub enum PaletteId {
     Obsidian,
     /// Indigo status board with a cyan-teal active state.
     Lattice,
+    /// Blue-grey light palette (terminal-derived: bg 7792b2, fg 4b4b4b).
+    Slate,
+    /// Slate after lowering the lights: still a luminous slate-blue, not black.
+    SlateDusk,
 }
 
 impl PaletteId {
@@ -53,6 +57,8 @@ impl PaletteId {
             Self::Travertine => "travertine",
             Self::Obsidian   => "obsidian",
             Self::Lattice    => "lattice",
+            Self::Slate      => "slate",
+            Self::SlateDusk  => "slate-dusk",
         }
     }
     pub fn display_name(self) -> &'static str {
@@ -74,6 +80,8 @@ impl PaletteId {
             Self::Travertine => "Travertine",
             Self::Obsidian   => "Obsidian",
             Self::Lattice    => "Lattice",
+            Self::Slate      => "Slate",
+            Self::SlateDusk  => "Slate Dusk",
         }
     }
     pub fn from_str(s: &str) -> Self {
@@ -94,13 +102,15 @@ impl PaletteId {
             "travertine"  => Self::Travertine,
             "obsidian"    => Self::Obsidian,
             "lattice"     => Self::Lattice,
+            "slate"       => Self::Slate,
+            "slate-dusk"  => Self::SlateDusk,
             _             => Self::Dark,
         }
     }
     pub fn all() -> &'static [Self] {
         &[Self::Dark, Self::PitchBlack, Self::Paper, Self::Neon, Self::Minimal, Self::Modern,
           Self::Earth, Self::Pastels, Self::Metallic, Self::Night, Self::System, Self::Voice, Self::Amber, Self::Arena,
-          Self::Travertine, Self::Obsidian, Self::Lattice]
+          Self::Travertine, Self::Obsidian, Self::Lattice, Self::Slate, Self::SlateDusk]
     }
 }
 
@@ -648,4 +658,58 @@ pub const LATTICE: Palette = Palette {
     gradient_hero: ["#16203a", "#0a0f1a"],
     gradient_bar:  ["#101828", "#0a0f1a"],
     glow_online:   "#4fb07a",
+};
+
+/// Blue-grey light: the user's terminal palette (bg 7792b2, fg 4b4b4b).
+/// Surfaces step lighter than the page; the blue is the accent, links the soft accent.
+pub const SLATE: Palette = Palette {
+    id: PaletteId::Slate, name: "Slate",
+    bg_deep:   "#6a84a3",
+    bg_base:   "#7792b2",
+    bg_card:   "#8aa2bf",
+    bg_raised: "#9db2cc",
+    bg_hover:  "#a9bbd2",
+    bg_scrim:  "rgba(43,54,65,0.5)",
+    text_primary:   "#4b4b4b",
+    text_secondary: "#656565",
+    text_disabled:  "#8d8d8d",
+    text_inverse:   "#e7e7e7",
+    accent:      "#2743c7",
+    accent_soft: "#2d80d6",
+    accent_dim:  "#829cb9",
+    danger:  "#b43c29",
+    success: "#66d74f",
+    warning: "#c7c400",
+    border:       "#5f7690",
+    border_focus: "#2d80d6",
+    gradient_hero: ["#7792b2", "#6a84a3"],
+    gradient_bar:  ["#7792b2", "#8aa2bf"],
+    glow_online:   "#66d74f",
+};
+
+/// Slate with the lights lowered: the slate-blue stays luminous (536b86, not
+/// a black), ANSI-derived colours keep enough luminance to read on it.
+pub const SLATE_DUSK: Palette = Palette {
+    id: PaletteId::SlateDusk, name: "Slate Dusk",
+    bg_deep:   "#46596f",
+    bg_base:   "#536b86",
+    bg_card:   "#5c7592",
+    bg_raised: "#6a8199",
+    bg_hover:  "#7189a5",
+    bg_scrim:  "rgba(37,47,57,0.6)",
+    text_primary:   "#d0d2d5",
+    text_secondary: "#b0b8c2",
+    text_disabled:  "#858b92",
+    text_inverse:   "#10161d",
+    accent:      "#6178d5",
+    accent_soft: "#6fa5e5",
+    accent_dim:  "#7189a5",
+    danger:  "#c65340",
+    success: "#70d65c",
+    warning: "#d0cd32",
+    border:       "#46596f",
+    border_focus: "#6fa5e5",
+    gradient_hero: ["#536b86", "#46596f"],
+    gradient_bar:  ["#536b86", "#5c7592"],
+    glow_online:   "#70d65c",
 };

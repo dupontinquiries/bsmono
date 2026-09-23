@@ -526,7 +526,8 @@ fn main() -> eframe::Result<()> {
         APP_ID,
         opts,
         Box::new(move |cc| {
-            let prefs = settings_kit::Prefs::default();
+            let mut prefs = settings_kit::Prefs::default();
+            prefs.palette = shell.prefs.theme.clone();
             uikit_egui::apply_prefs(&cc.egui_ctx, &prefs);
             let palette = uikit_egui::palette_colors_ctx(&cc.egui_ctx, &prefs.palette);
             let mut view = ShellView::default();

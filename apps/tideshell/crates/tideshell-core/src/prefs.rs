@@ -49,6 +49,9 @@ pub struct ShellPrefs {
     /// Backlight write rate, Hz. 30 by default: 90 provoked DSI worker
     /// errors on the FP5's panel; lower it further if they persist.
     pub brightness_rate: u32,
+    /// uikit palette id for the shell's own surfaces ("night", "slate",
+    /// "slate-dusk", ...). Validated by the frontend against the registry.
+    pub theme: String,
     /// Cover clock: digital or analog, and how fuzzy.
     pub clock_style: crate::clock::ClockStyle,
     pub clock_fuzzy: crate::clock::Fuzzy,
@@ -68,13 +71,14 @@ impl Default for ShellPrefs {
             brightness_offset: 0.0,
             night: crate::ambient::NightWindow::default(),
             brightness_rate: 30,
+            theme: "night".into(),
             clock_style: crate::clock::ClockStyle::Digital,
             clock_fuzzy: crate::clock::Fuzzy::Exact,
         }
     }
 }
 
-pub const KEYS: [&str; 13] = [
+pub const KEYS: [&str; 14] = [
     "shell.layout",
     "shell.bar.widgets",
     "shell.bar.width",
@@ -86,6 +90,7 @@ pub const KEYS: [&str; 13] = [
     "shell.brightness.offset",
     "shell.brightness.night",
     "shell.brightness.rate",
+    "shell.theme",
     "shell.clock.style",
     "shell.clock.fuzzy",
 ];
@@ -111,6 +116,7 @@ impl ShellPrefs {
             ("shell.brightness.offset".into(), format!("{:.3}", self.brightness_offset)),
             ("shell.brightness.night".into(), self.night.format_span()),
             ("shell.brightness.rate".into(), self.brightness_rate.to_string()),
+            ("shell.theme".into(), self.theme.clone()),
             (
                 "shell.clock.style".into(),
                 match self.clock_style {
@@ -165,6 +171,12 @@ impl ShellPrefs {
             }
             "shell.brightness.offset" => self.brightness_offset = parse_range(key, v, -1.0, 1.0)?,
             "shell.brightness.rate" => self.brightness_rate = parse_range(key, v, 2.0, 90.0)? as u32,
+            "shell.theme" => {
+                if v.is_empty() || !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                    return Err(format!("shell.theme: '{v}' is not a palette id"));
+                }
+                self.theme = v.to_string();
+            }
             "shell.brightness.night" => {
                 let (start, end) = crate::ambient::NightWindow::parse_span(v).ok_or_else(|| format!("shell.brightness.night: '{v}' is not HH:MM-HH:MM"))?;
                 self.night.start = start;
@@ -236,6 +248,7 @@ mod tests {
         p.night.end = 6 * 60;
         p.clock_style = crate::clock::ClockStyle::Analog;
         p.brightness_rate = 12;
+        p.theme = "slate-dusk".into();
         p.clock_fuzzy = crate::clock::Fuzzy::Quarter;
         p.bar_widgets = bar::parse_widgets("clock,toggle:trackpad,app:org.gnome.Console").0;
         let kv = p.to_kv();
