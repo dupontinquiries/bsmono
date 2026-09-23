@@ -71,6 +71,8 @@ pub fn key_events(pressed: bool, keysym: u32, utf8: &str, ctrl: bool, alt: bool,
 }
 #[cfg(feature = "sensors")]
 pub mod sensors;
+#[cfg(feature = "sensors")]
+pub mod keys;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
 use tideshell_core::bar::{self, BarWidget};

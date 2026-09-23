@@ -192,7 +192,8 @@ impl Executor for System {
             }
             Action::Pointer(_) => Outcome::Unwired("EI sender not wired (needs cosmic-comp patch 0002 + reis client)"),
             Action::SetQuick(..) => Outcome::Unwired("no system backend for quick toggles yet"),
-            Action::SetSlider(..) => Outcome::Unwired("no brightness/volume backend yet"),
+            Action::SetSlider(tideshell_core::control_center::SliderKind::Volume, v) => fade_volume(*v),
+            Action::SetSlider(..) => Outcome::Unwired("brightness is applied by the layer runtime"),
             Action::DisplayPower(_) => Outcome::Unwired("display power is handled by the layer runtime"),
         }
     }
@@ -286,6 +287,48 @@ pub fn recover_system_cursor(config_home: &std::path::Path) -> Option<Outcome> {
         Ok(()) => Outcome::Done("restored system cursor left hidden by a previous run".into()),
         Err(e) => Outcome::Failed(format!("cursor recovery: {e}")),
     })
+}
+
+// ---- volume (PipeWire via wpctl) -----------------------------------------------
+
+pub const FADE_STEPS: usize = 6;
+pub const FADE_STEP_MS: u64 = 40;
+
+/// `wpctl get-volume` prints "Volume: 0.45" (with " [MUTED]" when muted).
+pub fn parse_wpctl_volume(s: &str) -> Option<f32> {
+    s.split_whitespace().skip_while(|w| *w != "Volume:").nth(1).and_then(|v| v.parse().ok())
+}
+
+/// The levels to set, one per step, ending exactly on `to`. A fade instead
+/// of one jump: the volume keys step in 5 % increments and a jump of 5 % is
+/// audible as a bump; six 40 ms steps are not.
+pub fn fade_steps(from: f32, to: f32, n: usize) -> Vec<f32> {
+    (1..=n).map(|i| from + (to - from) * i as f32 / n as f32).map(|v| (v * 1000.0).round() / 1000.0).collect()
+}
+
+fn wpctl(args: &[&str]) -> Result<String, String> {
+    let out = Command::new("wpctl").args(args).stdin(Stdio::null()).output().map_err(|e| format!("wpctl: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(format!("wpctl {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
+/// Fade the default sink to `to` (0..1) on a thread; returns at once.
+pub fn fade_volume(to: f32) -> Outcome {
+    let to = to.clamp(0.0, 1.0);
+    let from = match wpctl(&["get-volume", "@DEFAULT_AUDIO_SINK@"]) {
+        Ok(s) => parse_wpctl_volume(&s).unwrap_or(to),
+        Err(e) => return Outcome::Failed(e),
+    };
+    std::thread::spawn(move || {
+        for v in fade_steps(from, to, FADE_STEPS) {
+            let _ = wpctl(&["set-volume", "@DEFAULT_AUDIO_SINK@", &format!("{v:.3}")]);
+            std::thread::sleep(std::time::Duration::from_millis(FADE_STEP_MS));
+        }
+    });
+    Outcome::Done(format!("volume fade {from:.2} -> {to:.2}"))
 }
 
 // ---- prefs file ------------------------------------------------------------
@@ -451,6 +494,18 @@ mod tests {
         let mut sys = System { launcher: None, pending: Vec::new() };
         sys.start(&["sleep", "5"], true);
         assert!(sys.pending.is_empty());
+    }
+
+    #[test]
+    fn volume_fade_math() {
+        assert_eq!(parse_wpctl_volume("Volume: 0.45\n"), Some(0.45));
+        assert_eq!(parse_wpctl_volume("Volume: 0.60 [MUTED]"), Some(0.6));
+        assert_eq!(parse_wpctl_volume("garbage"), None);
+        let steps = fade_steps(0.40, 0.45, 6);
+        assert_eq!(steps.len(), 6);
+        assert!((steps[5] - 0.45).abs() < 1e-6, "ends exactly on the target");
+        assert!(steps.windows(2).all(|w| w[1] > w[0]) && steps[0] > 0.40, "monotonic, every step moves");
+        assert!(fade_steps(0.5, 0.45, 6).windows(2).all(|w| w[1] < w[0]), "down too");
     }
 
     #[test]

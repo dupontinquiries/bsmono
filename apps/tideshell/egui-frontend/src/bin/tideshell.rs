@@ -40,6 +40,7 @@ struct Shellbox {
     filter: tideshell_core::touchfilter::TouchFilter,
     filter_stats: tideshell_core::touchfilter::Stats,
     pending_display_power: Option<bool>,
+    keys: Option<tideshell_egui::keys::Keys>,
 }
 
 impl Shellbox {
@@ -233,7 +234,15 @@ fn main() {
         filter: tideshell_core::touchfilter::TouchFilter::default(),
         filter_stats: tideshell_core::touchfilter::Stats::default(),
         pending_display_power: None,
+        keys: None,
     };
+    {
+        let found = tideshell_egui::keys::discover(std::path::Path::new("/sys"), std::path::Path::new("/dev/input"));
+        let bus = zbus::blocking::Connection::system().ok();
+        let k = tideshell_egui::keys::Keys::spawn(found, bus.as_ref());
+        sb.shell.note(k.status.clone());
+        sb.keys = Some(k);
+    }
     sb.backlight.set_rate(sb.shell.prefs.brightness_rate);
     // Auto-brightness ramps from the real current level, or not at all.
     if let Some(l) = sb.backlight.initial {
@@ -385,6 +394,18 @@ fn main() {
                 let (rate, _) = io.st_repeat();
                 *next = now_ms + (1000 / rate.max(1)) as u64;
             }
+        }
+        // Hardware keys: power = sleep/wake, volume = a 5 % fade.
+        let presses: Vec<tideshell_egui::keys::KeyPress> = sb.keys.as_ref().map(|k| k.rx.try_iter().collect()).unwrap_or_default();
+        for k in presses {
+            use tideshell_core::control_center::SliderKind;
+            use tideshell_egui::keys::KeyPress;
+            let v = sb.shell.drawer.volume;
+            actions.extend(match k {
+                KeyPress::Power => sb.shell.power_key(),
+                KeyPress::VolumeUp => sb.shell.set_slider(SliderKind::Volume, (v + 0.05).min(1.0)),
+                KeyPress::VolumeDown => sb.shell.set_slider(SliderKind::Volume, (v - 0.05).max(0.0)),
+            });
         }
         actions.extend(sb.shell.tick(now_ms));
         sb.execute(actions);
