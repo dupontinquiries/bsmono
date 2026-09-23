@@ -62,6 +62,9 @@ pub struct State {
     /// Where encodes go. Empty = beside each local source file.
     pub output_dir: String,
     pub quality: u8,
+    /// Compact (motion-predicted) encoding: smaller at low bitrates, encodes
+    /// frame by frame, quality declines a little across a run -- see `motion`.
+    pub compact: bool,
     pub job: Option<EncodeJob>,
     /// Frames sampled per file by Analyze.
     pub samples: usize,
@@ -82,7 +85,7 @@ impl Default for State {
             selection: Selection::default(), new_folder: String::new(), new_server: String::new(),
             include_text: String::new(), exclude_text: String::new(), only_selected: false,
             rx: None, tx: None, pending: 0,
-            output_dir: String::new(), quality: 80, job: None,
+            output_dir: String::new(), quality: 80, compact: crate::transcode::MOTION_DEFAULT, job: None,
             samples: crate::analyze::DEFAULT_SAMPLES, analysis: None, analyzing: None,
             analyze_progress: (0, 0),
         }
@@ -284,6 +287,7 @@ impl State {
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
         let quality = self.quality;
+        let compact = self.compact;
         let total = items.len();
         std::thread::spawn(move || {
             for (i, it) in items.into_iter().enumerate() {
@@ -292,7 +296,7 @@ impl State {
                 if let Some(parent) = it.output.parent() { let _ = std::fs::create_dir_all(parent); }
                 let ptx = tx.clone();
                 let mut last = std::time::Instant::now();
-                let r = crate::transcode::transcode_to_file_cancellable(&it.input, &it.output, quality, None,
+                let r = crate::transcode::transcode_to_file_with(&it.input, &it.output, quality, None,
                     |d, t| {
                         // A message per frame floods the channel at 144 fps;
                         // ten a second is plenty for a progress bar.
@@ -300,7 +304,7 @@ impl State {
                             last = std::time::Instant::now();
                             let _ = ptx.send(JobEvent::Progress(d, t));
                         }
-                    }, Some(&stop));
+                    }, Some(&stop), compact);
                 let _ = tx.send(JobEvent::Finished(it.output, r));
             }
             let _ = tx.send(JobEvent::AllDone);
@@ -499,6 +503,9 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
         ui.add(egui::TextEdit::singleline(&mut st.output_dir).id_salt("media-output_dir")
             .hint_text("beside each local file (required for server files)").desired_width(280.0));
         ui.add(egui::Slider::new(&mut st.quality, 10..=100).text("quality"));
+        ui.checkbox(&mut st.compact, "compact (experimental)").on_hover_text(
+            "Predict moving blocks from the previous frame. Much smaller for camera pans, \
+             but frames encode one at a time and quality dips a little between keyframes.");
     });
     let running = st.job.as_ref().is_some_and(|j| j.running);
     let (plan, skipped) = st.plan_encode();

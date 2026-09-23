@@ -155,6 +155,9 @@ pub const CATALOG: &[Codec] = &[
     Codec { codename: "Quiltstone", version: "egui block patch", marker: Some(b'M'),
         what: "only the 16x16 blocks that changed, over the previous frame -- Keystone DCT underneath",
         status: Status::Current, encode: Some("transcode (patch frames between keyframes)"), decode: Decode::Yes },
+    Codec { codename: "Shiftquilt", version: "egui motion patch", marker: Some(b'Q'),
+        what: "Quiltstone with motion: changed blocks predicted from the previous frame where that is cheaper",
+        status: Status::Current, encode: Some("transcode (compact mode)"), decode: Decode::Yes },
 ];
 
 /// The codec that wrote a frame, from its marker byte.
@@ -220,7 +223,7 @@ mod tests {
     /// ('R' is a repeat marker, not a codec, and resolves to the frame it repeats.)
     #[test]
     fn every_decoded_marker_has_a_codename() {
-        for m in [b'D', b'P', b'L', b'K', b'T', b'V', b'Z', b'X', b'M'] {
+        for m in [b'D', b'P', b'L', b'K', b'T', b'V', b'Z', b'X', b'M', b'Q'] {
             assert!(by_marker(m).is_some(), "marker '{}' has no codename", m as char);
         }
     }
@@ -234,7 +237,7 @@ mod tests {
             .map(|c| c.codename).collect();
         // Quiltstone joined when the transcoder began writing patch frames --
         // a REAL encoder: its output is decoded and checked in transcode's tests.
-        assert_eq!(enc, vec!["Keystone", "Quiltstone"]);
+        assert_eq!(enc, vec!["Keystone", "Quiltstone", "Shiftquilt"]);
         let drift = CATALOG.iter().find(|c| c.codename == "Driftwing").unwrap();
         assert!(drift.unavailable(Purpose::Encode).unwrap().contains("estimated"));
     }

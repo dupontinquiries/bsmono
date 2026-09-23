@@ -51,7 +51,7 @@ pub fn grid(w: usize, h: usize) -> (usize, usize) {
 }
 
 /// The in-frame rectangle of block `i`: `(x, y, bw, bh)`.
-fn block_rect(i: usize, w: usize, h: usize) -> (usize, usize, usize, usize) {
+pub(crate) fn block_rect(i: usize, w: usize, h: usize) -> (usize, usize, usize, usize) {
     let cols = w.div_ceil(MB);
     let (x, y) = ((i % cols) * MB, (i / cols) * MB);
     (x, y, MB.min(w - x), MB.min(h - y))

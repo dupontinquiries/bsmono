@@ -251,6 +251,15 @@ impl FaoFile {
             let prev = if idx > 0 { self.decode_rgb(idx - 1).ok() } else { None };
             return fao_v1::v10::decode_frame(&bytes, prev.as_deref(), w, h).ok_or(Gap::Failed(marker));
         }
+        if marker == crate::motion::MARKER {
+            // Shiftquilt: changed blocks intra-coded or predicted from the
+            // previous frame's picture. Like M, never first.
+            if idx == 0 {
+                return Err(Gap::Failed(marker));
+            }
+            let prev = self.decode_rgb(idx - 1)?;
+            return crate::motion::decode(&bytes, &prev, w, h).ok_or(Gap::Failed(marker));
+        }
         if marker == crate::patch::MARKER {
             // Quiltstone: the changed blocks over the PREVIOUS frame's picture.
             // A patch frame is never first (the transcoder starts every run with

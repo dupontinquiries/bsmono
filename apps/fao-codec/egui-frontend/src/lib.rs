@@ -32,6 +32,8 @@ pub mod http_range;
 /// Quiltstone: block-patch frames (marker M) -- only the 16x16 blocks that
 /// changed, over the Keystone DCT codec.
 pub mod patch;
+/// Shiftquilt: patch frames with motion-predicted blocks (marker Q).
+pub mod motion;
 /// The media collection: video files from local folders and dufs servers, with
 /// glob patterns and individual selection. Distinct from the mesh Web Library.
 /// Fast sampled estimate of what a SHARED block dictionary would save across a

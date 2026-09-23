@@ -137,7 +137,24 @@ pub fn transcode_to_writer<W: std::io::Write + std::io::Seek>(
 /// behind looking like a finished file.
 pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
     path: &str, out: W, quality: u8, max_frames: Option<usize>,
+    progress: impl FnMut(usize, usize), cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(W, TranscodeReport), String> {
+    transcode_cancellable_with(path, out, quality, max_frames, progress, cancel, MOTION_DEFAULT)
+}
+
+/// Whether transcodes predict changed blocks from the previous frame (motion
+/// patches, marker Q) unless told otherwise. See `transcode_cancellable_with`.
+pub const MOTION_DEFAULT: bool = false;
+
+/// [`transcode_cancellable`] with the motion choice explicit.
+///
+/// `motion`: COMPACT (smaller files; frames encode one after another, because
+/// each is predicted from the decoded picture of the one before) versus FAST
+/// (patches coded from scratch; frames encode in parallel).
+pub fn transcode_cancellable_with<W: std::io::Write + std::io::Seek>(
+    path: &str, out: W, quality: u8, max_frames: Option<usize>,
     mut progress: impl FnMut(usize, usize), cancel: Option<&std::sync::atomic::AtomicBool>,
+    motion: bool,
 ) -> Result<(W, TranscodeReport), String> {
     use std::io::Read;
     let info = probe(path)?;
@@ -196,6 +213,9 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
     let mut patches = 0usize;
     // Size of the last keyframe written, for the patch-versus-keyframe check.
     let mut last_key_len: Option<usize> = None;
+    // MOTION MODE ONLY: the decoder's picture of the last real frame, obtained
+    // by decoding the bytes just written -- the closed loop.
+    let mut prev_dec: Option<Vec<u8>> = None;
     // BATCHED, PARALLEL. Every frame here is an intra DCT frame, so frames are
     // independent -- the ideal case for encoding several at once. A batch of
     // `2 x workers` frames is read, encoded across `workers` threads, then
@@ -226,7 +246,11 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
             let job = match reference.as_mut() {
                 Some(r) if since_key < KEY_EVERY => {
                     let blocks = crate::patch::changed_blocks(f, r, w, h, tol);
-                    if blocks.len() * 100 > n_blocks * KEY_IF_CHANGED_PCT {
+                    // Not in motion mode: a camera PAN changes every block yet
+                    // nearly all of them are predictable, and this rule would turn
+                    // every pan into keyframes. There the size check (a patch no
+                    // smaller than a keyframe is sent as one) decides instead.
+                    if !motion && blocks.len() * 100 > n_blocks * KEY_IF_CHANGED_PCT {
                         None
                     } else {
                         crate::patch::update_reference(r, f, w, h, &blocks);
@@ -244,7 +268,44 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
                 }
             }
         }
-        let mut encoded = encode_jobs(&jobs, n, w, h, quality, workers, PSNR_EVERY).into_iter();
+        let encoded_vec = if motion {
+            // SEQUENTIAL, CLOSED LOOP. Each patch is planned against the
+            // decoder's own picture of the previous frame, and the frame's
+            // bytes are then DECODED to become the next frame's reference --
+            // so encoder and decoder predict from identical pixels.
+            //
+            // The patch-versus-keyframe check lives HERE in this mode: the
+            // choice must be made before the frame is decoded, or the next
+            // frame's prediction would come from a payload that was not sent.
+            let mut v = Vec::with_capacity(jobs.len());
+            for (k, job) in jobs.iter().enumerate() {
+                let measure = (n + k) % PSNR_EVERY == 0;
+                let r = match job {
+                    Job::Key(f) => encode_one(f, w, h, quality, measure),
+                    Job::Patch(f, blocks) => {
+                        let pd = prev_dec.as_deref().expect("a keyframe precedes every patch");
+                        let modes = crate::motion::plan(f, pd, w, h, blocks);
+                        let p = crate::motion::encode(f, pd, w, h, blocks, &modes, quality);
+                        match last_key_len {
+                            Some(kl) if p.len() >= kl => { patches -= 1; encode_one(f, w, h, quality, false) }
+                            _ => (p, None),
+                        }
+                    }
+                };
+                let next = if r.0.first() == Some(&b'D') {
+                    last_key_len = Some(r.0.len());
+                    fao_v1::decompress_frame_dct(&r.0, w, h).map(|yuv| crate::decode::yuv_to_rgb(&yuv, w, h))
+                } else {
+                    crate::motion::decode(&r.0, prev_dec.as_deref().expect("reference"), w, h)
+                };
+                prev_dec = Some(next.ok_or("a frame this encoder wrote did not decode")?);
+                v.push(r);
+            }
+            v
+        } else {
+            encode_jobs(&jobs, n, w, h, quality, workers, PSNR_EVERY)
+        };
+        let mut encoded = encoded_vec.into_iter();
         let mut job_of = jobs.iter();
         let mut failed = None;
         for dup in &dups {
@@ -263,7 +324,7 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
                 // advanced it for later frames in this batch. It stays safe --
                 // for blocks the patch skipped, the reference is within `tol` of
                 // this frame, so a later skip is within 2*tol plus one coding.
-                if let (Job::Patch(f, _), Some(k)) = (job, last_key_len) {
+                if let (false, Job::Patch(f, _), Some(k)) = (motion, job, last_key_len) {
                     if r.0.len() >= k {
                         r = encode_one(f, w, h, quality, false);
                         patches -= 1;
@@ -459,8 +520,15 @@ pub fn transcode_to_file(path: &str, out_path: &std::path::Path, quality: u8, ma
 pub fn transcode_to_file_cancellable(path: &str, out_path: &std::path::Path, quality: u8,
         max_frames: Option<usize>, progress: impl FnMut(usize, usize),
         cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<TranscodeReport, String> {
+    transcode_to_file_with(path, out_path, quality, max_frames, progress, cancel, MOTION_DEFAULT)
+}
+
+/// [`transcode_to_file_cancellable`] with the motion choice explicit.
+pub fn transcode_to_file_with(path: &str, out_path: &std::path::Path, quality: u8,
+        max_frames: Option<usize>, progress: impl FnMut(usize, usize),
+        cancel: Option<&std::sync::atomic::AtomicBool>, motion: bool) -> Result<TranscodeReport, String> {
     let f = std::fs::File::create(out_path).map_err(|e| format!("creating {}: {e}", out_path.display()))?;
-    let r = transcode_cancellable(path, std::io::BufWriter::new(f), quality, max_frames, progress, cancel)
+    let r = transcode_cancellable_with(path, std::io::BufWriter::new(f), quality, max_frames, progress, cancel, motion)
         .map(|(_, rep)| rep);
     if r.is_err() { let _ = std::fs::remove_file(out_path); }
     r
@@ -978,6 +1046,89 @@ mod tests {
                   in_b as f64 / 1e6, rep.output_bytes as f64 / 1e6, rep.output_bytes as f64 / in_b as f64,
                   rep.frames - rep.patches - rep.repeats, rep.patches, rep.repeats, rep.mean_psnr);
         assert_eq!(rep.frames, 120);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Encode the same source both ways; `(fast, compact)` reports and files.
+    fn both_modes(src: &std::path::Path, dir: &std::path::Path) -> ((TranscodeReport, Vec<u8>), (TranscodeReport, Vec<u8>)) {
+        let run = |motion: bool, name: &str| {
+            let out = dir.join(name);
+            let rep = transcode_to_file_with(src.to_str().unwrap(), &out, 80, None, |_, _| {}, None, motion).unwrap();
+            (rep, std::fs::read(&out).unwrap())
+        };
+        (run(false, "fast.fao"), run(true, "compact.fao"))
+    }
+
+    /// A CAMERA PAN, the case motion is for: the whole scene slides 3 px per
+    /// frame. Fast mode can only send keyframes (every block changed); compact
+    /// mode predicts every frame and is much smaller.
+    ///
+    /// WHAT THIS DOES NOT CLAIM. A first version asserted "3x smaller, and no
+    /// frame 2 dB below the keyframe". Measured: ~0.44x the size -- but quality
+    /// DECLINES across the run (~30 dB early, ~26.6 dB late), the known
+    /// limitation in `motion`'s doc. The floor below guards that it gets no
+    /// WORSE; it is not a claim that there is no degradation.
+    #[test]
+    fn a_camera_pan_is_far_smaller_with_motion() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-pan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (w, h) = (160usize, 96usize);
+        let src = dir.join("pan.mkv");
+        make(&src, &["-f", "lavfi", "-i",
+            "nullsrc=s=160x96:r=30,geq=r='128+90*sin((X+N*3)*0.11)*cos(Y*0.07)':g='128+70*sin((X+N*3+Y)*0.05)':b='100+mod((X+N*3)*3+Y*2,80)'",
+            "-frames:v", "45", "-c:v", "ffv1"]);
+        let ((fast, fb), (compact, cb)) = both_modes(&src, &dir);
+        assert_eq!(fast.patches, 0, "fast mode: every block changed, so keyframes only");
+        assert!(compact.patches >= 40, "compact mode predicts the pan: {} patch frames", compact.patches);
+        assert!(cb.len() * 2 < fb.len(), "compact {} bytes vs fast {} bytes", cb.len(), fb.len());
+        let raw = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&src)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]).output().unwrap().stdout;
+        let frames: Vec<&[u8]> = raw.chunks(w * h * 3).collect();
+        let f = crate::decode::FaoFile::parse(cb).unwrap();
+        let key = psnr(frames[0], &f.decode_rgb(0).unwrap());
+        for i in 1..f.frame_count() {
+            let p = psnr(frames[i], &f.decode_rgb(i).unwrap());
+            assert!(p > key - 5.5, "frame {i}: {p:.2} dB vs keyframe {key:.2} dB -- worse than the measured decline");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Compact mode on the moving-window scene and the slow fade.
+    ///
+    /// * The FADE stays strict: it guards the skip mechanism, which must not
+    ///   accumulate at all, motion or not.
+    /// * The moving window gets a MEASURED BOUND, not a no-drift claim:
+    ///   residuals are coded coarser (RESIDUAL_Q_DROP) and quality declines a
+    ///   little across a run (motion's documented limitation). Measured: worst
+    ///   frame 25.03 dB against a 26.08 dB keyframe -- 1.05 below.
+    #[test]
+    fn compact_mode_stays_within_its_measured_bounds() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-cmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, frames, _w, _h) = moving_box_source(&dir);
+        let ((_fast, fb), (_compact, cb)) = both_modes(&src, &dir);
+        assert!(cb.len() < fb.len(), "compact {} vs fast {}", cb.len(), fb.len());
+        let f = crate::decode::FaoFile::parse(cb).unwrap();
+        let key = psnr(&frames[0], &f.decode_rgb(0).unwrap());
+        for i in 0..f.frame_count() {
+            let p = psnr(&frames[i], &f.decode_rgb(i).unwrap());
+            assert!(p > key - 2.0, "frame {i}: {p:.2} dB vs keyframe {key:.2} dB -- worse than measured");
+        }
+        let fade = dir.join("fade.mkv");
+        make(&fade, &["-f", "lavfi", "-i", "nullsrc=s=64x48:r=30,geq=r='60+N':g='60+N':b='60+N'",
+                      "-frames:v", "59", "-c:v", "ffv1"]);
+        let raw = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&fade)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]).output().unwrap().stdout;
+        let out = dir.join("fade.fao");
+        transcode_to_file_with(fade.to_str().unwrap(), &out, 80, None, |_, _| {}, None, true).unwrap();
+        let ff = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        let last = ff.frame_count() - 1;
+        let err = ff.decode_rgb(last).unwrap().iter().zip(&raw[last * 64 * 48 * 3..]).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        assert!(err <= 6, "compact-mode fade stays within a few levels: max error {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
