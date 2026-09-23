@@ -6231,7 +6231,9 @@ impl App {
             .collapsible(false).show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("format:");
-                    ui.selectable_value(&mut plan.format, ExportFormat::Opus, "opus");
+                    if ExportFormat::Opus.available() {
+                        ui.selectable_value(&mut plan.format, ExportFormat::Opus, "opus");
+                    }
                     ui.selectable_value(&mut plan.format, ExportFormat::Wav, "wav");
                     ui.selectable_value(&mut plan.format, ExportFormat::Mp3, "mp3")
                         .on_hover_text("for the group chat — through ffmpeg");
@@ -6930,7 +6932,19 @@ mod arrangement_tests {
 /// What `Studio::export_arrangement` writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat { Wav, Opus, Mp3, M4a }
+
+/// Opus is compiled in (the `audio` feature: libopus via studio-media).
+/// Without it studio builds codec-free for devices with no audio output (a
+/// Paper Pro without Bluetooth audio): exports default to WAV, the export
+/// dialog does not offer Opus, and Opus bounces are written as FLAC.
+pub const OPUS_BUILT: bool = cfg!(feature = "audio");
+
 impl ExportFormat {
+    /// Can this build encode it? (Mp3/M4a go through an external ffmpeg,
+    /// so they are offered regardless and fail with ffmpeg's own message.)
+    pub fn available(self) -> bool {
+        self != ExportFormat::Opus || OPUS_BUILT
+    }
     pub fn ext(self) -> &'static str {
         match self { ExportFormat::Wav => "wav", ExportFormat::Opus => "opus",
                      ExportFormat::Mp3 => "mp3", ExportFormat::M4a => "m4a" }
@@ -6965,7 +6979,7 @@ mod export_tests {
         let dir = std::env::temp_dir().join("studio-export-test");
         let expect_frames = s.render_arrangement(48_000, &sources).len() / 2;
 
-        for fmt in [ExportFormat::Wav, ExportFormat::Opus] {
+        for fmt in [ExportFormat::Wav, ExportFormat::Opus].into_iter().filter(|f| f.available()) {
             let path = s.export_arrangement(&sources, &dir, fmt, 48_000, studio_audio::format::ChannelFormat::Stereo).expect("exports");
             assert!(s.status.contains("exported"), "status names it: {:?}", s.status);
             let back = studio_media::decode_file(&path).expect("our decoder reads it");
@@ -7011,6 +7025,7 @@ mod export_tests {
         }
     }
 
+    #[cfg(feature = "audio")] // measures real Opus encoding
     #[test]
     fn the_opus_export_is_the_small_one() {
         // The stated reason this format exists. Not a benchmark — an order
@@ -8067,6 +8082,7 @@ mod surround_export_tests {
         assert!(e(3) > 0.0, "LFE carries the low end");
     }
 
+    #[cfg(feature = "audio")] // measures real Opus encoding
     #[test]
     fn opus_refuses_to_pretend_it_can_carry_surround() {
         // Mapping family 0 is mono/stereo; an encoder error at the end of a

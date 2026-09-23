@@ -19,6 +19,15 @@ path = "src/lib.rs"
 [[bin]]
 name = "tomescope"
 path = "src/main.rs"
+required-features = ["desktop"]
+
+# The e-ink tablet shell (reMarkable via AppLoad/qtfb or Oxide/Blight): the
+# same app core, drawn by eink-kit's CPU rasterizer. No eframe, no winit.
+# Build: --no-default-features --features eink
+[[bin]]
+name = "tomescope-eink"
+path = "src/bin/tomescope_eink.rs"
+required-features = ["eink"]
 
 # The command-line companion. ON BY DEFAULT — it is how the library is scripted and
 # inspected headlessly, and a default build should produce it. Gated so a packager who wants
@@ -31,7 +40,11 @@ path = "src/bin/shelfctl.rs"
 required-features = ["shelfctl"]
 
 [features]
-default = ["shelfctl"]
+default = ["desktop", "shelfctl"]
+# The desktop window (eframe/glow/winit).
+desktop = ["dep:eframe"]
+# The e-ink tablet shell.
+eink = ["dep:eink-kit"]
 # Build the `shelfctl` command-line companion.
 shelfctl = []
 # The GUI alone, for a build that wants no extra binaries.
@@ -44,7 +57,8 @@ espeak = []
 
 [dependencies]
 egui = "0.34"
-eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
+eink-kit = { path = "../../shared/eink-kit", optional = true }
 
 # The gui kit (from the reference tree). uikit-egui re-exports uikit-gesture.
 uikit-egui = { path = "../../shared/uikit/crates/uikit-egui" }
@@ -65,3 +79,5 @@ anyhow = "1"
 
 [profile.dev]
 opt-level = 1
+
+[dev-dependencies]

@@ -3,6 +3,7 @@
 //! model, library index, layout engine, and everything else that isn't
 //! specifically GUI event-loop glue (which stays in `main.rs`).
 
+pub mod app;
 pub mod content;
 pub mod formats;
 pub mod formats_cbz;

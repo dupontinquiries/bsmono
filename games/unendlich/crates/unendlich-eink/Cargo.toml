@@ -1,0 +1,13 @@
+[package]
+name = "unendlich-eink"
+version = "0.1.0"
+edition = "2021"
+description = "unendlich's world on an e-ink tablet: a 2.5D heightfield view over a cached, background-filled surface map, drawn by eink-kit"
+
+[dependencies]
+unendlich-engine = { path = "../unendlich-engine", default-features = false }
+eink-kit = { path = "../../../../shared/eink-kit" }
+
+[[bin]]
+name = "unendlich-eink"
+path = "src/bin/unendlich_eink.rs"

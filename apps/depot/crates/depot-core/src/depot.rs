@@ -15,6 +15,8 @@ pub struct Depot {
     pub store: Store,
     pub catalog: Catalog,
     pub config: Config,
+    /// catalog.json's mtime when `catalog` was loaded (see `refresh`).
+    catalog_mtime: Option<std::time::SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -49,7 +51,23 @@ impl Depot {
         if !root.join("objects").is_dir() {
             return Err(invalid(format!("{} is not a depot (no objects/); run `depot init --root {}`", root.display(), root.display())));
         }
-        Ok(Depot { root: root.to_path_buf(), store: Store::open(root), catalog: Catalog::load(root)?, config: Config::load(root)? })
+        let catalog_mtime = std::fs::metadata(root.join("catalog.json")).and_then(|m| m.modified()).ok();
+        Ok(Depot { root: root.to_path_buf(), store: Store::open(root), catalog: Catalog::load(root)?, config: Config::load(root)?, catalog_mtime })
+    }
+
+    /// Reload the catalog if another process (the CLI ingesting while the
+    /// server runs, the normal workflow) changed catalog.json since it was
+    /// loaded. Without this the served FILES were current (hardlinks on
+    /// disk) but the server's /api answered from its startup catalog.
+    /// Returns whether it reloaded.
+    pub fn refresh(&mut self) -> Result<bool> {
+        let now = std::fs::metadata(self.root.join("catalog.json")).and_then(|m| m.modified()).ok();
+        if now.is_some() && now != self.catalog_mtime {
+            self.catalog = Catalog::load(&self.root)?;
+            self.catalog_mtime = now;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn views(&self) -> Views<'_> {
@@ -165,6 +183,18 @@ impl Depot {
         }
         self.catalog.save(&self.root)?;
         self.views().rebuild_nix()?;
+        Ok(rep)
+    }
+
+    /// An Alpine repository tree (`<branch>/<repo>/<arch>/APKINDEX.tar.gz`
+    /// plus any subset of its packages); see alpine.rs.
+    pub fn ingest_alpine_dir(&mut self, dir: &Path) -> Result<crate::alpine::IngestReport> {
+        let (repos, rep) = crate::alpine::ingest_dir(&self.store, dir)?;
+        for (key, repo) in repos {
+            self.catalog.upsert_alpine(&key, repo);
+        }
+        self.catalog.save(&self.root)?;
+        self.views().rebuild_alpine()?;
         Ok(rep)
     }
 
@@ -386,5 +416,25 @@ mod tests {
         assert_eq!((s.fresh, s.size), (false, xz.len() as u64));
         std::fs::remove_dir_all(a).unwrap();
         std::fs::remove_dir_all(b).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    #[test]
+    fn a_running_depot_sees_what_another_process_ingested() {
+        let root = std::env::temp_dir().join(format!("depot_refresh_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        super::Depot::init(&root).unwrap();
+        let mut server = super::Depot::open(&root).unwrap(); // the long-running server's view
+        let mut cli = super::Depot::open(&root).unwrap();    // `depot ingest` in another process
+        assert!(!server.refresh().unwrap(), "nothing changed yet");
+        std::thread::sleep(std::time::Duration::from_millis(20)); // distinct mtime
+        cli.catalog.upsert_alpine("v3.22/main/aarch64", crate::catalog::AlpineRepo { index: "ab".repeat(32), index_size: 1, packages: vec![] });
+        cli.catalog.save(&root).unwrap();
+        assert!(server.catalog.alpine.is_empty());
+        assert!(server.refresh().unwrap(), "reloaded");
+        assert_eq!(server.catalog.alpine.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

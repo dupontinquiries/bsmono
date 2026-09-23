@@ -58,6 +58,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     );
     ui.separator();
 
+    let c = uikit_egui::palette_colors(&app.prefs.palette);
     let st = &mut app.diagnostics;
 
     // ── 1. the host cannot see the device ────────────────────────────
@@ -88,17 +89,10 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             {
                 let v = cockpit::udevcheck::evaluate(
                     &st.udev_rules, st.udev_vid.trim(), st.udev_pid.trim());
-                ui.label(format!("{v:?}"));
-                // The fix is offered as TEXT to copy rather than written
-                // for them: the rules file is on the other machine, and
-                // a button that claimed to fix it could not.
-                let fix = cockpit::udevcheck::fix_rule(st.udev_vid.trim(), st.udev_pid.trim());
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(&fix).monospace().small());
-                    if ui.small_button("copy").clicked() {
-                        ui.ctx().copy_text(fix.clone());
-                    }
-                });
+                // Explained, not {:?}-printed. The fix is offered as TEXT to
+                // copy rather than written for them: the rules file is on the
+                // other machine, and a button that claimed to fix it could not.
+                crate::show::finding(ui, &c, &cockpit::finding::udev(&v, st.udev_vid.trim(), st.udev_pid.trim()));
             }
         });
 
@@ -111,7 +105,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                     .hint_text("paste `fastboot devices` output"),
             );
             if !st.fastboot_out.trim().is_empty() {
-                ui.label(format!("{:?}", cockpit::fbdiag::classify(&st.fastboot_out)));
+                crate::show::finding(ui, &c, &cockpit::finding::fastboot(&cockpit::fbdiag::classify(&st.fastboot_out)));
             }
         });
 
@@ -132,13 +126,23 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             );
             if !st.kernel_log.trim().is_empty() {
                 let records = cockpit::klog::parse(&st.kernel_log);
+                crate::show::findings(ui, &c, &cockpit::finding::klog_signatures(&records));
                 ui.label(format!("{} record(s)", records.len()));
                 // Capped: a dmesg is thousands of lines and drawing all
                 // of them would make the page slower than reading the
                 // log by hand, which is what it replaces.
-                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                    for r in records.iter().take(200) {
-                        ui.label(egui::RichText::new(format!("{r:?}")).monospace().small());
+                // Typed rows (level chip from the syslog level, stamp, message)
+                // instead of a {:?} dump of each Record.
+                egui::ScrollArea::vertical().id_salt("klog-rows").max_height(220.0).show(ui, |ui| {
+                    use uikit_egui::log_view::{log_row, LogEntry, LogLevel};
+                    for (i, r) in records.iter().take(200).enumerate() {
+                        let level = match cockpit::finding::klog_severity(r.level) {
+                            cockpit::finding::Severity::Error => LogLevel::Error,
+                            cockpit::finding::Severity::Warning => LogLevel::Warn,
+                            _ => LogLevel::Info,
+                        };
+                        let text = match r.monotonic { Some(t) => format!("[{t:>10.3}] {}", r.message), None => r.message.clone() };
+                        log_row(ui, &LogEntry::new(level, text, i as u64));
                     }
                 });
                 if records.len() > 200 {

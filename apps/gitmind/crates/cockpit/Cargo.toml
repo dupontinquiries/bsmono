@@ -12,6 +12,9 @@ name = "cockpit"
 path = "src/lib.rs"
 
 [dependencies]
+# depot's shared core: its API types and Alpine index/closure logic, so
+# gitmind and depot agree on formats by construction (no socket code in it).
+depot-core = { path = "../../../depot/crates/depot-core" }
 repo-map = { path = "../../../../shared/repo-map" }
 serde_json = "1"
 gitmind-core = { path = "../core" }

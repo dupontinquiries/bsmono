@@ -32,6 +32,30 @@ pub struct Catalog {
     pub nix: Vec<NixEntry>,
     #[serde(default)]
     pub toolchains: Vec<ToolchainEntry>,
+    /// Alpine repositories, keyed `<branch>/<repo>/<arch>` (alpine.rs).
+    #[serde(default)]
+    pub alpine: BTreeMap<String, AlpineRepo>,
+}
+
+/// One Alpine repository: its signed index and the packages ingested.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct AlpineRepo {
+    /// Object hash of APKINDEX.tar.gz, served byte-for-byte.
+    pub index: String,
+    pub index_size: u64,
+    #[serde(default)]
+    pub packages: Vec<ApkEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApkEntry {
+    pub name: String,
+    pub version: String,
+    pub filename: String,
+    pub hash: String,
+    pub size: u64,
+    #[serde(default)]
+    pub added: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -172,6 +196,24 @@ impl Catalog {
         }
     }
 
+    /// Replace the repo's index with `repo.index` (the newer signed index
+    /// wins) and add its packages; true if anything was new.
+    pub fn upsert_alpine(&mut self, key: &str, repo: AlpineRepo) -> bool {
+        let dst = self.alpine.entry(key.to_string()).or_default();
+        let mut changed = dst.index != repo.index;
+        dst.index = repo.index;
+        dst.index_size = repo.index_size;
+        for p in repo.packages {
+            if !dst.packages.iter().any(|x| x.filename == p.filename && x.hash == p.hash) {
+                dst.packages.retain(|x| x.filename != p.filename);
+                dst.packages.push(p);
+                changed = true;
+            }
+        }
+        dst.packages.sort_by(|a, b| a.filename.cmp(&b.filename));
+        changed
+    }
+
     pub fn upsert_toolchain(&mut self, e: ToolchainEntry) -> bool {
         if let Some(x) = self.toolchains.iter_mut().find(|x| x.version == e.version && x.triple == e.triple && x.component == e.component) {
             let n = x.hash != e.hash;
@@ -210,6 +252,12 @@ impl Catalog {
         for t in &self.toolchains {
             v.push(t.hash.clone());
         }
+        for r in self.alpine.values() {
+            v.push(r.index.clone());
+            for p in &r.packages {
+                v.push(p.hash.clone());
+            }
+        }
         v.sort();
         v.dedup();
         v
@@ -223,6 +271,8 @@ impl Catalog {
             rpm_packages: self.rpm.values().map(|r| r.packages.len()).sum(),
             nix_paths: self.nix.len(),
             toolchain_files: self.toolchains.len(),
+            alpine_repos: self.alpine.len(),
+            alpine_packages: self.alpine.values().map(|r| r.packages.len()).sum(),
         }
     }
 }
@@ -235,6 +285,10 @@ pub struct Counts {
     pub rpm_packages: usize,
     pub nix_paths: usize,
     pub toolchain_files: usize,
+    #[serde(default)]
+    pub alpine_repos: usize,
+    #[serde(default)]
+    pub alpine_packages: usize,
 }
 
 #[cfg(test)]

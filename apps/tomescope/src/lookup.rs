@@ -7,7 +7,7 @@
 
 use crate::content::{BookContent, IndexTerm, LocusRange};
 use crate::reader::Selection;
-use eframe::egui;
+use egui;
 use std::collections::HashMap;
 
 /// A tiny built-in glossary. Real deployments would ship a bundled

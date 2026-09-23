@@ -78,7 +78,9 @@ pub struct Plan {
 
 impl Default for Plan {
     fn default() -> Plan {
-        Plan { format: ExportFormat::Opus, scope: Scope::Full, stems: false,
+        // Opus when the build has it; WAV otherwise (never a default that fails).
+        Plan { format: if crate::OPUS_BUILT { ExportFormat::Opus } else { ExportFormat::Wav },
+               scope: Scope::Full, stems: false,
                rate: 48_000, layout: studio_audio::format::ChannelFormat::Stereo,
                opus_bitrate: 128_000 }
     }
@@ -524,6 +526,11 @@ mod video_tests {
     }
 
     #[test]
+    fn the_default_export_is_one_this_build_can_encode() {
+        assert!(Plan::default().format.available(), "{:?}", Plan::default().format);
+    }
+
+    #[test]
     fn the_music_video_is_the_timelines_cuts_over_the_mixdown_and_a_missing_file_is_a_gap() {
         let tmp = std::env::temp_dir().join(format!("studio-mv-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -759,6 +766,7 @@ mod tests {
                 "a real WAV landed");
     }
 
+    #[cfg(feature = "audio")] // plans an Opus export explicitly
     #[test]
     fn stems_land_one_named_file_each_and_opus_survives_its_own_decoder() {
         let p = project();
@@ -810,6 +818,7 @@ mod tests {
         assert!(!dest.exists(), "a cancelled job writes nothing");
     }
 
+    #[cfg(feature = "audio")] // plans an Opus export explicitly
     #[test]
     fn a_rack_loop_export_is_audible_and_stereo() {
         let rack = studio_live::Rack::trap_kit();

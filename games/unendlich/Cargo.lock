@@ -1230,6 +1230,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eink-kit"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "libc",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4195,6 +4203,14 @@ dependencies = [
  "regex",
  "serde_json",
  "unendlich-ui",
+]
+
+[[package]]
+name = "unendlich-eink"
+version = "0.1.0"
+dependencies = [
+ "eink-kit",
+ "unendlich-engine",
 ]
 
 [[package]]

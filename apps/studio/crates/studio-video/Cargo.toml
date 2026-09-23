@@ -6,7 +6,13 @@ description = "Video probing, thumbnailing, and audio-track extraction via ffmpe
 
 [dependencies]
 studio-audio = { path = "../studio-audio" }
-studio-media = { path = "../studio-media" }
+studio-media = { path = "../studio-media", default-features = false }
 studio-core = { path = "../studio-core" }
 serde_json = "1"
 sha2 = "0.10"
+
+[features]
+# Opus decode in the media layer (libopus, a C library). Default-on; a
+# dependent that wants a codec-free build takes this crate without defaults.
+default = ["opus"]
+opus = ["studio-media/opus"]

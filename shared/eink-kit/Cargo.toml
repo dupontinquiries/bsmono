@@ -1,0 +1,25 @@
+# eink-kit — run egui apps on e-ink panels (reMarkable via qtfb or Oxide's
+# Blight) with no GPU: egui meshes are rasterized on the CPU into the display
+# server's shared buffer, diffed per tile, and committed with a waveform the
+# refresh policy picks. See src/lib.rs for the layering.
+[package]
+name = "eink-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Headless egui runner for e-ink displays: CPU raster, damage, refresh policy, touch"
+
+[dependencies]
+# Must match uikit-egui (0.34) or Color32/Context are different types.
+egui = { version = "0.34", default-features = false, features = ["default_fonts"] }
+libc = "0.2"
+
+[[bin]]
+name = "eink-demo"
+path = "src/bin/eink_demo.rs"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

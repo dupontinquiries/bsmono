@@ -1695,6 +1695,16 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                             // an earlier draft computed this INSIDE the
                             // closure and then tried to read it outside,
                             // which does not compile (out of scope).
+                            // Spoken input needs the `voice` feature (mic +
+                            // whisper); without it the mode is typed only.
+                            #[cfg(not(feature = "voice"))]
+                            ui.label(
+                                egui::RichText::new("type what you'd say, then Enter · Esc cancel (no microphone in this build)")
+                                    .color(colors.text_weak)
+                                    .small(),
+                            );
+                            #[cfg(feature = "voice")]
+                            {
                             let stage_listening = matches!(
                                 state.voice_popup.stage,
                                 uikit_egui::voice_popup::Stage::Listening
@@ -1762,6 +1772,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                     // the mode silently doing nothing.
                                     ui.label(egui::RichText::new(message.as_str()).color(colors.danger));
                                 }
+                            }
                             }
                             if enter && !p.input.trim().is_empty() {
                                 submit_voice = Some(p.input.trim().to_string());

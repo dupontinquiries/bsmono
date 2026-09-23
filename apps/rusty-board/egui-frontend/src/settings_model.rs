@@ -48,8 +48,6 @@ impl Group {
     }
 }
 
-/// One multiple-choice setting.
-#[derive(Clone, Debug, PartialEq)]
 /// What kind of control a setting needs.
 ///
 /// The GTK panel has exactly three row builders — `build_setting_row`,
@@ -89,6 +87,8 @@ pub enum Kind {
     Color,
 }
 
+/// One multiple-choice setting.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Setting {
     /// Config key, e.g. `layout.letters`.
     pub key: &'static str,

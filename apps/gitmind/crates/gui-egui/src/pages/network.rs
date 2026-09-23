@@ -216,7 +216,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     let lines = app.task.log();
     if !lines.is_empty() || !app.net.streaming_name.is_empty() {
         ui.add_space(6.0);
-        uikit_egui::scroll::log(ui, &lines, 180.0);
+        crate::show::task_log(ui, "network", &lines, 180.0);
     }
 
     if let Some(r) = app.task.take_result() {

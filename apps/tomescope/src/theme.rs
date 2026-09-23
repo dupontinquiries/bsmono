@@ -5,7 +5,7 @@
 //! a very common combination, so these are two independent choices that
 //! both get applied when rendering the reader screen.
 
-use eframe::egui::Color32;
+use egui::Color32;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,7 +97,11 @@ impl ReadingTheme {
     /// still override the app palette independently).
     pub fn suggested_app_palette(&self) -> &'static str {
         match self {
-            ReadingTheme::Paper | ReadingTheme::Sepia | ReadingTheme::Forest | ReadingTheme::EInk => "light",
+            // "paper", not "light": there is no "light" palette, and
+            // palette_colors falls back to the FIRST palette (dark) for an
+            // unknown id, so every light reading theme got dark chrome, and on
+            // an e-ink panel near-white page text on white paper.
+            ReadingTheme::Paper | ReadingTheme::Sepia | ReadingTheme::Forest | ReadingTheme::EInk => "paper",
             ReadingTheme::Slate | ReadingTheme::Night | ReadingTheme::HighContrast => "dark",
         }
     }
@@ -161,6 +165,19 @@ impl ReaderPrefs {
             ReadingTheme::Night
         } else {
             self.reading_theme
+        }
+    }
+}
+
+#[cfg(test)]
+mod palette_id_tests {
+    use super::*;
+
+    #[test]
+    fn every_suggested_app_palette_is_a_real_palette() {
+        let ids: Vec<&str> = snapclone_theme::PaletteId::all().iter().map(|p| p.as_str()).collect();
+        for t in ReadingTheme::all() {
+            assert!(ids.contains(&t.suggested_app_palette()), "{t:?} suggests unknown palette {:?}", t.suggested_app_palette());
         }
     }
 }

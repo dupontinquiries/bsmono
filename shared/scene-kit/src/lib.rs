@@ -27,4 +27,11 @@ pub mod textsurface;
 pub mod inscribe;
 pub mod perf;
 #[cfg(feature = "glow")]
+pub mod scene_types;
+/// The GPU scene renderer (glow). On e-ink builds (cfg `eink`) the same API
+/// is provided without a GPU; see glow_scene_eink.rs.
+#[cfg(all(feature = "glow", not(eink)))]
+pub mod glow_scene;
+#[cfg(all(feature = "glow", eink))]
+#[path = "glow_scene_eink.rs"]
 pub mod glow_scene;

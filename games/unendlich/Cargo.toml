@@ -8,6 +8,7 @@ members = [
     "crates/unendlich-analyze",
     "crates/unendlich-dash",
     "crates/unendlich-ui",
+    "crates/unendlich-eink",
     "crates/voxel-tools",
     # The harness was never a member, so cargo in it failed with "believes it
     # is in a workspace when it is not" and nothing ever built it — which is

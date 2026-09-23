@@ -1,0 +1,36 @@
+# eframe, on e-ink: the subset of eframe 0.34's API the monorepo's egui apps
+# use, implemented on eink-kit. Swapped in at BUILD time, apps unchanged:
+#
+#   cargo build --config 'patch.crates-io.eframe.path="<repo>/shared/eink-kit/eframe-shim"' ...
+#
+# (gitmind's tablet builds do this.) Same package name and a compatible
+# version, and every eframe feature name exists (as a no-op) so apps'
+# feature lists resolve. Deliberately absent: glow, wgpu, winit handles.
+# An app that uses them fails to COMPILE, naming exactly what to port.
+[package]
+name = "eframe"
+version = "0.34.3"
+edition = "2021"
+description = "eframe-compatible shim that runs egui apps on eink-kit (e-ink tablets)"
+publish = false
+
+[features]
+default = []
+glow = []
+wgpu = []
+wgpu_no_default_features = []
+wayland = []
+x11 = []
+persistence = []
+accesskit = []
+default_fonts = []
+web_screen_reader = []
+android-game-activity = []
+android-native-activity = []
+__screenshot = []
+
+[dependencies]
+egui = { version = "0.34", default-features = false, features = ["default_fonts"] }
+eink-kit = { path = ".." }
+serde = "1"
+serde_json = "1"
