@@ -73,6 +73,7 @@ pub fn key_events(pressed: bool, keysym: u32, utf8: &str, ctrl: bool, alt: bool,
 pub mod sensors;
 #[cfg(feature = "sensors")]
 pub mod keys;
+pub mod camera;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
 use tideshell_core::bar::{self, BarWidget};
@@ -133,6 +134,8 @@ pub struct ShellView {
     cover_drag: Option<(i32, f32)>,
     /// The palette's search field has been given focus for this opening.
     palette_focused: bool,
+    /// The camera pane's latest frame as a texture, with its size.
+    camera_tex: Option<(egui::TextureHandle, usize, usize)>,
     bar_drag: f32,
     sheet: SettingsSheet,
 }
@@ -238,6 +241,19 @@ impl ShellView {
     /// the exclusive zone it reserves (always the collapsed width).
     pub fn bar_geometry(shell: &Shell) -> Option<(u32, i32)> {
         (shell.prefs.layout == Layout::RightBar).then(|| (Self::bar_width(shell).round() as u32, shell.prefs.bar_width.round() as i32))
+    }
+
+    /// The camera pane's newest frame (RGBA), uploaded as a texture.
+    pub fn set_camera_frame(&mut self, ctx: &egui::Context, w: usize, h: usize, rgba: &[u8]) {
+        let img = egui::ColorImage::from_rgba_unmultiplied([w, h], rgba);
+        match &mut self.camera_tex {
+            Some((t, tw, th)) if *tw == w && *th == h => t.set(img, egui::TextureOptions::LINEAR),
+            _ => self.camera_tex = Some((ctx.load_texture("ts-camera", img, egui::TextureOptions::LINEAR), w, h)),
+        }
+    }
+
+    pub fn clear_camera_frame(&mut self) {
+        self.camera_tex = None;
     }
 
     /// Draw one carousel peek filling this `Ui` (its own layer surface).
@@ -588,8 +604,29 @@ impl ShellView {
         let prog = shell.lock.reveal.progress;
         let alpha = (1.0 - prog * 0.8).clamp(0.0, 1.0);
         let top = origin + Vec2::new(0.0, -prog * size.y);
-        // Background: a vertical gradient (the camera layer replaces it later).
-        let bands = 32;
+        // Background: the camera when it is running (the pane), else a gradient.
+        if let Some((tex, _, _)) = &self.camera_tex {
+            let r = Rect::from_min_size(top, size);
+            p.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::from_white_alpha((alpha * 255.0) as u8));
+            // Darken for legibility, keep the picture.
+            p.rect_filled(r, cr(0), Color32::from_black_alpha((alpha * 90.0) as u8));
+            // World anchors: rings where the world says they are.
+            let c = top + Vec2::new(size.x / 2.0, size.y / 2.0);
+            for a in &shell.world.anchors {
+                if let Some((x, y)) = shell.world.project(a.dir) {
+                    let at = c + Vec2::new(x, y);
+                    if r.contains(at) {
+                        p.circle_stroke(at, 14.0, Stroke::new(2.0, Color32::from_white_alpha((alpha * 220.0) as u8)));
+                        p.circle_filled(at, 3.0, Color32::from_white_alpha((alpha * 220.0) as u8));
+                        p.text(at + Vec2::new(0.0, 24.0), Align2::CENTER_CENTER, &a.label, FontId::proportional(12.0), Color32::from_white_alpha((alpha * 220.0) as u8));
+                    }
+                }
+            }
+            // Live indicator: the camera is on.
+            p.circle_filled(top + Vec2::new(size.x - 22.0, 22.0), 5.0, Color32::from_rgba_unmultiplied(230, 60, 50, (alpha * 255.0) as u8));
+            p.text(top + Vec2::new(size.x - 34.0, 22.0), Align2::RIGHT_CENTER, format!("{:.0}°", shell.world.yaw_deg()), FontId::proportional(12.0), Color32::from_white_alpha((alpha * 200.0) as u8));
+        }
+        let bands = if self.camera_tex.is_some() { 0 } else { 32 };
         for i in 0..bands {
             let t = i as f32 / (bands - 1) as f32;
             let lerp = |a: f32, b: f32| (a + (b - a) * t) as u8;

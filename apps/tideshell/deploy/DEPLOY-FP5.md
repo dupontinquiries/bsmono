@@ -35,6 +35,7 @@ Everything for deployment is in `apps/tideshell/deploy/`:
 | `DEPLOY-FP5.md` | this document |
 | `preflight.sh` | read-only phone checks, PASS/WARN/FAIL |
 | `fp5-touch-diag.sh` | which layer drops touch; edge-touch test |
+| `fp5-camera-diag.sh` | why the camera works under plasma but not cosmic, link by link |
 | `pack-src.sh` | packs the 11 crates the phone build needs |
 | `run-in-session.sh` | runs tideshell inside the cosmic session from ssh |
 | `tideshell.service` | systemd user unit (autostart), stage 6 only |
@@ -150,6 +151,7 @@ Try each, and for each note what happened on screen **and** the trace lines:
 | 12 | press volume up / down | `-> SetSlider(Volume, ...)` then `ok: volume fade 0.xx -> 0.yy` and the level changes smoothly (needs `wpctl`, i.e. PipeWire/WirePlumber; else `FAILED: wpctl ...`) |
 | 14 | drawer -> drag on the Volume pad: left/right = level, up = cut through, down = soft | first drag: `FAILED: voicing sink installed at ~/.config/pipewire/pipewire.conf.d/tideshell-voicing.conf; restart pipewire ...` -> run `systemctl --user restart pipewire wireplumber`, then `wpctl set-default $(wpctl status | grep -m1 'tideshell voicing' | grep -oE '[0-9]+' | head -1)`; later drags: `ok: voicing +0.70: hp 250 Hz ...` and speech gets clearer / softer. Needs `pw-cli` (pipewire-tools) |
 | 15 | put the phone in a pocket, then triple-tap through the fabric; take it out, wait a second, triple-tap | `proximity: iio-sensor-proxy` at start; in the pocket `proximity near: covered` and the taps do nothing; out of the pocket, after ~0.8 s, the triple tap wakes |
+| 16 | camera pane: with the cover up (power key, wake), read the `camera:`, `imu:`, `compass:`, `mic:` lines; turn on the spot | `camera: started gst-launch-1.0` and the picture behind the clock with a red dot (needs `gst-launch-1.0` + the libcamera GStreamer plugin: `apk add gstreamer-tools gst-plugins-base libcamera-gstreamer`, names unverified); `imu: gyro ... accel ...`; turning the phone moves the heading number and the anchors stay on their spots. If the picture is missing, run `sh fp5-camera-diag.sh` (in the bundle) and report it. The mic: `mic: pw-record ...` then, in a noisy place, `ambient sound: floor -30 dBFS -> notification gain 0.9`; `shell.ambient.mic = off` disables it |
 | 13 | turn the phone to landscape, hold it there | `orientation: iio-sensor-proxy accelerometer` at start; after ~0.5 s in landscape `rotate LeftUp` (or RightUp) then `ok: rotated DSI-1 to 90`; the screen rotates. If it rotates the WRONG way, set `shell.rotate.flip = on`. Needs `wlr-randr` (`apk add wlr-randr`); a 45° tilt or laying it flat must not rotate. `shell.rotate.auto = off` disables |
 | 10 | at start: read the `ambient:` and `backlight:` lines; then cover the light sensor (top bezel) for 5 s, uncover | ideally `ambient: iio-sensor-proxy (lux)` and `backlight: <name> (max N) via logind ...`; screen dims ~3 s after covering, brightens quickly after uncovering. `no light sensor found` = time of day only (report it); `cannot set` = neither logind nor sysfs worked (report the line) |
 

@@ -162,6 +162,8 @@ struct App {
     fake_lux: Option<f32>,
     /// --lux-noise F: the fake reading wobbles by +-F (fraction), 4 Hz.
     lux_noise: f32,
+    /// --camera synthetic: a moving pattern behind the cover.
+    camera: bool,
     fake_clock: Option<u32>,
     /// Actions from raw_input_hook, executed in the next ui() call.
     routed: Vec<Action>,
@@ -393,6 +395,10 @@ impl eframe::App for App {
             let routed = std::mem::take(&mut self.routed);
             self.execute(routed, now);
             self.demo_frame(now);
+            if self.camera && self.shell.camera_wanted() {
+                let f = tideshell_egui::camera::synthetic_frame(120, 160, now as f32);
+                self.view.set_camera_frame(ctx, f.w, f.h, &f.rgba);
+            }
             self.shell.set_clock(self.fake_clock.unwrap_or_else(tideshell_egui::sensors::local_minute));
             if let Some(l) = self.fake_lux {
                 let wobble = if ((now * 4.0) as u64) % 2 == 0 { 1.0 + self.lux_noise } else { 1.0 - self.lux_noise };
@@ -519,6 +525,11 @@ fn main() -> eframe::Result<()> {
     });
     let fake_lux: Option<f32> = val("--lux").and_then(|v| v.parse().ok());
     let lux_noise: f32 = val("--lux-noise").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let camera = val("--camera").as_deref() == Some("synthetic");
+    if camera {
+        shell.world.drop_anchor("door");
+        shell.on_heading(0.0);
+    }
     let fake_clock: Option<u32> = val("--clock").and_then(|v| tideshell_core::ambient::NightWindow::parse_span(&format!("{v}-00:00")).map(|(s, _)| s));
     if has("--locked") {
         shell.lock_now();
@@ -541,7 +552,7 @@ fn main() -> eframe::Result<()> {
             // The fake world's cursor is not the real pointer, so the mouse may
             // drive the pad there. With --wayland the pad feeds EI: no.
             view.pointer_pad = !wayland_mode;
-            Ok(Box::new(App { shell, view, world, system, persist, palette, apps, demo, demo_started: None, last_cards: vec![], live, ei, ei_status: None, ei_selftest, ei_ready_at: None, routed: vec![], fake_lux, fake_clock, lux_noise }))
+            Ok(Box::new(App { shell, view, world, system, persist, palette, apps, demo, demo_started: None, last_cards: vec![], live, ei, ei_status: None, ei_selftest, ei_ready_at: None, routed: vec![], fake_lux, fake_clock, lux_noise, camera }))
         }),
     )
 }

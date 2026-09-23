@@ -330,6 +330,206 @@ impl ProximityFeed {
     }
 }
 
+// ---- IMU (IIO sysfs gyro + accelerometer) -----------------------------------------------
+
+/// An IIO device with an angular-velocity or acceleration triplet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IioVec {
+    pub dir: PathBuf,
+    pub prefix: &'static str,
+    pub scale: f32,
+}
+
+impl IioVec {
+    pub fn read(&self) -> Option<[f32; 3]> {
+        let axis = |a: &str| read_f32(&self.dir.join(format!("{}_{a}_raw", self.prefix)));
+        Some([axis("x")? * self.scale, axis("y")? * self.scale, axis("z")? * self.scale])
+    }
+}
+
+/// Find `in_anglvel` (gyro, rad/s after scale) and `in_accel` (m/s²)
+/// devices under `<sys>/bus/iio/devices`.
+pub fn find_iio_vec(sys: &Path, prefix: &'static str) -> Option<IioVec> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(sys.join("bus/iio/devices")).ok()?.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    dirs.into_iter().find(|d| d.join(format!("{prefix}_x_raw")).exists()).map(|dir| {
+        let scale = read_f32(&dir.join(format!("{prefix}_scale"))).unwrap_or(1.0);
+        IioVec { dir, prefix, scale }
+    })
+}
+
+/// (gyro rad/s, accel) samples at ~50 Hz while the receiver listens.
+pub struct ImuFeed {
+    pub rx: Receiver<([f32; 3], [f32; 3])>,
+    status: Arc<Mutex<String>>,
+}
+
+impl ImuFeed {
+    pub fn spawn(sys: PathBuf) -> ImuFeed {
+        let (tx, rx) = mpsc::channel();
+        let status = Arc::new(Mutex::new(String::new()));
+        let st = status.clone();
+        std::thread::Builder::new()
+            .name("tideshell-imu".into())
+            .spawn(move || {
+                let (gyro, accel) = (find_iio_vec(&sys, "in_anglvel"), find_iio_vec(&sys, "in_accel"));
+                let msg = match (&gyro, &accel) {
+                    (Some(g), Some(a)) => format!("imu: gyro {} accel {}", g.dir.display(), a.dir.display()),
+                    (None, Some(a)) => format!("imu: no gyro in IIO (accel {}); the camera world will follow gravity only", a.dir.display()),
+                    (Some(g), None) => format!("imu: gyro {} but no accelerometer; no gravity correction", g.dir.display()),
+                    (None, None) => "imu: no gyro or accelerometer in IIO sysfs".into(),
+                };
+                *st.lock().unwrap() = msg;
+                if gyro.is_none() && accel.is_none() {
+                    return;
+                }
+                loop {
+                    let g = gyro.as_ref().and_then(|g| g.read()).unwrap_or([0.0; 3]);
+                    let a = accel.as_ref().and_then(|a| a.read()).unwrap_or([0.0, 0.0, 0.0]);
+                    if tx.send((g, a)).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+            .expect("spawn imu thread");
+        ImuFeed { rx, status }
+    }
+
+    pub fn status(&self) -> String {
+        self.status.lock().unwrap().clone()
+    }
+}
+
+/// Compass heading (degrees) from iio-sensor-proxy, on change.
+pub struct CompassFeed {
+    pub rx: Receiver<f32>,
+    status: Arc<Mutex<String>>,
+}
+
+impl CompassFeed {
+    pub fn spawn(bus: Option<Connection>) -> CompassFeed {
+        let (tx, rx) = mpsc::channel();
+        let status = Arc::new(Mutex::new("compass: starting".to_string()));
+        let st = status.clone();
+        std::thread::Builder::new()
+            .name("tideshell-compass".into())
+            .spawn(move || {
+                let set = |s: String| *st.lock().unwrap() = s;
+                let Some(bus) = bus else {
+                    set("compass: no system bus".into());
+                    return;
+                };
+                let p = match sensor_proxy_compass(&bus) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        set(format!("compass: {e}"));
+                        return;
+                    }
+                };
+                if !p.get_property::<bool>("HasCompass").unwrap_or(false) {
+                    set("compass: iio-sensor-proxy reports none".into());
+                    return;
+                }
+                if let Err(e) = p.call_method("ClaimCompass", &()) {
+                    set(format!("compass: ClaimCompass: {e}"));
+                    return;
+                }
+                set("compass: iio-sensor-proxy".into());
+                let mut last = f32::NAN;
+                loop {
+                    match p.get_property::<f64>("CompassHeading") {
+                        Ok(h) => {
+                            let h = h as f32;
+                            if (h - last).abs() > 0.5 {
+                                last = h;
+                                if tx.send(h).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            set(format!("compass: read failed ({e})"));
+                            return;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            })
+            .expect("spawn compass thread");
+        CompassFeed { rx, status }
+    }
+
+    pub fn status(&self) -> String {
+        self.status.lock().unwrap().clone()
+    }
+}
+
+fn sensor_proxy_compass(bus: &Connection) -> zbus::Result<Proxy<'static>> {
+    Proxy::new(bus, "net.hadess.SensorProxy", "/net/hadess/SensorProxy/Compass", "net.hadess.SensorProxy.Compass")
+}
+
+// ---- microphone level (pw-record) -----------------------------------------------------
+
+/// dBFS per 100 ms window from the default source, through `pw-record`
+/// writing raw f32 mono to stdout. Only while the receiver listens; the
+/// child is killed on drop.
+pub struct MicFeed {
+    pub rx: Receiver<f32>,
+    pub status: String,
+    child: Option<std::process::Child>,
+}
+
+impl MicFeed {
+    pub fn spawn() -> MicFeed {
+        Self::spawn_with(&["pw-record".into(), "--format=f32".into(), "--rate=16000".into(), "--channels=1".into(), "-".into()], 16000)
+    }
+
+    /// `argv` writes raw f32 LE mono samples at `rate` to stdout.
+    pub fn spawn_with(argv: &[String], rate: usize) -> MicFeed {
+        let (tx, rx) = mpsc::channel();
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+        match cmd.spawn() {
+            Ok(mut child) => {
+                let mut out = child.stdout.take().expect("piped");
+                let window = rate / 10; // 100 ms
+                std::thread::Builder::new()
+                    .name("tideshell-mic".into())
+                    .spawn(move || {
+                        use std::io::Read;
+                        let mut buf = vec![0u8; window * 4];
+                        loop {
+                            let mut filled = 0;
+                            while filled < buf.len() {
+                                match out.read(&mut buf[filled..]) {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => filled += n,
+                                }
+                            }
+                            let samples: Vec<f32> = buf.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+                            if tx.send(tideshell_core::ambient_sound::rms_dbfs(&samples)).is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .expect("spawn mic thread");
+                MicFeed { rx, status: format!("mic: {} at {rate} Hz, 100 ms windows", argv[0]), child: Some(child) }
+            }
+            Err(e) => MicFeed { rx, status: format!("mic: cannot start {}: {e} (PipeWire tools?)", argv[0]), child: None },
+        }
+    }
+}
+
+impl Drop for MicFeed {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
 // ---- threads -------------------------------------------------------------------
 
 /// Background reader: lux values arrive on `rx` (~4 Hz), `status()` says
@@ -716,6 +916,46 @@ mod tests {
         assert!(wait_for(|| out.status().contains("backing off")), "{}", out.status());
         assert!(out.status().contains("cannot set panel"));
         let _ = std::fs::remove_dir_all(&sys);
+    }
+
+    #[test]
+    fn iio_imu_discovery_and_scaling() {
+        let sys = tmp("imu");
+        put(&sys.join("bus/iio/devices/iio:device2/in_anglvel_x_raw"), "1000");
+        put(&sys.join("bus/iio/devices/iio:device2/in_anglvel_y_raw"), "-500");
+        put(&sys.join("bus/iio/devices/iio:device2/in_anglvel_z_raw"), "0");
+        put(&sys.join("bus/iio/devices/iio:device2/in_anglvel_scale"), "0.001");
+        put(&sys.join("bus/iio/devices/iio:device3/in_accel_x_raw"), "0");
+        put(&sys.join("bus/iio/devices/iio:device3/in_accel_y_raw"), "9810");
+        put(&sys.join("bus/iio/devices/iio:device3/in_accel_z_raw"), "0");
+        put(&sys.join("bus/iio/devices/iio:device3/in_accel_scale"), "0.001");
+        let g = find_iio_vec(&sys, "in_anglvel").unwrap();
+        assert_eq!(g.read(), Some([1.0, -0.5, 0.0]));
+        let a = find_iio_vec(&sys, "in_accel").unwrap();
+        assert_eq!(a.read(), Some([0.0, 9.81, 0.0]));
+        assert!(find_iio_vec(&sys, "in_magn").is_none());
+        let feed = ImuFeed::spawn(sys.clone());
+        let (gy, ac) = feed.rx.recv_timeout(Duration::from_secs(3)).expect("a sample");
+        assert_eq!((gy, ac), ([1.0, -0.5, 0.0], [0.0, 9.81, 0.0]));
+        let _ = std::fs::remove_dir_all(&sys);
+    }
+
+    #[test]
+    fn mic_levels_come_from_raw_f32_windows() {
+        // 0.5 amplitude square wave for 0.3 s at 1000 Hz -> three -6 dBFS windows.
+        let script = "import sys,struct
+sys.stdout.buffer.write(b''.join(struct.pack('<f', 0.5 if (i//5)%2==0 else -0.5) for i in range(300)))
+";
+        let feed = MicFeed::spawn_with(&["python3".into(), "-c".into(), script.into()], 1000);
+        assert!(feed.child.is_some(), "{}", feed.status);
+        let mut got = vec![];
+        for _ in 0..3 {
+            if let Ok(v) = feed.rx.recv_timeout(Duration::from_secs(3)) {
+                got.push(v);
+            }
+        }
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert!(got.iter().all(|v| (v + 6.02).abs() < 0.1), "{got:?}");
     }
 
     #[test]

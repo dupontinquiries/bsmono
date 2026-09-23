@@ -49,6 +49,15 @@ struct Shellbox {
     foreground_written: String,
     proximity: tideshell_egui::sensors::ProximityFeed,
     proximity_status: String,
+    imu: tideshell_egui::sensors::ImuFeed,
+    compass: tideshell_egui::sensors::CompassFeed,
+    mic: Option<tideshell_egui::sensors::MicFeed>,
+    camera: Option<tideshell_egui::camera::ChildSource>,
+    /// Tracker state: the previous frame, its corners, and the world's
+    /// yaw/pitch when it was taken.
+    prev_frame: Option<(tideshell_core::track::Frame, Vec<tideshell_core::track::Point>, f32, f32)>,
+    feed_status: (String, String, String, String),
+    notify_gain_written: f32,
 }
 
 impl Shellbox {
@@ -136,6 +145,25 @@ impl Shellbox {
             let s = self.filter.stats;
             self.shell.note(format!("touch filter: wet episodes {} dropped {} jumps {} excess {}", s.wet_episodes, s.dropped_wet, s.cancelled_jump, s.dropped_excess));
             self.filter_stats = s;
+        }
+        let fs = (
+            self.imu.status(),
+            self.compass.status(),
+            self.mic.as_ref().map(|m| m.status.clone()).unwrap_or_else(|| "mic: off (shell.ambient.mic)".into()),
+            self.camera.as_ref().map(|c| c.status.clone()).unwrap_or_else(|| "camera: off".into()),
+        );
+        for (new, old) in [(&fs.0, &self.feed_status.0), (&fs.1, &self.feed_status.1), (&fs.2, &self.feed_status.2), (&fs.3, &self.feed_status.3)] {
+            if new != old {
+                self.shell.note(new.clone());
+            }
+        }
+        self.feed_status = fs;
+        let g = self.shell.notification_gain();
+        if (g - self.notify_gain_written).abs() >= 0.05 {
+            self.notify_gain_written = g;
+            if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+                let _ = std::fs::write(std::path::PathBuf::from(dir).join("tideshell.notify-gain"), format!("{g:.2}"));
+            }
         }
         let ps = self.proximity.status();
         if ps != self.proximity_status {
@@ -274,7 +302,17 @@ fn main() {
         foreground_written: String::new(),
         proximity: tideshell_egui::sensors::ProximityFeed::spawn(zbus::blocking::Connection::system().ok()),
         proximity_status: String::new(),
+        imu: tideshell_egui::sensors::ImuFeed::spawn("/sys".into()),
+        compass: tideshell_egui::sensors::CompassFeed::spawn(zbus::blocking::Connection::system().ok()),
+        mic: None,
+        camera: None,
+        prev_frame: None,
+        feed_status: Default::default(),
+        notify_gain_written: -1.0,
     };
+    if sb.shell.prefs.ambient_mic {
+        sb.mic = Some(tideshell_egui::sensors::MicFeed::spawn());
+    }
     {
         let found = tideshell_egui::keys::discover(std::path::Path::new("/sys"), std::path::Path::new("/dev/input"));
         let bus = zbus::blocking::Connection::system().ok();
@@ -351,6 +389,44 @@ fn main() {
         sb.shell.set_clock(tideshell_egui::sensors::local_minute());
         while let Ok(lux) = sb.ambient.rx.try_recv() {
             sb.shell.on_lux(lux, now_ms);
+        }
+        for (g, a) in sb.imu.rx.try_iter().collect::<Vec<_>>() {
+            sb.shell.on_imu(g, a, now_ms);
+        }
+        for h in sb.compass.rx.try_iter().collect::<Vec<_>>() {
+            sb.shell.on_heading(h);
+        }
+        if let Some(m) = &sb.mic {
+            for l in m.rx.try_iter().collect::<Vec<_>>() {
+                sb.shell.on_mic_level(l, now_ms);
+            }
+        }
+        // The camera: on only while the cover shows on a lit screen.
+        let want_cam = sb.shell.camera_wanted();
+        if want_cam && sb.camera.is_none() {
+            sb.camera = Some(tideshell_egui::camera::ChildSource::start(&tideshell_egui::camera::gst_command(tideshell_egui::camera::FRAME_W, tideshell_egui::camera::FRAME_H), tideshell_egui::camera::FRAME_W, tideshell_egui::camera::FRAME_H));
+        } else if !want_cam && sb.camera.is_some() {
+            sb.camera = None;
+            sb.prev_frame = None;
+            sb.view.clear_camera_frame();
+        }
+        if let Some(f) = sb.camera.as_mut().and_then(|c| c.poll()) {
+            use tideshell_core::track;
+            let gray = track::Frame::from_rgba(f.w, f.h, &f.rgba);
+            let (yaw, pitch) = (sb.shell.world.yaw_deg().to_radians(), sb.shell.world.pitch_deg().to_radians());
+            if let Some((prev, pts, y0, p0)) = &sb.prev_frame {
+                let m = track::estimate_motion(prev, pts, &gray);
+                if m.tracked >= 8 {
+                    let dyaw = ((yaw - y0 + std::f32::consts::PI).rem_euclid(2.0 * std::f32::consts::PI)) - std::f32::consts::PI;
+                    let predicted = sb.shell.world.predicted_shift(dyaw, pitch - p0);
+                    // The pane's focal is in screen px; the tracker works on the small frame.
+                    let scale = sb.shell.screen.0 / f.w as f32;
+                    sb.shell.on_image_motion((m.dx * scale, m.dy * scale), predicted);
+                }
+            }
+            let pts = track::find_corners(&gray);
+            sb.prev_frame = Some((gray, pts, yaw, pitch));
+            sb.view.set_camera_frame(&ctx, f.w, f.h, &f.rgba);
         }
         let nears: Vec<bool> = sb.proximity.rx.try_iter().collect();
         for n in nears {

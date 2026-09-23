@@ -54,6 +54,11 @@ pub struct Shell {
     /// Power key -> fade -> panel off; triple tap wakes.
     pub sleep: Sleep,
     pub rotate: crate::rotate::AutoRotate,
+    /// The camera pane's world (gyro/gravity/compass) and its anchors.
+    pub world: crate::world::World,
+    /// Ambient loudness -> notification gain.
+    pub sound: crate::ambient_sound::AmbientSound,
+    last_imu: Option<Millis>,
     /// Local minute of the day, set by the runtime (the engine has no clock).
     clock_minute: u32,
     /// The learned offset changed and is waiting to be saved once the user
@@ -104,6 +109,9 @@ impl Shell {
             lock: LockScreen::default(),
             sleep: Sleep::default(),
             rotate,
+            world: crate::world::World::new(screen.0 * 0.9),
+            sound: crate::ambient_sound::AmbientSound::default(),
+            last_imu: None,
             clock_minute: 12 * 60,
             offset_dirty_at: None,
             bar_expanded: false,
@@ -666,6 +674,43 @@ impl Shell {
         self.clock_minute = minute % 1440;
     }
 
+    /// Whether the camera should run: only while the cover is showing on a
+    /// lit screen (never behind apps, never in a pocket).
+    pub fn camera_wanted(&self) -> bool {
+        self.lock.is_locked() && !self.sleep.captures_input() && !self.is_covered()
+    }
+
+    /// Gyro rates (rad/s) and accelerometer (any scale), device axes.
+    pub fn on_imu(&mut self, gyro: [f32; 3], accel: [f32; 3], now: Millis) {
+        let dt = self.last_imu.map(|t| now.saturating_sub(t) as f32 / 1000.0).unwrap_or(0.0).min(0.1);
+        self.last_imu = Some(now);
+        if dt > 0.0 {
+            self.world.gyro(gyro, dt);
+        }
+        self.world.accel(accel);
+    }
+
+    pub fn on_heading(&mut self, degrees: f32) {
+        self.world.heading(degrees);
+    }
+
+    /// The tracker's measured image motion for the last frame pair, and
+    /// what the gyro predicted over the same interval.
+    pub fn on_image_motion(&mut self, measured_px: (f32, f32), predicted_px: (f32, f32)) {
+        self.world.image_correction(measured_px, predicted_px, 0.3);
+    }
+
+    /// A microphone window's level (dBFS). Logs gain steps.
+    pub fn on_mic_level(&mut self, dbfs: f32, now: Millis) {
+        if let Some(g) = self.sound.on_level(dbfs, now) {
+            self.log(format!("ambient sound: floor {:.0} dBFS -> notification gain {:.2}", self.sound.floor_dbfs().unwrap_or(-100.0), g));
+        }
+    }
+
+    pub fn notification_gain(&self) -> f32 {
+        self.sound.gain()
+    }
+
     /// The proximity sensor: near = covered (pocket, face). Touches are
     /// ignored and the triple tap cannot wake while covered.
     pub fn on_proximity(&mut self, near: bool, now: Millis) {
@@ -1172,6 +1217,28 @@ mod tests {
         assert_eq!(saves, 1, "one save after the drag, not one per event");
         assert!((sh.prefs.brightness_offset - sh.ambient.user).abs() < 1e-6 && sh.ambient.user > 0.0);
         assert_eq!(sh.brightness_slider_pos(), (sh.ambient.user + 1.0) / 2.0);
+    }
+
+    #[test]
+    fn the_camera_runs_only_on_a_lit_cover() {
+        let mut sh = shell_with_three();
+        assert!(!sh.camera_wanted(), "apps in front: no camera");
+        sh.lock_now();
+        assert!(sh.camera_wanted());
+        sh.on_proximity(true, 100);
+        assert!(!sh.camera_wanted(), "in a pocket: no");
+        sh.on_proximity(false, 200);
+        sh.tick(200 + crate::sleep::POCKET_HOLD_MS + 1);
+        assert!(sh.camera_wanted());
+        sh.power_key();
+        assert!(!sh.camera_wanted(), "screen going dark: no");
+        // IMU samples turn the world; a heading sets north.
+        for i in 0..50u64 {
+            sh.on_imu([0.0, 10.0 * crate::world::DEG, 0.0], [0.0, 9.8, 0.0], 5000 + i * 20);
+        }
+        assert!((sh.world.yaw_deg() - 350.0).abs() < 2.0, "{}", sh.world.yaw_deg());
+        sh.on_mic_level(-30.0, 6000);
+        assert!(sh.notification_gain() > 0.0);
     }
 
     #[test]
