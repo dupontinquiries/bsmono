@@ -190,7 +190,9 @@ mod tests {
         assert_eq!(f.stats.cancelled_jump, 1);
         // A large move over a LONG interval is a fast swipe, not a jump.
         f.filter(TouchEvent::Down { slot: 1, x: 100.0, y: 100.0, t: 1000 });
-        assert!(f.filter(TouchEvent::Move { slot: 1, x: 400.0, y: 100.0, t: 1200 }).is_some());
+        // Must come back as the Move itself, not a Cancel (the first version
+        // of this assertion accepted either and missed a missing time bound).
+        assert_eq!(f.filter(TouchEvent::Move { slot: 1, x: 400.0, y: 100.0, t: 1200 }), Some(TouchEvent::Move { slot: 1, x: 400.0, y: 100.0, t: 1200 }));
     }
 
     #[test]
