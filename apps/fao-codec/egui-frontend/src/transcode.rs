@@ -103,6 +103,8 @@ pub fn reserve_for(info: &VideoInfo, max_frames: Option<usize>) -> u64 {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TranscodeReport {
     pub frames: usize,
+    /// Of `frames`, how many were exact repeats stored as one-byte `R` frames.
+    pub repeats: usize,
     pub w: usize,
     pub h: usize,
     pub input_bytes: u64,
@@ -172,6 +174,16 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
     let mut n = 0usize;
     let mut psnr_sum = 0.0;
     let mut psnr_n = 0usize;
+    // EXACT REPEATS become `R` frames: a one-byte payload the decoder resolves
+    // to the previous real frame. Game captures are full of them -- a 30 fps
+    // game recorded into a 60 fps file repeats every other frame; pauses,
+    // menus and loading screens repeat for seconds -- and each was being
+    // re-encoded in full. Detection is sequential (each frame against the one
+    // before), so it runs BEFORE the parallel encode, which then only sees the
+    // frames that differ.
+    let mut prev: Option<Vec<u8>> = None;
+    let mut run = 0usize;
+    let mut repeats = 0usize;
     // BATCHED, PARALLEL. Every frame here is an intra DCT frame, so frames are
     // independent -- the ideal case for encoding several at once. A batch of
     // `2 x workers` frames is read, encoded across `workers` threads, then
@@ -181,16 +193,25 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
             break Err(CANCELLED.into());
         }
-        let (batch, ended) = match read_batch(&mut stdout, fsz, batch_size) {
+        let (mut batch, ended) = match read_batch(&mut stdout, fsz, batch_size) {
             Ok(b) => b,
             Err(e) => break Err(e),
         };
         if batch.is_empty() {
             break Ok(());
         }
-        let encoded = encode_batch(&batch, n, w, h, quality, workers, PSNR_EVERY);
+        let (dups, carried) = mark_repeats(&batch, prev.as_deref(), run);
+        run = carried;
+        let fresh: Vec<&[u8]> = batch.iter().zip(&dups).filter(|(_, d)| !**d).map(|(f, _)| f.as_slice()).collect();
+        let mut encoded = encode_batch(&fresh, n, w, h, quality, workers, PSNR_EVERY).into_iter();
         let mut failed = None;
-        for (payload, p) in encoded {
+        for dup in &dups {
+            let (payload, p) = if *dup {
+                repeats += 1;
+                (vec![b'R'], None)
+            } else {
+                encoded.next().expect("one encoded result per fresh frame")
+            };
             if let Some(p) = p {
                 psnr_sum += p;
                 psnr_n += 1;
@@ -205,6 +226,7 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
             n += 1;
             progress(n, estimate.max(n));
         }
+        prev = batch.pop();
         if let Some(e) = failed {
             break Err(e);
         }
@@ -223,12 +245,34 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
     progress(n, n);
     let mut out = writer.finish().map_err(|e| format!("finishing the file: {e}"))?;
     let output_bytes = out.stream_position().unwrap_or(0);
-    Ok((out, TranscodeReport { frames: n, w, h, input_bytes, output_bytes,
+    Ok((out, TranscodeReport { frames: n, repeats, w, h, input_bytes, output_bytes,
                                mean_psnr: if psnr_n == 0 { 0.0 } else { psnr_sum / psnr_n as f64 } }))
 }
 
 /// The error a cancelled transcode returns, so callers can tell it from a failure.
 pub const CANCELLED: &str = "cancelled";
+
+/// Longest run of repeat (`R`) frames before a real frame is re-encoded.
+/// The decoder walks back from an `R` to the last real frame but only up to
+/// `decode::MAX_R_WALKBACK` (600) frames, then reports `RepeatUnresolved` -- so
+/// a long static stretch (a paused game) must still get a real frame now and
+/// then. 300 keeps well inside that: 5 s at 60 fps.
+pub const MAX_REPEAT_RUN: usize = 300;
+
+/// Which frames of `batch` are exact repeats of the frame before them, given
+/// the last frame of the previous batch (`prev`) and the repeat run so far.
+/// Returns the flags and the run length carried out of the batch. Pure.
+fn mark_repeats(batch: &[Vec<u8>], prev: Option<&[u8]>, mut run: usize) -> (Vec<bool>, usize) {
+    let mut out = Vec::with_capacity(batch.len());
+    let mut before = prev;
+    for f in batch {
+        let dup = before == Some(f.as_slice()) && run < MAX_REPEAT_RUN;
+        run = if dup { run + 1 } else { 0 };
+        out.push(dup);
+        before = Some(f.as_slice());
+    }
+    (out, run)
+}
 
 /// Measure PSNR on one frame in this many. Measuring means DECODING the frame
 /// again and comparing -- pure overhead in a batch encode, only there for the
@@ -272,12 +316,12 @@ fn encode_one(rgb: &[u8], w: usize, h: usize, quality: u8, measure: bool) -> (Ve
 /// run of output slots, so order is fixed by index, not by which thread
 /// finishes first -- the output is byte-identical to encoding one at a time
 /// (tested). `first` is the batch's first frame number, for PSNR sampling.
-fn encode_batch(batch: &[Vec<u8>], first: usize, w: usize, h: usize, quality: u8,
+fn encode_batch<T: AsRef<[u8]> + Sync>(batch: &[T], first: usize, w: usize, h: usize, quality: u8,
                 workers: usize, psnr_every: usize) -> Vec<(Vec<u8>, Option<f64>)> {
     let every = psnr_every.max(1);
     if workers <= 1 || batch.len() <= 1 {
         return batch.iter().enumerate()
-            .map(|(k, f)| encode_one(f, w, h, quality, (first + k) % every == 0))
+            .map(|(k, f)| encode_one(f.as_ref(), w, h, quality, (first + k) % every == 0))
             .collect();
     }
     let chunk = batch.len().div_ceil(workers);
@@ -287,7 +331,7 @@ fn encode_batch(batch: &[Vec<u8>], first: usize, w: usize, h: usize, quality: u8
             sc.spawn(move || {
                 for (k, (f, slot)) in frames.iter().zip(slots.iter_mut()).enumerate() {
                     let idx = first + ci * chunk + k;
-                    *slot = Some(encode_one(f, w, h, quality, idx % every == 0));
+                    *slot = Some(encode_one(f.as_ref(), w, h, quality, idx % every == 0));
                 }
             });
         }
@@ -551,6 +595,95 @@ mod tests {
         assert_eq!((b.len(), ended), (2, false));
         let (b, ended) = read_batch(&mut r, 10, 2).unwrap();
         assert_eq!((b.len(), ended), (1, true), "one frame left, then the end");
+    }
+
+    #[test]
+    fn repeats_are_marked_against_the_previous_frame_across_batches() {
+        let (a, b) = (vec![1u8; 4], vec![2u8; 4]);
+        // prev = a: [a, a, b, b, a] -> repeats at 0,1 (vs prev / vs a), 3 (b after b).
+        let (d, run) = mark_repeats(&[a.clone(), a.clone(), b.clone(), b.clone(), a.clone()], Some(&a), 0);
+        assert_eq!(d, vec![true, true, false, true, false]);
+        assert_eq!(run, 0, "the last frame differed, so no run carries out");
+        let (d, _) = mark_repeats(&[a.clone()], None, 0);
+        assert_eq!(d, vec![false], "the first frame of a file is never a repeat");
+    }
+
+    /// The run cap: at MAX_REPEAT_RUN repeats in a row, the next identical
+    /// frame is encoded for real, and the run restarts -- including across a
+    /// batch boundary, via the carried run length.
+    #[test]
+    fn a_long_run_of_repeats_is_broken_by_a_real_frame() {
+        let a = vec![9u8; 4];
+        let (d, run) = mark_repeats(&vec![a.clone(); 3], Some(&a), MAX_REPEAT_RUN - 2);
+        assert_eq!(d, vec![true, true, false], "two more repeats reach the cap; the third is real");
+        assert_eq!(run, 0);
+    }
+
+    fn make(path: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("ffmpeg").args(["-v", "error", "-y"]).args(args).arg(path).status().unwrap().success();
+        assert!(ok, "fixture {}", path.display());
+    }
+
+    /// REAL: a 30 fps clip stored at 60 fps -- every other frame a duplicate,
+    /// exactly what a 30 fps game recorded at 60 looks like. Lossless (ffv1),
+    /// so duplicates are byte-identical after decoding. Exactly the frames
+    /// ffmpeg's own hashes call repeats become one-byte R frames, and every frame still decodes, each repeat to
+    /// the same picture as the frame before it.
+    #[test]
+    fn a_30fps_clip_at_60fps_stores_its_duplicates_as_repeats() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-rep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mkv");
+        make(&src, &["-f", "lavfi", "-i", "testsrc2=size=64x48:rate=30:duration=1", "-r", "60", "-c:v", "ffv1"]);
+        let out = dir.join("out.fao");
+        let rep = transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        assert_eq!(rep.frames, 60);
+        // GROUND TRUTH FROM FFMPEG, not a guess. A first version asserted
+        // "about half" (~30) and got 47 -- and ffmpeg's own per-frame hashes
+        // agreed: at 64x48 testsrc2's slow motion collapses 30 source frames to
+        // 13 distinct pictures. So: hash every decoded frame in the SAME format
+        // the transcoder compares (rgb24) and count consecutive equal hashes.
+        let hashes = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&src)
+            .args(["-pix_fmt", "rgb24", "-f", "framemd5", "-"]).output().unwrap();
+        let hs: Vec<String> = String::from_utf8_lossy(&hashes.stdout).lines()
+            .filter(|l| !l.starts_with('#')).map(|l| l.rsplit(',').next().unwrap().trim().to_string()).collect();
+        assert_eq!(hs.len(), 60);
+        let expected = hs.windows(2).filter(|w| w[0] == w[1]).count();
+        assert!(expected >= 30, "the fixture must actually contain duplicates: {expected}");
+        assert_eq!(rep.repeats, expected, "exactly the frames ffmpeg says repeat");
+        let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        let mut repeats_seen = 0;
+        for i in 0..f.frame_count() {
+            let px = f.decode_rgb(i).expect("every frame decodes");
+            if f.marker(i) == Some(b'R') {
+                repeats_seen += 1;
+                assert_eq!(px, f.decode_rgb(i - 1).unwrap(), "repeat {i} shows the frame before it");
+            }
+        }
+        assert_eq!(repeats_seen, rep.repeats);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REAL: a static picture held for 320 frames -- a paused game. Real frames
+    /// at 0 and 301 (the cap), repeats between, and the LAST frame still decodes:
+    /// its walk back is 18 frames, far inside the decoder's 600.
+    #[test]
+    fn a_long_static_stretch_stays_decodable_to_the_end() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-static-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mkv");
+        make(&src, &["-f", "lavfi", "-i", "color=c=0x336699:size=64x48:rate=60", "-frames:v", "320", "-c:v", "ffv1"]);
+        let out = dir.join("out.fao");
+        let rep = transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        assert_eq!((rep.frames, rep.repeats), (320, 318), "real frames at 0 and at the cap");
+        let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        assert_ne!(f.marker(MAX_REPEAT_RUN + 1), Some(b'R'), "a real frame at the cap");
+        assert_eq!(f.decode_rgb(319).unwrap(), f.decode_rgb(0).unwrap(), "the last frame decodes to the picture");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn have_ffmpeg() -> bool {
