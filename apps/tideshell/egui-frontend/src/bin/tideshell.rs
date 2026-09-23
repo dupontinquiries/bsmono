@@ -1,6 +1,8 @@
 //! tideshell — the shell itself, on layer-shell surfaces (no eframe).
 //!
-//!   tideshell [--trace] [--layout right-bar]
+//!   tideshell [--trace] [--layout right-bar] [--rotate DEG]
+//! `--rotate 0|90|180|270` applies that output transform once at start (to
+//! check the panel's mapping on a phone); autorotation continues after.
 //!
 //! Env: `TIDESHELL_SHOW_STRIPS=1` tints the edge strips so they can be seen.
 //! `TIDESHELL_PERSIST=0` stops it writing ~/.config/tideshell/prefs.
@@ -40,6 +42,7 @@ struct Shellbox {
     filter: tideshell_core::touchfilter::TouchFilter,
     filter_stats: tideshell_core::touchfilter::Stats,
     pending_display_power: Option<bool>,
+    pending_rotate: Option<u32>,
     keys: Option<tideshell_egui::keys::Keys>,
     orientation: tideshell_egui::sensors::OrientationFeed,
     orientation_status: String,
@@ -82,6 +85,10 @@ impl Shellbox {
                     continue;
                 }
                 // Executed by the layer runtime (it owns the Wayland connection).
+                Action::Rotate(deg) => {
+                    self.pending_rotate = Some(*deg);
+                    continue;
+                }
                 Action::DisplayPower(on) => {
                     self.pending_display_power = Some(*on);
                     continue;
@@ -241,6 +248,7 @@ fn main() {
         filter: tideshell_core::touchfilter::TouchFilter::default(),
         filter_stats: tideshell_core::touchfilter::Stats::default(),
         pending_display_power: None,
+        pending_rotate: None,
         keys: None,
         orientation: tideshell_egui::sensors::OrientationFeed::spawn(zbus::blocking::Connection::system().ok()),
         orientation_status: String::new(),
@@ -300,6 +308,10 @@ fn main() {
     // Key repeat: the held key's events and when to repeat them next.
     let mut held: Option<(Vec<egui::Event>, u64)> = None;
     let mut last_power_status = String::new();
+    let mut last_config_status = String::new();
+    if let Some(deg) = args.iter().position(|a| a == "--rotate").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()) {
+        sb.pending_rotate = Some(deg);
+    }
     let trace_stderr = std::env::var("TIDESHELL_TRACE").is_ok_and(|v| v == "stderr");
     let mut printed: Vec<String> = Vec::new();
     loop {
@@ -426,6 +438,24 @@ fn main() {
         if let Some(on) = sb.pending_display_power.take() {
             let msg = io.set_display_power(on);
             sb.shell.note(msg);
+        }
+        if let Some(deg) = sb.pending_rotate {
+            // Needs the compositor's first `done`; keep it pending until then.
+            match io.set_transform(deg) {
+                Ok(msg) => {
+                    sb.pending_rotate = None;
+                    sb.shell.note(msg);
+                }
+                Err(e) if e.starts_with("no output state") => {}
+                Err(e) => {
+                    sb.pending_rotate = None;
+                    sb.shell.note(format!("rotate: {e}"));
+                }
+            }
+        }
+        if io.config_status() != last_config_status {
+            last_config_status = io.config_status();
+            sb.shell.note(last_config_status.clone());
         }
         if io.power_status() != last_power_status {
             last_power_status = io.power_status();

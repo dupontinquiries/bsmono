@@ -55,6 +55,13 @@ use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1},
     wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
 };
+use wayland_protocols_wlr::output_management::v1::client::{
+    zwlr_output_configuration_head_v1::ZwlrOutputConfigurationHeadV1,
+    zwlr_output_configuration_v1::{self, ZwlrOutputConfigurationV1},
+    zwlr_output_head_v1::{self, ZwlrOutputHeadV1},
+    zwlr_output_manager_v1::{self, ZwlrOutputManagerV1},
+    zwlr_output_mode_v1::ZwlrOutputModeV1,
+};
 use wayland_protocols_wlr::output_power_management::v1::client::{
     zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1,
     zwlr_output_power_v1::{self, Mode as PowerMode, ZwlrOutputPowerV1},
@@ -233,6 +240,12 @@ pub struct State {
     /// zwlr_output_power_v1 per output, and the last mode each reported.
     powers: Vec<ZwlrOutputPowerV1>,
     pub power_status: String,
+    /// wlr-output-management: the heads the compositor listed, the serial
+    /// of the latest `done`, and the result of our last configuration.
+    out_mgr: Option<ZwlrOutputManagerV1>,
+    heads: Vec<Head>,
+    out_serial: Option<u32>,
+    pub config_status: String,
     cursor_mgr: Option<WpCursorShapeManagerV1>,
     shape_device: Option<WpCursorShapeDeviceV1>,
     /// Serial of the last pointer enter: set_shape / set_cursor must quote it.
@@ -306,6 +319,7 @@ impl Io {
         let frac_mgr: Option<WpFractionalScaleManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
         // Panel off/on without suspending: one power object per output.
         let power_mgr: Option<ZwlrOutputPowerManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+        let out_mgr: Option<ZwlrOutputManagerV1> = globals.bind(&qh, 1..=4, ()).ok();
         let outputs: Vec<WlOutput> = globals.contents().with_list(|list| {
             list.iter().filter(|g| g.interface == "wl_output").map(|g| globals.registry().bind::<WlOutput, _, _>(g.name, g.version.min(4), &qh, ())).collect()
         });
@@ -325,6 +339,10 @@ impl Io {
             repeat: (25, 400),
             powers: Vec::new(),
             power_status: String::new(),
+            out_mgr: None,
+            heads: Vec::new(),
+            out_serial: None,
+            config_status: String::new(),
             cursor_mgr: globals.bind(&qh, 1..=1, ()).ok(),
             shape_device: None,
             enter_serial: None,
@@ -332,6 +350,7 @@ impl Io {
             applied: None,
         };
         let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, frac_mgr, viewporter, strip_px, show_strips, right_enabled: false, side_sizes: HashMap::new(), _outputs: outputs, overlay_keyboard: false };
+        io.st.out_mgr = out_mgr;
         if let Some(m) = &power_mgr {
             io.st.powers = io._outputs.iter().map(|o| m.get_output_power(o, &io.qh, ())).collect();
             io.st.power_status = format!("output power: {} output(s)", io.st.powers.len());
@@ -516,6 +535,40 @@ impl Io {
 
 
 
+    /// Rotate every enabled head to `deg` (0/90/180/270) through
+    /// wlr-output-management; other properties keep their current values.
+    /// The result arrives later as `config_status`.
+    pub fn set_transform(&mut self, deg: u32) -> Result<String, String> {
+        use wayland_client::protocol::wl_output::Transform;
+        let mgr = self.st.out_mgr.clone().ok_or("zwlr_output_manager_v1 not offered")?;
+        let serial = self.st.out_serial.ok_or("no output state yet (no `done` from the compositor)")?;
+        let t = match deg % 360 {
+            0 => Transform::Normal,
+            90 => Transform::_90,
+            180 => Transform::_180,
+            _ => Transform::_270,
+        };
+        let cfg = mgr.create_configuration(serial, &self.qh, ());
+        let mut names = Vec::new();
+        for h in self.st.heads.iter().filter(|h| h.enabled && !h.finished) {
+            let ch = cfg.enable_head(&h.proxy, &self.qh, ());
+            ch.set_transform(t);
+            names.push(h.name.clone());
+        }
+        if names.is_empty() {
+            cfg.destroy();
+            return Err("no enabled heads".into());
+        }
+        cfg.apply();
+        self.st.config_status = "output config: applied, awaiting result".into();
+        self.flush();
+        Ok(format!("output config: {} -> {:?} sent", names.join(","), t))
+    }
+
+    pub fn config_status(&self) -> String {
+        self.st.config_status.clone()
+    }
+
     pub fn st_repeat(&self) -> (i32, i32) {
         self.st.repeat
     }
@@ -639,6 +692,57 @@ noop!(ZwlrLayerShellV1);
 noop!(WlCallback);
 noop!(WpCursorShapeManagerV1);
 noop!(ZwlrOutputPowerManagerV1);
+noop!(ZwlrOutputModeV1);
+noop!(ZwlrOutputConfigurationHeadV1);
+
+/// One zwlr_output_head_v1 as the compositor describes it.
+struct Head {
+    proxy: ZwlrOutputHeadV1,
+    name: String,
+    enabled: bool,
+    finished: bool,
+}
+
+impl Dispatch<ZwlrOutputManagerV1, ()> for State {
+    fn event(st: &mut Self, _: &ZwlrOutputManagerV1, e: zwlr_output_manager_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match e {
+            zwlr_output_manager_v1::Event::Head { head } => st.heads.push(Head { proxy: head, name: String::new(), enabled: false, finished: false }),
+            zwlr_output_manager_v1::Event::Done { serial } => st.out_serial = Some(serial),
+            zwlr_output_manager_v1::Event::Finished => st.out_mgr = None,
+            _ => {}
+        }
+    }
+    wayland_client::event_created_child!(State, ZwlrOutputManagerV1, [
+        zwlr_output_manager_v1::EVT_HEAD_OPCODE => (ZwlrOutputHeadV1, ()),
+    ]);
+}
+
+impl Dispatch<ZwlrOutputHeadV1, ()> for State {
+    fn event(st: &mut Self, h: &ZwlrOutputHeadV1, e: zwlr_output_head_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        let Some(head) = st.heads.iter_mut().find(|x| &x.proxy == h) else { return };
+        match e {
+            zwlr_output_head_v1::Event::Name { name } => head.name = name,
+            zwlr_output_head_v1::Event::Enabled { enabled } => head.enabled = enabled != 0,
+            zwlr_output_head_v1::Event::Finished => head.finished = true,
+            _ => {}
+        }
+    }
+    wayland_client::event_created_child!(State, ZwlrOutputHeadV1, [
+        zwlr_output_head_v1::EVT_MODE_OPCODE => (ZwlrOutputModeV1, ()),
+    ]);
+}
+
+impl Dispatch<ZwlrOutputConfigurationV1, ()> for State {
+    fn event(st: &mut Self, c: &ZwlrOutputConfigurationV1, e: zwlr_output_configuration_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        st.config_status = match e {
+            zwlr_output_configuration_v1::Event::Succeeded => "output config: succeeded".into(),
+            zwlr_output_configuration_v1::Event::Failed => "output config: FAILED (compositor rejected it)".into(),
+            zwlr_output_configuration_v1::Event::Cancelled => "output config: cancelled (output state changed underneath; retry)".into(),
+            _ => return,
+        };
+        c.destroy();
+    }
+}
 noop!(WlOutput);
 
 impl Dispatch<ZwlrOutputPowerV1, ()> for State {
