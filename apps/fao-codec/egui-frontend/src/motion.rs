@@ -53,7 +53,18 @@ use crate::decode::{rgb_to_yuv420p, yuv_to_rgb};
 use crate::patch::{block_rect, grid, patch_dims, MB};
 use fao_codec_lib as fao_v1;
 
-pub const MARKER: u8 = b'Q';
+/// Current layout: the three residual channels stacked into ONE plane.
+pub const MARKER: u8 = b'U';
+/// The first layout (2eb4a5ca8 .. a3434bbd7): each residual channel wrapped in
+/// its own 4:2:0 image with neutral chroma. Decoded, never written -- files
+/// encoded with compact mode as the default exist.
+pub const MARKER_Q: u8 = b'Q';
+
+/// Can `k` predicted blocks' stacked residual (3 x patch height) be stored?
+/// The plane header holds dimensions as u16; this covers 4K (32,400 blocks).
+pub fn fits(k: usize) -> bool {
+    patch_dims(k).1 * 3 <= u16::MAX as usize
+}
 /// Search range, pixels, each axis. Fits an i8 with room to spare.
 pub const RANGE: i32 = 24;
 
@@ -231,9 +242,11 @@ fn residual_patch(cur: &[u8], prev: &[u8], w: usize, h: usize, inter: &[(usize, 
 }
 
 /// Channel `c` of an interleaved RGB image as the LUMA of a 4:2:0 image with
-/// neutral chroma -- so the DCT codec codes it at full resolution, with no
-/// colour transform and no subsampling. The neutral chroma planes are flat and
-/// cost almost nothing.
+/// neutral chroma -- how the LEGACY Q layout coded each residual channel.
+/// Test-only now: it builds real Q frames for the legacy-decode test. (Those
+/// neutral chroma planes were a third of the residual DCT work, which is why
+/// the U layout stacks the channels into one plane instead.)
+#[cfg(test)]
 fn plane_as_yuv(rgb: &[u8], c: usize, w: usize, h: usize) -> Vec<u8> {
     let mut yuv: Vec<u8> = rgb.chunks_exact(3).map(|p| p[c]).collect();
     yuv.resize(w * h + 2 * (w / 2) * (h / 2), 128);
@@ -263,14 +276,13 @@ pub fn encode(cur: &[u8], prev: &[u8], w: usize, h: usize, blocks: &[usize], mod
     out.extend_from_slice(&intra_bytes);
     if !inter.is_empty() {
         let (r, pw, ph) = residual_patch(cur, prev, w, h, &inter);
-        let rq = residual_quality(quality);
+        // R, G, B stacked into one plane (pw x 3ph), coded once: no neutral
+        // chroma planes, one header instead of three. See compress_plane_dct.
+        let mut stacked = Vec::with_capacity(pw * ph * 3);
         for c in 0..3 {
-            let plane = fao_v1::compress_frame_dct(&plane_as_yuv(&r, c, pw, ph), pw, ph, rq);
-            if c < 2 {
-                out.extend_from_slice(&(plane.len() as u32).to_le_bytes());
-            }
-            out.extend_from_slice(&plane);
+            stacked.extend(r.chunks_exact(3).map(|p| p[c]));
         }
+        out.extend_from_slice(&fao_v1::compress_plane_dct(&stacked, pw, ph * 3, residual_quality(quality)));
     }
     out
 }
@@ -281,7 +293,8 @@ pub fn encode(cur: &[u8], prev: &[u8], w: usize, h: usize, blocks: &[usize], mod
 pub fn decode(payload: &[u8], prev: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
     let (cols, rows) = grid(w, h);
     let nbytes = (cols * rows).div_ceil(8);
-    if payload.first() != Some(&MARKER) || payload.len() < 5 + nbytes || prev.len() != w * h * 3 {
+    let marker = *payload.first()?;
+    if (marker != MARKER && marker != MARKER_Q) || payload.len() < 5 + nbytes || prev.len() != w * h * 3 {
         return None;
     }
     let k = u32::from_le_bytes(payload[1..5].try_into().ok()?) as usize;
@@ -310,6 +323,12 @@ pub fn decode(payload: &[u8], prev: &[u8], w: usize, h: usize) -> Option<Vec<u8>
     if !inter.is_empty() {
         let (pw, ph) = patch_dims(inter.len());
         let mut planes: Vec<Vec<u8>> = Vec::with_capacity(3);
+        if marker == MARKER {
+            let st = fao_v1::decompress_plane_dct(payload.get(at..)?, pw, ph * 3)?;
+            for c in 0..3 {
+                planes.push(st[c * pw * ph..(c + 1) * pw * ph].to_vec());
+            }
+        } else {
         for c in 0..3 {
             let data = if c < 2 {
                 let n = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
@@ -322,6 +341,7 @@ pub fn decode(payload: &[u8], prev: &[u8], w: usize, h: usize) -> Option<Vec<u8>
             };
             let yuv = fao_v1::decompress_frame_dct(data, pw, ph)?;
             planes.push(yuv.get(..pw * ph)?.to_vec());
+        }
         }
         let pcols = pw / MB;
         for (slot, &(i, mv)) in inter.iter().enumerate() {
@@ -345,6 +365,48 @@ pub fn decode(payload: &[u8], prev: &[u8], w: usize, h: usize) -> Option<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The LEGACY Q encoder, exactly as it shipped (each channel wrapped in a
+    /// 4:2:0 image with neutral chroma, three payloads). Test-only: it exists
+    /// to produce real Q frames, so the legacy decoder is checked against what
+    /// actually wrote those files.
+    fn encode_q_legacy(cur: &[u8], prev: &[u8], w: usize, h: usize, blocks: &[usize], modes: &[Option<(i8, i8)>], quality: u8) -> Vec<u8> {
+        let mut out = encode(cur, prev, w, h, blocks, modes, quality);
+        out[0] = MARKER_Q;
+        let inter: Vec<(usize, (i8, i8))> = blocks.iter().zip(modes).filter_map(|(&i, m)| m.map(|mv| (i, mv))).collect();
+        if inter.is_empty() { return out; }
+        // Everything up to the residual is shared; replace the residual section.
+        let (cols, rows) = grid(w, h);
+        let mut at = 5 + (cols * rows).div_ceil(8);
+        at += modes.iter().map(|m| if m.is_some() { 3 } else { 1 }).sum::<usize>();
+        let ilen = u32::from_le_bytes(out[at..at + 4].try_into().unwrap()) as usize;
+        out.truncate(at + 4 + ilen);
+        let (r, pw, ph) = residual_patch(cur, prev, w, h, &inter);
+        for c in 0..3 {
+            let plane = fao_v1::compress_frame_dct(&plane_as_yuv(&r, c, pw, ph), pw, ph, residual_quality(quality));
+            if c < 2 { out.extend_from_slice(&(plane.len() as u32).to_le_bytes()); }
+            out.extend_from_slice(&plane);
+        }
+        out
+    }
+
+    /// OLD FILES STILL DECODE: a real legacy Q frame decodes, to the same
+    /// picture as the new U layout within coding noise (the residual is coded
+    /// the same way; only the packaging differs).
+    #[test]
+    fn legacy_q_frames_still_decode() {
+        let (w, h) = (96, 64);
+        let (prev, cur) = (scene(w, h, 0), scene(w, h, 5));
+        let blocks: Vec<usize> = (0..grid(w, h).0 * grid(w, h).1).collect();
+        let modes = plan(&cur, &prev, w, h, &blocks);
+        assert!(modes.iter().any(|m| m.is_some()), "the fixture must exercise the residual path");
+        let q = encode_q_legacy(&cur, &prev, w, h, &blocks, &modes, 80);
+        let u = encode(&cur, &prev, w, h, &blocks, &modes, 80);
+        assert_eq!((q[0], u[0]), (MARKER_Q, MARKER));
+        let (dq, du) = (decode(&q, &prev, w, h).expect("legacy Q decodes"), decode(&u, &prev, w, h).expect("U decodes"));
+        assert_eq!(dq, du, "same residual coding, so the same picture");
+        assert!(u.len() < q.len(), "one header, no neutral chroma: U {} vs Q {} bytes", u.len(), q.len());
+    }
 
     /// A smooth, textured picture: predictable, the way real scenery is.
     fn scene(w: usize, h: usize, t: i32) -> Vec<u8> {

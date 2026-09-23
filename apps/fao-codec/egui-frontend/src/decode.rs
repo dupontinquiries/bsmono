@@ -251,7 +251,7 @@ impl FaoFile {
             let prev = if idx > 0 { self.decode_rgb(idx - 1).ok() } else { None };
             return fao_v1::v10::decode_frame(&bytes, prev.as_deref(), w, h).ok_or(Gap::Failed(marker));
         }
-        if marker == crate::motion::MARKER {
+        if marker == crate::motion::MARKER || marker == crate::motion::MARKER_Q {
             // Shiftquilt: changed blocks intra-coded or predicted from the
             // previous frame's picture. Like M, never first.
             if idx == 0 {
@@ -558,5 +558,24 @@ mod tests {
         let rgb: Vec<u8> = (0..w * h).flat_map(|_| [120u8, 60, 200]).collect();
         let back = yuv_to_rgb(&rgb_to_yuv420p(&rgb, w, h), w, h);
         for (a, b) in rgb.iter().zip(&back) { assert!((*a as i32 - *b as i32).abs() <= 3, "{a} vs {b}"); }
+    }
+
+
+    /// The plane codec IS the frame codec's luma path: a plane coded alone
+    /// decodes to exactly the luma the frame codec produces for the same image.
+    #[test]
+    fn a_plane_codes_exactly_like_a_frames_luma() {
+        for (w, h) in [(48usize, 32usize), (512, 64)] {
+            let rgb: Vec<u8> = (0..w * h * 3).map(|i| (((i / 3) % w * 7 ^ (i / 3) / w * 5) % 256) as u8).collect();
+            let yuv = rgb_to_yuv420p(&rgb, w, h);
+            for q in [10u8, 24, 80, 100] {
+                let frame = fao_v1::decompress_frame_dct(&fao_v1::compress_frame_dct(&yuv, w, h, q), w, h).unwrap();
+                let plane = fao_v1::decompress_plane_dct(&fao_v1::compress_plane_dct(&yuv[..w * h], w, h, q), w, h).unwrap();
+                assert_eq!(plane, frame[..w * h], "{w}x{h} q{q}");
+            }
+        }
+        let p = fao_v1::compress_plane_dct(&vec![9u8; 64], 8, 8, 50);
+        assert!(fao_v1::decompress_plane_dct(&p, 16, 8).is_none(), "size mismatch rejected");
+        assert!(fao_v1::decompress_plane_dct(&p[..5], 8, 8).is_none(), "truncated rejected");
     }
 }

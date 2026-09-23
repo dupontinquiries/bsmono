@@ -155,8 +155,11 @@ pub const CATALOG: &[Codec] = &[
     Codec { codename: "Quiltstone", version: "egui block patch", marker: Some(b'M'),
         what: "only the 16x16 blocks that changed, over the previous frame -- Keystone DCT underneath",
         status: Status::Current, encode: Some("transcode (patch frames between keyframes)"), decode: Decode::Yes },
-    Codec { codename: "Shiftquilt", version: "egui motion patch", marker: Some(b'Q'),
-        what: "Quiltstone with motion: changed blocks predicted from the previous frame where that is cheaper",
+    Codec { codename: "Shiftquilt v1", version: "egui motion patch, first layout", marker: Some(b'Q'),
+        what: "motion patches, each residual channel in its own 4:2:0 image -- still decoded",
+        status: Status::Retired, encode: None, decode: Decode::Yes },
+    Codec { codename: "Shiftquilt", version: "egui motion patch", marker: Some(b'U'),
+        what: "Quiltstone with motion: changed blocks predicted from the previous frame, residual channels stacked in one plane",
         status: Status::Current, encode: Some("transcode (compact mode)"), decode: Decode::Yes },
 ];
 
@@ -223,7 +226,7 @@ mod tests {
     /// ('R' is a repeat marker, not a codec, and resolves to the frame it repeats.)
     #[test]
     fn every_decoded_marker_has_a_codename() {
-        for m in [b'D', b'P', b'L', b'K', b'T', b'V', b'Z', b'X', b'M', b'Q'] {
+        for m in [b'D', b'P', b'L', b'K', b'T', b'V', b'Z', b'X', b'M', b'Q', b'U'] {
             assert!(by_marker(m).is_some(), "marker '{}' has no codename", m as char);
         }
     }

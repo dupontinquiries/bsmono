@@ -311,7 +311,9 @@ pub fn transcode_cancellable_with<W: std::io::Write + std::io::Seek>(
                         if intra * 100 > n_blocks * KEY_IF_CHANGED_PCT {
                             patches -= 1;
                             encode_one(f, w, h, quality, false)
-                        } else if intra == modes.len() {
+                        } else if intra == modes.len() || !crate::motion::fits(modes.len() - intra) {
+                            // (or too many predicted blocks for the stacked residual's
+                            // u16 height -- beyond 4K -- in which case plain intra)
                             // NOTHING PREDICTED: a plain M patch -- the same intra blocks
                             // without Q's per-block modes, length fields and three
                             // residual headers. Measured: on a scene whose moving part
