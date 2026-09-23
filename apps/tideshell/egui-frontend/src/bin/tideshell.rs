@@ -173,7 +173,34 @@ fn print_new_trace(shell: &Shell, printed: &mut Vec<String>) {
     }
 }
 
+/// Give the systemd user manager and D-Bus activation this session's display.
+///
+/// Services started BY systemd or by D-Bus activation -- the on-screen keyboard
+/// among them -- inherit the user manager's environment, not this session's.
+/// Nothing put WAYLAND_DISPLAY there, so on the FP5 the keyboard's unit
+/// crash-looped with no display to connect to. Sway's documentation
+/// recommends exactly this step in every session config; tideshell runs
+/// inside the session and knows the values.
+fn export_session_env() {
+    let vars: Vec<&str> = ["WAYLAND_DISPLAY", "DISPLAY", "XDG_CURRENT_DESKTOP"]
+        .into_iter().filter(|v| std::env::var_os(v).is_some()).collect();
+    if vars.is_empty() {
+        eprintln!("tideshell: session env: no WAYLAND_DISPLAY/DISPLAY to export");
+        return;
+    }
+    for (cmd, pre) in [("systemctl", &["--user", "import-environment"][..]),
+                       ("dbus-update-activation-environment", &["--systemd"][..])] {
+        match std::process::Command::new(cmd).args(pre).args(&vars)
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).output() {
+            Ok(o) if o.status.success() => eprintln!("tideshell: session env: {cmd} {}", vars.join(" ")),
+            Ok(o) => eprintln!("tideshell: session env: {cmd} failed: {}", String::from_utf8_lossy(&o.stderr).trim()),
+            Err(e) => eprintln!("tideshell: session env: {cmd}: {e}"),
+        }
+    }
+}
+
 fn main() {
+    export_session_env();
     let args: Vec<String> = std::env::args().collect();
     let has = |f: &str| args.iter().any(|a| a == f);
     let persist = std::env::var("TIDESHELL_PERSIST").map(|v| v != "0").unwrap_or(true);

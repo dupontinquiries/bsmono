@@ -4,6 +4,14 @@ Documentation=https://github.com/example/rusty-board
 After=graphical-session.target
 PartOf=graphical-session.target
 
+# Skip, rather than crash-loop, when the user manager has no display to give
+# it: started without WAYLAND_DISPLAY (or DISPLAY) the keyboard exits at once,
+# Restart= retries it every 2 s, and the unit ends up "failed" with a reason
+# that never names the missing variable. The session is what supplies it --
+# tideshell imports WAYLAND_DISPLAY into the user manager at startup.
+ConditionEnvironment=|WAYLAND_DISPLAY
+ConditionEnvironment=|DISPLAY
+
 [Service]
 Type=simple
 ExecStart=@BIN_DIR@/rusty-board
