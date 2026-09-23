@@ -1,0 +1,12 @@
+[package]
+name = "comfortgov"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A comfort governor for phones: a sleep/work model over cpufreq (floor at the voltage knee, bursts that race to idle, sustained loads capped for efficiency), a skin-temperature ceiling, battery awareness, and memory policy (swappiness, MGLRU working-set protection, proactive reclaim of background cgroups). Pure policy in policy.rs, sysfs discovery/IO in sysfs.rs, dry-run by default."
+
+[[bin]]
+name = "comfortgov"
+path = "src/main.rs"
+
+[dependencies]

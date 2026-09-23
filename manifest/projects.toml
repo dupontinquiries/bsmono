@@ -38,6 +38,16 @@ targets = ["desktop", "phone"]
 primary = true            # the egui shell over crates/hatch-core; the QML plasmoid in apps/hatch/qml is the Plasma-native surface, installed with kpackagetool6, not built here
 notes = "fullscreen app launcher: hatch-core (std-only: .desktop scan, Exec spawn, icon-theme resolve, fuzzy rank, favorites/recents via config-kit) under an egui grid shell. Single-instance with a poke-file toggle so a global shortcut summons the running window (`hatch-egui --toggle`). `svg` feature (default on) pulls resvg for breeze system icons; drop it for a min-size musl build and svg-only icons fall back to letter tiles."
 
+[system.comfortgov]
+path = "system/comfortgov"
+kind = "cargo"
+role = "daemon"
+daemon = true
+flatpak = false
+runtime = "none"
+targets = ["phone", "desktop"]
+notes = "comfort CPU/thermal/memory governor: sleep/work model over cpufreq windows (floor at the voltage knee, bursts race to idle, sustained loads capped), skin-temperature ceiling, battery cap, swappiness/MGLRU/proactive reclaim. Dry-run by default; --apply writes as root. Verified against a fake sysfs only."
+
 [apps.tideshell-egui]
 path = "apps/tideshell/egui-frontend"
 kind = "cargo"

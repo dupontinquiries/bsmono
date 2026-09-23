@@ -1,0 +1,19 @@
+# System unit: comfortgov writes cpufreq and vm knobs, so it runs as root.
+#   sudo install -Dm644 comfortgov.service /etc/systemd/system/comfortgov.service
+#   sudo install -Dm755 comfortgov /usr/local/bin/comfortgov
+#   sudo systemctl daemon-reload && sudo systemctl enable --now comfortgov
+# First run it by hand: `comfortgov --probe`, then `comfortgov` (dry run) for a
+# while, reading the log, before adding --apply here.
+[Unit]
+Description=comfortgov (comfort CPU/thermal/memory governor)
+After=multi-user.target
+
+[Service]
+# --hint: tideshell touches this file on input (per-user runtime dir of uid 10000).
+ExecStart=/usr/local/bin/comfortgov --apply --hint /run/user/10000/comfortgov.input
+Restart=on-failure
+RestartSec=5
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
