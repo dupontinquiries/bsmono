@@ -322,6 +322,58 @@ fn main() {
         print!("{}", tideshell_egui::powerdoctor::report(&tideshell_egui::powerdoctor::gather(bus.as_ref(), home.as_deref())));
         std::process::exit(0);
     }
+    // `tideshell sensors`: what each input actually resolves to on THIS
+    // device, and a few live readings. Written because a probe that only
+    // looks for `/sys/class/light` or an `in_illuminance_*` file concludes
+    // "no ambient light sensor" on a phone whose ALS works fine behind
+    // iio-sensor-proxy (the sensor hub exposes it over D-Bus, and an IIO
+    // sensor in buffered mode has no `_input`/`_raw` attribute to find).
+    if args.get(1).map(String::as_str) == Some("sensors") {
+        let sys = std::path::Path::new("/sys");
+        let bus = zbus::blocking::Connection::system().ok();
+        println!("iio devices:");
+        let mut any = false;
+        let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(sys.join("bus/iio/devices")).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        dirs.sort();
+        for d in &dirs {
+            any = true;
+            let name = std::fs::read_to_string(d.join("name")).unwrap_or_default().trim().to_string();
+            let chans: Vec<String> = std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|f| f.starts_with("in_")).collect();
+            let buffered = d.join("scan_elements").is_dir();
+            println!("  {} {name}{}{}", d.display(), if buffered { " [buffered]" } else { "" }, if chans.is_empty() { String::new() } else { format!(" {}", chans.join(" ")) });
+        }
+        if !any {
+            println!("  (none)");
+        }
+        match &bus {
+            Some(b) => match tideshell_egui::sensors::sensor_proxy_claim(b) {
+                Ok(unit) => {
+                    println!("iio-sensor-proxy: ambient light, unit {unit}");
+                    for _ in 0..4 {
+                        match tideshell_egui::sensors::sensor_proxy_read(b) {
+                            Ok(v) => println!("  light = {v}"),
+                            Err(e) => println!("  read failed: {e}"),
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                    }
+                }
+                Err(e) => println!("iio-sensor-proxy: {e}"),
+            },
+            None => println!("iio-sensor-proxy: no system bus"),
+        }
+        match tideshell_egui::sensors::find_iio_light(sys) {
+            Some(l) => println!("sysfs light: {} -> {:?} lux", l.dir.display(), l.read()),
+            None => println!("sysfs light: no in_illuminance_input / in_illuminance_raw (a buffered-mode sensor has neither; the D-Bus line above is the one that matters)"),
+        }
+        match tideshell_egui::sensors::find_backlight(sys) {
+            Some(b) => println!("backlight: {} level {:?}", b.name, b.read_level()),
+            None => println!("backlight: none under /sys/class/backlight"),
+        }
+        let amb = tideshell_egui::sensors::Ambient::spawn(sys.to_path_buf(), bus);
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        println!("what tideshell would use -> {}", amb.status());
+        std::process::exit(0);
+    }
     // `tideshell install-keys` / `remove-keys`: the same lever the shell
     // pulls at startup, by hand.
     if matches!(args.get(1).map(String::as_str), Some("install-keys" | "remove-keys")) {
