@@ -174,6 +174,35 @@ impl Sys {
         Ok(())
     }
 
+    /// App scopes under `dir` (tideshell names them `app-tideshell-<id>-<pid>.scope`).
+    pub fn app_scopes(dir: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map(|d| d.flatten().map(|e| e.path()).filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("app-tideshell-"))).collect())
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// Which scope to reclaim from this tick: round-robin over the scopes
+    /// that are NOT the foreground app's (the id sits in the scope's name,
+    /// with the same character substitution tideshell applies).
+    pub fn pick_reclaim_target(scopes: &[PathBuf], foreground_app: &str, cursor: usize) -> Option<usize> {
+        let fg: String = foreground_app.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' { c } else { '_' }).collect();
+        let candidates: Vec<usize> = scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                let n = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                fg.is_empty() || !n.starts_with(&format!("app-tideshell-{fg}-"))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        Some(candidates[cursor % candidates.len()])
+    }
+
     pub fn apply(&self, probe: &Probe, cur: &[Option<Window>], d: &Decision, bg_cgroup: Option<&Path>) -> Vec<String> {
         let mut log = Vec::new();
         for (i, dir) in probe.cluster_dirs.iter().enumerate() {
@@ -303,6 +332,31 @@ mod tests {
         assert!(r.is_err());
         assert_eq!(read(&dir.join("scaling_min_freq")).as_deref(), Some("300000"), "min was written first");
         let _ = std::fs::remove_dir_all(&sys.root);
+    }
+
+    #[test]
+    fn reclaim_rotates_over_background_scopes_and_spares_the_front_app() {
+        let root = std::env::temp_dir().join(format!("comfortgov-scopes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for n in ["app-tideshell-org.gnome.Console-100.scope", "app-tideshell-org.mozilla.firefox-200.scope", "app-tideshell-org.mozilla.firefox-300.scope", "session.scope"] {
+            std::fs::create_dir_all(root.join(n)).unwrap();
+        }
+        let scopes = Sys::app_scopes(&root);
+        assert_eq!(scopes.len(), 3, "only tideshell app scopes");
+        // Firefox in front (both its windows' scopes spared): only Console is a target.
+        for c in 0..4 {
+            let i = Sys::pick_reclaim_target(&scopes, "org.mozilla.firefox", c).unwrap();
+            assert!(scopes[i].ends_with("app-tideshell-org.gnome.Console-100.scope"));
+        }
+        // Console in front: the two firefox scopes alternate.
+        let a = Sys::pick_reclaim_target(&scopes, "org.gnome.Console", 0).unwrap();
+        let b = Sys::pick_reclaim_target(&scopes, "org.gnome.Console", 1).unwrap();
+        assert_ne!(a, b);
+        // Nothing in front: everything rotates.
+        assert!(Sys::pick_reclaim_target(&scopes, "", 5).is_some());
+        // Only the front app running: nothing to reclaim.
+        assert_eq!(Sys::pick_reclaim_target(&scopes[..1], "org.gnome.Console", 0), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

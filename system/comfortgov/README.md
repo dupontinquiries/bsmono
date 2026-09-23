@@ -37,9 +37,10 @@ what warms the hand), released only below 37 °C.
 **Memory**: swappiness 40 and MGLRU `min_ttl_ms` 1000 while interacting
 (working-set protection), 100/0 asleep; proactive `memory.reclaim` of the
 background cgroup (`--bg-cgroup`) in 64 MiB steps at most every 5 s, only
-asleep, PSI-quiet, and on the charger or short of RAM. That needs apps in
-their own cgroups (hatch launching each app in a transient scope): not
-wired yet, so reclaim is off unless the cgroup is given.
+asleep, PSI-quiet, and on the charger or short of RAM. tideshell launches every app in its own transient scope
+(`app-tideshell-<id>-<pid>.scope` under app.slice) and writes the front
+app's id to `$XDG_RUNTIME_DIR/comfortgov.foreground`; with `--app-scopes DIR`
+reclaim rotates over the other apps' scopes and spares the front one.
 
 Input comes from the mtime of a hint file (`$XDG_RUNTIME_DIR/comfortgov.input`);
 tideshell should touch it on input. Verified against a fake sysfs tree

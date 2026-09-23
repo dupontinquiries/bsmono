@@ -10,7 +10,7 @@ After=multi-user.target
 
 [Service]
 # --hint: tideshell touches this file on input (per-user runtime dir of uid 10000).
-ExecStart=/usr/local/bin/comfortgov --apply --hint /run/user/10000/comfortgov.input
+ExecStart=/usr/local/bin/comfortgov --apply --hint /run/user/10000/comfortgov.input --foreground-hint /run/user/10000/comfortgov.foreground --app-scopes /sys/fs/cgroup/user.slice/user-10000.slice/user@10000.service/app.slice
 Restart=on-failure
 RestartSec=5
 Nice=-5

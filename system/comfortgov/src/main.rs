@@ -6,8 +6,13 @@
 //!   options: --interval-ms N (250)  --floor policy0=576000 (repeatable)
 //!            --hint FILE   a file whose mtime is the last user input
 //!                          (tideshell touches $XDG_RUNTIME_DIR/comfortgov.input)
-//!            --bg-cgroup PATH   cgroup v2 dir of background apps, for
-//!                          proactive reclaim (memory.reclaim)
+//!            --bg-cgroup PATH   one cgroup v2 dir to reclaim from (memory.reclaim)
+//!            --app-scopes DIR   the dir holding tideshell's per-app scopes
+//!                          (app-tideshell-<id>-<pid>.scope, e.g.
+//!                          /sys/fs/cgroup/user.slice/user-10000.slice/user@10000.service/app.slice);
+//!                          reclaim rotates over them, sparing the app named in
+//!            --foreground-hint FILE   (tideshell writes the front app's id there;
+//!                          default $XDG_RUNTIME_DIR/comfortgov.foreground)
 //!            --root DIR    sysfs/procfs root (tests; default /)
 
 mod policy;
@@ -34,6 +39,9 @@ fn main() {
     let floors: Vec<(String, u32)> = vals("--floor").iter().filter_map(|s| s.split_once('=').and_then(|(n, f)| f.parse().ok().map(|f| (n.to_string(), f)))).collect();
     let hint: Option<PathBuf> = vals("--hint").pop().map(PathBuf::from).or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(|r| PathBuf::from(r).join("comfortgov.input")));
     let bg_cgroup: Option<PathBuf> = vals("--bg-cgroup").pop().map(PathBuf::from);
+    let app_scopes: Option<PathBuf> = vals("--app-scopes").pop().map(PathBuf::from);
+    let fg_hint: Option<PathBuf> = vals("--foreground-hint").pop().map(PathBuf::from).or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(|r| PathBuf::from(r).join("comfortgov.foreground")));
+    let mut scope_cursor = 0usize;
     let apply = has("--apply");
 
     let sys = sysfs::Sys::new(&root);
@@ -55,7 +63,7 @@ fn main() {
         None => println!("skin sensor: none, no proxy: no thermal ceiling"),
     }
     println!("battery: {}", probe.battery.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none (treated as on charger)".into()));
-    println!("mglru min_ttl_ms: {}   psi memory: {}   input hint: {}   background cgroup: {}", probe.has_mglru, probe.has_psi, hint.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()), bg_cgroup.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none (no proactive reclaim)".into()));
+    println!("mglru min_ttl_ms: {}   psi memory: {}   input hint: {}   background cgroup: {}", probe.has_mglru, probe.has_psi, hint.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()), bg_cgroup.as_ref().or(app_scopes.as_ref()).map(|p| p.display().to_string()).unwrap_or_else(|| "none (no proactive reclaim)".into()));
     if has("--probe") {
         return;
     }
@@ -112,7 +120,18 @@ fn main() {
             } else if d.reclaim_bytes > 0 {
                 slow_tick = Instant::now();
             }
-            for line in sys.apply(&probe, &cur, &dd, bg_cgroup.as_deref()) {
+            // Per-app scopes: this tick's target is one background scope.
+            let scope_target: Option<PathBuf> = match (&app_scopes, dd.reclaim_bytes > 0) {
+                (Some(dir), true) => {
+                    let scopes = sysfs::Sys::app_scopes(dir);
+                    let fg = fg_hint.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+                    let t = sysfs::Sys::pick_reclaim_target(&scopes, fg.trim(), scope_cursor).map(|i| scopes[i].clone());
+                    scope_cursor = scope_cursor.wrapping_add(1);
+                    t
+                }
+                _ => None,
+            };
+            for line in sys.apply(&probe, &cur, &dd, scope_target.as_deref().or(bg_cgroup.as_deref())) {
                 println!("         {line}");
             }
             for (i, w) in d.windows.iter().enumerate() {

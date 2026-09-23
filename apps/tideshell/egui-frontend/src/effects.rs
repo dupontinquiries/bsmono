@@ -96,11 +96,13 @@ pub fn keyboard_argv(show: bool) -> [&'static str; 8] {
 pub struct System {
     pub launcher: Option<hatch_core::Launcher>,
     pending: Vec<Pending>,
+    /// For moving launched apps into systemd --user scopes.
+    pub session_bus: Option<zbus::blocking::Connection>,
 }
 
 impl System {
     pub fn new() -> System {
-        System { launcher: Some(hatch_core::Launcher::new(hatch_core::Config::load())), pending: Vec::new() }
+        System { launcher: Some(hatch_core::Launcher::new(hatch_core::Config::load())), pending: Vec::new(), session_bus: zbus::blocking::Connection::session().ok() }
     }
 }
 
@@ -168,7 +170,18 @@ impl Executor for System {
                 // Through hatch-core so the launch lands in hatch's recents
                 // and honours Terminal=/Path= exactly as hatch would.
                 Some(l) => match l.activate(id) {
-                    Ok(pid) => Outcome::Done(format!("launched {id} (pid {pid})")),
+                    Ok(pid) => {
+                        // Into its own cgroup scope, so comfortgov can reclaim
+                        // background apps one by one and protect the front one.
+                        let scoped = match &self.session_bus {
+                            Some(bus) => match move_to_scope(bus, pid, id) {
+                                Ok(unit) => format!(", scope {unit}"),
+                                Err(e) => format!(", no scope ({e})"),
+                            },
+                            None => ", no scope (no session bus)".to_string(),
+                        };
+                        Outcome::Done(format!("launched {id} (pid {pid}){scoped}"))
+                    }
                     Err(e) => Outcome::Failed(format!("launch {id}: {e}")),
                 },
                 None => Outcome::Failed("no hatch launcher".into()),
@@ -288,6 +301,30 @@ pub fn recover_system_cursor(config_home: &std::path::Path) -> Option<Outcome> {
         Ok(()) => Outcome::Done("restored system cursor left hidden by a previous run".into()),
         Err(e) => Outcome::Failed(format!("cursor recovery: {e}")),
     })
+}
+
+// ---- app scopes (systemd --user) ------------------------------------------------
+
+/// A unit name for one launch: `app-tideshell-<id>-<pid>.scope`, with the
+/// desktop id reduced to systemd's safe set so comfortgov can read the app
+/// id back out of the cgroup's directory name.
+pub fn scope_unit_name(desktop_id: &str, pid: u32) -> String {
+    format!("app-tideshell-{}-{pid}.scope", sanitize_unit(desktop_id))
+}
+
+pub fn sanitize_unit(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' { c } else { '_' }).collect()
+}
+
+/// systemd1.Manager.StartTransientUnit with the PID, under app.slice.
+pub fn move_to_scope(bus: &zbus::blocking::Connection, pid: u32, desktop_id: &str) -> Result<String, String> {
+    use zbus::zvariant::Value;
+    let unit = scope_unit_name(desktop_id, pid);
+    let p = zbus::blocking::Proxy::new(bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager").map_err(|e| e.to_string())?;
+    let props: Vec<(&str, Value)> = vec![("PIDs", Value::from(vec![pid])), ("Slice", Value::from("app.slice")), ("CollectMode", Value::from("inactive-or-failed"))];
+    let aux: Vec<(&str, Vec<(&str, Value)>)> = Vec::new();
+    p.call_method("StartTransientUnit", &(unit.as_str(), "fail", props, aux)).map_err(|e| format!("StartTransientUnit: {e}"))?;
+    Ok(unit)
 }
 
 // ---- volume (PipeWire via wpctl) -----------------------------------------------
@@ -503,7 +540,7 @@ mod tests {
 
     #[test]
     fn short_commands_report_their_real_result() {
-        let mut sys = System { launcher: None, pending: Vec::new() };
+        let mut sys = System { launcher: None, pending: Vec::new(), session_bus: None };
         assert!(matches!(sys.start(&["true"], false), Outcome::Done(ref s) if s.starts_with("started")));
         assert!(matches!(sys.start_with(&["sh", "-c", "echo nope >&2; exit 3"], false, Some(Undo::KeyboardShown)), Outcome::Done(_)));
         let mut got = Vec::new();
@@ -522,7 +559,7 @@ mod tests {
 
     #[test]
     fn long_running_commands_are_not_tracked() {
-        let mut sys = System { launcher: None, pending: Vec::new() };
+        let mut sys = System { launcher: None, pending: Vec::new(), session_bus: None };
         sys.start(&["sleep", "5"], true);
         assert!(sys.pending.is_empty());
     }
@@ -532,6 +569,50 @@ mod tests {
         let listing = "DSI-1 \"Unknown\"\n  Make: Unknown\n  Enabled: yes\n  Modes:\n    1224x2700 px, 60.000000 Hz (preferred, current)\n  Position: 0,0\n  Transform: normal\n";
         assert_eq!(first_output_name(listing).as_deref(), Some("DSI-1"));
         assert_eq!(first_output_name("  only indented\n"), None);
+    }
+
+    #[test]
+    fn scope_names_are_safe_and_carry_the_app_id() {
+        assert_eq!(scope_unit_name("org.gnome.Console", 4242), "app-tideshell-org.gnome.Console-4242.scope");
+        assert_eq!(scope_unit_name("weird name/with:chars", 1), "app-tideshell-weird_name_with_chars-1.scope");
+    }
+
+    /// StartTransientUnit against a mock systemd1 on a private bus.
+    #[test]
+    fn launched_apps_are_moved_into_their_own_scope() {
+        use std::sync::{Arc, Mutex};
+        struct Mock(Arc<Mutex<Vec<(String, String, Vec<String>)>>>);
+        #[zbus::interface(name = "org.freedesktop.systemd1.Manager")]
+        impl Mock {
+            fn start_transient_unit(&self, name: String, mode: String, properties: Vec<(String, zbus::zvariant::OwnedValue)>, _aux: Vec<(String, Vec<(String, zbus::zvariant::OwnedValue)>)>) -> zbus::zvariant::OwnedObjectPath {
+                let keys = properties.iter().map(|(k, _)| k.clone()).collect();
+                self.0.lock().unwrap().push((name, mode, keys));
+                zbus::zvariant::OwnedObjectPath::try_from("/org/freedesktop/systemd1/job/1").unwrap()
+            }
+        }
+        let sock = std::env::temp_dir().join(format!("tideshell-sd-{}", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let addr = format!("unix:path={}", sock.display());
+        let Ok(mut daemon) = std::process::Command::new("dbus-daemon").args(["--session", "--nofork", "--nopidfile", &format!("--address={addr}")]).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else {
+            eprintln!("dbus-daemon not available: skipping");
+            return;
+        };
+        for _ in 0..50 {
+            if sock.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let _server = zbus::blocking::connection::Builder::address(addr.as_str()).unwrap().name("org.freedesktop.systemd1").unwrap().serve_at("/org/freedesktop/systemd1", Mock(calls.clone())).unwrap().build().unwrap();
+        let client = zbus::blocking::connection::Builder::address(addr.as_str()).unwrap().build().unwrap();
+        let unit = move_to_scope(&client, 777, "org.gnome.Console").unwrap();
+        assert_eq!(unit, "app-tideshell-org.gnome.Console-777.scope");
+        let c = calls.lock().unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!((c[0].0.as_str(), c[0].1.as_str()), (unit.as_str(), "fail"));
+        assert!(c[0].2.contains(&"PIDs".to_string()) && c[0].2.contains(&"Slice".to_string()), "{:?}", c[0].2);
+        let _ = daemon.kill();
     }
 
     #[test]
@@ -562,7 +643,7 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("XDG_CONFIG_HOME", &home);
         let entry = hatch_core::AppEntry { id: "t".into(), name: "T".into(), exec: "true".into(), ..Default::default() };
-        let mut sys = System { launcher: Some(hatch_core::Launcher::with_entries(hatch_core::Config::default(), vec![entry])), pending: Vec::new() };
+        let mut sys = System { launcher: Some(hatch_core::Launcher::with_entries(hatch_core::Config::default(), vec![entry])), pending: Vec::new(), session_bus: None };
         match sys.run(&Action::LaunchApp("t".into())) {
             Outcome::Done(s) => assert!(s.starts_with("launched t")),
             o => panic!("{o:?}"),

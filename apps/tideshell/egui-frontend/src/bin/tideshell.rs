@@ -46,6 +46,7 @@ struct Shellbox {
     keys: Option<tideshell_egui::keys::Keys>,
     orientation: tideshell_egui::sensors::OrientationFeed,
     orientation_status: String,
+    foreground_written: String,
 }
 
 impl Shellbox {
@@ -104,6 +105,16 @@ impl Shellbox {
         }
     }
 
+    /// comfortgov reads this as the app in front (its scope is spared reclaim).
+    fn write_foreground_hint(&mut self) {
+        let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else { return };
+        let active = self.shell.windows().iter().find(|w| w.activated).map(|w| w.app_id.clone()).unwrap_or_default();
+        if active != self.foreground_written {
+            let _ = std::fs::write(std::path::PathBuf::from(dir).join("comfortgov.foreground"), &active);
+            self.foreground_written = active;
+        }
+    }
+
     fn poll_world(&mut self) {
         for (o, undo) in self.system.reap() {
             self.shell.note(o.describe());
@@ -116,6 +127,7 @@ impl Shellbox {
             if let Some(cards) = w.poll() {
                 let more = self.shell.set_windows(cards);
                 self.execute(more);
+                self.write_foreground_hint();
             }
         }
         if self.filter.stats != self.filter_stats {
@@ -252,6 +264,7 @@ fn main() {
         keys: None,
         orientation: tideshell_egui::sensors::OrientationFeed::spawn(zbus::blocking::Connection::system().ok()),
         orientation_status: String::new(),
+        foreground_written: String::new(),
     };
     {
         let found = tideshell_egui::keys::discover(std::path::Path::new("/sys"), std::path::Path::new("/dev/input"));
