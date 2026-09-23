@@ -1947,6 +1947,7 @@ impl Backend {
             no_default: !features.to_string().trim().is_empty(),
             target: target.to_string(),
             run_flags: flags.to_string(),
+            bin_name: None,
         };
         if app.name.trim().is_empty() || app.path.trim().is_empty() {
             return err_json("missing app name or path");
