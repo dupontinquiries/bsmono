@@ -36,6 +36,9 @@ struct Shellbox {
     sensor_status: (String, String),
     /// A dropped-pointer-output notice was already written for the current EI state.
     ei_drop_noted: bool,
+    /// Wet / palm / pocket rejection in front of every consumer.
+    filter: tideshell_core::touchfilter::TouchFilter,
+    filter_stats: tideshell_core::touchfilter::Stats,
 }
 
 impl Shellbox {
@@ -100,6 +103,11 @@ impl Shellbox {
                 self.execute(more);
             }
         }
+        if self.filter.stats != self.filter_stats {
+            let s = self.filter.stats;
+            self.shell.note(format!("touch filter: wet episodes {} dropped {} jumps {} excess {}", s.wet_episodes, s.dropped_wet, s.cancelled_jump, s.dropped_excess));
+            self.filter_stats = s;
+        }
         let st = (self.ambient.status(), self.backlight.status());
         if st != self.sensor_status {
             if st.0 != self.sensor_status.0 {
@@ -118,6 +126,30 @@ impl Shellbox {
                 self.ei_drop_noted = false;
             }
         }
+    }
+}
+
+/// Touch events through the rejection filter, in screen coordinates. The
+/// pointer (slot -1) is never filtered. A rejected contact becomes a Cancel.
+fn filter_input(f: &mut tideshell_core::touchfilter::TouchFilter, io: &Io, ev: Input, now: u64) -> Option<Input> {
+    let to_screen = |role: Role, x: f32, y: f32| io.to_screen(role, x, y).unwrap_or((x, y));
+    let verdict = match ev {
+        Input::Down { role, slot, x, y, .. } if slot != POINTER_SLOT => {
+            let (sx, sy) = to_screen(role, x, y);
+            f.filter(TouchEvent::Down { slot, x: sx, y: sy, t: now })
+        }
+        Input::Move { role, slot, x, y, .. } if slot != POINTER_SLOT => {
+            let (sx, sy) = to_screen(role, x, y);
+            f.filter(TouchEvent::Move { slot, x: sx, y: sy, t: now })
+        }
+        Input::Up { slot, .. } if slot != POINTER_SLOT => f.filter(TouchEvent::Up { slot, t: now }),
+        Input::Cancel => f.filter(TouchEvent::Cancel),
+        _ => return Some(ev),
+    };
+    match verdict {
+        Some(TouchEvent::Cancel) => Some(Input::Cancel),
+        Some(_) => Some(ev),
+        None => None,
     }
 }
 
@@ -193,6 +225,8 @@ fn main() {
         backlight: tideshell_egui::sensors::BacklightOut::spawn(std::path::Path::new("/sys"), zbus::blocking::Connection::system().ok()),
         sensor_status: (String::new(), String::new()),
         ei_drop_noted: false,
+        filter: tideshell_core::touchfilter::TouchFilter::default(),
+        filter_stats: tideshell_core::touchfilter::Stats::default(),
     };
     sb.backlight.set_rate(sb.shell.prefs.brightness_rate);
     // Auto-brightness ramps from the real current level, or not at all.
@@ -262,8 +296,13 @@ fn main() {
         io.set_right_enabled(sb.shell.recognizer.cfg.right_enabled);
 
         // Strips -> recognizer (screen coords). Overlay -> egui events.
+        // Real touches (not the pointer) pass the rejection filter first.
         let mut actions = Vec::new();
         for ev in input {
+            let ev = match filter_input(&mut sb.filter, &io, ev, now_ms) {
+                Some(e) => e,
+                None => continue,
+            };
             match ev {
                 // Side surfaces (bar, peeks) are widget surfaces, not edges:
                 // their input goes to their own egui contexts.

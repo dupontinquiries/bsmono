@@ -37,6 +37,7 @@ pub mod prefs;
 pub mod shell;
 pub mod sleep;
 pub mod switcher;
+pub mod touchfilter;
 pub mod trackpad;
 
 pub use shell::Shell;
