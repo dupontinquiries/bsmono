@@ -89,6 +89,9 @@ pub const SKIN_HYST_C: f32 = 1.0;
 /// The ceiling factor moves at most this much per second (the case is slow).
 pub const SKIN_SLEW_PER_S: f32 = 0.05;
 pub const LOW_BATTERY_PCT: u32 = 20;
+/// A cold lithium battery sags under load: below this the efficiency cap
+/// applies (the phone that dies at 30% in the snow is a current spike).
+pub const COLD_BATTERY_C: f32 = 5.0;
 /// Proactive reclaim per tick, bytes, when idle and quiet.
 pub const RECLAIM_STEP: u64 = 64 << 20;
 /// PSI memory "some" (fraction of time) above which reclaim is not proactive.
@@ -105,6 +108,8 @@ pub struct Sample {
     pub skin_c: Option<f32>,
     pub on_battery: bool,
     pub battery_pct: u32,
+    /// Battery temperature, °C; None = unknown.
+    pub battery_c: Option<f32>,
     /// PSI memory "some" avg10 as a fraction 0..1.
     pub psi_mem_some: f32,
     /// Fraction of RAM available.
@@ -214,7 +219,8 @@ impl Policy {
         self.update_skin(s.skin_c, dt_s);
         let state = self.next_state(s);
         let low_battery = s.on_battery && s.battery_pct <= LOW_BATTERY_PCT;
-        let ceiling = self.skin_factor * if low_battery { EFFICIENCY_FRAC } else { 1.0 };
+        let cold = s.on_battery && s.battery_c.is_some_and(|c| c <= COLD_BATTERY_C);
+        let ceiling = self.skin_factor * if low_battery || cold { EFFICIENCY_FRAC } else { 1.0 };
         let windows = self
             .clusters
             .iter()
@@ -249,7 +255,7 @@ impl Policy {
             s.util,
             s.skin_c.map(|t| format!("{t:.1}C")).unwrap_or_else(|| "n/a".into()),
             ceiling,
-            if low_battery { " low-battery" } else { "" },
+            if low_battery { " low-battery" } else if cold { " cold-battery" } else { "" },
             if interacting { " input" } else { "" }
         );
         Decision { state, windows, ceiling, swappiness, min_ttl_ms, reclaim_bytes, why }
@@ -267,7 +273,7 @@ mod tests {
         Cluster { name: "policy0".into(), freqs: vec![300_000, 576_000, 768_000, 1_017_600, 1_248_000, 1_516_800, 1_804_800], floor_khz: None }
     }
     fn sample(now: u64) -> Sample {
-        Sample { now_ms: now, last_input_ms: None, util: 0.05, skin_c: Some(30.0), on_battery: true, battery_pct: 80, psi_mem_some: 0.0, mem_avail_frac: 0.4 }
+        Sample { now_ms: now, last_input_ms: None, util: 0.05, skin_c: Some(30.0), on_battery: true, battery_pct: 80, battery_c: Some(25.0), psi_mem_some: 0.0, mem_avail_frac: 0.4 }
     }
 
     #[test]
@@ -374,6 +380,12 @@ mod tests {
         assert_eq!(d.windows[0].max_khz, 1_516_800);
         s.on_battery = false;
         assert_eq!(p.decide(&s).ceiling, 1.0, "on the charger the battery cap is off");
+        let mut s = sample(0);
+        s.last_input_ms = Some(0);
+        s.battery_c = Some(2.0);
+        assert_eq!(p.decide(&s).ceiling, EFFICIENCY_FRAC, "a cold battery is capped on battery");
+        s.on_battery = false;
+        assert_eq!(p.decide(&s).ceiling, 1.0, "but not on the charger");
     }
 
     #[test]

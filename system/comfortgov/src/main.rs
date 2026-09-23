@@ -14,6 +14,10 @@
 //!            --foreground-hint FILE   (tideshell writes the front app's id there;
 //!                          default $XDG_RUNTIME_DIR/comfortgov.foreground)
 //!            --root DIR    sysfs/procfs root (tests; default /)
+//!            --state-file PATH  where the current state is published for
+//!                          the shell (default /run/comfortgov.state as root,
+//!                          else /tmp/comfortgov.state):
+//!                          `state=Sleep ceiling=1.00 on_battery=true battery=63`
 
 mod policy;
 mod sysfs;
@@ -24,6 +28,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+fn unsafe_is_root() -> bool {
+    std::fs::metadata("/proc/self").ok().map(|m| {
+        use std::os::unix::fs::MetadataExt;
+        m.uid() == 0
+    }).unwrap_or(false)
 }
 
 fn mtime_ms(p: &Path) -> Option<u64> {
@@ -43,6 +54,7 @@ fn main() {
     let fg_hint: Option<PathBuf> = vals("--foreground-hint").pop().map(PathBuf::from).or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(|r| PathBuf::from(r).join("comfortgov.foreground")));
     let mut scope_cursor = 0usize;
     let apply = has("--apply");
+    let state_file: PathBuf = vals("--state-file").pop().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(if unsafe_is_root() { "/run/comfortgov.state" } else { "/tmp/comfortgov.state" }));
 
     let sys = sysfs::Sys::new(&root);
     let probe = sys.probe(&floors);
@@ -75,6 +87,7 @@ fn main() {
     let mut last_util = 0.0f32;
     let mut last_why = String::new();
     let mut last_windows: Vec<policy::Window> = Vec::new();
+    let mut last_state_line = String::new();
     let t0 = Instant::now();
     let mut slow_tick = Instant::now();
     loop {
@@ -89,6 +102,7 @@ fn main() {
         last_util = util;
         last_jiffies = j;
         let (on_battery, battery_pct) = sys.battery(&probe.battery);
+        let battery_c = sys.battery_c(&probe.battery);
         let s = Sample {
             now_ms: now_ms(),
             last_input_ms: hint.as_ref().and_then(|p| mtime_ms(p)),
@@ -96,10 +110,16 @@ fn main() {
             skin_c: sys.skin_c(&probe.skin),
             on_battery,
             battery_pct,
+            battery_c,
             psi_mem_some: sys.psi_mem_some(),
             mem_avail_frac: sys.mem_avail_frac(),
         };
         let d = policy.decide(&s);
+        let state_line = format!("state={:?} ceiling={:.2} on_battery={} battery={}", d.state, d.ceiling, on_battery, battery_pct);
+        if state_line != last_state_line {
+            last_state_line = state_line.clone();
+            let _ = std::fs::write(&state_file, &state_line);
+        }
         // Log when something the user could notice changed: the state or a
         // window. The ceiling factor alone (1% per tick while the case
         // warms) is not worth a line each.

@@ -210,7 +210,44 @@ impl Executor for System {
             Action::DisplayPower(_) => Outcome::Unwired("display power is handled by the layer runtime"),
             Action::Rotate(deg) => rotate_output(*deg),
             Action::SetVoicing(tone) => apply_voicing(*tone),
+            Action::AppsLightTheme(on) => match cosmic_config_home() {
+                Some(base) => set_apps_light_theme(&base, *on),
+                None => Outcome::Failed("no config home".into()),
+            },
         }
+    }
+}
+
+// ---- apps' theme (cosmic) ------------------------------------------------------
+
+/// cosmic's live-reloaded theme mode: `is_dark` under
+/// com.system76.CosmicTheme.Mode. COSMIC apps follow it at once; GTK apps
+/// through cosmic-settings-daemon's portal setting. Saved to a sidecar
+/// and restored exactly (including "no key"), like the cursor override.
+pub fn theme_mode_path(config_home: &std::path::Path) -> PathBuf {
+    config_home.join("cosmic/com.system76.CosmicTheme.Mode/v1/is_dark")
+}
+
+pub fn set_apps_light_theme(config_home: &std::path::Path, light: bool) -> Outcome {
+    let path = theme_mode_path(config_home);
+    let saved = config_home.join("tideshell/is_dark.saved");
+    let r = (|| -> std::io::Result<()> {
+        if light {
+            if !saved.exists() {
+                let orig = match std::fs::read_to_string(&path) {
+                    Ok(t) => format!("value:{t}"),
+                    Err(_) => "absent".to_string(),
+                };
+                write_atomic(&saved, &orig)?;
+            }
+            write_atomic(&path, "false")
+        } else {
+            restore_from(&path, &saved)
+        }
+    })();
+    match r {
+        Ok(()) => Outcome::Done(format!("apps theme {} ({})", if light { "light for sunlight" } else { "restored" }, path.display())),
+        Err(e) => Outcome::Failed(format!("{}: {e}", path.display())),
     }
 }
 
@@ -575,6 +612,25 @@ mod tests {
         std::fs::write(&path, "Some(9)").unwrap();
         hide_system_cursor_in(&base, false);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "Some(9)");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn apps_theme_flip_restores_exactly() {
+        let base = std::env::temp_dir().join(format!("tideshell-theme-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let path = theme_mode_path(&base);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "true").unwrap();
+        assert!(matches!(set_apps_light_theme(&base, true), Outcome::Done(_)));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "false");
+        set_apps_light_theme(&base, true); // twice: the saved original stays "true"
+        set_apps_light_theme(&base, false);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "true");
+        std::fs::remove_file(&path).unwrap();
+        set_apps_light_theme(&base, true);
+        set_apps_light_theme(&base, false);
+        assert!(!path.exists(), "no key before: no key after");
         let _ = std::fs::remove_dir_all(&base);
     }
 

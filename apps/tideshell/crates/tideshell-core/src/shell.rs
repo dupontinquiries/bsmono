@@ -717,6 +717,12 @@ impl Shell {
         self.clock_minute = minute % 1440;
     }
 
+    /// The sunlight polarity flip (with hysteresis), shared by the apps'
+    /// theme and the shell's own look.
+    pub fn apps_light(&self) -> bool {
+        self.apps_light
+    }
+
     /// Battery temperature (°C): drives cold mode unless forced.
     pub fn on_battery_temp(&mut self, c: f32) {
         if self.cold.on_battery_temp(c) {

@@ -193,6 +193,13 @@ pub fn logind_set_brightness(bus: &Connection, session: &OwnedObjectPath, name: 
     s.call_method("SetBrightness", &("backlight", name, raw)).map(|_| ()).map_err(|e| format!("SetBrightness: {e}"))
 }
 
+/// Battery temperature in °C from the first Battery power supply (sysfs
+/// `temp` is in tenths of a degree), for cold mode.
+pub fn battery_temp_c(sys: &Path) -> Option<f32> {
+    let d = std::fs::read_dir(sys.join("class/power_supply")).ok()?.flatten().map(|e| e.path()).find(|p| std::fs::read_to_string(p.join("type")).map(|t| t.trim() == "Battery").unwrap_or(false))?;
+    read_f32(&d.join("temp")).map(|t| t / 10.0)
+}
+
 // ---- orientation (iio-sensor-proxy accelerometer) ------------------------------
 
 /// Orientation strings ("normal", "left-up", ...) as they change, ~5 Hz.
@@ -956,6 +963,16 @@ sys.stdout.buffer.write(b''.join(struct.pack('<f', 0.5 if (i//5)%2==0 else -0.5)
         }
         assert_eq!(got.len(), 3, "{got:?}");
         assert!(got.iter().all(|v| (v + 6.02).abs() < 0.1), "{got:?}");
+    }
+
+    #[test]
+    fn battery_temperature_is_tenths_of_a_degree() {
+        let sys = tmp("bt");
+        put(&sys.join("class/power_supply/usb/type"), "USB");
+        put(&sys.join("class/power_supply/battery/type"), "Battery");
+        put(&sys.join("class/power_supply/battery/temp"), "63");
+        assert_eq!(battery_temp_c(&sys), Some(6.3));
+        let _ = std::fs::remove_dir_all(&sys);
     }
 
     #[test]

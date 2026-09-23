@@ -58,6 +58,8 @@ struct Shellbox {
     prev_frame: Option<(tideshell_core::track::Frame, Vec<tideshell_core::track::Point>, f32, f32)>,
     feed_status: (String, String, String, String),
     notify_gain_written: f32,
+    last_temp_poll: u64,
+    strip_base_px: u32,
 }
 
 impl Shellbox {
@@ -196,6 +198,22 @@ impl Shellbox {
     }
 }
 
+/// comfortgov's state line: `state=Sustained ceiling=0.93 on_battery=true battery=63`.
+fn parse_headroom(s: &str) -> tideshell_core::voice::Headroom {
+    let mut h = tideshell_core::voice::Headroom::default();
+    for kv in s.split_whitespace() {
+        let Some((k, v)) = kv.split_once('=') else { continue };
+        match k {
+            "ceiling" => h.ceiling = v.parse().unwrap_or(1.0),
+            "on_battery" => h.on_battery = v == "true",
+            "battery" => h.battery_pct = v.parse().unwrap_or(100),
+            "state" => h.sustained_load = v == "Sustained",
+            _ => {}
+        }
+    }
+    h
+}
+
 /// Touch events through the rejection filter, in screen coordinates. The
 /// pointer (slot -1) is never filtered. A rejected contact becomes a Cancel.
 fn filter_input(f: &mut tideshell_core::touchfilter::TouchFilter, io: &Io, ev: Input, now: u64) -> Option<Input> {
@@ -309,6 +327,8 @@ fn main() {
         prev_frame: None,
         feed_status: Default::default(),
         notify_gain_written: -1.0,
+        last_temp_poll: 0,
+        strip_base_px: 0,
     };
     if sb.shell.prefs.ambient_mic {
         sb.mic = Some(tideshell_egui::sensors::MicFeed::spawn());
@@ -399,6 +419,31 @@ fn main() {
         if let Some(m) = &sb.mic {
             for l in m.rx.try_iter().collect::<Vec<_>>() {
                 sb.shell.on_mic_level(l, now_ms);
+            }
+        }
+        // Every 2 s: battery temperature (cold mode) and the governor's
+        // state file (voice headroom); publish the voice route on change.
+        if now_ms.saturating_sub(sb.last_temp_poll) >= 2000 {
+            sb.last_temp_poll = now_ms;
+            if let Some(c) = tideshell_egui::sensors::battery_temp_c(std::path::Path::new("/sys")) {
+                sb.shell.on_battery_temp(c);
+            }
+            let t = sb.shell.cold_tuning();
+            sb.filter.slop_scale = t.slop_scale;
+            if sb.strip_base_px == 0 {
+                sb.strip_base_px = io.strip_px;
+            }
+            io.set_strip_px((sb.strip_base_px as f32 * t.target_scale).round() as u32);
+            for p in ["/run/comfortgov.state", "/tmp/comfortgov.state"] {
+                if let Ok(s) = std::fs::read_to_string(p) {
+                    sb.shell.headroom = parse_headroom(&s);
+                    break;
+                }
+            }
+            if let Some(line) = sb.shell.voice_route_line() {
+                if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+                    let _ = std::fs::write(std::path::PathBuf::from(dir).join("tideshell.voice-route"), line);
+                }
             }
         }
         // The camera: on only while the cover shows on a lit screen.

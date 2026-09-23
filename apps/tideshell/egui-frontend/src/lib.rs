@@ -76,6 +76,7 @@ pub mod keys;
 pub mod camera;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
+use std::collections::HashMap;
 use tideshell_core::bar::{self, BarWidget};
 use tideshell_core::control_center::{QuickKind, SliderKind, Stage};
 use tideshell_core::prefs::{Layout, ShellPrefs};
@@ -138,6 +139,14 @@ pub struct ShellView {
     camera_tex: Option<(egui::TextureHandle, usize, usize)>,
     bar_drag: f32,
     sheet: SettingsSheet,
+    /// Press feedback per widget: a spring on its scale (0.94 pressed, 1.0
+    /// released with a jiggle). Ticked every frame; settled ones are dropped.
+    press: HashMap<Id, tideshell_core::anim::Spring>,
+    last_frame_ms: Option<u64>,
+    /// This frame's dt for the springs (set at the top of `ui`).
+    frame_dt: f32,
+    /// The switcher landed (reveal reached 1): kick the cards once.
+    switcher_landed: bool,
 }
 
 const MOUSE_SLOT: i32 = -1;
@@ -243,6 +252,43 @@ impl ShellView {
         (shell.prefs.layout == Layout::RightBar).then(|| (Self::bar_width(shell).round() as u32, shell.prefs.bar_width.round() as i32))
     }
 
+    /// The scale to draw a widget at, given whether it is pressed now: a
+    /// quick squeeze in, a jiggle back. `id` keys the spring.
+    fn press_scale(&mut self, id: Id, pressed: bool, dt_ms: f32) -> f32 {
+        let s = self.press.entry(id).or_insert_with(|| tideshell_core::anim::Spring::jiggle(1.0));
+        s.set_target(if pressed { 0.94 } else { 1.0 });
+        s.tick(dt_ms);
+        s.value
+    }
+
+    /// Draw `r` scaled about its centre for the press feedback of `id`.
+    fn pressed_rect(&mut self, ui: &egui::Ui, id: Id, r: Rect, dt_ms: f32) -> Rect {
+        let pressed = ui.input(|i| i.pointer.primary_down()) && ui.rect_contains_pointer(r);
+        let s = self.press_scale(id, pressed, dt_ms);
+        Rect::from_center_size(r.center(), r.size() * s)
+    }
+
+    /// Any press spring still moving (keeps the frame loop awake).
+    pub fn is_jiggling(&self) -> bool {
+        self.press.values().any(|s| !s.is_settled())
+    }
+
+    fn blend_palettes(a: &PaletteColors, b: &PaletteColors, t: f32) -> PaletteColors {
+        let m = |x: Color32, y: Color32| mix(x, y, t);
+        PaletteColors {
+            bg_base: m(a.bg_base, b.bg_base),
+            bg_card: m(a.bg_card, b.bg_card),
+            bg_raised: m(a.bg_raised, b.bg_raised),
+            bg_hover: m(a.bg_hover, b.bg_hover),
+            text: m(a.text, b.text),
+            text_weak: m(a.text_weak, b.text_weak),
+            accent: m(a.accent, b.accent),
+            accent_soft: m(a.accent_soft, b.accent_soft),
+            border: m(a.border, b.border),
+            ..*a
+        }
+    }
+
     /// The camera pane's newest frame (RGBA), uploaded as a texture.
     pub fn set_camera_frame(&mut self, ctx: &egui::Context, w: usize, h: usize, rgba: &[u8]) {
         let img = egui::ColorImage::from_rgba_unmultiplied([w, h], rgba);
@@ -275,7 +321,8 @@ impl ShellView {
             .find(|w| w.id == id)
             .map(|w| (w.title.clone(), w.app_id.clone()))
             .unwrap_or_default();
-        let inset = r.shrink2(Vec2::new(4.0, 40.0));
+        let dt = self.frame_dt;
+        let inset = self.pressed_rect(ui, Id::new(("ts-peek-j", side == Side::Left)), r.shrink2(Vec2::new(4.0, 40.0)), dt);
         p.rect_filled(inset, cr(10), with_alpha(app_color(&app), 0.9));
         p.text(inset.center_top() + Vec2::new(0.0, 26.0), Align2::CENTER_CENTER, initial(&title), FontId::proportional(20.0), Color32::WHITE);
         // Title down the strip, one character per line, capped.
@@ -330,6 +377,39 @@ impl ShellView {
         out
     }
 
+    /// The dark look pushed to its contrast limit: black ground, white text.
+    fn dark_high_contrast_palette(pal: &PaletteColors) -> PaletteColors {
+        PaletteColors {
+            bg_base: Color32::BLACK,
+            bg_card: Color32::from_gray(8),
+            bg_raised: Color32::from_gray(40),
+            bg_hover: Color32::from_gray(60),
+            text: Color32::WHITE,
+            text_weak: Color32::from_gray(200),
+            accent: Color32::from_rgb(120, 190, 255),
+            accent_soft: Color32::from_rgb(90, 140, 210),
+            border: Color32::from_gray(140),
+            ..*pal
+        }
+    }
+
+    /// The light look at its softest (just past the flip): light grey ground,
+    /// dark grey text, so the switch is not a jolt.
+    fn light_soft_palette(pal: &PaletteColors) -> PaletteColors {
+        PaletteColors {
+            bg_base: Color32::from_gray(215),
+            bg_card: Color32::from_gray(222),
+            bg_raised: Color32::from_gray(200),
+            bg_hover: Color32::from_gray(185),
+            text: Color32::from_gray(35),
+            text_weak: Color32::from_gray(80),
+            accent: Color32::from_rgb(20, 90, 190),
+            accent_soft: Color32::from_rgb(120, 160, 220),
+            border: Color32::from_gray(130),
+            ..*pal
+        }
+    }
+
     /// Sunlight look: opaque white surfaces, black text, a saturated accent.
     /// Translucent dark chrome is what disappears first outdoors on a panel
     /// that is not sunlight-readable; contrast is the lever the shell has.
@@ -349,10 +429,26 @@ impl ShellView {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, shell: &mut Shell, pal: &PaletteColors, info: &FrameInfo) -> Vec<Action> {
-        let sun;
-        let pal = if shell.brightness_band().sunlight {
-            sun = Self::sunlight_palette(pal);
-            &sun
+        let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
+        let dt_ms = self.last_frame_ms.map(|t| now_ms.saturating_sub(t) as f32).unwrap_or(16.0).min(100.0);
+        self.last_frame_ms = Some(now_ms);
+        self.frame_dt = dt_ms;
+        self.press.retain(|_, s| !s.is_settled() || s.target < 1.0);
+        // Contrast rises with the light and never dips: below the polarity
+        // flip the dark look gains contrast (darker ground, whiter text);
+        // at the flip (the apps' hysteretic one) it becomes a soft light
+        // look that then gains contrast toward white/black. (Blending dark
+        // straight into light met in a muddy middle where text and ground
+        // had the same luminance: seen in the simulator at 5 000 lux.)
+        let contrast = shell.brightness_band().contrast;
+        let blended;
+        let pal = if contrast > 0.0 {
+            blended = if shell.apps_light() {
+                Self::blend_palettes(&Self::light_soft_palette(pal), &Self::sunlight_palette(pal), ((contrast - 0.3) / 0.7).clamp(0.0, 1.0))
+            } else {
+                Self::blend_palettes(pal, &Self::dark_high_contrast_palette(pal), (contrast / 0.6).clamp(0.0, 1.0))
+            };
+            &blended
         } else {
             pal
         };
@@ -435,6 +531,7 @@ impl ShellView {
             || shell.switcher.is_animating()
             || shell.fat.as_ref().is_some_and(|f| f.is_animating())
             || shell.sleep.is_animating()
+            || self.is_jiggling()
             || (shell.palette.is_visible() && !shell.palette.reveal.is_settled())
             || (shell.lock.is_locked() && !shell.lock.reveal.is_settled())
         {
@@ -716,6 +813,8 @@ impl ShellView {
         for (i, m) in shell.palette.modes.iter().enumerate() {
             let (x, y, w, h) = g.mode_rect(i);
             let r = Rect::from_min_size(at(x, y), Vec2::new(w, h));
+            let dt = self.frame_dt;
+            let r = self.pressed_rect(ui, Id::new(("ts-mode-j", i)), r, dt);
             let on = match m {
                 HoldOption::Carousel => shell.carousel.is_active(),
                 HoldOption::Keyboard => shell.modes.keyboard,
@@ -826,10 +925,12 @@ impl ShellView {
                 continue;
             }
             let on = shell.quick_state(*kind);
+            let dt = self.frame_dt;
+            let hit = r.intersect(panel);
+            let r = self.pressed_rect(ui, Id::new(("ts-tile-j", i)), r, dt);
             pc.rect_filled(r, cr(16), if on { pal.accent } else { pal.bg_raised });
             pc.text(r.center() - Vec2::new(0.0, 8.0), Align2::CENTER_CENTER, initial(kind.label()), FontId::proportional(20.0), if on { pal.bg_base } else { pal.text });
             pc.text(r.center_bottom() - Vec2::new(0.0, 13.0), Align2::CENTER_CENTER, short(kind.label()), FontId::proportional(10.0), if on { pal.bg_base } else { pal.text_weak });
-            let hit = r.intersect(panel);
             if visible && hit.height() > 20.0 && ui.interact(hit, Id::new(("ts-tile", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 out.extend(shell.tap_quick(*kind));
             }
@@ -1031,6 +1132,18 @@ impl ShellView {
         // the swipe (or the spring after it); input only once open.
         let rv = shell.switcher.reveal.progress.clamp(0.0, 1.0);
         let live = shell.switcher.open;
+        // Landing: the first frame at full reveal kicks every card's spring
+        // once, a small settle-in bounce; rearmed when the switcher leaves.
+        if rv >= 0.999 && live && !self.switcher_landed {
+            self.switcher_landed = true;
+            let ids: Vec<u64> = shell.switcher.cards().iter().map(|c| c.id).collect();
+            for id in ids {
+                self.press.entry(Id::new(("ts-card-j", id))).or_insert_with(|| tideshell_core::anim::Spring::jiggle(1.0)).kick(-1.2);
+            }
+        }
+        if rv < 0.5 {
+            self.switcher_landed = false;
+        }
         p.rect_filled(full, cr(0), with_alpha(pal.bg_base, 0.94 * rv));
         let rise = (1.0 - rv) * size.y * 0.35;
         let scale = 0.86 + 0.14 * rv;
@@ -1064,6 +1177,8 @@ impl ShellView {
             let dy = dragging.filter(|(d, _)| d == id).map(|(_, dy)| dy).unwrap_or(0.0);
             let rr = Rect::from_min_size(origin + Vec2::new(r.x, top + r.y + dy + rise), Vec2::new(r.w, r.h));
             let rr = Rect::from_center_size(rr.center(), rr.size() * scale);
+            let dt = self.frame_dt;
+            let rr = if live { self.pressed_rect(ui, Id::new(("ts-card-j", *id)), rr, dt) } else { rr };
             let fade = 1.0 - (-dy / (shell.switcher.close_px * 1.6)).clamp(0.0, 0.8);
             p.rect_filled(rr, cr(18), with_alpha(app_color(app), fade));
             if *active {

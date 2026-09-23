@@ -577,6 +577,22 @@ impl Io {
         self.st.power_status.clone()
     }
 
+    /// Resize the edge strips (cold mode grows them). Takes effect at the
+    /// strips' next configure.
+    pub fn set_strip_px(&mut self, px: u32) {
+        if self.strip_px == px {
+            return;
+        }
+        self.strip_px = px;
+        for s in self.st.surfs.iter().filter(|s| matches!(s.role, Role::Top | Role::Bottom | Role::Right)) {
+            match s.role {
+                Role::Right => s.layer.set_size(px, 0),
+                _ => s.layer.set_size(0, px),
+            }
+            s.wl.commit();
+        }
+    }
+
     /// Panel on or off (all outputs). Returns what happened, for the trace.
     pub fn set_display_power(&mut self, on: bool) -> String {
         if self.st.powers.is_empty() {

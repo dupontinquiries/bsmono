@@ -117,6 +117,10 @@ impl Sys {
         read_u64(p).map(|m| m as f32 / 1000.0 - off)
     }
 
+    pub fn battery_c(&self, dir: &Option<PathBuf>) -> Option<f32> {
+        read_u64(&dir.as_ref()?.join("temp")).map(|t| t as f32 / 10.0)
+    }
+
     /// (on_battery, percent).
     pub fn battery(&self, dir: &Option<PathBuf>) -> (bool, u32) {
         let Some(d) = dir else { return (false, 100) };
