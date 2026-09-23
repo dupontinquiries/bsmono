@@ -1,0 +1,47 @@
+From: fp5-touch <local>
+Subject: [PATCH] input: focus/activate element on first touch down
+
+TouchDown delivered wl_touch.down to the surface under the finger but never
+changed keyboard focus, unlike PointerButton press. On a touch-only device this
+means tapping a window does not activate/raise it and text (incl. OSK input)
+keeps going to the previously focused surface.
+
+Mirror the pointer path: on the first contact of a touch sequence, when no
+move/resize/popup grab owns touch, set keyboard focus to element_under().
+
+Base: cosmic-comp epoch-1.8.0 (a5578599). Type-checked with rustc 1.91
+(--ignore-rust-version) on x86_64; not yet run on hardware.
+---
+diff --git a/src/input/mod.rs b/src/input/mod.rs
+index 45586b03..b19f7c31 100644
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -1463,10 +1463,27 @@ impl State {
+                     let under = State::surface_under(position, &output, &shell)
+                         .map(|(target, pos)| (target, pos.as_logical()));
+ 
++                    // Touch-to-focus, mirroring the pointer-press path: activate and give
++                    // keyboard focus to the element under the first finger of a sequence.
++                    // `is_grabbed()` is false only before the first contact (smithay installs
++                    // an implicit TouchDownGrab on it) and when no move/resize/popup grab owns
++                    // touch, so extra fingers and grabbed sequences never steal focus.
++                    // Resize forks are excluded like on the pointer path.
++                    let touch = seat.get_touch().unwrap();
++                    let focus_target = if touch.is_grabbed()
++                        || matches!(under, Some((PointerFocusTarget::ResizeFork(_), _)))
++                    {
++                        None
++                    } else {
++                        State::element_under(position, &output, &shell, &seat)
++                    };
++
+                     std::mem::drop(shell);
+ 
+                     let serial = SERIAL_COUNTER.next_serial();
+-                    let touch = seat.get_touch().unwrap();
++                    if let Some(target) = focus_target {
++                        Shell::set_focus(self, Some(&target), &seat, Some(serial), false);
++                    }
+                     touch.down(
+                         self,
+                         under,

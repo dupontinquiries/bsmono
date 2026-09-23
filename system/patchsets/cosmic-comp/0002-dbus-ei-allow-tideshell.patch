@@ -1,0 +1,25 @@
+From: fp5-touch <local>
+Subject: [PATCH] dbus/ei: allow org.tideshell.Shell to open an EI sender socket
+
+tideshell's virtual trackpad sends relative pointer motion, buttons and scroll
+through cosmic-comp's EI path, the same way cosmic-osk does. GetSenderSocket
+only accepts callers that own an allowlisted well-known name; add the shell's.
+Trust level is the same as the existing CosmicOSK entry.
+
+Base: cosmic-comp epoch-1.8.0. Type-checked with rustc 1.91
+(--ignore-rust-version) on x86_64; not run on hardware.
+---
+diff --git a/src/dbus/ei.rs b/src/dbus/ei.rs
+index 263bced4..e6f6a21c 100644
+--- a/src/dbus/ei.rs
++++ b/src/dbus/ei.rs
+@@ -11,6 +11,9 @@ use super::name_owners::NameOwners;
+ static ALLOWED_NAMES: &[WellKnownName] = &[
+     WellKnownName::from_static_str_unchecked("org.freedesktop.impl.portal.desktop.cosmic"),
+     WellKnownName::from_static_str_unchecked("com.system76.CosmicOSK"),
++    // tideshell's virtual trackpad (relative pointer + buttons + scroll).
++    // Same trust level as CosmicOSK: owning a session-bus name.
++    WellKnownName::from_static_str_unchecked("org.tideshell.Shell"),
+ ];
+ 
+ /// Channel for handing the EI socketpair (and requested device types)

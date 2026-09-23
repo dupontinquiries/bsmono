@@ -96,6 +96,7 @@ pub fn run() -> i32 {
         "apply" => cmd_apply(rest),
         "zip" => cmd_zip(rest),
         "fleet" => cmd_fleet(rest),
+        "patchset" => cmd_patchset(rest),
         "bridge" => cmd_bridge(rest),
         "watch" => cmd_watch(rest),
         "bundle" => match rest.first() {
@@ -1383,6 +1384,82 @@ fn iso_now() -> String {
 }
 
 // ── fleet: cockpit operations shared with the GUI (import / build / apply / merge / reclaim) ──
+
+/// `gitmind patchset <show|apkbuild|freeze|rollout|bump> <patchset.txt> [args]`:
+/// the frozen package base, its patches, and the fleet rollout as text.
+fn cmd_patchset(rest: &[String]) -> i32 {
+    use cockpit::patchset::{apkbuild_source, rollout, Freeze, Patchset, Where};
+    let usage = "usage: gitmind patchset show <patchset.txt>\n       gitmind patchset apkbuild <patchset.txt> [arch]\n       gitmind patchset freeze <patchset.txt> <repo-url> [more pkgs...]\n       gitmind patchset rollout <patchset.txt> <repo-url> <builder-aports-dir> [--untested]\n       gitmind patchset bump <patchset.txt> <new-version> [base-pkgrel]";
+    let (sub, path) = match (rest.first(), rest.get(1)) {
+        (Some(s), Some(p)) => (s.as_str(), p),
+        _ => return err(usage),
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => return err(&format!("{path}: {e}")),
+    };
+    let ps = match Patchset::from_text(&text) {
+        Ok(p) => p,
+        Err(e) => return err(&format!("{path}: {e}")),
+    };
+    let freeze = |url: &str, extra: &[String]| Freeze { repo_url: url.to_string(), tag: ps.tag.clone(), pinned: std::iter::once(ps.pkg.clone()).chain(extra.iter().cloned()).collect() };
+    match sub {
+        "show" => {
+            println!("{} {} (upstream {}-r{} + {} patch(es)) tag @{}", ps.pkg, ps.version_string(), ps.base_version, ps.base_pkgrel, ps.patches.len(), ps.tag);
+            for p in &ps.patches {
+                println!("  {}  {}", p.file, p.subject);
+            }
+            if ps.tested_on.is_empty() {
+                println!("  UNTESTED: a rollout to the fleet is refused until one device is recorded as tested");
+            }
+            for t in &ps.tested_on {
+                println!("  tested on {} ({}): {}", t.device, t.date, t.note);
+            }
+            if !ps.notes.is_empty() {
+                println!("  notes: {}", ps.notes);
+            }
+            0
+        }
+        "apkbuild" => {
+            let arch = rest.get(2).map(|s| s.as_str()).unwrap_or("aarch64");
+            print!("{}", apkbuild_source(&ps, arch, &["cargo", "rust", "libinput-dev", "libseat-dev", "libdisplay-info-dev", "libxkbcommon-dev", "mesa-dev", "pixman-dev", "udev-dev", "pkgconf"]));
+            0
+        }
+        "freeze" => {
+            let Some(url) = rest.get(2) else { return err(usage) };
+            let f = freeze(url, &rest[3..]);
+            println!("# /etc/apk/repositories line:\n{}\n# /etc/apk/world entries:\n{}\n# one-shot install:\n{}", f.repositories_line(), f.world_entries().join("\n"), f.install_cmd());
+            0
+        }
+        "rollout" => {
+            let (Some(url), Some(dir)) = (rest.get(2), rest.get(3)) else { return err(usage) };
+            let untested_ok = rest.iter().any(|a| a == "--untested");
+            let f = freeze(url, &[]);
+            match rollout(&ps, &f, dir, !untested_ok) {
+                Ok(steps) => {
+                    for (i, s) in steps.iter().enumerate() {
+                        println!("{:>2}. [{}] {}\n    $ {}\n    gate: {:?}{}", i + 1, match s.on { Where::Builder => "builder", Where::Device => "device " }, s.what, s.cmd, s.gate, s.rollback.as_ref().map(|r| format!("\n    rollback: {r}")).unwrap_or_default());
+                    }
+                    0
+                }
+                Err(e) => err(&e),
+            }
+        }
+        "bump" => {
+            let Some(v) = rest.get(2) else { return err(usage) };
+            let rel = rest.get(3).and_then(|r| r.parse().ok()).unwrap_or(0);
+            let b = ps.bump(v, rel);
+            match std::fs::write(path, b.to_text()) {
+                Ok(()) => {
+                    println!("{path}: now {} (tests cleared; test on one device with `rollout --untested`, then record `tested = ...`)", b.version_string());
+                    0
+                }
+                Err(e) => err(&format!("{path}: {e}")),
+            }
+        }
+        _ => err(usage),
+    }
+}
 
 fn cmd_fleet(rest: &[String]) -> i32 {
     use cockpit::flow;

@@ -1,0 +1,12 @@
+# The fleet's cosmic-comp: upstream epoch-1.8.0 (pmOS cosmic-comp-1.8.0-r0) plus
+# the patches tideshell needs, frozen through the @fleet repo. See
+# apps/gitmind/crates/cockpit/src/patchset.rs for what gitmind does with it.
+pkg = cosmic-comp
+base_version = 1.8.0
+base_pkgrel = 0
+source_url = https://github.com/pop-os/cosmic-comp/archive/refs/tags/epoch-{version}.tar.gz
+tag = fleet
+patch = 0001-input-focus-element-on-first-touch-down.patch | touch down changes keyboard focus like a pointer press
+patch = 0002-dbus-ei-allow-tideshell.patch | EI: allow org.tideshell.Shell (the virtual trackpad)
+tested = nested-cosmic-comp | 2026-09-22 | both patches apply to epoch-1.8.0 and type-check; 0002 verified live (trackpad over EI)
+notes = Not in this set but wanted on the FP5: the DPU brightness patch from pmaports #4274 (kernel, not cosmic-comp); tideshell works around it with the safe backlight write mode until it lands.

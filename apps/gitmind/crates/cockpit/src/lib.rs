@@ -48,6 +48,7 @@ pub mod merge;
 pub mod netshare;
 pub mod ops;
 pub mod packaging;
+pub mod patchset;
 pub mod places;
 pub mod preview;
 pub mod rendezvous;
