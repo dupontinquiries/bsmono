@@ -297,6 +297,42 @@ fn print_new_trace(shell: &Shell, printed: &mut Vec<String>) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // `tideshell ctl <command>`: a client, for cosmic-comp's key bindings.
+    // `tideshell install-keys`: write those bindings into cosmic's config.
+    if args.get(1).map(String::as_str) == Some("ctl") {
+        let cmd = args.get(2).map(String::as_str).unwrap_or("");
+        match tideshell_egui::ctl::socket_path().ok_or_else(|| "XDG_RUNTIME_DIR not set".to_string()).and_then(|p| tideshell_egui::ctl::send(&p, cmd)) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("tideshell ctl: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.get(1).map(String::as_str) == Some("install-keys") {
+        let Some(home) = effects::cosmic_config_home() else {
+            eprintln!("tideshell install-keys: no config home");
+            std::process::exit(1);
+        };
+        let file = tideshell_egui::ctl::cosmic_custom_shortcuts(&home);
+        let bin = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "tideshell".into());
+        let old = std::fs::read_to_string(&file).unwrap_or_default();
+        if !old.is_empty() {
+            let _ = std::fs::write(file.with_extension("before-tideshell"), &old);
+        }
+        let new = tideshell_egui::ctl::merge_custom_shortcuts(&old, &bin);
+        let r = file.parent().map(std::fs::create_dir_all).unwrap_or(Ok(())).and_then(|_| std::fs::write(&file, &new));
+        match r {
+            Ok(()) => {
+                println!("{}: power, volume up/down now run `{bin} ctl ...` (cosmic-comp reloads it live){}", file.display(), if old.is_empty() { String::new() } else { format!("; previous file saved as {}", file.with_extension("before-tideshell").display()) });
+                std::process::exit(0)
+            }
+            Err(e) => {
+                eprintln!("tideshell install-keys: {}: {e}", file.display());
+                std::process::exit(1)
+            }
+        }
+    }
     let has = |f: &str| args.iter().any(|a| a == f);
     let persist = std::env::var("TIDESHELL_PERSIST").map(|v| v != "0").unwrap_or(true);
     let (mut prefs, errs) = effects::load_prefs();
@@ -362,7 +398,8 @@ fn main() {
     {
         let found = tideshell_egui::keys::discover(std::path::Path::new("/sys"), std::path::Path::new("/dev/input"));
         let bus = zbus::blocking::Connection::system().ok();
-        let k = tideshell_egui::keys::Keys::spawn(found, bus.as_ref());
+        let via = effects::cosmic_config_home().is_some_and(|h| tideshell_egui::ctl::compositor_route_installed(&h));
+        let k = tideshell_egui::keys::Keys::spawn(found, bus.as_ref(), via);
         sb.shell.note(k.status.clone());
         sb.keys = Some(k);
     }
@@ -416,6 +453,17 @@ fn main() {
     // Key repeat: the held key's events and when to repeat them next.
     let mut held: Option<(Vec<egui::Event>, u64)> = None;
     let mut last_power_status = String::new();
+    let ctl_server = match tideshell_egui::ctl::socket_path().map(|p| tideshell_egui::ctl::Server::bind(&p)) {
+        Some(Ok(s)) => {
+            sb.shell.note("ctl: listening (tideshell ctl power-key | volume-up | volume-down | lock | palette | switcher)".to_string());
+            Some(s)
+        }
+        Some(Err(e)) => {
+            sb.shell.note(format!("ctl: cannot bind the control socket: {e}"));
+            None
+        }
+        None => None,
+    };
     let mut last_config_status = String::new();
     if let Some(deg) = args.iter().position(|a| a == "--rotate").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()) {
         sb.pending_rotate = Some(deg);
@@ -622,8 +670,24 @@ fn main() {
                 *next = now_ms + (1000 / rate.max(1)) as u64;
             }
         }
-        // Hardware keys: power = sleep/wake, volume = a 5 % fade.
-        let presses: Vec<tideshell_egui::keys::KeyPress> = sb.keys.as_ref().map(|k| k.rx.try_iter().collect()).unwrap_or_default();
+        // Hardware keys: power = sleep/wake, volume = a 5 % fade. From
+        // cosmic-comp through the control socket, or (fallback) evdev.
+        let mut presses: Vec<tideshell_egui::keys::KeyPress> = sb.keys.as_ref().map(|k| k.rx.try_iter().collect()).unwrap_or_default();
+        if let Some(srv) = &ctl_server {
+            use tideshell_egui::ctl::Command;
+            use tideshell_egui::keys::KeyPress;
+            for c in srv.poll() {
+                match c {
+                    Ok(Command::PowerKey) => presses.push(KeyPress::Power),
+                    Ok(Command::VolumeUp) => presses.push(KeyPress::VolumeUp),
+                    Ok(Command::VolumeDown) => presses.push(KeyPress::VolumeDown),
+                    Ok(Command::Lock) => sb.shell.lock_now(),
+                    Ok(Command::Palette) => sb.shell.open_palette(),
+                    Ok(Command::Switcher) => sb.shell.open_switcher(),
+                    Err(t) => sb.shell.note(format!("ctl: unknown command {t:?}")),
+                }
+            }
+        }
         for k in presses {
             use tideshell_core::control_center::SliderKind;
             use tideshell_egui::keys::KeyPress;

@@ -1,0 +1,9 @@
+# D-Bus activation for rusty-board: the first `Show` call from tideshell's
+# keyboard toggle starts the keyboard through systemd if it is not running.
+# (KWin launches its keyboard itself, InputMethod= in kwinrc; cosmic-comp
+# does not, which is why the FP5 log said "rusty-board not running".)
+#   install -Dm644 io.rustyboard.Keyboard.service ~/.local/share/dbus-1/services/io.rustyboard.Keyboard.service
+[D-BUS Service]
+Name=io.rustyboard.Keyboard
+Exec=/bin/false
+SystemdService=rusty-board.service

@@ -73,6 +73,7 @@ pub fn key_events(pressed: bool, keysym: u32, utf8: &str, ctrl: bool, alt: bool,
 pub mod sensors;
 #[cfg(feature = "sensors")]
 pub mod keys;
+pub mod ctl;
 pub mod camera;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};

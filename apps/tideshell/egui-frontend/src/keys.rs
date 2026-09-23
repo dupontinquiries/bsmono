@@ -80,7 +80,20 @@ pub struct Keys {
 impl Keys {
     /// Open the discovered devices and start readers. Only key PRESSES are
     /// reported (value 1); releases and repeats are dropped.
-    pub fn spawn(devices: Vec<KeyDevice>, bus: Option<&zbus::blocking::Connection>) -> Keys {
+    /// `via_compositor`: cosmic-comp hands the keys over through the control
+    /// socket (ctl.rs), so the devices are not opened at all (no double
+    /// volume steps), and the logind inhibitor is taken regardless of device
+    /// access: logind reads the key itself and would still power off.
+    pub fn spawn(devices: Vec<KeyDevice>, bus: Option<&zbus::blocking::Connection>, via_compositor: bool) -> Keys {
+        if via_compositor {
+            let (_tx, rx) = mpsc::channel();
+            let inhibit = bus.and_then(|b| inhibit_power_key(b).ok());
+            let status = format!(
+                "keys: from cosmic-comp via tideshell ctl; {}",
+                if inhibit.is_some() { "logind power-key inhibitor held" } else { "NO logind inhibitor (D-Bus refused): install 50-tideshell-powerkey.conf or logind powers off" }
+            );
+            return Keys { rx, status, _inhibit: inhibit };
+        }
         let (tx, rx) = mpsc::channel();
         let mut opened = Vec::new();
         let mut failed = Vec::new();
