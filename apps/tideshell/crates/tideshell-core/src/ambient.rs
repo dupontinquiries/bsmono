@@ -150,6 +150,21 @@ pub const MAX_SPEED: f32 = 0.8;
 /// Emit when the output moved at least this much (~one step of a 12-bit backlight x 6).
 pub const EMIT_STEP: f32 = 0.0015;
 pub const SENSOR_STALE_MS: Millis = 15_000;
+/// Above this the shell switches its own surfaces to a sunlight (high
+/// contrast) look; the FP5 panel is not readable outdoors on brightness alone.
+pub const SUNLIGHT_LUX: f32 = 10_000.0;
+/// Absolute-slider curve: level = pos^SLIDER_GAMMA, so the lower half of the
+/// slider's travel covers the bottom ~20% of brightness (night levels get
+/// the resolution; the top is where a coarse control is fine).
+pub const SLIDER_GAMMA: f32 = 2.2;
+
+pub fn slider_to_level(pos: f32) -> f32 {
+    pos.clamp(0.0, 1.0).powf(SLIDER_GAMMA)
+}
+
+pub fn level_to_slider(level: f32) -> f32 {
+    level.clamp(0.0, 1.0).powf(1.0 / SLIDER_GAMMA)
+}
 pub const DAY_LEVEL_NO_SENSOR: f32 = 0.6;
 
 /// The curve on the log axis, and its local slope (brightness per log10-lux).
@@ -184,6 +199,8 @@ pub struct Band {
     pub stability: f32,
     /// log10-lux per second.
     pub trend: f32,
+    /// Bright enough outdoors that the shell should draw for sunlight.
+    pub sunlight: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -338,6 +355,7 @@ impl AutoBrightness {
             user_offset,
             stability: if self.has_sensor(now) { self.stability() } else { 1.0 },
             trend: self.trend,
+            sunlight: self.has_sensor(now) && self.smoothed_lux().is_some_and(|l| l >= SUNLIGHT_LUX),
         }
     }
 
@@ -692,6 +710,29 @@ mod tests {
         a.on_lux(300.0, 0);
         let (d, n) = (a.band(1, NOON).center, a.band(1, 23 * 60).center);
         assert!((n - d * 0.6).abs() < 1e-4, "{d} {n}");
+    }
+
+    #[test]
+    fn slider_curve_gives_the_low_end_the_travel_and_round_trips() {
+        assert!(slider_to_level(0.5) < 0.25, "half the travel is under a quarter of the brightness");
+        assert!(slider_to_level(0.3) > 0.05, "but still usable");
+        for i in 0..=20 {
+            let p = i as f32 / 20.0;
+            assert!((level_to_slider(slider_to_level(p)) - p).abs() < 1e-5);
+        }
+        assert_eq!((slider_to_level(0.0), slider_to_level(1.0)), (0.0, 1.0));
+    }
+
+    #[test]
+    fn sunlight_flag_needs_a_live_sensor_and_real_daylight() {
+        let mut a = on();
+        assert!(!a.band(0, NOON).sunlight);
+        run(&mut a, 30_000.0, 20.0, 0, 10);
+        assert!(a.band(20_100, NOON).sunlight);
+        assert!(!a.band(20_100 + SENSOR_STALE_MS, NOON).sunlight, "stale sensor: no");
+        let mut b = on();
+        run(&mut b, 800.0, 20.0, 0, 10);
+        assert!(!b.band(20_100, NOON).sunlight, "indoors: no");
     }
 
     #[test]

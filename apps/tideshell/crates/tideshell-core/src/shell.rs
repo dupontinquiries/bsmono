@@ -301,6 +301,11 @@ impl Shell {
                 self.log("cover dismissed");
             }
         }
+        // A tap's held release goes out at its deadline (libinput timing).
+        for o in self.trackpad.tick(now) {
+            self.log(format!("-> {:?}", Action::Pointer(o)));
+            out.push(Action::Pointer(o));
+        }
         // Auto-brightness ramp steps: not logged (a ramp is many steps).
         if let Some(v) = self.ambient.tick(now, self.clock_minute) {
             self.drawer.brightness = v;
@@ -468,6 +473,8 @@ impl Shell {
             self.offset_dirty_at = Some(self.now);
             return vec![];
         }
+        // Absolute brightness: the slider is curved (fine at the bottom).
+        let v = if kind == SliderKind::Brightness { crate::ambient::slider_to_level(v) } else { v };
         let a = self.drawer.set_slider(kind, v);
         if kind == SliderKind::Brightness {
             self.ambient.set_absolute(self.drawer.brightness);
@@ -481,7 +488,7 @@ impl Shell {
         if self.ambient.enabled {
             (self.ambient.user + 1.0) / 2.0
         } else {
-            self.drawer.brightness
+            crate::ambient::level_to_slider(self.drawer.brightness)
         }
     }
 
@@ -551,8 +558,8 @@ impl Shell {
     pub const REFLOW_COOLDOWN: Millis = 3000;
 
     /// Re-maximize maximized windows that are laid out wider than the space
-    /// the right edge leaves (`reserve_right` px), so they move out from
-    /// under the bar. Call on every window update while the bar is mapped;
+    /// the shell's exclusive zones leave (`reserved` px in total: the bar,
+    /// the carousel peeks), so they move out from under them. Call on every window update while the bar is mapped;
     /// it only acts on windows that are actually wrong.
     ///
     /// Why: cosmic-comp epoch-1.8.0 does not re-lay-out an ALREADY maximized
@@ -561,8 +568,8 @@ impl Shell {
     /// after the bar appeared got 1216; removing the bar re-grew it). A
     /// one-shot reflow when the bar mapped was tried first and found nothing:
     /// the window list and its maximized state arrive over several polls.
-    pub fn reflow_for_zone(&mut self, reserve_right: f32) -> Vec<Action> {
-        let limit = self.screen.0 - reserve_right + 1.0;
+    pub fn reflow_for_zone(&mut self, reserved: f32) -> Vec<Action> {
+        let limit = self.screen.0 - reserved + 1.0;
         let now = self.now;
         let ids: Vec<u64> = self
             .windows
@@ -580,6 +587,24 @@ impl Shell {
         self.log(format!("reflow {} maximized window(s) wider than the bar leaves", ids.len()));
         let out = ids.into_iter().flat_map(|id| [Action::SetMaximized(id, false), Action::SetMaximized(id, true)]).collect();
         self.emit(out)
+    }
+
+    /// A tap on a carousel peek: cycle to the neighbour it shows.
+    pub fn peek_tap(&mut self, side: crate::carousel::Side) -> Vec<Action> {
+        let out = self.carousel.tap_peek(side, &self.windows);
+        if !out.is_empty() {
+            self.log(format!("carousel peek tap {side:?}"));
+        }
+        self.emit(out)
+    }
+
+    /// Width in px the carousel peeks reserve on EACH side while active.
+    pub fn peek_reserve(&self) -> f32 {
+        if self.carousel.is_active() {
+            (self.screen.0 * crate::carousel::peek_frac()).round()
+        } else {
+            0.0
+        }
     }
 
     /// The bar's own horizontal drag (it owns the right edge).
@@ -727,8 +752,13 @@ mod tests {
         let out = edge_drag(&mut sh, (100.0, 895.0), (250.0, 895.0), 12, 1000);
         assert_eq!(out, vec![Action::Activate(1), Action::SetMaximized(1, true)]);
         assert!(!sh.switcher.is_streaking(), "quick-switch must not also run");
+        // Tap the right peek: no swipe needed.
+        // (3 is unmaximized in this fixture, so it gets maximized on arrival.)
+        assert_eq!(sh.peek_tap(crate::carousel::Side::Right), vec![Action::Activate(3), Action::SetMaximized(3, true)]);
+        assert!(sh.peek_reserve() > 0.0);
         let out = sh.tap_quick(QuickKind::Carousel);
         assert_eq!(out.len(), 2, "restores both windows it maximized: {out:?}");
+        assert_eq!(sh.peek_reserve(), 0.0);
         assert!(!sh.quick_state(QuickKind::Carousel));
     }
 
@@ -774,11 +804,24 @@ mod tests {
         sh.on_trackpad_touch(TouchEvent::Down { slot: 0, x: 10.0, y: 10.0, t: 0 });
         sh.on_trackpad_touch(TouchEvent::Up { slot: 0, t: 50 });
         sh.on_trackpad_touch(TouchEvent::Down { slot: 0, x: 10.0, y: 10.0, t: 100 });
+        assert!(sh.trackpad.button_held());
         let out = sh.toggle_mode(HoldOption::Trackpad);
         assert!(out.contains(&Action::Pointer(crate::trackpad::PointerOut::Button {
             button: crate::trackpad::Button::Left,
             pressed: false
         })));
+    }
+
+    #[test]
+    fn a_taps_release_reaches_the_transport_through_tick() {
+        let mut sh = shell_with_three();
+        sh.toggle_mode(HoldOption::Trackpad);
+        sh.on_trackpad_touch(TouchEvent::Down { slot: 0, x: 10.0, y: 10.0, t: 0 });
+        let up = sh.on_trackpad_touch(TouchEvent::Up { slot: 0, t: 60 });
+        assert_eq!(up, vec![Action::Pointer(crate::trackpad::PointerOut::Button { button: crate::trackpad::Button::Left, pressed: true })]);
+        assert!(sh.tick(100).iter().all(|a| !matches!(a, Action::Pointer(_))));
+        let later = sh.tick(60 + crate::trackpad::TAP_DRAG_MS);
+        assert!(later.contains(&Action::Pointer(crate::trackpad::PointerOut::Button { button: crate::trackpad::Button::Left, pressed: false })), "{later:?}");
     }
 
     #[test]
