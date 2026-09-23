@@ -188,7 +188,7 @@ impl ShellView {
     /// stays mapped costs compositing and can block direct scanout.
     pub fn needs_overlay(&self, shell: &Shell) -> bool {
         shell.drawer.is_visible()
-            || shell.switcher.open
+            || shell.switcher.is_visible()
             || shell.hold.is_some()
             || shell.palette.is_visible()
             || shell.swipe_up > 0.0
@@ -338,7 +338,7 @@ impl ShellView {
             }
         }
         self.previews(&p, shell, pal, origin, size);
-        if shell.switcher.open {
+        if shell.switcher.is_visible() {
             out.extend(self.switcher(ui, shell, pal, origin, size));
         }
         if shell.drawer.is_visible() {
@@ -380,6 +380,7 @@ impl ShellView {
         if !shell.recognizer.is_idle()
             || shell.drawer.is_animating()
             || shell.switcher.is_streaking()
+            || shell.switcher.is_animating()
             || shell.fat.as_ref().is_some_and(|f| f.is_animating())
             || shell.sleep.is_animating()
             || (shell.palette.is_visible() && !shell.palette.reveal.is_settled())
@@ -937,8 +938,14 @@ impl ShellView {
         let bw = Self::reserved_right(shell);
         let full = Rect::from_min_size(origin, Vec2::new(size.x - bw, size.y));
         let p = ui.painter_at(full);
-        p.rect_filled(full, cr(0), with_alpha(pal.bg_base, 0.94));
-        if ui.interact(full, Id::new("ts-sw-back"), Sense::click()).clicked() {
+        // Reveal: backdrop fades in, cards rise from below and scale up with
+        // the swipe (or the spring after it); input only once open.
+        let rv = shell.switcher.reveal.progress.clamp(0.0, 1.0);
+        let live = shell.switcher.open;
+        p.rect_filled(full, cr(0), with_alpha(pal.bg_base, 0.94 * rv));
+        let rise = (1.0 - rv) * size.y * 0.35;
+        let scale = 0.86 + 0.14 * rv;
+        if live && ui.interact(full, Id::new("ts-sw-back"), Sense::click()).clicked() {
             shell.dismiss_overlays();
         }
         // Header actions: multitask-first means "close all" and "all apps"
@@ -946,13 +953,13 @@ impl ShellView {
         let hdr = |x: f32, w: f32| Rect::from_min_size(origin + Vec2::new(x, 14.0), Vec2::new(w, 34.0));
         let (close_r, apps_r) = (hdr(14.0, 96.0), hdr(full.width() - 110.0, 96.0));
         for (r, t) in [(close_r, "Close all"), (apps_r, "All apps")] {
-            p.rect_filled(r, cr(17), pal.bg_raised);
-            p.text(r.center(), Align2::CENTER_CENTER, t, FontId::proportional(13.0), pal.text);
+            p.rect_filled(r, cr(17), with_alpha(pal.bg_raised, rv));
+            p.text(r.center(), Align2::CENTER_CENTER, t, FontId::proportional(13.0), with_alpha(pal.text, rv));
         }
-        if ui.interact(close_r, Id::new("ts-sw-closeall"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        if live && ui.interact(close_r, Id::new("ts-sw-closeall"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             out.extend(shell.switcher_close_all());
         }
-        if ui.interact(apps_r, Id::new("ts-sw-apps"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        if live && ui.interact(apps_r, Id::new("ts-sw-apps"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             out.extend(shell.open_launcher());
         }
         let top = 60.0;
@@ -966,7 +973,8 @@ impl ShellView {
         let dragging = shell.switcher.dragging;
         for ((id, title, app, active), r) in cards.iter().zip(rects) {
             let dy = dragging.filter(|(d, _)| d == id).map(|(_, dy)| dy).unwrap_or(0.0);
-            let rr = Rect::from_min_size(origin + Vec2::new(r.x, top + r.y + dy), Vec2::new(r.w, r.h));
+            let rr = Rect::from_min_size(origin + Vec2::new(r.x, top + r.y + dy + rise), Vec2::new(r.w, r.h));
+            let rr = Rect::from_center_size(rr.center(), rr.size() * scale);
             let fade = 1.0 - (-dy / (shell.switcher.close_px * 1.6)).clamp(0.0, 0.8);
             p.rect_filled(rr, cr(18), with_alpha(app_color(app), fade));
             if *active {
@@ -974,6 +982,9 @@ impl ShellView {
             }
             p.text(rr.center(), Align2::CENTER_CENTER, initial(title), FontId::proportional(34.0), with_alpha(Color32::WHITE, 0.85 * fade));
             p.text(rr.center_bottom() + Vec2::new(0.0, 11.0), Align2::CENTER_CENTER, title, FontId::proportional(12.0), pal.text);
+            if !live {
+                continue;
+            }
             let resp = ui.interact(rr, Id::new(("ts-card", *id)), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::PointingHand);
             if resp.drag_started() {
                 self.card_drag = 0.0;

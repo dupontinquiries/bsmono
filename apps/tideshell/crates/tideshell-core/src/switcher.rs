@@ -17,8 +17,14 @@
 //!    iOS behaviour). The streak settles after a pause, and the order is
 //!    rebuilt from the window you landed on.
 
+use crate::anim::DragTransition;
 use crate::edge::Dir;
 use crate::{Action, Millis, WindowCard};
+
+/// Swipe-up progress (fraction of the screen height) at which the cards
+/// are fully in; the recognizer commits the switcher at 12 %, so the last
+/// stretch is animated after release.
+pub const REVEAL_TRAVEL: f32 = 0.25;
 
 /// Pause after which a quick-switch streak settles.
 pub const STREAK_MS: Millis = 1500;
@@ -53,6 +59,8 @@ struct Streak {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Switcher {
     pub open: bool,
+    /// 0 = away, 1 = fully in. Follows the swipe, then springs.
+    pub reveal: DragTransition,
     pub style: Style,
     windows: Vec<WindowCard>,
     /// Window ids, most recent first.
@@ -66,7 +74,7 @@ pub struct Switcher {
 
 impl Default for Switcher {
     fn default() -> Self {
-        Switcher { open: false, style: Style::Grid, windows: Vec::new(), mru: Vec::new(), streak: None, dragging: None, close_px: 120.0 }
+        Switcher { open: false, reveal: DragTransition::default(), style: Style::Grid, windows: Vec::new(), mru: Vec::new(), streak: None, dragging: None, close_px: 120.0 }
     }
 }
 
@@ -146,6 +154,27 @@ impl Switcher {
         Some(Action::Activate(s.snapshot[next]))
     }
 
+    /// The swipe is moving: cards follow the finger.
+    pub fn drag(&mut self, swipe_progress: f32, now: Millis) {
+        if !self.open {
+            self.reveal.drag((swipe_progress / REVEAL_TRAVEL).clamp(0.0, 1.0), now);
+        }
+    }
+
+    /// Drawn while sliding in or out, not only while open.
+    pub fn is_visible(&self) -> bool {
+        self.open || self.reveal.progress > 0.001
+    }
+
+    pub fn is_animating(&self) -> bool {
+        !self.reveal.is_settled()
+    }
+
+    /// Advance the reveal animation.
+    pub fn tick_anim(&mut self, dt_ms: f32) {
+        self.reveal.tick(dt_ms);
+    }
+
     /// Called from the shell's tick: settle a streak after the pause.
     pub fn tick(&mut self, now: Millis) {
         if self.streak.as_ref().is_some_and(|s| now.saturating_sub(s.last) >= STREAK_MS) {
@@ -166,11 +195,20 @@ impl Switcher {
         self.settle();
         self.open = true;
         self.dragging = None;
+        self.reveal.animate_to(1.0);
     }
 
     pub fn hide(&mut self) {
         self.open = false;
         self.dragging = None;
+        self.reveal.animate_to(0.0);
+    }
+
+    /// A swipe that did not commit: slide the cards back down.
+    pub fn cancel_reveal(&mut self) {
+        if !self.open {
+            self.reveal.animate_to(0.0);
+        }
     }
 
     pub fn tap(&mut self, id: u64) -> Vec<Action> {
@@ -315,6 +353,34 @@ mod tests {
         assert_eq!(s.release_card(), vec![Action::Close(2)]);
         s.drag_card(2, 300.0);
         assert!(s.release_card().is_empty(), "downward drag never closes");
+    }
+
+    #[test]
+    fn cards_follow_the_swipe_then_spring_in_and_slide_out() {
+        let mut s = three();
+        s.drag(0.06, 0);
+        assert!((s.reveal.progress - 0.24).abs() < 1e-5, "6% of the height = 24% of the travel");
+        assert!(s.is_visible() && !s.open);
+        s.drag(0.125, 30);
+        assert!((s.reveal.progress - 0.5).abs() < 1e-5);
+        s.show();
+        for _ in 0..100 {
+            s.tick_anim(11.1);
+        }
+        assert!((s.reveal.progress - 1.0).abs() < 1e-3 && s.open);
+        s.hide();
+        assert!(!s.open && s.is_visible(), "still drawn while sliding out");
+        for _ in 0..100 {
+            s.tick_anim(11.1);
+        }
+        assert!(!s.is_visible());
+        // A cancelled swipe springs back.
+        s.drag(0.05, 5000);
+        s.cancel_reveal();
+        for _ in 0..100 {
+            s.tick_anim(11.1);
+        }
+        assert!(!s.is_visible());
     }
 
     #[test]

@@ -301,6 +301,7 @@ impl Shell {
         let dt = self.last_tick.map(|l| now.saturating_sub(l) as f32).unwrap_or(0.0);
         self.last_tick = Some(now);
         self.drawer.tick(dt.min(100.0));
+        self.switcher.tick_anim(dt.min(100.0));
         let streaking = self.switcher.is_streaking();
         self.switcher.tick(now);
         if streaking && !self.switcher.is_streaking() {
@@ -368,13 +369,17 @@ impl Shell {
                 if self.drawer.is_visible() {
                     self.drawer.close();
                 }
+                self.switcher.drag(progress, self.now);
                 vec![]
             }
             GestureEvent::SwipeUpRelease { target } => {
                 self.swipe_up = 0.0;
                 self.log(format!("swipe-up -> {target:?}"));
                 match target {
-                    SwipeUpTarget::Cancel => vec![],
+                    SwipeUpTarget::Cancel => {
+                        self.switcher.cancel_reveal();
+                        vec![]
+                    }
                     SwipeUpTarget::Switcher => {
                         self.switcher.show();
                         vec![]
@@ -435,6 +440,7 @@ impl Shell {
                 self.peek_dx = 0.0;
                 self.hold = None;
                 self.palette.end_hold();
+                self.switcher.cancel_reveal();
                 self.drawer.release(false);
                 self.log("gesture cancelled");
                 vec![]

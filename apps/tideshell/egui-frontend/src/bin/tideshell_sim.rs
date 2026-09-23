@@ -279,7 +279,7 @@ impl App {
         let out = match which {
             "drawer" => drag(&mut self.shell, (w / 2.0, 3.0), (w / 2.0, h * 0.8), 30, true),
             "switcher" => drag(&mut self.shell, (w / 2.0, h - 4.0), (w / 2.0, h * 0.72), 30, true),
-            "swipe" => drag(&mut self.shell, (w / 2.0, h - 4.0), (w / 2.0, h * 0.62), 30, false),
+            "swipe" => drag(&mut self.shell, (w / 2.0, h - 4.0), (w / 2.0, h * 0.90), 30, false),
             "hold" => {
                 let o = self.shell.on_edge_touch(TouchEvent::Down { slot: 9, x: w / 2.0, y: h - 6.0, t: 0 });
                 // tick() past hold_ms opens the palette; slide onto Keyboard.
