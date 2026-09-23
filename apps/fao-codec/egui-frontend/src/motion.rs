@@ -34,12 +34,19 @@
 //! ```text
 //! b'Q' | u32 LE k | bitmap (as M) | per changed block, bitmap order:
 //!        u8 mode (0 intra, 1 inter) [+ i8 dx, i8 dy if inter]
-//!      | u32 LE intra length | intra DCT patch (Keystone) | residual DCT patch
+//!      | u32 LE intra length | intra DCT patch (Keystone)
+//!      | u32 LE R length | R plane | u32 LE G length | G plane | B plane
 //! ```
 //!
+//! (The first build of Q, 2eb4a5ca8, coded one 4:2:0 RGB residual instead.
+//! Compact mode was opt-in and experimental; files from that build will not
+//! decode.)
+//!
 //! Residuals are `src - pred + 128`, clamped to a byte, packed like intra
-//! blocks and DCT-coded -- a flat 128 where the prediction is good, which the
-//! DCT codes almost for free. A vector points into the previous frame:
+//! blocks -- a flat 128 where the prediction is good, which the DCT codes
+//! almost for free. Each of R, G, B is coded as its OWN full-resolution plane
+//! (the luma of a greyscale 4:2:0 image), never through a colour transform --
+//! see "Why three planes" below. A vector points into the previous frame:
 //! `cur(x, y) ~ prev(x + dx, y + dy)`, coordinates clamped at the frame edge.
 
 use crate::decode::{rgb_to_yuv420p, yuv_to_rgb};
@@ -201,6 +208,16 @@ fn residual_patch(cur: &[u8], prev: &[u8], w: usize, h: usize, inter: &[(usize, 
     (out, pw, ph)
 }
 
+/// Channel `c` of an interleaved RGB image as the LUMA of a 4:2:0 image with
+/// neutral chroma -- so the DCT codec codes it at full resolution, with no
+/// colour transform and no subsampling. The neutral chroma planes are flat and
+/// cost almost nothing.
+fn plane_as_yuv(rgb: &[u8], c: usize, w: usize, h: usize) -> Vec<u8> {
+    let mut yuv: Vec<u8> = rgb.chunks_exact(3).map(|p| p[c]).collect();
+    yuv.resize(w * h + 2 * (w / 2) * (h / 2), 128);
+    yuv
+}
+
 /// Encode a motion patch frame.
 pub fn encode(cur: &[u8], prev: &[u8], w: usize, h: usize, blocks: &[usize], modes: &[Option<(i8, i8)>], quality: u8) -> Vec<u8> {
     let (cols, rows) = grid(w, h);
@@ -224,8 +241,14 @@ pub fn encode(cur: &[u8], prev: &[u8], w: usize, h: usize, blocks: &[usize], mod
     out.extend_from_slice(&intra_bytes);
     if !inter.is_empty() {
         let (r, pw, ph) = residual_patch(cur, prev, w, h, &inter);
-        out.extend_from_slice(&fao_v1::compress_frame_dct(&rgb_to_yuv420p(&r, pw, ph), pw, ph,
-                                                          quality.saturating_sub(RESIDUAL_Q_DROP)));
+        let rq = quality.saturating_sub(RESIDUAL_Q_DROP);
+        for c in 0..3 {
+            let plane = fao_v1::compress_frame_dct(&plane_as_yuv(&r, c, pw, ph), pw, ph, rq);
+            if c < 2 {
+                out.extend_from_slice(&(plane.len() as u32).to_le_bytes());
+            }
+            out.extend_from_slice(&plane);
+        }
     }
     out
 }
@@ -264,7 +287,20 @@ pub fn decode(payload: &[u8], prev: &[u8], w: usize, h: usize) -> Option<Vec<u8>
     }
     if !inter.is_empty() {
         let (pw, ph) = patch_dims(inter.len());
-        let res = yuv_to_rgb(&fao_v1::decompress_frame_dct(&payload[at..], pw, ph)?, pw, ph);
+        let mut planes: Vec<Vec<u8>> = Vec::with_capacity(3);
+        for c in 0..3 {
+            let data = if c < 2 {
+                let n = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
+                at += 4;
+                let d = payload.get(at..at + n)?;
+                at += n;
+                d
+            } else {
+                payload.get(at..)?
+            };
+            let yuv = fao_v1::decompress_frame_dct(data, pw, ph)?;
+            planes.push(yuv.get(..pw * ph)?.to_vec());
+        }
         let pcols = pw / MB;
         for (slot, &(i, mv)) in inter.iter().enumerate() {
             let (x, y, bw, bh) = block_rect(i, w, h);
@@ -272,10 +308,10 @@ pub fn decode(payload: &[u8], prev: &[u8], w: usize, h: usize) -> Option<Vec<u8>
             for py in 0..bh {
                 for px in 0..bw {
                     let p = pred(prev, w, h, x, y, mv, px, py);
-                    let r = ((oy + py) * pw + ox + px) * 3;
+                    let r = (oy + py) * pw + ox + px;
                     let d = ((y + py) * w + x + px) * 3;
                     for c in 0..3 {
-                        out[d + c] = (p[c] as i32 + res[r + c] as i32 - 128).clamp(0, 255) as u8;
+                        out[d + c] = (p[c] as i32 + planes[c][r] as i32 - 128).clamp(0, 255) as u8;
                     }
                 }
             }

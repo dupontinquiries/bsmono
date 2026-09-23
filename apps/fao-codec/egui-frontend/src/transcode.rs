@@ -285,18 +285,40 @@ pub fn transcode_cancellable_with<W: std::io::Write + std::io::Seek>(
                     Job::Patch(f, blocks) => {
                         let pd = prev_dec.as_deref().expect("a keyframe precedes every patch");
                         let modes = crate::motion::plan(f, pd, w, h, blocks);
-                        let p = crate::motion::encode(f, pd, w, h, blocks, &modes, quality);
-                        match last_key_len {
-                            Some(kl) if p.len() >= kl => { patches -= 1; encode_one(f, w, h, quality, false) }
-                            _ => (p, None),
+                        let intra = modes.iter().filter(|m| m.is_none()).count();
+                        // A SCENE CUT, not a size comparison, triggers the keyframe
+                        // here: prediction failing for most of the frame. Size is the
+                        // wrong signal in this mode -- the first predicted frame after
+                        // a keyframe is EXPENSIVE because its full-resolution residual
+                        // repairs colour detail the keyframe's 4:2:0 lost (measured:
+                        // 4,497 bytes after a 2,848-byte key, then 1,232-2,012). A
+                        // size rule promoted it, restarted that same first step, and
+                        // cascaded: every frame became a keyframe.
+                        if intra * 100 > n_blocks * KEY_IF_CHANGED_PCT {
+                            patches -= 1;
+                            encode_one(f, w, h, quality, false)
+                        } else if intra == modes.len() {
+                            // NOTHING PREDICTED: a plain M patch -- the same intra blocks
+                            // without Q's per-block modes, length fields and three
+                            // residual headers. Measured: on a scene whose moving part
+                            // animates (so little is predictable) compact was 5% larger
+                            // than fast at equal quality, and it was that overhead.
+                            (crate::patch::encode(f, w, h, blocks, quality), None)
+                        } else {
+                            (crate::motion::encode(f, pd, w, h, blocks, &modes, quality), None)
                         }
                     }
                 };
-                let next = if r.0.first() == Some(&b'D') {
-                    last_key_len = Some(r.0.len());
-                    fao_v1::decompress_frame_dct(&r.0, w, h).map(|yuv| crate::decode::yuv_to_rgb(&yuv, w, h))
-                } else {
-                    crate::motion::decode(&r.0, prev_dec.as_deref().expect("reference"), w, h)
+                // Decode with whichever decoder the WRITTEN marker selects -- the
+                // same dispatch the player makes.
+                let next = match r.0.first() {
+                    Some(&b'D') => {
+                        last_key_len = Some(r.0.len());
+                        fao_v1::decompress_frame_dct(&r.0, w, h).map(|yuv| crate::decode::yuv_to_rgb(&yuv, w, h))
+                    }
+                    Some(&m) if m == crate::patch::MARKER =>
+                        crate::patch::decode(&r.0, prev_dec.as_deref().expect("reference"), w, h),
+                    _ => crate::motion::decode(&r.0, prev_dec.as_deref().expect("reference"), w, h),
                 };
                 prev_dec = Some(next.ok_or("a frame this encoder wrote did not decode")?);
                 v.push(r);
@@ -1059,15 +1081,44 @@ mod tests {
         (run(false, "fast.fao"), run(true, "compact.fao"))
     }
 
+    /// NOTHING PREDICTABLE -- fresh noise every frame over a static scene --
+    /// so compact mode writes plain M patches, not Q frames carrying modes and
+    /// residual headers for no prediction. Every frame still decodes.
+    #[test]
+    fn unpredictable_frames_are_written_as_plain_patches() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-noise-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("noise.mkv");
+        make(&src, &["-f", "lavfi", "-i",
+            "nullsrc=s=96x64:r=30,geq=r='mod(X*7+Y*3,256)':g='mod(X*3+Y*11,256)':b='mod(X*13+Y*5,256)'[bg];\
+             nullsrc=s=32x32:r=30,geq=r='random(1)*255':g='random(2)*255':b='random(3)*255'[fg];[bg][fg]overlay=x=32:y=16",
+            "-frames:v", "20", "-c:v", "ffv1"]);
+        let out = dir.join("out.fao");
+        let rep = transcode_to_file_with(src.to_str().unwrap(), &out, 80, None, |_, _| {}, None, true).unwrap();
+        let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        let (m, q) = (0..f.frame_count()).fold((0, 0), |(m, q), i| match f.marker(i) {
+            Some(x) if x == crate::patch::MARKER => (m + 1, q),
+            Some(x) if x == crate::motion::MARKER => (m, q + 1),
+            _ => (m, q),
+        });
+        assert!(m >= 15, "noise cannot be predicted: {m} M frames, {q} Q frames");
+        assert_eq!(q, 0, "no Q frame without a predicted block");
+        for i in 0..f.frame_count() { f.decode_rgb(i).expect("every frame decodes"); }
+        assert_eq!(rep.patches, m);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A CAMERA PAN, the case motion is for: the whole scene slides 3 px per
     /// frame. Fast mode can only send keyframes (every block changed); compact
-    /// mode predicts every frame and is much smaller.
+    /// mode predicts every frame. Measured: 90,166 vs 145,767 bytes, mean
+    /// 36.46 vs 30.56 dB -- SMALLER AND BETTER, and quality holds or rises
+    /// through the run instead of declining.
     ///
-    /// WHAT THIS DOES NOT CLAIM. A first version asserted "3x smaller, and no
-    /// frame 2 dB below the keyframe". Measured: ~0.44x the size -- but quality
-    /// DECLINES across the run (~30 dB early, ~26.6 dB late), the known
-    /// limitation in `motion`'s doc. The floor below guards that it gets no
-    /// WORSE; it is not a claim that there is no degradation.
+    /// History: with residuals coded through 4:2:0 and a colour transform,
+    /// this pan ran ~30 dB early and ~26.6 late, and lost to keyframes at high
+    /// quality. Full-resolution per-channel residuals fixed both.
     #[test]
     fn a_camera_pan_is_far_smaller_with_motion() {
         if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
@@ -1082,16 +1133,19 @@ mod tests {
         let ((fast, fb), (compact, cb)) = both_modes(&src, &dir);
         assert_eq!(fast.patches, 0, "fast mode: every block changed, so keyframes only");
         assert!(compact.patches >= 40, "compact mode predicts the pan: {} patch frames", compact.patches);
-        assert!(cb.len() * 2 < fb.len(), "compact {} bytes vs fast {} bytes", cb.len(), fb.len());
+        assert!(cb.len() * 10 < fb.len() * 7, "compact {} bytes vs fast {} bytes", cb.len(), fb.len());
         let raw = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&src)
             .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]).output().unwrap().stdout;
         let frames: Vec<&[u8]> = raw.chunks(w * h * 3).collect();
-        let f = crate::decode::FaoFile::parse(cb).unwrap();
-        let key = psnr(frames[0], &f.decode_rgb(0).unwrap());
-        for i in 1..f.frame_count() {
-            let p = psnr(frames[i], &f.decode_rgb(i).unwrap());
-            assert!(p > key - 5.5, "frame {i}: {p:.2} dB vs keyframe {key:.2} dB -- worse than the measured decline");
-        }
+        let mean = |b: Vec<u8>| {
+            let f = crate::decode::FaoFile::parse(b).unwrap();
+            (0..f.frame_count()).map(|i| psnr(frames[i], &f.decode_rgb(i).unwrap())).collect::<Vec<f64>>()
+        };
+        let (pf, pc) = (mean(fb), mean(cb));
+        let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        assert!(avg(&pc) > avg(&pf) + 3.0, "compact {:.2} dB vs fast {:.2} dB", avg(&pc), avg(&pf));
+        let (early, late) = (avg(&pc[1..6]), avg(&pc[pc.len() - 5..]));
+        assert!(late > early - 0.5, "no decline through the pan: first frames {early:.2} dB, last {late:.2} dB");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1099,10 +1153,10 @@ mod tests {
     ///
     /// * The FADE stays strict: it guards the skip mechanism, which must not
     ///   accumulate at all, motion or not.
-    /// * The moving window gets a MEASURED BOUND, not a no-drift claim:
-    ///   residuals are coded coarser (RESIDUAL_Q_DROP) and quality declines a
-    ///   little across a run (motion's documented limitation). Measured: worst
-    ///   frame 25.03 dB against a 26.08 dB keyframe -- 1.05 below.
+    /// * The moving window: its box ANIMATES, so little is predictable, and
+    ///   compact is roughly neutral against fast -- measured 122,001 vs 116,262
+    ///   bytes (+4.9%, ~64 bytes a frame of Q-format overhead) at 25.99 vs 26.00
+    ///   dB. Asserted as such: close in size, equal in quality.
     #[test]
     fn compact_mode_stays_within_its_measured_bounds() {
         if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
@@ -1111,7 +1165,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (src, frames, _w, _h) = moving_box_source(&dir);
         let ((_fast, fb), (_compact, cb)) = both_modes(&src, &dir);
-        assert!(cb.len() < fb.len(), "compact {} vs fast {}", cb.len(), fb.len());
+        assert!(cb.len() * 100 < fb.len() * 110, "compact {} vs fast {}: more than 10% larger", cb.len(), fb.len());
         let f = crate::decode::FaoFile::parse(cb).unwrap();
         let key = psnr(&frames[0], &f.decode_rgb(0).unwrap());
         for i in 0..f.frame_count() {
@@ -1131,6 +1185,7 @@ mod tests {
         assert!(err <= 6, "compact-mode fade stays within a few levels: max error {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
 
     fn have_ffmpeg() -> bool {
         Command::new("ffmpeg").arg("-version").output().map(|o| o.status.success()).unwrap_or(false)
