@@ -301,11 +301,17 @@ the model, undo, and convergence. What does not exist yet, in rough order:
    `thumbnail_png` for a single frame's raw PNG bytes, `extract_audio`
    piping a video's audio track straight into `decode_bytes` with no temp
    file. 8 tests, all against real subprocesses and ffmpeg-generated
-   fixtures, not fakes. Deliberately NOT built: decoding a video frame into
-   pixels — there is no `VideoFrame` type anywhere in this codebase yet,
-   and that's real, separate work past what an editor needs first
-   (knowing what a file is, showing something for it, treating its audio
-   like any other source).
+   fixtures, not fakes. *Since this was written* the picture side landed
+   too (the film merge and after): `frame_rgb` decodes frames for the
+   viewport, which composites every video layer with its grade, style,
+   kaleidoscope, transform, blend and fade; and `studio_video::edit`
+   RENDERS the timeline to a file -- cuts, black gaps, the same picture
+   effects, fades to and from black, the mixdown underneath -- with the
+   best H.264 encoder the machine has (libx264, else libopenh264 as on
+   Fedora, else mpeg4). What the export still cannot do is named per cut
+   by `edit::unsupported` rather than dropped: layer blends/opacity (the
+   export is top-track-wins, the preview composites), and true dissolves
+   (two abutting fades dip through black).
 2. **Audio render graph** — `studio_audio::mixdown` mixes tracks, applies
    clip and bus effect chains, handles sends/mute/solo, and is real and
    tested (72 tests) — `studio-live`'s own
@@ -360,10 +366,10 @@ the model, undo, and convergence. What does not exist yet, in rough order:
 This closes every item that was on this list when this section was last
 written honestly. What's real and load-bearing now, named precisely rather
 than left as a vague "not built yet": real hardware verification for
-`studio-io` (item 3), the network half of DHT publishing (item 4), and a
-`VideoFrame` type plus everything a timeline needs to composite/render one
-(item 1's own remaining piece — `studio-video` gives an editor what it
-needs first, not full video playback). None of those are guesses — each is
+`studio-io` (item 3), the network half of DHT publishing (item 4), and
+compositing in the EXPORT -- blends, opacity and dissolves, which the
+preview already shows (item 1's remaining piece; realtime video playback
+in the viewport, rather than a seek per frame, is the other). None of those are guesses — each is
 a concrete next step pinned by a test or a doc comment that says exactly
 what it's waiting on. Item 2's own remaining piece — a streaming render
 path — is no longer on this list; it's built.
