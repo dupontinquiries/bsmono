@@ -23,6 +23,7 @@
 //!   phone.
 
 pub mod ambient;
+pub mod ambient_sound;
 pub mod anim;
 pub mod audio;
 pub mod bar;
@@ -40,7 +41,9 @@ pub mod shell;
 pub mod sleep;
 pub mod switcher;
 pub mod touchfilter;
+pub mod track;
 pub mod trackpad;
+pub mod world;
 
 pub use shell::Shell;
 
