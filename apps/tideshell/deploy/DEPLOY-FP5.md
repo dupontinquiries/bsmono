@@ -201,6 +201,28 @@ sudo systemctl restart display-manager      # logs the session out
 then `sudo systemctl restart display-manager`. Do not do this stage without
 ssh access confirmed working, and never on a phone whose tunnel is down.
 
+## Stage 8 (optional) — comfortgov, the comfort governor
+
+Separate daemon, `system/comfortgov` in the bundle (no dependencies). Build
+it on the phone, probe, dry-run, and only then apply:
+
+```sh
+cd ~/src/tideshell/system/comfortgov && cargo build --release
+./target/release/comfortgov --probe                # report this output
+./target/release/comfortgov | head -50             # dry run: decisions, nothing written
+sudo ./target/release/comfortgov --apply --hint /run/user/$(id -u)/comfortgov.input
+```
+
+The probe prints each cluster's OPP table and the heuristic knee; the
+skin sensor it picked (report which); battery; MGLRU/PSI availability.
+tideshell touches the hint file on every touch, so with both running the
+governor sees your input. Undo: stop it; the kernel's defaults return at
+the next boot (or `echo` the cpuinfo min/max back into scaling_min/max_freq).
+
+**Report:** the probe output, a minute of dry-run log while you use the
+phone (tap around, then leave it alone), and whether anything felt rough
+or warm with --apply.
+
 ## Rollback summary
 
 | what | undo |
@@ -210,6 +232,7 @@ ssh access confirmed working, and never on a phone whose tunnel is down.
 | cursor hidden after a crash in fat-cursor mode | start tideshell once (restores), or `rm ~/.config/cosmic/com.system76.CosmicComp/v1/cursor_hide_timeout` |
 | settings | `rm ~/.config/tideshell/prefs` |
 | patched cosmic-comp | `sudo apk fix cosmic-comp` |
+| comfortgov limits | `sudo systemctl stop comfortgov` (or Ctrl-C), then reboot or restore cpuinfo min/max into scaling_min/max_freq |
 
 ## What to send back
 

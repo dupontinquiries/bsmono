@@ -19,7 +19,8 @@ shared/systemcompkit
 shared/touchkit
 shared/uikit/crates/snapclone-theme
 shared/uikit/crates/uikit-egui
-shared/uikit/crates/uikit-gesture"
+shared/uikit/crates/uikit-gesture
+system/comfortgov"
 if command -v cargo >/dev/null 2>&1; then
     derived=$(cd apps/tideshell/egui-frontend && cargo metadata --format-version 1 --no-default-features --features layer,ei 2>/dev/null \
         | python3 -c 'import json,sys,os; r=os.path.realpath("../../.."); m=json.load(sys.stdin); print("\n".join(sorted({os.path.relpath(os.path.dirname(p["manifest_path"]), r) for p in m["packages"] if p["source"] is None})))')

@@ -270,6 +270,9 @@ fn main() {
     let mut contact_pos: HashMap<i32, Pos2> = HashMap::new();
     let mut last_region: Option<Option<Vec<Rect>>> = None;
     let mut last_poll = 0u64;
+    // comfortgov reads the mtime of this file as "last user input".
+    let hint = std::env::var_os("XDG_RUNTIME_DIR").map(|r| std::path::PathBuf::from(r).join("comfortgov.input"));
+    let mut last_hint = 0u64;
     let trace_stderr = std::env::var("TIDESHELL_TRACE").is_ok_and(|v| v == "stderr");
     let mut printed: Vec<String> = Vec::new();
     loop {
@@ -303,6 +306,12 @@ fn main() {
                 Some(e) => e,
                 None => continue,
             };
+            if matches!(ev, Input::Down { .. }) && now_ms.saturating_sub(last_hint) >= 500 {
+                last_hint = now_ms;
+                if let Some(h) = &hint {
+                    let _ = std::fs::write(h, b"");
+                }
+            }
             match ev {
                 // Side surfaces (bar, peeks) are widget surfaces, not edges:
                 // their input goes to their own egui contexts.
