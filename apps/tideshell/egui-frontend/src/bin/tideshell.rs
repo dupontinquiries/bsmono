@@ -19,7 +19,7 @@ use egui::{Pos2, Rect, Vec2};
 use tideshell_core::{Action, Shell, TouchEvent};
 use tideshell_egui::effects::{self, Executor, Outcome, System};
 use tideshell_egui::layer::{shape_for, CursorWant, Gl, Input, Io, Role, POINTER_SLOT};
-use tideshell_egui::{AppTile, FrameInfo, ShellView};
+use tideshell_egui::{key_events, AppTile, FrameInfo, ShellView};
 
 const STRIP_PX: u32 = 28;
 
@@ -33,18 +33,26 @@ struct Shellbox {
     persist: bool,
     ambient: tideshell_egui::sensors::Ambient,
     backlight: tideshell_egui::sensors::BacklightOut,
-    power_key: tideshell_egui::power_key::PowerKey,
-    output_power: tideshell_egui::output_power::OutputPower,
     sensor_status: (String, String),
     /// A dropped-pointer-output notice was already written for the current EI state.
     ei_drop_noted: bool,
+    /// Wet / palm / pocket rejection in front of every consumer.
+    filter: tideshell_core::touchfilter::TouchFilter,
+    filter_stats: tideshell_core::touchfilter::Stats,
+    pending_display_power: Option<bool>,
+    keys: Option<tideshell_egui::keys::Keys>,
+    orientation: tideshell_egui::sensors::OrientationFeed,
+    orientation_status: String,
 }
 
 impl Shellbox {
     fn execute(&mut self, actions: Vec<Action>) {
         for a in actions {
             let o = match &a {
-                Action::SavePrefs if self.persist => effects::save_prefs(&self.shell.prefs),
+                Action::SavePrefs if self.persist => {
+                    self.backlight.set_rate(self.shell.prefs.brightness_rate);
+                    effects::save_prefs(&self.shell.prefs)
+                }
                 Action::SavePrefs => Outcome::Done("prefs not persisted (TIDESHELL_PERSIST=0)".into()),
                 // Only a Ready EI connection moves the pointer. Output sent to a
                 // failed one used to vanish silently (seen on the FP5: the
@@ -73,12 +81,13 @@ impl Shellbox {
                     self.backlight.set(*v);
                     continue;
                 }
+                // Executed by the layer runtime (it owns the Wayland connection).
+                // Brightness writes stop HERE, before the panel goes dark: a
+                // DSI command to an off panel is the journal's dsi error.
                 Action::DisplayPower(on) => {
-                    // Stop brightness writes BEFORE the panel goes dark (a DSI
-                    // command to an off panel is the journal's dsi error).
                     self.backlight.set_display(*on);
-                    self.output_power.set(*on);
-                    Outcome::Done(format!("display power {}", if *on { "on" } else { "off" }))
+                    self.pending_display_power = Some(*on);
+                    continue;
                 }
                 Action::SetGovernor(wanted) => match tideshell_egui::cpu_governor::apply(*wanted) {
                     Ok(chosen) if chosen == *wanted => Outcome::Done(format!("cpu governor: {}", chosen.label())),
@@ -112,6 +121,16 @@ impl Shellbox {
                 self.execute(more);
             }
         }
+        if self.filter.stats != self.filter_stats {
+            let s = self.filter.stats;
+            self.shell.note(format!("touch filter: wet episodes {} dropped {} jumps {} excess {}", s.wet_episodes, s.dropped_wet, s.cancelled_jump, s.dropped_excess));
+            self.filter_stats = s;
+        }
+        let os = self.orientation.status();
+        if os != self.orientation_status {
+            self.shell.note(os.clone());
+            self.orientation_status = os;
+        }
         let st = (self.ambient.status(), self.backlight.status());
         if st != self.sensor_status {
             if st.0 != self.sensor_status.0 {
@@ -130,6 +149,30 @@ impl Shellbox {
                 self.ei_drop_noted = false;
             }
         }
+    }
+}
+
+/// Touch events through the rejection filter, in screen coordinates. The
+/// pointer (slot -1) is never filtered. A rejected contact becomes a Cancel.
+fn filter_input(f: &mut tideshell_core::touchfilter::TouchFilter, io: &Io, ev: Input, now: u64) -> Option<Input> {
+    let to_screen = |role: Role, x: f32, y: f32| io.to_screen(role, x, y).unwrap_or((x, y));
+    let verdict = match ev {
+        Input::Down { role, slot, x, y, .. } if slot != POINTER_SLOT => {
+            let (sx, sy) = to_screen(role, x, y);
+            f.filter(TouchEvent::Down { slot, x: sx, y: sy, t: now })
+        }
+        Input::Move { role, slot, x, y, .. } if slot != POINTER_SLOT => {
+            let (sx, sy) = to_screen(role, x, y);
+            f.filter(TouchEvent::Move { slot, x: sx, y: sy, t: now })
+        }
+        Input::Up { slot, .. } if slot != POINTER_SLOT => f.filter(TouchEvent::Up { slot, t: now }),
+        Input::Cancel => f.filter(TouchEvent::Cancel),
+        _ => return Some(ev),
+    };
+    match verdict {
+        Some(TouchEvent::Cancel) => Some(Input::Cancel),
+        Some(_) => Some(ev),
+        None => None,
     }
 }
 
@@ -220,11 +263,10 @@ fn main() {
         std::process::exit(1)
     });
 
-    // The backlight writer must hear when the COMPOSITOR blanks the screen
-    // (lock screen, idle) -- not only tideshell's own power key -- so the
-    // screen-power client reports every mode change to it.
+    // The backlight writer also hears when the COMPOSITOR blanks the screen
+    // (lock screen, idle): the layer runtime's power objects report every
+    // mode change, forwarded in the frame loop (`io.display_on()`).
     let backlight = tideshell_egui::sensors::BacklightOut::spawn(std::path::Path::new("/sys"), zbus::blocking::Connection::system().ok());
-    let output_power = tideshell_egui::output_power::OutputPower::spawn_observing(backlight.display_notifier());
     let mut sb = Shellbox {
         shell: Shell::new(prefs, (0.0, 0.0)),
         view: ShellView::default(),
@@ -235,11 +277,23 @@ fn main() {
         persist,
         ambient: tideshell_egui::sensors::Ambient::spawn("/sys".into(), zbus::blocking::Connection::system().ok()),
         backlight,
-        power_key: tideshell_egui::power_key::PowerKey::spawn(zbus::blocking::Connection::system().ok().as_ref()),
-        output_power,
         sensor_status: (String::new(), String::new()),
         ei_drop_noted: false,
+        filter: tideshell_core::touchfilter::TouchFilter::default(),
+        filter_stats: tideshell_core::touchfilter::Stats::default(),
+        pending_display_power: None,
+        keys: None,
+        orientation: tideshell_egui::sensors::OrientationFeed::spawn(zbus::blocking::Connection::system().ok()),
+        orientation_status: String::new(),
     };
+    {
+        let found = tideshell_egui::keys::discover(std::path::Path::new("/sys"), std::path::Path::new("/dev/input"));
+        let bus = zbus::blocking::Connection::system().ok();
+        let k = tideshell_egui::keys::Keys::spawn(found, bus.as_ref());
+        sb.shell.note(k.status.clone());
+        sb.keys = Some(k);
+    }
+    sb.backlight.set_rate(sb.shell.prefs.brightness_rate);
     // Auto-brightness ramps from the real current level, or not at all.
     if let Some(l) = sb.backlight.initial {
         sb.shell.set_current_brightness(l);
@@ -259,25 +313,35 @@ fn main() {
         Err(e) => sb.shell.note(format!("wayland toplevels: {e:?}")),
     }
     let apps: Vec<AppTile> = sb.system.launcher.as_ref().map(|l| effects::hatch_tiles(l, 8)).unwrap_or_default();
+    // The palette lists every hatch entry, not just the bar's favourites.
+    let all_apps: Vec<(String, String)> = sb.system.launcher.as_ref().map(|l| l.results().map(|e| (e.id.clone(), e.name.clone())).collect()).unwrap_or_default();
+    sb.shell.set_apps(all_apps);
 
     let ctx = egui::Context::default();
-    let ui_prefs = settings_kit::Prefs::default();
+    let mut ui_prefs = settings_kit::Prefs::default();
+    ui_prefs.palette = sb.shell.prefs.theme.clone();
     uikit_egui::apply_prefs(&ctx, &ui_prefs);
     let palette = uikit_egui::palette_colors_ctx(&ctx, &ui_prefs.palette);
     // Transparent panels: the overlay composites over the apps.
     ctx.global_style_mut(|s| s.visuals.panel_fill = egui::Color32::TRANSPARENT);
-    // The bar's surface has its own egui context (own textures, own input).
-    let bar_ctx = egui::Context::default();
-    uikit_egui::apply_prefs(&bar_ctx, &ui_prefs);
-    let _ = uikit_egui::palette_colors_ctx(&bar_ctx, &ui_prefs.palette);
-    let mut bar_events: Vec<egui::Event> = Vec::new();
-    let mut bar_pos: HashMap<i32, Pos2> = HashMap::new();
+    // Side surfaces (bar, peeks) each get their own egui context (own
+    // textures, own input), created on first use.
+    let mut side_ctx: HashMap<Role, egui::Context> = HashMap::new();
+    let mut side_events: HashMap<Role, Vec<egui::Event>> = HashMap::new();
+    let mut side_pos: HashMap<(Role, i32), Pos2> = HashMap::new();
 
     let t0 = Instant::now();
     let mut overlay_events: Vec<egui::Event> = Vec::new();
     let mut contact_pos: HashMap<i32, Pos2> = HashMap::new();
     let mut last_region: Option<Option<Vec<Rect>>> = None;
     let mut last_poll = 0u64;
+    // comfortgov reads the mtime of this file as "last user input".
+    let hint = std::env::var_os("XDG_RUNTIME_DIR").map(|r| std::path::PathBuf::from(r).join("comfortgov.input"));
+    let mut last_hint = 0u64;
+    // Key repeat: the held key's events and when to repeat them next.
+    let mut held: Option<(Vec<egui::Event>, u64)> = None;
+    let mut last_power_status = String::new();
+    let mut last_display_on: Option<bool> = None;
     let trace_stderr = std::env::var("TIDESHELL_TRACE").is_ok_and(|v| v == "stderr");
     let mut printed: Vec<String> = Vec::new();
     loop {
@@ -296,10 +360,11 @@ fn main() {
         while let Ok(lux) = sb.ambient.rx.try_recv() {
             sb.shell.on_lux(lux, now_ms);
         }
-        // Collected before `actions` exists yet (declared below, once the
-        // frame's real input is in hand) and replayed into it there -- one
-        // path, one set of tests, whichever button triggered it.
-        let power_presses = sb.power_key.drain().count();
+        let readings: Vec<String> = sb.orientation.rx.try_iter().collect();
+        for o in readings {
+            let out = sb.shell.on_orientation(&o, now_ms);
+            sb.execute(out);
+        }
         if let Some(screen) = io.screen() {
             if screen != sb.shell.screen {
                 sb.shell.set_screen(screen);
@@ -308,30 +373,35 @@ fn main() {
         io.set_right_enabled(sb.shell.recognizer.cfg.right_enabled);
 
         // Strips -> recognizer (screen coords). Overlay -> egui events.
+        // Real touches (not the pointer) pass the rejection filter first.
         let mut actions = Vec::new();
-        // Each press asks the SAME question `Shell::power_key` already answers
-        // for the on-screen button (lock, fade, wake) -- one path, one set of
-        // tests, whichever button triggered it.
-        for _ in 0..power_presses {
-            actions.extend(sb.shell.power_key());
-        }
         for ev in input {
+            let ev = match filter_input(&mut sb.filter, &io, ev, now_ms) {
+                Some(e) => e,
+                None => continue,
+            };
+            if matches!(ev, Input::Down { .. }) && now_ms.saturating_sub(last_hint) >= 500 {
+                last_hint = now_ms;
+                if let Some(h) = &hint {
+                    let _ = std::fs::write(h, b"");
+                }
+            }
             match ev {
-                // The bar is a widget surface, not an edge: its input goes to
-                // its own egui context (it owns the right edge; see prefs).
-                Input::Down { role: Role::Bar, slot, x, y, .. } => {
-                    bar_pos.insert(slot, Pos2::new(x, y));
-                    bar_events.extend(contact_events(slot, egui::TouchPhase::Start, Pos2::new(x, y)));
+                // Side surfaces (bar, peeks) are widget surfaces, not edges:
+                // their input goes to their own egui contexts.
+                Input::Down { role, slot, x, y, .. } if role.is_side() => {
+                    side_pos.insert((role, slot), Pos2::new(x, y));
+                    side_events.entry(role).or_default().extend(contact_events(slot, egui::TouchPhase::Start, Pos2::new(x, y)));
                 }
-                Input::Move { role: Role::Bar, slot, x, y, .. } => {
-                    bar_pos.insert(slot, Pos2::new(x, y));
-                    bar_events.extend(contact_events(slot, egui::TouchPhase::Move, Pos2::new(x, y)));
+                Input::Move { role, slot, x, y, .. } if role.is_side() => {
+                    side_pos.insert((role, slot), Pos2::new(x, y));
+                    side_events.entry(role).or_default().extend(contact_events(slot, egui::TouchPhase::Move, Pos2::new(x, y)));
                 }
-                Input::Up { role: Role::Bar, slot, .. } => {
-                    let pos = bar_pos.remove(&slot).unwrap_or(Pos2::ZERO);
-                    bar_events.extend(contact_events(slot, egui::TouchPhase::End, pos));
+                Input::Up { role, slot, .. } if role.is_side() => {
+                    let pos = side_pos.remove(&(role, slot)).unwrap_or(Pos2::ZERO);
+                    side_events.entry(role).or_default().extend(contact_events(slot, egui::TouchPhase::End, pos));
                 }
-                Input::Hover { role: Role::Bar, x, y } => bar_events.push(egui::Event::PointerMoved(Pos2::new(x, y))),
+                Input::Hover { role, x, y } if role.is_side() => side_events.entry(role).or_default().push(egui::Event::PointerMoved(Pos2::new(x, y))),
                 Input::Down { role: Role::Overlay, slot, x, y, .. } => {
                     contact_pos.insert(slot, Pos2::new(x, y));
                     overlay_events.extend(contact_events(slot, egui::TouchPhase::Start, Pos2::new(x, y)));
@@ -346,6 +416,16 @@ fn main() {
                 }
                 Input::Hover { role: Role::Overlay, x, y } => overlay_events.push(egui::Event::PointerMoved(Pos2::new(x, y))),
                 Input::Hover { .. } => {}
+                Input::Key { pressed, keysym, utf8, ctrl, alt, shift } => {
+                    let ev = key_events(pressed, keysym, &utf8, ctrl, alt, shift, false);
+                    if pressed {
+                        let (rate, delay) = io.st_repeat();
+                        held = (rate > 0).then(|| (key_events(true, keysym, &utf8, ctrl, alt, shift, true), now_ms + delay.max(0) as u64));
+                    } else {
+                        held = None;
+                    }
+                    overlay_events.extend(ev);
+                }
                 Input::Down { role, slot, x, y, .. } => {
                     if let Some((sx, sy)) = io.to_screen(role, x, y) {
                         actions.extend(sb.shell.on_edge_touch(TouchEvent::Down { slot, x: sx, y: sy, t: now_ms }));
@@ -364,55 +444,117 @@ fn main() {
                 }
             }
         }
+        if let Some((ev, next)) = &mut held {
+            if now_ms >= *next {
+                overlay_events.extend(ev.iter().cloned());
+                let (rate, _) = io.st_repeat();
+                *next = now_ms + (1000 / rate.max(1)) as u64;
+            }
+        }
+        // Hardware keys: power = sleep/wake, volume = a 5 % fade.
+        let presses: Vec<tideshell_egui::keys::KeyPress> = sb.keys.as_ref().map(|k| k.rx.try_iter().collect()).unwrap_or_default();
+        for k in presses {
+            use tideshell_core::control_center::SliderKind;
+            use tideshell_egui::keys::KeyPress;
+            let v = sb.shell.drawer.volume;
+            actions.extend(match k {
+                KeyPress::Power => sb.shell.power_key(),
+                KeyPress::VolumeUp => sb.shell.set_slider(SliderKind::Volume, (v + 0.05).min(1.0)),
+                KeyPress::VolumeDown => sb.shell.set_slider(SliderKind::Volume, (v - 0.05).max(0.0)),
+            });
+        }
         actions.extend(sb.shell.tick(now_ms));
         sb.execute(actions);
+        if let Some(on) = sb.pending_display_power.take() {
+            let msg = io.set_display_power(on);
+            sb.shell.note(msg);
+        }
+        // The compositor's view of the display, whoever changed it, reaches
+        // the backlight writer: no DSI commands to a dark panel, and the level
+        // re-asserted when it comes back on.
+        let display_on = io.display_on();
+        if display_on != last_display_on {
+            last_display_on = display_on;
+            if let Some(on) = display_on {
+                sb.backlight.set_display(on);
+            }
+        }
+        if io.power_status() != last_power_status {
+            last_power_status = io.power_status();
+            sb.shell.note(last_power_status.clone());
+        }
+        // Keys go to the overlay only while it shows something typed into.
+        io.set_overlay_keyboard(sb.shell.palette.open || sb.view.settings_open());
 
         if now_ms.saturating_sub(last_poll) >= 100 {
             last_poll = now_ms;
             sb.poll_world();
         }
 
-        // Bar: its own surface with an exclusive zone (right-bar layout only).
-        let geom = ShellView::bar_geometry(&sb.shell);
-        io.ensure_bar(geom.is_some(), geom.map_or(0, |g| g.0), geom.map_or(0, |g| g.1));
-        let bar_now = io.bar();
-        // Maximized windows still laid out under the bar get re-maximized
+        // Side surfaces, each with an exclusive zone: the bar (right-bar
+        // layout) and the two carousel peeks (carousel mode). Each has its
+        // own egui context, input queue and EGL window.
+        let bar_geom = ShellView::bar_geometry(&sb.shell);
+        let peek = sb.shell.peek_reserve().round() as u32;
+        let sides: [(Role, Option<(u32, i32)>); 3] = [
+            (Role::Bar, bar_geom),
+            (Role::PeekLeft, (peek > 0).then_some((peek, peek as i32))),
+            (Role::PeekRight, (peek > 0).then_some((peek, peek as i32))),
+        ];
+        let mut reserved = 0.0;
+        for (role, geom) in sides {
+            io.ensure_side(role, geom.is_some(), geom.map_or(0, |g| g.0), geom.map_or(0, |g| g.1));
+            if let (Some(_), Some((_, r))) = (io.side(role), geom) {
+                reserved += r as f32;
+            }
+        }
+        // Maximized windows still laid out under a zone get re-maximized
         // (see Shell::reflow_for_zone for why cosmic-comp needs this).
-        if let (Some(_), Some((_, reserve))) = (&bar_now, geom) {
-            let out = sb.shell.reflow_for_zone(reserve as f32);
+        if reserved > 0.0 {
+            let out = sb.shell.reflow_for_zone(reserved);
             sb.execute(out);
         }
-        match bar_now {
-            Some(t) => {
-                t.prepare(&mut io);
-                let size_px = t.size_px();
-                let (w, h) = t.logical;
-                if gl.bind(Role::Bar, &t.surface, size_px).is_ok() {
-                    let mut raw = egui::RawInput {
-                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w as f32, h as f32))),
-                        time: Some(t0.elapsed().as_secs_f64()),
-                        events: std::mem::take(&mut bar_events),
-                        focused: true,
-                        ..Default::default()
-                    };
-                    raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(t.scale);
-                    let info = FrameInfo { apps: &apps, time: tideshell_egui::sensors::local_time(), battery: None };
-                    let mut bar_actions = Vec::new();
-                    let out = bar_ctx.run_ui(raw, |ui| {
-                        egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
-                            bar_actions = sb.view.bar_ui(ui, &mut sb.shell, &palette, &info);
-                        });
-                    });
-                    sb.execute(bar_actions);
-                    let prims = bar_ctx.tessellate(out.shapes, out.pixels_per_point);
-                    if let Err(e) = gl.paint(Role::Bar, size_px, out.pixels_per_point, &prims, &out.textures_delta) {
-                        eprintln!("tideshell: bar: {e}");
-                    }
-                }
+        for (role, _) in sides {
+            let Some(t) = io.side(role) else {
+                gl.unbind(role);
+                side_events.remove(&role);
+                continue;
+            };
+            t.prepare(&mut io);
+            let size_px = t.size_px();
+            let (w, h) = t.logical;
+            if gl.bind(role, &t.surface, size_px).is_err() {
+                continue;
             }
-            None => {
-                gl.unbind(Role::Bar);
-                bar_events.clear();
+            let mut raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w as f32, h as f32))),
+                time: Some(t0.elapsed().as_secs_f64()),
+                events: side_events.remove(&role).unwrap_or_default(),
+                focused: true,
+                ..Default::default()
+            };
+            raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(t.scale);
+            let info = FrameInfo { apps: &apps, time: tideshell_egui::sensors::local_time(), battery: None };
+            let mut actions = Vec::new();
+            let ctx_side = side_ctx.entry(role).or_insert_with(|| {
+                let c = egui::Context::default();
+                uikit_egui::apply_prefs(&c, &ui_prefs);
+                let _ = uikit_egui::palette_colors_ctx(&c, &ui_prefs.palette);
+                c
+            });
+            let out = ctx_side.run_ui(raw, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
+                    actions = match role {
+                        Role::Bar => sb.view.bar_ui(ui, &mut sb.shell, &palette, &info),
+                        Role::PeekLeft => sb.view.peek_ui(ui, &mut sb.shell, tideshell_core::carousel::Side::Left, &palette),
+                        _ => sb.view.peek_ui(ui, &mut sb.shell, tideshell_core::carousel::Side::Right, &palette),
+                    };
+                });
+            });
+            sb.execute(actions);
+            let prims = ctx_side.tessellate(out.shapes, out.pixels_per_point);
+            if let Err(e) = gl.paint(role, size_px, out.pixels_per_point, &prims, &out.textures_delta) {
+                eprintln!("tideshell: {role:?}: {e}");
             }
         }
 

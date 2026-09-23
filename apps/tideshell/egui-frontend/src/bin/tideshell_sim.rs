@@ -2,7 +2,7 @@
 //! windows that obey the shell's Actions (activate, close, maximize, launch).
 //!
 //!   cargo run --release -- [--trace] [--live] [--persist] [--layout right-bar]
-//!                          [--demo drawer|switcher|hold|bar|trackpad|fatcursor|settings|swipe]
+//!                          [--demo drawer|switcher|hold|palette|bar|trackpad|fatcursor|carousel|settings|swipe]
 //!
 //! * Mouse = one finger. Edge zones are 28 px: pull from the top, swipe or
 //!   hold on the bottom, swipe along the bottom, swipe in from the right
@@ -120,6 +120,7 @@ impl Executor for SimExec<'_> {
                 Outcome::Done(String::new())
             }
             Action::DisplayPower(on) => Outcome::Done(format!("sim: display {}", if *on { "on" } else { "off" })),
+            Action::Rotate(deg) => Outcome::Done(format!("sim: rotate {deg}")),
             Action::HideSystemCursor(on) => {
                 self.world.fat = *on;
                 Outcome::Done(format!("sim: system cursor hidden={on}"))
@@ -281,13 +282,16 @@ impl App {
             "swipe" => drag(&mut self.shell, (w / 2.0, h - 4.0), (w / 2.0, h * 0.62), 30, false),
             "hold" => {
                 let o = self.shell.on_edge_touch(TouchEvent::Down { slot: 9, x: w / 2.0, y: h - 6.0, t: 0 });
-                // tick() past hold_ms opens the arc; then slide onto Keyboard.
+                // tick() past hold_ms opens the palette; slide onto Keyboard.
                 self.shell.tick(1000);
-                if let Some(m) = self.shell.hold.clone() {
-                    let (x, y) = m.centers[1];
-                    self.shell.on_edge_touch(TouchEvent::Move { slot: 9, x, y, t: 1100 });
-                }
+                let g = tideshell_core::palette::Geom::new((w, h));
+                let (x, y, mw, mh) = g.mode_rect(1);
+                self.shell.on_edge_touch(TouchEvent::Move { slot: 9, x: x + mw / 2.0, y: y + mh / 2.0, t: 1100 });
                 o
+            }
+            "palette" => {
+                self.shell.open_palette();
+                vec![]
             }
             "trackpad" => self.shell.toggle_mode(tideshell_core::hold::HoldOption::Trackpad),
             "sleep" => self.shell.power_key(),
@@ -297,6 +301,7 @@ impl App {
                 self.shell.lock.drag_reveal(0.3, 0);
                 vec![]
             }
+            "carousel" => self.shell.toggle_mode(tideshell_core::hold::HoldOption::Carousel),
             "fatcursor" => {
                 let mut p = self.shell.prefs.clone();
                 p.fat_cursor = true;
@@ -395,7 +400,10 @@ impl eframe::App for App {
             let p = ui.painter_at(area);
             p.rect_filled(area, CornerRadius::ZERO, Color32::from_rgb(28, 32, 44));
             // The active window fills the space beside the bar's exclusive zone.
-            let win_r = Rect::from_min_max(area.min, area.max - Vec2::new(ShellView::reserved_right(&self.shell), 0.0));
+            // The active window sits beside the bar's zone and, in carousel
+            // mode, in the centre 80% between the two peek zones.
+            let pk = self.shell.peek_reserve();
+            let win_r = Rect::from_min_max(area.min + Vec2::new(pk, 0.0), area.max - Vec2::new(ShellView::reserved_right(&self.shell) + pk, 0.0));
             if let Some(live) = &self.live {
                 let caps = live.capabilities();
                 let msg = format!("live: {} windows, manager caps {}", self.last_cards.len(), if caps.received { "received" } else { "pending" });
@@ -478,6 +486,7 @@ fn main() -> eframe::Result<()> {
             .map(|(id, n)| AppTile { id: (*id).into(), name: (*n).into() })
             .collect();
     }
+    shell.set_apps(apps.iter().map(|a| (a.id.clone(), a.name.clone())).collect());
     let world = World::new();
     let live = if has("--wayland") {
         match tideshell_egui::wayland::Windows::connect() {
@@ -522,7 +531,8 @@ fn main() -> eframe::Result<()> {
         APP_ID,
         opts,
         Box::new(move |cc| {
-            let prefs = settings_kit::Prefs::default();
+            let mut prefs = settings_kit::Prefs::default();
+            prefs.palette = shell.prefs.theme.clone();
             uikit_egui::apply_prefs(&cc.egui_ctx, &prefs);
             let palette = uikit_egui::palette_colors_ctx(&cc.egui_ctx, &prefs.palette);
             let mut view = ShellView::default();

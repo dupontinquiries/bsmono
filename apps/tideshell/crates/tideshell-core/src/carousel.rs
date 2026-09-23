@@ -1,6 +1,11 @@
-//! Carousel focus mode: one window at a time, maximized, and the bottom-edge
-//! horizontal swipe steps to its neighbour instead of quick-switching by
-//! recency. The ring is frozen when the mode starts (MRU order at that
+//! Carousel focus mode: one window at a time, maximized into the centre
+//! CENTER_FRAC of the screen, with its ring neighbours peeking in the strips
+//! either side. A TAP on a peek cycles to that neighbour: no swipe, no
+//! dragging, one tap. The bottom-edge horizontal swipe still steps too.
+//!
+//! The peeks are the runtime's business (layer surfaces with exclusive
+//! zones, so maximized windows land in the centre); this model says which
+//! window each peek shows and what a tap on it does. The ring is frozen when the mode starts (MRU order at that
 //! moment), so stepping is spatial and predictable: left is always the same
 //! window until you leave the mode.
 //!
@@ -11,6 +16,20 @@
 
 use crate::edge::Dir;
 use crate::{Action, WindowCard};
+
+/// Width fraction the active window gets; the rest is split into two peeks.
+pub const CENTER_FRAC: f32 = 0.8;
+
+/// Width fraction of one peek strip.
+pub fn peek_frac() -> f32 {
+    (1.0 - CENTER_FRAC) / 2.0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Carousel {
@@ -37,6 +56,28 @@ impl Carousel {
     /// Position as (index, count) for a page indicator.
     pub fn position(&self) -> (usize, usize) {
         (self.idx, self.ring.len())
+    }
+
+    /// The window a peek shows: the ring neighbour on that side (wrapping).
+    /// None with fewer than two windows (nothing to cycle to).
+    pub fn peek(&self, side: Side) -> Option<u64> {
+        let n = self.ring.len();
+        if !self.active || n < 2 {
+            return None;
+        }
+        let i = match side {
+            Side::Left => (self.idx + n - 1) % n,
+            Side::Right => (self.idx + 1) % n,
+        };
+        self.ring.get(i).copied()
+    }
+
+    /// A tap on a peek: cycle to the window it shows.
+    pub fn tap_peek(&mut self, side: Side, windows: &[WindowCard]) -> Vec<Action> {
+        match side {
+            Side::Left => self.step(Dir::Back, windows),
+            Side::Right => self.step(Dir::Forward, windows),
+        }
     }
 
     fn focus(&mut self, id: u64, windows: &[WindowCard]) -> Vec<Action> {
@@ -187,6 +228,29 @@ mod tests {
         assert!(c.sync(&[w(1, true), w(2, true), w(3, true), w(9, false)]).is_empty());
         assert_eq!(c.ring(), &[1, 9, 2, 3]);
         assert_eq!(c.current(), Some(1));
+    }
+
+    #[test]
+    fn peeks_show_the_ring_neighbours_and_a_tap_cycles() {
+        let ws = [w(1, true), w(2, true), w(3, true)];
+        let mut c = Carousel::default();
+        assert_eq!(c.peek(Side::Left), None, "inactive: no peeks");
+        c.enter(&[1, 2, 3], &ws);
+        assert_eq!((c.peek(Side::Left), c.peek(Side::Right)), (Some(3), Some(2)), "wraps at the start");
+        assert_eq!(c.tap_peek(Side::Right, &ws), vec![Action::Activate(2)]);
+        assert_eq!((c.current(), c.peek(Side::Left), c.peek(Side::Right)), (Some(2), Some(1), Some(3)));
+        assert_eq!(c.tap_peek(Side::Left, &ws), vec![Action::Activate(1)]);
+        assert_eq!(c.current(), Some(1));
+        // Two windows: both peeks show the same other window.
+        let mut c = Carousel::default();
+        c.enter(&[1, 2], &ws[..2]);
+        assert_eq!((c.peek(Side::Left), c.peek(Side::Right)), (Some(2), Some(2)));
+        // One window: nothing to cycle to.
+        let mut c = Carousel::default();
+        c.enter(&[1], &ws[..1]);
+        assert_eq!((c.peek(Side::Left), c.peek(Side::Right)), (None, None));
+        assert!(c.tap_peek(Side::Right, &ws[..1]).is_empty());
+        assert!((peek_frac() - 0.1).abs() < 1e-6);
     }
 
     #[test]

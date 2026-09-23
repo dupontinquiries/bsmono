@@ -16,6 +16,14 @@
 //!   the zoom convention of browsers, viewers, terminals and toolkits.
 //! * tap, then touch again within [`TAP_DRAG_MS`] and move → left button held
 //!   for the drag ("tap-and-drag"), released when the finger lifts
+//! * tap, tap → a double click
+//!
+//! Tap timing follows libinput's tap state machine: a tap's button PRESS goes
+//! out when the finger lifts, but its RELEASE is held until TAP_DRAG_MS pass
+//! (`tick`) or a second touch begins. A second touch continues the press as a
+//! drag (no second press), so apps see press, motion, release: one drag. The
+//! first version released at once and re-pressed on the second touch; apps
+//! saw click + press + drag, which text views treat as a word-select drag.
 
 use crate::Millis;
 
@@ -87,14 +95,15 @@ pub struct Trackpad {
     moved: bool,
     seq_t0: Millis,
     /// When the last one-finger tap completed, for tap-and-drag.
-    last_tap: Option<Millis>,
+    /// A tap's release, held until this time (or a second touch).
+    pending_release: Option<Millis>,
     drag_lock: bool,
     two: Option<Two>,
 }
 
 impl Default for Trackpad {
     fn default() -> Self {
-        Trackpad { speed: 1.0, fingers: Vec::new(), peak: 0, moved: false, seq_t0: 0, last_tap: None, drag_lock: false, two: None }
+        Trackpad { speed: 1.0, fingers: Vec::new(), peak: 0, moved: false, seq_t0: 0, pending_release: None, drag_lock: false, two: None }
     }
 }
 
@@ -117,12 +126,10 @@ impl Trackpad {
             self.peak = 0;
             self.moved = false;
             self.seq_t0 = t;
-            if self.last_tap.is_some_and(|lt| t.saturating_sub(lt) <= TAP_DRAG_MS) {
-                // Second touch of tap-and-drag: hold the button now so the
-                // drag starts under the pointer, not after the first move.
+            if self.pending_release.take().is_some() {
+                // Second touch while a tap's release is held: the button stays
+                // down and this touch is the drag (or a double tap, see `up`).
                 self.drag_lock = true;
-                self.last_tap = None;
-                out.push(PointerOut::Button { button: Button::Left, pressed: true });
             }
         }
         self.fingers.push(Finger { slot, start: (x, y), last: (x, y), t0: t });
@@ -222,21 +229,43 @@ impl Trackpad {
             return ended; // a pinch is not a tap
         }
         let quick = t.saturating_sub(self.seq_t0) <= TAP_MS;
+        let release = PointerOut::Button { button: Button::Left, pressed: false };
         if self.drag_lock {
             self.drag_lock = false;
-            return vec![PointerOut::Button { button: Button::Left, pressed: false }];
+            if quick && !self.moved && self.peak == 1 {
+                // Tap, tap: the held press becomes the first click, this tap
+                // the second, and the second click's release is held again
+                // (a third tap would make it a triple click).
+                self.pending_release = Some(t + TAP_DRAG_MS);
+                return vec![release, PointerOut::Button { button: Button::Left, pressed: true }];
+            }
+            return vec![release];
         }
         if quick && !self.moved {
-            let button = if self.peak >= 2 { Button::Right } else { Button::Left };
-            if button == Button::Left {
-                self.last_tap = Some(t);
+            if self.peak >= 2 {
+                return vec![
+                    PointerOut::Button { button: Button::Right, pressed: true },
+                    PointerOut::Button { button: Button::Right, pressed: false },
+                ];
             }
-            return vec![
-                PointerOut::Button { button, pressed: true },
-                PointerOut::Button { button, pressed: false },
-            ];
+            self.pending_release = Some(t + TAP_DRAG_MS);
+            return vec![PointerOut::Button { button: Button::Left, pressed: true }];
         }
         vec![]
+    }
+
+    /// Time passes with no touch: a held tap release goes out at its deadline.
+    pub fn tick(&mut self, now: Millis) -> Vec<PointerOut> {
+        if self.pending_release.is_some_and(|d| now >= d) && self.fingers.is_empty() {
+            self.pending_release = None;
+            return vec![PointerOut::Button { button: Button::Left, pressed: false }];
+        }
+        vec![]
+    }
+
+    /// Whether the left button is currently held by a tap or drag.
+    pub fn button_held(&self) -> bool {
+        self.pending_release.is_some() || self.drag_lock
     }
 
     /// Release anything held (overlay hidden, sequence cancelled).
@@ -246,8 +275,7 @@ impl Trackpad {
             out.push(PointerOut::ZoomEnd); // never leave Ctrl held
         }
         self.fingers.clear();
-        self.last_tap = None;
-        if std::mem::take(&mut self.drag_lock) {
+        if self.pending_release.take().is_some() | std::mem::take(&mut self.drag_lock) {
             out.push(PointerOut::Button { button: Button::Left, pressed: false });
         }
         out
@@ -261,12 +289,29 @@ mod tests {
     fn click(b: Button) -> Vec<PointerOut> {
         vec![PointerOut::Button { button: b, pressed: true }, PointerOut::Button { button: b, pressed: false }]
     }
+    const PRESS: PointerOut = PointerOut::Button { button: Button::Left, pressed: true };
+    const RELEASE: PointerOut = PointerOut::Button { button: Button::Left, pressed: false };
 
     #[test]
-    fn one_finger_tap_is_left_click() {
+    fn one_finger_tap_is_a_left_click_with_the_release_held_for_the_drag_timeout() {
         let mut p = Trackpad::default();
         p.down(0, 100.0, 100.0, 0);
-        assert_eq!(p.up(0, 100), click(Button::Left));
+        assert_eq!(p.up(0, 100), vec![PRESS]);
+        assert!(p.button_held());
+        assert!(p.tick(100 + TAP_DRAG_MS - 1).is_empty());
+        assert_eq!(p.tick(100 + TAP_DRAG_MS), vec![RELEASE]);
+        assert!(!p.button_held() && p.tick(9999).is_empty(), "released once");
+    }
+
+    #[test]
+    fn double_tap_is_two_clicks_and_never_a_word_select_drag() {
+        let mut p = Trackpad::default();
+        p.down(0, 100.0, 100.0, 0);
+        let mut out = p.up(0, 80);
+        out.extend(p.down(0, 102.0, 101.0, 200));
+        out.extend(p.up(0, 270));
+        out.extend(p.tick(270 + TAP_DRAG_MS));
+        assert_eq!(out, vec![PRESS, RELEASE, PRESS, RELEASE], "exactly press/release twice: {out:?}");
     }
 
     #[test]
@@ -397,17 +442,22 @@ mod tests {
     }
 
     #[test]
-    fn tap_then_drag_holds_left_until_lift() {
+    fn tap_then_drag_is_one_press_motion_release() {
         let mut p = Trackpad::default();
         p.down(0, 100.0, 100.0, 0);
-        p.up(0, 80);
-        assert_eq!(p.down(0, 100.0, 100.0, 80 + TAP_DRAG_MS), vec![PointerOut::Button { button: Button::Left, pressed: true }]);
-        assert!(matches!(p.motion(0, 160.0, 100.0, 400)[0], PointerOut::Motion { .. }));
-        assert_eq!(p.up(0, 700), vec![PointerOut::Button { button: Button::Left, pressed: false }]);
-        // A late second touch is a fresh touch, not a drag.
+        let mut out = p.up(0, 80);
+        out.extend(p.down(0, 100.0, 100.0, 80 + TAP_DRAG_MS)); // within the window: no second press
+        out.extend(p.motion(0, 160.0, 100.0, 400));
+        out.extend(p.up(0, 700));
+        let buttons: Vec<&PointerOut> = out.iter().filter(|o| matches!(o, PointerOut::Button { .. })).collect();
+        assert_eq!(buttons, vec![&PRESS, &RELEASE], "{out:?}");
+        assert!(out.iter().any(|o| matches!(o, PointerOut::Motion { .. })));
+        // A late second touch is a fresh touch: the first tap has released.
         p.down(0, 100.0, 100.0, 1000);
         p.up(0, 1050);
-        assert!(p.down(0, 100.0, 100.0, 1050 + TAP_DRAG_MS + 1).is_empty());
+        assert_eq!(p.tick(1050 + TAP_DRAG_MS + 1), vec![RELEASE]);
+        assert!(p.down(0, 100.0, 100.0, 1400).is_empty());
+        assert!(!p.button_held());
     }
 
     #[test]
@@ -415,8 +465,11 @@ mod tests {
         let mut p = Trackpad::default();
         p.down(0, 0.0, 0.0, 0);
         p.up(0, 50);
-        p.down(0, 0.0, 0.0, 100);
-        assert_eq!(p.cancel(), vec![PointerOut::Button { button: Button::Left, pressed: false }]);
+        assert_eq!(p.cancel(), vec![RELEASE], "a tap's held release");
+        p.down(0, 0.0, 0.0, 200);
+        p.up(0, 250);
+        p.down(0, 0.0, 0.0, 300);
+        assert_eq!(p.cancel(), vec![RELEASE], "a drag's held button");
         assert!(p.cancel().is_empty());
     }
 }

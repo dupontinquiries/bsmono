@@ -272,6 +272,78 @@ pub fn logind_set_brightness(bus: &Connection, session: &OwnedObjectPath, name: 
     s.call_method("SetBrightness", &("backlight", name, raw)).map(|_| ()).map_err(|e| format!("SetBrightness: {e}"))
 }
 
+// ---- orientation (iio-sensor-proxy accelerometer) ------------------------------
+
+/// Orientation strings ("normal", "left-up", ...) as they change, ~5 Hz.
+pub struct OrientationFeed {
+    pub rx: Receiver<String>,
+    status: Arc<Mutex<String>>,
+}
+
+impl OrientationFeed {
+    pub fn spawn(bus: Option<Connection>) -> OrientationFeed {
+        let (tx, rx) = mpsc::channel();
+        let status = Arc::new(Mutex::new("orientation: starting".to_string()));
+        let st = status.clone();
+        std::thread::Builder::new()
+            .name("tideshell-orientation".into())
+            .spawn(move || {
+                let set = |s: String| *st.lock().unwrap() = s;
+                let Some(bus) = bus else {
+                    set("orientation: no system bus".into());
+                    return;
+                };
+                let p = match sensor_proxy(&bus) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        set(format!("orientation: iio-sensor-proxy unavailable ({e})"));
+                        return;
+                    }
+                };
+                match p.get_property::<bool>("HasAccelerometer") {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        set("orientation: iio-sensor-proxy reports no accelerometer".into());
+                        return;
+                    }
+                    Err(e) => {
+                        set(format!("orientation: HasAccelerometer: {e}"));
+                        return;
+                    }
+                }
+                if let Err(e) = p.call_method("ClaimAccelerometer", &()) {
+                    set(format!("orientation: ClaimAccelerometer: {e}"));
+                    return;
+                }
+                set("orientation: iio-sensor-proxy accelerometer".into());
+                let mut last = String::new();
+                loop {
+                    match p.get_property::<String>("AccelerometerOrientation") {
+                        Ok(o) => {
+                            if o != last {
+                                last = o.clone();
+                                if tx.send(o).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            set(format!("orientation: read failed ({e})"));
+                            return;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            })
+            .expect("spawn orientation thread");
+        OrientationFeed { rx, status }
+    }
+
+    pub fn status(&self) -> String {
+        self.status.lock().unwrap().clone()
+    }
+}
+
 // ---- threads -------------------------------------------------------------------
 
 /// Background reader: lux values arrive on `rx` (~4 Hz), `status()` says
@@ -343,6 +415,8 @@ fn ambient_loop(sys: PathBuf, bus: Option<Connection>, tx: Sender<f32>, st: Arc<
 pub struct BacklightOut {
     tx: Option<Sender<BacklightMsg>>,
     status: Arc<Mutex<String>>,
+    /// Write interval in microseconds; `set_rate` changes it live.
+    interval_us: Arc<std::sync::atomic::AtomicU64>,
     /// The level found at startup (None: no readable backlight).
     pub initial: Option<f32>,
 }
@@ -355,34 +429,25 @@ impl BacklightOut {
     /// `spawn` with an explicit brightnessctl path (tests pass a fake one).
     pub fn spawn_with(sys: &Path, bus: Option<Connection>, tool: Option<PathBuf>) -> BacklightOut {
         let status = Arc::new(Mutex::new(String::new()));
+        let interval_us = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000 / 30));
         let Some(bl) = find_backlight(sys) else {
             *status.lock().unwrap() = "backlight: none found under /sys/class/backlight".into();
-            return BacklightOut { tx: None, status, initial: None };
+            return BacklightOut { tx: None, status, interval_us, initial: None };
         };
         let initial = bl.read_level();
         let (tx, rx) = mpsc::channel::<BacklightMsg>();
         let st = status.clone();
+        let iv = interval_us.clone();
         std::thread::Builder::new()
             .name("tideshell-backlight".into())
-            .spawn(move || backlight_loop(bl, bus, tool, rx, st))
+            .spawn(move || backlight_loop(bl, bus, tool, rx, st, iv))
             .expect("spawn backlight thread");
-        BacklightOut { tx: Some(tx), status, initial }
+        BacklightOut { tx: Some(tx), status, interval_us, initial }
     }
 
     pub fn set(&self, level: f32) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(BacklightMsg::Level(level));
-        }
-    }
-
-    /// A callback for `OutputPower::spawn_observing`: tells this writer when
-    /// the COMPOSITOR changes the display's power (lock screen, idle).
-    pub fn display_notifier(&self) -> impl Fn(bool) + Send + 'static {
-        let tx = self.tx.clone();
-        move |on| {
-            if let Some(tx) = &tx {
-                let _ = tx.send(BacklightMsg::Display(on));
-            }
         }
     }
 
@@ -392,6 +457,11 @@ impl BacklightOut {
         if let Some(tx) = &self.tx {
             let _ = tx.send(BacklightMsg::Display(on));
         }
+    }
+
+    /// Maximum write rate in Hz (the loop never writes faster).
+    pub fn set_rate(&self, hz: u32) {
+        self.interval_us.store(1_000_000 / hz.clamp(1, 90) as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn status(&self) -> String {
@@ -414,11 +484,10 @@ pub enum Method {
 /// Minimum spacing between writes: brightnessctl is a process per call and
 /// a ramp produces many steps; coalescing keeps only the newest value.
 pub const MIN_WRITE_INTERVAL: Duration = Duration::from_millis(50);
-/// logind / sysfs. Was one frame of a 90 Hz panel (11 ms): up to 90 DSI
-/// commands a second during every ramp, competing with the display's own
-/// traffic. 30 Hz still ramps smoothly -- the core's steps are coalesced to
-/// the newest -- with a third of the link traffic. Unmeasured on the panel.
-pub const FAST_WRITE_INTERVAL: Duration = Duration::from_millis(33);
+// The write rate on the cheap paths is `BacklightOut::set_rate` (default
+// 30 Hz). It was one frame of a 90 Hz panel: on the FP5 every write is a DSI
+// command to the panel, and up to 90 a second competed with the display's own
+// traffic.
 
 /// `brightnessctl` on PATH, if installed.
 pub fn find_brightnessctl() -> Option<PathBuf> {
@@ -438,7 +507,12 @@ fn brightnessctl_set(tool: &Path, name: &str, raw: u32) -> Result<(), String> {
     }
 }
 
-fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>, rx: Receiver<BacklightMsg>, st: Arc<Mutex<String>>) {
+/// After a failed write, the interval doubles (up to this) and halves back
+/// on each success: a driver that objects to the rate is not hammered.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>, rx: Receiver<BacklightMsg>,
+                  st: Arc<Mutex<String>>, interval_us: Arc<std::sync::atomic::AtomicU64>) {
     let set = |s: String| *st.lock().unwrap() = s;
     let session = bus.as_ref().map(logind_graphical_session);
     // Candidate methods in order; the first that works stays in use, and a
@@ -472,10 +546,15 @@ fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>,
     let mut last_write: Option<std::time::Instant> = None;
     let mut gate = WriteGate::new();
     let mut failures = 0u32;
+    let mut backoff: Option<Duration> = None;
     while let Ok(first) = rx.recv() {
-        // 30 Hz on the cheap paths (logind is one D-Bus call, sysfs one
-        // write); brightnessctl is a process per call, so 20 Hz.
-        let interval = if methods[cur] == Method::Brightnessctl { MIN_WRITE_INTERVAL } else { FAST_WRITE_INTERVAL };
+        // The configured rate on the cheap paths (logind is one D-Bus call,
+        // sysfs one write); brightnessctl is a process per call, so <= 20 Hz.
+        let configured = Duration::from_micros(interval_us.load(std::sync::atomic::Ordering::Relaxed));
+        let mut interval = if methods[cur] == Method::Brightnessctl { configured.max(MIN_WRITE_INTERVAL) } else { configured };
+        if let Some(b) = backoff {
+            interval = interval.max(b);
+        }
         if let Some(t) = last_write {
             let since = t.elapsed();
             if since < interval {
@@ -518,6 +597,7 @@ fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>,
             match r {
                 Ok(()) => {
                     gate.written(raw);
+                    backoff = backoff.and_then(|b| (b > interval * 2).then_some(b / 2));
                     if i == cur {
                         if failures > 0 { set(note(cur, &skipped)); }
                         failures = 0;
@@ -545,7 +625,11 @@ fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>,
                     if i + 1 < methods.len() {
                         i += 1;
                     } else {
-                        set(format!("backlight: cannot set {} (last: {e}) [{}]", bl.name, skipped.join("; ")));
+                        // Every method failed for this write: back off, so a
+                        // driver that objects is not hammered.
+                        backoff = Some(backoff.map_or(interval * 2, |b| (b * 2).min(BACKOFF_MAX)));
+                        set(format!("backlight: cannot set {} (all methods failed; last: {e}; backing off to {:?}) [{}]",
+                                    bl.name, backoff.unwrap(), skipped.join("; ")));
                         break;
                     }
                 }
@@ -739,6 +823,19 @@ mod tests {
             assert!(wait_for(|| std::fs::read_to_string(&path).unwrap_or_default() == raw.to_string()));
         }
         assert!(wait_for(|| out.status().contains("3 in a row")), "abandoned after three: {}", out.status());
+        let _ = std::fs::remove_dir_all(&sys);
+    }
+
+    #[test]
+    fn every_method_failing_is_reported_with_a_backoff() {
+        let sys = tmp("bl-allfail");
+        put(&sys.join("class/backlight/panel/max_brightness"), "255");
+        // A directory where the brightness file should be: every write fails.
+        std::fs::create_dir_all(sys.join("class/backlight/panel/brightness")).unwrap();
+        let out = BacklightOut::spawn_with(&sys, None, None);
+        out.set(0.7);
+        assert!(wait_for(|| out.status().contains("backing off")), "{}", out.status());
+        assert!(out.status().contains("cannot set panel"));
         let _ = std::fs::remove_dir_all(&sys);
     }
 

@@ -24,7 +24,7 @@ path. Expect surprises there; the trace is designed to explain them.
 ## Stage 0 — get the code (on the Mac)
 
 ```sh
-git clone -b tideshell c19unified-025-tideshell-deploy.bundle mono
+git clone c19unified-038-tideshell-merged.bundle mono   # main: the tideshell branch is merged into it
 cd mono && git log --oneline -1          # note this commit in your report
 ```
 
@@ -146,14 +146,19 @@ Try each, and for each note what happened on screen **and** the trace lines:
 | 7 | press and hold on the bottom edge, slide onto Keyboard, lift | `edge pending -> hold`, `hold release -> Some(Keyboard)`, then `succeeded` or `FAILED ... exited N` (+ `keyboard mode off`) |
 | 8 | hold -> Trackpad; drag on the pad; tap | pointer moves; tap clicks (needs `ei: Ready`) |
 | 9 | drawer -> Shell settings -> Right-hand bar -> Apply | bar appears on the right; maximized windows narrow beside it (`reflow ... maximized window(s)`) |
+| 11 | at start: read the `keys:` line; then press the POWER key once; wait; triple-tap the screen | `keys: <device names>; logind power-key inhibitor held` (if it says `cannot open ... input group`, run `sudo adduser user input`, log out and in, retry); power key -> `power key`, `cover shown`, `display off`, `output power: set off on 1 output(s)` and the screen goes dark WITHOUT powering off; triple tap -> `triple tap: wake`, `output power: set on`. If the phone powers off instead, the inhibitor was not held: report the `keys:` line |
+| 12 | press volume up / down | `-> SetSlider(Volume, ...)` then `ok: volume fade 0.xx -> 0.yy` and the level changes smoothly (needs `wpctl`, i.e. PipeWire/WirePlumber; else `FAILED: wpctl ...`) |
+| 13 | turn the phone to landscape, hold it there | `orientation: iio-sensor-proxy accelerometer` at start; after ~0.5 s in landscape `rotate LeftUp` (or RightUp) then `ok: rotated DSI-1 to 90`; the screen rotates. If it rotates the WRONG way, set `shell.rotate.flip = on`. Needs `wlr-randr` (`apk add wlr-randr`); a 45° tilt or laying it flat must not rotate. `shell.rotate.auto = off` disables |
 | 10 | at start: read the `ambient:` and `backlight:` lines; then cover the light sensor (top bezel) for 5 s, uncover | ideally `ambient: iio-sensor-proxy (lux)` and `backlight: <name> (max N) via logind ...`; screen dims ~3 s after covering, brightens quickly after uncovering. `no light sensor found` = time of day only (report it); `cannot set` = neither logind nor sysfs worked (report the line) |
+| 14 | lock the phone (let cosmic blank it, or the power key), wait 10 s, wake it; then leave it in a dark place 30 s and look | on lock `output power: compositor reports Off (output 0)`, on wake `... On (output 0)` -- tideshell now SEES cosmic's own blanking. While off, auto-brightness must write nothing: `journalctl -k -b \| grep -ci dsi` should not grow across the lock (it grew constantly before). After wake the brightness is re-asserted (screen not stuck dark). In the dark the screen is DIM, never black: the floor is raw 16 of 4095 (was 1, visually off) -- if 16 is still too dark or too bright, report it; it is one constant, `raw_floor` in sensors.rs |
+| 15 | at start: read the `session env:` lines; then open the Keyboard mode (row 7) | `tideshell: session env: systemctl WAYLAND_DISPLAY ...` and `... dbus-update-activation-environment ...` (each `failed:` line names why). Re-run rusty-board's `scripts/install.sh` first so it installs the D-Bus activation file; then `busctl --user list --activatable \| grep -i rustyboard` lists it, and the keyboard starts on demand instead of `not activatable` |
 
 Also capture screenshots if `grim` is available
 (`WAYLAND_DISPLAY=... grim ~/ts-N.png`) for #2, #5, #9.
 
 **Gate:** tideshell stays running, strips visible, #2 and #5 work.
 
-**Report:** `~/tideshell-run.log`, the table filled in, screenshots, and for row 10 the output of `busctl --system list | grep -i sensorproxy` and `ls /sys/class/backlight/`.
+**Report:** `~/tideshell-run.log`, the table filled in, screenshots, the `journalctl -k -b | grep -ci dsi` count before and after row 14, and for row 10 the output of `busctl --system list | grep -i sensorproxy` and `ls /sys/class/backlight/`; for row 11, `id` and `ls -l /dev/input/`.
 
 If a gesture does nothing, the trace says why: no `edge pending` line = the
 touch never reached the strip (edge dead zone / cosmic-panel on top); an
@@ -201,6 +206,28 @@ sudo systemctl restart display-manager      # logs the session out
 then `sudo systemctl restart display-manager`. Do not do this stage without
 ssh access confirmed working, and never on a phone whose tunnel is down.
 
+## Stage 8 (optional) — comfortgov, the comfort governor
+
+Separate daemon, `system/comfortgov` in the bundle (no dependencies). Build
+it on the phone, probe, dry-run, and only then apply:
+
+```sh
+cd ~/src/tideshell/system/comfortgov && cargo build --release
+./target/release/comfortgov --probe                # report this output
+./target/release/comfortgov | head -50             # dry run: decisions, nothing written
+sudo ./target/release/comfortgov --apply --hint /run/user/$(id -u)/comfortgov.input
+```
+
+The probe prints each cluster's OPP table and the heuristic knee; the
+skin sensor it picked (report which); battery; MGLRU/PSI availability.
+tideshell touches the hint file on every touch, so with both running the
+governor sees your input. Undo: stop it; the kernel's defaults return at
+the next boot (or `echo` the cpuinfo min/max back into scaling_min/max_freq).
+
+**Report:** the probe output, a minute of dry-run log while you use the
+phone (tap around, then leave it alone), and whether anything felt rough
+or warm with --apply.
+
 ## Rollback summary
 
 | what | undo |
@@ -210,6 +237,7 @@ ssh access confirmed working, and never on a phone whose tunnel is down.
 | cursor hidden after a crash in fat-cursor mode | start tideshell once (restores), or `rm ~/.config/cosmic/com.system76.CosmicComp/v1/cursor_hide_timeout` |
 | settings | `rm ~/.config/tideshell/prefs` |
 | patched cosmic-comp | `sudo apk fix cosmic-comp` |
+| comfortgov limits | `sudo systemctl stop comfortgov` (or Ctrl-C), then reboot or restore cpuinfo min/max into scaling_min/max_freq |
 
 ## What to send back
 

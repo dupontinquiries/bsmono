@@ -19,24 +19,70 @@ pub mod wayland;
 pub mod ei;
 #[cfg(feature = "layer")]
 pub mod layer;
+
+/// A key from the compositor (X keysym + the UTF-8 it produced) as egui
+/// events: a Key event for keys egui names, plus a Text event for printable
+/// input (not with Ctrl/Alt held, not control characters). Pure.
+pub fn key_events(pressed: bool, keysym: u32, utf8: &str, ctrl: bool, alt: bool, shift: bool, repeat: bool) -> Vec<egui::Event> {
+    // X11 keysym values (xkbcommon's keysyms.rs), spelled out so this stays
+    // testable without the layer feature.
+    const BACKSPACE: u32 = 0xff08;
+    const TAB: u32 = 0xff09;
+    const RETURN: u32 = 0xff0d;
+    const ESCAPE: u32 = 0xff1b;
+    const HOME: u32 = 0xff50;
+    const LEFT: u32 = 0xff51;
+    const UP: u32 = 0xff52;
+    const RIGHT: u32 = 0xff53;
+    const DOWN: u32 = 0xff54;
+    const END: u32 = 0xff57;
+    const DELETE: u32 = 0xffff;
+    const KP_ENTER: u32 = 0xff8d;
+    let modifiers = egui::Modifiers { alt, ctrl, shift, mac_cmd: false, command: ctrl };
+    let key = match keysym {
+        BACKSPACE => Some(egui::Key::Backspace),
+        TAB => Some(egui::Key::Tab),
+        RETURN | KP_ENTER => Some(egui::Key::Enter),
+        ESCAPE => Some(egui::Key::Escape),
+        HOME => Some(egui::Key::Home),
+        END => Some(egui::Key::End),
+        LEFT => Some(egui::Key::ArrowLeft),
+        UP => Some(egui::Key::ArrowUp),
+        RIGHT => Some(egui::Key::ArrowRight),
+        DOWN => Some(egui::Key::ArrowDown),
+        DELETE => Some(egui::Key::Delete),
+        0x20 => Some(egui::Key::Space),
+        // Letters and digits: from the keysym, which Latin keysyms share with
+        // Unicode, so a RELEASE (no text) still names its key; utf8 alone
+        // lost every release and egui kept the key "down" (found by a test).
+        _ => match char::from_u32(keysym) {
+            Some(c) if c.is_ascii_alphanumeric() => egui::Key::from_name(&c.to_ascii_uppercase().to_string()),
+            _ => None,
+        },
+    };
+    let mut out = Vec::new();
+    if let Some(k) = key {
+        out.push(egui::Event::Key { key: k, physical_key: None, pressed, repeat, modifiers });
+    }
+    if pressed && !ctrl && !alt && !utf8.is_empty() && !utf8.chars().any(|c| c.is_control()) {
+        out.push(egui::Event::Text(utf8.to_string()));
+    }
+    out
+}
 #[cfg(feature = "sensors")]
 pub mod sensors;
-/// The hardware power button: an evdev reader plus a logind inhibitor. Needs
-/// only libc and zbus, like `sensors`, so it shares that feature gate.
-#[cfg(feature = "sensors")]
-pub mod power_key;
-/// Screen power via wlr-output-power-management-v1, on its own connection.
-/// Shares `layer`'s wayland-client + wayland-protocols-wlr, though it needs
-/// neither EGL nor a layer surface itself.
-#[cfg(feature = "layer")]
-pub mod output_power;
 /// cpupower's scaling governor, over sysfs. Pure std, no feature gate needed.
 pub mod cpu_governor;
+/// Hardware keys -- power and volume -- from evdev, with the logind power-key
+/// inhibitor. (Supersedes this branch's `power_key`, which handled power only;
+/// screen power likewise lives in the layer runtime now, replacing the
+/// separate-connection `output_power`.)
+#[cfg(feature = "sensors")]
+pub mod keys;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
 use tideshell_core::bar::{self, BarWidget};
 use tideshell_core::control_center::{QuickKind, SliderKind, Stage};
-use tideshell_core::hold::HoldOption;
 use tideshell_core::prefs::{Layout, ShellPrefs};
 use tideshell_core::switcher::Style;
 use tideshell_core::{Action, Shell, TouchEvent};
@@ -81,8 +127,9 @@ pub struct ShellView {
     /// a feedback loop, seen live in nested cosmic-comp. Only the
     /// simulator's fake cursor turns this on.
     pub pointer_pad: bool,
-    /// The bar is drawn on its own surface (`bar_ui`), not in the overlay.
-    /// The layer runtime sets this; the simulator keeps it off.
+    /// The bar and the carousel peeks are drawn on their own surfaces
+    /// (`bar_ui`, `peek_ui`), not in the overlay. The layer runtime sets
+    /// this; the simulator keeps it off and draws them in-window.
     pub bar_surface: bool,
     owners: Vec<(i32, Owner)>,
     touch_seen: bool,
@@ -90,6 +137,8 @@ pub struct ShellView {
     card_drag: f32,
     /// Cover drag in progress: (slot, start y).
     cover_drag: Option<(i32, f32)>,
+    /// The palette's search field has been given focus for this opening.
+    palette_focused: bool,
     bar_drag: f32,
     sheet: SettingsSheet,
 }
@@ -147,10 +196,11 @@ impl ShellView {
         shell.drawer.is_visible()
             || shell.switcher.open
             || shell.hold.is_some()
+            || shell.palette.is_visible()
             || shell.swipe_up > 0.0
             || shell.peek_dx.abs() > 1.0
             || shell.modes.trackpad
-            || shell.carousel.is_active()
+            || (shell.carousel.is_active() && !self.bar_surface)
             || (shell.prefs.layout == Layout::RightBar && !self.bar_surface)
             || self.sheet.open
             || self.show_trace
@@ -164,7 +214,7 @@ impl ShellView {
     /// through to the apps underneath (trackpad pad, bar, or nothing at all
     /// for passive previews and the carousel dots).
     pub fn input_rects(&self, shell: &Shell) -> Option<Vec<Rect>> {
-        if shell.drawer.is_visible() || shell.switcher.open || self.sheet.open || shell.hold.is_some() || shell.lock.is_locked() || shell.sleep.captures_input() {
+        if shell.drawer.is_visible() || shell.switcher.open || self.sheet.open || shell.hold.is_some() || shell.palette.open || shell.lock.is_locked() || shell.sleep.captures_input() {
             return None;
         }
         let size = Vec2::new(shell.screen.0, shell.screen.1);
@@ -176,6 +226,11 @@ impl ShellView {
             let bw = Self::bar_width(shell);
             v.push(Rect::from_min_size(Pos2::new(size.x - bw, 0.0), Vec2::new(bw, size.y)));
         }
+        if shell.carousel.is_active() && !self.bar_surface {
+            let pw = shell.peek_reserve();
+            v.push(Rect::from_min_size(Pos2::ZERO, Vec2::new(pw, size.y)));
+            v.push(Rect::from_min_size(Pos2::new(size.x - Self::reserved_right(shell) - pw, 0.0), Vec2::new(pw, size.y)));
+        }
         Some(v)
     }
 
@@ -185,13 +240,76 @@ impl ShellView {
         (shell.prefs.layout == Layout::RightBar).then(|| (Self::bar_width(shell).round() as u32, shell.prefs.bar_width.round() as i32))
     }
 
+    /// Draw one carousel peek filling this `Ui` (its own layer surface).
+    pub fn peek_ui(&mut self, ui: &mut egui::Ui, shell: &mut Shell, side: tideshell_core::carousel::Side, pal: &PaletteColors) -> Vec<Action> {
+        let area = ui.max_rect();
+        self.peek(ui, shell, side, pal, area)
+    }
+
+    /// A peek strip: the neighbour window's tile (app colour, initial,
+    /// title down the strip) and a chevron. A tap anywhere cycles to it.
+    fn peek(&mut self, ui: &mut egui::Ui, shell: &mut Shell, side: tideshell_core::carousel::Side, pal: &PaletteColors, r: Rect) -> Vec<Action> {
+        use tideshell_core::carousel::Side;
+        let p = ui.painter_at(r);
+        p.rect_filled(r, cr(0), pal.bg_card);
+        let Some(id) = shell.carousel.peek(side) else { return vec![] };
+        let (title, app) = shell
+            .windows()
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| (w.title.clone(), w.app_id.clone()))
+            .unwrap_or_default();
+        let inset = r.shrink2(Vec2::new(4.0, 40.0));
+        p.rect_filled(inset, cr(10), with_alpha(app_color(&app), 0.9));
+        p.text(inset.center_top() + Vec2::new(0.0, 26.0), Align2::CENTER_CENTER, initial(&title), FontId::proportional(20.0), Color32::WHITE);
+        // Title down the strip, one character per line, capped.
+        let chars: String = title.chars().take(14).collect();
+        for (i, ch) in chars.chars().enumerate() {
+            p.text(inset.center_top() + Vec2::new(0.0, 58.0 + 16.0 * i as f32), Align2::CENTER_CENTER, ch, FontId::proportional(13.0), with_alpha(Color32::WHITE, 0.9));
+        }
+        let c = inset.center_bottom() - Vec2::new(0.0, 22.0);
+        let d = if side == Side::Left { -1.0 } else { 1.0 };
+        let s = Stroke::new(2.5, Color32::WHITE);
+        p.line_segment([c + Vec2::new(-6.0 * d, -9.0), c + Vec2::new(6.0 * d, 0.0)], s);
+        p.line_segment([c + Vec2::new(6.0 * d, 0.0), c + Vec2::new(-6.0 * d, 9.0)], s);
+        if ui.interact(r, Id::new(("ts-peek", side == Side::Left)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            return shell.peek_tap(side);
+        }
+        vec![]
+    }
+
     /// Draw the bar filling this `Ui` (its own layer surface).
     pub fn bar_ui(&mut self, ui: &mut egui::Ui, shell: &mut Shell, pal: &PaletteColors, info: &FrameInfo) -> Vec<Action> {
         let area = ui.max_rect();
         self.bar(ui, shell, pal, info, area.min, area.size())
     }
 
+    /// Sunlight look: opaque white surfaces, black text, a saturated accent.
+    /// Translucent dark chrome is what disappears first outdoors on a panel
+    /// that is not sunlight-readable; contrast is the lever the shell has.
+    pub fn sunlight_palette(pal: &PaletteColors) -> PaletteColors {
+        PaletteColors {
+            bg_base: Color32::WHITE,
+            bg_card: Color32::WHITE,
+            bg_raised: Color32::from_gray(232),
+            bg_hover: Color32::from_gray(215),
+            text: Color32::BLACK,
+            text_weak: Color32::from_gray(60),
+            accent: Color32::from_rgb(0, 90, 200),
+            accent_soft: Color32::from_rgb(150, 190, 240),
+            border: Color32::from_gray(120),
+            ..pal.clone()
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, shell: &mut Shell, pal: &PaletteColors, info: &FrameInfo) -> Vec<Action> {
+        let sun;
+        let pal = if shell.brightness_band().sunlight {
+            sun = Self::sunlight_palette(pal);
+            &sun
+        } else {
+            pal
+        };
         let area = ui.max_rect();
         let origin = area.min;
         let size = area.size();
@@ -207,6 +325,14 @@ impl ShellView {
         // Bottom layer first: bar, then overlays above it.
         if shell.prefs.layout == Layout::RightBar && !self.bar_surface {
             out.extend(self.bar(ui, shell, pal, info, origin, size));
+        }
+        if shell.carousel.is_active() && !self.bar_surface {
+            use tideshell_core::carousel::Side;
+            let pw = shell.peek_reserve();
+            let left = Rect::from_min_size(origin, Vec2::new(pw, size.y));
+            let right = Rect::from_min_size(origin + Vec2::new(size.x - Self::reserved_right(shell) - pw, 0.0), Vec2::new(pw, size.y));
+            out.extend(self.peek(ui, shell, Side::Left, pal, left));
+            out.extend(self.peek(ui, shell, Side::Right, pal, right));
         }
         if shell.modes.trackpad {
             let r = Self::pad_rect(size, Self::bar_width(shell)).translate(origin.to_vec2());
@@ -232,33 +358,12 @@ impl ShellView {
                 p.circle_filled(c, if k == i { 4.5 } else { 3.0 }, if k == i { pal.accent } else { pal.text_weak });
             }
         }
-        if let Some(h) = &shell.hold {
-            let o = to(h.origin.0, h.origin.1);
-            p.circle_filled(o, h.radius + h.hit, with_alpha(pal.bg_base, 0.55));
-            for (opt, (x, y)) in HoldOption::ALL.into_iter().zip(h.centers) {
-                let c = to(x, y);
-                let on = match opt {
-                    HoldOption::Carousel => shell.carousel.is_active(),
-                    HoldOption::Keyboard => shell.modes.keyboard,
-                    HoldOption::Trackpad => shell.modes.trackpad,
-                };
-                let hot = h.hover == Some(opt);
-                p.line_segment([o, c], Stroke::new(1.0, with_alpha(pal.text_weak, 0.4)));
-                p.circle_filled(c, if hot { h.hit } else { h.hit * 0.82 }, if hot { pal.accent } else { pal.bg_raised });
-                if on {
-                    p.circle_stroke(c, h.hit * 0.82, Stroke::new(2.5, pal.success));
-                }
-                p.text(c, Align2::CENTER_CENTER, opt.label(), FontId::proportional(12.0), pal.text);
-            }
+        if shell.palette.is_visible() {
+            out.extend(self.palette_sheet(ui, shell, pal, origin, size));
         }
-        // Fat cursor: drawn last, above everything the shell shows.
-        if let Some(f) = &shell.fat {
-            if f.opacity > 0.0 {
-                let c = to(f.shown.0, f.shown.1);
-                // iPadOS look: neutral translucent disc, faint rim, no arrow.
-                p.circle_filled(c, f.radius, Color32::from_black_alpha((105.0 * f.opacity) as u8));
-                p.circle_stroke(c, f.radius, Stroke::new(1.0, Color32::from_white_alpha((70.0 * f.opacity) as u8)));
-            }
+        if shell.settings_requested {
+            shell.settings_requested = false;
+            self.open_settings(shell);
         }
         // Home indicator: the affordance for every bottom-edge gesture.
         let hw = 110.0 + shell.swipe_up * 40.0;
@@ -283,6 +388,7 @@ impl ShellView {
             || shell.switcher.is_streaking()
             || shell.fat.as_ref().is_some_and(|f| f.is_animating())
             || shell.sleep.is_animating()
+            || (shell.palette.is_visible() && !shell.palette.reveal.is_settled())
             || (shell.lock.is_locked() && !shell.lock.reveal.is_settled())
         {
             ui.ctx().request_repaint();
@@ -355,7 +461,7 @@ impl ShellView {
                 let may_pad = slot != MOUSE_SLOT || self.pointer_pad;
                 let owner = if shell.modes.trackpad && !modal && may_pad && pad.contains(Pos2::new(x, y)) {
                     Some(Owner::Pad)
-                } else if shell.recognizer.edge_at(x, y).is_some() && !self.sheet.open {
+                } else if shell.recognizer.edge_at(x, y).is_some() && !self.sheet.open && !shell.palette.open {
                     Some(Owner::Edge)
                 } else {
                     None
@@ -502,6 +608,83 @@ impl ShellView {
                 }
             }
         }
+    }
+
+    /// The command palette: a sheet rising from the bottom (reveal follows
+    /// the engine's DragTransition), the three mode buttons on top, a search
+    /// field, then the rows. Hit-testing is the engine's (`palette::Geom`),
+    /// so a tap here and a hold-and-slide behave identically.
+    fn palette_sheet(&mut self, ui: &mut egui::Ui, shell: &mut Shell, pal: &PaletteColors, origin: Pos2, size: Vec2) -> Vec<Action> {
+        use tideshell_core::hold::HoldOption;
+        use tideshell_core::palette::{Geom, Hit, MODE_ROW_H, PAD, ROW_H, SEARCH_H};
+        let mut out = vec![];
+        let g = Geom::new((size.x, size.y));
+        let reveal = shell.palette.reveal.progress;
+        let dy = (1.0 - reveal) * (size.y - g.sheet_top);
+        let full = Rect::from_min_size(origin, size);
+        let p = ui.painter_at(full);
+        p.rect_filled(full, cr(0), Color32::from_black_alpha((reveal * 120.0) as u8));
+        // One interact over the whole screen, registered first so the
+        // search field (later) wins where they overlap.
+        let bg = ui.interact(full, Id::new("ts-palette-bg"), Sense::click());
+        if bg.clicked() {
+            if let Some(pos) = bg.interact_pointer_pos() {
+                out.extend(shell.palette_tap(pos.x - origin.x, pos.y - origin.y));
+            }
+        }
+        let at = |x: f32, y: f32| origin + Vec2::new(x, y + dy);
+        let sheet = Rect::from_min_max(at(0.0, g.sheet_top), at(size.x, size.y));
+        p.rect_filled(sheet, CornerRadius { nw: 22, ne: 22, sw: 0, se: 0 }, pal.bg_card);
+        p.rect_filled(Rect::from_center_size(sheet.center_top() + Vec2::new(0.0, 7.0), Vec2::new(40.0, 4.0)), cr(2), pal.text_weak);
+        for (i, m) in shell.palette.modes.iter().enumerate() {
+            let (x, y, w, h) = g.mode_rect(i);
+            let r = Rect::from_min_size(at(x, y), Vec2::new(w, h));
+            let on = match m {
+                HoldOption::Carousel => shell.carousel.is_active(),
+                HoldOption::Keyboard => shell.modes.keyboard,
+                HoldOption::Trackpad => shell.modes.trackpad,
+            };
+            let hot = shell.palette.hover == Some(Hit::Mode(i));
+            p.rect_filled(r, cr(14), if hot { pal.accent } else if on { pal.accent_soft } else { pal.bg_raised });
+            p.text(r.center() - Vec2::new(0.0, 10.0), Align2::CENTER_CENTER, initial(m.label()), FontId::proportional(22.0), if hot { pal.bg_base } else { pal.text });
+            p.text(r.center() + Vec2::new(0.0, 16.0), Align2::CENTER_CENTER, m.label(), FontId::proportional(12.0), if hot { pal.bg_base } else { pal.text_weak });
+            if on {
+                p.circle_filled(r.right_top() + Vec2::new(-10.0, 10.0), 4.0, pal.success);
+            }
+        }
+        let sr = Rect::from_min_size(at(PAD, g.search_y()), Vec2::new(size.x - PAD * 2.0, SEARCH_H));
+        p.rect_filled(sr, cr(12), pal.bg_raised);
+        let mut q = shell.palette.query.clone();
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(sr.shrink2(Vec2::new(12.0, 8.0))));
+        let te = egui::TextEdit::singleline(&mut q).id_salt("ts-palette-search").hint_text("Search").frame(egui::Frame::NONE).desired_width(f32::INFINITY);
+        let resp = child.add(te);
+        // Focus the field when the palette opens (a hold that lifted on
+        // nothing, or a tap-open): typing filters at once, no second tap.
+        if shell.palette.open && !self.palette_focused {
+            self.palette_focused = true;
+            resp.request_focus();
+        }
+        if !shell.palette.open {
+            self.palette_focused = false;
+        }
+        if resp.changed() {
+            shell.palette_query(&q);
+        }
+        let rows: Vec<(String, &'static str)> = shell.palette.rows().map(|r| (r.label.clone(), r.hint)).collect();
+        for (i, (label, hint)) in rows.iter().enumerate().take(g.rows_visible()) {
+            let r = Rect::from_min_size(at(PAD, g.row_y(i)), Vec2::new(size.x - PAD * 2.0, ROW_H));
+            let hot = shell.palette.hover == Some(Hit::Row(i));
+            if hot {
+                p.rect_filled(r, cr(10), pal.accent);
+            }
+            p.text(r.left_center() + Vec2::new(14.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(15.0), if hot { pal.bg_base } else { pal.text });
+            p.text(r.right_center() - Vec2::new(14.0, 0.0), Align2::RIGHT_CENTER, *hint, FontId::proportional(11.0), if hot { pal.bg_base } else { pal.text_weak });
+        }
+        if rows.is_empty() {
+            p.text(at(size.x / 2.0, g.row_y(0) + ROW_H / 2.0), Align2::CENTER_CENTER, "No matches", FontId::proportional(13.0), pal.text_weak);
+        }
+        let _ = MODE_ROW_H;
+        out
     }
 
     // ---- previews --------------------------------------------------------------
@@ -1123,6 +1306,22 @@ mod tests {
         view.route_raw(&mut sh, &mut ev, Pos2::ZERO, 0);
         // Only the hover before the press survives; press/drag/release are the recognizer's.
         assert_eq!(ev, vec![egui::Event::PointerMoved(Pos2::new(200.0, 4.0))]);
+    }
+
+    #[test]
+    fn keys_become_egui_keys_and_text() {
+        let ev = key_events(true, 0x61, "a", false, false, false, false);
+        assert!(matches!(ev[0], egui::Event::Key { key: egui::Key::A, pressed: true, .. }));
+        assert_eq!(ev[1], egui::Event::Text("a".into()));
+        assert_eq!(key_events(false, 0x61, "", false, false, false, false).len(), 1, "release: key only, no text");
+        let bs = key_events(true, 0xff08, "\u{8}", false, false, false, false);
+        assert_eq!(bs.len(), 1, "backspace is a key, its control char is not text");
+        assert!(matches!(bs[0], egui::Event::Key { key: egui::Key::Backspace, .. }));
+        let ctrl = key_events(true, 0x61, "a", true, false, false, false);
+        assert_eq!(ctrl.len(), 1, "ctrl+a: key only, no text");
+        assert!(matches!(ctrl[0], egui::Event::Key { modifiers, .. } if modifiers.ctrl && modifiers.command));
+        let e = key_events(true, 0xe9, "\u{e9}", false, false, false, false);
+        assert_eq!(e, vec![egui::Event::Text("\u{e9}".into())], "non-ASCII text has no egui key but is text");
     }
 
     #[test]

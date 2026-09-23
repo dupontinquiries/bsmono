@@ -31,11 +31,14 @@ pub mod control_center;
 pub mod cursor;
 pub mod edge;
 pub mod hold;
+pub mod palette;
 pub mod lock;
 pub mod prefs;
+pub mod rotate;
 pub mod shell;
 pub mod sleep;
 pub mod switcher;
+pub mod touchfilter;
 pub mod trackpad;
 
 pub use shell::Shell;
@@ -99,4 +102,6 @@ pub enum Action {
     HideSystemCursor(bool),
     /// Panel on/off without suspending (zwlr_output_power_v1.set_mode).
     DisplayPower(bool),
+    /// Rotate the output (degrees: 0, 90, 180, 270).
+    Rotate(u32),
 }
