@@ -1,0 +1,26 @@
+# gitmind's aarch64-unknown-linux-musl build image.
+#
+# Built ON: this fleet's musl phone target has no cross-linker in Debian's
+# archive (see cockpit::buildflags::cross_linker's doc) -- podman + this image
+# is the fallback cockpit::podman uses automatically when a local/cross build
+# fails and this target has a known image (cockpit::podman::image_for).
+#
+# `messense/rust-musl-cross:aarch64-musl` already bundles a working
+# `aarch64-linux-musl-gcc` and static OpenSSL (500k+ pulls, actively
+# maintained) -- reused rather than hand-rolled, since a from-scratch Alpine
+# image is exactly how a session once lost time rediscovering one missing
+# package (pkg-config, then dbus-dev) at a time.
+#
+# ADDED HERE: the packages beyond OpenSSL this fleet's apps have needed --
+# pkgconf (bluer/dbus-sys builds need pkg-config at BUILD time, not just a
+# linker) and dbus's static library (bt-kit -> bluer -> libdbus-sys, hard-
+# coded on in voiceterm's own Cargo.toml -- see its rfcomm feature). Extend
+# this list here, in one place, rather than live-patching a running
+# container by hand.
+FROM messense/rust-musl-cross:aarch64-musl
+
+RUN apk add --no-cache pkgconf dbus-dev dbus-static
+
+# `rust-musl-cross` mounts the source at /home/rust/src and runs as this
+# user; cockpit::podman::build_argv relies on exactly this path.
+WORKDIR /home/rust/src

@@ -232,6 +232,43 @@ fn read_head(path: &Path, n: usize) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Build for `target`, falling back to a podman container when the local/cross
+/// attempt fails AND a native podman image exists for `target` -- the
+/// composition `recommend_strategy` describes, applied at RUNTIME rather than
+/// only shown as advice: a person should not have to already know their host
+/// lacks a cross-linker before the right thing happens.
+///
+/// Tries local first even when a cross-linker looks absent: `native` (same
+/// arch+libc) needs no linker at all, and this way one code path covers every
+/// case rather than asking the caller to pre-classify itself. Only on FAILURE,
+/// and only if podman looks usable for this target, is the container tried;
+/// its own failure is reported ALONGSIDE the local one, not instead of it, so
+/// a person is not left choosing which single error to trust.
+pub fn build_with_fallback_logged(
+    app: &str,
+    app_dir: &Path,
+    target: &str,
+    feats: &[String],
+    no_default: bool,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<(PathBuf, u64), String> {
+    match build_locally_logged(app, app_dir, target, feats, no_default, on_line) {
+        Ok(r) => Ok(r),
+        Err(local_err) => {
+            let path_env = tool_path_env();
+            let podman_ok = crate::podman::which_podman(&path_env) && crate::podman::image_for(target).is_some();
+            if !podman_ok {
+                return Err(local_err);
+            }
+            on_line(&format!("• local build failed ({local_err}); podman has a native image for {target} — trying that"));
+            match crate::podman::build_in_container_cancellable(app, app_dir, target, feats, no_default, on_line) {
+                Ok(r) => Ok(r),
+                Err(podman_err) => Err(format!("local: {local_err}\npodman: {podman_err}")),
+            }
+        }
+    }
+}
+
 pub fn build_locally_logged(
     app: &str,
     app_dir: &Path,
@@ -839,4 +876,27 @@ pub fn bundle_refs(path: &str) -> (Vec<String>, Vec<String>) {
         }
     }
     (refs, requires)
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    /// No Cargo.toml -> the local build fails fast and clearly. Podman is
+    /// genuinely absent from THIS machine (confirmed: `podman --version` ->
+    /// "not found"), so this exercises the real "no fallback available"
+    /// branch against the real environment, not a stand-in for it: the local
+    /// error must surface UNCHANGED, with no podman attempt mentioned.
+    #[test]
+    fn without_podman_the_local_error_surfaces_unchanged() {
+        let dir = std::env::temp_dir().join(format!("fallback_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut lines = Vec::new();
+        let err = build_with_fallback_logged("nope", &dir, "aarch64-unknown-linux-musl", &[], false, &mut |l| lines.push(l.to_string()))
+            .unwrap_err();
+        assert!(err.contains("no Cargo.toml"), "{err}");
+        assert!(!err.contains("podman"), "no fallback was attempted, so podman must not appear: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
