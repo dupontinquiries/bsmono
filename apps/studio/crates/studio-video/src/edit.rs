@@ -59,10 +59,55 @@ pub struct Picture {
     /// A clip style transfer, run as a 3D LUT after the grade and before the
     /// kaleidoscope -- the viewport's order.
     pub style: Option<crate::style::Transfer>,
+    /// The clip's fade in / out to black, from the model's fades.
+    pub fade: Option<Fade>,
     /// Effects that change the picture in the preview but that this export
     /// cannot yet reproduce, named for the person exporting. Never silently
     /// dropped: a file that differs from the preview must say so.
     pub unsupported: Vec<String>,
+}
+
+/// A clip's fades, placed on its SOURCE's timeline, in seconds.
+///
+/// On the source timeline, not the cut's, because `edit_list` can split one
+/// clip into several cuts where a higher track covers part of it -- and a cut
+/// that starts halfway through a fade must start half-faded. Applying the
+/// fade to the source before `trim` makes every piece inherit exactly the
+/// right brightness; a fade computed per cut would restart from black.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Fade {
+    /// Fade in from black over `[in_at, in_at + in_len)`; `in_len` 0 = none.
+    pub in_at: f64,
+    pub in_len: f64,
+    /// Fade out to black over `[out_at, out_at + out_len)`; 0 = none.
+    pub out_at: f64,
+    pub out_len: f64,
+}
+
+impl Fade {
+    /// For a clip starting at `src_in` in its source, `len` long, with the
+    /// model's `(fade_in, fade_out)`. `None` when both are zero.
+    pub fn of(src_in: Ticks, len: Ticks, fade_in: Ticks, fade_out: Ticks) -> Option<Fade> {
+        if fade_in.0 <= 0 && fade_out.0 <= 0 {
+            return None;
+        }
+        let (start, l) = (src_in.to_seconds(), len.to_seconds());
+        let (fi, fo) = (fade_in.to_seconds().max(0.0), fade_out.to_seconds().max(0.0));
+        Some(Fade { in_at: start, in_len: fi, out_at: start + l - fo, out_len: fo })
+    }
+
+    /// ffmpeg `fade` filters, each followed by a comma, for the start of a
+    /// cut's chain -- BEFORE its `trim`, so they run on source timestamps.
+    pub fn filters(&self) -> String {
+        let mut f = String::new();
+        if self.in_len > 0.0 {
+            f.push_str(&format!("fade=t=in:st={:.6}:d={:.6},", self.in_at, self.in_len));
+        }
+        if self.out_len > 0.0 {
+            f.push_str(&format!("fade=t=out:st={:.6}:d={:.6},", self.out_at, self.out_len));
+        }
+        f
+    }
 }
 
 impl Picture {
@@ -205,7 +250,10 @@ pub fn edit_list(project: &Project, paths: &BTreeMap<SourceId, PathBuf>, end: Op
                 src_in: c.src_in.saturating_add(s.saturating_sub(c.pos)),
                 len: e.saturating_sub(s),
                 at: s,
-                picture: Picture::of(&c.effects),
+                picture: Picture {
+                    fade: project.fades.get(&c.id).and_then(|(fi, fo)| Fade::of(c.src_in, c.len, *fi, *fo)),
+                    ..Picture::of(&c.effects)
+                },
             });
             covered.push((s, e));
         }
@@ -383,7 +431,8 @@ pub fn render_args_enc(segments: &[Segment], audio: Option<&Path>, out: &Path, w
             Segment::Cut(c) if !c.picture.is_identity() => {
                 let input = inputs.iter().position(|p| *p == c.path).expect("collected above");
                 let (chain, at) = c.picture.filters(w, h);
-                let base = format!("[{input}:v]trim=start={:.6}:duration={:.6},setpts=PTS-STARTPTS,{fit_rgb}{chain}",
+                let fades = c.picture.fade.map(|f| f.filters()).unwrap_or_default();
+                let base = format!("[{input}:v]{fades}trim=start={:.6}:duration={:.6},setpts=PTS-STARTPTS,{fit_rgb}{chain}",
                                    c.src_in.to_seconds(), c.len.to_seconds());
                 match at {
                     None => filter.push_str(&format!("{base},format=yuv420p{label};")),
@@ -394,8 +443,9 @@ pub fn render_args_enc(segments: &[Segment], audio: Option<&Path>, out: &Path, w
             }
             Segment::Cut(c) => {
                 let input = inputs.iter().position(|p| *p == c.path).expect("collected above");
+                let fades = c.picture.fade.map(|f| f.filters()).unwrap_or_default();
                 filter.push_str(&format!(
-                    "[{input}:v]trim=start={:.6}:duration={:.6},setpts=PTS-STARTPTS,{fit}{label};",
+                    "[{input}:v]{fades}trim=start={:.6}:duration={:.6},setpts=PTS-STARTPTS,{fit}{label};",
                     c.src_in.to_seconds(), c.len.to_seconds()));
             }
             Segment::Black { len, .. } => {
@@ -624,6 +674,67 @@ mod tests {
         for f in [red, blue, out, wav] { let _ = std::fs::remove_file(f); }
     }
 
+    /// A fade reaches the cut, on the SOURCE timeline: a clip at 2 s in its
+    /// source, 3 s long, fading in 1 s and out 0.5 s, fades in over source
+    /// 2-3 s and out over 4.5-5 s -- and the filters come BEFORE the trim.
+    #[test]
+    fn a_clip_fade_reaches_the_export_on_the_source_timeline() {
+        let paths: BTreeMap<SourceId, PathBuf> = [(SourceId(1), "a.mp4".into())].into();
+        let mut p = project_with(&paths);
+        clip(&mut p, 1, 1, 1, 0.0, 3.0, 2.0);
+        p.apply(&Op::SetClipFade { id: ClipId(1), fade_in: s(1.0), fade_out: s(0.5) }).unwrap();
+        let list = edit_list(&p, &paths, None);
+        let Segment::Cut(c) = &list[0] else { panic!("{list:?}") };
+        let f = c.picture.fade.expect("the model's fade");
+        assert!((f.in_at - 2.0).abs() < 1e-6 && (f.in_len - 1.0).abs() < 1e-6, "{f:?}");
+        assert!((f.out_at - 4.5).abs() < 1e-6 && (f.out_len - 0.5).abs() < 1e-6, "{f:?}");
+        let fc = render_args(&list, None, Path::new("o.mp4"), 64, 48, 10).into_iter()
+            .skip_while(|a| a != "-filter_complex").nth(1).unwrap();
+        let (fi, fo, tr) = (fc.find("fade=t=in:st=2.000000").unwrap(), fc.find("fade=t=out:st=4.500000").unwrap(), fc.find("trim=").unwrap());
+        assert!(fi < tr && fo < tr, "fades run before the trim: {fc}");
+        assert!(Fade::of(s(0.0), s(1.0), Ticks::ZERO, Ticks::ZERO).is_none(), "no fade, no filter");
+    }
+
+    /// Mean brightness of the centre of a rendered frame at `t`.
+    fn luma_at(out: &Path, t: f64) -> f64 {
+        let px = super::super::frame_rgb(out, s(t), 8, 6).unwrap();
+        px.iter().map(|&v| v as f64).sum::<f64>() / px.len() as f64
+    }
+
+    /// RENDERED: a white clip fading in over its first second and out over its
+    /// last is dark at its start and end and bright in its middle. And a clip
+    /// whose START is covered by a higher track starts HALF-faded where it
+    /// first shows -- the case the source-timeline design exists for; a fade
+    /// restarted per cut would start that piece from black.
+    #[test]
+    fn a_rendered_clip_fades_and_a_covered_start_shows_mid_fade() {
+        if !crate::testkit::ffmpeg_or_skip("a_rendered_clip_fades_and_a_covered_start_shows_mid_fade") { return; }
+        let dir = std::env::temp_dir().join(format!("studio-fade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = |colour: &str| {
+            let path = dir.join(format!("{colour}.mp4"));
+            super::super::run("ffmpeg", &["-y", "-f", "lavfi", "-i", &format!("color=c={colour}:s=64x48:r=20:d=4"),
+                "-c:v", "mpeg4", "-q:v", "2", "-pix_fmt", "yuv420p", "-an", path.to_str().unwrap()]).expect("fixture");
+            path
+        };
+        let (white, red) = (fixture("white"), fixture("red"));
+        let paths: BTreeMap<SourceId, PathBuf> = [(SourceId(1), white), (SourceId(2), red)].into();
+        let mut p = project_with(&paths);
+        // cam B (lower): white 0-3 s, fading in 2 s and out 1 s.
+        clip(&mut p, 1, 1, 2, 0.0, 3.0, 0.0);
+        p.apply(&Op::SetClipFade { id: ClipId(1), fade_in: s(2.0), fade_out: s(1.0) }).unwrap();
+        // cam A (top): red over 0-1 s, covering the first half of the fade-in.
+        clip(&mut p, 2, 2, 1, 0.0, 1.0, 0.0);
+        let out = dir.join("out.mp4");
+        render_with_encoder(&edit_list(&p, &paths, None), None, &out, 64, 48, 20, VideoEncoder::Mpeg4).expect("render");
+        let (at_1_1, mid, near_end) = (luma_at(&out, 1.05), luma_at(&out, 2.0), luma_at(&out, 2.95));
+        // White is ~235-255. Half-way through a 2 s fade-in: ~half bright.
+        assert!(at_1_1 > 80.0 && at_1_1 < 180.0, "the covered clip appears HALF-faded at 1.05 s, not black: {at_1_1:.0}");
+        assert!(mid > 200.0, "fully up by 2 s: {mid:.0}");
+        assert!(near_end < 40.0, "faded out by the clip's end: {near_end:.0}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A real `ffmpeg -encoders` line has a six-character flags column; the
     /// name is the next field.
     fn listing(names: &[&str]) -> String {
@@ -812,7 +923,7 @@ mod tests {
             crop: (0.2, 0.0, 0.0, 0.1), ..Default::default() };
         let c = studio_fx::Color { lift: [0.0, 0.0, 0.1], gamma: [1.0, 1.6, 1.0],
             gain: [0.6, 1.0, 1.0], saturation: 0.7 };
-        let picture = Picture { transform: Some(t), color: Some(c), kaleido: None, style: None, unsupported: vec![] };
+        let picture = Picture { transform: Some(t), color: Some(c), kaleido: None, style: None, fade: None, unsupported: vec![] };
         let seg = Segment::Cut(Cut { path: take.video.clone(), src_in: s(1.0), len: s(1.0), at: s(0.0), picture });
         let out = shoot.dir.join(format!("fx-{}.mp4", std::process::id()));
         render(&[seg], None, &out, w, h, 12).expect("render");

@@ -71,7 +71,9 @@ pub fn layers_at(project: &Project, playhead: Ticks) -> Vec<LayerSpec> {
                 }
                 let kaleido = studio_video::kaleido::Kaleido::of(&c.effects);
                 let style = studio_video::style::Transfer::of(&c.effects);
-                out.push(LayerSpec { path: src.path.clone(), media, transform, mode, opacity, color, kaleido, style });
+                let fade = project.fades.get(&c.id)
+                    .map(|(fi, fo)| fade_gain(c.pos, c.end(), *fi, *fo, playhead)).unwrap_or(1.0);
+                out.push(LayerSpec { path: src.path.clone(), media, transform, mode, opacity, color, kaleido, style, fade });
                 break;
             }
         }
@@ -94,11 +96,35 @@ pub struct LayerSpec {
     pub kaleido: Option<studio_video::kaleido::Kaleido>,
     /// The clip's style transfer, applied as its LUT after the grade.
     pub style: Option<studio_video::style::Transfer>,
+    /// The clip's fade at the playhead: 1.0 full picture, 0.0 black.
+    pub fade: f32,
+}
+
+/// Brightness of a clip at `t` under its fade in / out to black: linear, as
+/// ffmpeg's `fade` filter is, so the preview dims exactly as the file does.
+pub fn fade_gain(pos: Ticks, end: Ticks, fade_in: Ticks, fade_out: Ticks, t: Ticks) -> f32 {
+    let mut g = 1.0f64;
+    if fade_in.0 > 0 {
+        g = g.min(t.saturating_sub(pos).to_seconds() / fade_in.to_seconds());
+    }
+    if fade_out.0 > 0 {
+        g = g.min(end.saturating_sub(t).to_seconds() / fade_out.to_seconds());
+    }
+    g.clamp(0.0, 1.0) as f32
 }
 
 impl LayerSpec {
     /// Grade a fetched frame in place.
     pub fn grade(&self, px: &mut [u8]) {
+        // THE FADE FIRST, as the export does it: there it runs on the source
+        // before trim (so a clip split by a higher track fades correctly),
+        // which puts it before the grade. The consequence is shared by both,
+        // and stated: a grade that lifts blacks lifts a faded-out picture too.
+        if self.fade < 1.0 {
+            for v in px.iter_mut() {
+                *v = (*v as f32 * self.fade + 0.5) as u8;
+            }
+        }
         if let Some(c) = &self.color {
             for p in px.chunks_mut(3) {
                 let o = c.apply([p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0]);
@@ -253,8 +279,10 @@ pub fn show(ui: &mut egui::Ui, project: &Project, playhead: Ticks,
     // appearing or a blend changing re-composites; one track is the old key.
     // Transform and grade are in the key: without them, adjusting either left
     // the old picture on screen until the playhead crossed a half-second.
-    let key = (layers.iter().map(|l| format!("{}@{}:{:?}:{:.2}:{:?}:{:?}", l.path, coarse(l.media), l.mode, l.opacity,
-                                             l.transform, (l.color, l.kaleido, l.style))).collect::<Vec<_>>().join("|"), coarse(media));
+    // The FADE is in the key too: the composite is graded then cached, so
+    // without it a fade would freeze at whatever brightness was cached first.
+    let key = (layers.iter().map(|l| format!("{}@{}:{:?}:{:.2}:{:?}:{:?}:{:.2}", l.path, coarse(l.media), l.mode, l.opacity,
+                                             l.transform, (l.color, l.kaleido, l.style), l.fade)).collect::<Vec<_>>().join("|"), coarse(media));
     if cache.key.as_ref() != Some(&key) && cache.failed.as_ref() != Some(&key) {
         let mut frames: Vec<(Vec<u8>, &LayerSpec)> = Vec::new();
         let mut err = None;
@@ -295,6 +323,43 @@ pub fn show(ui: &mut egui::Ui, project: &Project, playhead: Ticks,
 
 #[cfg(test)]
 mod tests {
+    fn secs(x: f64) -> Ticks { Ticks::from_seconds(x) }
+
+    /// Linear, as ffmpeg's fade: half way through a 2 s fade-in is half
+    /// bright; the fade-out mirrors it; outside both, full.
+    #[test]
+    fn the_preview_fade_matches_the_export_curve() {
+        let g = |t: f64| fade_gain(secs(0.0), secs(3.0), secs(2.0), secs(1.0), secs(t));
+        assert!((g(0.0) - 0.0).abs() < 1e-6);
+        assert!((g(1.0) - 0.5).abs() < 1e-3, "{}", g(1.0));
+        assert!((g(2.0) - 1.0).abs() < 1e-6);
+        assert!((g(2.5) - 0.5).abs() < 1e-3, "{}", g(2.5));
+        assert!(g(2.999) < 0.01);
+        assert_eq!(fade_gain(secs(0.0), secs(3.0), Ticks::ZERO, Ticks::ZERO, secs(1.0)), 1.0, "no fade");
+    }
+
+    /// The model's fade reaches the layer at the playhead, and grading a
+    /// frame through it dims it -- before the colour grade, as the export.
+    #[test]
+    fn a_faded_clip_dims_its_layer() {
+        let mut p = Project::default();
+        p.apply(&studio_core::Op::AddTrack { track: studio_core::Track { id: studio_core::TrackId(1),
+            kind: TrackKind::Video, name: "v".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+        p.apply(&studio_core::Op::AddSource { source: studio_core::Source { id: studio_core::SourceId(1),
+            path: "a.mp4".into(), len: secs(60.0), sample_rate: 48_000, channels: 2,
+            has_video: true, kind: studio_core::SourceKind::File } }).unwrap();
+        p.apply(&studio_core::Op::AddClip { clip: studio_core::Clip { id: studio_core::ClipId(1),
+            source: studio_core::SourceId(1), track: studio_core::TrackId(1), pos: secs(0.0), src_in: secs(0.0),
+            len: secs(4.0), gain: 1.0, effects: vec![] } }).unwrap();
+        p.apply(&studio_core::Op::SetClipFade { id: studio_core::ClipId(1), fade_in: secs(2.0), fade_out: Ticks::ZERO }).unwrap();
+        let l = &layers_at(&p, secs(0.5))[0];
+        assert!((l.fade - 0.25).abs() < 1e-3, "{}", l.fade);
+        let mut px = vec![200u8; 12];
+        l.grade(&mut px);
+        assert!(px.iter().all(|&v| v == 50), "a quarter of 200: {px:?}");
+        assert_eq!(layers_at(&p, secs(3.0))[0].fade, 1.0);
+    }
+
     use super::*;
     use studio_core::{Clip, ClipId, Op, Source, SourceId, Track, TrackId};
 
