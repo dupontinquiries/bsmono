@@ -7,6 +7,11 @@
 //! input-taking surface for that. Waking optionally lands on the lock screen
 //! (`lock_on_sleep`), the phone convention.
 //!
+//! With a proximity sensor, "near" means the screen is covered (a pocket, a
+//! face, a table): the wake detector is off and touches are ignored while
+//! it lasts, plus POCKET_HOLD_MS after it clears so the sensor's own lag
+//! cannot let a pocket tap through.
+//!
 //! The triple-tap detector is strict because a pocket produces touches: a tap
 //! is short (TAP_MAX_MS) and still (TAP_SLOP); three must land within
 //! TRIPLE_WINDOW_MS of the first touch and within CLUSTER px of the first
@@ -21,6 +26,7 @@ pub const TAP_MAX_MS: Millis = 200;
 pub const TAP_SLOP: f32 = 24.0;
 pub const TRIPLE_WINDOW_MS: Millis = 700;
 pub const CLUSTER: f32 = 90.0;
+pub const POCKET_HOLD_MS: Millis = 800;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -48,11 +54,14 @@ pub struct Sleep {
     taps: Vec<(Millis, f32, f32)>,
     /// The touch currently down: (slot, down time, x, y, moved too far).
     down: Option<(i32, Millis, f32, f32, bool)>,
+    /// Proximity "near" (covered) and when it last cleared.
+    near: bool,
+    near_cleared_at: Option<Millis>,
 }
 
 impl Default for Sleep {
     fn default() -> Self {
-        Sleep { phase: Phase::Awake, black: 0.0, lock_on_sleep: true, taps: Vec::new(), down: None }
+        Sleep { phase: Phase::Awake, black: 0.0, lock_on_sleep: true, taps: Vec::new(), down: None, near: false, near_cleared_at: None }
     }
 }
 
@@ -60,6 +69,22 @@ impl Sleep {
     /// Whether touches must be swallowed (opaque input surface mapped).
     pub fn captures_input(&self) -> bool {
         matches!(self.phase, Phase::FadingOut | Phase::Off)
+    }
+
+    /// The proximity sensor: near = covered.
+    pub fn set_near(&mut self, near: bool, now: Millis) {
+        if self.near && !near {
+            self.near_cleared_at = Some(now);
+        }
+        self.near = near;
+        if near {
+            self.reset_taps();
+        }
+    }
+
+    /// Covered right now, or cleared less than POCKET_HOLD_MS ago.
+    pub fn is_covered(&self, now: Millis) -> bool {
+        self.near || self.near_cleared_at.is_some_and(|t| now.saturating_sub(t) < POCKET_HOLD_MS)
     }
 
     pub fn is_animating(&self) -> bool {
@@ -119,7 +144,7 @@ impl Sleep {
 
     /// Touch input while captured (fading out or off). Returns wake actions.
     pub fn touch_down(&mut self, slot: i32, x: f32, y: f32, now: Millis) -> Vec<SleepAction> {
-        if !self.captures_input() {
+        if !self.captures_input() || self.is_covered(now) {
             return vec![];
         }
         // A second finger means "not a deliberate tap sequence".
@@ -250,6 +275,30 @@ mod tests {
         s.touch_up(0, 220);
         tap(&mut s, 200.0, 500.0, 300, 80);
         assert_eq!(s.phase, Phase::Off, "swipe broke it");
+    }
+
+    #[test]
+    fn a_covered_screen_never_wakes_on_taps_until_the_hold_after_it_clears() {
+        let mut s = asleep();
+        s.set_near(true, 1000);
+        for i in 0..3 {
+            tap(&mut s, 200.0, 500.0, 1100 + i * 200, 80);
+        }
+        assert_eq!(s.phase, Phase::Off, "in a pocket: no");
+        s.set_near(false, 2000);
+        for i in 0..3 {
+            tap(&mut s, 200.0, 500.0, 2100 + i * 200, 80); // within the hold
+        }
+        assert_eq!(s.phase, Phase::Off, "just out of the pocket: still no");
+        let t0 = 2000 + POCKET_HOLD_MS + 100;
+        for i in 0..2 {
+            tap(&mut s, 200.0, 500.0, t0 + i * 200, 80);
+        }
+        assert_eq!(tap(&mut s, 200.0, 500.0, t0 + 400, 80), vec![SleepAction::DisplayPower(true)], "after the hold: wakes");
+        // The power key still works covered (a deliberate press).
+        let mut s = asleep();
+        s.set_near(true, 0);
+        assert_eq!(s.power_key(), vec![SleepAction::DisplayPower(true)]);
     }
 
     #[test]

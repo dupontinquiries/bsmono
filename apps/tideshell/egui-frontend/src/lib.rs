@@ -143,6 +143,12 @@ fn cr(r: u8) -> CornerRadius {
     CornerRadius::same(r)
 }
 
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
+    Color32::from_rgba_unmultiplied(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()), l(a.a(), b.a()))
+}
+
 fn with_alpha(c: Color32, a: f32) -> Color32 {
     let [r, g, b, _] = c.to_srgba_unmultiplied();
     Color32::from_rgba_unmultiplied(r, g, b, (a.clamp(0.0, 1.0) * 255.0) as u8)
@@ -278,6 +284,36 @@ impl ShellView {
         self.bar(ui, shell, pal, info, area.min, area.size())
     }
 
+    /// The volume pad. The fill's width is the level; a horizontal line marks
+    /// the voicing; the accent tints with it (cool = soft, warm = cutting).
+    fn volume_pad(&mut self, ui: &mut egui::Ui, shell: &mut Shell, pal: &PaletteColors, clip: Rect, r: Rect) -> Vec<Action> {
+        let mut out = vec![];
+        let pc = ui.painter_at(clip);
+        let v = shell.drawer.volume;
+        let tone = shell.prefs.audio_tone;
+        pc.rect_filled(r, cr(16), pal.bg_raised);
+        let tint = if tone >= 0.0 { pal.warning } else { pal.accent_soft };
+        let fill = with_alpha(mix(pal.accent, tint, tone.abs() * 0.6), 0.45);
+        pc.rect_filled(Rect::from_min_size(r.min, Vec2::new(r.width() * v, r.height())), cr(16), fill);
+        // Voicing line: top = +1, middle = 0, bottom = -1, kept below the label.
+        let (top, bottom) = (r.top() + 30.0, r.bottom() - 10.0);
+        let mid = (top + bottom) / 2.0;
+        let ly = mid - tone * (bottom - top) / 2.0;
+        pc.line_segment([Pos2::new(r.left() + 10.0, ly), Pos2::new(r.right() - 10.0, ly)], Stroke::new(2.0, with_alpha(pal.text, 0.7)));
+        pc.line_segment([Pos2::new(r.left() + 10.0, mid), Pos2::new(r.right() - 10.0, mid)], Stroke::new(1.0, with_alpha(pal.text_weak, 0.35)));
+        let label = if tone > 0.15 { "cut through" } else if tone < -0.15 { "soft" } else { "flat" };
+        pc.text(r.left_top() + Vec2::new(16.0, 14.0), Align2::LEFT_CENTER, format!("Volume  {:.0}%  ·  {label}", v * 100.0), FontId::proportional(13.0), pal.text);
+        pc.text(r.right_top() + Vec2::new(-14.0, 14.0), Align2::RIGHT_CENTER, "loud place", FontId::proportional(10.0), pal.text_weak);
+        pc.text(r.right_bottom() + Vec2::new(-14.0, -12.0), Align2::RIGHT_CENTER, "quiet room", FontId::proportional(10.0), pal.text_weak);
+        let resp = ui.interact(clip, Id::new("ts-volume-pad"), Sense::click_and_drag());
+        if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.clicked()) {
+            out.extend(shell.set_slider(SliderKind::Volume, ((pos.x - r.left()) / r.width()).clamp(0.0, 1.0)));
+            let t = -((pos.y - mid) / ((bottom - top) / 2.0)).clamp(-1.0, 1.0);
+            out.extend(shell.set_voicing(t));
+        }
+        out
+    }
+
     /// Sunlight look: opaque white surfaces, black text, a saturated accent.
     /// Translucent dark chrome is what disappears first outdoors on a panel
     /// that is not sunlight-readable; contrast is the lever the shell has.
@@ -410,6 +446,15 @@ impl ShellView {
     /// Call once per frame with that frame's events: the simulator from
     /// eframe's `raw_input_hook`, the layer runtime before `run_ui`.
     pub fn route_raw(&mut self, shell: &mut Shell, events: &mut Vec<egui::Event>, origin: Pos2, now: u64) -> Vec<Action> {
+        if shell.is_covered() {
+            // Pocket / face: nothing reaches anything (the sleep model still
+            // sees touches, so the wake gate is its decision).
+            let mut sink = std::mem::take(events);
+            if shell.sleep.captures_input() {
+                return self.route_covered(shell, &mut sink, origin, now);
+            }
+            return vec![];
+        }
         if shell.sleep.captures_input() || shell.lock.is_locked() {
             return self.route_covered(shell, events, origin, now);
         }
@@ -755,9 +800,16 @@ impl ShellView {
         let rows = (tiles.len() as f32 / 5.0).ceil();
         let mut y = 40.0 + rows * (th + gap) + 6.0;
         for kind in [SliderKind::Brightness, SliderKind::Volume] {
-            let r = Rect::from_min_size(origin + Vec2::new(pad, y), Vec2::new(size.x - pad * 2.0, 40.0));
-            y += 50.0;
+            // Volume is a pad: x = level, y = voicing (up: cut through a loud
+            // place; middle: flat; down: soft for a quiet room).
+            let h = if kind == SliderKind::Volume { 96.0 } else { 40.0 };
+            let r = Rect::from_min_size(origin + Vec2::new(pad, y), Vec2::new(size.x - pad * 2.0, h));
+            y += h + 10.0;
             if r.top() > panel.bottom() {
+                continue;
+            }
+            if kind == SliderKind::Volume {
+                out.extend(self.volume_pad(ui, shell, pal, r.intersect(panel), r));
                 continue;
             }
             let relative = kind == SliderKind::Brightness && shell.ambient.enabled;

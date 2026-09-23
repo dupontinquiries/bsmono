@@ -24,6 +24,7 @@
 
 pub mod ambient;
 pub mod anim;
+pub mod audio;
 pub mod bar;
 pub mod carousel;
 pub mod clock;
@@ -103,4 +104,6 @@ pub enum Action {
     DisplayPower(bool),
     /// Rotate the output (degrees: 0, 90, 180, 270).
     Rotate(u32),
+    /// Audio voicing (-1 soft .. +1 cut through); see `audio`.
+    SetVoicing(f32),
 }

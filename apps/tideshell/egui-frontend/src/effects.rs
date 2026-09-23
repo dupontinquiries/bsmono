@@ -209,6 +209,7 @@ impl Executor for System {
             Action::SetSlider(..) => Outcome::Unwired("brightness is applied by the layer runtime"),
             Action::DisplayPower(_) => Outcome::Unwired("display power is handled by the layer runtime"),
             Action::Rotate(deg) => rotate_output(*deg),
+            Action::SetVoicing(tone) => apply_voicing(*tone),
         }
     }
 }
@@ -325,6 +326,62 @@ pub fn move_to_scope(bus: &zbus::blocking::Connection, pid: u32, desktop_id: &st
     let aux: Vec<(&str, Vec<(&str, Value)>)> = Vec::new();
     p.call_method("StartTransientUnit", &(unit.as_str(), "fail", props, aux)).map_err(|e| format!("StartTransientUnit: {e}"))?;
     Ok(unit)
+}
+
+// ---- voicing (PipeWire filter-chain) --------------------------------------------
+
+/// The node id of `name` in `pw-cli ls Node` output (blocks of
+/// `\tid N, type ...` followed by indented `key = "value"` lines).
+pub fn parse_node_id(listing: &str, name: &str) -> Option<u32> {
+    let mut cur: Option<u32> = None;
+    for line in listing.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("id ") {
+            cur = rest.split(',').next().and_then(|n| n.trim().parse().ok());
+        } else if t.starts_with("node.name") && t.ends_with(&format!("\"{name}\"")) {
+            return cur;
+        }
+    }
+    None
+}
+
+pub fn voicing_config_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|c| c.join("pipewire/pipewire.conf.d/tideshell-voicing.conf"))
+}
+
+/// Set the voicing sink's controls; if the sink does not exist yet, install
+/// its config (PipeWire picks it up after a restart) and say so.
+pub fn apply_voicing(tone: f32) -> Outcome {
+    let p = tideshell_core::audio::params(tone);
+    let listing = match Command::new("pw-cli").args(["ls", "Node"]).stdin(Stdio::null()).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => return Outcome::Failed(format!("pw-cli ls: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => return Outcome::Failed(format!("pw-cli: {e} (PipeWire tools not installed)")),
+    };
+    let Some(id) = parse_node_id(&listing, tideshell_core::audio::SINK_NAME) else {
+        return match voicing_config_path() {
+            Some(path) if path.exists() => Outcome::Failed(format!("voicing sink not running; config is at {} (restart pipewire: systemctl --user restart pipewire)", path.display())),
+            Some(path) => {
+                if let Some(d) = path.parent() {
+                    let _ = std::fs::create_dir_all(d);
+                }
+                match std::fs::write(&path, tideshell_core::audio::filter_chain_config()) {
+                    Ok(()) => Outcome::Failed(format!("voicing sink installed at {}; restart pipewire (systemctl --user restart pipewire) and set it as the default sink", path.display())),
+                    Err(e) => Outcome::Failed(format!("cannot write {}: {e}", path.display())),
+                }
+            }
+            None => Outcome::Failed("no config dir for the voicing sink".into()),
+        };
+    };
+    let props = tideshell_core::audio::props_text(&p);
+    match Command::new("pw-cli").args(["set-param", &id.to_string(), "Props", &props]).stdin(Stdio::null()).output() {
+        Ok(o) if o.status.success() => Outcome::Done(format!("voicing {tone:+.2}: hp {:.0} Hz, lp {:.0} Hz, presence {:+.1} dB, trim {:+.1} dB", p.hp_hz, p.lp_hz, p.presence_db, p.trim_db)),
+        Ok(o) => Outcome::Failed(format!("pw-cli set-param: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => Outcome::Failed(format!("pw-cli: {e}")),
+    }
 }
 
 // ---- volume (PipeWire via wpctl) -----------------------------------------------
@@ -613,6 +670,13 @@ mod tests {
         assert_eq!((c[0].0.as_str(), c[0].1.as_str()), (unit.as_str(), "fail"));
         assert!(c[0].2.contains(&"PIDs".to_string()) && c[0].2.contains(&"Slice".to_string()), "{:?}", c[0].2);
         let _ = daemon.kill();
+    }
+
+    #[test]
+    fn pw_cli_node_listing_yields_the_voicing_sink_id() {
+        let listing = "\tid 31, type PipeWire:Interface:Node/3\n \t\tobject.serial = \"31\"\n \t\tnode.name = \"alsa_output.platform-sound.stereo-fallback\"\n\tid 47, type PipeWire:Interface:Node/3\n \t\tnode.name = \"tideshell-voicing\"\n \t\tmedia.class = \"Audio/Sink\"\n\tid 48, type PipeWire:Interface:Node/3\n \t\tnode.name = \"tideshell-voicing.out\"\n";
+        assert_eq!(parse_node_id(listing, "tideshell-voicing"), Some(47), "the sink, not its .out playback node");
+        assert_eq!(parse_node_id(listing, "nope"), None);
     }
 
     #[test]

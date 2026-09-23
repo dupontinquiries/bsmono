@@ -340,7 +340,7 @@ impl Shell {
         if self.offset_dirty_at.is_some_and(|t| now.saturating_sub(t) >= 1500) {
             self.offset_dirty_at = None;
             self.prefs.brightness_offset = self.ambient.user;
-            self.log(format!("auto brightness: slider at {:+.2} of the band", self.ambient.user));
+            self.log(format!("saved: brightness {:+.2} of the band, voicing {:+.2}", self.ambient.user, self.prefs.audio_tone));
             out.push(Action::SavePrefs);
         }
         // The fat cursor's eased position IS the pointer: send it as it moves.
@@ -649,9 +649,37 @@ impl Shell {
         self.ambient.band(self.now, self.clock_minute)
     }
 
+    /// The voicing axis of the volume pad moved (-1..1). Saved once the
+    /// finger has been still, like the brightness offset.
+    pub fn set_voicing(&mut self, tone: f32) -> Vec<Action> {
+        let tone = tone.clamp(-1.0, 1.0);
+        if (tone - self.prefs.audio_tone).abs() < 1e-4 {
+            return vec![];
+        }
+        self.prefs.audio_tone = tone;
+        self.offset_dirty_at = Some(self.now);
+        vec![Action::SetVoicing(tone)]
+    }
+
     /// Local minute of the day (0..1440), for the night window.
     pub fn set_clock(&mut self, minute: u32) {
         self.clock_minute = minute % 1440;
+    }
+
+    /// The proximity sensor: near = covered (pocket, face). Touches are
+    /// ignored and the triple tap cannot wake while covered.
+    pub fn on_proximity(&mut self, near: bool, now: Millis) {
+        self.now = self.now.max(now);
+        let was = self.sleep.is_covered(now);
+        self.sleep.set_near(near, now);
+        if was != near {
+            self.log(format!("proximity {}", if near { "near: covered" } else { "far" }));
+        }
+    }
+
+    /// Covered: every touch is dropped before it means anything.
+    pub fn is_covered(&self) -> bool {
+        self.sleep.is_covered(self.now)
     }
 
     /// An orientation reading from iio-sensor-proxy.
@@ -1112,6 +1140,18 @@ mod tests {
         assert_eq!(sh.tap_quick(QuickKind::AutoBrightness), vec![Action::SavePrefs]);
         assert!(!sh.quick_state(QuickKind::AutoBrightness) && !sh.prefs.auto_brightness);
         assert!(!sh.tick(10_000).iter().any(|a| matches!(a, Action::SetSlider(..))), "off: no more changes");
+    }
+
+    #[test]
+    fn voicing_moves_emit_once_and_are_saved_after_the_finger_rests() {
+        let mut sh = Shell::new(ShellPrefs::default(), S);
+        sh.tick(0);
+        assert_eq!(sh.set_voicing(0.4), vec![Action::SetVoicing(0.4)]);
+        assert!(sh.set_voicing(0.4).is_empty(), "no repeat for the same value");
+        assert_eq!(sh.set_voicing(3.0), vec![Action::SetVoicing(1.0)], "clamped");
+        let saves: usize = (100..3000).step_by(100).map(|t| sh.tick(t).iter().filter(|a| **a == Action::SavePrefs).count()).sum();
+        assert_eq!(saves, 1);
+        assert_eq!(sh.prefs.audio_tone, 1.0);
     }
 
     #[test]

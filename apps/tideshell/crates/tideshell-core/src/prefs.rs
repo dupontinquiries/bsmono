@@ -54,6 +54,8 @@ pub struct ShellPrefs {
     pub theme: String,
     /// Command-palette recents, most recent first (item keys, comma-joined).
     pub palette_recent: String,
+    /// Audio voicing position, -1..1 (see audio.rs).
+    pub audio_tone: f32,
     /// Autorotation on/off, and whether landscape is mirrored on this panel.
     pub autorotate: bool,
     pub rotate_flip: bool,
@@ -78,6 +80,7 @@ impl Default for ShellPrefs {
             brightness_rate: 30,
             theme: "night".into(),
             palette_recent: String::new(),
+            audio_tone: 0.0,
             autorotate: true,
             rotate_flip: false,
             clock_style: crate::clock::ClockStyle::Digital,
@@ -86,7 +89,7 @@ impl Default for ShellPrefs {
     }
 }
 
-pub const KEYS: [&str; 17] = [
+pub const KEYS: [&str; 18] = [
     "shell.layout",
     "shell.bar.widgets",
     "shell.bar.width",
@@ -100,6 +103,7 @@ pub const KEYS: [&str; 17] = [
     "shell.brightness.rate",
     "shell.theme",
     "shell.palette.recent",
+    "shell.audio.tone",
     "shell.rotate.auto",
     "shell.rotate.flip",
     "shell.clock.style",
@@ -129,6 +133,7 @@ impl ShellPrefs {
             ("shell.brightness.rate".into(), self.brightness_rate.to_string()),
             ("shell.theme".into(), self.theme.clone()),
             ("shell.palette.recent".into(), self.palette_recent.clone()),
+            ("shell.audio.tone".into(), format!("{:.3}", self.audio_tone)),
             ("shell.rotate.auto".into(), if self.autorotate { "on" } else { "off" }.into()),
             ("shell.rotate.flip".into(), if self.rotate_flip { "on" } else { "off" }.into()),
             (
@@ -186,6 +191,7 @@ impl ShellPrefs {
             "shell.brightness.offset" => self.brightness_offset = parse_range(key, v, -1.0, 1.0)?,
             "shell.brightness.rate" => self.brightness_rate = parse_range(key, v, 2.0, 90.0)? as u32,
             "shell.palette.recent" => self.palette_recent = v.to_string(),
+            "shell.audio.tone" => self.audio_tone = parse_range(key, v, -1.0, 1.0)?,
             "shell.rotate.auto" => self.autorotate = parse_on_off(key, v)?,
             "shell.rotate.flip" => self.rotate_flip = parse_on_off(key, v)?,
             "shell.theme" => {
@@ -276,6 +282,7 @@ mod tests {
         p.theme = "slate-dusk".into();
         p.palette_recent = "mode:keyboard,app:x".into();
         p.autorotate = false;
+        p.audio_tone = -0.25;
         p.rotate_flip = true;
         p.clock_fuzzy = crate::clock::Fuzzy::Quarter;
         p.bar_widgets = bar::parse_widgets("clock,toggle:trackpad,app:org.gnome.Console").0;

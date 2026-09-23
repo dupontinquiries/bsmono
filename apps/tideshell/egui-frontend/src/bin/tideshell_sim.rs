@@ -121,6 +121,7 @@ impl Executor for SimExec<'_> {
             }
             Action::DisplayPower(on) => Outcome::Done(format!("sim: display {}", if *on { "on" } else { "off" })),
             Action::Rotate(deg) => Outcome::Done(format!("sim: rotate {deg}")),
+            Action::SetVoicing(t) => Outcome::Done(format!("sim: voicing {t:+.2}")),
             Action::HideSystemCursor(on) => {
                 self.world.fat = *on;
                 Outcome::Done(format!("sim: system cursor hidden={on}"))

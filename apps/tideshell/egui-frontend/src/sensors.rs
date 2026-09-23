@@ -265,6 +265,71 @@ impl OrientationFeed {
     }
 }
 
+// ---- proximity (iio-sensor-proxy) -------------------------------------------------
+
+/// `true` = near, on change, ~5 Hz.
+pub struct ProximityFeed {
+    pub rx: Receiver<bool>,
+    status: Arc<Mutex<String>>,
+}
+
+impl ProximityFeed {
+    pub fn spawn(bus: Option<Connection>) -> ProximityFeed {
+        let (tx, rx) = mpsc::channel();
+        let status = Arc::new(Mutex::new("proximity: starting".to_string()));
+        let st = status.clone();
+        std::thread::Builder::new()
+            .name("tideshell-proximity".into())
+            .spawn(move || {
+                let set = |s: String| *st.lock().unwrap() = s;
+                let Some(bus) = bus else {
+                    set("proximity: no system bus".into());
+                    return;
+                };
+                let p = match sensor_proxy(&bus) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        set(format!("proximity: iio-sensor-proxy unavailable ({e})"));
+                        return;
+                    }
+                };
+                if !p.get_property::<bool>("HasProximitySensor").unwrap_or(false) {
+                    set("proximity: no proximity sensor".into());
+                    return;
+                }
+                if let Err(e) = p.call_method("ClaimProximity", &()) {
+                    set(format!("proximity: ClaimProximity: {e}"));
+                    return;
+                }
+                set("proximity: iio-sensor-proxy".into());
+                let mut last: Option<bool> = None;
+                loop {
+                    match p.get_property::<bool>("ProximityNear") {
+                        Ok(near) => {
+                            if last != Some(near) {
+                                last = Some(near);
+                                if tx.send(near).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            set(format!("proximity: read failed ({e})"));
+                            return;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            })
+            .expect("spawn proximity thread");
+        ProximityFeed { rx, status }
+    }
+
+    pub fn status(&self) -> String {
+        self.status.lock().unwrap().clone()
+    }
+}
+
 // ---- threads -------------------------------------------------------------------
 
 /// Background reader: lux values arrive on `rx` (~4 Hz), `status()` says

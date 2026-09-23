@@ -47,6 +47,8 @@ struct Shellbox {
     orientation: tideshell_egui::sensors::OrientationFeed,
     orientation_status: String,
     foreground_written: String,
+    proximity: tideshell_egui::sensors::ProximityFeed,
+    proximity_status: String,
 }
 
 impl Shellbox {
@@ -134,6 +136,11 @@ impl Shellbox {
             let s = self.filter.stats;
             self.shell.note(format!("touch filter: wet episodes {} dropped {} jumps {} excess {}", s.wet_episodes, s.dropped_wet, s.cancelled_jump, s.dropped_excess));
             self.filter_stats = s;
+        }
+        let ps = self.proximity.status();
+        if ps != self.proximity_status {
+            self.shell.note(ps.clone());
+            self.proximity_status = ps;
         }
         let os = self.orientation.status();
         if os != self.orientation_status {
@@ -265,6 +272,8 @@ fn main() {
         orientation: tideshell_egui::sensors::OrientationFeed::spawn(zbus::blocking::Connection::system().ok()),
         orientation_status: String::new(),
         foreground_written: String::new(),
+        proximity: tideshell_egui::sensors::ProximityFeed::spawn(zbus::blocking::Connection::system().ok()),
+        proximity_status: String::new(),
     };
     {
         let found = tideshell_egui::keys::discover(std::path::Path::new("/sys"), std::path::Path::new("/dev/input"));
@@ -342,6 +351,10 @@ fn main() {
         sb.shell.set_clock(tideshell_egui::sensors::local_minute());
         while let Ok(lux) = sb.ambient.rx.try_recv() {
             sb.shell.on_lux(lux, now_ms);
+        }
+        let nears: Vec<bool> = sb.proximity.rx.try_iter().collect();
+        for n in nears {
+            sb.shell.on_proximity(n, now_ms);
         }
         let readings: Vec<String> = sb.orientation.rx.try_iter().collect();
         for o in readings {
