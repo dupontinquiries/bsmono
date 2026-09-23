@@ -63,6 +63,69 @@ fn query_param<'a>(url: &'a str, key: &str) -> Option<&'a str> {
 /// what it can actually play. Anything that parses as an http(s) URL is offered
 /// as a video and yt-dlp gets to decide — it fails with a clear message, which
 /// is a better outcome than the palette silently not offering the entry.
+/// The first existing local file named in clipboard text, if any.
+///
+/// What a file manager puts on the clipboard when a video is COPIED is rarely
+/// a bare path, and each of these used to fall through to "not playable":
+///
+/// * `file:///home/u/My%20Match.mp4` -- a URI, PERCENT-ENCODED. Stripping the
+///   scheme left `My%20Match.mp4`, which does not exist, so any file with a
+///   space or a non-ASCII character in its name silently failed.
+/// * `copy\nfile:///...` -- GNOME's copied-files format as text: an action
+///   line first. `file://localhost/...` also appears.
+/// * Several copied files, one per line: the first that exists is taken.
+/// * `~/Videos/x.mp4` -- the tilde was never expanded.
+///
+/// Pure apart from the existence check; `home` is a parameter so tests need
+/// not touch the process-wide `HOME`.
+pub fn local_file(text: &str, home: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    for line in text.lines().map(str::trim) {
+        let path = if let Some(rest) = line.strip_prefix("file://") {
+            // An authority part, if any, must be empty or "localhost".
+            let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+            if !rest.starts_with('/') {
+                continue;
+            }
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(percent_decode(rest)))
+        } else if let Some(rest) = line.strip_prefix("~/") {
+            match home {
+                Some(h) => h.join(rest),
+                None => continue,
+            }
+        } else if line.starts_with('/') {
+            std::path::PathBuf::from(line)
+        } else {
+            continue; // "copy", "cut", "x-special/...", blank lines
+        };
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// `%XX` escapes to bytes; anything malformed is kept literally. Bytes, not a
+/// String: a Unix file name need not be UTF-8.
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
 pub fn classify(text: &str) -> Paste {
     let t = text.trim();
     if t.is_empty() {
@@ -71,11 +134,9 @@ pub fn classify(text: &str) -> Paste {
 
     // A local path first: it needs no network and an existing file is
     // unambiguous.
-    if t.starts_with('/') || t.starts_with("~/") || t.starts_with("file://") {
-        let p = std::path::PathBuf::from(t.trim_start_matches("file://"));
-        if p.is_file() {
-            return Paste::LocalFile(p);
-        }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    if let Some(p) = local_file(t, home.as_deref()) {
+        return Paste::LocalFile(p);
     }
 
     if !(t.starts_with("http://") || t.starts_with("https://")) {
@@ -198,6 +259,65 @@ pub fn related_from_json(json: &str) -> Related {
 
 #[cfg(test)]
 mod tests {
+    use super::{local_file, percent_decode};
+
+    fn tmp_file(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("vk_paste_{}_{}", std::process::id(), name.len()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join(name);
+        std::fs::write(&f, b"x").unwrap();
+        (dir, f)
+    }
+
+    /// Spaces and non-ASCII names, copied from a file manager as a URI: the
+    /// case that silently failed -- the scheme was stripped, the %20 was not.
+    #[test]
+    fn a_percent_encoded_file_uri_is_found() {
+        let (dir, f) = tmp_file("My Match \u{e9}t\u{e9}.mp4");
+        let uri = format!("file://{}", dir.join("My%20Match%20%C3%A9t%C3%A9.mp4").display());
+        assert_eq!(local_file(&uri, None), Some(f.clone()));
+        let with_host = uri.replacen("file://", "file://localhost", 1);
+        assert_eq!(local_file(&with_host, None), Some(f));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GNOME's copied-files text: an action line, then URIs, one per line.
+    /// The first that exists wins; the action line is not a path.
+    #[test]
+    fn file_manager_copy_formats_are_understood() {
+        let (dir, f) = tmp_file("clip.mkv");
+        let text = format!("copy\nfile:///nonexistent/a.mp4\nfile://{}\n", f.display());
+        assert_eq!(local_file(&text, None), Some(f.clone()));
+        assert_eq!(local_file("copy\n", None), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tilde_path_expands_against_home() {
+        let (dir, f) = tmp_file("t.webm");
+        assert_eq!(local_file("~/t.webm", Some(&dir)), Some(f));
+        assert_eq!(local_file("~/t.webm", None), None, "no home, no guess");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn percent_decoding_keeps_malformed_escapes_literally() {
+        assert_eq!(percent_decode("/a%20b"), b"/a b");
+        assert_eq!(percent_decode("/100%"), b"/100%", "a trailing % is not an escape");
+        assert_eq!(percent_decode("/x%zzy"), b"/x%zzy");
+        assert_eq!(percent_decode("/%2"), b"/%2", "short escape at the end");
+        assert_eq!(percent_decode(""), b"");
+    }
+
+    /// And through the public entry point: a URI with a space reaches LocalFile.
+    #[test]
+    fn classify_plays_a_copied_file_with_a_space_in_its_name() {
+        let (dir, f) = tmp_file("two words.mp4");
+        let uri = format!("file://{}", dir.join("two%20words.mp4").display());
+        assert!(matches!(super::classify(&uri), super::Paste::LocalFile(p) if p == f));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]
