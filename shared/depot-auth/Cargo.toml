@@ -1,0 +1,10 @@
+[package]
+name = "depot-auth"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "depot client auth: per-client ed25519 keys, signed requests, pairing codes (pure; shared by depot and its clients)"
+
+[dependencies]
+crypto-kit = { path = "../crypto-kit" }
+sha2 = "0.10"
