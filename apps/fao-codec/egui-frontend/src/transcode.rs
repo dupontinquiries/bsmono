@@ -167,26 +167,50 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
     let mut writer = crate::export::FaoStreamWriter::new(out, w, h, info.rate.0, info.rate.1, quality, reserve)
         .map_err(|e| format!("starting the file: {e}"))?;
     let fsz = w * h * 3;
-    let mut rgb = vec![0u8; fsz];
+    let workers = encode_workers();
+    let batch_size = (workers * 2).max(1);
     let mut n = 0usize;
     let mut psnr_sum = 0.0;
+    let mut psnr_n = 0usize;
+    // BATCHED, PARALLEL. Every frame here is an intra DCT frame, so frames are
+    // independent -- the ideal case for encoding several at once. A batch of
+    // `2 x workers` frames is read, encoded across `workers` threads, then
+    // written IN ORDER (each worker fills fixed slots; see `encode_batch`).
+    // Cancellation is checked per batch, so it lands within one batch.
     let result: Result<(), String> = loop {
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
             break Err(CANCELLED.into());
         }
-        match read_frame(&mut stdout, &mut rgb) {
-            Ok(false) => break Ok(()),
-            Ok(true) => {}
+        let (batch, ended) = match read_batch(&mut stdout, fsz, batch_size) {
+            Ok(b) => b,
             Err(e) => break Err(e),
+        };
+        if batch.is_empty() {
+            break Ok(());
         }
-        let yuv = crate::decode::rgb_to_yuv420p(&rgb, w, h);
-        let payload = fao_v1::compress_frame_dct(&yuv, w, h, quality);
-        let recon = fao_v1::decompress_frame_dct(&payload, w, h).unwrap_or_else(|| yuv.clone());
-        let p = psnr(&rgb, &crate::decode::yuv_to_rgb(&recon, w, h));
-        psnr_sum += p;
-        if let Err(e) = writer.push(&payload, b'D', p) { break Err(format!("writing frame {n}: {e}")); }
-        n += 1;
-        progress(n, estimate.max(n));
+        let encoded = encode_batch(&batch, n, w, h, quality, workers, PSNR_EVERY);
+        let mut failed = None;
+        for (payload, p) in encoded {
+            if let Some(p) = p {
+                psnr_sum += p;
+                psnr_n += 1;
+            }
+            // 0 = "not measured" for unsampled frames. Nothing reads the
+            // per-frame header PSNR back from a file (checked: every PSNR shown
+            // in the UI comes from an in-memory encode result).
+            if let Err(e) = writer.push(&payload, b'D', p.unwrap_or(0.0)) {
+                failed = Some(format!("writing frame {n}: {e}"));
+                break;
+            }
+            n += 1;
+            progress(n, estimate.max(n));
+        }
+        if let Some(e) = failed {
+            break Err(e);
+        }
+        if ended {
+            break Ok(());
+        }
     };
     if result.is_err() { let _ = child.kill(); }
     let status = child.wait().map_err(|e| format!("ffmpeg wait: {e}"))?;
@@ -200,11 +224,76 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
     let mut out = writer.finish().map_err(|e| format!("finishing the file: {e}"))?;
     let output_bytes = out.stream_position().unwrap_or(0);
     Ok((out, TranscodeReport { frames: n, w, h, input_bytes, output_bytes,
-                               mean_psnr: psnr_sum / n as f64 }))
+                               mean_psnr: if psnr_n == 0 { 0.0 } else { psnr_sum / psnr_n as f64 } }))
 }
 
 /// The error a cancelled transcode returns, so callers can tell it from a failure.
 pub const CANCELLED: &str = "cancelled";
+
+/// Measure PSNR on one frame in this many. Measuring means DECODING the frame
+/// again and comparing -- pure overhead in a batch encode, only there for the
+/// report. Sampled, the report's mean is an estimate; frame 0 is always in it.
+const PSNR_EVERY: usize = 8;
+
+/// Encode threads: the machine's parallelism, capped -- beyond 8 the batch's
+/// memory (two raw frames per worker) grows faster than the gain.
+fn encode_workers() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8)
+}
+
+/// Read up to `max` frames. `(frames, ended)`: `ended` when ffmpeg's output
+/// finished within this batch.
+fn read_batch(r: &mut impl std::io::Read, fsz: usize, max: usize) -> Result<(Vec<Vec<u8>>, bool), String> {
+    let mut batch = Vec::with_capacity(max);
+    while batch.len() < max {
+        let mut buf = vec![0u8; fsz];
+        if !read_frame(r, &mut buf)? {
+            return Ok((batch, true));
+        }
+        batch.push(buf);
+    }
+    Ok((batch, false))
+}
+
+/// One frame: its DCT payload, and its PSNR if this frame is sampled.
+fn encode_one(rgb: &[u8], w: usize, h: usize, quality: u8, measure: bool) -> (Vec<u8>, Option<f64>) {
+    let yuv = crate::decode::rgb_to_yuv420p(rgb, w, h);
+    let payload = fao_v1::compress_frame_dct(&yuv, w, h, quality);
+    let p = measure.then(|| {
+        let recon = fao_v1::decompress_frame_dct(&payload, w, h).unwrap_or_else(|| yuv.clone());
+        psnr(rgb, &crate::decode::yuv_to_rgb(&recon, w, h))
+    });
+    (payload, p)
+}
+
+/// Encode a batch across `workers` threads, results IN INPUT ORDER.
+///
+/// Each worker takes a CONTIGUOUS run of frames and writes into the matching
+/// run of output slots, so order is fixed by index, not by which thread
+/// finishes first -- the output is byte-identical to encoding one at a time
+/// (tested). `first` is the batch's first frame number, for PSNR sampling.
+fn encode_batch(batch: &[Vec<u8>], first: usize, w: usize, h: usize, quality: u8,
+                workers: usize, psnr_every: usize) -> Vec<(Vec<u8>, Option<f64>)> {
+    let every = psnr_every.max(1);
+    if workers <= 1 || batch.len() <= 1 {
+        return batch.iter().enumerate()
+            .map(|(k, f)| encode_one(f, w, h, quality, (first + k) % every == 0))
+            .collect();
+    }
+    let chunk = batch.len().div_ceil(workers);
+    let mut out: Vec<Option<(Vec<u8>, Option<f64>)>> = (0..batch.len()).map(|_| None).collect();
+    std::thread::scope(|sc| {
+        for (ci, (frames, slots)) in batch.chunks(chunk).zip(out.chunks_mut(chunk)).enumerate() {
+            sc.spawn(move || {
+                for (k, (f, slot)) in frames.iter().zip(slots.iter_mut()).enumerate() {
+                    let idx = first + ci * chunk + k;
+                    *slot = Some(encode_one(f, w, h, quality, idx % every == 0));
+                }
+            });
+        }
+    });
+    out.into_iter().map(|o| o.expect("every slot is filled by its worker")).collect()
+}
 
 /// Read exactly one frame. `Ok(false)` at a clean end; a PARTIAL frame is an
 /// error, not a frame padded with the previous one's bytes.
@@ -379,6 +468,89 @@ mod tests {
         assert_eq!(r.unwrap_err(), CANCELLED);
         assert!(!out.exists(), "the partial file must be removed");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BENCHMARK, not a check: 1080p60 transcode speed and size, for sizing a
+    /// real batch ("hundreds of GB of matches"). Ignored by default; run in
+    /// release, since debug speed says nothing:
+    ///
+    ///     cargo test --release -- --ignored --nocapture bench_1080p
+    ///
+    /// The source is ffmpeg's synthetic `testsrc2`, encoded with whatever H.264
+    /// or MPEG-4 encoder this ffmpeg has -- so the SPEED is representative (the
+    /// DCT path's cost is per block, not per content), but the SIZE RATIO is
+    /// only indicative: synthetic motion compresses differently from gameplay.
+    #[test]
+    #[ignore = "benchmark: cargo test --release -- --ignored --nocapture bench_1080p"]
+    fn bench_1080p_transcode_speed_and_size() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-bench-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mp4");
+        // No -c:v: ffmpeg picks its default (libx264 where present, mpeg4 on
+        // builds without it, e.g. Fedora's ffmpeg-free) -- works everywhere.
+        assert!(Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i",
+            "testsrc2=size=1920x1080:rate=60:duration=2", "-pix_fmt", "yuv420p"])
+            .arg(&src).status().unwrap().success());
+        let out = dir.join("out.fao");
+        let t = std::time::Instant::now();
+        let rep = transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        let secs = t.elapsed().as_secs_f64();
+        let in_b = std::fs::metadata(&src).unwrap().len();
+        eprintln!("BENCH 1080p60: {} frames in {:.2} s = {:.1} fps ({:.2}x realtime); \
+                   source {:.2} MB -> fao {:.2} MB ({:.1}x); mean PSNR {:.1} dB",
+                  rep.frames, secs, rep.frames as f64 / secs, (rep.frames as f64 / 60.0) / secs,
+                  in_b as f64 / 1e6, rep.output_bytes as f64 / 1e6,
+                  rep.output_bytes as f64 / in_b as f64, rep.mean_psnr);
+        assert_eq!(rep.frames, 120);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn frames(n: usize, w: usize, h: usize) -> Vec<Vec<u8>> {
+        (0..n).map(|k| (0..w * h * 3).map(|i| ((i * 13 + k * 57 + (i / w) * 3) % 256) as u8).collect()).collect()
+    }
+
+    /// PARALLEL IS BYTE-IDENTICAL TO SEQUENTIAL. 7 frames over 4 workers gives
+    /// uneven runs (2,2,2,1), and the batch starts at frame 5 rather than 0 --
+    /// the cases where a slot-indexing mistake would reorder or mis-sample.
+    #[test]
+    fn a_parallel_batch_matches_one_at_a_time_exactly() {
+        let (w, h) = (48, 32);
+        let batch = frames(7, w, h);
+        let seq = encode_batch(&batch, 5, w, h, 80, 1, 3);
+        for workers in [2, 3, 4, 8] {
+            let par = encode_batch(&batch, 5, w, h, 80, workers, 3);
+            assert_eq!(par.len(), seq.len());
+            for (i, (a, b)) in par.iter().zip(&seq).enumerate() {
+                assert_eq!(a.0, b.0, "payload {i} with {workers} workers");
+                assert_eq!(a.1.is_some(), b.1.is_some(), "sampling {i} with {workers} workers");
+            }
+        }
+    }
+
+    /// Frames sampled for PSNR are exactly those whose GLOBAL index is a
+    /// multiple of `every` -- so batch boundaries do not shift the sample.
+    #[test]
+    fn psnr_is_sampled_by_global_frame_index() {
+        let (w, h) = (32, 16);
+        let got: Vec<bool> = encode_batch(&frames(6, w, h), 5, w, h, 80, 3, 4)
+            .iter().map(|(_, p)| p.is_some()).collect();
+        // Global indices 5..=10; multiples of 4 there: 8 only.
+        assert_eq!(got, vec![false, false, false, true, false, false]);
+        let first: Vec<bool> = encode_batch(&frames(3, w, h), 0, w, h, 80, 2, 8)
+            .iter().map(|(_, p)| p.is_some()).collect();
+        assert_eq!(first, vec![true, false, false], "frame 0 is always measured");
+    }
+
+    #[test]
+    fn a_batch_reader_reports_where_the_stream_ends() {
+        let data = vec![7u8; 10 * 3];
+        let mut r = std::io::Cursor::new(data);
+        let (b, ended) = read_batch(&mut r, 10, 2).unwrap();
+        assert_eq!((b.len(), ended), (2, false));
+        let (b, ended) = read_batch(&mut r, 10, 2).unwrap();
+        assert_eq!((b.len(), ended), (1, true), "one frame left, then the end");
     }
 
     fn have_ffmpeg() -> bool {
