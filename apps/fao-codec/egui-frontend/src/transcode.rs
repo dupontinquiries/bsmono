@@ -105,6 +105,8 @@ pub struct TranscodeReport {
     pub frames: usize,
     /// Of `frames`, how many were exact repeats stored as one-byte `R` frames.
     pub repeats: usize,
+    /// Of `frames`, how many were Quiltstone patch frames (`M`).
+    pub patches: usize,
     pub w: usize,
     pub h: usize,
     pub input_bytes: u64,
@@ -184,6 +186,14 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
     let mut prev: Option<Vec<u8>> = None;
     let mut run = 0usize;
     let mut repeats = 0usize;
+    // QUILTSTONE PATCH FRAMES between keyframes (see `patch`): each block is
+    // judged against the source pixels it had when last SENT (`reference`), so
+    // skipping cannot accumulate error. `since_key` bounds seek cost.
+    let tol = crate::patch::tolerance(quality);
+    let n_blocks = { let (c, r) = crate::patch::grid(w, h); c * r };
+    let mut reference: Option<Vec<u8>> = None;
+    let mut since_key = 0usize;
+    let mut patches = 0usize;
     // BATCHED, PARALLEL. Every frame here is an intra DCT frame, so frames are
     // independent -- the ideal case for encoding several at once. A batch of
     // `2 x workers` frames is read, encoded across `workers` threads, then
@@ -202,8 +212,37 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
         }
         let (dups, carried) = mark_repeats(&batch, prev.as_deref(), run);
         run = carried;
-        let fresh: Vec<&[u8]> = batch.iter().zip(&dups).filter(|(_, d)| !**d).map(|(f, _)| f.as_slice()).collect();
-        let mut encoded = encode_batch(&fresh, n, w, h, quality, workers, PSNR_EVERY).into_iter();
+        // PLAN, sequentially and cheaply: each non-repeat frame becomes a
+        // keyframe or a patch of its changed blocks. The expensive compression
+        // below only needs each job's own frame, so it stays parallel.
+        let mut jobs: Vec<Job> = Vec::new();
+        for (f, dup) in batch.iter().zip(&dups) {
+            if *dup {
+                since_key += 1;
+                continue;
+            }
+            let job = match reference.as_mut() {
+                Some(r) if since_key < KEY_EVERY => {
+                    let blocks = crate::patch::changed_blocks(f, r, w, h, tol);
+                    if blocks.len() * 100 > n_blocks * KEY_IF_CHANGED_PCT {
+                        None
+                    } else {
+                        crate::patch::update_reference(r, f, w, h, &blocks);
+                        Some(Job::Patch(f.as_slice(), blocks))
+                    }
+                }
+                _ => None,
+            };
+            match job {
+                Some(j) => { since_key += 1; patches += 1; jobs.push(j); }
+                None => {
+                    reference = Some(f.clone());
+                    since_key = 1;
+                    jobs.push(Job::Key(f.as_slice()));
+                }
+            }
+        }
+        let mut encoded = encode_jobs(&jobs, n, w, h, quality, workers, PSNR_EVERY).into_iter();
         let mut failed = None;
         for dup in &dups {
             let (payload, p) = if *dup {
@@ -245,7 +284,7 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
     progress(n, n);
     let mut out = writer.finish().map_err(|e| format!("finishing the file: {e}"))?;
     let output_bytes = out.stream_position().unwrap_or(0);
-    Ok((out, TranscodeReport { frames: n, repeats, w, h, input_bytes, output_bytes,
+    Ok((out, TranscodeReport { frames: n, repeats, patches, w, h, input_bytes, output_bytes,
                                mean_psnr: if psnr_n == 0 { 0.0 } else { psnr_sum / psnr_n as f64 } }))
 }
 
@@ -272,6 +311,19 @@ fn mark_repeats(batch: &[Vec<u8>], prev: Option<&[u8]>, mut run: usize) -> (Vec<
         before = Some(f.as_slice());
     }
     (out, run)
+}
+
+/// A keyframe at least this often, so seeking into a run decodes at most this
+/// many (cheap) patch frames forward from its keyframe.
+pub const KEY_EVERY: usize = 60;
+/// Past this share of blocks changed, a patch saves nothing: send a keyframe,
+/// which also resets every block's reference exactly.
+pub const KEY_IF_CHANGED_PCT: usize = 70;
+
+/// One frame's encoding work.
+pub(crate) enum Job<'a> {
+    Key(&'a [u8]),
+    Patch(&'a [u8], Vec<usize>),
 }
 
 /// Measure PSNR on one frame in this many. Measuring means DECODING the frame
@@ -318,20 +370,37 @@ fn encode_one(rgb: &[u8], w: usize, h: usize, quality: u8, measure: bool) -> (Ve
 /// (tested). `first` is the batch's first frame number, for PSNR sampling.
 fn encode_batch<T: AsRef<[u8]> + Sync>(batch: &[T], first: usize, w: usize, h: usize, quality: u8,
                 workers: usize, psnr_every: usize) -> Vec<(Vec<u8>, Option<f64>)> {
+    let jobs: Vec<Job> = batch.iter().map(|f| Job::Key(f.as_ref())).collect();
+    encode_jobs(&jobs, first, w, h, quality, workers, psnr_every)
+}
+
+/// One job: a keyframe (PSNR if sampled) or a patch frame (never measured --
+/// its quality is the keyframe path's, on fewer blocks).
+fn encode_job(job: &Job, w: usize, h: usize, quality: u8, measure: bool) -> (Vec<u8>, Option<f64>) {
+    match job {
+        Job::Key(f) => encode_one(f, w, h, quality, measure),
+        Job::Patch(f, blocks) => (crate::patch::encode(f, w, h, blocks, quality), None),
+    }
+}
+
+/// `encode_batch` over mixed jobs: same contiguous-run, fixed-slot scheme, so
+/// results come back in job order whichever thread finishes first.
+fn encode_jobs(jobs: &[Job], first: usize, w: usize, h: usize, quality: u8,
+               workers: usize, psnr_every: usize) -> Vec<(Vec<u8>, Option<f64>)> {
     let every = psnr_every.max(1);
-    if workers <= 1 || batch.len() <= 1 {
-        return batch.iter().enumerate()
-            .map(|(k, f)| encode_one(f.as_ref(), w, h, quality, (first + k) % every == 0))
+    if workers <= 1 || jobs.len() <= 1 {
+        return jobs.iter().enumerate()
+            .map(|(k, j)| encode_job(j, w, h, quality, (first + k) % every == 0))
             .collect();
     }
-    let chunk = batch.len().div_ceil(workers);
-    let mut out: Vec<Option<(Vec<u8>, Option<f64>)>> = (0..batch.len()).map(|_| None).collect();
+    let chunk = jobs.len().div_ceil(workers);
+    let mut out: Vec<Option<(Vec<u8>, Option<f64>)>> = (0..jobs.len()).map(|_| None).collect();
     std::thread::scope(|sc| {
-        for (ci, (frames, slots)) in batch.chunks(chunk).zip(out.chunks_mut(chunk)).enumerate() {
+        for (ci, (js, slots)) in jobs.chunks(chunk).zip(out.chunks_mut(chunk)).enumerate() {
             sc.spawn(move || {
-                for (k, (f, slot)) in frames.iter().zip(slots.iter_mut()).enumerate() {
+                for (k, (j, slot)) in js.iter().zip(slots.iter_mut()).enumerate() {
                     let idx = first + ci * chunk + k;
-                    *slot = Some(encode_one(f.as_ref(), w, h, quality, idx % every == 0));
+                    *slot = Some(encode_job(j, w, h, quality, idx % every == 0));
                 }
             });
         }
@@ -683,6 +752,141 @@ mod tests {
         let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
         assert_ne!(f.marker(MAX_REPEAT_RUN + 1), Some(b'R'), "a real frame at the cap");
         assert_eq!(f.decode_rgb(319).unwrap(), f.decode_rgb(0).unwrap(), "the last frame decodes to the picture");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A DETAILED static background with a small moving, animating box -- the
+    /// shape of game footage patches are for (a textured scene and HUD that sit
+    /// still, a part that moves). Lossless (ffv1), so decoded frames can be
+    /// compared with the true source.
+    ///
+    /// DETAILED ON PURPOSE. A first version used a flat grey background, and
+    /// patches came out LARGER than whole keyframes (~1,350 vs 1,125 bytes):
+    /// in a DCT codec flat blocks are nearly free, so a keyframe of a flat
+    /// scene is already mostly the moving box, and a patch carries that same
+    /// detail plus its own fixed overhead. Patches win where keyframes keep
+    /// paying for STATIC DETAIL -- `geq` draws a pattern that is a pure
+    /// function of position: detailed, and truly static.
+    fn moving_box_source(dir: &std::path::Path) -> (std::path::PathBuf, Vec<Vec<u8>>, usize, usize) {
+        let (w, h) = (160usize, 96usize);
+        let src = dir.join("box.mkv");
+        make(&src, &["-f", "lavfi", "-i",
+            "nullsrc=s=160x96:r=30,geq=r='mod(X*7+Y*3,256)':g='mod(X*3+Y*11,256)':b='mod(X*13+Y*5,256)'[bg];\
+             testsrc2=s=32x32:r=30[fg];[bg][fg]overlay=x='t*30':y=30",
+            "-t", "3", "-c:v", "ffv1"]);
+        let raw = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&src)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]).output().unwrap().stdout;
+        let frames: Vec<Vec<u8>> = raw.chunks(w * h * 3).map(|c| c.to_vec()).collect();
+        (src, frames, w, h)
+    }
+
+    /// PATCHES ARE USED, AND ARE SMALL: most frames become patch frames, and
+    /// the file is a fraction of what keyframes alone would take.
+    #[test]
+    fn a_mostly_static_scene_becomes_small_patch_frames() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-patch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, frames, w, h) = moving_box_source(&dir);
+        let out = dir.join("out.fao");
+        let rep = transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        assert_eq!(rep.frames, frames.len());
+        let keys = rep.frames - rep.repeats - rep.patches;
+        assert!(keys >= 2 && keys <= 3, "a keyframe per {KEY_EVERY} frames over 90: {keys}");
+        // Everything else is a patch or a REPEAT -- and this source has exact
+        // repeats (the overlay's frame sync duplicates frames). A first version
+        // asserted 80+ patches and got 54; ffmpeg's framemd5 counts 34 repeats,
+        // and 54 + 34 + 2 keyframes = 90. So: repeats must match ffmpeg's own
+        // count, and every other non-keyframe must be a patch.
+        let hashes = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&src)
+            .args(["-pix_fmt", "rgb24", "-f", "framemd5", "-"]).output().unwrap();
+        let hs: Vec<String> = String::from_utf8_lossy(&hashes.stdout).lines()
+            .filter(|l| !l.starts_with('#')).map(|l| l.rsplit(',').next().unwrap().trim().to_string()).collect();
+        let expected_repeats = hs.windows(2).filter(|w| w[0] == w[1]).count();
+        assert_eq!(rep.repeats, expected_repeats, "repeats per ffmpeg");
+        assert_eq!(rep.patches, rep.frames - rep.repeats - keys, "every other non-keyframe is a patch");
+        assert!(rep.patches >= 40, "and there are plenty of them: {}", rep.patches);
+        let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        let key_bytes = f.payload(0).unwrap().len();
+        let all_keys = key_bytes * rep.frames;
+        assert!((rep.output_bytes as usize) * 3 < all_keys,
+                "patches must cut the file well below keyframes-only: {} vs ~{}", rep.output_bytes, all_keys);
+        let _ = (w, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NO DRIFT: every decoded frame stays close to its TRUE source, and the
+    /// last frame before a keyframe is no worse than the first after one. A
+    /// codec predicting from the previous SOURCE would degrade across the run.
+    #[test]
+    fn patch_frames_do_not_drift_from_the_source() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-drift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, frames, w, h) = moving_box_source(&dir);
+        let out = dir.join("out.fao");
+        transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        let ps: Vec<f64> = (0..f.frame_count()).map(|i| psnr(&frames[i], &f.decode_rgb(i).unwrap())).collect();
+        let worst = ps.iter().cloned().fold(f64::INFINITY, f64::min);
+        // RELATIVE TO THE KEYFRAME, not an absolute floor: this pattern is hard
+        // for 8x8 DCT, so a keyframe itself measures ~26 dB. Measured: key 26.08,
+        // frame 30 26.03, frame 59 26.00, worst 25.90 -- flat across the run.
+        let key = ps[0];
+        assert!(worst > key - 1.0, "no frame much worse than a keyframe: key {key:.2}, worst {worst:.2} dB");
+        let (first, last) = (ps[1], ps[KEY_EVERY - 1]);
+        assert!(last > first - 1.0, "no degradation across a run: frame 1 {first:.2} dB, frame {} {last:.2} dB", KEY_EVERY - 1);
+        let _ = (w, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE TEST THAT SEPARATES THE DESIGNS: a slow fade, one level per frame --
+    /// under the skip tolerance (2 at quality 80). Judging each block against
+    /// the PREVIOUS frame would skip every step and the error would climb a
+    /// level per frame, silently, for the whole run. Judging it against what was
+    /// LAST SENT resends after a few frames, so error stays bounded.
+    #[test]
+    fn a_slow_fade_under_the_tolerance_does_not_accumulate() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-fade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (w, h) = (64usize, 48usize);
+        let src = dir.join("fade.mkv");
+        make(&src, &["-f", "lavfi", "-i", "nullsrc=s=64x48:r=30,geq=r='60+N':g='60+N':b='60+N'",
+                     "-frames:v", "59", "-c:v", "ffv1"]);
+        let raw = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&src)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]).output().unwrap().stdout;
+        let frames: Vec<&[u8]> = raw.chunks(w * h * 3).collect();
+        let out = dir.join("out.fao");
+        transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        let last = f.frame_count() - 1;
+        let err = f.decode_rgb(last).unwrap().iter().zip(frames[last]).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        assert!(err <= 6, "the fade's last frame is within a few levels of its source, not {last} behind: max error {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEEKING into a run -- a fresh reader asked for frame 45 first -- decodes
+    /// the same picture as playing 0..=45 in order.
+    #[test]
+    fn seeking_into_a_run_matches_playing_up_to_it() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-seek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, _frames, _w, _h) = moving_box_source(&dir);
+        let out = dir.join("out.fao");
+        transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let played = crate::decode::FaoFile::parse(bytes.clone()).unwrap();
+        let mut last = Vec::new();
+        for i in 0..=45 { last = played.decode_rgb(i).unwrap(); }
+        let seeked = crate::decode::FaoFile::parse(bytes).unwrap();
+        assert_eq!(seeked.marker(45), Some(crate::patch::MARKER), "frame 45 is a patch, so the seek walks back");
+        assert_eq!(seeked.decode_rgb(45).unwrap(), last);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

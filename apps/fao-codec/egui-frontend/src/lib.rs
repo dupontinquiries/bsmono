@@ -29,6 +29,9 @@ pub mod stream;
 /// Reading a remote `.fao` over HTTP byte ranges: a pure block cache plus a
 /// ureq transport, so the streaming player can play files on a dufs server.
 pub mod http_range;
+/// Quiltstone: block-patch frames (marker M) -- only the 16x16 blocks that
+/// changed, over the Keystone DCT codec.
+pub mod patch;
 /// The media collection: video files from local folders and dufs servers, with
 /// glob patterns and individual selection. Distinct from the mesh Web Library.
 /// Fast sampled estimate of what a SHARED block dictionary would save across a

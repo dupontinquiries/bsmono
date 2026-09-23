@@ -150,6 +150,11 @@ pub const CATALOG: &[Codec] = &[
         what: "the web thesis in its strongest 2D form",
         status: Status::Research, encode: None,
         decode: Decode::No("no container marker -- research module only") },
+    // The one entry authored in THIS frontend rather than ported: the reference
+    // app and CLI do not know marker M and will show these frames as gaps.
+    Codec { codename: "Quiltstone", version: "egui block patch", marker: Some(b'M'),
+        what: "only the 16x16 blocks that changed, over the previous frame -- Keystone DCT underneath",
+        status: Status::Current, encode: Some("transcode (patch frames between keyframes)"), decode: Decode::Yes },
 ];
 
 /// The codec that wrote a frame, from its marker byte.
@@ -215,7 +220,7 @@ mod tests {
     /// ('R' is a repeat marker, not a codec, and resolves to the frame it repeats.)
     #[test]
     fn every_decoded_marker_has_a_codename() {
-        for m in [b'D', b'P', b'L', b'K', b'T', b'V', b'Z', b'X'] {
+        for m in [b'D', b'P', b'L', b'K', b'T', b'V', b'Z', b'X', b'M'] {
             assert!(by_marker(m).is_some(), "marker '{}' has no codename", m as char);
         }
     }
@@ -227,7 +232,9 @@ mod tests {
     fn only_real_encoders_are_selectable_for_encoding() {
         let enc: Vec<_> = CATALOG.iter().filter(|c| c.unavailable(Purpose::Encode).is_none())
             .map(|c| c.codename).collect();
-        assert_eq!(enc, vec!["Keystone"]);
+        // Quiltstone joined when the transcoder began writing patch frames --
+        // a REAL encoder: its output is decoded and checked in transcode's tests.
+        assert_eq!(enc, vec!["Keystone", "Quiltstone"]);
         let drift = CATALOG.iter().find(|c| c.codename == "Driftwing").unwrap();
         assert!(drift.unavailable(Purpose::Encode).unwrap().contains("estimated"));
     }
