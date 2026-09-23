@@ -32,6 +32,8 @@ use khronos_egl as egl;
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{
     wl_buffer::{self, WlBuffer},
+    wl_keyboard::{self, WlKeyboard},
+    wl_output::WlOutput,
     wl_callback::WlCallback,
     wl_compositor::WlCompositor,
     wl_pointer::{self, WlPointer},
@@ -52,6 +54,10 @@ use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_view
 use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1},
     wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+};
+use wayland_protocols_wlr::output_power_management::v1::client::{
+    zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1,
+    zwlr_output_power_v1::{self, Mode as PowerMode, ZwlrOutputPowerV1},
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
@@ -111,13 +117,17 @@ impl Role {
 }
 
 /// Input in surface-local logical coordinates; `Io::to_screen` maps it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Input {
     Down { role: Role, slot: i32, x: f32, y: f32, t: u32 },
     Move { role: Role, slot: i32, x: f32, y: f32, t: u32 },
     Up { role: Role, slot: i32, t: u32 },
     /// Pointer motion with no button held (hover, for egui).
     Hover { role: Role, x: f32, y: f32 },
+    /// A key on the overlay (the only surface that takes keyboard focus):
+    /// keysym per xkbcommon, the UTF-8 it produces (empty for non-text),
+    /// and modifiers.
+    Key { pressed: bool, keysym: u32, utf8: String, ctrl: bool, alt: bool, shift: bool },
     Cancel,
 }
 
@@ -215,6 +225,14 @@ pub struct State {
     ptr_pos: (f32, f32),
     ptr_down: bool,
     touch_roles: HashMap<i32, (Role, (f32, f32))>,
+    keyboard: Option<WlKeyboard>,
+    xkb_ctx: xkbcommon::xkb::Context,
+    xkb: Option<xkbcommon::xkb::State>,
+    /// (rate per second, delay ms) from wl_keyboard.repeat_info.
+    pub repeat: (i32, i32),
+    /// zwlr_output_power_v1 per output, and the last mode each reported.
+    powers: Vec<ZwlrOutputPowerV1>,
+    pub power_status: String,
     cursor_mgr: Option<WpCursorShapeManagerV1>,
     shape_device: Option<WpCursorShapeDeviceV1>,
     /// Serial of the last pointer enter: set_shape / set_cursor must quote it.
@@ -270,6 +288,9 @@ pub struct Io {
     right_enabled: bool,
     /// (surface width, exclusive zone) per side surface (bar, peeks).
     side_sizes: HashMap<Role, (u32, i32)>,
+    _outputs: Vec<WlOutput>,
+    /// The overlay currently asks for exclusive keyboard focus.
+    overlay_keyboard: bool,
 }
 
 impl Io {
@@ -283,6 +304,11 @@ impl Io {
         let layer_shell: ZwlrLayerShellV1 = globals.bind(&qh, 1..=4, ()).map_err(|_| "no zwlr_layer_shell_v1")?;
         let seat: Option<WlSeat> = globals.bind(&qh, 1..=7, ()).ok();
         let frac_mgr: Option<WpFractionalScaleManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+        // Panel off/on without suspending: one power object per output.
+        let power_mgr: Option<ZwlrOutputPowerManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+        let outputs: Vec<WlOutput> = globals.contents().with_list(|list| {
+            list.iter().filter(|g| g.interface == "wl_output").map(|g| globals.registry().bind::<WlOutput, _, _>(g.name, g.version.min(4), &qh, ())).collect()
+        });
         let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
         let st = State {
             surfs: Vec::new(),
@@ -293,13 +319,25 @@ impl Io {
             ptr_pos: (0.0, 0.0),
             ptr_down: false,
             touch_roles: HashMap::new(),
+            keyboard: None,
+            xkb_ctx: xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS),
+            xkb: None,
+            repeat: (25, 400),
+            powers: Vec::new(),
+            power_status: String::new(),
             cursor_mgr: globals.bind(&qh, 1..=1, ()).ok(),
             shape_device: None,
             enter_serial: None,
             overlay_cursor: CursorWant::Shape(Shape::Default),
             applied: None,
         };
-        let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, frac_mgr, viewporter, strip_px, show_strips, right_enabled: false, side_sizes: HashMap::new() };
+        let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, frac_mgr, viewporter, strip_px, show_strips, right_enabled: false, side_sizes: HashMap::new(), _outputs: outputs, overlay_keyboard: false };
+        if let Some(m) = &power_mgr {
+            io.st.powers = io._outputs.iter().map(|o| m.get_output_power(o, &io.qh, ())).collect();
+            io.st.power_status = format!("output power: {} output(s)", io.st.powers.len());
+        } else {
+            io.st.power_status = "output power: zwlr_output_power_manager_v1 not offered".into();
+        }
         for r in [Role::Top, Role::Bottom, Role::Right] {
             io.create(r);
         }
@@ -337,7 +375,7 @@ impl Io {
         } else {
             layer.set_exclusive_zone(-1);
         }
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.set_keyboard_interactivity(if role == Role::Overlay && self.overlay_keyboard { KeyboardInteractivity::Exclusive } else { KeyboardInteractivity::None });
         // EGL surfaces get fractional scaling; strips are transparent, so
         // their scale is irrelevant.
         let (frac, viewport) = if matches!(role, Role::Overlay | Role::Bar) {
@@ -478,6 +516,39 @@ impl Io {
 
 
 
+    pub fn st_repeat(&self) -> (i32, i32) {
+        self.st.repeat
+    }
+
+    pub fn power_status(&self) -> String {
+        self.st.power_status.clone()
+    }
+
+    /// Panel on or off (all outputs). Returns what happened, for the trace.
+    pub fn set_display_power(&mut self, on: bool) -> String {
+        if self.st.powers.is_empty() {
+            return self.st.power_status.clone();
+        }
+        for p in &self.st.powers {
+            p.set_mode(if on { PowerMode::On } else { PowerMode::Off });
+        }
+        self.flush();
+        format!("output power: set {} on {} output(s)", if on { "on" } else { "off" }, self.st.powers.len())
+    }
+
+    /// Whether the overlay takes keyboard focus exclusively (palette or
+    /// settings open). Off, keys go to the app underneath as usual.
+    pub fn set_overlay_keyboard(&mut self, exclusive: bool) {
+        if self.overlay_keyboard == exclusive {
+            return;
+        }
+        self.overlay_keyboard = exclusive;
+        if let Some(s) = self.surf(Role::Overlay) {
+            s.layer.set_keyboard_interactivity(if exclusive { KeyboardInteractivity::Exclusive } else { KeyboardInteractivity::None });
+            s.wl.commit();
+        }
+    }
+
     /// The cursor over the overlay (egui's icon, or hidden in fat mode).
     pub fn set_overlay_cursor(&mut self, want: CursorWant) {
         self.st.overlay_cursor = want;
@@ -567,6 +638,47 @@ noop!(WlRegion);
 noop!(ZwlrLayerShellV1);
 noop!(WlCallback);
 noop!(WpCursorShapeManagerV1);
+noop!(ZwlrOutputPowerManagerV1);
+noop!(WlOutput);
+
+impl Dispatch<ZwlrOutputPowerV1, ()> for State {
+    fn event(st: &mut Self, _: &ZwlrOutputPowerV1, e: zwlr_output_power_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match e {
+            zwlr_output_power_v1::Event::Mode { mode } => st.power_status = format!("output power: compositor reports {mode:?}"),
+            zwlr_output_power_v1::Event::Failed => st.power_status = "output power: compositor reported failure (object dead)".into(),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlKeyboard, ()> for State {
+    fn event(st: &mut Self, _: &WlKeyboard, e: wl_keyboard::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        use xkbcommon::xkb;
+        match e {
+            wl_keyboard::Event::Keymap { format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1), fd, size } => {
+                // SAFETY: the compositor hands us a read-only keymap of `size` bytes.
+                let km = unsafe { xkb::Keymap::new_from_fd(&st.xkb_ctx, fd, size as usize, xkb::KEYMAP_FORMAT_TEXT_V1, xkb::KEYMAP_COMPILE_NO_FLAGS) };
+                st.xkb = km.ok().flatten().map(|k| xkb::State::new(&k));
+            }
+            wl_keyboard::Event::Modifiers { mods_depressed, mods_latched, mods_locked, group, .. } => {
+                if let Some(x) = &mut st.xkb {
+                    x.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+                }
+            }
+            wl_keyboard::Event::RepeatInfo { rate, delay } => st.repeat = (rate, delay),
+            wl_keyboard::Event::Key { key, state, .. } => {
+                let Some(x) = &st.xkb else { return };
+                let code = xkb::Keycode::new(key + 8);
+                let keysym = x.key_get_one_sym(code).raw();
+                let pressed = matches!(state, WEnum::Value(wl_keyboard::KeyState::Pressed));
+                let utf8 = if pressed { x.key_get_utf8(code) } else { String::new() };
+                let m = |n: &str| x.mod_name_is_active(n, xkb::STATE_MODS_EFFECTIVE);
+                st.input.push(Input::Key { pressed, keysym, utf8, ctrl: m(xkb::MOD_NAME_CTRL), alt: m(xkb::MOD_NAME_ALT), shift: m(xkb::MOD_NAME_SHIFT) });
+            }
+            _ => {}
+        }
+    }
+}
 noop!(WpFractionalScaleManagerV1);
 noop!(WpViewporter);
 noop!(WpViewport);
@@ -633,6 +745,9 @@ impl Dispatch<WlSeat, ()> for State {
                 let p = seat.get_pointer(qh, ());
                 st.shape_device = st.cursor_mgr.as_ref().map(|m| m.get_pointer(&p, qh, ()));
                 st.pointer = Some(p);
+            }
+            if c.contains(wl_seat::Capability::Keyboard) && st.keyboard.is_none() {
+                st.keyboard = Some(seat.get_keyboard(qh, ()));
             }
             if c.contains(wl_seat::Capability::Touch) && st.touch.is_none() {
                 st.touch = Some(seat.get_touch(qh, ()));

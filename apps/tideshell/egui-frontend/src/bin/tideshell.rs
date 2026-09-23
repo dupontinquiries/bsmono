@@ -19,7 +19,7 @@ use egui::{Pos2, Rect, Vec2};
 use tideshell_core::{Action, Shell, TouchEvent};
 use tideshell_egui::effects::{self, Executor, Outcome, System};
 use tideshell_egui::layer::{shape_for, CursorWant, Gl, Input, Io, Role, POINTER_SLOT};
-use tideshell_egui::{AppTile, FrameInfo, ShellView};
+use tideshell_egui::{key_events, AppTile, FrameInfo, ShellView};
 
 const STRIP_PX: u32 = 28;
 
@@ -39,6 +39,7 @@ struct Shellbox {
     /// Wet / palm / pocket rejection in front of every consumer.
     filter: tideshell_core::touchfilter::TouchFilter,
     filter_stats: tideshell_core::touchfilter::Stats,
+    pending_display_power: Option<bool>,
 }
 
 impl Shellbox {
@@ -77,7 +78,11 @@ impl Shellbox {
                     self.backlight.set(*v);
                     continue;
                 }
-                Action::DisplayPower(_) => Outcome::Unwired("display power: zwlr_output_power transport not wired yet"),
+                // Executed by the layer runtime (it owns the Wayland connection).
+                Action::DisplayPower(on) => {
+                    self.pending_display_power = Some(*on);
+                    continue;
+                }
                 // The overlay IS the trackpad surface here; nothing to execute.
                 Action::ShowTrackpad(on) => Outcome::Done(format!("trackpad {}", if *on { "on" } else { "off" })),
                 _ => match self.windows.as_mut() {
@@ -227,6 +232,7 @@ fn main() {
         ei_drop_noted: false,
         filter: tideshell_core::touchfilter::TouchFilter::default(),
         filter_stats: tideshell_core::touchfilter::Stats::default(),
+        pending_display_power: None,
     };
     sb.backlight.set_rate(sb.shell.prefs.brightness_rate);
     // Auto-brightness ramps from the real current level, or not at all.
@@ -273,6 +279,9 @@ fn main() {
     // comfortgov reads the mtime of this file as "last user input".
     let hint = std::env::var_os("XDG_RUNTIME_DIR").map(|r| std::path::PathBuf::from(r).join("comfortgov.input"));
     let mut last_hint = 0u64;
+    // Key repeat: the held key's events and when to repeat them next.
+    let mut held: Option<(Vec<egui::Event>, u64)> = None;
+    let mut last_power_status = String::new();
     let trace_stderr = std::env::var("TIDESHELL_TRACE").is_ok_and(|v| v == "stderr");
     let mut printed: Vec<String> = Vec::new();
     loop {
@@ -342,6 +351,16 @@ fn main() {
                 }
                 Input::Hover { role: Role::Overlay, x, y } => overlay_events.push(egui::Event::PointerMoved(Pos2::new(x, y))),
                 Input::Hover { .. } => {}
+                Input::Key { pressed, keysym, utf8, ctrl, alt, shift } => {
+                    let ev = key_events(pressed, keysym, &utf8, ctrl, alt, shift, false);
+                    if pressed {
+                        let (rate, delay) = io.st_repeat();
+                        held = (rate > 0).then(|| (key_events(true, keysym, &utf8, ctrl, alt, shift, true), now_ms + delay.max(0) as u64));
+                    } else {
+                        held = None;
+                    }
+                    overlay_events.extend(ev);
+                }
                 Input::Down { role, slot, x, y, .. } => {
                     if let Some((sx, sy)) = io.to_screen(role, x, y) {
                         actions.extend(sb.shell.on_edge_touch(TouchEvent::Down { slot, x: sx, y: sy, t: now_ms }));
@@ -360,8 +379,25 @@ fn main() {
                 }
             }
         }
+        if let Some((ev, next)) = &mut held {
+            if now_ms >= *next {
+                overlay_events.extend(ev.iter().cloned());
+                let (rate, _) = io.st_repeat();
+                *next = now_ms + (1000 / rate.max(1)) as u64;
+            }
+        }
         actions.extend(sb.shell.tick(now_ms));
         sb.execute(actions);
+        if let Some(on) = sb.pending_display_power.take() {
+            let msg = io.set_display_power(on);
+            sb.shell.note(msg);
+        }
+        if io.power_status() != last_power_status {
+            last_power_status = io.power_status();
+            sb.shell.note(last_power_status.clone());
+        }
+        // Keys go to the overlay only while it shows something typed into.
+        io.set_overlay_keyboard(sb.shell.palette.open || sb.view.settings_open());
 
         if now_ms.saturating_sub(last_poll) >= 100 {
             last_poll = now_ms;

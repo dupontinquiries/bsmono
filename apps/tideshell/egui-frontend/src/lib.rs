@@ -19,6 +19,56 @@ pub mod wayland;
 pub mod ei;
 #[cfg(feature = "layer")]
 pub mod layer;
+
+/// A key from the compositor (X keysym + the UTF-8 it produced) as egui
+/// events: a Key event for keys egui names, plus a Text event for printable
+/// input (not with Ctrl/Alt held, not control characters). Pure.
+pub fn key_events(pressed: bool, keysym: u32, utf8: &str, ctrl: bool, alt: bool, shift: bool, repeat: bool) -> Vec<egui::Event> {
+    // X11 keysym values (xkbcommon's keysyms.rs), spelled out so this stays
+    // testable without the layer feature.
+    const BACKSPACE: u32 = 0xff08;
+    const TAB: u32 = 0xff09;
+    const RETURN: u32 = 0xff0d;
+    const ESCAPE: u32 = 0xff1b;
+    const HOME: u32 = 0xff50;
+    const LEFT: u32 = 0xff51;
+    const UP: u32 = 0xff52;
+    const RIGHT: u32 = 0xff53;
+    const DOWN: u32 = 0xff54;
+    const END: u32 = 0xff57;
+    const DELETE: u32 = 0xffff;
+    const KP_ENTER: u32 = 0xff8d;
+    let modifiers = egui::Modifiers { alt, ctrl, shift, mac_cmd: false, command: ctrl };
+    let key = match keysym {
+        BACKSPACE => Some(egui::Key::Backspace),
+        TAB => Some(egui::Key::Tab),
+        RETURN | KP_ENTER => Some(egui::Key::Enter),
+        ESCAPE => Some(egui::Key::Escape),
+        HOME => Some(egui::Key::Home),
+        END => Some(egui::Key::End),
+        LEFT => Some(egui::Key::ArrowLeft),
+        UP => Some(egui::Key::ArrowUp),
+        RIGHT => Some(egui::Key::ArrowRight),
+        DOWN => Some(egui::Key::ArrowDown),
+        DELETE => Some(egui::Key::Delete),
+        0x20 => Some(egui::Key::Space),
+        // Letters and digits: from the keysym, which Latin keysyms share with
+        // Unicode, so a RELEASE (no text) still names its key; utf8 alone
+        // lost every release and egui kept the key "down" (found by a test).
+        _ => match char::from_u32(keysym) {
+            Some(c) if c.is_ascii_alphanumeric() => egui::Key::from_name(&c.to_ascii_uppercase().to_string()),
+            _ => None,
+        },
+    };
+    let mut out = Vec::new();
+    if let Some(k) = key {
+        out.push(egui::Event::Key { key: k, physical_key: None, pressed, repeat, modifiers });
+    }
+    if pressed && !ctrl && !alt && !utf8.is_empty() && !utf8.chars().any(|c| c.is_control()) {
+        out.push(egui::Event::Text(utf8.to_string()));
+    }
+    out
+}
 #[cfg(feature = "sensors")]
 pub mod sensors;
 
@@ -1245,6 +1295,22 @@ mod tests {
         view.route_raw(&mut sh, &mut ev, Pos2::ZERO, 0);
         // Only the hover before the press survives; press/drag/release are the recognizer's.
         assert_eq!(ev, vec![egui::Event::PointerMoved(Pos2::new(200.0, 4.0))]);
+    }
+
+    #[test]
+    fn keys_become_egui_keys_and_text() {
+        let ev = key_events(true, 0x61, "a", false, false, false, false);
+        assert!(matches!(ev[0], egui::Event::Key { key: egui::Key::A, pressed: true, .. }));
+        assert_eq!(ev[1], egui::Event::Text("a".into()));
+        assert_eq!(key_events(false, 0x61, "", false, false, false, false).len(), 1, "release: key only, no text");
+        let bs = key_events(true, 0xff08, "\u{8}", false, false, false, false);
+        assert_eq!(bs.len(), 1, "backspace is a key, its control char is not text");
+        assert!(matches!(bs[0], egui::Event::Key { key: egui::Key::Backspace, .. }));
+        let ctrl = key_events(true, 0x61, "a", true, false, false, false);
+        assert_eq!(ctrl.len(), 1, "ctrl+a: key only, no text");
+        assert!(matches!(ctrl[0], egui::Event::Key { modifiers, .. } if modifiers.ctrl && modifiers.command));
+        let e = key_events(true, 0xe9, "\u{e9}", false, false, false, false);
+        assert_eq!(e, vec![egui::Event::Text("\u{e9}".into())], "non-ASCII text has no egui key but is text");
     }
 
     #[test]
