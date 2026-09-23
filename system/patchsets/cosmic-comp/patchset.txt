@@ -6,6 +6,15 @@ base_version = 1.8.0
 base_pkgrel = 0
 source_url = https://github.com/pop-os/cosmic-comp/archive/refs/tags/epoch-{version}.tar.gz
 tag = fleet
+# How it packages. cosmic-comp's `make install` ships the binary AND
+# /usr/share/cosmic/com.system76.CosmicSettings.Shortcuts/v1/defaults and
+# .../WindowRules/v1/tiling_exception_defaults (Makefile at epoch-1.8.0).
+# A binary-only package() would make apk delete both on upgrade: every
+# default shortcut, the volume keys included.
+url = https://github.com/pop-os/cosmic-comp
+license = GPL-3.0-only
+builddir = {pkg}-epoch-{version}
+package = make install DESTDIR="$pkgdir" prefix=/usr
 patch = 0001-input-focus-element-on-first-touch-down.patch | touch down changes keyboard focus like a pointer press
 patch = 0002-dbus-ei-allow-tideshell.patch | EI: allow org.tideshell.Shell (the virtual trackpad)
 tested = nested-cosmic-comp | 2026-09-22 | both patches apply to epoch-1.8.0 and type-check; 0002 verified live (trackpad over EI)

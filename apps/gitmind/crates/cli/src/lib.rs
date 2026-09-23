@@ -1493,6 +1493,7 @@ fn cmd_patchset(rest: &[String]) -> i32 {
             for p in &ps.patches {
                 println!("  {}  {}", p.file, p.subject);
             }
+            println!("  packages as: {} ({}), builddir {}, package(): {}", ps.recipe.url, if ps.recipe.license.is_empty() { "NO LICENSE SET: the APKBUILD will say unknown" } else { &ps.recipe.license }, ps.builddir(), ps.recipe.package.join("; "));
             if ps.tested_on.is_empty() {
                 println!("  UNTESTED: a rollout to the fleet is refused until one device is recorded as tested");
             }

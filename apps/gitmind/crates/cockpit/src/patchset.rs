@@ -47,14 +47,53 @@ pub struct Patchset {
     pub source_url: String,
     /// What the repo tag is, e.g. "fleet".
     pub tag: String,
+    /// How the package is built into an apk (the APKBUILD's per-package
+    /// facts). Distinct per package: cosmic-comp's are not tideshell's.
+    pub recipe: Recipe,
     pub patches: Vec<Patch>,
     pub tested_on: Vec<TestedOn>,
     pub notes: String,
 }
 
+/// The parts of an APKBUILD that differ between packages. The defaults suit
+/// a plain Rust binary crate in a GitHub-style tarball; anything else says
+/// so in its patchset.txt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recipe {
+    /// Project homepage (`url=`). Default: `source_url` up to `/archive/`.
+    pub url: String,
+    /// SPDX licence (`license=`). No sensible default: empty is reported by
+    /// `show` and written as "unknown", which abuild accepts but a reviewer
+    /// should not.
+    pub license: String,
+    /// The unpacked source directory under $srcdir, `{pkg}`/`{version}`
+    /// substituted. Default `{pkg}-{version}`.
+    pub builddir: String,
+    /// The body of package(), one shell line per entry, `{pkg}` substituted.
+    /// Default: install the one binary. A package that ships more than its
+    /// binary MUST list it all: apk removes every file the old package owned
+    /// that the new one does not (cosmic-comp owns its default keybindings).
+    pub package: Vec<String>,
+}
+
+pub const DEFAULT_BUILDDIR: &str = "{pkg}-{version}";
+pub const DEFAULT_PACKAGE: &str = "install -Dm755 target/release/{pkg} \"$pkgdir\"/usr/bin/{pkg}";
+
+impl Recipe {
+    fn defaults(source_url: &str) -> Recipe {
+        let url = source_url.split("/archive/").next().unwrap_or(source_url).to_string();
+        Recipe { url, license: String::new(), builddir: DEFAULT_BUILDDIR.into(), package: vec![DEFAULT_PACKAGE.into()] }
+    }
+}
+
 impl Patchset {
     pub fn pkgrel(&self) -> u32 {
         self.base_pkgrel + 1
+    }
+
+    /// The source directory name under $srcdir.
+    pub fn builddir(&self) -> String {
+        self.recipe.builddir.replace("{pkg}", &self.pkg).replace("{version}", &self.base_version)
     }
 
     /// `1.8.0-r1`.
@@ -72,6 +111,14 @@ impl Patchset {
         s.push_str(&format!("base_pkgrel = {}\n", self.base_pkgrel));
         s.push_str(&format!("source_url = {}\n", self.source_url));
         s.push_str(&format!("tag = {}\n", self.tag));
+        s.push_str(&format!("url = {}\n", self.recipe.url));
+        if !self.recipe.license.is_empty() {
+            s.push_str(&format!("license = {}\n", self.recipe.license));
+        }
+        s.push_str(&format!("builddir = {}\n", self.recipe.builddir));
+        for l in &self.recipe.package {
+            s.push_str(&format!("package = {l}\n"));
+        }
         for p in &self.patches {
             s.push_str(&format!("patch = {} | {}\n", p.file, p.subject));
         }
@@ -88,6 +135,7 @@ impl Patchset {
         let mut kv: BTreeMap<&str, String> = BTreeMap::new();
         let mut patches = Vec::new();
         let mut tested = Vec::new();
+        let mut package: Vec<String> = Vec::new();
         for (n, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -100,6 +148,7 @@ impl Patchset {
                     let (f, subj) = v.split_once('|').ok_or_else(|| format!("line {}: patch = FILE | subject", n + 1))?;
                     patches.push(Patch { file: f.trim().into(), subject: subj.trim().into() });
                 }
+                "package" => package.push(v.to_string()),
                 "tested" => {
                     let parts: Vec<&str> = v.splitn(3, '|').map(str::trim).collect();
                     if parts.len() < 2 {
@@ -113,12 +162,24 @@ impl Patchset {
             }
         }
         let get = |k: &str| kv.get(k).cloned().ok_or_else(|| format!("missing {k}"));
+        let pkg = get("pkg")?;
+        let base_version = get("base_version")?;
+        let base_pkgrel = get("base_pkgrel")?.parse().map_err(|_| "base_pkgrel: not a number".to_string())?;
+        let source_url = get("source_url")?;
+        let d = Recipe::defaults(&source_url);
+        let recipe = Recipe {
+            url: kv.get("url").cloned().unwrap_or(d.url),
+            license: kv.get("license").cloned().unwrap_or(d.license),
+            builddir: kv.get("builddir").cloned().unwrap_or(d.builddir),
+            package: if package.is_empty() { d.package } else { package },
+        };
         Ok(Patchset {
-            pkg: get("pkg")?,
-            base_version: get("base_version")?,
-            base_pkgrel: get("base_pkgrel")?.parse().map_err(|_| "base_pkgrel: not a number".to_string())?,
-            source_url: get("source_url")?,
+            pkg,
+            base_version,
+            base_pkgrel,
+            source_url,
             tag: kv.get("tag").cloned().unwrap_or_else(|| "fleet".into()),
+            recipe,
             patches,
             tested_on: tested,
             notes: kv.get("notes").cloned().unwrap_or_default(),
@@ -158,18 +219,19 @@ pub fn apkbuild_source(ps: &Patchset, arch: &str, build_deps: &[&str]) -> String
     s.push_str(&format!("pkgver={}\n", ps.base_version));
     s.push_str(&format!("pkgrel={}\n", ps.pkgrel()));
     s.push_str(&format!("pkgdesc=\"{} {} with the fleet patchset\"\n", ps.pkg, ps.base_version));
-    s.push_str("url=\"https://github.com/pop-os/cosmic-comp\"\n");
+    s.push_str(&format!("url=\"{}\"\n", ps.recipe.url));
     s.push_str(&format!("arch=\"{arch}\"\n"));
-    s.push_str("license=\"GPL-3.0-only\"\n");
+    s.push_str(&format!("license=\"{}\"\n", if ps.recipe.license.is_empty() { "unknown" } else { &ps.recipe.license }));
     s.push_str("options=\"net !check\"\n");
     s.push_str(&format!("makedepends=\"{}\"\n", build_deps.join(" ")));
     let mut sources = vec![format!("{}-{}.tar.gz::{}", ps.pkg, ps.base_version, ps.source())];
     sources.extend(ps.patches.iter().map(|p| p.file.clone()));
     s.push_str(&format!("source=\"{}\"\n", sources.join("\n\t")));
-    s.push_str(&format!("builddir=\"$srcdir/{}-epoch-{}\"\n\n", ps.pkg, ps.base_version));
+    s.push_str(&format!("builddir=\"$srcdir/{}\"\n\n", ps.builddir()));
     s.push_str("prepare() {\n\tdefault_prepare\n\tcargo fetch --locked\n}\n\n");
     s.push_str("build() {\n\tcargo build --release --frozen\n}\n\n");
-    s.push_str(&format!("package() {{\n\tinstall -Dm755 target/release/{0} \"$pkgdir\"/usr/bin/{0}\n}}\n", ps.pkg));
+    let body: Vec<String> = ps.recipe.package.iter().map(|l| format!("\t{}", l.replace("{pkg}", &ps.pkg))).collect();
+    s.push_str(&format!("package() {{\n{}\n}}\n", body.join("\n")));
     s.push_str("sha512sums=\"SKIP\"\n");
     s
 }
@@ -230,6 +292,27 @@ pub struct Step {
     pub rollback: Option<String>,
 }
 
+/// Where the device keeps the package it had before a rollout.
+pub fn rollback_dir(pkg: &str) -> String {
+    format!("/var/lib/fleet/rollback/{pkg}")
+}
+
+/// Put the kept package back. NOT `apk fix`: that reinstalls whatever the
+/// world selects, and after the freeze the world says `pkg@fleet`, which is
+/// the new build. Installing the kept file restores the old version and
+/// replaces the @fleet world entry, so the tagged repo stops supplying it.
+pub fn revert_cmd(pkg: &str) -> String {
+    format!("apk add --allow-untrusted {}/*.apk", rollback_dir(pkg))
+}
+
+/// Save the currently installed package file under rollback_dir. The
+/// version comes from `apk info -v` ("cosmic-comp-1.8.0-r0" -> "=1.8.0-r0").
+/// Earlier saves are cleared first so the directory holds exactly one apk.
+pub fn keep_cmd(pkg: &str) -> String {
+    let d = rollback_dir(pkg);
+    format!("mkdir -p {d} && rm -f {d}/*.apk && cd {d} && apk fetch {pkg}=$(apk info -v {pkg} | head -n 1 | sed 's/^{pkg}-//') && ls {d}/*.apk")
+}
+
 /// Seconds the dead-man timer gives the new compositor to come up before
 /// the device reverts on its own.
 pub const DEAD_MAN_S: u32 = 180;
@@ -244,19 +327,25 @@ pub fn rollout(ps: &Patchset, freeze: &Freeze, builder_repo_dir: &str, require_t
     let apk = format!("{}-{}.apk", ps.pkg, ps.version_string());
     let mut steps = vec![
         Step { on: Where::Builder, what: "fetch upstream", cmd: format!("cd {d}/{p} && abuild fetch", d = builder_repo_dir, p = ps.pkg), gate: Gate::ExitZero, rollback: None },
-        Step { on: Where::Builder, what: "patches apply cleanly", cmd: format!("cd {d}/{p} && abuild unpack && cd src/{p}-epoch-{v} && for f in {patches}; do git apply --check ../../$f || exit 1; done", d = builder_repo_dir, p = ps.pkg, v = ps.base_version, patches = ps.patches.iter().map(|p| p.file.as_str()).collect::<Vec<_>>().join(" ")), gate: Gate::ExitZero, rollback: None },
+        Step { on: Where::Builder, what: "patches apply cleanly", cmd: format!("cd {d}/{p} && abuild unpack && cd src/{b} && for f in {patches}; do git apply --check ../../$f || exit 1; done", d = builder_repo_dir, p = ps.pkg, b = ps.builddir(), patches = ps.patches.iter().map(|p| p.file.as_str()).collect::<Vec<_>>().join(" ")), gate: Gate::ExitZero, rollback: None },
         Step { on: Where::Builder, what: "build the apk", cmd: format!("cd {d}/{p} && abuild -r -F", d = builder_repo_dir, p = ps.pkg), gate: Gate::ExitZero, rollback: None },
         Step { on: Where::Builder, what: "publish to the fleet repo", cmd: format!("cd {d}/repo && apk index -o APKINDEX.tar.gz *.apk && ls {apk}", d = builder_repo_dir), gate: Gate::Contains(apk.clone()), rollback: None },
-        Step { on: Where::Device, what: "record the installed version", cmd: format!("apk info -v {} | head -1", ps.pkg), gate: Gate::Contains(ps.pkg.clone()), rollback: None },
-        Step { on: Where::Device, what: "arm the dead-man timer", cmd: format!("systemd-run --unit=fleet-revert-{p} --on-active={s} sh -c 'apk fix --allow-untrusted {p} ; systemctl restart display-manager'", p = ps.pkg, s = DEAD_MAN_S), gate: Gate::ExitZero, rollback: Some(format!("systemctl stop fleet-revert-{}.timer", ps.pkg)) },
-        Step { on: Where::Device, what: "install the freeze and the patched package", cmd: freeze.install_cmd(), gate: Gate::ExitZero, rollback: Some(format!("apk fix --allow-untrusted {}", ps.pkg)) },
-        Step { on: Where::Device, what: "the new version is installed", cmd: format!("apk info -v {}", ps.pkg), gate: Gate::Contains(format!("{}-{}", ps.pkg, ps.version_string())), rollback: Some(format!("apk fix --allow-untrusted {}", ps.pkg)) },
+        Step { on: Where::Device, what: "record the installed version", cmd: format!("apk info -v {} | head -n 1", ps.pkg), gate: Gate::Contains(ps.pkg.clone()), rollback: None },
+        // The old package, kept on the device, is what every rollback
+        // reinstalls. `apk fetch NAME=VERSION` asks the repos the device
+        // installed it from; the gate is that a file actually landed.
+        Step { on: Where::Device, what: "keep the installed package for rollback", cmd: keep_cmd(&ps.pkg), gate: Gate::Contains(".apk".into()), rollback: None },
+        Step { on: Where::Device, what: "arm the dead-man timer", cmd: format!("systemd-run --unit=fleet-revert-{p} --on-active={s} sh -c '{r} ; systemctl restart display-manager'", p = ps.pkg, s = DEAD_MAN_S, r = revert_cmd(&ps.pkg)), gate: Gate::ExitZero, rollback: Some(format!("systemctl stop fleet-revert-{}.timer", ps.pkg)) },
+        Step { on: Where::Device, what: "install the freeze and the patched package", cmd: freeze.install_cmd(), gate: Gate::ExitZero, rollback: Some(revert_cmd(&ps.pkg)) },
+        Step { on: Where::Device, what: "the new version is installed", cmd: format!("apk info -v {}", ps.pkg), gate: Gate::Contains(format!("{}-{}", ps.pkg, ps.version_string())), rollback: Some(revert_cmd(&ps.pkg)) },
         Step { on: Where::Device, what: "restart the compositor", cmd: "systemctl restart display-manager".into(), gate: Gate::ExitZero, rollback: None },
         Step { on: Where::Device, what: "the compositor is up again", cmd: format!("sleep 20; pgrep -x {} && journalctl -b --no-pager -u display-manager -n 5", ps.pkg), gate: Gate::Contains("".into()), rollback: None },
         Step { on: Where::Device, what: "disarm the dead-man timer", cmd: format!("systemctl stop fleet-revert-{}.timer", ps.pkg), gate: Gate::ExitZero, rollback: None },
     ];
     // The compositor-up gate: pgrep's exit code is what matters.
-    steps[9].gate = Gate::ExitZero;
+    if let Some(up) = steps.iter_mut().find(|s| s.what == "the compositor is up again") {
+        up.gate = Gate::ExitZero;
+    }
     Ok(steps)
 }
 
@@ -271,6 +360,12 @@ mod tests {
             base_pkgrel: 0,
             source_url: "https://github.com/pop-os/cosmic-comp/archive/refs/tags/epoch-{version}.tar.gz".into(),
             tag: "fleet".into(),
+            recipe: Recipe {
+                url: "https://github.com/pop-os/cosmic-comp".into(),
+                license: "GPL-3.0-only".into(),
+                builddir: "{pkg}-epoch-{version}".into(),
+                package: vec!["make install DESTDIR=\"$pkgdir\" prefix=/usr".into()],
+            },
             patches: vec![
                 Patch { file: "0001-input-focus-element-on-first-touch-down.patch".into(), subject: "touch down focuses the element".into() },
                 Patch { file: "0002-dbus-ei-allow-tideshell.patch".into(), subject: "EI: allow org.tideshell.Shell".into() },
@@ -301,7 +396,32 @@ mod tests {
         assert!(a.contains("epoch-1.8.0.tar.gz"), "the version substituted into the url");
         assert!(a.contains("default_prepare"), "abuild applies the patches");
         assert!(a.contains("options=\"net !check\"") && a.contains("--frozen"));
+        assert!(a.contains("builddir=\"$srcdir/cosmic-comp-epoch-1.8.0\"") && a.contains("url=\"https://github.com/pop-os/cosmic-comp\""));
+        // cosmic-comp's package owns its default keybindings and tiling
+        // exceptions: a binary-only package() would make apk delete them.
+        assert!(a.contains("package() {\n\tmake install DESTDIR=\"$pkgdir\" prefix=/usr\n}"), "{a}");
         assert_eq!(ps.version_string(), "1.8.0-r1");
+    }
+
+    #[test]
+    fn the_fleets_cosmic_comp_patchset_packages_everything_make_install_does() {
+        let ps = Patchset::from_text(include_str!("../../../../../system/patchsets/cosmic-comp/patchset.txt")).unwrap();
+        let a = apkbuild_source(&ps, "aarch64", &["cargo"]);
+        assert!(a.contains("make install DESTDIR=\"$pkgdir\" prefix=/usr"), "the real patchset must not package the binary alone");
+        assert!(a.contains("builddir=\"$srcdir/cosmic-comp-epoch-1.8.0\"") && a.contains("license=\"GPL-3.0-only\""));
+    }
+
+    #[test]
+    fn a_plain_recipe_defaults_and_nothing_is_cosmic_specific() {
+        let t = "pkg = tideshell\nbase_version = 0.3.0\nbase_pkgrel = 0\nsource_url = https://example.org/tideshell/archive/v{version}.tar.gz\n";
+        let ps = Patchset::from_text(t).unwrap();
+        assert_eq!(ps.recipe.url, "https://example.org/tideshell");
+        assert_eq!(ps.builddir(), "tideshell-0.3.0");
+        let a = apkbuild_source(&ps, "aarch64", &["cargo"]);
+        assert!(!a.contains("cosmic") && !a.contains("GPL"), "{a}");
+        assert!(a.contains("license=\"unknown\"") && a.contains("install -Dm755 target/release/tideshell \"$pkgdir\"/usr/bin/tideshell"));
+        assert_eq!(Patchset::from_text(&ps.to_text()).unwrap(), ps, "defaults round-trip");
+        assert_eq!(ps.version_string(), "0.3.0-r1");
     }
 
     #[test]
@@ -339,7 +459,13 @@ mod tests {
         assert!(steps.iter().take_while(|s| s.on == Where::Builder).count() == 4, "the builder finishes before any device step");
         let install = &steps[idx("the new version is installed")];
         assert_eq!(install.gate, Gate::Contains("cosmic-comp-1.8.0-r1".into()));
-        assert!(install.rollback.as_deref().unwrap().contains("apk fix"), "every device step until confirmation can roll back");
+        let rb = install.rollback.as_deref().unwrap();
+        assert_eq!(rb, "apk add --allow-untrusted /var/lib/fleet/rollback/cosmic-comp/*.apk", "rollback reinstalls the kept package");
+        assert!(!steps.iter().any(|s| s.cmd.contains("apk fix") || s.rollback.as_deref().is_some_and(|r| r.contains("apk fix"))), "apk fix reinstalls the @fleet build, it does not revert");
+        assert!(idx("keep the installed package for rollback") < idx("arm the dead-man timer"), "the old package is on disk before anything can need it");
+        let keep = &steps[idx("keep the installed package for rollback")].cmd;
+        assert!(keep.contains("apk fetch cosmic-comp=$(") && keep.contains("sed 's/^cosmic-comp-//'"), "{keep}");
+        assert!(steps[idx("arm the dead-man timer")].cmd.contains(&revert_cmd("cosmic-comp")));
         assert!(steps[idx("arm the dead-man timer")].cmd.contains(&format!("--on-active={DEAD_MAN_S}")));
     }
 }
