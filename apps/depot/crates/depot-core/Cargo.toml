@@ -14,6 +14,7 @@ sha2 = "0.10"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tar = { version = "0.4", default-features = false }
 crypto-kit = { path = "../../../../shared/crypto-kit" }
+depot-auth = { path = "../../../../shared/depot-auth" }
 zeroize = "1"
 zstd = { version = "0.13", optional = true }
 

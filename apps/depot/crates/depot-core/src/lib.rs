@@ -28,6 +28,7 @@
 pub mod alpine;
 pub mod api;
 pub mod catalog;
+pub mod clients;
 pub mod config;
 pub mod crates;
 pub mod depot;

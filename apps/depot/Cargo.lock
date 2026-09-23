@@ -203,6 +203,7 @@ name = "depot"
 version = "0.1.0"
 dependencies = [
  "cli-kit",
+ "depot-auth",
  "depot-core",
  "depot-httpd",
  "libc",
@@ -214,10 +215,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "depot-auth"
+version = "0.1.0"
+dependencies = [
+ "crypto-kit",
+ "sha2",
+]
+
+[[package]]
 name = "depot-core"
 version = "0.1.0"
 dependencies = [
  "crypto-kit",
+ "depot-auth",
  "flate2",
  "serde",
  "serde_json",
