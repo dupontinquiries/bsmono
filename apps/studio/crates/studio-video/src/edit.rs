@@ -281,6 +281,76 @@ pub fn render_args(segments: &[Segment], audio: Option<&Path>, out: &Path, w: u3
 
 /// `render_args` with an explicit fit policy.
 pub fn render_args_with(segments: &[Segment], audio: Option<&Path>, out: &Path, w: u32, h: u32, fps: u32, fit: Fit) -> Vec<String> {
+    render_args_enc(segments, audio, out, w, h, fps, fit, VideoEncoder::X264)
+}
+
+/// The video encoder a render uses.
+///
+/// `libx264` was HARDCODED, and Fedora's ffmpeg (`ffmpeg-free`) does not have
+/// it -- licensing -- so on those machines every video export failed. The
+/// fleet already knew: fao-codec's test fixtures moved off libx264 for the same
+/// Fedora boxes. Fedora does ship `libopenh264` (still H.264, plays anywhere),
+/// and `mpeg4` exists in every ffmpeg build as the last resort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoEncoder {
+    X264,
+    OpenH264,
+    Mpeg4,
+}
+
+impl VideoEncoder {
+    /// Best first.
+    pub const PREFERENCE: [VideoEncoder; 3] = [VideoEncoder::X264, VideoEncoder::OpenH264, VideoEncoder::Mpeg4];
+
+    /// ffmpeg's name for it.
+    pub fn name(self) -> &'static str {
+        match self {
+            VideoEncoder::X264 => "libx264",
+            VideoEncoder::OpenH264 => "libopenh264",
+            VideoEncoder::Mpeg4 => "mpeg4",
+        }
+    }
+
+    /// Codec and quality arguments. Each encoder takes quality differently:
+    /// x264 a constant-quality factor, openh264 only a bitrate, mpeg4 a
+    /// quantiser -- the same flag on all three would be ignored by two.
+    pub fn codec_args(self) -> Vec<String> {
+        let a: &[&str] = match self {
+            VideoEncoder::X264 => &["-c:v", "libx264", "-crf", "20", "-preset", "medium"],
+            VideoEncoder::OpenH264 => &["-c:v", "libopenh264", "-b:v", "8M"],
+            VideoEncoder::Mpeg4 => &["-c:v", "mpeg4", "-q:v", "3"],
+        };
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The best encoder in an `ffmpeg -encoders` listing. Pure, so a Fedora
+    /// listing can be tested on a machine that has libx264. Matches the NAME
+    /// column exactly: "libx264" must not match "libx264rgb".
+    pub fn pick(listing: &str) -> Option<VideoEncoder> {
+        let names: Vec<&str> = listing.lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let flags = it.next()?;
+                (flags.starts_with('V') && flags.len() == 6).then(|| it.next()).flatten()
+            })
+            .collect();
+        VideoEncoder::PREFERENCE.into_iter().find(|e| names.contains(&e.name()))
+    }
+
+    /// Ask this machine's ffmpeg, once.
+    pub fn detect() -> Option<VideoEncoder> {
+        static FOUND: std::sync::OnceLock<Option<VideoEncoder>> = std::sync::OnceLock::new();
+        *FOUND.get_or_init(|| {
+            let out = std::process::Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output().ok()?;
+            VideoEncoder::pick(&String::from_utf8_lossy(&out.stdout))
+        })
+    }
+}
+
+/// [`render_args_with`] with the encoder explicit.
+#[allow(clippy::too_many_arguments)]
+pub fn render_args_enc(segments: &[Segment], audio: Option<&Path>, out: &Path, w: u32, h: u32, fps: u32, fit: Fit,
+                       encoder: VideoEncoder) -> Vec<String> {
     let mut args: Vec<String> = vec!["-y".into(), "-hide_banner".into(), "-loglevel".into(), "error".into()];
     // One input per distinct file, in first-use order.
     let mut inputs: Vec<PathBuf> = Vec::new();
@@ -344,8 +414,8 @@ pub fn render_args_with(segments: &[Segment], audio: Option<&Path>, out: &Path, 
         args.push("-c:a".into()); args.push("aac".into());
         args.push("-shortest".into());
     }
-    args.extend(["-c:v".into(), "libx264".into(), "-pix_fmt".into(), "yuv420p".into(),
-                 "-movflags".into(), "+faststart".into()]);
+    args.extend(encoder.codec_args());
+    args.extend(["-pix_fmt".into(), "yuv420p".into(), "-movflags".into(), "+faststart".into()]);
     args.push(out.to_string_lossy().into_owned());
     args
 }
@@ -369,7 +439,18 @@ pub fn render(segments: &[Segment], audio: Option<&Path>, out: &Path, w: u32, h:
     if segments.is_empty() {
         return Err(super::VideoError::UnexpectedOutput("edit list is empty: nothing on the timeline".into()));
     }
-    let args = render_args(segments, audio, out, w, h, fps);
+    let encoder = VideoEncoder::detect().ok_or_else(|| super::VideoError::UnexpectedOutput(
+        "this ffmpeg has none of libx264, libopenh264 or mpeg4 -- cannot write video".into()))?;
+    render_with_encoder(segments, audio, out, w, h, fps, encoder)
+}
+
+/// [`render`] with the encoder chosen by the caller.
+pub fn render_with_encoder(segments: &[Segment], audio: Option<&Path>, out: &Path, w: u32, h: u32, fps: u32,
+                           encoder: VideoEncoder) -> Result<(), super::VideoError> {
+    if segments.is_empty() {
+        return Err(super::VideoError::UnexpectedOutput("edit list is empty: nothing on the timeline".into()));
+    }
+    let args = render_args_enc(segments, audio, out, w, h, fps, Fit::default(), encoder);
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     super::run("ffmpeg", &refs).map(|_| ())
 }
@@ -503,7 +584,9 @@ mod tests {
             let path = std::env::temp_dir().join(format!("studio-edit-{colour}-{}-{}.mp4", std::process::id(),
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()));
             let src = format!("color=c={colour}:s=64x48:r=10:d=1");
-            super::super::run("ffmpeg", &["-y", "-f", "lavfi", "-i", &src, "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            // mpeg4, not libx264: the fixture's own codec is irrelevant here, and
+            // libx264 made this test fail before testing anything on Fedora.
+            super::super::run("ffmpeg", &["-y", "-f", "lavfi", "-i", &src, "-c:v", "mpeg4", "-q:v", "2", "-pix_fmt", "yuv420p",
                 "-an", path.to_str().unwrap()]).expect("fixture");
             path
         };
@@ -539,6 +622,71 @@ mod tests {
         assert!(is(colour_at(1.25), false, false, false), "1.25 s: black, got {:?}", colour_at(1.25));
         assert!(is(colour_at(1.75), true, false, false), "1.75 s: red again, got {:?}", colour_at(1.75));
         for f in [red, blue, out, wav] { let _ = std::fs::remove_file(f); }
+    }
+
+    /// A real `ffmpeg -encoders` line has a six-character flags column; the
+    /// name is the next field.
+    fn listing(names: &[&str]) -> String {
+        let mut l = String::from("Encoders:\n V..... = Video\n ------\n");
+        for n in names { l.push_str(&format!(" V....D {n:<20} some description\n")); }
+        l.push_str(" A....D aac                  AAC (Advanced Audio Coding)\n");
+        l
+    }
+
+    #[test]
+    fn the_best_available_video_encoder_is_picked() {
+        assert_eq!(VideoEncoder::pick(&listing(&["libx264", "libopenh264", "mpeg4"])), Some(VideoEncoder::X264));
+        // FEDORA's ffmpeg-free: no libx264 -- H.264 still, through openh264.
+        assert_eq!(VideoEncoder::pick(&listing(&["libopenh264", "libsvtav1", "mpeg4"])), Some(VideoEncoder::OpenH264));
+        // libx264rgb is a DIFFERENT encoder; a substring match would take it.
+        assert_eq!(VideoEncoder::pick(&listing(&["libx264rgb", "mpeg4"])), Some(VideoEncoder::Mpeg4));
+        assert_eq!(VideoEncoder::pick(&listing(&["libsvtav1"])), None);
+        // The legend line " V..... = Video" must not register an encoder "=".
+        assert_eq!(VideoEncoder::pick(" V..... = Video\n"), None);
+    }
+
+    /// And against THIS machine's real listing, so the parser is checked on
+    /// what ffmpeg actually prints, not only on a hand-made imitation.
+    #[test]
+    fn this_machines_ffmpeg_listing_parses() {
+        if !crate::testkit::ffmpeg_or_skip("this_machines_ffmpeg_listing_parses") { return; }
+        assert!(VideoEncoder::detect().is_some(), "some encoder found in a real ffmpeg -encoders listing");
+    }
+
+    /// THE FALLBACK REALLY RENDERS: the same three-cut edit through mpeg4, as
+    /// a machine with neither libx264 nor openh264 would -- the file is mpeg4,
+    /// the right length, and shows the right picture at the right times.
+    #[test]
+    fn an_export_without_libx264_still_renders_the_edit() {
+        if !crate::testkit::ffmpeg_or_skip("an_export_without_libx264_still_renders_the_edit") { return; }
+        let dir = std::env::temp_dir().join(format!("studio-enc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = |colour: &str| {
+            let path = dir.join(format!("{colour}.mp4"));
+            super::super::run("ffmpeg", &["-y", "-f", "lavfi", "-i", &format!("color=c={colour}:s=64x48:r=10:d=1"),
+                "-c:v", "mpeg4", "-q:v", "2", "-pix_fmt", "yuv420p", "-an", path.to_str().unwrap()]).expect("fixture");
+            path
+        };
+        let (red, blue) = (fixture("red"), fixture("blue"));
+        let paths: BTreeMap<SourceId, PathBuf> = [(SourceId(1), red), (SourceId(2), blue)].into();
+        let mut p = project_with(&paths);
+        clip(&mut p, 1, 1, 1, 0.0, 0.5, 0.0);
+        clip(&mut p, 2, 2, 2, 0.5, 0.5, 0.2);
+        clip(&mut p, 3, 1, 1, 1.5, 0.5, 0.3);
+        let list = edit_list(&p, &paths, None);
+        let out = dir.join("out.mp4");
+        render_with_encoder(&list, None, &out, 64, 48, 10, VideoEncoder::Mpeg4).expect("render through mpeg4");
+        let codec = std::process::Command::new("ffprobe").args(["-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name", "-of", "csv=p=0"]).arg(&out).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&codec.stdout).trim(), "mpeg4");
+        let probe = super::super::probe(&out).expect("probe");
+        assert!((probe.duration.to_seconds() - 2.0).abs() < 0.15, "{:?}", probe.duration);
+        let centre = |t: f64| { let px = super::super::frame_rgb(&out, s(t), 8, 6).unwrap(); let i = (3 * 8 + 4) * 3; (px[i], px[i + 1], px[i + 2]) };
+        let (r, b, k) = (centre(0.25), centre(0.75), centre(1.25));
+        assert!(r.0 > 128 && r.2 < 128, "red at 0.25 s: {r:?}");
+        assert!(b.2 > 128 && b.0 < 128, "blue at 0.75 s: {b:?}");
+        assert!(k.0 < 60 && k.1 < 60 && k.2 < 60, "black gap at 1.25 s: {k:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// THE DEFAULT MUST NOT CHANGE. This pipeline has always fit-inside-and-

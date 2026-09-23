@@ -203,10 +203,22 @@ fn spawn_decoder(p: &Pipe, gray: bool) -> std::io::Result<Child> {
 }
 
 fn spawn_encoder(p: &Pipe, out: &Path, crf: u32) -> std::io::Result<Child> {
+    // Not hardcoded to libx264: Fedora's ffmpeg does not have it, and every
+    // processed clip failed to write there. x264 keeps its tuned settings;
+    // a fallback encoder uses its own (see edit::VideoEncoder).
+    use crate::edit::VideoEncoder;
+    let enc = VideoEncoder::detect().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound,
+        "this ffmpeg has none of libx264, libopenh264 or mpeg4"))?;
+    let codec: Vec<String> = match enc {
+        VideoEncoder::X264 => ["-c:v", "libx264", "-preset", "veryfast", "-crf", &crf.to_string()]
+            .iter().map(|s| s.to_string()).collect(),
+        other => other.codec_args(),
+    };
     Command::new("ffmpeg")
         .args(["-v", "error", "-y", "-nostdin", "-f", "rawvideo", "-pix_fmt", "rgb24",
-               "-s", &format!("{}x{}", p.size.w, p.size.h), "-r", &format!("{}", p.fps), "-i", "-",
-               "-c:v", "libx264", "-preset", "veryfast", "-crf", &crf.to_string(), "-pix_fmt", "yuv420p"])
+               "-s", &format!("{}x{}", p.size.w, p.size.h), "-r", &format!("{}", p.fps), "-i", "-"])
+        .args(&codec)
+        .args(["-pix_fmt", "yuv420p"])
         .arg(out)
         .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()
 }
