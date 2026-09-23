@@ -503,9 +503,10 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
         ui.add(egui::TextEdit::singleline(&mut st.output_dir).id_salt("media-output_dir")
             .hint_text("beside each local file (required for server files)").desired_width(280.0));
         ui.add(egui::Slider::new(&mut st.quality, 10..=100).text("quality"));
-        ui.checkbox(&mut st.compact, "compact (experimental)").on_hover_text(
-            "Predict moving blocks from the previous frame. Much smaller for camera pans, \
-             but frames encode one at a time and quality dips a little between keyframes.");
+        ui.checkbox(&mut st.compact, "compact (smaller, slower)").on_hover_text(
+            "Predict moving blocks from the previous frame: 14-40% smaller at equal quality in \
+             testing, most on camera pans. Frames encode one at a time, so it is roughly half \
+             the speed -- untick for faster encoding.");
     });
     let running = st.job.as_ref().is_some_and(|j| j.running);
     let (plan, skipped) = st.plan_encode();

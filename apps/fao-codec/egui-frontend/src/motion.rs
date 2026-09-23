@@ -17,17 +17,17 @@
 //! pictures and there is nothing to drift. The cost: frame n cannot be encoded
 //! before frame n-1 is decoded, so frames encode SEQUENTIALLY.
 //!
-//! ## KNOWN LIMITATION: quality declines across a run
+//! ## History: the quality slide, and its fix
 //!
-//! Measured on a camera pan: mean PSNR ~30 dB over the first frames after a
-//! keyframe, ~26.6 dB over the last -- keyframes-only stays flat. So "closed
-//! loop, therefore no drift" was incomplete. Best hypothesis: each predicted
-//! frame round-trips RGB -> YUV 4:2:0 -> RGB, and chroma subsampling discards
-//! high-frequency colour error the residual can never correct at full
-//! resolution, so it accumulates. The fix is to predict and code in YUV end to
-//! end, which means a YUV decode cache -- not done here. The degradation is
-//! bounded by the keyframe interval (a keyframe resets it), and it is why
-//! motion is opt-in (`transcode::MOTION_DEFAULT` is false).
+//! The first build of Q coded residuals as one 4:2:0 RGB image. On a camera
+//! pan, quality slid ~30 dB -> ~26.6 dB across each run and compact lost to
+//! keyframes at high quality. By elimination: not a rounding bias (flat 128
+//! and 40 chained perfect predictions are exact); luma error levels off while
+//! COLOUR error kept climbing; odd shifts were a quarter of it. Coding each of
+//! R, G, B as its own full-resolution plane removed it -- colour error then
+//! FALLS through a run, since full-resolution residuals repair what every
+//! keyframe loses to 4:2:0. A size-based keyframe rule then cascaded (every
+//! frame a keyframe), so compact mode keyframes on scene cuts instead.
 //!
 //! ## Payload (marker Q)
 //!
@@ -57,17 +57,31 @@ pub const MARKER: u8 = b'Q';
 /// Search range, pixels, each axis. Fits an i8 with room to spare.
 pub const RANGE: i32 = 24;
 
-/// Residuals are coded this much below the frame's quality. A residual is
-/// mostly the previous frame's coding noise, and re-encoding noise faithfully
-/// buys little. Measured on a 45-frame pan (160x96), size / mean PSNR:
+/// The quality residuals are coded at, for a frame quality `q`: 30% of it,
+/// never below 5.
 ///
-///   residual at quality     bytes    mean dB
-///   80 (no drop)           95,437    28.11   worse than keyframes-only q50
-///   60 (drop 20)           63,791    28.07   better than keyframes-only q20
-///   40 (drop 40)           51,098    27.87   (65,282 / 27.45)
+/// KEYFRAMES STAY AT `q`; only residuals are coarser. A residual is mostly
+/// the previous frame's coding noise plus what moved, and predicted frames
+/// inherit their detail from the keyframe -- so a coarse residual HOLDS the
+/// keyframe's quality instead of exceeding it. At a fixed "q - 20" residual,
+/// compact mode overshot: at q80 it spent its bytes pushing predicted frames
+/// ~4 dB past the keyframe, and came out LARGER than keyframes-only.
 ///
-/// Nearly free in quality, large in size; 20 is the measured sweet spot.
-pub const RESIDUAL_Q_DROP: u8 = 20;
+/// Measured on a 1080p60 camera pan at q80 (120 frames):
+///
+///   residual quality     size      mean dB   worst dB
+///   keyframes only     11.50 MB    31.83     31.67
+///   q - 20 (60)        12.97 MB    36.18     31.94
+///   q - 40 (40)        10.26 MB    34.82     31.94
+///   q - 55 (25)         7.19 MB    33.85     31.94
+///
+/// The worst frame is the keyframe (31.94) in every row: predicted frames
+/// never fall below it. At 30% (24 at q80) compact is ~37% smaller than
+/// keyframes-only with a higher mean AND a higher worst frame. A fraction,
+/// not a subtraction, so low settings do not hit quality 0.
+pub fn residual_quality(q: u8) -> u8 {
+    ((q as u32 * 30 / 100) as u8).max(5)
+}
 
 /// Luma (BT.601-ish integer) of an RGB image, for motion search only.
 pub fn luma(rgb: &[u8]) -> Vec<u8> {
@@ -119,6 +133,14 @@ pub fn search(cur: &[u8], prev: &[u8], w: usize, h: usize, i: usize, hint: (i32,
         if s < best_s { best = hint; best_s = s; }
     }
     const RING: [(i32, i32); 8] = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
+    // EARLY EXIT: if the zero or neighbour vector already matches to within
+    // about 2 levels per pixel on average, the multi-step search cannot beat
+    // it by anything a coarse residual would notice. In a pan every block
+    // moves like its neighbour, so this skips nearly every search.
+    let (_, _, bw, bh) = block_rect(i, w, h);
+    if best_s <= (bw * bh * 2) as u32 {
+        return (best, best_s);
+    }
     let mut step = 8;
     while step >= 1 {
         let c = best;
@@ -241,7 +263,7 @@ pub fn encode(cur: &[u8], prev: &[u8], w: usize, h: usize, blocks: &[usize], mod
     out.extend_from_slice(&intra_bytes);
     if !inter.is_empty() {
         let (r, pw, ph) = residual_patch(cur, prev, w, h, &inter);
-        let rq = quality.saturating_sub(RESIDUAL_Q_DROP);
+        let rq = residual_quality(quality);
         for c in 0..3 {
             let plane = fao_v1::compress_frame_dct(&plane_as_yuv(&r, c, pw, ph), pw, ph, rq);
             if c < 2 {

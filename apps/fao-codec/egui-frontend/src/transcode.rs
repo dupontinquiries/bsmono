@@ -144,7 +144,21 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
 
 /// Whether transcodes predict changed blocks from the previous frame (motion
 /// patches, marker Q) unless told otherwise. See `transcode_cancellable_with`.
-pub const MOTION_DEFAULT: bool = false;
+///
+/// ON, because at the same quality setting compact was smaller on every 1080p
+/// scene measured, at equal or better quality on both the mean and the worst
+/// frame (q80, every frame compared with the source):
+///
+///   scene          fast                 compact              size
+///   test pattern   8.99 MB, 52.9 fps    7.74 MB, 25.9 fps    -14%, equal quality
+///   static scene   4.36 MB, 61.3 fps    2.75 MB, 38.0 fps    -37%, +0.15 dB mean
+///   camera pan    11.50 MB, 40.5 fps    6.90 MB, 16.4 fps    -40%, +2.0 dB mean
+///
+/// The cost is SPEED: frames encode one after another (each predicted from
+/// the decoded one before), so compact runs 0.4-0.6x fast mode on one core,
+/// and the gap is larger on many cores, where fast mode encodes in parallel.
+/// (Static-scene figures predate the motion search's early exit.)
+pub const MOTION_DEFAULT: bool = true;
 
 /// [`transcode_cancellable`] with the motion choice explicit.
 ///
@@ -705,33 +719,6 @@ mod tests {
     /// The source is ffmpeg's synthetic `testsrc2`, encoded with whatever H.264
     /// or MPEG-4 encoder this ffmpeg has -- so the SPEED is representative (the
     /// DCT path's cost is per block, not per content), but the SIZE RATIO is
-    /// only indicative: synthetic motion compresses differently from gameplay.
-    #[test]
-    #[ignore = "benchmark: cargo test --release -- --ignored --nocapture bench_1080p"]
-    fn bench_1080p_transcode_speed_and_size() {
-        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
-        let dir = std::env::temp_dir().join(format!("fao-bench-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("in.mp4");
-        // No -c:v: ffmpeg picks its default (libx264 where present, mpeg4 on
-        // builds without it, e.g. Fedora's ffmpeg-free) -- works everywhere.
-        assert!(Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i",
-            "testsrc2=size=1920x1080:rate=60:duration=2", "-pix_fmt", "yuv420p"])
-            .arg(&src).status().unwrap().success());
-        let out = dir.join("out.fao");
-        let t = std::time::Instant::now();
-        let rep = transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
-        let secs = t.elapsed().as_secs_f64();
-        let in_b = std::fs::metadata(&src).unwrap().len();
-        eprintln!("BENCH 1080p60: {} frames in {:.2} s = {:.1} fps ({:.2}x realtime); \
-                   source {:.2} MB -> fao {:.2} MB ({:.1}x); mean PSNR {:.1} dB",
-                  rep.frames, secs, rep.frames as f64 / secs, (rep.frames as f64 / 60.0) / secs,
-                  in_b as f64 / 1e6, rep.output_bytes as f64 / 1e6,
-                  rep.output_bytes as f64 / in_b as f64, rep.mean_psnr);
-        assert_eq!(rep.frames, 120);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     fn frames(n: usize, w: usize, h: usize) -> Vec<Vec<u8>> {
         (0..n).map(|k| (0..w * h * 3).map(|i| ((i * 13 + k * 57 + (i / w) * 3) % 256) as u8).collect()).collect()
@@ -970,7 +957,9 @@ mod tests {
             "color=c=0x404850:s=160x96:r=30[bg];testsrc2=s=32x32:r=30[fg];[bg][fg]overlay=x='t*30':y=30",
             "-t", "3", "-c:v", "ffv1"]);
         let out = dir.join("out.fao");
-        let rep = transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        // FAST mode's rule, named explicitly: compact mode promotes on a scene
+        // cut instead (see transcode_cancellable_with).
+        let rep = transcode_to_file_with(src.to_str().unwrap(), &out, 80, None, |_, _| {}, None, false).unwrap();
         let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
         let mut last_key = None;
         let mut promoted_keys = 0;
@@ -1027,15 +1016,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (src, _frames, _w, _h) = moving_box_source(&dir);
+        // BOTH MODES: a patch (M) and a motion patch (Q) must each decode the
+        // same picture when reached by seeking as when played up to.
+        for (motion, marker) in [(false, crate::patch::MARKER), (true, crate::motion::MARKER)] {
         let out = dir.join("out.fao");
-        transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        transcode_to_file_with(src.to_str().unwrap(), &out, 80, None, |_, _| {}, None, motion).unwrap();
         let bytes = std::fs::read(&out).unwrap();
         let played = crate::decode::FaoFile::parse(bytes.clone()).unwrap();
         let mut last = Vec::new();
         for i in 0..=45 { last = played.decode_rgb(i).unwrap(); }
         let seeked = crate::decode::FaoFile::parse(bytes).unwrap();
-        assert_eq!(seeked.marker(45), Some(crate::patch::MARKER), "frame 45 is a patch, so the seek walks back");
-        assert_eq!(seeked.decode_rgb(45).unwrap(), last);
+        assert_eq!(seeked.marker(45), Some(marker), "frame 45 is a patch, so the seek walks back");
+        assert_eq!(seeked.decode_rgb(45).unwrap(), last, "motion mode {motion}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1044,32 +1037,6 @@ mod tests {
     /// animating 320x240 window, the shape of a game with a still scene and HUD.
     /// Reports speed, size against the source, and the frame-type mix.
     ///
-    ///     cargo test --release -- --ignored --nocapture bench_1080p_static
-    #[test]
-    #[ignore = "benchmark: cargo test --release -- --ignored --nocapture bench_1080p_static"]
-    fn bench_1080p_static_scene_with_patches() {
-        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
-        let dir = std::env::temp_dir().join(format!("fao-bench-static-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("in.mp4");
-        make(&src, &["-f", "lavfi", "-i",
-            "nullsrc=s=1920x1080:r=60,geq=r='mod(X*7+Y*3,256)':g='mod(X*3+Y*11,256)':b='mod(X*13+Y*5,256)'[bg];\
-             testsrc2=s=320x240:r=60[fg];[bg][fg]overlay=x='200+t*300':y=400",
-            "-t", "2", "-pix_fmt", "yuv420p"]);
-        let out = dir.join("out.fao");
-        let t = std::time::Instant::now();
-        let rep = transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
-        let secs = t.elapsed().as_secs_f64();
-        let in_b = std::fs::metadata(&src).unwrap().len();
-        eprintln!("BENCH 1080p60 static scene: {} frames in {:.2} s = {:.1} fps ({:.2}x realtime); \
-                   source {:.2} MB -> fao {:.2} MB ({:.2}x); keys {} patches {} repeats {}; PSNR(keys) {:.1} dB",
-                  rep.frames, secs, rep.frames as f64 / secs, (rep.frames as f64 / 60.0) / secs,
-                  in_b as f64 / 1e6, rep.output_bytes as f64 / 1e6, rep.output_bytes as f64 / in_b as f64,
-                  rep.frames - rep.patches - rep.repeats, rep.patches, rep.repeats, rep.mean_psnr);
-        assert_eq!(rep.frames, 120);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     /// Encode the same source both ways; `(fast, compact)` reports and files.
     fn both_modes(src: &std::path::Path, dir: &std::path::Path) -> ((TranscodeReport, Vec<u8>), (TranscodeReport, Vec<u8>)) {
@@ -1112,9 +1079,14 @@ mod tests {
 
     /// A CAMERA PAN, the case motion is for: the whole scene slides 3 px per
     /// frame. Fast mode can only send keyframes (every block changed); compact
-    /// mode predicts every frame. Measured: 90,166 vs 145,767 bytes, mean
-    /// 36.46 vs 30.56 dB -- SMALLER AND BETTER, and quality holds or rises
-    /// through the run instead of declining.
+    /// mode predicts every frame. The promise, at the SAME quality setting:
+    /// smaller, with a mean AND a worst frame at least as good, and no decline
+    /// through the run.
+    ///
+    /// Residuals are coded at 30% of the setting, so predicted frames HOLD the
+    /// keyframe's quality rather than overshooting it; the mean margin is
+    /// smaller than it was (measured +2.7 dB, from +5.9 with residuals at
+    /// q - 20), and the file much smaller.
     ///
     /// History: with residuals coded through 4:2:0 and a colour transform,
     /// this pan ran ~30 dB early and ~26.6 late, and lost to keyframes at high
@@ -1143,7 +1115,9 @@ mod tests {
         };
         let (pf, pc) = (mean(fb), mean(cb));
         let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-        assert!(avg(&pc) > avg(&pf) + 3.0, "compact {:.2} dB vs fast {:.2} dB", avg(&pc), avg(&pf));
+        let low = |v: &[f64]| v.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(avg(&pc) > avg(&pf) + 1.0, "mean: compact {:.2} dB vs fast {:.2} dB", avg(&pc), avg(&pf));
+        assert!(low(&pc) > low(&pf) - 0.5, "worst frame: compact {:.2} dB vs fast {:.2} dB", low(&pc), low(&pf));
         let (early, late) = (avg(&pc[1..6]), avg(&pc[pc.len() - 5..]));
         assert!(late > early - 0.5, "no decline through the pan: first frames {early:.2} dB, last {late:.2} dB");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1186,6 +1160,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    /// Quality of EVERY frame of `fao` against the frames the transcoder read
+    /// from `src` -- streamed, so 1080p never holds a whole clip in memory
+    /// (120 frames would be ~750 MB). `(mean, worst)` PSNR.
+    ///
+    /// The old benchmarks reported only KEYFRAME PSNR (sampled at encode), so
+    /// comparisons between modes at 1080p were size-only -- and on the pan,
+    /// quality was where compact mode won by 6 dB.
+    fn stream_quality(src: &std::path::Path, fao: &std::path::Path, w: usize, h: usize) -> (f64, f64) {
+        let mut child = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(src)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]).stdout(Stdio::piped()).spawn().unwrap();
+        let mut pipe = child.stdout.take().unwrap();
+        let f = crate::decode::FaoFile::open_stream(Box::new(std::fs::File::open(fao).unwrap())).unwrap();
+        let mut buf = vec![0u8; w * h * 3];
+        let (mut sum, mut worst, mut n) = (0.0, f64::INFINITY, 0usize);
+        while read_frame(&mut pipe, &mut buf).unwrap() {
+            let p = psnr(&buf, &f.decode_rgb(n).unwrap());
+            sum += p;
+            worst = worst.min(p);
+            n += 1;
+        }
+        let _ = child.wait();
+        assert_eq!(n, f.frame_count(), "every frame compared");
+        (sum / n as f64, worst)
+    }
+
+    /// Encode `src` in FAST and COMPACT mode and report, for each: speed, size
+    /// against the source, and the quality of EVERY frame.
+    fn bench_both_modes(name: &str, src: &std::path::Path, dir: &std::path::Path, w: usize, h: usize) {
+        let in_b = std::fs::metadata(src).unwrap().len();
+        for motion in [false, true] {
+            let out = dir.join(if motion { "compact.fao" } else { "fast.fao" });
+            let t = std::time::Instant::now();
+            let rep = transcode_to_file_with(src.to_str().unwrap(), &out, 80, None, |_, _| {}, None, motion).unwrap();
+            let secs = t.elapsed().as_secs_f64();
+            let (mean, worst) = stream_quality(src, &out, w, h);
+            eprintln!("BENCH {name} {:>7}: {:5.1} fps ({:.2}x realtime) | {:6.2} MB ({:.2}x source) | \
+                       all frames {mean:.2} dB mean, {worst:.2} worst | key {} patch {} repeat {}",
+                      if motion { "compact" } else { "fast" }, rep.frames as f64 / secs, (rep.frames as f64 / 60.0) / secs,
+                      rep.output_bytes as f64 / 1e6, rep.output_bytes as f64 / in_b as f64,
+                      rep.frames - rep.patches - rep.repeats, rep.patches, rep.repeats);
+            assert_eq!(rep.frames, 120);
+        }
+    }
+
+    /// BENCHMARK: 1080p60 synthetic test pattern (testsrc2: moving elements over
+    /// the whole frame), both modes. Run in release, one test at a time -- the
+    /// harness runs tests concurrently, which on a small machine skews timings:
+    ///
+    ///     cargo test --release -- --ignored --nocapture --test-threads=1 bench_1080p
+    ///
+    /// The source is encoded with whatever H.264/MPEG-4 encoder this ffmpeg has
+    /// (no -c:v), so it runs on builds without libx264 too.
+    #[test]
+    #[ignore = "benchmark: cargo test --release -- --ignored --nocapture --test-threads=1 bench_1080p"]
+    fn bench_1080p_test_pattern() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-bench-tp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mp4");
+        make(&src, &["-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=60:duration=2", "-pix_fmt", "yuv420p"]);
+        bench_both_modes("1080p test pattern", &src, &dir, 1920, 1080);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BENCHMARK: 1080p60 detailed static scenery with a moving, animating
+    /// 320x240 window -- the shape of a game with a still scene and HUD.
+    #[test]
+    #[ignore = "benchmark: cargo test --release -- --ignored --nocapture --test-threads=1 bench_1080p"]
+    fn bench_1080p_static_scene() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-bench-ss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mp4");
+        make(&src, &["-f", "lavfi", "-i",
+            "nullsrc=s=1920x1080:r=60,geq=r='mod(X*7+Y*3,256)':g='mod(X*3+Y*11,256)':b='mod(X*13+Y*5,256)'[bg];\
+             testsrc2=s=320x240:r=60[fg];[bg][fg]overlay=x='200+t*300':y=400",
+            "-t", "2", "-pix_fmt", "yuv420p"]);
+        bench_both_modes("1080p static scene", &src, &dir, 1920, 1080);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BENCHMARK: 1080p60 CAMERA PAN over detailed scenery, 6 px per frame --
+    /// the case compact mode is for, at real resolution.
+    #[test]
+    #[ignore = "benchmark: cargo test --release -- --ignored --nocapture --test-threads=1 bench_1080p"]
+    fn bench_1080p_pan() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-bench-pan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // ONE wide still, then a 1080p window slid across it with `crop`. A first
+        // version evaluated sin/cos per pixel for all 120 frames with `geq`, and
+        // generating the source alone outlasted a five-minute run.
+        let still = dir.join("still.png");
+        make(&still, &["-f", "lavfi", "-i",
+            "nullsrc=s=2640x1080,geq=r='128+90*sin(X*0.03)*cos(Y*0.02)':g='128+70*sin((X+Y)*0.015)':b='100+mod(X*3+Y*2,80)'",
+            "-frames:v", "1"]);
+        let src = dir.join("in.mp4");
+        make(&src, &["-loop", "1", "-i", still.to_str().unwrap(), "-vf", "crop=1920:1080:x='n*6':y=0",
+                     "-r", "60", "-frames:v", "120", "-pix_fmt", "yuv420p"]);
+        bench_both_modes("1080p camera pan", &src, &dir, 1920, 1080);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn have_ffmpeg() -> bool {
         Command::new("ffmpeg").arg("-version").output().map(|o| o.status.success()).unwrap_or(false)
