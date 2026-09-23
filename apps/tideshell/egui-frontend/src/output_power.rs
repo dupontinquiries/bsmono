@@ -53,11 +53,20 @@ pub struct OutputPower {
 
 impl OutputPower {
     pub fn spawn() -> OutputPower {
+        Self::spawn_observing(|_| {})
+    }
+
+    /// As `spawn`, and `on_mode(on)` is called whenever the display's power
+    /// actually changes -- INCLUDING changes the compositor makes itself: the
+    /// lock screen and idle blanking. Before this, the power objects existed
+    /// only for tideshell's own requests, so tideshell never knew the screen
+    /// had gone off, and auto-brightness kept writing to a dark panel.
+    pub fn spawn_observing(on_mode: impl Fn(bool) + Send + 'static) -> OutputPower {
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("tideshell-output-power".into())
             .spawn(move || {
-                if let Err(e) = run(rx) {
+                if let Err(e) = run(rx, Box::new(on_mode)) {
                     eprintln!("output power: {e}");
                 }
             })
@@ -70,13 +79,28 @@ impl OutputPower {
     }
 }
 
-struct State {
-    manager: ZwlrOutputPowerManagerV1,
-    outputs: Vec<WlOutput>,
-    qh: QueueHandle<State>,
+/// Whether the display counts as on, from each output's last reported mode:
+/// on if ANY output is on, off once every output has said it is off, unknown
+/// until then. Pure.
+pub fn combine(modes: &[Option<bool>]) -> Option<bool> {
+    if modes.iter().any(|m| *m == Some(true)) {
+        Some(true)
+    } else if !modes.is_empty() && modes.iter().all(|m| *m == Some(false)) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
-fn run(rx: Receiver<bool>) -> Result<(), String> {
+struct State {
+    /// Last reported mode per output, by index.
+    modes: Vec<Option<bool>>,
+    /// What was last passed to `on_mode`, so it fires on CHANGES only.
+    reported: Option<bool>,
+    on_mode: Box<dyn Fn(bool) + Send>,
+}
+
+fn run(rx: Receiver<bool>, on_mode: Box<dyn Fn(bool) + Send>) -> Result<(), String> {
     let conn = Connection::connect_to_env().map_err(|e| format!("connect: {e}"))?;
     let (globals, mut queue) = registry_queue_init::<State>(&conn).map_err(|e| format!("registry: {e}"))?;
     let qh = queue.handle();
@@ -87,10 +111,6 @@ fn run(rx: Receiver<bool>) -> Result<(), String> {
     // an interface, but a phone with an external display (or, later, a
     // multi-panel device) has more than one `wl_output`, and every one of them
     // should follow the request.
-    // `Registry::bind` is infallible at the protocol level (it only sends a
-    // request); a global that does not really exist is a server bug the
-    // connection would eventually report some other way, not something this
-    // call can detect.
     let outputs: Vec<WlOutput> = globals
         .contents()
         .with_list(|l| l.iter().filter(|g| g.interface == "wl_output").map(|g| (g.name, g.version)).collect::<Vec<_>>())
@@ -100,20 +120,30 @@ fn run(rx: Receiver<bool>) -> Result<(), String> {
     if outputs.is_empty() {
         return Err("no wl_output found".into());
     }
-    let mut state = State { manager, outputs, qh };
-    queue.roundtrip(&mut state).map_err(|e| format!("roundtrip: {e}"))?;
+    // One power object per output, kept for the life of the connection: the
+    // protocol reports its mode once on creation and again on EVERY change,
+    // whoever made it. (They used to be created per request, and dropped.)
+    let powers: Vec<ZwlrOutputPowerV1> =
+        outputs.iter().enumerate().map(|(i, o)| manager.get_output_power(o, &qh, i)).collect();
+    let mut state = State { modes: vec![None; powers.len()], reported: None, on_mode };
 
+    // tideshell's own requests go out from a second thread -- proxies are
+    // thread-safe and the connection can be flushed from anywhere -- so THIS
+    // one can block in dispatch and hear every mode change as it happens.
+    let (req_powers, req_conn) = (powers.clone(), conn.clone());
+    std::thread::Builder::new()
+        .name("tideshell-output-power-req".into())
+        .spawn(move || {
+            while let Ok(on) = rx.recv() {
+                for p in &req_powers {
+                    p.set_mode(decide(on));
+                }
+                let _ = req_conn.flush();
+            }
+        })
+        .map_err(|e| format!("request thread: {e}"))?;
     loop {
-        let on = rx.recv().map_err(|_| "sender dropped".to_string())?;
-        let mode = decide(on);
-        for output in &state.outputs {
-            let power = state.manager.get_output_power(output, &state.qh, ());
-            power.set_mode(mode);
-        }
-        // Flush the requests and let `mode`/`failed` events land (logged, not
-        // acted on -- there is no fallback path to try if the compositor
-        // refuses, only something worth knowing from a log).
-        queue.roundtrip(&mut state).map_err(|e| format!("roundtrip: {e}"))?;
+        queue.blocking_dispatch(&mut state).map_err(|e| format!("dispatch: {e}"))?;
     }
 }
 
@@ -127,11 +157,22 @@ macro_rules! noop {
 noop!(ZwlrOutputPowerManagerV1);
 noop!(WlOutput);
 
-impl Dispatch<ZwlrOutputPowerV1, ()> for State {
-    fn event(_: &mut Self, _: &ZwlrOutputPowerV1, e: zwlr_output_power_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+impl Dispatch<ZwlrOutputPowerV1, usize> for State {
+    fn event(state: &mut Self, _: &ZwlrOutputPowerV1, e: zwlr_output_power_v1::Event, idx: &usize, _: &Connection, _: &QueueHandle<Self>) {
         match e {
-            zwlr_output_power_v1::Event::Mode { mode } => eprintln!("output power: now {mode:?}"),
-            zwlr_output_power_v1::Event::Failed => eprintln!("output power: compositor refused the request"),
+            zwlr_output_power_v1::Event::Mode { mode } => {
+                let on = matches!(mode, wayland_client::WEnum::Value(Mode::On));
+                eprintln!("output power: output {idx} now {}", if on { "on" } else { "off" });
+                if let Some(m) = state.modes.get_mut(*idx) {
+                    *m = Some(on);
+                }
+                let now = combine(&state.modes);
+                if now.is_some() && now != state.reported {
+                    state.reported = now;
+                    (state.on_mode)(now.unwrap());
+                }
+            }
+            zwlr_output_power_v1::Event::Failed => eprintln!("output power: compositor refused (output {idx})"),
             _ => {}
         }
     }
@@ -144,6 +185,15 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_display_is_on_if_any_output_is_and_off_only_when_all_say_so() {
+        assert_eq!(combine(&[Some(true)]), Some(true));
+        assert_eq!(combine(&[Some(false)]), Some(false));
+        assert_eq!(combine(&[Some(false), None]), None, "not all known yet: no claim");
+        assert_eq!(combine(&[Some(false), Some(true)]), Some(true), "an external screen still on");
+        assert_eq!(combine(&[]), None);
+    }
 
     #[test]
     fn on_and_off_map_to_the_protocols_two_modes() {

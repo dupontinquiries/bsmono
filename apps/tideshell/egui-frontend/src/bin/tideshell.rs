@@ -74,6 +74,9 @@ impl Shellbox {
                     continue;
                 }
                 Action::DisplayPower(on) => {
+                    // Stop brightness writes BEFORE the panel goes dark (a DSI
+                    // command to an off panel is the journal's dsi error).
+                    self.backlight.set_display(*on);
                     self.output_power.set(*on);
                     Outcome::Done(format!("display power {}", if *on { "on" } else { "off" }))
                 }
@@ -190,6 +193,11 @@ fn main() {
         std::process::exit(1)
     });
 
+    // The backlight writer must hear when the COMPOSITOR blanks the screen
+    // (lock screen, idle) -- not only tideshell's own power key -- so the
+    // screen-power client reports every mode change to it.
+    let backlight = tideshell_egui::sensors::BacklightOut::spawn(std::path::Path::new("/sys"), zbus::blocking::Connection::system().ok());
+    let output_power = tideshell_egui::output_power::OutputPower::spawn_observing(backlight.display_notifier());
     let mut sb = Shellbox {
         shell: Shell::new(prefs, (0.0, 0.0)),
         view: ShellView::default(),
@@ -199,9 +207,9 @@ fn main() {
         ei_status: None,
         persist,
         ambient: tideshell_egui::sensors::Ambient::spawn("/sys".into(), zbus::blocking::Connection::system().ok()),
-        backlight: tideshell_egui::sensors::BacklightOut::spawn(std::path::Path::new("/sys"), zbus::blocking::Connection::system().ok()),
+        backlight,
         power_key: tideshell_egui::power_key::PowerKey::spawn(zbus::blocking::Connection::system().ok().as_ref()),
-        output_power: tideshell_egui::output_power::OutputPower::spawn(),
+        output_power,
         sensor_status: (String::new(), String::new()),
         ei_drop_noted: false,
     };
