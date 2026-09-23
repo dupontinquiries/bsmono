@@ -194,6 +194,8 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
     let mut reference: Option<Vec<u8>> = None;
     let mut since_key = 0usize;
     let mut patches = 0usize;
+    // Size of the last keyframe written, for the patch-versus-keyframe check.
+    let mut last_key_len: Option<usize> = None;
     // BATCHED, PARALLEL. Every frame here is an intra DCT frame, so frames are
     // independent -- the ideal case for encoding several at once. A batch of
     // `2 x workers` frames is read, encoded across `workers` threads, then
@@ -243,14 +245,35 @@ pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
             }
         }
         let mut encoded = encode_jobs(&jobs, n, w, h, quality, workers, PSNR_EVERY).into_iter();
+        let mut job_of = jobs.iter();
         let mut failed = None;
         for dup in &dups {
             let (payload, p) = if *dup {
                 repeats += 1;
                 (vec![b'R'], None)
             } else {
-                encoded.next().expect("one encoded result per fresh frame")
+                let job = job_of.next().expect("one job per fresh frame");
+                let mut r = encoded.next().expect("one encoded result per fresh frame");
+                // A PATCH NO SMALLER THAN A KEYFRAME IS SENT AS A KEYFRAME. On a
+                // near-flat scene a keyframe is already tiny (flat DCT blocks are
+                // nearly free) and a patch adds fixed overhead: measured ~1,350
+                // vs 1,125 bytes. Re-encoding only happens in that losing case.
+                //
+                // The reference is deliberately NOT reset: planning already
+                // advanced it for later frames in this batch. It stays safe --
+                // for blocks the patch skipped, the reference is within `tol` of
+                // this frame, so a later skip is within 2*tol plus one coding.
+                if let (Job::Patch(f, _), Some(k)) = (job, last_key_len) {
+                    if r.0.len() >= k {
+                        r = encode_one(f, w, h, quality, false);
+                        patches -= 1;
+                    }
+                }
+                r
             };
+            if payload.first() == Some(&b'D') {
+                last_key_len = Some(payload.len());
+            }
             if let Some(p) = p {
                 psnr_sum += p;
                 psnr_n += 1;
@@ -842,6 +865,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ON A FLAT SCENE, patches lose to keyframes (flat DCT blocks are nearly
+    /// free, so a keyframe is already mostly the moving part). Such frames must
+    /// go out as keyframes: in the file, no patch is as large as the keyframe
+    /// before it -- and every frame still decodes.
+    #[test]
+    fn a_patch_never_outweighs_the_keyframe_before_it() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-flat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("flat.mkv");
+        make(&src, &["-f", "lavfi", "-i",
+            "color=c=0x404850:s=160x96:r=30[bg];testsrc2=s=32x32:r=30[fg];[bg][fg]overlay=x='t*30':y=30",
+            "-t", "3", "-c:v", "ffv1"]);
+        let out = dir.join("out.fao");
+        let rep = transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        let mut last_key = None;
+        let mut promoted_keys = 0;
+        for i in 0..f.frame_count() {
+            let len = f.payload(i).unwrap().len();
+            match f.marker(i) {
+                Some(b'D') => { last_key = Some(len); if i > 0 { promoted_keys += 1; } }
+                Some(m) if m == crate::patch::MARKER => {
+                    let k = last_key.expect("a keyframe comes first");
+                    assert!(len < k, "patch {i} ({len} bytes) is not smaller than the keyframe before it ({k})");
+                }
+                _ => {}
+            }
+            f.decode_rgb(i).expect("every frame decodes");
+        }
+        assert!(promoted_keys > 2, "this scene should promote patches to keyframes: {promoted_keys} keyframes after frame 0");
+        assert_eq!(rep.frames - rep.repeats - rep.patches, promoted_keys + 1, "report counts what the file holds");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// THE TEST THAT SEPARATES THE DESIGNS: a slow fade, one level per frame --
     /// under the skip tolerance (2 at quality 80). Judging each block against
     /// the PREVIOUS frame would skip every step and the error would climb a
@@ -887,6 +946,38 @@ mod tests {
         let seeked = crate::decode::FaoFile::parse(bytes).unwrap();
         assert_eq!(seeked.marker(45), Some(crate::patch::MARKER), "frame 45 is a patch, so the seek walks back");
         assert_eq!(seeked.decode_rgb(45).unwrap(), last);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BENCHMARK: 1080p60 with PATCH FRAMES doing their job -- detailed static
+    /// scenery (a `geq` pattern, a pure function of position) with a moving,
+    /// animating 320x240 window, the shape of a game with a still scene and HUD.
+    /// Reports speed, size against the source, and the frame-type mix.
+    ///
+    ///     cargo test --release -- --ignored --nocapture bench_1080p_static
+    #[test]
+    #[ignore = "benchmark: cargo test --release -- --ignored --nocapture bench_1080p_static"]
+    fn bench_1080p_static_scene_with_patches() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-bench-static-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mp4");
+        make(&src, &["-f", "lavfi", "-i",
+            "nullsrc=s=1920x1080:r=60,geq=r='mod(X*7+Y*3,256)':g='mod(X*3+Y*11,256)':b='mod(X*13+Y*5,256)'[bg];\
+             testsrc2=s=320x240:r=60[fg];[bg][fg]overlay=x='200+t*300':y=400",
+            "-t", "2", "-pix_fmt", "yuv420p"]);
+        let out = dir.join("out.fao");
+        let t = std::time::Instant::now();
+        let rep = transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        let secs = t.elapsed().as_secs_f64();
+        let in_b = std::fs::metadata(&src).unwrap().len();
+        eprintln!("BENCH 1080p60 static scene: {} frames in {:.2} s = {:.1} fps ({:.2}x realtime); \
+                   source {:.2} MB -> fao {:.2} MB ({:.2}x); keys {} patches {} repeats {}; PSNR(keys) {:.1} dB",
+                  rep.frames, secs, rep.frames as f64 / secs, (rep.frames as f64 / 60.0) / secs,
+                  in_b as f64 / 1e6, rep.output_bytes as f64 / 1e6, rep.output_bytes as f64 / in_b as f64,
+                  rep.frames - rep.patches - rep.repeats, rep.patches, rep.repeats, rep.mean_psnr);
+        assert_eq!(rep.frames, 120);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

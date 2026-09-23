@@ -319,7 +319,7 @@ impl State {
                     JobEvent::Progress(d, t) => job.frames = (d, t),
                     JobEvent::Finished(out, Ok(rep)) => {
                         job.done += 1;
-                        job.log.push(format!("✔ {} — {} frames, {:.1} dB", out.display(), rep.frames, rep.mean_psnr));
+                        job.log.push(encode_summary(&out, &rep));
                         finished.push(out);
                     }
                     JobEvent::Finished(out, Err(e)) => job.log.push(format!("✖ {}: {e}", out.display())),
@@ -352,6 +352,25 @@ impl State {
     pub fn cancel_encode(&mut self) {
         if let Some(j) = &self.job { j.cancel.store(true, Ordering::Relaxed); }
     }
+}
+
+/// The line a finished encode leaves in the log: size against the source
+/// first -- the number that decides whether storing matches this way is worth
+/// it -- then the frame mix, then quality.
+///
+/// A server source has no local size (the transcoder reads it over HTTP), so
+/// the ratio is omitted rather than shown as a division by zero.
+pub fn encode_summary(out: &std::path::Path, rep: &crate::transcode::TranscodeReport) -> String {
+    let mb = |b: u64| b as f64 / 1e6;
+    let size = if rep.input_bytes > 0 {
+        format!("{:.1} MB -> {:.1} MB ({:.2}x the source)", mb(rep.input_bytes), mb(rep.output_bytes),
+                rep.output_bytes as f64 / rep.input_bytes as f64)
+    } else {
+        format!("{:.1} MB", mb(rep.output_bytes))
+    };
+    let keys = rep.frames - rep.patches - rep.repeats;
+    format!("✔ {} — {size}; {} frames: {keys} key, {} patch, {} repeat; keyframes {:.1} dB",
+            out.display(), rep.frames, rep.patches, rep.repeats, rep.mean_psnr)
 }
 
 fn gb(bytes: u64) -> String {
@@ -788,6 +807,18 @@ mod tests {
         assert_eq!(r.files, 2);
         assert!(r.savings_ratio() > 0.0, "{r:?}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_encode_summary_leads_with_size_against_the_source() {
+        let rep = crate::transcode::TranscodeReport { frames: 120, repeats: 10, patches: 100, w: 1920, h: 1080,
+            input_bytes: 2_000_000, output_bytes: 9_000_000, mean_psnr: 26.8 };
+        let line = encode_summary(std::path::Path::new("/m/a.fao"), &rep);
+        assert!(line.contains("2.0 MB -> 9.0 MB (4.50x the source)"), "{line}");
+        assert!(line.contains("120 frames: 10 key, 100 patch, 10 repeat"), "{line}");
+        let remote = crate::transcode::TranscodeReport { input_bytes: 0, ..rep };
+        let line = encode_summary(std::path::Path::new("/m/a.fao"), &remote);
+        assert!(line.contains("9.0 MB;") && !line.contains("the source"), "no ratio without a local size: {line}");
     }
 
     #[test]
