@@ -1,12 +1,14 @@
 //! Touch rejection, in front of every consumer (strips, overlay, pad):
 //! what water, a palm or a pocket produce, dropped before it means anything.
 //!
-//! * **Rain / wet screen**: water makes bursts of brief, still touches. Four
-//!   such touches (each under RAIN_TAP_MS, moving less than RAIN_SLOP) within
-//!   RAIN_WINDOW_MS put the filter in a wet state for WET_MS, during which
-//!   every new contact is dropped; more phantom touches extend it. A real
-//!   triple tap is three touches, and a real tap-tap-tap-tap in 0.6 s is rare
-//!   enough to trade for not typing on rain.
+//! * **Rain / wet screen**: water makes bursts of brief, still touches at
+//!   DIFFERENT places. Four such touches (each under RAIN_TAP_MS, moving
+//!   less than RAIN_SLOP), spread over the screen (each at least RAIN_SPREAD
+//!   from the previous one), within RAIN_WINDOW_MS put the filter in a wet
+//!   state for WET_MS, during which every new contact is dropped; more
+//!   phantoms extend it. A person hammering one button lands on the same
+//!   spot every time and is never rain (the FP5 log showed eight taps on a
+//!   dead launcher button trip the first version, and 13 touches dropped).
 //! * **Jumps**: a contact that moves more than JUMP_PX in one short sample is
 //!   not a finger (two-point-to-one merges, water bridging): that contact is
 //!   cancelled and its remaining events dropped.
@@ -22,6 +24,8 @@ use std::collections::HashMap;
 pub const RAIN_TAP_MS: Millis = 120;
 pub const RAIN_SLOP: f32 = 8.0;
 pub const RAIN_N: usize = 4;
+/// Brief touches closer than this to the previous one are the same finger.
+pub const RAIN_SPREAD: f32 = 60.0;
 pub const RAIN_WINDOW_MS: Millis = 600;
 pub const WET_MS: Millis = 2000;
 pub const JUMP_PX: f32 = 250.0;
@@ -50,8 +54,8 @@ pub struct TouchFilter {
     /// Cold mode multiplies the slops (a gloved finger wobbles).
     pub slop_scale: f32,
     contacts: HashMap<i32, Contact>,
-    /// Lift times of recent brief, still touches.
-    brief: Vec<Millis>,
+    /// Recent brief, still touches: (lift time, x, y).
+    brief: Vec<(Millis, f32, f32)>,
     wet_until: Option<Millis>,
     pub stats: Stats,
 }
@@ -106,8 +110,11 @@ impl TouchFilter {
                 }
                 let brief = t.saturating_sub(c.down) <= RAIN_TAP_MS && (c.last.0 - c.start.0).hypot(c.last.1 - c.start.1) <= RAIN_SLOP * self.slop_scale;
                 if brief {
-                    self.brief.retain(|&b| t.saturating_sub(b) <= RAIN_WINDOW_MS);
-                    self.brief.push(t);
+                    self.brief.retain(|b| t.saturating_sub(b.0) <= RAIN_WINDOW_MS);
+                    let same_spot = self.brief.last().is_some_and(|b| (c.start.0 - b.1).hypot(c.start.1 - b.2) < RAIN_SPREAD);
+                    if !same_spot {
+                        self.brief.push((t, c.start.0, c.start.1));
+                    }
                     if self.brief.len() >= RAIN_N {
                         if !self.is_wet(t) {
                             self.stats.wet_episodes += 1;
@@ -171,6 +178,16 @@ mod tests {
         assert!(f.stats.dropped_wet >= 2);
         assert!(!f.is_wet(500 + WET_MS + 1));
         assert!(f.filter(TouchEvent::Down { slot: 9, x: 200.0, y: 200.0, t: 500 + WET_MS + 1 }).is_some(), "dry again");
+    }
+
+    #[test]
+    fn hammering_one_button_is_never_rain() {
+        let mut f = TouchFilter::default();
+        for i in 0..12 {
+            let (d, u) = tap(&mut f, 0, 200.0, 700.0, 120 * i as u64, 60);
+            assert!(d.is_some() && matches!(u, Some(TouchEvent::Up { .. })), "tap {i} delivered");
+        }
+        assert!(!f.is_wet(2000) && f.stats.wet_episodes == 0);
     }
 
     #[test]

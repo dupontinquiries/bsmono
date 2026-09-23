@@ -98,6 +98,10 @@ pub struct FrameInfo<'a> {
     /// Local time; the clock's style and fuzziness come from the prefs.
     pub time: tideshell_core::clock::LocalTime,
     pub battery: Option<f32>,
+    /// Why the trackpad cannot work right now (EI failed), shown on the pad.
+    pub trackpad_note: Option<&'a str>,
+    /// Seconds since the shell started, for the breathing.
+    pub t_secs: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +151,9 @@ pub struct ShellView {
     frame_dt: f32,
     /// The switcher landed (reveal reached 1): kick the cards once.
     switcher_landed: bool,
+    /// The mood's spring parameters for this frame.
+    spring_omega: f32,
+    spring_zeta: f32,
 }
 
 const MOUSE_SLOT: i32 = -1;
@@ -255,7 +262,11 @@ impl ShellView {
     /// The scale to draw a widget at, given whether it is pressed now: a
     /// quick squeeze in, a jiggle back. `id` keys the spring.
     fn press_scale(&mut self, id: Id, pressed: bool, dt_ms: f32) -> f32 {
-        let s = self.press.entry(id).or_insert_with(|| tideshell_core::anim::Spring::jiggle(1.0));
+        // Side surfaces draw before the overlay sets the mood: default then.
+        let (omega, zeta) = if self.spring_omega > 0.0 { (self.spring_omega, self.spring_zeta) } else { (28.0, 0.4) };
+        let s = self.press.entry(id).or_insert_with(|| tideshell_core::anim::Spring::new(1.0, omega, zeta));
+        s.omega = omega;
+        s.zeta = zeta;
         s.set_target(if pressed { 0.94 } else { 1.0 });
         s.tick(dt_ms);
         s.value
@@ -271,6 +282,30 @@ impl ShellView {
     /// Any press spring still moving (keeps the frame loop awake).
     pub fn is_jiggling(&self) -> bool {
         self.press.values().any(|s| !s.is_settled())
+    }
+
+    /// Apply a mood: the accent replaces the theme's blue (softened toward
+    /// the surface for accent_soft), warmth tints the surfaces toward amber
+    /// or a cool slate, brightness scales them. Sunlight contrast wins: the
+    /// tint fades out as contrast rises, so nothing muddies the high-contrast look.
+    fn living_palette(pal: &PaletteColors, m: &tideshell_core::season::Mood, accent: [u8; 3], contrast: f32) -> PaletteColors {
+        let acc = Color32::from_rgb(accent[0], accent[1], accent[2]);
+        let tint_amount = (1.0 - contrast) * 0.14 * m.warmth.abs();
+        let tint = if m.warmth >= 0.0 { Color32::from_rgb(255, 180, 110) } else { Color32::from_rgb(150, 175, 215) };
+        let surface = |c: Color32| {
+            let t = mix(c, tint, tint_amount);
+            let b = m.brightness;
+            Color32::from_rgba_unmultiplied((t.r() as f32 * b) as u8, (t.g() as f32 * b) as u8, (t.b() as f32 * b) as u8, t.a())
+        };
+        PaletteColors {
+            bg_base: surface(pal.bg_base),
+            bg_card: surface(pal.bg_card),
+            bg_raised: surface(pal.bg_raised),
+            bg_hover: surface(pal.bg_hover),
+            accent: mix(acc, pal.accent, contrast * 0.5),
+            accent_soft: mix(mix(acc, pal.bg_raised, 0.45), pal.accent_soft, contrast * 0.5),
+            ..*pal
+        }
     }
 
     fn blend_palettes(a: &PaletteColors, b: &PaletteColors, t: f32) -> PaletteColors {
@@ -452,6 +487,13 @@ impl ShellView {
         } else {
             pal
         };
+        // The living design: the scene's accent (never blue at night), its
+        // warmth on the surfaces, its brightness, and its springs.
+        let mood = shell.mood();
+        let living = Self::living_palette(pal, &mood, shell.accent(), contrast);
+        let pal = &living;
+        self.spring_omega = mood.omega;
+        self.spring_zeta = mood.zeta;
         let area = ui.max_rect();
         let origin = area.min;
         let size = area.size();
@@ -480,6 +522,9 @@ impl ShellView {
             let r = Self::pad_rect(size, Self::bar_width(shell)).translate(origin.to_vec2());
             p.rect_filled(r, cr(22), with_alpha(pal.bg_raised, 0.92));
             p.text(r.center_top() + Vec2::new(0.0, 18.0), Align2::CENTER_CENTER, "Trackpad", FontId::proportional(13.0), pal.text_weak);
+            if let Some(note) = info.trackpad_note {
+                p.text(r.center(), Align2::CENTER_CENTER, note, FontId::proportional(12.0), with_alpha(pal.warning, 0.9));
+            }
             let n = shell.trackpad.finger_count();
             if n > 0 {
                 p.text(r.center(), Align2::CENTER_CENTER, format!("{n} finger{}", if n > 1 { "s" } else { "" }), FontId::proportional(15.0), pal.accent);
@@ -507,10 +552,12 @@ impl ShellView {
             shell.settings_requested = false;
             self.open_settings(shell);
         }
-        // Home indicator: the affordance for every bottom-edge gesture.
-        let hw = 110.0 + shell.swipe_up * 40.0;
+        // Home indicator: the affordance for every bottom-edge gesture. It
+        // breathes: a slow widening and brightening at the mood's pace.
+        let br = tideshell_core::season::breath(&mood, info.t_secs);
+        let hw = 110.0 + shell.swipe_up * 40.0 + br * 22.0;
         let hy = size.y - 9.0 - shell.swipe_up * 30.0;
-        p.rect_filled(Rect::from_center_size(to(size.x / 2.0 + shell.peek_dx * 0.3, hy), Vec2::new(hw, 5.0)), cr(3), with_alpha(pal.text, 0.75));
+        p.rect_filled(Rect::from_center_size(to(size.x / 2.0 + shell.peek_dx * 0.3, hy), Vec2::new(hw, 5.0)), cr(3), with_alpha(pal.text, 0.6 + br * 0.35));
 
         if shell.lock.is_locked() {
             self.cover(&p, shell, info, origin, size);
@@ -724,10 +771,16 @@ impl ShellView {
             p.text(top + Vec2::new(size.x - 34.0, 22.0), Align2::RIGHT_CENTER, format!("{:.0}°", shell.world.yaw_deg()), FontId::proportional(12.0), Color32::from_white_alpha((alpha * 200.0) as u8));
         }
         let bands = if self.camera_tex.is_some() { 0 } else { 32 };
+        let br = tideshell_core::season::breath(&shell.mood(), info.t_secs);
+        let acc = shell.accent();
         for i in 0..bands {
             let t = i as f32 / (bands - 1) as f32;
             let lerp = |a: f32, b: f32| (a + (b - a) * t) as u8;
-            let c = Color32::from_rgba_unmultiplied(lerp(14.0, 46.0), lerp(22.0, 30.0), lerp(40.0, 64.0), (alpha * 255.0) as u8);
+            // The gradient runs from a dark of the scene's accent to a
+            // lighter one, and breathes: the light end lifts with the breath.
+            let dark = [acc[0] as f32 * 0.12, acc[1] as f32 * 0.12, acc[2] as f32 * 0.14];
+            let light = [acc[0] as f32 * (0.28 + br * 0.08), acc[1] as f32 * (0.28 + br * 0.08), acc[2] as f32 * (0.32 + br * 0.08)];
+            let c = Color32::from_rgba_unmultiplied(lerp(dark[0], light[0]), lerp(dark[1], light[1]), lerp(dark[2], light[2]), (alpha * 255.0) as u8);
             let band_h = size.y / bands as f32;
             p.rect_filled(Rect::from_min_size(top + Vec2::new(0.0, i as f32 * band_h), Vec2::new(size.x, band_h + 1.0)), cr(0), c);
         }
@@ -1442,7 +1495,7 @@ mod tests {
         let mut view = ShellView::default();
         view.pointer_pad = pointer_pad;
         let pal = uikit_egui::palette_colors("night");
-        let info = FrameInfo { apps: &[], time: tideshell_core::clock::LocalTime { hour: 12, minute: 0, weekday: 1 }, battery: None };
+        let info = FrameInfo { apps: &[], time: tideshell_core::clock::LocalTime { hour: 12, minute: 0, weekday: 1 }, battery: None, trackpad_note: None, t_secs: 0.0 };
         let ctx = egui::Context::default();
         let mut out = Vec::new();
         let frames = [

@@ -1,0 +1,6 @@
+# The power and volume keys for the seat's user, without the input group:
+# any key-capable input device gets a uaccess ACL for the active seat.
+#   sudo install -Dm644 70-tideshell-keys.rules /etc/udev/rules.d/70-tideshell-keys.rules
+#   sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=input
+# Alternative: `sudo adduser user input` and log out and in.
+KERNEL=="event*", SUBSYSTEM=="input", ENV{ID_INPUT_KEY}=="1", TAG+="uaccess"

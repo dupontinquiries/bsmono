@@ -46,14 +46,26 @@ pub struct ShellPrefs {
     pub brightness_offset: f32,
     /// Night window for the time-of-day dimming.
     pub night: crate::ambient::NightWindow,
-    /// Backlight write rate, Hz. 30 by default: 90 provoked DSI worker
-    /// errors on the FP5's panel; lower it further if they persist.
+    /// Backlight write rate, Hz. 10 by default: 90 and then 30 provoked
+    /// bursts of DSI worker errors on the FP5's panel (seen in its journal
+    /// right after "auto brightness on"); raise it only on a panel that
+    /// takes it.
     pub brightness_rate: u32,
     /// uikit palette id for the shell's own surfaces ("night", "slate",
     /// "slate-dusk", ...). Validated by the frontend against the registry.
     pub theme: String,
     /// Command-palette recents, most recent first (item keys, comma-joined).
     pub palette_recent: String,
+    /// Which hemisphere the seasons follow: north | south.
+    pub hemisphere: String,
+    /// The living design (season/time-of-day colour and motion) on/off.
+    pub living: bool,
+    /// How brightness reaches the panel: smooth (a rate-limited ramp),
+    /// stepped (>= 5% steps, 2/s), safe (one write once the value has
+    /// settled). auto = safe on a DSI backlight (the FP5's DPU driver
+    /// corrupts the display under a stream of changes, pmaports #4274),
+    /// smooth elsewhere.
+    pub brightness_mode: String,
     /// Cold mode: auto (battery temperature), on, off.
     pub cold: String,
     /// Ambient loudness from the microphone (notification gain). The mic is
@@ -82,9 +94,12 @@ impl Default for ShellPrefs {
             auto_brightness: true,
             brightness_offset: 0.0,
             night: crate::ambient::NightWindow::default(),
-            brightness_rate: 30,
+            brightness_rate: 10,
             theme: "night".into(),
             palette_recent: String::new(),
+            brightness_mode: "auto".into(),
+            hemisphere: "north".into(),
+            living: true,
             cold: "auto".into(),
             ambient_mic: true,
             audio_tone: 0.0,
@@ -96,7 +111,7 @@ impl Default for ShellPrefs {
     }
 }
 
-pub const KEYS: [&str; 20] = [
+pub const KEYS: [&str; 23] = [
     "shell.layout",
     "shell.bar.widgets",
     "shell.bar.width",
@@ -110,6 +125,9 @@ pub const KEYS: [&str; 20] = [
     "shell.brightness.rate",
     "shell.theme",
     "shell.palette.recent",
+    "shell.brightness.mode",
+    "shell.hemisphere",
+    "shell.living",
     "shell.cold",
     "shell.ambient.mic",
     "shell.audio.tone",
@@ -142,6 +160,9 @@ impl ShellPrefs {
             ("shell.brightness.rate".into(), self.brightness_rate.to_string()),
             ("shell.theme".into(), self.theme.clone()),
             ("shell.palette.recent".into(), self.palette_recent.clone()),
+            ("shell.brightness.mode".into(), self.brightness_mode.clone()),
+            ("shell.hemisphere".into(), self.hemisphere.clone()),
+            ("shell.living".into(), if self.living { "on" } else { "off" }.into()),
             ("shell.cold".into(), self.cold.clone()),
             ("shell.ambient.mic".into(), if self.ambient_mic { "on" } else { "off" }.into()),
             ("shell.audio.tone".into(), format!("{:.3}", self.audio_tone)),
@@ -202,6 +223,19 @@ impl ShellPrefs {
             "shell.brightness.offset" => self.brightness_offset = parse_range(key, v, -1.0, 1.0)?,
             "shell.brightness.rate" => self.brightness_rate = parse_range(key, v, 2.0, 90.0)? as u32,
             "shell.palette.recent" => self.palette_recent = v.to_string(),
+            "shell.brightness.mode" => {
+                if !matches!(v, "auto" | "smooth" | "stepped" | "safe") {
+                    return Err(format!("shell.brightness.mode: '{v}' is not auto|smooth|stepped|safe"));
+                }
+                self.brightness_mode = v.to_string();
+            }
+            "shell.hemisphere" => {
+                if !matches!(v, "north" | "south") {
+                    return Err(format!("shell.hemisphere: '{v}' is not north|south"));
+                }
+                self.hemisphere = v.to_string();
+            }
+            "shell.living" => self.living = parse_on_off(key, v)?,
             "shell.cold" => {
                 if !matches!(v, "auto" | "on" | "off") {
                     return Err(format!("shell.cold: '{v}' is not auto|on|off"));
@@ -303,6 +337,9 @@ mod tests {
         p.audio_tone = -0.25;
         p.ambient_mic = false;
         p.cold = "on".into();
+        p.hemisphere = "south".into();
+        p.brightness_mode = "stepped".into();
+        p.living = false;
         p.rotate_flip = true;
         p.clock_fuzzy = crate::clock::Fuzzy::Quarter;
         p.bar_widgets = bar::parse_widgets("clock,toggle:trackpad,app:org.gnome.Console").0;

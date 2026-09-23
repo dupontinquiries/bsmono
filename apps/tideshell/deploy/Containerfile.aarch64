@@ -1,0 +1,9 @@
+# Cross-build tideshell for the phone WITHOUT a cross toolchain: an Alpine
+# aarch64 container run under qemu-user (podman --platform linux/arm64),
+# with the same packages the phone has. Slow (emulated), but the binary
+# links against the same musl, libwayland and libEGL as postmarketOS.
+#   podman build --platform linux/arm64 -t tideshell-aarch64 -f Containerfile.aarch64 .
+#   sh build-in-podman.sh
+FROM --platform=linux/arm64 docker.io/alpine:edge
+RUN apk add --no-cache cargo rust wayland-dev mesa-dev pkgconf libxkbcommon-dev musl-dev
+WORKDIR /src

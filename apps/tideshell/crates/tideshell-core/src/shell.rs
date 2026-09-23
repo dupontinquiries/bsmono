@@ -68,6 +68,12 @@ pub struct Shell {
     pub headroom: crate::voice::Headroom,
     voice_line: String,
     apps_light: bool,
+    /// The living design's calendar input (1..366), set by the runtime.
+    day_of_year: u32,
+    /// Places and what they are like.
+    pub ambience: crate::ambience::Ambience,
+    ambience_dirty: bool,
+    last_ambience_log: Option<Millis>,
     /// Local minute of the day, set by the runtime (the engine has no clock).
     clock_minute: u32,
     /// The learned offset changed and is waiting to be saved once the user
@@ -135,6 +141,10 @@ impl Shell {
             headroom: crate::voice::Headroom::default(),
             voice_line: String::new(),
             apps_light: false,
+            day_of_year: 172,
+            ambience: crate::ambience::Ambience::default(),
+            ambience_dirty: false,
+            last_ambience_log: None,
             clock_minute: 12 * 60,
             offset_dirty_at: None,
             bar_expanded: false,
@@ -357,6 +367,7 @@ impl Shell {
                 self.log("cover dismissed");
             }
         }
+        self.log_ambience(now);
         // Sunlight: switch the apps to a light theme when the contrast is
         // well in (0.6) and back once it is well out (0.3): a theme is a
         // step, so hysteresis keeps it from flapping in dappled light.
@@ -715,6 +726,88 @@ impl Shell {
     /// Local minute of the day (0..1440), for the night window.
     pub fn set_clock(&mut self, minute: u32) {
         self.clock_minute = minute % 1440;
+    }
+
+    // ---- living design and places -------------------------------------------------
+
+    pub fn set_date(&mut self, day_of_year: u32) {
+        self.day_of_year = day_of_year.clamp(1, 366);
+    }
+
+    /// The design of this moment: season and time of day, shaded by the
+    /// place if one is known (its colours' warmth, its quiet). Neutral when
+    /// the living design is off.
+    pub fn mood(&self) -> crate::season::Mood {
+        use crate::season::Mood;
+        if !self.prefs.living {
+            return Mood { accent: crate::season::ICE, warmth: 0.0, saturation: 1.0, brightness: 1.0, omega: 28.0, zeta: 0.4, breath_period: 5.0, breath_amp: 0.0, season: "off", phase: "off" };
+        }
+        let mut m = crate::season::mood(self.day_of_year, self.clock_minute, self.prefs.hemisphere == "south");
+        if let Some(h) = self.ambience.hints(self.clock_minute / 60) {
+            m.warmth = (m.warmth + 0.5 * h.warmth).clamp(-1.0, 1.0);
+            if h.quiet {
+                m.zeta = (m.zeta * 1.25).min(0.95);
+                m.breath_amp *= 0.6;
+            }
+        }
+        m
+    }
+
+    /// The place's accent colour, when the place has one.
+    pub fn place_accent(&self) -> Option<[u8; 3]> {
+        self.ambience.hints(self.clock_minute / 60).and_then(|h| h.accent)
+    }
+
+    /// The accent to draw with now: the scene's, shaded 60/40 toward the
+    /// place's own colour when one is known.
+    pub fn accent(&self) -> [u8; 3] {
+        let m = self.mood().accent;
+        match self.place_accent() {
+            Some(p) if self.prefs.living => crate::season::mix_rgb(m, p, 0.6),
+            _ => m,
+        }
+    }
+
+    /// Somewhere recognized: by WiFi (the shell) or a snapclone landmark.
+    pub fn on_place(&mut self, key: crate::ambience::PlaceKey, name: &str) {
+        if self.ambience.arrive(key.clone(), name, self.now) {
+            let p = self.ambience.here().map(|p| (p.visits, p.colors.len())).unwrap_or((0, 0));
+            self.log(format!("place: {} {name:?} (visit {}, {} colours known)", key.token(), p.0, p.1));
+            self.ambience_dirty = true;
+        }
+    }
+
+    /// The camera pane's dominant colours: remembered for this place.
+    pub fn on_photo_colors(&mut self, colors: &[[u8; 3]]) {
+        if let Some(p) = self.ambience.here() {
+            p.note_colors(colors);
+            self.ambience_dirty = true;
+        }
+    }
+
+    /// Called from tick: once a minute, log the light and sound floor here.
+    fn log_ambience(&mut self, now: Millis) {
+        if self.last_ambience_log.is_some_and(|t| now.saturating_sub(t) < 60_000) {
+            return;
+        }
+        self.last_ambience_log = Some(now);
+        let lux = self.ambient.smoothed_lux().filter(|_| self.ambient.has_sensor(now));
+        let floor = self.sound.floor_dbfs();
+        let hour = self.clock_minute / 60;
+        if let Some(p) = self.ambience.here() {
+            if let Some(l) = lux {
+                p.note_lux(l, hour);
+            }
+            if let Some(f) = floor {
+                p.note_sound(f);
+            }
+            self.ambience_dirty = true;
+        }
+    }
+
+    /// The places log changed since last asked (the runtime saves it).
+    pub fn take_ambience_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.ambience_dirty)
     }
 
     /// The sunlight polarity flip (with hysteresis), shared by the apps'
@@ -1322,6 +1415,39 @@ mod tests {
         assert_eq!(saves, 1, "one save after the drag, not one per event");
         assert!((sh.prefs.brightness_offset - sh.ambient.user).abs() < 1e-6 && sh.ambient.user > 0.0);
         assert_eq!(sh.brightness_slider_pos(), (sh.ambient.user + 1.0) / 2.0);
+    }
+
+    #[test]
+    fn the_mood_follows_the_calendar_and_the_place() {
+        let mut sh = shell_with_three();
+        sh.set_date(20);
+        sh.set_clock(2 * 60);
+        let m = sh.mood();
+        assert_eq!((m.season, m.phase), ("winter", "night"));
+        assert!(m.warmth < -0.4 && m.zeta > 0.6);
+        sh.set_date(200);
+        sh.set_clock(13 * 60);
+        assert_eq!(sh.mood().season, "summer");
+        // A warm, quiet place shades the mood.
+        sh.on_place(crate::ambience::PlaceKey::Landmark("cafe".into()), "Cafe");
+        sh.on_photo_colors(&[[220, 150, 60]]);
+        for _ in 0..3 {
+            sh.ambience.here().unwrap().note_sound(-60.0);
+        }
+        let m2 = sh.mood();
+        assert!(m2.warmth > sh_mood_without_place(&sh).warmth + 0.1, "warmer at the cafe");
+        assert!(m2.zeta > sh_mood_without_place(&sh).zeta, "calmer at a quiet place");
+        assert_eq!(sh.place_accent(), Some([220, 150, 60]));
+        assert!(sh.take_ambience_dirty() && !sh.take_ambience_dirty());
+        // Off: neutral.
+        let mut p = sh.prefs.clone();
+        p.living = false;
+        sh.set_prefs(p);
+        assert_eq!(sh.mood().phase, "off");
+    }
+
+    fn sh_mood_without_place(sh: &Shell) -> crate::season::Mood {
+        crate::season::mood(sh.day_of_year, sh.clock_minute, false)
     }
 
     #[test]

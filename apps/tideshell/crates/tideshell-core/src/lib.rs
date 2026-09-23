@@ -22,6 +22,7 @@
 //!   overlay, so "why didn't my swipe open the switcher" is answerable on the
 //!   phone.
 
+pub mod ambience;
 pub mod ambient;
 pub mod ambient_sound;
 pub mod anim;
@@ -38,6 +39,7 @@ pub mod palette;
 pub mod lock;
 pub mod prefs;
 pub mod rotate;
+pub mod season;
 pub mod shell;
 pub mod sleep;
 pub mod switcher;

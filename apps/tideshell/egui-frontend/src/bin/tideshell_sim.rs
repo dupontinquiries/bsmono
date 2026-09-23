@@ -449,7 +449,7 @@ impl eframe::App for App {
                     ctx.request_repaint();
                 }
             }
-            let info = FrameInfo { apps: &self.apps, time: sim_time(self.fake_clock), battery: battery() };
+            let info = FrameInfo { apps: &self.apps, time: sim_time(self.fake_clock), battery: battery(), trackpad_note: None, t_secs: now as f32 };
             let actions = self.view.ui(ui, &mut self.shell, &self.palette, &info);
             self.execute(actions, now);
         });
@@ -526,6 +526,15 @@ fn main() -> eframe::Result<()> {
     let fake_lux: Option<f32> = val("--lux").and_then(|v| v.parse().ok());
     let lux_noise: f32 = val("--lux-noise").and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let camera = val("--camera").as_deref() == Some("synthetic");
+    // --date MM-DD sets the season; --place rrggbb[,rrggbb] a fake known place.
+    if let Some((m, d)) = val("--date").and_then(|v| v.split_once('-').map(|(a, b)| (a.parse::<u32>().unwrap_or(6), b.parse::<u32>().unwrap_or(21)))) {
+        shell.set_date(tideshell_core::season::day_of_year(2026, m, d));
+    }
+    if let Some(cols) = val("--place") {
+        shell.on_place(tideshell_core::ambience::PlaceKey::Landmark("sim".into()), "Sim place");
+        let parsed: Vec<[u8; 3]> = cols.split(',').filter_map(|c| u32::from_str_radix(c, 16).ok()).map(|x| [(x >> 16) as u8, (x >> 8) as u8, x as u8]).collect();
+        shell.on_photo_colors(&parsed);
+    }
     if camera {
         shell.world.drop_anchor("door");
         shell.on_heading(0.0);

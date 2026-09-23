@@ -29,6 +29,48 @@ pub fn local_minute() -> u32 {
     h * 60 + m
 }
 
+/// Day of the year, 1..366 (libc tm_yday + 1).
+pub fn local_yday() -> u32 {
+    // SAFETY: as local_hm.
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return 172;
+        }
+        (tm.tm_yday + 1).clamp(1, 366) as u32
+    }
+}
+
+/// The BSSID and SSID of the connected WiFi from `nmcli`, if any
+/// (`nmcli -t -f ACTIVE,SSID,BSSID dev wifi`; BSSID colons are escaped).
+pub fn wifi_place() -> Option<(String, String)> {
+    let out = std::process::Command::new("nmcli").args(["-t", "-f", "ACTIVE,SSID,BSSID", "dev", "wifi"]).stdin(std::process::Stdio::null()).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_nmcli_wifi(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// (bssid, ssid) of the active line. nmcli escapes ':' in the BSSID as '\:'.
+pub fn parse_nmcli_wifi(text: &str) -> Option<(String, String)> {
+    for line in text.lines() {
+        let un = line.replace("\\:", "\u{0}");
+        let mut parts = un.split(':');
+        let active = parts.next()?;
+        if active != "yes" {
+            continue;
+        }
+        let ssid = parts.next()?.to_string();
+        let bssid = parts.next()?.replace('\u{0}', ":").to_ascii_lowercase();
+        if bssid.is_empty() {
+            continue;
+        }
+        return Some((bssid, ssid));
+    }
+    None
+}
+
 /// Local hour, minute and weekday (0 = Sunday).
 pub fn local_time() -> tideshell_core::clock::LocalTime {
     // SAFETY: as local_hm.
@@ -610,6 +652,9 @@ pub struct BacklightOut {
     status: Arc<Mutex<String>>,
     /// Write interval in microseconds; `set_rate` changes it live.
     interval_us: Arc<std::sync::atomic::AtomicU64>,
+    /// 0 smooth, 1 stepped, 2 safe; `set_mode` changes it live.
+    mode: Arc<std::sync::atomic::AtomicU8>,
+    pub backlight_name: String,
     /// The level found at startup (None: no readable backlight).
     pub initial: Option<f32>,
 }
@@ -622,26 +667,37 @@ impl BacklightOut {
     /// `spawn` with an explicit brightnessctl path (tests pass a fake one).
     pub fn spawn_with(sys: &Path, bus: Option<Connection>, tool: Option<PathBuf>) -> BacklightOut {
         let status = Arc::new(Mutex::new(String::new()));
-        let interval_us = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000 / 30));
+        let interval_us = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000 / 10));
+        let mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
         let Some(bl) = find_backlight(sys) else {
             *status.lock().unwrap() = "backlight: none found under /sys/class/backlight".into();
-            return BacklightOut { tx: None, status, interval_us, initial: None };
+            return BacklightOut { tx: None, status, interval_us, mode, initial: None, backlight_name: String::new() };
         };
         let initial = bl.read_level();
         let (tx, rx) = mpsc::channel::<f32>();
         let st = status.clone();
         let iv = interval_us.clone();
+        let md = mode.clone();
+        let backlight_name = bl.name.clone();
+        mode.store(match WriteMode::auto_for(&backlight_name) { WriteMode::Smooth => 0, WriteMode::Stepped => 1, WriteMode::Safe => 2 }, std::sync::atomic::Ordering::Relaxed);
         std::thread::Builder::new()
             .name("tideshell-backlight".into())
-            .spawn(move || backlight_loop(bl, bus, tool, rx, st, iv))
+            .spawn(move || backlight_loop(bl, bus, tool, rx, st, iv, md))
             .expect("spawn backlight thread");
-        BacklightOut { tx: Some(tx), status, interval_us, initial }
+        BacklightOut { tx: Some(tx), status, interval_us, mode, initial, backlight_name }
     }
 
     pub fn set(&self, level: f32) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(level);
         }
+    }
+
+    /// The write mode; "auto" picks by the backlight's name.
+    pub fn set_mode(&self, pref: &str) -> WriteMode {
+        let m = WriteMode::parse(pref).unwrap_or_else(|| WriteMode::auto_for(&self.backlight_name));
+        self.mode.store(match m { WriteMode::Smooth => 0, WriteMode::Stepped => 1, WriteMode::Safe => 2 }, std::sync::atomic::Ordering::Relaxed);
+        m
     }
 
     /// Maximum write rate in Hz (the loop never writes faster).
@@ -692,7 +748,42 @@ fn brightnessctl_set(tool: &Path, name: &str, raw: u32) -> Result<(), String> {
 /// on each success: a driver that objects to the rate is not hammered.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(1);
 
-fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>, rx: Receiver<f32>, st: Arc<Mutex<String>>, interval_us: Arc<std::sync::atomic::AtomicU64>) {
+/// How values reach the panel. `Safe` exists for the FP5 (pmaports #4274):
+/// its DPU driver corrupts the display, flickers, or switches the panel
+/// off under a STREAM of brightness changes, while single writes are fine
+/// ("tapping a spot in the slider works; dragging breaks it"). So Safe
+/// holds a value until nothing new has arrived for SETTLE_MS and writes
+/// once; Stepped writes only >= 5% changes at most twice a second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    Smooth,
+    Stepped,
+    Safe,
+}
+
+pub const SETTLE_MS: u64 = 800;
+
+impl WriteMode {
+    pub fn parse(s: &str) -> Option<WriteMode> {
+        match s {
+            "smooth" => Some(WriteMode::Smooth),
+            "stepped" => Some(WriteMode::Stepped),
+            "safe" => Some(WriteMode::Safe),
+            _ => None,
+        }
+    }
+
+    /// `auto`: Safe on a DSI panel backlight, Smooth elsewhere.
+    pub fn auto_for(backlight_name: &str) -> WriteMode {
+        if backlight_name.contains("dsi") {
+            WriteMode::Safe
+        } else {
+            WriteMode::Smooth
+        }
+    }
+}
+
+fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>, rx: Receiver<f32>, st: Arc<Mutex<String>>, interval_us: Arc<std::sync::atomic::AtomicU64>, mode: Arc<std::sync::atomic::AtomicU8>) {
     let set = |s: String| *st.lock().unwrap() = s;
     let session = bus.as_ref().map(logind_graphical_session);
     // Candidate methods in order; the first that works stays in use, and a
@@ -725,7 +816,38 @@ fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>,
     set(note(cur, &skipped));
     let mut last_write: Option<std::time::Instant> = None;
     let mut backoff: Option<Duration> = None;
-    while let Ok(mut level) = rx.recv() {
+    let mut last_raw: Option<u32> = None;
+    loop {
+        let mode_now = match mode.load(std::sync::atomic::Ordering::Relaxed) {
+            2 => WriteMode::Safe,
+            1 => WriteMode::Stepped,
+            _ => WriteMode::Smooth,
+        };
+        let Ok(mut level) = rx.recv() else { return };
+        if mode_now != WriteMode::Smooth {
+            // Keep taking values until none has arrived for SETTLE_MS (Safe),
+            // or a >= 5% step has accumulated (Stepped): the panel gets one
+            // write per gesture or per real change, never a stream.
+            loop {
+                let wait = if mode_now == WriteMode::Safe { Duration::from_millis(SETTLE_MS) } else { Duration::from_millis(500) };
+                match rx.recv_timeout(wait) {
+                    Ok(v) => {
+                        level = v;
+                        if mode_now == WriteMode::Stepped {
+                            let raw = level_to_raw(level, bl.max);
+                            if last_raw.is_some_and(|l| (raw as i64 - l as i64).unsigned_abs() as f32 >= bl.max as f32 * 0.05) {
+                                break;
+                            }
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(_) => return,
+                }
+            }
+        }
+        if last_raw == Some(level_to_raw(level, bl.max)) {
+            continue;
+        }
         // The configured rate on the cheap paths (logind is one D-Bus call,
         // sysfs one write); brightnessctl is a process per call, so <= 20 Hz.
         let configured = Duration::from_micros(interval_us.load(std::sync::atomic::Ordering::Relaxed));
@@ -744,6 +866,7 @@ fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>,
             level = newer;
         }
         let raw = level_to_raw(level, bl.max);
+        last_raw = Some(raw);
         loop {
             let r = match methods[cur] {
                 Method::Logind => match (&bus, &session) {
@@ -973,6 +1096,44 @@ sys.stdout.buffer.write(b''.join(struct.pack('<f', 0.5 if (i//5)%2==0 else -0.5)
         put(&sys.join("class/power_supply/battery/temp"), "63");
         assert_eq!(battery_temp_c(&sys), Some(6.3));
         let _ = std::fs::remove_dir_all(&sys);
+    }
+
+    #[test]
+    fn nmcli_active_wifi_is_parsed_with_escaped_bssid() {
+        let t = "no:Neighbour:AA\\:BB\\:CC\\:DD\\:EE\\:01\nyes:Home Net:AA\\:BB\\:CC\\:DD\\:EE\\:FF\n";
+        assert_eq!(parse_nmcli_wifi(t), Some(("aa:bb:cc:dd:ee:ff".to_string(), "Home Net".to_string())));
+        assert_eq!(parse_nmcli_wifi("no:x:y\n"), None);
+        assert!(local_yday() >= 1 && local_yday() <= 366);
+    }
+
+    #[test]
+    fn safe_mode_writes_once_after_the_stream_settles() {
+        assert_eq!(WriteMode::auto_for("ae94000.dsi.0"), WriteMode::Safe, "the FP5's panel");
+        assert_eq!(WriteMode::auto_for("intel_backlight"), WriteMode::Smooth);
+        let sys = fake_sys("safe");
+        let tool = fake_tool(&sys, 0);
+        let out = BacklightOut::spawn_with(&sys, None, Some(tool));
+        assert_eq!(out.set_mode("safe"), WriteMode::Safe);
+        // A 30-step ramp over 300 ms: with the panel unable to take a stream,
+        // exactly one write must land, with the final value.
+        for i in 0..=30 {
+            out.set(0.3 + i as f32 * 0.02);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let calls = sys.join("calls");
+        let want = format!("-q -d panel set {}", level_to_raw(0.9, 4095));
+        assert!(wait_for(|| std::fs::read_to_string(&calls).unwrap_or_default().lines().last() == Some(want.as_str())), "{:?}", std::fs::read_to_string(&calls).ok());
+        std::thread::sleep(Duration::from_millis(300));
+        let n = std::fs::read_to_string(&calls).unwrap().lines().count();
+        assert_eq!(n, 1, "one write for the whole ramp, not {n}");
+        let _ = std::fs::remove_dir_all(&sys);
+    }
+
+    #[test]
+    fn nmcli_terse_wifi_lines_parse_with_escaped_colons() {
+        let s = "no:Neighbours:AA\\:BB\\:CC\\:DD\\:EE\\:01\nyes:Home net:AA\\:BB\\:CC\\:DD\\:EE\\:FF\n";
+        assert_eq!(parse_nmcli_wifi(s), Some(("aa:bb:cc:dd:ee:ff".into(), "Home net".into())));
+        assert_eq!(parse_nmcli_wifi("no:x:AA\\:BB\n"), None);
     }
 
     #[test]

@@ -60,6 +60,8 @@ struct Shellbox {
     notify_gain_written: f32,
     last_temp_poll: u64,
     strip_base_px: u32,
+    last_place_poll: u64,
+    last_color_note: u64,
 }
 
 impl Shellbox {
@@ -68,6 +70,7 @@ impl Shellbox {
             let o = match &a {
                 Action::SavePrefs if self.persist => {
                     self.backlight.set_rate(self.shell.prefs.brightness_rate);
+                    self.backlight.set_mode(&self.shell.prefs.brightness_mode);
                     effects::save_prefs(&self.shell.prefs)
                 }
                 Action::SavePrefs => Outcome::Done("prefs not persisted (TIDESHELL_PERSIST=0)".into()),
@@ -116,6 +119,20 @@ impl Shellbox {
             };
             self.shell.note(o.describe());
         }
+    }
+
+    /// What the pad should say when it cannot work.
+    fn trackpad_note(&self) -> Option<&'static str> {
+        match &self.ei_status {
+            Some(tideshell_egui::ei::Status::Ready) => None,
+            Some(tideshell_egui::ei::Status::Failed(_)) => Some("needs cosmic-comp patch 0002 (EI access denied)"),
+            _ => Some("connecting to the compositor..."),
+        }
+    }
+
+    /// The places log on disk.
+    fn places_path() -> Option<std::path::PathBuf> {
+        std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))).map(|d| d.join("tideshell/places.log"))
     }
 
     /// comfortgov reads this as the app in front (its scope is spared reclaim).
@@ -329,7 +346,16 @@ fn main() {
         notify_gain_written: -1.0,
         last_temp_poll: 0,
         strip_base_px: 0,
+        last_place_poll: 0,
+        last_color_note: 0,
     };
+    sb.shell.set_date(tideshell_egui::sensors::local_yday());
+    if let Some(p) = Shellbox::places_path() {
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            sb.shell.ambience = tideshell_core::ambience::Ambience::load(&text);
+            sb.shell.note(format!("places: {} known ({})", sb.shell.ambience.places.len(), p.display()));
+        }
+    }
     if sb.shell.prefs.ambient_mic {
         sb.mic = Some(tideshell_egui::sensors::MicFeed::spawn());
     }
@@ -341,6 +367,8 @@ fn main() {
         sb.keys = Some(k);
     }
     sb.backlight.set_rate(sb.shell.prefs.brightness_rate);
+    let wm = sb.backlight.set_mode(&sb.shell.prefs.brightness_mode);
+    sb.shell.note(format!("backlight write mode: {wm:?} (shell.brightness.mode = {}; safe = one write per settled value, for the FP5 DPU bug pmaports#4274)", sb.shell.prefs.brightness_mode));
     // Auto-brightness ramps from the real current level, or not at all.
     if let Some(l) = sb.backlight.initial {
         sb.shell.set_current_brightness(l);
@@ -421,6 +449,26 @@ fn main() {
                 sb.shell.on_mic_level(l, now_ms);
             }
         }
+        // Every 60 s: which WiFi we are on (a place), the landmark hint file
+        // from snapclone, the calendar, and the places log if it changed.
+        if now_ms.saturating_sub(sb.last_place_poll) >= 60_000 {
+            sb.last_place_poll = now_ms;
+            sb.shell.set_date(tideshell_egui::sensors::local_yday());
+            let hint = std::env::var_os("XDG_RUNTIME_DIR").map(|r| std::path::PathBuf::from(r).join("tideshell.place")).and_then(|p| std::fs::read_to_string(p).ok());
+            if let Some((key, name)) = hint.as_deref().and_then(tideshell_core::ambience::PlaceKey::parse) {
+                sb.shell.on_place(key, &name);
+            } else if let Some((bssid, ssid)) = tideshell_egui::sensors::wifi_place() {
+                sb.shell.on_place(tideshell_core::ambience::PlaceKey::Wifi(bssid), &ssid);
+            }
+            if sb.shell.take_ambience_dirty() {
+                if let Some(p) = Shellbox::places_path() {
+                    if let Some(d) = p.parent() {
+                        let _ = std::fs::create_dir_all(d);
+                    }
+                    let _ = std::fs::write(&p, sb.shell.ambience.save());
+                }
+            }
+        }
         // Every 2 s: battery temperature (cold mode) and the governor's
         // state file (voice headroom); publish the voice route on change.
         if now_ms.saturating_sub(sb.last_temp_poll) >= 2000 {
@@ -471,6 +519,12 @@ fn main() {
             }
             let pts = track::find_corners(&gray);
             sb.prev_frame = Some((gray, pts, yaw, pitch));
+            // What this place looks like: its dominant colours, every 5 s.
+            if now_ms.saturating_sub(sb.last_color_note) >= 5000 {
+                sb.last_color_note = now_ms;
+                let colors = tideshell_core::ambience::dominant_colors(&f.rgba, 3);
+                sb.shell.on_photo_colors(&colors);
+            }
             sb.view.set_camera_frame(&ctx, f.w, f.h, &f.rgba);
         }
         let nears: Vec<bool> = sb.proximity.rx.try_iter().collect();
@@ -659,7 +713,7 @@ fn main() {
                 ..Default::default()
             };
             raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(t.scale);
-            let info = FrameInfo { apps: &apps, time: tideshell_egui::sensors::local_time(), battery: None };
+            let info = FrameInfo { apps: &apps, time: tideshell_egui::sensors::local_time(), battery: None, trackpad_note: sb.trackpad_note(), t_secs: t0.elapsed().as_secs_f32() };
             let mut actions = Vec::new();
             let ctx_side = side_ctx.entry(role).or_insert_with(|| {
                 let c = egui::Context::default();
@@ -720,7 +774,7 @@ fn main() {
             ..Default::default()
         };
         raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(t.scale);
-        let info = FrameInfo { apps: &apps, time: tideshell_egui::sensors::local_time(), battery: None };
+        let info = FrameInfo { apps: &apps, time: tideshell_egui::sensors::local_time(), battery: None, trackpad_note: sb.trackpad_note(), t_secs: t0.elapsed().as_secs_f32() };
         let mut frame_actions = Vec::new();
         let out = ctx.run_ui(raw, |ui| {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {

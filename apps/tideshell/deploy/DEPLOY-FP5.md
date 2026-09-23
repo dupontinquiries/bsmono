@@ -36,6 +36,10 @@ Everything for deployment is in `apps/tideshell/deploy/`:
 | `preflight.sh` | read-only phone checks, PASS/WARN/FAIL |
 | `fp5-touch-diag.sh` | which layer drops touch; edge-touch test |
 | `fp5-camera-diag.sh` | why the camera works under plasma but not cosmic, link by link |
+| `70-tideshell-keys.rules` | udev: the power/volume keys for the seat's user (no input group) |
+| `build-in-podman.sh` + `Containerfile.aarch64` | build on the Mac in an emulated Alpine (unverified) |
+| `GITMIND-DEPLOY.md` | the deploy as a one-button plan for gitmind/depot |
+| `AMBIENCE-API.md` | how snapclone (or anything) names the place tideshell is at |
 | `pack-src.sh` | packs the 11 crates the phone build needs |
 | `run-in-session.sh` | runs tideshell inside the cosmic session from ssh |
 | `tideshell.service` | systemd user unit (autostart), stage 6 only |
@@ -147,7 +151,7 @@ Try each, and for each note what happened on screen **and** the trace lines:
 | 7 | press and hold on the bottom edge, slide onto Keyboard, lift | `edge pending -> hold`, `hold release -> Some(Keyboard)`, then `succeeded` or `FAILED ... exited N` (+ `keyboard mode off`) |
 | 8 | hold -> Trackpad; drag on the pad; tap | pointer moves; tap clicks (needs `ei: Ready`) |
 | 9 | drawer -> Shell settings -> Right-hand bar -> Apply | bar appears on the right; maximized windows narrow beside it (`reflow ... maximized window(s)`) |
-| 11 | at start: read the `keys:` line; then press the POWER key once; wait; triple-tap the screen | `keys: <device names>; logind power-key inhibitor held` (if it says `cannot open ... input group`, run `sudo adduser user input`, log out and in, retry); power key -> `power key`, `cover shown`, `display off`, `output power: set off on 1 output(s)` and the screen goes dark WITHOUT powering off; triple tap -> `triple tap: wake`, `output power: set on`. If the phone powers off instead, the inhibitor was not held: report the `keys:` line |
+| 11 | FIRST: `sudo install -Dm644 70-tideshell-keys.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=input` (or `sudo adduser user input` + relogin; sudo over ssh: `echo PASSWORD \| sudo -S ...`). Then at start read the `keys:` line; press the POWER key once; wait; triple-tap | `keys: <device names>; logind power-key inhibitor held` (if it says `cannot open ... input group`, run `sudo adduser user input`, log out and in, retry); power key -> `power key`, `cover shown`, `display off`, `output power: set off on 1 output(s)` and the screen goes dark WITHOUT powering off; triple tap -> `triple tap: wake`, `output power: set on`. If the phone powers off instead, the inhibitor was not held: report the `keys:` line |
 | 12 | press volume up / down | `-> SetSlider(Volume, ...)` then `ok: volume fade 0.xx -> 0.yy` and the level changes smoothly (needs `wpctl`, i.e. PipeWire/WirePlumber; else `FAILED: wpctl ...`) |
 | 14 | drawer -> drag on the Volume pad: left/right = level, up = cut through, down = soft | first drag: `FAILED: voicing sink installed at ~/.config/pipewire/pipewire.conf.d/tideshell-voicing.conf; restart pipewire ...` -> run `systemctl --user restart pipewire wireplumber`, then `wpctl set-default $(wpctl status | grep -m1 'tideshell voicing' | grep -oE '[0-9]+' | head -1)`; later drags: `ok: voicing +0.70: hp 250 Hz ...` and speech gets clearer / softer. Needs `pw-cli` (pipewire-tools) |
 | 15 | put the phone in a pocket, then triple-tap through the fabric; take it out, wait a second, triple-tap | `proximity: iio-sensor-proxy` at start; in the pocket `proximity near: covered` and the taps do nothing; out of the pocket, after ~0.8 s, the triple tap wakes |
@@ -157,6 +161,7 @@ Try each, and for each note what happened on screen **and** the trace lines:
 | 19 | bright sun: walk outside with the drawer open | the shell's contrast rises with the light, flips to a light look around 8 000 lux, and `sunlight: apps to the light theme` switches COSMIC apps to light (restored below ~3 000 lux); `cat ~/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark` shows false meanwhile |
 | 20 | voice route: `cat /run/user/$(id -u)/tideshell.voice-route` with a text app in front, then with the palette open; with comfortgov running, also while hot or below 20 % | `tiers=tiny,base reason=...` / `tiers=tiny reason=command...` / `tiers=tiny reason=phone is hot, low or busy...`; voiceterm reading this file is the follow-up |
 | 13 | turn the phone to landscape, hold it there | `orientation: iio-sensor-proxy accelerometer` at start; after ~0.5 s in landscape `rotate LeftUp` (or RightUp) then `ok: rotated DSI-1 to 90`; the screen rotates. If it rotates the WRONG way, set `shell.rotate.flip = on`. Needs `wlr-randr` (`apk add wlr-randr`); a 45° tilt or laying it flat must not rotate. `shell.rotate.auto = off` disables |
+| 21 | brightness on this panel: read `backlight write mode:` at start | `Safe` on the FP5 (its backlight is `ae94000.dsi.0`): one write per settled value, because the DPU driver corrupts the display under a stream of changes (pmaports #4274: garbage bars, flicker, the panel switching off). The slider still animates; the panel steps once when you let go. `shell.brightness.mode = smooth` re-enables the ramp only on a kernel with Marcel's DPU patch from that issue |
 | 10 | at start: read the `ambient:` and `backlight:` lines; then cover the light sensor (top bezel) for 5 s, uncover | ideally `ambient: iio-sensor-proxy (lux)` and `backlight: <name> (max N) via logind ...`; screen dims ~3 s after covering, brightens quickly after uncovering. `no light sensor found` = time of day only (report it); `cannot set` = neither logind nor sysfs worked (report the line) |
 
 Also capture screenshots if `grim` is available
@@ -194,11 +199,15 @@ Only if needed:
 - **0001** if stage 2 showed taps do not focus windows.
 
 Both are against **cosmic-comp epoch-1.8.0**; check the installed package
-matches (`apk info -v cosmic-comp`). Source: `git clone --depth 1 -b
-epoch-1.8.0 https://github.com/pop-os/cosmic-comp`, then
-`git apply --check` each patch before applying. Build per the runbook's
-on-phone route (`cargo build --release`), or better as an apk from the
-pmOS aport with the patches in `source=`.
+matches (`apk info -v cosmic-comp`). The on-phone recipe (~40 min):
+```sh
+cd ~/src && git clone --depth 1 -b epoch-1.8.0 https://github.com/pop-os/cosmic-comp && cd cosmic-comp
+git apply --check ~/0002-dbus-ei-allow-tideshell.patch && git apply ~/0002-dbus-ei-allow-tideshell.patch
+sudo apk add libinput-dev libseat-dev libdisplay-info-dev libxkbcommon-dev mesa-dev pixman-dev udev-dev   # names unverified
+cargo build --release
+```
+then the binary swap and rollback below. Better long-term: the pmOS aport
+with the patch in `source=`, built as an apk (gitmind's packaging.rs).
 
 Swapping the binary (the fast test path):
 

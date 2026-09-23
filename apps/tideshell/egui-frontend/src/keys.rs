@@ -94,15 +94,20 @@ impl Keys {
                 Err(e) => failed.push(format!("{}: {e}", d.node.display())),
             }
         }
-        let inhibit = if devices.iter().any(|d| d.power) { bus.and_then(|b| inhibit_power_key(b).ok()) } else { None };
+        // The inhibitor only when the power key can actually be READ: taking
+        // it with the device unreadable left the key doing nothing at all on
+        // the FP5 (logind no longer powered off, tideshell never saw the key).
+        let power_readable = devices.iter().any(|d| d.power && opened.iter().any(|o| o.contains(&d.node.display().to_string())));
+        let inhibit = if power_readable { bus.and_then(|b| inhibit_power_key(b).ok()) } else { None };
         let status = format!(
             "keys: {}{}{}",
             if opened.is_empty() { "no readable power/volume device".to_string() } else { opened.join(", ") },
             if failed.is_empty() { String::new() } else { format!("; cannot open {} (add the user to the input group)", failed.join(", ")) },
-            match (&inhibit, devices.iter().any(|d| d.power)) {
-                (Some(_), _) => "; logind power-key inhibitor held",
-                (None, true) => "; NO logind inhibitor: the power key still powers off",
-                (None, false) => "",
+            match (&inhibit, devices.iter().any(|d| d.power), power_readable) {
+                (Some(_), _, _) => "; logind power-key inhibitor held",
+                (None, true, false) => "; power key left to logind (device unreadable: it still powers off)",
+                (None, true, true) => "; NO logind inhibitor (D-Bus refused): the power key still powers off",
+                (None, false, _) => "",
             }
         );
         Keys { rx, status, _inhibit: inhibit }
