@@ -52,6 +52,8 @@ pub struct ShellPrefs {
     /// uikit palette id for the shell's own surfaces ("night", "slate",
     /// "slate-dusk", ...). Validated by the frontend against the registry.
     pub theme: String,
+    /// Command-palette recents, most recent first (item keys, comma-joined).
+    pub palette_recent: String,
     /// Cover clock: digital or analog, and how fuzzy.
     pub clock_style: crate::clock::ClockStyle,
     pub clock_fuzzy: crate::clock::Fuzzy,
@@ -72,13 +74,14 @@ impl Default for ShellPrefs {
             night: crate::ambient::NightWindow::default(),
             brightness_rate: 30,
             theme: "night".into(),
+            palette_recent: String::new(),
             clock_style: crate::clock::ClockStyle::Digital,
             clock_fuzzy: crate::clock::Fuzzy::Exact,
         }
     }
 }
 
-pub const KEYS: [&str; 14] = [
+pub const KEYS: [&str; 15] = [
     "shell.layout",
     "shell.bar.widgets",
     "shell.bar.width",
@@ -91,6 +94,7 @@ pub const KEYS: [&str; 14] = [
     "shell.brightness.night",
     "shell.brightness.rate",
     "shell.theme",
+    "shell.palette.recent",
     "shell.clock.style",
     "shell.clock.fuzzy",
 ];
@@ -117,6 +121,7 @@ impl ShellPrefs {
             ("shell.brightness.night".into(), self.night.format_span()),
             ("shell.brightness.rate".into(), self.brightness_rate.to_string()),
             ("shell.theme".into(), self.theme.clone()),
+            ("shell.palette.recent".into(), self.palette_recent.clone()),
             (
                 "shell.clock.style".into(),
                 match self.clock_style {
@@ -171,6 +176,7 @@ impl ShellPrefs {
             }
             "shell.brightness.offset" => self.brightness_offset = parse_range(key, v, -1.0, 1.0)?,
             "shell.brightness.rate" => self.brightness_rate = parse_range(key, v, 2.0, 90.0)? as u32,
+            "shell.palette.recent" => self.palette_recent = v.to_string(),
             "shell.theme" => {
                 if v.is_empty() || !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
                     return Err(format!("shell.theme: '{v}' is not a palette id"));
@@ -249,6 +255,7 @@ mod tests {
         p.clock_style = crate::clock::ClockStyle::Analog;
         p.brightness_rate = 12;
         p.theme = "slate-dusk".into();
+        p.palette_recent = "mode:keyboard,app:x".into();
         p.clock_fuzzy = crate::clock::Fuzzy::Quarter;
         p.bar_widgets = bar::parse_widgets("clock,toggle:trackpad,app:org.gnome.Console").0;
         let kv = p.to_kv();

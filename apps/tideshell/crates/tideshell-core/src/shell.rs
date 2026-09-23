@@ -14,6 +14,7 @@ use crate::lock::{LockAction, LockScreen};
 use crate::sleep::{Sleep, SleepAction};
 use crate::edge::{GestureEvent, Recognizer, SwipeUpTarget};
 use crate::hold::{HoldMenu, HoldOption};
+use crate::palette::{Geom, Palette, PaletteAction, PaletteItem};
 use crate::prefs::{Layout, ShellPrefs};
 use crate::switcher::Switcher;
 use crate::trackpad::Trackpad;
@@ -42,6 +43,12 @@ pub struct Shell {
     pub fat: Option<FatCursor>,
     /// Ambient light + time of day brightness.
     pub ambient: AutoBrightness,
+    /// The command palette (press-and-hold on the bottom edge).
+    pub palette: Palette,
+    /// Apps for the palette (desktop id, name), from hatch via the frontend.
+    apps: Vec<(String, String)>,
+    /// The palette asked for the settings sheet; the view takes it.
+    pub settings_requested: bool,
     /// The lock cover (cover mode for now: swipe dismisses, no auth).
     pub lock: LockScreen,
     /// Power key -> fade -> panel off; triple tap wakes.
@@ -88,6 +95,9 @@ impl Shell {
             modes: Modes::default(),
             fat: None,
             ambient,
+            palette: Palette::default(),
+            apps: Vec::new(),
+            settings_requested: false,
             lock: LockScreen::default(),
             sleep: Sleep::default(),
             clock_minute: 12 * 60,
@@ -190,6 +200,7 @@ impl Shell {
         self.switcher.sync(&windows);
         let out = self.carousel.sync(&windows);
         self.windows = windows;
+        self.rebuild_palette();
         self.emit(out)
     }
 
@@ -296,6 +307,7 @@ impl Shell {
         for a in self.sleep.tick(dt) {
             out.extend(self.on_sleep_action(a));
         }
+        self.palette.tick(dt);
         for a in self.lock.tick(dt, now) {
             if a == LockAction::Unlock {
                 self.log("cover dismissed");
@@ -377,22 +389,27 @@ impl Shell {
                 };
                 self.emit(out)
             }
-            GestureEvent::HoldStart { x, y } => {
+            GestureEvent::HoldStart { .. } => {
                 self.swipe_up = 0.0;
-                self.hold = Some(HoldMenu::open((x, y), self.screen));
+                self.drawer.close();
+                self.switcher.hide();
+                self.rebuild_palette();
+                self.palette.open_by_hold();
+                self.log("palette opened by hold");
                 vec![]
             }
             GestureEvent::HoldMove { x, y } => {
-                if let Some(h) = &mut self.hold {
-                    h.hover_to(x, y);
-                }
+                let g = Geom::new(self.screen);
+                self.palette.hold_move(&g, x, y);
                 vec![]
             }
             GestureEvent::HoldRelease { x, y } => {
-                let pick = self.hold.take().and_then(|h| h.release(x, y));
+                let g = Geom::new(self.screen);
+                let pick = self.palette.hold_release(&g, x, y);
+                self.palette.end_hold();
                 self.log(format!("hold release -> {pick:?}"));
                 match pick {
-                    Some(opt) => self.toggle_mode(opt),
+                    Some(a) => self.palette_action(a),
                     None => vec![],
                 }
             }
@@ -405,6 +422,7 @@ impl Shell {
                 self.swipe_up = 0.0;
                 self.peek_dx = 0.0;
                 self.hold = None;
+                self.palette.end_hold();
                 self.drawer.release(false);
                 self.log("gesture cancelled");
                 vec![]
@@ -441,6 +459,123 @@ impl Shell {
         };
         self.log(format!("mode {opt:?}"));
         self.emit(out)
+    }
+
+    // ---- command palette -------------------------------------------------------
+
+    /// Apps for the palette, from hatch (desktop id, display name).
+    pub fn set_apps(&mut self, apps: Vec<(String, String)>) {
+        self.apps = apps;
+        self.rebuild_palette();
+    }
+
+    fn rebuild_palette(&mut self) {
+        let mut items = Vec::new();
+        for w in self.switcher.cards() {
+            items.push(PaletteItem::new(format!("win:{}", w.id), w.title.clone(), "running", PaletteAction::Window(w.id)));
+        }
+        for (id, name) in &self.apps {
+            items.push(PaletteItem::new(format!("app:{id}"), name.clone(), "app", PaletteAction::App(id.clone())));
+        }
+        let ab = if self.ambient.enabled { "Auto brightness: off" } else { "Auto brightness: on" };
+        items.push(PaletteItem::new("set:autobright", ab, "setting", PaletteAction::ToggleAutoBrightness));
+        let fc = if self.prefs.fat_cursor { "Cursor: normal" } else { "Cursor: fat" };
+        items.push(PaletteItem::new("set:cursor", fc, "setting", PaletteAction::ToggleFatCursor));
+        match self.prefs.layout {
+            Layout::PullDown => items.push(PaletteItem::new("set:layout", "Layout: right-hand bar", "setting", PaletteAction::LayoutRightBar)),
+            Layout::RightBar => items.push(PaletteItem::new("set:layout", "Layout: pull-down", "setting", PaletteAction::LayoutPullDown)),
+        }
+        match self.prefs.clock_style {
+            crate::clock::ClockStyle::Digital => items.push(PaletteItem::new("set:clock", "Clock: analog", "setting", PaletteAction::ClockAnalog)),
+            crate::clock::ClockStyle::Analog => items.push(PaletteItem::new("set:clock", "Clock: digital", "setting", PaletteAction::ClockDigital)),
+        }
+        items.push(PaletteItem::new("act:switcher", "Switcher", "action", PaletteAction::Switcher));
+        items.push(PaletteItem::new("act:launcher", "All apps", "action", PaletteAction::Launcher));
+        items.push(PaletteItem::new("act:settings", "Shell settings", "action", PaletteAction::Settings));
+        items.push(PaletteItem::new("act:closeall", "Close all windows", "action", PaletteAction::CloseAll));
+        items.push(PaletteItem::new("act:lock", "Lock", "action", PaletteAction::Lock));
+        items.push(PaletteItem::new("act:sleep", "Sleep", "action", PaletteAction::Sleep));
+        let recents = self.prefs.palette_recent.split(',').filter(|k| !k.is_empty()).map(str::to_string);
+        self.palette.set_recents(recents);
+        self.palette.set_items(items);
+    }
+
+    /// Open the palette from a tap (a bar widget, a tile).
+    pub fn open_palette(&mut self) {
+        self.drawer.close();
+        self.switcher.hide();
+        self.rebuild_palette();
+        self.palette.open_by_tap();
+        self.log("palette opened");
+    }
+
+    /// A tap on the open palette at screen coordinates.
+    pub fn palette_tap(&mut self, x: f32, y: f32) -> Vec<Action> {
+        let g = Geom::new(self.screen);
+        match self.palette.tap(&g, x, y) {
+            Some(a) => self.palette_action(a),
+            None => vec![],
+        }
+    }
+
+    pub fn palette_query(&mut self, q: &str) {
+        self.palette.set_query(q);
+    }
+
+    fn palette_action(&mut self, a: PaletteAction) -> Vec<Action> {
+        self.log(format!("palette -> {a:?}"));
+        let recent = self.palette.recents_kv();
+        let mut out = if recent != self.prefs.palette_recent {
+            self.prefs.palette_recent = recent;
+            vec![Action::SavePrefs]
+        } else {
+            vec![]
+        };
+        let mut prefs = self.prefs.clone();
+        let rest = match a {
+            PaletteAction::Mode(m) => self.toggle_mode(m),
+            PaletteAction::ToggleAutoBrightness => self.tap_quick(QuickKind::AutoBrightness),
+            PaletteAction::ToggleFatCursor => {
+                prefs.fat_cursor = !prefs.fat_cursor;
+                self.set_prefs(prefs)
+            }
+            PaletteAction::LayoutPullDown => {
+                prefs.layout = Layout::PullDown;
+                self.set_prefs(prefs)
+            }
+            PaletteAction::LayoutRightBar => {
+                prefs.layout = Layout::RightBar;
+                self.set_prefs(prefs)
+            }
+            PaletteAction::ClockDigital => {
+                prefs.clock_style = crate::clock::ClockStyle::Digital;
+                self.set_prefs(prefs)
+            }
+            PaletteAction::ClockAnalog => {
+                prefs.clock_style = crate::clock::ClockStyle::Analog;
+                self.set_prefs(prefs)
+            }
+            PaletteAction::Window(id) => self.activate(id),
+            PaletteAction::App(id) => self.launch(&id),
+            PaletteAction::Switcher => {
+                self.open_switcher();
+                vec![]
+            }
+            PaletteAction::Launcher => self.open_launcher(),
+            PaletteAction::Settings => {
+                self.settings_requested = true;
+                vec![]
+            }
+            PaletteAction::CloseAll => self.switcher_close_all(),
+            PaletteAction::Lock => {
+                self.lock_now();
+                vec![]
+            }
+            PaletteAction::Sleep => self.power_key(),
+        };
+        out.extend(rest);
+        self.rebuild_palette();
+        out
     }
 
     // ---- overlay taps ------------------------------------------------------
@@ -724,23 +859,35 @@ mod tests {
         let mut sh = shell_with_three();
         sh.on_edge_touch(TouchEvent::Down { slot: 0, x: 204.0, y: 895.0, t: 0 });
         assert!(sh.tick(500).is_empty());
-        let menu = sh.hold.clone().expect("hold menu open");
-        let (kx, ky) = menu.centers[1];
-        sh.on_edge_touch(TouchEvent::Move { slot: 0, x: kx, y: ky, t: 600 });
-        assert_eq!(sh.hold.as_ref().unwrap().hover, Some(HoldOption::Keyboard));
+        assert!(sh.palette.open, "the hold opens the palette");
+        let g = Geom::new(S);
+        let (x, y, w, h) = g.mode_rect(1);
+        sh.on_edge_touch(TouchEvent::Move { slot: 0, x: x + w / 2.0, y: y + h / 2.0, t: 600 });
+        assert_eq!(sh.palette.hover, Some(crate::palette::Hit::Mode(1)));
         let out = sh.on_edge_touch(TouchEvent::Up { slot: 0, t: 700 });
-        assert_eq!(out, vec![Action::ShowKeyboard(true)]);
-        assert!(sh.hold.is_none());
+        assert!(out.contains(&Action::ShowKeyboard(true)), "{out:?}");
+        assert!(!sh.palette.open, "activating closes the palette");
         assert!(sh.quick_state(QuickKind::Keyboard));
+        assert!(sh.prefs.palette_recent.starts_with("mode:keyboard"), "{}", sh.prefs.palette_recent);
     }
 
     #[test]
-    fn hold_released_in_place_does_nothing() {
+    fn hold_released_in_place_leaves_the_palette_open_for_taps() {
         let mut sh = shell_with_three();
         sh.on_edge_touch(TouchEvent::Down { slot: 0, x: 204.0, y: 895.0, t: 0 });
         sh.tick(500);
         assert!(sh.on_edge_touch(TouchEvent::Up { slot: 0, t: 600 }).is_empty());
         assert_eq!(sh.modes, Modes::default());
+        assert!(sh.palette.open);
+        // Palette lists the running windows; tapping one activates it.
+        let g = Geom::new(S);
+        let row = sh.palette.rows().position(|r| r.label == "w1").expect("window row");
+        let out = sh.palette_tap(200.0, g.row_y(row) + 5.0);
+        assert!(out.contains(&Action::Activate(1)), "{out:?}");
+        assert!(!sh.palette.open);
+        // Tapping above the sheet closes it.
+        sh.open_palette();
+        assert!(sh.palette_tap(200.0, 20.0).is_empty() && !sh.palette.open);
     }
 
     #[test]

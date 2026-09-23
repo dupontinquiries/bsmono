@@ -31,6 +31,7 @@ pub mod control_center;
 pub mod cursor;
 pub mod edge;
 pub mod hold;
+pub mod palette;
 pub mod lock;
 pub mod prefs;
 pub mod shell;
