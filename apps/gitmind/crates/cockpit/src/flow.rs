@@ -1335,6 +1335,29 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
         features: vec![], no_default: false, target: String::new(), run_flags: String::new(),
         bin_name: Some("dialer-egui".into()),
     };
+    // stoat: the gdb/MI debugger. A workspace whose runnable crate is the
+    // member `crates/gui-egui` (bin `stoat-egui`), the primary in the manifest;
+    // the bare name would resolve to the workspace root with no bin.
+    let stoat = || crate::suite::SuiteApp {
+        name: "stoat".into(),
+        path: "apps/stoat/crates/gui-egui".into(),
+        features: vec![], no_default: false, target: String::new(), run_flags: String::new(),
+        bin_name: Some("stoat-egui".into()),
+    };
+    // tideshell: the runnable crate is `egui-frontend`, not the directory root.
+    // It builds two binaries. `tideshell` does not open a window: it BECOMES
+    // the shell (layer surfaces over cosmic-comp) and ships its own deploy kit
+    // (launcher + systemd unit). Launched from the store on a desktop it would
+    // take over the session, so the store runs `tideshell-sim`, the phone-sized
+    // simulator. Switching bin_name to "tideshell" is the alternative if the
+    // store should drive real deployment. The crate's default features (app,
+    // wayland, ei, layer) satisfy both binaries.
+    let tideshell = || crate::suite::SuiteApp {
+        name: "tideshell".into(),
+        path: "apps/tideshell/egui-frontend".into(),
+        features: vec![], no_default: false, target: String::new(), run_flags: String::new(),
+        bin_name: Some("tideshell-sim".into()),
+    };
     let unendlich = || crate::suite::SuiteApp {
         name: "unendlich".into(),
         path: "unendlich".into(),
@@ -1352,6 +1375,8 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     work_group.apps.push(switcheroo());
     work_group.apps.push(hatch());
     work_group.apps.push(drivemind());
+    // A shell is input and daily-use surface.
+    work_group.apps.push(tideshell());
     // clawbound-battleground: a plain package at games/clawbound-battleground
     // whose package and bin share the name, so the simple shape is exact;
     // discovery resolves games/ at build time. Listed as a custom push rather
@@ -1381,6 +1406,8 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     all_group.apps.push(simscope());
     all_group.apps.push(unendlich());
     all_group.apps.push(battleground());
+    all_group.apps.push(stoat());
+    all_group.apps.push(tideshell());
     vec![
         {
             // cadscope and simscope join here rather than via the simple
@@ -1391,6 +1418,7 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
             c.apps.push(aperture());
             c.apps.push(cadscope());
             c.apps.push(simscope());
+            c.apps.push(stoat());
             c
         },
         media_group,
@@ -1461,7 +1489,7 @@ mod store_group_tests {
         // `egui-frontend` deliberately. Same exception, different cause, and
         // worth saying so: the next reader will otherwise assume it is another
         // workspace.
-        const EXPLICIT_PATH: [&str; 13] = [
+        const EXPLICIT_PATH: [&str; 15] = [
             "bsettings", "studio", "aperture", "cadscope", "simscope", "ambient-learner",
             // Five apps the store did not offer at all until they were added;
             // each is a workspace whose runnable crate is a member.
@@ -1471,6 +1499,10 @@ mod store_group_tests {
             // no package respectively), but it is not what the manifest calls primary, so
             // these point at the egui port explicitly.
             "rusty-board", "fao-codec",
+            // stoat: a workspace whose runnable crate is a member (gui-egui).
+            // tideshell: the runnable crate is egui-frontend, and the store
+            // runs its simulator binary, not the session shell.
+            "stoat", "tideshell",
         ];
         for a in &all.apps {
             assert!(!a.path.contains('/') || EXPLICIT_PATH.contains(&a.name.as_str()),
