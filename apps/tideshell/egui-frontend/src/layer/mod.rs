@@ -97,6 +97,17 @@ pub enum Role {
     /// The right-hand bar: its own surface on the Top layer, with an
     /// exclusive zone so maximized windows are laid out beside it.
     Bar,
+    /// Carousel peeks: Top-layer side surfaces with exclusive zones, so the
+    /// active window is laid out in the centre; a tap cycles.
+    PeekLeft,
+    PeekRight,
+}
+
+impl Role {
+    /// Surfaces rendered with egui on their own EGL window.
+    pub fn is_side(self) -> bool {
+        matches!(self, Role::Bar | Role::PeekLeft | Role::PeekRight)
+    }
 }
 
 /// Input in surface-local logical coordinates; `Io::to_screen` maps it.
@@ -115,7 +126,8 @@ pub enum Input {
 pub fn strip_to_screen(role: Role, x: f32, y: f32, screen: (f32, f32), strip: (f32, f32)) -> (f32, f32) {
     match role {
         Role::Top | Role::Overlay => (x, y),
-        Role::Bar => (x + screen.0 - strip.0, y),
+        Role::Bar | Role::PeekRight => (x + screen.0 - strip.0, y),
+        Role::PeekLeft => (x, y),
         Role::Bottom => (x, y + screen.1 - strip.1),
         Role::Right => (x + screen.0 - strip.0, y),
     }
@@ -256,8 +268,8 @@ pub struct Io {
     /// Tint the strips so they can be seen (`TIDESHELL_SHOW_STRIPS=1`).
     pub show_strips: bool,
     right_enabled: bool,
-    /// (surface width, exclusive zone) for the bar.
-    bar_size: (u32, i32),
+    /// (surface width, exclusive zone) per side surface (bar, peeks).
+    side_sizes: HashMap<Role, (u32, i32)>,
 }
 
 impl Io {
@@ -287,7 +299,7 @@ impl Io {
             overlay_cursor: CursorWant::Shape(Shape::Default),
             applied: None,
         };
-        let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, frac_mgr, viewporter, strip_px, show_strips, right_enabled: false, bar_size: (0, 0) };
+        let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, frac_mgr, viewporter, strip_px, show_strips, right_enabled: false, side_sizes: HashMap::new() };
         for r in [Role::Top, Role::Bottom, Role::Right] {
             io.create(r);
         }
@@ -303,7 +315,7 @@ impl Io {
         let wl = self.compositor.create_surface(&self.qh, ());
         // Strips and overlay sit above everything (including fullscreen apps);
         // the bar is ordinary panel furniture on the Top layer.
-        let layer_kind = if role == Role::Bar { zwlr_layer_shell_v1::Layer::Top } else { zwlr_layer_shell_v1::Layer::Overlay };
+        let layer_kind = if role.is_side() { zwlr_layer_shell_v1::Layer::Top } else { zwlr_layer_shell_v1::Layer::Overlay };
         let layer = self.layer_shell.get_layer_surface(&wl, None, layer_kind, "tideshell".into(), &self.qh, ());
         let px = self.strip_px;
         let (anchor, size) = match role {
@@ -311,16 +323,17 @@ impl Io {
             Role::Bottom => (Anchor::Bottom | Anchor::Left | Anchor::Right, (0, px)),
             Role::Right => (Anchor::Top | Anchor::Bottom | Anchor::Right, (if self.right_enabled { px } else { 1 }, 0)),
             Role::Overlay => (Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right, (0, 0)),
-            Role::Bar => (Anchor::Top | Anchor::Bottom | Anchor::Right, (self.bar_size.0.max(1), 0)),
+            Role::Bar | Role::PeekRight => (Anchor::Top | Anchor::Bottom | Anchor::Right, (self.side_size(role).0.max(1), 0)),
+            Role::PeekLeft => (Anchor::Top | Anchor::Bottom | Anchor::Left, (self.side_size(role).0.max(1), 0)),
         };
         layer.set_anchor(anchor);
         layer.set_size(size.0, size.1);
         // -1: ignore other surfaces' exclusive zones, so strips sit on the
         // true screen edge even under a panel, and the overlay is fullscreen.
-        if role == Role::Bar {
-            // Reserve the collapsed width only: expanding overlaps windows
-            // (a drawer), it does not reflow them on every expand.
-            layer.set_exclusive_zone(self.bar_size.1);
+        if role.is_side() {
+            // The bar reserves its collapsed width only: expanding overlaps
+            // windows (a drawer), it does not reflow them on every expand.
+            layer.set_exclusive_zone(self.side_size(role).1);
         } else {
             layer.set_exclusive_zone(-1);
         }
@@ -408,12 +421,16 @@ impl Io {
         }
     }
 
-    /// Map/resize or unmap the bar. `width` is the drawn width (expanded or
-    /// not), `reserve` the exclusive zone (the collapsed width).
-    pub fn ensure_bar(&mut self, on: bool, width: u32, reserve: i32) {
-        let have = self.surf(Role::Bar).is_some();
+    fn side_size(&self, role: Role) -> (u32, i32) {
+        self.side_sizes.get(&role).copied().unwrap_or((0, 0))
+    }
+
+    /// Map/resize or unmap a side surface (bar or peek). `width` is the
+    /// drawn width, `reserve` the exclusive zone.
+    pub fn ensure_side(&mut self, role: Role, on: bool, width: u32, reserve: i32) {
+        let have = self.surf(role).is_some();
         if !on {
-            if let Some(i) = self.st.surfs.iter().position(|s| s.role == Role::Bar) {
+            if let Some(i) = self.st.surfs.iter().position(|s| s.role == role) {
                 let s = self.st.surfs.remove(i);
                 if let Some(f) = &s.frac {
                     f.destroy();
@@ -426,12 +443,12 @@ impl Io {
             }
             return;
         }
-        let changed = self.bar_size != (width, reserve);
-        self.bar_size = (width, reserve);
+        let changed = self.side_size(role) != (width, reserve);
+        self.side_sizes.insert(role, (width, reserve));
         if !have {
-            self.create(Role::Bar);
+            self.create(role);
         } else if changed {
-            if let Some(s) = self.surf(Role::Bar) {
+            if let Some(s) = self.surf(role) {
                 s.layer.set_size(width.max(1), 0);
                 s.layer.set_exclusive_zone(reserve);
                 s.wl.commit();
@@ -439,9 +456,9 @@ impl Io {
         }
     }
 
-    /// The bar's surface, logical size and buffer scale, once configured.
-    pub fn bar(&self) -> Option<EguiTarget> {
-        self.egui_target(Role::Bar)
+    /// A side surface (bar, peek), once configured.
+    pub fn side(&self, role: Role) -> Option<EguiTarget> {
+        self.egui_target(role)
     }
 
     fn egui_target(&self, role: Role) -> Option<EguiTarget> {
@@ -499,7 +516,7 @@ impl Io {
             })
             .collect();
         for (role, size) in fresh {
-            if !matches!(role, Role::Overlay | Role::Bar) {
+            if !(role == Role::Overlay || role.is_side()) {
                 self.attach_strip_buffer(role, size)?;
             }
         }

@@ -2,7 +2,7 @@
 //! windows that obey the shell's Actions (activate, close, maximize, launch).
 //!
 //!   cargo run --release -- [--trace] [--live] [--persist] [--layout right-bar]
-//!                          [--demo drawer|switcher|hold|bar|trackpad|fatcursor|settings|swipe]
+//!                          [--demo drawer|switcher|hold|bar|trackpad|fatcursor|carousel|settings|swipe]
 //!
 //! * Mouse = one finger. Edge zones are 28 px: pull from the top, swipe or
 //!   hold on the bottom, swipe along the bottom, swipe in from the right
@@ -297,6 +297,7 @@ impl App {
                 self.shell.lock.drag_reveal(0.3, 0);
                 vec![]
             }
+            "carousel" => self.shell.toggle_mode(tideshell_core::hold::HoldOption::Carousel),
             "fatcursor" => {
                 let mut p = self.shell.prefs.clone();
                 p.fat_cursor = true;
@@ -395,7 +396,10 @@ impl eframe::App for App {
             let p = ui.painter_at(area);
             p.rect_filled(area, CornerRadius::ZERO, Color32::from_rgb(28, 32, 44));
             // The active window fills the space beside the bar's exclusive zone.
-            let win_r = Rect::from_min_max(area.min, area.max - Vec2::new(ShellView::reserved_right(&self.shell), 0.0));
+            // The active window sits beside the bar's zone and, in carousel
+            // mode, in the centre 80% between the two peek zones.
+            let pk = self.shell.peek_reserve();
+            let win_r = Rect::from_min_max(area.min + Vec2::new(pk, 0.0), area.max - Vec2::new(ShellView::reserved_right(&self.shell) + pk, 0.0));
             if let Some(live) = &self.live {
                 let caps = live.capabilities();
                 let msg = format!("live: {} windows, manager caps {}", self.last_cards.len(), if caps.received { "received" } else { "pending" });

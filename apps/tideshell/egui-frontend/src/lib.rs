@@ -70,8 +70,9 @@ pub struct ShellView {
     /// a feedback loop, seen live in nested cosmic-comp. Only the
     /// simulator's fake cursor turns this on.
     pub pointer_pad: bool,
-    /// The bar is drawn on its own surface (`bar_ui`), not in the overlay.
-    /// The layer runtime sets this; the simulator keeps it off.
+    /// The bar and the carousel peeks are drawn on their own surfaces
+    /// (`bar_ui`, `peek_ui`), not in the overlay. The layer runtime sets
+    /// this; the simulator keeps it off and draws them in-window.
     pub bar_surface: bool,
     owners: Vec<(i32, Owner)>,
     touch_seen: bool,
@@ -139,7 +140,7 @@ impl ShellView {
             || shell.swipe_up > 0.0
             || shell.peek_dx.abs() > 1.0
             || shell.modes.trackpad
-            || shell.carousel.is_active()
+            || (shell.carousel.is_active() && !self.bar_surface)
             || (shell.prefs.layout == Layout::RightBar && !self.bar_surface)
             || self.sheet.open
             || self.show_trace
@@ -165,6 +166,11 @@ impl ShellView {
             let bw = Self::bar_width(shell);
             v.push(Rect::from_min_size(Pos2::new(size.x - bw, 0.0), Vec2::new(bw, size.y)));
         }
+        if shell.carousel.is_active() && !self.bar_surface {
+            let pw = shell.peek_reserve();
+            v.push(Rect::from_min_size(Pos2::ZERO, Vec2::new(pw, size.y)));
+            v.push(Rect::from_min_size(Pos2::new(size.x - Self::reserved_right(shell) - pw, 0.0), Vec2::new(pw, size.y)));
+        }
         Some(v)
     }
 
@@ -174,13 +180,76 @@ impl ShellView {
         (shell.prefs.layout == Layout::RightBar).then(|| (Self::bar_width(shell).round() as u32, shell.prefs.bar_width.round() as i32))
     }
 
+    /// Draw one carousel peek filling this `Ui` (its own layer surface).
+    pub fn peek_ui(&mut self, ui: &mut egui::Ui, shell: &mut Shell, side: tideshell_core::carousel::Side, pal: &PaletteColors) -> Vec<Action> {
+        let area = ui.max_rect();
+        self.peek(ui, shell, side, pal, area)
+    }
+
+    /// A peek strip: the neighbour window's tile (app colour, initial,
+    /// title down the strip) and a chevron. A tap anywhere cycles to it.
+    fn peek(&mut self, ui: &mut egui::Ui, shell: &mut Shell, side: tideshell_core::carousel::Side, pal: &PaletteColors, r: Rect) -> Vec<Action> {
+        use tideshell_core::carousel::Side;
+        let p = ui.painter_at(r);
+        p.rect_filled(r, cr(0), pal.bg_card);
+        let Some(id) = shell.carousel.peek(side) else { return vec![] };
+        let (title, app) = shell
+            .windows()
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| (w.title.clone(), w.app_id.clone()))
+            .unwrap_or_default();
+        let inset = r.shrink2(Vec2::new(4.0, 40.0));
+        p.rect_filled(inset, cr(10), with_alpha(app_color(&app), 0.9));
+        p.text(inset.center_top() + Vec2::new(0.0, 26.0), Align2::CENTER_CENTER, initial(&title), FontId::proportional(20.0), Color32::WHITE);
+        // Title down the strip, one character per line, capped.
+        let chars: String = title.chars().take(14).collect();
+        for (i, ch) in chars.chars().enumerate() {
+            p.text(inset.center_top() + Vec2::new(0.0, 58.0 + 16.0 * i as f32), Align2::CENTER_CENTER, ch, FontId::proportional(13.0), with_alpha(Color32::WHITE, 0.9));
+        }
+        let c = inset.center_bottom() - Vec2::new(0.0, 22.0);
+        let d = if side == Side::Left { -1.0 } else { 1.0 };
+        let s = Stroke::new(2.5, Color32::WHITE);
+        p.line_segment([c + Vec2::new(-6.0 * d, -9.0), c + Vec2::new(6.0 * d, 0.0)], s);
+        p.line_segment([c + Vec2::new(6.0 * d, 0.0), c + Vec2::new(-6.0 * d, 9.0)], s);
+        if ui.interact(r, Id::new(("ts-peek", side == Side::Left)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            return shell.peek_tap(side);
+        }
+        vec![]
+    }
+
     /// Draw the bar filling this `Ui` (its own layer surface).
     pub fn bar_ui(&mut self, ui: &mut egui::Ui, shell: &mut Shell, pal: &PaletteColors, info: &FrameInfo) -> Vec<Action> {
         let area = ui.max_rect();
         self.bar(ui, shell, pal, info, area.min, area.size())
     }
 
+    /// Sunlight look: opaque white surfaces, black text, a saturated accent.
+    /// Translucent dark chrome is what disappears first outdoors on a panel
+    /// that is not sunlight-readable; contrast is the lever the shell has.
+    pub fn sunlight_palette(pal: &PaletteColors) -> PaletteColors {
+        PaletteColors {
+            bg_base: Color32::WHITE,
+            bg_card: Color32::WHITE,
+            bg_raised: Color32::from_gray(232),
+            bg_hover: Color32::from_gray(215),
+            text: Color32::BLACK,
+            text_weak: Color32::from_gray(60),
+            accent: Color32::from_rgb(0, 90, 200),
+            accent_soft: Color32::from_rgb(150, 190, 240),
+            border: Color32::from_gray(120),
+            ..pal.clone()
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, shell: &mut Shell, pal: &PaletteColors, info: &FrameInfo) -> Vec<Action> {
+        let sun;
+        let pal = if shell.brightness_band().sunlight {
+            sun = Self::sunlight_palette(pal);
+            &sun
+        } else {
+            pal
+        };
         let area = ui.max_rect();
         let origin = area.min;
         let size = area.size();
@@ -196,6 +265,14 @@ impl ShellView {
         // Bottom layer first: bar, then overlays above it.
         if shell.prefs.layout == Layout::RightBar && !self.bar_surface {
             out.extend(self.bar(ui, shell, pal, info, origin, size));
+        }
+        if shell.carousel.is_active() && !self.bar_surface {
+            use tideshell_core::carousel::Side;
+            let pw = shell.peek_reserve();
+            let left = Rect::from_min_size(origin, Vec2::new(pw, size.y));
+            let right = Rect::from_min_size(origin + Vec2::new(size.x - Self::reserved_right(shell) - pw, 0.0), Vec2::new(pw, size.y));
+            out.extend(self.peek(ui, shell, Side::Left, pal, left));
+            out.extend(self.peek(ui, shell, Side::Right, pal, right));
         }
         if shell.modes.trackpad {
             let r = Self::pad_rect(size, Self::bar_width(shell)).translate(origin.to_vec2());

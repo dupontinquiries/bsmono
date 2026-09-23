@@ -42,7 +42,10 @@ impl Shellbox {
     fn execute(&mut self, actions: Vec<Action>) {
         for a in actions {
             let o = match &a {
-                Action::SavePrefs if self.persist => effects::save_prefs(&self.shell.prefs),
+                Action::SavePrefs if self.persist => {
+                    self.backlight.set_rate(self.shell.prefs.brightness_rate);
+                    effects::save_prefs(&self.shell.prefs)
+                }
                 Action::SavePrefs => Outcome::Done("prefs not persisted (TIDESHELL_PERSIST=0)".into()),
                 // Only a Ready EI connection moves the pointer. Output sent to a
                 // failed one used to vanish silently (seen on the FP5: the
@@ -191,6 +194,7 @@ fn main() {
         sensor_status: (String::new(), String::new()),
         ei_drop_noted: false,
     };
+    sb.backlight.set_rate(sb.shell.prefs.brightness_rate);
     // Auto-brightness ramps from the real current level, or not at all.
     if let Some(l) = sb.backlight.initial {
         sb.shell.set_current_brightness(l);
@@ -217,12 +221,11 @@ fn main() {
     let palette = uikit_egui::palette_colors_ctx(&ctx, &ui_prefs.palette);
     // Transparent panels: the overlay composites over the apps.
     ctx.global_style_mut(|s| s.visuals.panel_fill = egui::Color32::TRANSPARENT);
-    // The bar's surface has its own egui context (own textures, own input).
-    let bar_ctx = egui::Context::default();
-    uikit_egui::apply_prefs(&bar_ctx, &ui_prefs);
-    let _ = uikit_egui::palette_colors_ctx(&bar_ctx, &ui_prefs.palette);
-    let mut bar_events: Vec<egui::Event> = Vec::new();
-    let mut bar_pos: HashMap<i32, Pos2> = HashMap::new();
+    // Side surfaces (bar, peeks) each get their own egui context (own
+    // textures, own input), created on first use.
+    let mut side_ctx: HashMap<Role, egui::Context> = HashMap::new();
+    let mut side_events: HashMap<Role, Vec<egui::Event>> = HashMap::new();
+    let mut side_pos: HashMap<(Role, i32), Pos2> = HashMap::new();
 
     let t0 = Instant::now();
     let mut overlay_events: Vec<egui::Event> = Vec::new();
@@ -258,21 +261,21 @@ fn main() {
         let mut actions = Vec::new();
         for ev in input {
             match ev {
-                // The bar is a widget surface, not an edge: its input goes to
-                // its own egui context (it owns the right edge; see prefs).
-                Input::Down { role: Role::Bar, slot, x, y, .. } => {
-                    bar_pos.insert(slot, Pos2::new(x, y));
-                    bar_events.extend(contact_events(slot, egui::TouchPhase::Start, Pos2::new(x, y)));
+                // Side surfaces (bar, peeks) are widget surfaces, not edges:
+                // their input goes to their own egui contexts.
+                Input::Down { role, slot, x, y, .. } if role.is_side() => {
+                    side_pos.insert((role, slot), Pos2::new(x, y));
+                    side_events.entry(role).or_default().extend(contact_events(slot, egui::TouchPhase::Start, Pos2::new(x, y)));
                 }
-                Input::Move { role: Role::Bar, slot, x, y, .. } => {
-                    bar_pos.insert(slot, Pos2::new(x, y));
-                    bar_events.extend(contact_events(slot, egui::TouchPhase::Move, Pos2::new(x, y)));
+                Input::Move { role, slot, x, y, .. } if role.is_side() => {
+                    side_pos.insert((role, slot), Pos2::new(x, y));
+                    side_events.entry(role).or_default().extend(contact_events(slot, egui::TouchPhase::Move, Pos2::new(x, y)));
                 }
-                Input::Up { role: Role::Bar, slot, .. } => {
-                    let pos = bar_pos.remove(&slot).unwrap_or(Pos2::ZERO);
-                    bar_events.extend(contact_events(slot, egui::TouchPhase::End, pos));
+                Input::Up { role, slot, .. } if role.is_side() => {
+                    let pos = side_pos.remove(&(role, slot)).unwrap_or(Pos2::ZERO);
+                    side_events.entry(role).or_default().extend(contact_events(slot, egui::TouchPhase::End, pos));
                 }
-                Input::Hover { role: Role::Bar, x, y } => bar_events.push(egui::Event::PointerMoved(Pos2::new(x, y))),
+                Input::Hover { role, x, y } if role.is_side() => side_events.entry(role).or_default().push(egui::Event::PointerMoved(Pos2::new(x, y))),
                 Input::Down { role: Role::Overlay, slot, x, y, .. } => {
                     contact_pos.insert(slot, Pos2::new(x, y));
                     overlay_events.extend(contact_events(slot, egui::TouchPhase::Start, Pos2::new(x, y)));
@@ -313,47 +316,70 @@ fn main() {
             sb.poll_world();
         }
 
-        // Bar: its own surface with an exclusive zone (right-bar layout only).
-        let geom = ShellView::bar_geometry(&sb.shell);
-        io.ensure_bar(geom.is_some(), geom.map_or(0, |g| g.0), geom.map_or(0, |g| g.1));
-        let bar_now = io.bar();
-        // Maximized windows still laid out under the bar get re-maximized
+        // Side surfaces, each with an exclusive zone: the bar (right-bar
+        // layout) and the two carousel peeks (carousel mode). Each has its
+        // own egui context, input queue and EGL window.
+        let bar_geom = ShellView::bar_geometry(&sb.shell);
+        let peek = sb.shell.peek_reserve().round() as u32;
+        let sides: [(Role, Option<(u32, i32)>); 3] = [
+            (Role::Bar, bar_geom),
+            (Role::PeekLeft, (peek > 0).then_some((peek, peek as i32))),
+            (Role::PeekRight, (peek > 0).then_some((peek, peek as i32))),
+        ];
+        let mut reserved = 0.0;
+        for (role, geom) in sides {
+            io.ensure_side(role, geom.is_some(), geom.map_or(0, |g| g.0), geom.map_or(0, |g| g.1));
+            if let (Some(_), Some((_, r))) = (io.side(role), geom) {
+                reserved += r as f32;
+            }
+        }
+        // Maximized windows still laid out under a zone get re-maximized
         // (see Shell::reflow_for_zone for why cosmic-comp needs this).
-        if let (Some(_), Some((_, reserve))) = (&bar_now, geom) {
-            let out = sb.shell.reflow_for_zone(reserve as f32);
+        if reserved > 0.0 {
+            let out = sb.shell.reflow_for_zone(reserved);
             sb.execute(out);
         }
-        match bar_now {
-            Some(t) => {
-                t.prepare(&mut io);
-                let size_px = t.size_px();
-                let (w, h) = t.logical;
-                if gl.bind(Role::Bar, &t.surface, size_px).is_ok() {
-                    let mut raw = egui::RawInput {
-                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w as f32, h as f32))),
-                        time: Some(t0.elapsed().as_secs_f64()),
-                        events: std::mem::take(&mut bar_events),
-                        focused: true,
-                        ..Default::default()
-                    };
-                    raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(t.scale);
-                    let info = FrameInfo { apps: &apps, time: tideshell_egui::sensors::local_time(), battery: None };
-                    let mut bar_actions = Vec::new();
-                    let out = bar_ctx.run_ui(raw, |ui| {
-                        egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
-                            bar_actions = sb.view.bar_ui(ui, &mut sb.shell, &palette, &info);
-                        });
-                    });
-                    sb.execute(bar_actions);
-                    let prims = bar_ctx.tessellate(out.shapes, out.pixels_per_point);
-                    if let Err(e) = gl.paint(Role::Bar, size_px, out.pixels_per_point, &prims, &out.textures_delta) {
-                        eprintln!("tideshell: bar: {e}");
-                    }
-                }
+        for (role, _) in sides {
+            let Some(t) = io.side(role) else {
+                gl.unbind(role);
+                side_events.remove(&role);
+                continue;
+            };
+            t.prepare(&mut io);
+            let size_px = t.size_px();
+            let (w, h) = t.logical;
+            if gl.bind(role, &t.surface, size_px).is_err() {
+                continue;
             }
-            None => {
-                gl.unbind(Role::Bar);
-                bar_events.clear();
+            let mut raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w as f32, h as f32))),
+                time: Some(t0.elapsed().as_secs_f64()),
+                events: side_events.remove(&role).unwrap_or_default(),
+                focused: true,
+                ..Default::default()
+            };
+            raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(t.scale);
+            let info = FrameInfo { apps: &apps, time: tideshell_egui::sensors::local_time(), battery: None };
+            let mut actions = Vec::new();
+            let ctx_side = side_ctx.entry(role).or_insert_with(|| {
+                let c = egui::Context::default();
+                uikit_egui::apply_prefs(&c, &ui_prefs);
+                let _ = uikit_egui::palette_colors_ctx(&c, &ui_prefs.palette);
+                c
+            });
+            let out = ctx_side.run_ui(raw, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
+                    actions = match role {
+                        Role::Bar => sb.view.bar_ui(ui, &mut sb.shell, &palette, &info),
+                        Role::PeekLeft => sb.view.peek_ui(ui, &mut sb.shell, tideshell_core::carousel::Side::Left, &palette),
+                        _ => sb.view.peek_ui(ui, &mut sb.shell, tideshell_core::carousel::Side::Right, &palette),
+                    };
+                });
+            });
+            sb.execute(actions);
+            let prims = ctx_side.tessellate(out.shapes, out.pixels_per_point);
+            if let Err(e) = gl.paint(role, size_px, out.pixels_per_point, &prims, &out.textures_delta) {
+                eprintln!("tideshell: {role:?}: {e}");
             }
         }
 

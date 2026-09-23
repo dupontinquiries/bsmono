@@ -264,6 +264,8 @@ fn ambient_loop(sys: PathBuf, bus: Option<Connection>, tx: Sender<f32>, st: Arc<
 pub struct BacklightOut {
     tx: Option<Sender<f32>>,
     status: Arc<Mutex<String>>,
+    /// Write interval in microseconds; `set_rate` changes it live.
+    interval_us: Arc<std::sync::atomic::AtomicU64>,
     /// The level found at startup (None: no readable backlight).
     pub initial: Option<f32>,
 }
@@ -276,24 +278,31 @@ impl BacklightOut {
     /// `spawn` with an explicit brightnessctl path (tests pass a fake one).
     pub fn spawn_with(sys: &Path, bus: Option<Connection>, tool: Option<PathBuf>) -> BacklightOut {
         let status = Arc::new(Mutex::new(String::new()));
+        let interval_us = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000 / 30));
         let Some(bl) = find_backlight(sys) else {
             *status.lock().unwrap() = "backlight: none found under /sys/class/backlight".into();
-            return BacklightOut { tx: None, status, initial: None };
+            return BacklightOut { tx: None, status, interval_us, initial: None };
         };
         let initial = bl.read_level();
         let (tx, rx) = mpsc::channel::<f32>();
         let st = status.clone();
+        let iv = interval_us.clone();
         std::thread::Builder::new()
             .name("tideshell-backlight".into())
-            .spawn(move || backlight_loop(bl, bus, tool, rx, st))
+            .spawn(move || backlight_loop(bl, bus, tool, rx, st, iv))
             .expect("spawn backlight thread");
-        BacklightOut { tx: Some(tx), status, initial }
+        BacklightOut { tx: Some(tx), status, interval_us, initial }
     }
 
     pub fn set(&self, level: f32) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(level);
         }
+    }
+
+    /// Maximum write rate in Hz (the loop never writes faster).
+    pub fn set_rate(&self, hz: u32) {
+        self.interval_us.store(1_000_000 / hz.clamp(1, 90) as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn status(&self) -> String {
@@ -316,8 +325,6 @@ pub enum Method {
 /// Minimum spacing between writes: brightnessctl is a process per call and
 /// a ramp produces many steps; coalescing keeps only the newest value.
 pub const MIN_WRITE_INTERVAL: Duration = Duration::from_millis(50);
-/// logind / sysfs: one frame of a 90 Hz panel.
-pub const FAST_WRITE_INTERVAL: Duration = Duration::from_micros(11_111);
 
 /// `brightnessctl` on PATH, if installed.
 pub fn find_brightnessctl() -> Option<PathBuf> {
@@ -337,7 +344,11 @@ fn brightnessctl_set(tool: &Path, name: &str, raw: u32) -> Result<(), String> {
     }
 }
 
-fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>, rx: Receiver<f32>, st: Arc<Mutex<String>>) {
+/// After a failed write, the interval doubles (up to this) and halves back
+/// on each success: a driver that objects to the rate is not hammered.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>, rx: Receiver<f32>, st: Arc<Mutex<String>>, interval_us: Arc<std::sync::atomic::AtomicU64>) {
     let set = |s: String| *st.lock().unwrap() = s;
     let session = bus.as_ref().map(logind_graphical_session);
     // Candidate methods in order; the first that works stays in use, and a
@@ -369,10 +380,15 @@ fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>,
     };
     set(note(cur, &skipped));
     let mut last_write: Option<std::time::Instant> = None;
+    let mut backoff: Option<Duration> = None;
     while let Ok(mut level) = rx.recv() {
-        // 90 Hz on the cheap paths (logind is one D-Bus call, sysfs one
-        // write); brightnessctl is a process per call, so 20 Hz.
-        let interval = if methods[cur] == Method::Brightnessctl { MIN_WRITE_INTERVAL } else { FAST_WRITE_INTERVAL };
+        // The configured rate on the cheap paths (logind is one D-Bus call,
+        // sysfs one write); brightnessctl is a process per call, so <= 20 Hz.
+        let configured = Duration::from_micros(interval_us.load(std::sync::atomic::Ordering::Relaxed));
+        let mut interval = if methods[cur] == Method::Brightnessctl { configured.max(MIN_WRITE_INTERVAL) } else { configured };
+        if let Some(b) = backoff {
+            interval = interval.max(b);
+        }
         if let Some(t) = last_write {
             let since = t.elapsed();
             if since < interval {
@@ -394,14 +410,19 @@ fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>,
                 Method::Sysfs => bl.write_sysfs(raw).map_err(|e| format!("sysfs: {e}")),
             };
             match r {
-                Ok(()) => break,
+                Ok(()) => {
+                    backoff = backoff.and_then(|b| (b > interval * 2).then_some(b / 2));
+                    break;
+                }
                 Err(e) if cur + 1 < methods.len() => {
+                    backoff = Some(backoff.map_or(interval * 2, |b| (b * 2).min(BACKOFF_MAX)));
                     skipped.push(e);
                     cur += 1;
                     set(note(cur, &skipped));
                 }
                 Err(e) => {
-                    set(format!("backlight: cannot set {} (all methods failed; last: {e}) [{}]", bl.name, skipped.join("; ")));
+                    backoff = Some(backoff.map_or(interval * 2, |b| (b * 2).min(BACKOFF_MAX)));
+                    set(format!("backlight: cannot set {} (all methods failed; last: {e}; backing off to {:?}) [{}]", bl.name, backoff.unwrap(), skipped.join("; ")));
                     break;
                 }
             }
@@ -544,6 +565,19 @@ mod tests {
         assert!(wait_for(|| std::fs::read_to_string(&path).unwrap_or_default() == "4095"));
         let st = out.status();
         assert!(st.contains("via sysfs") && st.contains("brightnessctl exited 1"), "{st}");
+        let _ = std::fs::remove_dir_all(&sys);
+    }
+
+    #[test]
+    fn every_method_failing_is_reported_with_a_backoff() {
+        let sys = tmp("bl-allfail");
+        put(&sys.join("class/backlight/panel/max_brightness"), "255");
+        // A directory where the brightness file should be: every write fails.
+        std::fs::create_dir_all(sys.join("class/backlight/panel/brightness")).unwrap();
+        let out = BacklightOut::spawn_with(&sys, None, None);
+        out.set(0.7);
+        assert!(wait_for(|| out.status().contains("backing off")), "{}", out.status());
+        assert!(out.status().contains("cannot set panel"));
         let _ = std::fs::remove_dir_all(&sys);
     }
 
