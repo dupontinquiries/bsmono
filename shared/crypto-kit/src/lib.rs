@@ -117,6 +117,11 @@ pub fn ed25519_keypair() -> (Zeroizing<[u8; PRIV_KEY_LEN]>, [u8; PUB_KEY_LEN]) {
     (Zeroizing::new(sk.to_bytes()), vk.to_bytes())
 }
 
+/// The Ed25519 verifying key for a signing key (seed).
+pub fn ed25519_public_from_seed(signing_key: &[u8; PRIV_KEY_LEN]) -> [u8; PUB_KEY_LEN] {
+    SigningKey::from_bytes(signing_key).verifying_key().to_bytes()
+}
+
 /// Sign a message with an Ed25519 signing key.
 pub fn sign(signing_key: &[u8; PRIV_KEY_LEN], msg: &[u8]) -> [u8; SIG_LEN] {
     let sk = SigningKey::from_bytes(signing_key);
@@ -182,6 +187,14 @@ mod tests {
         assert!(!verify(&vk, b"other message", &sig), "wrong message must fail");
         let (_, vk2) = ed25519_keypair();
         assert!(!verify(&vk2, msg, &sig), "wrong key must fail");
+    }
+
+    #[test]
+    fn the_public_key_derived_from_a_seed_is_the_keypairs() {
+        let (sk, vk) = ed25519_keypair();
+        assert_eq!(ed25519_public_from_seed(&sk), vk);
+        let (sk2, _) = ed25519_keypair();
+        assert_ne!(ed25519_public_from_seed(&sk2), vk);
     }
 
     #[test]
