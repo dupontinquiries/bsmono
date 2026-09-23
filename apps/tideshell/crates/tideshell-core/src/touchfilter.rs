@@ -45,13 +45,21 @@ pub struct Stats {
     pub wet_episodes: u32,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TouchFilter {
+    /// Cold mode multiplies the slops (a gloved finger wobbles).
+    pub slop_scale: f32,
     contacts: HashMap<i32, Contact>,
     /// Lift times of recent brief, still touches.
     brief: Vec<Millis>,
     wet_until: Option<Millis>,
     pub stats: Stats,
+}
+
+impl Default for TouchFilter {
+    fn default() -> Self {
+        TouchFilter { slop_scale: 1.0, contacts: HashMap::new(), brief: Vec::new(), wet_until: None, stats: Stats::default() }
+    }
 }
 
 impl TouchFilter {
@@ -96,7 +104,7 @@ impl TouchFilter {
                 if c.rejected {
                     return None;
                 }
-                let brief = t.saturating_sub(c.down) <= RAIN_TAP_MS && (c.last.0 - c.start.0).hypot(c.last.1 - c.start.1) <= RAIN_SLOP;
+                let brief = t.saturating_sub(c.down) <= RAIN_TAP_MS && (c.last.0 - c.start.0).hypot(c.last.1 - c.start.1) <= RAIN_SLOP * self.slop_scale;
                 if brief {
                     self.brief.retain(|&b| t.saturating_sub(b) <= RAIN_WINDOW_MS);
                     self.brief.push(t);

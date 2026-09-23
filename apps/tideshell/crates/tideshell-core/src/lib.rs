@@ -29,6 +29,7 @@ pub mod audio;
 pub mod bar;
 pub mod carousel;
 pub mod clock;
+pub mod cold;
 pub mod control_center;
 pub mod cursor;
 pub mod edge;
@@ -40,9 +41,11 @@ pub mod rotate;
 pub mod shell;
 pub mod sleep;
 pub mod switcher;
+pub mod tilt;
 pub mod touchfilter;
 pub mod track;
 pub mod trackpad;
+pub mod voice;
 pub mod world;
 
 pub use shell::Shell;
@@ -109,4 +112,6 @@ pub enum Action {
     Rotate(u32),
     /// Audio voicing (-1 soft .. +1 cut through); see `audio`.
     SetVoicing(f32),
+    /// Switch the apps' theme to light (true) for sunlight, or restore.
+    AppsLightTheme(bool),
 }

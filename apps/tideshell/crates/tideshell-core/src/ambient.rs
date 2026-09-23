@@ -153,6 +153,14 @@ pub const SENSOR_STALE_MS: Millis = 15_000;
 /// Above this the shell switches its own surfaces to a sunlight (high
 /// contrast) look; the FP5 panel is not readable outdoors on brightness alone.
 pub const SUNLIGHT_LUX: f32 = 10_000.0;
+pub const CONTRAST_START_LUX: f32 = 2_500.0;
+
+/// 0 below the start, 1 at full sunlight, smoothstep between (in log lux).
+pub fn contrast_for_lux(lux: f32) -> f32 {
+    let (a, b) = (CONTRAST_START_LUX.ln(), SUNLIGHT_LUX.ln());
+    let x = ((lux.max(1.0).ln() - a) / (b - a)).clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
 /// Absolute-slider curve: level = pos^SLIDER_GAMMA, so the lower half of the
 /// slider's travel covers the bottom ~20% of brightness (night levels get
 /// the resolution; the top is where a coarse control is fine).
@@ -201,6 +209,10 @@ pub struct Band {
     pub trend: f32,
     /// Bright enough outdoors that the shell should draw for sunlight.
     pub sunlight: bool,
+    /// How far into the sunlight look to blend, 0..1: smooth from
+    /// CONTRAST_START_LUX to SUNLIGHT_LUX, so the shell's contrast rises
+    /// with the light instead of switching.
+    pub contrast: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -356,6 +368,7 @@ impl AutoBrightness {
             stability: if self.has_sensor(now) { self.stability() } else { 1.0 },
             trend: self.trend,
             sunlight: self.has_sensor(now) && self.smoothed_lux().is_some_and(|l| l >= SUNLIGHT_LUX),
+            contrast: if self.has_sensor(now) { self.smoothed_lux().map(contrast_for_lux).unwrap_or(0.0) } else { 0.0 },
         }
     }
 
@@ -733,6 +746,20 @@ mod tests {
         let mut b = on();
         run(&mut b, 800.0, 20.0, 0, 10);
         assert!(!b.band(20_100, NOON).sunlight, "indoors: no");
+    }
+
+    #[test]
+    fn contrast_blends_in_with_the_light() {
+        assert_eq!(contrast_for_lux(500.0), 0.0);
+        assert_eq!(contrast_for_lux(30_000.0), 1.0);
+        let mid = contrast_for_lux((CONTRAST_START_LUX * SUNLIGHT_LUX).sqrt());
+        assert!((mid - 0.5).abs() < 1e-3, "half-way in log lux: {mid}");
+        let mut prev = 0.0;
+        for i in 0..50 {
+            let c = contrast_for_lux(1000.0 * 1.1f32.powi(i));
+            assert!(c >= prev);
+            prev = c;
+        }
     }
 
     #[test]

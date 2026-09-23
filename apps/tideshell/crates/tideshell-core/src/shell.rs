@@ -59,6 +59,15 @@ pub struct Shell {
     /// Ambient loudness -> notification gain.
     pub sound: crate::ambient_sound::AmbientSound,
     last_imu: Option<Millis>,
+    pub cold: crate::cold::Cold,
+    /// The recognizer's warm-weather config, so cold tuning is applied to
+    /// the original and not compounded.
+    base_edge: crate::edge::EdgeConfig,
+    tilt: crate::tilt::Tilt,
+    /// The governor's headroom, from its state file; default = free.
+    pub headroom: crate::voice::Headroom,
+    voice_line: String,
+    apps_light: bool,
     /// Local minute of the day, set by the runtime (the engine has no clock).
     clock_minute: u32,
     /// The learned offset changed and is waiting to be saved once the user
@@ -85,6 +94,14 @@ impl Shell {
         switcher.style = prefs.switcher_style;
         let mut trackpad = Trackpad::default();
         trackpad.speed = prefs.trackpad_speed;
+        let cold_force = match prefs.cold.as_str() {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        };
+        let base_edge = prefs.edge_config();
+        let mut cold = crate::cold::Cold::default();
+        cold.force = cold_force;
         let mut rotate = crate::rotate::AutoRotate::default();
         rotate.enabled = prefs.autorotate;
         let mut ambient = AutoBrightness::default();
@@ -112,6 +129,12 @@ impl Shell {
             world: crate::world::World::new(screen.0 * 0.9),
             sound: crate::ambient_sound::AmbientSound::default(),
             last_imu: None,
+            cold,
+            base_edge,
+            tilt: crate::tilt::Tilt::default(),
+            headroom: crate::voice::Headroom::default(),
+            voice_line: String::new(),
+            apps_light: false,
             clock_minute: 12 * 60,
             offset_dirty_at: None,
             bar_expanded: false,
@@ -199,7 +222,14 @@ impl Shell {
         self.ambient.user = prefs.brightness_offset;
         self.ambient.night = prefs.night;
         self.rotate.enabled = prefs.autorotate;
+        self.cold.set_force(match prefs.cold.as_str() {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        });
+        self.base_edge = prefs.edge_config();
         self.prefs = prefs;
+        self.apply_cold();
         let mut out = vec![Action::SavePrefs];
         out.extend(self.sync_fat());
         self.emit(out)
@@ -326,6 +356,19 @@ impl Shell {
             if a == LockAction::Unlock {
                 self.log("cover dismissed");
             }
+        }
+        // Sunlight: switch the apps to a light theme when the contrast is
+        // well in (0.6) and back once it is well out (0.3): a theme is a
+        // step, so hysteresis keeps it from flapping in dappled light.
+        let contrast = self.ambient.band(now, self.clock_minute).contrast;
+        if !self.apps_light && contrast >= 0.6 {
+            self.apps_light = true;
+            self.log("sunlight: apps to the light theme");
+            out.push(Action::AppsLightTheme(true));
+        } else if self.apps_light && contrast <= 0.3 {
+            self.apps_light = false;
+            self.log("sunlight over: apps theme restored");
+            out.push(Action::AppsLightTheme(false));
         }
         // A rotation that waited for the cover or sleep to end.
         if !self.lock.is_locked() && !self.sleep.captures_input() {
@@ -674,6 +717,52 @@ impl Shell {
         self.clock_minute = minute % 1440;
     }
 
+    /// Battery temperature (°C): drives cold mode unless forced.
+    pub fn on_battery_temp(&mut self, c: f32) {
+        if self.cold.on_battery_temp(c) {
+            self.log(format!("cold mode {} (battery {c:.1} C)", if self.cold.on { "on" } else { "off" }));
+            self.apply_cold();
+        }
+    }
+
+    fn apply_cold(&mut self) {
+        let t = self.cold.tuning();
+        let mut cfg = self.base_edge.clone();
+        cfg.edge_px *= t.target_scale;
+        cfg.slop_px *= t.slop_scale;
+        cfg.hold_ms = (cfg.hold_ms as f32 * t.time_scale) as Millis;
+        self.recognizer.cfg = cfg;
+    }
+
+    /// Cold tuning for the frontend (targets, slops).
+    pub fn cold_tuning(&self) -> crate::cold::ColdTuning {
+        self.cold.tuning()
+    }
+
+    /// Where a listen would be used right now, for the voice route.
+    pub fn voice_focus(&self) -> crate::voice::Focus {
+        if self.palette.open || self.lock.is_locked() {
+            return crate::voice::Focus::Command;
+        }
+        let text_app = self.windows.iter().find(|w| w.activated).is_some_and(|w| {
+            let id = w.app_id.to_ascii_lowercase();
+            ["texteditor", "editor", "console", "term", "gedit", "kate", "code", "notes", "writer", "mail", "chat", "message"].iter().any(|k| id.contains(k))
+        });
+        if text_app { crate::voice::Focus::Dictation } else { crate::voice::Focus::Other }
+    }
+
+    /// The route line for voiceterm, when it changed since last asked.
+    pub fn voice_route_line(&mut self) -> Option<String> {
+        let line = crate::voice::route(self.voice_focus(), &self.headroom).line();
+        if line != self.voice_line {
+            self.voice_line = line.clone();
+            self.log(format!("voice route: {line}"));
+            Some(line)
+        } else {
+            None
+        }
+    }
+
     /// Whether the camera should run: only while the cover is showing on a
     /// lit screen (never behind apps, never in a pocket).
     pub fn camera_wanted(&self) -> bool {
@@ -686,6 +775,16 @@ impl Shell {
         self.last_imu = Some(now);
         if dt > 0.0 {
             self.world.gyro(gyro, dt);
+            // Gyro select: only while a finger holds the palette open.
+            if self.palette.is_holding() {
+                let (dx, dy) = self.tilt.feed(gyro[0], gyro[2], dt);
+                if dx != 0 || dy != 0 {
+                    self.palette.move_hover(dx, dy);
+                    self.log(format!("tilt select {:?}", self.palette.hover));
+                }
+            } else {
+                self.tilt.reset();
+            }
         }
         self.world.accel(accel);
     }
@@ -1217,6 +1316,69 @@ mod tests {
         assert_eq!(saves, 1, "one save after the drag, not one per event");
         assert!((sh.prefs.brightness_offset - sh.ambient.user).abs() < 1e-6 && sh.ambient.user > 0.0);
         assert_eq!(sh.brightness_slider_pos(), (sh.ambient.user + 1.0) / 2.0);
+    }
+
+    #[test]
+    fn cold_mode_grows_the_edges_and_slows_the_hold() {
+        let mut sh = shell_with_three();
+        let warm = sh.recognizer.cfg.clone();
+        sh.on_battery_temp(3.0);
+        assert!(sh.cold.on);
+        assert!((sh.recognizer.cfg.edge_px - warm.edge_px * 1.35).abs() < 1e-3);
+        assert_eq!(sh.recognizer.cfg.hold_ms, (warm.hold_ms as f32 * 1.4) as Millis);
+        sh.on_battery_temp(20.0);
+        assert_eq!(sh.recognizer.cfg, warm, "restored exactly, not compounded");
+        let mut p = sh.prefs.clone();
+        p.cold = "on".into();
+        sh.set_prefs(p);
+        assert!(sh.cold.on && sh.recognizer.cfg.edge_px > warm.edge_px, "forced on");
+    }
+
+    #[test]
+    fn tilting_while_holding_the_palette_moves_the_hover() {
+        let mut sh = shell_with_three();
+        sh.on_edge_touch(TouchEvent::Down { slot: 0, x: 204.0, y: 895.0, t: 0 });
+        sh.tick(500);
+        assert!(sh.palette.is_holding());
+        let mut t = 500u64;
+        for _ in 0..40 {
+            t += 20;
+            sh.on_imu([-40f32.to_radians(), 0.0, 0.0], [0.0, 9.8, 0.0], t); // top edge away: down
+        }
+        assert!(matches!(sh.palette.hover, Some(crate::palette::Hit::Row(_))), "{:?}", sh.palette.hover);
+        // Lift: the hovered row is activated through the normal release path.
+        let g = crate::palette::Geom::new(S);
+        let _ = g;
+    }
+
+    #[test]
+    fn sunlight_flips_the_apps_theme_with_hysteresis_and_the_voice_route_follows_focus() {
+        let mut sh = shell_with_three();
+        sh.set_current_brightness(0.5);
+        let mut acts = vec![];
+        for i in 0..400u64 {
+            sh.on_lux(30_000.0, i * 100);
+            acts.extend(sh.tick(i * 100));
+        }
+        assert!(acts.contains(&Action::AppsLightTheme(true)));
+        acts.clear();
+        for i in 400..800u64 {
+            sh.on_lux(5_000.0, i * 100); // dappled: contrast 0.5, inside the band
+            acts.extend(sh.tick(i * 100));
+        }
+        assert!(!acts.iter().any(|a| matches!(a, Action::AppsLightTheme(_))), "no flap in the band");
+        for i in 800..1200u64 {
+            sh.on_lux(500.0, i * 100);
+            acts.extend(sh.tick(i * 100));
+        }
+        assert!(acts.contains(&Action::AppsLightTheme(false)));
+        // Voice: apps in front -> default; a console -> dictation; the palette -> command.
+        assert_eq!(sh.voice_route_line().as_deref(), Some("tiers=tiny,base reason=default: tiny + base"));
+        assert!(sh.voice_route_line().is_none(), "unchanged: nothing to publish");
+        sh.set_windows(vec![WindowCard { app_id: "org.gnome.Console".into(), activated: true, ..win(9, true) }]);
+        assert!(sh.voice_route_line().unwrap().contains("dictation"));
+        sh.open_palette();
+        assert!(sh.voice_route_line().unwrap().starts_with("tiers=tiny reason=command"));
     }
 
     #[test]

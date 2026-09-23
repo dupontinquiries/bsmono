@@ -54,6 +54,8 @@ pub struct ShellPrefs {
     pub theme: String,
     /// Command-palette recents, most recent first (item keys, comma-joined).
     pub palette_recent: String,
+    /// Cold mode: auto (battery temperature), on, off.
+    pub cold: String,
     /// Ambient loudness from the microphone (notification gain). The mic is
     /// only ever reduced to a level, but it is open while this is on.
     pub ambient_mic: bool,
@@ -83,6 +85,7 @@ impl Default for ShellPrefs {
             brightness_rate: 30,
             theme: "night".into(),
             palette_recent: String::new(),
+            cold: "auto".into(),
             ambient_mic: true,
             audio_tone: 0.0,
             autorotate: true,
@@ -93,7 +96,7 @@ impl Default for ShellPrefs {
     }
 }
 
-pub const KEYS: [&str; 19] = [
+pub const KEYS: [&str; 20] = [
     "shell.layout",
     "shell.bar.widgets",
     "shell.bar.width",
@@ -107,6 +110,7 @@ pub const KEYS: [&str; 19] = [
     "shell.brightness.rate",
     "shell.theme",
     "shell.palette.recent",
+    "shell.cold",
     "shell.ambient.mic",
     "shell.audio.tone",
     "shell.rotate.auto",
@@ -138,6 +142,7 @@ impl ShellPrefs {
             ("shell.brightness.rate".into(), self.brightness_rate.to_string()),
             ("shell.theme".into(), self.theme.clone()),
             ("shell.palette.recent".into(), self.palette_recent.clone()),
+            ("shell.cold".into(), self.cold.clone()),
             ("shell.ambient.mic".into(), if self.ambient_mic { "on" } else { "off" }.into()),
             ("shell.audio.tone".into(), format!("{:.3}", self.audio_tone)),
             ("shell.rotate.auto".into(), if self.autorotate { "on" } else { "off" }.into()),
@@ -197,6 +202,12 @@ impl ShellPrefs {
             "shell.brightness.offset" => self.brightness_offset = parse_range(key, v, -1.0, 1.0)?,
             "shell.brightness.rate" => self.brightness_rate = parse_range(key, v, 2.0, 90.0)? as u32,
             "shell.palette.recent" => self.palette_recent = v.to_string(),
+            "shell.cold" => {
+                if !matches!(v, "auto" | "on" | "off") {
+                    return Err(format!("shell.cold: '{v}' is not auto|on|off"));
+                }
+                self.cold = v.to_string();
+            }
             "shell.ambient.mic" => self.ambient_mic = parse_on_off(key, v)?,
             "shell.audio.tone" => self.audio_tone = parse_range(key, v, -1.0, 1.0)?,
             "shell.rotate.auto" => self.autorotate = parse_on_off(key, v)?,
@@ -291,6 +302,7 @@ mod tests {
         p.autorotate = false;
         p.audio_tone = -0.25;
         p.ambient_mic = false;
+        p.cold = "on".into();
         p.rotate_flip = true;
         p.clock_fuzzy = crate::clock::Fuzzy::Quarter;
         p.bar_widgets = bar::parse_widgets("clock,toggle:trackpad,app:org.gnome.Console").0;

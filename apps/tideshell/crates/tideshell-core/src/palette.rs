@@ -242,6 +242,43 @@ impl Palette {
         self.reveal.animate_to(0.0);
     }
 
+    /// Gyro select: move the hover by whole steps (dx across the mode row,
+    /// dy down the list) while a finger holds. From nothing, a step lands on
+    /// the first mode; below the mode row is the list.
+    pub fn move_hover(&mut self, dx: i32, dy: i32) {
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        let rows = self.row_count() as i32;
+        let next = match self.hover {
+            None => Some(Hit::Mode(0)),
+            Some(Hit::Mode(i)) => {
+                let i = i as i32;
+                if dy > 0 && rows > 0 {
+                    Some(Hit::Row(0))
+                } else {
+                    Some(Hit::Mode((i + dx).clamp(0, 2) as usize))
+                }
+            }
+            Some(Hit::Row(r)) => {
+                let r = r as i32 + dy;
+                if r < 0 {
+                    Some(Hit::Mode(1))
+                } else {
+                    Some(Hit::Row(r.min(rows - 1).max(0) as usize))
+                }
+            }
+            other => other,
+        };
+        self.hover = next;
+    }
+
+    /// Activate whatever the hover is on (a gyro-select release).
+    pub fn activate_hover(&mut self) -> Option<PaletteAction> {
+        let h = self.hover.take()?;
+        self.activate_hit(h)
+    }
+
     /// The held finger moved.
     pub fn hold_move(&mut self, geom: &Geom, x: f32, y: f32) {
         self.hover = match geom.hit(x, y, self.row_count()) {
@@ -393,6 +430,27 @@ mod tests {
         assert!(p.open, "stays open for taps");
         assert_eq!(p.hold_release(&g, 200.0, 50.0), None, "lift above the sheet");
         assert!(p.open);
+    }
+
+    #[test]
+    fn gyro_steps_walk_the_modes_then_the_list_and_release_activates() {
+        let (mut p, _) = open();
+        p.move_hover(1, 0);
+        assert_eq!(p.hover, Some(Hit::Mode(0)), "first step lands on the first mode");
+        p.move_hover(1, 0);
+        p.move_hover(1, 0);
+        p.move_hover(1, 0);
+        assert_eq!(p.hover, Some(Hit::Mode(2)), "clamped at the last mode");
+        p.move_hover(0, 1);
+        assert_eq!(p.hover, Some(Hit::Row(0)), "down from the modes: the first row");
+        p.move_hover(0, 2);
+        assert_eq!(p.hover, Some(Hit::Row(2)));
+        p.move_hover(0, -5);
+        assert_eq!(p.hover, Some(Hit::Mode(1)), "up past the top: back to the modes");
+        p.move_hover(0, 1);
+        p.move_hover(0, 1);
+        assert_eq!(p.activate_hover(), Some(PaletteAction::Window(2)), "row 1 = Widget Factory");
+        assert!(!p.open);
     }
 
     #[test]
