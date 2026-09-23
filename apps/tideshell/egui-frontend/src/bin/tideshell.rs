@@ -41,6 +41,8 @@ struct Shellbox {
     filter_stats: tideshell_core::touchfilter::Stats,
     pending_display_power: Option<bool>,
     keys: Option<tideshell_egui::keys::Keys>,
+    orientation: tideshell_egui::sensors::OrientationFeed,
+    orientation_status: String,
 }
 
 impl Shellbox {
@@ -113,6 +115,11 @@ impl Shellbox {
             let s = self.filter.stats;
             self.shell.note(format!("touch filter: wet episodes {} dropped {} jumps {} excess {}", s.wet_episodes, s.dropped_wet, s.cancelled_jump, s.dropped_excess));
             self.filter_stats = s;
+        }
+        let os = self.orientation.status();
+        if os != self.orientation_status {
+            self.shell.note(os.clone());
+            self.orientation_status = os;
         }
         let st = (self.ambient.status(), self.backlight.status());
         if st != self.sensor_status {
@@ -235,6 +242,8 @@ fn main() {
         filter_stats: tideshell_core::touchfilter::Stats::default(),
         pending_display_power: None,
         keys: None,
+        orientation: tideshell_egui::sensors::OrientationFeed::spawn(zbus::blocking::Connection::system().ok()),
+        orientation_status: String::new(),
     };
     {
         let found = tideshell_egui::keys::discover(std::path::Path::new("/sys"), std::path::Path::new("/dev/input"));
@@ -308,6 +317,11 @@ fn main() {
         sb.shell.set_clock(tideshell_egui::sensors::local_minute());
         while let Ok(lux) = sb.ambient.rx.try_recv() {
             sb.shell.on_lux(lux, now_ms);
+        }
+        let readings: Vec<String> = sb.orientation.rx.try_iter().collect();
+        for o in readings {
+            let out = sb.shell.on_orientation(&o, now_ms);
+            sb.execute(out);
         }
         if let Some(screen) = io.screen() {
             if screen != sb.shell.screen {

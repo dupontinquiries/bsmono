@@ -193,6 +193,78 @@ pub fn logind_set_brightness(bus: &Connection, session: &OwnedObjectPath, name: 
     s.call_method("SetBrightness", &("backlight", name, raw)).map(|_| ()).map_err(|e| format!("SetBrightness: {e}"))
 }
 
+// ---- orientation (iio-sensor-proxy accelerometer) ------------------------------
+
+/// Orientation strings ("normal", "left-up", ...) as they change, ~5 Hz.
+pub struct OrientationFeed {
+    pub rx: Receiver<String>,
+    status: Arc<Mutex<String>>,
+}
+
+impl OrientationFeed {
+    pub fn spawn(bus: Option<Connection>) -> OrientationFeed {
+        let (tx, rx) = mpsc::channel();
+        let status = Arc::new(Mutex::new("orientation: starting".to_string()));
+        let st = status.clone();
+        std::thread::Builder::new()
+            .name("tideshell-orientation".into())
+            .spawn(move || {
+                let set = |s: String| *st.lock().unwrap() = s;
+                let Some(bus) = bus else {
+                    set("orientation: no system bus".into());
+                    return;
+                };
+                let p = match sensor_proxy(&bus) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        set(format!("orientation: iio-sensor-proxy unavailable ({e})"));
+                        return;
+                    }
+                };
+                match p.get_property::<bool>("HasAccelerometer") {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        set("orientation: iio-sensor-proxy reports no accelerometer".into());
+                        return;
+                    }
+                    Err(e) => {
+                        set(format!("orientation: HasAccelerometer: {e}"));
+                        return;
+                    }
+                }
+                if let Err(e) = p.call_method("ClaimAccelerometer", &()) {
+                    set(format!("orientation: ClaimAccelerometer: {e}"));
+                    return;
+                }
+                set("orientation: iio-sensor-proxy accelerometer".into());
+                let mut last = String::new();
+                loop {
+                    match p.get_property::<String>("AccelerometerOrientation") {
+                        Ok(o) => {
+                            if o != last {
+                                last = o.clone();
+                                if tx.send(o).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            set(format!("orientation: read failed ({e})"));
+                            return;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            })
+            .expect("spawn orientation thread");
+        OrientationFeed { rx, status }
+    }
+
+    pub fn status(&self) -> String {
+        self.status.lock().unwrap().clone()
+    }
+}
+
 // ---- threads -------------------------------------------------------------------
 
 /// Background reader: lux values arrive on `rx` (~4 Hz), `status()` says

@@ -53,6 +53,7 @@ pub struct Shell {
     pub lock: LockScreen,
     /// Power key -> fade -> panel off; triple tap wakes.
     pub sleep: Sleep,
+    pub rotate: crate::rotate::AutoRotate,
     /// Local minute of the day, set by the runtime (the engine has no clock).
     clock_minute: u32,
     /// The learned offset changed and is waiting to be saved once the user
@@ -79,6 +80,8 @@ impl Shell {
         switcher.style = prefs.switcher_style;
         let mut trackpad = Trackpad::default();
         trackpad.speed = prefs.trackpad_speed;
+        let mut rotate = crate::rotate::AutoRotate::default();
+        rotate.enabled = prefs.autorotate;
         let mut ambient = AutoBrightness::default();
         ambient.enabled = prefs.auto_brightness;
         ambient.user = prefs.brightness_offset;
@@ -100,6 +103,7 @@ impl Shell {
             settings_requested: false,
             lock: LockScreen::default(),
             sleep: Sleep::default(),
+            rotate,
             clock_minute: 12 * 60,
             offset_dirty_at: None,
             bar_expanded: false,
@@ -186,6 +190,7 @@ impl Shell {
         self.ambient.enabled = prefs.auto_brightness;
         self.ambient.user = prefs.brightness_offset;
         self.ambient.night = prefs.night;
+        self.rotate.enabled = prefs.autorotate;
         self.prefs = prefs;
         let mut out = vec![Action::SavePrefs];
         out.extend(self.sync_fat());
@@ -311,6 +316,13 @@ impl Shell {
         for a in self.lock.tick(dt, now) {
             if a == LockAction::Unlock {
                 self.log("cover dismissed");
+            }
+        }
+        // A rotation that waited for the cover or sleep to end.
+        if !self.lock.is_locked() && !self.sleep.captures_input() {
+            if let Some(o) = self.rotate.pending() {
+                self.log(format!("rotate {o:?} (deferred)"));
+                out.push(Action::Rotate(o.transform_deg(self.prefs.rotate_flip)));
             }
         }
         // A tap's held release goes out at its deadline (libinput timing).
@@ -634,6 +646,18 @@ impl Shell {
     /// Local minute of the day (0..1440), for the night window.
     pub fn set_clock(&mut self, minute: u32) {
         self.clock_minute = minute % 1440;
+    }
+
+    /// An orientation reading from iio-sensor-proxy.
+    pub fn on_orientation(&mut self, s: &str, now: Millis) -> Vec<Action> {
+        let blocked = self.lock.is_locked() || self.sleep.captures_input();
+        match self.rotate.on_reading(s, now, blocked) {
+            Some(o) => {
+                self.log(format!("rotate {o:?}"));
+                self.emit(vec![Action::Rotate(o.transform_deg(self.prefs.rotate_flip))])
+            }
+            None => vec![],
+        }
     }
 
     /// An ambient light reading in lux.

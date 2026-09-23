@@ -195,6 +195,7 @@ impl Executor for System {
             Action::SetSlider(tideshell_core::control_center::SliderKind::Volume, v) => fade_volume(*v),
             Action::SetSlider(..) => Outcome::Unwired("brightness is applied by the layer runtime"),
             Action::DisplayPower(_) => Outcome::Unwired("display power is handled by the layer runtime"),
+            Action::Rotate(deg) => rotate_output(*deg),
         }
     }
 }
@@ -329,6 +330,36 @@ pub fn fade_volume(to: f32) -> Outcome {
         }
     });
     Outcome::Done(format!("volume fade {from:.2} -> {to:.2}"))
+}
+
+// ---- output rotation (wlr-randr for now) ------------------------------------------
+
+/// The first output's name from `wlr-randr`'s listing (a header line per
+/// output: `NAME "description"`; detail lines are indented).
+pub fn first_output_name(listing: &str) -> Option<String> {
+    listing.lines().find(|l| !l.starts_with(' ') && !l.trim().is_empty()).and_then(|l| l.split_whitespace().next()).map(str::to_string)
+}
+
+/// Rotate the (first) output. `wlr-randr` is the transport until the
+/// wlr-output-management client lands in the layer runtime.
+pub fn rotate_output(deg: u32) -> Outcome {
+    let list = match Command::new("wlr-randr").stdin(Stdio::null()).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => return Outcome::Failed(format!("wlr-randr: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => return Outcome::Failed(format!("wlr-randr: {e} (apk add wlr-randr)")),
+    };
+    let Some(name) = first_output_name(&list) else { return Outcome::Failed("wlr-randr listed no output".into()) };
+    let transform = match deg % 360 {
+        0 => "normal",
+        90 => "90",
+        180 => "180",
+        _ => "270",
+    };
+    match Command::new("wlr-randr").args(["--output", &name, "--transform", transform]).stdin(Stdio::null()).output() {
+        Ok(o) if o.status.success() => Outcome::Done(format!("rotated {name} to {transform}")),
+        Ok(o) => Outcome::Failed(format!("wlr-randr --transform: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => Outcome::Failed(format!("wlr-randr: {e}")),
+    }
 }
 
 // ---- prefs file ------------------------------------------------------------
@@ -494,6 +525,13 @@ mod tests {
         let mut sys = System { launcher: None, pending: Vec::new() };
         sys.start(&["sleep", "5"], true);
         assert!(sys.pending.is_empty());
+    }
+
+    #[test]
+    fn wlr_randr_output_name_is_the_first_unindented_line() {
+        let listing = "DSI-1 \"Unknown\"\n  Make: Unknown\n  Enabled: yes\n  Modes:\n    1224x2700 px, 60.000000 Hz (preferred, current)\n  Position: 0,0\n  Transform: normal\n";
+        assert_eq!(first_output_name(listing).as_deref(), Some("DSI-1"));
+        assert_eq!(first_output_name("  only indented\n"), None);
     }
 
     #[test]
