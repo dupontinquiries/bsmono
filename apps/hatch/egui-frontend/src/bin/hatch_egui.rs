@@ -162,7 +162,11 @@ fn main() -> eframe::Result<()> {
     };
 
     let stay = has("--stay");
-    let quit_on_hide = has("--quit-on-hide");
+    let quit_on_hide = effective_quit_on_hide(
+        has("--quit-on-hide"),
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        std::env::var("WINIT_UNIX_BACKEND").ok().as_deref(),
+    );
     let result = eframe::run_native(
         APP_ID,
         opts,
@@ -186,4 +190,26 @@ fn main() -> eframe::Result<()> {
     );
     single_instance::release(APP_ID);
     result
+}
+
+/// Whether hiding must quit. On Wayland it always must: winit 0.30's
+/// `set_visible` is a no-op there ("Not possible on Wayland",
+/// platform_impl/linux/wayland/window), so a "hidden" hatch stayed on screen
+/// after launching an app (seen on the Fairphone). Quitting is the only way
+/// to get out of the way; the next summon starts it fresh.
+fn effective_quit_on_hide(flag: bool, wayland_display: bool, winit_backend: Option<&str>) -> bool {
+    flag || (wayland_display && winit_backend != Some("x11"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_quit_on_hide;
+
+    #[test]
+    fn wayland_hides_by_quitting_x11_keeps_the_resident_instance() {
+        assert!(effective_quit_on_hide(false, true, None), "Wayland: hide is impossible, so quit");
+        assert!(!effective_quit_on_hide(false, true, Some("x11")), "forced X11 can really hide");
+        assert!(!effective_quit_on_hide(false, false, None), "X11 session: stay resident");
+        assert!(effective_quit_on_hide(true, false, None), "the flag still forces it");
+    }
 }
