@@ -25,7 +25,6 @@ pub mod sensors;
 use egui::{Align2, Color32, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
 use tideshell_core::bar::{self, BarWidget};
 use tideshell_core::control_center::{QuickKind, SliderKind, Stage};
-use tideshell_core::hold::HoldOption;
 use tideshell_core::prefs::{Layout, ShellPrefs};
 use tideshell_core::switcher::Style;
 use tideshell_core::{Action, Shell, TouchEvent};
@@ -80,6 +79,8 @@ pub struct ShellView {
     card_drag: f32,
     /// Cover drag in progress: (slot, start y).
     cover_drag: Option<(i32, f32)>,
+    /// The palette's search field has been given focus for this opening.
+    palette_focused: bool,
     bar_drag: f32,
     sheet: SettingsSheet,
 }
@@ -137,6 +138,7 @@ impl ShellView {
         shell.drawer.is_visible()
             || shell.switcher.open
             || shell.hold.is_some()
+            || shell.palette.is_visible()
             || shell.swipe_up > 0.0
             || shell.peek_dx.abs() > 1.0
             || shell.modes.trackpad
@@ -154,7 +156,7 @@ impl ShellView {
     /// through to the apps underneath (trackpad pad, bar, or nothing at all
     /// for passive previews and the carousel dots).
     pub fn input_rects(&self, shell: &Shell) -> Option<Vec<Rect>> {
-        if shell.drawer.is_visible() || shell.switcher.open || self.sheet.open || shell.hold.is_some() || shell.lock.is_locked() || shell.sleep.captures_input() {
+        if shell.drawer.is_visible() || shell.switcher.open || self.sheet.open || shell.hold.is_some() || shell.palette.open || shell.lock.is_locked() || shell.sleep.captures_input() {
             return None;
         }
         let size = Vec2::new(shell.screen.0, shell.screen.1);
@@ -298,33 +300,12 @@ impl ShellView {
                 p.circle_filled(c, if k == i { 4.5 } else { 3.0 }, if k == i { pal.accent } else { pal.text_weak });
             }
         }
-        if let Some(h) = &shell.hold {
-            let o = to(h.origin.0, h.origin.1);
-            p.circle_filled(o, h.radius + h.hit, with_alpha(pal.bg_base, 0.55));
-            for (opt, (x, y)) in HoldOption::ALL.into_iter().zip(h.centers) {
-                let c = to(x, y);
-                let on = match opt {
-                    HoldOption::Carousel => shell.carousel.is_active(),
-                    HoldOption::Keyboard => shell.modes.keyboard,
-                    HoldOption::Trackpad => shell.modes.trackpad,
-                };
-                let hot = h.hover == Some(opt);
-                p.line_segment([o, c], Stroke::new(1.0, with_alpha(pal.text_weak, 0.4)));
-                p.circle_filled(c, if hot { h.hit } else { h.hit * 0.82 }, if hot { pal.accent } else { pal.bg_raised });
-                if on {
-                    p.circle_stroke(c, h.hit * 0.82, Stroke::new(2.5, pal.success));
-                }
-                p.text(c, Align2::CENTER_CENTER, opt.label(), FontId::proportional(12.0), pal.text);
-            }
+        if shell.palette.is_visible() {
+            out.extend(self.palette_sheet(ui, shell, pal, origin, size));
         }
-        // Fat cursor: drawn last, above everything the shell shows.
-        if let Some(f) = &shell.fat {
-            if f.opacity > 0.0 {
-                let c = to(f.shown.0, f.shown.1);
-                // iPadOS look: neutral translucent disc, faint rim, no arrow.
-                p.circle_filled(c, f.radius, Color32::from_black_alpha((105.0 * f.opacity) as u8));
-                p.circle_stroke(c, f.radius, Stroke::new(1.0, Color32::from_white_alpha((70.0 * f.opacity) as u8)));
-            }
+        if shell.settings_requested {
+            shell.settings_requested = false;
+            self.open_settings(shell);
         }
         // Home indicator: the affordance for every bottom-edge gesture.
         let hw = 110.0 + shell.swipe_up * 40.0;
@@ -349,6 +330,7 @@ impl ShellView {
             || shell.switcher.is_streaking()
             || shell.fat.as_ref().is_some_and(|f| f.is_animating())
             || shell.sleep.is_animating()
+            || (shell.palette.is_visible() && !shell.palette.reveal.is_settled())
             || (shell.lock.is_locked() && !shell.lock.reveal.is_settled())
         {
             ui.ctx().request_repaint();
@@ -421,7 +403,7 @@ impl ShellView {
                 let may_pad = slot != MOUSE_SLOT || self.pointer_pad;
                 let owner = if shell.modes.trackpad && !modal && may_pad && pad.contains(Pos2::new(x, y)) {
                     Some(Owner::Pad)
-                } else if shell.recognizer.edge_at(x, y).is_some() && !self.sheet.open {
+                } else if shell.recognizer.edge_at(x, y).is_some() && !self.sheet.open && !shell.palette.open {
                     Some(Owner::Edge)
                 } else {
                     None
@@ -568,6 +550,83 @@ impl ShellView {
                 }
             }
         }
+    }
+
+    /// The command palette: a sheet rising from the bottom (reveal follows
+    /// the engine's DragTransition), the three mode buttons on top, a search
+    /// field, then the rows. Hit-testing is the engine's (`palette::Geom`),
+    /// so a tap here and a hold-and-slide behave identically.
+    fn palette_sheet(&mut self, ui: &mut egui::Ui, shell: &mut Shell, pal: &PaletteColors, origin: Pos2, size: Vec2) -> Vec<Action> {
+        use tideshell_core::hold::HoldOption;
+        use tideshell_core::palette::{Geom, Hit, MODE_ROW_H, PAD, ROW_H, SEARCH_H};
+        let mut out = vec![];
+        let g = Geom::new((size.x, size.y));
+        let reveal = shell.palette.reveal.progress;
+        let dy = (1.0 - reveal) * (size.y - g.sheet_top);
+        let full = Rect::from_min_size(origin, size);
+        let p = ui.painter_at(full);
+        p.rect_filled(full, cr(0), Color32::from_black_alpha((reveal * 120.0) as u8));
+        // One interact over the whole screen, registered first so the
+        // search field (later) wins where they overlap.
+        let bg = ui.interact(full, Id::new("ts-palette-bg"), Sense::click());
+        if bg.clicked() {
+            if let Some(pos) = bg.interact_pointer_pos() {
+                out.extend(shell.palette_tap(pos.x - origin.x, pos.y - origin.y));
+            }
+        }
+        let at = |x: f32, y: f32| origin + Vec2::new(x, y + dy);
+        let sheet = Rect::from_min_max(at(0.0, g.sheet_top), at(size.x, size.y));
+        p.rect_filled(sheet, CornerRadius { nw: 22, ne: 22, sw: 0, se: 0 }, pal.bg_card);
+        p.rect_filled(Rect::from_center_size(sheet.center_top() + Vec2::new(0.0, 7.0), Vec2::new(40.0, 4.0)), cr(2), pal.text_weak);
+        for (i, m) in shell.palette.modes.iter().enumerate() {
+            let (x, y, w, h) = g.mode_rect(i);
+            let r = Rect::from_min_size(at(x, y), Vec2::new(w, h));
+            let on = match m {
+                HoldOption::Carousel => shell.carousel.is_active(),
+                HoldOption::Keyboard => shell.modes.keyboard,
+                HoldOption::Trackpad => shell.modes.trackpad,
+            };
+            let hot = shell.palette.hover == Some(Hit::Mode(i));
+            p.rect_filled(r, cr(14), if hot { pal.accent } else if on { pal.accent_soft } else { pal.bg_raised });
+            p.text(r.center() - Vec2::new(0.0, 10.0), Align2::CENTER_CENTER, initial(m.label()), FontId::proportional(22.0), if hot { pal.bg_base } else { pal.text });
+            p.text(r.center() + Vec2::new(0.0, 16.0), Align2::CENTER_CENTER, m.label(), FontId::proportional(12.0), if hot { pal.bg_base } else { pal.text_weak });
+            if on {
+                p.circle_filled(r.right_top() + Vec2::new(-10.0, 10.0), 4.0, pal.success);
+            }
+        }
+        let sr = Rect::from_min_size(at(PAD, g.search_y()), Vec2::new(size.x - PAD * 2.0, SEARCH_H));
+        p.rect_filled(sr, cr(12), pal.bg_raised);
+        let mut q = shell.palette.query.clone();
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(sr.shrink2(Vec2::new(12.0, 8.0))));
+        let te = egui::TextEdit::singleline(&mut q).id_salt("ts-palette-search").hint_text("Search").frame(egui::Frame::NONE).desired_width(f32::INFINITY);
+        let resp = child.add(te);
+        // Focus the field when the palette opens (a hold that lifted on
+        // nothing, or a tap-open): typing filters at once, no second tap.
+        if shell.palette.open && !self.palette_focused {
+            self.palette_focused = true;
+            resp.request_focus();
+        }
+        if !shell.palette.open {
+            self.palette_focused = false;
+        }
+        if resp.changed() {
+            shell.palette_query(&q);
+        }
+        let rows: Vec<(String, &'static str)> = shell.palette.rows().map(|r| (r.label.clone(), r.hint)).collect();
+        for (i, (label, hint)) in rows.iter().enumerate().take(g.rows_visible()) {
+            let r = Rect::from_min_size(at(PAD, g.row_y(i)), Vec2::new(size.x - PAD * 2.0, ROW_H));
+            let hot = shell.palette.hover == Some(Hit::Row(i));
+            if hot {
+                p.rect_filled(r, cr(10), pal.accent);
+            }
+            p.text(r.left_center() + Vec2::new(14.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(15.0), if hot { pal.bg_base } else { pal.text });
+            p.text(r.right_center() - Vec2::new(14.0, 0.0), Align2::RIGHT_CENTER, *hint, FontId::proportional(11.0), if hot { pal.bg_base } else { pal.text_weak });
+        }
+        if rows.is_empty() {
+            p.text(at(size.x / 2.0, g.row_y(0) + ROW_H / 2.0), Align2::CENTER_CENTER, "No matches", FontId::proportional(13.0), pal.text_weak);
+        }
+        let _ = MODE_ROW_H;
+        out
     }
 
     // ---- previews --------------------------------------------------------------

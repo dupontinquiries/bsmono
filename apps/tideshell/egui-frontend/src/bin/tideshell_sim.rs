@@ -2,7 +2,7 @@
 //! windows that obey the shell's Actions (activate, close, maximize, launch).
 //!
 //!   cargo run --release -- [--trace] [--live] [--persist] [--layout right-bar]
-//!                          [--demo drawer|switcher|hold|bar|trackpad|fatcursor|carousel|settings|swipe]
+//!                          [--demo drawer|switcher|hold|palette|bar|trackpad|fatcursor|carousel|settings|swipe]
 //!
 //! * Mouse = one finger. Edge zones are 28 px: pull from the top, swipe or
 //!   hold on the bottom, swipe along the bottom, swipe in from the right
@@ -281,13 +281,16 @@ impl App {
             "swipe" => drag(&mut self.shell, (w / 2.0, h - 4.0), (w / 2.0, h * 0.62), 30, false),
             "hold" => {
                 let o = self.shell.on_edge_touch(TouchEvent::Down { slot: 9, x: w / 2.0, y: h - 6.0, t: 0 });
-                // tick() past hold_ms opens the arc; then slide onto Keyboard.
+                // tick() past hold_ms opens the palette; slide onto Keyboard.
                 self.shell.tick(1000);
-                if let Some(m) = self.shell.hold.clone() {
-                    let (x, y) = m.centers[1];
-                    self.shell.on_edge_touch(TouchEvent::Move { slot: 9, x, y, t: 1100 });
-                }
+                let g = tideshell_core::palette::Geom::new((w, h));
+                let (x, y, mw, mh) = g.mode_rect(1);
+                self.shell.on_edge_touch(TouchEvent::Move { slot: 9, x: x + mw / 2.0, y: y + mh / 2.0, t: 1100 });
                 o
+            }
+            "palette" => {
+                self.shell.open_palette();
+                vec![]
             }
             "trackpad" => self.shell.toggle_mode(tideshell_core::hold::HoldOption::Trackpad),
             "sleep" => self.shell.power_key(),
@@ -482,6 +485,7 @@ fn main() -> eframe::Result<()> {
             .map(|(id, n)| AppTile { id: (*id).into(), name: (*n).into() })
             .collect();
     }
+    shell.set_apps(apps.iter().map(|a| (a.id.clone(), a.name.clone())).collect());
     let world = World::new();
     let live = if has("--wayland") {
         match tideshell_egui::wayland::Windows::connect() {

@@ -214,6 +214,9 @@ fn main() {
         Err(e) => sb.shell.note(format!("wayland toplevels: {e:?}")),
     }
     let apps: Vec<AppTile> = sb.system.launcher.as_ref().map(|l| effects::hatch_tiles(l, 8)).unwrap_or_default();
+    // The palette lists every hatch entry, not just the bar's favourites.
+    let all_apps: Vec<(String, String)> = sb.system.launcher.as_ref().map(|l| l.results().map(|e| (e.id.clone(), e.name.clone())).collect()).unwrap_or_default();
+    sb.shell.set_apps(all_apps);
 
     let ctx = egui::Context::default();
     let mut ui_prefs = settings_kit::Prefs::default();
