@@ -97,6 +97,7 @@ pub fn run() -> i32 {
         "zip" => cmd_zip(rest),
         "fleet" => cmd_fleet(rest),
         "patchset" => cmd_patchset(rest),
+        "depot" => cmd_depot(rest),
         "eink" => cmd_eink(rest),
         "bridge" => cmd_bridge(rest),
         "watch" => cmd_watch(rest),
@@ -1386,6 +1387,87 @@ fn iso_now() -> String {
 }
 
 // ── fleet: cockpit operations shared with the GUI (import / build / apply / merge / reclaim) ──
+
+/// `gitmind depot ...`: this machine as a paired depot client. Each command
+/// is one step of the pairing loop (cockpit::depot_client), printed as it
+/// stands, so the loop is visible and can be driven by hand.
+fn cmd_depot(rest: &[String]) -> i32 {
+    use cockpit::depot_client::{default_name, Client, Conf, PairState, DEFAULT_SCOPES};
+    let usage = "usage: gitmind depot [status]\n       gitmind depot config <host:port> [ssh=USER@HOST] [root=DIR]\n       gitmind depot pair [name] [scopes]      (default name gitmind-<host>, scopes ingest,packs)\n       gitmind depot approve [--token TOKEN]   (default: over ssh to the depot host)\n       gitmind depot put-crate <file.crate>    (a signed, hash-checked ingest)\n       gitmind depot forget";
+    let Some(dir) = Client::default_dir() else { return err("no $XDG_CONFIG_HOME or $HOME") };
+    let c = Client::new(&dir);
+    let show = |st: &PairState| match st {
+        PairState::NoServer => println!("no depot configured: gitmind depot config <host:port> [ssh=USER@HOST]"),
+        PairState::Unpaired => println!("not paired: gitmind depot pair"),
+        PairState::Pending { id, code } => println!("pending: request {id}, code {code}\n  approve on the depot host: depot pair approve {id} --code {code}\n  or from here:              gitmind depot approve [--token TOKEN]"),
+        PairState::Paired { name } => println!("paired as {name}"),
+        PairState::Denied => println!("the depot denied the request; gitmind depot pair to ask again"),
+        PairState::Lost => println!("the request expired or vanished; gitmind depot pair to ask again"),
+    };
+    match rest.first().map(String::as_str).unwrap_or("status") {
+        "status" => {
+            let conf = c.conf();
+            println!("config  {}  (server={} ssh={} root={})", dir.join("depot.conf").display(), conf.server, conf.ssh, conf.root);
+            show(&c.poll());
+            0
+        }
+        "config" => {
+            let Some(server) = rest.get(1) else { return err(usage) };
+            let mut conf = Conf { server: cockpit::depot_client::normalize_server(server), ..c.conf() };
+            for kv in &rest[2..] {
+                match kv.split_once('=') {
+                    Some(("ssh", v)) => conf.ssh = v.to_string(),
+                    Some(("root", v)) => conf.root = v.to_string(),
+                    _ => return err(usage),
+                }
+            }
+            match c.save_conf(&conf) {
+                Ok(()) => { println!("server={} ssh={} root={}", conf.server, conf.ssh, conf.root); 0 }
+                Err(e) => err(&e),
+            }
+        }
+        "pair" => {
+            let name = rest.get(1).cloned().unwrap_or_else(default_name);
+            let scopes = rest.get(2).map(String::as_str).unwrap_or(DEFAULT_SCOPES);
+            match c.start_pairing(&name, scopes) {
+                Ok(st) => { show(&st); 0 }
+                Err(e) => err(&e),
+            }
+        }
+        "approve" => {
+            let token = match (rest.get(1).map(String::as_str), rest.get(2)) {
+                (Some("--token"), Some(t)) => Some(t.clone()),
+                (None, _) => None,
+                _ => return err(usage),
+            };
+            let r = match token {
+                Some(t) => c.approve_with(&t, None),
+                None => c.approve_via_ssh(),
+            };
+            match r {
+                Ok(out) => { println!("{out}"); show(&c.poll()); 0 }
+                Err(e) => err(&e),
+            }
+        }
+        "put-crate" => {
+            let Some(f) = rest.get(1) else { return err(usage) };
+            let body = match std::fs::read(f) {
+                Ok(b) => b,
+                Err(e) => return err(&format!("{f}: {e}")),
+            };
+            match c.put_checked("/api/crates", &body) {
+                Ok(reply) => { println!("{reply}"); 0 }
+                Err(e) => err(&e),
+            }
+        }
+        "forget" => {
+            c.forget();
+            println!("forgot this client's key (the depot still lists it until `depot pair revoke`)");
+            0
+        }
+        _ => err(usage),
+    }
+}
 
 /// `gitmind patchset <show|apkbuild|freeze|rollout|bump> <patchset.txt> [args]`:
 /// the frozen package base, its patches, and the fleet rollout as text.

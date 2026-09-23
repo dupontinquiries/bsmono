@@ -301,6 +301,21 @@ impl Client {
         http(&c.server, &wire(method, path_and_query, &c.server, Some(&auth), content_type, body))
     }
 
+    /// An ingest (PUT), signed, then checked: the body is not in the
+    /// signature, so the client compares the sha256 depot reports storing
+    /// with what it sent. Returns depot's reply.
+    pub fn put_checked(&self, path: &str, body: &[u8]) -> Result<String, String> {
+        let (st, reply) = self.signed("PUT", path, "application/octet-stream", body)?;
+        if st != 200 {
+            return Err(format!("depot refused ({st}): {}", reply.trim()));
+        }
+        let hash = json_field(&reply, "hash").ok_or_else(|| format!("depot's reply names no hash: {}", reply.trim()))?;
+        if !depot_auth::client_checks_stored_hash(body, &hash) {
+            return Err(format!("depot stored {hash}, which is not the sha256 of what was sent"));
+        }
+        Ok(reply.trim().to_string())
+    }
+
     /// Forget this client locally (the depot side: `depot pair revoke`).
     pub fn forget(&self) {
         let _ = std::fs::remove_file(self.dir.join("depot-client.key"));
