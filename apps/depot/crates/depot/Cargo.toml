@@ -17,6 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 cli-kit = { path = "../../../../shared/cli-kit" }
 net-kit = { path = "../../../../shared/net-kit" }
+depot-auth = { path = "../../../../shared/depot-auth" }
 # niftyplot diagrams in tutorials/manual: parse + layout + the SVG backend
 nifty-core = { path = "../../../../shared/nifty-core" }
 # in-browser terminal: a real shell behind a pty (same crate voiceterm uses)

@@ -36,6 +36,8 @@ pub struct App {
     pub token_file: PathBuf,
     /// Present only when [terminal] is enabled; None means the endpoints 404.
     pub terminals: Option<crate::terminal::Terminals>,
+    /// Nonces of signed requests seen within the clock window (depot-auth).
+    pub replay: Mutex<depot_auth::Replay>,
 }
 
 impl App {
@@ -51,7 +53,24 @@ impl App {
     /// request carries its contents. The file is re-read per request so a
     /// rotated token takes effect without a restart — the cost is one small
     /// read on a path nobody hits in a loop.
+    ///
+    /// A paired client instead signs the request (`Authorization: Depot-Sig
+    /// ...`, shared/depot-auth); its scopes decide which routes it may use.
+    /// Routes no scope covers take the admin token only.
     fn authorize(&self, req: &Request<'_>) -> Result<(), Response> {
+        if let Some(h) = req.header("authorization").filter(|h| h.trim_start().starts_with(depot_auth::SCHEME)) {
+            let Some(need) = depot_auth::scope_for(&req.method, &req.path) else {
+                return Err(Response::text(403, "this route takes the admin token only\n"));
+            };
+            let pq = if req.query.is_empty() { req.path.clone() } else { format!("{}?{}", req.path, req.query) };
+            let root = self.root.clone();
+            let mut replay = self.replay.lock().unwrap();
+            return match depot_auth::verify(h, &req.method, &pq, req.content_length, need, depot_core::now(), &mut replay, |n| depot_core::clients::load(&root, n)) {
+                Ok(_) => Ok(()),
+                Err(d @ depot_auth::Denied::Scope { .. }) => Err(Response::text(403, format!("{d}\n"))),
+                Err(d) => Err(Response::text(401, format!("{d}\n"))),
+            };
+        }
         let want = match std::fs::read_to_string(&self.token_file) {
             Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
             _ => return Err(Response::text(403, "writes are disabled: no admin token on this depot (depot admin-token --new)\n")),
@@ -199,6 +218,61 @@ impl App {
                 ok_json(&json!({"tutorials": list}))
             }
             (m, seg) if seg.first() == Some(&"term") => return self.terminal(m, &seg[1..], req),
+            // ── pairing (shared/depot-auth, depot-core/clients.rs) ──
+            // Filing a request is open (bounded queue); approving needs the
+            // `approve` scope or the admin token; `depot pair approve` on the
+            // depot host needs neither (the shell there is the authority).
+            ("POST", ["pair"]) => {
+                let body = match req.read_body(4096) {
+                    Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                    Err(e) => return Response::text(413, format!("pair: {e}\n")),
+                };
+                let get = |k: &str| body.lines().find_map(|l| l.strip_prefix(&format!("{k}="))).unwrap_or("").trim().to_string();
+                match depot_core::clients::request(&self.root, &get("name"), &get("public"), &get("scopes"), depot_core::now()) {
+                    Ok(r) => ok_json(&json!({"id": r.id, "nonce": r.nonce, "expires_in": depot_auth::PAIR_TTL_S})),
+                    Err(e) => err(422, e),
+                }
+            }
+            ("GET", ["pair"]) => {
+                let now = depot_core::now();
+                let list: Vec<serde_json::Value> = depot_core::clients::pending(&self.root, now)
+                    .iter()
+                    .map(|r| json!({"id": r.id, "name": r.name, "scopes": depot_auth::Scope::list(&r.scopes), "code": r.code(), "age_s": now.saturating_sub(r.created)}))
+                    .collect();
+                ok_json(&json!({"pending": list}))
+            }
+            ("GET", ["pair", id]) => {
+                let (status, name) = match depot_core::clients::status(&self.root, id, depot_core::now()) {
+                    depot_core::clients::Status::Pending => ("pending", String::new()),
+                    depot_core::clients::Status::Approved(n) => ("approved", n),
+                    depot_core::clients::Status::Denied => ("denied", String::new()),
+                    depot_core::clients::Status::Unknown => ("unknown", String::new()),
+                };
+                ok_json(&json!({"id": id, "status": status, "name": name}))
+            }
+            ("POST", ["pair", id, "approve"]) => {
+                if let Err(r) = self.authorize(req) {
+                    return r;
+                }
+                let code = req.query_param("code").unwrap_or_default();
+                match depot_core::clients::approve(&self.root, id, &code, depot_core::now()) {
+                    Ok(k) => ok_json(&json!({"approved": k.name, "scopes": depot_auth::Scope::list(&k.scopes)})),
+                    Err(e) => err(422, e),
+                }
+            }
+            ("POST", ["pair", id, "deny"]) => {
+                if let Err(r) = self.authorize(req) {
+                    return r;
+                }
+                match depot_core::clients::deny(&self.root, id) {
+                    Ok(()) => ok_json(&json!({"denied": id})),
+                    Err(e) => err(404, e),
+                }
+            }
+            ("GET", ["clients"]) => {
+                let list: Vec<serde_json::Value> = depot_core::clients::list(&self.root).iter().map(|k| json!({"name": k.name, "scopes": depot_auth::Scope::list(&k.scopes)})).collect();
+                ok_json(&json!({"clients": list}))
+            }
             ("POST", ["niftyplot"]) => {
                 // Diagram source in, SVG out. Rendering is pure; the only
                 // guard is the body size.

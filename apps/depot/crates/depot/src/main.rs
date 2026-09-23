@@ -31,6 +31,12 @@ SET UP
   serve [--bind ADDR] [--quiet]    run the web server + UI (default 0.0.0.0:8000)
   status [--json]                  what this depot holds
   admin-token [--new]              show / create the token that enables HTTP writes
+  pair list                        pairing requests waiting (id, name, scopes, CODE)
+  pair approve ID --code NNNNNN    approve one; the code must match the one the
+                                   client shows (gitmind runs this over ssh)
+  pair deny ID                     refuse one
+  pair clients                     paired clients and their scopes
+  pair revoke NAME                 unpair a client (its key stops working at once)
   keygen                           create keys/depot.key if missing
   trust NAME (HEX|FILE)            accept packs signed by this public key
   client-config --server URL [--crates] [--rpm ID]... [--nix] [--toolchain] [--all]
@@ -85,7 +91,7 @@ fn open(cli: &Cli) -> Result<Depot, String> {
 }
 
 fn run(cli: &Cli) -> Result<(), String> {
-    let value_opts = ["root", "bind", "repo", "out", "have", "server", "rpm"];
+    let value_opts = ["root", "bind", "repo", "out", "have", "server", "rpm", "code"];
     let pos = cli.positionals_with_values(&value_opts);
     let Some(cmd) = pos.first().copied() else {
         print!("{USAGE}");
@@ -126,6 +132,49 @@ fn run(cli: &Cli) -> Result<(), String> {
                 println!("http writes {}", if st.writes_enabled { "enabled (admin token present)" } else { "disabled" });
             }
             Ok(())
+        }
+        "pair" => {
+            let r = root(cli);
+            let now = depot_core::now();
+            match args.as_slice() {
+                ["list"] | [] => {
+                    let p = depot_core::clients::pending(&r, now);
+                    if p.is_empty() {
+                        println!("(no pairing requests waiting)");
+                    }
+                    for q in p {
+                        println!("{}  {:<24} {:<22} code {}  ({} s ago)", q.id, q.name, depot_auth::Scope::list(&q.scopes), q.code(), now.saturating_sub(q.created));
+                    }
+                    Ok(())
+                }
+                ["approve", id] => {
+                    let code = cli.opt("code").ok_or("pair approve ID --code NNNNNN (the code the client shows)")?;
+                    let k = depot_core::clients::approve(&r, id, code, now)?;
+                    println!("paired {} ({})", k.name, depot_auth::Scope::list(&k.scopes));
+                    Ok(())
+                }
+                ["deny", id] => {
+                    depot_core::clients::deny(&r, id)?;
+                    println!("denied {id}");
+                    Ok(())
+                }
+                ["clients"] => {
+                    let l = depot_core::clients::list(&r);
+                    if l.is_empty() {
+                        println!("(no paired clients)");
+                    }
+                    for k in l {
+                        println!("{:<24} {}", k.name, depot_auth::Scope::list(&k.scopes));
+                    }
+                    Ok(())
+                }
+                ["revoke", name] => {
+                    depot_core::clients::revoke(&r, name)?;
+                    println!("revoked {name}");
+                    Ok(())
+                }
+                _ => Err("pair list | approve ID --code NNNNNN | deny ID | clients | revoke NAME".into()),
+            }
         }
         "admin-token" => {
             let d = open(cli)?;
@@ -452,6 +501,7 @@ fn serve(cli: &Cli) -> Result<(), String> {
         public_url: depot.config.server.public_url.clone(),
         token_file: r.join(&depot.config.server.admin_token_file),
         terminals,
+        replay: Mutex::new(depot_auth::Replay::default()),
         depot: Arc::new(Mutex::new(depot)),
     };
     let writes = app.token_file.is_file();
