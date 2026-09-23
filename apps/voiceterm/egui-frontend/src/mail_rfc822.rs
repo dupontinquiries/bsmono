@@ -28,11 +28,14 @@
 //!
 //! Unfolding, `From`/`To`/`Subject`/`Date`/`Message-ID`, the blank line that
 //! ends the headers, and mbox's `From ` separator. Not implemented: MIME
-//! multipart, transfer encodings, RFC 2047 encoded words, address group
-//! syntax. Each of those is a real thing a real mail file contains, and
-//! every one of them degrades to "shown as written" rather than to a parse
-//! failure — an encoded subject displays as `=?utf-8?B?…?=`, which is ugly
-//! and readable, where refusing the message would lose it.
+//! multipart, transfer encodings, address group syntax. Each of those is a
+//! real thing a real mail file contains, and every one of them degrades to
+//! "shown as written" rather than to a parse failure.
+//!
+//! RFC 2047 encoded words (`=?utf-8?B?…?=`) in Subject, From and To ARE
+//! decoded ([`decode_words`]): B and Q encodings, UTF-8, US-ASCII,
+//! ISO-8859-1 and Windows-1252. Anything else (another charset, a malformed
+//! word) stays as written, the same degrade-to-readable rule.
 //!
 //! ## Dates
 //!
@@ -113,9 +116,9 @@ pub fn parse_message(text: &str) -> Parsed {
     let root = refs.split_whitespace().next().unwrap_or("").to_string();
     Parsed {
         message_id: header(&h, "message-id").to_string(),
-        from: header(&h, "from").to_string(),
-        to: header(&h, "to").to_string(),
-        subject: header(&h, "subject").to_string(),
+        from: decode_words(header(&h, "from")),
+        to: decode_words(header(&h, "to")),
+        subject: decode_words(header(&h, "subject")),
         date: header(&h, "date").to_string(),
         in_reply_to: if root.is_empty() {
             header(&h, "in-reply-to").to_string()
@@ -123,6 +126,194 @@ pub fn parse_message(text: &str) -> Parsed {
             root
         },
         body,
+    }
+}
+
+/// Decode RFC 2047 encoded words in a header value.
+///
+/// Two rules that are easy to get wrong and visible when wrong:
+/// - whitespace BETWEEN two encoded words is not text (RFC 2047 §6.2): a
+///   long subject split into several words must come back without spaces
+///   at the seams. Whitespace between an encoded word and plain text stays.
+/// - adjacent words in the same charset are decoded as ONE byte string:
+///   senders split UTF-8 mid-character across words, and decoding each word
+///   alone turns that character into two replacement marks.
+///
+/// A word that does not parse, or names a charset not handled here, is
+/// left exactly as written.
+pub fn decode_words(value: &str) -> String {
+    // Tokenise into encoded words and the text between them.
+    enum Tok<'a> {
+        Text(&'a str),
+        Word { raw: &'a str, charset: String, bytes: Vec<u8> },
+    }
+    let mut toks: Vec<Tok> = Vec::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("=?") {
+        match parse_word(&rest[start..]) {
+            Some((len, charset, bytes)) => {
+                if start > 0 {
+                    toks.push(Tok::Text(&rest[..start]));
+                }
+                toks.push(Tok::Word { raw: &rest[start..start + len], charset, bytes });
+                rest = &rest[start + len..];
+            }
+            None => {
+                toks.push(Tok::Text(&rest[..start + 2]));
+                rest = &rest[start + 2..];
+            }
+        }
+    }
+    if !rest.is_empty() {
+        toks.push(Tok::Text(rest));
+    }
+    // Drop whitespace-only text between two words, then merge same-charset
+    // runs and decode.
+    let mut out = String::new();
+    let mut i = 0;
+    while i < toks.len() {
+        match &toks[i] {
+            Tok::Text(t) => {
+                out.push_str(t);
+                i += 1;
+            }
+            Tok::Word { raw, charset, bytes } => {
+                let mut run = bytes.clone();
+                let mut orig = raw.to_string();
+                let mut skipped: &str = "";
+                let mut j = i + 1;
+                loop {
+                    let next = match toks.get(j) {
+                        Some(Tok::Text(t)) if t.chars().all(char::is_whitespace) => j + 1,
+                        _ => j,
+                    };
+                    match toks.get(next) {
+                        Some(Tok::Word { raw: r2, charset: c2, bytes: b2 }) if c2 == charset => {
+                            run.extend_from_slice(b2);
+                            if let (true, Some(Tok::Text(ws))) = (next != j, toks.get(j)) {
+                                orig.push_str(ws);
+                            }
+                            orig.push_str(r2);
+                            j = next + 1;
+                        }
+                        Some(Tok::Word { .. }) if next != j => {
+                            // A different charset after whitespace: the
+                            // whitespace is still not text; the next word
+                            // starts its own run.
+                            if let Some(Tok::Text(ws)) = toks.get(j) {
+                                skipped = ws;
+                            }
+                            j = next;
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+                match decode_charset(charset, &run) {
+                    Some(text) => out.push_str(&text),
+                    // Undecodable: as written, including the whitespace
+                    // after it (only a decoded word swallows that).
+                    None => {
+                        out.push_str(&orig);
+                        out.push_str(skipped);
+                    }
+                }
+                i = j;
+            }
+        }
+    }
+    out
+}
+
+/// One `=?charset?enc?text?=` at the start of `s`: (length, lowercase
+/// charset without an RFC 2231 `*lang` suffix, decoded bytes).
+fn parse_word(s: &str) -> Option<(usize, String, Vec<u8>)> {
+    let body = s.strip_prefix("=?")?;
+    let q1 = body.find('?')?;
+    let charset = &body[..q1];
+    let after = &body[q1 + 1..];
+    let q2 = after.find('?')?;
+    let enc = &after[..q2];
+    let text_and_rest = &after[q2 + 1..];
+    let end = text_and_rest.find("?=")?;
+    let text = &text_and_rest[..end];
+    if charset.is_empty() || text.contains(char::is_whitespace) || charset.contains(char::is_whitespace) {
+        return None;
+    }
+    let bytes = match enc {
+        "B" | "b" => base64_decode(text)?,
+        "Q" | "q" => q_decode(text)?,
+        _ => return None,
+    };
+    let len = 2 + q1 + 1 + q2 + 1 + end + 2;
+    let charset = charset.split('*').next().unwrap_or(charset).to_ascii_lowercase();
+    Some((len, charset, bytes))
+}
+
+fn q_decode(t: &str) -> Option<Vec<u8>> {
+    let b = t.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'_' => out.push(b' '),
+            b'=' => {
+                let h = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+                out.push(u8::from_str_radix(h, 16).ok()?);
+                i += 2;
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    Some(out)
+}
+
+fn base64_decode(t: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let data: Vec<u8> = t.bytes().filter(|&c| c != b'=').collect();
+    if data.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(data.len() * 3 / 4);
+    for chunk in data.chunks(4) {
+        let mut n = 0u32;
+        for (k, &c) in chunk.iter().enumerate() {
+            n |= val(c)? << (18 - 6 * k);
+        }
+        let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        out.extend_from_slice(&bytes[..chunk.len() - 1]);
+    }
+    Some(out)
+}
+
+/// Windows-1252's 0x80..=0x9F (the rest is ISO-8859-1). 0 = undefined.
+const CP1252_HIGH: [u16; 32] = [
+    0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017D, 0,
+    0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178,
+];
+
+fn decode_charset(charset: &str, b: &[u8]) -> Option<String> {
+    match charset {
+        "utf-8" | "utf8" | "us-ascii" => String::from_utf8(b.to_vec()).ok(),
+        "iso-8859-1" | "latin1" | "iso_8859-1" => Some(b.iter().map(|&c| c as char).collect()),
+        "windows-1252" | "cp1252" => b
+            .iter()
+            .map(|&c| match c {
+                0x80..=0x9F => char::from_u32(CP1252_HIGH[(c - 0x80) as usize] as u32).filter(|&ch| ch != '\0'),
+                _ => Some(c as char),
+            })
+            .collect(),
+        _ => None,
     }
 }
 
@@ -604,5 +795,51 @@ References: <abc@example.com>\n\nagreed\n");
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].subject, "");
         assert_eq!(m[0].time, 0);
+    }
+
+    #[test]
+    fn encoded_words_decode_in_both_encodings_and_common_charsets() {
+        assert_eq!(decode_words("=?utf-8?B?SGVsbG8gd8O2cmxk?="), "Hello wörld");
+        assert_eq!(decode_words("=?UTF-8?Q?Caf=C3=A9_au_lait?="), "Café au lait", "Q: _ is space, =XX a byte; charset case-insensitive");
+        assert_eq!(decode_words("=?iso-8859-1?q?Andr=E9?= Pirard <pirard@example.be>"), "André Pirard <pirard@example.be>");
+        assert_eq!(decode_words("=?windows-1252?Q?=93quoted=94_=80?="), "\u{201C}quoted\u{201D} \u{20AC}");
+        assert_eq!(decode_words("=?utf-8*en?Q?hi?="), "hi", "RFC 2231 language suffix");
+        assert_eq!(decode_words("=?utf-8?B?SGk?="), "Hi", "unpadded base64");
+    }
+
+    #[test]
+    fn whitespace_between_encoded_words_is_not_text_but_next_to_plain_text_it_is() {
+        // A subject split over two words, folded: no space at the seam.
+        assert_eq!(decode_words("=?utf-8?Q?Quarterly_rep?= =?utf-8?Q?ort?="), "Quarterly report");
+        assert_eq!(decode_words("=?utf-8?Q?a?=\t  =?utf-8?Q?b?="), "ab");
+        // Between an encoded word and plain text the space is real.
+        assert_eq!(decode_words("Re: =?utf-8?Q?caf=C3=A9?= tomorrow"), "Re: café tomorrow");
+        // Different charsets: still no space between them.
+        assert_eq!(decode_words("=?iso-8859-1?Q?=E9?= =?utf-8?Q?=C3=A9?="), "éé");
+    }
+
+    #[test]
+    fn a_character_split_across_two_words_survives() {
+        // "é" is C3 A9; a sender split it between the two words.
+        assert_eq!(decode_words("=?utf-8?Q?caf=C3?= =?utf-8?Q?=A9?="), "café");
+        // Same in base64: "Zm9vw6k=" is "fooé"; split its bytes 66 6F 6F C3 | A9.
+        assert_eq!(decode_words("=?utf-8?B?Zm9vww==?= =?utf-8?B?qQ==?="), "fooé");
+    }
+
+    #[test]
+    fn what_cannot_be_decoded_is_left_exactly_as_written() {
+        for raw in ["=?koi8-r?B?8NLJ18XU?= and more", "=?utf-8?X?abc?=", "=?utf-8?B?not base64!?=", "a =? b ?= c", "=?utf-8?Q?=ZZ?=", "plain subject", "=?", "=?utf-8?Q?unterminated"] {
+            assert_eq!(decode_words(raw), raw);
+        }
+        assert_eq!(decode_words("=?koi8-r?Q?x?= =?utf-8?Q?y?="), "=?koi8-r?Q?x?= y", "the space after an undecodable word stays");
+        assert_eq!(decode_words("=?utf-8?Q?=FF?="), "=?utf-8?Q?=FF?=", "invalid UTF-8 is not replaced by marks");
+    }
+
+    #[test]
+    fn a_parsed_message_shows_decoded_subject_and_sender() {
+        let m = parse_message("From: =?utf-8?Q?Zo=C3=AB?= <zoe@example.com>\nTo: bo@example.com\nSubject: =?utf-8?B?w5xiZXIg?=\n =?utf-8?B?ZGllIEJyw7xja2U=?=\n\nbody\n");
+        assert_eq!(m.subject, "Über die Brücke", "folded over two lines and two words");
+        assert_eq!(parse_address(&m.from).name, "Zoë");
+        assert_eq!(parse_address(&m.from).address, "zoe@example.com");
     }
 }
