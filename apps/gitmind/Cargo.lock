@@ -521,6 +521,7 @@ dependencies = [
 name = "cockpit"
 version = "0.1.0"
 dependencies = [
+ "depot-auth",
  "depot-core",
  "gitmind-core",
  "net-kit",
@@ -863,10 +864,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac6b926516df9c60bfa16e107b21086399f8285a44ca9711344b9e553c5146e2"
 
 [[package]]
+name = "depot-auth"
+version = "0.1.0"
+dependencies = [
+ "crypto-kit",
+ "sha2",
+]
+
+[[package]]
 name = "depot-core"
 version = "0.1.0"
 dependencies = [
  "crypto-kit",
+ "depot-auth",
  "flate2",
  "serde",
  "serde_json",

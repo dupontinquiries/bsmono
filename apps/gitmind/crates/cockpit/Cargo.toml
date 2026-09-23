@@ -20,4 +20,5 @@ serde_json = "1"
 gitmind-core = { path = "../core" }
 peek = { path = "../../../../tools/peek" }
 net-kit = { path = "../../../../shared/net-kit" }
+depot-auth = { path = "../../../../shared/depot-auth" }
 proc-kit = { path = "../../../../shared/proc-kit" }
