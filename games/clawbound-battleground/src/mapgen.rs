@@ -84,8 +84,8 @@ impl MapDraft {
             return Some("coordinates must be numbers".into());
         }
         let r = kind.footprint().radius;
-        if x.hypot(z) > consts::ARENA_RADIUS - 4.0 {
-            return Some(format!("outside the arena (radius {:.0})", consts::ARENA_RADIUS));
+        if x.hypot(z) > consts::arena_radius() - 4.0 {
+            return Some(format!("outside the arena (radius {:.0})", consts::arena_radius()));
         }
         // On a map carved out of rock, the rock is not floor. Without this
         // the engine accepted a rock on top of Twinfang Pass's 96 u summit
@@ -623,14 +623,15 @@ mod tests {
     fn on_the_pass_the_rock_is_refused_and_twins_mirror_in_z() {
         crate::map::with(crate::map::MapId::Pass, || {
             let mut d = MapDraft::default();
-            for (x, z) in [(-60.0, 0.0), (24.0, -60.0), (-14.0, -60.0)] {
+            let k = crate::pass::S;
+            for (x, z) in [(-60.0 * k, 0.0), (24.0 * k, -60.0 * k), (-14.0 * k, -60.0 * k)] {
                 let e = d.place(PropKind::Rock, x, z, 0).unwrap_err();
                 assert!(e.contains("in the rock"), "({x},{z}): {e}");
             }
-            assert!(d.survey(-60.0, 0.0, 8.0).contains("0% walkable"), "{}", d.survey(-60.0, 0.0, 8.0));
+            assert!(d.survey(-60.0 * k, 0.0, 8.0).contains("0% walkable"), "{}", d.survey(-60.0 * k, 0.0, 8.0));
             // a floor spot: its twin is (x, -z)
-            d.place(PropKind::Bush, -26.0, -38.0, 0).unwrap();
-            assert!(d.placements.iter().any(|p| (p.x + 26.0).abs() < 1e-3 && (p.z - 38.0).abs() < 1e-3), "{:?}", d.placements);
+            d.place(PropKind::Bush, -26.0 * k, -38.0 * k, 0).unwrap();
+            assert!(d.placements.iter().any(|p| (p.x + 26.0 * k).abs() < 1e-3 && (p.z - 38.0 * k).abs() < 1e-3), "{:?}", d.placements);
             assert!(d.validate().is_empty(), "{:?}", d.validate());
             assert!(tools().contains("Twinfang Pass") && tools().contains("across z = 0"));
         });

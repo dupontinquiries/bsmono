@@ -1461,17 +1461,18 @@ pub fn sphere_in_frustum(vp: &Mat4, center: Vec3, radius: f32) -> bool {
 
 fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
     use crate::consts::{river_dist, GROUND_HALF, RIVER_HALF_WIDTH, ARENA_RADIUS};
-    const HALF: f32 = GROUND_HALF;
+    let half_ground = crate::consts::ground_half();
+    let _ = GROUND_HALF;
     // 1.6 u grid (was 3.2): ~80k verts, fine enough for the river channels
     // and lane edges to read; the fragment shader adds the sub-metre detail.
     const STEP: f32 = 1.6;
-    const N: usize = ((HALF * 2.0) / STEP) as usize + 1;
+    let n_side: usize = ((half_ground * 2.0) / STEP) as usize + 1;
 
-    let mut verts = Vec::with_capacity(N * N);
-    for iz in 0..N {
-        for ix in 0..N {
-            let x = -HALF + ix as f32 * STEP;
-            let z = -HALF + iz as f32 * STEP;
+    let mut verts = Vec::with_capacity(n_side * n_side);
+    for iz in 0..n_side {
+        for ix in 0..n_side {
+            let x = -half_ground + ix as f32 * STEP;
+            let z = -half_ground + iz as f32 * STEP;
             let h = terrain_height(x, z);
             // normal from height diffs
             let hl = terrain_height(x - STEP, z);
@@ -1587,13 +1588,13 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
         }
     }
 
-    let mut idx = Vec::with_capacity((N - 1) * (N - 1) * 6);
-    for iz in 0..N - 1 {
-        for ix in 0..N - 1 {
-            let a = (ix + N * iz) as u32;
-            let b = (ix + 1 + N * iz) as u32;
-            let c = (ix + N * (iz + 1)) as u32;
-            let d = (ix + 1 + N * (iz + 1)) as u32;
+    let mut idx = Vec::with_capacity((n_side - 1) * (n_side - 1) * 6);
+    for iz in 0..n_side - 1 {
+        for ix in 0..n_side - 1 {
+            let a = (ix + n_side * iz) as u32;
+            let b = (ix + 1 + n_side * iz) as u32;
+            let c = (ix + n_side * (iz + 1)) as u32;
+            let d = (ix + 1 + n_side * (iz + 1)) as u32;
             idx.extend_from_slice(&[a, c, b, b, c, d]);
         }
     }
@@ -1757,7 +1758,8 @@ fn build_water() -> (Vec<WaterVert>, Vec<u32>) {
 fn build_flood_plane() -> (Vec<WaterVert>, Vec<u32>) {
     use crate::consts::{river_dist, ARENA_RADIUS, RIVER_HALF_WIDTH, WATER_LEVEL};
     const STEP: f32 = 2.0;
-    let half = ARENA_RADIUS + 10.0;
+    let half = crate::consts::arena_radius() + 10.0;
+    let _ = ARENA_RADIUS;
     let n = (half * 2.0 / STEP) as usize + 1;
     let mut verts = Vec::with_capacity(n * n);
     let mut idx = Vec::new();

@@ -883,7 +883,7 @@ pub fn run_pass_shots() -> Result<(), String> {
     let fall = crate::pass::falls()[0];
     let clearing = crate::pass::clearings()[4];
     let cz = Vec3::new(clearing.0, 0.0, clearing.1);
-    shoot(&mut renderer, &game, &mut vfx, "pass_overview.png", Camera { eye: Vec3::new(0.0, 360.0, -80.0), target: Vec3::ZERO, fov_y: 1.1 })?;
+    shoot(&mut renderer, &game, &mut vfx, "pass_overview.png", Camera { eye: Vec3::new(0.0, 470.0, -100.0), target: Vec3::ZERO, fov_y: 1.1 })?;
     shoot(&mut renderer, &game, &mut vfx, "pass_gorge.png", Camera { eye: Vec3::new(2.0, 3.0, -76.0), target: Vec3::new(-4.0, 22.0, 0.0), fov_y: 1.0 })?;
     // Cameras stand ON the floor (clamped in from the rock), or the first
     // try looked at the inside of a boulder and a cliff.
@@ -891,6 +891,9 @@ pub fn run_pass_shots() -> Result<(), String> {
     // from down the stream, looking back up it at the fall
     shoot(&mut renderer, &game, &mut vfx, "pass_waterfall.png", Camera { eye: on_floor(crate::pass::streams()[0][3], 2.5), target: fall.foot + Vec3::Y * 5.0, fov_y: 0.75 })?;
     shoot(&mut renderer, &game, &mut vfx, "pass_clearing.png", Camera { eye: on_floor(cz + Vec3::new(-5.0, 0.0, -5.0), 7.0), target: cz, fov_y: 1.05 })?;
+    // a choke, from the wide lane looking into the narrows
+    let (cp, cd) = crate::pass::choke_points()[2];
+    shoot(&mut renderer, &game, &mut vfx, "pass_choke.png", Camera { eye: cp - cd * 22.0 + Vec3::Y * 6.0, target: cp + cd * 6.0 + Vec3::Y * 2.0, fov_y: 0.95 })?;
     shoot(&mut renderer, &game, &mut vfx, "pass_peaks.png", Camera { eye: Vec3::new(0.0, 4.0, -118.0), target: Vec3::new(0.0, 40.0, 0.0), fov_y: 1.0 })?;
     // The fight: run the match, then frame the densest knot of cats.
     let steps: usize = std::env::var("CLAWBOUND_PASS_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(75) * 60;

@@ -21,7 +21,18 @@ pub const ARENA_RADIUS: f32 = 95.0 * MAP_SCALE + JUNGLE_MARGIN; // playable floo
 /// The playable radius of the active map. One function so a map can differ
 /// in size (the jungle and the pass share `ARENA_RADIUS` today).
 pub fn arena_radius() -> f32 {
-    ARENA_RADIUS
+    match crate::map::active() {
+        crate::map::MapId::Jungle => ARENA_RADIUS,
+        crate::map::MapId::Pass => crate::pass::ARENA_RADIUS,
+    }
+}
+
+/// Half the side of the rendered terrain square, for the active map.
+pub fn ground_half() -> f32 {
+    match crate::map::active() {
+        crate::map::MapId::Jungle => GROUND_HALF,
+        crate::map::MapId::Pass => crate::pass::GROUND_HALF,
+    }
 }
 
 /// Everything past the playable floor -- the hill ring, the landmarks, the

@@ -267,8 +267,8 @@ impl Game {
 
             // arena bounds
             let r = Vec3::new(g.pos.x, 0.0, g.pos.z).length();
-            if r > ARENA_RADIUS - 2.0 {
-                let s = (ARENA_RADIUS - 2.0) / r;
+            if r > crate::consts::arena_radius() - 2.0 {
+                let s = (crate::consts::arena_radius() - 2.0) / r;
                 g.pos.x *= s;
                 g.pos.z *= s;
             }
@@ -794,7 +794,7 @@ impl Game {
                 _ => {
                     p.pos += p.vel * dt;
                     p.life -= dt;
-                    if p.life <= 0.0 || p.pos.y < -0.5 || Vec3::new(p.pos.x, 0.0, p.pos.z).length() > ARENA_RADIUS + 4.0 {
+                    if p.life <= 0.0 || p.pos.y < -0.5 || Vec3::new(p.pos.x, 0.0, p.pos.z).length() > crate::consts::arena_radius() + 4.0 {
                         dead[pi] = true;
                         continue;
                     }

@@ -669,7 +669,7 @@ fn draw_minimap(ctx: &egui::Context, game: &Game, player: usize) {
         let size = 170.0;
         let (rect, _) = ui.allocate_exact_size(Vec2::new(size, size), Sense::hover());
         let p = ui.painter();
-        let scale = size * 0.5 / (ARENA_RADIUS + 8.0);
+        let scale = size * 0.5 / (consts::arena_radius() + 8.0);
         let to_map = |pos: Vec3| -> Pos2 {
             let c = rect.center();
             Pos2::new(c.x + pos.x * scale, c.y - pos.z * scale)

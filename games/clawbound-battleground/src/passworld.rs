@@ -57,10 +57,11 @@ pub fn placements() -> Vec<Item> {
 
     // Scree: rocks fallen at the foot of the cliffs, on the floor's edge.
     // Mirrored in z so the halves are fair.
-    let mut z = -160.0f32;
+    let lim = 165.0 * pass::S;
+    let mut z = -lim;
     while z <= 0.0 {
-        let mut x = -165.0f32;
-        while x <= 165.0 {
+        let mut x = -lim;
+        while x <= lim {
             let (jx, jz) = (x + rng.range(-1.2, 1.2), z + rng.range(-1.2, 1.2));
             let d = f.sdf(jx, jz);
             if (-3.0..=-1.4).contains(&d) && clear_of_play(jx, jz, 6.5) {
@@ -118,10 +119,10 @@ pub fn placements() -> Vec<Item> {
     }
 
     // Occasional grass and scrub along the lanes' margins: very occasional.
-    let mut z = -150.0f32;
+    let mut z = -155.0 * pass::S;
     while z <= 0.0 {
-        let mut x = -160.0f32;
-        while x <= 160.0 {
+        let mut x = -lim;
+        while x <= lim {
             let d = f.sdf(x, z);
             if (-2.2..=-1.0).contains(&d) && rng.f32() < 0.07 && clear_of_play(x, z, 4.5) {
                 let kind = if rng.f32() < 0.3 { PropKind::Bush } else { PropKind::Fern };
@@ -137,15 +138,16 @@ pub fn placements() -> Vec<Item> {
 
     // Pines clinging to the plateau: out of reach, scenery only, thinning
     // with height and gone above the treeline.
-    let mut z = -200.0f32;
-    while z <= 200.0 {
-        let mut x = -200.0f32;
-        while x <= 200.0 {
+    let hl = consts::arena_radius() + 30.0;
+    let mut z = -hl;
+    while z <= hl {
+        let mut x = -hl;
+        while x <= hl {
             let (jx, jz) = (x + rng.range(-3.0, 3.0), z + rng.range(-3.0, 3.0));
             let d = f.sdf(jx, jz);
             let h = pass::terrain_height(jx, jz);
             let chance = 0.22 * (1.0 - ((h - 14.0) / 16.0).clamp(0.0, 1.0));
-            if d > 3.5 && h < 30.0 && Vec3::new(jx, 0.0, jz).length() < consts::ARENA_RADIUS + 25.0 && rng.f32() < chance {
+            if d > 3.5 && h < 30.0 && Vec3::new(jx, 0.0, jz).length() < consts::arena_radius() + 25.0 && rng.f32() < chance {
                 out.push(Item::HighPine { x: jx, z: jz, y: h - 0.3, scale: rng.range(0.6, 1.0) });
             }
             x += 8.0;
@@ -184,7 +186,7 @@ fn weathered(mut m: crate::voxel::VoxelMesh, grey: f32, dark: f32) -> crate::vox
 
 /// Meshes and collision for everything in [`placements`].
 pub fn build() -> (Vec<Piece>, Blockers) {
-    let mut blockers = Blockers::new(consts::ARENA_RADIUS + 20.0, 6.0);
+    let mut blockers = Blockers::new(consts::arena_radius() + 20.0, 6.0);
     blockers.set_floor(pass::floor());
     let mut pieces = Vec::new();
     for (i, it) in placements().into_iter().enumerate() {
