@@ -786,7 +786,7 @@ pub fn draw_scoreboard_labelled(ctx: &egui::Context, game: &Game, ui_label: Opti
             // heading ~28 + frame margins 28 + stroke
             egui::ScrollArea::vertical().id_source("board_scroll").max_height(max_h - 64.0).show(ui, |ui| {
             for team in [Team::Blue, Team::Red] {
-                ui.label(egui::RichText::new(if team == Team::Blue { "— ORDER (BLUE) —" } else { "— CHAOS (RED) —" }).size(15.0).color(col(team)));
+                ui.label(egui::RichText::new(format!("— {} —", team.name())).size(15.0).color(col(team)));
                 ui.label(egui::RichText::new(format!("hunt: {} animals caught", game.wild.caught[team as usize])).size(12.0).color(Color32::from_rgb(170, 168, 158)));
                 egui::Grid::new(format!("grid{}", team as usize)).num_columns(7).spacing([14.0, 3.0]).show(ui, |ui| {
                     ui.monospace("Ancestor");
@@ -1103,4 +1103,56 @@ pub fn draw_touch_pad(ctx: &egui::Context, pad: &crate::touch::TouchPad, game: &
 /// reference's lifetime — see the note on `GridPicker`'s `text` parameter.
 fn ancestor_tag_text<'a>(i: &'a (&'static str, String)) -> (&'a str, &'a str) {
     (i.0, i.1.as_str())
+}
+
+/// The match intro's overlay (`intro::Overlay`): cinema bars, the lane
+/// caption, the team-versus-team card, the announcer's line, a skip hint.
+/// Draws only; every value comes from the intro timeline.
+pub fn draw_intro_overlay(ctx: &egui::Context, o: &crate::intro::Overlay) {
+    let screen = ctx.screen_rect();
+    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("intro")));
+    let (w, h) = (screen.width(), screen.height());
+    let a = |x: f32| (x.clamp(0.0, 1.0) * 255.0) as u8;
+    // bars
+    let bar = h * 0.11 * o.bars;
+    if bar > 0.5 {
+        p.rect_filled(Rect::from_min_size(screen.min, Vec2::new(w, bar)), 0.0, Color32::BLACK);
+        p.rect_filled(Rect::from_min_size(Pos2::new(screen.min.x, screen.max.y - bar), Vec2::new(w, bar)), 0.0, Color32::BLACK);
+    }
+    if let Some(c) = o.caption {
+        p.text(Pos2::new(screen.min.x + 28.0, screen.min.y + bar + 20.0), Align2::LEFT_TOP, c, FontId::proportional(22.0), Color32::from_rgba_unmultiplied(235, 230, 220, 220));
+    }
+    if o.versus > 0.01 {
+        let v = o.versus;
+        let cy = screen.center().y - h * 0.04;
+        let slide = (1.0 - v) * w * 0.12;
+        // a dark band behind the names
+        p.rect_filled(Rect::from_center_size(Pos2::new(screen.center().x, cy), Vec2::new(w, h * 0.22)), 0.0, Color32::from_black_alpha(a(v * 0.55)));
+        let size = (h * 0.075).clamp(26.0, 64.0);
+        for (team, sx, align) in [(Team::Blue, -1.0f32, Align2::RIGHT_CENTER), (Team::Red, 1.0, Align2::LEFT_CENTER)] {
+            let c = team.rgb();
+            let col = Color32::from_rgba_unmultiplied((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8, a(v));
+            let x = screen.center().x + sx * (w * 0.07 + slide);
+            // a soft glow: the name at the SAME size, faint, offset round
+            // itself (a bigger font from the same anchor misaligns -- it
+            // read as ghost letters)
+            for k in 0..8 {
+                let ang = k as f32 / 8.0 * std::f32::consts::TAU;
+                p.text(Pos2::new(x + ang.cos() * 2.5, cy - size * 0.18 + ang.sin() * 2.5), align, team.name(), FontId::proportional(size), col.linear_multiply(0.12));
+            }
+            p.text(Pos2::new(x, cy - size * 0.18), align, team.name(), FontId::proportional(size), col);
+            p.text(Pos2::new(x, cy + size * 0.62), align, team.motto(), FontId::proportional(size * 0.28), Color32::from_rgba_unmultiplied(220, 216, 205, a(v * 0.85)));
+        }
+        p.text(Pos2::new(screen.center().x, cy - size * 0.18), Align2::CENTER_CENTER, "VS", FontId::proportional(size * 0.8), Color32::from_rgba_unmultiplied(222, 186, 96, a(v)));
+    }
+    if let Some(line) = o.line {
+        if o.line_alpha > 0.01 {
+            let y = screen.max.y - bar.max(h * 0.06) - 26.0;
+            p.text(Pos2::new(screen.center().x + 1.5, y + 1.5), Align2::CENTER_BOTTOM, line, FontId::proportional((h * 0.034).clamp(16.0, 30.0)), Color32::from_black_alpha(a(o.line_alpha * 0.7)));
+            p.text(Pos2::new(screen.center().x, y), Align2::CENTER_BOTTOM, line, FontId::proportional((h * 0.034).clamp(16.0, 30.0)), Color32::from_rgba_unmultiplied(240, 232, 214, a(o.line_alpha)));
+        }
+    }
+    if o.skip_hint > 0.01 {
+        p.text(Pos2::new(screen.max.x - 20.0, screen.max.y - 14.0), Align2::RIGHT_BOTTOM, "tap or press any key to skip", FontId::proportional(13.0), Color32::from_rgba_unmultiplied(200, 196, 186, a(o.skip_hint * 0.7)));
+    }
 }
