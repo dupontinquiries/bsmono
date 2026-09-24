@@ -1336,7 +1336,11 @@ fn main() {
                 WindowEvent::CursorPos(_, _) => cursor_events += 1,
                 _ => {}
             }
-            input.handle_event(&event);
+            // The engine's Input takes its own event type since the glfw decoupling;
+            // convert as unendlich-fullgame does.
+            if let Some(ev) = unendlich_engine::input_codes::input_event_from_glfw(&event) {
+                input.handle_event(&ev);
+            }
             match event {
                 WindowEvent::Key(Key::Escape, _, Action::Press, _) => {
                     esc_pressed = true;
@@ -1369,7 +1373,7 @@ fn main() {
         }
 
         // Carry-aware: a late-drained Esc shows up as just-pressed next frame.
-        esc_pressed |= input.is_key_just_pressed(Key::Escape);
+        esc_pressed |= input.is_key_just_pressed(unendlich_engine::input_codes::Keycode::Escape);
 
         // P handling: toggle panel mode (cursor visible + UI clicks routed).
         if p_pressed {
@@ -1405,7 +1409,7 @@ fn main() {
         }
 
         // Click-to-capture mouse — suppressed in panel mode so UI clicks land.
-        if !mouse_captured && !ui_panel_open && !renderer.settings_open && input.is_mouse_button_just_pressed(MouseButtonLeft) {
+        if !mouse_captured && !ui_panel_open && !renderer.settings_open && input.is_mouse_button_just_pressed(MouseButtonLeft.into()) {
             window.set_cursor_mode(CursorMode::Disabled);
             mouse_captured = true;
             // Reset deltas so we don't snap on first frame.
@@ -2370,8 +2374,8 @@ fn main() {
         // edge detection alone would only do one edit per click — fine for
         // building, frustrating for breaking through walls. Cooldown is the
         // middle ground.
-        let mouse_left_held = input.is_mouse_button_pressed(MouseButton::Button1);
-        let mouse_right_held = input.is_mouse_button_pressed(MouseButton::Button2);
+        let mouse_left_held = input.is_mouse_button_pressed(MouseButton::Button1.into());
+        let mouse_right_held = input.is_mouse_button_pressed(MouseButton::Button2.into());
         let cooldown_ok = last_block_action.elapsed().as_millis() >= BLOCK_ACTION_COOLDOWN_MS;
         // Permission gate: a player without can_break_block / can_place_block
         // shouldn't even raycast (saves cycles). Single-player default
@@ -3010,9 +3014,22 @@ fn main() {
                         } else {
                             None
                         };
+                        // As unendlich-fullgame: face-neighbours for seam culling (a
+                        // `None` slot falls back to Air-at-edge), the world epoch
+                        // stamped at submit (r195). Both fields postdate this bin.
+                        let neighbors = unendlich_engine::render::mesher::NeighborChunks {
+                            neg_x: chunk_manager.get_chunk(unendlich_engine::world::chunk::ChunkCoord::new(coord.x - 1, coord.y, coord.z)),
+                            pos_x: chunk_manager.get_chunk(unendlich_engine::world::chunk::ChunkCoord::new(coord.x + 1, coord.y, coord.z)),
+                            neg_y: chunk_manager.get_chunk(unendlich_engine::world::chunk::ChunkCoord::new(coord.x, coord.y - 1, coord.z)),
+                            pos_y: chunk_manager.get_chunk(unendlich_engine::world::chunk::ChunkCoord::new(coord.x, coord.y + 1, coord.z)),
+                            neg_z: chunk_manager.get_chunk(unendlich_engine::world::chunk::ChunkCoord::new(coord.x, coord.y, coord.z - 1)),
+                            pos_z: chunk_manager.get_chunk(unendlich_engine::world::chunk::ChunkCoord::new(coord.x, coord.y, coord.z + 1)),
+                        };
                         let req = MeshRequest {
                             coord,
                             chunk,
+                            epoch: chunk_manager.world_epoch(),
+                            neighbors,
                             version_at_submit: version,
                             sky: sky_state,
                             world_model: Some(Arc::clone(&world_model)),
@@ -3509,6 +3526,10 @@ fn main() {
                 time_of_day: world_time,
                 wind_xz: [wx, wz],
                 wind_magnitude: wmag,
+                // Added after this bin (r420); 1.0 is the documented "unchanged",
+                // i.e. the animation this viewer always had. (unendlich-fullgame
+                // chose 0.45 as a look, r426; not adopted here silently.)
+                wave_speed: 1.0,
             }
         };
 
@@ -3551,7 +3572,9 @@ fn main() {
             // button PRESS edges caught here carry into next frame's
             // just-pressed set instead of being wiped by end_frame (the
             // "eaten esc / jump / flight" bug).
-            input.handle_event_late(&event);
+            if let Some(ev) = unendlich_engine::input_codes::input_event_from_glfw(&event) {
+                input.handle_event_late(&ev);
+            }
         }
         if mouse_captured && input.cursor_delta != (0.0, 0.0) {
             local_player.apply_mouse(input.cursor_delta.0, input.cursor_delta.1);
@@ -3583,7 +3606,7 @@ fn main() {
             // Clicks whose press+release collapse into one frame (low fps)
             // produce no level edge; forward them as discrete clicks.
             renderer.ui_click_pending =
-                (input.is_mouse_button_just_pressed(MouseButtonLeft)
+                (input.is_mouse_button_just_pressed(MouseButtonLeft.into())
                     && !input.is_mouse_button_pressed(MouseButtonLeft)) as u32;
             renderer.ui_pointer_active = ui_panel_open || renderer.settings_open;
         }
