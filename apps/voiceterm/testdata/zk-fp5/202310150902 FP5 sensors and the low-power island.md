@@ -45,4 +45,12 @@ The practical consequence: compiling an IMU driver into the kernel finds
 nothing, because there is no bus for it to probe. The route is a userspace
 client speaking QMI to the sensor service on the island.
 
+The transport for that route exists and is healthy: `CONFIG_QRTR=y`,
+`QCOM_QMI_HELPERS=y`, a live `IPCRTR` glink edge on the ADSP, and
+`pd-mapper`, `rmtfs`, `tqftpserv` and `qmi-proxy` all running. What is
+missing is a client and the knowledge of what the ADSP publishes;
+`qrtr-lookup` answers the second. Note the contrast with the cameras, whose
+sensors sit on CCI buses the AP owns and therefore work —
+[[202310150909 FP5 camera pipeline]].
+
 #sensors #qcm6490 #open-question

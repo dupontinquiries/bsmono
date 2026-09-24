@@ -1,6 +1,6 @@
 # zk-fp5 — a Fairphone 5 demo vault
 
-Eight interlinked notes built from *Fairphone 5: Information on how to repair
+Nine interlinked notes built from *Fairphone 5: Information on how to repair
 and recycle* (95 pp, rev. 2025-07-23). Drop the directory into a vault root
 and open `202310150900 Fairphone 5.md`.
 
@@ -18,12 +18,13 @@ the note graph already expects.
 | …0904 spare parts and screws | four small tables | short tables in sequence |
 | …0905 recycler material mass | a 21-row table plus a graph | the widest table; two real data errors left in place |
 | …0906 diagnostics | grouped table | cells with long comma lists |
-| …0907 mainline Linux gaps | table + graph | a note that is half prose, half diagram |
+| …0907 mainline Linux gaps | table + graph | a note that is half prose, half diagram; the graph is 11/8 |
+| …0909 camera pipeline | measured device findings | tables plus shell blocks; the only note with runnable commands |
 | …0908 capture damage sample | broken on purpose | `docingest::diagnose` — empty refs, base64 asset names, split table cells |
 
 ## Test suite notes
 
-- **Link graph**: 9 files, 8 notes plus this README. The hub carries 8
+- **Link graph**: 10 files, 9 notes plus this README. The hub carries 9
   wikilinks; every other note links back up to it, and 0902↔0907, 0903↔0904,
   0905←0908 and 0906→0907 are the lateral edges, so `neighbors()` returns
   more than the hub for those.
@@ -37,7 +38,7 @@ the note graph already expects.
   documents, and the current check does not catch this instance. That makes
   0908 a regression test for a fix that has not been written yet.
 - **niftyplot**: four graph-kind blocks, parsed with `niftyplot::parse` —
-  0902 (7 nodes, 6 edges), 0903 (12/12), 0905 (10/7), 0907 (10/7). All four
+  0902 (7 nodes, 6 edges), 0903 (12/12), 0905 (10/7), 0907 (11/8). All four
   parse with zero warnings and zero errors. 0902 exercises the labelled-edge
   form (`A -- "label" → B`); the others are plain chains.
 - **Data quality**: 0905 contains two genuine errors from the source document
