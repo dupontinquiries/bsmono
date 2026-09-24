@@ -200,6 +200,10 @@ pub struct Palette {
     /// thumb travels off the top. Not a spring — it follows the finger, so
     /// pulling back restores it.
     pub hold_fade: f32,
+    /// The row a keyboard or the volume keys have walked to. Separate from
+    /// `hover`, which belongs to a finger: the two can disagree, and the one
+    /// that acts is whichever the user last used.
+    pub selected: Option<usize>,
     pub reveal: DragTransition,
     /// The three mode buttons, in row order.
     pub modes: [HoldOption; 3],
@@ -214,6 +218,7 @@ impl Default for Palette {
     fn default() -> Self {
         Palette {
             hold_fade: 1.0,
+            selected: None,
             open: false,
             query: String::new(),
             hover: None,
@@ -413,6 +418,37 @@ impl Palette {
         self.hold_move(geom, x, y);
         let h = self.hover.take()?;
         self.activate_hit(h)
+    }
+
+    /// Move the keyed selection. `down` walks toward the end of the list.
+    ///
+    /// Wraps at both ends, because a key-only user has no other way back and
+    /// pressing past the end to return is how every list of this shape
+    /// behaves.
+    pub fn step(&mut self, down: bool) {
+        let n = self.row_count();
+        if n == 0 {
+            self.selected = None;
+            return;
+        }
+        self.selected = Some(match self.selected {
+            None => {
+                if down {
+                    0
+                } else {
+                    n - 1
+                }
+            }
+            Some(i) if down => (i + 1) % n,
+            Some(0) => n - 1,
+            Some(i) => i - 1,
+        });
+    }
+
+    /// Activate the keyed selection, if any.
+    pub fn activate_selected(&mut self) -> Option<PaletteAction> {
+        let i = self.selected?;
+        self.activate_hit(Hit::Row(i))
     }
 
     /// A tap on the sheet.
@@ -686,5 +722,64 @@ mod band_tests {
         let (p, g) = open_palette();
         let below = press().1 + 200.0;
         assert_eq!(p.hold_band(&g, press(), 540.0, below), Band::Idle);
+    }
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+
+    fn p3() -> Palette {
+        let mut p = Palette::default();
+        p.set_items(vec![
+            PaletteItem::new("a", "Alpha", "", PaletteAction::ToggleFatCursor),
+            PaletteItem::new("b", "Beta", "", PaletteAction::ToggleAutoBrightness),
+            PaletteItem::new("c", "Gamma", "", PaletteAction::ToggleFatCursor),
+        ]);
+        p.open_by_hold();
+        p
+    }
+
+    #[test]
+    fn the_keys_walk_the_list_and_wrap_at_both_ends() {
+        // A key-only user — gloves, rain, a screen that will not answer —
+        // has no other way back, so pressing past the end returns.
+        let mut p = p3();
+        assert_eq!(p.selected, None, "nothing is selected until a key is pressed");
+        p.step(true);
+        assert_eq!(p.selected, Some(0));
+        p.step(true);
+        p.step(true);
+        assert_eq!(p.selected, Some(2));
+        p.step(true);
+        assert_eq!(p.selected, Some(0), "wraps forward");
+        p.step(false);
+        assert_eq!(p.selected, Some(2), "and back");
+        // Starting upward from nothing lands on the end, not the start.
+        let mut q = p3();
+        q.step(false);
+        assert_eq!(q.selected, Some(2));
+    }
+
+    #[test]
+    fn stepping_an_empty_list_selects_nothing_rather_than_panicking() {
+        let mut p = Palette::default();
+        p.open_by_hold();
+        p.set_query("no such thing at all");
+        p.step(true);
+        assert_eq!(p.selected, None);
+        assert_eq!(p.activate_selected(), None);
+    }
+
+    #[test]
+    fn the_keyed_selection_is_not_the_finger_hover() {
+        // Both can exist; they answer different questions, and conflating
+        // them would make a thumb resting on the sheet move what the keys
+        // are pointing at.
+        let mut p = p3();
+        p.step(true);
+        p.hover = Some(Hit::Row(2));
+        assert_eq!(p.selected, Some(0));
+        assert!(p.activate_selected().is_some());
     }
 }

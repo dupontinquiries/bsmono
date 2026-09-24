@@ -71,6 +71,7 @@ struct Shellbox {
     /// The speakers follow the screen: the same transform that rotates the
     /// display decides which driver is on the listener's left.
     pose: speaker_pose::Mix,
+    volkeys: tideshell_core::volkeys::VolKeys,
     /// The matrix last pushed to PipeWire, so nothing is sent per frame.
     last_pose: Option<speaker_pose::Matrix>,
     /// The rear camera's libcamera id, found once at startup.
@@ -514,6 +515,7 @@ fn main() {
         camera: None,
         cam_duty: tideshell_egui::camera::DutyCycle::new(tideshell_egui::camera::Duty::default()),
         pose: speaker_pose::Mix::new(speaker_pose::Transform::Normal, speaker_pose::Tuning::default()),
+        volkeys: tideshell_core::volkeys::VolKeys::default(),
         last_pose: None,
         rear_camera: tideshell_egui::camera::pick_rear(&cam_list),
         last_glass: None,
@@ -921,17 +923,28 @@ fn main() {
                 *next = now_ms + (1000 / rate.max(1)) as u64;
             }
         }
-        // Hardware keys: power = sleep/wake, volume = a 5 % fade. From
-        // cosmic-comp through the control socket, or (fallback) evdev.
-        let mut presses: Vec<tideshell_egui::keys::KeyPress> = sb.keys.as_ref().map(|k| k.rx.try_iter().collect()).unwrap_or_default();
+        // Hardware keys. The power key arrives from cosmic-comp through the
+        // control socket; the volume keys come from evdev, because a
+        // compositor shortcut fires on press and reports no release, and a
+        // hold cannot be told from a tap without one.
+        use tideshell_core::volkeys::{Intent, VolKey};
+        use tideshell_egui::keys::{KeyEvent, KeyPress};
+        let mut events: Vec<KeyEvent> = sb.keys.as_ref().map(|k| k.rx.try_iter().collect()).unwrap_or_default();
         if let Some(srv) = &ctl_server {
             use tideshell_egui::ctl::Command;
-            use tideshell_egui::keys::KeyPress;
             for c in srv.poll() {
                 match c {
-                    Ok(Command::PowerKey) => presses.push(KeyPress::Power),
-                    Ok(Command::VolumeUp) => presses.push(KeyPress::VolumeUp),
-                    Ok(Command::VolumeDown) => presses.push(KeyPress::VolumeDown),
+                    // A socket command is a complete press: down and up at
+                    // once, so a bound hold can never fire from one.
+                    Ok(Command::PowerKey) => events.push(KeyEvent { key: KeyPress::Power, down: true }),
+                    Ok(Command::VolumeUp) => {
+                        events.push(KeyEvent { key: KeyPress::VolumeUp, down: true });
+                        events.push(KeyEvent { key: KeyPress::VolumeUp, down: false });
+                    }
+                    Ok(Command::VolumeDown) => {
+                        events.push(KeyEvent { key: KeyPress::VolumeDown, down: true });
+                        events.push(KeyEvent { key: KeyPress::VolumeDown, down: false });
+                    }
                     Ok(Command::Lock) => sb.shell.lock_now(),
                     Ok(Command::Palette) => sb.shell.open_palette(),
                     Ok(Command::Switcher) => sb.shell.open_switcher(),
@@ -939,15 +952,39 @@ fn main() {
                 }
             }
         }
-        for k in presses {
+        // Steering follows cold/glove mode: with the touchscreen unreliable,
+        // the keys move a selection instead of the volume.
+        sb.volkeys.steering = sb.shell.cold.on;
+        let mut intents: Vec<Intent> = Vec::new();
+        for e in events {
+            match (e.key, e.down) {
+                (KeyPress::Power, true) => actions.extend(sb.shell.power_key()),
+                (KeyPress::Power, false) => {}
+                (KeyPress::VolumeUp, d) => intents.extend(if d { sb.volkeys.press(VolKey::Up, now_ms) } else { sb.volkeys.release(VolKey::Up, now_ms) }),
+                (KeyPress::VolumeDown, d) => intents.extend(if d { sb.volkeys.press(VolKey::Down, now_ms) } else { sb.volkeys.release(VolKey::Down, now_ms) }),
+            }
+        }
+        intents.extend(sb.volkeys.tick(now_ms));
+        for i in intents {
             use tideshell_core::control_center::SliderKind;
-            use tideshell_egui::keys::KeyPress;
             let v = sb.shell.drawer.volume;
-            actions.extend(match k {
-                KeyPress::Power => sb.shell.power_key(),
-                KeyPress::VolumeUp => sb.shell.set_slider(SliderKind::Volume, (v + 0.05).min(1.0)),
-                KeyPress::VolumeDown => sb.shell.set_slider(SliderKind::Volume, (v - 0.05).max(0.0)),
-            });
+            match i {
+                Intent::Volume(VolKey::Up) => actions.extend(sb.shell.set_slider(SliderKind::Volume, (v + 0.05).min(1.0))),
+                Intent::Volume(VolKey::Down) => actions.extend(sb.shell.set_slider(SliderKind::Volume, (v - 0.05).max(0.0))),
+                // Steering: the palette is the shell's list of everything,
+                // so it is what the keys walk when a finger will not do.
+                Intent::Step(k) => {
+                    if !sb.shell.palette.open {
+                        sb.shell.open_palette();
+                    }
+                    sb.shell.palette_step(matches!(k, VolKey::Down));
+                }
+                Intent::Activate => actions.extend(sb.shell.palette_activate_selected()),
+                // A hold with no binding opens the palette rather than doing
+                // nothing: it is the one action that leads to every other.
+                Intent::Bound(_) => sb.shell.open_palette(),
+                Intent::Chord => sb.shell.lock_now(),
+            }
         }
         actions.extend(sb.shell.tick(now_ms));
         sb.execute(actions);

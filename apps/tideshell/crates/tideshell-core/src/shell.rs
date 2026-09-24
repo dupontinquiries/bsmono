@@ -592,6 +592,20 @@ impl Shell {
     }
 
     /// Open the palette from a tap (a bar widget, a tile).
+    /// Walk the palette's selection with the volume keys (volkeys.rs).
+    pub fn palette_step(&mut self, down: bool) {
+        self.palette.step(down);
+        self.log(format!("palette step -> {:?}", self.palette.selected));
+    }
+
+    /// Activate whatever the keys have walked to.
+    pub fn palette_activate_selected(&mut self) -> Vec<Action> {
+        match self.palette.activate_selected() {
+            Some(a) => self.palette_action(a),
+            None => vec![],
+        }
+    }
+
     pub fn open_palette(&mut self) {
         self.drawer.close();
         self.switcher.hide();

@@ -41,7 +41,17 @@ impl Command {
 }
 
 /// The keys cosmic-comp should hand to tideshell, as (keysym name, command).
-pub const COMPOSITOR_KEYS: [(&str, &str); 3] = [("XF86PowerOff", "power-key"), ("XF86AudioRaiseVolume", "volume-up"), ("XF86AudioLowerVolume", "volume-down")];
+///
+/// The power key only. A compositor shortcut fires on PRESS and reports no
+/// release, so anything routed this way can never tell a tap from a hold —
+/// and the volume keys are the shell's hold surface (volkeys.rs), the one
+/// control that works with gloves on and the screen off. They are read from
+/// evdev instead, where releases exist.
+///
+/// The power key has no such need: a short press is the whole gesture, and
+/// the long press belongs to logind, which handles it below us and will
+/// power the phone off even if this shell has hung.
+pub const COMPOSITOR_KEYS: [(&str, &str); 1] = [("XF86PowerOff", "power-key")];
 
 /// Where cosmic reads user shortcuts that override its defaults.
 pub fn cosmic_custom_shortcuts(config_home: &Path) -> PathBuf {
@@ -262,7 +272,12 @@ mod tests {
         assert!(m.contains("(modifiers: [Super], key: \"t\"): Spawn(\"cosmic-term\"),"), "{m}");
         assert!(!m.contains("System(PowerOff)"), "the old power binding is replaced");
         assert!(m.contains("(modifiers: [], key: \"XF86PowerOff\"): Spawn(\"/home/user/.local/bin/tideshell ctl power-key\"),"));
-        assert!(m.contains("XF86AudioLowerVolume\"): Spawn(\"/home/user/.local/bin/tideshell ctl volume-down\")"));
+        // The volume keys are deliberately NOT bound here: a compositor
+        // shortcut fires on press and never reports the release, so a hold
+        // could not be told from a tap, and the volume keys are the shell's
+        // hold surface. They are read from evdev instead.
+        assert!(!m.contains("XF86AudioLowerVolume"), "volume must stay on evdev: {m}");
+        assert!(!m.contains("XF86AudioRaiseVolume"));
         assert!(m.starts_with("{\n") && m.trim_end().ends_with('}'));
         let twice = merge_custom_shortcuts(&m, "/home/user/.local/bin/tideshell");
         assert_eq!(twice, m, "idempotent");
@@ -285,7 +300,9 @@ mod tests {
 }"#;
         let m2 = merge_custom_shortcuts(pretty, "tideshell");
         let entries = map_entries(&m2);
-        assert_eq!(entries.len(), 4, "{m2}");
+        // One user entry kept, plus ours. Ours is a single binding now:
+        // only the power key goes through the compositor.
+        assert_eq!(entries.len(), 2, "{m2}");
         assert!(entries[0].starts_with('(') && entries[0].contains("Super") && entries[0].contains("Shift") && entries[0].ends_with(r#"Spawn("cosmic-term, --x")"#), "the user's multi-line entry kept whole: {}", entries[0]);
         assert!(!m2.contains("System(PowerOff)") && !m2.contains("(,") && !m2.contains(",,"), "{m2}");
         // A binding of the same key WITH modifiers is a different binding: kept.
@@ -294,7 +311,7 @@ mod tests {
         let tight = merge_custom_shortcuts(r#"{(modifiers:[],key:"XF86PowerOff"):System(PowerOff)}"#, "t");
         assert!(!tight.contains("System(PowerOff)"), "spacing does not hide the default: {tight}");
         let fresh = merge_custom_shortcuts("", "tideshell");
-        assert_eq!(fresh.matches("Spawn(").count(), 3);
+        assert_eq!(fresh.matches("Spawn(").count(), 1, "the power key, and only the power key");
         let base = std::env::temp_dir().join(format!("tideshell-cc-{}", std::process::id()));
         let f = cosmic_custom_shortcuts(&base);
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();

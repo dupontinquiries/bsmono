@@ -72,7 +72,7 @@ pub enum KeyPress {
 }
 
 pub struct Keys {
-    pub rx: Receiver<KeyPress>,
+    pub rx: Receiver<KeyEvent>,
     pub status: String,
     _inhibit: Option<OwnedFd>,
 }
@@ -101,7 +101,7 @@ impl Keys {
             match std::fs::File::open(&d.node) {
                 Ok(f) => {
                     opened.push(format!("{} ({})", d.name, d.node.display()));
-                    let tx: Sender<KeyPress> = tx.clone();
+                    let tx: Sender<KeyEvent> = tx.clone();
                     std::thread::Builder::new().name("tideshell-keys".into()).spawn(move || reader(f, tx)).expect("spawn key reader");
                 }
                 Err(e) => failed.push(format!("{}: {e}", d.node.display())),
@@ -127,7 +127,17 @@ impl Keys {
     }
 }
 
-fn reader(mut f: std::fs::File, tx: Sender<KeyPress>) {
+/// A key going down or coming up. Releases matter because a HOLD is only
+/// knowable from one: a shortcut that fires on press can never distinguish a
+/// tap from a hold, which is why the volume keys cannot be routed through
+/// the compositor if they are to do more than step the volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyEvent {
+    pub key: KeyPress,
+    pub down: bool,
+}
+
+fn reader(mut f: std::fs::File, tx: Sender<KeyEvent>) {
     let mut buf = [0u8; 24 * 16];
     loop {
         let n = match f.read(&mut buf) {
@@ -135,14 +145,17 @@ fn reader(mut f: std::fs::File, tx: Sender<KeyPress>) {
             Ok(n) => n,
         };
         for chunk in buf[..n].chunks_exact(24) {
-            if let Some((EV_KEY, code, 1)) = decode_event(chunk) {
-                let k = match code {
+            // 2 is autorepeat, which is the kernel's own timer and not the
+            // one this shell wants: holds are timed against the shell's
+            // clock so they behave the same however the key repeat is set.
+            if let Some((EV_KEY, code, v @ (0 | 1))) = decode_event(chunk) {
+                let key = match code {
                     KEY_POWER => KeyPress::Power,
                     KEY_VOLUMEUP => KeyPress::VolumeUp,
                     KEY_VOLUMEDOWN => KeyPress::VolumeDown,
                     _ => continue,
                 };
-                if tx.send(k).is_err() {
+                if tx.send(KeyEvent { key, down: v == 1 }).is_err() {
                     return;
                 }
             }
