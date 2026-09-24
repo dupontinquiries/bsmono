@@ -537,6 +537,10 @@ fn main() {
     {
         let out = tideshell_egui::effects::ensure_speaker_chain();
         sb.shell.note(format!("{out:?}"));
+        // And whatever the operator last chose. Resolved against this
+        // session's sliders, not the ones at the moment it was saved.
+        let out = tideshell_egui::effects::apply_saved_speaker(sb.shell.drawer.warmth, sb.shell.drawer.volume);
+        sb.shell.note(format!("{out:?}"));
     }
     sb.view.camera_mirror = cam_mount.mirror;
     sb.shell.note(tideshell_egui::devices::describe(&model, false, cam_mount));

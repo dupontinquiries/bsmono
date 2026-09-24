@@ -175,6 +175,43 @@ mod tests {
     }
 }
 
+/// Where the chain's settings live. Beside the shell's prefs, but a
+/// separate file: this is a list of values and bindings rather than flat
+/// keys, and wedging a variable-length graph into the prefs file would make
+/// both harder to read by hand.
+pub fn state_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(base.join("tideshell").join("speaker"))
+}
+
+/// Read the saved chain, or the defaults.
+pub fn load_state() -> Speaker {
+    let mut s = Speaker::default();
+    let Some(text) = state_path().and_then(|p| std::fs::read_to_string(p).ok()) else { return s };
+    let (values, bindings) = tideshell_core::chaingraph::decode_state(&text);
+    for (stage, control, v) in values {
+        if let Some(slot) = s.values.iter_mut().find(|(st, c, _)| *st == stage && *c == control) {
+            slot.2 = v;
+        }
+    }
+    s.bindings = bindings;
+    s
+}
+
+/// Write it, so the shell comes up sounding the way it was left.
+pub fn save_state(s: &Speaker) -> Result<std::path::PathBuf, String> {
+    let path = state_path().ok_or("no HOME or XDG_CONFIG_HOME")?;
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    let text = tideshell_core::chaingraph::encode_state(&s.values, &s.bindings);
+    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
 /// Send the resolved controls to the running shell.
 ///
 /// tideshell owns the PipeWire connection, so this app decides and the shell
@@ -281,10 +318,18 @@ pub fn ui(s: &mut Speaker, ui: &mut egui::Ui, touch_h: f32) -> Vec<SpeakerAction
     // what the shell already has, and the two getting out of step is a
     // worse failure than a few spare bytes.
     if !out.is_empty() {
+        // Saved AND applied: the file is what survives a restart, the
+        // datagram is what changes the sound now. Neither substitutes for
+        // the other, and a failure in one is not a failure in the other.
+        let saved = save_state(s);
         let pairs = s.resolve(0.5, 0.5);
-        if let Err(e) = send_to_shell(&pairs) {
-            s.status = format!("not applied: {e}");
-        }
+        let applied = send_to_shell(&pairs);
+        s.status = match (saved, applied) {
+            (Ok(p), Ok(())) => format!("saved {} and applied now", p.display()),
+            (Ok(p), Err(e)) => format!("saved {} (applies when the shell starts: {e})", p.display()),
+            (Err(e), Ok(())) => format!("applied now, but NOT saved: {e}"),
+            (Err(e), Err(a)) => format!("not saved: {e}; not applied: {a}"),
+        };
     }
     out
 }
@@ -338,5 +383,63 @@ mod send_tests {
         let e = send_to_shell(&[("a".into(), 1.0)]).unwrap_err();
         assert!(e.contains("is tideshell running"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod state_file_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ts-spk-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &d) };
+        d
+    }
+
+    #[test]
+    fn the_chain_survives_a_restart() {
+        let d = scratch("restart");
+        let mut s = Speaker::default();
+        s.apply(SpeakerAction::Set(tideshell_core::chaingraph::Stage::HpTop, "Freq", 250.0));
+        s.apply(SpeakerAction::Bind(tideshell_core::chaingraph::Stage::CompT, "Ratio", Source::Volume, 4.0, 1.0));
+        save_state(&s).unwrap();
+
+        let back = load_state();
+        assert_eq!(back.bindings.len(), 1, "the binding came back as a binding");
+        let f = back.resolve(0.0, 0.0).into_iter().find(|(k, _)| k == "hpTop:Freq").unwrap().1;
+        assert_eq!(f, 250.0);
+        // Still following, so a different session's volume gives a
+        // different ratio — which is the whole reason choices are saved
+        // rather than resolved numbers.
+        let quiet = back.resolve(0.0, 0.0).into_iter().find(|(k, _)| k == "compT:Ratio").unwrap().1;
+        let loud = back.resolve(0.0, 1.0).into_iter().find(|(k, _)| k == "compT:Ratio").unwrap().1;
+        assert!(quiet > loud, "{quiet} vs {loud}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn with_no_file_it_is_the_defaults_not_an_error() {
+        let d = scratch("none");
+        let s = load_state();
+        assert!(s.bindings.is_empty());
+        let amt = s.resolve(1.0, 1.0).into_iter().find(|(k, _)| k == "bassL:amt").unwrap().1;
+        assert_eq!(amt, 0.0, "bass off, as it ships");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_save_failure_and_an_apply_failure_are_told_apart() {
+        // They mean different things to the person: one loses the setting,
+        // the other only delays it.
+        let d = scratch("split");
+        let mut s = Speaker::default();
+        s.apply(SpeakerAction::Set(tideshell_core::chaingraph::Stage::BassL, "amt", 0.5));
+        assert!(save_state(&s).is_ok());
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", d.join("nowhere")) };
+        assert!(send_to_shell(&s.resolve(0.5, 0.5)).is_err(), "no shell listening");
+        assert!(load_state().values.iter().any(|(_, c, v)| *c == "amt" && *v == 0.5), "saved anyway");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

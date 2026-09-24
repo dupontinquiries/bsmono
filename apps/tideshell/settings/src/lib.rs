@@ -60,7 +60,7 @@ impl App {
     pub fn new(store: Store) -> App {
         let levers = cosmic_levers::levers();
         let readings = levers.iter().map(|l| store.read(l)).collect();
-        App { screen: Screen::Cosmic, speaker: speaker::Speaker::default(), shell_prefs: scale::load(), store, levers, readings, details: None, status: String::new(), last_read: Instant::now() }
+        App { screen: Screen::Cosmic, speaker: speaker::load_state(), shell_prefs: scale::load(), store, levers, readings, details: None, status: String::new(), last_read: Instant::now() }
     }
 
     pub fn reread(&mut self) {

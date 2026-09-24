@@ -422,6 +422,34 @@ pub fn apply_voicing(tone: f32) -> Outcome {
     }
 }
 
+/// Where the saved chain lives; the settings app writes it.
+pub fn speaker_state_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|c| c.join("tideshell").join("speaker"))
+}
+
+/// Apply the saved chain, so the shell comes up sounding the way it was
+/// left rather than at defaults until someone opens the settings app.
+///
+/// Resolved HERE with the shell's own slider positions, which is the reason
+/// the file stores choices rather than resolved numbers: a parameter that
+/// follows the volume must follow THIS session's volume, not the volume at
+/// the moment it was saved.
+pub fn apply_saved_speaker(warmth: f32, volume: f32) -> Outcome {
+    let Some(path) = speaker_state_path() else { return Outcome::Unwired("no config dir") };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Outcome::Unwired("no saved speaker chain");
+    };
+    let (values, bindings) = tideshell_core::chaingraph::decode_state(&text);
+    if values.is_empty() && bindings.is_empty() {
+        return Outcome::Unwired("saved speaker chain is empty");
+    }
+    apply_speaker_props(&tideshell_core::chaingraph::resolve(&bindings, &values, warmth, volume))
+}
+
 /// Send resolved control/value pairs to the speaker chain.
 ///
 /// One Props message for the whole set: the chain is a graph, and half of a
