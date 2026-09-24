@@ -26,7 +26,12 @@
 /// What the wire carries.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Packet {
+    /// Raw S16LE samples: what a build without a codec sends.
     VoiceFrame(Vec<u8>),
+    /// One Opus packet (`voice_codec`). Its own kind, so a build that predates
+    /// it drops it (`decode` answers None for a kind it does not know) instead
+    /// of playing Opus bytes as samples, which would be noise.
+    VoiceOpus(Vec<u8>),
     /// A claim to the floor, carrying only its timestamp — see the module docs.
     FloorAssert { claim_ts: u64 },
     FloorRelease,
@@ -61,6 +66,7 @@ pub fn encode(p: &Packet) -> Vec<u8> {
             out.extend_from_slice(&claim_ts.to_be_bytes());
         }
         Packet::FloorRelease => out.push(3),
+        Packet::VoiceOpus(f) => { out.push(4); out.extend_from_slice(f); }
     }
     out
 }
@@ -79,6 +85,7 @@ pub fn decode(payload: &[u8]) -> Option<Packet> {
             Some(Packet::FloorAssert { claim_ts: u64::from_be_bytes(b) })
         }
         3 => Some(Packet::FloorRelease),
+        4 => Some(Packet::VoiceOpus(body[1..].to_vec())),
         _ => None,
     }
 }
@@ -208,7 +215,7 @@ mod tests {
 
     #[test]
     fn every_packet_kind_round_trips() {
-        for p in [Packet::VoiceFrame(vec![1, 2, 3, 4]),
+        for p in [Packet::VoiceFrame(vec![1, 2, 3, 4]), Packet::VoiceOpus(vec![0x78, 9, 9]),
                   Packet::FloorAssert { claim_ts: u64::MAX },
                   Packet::FloorRelease] {
             assert_eq!(decode(&encode(&p)), Some(p));

@@ -96,6 +96,8 @@ struct VoiceRig {
     mic_thread: Option<std::thread::JoinHandle<()>>,
     speaker: Option<audio::Speaker>,
     speaker_child: Option<audio::Child>,
+    /// Packs mic frames for the wire and unpacks arriving ones (voice_codec).
+    codec: snapclone_egui::voice_codec::VoiceCodec,
     /// Wall-clock of the last `SinkDepth`, so the tick runs at the cushion's
     /// rate rather than the frame rate — a 120 Hz display must not ask the
     /// play-out layer for audio twice per frame.
@@ -117,6 +119,8 @@ impl VoiceRig {
             sock: None, peers: snapclone_egui::voice_wire::Peers::new(),
             mic: audio::MicShared::new(), mic_stop: Arc::new(AtomicBool::new(false)),
             mic_child: None, mic_thread: None, speaker: None, speaker_child: None,
+            codec: snapclone_egui::voice_codec::VoiceCodec::new(
+                snapclone_egui::sink_cushion::SAMPLE_RATE, snapclone_egui::sink_cushion::frame_samples(snapclone_egui::sink_cushion::FRAME_MS)),
             last_sink_tick: std::time::Instant::now(), warned_no_audio: false,
             joined: false, warned_no_socket: false,
         }
@@ -176,6 +180,7 @@ impl VoiceRig {
 
     /// Both halves of the stop contract for each child, then reap.
     fn stop(&mut self) {
+        self.codec.reset();
         self.mic_stop.store(true, Ordering::Relaxed);
         if let Some(c) = self.mic_child.take() { c.stop(); c.reap(); }
         if let Some(t) = self.mic_thread.take() { let _ = t.join(); }
@@ -766,14 +771,14 @@ impl App {
             if self.voice.live() {
                 let cmds = self.snap.apply(HostEvent::VoiceLink(true));
                 self.handle(cmds);
-                // RAW S16LE, NOT OPUS. There is no encoder linked here, and
-                // the honest way to say that is to send the samples as they
-                // are rather than to claim a codec. It costs ~32 kB/s per
-                // peer against Opus's ~2, which is fine on a LAN and is not
-                // fine on mobile data — swapping in a real encoder is a
-                // change to these two conversions and nothing else, which
-                // is why they are the only place bytes and samples meet.
-                let cmds = self.snap.apply(HostEvent::EncoderReady(true));
+                // The codec for THIS call's frame length: Opus when the
+                // length is one Opus takes, raw otherwise -- and the host is
+                // told which, so "transmitting without a codec" fires exactly
+                // when it is so. (This used to say EncoderReady(true) while
+                // sending raw S16LE: the warning could never fire.)
+                self.voice.codec = snapclone_egui::voice_codec::VoiceCodec::new(
+                    snapclone_egui::sink_cushion::SAMPLE_RATE, snapclone_egui::sink_cushion::frame_samples(frame_ms));
+                let cmds = self.snap.apply(HostEvent::EncoderReady(self.voice.codec.encoder_ready()));
                 self.handle(cmds);
             }
         } else if !joined && self.voice.live() {
@@ -834,9 +839,8 @@ impl App {
                 c, HostCommand::VoiceEmit(snapclone_egui::voice_send::Emit::Send { .. })));
             self.handle(cmds);
             if may_send {
-                let payload = snapclone_egui::audio::f32_to_pcm(&frame);
-                let cmds = self.snap.apply(HostEvent::VoiceOutbound(
-                    snapclone_egui::voice_bridge::Packet::VoiceFrame(payload)));
+                let packet = self.voice.codec.encode(&frame);
+                let cmds = self.snap.apply(HostEvent::VoiceOutbound(packet));
                 self.handle(cmds);
             }
         }
@@ -1078,14 +1082,13 @@ impl App {
                 // out — matching what this host sends. A payload whose
                 // length is not a whole number of samples is refused rather
                 // than played as a half-sample of noise.
-                HostCommand::DecodeAudio { peer, pcm } => {
-                    if pcm.len() % 2 == 0 && !pcm.is_empty() {
-                        // The peer rides through decode unchanged -- this is
-                        // the boundary that used to drop it.
-                        pending.push(HostEvent::DecodedAudio {
-                            peer,
-                            samples: snapclone_egui::audio::pcm_to_f32(&pcm),
-                        });
+                HostCommand::DecodeAudio { peer, codec, pcm } => {
+                    // Raw or Opus by the packet's kind, one decoder per
+                    // speaker; a payload that is not a whole frame of its
+                    // codec is refused (voice_codec::decode). The peer rides
+                    // through decode unchanged.
+                    if let Some(samples) = self.voice.codec.decode(&peer, codec, &pcm) {
+                        pending.push(HostEvent::DecodedAudio { peer, samples });
                     }
                 }
                 HostCommand::PlayAudio(frames) => {

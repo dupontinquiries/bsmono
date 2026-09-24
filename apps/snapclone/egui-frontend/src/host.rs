@@ -294,7 +294,8 @@ pub enum HostCommand {
     /// f32 and nothing about how they were packed. Before this the decoded
     /// packet was matched on and DROPPED — inbound audio reached the bridge
     /// and stopped there, so a call was silent in both directions.
-    DecodeAudio { peer: String, pcm: Vec<u8> },
+    /// `codec` says what the bytes are: raw S16LE or one Opus packet.
+    DecodeAudio { peer: String, codec: crate::voice_codec::Codec, pcm: Vec<u8> },
     /// Show a notification. Only produced when the app decided one is
     /// warranted — an unfocused window and at least one sender.
     Notify(uikit_egui::notify::Rendered),
@@ -529,10 +530,16 @@ impl Snapclone {
                 // identity, the same one its security rule rests on ("the
                 // asserting peer IS the sender"). Per-contact processing keys on
                 // who the bridge says this is, not on a transport address.
-                if let crate::voice_bridge::Inbound::Handled {
-                    from, packet: crate::voice_bridge::Packet::VoiceFrame(f),
-                } = self.voice_receive(&sender, &payload) {
-                    out.push(HostCommand::DecodeAudio { peer: from, pcm: f });
+                // Both voice kinds, through the SAME bridge rules: an Opus
+                // frame gets exactly the checks a raw one does.
+                match self.voice_receive(&sender, &payload) {
+                    crate::voice_bridge::Inbound::Handled { from, packet: crate::voice_bridge::Packet::VoiceFrame(f) } => {
+                        out.push(HostCommand::DecodeAudio { peer: from, codec: crate::voice_codec::Codec::RawS16, pcm: f });
+                    }
+                    crate::voice_bridge::Inbound::Handled { from, packet: crate::voice_bridge::Packet::VoiceOpus(f) } => {
+                        out.push(HostCommand::DecodeAudio { peer: from, codec: crate::voice_codec::Codec::Opus, pcm: f });
+                    }
+                    _ => {}
                 }
                 // Arriving voice is what arms the proximity screensaver's
                 // window, and the posture engine is told separately from the

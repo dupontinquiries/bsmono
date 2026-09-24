@@ -14,8 +14,12 @@ path = "src/bin/snapclone_egui.rs"
 required-features = ["app"]
 
 [features]
-default = ["app"]
+default = ["app", "opus"]
 app = ["dep:eframe"]
+# Opus voice (voice_codec). Needs libopus (opus-dev / libopus-dev) at build
+# time; without it, `--no-default-features --features app` sends raw S16LE and
+# tells the host so.
+opus = ["dep:snapclone-audio", "snapclone-audio/opus"]
 
 [dependencies]
 # JPEG for the send path. Pure Rust, no native encoder: `default-features =
@@ -27,6 +31,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # `Av1Policy.hpp` says in its own header that it mirrors this crate's
 # `plan_for`; a third copy of those numbers is how three copies disagree.
 snapclone-av1policy = { path = "../rust/snapclone-av1policy" }
+snapclone-audio = { path = "../rust/snapclone-audio", optional = true, default-features = false }
 # The composer tile-strip decision model. A real dependency rather than a
 # #[path] include: it is a standalone crate with an rlib target, and its `ffi`
 # module uses `crate::` paths that break when a lib.rs is pulled in as a
