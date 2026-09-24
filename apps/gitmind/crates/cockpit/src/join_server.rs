@@ -134,7 +134,7 @@ fn sha256_hex(s: &str) -> String {
 }
 
 impl Session {
-    /// A new session. `rand` supplies randomness (the transport passes /dev/urandom; tests a
+    /// A new session. `rand` supplies randomness (the transport passes the OS CSPRNG; tests a
     /// fixed sequence).
     pub fn new(base_url: &str, fleet_user: &str, pubkey: &str, now: u64, mut rand: Box<dyn FnMut() -> u64 + Send>) -> Session {
         let code = crate::join::code_from_bytes(&rand().to_le_bytes());
@@ -296,12 +296,9 @@ pub fn local_addresses() -> Vec<(String, String)> {
 // ── transport ──
 
 fn urandom_u64() -> u64 {
-    use std::io::Read;
+    // The OS CSPRNG via crypto-kit (panics if there is none: tokens must not be guessable).
     let mut b = [0u8; 8];
-    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).is_err() {
-        // No urandom is not a machine this should run on; refuse rather than weaken.
-        panic!("join_server: /dev/urandom unavailable");
-    }
+    crypto_kit::random_bytes(&mut b);
     u64::from_le_bytes(b)
 }
 

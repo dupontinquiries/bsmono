@@ -28,15 +28,10 @@ fn outcome_dir(root: &Path) -> PathBuf {
     root.join("keys/paired")
 }
 
+/// Pairing ids and code nonces, from the OS CSPRNG (crypto-kit). No clock fallback: a
+/// predictable nonce weakens the pairing code it is mixed into.
 fn random_hex(n: usize) -> String {
-    use std::io::Read;
-    let mut b = vec![0u8; n];
-    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).is_err() {
-        // Not a secret (ids and code nonces); a clock fallback is enough.
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        b.iter_mut().enumerate().for_each(|(i, x)| *x = (t >> ((i % 16) * 8)) as u8 ^ i as u8);
-    }
-    depot_auth::hex(&b)
+    crypto_kit::random_hex(n)
 }
 
 fn write_private(p: &Path, text: &str) -> std::io::Result<()> {

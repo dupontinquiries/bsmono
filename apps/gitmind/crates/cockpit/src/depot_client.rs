@@ -127,16 +127,10 @@ fn json_field(body: &str, key: &str) -> Option<String> {
     v.get(key).map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string()))
 }
 
+/// Request nonces, from the OS CSPRNG (crypto-kit). No clock fallback: depot's replay check
+/// is only as good as the nonces' unpredictability.
 fn random_hex(n: usize) -> String {
-    use std::io::Read;
-    let mut b = vec![0u8; n];
-    // /dev/urandom is always there on Linux; a nonce needs uniqueness, and
-    // the clock fallback still gives that per process.
-    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).is_err() {
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        b.iter_mut().enumerate().for_each(|(i, x)| *x = (t >> ((i % 16) * 8)) as u8 ^ (i as u8).wrapping_mul(37));
-    }
-    depot_auth::hex(&b)
+    crypto_kit::random_hex(n)
 }
 
 fn now() -> u64 {

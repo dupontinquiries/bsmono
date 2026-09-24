@@ -521,6 +521,7 @@ dependencies = [
 name = "cockpit"
 version = "0.1.0"
 dependencies = [
+ "crypto-kit",
  "depot-auth",
  "depot-core",
  "gitmind-core",
