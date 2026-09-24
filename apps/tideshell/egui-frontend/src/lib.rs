@@ -78,6 +78,7 @@ pub mod keys;
 pub mod powerdoctor;
 pub mod ctl;
 pub mod camera;
+pub mod damage;
 pub mod devices;
 pub mod fit;
 

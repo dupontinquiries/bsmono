@@ -591,6 +591,7 @@ fn main() {
     let mut contact_pos: HashMap<i32, Pos2> = HashMap::new();
     let mut last_region: Option<Option<Vec<Rect>>> = None;
     let mut renderer_noted = false;
+    let mut last_frame_hash: HashMap<Role, u64> = HashMap::new();
     let mut last_poll = 0u64;
     // comfortgov reads the mtime of this file as "last user input".
     let hint = std::env::var_os("XDG_RUNTIME_DIR").map(|r| std::path::PathBuf::from(r).join("comfortgov.input"));
@@ -989,8 +990,16 @@ fn main() {
                     };
                 });
             });
-            sb.execute(actions);
             let prims = ctx_side.tessellate(out.shapes, out.pixels_per_point);
+            // Skip a surface whose frame is identical to the one already on
+            // screen. Tessellation has happened either way; what is saved is
+            // the fill and the commit, which is where the pixels are.
+            let h = tideshell_egui::damage::frame_hash(&prims);
+            if !tideshell_egui::damage::changed(last_frame_hash.get(&role).copied(), h, !out.textures_delta.is_empty()) {
+                sb.execute(actions);
+                continue;
+            }
+            last_frame_hash.insert(role, h);
             if !gl.renderer.is_empty() && !renderer_noted {
                 renderer_noted = true;
                 sb.view.accelerated = tideshell_core::paintrate::accelerated_renderer(&gl.renderer);
@@ -1003,6 +1012,7 @@ fn main() {
             if let Err(e) = gl.paint(role, size_px, out.pixels_per_point, &prims, &out.textures_delta) {
                 eprintln!("tideshell: {role:?}: {e}");
             }
+            sb.execute(actions);
         }
 
         // Overlay: map/unmap, input region, frame.
