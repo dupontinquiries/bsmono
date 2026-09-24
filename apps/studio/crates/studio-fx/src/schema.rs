@@ -180,6 +180,10 @@ pub fn schema(kind: &str) -> Option<Vec<ParamSpec>> {
             e("root", "root", NOTE_NAMES, 0),
             e("mode", "scale", SCALE_MODES, 0),
             f("speed", "retune speed", 0.0, 400.0, "ms", 30.0),
+            // hard hold: speed 0, slide off. Slide into key: slower, slide on.
+            f("slide", "slide into each note", 0.0, 1.0, "", 0.0),
+            f("amount", "amount", 0.0, 1.0, "%", 1.0),
+            f("tolerance", "leave notes within", 0.0, 100.0, "cents", 0.0),
             f("voiced", "voiced threshold", 0.0, 1.0, "", 0.15),
             count("notes", "custom notes", 0, 24, 0),
         ],

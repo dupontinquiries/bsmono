@@ -204,8 +204,22 @@ pub struct RealtimeTune {
     ring_write: usize,
     hop_countdown: usize,
     hop: usize,
+    /// SLIDE: each new note (a change of target note, or the first voiced
+    /// moment after a breath) starts UNCORRECTED and glides into key at
+    /// `retune_speed_ms` -- the "slide into key" feel. Off, the correction
+    /// runs continuously and a new note inherits the last one's (the hard,
+    /// held feel at speed 0). Until c20 there was only the latter.
+    pub slide: bool,
+    /// How much of the correction to apply, 0..=1: less than 1 leaves some of
+    /// the singer's own pitch in the note.
+    pub amount: f32,
+    /// A note already within this many cents of its target is left alone.
+    pub tolerance_cents: f32,
     /// Current correction in cents, smoothed; ratio is derived from it.
     cents: f32,
+    /// The target note being corrected toward (for SLIDE's new-note test);
+    /// `None` after a breath.
+    last_target: Option<f32>,
     /// The ratio actually applied this sample, ramped toward `ratio_target`
     /// across the hop that follows each analysis.
     ratio: f32,
@@ -245,6 +259,10 @@ impl RealtimeTune {
             hop_countdown: hop,
             hop: hop.max(1),
             cents: 0.0,
+            slide: false,
+            amount: 1.0,
+            tolerance_cents: 0.0,
+            last_target: None,
             ratio: 1.0,
             ratio_target: 1.0,
             ratio_step: 0.0,
@@ -258,6 +276,9 @@ impl RealtimeTune {
     /// The monitoring delay this adds, in samples. Fixed for the life of the
     /// instance, so a caller can compensate elsewhere if it needs to.
     pub fn latency_samples(&self) -> usize { self.shifters[0].buf.len() / 2 }
+
+    /// The correction being applied right now, in cents.
+    pub fn correction_cents(&self) -> f32 { self.cents }
 
     /// One interleaved sample. Channel 0's stream drives detection; every
     /// channel gets the same ratio.
@@ -325,10 +346,16 @@ impl RealtimeTune {
             // it. (Same call Retune makes; see its docs.)
             self.ratio_target = 1.0;
             self.ratio_step = (1.0 - self.ratio) / self.hop as f32;
+            self.last_target = None;
             return;
         };
         let target_hz = self.target.nearest_hz(p.hz);
-        let want_cents = 1200.0 * (target_hz / p.hz).log2();
+        let raw = 1200.0 * (target_hz / p.hz).log2();
+        if self.slide && self.last_target.is_none_or(|t| (t - target_hz).abs() > 0.5) {
+            self.cents = 0.0; // a new note starts as sung, then slides in
+        }
+        self.last_target = Some(target_hz);
+        let want_cents = if raw.abs() <= self.tolerance_cents { 0.0 } else { raw * self.amount.clamp(0.0, 1.0) };
         let hop_ms = self.hop as f32 / self.sample_rate * 1000.0;
         let a = if self.retune_speed_ms <= 0.0 {
             1.0
@@ -531,5 +558,44 @@ mod tests {
         let t = Target::Notes(Vec::new());
         let got = t.nearest_hz(452.0);
         assert!((got - 440.0).abs() < 1.0, "fell back to the nearest semitone, got {got}");
+    }
+
+    fn run(t: &mut RealtimeTune, hz: f32, secs: f32) {
+        for x in sine(hz, secs, 48_000.0) { t.process(x); }
+    }
+    fn chromatic(speed: f32) -> RealtimeTune {
+        let mut t = RealtimeTune::new(Target::Scale(crate::retune::Scale { root: 0, mode: Mode::Chromatic }), 48_000.0, 1);
+        t.retune_speed_ms = speed;
+        t
+    }
+
+    #[test]
+    fn slide_starts_each_new_note_as_sung_and_glides_in_hard_carries_on() {
+        // 452 Hz wants about -47 cents (to A4); 485 Hz about +31 (to B4) -- a different
+        // note. (479 Hz was the first choice: it is nearest A#4, ALSO -47 -- no change to see.)
+        let (mut slide, mut held) = (chromatic(150.0), chromatic(150.0));
+        slide.slide = true;
+        for t in [&mut slide, &mut held] { run(t, 452.0, 1.0); }
+        assert!((slide.correction_cents() + 47.0).abs() < 10.0, "settled on the first note: {}", slide.correction_cents());
+        for t in [&mut slide, &mut held] { run(t, 485.0, 0.06); }
+        assert!(slide.correction_cents().abs() < 25.0, "just after the change the new note is barely corrected: {}", slide.correction_cents());
+        assert!(held.correction_cents() < -10.0, "without slide the OLD correction is still pulling: {}", held.correction_cents());
+        run(&mut slide, 485.0, 1.0);
+        assert!((slide.correction_cents() - 31.0).abs() < 10.0, "and then it glides into key: {}", slide.correction_cents());
+    }
+
+    #[test]
+    fn tolerance_leaves_close_notes_alone_and_amount_corrects_part_way() {
+        let mut t = chromatic(0.0);
+        t.tolerance_cents = 30.0;
+        run(&mut t, 445.0, 0.5); // ~ +20 cents off A4
+        assert!(t.correction_cents().abs() < 1e-3, "{}", t.correction_cents());
+        let mut u = chromatic(0.0);
+        run(&mut u, 445.0, 0.5);
+        assert!((u.correction_cents() + 20.0).abs() < 8.0, "no tolerance: corrected, {}", u.correction_cents());
+        let mut h = chromatic(0.0);
+        h.amount = 0.5;
+        run(&mut h, 452.0, 0.5);
+        assert!((h.correction_cents() + 23.5).abs() < 6.0, "half of -47: {}", h.correction_cents());
     }
 }

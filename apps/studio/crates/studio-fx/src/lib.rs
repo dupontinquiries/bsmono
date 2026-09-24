@@ -810,6 +810,9 @@ pub fn instantiate(effect: &studio_core::Effect, rate: f32) -> Option<Instance> 
                 target, rate, p(q, "channels", 2.0).clamp(1.0, 8.0) as usize);
             t.retune_speed_ms = p(q, "speed", 30.0).max(0.0);
             t.voiced_threshold = p(q, "voiced", 0.15).clamp(0.0, 1.0);
+            t.slide = p(q, "slide", 0.0) >= 0.5;
+            t.amount = p(q, "amount", 1.0).clamp(0.0, 1.0);
+            t.tolerance_cents = p(q, "tolerance", 0.0).clamp(0.0, 100.0);
             Instance::RealTune(Box::new(t))
         }
         "tapestop" => Instance::TapeStop(playrate::TapeStop::new(

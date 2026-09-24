@@ -180,6 +180,16 @@ pub fn inventory(b: &[u8]) -> Result<Value, FlpError> {
             Ev::Data(236, _) => mixer_on = true,
             Ev::Data(201, d) if mixer_on => { slot.insert("plugin".into(), json!(text(d))); }
             Ev::Data(203, d) if mixer_on => { slot.insert("name".into(), json!(text(d))); }
+            // Pitcher's state: an "SSLF" block; f32 at 12 is the knob read as
+            // SPEED (inferred -- see flp_import::pitcher_params), and bytes
+            // 144..156 are the twelve note switches, C first. Decoded from
+            // Blue Moon's four Pitchers (all D major there).
+            Ev::Data(213, d) if mixer_on && slot.get("plugin").and_then(Value::as_str) == Some("Pitcher") && d.len() >= 156 && &d[..4] == b"SSLF" => {
+                slot.insert("pitcher".into(), json!({
+                    "speed": f32at(d, 12).map(|x| x as f64),
+                    "notes": d[144..156].iter().map(|b| *b != 0).collect::<Vec<bool>>(),
+                }));
+            }
             Ev::Num(98, v) if mixer_on => {
                 let mut s = std::mem::take(&mut slot);
                 s.insert("index".into(), json!(v));

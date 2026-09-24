@@ -75,6 +75,40 @@ pub fn channel_gain(c: &Value, m: Option<Media>) -> f32 {
     vol * norm
 }
 
+/// A Pitcher slot's settings as Studio autotune params, and a line saying
+/// what was read. The NOTE MASK is decoded (twelve switches, C first); it maps
+/// onto a scale when it is one -- a major key as its relative natural minor,
+/// the same notes. The SPEED is INFERRED: the float at offset 12 of Pitcher's
+/// state, read as 1.0 = instant. Evidence: on Blue Moon the female lead's bus
+/// (which the artist says slides into key) holds the lowest value (0.615),
+/// the male lead's 0.913. Four samples; the report says "inferred".
+pub fn pitcher_params(v: &Value) -> (BTreeMap<String, f32>, String) {
+    let mut q = BTreeMap::new();
+    let mut said = Vec::new();
+    let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    if let Some(mask) = v["notes"].as_array().map(|a| a.iter().map(|b| b.as_bool().unwrap_or(false)).collect::<Vec<bool>>()).filter(|m| m.len() == 12) {
+        let fits = |steps: &[usize], r: usize| (0..12).all(|k| mask[(r + k) % 12] == steps.contains(&k));
+        if let Some(r) = (0..12).find(|r| fits(&[0, 2, 3, 5, 7, 8, 10], *r)) {
+            q.insert("root".into(), r as f32); q.insert("mode".into(), 0.0);
+            said.push(format!("key {} major / {} minor (read from Pitcher's note switches)", names[(r + 3) % 12], names[r]));
+        } else if let Some(r) = (0..12).find(|r| fits(&[0, 2, 3, 5, 7, 8, 11], *r)) {
+            q.insert("root".into(), r as f32); q.insert("mode".into(), 1.0);
+            said.push(format!("key {} harmonic minor (read from Pitcher)", names[r]));
+        } else {
+            q.insert("mode".into(), 2.0);
+            said.push("Pitcher's notes are not a scale Studio has: chromatic".into());
+        }
+    }
+    if let Some(sp) = v["speed"].as_f64() {
+        let ms = ((1.0 - sp.clamp(0.0, 1.0)) * 400.0) as f32;
+        q.insert("speed".into(), ms);
+        let slide = ms >= 50.0;
+        q.insert("slide".into(), if slide { 1.0 } else { 0.0 });
+        said.push(format!("speed {ms:.0} ms{} (INFERRED from Pitcher's knob {sp:.3})", if slide { ", sliding into each note" } else { ", a hard hold" }));
+    }
+    (q, said.join("; "))
+}
+
 /// Steps per pattern at most (the rack rows are a u64 bitmask).
 const MAX_STEPS: u32 = 64;
 
@@ -284,7 +318,13 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
             match effect_for(plug) {
                 Some((kind, how)) => {
                     if how != "exact kind" && !approx.iter().any(|a| a.starts_with(plug)) { approx.push(format!("{plug}: {how}")); }
-                    chain.push(Effect { kind: kind.into(), params: BTreeMap::new(), enabled: slot["enabled"].as_bool().unwrap_or(true) });
+                    let mut params = BTreeMap::new();
+                    if plug == "Pitcher" && slot["pitcher"].is_object() {
+                        let (q, said) = pitcher_params(&slot["pitcher"]);
+                        params = q;
+                        approx.push(format!("Pitcher on {}: {said}", s(&m["name"]).map(str::to_string).unwrap_or_else(|| format!("Insert {insert}"))));
+                    }
+                    chain.push(Effect { kind: kind.into(), params, enabled: slot["enabled"].as_bool().unwrap_or(true) });
                 }
                 None => *unmapped.entry(label.to_string()).or_default() += 1,
             }
@@ -399,7 +439,25 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         p.tracks.len(), rack.channels.len(), rack.patterns.len(), p.busses.len(), bpm));
     if overflowed > 0 { report.push(format!("{overflowed} clip{} overlapped another on its FL track (FL allows it) -- moved to an overflow track, marked (2)", if overflowed == 1 { "" } else { "s" })); }
     if automation_clips > 0 { report.push(format!("{automation_clips} automation clip{} not imported (their points are not read yet)", if automation_clips == 1 { "" } else { "s" })); }
-    if !approx.is_empty() { report.push(format!("approximate effects: {}", approx.join("; "))); }
+    if !approx.is_empty() { report.push(format!("effects read or approximated: {}", approx.join("; "))); }
+    // Which tracks each autotune feeds from -- so "the male takes have their
+    // own" is checked, not assumed.
+    let feeds = |bus: BusId| -> Vec<String> {
+        let mut into = vec![bus];
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for b in p.busses.values() {
+                if b.parent.is_some_and(|x| into.contains(&x)) && !into.contains(&b.id) { into.push(b.id); grew = true; }
+            }
+        }
+        let mut names: Vec<String> = p.tracks.iter().filter(|t| t.route.is_some_and(|r| into.contains(&r))).map(|t| t.name.clone()).collect();
+        names.dedup();
+        names
+    };
+    for b in p.busses.values().filter(|b| b.chain.iter().any(|e| e.kind == "autotune")) {
+        report.push(format!("autotune on {} tunes: {}", b.name, feeds(b.id).join(", ")));
+    }
     report.push("every mapped effect is at Studio's DEFAULT settings -- the plugin parameters are not decoded".into());
     if !unmapped.is_empty() {
         report.push(format!("effects with no Studio counterpart, left out: {}",
@@ -533,6 +591,22 @@ mod tests {
         assert_eq!(fl_pan(12800.0), 1.0);
         let kick = im.rack.channels.iter().find(|c| c.name == "Kick").unwrap();
         assert!((kick.gain - 1.0).abs() < 1e-6, "not normalized: its volume alone");
+    }
+
+    #[test]
+    fn pitchers_note_switches_become_the_key_and_its_speed_a_slide_or_a_hold() {
+        // Blue Moon's mask: C# D E F# G A B -- D major
+        let dmaj = json!({"speed": 0.615, "notes": [false, true, true, false, true, false, true, true, false, true, false, true]});
+        let (q, said) = pitcher_params(&dmaj);
+        assert_eq!((q["root"], q["mode"]), (11.0, 0.0), "D major is B natural minor: the same notes");
+        assert!((q["speed"] - 154.0).abs() < 1.0, "{}", q["speed"]);
+        assert_eq!(q["slide"], 1.0);
+        assert!(said.contains("D major / B minor") && said.contains("INFERRED"), "{said}");
+        let hard = json!({"speed": 0.97, "notes": dmaj["notes"].clone()});
+        let (q, _) = pitcher_params(&hard);
+        assert_eq!(q["slide"], 0.0, "{} ms is a hold", q["speed"]);
+        let odd = json!({"notes": [true, true, false, false, false, false, false, false, false, false, false, false]});
+        assert_eq!(pitcher_params(&odd).0["mode"], 2.0, "not a scale Studio has: chromatic, and said");
     }
 
     #[test]

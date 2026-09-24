@@ -4667,6 +4667,23 @@
         {
           "enabled": true,
           "index": 0,
+          "pitcher": {
+            "notes": [
+              false,
+              true,
+              true,
+              false,
+              true,
+              false,
+              true,
+              true,
+              false,
+              true,
+              false,
+              true
+            ],
+            "speed": 1.0
+          },
           "plugin": "Pitcher"
         },
         {
@@ -5121,6 +5138,23 @@
         {
           "enabled": true,
           "index": 0,
+          "pitcher": {
+            "notes": [
+              false,
+              true,
+              true,
+              false,
+              true,
+              false,
+              true,
+              true,
+              false,
+              true,
+              false,
+              true
+            ],
+            "speed": 0.6150006055831909
+          },
           "plugin": "Pitcher"
         },
         {
@@ -5279,6 +5313,23 @@
         {
           "enabled": true,
           "index": 0,
+          "pitcher": {
+            "notes": [
+              false,
+              true,
+              true,
+              false,
+              true,
+              false,
+              true,
+              true,
+              false,
+              true,
+              false,
+              true
+            ],
+            "speed": 0.9125000834465027
+          },
           "plugin": "Pitcher"
         },
         {
@@ -5382,6 +5433,23 @@
         {
           "enabled": true,
           "index": 0,
+          "pitcher": {
+            "notes": [
+              false,
+              true,
+              true,
+              false,
+              true,
+              false,
+              true,
+              true,
+              false,
+              true,
+              false,
+              true
+            ],
+            "speed": 0.9700002670288086
+          },
           "plugin": "Pitcher"
         },
         {
