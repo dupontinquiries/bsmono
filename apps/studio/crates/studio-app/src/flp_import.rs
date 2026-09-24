@@ -116,6 +116,17 @@ pub const DECLICK: f64 = 0.003;
 /// Steps per pattern at most (the rack rows are a u64 bitmask).
 const MAX_STEPS: u32 = 64;
 
+/// Starting settings for a mapped effect whose own settings are not decoded:
+/// gentle, so a mix with fourteen exciters is coloured, not wrecked.
+pub fn default_params(slot_name: &str) -> BTreeMap<String, f32> {
+    let kv = |v: &[(&str, f32)]| v.iter().map(|(k, x)| (k.to_string(), *x)).collect();
+    match slot_name {
+        "Ozone 8 Exciter" => kv(&[("profile", 0.0), ("drive", 0.15), ("mix", 0.35)]),
+        "Ozone 8 Vintage Tape" => kv(&[("profile", 1.0), ("drive", 0.2), ("mix", 0.5)]),
+        _ => BTreeMap::new(),
+    }
+}
+
 /// FL's native effects that have a Studio counterpart, and the counterpart.
 pub fn effect_for(plugin: &str) -> Option<(&'static str, &'static str)> {
     Some(match plugin {
@@ -128,6 +139,16 @@ pub fn effect_for(plugin: &str) -> Option<(&'static str, &'static str)> {
         "Pitcher" => ("autotune", "exact kind"),
         "Fruity Balance" => ("gain", "exact kind (pan not kept)"),
         "Fruity Compressor" => ("compressor", "exact kind"),
+        // iZotope, by the slot's name (they are VSTs: the internal name is
+        // "Fruity Wrapper"). Studio has a tool of each KIND; the settings are
+        // not decoded, so each lands gentle -- see `default_params`.
+        "Ozone 8 Exciter" => ("saturation", "approximate: Ozone's exciter is multiband, Studio's saturation full-band"),
+        "Ozone 8 Vintage Tape" => ("saturation", "approximate: tape profile"),
+        "Ozone 8 Vintage Limiter" | "Ozone 8 Maximizer" => ("limiter", "approximate"),
+        "Ozone 8 Dynamics" => ("compressor", "approximate: Ozone's is multiband"),
+        "Ozone 8 Equalizer" | "Ozone 8 Dynamic EQ" => ("eq", "approximate: flat until set"),
+        "Ozone 8" => ("multiband", "approximate: the whole Ozone suite as a multiband stage"),
+        "Neutron 3" => ("compressor", "approximate: Neutron's channel strip as a compressor"),
         "Fruity Multiband Compressor" => ("multiband", "exact kind"),
         _ => return None,
     })
@@ -300,10 +321,11 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         for slot in m["slots"].as_array().into_iter().flatten() {
             let plug = s(&slot["plugin"]).unwrap_or("");
             let name = if plug == "Fruity Wrapper" { s(&slot["name"]).unwrap_or("a plugin") } else { plug };
-            match effect_for(plug) {
+            // a VST is known by its slot's name; a native plugin by its own
+            match effect_for(name) {
                 Some((kind, how)) => {
-                    if how != "exact kind" && !approx.iter().any(|a| a.starts_with(plug)) { approx.push(format!("{plug}: {how}")); }
-                    let mut params = BTreeMap::new();
+                    if how != "exact kind" && !approx.iter().any(|a| a.starts_with(name)) { approx.push(format!("{name}: {how}")); }
+                    let mut params = default_params(name);
                     if plug == "Pitcher" && slot["pitcher"].is_object() {
                         let (q, said) = pitcher_params(&slot["pitcher"]);
                         params = q;
@@ -499,6 +521,13 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         report.push(format!("SIDECHAIN (FL's level-0 routes) as a duck keyed by the source: {} -- at Studio's defaults \
 (threshold -24 dB, depth 10 dB, attack 5 / release 150 ms): FL's compressor settings on the destination are not decoded", ducked.join(", ")));
     }
+    // insert pan: FL's mixer pan runs -6400..=6400 around 0 (unlike a
+    // CHANNEL's 0..12800 around 6400) -- a balance, which is what Studio's is
+    for (insert, bus) in &busses {
+        if let Some(pan) = mixer.get(insert).and_then(|m| f(&m["pan"])).filter(|p| *p != 0.0) {
+            ops.push(Op::SetBusPan { id: *bus, pan: (pan / 6400.0).clamp(-1.0, 1.0) as f32 });
+        }
+    }
     // ── apply, through the model's own checks ───────────────────────────
     let mut refused = 0;
     for op in ops {
@@ -532,7 +561,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     for b in p.busses.values().filter(|b| b.chain.iter().any(|e| e.kind == "autotune")) {
         report.push(format!("autotune on {} tunes: {}", b.name, feeds(b.id).join(", ")));
     }
-    report.push("every mapped effect is at Studio's DEFAULT settings -- the plugin parameters are not decoded".into());
+    report.push("mapped effects start at Studio's defaults (the approximated iZotope ones at a gentle setting) -- the plugins' own parameters are not decoded".into());
     if !unmapped.is_empty() {
         report.push(format!("effects with no Studio counterpart, left out: {}",
             unmapped.iter().map(|(k, n)| if *n > 1 { format!("{k} x{n}") } else { k.clone() }).collect::<Vec<_>>().join(", ")));
@@ -551,7 +580,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         report.push("no routing in this inventory (PyFLP's is not trustworthy -- use the native reader): every bus feeds the master".into());
     }
     let panned = mixer.values().filter(|m| f(&m["pan"]).is_some_and(|p| p != 0.0) && busses.contains_key(&i(&m["iid"]).unwrap_or(-1))).count();
-    if panned > 0 { report.push(format!("{panned} insert pan{} not imported (Studio busses have no pan)", if panned == 1 { "" } else { "s" })); }
+    if panned > 0 { report.push(format!("{panned} insert pan{} imported as bus balance", if panned == 1 { "" } else { "s" })); }
     report.push("faders are FL's value / 12800 as linear gain: FL's fader law is not linear, so levels are close, not exact".into());
     if !missing.is_empty() { report.push(format!("media not found beside the project: {}", missing.join(", "))); }
     Ok(Imported { project: p, rack, report })
@@ -603,7 +632,7 @@ mod tests {
                 {"iid": 1, "name": "Drums", "volume": 12800, "routes": [{"to": 0, "level": 12800}, {"to": 3, "level": 6400}, {"to": 5, "level": 12800}, {"to": 4, "level": 0}],
                  "slots": [{"plugin": "Fruity Parametric EQ 2"}, {"plugin": "Soundgoodizer"}]},
                 {"iid": 2, "name": "Vox bus", "volume": 6400, "pan": -800, "routes": [{"to": 4, "level": 12800}, {"to": 3, "level": 3200}],
-                 "slots": [{"plugin": "Pitcher"}, {"plugin": "Fruity Wrapper", "name": "Neutron 3"}, {"plugin": "Fruity Chorus"}]},
+                 "slots": [{"plugin": "Pitcher"}, {"plugin": "Fruity Wrapper", "name": "Ozone 8 Exciter"}, {"plugin": "Fruity Chorus"}]},
                 {"iid": 3, "name": "Verb send", "routes": [{"to": 0, "level": 12800}], "slots": [{"plugin": "Fruity Reeverb 2"}]},
                 {"iid": 4, "name": "Vocal group", "routes": [{"to": 0, "level": 12800}]},
                 {"iid": 5, "name": "Meter", "routing_known": true, "routes": []}
@@ -703,7 +732,8 @@ mod tests {
         let by = |n: &str| p.busses.values().find(|b| b.name == n).unwrap_or_else(|| panic!("no bus {n}: {:?}", p.busses.values().map(|b| &b.name).collect::<Vec<_>>()));
         let (drums, vox, verb, group) = (by("Drums"), by("Vox bus"), by("Verb send"), by("Vocal group"));
         let master = by("Master");
-        assert_eq!(master.chain.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), vec!["limiter"], "FL's master chain, Ozone left out");
+        assert_eq!(master.chain.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), vec!["limiter", "multiband"],
+                   "FL's master chain, the Ozone suite as a multiband stage");
         assert_eq!(drums.parent, Some(master.id), "feeds the master");
         let meter = by("Meter");
         assert!(meter.silent, "routing known, no route out: silent in FL, silent here");
@@ -722,7 +752,8 @@ mod tests {
         assert!(r.contains("routing: 1 bus output into another bus, 3 sends"), "{r}");
         assert!(r.contains("Vocal group ducks under Drums"), "{r}");
         assert!(r.contains("imported silent: Meter"), "{r}");
-        assert!(r.contains("1 insert pan not imported"), "{r}");
+        assert!(r.contains("1 insert pan imported as bus balance"), "{r}");
+        assert!((p.bus_pans[&vox.id] + 0.125).abs() < 1e-6, "-800 of 6400: an eighth left, {:?}", p.bus_pans);
     }
 
     #[test]
@@ -731,15 +762,17 @@ mod tests {
         let p = &im.project;
         let vox = p.busses.values().find(|b| b.name == "Vox bus").expect("a bus per used insert");
         assert!((vox.gain - 0.5).abs() < 1e-6);
-        assert_eq!(vox.chain.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), vec!["autotune"]);
+        assert_eq!(vox.chain.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), vec!["autotune", "saturation"],
+                   "a VST by its slot name: the Ozone exciter as saturation");
+        assert!((vox.chain[1].params["drive"] - 0.15).abs() < 1e-6, "gentle, not the full drive");
         let drums = p.busses.values().find(|b| b.name == "Drums").unwrap();
         assert_eq!(drums.chain.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), vec!["eq", "multiband"]);
         let vt = p.tracks.iter().find(|t| t.name == "Vocals").unwrap();
         assert_eq!(vt.route, Some(vox.id));
         let r = im.report.join("\n");
-        assert!(r.contains("Neutron 3") && r.contains("Fruity Chorus"), "{r}");
+        assert!(r.contains("Ozone 8 Exciter: approximate") && r.contains("Fruity Chorus"), "{r}");
         assert!(r.contains("Soundgoodizer: approximate"), "{r}");
-        assert!(r.contains("master: FL's master insert is the bus \"Master\" (chain: limiter)"), "{r}");
+        assert!(r.contains("master: FL's master insert is the bus \"Master\" (chain: limiter -> multiband)"), "{r}");
         assert!(!r.contains("refused by the model"), "{r}");
     }
 }

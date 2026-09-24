@@ -113,7 +113,8 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// file with an empty path: "missing or undecodable", silent (found when an
 /// FL import saved 51 pattern sources and reopened with 51 missing). A shape
 /// change, so a bump: tag 0 File, 1 Pattern (u64 pattern, str name).
-pub const WIRE_VERSION: u8 = 20;
+/// v21: `Op::SetBusPan` (tag 47) -- Studio's first pan in the timeline mix.
+pub const WIRE_VERSION: u8 = 21;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -560,6 +561,7 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
         Op::SetBusFlags { id, muted } => { put_u8(o, 17); put_u64(o, id.0); put_u8(o, *muted as u8); }
         Op::SetBusSilent { id, silent } => { put_u8(o, 45); put_u64(o, id.0); put_u8(o, *silent as u8); }
         Op::SetSourcePath { id, path } => { put_u8(o, 46); put_u64(o, id.0); put_str(o, path); }
+        Op::SetBusPan { id, pan } => { put_u8(o, 47); put_u64(o, id.0); put_f32(o, *pan); }
         Op::SetBusChain { id, chain } => { put_u8(o, 14); put_u64(o, id.0); put_effects(o, chain); }
         Op::SetBusSends { id, sends } => { put_u8(o, 15); put_u64(o, id.0); put_sends(o, sends); }
         Op::SetRoute { track, bus } => { put_u8(o, 16); put_u64(o, track.0); put_opt_bus_id(o, *bus); }
@@ -780,6 +782,7 @@ fn get_op(r: &mut R) -> Option<Op> {
         }
         45 => Op::SetBusSilent { id: BusId(r.u64()?), silent: r.u8()? != 0 },
         46 => Op::SetSourcePath { id: SourceId(r.u64()?), path: r.str()? },
+        47 => Op::SetBusPan { id: BusId(r.u64()?), pan: r.f32()? },
         44 => Op::SetClipFade {
             id: ClipId(r.u64()?),
             fade_in: Ticks(r.i64()?),
@@ -1601,7 +1604,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 20, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 21, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]

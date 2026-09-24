@@ -320,6 +320,23 @@ fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
                 s.edit(studio_core::Op::SetBusGain { id: b.id, gain: shown }, "bus gain");
             }
             automate_menu(&resp, s, studio_core::AutoTarget::BusGain(b.id));
+            // PAN: a balance (see Project::bus_pans). One edit on release,
+            // like the faders; a double-click centres it.
+            let cur = s.session.doc.project.bus_pans.get(&b.id).copied().unwrap_or(0.0);
+            let key = egui::Id::new(("bus-pan", b.id.0));
+            let mut pan = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(cur);
+            let presp = ui.add(egui::Slider::new(&mut pan, -1.0..=1.0).text("pan")
+                .custom_formatter(|v, _| if v.abs() < 0.005 { "C".into() }
+                                  else if v < 0.0 { format!("L{:.0}", -v * 100.0) } else { format!("R{:.0}", v * 100.0) }));
+            if presp.double_clicked() {
+                ui.data_mut(|d| d.remove::<f32>(key));
+                s.edit(studio_core::Op::SetBusPan { id: b.id, pan: 0.0 }, "bus pan centred");
+            } else if presp.dragged() {
+                ui.data_mut(|d| d.insert_temp(key, pan));
+            } else if presp.drag_stopped() || presp.changed() {
+                ui.data_mut(|d| d.remove::<f32>(key));
+                s.edit(studio_core::Op::SetBusPan { id: b.id, pan }, "bus pan");
+            }
             ui.label("→");
             let parent_label = b.parent
                 .and_then(|p| busses.iter().find(|x| x.id == p))

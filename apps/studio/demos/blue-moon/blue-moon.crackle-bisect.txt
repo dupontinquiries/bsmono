@@ -8,3 +8,4 @@ done
 full-v4                peak   0.97  clicks    3  first: [0.17, 1.36, 1.87]
 v4-no-duck             peak   0.97  clicks    0  first: []
 done
+files-only-declicked   peak   2.57  clicks    6  first: [1.35, 1.86, 11.07, 12.26, 15.34, 16.52]

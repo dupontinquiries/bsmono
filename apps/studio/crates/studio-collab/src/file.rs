@@ -105,6 +105,16 @@ pub fn snapshot(project: &Project) -> Vec<Op> {
     for c in project.clips.values() {
         ops.push(Op::AddClip { clip: c.clone() });
     }
+    for (id, pan) in &project.bus_pans {
+        ops.push(Op::SetBusPan { id: *id, pan: *pan });
+    }
+    // Clip fades. Never emitted until c20: every fade was lost on save and
+    // reopen, and on a peer's join (which catches up from this snapshot) --
+    // found when an FL import's 3 ms declick fades never reached a render made
+    // from the saved file. After the clips, which they name.
+    for (id, (fi, fo)) in &project.fades {
+        ops.push(Op::SetClipFade { id: *id, fade_in: *fi, fade_out: *fo });
+    }
     // Automation lanes, as the ops that place their points — before the
     // relock, because a locked track refuses its lane the way it refuses
     // its fader, and a save that silently dropped a locked track's ride
@@ -650,5 +660,27 @@ mod source_kind_tests {
         let back = SaveFile::decode(&bytes).expect("a v19 file opens").to_project();
         assert_eq!(back.sources.len(), 2);
         assert_eq!(back.sources[&SourceId(8)].path, "vox.opus");
+    }
+}
+
+#[cfg(test)]
+mod fade_save_tests {
+    use super::*;
+    use studio_core::{Clip, ClipId, Op, Project, Source, SourceId, Ticks, Track, TrackId, TrackKind};
+
+    #[test]
+    fn clip_fades_survive_a_save() {
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "a".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+        p.apply(&Op::AddSource { source: Source::file(SourceId(1), "a.opus", Ticks::from_seconds(5.0), 48_000, 1, false) }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO,
+            len: Ticks::from_seconds(4.0), gain: 1.0, effects: vec![] } }).unwrap();
+        p.apply(&Op::SetClipFade { id: ClipId(1), fade_in: Ticks::from_seconds(0.003), fade_out: Ticks::from_seconds(1.5) }).unwrap();
+        p.apply(&Op::AddBus { bus: studio_core::Bus { id: studio_core::BusId(3), name: "b".into(), parent: None, gain: 1.0,
+            chain: vec![], sends: vec![], muted: false, silent: false } }).unwrap();
+        p.apply(&Op::SetBusPan { id: studio_core::BusId(3), pan: -0.25 }).unwrap();
+        let back = SaveFile::decode(&SaveFile::from_project(&p, Vec::new(), None).encode()).unwrap().to_project();
+        assert_eq!(back.fades, p.fades, "the fades came back");
+        assert_eq!(back.bus_pans, p.bus_pans, "and the bus pan");
     }
 }

@@ -92,6 +92,7 @@ impl Command {
                 Op::AddBus { .. } => CommandKind::EditAddBus,
                 Op::RemoveBus { .. } => CommandKind::EditRemoveBus,
                 Op::SetBusGain { .. } => CommandKind::EditSetBusGain,
+                Op::SetBusPan { .. } => CommandKind::EditSetBusPan,
                 Op::SetBusFlags { .. } => CommandKind::EditSetBusFlags,
                 Op::SetBusSilent { .. } => CommandKind::EditSetBusSilent,
                 Op::SetSourcePath { .. } => CommandKind::EditRelinkSource,
@@ -196,6 +197,7 @@ pub enum CommandKind {
     EditRemoveBus,
     EditSetTrackGain,
     EditSetBusGain,
+    EditSetBusPan,
     EditSetBusFlags,
     /// See `studio_core::Bus::silent`: a bus that renders and then feeds
     /// nothing, so it can be read as a control signal.
@@ -268,6 +270,7 @@ impl CommandKind {
         CommandKind::EditRemoveBus,
         CommandKind::EditSetTrackGain,
         CommandKind::EditSetBusGain,
+        CommandKind::EditSetBusPan,
         CommandKind::EditSetBusFlags,
         CommandKind::EditSetBusSilent,
         CommandKind::EditRelinkSource,
@@ -337,6 +340,7 @@ pub static COMMAND_TABLE: &[CommandSpec] = &[
     CommandSpec { kind: CommandKind::EditRemoveBus, name: "remove bus", phrases: &["delete this bus", "remove the bus"], destructive: true },
     CommandSpec { kind: CommandKind::EditSetTrackGain, name: "set track gain", phrases: &["turn up the track", "turn down the track", "fader"], destructive: false },
     CommandSpec { kind: CommandKind::EditSetBusGain, name: "set bus gain", phrases: &["turn up the bus", "turn down the bus"], destructive: false },
+    CommandSpec { kind: CommandKind::EditSetBusPan, name: "set bus pan", phrases: &["pan the bus left", "pan the bus right", "centre the bus"], destructive: false },
     CommandSpec { kind: CommandKind::EditSetBusFlags, name: "set bus flags", phrases: &["mute the bus", "unmute the bus"], destructive: false },
     CommandSpec { kind: CommandKind::EditSetBusSilent, name: "set bus silent", phrases: &["make this a control channel", "silence this bus but keep it", "use this as a dummy channel"], destructive: false },
     CommandSpec { kind: CommandKind::EditRelinkSource, name: "relink media", phrases: &["relink the media", "point this at the originals", "find the moved files"], destructive: false },

@@ -1160,6 +1160,12 @@ pub fn mixdown_into(
         } else {
             for s in buf.iter_mut() { *s *= bus.gain; }
         }
+        // PAN, as a balance on the stereo bus, with the fader (pre-fader
+        // sends heard it before either, as a desk's do)
+        if let Some(pan) = project.bus_pans.get(&id) {
+            let (gl, gr) = studio_core::balance_gains(*pan);
+            for fr in buf.chunks_exact_mut(2) { fr[0] *= gl; fr[1] *= gr; }
+        }
 
         if key_ids.contains(&id) { keys.insert(id, buf.clone()); }
         // A silent bus stops here: it has been summed, processed and faded
@@ -3108,6 +3114,20 @@ mod duck_tests {
         assert!(db(under, d_under) < -9.0, "ducked on the hit: {:.1} dB", db(under, d_under));
         assert!(db(between, d_between) > -1.0, "back between hits: {:.1} dB", db(between, d_between));
         }
+    }
+
+    /// Bus pan is a balance: hard left silences the right side and leaves the
+    /// left exactly as it was; centre changes nothing.
+    #[test]
+    fn a_bus_panned_hard_left_keeps_its_left_and_loses_its_right() {
+        let (mut p, audio) = project(false);
+        let centre = mixdown(&p, &audio, &BTreeMap::new(), s(0.40), s(0.48), 48_000, &[], &[]);
+        p.apply(&Op::SetBusPan { id: BusId(1), pan: -1.0 }).unwrap();
+        let left = mixdown(&p, &audio, &BTreeMap::new(), s(0.40), s(0.48), 48_000, &[], &[]);
+        let (l0, l1): (Vec<f32>, Vec<f32>) = (centre.iter().step_by(2).copied().collect(), left.iter().step_by(2).copied().collect());
+        assert_eq!(l0, l1, "the near side is untouched");
+        assert!(left.iter().skip(1).step_by(2).all(|x| *x == 0.0), "the far side is gone");
+        assert!(centre.iter().skip(1).step_by(2).any(|x| *x != 0.0), "and was there at centre");
     }
 
     #[test]

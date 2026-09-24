@@ -21,6 +21,7 @@ fn main() {
     let path = std::path::PathBuf::from(&a[1]);
     let opt = |k: &str| a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).cloned();
     let bypass: Vec<String> = opt("--bypass").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default();
+    let t_load = std::time::Instant::now();
     let save = studio_collab::file::SaveFile::decode(&std::fs::read(&path).unwrap()).expect("project");
     let mut rack = save.rack.clone().unwrap_or_else(studio_live::Rack::trap_kit);
     let mut project = save.to_project();
@@ -47,6 +48,8 @@ fn main() {
     let rate = 48_000;
     let end = opt("--to").and_then(|v| v.parse().ok()).map(studio_core::Ticks::from_seconds).unwrap_or(project.duration());
     let mut out = std::io::BufWriter::new(std::fs::File::create(&a[2]).unwrap());
+    let load_s = t_load.elapsed().as_secs_f64();
+    let t_mix = std::time::Instant::now();
     let mut cache = studio_audio::EffectCache::new();
     let start = opt("--from").and_then(|v| v.parse().ok()).map(studio_core::Ticks::from_seconds).unwrap_or(studio_core::Ticks::ZERO);
     let (mut t, step, mut peak) = (start, studio_core::Ticks::from_seconds(5.0), 0.0f32);
@@ -58,4 +61,7 @@ fn main() {
         eprint!("\r{:.0} / {:.0} s", t.to_seconds(), end.to_seconds());
     }
     eprintln!("\npeak {:.2} ({:+.1} dBFS)", peak, 20.0 * peak.max(1e-9).log10());
+    let (mix_s, song_s) = (t_mix.elapsed().as_secs_f64(), end.saturating_sub(start).to_seconds());
+    eprintln!("timing: load {load_s:.1} s (decode + patterns), mix {mix_s:.1} s for {song_s:.1} s of song = {:.2}x real time",
+              song_s / mix_s.max(1e-9));
 }

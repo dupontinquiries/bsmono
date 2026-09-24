@@ -3,20 +3,20 @@ Nifty w Allie - 2021-May-02_3 #2: a Fruity Slicer -- plays its whole recording f
 Nifty w Allie - 2021-May-02_3 #3: a Fruity Slicer -- plays its whole recording from each note; the slice map is not in the dump
 10 plugin synths cannot be hosted and their sound is not in the file -- STAND-INS, notes kept: FL Keys (FL Keys) -> Sine; Omnisphere (VST) -> Sine; Omnisphere #4 (VST) -> Sine; Omnisphere #3 (VST) -> Sine; Omnisphere #5 (VST) -> Sine; Omnisphere #6 (VST) -> Sine; Omnisphere #7 (VST) -> Sine; Omnisphere #12 (VST) -> Sine; Omnisphere #11 (VST) -> Sine; Omnisphere #9 (VST) -> Sine
 patterns are on 16th steps: 122 notes off the grid moved to the nearest step, 16 hits landed on an already-set step (merged)
-master: FL's master insert is the bus "Master" (chain: limiter -> limiter -> limiter); every bus that fed it feeds this
+master: FL's master insert is the bus "Master" (chain: limiter -> compressor -> multiband -> multiband -> limiter -> limiter); every bus that fed it feeds this
 SIDECHAIN (FL's level-0 routes) as a duck keyed by the source: B ducks under Kck, 0808 ducks under Kck -- at Studio's defaults (threshold -24 dB, depth 10 dB, attack 5 / release 150 ms): FL's compressor settings on the destination are not decoded
 6 clips overlapped another on its FL track (FL allows it) -- moved to an overflow track, marked (2)
 70 audio clips declicked: 3 ms fades at each edge, as FL does by default
 37 automation clips not imported (their points are not read yet)
-effects read or approximated: Pitcher on KVocal: key D major / B minor (read from Pitcher's note switches); speed 35 ms, a hard hold (INFERRED from Pitcher's knob 0.913); Pitcher on AllieBGV: key D major / B minor (read from Pitcher's note switches); speed 12 ms, a hard hold (INFERRED from Pitcher's knob 0.970); Pitcher on VMainChorus: key D major / B minor (read from Pitcher's note switches); speed 154 ms, sliding into each note (INFERRED from Pitcher's knob 0.615); Fruity Balance: exact kind (pan not kept); Pitcher on Insert 8: key D major / B minor (read from Pitcher's note switches); speed 0 ms, a hard hold (INFERRED from Pitcher's knob 1.000); Soundgoodizer: approximate: Soundgoodizer is a Maximus preset
+effects read or approximated: Neutron 3: approximate: Neutron's channel strip as a compressor; Ozone 8: approximate: the whole Ozone suite as a multiband stage; Pitcher on KVocal: key D major / B minor (read from Pitcher's note switches); speed 35 ms, a hard hold (INFERRED from Pitcher's knob 0.913); Pitcher on AllieBGV: key D major / B minor (read from Pitcher's note switches); speed 12 ms, a hard hold (INFERRED from Pitcher's knob 0.970); Pitcher on VMainChorus: key D major / B minor (read from Pitcher's note switches); speed 154 ms, sliding into each note (INFERRED from Pitcher's knob 0.615); Fruity Balance: exact kind (pan not kept); Pitcher on Insert 8: key D major / B minor (read from Pitcher's note switches); speed 0 ms, a hard hold (INFERRED from Pitcher's knob 1.000); Soundgoodizer: approximate: Soundgoodizer is a Maximus preset
 autotune on KVocal tunes: Nifty4 - 2021-May-02_8, Nifty4 - 2021-May-02_8 (2), Nifty4 - 2021-May-02_9, Nifty4 - 2021-May-02_9 (2)
 autotune on AllieBGV tunes: Nifty4 - 2021-May-02_10
 autotune on VMainChorus tunes: Chop, Chop (2), Nifty4 - 2021-May-02_6, Nifty4 - 2021-May-02_6 (2), Nifty4 - 2021-May-02_5
 autotune on Insert 8 tunes: Omnisphere #4, Omnisphere #2
-every mapped effect is at Studio's DEFAULT settings -- the plugin parameters are not decoded
-effects with no Studio counterpart, left out: Control Surface, Edison, Fruity Chorus x3, Fruity Peak Controller x2, Fruity Stereo Enhancer x4, Neutron 3 x5, Ozone 8 x14, Vocal Doubler x2
+mapped effects start at Studio's defaults (the approximated iZotope ones at a gentle setting) -- the plugins' own parameters are not decoded
+effects with no Studio counterpart, left out: Control Surface, Edison, Fruity Chorus x3, Fruity Peak Controller x2, Fruity Stereo Enhancer x4, Vocal Doubler x2
 silent in FL (no route out), imported silent: LowMeter
 routing: 12 busses output into another bus, 4 sends at FL's send levels; the rest feed the master
-2 insert pans not imported (Studio busses have no pan)
+2 insert pans imported as bus balance
 faders are FL's value / 12800 as linear gain: FL's fader law is not linear, so levels are close, not exact
 media: 25 files as Opus (the .wav names FL used map to the .opus beside them)
