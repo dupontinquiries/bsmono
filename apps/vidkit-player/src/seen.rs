@@ -113,6 +113,15 @@ pub struct Index {
 }
 
 impl Index {
+    /// Every watched title's meta, without loading transcripts.
+    pub fn metas(dir: &Path) -> Vec<Meta> {
+        let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+        rd.flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("meta"))
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok().and_then(|t| Meta::from_line(&t)))
+            .collect()
+    }
+
     pub fn load(dir: &Path) -> Self {
         let mut videos = Vec::new();
         let Ok(rd) = std::fs::read_dir(dir) else { return Self::default() };

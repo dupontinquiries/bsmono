@@ -27,7 +27,11 @@ use vidkit_core::traits::MediaSource;
 use vidkit_egui::{bottom_bar, next_fit, EguiPresenter, Fit, Transport, VideoView};
 
 mod filepick;
+#[cfg(feature = "bscale")]
+mod analysis;
 mod audio_out;
+mod gpu_selftest;
+mod enhance_plan;
 mod decode;
 mod export;
 mod media_cache;
@@ -168,6 +172,14 @@ struct Player {
     /// Picture-in-picture: the video floats, the chapters take the screen.
     pip: vidkit_egui::Pip,
     pip_on: bool,
+    /// Enhancement: what analysis learned about the title playing (None =
+    /// not analysed, so not enhanced), the plan in force and the output size
+    /// it was made for.
+    enh_facts: Option<enhance_plan::TitleFacts>,
+    enh_plan: Option<enhance_plan::Plan>,
+    enh_px: (u32, u32),
+    analysis_status: Arc<Mutex<String>>,
+    analysis_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 const SPEED_SETTLE: Duration = Duration::from_millis(250);
@@ -335,6 +347,11 @@ impl Player {
             seen_hits: Vec::new(),
             pip: Default::default(),
             pip_on: false,
+            enh_facts: None,
+            enh_plan: None,
+            enh_px: (0, 0),
+            analysis_status: Arc::new(Mutex::new(String::new())),
+            analysis_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         // A file named on the command line gets its transcript too.
         if let Some(p) = me.path.clone().filter(|_| me.engine.is_some()) {
@@ -595,6 +612,7 @@ impl eframe::App for Player {
         self.sections_tick(ctx);
         self.follow_shell_colours(ctx);
 
+        let mut want_analysis = false;
         egui::TopBottomPanel::top("what").show(ctx, |ui| match &self.opened {
             Some(Err(e)) => {
                 ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
@@ -617,6 +635,13 @@ impl eframe::App for Player {
                     if ui.selectable_label(self.subtitles, "CC").on_hover_text("subtitles from the transcript").clicked() {
                         self.subtitles = !self.subtitles;
                     }
+                    let running = self.analysis_running.load(std::sync::atomic::Ordering::Relaxed);
+                    if ui.selectable_label(running, "Analyse").on_hover_text("bscale analysis of watched titles, within a time budget; only analysed titles are enhanced").clicked() && !running {
+                        want_analysis = true;
+                    }
+                    if let Some(p) = &self.enh_plan {
+                        ui.small(format!("enhance: {:?}", p.tier)).on_hover_text(p.reason.clone());
+                    }
                     if ui.selectable_label(self.pip_on, "PiP").on_hover_text("float the video over the chapters; drag it off the side to hide it").clicked() {
                         self.pip_on = !self.pip_on;
                         self.pip.unhide();
@@ -627,6 +652,9 @@ impl eframe::App for Player {
                 ui.small("test pattern — pass a .mp4 or .webm to open one");
             }
         });
+        if want_analysis {
+            self.start_analysis();
+        }
 
         // After the top bar, so the panel sits beside the picture rather than
         // claiming the full window height and pushing its strip under the bar.
@@ -657,6 +685,8 @@ impl eframe::App for Player {
                     self.view.fit,
                 );
                 if r.width() > 0.0 {
+                    let ppp = ui.ctx().pixels_per_point();
+                    self.apply_enhance(((r.width() * ppp) as u32, (r.height() * ppp) as u32));
                     ui.painter().add(vidkit_egui::glow_present::callback(r, gpu));
                 }
                 return;
@@ -1057,6 +1087,15 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    if first.as_deref() == Some("--gpu-selftest") {
+        let opts = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default().with_inner_size([200.0, 140.0]),
+            renderer: eframe::Renderer::Glow,
+            ..Default::default()
+        };
+        return eframe::run_native("vidkit gpu selftest", opts, Box::new(|cc| Ok(Box::new(gpu_selftest::SelfTest::new(cc)))));
+    }
+
     // `--clipboard`: the palette's "Play from clipboard", at launch. On a phone
     // that is one tap on a launcher shortcut -- copy a video in the file
     // manager or a link in the browser, tap "Play copied video" -- instead of
@@ -1402,6 +1441,10 @@ impl Player {
         let factory = factory.unwrap_or_else(|| transcribe::source_factory(file));
         self.worker = Some(transcribe::Worker::start(factory, audio, total, cache));
         self.reset_sections();
+        // Enhancement only for titles analysis has looked at.
+        self.enh_facts = seen::dir().and_then(|d| enhance_plan::load_facts(&d, &url));
+        self.enh_plan = None;
+        self.enh_px = (0, 0);
     }
 
     fn reset_sections(&mut self) {
@@ -1744,6 +1787,111 @@ impl Player {
                 self.gpu_error = Some("video hidden — the sound carries on; tap the tab to bring it back".into());
             }
             Some(vidkit_egui::PipAction::Unhide) | None => {}
+        }
+    }
+}
+
+impl Player {
+    /// Plan for this title at this output size, and hand it to the GPU.
+    /// Recomputed only when the size changes: the plan is pure and cheap,
+    /// but not free every frame.
+    fn apply_enhance(&mut self, px: (u32, u32)) {
+        if px == self.enh_px && (self.enh_plan.is_some() || self.enh_facts.is_none()) {
+            return;
+        }
+        self.enh_px = px;
+        let enhance = match &self.enh_facts {
+            Some(f) => {
+                let phone = decode::machine().kind == decode::MachineKind::QualcommVenus;
+                let plan = enhance_plan::plan_title(f, &enhance_plan::Device::default_for(phone, px.0, px.1));
+                let e = plan.enhance;
+                self.enh_plan = Some(plan);
+                e
+            }
+            None => {
+                self.enh_plan = None;
+                vidkit_egui::glow_present::Enhance::default()
+            }
+        };
+        if let Some(g) = &self.gpu {
+            if let Ok(mut g) = g.lock() {
+                g.enhance = enhance;
+            }
+        }
+    }
+
+    /// Analysis mode: rank watched titles that can be read without the
+    /// network, analyse the best ones within the time budget, store facts.
+    fn start_analysis(&mut self) {
+        #[cfg(not(feature = "bscale"))]
+        {
+            self.gpu_error = Some("this build has no bscale analysis (feature `bscale`)".into());
+        }
+        #[cfg(feature = "bscale")]
+        {
+            use std::sync::atomic::Ordering;
+            let Some(dir) = seen::dir() else { return };
+            let (status, running, done_msg) = (self.analysis_status.clone(), self.analysis_running.clone(), self.export_status.clone());
+            running.store(true, Ordering::Relaxed);
+            let cap = self.settings.quality.max_long_edge();
+            let screen = (1920u32, 1080u32);
+            let budget = Duration::from_secs(std::env::var("VIDKIT_ANALYSIS_S").ok().and_then(|v| v.parse().ok()).unwrap_or(120));
+            let _ = std::thread::Builder::new().name("vidkit-analysis".into()).spawn(move || {
+                unsafe {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                }
+                let set = |m: String| {
+                    if let Ok(mut s) = status.lock() {
+                        *s = m;
+                    }
+                };
+                // Candidates: watched, playable offline, not yet analysed.
+                let root = media_cache::root();
+                let mut cands = Vec::new();
+                let mut inputs = std::collections::HashMap::new();
+                for m in seen::Index::metas(&dir) {
+                    if enhance_plan::load_facts(&dir, &m.url).is_some() {
+                        continue;
+                    }
+                    let input = match m.url.strip_prefix("file://") {
+                        Some(p) if std::path::Path::new(p).is_file() => p.to_string(),
+                        Some(_) => continue,
+                        None => match media_cache::lookup(&root, &m.url, cap) {
+                            Some(p) => p.to_string_lossy().into_owned(),
+                            None => continue,
+                        },
+                    };
+                    let Ok(pr) = decode::probe(std::path::Path::new(&input)) else { continue };
+                    let dur = decode::probe_duration(&input);
+                    inputs.insert(m.url.clone(), (input, pr.fps, dur));
+                    cands.push(enhance_plan::Candidate { key: m.url.clone(), src_w: pr.width, src_h: pr.height, watched: m.watched, duration: dur });
+                }
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                enhance_plan::rank(&mut cands, screen.0, screen.1, now);
+                let total = cands.len();
+                let (mut spent, mut done) = (Duration::ZERO, 0usize);
+                for c in &cands {
+                    if !enhance_plan::within_budget(spent, done, budget) {
+                        break;
+                    }
+                    let (input, fps, dur) = &inputs[&c.key];
+                    set(format!("analysing {}/{}: {}", done + 1, total, seen::default_title(&c.key)));
+                    match analysis::analyse(input, c.src_w, c.src_h, *fps, *dur) {
+                        Ok((facts, took)) => {
+                            spent += took;
+                            let _ = std::fs::write(enhance_plan::facts_path(&dir, &c.key), enhance_plan::facts_to_line(&facts));
+                        }
+                        Err(e) => set(format!("{}: {e}", seen::default_title(&c.key))),
+                    }
+                    done += 1;
+                }
+                let msg = format!("analysis: {done} of {total} candidate titles within {}s; only those are enhanced", budget.as_secs());
+                set(msg.clone());
+                if let Ok(mut s) = done_msg.lock() {
+                    *s = Some(msg);
+                }
+                running.store(false, Ordering::Relaxed);
+            });
         }
     }
 }

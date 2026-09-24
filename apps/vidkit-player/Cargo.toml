@@ -54,6 +54,12 @@ vidkit-relevance = { path = "../../shared/vidkit/crates/vidkit-relevance" }
 vidkit-transcribe = { path = "../../shared/vidkit/crates/vidkit-transcribe" }
 # tideshell's living palette, followed when the shell publishes it.
 ambient-palette = { path = "../../shared/ambient-palette" }
+# bscale's headless engine: stage A analysis (which blocks the CNN would
+# run on) and the reference RCAS. An app depending on an app's crate, as
+# studio does with d2x-job; the shared vidkit kits stay clear of it.
+d2x-core = { path = "../bscale/crates/d2x-core", optional = true }
+# FrameSource is written against anyhow::Result.
+anyhow = { version = "1", optional = true }
 uikit-egui = { path = "../../shared/uikit/crates/uikit-egui" }
 snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
 
@@ -61,7 +67,7 @@ snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
 # Default-on, matching the other -egui apps: `cargo build --release` in this
 # directory produces the deployable binary with no feature incantation. Off is
 # for a headless build that only wants the library half.
-default = ["app", "https", "whisper", "alsa"]
+default = ["app", "https", "whisper", "alsa", "bscale"]
 app = ["dep:eframe"]
 # HTTPS range fetching. Separate from `app` so a headless build that only wants
 # the demuxers does not pull rustls.
@@ -75,6 +81,8 @@ whisper = ["vidkit-transcribe/whisper"]
 # Needs alsa-lib headers (libasound2-dev / alsa-lib-dev). Without it, audio
 # goes through pw-play / paplay / aplay as before.
 alsa = ["dep:cpal"]
+# Analysis mode: bscale stage A per title, to budget enhancement.
+bscale = ["dep:d2x-core", "dep:anyhow"]
 
 # Monorepo-wide dev policy: full DWARF is the biggest artifact and link cost,
 # and the sandbox boxes are disk-starved.

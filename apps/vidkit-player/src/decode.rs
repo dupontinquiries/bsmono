@@ -120,6 +120,17 @@ pub fn probe_input(input: &str, headers: &[(String, String)]) -> Result<Probe, S
     parse_probe(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| format!("{input}: no video stream"))
 }
 
+/// The container's duration, if ffprobe knows it.
+pub fn probe_duration(input: &str) -> Option<Duration> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(input)
+        .output()
+        .ok()?;
+    let secs: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    (secs.is_finite() && secs > 0.0).then(|| Duration::from_secs_f64(secs))
+}
+
 /// Kept for callers that probe a URL by name.
 pub fn probe_url(url: &str, headers: &[(String, String)]) -> Result<Probe, String> {
     probe_input(url, headers)

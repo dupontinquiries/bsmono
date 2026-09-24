@@ -1,0 +1,245 @@
+//! `vidkit-player --gpu-selftest`: the video shaders, checked on the GPU.
+//!
+//! Unit tests check the shaders' Rust mirrors; nothing checked the GLSL.
+//! This renders synthetic NV12 frames through the real `Nv12Gpu` in a real
+//! GL context (any: llvmpipe under Xvfb, the phone's own driver), reads the
+//! pixels back inside the paint callback, and compares:
+//!
+//! 1. plain pass vs the CPU colour converter, on a 2-D pattern -- also pins
+//!    orientation;
+//! 2. RCAS at 1:1 vs `rcas_reference` computed on the CPU from the same
+//!    converted frame -- the offscreen pass, its orientation and the shader
+//!    arithmetic together;
+//! 3. bicubic at 2x: exact on a linear ramp (Catmull-Rom reproduces linear
+//!    functions), and overshooting a hard step, which bilinear never does.
+//!
+//! Prints one line per case and exits 0 only if all pass.
+
+use std::sync::{Arc, Mutex};
+
+use eframe::egui;
+use vidkit_core::frame::{ColorInfo, CpuPlanes, Frame, FrameData, PlaneLayout};
+use vidkit_egui::glow_present::{expected_rgb, rcas_reference, Enhance, Nv12Gpu, Scaler};
+
+fn nv12(w: u32, h: u32, y: impl Fn(u32, u32) -> u8) -> Frame {
+    let mut luma = Vec::with_capacity((w * h) as usize);
+    for yy in 0..h {
+        for x in 0..w {
+            luma.push(y(x, yy));
+        }
+    }
+    let chroma = vec![128u8; (w as usize).div_ceil(2) * 2 * (h as usize).div_ceil(2)];
+    Frame {
+        data: FrameData::Cpu(CpuPlanes { data: vec![luma, chroma], strides: vec![w, w] }),
+        width: w,
+        height: h,
+        layout: PlaneLayout::Nv12,
+        color: ColorInfo::default(),
+        pts: std::time::Duration::ZERO,
+        duration: None,
+        recycle: None,
+    }
+}
+
+struct Case {
+    name: &'static str,
+    frame: Frame,
+    enhance: Enhance,
+    /// Output size in pixels.
+    out: (u32, u32),
+    check: fn(&Frame, &[[u8; 3]], (u32, u32)) -> Result<String, String>,
+}
+
+fn luma_of(f: &Frame, x: u32, y: u32) -> u8 {
+    match &f.data {
+        FrameData::Cpu(p) => p.data[0][(y * f.width + x) as usize],
+        _ => 0,
+    }
+}
+
+fn conv(f: &Frame, x: u32, y: u32) -> [u8; 3] {
+    expected_rgb(luma_of(f, x, y), 128, 128, f.color)
+}
+
+fn max_err(a: &[[u8; 3]], b: impl Fn(usize) -> [u8; 3], skip_border: Option<(u32, u32)>) -> u8 {
+    let mut worst = 0u8;
+    for (i, px) in a.iter().enumerate() {
+        if let Some((w, h)) = skip_border {
+            let (x, y) = (i as u32 % w, i as u32 / w);
+            if x == 0 || y == 0 || x + 1 == w || y + 1 == h {
+                continue;
+            }
+        }
+        let e = b(i);
+        for c in 0..3 {
+            worst = worst.max(px[c].abs_diff(e[c]));
+        }
+    }
+    worst
+}
+
+fn check_plain(f: &Frame, got: &[[u8; 3]], (w, _h): (u32, u32)) -> Result<String, String> {
+    let worst = max_err(got, |i| conv(f, i as u32 % w, i as u32 / w), None);
+    if worst <= 2 { Ok(format!("max error {worst}/255")) } else { Err(format!("max error {worst}/255 against the CPU converter")) }
+}
+
+fn check_rcas(f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String, String> {
+    let scale = (-0.2f32).exp2();
+    let px = |x: u32, y: u32| conv(f, x, y).map(|v| v as f32 / 255.0);
+    let expect = |i: usize| {
+        let (x, y) = (i as u32 % w, i as u32 / w);
+        let o = rcas_reference(px(x, y - 1), px(x - 1, y), px(x, y), px(x + 1, y), px(x, y + 1), scale);
+        o.map(|v| (v * 255.0).round() as u8)
+    };
+    let worst = max_err(got, expect, Some((w, h)));
+    // How much sharpening happened at all: a pass that silently did nothing
+    // would match a flat reference too.
+    let moved = got.iter().enumerate().filter(|(i, p)| {
+        let (x, y) = (*i as u32 % w, *i as u32 / w);
+        x > 0 && y > 0 && x + 1 < w && y + 1 < h && p[0].abs_diff(conv(f, x, y)[0]) > 3
+    }).count();
+    if worst > 3 {
+        Err(format!("max error {worst}/255 against rcas_reference"))
+    } else if moved == 0 {
+        Err("no pixel changed: the RCAS pass did not run".into())
+    } else {
+        Ok(format!("max error {worst}/255, {moved} pixels sharpened"))
+    }
+}
+
+fn check_ramp(f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String, String> {
+    // A horizontal ramp shown at 2x: interior output pixels sit on the line
+    // through the source samples.
+    let src_w = f.width as f32;
+    let mut worst = 0.0f32;
+    for y in 2..h - 2 {
+        for x in 4..w - 4 {
+            let sx = (x as f32 + 0.5) * src_w / w as f32 - 0.5;
+            let yv = 40.0 + sx * 4.0;
+            let e = expected_rgb(yv.round() as u8, 128, 128, f.color)[0] as f32;
+            worst = worst.max((got[(y * w + x) as usize][0] as f32 - e).abs());
+        }
+    }
+    if worst <= 3.0 { Ok(format!("linear ramp reproduced within {worst:.0}/255")) } else { Err(format!("ramp off by {worst:.0}/255")) }
+}
+
+fn check_step_overshoot(f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String, String> {
+    let hi = conv(f, f.width - 1, 0)[0];
+    let lo = conv(f, 0, 0)[0];
+    let row = &got[((h / 2) * w) as usize..((h / 2 + 1) * w) as usize];
+    let (mx, mn) = (row.iter().map(|p| p[0]).max().unwrap_or(0), row.iter().map(|p| p[0]).min().unwrap_or(255));
+    if mx > hi || mn < lo {
+        Ok(format!("Catmull-Rom overshoot at the step: {mn}..{mx} beyond {lo}..{hi}"))
+    } else {
+        Err(format!("no overshoot ({mn}..{mx} within {lo}..{hi}): bicubic did not run"))
+    }
+}
+
+fn cases() -> Vec<Case> {
+    // 2-D pattern: soft diagonal field plus a bright square near the TOP-LEFT,
+    // so a vertical or horizontal flip anywhere shows as a large error.
+    let pattern = |x: u32, y: u32| {
+        if x < 12 && y < 8 && x > 3 && y > 2 { 220 } else { (40 + (x * 3 + y * 2) % 120) as u8 }
+    };
+    vec![
+        Case { name: "plain conversion", frame: nv12(64, 48, pattern), enhance: Enhance::default(), out: (64, 48), check: check_plain },
+        Case { name: "RCAS offscreen pass", frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2) }, out: (64, 48), check: check_rcas },
+        Case { name: "bicubic 2x on a ramp", frame: nv12(32, 16, |x, _| (40 + x * 4) as u8), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None }, out: (64, 32), check: check_ramp },
+        Case { name: "bicubic 2x on a step", frame: nv12(32, 16, |x, _| if x < 16 { 60 } else { 200 }), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None }, out: (64, 32), check: check_step_overshoot },
+    ]
+}
+
+pub struct SelfTest {
+    gpu: Option<Arc<Mutex<Nv12Gpu>>>,
+    cases: Vec<Case>,
+    at: usize,
+    shown: u32,
+    readback: Arc<Mutex<Option<Vec<[u8; 3]>>>>,
+    failed: bool,
+}
+
+impl SelfTest {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let gpu = cc.gl.as_ref().and_then(|gl| unsafe { Nv12Gpu::new(gl) }.map_err(|e| eprintln!("GPU SELFTEST: shader build failed: {e}")).ok());
+        Self { gpu: gpu.map(|g| Arc::new(Mutex::new(g))), cases: cases(), at: 0, shown: 0, readback: Arc::new(Mutex::new(None)), failed: false }
+    }
+}
+
+impl eframe::App for SelfTest {
+    // eframe 0.34 requires `ui`; the player drives everything from the
+    // deprecated `update` the same way, so this does too.
+    fn ui(&mut self, _ui: &mut egui::Ui, _f: &mut eframe::Frame) {}
+
+    #[allow(deprecated)]
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let Some(gpu) = self.gpu.clone() else {
+            println!("GPU SELFTEST FAIL: no GL context or shaders did not build");
+            std::process::exit(1);
+        };
+        if self.at >= self.cases.len() {
+            println!("GPU SELFTEST {}", if self.failed { "FAILED" } else { "PASSED" });
+            std::process::exit(if self.failed { 1 } else { 0 });
+        }
+        if let Some(px) = self.readback.lock().ok().and_then(|mut r| r.take()) {
+            let c = &self.cases[self.at];
+            match (c.check)(&c.frame, &px, c.out) {
+                Ok(m) => println!("  ok   {:<24} {m}", c.name),
+                Err(m) => {
+                    println!("  FAIL {:<24} {m}", c.name);
+                    self.failed = true;
+                }
+            }
+            self.at += 1;
+            self.shown = 0;
+            ctx.request_repaint();
+            return;
+        }
+        let c = &self.cases[self.at];
+        if self.shown == 0 {
+            if let (Ok(mut g), Some(gl)) = (gpu.lock(), frame.gl()) {
+                if let Err(e) = unsafe { g.upload(gl, &c.frame) } {
+                    println!("GPU SELFTEST FAIL: upload: {e}");
+                    std::process::exit(1);
+                }
+                g.enhance = c.enhance;
+            }
+        }
+        self.shown += 1;
+        let ppp = ctx.pixels_per_point();
+        let (w, h) = c.out;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let r = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(w as f32 / ppp, h as f32 / ppp));
+            let (g2, rb, grab) = (gpu.clone(), self.readback.clone(), self.shown >= 2);
+            ui.painter().add(egui::PaintCallback {
+                rect: r,
+                callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |info, painter| {
+                    let vp = info.viewport_in_pixels();
+                    let gl = painter.gl();
+                    if let Ok(mut g) = g2.lock() {
+                        unsafe { g.paint(gl, (vp.width_px, vp.height_px)) };
+                    }
+                    if grab {
+                        use eframe::glow::HasContext;
+                        let (vw, vh) = (vp.width_px, vp.height_px);
+                        let mut buf = vec![0u8; (vw * vh * 4) as usize];
+                        unsafe {
+                            gl.read_pixels(vp.left_px, vp.from_bottom_px, vw, vh, eframe::glow::RGBA, eframe::glow::UNSIGNED_BYTE, eframe::glow::PixelPackData::Slice(Some(&mut buf)));
+                        }
+                        // GL rows are bottom-up; the checks are top-down.
+                        let mut out = Vec::with_capacity((vw * vh) as usize);
+                        for row in (0..vh).rev() {
+                            for x in 0..vw {
+                                let i = ((row * vw + x) * 4) as usize;
+                                out.push([buf[i], buf[i + 1], buf[i + 2]]);
+                            }
+                        }
+                        if let Ok(mut r) = rb.lock() {
+                            *r = Some(out);
+                        }
+                    }
+                })),
+            });
+        });
+        ctx.request_repaint();
+    }
+}
