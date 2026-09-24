@@ -78,7 +78,23 @@ HITS="${LOG%.log}.hits"
 MARKS="${LOG%.log}.marks"
 READER_PID=""
 
-now_ns() { date +%s%N 2>/dev/null || echo 0; }
+# Pick a nanosecond-ish clock once. Only differences are ever used, so a
+# monotonic source is fine and preferable.
+if [ "$(date +%s%N 2>/dev/null | tr -dc 'N')" = "" ] && [ -n "$(date +%s%N 2>/dev/null)" ]; then
+    TIMER=date
+elif [ -r /proc/uptime ]; then
+    TIMER=uptime          # 10 ms resolution, monotonic
+else
+    TIMER=seconds
+fi
+
+now_ns() {
+    case "$TIMER" in
+        date)   date +%s%N ;;
+        uptime) awk '{ printf "%.0f", $1 * 1000000000 }' /proc/uptime ;;
+        *)      echo "$(date +%s)000000000" ;;
+    esac
+}
 
 start_listening() {
     # -r is not enough: /dev/tty exists but fails to open when there is no
@@ -131,8 +147,18 @@ find_subdev() {
 }
 
 limits() { # min and max from the driver, not assumed
+    # Plain assignments in their own statements: busybox awk rejects the
+    # `sub(...) && var=x` form outright and then runs nothing at all.
     $SUDO v4l2-ctl -d "$SUBDEV" --list-ctrls 2>/dev/null \
-      | awk -v c="$CTRL" '$1 == c { for (i=1;i<=NF;i++) { if ($i ~ /^min=/) sub("min=","",$i) && m=$i; if ($i ~ /^max=/) sub("max=","",$i) && M=$i } print m, M }'
+      | awk -v c="$CTRL" '
+        $1 == c {
+            m = ""; M = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^min=/) { t = $i; sub("min=", "", t); m = t }
+                if ($i ~ /^max=/) { t = $i; sub("max=", "", t); M = t }
+            }
+            if (m != "" && M != "") { print m, M; exit }
+        }'
 }
 
 # ── the fast path ────────────────────────────────────────────────────────────
@@ -241,14 +267,13 @@ t_sweep() {
     MID=$((MAX / 2))
     for period_ms in 200 120 80 50 33 25 16 12 8; do
         step "sweep:${period_ms}ms:$AMP" "square wave, period ${period_ms} ms (~$((1000 / period_ms)) Hz), amplitude $AMP"
-        half=$(awk -v p="$period_ms" 'BEGIN { printf "%.3f", p / 2000 }')
-        cycles=$((1500 / period_ms))
+        # Through play_samples rather than a fork per edge: at 8 ms a
+        # fork-per-edge loop cannot keep the period it claims.
+        RATE=0.002; have_fast || RATE=0.02
+        n=$(awk -v p="$period_ms" -v r="$RATE" 'BEGIN { n = int(p / 1000 / r); print n < 2 ? 2 : n }')
+        reps=$((1500 / period_ms))
         i=0
-        while [ $i -lt $cycles ]; do
-            set_focus $((MID - AMP / 2)); sleep "$half"
-            set_focus $((MID + AMP / 2)); sleep "$half"
-            i=$((i + 1))
-        done
+        while [ $i -lt $reps ]; do samples square "$MID" "$AMP" "$n"; i=$((i + 1)); done | play_samples "$RATE"
         set_focus "$MID"; sleep 0.3
     done
     park
@@ -344,7 +369,8 @@ t_hold() {
 t_rate() {
     say "== rate: how fast a write actually lands. Everything else is capped"
     say "   by this number."
-    for n in 20 100; do
+    [ "$TIMER" = uptime ] && say "   (10 ms clock: using the larger batch as the real figure)"
+    for n in 20 100 400; do
         step "rate:$n" "$n alternating writes"
         start=$(date +%s%N 2>/dev/null || echo 0)
         i=0
@@ -354,7 +380,13 @@ t_rate() {
         done
         end=$(date +%s%N 2>/dev/null || echo 0)
         if [ "$start" != 0 ]; then
-            say "   $(awk -v s="$start" -v e="$end" -v n="$n" 'BEGIN { printf "%.2f ms per write, %.0f Hz ceiling", (e-s)/1e6/n, n/((e-s)/1e9) }')"
+            # A zero delta means the batch finished inside one clock tick, not
+            # that writes are free. Say which it is rather than printing inf.
+            say "   $(awk -v s="$start" -v e="$end" -v n="$n" -v tm="$TIMER" 'BEGIN {
+                d = e - s
+                if (d <= 0) { printf "under this clocks resolution (%s): try a larger batch", tm }
+                else        { printf "%.3f ms per write, %.0f Hz ceiling", d/1e6/n, n/(d/1e9) }
+            }')"
         fi
     done
     park
@@ -415,6 +447,8 @@ fi
 trap 'echo; echo "parking lens at $MIN"; stop_listening; DRY=$DRY park 2>/dev/null; report_hits; exit 130' INT TERM
 
 say "focus-probe: $SUBDEV, $CTRL range $MIN..$MAX, log $LOG"
+say "clock: $TIMER$([ "$TIMER" = seconds ] && echo ' (1 s resolution — rate figures will be useless)')"
+have_fast && say "writer: ioctl fast path (python3)" || say "writer: v4l2-ctl per sample (~50 Hz ceiling)"
 say "started $(date -Is)${DRY:+ }$([ "$DRY" = 1 ] && echo '(DRY RUN — no writes)')"
 say ""
 say "  >>> Hit ENTER every time you hear the lens. Each press is timestamped"
