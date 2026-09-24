@@ -159,6 +159,9 @@ pub struct ShellView {
     /// Grain, uploaded once. Per-frame noise would put back exactly the data
     /// movement this avoids, and would shimmer.
     grain: Option<egui::TextureHandle>,
+    /// Whether a full-screen fill is cheap here. False on llvmpipe, where
+    /// asking for 90 frames a second of a slow fade is pure heat.
+    pub accelerated: bool,
     bar_drag: f32,
     sheet: SettingsSheet,
     /// Press feedback per widget: a spring on its scale (0.94 pressed, 1.0
@@ -619,17 +622,32 @@ impl ShellView {
         if self.show_trace {
             self.trace(&p, shell, pal, origin);
         }
-        if !shell.recognizer.is_idle()
-            || shell.drawer.is_animating()
-            || shell.switcher.is_streaking()
+        // Ask for the next frame at an interval rather than immediately.
+        // The finger's own motion is never slowed — the hand can compare it
+        // against the thing it is touching — but a fade or a breath can be,
+        // and on a software rasterizer filling this many pixels that is the
+        // difference between a warm phone and a cool one.
+        use tideshell_core::paintrate::{interval_ms, Motion};
+        let tracking = !shell.recognizer.is_idle() || shell.switcher.is_streaking() || self.is_jiggling();
+        let transition = shell.drawer.is_animating()
             || shell.switcher.is_animating()
             || shell.fat.as_ref().is_some_and(|f| f.is_animating())
             || shell.sleep.is_animating()
-            || self.is_jiggling()
             || (shell.palette.is_visible() && !shell.palette.reveal.is_settled())
-            || (shell.lock.is_locked() && !shell.lock.reveal.is_settled())
-        {
-            ui.ctx().request_repaint();
+            || (shell.lock.is_locked() && !shell.lock.reveal.is_settled());
+        let motion = if tracking {
+            Motion::Tracking
+        } else if transition {
+            Motion::Transition
+        } else {
+            Motion::Still
+        };
+        if let Some(ms) = interval_ms(motion, self.accelerated) {
+            if ms == 0 {
+                ui.ctx().request_repaint();
+            } else {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(ms));
+            }
         }
         // The reduced white point, last so it veils everything drawn above.
         // A black rectangle over the whole surface: the cheapest possible

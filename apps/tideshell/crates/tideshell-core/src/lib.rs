@@ -36,6 +36,7 @@ pub mod cursor;
 pub mod dimming;
 pub mod edge;
 pub mod hold;
+pub mod paintrate;
 pub mod palette;
 pub mod lock;
 pub mod prefs;

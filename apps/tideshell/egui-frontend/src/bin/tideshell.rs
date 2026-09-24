@@ -506,6 +506,10 @@ fn main() {
         last_color_note: 0,
     };
     sb.view.camera_rot = cam_rot;
+    // Default to "accelerated" until the first paint tells us otherwise: the
+    // cost of guessing software on real hardware is a shell that feels
+    // sluggish for no reason.
+    sb.view.accelerated = true;
     sb.view.camera_mirror = cam_mount.mirror;
     sb.shell.note(tideshell_egui::devices::describe(&model, false, cam_mount));
     sb.shell.set_date(tideshell_egui::sensors::local_yday());
@@ -586,6 +590,7 @@ fn main() {
     let mut overlay_events: Vec<egui::Event> = Vec::new();
     let mut contact_pos: HashMap<i32, Pos2> = HashMap::new();
     let mut last_region: Option<Option<Vec<Rect>>> = None;
+    let mut renderer_noted = false;
     let mut last_poll = 0u64;
     // comfortgov reads the mtime of this file as "last user input".
     let hint = std::env::var_os("XDG_RUNTIME_DIR").map(|r| std::path::PathBuf::from(r).join("comfortgov.input"));
@@ -986,6 +991,15 @@ fn main() {
             });
             sb.execute(actions);
             let prims = ctx_side.tessellate(out.shapes, out.pixels_per_point);
+            if !gl.renderer.is_empty() && !renderer_noted {
+                renderer_noted = true;
+                sb.view.accelerated = tideshell_core::paintrate::accelerated_renderer(&gl.renderer);
+                sb.shell.note(format!(
+                    "renderer: {} ({})",
+                    gl.renderer,
+                    if sb.view.accelerated { "accelerated" } else { "SOFTWARE — animations are rate-limited" }
+                ));
+            }
             if let Err(e) = gl.paint(role, size_px, out.pixels_per_point, &prims, &out.textures_delta) {
                 eprintln!("tideshell: {role:?}: {e}");
             }
