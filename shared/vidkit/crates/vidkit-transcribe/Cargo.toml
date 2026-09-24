@@ -1,0 +1,21 @@
+[package]
+name = "vidkit-transcribe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Timed transcripts for vidkit: a CueSource seam (whisper, sidecar subtitles), playhead-first chunk scheduling, boundary-safe merging, and a cache format. No threads, no processes."
+
+[dependencies]
+vidkit-relevance = { path = "../vidkit-relevance" }
+# Hallucination filtering and model resolution through models-kit. Already in
+# the graph via voiced-core; zero dependencies of its own beyond models-kit.
+voice-kit = { path = "../../../voice-kit" }
+# Same major as shared/voice-engine-kit, so a machine that builds voiceterm has
+# whisper.cpp built once. Off by default: it compiles whisper.cpp with cmake,
+# which is minutes on a phone and needs libclang for bindgen.
+whisper-rs = { version = "0.16", optional = true }
+
+[features]
+default = []
+whisper = ["dep:whisper-rs"]

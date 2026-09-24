@@ -10,6 +10,8 @@ description = "egui front end for vidkit: a Presenter on an egui texture, and a 
 vidkit-core = { path = "../vidkit-core" }
 # For clipboard URL classification in the palette.
 vidkit-ytdlp = { path = "../vidkit-ytdlp" }
+# Chapter, Hit and Section for the sections panel. Pure, no dependencies.
+vidkit-relevance = { path = "../vidkit-relevance" }
 # The voice grammar/matcher, rather than a second one here.
 voiced-core = { path = "../../../voiced-core" }
 egui = "0.34"
