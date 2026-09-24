@@ -2490,6 +2490,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "speaker-pose"
+version = "0.1.0"
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2616,6 +2620,7 @@ dependencies = [
  "reis",
  "rustix 1.1.5",
  "settings-kit",
+ "speaker-pose",
  "systemcompkit",
  "tideshell-core",
  "uikit-egui",

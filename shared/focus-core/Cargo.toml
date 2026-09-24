@@ -1,0 +1,6 @@
+[package]
+name = "focus-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "policy for a voice-coil lens actuator: who may move it, how far, how often, and when it must go back to rest (pure; no I/O, no clock)"

@@ -1,0 +1,13 @@
+[package]
+name = "typein"
+version = "0.1.0"
+edition = "2021"
+description = "type text and press keys through dotool under whatever keyboard layout the compositor is using. Emacs-style control macros (C-a, M-x, C-{x c}) parsed here; layout detection and the dotool pipe are the shell around it."
+
+[lib]
+name = "typein"
+path = "src/lib.rs"
+
+[[bin]]
+name = "typein"
+path = "src/main.rs"

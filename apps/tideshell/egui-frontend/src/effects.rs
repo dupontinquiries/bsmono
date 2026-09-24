@@ -206,6 +206,7 @@ impl Executor for System {
             Action::Pointer(_) => Outcome::Unwired("EI sender not wired (needs cosmic-comp patch 0002 + reis client)"),
             Action::SetQuick(..) => Outcome::Unwired("no system backend for quick toggles yet"),
             Action::SetSlider(tideshell_core::control_center::SliderKind::Volume, v) => fade_volume(*v),
+            Action::SetSlider(tideshell_core::control_center::SliderKind::Warmth, v) => apply_warmth(*v),
             Action::SetSlider(..) => Outcome::Unwired("brightness is applied by the layer runtime"),
             Action::SetGovernor(_) => Outcome::Unwired("cpu governor: no system backend for this executor"),
             Action::DisplayPower(_) => Outcome::Unwired("display power is handled by the layer runtime"),
@@ -417,6 +418,102 @@ pub fn apply_voicing(tone: f32) -> Outcome {
     let props = tideshell_core::audio::props_text(&p);
     match Command::new("pw-cli").args(["set-param", &id.to_string(), "Props", &props]).stdin(Stdio::null()).output() {
         Ok(o) if o.status.success() => Outcome::Done(format!("voicing {tone:+.2}: hp {:.0} Hz, lp {:.0} Hz, presence {:+.1} dB, trim {:+.1} dB", p.hp_hz, p.lp_hz, p.presence_db, p.trim_db)),
+        Ok(o) => Outcome::Failed(format!("pw-cli set-param: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => Outcome::Failed(format!("pw-cli: {e}")),
+    }
+}
+
+/// Point the speaker chain's matrix at the screen's current orientation.
+///
+/// The same rotation that turns the display moves the audio, because what
+/// matters is where the listener thinks left is — and on this phone the two
+/// speakers are a top earpiece and a bottom main driver, so upright they are
+/// not a stereo pair at all and the right answer is mono into both with the
+/// bass going where bass can be made (speaker_pose::matrix_for).
+///
+/// Sent as one Props message: two gains per mixer, plus the earpiece's
+/// high-pass corner, so a rotation cannot be seen half-applied.
+pub fn apply_speaker_pose(m: &speaker_pose::Matrix, crossover_hz: f32) -> Outcome {
+    let listing = match Command::new("pw-cli").args(["ls", "Node"]).stdin(Stdio::null()).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => return Outcome::Failed(format!("pw-cli ls: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => return Outcome::Failed(format!("pw-cli: {e}")),
+    };
+    let Some(id) = parse_node_id(&listing, tideshell_core::audio::SPEAKER_SINK) else {
+        return Outcome::Unwired("speaker chain not running (set the warmth slider once to install it)");
+    };
+    let props = speaker_pose_props(m, crossover_hz);
+    match Command::new("pw-cli").args(["set-param", &id.to_string(), "Props", &props]).stdin(Stdio::null()).output() {
+        Ok(o) if o.status.success() => Outcome::Done(format!(
+            "speakers: {} (top {:.2}/{:.2}, bottom {:.2}/{:.2})",
+            if m.mono { "mono, bass to the main driver" } else { "stereo" },
+            m.top.from_left, m.top.from_right, m.bottom.from_left, m.bottom.from_right
+        )),
+        Ok(o) => Outcome::Failed(format!("pw-cli set-param: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => Outcome::Failed(format!("pw-cli: {e}")),
+    }
+}
+
+/// The Props text for a routing matrix. Gains carry the per-speaker trim,
+/// since the mixer is the only place in the graph with a level control.
+pub fn speaker_pose_props(m: &speaker_pose::Matrix, crossover_hz: f32) -> String {
+    let items: Vec<(String, f32)> = vec![
+        ("mixTop:Gain 1".into(), m.top.from_left * m.top.gain),
+        ("mixTop:Gain 2".into(), m.top.from_right * m.top.gain),
+        ("mixBot:Gain 1".into(), m.bottom.from_left * m.bottom.gain),
+        ("mixBot:Gain 2".into(), m.bottom.from_right * m.bottom.gain),
+        // The high-pass follows the SPEAKER, so it stays on the earpiece in
+        // every orientation; only its corner is configurable.
+        ("hpTop:Freq".into(), if m.top.high_pass_hz > 0.0 { m.top.high_pass_hz } else { crossover_hz }),
+    ];
+    let body: Vec<String> = items.iter().map(|(k, v)| format!("\"{k}\" {v:.4}")).collect();
+    format!("{{ params = [ {} ] }}", body.join(" "))
+}
+
+/// Where the speaker chain's config lives.
+pub fn speaker_config_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|c| c.join("pipewire/pipewire.conf.d/tideshell-speaker.conf"))
+}
+
+/// Move the speaker chain's controls. If the sink is not running, write the
+/// config and say what is missing rather than failing silently — the chain
+/// needs plugins that are not builtin (bankstown as LV2, swh-plugins for
+/// the compressor and limiter), so "not running" usually means "not
+/// installed", and that is worth saying out loud.
+pub fn apply_warmth(x: f32) -> Outcome {
+    let w = tideshell_core::audio::warmth(x);
+    let listing = match Command::new("pw-cli").args(["ls", "Node"]).stdin(Stdio::null()).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => return Outcome::Failed(format!("pw-cli ls: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => return Outcome::Failed(format!("pw-cli: {e} (PipeWire tools not installed)")),
+    };
+    let Some(id) = parse_node_id(&listing, tideshell_core::audio::SPEAKER_SINK) else {
+        return match speaker_config_path() {
+            Some(path) if path.exists() => Outcome::Failed(format!(
+                "speaker chain not running; config is at {}. It needs an LV2 bankstown bundle (lv2ls | grep bankstown) and swh-plugins, then: systemctl --user restart pipewire",
+                path.display()
+            )),
+            Some(path) => {
+                if let Some(d) = path.parent() {
+                    let _ = std::fs::create_dir_all(d);
+                }
+                match std::fs::write(&path, tideshell_core::audio::speaker_chain_config()) {
+                    Ok(()) => Outcome::Failed(format!("speaker chain installed at {}; install bankstown (LV2) and swh-plugins, then restart pipewire", path.display())),
+                    Err(e) => Outcome::Failed(format!("cannot write {}: {e}", path.display())),
+                }
+            }
+            None => Outcome::Failed("no config dir for the speaker chain".into()),
+        };
+    };
+    let props = tideshell_core::audio::warmth_props_text(&w);
+    match Command::new("pw-cli").args(["set-param", &id.to_string(), "Props", &props]).stdin(Stdio::null()).output() {
+        Ok(o) if o.status.success() => Outcome::Done(format!(
+            "warmth {x:.2}: harmonics {:.2}, compression {:.1}:1, limit {:.0} dB",
+            w.bass_amt, w.comp_ratio, w.limit_db
+        )),
         Ok(o) => Outcome::Failed(format!("pw-cli set-param: {}", String::from_utf8_lossy(&o.stderr).trim())),
         Err(e) => Outcome::Failed(format!("pw-cli: {e}")),
     }

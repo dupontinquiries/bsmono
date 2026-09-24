@@ -22,6 +22,7 @@
 //! left+right, so its configured width is the output width; the right strip
 //! is anchored top+bottom, so its height is the output height.
 
+use glow::HasContext as _;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io::Write;
@@ -1004,6 +1005,9 @@ impl Dispatch<WlTouch, ()> for State {
 /// so two surfaces sharing one Painter would mix up textures; hence a
 /// painter per role, all on the same GL context.
 pub struct Gl {
+    /// GL_RENDERER, read once. The only thing anyone asks of it is whether a
+    /// full-screen fill is cheap (paintrate::accelerated_renderer).
+    pub renderer: String,
     egl: egl::Instance<egl::Static>,
     display: egl::Display,
     config: egl::Config,
@@ -1032,7 +1036,7 @@ impl Gl {
         let context = egl
             .create_context(display, config, None, &[egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE])
             .map_err(|e| format!("eglCreateContext: {e}"))?;
-        Ok(Gl { egl, display, config, context, glow: None, surfs: HashMap::new() })
+        Ok(Gl { renderer: String::new(), egl, display, config, context, glow: None, surfs: HashMap::new() })
     }
 
     /// Bind `role`'s surface at `size_px` physical pixels, (re)creating its
@@ -1061,6 +1065,12 @@ impl Gl {
             let gl = unsafe {
                 glow::Context::from_loader_function(|name| egl.get_proc_address(name).map_or(std::ptr::null(), |p| p as *const c_void))
             };
+            // Read GL_RENDERER here, the one moment a context is current.
+            // What downstream wants is only "is a full-screen fill cheap",
+            // but the string itself is worth keeping for the trace: a shell
+            // that has silently fallen back to llvmpipe should be able to
+            // say so rather than just feeling slow.
+            self.renderer = unsafe { gl.get_parameter_string(glow::RENDERER) };
             self.glow = Some(Arc::new(gl));
         }
         let gs = self.surfs.get_mut(&role).unwrap();

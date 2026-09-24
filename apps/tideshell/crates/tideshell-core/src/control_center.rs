@@ -152,6 +152,10 @@ impl QuickKind {
 pub enum SliderKind {
     Brightness,
     Volume,
+    /// How hard the speaker chain works to fake bass: harmonics first, then
+    /// compression (audio::warmth). Not volume — this is what the speaker
+    /// does with whatever volume it is given.
+    Warmth,
 }
 
 impl SliderKind {
@@ -159,12 +163,14 @@ impl SliderKind {
         match self {
             SliderKind::Brightness => "brightness",
             SliderKind::Volume => "volume",
+            SliderKind::Warmth => "warmth",
         }
     }
     pub fn from_token(s: &str) -> Option<SliderKind> {
         match s {
             "brightness" => Some(SliderKind::Brightness),
             "volume" => Some(SliderKind::Volume),
+            "warmth" => Some(SliderKind::Warmth),
             _ => None,
         }
     }
@@ -172,6 +178,7 @@ impl SliderKind {
         match self {
             SliderKind::Brightness => "Brightness",
             SliderKind::Volume => "Volume",
+            SliderKind::Warmth => "Warmth",
         }
     }
 }
@@ -201,6 +208,9 @@ pub struct ControlCenter {
     /// `set_governor_state`), the same "reported by a backend" pattern
     /// `set_system_state` documents for the boolean tiles.
     pub governor: CpuGovernor,
+    /// Speaker warmth. Lives beside the others so one slider widget serves
+    /// all three, but it is only offered where a speaker chain exists.
+    pub warmth: f32,
 }
 
 impl Default for ControlCenter {
@@ -216,6 +226,10 @@ impl Default for ControlCenter {
             brightness: 0.6,
             volume: 0.5,
             governor: CpuGovernor::Powersave,
+            // Off by default: the speaker chain may not exist, and warmth
+            // should be something a listener turns up deliberately rather
+            // than a colouration they find already applied.
+            warmth: 0.0,
         }
     }
 }
@@ -328,6 +342,7 @@ impl ControlCenter {
         match kind {
             SliderKind::Brightness => self.brightness = v,
             SliderKind::Volume => self.volume = v,
+            SliderKind::Warmth => self.warmth = v,
         }
         Action::SetSlider(kind, v)
     }
@@ -336,6 +351,7 @@ impl ControlCenter {
         match kind {
             SliderKind::Brightness => self.brightness,
             SliderKind::Volume => self.volume,
+            SliderKind::Warmth => self.warmth,
         }
     }
 

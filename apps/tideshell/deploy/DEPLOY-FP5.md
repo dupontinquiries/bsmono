@@ -36,6 +36,8 @@ Everything for deployment is in `apps/tideshell/deploy/`:
 | `preflight.sh` | read-only phone checks, PASS/WARN/FAIL |
 | `fp5-touch-diag.sh` | which layer drops touch; edge-touch test |
 | `fp5-camera-diag.sh` | why the camera works under plasma but not cosmic, link by link |
+| `typein` (built from `tools/typein`) | type text and press keys with dotool under any keyboard layout: reads cosmic's own `xkb_config` and sets `DOTOOL_XKB_LAYOUT`, so `typein warp enter` types "warp" instead of ",apl". Emacs control macros: `C-a`, `M-x`, `C-{x c}` |
+| `focus-probe.sh` | characterise the ultra-wide's VCM: range, step size, resonance, hold current, write rate. Hit Enter when you hear it; the report says which named step made the noise |
 | `50-tideshell-powerkey.conf` | logind: short power press to the shell, long press powers off |
 | `io.rustyboard.Keyboard.service` | D-Bus activation: tideshell's keyboard toggle starts rusty-board |
 | `70-tideshell-keys.rules` | udev fallback: the keys by evdev (only without `tideshell install-keys`) |

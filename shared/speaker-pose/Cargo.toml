@@ -1,0 +1,6 @@
+[package]
+name = "speaker-pose"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "how a phone's two mismatched speakers should be driven as the screen rotates (pure; no audio, no clock)"

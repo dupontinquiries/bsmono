@@ -163,3 +163,331 @@ mod tests {
         assert!((trim - 0.708).abs() < 0.002, "-3 dB as a linear multiplier: {trim}");
     }
 }
+
+// ── warmth: the speaker slider ───────────────────────────────────────────────
+//
+// A phone speaker cannot move enough air for real bass, so two different
+// tricks are used to fake it, and they fail in opposite directions:
+//
+// * **Harmonics** (bankstown). Synthesises the overtones of a bass note the
+//   driver cannot produce; the ear infers the missing fundamental. Cheap in
+//   excursion — the driver only ever reproduces frequencies it can actually
+//   make — but overdone it sounds buzzy and hollow.
+// * **Compression**. Raises the quiet parts, so everything is closer to the
+//   loudest the speaker can manage. Makes a track feel bigger, but flattens
+//   it, and pushed hard it pumps.
+//
+// One slider, blending between them, because they are complements rather
+// than alternatives: harmonics first (free in excursion), compression
+// second (costly in dynamics).
+//
+// A LIMITER is not on the slider. It is always on and it is not optional:
+// bankstown ADDS energy, so peaks that used to sit at full scale now clip,
+// and the whole point of a bass exciter is that people then turn the volume
+// up because it sounds good. The limiter is what stops that from reaching
+// the voice coil as a square wave.
+
+/// Threshold for the always-on limiter, in dBFS.
+pub const LIMIT_DB: f32 = -1.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Warmth {
+    /// bankstown `amt`, 0..1.
+    pub bass_amt: f32,
+    /// bankstown `blend`, how much of the synthesised signal is mixed in.
+    pub bass_blend: f32,
+    /// Compressor ratio, 1.0 = off.
+    pub comp_ratio: f32,
+    /// Compressor threshold in dBFS; less negative means it acts less.
+    pub comp_threshold_db: f32,
+    /// Make-up gain, linear.
+    pub makeup: f32,
+    /// Always-on, never zero.
+    pub limit_db: f32,
+}
+
+/// The slider, 0..1. Zero is bypass — genuinely bypass, so the setting can
+/// be compared against untouched audio rather than against "a bit less".
+///
+/// The first half adds harmonics only. The second half holds harmonics near
+/// their useful maximum and brings the compressor in, because past a point
+/// more harmonics only buzz.
+pub fn warmth(x: f32) -> Warmth {
+    let x = x.clamp(0.0, 1.0);
+    let first = (x * 2.0).min(1.0);
+    let second = ((x - 0.5) * 2.0).max(0.0);
+    Warmth {
+        bass_amt: 0.75 * first,
+        bass_blend: 0.35 + 0.35 * first,
+        comp_ratio: 1.0 + 2.5 * second,
+        comp_threshold_db: -12.0 * second,
+        // Make-up follows the compression, not the harmonics: bankstown is
+        // already louder by construction.
+        makeup: 1.0 + 0.25 * second,
+        limit_db: LIMIT_DB,
+    }
+}
+
+/// bankstown's own control names, for a filter-chain node.
+pub fn bankstown_controls(w: &Warmth) -> Vec<(String, f32)> {
+    vec![
+        ("bankstown:bypass".into(), if w.bass_amt <= 0.0 { 1.0 } else { 0.0 }),
+        ("bankstown:amt".into(), w.bass_amt),
+        ("bankstown:blend".into(), w.bass_blend),
+        // The band it synthesises into, and the final high-pass that keeps
+        // sub-bass the driver cannot make out of the cone entirely.
+        ("bankstown:floor".into(), 45.0),
+        ("bankstown:ceil".into(), 180.0),
+        ("bankstown:final_hp".into(), 40.0),
+        ("bankstown:sat_second".into(), 0.3),
+        ("bankstown:sat_third".into(), 0.6),
+    ]
+}
+
+#[cfg(test)]
+mod warmth_tests {
+    use super::*;
+
+    #[test]
+    fn zero_is_a_real_bypass() {
+        let w = warmth(0.0);
+        assert_eq!(w.bass_amt, 0.0);
+        assert_eq!(w.comp_ratio, 1.0, "no compression either");
+        assert_eq!(bankstown_controls(&w)[0], ("bankstown:bypass".to_string(), 1.0));
+    }
+
+    #[test]
+    fn harmonics_come_first_and_compression_second() {
+        let lo = warmth(0.25);
+        let mid = warmth(0.5);
+        let hi = warmth(1.0);
+        assert!(lo.bass_amt > 0.0 && lo.comp_ratio == 1.0, "the cheap trick first");
+        assert!((mid.bass_amt - hi.bass_amt).abs() < 1e-6, "harmonics stop climbing past halfway");
+        assert!(hi.comp_ratio > mid.comp_ratio, "and the costly one takes over");
+        assert!(hi.comp_threshold_db < mid.comp_threshold_db);
+        // Monotonic overall, so the slider never reverses under a finger.
+        let mut prev = -1.0;
+        for i in 0..=20 {
+            let w = warmth(i as f32 / 20.0);
+            let loudness = w.bass_amt + (w.comp_ratio - 1.0);
+            assert!(loudness >= prev, "went backwards at {i}");
+            prev = loudness;
+        }
+    }
+
+    #[test]
+    fn the_limiter_is_never_off() {
+        // bankstown adds energy and people then raise the volume; without a
+        // limiter that arrives at the coil as clipping.
+        for i in 0..=10 {
+            let w = warmth(i as f32 / 10.0);
+            assert_eq!(w.limit_db, LIMIT_DB);
+            assert!(w.limit_db < 0.0);
+        }
+        assert!(warmth(2.0).bass_amt <= 0.75, "clamped");
+        assert_eq!(warmth(-1.0).bass_amt, 0.0);
+    }
+}
+
+/// The speaker sink: bankstown, a compressor, and a limiter that is never
+/// off. Named so [`warmth_props_text`] can move the controls at runtime.
+pub const SPEAKER_SINK: &str = "tideshell-speaker";
+
+/// The PipeWire user config for the speaker chain.
+///
+/// An EXPLICIT two-in two-out graph, not a mono graph left to be duplicated.
+/// A filter-chain whose graph has one input and one output is replicated per
+/// channel, which is what the simple configs rely on — but the two speakers
+/// here are different drivers that need different treatment (only one can
+/// make bass), and the channels have to cross when the screen turns. Neither
+/// is possible once the graph is per-channel, so both channels are wired by
+/// hand and `inputs`/`outputs` name the ends.
+///
+/// The shape:
+///
+/// ```text
+///  FL -> bassL -\            /-> hpTop -> compT -> limT -> top (earpiece)
+///                 mixTop/mixBot
+///  FR -> bassR -/            \-> ......... compB -> limB -> bottom (main)
+/// ```
+///
+/// `mixTop`/`mixBot` are the 2x2 matrix that [`speaker-pose`] drives: mono
+/// into both when upright, stereo when turned, crossfaded between. `hpTop`
+/// keeps the low end out of the earpiece, which cannot make it and only
+/// rattles trying — the bottom driver gets it instead.
+///
+/// None of the plugin stages is builtin. PipeWire's own filters are mixers,
+/// copies, biquads and convolvers, so this loads only where these exist:
+///
+/// * bankstown, LV2 `https://chadmed.au/bankstown`, installed as a proper
+///   bundle — `bankstown.so` (renamed from `libbankstown.so`),
+///   `bankstown.ttl` AND `manifest.ttl`, or lilv will not find it.
+/// * swh-plugins for the LADSPA compressor (`sc4`) and limiter
+///   (`fastLookaheadLimiter`).
+///
+/// The limiter is last on both legs and is not on any slider. bankstown ADDS
+/// energy, and a bass exciter's whole effect is that people then turn the
+/// volume up; without a limiter that arrives at the voice coil as clipping.
+///
+/// Port names follow each plugin's own convention and want checking against
+/// `lv2ls`/`listplugins` output on the device before anyone trusts this
+/// config to come up first time.
+pub fn speaker_chain_config() -> String {
+    let bank = |n: &str| format!(r#"{{ type = lv2 plugin = "https://chadmed.au/bankstown" label = bankstown name = {n}
+                       control = {{ "bypass" = 1.0 "amt" = 0.0 "blend" = 0.5 "floor" = 45.0 "ceil" = 180.0 "final_hp" = 40.0 "sat_second" = 0.3 "sat_third" = 0.6 }} }}"#);
+    let comp = |n: &str| format!(r#"{{ type = ladspa plugin = "sc4_1882" label = sc4 name = {n}
+                       control = {{ "Ratio" = 1.0 "Threshold level (dB)" = 0.0 "Attack time (ms)" = 10.0 "Release time (ms)" = 200.0 "Makeup gain (dB)" = 0.0 }} }}"#);
+    let limit = |n: &str| format!(r#"{{ type = ladspa plugin = "fast_lookahead_limiter_1913" label = fastLookaheadLimiter name = {n}
+                       control = {{ "Input gain (dB)" = 0.0 "Limit (dB)" = {LIMIT_DB:.1} "Release time (s)" = 0.1 }} }}"#);
+    format!(
+        r#"# tideshell speaker sink.
+#
+#   FL -> bassL -\            /-> hpTop -> compT -> limT -> top (earpiece)
+#                 mixTop/mixBot
+#   FR -> bassR -/            \-------------> compB -> limB -> bottom (main)
+#
+# Needs an LV2 bankstown bundle and swh-plugins:
+#   lv2ls | grep bankstown
+#   listplugins | grep -iE 'limiter|sc4'
+#
+# The limiter is deliberately not adjustable from the shell: it keeps what
+# the exciter adds off the voice coil.
+context.modules = [
+    {{  name = libpipewire-module-filter-chain
+        args = {{
+            node.description = "tideshell speaker"
+            media.name       = "tideshell speaker"
+            filter.graph = {{
+                nodes = [
+                    {bass_l}
+                    {bass_r}
+                    {{ type = builtin label = mixer name = mixTop control = {{ "Gain 1" = 0.5 "Gain 2" = 0.5 }} }}
+                    {{ type = builtin label = mixer name = mixBot control = {{ "Gain 1" = 0.5 "Gain 2" = 0.5 }} }}
+                    {{ type = builtin label = bq_highpass name = hpTop control = {{ "Freq" = {cross:.1} "Q" = 0.7 }} }}
+                    {comp_t}
+                    {comp_b}
+                    {limit_t}
+                    {limit_b}
+                ]
+                links = [
+                    {{ output = "bassL:Out" input = "mixTop:In 1" }}
+                    {{ output = "bassR:Out" input = "mixTop:In 2" }}
+                    {{ output = "bassL:Out" input = "mixBot:In 1" }}
+                    {{ output = "bassR:Out" input = "mixBot:In 2" }}
+                    {{ output = "mixTop:Out" input = "hpTop:In" }}
+                    {{ output = "hpTop:Out" input = "compT:In" }}
+                    {{ output = "compT:Out" input = "limT:In" }}
+                    {{ output = "mixBot:Out" input = "compB:In" }}
+                    {{ output = "compB:Out" input = "limB:In" }}
+                ]
+                inputs  = [ "bassL:In" "bassR:In" ]
+                outputs = [ "limT:Out" "limB:Out" ]
+            }}
+            capture.props = {{
+                node.name   = "{sink}"
+                media.class = Audio/Sink
+                audio.position = [ FL FR ]
+            }}
+            playback.props = {{
+                node.name   = "{sink}.out"
+                node.passive = true
+                audio.position = [ FL FR ]
+            }}
+        }}
+    }}
+]
+"#,
+        bass_l = bank("bassL"),
+        bass_r = bank("bassR"),
+        comp_t = comp("compT"),
+        comp_b = comp("compB"),
+        limit_t = limit("limT"),
+        limit_b = limit("limB"),
+        cross = 400.0,
+        sink = SPEAKER_SINK
+    )
+}
+
+/// `pw-cli set-param <node> Props` for a warmth position.
+pub fn warmth_props_text(w: &Warmth) -> String {
+    let bypass = if w.bass_amt <= 0.0 { 1.0 } else { 0.0 };
+    let makeup_db = 20.0 * w.makeup.log10();
+    let mut items: Vec<(String, f32)> = Vec::new();
+    // Both legs move together: warmth is a property of the programme, not of
+    // one speaker.
+    for ch in ["bassL", "bassR"] {
+        items.push((format!("{ch}:bypass"), bypass));
+        items.push((format!("{ch}:amt"), w.bass_amt));
+        items.push((format!("{ch}:blend"), w.bass_blend));
+    }
+    for c in ["compT", "compB"] {
+        items.push((format!("{c}:Ratio"), w.comp_ratio));
+        items.push((format!("{c}:Threshold level (dB)"), w.comp_threshold_db));
+        items.push((format!("{c}:Makeup gain (dB)"), makeup_db));
+    }
+    for l in ["limT", "limB"] {
+        items.push((format!("{l}:Limit (dB)"), w.limit_db));
+    }
+    let body: Vec<String> = items.iter().map(|(k, v)| format!("\"{k}\" {v:.3}")).collect();
+    format!("{{ params = [ {} ] }}", body.join(" "))
+}
+
+#[cfg(test)]
+mod speaker_chain_tests {
+    use super::*;
+
+    #[test]
+    fn both_legs_end_in_a_limiter() {
+        let c = speaker_chain_config();
+        assert!(c.contains("chadmed.au/bankstown"));
+        for leg in ["compT:Out\" input = \"limT:In", "compB:Out\" input = \"limB:In"] {
+            assert!(c.contains(leg), "missing {leg}");
+        }
+        assert_eq!(c.matches("fastLookaheadLimiter").count(), 2, "one per speaker: the plugins are mono");
+        assert!(c.contains(&format!("{LIMIT_DB:.1}")));
+        assert!(c.contains("lv2ls") && c.contains("swh-plugins"), "it says what it needs; none of this is builtin");
+    }
+
+    #[test]
+    fn the_graph_is_explicitly_stereo_and_crossable() {
+        // A one-in one-out graph gets duplicated per channel, which would
+        // make the matrix and the per-speaker high-pass impossible.
+        let c = speaker_chain_config();
+        assert!(c.contains(r#"inputs  = [ "bassL:In" "bassR:In" ]"#));
+        assert!(c.contains(r#"outputs = [ "limT:Out" "limB:Out" ]"#));
+        // Every input reaches every output: that is what lets the channels
+        // swap when the screen turns.
+        for link in [
+            r#"output = "bassL:Out" input = "mixTop:In 1""#,
+            r#"output = "bassR:Out" input = "mixTop:In 2""#,
+            r#"output = "bassL:Out" input = "mixBot:In 1""#,
+            r#"output = "bassR:Out" input = "mixBot:In 2""#,
+        ] {
+            assert!(c.contains(link), "missing {link}");
+        }
+        // The earpiece is high-passed and the main driver is not.
+        assert!(c.contains(r#"output = "mixTop:Out" input = "hpTop:In""#));
+        assert!(c.contains(r#"output = "mixBot:Out" input = "compB:In""#), "no high-pass on the bottom leg");
+        assert_eq!(c.matches("bq_highpass").count(), 1);
+    }
+
+    #[test]
+    fn the_props_move_every_stage_but_the_limit_stays_put() {
+        let quiet = warmth_props_text(&warmth(0.0));
+        assert!(quiet.contains("\"bassL:bypass\" 1.000") && quiet.contains("\"bassR:bypass\" 1.000"), "zero really bypasses: {quiet}");
+        let loud = warmth_props_text(&warmth(1.0));
+        assert!(loud.contains("\"bassL:bypass\" 0.000"));
+        // Both legs move together: warmth is a property of the programme,
+        // not of one speaker.
+        assert!(loud.contains("\"compT:Ratio\" 3.500") && loud.contains("\"compB:Ratio\" 3.500"));
+        for x in [0.0, 0.5, 1.0] {
+            let t = warmth_props_text(&warmth(x));
+            for l in ["limT", "limB"] {
+                assert!(t.contains(&format!("\"{l}:Limit (dB)\" {LIMIT_DB:.3}")), "the limiter never moves, at {x} on {l}");
+            }
+        }
+        // Make-up is dB for the LADSPA port, not the linear factor the model
+        // carries.
+        assert!(loud.contains("\"compT:Makeup gain (dB)\" 1.9"));
+    }
+}

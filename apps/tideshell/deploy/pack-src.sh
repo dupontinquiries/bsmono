@@ -11,13 +11,14 @@ set -eu
 REF=${1:-HEAD}
 PATHS="apps/hatch/crates/hatch-core
 apps/tideshell/crates/tideshell-core
+apps/tideshell/deploy
 apps/tideshell/egui-frontend
 apps/tideshell/settings
-apps/tideshell/deploy
 shared/config-kit
 shared/cosmic-levers
 shared/math-kit
 shared/settings-kit
+shared/speaker-pose
 shared/systemcompkit
 shared/touchkit
 shared/uikit/crates/snapclone-theme

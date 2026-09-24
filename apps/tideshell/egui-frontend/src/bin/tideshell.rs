@@ -21,7 +21,7 @@ use egui::{Pos2, Rect, Vec2};
 use tideshell_core::{Action, Shell, TouchEvent};
 use tideshell_egui::effects::{self, Executor, Outcome, System};
 use tideshell_egui::layer::{shape_for, CursorWant, Gl, Input, Io, Role, POINTER_SLOT};
-use tideshell_egui::{key_events, AppTile, FrameInfo, ShellView};
+use tideshell_egui::{camera, key_events, AppTile, FrameInfo, ShellView};
 
 const STRIP_PX: u32 = 28;
 
@@ -53,6 +53,16 @@ struct Shellbox {
     compass: tideshell_egui::sensors::CompassFeed,
     mic: Option<tideshell_egui::sensors::MicFeed>,
     camera: Option<tideshell_egui::camera::ChildSource>,
+    cam_duty: tideshell_egui::camera::DutyCycle,
+    /// The speakers follow the screen: the same transform that rotates the
+    /// display decides which driver is on the listener's left.
+    pose: speaker_pose::Mix,
+    /// The matrix last pushed to PipeWire, so nothing is sent per frame.
+    last_pose: Option<speaker_pose::Matrix>,
+    /// The rear camera's libcamera id, found once at startup.
+    rear_camera: Option<String>,
+    /// The last colour grid, for deciding whether the room changed.
+    last_glass: Option<Vec<[u8; 3]>>,
     /// Tracker state: the previous frame, its corners, and the world's
     /// yaw/pitch when it was taken.
     prev_frame: Option<(tideshell_core::track::Frame, Vec<tideshell_core::track::Point>, f32, f32)>,
@@ -331,6 +341,29 @@ fn export_session_env() {
     }
 }
 
+/// A display transform in degrees, as the shell emits it, to the screen
+/// orientation the speakers care about.
+fn transform_of(deg: u32) -> speaker_pose::Transform {
+    match deg % 360 {
+        90 => speaker_pose::Transform::Rotate90,
+        180 => speaker_pose::Transform::Rotate180,
+        270 => speaker_pose::Transform::Rotate270,
+        _ => speaker_pose::Transform::Normal,
+    }
+}
+
+/// Is this matrix audibly different from the last one sent? A crossfade
+/// produces a new matrix every frame; only steps worth a round trip to
+/// PipeWire are pushed.
+fn pose_differs(a: &speaker_pose::Matrix, b: &speaker_pose::Matrix) -> bool {
+    const EPS: f32 = 0.01;
+    (a.top.from_left - b.top.from_left).abs() > EPS
+        || (a.top.from_right - b.top.from_right).abs() > EPS
+        || (a.bottom.from_left - b.bottom.from_left).abs() > EPS
+        || (a.bottom.from_right - b.bottom.from_right).abs() > EPS
+        || a.mono != b.mono
+}
+
 fn main() {
     export_session_env();
     let args: Vec<String> = std::env::args().collect();
@@ -357,6 +390,58 @@ fn main() {
         // Under sudo, look at the invoking user's cosmic config, not root's.
         let home = std::env::var("SUDO_USER").ok().filter(|u| !u.is_empty() && u != "root").map(|u| std::path::PathBuf::from(format!("/home/{u}/.config"))).or_else(effects::cosmic_config_home);
         print!("{}", tideshell_egui::powerdoctor::report(&tideshell_egui::powerdoctor::gather(bus.as_ref(), home.as_deref())));
+        std::process::exit(0);
+    }
+    // `tideshell sensors`: what each input actually resolves to on THIS
+    // device, and a few live readings. Written because a probe that only
+    // looks for `/sys/class/light` or an `in_illuminance_*` file concludes
+    // "no ambient light sensor" on a phone whose ALS works fine behind
+    // iio-sensor-proxy (the sensor hub exposes it over D-Bus, and an IIO
+    // sensor in buffered mode has no `_input`/`_raw` attribute to find).
+    if args.get(1).map(String::as_str) == Some("sensors") {
+        let sys = std::path::Path::new("/sys");
+        let bus = zbus::blocking::Connection::system().ok();
+        println!("iio devices:");
+        let mut any = false;
+        let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(sys.join("bus/iio/devices")).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        dirs.sort();
+        for d in &dirs {
+            any = true;
+            let name = std::fs::read_to_string(d.join("name")).unwrap_or_default().trim().to_string();
+            let chans: Vec<String> = std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|f| f.starts_with("in_")).collect();
+            let buffered = d.join("scan_elements").is_dir();
+            println!("  {} {name}{}{}", d.display(), if buffered { " [buffered]" } else { "" }, if chans.is_empty() { String::new() } else { format!(" {}", chans.join(" ")) });
+        }
+        if !any {
+            println!("  (none)");
+        }
+        match &bus {
+            Some(b) => match tideshell_egui::sensors::sensor_proxy_claim(b) {
+                Ok(unit) => {
+                    println!("iio-sensor-proxy: ambient light, unit {unit}");
+                    for _ in 0..4 {
+                        match tideshell_egui::sensors::sensor_proxy_read(b) {
+                            Ok(v) => println!("  light = {v}"),
+                            Err(e) => println!("  read failed: {e}"),
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                    }
+                }
+                Err(e) => println!("iio-sensor-proxy: {e}"),
+            },
+            None => println!("iio-sensor-proxy: no system bus"),
+        }
+        match tideshell_egui::sensors::find_iio_light(sys) {
+            Some(l) => println!("sysfs light: {} -> {:?} lux", l.dir.display(), l.read()),
+            None => println!("sysfs light: no in_illuminance_input / in_illuminance_raw (a buffered-mode sensor has neither; the D-Bus line above is the one that matters)"),
+        }
+        match tideshell_egui::sensors::find_backlight(sys) {
+            Some(b) => println!("backlight: {} level {:?}", b.name, b.read_level()),
+            None => println!("backlight: none under /sys/class/backlight"),
+        }
+        let amb = tideshell_egui::sensors::Ambient::spawn(sys.to_path_buf(), bus);
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        println!("what tideshell would use -> {}", amb.status());
         std::process::exit(0);
     }
     // `tideshell install-keys` / `remove-keys`: the same lever the shell
@@ -406,6 +491,22 @@ fn main() {
     // (lock screen, idle): the layer runtime's power objects report every
     // mode change, forwarded in the frame loop (`io.display_on()`).
     let backlight = tideshell_egui::sensors::BacklightOut::spawn(std::path::Path::new("/sys"), zbus::blocking::Connection::system().ok());
+        // Which camera is the rear one. Asked once: `cam -l` starts a libcamera
+    // manager, which is not something to do every window.
+    // How the sensor sits relative to the screen: looked up per device,
+    // because nothing in the stream says. libcamera reports a Rotation only
+    // where the kernel driver declares one, and these drivers do not.
+    // TIDESHELL_CAMERA_ROTATE / _MIRROR override the table, so a new handset
+    // can be worked out live and written down afterwards.
+    let model = std::fs::read("/proc/device-tree/model").map(|b| tideshell_egui::devices::parse_model(&b)).unwrap_or_default();
+    let cam_mount = tideshell_egui::devices::mount_for(
+        &model,
+        false,
+        std::env::var("TIDESHELL_CAMERA_ROTATE").ok().as_deref(),
+        std::env::var("TIDESHELL_CAMERA_MIRROR").ok().as_deref(),
+    );
+    let cam_rot = cam_mount.rotate;
+    let cam_list = std::process::Command::new("cam").arg("-l").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
     let mut sb = Shellbox {
         shell: Shell::new(prefs, (0.0, 0.0)),
         view: ShellView::default(),
@@ -432,6 +533,11 @@ fn main() {
         compass: tideshell_egui::sensors::CompassFeed::spawn(zbus::blocking::Connection::system().ok()),
         mic: None,
         camera: None,
+        cam_duty: tideshell_egui::camera::DutyCycle::new(tideshell_egui::camera::Duty::default()),
+        pose: speaker_pose::Mix::new(speaker_pose::Transform::Normal, speaker_pose::Tuning::default()),
+        last_pose: None,
+        rear_camera: tideshell_egui::camera::pick_rear(&cam_list),
+        last_glass: None,
         prev_frame: None,
         feed_status: Default::default(),
         notify_gain_written: -1.0,
@@ -440,6 +546,13 @@ fn main() {
         last_place_poll: 0,
         last_color_note: 0,
     };
+    sb.view.camera_rot = cam_rot;
+    // Default to "accelerated" until the first paint tells us otherwise: the
+    // cost of guessing software on real hardware is a shell that feels
+    // sluggish for no reason.
+    sb.view.accelerated = true;
+    sb.view.camera_mirror = cam_mount.mirror;
+    sb.shell.note(tideshell_egui::devices::describe(&model, false, cam_mount));
     sb.shell.set_date(tideshell_egui::sensors::local_yday());
     if let Some(p) = Shellbox::places_path() {
         if let Ok(text) = std::fs::read_to_string(&p) {
@@ -514,9 +627,12 @@ fn main() {
     let mut side_pos: HashMap<(Role, i32), Pos2> = HashMap::new();
 
     let t0 = Instant::now();
+
     let mut overlay_events: Vec<egui::Event> = Vec::new();
     let mut contact_pos: HashMap<i32, Pos2> = HashMap::new();
     let mut last_region: Option<Option<Vec<Rect>>> = None;
+    let mut renderer_noted = false;
+    let mut last_frame_hash: HashMap<Role, u64> = HashMap::new();
     let mut last_poll = 0u64;
     // comfortgov reads the mtime of this file as "last user input".
     let hint = std::env::var_os("XDG_RUNTIME_DIR").map(|r| std::path::PathBuf::from(r).join("comfortgov.input"));
@@ -614,14 +730,32 @@ fn main() {
                 }
             }
         }
-        // The camera: on only while the cover shows on a lit screen.
+        // The camera: on only while the cover shows on a lit screen, and
+        // then only in short windows (camera::DutyCycle). Continuous capture
+        // for a surface that is blurred to a colour wash costs a software
+        // debayer per frame — libcamera has no hardware ISP on this phone —
+        // for detail nobody sees.
         let want_cam = sb.shell.camera_wanted();
-        if want_cam && sb.camera.is_none() {
-            sb.camera = Some(tideshell_egui::camera::ChildSource::start(&tideshell_egui::camera::gst_command(&tideshell_egui::camera::CameraChoice::from_vars(std::env::var("TIDESHELL_CAMERA").ok().as_deref(), std::env::var("TIDESHELL_CAMERA_CAPTURE").ok().as_deref()), tideshell_egui::camera::FRAME_W, tideshell_egui::camera::FRAME_H), tideshell_egui::camera::FRAME_W, tideshell_egui::camera::FRAME_H));
-        } else if !want_cam && sb.camera.is_some() {
-            sb.camera = None;
-            sb.prev_frame = None;
-            sb.view.clear_camera_frame();
+        match sb.cam_duty.tick(want_cam, now_ms) {
+            camera::DutyAction::Start => {
+                let choice = camera::CameraChoice {
+                    // Auto-pick the REAR camera when nothing names one:
+                    // libcamerasrc's own default is whichever libcamera lists
+                    // first, which here is the selfie camera.
+                    name: std::env::var("TIDESHELL_CAMERA").ok().filter(|v| !v.trim().is_empty()).or_else(|| sb.rear_camera.clone()),
+                    capture: camera::CameraChoice::from_vars(None, std::env::var("TIDESHELL_CAMERA_CAPTURE").ok().as_deref()).capture,
+                    fps: Some(2),
+                };
+                sb.camera = Some(camera::ChildSource::start(&camera::gst_command(&choice, camera::FRAME_W, camera::FRAME_H), camera::FRAME_W, camera::FRAME_H));
+            }
+            camera::DutyAction::Stop => {
+                sb.camera = None;
+                sb.prev_frame = None;
+                if !want_cam {
+                    sb.view.clear_camera_frame();
+                }
+            }
+            camera::DutyAction::Wait => {}
         }
         if let Some(f) = sb.camera.as_mut().and_then(|c| c.poll()) {
             use tideshell_core::track;
@@ -639,13 +773,26 @@ fn main() {
             }
             let pts = track::find_corners(&gray);
             sb.prev_frame = Some((gray, pts, yaw, pitch));
+            // Has the room changed? The only idle signal on a phone whose
+            // accelerometer is unreadable, and the right question anyway:
+            // what matters for a tint is the room, not the handset.
+            let grid = camera::glass(&f, 4, 5);
+            let changed = sb.last_glass.as_ref().map(|prev| camera::scene_changed(prev, &grid, 4.0)).unwrap_or(true);
+            // The pane draws the wash from these twenty cells, not from the
+            // frame: 60 bytes instead of a texture upload, and the GPU does
+            // the interpolation.
+            sb.view.set_glass(grid.clone(), 4, 5);
+            sb.last_glass = Some(grid);
+            sb.cam_duty.frame(changed);
             // What this place looks like: its dominant colours, every 5 s.
             if now_ms.saturating_sub(sb.last_color_note) >= 5000 {
                 sb.last_color_note = now_ms;
                 let colors = tideshell_core::ambience::dominant_colors(&f.rgba, 3);
                 sb.shell.on_photo_colors(&colors);
             }
-            sb.view.set_camera_frame(&ctx, f.w, f.h, &f.rgba);
+            // The wash no longer reads the texture, so it is not uploaded.
+            // The motion tracker above works on the CPU-side grayscale copy
+            // and never needed the GPU one.
         }
         let nears: Vec<bool> = sb.proximity.rx.try_iter().collect();
         for n in nears {
@@ -654,7 +801,26 @@ fn main() {
         let readings: Vec<String> = sb.orientation.rx.try_iter().collect();
         for o in readings {
             let out = sb.shell.on_orientation(&o, now_ms);
+            // The speakers turn with the screen. Told from the same rotation
+            // rather than from a sensor of its own, so the audio can never
+            // disagree with what the user is looking at.
+            for a in &out {
+                if let Action::Rotate(deg) = a {
+                    sb.pose.observe(transform_of(*deg), now_ms);
+                }
+            }
             sb.execute(out);
+        }
+        // Crossfade the speaker matrix. Only pushed when it actually moves:
+        // a Props message per frame would be absurd, and the fade is over in
+        // a few hundred ms.
+        {
+            let m = sb.pose.tick(now_ms);
+            if sb.last_pose.map(|p| pose_differs(&p, &m)).unwrap_or(true) {
+                sb.last_pose = Some(m);
+                let out = tideshell_egui::effects::apply_speaker_pose(&m, speaker_pose::Tuning::default().crossover_hz);
+                sb.shell.note(format!("{out:?}"));
+            }
         }
         if let Some(screen) = io.screen() {
             if screen != sb.shell.screen {
@@ -876,11 +1042,29 @@ fn main() {
                     };
                 });
             });
-            sb.execute(actions);
             let prims = ctx_side.tessellate(out.shapes, out.pixels_per_point);
+            // Skip a surface whose frame is identical to the one already on
+            // screen. Tessellation has happened either way; what is saved is
+            // the fill and the commit, which is where the pixels are.
+            let h = tideshell_egui::damage::frame_hash(&prims);
+            if !tideshell_egui::damage::changed(last_frame_hash.get(&role).copied(), h, !out.textures_delta.is_empty()) {
+                sb.execute(actions);
+                continue;
+            }
+            last_frame_hash.insert(role, h);
+            if !gl.renderer.is_empty() && !renderer_noted {
+                renderer_noted = true;
+                sb.view.accelerated = tideshell_core::paintrate::accelerated_renderer(&gl.renderer);
+                sb.shell.note(format!(
+                    "renderer: {} ({})",
+                    gl.renderer,
+                    if sb.view.accelerated { "accelerated" } else { "SOFTWARE — animations are rate-limited" }
+                ));
+            }
             if let Err(e) = gl.paint(role, size_px, out.pixels_per_point, &prims, &out.textures_delta) {
                 eprintln!("tideshell: {role:?}: {e}");
             }
+            sb.execute(actions);
         }
 
         // Overlay: map/unmap, input region, frame.

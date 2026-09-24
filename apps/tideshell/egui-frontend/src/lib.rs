@@ -14,6 +14,7 @@
 
 pub mod effects;
 #[cfg(feature = "wayland")]
+pub mod wash;
 pub mod wayland;
 #[cfg(feature = "ei")]
 pub mod ei;
@@ -82,7 +83,11 @@ pub mod keys;
 #[cfg(feature = "sensors")]
 pub mod powerdoctor;
 pub mod ctl;
+pub mod blur;
 pub mod camera;
+pub mod damage;
+pub mod devices;
+pub mod fit;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
 use std::collections::HashMap;
@@ -150,6 +155,21 @@ pub struct ShellView {
     palette_focused: bool,
     /// The camera pane's latest frame as a texture, with its size.
     camera_tex: Option<(egui::TextureHandle, usize, usize)>,
+    /// How the sensor is mounted relative to the screen. A property of the
+    /// hardware, so it is set once rather than guessed per frame.
+    pub camera_rot: crate::fit::Quarter,
+    /// Flip the preview horizontally (front cameras).
+    pub camera_mirror: bool,
+    /// The colour wash: a coarse grid of cell colours, drawn as a lattice of
+    /// gradient quads instead of a stretched texture. 60 bytes a window
+    /// rather than a 5 kB upload.
+    glass: Option<(Vec<[u8; 3]>, usize, usize)>,
+    /// Grain, uploaded once. Per-frame noise would put back exactly the data
+    /// movement this avoids, and would shimmer.
+    grain: Option<egui::TextureHandle>,
+    /// Whether a full-screen fill is cheap here. False on llvmpipe, where
+    /// asking for 90 frames a second of a slow fade is pure heat.
+    pub accelerated: bool,
     bar_drag: f32,
     sheet: SettingsSheet,
     /// Press feedback per widget: a spring on its scale (0.94 pressed, 1.0
@@ -233,6 +253,11 @@ impl ShellView {
             || self.sheet.open
             || self.show_trace
             || shell.lock.is_locked()
+            // A reduced white point is drawn as a veil on this layer, so the
+            // overlay has to stay mapped even when nothing else wants it —
+            // unmapping it is what would make the screen jump back to the
+            // panel's floor.
+            || tideshell_core::dimming::split(shell.drawer.brightness, shell.prefs.digital_dim).is_dimming()
             || shell.sleep.phase != tideshell_core::sleep::Phase::Awake
     }
 
@@ -344,6 +369,26 @@ impl ShellView {
 
     pub fn clear_camera_frame(&mut self) {
         self.camera_tex = None;
+        self.glass = None;
+    }
+
+    /// The wash for this window, from camera::glass.
+    pub fn set_glass(&mut self, cells: Vec<[u8; 3]>, cols: usize, rows: usize) {
+        self.glass = Some((cells, cols, rows));
+    }
+
+    /// The grain texture, made once on first use.
+    fn grain(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        if let Some(t) = &self.grain {
+            return t.clone();
+        }
+        const N: usize = 64;
+        let a = crate::wash::noise_tile(N, 0x7715, 255);
+        let px: Vec<egui::Color32> = a.iter().map(|v| egui::Color32::from_white_alpha(*v)).collect();
+        let img = egui::ColorImage { size: [N, N], pixels: px, source_size: egui::Vec2::new(N as f32, N as f32) };
+        let t = ctx.load_texture("ts-grain", img, egui::TextureOptions { magnification: egui::TextureFilter::Nearest, minification: egui::TextureFilter::Nearest, wrap_mode: egui::TextureWrapMode::Repeat, mipmap_mode: None });
+        self.grain = Some(t.clone());
+        t
     }
 
     /// Draw one carousel peek filling this `Ui` (its own layer surface).
@@ -478,6 +523,10 @@ impl ShellView {
         self.last_frame_ms = Some(now_ms);
         self.frame_dt = dt_ms;
         self.press.retain(|_, s| !s.is_settled() || s.target < 1.0);
+        // The grain is made once, here, because `cover` has only a painter.
+        if self.grain.is_none() && (self.glass.is_some() || tideshell_core::dimming::split(shell.drawer.brightness, shell.prefs.digital_dim).is_dimming()) {
+            let _ = self.grain(ui.ctx());
+        }
         // Contrast rises with the light and never dips: below the polarity
         // flip the dark look gains contrast (darker ground, whiter text);
         // at the flip (the apps' hysteretic one) it becomes a soft light
@@ -581,17 +630,53 @@ impl ShellView {
         if self.show_trace {
             self.trace(&p, shell, pal, origin);
         }
-        if !shell.recognizer.is_idle()
-            || shell.drawer.is_animating()
-            || shell.switcher.is_streaking()
+        // Ask for the next frame at an interval rather than immediately.
+        // The finger's own motion is never slowed — the hand can compare it
+        // against the thing it is touching — but a fade or a breath can be,
+        // and on a software rasterizer filling this many pixels that is the
+        // difference between a warm phone and a cool one.
+        use tideshell_core::paintrate::{interval_ms, Motion};
+        let tracking = !shell.recognizer.is_idle() || shell.switcher.is_streaking() || self.is_jiggling();
+        let transition = shell.drawer.is_animating()
             || shell.switcher.is_animating()
             || shell.fat.as_ref().is_some_and(|f| f.is_animating())
             || shell.sleep.is_animating()
-            || self.is_jiggling()
             || (shell.palette.is_visible() && !shell.palette.reveal.is_settled())
-            || (shell.lock.is_locked() && !shell.lock.reveal.is_settled())
-        {
-            ui.ctx().request_repaint();
+            || (shell.lock.is_locked() && !shell.lock.reveal.is_settled());
+        let motion = if tracking {
+            Motion::Tracking
+        } else if transition {
+            Motion::Transition
+        } else {
+            Motion::Still
+        };
+        if let Some(ms) = interval_ms(motion, self.accelerated) {
+            if ms == 0 {
+                ui.ctx().request_repaint();
+            } else {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(ms));
+            }
+        }
+        // The reduced white point, last so it veils everything drawn above.
+        // A black rectangle over the whole surface: the cheapest possible
+        // way to scale every pixel toward black, and the only one available
+        // to a client that does not own the compositor's colour pipeline.
+        let dim = tideshell_core::dimming::split(shell.drawer.brightness, shell.prefs.digital_dim);
+        if dim.is_dimming() {
+            let a = (dim.veil_alpha() * 255.0).round().clamp(0.0, 255.0) as u8;
+            ui.painter().rect_filled(ui.max_rect(), 0.0, egui::Color32::from_black_alpha(a));
+        }
+        // Grain LAST, after the veil. A veil multiplies everything toward
+        // black, so dither applied before it is dither that has been dimmed
+        // away — and the banding it exists to hide is worst exactly when the
+        // veil is heaviest, because the darkest greys are where 8-bit steps
+        // are widest relative to what the eye can see. The amount therefore
+        // rises with the dimming rather than staying fixed.
+        if let Some(grain) = self.grain.clone() {
+            let r = ui.max_rect();
+            let (tx, ty) = ((r.width() / 64.0).max(1.0), (r.height() / 64.0).max(1.0));
+            let amount = 14.0 + 26.0 * dim.veil_alpha();
+            ui.painter().image(grain.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(tx, ty)), Color32::from_white_alpha(amount as u8));
         }
         out
     }
@@ -758,9 +843,54 @@ impl ShellView {
         let alpha = (1.0 - prog * 0.8).clamp(0.0, 1.0);
         let top = origin + Vec2::new(0.0, -prog * size.y);
         // Background: the camera when it is running (the pane), else a gradient.
-        if let Some((tex, _, _)) = &self.camera_tex {
+        // The wash: twenty cells drawn as a lattice of gradient quads. The
+        // GPU's vertex interpolation is the upscaler, so nothing is
+        // resampled and nothing large is uploaded. Preferred over the
+        // texture path because this is what the lock screen actually wants —
+        // colour from the room, not a picture of it.
+        if let Some((cells, cols, rows)) = self.glass.clone() {
             let r = Rect::from_min_size(top, size);
-            p.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::from_white_alpha((alpha * 255.0) as u8));
+            let corners = crate::wash::lattice(&cells, cols, rows);
+            let mut mesh = egui::Mesh::default();
+            for gy in 0..=rows {
+                for gx in 0..=cols {
+                    let c = corners[gy * (cols + 1) + gx];
+                    let p = Pos2::new(r.left() + r.width() * gx as f32 / cols as f32, r.top() + r.height() * gy as f32 / rows as f32);
+                    mesh.vertices.push(egui::epaint::Vertex {
+                        pos: p,
+                        uv: egui::epaint::WHITE_UV,
+                        color: Color32::from_rgba_unmultiplied(c[0], c[1], c[2], (alpha * 255.0) as u8),
+                    });
+                }
+            }
+            mesh.indices = crate::wash::indices(cols, rows);
+            p.add(egui::Shape::mesh(mesh));
+            // Grain, to break the banding a gradient this smooth shows on a
+            // dim screen. One tiled texture, drawn at low alpha.
+            p.rect_filled(r, cr(0), Color32::from_black_alpha((alpha * 90.0) as u8));
+        } else if let Some((tex, fw, fh)) = &self.camera_tex {
+            let r = Rect::from_min_size(top, size);
+            // Not `p.image` with a full 0..1 uv: that stretches the frame to
+            // the pane on BOTH axes independently, so a landscape sensor in
+            // a portrait pane comes out squashed and, with the sensor a
+            // quarter turn from the screen, sideways as well. A mesh lets
+            // each destination corner read a different source corner, which
+            // both turns the image and crops it to one scale factor, so
+            // real-world proportions survive.
+            let mut uv = crate::fit::corner_uvs((*fw as f32, *fh as f32), (size.x, size.y), self.camera_rot);
+            if self.camera_mirror {
+                // Swap the left and right columns of the quad: a mirror is a
+                // reordering, not a second sampling pass.
+                uv.swap(0, 1);
+                uv.swap(3, 2);
+            }
+            let tint = Color32::from_white_alpha((alpha * 255.0) as u8);
+            let mut mesh = egui::Mesh::with_texture(tex.id());
+            for (i, corner) in [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()].iter().enumerate() {
+                mesh.vertices.push(egui::epaint::Vertex { pos: *corner, uv: Pos2::new(uv[i][0], uv[i][1]), color: tint });
+            }
+            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+            p.add(egui::Shape::mesh(mesh));
             // Darken for legibility, keep the picture.
             p.rect_filled(r, cr(0), Color32::from_black_alpha((alpha * 90.0) as u8));
             // World anchors: rings where the world says they are.
@@ -1382,6 +1512,17 @@ impl ShellView {
                         }
                     });
                 });
+                ui.separator();
+                ui.label("Accessibility");
+                ui.checkbox(&mut draft.digital_dim, "Dim below the panel's floor");
+                ui.label(
+                    egui::RichText::new(
+                        "Below 5% the pixels dim as well as the backlight, reaching about a tenth of the panel's lowest step. \
+                         For dark rooms. Costs some bit depth, so the darkest greys may band.",
+                    )
+                    .small()
+                    .weak(),
+                );
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Apply").clicked() {
