@@ -452,3 +452,36 @@ fn a_full_match_tick_is_cheap_enough_to_leave_the_frame_to_the_gpu() {
     println!("sim: {ms:.3} ms/tick over {ticks} ticks, {} minions, {} projectiles (unoptimised profile)", game.minions.len(), game.projectiles.len());
     assert!(ms < 6.0, "a tick costs {ms:.2} ms unoptimised; the budget at 60 Hz is 16.6 for EVERYTHING");
 }
+
+/// Rough ground through the real sim loop: a cat run through a thicket
+/// covers less ground than the same run on open ground, is not stopped, and
+/// a leap over it is not slowed at all (`move_speed` skips the going while
+/// airborne).
+#[test]
+fn a_thicket_slows_a_cat_and_does_not_stop_it() {
+    use clawbound::blockers::{Blockers, Shape};
+    use clawbound::going::{Ground, Rough};
+    use glam::Vec3;
+    let run = |rough: bool| {
+        let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        for g in game.gods.iter_mut().skip(1) {
+            g.respawn_t = 999.0; // alone on the field
+        }
+        game.gods[0].ai = None;
+        let start = game.gods[0].pos;
+        let mut b = Blockers::new(200.0, 6.0);
+        if rough {
+            b.push_rough(Rough { shape: Shape::Circle { x: start.x, z: start.z + 6.0, r: 8.0 }, mul: 0.5, edge: 0.5, ground: Ground::Thicket });
+        }
+        game.blockers = std::sync::Arc::new(b);
+        for _ in 0..60 {
+            game.gods[0].move_dir = Vec3::Z;
+            game.tick(1.0 / 60.0);
+        }
+        (game.gods[0].pos - start).length()
+    };
+    let (open, thick) = (run(false), run(true));
+    assert!(thick > 0.5, "slowed, not stopped: {thick}");
+    let ratio = thick / open;
+    assert!((ratio - 0.5).abs() < 0.08, "a 0.5 thicket halves the run: {thick} vs {open} ({ratio})");
+}

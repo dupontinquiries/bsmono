@@ -581,8 +581,16 @@ impl Game {
         // wading: the rivers are slow going unless you were born to them
         let depth = self.water_depth_now(g.pos.x, g.pos.z);
         let wade = if g.blessing_t > 0.0 || crate::wild::is_riverborn(def) { 1.0 } else { wade_speed_mul(depth) };
-        let stalk = if self.stalking(i) { crate::consts::SNEAK_SPEED } else { 1.0 };
-        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk
+        let stalking = self.stalking(i);
+        let stalk = if stalking { crate::consts::SNEAK_SPEED } else { 1.0 };
+        // Rough ground (`going`). Not while airborne or perched: a leap
+        // clears the thicket, and a boulder's top is not its scree skirt.
+        let going = if g.leap.is_some() || g.dash.is_some() || g.perch.is_some() {
+            1.0
+        } else {
+            self.blockers.going_at(g.pos.x, g.pos.z, crate::going::Carriage { stalking })
+        };
+        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk * going
     }
 
     pub fn auto_interval(&self, i: usize) -> f32 {

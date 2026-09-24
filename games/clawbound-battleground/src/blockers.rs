@@ -212,7 +212,9 @@ impl PropKind {
             JungleTree => Footprint::solid(0.90, 4.0),
             Palm => Footprint::solid(0.55, 4.0),
             StranglerFig => Footprint::solid(1.10, 4.0),
-            Bamboo => Footprint::solid(0.45, 4.0),
+            // A stand of stems, not a trunk: you shoulder through it. Hides
+            // well, costs a lot of speed (`going`), stops nobody.
+            Bamboo => Footprint::cover(0.75, 1.5),
             MegaTree => Footprint::solid(2.60, 8.0),
 
             // Stone.
@@ -295,11 +297,11 @@ impl PropKind {
             Rock | BoulderCluster | StoneHead | ColossusHead | FallenLog => Perch::Flat,
             RuinWall | RuinPillar => Perch::Narrow,
             // Trees block up to a height; they do not END there.
-            Pine | Oak | JungleTree | Palm | StranglerFig | Bamboo | MegaTree => Perch::None,
+            Pine | Oak | JungleTree | Palm | StranglerFig | MegaTree => Perch::None,
             // Fire, points, and the things each team is there to defend: a
             // cat on the enemy gate is a balance problem, not a vista.
             Brazier | Crystal | BaseGate | Fountain | TitanPedestal | Ziggurat | AqueductArch => Perch::None,
-            Bridge | RuinArch | Bush | Fern | VineCurtain | LanePad => Perch::None,
+            Bridge | RuinArch | Bush | Fern | VineCurtain | Bamboo | LanePad => Perch::None,
         }
     }
 }
@@ -345,6 +347,10 @@ pub struct Blockers {
     cell: f32,
     dim: i32,
     half_extent: f32,
+    /// Rough ground: what the world COSTS to cross, where `all` is what it
+    /// forbids. See `going`. Filled by `push_prop` from the same PropKind,
+    /// so a prop cannot be moved and leave its thicket behind.
+    going: crate::going::Going,
 }
 
 impl Blockers {
@@ -362,7 +368,24 @@ impl Blockers {
             cell,
             dim,
             half_extent,
+            going: crate::going::Going::new(half_extent, cell),
         }
+    }
+
+    /// Speed multiplier for crossing `(x, z)`. See `going`.
+    pub fn going_at(&self, x: f32, z: f32, who: crate::going::Carriage) -> f32 {
+        self.going.at(x, z, who)
+    }
+
+    /// The rough-ground layer, for steering and plans.
+    pub fn going(&self) -> &crate::going::Going {
+        &self.going
+    }
+
+    /// Lay a patch of rough ground that belongs to no single prop: a bramble
+    /// bed, a scree slope.
+    pub fn push_rough(&mut self, r: crate::going::Rough) -> bool {
+        self.going.push(r)
     }
 
     pub fn len(&self) -> usize {
@@ -406,6 +429,7 @@ impl Blockers {
     /// take an `s` — a 1.3-scale jungle tree presents a 1.3x trunk. Returns
     /// whether anything was added, so a caller can assert coverage.
     pub fn push_prop(&mut self, kind: PropKind, x: f32, z: f32, ground_y: f32, scale: f32) -> bool {
+        self.going.push_prop(kind, x, z, scale);
         let f = kind.footprint();
         let solid = !f.passable && f.radius > 0.0;
         if !solid && !f.conceals() {
@@ -462,6 +486,8 @@ impl Blockers {
             let (r0, r1) = (6.65 * VOX, 8.0 * VOX);
             let shape = Shape::Segment { x0: x + dx * r0, z0: z + dz * r0, x1: x + dx * r1, z1: z + dz * r1, r: 1.5 * VOX };
             n += self.push_step(shape, base_y, 3.0 * VOX) as usize;
+            // A stride over each root: not a wall, a small cost.
+            self.going.push(crate::going::Rough { shape, mul: 0.82, edge: 0.4, ground: crate::going::Ground::Roots });
         }
         n
     }

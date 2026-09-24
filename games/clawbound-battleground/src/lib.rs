@@ -16,6 +16,8 @@ pub mod voxel;
 pub mod models;
 pub mod props;
 pub mod blockers;
+/// Rough ground: what the jungle costs to cross, where blockers is what it forbids.
+pub mod going;
 /// The state behind the LAN screen (discovery is `netcode::lan`).
 pub mod lanlobby;
 /// Input-only lockstep: the rule that lets two machines play one match.
