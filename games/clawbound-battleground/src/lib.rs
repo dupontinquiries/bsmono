@@ -16,6 +16,8 @@ pub mod voxel;
 pub mod models;
 pub mod props;
 pub mod blockers;
+/// The walkable floor of a map carved out of rock, as an exact SDF.
+pub mod floor;
 /// Rough ground: what the jungle costs to cross, where blockers is what it forbids.
 pub mod going;
 /// The state behind the LAN screen (discovery is `netcode::lan`).
