@@ -41,6 +41,7 @@ mod io;
 mod palette;
 mod pattern;
 mod playback;
+mod power;
 
 /// What we managed to learn about the file the user named.
 struct Opened {
@@ -171,6 +172,9 @@ struct Player {
     seen_hits: Vec<seen::SeenHit>,
     /// Sound only, by choice (the palette's "Listen only").
     listen_only: bool,
+    /// What background work the power supply allows, and when it was read.
+    energy: power::EnergyPolicy,
+    energy_read: Option<Instant>,
     /// Picture-in-picture: the video floats, the chapters take the screen.
     pip: vidkit_egui::Pip,
     pip_on: bool,
@@ -370,6 +374,8 @@ impl Player {
             seen_query: String::new(),
             seen_hits: Vec::new(),
             listen_only: false,
+            energy: power::policy(power::current()),
+            energy_read: None,
             pip: Default::default(),
             pip_on: false,
             max_texture,
@@ -659,6 +665,7 @@ impl eframe::App for Player {
         self.follow_shell_colours(ctx);
         self.follow_display(ctx);
         self.follow_visibility(ctx);
+        self.follow_power();
         self.measure_refresh();
 
         let mut want_analysis = false;
@@ -1505,6 +1512,7 @@ impl Player {
             .or_else(|| file.as_deref().and_then(transcribe::cache_path));
         let factory = factory.unwrap_or_else(|| transcribe::source_factory(file));
         self.worker = Some(transcribe::Worker::start(factory, audio, total, cache));
+        self.apply_transcribe_policy();
         self.reset_sections();
         // Enhancement only for titles analysis has looked at.
         self.enh_facts = seen::dir().and_then(|d| enhance_plan::load_facts(&d, &url));
@@ -1777,7 +1785,8 @@ impl Player {
     /// link the two compete. After that it plays from /tmp with no network
     /// at all. VIDKIT_KEEP_STREAMS=0 streams only, as before.
     fn keep_in_background(&mut self, url: String, cap: Option<u32>) {
-        if std::env::var("VIDKIT_KEEP_STREAMS").as_deref() == Ok("0") {
+        if std::env::var("VIDKIT_KEEP_STREAMS").as_deref() == Ok("0") || !self.energy.keep_download {
+            // On battery the radio is not kept busy fetching a second copy.
             return;
         }
         let status = self.export_status.clone();
@@ -1871,7 +1880,7 @@ impl Player {
                     enhance_plan::classify_gpu(&enhance_plan::drm_cards(), decode::machine().kind == decode::MachineKind::QualcommVenus)
                 });
                 let plan = enhance_plan::plan_title(f, &enhance_plan::Device::default_for(class, px.0, px.1));
-                let e = plan.enhance;
+                let e = power::limit(plan.enhance, self.energy.enhance);
                 self.enh_plan = Some(plan);
                 e
             }
@@ -1897,6 +1906,10 @@ impl Player {
         #[cfg(feature = "bscale")]
         {
             use std::sync::atomic::Ordering;
+            if !self.energy.analysis {
+                self.gpu_error = Some("analysis waits for mains power: it is minutes of CPU".into());
+                return;
+            }
             let Some(dir) = seen::dir() else { return };
             let (status, running, done_msg) = (self.analysis_status.clone(), self.analysis_running.clone(), self.export_status.clone());
             running.store(true, Ordering::Relaxed);
@@ -2083,6 +2096,43 @@ impl Player {
                 if let Err(err) = e.set_video_enabled(want) {
                     self.gpu_error = Some(format!("switching video {}: {err}", if want { "on" } else { "off" }));
                 }
+            }
+        }
+    }
+}
+
+impl Player {
+    /// Re-read the power supply every 30 s and apply what changed.
+    fn follow_power(&mut self) {
+        if self.energy_read.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
+            return;
+        }
+        self.energy_read = Some(Instant::now());
+        let p = power::policy(power::current());
+        if p == self.energy {
+            return;
+        }
+        let enhance_changed = p.enhance != self.energy.enhance;
+        self.energy = p;
+        self.apply_transcribe_policy();
+        if enhance_changed {
+            // Recompute the plan at the next paint under the new allowance.
+            self.enh_px = (0, 0);
+            self.enh_plan = None;
+        }
+    }
+
+    /// On battery, whisper works only ahead of the playhead, or not at all.
+    fn apply_transcribe_policy(&mut self) {
+        use vidkit_transcribe::coverage::Mode;
+        if let Some(w) = &self.worker {
+            let mode = match self.energy.transcribe_ahead {
+                None => Mode::All,
+                Some(h) if h.is_zero() => Mode::Paused,
+                Some(h) => Mode::Ahead(h),
+            };
+            if w.mode() != mode {
+                w.set_mode(mode);
             }
         }
     }
