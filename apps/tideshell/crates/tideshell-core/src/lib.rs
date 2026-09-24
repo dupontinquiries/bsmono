@@ -41,6 +41,7 @@ pub mod prefs;
 pub mod rotate;
 pub mod season;
 pub mod shell;
+pub mod sidebar;
 pub mod sleep;
 pub mod switcher;
 pub mod tilt;
