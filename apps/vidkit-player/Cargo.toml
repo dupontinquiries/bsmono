@@ -46,6 +46,10 @@ ureq = { version = "2", optional = true, features = ["native-certs"] }
 vidkit-egui = { path = "../../shared/vidkit/crates/vidkit-egui", features = ["glow-upload"] }
 vidkit-mp4 = { path = "../../shared/vidkit/crates/vidkit-mp4" }
 vidkit-webm = { path = "../../shared/vidkit/crates/vidkit-webm" }
+# Section watching: chapters, search and plans (pure), and the transcript
+# producer whose loop src/transcribe.rs drives.
+vidkit-relevance = { path = "../../shared/vidkit/crates/vidkit-relevance" }
+vidkit-transcribe = { path = "../../shared/vidkit/crates/vidkit-transcribe" }
 uikit-egui = { path = "../../shared/uikit/crates/uikit-egui" }
 snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
 
@@ -53,11 +57,16 @@ snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
 # Default-on, matching the other -egui apps: `cargo build --release` in this
 # directory produces the deployable binary with no feature incantation. Off is
 # for a headless build that only wants the library half.
-default = ["app", "https"]
+default = ["app", "https", "whisper"]
 app = ["dep:eframe"]
 # HTTPS range fetching. Separate from `app` so a headless build that only wants
 # the demuxers does not pull rustls.
 https = ["dep:ureq"]
+# Whisper transcription in process (whisper-rs 0.16 / whisper.cpp). Needs cmake
+# and libclang at build time; `--no-default-features --features app,https`
+# builds without it, and section watching then works from sidecar subtitles
+# only.
+whisper = ["vidkit-transcribe/whisper"]
 
 # Monorepo-wide dev policy: full DWARF is the biggest artifact and link cost,
 # and the sandbox boxes are disk-starved.

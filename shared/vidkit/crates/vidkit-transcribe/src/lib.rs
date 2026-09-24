@@ -45,11 +45,11 @@ pub trait CueSource: Send {
     fn transcribe(&mut self, pcm: &[f32], offset: Duration) -> Result<Vec<Cue>, String>;
     /// For the UI and the cache key: `whisper:ggml-base.en.bin`, `subtitles:x.vtt`.
     fn name(&self) -> String;
-    /// Whether this source needs audio at all. A sidecar file does not, and
-    /// decoding an hour of audio to throw it away is exactly the waste the
-    /// shell should skip.
-    fn needs_audio(&self) -> bool {
-        true
+    /// The whole transcript, if this source has it without listening -- a
+    /// sidecar file does. The shell asks first and skips decoding entirely:
+    /// an hour of audio decoded to be ignored is exactly the waste to avoid.
+    fn complete(&mut self) -> Option<Vec<Cue>> {
+        None
     }
 }
 

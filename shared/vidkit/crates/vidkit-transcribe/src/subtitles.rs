@@ -115,8 +115,8 @@ impl CueSource for SubtitleSource {
     fn name(&self) -> String {
         self.name.clone()
     }
-    fn needs_audio(&self) -> bool {
-        false
+    fn complete(&mut self) -> Option<Vec<Cue>> {
+        Some(self.cues.clone())
     }
 }
 
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn the_source_answers_the_span_and_wants_no_audio() {
         let mut s = SubtitleSource::from_text("t", "WEBVTT\n\n00:01.000 --> 00:02.000\na\n\n00:31.000 --> 00:32.000\nb\n");
-        assert!(!s.needs_audio());
+        assert_eq!(s.complete().map(|c| c.len()), Some(2), "all of it, up front");
         let pcm = vec![0.0f32; 30 * crate::SAMPLE_RATE as usize];
         let got = s.transcribe(&pcm, Duration::ZERO).unwrap();
         assert_eq!(got.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), vec!["a"]);

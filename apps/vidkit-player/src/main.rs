@@ -23,11 +23,13 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use uikit_egui::{adaptive::Adaptive, skin::Skin, PaletteColors};
-use vidkit_core::traits::{MediaSource, Presenter};
+use vidkit_core::traits::MediaSource;
 use vidkit_egui::{bottom_bar, next_fit, EguiPresenter, Fit, Transport, VideoView};
 
 mod filepick;
 mod decode;
+mod export;
+mod transcribe;
 mod io;
 mod palette;
 mod pattern;
@@ -133,6 +135,19 @@ struct Player {
     /// Kept alive so the downloaded file outlives the decoder reading it.
     /// Dropping it deletes the file, and ffmpeg is still holding it open.
     downloaded: Option<io::TempMedia>,
+    /// Section watching: the panel, the loop that feeds it, and what the
+    /// loop has produced so far (recomputed only when its version changes).
+    sections: vidkit_egui::SectionsPanel,
+    sections_open: bool,
+    subtitles: bool,
+    worker: Option<transcribe::Worker>,
+    seen_version: u64,
+    windows: Vec<vidkit_relevance::Window>,
+    chapters: Vec<vidkit_relevance::sections::Chapter>,
+    hits: Vec<vidkit_relevance::sections::Hit>,
+    /// Active watch plan; empty plays everything.
+    plan: Vec<vidkit_relevance::Section>,
+    export_status: Arc<Mutex<Option<String>>>,
 }
 
 /// File-picker state. Navigation is uikit-egui's PathPicker; the file list and
@@ -251,7 +266,7 @@ impl Player {
             _ => Some(Duration::from_secs(212)),
         };
 
-        Self {
+        let mut me = Self {
             presenter: EguiPresenter::new(&cc.egui_ctx),
             view: VideoView::new().with_fit(Fit::Contain),
             transport: Transport {
@@ -276,7 +291,23 @@ impl Player {
             settings: Default::default(),
             settings_open: false,
             last_paste: None,
+            sections: Default::default(),
+            sections_open: false,
+            subtitles: false,
+            worker: None,
+            seen_version: 0,
+            windows: Vec::new(),
+            chapters: Vec::new(),
+            hits: Vec::new(),
+            plan: Vec::new(),
+            export_status: Arc::new(Mutex::new(None)),
+        };
+        // A file named on the command line gets its transcript too.
+        if let Some(p) = me.path.clone().filter(|_| me.engine.is_some()) {
+            let total = me.opened.as_ref().and_then(|o| o.as_ref().ok()).and_then(|o| o.duration);
+            me.start_transcription(Some(p.clone()), transcribe::AudioIn { input: p.to_string_lossy().into(), headers: Vec::new() }, total);
         }
+        me
     }
 
     /// Feed the presenter from the engine: the frame the clock says is due,
@@ -511,6 +542,9 @@ impl eframe::App for Player {
         // the app opened a file, parsed it, and said nothing about it. "What am
         // I playing" is the primary question a player answers; it does not
         // belong in the first field to be dropped for space.
+        self.sections_tick(ctx);
+        self.sections_ui(ctx);
+
         egui::TopBottomPanel::top("what").show(ctx, |ui| match &self.opened {
             Some(Err(e)) => {
                 ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
@@ -526,6 +560,13 @@ impl eframe::App for Player {
                     } else {
                         "not decoding — showing the test pattern"
                     });
+                    ui.separator();
+                    if ui.selectable_label(self.sections_open, "Sections").clicked() {
+                        self.sections_open = !self.sections_open;
+                    }
+                    if ui.selectable_label(self.subtitles, "CC").on_hover_text("subtitles from the transcript").clicked() {
+                        self.subtitles = !self.subtitles;
+                    }
                 });
             }
             None => {
@@ -533,7 +574,7 @@ impl eframe::App for Player {
             }
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let central = egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(gpu) = self.gpu.clone() {
                 let surface = ui.available_rect_before_wrap();
                 let (w, h) = gpu.lock().map(|g| g.size()).unwrap_or((0, 0));
@@ -562,6 +603,8 @@ impl eframe::App for Player {
                 self.seek_to(to);
             }
         });
+
+        self.subtitle_overlay(ctx, central.response.rect);
 
         // Overlays after the page, so they draw on top of it.
         self.palette_ui(ctx);
@@ -642,9 +685,8 @@ impl Player {
             // that appears to work and does not is worse than one that admits
             // it is unfinished.
             C::PlayClipboard => self.play_clipboard(),
-            C::Subtitles | C::ScrubToSections => {
-                self.gpu_error = Some(format!("{:?} is not wired up yet", c));
-            }
+            C::Subtitles => self.subtitles = !self.subtitles,
+            C::ScrubToSections => self.sections_open = !self.sections_open,
             // The same 5% steps the gestures and the bar use, so the three
             // controls cannot land on different values.
             C::SpeedUp => {
@@ -689,6 +731,7 @@ impl Player {
             Ok(e) => { self.transport.playing = true; Some(e) }
             Err(e) => { self.gpu_error = Some(format!("cannot play {}: {e}", path.display())); None }
         };
+        self.start_transcription(Some(path.clone()), transcribe::AudioIn { input: path.to_string_lossy().into(), headers: Vec::new() }, self.transport.duration);
         self.path = Some(path);
         self.opened = Some(result);
     }
@@ -1129,6 +1172,12 @@ impl Player {
             duration: None,
         }));
         self.engine = Some(engine);
+        // Transcribe from the audio URL (the video URL when muxed). No cache:
+        // the signed URL expires and is no key for anything.
+        let audio_url = resolved.audio_url.clone().unwrap_or_else(|| resolved.video_url.clone());
+        let headers: Vec<(String, String)> = resolved.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        self.start_transcription(None, transcribe::AudioIn { input: audio_url, headers }, None);
+        self.path = None;
         // The previous download, if any, is no longer needed.
         self.downloaded = None;
         self.transport.playing = true;
@@ -1213,4 +1262,211 @@ fn sink_maker() -> playback::SinkMaker {
 
 fn start_file(p: PathBuf) -> Result<playback::Engine, String> {
     playback::Engine::start(file_opener(p), sink_maker(), Duration::ZERO, 60)
+}
+
+/// `1:30–2:00`, for status lines.
+pub(crate) fn fmt_span(a: Duration, b: Duration) -> String {
+    format!("{}–{}", vidkit_egui::format_time(a), vidkit_egui::format_time(b))
+}
+
+impl Player {
+    /// (Re)start the transcription loop for what is now playing. The old
+    /// worker, if any, is dropped and stops after its current chunk.
+    fn start_transcription(&mut self, video: Option<PathBuf>, audio: transcribe::AudioIn, total: Option<Duration>) {
+        let cache = video.as_deref().and_then(transcribe::cache_path);
+        self.worker = Some(transcribe::Worker::start(transcribe::source_factory(video), audio, total, cache));
+        self.seen_version = 0;
+        self.windows.clear();
+        self.chapters.clear();
+        self.hits.clear();
+        self.plan.clear();
+        self.sections.selected.clear();
+    }
+
+    /// Per frame: feed the loop the playhead, pick up new transcript, and
+    /// enforce the watch plan.
+    fn sections_tick(&mut self, ctx: &egui::Context) {
+        let pos = self.transport.position;
+        if let Some(w) = &self.worker {
+            w.set_playhead(pos);
+            let (v, done) = w.with(|s| (s.version, s.coverage.complete()));
+            if v != self.seen_version {
+                self.seen_version = v;
+                // Minute windows: the unit vidkit-relevance scores and cuts.
+                self.windows = w.with(|s| s.transcript.windows(Duration::from_secs(60)));
+                self.chapters = vidkit_relevance::sections::chapters(
+                    &self.windows,
+                    &vidkit_relevance::sections::ChapterPolicy::default(),
+                );
+                let q = self.sections.query.trim();
+                if !q.is_empty() {
+                    self.hits = vidkit_relevance::sections::search(&self.windows, q, 8);
+                }
+            }
+            // Keep a visible panel current while paused, once a second --
+            // not more: nothing in it changes faster than a chunk.
+            if self.sections_open && !done {
+                ctx.request_repaint_after(Duration::from_secs(1));
+            }
+        }
+        if !self.plan.is_empty() && self.engine.is_some() && self.transport.playing {
+            if let Some(to) = vidkit_relevance::next_position(&self.plan, pos) {
+                let end = self.plan.last().map(|s| s.end).unwrap_or_default();
+                if to >= end {
+                    self.transport.playing = false;
+                    self.gpu_error = Some("end of the chosen sections".into());
+                } else {
+                    self.seek_to(to);
+                }
+            }
+        }
+        if let Some(msg) = self.export_status.lock().ok().and_then(|mut m| m.take()) {
+            self.gpu_error = Some(msg);
+        }
+    }
+
+    fn sections_ui(&mut self, ctx: &egui::Context) {
+        if !self.sections_open {
+            return;
+        }
+        let (status, progress, transcribed, total, mode) = match &self.worker {
+            Some(w) => w.with(|s| {
+                let rtf = s.realtime_factor.map(|r| format!(" · {r:.2}× realtime")).unwrap_or_default();
+                (format!("{}{rtf}", s.status), s.coverage.progress(), s.coverage.spans(), s.coverage.total(), s.coverage.mode)
+            }),
+            None => ("nothing open".into(), None, Vec::new(), None, vidkit_transcribe::coverage::Mode::Paused),
+        };
+        let scope = match mode {
+            vidkit_transcribe::coverage::Mode::Paused => vidkit_egui::Scope::Paused,
+            vidkit_transcribe::coverage::Mode::Ahead(_) => vidkit_egui::Scope::Ahead,
+            vidkit_transcribe::coverage::Mode::All => vidkit_egui::Scope::All,
+        };
+        let model = vidkit_egui::SectionsModel {
+            chapters: &self.chapters,
+            hits: &self.hits,
+            total: total.or(self.transport.duration),
+            position: self.transport.position,
+            transcribed: &transcribed,
+            progress,
+            status: &status,
+            plan: &self.plan,
+            scope,
+            can_export: self.path.is_some(),
+        };
+        // A phone in portrait has no room beside the picture: underneath.
+        let narrow = ctx.content_rect().width() < 700.0;
+        let panel = &mut self.sections;
+        let actions = if narrow {
+            egui::TopBottomPanel::bottom("sections").resizable(true).default_height(280.0)
+                .show(ctx, |ui| panel.ui(ui, &model)).inner
+        } else {
+            egui::SidePanel::right("sections").resizable(true).default_width(340.0)
+                .show(ctx, |ui| panel.ui(ui, &model)).inner
+        };
+        for a in actions {
+            self.section_action(a);
+        }
+    }
+
+    fn section_action(&mut self, a: vidkit_egui::SectionAction) {
+        use vidkit_egui::SectionAction as A;
+        let total = self
+            .worker
+            .as_ref()
+            .and_then(|w| w.with(|s| s.coverage.total()))
+            .or(self.transport.duration)
+            .unwrap_or_else(|| self.windows.last().map(|w| w.end).unwrap_or_default());
+        match a {
+            A::Seek(t) => self.seek_to(t),
+            A::Search(q) => self.hits = vidkit_relevance::sections::search(&self.windows, &q, 8),
+            A::WatchSpans(spans) => {
+                self.plan = vidkit_relevance::plan_keeping(&spans, total);
+                self.enter_plan();
+            }
+            A::WatchMatching(q) => {
+                let scores: Vec<vidkit_relevance::Score> = self
+                    .windows
+                    .iter()
+                    .map(|w| vidkit_relevance::Score::Lexical(vidkit_relevance::lexical_score(&q, &w.text)))
+                    .collect();
+                let plan = vidkit_relevance::plan(&self.windows, &scores, &vidkit_relevance::SkipPolicy::default());
+                let skipped = vidkit_relevance::skipped_fraction(&plan);
+                if skipped <= 0.0 {
+                    // plan() keeps everything both when everything matches and
+                    // when nothing does (its safety rule). Either way there is
+                    // no plan to follow, and the viewer should hear why.
+                    self.plan.clear();
+                    self.gpu_error = Some(format!("\"{q}\": no sections to skip — it matched everywhere or nowhere"));
+                } else {
+                    self.gpu_error = Some(format!("\"{q}\": skipping {:.0}% of the transcribed video", skipped * 100.0));
+                    self.plan = plan;
+                    self.enter_plan();
+                }
+            }
+            A::ClearPlan => self.plan.clear(),
+            A::Export(spans) => {
+                let Some(input) = self.path.clone() else { return };
+                let out = export::default_output(&input);
+                let status = self.export_status.clone();
+                self.gpu_error = Some(format!("exporting {} section(s) to {}…", spans.len(), out.display()));
+                let _ = std::thread::Builder::new().name("vidkit-export".into()).spawn(move || {
+                    let msg = match export::export(&input, &spans, &out) {
+                        Ok(()) => format!("exported to {}", out.display()),
+                        Err(e) => format!("export failed: {e}"),
+                    };
+                    if let Ok(mut s) = status.lock() {
+                        *s = Some(msg);
+                    }
+                });
+            }
+            A::SetScope(scope) => {
+                if let Some(w) = &self.worker {
+                    w.set_mode(match scope {
+                        vidkit_egui::Scope::Paused => vidkit_transcribe::coverage::Mode::Paused,
+                        // Five minutes: about ten chunks, a few minutes of
+                        // whisper on a phone -- enough to stay ahead of the
+                        // viewer without transcribing a lecture they may quit.
+                        vidkit_egui::Scope::Ahead => vidkit_transcribe::coverage::Mode::Ahead(Duration::from_secs(300)),
+                        vidkit_egui::Scope::All => vidkit_transcribe::coverage::Mode::All,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Starting a plan from outside a kept section jumps to the first one.
+    fn enter_plan(&mut self) {
+        let pos = self.transport.position;
+        let inside = self.plan.iter().any(|s| s.keep && pos >= s.start && pos < s.end);
+        if !inside {
+            if let Some(first) = self.plan.iter().find(|s| s.keep && s.end > pos).or_else(|| self.plan.iter().find(|s| s.keep)) {
+                let to = first.start;
+                self.seek_to(to);
+            }
+        }
+        self.transport.playing = true;
+    }
+
+    /// The spoken line, over the bottom of the picture.
+    fn subtitle_overlay(&self, ctx: &egui::Context, area: egui::Rect) {
+        if !self.subtitles {
+            return;
+        }
+        let Some(text) = self
+            .worker
+            .as_ref()
+            .and_then(|w| w.with(|s| s.transcript.at(self.transport.position).map(|c| c.text.clone())))
+        else {
+            return;
+        };
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("vidkit-subtitles")));
+        let font = egui::FontId::proportional((area.height() * 0.045).clamp(14.0, 30.0));
+        let galley = painter.layout(text, font, egui::Color32::WHITE, area.width() * 0.85);
+        let pos = egui::pos2(area.center().x - galley.size().x / 2.0, area.bottom() - galley.size().y - area.height() * 0.08);
+        // A backing box, not an outline: legible over white snow and black
+        // night alike, which a coloured outline is not.
+        let bg = egui::Rect::from_min_size(pos, galley.size()).expand(6.0);
+        painter.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(170));
+        painter.galley(pos, galley, egui::Color32::WHITE);
+    }
 }
