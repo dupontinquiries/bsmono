@@ -448,10 +448,12 @@ impl TranslatedFrame {
             }
         }
         
-        // Chroma copied from anchor (predictive only)
-        for i in y_sz..output.len().min(anchor_yuv.len()) {
-            output[i] = anchor_yuv[i];
-        }
+        // Chroma: `output` started as the motion-compensated prediction, and
+        // predict_from_motion moves chroma with its luma block. There is no chroma residual,
+        // so that IS the chroma. (Until this change a loop here overwrote it with the anchor's
+        // chroma, unmoved. Files written before decode with colour that now follows the
+        // motion; no residual was ever computed against the old chroma, so nothing in them
+        // depended on it staying put.)
         
         Some(output)
     }
@@ -624,7 +626,33 @@ fn predict_from_motion(anchor_yuv: &[u8], mvs: &[(i8, i8)], w: usize, h: usize) 
         }
     }
     
-    let _ = y_sz;
+    // Chroma (4:2:0, U then V, each (w/2)×(h/2)) moves with its 16×16 luma block: an 8×8
+    // chroma block, by the MV halved. Without this the prediction moved the brightness and
+    // left the colour where the anchor had it -- and since the residual is luma-only, nothing
+    // ever corrected that: a 2 px pan of a textured scene decoded at ~20 dB whatever the
+    // residual cost. Halving truncates toward zero, so an odd MV lands a half chroma pixel
+    // short; sub-pixel chroma is not worth a format change here.
+    let (cw, ch) = (w / 2, h / 2);
+    let c_sz = cw * ch;
+    if anchor_yuv.len() >= y_sz + 2 * c_sz && cw > 0 && ch > 0 {
+        for (bi, (dx, dy)) in mvs.iter().enumerate() {
+            if *dx == 0 && *dy == 0 { continue; }
+            let (bx, by) = (bi % bw, bi / bw);
+            let (cdx, cdy) = (*dx as i32 / 2, *dy as i32 / 2);
+            for plane in 0..2 {
+                let base = y_sz + plane * c_sz;
+                for py in 0..8 {
+                    for px in 0..8 {
+                        let (x, y) = (bx * 8 + px, by * 8 + py);
+                        if x >= cw || y >= ch { continue; }
+                        let sx = (x as i32 + cdx).clamp(0, cw as i32 - 1) as usize;
+                        let sy = (y as i32 + cdy).clamp(0, ch as i32 - 1) as usize;
+                        out[base + y * cw + x] = anchor_yuv[base + sy * cw + sx];
+                    }
+                }
+            }
+        }
+    }
     out
 }
 
@@ -916,5 +944,44 @@ pub fn unsharp_mask_y(
             let sharpened = center + strength * (center - blurred);
             y_plane[y * w + x] = sharpened.clamp(0.0, 255.0) as u8;
         }
+    }
+}
+
+#[cfg(test)]
+mod chroma_motion_tests {
+    use super::*;
+
+    /// A 4:2:0 frame whose luma AND chroma carry horizontal texture, shifted `shift` px left.
+    fn frame(w: usize, h: usize, shift: usize) -> Vec<u8> {
+        let (cw, ch) = (w / 2, h / 2);
+        let mut v = vec![0u8; w * h + 2 * cw * ch];
+        for y in 0..h { for x in 0..w { v[y * w + x] = (((x + shift) * 7 + y * 3) % 256) as u8; } }
+        for p in 0..2 {
+            let base = w * h + p * cw * ch;
+            for y in 0..ch { for x in 0..cw { v[base + y * cw + x] = (((x + shift / 2) * 23 + p * 90) % 256) as u8; } }
+        }
+        v
+    }
+
+    #[test]
+    fn chroma_follows_the_motion_vectors() {
+        let (w, h) = (64, 64);
+        let (anchor, actual) = (frame(w, h, 0), frame(w, h, 4));
+        // Every block moved by (4, 0).
+        let mvs = vec![(4i8, 0i8); (w / 16) * (h / 16)];
+        let pred = predict_from_motion(&anchor, &mvs, w, h);
+        let (cw, ch) = (w / 2, h / 2);
+        for p in 0..2 {
+            let base = w * h + p * cw * ch;
+            for y in 0..ch { for x in 0..cw - 2 {
+                assert_eq!(pred[base + y * cw + x], actual[base + y * cw + x], "plane {p} ({x},{y}): chroma must move by MV/2");
+            }}
+        }
+        // And through the decoder: a motion-only T-frame decodes to the moved chroma too.
+        let tf = TranslatedFrame { anchor_ref: 0, motion_vectors: mvs, residual_quantized: vec![], quant_step: 0, flags: 0x02, filter_mask: vec![] };
+        let out = tf.decode_with_anchor(&anchor, w, h).unwrap();
+        let base = w * h;
+        assert_eq!(out[base + 5 * cw + 3], actual[base + 5 * cw + 3]);
+        assert_ne!(out[base + 5 * cw + 3], anchor[base + 5 * cw + 3], "not the anchor's chroma left in place");
     }
 }
