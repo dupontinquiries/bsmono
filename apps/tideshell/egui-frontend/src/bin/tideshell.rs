@@ -14,6 +14,20 @@
 //! gets an egui frame through ShellView -> Actions go to the verified
 //! transports (zcosmic toplevel requests, EI, hatch, rusty-board).
 
+// musl returns modest allocations straight to the kernel rather than
+// retaining them, so a loop that allocates a few 8-32 kB buffers per frame
+// pays an mmap and an munmap for each — measured on the FP5 at about 1400 of
+// each per second, the largest syscall count in the process by a wide
+// margin, and every pair is a page-table walk and a TLB shootdown. A caching
+// allocator keeps those spans in userspace.
+//
+// Global rather than feature-gated: glibc would not have produced the
+// symptom, but it does not suffer from the fix either, and a phone shell
+// that behaves differently on the developer's laptop than on the phone is
+// worse than a megabyte of allocator.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashMap;
 use std::time::Instant;
 
