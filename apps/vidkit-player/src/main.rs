@@ -266,6 +266,10 @@ impl Player {
         }
 
         let colors = vidkit_egui::install(&cc.egui_ctx, snapclone_theme::palette_by_id("dark"));
+        // The decoder thread wakes the UI when a frame lands on a starved
+        // queue, instead of the UI polling every 4 ms (see Pick::Starved).
+        let waker_ctx = cc.egui_ctx.clone();
+        playback::set_global_waker(Arc::new(move || waker_ctx.request_repaint()));
         // The largest texture the GPU takes: the ceiling on decode size, so a
         // 12K source on a GPU that stops at 8192 is scaled by ffmpeg rather
         // than failing at upload.
@@ -415,7 +419,16 @@ impl Player {
         } else {
             self.speed_pending = None;
         }
-        let tick = engine.tick();
+        // How early egui woke us for our own deadline: the frame drawn now
+        // is seen at about that deadline, so pick for then.
+        let lead = self.presenter.deadline().map(|d| d.saturating_duration_since(Instant::now())).unwrap_or_default();
+        let tick = engine.tick_ahead(lead);
+        stats_note(match &tick {
+            playback::Tick::Show { .. } => "show",
+            playback::Tick::Wait(d) if *d < Duration::from_millis(2) => "wait<2ms",
+            playback::Tick::Wait(_) => "wait",
+            playback::Tick::Ended => "ended",
+        });
         self.transport.position = engine.position();
         // Say what is timing playback. On a device, "wall clock (no audio
         // player)" versus "audio clock (pw-play)" is the first thing to know
@@ -485,6 +498,8 @@ impl eframe::App for Player {
 
     #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
+        stats_tick(ctx);
+        stats_note(if ctx.current_pass_index() > 0 { "pass>0" } else { "pass0" });
         if self.quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -1978,5 +1993,56 @@ impl Player {
                 }
             }
         }
+    }
+}
+
+/// Count an engine tick kind for the stats line.
+fn stats_note(kind: &'static str) {
+    static KINDS: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new());
+    if std::env::var_os("VIDKIT_STATS").is_none() {
+        return;
+    }
+    if let Ok(mut k) = KINDS.lock() {
+        match k.iter_mut().find(|(n, _)| *n == kind) {
+            Some(e) => e.1 += 1,
+            None => k.push((kind, 1)),
+        }
+        if kind == "report" {
+            k.retain(|(n, _)| *n != "report");
+            eprintln!("STATS ticks {:?}", *k);
+            k.clear();
+        }
+    }
+}
+
+/// `VIDKIT_STATS=1`: repaints per second to stderr, once a second. For
+/// measuring what the UI costs in each state; off, it is one relaxed load.
+fn stats_tick(ctx: &egui::Context) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static FRAMES: AtomicU64 = AtomicU64::new(0);
+    static SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var_os("VIDKIT_STATS").is_some()) {
+        return;
+    }
+    FRAMES.fetch_add(1, Ordering::Relaxed);
+    static CAUSES: Mutex<Option<std::collections::HashMap<String, u32>>> = Mutex::new(None);
+    if let Ok(mut c) = CAUSES.lock() {
+        let m = c.get_or_insert_with(Default::default);
+        for cause in ctx.repaint_causes() {
+            *m.entry(format!("{cause}")).or_default() += 1;
+        }
+    }
+    let Ok(mut since) = SINCE.lock() else { return };
+    let t = since.get_or_insert_with(Instant::now);
+    if t.elapsed() >= Duration::from_secs(1) {
+        let top = CAUSES.lock().ok().and_then(|mut c| c.take()).map(|m| {
+            let mut v: Vec<_> = m.into_iter().collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            v.into_iter().take(3).map(|(k, n)| format!("{n}x {k}")).collect::<Vec<_>>().join(" | ")
+        }).unwrap_or_default();
+        eprintln!("STATS repaints/s {} causes: {top}", FRAMES.swap(0, Ordering::Relaxed));
+        stats_note("report");
+        *t = Instant::now();
     }
 }

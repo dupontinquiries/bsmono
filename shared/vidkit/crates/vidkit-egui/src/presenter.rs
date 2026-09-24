@@ -145,6 +145,11 @@ impl EguiPresenter {
         }
     }
 
+    /// The next frame's deadline, if one is set.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
     /// Playback stopped; stop asking for repaints.
     ///
     /// The explicit call is the correct fix and the staleness guard above is

@@ -84,6 +84,20 @@ pub fn set_refresh_hz(hz: u32) {
     REFRESH_HZ.store(hz.clamp(24, 1000), Ordering::Relaxed);
 }
 
+/// How long a starved tick waits if the decoder's wake never comes.
+pub const STARVED_BACKSTOP: Duration = Duration::from_millis(250);
+
+/// Called by the decoder thread to wake the UI.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
+static WAKER: std::sync::OnceLock<Waker> = std::sync::OnceLock::new();
+
+/// The app's waker for every engine (egui's `request_repaint`), set once at
+/// startup: engines spawn their decoder thread as they start.
+pub fn set_global_waker(w: Waker) {
+    let _ = WAKER.set(w);
+}
+
 /// Bytes of decoded frames the queue may hold ahead. Counted in bytes, not
 /// frames: six frames is 18 MB at 1080p and 715 MB at 12K (12288x6480 NV12
 /// is 119 MB a frame).
@@ -344,6 +358,10 @@ pub struct Engine {
     depth: usize,
     /// A wall clock held until the first frame is queued.
     waiting_first: bool,
+    /// Set by a starved tick; the decoder thread clears it and wakes the UI
+    /// when the next frame is queued.
+    starved: Arc<AtomicBool>,
+    waker: Option<Waker>,
     audio_error: Arc<Mutex<Option<String>>>,
     paused: bool,
     frame_interval: Duration,
@@ -374,6 +392,8 @@ impl Engine {
             speed: 1.0,
             depth: QUEUE_DEPTH,
             waiting_first: false,
+            starved: Arc::new(AtomicBool::new(false)),
+            waker: WAKER.get().cloned(),
             audio_error: Arc::new(Mutex::new(None)),
             paused: false,
             frame_interval: Duration::from_millis(33),
@@ -414,6 +434,7 @@ impl Engine {
         self.depth = queue_depth(fb);
         let (tx, rx) = mpsc::sync_channel::<Frame>(channel_depth(fb));
         let (stop, decoder) = (self.stop.clone(), self.decoder.clone());
+        let (starved, waker) = (self.starved.clone(), self.waker.clone());
         std::thread::Builder::new().name("vidkit-video".into()).spawn(move || {
             let mut video = video;
             while !stop.load(Ordering::Relaxed) {
@@ -425,6 +446,11 @@ impl Engine {
                 }
                 if tx.send(f).is_err() {
                     break;
+                }
+                if starved.swap(false, Ordering::SeqCst) {
+                    if let Some(w) = &waker {
+                        w();
+                    }
                 }
             }
         }).map_err(|e| format!("video thread: {e}"))?;
@@ -527,6 +553,26 @@ impl Engine {
 
     /// One UI repaint's worth of work: never blocks on a decoder or a sink.
     pub fn tick(&mut self) -> Tick {
+        self.tick_ahead(Duration::ZERO)
+    }
+
+    /// The largest presentation lead [`tick_ahead`](Self::tick_ahead) honours:
+    /// half a frame, and never more than 25 ms.
+    pub fn max_lead(&self) -> Duration {
+        (self.frame_interval / 2).min(Duration::from_millis(25))
+    }
+
+    /// Pick for the moment the frame will be SEEN: `lead` from now.
+    ///
+    /// egui wakes a repaint early by about its render time, so the frame is
+    /// on screen by the deadline asked for. Asked "what is due now?", the
+    /// engine answered "nothing yet, wait 15 ms" and the app went round again
+    /// -- measured 96 repaints a second for 24 fps video, 72 of them to be
+    /// told to wait. Picking for the presentation time shows the frame on
+    /// the wake egui intended. Capped by max_lead, so a wake from input
+    /// cannot pull a frame visibly early.
+    pub fn tick_ahead(&mut self, lead: Duration) -> Tick {
+        let lead = lead.min(self.max_lead());
         // AUDIO ENDED FIRST: carry on from where it stopped on the wall clock,
         // or the video would freeze on the frame the audio ran out at.
         if self.master.is_audio() && self.audio_done.load(Ordering::SeqCst) {
@@ -555,10 +601,14 @@ impl Engine {
             return Tick::Wait(Duration::from_millis(250));
         }
         let pool = self.pool.clone();
-        match pick(&mut self.queue, self.master.now(), &self.policy, &mut |f| pool.recycle(f)) {
+        let at = self.master.now() + lead;
+        match pick(&mut self.queue, at, &self.policy, &mut |f| pool.recycle(f)) {
             Pick::Show { frame, dropped } => {
                 self.dropped += dropped as u64;
                 self.shown += 1;
+                // Durations back to the app are from NOW: it adds them to
+                // the current instant for its deadline. Only the pick uses
+                // the presentation time.
                 let next = self.queue.front()
                     .map(|n| n.pts.saturating_sub(self.master.now()))
                     .unwrap_or(self.frame_interval);
@@ -566,11 +616,23 @@ impl Engine {
             }
             Pick::Hold { wait, dropped } => {
                 self.dropped += dropped as u64;
-                Tick::Wait(wait)
+                // `wait` was measured from the presentation time.
+                Tick::Wait(wait + lead)
             }
             Pick::Starved { dropped } => {
                 self.dropped += dropped as u64;
-                if self.video_rx.is_none() { Tick::Ended } else { Tick::Wait(Duration::from_millis(4)) }
+                if self.video_rx.is_none() {
+                    Tick::Ended
+                } else {
+                    // Event-driven, not polled. This returned Wait(4 ms), and
+                    // the UI repainted the whole window every 4 ms asking
+                    // "is the frame there yet?" -- measured 96 repaints a
+                    // second for 24 fps video. Now the decoder thread wakes
+                    // the UI when a frame lands while we are starved; the
+                    // wait is only the backstop for a missed wake.
+                    self.starved.store(true, Ordering::SeqCst);
+                    Tick::Wait(STARVED_BACKSTOP)
+                }
             }
         }
     }
@@ -615,6 +677,12 @@ impl Engine {
     /// (allocated, reused) plane buffers since start.
     pub fn pool_stats(&self) -> (u64, u64) {
         (self.pool.allocated.load(Ordering::Relaxed), self.pool.reused.load(Ordering::Relaxed))
+    }
+
+    /// How the decoder thread wakes the UI (egui's `request_repaint`). Takes
+    /// effect from the next (re)start of the decoder thread.
+    pub fn set_waker(&mut self, w: Waker) {
+        self.waker = Some(w);
     }
 
     /// The display's refresh rate: the sync slack is half its interval. It
@@ -1178,5 +1246,85 @@ mod tests {
             assert!(t0.elapsed() < ms(2000));
         };
         assert!(first < ms(50), "the clock ran ahead before the first frame: first shown {first:?}");
+    }
+
+    /// A starved engine does not ask to be polled: its wait is the long
+    /// backstop, and the decoder thread's wake arrives when the frame does.
+    #[test]
+    fn starvation_is_woken_not_polled() {
+        if !have_ffmpeg() { return; }
+        let p = clip("wake.mkv", 2.0, 0.0);
+        let woken = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let w2 = woken.clone();
+        let mut e = Engine::start(opener(p.clone()), null_sink(), Duration::ZERO, 60).unwrap();
+        e.set_waker(Arc::new(move || { w2.fetch_add(1, Ordering::SeqCst); }));
+        e.restart(Duration::ZERO).unwrap(); // the waker reaches the new decoder thread
+        let t0 = Instant::now();
+        let (mut waits, mut shown) = (Vec::new(), 0);
+        while t0.elapsed() < ms(1200) && shown < 20 {
+            match e.tick() {
+                Tick::Show { frame, next } => { shown += 1; e.recycle(frame); std::thread::sleep(next.min(ms(40))); }
+                Tick::Wait(d) => {
+                    waits.push(d);
+                    // Sleep until woken or the backstop, like egui would.
+                    let before = woken.load(Ordering::SeqCst);
+                    let until = Instant::now() + d.min(ms(300));
+                    while Instant::now() < until && woken.load(Ordering::SeqCst) == before { std::thread::sleep(ms(1)); }
+                }
+                Tick::Ended => break,
+            }
+        }
+        assert!(shown >= 20, "played {shown}");
+        assert!(waits.iter().all(|d| *d >= ms(5)), "a poll-rate wait came back: {waits:?}");
+        if waits.iter().any(|d| *d == STARVED_BACKSTOP) {
+            assert!(woken.load(Ordering::SeqCst) > 0, "starved, and nothing woke us");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn diag_ticks_per_frame() {
+        let p = clip("diag24.mkv", 3.0, 0.0);
+        let mut e = Engine::start(opener(p), null_sink(), Duration::ZERO, 60).unwrap();
+        let t0 = Instant::now();
+        let mut log = Vec::new();
+        while t0.elapsed() < ms(1500) {
+            let tick = e.tick();
+            let at = t0.elapsed().as_millis();
+            match tick {
+                Tick::Show { frame, next } => { log.push(format!("{at}ms SHOW pts {} next {}ms", frame.pts.as_millis(), next.as_millis())); e.recycle(frame); std::thread::sleep(next); }
+                Tick::Wait(d) => { log.push(format!("{at}ms WAIT {}ms", d.as_millis())); std::thread::sleep(d); }
+                Tick::Ended => break,
+            }
+        }
+        for l in log.iter().skip(20).take(24) { eprintln!("DIAG {l}"); }
+        eprintln!("DIAG ticks {} shown {}", log.len(), e.shown);
+    }
+
+    /// Woken 12 ms before a frame is due (egui's render lead), the engine
+    /// shows it rather than sending the app round again; a lead larger than
+    /// half a frame is capped.
+    #[test]
+    fn a_frame_due_within_the_presentation_lead_is_shown() {
+        if !have_ffmpeg() { return; }
+        let p = clip("lead.mkv", 2.0, 0.0);
+        let mut e = Engine::start(opener(p), null_sink(), Duration::ZERO, 60).unwrap();
+        // Get to steady state, then stop just after a frame.
+        let t0 = Instant::now();
+        while t0.elapsed() < ms(400) {
+            if let Tick::Show { frame, next } = e.tick() { e.recycle(frame); std::thread::sleep(next); }
+        }
+        let mut shown_early = 0;
+        let mut waited = 0;
+        for _ in 0..20 {
+            // Wake 12 ms before the next frame, as egui does.
+            match e.tick_ahead(ms(12)) {
+                Tick::Show { frame, next } => { shown_early += 1; e.recycle(frame); std::thread::sleep(next.saturating_sub(ms(12))); }
+                Tick::Wait(d) => { waited += 1; std::thread::sleep(d.saturating_sub(ms(12))); }
+                Tick::Ended => break,
+            }
+        }
+        assert!(shown_early >= 15 && waited <= 5, "shown {shown_early}, sent round again {waited}");
+        assert_eq!(e.max_lead().as_millis(), 16, "30 fps: half a frame");
     }
 }
