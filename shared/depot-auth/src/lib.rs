@@ -80,13 +80,21 @@ pub fn scope_for(method: &str, path: &str) -> Option<Scope> {
     if path.starts_with("/api/pair/") && (path.ends_with("/approve") || path.ends_with("/deny")) {
         return Some(Scope::Approve);
     }
-    if path.starts_with("/api/packs") {
+    // POST /api/pack (singular) is a real route too, and "/api/packs" does
+    // not prefix-match it.
+    if path == "/api/pack" || path.starts_with("/api/packs") {
         return Some(Scope::Packs);
     }
     if path.starts_with("/api/term/") {
         return Some(Scope::Term);
     }
-    if ["/api/crates", "/api/rpm/", "/api/toolchains", "/api/apk/", "/api/artifacts/"].iter().any(|p| path.starts_with(p)) {
+    // The ingest routes depot actually serves. /api/apk and /api/artifacts
+    // were listed here but no such routes exist, so they promised a paired
+    // client access to nothing. A write route with no scope takes the admin
+    // token and nothing else, which is the safe default and also the reason
+    // a newly added route looks broken for paired clients until it is added
+    // here.
+    if ["/api/crates", "/api/rpm/", "/api/toolchains"].iter().any(|p| path.starts_with(p)) {
         return Some(Scope::Ingest);
     }
     None
@@ -340,19 +348,19 @@ mod tests {
         let key = paired(&id, &[Scope::Ingest]);
         let look = |n: &str| (n == key.name).then(|| key.clone());
         let mut rp = Replay::default();
-        let h = id.authorization("PUT", "/api/apk/fleet", 1000, "0123456789abcdef", 42);
-        assert!(verify(&h, "PUT", "/api/apk/fleet", 42, Scope::Ingest, 1010, &mut rp, look).is_ok());
-        assert_eq!(verify(&h, "PUT", "/api/apk/fleet", 42, Scope::Ingest, 1010, &mut rp, look), Err(Denied::Replay));
-        let h2 = id.authorization("PUT", "/api/apk/fleet", 1000, "1123456789abcdef", 42);
-        assert_eq!(verify(&h2, "PUT", "/api/apk/other", 42, Scope::Ingest, 1000, &mut rp, look), Err(Denied::BadSignature), "path is signed");
-        assert_eq!(verify(&h2, "PUT", "/api/apk/fleet", 43, Scope::Ingest, 1000, &mut rp, look), Err(Denied::BadSignature), "length is signed");
-        assert_eq!(verify(&h2, "POST", "/api/apk/fleet", 42, Scope::Ingest, 1000, &mut rp, look), Err(Denied::BadSignature), "method is signed");
-        assert!(matches!(verify(&h2, "PUT", "/api/apk/fleet", 42, Scope::Ingest, 1000 + SKEW_S + 1, &mut rp, look), Err(Denied::Clock { .. })));
+        let h = id.authorization("PUT", "/api/rpm/fedora", 1000, "0123456789abcdef", 42);
+        assert!(verify(&h, "PUT", "/api/rpm/fedora", 42, Scope::Ingest, 1010, &mut rp, look).is_ok());
+        assert_eq!(verify(&h, "PUT", "/api/rpm/fedora", 42, Scope::Ingest, 1010, &mut rp, look), Err(Denied::Replay));
+        let h2 = id.authorization("PUT", "/api/rpm/fedora", 1000, "1123456789abcdef", 42);
+        assert_eq!(verify(&h2, "PUT", "/api/rpm/other", 42, Scope::Ingest, 1000, &mut rp, look), Err(Denied::BadSignature), "path is signed");
+        assert_eq!(verify(&h2, "PUT", "/api/rpm/fedora", 43, Scope::Ingest, 1000, &mut rp, look), Err(Denied::BadSignature), "length is signed");
+        assert_eq!(verify(&h2, "POST", "/api/rpm/fedora", 42, Scope::Ingest, 1000, &mut rp, look), Err(Denied::BadSignature), "method is signed");
+        assert!(matches!(verify(&h2, "PUT", "/api/rpm/fedora", 42, Scope::Ingest, 1000 + SKEW_S + 1, &mut rp, look), Err(Denied::Clock { .. })));
         let h3 = id.authorization("PUT", "/api/packs", 1000, "2123456789abcdef", 1);
         assert!(matches!(verify(&h3, "PUT", "/api/packs", 1, Scope::Packs, 1000, &mut rp, look), Err(Denied::Scope { .. })));
         let other = Identity::generate("mallory");
-        let h4 = other.authorization("PUT", "/api/apk/fleet", 1000, "3123456789abcdef", 42).replace("mallory", "gitmind-egui-mac");
-        assert_eq!(verify(&h4, "PUT", "/api/apk/fleet", 42, Scope::Ingest, 1000, &mut rp, look), Err(Denied::BadSignature), "a different key under the paired name");
+        let h4 = other.authorization("PUT", "/api/rpm/fedora", 1000, "3123456789abcdef", 42).replace("mallory", "gitmind-egui-mac");
+        assert_eq!(verify(&h4, "PUT", "/api/rpm/fedora", 42, Scope::Ingest, 1000, &mut rp, look), Err(Denied::BadSignature), "a different key under the paired name");
         assert!(matches!(verify("Bearer x", "PUT", "/", 0, Scope::Ingest, 0, &mut rp, look), Err(Denied::Malformed)));
         assert!(matches!(verify(&id.authorization("PUT", "/", 0, "short", 0), "PUT", "/", 0, Scope::Ingest, 0, &mut rp, look), Err(Denied::Malformed)), "nonce too short");
     }
@@ -391,6 +399,9 @@ mod tests {
         assert_eq!(scope_for("PUT", "/api/crates"), Some(Scope::Ingest));
         assert_eq!(scope_for("PUT", "/api/rpm/fedora"), Some(Scope::Ingest));
         assert_eq!(scope_for("PUT", "/api/packs"), Some(Scope::Packs));
+        assert_eq!(scope_for("POST", "/api/pack"), Some(Scope::Packs));
+        assert_eq!(scope_for("POST", "/api/crates/foo/1.0/yank"), Some(Scope::Ingest));
+        assert_eq!(scope_for("PUT", "/api/artifacts/x"), None, "no artifacts route exists yet: admin only until one does");
         assert_eq!(scope_for("POST", "/api/pair/p1/approve"), Some(Scope::Approve));
         assert_eq!(scope_for("POST", "/api/term/open"), Some(Scope::Term));
         assert_eq!(scope_for("GET", "/api/crates"), None, "reads are open");
