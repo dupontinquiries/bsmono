@@ -670,11 +670,18 @@ fn main() {
         } else {
             250
         };
-        // Sleep on the control socket as well as on Wayland: the power key
-        // arrives there, and at the idle timeout it would otherwise wait a
-        // quarter of a second before the screen reacted.
-        let ctl_fd = ctl_server.as_ref().map(|s| s.as_fd());
-        let input = io.dispatch_with(timeout, ctl_fd).unwrap_or_else(|e| {
+        // Sleep on everything that can want the loop, not only on Wayland:
+        // the power key arrives on the control socket and the volume keys
+        // come from the evdev reader, and at the idle timeout either would
+        // otherwise wait a quarter of a second before anything happened.
+        let mut wake_fds: Vec<std::os::fd::BorrowedFd> = Vec::new();
+        if let Some(c) = ctl_server.as_ref() {
+            wake_fds.push(c.as_fd());
+        }
+        if let Some(k) = sb.keys.as_ref().and_then(|k| k.wake_fd()) {
+            wake_fds.push(k);
+        }
+        let input = io.dispatch_with(timeout, &wake_fds).unwrap_or_else(|e| {
             eprintln!("tideshell: wayland: {e}");
             std::process::exit(1)
         });
@@ -937,6 +944,9 @@ fn main() {
         use tideshell_core::volkeys::{Intent, VolKey};
         use tideshell_egui::keys::{KeyEvent, KeyPress};
         let mut events: Vec<KeyEvent> = sb.keys.as_ref().map(|k| k.rx.try_iter().collect()).unwrap_or_default();
+        if let Some(k) = sb.keys.as_ref() {
+            k.drain_wake();
+        }
         if let Some(srv) = &ctl_server {
             use tideshell_egui::ctl::Command;
             for c in srv.poll() {

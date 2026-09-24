@@ -659,24 +659,26 @@ impl Io {
     /// Wait up to `timeout_ms` for events, dispatch them, act on configures,
     /// and return the input gathered.
     pub fn dispatch(&mut self, timeout_ms: i32) -> Result<Vec<Input>, String> {
-        self.dispatch_with(timeout_ms, None)
+        self.dispatch_with(timeout_ms, &[])
     }
 
     /// The same, also waking on `extra`.
     ///
     /// The loop sleeps up to its timeout on the Wayland connection, so
-    /// anything arriving on another descriptor waits for it — and the power
-    /// key comes in on the control socket. At the idle timeout that was a
-    /// quarter of a second between pressing power and the screen reacting,
-    /// which reads as a phone that is thinking about it. Waiting on both
-    /// costs nothing: it is the same poll with one more entry.
-    pub fn dispatch_with(&mut self, timeout_ms: i32, extra: Option<std::os::fd::BorrowedFd<'_>>) -> Result<Vec<Input>, String> {
+    /// anything arriving on another descriptor waits for it — the power key
+    /// on the control socket, a volume press from evdev. At the idle timeout
+    /// that is a quarter of a second between pressing a key and the screen
+    /// reacting, which reads as a phone thinking about whether to obey.
+    /// Waiting on all of them costs nothing: it is the same poll with more
+    /// entries.
+    pub fn dispatch_with(&mut self, timeout_ms: i32, extra: &[std::os::fd::BorrowedFd<'_>]) -> Result<Vec<Input>, String> {
         self.flush();
         self.queue.dispatch_pending(&mut self.st).map_err(|e| e.to_string())?;
         if let Some(guard) = self.queue.prepare_read() {
             let fd = guard.connection_fd();
-            let mut fds: Vec<rustix::event::PollFd> = vec![rustix::event::PollFd::new(&fd, rustix::event::PollFlags::IN)];
-            if let Some(e) = extra.as_ref() {
+            let mut fds: Vec<rustix::event::PollFd> = Vec::with_capacity(1 + extra.len());
+            fds.push(rustix::event::PollFd::new(&fd, rustix::event::PollFlags::IN));
+            for e in extra {
                 fds.push(rustix::event::PollFd::new(e, rustix::event::PollFlags::IN));
             }
             let ts = rustix::time::Timespec { tv_sec: (timeout_ms / 1000) as i64, tv_nsec: ((timeout_ms % 1000) as i64) * 1_000_000 };
