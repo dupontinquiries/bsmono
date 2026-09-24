@@ -38,6 +38,9 @@ pub struct SmokeVolume {
     /// Half-thickness when it was made: as it spreads it thins by
     /// `across0 / half[1]` (a fixed "3" here diluted big puffs from birth).
     pub across0: f32,
+    /// The dragon whose smoke this is (0 = nobody's), so its wisps can wear
+    /// that dragon's feelings (`smoke_wisps`).
+    pub owner: u64,
 }
 
 impl SmokeVolume {
@@ -55,6 +58,7 @@ impl SmokeVolume {
             age: 0.0,
             life,
             across0: 3.0,
+            owner: 0,
         }
     }
 
@@ -106,6 +110,7 @@ pub struct Mantle {
     pub puff_life: f32,
     last: Option<([f32; 3], f32)>,
     t: f32,
+    n: u64,
 }
 
 impl Mantle {
@@ -117,6 +122,7 @@ impl Mantle {
             puff_life: 10.0,
             last: None,
             t: 0.0,
+            n: 0,
         }
     }
 
@@ -144,14 +150,24 @@ impl Mantle {
             return None;
         }
         self.last = Some((dragon_ground, self.t));
+        // Puffs land scattered around it, not centred on it: the cloud's shape
+        // must not point at where the dragon is.
+        self.n += 1;
+        let j = |i: u64| {
+            let mut z = self.n.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ i.wrapping_mul(0xD1B5_4A32_D192_ED03);
+            z = (z ^ (z >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            ((z ^ (z >> 32)) >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        };
+        let off = [j(1) * self.radius * 1.3, j(2) * self.radius * 1.3];
         Some(SmokeVolume {
-            center: [dragon_ground[0], dragon_ground[1] + self.height * 0.5, dragon_ground[2]],
+            center: [dragon_ground[0] + off[0], dragon_ground[1] + self.height * 0.5, dragon_ground[2] + off[1]],
             along: [1.0, 0.0],
             half: [self.radius, self.radius, self.height * 0.5],
             density: 0.8,
             age: 0.0,
             life: self.puff_life,
             across0: self.radius,
+            owner: 0,
         })
     }
 }
@@ -288,6 +304,17 @@ mod tests {
     }
 
     #[test]
+    fn puffs_scatter_around_it_rather_than_marking_its_spot() {
+        let mut m = Mantle::new(30.0, 4.0);
+        let offs: Vec<f32> = (0..200)
+            .filter_map(|i| m.emit([i as f32 * 0.5, 64.0, 0.0], 0.1).map(|p| (p.center[2]).abs() + (p.center[0] - i as f32 * 0.5).abs()))
+            .collect();
+        assert!(offs.len() > 10);
+        let mean = offs.iter().sum::<f32>() / offs.len() as f32;
+        assert!(mean > m.radius * 0.5, "puffs sit {mean:.1} m from it on average");
+    }
+
+    #[test]
     fn a_fast_dragon_does_not_outrun_its_smoke() {
         let mut m = Mantle::new(10.0, 4.0);
         let mut last: Option<f32> = None;
@@ -296,7 +323,7 @@ mod tests {
             x += 15.0 * 0.05; // 15 m/s
             if let Some(p) = m.emit([x, 64.0, 0.0], 0.05) {
                 if let Some(l) = last {
-                    assert!(p.center[0] - l <= m.radius * 0.6 + 0.8, "gap {}", p.center[0] - l);
+                    assert!(p.center[0] - l <= m.radius * 0.6 + 0.8 + 2.0 * 1.3 * m.radius, "gap {}", p.center[0] - l);
                 }
                 last = Some(p.center[0]);
             }

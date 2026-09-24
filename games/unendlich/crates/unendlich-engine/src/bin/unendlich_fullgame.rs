@@ -2636,6 +2636,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // (sim::smoke_tells); lifts the ambient light for that frame.
     let mut smoke_flash: f32 = 0.0;
     let mut smoke_flash_shown: f32;
+    // What dragons' smoke LOOKS like (sim::smoke_wisps): wisps spawned inside the
+    // smoke volumes, moved by each owner-dragon's FEELINGS (hunger, rage, fear,
+    // calm) -- never by where it is. dragon_looks is refreshed every frame.
+    let mut wisps = unendlich_engine::sim::smoke_wisps::WispField::new(320, 0x5E0C_EB15);
+    let mut dragon_looks: std::collections::HashMap<u64, unendlich_engine::sim::smoke_wisps::Look> =
+        std::collections::HashMap::new();
     // UNENDLICH_DRAGON_AT=<metres>[:downwind]: 3 s after entering a world,
     // hatch ONE dragon that far ahead of you (or downwind of you, where your
     // scent goes). For soaks and for testing a fight without hunting for one
@@ -9462,6 +9468,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
             smoke_walls.retain(|w| w.alive());
             {
+                use unendlich_engine::sim::smoke_wisps as sw;
+                let calm = sw::look(&sw::Feeling::default());
+                let looks = |o: u64| dragon_looks.get(&o).copied().unwrap_or(calm);
+                let owners: Vec<u64> = smoke_walls.iter().map(|w| w.owner).collect();
+                let pp = local_player.view.position;
+                wisps.emit(&smoke_walls, &owners, &looks, dt);
+                wisps.step(&looks, scent_wind, Some([pp.x, pp.y - 1.4, pp.z]), dt);
+                if dragon_trace && !wisps.wisps.is_empty() && (wisps.time % 5.0) < dt {
+                    log::info!("[smoke] {} wisps over {} volumes", wisps.wisps.len(), smoke_walls.len());
+                }
+            }
+            {
                 let pp = local_player.view.position;
                 let d = unendlich_engine::sim::smoke_wall::density_at(&smoke_walls, [pp.x, pp.y, pp.z]);
                 let now_in = d > 0.15;
@@ -11210,9 +11228,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     if area.ability.form == unendlich_engine::sim::dragon_abilities::Form::SmokeWall {
                                         let len = area.ability.radius * 2.0;
                                         let height = (area.ability.radius * 2.2).max(14.0);
-                                        smoke_walls.push(unendlich_engine::sim::smoke_wall::SmokeVolume::wall(
+                                        let mut wall = unendlich_engine::sim::smoke_wall::SmokeVolume::wall(
                                             area.center, area.from, feet, len, height, area.ability.linger_s,
-                                        ));
+                                        );
+                                        wall.owner = d.id;
+                                        smoke_walls.push(wall);
                                         // …and it keeps smoking as it moves: its cover goes
                                         // with it, so the wall is not yours to camp behind.
                                         d.mantle = Some(unendlich_engine::sim::smoke_wall::Mantle::new(
@@ -11249,7 +11269,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             // Smoking: lay a puff where it is now.
                             if let Some(m) = d.mantle.as_mut() {
                                 let ground = [cr.body.position[0], cr.body.position[1] - cr.body.half_extents[1], cr.body.position[2]];
-                                if let Some(p) = m.emit(ground, dt) {
+                                if let Some(mut p) = m.emit(ground, dt) {
+                                    p.owner = d.id;
                                     smoke_walls.push(p);
                                 }
                                 if !m.active() {
@@ -11268,6 +11289,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 log::info!("[dragon#{:04x}] eyes open in the smoke ({:.0}% through)", tag, tell.eyes * 100.0);
                             }
                             d.eyes = tell.eyes;
+                            // How it feels, for its smoke (sim::smoke_wisps).
+                            {
+                                use unendlich_engine::sim::smoke_wisps as sw;
+                                let f = sw::Feeling::from_state(
+                                    1.0 - vitality.energy.clamp(0.0, 1.0),
+                                    d.state.mem.total_pain(),
+                                    (*hp).max(0) as f32 / d.profile.max_hp.max(1) as f32,
+                                    d.profile.ferocity,
+                                    cunning_now,
+                                );
+                                dragon_looks.insert(d.id, sw::look(&f));
+                            }
                             smoke_flash = smoke_flash.max(tell.flash);
                             // The wind-up is visible: it glows in its element's hue
                             // as the charge builds (was the old bending AI's tell).
@@ -15256,22 +15289,58 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 everts.extend(cv);
                 eindices.extend(ci.iter().map(|i| i + base));
             }
-            // Dragons' smoke, drawn as translucent volumes (no volumetric pass
-            // exists; the entity pipeline blends per-vertex alpha). Denser =
-            // more opaque; a charging dragon's flash lights it.
-            for w in &smoke_walls {
-                let dens = w.density_at(w.center);
-                if dens <= 0.01 {
-                    continue;
-                }
+            // Dragons' smoke: soft camera-facing cards from sim::smoke_wisps
+            // (no volumetric pass exists; the entity pipeline blends per-vertex
+            // alpha, so a fan with an opaque centre and clear rim reads as a
+            // soft wisp). A charging dragon's flash lights the whole cloud.
+            {
+                use unendlich_engine::sim::smoke_wisps as sw;
+                let calm = sw::look(&sw::Feeling::default());
+                let looks = |o: u64| dragon_looks.get(&o).copied().unwrap_or(calm);
+                let f = local_player.view.forward();
+                let rl = (f.x * f.x + f.z * f.z).sqrt().max(1e-4);
+                let right = [-f.z / rl, 0.0, f.x / rl];
+                let up = [
+                    right[1] * f.z - right[2] * f.y,
+                    right[2] * f.x - right[0] * f.z,
+                    right[0] * f.y - right[1] * f.x,
+                ];
                 let lit = smoke_flash_shown * 0.6;
-                let col = [0.22 + lit, 0.21 + lit * 0.85, 0.2 + lit * 0.6];
-                for (scale, a) in [(1.0f32, 0.18f32), (0.7, 0.22), (0.4, 0.28)] {
-                    push_oriented_box(
-                        everts, eindices, w.center,
-                        [w.half[0] * scale, w.half[1] * scale, w.half[2] * scale],
-                        w.along, col, (a * dens).min(0.6),
-                    );
+                for c in wisps.cards(&looks) {
+                    if c.alpha <= 0.01 {
+                        continue;
+                    }
+                    let col = [c.color[0] + lit, c.color[1] + lit * 0.85, c.color[2] + lit * 0.6];
+                    let base = everts.len() as u32;
+                    everts.push(unendlich_engine::world::entity::EntityVertex { position: c.center, color: col, alpha: c.alpha });
+                    // Two rings: an inner one at 45% radius keeping 60% of the
+                    // alpha, then a clear rim -- a falloff close to a Gaussian,
+                    // so overlapping cards don't show their polygon edges.
+                    const SEG: u32 = 12;
+                    for (ring, rr, aa) in [(0u32, 0.45f32, 0.6f32), (1, 1.0, 0.0)] {
+                        let _ = ring;
+                        for k in 0..SEG {
+                            let a = std::f32::consts::TAU * (k as f32 + 0.5 * ring as f32) / SEG as f32;
+                            let (ca, sa) = (a.cos() * c.radius * rr, a.sin() * c.radius * rr);
+                            everts.push(unendlich_engine::world::entity::EntityVertex {
+                                position: [
+                                    c.center[0] + right[0] * ca + up[0] * sa,
+                                    c.center[1] + right[1] * ca + up[1] * sa,
+                                    c.center[2] + right[2] * ca + up[2] * sa,
+                                ],
+                                color: col,
+                                alpha: c.alpha * aa,
+                            });
+                        }
+                    }
+                    let inner = |k: u32| base + 1 + (k % SEG);
+                    let outer = |k: u32| base + 1 + SEG + (k % SEG);
+                    for k in 0..SEG {
+                        for t in [[base, inner(k), inner(k + 1)], [inner(k), outer(k), inner(k + 1)], [inner(k + 1), outer(k), outer(k + 1)]] {
+                            eindices.extend(t);
+                            eindices.extend([t[0], t[2], t[1]]); // both faces
+                        }
+                    }
                 }
             }
             // Append sim mobs via the bridge.
