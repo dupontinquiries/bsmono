@@ -47,6 +47,9 @@ const DISMISS_DRAG: f32 = 80.0;
 
 pub struct HatchUi {
     pub core: Launcher,
+    /// The one line from the boxes at home (logscope on the Ultra / the mini), off the DHT.
+    /// Empty channel = never asks, draws nothing. `HATCH_STATUS_CHANNEL` sets it.
+    pub status: hatch_core::status::Feed,
     query: String,
     /// Keyboard selection into the current results; drawn as the highlight
     /// and launched by Enter. Reset on query change.
@@ -111,6 +114,7 @@ impl HatchUi {
     pub fn new(core: Launcher) -> Self {
         let board_config = core.config.anim; // captured before `core` moves into the struct below
         HatchUi {
+            status: hatch_core::status::Feed::new(&std::env::var("HATCH_STATUS_CHANNEL").unwrap_or_default()),
             core,
             query: String::new(),
             sel: 0,
@@ -314,6 +318,7 @@ impl HatchUi {
         }
 
         // ---- system row + search pill, bottom-anchored ----
+        self.status.tick();
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
             ui.add_space(8.0);
             if self.search_pill(ui, search_h, colors) {
@@ -324,6 +329,15 @@ impl HatchUi {
                 if self.system_row(ui, colors) {
                     event = UiEvent::Launched;
                 }
+            }
+            // The status line from home, above the system row: `mini · loaded Ornith 71 tok/s`.
+            // Dimmed once it is older than the feed's ask interval, so a dead publisher reads as
+            // stale rather than as current. Not a tile, not tappable, never launches anything.
+            if let Some(line) = self.status.latest() {
+                let stale = self.status.age().map(|a| a > self.status.interval * 3).unwrap_or(true);
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(line.render()).small().color(if stale { colors.text_weak } else { colors.text }));
+                ui.ctx().request_repaint_after(self.status.interval);
             }
         });
 

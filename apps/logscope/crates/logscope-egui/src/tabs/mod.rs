@@ -16,19 +16,19 @@ pub mod models;
 use crate::model::ModelState;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Tab { Sources, Peek, Tokens, Blocks, Rotate, Cargo, Chat, Code, Modify, Bloc, Models }
+pub enum Tab { Sources, Peek, Tokens, Blocks, Rotate, Cargo, Chat, Code, Modify, Bloc, Models, Hive }
 
 impl Tab {
-    pub const ALL: [Tab; 11] = [
+    pub const ALL: [Tab; 12] = [
         Tab::Sources, Tab::Peek, Tab::Tokens, Tab::Blocks, Tab::Rotate,
-        Tab::Cargo, Tab::Chat, Tab::Code, Tab::Modify, Tab::Bloc, Tab::Models,
+        Tab::Cargo, Tab::Chat, Tab::Code, Tab::Modify, Tab::Bloc, Tab::Models, Tab::Hive,
     ];
     pub fn label(self) -> &'static str {
         match self {
             Tab::Sources => "Sources", Tab::Peek => "Peek", Tab::Tokens => "Tokens",
             Tab::Blocks => "Blocks", Tab::Rotate => "Rotate", Tab::Cargo => "Cargo",
             Tab::Chat => "Chat", Tab::Code => "Code", Tab::Modify => "Modify", Tab::Bloc => "Bloc",
-            Tab::Models => "Models",
+            Tab::Models => "Models", Tab::Hive => "Hive",
         }
     }
 
@@ -58,6 +58,7 @@ impl Tab {
             Tab::Modify  => "Edit and transform from clipboard history",
             Tab::Bloc    => "AST-scored regions and suggestions",
             Tab::Models  => "The model library, with status",
+            Tab::Hive    => "Drive other boxes and Claude Code",
         }
     }
 }
@@ -153,12 +154,17 @@ pub struct Tabs {
     pub modify: modify::Modify,
     pub bloc: bloc::Bloc,
     pub models: models::Models,
+    /// The multi-box panels: Claude Code headless, the mini's shim, status-out to the phone.
+    pub hive: crate::addons::Panels,
 }
 
 impl Tabs {
     pub fn ui(&mut self, tab: Tab, ui: &mut egui::Ui, model: &mut ModelState,
               doc: &mut crate::analysis::Doc, scanning: bool,
               infer: &crate::backend::Inference, model_loaded: bool) -> Option<String> {
+        // `:bundle` in the chat lands in the Hive tab's Integrate field, whatever tab is showing.
+        if let Some(p) = self.chat.take_last_bundle() { self.hive.mini.bundle_path = p.display().to_string(); }
+        if let Some((q, plan)) = self.chat.take_last_plan() { self.hive.plan.set_plan(format!("survey: {q}"), plan); }
         match tab {
             Tab::Sources => self.sources.ui(ui, doc),
             Tab::Peek => { self.peek.ui(ui, doc); None }
@@ -171,9 +177,21 @@ impl Tabs {
             Tab::Modify => { self.modify.ui(ui); None }
             Tab::Bloc => self.bloc.ui(ui, model, scanning),
             Tab::Models => { self.models.ui(ui); None }
+            Tab::Hive => { self.hive.ui(ui); None }
         }
     }
     /// Route a composed prompt from another tab into the Chat input.
     pub fn route_to_chat(&mut self, prompt: String) { self.chat.set_input(prompt); }
-    pub fn apply_chat_evt(&mut self, e: crate::backend::Evt) { self.chat.apply_evt(e); }
+    pub fn apply_chat_evt(&mut self, e: crate::backend::Evt) {
+        // The liaison's outbound: a load or a finished turn is a fact this box can state; an error is
+        // a fact too. Tokens are not status. Sinks that are off drop it; the ledger always keeps it.
+        use hive::status::Level;
+        match &e {
+            crate::backend::Evt::Loaded(Ok(info)) => self.hive.status.say(Level::Fact, &format!("loaded {}", info.summary())),
+            crate::backend::Evt::Loaded(Err(err)) => self.hive.status.say(Level::Fact, &format!("load failed: {}", err.chars().take(120).collect::<String>())),
+            crate::backend::Evt::Done { tokens, secs } => if *tokens >= 64 { self.hive.status.say(Level::Fact, &format!("turn done: {tokens} tok in {secs:.1}s ({:.1} tok/s)", *tokens as f32 / secs.max(0.01))) },
+            _ => {}
+        }
+        self.chat.apply_evt(e);
+    }
 }

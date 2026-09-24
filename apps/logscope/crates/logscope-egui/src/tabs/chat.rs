@@ -994,6 +994,20 @@ pub struct Chat {
     agent_candidates: Vec<crate::workspace_exec::BranchSummary>, // folded branch summaries to prune to the keeper
     fan_is_docs: bool, // the active/just-finished fan is a DOC fan → suggest :merge-docs (union) over :pick (keep one)
     agent_pending_submit: Option<String>, // next agent prompt to hand the inference worker (drained in sync_worker)
+    /// The tool-fence GBNF for the run in progress. Set at :agent / :fan-agent from the run's tool
+    /// whitelist, cleared when the run ends; `sync_worker` sends it with every agent prompt and
+    /// re-sends plain params afterwards. `LOGSCOPE_TOOL_GRAMMAR=0` leaves it off.
+    agent_grammar: Option<String>,
+    /// The last run's scoreboard, one line, shown in the note and kept for the status panel.
+    pub harness_line: Option<String>,
+    /// The bundle `:bundle` just wrote, for the Hive tab to pick up into its Integrate field.
+    last_bundle: Option<std::path::PathBuf>,
+    /// The plan `:survey` just produced, for the Hive tab to run.
+    last_plan: Option<(String, hive::plan::Plan)>,
+    /// The active model's own chat template, read from its GGUF and cached by path. Used only when
+    /// `LOGSCOPE_GGUF_TEMPLATE=1`; otherwise the hand-built families below run. `Some((path, None))`
+    /// records a path whose GGUF had no template, so it is not re-read every frame.
+    gguf_tmpl: std::cell::RefCell<Option<(String, Option<std::sync::Arc<template_kit::Renderer>>)>>,
     agent_task: String, // the in-flight :agent task text (for the snapshot message + reaction seeding)
     lanes: Option<crate::lanes::LanePool>, // :lanes N — concurrent generation lanes over ONE resident model; fan branches decode in parallel through this instead of round-robin on the single worker
     lane_jobs: std::collections::HashMap<crate::lanes::JobId, usize>, // in-flight pool job → fan branch (routes tagged Token/Done events)
@@ -1238,6 +1252,11 @@ impl Default for Chat {
             agent_candidates: Vec::new(),
             fan_is_docs: false,
             agent_pending_submit: None,
+            agent_grammar: None,
+            harness_line: None,
+            last_bundle: None,
+            last_plan: None,
+            gguf_tmpl: std::cell::RefCell::new(None),
             agent_task: String::new(),
             lanes: None, lane_jobs: std::collections::HashMap::new(), lanes_ready: false,
             local_model_path: None,
@@ -1276,6 +1295,46 @@ impl Default for Chat {
         }
     }
 }
+impl Chat {
+    /// The hand-built family's markers for one system + one user turn, for `:template`'s
+    /// side-by-side. Mirrors the builders above; kept separate so the comparison cannot drift with
+    /// the live history.
+    fn render_family_sample(&self, kind: TemplateKind, sys: &str, user: &str) -> String {
+        match kind {
+            TemplateKind::ChatML => format!("<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"),
+            TemplateKind::Llama3 | TemplateKind::Llama4 => format!("<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{sys}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"),
+            TemplateKind::Gemma => format!("<start_of_turn>user\n{sys}\n\n{user}<end_of_turn>\n<start_of_turn>model\n"),
+            TemplateKind::Bailing2 => format!("<role>SYSTEM</role>{sys}\n<role>HUMAN</role>{user}\n<role>ASSISTANT</role>"),
+            TemplateKind::Plain => format!("{sys}\n\nUser: {user}\n\nAssistant: "),
+        }
+    }
+
+    /// Put a block of text in the transcript as a finished assistant message. For commands whose
+    /// output is too long for the one-line note (`:template`), so it lands where it can be read,
+    /// scrolled and exported like any other turn rather than in a status bar.
+    fn push_note_block(&mut self, text: &str) {
+        let mut m = Msg::assistant();
+        m.variants[0] = text.to_string();
+        m.think_open = false;
+        m.parent = self.active_leaf;
+        self.msgs.push(m);
+        self.active_leaf = Some(self.msgs.len() - 1);
+    }
+
+    /// The bundle `:bundle` produced since last asked; the Hive tab drains it into Integrate.
+    pub fn take_last_bundle(&mut self) -> Option<std::path::PathBuf> { self.last_bundle.take() }
+    /// The plan `:survey` produced since last asked; the Hive tab drains it into its plan runner.
+    pub fn take_last_plan(&mut self) -> Option<(String, hive::plan::Plan)> { self.last_plan.take() }
+}
+
+/// The GBNF for a run's tool whitelist, or None when the operator turned it off. Fans pass an
+/// empty list and get the whole runtime menu, since their workers' whitelists differ per bee.
+fn tool_grammar_for(tools: &[String]) -> Option<String> {
+    if std::env::var("LOGSCOPE_TOOL_GRAMMAR").as_deref() == Ok("0") { return None; }
+    let names: Vec<&str> = if tools.is_empty() { crate::workspace_exec::RUNTIME_TOOLS.to_vec() } else { tools.iter().map(|s| s.as_str()).collect() };
+    Some(crate::llm_remote::tool_fence_grammar(&names))
+}
+
 impl Chat {
     /// Prefill the composer (used when another tab routes a prompt to Chat).
     pub fn set_input(&mut self, s: String) { self.input = s; }
@@ -1776,7 +1835,7 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
             // the more destructive option. The prompt is raised separately.
             summarize_instead_of_squeeze: self.auto_continue
                 && self.relief_policy.engine_flag().unwrap_or(false),
-            n_threads: 4, n_gpu_layers: -1 }
+            n_threads: 4, n_gpu_layers: -1, grammar: None }
     }
 
     /// The loaded model's template, preferring the worker's live value over the per-frame copy.
@@ -1803,6 +1862,22 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     }
 
     fn build_prompt(&self, doc: &crate::analysis::Doc) -> String { self.build_prompt_upto(self.msgs.len(), doc) }
+
+    /// The same history as `build_prompt`, as structured turns for a backend that templates them
+    /// itself (Remote → llama-server). System first, then the chosen messages; no assistant primer,
+    /// the server adds it. Tool-role turns are not distinguished here (the chat is plain Q&A); the
+    /// agent loop, which does have tool results, builds its own turns.
+    fn build_turns(&self, doc: &crate::analysis::Doc) -> Vec<crate::backend::ChatTurn> {
+        use crate::backend::ChatTurn;
+        let sys = neutralize_markers(&self.full_system(doc));
+        let mut turns = Vec::new();
+        if !sys.trim().is_empty() { turns.push(ChatTurn::system(sys.clone())); }
+        for m in self.chosen_msgs(8, &sys, self.msgs.len()) {
+            let text = neutralize_markers(m.text());
+            turns.push(if m.role == Role::User { ChatTurn::user(text) } else { ChatTurn::assistant(text) });
+        }
+        turns
+    }
 
     /// Every branch tip: a message id that is no other message's (effective) parent. The effective parent
     /// is the recorded `parent`, or the previous turn for pre-branch linear history — the same rule the
@@ -2111,7 +2186,7 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
         // rather than everything since process start.
         self.metrics_base = crate::metricspanel::snapshot(0);
         self.metrics_start = Some(std::time::Instant::now());
-        infer.generate(prompt);
+        if self.backend == BackendKind::Remote { infer.generate_chat(self.build_turns(doc)); } else { infer.generate(prompt); }
     }
 
     /// Build the prompt from history `msgs[..upto]` (so regenerate/edit can re-run from a point).
@@ -2174,7 +2249,7 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
             // Read the template LIVE rather than trusting the per-frame copy. The copy is refreshed in
             // the update loop, so a generate submitted in the same frame as a model load still carried
             // the PREVIOUS model's template — which is the "stale UI state" the worker kept reporting.
-            BackendKind::Wgpu => match self.live_template() {
+            BackendKind::Wgpu => if let Some(p) = self.build_prompt_gguf(&sys, upto) { p } else { match self.live_template() {
                 TemplateKind::ChatML => self.build_prompt_chatml(&sys, upto),
                 TemplateKind::Llama3 => self.build_prompt_llama3(&sys, upto),
                 // Llama4: build with Llama-3 markers — the worker's normalize_prompt_template
@@ -2183,12 +2258,13 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
                 TemplateKind::Gemma => self.build_prompt_gemma(&sys, upto),
                 TemplateKind::Bailing2 => self.build_prompt_bailing2(&sys, upto),
                 TemplateKind::Plain => self.build_prompt_plain(&sys, upto),
-            },
-            // llama.cpp path is otherwise Plain, but Gemma needs its own turn markers to stop correctly.
-            // Reads live_template() like the arm above: a persisted value that disagrees with what
-            // the worker detected must not decide the frame (see the resume builder's comment).
-            _ if self.live_template() == TemplateKind::Gemma => self.build_prompt_gemma(&sys, upto),
-            _ => self.build_prompt_plain(&sys, upto),
+            } },
+            // Remote templates server-side (generate_chat); this prompt is unused for it, so keep it Plain.
+            BackendKind::Remote => self.build_prompt_plain(&sys, upto),
+            // llama.cpp: prefer the model's own GGUF template when the flag is on (same as the wgpu arm),
+            // else Plain — but Gemma needs its own turn markers to stop correctly.
+            _ => self.build_prompt_gguf(&sys, upto).unwrap_or_else(||
+                if self.live_template() == TemplateKind::Gemma { self.build_prompt_gemma(&sys, upto) } else { self.build_prompt_plain(&sys, upto) }),
         }
     }
 
@@ -2599,6 +2675,30 @@ reply is framed differently from the turn that produced it.");
     /// ChatML template (smollm2 and other `<|im_end|>` models). Feeding these the Llama-3 markers
     /// above makes the tokenizer emit them as byte-level text — the model never reaches its real
     /// stop (`<|im_end|>`) and runs to the cap. Matching the template is the fix.
+    /// The active model's own template, from its GGUF, rendered with the current history. Returns None
+    /// when the flag is off, no model is loaded, the GGUF carries no template, or rendering fails —
+    /// every one of which falls back to the hand-built family. Cached per model path.
+    fn build_prompt_gguf(&self, sys: &str, upto: usize) -> Option<String> {
+        if std::env::var("LOGSCOPE_GGUF_TEMPLATE").as_deref() != Ok("1") { return None; }
+        let path = logscope::llm_backend::active_model()?.path.clone();
+        let stale = self.gguf_tmpl.borrow().as_ref().map(|(p, _)| p != &path).unwrap_or(true);
+        if stale {
+            let r = template_kit::gguf::read_templates_from(std::path::Path::new(&path)).ok()
+                .and_then(|t| t.for_tools().map(|s| s.to_string()))
+                .and_then(|src| template_kit::Renderer::new(&src).ok())
+                .map(std::sync::Arc::new);
+            *self.gguf_tmpl.borrow_mut() = Some((path.clone(), r));
+        }
+        let renderer = self.gguf_tmpl.borrow().as_ref().and_then(|(_, r)| r.clone())?;
+        let mut msgs = Vec::new();
+        if !sys.trim().is_empty() { msgs.push(template_kit::Message::system(sys)); }
+        for m in self.chosen_msgs(8, sys, upto) {
+            let text = neutralize_markers(m.text());
+            msgs.push(if m.role == Role::User { template_kit::Message::user(&text) } else { template_kit::Message::assistant(&text) });
+        }
+        match renderer.render(&msgs, &[], true) { Ok(p) => Some(p), Err(_) => None }
+    }
+
     fn build_prompt_chatml(&self, sys: &str, upto: usize) -> String {
         let mut s = format!("<|im_start|>system\n{}<|im_end|>\n", sys);
         for m in self.chosen_msgs(8, sys, upto) {
@@ -2962,11 +3062,26 @@ reply is framed differently from the turn that produced it.");
         if self.sent_params != Some(key) { infer.set_params(self.params()); self.sent_params = Some(key); }
         // Drain a queued agent prompt (initial or next-turn) to the worker — this is where the non-blocking
         // agent actually submits generations, since `infer` is in scope here every frame.
-        if let Some(prompt) = self.agent_pending_submit.take() { infer.generate(prompt); }
+        if let Some(prompt) = self.agent_pending_submit.take() {
+            if let Some(g) = self.agent_grammar.clone().filter(|_| self.agent_run.is_some() || self.agent_fan.is_some()) {
+                let mut p = self.params(); p.grammar = Some(g);
+                infer.set_params(p);
+                self.sent_params = None;   // forces plain params to be re-sent before the next chat turn
+            }
+            infer.generate(prompt);
+        }
     }
 
     /// Finalize a non-blocking agent run: snapshot the workspace, surface the outcome, clear the driver.
     fn finish_agent_run(&mut self, stop: crate::workspace_exec::Stop) {
+        self.agent_grammar = None;
+        // The scoreboard, before the driver is consumed: one ledger line in the same terms as
+        // `hive count` on a Claude Code transcript, so the two harnesses meet on one table.
+        if let Some(run) = self.agent_run.as_ref() {
+            let counts = run.counts(&stop);
+            let _ = hive::ledger::append(hive::ledger::Entry::Note { text: format!("harness: {}", counts.render()) });
+            self.harness_line = Some(counts.render());
+        }
         let (files, plan, plan_summary, verified, turns, had_verifier, phase, patterns, compacted) = match self.agent_run.take() {
             Some(r) => (r.events().to_vec(), r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect::<Vec<_>>(), r.plan().summary(), r.verified(), r.turns(), r.had_verifier(), r.phase(), r.pattern_report(), r.compacted_turns()),
             None => return,
@@ -3021,7 +3136,8 @@ different worker or a new one ({turns} turns)", lane.join(", ")),
         // rather than per write. The summary reports verified / pending / unverifiable apart, so a
         // step nobody can check never reads as a step that was done.
         let plan_note = if self.agent_plan.is_empty() { String::new() } else { format!(" · plan {plan_summary}") };
-        self.note = format!("agent: {stopdesc}{plan_note} · {touched} file(s){vnote}{phase_note}{cmp_note}{snap_note} · :reapply to land");
+        let score = self.harness_line.as_ref().map(|l| format!(" · [{l}]")).unwrap_or_default();
+        self.note = format!("agent: {stopdesc}{plan_note} · {touched} file(s){vnote}{phase_note}{cmp_note}{snap_note}{score} · :reapply to land");
     }
 
     /// Launch a fan of agent branches with `cfg`, seeding goals from `task`. Shared by :fan-agent and :docs.
@@ -3467,6 +3583,7 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
             crate::engprofile::suggest(&task)
         } else { self.profiles_manual.clone() };
         let profile_names: Vec<&str> = cfg.profiles.iter().map(|p| p.profile().name).collect();
+        self.agent_grammar = tool_grammar_for(&cfg.tools);
         let (run, first) = crate::workspace_exec::AgentRun::start(work_dir, &task, cfg);
         let guided = run.phase().is_some();
         self.agent_run = Some(run);
@@ -3578,7 +3695,9 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
                         }
                     }
                 }
-                self.agent_fan = Some(fan);
+                self.agent_grammar = tool_grammar_for(&[]);
+                self.agent_grammar = tool_grammar_for(&[]);
+        self.agent_fan = Some(fan);
                 let ready = if self.lanes_ready { "decoding in parallel" } else { "queued (lanes still loading)" };
                 self.note = format!("{label}: {n} branches — {launched} {ready} on {lane_n} lane(s)");
             } else {
@@ -3586,7 +3705,8 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
                     crate::workspace_exec::FanStep::Submit { prompt, .. } => {
                         self.agent_pending_submit = Some(prompt);
                         let n = fan.len();
-                        self.agent_fan = Some(fan);
+                        self.agent_grammar = tool_grammar_for(&[]);
+                self.agent_fan = Some(fan);
                         self.note = format!("{label}: {n} branches spinning up — planning… (tip: :lanes 2 runs them in parallel)");
                     }
                     crate::workspace_exec::FanStep::AllDone => self.note = format!(":{label} — nothing to run"),
@@ -3847,6 +3967,7 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
     }
 
     fn finish_agent_fan(&mut self) {
+        self.agent_grammar = None;
         let fan = match self.agent_fan.take() { Some(f) => f, None => return };
         let best = fan.best().map(|i| i + 1).unwrap_or(1);
         self.agent_candidates = fan.summaries();
@@ -4519,6 +4640,7 @@ an empty result set: nothing was searched.");
                 let n = self.queue.len(); self.queue.clear(); self.fan = None;
                 if let Some(p) = &self.lanes { p.cancel_all(); }
                 self.lane_jobs.clear();
+                self.agent_grammar = None;
                 if self.agent_run.take().is_some() || self.agent_fan.take().is_some() {
                     self.agent_pending_submit = None;
                     self.pending_cancel = true; // stop the in-flight generation too
@@ -4890,6 +5012,81 @@ an empty result set: nothing was searched.");
                         self.gitmind_session = Some(s); // keep the session so the user can retry
                     }
                 },
+            },
+            Command::Template => {
+                match logscope::llm_backend::active_model() {
+                    None => self.note = ":template — no model loaded".into(),
+                    Some(m) => {
+                        let path = m.path.clone();
+                        match template_kit::gguf::read_templates_from(std::path::Path::new(&path)) {
+                            Err(e) => self.note = format!(":template — {e}"),
+                            Ok(t) => {
+                                let arch = t.architecture.clone().unwrap_or("?".into());
+                                match t.for_tools() {
+                                    None => self.note = format!(":template — {arch}: this GGUF carries no chat template; the hand-built {:?} family is the only option", self.live_template()),
+                                    Some(src) => match template_kit::Renderer::new(src) {
+                                        Err(e) => self.note = format!(":template — {arch}: the GGUF's template does not compile here: {e}"),
+                                        Ok(r) => {
+                                            // Render the SAME two turns both ways and show the diff in one line
+                                            // plus the full text in the transcript, so the choice is visible.
+                                            let msgs = vec![template_kit::Message::system("S"), template_kit::Message::user("U")];
+                                            let own = r.render(&msgs, &[], true).unwrap_or_else(|e| format!("(render failed: {e})"));
+                                            // The comparison uses the SAME synthetic turns on both
+                                            // sides (system "S", user "U"), so what differs is the
+                                            // template and nothing else. The live history would make
+                                            // the two sides incomparable.
+                                            let built = self.render_family_sample(self.live_template(), "S", "U");
+                                            let syntax = r.probe_tool_syntax().ok();
+                                            let fmt = template_kit::toolcall::detect_format(src);
+                                            let flag = std::env::var("LOGSCOPE_GGUF_TEMPLATE").as_deref() == Ok("1");
+                                            self.push_note_block(&format!(
+                                                "## template · {arch}\n\nGGUF template: {} chars, tool syntax {:?}, call format {:?}\nLOGSCOPE_GGUF_TEMPLATE is {}\n\n### the model's own, rendered\n```\n{}\n```\n\n### the hand-built {:?} family, rendered\n```\n{}\n```\n",
+                                                src.len(), syntax.as_ref().map(|s| s.call_open.clone()).unwrap_or("(no tool support)".into()), fmt,
+                                                if flag { "ON (the model's own is in use)" } else { "off (the hand-built family is in use)" },
+                                                own, self.live_template(), built.chars().take(1200).collect::<String>()));
+                                            self.note = format!("template: {arch} · {:?} · see the transcript", fmt);
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Command::Survey(q) => {
+                let q = q.trim().to_string();
+                if q.is_empty() { self.note = ":survey needs a question".into(); }
+                else {
+                    // The workspace under survey: the loaded session's scratch, else the cwd.
+                    let root = self.gitmind_session.as_ref().map(|s| s.work_dir().to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    let ceiling: u32 = std::env::var("LOGSCOPE_SURVEY_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(6_000);
+                    let sess = crate::queen::answer(&q, ceiling, |p| crate::probe_exec::run(&root, p).map_err(|e| format!("{e:?}")));
+                    let absences = crate::queen::record_absences(&sess, &root.display().to_string());
+                    let plan = crate::queen::to_plan(&q, &sess, if self.workers.is_empty() { None } else { Some(&self.workers) });
+                    let files = plan.tasks.len().saturating_sub(1);
+                    self.note = format!("survey: {} probes, {} findings, {} misses → {} absence(s) ledgered · plan: {} read task(s) + answer{} · Hive → Run plan",
+                        sess.ran.len(), sess.findings.len(), sess.misses.len(), absences, files, if sess.budget_exhausted { " (budget exhausted)" } else { "" });
+                    self.last_plan = Some((q, plan));
+                }
+            }
+            Command::Bundle => match self.gitmind_session.as_ref() {
+                None => self.note = ":bundle — no .gitmind session loaded (:load-gitmind <path> first)".into(),
+                Some(s) => {
+                    // Snapshot first so the bundle carries everything on disk, then export. The
+                    // exports dir is per user, not per project: the project tree is never written.
+                    let snapped = crate::mount::snapshot(&s.ws, &format!("logscope: {}", s.name)).unwrap_or(false);
+                    let out = std::env::var("LOGSCOPE_EXPORTS").map(std::path::PathBuf::from)
+                        .unwrap_or_else(|_| std::env::var("XDG_DATA_HOME").map(std::path::PathBuf::from)
+                            .unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share")).join("logscope").join("exports"));
+                    match crate::mount::bundle(&s.ws, &out) {
+                        Ok(a) => {
+                            self.note = format!("bundle: {} · {} file(s){} · Hive → Integrate, or `git fetch {} {}`",
+                                a.bundle.display(), a.changed.len(), if snapped { " (snapshotted)" } else { "" }, a.bundle.display(), s.ws.branch);
+                            self.last_bundle = Some(a.bundle);
+                        }
+                        Err(e) => self.note = format!(":bundle — {e}"),
+                    }
+                }
             },
             Command::Compact(arg) => {
                 // active lineage (tip → root), reversed to chronological
@@ -5344,7 +5541,8 @@ if let Some(msg) = self.error_banner.clone() {
             if let Some(r) = &tick.reaction {
                 if r.is_cancel() {
                     infer.cancel(); // spoke over the model
-                    if self.agent_run.take().is_some() || self.agent_fan.take().is_some() { self.agent_pending_submit = None; self.note = "agent run cancelled (barge-in)".into(); }
+                    self.agent_grammar = None;
+                if self.agent_run.take().is_some() || self.agent_fan.take().is_some() { self.agent_pending_submit = None; self.note = "agent run cancelled (barge-in)".into(); }
                 }
             }
         }

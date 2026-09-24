@@ -41,6 +41,10 @@ pub struct GenParams {
     pub n_threads: i32,
     /// -1 = offload all layers to the GPU.
     pub n_gpu_layers: i32,
+    /// A GBNF grammar the sampler must obey (llama.cpp in-process and llama-server both honour it;
+    /// the wgpu engine ignores it). The agent loop sets it to the tool-fence grammar so a small model
+    /// cannot emit a malformed tool block. `None` for ordinary chat.
+    pub grammar: Option<String>,
 }
 impl Default for GenParams {
     fn default() -> Self {

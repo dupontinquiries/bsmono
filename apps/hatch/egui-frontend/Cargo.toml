@@ -20,6 +20,8 @@ app = ["dep:eframe"]
 # letter-tiles for the svg-only ones and shaves the resvg stack off a
 # size-constrained musl build.
 svg = ["dep:resvg"]
+# the status line from home over the DHT (hatch-core's presence node)
+status-dht = ["hatch-core/status-dht"]
 
 [dependencies]
 hatch-core = { path = "../crates/hatch-core" }

@@ -39,6 +39,7 @@ pub mod intent;
 pub mod media;
 pub mod schedule;
 pub mod wifi;
+pub mod wemo_wifi;   // the Wi-Fi Wemos: local SOAP, no pairing (std only)
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};

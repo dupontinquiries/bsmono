@@ -1973,6 +1973,21 @@ pub trait Llm {
 /// model gets a "no tool call parsed" nudge and can retry) rather than crashing the loop.
 pub fn parse_tools(text: &str) -> Vec<Tool> { parse_tools_reported(text).0 }
 
+/// Remove every `<think>…</think>` block (Qwen3.x/Ornith reasoning). An unterminated block — the
+/// reply was cut off while thinking — is removed to the end, which is the safe reading: nothing
+/// after the open tag was an action. Returns the input unchanged when there is no such block.
+pub fn strip_thinking(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("<think>") { return std::borrow::Cow::Borrowed(text); }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(a) = rest.find("<think>") {
+        out.push_str(&rest[..a]);
+        match rest[a..].find("</think>") { Some(b) => rest = &rest[a + b + "</think>".len()..], None => { rest = ""; } }
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
 /// Why a block that LOOKED like a tool call was not one.
 ///
 /// Each variant is a distinct `?` in `parse_one`, and they call for different responses: an unknown
@@ -1997,6 +2012,12 @@ pub enum Rejected {
 /// against a better model. Nothing about which calls are ACCEPTED changes here; the rejects simply
 /// stop being invisible.
 pub fn parse_tools_reported(text: &str) -> (Vec<Tool>, Vec<Rejected>) {
+    // Qwen3.5-family models (Ornith among them) think out loud inside <think>…</think> before they
+    // act. A tool fence inside the think block is the model considering a call, not making one:
+    // acting on it runs tools the model decided against. The block is dropped here, before any
+    // fence is looked for; the transcript still carries it.
+    let text = strip_thinking(text);
+    let text: &str = &text;
     let (mut out, mut bad) = (Vec::new(), Vec::new());
     for raw in extract_blocks(text) {
         if raw.cut_off {
@@ -3634,6 +3655,8 @@ pub struct AgentRun {
     had_verifier: bool,
     step: usize,
     turns: usize,
+    /// The scoreboard, accumulated per turn; `counts()` renders it at the end of the run.
+    counts: HarnessCounts,
     guard: crate::repetition::LoopGuard,
     ladder: crate::line_calls::RefusalLadder,
     /// StatefulGuide's phase machine, when `cfg.stateful_guide` — the run's evidence-decided position.
@@ -3683,7 +3706,7 @@ impl AgentRun {
         }
         let run = Self {
             ws, prompt: prompt.clone(), reply: String::new(),
-            plan: Plan::default(), verified, step: 0, turns: 0, cfg,
+            plan: Plan::default(), verified, step: 0, turns: 0, counts: HarnessCounts::default(), cfg,
             guard: crate::repetition::LoopGuard::default(),
             ladder: crate::line_calls::RefusalLadder::new(4),
             // Mirrors the Session field: a run with no verifier must not read as one that passed.
@@ -3723,6 +3746,11 @@ impl AgentRun {
         let text = std::mem::take(&mut self.reply);
         let (results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step, &mut self.guard, &mut self.ladder, self.guide.as_mut(), self.heroes.as_mut());
         self.turns += 1;
+        self.counts.turns += 1;
+        self.counts.tool_calls += results.len();
+        match results.len() { 0 => self.counts.prose_turns += 1, 1 => self.counts.single_turns += 1, _ => self.counts.fanout_turns += 1 }
+        self.counts.rejected_calls += parse_tools_reported(&text).1.len();
+        self.counts.failed_calls += results.iter().filter(|(_, r)| !r.ok).count();
         self.step += 1;
         if let Some(stop) = stop { return AgentStep::Finished(stop); }
         // LANE-REFUSAL LADDER. `check_owned` refuses a write outside `cfg.owns`, but a model that
@@ -3800,6 +3828,10 @@ change elsewhere, say so and stop rather than trying another out-of-lane path.)\
     /// generation without advancing the agent loop).
     pub fn take_reply(&mut self) -> String { std::mem::take(&mut self.reply) }
     pub fn config(&self) -> &AgentConfig { &self.cfg }
+    /// The run's scoreboard so far, with the end state filled in from the driver.
+    pub fn counts(&self, stop: &Stop) -> HarnessCounts {
+        HarnessCounts { files_touched: self.ws.events().len(), verified: self.verified, had_verifier: self.had_verifier, stop: format!("{stop:?}"), ..self.counts.clone() }
+    }
 
     pub fn events(&self) -> &[FileEvent] { self.ws.events() }
     pub fn plan(&self) -> &Plan { &self.plan }
@@ -4288,6 +4320,53 @@ pub fn run_local_agent(
     let mut llm = LocalLlm::from_active(params)
         .ok_or_else(|| "no local model loaded — pick a .gguf (MODEL selector) and load it first".to_string())?;
     Ok(run_agent_cfg(&mut llm, ws, task, cfg))
+}
+
+// ── the harness scoreboard ────────────────────────────────────────────────────────────────────────
+
+/// What a run cost in moves, in the same terms `hive count` uses on Claude Code transcripts, so a
+/// 9B in this harness and the frontier in Claude Code's can be compared on one table: tool calls per
+/// turn, fan-out turns (several calls in one message), calls the parser rejected, tool failures, and
+/// whether the run verified. Pure over `Session`; nothing here runs anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HarnessCounts {
+    pub turns: usize,
+    pub tool_calls: usize,
+    /// Turns that issued two or more tool calls at once.
+    pub fanout_turns: usize,
+    /// Turns that issued exactly one.
+    pub single_turns: usize,
+    /// Turns with no tool call (prose, plan, or the done marker).
+    pub prose_turns: usize,
+    /// Blocks that looked like tool calls and were not (the parser's report).
+    pub rejected_calls: usize,
+    /// Tool calls the workspace refused or that failed.
+    pub failed_calls: usize,
+    pub files_touched: usize,
+    pub verified: bool,
+    pub had_verifier: bool,
+    pub stop: String,
+}
+
+impl HarnessCounts {
+    /// One line for the ledger: `7 turns · 9 calls (2 fan-out, 1 rejected, 0 failed) · 3 files · verified · Done`.
+    pub fn render(&self) -> String {
+        format!("{} turns · {} calls ({} fan-out, {} rejected, {} failed) · {} files · {} · {}",
+            self.turns, self.tool_calls, self.fanout_turns, self.rejected_calls, self.failed_calls, self.files_touched,
+            match (self.had_verifier, self.verified) { (true, true) => "verified", (true, false) => "NOT verified", (false, _) => "no verifier" }, self.stop)
+    }
+}
+
+pub fn harness_counts(s: &Session) -> HarnessCounts {
+    let mut c = HarnessCounts { turns: s.turns.len(), files_touched: s.files.len(), verified: s.verified, had_verifier: s.had_verifier, stop: format!("{:?}", s.stop), ..Default::default() };
+    for t in &s.turns {
+        let n = t.results.len();
+        c.tool_calls += n;
+        match n { 0 => c.prose_turns += 1, 1 => c.single_turns += 1, _ => c.fanout_turns += 1 }
+        c.rejected_calls += parse_tools_reported(&t.model_text).1.len();
+        c.failed_calls += t.results.iter().filter(|(_, r)| !r.ok).count();
+    }
+    c
 }
 
 // ── doc gathering + merge across fan branches ────────────────────────────────────────────────────
@@ -4954,6 +5033,49 @@ That is this machine, not the allowlist.", tldr.output.trim());
         assert_eq!(std::fs::read(ws.root().join("assets/logo.bin")).unwrap(), vec![0u8, 1, 2, 3]);
         // escape attempt is rejected
         assert!(!ws.ingest("../evil", b"x").ok);
+    }
+
+    /// The native syntaxes are already understood by `canonical_block`; this pins that, because a
+    /// regression here reads as "the model made no tool call" for a call that was well-formed.
+    #[test]
+    fn every_family_native_tool_call_is_understood() {
+        assert_eq!(parse_tools("<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"src/a.rs\"}}\n</tool_call>"),
+                   vec![Tool::ReadFile { path: "src/a.rs".into() }], "Qwen/Ornith/Hermes");
+        assert_eq!(parse_tools("[TOOL_CALLS][{\"name\": \"list_dir\", \"arguments\": {\"path\": \"src\"}}]"),
+                   vec![Tool::ListDir { path: "src".into() }], "Mistral");
+        assert_eq!(parse_tools("```tool\n{\"tool\":\"list_dir\",\"path\":\"src\"}\n```"),
+                   vec![Tool::ListDir { path: "src".into() }], "the harness fence");
+        // and none of them counts when it was only being considered
+        assert!(parse_tools("<think><tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"x\"}}</tool_call></think>").is_empty());
+    }
+
+    #[test]
+    fn a_tool_fence_inside_a_think_block_is_not_a_call() {
+        let t = "<think>maybe I should\n```tool\n{\"tool\":\"run\",\"argv\":[\"rm\",\"-rf\",\"x\"]}\n```\nno, read first</think>\n```tool\n{\"tool\":\"read_file\",\"path\":\"a.rs\"}\n```";
+        let (tools, bad) = parse_tools_reported(t);
+        assert_eq!(tools, vec![Tool::ReadFile { path: "a.rs".into() }], "{bad:?}");
+        assert!(bad.is_empty());
+        // cut off mid-thought: nothing after the open tag counts
+        let (tools, _) = parse_tools_reported("<think>plan: ```tool\n{\"tool\":\"run\",\"argv\":[\"ls\"]}\n```");
+        assert!(tools.is_empty());
+        assert_eq!(strip_thinking("no thinking here"), "no thinking here");
+    }
+
+    #[test]
+    fn harness_counts_read_a_scripted_run() {
+        let mut ws = Workspace::new(tmp("counts"));
+        let mut llm = Scripted { i: 0, turns: vec![
+            "two at once\n```tool\n{\"tool\":\"write_file\",\"path\":\"a.txt\",\"contents\":\"a\"}\n```\n```tool\n{\"tool\":\"write_file\",\"path\":\"b.txt\",\"contents\":\"b\"}\n```".into(),
+            "a bad one\n```tool\n{\"tool\":\"read_file\"}\n```".into(),
+            format!("done {DONE_MARKER}"),
+        ]};
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new(), ..Default::default() };
+        let s = run_agent_cfg(&mut llm, &mut ws, "count me", &cfg);
+        let c = harness_counts(&s);
+        assert_eq!((c.turns, c.tool_calls, c.fanout_turns, c.prose_turns), (3, 2, 1, 2), "{c:?}");
+        assert_eq!(c.rejected_calls, 1, "the read_file without a path is a rejected block: {c:?}");
+        assert_eq!(c.files_touched, 2);
+        assert!(c.render().contains("1 fan-out") && c.render().contains("no verifier"), "{}", c.render());
     }
 
     #[test]

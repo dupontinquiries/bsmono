@@ -131,6 +131,14 @@ pub enum Command {
                        // ask the model for a per-file summary (fan-out friendly)
     LoadGitmind(String), // :load-gitmind <path> — mirror a .gitmind project into an isolated /tmp session
     Reapply,             // :reapply — land the loaded session's changes over the project as one new commit
+    Template,            // :template — show the loaded model's own GGUF chat template rendered against the
+                         //           current history, beside the hand-built family, so LOGSCOPE_GGUF_TEMPLATE
+                         //           can be flipped on evidence rather than hope
+    Survey(String),      // :survey <question> — the Queen: deterministic outline/grep/slice probes over the loaded
+                         //           workspace, misses ledgered as absences, the reads and the answer emitted as a
+                         //           hive plan the Hive tab runs across the matrix
+    Bundle,              // :bundle — snapshot the loaded session and export a git bundle + patch (the bubble's exit:
+                         //           hand it to the Hive tab's Integrate, or `git fetch <bundle> logscope-work`)
     Agent(String),       // :agent <task> — run the local-LLM agentic loop (tool-calling) in the loaded
                          // session's isolated workspace: the model writes/reads/runs to build the task,
                          // files appear live in the scene, then :reapply lands them as one commit
@@ -553,6 +561,9 @@ pub fn parse_command(line: &str) -> Command {
         "summarize-files" | "summarise-files" | "sf" => Command::SummarizeFiles(arg.to_string()),
         "load-gitmind" | "lgm" => Command::LoadGitmind(arg.to_string()),
         "reapply" | "ra" => Command::Reapply,
+        "bundle" | "bd" => Command::Bundle,
+        "survey" | "sv" => Command::Survey(arg.to_string()),
+        "template" | "tmpl" => Command::Template,
         "agent" | "ag" => Command::Agent(arg.to_string()),
         "fan-agent" | "faa" => Command::FanAgent(arg.to_string()),
         "lanes" | "ln" => Command::Lanes(arg.to_string()),
@@ -703,6 +714,11 @@ mod tests {
         assert_eq!(parse_command(":lgm /x"), Command::LoadGitmind("/x".into()));
         assert_eq!(parse_command(":reapply"), Command::Reapply);
         assert_eq!(parse_command(":ra"), Command::Reapply);
+        assert_eq!(parse_command(":bundle"), Command::Bundle);
+        assert_eq!(parse_command(":bd"), Command::Bundle);
+        assert_eq!(parse_command(":survey where is parse defined"), Command::Survey("where is parse defined".into()));
+        assert_eq!(parse_command(":template"), Command::Template);
+        assert_eq!(parse_command(":tmpl"), Command::Template);
         assert_eq!(parse_command(":agent add a test for foo"), Command::Agent("add a test for foo".into()));
         assert_eq!(parse_command(":ag build a CLI"), Command::Agent("build a CLI".into()));
         assert_eq!(parse_command(":fan-agent try anyhow and thiserror"), Command::FanAgent("try anyhow and thiserror".into()));

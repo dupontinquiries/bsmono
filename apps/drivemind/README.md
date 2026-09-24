@@ -18,6 +18,11 @@ dvm videos PATH --batch F  # legacy/hot-bitrate codecs → av1tuner batch file
 dvm gitscan REPO           # tracked delta-hostile files → `gin migrate` command
 dvm clone SRC DST [--run]  # dd (healthy) or ddrescue (unhealthy) plan; blockers unforceable
 dvm advise PATH            # everything above, one prioritized list
+dvm nvme record [dev…]     # append a wear snapshot per NVMe (internal Apple, TB/USB external) to the ledger
+dvm nvme trend [key]       # TB/day, %used/day, projected life vs rated TBW, unsafe-shutdown and media-error deltas
+dvm nvme swap              # swap in use = the internal module taking writes nobody asked for
+dvm scrub ROOT MANIFEST    # verify a BLAKE3 manifest, log it to scrubs.jsonl, read errors ≠ drift
+   … --announce http://mini:8790 --token T --source ultra   # one status line to the shim → the phone
 ```
 
 Design invariants:

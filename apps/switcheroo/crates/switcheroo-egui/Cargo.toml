@@ -9,6 +9,13 @@ name = "switcheroo"
 path = "src/main.rs"
 required-features = ["app"]
 
+# Headless: turn a Wemo on/off from a terminal. Builds without eframe; the `ble` half needs the
+# `ble` feature (btleplug), the Wi-Fi half needs nothing.
+[[bin]]
+name = "switcheroo-cli"
+path = "src/bin/switcheroo-cli.rs"
+required-features = []
+
 [dependencies]
 switcheroo-core = { path = "../switcheroo-core" }
 # The HomeKit protocol. Headless; only `hap.rs` (behind `ble`) drives it over a radio.
