@@ -169,6 +169,8 @@ struct Player {
     seen_index: Option<seen::Index>,
     seen_query: String,
     seen_hits: Vec<seen::SeenHit>,
+    /// Sound only, by choice (the palette's "Listen only").
+    listen_only: bool,
     /// Picture-in-picture: the video floats, the chapters take the screen.
     pip: vidkit_egui::Pip,
     pip_on: bool,
@@ -367,6 +369,7 @@ impl Player {
             seen_index: None,
             seen_query: String::new(),
             seen_hits: Vec::new(),
+            listen_only: false,
             pip: Default::default(),
             pip_on: false,
             max_texture,
@@ -655,6 +658,7 @@ impl eframe::App for Player {
         self.sections_tick(ctx);
         self.follow_shell_colours(ctx);
         self.follow_display(ctx);
+        self.follow_visibility(ctx);
         self.measure_refresh();
 
         let mut want_analysis = false;
@@ -718,6 +722,19 @@ impl eframe::App for Player {
         }
 
         let central = egui::CentralPanel::default().show(ctx, |ui| {
+            if self.engine.as_ref().is_some_and(|e| !e.video_enabled()) {
+                // No stale frame: say what is happening and how to undo it.
+                let r = ui.available_rect_before_wrap();
+                ui.painter().rect_filled(r, 0.0, egui::Color32::from_rgb(20, 18, 26));
+                ui.painter().text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Listening — video off\npalette: \"Listen only\" to show it",
+                    egui::FontId::proportional(18.0),
+                    ui.visuals().weak_text_color(),
+                );
+                return;
+            }
             if let Some(gpu) = self.gpu.clone() {
                 let surface = ui.available_rect_before_wrap();
                 let (w, h) = gpu.lock().map(|g| g.size()).unwrap_or((0, 0));
@@ -831,6 +848,7 @@ impl Player {
             // it is unfinished.
             C::PlayClipboard => self.play_clipboard(),
             C::Subtitles => self.subtitles = !self.subtitles,
+            C::ListenOnly => self.listen_only = !self.listen_only,
             C::ScrubToSections => self.sections_open = !self.sections_open,
             // The same 5% steps the gestures and the bar use, so the three
             // controls cannot land on different values.
@@ -2044,5 +2062,28 @@ fn stats_tick(ctx: &egui::Context) {
         eprintln!("STATS repaints/s {} causes: {top}", FRAMES.swap(0, Ordering::Relaxed));
         stats_note("report");
         *t = Instant::now();
+    }
+}
+
+impl Player {
+    /// Decode video only while someone can see it: not while listening
+    /// only, not with the picture-in-picture flung off the side, not with
+    /// the window minimised or covered. Each switch reopens the decoder at
+    /// the current position -- a one-off cost, against the whole video path
+    /// (decode, upload, draw) for as long as nobody is looking.
+    fn follow_visibility(&mut self, ctx: &egui::Context) {
+        let (minimized, occluded) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.minimized.unwrap_or(false), v.occluded.unwrap_or(false))
+        });
+        let pip_hidden = self.pip_on && self.pip.hidden.is_some();
+        let want = !(self.listen_only || pip_hidden || minimized || occluded);
+        if let Some(e) = self.engine.as_mut() {
+            if e.video_enabled() != want {
+                if let Err(err) = e.set_video_enabled(want) {
+                    self.gpu_error = Some(format!("switching video {}: {err}", if want { "on" } else { "off" }));
+                }
+            }
+        }
     }
 }

@@ -358,6 +358,8 @@ pub struct Engine {
     depth: usize,
     /// A wall clock held until the first frame is queued.
     waiting_first: bool,
+    /// False while listening only: no video decoder runs at all.
+    video_enabled: bool,
     /// Set by a starved tick; the decoder thread clears it and wakes the UI
     /// when the next frame is queued.
     starved: Arc<AtomicBool>,
@@ -392,6 +394,7 @@ impl Engine {
             speed: 1.0,
             depth: QUEUE_DEPTH,
             waiting_first: false,
+            video_enabled: true,
             starved: Arc::new(AtomicBool::new(false)),
             waker: WAKER.get().cloned(),
             audio_error: Arc::new(Mutex::new(None)),
@@ -426,6 +429,7 @@ impl Engine {
         let (mut video, audio) = (self.opener)(from, self.speed)?;
         self.frame_interval = video.frame_interval;
         self.hdr_peak = video.hdr_peak;
+        if self.video_enabled {
         video.set_pool(self.pool.clone());
         if let Ok(mut d) = self.decoder.lock() {
             *d = format!("{} {}x{}", video.accel.label(), video.width, video.height);
@@ -455,6 +459,17 @@ impl Engine {
             }
         }).map_err(|e| format!("video thread: {e}"))?;
         self.video_rx = Some(rx);
+        } else {
+            // Listening only: the decoder dies here with its ffmpeg, and no
+            // video thread runs. The clock (audio, or wall for a silent
+            // file) carries on; set_video_enabled(true) reopens at the
+            // position it reached.
+            drop(video);
+            self.video_rx = None;
+            if let Ok(mut d) = self.decoder.lock() {
+                *d = "video off".into();
+            }
+        }
 
         let sink = audio.as_ref().map(|_| (self.make_sink)());
         self.master = match (audio, sink) {
@@ -481,7 +496,9 @@ impl Engine {
         // A wall clock waits for the first frame. Started with the engine,
         // it ran through ffmpeg's startup, so every frame arrived tens of ms
         // late -- at 500 Hz (a 6 ms late limit) all of them were dropped.
-        self.waiting_first = !self.master.is_audio();
+        // Only while there will BE a first frame: with video off, a silent
+        // file's wall clock would otherwise never start.
+        self.waiting_first = !self.master.is_audio() && self.video_enabled;
         if self.waiting_first {
             self.master.pause();
         }
@@ -600,6 +617,16 @@ impl Engine {
         if self.paused {
             return Tick::Wait(Duration::from_millis(250));
         }
+        if !self.video_enabled {
+            // Nothing to show. The UI needs only the position for the
+            // transport bar, so a slow tick: four a second, not the film's
+            // frame rate. The end comes from the audio running out (or the
+            // clock passing the duration, which the app knows).
+            if self.master.is_audio() && self.audio_done.load(Ordering::SeqCst) {
+                return Tick::Ended;
+            }
+            return Tick::Wait(Duration::from_millis(250));
+        }
         let pool = self.pool.clone();
         let at = self.master.now() + lead;
         match pick(&mut self.queue, at, &self.policy, &mut |f| pool.recycle(f)) {
@@ -677,6 +704,21 @@ impl Engine {
     /// (allocated, reused) plane buffers since start.
     pub fn pool_stats(&self) -> (u64, u64) {
         (self.pool.allocated.load(Ordering::Relaxed), self.pool.reused.load(Ordering::Relaxed))
+    }
+
+    /// Turn the video decoder off (listening only) or back on. Off kills the
+    /// video ffmpeg and its thread; on reopens at the current position.
+    pub fn set_video_enabled(&mut self, on: bool) -> Result<(), String> {
+        if on == self.video_enabled {
+            return Ok(());
+        }
+        self.video_enabled = on;
+        let at = self.position();
+        self.restart(at)
+    }
+
+    pub fn video_enabled(&self) -> bool {
+        self.video_enabled
     }
 
     /// How the decoder thread wakes the UI (egui's `request_repaint`). Takes
@@ -1326,5 +1368,39 @@ mod tests {
         }
         assert!(shown_early >= 15 && waited <= 5, "shown {shown_early}, sent round again {waited}");
         assert_eq!(e.max_lead().as_millis(), 16, "30 fps: half a frame");
+    }
+
+    /// Listening only: the video decoder is gone (no frames arrive), the
+    /// audio clock keeps going, and turning video back on resumes at the
+    /// position reached, not at the start.
+    #[test]
+    fn listening_only_stops_the_video_and_keeps_the_clock() {
+        if !have_ffmpeg() { return; }
+        let p = clip("listen.mkv", 4.0, 4.0);
+        let maker: SinkMaker = Box::new(|| Box::new(PacedSink { latency: ms(20), bytes: Arc::new(Mutex::new(0)) }) as Box<dyn AudioSink>);
+        let mut e = Engine::start(opener(p), maker, Duration::ZERO, 60).unwrap();
+        let _ = run(&mut e, ms(500));
+        e.set_video_enabled(false).unwrap();
+        assert_eq!(e.decoder(), "video off");
+        let before = e.position();
+        let shown0 = e.shown;
+        let t0 = Instant::now();
+        let mut waits = Vec::new();
+        while t0.elapsed() < ms(1000) {
+            match e.tick() {
+                Tick::Show { .. } => panic!("a frame arrived with video off"),
+                Tick::Wait(d) => { waits.push(d); std::thread::sleep(d.min(ms(50))); }
+                Tick::Ended => break,
+            }
+        }
+        assert_eq!(e.shown, shown0);
+        assert!(waits.iter().all(|d| *d >= ms(250)), "ticks faster than needed: {waits:?}");
+        let advanced = e.position().saturating_sub(before);
+        assert!(advanced > ms(800), "the audio clock stalled: {advanced:?}");
+        // Back on: frames again, from where the clock got to.
+        e.set_video_enabled(true).unwrap();
+        let (pts, _, _) = run(&mut e, ms(400));
+        assert!(!pts.is_empty(), "no frames after turning video back on");
+        assert!(pts[0] >= before + ms(700), "restarted from {:?}, not the position reached", pts[0]);
     }
 }

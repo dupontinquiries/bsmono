@@ -30,6 +30,7 @@ pub enum Command {
     VolumeDown,
     Settings,
     Subtitles,
+    ListenOnly,
     ScrubToSections,
     PlayClipboard,
     Quit,
@@ -52,6 +53,7 @@ impl Command {
         Command::VolumeDown,
         Command::Settings,
         Command::Subtitles,
+        Command::ListenOnly,
         Command::ScrubToSections,
         Command::PlayClipboard,
         Command::Quit,
@@ -70,6 +72,7 @@ impl Command {
             Command::VolumeDown => "Volume −5%",
             Command::Settings => "Settings…",
             Command::Subtitles => "Subtitles",
+            Command::ListenOnly => "Listen only (video off)",
             Command::ScrubToSections => "Scrub to sections…",
             Command::PlayClipboard => "Play from clipboard",
             Command::Quit => "Quit",
@@ -106,6 +109,7 @@ impl Command {
             Command::Settings => "options preferences config gestures sensitivity power",
             Command::Subtitles => "captions cc transcribe transcript",
             Command::ScrubToSections => "find search skip prompt relevant jump",
+            Command::ListenOnly => "audio sound podcast battery video off hide",
             Command::PlayClipboard => "paste url link youtube open video",
             Command::Quit => "exit close",
         }
@@ -318,6 +322,7 @@ impl Command {
             Command::VolumeDown => A::SetVolume(f32::NAN),
             Command::Settings => A::OpenSettings,
             Command::Subtitles => A::ToggleSubtitles,
+            Command::ListenOnly => A::ToggleListenOnly,
             Command::ScrubToSections => A::ScrubToSections,
             Command::PlayClipboard => A::PlayClipboard,
             Command::Quit => A::Quit,
@@ -349,7 +354,7 @@ mod action_bridge_tests {
         for a in [
             A::TogglePlay, A::Rotate, A::CycleFit, A::ResetView, A::OpenFile,
             A::SetSpeed(1.0), A::SetVolume(1.0), A::OpenSettings,
-            A::ToggleSubtitles, A::ScrubToSections, A::PlayClipboard, A::Quit,
+            A::ToggleSubtitles, A::ToggleListenOnly, A::ScrubToSections, A::PlayClipboard, A::Quit,
         ] {
             assert!(has(&a), "{a:?} has no palette row");
         }

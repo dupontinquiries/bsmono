@@ -41,6 +41,7 @@ mod ev {
     pub const FIT: &str = "cycle_fit";
     pub const RESET: &str = "reset_view";
     pub const SUBTITLES: &str = "subtitles";
+    pub const LISTEN: &str = "listen_only";
     pub const SETTINGS: &str = "settings";
     pub const QUIT: &str = "quit";
     pub const BACK: &str = "back";
@@ -65,6 +66,9 @@ pub fn phrases() -> Vec<(&'static str, &'static str)> {
         (ev::FIT, "change the fit"),
         (ev::RESET, "reset the view"),
         (ev::SUBTITLES, "subtitles"),
+        (ev::LISTEN, "listen only"),
+        (ev::LISTEN, "audio only"),
+        (ev::LISTEN, "turn off the video"),
         (ev::SUBTITLES, "captions"),
         (ev::SETTINGS, "settings"),
         (ev::QUIT, "quit"),
@@ -150,6 +154,7 @@ pub fn route(event_type: &str, slots: &[String]) -> Command {
         ev::FIT => Command::Do(Action::CycleFit),
         ev::RESET => Command::Do(Action::ResetView),
         ev::SUBTITLES => Command::Do(Action::ToggleSubtitles),
+        ev::LISTEN => Command::Do(Action::ToggleListenOnly),
         ev::SETTINGS => Command::Do(Action::OpenSettings),
         ev::QUIT => Command::Do(Action::Quit),
         ev::OPEN_CLIP => Command::Do(Action::PlayClipboard),
@@ -219,6 +224,7 @@ mod tests {
             ("pause", Action::TogglePlay),
             ("rotate", Action::Rotate),
             ("subtitles", Action::ToggleSubtitles),
+            ("audio only", Action::ToggleListenOnly),
             ("settings", Action::OpenSettings),
             ("reset the view", Action::ResetView),
         ] {
