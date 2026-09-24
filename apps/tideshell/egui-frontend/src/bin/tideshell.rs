@@ -558,7 +558,7 @@ fn main() {
         // The camera: on only while the cover shows on a lit screen.
         let want_cam = sb.shell.camera_wanted();
         if want_cam && sb.camera.is_none() {
-            sb.camera = Some(tideshell_egui::camera::ChildSource::start(&tideshell_egui::camera::gst_command(tideshell_egui::camera::FRAME_W, tideshell_egui::camera::FRAME_H), tideshell_egui::camera::FRAME_W, tideshell_egui::camera::FRAME_H));
+            sb.camera = Some(tideshell_egui::camera::ChildSource::start(&tideshell_egui::camera::gst_command(&tideshell_egui::camera::CameraChoice::from_vars(std::env::var("TIDESHELL_CAMERA").ok().as_deref(), std::env::var("TIDESHELL_CAMERA_CAPTURE").ok().as_deref()), tideshell_egui::camera::FRAME_W, tideshell_egui::camera::FRAME_H), tideshell_egui::camera::FRAME_W, tideshell_egui::camera::FRAME_H));
         } else if !want_cam && sb.camera.is_some() {
             sb.camera = None;
             sb.prev_frame = None;

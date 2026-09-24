@@ -67,7 +67,7 @@ hr "6. a 3-second capture attempt (the decisive test)"
 if command -v cam >/dev/null 2>&1; then
     LIBCAMERA_LOG_LEVELS=*:INFO timeout 10 cam -c 1 --capture=3 2>&1 | tail -12 | sed 's/^/      /'
 elif command -v gst-launch-1.0 >/dev/null 2>&1; then
-    timeout 10 gst-launch-1.0 libcamerasrc num-buffers=3 ! fakesink 2>&1 | tail -6 | sed 's/^/      /'
+    timeout 10 gst-launch-1.0 libcamerasrc ! identity eos-after=3 ! fakesink 2>&1 | tail -6 | sed 's/^/      /'
 else
     warn "no capture tool (apk add libcamera-tools)"
 fi

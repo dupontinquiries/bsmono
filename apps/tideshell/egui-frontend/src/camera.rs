@@ -23,25 +23,53 @@ pub struct Frame {
     pub rgba: Vec<u8>,
 }
 
+/// Which libcamera camera the pane opens, and at what size it asks the
+/// camera to deliver. Both optional: with no name `libcamerasrc` opens the
+/// FIRST camera libcamera lists, which on the FP5 is the FRONT one; with no
+/// capture size libcamera picks its default stream, which on the FP5 main
+/// camera is 4096x3072 (and 8192x6144 on the front), all of it then
+/// converted and scaled on the CPU for a small pane.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CameraChoice {
+    /// A libcamera camera id, as `cam -l` prints it in parentheses.
+    pub name: Option<String>,
+    pub capture: Option<(usize, usize)>,
+}
+
+impl CameraChoice {
+    /// `TIDESHELL_CAMERA` (a camera id) and `TIDESHELL_CAMERA_CAPTURE`
+    /// (`WxH`), as the environment gives them. Pure: the caller passes the
+    /// values in.
+    pub fn from_vars(camera: Option<&str>, capture: Option<&str>) -> CameraChoice {
+        let name = camera.map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+        let capture = capture.and_then(|c| {
+            let (w, h) = c.trim().split_once(['x', 'X'])?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        });
+        CameraChoice { name, capture }
+    }
+}
+
 /// The pipeline the phone runs: libcamera through GStreamer, scaled to the
 /// pane's size, RGBA on stdout. `videoflip` is not applied: the pane
 /// rotates with the shell.
-pub fn gst_command(w: usize, h: usize) -> Vec<String> {
-    vec![
-        "gst-launch-1.0".into(),
-        "-q".into(),
-        "libcamerasrc".into(),
-        "!".into(),
-        "videoconvert".into(),
-        "!".into(),
-        "videoscale".into(),
-        "!".into(),
-        format!("video/x-raw,format=RGBA,width={w},height={h}"),
-        "!".into(),
-        "fdsink".into(),
-        "fd=1".into(),
-        "sync=false".into(),
-    ]
+pub fn gst_command(choice: &CameraChoice, w: usize, h: usize) -> Vec<String> {
+    let mut v: Vec<String> = vec!["gst-launch-1.0".into(), "-q".into(), "libcamerasrc".into()];
+    if let Some(n) = &choice.name {
+        v.push(format!("camera-name={n}"));
+    }
+    if let Some((cw, ch)) = choice.capture {
+        v.push("!".into());
+        v.push(format!("video/x-raw,width={cw},height={ch}"));
+    }
+    for a in ["!", "videoconvert", "!", "videoscale", "!"] {
+        v.push(a.into());
+    }
+    v.push(format!("video/x-raw,format=RGBA,width={w},height={h}"));
+    for a in ["!", "fdsink", "fd=1", "sync=false"] {
+        v.push(a.into());
+    }
+    v
 }
 
 pub struct ChildSource {
@@ -179,9 +207,24 @@ mod tests {
     fn a_missing_binary_is_reported_not_panicked() {
         let src = ChildSource::start(&["/nonexistent/gst-launch-1.0".to_string()], 4, 4);
         assert!(!src.is_running() && src.status.contains("cannot start"));
-        let cmd = gst_command(240, 320);
+        let cmd = gst_command(&CameraChoice::default(), 240, 320);
         assert_eq!(cmd[0], "gst-launch-1.0");
         assert!(cmd.iter().any(|a| a.contains("format=RGBA,width=240,height=320")));
+        assert!(!cmd.iter().any(|a| a.starts_with("camera-name=")), "no choice: libcamerasrc's own default");
+    }
+
+    #[test]
+    fn the_camera_choice_reaches_the_pipeline_as_separate_arguments() {
+        // The FP5's main rear camera, as `cam -l` printed it there.
+        let id = "/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a";
+        let c = CameraChoice::from_vars(Some(id), Some("1280x960"));
+        assert_eq!(c, CameraChoice { name: Some(id.into()), capture: Some((1280, 960)) });
+        let cmd = gst_command(&c, 240, 320);
+        let at = |x: &str| cmd.iter().position(|a| a == x).unwrap_or_else(|| panic!("{x} missing: {cmd:?}"));
+        assert_eq!(at("libcamerasrc") + 1, at(&format!("camera-name={id}")), "the property belongs to libcamerasrc");
+        assert!(at("video/x-raw,width=1280,height=960") < at("videoconvert"), "the capture size is asked of the camera, before any CPU work");
+        assert_eq!(CameraChoice::from_vars(Some("  "), Some("big")), CameraChoice::default(), "blank or malformed values mean no choice");
+        assert_eq!(CameraChoice::from_vars(None, Some("640X480")).capture, Some((640, 480)));
     }
 
     #[test]

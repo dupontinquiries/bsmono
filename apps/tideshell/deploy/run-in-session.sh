@@ -32,6 +32,8 @@ echo "WAYLAND_DISPLAY=$WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BU
 
 if [ "${1:-}" = "--show-strips" ]; then export TIDESHELL_SHOW_STRIPS=1; shift; fi
 export TIDESHELL_TRACE=stderr
+# The same per-phone settings file the systemd unit reads.
+if [ -f "$HOME/.config/tideshell/env" ]; then set -a; . "$HOME/.config/tideshell/env"; set +a; fi
 [ -x "$BIN" ] || { echo "no binary at $BIN (set TIDESHELL_BIN)"; exit 1; }
 pgrep -x tideshell >/dev/null && { echo "tideshell already running (pid $(pgrep -x tideshell)); stop it first"; exit 1; }
 LOG=$HOME/tideshell-run.log
