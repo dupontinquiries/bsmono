@@ -1681,10 +1681,13 @@ mod tests {
         let far  = results.iter().find(|r| r.lod == LodLevel::Far).unwrap();
 
         // Dispatch correctness: each worker output must equal the
-        // direct call to the expected mesher.
-        assert_eq!(near.mesh.vertex_count(), expected_near_verts,
+        // direct call to the expected mesher. Read from `packed`: the worker
+        // sheds the raw vertex copy after packing (pack_and_shed, cb251c389),
+        // so `mesh` is empty by design -- these assertions read it and failed
+        // from that commit on, unseen while the test crate could not run.
+        assert_eq!(near.packed.as_ref().expect("the worker packs every result").vertex_count(), expected_near_verts,
             "Near worker should match mesh_chunk_with_sky output");
-        assert_eq!(far.mesh.vertex_count(),  expected_far_verts,
+        assert_eq!(far.packed.as_ref().expect("the worker packs every result").vertex_count(),  expected_far_verts,
             "Far worker should match mesh_chunk_downsampled(., 4) output");
 
         // Sanity: on terrain (not solid), the far mesher really does
@@ -1692,8 +1695,8 @@ mod tests {
         // greedy mesher's merging means it MIGHT match or beat far
         // on simple chunks, so we don't pin Near vs Far ordering
         // here — that test belongs in F2 where it lives.
-        assert!(far.mesh.vertex_count()  > 0);
-        assert!(near.mesh.vertex_count() > 0);
+        assert!(far.packed.as_ref().expect("the worker packs every result").vertex_count()  > 0);
+        assert!(near.packed.as_ref().expect("the worker packs every result").vertex_count() > 0);
     }
 
     /// v0.23.7 Stage 2b: when a generator Arc is attached AND the LOD
@@ -1759,14 +1762,14 @@ mod tests {
             .expect("virtual result");
 
         // Materialised on empty chunk → empty mesh.
-        assert!(materialised.mesh.is_empty(),
+        assert!(materialised.packed.as_ref().expect("the worker packs every result").is_empty(),
             "materialised path on empty chunk should produce empty mesh");
 
         // Virtual on surface coord → non-empty mesh (samples real terrain).
         // This is the dispatch signal: the worker had a chunk that, if
         // meshed materially, would be empty. But it took the virtual path
         // and sampled the generator → got real terrain.
-        assert!(!virtual_r.mesh.is_empty(),
+        assert!(!virtual_r.packed.as_ref().expect("the worker packs every result").is_empty(),
             "virtual path on surface coord should produce non-empty mesh");
     }
 
