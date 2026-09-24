@@ -17,6 +17,56 @@ pub struct Probe {
     pub formats: Vec<RawFormat>,
     /// Present on progressive-only extractors that emit no `formats` array.
     pub url: Option<String>,
+    /// Uploaded subtitles, by language.
+    #[serde(default)]
+    pub subtitles: std::collections::BTreeMap<String, Vec<SubTrack>>,
+    /// YouTube's speech recognition, by language -- the original track and
+    /// machine translations of it.
+    #[serde(default)]
+    pub automatic_captions: std::collections::BTreeMap<String, Vec<SubTrack>>,
+}
+
+/// One rendition of a subtitle track.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubTrack {
+    pub ext: Option<String>,
+    pub url: Option<String>,
+    pub name: Option<String>,
+}
+
+/// A caption track to fetch instead of running whisper.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Caption {
+    pub url: String,
+    pub lang: String,
+    /// Machine-generated. Worse punctuation, but timed to the speech, which
+    /// is all chapters and search need.
+    pub automatic: bool,
+}
+
+/// Choose captions for `lang` (default English). Pure.
+///
+/// Order: uploaded subtitles in the language; then the ORIGINAL automatic
+/// track (`en-orig` in current yt-dlp) -- recognised from the speech; then
+/// the plain `en` automatic track, which on a video spoken in another
+/// language is a machine TRANSLATION, so it comes last. VTT only: that is
+/// what the parser reads, and YouTube offers it for every track.
+pub fn pick_captions(p: &Probe, lang: Option<&str>) -> Option<Caption> {
+    let lang = lang.unwrap_or("en");
+    let vtt = |tracks: &Vec<SubTrack>| -> Option<String> {
+        tracks.iter().find(|t| t.ext.as_deref() == Some("vtt")).and_then(|t| t.url.clone())
+    };
+    let base = |k: &str| k.split(['-', '_']).next().unwrap_or(k).to_string();
+    if let Some((k, t)) = p.subtitles.iter().find(|(k, t)| base(k) == lang && vtt(t).is_some()) {
+        return Some(Caption { url: vtt(t)?, lang: k.clone(), automatic: false });
+    }
+    let orig = format!("{lang}-orig");
+    for key in [orig.as_str(), lang] {
+        if let Some(url) = p.automatic_captions.get(key).and_then(vtt) {
+            return Some(Caption { url, lang: key.to_string(), automatic: true });
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,4 +143,31 @@ impl RawFormat {
 
 pub fn parse(json: &str) -> Result<Probe, serde_json::Error> {
     serde_json::from_str(json)
+}
+
+#[cfg(test)]
+mod caption_tests {
+    use super::*;
+
+    #[test]
+    fn captions_prefer_uploaded_then_original_speech_then_translation() {
+        let j = r#"{"id":"v","formats":[],
+          "subtitles":{"de":[{"ext":"vtt","url":"https://s/de"}],"en-GB":[{"ext":"srv3","url":"x"},{"ext":"vtt","url":"https://s/en"}]},
+          "automatic_captions":{"en":[{"ext":"vtt","url":"https://a/en"}],"en-orig":[{"ext":"vtt","url":"https://a/orig"}]}}"#;
+        let p: Probe = serde_json::from_str(j).unwrap();
+        assert_eq!(pick_captions(&p, None), Some(Caption { url: "https://s/en".into(), lang: "en-GB".into(), automatic: false }));
+        assert_eq!(pick_captions(&p, Some("de")).map(|c| c.url), Some("https://s/de".into()));
+        let mut p2 = p.clone();
+        p2.subtitles.clear();
+        assert_eq!(pick_captions(&p2, None).map(|c| c.url), Some("https://a/orig".into()), "speech, not translation");
+        p2.automatic_captions.remove("en-orig");
+        assert_eq!(pick_captions(&p2, None).map(|c| (c.url, c.automatic)), Some(("https://a/en".into(), true)));
+        assert_eq!(pick_captions(&p2, Some("ja")), None);
+    }
+
+    #[test]
+    fn a_probe_without_caption_fields_still_parses() {
+        let p: Probe = serde_json::from_str(r#"{"id":"v","formats":[]}"#).unwrap();
+        assert!(p.subtitles.is_empty() && pick_captions(&p, None).is_none());
+    }
 }

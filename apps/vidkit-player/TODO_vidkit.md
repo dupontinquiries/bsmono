@@ -30,7 +30,8 @@ keep:
 | yt-dlp process | `CommandRunner` | `src/io.rs` | ✅ written, wired, tested with a scripted extractor — *verified*; never run against real yt-dlp — *assumed* |
 | HTTP range fetch | `HttpTransport` | `src/io.rs` | ✅ plain TCP + `ureq`/rustls, picked by scheme — *verified* for both, TLS against a real HTTPS origin |
 | V4L2 decode | `V4l2Api` | `vidkit-v4l2::device` | compiles, never run — *verified* it builds, *assumed* it works |
-| transcription | `Transcriber` (voiced-core) | app | **not written** |
+| transcription | `CueSource` (vidkit-transcribe) | `vidkit-transcribe::whisper`, `::subtitles`; loop in `src/transcribe.rs` | sidecar VTT/SRT *verified* end to end incl. screenshots; whisper-rs 0.16 *compiles*, **never run** (no model obtainable in the sandbox) |
+| audio output | `AudioSink` | `src/audio_out.rs` (cpal, feature `alsa`) | ring + engine clock *verified* against a simulated device; cpal *verified* to open/drain/pause on ALSA `null`; **never run on a real card** |
 | relevance model | `Analyzer::take_pending`/`fulfill` | app | **not written** |
 | screen inhibit | `Inhibitor` | app | **not written** |
 
@@ -82,18 +83,17 @@ untestable wrapper would have looked like progress.
    unsupported instead of reporting a corrupt `stsc`.
 
 
-1. **`Transcriber` impl (whisper-rs).** Resolve the model through
-   `shared/models-kit` — `models_kit::find("whisper", name)` — and NOT with a
-   path of its own. `~/models/<kind>/<name>` is the canonical store and
-   models-kit already knows the legacy locations, so a machine that has a
-   model for voiceterm has one for vidkit. Do not add a sixth directory. The ONLY thing missing for lecture
-   watching now: `vidkit_relevance::sections` already turns cues into chapters
-   and answers "where did they discuss X" with a timestamp, and it needs no
-   model — but it needs cues, and nothing produces them. Also unblocks
-   subtitles, scrub-to-sections and the voice router — three palette rows currently say "not wired
-   up yet". `voice-kit` already does the post-processing and
-   `voiced-core::grammar` already does the matching; only the mic and the model
-   are missing. *read*
+1. **Run whisper on a device.** Put `ggml-base.en.bin` (or tiny on a phone,
+   `WHISPER_PREFER=speed`) in `~/models/whisper`, open a lecture with no
+   sidecar, open Sections. Watch the realtime factor in the panel's status
+   line: above 1.0 the transcript falls behind playback, and `Ahead` scope is
+   the right default on that device. *assumed* until someone does this.
+2. **Hardware decode on real hardware.** `decode::choose_accel` picks
+   v4l2m2m on Venus and VAAPI on i915/xe/amdgpu, with a software fallback if
+   no first frame arrives. The status line names what is decoding. Never run
+   here -- no /dev/dri, no V4L2 decoder. *read*
+3. **The cpal sink on a real card**, and compare `VIDKIT_AUDIO=pipe`: seek
+   gaps and A/V offset are the two things to listen for. *assumed*
 4. **Tooltip fade-in.** Asked for and done — see below — but only the shared
    helper; individual controls still need `.on_hover_text` replaced. *verified*
 5. **`Inhibitor` impl.** wlr idle-inhibit on Phosh, `org.freedesktop.ScreenSaver`

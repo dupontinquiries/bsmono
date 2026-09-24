@@ -31,11 +31,12 @@
 //! `Decoder`, and this app decodes in an ffmpeg process that emits finished
 //! frames. Its clocks and sync policy are exactly what is needed, and are.
 
-use crate::decode::{AudioSink, AudioStream, FfmpegFrames};
+use crate::decode::{AudioSink, AudioStream, FfmpegFrames, PlanePool};
+use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 use vidkit_core::clock::{Action, MonotonicClock, SyncPolicy};
 use vidkit_core::traits::Clock;
 use vidkit_core::{AudioClock, Frame};
@@ -43,6 +44,184 @@ use vidkit_core::{AudioClock, Frame};
 /// Decoded frames buffered ahead of the clock. Six 1080p NV12 frames is
 /// ~18 MB -- enough to ride out a slow decode, bounded however long the film.
 pub const QUEUE_DEPTH: usize = 6;
+
+/// Frames parked in the channel between the decoder thread and the queue.
+/// It was QUEUE_DEPTH as well, which doubled the frames held ahead (and the
+/// memory) without adding any slack the queue does not already give: the
+/// decoder still blocks the moment the consumer is ahead.
+pub const CHANNEL_DEPTH: usize = 2;
+
+/// Display refresh rates, for snapping a measured interval to the rate the
+/// panel really runs at. Up to 540: 500 Hz panels ship, and 540 exists.
+pub const RATES: [u32; 20] = [30, 48, 50, 60, 72, 75, 90, 100, 120, 144, 165, 170, 180, 200, 240, 280, 360, 480, 500, 540];
+
+/// The refresh rate from repaint intervals (seconds), or `None` if there is
+/// not enough to go on. Pure.
+///
+/// Median, not mean: a frame that took long (a seek, a GC in the compositor)
+/// is an outlier the median ignores. Intervals over 50 ms are the app idling
+/// between repaints, not vsync, and are left out. The median is snapped to a
+/// known rate within 4%, or reported as measured -- a 500 Hz panel's 2.0 ms
+/// with scheduler jitter still reads 500.
+pub fn estimate_refresh(intervals: &[f64]) -> Option<u32> {
+    let mut v: Vec<f64> = intervals.iter().copied().filter(|d| *d > 0.0008 && *d < 0.05).collect();
+    if v.len() < 30 {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let hz = 1.0 / v[v.len() / 2];
+    Some(RATES.iter().copied().find(|r| ((*r as f64) - hz).abs() / hz < 0.04).unwrap_or(hz.round() as u32))
+}
+
+static REFRESH_HZ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(60);
+
+/// The refresh rate engines start with; the app measures and updates it.
+pub fn refresh_hz() -> u32 {
+    REFRESH_HZ.load(Ordering::Relaxed)
+}
+
+pub fn set_refresh_hz(hz: u32) {
+    REFRESH_HZ.store(hz.clamp(24, 1000), Ordering::Relaxed);
+}
+
+/// How long a starved tick waits if the decoder's wake never comes.
+pub const STARVED_BACKSTOP: Duration = Duration::from_millis(250);
+
+/// Called by the decoder thread to wake the UI.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
+static WAKER: std::sync::OnceLock<Waker> = std::sync::OnceLock::new();
+
+/// The app's waker for every engine (egui's `request_repaint`), set once at
+/// startup: engines spawn their decoder thread as they start.
+pub fn set_global_waker(w: Waker) {
+    let _ = WAKER.set(w);
+}
+
+/// Bytes of decoded frames the queue may hold ahead. Counted in bytes, not
+/// frames: six frames is 18 MB at 1080p and 715 MB at 12K (12288x6480 NV12
+/// is 119 MB a frame).
+pub const QUEUE_BYTES: usize = 256 << 20;
+
+/// Frames to queue ahead for frames of `frame_bytes`: the byte budget, at
+/// least 2 (one showing, one next -- fewer and every late decode is a
+/// visible stall) and at most QUEUE_DEPTH. Pure.
+pub fn queue_depth(frame_bytes: usize) -> usize {
+    (QUEUE_BYTES / frame_bytes.max(1)).clamp(2, QUEUE_DEPTH)
+}
+
+/// Channel slots between decoder and queue: one for frames over 32 MB (8K
+/// and up), where a second is a quarter of a gigabyte more. Pure.
+pub fn channel_depth(frame_bytes: usize) -> usize {
+    if frame_bytes > 32 << 20 { 1 } else { CHANNEL_DEPTH }
+}
+
+/// How far the interpolated audio clock may run past the last reading. The
+/// audio thread advances the clock once per 100 ms block, so a reading older
+/// than that means the audio has stalled, and the video must stall with it
+/// rather than run away.
+pub const INTERP_CAP: Duration = Duration::from_millis(120);
+
+/// The audio clock between readings.
+///
+/// `AudioClock` moves only when the audio thread finishes writing a block --
+/// every 100 ms. Presented against that, video arrived in bursts of three and
+/// `pick` dropped the two older frames of each: measured 15 shown and 30
+/// dropped of 45 due, i.e. 10 fps with sound on, full rate with sound off.
+///
+/// Between readings this extrapolates with wall time, capped at
+/// [`INTERP_CAP`], and never goes backwards: when a reading lands behind the
+/// estimate, the output holds until the audio catches up. Pure, for testing.
+#[derive(Clone, Copy, Debug)]
+pub struct Interp {
+    raw: Duration,
+    at: Option<Instant>,
+    out: Duration,
+    running: bool,
+    /// Media seconds per wall second: the playback speed.
+    rate: f64,
+}
+
+impl Interp {
+    pub fn new(pos: Duration) -> Self {
+        Self { raw: pos, at: None, out: pos, running: false, rate: 1.0 }
+    }
+
+    /// At 2x, media time moves two seconds per wall second between readings,
+    /// and the cap -- one block of audio -- covers twice the media.
+    pub fn with_rate(pos: Duration, rate: f64) -> Self {
+        Self { rate: rate.clamp(0.25, 4.0), ..Self::new(pos) }
+    }
+
+    pub fn read(&mut self, raw: Duration, now: Instant, running: bool) -> Duration {
+        if raw < self.raw {
+            // Only a seek moves the audio clock backwards.
+            *self = Self::with_rate(raw, self.rate);
+        }
+        // A new reading, or playback just (re)started: extrapolate from now,
+        // not from the last reading before a pause -- that would jump the
+        // clock by the whole cap on resume.
+        if raw != self.raw || self.at.is_none() || (running && !self.running) {
+            self.raw = raw;
+            self.at = Some(now);
+        }
+        self.running = running;
+        let est = match (running, self.at) {
+            (true, Some(at)) => raw + now.saturating_duration_since(at).min(INTERP_CAP).mul_f64(self.rate),
+            _ => raw,
+        };
+        self.out = self.out.max(est);
+        self.out
+    }
+}
+
+/// Scale interleaved s16le PCM in place. Unity is free; everything else
+/// saturates rather than wrapping, because a wrapped sample is a full-scale
+/// click.
+pub fn apply_gain(pcm: &mut [u8], gain: f32) {
+    if (gain - 1.0).abs() < 1e-4 {
+        return;
+    }
+    let g = gain.max(0.0);
+    for s in pcm.chunks_exact_mut(2) {
+        let v = i16::from_le_bytes([s[0], s[1]]) as f32 * g;
+        let v = v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        s.copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// Pause for the audio thread: parked on a condvar, not polled. The old loop
+/// slept 10 ms and looked again -- a hundred wakeups a second for as long as
+/// the film sat paused, which on a phone is the difference between the CPU
+/// reaching its deep idle state and not.
+#[derive(Default)]
+struct Gate {
+    paused: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Gate {
+    fn set(&self, paused: bool) {
+        if let Ok(mut p) = self.paused.lock() {
+            *p = paused;
+        }
+        self.cv.notify_all();
+    }
+    /// Block while paused. Returns whether a pause happened, so the caller
+    /// can tell the sink.
+    fn wait(&self, stop: &AtomicBool) -> bool {
+        let Ok(mut p) = self.paused.lock() else { return false };
+        let mut waited = false;
+        while *p && !stop.load(Ordering::Relaxed) {
+            waited = true;
+            p = match self.cv.wait(p) {
+                Ok(p) => p,
+                Err(_) => return waited,
+            };
+        }
+        waited
+    }
+}
 
 /// What to do with the frame queue at this instant.
 #[derive(Debug)]
@@ -54,22 +233,37 @@ pub enum Pick {
 
 /// Choose the frame to show at media time `now`. Pure.
 ///
-/// Late frames past the policy's limit are dropped. A frame that is due is
+/// Late frames past the policy's limit are dropped while a newer one is
+/// queued; the newest is shown however late (see below). A frame that is due is
 /// shown -- unless the one after it is due too, in which case this one is
 /// stale and skipped, or a slow repaint would show every frame late forever.
-pub fn pick(queue: &mut VecDeque<Frame>, now: Duration, policy: &SyncPolicy) -> Pick {
+///
+/// Dropped frames go to `on_drop` rather than being freed, so their planes
+/// return to the pool.
+pub fn pick(queue: &mut VecDeque<Frame>, now: Duration, policy: &SyncPolicy, on_drop: &mut dyn FnMut(Frame)) -> Pick {
     let mut dropped = 0;
     loop {
         let Some(head) = queue.front() else { return Pick::Starved { dropped } };
         match policy.decide(head.pts, now) {
-            Action::Drop => {
-                queue.pop_front();
+            // Drop a late frame only when a newer one is queued to take its
+            // place. The newest frame available is shown however late it is:
+            // a decoder that cannot keep up then plays at its own pace
+            // instead of showing NOTHING. Measured before this: 500 fps with
+            // the 500 Hz policy (late limit 6 ms) showed 0 of 502 frames,
+            // because ffmpeg's startup put every frame over 6 ms late and the
+            // decoder never got far enough ahead to catch up.
+            Action::Drop if queue.len() > 1 => {
+                on_drop(queue.pop_front().expect("front exists"));
                 dropped += 1;
+            }
+            Action::Drop => {
+                let frame = queue.pop_front().expect("front exists");
+                return Pick::Show { frame, dropped };
             }
             Action::Hold(wait) => return Pick::Hold { wait, dropped },
             Action::Show => {
                 if queue.get(1).is_some_and(|next| next.pts <= now) {
-                    queue.pop_front();
+                    on_drop(queue.pop_front().expect("front exists"));
                     dropped += 1;
                     continue;
                 }
@@ -82,39 +276,47 @@ pub fn pick(queue: &mut VecDeque<Frame>, now: Duration, policy: &SyncPolicy) -> 
 
 /// The clock video is presented against.
 pub enum Master {
-    /// Advanced by the audio thread from what the sink has consumed.
-    Audio(Arc<Mutex<AudioClock>>),
+    /// Advanced by the audio thread from what the sink has consumed, and
+    /// interpolated between its advances (see [`Interp`]).
+    Audio(Arc<Mutex<AudioClock>>, Cell<Interp>),
     Wall(MonotonicClock),
 }
 
 impl Master {
     pub fn now(&self) -> Duration {
         match self {
-            Master::Audio(c) => c.lock().map(|c| c.now()).unwrap_or_default(),
+            Master::Audio(c, interp) => {
+                let (raw, running) = c.lock().map(|c| (c.now(), !c.is_paused())).unwrap_or_default();
+                let mut i = interp.get();
+                let out = i.read(raw, Instant::now(), running);
+                interp.set(i);
+                out
+            }
             Master::Wall(c) => c.now(),
         }
     }
     fn pause(&mut self) {
         match self {
-            Master::Audio(c) => { if let Ok(mut c) = c.lock() { c.pause() } }
+            Master::Audio(c, _) => { if let Ok(mut c) = c.lock() { c.pause() } }
             Master::Wall(c) => c.pause(),
         }
     }
     fn resume(&mut self) {
         match self {
-            Master::Audio(c) => { if let Ok(mut c) = c.lock() { c.resume() } }
+            Master::Audio(c, _) => { if let Ok(mut c) = c.lock() { c.resume() } }
             Master::Wall(c) => c.resume(),
         }
     }
     pub fn is_audio(&self) -> bool {
-        matches!(self, Master::Audio(_))
+        matches!(self, Master::Audio(..))
     }
 }
 
 /// Opens the source at a position: video frames, and audio if it has any.
 /// A closure so a file and a network stream take the same path, and so a
 /// seek or a speed change can reopen both.
-pub type Opener = Box<dyn Fn(Duration) -> Result<(FfmpegFrames, Option<AudioStream>), String> + Send>;
+/// Called with the media position and the playback speed.
+pub type Opener = Box<dyn Fn(Duration, f64) -> Result<(FfmpegFrames, Option<AudioStream>), String> + Send>;
 /// Makes a fresh audio sink. Fresh per (re)start: dropping the old one kills
 /// the player process, so audio buffered before a seek is not heard after it.
 pub type SinkMaker = Box<dyn Fn() -> Box<dyn AudioSink> + Send>;
@@ -138,8 +340,30 @@ pub struct Engine {
     queue: VecDeque<Frame>,
     master: Master,
     stop: Arc<AtomicBool>,
-    audio_paused: Arc<AtomicBool>,
+    gate: Arc<Gate>,
+    /// Linear gain, as f32 bits: the audio thread reads it every block, so a
+    /// volume change is heard within 100 ms and costs no restart.
+    gain: Arc<AtomicU32>,
+    /// Plane buffers, shared with the decoder thread and kept across seeks.
+    pool: Arc<PlanePool>,
+    /// What is decoding, for the status line; the video thread rewrites it
+    /// if a hardware decoder falls back to software.
+    decoder: Arc<Mutex<String>>,
+    /// The playing stream's HDR content peak, for the presenter's EETF.
+    hdr_peak: Option<f32>,
     audio_done: Arc<AtomicBool>,
+    /// Playback speed, applied at the next (re)start.
+    speed: f64,
+    /// Frames queued ahead, from the frame size (queue_depth).
+    depth: usize,
+    /// A wall clock held until the first frame is queued.
+    waiting_first: bool,
+    /// False while listening only: no video decoder runs at all.
+    video_enabled: bool,
+    /// Set by a starved tick; the decoder thread clears it and wakes the UI
+    /// when the next frame is queued.
+    starved: Arc<AtomicBool>,
+    waker: Option<Waker>,
     audio_error: Arc<Mutex<Option<String>>>,
     paused: bool,
     frame_interval: Duration,
@@ -161,8 +385,18 @@ impl Engine {
             queue: VecDeque::new(),
             master: Master::Wall(MonotonicClock::new()),
             stop: Arc::new(AtomicBool::new(false)),
-            audio_paused: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new(Gate::default()),
+            gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            pool: PlanePool::new(),
+            decoder: Arc::new(Mutex::new(String::new())),
+            hdr_peak: None,
             audio_done: Arc::new(AtomicBool::new(false)),
+            speed: 1.0,
+            depth: QUEUE_DEPTH,
+            waiting_first: false,
+            video_enabled: true,
+            starved: Arc::new(AtomicBool::new(false)),
+            waker: WAKER.get().cloned(),
             audio_error: Arc::new(Mutex::new(None)),
             paused: false,
             frame_interval: Duration::from_millis(33),
@@ -179,27 +413,63 @@ impl Engine {
     /// processes are killed as they drop.
     fn restart(&mut self, from: Duration) -> Result<(), String> {
         self.stop.store(true, Ordering::SeqCst);
+        // Wake an old audio thread parked on pause, so it sees `stop` and
+        // exits instead of sleeping forever holding a sink.
+        self.gate.cv.notify_all();
         self.stop = Arc::new(AtomicBool::new(false));
-        self.audio_paused = Arc::new(AtomicBool::new(self.paused));
+        self.gate = Arc::new(Gate::default());
+        self.gate.set(self.paused);
         self.audio_done = Arc::new(AtomicBool::new(false));
-        self.queue.clear();
+        for f in self.queue.drain(..) {
+            self.pool.recycle(f);
+        }
         self.shown = 0;
         self.dropped = 0;
 
-        let (video, audio) = (self.opener)(from)?;
+        let (mut video, audio) = (self.opener)(from, self.speed)?;
         self.frame_interval = video.frame_interval;
-        let (tx, rx) = mpsc::sync_channel::<Frame>(QUEUE_DEPTH);
-        let stop = self.stop.clone();
+        self.hdr_peak = video.hdr_peak;
+        if self.video_enabled {
+        video.set_pool(self.pool.clone());
+        if let Ok(mut d) = self.decoder.lock() {
+            *d = format!("{} {}x{}", video.accel.label(), video.width, video.height);
+        }
+        let fb = video.frame_bytes();
+        self.depth = queue_depth(fb);
+        let (tx, rx) = mpsc::sync_channel::<Frame>(channel_depth(fb));
+        let (stop, decoder) = (self.stop.clone(), self.decoder.clone());
+        let (starved, waker) = (self.starved.clone(), self.waker.clone());
         std::thread::Builder::new().name("vidkit-video".into()).spawn(move || {
             let mut video = video;
             while !stop.load(Ordering::Relaxed) {
                 let Some(f) = video.next_frame() else { break };
+                if let Some(note) = video.note.take() {
+                    if let Ok(mut d) = decoder.lock() {
+                        *d = format!("{} {}x{} ({note})", video.accel.label(), video.width, video.height);
+                    }
+                }
                 if tx.send(f).is_err() {
                     break;
+                }
+                if starved.swap(false, Ordering::SeqCst) {
+                    if let Some(w) = &waker {
+                        w();
+                    }
                 }
             }
         }).map_err(|e| format!("video thread: {e}"))?;
         self.video_rx = Some(rx);
+        } else {
+            // Listening only: the decoder dies here with its ffmpeg, and no
+            // video thread runs. The clock (audio, or wall for a silent
+            // file) carries on; set_video_enabled(true) reopens at the
+            // position it reached.
+            drop(video);
+            self.video_rx = None;
+            if let Ok(mut d) = self.decoder.lock() {
+                *d = "video off".into();
+            }
+        }
 
         let sink = audio.as_ref().map(|_| (self.make_sink)());
         self.master = match (audio, sink) {
@@ -212,7 +482,7 @@ impl Engine {
                     if !self.paused { c.resume(); }
                 }
                 self.spawn_audio(stream, sink, clock.clone())?;
-                Master::Audio(clock)
+                Master::Audio(clock, Cell::new(Interp::with_rate(from, self.speed)))
             }
             (Some(_), Some(sink)) => {
                 self.audio_note = format!("{} -- no audio player, timing from the wall clock", sink.name());
@@ -223,35 +493,61 @@ impl Engine {
                 self.wall_at(from)
             }
         };
+        // A wall clock waits for the first frame. Started with the engine,
+        // it ran through ffmpeg's startup, so every frame arrived tens of ms
+        // late -- at 500 Hz (a 6 ms late limit) all of them were dropped.
+        // Only while there will BE a first frame: with video off, a silent
+        // file's wall clock would otherwise never start.
+        self.waiting_first = !self.master.is_audio() && self.video_enabled;
+        if self.waiting_first {
+            self.master.pause();
+        }
         Ok(())
     }
 
     fn wall_at(&self, from: Duration) -> Master {
         let mut c = MonotonicClock::new();
         c.set_position(from);
+        c.set_rate(self.speed);
         if self.paused { c.pause(); } else { c.resume(); }
         Master::Wall(c)
     }
 
     fn spawn_audio(&self, mut stream: AudioStream, mut sink: Box<dyn AudioSink>, clock: Arc<Mutex<AudioClock>>) -> Result<(), String> {
-        let (stop, paused, done, err) = (self.stop.clone(), self.audio_paused.clone(), self.audio_done.clone(), self.audio_error.clone());
+        let (stop, gate, done, err, gain) = (self.stop.clone(), self.gate.clone(), self.audio_done.clone(), self.audio_error.clone(), self.gain.clone());
         let bytes_per_frame = stream.channels as usize * 2;
         let rate = stream.rate as f64;
+        // atempo has already compressed the audio: each output frame carries
+        // `speed` frames of MEDIA. The clock counts media, so scale both the
+        // frames written and the latency still buffered.
+        let speed = self.speed;
         std::thread::Builder::new().name("vidkit-audio".into()).spawn(move || {
             loop {
                 if stop.load(Ordering::Relaxed) { return; }
-                if paused.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(10));
+                if gate.wait(&stop) {
+                    // Paused and resumed. The sink was told on the way in by
+                    // Engine::pause through the gate; tell it on the way out.
+                    sink.set_paused(false);
                     continue;
                 }
                 let Some(pcm) = stream.next_block() else { break };
+                apply_gain(pcm, f32::from_bits(gain.load(Ordering::Relaxed)));
                 if let Err(e) = sink.play(pcm) {
                     if let Ok(mut s) = err.lock() { *s = Some(format!("audio stopped: {e}")); }
                     break;
                 }
-                let frames = (pcm.len() / bytes_per_frame) as u64;
-                let latency = (sink.latency().as_secs_f64() * rate) as u64;
-                if let Ok(mut c) = clock.lock() { c.advance(frames, latency); }
+                let frames = ((pcm.len() / bytes_per_frame) as f64 * speed) as u64;
+                let latency = (sink.latency().as_secs_f64() * rate * speed) as u64;
+                let underrun = sink.take_underrun_frames();
+                if let Ok(mut c) = clock.lock() {
+                    c.advance(frames, latency);
+                    if underrun > 0 { c.report_underrun(underrun); }
+                }
+                if gate.paused.lock().map(|p| *p).unwrap_or(false) {
+                    // About to park: stop the device too, or it plays out its
+                    // buffer and then renders silence for the whole pause.
+                    sink.set_paused(true);
+                }
             }
             done.store(true, Ordering::SeqCst);
         }).map_err(|e| format!("audio thread: {e}"))?;
@@ -274,6 +570,26 @@ impl Engine {
 
     /// One UI repaint's worth of work: never blocks on a decoder or a sink.
     pub fn tick(&mut self) -> Tick {
+        self.tick_ahead(Duration::ZERO)
+    }
+
+    /// The largest presentation lead [`tick_ahead`](Self::tick_ahead) honours:
+    /// half a frame, and never more than 25 ms.
+    pub fn max_lead(&self) -> Duration {
+        (self.frame_interval / 2).min(Duration::from_millis(25))
+    }
+
+    /// Pick for the moment the frame will be SEEN: `lead` from now.
+    ///
+    /// egui wakes a repaint early by about its render time, so the frame is
+    /// on screen by the deadline asked for. Asked "what is due now?", the
+    /// engine answered "nothing yet, wait 15 ms" and the app went round again
+    /// -- measured 96 repaints a second for 24 fps video, 72 of them to be
+    /// told to wait. Picking for the presentation time shows the frame on
+    /// the wake egui intended. Capped by max_lead, so a wake from input
+    /// cannot pull a frame visibly early.
+    pub fn tick_ahead(&mut self, lead: Duration) -> Tick {
+        let lead = lead.min(self.max_lead());
         // AUDIO ENDED FIRST: carry on from where it stopped on the wall clock,
         // or the video would freeze on the frame the audio ran out at.
         if self.master.is_audio() && self.audio_done.load(Ordering::SeqCst) {
@@ -283,7 +599,7 @@ impl Engine {
         }
         let mut disconnected = false;
         if let Some(rx) = &self.video_rx {
-            while self.queue.len() < QUEUE_DEPTH {
+            while self.queue.len() < self.depth {
                 match rx.try_recv() {
                     Ok(f) => self.queue.push_back(f),
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -294,13 +610,32 @@ impl Engine {
         if disconnected {
             self.video_rx = None;
         }
+        if self.waiting_first && !self.queue.is_empty() && !self.paused {
+            self.master.resume();
+            self.waiting_first = false;
+        }
         if self.paused {
             return Tick::Wait(Duration::from_millis(250));
         }
-        match pick(&mut self.queue, self.master.now(), &self.policy) {
+        if !self.video_enabled {
+            // Nothing to show. The UI needs only the position for the
+            // transport bar, so a slow tick: four a second, not the film's
+            // frame rate. The end comes from the audio running out (or the
+            // clock passing the duration, which the app knows).
+            if self.master.is_audio() && self.audio_done.load(Ordering::SeqCst) {
+                return Tick::Ended;
+            }
+            return Tick::Wait(Duration::from_millis(250));
+        }
+        let pool = self.pool.clone();
+        let at = self.master.now() + lead;
+        match pick(&mut self.queue, at, &self.policy, &mut |f| pool.recycle(f)) {
             Pick::Show { frame, dropped } => {
                 self.dropped += dropped as u64;
                 self.shown += 1;
+                // Durations back to the app are from NOW: it adds them to
+                // the current instant for its deadline. Only the pick uses
+                // the presentation time.
                 let next = self.queue.front()
                     .map(|n| n.pts.saturating_sub(self.master.now()))
                     .unwrap_or(self.frame_interval);
@@ -308,11 +643,23 @@ impl Engine {
             }
             Pick::Hold { wait, dropped } => {
                 self.dropped += dropped as u64;
-                Tick::Wait(wait)
+                // `wait` was measured from the presentation time.
+                Tick::Wait(wait + lead)
             }
             Pick::Starved { dropped } => {
                 self.dropped += dropped as u64;
-                if self.video_rx.is_none() { Tick::Ended } else { Tick::Wait(Duration::from_millis(4)) }
+                if self.video_rx.is_none() {
+                    Tick::Ended
+                } else {
+                    // Event-driven, not polled. This returned Wait(4 ms), and
+                    // the UI repainted the whole window every 4 ms asking
+                    // "is the frame there yet?" -- measured 96 repaints a
+                    // second for 24 fps video. Now the decoder thread wakes
+                    // the UI when a frame lands while we are starved; the
+                    // wait is only the backstop for a missed wake.
+                    self.starved.store(true, Ordering::SeqCst);
+                    Tick::Wait(STARVED_BACKSTOP)
+                }
             }
         }
     }
@@ -320,7 +667,7 @@ impl Engine {
     pub fn pause(&mut self) {
         if !self.paused {
             self.paused = true;
-            self.audio_paused.store(true, Ordering::SeqCst);
+            self.gate.set(true);
             self.master.pause();
         }
     }
@@ -328,13 +675,89 @@ impl Engine {
     pub fn resume(&mut self) {
         if self.paused {
             self.paused = false;
-            self.audio_paused.store(false, Ordering::SeqCst);
-            self.master.resume();
+            self.gate.set(false);
+            if !self.waiting_first {
+                self.master.resume();
+            }
         }
     }
 
     pub fn is_paused(&self) -> bool {
         self.paused
+    }
+
+    /// The HDR content peak (MaxCLL / mastering), when the stream has one.
+    pub fn hdr_peak(&self) -> Option<f32> {
+        self.hdr_peak
+    }
+
+    /// Hand a presented frame's planes back for reuse.
+    pub fn recycle(&self, frame: Frame) {
+        self.pool.recycle(frame);
+    }
+
+    /// Plane buffers waiting for reuse, for the diagnostics line.
+    pub fn pooled(&self) -> usize {
+        self.pool.len()
+    }
+
+    /// (allocated, reused) plane buffers since start.
+    pub fn pool_stats(&self) -> (u64, u64) {
+        (self.pool.allocated.load(Ordering::Relaxed), self.pool.reused.load(Ordering::Relaxed))
+    }
+
+    /// Turn the video decoder off (listening only) or back on. Off kills the
+    /// video ffmpeg and its thread; on reopens at the current position.
+    pub fn set_video_enabled(&mut self, on: bool) -> Result<(), String> {
+        if on == self.video_enabled {
+            return Ok(());
+        }
+        self.video_enabled = on;
+        let at = self.position();
+        self.restart(at)
+    }
+
+    pub fn video_enabled(&self) -> bool {
+        self.video_enabled
+    }
+
+    /// How the decoder thread wakes the UI (egui's `request_repaint`). Takes
+    /// effect from the next (re)start of the decoder thread.
+    pub fn set_waker(&mut self, w: Waker) {
+        self.waker = Some(w);
+    }
+
+    /// The display's refresh rate: the sync slack is half its interval. It
+    /// was fixed at 60 Hz, whose 8.3 ms of slack spans four frames at 500 fps.
+    pub fn set_refresh_hz(&mut self, hz: u32) {
+        self.policy = SyncPolicy::for_refresh_hz(hz);
+    }
+
+    /// Volume, 0..=1 from the transport (values above 1 amplify and clip).
+    pub fn set_volume(&self, v: f32) {
+        self.gain.store(v.max(0.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// What is decoding: `VAAPI 1920x1080`, `software 1280x720 (...)`.
+    pub fn decoder(&self) -> String {
+        self.decoder.lock().map(|d| d.clone()).unwrap_or_default()
+    }
+
+    /// Change speed: 0.25..=4. A restart at the current position, since both
+    /// the audio filter and the clock rate are fixed per ffmpeg run -- which
+    /// is why the app debounces a drag rather than calling this per detent.
+    pub fn set_speed(&mut self, speed: f64) -> Result<(), String> {
+        let s = speed.clamp(0.25, 4.0);
+        if (s - self.speed).abs() < 1e-3 {
+            return Ok(());
+        }
+        self.speed = s;
+        let at = self.position();
+        self.restart(at)
+    }
+
+    pub fn speed(&self) -> f64 {
+        self.speed
     }
 
     /// Move video AND audio to `to`.
@@ -346,6 +769,7 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        self.gate.cv.notify_all();
     }
 }
 
@@ -370,11 +794,11 @@ mod tests {
     #[test]
     fn a_due_frame_is_shown_and_a_future_one_held() {
         let mut queue = q(&[100, 133]);
-        match pick(&mut queue, ms(100), &pol()) {
+        match pick(&mut queue, ms(100), &pol(), &mut |_| {}) {
             Pick::Show { frame, dropped } => { assert_eq!(frame.pts, ms(100)); assert_eq!(dropped, 0); }
             p => panic!("{p:?}"),
         }
-        match pick(&mut queue, ms(100), &pol()) {
+        match pick(&mut queue, ms(100), &pol(), &mut |_| {}) {
             Pick::Hold { wait, .. } => assert!(wait > ms(20) && wait < ms(33), "{wait:?}"),
             p => panic!("{p:?}"),
         }
@@ -385,7 +809,7 @@ mod tests {
     #[test]
     fn stale_frames_are_skipped_when_a_newer_one_is_due() {
         let mut queue = q(&[100, 133, 166, 200]);
-        match pick(&mut queue, ms(170), &pol()) {
+        match pick(&mut queue, ms(170), &pol(), &mut |_| {}) {
             Pick::Show { frame, dropped } => { assert_eq!(frame.pts, ms(166)); assert_eq!(dropped, 2); }
             p => panic!("{p:?}"),
         }
@@ -394,7 +818,7 @@ mod tests {
 
     #[test]
     fn an_empty_queue_is_starved() {
-        assert!(matches!(pick(&mut VecDeque::new(), ms(0), &pol()), Pick::Starved { dropped: 0 }));
+        assert!(matches!(pick(&mut VecDeque::new(), ms(0), &pol(), &mut |_| {}), Pick::Starved { dropped: 0 }));
     }
 
     // ---- against real ffmpeg: a clip made here, decoded by the real decoder ----
@@ -421,9 +845,9 @@ mod tests {
     }
 
     fn opener(p: std::path::PathBuf) -> Opener {
-        Box::new(move |from| {
+        Box::new(move |from, speed| {
             let v = if from.is_zero() { FfmpegFrames::open(&p, None)? } else { FfmpegFrames::open_at(&p, None, from)? };
-            let a = AudioStream::open(&p.to_string_lossy(), 48_000, 2, from).ok();
+            let a = AudioStream::open(&p.to_string_lossy(), 48_000, 2, from, speed).ok();
             Ok((v, a))
         })
     }
@@ -556,5 +980,427 @@ mod tests {
         let _ = run(&mut e, ms(300));
         let after = e.position();
         assert!(after > held && after < held + ms(500), "resumed from {held:?}, now {after:?} -- not jumped by the pause");
+    }
+
+    // ---- the audio clock between readings --------------------------------
+
+    /// Readings every 100 ms; between them the output must keep moving with
+    /// wall time, or video arrives in bursts and two of every three frames are
+    /// dropped (measured before this existed: 15 shown, 30 dropped of 45).
+    #[test]
+    fn interp_moves_between_readings() {
+        let t0 = Instant::now();
+        let mut i = Interp::new(ms(0));
+        assert_eq!(i.read(ms(0), t0, true), ms(0));
+        let mid = i.read(ms(0), t0 + ms(50), true);
+        assert_eq!(mid, ms(50), "moved with wall time between readings");
+        // The next reading lands exactly on the estimate's path.
+        assert_eq!(i.read(ms(100), t0 + ms(100), true), ms(100));
+        assert_eq!(i.read(ms(100), t0 + ms(133), true), ms(133));
+    }
+
+    /// Stalled audio stalls the video: at most INTERP_CAP past the last
+    /// reading, however long the stall.
+    #[test]
+    fn interp_is_capped_when_the_audio_stalls() {
+        let t0 = Instant::now();
+        let mut i = Interp::new(ms(1000));
+        i.read(ms(1000), t0, true);
+        assert_eq!(i.read(ms(1000), t0 + ms(5000), true), ms(1000) + INTERP_CAP);
+    }
+
+    /// A reading behind the estimate must not move the clock backwards --
+    /// the queue would hold frames already shown -- but a seek must.
+    #[test]
+    fn interp_never_goes_back_except_for_a_seek() {
+        let t0 = Instant::now();
+        let mut i = Interp::new(ms(0));
+        i.read(ms(0), t0, true);
+        let est = i.read(ms(0), t0 + ms(110), true);
+        assert_eq!(est, ms(110));
+        // The audio lands late at 90 ms: held, not rewound.
+        assert_eq!(i.read(ms(90), t0 + ms(111), true), ms(110));
+        // And catches up.
+        assert_eq!(i.read(ms(90), t0 + ms(140), true), ms(119));
+        // A seek back to 10 s... then back to 2 s.
+        assert_eq!(i.read(ms(10_000), t0 + ms(150), true), ms(10_000));
+        assert_eq!(i.read(ms(2_000), t0 + ms(160), true), ms(2_000), "a seek backwards is obeyed");
+    }
+
+    /// Paused: frozen. Resumed: extrapolate from the moment of resuming, not
+    /// from the last reading before the pause, which would leap by the cap.
+    #[test]
+    fn interp_freezes_on_pause_and_resumes_without_a_leap() {
+        let t0 = Instant::now();
+        let mut i = Interp::new(ms(0));
+        i.read(ms(500), t0, true);
+        assert_eq!(i.read(ms(500), t0 + ms(40), true), ms(540));
+        let at_pause = i.read(ms(500), t0 + ms(41), false);
+        assert_eq!(at_pause, ms(540), "holds what was already shown");
+        assert_eq!(i.read(ms(500), t0 + ms(3000), false), ms(540), "frozen while paused");
+        let resumed = i.read(ms(500), t0 + ms(3001), true);
+        assert!(resumed < ms(560), "leapt on resume: {resumed:?}");
+    }
+
+    #[test]
+    fn gain_scales_saturates_and_leaves_unity_alone() {
+        let pcm = |v: &[i16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let back = |b: &[u8]| b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect::<Vec<i16>>();
+        let mut a = pcm(&[1000, -1000, 30000, -30000]);
+        apply_gain(&mut a, 0.5);
+        assert_eq!(back(&a), vec![500, -500, 15000, -15000]);
+        let mut b = pcm(&[30000, -30000]);
+        apply_gain(&mut b, 2.0);
+        assert_eq!(back(&b), vec![i16::MAX, i16::MIN], "saturates, never wraps to a click");
+        let mut c = pcm(&[123, -456]);
+        apply_gain(&mut c, 1.0);
+        assert_eq!(back(&c), vec![123, -456]);
+        let mut d = pcm(&[123, -456]);
+        apply_gain(&mut d, 0.0);
+        assert_eq!(back(&d), vec![0, 0]);
+    }
+
+    /// THE REGRESSION: with a real-time audio sink as master, frames are shown
+    /// at the film's rate, not dropped in bursts. Before the interpolation this
+    /// showed 15 of 45 due frames.
+    #[test]
+    fn with_audio_as_master_frames_are_not_dropped_in_bursts() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let p = clip("burst.mkv", 3.0, 3.0);
+        let maker: SinkMaker = Box::new(|| Box::new(PacedSink { latency: ms(50), bytes: Arc::new(Mutex::new(0)) }) as Box<dyn AudioSink>);
+        let mut e = Engine::start(opener(p), maker, Duration::ZERO, 60).unwrap();
+        assert!(e.clock_is_audio());
+        let _ = run(&mut e, ms(300));
+        let (s0, d0) = (e.shown, e.dropped);
+        let _ = run(&mut e, ms(1500));
+        let (shown, dropped) = (e.shown - s0, e.dropped - d0);
+        eprintln!("DIAG audio master: shown {shown} dropped {dropped} over 1.5 s at 30 fps");
+        assert!(shown >= 36, "~45 due, only {shown} shown ({dropped} dropped)");
+        assert!(dropped * 5 <= shown, "dropping in bursts: {shown} shown, {dropped} dropped");
+    }
+
+    /// Volume reaches the samples, without a restart.
+    #[test]
+    fn volume_is_applied_to_what_the_sink_receives() {
+        if !have_ffmpeg() { return; }
+        struct Peak(Arc<Mutex<i16>>);
+        impl AudioSink for Peak {
+            fn play(&mut self, pcm: &[u8]) -> Result<(), String> {
+                std::thread::sleep(Duration::from_secs_f64(pcm.len() as f64 / (48_000.0 * 4.0)));
+                let m = pcm.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]).saturating_abs()).max().unwrap_or(0);
+                *self.0.lock().unwrap() = m;
+                Ok(())
+            }
+            fn name(&self) -> &str { "peak" }
+        }
+        let p = clip("vol.mkv", 2.0, 2.0);
+        let peak = Arc::new(Mutex::new(0i16));
+        let p2 = peak.clone();
+        let maker: SinkMaker = Box::new(move || Box::new(Peak(p2.clone())) as Box<dyn AudioSink>);
+        let mut e = Engine::start(opener(p), maker, Duration::ZERO, 60).unwrap();
+        let _ = run(&mut e, ms(400));
+        let loud = *peak.lock().unwrap();
+        e.set_volume(0.25);
+        let _ = run(&mut e, ms(400));
+        let quiet = *peak.lock().unwrap();
+        assert!(loud > 1000, "the fixture is audible: {loud}");
+        let ratio = quiet as f64 / loud as f64;
+        assert!((ratio - 0.25).abs() < 0.05, "peak {loud} -> {quiet}, ratio {ratio:.3}");
+    }
+
+    /// Dropped frames and flushed queues go back to the pool, and the decoder
+    /// takes from it: after a while of playback nothing is being allocated.
+    #[test]
+    fn frames_are_recycled_rather_than_reallocated() {
+        if !have_ffmpeg() { return; }
+        let p = clip("pool.mkv", 2.0, 0.0);
+        let mut e = Engine::start(opener(p), null_sink(), Duration::ZERO, 60).unwrap();
+        let t0 = Instant::now();
+        let mut shown = 0;
+        while t0.elapsed() < ms(1000) {
+            match e.tick() {
+                Tick::Show { frame, next } => { shown += 1; e.recycle(frame); std::thread::sleep(next.min(ms(20))); }
+                Tick::Wait(d) => std::thread::sleep(d.min(ms(20))),
+                Tick::Ended => break,
+            }
+        }
+        assert!(shown > 10, "played: {shown}");
+        let (alloc, reused) = e.pool_stats();
+        // Two planes a frame; steady state allocates nothing, so the buffers
+        // made are bounded by what is in flight and the rest are reuse.
+        assert!(alloc <= 2 * 12, "{alloc} buffers allocated: not reusing");
+        assert!(reused > alloc, "reused {reused} vs allocated {alloc}");
+    }
+
+    #[test]
+    fn interp_extrapolates_media_time_at_the_playback_rate() {
+        let t0 = Instant::now();
+        let mut i = Interp::with_rate(ms(0), 2.0);
+        i.read(ms(0), t0, true);
+        assert_eq!(i.read(ms(0), t0 + ms(50), true), ms(100), "2x: 100 ms of media in 50 ms");
+        assert_eq!(i.read(ms(0), t0 + ms(900), true), INTERP_CAP * 2, "the cap is one block of OUTPUT");
+        let mut back = Interp::with_rate(ms(5000), 2.0);
+        back.read(ms(5000), t0, true);
+        assert_eq!(back.read(ms(1000), t0 + ms(10), true), ms(1000), "a seek keeps the rate");
+        assert_eq!(back.read(ms(1000), t0 + ms(20), true), ms(1020));
+    }
+
+    /// 2x with audio as master: media time runs at twice wall time, frames
+    /// follow it, and the sink receives HALF the audio bytes per media second
+    /// -- atempo compressed it, rather than the clock just running fast over
+    /// normal-speed audio.
+    #[test]
+    fn double_speed_moves_media_time_twice_as_fast_with_tempo_corrected_audio() {
+        if !have_ffmpeg() { return; }
+        let p = clip("speed.mkv", 4.0, 4.0);
+        let bytes = Arc::new(Mutex::new(0u64));
+        let b2 = bytes.clone();
+        let maker: SinkMaker = Box::new(move || Box::new(PacedSink { latency: ms(20), bytes: b2.clone() }) as Box<dyn AudioSink>);
+        let mut e = Engine::start(opener(p), maker, Duration::ZERO, 60).unwrap();
+        e.set_speed(2.0).unwrap();
+        assert!(e.clock_is_audio());
+        let t0 = Instant::now();
+        let (pts, _, _) = run(&mut e, ms(1000));
+        let (media, wall) = (e.position().as_secs_f64(), t0.elapsed().as_secs_f64());
+        eprintln!("DIAG 2x: {media:.2} s of media in {wall:.2} s, {} frames shown", pts.len());
+        assert!(media > 2.0 * wall - 0.45 && media < 2.0 * wall + 0.1, "media {media:.3} vs 2 x wall {wall:.3}");
+        assert!(pts.last().copied().unwrap_or_default() > ms(1400), "frames kept up: last {:?}", pts.last());
+        // Whether the AUDIO is tempo-corrected cannot be seen from here:
+        // playback ends with the video, so the sink hears about wall time's
+        // worth either way. decode::audio_tests checks the stream directly.
+        let _ = &bytes;
+    }
+
+    /// 12K must not take a gigabyte of queue; 1080p keeps its full depth.
+    #[test]
+    fn the_queue_is_bounded_by_bytes_at_every_resolution() {
+        let fb = |w, h| crate::decode::frame_bytes(w, h);
+        assert_eq!(queue_depth(fb(1920, 1080)), QUEUE_DEPTH);
+        assert_eq!(queue_depth(fb(3840, 2160)), QUEUE_DEPTH, "4K: 12 MB frames, 72 MB queued");
+        assert_eq!(queue_depth(fb(7680, 4320)), 5, "8K: 50 MB frames");
+        assert_eq!(queue_depth(fb(12288, 6480)), 2, "12K: 119 MB frames");
+        // Through 12K, everything in flight (queue + channel + the one being
+        // decoded) stays under half a gigabyte: 12K is 476 MB.
+        for (w, h) in [(1920, 1080), (3840, 2160), (7680, 4320), (12288, 6480)] {
+            let held = (queue_depth(fb(w, h)) + channel_depth(fb(w, h)) + 1) * fb(w, h);
+            assert!(held <= 512 << 20, "{w}x{h}: {} MB in flight", held >> 20);
+        }
+        // Past it (16K, 199 MB frames) the floor is structural: two queued,
+        // one in the channel, one decoding -- ~760 MB -- and nothing smaller
+        // plays without stalling on every late frame.
+        let sixteen = fb(15360, 8640);
+        assert_eq!((queue_depth(sixteen), channel_depth(sixteen)), (2, 1));
+        assert_eq!(channel_depth(fb(1920, 1080)), 2);
+        assert_eq!(channel_depth(fb(12288, 6480)), 1);
+    }
+
+    #[test]
+    fn refresh_is_measured_from_repaints_and_snapped() {
+        let jitter = |hz: f64, n: usize| -> Vec<f64> {
+            (0..n).map(|i| 1.0 / hz * (1.0 + 0.03 * ((i * 7 % 11) as f64 / 11.0 - 0.5))).collect()
+        };
+        assert_eq!(estimate_refresh(&jitter(500.0, 120)), Some(500));
+        assert_eq!(estimate_refresh(&jitter(144.0, 120)), Some(144));
+        assert_eq!(estimate_refresh(&jitter(59.94, 120)), Some(60));
+        let mut v = jitter(240.0, 100);
+        v.extend([0.2, 0.5, 0.03, 0.03]); // idle gaps and a slow frame
+        assert_eq!(estimate_refresh(&v), Some(240));
+        assert_eq!(estimate_refresh(&jitter(500.0, 10)), None, "too few to say");
+    }
+
+    /// 500 fps through the whole engine: frames at 2 ms intervals, wall
+    /// clock, a tick loop that sleeps until the next frame is due. With the
+    /// policy sized for 500 Hz, nearly every due frame is shown.
+    #[test]
+    fn five_hundred_fps_plays_at_its_rate() {
+        if !have_ffmpeg() { return; }
+        let dir = std::env::temp_dir();
+        let p = dir.join(format!("vk-500-{}.mkv", std::process::id()));
+        assert!(std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=500:duration=3", "-c:v", "mpeg4", "-q:v", "5"]).arg(&p).status().unwrap().success());
+        for hz in [500u32, 60] {
+            let mut e = Engine::start(opener(p.clone()), null_sink(), Duration::ZERO, hz).unwrap();
+            let _ = run(&mut e, ms(300));
+            let (s0, d0) = (e.shown, e.dropped);
+            let t0 = Instant::now();
+            // Ticked like a 500 Hz display: every 2 ms on the beat, not when
+            // the next frame is due -- the slack only matters then.
+            let (mut pts, mut at) = (vec![], vec![]);
+            let beat = Duration::from_micros(2000);
+            let mut next_tick = Instant::now() + Duration::from_micros(700);
+            while t0.elapsed() < ms(1000) {
+                if let Some(d) = next_tick.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(d);
+                }
+                next_tick += beat;
+                if let Tick::Show { frame, .. } = e.tick() {
+                    pts.push(frame.pts);
+                    at.push(e.position());
+                    e.recycle(frame);
+                }
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            let (shown, dropped) = (e.shown - s0, e.dropped - d0);
+            // How early a frame went up: pts ahead of the clock at showing.
+            let early = pts.iter().zip(&at).map(|(p, a)| p.saturating_sub(*a)).max().unwrap_or_default();
+            eprintln!("DIAG 500 fps, policy for {hz} Hz: shown {shown} dropped {dropped} in {secs:.2} s, worst early {:.2} ms", early.as_secs_f64() * 1e3);
+            assert!(shown as f64 >= 0.85 * 500.0 * secs, "{shown} shown of ~{:.0} due", 500.0 * secs);
+            if hz == 500 {
+                // Half a 2 ms interval: never more than one frame early.
+                assert!(early <= Duration::from_micros(1100), "{early:?} early at 500 Hz");
+            }
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The newest frame is shown however late: dropping it shows nothing.
+    #[test]
+    fn a_lone_late_frame_is_shown_not_dropped() {
+        let mut q: VecDeque<Frame> = VecDeque::new();
+        q.push_back(f(0));
+        match pick(&mut q, ms(500), &SyncPolicy::for_refresh_hz(500), &mut |_| {}) {
+            Pick::Show { frame, dropped } => assert_eq!((frame.pts, dropped), (ms(0), 0)),
+            other => panic!("{other:?}"),
+        }
+        // With a newer one queued the late one still goes.
+        let mut q: VecDeque<Frame> = [f(0), f(490)].into_iter().collect();
+        match pick(&mut q, ms(500), &SyncPolicy::for_refresh_hz(500), &mut |_| {}) {
+            Pick::Show { frame, dropped } => assert_eq!((frame.pts, dropped), (ms(490), 1)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The wall clock starts at the first frame, not at engine start: a
+    /// busy UI (or a slow ffmpeg start) must not put the clock ahead of the
+    /// picture before anything is shown.
+    #[test]
+    fn the_wall_clock_waits_for_the_first_frame() {
+        if !have_ffmpeg() { return; }
+        let p = clip("first.mkv", 2.0, 0.0);
+        let mut e = Engine::start(opener(p), null_sink(), Duration::ZERO, 60).unwrap();
+        std::thread::sleep(ms(200));
+        let t0 = Instant::now();
+        let first = loop {
+            match e.tick() {
+                Tick::Show { frame, .. } => break frame.pts,
+                Tick::Wait(d) => std::thread::sleep(d.min(ms(5))),
+                Tick::Ended => panic!("ended"),
+            }
+            assert!(t0.elapsed() < ms(2000));
+        };
+        assert!(first < ms(50), "the clock ran ahead before the first frame: first shown {first:?}");
+    }
+
+    /// A starved engine does not ask to be polled: its wait is the long
+    /// backstop, and the decoder thread's wake arrives when the frame does.
+    #[test]
+    fn starvation_is_woken_not_polled() {
+        if !have_ffmpeg() { return; }
+        let p = clip("wake.mkv", 2.0, 0.0);
+        let woken = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let w2 = woken.clone();
+        let mut e = Engine::start(opener(p.clone()), null_sink(), Duration::ZERO, 60).unwrap();
+        e.set_waker(Arc::new(move || { w2.fetch_add(1, Ordering::SeqCst); }));
+        e.restart(Duration::ZERO).unwrap(); // the waker reaches the new decoder thread
+        let t0 = Instant::now();
+        let (mut waits, mut shown) = (Vec::new(), 0);
+        while t0.elapsed() < ms(1200) && shown < 20 {
+            match e.tick() {
+                Tick::Show { frame, next } => { shown += 1; e.recycle(frame); std::thread::sleep(next.min(ms(40))); }
+                Tick::Wait(d) => {
+                    waits.push(d);
+                    // Sleep until woken or the backstop, like egui would.
+                    let before = woken.load(Ordering::SeqCst);
+                    let until = Instant::now() + d.min(ms(300));
+                    while Instant::now() < until && woken.load(Ordering::SeqCst) == before { std::thread::sleep(ms(1)); }
+                }
+                Tick::Ended => break,
+            }
+        }
+        assert!(shown >= 20, "played {shown}");
+        assert!(waits.iter().all(|d| *d >= ms(5)), "a poll-rate wait came back: {waits:?}");
+        if waits.iter().any(|d| *d == STARVED_BACKSTOP) {
+            assert!(woken.load(Ordering::SeqCst) > 0, "starved, and nothing woke us");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn diag_ticks_per_frame() {
+        let p = clip("diag24.mkv", 3.0, 0.0);
+        let mut e = Engine::start(opener(p), null_sink(), Duration::ZERO, 60).unwrap();
+        let t0 = Instant::now();
+        let mut log = Vec::new();
+        while t0.elapsed() < ms(1500) {
+            let tick = e.tick();
+            let at = t0.elapsed().as_millis();
+            match tick {
+                Tick::Show { frame, next } => { log.push(format!("{at}ms SHOW pts {} next {}ms", frame.pts.as_millis(), next.as_millis())); e.recycle(frame); std::thread::sleep(next); }
+                Tick::Wait(d) => { log.push(format!("{at}ms WAIT {}ms", d.as_millis())); std::thread::sleep(d); }
+                Tick::Ended => break,
+            }
+        }
+        for l in log.iter().skip(20).take(24) { eprintln!("DIAG {l}"); }
+        eprintln!("DIAG ticks {} shown {}", log.len(), e.shown);
+    }
+
+    /// Woken 12 ms before a frame is due (egui's render lead), the engine
+    /// shows it rather than sending the app round again; a lead larger than
+    /// half a frame is capped.
+    #[test]
+    fn a_frame_due_within_the_presentation_lead_is_shown() {
+        if !have_ffmpeg() { return; }
+        let p = clip("lead.mkv", 2.0, 0.0);
+        let mut e = Engine::start(opener(p), null_sink(), Duration::ZERO, 60).unwrap();
+        // Get to steady state, then stop just after a frame.
+        let t0 = Instant::now();
+        while t0.elapsed() < ms(400) {
+            if let Tick::Show { frame, next } = e.tick() { e.recycle(frame); std::thread::sleep(next); }
+        }
+        let mut shown_early = 0;
+        let mut waited = 0;
+        for _ in 0..20 {
+            // Wake 12 ms before the next frame, as egui does.
+            match e.tick_ahead(ms(12)) {
+                Tick::Show { frame, next } => { shown_early += 1; e.recycle(frame); std::thread::sleep(next.saturating_sub(ms(12))); }
+                Tick::Wait(d) => { waited += 1; std::thread::sleep(d.saturating_sub(ms(12))); }
+                Tick::Ended => break,
+            }
+        }
+        assert!(shown_early >= 15 && waited <= 5, "shown {shown_early}, sent round again {waited}");
+        assert_eq!(e.max_lead().as_millis(), 16, "30 fps: half a frame");
+    }
+
+    /// Listening only: the video decoder is gone (no frames arrive), the
+    /// audio clock keeps going, and turning video back on resumes at the
+    /// position reached, not at the start.
+    #[test]
+    fn listening_only_stops_the_video_and_keeps_the_clock() {
+        if !have_ffmpeg() { return; }
+        let p = clip("listen.mkv", 4.0, 4.0);
+        let maker: SinkMaker = Box::new(|| Box::new(PacedSink { latency: ms(20), bytes: Arc::new(Mutex::new(0)) }) as Box<dyn AudioSink>);
+        let mut e = Engine::start(opener(p), maker, Duration::ZERO, 60).unwrap();
+        let _ = run(&mut e, ms(500));
+        e.set_video_enabled(false).unwrap();
+        assert_eq!(e.decoder(), "video off");
+        let before = e.position();
+        let shown0 = e.shown;
+        let t0 = Instant::now();
+        let mut waits = Vec::new();
+        while t0.elapsed() < ms(1000) {
+            match e.tick() {
+                Tick::Show { .. } => panic!("a frame arrived with video off"),
+                Tick::Wait(d) => { waits.push(d); std::thread::sleep(d.min(ms(50))); }
+                Tick::Ended => break,
+            }
+        }
+        assert_eq!(e.shown, shown0);
+        assert!(waits.iter().all(|d| *d >= ms(250)), "ticks faster than needed: {waits:?}");
+        let advanced = e.position().saturating_sub(before);
+        assert!(advanced > ms(800), "the audio clock stalled: {advanced:?}");
+        // Back on: frames again, from where the clock got to.
+        e.set_video_enabled(true).unwrap();
+        let (pts, _, _) = run(&mut e, ms(400));
+        assert!(!pts.is_empty(), "no frames after turning video back on");
+        assert!(pts[0] >= before + ms(700), "restarted from {:?}, not the position reached", pts[0]);
     }
 }

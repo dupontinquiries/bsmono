@@ -46,6 +46,14 @@ pub struct EguiPresenter {
     uploaded_bytes: u64,
     skipped_uploads: u64,
     last_error: Option<String>,
+    /// Damage rendering (vidkit_core::damage): the tile tree and the
+    /// persistent RGBA canvas it updates. None = whole-frame conversion.
+    damage: Option<(vidkit_core::damage::TileTree, Vec<u8>)>,
+    /// Conversions a frame may spend, as a fraction of a whole frame. 1.0
+    /// never degrades (only unchanged tiles are skipped).
+    pub damage_budget: f32,
+    /// The last frame's plan, for profiling.
+    pub last_plan: Option<vidkit_core::damage::Plan>,
 }
 
 impl EguiPresenter {
@@ -63,7 +71,85 @@ impl EguiPresenter {
             uploaded_bytes: 0,
             skipped_uploads: 0,
             last_error: None,
+            damage: None,
+            damage_budget: 1.0,
+            last_plan: None,
         }
+    }
+
+    pub fn damage_rendering(&self) -> bool {
+        self.damage.is_some()
+    }
+
+    /// Turn damage rendering on or off.
+    pub fn set_damage_rendering(&mut self, on: bool) {
+        if on != self.damage.is_some() {
+            self.damage = None;
+            if on {
+                // Built lazily at the first frame, when the size is known.
+                self.damage = Some((vidkit_core::damage::TileTree::new(0, 0), Vec::new()));
+            }
+        }
+    }
+
+    /// Damage path: convert and upload only what the plan says. Returns
+    /// false if the frame is not a form it handles (the caller falls back).
+    fn show_damaged(&mut self, frame: &Frame) -> bool {
+        use vidkit_core::damage::{convert_region, TileTree};
+        use vidkit_core::frame::{FrameData, PlaneLayout};
+        let FrameData::Cpu(planes) = &frame.data else { return false };
+        let bps = match frame.layout {
+            PlaneLayout::Nv12 => 1,
+            PlaneLayout::P010 => 2,
+            _ => return false,
+        };
+        let (w, h) = (frame.width, frame.height);
+        let Some((tree, canvas)) = self.damage.as_mut() else { return false };
+        let fresh = tree.width != w || tree.height != h || self.texture.is_none();
+        if fresh {
+            *tree = TileTree::new(w, h);
+            *canvas = vec![0u8; (w * h * 4) as usize];
+        }
+        let hashes = tree.hash_frame(planes, bps);
+        let budget = ((w as f64 * h as f64) * self.damage_budget.clamp(0.01, 1.0) as f64) as u64;
+        let plan = tree.plan(&hashes, budget);
+        for op in &plan.ops {
+            if convert_region(planes, frame.layout, frame.color, w, *op, canvas).is_err() {
+                self.drops += 1;
+                return true;
+            }
+        }
+        let full = |canvas: &[u8]| ColorImage::from_rgba_unmultiplied([w as usize, h as usize], canvas);
+        match &mut self.texture {
+            Some(t) if !fresh => {
+                for op in &plan.ops {
+                    let mut rect = Vec::with_capacity((op.w * op.h * 4) as usize);
+                    for y in op.y..op.y + op.h {
+                        let a = ((y * w + op.x) * 4) as usize;
+                        rect.extend_from_slice(&canvas[a..a + (op.w * 4) as usize]);
+                    }
+                    let img = ColorImage::from_rgba_unmultiplied([op.w as usize, op.h as usize], &rect);
+                    t.set_partial([op.x as usize, op.y as usize], img, TextureOptions::LINEAR);
+                    self.uploaded_bytes += (op.w * op.h * 4) as u64;
+                }
+            }
+            Some(t) => {
+                t.set(full(canvas), TextureOptions::LINEAR);
+                self.uploaded_bytes += (w * h * 4) as u64;
+            }
+            None => {
+                self.texture = Some(self.ctx.load_texture("vidkit-video", full(canvas), TextureOptions::LINEAR));
+                self.uploaded_bytes += (w * h * 4) as u64;
+            }
+        }
+        if !plan.ops.is_empty() || fresh {
+            self.uploads += 1;
+        }
+        self.frame_size = Vec2::new(w as f32, h as f32);
+        self.shown_pts = Some(frame.pts);
+        self.last_plan = Some(plan);
+        self.last_error = None;
+        true
     }
 
     pub fn texture(&self) -> Option<&TextureHandle> {
@@ -145,6 +231,11 @@ impl EguiPresenter {
         }
     }
 
+    /// The next frame's deadline, if one is set.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
     /// Playback stopped; stop asking for repaints.
     ///
     /// The explicit call is the correct fix and the staleness guard above is
@@ -160,8 +251,14 @@ impl EguiPresenter {
 /// repaint when it recovers.
 const STALE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 
-impl Presenter for EguiPresenter {
-    fn submit(&mut self, frame: Frame) -> core_traits::Result<Option<RecycleToken>> {
+impl EguiPresenter {
+    /// Put a frame on screen without taking it.
+    ///
+    /// [`Presenter::submit`] consumes the frame, which suits a decoder with
+    /// recycle tokens but throws away the planes of one that pools its own
+    /// buffers (the ffmpeg path, which gets its planes back after this).
+    /// Returns whether an upload happened.
+    pub fn show(&mut self, frame: &Frame) -> bool {
         let (w, h) = (frame.width as usize, frame.height as usize);
 
         // A frame already on screen is a no-op. The player re-submits when a
@@ -171,13 +268,14 @@ impl Presenter for EguiPresenter {
         // and warm.
         if self.shown_pts == Some(frame.pts) && self.texture.is_some() {
             self.skipped_uploads += 1;
-            let mut frame = frame;
-            let previous = self.held.take();
-            self.held = frame.recycle.take();
-            return Ok(previous);
+            return false;
         }
 
-        match vidkit_core::frame_to_rgba8_into(&frame, &mut self.scratch) {
+        if self.damage.is_some() && self.show_damaged(frame) {
+            return true;
+        }
+
+        match vidkit_core::frame_to_rgba8_into(frame, &mut self.scratch) {
             Ok(()) => {
                 let image = ColorImage::from_rgba_unmultiplied([w, h], &self.scratch);
                 match &mut self.texture {
@@ -197,6 +295,7 @@ impl Presenter for EguiPresenter {
                 self.uploaded_bytes += (w * h * 4) as u64;
                 self.shown_pts = Some(frame.pts);
                 self.last_error = None;
+                true
             }
             Err(e) => {
                 // Drop the picture, keep the buffer. Counting this as a drop
@@ -205,9 +304,15 @@ impl Presenter for EguiPresenter {
                 // the session.
                 self.drops += 1;
                 self.last_error = Some(e.to_string());
+                false
             }
         }
+    }
+}
 
+impl Presenter for EguiPresenter {
+    fn submit(&mut self, frame: Frame) -> core_traits::Result<Option<RecycleToken>> {
+        self.show(&frame);
         let mut frame = frame;
         let previous = self.held.take();
         self.held = frame.recycle.take();

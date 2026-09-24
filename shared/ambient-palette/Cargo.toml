@@ -1,0 +1,8 @@
+[package]
+name = "ambient-palette"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "tideshell's living palette, published for other apps: a one-line file in $XDG_RUNTIME_DIR (like tideshell.place and tideshell.notify-gain), a throttled publisher and a stat-polling watcher. Zero dependencies, no egui: the colour mapping lives in uikit-egui."
+
+[dependencies]

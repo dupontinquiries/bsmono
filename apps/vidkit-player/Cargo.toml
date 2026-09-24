@@ -26,6 +26,8 @@ vidkit-core = { path = "../../shared/vidkit/crates/vidkit-core" }
 # default 64 KB pipe holds ~340 ms of 48 kHz stereo, all of it "written" but not
 # yet heard. Already in the lockfile transitively.
 libc = "0.2"
+# Same major as shared/voice-engine-kit. Optional: see the `alsa` feature.
+cpal = { version = "0.15", optional = true }
 # The runtime device probe, which replaces a target-triple guess.
 vidkit-v4l2 = { path = "../../shared/vidkit/crates/vidkit-v4l2" }
 # The IO wrappers in src/io.rs implement its CommandRunner and HttpTransport.
@@ -46,6 +48,18 @@ ureq = { version = "2", optional = true, features = ["native-certs"] }
 vidkit-egui = { path = "../../shared/vidkit/crates/vidkit-egui", features = ["glow-upload"] }
 vidkit-mp4 = { path = "../../shared/vidkit/crates/vidkit-mp4" }
 vidkit-webm = { path = "../../shared/vidkit/crates/vidkit-webm" }
+# Section watching: chapters, search and plans (pure), and the transcript
+# producer whose loop src/transcribe.rs drives.
+vidkit-relevance = { path = "../../shared/vidkit/crates/vidkit-relevance" }
+vidkit-transcribe = { path = "../../shared/vidkit/crates/vidkit-transcribe" }
+# tideshell's living palette, followed when the shell publishes it.
+ambient-palette = { path = "../../shared/ambient-palette" }
+# bscale's headless engine: stage A analysis (which blocks the CNN would
+# run on) and the reference RCAS. An app depending on an app's crate, as
+# studio does with d2x-job; the shared vidkit kits stay clear of it.
+d2x-core = { path = "../bscale/crates/d2x-core", optional = true }
+# FrameSource is written against anyhow::Result.
+anyhow = { version = "1", optional = true }
 uikit-egui = { path = "../../shared/uikit/crates/uikit-egui" }
 snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
 
@@ -53,16 +67,46 @@ snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
 # Default-on, matching the other -egui apps: `cargo build --release` in this
 # directory produces the deployable binary with no feature incantation. Off is
 # for a headless build that only wants the library half.
-default = ["app", "https"]
+default = ["app", "https", "whisper", "alsa", "bscale"]
 app = ["dep:eframe"]
 # HTTPS range fetching. Separate from `app` so a headless build that only wants
 # the demuxers does not pull rustls.
 https = ["dep:ureq"]
+# Whisper transcription in process (whisper-rs 0.16 / whisper.cpp). Needs cmake
+# and libclang at build time; `--no-default-features --features app,https`
+# builds without it, and section watching then works from sidecar subtitles
+# only.
+whisper = ["vidkit-transcribe/whisper"]
+# In-process audio output through cpal (ALSA; PipeWire via pipewire-alsa).
+# Needs alsa-lib headers (libasound2-dev / alsa-lib-dev). Without it, audio
+# goes through pw-play / paplay / aplay as before.
+alsa = ["dep:cpal"]
+# Analysis mode: bscale stage A per title, to budget enhancement.
+bscale = ["dep:d2x-core", "dep:anyhow"]
 
 # Monorepo-wide dev policy: full DWARF is the biggest artifact and link cost,
 # and the sandbox boxes are disk-starved.
 [profile.dev]
 debug = "line-tables-only"
+
+# The hot numeric code, optimised even in dev builds. The rest stays at
+# opt-level 0 so the app itself still builds fast.
+#
+# - d2x-core: bscale's stage A. Unoptimised, analysing one 6-minute title
+#   took ~145 s (one core, video playing alongside).
+# - whisper-rs-sys: the `cmake` crate maps opt-level 0 to
+#   CMAKE_BUILD_TYPE=Debug, so every dev build transcribed with an
+#   unoptimised whisper.cpp -- several times slower, silently.
+[profile.dev.package.d2x-core]
+opt-level = 3
+[profile.dev.package.rustfft]
+opt-level = 3
+[profile.dev.package.whisper-rs-sys]
+opt-level = 3
+# The CPU presenter's per-pixel conversion and the damage tree's hashing:
+# unoptimised, whole-frame conversion of 640x360 managed 8 fps.
+[profile.dev.package.vidkit-core]
+opt-level = 3
 
 [dev-dependencies]
 # The URL test serves a real MP4 from the demuxer's own fixture writer.

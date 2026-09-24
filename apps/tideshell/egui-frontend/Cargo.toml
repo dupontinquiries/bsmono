@@ -37,6 +37,9 @@ tideshell-core = { path = "../crates/tideshell-core" }
 speaker-pose = { path = "../../../shared/speaker-pose" }
 hatch-core = { path = "../../hatch/crates/hatch-core" }
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+# Publishes the living palette to $XDG_RUNTIME_DIR/tideshell.palette so apps
+# (vidkit first) can dress to match. Zero dependencies.
+ambient-palette = { path = "../../../shared/ambient-palette" }
 settings-kit = { path = "../../../shared/settings-kit" }
 systemcompkit = { path = "../../../shared/systemcompkit", features = ["wayland_io"], optional = true }
 egui = "0.34"

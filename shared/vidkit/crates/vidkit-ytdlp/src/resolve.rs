@@ -92,6 +92,12 @@ pub struct Resolved {
     /// Earliest expiry across the chosen streams, if the URLs carry one.
     pub expires_at: Option<SystemTime>,
     pub summary: String,
+    /// From the same `-J` call: the length, and captions that make whisper
+    /// unnecessary. Both free -- the JSON was already fetched.
+    pub duration: Option<std::time::Duration>,
+    pub captions: Option<crate::probe::Caption>,
+    /// The page's title, for history and search results.
+    pub title: Option<String>,
 }
 
 /// Build the argument list.
@@ -144,7 +150,11 @@ fn find<'a>(p: &'a Probe, id: &str) -> Option<&'a RawFormat> {
     p.formats.iter().find(|f| f.format_id == id)
 }
 
-fn build_resolved(probe: &Probe, sel: &Selection) -> Option<Resolved> {
+fn duration_of(p: &Probe) -> Option<std::time::Duration> {
+    p.duration.filter(|d| d.is_finite() && *d > 0.0).map(std::time::Duration::from_secs_f64)
+}
+
+fn build_resolved(probe: &Probe, sel: &Selection, lang: Option<&str>) -> Option<Resolved> {
     let v = find(probe, &sel.video_format_id)?;
     let a = sel.audio_format_id.as_deref().and_then(|id| find(probe, id));
 
@@ -168,6 +178,9 @@ fn build_resolved(probe: &Probe, sel: &Selection) -> Option<Resolved> {
         fps: v.fps_or_guess(),
         expires_at,
         summary: sel.summary.clone(),
+        duration: duration_of(probe),
+        captions: crate::probe::pick_captions(probe, lang),
+        title: probe.title.clone(),
     })
 }
 
@@ -225,7 +238,7 @@ impl<R: CommandRunner> Resolver<R> {
         }
         let lang = self.opts.prefer_language.clone();
         let sel = select(&probe, caps, lang.as_deref()).map_err(|_| ResolveError::NoPlayableFormat)?;
-        let r = build_resolved(&probe, &sel).ok_or(ResolveError::NoPlayableFormat)?;
+        let r = build_resolved(&probe, &sel, lang.as_deref()).ok_or(ResolveError::NoPlayableFormat)?;
         self.current = Some(r);
         Ok(self.current.as_ref().expect("just set"))
     }
@@ -263,6 +276,9 @@ impl<R: CommandRunner> Resolver<R> {
                             (x, y) => x.or(y),
                         },
                         summary: prev.summary.clone(),
+                        duration: duration_of(&probe),
+                        captions: crate::probe::pick_captions(&probe, self.opts.prefer_language.as_deref()),
+                        title: probe.title.clone(),
                     };
                     self.current = Some(r);
                     return Ok(self.current.as_ref().expect("just set"));
@@ -274,7 +290,7 @@ impl<R: CommandRunner> Resolver<R> {
         // handle a format change.
         let lang = self.opts.prefer_language.clone();
         let sel = select(&probe, caps, lang.as_deref()).map_err(|_| ResolveError::NoPlayableFormat)?;
-        let r = build_resolved(&probe, &sel).ok_or(ResolveError::NoPlayableFormat)?;
+        let r = build_resolved(&probe, &sel, lang.as_deref()).ok_or(ResolveError::NoPlayableFormat)?;
         self.current = Some(r);
         Ok(self.current.as_ref().expect("just set"))
     }

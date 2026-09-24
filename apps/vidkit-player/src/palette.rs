@@ -30,6 +30,12 @@ pub enum Command {
     VolumeDown,
     Settings,
     Subtitles,
+    ListenOnly,
+    SwFull,
+    SwBalanced,
+    SwSaver,
+    SwMinimum,
+    SwFollowPower,
     ScrubToSections,
     PlayClipboard,
     Quit,
@@ -52,6 +58,12 @@ impl Command {
         Command::VolumeDown,
         Command::Settings,
         Command::Subtitles,
+        Command::ListenOnly,
+        Command::SwFull,
+        Command::SwBalanced,
+        Command::SwSaver,
+        Command::SwMinimum,
+        Command::SwFollowPower,
         Command::ScrubToSections,
         Command::PlayClipboard,
         Command::Quit,
@@ -70,6 +82,12 @@ impl Command {
             Command::VolumeDown => "Volume −5%",
             Command::Settings => "Settings…",
             Command::Subtitles => "Subtitles",
+            Command::ListenOnly => "Listen only (video off)",
+            Command::SwFull => "Software quality: full",
+            Command::SwBalanced => "Software quality: balanced (½ budget)",
+            Command::SwSaver => "Software quality: battery saver (¼)",
+            Command::SwMinimum => "Software quality: minimum (1/16)",
+            Command::SwFollowPower => "Software quality: follow power",
             Command::ScrubToSections => "Scrub to sections…",
             Command::PlayClipboard => "Play from clipboard",
             Command::Quit => "Quit",
@@ -106,6 +124,10 @@ impl Command {
             Command::Settings => "options preferences config gestures sensitivity power",
             Command::Subtitles => "captions cc transcribe transcript",
             Command::ScrubToSections => "find search skip prompt relevant jump",
+            Command::ListenOnly => "audio sound podcast battery video off hide",
+            Command::SwFull | Command::SwBalanced | Command::SwSaver | Command::SwMinimum | Command::SwFollowPower => {
+                "budget damage energy battery quality lod blur cpu software"
+            }
             Command::PlayClipboard => "paste url link youtube open video",
             Command::Quit => "exit close",
         }
@@ -117,6 +139,22 @@ impl Command {
 /// Scores the label and the aliases and keeps the better of the two, so
 /// "louder" finds Volume +5% without "louder" appearing on the row. An empty
 /// query returns everything in declaration order.
+/// A typed budget: "budget 30", "budget 30%", "budget 0.3", "sw 25%",
+/// "quality 0.5". Percent when > 1 or with %, a fraction otherwise; clamped
+/// to 1..100%. Pure.
+pub fn parse_budget(query: &str) -> Option<f32> {
+    let q = query.trim().to_ascii_lowercase();
+    let rest = ["budget", "sw", "quality", "damage"].iter().find_map(|k| q.strip_prefix(k))?;
+    let rest = rest.trim().trim_start_matches(['=', ':']).trim();
+    let (num, pct) = match rest.strip_suffix('%') {
+        Some(n) => (n.trim(), true),
+        None => (rest, false),
+    };
+    let v: f32 = num.parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0)?;
+    let frac = if pct || v > 1.0 { v / 100.0 } else { v };
+    Some(frac.clamp(0.01, 1.0))
+}
+
 pub fn rank(query: &str) -> Vec<Command> {
     if query.trim().is_empty() {
         return Command::ALL.to_vec();
@@ -318,6 +356,12 @@ impl Command {
             Command::VolumeDown => A::SetVolume(f32::NAN),
             Command::Settings => A::OpenSettings,
             Command::Subtitles => A::ToggleSubtitles,
+            Command::ListenOnly => A::ToggleListenOnly,
+            Command::SwFull => A::SetSwBudget(1.0),
+            Command::SwBalanced => A::SetSwBudget(0.5),
+            Command::SwSaver => A::SetSwBudget(0.25),
+            Command::SwMinimum => A::SetSwBudget(1.0 / 16.0),
+            Command::SwFollowPower => A::SetSwBudget(f32::NAN),
             Command::ScrubToSections => A::ScrubToSections,
             Command::PlayClipboard => A::PlayClipboard,
             Command::Quit => A::Quit,
@@ -349,7 +393,7 @@ mod action_bridge_tests {
         for a in [
             A::TogglePlay, A::Rotate, A::CycleFit, A::ResetView, A::OpenFile,
             A::SetSpeed(1.0), A::SetVolume(1.0), A::OpenSettings,
-            A::ToggleSubtitles, A::ScrubToSections, A::PlayClipboard, A::Quit,
+            A::ToggleSubtitles, A::ToggleListenOnly, A::SetSwBudget(1.0), A::ScrubToSections, A::PlayClipboard, A::Quit,
         ] {
             assert!(has(&a), "{a:?} has no palette row");
         }
@@ -372,4 +416,31 @@ mod action_bridge_tests {
             );
         }
     }
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn typed_budgets_parse_as_percent_or_fraction() {
+        assert_eq!(parse_budget("budget 30"), Some(0.3));
+        assert_eq!(parse_budget("budget 30%"), Some(0.3));
+        assert_eq!(parse_budget("Budget 0.3"), Some(0.3));
+        assert_eq!(parse_budget("sw 25%"), Some(0.25));
+        assert_eq!(parse_budget("quality: 1"), Some(1.0), "1 alone is the whole frame");
+        assert_eq!(parse_budget("budget 250"), Some(1.0), "clamped");
+        assert_eq!(parse_budget("budget 0.001"), Some(0.01));
+        assert_eq!(parse_budget("budget"), None, "nothing typed yet");
+        assert_eq!(parse_budget("budget -5"), None);
+        assert_eq!(parse_budget("budget abc"), None);
+        assert_eq!(parse_budget("rotate"), None);
+    }
+
+    #[test]
+    fn the_tiers_are_found_by_what_people_type() {
+        for q in ["battery", "quality", "budget", "saver"] {
+            assert!(rank(q).iter().any(|c| matches!(c, Command::SwSaver)), "{q} did not find the saver tier");
+        }
+    }
+}
 }

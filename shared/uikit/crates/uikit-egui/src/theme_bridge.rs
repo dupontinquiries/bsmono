@@ -292,3 +292,81 @@ mod prefs_tests {
         assert_eq!(filter_color(Color32::from_rgb(10, 20, 30), &none), Color32::from_rgb(10, 20, 30));
     }
 }
+
+/// Visuals from resolved colours, public: for a palette that did not come
+/// from a [`Palette`] -- tideshell's living one, via [`ambient`].
+pub fn apply_colors(ctx: &Context, c: &PaletteColors) {
+    ctx.set_visuals(build_visuals(c));
+}
+
+/// tideshell's living palette <-> [`PaletteColors`]. One mapping, used by the
+/// shell to write and by apps to read.
+pub mod ambient {
+    use super::PaletteColors;
+    use ambient_palette::{AmbientPalette, Rgba};
+    use egui::Color32;
+
+    fn out(c: Color32) -> Option<Rgba> {
+        Some(c.to_srgba_unmultiplied())
+    }
+    fn inn(c: Option<Rgba>, keep: Color32) -> Color32 {
+        c.map(|[r, g, b, a]| Color32::from_rgba_unmultiplied(r, g, b, a)).unwrap_or(keep)
+    }
+
+    /// What the shell publishes. danger/success/warning/glow are not sent:
+    /// they carry meaning, and an app's "error red" should not drift warm
+    /// because the evening did.
+    pub fn to_ambient(c: &PaletteColors, light: bool) -> AmbientPalette {
+        AmbientPalette {
+            light,
+            seq: 0,
+            bg_base: out(c.bg_base),
+            bg_card: out(c.bg_card),
+            bg_raised: out(c.bg_raised),
+            bg_hover: out(c.bg_hover),
+            text: out(c.text),
+            text_weak: out(c.text_weak),
+            accent: out(c.accent),
+            accent_soft: out(c.accent_soft),
+            border: out(c.border),
+        }
+    }
+
+    /// The app's own palette with the shell's roles laid over it.
+    pub fn merge(base: &PaletteColors, a: &AmbientPalette) -> PaletteColors {
+        PaletteColors {
+            bg_base: inn(a.bg_base, base.bg_base),
+            bg_card: inn(a.bg_card, base.bg_card),
+            bg_raised: inn(a.bg_raised, base.bg_raised),
+            bg_hover: inn(a.bg_hover, base.bg_hover),
+            text: inn(a.text, base.text),
+            text_weak: inn(a.text_weak, base.text_weak),
+            accent: inn(a.accent, base.accent),
+            accent_soft: inn(a.accent_soft, base.accent_soft),
+            border: inn(a.border, base.border),
+            ..*base
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_wire_carries_the_look_and_not_the_semantics() {
+            let base = PaletteColors::from_palette(snapclone_theme::palette_by_id("dark"));
+            let mut shell = base;
+            shell.accent = Color32::from_rgb(217, 144, 90);
+            shell.bg_base = Color32::from_rgb(30, 24, 20);
+            shell.danger = Color32::from_rgb(1, 2, 3);
+            let line = to_ambient(&shell, false).to_line();
+            let back = merge(&base, &AmbientPalette::from_line(&line).unwrap());
+            assert_eq!(back.accent, shell.accent);
+            assert_eq!(back.bg_base, shell.bg_base);
+            assert_eq!(back.danger, base.danger, "the app's own danger red is kept");
+            // An empty palette changes nothing.
+            let same = merge(&base, &AmbientPalette::default());
+            assert_eq!(same.accent, base.accent);
+        }
+    }
+}

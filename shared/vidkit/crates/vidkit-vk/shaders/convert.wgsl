@@ -89,27 +89,33 @@ fn hlg_eotf(e: f32) -> f32 {
     return (exp((e - c) / a) + b) / 12.0;
 }
 
-// Soft-knee roll-off: linear below the knee, hyperbolic above, asymptotic to
-// 1.0. `peak` is the luminance that should render as SDR white.
-//
-// The obvious `v / (1 + v)` Reinhard is wrong here and not subtly: it maps
-// v = 1 — that is, exactly the target luminance — to 0.5. ITU reference white
-// is 203 nits, so every HDR file would render diffuse white as mid-grey and
-// look uniformly dim. Measured at 0.487 before this change; see
-// `pq_reference_white_lands_near_sdr_white`.
-//
-// With knee = 0.8: reference white lands at 0.9, 1000 nits at 0.99, and 10000
-// nits at 0.999, so highlights stay ordered instead of clipping flat.
-// Still a placeholder — a real display-referred tonemap is a tuning exercise —
-// but one whose anchor points are defensible.
-fn tonemap(x: f32, peak: f32) -> f32 {
-    let knee = 0.8;
-    let v = x / max(peak, 1.0);
-    if v <= knee {
-        return v;
+fn pq_oetf(nits: f32) -> f32 {
+    let y = pow(clamp(nits / 10000.0, 0.0, 1.0), 0.1593017578125);
+    return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
+}
+
+// BT.2390 EETF, mirroring vidkit-core's `bt2390`: nits from content with
+// peak `src` onto a display with peak `dst`, in the PQ domain. Replaces the
+// linear-light soft knee, which gave 203..4000 nits about 11 output codes.
+// The content peak is fixed at 1000 nits here (the common HDR10 grade):
+// passing MaxCLL needs a Params field, and the Rust layout is not changed
+// without a Vulkan device to run the parity tests.
+fn bt2390(nits: f32, src: f32, dst: f32) -> f32 {
+    if src <= dst {
+        return min(nits, dst);
     }
-    let e = v - knee;
-    return knee + (1.0 - knee) * (e / (e + (1.0 - knee)));
+    let smax = pq_oetf(src);
+    let e1 = pq_oetf(nits) / smax;
+    let ml = pq_oetf(dst) / smax;
+    let ks = 1.5 * ml - 0.5;
+    var e2 = e1;
+    if e1 >= ks {
+        let t = min((e1 - ks) / (1.0 - ks), 1.0);
+        let t2 = t * t;
+        let t3 = t2 * t;
+        e2 = (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks) + (-2.0 * t3 + 3.0 * t2) * ml;
+    }
+    return pq_eotf(e2 * smax) * 10000.0;
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -156,23 +162,45 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let m = yuv_to_rgb_matrix(p.matrix_id);
     var rgb = m * vec3<f32>(yv, u, v);
 
-    switch p.transfer_id {
-        case 1u: {
-            rgb = vec3<f32>(pq_eotf(rgb.r), pq_eotf(rgb.g), pq_eotf(rgb.b)) * 10000.0;
-            rgb = vec3<f32>(
-                tonemap(rgb.r, p.target_nits),
-                tonemap(rgb.g, p.target_nits),
-                tonemap(rgb.b, p.target_nits),
+    // HDR -> SDR, mirroring vidkit-core's `hdr_to_sdr`: linear light with
+    // reference white (target_nits) at 1.0, BT.2020 -> BT.709 in linear
+    // light when the matrix is BT.2020, the knee on the MAX channel (per
+    // channel shifted hue), then sRGB encoding -- the step that was missing:
+    // linear light went into the non-linear output and 18% grey rendered at
+    // ~43/255 instead of ~118. SDR stays gamma-encoded, as before.
+    //
+    // KNOWN REMAINING DIFFERENCE, not fixed here: the limited-range
+    // constants below are 8-bit (16/219/128/224). vidkit-core now uses
+    // 64/876/512/896 for 10-bit; on P010 input this shader still centres
+    // chroma at 128/255, a ~5% green cast in PQ. Fixing it needs a bit-depth
+    // field in Params, i.e. the Rust uniform layout, and there is no Vulkan
+    // device in the sandbox to run the parity tests that would check it.
+    if p.transfer_id == 1u || p.transfer_id == 2u {
+        var lin: vec3<f32>; // absolute nits
+        if p.transfer_id == 1u {
+            lin = vec3<f32>(pq_eotf(rgb.r), pq_eotf(rgb.g), pq_eotf(rgb.b)) * 10000.0;
+        } else {
+            let scene = vec3<f32>(hlg_eotf(rgb.r), hlg_eotf(rgb.g), hlg_eotf(rgb.b));
+            let ys = dot(scene, vec3<f32>(0.2627, 0.6780, 0.0593));
+            let k = select(0.0, pow(ys, 0.2), ys > 0.0);
+            lin = scene * k * 1000.0;
+        }
+        if p.matrix_id == 2u {
+            // WGSL matrices are column-major: these are BT.2087's rows
+            // written as columns.
+            let m = mat3x3<f32>(
+                vec3<f32>(1.6605, -0.1246, -0.0182),
+                vec3<f32>(-0.5876, 1.1329, -0.1006),
+                vec3<f32>(-0.0728, -0.0083, 1.1187),
             );
+            lin = m * lin;
         }
-        case 2u: {
-            rgb = vec3<f32>(hlg_eotf(rgb.r), hlg_eotf(rgb.g), hlg_eotf(rgb.b));
-        }
-        default: {
-            // SDR: leave gamma-encoded. The output is rgba16float and the
-            // swapchain is assumed non-linear sRGB; converting to linear here
-            // and back at present would only add rounding.
-        }
+        lin = max(lin, vec3<f32>(0.0));
+        let peak = max(lin.r, max(lin.g, lin.b));
+        let white = max(p.target_nits, 1.0);
+        let scale = select(0.0, bt2390(peak, 1000.0, white) / peak, peak > 0.0);
+        let l = clamp(lin * scale / white, vec3<f32>(0.0), vec3<f32>(1.0));
+        rgb = select(1.055 * pow(l, vec3<f32>(1.0 / 2.4)) - 0.055, 12.92 * l, l <= vec3<f32>(0.0031308));
     }
 
     textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)),

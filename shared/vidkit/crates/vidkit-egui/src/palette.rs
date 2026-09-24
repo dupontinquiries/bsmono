@@ -35,6 +35,11 @@ pub enum Action {
     /// Ask for a prompt, then scrub to the sections that match it.
     ScrubToSections,
     ToggleSubtitles,
+    /// Sound only: the video decoder stops until it is turned back on.
+    ToggleListenOnly,
+    /// Software presenter conversion budget, 0..1 of a frame
+    /// (vidkit_core::damage); NaN = follow the power policy.
+    SetSwBudget(f32),
     OpenSettings,
     Quit,
 }
@@ -60,6 +65,9 @@ pub fn commands() -> Vec<Command> {
         Command { name: "browse channel from clipboard", aliases: &["paste", "channel", "playlist"], hint: "list the uploader's videos", action: Action::BrowseClipboard },
         Command { name: "scrub to sections", aliases: &["find", "prompt", "skip", "search"], hint: "describe what you want to see", action: Action::ScrubToSections },
         Command { name: "subtitles", aliases: &["captions", "cc", "transcribe"], hint: "transcribe as it plays", action: Action::ToggleSubtitles },
+        Command { name: "software quality: full", aliases: &["budget", "damage", "lossless"], hint: "convert every changed tile at full detail", action: Action::SetSwBudget(1.0) },
+        Command { name: "software quality: battery saver", aliases: &["budget", "damage", "save", "energy"], hint: "a quarter of a frame's conversions; motion goes soft", action: Action::SetSwBudget(0.25) },
+        Command { name: "listen only", aliases: &["audio only", "sound only", "video off", "battery", "podcast"], hint: "stop decoding video; the sound carries on", action: Action::ToggleListenOnly },
         Command { name: "rotate", aliases: &["turn", "orientation"], hint: "90 degrees, or swipe the right edge", action: Action::Rotate },
         Command { name: "cycle fit", aliases: &["zoom", "fill", "letterbox", "bleed"], hint: "fit, fill, stretch", action: Action::CycleFit },
         Command { name: "reset view", aliases: &["unzoom", "restore"], hint: "clear rotation and zoom", action: Action::ResetView },
@@ -100,7 +108,9 @@ pub fn available(commands: Vec<Command>, has_video: bool, clipboard: &ClipboardS
             | Action::CycleFit
             | Action::ResetView
             | Action::ScrubToSections
-            | Action::ToggleSubtitles => has_video,
+            | Action::ToggleSubtitles
+            | Action::ToggleListenOnly
+            | Action::SetSwBudget(_) => has_video,
             Action::PlayClipboard => clipboard.playable,
             Action::BrowseClipboard => clipboard.browsable,
             _ => true,
@@ -200,6 +210,8 @@ pub fn icon_for(action: &Action) -> &'static str {
         Action::PlayClipboard | Action::BrowseClipboard => "🔗",
         Action::ScrubToSections => "🔍",
         Action::ToggleSubtitles => "💬",
+        Action::ToggleListenOnly => "🎧",
+        Action::SetSwBudget(_) => "▦",
         Action::OpenSettings => "⚙",
         Action::Quit => "✕",
     }

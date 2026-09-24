@@ -22,6 +22,10 @@ license = "MIT OR Apache-2.0"
 # Dependency-free maths. `lux::sky_at` delegates to `math_kit::daylight` so the
 # panels, scene-kit and logscope all read ONE sun curve — see that module.
 math-kit = { path = "../../../math-kit" }
+# tideshell's living palette on the wire; zero dependencies. The mapping to
+# PaletteColors lives here (theme_bridge::ambient) so the shell writing it and
+# every app reading it share one definition.
+ambient-palette = { path = "../../../ambient-palette" }
 qrcodegen = { version = "1.8", optional = true }
 voice-engine-kit = { path = "../../../voice-engine-kit", optional = true, features = ["voice"] }
 touchkit = { path = "../../../touchkit", features = ["egui"] }

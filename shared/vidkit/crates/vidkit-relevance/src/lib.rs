@@ -366,6 +366,44 @@ pub fn next_position(plan: &[Section], at: Duration) -> Option<Duration> {
     Some(here.end)
 }
 
+/// A plan that keeps exactly `keep` and skips the rest of `0..total`.
+///
+/// For "watch these chapters": the viewer chose, so none of `plan`'s
+/// protections apply -- no minimum skip, no "too much skipped" fallback. A
+/// viewer who picks one five-minute chapter of an hour wants five minutes.
+/// Overlapping or unsorted spans are normalised; spans past `total` are cut.
+pub fn plan_keeping(keep: &[(Duration, Duration)], total: Duration) -> Vec<Section> {
+    let mut spans: Vec<(Duration, Duration)> = keep
+        .iter()
+        .map(|&(a, b)| (a.min(total), b.min(total)))
+        .filter(|(a, b)| a < b)
+        .collect();
+    spans.sort();
+    let mut merged: Vec<(Duration, Duration)> = Vec::new();
+    for (a, b) in spans {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    if merged.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut at = Duration::ZERO;
+    for (a, b) in merged {
+        if a > at {
+            out.push(Section { start: at, end: a, keep: false });
+        }
+        out.push(Section { start: a, end: b, keep: true });
+        at = b;
+    }
+    if at < total {
+        out.push(Section { start: at, end: total, keep: false });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +630,26 @@ mod tests {
         let ws: Vec<Window> = (0..2).map(|i| win(i, "")).collect();
         let p = plan(&ws, &scores(&[0.9, 0.9]), &SkipPolicy::default());
         assert_eq!(next_position(&p, min(99)), None);
+    }
+
+    #[test]
+    fn plan_keeping_tiles_the_timeline_and_merges_overlaps() {
+        let s = |n: u64| Duration::from_secs(n);
+        let p = plan_keeping(&[(s(300), s(400)), (s(100), s(200)), (s(150), s(250))], s(600));
+        let got: Vec<(u64, u64, bool)> = p.iter().map(|x| (x.start.as_secs(), x.end.as_secs(), x.keep)).collect();
+        assert_eq!(got, vec![(0, 100, false), (100, 250, true), (250, 300, false), (300, 400, true), (400, 600, false)]);
+        // Chosen, so no protections: 90% skipped is what was asked for.
+        assert!(skipped_fraction(&p) > 0.5);
+        assert_eq!(next_position(&p, s(50)), Some(s(100)));
+        assert_eq!(next_position(&p, s(120)), None);
+        assert_eq!(next_position(&p, s(500)), Some(s(600)), "past the last kept span: to the end");
+    }
+
+    #[test]
+    fn plan_keeping_of_nothing_is_no_plan() {
+        let s = |n: u64| Duration::from_secs(n);
+        assert!(plan_keeping(&[], s(10)).is_empty());
+        assert!(plan_keeping(&[(s(20), s(30))], s(10)).is_empty(), "entirely past the end");
+        assert_eq!(plan_keeping(&[(s(0), s(10))], s(10)).len(), 1, "keep everything: one section");
     }
 }
