@@ -21,4 +21,6 @@ gitmind-core = { path = "../core" }
 peek = { path = "../../../../tools/peek" }
 net-kit = { path = "../../../../shared/net-kit" }
 depot-auth = { path = "../../../../shared/depot-auth" }
+# SHA-256 for the join script fingerprint (already in the graph via depot-auth).
+sha2 = "0.10"
 proc-kit = { path = "../../../../shared/proc-kit" }

@@ -30,6 +30,7 @@ pub mod fastboot;
 pub mod fbdiag;
 /// First contact with a freshly-imaged phone: pairing code and join script.
 pub mod join;
+pub mod join_server;
 /// Trying a kernel on the spare slot, and getting evidence out when it dies.
 pub mod kerneltry;
 /// Kernel output parsed, normalised, and reduced to a crash signature.

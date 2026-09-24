@@ -529,6 +529,7 @@ dependencies = [
  "proc-kit",
  "repo-map",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
