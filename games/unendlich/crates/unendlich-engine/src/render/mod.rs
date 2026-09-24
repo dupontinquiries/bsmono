@@ -104,6 +104,12 @@ pub mod egui_overlay;
 // in swapchain.rs, then declare bloom + postfx, then integrate.
 // present_pipeline imports only ash and IS safe — declared below.
 pub mod present_pipeline;
+// c20unified: the three constructors are back in swapchain.rs, so bloom and
+// postfx are declared (compiled, kept from rotting further). NOT yet wired
+// into the frame loop -- that is the integration step above, and it needs a
+// GPU to check.
+pub mod bloom;
+pub mod postfx;
 
 pub use camera::{Camera, FlyCamera};
 pub use chunk_renderer::ChunkRenderer;

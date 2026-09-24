@@ -364,6 +364,105 @@ pub fn create_render_pass_with_depth(
     Ok(unsafe { device.create_render_pass(&info, None)? })
 }
 
+// ── The post-processing passes (render::postfx, render::bloom) ──────────────
+//
+// postfx.rs and bloom.rs called three constructors that no longer existed here,
+// which is why the r155 audit left both modules undeclared. Written back from
+// what their callers require (formats from the caller, load/final layouts from
+// the comments at each begin_render_pass):
+//   offscreen: HDR colour + depth, CLEARed, colour ends SHADER_READ_ONLY (sampled
+//              by bloom and by the present pass);
+//   bloom:     one colour, DONT_CARE (a fullscreen triangle overwrites every
+//              texel), ends SHADER_READ_ONLY (sampled by the present pass);
+//   present:   the swapchain image, DONT_CARE, ends PRESENT_SRC_KHR.
+// Compile-checked, NOT run: no GPU in the sandbox that wrote them. Both
+// features are off unless UNENDLICH_POSTFX / UNENDLICH_BLOOM are set.
+
+/// One colour attachment (plus optional depth) with the given load op and final
+/// layout. A pass whose output is SAMPLED next gets two dependencies: earlier
+/// fragment-shader reads of this image finish before it is written, and its
+/// writes are visible to the next pass's sampling.
+fn color_pass(
+    device: &Device,
+    color_format: vk::Format,
+    load: vk::AttachmentLoadOp,
+    final_layout: vk::ImageLayout,
+    depth_format: Option<vk::Format>,
+) -> Result<vk::RenderPass> {
+    let mut attachments = vec![*vk::AttachmentDescription::builder()
+        .format(color_format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(load)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(final_layout)];
+    if let Some(df) = depth_format {
+        attachments.push(*vk::AttachmentDescription::builder()
+            .format(df)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL));
+    }
+    let color_refs = [vk::AttachmentReference { attachment: 0, layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL }];
+    let depth_ref = vk::AttachmentReference { attachment: 1, layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    let mut subpass = vk::SubpassDescription::builder()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(&color_refs);
+    if depth_format.is_some() {
+        subpass = subpass.depth_stencil_attachment(&depth_ref);
+    }
+    let (out_stage, out_access) = if depth_format.is_some() {
+        (vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+         vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+    } else {
+        (vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+    };
+    let sampled_next = final_layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+    let mut deps = vec![*vk::SubpassDependency::builder()
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        .dst_subpass(0)
+        .src_stage_mask(if sampled_next { vk::PipelineStageFlags::FRAGMENT_SHADER | out_stage } else { out_stage })
+        .src_access_mask(if sampled_next { vk::AccessFlags::SHADER_READ } else { vk::AccessFlags::empty() })
+        .dst_stage_mask(out_stage)
+        .dst_access_mask(out_access)];
+    if sampled_next {
+        deps.push(*vk::SubpassDependency::builder()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ));
+    }
+    let subpasses = [*subpass];
+    let info = vk::RenderPassCreateInfo::builder()
+        .attachments(&attachments)
+        .subpasses(&subpasses)
+        .dependencies(&deps);
+    Ok(unsafe { device.create_render_pass(&info, None)? })
+}
+
+/// The scene rendered into an offscreen HDR target (postfx), sampled afterwards.
+pub fn create_offscreen_render_pass(device: &Device, color_format: vk::Format, depth_format: vk::Format) -> Result<vk::RenderPass> {
+    color_pass(device, color_format, vk::AttachmentLoadOp::CLEAR, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, Some(depth_format))
+}
+
+/// The bloom bright-pass / blur targets: fully overwritten, sampled afterwards.
+pub fn create_bloom_render_pass(device: &Device, format: vk::Format) -> Result<vk::RenderPass> {
+    color_pass(device, format, vk::AttachmentLoadOp::DONT_CARE, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, None)
+}
+
+/// The final composite onto the swapchain image: fully overwritten, presented.
+pub fn create_present_render_pass(device: &Device, format: vk::Format) -> Result<vk::RenderPass> {
+    color_pass(device, format, vk::AttachmentLoadOp::DONT_CARE, vk::ImageLayout::PRESENT_SRC_KHR, None)
+}
+
 // silence unused import warning when we add Instance later
 #[allow(dead_code)]
 fn _unused(_i: &Instance, _l: &khr::Swapchain) {}
