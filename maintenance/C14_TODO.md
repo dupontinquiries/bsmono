@@ -557,6 +557,12 @@ That is the §10 pattern at its largest: a tested state machine, a tested
 one-shot reporter, and a whole codec module, none of it reachable from the
 binary.
 
+**STATUS (c20unified, 623f42518 + 53195b3b3): done, all three steps.** The
+binary reports `EncoderReady(codec.encoder_ready())`; snapclone-egui links
+snapclone-audio with `opus` (default feature); outgoing voice is one Opus
+packet per frame (`Packet::VoiceOpus`, wire kind 4), incoming is decoded per
+speaker (`voice_codec`). Not yet tried in a call between two devices.
+
 ### Order of work
 
 1. **Tell the truth first.** `EncoderReady(false)` while the payload is raw
