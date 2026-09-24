@@ -730,6 +730,10 @@ fn main() {
             // what matters for a tint is the room, not the handset.
             let grid = camera::glass(&f, 4, 5);
             let changed = sb.last_glass.as_ref().map(|prev| camera::scene_changed(prev, &grid, 4.0)).unwrap_or(true);
+            // The pane draws the wash from these twenty cells, not from the
+            // frame: 60 bytes instead of a texture upload, and the GPU does
+            // the interpolation.
+            sb.view.set_glass(grid.clone(), 4, 5);
             sb.last_glass = Some(grid);
             sb.cam_duty.frame(changed);
             // What this place looks like: its dominant colours, every 5 s.
@@ -738,7 +742,9 @@ fn main() {
                 let colors = tideshell_core::ambience::dominant_colors(&f.rgba, 3);
                 sb.shell.on_photo_colors(&colors);
             }
-            sb.view.set_camera_frame(&ctx, f.w, f.h, &f.rgba);
+            // The wash no longer reads the texture, so it is not uploaded.
+            // The motion tracker above works on the CPU-side grayscale copy
+            // and never needed the GPU one.
         }
         let nears: Vec<bool> = sb.proximity.rx.try_iter().collect();
         for n in nears {

@@ -14,6 +14,7 @@
 
 pub mod effects;
 #[cfg(feature = "wayland")]
+pub mod wash;
 pub mod wayland;
 #[cfg(feature = "ei")]
 pub mod ei;
@@ -151,6 +152,13 @@ pub struct ShellView {
     pub camera_rot: crate::fit::Quarter,
     /// Flip the preview horizontally (front cameras).
     pub camera_mirror: bool,
+    /// The colour wash: a coarse grid of cell colours, drawn as a lattice of
+    /// gradient quads instead of a stretched texture. 60 bytes a window
+    /// rather than a 5 kB upload.
+    glass: Option<(Vec<[u8; 3]>, usize, usize)>,
+    /// Grain, uploaded once. Per-frame noise would put back exactly the data
+    /// movement this avoids, and would shimmer.
+    grain: Option<egui::TextureHandle>,
     bar_drag: f32,
     sheet: SettingsSheet,
     /// Press feedback per widget: a spring on its scale (0.94 pressed, 1.0
@@ -350,6 +358,26 @@ impl ShellView {
 
     pub fn clear_camera_frame(&mut self) {
         self.camera_tex = None;
+        self.glass = None;
+    }
+
+    /// The wash for this window, from camera::glass.
+    pub fn set_glass(&mut self, cells: Vec<[u8; 3]>, cols: usize, rows: usize) {
+        self.glass = Some((cells, cols, rows));
+    }
+
+    /// The grain texture, made once on first use.
+    fn grain(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        if let Some(t) = &self.grain {
+            return t.clone();
+        }
+        const N: usize = 64;
+        let a = crate::wash::noise_tile(N, 0x7715, 255);
+        let px: Vec<egui::Color32> = a.iter().map(|v| egui::Color32::from_white_alpha(*v)).collect();
+        let img = egui::ColorImage { size: [N, N], pixels: px, source_size: egui::Vec2::new(N as f32, N as f32) };
+        let t = ctx.load_texture("ts-grain", img, egui::TextureOptions { magnification: egui::TextureFilter::Nearest, minification: egui::TextureFilter::Nearest, wrap_mode: egui::TextureWrapMode::Repeat, mipmap_mode: None });
+        self.grain = Some(t.clone());
+        t
     }
 
     /// Draw one carousel peek filling this `Ui` (its own layer surface).
@@ -484,6 +512,10 @@ impl ShellView {
         self.last_frame_ms = Some(now_ms);
         self.frame_dt = dt_ms;
         self.press.retain(|_, s| !s.is_settled() || s.target < 1.0);
+        // The grain is made once, here, because `cover` has only a painter.
+        if self.glass.is_some() && self.grain.is_none() {
+            let _ = self.grain(ui.ctx());
+        }
         // Contrast rises with the light and never dips: below the polarity
         // flip the dark look gains contrast (darker ground, whiter text);
         // at the flip (the apps' hysteretic one) it becomes a soft light
@@ -773,7 +805,36 @@ impl ShellView {
         let alpha = (1.0 - prog * 0.8).clamp(0.0, 1.0);
         let top = origin + Vec2::new(0.0, -prog * size.y);
         // Background: the camera when it is running (the pane), else a gradient.
-        if let Some((tex, fw, fh)) = &self.camera_tex {
+        // The wash: twenty cells drawn as a lattice of gradient quads. The
+        // GPU's vertex interpolation is the upscaler, so nothing is
+        // resampled and nothing large is uploaded. Preferred over the
+        // texture path because this is what the lock screen actually wants —
+        // colour from the room, not a picture of it.
+        if let Some((cells, cols, rows)) = self.glass.clone() {
+            let r = Rect::from_min_size(top, size);
+            let corners = crate::wash::lattice(&cells, cols, rows);
+            let mut mesh = egui::Mesh::default();
+            for gy in 0..=rows {
+                for gx in 0..=cols {
+                    let c = corners[gy * (cols + 1) + gx];
+                    let p = Pos2::new(r.left() + r.width() * gx as f32 / cols as f32, r.top() + r.height() * gy as f32 / rows as f32);
+                    mesh.vertices.push(egui::epaint::Vertex {
+                        pos: p,
+                        uv: egui::epaint::WHITE_UV,
+                        color: Color32::from_rgba_unmultiplied(c[0], c[1], c[2], (alpha * 255.0) as u8),
+                    });
+                }
+            }
+            mesh.indices = crate::wash::indices(cols, rows);
+            p.add(egui::Shape::mesh(mesh));
+            // Grain, to break the banding a gradient this smooth shows on a
+            // dim screen. One tiled texture, drawn at low alpha.
+            if let Some(grain) = &self.grain {
+                let (tx, ty) = ((r.width() / 64.0).max(1.0), (r.height() / 64.0).max(1.0));
+                p.image(grain.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(tx, ty)), Color32::from_white_alpha((alpha * 18.0) as u8));
+            }
+            p.rect_filled(r, cr(0), Color32::from_black_alpha((alpha * 90.0) as u8));
+        } else if let Some((tex, fw, fh)) = &self.camera_tex {
             let r = Rect::from_min_size(top, size);
             // Not `p.image` with a full 0..1 uv: that stretches the frame to
             // the pane on BOTH axes independently, so a landscape sensor in
