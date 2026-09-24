@@ -907,5 +907,52 @@ pub fn run_pass_shots() -> Result<(), String> {
         vfx.update(1.0 / 60.0, &ev, &game);
     }
     shoot(&mut renderer, &game, &mut vfx, "pass_fight_fog.png", Camera { eye: knot + Vec3::new(-10.0, 9.0, -12.0), target: knot + Vec3::Y, fov_y: 1.0 })?;
+    // The same fight by day, under plain overcast: a map event (a Long
+    // Night) had darkened the first one, which hid the cats.
+    game.weather.night = 0.0;
+    game.weather.night_target = 0.0;
+    game.weather.force(crate::weather::WeatherKind::Overcast, game.t + 999.0);
+    for _ in 0..(3 * 60) {
+        game.tick(1.0 / 60.0);
+        game.weather.night = 0.0;
+        game.weather.night_target = 0.0;
+        let ev: Vec<crate::sim::Event> = game.events.drain(..).collect();
+        vfx.update(1.0 / 60.0, &ev, &game);
+    }
+    let alive: Vec<Vec3> = game.gods.iter().filter(|g| g.respawn_t <= 0.0).map(|g| g.pos).collect();
+    let knot = alive.iter().copied().max_by_key(|p| alive.iter().filter(|q| (**q - *p).length() < 14.0).count()).unwrap_or(Vec3::ZERO);
+    let cam = Camera { eye: knot + Vec3::new(-11.0, 8.0, -13.0), target: knot + Vec3::Y, fov_y: 1.0 };
+    shoot(&mut renderer, &game, &mut vfx, "pass_fight_day.png", cam)?;
+    // HUD and scoreboard with 30 cats, over that frame.
+    if want("pass_hud") {
+        let mut egui_renderer = egui_wgpu::Renderer::new(&renderer.device, wgpu::TextureFormat::Rgba8UnormSrgb, None, 1);
+        let ctx = egui::Context::default();
+        let mut st = UiState::new();
+        renderer.clear_queues();
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        let vp = cam.view_proj(W as f32 / H as f32);
+        let mut textures = egui::TexturesDelta::default();
+        let mut out = None;
+        for k in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W as f32, H as f32))),
+                time: Some(k as f64 * 0.016),
+                ..Default::default()
+            };
+            let o = ctx.run(raw, |c| {
+                ui::draw_hud(c, &game, 0, vp, W as f32, H as f32, &mut st);
+                ui::draw_scoreboard(c, &game);
+            });
+            textures.append(o.textures_delta.clone());
+            out = Some(o);
+        }
+        let mut out = out.expect("ran");
+        out.textures_delta = textures;
+        draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
+        save_shot(&renderer.device, &renderer.queue, &target, "pass_hud_scoreboard.png")?;
+        println!("saved pass_hud_scoreboard.png");
+    }
     Ok(())
 }

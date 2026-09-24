@@ -773,9 +773,18 @@ pub fn draw_scoreboard(ctx: &egui::Context, game: &Game) {
 pub fn draw_scoreboard_labelled(ctx: &egui::Context, game: &Game, ui_label: Option<&str>) {
     let ui_label = ui_label.map(|s| s.to_string());
     setup_style(ctx);
-    egui::Area::new(egui::Id::new("board")).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+    // Fifteen a side does not fit a screen, let alone a phone held
+    // landscape: the board scrolls, and with more than five a side the item
+    // names (the widest column by far) become a count.
+    // Anchored to the top with an explicit budget: egui centres an area by
+    // LAST frame's size, so a centred board that grows runs off the bottom.
+    let max_h = (ctx.screen_rect().height() - 24.0).max(160.0);
+    let big = game.gods.iter().filter(|g| g.team == Team::Blue).count() > 5;
+    egui::Area::new(egui::Id::new("board")).anchor(egui::Align2::CENTER_TOP, [0.0, 12.0]).show(ctx, |ui| {
         egui::Frame::default().fill(PANEL).stroke(Stroke::new(1.5_f32, GOLD)).inner_margin(14.0).show(ui, |ui| {
             ui.heading(egui::RichText::new("SCOREBOARD").size(20.0).color(GOLD));
+            // heading ~28 + frame margins 28 + stroke
+            egui::ScrollArea::vertical().id_source("board_scroll").max_height(max_h - 64.0).show(ui, |ui| {
             for team in [Team::Blue, Team::Red] {
                 ui.label(egui::RichText::new(if team == Team::Blue { "— ORDER (BLUE) —" } else { "— CHAOS (RED) —" }).size(15.0).color(col(team)));
                 ui.label(egui::RichText::new(format!("hunt: {} animals caught", game.wild.caught[team as usize])).size(12.0).color(Color32::from_rgb(170, 168, 158)));
@@ -801,7 +810,13 @@ pub fn draw_scoreboard_labelled(ctx: &egui::Context, game: &Game, ui_label: Opti
                         ui.monospace(format!("{}", g.level));
                         ui.monospace(format!("{}/{}/{}", g.kills, g.deaths, g.assists));
                         ui.monospace(format!("{:.0}", g.gold));
-                        ui.monospace(if names.is_empty() { "—".into() } else { names.join(", ") });
+                        ui.monospace(if names.is_empty() {
+                            "—".into()
+                        } else if big {
+                            format!("{} item{}", names.len(), if names.len() == 1 { "" } else { "s" })
+                        } else {
+                            names.join(", ")
+                        });
                         ui.monospace(g.ai.as_ref().map_or("YOU".to_string(), |b| b.lane.name().to_string()));
                         ui.monospace(match &g.ai {
                             Some(b) => match b.state {
@@ -816,6 +831,7 @@ pub fn draw_scoreboard_labelled(ctx: &egui::Context, game: &Game, ui_label: Opti
                 });
                 ui.add_space(6.0);
             }
+            });
         });
     });
 }
