@@ -395,9 +395,12 @@ fn dress(kind: HeroKind, b: &mut Body, w: &[Xf; NPIV], dim: &HeroDims, col: &Her
             b.part(&w[HEAD], [dim.head * 1.06, 3.0, dim.head * 1.06], rgb(0xbfa066), [0.0, 0.42, 0.0]);
             b.part(&w[HEAD], [5.4, 1.5, 0.6], rgb(0x16161c), [0.0, 0.20, ff + 0.02]);
             b.part(&w[HEAD], [5.6, 0.4, 0.5], col.accent, [0.0, 0.50, ff + 0.03]);
-            // flowing cape down the back (behind = -z)
-            b.part(&w[CHEST], [dim.t_w * 1.12, 26.0, 1.8], rgb(0xb28a44), [0.0, -0.5, -ff - 0.10]);
-            b.part(&w[CHEST], [dim.t_w * 0.6, 18.0, 2.0], rgb(0x9c7a3c), [0.0, -1.5, -ff - 0.16]);
+            // flowing cape down the back (behind = -z) -- as cloth when the caller
+            // drapes it (garment_specs), else these two boxes.
+            if !pose.cloth_garments {
+                b.part(&w[CHEST], [dim.t_w * 1.12, 26.0, 1.8], rgb(0xb28a44), [0.0, -0.5, -ff - 0.10]);
+                b.part(&w[CHEST], [dim.t_w * 0.6, 18.0, 2.0], rgb(0x9c7a3c), [0.0, -1.5, -ff - 0.16]);
+            }
             // sun-orb staff - vertical at the left side (world/root space, turns with yaw)
             let sx = -1.05;
             let sz = 0.30;
@@ -425,7 +428,9 @@ fn dress(kind: HeroKind, b: &mut Body, w: &[Xf; NPIV], dim: &HeroDims, col: &Her
         HeroKind::Gravitybender => {
             // hooded cloak over the head + back
             b.part(&w[HEAD], [dim.head * 1.12, dim.head * 1.1, dim.head * 1.12], rgb(0x2a2433), [0.0, 0.30, -0.10]);
-            b.part(&w[CHEST], [dim.t_w * 1.18, 22.0, 2.2], rgb(0x2a2433), [0.0, -0.4, -ff - 0.08]);
+            if !pose.cloth_garments { // the back panel; as cloth, see garment_specs
+                b.part(&w[CHEST], [dim.t_w * 1.18, 22.0, 2.2], rgb(0x2a2433), [0.0, -0.4, -ff - 0.08]);
+            }
             // floating debris platform it levitates on (becomes the grounded base)
             for &(dx, dz, s) in &[(0.0f32, 0.0f32, 7.0f32), (-3.0, 1.5, 4.0), (3.2, -1.0, 4.5), (0.5, 3.0, 3.5), (-2.0, -2.5, 3.0)] {
                 let sp = (t * 0.6 + dx).sin() * 0.4;
@@ -444,7 +449,7 @@ fn dress(kind: HeroKind, b: &mut Body, w: &[Xf; NPIV], dim: &HeroDims, col: &Her
             // AIR — an aviator's scarf that streams and flutters behind, gliding
             // wind-wisps orbiting the torso, and light air currents off the ankles.
             b.part(&w[NECK], [6.0, 1.8, 1.4], col.accent, [0.0, 0.05, ff * 0.35]); // scarf knot
-            for i in 0..5 {
+            for i in 0..(if pose.cloth_garments { 0 } else { 5 }) { // the tail; as cloth, see garment_specs
                 let f = i as f32;
                 let s = (t * 2.1 + f * 0.6).sin();
                 let c = if i % 2 == 0 { col.accent } else { rgb(0xe4e4da) };
@@ -586,12 +591,17 @@ pub struct HeroPose {
     /// block is SEEN in first person: the real arm, so walking, crouching and the
     /// swing all carry it, instead of a separate floating viewmodel.
     pub fp_carry01: f32,
+    /// Garments as CLOTH: the capes / cloaks / scarf tails `garment_specs`
+    /// lists are left out of the mesh, and `build_rigged` reports where each
+    /// hangs (`HeroAnchors::garments`) so the caller can drape a `sim::garment`
+    /// there. false = the static boxes, exactly as before.
+    pub cloth_garments: bool,
 }
 
 impl Default for HeroPose {
     fn default() -> Self {
         HeroPose { yaw: 0.0, gaze_pitch: 0.0, walk_phase: 0.0, walk_amp: 0.0, anim_t: 0.0, held_color: None, held: None,
-            airborne: 0.0, vertical_vel: 0.0, land_crouch: 0.0, flight01: 0.0, bank: 0.0, swing01: 0.0, fp_carry01: 0.0 }
+            airborne: 0.0, vertical_vel: 0.0, land_crouch: 0.0, flight01: 0.0, bank: 0.0, swing01: 0.0, fp_carry01: 0.0, cloth_garments: false }
     }
 }
 
@@ -648,7 +658,7 @@ pub fn height_range(kind: HeroKind) -> (f32, f32) {
 /// feet position; feet are auto-grounded to it. Returns engine entity geometry.
 /// Where the rig's head and hand ARE this frame, in world space, from the same
 /// solve and the same transform as the drawn mesh.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HeroAnchors {
     /// Between the eyes, just behind the face surface: where a first-person
     /// camera belongs so it moves with the head (walk bob, lean, crouch, flight)
@@ -659,6 +669,36 @@ pub struct HeroAnchors {
     /// Rig units -> world blocks. Constant for a hero and its build: set by the
     /// rest-pose anatomy, not by the pose or what the hero carries.
     pub scale: f32,
+    /// Where each cloth garment hangs (empty unless `pose.cloth_garments`).
+    pub garments: Vec<crate::sim::garment::GarmentAnchor>,
+    /// The torso as a capsule (hips to the base of the neck), for garments to
+    /// hang against rather than through.
+    pub torso: crate::sim::cloth::Capsule,
+}
+
+/// A garment the rig hangs as cloth: the pivot it hangs from, its top edge's
+/// two ends in that pivot's frame (three space: -z is behind), its length and
+/// colour, in rig units.
+struct GarmentSpec { pivot: usize, left: [f32; 3], right: [f32; 3], length: f32, color: [f32; 3] }
+
+fn garment_specs(kind: HeroKind, dim: &HeroDims, col: &HeroColors) -> Vec<GarmentSpec> {
+    let back = -(dim.t_d * U * 0.5) - 0.04; // just off the back of the chest
+    let ff = dim.head * U / 2.0;
+    match kind {
+        // The cape the two boxes drew: across the back at shoulder height.
+        HeroKind::Heliographer => vec![GarmentSpec {
+            pivot: CHEST, left: [-dim.t_w * U * 0.47, 1.12, back], right: [dim.t_w * U * 0.47, 1.12, back],
+            length: 26.0 * U, color: rgb(0xb28a44) }],
+        // The cloak's back panel (its hood stays a box).
+        HeroKind::Gravitybender => vec![GarmentSpec {
+            pivot: CHEST, left: [-dim.t_w * U * 0.52, 1.10, back - 0.01], right: [dim.t_w * U * 0.52, 1.10, back - 0.01],
+            length: 22.0 * U, color: rgb(0x2a2433) }],
+        // The scarf's tail, streaming from the back of the neck (the knot stays).
+        HeroKind::Windwalker => vec![GarmentSpec {
+            pivot: NECK, left: [-0.10, 0.05, -ff * 0.6], right: [0.10, 0.05, -ff * 0.6],
+            length: 1.5, color: col.accent }],
+        _ => Vec::new(),
+    }
 }
 
 /// Rig units -> blocks: the stature over the vertical span of the body itself --
@@ -887,9 +927,16 @@ pub fn build_rigged(
     let bob = (stride2 * 0.5 + 0.5) * amp * 0.10;
     let eye_i = body.mark(&world[HEAD], eye_local(&dim));
     let hand_i = body.mark(&world[ITEM_HAND], [0.0, -0.10, ff_depth(&dim)]);
+    let torso_a = body.mark(&world[HIPS], [0.0, 0.15, 0.0]);
+    let torso_b = body.mark(&world[CHEST], [0.0, 1.05, 0.0]);
+    let specs = if pose.cloth_garments { garment_specs(kind, &dim, &col) } else { Vec::new() };
+    let spec_marks: Vec<(usize, usize)> = specs.iter().map(|g| (body.mark(&world[g.pivot], g.left), body.mark(&world[g.pivot], g.right))).collect();
     let scale = rest_scale(&dim, &col, hero_total_height(params));
     let (v, i, m) = body.finalize(origin, bob, scale, anatomy_verts);
-    (v, i, HeroAnchors { eye: m[eye_i], right_hand: m[hand_i], scale })
+    let garments = specs.iter().zip(&spec_marks).map(|(g, &(l, r))| crate::sim::garment::GarmentAnchor {
+        left: m[l], right: m[r], length: g.length * scale, color: g.color }).collect();
+    let torso = crate::sim::cloth::Capsule { a: m[torso_a], b: m[torso_b], radius: dim.t_d * U * 0.5 * scale };
+    (v, i, HeroAnchors { eye: m[eye_i], right_hand: m[hand_i], scale, garments, torso })
 }
 
 /// The arm that holds an item: the ANATOMICAL right. The forge port puts
@@ -1169,6 +1216,37 @@ mod anchor_tests {
             let hanging = hand_in_view(kind, 0.0, 0.0, 0.0);
             let off = (hanging[0].hypot(hanging[1])).atan2(hanging[2]).to_degrees();
             assert!(off > 45.0, "{kind:?}: without the carry the hand is out of view ({off:.0} deg)");
+        }
+    }
+
+    /// Cloth garments: exactly the caped heroes report one; in garment mode the
+    /// static boxes they replace are gone (and nothing else changes for the
+    /// rest); each attach line is BEHIND the torso for the way the hero faces, at
+    /// upper-body height, and hangs a real length.
+    #[test]
+    fn caped_heroes_report_their_garments_behind_the_body_and_drop_the_boxes() {
+        use HeroKind::*;
+        let origin = [0.0, 10.0, 0.0];
+        for (kind, n) in [(Heliographer, 1), (Gravitybender, 1), (Windwalker, 1), (Tidecaller, 0), (Stormweaver, 0), (Brinekeeper, 0), (Luminant, 0)] {
+            let params = default_params(kind);
+            for yaw in [0.0f32, 0.7, -2.2] {
+                let (vb, _, ab) = build_rigged(kind, &params, origin, &HeroPose { yaw, ..Default::default() });
+                let (vc, _, ac) = build_rigged(kind, &params, origin, &HeroPose { yaw, cloth_garments: true, ..Default::default() });
+                assert!(ab.garments.is_empty(), "{kind:?}: no garments unless asked");
+                assert_eq!(ac.garments.len(), n, "{kind:?}");
+                if n > 0 { assert!(vc.len() < vb.len(), "{kind:?}: the boxes the cloth replaces are gone"); } else { assert_eq!(vc.len(), vb.len(), "{kind:?}: nothing else changes"); }
+                let facing = [yaw.cos(), 0.0, yaw.sin()];
+                let tm = [(ac.torso.a[0] + ac.torso.b[0]) * 0.5, (ac.torso.a[1] + ac.torso.b[1]) * 0.5, (ac.torso.a[2] + ac.torso.b[2]) * 0.5];
+                let h = hero_total_height(&params);
+                for g in &ac.garments {
+                    let mid = [(g.left[0] + g.right[0]) * 0.5, (g.left[1] + g.right[1]) * 0.5, (g.left[2] + g.right[2]) * 0.5];
+                    let ahead = (mid[0] - tm[0]) * facing[0] + (mid[2] - tm[2]) * facing[2];
+                    assert!(ahead < -0.05, "{kind:?} yaw {yaw}: behind the body ({ahead:.3})");
+                    let up = (mid[1] - origin[1]) / h;
+                    assert!((0.6..0.98).contains(&up), "{kind:?}: at {up:.2} of the height");
+                    assert!(g.length > 0.3 * h * 0.5, "{kind:?}: hangs a real length ({:.2})", g.length);
+                }
+            }
         }
     }
 
