@@ -121,6 +121,9 @@ pub enum ShellVerb {
     StageBind { bus: BusId, preset: u8 },
     /// Measure the look of the picture under the playhead and hold it.
     StyleCopy,
+    /// A first cut from the transcripts (`assembly`), at the playhead, on a
+    /// new track, reviews as markers.
+    Assemble,
     /// Give the selected clips the held look, at `pct`% strength.
     StylePaste(u32),
     /// What the selected clips' effects do after the clips end: `ring_ms` of
@@ -377,6 +380,9 @@ pub fn root() -> Vec<Choice> {
         c("show transcripts under clips (load a folder of .srt)",
           Some("what is being said, in the gutter under each clip"),
           Then::Do(Act::Shell(ShellVerb::LoadTranscripts))),
+        c("assemble a first cut from the transcripts",
+          Some("order from outline.txt / script.txt; reviews as markers"),
+          Then::Do(Act::Shell(ShellVerb::Assemble))),
         c("insert a clip at the playhead by what is said (or a time range)",
           Some("search the transcripts, or type C0057 12.5-18"),
           Then::Ask(Ask::InsertFind)),

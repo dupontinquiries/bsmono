@@ -12,6 +12,7 @@ path = "src/main.rs"
 required-features = ["app"]
 
 [dependencies]
+studio-assemble = { path = "../studio-assemble" }
 studio-core = { path = "../studio-core" }
 studio-collab = { path = "../studio-collab" }
 studio-audio = { path = "../studio-audio" }

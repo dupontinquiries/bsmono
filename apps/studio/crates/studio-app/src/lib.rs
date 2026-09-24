@@ -89,6 +89,7 @@ pub mod scroll_edge;
 pub mod pattern_pack;
 pub mod rack_panel;
 pub mod seq_header;
+pub mod assembly;
 
 /// Everything the running editor holds.
 pub struct Studio {
@@ -6338,6 +6339,23 @@ impl App {
                     self.studio.status = if self.words_raw.is_empty() {
                         "no transcripts loaded yet — the filter applies once they are".into()
                     } else { self.refilter_words() };
+                }
+                palette::ShellVerb::Assemble => {
+                    let outline = assembly::outline_beside(&self.project_path);
+                    let (from, lines) = match outline {
+                        Some((name, lines)) => (format!("{name}, {} lines", lines.len()), lines),
+                        None => ("no outline: shot order".into(), Vec::new()),
+                    };
+                    let at = self.studio.playhead();
+                    match assembly::plan(&self.studio.session.doc.project, &self.words_raw, &lines, at) {
+                        Ok((asm, ops)) => {
+                            let reviews = asm.reviews.len();
+                            self.studio.edit_group(ops, "assembled");
+                            self.studio.status = format!("assembled ({from}): {}{}", asm.summary(),
+                                if reviews > 0 { " -- palette: jump to marker, type \"review\"" } else { "" });
+                        }
+                        Err(e) => self.studio.status = e,
+                    }
                 }
                 palette::ShellVerb::StyleCopy => {
                     let project = &self.studio.session.doc.project;
