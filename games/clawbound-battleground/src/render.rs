@@ -13,7 +13,10 @@ pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const SHADOW_SIZE: u32 = 2048;
 /// Three lanes x two teams x inner/outer. terrain.wgsl hard-codes it.
 pub const MAX_TOWER_RINGS: usize = 12;
-pub const MAX_DRAWS: usize = 512;
+/// Draw slots per frame. 512 held a 5v5 (10 cats of ~15 parts, ~120
+/// world chunks, towers, minions); a 15v15 needs about three times the cats.
+/// 256 B each (DYN_ALIGN), so this is 1 MiB of uniform buffer.
+pub const MAX_DRAWS: usize = 4096;
 pub const MAX_PARTICLES: usize = 48000;
 pub const DYN_ALIGN: u64 = 256;
 
@@ -88,6 +91,8 @@ pub struct GpuMesh {
 // --- renderer -------------------------------------------------------------------
 
 pub struct Renderer {
+    /// Draws refused this frame for want of a slot; reported, not silent.
+    pub dropped_draws: u32,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub width: u32,
@@ -663,6 +668,7 @@ impl Renderer {
             opaque: Vec::new(),
             transparent: Vec::new(),
             draws: Vec::new(),
+            dropped_draws: 0,
             particles: Vec::new(),
             camera: Camera { eye: Vec3::ZERO, target: Vec3::Y, fov_y: 1.05 },
             time: 0.0,
@@ -776,10 +782,19 @@ impl Renderer {
         self.opaque.clear();
         self.transparent.clear();
         self.draws.clear();
+        if self.dropped_draws > 0 {
+            eprintln!("[clawbound] {} draws dropped last frame (MAX_DRAWS {})", self.dropped_draws, MAX_DRAWS);
+            self.dropped_draws = 0;
+        }
     }
 
     pub fn queue_draw(&mut self, mesh: u64, model: Mat4, tint: [f32; 4], emissive: f32, voxel: f32, alpha: bool) {
-        if self.draws.len() >= MAX_DRAWS {
+        // The LAST slot is the particle draw's (see `render_frame`'s
+        // staging). `>= MAX_DRAWS` let a full frame queue MAX_DRAWS draws and
+        // the particle slot then wrote one past the buffer -- a wgpu
+        // validation panic the first time a frame filled up (a 15v15).
+        if self.draws.len() >= MAX_DRAWS - 1 {
+            self.dropped_draws += 1;
             return;
         }
         let idx = self.draws.len() as u32;
