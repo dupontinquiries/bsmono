@@ -473,6 +473,75 @@ pub struct EffectCache {
     /// shorter than the chain, and a parameter ride addresses the chain.
     clip: BTreeMap<studio_core::ClipId, (Vec<studio_core::Effect>, Vec<(usize, studio_fx::Instance)>)>,
     bus: BTreeMap<studio_core::BusId, (Vec<studio_core::Effect>, Vec<(usize, studio_fx::Instance)>)>,
+    /// Each ducked bus's follower state, kept across contiguous calls like
+    /// every other effect's (a duck that re-armed per buffer would click).
+    ducks: BTreeMap<studio_core::BusId, Duck>,
+}
+
+/// SIDECHAIN DUCK: a bus turned down while ANOTHER bus (the key) is loud --
+/// the kick pulling the 808 and the reverb down on every hit, so the low end
+/// stays tight and the listener does not hear anything leave. Written as
+/// effect kind `duck` in a bus's chain, params:
+///
+/// * `key`: the key bus's id; `threshold` dBFS (-24); `depth` dB, the most it
+///   will take away (12); `ratio` (4); `attack` / `release` ms (1 / 120).
+///
+/// The key is the key bus's FINISHED output (post chain, post fader) -- what
+/// FL's "sidechain to this track" hands a compressor. Applied after the
+/// ducked bus's own chain, before its fader. Not in `studio_fx::instantiate`
+/// on purpose: it needs another bus's signal, which only the mixdown has.
+#[derive(Debug, Clone, Default)]
+pub struct Duck { env: f32, gain_db: f32 }
+
+impl Duck {
+    /// Per-frame gains for `key` (interleaved stereo), continuing the state.
+    pub fn gains(&mut self, key: &[f32], p: &studio_core::Effect, rate: u32) -> Vec<f32> {
+        let q = |k: &str, d: f32| p.params.get(k).copied().unwrap_or(d);
+        let (thr, depth, ratio) = (q("threshold", -24.0), q("depth", 12.0).max(0.0), q("ratio", 4.0).max(1.0));
+        let coef = |ms: f32| (-1.0 / (ms.max(0.05) * 0.001 * rate as f32)).exp();
+        let (att, rel) = (coef(q("attack", 1.0)), coef(q("release", 120.0)));
+        key.chunks(2).map(|fr| {
+            let x = fr.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            // peak follower: rises at attack, falls at release
+            let c = if x > self.env { att } else { rel };
+            self.env = x + (self.env - x) * c;
+            let lvl = 20.0 * self.env.max(1e-9).log10();
+            let want = if lvl > thr { ((lvl - thr) * (1.0 - 1.0 / ratio)).min(depth) } else { 0.0 };
+            // the reduction itself eases the same way, so it pumps, not clicks
+            let c = if want > self.gain_db { att } else { rel };
+            self.gain_db = want + (self.gain_db - want) * c;
+            10f32.powf(-self.gain_db / 20.0)
+        }).collect()
+    }
+}
+
+/// The key bus a bus's `duck` effect listens to, if it has an enabled one.
+pub fn duck_of(bus: &studio_core::Bus) -> Option<(studio_core::BusId, &studio_core::Effect)> {
+    bus.chain.iter().find(|e| e.kind == "duck" && e.enabled)
+        .and_then(|e| e.params.get("key").map(|k| (studio_core::BusId(*k as u64), e)))
+}
+
+/// `order` with every ducked bus moved to just after its key -- keys are
+/// usually siblings (the kick and the 808 both feed the master) and siblings
+/// come in no particular order. A move that would put a bus after its own
+/// parent is not made (that duck then reads silence and does nothing).
+pub fn order_for_ducks(project: &Project, mut order: Vec<studio_core::BusId>) -> Vec<studio_core::BusId> {
+    for _ in 0..order.len() {
+        let mut moved = false;
+        for b in project.busses.values() {
+            let Some((key, _)) = duck_of(b) else { continue };
+            let (Some(pb), Some(pk)) = (order.iter().position(|x| *x == b.id), order.iter().position(|x| *x == key)) else { continue };
+            if pb > pk { continue; }
+            // parent must stay after the moved bus
+            if let Some(par) = b.parent { if order.iter().position(|x| *x == par).is_some_and(|pp| pp <= pk) { continue; } }
+            let id = order.remove(pb);
+            let pk = order.iter().position(|x| *x == key).unwrap();
+            order.insert(pk + 1, id);
+            moved = true;
+        }
+        if !moved { break; }
+    }
+    order
 }
 
 impl EffectCache {
@@ -489,6 +558,7 @@ impl EffectCache {
     pub fn reset(&mut self) {
         self.clip.clear();
         self.bus.clear();
+        self.ducks.clear();
     }
 
     fn build(chain: &[studio_core::Effect], rate: f32) -> Vec<(usize, studio_fx::Instance)> {
@@ -992,8 +1062,11 @@ pub fn mixdown_into(
     // the refusal belongs at load time (where the caller can tell the user),
     // not buried in a pure render function with no error channel to report
     // it through.
-    let order = project.bus_order().unwrap_or_default();
+    let order = order_for_ducks(project, project.bus_order().unwrap_or_default());
     let audible = solo_audible_bus_set(project, bus_solo);
+    // finished outputs of busses something ducks under, for this call
+    let key_ids: Vec<studio_core::BusId> = project.busses.values().filter_map(|b| duck_of(b).map(|(k, _)| k)).collect();
+    let mut keys: BTreeMap<studio_core::BusId, Vec<f32>> = BTreeMap::new();
     for id in order {
         let Some(bus) = project.busses.get(&id) else { continue };
         // Removed (not merely borrowed) from `bus_buf` for the rest of
@@ -1058,6 +1131,14 @@ pub fn mixdown_into(
                 }
             }
         }
+        if let Some((key, fx)) = duck_of(bus) {
+            // a key not yet heard in this call (a cycle, or a key that is this
+            // bus's own descendant... not reachable by FL) reads as silence
+            let silence;
+            let k: &[f32] = match keys.get(&key) { Some(k) => k, None => { silence = vec![0.0; buf.len()]; &silence } };
+            let g = cache.ducks.entry(id).or_default().gains(k, fx, rate);
+            for (fr, gi) in buf.chunks_exact_mut(2).zip(g) { fr[0] *= gi; fr[1] *= gi; }
+        }
         zero_resize(&mut scratch.pre, buf.len());
         scratch.pre.copy_from_slice(&buf);
         let bus_lane = project.automation.get(&AutoTarget::BusGain(id));
@@ -1080,6 +1161,7 @@ pub fn mixdown_into(
             for s in buf.iter_mut() { *s *= bus.gain; }
         }
 
+        if key_ids.contains(&id) { keys.insert(id, buf.clone()); }
         // A silent bus stops here: it has been summed, processed and faded
         // (so `bus_signal` can read a finished signal), and now feeds
         // nothing — not its sends, not its parent. Without this a control
@@ -2957,5 +3039,83 @@ mod band_peak_tests {
         assert!(full > 0.45 && mid > 0.3, "the voice dominates everywhere else: {full} / {mid}");
         assert!(low < 0.12, "the low band must not just be the voice again: {low}");
         assert!(low > 0.01, "and the rumble must actually show: {low}");
+    }
+}
+
+#[cfg(test)]
+mod duck_tests {
+    use super::*;
+    use studio_core::{Bus, BusId, Clip, ClipId, Effect, Op, Source, SourceId, Track, TrackId, TrackKind};
+
+    fn s(x: f64) -> Ticks { Ticks::from_seconds(x) }
+
+    /// A kick (a 60 ms burst every 0.5 s) and a steady bass, each on its own
+    /// bus; the BASS bus ducks keyed by the KICK bus. The bass bus has the
+    /// LOWER id, so a plain bus order would fold it before its key.
+    fn project(duck: bool) -> (Project, BTreeMap<SourceId, SourceAudio>) { project_ids(duck, 1, 2) }
+
+    /// Bass on bus `bass_bus`, kick on `kick_bus`: both ways round, because
+    /// the plain bus order puts ONE of them first and the reorder must
+    /// matter in the other (the first version only built one, where the
+    /// kick happened to come first and the reorder was never needed).
+    fn project_ids(duck: bool, bass_bus: u64, kick_bus: u64) -> (Project, BTreeMap<SourceId, SourceAudio>) {
+        let rate = 48_000u32;
+        let n = rate as usize * 2;
+        let kick: Vec<f32> = (0..n).map(|i| if i % (rate as usize / 2) < rate as usize * 6 / 100 { 0.9 * ((i as f32) * 0.2).sin() } else { 0.0 }).collect();
+        let bass: Vec<f32> = (0..n).map(|i| 0.3 * ((i as f32) * 0.01).sin()).collect();
+        let mut p = Project::default();
+        let mut chain = Vec::new();
+        if duck {
+            chain.push(Effect { kind: "duck".into(), enabled: true,
+                params: [("key".to_string(), kick_bus as f32), ("threshold".to_string(), -30.0), ("depth".to_string(), 12.0),
+                         ("ratio".to_string(), 20.0), ("attack".to_string(), 0.5), ("release".to_string(), 80.0)].into() });
+        }
+        // the kick bus is SILENT: a sidechain-only dummy kick, heard by the
+        // duck and by nobody else -- so the mix is the bass alone
+        for (id, name, ch, silent) in [(bass_bus, "Bass", chain.clone(), false), (kick_bus, "Kick", Vec::new(), true)] {
+            p.apply(&Op::AddBus { bus: Bus { id: BusId(id), name: name.into(), parent: None, gain: 1.0, chain: ch, sends: vec![], muted: false, silent } }).unwrap();
+        }
+        let mut audio = BTreeMap::new();
+        for (id, bus, data) in [(1u64, bass_bus, bass), (2, kick_bus, kick)] {
+            p.apply(&Op::AddTrack { track: Track { id: TrackId(id), kind: TrackKind::Audio, name: format!("t{id}"), muted: false, locked: false,
+                gain: 1.0, route: Some(BusId(bus)) }, at: 0 }).unwrap();
+            p.apply(&Op::AddSource { source: Source::file(SourceId(id), format!("{id}.wav"), s(2.0), rate, 1, false) }).unwrap();
+            p.apply(&Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(id), track: TrackId(id), pos: Ticks::ZERO,
+                src_in: Ticks::ZERO, len: s(2.0), gain: 1.0, effects: vec![] } }).unwrap();
+            audio.insert(SourceId(id), SourceAudio { sample_rate: rate, channels: vec![data] });
+        }
+        (p, audio)
+    }
+
+    fn bass_rms(p: &Project, audio: &BTreeMap<SourceId, SourceAudio>, from: f64, to: f64) -> f32 {
+        // no solo: soloing the bass would stop the kick reaching its bus, and
+        // the key with it (the first version of this test did, and read 0 dB)
+        let out = mixdown(p, audio, &BTreeMap::new(), s(from), s(to), 48_000, &[], &[]);
+        (out.iter().map(|x| x * x).sum::<f32>() / out.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn the_bass_ducks_on_each_kick_and_comes_back_between_them() {
+        for (bb, kb) in [(1u64, 2u64), (2, 1)] {
+        let (dry, audio) = project_ids(false, bb, kb);
+        let (wet, _) = project_ids(true, bb, kb);
+        let plain = wet.bus_order().unwrap();
+        eprintln!("ids bass {bb} kick {kb}: plain order {plain:?}");
+        // inside a kick (0.51-0.55 s) and well after it (0.40-0.48 s: 340 ms on)
+        let (under, between) = (bass_rms(&wet, &audio, 0.51, 0.55), bass_rms(&wet, &audio, 0.40, 0.48));
+        let (d_under, d_between) = (bass_rms(&dry, &audio, 0.51, 0.55), bass_rms(&dry, &audio, 0.40, 0.48));
+        let db = |a: f32, b: f32| 20.0 * (a / b).log10();
+        assert!(db(under, d_under) < -9.0, "ducked on the hit: {:.1} dB", db(under, d_under));
+        assert!(db(between, d_between) > -1.0, "back between hits: {:.1} dB", db(between, d_between));
+        }
+    }
+
+    #[test]
+    fn a_key_folded_after_its_ducked_bus_is_moved_ahead_of_it() {
+        let (p, _) = project(true);
+        let plain = p.bus_order().unwrap();
+        let ordered = order_for_ducks(&p, plain.clone());
+        let pos = |o: &[BusId], b: u64| o.iter().position(|x| *x == BusId(b)).unwrap();
+        assert!(pos(&ordered, 2) < pos(&ordered, 1), "kick before the bass it keys: {ordered:?} (plain {plain:?})");
     }
 }

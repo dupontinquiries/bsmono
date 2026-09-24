@@ -298,6 +298,12 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         let m = *mixer.get(&insert)?;
         let routes: Vec<(i64, f32)> = m["routes"].as_array().into_iter().flatten()
             .filter_map(|r| Some((i(&r["to"])?, (f(&r["level"]).unwrap_or(12800.0) / 12800.0) as f32))).collect();
+        // FL: an insert whose routing is KNOWN and routes nowhere outputs
+        // nothing -- Blue Moon's "LowMeter", fed the kick and the 808 at full
+        // level for a peak controller, was sent to the master until c20 and
+        // DOUBLED the low end. It becomes a silent bus: it still hears, for
+        // whatever measures it, and feeds nothing.
+        let silent = m["routing_known"].as_bool() == Some(true) && routes.is_empty();
         let to_master = routes.is_empty() || routes.iter().any(|(t, _)| *t == 0);
         let mut dests: Vec<(BusId, f32)> = Vec::new();
         for (t, lvl) in routes.iter().filter(|(t, _)| *t > 0) {
@@ -308,7 +314,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         }
         let (parent, sends): (Option<BusId>, Vec<(BusId, f32)>) = if to_master || dests.is_empty() { (None, dests) }
             else { (Some(dests[0].0), dests[1..].to_vec()) };
-        *sends_made += sends.len();
+        *sends_made += sends.iter().filter(|(_, l)| *l > 0.0).count();
         let id = BusId(busses.len() as u64 + 1);
         busses.insert(insert, id);
         let mut chain = Vec::new();
@@ -332,8 +338,9 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         let name = s(&m["name"]).map(str::to_string).unwrap_or_else(|| format!("Insert {insert}"));
         let gain = (f(&m["volume"]).unwrap_or(12800.0) / 12800.0) as f32;
         ops.push(Op::AddBus { bus: Bus { id, name, parent, gain, chain,
-            sends: sends.into_iter().map(|(to, level)| studio_core::Send { to, level, pre_fader: false }).collect(),
-            muted: false, silent: false } });
+            sends: sends.into_iter().filter(|(_, level)| *level > 0.0)
+                .map(|(to, level)| studio_core::Send { to, level, pre_fader: false }).collect(),
+            muted: false, silent } });
         Some(id)
     }
     let mut bus_for = |insert: i64, ops: &mut Vec<Op>| -> Option<BusId> {
@@ -467,6 +474,22 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         let slots: Vec<&str> = master["slots"].as_array().into_iter().flatten().filter_map(|x| s(&x["name"]).or(s(&x["plugin"]))).collect();
         if !slots.is_empty() { report.push(format!("master chain not imported: {}", slots.join(" -> "))); }
     }
+    // FL's "sidechain to this track": a route at send level 0 -- the source is
+    // heard by the destination's plugins, not mixed in. Studio has no
+    // audio-keyed sidechain yet: named, so the gap is on the page.
+    let chains: Vec<String> = mixer.values().flat_map(|m| {
+        let from = s(&m["name"]).unwrap_or("?").to_string();
+        m["routes"].as_array().into_iter().flatten().filter(|r| f(&r["level"]) == Some(0.0))
+            .filter_map(|r| mixer.get(&i(&r["to"])?).map(|d| format!("{from} -> {}", s(&d["name"]).unwrap_or("?"))))
+            .collect::<Vec<_>>()
+    }).collect();
+    if !chains.is_empty() {
+        report.push(format!("SIDECHAIN routes (FL send level 0), not reproduced -- Studio has no audio-keyed sidechain yet: {}", chains.join(", ")));
+    }
+    let silent_busses: Vec<&str> = p.busses.values().filter(|b| b.silent).map(|b| b.name.as_str()).collect();
+    if !silent_busses.is_empty() {
+        report.push(format!("silent in FL (no route out), imported silent: {}", silent_busses.join(", ")));
+    }
     if has_routes {
         let parented = p.busses.values().filter(|b| b.parent.is_some()).count();
         report.push(format!("routing: {parented} bus{} output into another bus, {sends_made} send{} at FL's send levels; the rest feed the master{}",
@@ -525,12 +548,13 @@ mod tests {
             ]}],
             "mixer": [
                 {"iid": 0, "slots": [{"plugin": "Fruity Limiter"}, {"plugin": "Fruity Wrapper", "name": "Ozone 8"}]},
-                {"iid": 1, "name": "Drums", "volume": 12800, "routes": [{"to": 0, "level": 12800}, {"to": 3, "level": 6400}],
+                {"iid": 1, "name": "Drums", "volume": 12800, "routes": [{"to": 0, "level": 12800}, {"to": 3, "level": 6400}, {"to": 5, "level": 12800}, {"to": 4, "level": 0}],
                  "slots": [{"plugin": "Fruity Parametric EQ 2"}, {"plugin": "Soundgoodizer"}]},
                 {"iid": 2, "name": "Vox bus", "volume": 6400, "pan": -800, "routes": [{"to": 4, "level": 12800}, {"to": 3, "level": 3200}],
                  "slots": [{"plugin": "Pitcher"}, {"plugin": "Fruity Wrapper", "name": "Neutron 3"}, {"plugin": "Fruity Chorus"}]},
                 {"iid": 3, "name": "Verb send", "routes": [{"to": 0, "level": 12800}], "slots": [{"plugin": "Fruity Reeverb 2"}]},
-                {"iid": 4, "name": "Vocal group", "routes": [{"to": 0, "level": 12800}]}
+                {"iid": 4, "name": "Vocal group", "routes": [{"to": 0, "level": 12800}]},
+                {"iid": 5, "name": "Meter", "routing_known": true, "routes": []}
             ]
         })
     }
@@ -625,14 +649,18 @@ mod tests {
         let by = |n: &str| p.busses.values().find(|b| b.name == n).unwrap_or_else(|| panic!("no bus {n}: {:?}", p.busses.values().map(|b| &b.name).collect::<Vec<_>>()));
         let (drums, vox, verb, group) = (by("Drums"), by("Vox bus"), by("Verb send"), by("Vocal group"));
         assert_eq!(drums.parent, None, "feeds the master");
-        assert_eq!(drums.sends.len(), 1);
+        let meter = by("Meter");
+        assert!(meter.silent, "routing known, no route out: silent in FL, silent here");
+        assert_eq!(drums.sends.len(), 2, "the reverb and the meter; the level-0 sidechain route is not a send: {:?}", drums.sends);
         assert_eq!((drums.sends[0].to, drums.sends[0].level), (verb.id, 0.5), "and sends to the reverb at half");
         assert_eq!(vox.parent, Some(group.id), "no master route: its first destination is its output");
         assert_eq!((vox.sends[0].to, vox.sends[0].level), (verb.id, 0.25));
         assert_eq!(group.parent, None);
         assert_eq!(verb.chain[0].kind, "reverb", "a bus nothing but routing reaches is still made");
         let r = im.report.join("\n");
-        assert!(r.contains("routing: 1 bus output into another bus, 2 sends"), "{r}");
+        assert!(r.contains("routing: 1 bus output into another bus, 3 sends"), "{r}");
+        assert!(r.contains("SIDECHAIN routes") && r.contains("Drums -> Vocal group"), "{r}");
+        assert!(r.contains("imported silent: Meter"), "{r}");
         assert!(r.contains("1 insert pan not imported"), "{r}");
     }
 

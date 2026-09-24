@@ -221,6 +221,10 @@ pub fn inventory(b: &[u8]) -> Result<Value, FlpError> {
         let routes: Vec<Value> = routing.get(k).into_iter().flatten().enumerate().filter(|(_, on)| **on)
             .map(|(to, _)| json!({"to": to, "level": own.get(&(k, 64 + to as u8)).copied().unwrap_or(12800)})).collect();
         m.insert("routes".into(), Value::Array(routes));
+        // Whether the file said anything about this insert's routing: an
+        // insert WITH routing data and no route out is silent in FL (a meter,
+        // a sidechain tap); one without data defaults to the master.
+        m.insert("routing_known".into(), json!(routing.get(k).is_some_and(|r| !r.is_empty())));
         if let Some(Value::Array(ss)) = m.get_mut("slots") {
             for s in ss.iter_mut() {
                 let idx = s["index"].as_u64().unwrap_or(0) as usize;
