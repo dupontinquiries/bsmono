@@ -103,6 +103,27 @@ fn detail(p: vec2<f32>, m: f32, dist: f32) -> vec4<f32> {
     return vec4(mix(1.0, mul, fade), bump * fade, 0.0);
 }
 
+// Triplanar detail: the pattern projected along each axis, blended by how
+// much the surface faces it. `detail` alone samples world xz, which on a
+// cliff smears one texel down the whole face -- the vertical streaks on
+// every canyon wall. The side projections put world HEIGHT in the pattern's
+// second coordinate, so rock strata become horizontal bands on a cliff.
+// Returns (brightness mul, bump as a world-space vec3).
+fn tri_detail(w: vec3<f32>, n: vec3<f32>, m: f32, dist: f32) -> vec4<f32> {
+    let top = detail(w.xz, m, dist);
+    var bw = pow(abs(n), vec3(4.0));
+    bw = bw / max(bw.x + bw.y + bw.z, 1e-4);
+    if (bw.y > 0.96) {
+        // flat ground (almost all of it): one projection, as before
+        return vec4(top.x, top.y, 0.0, top.z);
+    }
+    let sx = detail(w.zy, m, dist); // faces looking along x
+    let sz = detail(w.xy, m, dist); // faces looking along z
+    let mul = top.x * bw.y + sx.x * bw.x + sz.x * bw.z;
+    let bump = vec3(top.y, 0.0, top.z) * bw.y + vec3(0.0, sx.z, sx.y) * bw.x + vec3(sz.y, sz.z, 0.0) * bw.z;
+    return vec4(mul, bump);
+}
+
 @vertex
 fn vs_main(in: VSIn) -> VSOut {
     var out: VSOut;
@@ -263,8 +284,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // in between -- which is exactly where two materials meet.
     let mat_id = round(in.mat);
     let purity = clamp(1.0 - 2.0 * abs(in.mat - mat_id), 0.0, 1.0);
-    let det = mix(detail(in.world.xz, 0.0, cam_d), detail(in.world.xz, mat_id, cam_d), purity);
-    let N = normalize(in.normal + vec3(det.y, 0.0, det.z));
+    let n0 = normalize(in.normal);
+    let det = mix(tri_detail(in.world, n0, 0.0, cam_d), tri_detail(in.world, n0, mat_id, cam_d), purity);
+    let N = normalize(in.normal + det.yzw);
     let sun = normalize(frame.sun_dir.xyz);
     let ndl = max(dot(N, sun), 0.0);
 

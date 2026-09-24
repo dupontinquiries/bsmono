@@ -76,6 +76,63 @@ pub struct Flock {
 }
 
 impl Vfx {
+    /// A cat arriving: a burst of starry mist. Stars -- tiny, near-white,
+    /// flung up and out, slowed by the air and drifting -- over a low ring
+    /// of pale mist in the team's colour that rolls outward and lifts, and a
+    /// thin column of light straight up. Deterministic per `seed` so the
+    /// headless harness renders the same burst every run.
+    pub fn star_burst(&mut self, pos: Vec3, team_rgb: [f32; 3], seed: f32) {
+        let tint = |c: [f32; 3], k: f32| [c[0] + (1.0 - c[0]) * k, c[1] + (1.0 - c[1]) * k, c[2] + (1.0 - c[2]) * k];
+        for i in 0..44 {
+            let s = seed * 31.7 + i as f32 * 1.618;
+            let dir = Vec3::new(rnd_jitter(s), 0.55 + rnd_jitter(s + 2.0).abs() * 0.9, rnd_jitter(s + 4.0)).normalize_or_zero();
+            let speed = 5.0 + rnd_jitter(s + 6.0).abs() * 6.0;
+            self.particles.push(Particle {
+                pos: pos + Vec3::Y * 0.8,
+                vel: dir * speed,
+                life: 1.1 + rnd_jitter(s + 8.0).abs() * 0.9,
+                max_life: 2.0,
+                size: 0.10 + rnd_jitter(s + 9.0).abs() * 0.14,
+                color: tint(team_rgb, 0.8),
+                alpha: 1.0,
+                gravity: -0.4, // stars float up as they slow
+                drag: 2.6,
+            });
+        }
+        // The mist is MANY small faint puffs: particles draw as voxel cubes,
+        // and the first version's metre-wide puffs read as white slabs.
+        for i in 0..70 {
+            let s = seed * 17.3 + i as f32 * 2.414;
+            let a = i as f32 / 70.0 * std::f32::consts::TAU + rnd_jitter(s) * 0.3;
+            let out = Vec3::new(a.cos(), 0.0, a.sin());
+            self.particles.push(Particle {
+                pos: pos + out * (0.4 + rnd_jitter(s + 7.0).abs() * 0.8) + Vec3::Y * (0.2 + rnd_jitter(s + 8.0).abs() * 0.8),
+                vel: out * (1.6 + rnd_jitter(s + 1.0).abs() * 2.2) + Vec3::Y * (0.3 + rnd_jitter(s + 2.0).abs() * 0.6),
+                life: 1.4 + rnd_jitter(s + 3.0).abs() * 1.0,
+                max_life: 2.4,
+                size: 0.22 + rnd_jitter(s + 5.0).abs() * 0.22,
+                color: tint(team_rgb, 0.6),
+                alpha: 0.22,
+                gravity: -0.35,
+                drag: 1.4,
+            });
+        }
+        for i in 0..14 {
+            let s = seed * 7.9 + i as f32;
+            self.particles.push(Particle {
+                pos: pos + Vec3::new(rnd_jitter(s) * 0.25, 0.3 + i as f32 * 0.25, rnd_jitter(s + 1.0) * 0.25),
+                vel: Vec3::Y * (7.0 + i as f32 * 0.6),
+                life: 0.7,
+                max_life: 0.7,
+                size: 0.16,
+                color: tint(team_rgb, 0.9),
+                alpha: 0.9,
+                gravity: 0.0,
+                drag: 1.8,
+            });
+        }
+    }
+
     fn seed_ambient(&mut self) {
         self.seeded = true;
         let mut rng = Rng::new(0x1F1E_5EED);

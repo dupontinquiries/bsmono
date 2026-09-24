@@ -18,6 +18,12 @@ pub const JUNGLE_MARGIN: f32 = 32.0;
 
 pub const ARENA_RADIUS: f32 = 95.0 * MAP_SCALE + JUNGLE_MARGIN; // playable floor (~167)
 
+/// The playable radius of the active map. One function so a map can differ
+/// in size (the jungle and the pass share `ARENA_RADIUS` today).
+pub fn arena_radius() -> f32 {
+    ARENA_RADIUS
+}
+
 /// Everything past the playable floor -- the hill ring, the landmarks, the
 /// mountain rim, the rendered ground -- was authored in world units for a
 /// 135 u arena. It is carried out by this ratio so the ring keeps its shape
@@ -148,10 +154,21 @@ impl Team {
             Team::Red => Vec3::new(0.0, 0.0, 82.0 * MAP_SCALE),
         }
     }
+    /// The two sides. Two-part clan-style names (the Warriors books'
+    /// naming pattern, none of their actual clans), each saying its colour:
+    /// ice-blue and ember-red. One table -- the HUD, scoreboard, announcer
+    /// and intro card all read it.
     pub fn name(self) -> &'static str {
         match self {
-            Team::Blue => "ORDER",
-            Team::Red => "CHAOS",
+            Team::Blue => "FROSTFANG",
+            Team::Red => "EMBERCLAW",
+        }
+    }
+    /// What the intro card says under the name.
+    pub fn motto(self) -> &'static str {
+        match self {
+            Team::Blue => "cold, patient, and never alone",
+            Team::Red => "quick to the hunt, first to the fire",
         }
     }
     pub fn rgb(self) -> [f32; 3] {

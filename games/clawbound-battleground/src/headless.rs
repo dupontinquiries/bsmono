@@ -67,6 +67,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("pass") {
         return run_pass_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("intro") {
+        return run_intro_shots();
+    }
     let (_instance, _adapter, device, queue) =
         make_device().ok_or_else(|| "No suitable GPU backend found (install mesa-vulkan-drivers for lavapipe)".to_string())?;
     let adapter_info = {
@@ -953,6 +956,89 @@ pub fn run_pass_shots() -> Result<(), String> {
         draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
         save_shot(&renderer.device, &renderer.queue, &target, "pass_hud_scoreboard.png")?;
         println!("saved pass_hud_scoreboard.png");
+    }
+    Ok(())
+}
+
+/// The match intro, played through the real draw path: the timeline
+/// (`intro`) drives the camera, fires the starry bursts as cats arrive and
+/// feeds the overlay. Captures a frame from each beat.
+/// `CLAWBOUND_SHOTS=intro clawbound-battleground --screenshot [--map pass]`.
+pub fn run_intro_shots() -> Result<(), String> {
+    use crate::intro::{self, Intro};
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut egui_renderer = egui_wgpu::Renderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, None, 1);
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("intro shot"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let mut rng = Rng::new(0x1A7);
+    let (blue, red) = crate::map::team_picks(3, &mut rng);
+    let mut game = Game::new_teams(&blue, &red);
+    game.blockers = scene.blockers.clone();
+    for g in game.gods.iter_mut() {
+        g.respawn_t = 999.0; // not arrived
+    }
+    let teams: Vec<Team> = game.gods.iter().map(|g| g.team).collect();
+    let p0 = game.gods[0].pos;
+    let play = intro::Shot { eye: p0 + Vec3::new(0.0, 6.5, -9.0), target: p0 + Vec3::Y * 1.5, fov_y: 0.95 };
+    let mut it = Intro::new(&teams, p0, play);
+    let mut vfx = Vfx::default();
+    let ctx = egui::Context::default();
+    let dt = 1.0 / 60.0;
+    let caps = [
+        (2.2, "intro_1_pan.png"),
+        (intro::PAN + 0.9, "intro_2_lane_top.png"),
+        (intro::PAN + intro::LANE + 0.9, "intro_3_lane_mid.png"),
+        (intro::FANFARE_AT + 0.75, "intro_4_spawn_blue.png"),
+        (intro::FANFARE_AT + intro::SPAWN + 0.75, "intro_5_spawn_red.png"),
+        (intro::FANFARE_AT + 2.0 * intro::SPAWN + intro::VERSUS * 0.5, "intro_6_versus.png"),
+        (intro::total() - 0.35, "intro_7_settle.png"),
+    ];
+    let mut next = 0;
+    while !it.done && next < caps.len() {
+        for gi in it.advance(dt) {
+            game.gods[gi].respawn_t = 0.0;
+            let c = game.gods[gi].team.rgb();
+            vfx.star_burst(game.gods[gi].pos, c, gi as f32);
+        }
+        vfx.update(dt, &[], &game);
+        if it.t >= caps[next].0 {
+            let f = it.frame();
+            let cam = Camera { eye: f.shot.eye, target: f.shot.target, fov_y: f.shot.fov_y };
+            renderer.clear_queues();
+            scene.draw(&mut renderer, &game, &mut vfx, cam);
+            renderer.atmosphere = game.weather.atmosphere();
+            renderer.render_frame(&view, cam, it.t);
+            let o = f.overlay;
+            let mut textures = egui::TexturesDelta::default();
+            let mut out = None;
+            for k in 0..2 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W as f32, H as f32))),
+                    time: Some(k as f64 * 0.016),
+                    ..Default::default()
+                };
+                let r = ctx.run(raw, |c| ui::draw_intro_overlay(c, &o));
+                textures.append(r.textures_delta.clone());
+                out = Some(r);
+            }
+            let mut out = out.expect("ran");
+            out.textures_delta = textures;
+            draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
+            save_shot(&renderer.device, &renderer.queue, &target, caps[next].1)?;
+            println!("saved {} (t={:.2}, {:?})", caps[next].1, it.t, f.beat);
+            next += 1;
+        }
     }
     Ok(())
 }

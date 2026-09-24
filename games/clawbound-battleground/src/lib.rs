@@ -20,6 +20,10 @@ pub mod blockers;
 pub mod floor;
 /// Which map this thread is playing; the free map functions dispatch on it.
 pub mod map;
+/// The match opening as a timeline: pan, lanes, spawns, versus card.
+pub mod intro;
+/// The intro's fanfare, synthesized brass.
+pub mod brass;
 /// Twinfang Pass: the mountain canyon map, 15 a side.
 pub mod pass;
 /// The pass's world: where its rocks, scrub, pines and waterfalls stand.
