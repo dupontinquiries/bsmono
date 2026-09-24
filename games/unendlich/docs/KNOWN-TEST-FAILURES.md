@@ -19,6 +19,29 @@ Four failures on first run, all fixed:
   test pinned the latch that `35d2285ca` removed (the stuck mine button); now pins the
   recovery (`2bbc77224`).
 
+### With the DEFAULT features (render tests included): 9208 passed, 4 failed of 9212
+
+Once the engine's default build compiled again (f19420473), its render tests ran for the first
+time since at least 2026-09-12 (`cargo test -p unendlich-engine --lib`, one build job: rustc
+peaks near 2.98 GB). Of the four failures:
+- `render::meshing_pool::tests::pool_dispatches_far_lod_to_downsampled_mesher` and
+  `pool_takes_virtual_path_when_generator_attached`: stale -- they read `result.mesh`, which
+  `pack_and_shed` (cb251c389) empties on purpose; the geometry is in `result.packed`. Fixed
+  (d7bc95360).
+- `world::mesh_tri_regression::tests::sample_grid_worst_case_stays_under_budget`: **real, left
+  failing on purpose.** 443,922 triangles in one chunk against a 90,000 budget, ~410K of them
+  foliage: ~800 triangles per stamped leaf block, 512 stamps allowed per chunk. Measured and
+  explained in 79ab94223; the fix is a detail-versus-cost decision (the stamp cap, culling
+  faces hidden inside templates, or skipping enclosed leaves).
+- `render::mesher_binary::tests::cross_tufts_are_eight_vertices_and_double_sided`: **open.**
+  With `TuftStyle::Cross` on a 5-block grass slab no tuft is emitted. The binary mesher is off
+  by default (`UNENDLICH_MESHER=binary`), so the shipped game is not affected. Hypothesis, NOT
+  confirmed: `decorate_chunk_styled` charges the per-chunk stamp budget (512) before its
+  surface / air-above / probability checks, so the slab's 512 lowest (buried) grass blocks
+  spend the whole budget and the surface layer is never reached. If so, the budget counts
+  candidates, not stamps, which its own doc (`plant_stamps`: "plants actually given ...
+  detail") says it should not.
+
 `sim::smoke_gpu::pure_decay_monotonic_decrease` (section 2 below) PASSES in this run. No
 commit in this repository touches it after this document was written, so the fix, if it was
 one, predates the in-tree landing (349acb36e); the section is kept as history.
