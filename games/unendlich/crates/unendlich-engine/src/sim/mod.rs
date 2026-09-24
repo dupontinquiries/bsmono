@@ -695,6 +695,7 @@ pub mod particulate_field;
 pub mod dragon_air;
 pub mod dragon_mode;
 pub mod dragon_hunt;
+pub mod dragon_duel;
 pub mod mob_pixel_peeper;
 pub mod camera_tremble;
 pub mod plant_root_system;

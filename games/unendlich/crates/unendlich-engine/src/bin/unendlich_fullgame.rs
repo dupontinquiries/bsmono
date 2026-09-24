@@ -175,6 +175,64 @@ struct Roamer {
     /// loop read about this creature. One field so the five constructors
     /// each add one line; `Default` is a standing, idle, unhurt body.
     rig: RoamerRig,
+    /// A dragon's fighting identity (genome, profile, tactics, stable id).
+    /// `None` for every other kind. Boxed: dragons are few, roamers many.
+    duel: Option<Box<DragonDuel>>,
+}
+
+/// One dragon's genetics and fight, carried on its roamer from spawn. Before
+/// this, the loop re-derived a genome from `flight_phase.to_bits()` at each use
+/// (breath, bending, takeoff log, essence drop) -- a value that advances every
+/// tick, so a dragon's element changed every frame and none of it matched the
+/// body `spawn()` built. The same key indexed `session.dragon_activities`,
+/// `dragon_hunts` and `dragon_bend_intents`, so those state machines restarted
+/// fresh every frame and the maps gained an entry per dragon per frame.
+struct DragonDuel {
+    /// Stable per-individual key for the session maps: the spawn seed.
+    id: u64,
+    genome: unendlich_engine::sim::dragon_archetype::Genome,
+    profile: unendlich_engine::sim::dragon_duel::DuelProfile,
+    state: unendlich_engine::sim::dragon_duel::DuelState,
+}
+
+/// The duel record for a creature spawned at `spawn_pos` -- the SAME position
+/// passed to `spawn::spawn`, so the genome is the one its body was built from.
+fn dragon_duel_for(
+    kind: unendlich_engine::item::CreatureKind,
+    spawn_pos: [f32; 3],
+) -> Option<Box<DragonDuel>> {
+    if !matches!(kind, unendlich_engine::item::CreatureKind::Dragon) {
+        return None;
+    }
+    let genome = unendlich_engine::spawn::dragon_genome_at(spawn_pos);
+    let id = unendlich_engine::spawn::dragon_id_at(spawn_pos);
+    let profile = unendlich_engine::sim::dragon_duel::DuelProfile::from_genome(&genome);
+    log::info!(
+        "[dragon#{:04x}] {} {:?} size {} — hp {} hide {:.0}, weak at the {}, cunning {:.2} ferocity {:.2} dread {:.2}",
+        id & 0xffff, profile.element_name(), profile.build, profile.size_class, profile.max_hp, profile.hide,
+        profile.weak_spot.name(), profile.cunning, profile.ferocity, profile.dread
+    );
+    Some(Box::new(DragonDuel {
+        id,
+        genome,
+        profile,
+        state: unendlich_engine::sim::dragon_duel::DuelState::new(id),
+    }))
+}
+
+/// The dragon's own genome. Every dragon roamer carries a duel record (all
+/// construction sites go through `dragon_duel_for`); the fallback exists only
+/// so a non-dragon caller cannot panic.
+fn dragon_genome_of(duel: &Option<Box<DragonDuel>>) -> unendlich_engine::sim::dragon_archetype::Genome {
+    duel.as_ref()
+        .map(|d| d.genome)
+        .unwrap_or_else(|| unendlich_engine::sim::dragon_archetype::Genome::from_seed(0))
+}
+
+/// Hit points for a freshly spawned roamer: a dragon's comes from its genome
+/// (120..540); everything else keeps the value its spawn site chose.
+fn roamer_hp(duel: &Option<Box<DragonDuel>>, default_hp: i32) -> i32 {
+    duel.as_ref().map_or(default_hp, |d| d.profile.max_hp)
 }
 
 /// r-rig: per-roamer animation / physics / combat state for
@@ -249,6 +307,7 @@ fn begin_death(roamers: &mut Vec<Roamer>, i: usize, impulse: [f32; 3], dt: f32) 
 /// senses / turn character / ecology all identical).
 fn build_roamer(kind: unendlich_engine::item::CreatureKind, pos: [f32; 3], wseed: u64) -> Roamer {
     let mut cr = unendlich_engine::spawn::spawn(kind, pos);
+    let duel = dragon_duel_for(kind, pos);
     cr.body.position[1] = cr.grounded_y(pos[1]);
     // r694: classify a DRAGON's builder phenotype from its seed (sim::builder_genome)
     // and announce the rare constructive ones. Most dragons are NonBuilders; a
@@ -295,7 +354,7 @@ fn build_roamer(kind: unendlich_engine::item::CreatureKind, pos: [f32; 3], wseed
     Roamer {
         bond: unendlich_engine::sim::bond_tame::Bond::Wild,
         trust: 0.0,
-        hp: 40,
+        hp: roamer_hp(&duel, 40),
         creature: cr,
         wander: unendlich_engine::sim::cognition::wander::Wander::new(wseed, speed),
         home,
@@ -324,6 +383,7 @@ fn build_roamer(kind: unendlich_engine::item::CreatureKind, pos: [f32; 3], wseed
         graze_cell: (i32::MIN, i32::MIN),
         graze_scan_tick: 0,
                         rig: RoamerRig::default(),
+                        duel,
     }
 }
 
@@ -454,6 +514,30 @@ fn equipped_weapon(
     let class = unendlich_engine::sim::viewmodel::weapon_class_for_id(hand_item?.0)?;
     const DEFAULT_INSTANCE_SEED: u64 = 0xC1A5_5EED;
     Some(unendlich_engine::sim::legendary_weapon::forge(DEFAULT_INSTANCE_SEED, class, 0, 0))
+}
+
+/// DRAGON DUEL: the held item as a dragon sees it — damage, reach, and
+/// element. A survival class-default weapon (no forged instance behind the
+/// slot) is `forge(.., element_idx 0, ..)`, i.e. nominally Wood; it is reported
+/// as UNALIGNED here, because nothing was forged into it and a Wood-countered
+/// dragon should not flinch from a plain axe.
+fn player_item_threat(
+    survival_mode: bool,
+    creative_place_item: Option<unendlich_engine::item::ItemKind>,
+    hand_item: Option<unendlich_engine::items::ItemId>,
+    app: &unendlich_engine::app::App,
+    selected_palette_idx: usize,
+) -> unendlich_engine::sim::dragon_duel::ItemThreat {
+    let forged = !survival_mode
+        || app.inventory().slot(selected_palette_idx).map_or(false, |s| s.weapon_instance.is_some());
+    match equipped_weapon(survival_mode, creative_place_item, hand_item, app, selected_palette_idx) {
+        Some(w) => unendlich_engine::sim::dragon_duel::ItemThreat {
+            element: if forged { Some(w.element_idx % 6) } else { None },
+            damage: w.base_damage,
+            reach: w.reach,
+        },
+        None => unendlich_engine::sim::dragon_duel::ItemThreat::BARE_HANDS,
+    }
 }
 
 /// r-item-models: the boxes the hero holds (`item_model`), from the same
@@ -2397,6 +2481,24 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // harm points and read by the roamer loop's witness check, then cleared.
     // Usually empty (no combat) → the witness check is a cheap empty-Vec scan.
     let mut attack_events: Vec<([f32; 3], u8)> = Vec::new();
+    // DRAGON DUEL: live tuning of every dragon's fight, e.g.
+    // UNENDLICH_DRAGON_TUNE="cunning=1.5,aggression=0.8,dread=0". 1.0 = the
+    // genome's own dragon. Parsed once; ignored keys are reported, not dropped.
+    let duel_tuning = {
+        let raw = std::env::var("UNENDLICH_DRAGON_TUNE").unwrap_or_default();
+        let (t, ignored) = unendlich_engine::sim::dragon_duel::DuelTuning::parse(&raw);
+        if !raw.is_empty() {
+            log::info!(
+                "[dragon] UNENDLICH_DRAGON_TUNE: cunning ×{} aggression ×{} dread ×{}{}",
+                t.cunning, t.aggression, t.dread,
+                if ignored.is_empty() { String::new() } else { format!(" (ignored: {})", ignored.join(", ")) }
+            );
+        }
+        t
+    };
+    // DRAGON DUEL: a melee swing that hit nothing, carried to the next frame's
+    // roamer loop (the melee check runs after it). A feinting dragon reads it.
+    let mut last_swing_whiffed = false;
     // r138: per-dragon bending wind-up state (keyed by flight-phase id bits).
     // r139: artifact imbue — the carried ingot (if any) slowly attunes to the
     // local element; its FieldDelta then adds onto the bending fields.
@@ -5936,6 +6038,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         ^ (sz as i32 as u32 as u64)
                         ^ 0xD1EC;
                     let mut cr = unendlich_engine::spawn::spawn(kind, [sx, sy as f32 + 1.0, sz]);
+                    let duel = dragon_duel_for(kind, [sx, sy as f32 + 1.0, sz]);
                     cr.body.position[1] = cr.grounded_y(sy as f32 + 1.0);
                     let genome = unendlich_engine::genetics::Genome::from_seed(wseed);
                     let ph = genome.express(wseed, 0);
@@ -5951,7 +6054,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     roamers.push(Roamer {
                         bond: unendlich_engine::sim::bond_tame::Bond::Wild,
                         trust: 0.0,
-                        hp: spawn_hp,
+                        hp: roamer_hp(&duel, spawn_hp),
                         creature: cr,
                         wander: unendlich_engine::sim::cognition::wander::Wander::new(
                             wseed, 0.8 + ph.speed * 1.4,
@@ -5985,6 +6088,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         graze_cell: (i32::MIN, i32::MIN),
                         graze_scan_tick: 0,
                         rig: RoamerRig::default(),
+                        duel,
                     });
                     log::info!(
                         "[director] {:?} spawned at ({:.0},{:.0}) — {} (phase {:.2})",
@@ -6899,6 +7003,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         ^ ((sx as i32 as u32 as u64) << 20)
                         ^ (sz as i32 as u32 as u64);
                     let mut cr = unendlich_engine::spawn::spawn(kind, [sx, sy, sz]);
+                    let duel = dragon_duel_for(kind, [sx, sy, sz]);
                     cr.body.position[1] = cr.grounded_y(sy);
                     let genome = unendlich_engine::genetics::Genome::from_seed(wseed);
                     let ph = genome.express(wseed, 0);
@@ -6914,7 +7019,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     roamers.push(Roamer {
                         bond: unendlich_engine::sim::bond_tame::Bond::Wild,
                         trust: 0.0,
-                        hp: spawn_hp,
+                        hp: roamer_hp(&duel, spawn_hp),
                         creature: cr,
                         wander: unendlich_engine::sim::cognition::wander::Wander::new(
                             wseed,
@@ -6949,6 +7054,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         graze_cell: (i32::MIN, i32::MIN),
                         graze_scan_tick: 0,
                         rig: RoamerRig::default(),
+                        duel,
                     });
                     hatched += 1;
                 }
@@ -8984,10 +9090,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         let senses = unendlich_engine::sim::senses::senses_for(kind, &genome, wseed, 0);
                         let turn_profile = unendlich_engine::sim::cognition::steering::TurnProfile::from_seed(wseed);
                         let persistent = matches!(kind, CreatureKind::Dragon);
+                        // After the dragon cap, so a capped spawn logs nothing.
+                        // (An UNENDLICH_SPAWN_ARCHE picker body is not built from
+                        // this genome; its fight stats follow the position genome.)
+                        let duel = dragon_duel_for(kind, s.pos);
                         roamers.push(Roamer {
                             bond: unendlich_engine::sim::bond_tame::Bond::Wild,
                             trust: 0.0,
-                            hp: 40,
+                            hp: roamer_hp(&duel, 40),
                             creature: cr,
                             wander: Wander::new(wseed, speed),
                             home: *c,
@@ -9016,6 +9126,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             graze_cell: (i32::MIN, i32::MIN),
                             graze_scan_tick: 0,
                         rig: RoamerRig::default(),
+                        duel,
                         });
                     }
                 }
@@ -9099,6 +9210,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // forage/dragon over ~200 creatures) is the prime remaining
             // suspect. Time it to confirm.
             let _t_roamer = Instant::now();
+            // DRAGON DUEL: what the dragons see in your hand this frame.
+            let player_threat = Some(player_item_threat(
+                survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
+            ));
             // r294: fresh surface memo each tick (the world is mutated between ticks).
             if surface_cache_enabled {
                 surface_cache.borrow_mut().clear();
@@ -9222,6 +9337,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     graze_scan_tick,
                     home, // r693: den anchor for dragon territorial defense
                     rig,
+                    duel,
                     ..
                 } = r;
                 let self_xz = (cr.body.position[0], cr.body.position[2]);
@@ -10250,9 +10366,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         {
                             // r133: announce this individual's attunement (the
                             // breath element) so the log reads per-dragon.
-                            let g = unendlich_engine::sim::dragon_archetype::Genome::from_seed(
-                                flight_phase.to_bits() as u64,
-                            );
+                            let g = dragon_genome_of(duel);
                             let e = unendlich_engine::sim::breath_attack::dominant_element(&g) as usize;
                             log::info!(
                                 "[dragon] TAKEOFF at ({:.0}, {:.0}, {:.0}) — {}-attuned",
@@ -10267,7 +10381,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // hunger pushes it to forage). Sleeping dragons LAND and
                     // do not bend; hunting dragons run the REAL dragon_hunt
                     // stalk -> stoop -> strike machine against the herd.
-                    let ent_id_act = flight_phase.to_bits() as u64;
+                    // Stable per-dragon key (was flight_phase bits, which change
+                    // every tick: the activity/hunt state never persisted).
+                    let ent_id_act = duel.as_ref().map_or(0, |d| d.id);
                     let dragon_asleep = {
                         use unendlich_engine::sim::dragon_activity as dact;
                         let pp3 = local_player.view.position;
@@ -10464,7 +10580,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // error. Runs every frame for flying dragons (budget-exempt).
                     {
                         use unendlich_engine::sim::dragon_bending_ai as dba;
-                        let ent_id = flight_phase.to_bits() as u64;
+                        let ent_id = duel.as_ref().map_or(0, |d| d.id);
                         let pp2 = local_player.view.position;
                         let dx = pp2.x - cr.body.position[0];
                         let dz = pp2.z - cr.body.position[2];
@@ -10506,7 +10622,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             willing: if survival_mode { 0.8 } else { 0.35 },
                             alertness01: (0.35 + hearing.startle01 * 0.6).clamp(0.0, 1.0),
                         };
-                        let g2 = unendlich_engine::sim::dragon_archetype::Genome::from_seed(ent_id);
+                        let g2 = dragon_genome_of(duel);
                         let fields2 = unendlich_engine::sim::affinity_access::Fields {
                             h: 0.5, r: 0.5, w: 0.4, p: 0.6, l: 0.3, s: 0.5, b: 0.6,
                         };
@@ -10574,47 +10690,128 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         }
                     }
                     } // r150: end !asleep gate around bending
-                    // r129: DRAGON BREATH BENDING — once per ~6s of the flight
-                    // cycle, a flying dragon in range breathes at the player.
-                    // Cone/range/damage/element from the REAL breath_attack
-                    // params over a per-individual archetype genome (stable
-                    // seed = flight_phase bits); falloff via damage_at.
-                    if *flying && (cycle % 6.0) < 0.02 {
-                        let g = unendlich_engine::sim::dragon_archetype::Genome::from_seed(
-                            flight_phase.to_bits() as u64,
-                        );
-                        let bp = unendlich_engine::sim::breath_attack::params_from(&g);
+                    // DRAGON DUEL (sim::dragon_duel) — replaces the r129 breath
+                    // timer, which fired every 6 s of the flight cycle regardless
+                    // of facing, from a genome re-rolled each frame. Now one
+                    // tactical step per tick over this dragon's own genome: it
+                    // reads the item in your hand, remembers what hurt it, and
+                    // chooses stalk / circle / feint / lunge / breath / retreat.
+                    // Every tactic change is logged with its reasons.
+                    let mut duel_steer: Option<(f32, f32, unendlich_engine::sim::dragon_duel::Tactic)> = None;
+                    if let Some(d) = duel.as_mut().filter(|_| !dragon_asleep) {
+                        use unendlich_engine::sim::dragon_duel as dd;
                         let pp = local_player.view.position;
                         let dx = pp.x - cr.body.position[0];
                         let dy = pp.y - cr.body.position[1];
                         let dz = pp.z - cr.body.position[2];
                         let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-                        if dist <= bp.max_range {
-                            let angle = {
-                                let fyaw = cr.yaw;
-                                let to_yaw = dz.atan2(dx);
-                                let mut d = (to_yaw - fyaw).abs();
-                                if d > std::f32::consts::PI { d = std::f32::consts::TAU - d; }
-                                d
+                        let fwd = local_player.forward();
+                        let flen = (fwd.x * fwd.x + fwd.z * fwd.z).sqrt().max(1e-4);
+                        let hlen = (dx * dx + dz * dz).sqrt().max(1e-4);
+                        // player -> dragon is (-dx, -dz)
+                        let player_facing = (fwd.x * -dx + fwd.z * -dz) / (flen * hlen);
+                        let he = cr.body.half_extents;
+                        let body_radius = he[0].max(he[2]);
+                        let o = dd::step(
+                            &mut d.state,
+                            &d.profile,
+                            &dd::DuelSenses {
+                                dist,
+                                self_yaw: cr.yaw,
+                                to_player_yaw: dz.atan2(dx),
+                                player_facing,
+                                can_see: !player_hidden && dist < 64.0,
+                                item: player_threat,
+                                hp01: (*hp).max(0) as f32 / d.profile.max_hp.max(1) as f32,
+                                player_vitality01: fg_app.vitality().energy,
+                                player_whiffed: last_swing_whiffed,
+                                body_radius,
+                            },
+                            duel_tuning,
+                            dt,
+                        );
+                        let tag = d.id & 0xffff;
+                        if o.changed {
+                            log::info!("[dragon#{:04x}] {} — {:.0} m", tag, dd::describe(&o), dist);
+                        }
+                        if o.roar {
+                            log::info!(
+                                "[dragon#{:04x}] ROARS — a {} {} (dread {:.2})",
+                                tag, d.profile.element_name(), d.profile.weak_spot.name(), o.dread
+                            );
+                            if cam_shake_on {
+                                shake_mag = shake_mag.max(0.25 + 0.5 * o.dread.max(d.profile.dread));
+                            }
+                        }
+                        if o.breathe {
+                            let off = {
+                                let mut a = (dz.atan2(dx) - cr.yaw).abs();
+                                if a > std::f32::consts::PI { a = std::f32::consts::TAU - a; }
+                                a
                             };
-                            let dmg = unendlich_engine::sim::breath_attack::damage_at(&bp, angle, dist);
-                            let elem = unendlich_engine::sim::dragon_archetype::ELEMENT_NAMES
-                                [bp.element as usize % unendlich_engine::sim::dragon_archetype::NUM_ELEMENTS];
+                            let dmg = unendlich_engine::sim::breath_attack::damage_at(&d.profile.breath, off, dist);
                             if dmg > 0.5 {
                                 if survival_mode {
                                     fg_app.vitality_mut().tick(1.0, dmg * 0.004 * player_dmg_resist);
                                 }
                                 log::info!(
-                                    "[dragon] {} BREATH hits you for {:.0} at {:.0} blocks — vitality {:.0}%",
-                                    elem, dmg, dist, fg_app.vitality().energy * 100.0
+                                    "[dragon#{:04x}] {} BREATH hits you for {:.0} at {:.0} m — vitality {:.0}%",
+                                    tag, d.profile.element_name(), dmg, dist, fg_app.vitality().energy * 100.0
                                 );
                             } else {
-                                log::info!("[dragon] {} breath misses ({:.0} blocks, off-axis)", elem, dist);
+                                log::info!("[dragon#{:04x}] {} breath misses ({:.0} m, {:.2} rad off)", tag, d.profile.element_name(), dist, off);
                             }
                         }
+                        if o.bite {
+                            if dist <= body_radius + dd::LUNGE_REACH {
+                                if survival_mode {
+                                    fg_app.vitality_mut().tick(1.0, d.profile.bite_damage * 0.004 * player_dmg_resist);
+                                }
+                                log::info!(
+                                    "[dragon#{:04x}] BITES you for {:.0} — vitality {:.0}%",
+                                    tag, d.profile.bite_damage, fg_app.vitality().energy * 100.0
+                                );
+                            } else {
+                                log::info!("[dragon#{:04x}] snaps and misses ({:.1} m)", tag, dist);
+                            }
+                        }
+                        if o.want_air == Some(true) && !*flying {
+                            *flying = true;
+                            log::info!("[dragon#{:04x}] takes to the air to break off", tag);
+                        }
+                        if o.tactic != dd::Tactic::Unaware {
+                            duel_steer = Some((o.heading, o.speed01, o.tactic));
+                        }
+                    }
+                    // Ground steering for an engaged dragon. (Airborne steering is
+                    // folded into the flight block below.) The ordinary ground
+                    // wander has already moved it this tick; this turns it toward
+                    // the tactic's heading and advances it on top.
+                    if let (Some((heading, v01, _)), false) = (duel_steer, *flying) {
+                        let e = {
+                            let d = heading - cr.yaw;
+                            (d + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+                        };
+                        let max_turn = *turn_rate * dt;
+                        cr.yaw += e.clamp(-max_turn, max_turn);
+                        let spd = 5.0 * v01;
+                        cr.body.position[0] += cr.yaw.cos() * spd * dt;
+                        cr.body.position[2] += cr.yaw.sin() * spd * dt;
                     }
                     if *flying {
-                        let target = if want_air {
+                        // An engaged dragon flies at the fight: low for the
+                        // close tactics, a breath-range perch otherwise.
+                        let close = matches!(
+                            duel_steer.map(|x| x.2),
+                            Some(unendlich_engine::sim::dragon_duel::Tactic::Lunge
+                                | unendlich_engine::sim::dragon_duel::Tactic::Feint
+                                | unendlich_engine::sim::dragon_duel::Tactic::Stalk)
+                        );
+                        let target = if duel_steer.is_some() && close {
+                            local_player.view.position.y + 1.0
+                        } else if duel_steer.is_some() {
+                            surf + 10.0
+                        } else if want_air {
                             surf + 16.0 + 4.0 * (cr.anim_time * 0.4).sin()
                         } else {
                             surf // landing approach
@@ -10622,9 +10819,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         let gap = target - cr.body.position[1];
                         let vy = gap.clamp(-6.0, 6.0);
                         cr.body.position[1] += vy * dt;
-                        // Wide banked circle.
-                        cr.yaw += 0.35 * dt;
-                        let spd = 7.0_f32;
+                        let spd = if let Some((heading, v01, _)) = duel_steer {
+                            let e = (heading - cr.yaw + std::f32::consts::PI)
+                                .rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+                            cr.yaw += e.clamp(-1.2 * dt, 1.2 * dt);
+                            4.0 + 8.0 * v01
+                        } else {
+                            // Wide banked circle.
+                            cr.yaw += 0.35 * dt;
+                            7.0_f32
+                        };
                         cr.body.position[0] += cr.yaw.cos() * spd * dt;
                         cr.body.position[2] += cr.yaw.sin() * spd * dt;
                         cr.body.velocity = [cr.yaw.cos() * spd, vy, cr.yaw.sin() * spd];
@@ -10774,13 +10978,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             let kind = a.kind;
                             let pos = a.creature.body.position;
                             let mut cr = unendlich_engine::spawn::spawn(kind, [pos[0], pos[1], pos[2]]);
+                            let duel = dragon_duel_for(kind, [pos[0], pos[1], pos[2]]);
                             cr.body.position[1] = cr.grounded_y(pos[1]);
                             let cseed = mseed ^ 0x5DEE_CE15;
                             let ph = child.express(cseed, 0);
                             offspring.push(Roamer {
                                 bond: unendlich_engine::sim::bond_tame::Bond::Wild,
                                 trust: 0.0,
-                                hp: 40,
+                                hp: roamer_hp(&duel, 40),
                                 flying: false,
                                 flight_phase: (cseed % 30) as f32,
                                 creature: cr,
@@ -10809,6 +11014,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 graze_cell: (i32::MIN, i32::MIN),
                                 graze_scan_tick: 0,
                         rig: RoamerRig::default(),
+                        duel,
                             });
                         }
                     }
@@ -11257,22 +11463,41 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     let eye = local_player.view.position;
                     let dir = cam_forward;
                     let mut best: Option<(usize, f32)> = None;
+                    // Nearest dragon centre, for whiff detection below.
+                    let mut dragon_near = false;
                     for (ri, r) in roamers.iter().enumerate() {
                         let p = r.creature.body.position;
                         let to = glm::vec3(p[0] - eye.x, p[1] - eye.y, p[2] - eye.z);
                         let along = glm::dot(&to, &dir);
-                        if !(0.5..=attack_reach.max(0.5 + 0.01)).contains(&along) {
+                        // DRAGON DUEL: a dragon is a big target. The old test
+                        // (centre within weapon reach, 1.2 lateral) made most of
+                        // a large dragon's body unhittable: its centre is metres
+                        // inside it. Dragons use their body radius instead.
+                        let (radius, aim_y) = if r.duel.is_some() {
+                            let he = r.creature.body.half_extents;
+                            (he[0].max(he[2]).max(1.0) + 0.3, 0.0)
+                        } else {
+                            (1.2, 0.5)
+                        };
+                        if r.duel.is_some() && glm::length(&to) < attack_reach + radius + 3.0 {
+                            dragon_near = true;
+                        }
+                        let max_along = if r.duel.is_some() { attack_reach + radius } else { attack_reach };
+                        if !(0.5..=max_along.max(0.5 + 0.01)).contains(&along) {
                             continue;
                         }
                         let closest = eye + dir * along;
                         let lateral = glm::distance(
                             &closest,
-                            &glm::vec3(p[0], p[1] + 0.5, p[2]),
+                            &glm::vec3(p[0], p[1] + aim_y, p[2]),
                         );
-                        if lateral < 1.2 && best.map_or(true, |(_, d)| along < d) {
+                        if lateral < radius && best.map_or(true, |(_, d)| along < d) {
                             best = Some((ri, along));
                         }
                     }
+                    // A swing that found no creature with a dragon close by is
+                    // a whiff; next frame's roamer loop hands it to the duel.
+                    last_swing_whiffed = best.is_none() && dragon_near;
                     if let Some((ri, _)) = best {
                         // r-weapon-fix: was a fixed `{ element: Earth, magnitude: 12 }`
                         // regardless of what was equipped, so every attack — bare
@@ -11335,6 +11560,46 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             roamers[ri].bond = nb;
                             roamers[ri].trust = nt;
                         }
+                        // DRAGON DUEL: a dragon takes the hit through its own
+                        // genetics — the item's element against its element, the
+                        // side the blow landed on against its build's weak spot,
+                        // and its hide — and remembers it (element, reach).
+                        let target = &mut roamers[ri];
+                        let (dp, dyaw, he, hp_now) = (
+                            target.creature.body.position,
+                            target.creature.yaw,
+                            target.creature.body.half_extents,
+                            target.hp,
+                        );
+                        let dmg_dealt = if let Some(d) = target.duel.as_mut() {
+                            use unendlich_engine::sim::dragon_duel as dd;
+                            let threat = player_item_threat(
+                                survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
+                            );
+                            let zone = dd::hit_zone(
+                                dp, dyaw, he[1], he[0].max(he[2]),
+                                [eye.x, eye.y, eye.z],
+                            );
+                            let h = dd::resolve_item_hit(&d.profile, &threat, zone);
+                            // No crit roll here: the combat-mods crit is folded into
+                            // a mass-armor mitigation above that dragons replace
+                            // with hide, and can't be separated back out of it.
+                            let dealt = h.damage;
+                            let from = glm::distance(&eye, &glm::vec3(dp[0], dp[1], dp[2]));
+                            d.state.mem.learn_hit(threat.element, dealt, d.profile.max_hp, from);
+                            log::info!(
+                                "[dragon#{:04x}] hit on the {:?}{} — item ×{:.1} ({} vs {}), hide {:.0} → {} dmg ({}/{} hp)",
+                                d.id & 0xffff, zone,
+                                if h.weak_spot { format!(" — its {}!", d.profile.weak_spot.name()) } else { String::new() },
+                                h.element_mult,
+                                threat.element.map_or("unaligned", |e| unendlich_engine::sim::dragon_archetype::ELEMENT_NAMES[e as usize % 6]),
+                                d.profile.element_name(), h.hide, dealt,
+                                (hp_now - dealt).max(0), d.profile.max_hp
+                            );
+                            dealt
+                        } else {
+                            dmg_dealt
+                        };
                         roamers[ri].hp -= dmg_dealt;
                         // r509: the weapon wears with each swing; at 0 it breaks (survival only).
                         if survival_mode {
@@ -11474,9 +11739,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 unendlich_engine::item::CreatureKind::Dragon
                             ) {
                                 use unendlich_engine::sim::dragon_material_yield as dmy;
-                                let g2 = unendlich_engine::sim::dragon_archetype::Genome::from_seed(
-                                    roamers[ri].flight_phase.to_bits() as u64,
-                                );
+                                let g2 = dragon_genome_of(&roamers[ri].duel);
                                 let elem = g2
                                     .element
                                     .iter()
