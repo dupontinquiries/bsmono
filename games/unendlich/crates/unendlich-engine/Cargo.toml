@@ -182,6 +182,11 @@ shader-variants = []
 path = "src/lib.rs"
 
 [[bin]]
+name = "roar-render"
+path = "src/bin/roar_render.rs"
+required-features = ["audio"]
+
+[[bin]]
 name = "world-bench"
 path = "src/bin/world_bench.rs"
 

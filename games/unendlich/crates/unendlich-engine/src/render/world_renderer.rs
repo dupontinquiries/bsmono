@@ -1032,6 +1032,13 @@ pub struct WorldRenderer {
     /// load, or stops the process, rather than letting a submission
     /// take the whole device down. See `voxel_tools::gpu_guard`.
     gpu_guard: voxel_tools::gpu_guard::Guard,
+    /// The device is a CPU rasteriser (lavapipe/llvmpipe). There is no GPU
+    /// driver watchdog to trip and no desktop to take down with it, so the
+    /// guard's Abort is logged once and not acted on. Without this every
+    /// xvfb+lavapipe soak died at the first 1.5 s frame (exit 70), which is
+    /// every frame there.
+    gpu_guard_software: bool,
+    gpu_guard_software_noted: bool,
     /// What the guard has given up so far. The passes consult this.
     shed_level: voxel_tools::gpu_guard::Shed,
 
@@ -1959,6 +1966,11 @@ impl WorldRenderer {
             last_wait_fences_ms: 0.0,
             last_gpu_total_ms: 0.0,
             gpu_guard: voxel_tools::gpu_guard::Guard::default(),
+            gpu_guard_software: unsafe {
+                ctx.instance.get_physical_device_properties(ctx.physical_device).device_type
+                    == ash::vk::PhysicalDeviceType::CPU
+            },
+            gpu_guard_software_noted: false,
             shed_level: voxel_tools::gpu_guard::Shed::Nothing,
             pending_destroy: Vec::new(),
             mesh_cache: HashMap::new(),
@@ -5931,6 +5943,15 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                             "level": level.name(), "why": why, "total_us": total_us,
                         }));
                         self.shed_level = level;
+                    }
+                    voxel_tools::gpu_guard::Verdict::Abort { why } if self.gpu_guard_software => {
+                        if !self.gpu_guard_software_noted {
+                            self.gpu_guard_software_noted = true;
+                            log::warn!(
+                                "[gpu-guard] would stop ({why}) -- but this is a CPU rasteriser with no \
+                                 driver watchdog, so continuing. Logged once."
+                            );
+                        }
                     }
                     voxel_tools::gpu_guard::Verdict::Abort { why } => {
                         log::error!("[gpu-guard] {why}");
