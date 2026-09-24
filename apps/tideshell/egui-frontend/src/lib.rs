@@ -234,6 +234,11 @@ impl ShellView {
             || self.sheet.open
             || self.show_trace
             || shell.lock.is_locked()
+            // A reduced white point is drawn as a veil on this layer, so the
+            // overlay has to stay mapped even when nothing else wants it —
+            // unmapping it is what would make the screen jump back to the
+            // panel's floor.
+            || tideshell_core::dimming::split(shell.drawer.brightness, shell.prefs.digital_dim).is_dimming()
             || shell.sleep.phase != tideshell_core::sleep::Phase::Awake
     }
 
@@ -593,6 +598,15 @@ impl ShellView {
             || (shell.lock.is_locked() && !shell.lock.reveal.is_settled())
         {
             ui.ctx().request_repaint();
+        }
+        // The reduced white point, last so it veils everything drawn above.
+        // A black rectangle over the whole surface: the cheapest possible
+        // way to scale every pixel toward black, and the only one available
+        // to a client that does not own the compositor's colour pipeline.
+        let dim = tideshell_core::dimming::split(shell.drawer.brightness, shell.prefs.digital_dim);
+        if dim.is_dimming() {
+            let a = (dim.veil_alpha() * 255.0).round().clamp(0.0, 255.0) as u8;
+            ui.painter().rect_filled(ui.max_rect(), 0.0, egui::Color32::from_black_alpha(a));
         }
         out
     }
@@ -1400,6 +1414,17 @@ impl ShellView {
                         }
                     });
                 });
+                ui.separator();
+                ui.label("Accessibility");
+                ui.checkbox(&mut draft.digital_dim, "Dim below the panel's floor");
+                ui.label(
+                    egui::RichText::new(
+                        "Below 5% the pixels dim as well as the backlight, reaching about a tenth of the panel's lowest step. \
+                         For dark rooms. Costs some bit depth, so the darkest greys may band.",
+                    )
+                    .small()
+                    .weak(),
+                );
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Apply").clicked() {

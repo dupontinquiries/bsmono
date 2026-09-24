@@ -66,6 +66,10 @@ pub struct ShellPrefs {
     /// corrupts the display under a stream of changes, pmaports #4274),
     /// smooth elsewhere.
     pub brightness_mode: String,
+    /// Reduced white point below the panel's floor (dimming::split). Under
+    /// accessibility and off by default: it trades bit depth for a screen
+    /// that can be looked at in the dark, which is a choice, not a default.
+    pub digital_dim: bool,
     /// Cold mode: auto (battery temperature), on, off.
     pub cold: String,
     /// Ambient loudness from the microphone (notification gain). The mic is
@@ -98,6 +102,7 @@ impl Default for ShellPrefs {
             theme: "night".into(),
             palette_recent: String::new(),
             brightness_mode: "auto".into(),
+            digital_dim: false,
             hemisphere: "north".into(),
             living: true,
             cold: "auto".into(),
@@ -111,7 +116,7 @@ impl Default for ShellPrefs {
     }
 }
 
-pub const KEYS: [&str; 23] = [
+pub const KEYS: [&str; 24] = [
     "shell.layout",
     "shell.bar.widgets",
     "shell.bar.width",
@@ -126,6 +131,7 @@ pub const KEYS: [&str; 23] = [
     "shell.theme",
     "shell.palette.recent",
     "shell.brightness.mode",
+    "shell.brightness.digital",
     "shell.hemisphere",
     "shell.living",
     "shell.cold",
@@ -161,6 +167,7 @@ impl ShellPrefs {
             ("shell.theme".into(), self.theme.clone()),
             ("shell.palette.recent".into(), self.palette_recent.clone()),
             ("shell.brightness.mode".into(), self.brightness_mode.clone()),
+            ("shell.brightness.digital".into(), if self.digital_dim { "on" } else { "off" }.into()),
             ("shell.hemisphere".into(), self.hemisphere.clone()),
             ("shell.living".into(), if self.living { "on" } else { "off" }.into()),
             ("shell.cold".into(), self.cold.clone()),
@@ -213,6 +220,7 @@ impl ShellPrefs {
             }
             "shell.hold_ms" => self.hold_ms = parse_range(key, v, 200.0, 1500.0)? as u64,
             "shell.trackpad.speed" => self.trackpad_speed = parse_range(key, v, 0.25, 4.0)?,
+            "shell.brightness.digital" => self.digital_dim = matches!(v, "on" | "true" | "1"),
             "shell.brightness.auto" => {
                 self.auto_brightness = match v {
                     "on" => true,

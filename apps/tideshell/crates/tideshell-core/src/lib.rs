@@ -33,6 +33,7 @@ pub mod clock;
 pub mod cold;
 pub mod control_center;
 pub mod cursor;
+pub mod dimming;
 pub mod edge;
 pub mod hold;
 pub mod palette;
