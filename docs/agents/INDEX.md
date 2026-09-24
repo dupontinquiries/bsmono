@@ -53,7 +53,12 @@ false alarm, and the rule that follows: probe before patching.
   [`../architecture/OFFLINE_SUPPLY_CHAIN.md`](../architecture/OFFLINE_SUPPLY_CHAIN.md)
 - `apps/logscope/HANDOFF.md`, `apps/logscope/reference-docs/HANDOFF-imagegen.md`
 - `apps/bo-suite/docs/HANDOFF.md`
-- `apps/gitmind/TOOLBOX.md`
+- `apps/gitmind/TOOLBOX.md`, `apps/gitmind/DEPLOY_TO_A_PHONE.md` (transports, first contact
+  from a browser, enrolment, depot credentials)
+- `apps/tideshell/deploy/DEPLOY-FP5.md` (the numbered on-phone checks),
+  `apps/tideshell/deploy/GITMIND-DEPLOY.md` (the deploy plan gitmind should run)
+- `apps/fao-codec/egui-frontend/PORT_STATUS.md` (the egui port against fao_app);
+  `apps/fao-codec/docs/` (the codec: CODEC_FORMATS, ARCHITECTURE, …)
 - `apps/voiceterm/docs/power-user-brainstorm.md`
 - `apps/ambient-learner/docs/` (MAIN_CHANGES, NEURAL_NETWORK_TRAINING,
   REMAINING_FEATURES, SWIPE_DEBOUNCE_AND_DBMAINT)
