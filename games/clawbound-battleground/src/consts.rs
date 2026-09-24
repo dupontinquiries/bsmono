@@ -10,7 +10,22 @@ use glam::Vec3;
 /// Global layout scale — expands the whole valley (lanes, bases, towers).
 pub const MAP_SCALE: f32 = 1.42;
 
-pub const ARENA_RADIUS: f32 = 95.0 * MAP_SCALE; // playable floor (~135)
+/// Deep jungle added beyond the lanes, world units. The arena grows by this
+/// much WITHOUT moving a lane, a base or a tower: MAP_SCALE stretches the
+/// whole valley and so changes every walk in the match; this only adds
+/// ground behind the side lanes and rivers to hunt, hide and flank through.
+pub const JUNGLE_MARGIN: f32 = 32.0;
+
+pub const ARENA_RADIUS: f32 = 95.0 * MAP_SCALE + JUNGLE_MARGIN; // playable floor (~167)
+
+/// Everything past the playable floor -- the hill ring, the landmarks, the
+/// mountain rim, the rendered ground -- was authored in world units for a
+/// 135 u arena. It is carried out by this ratio so the ring keeps its shape
+/// round a bigger floor instead of the floor growing into it.
+pub const OUTER_SCALE: f32 = ARENA_RADIUS / (95.0 * MAP_SCALE);
+
+/// Where the mountain rim starts rising.
+pub const RIM_RADIUS: f32 = 172.0 * OUTER_SCALE;
 
 /// Collision radius of a god, for prop push-out.
 ///
@@ -34,7 +49,7 @@ pub const HUSH_DASH_SECS: f32 = 1.5;
 
 /// Collision radius of a minion. Smaller because a minion is a mini cat.
 pub const MINION_RADIUS: f32 = 0.32;
-pub const GROUND_HALF: f32 = 225.0; // rendered terrain half-extent
+pub const GROUND_HALF: f32 = 225.0 * OUTER_SCALE; // rendered terrain half-extent (~279)
 
 /// Base microvoxel edge length (world units) for character voxels.
 pub const VOXEL_SIZE: f32 = 0.14;

@@ -291,6 +291,9 @@ pub struct Game {
     /// the pre-collision behaviour rather than silently depending on a world
     /// they never built.
     pub blockers: std::sync::Arc<crate::blockers::Blockers>,
+    /// Per-god steering memory (`steer::Memory`): a bot's planned detour.
+    /// Sim state, so a replay reproduces the same detours.
+    pub steer_mem: Vec<crate::steer::Memory>,
 }
 
 impl Game {
@@ -424,6 +427,7 @@ impl Game {
             bosses: crate::bosses::Bosses::new(),
             disasters: crate::disasters::Disasters::default(),
             blockers: std::sync::Arc::new(crate::blockers::Blockers::default()),
+            steer_mem: vec![crate::steer::Memory::default(); 10],
         };
         // starter items for AI gods (player buys via shop)
         for i in 0..10 {
@@ -581,8 +585,16 @@ impl Game {
         // wading: the rivers are slow going unless you were born to them
         let depth = self.water_depth_now(g.pos.x, g.pos.z);
         let wade = if g.blessing_t > 0.0 || crate::wild::is_riverborn(def) { 1.0 } else { wade_speed_mul(depth) };
-        let stalk = if self.stalking(i) { crate::consts::SNEAK_SPEED } else { 1.0 };
-        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk
+        let stalking = self.stalking(i);
+        let stalk = if stalking { crate::consts::SNEAK_SPEED } else { 1.0 };
+        // Rough ground (`going`). Not while airborne or perched: a leap
+        // clears the thicket, and a boulder's top is not its scree skirt.
+        let going = if g.leap.is_some() || g.dash.is_some() || g.perch.is_some() {
+            1.0
+        } else {
+            self.blockers.going_at(g.pos.x, g.pos.z, crate::going::Carriage { stalking })
+        };
+        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk * going
     }
 
     pub fn auto_interval(&self, i: usize) -> f32 {

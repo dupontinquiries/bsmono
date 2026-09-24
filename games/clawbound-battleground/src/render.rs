@@ -1350,7 +1350,7 @@ pub fn sort_far_to_near<T>(items: &mut [(f32, T)]) {
 /// beyond the arena bounds, a mountain rim at the horizon, and river valleys
 /// that dip under the lanes (roads stay solid — bridges span the crossings).
 pub fn terrain_height(x: f32, z: f32) -> f32 {
-    use crate::consts::{river_dist, GROUND_HALF, RIVER_HALF_WIDTH, RIVER_DEPTH, ARENA_RADIUS};
+    use crate::consts::{river_dist, GROUND_HALF, RIVER_HALF_WIDTH, RIVER_DEPTH, ARENA_RADIUS, RIM_RADIUS};
     let r = (x * x + z * z).sqrt();
     let mut h = 0.0f32;
     // rolling jungle hills outside the playable floor
@@ -1362,8 +1362,8 @@ pub fn terrain_height(x: f32, z: f32) -> f32 {
         h = s * (2.2 + n * 6.0 + n2 * 2.2);
     }
     // mountain rim beyond the hills
-    if r > 172.0 {
-        let t = ((r - 172.0) / (GROUND_HALF - 172.0)).clamp(0.0, 1.0);
+    if r > RIM_RADIUS {
+        let t = ((r - RIM_RADIUS) / (GROUND_HALF - RIM_RADIUS)).clamp(0.0, 1.0);
         h += t * t * 30.0 + vnoise(x * 0.05 + 13.0, z * 0.05) * t * 10.0;
     }
     // river valley (masked under lanes so the roads stay solid)
@@ -1472,7 +1472,7 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
 
             let mut color;
             let mut mat = 0.0f32;
-            if r > 175.0 && h > 14.0 {
+            if r > crate::consts::RIM_RADIUS + 3.0 && h > 14.0 {
                 // mountain rim: dark jungle rock with forest ledges
                 let rock = [0.24 + n1 * 0.05, 0.24 + n2 * 0.04, 0.22 + n1 * 0.03];
                 let forest = [0.085 + n1 * 0.03, 0.17 + n2 * 0.05, 0.075];
@@ -1536,6 +1536,14 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
                     mat = 3.0;
                     let t = (1.0 - (rd - RIVER_HALF_WIDTH) / 5.0).clamp(0.0, 1.0);
                     g = [g[0] + (0.46 - g[0]) * t * 0.85, g[1] + (0.40 - g[1]) * t * 0.85, g[2] + (0.27 - g[2]) * t * 0.85];
+                }
+                // The rim of the floor fades into the hill ring's darker
+                // green. It was a hard circle, as visible from above as a
+                // painted line; the arena edge is now a treeline, not a stripe.
+                let edge = smoothstep(ARENA_RADIUS - 14.0, ARENA_RADIUS, r);
+                if edge > 0.0 {
+                    let hill = [0.075 + n1 * 0.035, 0.175 + n2 * 0.06, 0.07 + n2 * 0.02];
+                    g = [g[0] + (hill[0] - g[0]) * edge, g[1] + (hill[1] - g[1]) * edge, g[2] + (hill[2] - g[2]) * edge];
                 }
                 // team base tints
                 for (bz, c) in [

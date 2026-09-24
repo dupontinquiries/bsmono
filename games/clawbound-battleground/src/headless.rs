@@ -61,6 +61,9 @@ const W: u32 = 1280;
 const H: u32 = 720;
 
 pub fn run() -> Result<(), String> {
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("shop") {
+        return run_shop_shots();
+    }
     let (_instance, _adapter, device, queue) =
         make_device().ok_or_else(|| "No suitable GPU backend found (install mesa-vulkan-drivers for lavapipe)".to_string())?;
     let adapter_info = {
@@ -465,6 +468,25 @@ pub fn run_rig_sheet() -> Result<(), String> {
     }
     // The authored centre from above: the Hollow, and a run either side of the lane.
     shots.push(Shot { name: "map_centre.png", eye: Vec3::new(0.0, 62.0, -46.0), look: Vec3::new(0.0, 0.0, 8.0) });
+    // A grove (scene::groves): the first bramble bed in the going layer.
+    let grove = scene.blockers.going().all().iter().find_map(|r| match r.shape {
+        // r > 2.5: a bamboo stand is also a 0.55 thicket, 1.5 across.
+        crate::blockers::Shape::Circle { x, z, r: rad } if r.mul == crate::scene::BRAMBLE_MUL && rad > 2.5 => Some(Vec3::new(x, 0.0, z)),
+        _ => None,
+    });
+    if let Some(g) = grove {
+        shots.push(Shot { name: "map_grove.png", eye: g + Vec3::new(-11.0, 5.0, -11.0), look: g + Vec3::Y * 0.5 });
+        shots.push(Shot { name: "map_grove_above.png", eye: g + Vec3::new(-4.0, 42.0, -6.0), look: g });
+    }
+    // The deep jungle ring from above: west of the west river, the ground
+    // JUNGLE_MARGIN added.
+    // The whole valley from straight above (near enough): where the props are.
+    shots.push(Shot { name: "map_overview.png", eye: Vec3::new(0.0, 330.0, -60.0), look: Vec3::ZERO });
+    shots.push(Shot { name: "map_deep_jungle.png", eye: Vec3::new(-150.0, 70.0, -60.0), look: Vec3::new(-135.0, 0.0, 0.0) });
+    // Paws in motion: one cat trotting across open ground, seen side-on at
+    // paw height, captured on several frames (`rig_trot_strip_<step>.png`).
+    let trot_at = Vec3::new(0.0, 0.0, -48.0) + Vec3::X * 20.0;
+    shots.push(Shot { name: "rig_trot_strip.png", eye: trot_at + Vec3::new(0.0, 1.1, -4.2), look: trot_at + Vec3::Y * 0.45 });
     // A strike in the Hollow, a third of a second on: the front is among the
     // trees, the ground is freshly broken, and an older crack beside it is
     // half healed. Gameplay camera distance, so the fitted shadow box is tight.
@@ -495,7 +517,7 @@ pub fn run_rig_sheet() -> Result<(), String> {
         };
         game.blockers = scene.blockers.clone();
         let mut vfx = Vfx::default();
-        let cam = Camera { eye: shot.eye, target: shot.look, fov_y: if si == 0 || si >= sig_first { 1.0 } else { 0.6 } };
+        let cam = Camera { eye: shot.eye, target: shot.look, fov_y: if shot.name == "map_overview.png" { 1.15 } else if si == 0 || si >= sig_first { 1.0 } else { 0.6 } };
         const STEPS: usize = 48;
         for step in 0..STEPS {
             let left = STEPS - 1 - step;
@@ -569,7 +591,15 @@ pub fn run_rig_sheet() -> Result<(), String> {
                     game.gods[0].pos = t + Vec3::X * (crate::consts::TOWER_RANGE - 2.0);
                     game.tick(1.0 / 60.0); // the real sim decides who the tower aims at
                 }
-                k if shots[k].name == "map_centre.png" => {
+                k if shots[k].name == "rig_trot_strip.png" => {
+                    for gi in 1..game.gods.len() {
+                        game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
+                    }
+                    let g = &mut game.gods[0];
+                    g.yaw = 0.0;
+                    g.pos = trot_at - Vec3::X * (left as f32 * (4.5 / 60.0));
+                }
+                k if shots[k].name.starts_with("map_") => {
                     for gi in 0..game.gods.len() {
                         game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
                     }
@@ -641,6 +671,17 @@ pub fn run_rig_sheet() -> Result<(), String> {
             vfx.update(1.0 / 60.0, &[], &game);
             renderer.clear_queues();
             scene.draw(&mut renderer, &game, &mut vfx, cam);
+            if shot.name == "rig_trot_strip.png" && step >= STEPS - 16 && step % 3 == 0 {
+                // follow the cat so every frame frames it
+                let c = Camera { eye: game.gods[0].pos + Vec3::new(0.0, 1.1, -4.2), target: game.gods[0].pos + Vec3::Y * 0.45, fov_y: 0.6 };
+                renderer.clear_queues();
+                scene.draw(&mut renderer, &game, &mut vfx, c);
+                renderer.atmosphere = game.weather.atmosphere();
+                renderer.render_frame(&view, c, 1.0);
+                let name = format!("rig_trot_strip_{step}.png");
+                save_shot(&renderer.device, &renderer.queue, &target, &name)?;
+                println!("saved {name}");
+            }
         }
         // CLAWBOUND_NO_BRUSH=1 renders the same frame with the leaf-bend off,
         // so the two can be diffed: everything else in the frame is identical,
@@ -668,4 +709,113 @@ pub fn run_rig_sheet() -> Result<(), String> {
 /// The enemy (Red) mid outer tower, for the staged tower shot.
 fn consts_tower() -> Vec3 {
     crate::consts::tower_pos(crate::consts::Lane::Mid, crate::consts::Team::Red, false)
+}
+
+/// The shop, three ways: desktop over the world, a landscape phone (844 x
+/// 474 pt) over the world, and a portrait phone (390 x 845 pt) on its own.
+/// `CLAWBOUND_SHOTS=shop clawbound-battleground --screenshot`.
+pub fn run_shop_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut egui_renderer = egui_wgpu::Renderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, None, 1);
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mk = |r: &Renderer, w: u32, h: u32| {
+        r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shop shot"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    };
+    let target = mk(&renderer, W, H);
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    // A mid-game purse: some bought, some affordable, some not, one armed
+    // for sale -- every state a card and a slot can be in.
+    let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    game.blockers = scene.blockers.clone();
+    game.gods[0].gold = 5000.0;
+    let rec = crate::shopview::recommended(&game, 0);
+    let first = crate::shopview::offers(&game, 0, rec[0]);
+    let _ = game.buy_item(0, first[0].item.id);
+    let _ = game.buy_item(0, first[3].item.id);
+    game.gods[0].gold = 1650.0;
+    let mut ui_state = UiState::new();
+    ui_state.shop_open = true;
+    ui_state.shop_tab = rec[0];
+    let mut vfx = Vfx::default();
+    for _ in 0..30 {
+        game.tick(1.0 / 60.0);
+    }
+    let p = game.gods[0].pos;
+    let cam = Camera { eye: p + Vec3::new(6.0, 7.0, -8.0), target: p + Vec3::Y * 1.2, fov_y: 0.95 };
+    let egui_ctx = egui::Context::default();
+    for (name, ppp) in [("clawbound_shop.png", 1.0f32), ("clawbound_shop_landscape_phone.png", W as f32 / 844.0)] {
+        renderer.atmosphere = game.weather.atmosphere();
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.render_frame(&view, cam, 1.0);
+        let out = shop_frame(&egui_ctx, &mut game, &mut ui_state, W, H, ppp);
+        draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &egui_ctx, out, W, H);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+    }
+    // Portrait phone: the shop alone on a cleared frame, on its Shelves
+    // tab and then its Hoard tab.
+    let (pw, ph) = (576u32, 1248u32); // width*4 must be a multiple of 256 for the readback
+    let ptarget = mk(&renderer, pw, ph);
+    let pview = ptarget.create_view(&Default::default());
+    for (name, tab) in [("clawbound_shop_phone.png", crate::shopui::PhoneTab::Shelves), ("clawbound_shop_phone_hoard.png", crate::shopui::PhoneTab::Hoard)] {
+        ui_state.shop_phone_tab = tab;
+        ui_state.sell_armed = if tab == crate::shopui::PhoneTab::Hoard { Some(1) } else { None };
+        clear(&renderer.device, &renderer.queue, &pview);
+        let out = shop_frame(&egui_ctx, &mut game, &mut ui_state, pw, ph, pw as f32 / 390.0);
+        draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &pview, &egui_ctx, out, pw, ph);
+        save_shot(&renderer.device, &renderer.queue, &ptarget, name)?;
+        println!("saved {name}");
+    }
+    Ok(())
+}
+
+/// Two egui passes (the first lays out, the second paints with hover state
+/// settled), returning the second's output.
+fn shop_frame(ctx: &egui::Context, game: &mut Game, st: &mut UiState, w: u32, h: u32, ppp: f32) -> egui::FullOutput {
+    ctx.set_pixels_per_point(ppp);
+    let mut textures = egui::TexturesDelta::default();
+    let mut out = None;
+    for k in 0..2 {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32 / ppp, h as f32 / ppp))),
+            time: Some(k as f64 * 0.016),
+            ..Default::default()
+        };
+        let o = ctx.run(raw, |c| ui::draw_shop(c, game, 0, st));
+        // Every pass's texture updates must reach the renderer, or the font
+        // atlas the first pass created is patched before it exists.
+        textures.append(o.textures_delta.clone());
+        out = Some(o);
+    }
+    let mut out = out.expect("ran");
+    out.textures_delta = textures;
+    out
+}
+
+fn clear(device: &wgpu::Device, queue: &wgpu::Queue, view: &wgpu::TextureView) {
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let _p = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.08, b: 0.05, a: 1.0 }), store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+    }
+    queue.submit([enc.finish()]);
 }

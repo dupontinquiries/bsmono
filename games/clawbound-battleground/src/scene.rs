@@ -111,6 +111,9 @@ impl Probe for WorldProbe<'_> {
     fn stem(&self, x: f32, z: f32, within: f32) -> Option<(f32, f32)> {
         self.blockers.nearest_stem(x, z, within)
     }
+    fn solid(&self, x: f32, z: f32) -> bool {
+        self.blockers.blocked(x, z, 0.05)
+    }
 }
 
 fn solid_tint(c: [f32; 3]) -> [f32; 4] {
@@ -489,8 +492,6 @@ impl Scene {
             puppet.advance(dt, &inp, rig, &world, &mut pevents);
             let pose = puppet.pose(&inp, rig);
             creature_rig::pose(rig.parts(), rig.torso_half, &pose.motion, None, &mut posed);
-            let mats = slot_transforms(rig, &posed, &pose.legs, &pose.body);
-
             // wading: sink toward the bed (capped so the head stays clear)
             let sink = consts::water_depth(g.pos.x, g.pos.z).min(0.9);
             // Model faces +Z; glam's rotation_y(t) sends +Z to (sin t, 0,
@@ -499,6 +500,14 @@ impl Scene {
             // on the north-south lanes, backwards on any east-west run.
             let base = Mat4::from_translation(g.pos + Vec3::Y * (pose.lift - sink))
                 * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - g.yaw);
+            // Planted paws (`footfall`): world soles into the rig frame. The
+            // sim's floor is y = 0 through the river too and the drawn cat
+            // is sunk, so the soles sink with it.
+            let mut legs = pose.legs;
+            for (l, f) in legs.iter_mut().zip(pose.feet) {
+                l.plant = f.map(|p| crate::rigged::world_to_rig(rig, base, p - Vec3::Y * sink));
+            }
+            let mats = slot_transforms(rig, &posed, &legs, &pose.body);
             for (s, m) in mats.iter().enumerate() {
                 r.queue_draw(self.god_parts[di][ti][s], base * *m, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
             }
@@ -624,26 +633,129 @@ fn mesh_radius(m: &VoxelMesh) -> f32 {
 fn jungle_spot(rng: &mut Rng, min_clear: f32) -> Option<(f32, f32)> {
     for _ in 0..40 {
         let a = rng.f32() * std::f32::consts::TAU;
-        let r = 22.0 + rng.f32() * (ARENA_RADIUS - 30.0);
+        // Uniform by AREA, not by radius. `22 + u * span` put as many props
+        // in the thin inner annulus as in the wide outer one, so the jungle
+        // thinned out exactly where the map has the most of it -- and the
+        // outer ring is where the deep jungle now is.
+        let (r0, r1) = (22.0f32, ARENA_RADIUS - 8.0);
+        let r = (r0 * r0 + rng.f32() * (r1 * r1 - r0 * r0)).sqrt();
         let x = a.cos() * r;
         let z = a.sin() * r;
-        // ...and not on the authored centre: a random trunk in a run's
-        // floor or a doorway undoes the one part of the map that is designed.
-        if consts::lane_clearance(x, z) > min_clear && consts::river_dist(x, z) > 9.5 && !crate::bosses::in_pit(x, z) && !crate::midjungle::reserved(x, z) && !consts::in_tower_clearing(x, z) {
+        if jungle_ok(x, z, min_clear) {
             return Some((x, z));
         }
     }
     None
 }
 
+/// May scatter put something at `(x, z)`? Off the lanes, out of the river,
+/// out of the pits, off the authored centre and out of the tower clearings.
+fn jungle_ok(x: f32, z: f32, min_clear: f32) -> bool {
+    // ...and not on the authored centre: a random trunk in a run's floor or
+    // a doorway undoes the one part of the map that is designed.
+    x.hypot(z) < ARENA_RADIUS - 6.0
+        && consts::lane_clearance(x, z) > min_clear
+        && consts::river_dist(x, z) > 9.5
+        && !crate::bosses::in_pit(x, z)
+        && !crate::midjungle::reserved(x, z)
+        && !consts::in_tower_clearing(x, z)
+}
+
+/// Does a fallen log at `(x, z)` fit? `jungle_spot` checks a point, and a
+/// log is 13 u long: a centre in the clear put one end across a Run's floor
+/// (`scatter_leaves_the_authored_centre_alone` found it when the scatter's
+/// random stream moved). Every point along the spine, padded by the log's
+/// thickness, has to be jungle.
+fn log_fits(x: f32, z: f32, quarter: u8, scale: f32) -> bool {
+    let r = PropKind::FallenLog.footprint().radius * scale;
+    Blockers::long_spines(PropKind::FallenLog, scale).iter().all(|&(x0, z0, x1, z1)| {
+        let turn = |mut px: f32, mut pz: f32| {
+            for _ in 0..(quarter % 4) {
+                (px, pz) = (pz, -px);
+            }
+            (x + px, z + pz)
+        };
+        let (a, b) = (turn(x0, z0), turn(x1, z1));
+        (0..=10).all(|k| {
+            let t = k as f32 / 10.0;
+            let (px, pz) = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+            jungle_ok(px, pz, 3.0 + r) && [(r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)].iter().all(|(dx, dz)| !crate::midjungle::reserved(px + dx, pz + dz))
+        })
+    })
+}
+
+/// A grove: a ring of big trees round a bramble bed. Returned as data so
+/// the placement rules are testable without meshing anything; `build_world`
+/// turns it into meshes, blockers and rough ground.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Grove {
+    pub x: f32,
+    pub z: f32,
+    /// Radius of the bramble bed at the centre.
+    pub bed: f32,
+    /// `(kind, x, z, scale)` -- trees on the ring, undergrowth in the bed.
+    pub parts: Vec<(PropKind, f32, f32, f32)>,
+}
+
+/// The rough ground at the heart of a grove. Slower than any single bush:
+/// this is the thing a chase goes AROUND.
+pub const BRAMBLE_MUL: f32 = 0.55;
+
+/// Lay out `n` groves. Spaced so two never merge into one wall of trunks,
+/// and every part checked against `jungle_ok` individually -- a grove near a
+/// lane loses the trees that would stand in it rather than moving the lane.
+pub fn groves(rng: &mut Rng, n: usize) -> Vec<Grove> {
+    const TAU: f32 = std::f32::consts::TAU;
+    let mut out: Vec<Grove> = Vec::new();
+    let mut tries = 0;
+    while out.len() < n && tries < n * 30 {
+        tries += 1;
+        let Some((x, z)) = jungle_spot(rng, 11.0) else { continue };
+        if out.iter().any(|g| (g.x - x).hypot(g.z - z) < 20.0) {
+            continue;
+        }
+        let bed = 2.8 + rng.f32() * 1.4;
+        let mut parts = Vec::new();
+        let bamboo_stand = rng.f32() < 0.3;
+        let ring = 5.2 + rng.f32() * 1.6;
+        let trees = 3 + (rng.f32() * 2.0) as usize;
+        let a0 = rng.f32() * TAU;
+        for k in 0..trees {
+            // Irregular spacing, and never a full ring: a grove you cannot
+            // enter is a pillar, and a gap is where the ambush comes from.
+            let a = a0 + (k as f32 + 0.25 * rng.f32()) / (trees as f32 + 0.8) * TAU;
+            let (tx, tz) = (x + a.cos() * ring, z + a.sin() * ring);
+            if !jungle_ok(tx, tz, 7.0) {
+                continue;
+            }
+            let kind = if bamboo_stand { PropKind::Bamboo } else if k % 3 == 2 { PropKind::StranglerFig } else { PropKind::JungleTree };
+            parts.push((kind, tx, tz, 0.9 + rng.f32() * 0.3));
+        }
+        // Dense enough to read as a bed from a raised camera: the first
+        // render at 5..8 small plants showed a bush and a fern on bare grass.
+        let fill = 10 + (rng.f32() * 5.0) as usize;
+        for k in 0..fill {
+            let a = rng.f32() * TAU;
+            let d = bed * rng.f32().sqrt() * 0.85;
+            let (ux, uz) = (x + a.cos() * d, z + a.sin() * d);
+            if !jungle_ok(ux, uz, 5.0) {
+                continue;
+            }
+            parts.push((if k % 2 == 0 { PropKind::Bush } else { PropKind::Fern }, ux, uz, 1.0));
+        }
+        out.push(Grove { x, z, bed, parts });
+    }
+    out
+}
+
 /// Random spot on the outer hills, clear of landmark structures.
 fn hill_spot(rng: &mut Rng, landmarks: &[Vec3], keep_out: f32) -> Option<(f32, f32)> {
     for _ in 0..40 {
         let a = rng.f32() * std::f32::consts::TAU;
-        let r = ARENA_RADIUS + 5.0 + rng.f32() * 45.0;
+        let r = ARENA_RADIUS + 5.0 + rng.f32() * 45.0 * consts::OUTER_SCALE;
         let x = a.cos() * r;
         let z = a.sin() * r;
-        if x.abs() > 190.0 || z.abs() > 190.0 {
+        if x.abs() > 190.0 * consts::OUTER_SCALE || z.abs() > 190.0 * consts::OUTER_SCALE {
             continue;
         }
         let p = Vec3::new(x, 0.0, z);
@@ -663,6 +775,14 @@ fn bird_mesh() -> VoxelMesh {
     g.set(2, 0, 0, solid_tint([0.12, 0.10, 0.09]));
     g.set(2, 0, 4, solid_tint([0.12, 0.10, 0.09]));
     g.mesh(0.5, true)
+}
+
+/// The real world's collision and going, without a renderer: what a
+/// headless match must run against to be the match anyone plays. Builds the
+/// meshes too (they are what the placements come from) and drops them; a few
+/// seconds of CPU.
+pub fn world_blockers() -> Blockers {
+    build_world().2
 }
 
 fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
@@ -721,52 +841,97 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
         }
     }
 
+    // --- groves: the deep jungle's rooms. A ring of trunks (or a bamboo
+    // stand) round a bramble bed you can push through at half speed. Most of
+    // the added jungle is this rather than more lone trees: it makes the
+    // ground dense without adding walls, which is what `going` is for.
+    // Placed BEFORE the scatter, and the scatter kept out of them: placed
+    // after, the scatter had already dropped boulders and rocks into the
+    // beds, and a grove read as more of the same jungle rather than a room.
+    let grove_list = groves(&mut rng, 26);
+    let rooms: Vec<(f32, f32, f32)> = grove_list.iter().map(|g| (g.x, g.z, g.bed + 1.5)).collect();
+    for gr in grove_list {
+        blockers.push_rough(crate::going::Rough {
+            shape: crate::blockers::Shape::Circle { x: gr.x, z: gr.z, r: gr.bed },
+            mul: BRAMBLE_MUL,
+            edge: 1.2,
+            ground: crate::going::Ground::Thicket,
+        });
+        for (kind, x, z, sc) in gr.parts {
+            let q = (v % 4) as u8;
+            match kind {
+                PropKind::JungleTree => {
+                    plant!(JungleTree; props::jungle_tree(sc, v), x, z, 0.0, q, V_MED, 1.0);
+                    blockers.push_jungle_roots(x, z, 0.0, v);
+                }
+                PropKind::StranglerFig => plant!(StranglerFig; props::strangler_fig(sc, v), x, z, 0.0, q, V_MED, 0.8),
+                PropKind::Bamboo => plant!(Bamboo; props::bamboo(sc, v), x, z, 0.0, q, V_MED, 2.2),
+                PropKind::Bush => plant!(Bush; props::bush(v), x, z, 0.0, 0, V_MED, 1.8),
+                PropKind::Fern => plant!(Fern; props::fern(v), x, z, 0.0, 0, V_SM, 2.6),
+                other => panic!("groves() places {other:?}, which build_world has no mesh arm for"),
+            }
+            v += 1;
+        }
+    }
+
+    // Every scatter pass below goes through this: `jungle_spot`, minus the
+    // grove beds.
+    let jungle_spot = |rng: &mut Rng, min_clear: f32| -> Option<(f32, f32)> {
+        for _ in 0..8 {
+            let (x, z) = jungle_spot(rng, min_clear)?;
+            if !rooms.iter().any(|&(gx, gz, r)| (x - gx).hypot(z - gz) < r) {
+                return Some((x, z));
+            }
+        }
+        None
+    };
+
     // --- playable jungle flora ---
-    for _ in 0..56 {
+    for _ in 0..70 {
         if let Some((x, z)) = jungle_spot(&mut rng, 8.5) {
             plant!(JungleTree; props::jungle_tree(0.85 + rng.f32() * 0.35, v), x, z, 0.0, (v % 4) as u8, V_MED, 1.0);
             blockers.push_jungle_roots(x, z, 0.0, v);
         }
         v += 1;
     }
-    for _ in 0..18 {
+    for _ in 0..24 {
         if let Some((x, z)) = jungle_spot(&mut rng, 7.0) {
             plant!(Palm; props::palm(0.9 + rng.f32() * 0.3, v), x, z, 0.0, (v % 4) as u8, V_MED, 1.6);
         }
         v += 1;
     }
-    for _ in 0..12 {
+    for _ in 0..16 {
         if let Some((x, z)) = jungle_spot(&mut rng, 9.0) {
             plant!(StranglerFig; props::strangler_fig(0.9 + rng.f32() * 0.25, v), x, z, 0.0, (v % 4) as u8, V_MED, 0.8);
         }
         v += 1;
     }
-    for _ in 0..22 {
+    for _ in 0..30 {
         if let Some((x, z)) = jungle_spot(&mut rng, 6.0) {
             plant!(Bamboo; props::bamboo(1.0, v), x, z, 0.0, (v % 4) as u8, V_MED, 2.2);
         }
         v += 1;
     }
-    for _ in 0..120 {
+    for _ in 0..190 {
         if let Some((x, z)) = jungle_spot(&mut rng, 5.2) {
             plant!(Fern; props::fern(v), x, z, 0.0, 0, V_SM, 2.6);
         }
         v += 1;
     }
-    for _ in 0..100 {
+    for _ in 0..160 {
         if let Some((x, z)) = jungle_spot(&mut rng, 5.6) {
             plant!(Bush; props::bush(v), x, z, 0.0, 0, V_MED, 1.8);
         }
         v += 1;
     }
-    for _ in 0..46 {
+    for _ in 0..60 {
         if let Some((x, z)) = jungle_spot(&mut rng, 7.0) {
             put!(Rock; props::rock(0.7 + rng.f32() * 0.6), x, z, 0.0, 0, V_MED);
         }
         v += 1;
     }
     // boulder clusters: in the jungle, and worn ones along the river banks
-    for _ in 0..18 {
+    for _ in 0..24 {
         if let Some((x, z)) = jungle_spot(&mut rng, 8.0) {
             put!(BoulderCluster; props::boulder_cluster(0.8 + rng.f32() * 0.5, v), x, z, 0.0, (v % 4) as u8, V_MED);
         }
@@ -809,7 +974,7 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
     }
 
     // vine curtains strung between the trees
-    for _ in 0..34 {
+    for _ in 0..54 {
         if let Some((x, z)) = jungle_spot(&mut rng, 6.5) {
             plant!(VineCurtain; props::vine_curtain(v), x, z, 0.0, (v % 4) as u8, V_MED, 2.4);
         }
@@ -821,23 +986,25 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
         }
         v += 1;
     }
-    for _ in 0..11 {
+    for _ in 0..15 {
         if let Some((x, z)) = jungle_spot(&mut rng, 7.5) {
             // Not `put!`: the log's length is its scale, and the capsule
             // has to be as long as the mesh.
             let (ls, q) = (0.85 + rng.f32() * 0.3, (v % 4) as u8);
-            blockers.push_placed(PropKind::FallenLog, x, z, 0.0, q, ls);
-            pieces.push(Piece { mesh: props::fallen_log(ls), pos: Vec3::new(x, 0.0, z), quarter: q, vsize: V_MED, sway: 0.0 });
+            if log_fits(x, z, q, ls) {
+                blockers.push_placed(PropKind::FallenLog, x, z, 0.0, q, ls);
+                pieces.push(Piece { mesh: props::fallen_log(ls), pos: Vec3::new(x, 0.0, z), quarter: q, vsize: V_MED, sway: 0.0 });
+            }
         }
         v += 1;
     }
-    for _ in 0..14 {
+    for _ in 0..18 {
         if let Some((x, z)) = jungle_spot(&mut rng, 8.0) {
             plant!(Pine; props::pine(0.9 + rng.f32() * 0.5), x, z, 0.0, 0, V_MED, 0.9);
         }
         v += 1;
     }
-    for _ in 0..14 {
+    for _ in 0..18 {
         if let Some((x, z)) = jungle_spot(&mut rng, 8.0) {
             plant!(Oak; props::oak(0.9 + rng.f32() * 0.4), x, z, 0.0, 0, V_MED, 1.0);
         }
@@ -847,10 +1014,10 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
     // --- ruin camps deep in the jungle ---
     let mut camps: Vec<(f32, f32)> = Vec::new();
     let mut tries = 0usize;
-    while camps.len() < 7 && tries < 400 {
+    while camps.len() < 9 && tries < 400 {
         tries += 1;
         let a = rng.f32() * TAU;
-        let r = 30.0 + rng.f32() * 85.0;
+        let r = 30.0 + rng.f32() * (ARENA_RADIUS - 50.0);
         let (x, z) = (a.cos() * r, a.sin() * r);
         if consts::lane_clearance(x, z) < 17.0 || consts::river_dist(x, z) < 14.0 {
             continue;
@@ -898,15 +1065,17 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
     }
 
     // --- beyond the bounds: colossal landmarks ---
-    let zg = 196.0f32;
+    let o = consts::OUTER_SCALE;
+    let zg = 196.0f32 * o;
     let zign = Vec3::new(0.0, terrain_height(0.0, zg) - 3.0, zg);
     let zigs = Vec3::new(0.0, terrain_height(0.0, -zg) - 3.0, -zg);
     put!(Ziggurat; props::ziggurat(), zign.x, zign.z, zign.y, 2, V_BIG); // stair faces the valley
     put!(Ziggurat; props::ziggurat(), zigs.x, zigs.z, zigs.y, 0, V_BIG);
     let mut landmarks = vec![zign, zigs];
 
-    let h1 = Vec3::new(-164.0, terrain_height(-164.0, 66.0) - 2.0, 66.0);
-    let h2 = Vec3::new(164.0, terrain_height(164.0, -66.0) - 2.0, -66.0);
+    let (hx, hz) = (164.0 * o, 66.0 * o);
+    let h1 = Vec3::new(-hx, terrain_height(-hx, hz) - 2.0, hz);
+    let h2 = Vec3::new(hx, terrain_height(hx, -hz) - 2.0, -hz);
     put!(ColossusHead; props::colossus_head(), h1.x, h1.z, h1.y, 1, V_BIG); // face +X, toward the valley
     put!(ColossusHead; props::colossus_head(), h2.x, h2.z, h2.y, 3, V_BIG); // face -X
     landmarks.push(h1);
@@ -914,8 +1083,8 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
 
     for k in 0..5 {
         let a = TAU * (k as f32 / 5.0) + 0.45;
-        let x = a.cos() * 178.0;
-        let z = a.sin() * 178.0;
+        let x = a.cos() * 178.0 * o;
+        let z = a.sin() * 178.0 * o;
         let p = Vec3::new(x, 0.0, z);
         if landmarks.iter().any(|l| (Vec3::new(l.x, 0.0, l.z) - p).length() < 46.0) {
             continue;
@@ -955,6 +1124,33 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
             plant!(Bush; props::bush(v), x, z, terrain_height(x, z), 0, V_MED, 1.8);
         }
         v += 1;
+    }
+
+    // --- the treeline: the arena's edge as jungle, not as a colour change.
+    // Cheap props only (palm ~170 instances, bamboo ~160, bush ~130, pine
+    // ~380 against a jungle tree's ~1000): the ring is 1080 u round and has
+    // to be dense without spending the instance budget the playable jungle
+    // needs. Outside the floor, so it is scenery and blocks nobody who can
+    // reach it; skipped where the rivers leave the map.
+    {
+        let n = 150;
+        for i in 0..n {
+            let a = (i as f32 + rng.f32() * 0.8) / n as f32 * TAU;
+            let r = ARENA_RADIUS + 1.5 + rng.f32() * 9.0;
+            let (x, z) = (a.cos() * r, a.sin() * r);
+            if consts::river_dist(x, z) < 9.0 {
+                continue;
+            }
+            let y = terrain_height(x, z) - 0.2;
+            let q = (v % 4) as u8;
+            match i % 5 {
+                0 | 3 => plant!(Palm; props::palm(0.9 + rng.f32() * 0.35, v), x, z, y, q, V_MED, 1.6),
+                1 => plant!(Bamboo; props::bamboo(1.0 + rng.f32() * 0.3, v), x, z, y, q, V_MED, 2.2),
+                2 => plant!(Pine; props::pine(0.9 + rng.f32() * 0.5), x, z, y, 0, V_MED, 0.9),
+                _ => plant!(Bush; props::bush(v), x, z, y, 0, V_MED, 1.8),
+            }
+            v += 1;
+        }
     }
 
     // --- batch into spatial chunks per voxel-size class ---
@@ -1093,6 +1289,61 @@ mod plan_tests {
         let mut a = crate::voxel::Grid::new(5, 5, 5);
         a.filled_box(0, 0, 0, 4, 4, 4, [0.2, 0.6, 0.2, 0.5]);
         assert_eq!(a.mesh(0.5, true).inst.len(), 125, "nothing behind a translucent voxel is culled");
+    }
+
+    /// The lanes are the fast ground and stay that way: no rough patch, no
+    /// grove, no bramble anywhere on a lane's walk. Minions path by
+    /// waypoint and never steer, so this is also what keeps waves on time.
+    #[test]
+    fn the_lanes_are_open_going_and_the_jungle_is_not() {
+        use crate::going::Carriage;
+        let (_, _, b) = build_world();
+        let run = Carriage::default();
+        for lane in consts::LANES {
+            for p in consts::lane_path(lane, Team::Blue) {
+                assert_eq!(b.going_at(p.x, p.z, run), 1.0, "{lane:?} lane is rough at {p}");
+            }
+        }
+        // And the jungle is: sample the floor off the lanes.
+        let (mut n, mut rough) = (0, 0);
+        let mut rng = Rng::new(77);
+        while n < 4000 {
+            if let Some((x, z)) = jungle_spot(&mut rng, 6.0) {
+                n += 1;
+                rough += (b.going_at(x, z, run) < 0.99) as usize;
+            }
+        }
+        let frac = rough as f32 / n as f32;
+        println!("rough fraction of the jungle floor: {frac:.3} ({} patches)", b.going().len());
+        assert!(frac > 0.10 && frac < 0.55, "{frac}: the jungle should cost something, and not everywhere");
+    }
+
+    /// Groves are rooms, not pillars: every one has a gap wide enough for a
+    /// cat, and none crowds a lane or another grove.
+    #[test]
+    fn groves_have_a_way_in_and_keep_off_the_lanes() {
+        let mut rng = Rng::new(0x5EED_1234);
+        let gs = groves(&mut rng, 26);
+        assert!(gs.len() >= 20, "only {} groves fit", gs.len());
+        for (i, g) in gs.iter().enumerate() {
+            assert!(consts::lane_clearance(g.x, g.z) > 11.0);
+            for h in &gs[i + 1..] {
+                assert!((g.x - h.x).hypot(g.z - h.z) >= 20.0);
+            }
+            let mut angles: Vec<f32> = g.parts.iter().filter(|p| !matches!(p.0, PropKind::Bush | PropKind::Fern)).map(|p| (p.2 - g.z).atan2(p.1 - g.x)).collect();
+            angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            if angles.len() >= 2 {
+                let mut widest = angles[0] + std::f32::consts::TAU - angles[angles.len() - 1];
+                for w in angles.windows(2) {
+                    widest = widest.max(w[1] - w[0]);
+                }
+                // ring radius >= 5.2: an arc of 1.2 rad there is > 6 u.
+                assert!(widest > 1.2, "grove at ({:.0},{:.0}) is closed: widest gap {widest}", g.x, g.z);
+            }
+            for p in &g.parts {
+                assert!(jungle_ok(p.1, p.2, 5.0), "{:?} placed off the jungle at ({}, {})", p.0, p.1, p.2);
+            }
+        }
     }
 
     #[test]
