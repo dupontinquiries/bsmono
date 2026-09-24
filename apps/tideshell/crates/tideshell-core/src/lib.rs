@@ -46,6 +46,7 @@ pub mod shell;
 pub mod sidebar;
 pub mod sleep;
 pub mod switcher;
+pub mod tilecache;
 pub mod tilt;
 pub mod touchfilter;
 pub mod track;

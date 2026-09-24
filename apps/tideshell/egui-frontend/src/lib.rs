@@ -77,6 +77,7 @@ pub mod keys;
 #[cfg(feature = "sensors")]
 pub mod powerdoctor;
 pub mod ctl;
+pub mod blur;
 pub mod camera;
 pub mod damage;
 pub mod devices;
@@ -517,7 +518,7 @@ impl ShellView {
         self.frame_dt = dt_ms;
         self.press.retain(|_, s| !s.is_settled() || s.target < 1.0);
         // The grain is made once, here, because `cover` has only a painter.
-        if self.glass.is_some() && self.grain.is_none() {
+        if self.grain.is_none() && (self.glass.is_some() || tideshell_core::dimming::split(shell.drawer.brightness, shell.prefs.digital_dim).is_dimming()) {
             let _ = self.grain(ui.ctx());
         }
         // Contrast rises with the light and never dips: below the polarity
@@ -658,6 +659,18 @@ impl ShellView {
         if dim.is_dimming() {
             let a = (dim.veil_alpha() * 255.0).round().clamp(0.0, 255.0) as u8;
             ui.painter().rect_filled(ui.max_rect(), 0.0, egui::Color32::from_black_alpha(a));
+        }
+        // Grain LAST, after the veil. A veil multiplies everything toward
+        // black, so dither applied before it is dither that has been dimmed
+        // away — and the banding it exists to hide is worst exactly when the
+        // veil is heaviest, because the darkest greys are where 8-bit steps
+        // are widest relative to what the eye can see. The amount therefore
+        // rises with the dimming rather than staying fixed.
+        if let Some(grain) = self.grain.clone() {
+            let r = ui.max_rect();
+            let (tx, ty) = ((r.width() / 64.0).max(1.0), (r.height() / 64.0).max(1.0));
+            let amount = 14.0 + 26.0 * dim.veil_alpha();
+            ui.painter().image(grain.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(tx, ty)), Color32::from_white_alpha(amount as u8));
         }
         out
     }
@@ -848,10 +861,6 @@ impl ShellView {
             p.add(egui::Shape::mesh(mesh));
             // Grain, to break the banding a gradient this smooth shows on a
             // dim screen. One tiled texture, drawn at low alpha.
-            if let Some(grain) = &self.grain {
-                let (tx, ty) = ((r.width() / 64.0).max(1.0), (r.height() / 64.0).max(1.0));
-                p.image(grain.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(tx, ty)), Color32::from_white_alpha((alpha * 18.0) as u8));
-            }
             p.rect_filled(r, cr(0), Color32::from_black_alpha((alpha * 90.0) as u8));
         } else if let Some((tex, fw, fh)) = &self.camera_tex {
             let r = Rect::from_min_size(top, size);
