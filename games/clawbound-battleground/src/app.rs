@@ -716,7 +716,26 @@ fn compute_aim(s: &AppState) -> Vec3 {
     }
 }
 
+/// Put the world on map `m`: the active map (thread-local), the renderer's
+/// terrain/water/flood meshes, and the scene -- the old scene's GPU meshes
+/// freed first. A no-op when everything is already on `m`.
+fn switch_map(s: &mut AppState, m: crate::map::MapId) {
+    let same = crate::map::active() == m && s.renderer.world_map == m && s.scene.as_ref().map_or(true, |sc| sc.map == m);
+    if same {
+        return;
+    }
+    let t = Instant::now();
+    let old = s.scene.take();
+    s.scene = Some(crate::scene::switch_world(&mut s.renderer, old, m));
+    eprintln!("[clawbound] switched to {} in {:.1} s ({} meshes resident)", m.name(), t.elapsed().as_secs_f32(), s.renderer.mesh_count());
+}
+
 fn start_game(s: &mut AppState) {
+    // The map the select screen chose -- except with a LAN lobby open,
+    // where both peers must be on the same map and the picker is not synced
+    // between them: that match stays on the launch map.
+    let want = if s.lan.is_some() { s.launch.map } else { s.ui.map_choice };
+    switch_map(s, want);
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

@@ -73,6 +73,12 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("perf") {
         return run_perf();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("switch") {
+        return run_switch_check();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("select") {
+        return run_select_shot();
+    }
     let (_instance, _adapter, device, queue) =
         make_device().ok_or_else(|| "No suitable GPU backend found (install mesa-vulkan-drivers for lavapipe)".to_string())?;
     let adapter_info = {
@@ -1201,5 +1207,125 @@ pub fn run_perf() -> Result<(), String> {
             save_shot(&renderer.device, &renderer.queue, &target, &format!("perf_{:?}_{}.png", crate::map::active(), name.replace(' ', "_").replace('/', "-")))?;
         }
     }
+    Ok(())
+}
+
+/// The map switch, end to end through the real renderer: jungle, switch to
+/// the pass, switch back, the same camera each time. Checks the two maps
+/// render differently, the resident mesh count returns exactly to the
+/// jungle's (no leak), and the jungle renders the same before and after
+/// (a deterministic rebuild). Prints a verdict; Err if any check fails.
+/// `CLAWBOUND_SHOTS=switch clawbound-battleground --screenshot`
+pub fn run_switch_check() -> Result<(), String> {
+    use crate::map::MapId;
+    crate::map::set_active(MapId::Jungle);
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("switch"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let cam = Camera { eye: Vec3::new(0.0, 60.0, -150.0), target: Vec3::new(0.0, 0.0, -60.0), fov_y: 1.0 };
+    let mut scene: Option<Scene> = None;
+    let mut shots: Vec<(MapId, usize, Vec<u8>)> = Vec::new();
+    for (k, m) in [MapId::Jungle, MapId::Pass, MapId::Jungle].into_iter().enumerate() {
+        let t = std::time::Instant::now();
+        let sc = crate::scene::switch_world(&mut renderer, scene.take(), m);
+        let built = t.elapsed().as_secs_f32();
+        let game = Game::new_teams(&[0, 1, 2, 3, 4], &[5, 6, 7, 8, 9]);
+        let mut vfx = Vfx::default();
+        vfx.update(1.0 / 60.0, &[], &game);
+        renderer.clear_queues();
+        sc.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, 1.0);
+        let name = format!("switch_{k}_{}.png", m.key());
+        save_shot(&renderer.device, &renderer.queue, &target, &name)?;
+        let px = std::fs::read(&name).map_err(|e| e.to_string())?;
+        if k == 0 {
+            // control: the same map, same camera, rendered again with NO
+            // switch -- what frame-to-frame variation looks like on its own
+            let game2 = Game::new_teams(&[0, 1, 2, 3, 4], &[5, 6, 7, 8, 9]);
+            let mut vfx2 = Vfx::default();
+            vfx2.update(1.0 / 60.0, &[], &game2);
+            renderer.clear_queues();
+            sc.draw(&mut renderer, &game2, &mut vfx2, cam);
+            renderer.atmosphere = game2.weather.atmosphere();
+            renderer.render_frame(&view, cam, 1.0);
+            save_shot(&renderer.device, &renderer.queue, &target, "switch_0_control.png")?;
+        }
+        println!("{name}: {} built in {built:.1} s, {} meshes resident, world geometry for {:?}", m.name(), renderer.mesh_count(), renderer.world_map);
+        shots.push((m, renderer.mesh_count(), px));
+        scene = Some(sc);
+    }
+    let differ = shots[0].2 != shots[1].2;
+    let no_leak = shots[0].1 == shots[2].1;
+    // Pixel-identical is too strict: the control (the same frame again, no
+    // switch) is not identical either. The round trip must differ from the
+    // first frame by no more than the control does, give or take.
+    let decode = |path: &str| -> Result<Vec<u8>, String> {
+        let img = image::open(path).map_err(|e| e.to_string())?.to_rgba8();
+        Ok(img.into_raw())
+    };
+    let first = decode("switch_0_jungle.png")?;
+    let control = decode("switch_0_control.png")?;
+    let back = decode("switch_2_jungle.png")?;
+    let differing = |a: &[u8], b: &[u8]| a.chunks(4).zip(b.chunks(4)).filter(|(p, q)| p.iter().zip(q.iter()).any(|(x, y)| x.abs_diff(*y) > 8)).count();
+    let (noise, trip) = (differing(&first, &control), differing(&first, &back));
+    println!("pixels differing by > 8: control (no switch) {noise}, round trip {trip}");
+    let same_back = trip <= noise * 2 + 50;
+    println!("maps render differently: {differ}; mesh count back to the jungle's ({} -> {} -> {}): {no_leak}; jungle identical after the round trip: {same_back}", shots[0].1, shots[1].1, shots[2].1);
+    if differ && no_leak && same_back {
+        Ok(())
+    } else {
+        Err("map switch check failed".into())
+    }
+}
+
+/// The select screen, with the map picker, on a cleared frame.
+pub fn run_select_shot() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut egui_renderer = egui_wgpu::Renderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, None, 1);
+    let renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("select"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let ctx = egui::Context::default();
+    let mut st = UiState::new();
+    st.map_choice = crate::map::MapId::Pass;
+    clear(&renderer.device, &renderer.queue, &view);
+    let mut textures = egui::TexturesDelta::default();
+    let mut out = None;
+    let mut locked = false;
+    for k in 0..2 {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W as f32, H as f32))),
+            time: Some(k as f64 * 0.016),
+            ..Default::default()
+        };
+        let o = ctx.run(raw, |c| ui::draw_select(c, &mut st, &mut locked));
+        textures.append(o.textures_delta.clone());
+        out = Some(o);
+    }
+    let mut out = out.expect("ran");
+    out.textures_delta = textures;
+    draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
+    save_shot(&renderer.device, &renderer.queue, &target, "select_map_picker.png")?;
+    println!("saved select_map_picker.png");
     Ok(())
 }

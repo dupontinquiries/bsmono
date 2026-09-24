@@ -64,6 +64,8 @@ pub struct Floater {
 
 #[derive(Default)]
 pub struct UiState {
+    /// The map the next match is played on (the select screen's picker).
+    pub map_choice: crate::map::MapId,
     /// the player's display name from the game centre, if launched from it
     pub player_label: Option<String>,
     pub shop_open: bool,
@@ -87,6 +89,7 @@ pub struct UiState {
 impl UiState {
     pub fn new() -> UiState {
         UiState {
+            map_choice: crate::map::active(),
             shop_tab: items::Cat::Strength,
             selected: 0,
             pick: GridPicker::new(3),
@@ -413,7 +416,9 @@ pub fn draw_select(ctx: &egui::Context, ui_state: &mut UiState, locked: &mut boo
             });
             ui.add_space(2.0);
         }
-        ui.add_space(14.0);
+        ui.add_space(12.0);
+        map_picker(ui, &mut ui_state.map_choice);
+        ui.add_space(10.0);
         let lock = ui.add_sized([300.0, 48.0], egui::Button::new(egui::RichText::new("LOCK IN").size(22.0).color(Color32::BLACK).strong()).fill(GOLD));
         glow_hover(ui, &lock, GOLD, 8.0);
         ui.label(egui::RichText::new("Enter also locks in · type to search · ← → ↑ ↓ to browse").size(11.0).color(Color32::from_rgb(140, 138, 130)));
@@ -1155,4 +1160,36 @@ pub fn draw_intro_overlay(ctx: &egui::Context, o: &crate::intro::Overlay) {
     if o.skip_hint > 0.01 {
         p.text(Pos2::new(screen.max.x - 20.0, screen.max.y - 14.0), Align2::RIGHT_BOTTOM, "tap or press any key to skip", FontId::proportional(13.0), Color32::from_rgba_unmultiplied(200, 196, 186, a(o.skip_hint * 0.7)));
     }
+}
+
+/// One line on each map, for the picker.
+pub fn map_blurb(m: crate::map::MapId) -> &'static str {
+    match m {
+        crate::map::MapId::Jungle => "the valley: three lanes through deep jungle",
+        crate::map::MapId::Pass => "the mountains: a canyon between twin peaks",
+    }
+}
+
+/// The map picker on the select screen: a card per map, the chosen one lit.
+pub fn map_picker(ui: &mut egui::Ui, choice: &mut crate::map::MapId) {
+    ui.label(egui::RichText::new("BATTLEGROUND").size(16.0).color(GOLD));
+    ui.horizontal(|ui| {
+        for m in crate::map::MapId::ALL {
+            let sel = *choice == m;
+            // wide enough for the blurb (210 overflowed it)
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(236.0, 58.0), Sense::click());
+            let t = hover_t(ui.ctx(), egui::Id::new("map_card").with(m.key()), resp.hovered());
+            let p = ui.painter();
+            p.rect_filled(rect, 8.0, if sel { Color32::from_rgb(58, 52, 36) } else { Color32::from_rgb(34, 33, 40).linear_multiply(1.0 + 0.3 * t) });
+            p.rect_stroke(rect, 8.0, Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { GOLD } else { Color32::from_rgb(80, 78, 70) }));
+            let n = m.team_size();
+            p.text(rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, m.name(), FontId::proportional(15.0), if sel { GOLD } else { Color32::from_rgb(220, 216, 205) });
+            p.text(rect.right_top() + Vec2::new(-10.0, 9.0), Align2::RIGHT_TOP, format!("{n} v {n}"), FontId::proportional(12.0), Color32::from_rgb(180, 176, 165));
+            p.text(rect.left_top() + Vec2::new(10.0, 32.0), Align2::LEFT_TOP, map_blurb(m), FontId::proportional(10.5), Color32::from_rgb(160, 156, 146));
+            if resp.clicked() {
+                *choice = m;
+            }
+            ui.add_space(6.0);
+        }
+    });
 }
