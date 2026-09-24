@@ -728,3 +728,39 @@ pub fn aqueduct_arch() -> VoxelMesh {
     }
     g.mesh(1.2, true)
 }
+
+/// A small mountain waterfall, `h` world units tall, falling down a cliff
+/// face onto the floor: a narrow sheet of pale water, streaked, fraying as
+/// it falls, with a skirt of white spray where it lands. Built at the small
+/// voxel size (0.35) so the streaks read. `feet_origin`: y = 0 is the pool.
+pub fn waterfall(h: f32, variant: i32) -> VoxelMesh {
+    const VOX: f32 = 0.35;
+    let ny = ((h / VOX).ceil() as usize).clamp(6, 64);
+    let mut g = Grid::new(9, ny + 2, 7);
+    let pale = [0.72, 0.84, 0.92];
+    let deep = [0.46, 0.62, 0.76];
+    let foam = [0.93, 0.96, 0.98];
+    for y in 0..ny as i32 {
+        let t = y as f32 / ny as f32; // 0 at the pool, 1 at the lip
+        // narrow at the lip, fraying wider toward the pool
+        let half = 1.0 + (1.0 - t) * 1.6;
+        for x in 0..9 {
+            let dx = x as f32 - 4.0;
+            if dx.abs() > half {
+                continue;
+            }
+            // streaks: columns alternate pale and deep, drifting with height
+            let streak = ((x as i32 + variant + y / 3) % 3) == 0;
+            let c = if streak { deep } else { pale };
+            // the sheet is one voxel thick against the cliff (z = 1), with a
+            // second layer where it frays so it is not paper from the side
+            g.set(x, y, 1, solid(c));
+            if t < 0.45 && ((x + y) % 2 == 0) {
+                g.set(x, y, 2, solid(mix(c, foam, 0.5)));
+            }
+        }
+    }
+    // spray where it lands
+    g.ellipsoid(4.0, 0.8, 2.5, 3.6, 1.4, 2.6, solid(foam));
+    g.mesh(VOX, true)
+}

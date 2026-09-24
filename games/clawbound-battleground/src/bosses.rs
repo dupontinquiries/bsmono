@@ -121,6 +121,9 @@ pub struct Bosses {
 /// The two pits, found deterministically in the west / east jungle at the
 /// map's equator so both bases have the same walk.
 pub fn pit_positions() -> [Vec3; 2] {
+    if crate::map::active() == crate::map::MapId::Pass {
+        return crate::pass::pit_positions();
+    }
     let mut rng = Rng::new(0xB0A2);
     let s = MAP_SCALE;
     let bands: [((f32, f32), (f32, f32)); 2] = [((-70.0, -42.0), (-8.0, 8.0)), ((42.0, 70.0), (-8.0, 8.0))];

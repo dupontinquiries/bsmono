@@ -132,11 +132,30 @@ pub struct Weather {
 
 pub const BLEND_SECS: f32 = 8.0;
 
+/// What the sky drifts between, as a bag to draw from: a kind listed twice
+/// is twice as likely. The jungle's is every kind once. The pass is cold and
+/// grey: mostly overcast, fog and snow, clear now and then, rain rarely.
+pub fn climate() -> &'static [WeatherKind] {
+    use WeatherKind::*;
+    match crate::map::active() {
+        crate::map::MapId::Jungle => &ALL_KINDS,
+        crate::map::MapId::Pass => &[Overcast, Overcast, Overcast, Fog, Fog, Fog, Snow, Snow, Clear, Rain],
+    }
+}
+
+/// How a match opens.
+pub fn opening() -> WeatherKind {
+    match crate::map::active() {
+        crate::map::MapId::Jungle => WeatherKind::Clear,
+        crate::map::MapId::Pass => WeatherKind::Overcast,
+    }
+}
+
 impl Weather {
     pub fn new() -> Weather {
         Weather {
-            kind: WeatherKind::Clear,
-            prev: WeatherKind::Clear,
+            kind: opening(),
+            prev: opening(),
             blend: 1.0,
             next_change_t: 75.0,
             forced_until: 0.0,
@@ -200,7 +219,7 @@ impl Weather {
 
         // natural drift, unless a map event holds the sky
         if t >= self.next_change_t && t >= self.forced_until {
-            let mut next = *rng.pick(&ALL_KINDS);
+            let mut next = *rng.pick(climate());
             // storms are rare on their own; fog and snow only occasionally
             if matches!(next, WeatherKind::Storm) && rng.f32() < 0.6 {
                 next = WeatherKind::Rain;
@@ -386,5 +405,40 @@ mod tests {
         w.set(WeatherKind::Clear);
         w.blend = 1.0;
         assert!((w.vision_mul() - 1.0).abs() < 1e-4);
+    }
+}
+
+#[cfg(test)]
+mod climate_tests {
+    use super::*;
+
+    /// Over a long match the pass is grey most of the time and still sees
+    /// fog and snow; the jungle still sees every kind.
+    #[test]
+    fn the_pass_is_bleak_and_the_jungle_is_not() {
+        let run = |m: crate::map::MapId| {
+            crate::map::with(m, || {
+                let mut w = Weather::new();
+                let mut rng = Rng::new(7);
+                let mut out = Vec::new();
+                let mut secs = std::collections::HashMap::new();
+                let mut t = 0.0;
+                while t < 4.0 * 3600.0 {
+                    w.tick(1.0, t, &mut rng, &mut out);
+                    *secs.entry(w.kind.name()).or_insert(0.0f32) += 1.0;
+                    t += 1.0;
+                }
+                (w.kind, secs)
+            })
+        };
+        let (_, pass) = run(crate::map::MapId::Pass);
+        let total: f32 = pass.values().sum();
+        let grey = ["Overcast", "Fog", "Snow"].iter().map(|k| pass.get(k).copied().unwrap_or(0.0)).sum::<f32>() / total;
+        assert!(grey > 0.6, "the pass is grey {grey:.2} of the time");
+        assert!(pass.get("Fog").copied().unwrap_or(0.0) / total > 0.12, "fog comes through");
+        assert!(pass.get("Snow").copied().unwrap_or(0.0) / total > 0.08, "and snow");
+        let (_, jungle) = run(crate::map::MapId::Jungle);
+        assert!(jungle.len() >= 5, "the jungle's sky still wanders: {jungle:?}");
+        assert_eq!(crate::map::with(crate::map::MapId::Pass, Weather::new).kind, WeatherKind::Overcast);
     }
 }

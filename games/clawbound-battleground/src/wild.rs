@@ -46,6 +46,9 @@ pub struct HealTree {
 /// pockets clear of lanes, rivers and bases, then mirrored through the
 /// centre so both sides have the same walk.
 pub fn heal_tree_positions() -> [Vec3; 6] {
+    if crate::map::active() == crate::map::MapId::Pass {
+        return crate::pass::heal_tree_positions();
+    }
     let mut rng = Rng::new(0x7EE5);
     let s = MAP_SCALE;
     // (x range, z range) in unscaled map units, Blue half
@@ -168,7 +171,7 @@ impl Wild {
             let r = 26.0 + rng.f32() * (ARENA_RADIUS - 40.0);
             let x = a.cos() * r;
             let z = a.sin() * r;
-            if lane_clearance(x, z) > 7.0 && river_dist(x, z) > 8.0 && !crate::bosses::in_pit(x, z) {
+            if lane_clearance(x, z) > 7.0 && river_dist(x, z) > 8.0 && !crate::bosses::in_pit(x, z) && crate::map::open_ground(x, z, 2.0) {
                 return Some(Vec3::new(x, 0.0, z));
             }
         }

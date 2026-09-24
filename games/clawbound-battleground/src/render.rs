@@ -1365,6 +1365,9 @@ pub fn sort_far_to_near<T>(items: &mut [(f32, T)]) {
 /// beyond the arena bounds, a mountain rim at the horizon, and river valleys
 /// that dip under the lanes (roads stay solid — bridges span the crossings).
 pub fn terrain_height(x: f32, z: f32) -> f32 {
+    if crate::map::active() == crate::map::MapId::Pass {
+        return crate::pass::terrain_height(x, z);
+    }
     use crate::consts::{river_dist, GROUND_HALF, RIVER_HALF_WIDTH, RIVER_DEPTH, ARENA_RADIUS, RIM_RADIUS};
     let r = (x * x + z * z).sqrt();
     let mut h = 0.0f32;
@@ -1487,7 +1490,9 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
 
             let mut color;
             let mut mat = 0.0f32;
-            if r > crate::consts::RIM_RADIUS + 3.0 && h > 14.0 {
+            if crate::map::active() == crate::map::MapId::Pass {
+                (color, mat) = pass_ground_color(x, z, h, slope, n1, n2, nm);
+            } else if r > crate::consts::RIM_RADIUS + 3.0 && h > 14.0 {
                 // mountain rim: dark jungle rock with forest ledges
                 let rock = [0.24 + n1 * 0.05, 0.24 + n2 * 0.04, 0.22 + n1 * 0.03];
                 let forest = [0.085 + n1 * 0.03, 0.17 + n2 * 0.05, 0.075];
@@ -1612,7 +1617,96 @@ struct WaterVert {
     uv: [f32; 2],
 }
 
+/// Twinfang Pass ground: smooth grey stone underfoot, a little tough grass
+/// in the clearings, dark wet rock on the cliff faces, paler weathered rock
+/// on the plateau, snow on the heights and in the high hollows. Cold and
+/// desaturated on purpose; the only saturated colour on this map is a cat.
+fn pass_ground_color(x: f32, z: f32, h: f32, slope: f32, n1: f32, n2: f32, nm: f32) -> ([f32; 3], f32) {
+    let d = crate::pass::floor().sdf(x, z);
+    let lerp = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    if d <= 0.3 {
+        // the floor
+        let stone = [0.40 + n1 * 0.05, 0.41 + n1 * 0.05, 0.43 + n2 * 0.04];
+        let rd = crate::pass::river_dist(x, z);
+        if rd < crate::pass::STREAM_HALF_WIDTH + 1.2 {
+            // stream bed: dark, water-polished pebble
+            return ([0.24 + n2 * 0.05, 0.26 + n2 * 0.05, 0.28 + n1 * 0.04], 2.0);
+        }
+        // grass only away from the lanes, in the clearings' hearts, patchy
+        let away = (crate::consts::lane_clearance(x, z) - 6.0).clamp(0.0, 6.0) / 6.0;
+        let grass_t = (smoothstep(0.55, 0.78, nm) * away * smoothstep(-1.0, -3.5, d)).clamp(0.0, 1.0);
+        let grass = [0.27 + n1 * 0.04, 0.33 + n2 * 0.05, 0.22];
+        // a darker margin where the cliff meets the floor: scree and damp
+        let foot = smoothstep(-2.5, 0.3, d) * 0.25;
+        let c = lerp(stone, grass, grass_t * 0.85);
+        return ([c[0] * (1.0 - foot), c[1] * (1.0 - foot), c[2] * (1.0 - foot * 0.8)], if grass_t > 0.5 { 0.0 } else { 5.0 });
+    }
+    let face = [0.25 + n1 * 0.04, 0.26 + n1 * 0.04, 0.29 + n2 * 0.04];
+    let top = [0.38 + n1 * 0.06, 0.38 + n1 * 0.05, 0.39 + n2 * 0.05];
+    let snow = [0.84 + n2 * 0.06, 0.86 + n2 * 0.06, 0.90 + n2 * 0.05];
+    // faces are the steep parts; tops the flat ones
+    let c = lerp(top, face, smoothstep(0.08, 0.35, slope));
+    // snow: certain above the snowline, in patches on flat high ground below it
+    let snowline = 44.0 + n1 * 10.0;
+    let patchy = smoothstep(20.0, 30.0, h) * smoothstep(0.72, 0.88, nm) * (1.0 - smoothstep(0.1, 0.3, slope));
+    let snow_t = smoothstep(snowline - 6.0, snowline + 4.0, h).max(patchy) * (1.0 - smoothstep(0.35, 0.6, slope) * 0.6);
+    (lerp(c, snow, snow_t), if snow_t > 0.5 { 6.0 } else { 4.0 })
+}
+
+/// The pass's streams: a strip of water over each, 0.5 u cells, cut to the
+/// wet part like the jungle's rivers. The lip-to-pool stretch is the
+/// waterfall and is a prop, not a strip.
+fn build_pass_water() -> (Vec<WaterVert>, Vec<u32>) {
+    use crate::consts::WATER_LEVEL;
+    const STEP: f32 = 0.5;
+    let half_w = crate::pass::STREAM_HALF_WIDTH + 1.4;
+    let mut verts = Vec::new();
+    let mut idx = Vec::new();
+    for s in crate::pass::streams() {
+        for w in s[1..].windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let along = b - a;
+            let len = along.length();
+            if len < 1e-3 {
+                continue;
+            }
+            let dir = along / len;
+            let side = Vec3::new(-dir.z, 0.0, dir.x);
+            // overlap the ends a little so the joints have no gaps
+            let (s0, s1) = (-half_w * 0.6, len + half_w * 0.6);
+            let nl = ((s1 - s0) / STEP) as usize + 1;
+            let nw = (half_w * 2.0 / STEP) as usize + 1;
+            let base = verts.len() as u32;
+            for il in 0..nl {
+                for iw in 0..nw {
+                    let p = a + dir * (s0 + il as f32 * STEP) + side * (-half_w + iw as f32 * STEP);
+                    verts.push(WaterVert {
+                        pos: [p.x, WATER_LEVEL, p.z],
+                        bed: terrain_height(p.x, p.z),
+                        flow: [dir.x, dir.z],
+                        uv: [(iw as f32 * STEP - half_w) / half_w, (s0 + il as f32 * STEP) * 0.05],
+                    });
+                }
+            }
+            for il in 0..nl - 1 {
+                for iw in 0..nw - 1 {
+                    let i = |l: usize, w: usize| base + (w + nw * l) as u32;
+                    let (qa, qb, qc, qd) = (i(il, iw), i(il, iw + 1), i(il + 1, iw), i(il + 1, iw + 1));
+                    let dry = [qa, qb, qc, qd].iter().all(|&k| verts[k as usize].bed > WATER_LEVEL + 0.05);
+                    if !dry {
+                        idx.extend_from_slice(&[qa, qc, qb, qb, qc, qd]);
+                    }
+                }
+            }
+        }
+    }
+    (verts, idx)
+}
+
 fn build_water() -> (Vec<WaterVert>, Vec<u32>) {
+    if crate::map::active() == crate::map::MapId::Pass {
+        return build_pass_water();
+    }
     use crate::consts::{river_x, GROUND_HALF, RIVER_HALF_WIDTH, WATER_LEVEL};
     const STEP: f32 = 1.0;
     let half_w = RIVER_HALF_WIDTH + 6.0;

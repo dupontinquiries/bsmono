@@ -124,6 +124,9 @@ pub fn on_link(x: f32, z: f32) -> bool {
 }
 
 pub fn reserved(x: f32, z: f32) -> bool {
+    if crate::map::active() != crate::map::MapId::Jungle {
+        return false; // the Hollow is the jungle's
+    }
     if x.hypot(z) < HOLLOW_RADIUS {
         return true;
     }

@@ -123,7 +123,15 @@ pub struct Memory {
     pub since: f32,
     /// How many plans this bot has needed, for tuning and tests.
     pub plans: u32,
+    /// Floor-route waypoint (`floor::next_waypoint`), cached: routing every
+    /// bot every tick doubled a 15v15's sim cost. Refreshed every
+    /// `ROUTE_EVERY` s or when reached.
+    pub route_wp: Option<glam::Vec3>,
+    pub route_t: f32,
 }
+
+/// Seconds between floor-route refreshes for one bot.
+pub const ROUTE_EVERY: f32 = 0.35;
 
 /// A planned detour is followed at most this long before the direct fan is
 /// trusted again -- the goal moves, and a stale path is its own trap.

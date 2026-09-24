@@ -13,9 +13,17 @@ use glam::Vec3;
 fn main() {
     let seed: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
     let minutes: f32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(6.0);
-    eprintln!("building the world's blockers...");
+    // CLAWBOUND_MAP=pass for Twinfang Pass (15 a side).
+    let map = std::env::var("CLAWBOUND_MAP").ok().and_then(|k| clawbound::map::MapId::from_key(&k)).unwrap_or_default();
+    clawbound::map::set_active(map);
+    eprintln!("building the world's blockers ({})...", map.name());
     let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
-    let mut game = Game::new((seed % 13) as u32, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    let mut game = if map == clawbound::map::MapId::Jungle {
+        Game::new((seed % 13) as u32, [1, 2, 3, 4], [5, 6, 7, 8, 9])
+    } else {
+        let (b, r) = clawbound::map::team_picks((seed % 13) as u32, &mut Rng::new(seed));
+        Game::new_teams(&b, &r)
+    };
     game.rng = Rng::new(0xC0FFEE ^ seed.wrapping_mul(7919));
     game.blockers = blockers.clone();
     game.gods[0].ai = Some(AiBrain { lane: clawbound::consts::Lane::Mid, aggression: 0.9, state: AiState::Push, target: None, strafe_dir: 1.0, strafe_t: 0.0, buy_t: 1.0, wp: 0 });
@@ -65,6 +73,15 @@ fn main() {
             break;
         }
     }
+    // Living cats only: a dead cat's position is where it fell, and is
+    // not moved again until it respawns at its fountain.
+    for (i, g) in game.gods.iter().enumerate() {
+        if !clawbound::map::open_ground(g.pos.x, g.pos.z, 0.0) {
+            println!("  off the floor: god {i} at ({:.1},{:.1}) respawn_t {:.1} leap {} dash {} fall {}", g.pos.x, g.pos.z, g.respawn_t, g.leap.is_some(), g.dash.is_some(), g.fall.is_some());
+        }
+    }
+    let off_floor = game.gods.iter().filter(|g| g.respawn_t <= 0.0 && !clawbound::map::open_ground(g.pos.x, g.pos.z, 0.0)).count();
+    println!("{} cats, {} living ended off the floor", game.gods.len(), off_floor);
     println!(
         "seed {seed}: {windows} moving bot-seconds, {stalls} stalled ({:.1}%), {:.0} s on rough ground, mean going underfoot {:.3}",
         100.0 * stalls as f32 / windows.max(1) as f32,

@@ -71,6 +71,9 @@ pub fn river_x(side: f32, z: f32) -> f32 {
 
 /// Distance from (x, z) to the nearest river centerline (both rivers).
 pub fn river_dist(x: f32, z: f32) -> f32 {
+    if crate::map::active() == crate::map::MapId::Pass {
+        return crate::pass::river_dist(x, z);
+    }
     (x - river_x(-1.0, z)).abs().min((x - river_x(1.0, z)).abs())
 }
 
@@ -119,18 +122,27 @@ impl Team {
     }
     /// Fountain (heal / respawn) position.
     pub fn fountain(self) -> Vec3 {
+        if crate::map::active() == crate::map::MapId::Pass {
+            return crate::pass::fountain(self);
+        }
         match self {
             Team::Blue => Vec3::new(0.0, 0.0, -88.0 * MAP_SCALE),
             Team::Red => Vec3::new(0.0, 0.0, 88.0 * MAP_SCALE),
         }
     }
     pub fn titan_pos(self) -> Vec3 {
+        if crate::map::active() == crate::map::MapId::Pass {
+            return crate::pass::titan_pos(self);
+        }
         match self {
             Team::Blue => Vec3::new(0.0, 0.0, -74.0 * MAP_SCALE),
             Team::Red => Vec3::new(0.0, 0.0, 74.0 * MAP_SCALE),
         }
     }
     pub fn base_pos(self) -> Vec3 {
+        if crate::map::active() == crate::map::MapId::Pass {
+            return crate::pass::base_pos(self);
+        }
         match self {
             Team::Blue => Vec3::new(0.0, 0.0, -82.0 * MAP_SCALE),
             Team::Red => Vec3::new(0.0, 0.0, 82.0 * MAP_SCALE),
@@ -172,6 +184,9 @@ impl Lane {
     }
     /// Canonical polyline from Blue base toward Red base.
     pub fn polyline(self) -> Vec<Vec3> {
+        if crate::map::active() == crate::map::MapId::Pass {
+            return crate::pass::lane_polyline(self);
+        }
         match self {
             Lane::Mid => vec![
                 Vec3::new(0.0, 0.0, -68.0),
@@ -240,8 +255,9 @@ fn push_sampled(out: &mut Vec<Vec3>, from: Vec3, to: Vec3, step: f32) {
 /// Cached per (lane, team) dense waypoints (6 combos, built once).
 pub fn lane_path(lane: Lane, team: Team) -> &'static [Vec3] {
     use std::sync::OnceLock;
-    static PATHS: OnceLock<Vec<Vec<Vec3>>> = OnceLock::new();
-    let all = PATHS.get_or_init(|| {
+    // One cache per map: the paths are the map's.
+    static PATHS: [OnceLock<Vec<Vec<Vec3>>>; 2] = [OnceLock::new(), OnceLock::new()];
+    let all = PATHS[crate::map::active() as usize].get_or_init(|| {
         let mut v = Vec::new();
         for lane in LANES {
             for team in [Team::Blue, Team::Red] {
@@ -255,6 +271,9 @@ pub fn lane_path(lane: Lane, team: Team) -> &'static [Vec3] {
 
 /// (lane, team) → tower world position. Two towers per lane per team.
 pub fn tower_pos(lane: Lane, team: Team, inner: bool) -> Vec3 {
+    if crate::map::active() == crate::map::MapId::Pass {
+        return crate::pass::tower_pos(lane, team, inner);
+    }
     use Lane::*;
     let zflip = |v: Vec3| -> Vec3 {
         match team {

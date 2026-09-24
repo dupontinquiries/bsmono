@@ -18,6 +18,12 @@ pub mod props;
 pub mod blockers;
 /// The walkable floor of a map carved out of rock, as an exact SDF.
 pub mod floor;
+/// Which map this thread is playing; the free map functions dispatch on it.
+pub mod map;
+/// Twinfang Pass: the mountain canyon map, 15 a side.
+pub mod pass;
+/// The pass's world: where its rocks, scrub, pines and waterfalls stand.
+pub mod passworld;
 /// Rough ground: what the jungle costs to cross, where blockers is what it forbids.
 pub mod going;
 /// The state behind the LAN screen (discovery is `netcode::lan`).
