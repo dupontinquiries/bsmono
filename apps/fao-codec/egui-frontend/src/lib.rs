@@ -81,9 +81,10 @@ pub mod archive;
 // cancellable, with live progress / per-frame cost / decoded preview, and
 // "Open in Player". It encodes with the one codec the port has (intra DCT);
 // the GTK dialog's v2.0-v8 / v9 codec choices are still not ported and the
-// page says so. Since then: T-frames (v2.1) on that page, and the Archive
-// tab (New / Open Archive, Add Video, finished encodes added -- the GTK
-// Export flow). The web view remains unported.
+// page says so. Since then: the Archive tab (New / Open Archive, Add Video,
+// finished encodes added -- the GTK Export flow), and with the hive merge
+// the encoder became the streaming compact/fast transcoder. The web view
+// remains unported. PORT_STATUS.md has the current picture.
 pub enum Tab {
     Encode,
     Lab,

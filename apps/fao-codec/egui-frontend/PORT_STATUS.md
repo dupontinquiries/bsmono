@@ -52,55 +52,54 @@ offline Rust 1.96 toolchain — it builds headless, GTK does not.
 ## Encode page (c20unified)
 
 The tester's report ("I can only do a test frame that doesn't even have feedback") was about
-this page not existing. It does now, as the default tab:
-- a video path (probed with ffprobe as you type: size, fps, duration, codec, frame estimate),
-  quality, a first-N-frames cap, an output path derived from the input unless edited;
-- Encode runs on a worker thread; the page shows a progress bar with fps and ETA, bytes so
-  far, mean and last-frame PSNR, a per-frame cost sparkline, and the DECODED output (what the
-  .fao will show) refreshed every 250 ms; Cancel stops between frames and writes nothing;
-- done: frames, size, ratio against the input file, bpp, mean PSNR, and **Open in Player**.
+this page not existing. It does now, as the default tab (`encode_page.rs`):
+- a video path, probed with ffprobe as you type (size, fps, duration, codec, frame estimate),
+  quality, a first-N-frames cap, compact or fast mode, and an output path derived from the
+  input unless edited;
+- Encode runs on a worker thread and the page shows progress with fps and ETA; Cancel stops
+  between frames; the output is written to `<name>.fao.part` and renamed only on success, so a
+  crash mid-encode never leaves a half file under the real name;
+- done: frames, size against the input file, bpp, mean PSNR, patch and repeat counts, **Open
+  in Player**, and -- with an archive open -- the file added to it.
 
-Underneath, `transcode.rs` now streams: `FrameReader` pulls one frame at a time from ffmpeg's
-pipe (the old path held the whole decoded video in memory — ~3.7 GB for 20 s of 1080p), kills
-ffmpeg on cancel/drop, and drains stderr on a thread. `transcode()` keeps its signature on top
-of the streaming path, so its original tests exercise the new code; a new test checks the
-streamed frames are byte-identical to the old whole-file decode.
+The encoder underneath is the hive line's streaming `transcode_cancellable_with` (see below).
+A live per-frame cost graph and a decoded-output preview existed here before the merge and
+were dropped with it: that transcoder's progress callback reports frame counts only. A
+per-frame hook in its loop would bring them back.
 
-Still honest about scope: the codec is intra DCT only. The GTK dialog's v2.0–v8 codec versions
-and the v9 trailer are not ported (their encoders live in fao_app's main.rs), and the page
-states that instead of offering choices that would all do the same thing.
+The GTK dialog's codec versions (v2.0–v8, the v9 trailer) are still not ported; their
+encoders live in fao_app's main.rs. The page says so rather than offering choices that would
+all do the same thing.
 
-## Inter frames on the Encode page (c20unified)
+## From the hive line (merged c20unified, e74b33b9c)
 
-T-frames are the v2.1 predictive format the Player already decodes (`TranslatedFrame`: anchor
-index, 16×16 motion vectors, luma residual, `'T'`). `transcode::FrameEncoder` decides per frame,
-and every decision carries its reason (shown live on the page):
-- I (`'D'`, DCT) for the first frame, past the GOP limit, past frame 65535 (anchors are u16),
-  or when the T-frame fails the policy;
-- T only if smaller than the anchor's I-frame AND its PSNR -- measured by parsing and decoding
-  the T bytes exactly as the Player will -- is within `max_psnr_drop` (default 3 dB) of the
-  anchor's. The library's own `try_translate_frame` rejects only below 8 dB, which is noise;
-- a T always references an I-frame, never another T: one level of recursion in the Player.
+A sibling session did most of the codec-side work, documented in `../docs/` (CODEC_FORMATS,
+ARCHITECTURE). What it changed about THIS port, from its commits:
+- `transcode.rs` streams frames in and writes the container out as it goes, so memory is one
+  frame whatever the length; cancellable; parallel in fast mode;
+- **compact mode is the default** (`MOTION_DEFAULT`): patch frames predicted from the
+  previous decoded frame, plus key frames and one-byte repeat frames; measured at 1080p,
+  a camera pan 40% smaller at +2 dB against fast mode, at about half the speed;
+- a **Media** tab: local folders and dufs servers, glob patterns, encode selected matches;
+- the Player opens files of any length (lazy anchors, the dictionary and V8 trailers read
+  without the whole file) and plays a `.fao` straight off an HTTP server with range requests;
+- a codec catalogue picker and an exporter.
 
-The encoder predicts from the anchor AS THE PLAYER RECONSTRUCTS IT (decode to RGB, back to
-YUV), not from its own YUV reconstruction; a test decodes the written container through the
-Player's FaoFile/decode_rgb and requires every frame's PSNR to equal what the encoder reported
-(1e-9) -- predicting from the encoder's own YUV instead fails it by 0.07 dB on frame 1.
+## Inter frames: the v2.1 T-frame path (c20unified, superseded)
 
-**Library fix found on the way** (`fao_codec_lib/src/v21_predictive.rs`): T-frame motion
-compensation moved only luma; `decode_with_anchor` then copied the anchor's chroma unmoved,
-and the residual is luma-only, so colour stayed where the anchor had it. A 2 px pan decoded
-at 21.6 dB whatever the residual cost; with chroma moved by MV/2 it is 24.7 dB at the same
-61 bytes. Existing files decode with colour that now follows the motion (no residual was ever
-computed against the old chroma). Regression test in the lib.
+Before the merge this port had its own inter-frame encoder: v2.1 T-frames (`TranslatedFrame`,
+motion vectors + luma residual against the last I-frame), decided per frame against a PSNR
+floor, with a test that the Player decodes every frame to exactly the quality the encoder
+measured. It was replaced by the hive line's compact mode on evidence: v2.1 predicts every
+T-frame from the anchor, so on a camera pan the uncovered edge grows each frame and most
+frames were refused, while compact predicts from the previous frame. The code is in history
+(12329fb78).
 
-What v2.1 T-frames are and are not good at, measured: a small object moving over a still,
-textured scene -- T-frames almost everywhere, total size under a third of intra-only. A camera
-pan -- mostly refused by the policy: every T predicts from the anchor, so frame k is shifted
-2k px against it and the uncovered edge is left to a residual the library skips unless a
-block's error is large (its threshold is ~40 luma levels per pixel at quality 70, tuned for
-screen content). That is the format's design, not a bug; a previous-frame reference or a
-denser residual would be a format change.
+What outlived it is a **library fix** (`fao_codec_lib/src/v21_predictive.rs`, 3e2a9fa33): T-frame
+motion compensation moved only luma, and the decoder copied the anchor's chroma unmoved, so in
+any T-frame with motion the colour stayed where the anchor had it. Chroma now moves with its
+block (MV/2); a 2 px shift decoded at 21.6 dB before, 24.7 dB after, at the same bytes. Every
+`.fao` with T-frames decodes with it, including those fao_app writes.
 
 ## Archive (c20unified)
 
@@ -125,11 +124,14 @@ four corrupted length fields load without panicking, and the full file round-tri
 - **World tab** — 3D scene viewer (freecam, orbit, colour modes). The largest remaining gap;
   the mesh/rasterizer plumbing the v8 Player work exposed (`SceneMesh`, `V8Decoder`,
   `v8_rasterizer`) is the natural foundation for it.
-- ~~Real inter-frame transcode~~ — done, above, with v2.1 T-frames. (`V2Encoder` turned out
-  to be `VideoEncoder` plus scene-graph statistics, with no bytes to wire.)
+- ~~Real inter-frame transcode~~ — done: compact mode, from the hive line (above). (`V2Encoder`
+  turned out to be `VideoEncoder` plus scene-graph statistics, with no bytes to wire.)
 - **`--v9` options**, AV1 export comparison.
 
 ## Done, added since the above was written
+
+(Historical: the intra-only slice below has since been replaced by the streaming transcoder
+described above. Kept for the two library bugs it found.)
 
 - **Real sequence transcode** (`transcode.rs`) — a real video file in, a real `.fao` out,
   opened straight in the Player. Deliberately the simplest pipeline that is real: every frame
@@ -166,3 +168,19 @@ full bisection.
 byte late — frame 0's marker was `0`, frame 1's header didn't parse. No app called this
 writer, so it survived; the Player's round-trip test was its first caller and failed on the
 first run. Fixed in the lib, not worked around here.
+
+## Damaged files (c20unified)
+
+`decode.rs`'s `damaged_files_are_refused_not_panicked_on` takes a real `.fao` from the
+transcoder (key, patch and repeat frames) and feeds every truncation and every single byte set
+to 0x00 or 0xFF -- 46,330 files -- through `FaoFile::parse` and every frame's decode. It found
+two library bugs, both in paths the Player and fao_app share:
+- `read_fao_index` reserved as many entries as the header's frame count claimed; one damaged
+  byte asked for 68 GB and the allocator ABORTED the process -- not a panic, so the app
+  vanished instead of reporting a bad file. It now reserves only what the file can hold.
+- `read_fao_frame` indexed one byte past a frame header when the file ended right after it
+  (an off-by-one guard), and its bounds sums could wrap on 32-bit targets (armv7: reMarkable
+  1/2). Fixed with `get` and `checked_add`.
+Now every one of the 46,330 is refused cleanly. Since the Player also streams partial downloads
+over HTTP, damaged input is not hypothetical.
+

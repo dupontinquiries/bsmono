@@ -253,7 +253,7 @@ flatpak = false
 runtime = "none"          # pure egui/glow (wayland/x11), same convention as the other -egui apps
 targets = ["desktop"]
 primary = true            # the egui port is the intended build
-notes = "the egui-primary port of fao_app (GTK4/libadwaita video-codec workbench) — begun per UI_STRATEGY.md with the shell + the Encode Lab page driving the REAL fao-codec-lib encoder (encode_iframe_recon on a deterministic torture pattern; size/bpp/PSNR report, headless-tested). `cargo build --release -p fao-codec-egui` produces the deployable bin (app feature default-on); `--no-default-features` is the CI lib. The GTK original (fao_app, ~13K lines) stays the parity reference; sequence encode, block-match viz and v1/v2 comparison are the next pages. FIRST crate in the tree verified with the offline Rust 1.96 toolchain (rustup drop 2026-07-26) — the cargo-1.75/edition-2024 wall no longer applies in-sandbox."
+notes = "the egui-primary port of fao_app (GTK4/libadwaita video-codec workbench). Encode (default tab: a real video in, a .fao out, streaming compact/fast transcode, cancel, open in Player), Media (local folders and dufs servers), Player (lazy, any length, HTTP range playback), Archive (the GTK video library), Encode Lab, Seq Lab, Library. Current status and what is not ported (the web view, codec versions v2.0-v8 / v9 trailer, the World tab): egui-frontend/PORT_STATUS.md. `cargo build --release -p fao-codec-egui` produces the deployable bin (app feature default-on); `--no-default-features` is the CI lib. The GTK original (fao_app) stays the parity reference."
 
 [apps.gitmind-egui]
 path = "apps/gitmind/crates/gui-egui"
