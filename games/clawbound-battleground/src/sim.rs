@@ -39,6 +39,13 @@ impl Rng {
 #[derive(Clone, Debug)]
 pub enum Event {
     Cast { god: usize, slot: u32, aim: Vec3 },
+    /// A cast began its wind-up (`abilities::cast_timing`); it fires as a
+    /// `Cast` after `dur` seconds unless interrupted. For the anticipation
+    /// pose and anyone watching.
+    CastStart { god: usize, slot: u32, aim: Vec3, dur: f32 },
+    /// The attack button pressed with nothing in range: an acknowledgement,
+    /// not an attack (the cat's shoulder shuffle).
+    Whiff { god: usize },
     Damage { pos: Vec3, amount: f32, big: bool },
     Kill { killer: String, victim: String, victim_team: Team, is_god: bool },
     LevelUp { pos: Vec3 },
@@ -106,6 +113,17 @@ pub struct AiBrain {
     pub wp: usize,
 }
 
+/// A cast in its wind-up or channel (`GodUnit::casting`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Casting {
+    pub slot: u32,
+    pub aim: Vec3,
+    pub t: f32,
+    pub dur: f32,
+    /// Movement multiplier while it lasts (0 = rooted: a channel).
+    pub move_mul: f32,
+}
+
 pub struct GodUnit {
     pub def_id: u32,
     pub team: Team,
@@ -160,6 +178,17 @@ pub struct GodUnit {
     pub sneak: bool,
     /// Seconds of ability-granted quiet left: full speed, low and silent.
     pub hush_t: f32,
+    /// A cast winding up or channelling: fires when `t` reaches `dur`.
+    pub casting: Option<Casting>,
+    /// Seconds during which movement does not turn the cat: after a cast
+    /// turns it to its aim, running on must not swing it straight back.
+    pub face_hold: f32,
+    /// The direction the player is looking (the camera's forward, flat).
+    /// Movement turns the cat only within a cone round it; zero for bots,
+    /// which face where they go.
+    pub face_ref: Vec3,
+    /// When the last whiff acknowledgement played, to rate-limit it.
+    pub whiff_t: f32,
     /// When this cat last attacked or cast.
     pub last_act_t: f32,
     pub ai: Option<AiBrain>,
@@ -380,6 +409,10 @@ impl Game {
                 recent_damagers: Vec::new(),
                 move_dir: Vec3::ZERO,
                 attack_held: false,
+                casting: None,
+                face_hold: 0.0,
+                face_ref: Vec3::ZERO,
+                whiff_t: -10.0,
                 sneak: false,
                 hush_t: 0.0,
                 last_act_t: -99.0,

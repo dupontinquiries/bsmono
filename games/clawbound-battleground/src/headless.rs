@@ -79,6 +79,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("select") {
         return run_select_shot();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("aim") {
+        return run_aim_shots();
+    }
     let (_instance, _adapter, device, queue) =
         make_device().ok_or_else(|| "No suitable GPU backend found (install mesa-vulkan-drivers for lavapipe)".to_string())?;
     let adapter_info = {
@@ -1327,5 +1330,74 @@ pub fn run_select_shot() -> Result<(), String> {
     draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
     save_shot(&renderer.device, &renderer.queue, &target, "select_map_picker.png")?;
     println!("saved select_map_picker.png");
+    Ok(())
+}
+
+/// Targeting and the cat's new body language, through the real draw path:
+/// each of a cat's four abilities prepared with its guide showing, then the
+/// shoulder shuffle (the attack button with nothing in range) frame by
+/// frame, and a standing cat for the bent-knee stance.
+/// `CLAWBOUND_SHOTS=aim clawbound-battleground --screenshot`
+pub fn run_aim_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("aim"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let god: u32 = std::env::var("CLAWBOUND_AIM_GOD").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut game = Game::new_teams(&[god], &[(god + 1) % 13]);
+    game.blockers = scene.blockers.clone();
+    game.gods[1].respawn_t = 999.0;
+    game.gods[0].ai = None;
+    let at = Vec3::new(0.0, 0.0, -36.0);
+    game.gods[0].pos = at;
+    game.gods[0].yaw = std::f32::consts::FRAC_PI_2; // facing +z
+    let mut vfx = Vfx::default();
+    for _ in 0..30 {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+        vfx.update(1.0 / 60.0, &[], &game);
+    }
+    let cam = Camera { eye: at + Vec3::new(0.0, 9.0, -11.0), target: at + Vec3::new(0.0, 0.0, 6.0), fov_y: 1.0 };
+    let aim = at + Vec3::new(4.0, 0.0, 12.0);
+    let mut shoot = |renderer: &mut Renderer, vfx: &mut Vfx, game: &Game, name: &str, guide: Option<u32>, cam: Camera| -> Result<(), String> {
+        renderer.clear_queues();
+        scene.draw(renderer, game, vfx, cam);
+        if let Some(slot) = guide {
+            let ab = game.def(0).abilities[slot as usize];
+            let g = crate::targeting::guide_for(&ab, game.gods[0].pos, aim);
+            scene.draw_guide(renderer, &crate::targeting::guide_points(&g, 1.1), ab.color);
+        }
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+        Ok(())
+    };
+    for slot in 0..4u32 {
+        let name = format!("aim_slot{slot}_{}.png", game.def(0).abilities[slot as usize].name.replace(' ', "_"));
+        shoot(&mut renderer, &mut vfx, &game, &name, Some(slot), cam)?;
+    }
+    // the shoulder shuffle, close
+    let close = Camera { eye: at + Vec3::new(3.2, 1.6, 3.4), target: at + Vec3::Y * 0.9, fov_y: 0.8 };
+    shoot(&mut renderer, &mut vfx, &game, "whiff_0_stand.png", None, close)?;
+    vfx.puppets.on_whiff(0);
+    for (k, steps) in [(1, 8), (2, 8), (3, 8)] {
+        for _ in 0..steps {
+            game.tick(1.0 / 60.0);
+            game.events.clear();
+            vfx.update(1.0 / 60.0, &[], &game);
+        }
+        shoot(&mut renderer, &mut vfx, &game, &format!("whiff_{k}.png"), None, close)?;
+    }
     Ok(())
 }

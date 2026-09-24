@@ -213,7 +213,30 @@ pub struct Puppet {
     vel: Vec3,
     /// Paw placement. See `footfall`.
     pub feet: crate::footfall::Footfall,
+    /// A cast's wind-up: (seconds in, length). The anticipation pose.
+    windup: Option<(f32, f32)>,
+    /// The attack button with nothing in range: seconds into the shoulder
+    /// shuffle that acknowledges it.
+    whiff: Option<f32>,
+    /// The body's spring: offset (fraction of leg length, + = lower) and
+    /// velocity. Kicked down by each paw that lands, it rebounds -- the
+    /// give in a cat's step.
+    spring: (f32, f32),
 }
+
+/// How far the body sits below straight legs, standing, as a fraction of
+/// leg length: a cat's legs are never locked straight. With the leg solve
+/// never STRETCHING a leg (`rigged::plant_leg`, max 1.0 of rest), the legs
+/// always read bent, not pulled.
+pub const KNEE_BEND: f32 = 0.12;
+/// The step spring: natural frequency (rad/s) and damping ratio. Under-
+/// damped on purpose -- a little bounce is the springiness.
+pub const SPRING_W: f32 = 16.0;
+pub const SPRING_ZETA: f32 = 0.38;
+/// How hard one paw landing kicks the spring, per unit of speed (m/s).
+pub const SPRING_KICK: f32 = 0.05;
+/// The shoulder shuffle's length.
+pub const WHIFF_SECS: f32 = 0.55;
 
 impl Puppet {
     pub fn new(build: Build) -> Puppet {
@@ -243,11 +266,24 @@ impl Puppet {
             last_cover: 0.0,
             vel: Vec3::ZERO,
             feet: crate::footfall::Footfall::new(),
+            windup: None,
+            whiff: None,
+            spring: (0.0, 0.0),
         }
+    }
+
+    /// A cast began winding up for `dur` seconds.
+    pub fn begin_windup(&mut self, dur: f32) {
+        self.windup = Some((0.0, dur.max(0.01)));
+    }
+    /// The attack button with nothing to hit.
+    pub fn begin_whiff(&mut self) {
+        self.whiff = Some(0.0);
     }
 
     pub fn begin_cast(&mut self, style: CastStyle) {
         let secs = if style == CastStyle::Rear { 0.75 } else { 0.45 };
+        self.windup = None;
         self.cast = Some((style, 0.0, secs));
         self.cast_slammed = false;
         self.combat.begin_cast(secs);
@@ -357,6 +393,21 @@ impl Puppet {
         }
         let mean = self.foot_h.iter().sum::<f32>() * 0.25;
         self.rise += (mean - self.rise) * (dt * 9.0).min(1.0);
+        // timers and the step spring (semi-implicit Euler: stable at any
+        // frame rate this game runs at)
+        if let Some((t, d)) = self.windup {
+            self.windup = if t + dt >= d + 0.3 { None } else { Some((t + dt, d)) };
+        }
+        if let Some(t) = self.whiff {
+            self.whiff = if t + dt >= WHIFF_SECS { None } else { Some(t + dt) };
+        }
+        {
+            let (x, v) = self.spring;
+            let a = -SPRING_W * SPRING_W * x - 2.0 * SPRING_ZETA * SPRING_W * v;
+            let v = v + a * dt.min(0.05);
+            let x = x + v * dt.min(0.05);
+            self.spring = (finite_or(x, 0.0).clamp(-0.2, 0.2), finite_or(v, 0.0).clamp(-4.0, 4.0));
+        }
 
         // ── where the paws go down ────────────────────────────────────
         // Only on the ground. A leap, a fall, a dash or a perch lets go of
@@ -386,7 +437,11 @@ impl Puppet {
                 hz: self.anim.build.stride_hz(self.anim.smoothed_speed()),
                 lift: creature_rig::anim_rig::SWING_LIFT,
             };
+            let before: [bool; 4] = std::array::from_fn(|i| matches!(self.feet.paws[i].phase, crate::footfall::Phase::Swing { .. }));
             self.feet.advance(dt, &body, world);
+            // each paw that lands kicks the spring down, by how fast we go
+            let landed = (0..4).filter(|&i| before[i] && matches!(self.feet.paws[i].phase, crate::footfall::Phase::Stance { .. })).count();
+            self.spring.1 += landed as f32 * SPRING_KICK * self.speed.min(12.0);
         } else {
             self.feet.release();
         }
@@ -479,6 +534,33 @@ impl Puppet {
         // a tilting body and is folded to reach its surface; a free one is
         // posed by whoever freed it.
         let mut planted = [true; 4];
+
+        // Knees bent, and the give of the step (see KNEE_BEND, SPRING_*).
+        if !inp.perched && inp.leap.is_none() {
+            drop += (KNEE_BEND + self.spring.0) * leg_len;
+        }
+        // The wind-up: gather -- lower, weight back, tail up -- over the
+        // wind-up, and hold it until the cast releases.
+        if let Some((t, d)) = self.windup {
+            let k = (t / d).clamp(0.0, 1.0);
+            let e = k * k * (3.0 - 2.0 * k);
+            drop += 0.16 * leg_len * e;
+            body.pitch += 0.10 * e;
+            body.tail_lift += 0.4 * e;
+            m.gaze_pitch += 0.08 * e;
+        }
+        // The shoulder shuffle: the attack button with nothing to hit. A
+        // quick shimmy of the shoulders side to side and a head bob that
+        // settle -- the button works, there is just nothing there.
+        if let Some(t) = self.whiff {
+            let u = (t / WHIFF_SECS).clamp(0.0, 1.0);
+            let fade = 1.0 - u;
+            let w = (u * std::f32::consts::TAU * 2.5).sin();
+            body.roll += 0.22 * w * fade; // read at gameplay distance (0.16 was faint)
+            body.pitch += 0.05 * (u * std::f32::consts::TAU * 5.0).sin().abs() * fade;
+            m.gaze_yaw += 0.35 * w * fade;
+            drop += 0.05 * leg_len * (u * std::f32::consts::PI).sin();
+        }
 
         // Idle life: the tail never quite stops, and a bored cat looks about.
         body.tail_lash = (time * 0.9).sin() * 0.18 * (1.0 - (self.speed / 4.0).min(1.0));
@@ -836,6 +918,14 @@ impl Troupe {
         all
     }
 
+    pub fn on_windup(&mut self, god: usize, dur: f32) {
+        self.ensure(god + 1);
+        self.puppets[god].begin_windup(dur);
+    }
+    pub fn on_whiff(&mut self, god: usize) {
+        self.ensure(god + 1);
+        self.puppets[god].begin_whiff();
+    }
     pub fn on_cast(&mut self, god: usize, style: CastStyle) {
         self.ensure(god + 1);
         self.puppets[god].begin_cast(style);
@@ -1303,5 +1393,72 @@ mod tests {
         let all = [pose.lift, pose.body.drop, pose.body.pitch, pose.body.roll, pose.body.tail_lash, pose.body.tail_lift, pose.body.arch];
         assert!(all.iter().all(|x| x.is_finite()), "{all:?}");
         assert!(pose.legs.iter().all(|l| l.pitch.is_finite() && l.fold.is_finite() && l.splay.is_finite()));
+    }
+
+    /// The shoulder shuffle: pressing attack with nothing in range rolls
+    /// the shoulders side to side (both ways), then settles back to the
+    /// same stance, inside WHIFF_SECS.
+    #[test]
+    fn a_whiff_shuffles_the_shoulders_and_settles() {
+        let (r, w) = (rig(), open());
+        let mut p = Puppet::new(Build::feline());
+        let inp = input(Vec3::ZERO);
+        settle(&mut p, &inp, &r, &w, 1.0);
+        let rest = p.pose(&inp, &r).body.roll;
+        p.begin_whiff();
+        let (mut lo, mut hi) = (0.0f32, 0.0f32);
+        let mut ev = Vec::new();
+        for _ in 0..40 {
+            p.advance(1.0 / 60.0, &inp, &r, &w, &mut ev);
+            let roll = p.pose(&inp, &r).body.roll - rest;
+            lo = lo.min(roll);
+            hi = hi.max(roll);
+        }
+        assert!(hi > 0.05 && lo < -0.05, "shoulders did not shuffle both ways: {lo}..{hi}");
+        settle(&mut p, &inp, &r, &w, 0.3);
+        assert!((p.pose(&inp, &r).body.roll - rest).abs() < 1e-3, "did not settle");
+    }
+
+    /// A wind-up gathers the cat: lower and weight back across it; the cast
+    /// releasing ends it.
+    #[test]
+    fn a_windup_gathers_the_cat_until_the_cast_releases() {
+        let (r, w) = (rig(), open());
+        let mut p = Puppet::new(Build::feline());
+        let inp = input(Vec3::ZERO);
+        settle(&mut p, &inp, &r, &w, 1.0);
+        let calm = p.pose(&inp, &r).body;
+        p.begin_windup(0.4);
+        settle(&mut p, &inp, &r, &w, 0.35);
+        let gathered = p.pose(&inp, &r).body;
+        assert!(gathered.drop > calm.drop + 0.02, "not lower: {} vs {}", gathered.drop, calm.drop);
+        assert!(gathered.pitch > calm.pitch + 0.05, "weight not back");
+        p.begin_cast(CastStyle::Stomp);
+        assert!(p.windup.is_none(), "the release ends the wind-up");
+    }
+
+    /// Springy, not stiff: a landing kicks the body down, it rebounds PAST
+    /// rest (under-damped) and settles; and standing, the body sits
+    /// KNEE_BEND below straight legs.
+    #[test]
+    fn the_step_spring_rebounds_and_settles() {
+        let mut p = Puppet::new(Build::feline());
+        let (r, w) = (rig(), open());
+        let inp = input(Vec3::ZERO);
+        settle(&mut p, &inp, &r, &w, 1.0);
+        p.spring = (0.0, 1.0); // a landing's kick
+        let mut ev = Vec::new();
+        let mut min_x = 0.0f32;
+        let mut max_x = 0.0f32;
+        for _ in 0..90 {
+            p.advance(1.0 / 60.0, &inp, &r, &w, &mut ev);
+            min_x = min_x.min(p.spring.0);
+            max_x = max_x.max(p.spring.0);
+        }
+        assert!(max_x > 0.02, "the kick did not compress: {max_x}");
+        assert!(min_x < -0.005, "no rebound past rest -- stiff, not springy: {min_x}");
+        assert!(p.spring.0.abs() < 0.003 && p.spring.1.abs() < 0.05, "did not settle: {:?}", p.spring);
+        let leg = r.hip(0)[1] - r.sole(0);
+        assert!(p.pose(&inp, &r).body.drop >= KNEE_BEND * leg - 1e-3, "standing on straight legs");
     }
 }

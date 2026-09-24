@@ -53,6 +53,8 @@ pub struct Scene {
     /// (`Renderer::free_meshes_from` gives its meshes back on a switch).
     pub map: crate::map::MapId,
     pub first_mesh: u64,
+    /// A small flat tile: the dots a targeting guide is drawn with.
+    pub guide_dot: u64,
     pub gate: [u64; 2],
     pub fountain: [u64; 2],
     pub pedestal: [u64; 2],
@@ -262,6 +264,11 @@ impl Scene {
         }
         total += bird_mesh.inst.len();
         let bird = r.upload_mesh(&bird_mesh);
+        let guide_dot = {
+            let mut g = crate::voxel::Grid::new(3, 1, 3);
+            g.filled_box(0, 0, 0, 2, 0, 2, [1.0, 1.0, 1.0, 1.0]);
+            r.upload_mesh(&g.mesh(0.12, true))
+        };
         let caves: Vec<CaveDraw> = if crate::map::active() == crate::map::MapId::Pass {
             crate::pass::caves()
                 .into_iter()
@@ -318,6 +325,7 @@ impl Scene {
             caves,
             map: crate::map::active(),
             first_mesh,
+            guide_dot,
             gate,
             fountain,
             pedestal,
@@ -1507,6 +1515,17 @@ mod plan_tests {
     fn plan_of_the_centre() {
         let (_, _, b) = build_world();
         println!("{}", plan(&b, 62.0, 2.0));
+    }
+}
+
+impl Scene {
+    /// Draw a targeting guide: glowing dots on the terrain at `points`
+    /// (ground plane positions), in the ability's colour.
+    pub fn draw_guide(&self, r: &mut Renderer, points: &[Vec3], color: [f32; 3]) {
+        for p in points {
+            let y = crate::render::terrain_height(p.x, p.z).max(crate::map::ground_y(p.x, p.z)) + 0.06;
+            r.queue_draw(self.guide_dot, Mat4::from_translation(Vec3::new(p.x, y, p.z)), [color[0], color[1], color[2], 1.0], 1.6, 0.12, false);
+        }
     }
 }
 

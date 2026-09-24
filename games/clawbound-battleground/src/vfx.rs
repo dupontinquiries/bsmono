@@ -318,6 +318,8 @@ impl Vfx {
                     }
                     let _ = amount;
                 }
+                Event::CastStart { god, dur, .. } => self.puppets.on_windup(*god, *dur),
+                Event::Whiff { god } => self.puppets.on_whiff(*god),
                 Event::Cast { god, slot, aim } => {
                     if let Some(a) = game.def(*god).abilities.get(*slot as usize) {
                         self.puppets.on_cast(*god, crate::puppet::cast_style(&a.arch, a.ult));

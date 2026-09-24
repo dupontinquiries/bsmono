@@ -310,7 +310,10 @@ fn stalking_is_broken_by_a_fight_granted_by_the_kit_and_forced_by_wounds() {
     let aim = game.gods[0].pos + glam::Vec3::Z * 6.0;
     game.cast_queue.push((0, slot, aim));
     tick(&mut game, 0.05);
-    assert!(!game.stalking(0), "casting is acting");
+    assert!(!game.stalking(0), "casting is acting -- from the wind-up");
+    // the hush comes with the ability itself, when it fires after its wind-up
+    let wind = clawbound::abilities::cast_timing(&game.def(0).abilities[slot as usize]).0;
+    tick(&mut game, wind + 0.02);
     assert!(game.gods[0].hush_t > 1.0, "but this ability grants a hush: {}", game.gods[0].hush_t);
     assert!((0.85..1.0).contains(&game.quiet(0)), "quiet {}", game.quiet(0));
     game.gods[0].sneak = false;
@@ -667,4 +670,139 @@ fn bots_and_minions_get_over_the_shelf() {
         assert!(god_past, "no blue bot got over the shelf in 150 s");
         assert!(minion_past, "no blue minion got over the shelf in 150 s");
     });
+}
+
+/// The firing range: every ability of every ancestor, cast by a cat facing
+/// EAST at an aim to the NORTH (where the camera looks). Each must fire;
+/// the cat must turn to face north; and every directional effect -- a
+/// projectile's flight, a dash's path, a blink's landing, a beam, a
+/// telegraph, a storm, a pull -- must go north, never along the cat's old
+/// facing.
+#[test]
+fn firing_range_every_ability_goes_where_it_is_aimed_and_turns_the_cat() {
+    use clawbound::gods::{Archetype, ROSTER};
+    use clawbound::sim::Event;
+    use glam::Vec3;
+    let north = Vec3::Z;
+    let mut report = Vec::new();
+    for (god, def) in ROSTER.iter().enumerate() {
+        for slot in 0..4u32 {
+            let mut game = Game::new_teams(&[god as u32], &[(god as u32 + 1) % 13]);
+            game.gods[1].respawn_t = 999.0; // an empty range
+            game.gods[0].ai = None;
+            let start = Vec3::new(0.0, 0.0, -40.0);
+            game.gods[0].pos = start;
+            game.gods[0].yaw = 0.0; // facing east: (cos 0, 0, sin 0)
+            game.gods[0].mana = 10_000.0;
+            let aim = start + north * 10.0;
+            game.cast_queue.push((0, slot, aim));
+            let mut events = Vec::new();
+            let mut fired = false;
+            let mut turned = false;
+            let mut dash_dir = None;
+            let mut shots: Vec<Vec3> = Vec::new();
+            for _ in 0..90 {
+                game.tick(1.0 / 60.0);
+                let f = clawbound::abilities::facing_of(game.gods[0].yaw);
+                turned |= f.dot(north) > 0.98;
+                if let Some(d) = game.gods[0].dash.as_ref() {
+                    dash_dir.get_or_insert((d.to - d.from).normalize_or_zero());
+                }
+                for p in &game.projectiles {
+                    if p.owner == 0 && p.vel.length() > 0.1 {
+                        shots.push(Vec3::new(p.vel.x, 0.0, p.vel.z).normalize());
+                    }
+                }
+                for e in game.events.drain(..) {
+                    fired |= matches!(e, Event::Cast { god: 0, .. });
+                    events.push(e);
+                }
+                if fired && game.gods[0].dash.is_none() && game.gods[0].casting.is_none() {
+                    break;
+                }
+            }
+            let ab = def.abilities[slot as usize];
+            assert!(fired, "{} slot {slot} ({}) never fired", def.name, ab.name);
+            assert!(turned, "{} slot {slot} ({}) did not turn the cat to its aim", def.name, ab.name);
+            // the evidence of direction, per archetype
+            let flat = |p: Vec3| Vec3::new(p.x - start.x, 0.0, p.z - start.z).normalize_or_zero();
+            let mut dirs: Vec<Vec3> = shots.clone();
+            for e in &events {
+                match *e {
+                    Event::BeamFx { dir, length, .. } if length > 2.0 => dirs.push(Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero()),
+                    Event::RingTelegraph { pos, .. } | Event::StormFx { pos, .. } | Event::PullFx { pos, .. } => {
+                        if Vec3::new(pos.x - start.x, 0.0, pos.z - start.z).length() > 1.0 {
+                            dirs.push(flat(pos));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(d) = dash_dir {
+                dirs.push(d);
+            }
+            if matches!(ab.arch, Archetype::Blink { .. }) {
+                dirs.push(flat(game.gods[0].pos));
+            }
+            let directional = !matches!(ab.arch, Archetype::Nova { .. } | Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. });
+            if directional {
+                assert!(!dirs.is_empty(), "{} slot {slot} ({:?}): no directional effect found", def.name, ab.arch);
+                for d in &dirs {
+                    assert!(d.dot(north) > 0.9, "{} slot {slot} ({}) went {d}, aimed north", def.name, ab.name);
+                }
+            }
+            report.push(format!("{}/{}: {} dirs ok", def.name, ab.name, dirs.len()));
+        }
+    }
+    assert_eq!(report.len(), ROSTER.len() * 4);
+}
+
+/// A cast aimed at the cat itself goes along its facing -- the cat's own
+/// convention, (cos yaw, sin yaw). It went along (sin, cos), mirrored.
+#[test]
+fn a_cast_aimed_at_the_cat_goes_along_its_facing() {
+    use clawbound::gods::{Archetype, ROSTER};
+    use glam::Vec3;
+    let (god, slot) = ROSTER
+        .iter()
+        .enumerate()
+        .find_map(|(g, d)| d.abilities.iter().position(|a| matches!(a.arch, Archetype::Bolt { .. })).map(|s| (g, s as u32)))
+        .expect("someone has a bolt");
+    let mut game = Game::new_teams(&[god as u32], &[(god as u32 + 1) % 13]);
+    game.gods[1].respawn_t = 999.0;
+    game.gods[0].ai = None;
+    game.gods[0].mana = 10_000.0;
+    let yaw = 0.4f32;
+    game.gods[0].yaw = yaw;
+    let p = game.gods[0].pos;
+    game.cast_queue.push((0, slot, p));
+    for _ in 0..60 {
+        game.tick(1.0 / 60.0);
+        if let Some(pr) = game.projectiles.iter().find(|pr| pr.owner == 0) {
+            let d = Vec3::new(pr.vel.x, 0.0, pr.vel.z).normalize();
+            let want = clawbound::abilities::facing_of(yaw);
+            assert!(d.dot(want) > 0.99, "bolt went {d}, facing is {want}");
+            return;
+        }
+    }
+    panic!("no bolt fired");
+}
+
+/// Movement turns the cat only within a cone round the view: strafing
+/// right, it turns part way; moving back toward the camera, it keeps
+/// facing the view and backs up. A channel roots it; a wind-up slows it.
+#[test]
+fn movement_faces_within_the_view_cone_and_casts_hold_the_cat() {
+    use clawbound::systems::{facing_yaw, BACKPEDAL, FACE_CONE};
+    use glam::Vec3;
+    let view = Vec3::Z;
+    let v = clawbound::abilities::yaw_of(view);
+    let east = facing_yaw(Vec3::X, view);
+    assert!(((east - v).abs() - FACE_CONE).abs() < 1e-4, "strafing turns only to the cone's edge");
+    let back = facing_yaw(-Vec3::Z, view);
+    assert!((back - v).abs() < 1e-4, "backing up keeps facing the view");
+    let ahead = facing_yaw(Vec3::new(0.3, 0.0, 1.0), view);
+    assert!((clawbound::abilities::facing_of(ahead) - Vec3::new(0.3, 0.0, 1.0).normalize()).length() < 1e-4, "inside the cone: face the move");
+    assert_eq!(facing_yaw(Vec3::X, Vec3::ZERO), 0.0, "no view (a bot): face the move");
+    assert!(BACKPEDAL > FACE_CONE);
 }

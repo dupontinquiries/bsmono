@@ -37,8 +37,9 @@ impl Game {
         // 3. cast queue (player requests + AI requests)
         let queue = std::mem::take(&mut self.cast_queue);
         for (gi, slot, aim) in queue {
-            self.cast(gi, slot, aim);
+            self.begin_cast(gi, slot, aim);
         }
+        self.tick_casting(dt);
 
         // 4. movement
         self.move_gods(dt);
@@ -144,7 +145,9 @@ impl Game {
                 self.gods[i].fall = None;
                 continue;
             }
-            let speed = self.move_speed(i);
+            // a wind-up slows the caster; a channel roots it
+            let speed = self.move_speed(i) * self.gods[i].casting.map_or(1.0, |c| c.move_mul);
+            self.gods[i].face_hold = (self.gods[i].face_hold - dt).max(0.0);
             let dir = self.gods[i].move_dir;
             let yaw_cur = self.gods[i].yaw;
             let g = &mut self.gods[i];
@@ -176,7 +179,12 @@ impl Game {
             } else if dir.length_squared() > 0.0001 {
                 let on_ridge = g.perch.is_some() && g.perch_narrow;
                 g.pos += dir.normalize() * speed * if on_ridge { crate::leap::NARROW_SPEED } else { 1.0 } * dt;
-                let want = dir.z.atan2(dir.x);
+                // Facing: toward the move, within a cone round where the
+                // player looks (`face_ref`, the camera's forward): strafing
+                // turns the cat only part way, and moving back toward the
+                // camera it keeps facing away from it and backs up. Not at
+                // all while a cast holds it on its aim.
+                let want = facing_yaw(dir, g.face_ref);
                 let mut d = want - yaw_cur;
                 while d > std::f32::consts::PI {
                     d -= std::f32::consts::TAU;
@@ -184,7 +192,9 @@ impl Game {
                 while d < -std::f32::consts::PI {
                     d += std::f32::consts::TAU;
                 }
-                g.yaw = yaw_cur + d * (dt * 14.0).min(1.0);
+                if g.face_hold <= 0.0 {
+                    g.yaw = yaw_cur + d * (dt * 14.0).min(1.0);
+                }
                 g.walk_anim += dt * 9.0;
             } else {
                 g.walk_anim += dt * 1.5;
@@ -434,6 +444,13 @@ impl Game {
             // alone lets a stale index through to `target_pos` and, before it
             // returned Option, to a bounds panic.
             let target_gone = target.is_some_and(|t| self.target_pos_opt(t).is_none());
+            // The attack button with nothing in range: acknowledge it (the
+            // shoulder shuffle), at most every 0.8 s -- pressing a button
+            // that visibly does nothing reads as a broken button.
+            if (target.is_none() || target_gone) && self.gods[i].attack_held && self.gods[i].ai.is_none() && self.t - self.gods[i].whiff_t > 0.8 {
+                self.gods[i].whiff_t = self.t;
+                self.events.push(Event::Whiff { god: i });
+            }
             if atk_timer_next > 0.0 || target.is_none() || target_gone {
                 let g = &mut self.gods[i];
                 g.atk_timer = atk_timer_next.max(0.0);
@@ -1131,3 +1148,33 @@ pub fn ability_color(def: &crate::gods::GodDef, slot: u32) -> [f32; 3] {
 /// Re-export for headless harness.
 pub use crate::gods::Archetype as ArchT;
 pub type ArchAlias = Archetype;
+
+/// Half-angle of the facing cone round the player's view: movement turns
+/// the cat at most this far from where the camera looks.
+pub const FACE_CONE: f32 = 1.2; // ~70 degrees
+/// Moving further than this from the view direction (toward the camera),
+/// the cat does not turn round: it faces the view and backs up.
+pub const BACKPEDAL: f32 = 2.0; // ~115 degrees
+
+/// The yaw a moving cat turns toward: its movement direction, clamped into
+/// the facing cone round `view` (none if `view` is zero: bots face where
+/// they go); past BACKPEDAL, the view itself.
+pub fn facing_yaw(move_dir: Vec3, view: Vec3) -> f32 {
+    let m = crate::abilities::yaw_of(move_dir);
+    if view.length_squared() < 1e-6 {
+        return m;
+    }
+    let v = crate::abilities::yaw_of(view);
+    let mut d = m - v;
+    while d > std::f32::consts::PI {
+        d -= std::f32::consts::TAU;
+    }
+    while d < -std::f32::consts::PI {
+        d += std::f32::consts::TAU;
+    }
+    if d.abs() > BACKPEDAL {
+        v
+    } else {
+        v + d.clamp(-FACE_CONE, FACE_CONE)
+    }
+}
