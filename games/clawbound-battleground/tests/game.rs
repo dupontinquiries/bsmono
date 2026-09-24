@@ -516,3 +516,72 @@ fn a_bot_steers_off_a_line_that_runs_into_a_trunk() {
     assert!(!b.blockers.blocked(probe.x, probe.z, GOD_RADIUS), "and not into the trunk");
     let _ = Vec3::ZERO;
 }
+
+/// Twinfang Pass through the real sim: 15 a side, the scene's own
+/// collision (cliffs included), 60 s of bots. No living cat is ever in the
+/// rock, and every lane's wave of cats has left its base.
+#[test]
+fn the_pass_holds_fifteen_a_side_and_nobody_walks_into_the_rock() {
+    use clawbound::map::{self, MapId};
+    map::with(MapId::Pass, || {
+        let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+        let (b, r) = map::team_picks(2, &mut clawbound::sim::Rng::new(5));
+        let mut game = Game::new_teams(&b, &r);
+        assert_eq!(game.gods.len(), 30);
+        game.blockers = blockers;
+        let f = map::floor().unwrap();
+        for _ in 0..(60 * 60) {
+            game.tick(1.0 / 60.0);
+            game.events.clear();
+            for (i, g) in game.gods.iter().enumerate() {
+                if g.respawn_t <= 0.0 {
+                    assert!(f.sdf(g.pos.x, g.pos.z) <= 0.05, "god {i} in the rock at {} (sdf {})", g.pos, f.sdf(g.pos.x, g.pos.z));
+                }
+            }
+        }
+        let left = game.gods.iter().filter(|g| (g.pos - g.team.base_pos()).length() > 40.0).count();
+        assert!(left >= 20, "only {left} of 30 cats got out of their bases in a minute");
+    });
+}
+
+/// A bot on the pass, inside a massif, finds its way out to its lane: the
+/// way starts sideways, round the peak, which local steering alone does not
+/// find (`floor::route`). Break-tested: with routing off the bot is still
+/// pinned at (-24, -43) after 30 s; with it, it is on the lane in < 1 s.
+/// (A shoulder clearing was tried first and did NOT fail without routing,
+/// so it proved nothing.)
+#[test]
+fn a_bot_finds_its_way_out_of_the_massif_on_the_pass() {
+    use clawbound::map::{self, MapId};
+    map::with(MapId::Pass, || {
+        let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+        let (b, r) = map::team_picks(2, &mut clawbound::sim::Rng::new(5));
+        let mut game = Game::new_teams(&b, &r);
+        game.blockers = blockers;
+        // everyone else out of the way
+        for g in game.gods.iter_mut().skip(3) {
+            g.respawn_t = 999.0;
+        }
+        // A mid-lane bot on the boss ground inside the west massif: the peak
+        // stands between it and its lane, and both ways out (the slot round
+        // the peak's flank, the slot to the side lane) start sideways.
+        let bot = 2;
+        assert_eq!(game.gods[bot].ai.as_ref().unwrap().lane, clawbound::consts::Lane::Mid);
+        game.gods[1].respawn_t = 999.0;
+        game.gods[bot].respawn_t = 0.0;
+        game.gods[bot].pos = glam::Vec3::new(-96.0, 0.0, 0.0);
+        let mut t = 0.0;
+        let mut on_lane = false;
+        while t < 30.0 {
+            game.tick(1.0 / 60.0);
+            game.events.clear();
+            t += 1.0 / 60.0;
+            let p = game.gods[bot].pos;
+            if clawbound::consts::lane_clearance(p.x, p.z) < 6.0 {
+                on_lane = true;
+                break;
+            }
+        }
+        assert!(on_lane, "still off its lane after {t:.0} s, at {}", game.gods[bot].pos);
+    });
+}

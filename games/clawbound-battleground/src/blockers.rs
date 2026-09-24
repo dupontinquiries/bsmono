@@ -351,6 +351,9 @@ pub struct Blockers {
     /// forbids. See `going`. Filled by `push_prop` from the same PropKind,
     /// so a prop cannot be moved and leave its thicket behind.
     going: crate::going::Going,
+    /// On a map carved out of rock (`floor`), the edge of the floor is a
+    /// wall too: a cliff. `None` on the open jungle.
+    floor: Option<&'static crate::floor::FloorPlan>,
 }
 
 impl Blockers {
@@ -369,7 +372,16 @@ impl Blockers {
             dim,
             half_extent,
             going: crate::going::Going::new(half_extent, cell),
+            floor: None,
         }
+    }
+
+    /// Make the edge of `floor` a wall: everything off it is cliff.
+    pub fn set_floor(&mut self, floor: &'static crate::floor::FloorPlan) {
+        self.floor = Some(floor);
+    }
+    pub fn floor(&self) -> Option<&'static crate::floor::FloorPlan> {
+        self.floor
     }
 
     /// Speed multiplier for crossing `(x, z)`. See `going`.
@@ -669,6 +681,19 @@ impl Blockers {
     ///
     /// Pass `f32::NEG_INFINITY` for ground movement (nothing is skipped).
     pub fn resolve_at(&self, pos: Vec3, radius: f32, feet_y: f32) -> Vec3 {
+        let p = self.resolve_props(pos, radius, feet_y);
+        // The cliffs last, so nothing a prop does can push a unit into the
+        // rock. Whatever the feet: no dash clears a cliff.
+        match self.floor {
+            Some(f) if pos.is_finite() => {
+                let (x, z) = f.push_in(p.x, p.z, radius);
+                Vec3::new(x, p.y, z)
+            }
+            _ => p,
+        }
+    }
+
+    fn resolve_props(&self, pos: Vec3, radius: f32, feet_y: f32) -> Vec3 {
         if self.all.is_empty() {
             return pos;
         }
@@ -789,6 +814,9 @@ impl Blockers {
     /// Is `(x, z)` inside any blocker? Used by map generation and spawn
     /// placement to avoid dropping something inside a rock.
     pub fn blocked(&self, x: f32, z: f32, radius: f32) -> bool {
+        if self.floor.is_some_and(|f| !f.fits(x, z, radius)) {
+            return true;
+        }
         let mut scratch = Vec::new();
         self.near(x, z, radius + self.cell, &mut scratch);
         scratch.iter().any(|&i| {

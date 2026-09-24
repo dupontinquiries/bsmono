@@ -608,18 +608,18 @@ impl Scene {
 // chunks (per voxel-size class) for frustum culling.
 // ---------------------------------------------------------------------------
 
-const V_SM: f32 = 0.35;
-const V_MED: f32 = 0.6;
+pub(crate) const V_SM: f32 = 0.35;
+pub(crate) const V_MED: f32 = 0.6;
 const V_BIG: f32 = 1.2;
 const V_BRAZ: f32 = 0.12;
 
-struct Piece {
-    mesh: VoxelMesh,
-    pos: Vec3,
-    quarter: u8,
-    vsize: f32,
+pub(crate) struct Piece {
+    pub(crate) mesh: VoxelMesh,
+    pub(crate) pos: Vec3,
+    pub(crate) quarter: u8,
+    pub(crate) vsize: f32,
     /// wind sway weight baked into each voxel's misc.y (0 = rigid)
-    sway: f32,
+    pub(crate) sway: f32,
 }
 
 fn mesh_radius(m: &VoxelMesh) -> f32 {
@@ -786,6 +786,10 @@ pub fn world_blockers() -> Blockers {
 }
 
 fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
+    if crate::map::active() == crate::map::MapId::Pass {
+        let (pieces, blockers) = crate::passworld::build();
+        return batch(pieces, blockers);
+    }
     const TAU: f32 = std::f32::consts::TAU;
     let mut pieces: Vec<Piece> = Vec::new();
     // Cell pitch of 6 world units: most props sit in one cell, and a unit's
@@ -1153,7 +1157,12 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
         }
     }
 
-    // --- batch into spatial chunks per voxel-size class ---
+    batch(pieces, blockers)
+}
+
+/// Batch placed pieces into spatial chunks per voxel-size class: what the
+/// renderer uploads. Shared by every map's world builder.
+fn batch(pieces: Vec<Piece>, blockers: Blockers) -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
     let mut cells: std::collections::HashMap<(i32, i32, u32), Vec<&Piece>> = std::collections::HashMap::new();
     for p in &pieces {
         let cls = if p.vsize == V_SM {

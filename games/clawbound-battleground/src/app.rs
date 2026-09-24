@@ -77,6 +77,8 @@ struct AppState {
 }
 
 pub fn run(opts: crate::launch::LaunchOptions) {
+    // Before anything builds geometry: the renderer meshes the terrain.
+    crate::map::set_active(opts.map);
     if let Some(role) = &opts.handoff {
         // The centre handed us a friend session: it becomes a den (see the
         // RESUMED block). This used to log "not wired yet" and start a solo
@@ -698,6 +700,12 @@ fn start_game(s: &mut AppState) {
         .map(|d| d.as_secs())
         .unwrap_or(42);
     let mut rng = crate::sim::Rng::new(0xBEEF ^ seed);
+    if crate::map::active() != crate::map::MapId::Jungle {
+        let (blue, red) = crate::map::team_picks(s.ui.selected as u32, &mut rng);
+        s.game = Some(Game::new_teams(&blue, &red));
+        finish_start(s);
+        return;
+    }
     let mut pool: Vec<u32> = (0..crate::gods::ROSTER_LEN as u32).filter(|&i| i != s.ui.selected as u32).collect();
     let mut allies = [0u32; 4];
     let mut enemies = [0u32; 5];
@@ -710,6 +718,11 @@ fn start_game(s: &mut AppState) {
         *e = pool.remove(k.min(pool.len() - 1));
     }
     s.game = Some(Game::new(s.ui.selected as u32, allies, enemies));
+    finish_start(s);
+}
+
+/// Everything after the rosters are drawn: shared by every map.
+fn finish_start(s: &mut AppState) {
     s.vfx = Vfx::default();
     s.screen = Screen::Playing;
     // static for the whole match (an ancestor's kit never changes): which

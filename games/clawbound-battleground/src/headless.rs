@@ -64,6 +64,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("shop") {
         return run_shop_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("pass") {
+        return run_pass_shots();
+    }
     let (_instance, _adapter, device, queue) =
         make_device().ok_or_else(|| "No suitable GPU backend found (install mesa-vulkan-drivers for lavapipe)".to_string())?;
     let adapter_info = {
@@ -818,4 +821,91 @@ fn clear(device: &wgpu::Device, queue: &wgpu::Queue, view: &wgpu::TextureView) {
         });
     }
     queue.submit([enc.finish()]);
+}
+
+/// Twinfang Pass, looked at: the whole map from above, the gorge between
+/// the peaks at cat height, a waterfall up close, a clearing, and the
+/// 15v15 fight in fog. `CLAWBOUND_SHOTS=pass clawbound-battleground
+/// --screenshot --map pass`. The match is real: bots on both sides, the
+/// scene's own blockers, `steps` of sim before the fight shot.
+pub fn run_pass_shots() -> Result<(), String> {
+    if crate::map::active() != crate::map::MapId::Pass {
+        return Err("run with --map pass (or CLAWBOUND_MAP=pass)".into());
+    }
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("pass shot"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    println!("total voxel instances uploaded: {}", scene.total_voxels);
+    let mut rng = Rng::new(0xFA11);
+    let (blue, red) = crate::map::team_picks(3, &mut rng);
+    let mut game = Game::new_teams(&blue, &red);
+    game.blockers = scene.blockers.clone();
+    game.gods[0].ai = Some(crate::sim::AiBrain {
+        lane: crate::consts::Lane::Mid,
+        aggression: 0.9,
+        state: crate::sim::AiState::Push,
+        target: None,
+        strafe_dir: 1.0,
+        strafe_t: 0.0,
+        buy_t: 1.0,
+        wp: 0,
+    });
+    let mut vfx = Vfx::default();
+    let only: Vec<String> = std::env::var("CLAWBOUND_SHEET").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default();
+    let want = |n: &str| only.is_empty() || only.iter().any(|o| n.contains(o.as_str()));
+    let mut shoot = |renderer: &mut Renderer, game: &Game, vfx: &mut Vfx, name: &str, cam: Camera| -> Result<(), String> {
+        if !want(name) {
+            return Ok(());
+        }
+        renderer.clear_queues();
+        vfx.update(1.0 / 60.0, &[], game);
+        scene.draw(renderer, game, vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+        Ok(())
+    };
+    let fall = crate::pass::falls()[0];
+    let clearing = crate::pass::clearings()[4];
+    let cz = Vec3::new(clearing.0, 0.0, clearing.1);
+    shoot(&mut renderer, &game, &mut vfx, "pass_overview.png", Camera { eye: Vec3::new(0.0, 360.0, -80.0), target: Vec3::ZERO, fov_y: 1.1 })?;
+    shoot(&mut renderer, &game, &mut vfx, "pass_gorge.png", Camera { eye: Vec3::new(2.0, 3.0, -76.0), target: Vec3::new(-4.0, 22.0, 0.0), fov_y: 1.0 })?;
+    // Cameras stand ON the floor (clamped in from the rock), or the first
+    // try looked at the inside of a boulder and a cliff.
+    let on_floor = |p: Vec3, h: f32| crate::map::onto_floor(p, 1.5) + Vec3::Y * h;
+    // from down the stream, looking back up it at the fall
+    shoot(&mut renderer, &game, &mut vfx, "pass_waterfall.png", Camera { eye: on_floor(crate::pass::streams()[0][3], 2.5), target: fall.foot + Vec3::Y * 5.0, fov_y: 0.75 })?;
+    shoot(&mut renderer, &game, &mut vfx, "pass_clearing.png", Camera { eye: on_floor(cz + Vec3::new(-5.0, 0.0, -5.0), 7.0), target: cz, fov_y: 1.05 })?;
+    shoot(&mut renderer, &game, &mut vfx, "pass_peaks.png", Camera { eye: Vec3::new(0.0, 4.0, -118.0), target: Vec3::new(0.0, 40.0, 0.0), fov_y: 1.0 })?;
+    // The fight: run the match, then frame the densest knot of cats.
+    let steps: usize = std::env::var("CLAWBOUND_PASS_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(75) * 60;
+    let t0 = std::time::Instant::now();
+    for _ in 0..steps {
+        game.tick(1.0 / 60.0);
+        let ev: Vec<crate::sim::Event> = game.events.drain(..).collect();
+        vfx.update(1.0 / 60.0, &ev, &game);
+    }
+    println!("sim: {} s of 15v15 in {:.2} s wall ({:.2} ms/tick)", steps / 60, t0.elapsed().as_secs_f32(), t0.elapsed().as_secs_f32() * 1000.0 / steps as f32);
+    let alive: Vec<Vec3> = game.gods.iter().filter(|g| g.respawn_t <= 0.0).map(|g| g.pos).collect();
+    let knot = alive.iter().copied().max_by_key(|p| alive.iter().filter(|q| (**q - *p).length() < 14.0).count()).unwrap_or(Vec3::ZERO);
+    game.weather.force(crate::weather::WeatherKind::Fog, game.t + 999.0);
+    for _ in 0..(10 * 60) {
+        game.tick(1.0 / 60.0);
+        let ev: Vec<crate::sim::Event> = game.events.drain(..).collect();
+        vfx.update(1.0 / 60.0, &ev, &game);
+    }
+    shoot(&mut renderer, &game, &mut vfx, "pass_fight_fog.png", Camera { eye: knot + Vec3::new(-10.0, 9.0, -12.0), target: knot + Vec3::Y, fov_y: 1.0 })?;
+    Ok(())
 }
