@@ -2552,11 +2552,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     }
     let mut player_prev_xz: Option<[f32; 2]> = None;
     let mut player_landing_speed: f32 = 0.0;
-    // UNENDLICH_DRAGON_AT=<metres>: 3 s after entering a world, hatch ONE
-    // dragon that far ahead of you. For soaks and for testing a fight without
-    // hunting for one (wild dragons tend to settle 70-100 m out). Fires once.
-    let mut dragon_at_pending: Option<f32> = std::env::var("UNENDLICH_DRAGON_AT")
-        .ok()
+    // UNENDLICH_DRAGON_AT=<metres>[:downwind]: 3 s after entering a world,
+    // hatch ONE dragon that far ahead of you (or downwind of you, where your
+    // scent goes). For soaks and for testing a fight without hunting for one
+    // (wild dragons tend to settle 70-100 m out). Fires once.
+    let dragon_at_raw = std::env::var("UNENDLICH_DRAGON_AT").unwrap_or_default();
+    let dragon_at_downwind = dragon_at_raw.ends_with(":downwind");
+    let mut dragon_at_pending: Option<f32> = dragon_at_raw
+        .split(':')
+        .next()
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|m| m.is_finite() && *m >= 4.0);
     let mut dragon_at_ingame_since: Option<Instant> = None;
@@ -4816,7 +4820,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 if since.elapsed().as_secs_f32() >= 3.0 {
                     dragon_at_pending = None;
                     let p = local_player.view.position;
-                    let yaw = local_player.view.yaw;
+                    let yaw = if dragon_at_downwind {
+                        let (wx, wz, _) = unendlich_engine::wind::wind_at(
+                            p.x as f64, p.y as f64, p.z as f64, sky_state.time_seconds as f64,
+                        );
+                        wz.atan2(wx)
+                    } else {
+                        local_player.view.yaw
+                    };
                     let (sx, sz) = (p.x + yaw.cos() * m, p.z + yaw.sin() * m);
                     let sy = chunk_manager
                         .generator()
@@ -4830,7 +4841,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         [sx, sy as f32, sz],
                         wseed,
                     ));
-                    log::info!("[dragon] UNENDLICH_DRAGON_AT: hatched a dragon {:.0} m ahead at ({:.0}, {}, {:.0})", m, sx, sy, sz);
+                    log::info!(
+                        "[dragon] UNENDLICH_DRAGON_AT: hatched a dragon {:.0} m {} at ({:.0}, {}, {:.0})",
+                        m, if dragon_at_downwind { "downwind" } else { "ahead" }, sx, sy, sz
+                    );
                 }
             }
         }
