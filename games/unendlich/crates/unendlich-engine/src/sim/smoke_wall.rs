@@ -35,6 +35,9 @@ pub struct SmokeVolume {
     pub density: f32,
     pub age: f32,
     pub life: f32,
+    /// Half-thickness when it was made: as it spreads it thins by
+    /// `across0 / half[1]` (a fixed "3" here diluted big puffs from birth).
+    pub across0: f32,
 }
 
 impl SmokeVolume {
@@ -51,6 +54,7 @@ impl SmokeVolume {
             density: 1.0,
             age: 0.0,
             life,
+            across0: 3.0,
         }
     }
 
@@ -84,7 +88,71 @@ impl SmokeVolume {
         let shape = soft(a, self.half[0]) * soft(c, self.half[1]) * soft(y, self.half[2]);
         let u = self.age / self.life.max(1e-3);
         let fade = if u < 0.5 { 1.0 } else { (1.0 - (u - 0.5) * 2.0).max(0.0) };
-        self.density * shape * fade * (3.0 / self.half[1].max(3.0))
+        self.density * shape * fade * (self.across0 / self.half[1].max(self.across0).max(1e-3))
+    }
+}
+
+/// A dragon that **smokes**: while active, it breathes out a puff every
+/// `spacing` metres (or `interval` seconds) wherever it is, so its cover moves
+/// with it. Nobody can camp in a dragon's smoke -- it takes the cover along,
+/// and the puffs it leaves behind thin out in `puff_life` seconds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Mantle {
+    /// Seconds of smoking left.
+    pub left: f32,
+    /// Puff size: horizontal radius and height (m) -- a large dragon smokes big.
+    pub radius: f32,
+    pub height: f32,
+    pub puff_life: f32,
+    last: Option<([f32; 3], f32)>,
+    t: f32,
+}
+
+impl Mantle {
+    pub fn new(duration: f32, body_radius: f32) -> Mantle {
+        Mantle {
+            left: duration.max(0.0),
+            radius: (body_radius * 2.0).clamp(4.0, 14.0),
+            height: (body_radius * 4.0).clamp(10.0, 30.0),
+            puff_life: 10.0,
+            last: None,
+            t: 0.0,
+        }
+    }
+
+    pub fn active(&self) -> bool {
+        self.left > 0.0
+    }
+
+    /// Advance; returns a new puff to add when one is due.
+    pub fn emit(&mut self, dragon_ground: [f32; 3], dt: f32) -> Option<SmokeVolume> {
+        let dt = if dt.is_finite() { dt.clamp(0.0, 1.0) } else { 0.0 };
+        self.t += dt;
+        if !self.active() || !dragon_ground.iter().all(|v| v.is_finite()) {
+            self.left = (self.left - dt).max(0.0);
+            return None;
+        }
+        self.left = (self.left - dt).max(0.0);
+        let due = match self.last {
+            None => true,
+            Some((p, t)) => {
+                let moved = ((p[0] - dragon_ground[0]).powi(2) + (p[2] - dragon_ground[2]).powi(2)).sqrt();
+                moved >= self.radius * 0.6 || self.t - t >= 0.8
+            }
+        };
+        if !due {
+            return None;
+        }
+        self.last = Some((dragon_ground, self.t));
+        Some(SmokeVolume {
+            center: [dragon_ground[0], dragon_ground[1] + self.height * 0.5, dragon_ground[2]],
+            along: [1.0, 0.0],
+            half: [self.radius, self.radius, self.height * 0.5],
+            density: 0.8,
+            age: 0.0,
+            life: self.puff_life,
+            across0: self.radius,
+        })
     }
 }
 
@@ -187,6 +255,52 @@ mod tests {
         let hatchling = transmittance(&[v], path.0, path.1, sensitivity(0, 4, 4));
         let air = transmittance(&[v], path.0, path.1, sensitivity(0, 4, 2));
         assert!(hatchling < SIGHT_FLOOR && air > SIGHT_FLOOR, "hatchling {hatchling} air {air}");
+    }
+
+    /// The cover moves with the dragon: where it is now is smoked; where it
+    /// was ten seconds ago is clear again -- no camping in its smoke.
+    #[test]
+    fn a_smoking_dragon_carries_its_cover() {
+        let mut m = Mantle::new(20.0, 4.0);
+        let mut vols: Vec<SmokeVolume> = Vec::new();
+        let mut pos = [0.0f32, 64.0, 0.0];
+        for _ in 0..(15.0 / 0.1) as usize {
+            pos[0] += 4.0 * 0.1; // it moves at 4 m/s
+            for v in vols.iter_mut() {
+                v.step([0.0, 0.0], 0.1);
+            }
+            vols.retain(|v| v.alive());
+            if let Some(p) = m.emit(pos, 0.1) {
+                vols.push(p);
+            }
+        }
+        let here = density_at(&vols, [pos[0], 66.0, 0.0]);
+        let start = density_at(&vols, [0.0, 66.0, 0.0]);
+        assert!(here > 0.5, "the dragon stands in its smoke: {here}");
+        assert!(start < 0.05, "where it began is clear again: {start}");
+        // An eye 30 m off cannot see it through its own cloud…
+        let t = transmittance(&vols, [pos[0] + 30.0, 66.0, 0.0], [pos[0], 66.0, 0.0], 1.0);
+        assert!(t < SIGHT_FLOOR, "t {t}");
+        // …and it stops smoking when the mantle runs out.
+        let mut spent = Mantle::new(0.5, 4.0);
+        let n = (0..50).filter_map(|_| spent.emit([0.0, 64.0, 0.0], 0.1)).count();
+        assert!(n <= 1);
+    }
+
+    #[test]
+    fn a_fast_dragon_does_not_outrun_its_smoke() {
+        let mut m = Mantle::new(10.0, 4.0);
+        let mut last: Option<f32> = None;
+        let mut x = 0.0f32;
+        for _ in 0..100 {
+            x += 15.0 * 0.05; // 15 m/s
+            if let Some(p) = m.emit([x, 64.0, 0.0], 0.05) {
+                if let Some(l) = last {
+                    assert!(p.center[0] - l <= m.radius * 0.6 + 0.8, "gap {}", p.center[0] - l);
+                }
+                last = Some(p.center[0]);
+            }
+        }
     }
 
     #[test]

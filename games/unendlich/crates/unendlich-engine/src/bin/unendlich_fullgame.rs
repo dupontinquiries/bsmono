@@ -218,6 +218,13 @@ struct DragonDuel {
     rep: unendlich_engine::sim::dragon_abilities::Repertoire,
     caster: unendlich_engine::sim::dragon_cast::Caster,
     areas: Vec<unendlich_engine::sim::dragon_cast::Area>,
+    /// Smoking (sim::smoke_wall::Mantle): its cover moves with it.
+    mantle: Option<unendlich_engine::sim::smoke_wall::Mantle>,
+    /// How much of it YOU can see through smoke (transmittance), and how
+    /// visible its eyes are right now (sim::smoke_tells) -- read by the
+    /// renderer to fade the body and draw the eyes.
+    view_t: f32,
+    eyes: f32,
 }
 
 /// Top ground speed of an engaged dragon at `speed01 = 1` (blocks/s). Wander
@@ -275,7 +282,51 @@ fn dragon_duel_for(
         caster: unendlich_engine::sim::dragon_cast::Caster::new(&rep),
         rep,
         areas: Vec::new(),
+        mantle: None,
+        view_t: 1.0,
+        eyes: 0.0,
     }))
+}
+
+/// An axis-aligned glowing box (a dragon's eye), appended to the entity stream.
+fn push_glow_box(
+    everts: &mut Vec<unendlich_engine::world::entity::EntityVertex>,
+    eindices: &mut Vec<u32>,
+    c: [f32; 3],
+    h: [f32; 3],
+    color: [f32; 3],
+    alpha: f32,
+) {
+    push_oriented_box(everts, eindices, c, h, [1.0, 0.0], color, alpha);
+}
+
+/// A box of half-extents `h` (along, across, up) turned so `along` is its
+/// first axis, appended to the entity stream with one colour and alpha.
+fn push_oriented_box(
+    everts: &mut Vec<unendlich_engine::world::entity::EntityVertex>,
+    eindices: &mut Vec<u32>,
+    c: [f32; 3],
+    h: [f32; 3],
+    along: [f32; 2],
+    color: [f32; 3],
+    alpha: f32,
+) {
+    let (ax, az) = (along[0], along[1]);
+    let base = everts.len() as u32;
+    for &(sa, sc, sy) in &[
+        (-1.0f32, -1.0f32, -1.0f32), (1.0, -1.0, -1.0), (1.0, 1.0, -1.0), (-1.0, 1.0, -1.0),
+        (-1.0, -1.0, 1.0), (1.0, -1.0, 1.0), (1.0, 1.0, 1.0), (-1.0, 1.0, 1.0),
+    ] {
+        let (la, lc) = (sa * h[0], sc * h[1]);
+        everts.push(unendlich_engine::world::entity::EntityVertex {
+            position: [c[0] + la * ax - lc * az, c[1] + sy * h[2], c[2] + la * az + lc * ax],
+            color,
+            alpha,
+        });
+    }
+    for f in [[0u32, 1, 2, 0, 2, 3], [4, 6, 5, 4, 7, 6], [0, 4, 5, 0, 5, 1], [3, 2, 6, 3, 6, 7], [0, 3, 7, 0, 7, 4], [1, 5, 6, 1, 6, 2]] {
+        eindices.extend(f.iter().map(|i| i + base));
+    }
 }
 
 /// The dragon's own genome. Every dragon roamer carries a duel record (all
@@ -2581,12 +2632,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // ways. Stepped with the wind each frame; the player's fog thickens inside.
     let mut smoke_walls: Vec<unendlich_engine::sim::smoke_wall::SmokeVolume> = Vec::new();
     let mut in_smoke_wall = false;
+    // Brightest directionless flash leaking from a dragon's smoke this frame
+    // (sim::smoke_tells); lifts the ambient light for that frame.
+    let mut smoke_flash: f32 = 0.0;
+    let mut smoke_flash_shown: f32;
     // UNENDLICH_DRAGON_AT=<metres>[:downwind]: 3 s after entering a world,
     // hatch ONE dragon that far ahead of you (or downwind of you, where your
     // scent goes). For soaks and for testing a fight without hunting for one
     // (wild dragons tend to settle 70-100 m out). Fires once.
     let dragon_at_raw = std::env::var("UNENDLICH_DRAGON_AT").unwrap_or_default();
-    let dragon_at_downwind = dragon_at_raw.ends_with(":downwind");
+    let dragon_at_downwind = dragon_at_raw.contains(":downwind");
+    // …[:smoke]: it hatches smoking (a 30 s Mantle) -- for trying the smoke
+    // fight (hidden, repositioning, flashes, eyes) without waiting for a Fire
+    // master to decide to smoke.
+    let dragon_at_smoke = dragon_at_raw.contains(":smoke");
     let mut dragon_at_pending: Option<f32> = dragon_at_raw
         .split(':')
         .next()
@@ -4870,6 +4929,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         [sx, sy as f32, sz],
                         wseed,
                     ));
+                    if dragon_at_smoke {
+                        if let Some(r) = roamers.last_mut() {
+                            let he = r.creature.body.half_extents;
+                            if let Some(d) = r.duel.as_mut() {
+                                d.mantle = Some(unendlich_engine::sim::smoke_wall::Mantle::new(30.0, he[0].max(he[2])));
+                                log::info!("[dragon] UNENDLICH_DRAGON_AT …:smoke — it hatches smoking");
+                            }
+                        }
+                    }
                     log::info!(
                         "[dragon] UNENDLICH_DRAGON_AT: hatched a dragon {:.0} m {} at ({:.0}, {}, {:.0})",
                         m, if dragon_at_downwind { "downwind" } else { "ahead" }, sx, sy, sz
@@ -10962,6 +11030,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             }
                         }
                         let dist = senses.dist;
+                        // Can YOU see IT? Same Beer-Lambert model, your eyes
+                        // (sensitivity 1). In its smoke it is hidden from you;
+                        // it outpositions (Tactic::Reposition) rather than charging.
+                        d.view_t = unendlich_engine::sim::smoke_wall::transmittance(
+                            &smoke_walls,
+                            pv.eye,
+                            [cr.body.position[0], cr.body.position[1] + cr.body.half_extents[1] * 0.5, cr.body.position[2]],
+                            1.0,
+                        );
+                        senses.hidden = d.view_t < unendlich_engine::sim::smoke_wall::SIGHT_FLOOR;
                         // What its bending offers (only against what it can see:
                         // no blind casting at a belief).
                         let cunning_now = (d.profile.cunning * duel_tuning.cunning).clamp(0.0, 1.0);
@@ -11135,6 +11213,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                         smoke_walls.push(unendlich_engine::sim::smoke_wall::SmokeVolume::wall(
                                             area.center, area.from, feet, len, height, area.ability.linger_s,
                                         ));
+                                        // …and it keeps smoking as it moves: its cover goes
+                                        // with it, so the wall is not yours to camp behind.
+                                        d.mantle = Some(unendlich_engine::sim::smoke_wall::Mantle::new(
+                                            area.ability.linger_s * 0.6, dbody.radius(),
+                                        ));
                                         log::info!(
                                             "[dragon#{:04x}] a wall of smoke {:.0} m long, {:.0} m tall rises between you — it cannot see you now, nor you it; it still smells and hears",
                                             tag, len, height
@@ -11163,6 +11246,29 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 }
                             }
                             d.areas.retain(|a| a.alive());
+                            // Smoking: lay a puff where it is now.
+                            if let Some(m) = d.mantle.as_mut() {
+                                let ground = [cr.body.position[0], cr.body.position[1] - cr.body.half_extents[1], cr.body.position[2]];
+                                if let Some(p) = m.emit(ground, dt) {
+                                    smoke_walls.push(p);
+                                }
+                                if !m.active() {
+                                    d.mantle = None;
+                                }
+                            }
+                            // What leaks out of the smoke: directionless flashes
+                            // while it charges, its eyes just before a lunge or breath.
+                            let strike_in = match d.state.tactic {
+                                dd::Tactic::Lunge if d.state.held < dd::LUNGE_TIME * 0.5 => Some(dd::LUNGE_TIME * 0.5 - d.state.held),
+                                dd::Tactic::Breath if d.state.held < 0.4 => Some(0.4 - d.state.held),
+                                _ => None,
+                            };
+                            let tell = unendlich_engine::sim::smoke_tells::tell(d.view_t, charge, strike_in, cunning_now, senses_now);
+                            if tell.eyes > 0.0 && d.eyes == 0.0 {
+                                log::info!("[dragon#{:04x}] eyes open in the smoke ({:.0}% through)", tag, tell.eyes * 100.0);
+                            }
+                            d.eyes = tell.eyes;
+                            smoke_flash = smoke_flash.max(tell.flash);
                             // The wind-up is visible: it glows in its element's hue
                             // as the charge builds (was the old bending AI's tell).
                             if charge > 0.0 {
@@ -14113,6 +14219,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             let sun_dir = sky_state.sun_direction();
             let mut sun_intensity = sky_state.directional_intensity();
             let mut ambient = sky_state.ambient_color();
+            // A dragon charging inside its smoke lights the cloud: a flash
+            // with no direction (sim::smoke_tells).
+            if smoke_flash > 0.0 {
+                for k in 0..3 {
+                    ambient[k] *= 1.0 + 2.5 * smoke_flash * [1.0, 0.85, 0.6][k];
+                }
+            }
+            smoke_flash_shown = smoke_flash; // the smoke impostors read it below
+            smoke_flash = 0.0;
             let mut sky_rgba = sky_state.sky_color_rgba();
             let mut fog_density = 0.012_f32;
             // Weather (opt-in) reshapes the atmosphere: greyed sky, dimmer sun,
@@ -15112,10 +15227,52 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     unendlich_engine::sim::ragdoll_bridge::sample_body_local(&d.nodes, cr.body.position, cr.yaw)
                 });
                 let rd = sample.as_ref().map(|(body, parts)| unendlich_engine::anim_rig::RagdollSample { body: *body, parts });
-                let (cv, ci) = unendlich_engine::world::entity::creature_to_vertices_rigged(cr, &motion, rd.as_ref(), 0.0);
+                let (mut cv, ci) = unendlich_engine::world::entity::creature_to_vertices_rigged(cr, &motion, rd.as_ref(), 0.0);
+                // In smoke you see less of it, down to nothing (same model as
+                // its eyes on you) -- except its eyes, just before it strikes.
+                if let Some(d) = r.duel.as_ref() {
+                    let a = ((d.view_t - 0.05) / (unendlich_engine::sim::smoke_wall::SIGHT_FLOOR + 0.1 - 0.05)).clamp(0.0, 1.0);
+                    if a < 0.999 {
+                        for v in cv.iter_mut() {
+                            v.alpha *= a;
+                        }
+                    }
+                    if d.eyes > 0.0 {
+                        let hr = cr.body.half_extents[0].max(cr.body.half_extents[2]);
+                        let (fx, fz) = (cr.yaw.cos(), cr.yaw.sin());
+                        let hy = cr.body.position[1] + cr.body.half_extents[1] * 0.7;
+                        let glow = unendlich_engine::spawn::dragon_tint(&d.genome);
+                        for side in [-1.0f32, 1.0] {
+                            let c = [
+                                cr.body.position[0] + fx * hr * 0.95 - fz * side * hr * 0.12,
+                                hy,
+                                cr.body.position[2] + fz * hr * 0.95 + fx * side * hr * 0.12,
+                            ];
+                            push_glow_box(everts, eindices, c, [0.14 * hr.max(1.0) * 0.3; 3], [1.0 + glow[0], 0.9 + glow[1] * 0.5, 0.4], d.eyes);
+                        }
+                    }
+                }
                 let base = everts.len() as u32;
                 everts.extend(cv);
                 eindices.extend(ci.iter().map(|i| i + base));
+            }
+            // Dragons' smoke, drawn as translucent volumes (no volumetric pass
+            // exists; the entity pipeline blends per-vertex alpha). Denser =
+            // more opaque; a charging dragon's flash lights it.
+            for w in &smoke_walls {
+                let dens = w.density_at(w.center);
+                if dens <= 0.01 {
+                    continue;
+                }
+                let lit = smoke_flash_shown * 0.6;
+                let col = [0.22 + lit, 0.21 + lit * 0.85, 0.2 + lit * 0.6];
+                for (scale, a) in [(1.0f32, 0.18f32), (0.7, 0.22), (0.4, 0.28)] {
+                    push_oriented_box(
+                        everts, eindices, w.center,
+                        [w.half[0] * scale, w.half[1] * scale, w.half[2] * scale],
+                        w.along, col, (a * dens).min(0.6),
+                    );
+                }
             }
             // Append sim mobs via the bridge.
             {

@@ -299,6 +299,9 @@ pub enum Tactic {
     Track,
     /// Bending: gathering one of its `dragon_abilities` (see `dragon_cast`).
     Cast,
+    /// Unseen (in its smoke, behind cover): working round to your back, or --
+    /// hurt -- opening distance, instead of coming straight at you.
+    Reposition,
 }
 
 impl Tactic {
@@ -313,6 +316,7 @@ impl Tactic {
             Tactic::Retreat => "retreat",
             Tactic::Track => "track",
             Tactic::Cast => "cast",
+            Tactic::Reposition => "reposition",
         }
     }
 }
@@ -392,6 +396,12 @@ pub struct DuelSenses {
     /// What its bending offers right now (from `dragon_cast::Caster` in the
     /// shell): `None` if nothing is ready and nothing is being gathered.
     pub cast: Option<CastOption>,
+    /// YOU cannot see IT (its smoke, terrain between) -- the shell computes
+    /// this with the same Beer-Lambert model as the dragon's eyes.
+    pub hidden: bool,
+    /// World yaw you face (from your view). Only trusted while it can see you;
+    /// out of sight it uses the last facing it saw.
+    pub player_yaw: f32,
 }
 
 /// A bending option, summarised for the tactical choice.
@@ -454,6 +464,8 @@ pub struct DuelState {
     pub belief: Option<(f32, f32)>,
     /// Seconds without sight of you.
     pub unseen_for: f32,
+    /// The way you were facing when it last saw you.
+    pub last_player_yaw: f32,
     /// The current Breath tactic has fired. Breath stays committed until it
     /// fires or [`BREATH_AIM_TIMEOUT`] passes: a slow-turning (flying) dragon
     /// needs longer than the draw to bring its snout round, and the first
@@ -477,6 +489,7 @@ impl DuelState {
             feint_in: true,
             belief: None,
             unseen_for: 0.0,
+            last_player_yaw: 0.0,
             breath_fired: false,
             mem: DuelMemory::new(),
         }
@@ -519,7 +532,7 @@ pub struct DuelOut {
     pub why: Why,
     /// Every tactic's score this tick, so a log or HUD can show the runner-up
     /// and how close it was. All `-1.0` while unaware.
-    pub scores: [(Tactic, f32); 7],
+    pub scores: [(Tactic, f32); 8],
     /// `Some(defensive)` on the tick it decides to cast: the shell picks the
     /// ability (`dragon_cast::Caster::choose`) and starts the wind-up.
     pub begin_cast: Option<bool>,
@@ -543,7 +556,8 @@ pub const ROAR_COOLDOWN: f32 = 45.0;
 pub const DREAD_RADIUS: f32 = 30.0;
 const MIN_HOLD: f32 = 0.6;
 const SWITCH_MARGIN: f32 = 0.15;
-const LUNGE_TIME: f32 = 0.55;
+/// Length of a lunge; the bite lands at its midpoint.
+pub const LUNGE_TIME: f32 = 0.55;
 const LUNGE_COOLDOWN: f32 = 2.2;
 /// Longest a Breath tactic waits to line up its shot before giving up.
 pub const BREATH_AIM_TIMEOUT: f32 = 3.0;
@@ -572,6 +586,7 @@ fn believed(st: &mut DuelState, s: &DuelSenses, dt: f32) -> DuelSenses {
     if s.can_see {
         st.unseen_for = 0.0;
         st.belief = Some((s.dist, s.to_player_yaw));
+        st.last_player_yaw = s.player_yaw;
         return *s;
     }
     st.unseen_for += dt;
@@ -591,6 +606,7 @@ fn believed(st: &mut DuelState, s: &DuelSenses, dt: f32) -> DuelSenses {
         }
     }
     b.player_facing = 0.0; // it cannot see which way you face
+    b.player_yaw = st.last_player_yaw;
     b
 }
 
@@ -705,6 +721,7 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
                 (Tactic::Breath, -1.0),
                 (Tactic::Retreat, -1.0),
                 (Tactic::Cast, -1.0),
+                (Tactic::Reposition, -1.0),
             ],
             begin_cast: None,
         };
@@ -721,7 +738,7 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
     let breath_ok = st.fuel >= BREATH_COST && dist <= p.breath.max_range && dist > lunge_range * 0.8;
     let retreat_hp = 0.18 + 0.2 * cunning;
 
-    let mut score = [(Tactic::Stalk, f32::MIN); 7];
+    let mut score = [(Tactic::Stalk, f32::MIN); 8];
     score[0] = (Tactic::Stalk, if !watched && dist > lunge_range { 0.4 + 0.4 * cunning } else { -1.0 });
     score[1] = (Tactic::Circle, if watched { 0.35 + 0.3 * cunning - boldness * 0.2 } else { 0.1 });
     score[2] = (
@@ -739,6 +756,10 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
             -1.0
         },
     );
+    // Where it is around you, relative to your back (0 = right behind you).
+    let around = wrap((s.to_player_yaw + PI) - (s.player_yaw + PI));
+    let behind_you = around.abs() < 0.7;
+    let hurt = s.hp01 < 0.55;
     score[3] = (
         Tactic::Lunge,
         if st.lunge_cd <= 0.0 && dist < lunge_range + 2.0 {
@@ -769,7 +790,12 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
     // counters it -- put the land between you. A cast in progress holds
     // through `committed` below.
     let c = s.cast;
-    let defend = c.map_or(false, |c| c.defence_ready) && s.hp01 < 0.55 && (counter > 1.0 || pain_now > 0.08);
+    // Defence: hurt by what you hold -- or, if cunning, BEFORE it is hurt:
+    // a weapon that counters it, close, is reason enough to fight on its own
+    // terms (smoke, a wall) and outposition you rather than trade blows.
+    let defend = c.map_or(false, |c| c.defence_ready)
+        && ((s.hp01 < 0.55 && (counter > 1.0 || pain_now > 0.08))
+            || (counter > 1.0 && cunning > 0.6 && dist < safe_gap + 6.0));
     score[6] = (
         Tactic::Cast,
         if defend {
@@ -778,6 +804,17 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
             0.5 + 0.35 * c.map_or(0.0, |c| c.value)
                 + (counter - 1.0).max(0.0) * 0.3 * cunning
                 + (respect_reach - 1.5).max(0.0) * 0.08
+        } else {
+            -1.0
+        },
+    );
+
+    // Unseen, it outpositions rather than charging: round to your back while
+    // healthy; hurt, it opens distance instead of fleeing outright.
+    score[7] = (
+        Tactic::Reposition,
+        if s.hidden && dist < DISENGAGE && (hurt || !behind_you) {
+            0.55 + 0.5 * cunning + if hurt { 0.3 } else { 0.0 }
         } else {
             -1.0
         },
@@ -880,6 +917,14 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
                 begin_cast = Some(defend);
             }
             (toward, 0.1, if defend { "raising the land between you" } else { "gathering its bending" })
+        }
+        Tactic::Reposition => {
+            let want = if hurt { safe_gap + 10.0 } else { safe_gap + 2.0 };
+            let radial = ((dist - want) / 6.0).clamp(-1.0, 1.0);
+            // Go round the way that reaches your back soonest.
+            let dir = if around < 0.0 { 1.0 } else { -1.0 };
+            let h = toward - dir * (FRAC_PI_2 - radial * 0.7);
+            (h, 0.8, if hurt { "falling back into the smoke" } else { "slipping round behind you in the smoke" })
         }
         Tactic::Unaware | Tactic::Track => (s.self_yaw, 0.0, "not engaged"),
     };
@@ -991,6 +1036,8 @@ pub fn senses_for(
         body_radius: body.radius(),
         lead: None,
         cast: None,
+        hidden: false,
+        player_yaw: player.forward[2].atan2(player.forward[0]),
     }
 }
 
@@ -1093,6 +1140,8 @@ mod tests {
             body_radius: 2.0,
             lead: None,
             cast: None,
+            hidden: false,
+            player_yaw: PI, // at +x from the dragon, facing it
         }
     }
 
@@ -1276,6 +1325,8 @@ mod tests {
                 body_radius: 2.0,
                 lead: None,
                 cast: None,
+                hidden: false,
+                player_yaw: pyaw,
             };
             let o = step(st, p, &s, DuelTuning::default(), dt);
             let e = wrap(o.heading - yaw);
@@ -1511,7 +1562,7 @@ mod tests {
             roar: false,
             dread: 0.0,
             why: Why { boldness: 0.0, counter: 1.0, respect_reach: 1.0, safe_gap: 1.0, reason: "" },
-            scores: [(Tactic::Circle, 0.0); 7],
+            scores: [(Tactic::Circle, 0.0); 8],
             begin_cast: None,
         }
     }
@@ -1945,6 +1996,106 @@ mod tests {
         calm.item = None;
         let o = step(&mut st2, &p, &calm, DuelTuning::default(), 0.05);
         assert_eq!(o.begin_cast, Some(false));
+    }
+
+    /// In its smoke: you face where it was; it smells/hears you, you cannot
+    /// see it. It works round to your back and strikes from there.
+    fn smoke_bout(hidden: bool, hp01: f32, secs: f32) -> (Vec<DuelOut>, Vec<f32>, f32) {
+        let mut p = DuelProfile::from_genome(&genome(4));
+        p.cunning = 0.8;
+        p.ferocity = 0.6;
+        p.breath.max_range = 0.0;
+        let mut st = DuelState::new(2);
+        // It saw you once at 15 m, in front of you (you face +x, it is at +x).
+        let mut s0 = senses(15.0);
+        s0.to_player_yaw = PI;
+        s0.player_yaw = 0.0;
+        step(&mut st, &p, &s0, DuelTuning::default(), 0.05);
+        let (mut x, mut z, mut yaw) = (15.0f32, 0.0f32, PI);
+        let mut outs = vec![];
+        let mut arounds = vec![];
+        let mut min_d = f32::MAX;
+        for _ in 0..(secs / 0.05) as usize {
+            let d = (x * x + z * z).sqrt();
+            min_d = min_d.min(d);
+            let toward = (-z).atan2(-x);
+            let mut s = senses(d);
+            s.can_see = !hidden;
+            s.hidden = hidden;
+            s.self_yaw = yaw;
+            s.to_player_yaw = toward;
+            s.player_yaw = 0.0;
+            s.player_facing = ((x / d.max(1e-3)) * 1.0).clamp(-1.0, 1.0);
+            s.hp01 = hp01;
+            // It keeps you by nose and ear: an exact lead.
+            s.lead = Some(Lead { est_dist: Some(d), heading: toward, speed01: 0.6, confidence: 0.8, kind: LeadKind::Sound { metal: false } });
+            let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
+            arounds.push(wrap(z.atan2(x) - PI).abs()); // 0 = right behind you
+            yaw = wrap(yaw + wrap(o.heading - yaw).clamp(-3.0 * 0.05, 3.0 * 0.05));
+            x += yaw.cos() * 7.0 * o.speed01 * 0.05;
+            z += yaw.sin() * 7.0 * o.speed01 * 0.05;
+            let dd = (x * x + z * z).sqrt();
+            if dd < 2.0 {
+                x *= 2.0 / dd.max(1e-3);
+                z *= 2.0 / dd.max(1e-3);
+            }
+            outs.push(o);
+        }
+        (outs, arounds, min_d)
+    }
+
+    #[test]
+    fn unseen_in_its_smoke_it_works_round_behind_you_then_strikes() {
+        let (outs, arounds, _) = smoke_bout(true, 1.0, 20.0);
+        assert!(outs.iter().any(|o| o.tactic == Tactic::Reposition), "never repositioned");
+        let first_bite = outs.iter().position(|o| o.bite).expect("never struck");
+        assert!(arounds[first_bite] < 0.9, "struck from {:.2} rad off your back, not from behind", arounds[first_bite]);
+        // It did not come straight at your face first.
+        let first_lunge = outs.iter().position(|o| o.tactic == Tactic::Lunge).unwrap();
+        assert!(outs[..first_lunge].iter().any(|o| o.tactic == Tactic::Reposition));
+    }
+
+    #[test]
+    fn out_of_sight_it_uses_the_facing_it_last_saw() {
+        let mut st = DuelState::new(0);
+        let mut s = senses(20.0);
+        s.player_yaw = 0.0;
+        believed(&mut st, &s, 0.05);
+        s.can_see = false;
+        s.player_yaw = 2.0; // you turned while it could not see you
+        let b = believed(&mut st, &s, 0.05);
+        assert_eq!(b.player_yaw, 0.0);
+    }
+
+    #[test]
+    fn a_cunning_dragon_smokes_first_against_a_countering_weapon() {
+        let mk = |cunning: f32| {
+            let mut p = DuelProfile::from_genome(&genome(4)); // Fire
+            p.cunning = cunning;
+            let mut st = DuelState::new(1);
+            st.fuel = 0.0;
+            let mut s = senses(8.0);
+            s.item = Some(ItemThreat { element: Some(3), damage: 20.0, reach: 2.0 }); // Dust counters Fire
+            s.cast = Some(CastOption { offence_ready: true, defence_ready: true, value: 0.5, busy: false });
+            step(&mut st, &p, &s, DuelTuning::default(), 0.05)
+        };
+        assert_eq!(mk(0.9).begin_cast, Some(true), "unhurt, but it sees what you hold");
+        assert_ne!(mk(0.2).begin_cast, Some(true), "a dull one only learns when hurt");
+    }
+
+    #[test]
+    fn seen_it_does_not_bother_repositioning() {
+        let (outs, _, _) = smoke_bout(false, 1.0, 10.0);
+        assert!(!outs.iter().any(|o| o.tactic == Tactic::Reposition));
+    }
+
+    #[test]
+    fn hurt_and_unseen_it_opens_distance_instead_of_pressing() {
+        let (outs, _, min_d) = smoke_bout(true, 0.45, 12.0);
+        assert!(outs.iter().filter(|o| o.tactic == Tactic::Reposition).count() > outs.len() / 2);
+        assert!(outs.iter().any(|o| o.why.reason == "falling back into the smoke"));
+        assert!(!outs.iter().any(|o| o.bite), "hurt, it does not press in");
+        assert!(min_d > 8.0, "came within {min_d:.1} m");
     }
 
     #[test]
