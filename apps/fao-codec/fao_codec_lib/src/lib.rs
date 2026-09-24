@@ -3108,73 +3108,73 @@ impl Archive {
 
     pub fn load_manifest(path: &std::path::Path) -> Result<Self, String> {
         let buf = std::fs::read(path).map_err(|e| e.to_string())?;
-        if buf.len() < 28 || &buf[..8] != b"FAOLIB01" {
+        if buf.len() < 8 || &buf[..8] != b"FAOLIB01" {
             return Err("Invalid manifest".into());
         }
-        let mut pos = 8usize;
-        let name_len = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
-        pos += 4;
-        let name = String::from_utf8_lossy(&buf[pos..pos+name_len]).to_string();
-        pos += name_len;
-        let created_at = u64::from_le_bytes(buf[pos..pos+8].try_into().unwrap_or([0;8]));
-        pos += 8;
-        let modified_at = u64::from_le_bytes(buf[pos..pos+8].try_into().unwrap_or([0;8]));
-        pos += 8;
-        let n_entries = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
-        pos += 4;
-
+        // Every read is bounds-checked: this parses a file the user picked, and a truncated or
+        // damaged manifest must be an error the app can show, not a panic that closes it.
+        // (The previous parser sliced unchecked past a 28-byte length guard; truncating a
+        // valid manifest to 28 bytes panicked it.) Same format as save_manifest.
+        struct Cur<'a> { b: &'a [u8], pos: usize }
+        impl<'a> Cur<'a> {
+            fn take(&mut self, n: usize, what: &str) -> Result<&'a [u8], String> {
+                let end = self.pos.checked_add(n).filter(|e| *e <= self.b.len())
+                    .ok_or_else(|| format!("manifest truncated reading {what} at byte {}", self.pos))?;
+                let s = &self.b[self.pos..end];
+                self.pos = end;
+                Ok(s)
+            }
+            fn u32(&mut self, what: &str) -> Result<u32, String> { Ok(u32::from_le_bytes(self.take(4, what)?.try_into().unwrap())) }
+            fn u64(&mut self, what: &str) -> Result<u64, String> { Ok(u64::from_le_bytes(self.take(8, what)?.try_into().unwrap())) }
+            fn f32(&mut self, what: &str) -> Result<f32, String> { Ok(f32::from_le_bytes(self.take(4, what)?.try_into().unwrap())) }
+            fn string(&mut self, what: &str) -> Result<String, String> {
+                let n = self.u32(what)? as usize;
+                Ok(String::from_utf8_lossy(self.take(n, what)?).to_string())
+            }
+            /// A count of items each at least `min` bytes: bounded by what is left, so a
+            /// damaged count cannot make the parser allocate or loop for billions of entries.
+            fn count(&mut self, min: usize, what: &str) -> Result<usize, String> {
+                let n = self.u32(what)? as usize;
+                if n.saturating_mul(min) > self.b.len() - self.pos {
+                    return Err(format!("manifest {what} count {n} exceeds the file"));
+                }
+                Ok(n)
+            }
+        }
+        let mut c = Cur { b: &buf, pos: 8 };
+        let name = c.string("name")?;
+        let created_at = c.u64("created_at")?;
+        let modified_at = c.u64("modified_at")?;
+        // An entry is at least: id 4, three strings 12, fixed fields 40, three counts 12.
+        let n_entries = c.count(68, "entry")?;
         let mut entries = Vec::with_capacity(n_entries);
         let mut total_size = 0u64;
         for _ in 0..n_entries {
-            if pos + 4 > buf.len() { break; }
-            let id = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]);
-            pos += 4;
-            let title = read_string(&buf, &mut pos);
-            let source_path = read_string(&buf, &mut pos);
-            let fao_path = read_string(&buf, &mut pos);
-            if pos + 36 > buf.len() { break; }
-            let width = u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap_or([0;4]));
-            pos += 4;
-            let height = u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap_or([0;4]));
-            pos += 4;
-            let fps = f32::from_le_bytes(buf[pos..pos+4].try_into().unwrap_or([0;4]));
-            pos += 4;
-            let frame_count = u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap_or([0;4]));
-            pos += 4;
-            let duration_secs = f32::from_le_bytes(buf[pos..pos+4].try_into().unwrap_or([0;4]));
-            pos += 4;
-            let file_size_bytes = u64::from_le_bytes(buf[pos..pos+8].try_into().unwrap_or([0;8]));
-            pos += 8;
-            let entry_created = u64::from_le_bytes(buf[pos..pos+8].try_into().unwrap_or([0;8]));
-            pos += 8;
-            let n_chapters = u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap_or([0;4])) as usize;
-            pos += 4;
+            let id = c.u32("entry id")?;
+            let title = c.string("title")?;
+            let source_path = c.string("source_path")?;
+            let fao_path = c.string("fao_path")?;
+            let width = c.u32("width")?;
+            let height = c.u32("height")?;
+            let fps = c.f32("fps")?;
+            let frame_count = c.u32("frame_count")?;
+            let duration_secs = c.f32("duration")?;
+            let file_size_bytes = c.u64("file_size")?;
+            let entry_created = c.u64("entry created_at")?;
+            let n_chapters = c.count(16, "chapter")?;
             let mut chapters = Vec::with_capacity(n_chapters);
             for _ in 0..n_chapters {
-                if pos + 12 > buf.len() { break; }
-                let sf = u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap_or([0;4]));
-                pos += 4;
-                let ef = u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap_or([0;4]));
-                pos += 4;
-                let ti = u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap_or([0;4]));
-                pos += 4;
-                let title = read_string(&buf, &mut pos);
+                let sf = c.u32("chapter start")?;
+                let ef = c.u32("chapter end")?;
+                let ti = c.u32("chapter thumbnail")?;
+                let title = c.string("chapter title")?;
                 chapters.push(Chapter { start_frame: sf, end_frame: ef, thumbnail_idx: ti, title });
             }
-            let n_tags = u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap_or([0;4])) as usize;
-            pos += 4;
+            let n_tags = c.count(4, "tag")?;
             let mut tags = Vec::with_capacity(n_tags);
-            for _ in 0..n_tags {
-                tags.push(read_string(&buf, &mut pos));
-            }
-            let thumb_len = u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap_or([0;4])) as usize;
-            pos += 4;
-            let thumbnail_data = if pos + thumb_len <= buf.len() {
-                let t = buf[pos..pos+thumb_len].to_vec();
-                pos += thumb_len;
-                t
-            } else { Vec::new() };
-
+            for _ in 0..n_tags { tags.push(c.string("tag")?); }
+            let thumb_len = c.u32("thumbnail length")? as usize;
+            let thumbnail_data = c.take(thumb_len, "thumbnail")?.to_vec();
             total_size += file_size_bytes;
             entries.push(VideoEntry {
                 id, title, source_path, fao_path, width, height, fps,
@@ -3182,16 +3182,13 @@ impl Archive {
                 created_at: entry_created, chapters, tags, thumbnail_data,
             });
         }
-
-        // Read trailer fields (if present)
-        let content_class = if pos < buf.len() {
-            read_string(&buf, &mut pos)
-        } else { String::new() };
-        let bsp = if pos < buf.len() {
-            let s = read_string(&buf, &mut pos);
+        // Trailer (forward-compat, optional): content_class, block_store_path.
+        let content_class = if c.pos < buf.len() { c.string("content_class")? } else { String::new() };
+        let bsp = if c.pos < buf.len() {
+            let s = c.string("block_store_path")?;
             if s.is_empty() { None } else { Some(s) }
         } else { None };
-        
+
         Ok(Archive {
             name,
             root_path: path.parent().map(|p| p.display().to_string()).unwrap_or_default(),
@@ -7661,3 +7658,51 @@ mod dct_frame_tests {
     }
 }
 
+
+#[cfg(test)]
+mod archive_manifest_tests {
+    use super::*;
+
+    fn sample() -> Archive {
+        let mut a = Archive::new("holiday".into(), "/tmp/x".into());
+        a.content_class = "camera".into();
+        a.add_video(VideoEntry {
+            id: 0, title: "beach".into(), source_path: "/src/beach.mp4".into(), fao_path: "/tmp/x/beach.fao".into(),
+            width: 1280, height: 720, fps: 29.97, frame_count: 300, duration_secs: 10.01, file_size_bytes: 123_456,
+            created_at: 1_700_000_000,
+            chapters: vec![Chapter { start_frame: 0, end_frame: 99, title: "arrival".into(), thumbnail_idx: 5 }],
+            tags: vec!["sea".into(), "2026".into()], thumbnail_data: vec![1, 2, 3, 4],
+        });
+        a
+    }
+
+    #[test]
+    fn a_manifest_round_trips_and_a_damaged_one_is_an_error_not_a_panic() {
+        let dir = std::env::temp_dir().join(format!("faolib-manifest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("archive.fao_lib");
+        let a = sample();
+        a.save_manifest(&p).unwrap();
+        let b = Archive::load_manifest(&p).unwrap();
+        assert_eq!((b.name.as_str(), b.content_class.as_str(), b.entries.len()), ("holiday", "camera", 1));
+        let e = &b.entries[0];
+        assert_eq!((e.title.as_str(), e.fao_path.as_str(), e.width, e.height, e.frame_count, e.file_size_bytes), ("beach", "/tmp/x/beach.fao", 1280, 720, 300, 123_456));
+        assert_eq!((e.chapters.len(), e.chapters[0].title.as_str(), e.tags.clone(), e.thumbnail_data.clone()), (1, "arrival", vec!["sea".to_string(), "2026".to_string()], vec![1, 2, 3, 4]));
+        assert_eq!(b.root_path, dir.display().to_string(), "root is the manifest's folder");
+        // Every truncation, and a few corruptions, must return, not panic.
+        let full = std::fs::read(&p).unwrap();
+        let q = dir.join("damaged.fao_lib");
+        let mut cases: Vec<Vec<u8>> = (0..full.len()).map(|n| full[..n].to_vec()).collect();
+        for at in [8usize, 12, 30, 40] {
+            let mut c = full.clone();
+            if at + 4 <= c.len() { c[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes()); }
+            cases.push(c);
+        }
+        for (i, c) in cases.iter().enumerate() {
+            std::fs::write(&q, c).unwrap();
+            let r = std::panic::catch_unwind(|| Archive::load_manifest(&q));
+            assert!(r.is_ok(), "case {i} ({} bytes) panicked", c.len());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
