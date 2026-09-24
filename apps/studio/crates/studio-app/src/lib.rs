@@ -93,6 +93,7 @@ pub mod assembly;
 pub mod deliver;
 pub mod story_check;
 pub mod vfx_setup;
+pub mod flp_import;
 
 /// Everything the running editor holds.
 pub struct Studio {
