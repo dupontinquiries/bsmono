@@ -11,7 +11,7 @@
 //! starts/cancels. The worker holds one decoded frame at a time (FrameReader), so a long file
 //! costs the compressed output, not the uncompressed video.
 
-use crate::transcode::{self, FrameStat, Stop, TranscodeReport, VideoInfo};
+use crate::transcode::{self, EncodeOpts, FrameStat, Stop, TranscodeReport, VideoInfo};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
@@ -37,7 +37,7 @@ pub struct Job {
 pub const PREVIEW_EVERY: Duration = Duration::from_millis(250);
 
 impl Job {
-    pub fn start(input: &str, out: &Path, quality: u8, max_frames: Option<usize>, total: Option<usize>) -> Job {
+    pub fn start(input: &str, out: &Path, opts: EncodeOpts, max_frames: Option<usize>, total: Option<usize>) -> Job {
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let (input, out_path, c) = (input.to_string(), out.to_path_buf(), cancel.clone());
@@ -45,7 +45,7 @@ impl Job {
             let mut last_preview: Option<Instant> = None;
             let mut dims = (0, 0);
             if let Ok(i) = transcode::probe(&input) { dims = (i.w & !1, i.h & !1); }
-            let r = transcode::transcode_stream(&input, quality, max_frames, &c, |s, img| {
+            let r = transcode::transcode_stream(&input, opts, max_frames, &c, |s, img| {
                 let due = last_preview.is_none_or(|t| t.elapsed() >= PREVIEW_EVERY);
                 let preview = due.then(|| { last_preview = Some(Instant::now()); (dims.0, dims.1, img.to_vec()) });
                 let _ = tx.send(Msg::Frame(s.clone(), preview));
@@ -65,6 +65,8 @@ impl Job {
 
     pub fn bytes_so_far(&self) -> usize { self.stats.iter().map(|s| s.bytes).sum() }
 
+    pub fn t_frames(&self) -> usize { self.stats.iter().filter(|s| s.marker == b'T').count() }
+
     pub fn mean_psnr(&self) -> f64 {
         if self.stats.is_empty() { 0.0 } else { self.stats.iter().map(|s| s.psnr).sum::<f64>() / self.stats.len() as f64 }
     }
@@ -81,6 +83,10 @@ pub struct State {
     pub info: Option<Result<VideoInfo, String>>,
     probed: String,
     pub quality: u8,
+    /// T-frames (motion + residual against the last I-frame) where they pay.
+    pub inter: bool,
+    pub max_gop: usize,
+    pub max_psnr_drop: f64,
     /// 0 = the whole file.
     pub max_frames: usize,
     pub output: String,
@@ -95,7 +101,7 @@ pub struct State {
 
 impl Default for State {
     fn default() -> Self {
-        State { input: String::new(), info: None, probed: String::new(), quality: 75, max_frames: 0, output: String::new(), output_edited: false, job: None, outcome: None, preview: None, preview_dirty: false, tex: None }
+        State { input: String::new(), info: None, probed: String::new(), quality: 75, inter: true, max_gop: EncodeOpts::inter(75).max_gop, max_psnr_drop: EncodeOpts::inter(75).max_psnr_drop, max_frames: 0, output: String::new(), output_edited: false, job: None, outcome: None, preview: None, preview_dirty: false, tex: None }
     }
 }
 
@@ -117,6 +123,14 @@ impl State {
         self.info = if path.is_empty() { None } else if !Path::new(&path).is_file() { Some(Err("no such file".into())) } else { Some(transcode::probe(&path)) };
     }
 
+    pub fn opts(&self) -> EncodeOpts {
+        if self.inter {
+            EncodeOpts { quality: self.quality, inter: true, max_gop: self.max_gop.max(1), max_psnr_drop: self.max_psnr_drop.max(0.0) }
+        } else {
+            EncodeOpts::intra(self.quality)
+        }
+    }
+
     pub fn can_start(&self) -> Result<(), String> {
         if self.job.is_some() { return Err("already encoding".into()); }
         match &self.info {
@@ -136,7 +150,7 @@ impl State {
         let total = self.info.as_ref().and_then(|i| i.as_ref().ok()).map(|i| transcode::estimated_frames(i, max));
         self.outcome = None;
         self.preview = None;
-        self.job = Some(Job::start(self.input.trim(), Path::new(self.output.trim()), self.quality, max, total));
+        self.job = Some(Job::start(self.input.trim(), Path::new(self.output.trim()), self.opts(), max, total));
         Ok(())
     }
 
@@ -187,6 +201,13 @@ fn sparkline(ui: &mut egui::Ui, stats: &[FrameStat]) {
     let pts: Vec<egui::Pos2> = stats.iter().enumerate().map(|(i, s)| {
         egui::pos2(rect.left() + rect.width() * i as f32 / n, rect.bottom() - rect.height() * (s.bytes as f32 / max) * 0.9)
     }).collect();
+    // I-frames as ticks along the bottom: where the anchors are, and why the line jumps there.
+    for (i, s) in stats.iter().enumerate() {
+        if s.marker != b'T' {
+            let x = rect.left() + rect.width() * i as f32 / n;
+            p.line_segment([egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - 6.0)], egui::Stroke::new(1.0, ui.visuals().warn_fg_color));
+        }
+    }
     p.add(egui::Shape::line(pts, egui::Stroke::new(1.5, ui.visuals().selection.bg_fill)));
 }
 
@@ -196,8 +217,9 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
         ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
     ui.heading("Encode");
-    ui.label(egui::RichText::new("A video file in, a .fao out. Codec: FAO intra DCT — every frame an I-frame ('D'). \
-        The GTK app's v2.0–v8 codecs and the v9 trailer are not ported yet.").weak().small());
+    ui.label(egui::RichText::new("A video file in, a .fao out. I-frames: FAO DCT ('D'). T-frames: v2.1 predictive \
+        ('T', motion vectors + residual against the last I-frame), used where smaller and close enough in quality. \
+        The GTK app's other codec versions (v3.0–v8, the v9 trailer) are not ported yet.").weak().small());
     ui.add_space(8.0);
 
     let running = s.job.is_some();
@@ -218,6 +240,15 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
             ui.label("Frames");
             ui.add(egui::DragValue::new(&mut s.max_frames).range(0..=1_000_000));
             ui.label(egui::RichText::new(if s.max_frames == 0 { "(all)" } else { "(first N)" }).weak());
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut s.inter, "Inter frames (T)");
+            ui.add_enabled_ui(s.inter, |ui| {
+                ui.label("GOP ≤");
+                ui.add(egui::DragValue::new(&mut s.max_gop).range(1..=10_000));
+                ui.label("max PSNR drop");
+                ui.add(egui::DragValue::new(&mut s.max_psnr_drop).range(0.0..=30.0).speed(0.1).suffix(" dB"));
+            });
         });
         ui.horizontal(|ui| {
             ui.label("Output");
@@ -250,7 +281,8 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
         let text = format!("{done}{} frames · {:.1} fps{eta}", j.total.map(|t| format!(" / ~{t}")).unwrap_or_default(), j.fps());
         ui.add(egui::ProgressBar::new(frac.unwrap_or(0.0)).text(text).animate(frac.is_none()));
         if let Some(last) = j.stats.last() {
-            ui.label(format!("so far {} · mean PSNR {:.2} dB · last frame {} at {:.2} dB", bytes_h(j.bytes_so_far() as u64), j.mean_psnr(), bytes_h(last.bytes as u64), last.psnr));
+            ui.label(format!("so far {} · mean PSNR {:.2} dB · I {} / T {} · last frame {} at {:.2} dB", bytes_h(j.bytes_so_far() as u64), j.mean_psnr(), j.stats.len() - j.t_frames(), j.t_frames(), bytes_h(last.bytes as u64), last.psnr));
+            ui.label(egui::RichText::new(format!("frame {}: {}", last.index, last.why)).weak().small());
         }
         sparkline(ui, &j.stats);
     }
@@ -260,7 +292,7 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
             let ratio = if r.output_bytes > 0 { r.input_bytes as f64 / r.output_bytes as f64 } else { 0.0 };
             let bpp = r.output_bytes as f64 * 8.0 / (r.w * r.h * r.frames).max(1) as f64;
             ui.label(egui::RichText::new(format!("Done: {} frames {}×{} in {:.1} s", r.frames, r.w, r.h, took.as_secs_f64())).strong());
-            ui.label(format!("{} → {} ({:.2}× vs the input file) · {:.3} bpp · mean PSNR {:.2} dB", bytes_h(r.input_bytes), bytes_h(r.output_bytes), ratio, bpp, r.mean_psnr));
+            ui.label(format!("{} → {} ({:.2}× vs the input file) · {:.3} bpp · mean PSNR {:.2} dB · {} I-frames, {} T-frames", bytes_h(r.input_bytes), bytes_h(r.output_bytes), ratio, bpp, r.mean_psnr, r.i_frames, r.t_frames));
             ui.label(egui::RichText::new(path.display().to_string()).monospace().small());
             if ui.button("Open in Player").clicked() {
                 let p = path.display().to_string();
@@ -381,7 +413,7 @@ mod tests {
         frame(&mut app); // refused, with a reason
         app.encode.preview = Some((64, 48, vec![128; 64 * 48 * 3]));
         app.encode.preview_dirty = true;
-        app.encode.outcome = Some(Outcome::Done(TranscodeReport { frames: 3, w: 64, h: 48, input_bytes: 5000, output_bytes: 2000, mean_psnr: 38.5 }, PathBuf::from("/tmp/x.fao"), Duration::from_millis(900)));
+        app.encode.outcome = Some(Outcome::Done(TranscodeReport { frames: 3, w: 64, h: 48, input_bytes: 5000, output_bytes: 2000, mean_psnr: 38.5, i_frames: 1, t_frames: 2 }, PathBuf::from("/tmp/x.fao"), Duration::from_millis(900)));
         frame(&mut app);
         assert!(app.encode.tex.is_some(), "the preview became a texture");
         app.encode.outcome = Some(Outcome::Failed("ffmpeg decode failed: boom".into()));
