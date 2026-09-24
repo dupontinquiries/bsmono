@@ -71,7 +71,11 @@ pub fn composite(w: u32, h: u32, background: [u8; 3], layers: &[Layer<'_>]) -> V
         let alpha = (layer.opacity * layer.transform.opacity).clamp(0.0, 1.0);
         if alpha <= 0.0 || layer.w == 0 || layer.h == 0 { continue; }
         let t = &layer.transform;
-        let (cos, sin) = (-t.rotation.to_radians()).sin_cos().swap();
+        // (cos θ, sin θ): the canvas-to-layer map below is then a turn of
+        // -rotation, the inverse of the model's clockwise +rotation
+        // (`Transform::apply` / `invert`). It was (-θ) here until c20, which
+        // turned the preview the wrong way.
+        let (cos, sin) = t.rotation.to_radians().sin_cos().swap();
         let (ax, ay) = (t.anchor_x * w as f32, t.anchor_y * h as f32);
         let (sx, sy) = (t.scale_x.max(1e-4), t.scale_y.max(1e-4));
         let (ox, oy) = (t.x * w as f32, t.y * h as f32);
@@ -120,6 +124,27 @@ pub fn blend_of(effect: &studio_core::Effect) -> (BlendMode, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rotation is "degrees, clockwise" (`Transform::rotation`), and the
+    /// model's own forward map (`Transform::apply`) turns a point RIGHT of
+    /// the anchor to BELOW it at +90 on a y-down screen. The compositor must
+    /// agree: its canvas-to-layer map is the INVERSE, a turn of -rotation.
+    /// Until c20 it turned by +rotation there, so the preview spun every
+    /// layer the wrong way (and the export had no rotation to disagree with).
+    #[test]
+    fn a_positive_rotation_turns_clockwise_as_the_model_says() {
+        let n = 9u32;
+        let mut rgb = vec![0u8; (n * n * 3) as usize];
+        for x in 6..9 { let i = ((4 * n + x) * 3) as usize; rgb[i..i + 3].copy_from_slice(&[255, 255, 255]); }
+        let t = Transform { rotation: 90.0, ..Default::default() };
+        let out = composite(n, n, [0, 0, 0], &[Layer { rgb: &rgb, w: n, h: n, transform: t, mode: BlendMode::Normal, opacity: 1.0 }]);
+        let lit = |x: u32, y: u32| out[((y * n + x) * 3) as usize] > 128;
+        // the model's forward map, for the same point
+        let (fx, fy) = t.apply(7.5 / 9.0, 4.5 / 9.0);
+        assert!((fx - 0.5).abs() < 1e-4 && fy > 0.5, "the model: right of centre goes BELOW ({fx}, {fy})");
+        assert!(lit(4, 7), "the compositor puts it below too");
+        assert!(!lit(4, 1), "and not above");
+    }
 
     fn solid(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
         (0..w * h).flat_map(|_| rgb).collect()

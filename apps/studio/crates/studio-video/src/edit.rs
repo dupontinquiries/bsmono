@@ -147,7 +147,6 @@ impl Picture {
                 Some(studio_fx::Instance::Transform(t)) => {
                     p.transform = (!t.is_identity()).then_some(t);
                     p.unsupported.retain(|u| !u.starts_with("transform"));
-                    if t.rotation.abs() > 1e-4 { p.unsupported.push("transform rotation".into()); }
                 }
                 Some(studio_fx::Instance::Color(c)) => p.color = (!c.is_identity()).then_some(c),
                 Some(studio_fx::Instance::Blend(m, o)) =>
@@ -225,8 +224,8 @@ impl Picture {
         }
         let Some(t) = &self.transform else { return (f, None) };
         // Forward map of the compositor's inverse: a layer point u (0..1)
-        // lands at canvas px = ax + (u·W − ax)·sx + ox. Rotation is not
-        // reproduced (reported in `unsupported`).
+        // lands at canvas px = ax + (u·W − ax)·sx + ox, then turns by the
+        // rotation about the anchor (below).
         let (wf, hf) = (w as f64, h as f64);
         let (cl, ct, cr, cb) = (t.crop.0 as f64, t.crop.1 as f64, t.crop.2 as f64, t.crop.3 as f64);
         let (sx, sy) = ((t.scale_x as f64).max(1e-4), (t.scale_y as f64).max(1e-4));
@@ -246,7 +245,24 @@ impl Picture {
         let (py0, py1) = (first(edge_y(ct)), first(edge_y(1.0 - cb)));
         let (ow, oh) = ((px1 - px0).max(1.0), (py1 - py0).max(1.0));
         f.push_str(&format!(",crop={cw}:{chh}:{cx}:{cy},scale={ow}:{oh}:flags=bicubic"));
-        (f, Some(Placement { x: px0.round() as i64, y: py0.round() as i64, w: ow as i64, h: oh as i64 }))
+        if t.rotation.abs() <= 1e-4 {
+            return (f, Some(Placement { x: px0.round() as i64, y: py0.round() as i64, w: ow as i64, h: oh as i64 }));
+        }
+        // ROTATION, clockwise (`Transform::rotation`; ffmpeg's `rotate` also
+        // turns clockwise for a positive angle), about the ANCHOR. `rotate`
+        // turns about the frame's centre into a frame sized to hold the
+        // result, corners transparent -- so turn the placed box, then put
+        // that frame's centre where turning the box's centre about the
+        // anchor sends it.
+        let th = (t.rotation as f64).to_radians();
+        let (c, s) = (th.cos(), th.sin());
+        let (rw, rh) = ((ow * c.abs() + oh * s.abs()).ceil().max(1.0), (ow * s.abs() + oh * c.abs()).ceil().max(1.0));
+        f.push_str(&format!(",format=rgba,rotate=a={th:.9}:ow={rw}:oh={rh}:c=none:bilinear=1"));
+        let (pvx, pvy) = (ax + t.x as f64 * wf, ay + t.y as f64 * hf);
+        let (dx, dy) = (px0 + ow * 0.5 - pvx, py0 + oh * 0.5 - pvy);
+        let (ncx, ncy) = (pvx + dx * c - dy * s, pvy + dx * s + dy * c);
+        (f, Some(Placement { x: (ncx - rw * 0.5).round() as i64, y: (ncy - rh * 0.5).round() as i64,
+                             w: rw as i64, h: rh as i64 }))
     }
 }
 
@@ -1074,10 +1090,11 @@ mod tests {
         assert_eq!(c.picture.transform.unwrap().scale_x, 0.5);
         assert_eq!(c.picture.transform.unwrap().x, 0.0, "the disabled transform did not win");
         assert_eq!(c.picture.blend, Some((BlendMode::Multiply, 0.5)));
-        // blends are rendered now; rotation still is not, and says so
+        // blends and rotation are rendered now: nothing to warn about
         let warn = unsupported(&list);
-        assert_eq!(warn.len(), 1, "{warn:?}");
-        assert!(warn[0].contains("rotation") && !warn[0].contains("blend"), "{warn:?}");
+        assert!(warn.is_empty(), "{warn:?}");
+        // retiming still is not, and says so
+        assert_eq!(Picture::of(&[fx("retime", &[("to_speed", 2.0)])]).unsupported, vec!["retime".to_string()]);
         // a blend effect at its defaults (Normal, full) is no blend at all
         assert_eq!(Picture::of(&[fx("blend", &[])]).blend, None);
         // identity effects cost nothing: the cut takes the plain path
@@ -1295,15 +1312,15 @@ mod tests {
         // the WRONG input changes the answer by ~30 levels.
         let fixture = |name: &str, hex: &str| {
             let path = dir.join(format!("{name}.mp4"));
-            super::super::run("ffmpeg", &["-y", "-f", "lavfi", "-i", &format!("color=c={hex}:s={w}x{h}:r=20:d=7"),
+            super::super::run("ffmpeg", &["-y", "-f", "lavfi", "-i", &format!("color=c={hex}:s={w}x{h}:r=20:d=8"),
                 "-c:v", "mpeg4", "-q:v", "2", "-pix_fmt", "yuv420p", "-an", path.to_str().unwrap()]).expect("fixture");
             path
         };
         let (top, low) = (fixture("top", "0x64B4DC"), fixture("low", "0xC86432"));
         let paths: BTreeMap<SourceId, PathBuf> = [(SourceId(1), top.clone()), (SourceId(2), low.clone())].into();
         let mut p = project_with(&paths);
-        clip(&mut p, 100, 2, 2, 0.0, 7.0, 0.0);   // the lower track, all the way
-        let cases: [(f64, Vec<studio_core::Effect>, BlendMode, f32, studio_fx::Transform); 7] = [
+        clip(&mut p, 100, 2, 2, 0.0, 8.0, 0.0);   // the lower track, all the way
+        let cases: [(f64, Vec<studio_core::Effect>, BlendMode, f32, studio_fx::Transform); 8] = [
             (0.0, vec![fx("blend", &[("opacity", 0.5)])], BlendMode::Normal, 0.5, Default::default()),
             (1.0, vec![fx("blend", &[("mode", 1.0)])], BlendMode::Add, 1.0, Default::default()),
             (2.0, vec![fx("blend", &[("mode", 2.0)])], BlendMode::Multiply, 1.0, Default::default()),
@@ -1314,6 +1331,16 @@ mod tests {
             // hanging off the left edge: cropped before pad, and multiplied
             (6.0, vec![fx("transform", &[("scale_x", 0.5), ("scale_y", 0.5), ("x", -0.5)]), fx("blend", &[("mode", 2.0)])],
              BlendMode::Multiply, 1.0, studio_fx::Transform { scale_x: 0.5, scale_y: 0.5, x: -0.5, ..Default::default() }),
+            // turned, in a stack: the rotated frame's transparent corners must
+            // survive the alpha dial and the pad, and show the track below.
+            // Scale 0.8 puts every sample point well inside or outside the
+            // turned edge: at 0.6 one sat 3.6 px inside a DIAGONAL edge and
+            // read 12 levels off in blue -- 4:2:0 chroma and the codec smear a
+            // diagonal colour edge further than the axis-aligned ones above.
+            // Multiply, not Screen: screen with black is the canvas unchanged,
+            // so opaque black corners would pass unseen (they did, once).
+            (7.0, vec![fx("transform", &[("scale_x", 0.8), ("scale_y", 0.8), ("rotation", 40.0)]), fx("blend", &[("mode", 2.0)])],
+             BlendMode::Multiply, 1.0, studio_fx::Transform { scale_x: 0.8, scale_y: 0.8, rotation: 40.0, ..Default::default() }),
         ];
         for (k, (at, effects, ..)) in cases.iter().enumerate() {
             clip(&mut p, k as u64 + 1, 1, 1, *at, 1.0, *at);
@@ -1455,6 +1482,42 @@ mod tests {
         let (start, end) = (luma_at(&out, 0.5), luma_at(&out, 2.95));
         assert!(start > 150.0, "lifted grey before the fade: {start:.0}");
         assert!(end < 25.0, "faded out to black, the lift faded with it: {end:.0}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rotated, non-square picture-in-picture, rendered and compared with
+    /// the compositor pixel by pixel. A rectangle turned the WRONG way covers
+    /// a visibly different set of pixels (its bounding box alone would not
+    /// tell: +30 and -30 have the same one), so the coverage mask is the check.
+    #[test]
+    fn a_rotated_layer_exports_where_the_compositor_turns_it() {
+        if !crate::testkit::ffmpeg_or_skip("a_rotated_layer_exports_where_the_compositor_turns_it") { return; }
+        let dir = std::env::temp_dir().join(format!("studio-rot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (w, h) = (96u32, 54u32);
+        let src = dir.join("white.mp4");
+        super::super::run("ffmpeg", &["-y", "-f", "lavfi", "-i", &format!("color=c=white:s={w}x{h}:r=12:d=2"),
+            "-c:v", "mpeg4", "-q:v", "2", "-pix_fmt", "yuv420p", "-an", src.to_str().unwrap()]).expect("fixture");
+        let t = studio_fx::Transform { scale_x: 0.6, scale_y: 0.3, rotation: 30.0, x: 0.08, y: -0.04,
+                                       anchor_x: 0.4, anchor_y: 0.5, ..Default::default() };
+        let picture = Picture { transform: Some(t), ..Picture::default() };
+        let seg = Segment::Cut(Cut { path: src.clone(), src_in: s(0.0), len: s(1.0), at: s(0.0), picture });
+        let out = dir.join("out.mp4");
+        render_with_encoder(&[seg], None, &out, w, h, 12, VideoEncoder::Mpeg4).expect("render");
+        let got = super::super::frame_rgb(&out, s(0.5), w, h).unwrap();
+        let white = vec![255u8; (w * h * 3) as usize];
+        let mask = |t: studio_fx::Transform| studio_fx::compositor::composite(w, h, [0, 0, 0],
+            &[studio_fx::compositor::Layer { rgb: &white, w, h, transform: t, mode: BlendMode::Normal, opacity: 1.0 }]);
+        let lit = |px: &[u8], i: usize| px[i] as u32 + px[i + 1] as u32 + px[i + 2] as u32 > 380;
+        let disagree = |want: &[u8]| (0..(w * h) as usize).filter(|p| lit(want, p * 3) != lit(&got, p * 3)).count();
+        let want = mask(t);
+        let inside = (0..(w * h) as usize).filter(|p| lit(&want, p * 3)).count();
+        assert!(inside > 400 && inside < (w * h) as usize / 2, "a real rectangle, not the frame: {inside}");
+        let wrong_way = disagree(&mask(studio_fx::Transform { rotation: -30.0, ..t }));
+        let right = disagree(&want);
+        // edges: bilinear vs nearest, and 4:2:0 -- a pixel's worth round the rim
+        assert!(right * 6 < inside, "{right} of {inside} pixels disagree with the compositor");
+        assert!(wrong_way > right * 3, "and turned the other way it would be clearly wrong: {wrong_way} vs {right}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
