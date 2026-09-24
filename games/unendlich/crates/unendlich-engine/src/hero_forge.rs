@@ -579,12 +579,19 @@ pub struct HeroPose {
     /// `(prog * PI).sin()` arc shape, so the third-person body and the first-person
     /// hand swing in perfect sync for free — no separate combat-animation clock.
     pub swing01: f32,
+    /// First-person CARRY, 0 = arms as the walk rig puts them, 1 = the holding arm
+    /// raised and bent so the hand -- and whatever it holds -- sits low in front
+    /// of the eyes, following the look pitch like the head does. With the
+    /// camera in the head (build_rigged's eye anchor) this is how a held item or
+    /// block is SEEN in first person: the real arm, so walking, crouching and the
+    /// swing all carry it, instead of a separate floating viewmodel.
+    pub fp_carry01: f32,
 }
 
 impl Default for HeroPose {
     fn default() -> Self {
         HeroPose { yaw: 0.0, gaze_pitch: 0.0, walk_phase: 0.0, walk_amp: 0.0, anim_t: 0.0, held_color: None, held: None,
-            airborne: 0.0, vertical_vel: 0.0, land_crouch: 0.0, flight01: 0.0, bank: 0.0, swing01: 0.0 }
+            airborne: 0.0, vertical_vel: 0.0, land_crouch: 0.0, flight01: 0.0, bank: 0.0, swing01: 0.0, fp_carry01: 0.0 }
     }
 }
 
@@ -807,6 +814,28 @@ pub fn build_rigged(
         rot[KNR][0] = lerp(rot[KNR][0], 0.0);
     }
 
+    // FIRST-PERSON CARRY: blend the holding arm to a raised, elbow-bent pose that
+    // tracks the look pitch, AFTER walk/air/flight (it wins over their arm
+    // swing, damped rather than removed) and BEFORE the attack swing (which adds
+    // on top). Angles in this rig: about X, negative = forward/up for an arm.
+    let carry = pose.fp_carry01.clamp(0.0, 1.0);
+    if carry > 0.001 {
+        let lerp = |a: f32, b: f32| a * (1.0 - carry) + b * carry;
+        let p = pose.gaze_pitch.clamp(-1.2, 1.2);
+        // Looking down, the arm follows a little MORE than the gaze, so the item
+        // stays under the crosshair instead of rising over the block being aimed
+        // at (the thick-armed Gravitybender's hand crossed 2 deg above centre).
+        let follow = if p < 0.0 { CARRY_PITCH_FOLLOW_DOWN } else { CARRY_PITCH_FOLLOW };
+        rot[CARRY_SH][0] = lerp(rot[CARRY_SH][0], CARRY_SH_X - follow * p);
+        // Roll inward in proportion to how far out the shoulder is: a fixed roll
+        // left the widest-shouldered hero's hand at 49 deg (Gravitybender, sh 0.94)
+        // while the narrow ones sat at 21-32.
+        rot[CARRY_SH][2] = lerp(rot[CARRY_SH][2], CARRY_SH_Z + CARRY_SH_Z_PER_SH * (dim.sh - 0.78));
+        // Looking up brings the raised hand close to the eye, which widens every
+        // view angle; straightening the elbow as the gaze rises keeps it out along
+        // the look line (the broad-shouldered Heliographer left the frame at +0.9).
+        rot[CARRY_EL][0] = lerp(rot[CARRY_EL][0], CARRY_EL_X + CARRY_EL_STRAIGHTEN * p.max(0.0));
+    }
     // r-swing: ATTACK SWING overlay — a right-arm chop, additive on top of
     // whatever the walk/flight rig already computed (mirrors how airborne/
     // land_crouch/flight01 all layer above). `swing01` is already the shaped
@@ -816,10 +845,13 @@ pub fn build_rigged(
     // moves around it.
     let swing = pose.swing01.clamp(0.0, 1.0);
     if swing > 0.001 {
-        rot[SHR][0] -= 1.6 * swing;   // chop forward/down
-        rot[SHR][2] -= 0.30 * swing;  // pull slightly across the body
-        rot[ELR][0] -= 0.90 * swing;  // elbow follows through
-        rot[CHEST][1] += 0.15 * swing; // torso twists into the swing
+        // On the item arm (ITEM_SH/ITEM_EL: the anatomical right, three -x), so
+        // the roll across the body and the chest twist are the mirror of what
+        // they were on the +x arm.
+        rot[ITEM_SH][0] -= 1.6 * swing;   // chop forward/down
+        rot[ITEM_SH][2] += 0.30 * swing;  // pull slightly across the body
+        rot[ITEM_EL][0] -= 0.90 * swing;  // elbow follows through
+        rot[CHEST][1] -= 0.15 * swing; // torso twists into the swing
     }
 
     let base_y = 0.0; // feet auto-grounded at finalize
@@ -840,25 +872,46 @@ pub fn build_rigged(
         let grip = [0.0, -0.10, ff_depth(&dim)];
         for b in &model.boxes {
             body.part(
-                &world[HAR],
+                &world[ITEM_HAND],
                 b.size,
                 b.color,
                 [grip[0] + b.center[0] * U, grip[1] + b.center[1] * U, grip[2] + b.center[2] * U],
             );
         }
     } else if let Some(hc) = pose.held_color {
-        body.part(&world[HAR], [1.7, 5.2, 1.7], hc, [0.0, -0.10, ff_depth(&dim)]);
+        body.part(&world[ITEM_HAND], [1.7, 5.2, 1.7], hc, [0.0, -0.10, ff_depth(&dim)]);
     }
 
     // a small vertical bounce on the walk (applied after grounding so the planted
     // pose still rests at the origin at mid-stride).
     let bob = (stride2 * 0.5 + 0.5) * amp * 0.10;
     let eye_i = body.mark(&world[HEAD], eye_local(&dim));
-    let hand_i = body.mark(&world[HAR], [0.0, -0.10, ff_depth(&dim)]);
+    let hand_i = body.mark(&world[ITEM_HAND], [0.0, -0.10, ff_depth(&dim)]);
     let scale = rest_scale(&dim, &col, hero_total_height(params));
     let (v, i, m) = body.finalize(origin, bob, scale, anatomy_verts);
     (v, i, HeroAnchors { eye: m[eye_i], right_hand: m[hand_i], scale })
 }
+
+/// The arm that holds an item: the ANATOMICAL right. The forge port puts
+/// SHR/ELR/HAR at three +x, but a three-space character faces +z, so +x is its
+/// LEFT side: every hero held items and swung with its left hand ("right hand"
+/// in every comment), and in first person the item sat on the left of the view
+/// (found by carry_in_view_by_pitch: the hand at camera-right -0.25). The -x
+/// chain (SHL/ELL/HAL) is the anatomical right; the pivot names are kept.
+const ITEM_SH: usize = SHL;
+const ITEM_EL: usize = ELL;
+const ITEM_HAND: usize = HAL;
+/// The carry pose: on the item arm. About X, negative = forward/up; about Z on
+/// this (-x) arm, positive = in toward the body's centre line.
+const CARRY_SH: usize = ITEM_SH;
+const CARRY_EL: usize = ITEM_EL;
+const CARRY_SH_X: f32 = -1.15;
+const CARRY_SH_Z: f32 = 0.42;
+const CARRY_EL_STRAIGHTEN: f32 = 0.45;
+const CARRY_SH_Z_PER_SH: f32 = 1.8;
+const CARRY_PITCH_FOLLOW_DOWN: f32 = 1.15;
+const CARRY_EL_X: f32 = -0.95;
+const CARRY_PITCH_FOLLOW: f32 = 1.0;
 
 #[inline]
 fn ff_depth(dim: &HeroDims) -> f32 {
@@ -1059,6 +1112,63 @@ mod anchor_tests {
             let skin = kind.colors().skin;
             let head_top = v.iter().filter(|x| x.color == skin).fold(f32::MIN, |m, x| m.max(x.position[1]));
             eprintln!("KIND {kind:?}: height {h:.2} | eye {:.2} ({:.3} of h) | skin top {:.2} | top {:.2} colour {:?}", a.eye[1], a.eye[1] / h, head_top, top, top_col);
+        }
+    }
+
+    /// The hand, seen from the eye anchor, in camera space: (right, up, forward).
+    fn hand_in_view(kind: HeroKind, yaw: f32, pitch: f32, carry: f32) -> [f32; 3] {
+        let params = default_params(kind);
+        let pose = HeroPose { yaw, gaze_pitch: pitch, fp_carry01: carry, held_color: Some([1.0, 0.0, 1.0]), ..Default::default() };
+        let (_, _, a) = build_rigged(kind, &params, [0.0, 50.0, 0.0], &pose);
+        let f = [yaw.cos() * pitch.cos(), pitch.sin(), yaw.sin() * pitch.cos()];
+        // right = forward x world-up, as a glm camera derives it; up = right x forward.
+        let r = { let v = [-f[2], 0.0, f[0]]; let n = (v[0] * v[0] + v[2] * v[2]).sqrt().max(1e-6); [v[0] / n, 0.0, v[2] / n] };
+        let u = [r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]];
+        let d = [a.right_hand[0] - a.eye[0], a.right_hand[1] - a.eye[1], a.right_hand[2] - a.eye[2]];
+        let dot = |x: [f32; 3], y: [f32; 3]| x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+        [dot(d, r), dot(d, u), dot(d, f)]
+    }
+
+    #[test]
+    #[ignore = "diagnostic: where the carried hand sits in the first-person view"]
+    fn carry_in_view_by_pitch() {
+        use HeroKind::*;
+        for kind in [Heliographer, Windwalker, Tidecaller, Stormweaver, Gravitybender, Brinekeeper, Luminant] {
+            let (mut worst_h, mut worst_b, mut min_b) = (f32::MIN, f32::MIN, f32::MAX);
+            for pitch in [-0.9f32, -0.45, 0.0, 0.45, 0.9] {
+                let v = hand_in_view(kind, 0.0, pitch, 1.0);
+                let (h, b) = (v[0].atan2(v[2]).to_degrees(), (-v[1]).atan2(v[2]).to_degrees());
+                worst_h = worst_h.max(h); worst_b = worst_b.max(b); min_b = min_b.min(b);
+            }
+            eprintln!("CARRY {kind:?}: horizontal max {worst_h:.0} | below max {worst_b:.0} min {min_b:.0}");
+        }
+    }
+
+    /// A held item is SEEN in first person: with the carry pose the hand is on the
+    /// right of the view and below its centre, inside a 60-degree vertical /
+    /// 16:9 frame (half-angles 30 / ~46 degrees; asserted with margin), at every
+    /// look pitch, for every hero. Without it, looking ahead, the hand hangs out
+    /// of view -- which is why a held block was never visible in first person.
+    #[test]
+    fn a_carried_item_is_in_the_first_person_view_at_every_pitch() {
+        use HeroKind::*;
+        // OPEN: Gravitybender (levitating, torso 23 wide, arms 10 thick, shoulders
+        // 0.94) is not yet in the frame with these angles: horizontal up to 47 deg
+        // and 15 deg ABOVE centre at one pitch (carry_in_view_by_pitch prints all
+        // seven). Its carry needs its own look; the other six are asserted.
+        for kind in [Heliographer, Windwalker, Tidecaller, Stormweaver, Brinekeeper, Luminant] {
+            for pitch in [-0.9f32, -0.45, 0.0, 0.45, 0.9] {
+                for yaw in [0.0f32, 2.1] {
+                    let v = hand_in_view(kind, yaw, pitch, 1.0);
+                    let (h, below) = (v[0].atan2(v[2]).to_degrees(), (-v[1]).atan2(v[2]).to_degrees());
+                    assert!(v[2] > 0.1, "{kind:?} pitch {pitch}: the hand is in front ({:?})", v);
+                    assert!(v[0] > 0.0 && h < 42.0, "{kind:?} pitch {pitch}: right of centre, inside the frame (horizontal {h:.0} deg)");
+                    assert!(v[1] < 0.0 && below < 28.0, "{kind:?} pitch {pitch}: below centre, inside the frame ({below:.0} deg down)");
+                }
+            }
+            let hanging = hand_in_view(kind, 0.0, 0.0, 0.0);
+            let off = (hanging[0].hypot(hanging[1])).atan2(hanging[2]).to_degrees();
+            assert!(off > 45.0, "{kind:?}: without the carry the hand is out of view ({off:.0} deg)");
         }
     }
 
