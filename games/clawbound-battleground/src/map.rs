@@ -99,6 +99,26 @@ pub fn open_ground(x: f32, z: f32, margin: f32) -> bool {
     }
 }
 
+/// Height of the ground at (x, z): where a grounded unit's feet are. 0
+/// everywhere on the jungle; the pass's climbing Top lane rises onto a
+/// shelf (`pass::floor_height`).
+pub fn ground_y(x: f32, z: f32) -> f32 {
+    match active() {
+        MapId::Jungle => 0.0,
+        MapId::Pass => crate::pass::floor_height(x, z),
+    }
+}
+
+/// How far above the ground a grounded unit may find itself and be SET on
+/// it rather than fall: walking down a ramp. 0 on the jungle (unchanged:
+/// anything above the floor falls).
+pub fn step_down() -> f32 {
+    match active() {
+        MapId::Jungle => 0.0,
+        MapId::Pass => 0.8,
+    }
+}
+
 /// The floor plan that is the map's collision boundary, if it has one.
 pub fn floor() -> Option<&'static crate::floor::FloorPlan> {
     match active() {

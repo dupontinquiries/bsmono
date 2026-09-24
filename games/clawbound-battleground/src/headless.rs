@@ -933,6 +933,18 @@ pub fn run_pass_shots() -> Result<(), String> {
         shoot(&mut renderer, &game, &mut vfx, "pass_cave_inside.png", Camera { eye: t + back * 12.0 + Vec3::Y * 6.0, target: t, fov_y: 0.95 })?;
         game.gods[0].pos = keep;
     }
+    // the climb: from the foot of Top's up-ramp, looking up onto the shelf;
+    // and from the shelf, looking back down
+    {
+        let top = crate::consts::Lane::Top.polyline();
+        let len: f32 = top.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+        let at = |f: f32| {
+            let p = crate::pass::along(&top, f * len);
+            Vec3::new(p.x, crate::map::ground_y(p.x, p.z), p.z)
+        };
+        shoot(&mut renderer, &game, &mut vfx, "pass_climb.png", Camera { eye: at(0.33) + Vec3::Y * 4.0, target: at(0.47) + Vec3::Y * 2.0, fov_y: 0.95 })?;
+        shoot(&mut renderer, &game, &mut vfx, "pass_shelf.png", Camera { eye: at(0.5) + Vec3::Y * 5.0, target: at(0.64) + Vec3::Y * 0.0, fov_y: 0.95 })?;
+    }
     // a choke, from the wide lane looking into the narrows
     let (cp, cd) = crate::pass::choke_points()[2];
     shoot(&mut renderer, &game, &mut vfx, "pass_choke.png", Camera { eye: cp - cd * 22.0 + Vec3::Y * 6.0, target: cp + cd * 6.0 + Vec3::Y * 2.0, fov_y: 0.95 })?;

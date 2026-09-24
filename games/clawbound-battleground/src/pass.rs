@@ -317,6 +317,65 @@ pub fn caves() -> Vec<Cave> {
     v
 }
 
+/// The climb: the Top lane -- the solo lane round the outside of the west
+/// peak -- rises onto a shelf this high around the far side of the peak.
+pub const SHELF_H: f32 = 9.0;
+/// Where along Top (fractions of its length) the ramp up starts and tops
+/// out, and the ramp down starts and ends. Between the chokes (0.3, 0.7),
+/// clear of the stream that joins at ~0.28.
+pub const SHELF: [f32; 4] = [0.38, 0.46, 0.54, 0.62];
+/// How far past the lane's edge the shelf's height carries before it
+/// fades to the surrounding floor (a slot joining the shelf ramps up
+/// over this distance).
+const SHELF_FADE: f32 = 14.0;
+
+/// Height of the floor at (x, z): 0 except on and around the Top lane's
+/// shelf. The sim's ground (`map::ground_y`), the terrain's floor, and
+/// where scenery on the shelf stands.
+pub fn floor_height(x: f32, z: f32) -> f32 {
+    // cached polyline and its length
+    static TOP: OnceLock<(Vec<Vec3>, f32)> = OnceLock::new();
+    let (pts, len) = TOP.get_or_init(|| {
+        let p = lane_polyline(Lane::Top);
+        let l = p.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+        (p, l)
+    });
+    // cheap reject: the shelf is on the far west
+    if x > -120.0 {
+        return 0.0;
+    }
+    let p = Vec3::new(x, 0.0, z);
+    let (mut best_d, mut best_s, mut acc) = (f32::MAX, 0.0, 0.0);
+    for w in pts.windows(2) {
+        let ab = w[1] - w[0];
+        let l = ab.length();
+        let t = ((p - w[0]).dot(ab) / (l * l).max(1e-6)).clamp(0.0, 1.0);
+        let d = (w[0] + ab * t - p).length();
+        if d < best_d {
+            best_d = d;
+            best_s = acc + t * l;
+        }
+        acc += l;
+    }
+    let f = best_s / len;
+    let sm = |a: f32, b: f32, x: f32| {
+        let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let along = sm(SHELF[0], SHELF[1], f) * (1.0 - sm(SHELF[2], SHELF[3], f));
+    let off = (best_d - SIDE_R).max(0.0);
+    let across = 1.0 - sm(0.0, SHELF_FADE, off);
+    let h = SHELF_H * along * across;
+    if h <= 0.0 {
+        return 0.0;
+    }
+    // Water does not run uphill: the stream that joins Top near the foot of
+    // the up-ramp keeps its bed at 0, and the shelf blends up away from it
+    // (the test found its lower reach inside the shelf's sideways fade).
+    let rd = river_dist(x, z);
+    h * sm(STREAM_HALF_WIDTH + 1.0, STREAM_HALF_WIDTH + 12.0, rd)
+}
+
 /// The narrowest point of every choke, and the lane's direction there.
 pub fn choke_points() -> Vec<(Vec3, Vec3)> {
     CHOKES
@@ -462,6 +521,12 @@ pub const CLIFF_RISE: f32 = 2.6;
 
 /// Terrain height: the floor (with stream beds cut into it), then cliffs.
 pub fn terrain_height(x: f32, z: f32) -> f32 {
+    floor_height(x, z) + terrain_height_flat(x, z)
+}
+
+/// The terrain as if the floor were all at 0: the floor's surface detail
+/// and stream beds, then the cliffs.
+fn terrain_height_flat(x: f32, z: f32) -> f32 {
     let d = floor().sdf(x, z);
     if d <= 0.0 {
         // the floor: flat stone, beds cut for the streams
@@ -651,6 +716,50 @@ mod tests {
                 prev = *p;
             }
             assert_eq!(*r.last().unwrap(), g);
+        }
+    }
+
+    /// The climb: Top rises to SHELF_H at its middle and nowhere else is
+    /// raised; the ramps are walkable; streams and clearings stay at 0; the
+    /// shelf is mirrored like the rest of the map.
+    #[test]
+    fn the_top_lane_climbs_onto_a_shelf_and_nothing_else_rises() {
+        let top = lane_polyline(Lane::Top);
+        let len: f32 = top.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+        let h = |f: f32| {
+            let p = along(&top, f * len);
+            floor_height(p.x, p.z)
+        };
+        assert!((h(0.5) - SHELF_H).abs() < 1e-3, "crest {}", h(0.5));
+        assert!(h(0.2) < 1e-3 && h(0.8) < 1e-3, "the ends stay down");
+        // walkable ramps: slope along the lane at most ~0.35 (about 19 deg)
+        let mut s = 0.0;
+        while s < len - 1.0 {
+            let (a, b) = (along(&top, s), along(&top, s + 1.0));
+            let dh = (floor_height(b.x, b.z) - floor_height(a.x, a.z)).abs();
+            assert!(dh <= 0.35, "too steep at {a}: {dh} per unit");
+            s += 1.0;
+        }
+        for lane in [Lane::Mid, Lane::Bot] {
+            for p in lane_polyline(lane) {
+                assert_eq!(floor_height(p.x, p.z), 0.0, "{lane:?} raised at {p}");
+            }
+        }
+        for s in streams() {
+            for p in s {
+                assert!(floor_height(p.x, p.z) < 1e-3, "a stream on the shelf at {p}");
+            }
+        }
+        for (x, z, _) in clearings() {
+            if !crate::bosses::in_pit(x, z) {
+                assert!(floor_height(x, z) < 1e-3, "a clearing raised at ({x},{z})");
+            }
+        }
+        for x in (-230..-120).step_by(3) {
+            for z in (-80..80).step_by(3) {
+                let (x, z) = (x as f32 + 0.4, z as f32 + 0.3);
+                assert!((floor_height(x, z) - floor_height(x, -z)).abs() < 1e-3, "shelf not mirrored at ({x},{z})");
+            }
         }
     }
 

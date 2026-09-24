@@ -239,8 +239,17 @@ impl Game {
             }
             g.perch_hp = g.hp;
             if g.perch.is_none() && g.leap.is_none() && g.dash.is_none() {
-                if g.pos.y > 0.0 && g.fall.is_none() {
-                    g.fall = Some(crate::leap::Fall::new(g.pos.y, 0.0)); // e.g. a dash that ended in the air
+                // The ground here: 0 on the jungle, the shelf's height on the
+                // pass's climbing lane (`map::ground_y`). Above it by more
+                // than a step: a fall. Otherwise stand on it -- walking down
+                // a ramp is not falling.
+                let ground = crate::map::ground_y(g.pos.x, g.pos.z);
+                if g.fall.is_none() {
+                    if g.pos.y > ground + crate::map::step_down() {
+                        g.fall = Some(crate::leap::Fall::new(g.pos.y, 0.0)); // e.g. a dash that ended in the air
+                    } else if g.pos.y != ground && (g.pos.y > ground || crate::map::step_down() > 0.0) {
+                        g.pos.y = ground;
+                    }
                 }
                 if let Some(f) = &mut g.fall {
                     let y0 = g.pos.y;
@@ -254,7 +263,7 @@ impl Game {
                     // 0.9 u in radius, and the integration test said so.
                     let from_y = f.from_y;
                     let under = blockers.landing_under(g.pos.x, g.pos.z, y0).filter(|u| u.0 < from_y - 0.05);
-                    let floor = under.map_or(0.0, |u| u.0);
+                    let floor = under.map_or(ground, |u| u.0.max(ground));
                     if y1 <= floor {
                         g.pos.y = floor;
                         g.leap = Some(crate::leap::LeapState::landing(g.pos, under, (f.from_y - floor).max(0.0)));
@@ -324,6 +333,7 @@ impl Game {
                     // matters because a wave piling into a trunk is what makes
                     // props read as solid from across the map.
                     m.pos = blockers.resolve(m.pos, MINION_RADIUS);
+                    m.pos.y = crate::map::ground_y(m.pos.x, m.pos.z);
                 }
             } else {
                 m.walk_anim += dt * 2.0;

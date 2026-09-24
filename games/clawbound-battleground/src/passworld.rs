@@ -421,6 +421,18 @@ fn weathered(mut m: crate::voxel::VoxelMesh, grey: f32, dark: f32) -> crate::vox
     m
 }
 
+fn lifted(it: Item) -> Item {
+    let up = |p: Vec3| Vec3::new(p.x, p.y + pass::floor_height(p.x, p.z), p.z);
+    match it {
+        Item::Prop { .. } | Item::HighPine { .. } | Item::Gem { .. } => it,
+        Item::Crag { at, .. } if pass::floor().sdf(at.x, at.z) > 4.0 => it, // a plateau spire
+        Item::Crag { at, size, lean, facing, variant, coarse, spiky } => Item::Crag { at: up(at), size, lean, facing, variant, coarse, spiky },
+        Item::Fall { at, height, facing } => Item::Fall { at: up(at), height, facing },
+        Item::Arch { at, span, height, yaw, variant } => Item::Arch { at: up(at), span, height, yaw, variant },
+        Item::Statue { at, owl, quarter } => Item::Statue { at: up(at), owl, quarter },
+    }
+}
+
 /// Meshes and collision for everything in [`placements`].
 pub fn build() -> (Vec<Piece>, Blockers) {
     let mut blockers = Blockers::new(consts::arena_radius() + 20.0, 6.0);
@@ -445,6 +457,10 @@ pub fn build() -> (Vec<Piece>, Blockers) {
     let mut crags: std::collections::HashMap<(i32, i32, i32), crate::voxel::VoxelMesh> = Default::default();
     for (i, it) in placements().into_iter().enumerate() {
         let v = i as i32;
+        // Lift what stands on the floor onto the floor's height there: the
+        // Top lane's shelf (`pass::floor_height`). Gems, plateau pines and
+        // plateau spires already stand on the terrain's height.
+        let it = lifted(it);
         match it {
             Item::Prop { kind, x, z, scale, quarter } => {
                 let (mesh, vs, sway) = match kind {
@@ -455,12 +471,13 @@ pub fn build() -> (Vec<Piece>, Blockers) {
                     PropKind::Fern => (weathered(props::fern(v), 0.55, 0.8), V_SM, 2.2),
                     other => panic!("passworld places {other:?}, which it has no mesh for"),
                 };
+                let y = pass::floor_height(x, z);
                 if matches!(kind, PropKind::Rock | PropKind::BoulderCluster) {
-                    blockers.push_placed(kind, x, z, 0.0, quarter, 1.0);
+                    blockers.push_placed(kind, x, z, y, quarter, 1.0);
                 } else {
-                    blockers.push_prop(kind, x, z, 0.0, 1.0);
+                    blockers.push_prop(kind, x, z, y, 1.0);
                 }
-                pieces.push(Piece { mesh, pos: Vec3::new(x, 0.0, z), quarter, vsize: vs, sway });
+                pieces.push(Piece { mesh, pos: Vec3::new(x, y, z), quarter, vsize: vs, sway });
             }
             Item::HighPine { x, z, y, scale } => {
                 pieces.push(Piece { mesh: weathered(props::pine(scale), 0.4, 0.75), pos: Vec3::new(x, y, z), quarter: 0, vsize: V_MED, sway: 0.4 });
