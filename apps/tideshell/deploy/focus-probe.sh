@@ -11,6 +11,8 @@
 #   ./focus-probe.sh range                   travel limits and dead zone
 #   ./focus-probe.sh steps                   step sizes, smallest audible
 #   ./focus-probe.sh sweep                   square waves, find resonance
+#   ./focus-probe.sh curves                  square/sine/triangle/saw/decay/dither
+#   ./focus-probe.sh chirp                   one glide 5->40 and 40->120 Hz
 #   ./focus-probe.sh hold                    hold current vs temperature
 #   ./focus-probe.sh rate                    how fast writes actually go
 #   ./focus-probe.sh all                     everything, ~6 minutes
@@ -24,7 +26,8 @@
 # no need to remember or write anything down.
 #
 # Env: SUBDEV=/dev/v4l-subdevN (auto-detected), DRY=1 to print without writing,
-#      SUDO=doas, LOG=path (default ./focus-probe.log).
+#      SUDO=doas or SUDO= (none, if already root), LOG=path, FORCE=1 to run
+#      even while something holds a camera node.
 #
 # SAFETY: a spring-return VCM holds position with CONTINUOUS current, so
 # resting far from 0 dissipates heat against the lens stack forever. Every
@@ -34,7 +37,9 @@
 
 set -e
 
-SUDO=${SUDO:-sudo}
+# ${SUDO-sudo}, not ${SUDO:-sudo}: SUDO= (empty) must mean "no sudo", which is
+# what you want when running the whole script under sudo already.
+SUDO=${SUDO-sudo}
 LOG=${LOG:-./focus-probe.log}
 DRY=${DRY:-0}
 CTRL=focus_absolute
@@ -76,7 +81,9 @@ READER_PID=""
 now_ns() { date +%s%N 2>/dev/null || echo 0; }
 
 start_listening() {
-    [ -r /dev/tty ] || { say "(no terminal: Enter-to-mark disabled)"; return; }
+    # -r is not enough: /dev/tty exists but fails to open when there is no
+    # controlling terminal (cron, a pipe, nohup). Try the open itself.
+    ( : < /dev/tty ) 2>/dev/null || { say "(no controlling terminal: Enter-to-mark disabled)"; return; }
     : > "$HITS"; : > "$MARKS"
     ( while IFS= read -r _; do now_ns >> "$HITS"; done < /dev/tty ) &
     READER_PID=$!
@@ -128,6 +135,40 @@ limits() { # min and max from the driver, not assumed
       | awk -v c="$CTRL" '$1 == c { for (i=1;i<=NF;i++) { if ($i ~ /^min=/) sub("min=","",$i) && m=$i; if ($i ~ /^max=/) sub("max=","",$i) && M=$i } print m, M }'
 }
 
+# ── the fast path ────────────────────────────────────────────────────────────
+# Each v4l2-ctl invocation is a fork+exec, so a waveform played that way tops
+# out around 50 Hz — right in the region a VCM resonance is likely to sit.
+# When python3 is present, play waveforms through VIDIOC_S_CTRL directly on an
+# open fd instead: sub-millisecond per sample, and real timing.
+have_fast() { [ "$DRY" != "1" ] && command -v python3 >/dev/null 2>&1; }
+
+# play_samples <dt_seconds> <<< one integer per line
+play_samples() {
+    dt=$1
+    if have_fast; then
+        $SUDO python3 -c '
+import sys, fcntl, struct, time, ctypes
+dev, dt = sys.argv[1], float(sys.argv[2])
+VIDIOC_S_CTRL = 0xc008561b            # _IOWR("V", 27, struct v4l2_control)
+CID = 0x009a090a                      # V4L2_CID_FOCUS_ABSOLUTE
+vals = [int(x) for x in sys.stdin.read().split()]
+fd = open(dev, "rb+", buffering=0)
+t = time.perf_counter()
+for v in vals:
+    fcntl.ioctl(fd, VIDIOC_S_CTRL, struct.pack("Ii", CID, v))
+    t += dt
+    d = t - time.perf_counter()
+    if d > 0: time.sleep(d)
+' "$SUBDEV" "$dt"
+    else
+        while read -r v; do
+            [ -n "$v" ] || continue
+            set_focus "$v"
+            sleep "$dt" 2>/dev/null || true
+        done
+    fi
+}
+
 set_focus() {
     if [ "$DRY" = "1" ]; then
         printf '   [dry] %s=%s\n' "$CTRL" "$1"
@@ -152,12 +193,19 @@ temp_now() { # the warmest camera-ish thermal zone, in C, or empty
     done | sort -k2 -n | tail -1
 }
 
-camera_busy() {
-    # Anything holding a camera should win over this script.
-    if command -v fuser >/dev/null 2>&1; then
-        fuser /dev/video* /dev/media0 2>/dev/null | grep -q . && return 0
-    fi
-    return 1
+# Who is holding a camera, one "pid comm" per line. Note that a media node
+# open is not the same as a stream running: pipewire and libcamera keep nodes
+# open just to enumerate. That is why this warns and names the holder rather
+# than refusing outright.
+camera_holders() {
+    for n in ${NODES:-/dev/video* /dev/media*}; do
+        [ -e "$n" ] || continue
+        for pid in $($SUDO fuser "$n" 2>/dev/null); do
+            case "$pid" in *[!0-9]*) continue ;; esac
+            c=$(cat /proc/$pid/comm 2>/dev/null) || continue
+            echo "$pid $c $n"
+        done
+    done | sort -u
 }
 
 # ── tests ────────────────────────────────────────────────────────────────────
@@ -202,6 +250,76 @@ t_sweep() {
             i=$((i + 1))
         done
         set_focus "$MID"; sleep 0.3
+    done
+    park
+}
+
+# ── waveforms ────────────────────────────────────────────────────────────────
+# A square wave is a bad instrument for this: it asks for an instantaneous
+# jump the actuator cannot make, and dw9719 parts apply slew shaping that
+# smooths exactly that transient. The shapes below differ in how they ARRIVE,
+# which is what decides whether the lens ticks, hums, or moves silently.
+#
+# samples <shape> <mid> <amp> <n> — n integers, one per line, one period.
+samples() {
+    awk -v shape="$1" -v mid="$2" -v amp="$3" -v n="$4" -v lo="$MIN" -v hi="$MAX" '
+    function clamp(v) { return v < lo ? lo : (v > hi ? hi : int(v + 0.5)) }
+    BEGIN {
+        pi = 3.14159265358979
+        for (i = 0; i < n; i++) {
+            p = i / n
+            if      (shape == "square")   v = mid + (p < 0.5 ? -amp/2 : amp/2)
+            else if (shape == "sine")     v = mid + (amp/2) * sin(2*pi*p)
+            else if (shape == "triangle") v = mid + amp * (p < 0.5 ? (p*2 - 0.5) : (1.5 - p*2))
+            else if (shape == "saw")      v = mid - amp/2 + amp*p
+            else if (shape == "decay")    v = mid + (amp/2) * sin(2*pi*p*4) * (1 - p)
+            else if (shape == "dither")   v = mid + (i % 2 ? amp/2 : -amp/2)
+            else                           v = mid
+            print clamp(v)
+        }
+    }'
+}
+
+t_curves() {
+    say "== curves: the same excursion, arrived at different ways. A square"
+    say "   demands a step the actuator cannot make and the driver smooths it;"
+    say "   a triangle or sine may be quieter, or may hum instead of tick."
+    MID=$((MAX / 2)); AMP=$((MAX / 2))
+    RATE=0.002   # 500 Hz sample rate on the fast path
+    have_fast || { say "   (no python3: falling back to v4l2-ctl per sample, ~50 Hz ceiling —"; say "    the higher-frequency steps below will not be played at their stated rate)"; RATE=0.02; }
+    for shape in square sine triangle saw decay dither; do
+        for period_ms in 100 50 25; do
+            n=$(awk -v p="$period_ms" -v r="$RATE" 'BEGIN { n = int(p / 1000 / r); print n < 4 ? 4 : n }')
+            step "curve:$shape:${period_ms}ms" "$shape, period ${period_ms} ms (~$((1000 / period_ms)) Hz), amplitude $AMP, $n samples/period"
+            reps=$((1200 / period_ms))
+            i=0
+            while [ $i -lt $reps ]; do samples "$shape" "$MID" "$AMP" "$n"; i=$((i + 1)); done | play_samples "$RATE"
+            set_focus "$MID"; sleep 0.4
+        done
+    done
+    park
+}
+
+t_chirp() {
+    say "== chirp: one continuous glide from slow to fast. Whatever frequency"
+    say "   the lens is loudest at, you will hear it pass through. Say when."
+    MID=$((MAX / 2)); AMP=$((MAX / 2)); RATE=0.002
+    have_fast || { say "   (no python3 — chirp needs the fast path to be meaningful; skipping)"; return; }
+    for span in "5 40" "40 120"; do
+        set -- $span
+        step "chirp:$1-$2" "glide $1 Hz to $2 Hz over 8 s, amplitude $AMP"
+        awk -v f0="$1" -v f1="$2" -v mid="$MID" -v amp="$AMP" -v r=0.002 -v dur=8 -v lo="$MIN" -v hi="$MAX" '
+        BEGIN {
+            pi = 3.14159265358979; n = dur / r; ph = 0
+            for (i = 0; i < n; i++) {
+                t = i / n
+                f = f0 + (f1 - f0) * t
+                ph += 2 * pi * f * r
+                v = mid + (amp/2) * sin(ph)
+                print v < lo ? lo : (v > hi ? hi : int(v + 0.5))
+            }
+        }' | play_samples "$RATE"
+        set_focus "$MID"; sleep 0.5
     done
     park
 }
@@ -278,9 +396,20 @@ SUBDEV=${SUBDEV:-$(find_subdev || true)}
 set -- $(limits)
 MIN=${1:-0}; MAX=${2:-1023}
 
-if camera_busy; then
-    echo "a camera is in use — moving the lens now would blur its frames. Stop it first." >&2
-    exit 1
+HOLDERS=$(camera_holders)
+if [ -n "$HOLDERS" ]; then
+    echo "these processes hold a camera node:" >&2
+    echo "$HOLDERS" | sed 's/^/  /' >&2
+    if [ "$FORCE" = "1" ]; then
+        echo "FORCE=1: continuing. If one of them is actually streaming, its frames will be smeared." >&2
+    else
+        echo "" >&2
+        echo "Moving the lens during an exposure smears the focal plane, so this stops here." >&2
+        echo "  - if one is a camera app, close it" >&2
+        echo "  - pipewire/libcamera often hold nodes open WITHOUT streaming; in that case" >&2
+        echo "    re-run with FORCE=1 $0 $CMD" >&2
+        exit 1
+    fi
 fi
 
 trap 'echo; echo "parking lens at $MIN"; stop_listening; DRY=$DRY park 2>/dev/null; report_hits; exit 130' INT TERM
@@ -302,8 +431,10 @@ case "$CMD" in
     sweep) t_sweep ;;
     hold)  t_hold ;;
     rate)  t_rate ;;
-    all)   t_rate; t_range; t_steps; t_sweep; t_hold ;;
-    *)     echo "unknown: $CMD (find range steps sweep hold rate all note notes hits name)" >&2; exit 1 ;;
+    curves) t_curves ;;
+    chirp) t_chirp ;;
+    all)   t_rate; t_range; t_steps; t_sweep; t_curves; t_chirp; t_hold ;;
+    *)     echo "unknown: $CMD (find range steps sweep curves chirp hold rate all note notes hits name)" >&2; exit 1 ;;
 esac
 
 park
