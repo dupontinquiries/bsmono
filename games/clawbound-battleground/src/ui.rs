@@ -431,6 +431,17 @@ pub fn draw_select(ctx: &egui::Context, ui_state: &mut UiState, locked: &mut boo
 // --- HUD ----------------------------------------------------------------------
 
 pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f32, h: f32, ui_state: &mut UiState) {
+    // Project into egui's OWN screen, in logical points. The caller passes
+    // the render surface's size, in physical pixels; on a display scaled
+    // 1.25x, 2x (Retina), 3x (phones) every world-anchored bar, name and
+    // floater landed that factor too far down and right -- following its
+    // cat, below it ("healthbars underground, but attached"). The headless
+    // renders run at 1x, which is why they never showed it.
+    let _ = (w, h);
+    let (w, h) = {
+        let r = ctx.screen_rect();
+        (r.width(), r.height())
+    };
     setup_style(ctx);
     let g = &game.gods[player];
     let def = game.def(player);
@@ -922,7 +933,10 @@ pub fn draw_crosshair(ctx: &egui::Context, locked: bool, w: f32, h: f32) {
     }
     egui::Area::new(egui::Id::new("crosshair")).fixed_pos(Pos2::ZERO).interactable(false).show(ctx, |ui| {
         let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("crosshair_layer")));
-        let c = Pos2::new(w * 0.5, h * 0.5);
+        // the centre of egui's screen, in logical points: w/h are the
+        // surface's physical pixels, and at 2x their half is the far corner
+        let _ = (w, h);
+        let c = ui.ctx().screen_rect().center();
         let a = (t * 220.0) as u8;
         let col = Color32::from_rgba_premultiplied(230, 226, 216, a);
         painter.line_segment([c + Vec2::new(-6.0, 0.0), c + Vec2::new(-2.0, 0.0)], Stroke::new(1.4_f32, col));
@@ -1192,4 +1206,71 @@ pub fn map_picker(ui: &mut egui::Ui, choice: &mut crate::map::MapId) {
             ui.add_space(6.0);
         }
     });
+}
+
+#[cfg(test)]
+mod hidpi_tests {
+    use super::*;
+
+    /// At 2x (a Retina display), a cat in the middle of the view has its
+    /// health bar in the middle of the screen -- in egui's logical points,
+    /// whatever size in physical pixels the caller passes.
+    #[test]
+    fn health_bars_sit_over_their_cats_on_a_scaled_display() {
+        let game = Game::new_teams(&[0], &[1]);
+        let cat = game.gods[0].pos;
+        let cam = crate::render::Camera { eye: cat + Vec3::new(0.0, 8.0, -12.0), target: cat + Vec3::Y * 2.6, fov_y: 1.0 };
+        let (pw, ph) = (1280.0f32, 720.0f32); // physical pixels
+        let vp = cam.view_proj(pw / ph);
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(2.0);
+        let mut st = UiState::new();
+        let mut shapes = Vec::new();
+        for k in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(pw / 2.0, ph / 2.0))),
+                time: Some(k as f64 * 0.016),
+                ..Default::default()
+            };
+            shapes = ctx.run(raw, |c| draw_hud(c, &game, 0, vp, pw, ph, &mut st)).shapes;
+        }
+        // the player's bar: a 64-point-wide dark rect
+        let bar = shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Rect(r) if (r.rect.width() - 64.0).abs() < 0.5 && (r.rect.height() - 7.0).abs() < 0.5 => Some(r.rect),
+                _ => None,
+            })
+            .expect("the player's health bar was drawn");
+        let centre = egui::pos2(pw / 4.0, ph / 4.0); // the middle of the LOGICAL screen
+        assert!((bar.center().x - centre.x).abs() < 4.0, "bar at x {} -- the middle is {}", bar.center().x, centre.x);
+        assert!((bar.center().y - centre.y).abs() < 12.0, "bar at y {} -- the middle is {}", bar.center().y, centre.y);
+    }
+
+    /// The crosshair marks the middle of the screen at 2x too.
+    #[test]
+    fn the_crosshair_is_centred_on_a_scaled_display() {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(2.0);
+        let (pw, ph) = (1280.0f32, 720.0f32);
+        let mut shapes = Vec::new();
+        for k in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(pw / 2.0, ph / 2.0))),
+                time: Some(k as f64 * 0.016),
+                ..Default::default()
+            };
+            shapes = ctx.run(raw, |c| draw_crosshair(c, true, pw, ph)).shapes;
+        }
+        let pts: Vec<egui::Pos2> = shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::LineSegment { points, .. } => Some(points[0].lerp(points[1], 0.5)),
+                _ => None,
+            })
+            .collect();
+        assert!(!pts.is_empty(), "no crosshair drawn");
+        let mid = pts.iter().fold(egui::Vec2::ZERO, |a, p| a + p.to_vec2()) / pts.len() as f32;
+        assert!((mid.x - pw / 4.0).abs() < 2.0 && (mid.y - ph / 4.0).abs() < 2.0, "crosshair at {mid:?}, screen middle ({}, {})", pw / 4.0, ph / 4.0);
+    }
 }
