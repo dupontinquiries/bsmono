@@ -11,40 +11,25 @@
 //! fallback text. Answered once per (char, pixels-per-point) and cached in
 //! egui's own memory, so the probe is not per-frame work.
 
-use egui::text::LayoutJob;
 use egui::{Context, FontId, Id};
 
 /// A char from a plane-14 range no font assigns: the tofu yardstick.
-const NEVER_ASSIGNED: char = '\u{E0002}';
 
-fn advance_of(ctx: &Context, c: char) -> f32 {
-    let mut job = LayoutJob::default();
-    job.append(&c.to_string(), 0.0, egui::TextFormat {
-        font_id: FontId::proportional(16.0),
-        ..Default::default()
-    });
-    let galley = ctx.fonts_mut(|f| f.layout_job(job));
-    galley.rows.first()
-        .and_then(|r| r.glyphs.first())
-        .map(|g| g.advance_width)
-        .unwrap_or(0.0)
-}
 
 /// Does `c` resolve to a real glyph in the current font stack?
 ///
-/// Method: a missing char resolves to the font's replacement glyph, whose
-/// advance equals any other missing char's. Matching the yardstick within a
-/// hair means tofu. A real glyph CAN coincidentally share the advance —
-/// accepted: the failure mode is showing a word instead of an icon, which is
-/// the fallback working harder than needed, never tofu shown.
+/// Asks epaint's glyph table for the proportional family (its whole fallback chain), which
+/// egui 0.34 exposes through `fonts_mut`. This replaced a metric probe (lay out `c` and a
+/// never-assigned char, call it tofu when their advances match): measured in fao-codec-egui,
+/// it reported U+25B6 ▶ and U+1F517 🔗 as missing though both are in the bundled fonts,
+/// because their advances coincide with the replacement glyph's -- so `glyph_or` showed the
+/// fallback word where the icon would have drawn.
 pub fn renders(ctx: &Context, c: char) -> bool {
     let key = Id::new(("uikit-glyph-renders", c as u32));
     if let Some(hit) = ctx.memory(|m| m.data.get_temp::<bool>(key)) {
         return hit;
     }
-    let yardstick = advance_of(ctx, NEVER_ASSIGNED);
-    let got = advance_of(ctx, c);
-    let ok = (got - yardstick).abs() > 0.01 && got > 0.0;
+    let ok = ctx.fonts_mut(|f| f.has_glyph(&FontId::proportional(16.0), c));
     ctx.memory_mut(|m| m.data.insert_temp(key, ok));
     ok
 }
@@ -85,6 +70,10 @@ mod tests {
     fn the_probe_tells_real_from_missing() {
         let c = ctx();
         assert!(renders(&c, 'A'));
+        // The metric probe this replaced called these two tofu (their advance matches the
+        // replacement glyph's); both are in the bundled fonts.
+        assert!(renders(&c, '\u{25B6}'), "▶");
+        assert!(renders(&c, '\u{1F517}'), "🔗");
         assert!(!renders(&c, '\u{E0044}'), "an unassigned char must read as missing");
     }
 
