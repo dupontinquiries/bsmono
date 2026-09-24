@@ -10,6 +10,9 @@
 //!   --from S --to S          render only that window
 //!   --bypass kind,kind       remove those effect kinds from every bus and clip
 //!   --mute-synths            mute the rack's stand-in synths (Sine / Sub)
+//!   --dry-master             bypass the "Master" bus's chain: the MIX, from the
+//!                            same project that renders the master -- one project,
+//!                            both deliverables, no re-export between them
 use std::collections::BTreeMap;
 use std::io::Write;
 
@@ -22,6 +25,9 @@ fn main() {
     let mut rack = save.rack.clone().unwrap_or_else(studio_live::Rack::trap_kit);
     let mut project = save.to_project();
     for b in project.busses.values_mut() { b.chain.retain(|e| !bypass.contains(&e.kind)); }
+    if a.iter().any(|x| x == "--dry-master") {
+        for b in project.busses.values_mut().filter(|b| b.name == "Master") { b.chain.clear(); }
+    }
     for c in project.clips.values_mut() { c.effects.retain(|e| !bypass.contains(&e.kind)); }
     if a.iter().any(|x| x == "--mute-synths") {
         for ch in rack.channels.iter_mut() {

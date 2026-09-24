@@ -127,6 +127,8 @@ pub fn effect_for(plugin: &str) -> Option<(&'static str, &'static str)> {
         "Fruity Delay 3" => ("delay", "exact kind"),
         "Pitcher" => ("autotune", "exact kind"),
         "Fruity Balance" => ("gain", "exact kind (pan not kept)"),
+        "Fruity Compressor" => ("compressor", "exact kind"),
+        "Fruity Multiband Compressor" => ("multiband", "exact kind"),
         _ => return None,
     })
 }
