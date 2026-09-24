@@ -182,6 +182,9 @@ struct Player {
     analysis_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Probed once: sysfs does not change under a running app.
+static GPU_CLASS: std::sync::OnceLock<enhance_plan::GpuClass> = std::sync::OnceLock::new();
+
 const SPEED_SETTLE: Duration = Duration::from_millis(250);
 
 /// File-picker state. Navigation is uikit-egui's PathPicker; the file list and
@@ -1802,8 +1805,10 @@ impl Player {
         self.enh_px = px;
         let enhance = match &self.enh_facts {
             Some(f) => {
-                let phone = decode::machine().kind == decode::MachineKind::QualcommVenus;
-                let plan = enhance_plan::plan_title(f, &enhance_plan::Device::default_for(phone, px.0, px.1));
+                let class = *GPU_CLASS.get_or_init(|| {
+                    enhance_plan::classify_gpu(&enhance_plan::drm_cards(), decode::machine().kind == decode::MachineKind::QualcommVenus)
+                });
+                let plan = enhance_plan::plan_title(f, &enhance_plan::Device::default_for(class, px.0, px.1));
                 let e = plan.enhance;
                 self.enh_plan = Some(plan);
                 e

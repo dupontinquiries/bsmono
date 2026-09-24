@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use vidkit_core::frame::{ColorInfo, CpuPlanes, Frame, FrameData, PlaneLayout};
-use vidkit_egui::glow_present::{expected_rgb, rcas_reference, Enhance, Nv12Gpu, Scaler};
+use vidkit_egui::glow_present::{expected_rgb, rcas_reference, temporal_reference, Enhance, Nv12Gpu, Scaler};
 
 fn nv12(w: u32, h: u32, y: impl Fn(u32, u32) -> u8) -> Frame {
     let mut luma = Vec::with_capacity((w * h) as usize);
@@ -43,7 +43,10 @@ fn nv12(w: u32, h: u32, y: impl Fn(u32, u32) -> u8) -> Frame {
 
 struct Case {
     name: &'static str,
+    /// The frame checked against. Multi-frame cases upload `history` first,
+    /// one per update, then this.
     frame: Frame,
+    history: Vec<Frame>,
     enhance: Enhance,
     /// Output size in pixels.
     out: (u32, u32),
@@ -135,6 +138,86 @@ fn check_step_overshoot(f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Resul
     }
 }
 
+fn at_pts(mut f: Frame, i: usize) -> Frame {
+    f.pts = std::time::Duration::from_millis(40 * i as u64);
+    f
+}
+
+/// Deterministic noise in -5..=5, different per frame and pixel.
+fn noise(seed: u32, x: u32, y: u32) -> i32 {
+    let mut v = seed.wrapping_mul(747796405).wrapping_add(x.wrapping_mul(2891336453)).wrapping_add(y.wrapping_mul(1181783497));
+    v ^= v >> 15;
+    v = v.wrapping_mul(277803737);
+    (v >> 16) as i32 % 11 - 5
+}
+
+fn board(x: u32, y: u32) -> u8 {
+    // Chalk-ish: dark board, a few pale strokes.
+    if (y == 10 && (6..40).contains(&x)) || (x == 20 && (6..30).contains(&y)) || (y == 24 && (30..56).contains(&x)) { 200 } else { 50 }
+}
+
+fn noisy_board(frame: u32) -> Frame {
+    nv12(64, 48, move |x, y| (board(x, y) as i32 + noise(frame, x, y)).clamp(16, 235) as u8)
+}
+
+fn check_denoise(f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String, String> {
+    // The CPU mirror over the same sequence, in the shader's own units
+    // (luma 0..1 before colour conversion).
+    let n = 10u32;
+    let mut acc: Vec<f32> = Vec::new();
+    for i in 0..n {
+        let fr = noisy_board(i);
+        for y in 0..h {
+            for x in 0..w {
+                let v = luma_of(&fr, x, y) as f32 / 255.0;
+                let k = (y * w + x) as usize;
+                if i == 0 { acc.push(v) } else { acc[k] = temporal_reference(v, acc[k]) }
+            }
+        }
+    }
+    let to_rgb = |l: f32| expected_rgb((l * 255.0).round().clamp(0.0, 255.0) as u8, 128, 128, f.color)[0];
+    let worst = got.iter().enumerate().map(|(i, p)| p[0].abs_diff(to_rgb(acc[i]))).max().unwrap_or(0);
+    // Noise left, against the clean board, vs one noisy frame's.
+    let rms = |pick: &dyn Fn(u32, u32) -> u8| {
+        let mut s = 0.0f64;
+        for y in 0..h {
+            for x in 0..w {
+                let clean = expected_rgb(board(x, y), 128, 128, f.color)[0] as f64;
+                s += (pick(x, y) as f64 - clean).powi(2);
+            }
+        }
+        (s / (w * h) as f64).sqrt()
+    };
+    let last = noisy_board(n - 1);
+    let before = rms(&|x, y| conv(&last, x, y)[0]);
+    let after = rms(&|x, y| got[(y * w + x) as usize][0]);
+    if worst > 2 {
+        Err(format!("max error {worst}/255 against temporal_reference"))
+    } else if before / after.max(0.01) < 2.0 {
+        Err(format!("noise only {before:.2} -> {after:.2} rms"))
+    } else {
+        Ok(format!("noise {before:.2} -> {after:.2} rms ({:.1}x), max error {worst}/255 vs mirror", before / after))
+    }
+}
+
+fn square_at(x0: u32) -> Frame {
+    nv12(64, 48, move |x, y| if (x0..x0 + 8).contains(&x) && (16..32).contains(&y) { 200 } else { 100 })
+}
+
+fn check_no_ghost(f: &Frame, got: &[[u8; 3]], (w, _h): (u32, u32)) -> Result<String, String> {
+    let (bg, sq) = (expected_rgb(100, 128, 128, f.color)[0], expected_rgb(200, 128, 128, f.color)[0]);
+    let px = |x: u32, y: u32| got[(y * w + x) as usize][0];
+    let old = px(12, 24);
+    let new = px(44, 24);
+    if old.abs_diff(bg) > 3 {
+        Err(format!("ghost where the square was: {old} (background {bg})"))
+    } else if new.abs_diff(sq) > 3 {
+        Err(format!("new position lagging: {new} (square {sq})"))
+    } else {
+        Ok(format!("moved square shown at once ({new}), old place clean ({old})"))
+    }
+}
+
 fn cases() -> Vec<Case> {
     // 2-D pattern: soft diagonal field plus a bright square near the TOP-LEFT,
     // so a vertical or horizontal flip anywhere shows as a large error.
@@ -142,10 +225,26 @@ fn cases() -> Vec<Case> {
         if x < 12 && y < 8 && x > 3 && y > 2 { 220 } else { (40 + (x * 3 + y * 2) % 120) as u8 }
     };
     vec![
-        Case { name: "plain conversion", frame: nv12(64, 48, pattern), enhance: Enhance::default(), out: (64, 48), check: check_plain },
-        Case { name: "RCAS offscreen pass", frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2) }, out: (64, 48), check: check_rcas },
-        Case { name: "bicubic 2x on a ramp", frame: nv12(32, 16, |x, _| (40 + x * 4) as u8), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None }, out: (64, 32), check: check_ramp },
-        Case { name: "bicubic 2x on a step", frame: nv12(32, 16, |x, _| if x < 16 { 60 } else { 200 }), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None }, out: (64, 32), check: check_step_overshoot },
+        Case {
+            name: "temporal denoise, board",
+            frame: at_pts(noisy_board(9), 9),
+            history: (0..9).map(|i| at_pts(noisy_board(i), i as usize)).collect(),
+            enhance: Enhance { temporal: true, ..Enhance::default() },
+            out: (64, 48),
+            check: check_denoise,
+        },
+        Case {
+            name: "temporal, no ghosting",
+            frame: at_pts(square_at(40), 8),
+            history: (0..8).map(|i| at_pts(square_at(8), i)).collect(),
+            enhance: Enhance { temporal: true, ..Enhance::default() },
+            out: (64, 48),
+            check: check_no_ghost,
+        },
+        Case { name: "plain conversion", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance::default(), out: (64, 48), check: check_plain },
+        Case { name: "RCAS offscreen pass", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
+        Case { name: "bicubic 2x on a ramp", history: vec![], frame: nv12(32, 16, |x, _| (40 + x * 4) as u8), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_ramp },
+        Case { name: "bicubic 2x on a step", history: vec![], frame: nv12(32, 16, |x, _| if x < 16 { 60 } else { 200 }), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_step_overshoot },
     ]
 }
 
@@ -195,13 +294,17 @@ impl eframe::App for SelfTest {
             return;
         }
         let c = &self.cases[self.at];
-        if self.shown == 0 {
+        // One upload per update: history first, then the checked frame. The
+        // temporal pass runs per upload, so this is one step per frame.
+        let n = c.history.len() as u32;
+        if self.shown <= n {
+            let f = if self.shown < n { &c.history[self.shown as usize] } else { &c.frame };
             if let (Ok(mut g), Some(gl)) = (gpu.lock(), frame.gl()) {
-                if let Err(e) = unsafe { g.upload(gl, &c.frame) } {
+                g.enhance = c.enhance;
+                if let Err(e) = unsafe { g.upload(gl, f) } {
                     println!("GPU SELFTEST FAIL: upload: {e}");
                     std::process::exit(1);
                 }
-                g.enhance = c.enhance;
             }
         }
         self.shown += 1;
@@ -209,7 +312,7 @@ impl eframe::App for SelfTest {
         let (w, h) = c.out;
         egui::CentralPanel::default().show(ctx, |ui| {
             let r = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(w as f32 / ppp, h as f32 / ppp));
-            let (g2, rb, grab) = (gpu.clone(), self.readback.clone(), self.shown >= 2);
+            let (g2, rb, grab) = (gpu.clone(), self.readback.clone(), self.shown >= n + 2);
             ui.painter().add(egui::PaintCallback {
                 rect: r,
                 callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |info, painter| {

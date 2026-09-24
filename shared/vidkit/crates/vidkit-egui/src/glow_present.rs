@@ -235,6 +235,49 @@ void main() {
 }
 "#;
 
+/// Motion-adaptive temporal denoise on luma, at SOURCE resolution, once per
+/// decoded frame.
+///
+/// For a static camera -- a lecture, a blackboard, a slide -- most pixels
+/// are the same scene re-encoded with fresh compression noise every frame.
+/// Where a pixel stays within `thr` of its running average it joins the
+/// average (weight `k`); where it moves by more than `2 thr` it passes
+/// through untouched, with a smooth ramp between, so a moving hand or a new
+/// line of chalk shows at once and leaves no trail. The noise that was
+/// dancing round each stroke settles, and RCAS then sharpens clean edges
+/// instead of amplifying the dance.
+const TEMPORAL_FRAG: &str = r#"
+precision mediump float;
+in vec2 uv;
+out vec4 frag;
+uniform sampler2D cur;
+uniform sampler2D prev;
+uniform float reset;
+uniform float thr;
+uniform float k;
+void main() {
+    float y = texture(cur, uv).r;
+    if (reset > 0.5) { frag = vec4(y, 0.0, 0.0, 1.0); return; }
+    float a = texture(prev, uv).r;
+    float w = smoothstep(thr, 2.0 * thr, abs(y - a));
+    frag = vec4(mix(mix(a, y, k), y, w), 0.0, 0.0, 1.0);
+}
+"#;
+
+/// Temporal denoise strength: threshold (0..1 luma) and blend weight.
+pub const TEMPORAL_THR: f32 = 8.0 / 255.0;
+pub const TEMPORAL_K: f32 = 0.2;
+
+/// The CPU mirror of TEMPORAL_FRAG, for the self-test.
+pub fn temporal_reference(y: f32, a: f32) -> f32 {
+    let (thr, k) = (TEMPORAL_THR, TEMPORAL_K);
+    let t = ((y - a).abs() - thr) / thr;
+    let t = t.clamp(0.0, 1.0);
+    let w = t * t * (3.0 - 2.0 * t);
+    let blended = a + (y - a) * k;
+    blended + (y - blended) * w
+}
+
 /// Scaling filter for the video.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum Scaler {
@@ -251,6 +294,8 @@ pub struct Enhance {
     pub scaler: Scaler,
     /// RCAS strength in FSR's stops (0 = strongest, 1 = half...); `None` off.
     pub sharpen: Option<f32>,
+    /// Temporal luma denoise, for static-camera content.
+    pub temporal: bool,
 }
 
 impl Enhance {
@@ -265,6 +310,11 @@ impl Enhance {
             Scaler::Bicubic => 10,
         };
         scale + if self.sharpen.is_some() { 5 } else { 0 }
+    }
+    /// Texture fetches per SOURCE pixel per frame: the temporal pass reads
+    /// the new frame and the running average.
+    pub fn fetches_per_source_pixel(&self) -> u32 {
+        if self.temporal { 2 } else { 0 }
     }
 }
 
@@ -305,6 +355,14 @@ pub struct Nv12Gpu {
     /// first use and resized with the output, never when sharpening is off.
     target: Option<(glow::Framebuffer, glow::Texture, (i32, i32))>,
     pub enhance: Enhance,
+    temporal_prog: glow::Program,
+    /// Ping-pong running averages at source size, and which is current.
+    acc: Option<([(glow::Framebuffer, glow::Texture); 2], (u32, u32))>,
+    acc_cur: usize,
+    acc_valid: bool,
+    last_pts: Option<std::time::Duration>,
+    /// Temporal passes run, for the self-test and the diagnostics line.
+    pub temporal_passes: u64,
     vao: glow::VertexArray,
     tex_y: glow::Texture,
     tex_uv: glow::Texture,
@@ -327,6 +385,7 @@ impl Nv12Gpu {
 
         let program = link(gl, version, FRAG)?;
         let rcas = link(gl, version, RCAS_FRAG)?;
+        let temporal_prog = link(gl, version, TEMPORAL_FRAG)?;
 
         let vao = gl.create_vertex_array()?;
         let tex_y = gl.create_texture()?;
@@ -346,6 +405,12 @@ impl Nv12Gpu {
             rcas,
             target: None,
             enhance: Enhance::default(),
+            temporal_prog,
+            acc: None,
+            acc_cur: 0,
+            acc_valid: false,
+            last_pts: None,
+            temporal_passes: 0,
             vao,
             tex_y,
             tex_uv,
@@ -396,18 +461,27 @@ impl Nv12Gpu {
 
         let y_stride = planes.strides.first().copied().unwrap_or(w);
         gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, y_stride as i32);
+        // Same size as last frame: write into the existing storage. A fresh
+        // tex_image_2d every frame reallocates both textures sixty times a
+        // second, which some drivers turn into a stall on the last frame's
+        // draw still reading the old storage.
+        let same = self.size == (w, h);
         gl.bind_texture(glow::TEXTURE_2D, Some(self.tex_y));
-        gl.tex_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            glow::R8 as i32,
-            w as i32,
-            h as i32,
-            0,
-            glow::RED,
-            glow::UNSIGNED_BYTE,
-            glow::PixelUnpackData::Slice(Some(&planes.data[0])),
-        );
+        if same {
+            gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, w as i32, h as i32, glow::RED, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(&planes.data[0])));
+        } else {
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::R8 as i32,
+                w as i32,
+                h as i32,
+                0,
+                glow::RED,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&planes.data[0])),
+            );
+        }
 
         // The chroma plane's stride is in BYTES and each texel is two bytes, so
         // the row length in TEXELS is half it. Passing the byte stride here
@@ -416,17 +490,21 @@ impl Nv12Gpu {
         let uv_stride_bytes = planes.strides.get(1).copied().unwrap_or(cw * 2);
         gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, (uv_stride_bytes / 2) as i32);
         gl.bind_texture(glow::TEXTURE_2D, Some(self.tex_uv));
-        gl.tex_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            glow::RG8 as i32,
-            cw as i32,
-            ch as i32,
-            0,
-            glow::RG,
-            glow::UNSIGNED_BYTE,
-            glow::PixelUnpackData::Slice(Some(&planes.data[1])),
-        );
+        if same {
+            gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, cw as i32, ch as i32, glow::RG, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(&planes.data[1])));
+        } else {
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RG8 as i32,
+                cw as i32,
+                ch as i32,
+                0,
+                glow::RG,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&planes.data[1])),
+            );
+        }
 
         // Leave the row length as the driver found it, or every later upload in
         // the process inherits ours.
@@ -434,16 +512,120 @@ impl Nv12Gpu {
 
         self.size = (w, h);
         self.color = frame.color;
+        if self.enhance.temporal {
+            // A seek, a jump or a size change restarts the average: blending
+            // across a cut is exactly the ghost the threshold exists to stop.
+            let jump = match self.last_pts {
+                Some(p) => frame.pts < p || frame.pts.saturating_sub(p) > std::time::Duration::from_millis(500),
+                None => true,
+            };
+            if jump || !same {
+                self.acc_valid = false;
+            }
+            self.temporal_pass(gl, w, h);
+        } else {
+            self.acc_valid = false;
+        }
+        self.last_pts = Some(frame.pts);
         self.uploads += 1;
         self.uploaded_bytes += upload_bytes(PlaneLayout::Nv12, w as usize, h as usize) as u64;
         Ok(())
+    }
+
+    /// The two running-average textures at `w x h`: R16F where the driver
+    /// can render to it (an 8-bit average rounds away every step smaller
+    /// than 1/255 and sticks up to thr away from the truth), R8 otherwise.
+    unsafe fn accumulators(&mut self, gl: &glow::Context, w: u32, h: u32) -> Option<[(glow::Framebuffer, glow::Texture); 2]> {
+        if let Some((pair, size)) = self.acc {
+            if size == (w, h) {
+                return Some(pair);
+            }
+            for (fb, t) in pair {
+                gl.delete_framebuffer(fb);
+                gl.delete_texture(t);
+            }
+            self.acc = None;
+        }
+        for (internal, ty) in [(glow::R16F, glow::HALF_FLOAT), (glow::R8, glow::UNSIGNED_BYTE)] {
+            let mut made = Vec::new();
+            let mut ok = true;
+            for _ in 0..2 {
+                let (Ok(t), Ok(fb)) = (gl.create_texture(), gl.create_framebuffer()) else { return None };
+                gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                gl.tex_image_2d(glow::TEXTURE_2D, 0, internal as i32, w as i32, h as i32, 0, glow::RED, ty, glow::PixelUnpackData::Slice(None));
+                for (k, v) in [(glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE), (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE), (glow::TEXTURE_MIN_FILTER, glow::LINEAR), (glow::TEXTURE_MAG_FILTER, glow::LINEAR)] {
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, k, v as i32);
+                }
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fb));
+                gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(t), 0);
+                ok &= gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
+                made.push((fb, t));
+            }
+            if ok {
+                let pair = [made[0], made[1]];
+                self.acc = Some((pair, (w, h)));
+                return Some(pair);
+            }
+            for (fb, t) in made {
+                gl.delete_framebuffer(fb);
+                gl.delete_texture(t);
+            }
+        }
+        None
+    }
+
+    /// One temporal step: the new luma plane and the current average into
+    /// the other average. Runs in `upload`, once per decoded frame -- egui
+    /// repaints the same frame several times and each must not count.
+    unsafe fn temporal_pass(&mut self, gl: &glow::Context, w: u32, h: u32) {
+        let prev_fb = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
+        let mut vp = [0i32; 4];
+        gl.get_parameter_i32_slice(glow::VIEWPORT, &mut vp);
+        let scissor = gl.is_enabled(glow::SCISSOR_TEST);
+        if let Some(pair) = self.accumulators(gl, w, h) {
+            let next = 1 - self.acc_cur;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(pair[next].0));
+            gl.disable(glow::SCISSOR_TEST);
+            gl.viewport(0, 0, w as i32, h as i32);
+            gl.use_program(Some(self.temporal_prog));
+            gl.bind_vertex_array(Some(self.vao));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.tex_y));
+            gl.active_texture(glow::TEXTURE1);
+            gl.bind_texture(glow::TEXTURE_2D, Some(pair[self.acc_cur].1));
+            let p = self.temporal_prog;
+            let u = |n: &str| gl.get_uniform_location(p, n);
+            if let Some(l) = u("cur") { gl.uniform_1_i32(Some(&l), 0); }
+            if let Some(l) = u("prev") { gl.uniform_1_i32(Some(&l), 1); }
+            if let Some(l) = u("reset") { gl.uniform_1_f32(Some(&l), if self.acc_valid { 0.0 } else { 1.0 }); }
+            if let Some(l) = u("thr") { gl.uniform_1_f32(Some(&l), TEMPORAL_THR); }
+            if let Some(l) = u("k") { gl.uniform_1_f32(Some(&l), TEMPORAL_K); }
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::BLEND);
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            gl.bind_vertex_array(None);
+            self.acc_cur = next;
+            self.acc_valid = true;
+            self.temporal_passes += 1;
+        }
+        let fb = std::num::NonZeroU32::new(prev_fb as u32).map(glow::NativeFramebuffer);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, fb);
+        gl.viewport(vp[0], vp[1], vp[2], vp[3]);
+        if scissor {
+            gl.enable(glow::SCISSOR_TEST);
+        }
     }
 
     unsafe fn draw_convert(&self, gl: &glow::Context, flip_y: f32) {
         gl.use_program(Some(self.program));
         gl.bind_vertex_array(Some(self.vao));
         gl.active_texture(glow::TEXTURE0);
-        gl.bind_texture(glow::TEXTURE_2D, Some(self.tex_y));
+        // The running average in place of the raw luma when denoising.
+        let luma = match (&self.acc, self.enhance.temporal && self.acc_valid) {
+            (Some((pair, _)), true) => pair[self.acc_cur].1,
+            _ => self.tex_y,
+        };
+        gl.bind_texture(glow::TEXTURE_2D, Some(luma));
         gl.active_texture(glow::TEXTURE1);
         gl.bind_texture(glow::TEXTURE_2D, Some(self.tex_uv));
         let p = self.program;
@@ -563,6 +745,13 @@ impl Nv12Gpu {
     pub unsafe fn destroy(&self, gl: &glow::Context) {
         gl.delete_program(self.program);
         gl.delete_program(self.rcas);
+        gl.delete_program(self.temporal_prog);
+        if let Some((pair, _)) = self.acc {
+            for (fb, t) in pair {
+                gl.delete_framebuffer(fb);
+                gl.delete_texture(t);
+            }
+        }
         if let Some((fb, tex, _)) = self.target {
             gl.delete_framebuffer(fb);
             gl.delete_texture(tex);
@@ -669,7 +858,7 @@ mod tests {
     /// desktop and fails on the phone.
     #[test]
     fn the_shader_source_is_es3_compatible() {
-        for src in [VERT, FRAG, RCAS_FRAG] {
+        for src in [VERT, FRAG, RCAS_FRAG, TEMPORAL_FRAG] {
             assert!(!src.contains("texture2D("), "texture2D is GLSL 1.20");
             assert!(!src.contains("varying "), "varying is GLSL 1.20");
             assert!(!src.contains("gl_FragColor"), "gl_FragColor is GLSL 1.20");
@@ -704,9 +893,19 @@ mod tests {
     #[test]
     fn enhancement_cost_is_counted_for_the_budget() {
         assert_eq!(Enhance::default().fetches_per_pixel(), 2);
-        let full = Enhance { scaler: Scaler::Bicubic, sharpen: Some(0.5) };
+        let full = Enhance { scaler: Scaler::Bicubic, sharpen: Some(0.5), temporal: false };
         assert_eq!(full.fetches_per_pixel(), 15);
         assert!((full.rcas_scale() - 0.7071).abs() < 1e-3);
         assert_eq!(Enhance::default().rcas_scale(), 0.0);
+    }
+
+    /// The CPU mirror: still pixels join the average, moving ones pass.
+    #[test]
+    fn temporal_mirror_averages_still_pixels_and_passes_motion() {
+        let n = 5.0 / 255.0;
+        assert!((temporal_reference(0.5 + n, 0.5) - (0.5 + 0.2 * n)).abs() < 1e-6, "noise joins the average");
+        assert_eq!(temporal_reference(0.9, 0.5), 0.9, "a big change passes straight through");
+        let mid = temporal_reference(0.5 + 12.0 / 255.0, 0.5);
+        assert!(mid > 0.5 + 0.2 * 12.0 / 255.0 && mid < 0.5 + 12.0 / 255.0, "between thr and 2 thr: a blend");
     }
 }
