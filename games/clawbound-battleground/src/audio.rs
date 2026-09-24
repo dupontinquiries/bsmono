@@ -543,6 +543,19 @@ pub mod output {
     }
 }
 
+/// Seconds the ambience takes to fade to silence when a match ends.
+pub const FADE_OUT_SECS: f32 = 0.6;
+
+/// The ambience with no match to listen to (the menu, the select screen):
+/// last frame's params, master falling to silence over FADE_OUT_SECS. The
+/// app only ever SET params from a live game, so when a match ended and the
+/// game was dropped, the synth kept playing that match's wind on the menu,
+/// forever (reported).
+pub fn fade_out(prev: AudioParams, dt: f32) -> AudioParams {
+    let step = 0.8 / FADE_OUT_SECS * dt.max(0.0);
+    AudioParams { master: (prev.master - step).max(0.0), ..prev }
+}
+
 /// Build this frame's `AudioParams` from the game + camera. Headless.
 pub fn params_for(game: &crate::sim::Game, listener: Vec3, cam_yaw: f32, thunder_count: u32, thunder_dist: f32) -> AudioParams {
     let atm = game.weather.atmosphere();
@@ -691,5 +704,38 @@ mod fanfare_tests {
         let (quiet, loud) = (run(false), run(true));
         assert!(loud > quiet * 3.0, "the fanfare is heard: {loud} vs {quiet}");
         assert!(loud.is_finite());
+    }
+}
+
+#[cfg(test)]
+mod fade_tests {
+    use super::*;
+
+    /// Out of a match the ambience fades -- monotonically, not a cut -- to
+    /// exactly silence within FADE_OUT_SECS, and stays there; and the synth
+    /// at master 0 outputs nothing.
+    #[test]
+    fn out_of_a_match_the_wind_fades_to_silence() {
+        let mut p = AudioParams::default();
+        p.wind = 0.9;
+        let start = p.master;
+        let mut last = start;
+        let mut t = 0.0;
+        while t < FADE_OUT_SECS + 0.05 {
+            p = fade_out(p, 1.0 / 60.0);
+            assert!(p.master <= last + 1e-6, "not monotone");
+            assert!(p.master > 0.0 || t > FADE_OUT_SECS * 0.5, "cut, not faded");
+            last = p.master;
+            t += 1.0 / 60.0;
+        }
+        assert_eq!(p.master, 0.0);
+        assert_eq!(fade_out(p, 1.0).master, 0.0);
+        assert_eq!(p.wind, 0.9, "only the level fades");
+        let mut w = WindSynth::new(22050.0);
+        let mut out = vec![0.0f32; 2 * 2048];
+        for _ in 0..8 {
+            w.render(&p, &mut out, 2);
+        }
+        assert!(out.iter().all(|x| x.abs() < 1e-6), "wind audible at master 0");
     }
 }

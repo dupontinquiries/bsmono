@@ -78,6 +78,9 @@ struct AppState {
     skip_intro: bool,
     /// Counter the audio synth watches: a change starts the fanfare.
     fanfare_count: u32,
+    /// The ambience's last params, faded to silence out of a match.
+    #[cfg(feature = "audio")]
+    audio_last: crate::audio::AudioParams,
     /// A prepared ability awaiting the attack button (`targeting`).
     targeting: crate::targeting::Targeting,
     /// The attack button as last frame saw it (for its press edge), and
@@ -388,6 +391,9 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         intro: None,
         skip_intro: false,
         fanfare_count: 0,
+        #[cfg(feature = "audio")]
+        // silent until a match: the menu has no wind to fade from
+        audio_last: crate::audio::AudioParams { master: 0.0, ..crate::audio::AudioParams::default() },
         targeting: Default::default(),
         attack_was: false,
         attack_eaten: false,
@@ -1024,10 +1030,20 @@ fn render(s: &mut AppState) {
     let vp = cam.view_proj(s.renderer.width as f32 / s.renderer.height as f32);
 
     // ambience: the listener is the player; the wind pans with the camera
+    // Out of a match -- the menu, the select screen, after a match -- the
+    // ambience fades to silence (`audio::fade_out`) instead of holding the
+    // last match's wind.
     #[cfg(feature = "audio")]
-    if let (Some(g), Some(amb)) = (s.game.as_ref(), s.ambience.as_ref()) {
-        let mut p = crate::audio::params_for(g, g.gods[0].pos, s.cam_yaw, s.thunder_count, s.thunder_dist);
-        p.fanfare_count = s.fanfare_count;
+    if let Some(amb) = s.ambience.as_ref() {
+        let p = match s.game.as_ref() {
+            Some(g) if s.screen == Screen::Playing => {
+                let mut p = crate::audio::params_for(g, g.gods[0].pos, s.cam_yaw, s.thunder_count, s.thunder_dist);
+                p.fanfare_count = s.fanfare_count;
+                p
+            }
+            _ => crate::audio::fade_out(s.audio_last, dt_frame),
+        };
+        s.audio_last = p;
         amb.set(p);
     }
 
