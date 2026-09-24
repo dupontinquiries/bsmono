@@ -453,6 +453,7 @@ pub fn assemble(takes: &[Take], outline: &[String], opts: &Options, noise: &dyn 
 }
 
 pub mod story;
+pub mod constraints;
 
 #[cfg(test)]
 mod tests;

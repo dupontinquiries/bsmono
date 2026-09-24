@@ -100,6 +100,7 @@ pub mod multicam;
 pub mod dualsync;
 /// The timeline's video clips cut into one mp4 over the mixdown — ffmpeg's edit list.
 pub mod edit;
+pub mod vfx_survey;
 
 use std::path::Path;
 use std::process::{Command, Stdio};
