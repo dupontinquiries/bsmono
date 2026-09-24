@@ -33,6 +33,13 @@ pub enum Item {
     /// (`props::crag`). Rooted in the rock: scenery, not collision -- the
     /// floor's edge is already the wall.
     Crag { at: Vec3, size: f32, lean: f32, facing: Vec3, variant: i32, coarse: bool, spiky: bool },
+    /// A glowing gem cluster at the foot of a wall (`props::gem_cluster`).
+    Gem { at: Vec3, size: f32, hue: u8, variant: i32 },
+    /// A natural stone arch over a corridor; `yaw` is the corridor's
+    /// direction. Its legs stand in the rock, so it is scenery.
+    Arch { at: Vec3, span: f32, height: f32, yaw: f32, variant: i32 },
+    /// An animal god, facing along quarter turn `quarter`.
+    Statue { at: Vec3, owl: bool, quarter: u8 },
 }
 
 /// Distinct crag meshes built; placements share them.
@@ -66,7 +73,16 @@ fn blue_half(z: f32) -> f32 {
     -(z.abs().max(0.6))
 }
 
+/// Everything placed on Twinfang Pass. Always computed AS the pass: it mixes
+/// the pass's own geometry with map-dispatched calls (`Team::base_pos`,
+/// `lane_clearance`, tower clearings), and run with the jungle active -- the
+/// thread default, as in a test -- it put the base statues at the jungle's
+/// bases, inside the pass's rock (`statues_arches_and_gems_...` caught it).
 pub fn placements() -> Vec<Item> {
+    crate::map::with(crate::map::MapId::Pass, placements_here)
+}
+
+fn placements_here() -> Vec<Item> {
     let f = pass::floor();
     let mut rng = Rng::new(0x7F1A_F00D);
     let mut out = Vec::new();
@@ -303,6 +319,79 @@ pub fn placements() -> Vec<Item> {
         }
     }
 
+    // Animal gods. Great cats flank each base, facing out toward the lanes;
+    // owls stand in the back walls of the boss grounds, facing in.
+    for t in [Team::Blue, Team::Red] {
+        let b = t.base_pos();
+        for sx in [-1.0f32, 1.0] {
+            let at = Vec3::new(sx * 21.0, 0.0, b.z - t.push_z() * 10.0);
+            out.push(Item::Statue { at, owl: false, quarter: if t == Team::Blue { 0 } else { 2 } });
+        }
+    }
+    for p in pass::pit_positions() {
+        let out_dir = Vec3::new(p.x.signum(), 0.0, 0.0);
+        let mut at = p;
+        while f.sdf(at.x, at.z) < 1.2 {
+            at += out_dir * 0.25;
+        }
+        // facing back in: +z turns to +x on quarter 1, -x on quarter 3
+        out.push(Item::Statue { at, owl: true, quarter: if p.x < 0.0 { 1 } else { 3 } });
+    }
+
+    // Arches over the flank slots and the shoulder ledges, spanning each
+    // square-on; kept only if both legs stand in the rock.
+    {
+        let pick: [(bool, usize); 4] = [(true, 1), (true, 4), (false, 0), (false, 2)];
+        for (is_slot, i) in pick {
+            let ((ax, az), (bx, bz)) = if is_slot { pass::SLOTS[i] } else { pass::LEDGES[i] };
+            for zs in [1.0f32, -1.0] {
+                let a = Vec3::new(ax * pass::S, 0.0, az * zs * pass::S);
+                let b = Vec3::new(bx * pass::S, 0.0, bz * zs * pass::S);
+                let mid = (a + b) * 0.5;
+                let dir = (b - a).normalize_or_zero();
+                let across = Vec3::new(-dir.z, 0.0, dir.x);
+                let half = if is_slot { pass::SLOT_R } else { pass::LEDGE_R };
+                let span = half * 2.0 + 2.2;
+                let legs = [mid + across * (span * 0.5 + 1.3), mid - across * (span * 0.5 + 1.3)];
+                if legs.iter().all(|l| f.sdf(l.x, l.z) >= 0.0) {
+                    out.push(Item::Arch { at: mid, span, height: if is_slot { 10.5 } else { 8.5 }, yaw: dir.x.atan2(dir.z), variant: i as i32 * 2 + (zs > 0.0) as i32 });
+                }
+            }
+        }
+    }
+
+    // Gems along the side paths: every ~10 u on a ledge or slot, at the
+    // foot of alternating walls, half in the rock. Blue half, mirrored.
+    {
+        let mut k = 0;
+        let paths: Vec<((f32, f32), (f32, f32), f32)> = pass::LEDGES.iter().map(|&(a, b)| (a, b, pass::LEDGE_R)).chain(pass::SLOTS.iter().map(|&(a, b)| (a, b, pass::SLOT_R))).collect();
+        for ((ax, az), (bx, bz), _half) in paths {
+            let a = Vec3::new(ax * pass::S, 0.0, az * pass::S);
+            let b = Vec3::new(bx * pass::S, 0.0, bz * pass::S);
+            let len = (b - a).length();
+            let dir = (b - a).normalize_or_zero();
+            let across = Vec3::new(-dir.z, 0.0, dir.x);
+            let mut s = 6.0;
+            while s < len - 6.0 {
+                let side = if k % 2 == 0 { 1.0 } else { -1.0 };
+                let mut q = a + dir * s;
+                for _ in 0..120 {
+                    if f.sdf(q.x, q.z) >= 0.3 {
+                        break;
+                    }
+                    q += across * side * 0.1;
+                }
+                if (0.2..1.0).contains(&f.sdf(q.x, q.z)) && q.z < -0.5 && !crate::bosses::in_pit(q.x, q.z) {
+                    let (size, hue, variant) = (rng.range(0.7, 1.05), (k % 3 == 2) as u8, k);
+                    out.push(Item::Gem { at: q, size, hue, variant });
+                    out.push(Item::Gem { at: Vec3::new(q.x, 0.0, -q.z), size, hue, variant });
+                }
+                k += 1;
+                s += 10.0;
+            }
+        }
+    }
+
     // A waterfall at the head of every stream: find the cliff face on the
     // line from the pool back up to the lip.
     for fall in pass::falls() {
@@ -380,6 +469,23 @@ pub fn build() -> (Vec<Piece>, Blockers) {
                 let mesh = crags.entry(key).or_insert_with(|| props::crag(key.1 as f32 / 4.0, key.0 / 4, (key.2 / 64) as f32 / 4.0, vox, yaw, spiky)).clone();
                 pieces.push(Piece { mesh, pos: at, quarter: 0, vsize: vox, sway: 0.0 });
             }
+            Item::Gem { at, size, hue, variant } => {
+                // seated on the ground actually there (a stream bed dips
+                // half a unit: a fixed height left one floating)
+                let y = pass::terrain_height(at.x, at.z).min(0.3) - 0.35;
+                pieces.push(Piece { mesh: props::gem_cluster(size, variant, hue), pos: Vec3::new(at.x, y, at.z), quarter: (variant % 4) as u8, vsize: V_SM, sway: 0.0 });
+            }
+            Item::Arch { at, span, height, yaw, variant } => {
+                pieces.push(Piece { mesh: props::stone_arch(span, height, yaw, variant), pos: at, quarter: 0, vsize: V_MED, sway: 0.0 });
+            }
+            Item::Statue { at, owl, quarter } => {
+                let mesh = if owl { props::statue_owl(1.0, 3) } else { props::statue_cat(1.0, 1) };
+                // a statue on the floor is solid; one set into a wall is not
+                if pass::floor().sdf(at.x, at.z) < 0.0 {
+                    blockers.push(crate::blockers::Blocker { shape: crate::blockers::Shape::Circle { x: at.x, z: at.z, r: 4.2 }, top: 14.0, cover: crate::blockers::Cover::NONE });
+                }
+                pieces.push(Piece { mesh, pos: at, quarter, vsize: V_MED, sway: 0.0 });
+            }
             Item::Fall { at, height, facing } => {
                 // The mesh's sheet faces -z (it is built against z = 1 of a
                 // 7-deep grid); pick the quarter turn nearest the facing.
@@ -396,8 +502,23 @@ pub fn build() -> (Vec<Piece>, Blockers) {
 mod tests {
     use super::*;
 
+    /// Run the test as the pass: its checks (lane_clearance, bases) are
+    /// map-dispatched, like the placement they check.
+    struct OnPass(crate::map::MapId);
+    impl Drop for OnPass {
+        fn drop(&mut self) {
+            crate::map::set_active(self.0);
+        }
+    }
+    fn on_pass() -> OnPass {
+        let prev = crate::map::active();
+        crate::map::set_active(crate::map::MapId::Pass);
+        OnPass(prev)
+    }
+
     #[test]
     fn nothing_blocks_a_lane_or_stands_in_the_rock() {
+        let _pass = on_pass();
         let items = placements();
         let f = pass::floor();
         let mut props = 0;
@@ -415,6 +536,7 @@ mod tests {
 
     #[test]
     fn it_is_fair_and_every_stream_has_its_fall() {
+        let _pass = on_pass();
         let items = placements();
         let props: Vec<_> = items.iter().filter_map(|i| if let Item::Prop { kind, x, z, .. } = *i { Some((kind, x, z)) } else { None }).collect();
         for &(k, x, z) in &props {
@@ -436,6 +558,7 @@ mod tests {
     /// of its wall (a choke's width is set by `pass::CHOKE_R`, not scenery).
     #[test]
     fn crags_stand_in_the_rock_and_keep_off_the_chokes() {
+        let _pass = on_pass();
         let f = pass::floor();
         let chokes = pass::choke_points();
         let (mut n, mut gates) = (0, 0);
@@ -458,5 +581,45 @@ mod tests {
         }
         assert!(n > 200, "the walls should be broken up: {n} crags");
         assert!(gates >= 4 * pass::CHOKES.len(), "gate crags at every choke: {gates}");
+    }
+
+    /// Statues on the floor are clear of every lane and solid; arches stand
+    /// with both legs in the rock; gems sit at the foot of a wall; all of it
+    /// mirrored like the rest of the map.
+    #[test]
+    fn statues_arches_and_gems_stand_where_they_should() {
+        let _pass = on_pass();
+        let f = pass::floor();
+        let items = placements();
+        let (mut statues, mut arches, mut gems) = (0, 0, 0);
+        for it in &items {
+            match *it {
+                Item::Statue { at, owl, .. } => {
+                    statues += 1;
+                    if f.sdf(at.x, at.z) < 0.0 {
+                        assert!(f.fits(at.x, at.z, 4.2), "statue half off the floor at {at}");
+                        assert!(lane_clearance(at.x, at.z) > 4.2 + 3.0, "statue on a lane at {at}");
+                    } else {
+                        assert!(owl, "only the owls are set into walls");
+                    }
+                }
+                Item::Arch { at, span, yaw, .. } => {
+                    arches += 1;
+                    let across = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
+                    for l in [at + across * (span * 0.5 + 1.3), at - across * (span * 0.5 + 1.3)] {
+                        assert!(f.sdf(l.x, l.z) >= 0.0, "arch leg on the floor at {l}");
+                    }
+                    assert!(f.sdf(at.x, at.z) < 0.0, "an arch spans a corridor, its middle is floor");
+                }
+                Item::Gem { at, .. } => {
+                    gems += 1;
+                    assert!((0.2..1.0).contains(&f.sdf(at.x, at.z)), "gem not at a wall's foot: {at}");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(statues, 6, "four cats at the bases, two owls at the boss grounds");
+        assert!(arches >= 4, "{arches} arches");
+        assert!(gems >= 20 && gems % 2 == 0, "{gems} gems (mirrored pairs)");
     }
 }

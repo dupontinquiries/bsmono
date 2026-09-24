@@ -887,3 +887,214 @@ pub fn crag(size: f32, variant: i32, lean: f32, vox: f32, yaw: f32, spiky: bool)
     }
     g.mesh(vox, true)
 }
+
+fn noise3(x: i32, y: i32, z: i32, seed: i32) -> f32 {
+    // wrapping: a hash, and debug builds panic on the overflow it relies on
+    let v = (x.wrapping_mul(73856093) ^ y.wrapping_mul(19349663) ^ z.wrapping_mul(83492791) ^ seed.wrapping_mul(2654435)) as f32 * 0.000_000_1;
+    let s = (v.sin() * 43758.547).fract();
+    s.abs()
+}
+
+/// Glowing gems: 3-6 hexagonal crystal prisms growing out of a small rock
+/// base, tilted outward. `hue` 0 = ice cyan, 1 = violet. The crystal voxels
+/// carry their glow in misc.z (the voxel shader adds it to the draw's
+/// emissive), brightest at each crystal's core and tip.
+pub fn gem_cluster(size: f32, variant: i32, hue: u8) -> VoxelMesh {
+    let n = ((20.0 * size).clamp(10.0, 32.0)) as usize;
+    let ny = ((34.0 * size).clamp(14.0, 48.0)) as usize;
+    let mut g = Grid::new(n, ny, n);
+    let c = n as f32 * 0.5;
+    let h = |k: i32| ((variant * 131 + k * 977) as f32 * 0.7548776).sin().abs().fract();
+    // the rock it grows from
+    g.ellipsoid(c, 1.0, c, n as f32 * 0.38, 2.2, n as f32 * 0.34, solid([0.26, 0.27, 0.30]));
+    let (core, rim) = match hue {
+        0 => ([0.62, 0.92, 1.0], [0.30, 0.62, 0.86]),
+        _ => ([0.86, 0.66, 1.0], [0.50, 0.32, 0.80]),
+    };
+    // few, long and thin: at this voxel size a fat or crowded prism is a
+    // blob (the first render), a thin one is a crystal
+    let crystals = 3 + (h(1) * 2.0) as i32;
+    let mut glow_cells: Vec<(i32, i32, i32, f32)> = Vec::new();
+    for k in 0..crystals {
+        let a = h(10 + k) * std::f32::consts::TAU;
+        let tilt = 0.15 + h(20 + k) * 0.55;
+        let dir = glam::Vec3::new(tilt.sin() * a.cos(), tilt.cos(), tilt.sin() * a.sin()).normalize();
+        let base = glam::Vec3::new(c + a.cos() * n as f32 * 0.2, 1.5, c + a.sin() * n as f32 * 0.2);
+        let len = ny as f32 * (0.6 + h(30 + k) * 0.35) * if k == 0 { 1.0 } else { 0.75 };
+        let r = 1.6 + h(40 + k) * 0.9;
+        let up = if dir.y.abs() < 0.95 { glam::Vec3::Y } else { glam::Vec3::X };
+        let e1 = up.cross(dir).normalize();
+        let e2 = dir.cross(e1);
+        for x in 0..n as i32 {
+            for y in 0..ny as i32 {
+                for z in 0..n as i32 {
+                    let p = glam::Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5) - base;
+                    let t = p.dot(dir) / len;
+                    if !(0.0..=1.0).contains(&t) {
+                        continue;
+                    }
+                    let q = p - dir * p.dot(dir);
+                    let (u, v) = (q.dot(e1), q.dot(e2));
+                    // hexagon: max over three axes of |projection|
+                    let hex = [0.0f32, 1.047, 2.094].iter().map(|&th| (u * th.cos() + v * th.sin()).abs()).fold(0.0, f32::max);
+                    // straight prism, then a pointed six-sided tip
+                    let taper = if t < 0.72 { 1.0 } else { 1.0 - (t - 0.72) / 0.28 };
+                    if hex > r * taper {
+                        continue;
+                    }
+                    let edge = hex / (r * taper).max(1e-3);
+                    let col = mix(core, rim, edge.powf(1.5));
+                    g.set(x, y, z, solid(col));
+                    glow_cells.push((x, y, z, (1.0 - edge * 0.6) * (0.7 + 0.6 * t)));
+                }
+            }
+        }
+    }
+    let mut m = g.mesh(0.35, true);
+    // bake the glow: the mesh's voxel offsets are grid cell * 0.35 (feet at
+    // y = 0, centred in x/z), so find each instance's cell
+    let glow_at: std::collections::HashMap<(i32, i32, i32), f32> = glow_cells.into_iter().map(|(x, y, z, gl)| ((x, y, z), gl)).collect();
+    let off = (n as f32 * 0.5, 0.0, n as f32 * 0.5);
+    for i in m.inst.iter_mut() {
+        let cx = (i.off_ao[0] / 0.35 + off.0 - 0.5).round() as i32;
+        let cy = (i.off_ao[1] / 0.35 - 0.5).round() as i32;
+        let cz = (i.off_ao[2] / 0.35 + off.2 - 0.5).round() as i32;
+        if let Some(&gl) = glow_at.get(&(cx, cy, cz)) {
+            i.misc[2] = 1.1 * gl;
+        }
+    }
+    m
+}
+
+/// A natural stone arch spanning `span` world units, `height` tall, built
+/// in any orientation: `yaw` is the direction the corridor runs (0 = +z), so
+/// the arch spans across it. Two jagged legs thickening to the ground, a
+/// rough lintel, weathered grey with lighter tops. Feet at y = 0.
+pub fn stone_arch(span: f32, height: f32, yaw: f32, variant: i32) -> VoxelMesh {
+    const VOX: f32 = 0.6;
+    let half = span * 0.5 + 3.0;
+    let n = ((half * 2.0 / VOX).ceil() as usize + 4).min(80);
+    let ny = ((height + 3.0) / VOX).ceil() as usize + 2;
+    let mut g = Grid::new(n, ny, n);
+    let c = n as f32 * 0.5;
+    let (sn, cs) = yaw.sin_cos();
+    for x in 0..n as i32 {
+        for y in 0..ny as i32 {
+            for z in 0..n as i32 {
+                // world-ish units, centred; u across the corridor, w along it
+                let px = (x as f32 + 0.5 - c) * VOX;
+                let pz = (z as f32 + 0.5 - c) * VOX;
+                let py = (y as f32 + 0.5) * VOX;
+                let u = px * cs - pz * sn;
+                let w = px * sn + pz * cs;
+                let rough = (noise3(x / 2, y / 2, z / 2, variant) - 0.5) * 1.1;
+                let a_out = span * 0.5 + 2.6 + rough;
+                let a_in = span * 0.5 - 0.2 + rough * 0.5;
+                let b_out = height + rough;
+                let b_in = height - 3.2 + rough * 0.6;
+                let e = |a: f32, b: f32| (u / a).powi(2) + (py / b).powi(2);
+                let in_band = e(a_out, b_out) <= 1.0 && e(a_in, b_in) > 1.0;
+                // thicker along the corridor near the ground (the legs)
+                let thick = 1.6 + (1.0 - (py / height).clamp(0.0, 1.0)) * 1.4 + rough * 0.4;
+                if !in_band || w.abs() > thick {
+                    continue;
+                }
+                let v = 0.30 + 0.10 * (py / height).clamp(0.0, 1.0) + (noise3(x, y, z, variant + 7) - 0.5) * 0.06;
+                g.set(x, y, z, solid([v, v * 1.01, v * 1.06]));
+            }
+        }
+    }
+    g.mesh(VOX, true)
+}
+
+/// Weathered statue stone: grey with lichen patches and dark cracks.
+fn statue_stone(x: i32, y: i32, z: i32, seed: i32) -> [f32; 4] {
+    let n = noise3(x, y, z, seed);
+    let lichen = noise3(x / 3, y / 3, z / 3, seed + 11) > 0.78;
+    let crack = noise3(x, y / 2, z, seed + 5) > 0.93;
+    if crack {
+        solid([0.20, 0.20, 0.22])
+    } else if lichen {
+        solid([0.42, 0.46, 0.34])
+    } else {
+        let v = 0.44 + n * 0.08;
+        solid([v, v * 0.99, v * 0.96])
+    }
+}
+
+fn restyle(g: &mut Grid, seed: i32) {
+    for x in 0..g.nx as i32 {
+        for y in 0..g.ny as i32 {
+            for z in 0..g.nz as i32 {
+                if g.get(x, y, z).is_some() {
+                    g.set(x, y, z, statue_stone(x, y, z, seed));
+                }
+            }
+        }
+    }
+}
+
+/// An animal god: a great cat seated on a plinth, head up, tail wrapped
+/// round its forepaws, facing +z. ~15 u tall at scale 1.
+pub fn statue_cat(s: f32, variant: i32) -> VoxelMesh {
+    let k = s / 0.6; // grid cells per world unit
+    let n = (14.0 * k) as usize;
+    let ny = (17.0 * k) as usize;
+    let mut g = Grid::new(n, ny, n);
+    let c = n as f32 * 0.5;
+    let u = |v: f32| v * k;
+    let st = solid([0.44, 0.44, 0.43]);
+    // plinth
+    g.filled_box((c - u(6.0)) as i32, 0, (c - u(6.0)) as i32, (c + u(6.0)) as i32, u(1.6) as i32, (c + u(6.0)) as i32, st);
+    // haunches, chest, forelegs
+    g.ellipsoid(c, u(4.2), c - u(1.8), u(4.2), u(3.0), u(3.6), st);
+    g.ellipsoid(c, u(7.4), c + u(0.6), u(2.8), u(4.2), u(2.6), st);
+    for side in [-1.0f32, 1.0] {
+        g.cyl_y(c + side * u(1.5), c + u(2.4), u(0.9), u(1.6) as i32, u(7.0) as i32, st);
+        g.ellipsoid(c + side * u(1.5), u(2.0), c + u(3.0), u(1.1), u(0.6), u(1.4), st);
+    }
+    // head, muzzle, ears
+    g.ellipsoid(c, u(12.0), c + u(1.6), u(2.2), u(2.0), u(2.1), st);
+    g.ellipsoid(c, u(11.3), c + u(3.4), u(1.1), u(0.9), u(1.0), st);
+    for side in [-1.0f32, 1.0] {
+        g.cone_y(c + side * u(1.3), c + u(1.2), u(0.9), u(0.1), u(13.4) as i32, u(15.6) as i32, st);
+    }
+    // tail wrapped round the front
+    for t in 0..20 {
+        let a = t as f32 / 19.0 * std::f32::consts::PI * 1.1 - 0.2;
+        g.ellipsoid(c + a.cos() * u(4.0), u(2.2), c - u(0.5) + a.sin() * u(3.8), u(0.7), u(0.7), u(0.7), st);
+    }
+    restyle(&mut g, variant);
+    g.mesh(0.6, true)
+}
+
+/// An animal god: an owl with folded wings on a plinth, ear tufts up,
+/// facing +z. ~14 u tall at scale 1.
+pub fn statue_owl(s: f32, variant: i32) -> VoxelMesh {
+    let k = s / 0.6;
+    let n = (11.0 * k) as usize;
+    let ny = (16.0 * k) as usize;
+    let mut g = Grid::new(n, ny, n);
+    let c = n as f32 * 0.5;
+    let u = |v: f32| v * k;
+    let st = solid([0.44, 0.44, 0.43]);
+    g.filled_box((c - u(4.5)) as i32, 0, (c - u(4.5)) as i32, (c + u(4.5)) as i32, u(1.6) as i32, (c + u(4.5)) as i32, st);
+    // body, folded wings, head
+    g.ellipsoid(c, u(6.6), c, u(3.2), u(5.0), u(2.9), st);
+    for side in [-1.0f32, 1.0] {
+        g.ellipsoid(c + side * u(2.8), u(6.2), c - u(0.4), u(1.0), u(4.6), u(2.6), st);
+        // feet
+        g.ellipsoid(c + side * u(1.2), u(1.9), c + u(1.2), u(0.8), u(0.4), u(1.0), st);
+        // ear tufts
+        g.cone_y(c + side * u(1.6), c + u(0.2), u(0.7), u(0.1), u(13.2) as i32, u(15.2) as i32, st);
+    }
+    g.ellipsoid(c, u(11.6), c + u(0.3), u(2.9), u(2.3), u(2.5), st);
+    restyle(&mut g, variant + 3);
+    // the face disc and deep eyes, carved after the restyle
+    for side in [-1.0f32, 1.0] {
+        g.carve_sphere(c + side * u(1.0), u(11.8), c + u(2.6), u(0.6));
+    }
+    // the beak
+    g.ellipsoid(c, u(11.0), c + u(2.7), u(0.35), u(0.6), u(0.5), solid([0.34, 0.33, 0.32]));
+    g.mesh(0.6, true)
+}

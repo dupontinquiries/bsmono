@@ -894,6 +894,31 @@ pub fn run_pass_shots() -> Result<(), String> {
     // from down the stream, looking back up it at the fall
     shoot(&mut renderer, &game, &mut vfx, "pass_waterfall.png", Camera { eye: on_floor(crate::pass::streams()[0][3], 2.5), target: fall.foot + Vec3::Y * 5.0, fov_y: 0.75 })?;
     shoot(&mut renderer, &game, &mut vfx, "pass_clearing.png", Camera { eye: on_floor(cz + Vec3::new(-5.0, 0.0, -5.0), 7.0), target: cz, fov_y: 1.05 })?;
+    // the new scenery, at real placements
+    {
+        use crate::passworld::Item;
+        let items = crate::passworld::placements();
+        let first = |f: &dyn Fn(&Item) -> Option<(Vec3, Vec3)>| items.iter().find_map(|i| f(i));
+        if let Some((at, _)) = first(&|i| if let Item::Statue { at, owl: false, .. } = i { Some((*at, Vec3::Z)) } else { None }) {
+            shoot(&mut renderer, &game, &mut vfx, "pass_statue.png", Camera { eye: at + Vec3::new(9.0, 5.0, 24.0), target: at + Vec3::Y * 8.0, fov_y: 0.9 })?;
+        }
+        if let Some((at, fwd)) = first(&|i| if let Item::Arch { at, yaw, .. } = i { Some((*at, Vec3::new(yaw.sin(), 0.0, yaw.cos()))) } else { None }) {
+            shoot(&mut renderer, &game, &mut vfx, "pass_arch.png", Camera { eye: at - fwd * 22.0 + Vec3::Y * 4.0, target: at + Vec3::Y * 6.0, fov_y: 0.95 })?;
+        }
+        if let Some((at, _)) = first(&|i| if let Item::Gem { at, .. } = i { Some((*at, Vec3::Z)) } else { None }) {
+            // from out on the floor, a few metres off (the first try stood
+            // the camera inside a crystal)
+            let f = crate::pass::floor();
+            let e = 0.5;
+            let away = Vec3::new(f.sdf(at.x - e, at.z) - f.sdf(at.x + e, at.z), 0.0, f.sdf(at.x, at.z - e) - f.sdf(at.x, at.z + e)).normalize_or_zero();
+            let out = crate::map::onto_floor(at + away * 7.0, 1.0);
+            shoot(&mut renderer, &game, &mut vfx, "pass_gems.png", Camera { eye: out + Vec3::Y * 2.2, target: at + Vec3::Y * 1.0, fov_y: 0.9 })?;
+        }
+        if let Some((at, _)) = first(&|i| if let Item::Statue { at, owl: true, .. } = i { Some((*at, Vec3::Z)) } else { None }) {
+            let look_from = Vec3::new(at.x * 0.82, 4.0, 0.0);
+            shoot(&mut renderer, &game, &mut vfx, "pass_owl.png", Camera { eye: look_from, target: at + Vec3::Y * 7.0, fov_y: 0.95 })?;
+        }
+    }
     // a choke, from the wide lane looking into the narrows
     let (cp, cd) = crate::pass::choke_points()[2];
     shoot(&mut renderer, &game, &mut vfx, "pass_choke.png", Camera { eye: cp - cd * 22.0 + Vec3::Y * 6.0, target: cp + cd * 6.0 + Vec3::Y * 2.0, fov_y: 0.95 })?;

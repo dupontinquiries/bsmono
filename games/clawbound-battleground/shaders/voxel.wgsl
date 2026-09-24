@@ -62,7 +62,7 @@ fn wind_offset(world: vec3<f32>, local_y: f32, sway: f32) -> vec3<f32> {
 struct DrawData {
     model: mat4x4<f32>,
     tint: vec4<f32>,   // rgb tint, a = alpha multiplier
-    params: vec4<f32>, // x emissive, y voxel_size, z unused, w unused
+    params: vec4<f32>, // x emissive, y voxel_size, z unused, w unused (per-voxel glow: misc.z)
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameData;
@@ -224,7 +224,9 @@ fn vs_main(in: VSIn) -> VSOut {
     out.color = in.color * d.tint;
     out.shadow_pos = frame.light_view_proj * world;
     out.ao = in.off_ao.w;
-    out.emissive = d.params.x;
+    // per-draw emissive, plus per-voxel glow baked in misc.z (gems in the
+    // static world: they glow inside a batched chunk, no draw of their own)
+    out.emissive = d.params.x + in.misc.z;
     return out;
 }
 
