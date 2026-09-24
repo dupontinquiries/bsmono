@@ -82,6 +82,8 @@ pub mod sim;
 pub mod systems;
 pub mod abilities;
 pub mod ai;
+/// A bot's last look at the ground: skirt small thickets, turn from walls.
+pub mod steer;
 pub mod vfx;
 /// Per-ancestor elemental motifs thrown on every cast.
 pub mod signature;

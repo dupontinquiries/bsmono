@@ -485,3 +485,34 @@ fn a_thicket_slows_a_cat_and_does_not_stop_it() {
     let ratio = thick / open;
     assert!((ratio - 0.5).abs() < 0.08, "a 0.5 thicket halves the run: {thick} vs {open} ({ratio})");
 }
+
+/// Bots look before they commit (`steer`): the same bot in the same state,
+/// with a trunk dropped two units down the line it chose, turns off that
+/// line instead of walking into the trunk and being pushed round it.
+#[test]
+fn a_bot_steers_off_a_line_that_runs_into_a_trunk() {
+    use clawbound::blockers::{Blocker, Blockers, Cover, Shape};
+    use glam::Vec3;
+    let fresh = || {
+        let mut g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        g.blockers = std::sync::Arc::new(Blockers::new(200.0, 6.0));
+        g
+    };
+    let bot = 1;
+    let mut a = fresh();
+    clawbound::ai::think(&mut a, bot);
+    let d1 = a.gods[bot].move_dir;
+    assert!(d1.length() > 0.1, "the bot wants to go somewhere: {d1}");
+    let at = a.gods[bot].pos + d1.normalize() * 2.0;
+    let mut b = fresh();
+    let mut bl = Blockers::new(200.0, 6.0);
+    bl.push(Blocker { shape: Shape::Circle { x: at.x, z: at.z, r: 0.9 }, top: 4.0, cover: Cover::NONE });
+    b.blockers = std::sync::Arc::new(bl);
+    clawbound::ai::think(&mut b, bot);
+    let d2 = b.gods[bot].move_dir;
+    let turn = d1.normalize().dot(d2.normalize()).clamp(-1.0, 1.0).acos();
+    assert!(turn > 0.3, "turned off the line by {turn} rad");
+    let probe = b.gods[bot].pos + d2.normalize() * 1.2;
+    assert!(!b.blockers.blocked(probe.x, probe.z, GOD_RADIUS), "and not into the trunk");
+    let _ = Vec3::ZERO;
+}

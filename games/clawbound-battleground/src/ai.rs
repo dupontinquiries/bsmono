@@ -300,6 +300,15 @@ pub fn think(game: &mut Game, gi: usize) {
         move_dir = Vec3::new(g.pos.x - enemy_f.x, 0.0, g.pos.z - enemy_f.z).normalize_or_zero();
     }
 
+    // Steer: skirt rough ground a sidestep avoids, turn from walls rather
+    // than sliding into them. The brain above says where; this says which
+    // way round.
+    let move_dir = {
+        let g = &game.gods[gi];
+        let who = crate::going::Carriage { stalking: game.stalking(gi) };
+        crate::steer::steer(&game.blockers, g.pos, move_dir, g.move_dir, crate::consts::GOD_RADIUS, who)
+    };
+
     // write back
     {
         let g = &mut game.gods[gi];
