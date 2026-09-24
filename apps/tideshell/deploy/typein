@@ -1,0 +1,177 @@
+#!/bin/sh
+# typein — type text with dotool without caring what keyboard layout is active.
+#
+#   typein warp enter          types "warp", then presses Enter
+#   typein hello world         types "hello world"
+#   typein -- enter tab        types the literal words "enter tab"
+#   typein --keys ctrl+c       presses a combination, types nothing
+#   typein --check             says which layout it found and how
+#
+# WHY THIS EXISTS
+#
+# dotool creates a uinput device and sends KEYCODES. The compositor then maps
+# those keycodes through ITS xkb layout. If dotool assumes one layout and the
+# compositor uses another, you get the right keys in the wrong places:
+# `type warp` under a Dvorak compositor arrives as ",apl", because the QWERTY
+# positions of w,a,r,p are ,,a,p,l in Dvorak.
+#
+# dotool can simulate a specific layout via DOTOOL_XKB_LAYOUT and
+# DOTOOL_XKB_VARIANT. So the fix is not to switch layouts, nor to remap
+# characters by hand, but to TELL dotool which layout the compositor is using.
+# This script finds that out and sets the variables.
+#
+# WHERE THE LAYOUT COMES FROM, in order:
+#   1. TYPEIN_LAYOUT / TYPEIN_VARIANT, if you set them
+#   2. DOTOOL_XKB_LAYOUT / DOTOOL_XKB_VARIANT, if already exported
+#   3. cosmic-comp's own xkb_config (the compositor doing the mapping)
+#   4. XKB_DEFAULT_LAYOUT / XKB_DEFAULT_VARIANT
+#   5. localectl's X11 layout
+#   6. /etc/default/keyboard
+#   7. us, and a warning
+#
+# Multi-layout strings ("us,dvorak") take the FIRST entry: dotool simulates one
+# layout, and the first is the one a compositor starts on.
+
+set -eu
+
+DOTOOL=${DOTOOL:-dotool}
+SUDO=${SUDO-}
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/typein-layout"
+
+# ── finding the layout ───────────────────────────────────────────────────────
+first_of() { echo "${1%%,*}"; }
+
+cosmic_xkb() { # prints "layout<TAB>variant" from cosmic's config, or nothing
+    f="${XDG_CONFIG_HOME:-$HOME/.config}/cosmic/com.system76.CosmicComp/v1/xkb_config"
+    [ -r "$f" ] || return 1
+    # A RON struct: layout: "us", variant: "dvorak", ...
+    l=$(sed -n 's/.*layout:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -1)
+    v=$(sed -n 's/.*variant:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -1)
+    [ -n "$l" ] || return 1
+    printf '%s\t%s\n' "$l" "$v"
+}
+
+detect() {
+    if [ -n "${TYPEIN_LAYOUT:-}" ]; then
+        printf '%s\t%s\tTYPEIN_LAYOUT\n' "${TYPEIN_LAYOUT}" "${TYPEIN_VARIANT:-}"; return
+    fi
+    if [ -n "${DOTOOL_XKB_LAYOUT:-}" ]; then
+        printf '%s\t%s\tDOTOOL_XKB_LAYOUT\n' "$DOTOOL_XKB_LAYOUT" "${DOTOOL_XKB_VARIANT:-}"; return
+    fi
+    if c=$(cosmic_xkb); then
+        printf '%s\t%s\tcosmic-comp xkb_config\n' "$(first_of "$(printf '%s' "$c" | cut -f1)")" "$(first_of "$(printf '%s' "$c" | cut -f2)")"; return
+    fi
+    if [ -n "${XKB_DEFAULT_LAYOUT:-}" ]; then
+        printf '%s\t%s\tXKB_DEFAULT_LAYOUT\n' "$(first_of "$XKB_DEFAULT_LAYOUT")" "$(first_of "${XKB_DEFAULT_VARIANT:-}")"; return
+    fi
+    if command -v localectl >/dev/null 2>&1; then
+        s=$(localectl status 2>/dev/null || true)
+        l=$(printf '%s' "$s" | sed -n 's/.*X11 Layout:[[:space:]]*\(.*\)/\1/p' | head -1)
+        v=$(printf '%s' "$s" | sed -n 's/.*X11 Variant:[[:space:]]*\(.*\)/\1/p' | head -1)
+        if [ -n "$l" ]; then printf '%s\t%s\tlocalectl\n' "$(first_of "$l")" "$(first_of "$v")"; return; fi
+    fi
+    if [ -r /etc/default/keyboard ]; then
+        l=$(sed -n 's/^XKBLAYOUT=*"*\([^"]*\)"*/\1/p' /etc/default/keyboard | head -1)
+        v=$(sed -n 's/^XKBVARIANT=*"*\([^"]*\)"*/\1/p' /etc/default/keyboard | head -1)
+        if [ -n "$l" ]; then printf '%s\t%s\t/etc/default/keyboard\n' "$(first_of "$l")" "$(first_of "$v")"; return; fi
+    fi
+    printf 'us\t\tfallback (nothing else said)\n'
+}
+
+# ── key names ────────────────────────────────────────────────────────────────
+# Trailing words that name a key become key presses. Everything before the
+# first such word is text. `--` forces the rest to be literal text, for when
+# you really do want to type the word "enter".
+is_key() {
+    case "$1" in
+        enter|return|tab|esc|escape|space|backspace|delete|home|end|pageup|pagedown| \
+        up|down|left|right|insert|f1|f2|f3|f4|f5|f6|f7|f8|f9|f10|f11|f12) return 0 ;;
+        *+*) return 0 ;;   # a combination: ctrl+c, super+shift+4
+        *) return 1 ;;
+    esac
+}
+
+# dotool's own names for the ones that differ from the word people use.
+key_name() {
+    case "$1" in
+        enter) echo return ;;
+        escape) echo esc ;;
+        pageup) echo pageup ;;
+        pagedown) echo pagedown ;;
+        *) echo "$1" ;;
+    esac
+}
+
+usage() {
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+# ── arguments ────────────────────────────────────────────────────────────────
+LITERAL=0
+KEYS_ONLY=0
+CHECK=0
+TEXT=""
+KEYS=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) LITERAL=1; shift; break ;;
+        --keys) KEYS_ONLY=1; shift ;;
+        --check) CHECK=1; shift ;;
+        --layout) TYPEIN_LAYOUT=$2; export TYPEIN_LAYOUT; shift 2 ;;
+        --variant) TYPEIN_VARIANT=$2; export TYPEIN_VARIANT; shift 2 ;;
+        -h|--help) usage 0 ;;
+        -*) echo "typein: unknown option $1" >&2; usage 1 ;;
+        *) break ;;
+    esac
+done
+
+if [ "$KEYS_ONLY" = 1 ]; then
+    KEYS="$*"
+elif [ "$LITERAL" = 1 ]; then
+    TEXT="$*"
+else
+    # Split at the first trailing key word: text first, keys after.
+    for a in "$@"; do
+        if [ -z "$KEYS" ] && ! is_key "$a"; then
+            TEXT="${TEXT:+$TEXT }$a"
+        else
+            KEYS="${KEYS:+$KEYS }$a"
+        fi
+    done
+fi
+
+# ── layout ───────────────────────────────────────────────────────────────────
+D=$(detect)
+L=$(printf '%s' "$D" | cut -f1)
+V=$(printf '%s' "$D" | cut -f2)
+SRC=$(printf '%s' "$D" | cut -f3)
+export DOTOOL_XKB_LAYOUT="$L"
+[ -n "$V" ] && export DOTOOL_XKB_VARIANT="$V"
+printf '%s\t%s\t%s\n' "$L" "$V" "$SRC" > "$CACHE" 2>/dev/null || true
+
+if [ "$CHECK" = 1 ]; then
+    printf 'layout   %s\n' "$L"
+    printf 'variant  %s\n' "${V:-(none)}"
+    printf 'source   %s\n' "$SRC"
+    command -v "$DOTOOL" >/dev/null 2>&1 || { echo "dotool   NOT FOUND"; exit 1; }
+    printf 'dotool   %s\n' "$(command -v "$DOTOOL")"
+    [ -w /dev/uinput ] && printf 'uinput   writable\n' || printf 'uinput   NOT writable — run under sudo, or join the input group\n'
+    # Ask dotool whether this layout can produce the printable ASCII set. It
+    # warns per impossible character, which is the only feedback available
+    # without reading the screen back.
+    bad=$(printf 'type %s\n' "$(printf '%s' 'abcdefghijklmnopqrstuvwxyz0123456789-=[]\;,./~!@#$%^&*()_+{}|:"<>?' )" \
+          | DOTOOL_DRYRUN=1 $SUDO "$DOTOOL" 2>&1 >/dev/null | grep -c 'impossible' || true)
+    printf 'coverage %s\n' "$([ "${bad:-0}" = 0 ] && echo 'every printable ASCII character is reachable' || echo "$bad character(s) this layout cannot type")"
+    exit 0
+fi
+
+[ -n "$TEXT$KEYS" ] || usage 1
+command -v "$DOTOOL" >/dev/null 2>&1 || { echo "typein: dotool not found" >&2; exit 1; }
+
+# ── go ───────────────────────────────────────────────────────────────────────
+{
+    [ -n "$TEXT" ] && printf 'type %s\n' "$TEXT"
+    for k in $KEYS; do printf 'key %s\n' "$(key_name "$k")"; done
+} | $SUDO "$DOTOOL"
