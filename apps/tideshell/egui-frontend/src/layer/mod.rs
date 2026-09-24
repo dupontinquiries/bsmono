@@ -190,6 +190,20 @@ pub fn buffer_px(logical: (u32, u32), scale: f32) -> (i32, i32) {
     ((logical.0 as f32 * scale).ceil() as i32, (logical.1 as f32 * scale).ceil() as i32)
 }
 
+/// egui's screen, in points, for a buffer of `size_px` at `scale`.
+///
+/// The buffer is ceil(logical x scale) pixels; telling egui the screen is
+/// `logical` points leaves it painting only logical x scale pixels, a
+/// fractional amount, so the last column and row (right and bottom) were
+/// cleared-to-transparent or half-covered: a ~1 px strip where whatever is
+/// underneath showed through (seen on the FP5 lock screen at a fractional
+/// scale). Sizing the screen from the buffer covers every pixel; the
+/// viewport maps it back onto the logical size. At an integer scale the two
+/// are identical.
+pub fn screen_points(size_px: (i32, i32), scale: f32) -> (f32, f32) {
+    (size_px.0 as f32 / scale, size_px.1 as f32 / scale)
+}
+
 /// Where and at what scale to render an egui surface this frame.
 pub struct EguiTarget {
     pub surface: WlSurface,
@@ -203,6 +217,12 @@ pub struct EguiTarget {
 impl EguiTarget {
     pub fn size_px(&self) -> (i32, i32) {
         buffer_px(self.logical, self.scale)
+    }
+
+    /// egui's screen size in points: the whole BUFFER, not the logical size.
+    /// See [`screen_points`].
+    pub fn screen_points(&self) -> (f32, f32) {
+        screen_points(self.size_px(), self.scale)
     }
 
     /// Per-frame surface state for this scale path, sent only on change.
@@ -1067,6 +1087,30 @@ mod tests {
         // 1/120 steps do not divide evenly: round UP, never short.
         assert_eq!(buffer_px((100, 100), 121.0 / 120.0), (101, 101));
         assert_eq!(buffer_px((64, 800), 1.0), (64, 800));
+    }
+
+    #[test]
+    fn egui_covers_every_buffer_pixel_at_fractional_scales() {
+        // Every logical size up to a phone's, at the scales compositors
+        // offer (n/120 steps): what egui paints must reach the buffer's
+        // last pixel, which `logical` points did not.
+        let mut short_before = 0;
+        for scale120 in [150u32, 180, 210, 240, 270, 300, 330, 350] {
+            let s = scale120 as f32 / 120.0;
+            for lw in (300u32..=500).step_by(7) {
+                let lh = lw * 2 + 3;
+                let px = buffer_px((lw, lh), s);
+                let (pw, ph) = screen_points(px, s);
+                assert!((pw * s - px.0 as f32).abs() < 0.01 && (ph * s - px.1 as f32).abs() < 0.01, "scale {s} logical {lw}x{lh}");
+                if (lw as f32 * s) < px.0 as f32 - 0.01 || (lh as f32 * s) < px.1 as f32 - 0.01 {
+                    short_before += 1;
+                }
+                // Never more than a pixel away from the logical size.
+                assert!(pw - lw as f32 <= 1.0 / s + 1e-3 && pw >= lw as f32 - 1e-3);
+            }
+        }
+        assert!(short_before > 0, "the old sizing left edge pixels uncovered in these cases");
+        assert_eq!(screen_points((1080, 2400), 3.0), (360.0, 800.0), "integer scale: identical to the logical size");
     }
 
     #[test]

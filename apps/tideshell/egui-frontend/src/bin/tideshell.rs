@@ -795,12 +795,12 @@ fn main() {
             };
             t.prepare(&mut io);
             let size_px = t.size_px();
-            let (w, h) = t.logical;
+            let (w, h) = t.screen_points();
             if gl.bind(role, &t.surface, size_px).is_err() {
                 continue;
             }
             let mut raw = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w as f32, h as f32))),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h))),
                 time: Some(t0.elapsed().as_secs_f64()),
                 events: side_events.remove(&role).unwrap_or_default(),
                 focused: true,
@@ -851,7 +851,7 @@ fn main() {
         let Some(t) = io.overlay() else { continue };
         t.prepare(&mut io);
         let size_px = t.size_px();
-        let (w, h) = t.logical;
+        let (w, h) = t.screen_points();
         if let Err(e) = gl.bind(Role::Overlay, &t.surface, size_px) {
             eprintln!("tideshell: {e}");
             continue;
@@ -861,7 +861,7 @@ fn main() {
         let routed = sb.view.route_raw(&mut sb.shell, &mut events, Pos2::ZERO, t0.elapsed().as_millis() as u64);
         sb.execute(routed);
         let mut raw = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w as f32, h as f32))),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h))),
             time: Some(t0.elapsed().as_secs_f64()),
             events,
             focused: true,
