@@ -5,7 +5,101 @@ use crate::gods::Archetype;
 use crate::sim::*;
 use glam::Vec3;
 
+/// How an ability is cast: wind-up seconds before it fires, and the
+/// caster's movement multiplier while it winds up (0 = rooted, a channel).
+/// One table so the balance reads in one place:
+/// - escapes and self-buffs are instant (Blink, Buff, Shield): they must
+///   answer a threat the moment it appears;
+/// - Dash nearly so;
+/// - skillshots get a short tell (Bolt 0.18 s at 60% speed; Ring, Volley,
+///   Lob 0.25-0.30 s);
+/// - big areas and control telegraph long enough to react to (Nova, Heal
+///   0.35 s, Pull 0.40 s slowed hard; Beam and Storm channel, rooted);
+/// - an ultimate winds up 1.5x as long (at least 0.45 s) and roots.
+pub fn cast_timing(ab: &crate::gods::AbilityDef) -> (f32, f32) {
+    let (w, m): (f32, f32) = match ab.arch {
+        Archetype::Blink { .. } | Archetype::Buff { .. } | Archetype::Shield { .. } => (0.0, 1.0),
+        Archetype::Dash { .. } => (0.08, 1.0),
+        Archetype::Bolt { .. } => (0.18, 0.6),
+        Archetype::Ring { .. } => (0.25, 0.6),
+        Archetype::Volley { .. } => (0.28, 0.5),
+        Archetype::Lob { .. } => (0.30, 0.6),
+        Archetype::Nova { .. } => (0.35, 0.4),
+        Archetype::Heal { .. } => (0.35, 0.5),
+        Archetype::Pull { .. } => (0.40, 0.4),
+        Archetype::Beam { .. } => (0.45, 0.0),
+        Archetype::Storm { .. } => (0.55, 0.0),
+    };
+    if ab.ult && w > 0.0 {
+        ((w * 1.5).max(0.45), 0.0)
+    } else {
+        (w, m)
+    }
+}
+
+/// The cat's yaw facing along `dir` (a cat faces (cos yaw, 0, sin yaw)).
+pub fn yaw_of(dir: Vec3) -> f32 {
+    dir.z.atan2(dir.x)
+}
+
+/// The cat's facing as a direction (the inverse of `yaw_of`).
+pub fn facing_of(yaw: f32) -> Vec3 {
+    Vec3::new(yaw.cos(), 0.0, yaw.sin())
+}
+
 impl Game {
+    /// Begin a cast: checks it can be cast now, turns the cat to its aim,
+    /// and either fires it (no wind-up) or starts the wind-up; `cast` fires
+    /// it when the wind-up ends (`tick_casting`). Cooldown and mana are spent
+    /// when it FIRES, so an interrupted cast costs nothing.
+    pub fn begin_cast(&mut self, gi: usize, slot: u32, aim: Vec3) {
+        if self.over.is_some() || self.gods[gi].respawn_t > 0.0 || self.gods[gi].casting.is_some() {
+            return;
+        }
+        let ab = self.def(gi).abilities[slot as usize];
+        let g = &self.gods[gi];
+        if g.cds[slot as usize] > 0.0 || g.mana < ab.cost {
+            return;
+        }
+        let (wind, move_mul) = cast_timing(&ab);
+        // turn to the aim now: a cast always faces where it goes
+        let d = Vec3::new(aim.x - g.pos.x, 0.0, aim.z - g.pos.z);
+        let g = &mut self.gods[gi];
+        if d.length() > 0.3 {
+            g.yaw = yaw_of(d);
+        }
+        g.face_hold = wind + 0.3;
+        // gathering to cast is already acting: it breaks a stalk from the
+        // first frame of the wind-up, not when the ability lands
+        g.last_act_t = self.t;
+        if wind <= 0.0 {
+            self.cast(gi, slot, aim);
+        } else {
+            g.casting = Some(Casting { slot, aim, t: 0.0, dur: wind, move_mul });
+            self.events.push(Event::CastStart { god: gi, slot, aim, dur: wind });
+        }
+    }
+
+    /// Advance wind-ups; fire those that finish; drop those interrupted (the
+    /// cat died, leapt or is dashing).
+    pub fn tick_casting(&mut self, dt: f32) {
+        for gi in 0..self.gods.len() {
+            let Some(mut c) = self.gods[gi].casting else { continue };
+            let g = &self.gods[gi];
+            if g.respawn_t > 0.0 || g.leap.is_some() || g.dash.is_some() {
+                self.gods[gi].casting = None;
+                continue;
+            }
+            c.t += dt;
+            if c.t >= c.dur {
+                self.gods[gi].casting = None;
+                self.cast(gi, c.slot, c.aim);
+            } else {
+                self.gods[gi].casting = Some(c);
+            }
+        }
+    }
+
     /// Execute one cast. `aim` is a ground point (abilities aim through it).
     pub fn cast(&mut self, gi: usize, slot: u32, aim: Vec3) {
         if self.over.is_some() || self.gods[gi].respawn_t > 0.0 {
@@ -26,7 +120,10 @@ impl Game {
         let mut dir = aim_flat - Vec3::new(from.x, 0.0, from.z);
         let dist = dir.length();
         if dist < 0.3 {
-            dir = Vec3::new(g.yaw.sin(), 0.0, g.yaw.cos());
+            // aim on the cat itself: along its facing -- (cos, sin), the
+            // cat's convention. This read (sin, cos), the CAMERA's
+            // convention, and fired along the facing mirrored.
+            dir = facing_of(g.yaw);
         } else {
             dir = dir.normalize();
         }

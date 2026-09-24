@@ -78,6 +78,13 @@ struct AppState {
     skip_intro: bool,
     /// Counter the audio synth watches: a change starts the fanfare.
     fanfare_count: u32,
+    /// A prepared ability awaiting the attack button (`targeting`).
+    targeting: crate::targeting::Targeting,
+    /// The attack button as last frame saw it (for its press edge), and
+    /// whether the current press belongs to the targeting (fired an
+    /// ability) so it must not also start auto-attacks until released.
+    attack_was: bool,
+    attack_eaten: bool,
     thunder_dist: f32,
     launch: crate::launch::LaunchOptions,
 }
@@ -381,6 +388,9 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         intro: None,
         skip_intro: false,
         fanfare_count: 0,
+        targeting: Default::default(),
+        attack_was: false,
+        attack_eaten: false,
         thunder_dist: 1.0,
         launch: crate::launch::LaunchOptions::default(),
     })
@@ -615,7 +625,10 @@ fn gather_controls(s: &mut AppState, dt: f32) {
         return;
     }
     if c.menu && s.capturing.is_none() {
-        if s.ui.shop_open {
+        if s.targeting.slot.is_some() {
+            // Esc puts a prepared ability away before it opens anything
+            s.targeting.slot = None;
+        } else if s.ui.shop_open {
             s.ui.shop_open = false;
             s.ui.sell_armed = None;
         } else if s.controls_open {
@@ -853,6 +866,7 @@ fn render(s: &mut AppState) {
             s.stalk_on = !s.stalk_on;
         }
         let stalk_on = s.stalk_on;
+        let attack_eaten = s.attack_eaten || s.targeting.eats_attack();
         if let Some(g) = s.game.as_mut() {
             // A leap goes where the cat is being steered; standing still,
             // where the camera looks. `leap::plan` turns that direction into
@@ -862,9 +876,28 @@ fn render(s: &mut AppState) {
                 let dir = if c.mv.length_squared() > 0.04 { fwd * c.mv.y + right * c.mv.x } else { fwd };
                 g.leap_queue.push((0, dir));
             }
-            // casts are edges: queue them once, outside the step loop
+            // Casts: an ability key PREPARES the ability (its guide shows);
+            // the attack button fires it at the current aim (`targeting`).
+            // A touch drag-to-aim is its own two-step gesture and fires on
+            // release, as before.
+            // the facing cone couples the cat to where the camera looks
+            g.gods[0].face_ref = input::camera_basis(yaw).0;
+            let attack_edge = c.attack && !s.attack_was;
+            let keys: [bool; 4] = std::array::from_fn(|k| c.cast[k] && c.cast_dir[k].is_none());
+            let out = s.targeting.step(crate::targeting::Press { cast: keys, attack: attack_edge, cancel: false });
+            if let crate::targeting::Outcome::Fire(slot) = out {
+                g.cast_queue.push((0, slot, aim));
+                s.attack_eaten = true;
+            }
+            if s.targeting.eats_attack() && c.attack {
+                s.attack_eaten = true;
+            }
+            if !c.attack {
+                s.attack_eaten = false;
+            }
+            s.attack_was = c.attack;
             for slot in 0..4u32 {
-                if c.cast[slot as usize] {
+                if c.cast[slot as usize] && c.cast_dir[slot as usize].is_some() {
                     let cast_aim = if let Some(dir) = c.cast_dir[slot as usize] {
                         // a committed touch drag-to-aim: rotate its screen-
                         // space direction (x right, y up) onto the camera's
@@ -927,7 +960,8 @@ fn render(s: &mut AppState) {
                 let gi = &mut g.gods[0];
                 gi.sneak = stalk_on || c.sneak_held || gentle;
                 gi.move_dir = mv;
-                gi.attack_held = c.attack;
+                // the click that fired a prepared ability is not an attack
+                gi.attack_held = c.attack && !attack_eaten;
                 g.tick(1.0 / 60.0);
                 let events: Vec<crate::sim::Event> = g.events.drain(..).collect();
                 for e in &events {
@@ -1007,6 +1041,14 @@ fn render(s: &mut AppState) {
         let mut vfx = std::mem::take(&mut s.vfx);
         scene.draw(&mut s.renderer, g, &mut vfx, cam);
         s.vfx = vfx;
+        // the prepared ability's guide, where the camera aims
+        if let Some(slot) = s.targeting.slot {
+            if s.screen == Screen::Playing && g.gods[0].respawn_t <= 0.0 {
+                let ab = g.def(0).abilities[slot as usize];
+                let guide = crate::targeting::guide_for(&ab, g.gods[0].pos, compute_aim(s));
+                scene.draw_guide(&mut s.renderer, &crate::targeting::guide_points(&guide, 1.1), ab.color);
+            }
+        }
     } else {
         s.renderer.atmosphere = crate::weather::Weather::new().atmosphere();
         s.renderer.clear_queues();

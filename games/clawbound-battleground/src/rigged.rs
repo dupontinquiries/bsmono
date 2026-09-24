@@ -390,7 +390,10 @@ pub fn plant_leg(rig: &QuadRig, i: usize, sole: Vec3) -> Option<Mat4> {
         return None;
     }
     let rot = glam::Quat::from_rotation_arc(Vec3::NEG_Y, d / len);
-    let k = (len / rest_len).clamp(0.3, 1.3);
+    // Never longer than rest: a planted leg that cannot reach bends the
+    // body down to it (KNEE_BEND, the puppet's drop), it does not stretch.
+    // At 1.3 the legs read pulled like taffy (reported).
+    let k = (len / rest_len).clamp(0.3, 1.0);
     Some(Mat4::from_translation(hip) * Mat4::from_quat(rot) * Mat4::from_scale(Vec3::new(1.0, k, 1.0)) * Mat4::from_translation(-hip))
 }
 
@@ -517,8 +520,9 @@ mod tests {
         let mut legs = [LegAdjust::default(); 4];
         let mut targets = [Vec3::ZERO; 4];
         for i in 0..4 {
-            // Somewhere near where the paw is at rest, pushed forward a bit.
-            let w = base.transform_point3(rest_sole(i)) + Vec3::new(0.15, -0.05, 0.1);
+            // Near where the paw is at rest, forward and a little UP: within
+            // reach, since a leg never stretches past rest (it did to 1.3).
+            let w = base.transform_point3(rest_sole(i)) + Vec3::new(0.15, 0.12, 0.1);
             targets[i] = w;
             // The puppet ALSO computes a fold and pitch for a walking leg;
             // a plant must win over them, not be applied beneath them.
@@ -537,6 +541,12 @@ mod tests {
         let hip_m = rig.body_centre + c.transform_vector3(Vec3::from_array(rig.hip(0)));
         let moved_hip = (m[LEG_SLOTS[0] as usize].transform_point3(hip_m) - hip_m).length();
         assert!(moved_hip < 1e-3, "the hip stays on the body: {moved_hip}");
+        // ...and it is exactly rest length: aimed at the target, not
+        // stretched toward it
+        let sole_m = rest_sole(0);
+        let reach = (m[LEG_SLOTS[0] as usize].transform_point3(sole_m) - hip_m).length();
+        let rest = (sole_m - hip_m).length();
+        assert!((reach - rest).abs() < 1e-3, "an unreachable plant stretched the leg: {reach} vs rest {rest}");
         assert!(m[LEG_SLOTS[0] as usize].is_finite());
     }
 

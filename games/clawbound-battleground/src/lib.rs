@@ -98,6 +98,8 @@ pub mod abilities;
 pub mod ai;
 /// A bot's last look at the ground: skirt small thickets, turn from walls.
 pub mod steer;
+/// Prepare an ability, see its guide on the ground, fire with the attack button.
+pub mod targeting;
 pub mod vfx;
 /// Per-ancestor elemental motifs thrown on every cast.
 pub mod signature;
