@@ -10,10 +10,14 @@
 //!
 //! ## The rule for two clips at once
 //!
-//! Video tracks stack: the FIRST video track in the project is on top,
-//! and where two clips overlap in time the top one is the picture. The
-//! same as every editor's track order, and the same as this app's
-//! arrangement paints them. A gap where no video track has a clip is
+//! Video tracks stack: the FIRST video track in the project is on top.
+//! Where clips overlap in time, the picture is the STACK the viewport's
+//! compositor paints (`studio_fx::compositor`): from the top down to the
+//! first layer that hides everything under it -- Normal blend, full
+//! opacity, no reframe -- painted bottom to top over black. A lone opaque
+//! layer is a plain [`Cut`], the old "top one wins"; anything else (a blend
+//! mode, a translucent layer, a picture-in-picture showing the track under
+//! it) is a [`Segment::Stack`]. A gap where no video track has a clip is
 //! black for that long — the timing of the audio must hold, so a gap is
 //! a segment, not a skip.
 //!
@@ -29,7 +33,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use studio_core::{Project, SourceId, Ticks, TrackKind};
+use studio_core::{ClipId, Project, SourceId, Ticks, TrackKind};
+use studio_fx::compositor::BlendMode;
 
 /// One piece of the picture: `len` of `path` from `src_in`, placed at
 /// `at` on the output.
@@ -61,6 +66,11 @@ pub struct Picture {
     pub style: Option<crate::style::Transfer>,
     /// The clip's fade in / out to black, from the model's fades.
     pub fade: Option<Fade>,
+    /// The clip's `blend` effect, `(mode, opacity)`; `None` is Normal at full
+    /// opacity. Honoured where the layer is composited over the ones under it
+    /// ([`Segment::Stack`]); a transform's own `opacity` multiplies in, as in
+    /// the compositor.
+    pub blend: Option<(BlendMode, f32)>,
     /// Effects that change the picture in the preview but that this export
     /// cannot yet reproduce, named for the person exporting. Never silently
     /// dropped: a file that differs from the preview must say so.
@@ -122,10 +132,10 @@ impl Picture {
                     p.transform = (!t.is_identity()).then_some(t);
                     p.unsupported.retain(|u| !u.starts_with("transform"));
                     if t.rotation.abs() > 1e-4 { p.unsupported.push("transform rotation".into()); }
-                    if (t.opacity - 1.0).abs() > 1e-4 { p.unsupported.push("transform opacity".into()); }
                 }
                 Some(studio_fx::Instance::Color(c)) => p.color = (!c.is_identity()).then_some(c),
-                Some(studio_fx::Instance::Blend(..)) => p.unsupported.push("blend (layer compositing)".into()),
+                Some(studio_fx::Instance::Blend(m, o)) =>
+                    p.blend = (m != BlendMode::Normal || o < 1.0 - 1e-4).then_some((m, o)),
                 Some(studio_fx::Instance::Retime(..)) => p.unsupported.push("retime".into()),
                 _ => {}
             }
@@ -137,11 +147,31 @@ impl Picture {
         self.transform.is_none() && self.color.is_none() && self.kaleido.is_none() && self.style.is_none()
     }
 
+    /// The layer's blend mode (Normal without a `blend` effect).
+    pub fn mode(&self) -> BlendMode { self.blend.map_or(BlendMode::Normal, |(m, _)| m) }
+
+    /// The layer's opacity as the compositor computes it: the blend effect's
+    /// dial times the transform's own.
+    pub fn alpha(&self) -> f32 {
+        let o = self.blend.map_or(1.0, |(_, o)| o) * self.transform.map_or(1.0, |t| t.opacity);
+        o.clamp(0.0, 1.0)
+    }
+
+    /// Painted over black this is just its picture: Normal, fully opaque.
+    pub fn is_opaque(&self) -> bool { self.mode() == BlendMode::Normal && self.alpha() >= 1.0 - 1e-4 }
+
+    /// Hides every layer under it: opaque AND filling the frame (no reframe
+    /// or crop). Where this is false the track below shows, as in the preview.
+    pub fn covers(&self) -> bool {
+        self.is_opaque() && self.transform.map_or(true, |t| studio_fx::Transform { opacity: 1.0, ..t }.is_identity())
+    }
+
     /// The filter chain from a fitted `w`×`h` frame to the finished picture,
-    /// as `(foreground chain, overlay position)`. The foreground chain runs on
-    /// the fitted frame; when there is a transform it ends smaller than the
-    /// canvas and is overlaid on black at the position given.
-    fn filters(&self, w: u32, h: u32) -> (String, Option<(i64, i64)>) {
+    /// as `(foreground chain, placement)`. The foreground chain runs on the
+    /// fitted frame; when there is a transform it ends smaller than the
+    /// canvas, `(width, height)` of the placement, and is overlaid at its
+    /// `(x, y)` — which may lie partly off the canvas.
+    fn filters(&self, w: u32, h: u32) -> (String, Option<Placement>) {
         let mut f = String::new();
         if let Some(c) = &self.color {
             // Lift, then gamma, then gain, per channel — studio_fx::Color::apply's order.
@@ -194,80 +224,133 @@ impl Picture {
         let (py0, py1) = (first(edge_y(ct)), first(edge_y(1.0 - cb)));
         let (ow, oh) = ((px1 - px0).max(1.0), (py1 - py0).max(1.0));
         f.push_str(&format!(",crop={cw}:{chh}:{cx}:{cy},scale={ow}:{oh}:flags=bicubic"));
-        let (x0, y0) = (px0, py0);
-        (f, Some((x0.round() as i64, y0.round() as i64)))
+        (f, Some(Placement { x: px0.round() as i64, y: py0.round() as i64, w: ow as i64, h: oh as i64 }))
     }
 }
 
-/// A segment of the output: a cut, or black.
+/// Where a reframed layer lands on the canvas, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Placement { x: i64, y: i64, w: i64, h: i64 }
+
+impl Placement {
+    /// The part of the layer on a `w`×`h` canvas, as
+    /// `(crop x, crop y, width, height, canvas x, canvas y)`, or `None` when
+    /// it is entirely off. `pad` (which puts it on a canvas-sized frame)
+    /// cannot take a negative offset, so what hangs off is cropped first.
+    fn visible(self, w: u32, h: u32) -> Option<(i64, i64, i64, i64, i64, i64)> {
+        let (x0, y0) = (self.x.max(0), self.y.max(0));
+        let (x1, y1) = ((self.x + self.w).min(w as i64), (self.y + self.h).min(h as i64));
+        (x1 > x0 && y1 > y0).then_some((x0 - self.x, y0 - self.y, x1 - x0, y1 - y0, x0, y0))
+    }
+}
+
+/// A segment of the output: a cut, black, or a stack of layers composited.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Segment {
     Cut(Cut),
     Black { at: Ticks, len: Ticks },
+    /// Several layers seen at once, BOTTOM FIRST (the compositor's order),
+    /// painted over black, each with its blend mode and opacity. Every layer
+    /// spans exactly `[at, at + len)`.
+    Stack { at: Ticks, len: Ticks, layers: Vec<Cut> },
 }
 
 impl Segment {
-    pub fn at(&self) -> Ticks { match self { Segment::Cut(c) => c.at, Segment::Black { at, .. } => *at } }
-    pub fn len(&self) -> Ticks { match self { Segment::Cut(c) => c.len, Segment::Black { len, .. } => *len } }
+    pub fn at(&self) -> Ticks {
+        match self { Segment::Cut(c) => c.at, Segment::Black { at, .. } | Segment::Stack { at, .. } => *at }
+    }
+    pub fn len(&self) -> Ticks {
+        match self { Segment::Cut(c) => c.len, Segment::Black { len, .. } | Segment::Stack { len, .. } => *len }
+    }
     pub fn end(&self) -> Ticks { self.at().saturating_add(self.len()) }
+    /// Any source picture in it (not only black).
+    pub fn has_picture(&self) -> bool { !matches!(self, Segment::Black { .. }) }
+    /// Every cut in it, bottom first.
+    pub fn cuts(&self) -> &[Cut] {
+        match self {
+            Segment::Cut(c) => std::slice::from_ref(c),
+            Segment::Black { .. } => &[],
+            Segment::Stack { layers, .. } => layers,
+        }
+    }
+    fn lengthen(&mut self, by: Ticks) {
+        match self {
+            Segment::Cut(c) => c.len = c.len.saturating_add(by),
+            Segment::Black { len, .. } => *len = len.saturating_add(by),
+            Segment::Stack { len, layers, .. } => {
+                *len = len.saturating_add(by);
+                for l in layers { l.len = l.len.saturating_add(by); }
+            }
+        }
+    }
 }
 
 /// The picture as segments covering `[0, end)` — `end` is the project's
 /// duration unless given — with no gaps: black where no video clip is.
 /// Only clips whose source has a path in `paths` and sits on a video
 /// track count; a video source whose file has not arrived is a gap.
+///
+/// The timeline is cut at every clip edge; each piece between two edges
+/// holds the stack visible there (see the module docs), and neighbouring
+/// pieces showing the same clips are one segment -- so a timeline with no
+/// overlaps gives exactly one cut per clip, as it always has.
 pub fn edit_list(project: &Project, paths: &BTreeMap<SourceId, PathBuf>, end: Option<Ticks>) -> Vec<Segment> {
     let end = end.unwrap_or_else(|| project.duration());
-    // Video clips in priority order: track index ascending (first is top).
-    let mut clips: Vec<(usize, &studio_core::Clip)> = project.clips.values()
+    // Video clips in priority order: track index ascending (first is top);
+    // within a track the earlier clip claims an overlap.
+    let mut clips: Vec<(usize, &studio_core::Clip, Picture)> = project.clips.values()
         .filter_map(|c| {
             let ti = project.tracks.iter().position(|t| t.id == c.track)?;
             if project.tracks[ti].kind != TrackKind::Video { return None; }
             if !paths.contains_key(&c.source) { return None; }
-            Some((ti, c))
+            let picture = Picture {
+                fade: project.fades.get(&c.id).and_then(|(fi, fo)| Fade::of(c.src_in, c.len, *fi, *fo)),
+                ..Picture::of(&c.effects)
+            };
+            Some((ti, c, picture))
         })
         .collect();
-    clips.sort_by_key(|(ti, c)| (*ti, c.pos));
-    // Sweep: each clip claims whatever of its span is not yet covered.
-    let mut covered: Vec<(Ticks, Ticks)> = Vec::new();
-    let mut cuts: Vec<Cut> = Vec::new();
-    for (_, c) in clips {
-        let (mut from, to) = (c.pos, c.end().min(end));
-        if from >= to { continue; }
-        // Walk the uncovered pieces of [from, to).
-        let mut pieces = Vec::new();
-        let mut occupied: Vec<(Ticks, Ticks)> = covered.iter().copied()
-            .filter(|(s, e)| *s < to && *e > from).collect();
-        occupied.sort();
-        for (s, e) in occupied {
-            if s > from { pieces.push((from, s)); }
-            from = from.max(e);
-        }
-        if from < to { pieces.push((from, to)); }
-        for (s, e) in pieces {
-            cuts.push(Cut {
-                path: paths[&c.source].clone(),
-                src_in: c.src_in.saturating_add(s.saturating_sub(c.pos)),
-                len: e.saturating_sub(s),
-                at: s,
-                picture: Picture {
-                    fade: project.fades.get(&c.id).and_then(|(fi, fo)| Fade::of(c.src_in, c.len, *fi, *fo)),
-                    ..Picture::of(&c.effects)
-                },
-            });
-            covered.push((s, e));
-        }
+    clips.sort_by_key(|(ti, c, _)| (*ti, c.pos));
+    let mut edges: Vec<Ticks> = vec![Ticks::ZERO, end];
+    for (_, c, _) in &clips {
+        edges.extend([c.pos, c.end()].into_iter().filter(|t| *t < end));
     }
-    cuts.sort_by_key(|c| c.at);
-    // Fill the gaps with black.
-    let mut out = Vec::new();
-    let mut t = Ticks::ZERO;
-    for c in cuts {
-        if c.at > t { out.push(Segment::Black { at: t, len: c.at.saturating_sub(t) }); }
-        t = c.at.saturating_add(c.len);
-        out.push(Segment::Cut(c));
+    edges.sort();
+    edges.dedup();
+    let mut out: Vec<Segment> = Vec::new();
+    let mut showing: Option<Vec<ClipId>> = None;
+    for pair in edges.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if a >= b { continue; }
+        // Top down: one clip per track, stopping at the first that hides the rest.
+        let mut stack: Vec<&(usize, &studio_core::Clip, Picture)> = Vec::new();
+        let mut track = None;
+        for entry in &clips {
+            let (ti, c, pic) = entry;
+            if track == Some(*ti) || !(c.pos <= a && a < c.end()) { continue; }
+            track = Some(*ti);
+            stack.push(entry);
+            if pic.covers() { break; }
+        }
+        let ids: Vec<ClipId> = stack.iter().map(|(_, c, _)| c.id).collect();
+        if showing.as_ref() == Some(&ids) {
+            out.last_mut().expect("a previous piece set `showing`").lengthen(b.saturating_sub(a));
+            continue;
+        }
+        let cut = |(_, c, pic): &&(usize, &studio_core::Clip, Picture)| Cut {
+            path: paths[&c.source].clone(),
+            src_in: c.src_in.saturating_add(a.saturating_sub(c.pos)),
+            len: b.saturating_sub(a),
+            at: a,
+            picture: pic.clone(),
+        };
+        out.push(match stack.as_slice() {
+            [] => Segment::Black { at: a, len: b.saturating_sub(a) },
+            [one] if one.2.is_opaque() => Segment::Cut(cut(one)),
+            _ => Segment::Stack { at: a, len: b.saturating_sub(a), layers: stack.iter().rev().map(cut).collect() },
+        });
+        showing = Some(ids);
     }
-    if end > t { out.push(Segment::Black { at: t, len: end.saturating_sub(t) }); }
     out
 }
 
@@ -402,10 +485,8 @@ pub fn render_args_enc(segments: &[Segment], audio: Option<&Path>, out: &Path, w
     let mut args: Vec<String> = vec!["-y".into(), "-hide_banner".into(), "-loglevel".into(), "error".into()];
     // One input per distinct file, in first-use order.
     let mut inputs: Vec<PathBuf> = Vec::new();
-    for s in segments {
-        if let Segment::Cut(c) = s {
-            if !inputs.contains(&c.path) { inputs.push(c.path.clone()); }
-        }
+    for c in segments.iter().flat_map(|s| s.cuts()) {
+        if !inputs.contains(&c.path) { inputs.push(c.path.clone()); }
     }
     for p in &inputs { args.push("-i".into()); args.push(p.to_string_lossy().into_owned()); }
     let audio_index = inputs.len();
@@ -436,7 +517,7 @@ pub fn render_args_enc(segments: &[Segment], audio: Option<&Path>, out: &Path, w
                                    c.src_in.to_seconds(), c.len.to_seconds());
                 match at {
                     None => filter.push_str(&format!("{base},format=yuv420p{label};")),
-                    Some((x, y)) => filter.push_str(&format!(
+                    Some(Placement { x, y, .. }) => filter.push_str(&format!(
                         "{base}[fg{i}];color=c=black:s={w}x{h}:r={fps}:d={:.6},format=rgb24[bg{i}];\
 [bg{i}][fg{i}]overlay=x={x}:y={y}:shortest=1:format=rgb,format=yuv420p{label};", c.len.to_seconds())),
                 }
@@ -451,6 +532,10 @@ pub fn render_args_enc(segments: &[Segment], audio: Option<&Path>, out: &Path, w
             Segment::Black { len, .. } => {
                 filter.push_str(&format!(
                     "color=c=black:s={w}x{h}:r={fps}:d={:.6},format=yuv420p{label};", len.to_seconds()));
+            }
+            Segment::Stack { len, layers, .. } => {
+                filter.push_str(&stack_filter(i, layers, &inputs, len.to_seconds(), w, h, fps, &fit_rgb));
+                filter.push_str(&format!("format=yuv420p,setsar=1{label};"));
             }
         }
         labels.push(label);
@@ -470,15 +555,74 @@ pub fn render_args_enc(segments: &[Segment], audio: Option<&Path>, out: &Path, w
     args
 }
 
+/// ffmpeg's `blend` name for a mode.
+fn blend_name(m: BlendMode) -> &'static str {
+    match m {
+        BlendMode::Normal => "normal",
+        BlendMode::Add => "addition",
+        BlendMode::Multiply => "multiply",
+        BlendMode::Screen => "screen",
+        BlendMode::Overlay => "overlay",
+    }
+}
+
+/// The graph for one [`Segment::Stack`], `i`th in the list: a black canvas,
+/// then each layer painted over it bottom first, ending in an RGB stream
+/// with the label open (the caller appends the chain that closes it).
+///
+/// Every layer is first made a CANVAS-SIZED RGBA frame: its picture chain,
+/// its opacity in the alpha channel, and -- when reframed -- padded out with
+/// transparency to the canvas, so what it does not cover is alpha 0 and
+/// leaves the canvas alone. Then, per layer, the compositor's formula
+/// `canvas + (mode(canvas, layer) - canvas) * alpha`:
+///
+///  * Normal is `overlay` with that alpha -- the formula exactly.
+///  * Any other mode is `blend` over the canvas, with the canvas as the
+///    FIRST input: ffmpeg's `overlay` blend mode tests its first input
+///    ("top") for the dark/light switch, and the compositor tests the canvas.
+///    Its alpha plane is `multiply` with the canvas's opaque 255, which hands
+///    the layer's alpha through untouched; `overlay` then lays the blended
+///    picture over the canvas by it. Multiply, screen and addition are
+///    symmetric, so only overlay cared about the order -- tested anyway.
+#[allow(clippy::too_many_arguments)]
+fn stack_filter(i: usize, layers: &[Cut], inputs: &[PathBuf], len: f64, w: u32, h: u32, fps: u32, fit_rgb: &str) -> String {
+    let mut f = format!("color=c=black:s={w}x{h}:r={fps}:d={len:.6},format=rgb24[k{i}_0];");
+    let mut canvas = 0;
+    for (j, c) in layers.iter().enumerate() {
+        let (chain, at) = c.picture.filters(w, h);
+        let mut layer = String::new();
+        if let Some(p) = at {
+            // entirely off the canvas: nothing to paint (and pad would refuse it)
+            let Some((cx, cy, vw, vh, x, y)) = p.visible(w, h) else { continue };
+            if (cx, cy, vw, vh) != (0, 0, p.w, p.h) { layer.push_str(&format!(",crop={vw}:{vh}:{cx}:{cy}")); }
+            layer.push_str(&format!(",pad={w}:{h}:{x}:{y}:color=black@0"));
+        }
+        let input = inputs.iter().position(|p| *p == c.path).expect("collected by the caller");
+        let fades = c.picture.fade.map(|f| f.filters()).unwrap_or_default();
+        let alpha = c.picture.alpha();
+        let dim = if alpha < 1.0 - 1e-4 { format!(",colorchannelmixer=aa={alpha:.6}") } else { String::new() };
+        // alpha BEFORE pad, so the padding stays fully transparent
+        f.push_str(&format!("[{input}:v]{fades}trim=start={:.6}:duration={:.6},setpts=PTS-STARTPTS,{fit_rgb}{chain},format=rgba{dim}{layer}[l{i}_{j}];",
+                            c.src_in.to_seconds(), c.len.to_seconds()));
+        let (from, to) = (format!("[k{i}_{canvas}]"), format!("[k{i}_{}]", canvas + 1));
+        match c.picture.mode() {
+            BlendMode::Normal => f.push_str(&format!("{from}[l{i}_{j}]overlay=format=rgb:shortest=1,format=rgb24{to};")),
+            m => f.push_str(&format!(
+                "{from}format=gbrap,split[ka{i}_{j}][kb{i}_{j}];[l{i}_{j}]format=gbrap[lg{i}_{j}];\
+[ka{i}_{j}][lg{i}_{j}]blend=c0_mode={n}:c1_mode={n}:c2_mode={n}:c3_mode=multiply:shortest=1[x{i}_{j}];\
+[kb{i}_{j}][x{i}_{j}]overlay=format=rgb:shortest=1,format=rgb24{to};", n = blend_name(m))),
+        }
+        canvas += 1;
+    }
+    format!("{f}[k{i}_{canvas}]")
+}
+
 /// Everything the export will NOT reproduce from the preview, one line per
 /// cut that has any, for the status line. Empty means the file will match.
 pub fn unsupported(segments: &[Segment]) -> Vec<String> {
-    segments.iter().filter_map(|s| match s {
-        Segment::Cut(c) if !c.picture.unsupported.is_empty() => Some(format!(
-            "{} at {:.2}s: {} not rendered", c.path.file_name().map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(), c.at.to_seconds(), c.picture.unsupported.join(", "))),
-        _ => None,
-    }).collect()
+    segments.iter().flat_map(|s| s.cuts()).filter(|c| !c.picture.unsupported.is_empty()).map(|c| format!(
+        "{} at {:.2}s: {} not rendered", c.path.file_name().map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(), c.at.to_seconds(), c.picture.unsupported.join(", "))).collect()
 }
 
 /// Render `segments` with `audio` under it to `out`. `segments` must be
@@ -545,6 +689,7 @@ mod tests {
             Segment::Cut(c) => (c.at.to_seconds(), c.len.to_seconds(),
                                 Some((c.path.to_str().unwrap(), c.src_in.to_seconds()))),
             Segment::Black { at, len } => (at.to_seconds(), len.to_seconds(), None),
+            Segment::Stack { .. } => panic!("opaque full-frame clips never stack: {seg:?}"),
         }).collect();
         // A wins 0–2 outright (top track), B shows 2–4 from 1.5 s in
         // (its own 0.5 plus the second it lost), black 4–5, B 5–6, black
@@ -890,18 +1035,24 @@ mod tests {
         p.apply(&Op::SetEffects { id: ClipId(1), effects: vec![
             fx("color", &[("gain_r", 0.5)]),
             fx("transform", &[("scale_x", 0.5), ("scale_y", 0.5), ("rotation", 10.0)]),
-            fx("blend", &[]),
+            fx("blend", &[("mode", 2.0), ("opacity", 0.5)]),
             fx("eq", &[]),                                     // audio: not the picture's business
             studio_core::Effect { enabled: false, ..fx("transform", &[("x", 0.3)]) },  // disabled: ignored
         ] }).unwrap();
         let list = edit_list(&p, &paths, None);
-        let Segment::Cut(c) = &list[0] else { panic!("{list:?}") };
+        // translucent: composited over black, so a stack of one, not a plain cut
+        let Segment::Stack { layers, .. } = &list[0] else { panic!("{list:?}") };
+        let c = &layers[0];
         assert_eq!(c.picture.color.unwrap().gain[0], 0.5);
         assert_eq!(c.picture.transform.unwrap().scale_x, 0.5);
         assert_eq!(c.picture.transform.unwrap().x, 0.0, "the disabled transform did not win");
+        assert_eq!(c.picture.blend, Some((BlendMode::Multiply, 0.5)));
+        // blends are rendered now; rotation still is not, and says so
         let warn = unsupported(&list);
         assert_eq!(warn.len(), 1, "{warn:?}");
-        assert!(warn[0].contains("rotation") && warn[0].contains("blend"), "{warn:?}");
+        assert!(warn[0].contains("rotation") && !warn[0].contains("blend"), "{warn:?}");
+        // a blend effect at its defaults (Normal, full) is no blend at all
+        assert_eq!(Picture::of(&[fx("blend", &[])]).blend, None);
         // identity effects cost nothing: the cut takes the plain path
         let plain = Picture::of(&[fx("transform", &[]), fx("color", &[])]);
         assert!(plain.is_identity());
@@ -923,7 +1074,7 @@ mod tests {
             crop: (0.2, 0.0, 0.0, 0.1), ..Default::default() };
         let c = studio_fx::Color { lift: [0.0, 0.0, 0.1], gamma: [1.0, 1.6, 1.0],
             gain: [0.6, 1.0, 1.0], saturation: 0.7 };
-        let picture = Picture { transform: Some(t), color: Some(c), kaleido: None, style: None, fade: None, unsupported: vec![] };
+        let picture = Picture { transform: Some(t), color: Some(c), kaleido: None, style: None, fade: None, blend: None, unsupported: vec![] };
         let seg = Segment::Cut(Cut { path: take.video.clone(), src_in: s(1.0), len: s(1.0), at: s(0.0), picture });
         let out = shoot.dir.join(format!("fx-{}.mp4", std::process::id()));
         render(&[seg], None, &out, w, h, 12).expect("render");
@@ -1047,5 +1198,133 @@ mod tests {
         assert!(err < 6.0, "export differs from the preview's look by {err:.1} levels on average");
         assert!((mean(&b) - mean(&a)).abs() > 8.0, "and it really changed: {} vs {}", mean(&b), mean(&a));
         for f in [&tex, &plain, &styled] { let _ = std::fs::remove_file(f); }
+    }
+
+    /// `(at, len, clip paths bottom first)` for each segment -- the shape of an
+    /// edit list without its pictures. Black is an empty path list.
+    fn stacks(list: &[Segment]) -> Vec<(f64, f64, Vec<String>)> {
+        list.iter().map(|s| (s.at().to_seconds(), s.len().to_seconds(),
+            s.cuts().iter().map(|c| c.path.to_string_lossy().into_owned()).collect())).collect()
+    }
+    fn names(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+
+    #[test]
+    fn a_reframed_or_translucent_top_layer_lets_the_track_below_show() {
+        let paths: BTreeMap<SourceId, PathBuf> = [(SourceId(1), "top.mp4".into()), (SourceId(2), "low.mp4".into())].into();
+        let mut p = project_with(&paths);
+        clip(&mut p, 1, 1, 1, 1.0, 2.0, 0.0);   // top track 1-3
+        clip(&mut p, 2, 2, 2, 0.0, 4.0, 0.0);   // lower track 0-4
+        // picture-in-picture: half size -- the lower track shows around it
+        p.apply(&Op::SetEffects { id: ClipId(1), effects: vec![fx("transform", &[("scale_x", 0.5), ("scale_y", 0.5)])] }).unwrap();
+        let list = edit_list(&p, &paths, None);
+        assert_eq!(stacks(&list), vec![
+            (0.0, 1.0, names(&["low.mp4"])),
+            (1.0, 2.0, names(&["low.mp4", "top.mp4"])),   // bottom first
+            (3.0, 1.0, names(&["low.mp4"])),
+        ]);
+        let Segment::Stack { layers, .. } = &list[1] else { panic!("{list:?}") };
+        assert_eq!(layers[0].src_in, s(1.0), "the lower clip's piece starts where it was reached");
+        assert_eq!(layers[1].src_in, s(0.0));
+        // translucent, full frame: the same stack
+        p.apply(&Op::SetEffects { id: ClipId(1), effects: vec![fx("blend", &[("opacity", 0.5)])] }).unwrap();
+        assert_eq!(stacks(&edit_list(&p, &paths, None))[1], (1.0, 2.0, names(&["low.mp4", "top.mp4"])));
+        // opaque transform opacity alone counts too (the compositor multiplies it in)
+        p.apply(&Op::SetEffects { id: ClipId(1), effects: vec![fx("transform", &[("opacity", 0.25)])] }).unwrap();
+        assert_eq!(stacks(&edit_list(&p, &paths, None))[1].2, names(&["low.mp4", "top.mp4"]));
+        // and with no effects the old rule holds exactly: top wins, one cut
+        p.apply(&Op::SetEffects { id: ClipId(1), effects: vec![] }).unwrap();
+        assert!(matches!(edit_list(&p, &paths, None)[1], Segment::Cut(_)));
+    }
+
+    #[test]
+    fn an_opaque_full_frame_layer_hides_everything_under_it_and_does_not_split() {
+        let paths: BTreeMap<SourceId, PathBuf> =
+            [(SourceId(1), "a.mp4".into()), (SourceId(2), "b.mp4".into()), (SourceId(4), "c.mp4".into())].into();
+        let mut p = project_with(&paths);
+        p.apply(&Op::AddTrack { track: studio_core::Track { id: TrackId(4), kind: TrackKind::Video, name: "cam C".into(),
+            muted: false, locked: false, gain: 1.0, route: None }, at: 2 }).unwrap();
+        clip(&mut p, 1, 1, 1, 0.0, 4.0, 0.0);   // top: translucent 0-4
+        p.apply(&Op::SetEffects { id: ClipId(1), effects: vec![fx("blend", &[("mode", 3.0)])] }).unwrap();
+        clip(&mut p, 2, 2, 2, 0.0, 4.0, 0.0);   // middle: opaque, full frame, 0-4
+        clip(&mut p, 3, 4, 4, 1.0, 1.0, 0.0);   // bottom: 1-2, hidden by the middle
+        let list = edit_list(&p, &paths, None);
+        // the bottom clip's edges at 1 and 2 must not cut the stack: nothing visible changes there
+        assert_eq!(stacks(&list), vec![(0.0, 4.0, names(&["b.mp4", "a.mp4"]))], "{list:?}");
+        let Segment::Stack { layers, len, .. } = &list[0] else { panic!() };
+        assert!(layers.iter().all(|l| l.len == *len), "merged pieces lengthen every layer");
+    }
+
+    /// Every blend mode, a translucent layer and a picture-in-picture, rendered
+    /// through ffmpeg and compared with the viewport's own compositor fed the
+    /// same decoded source frames.
+    #[test]
+    fn every_blend_mode_exports_what_the_compositor_paints() {
+        if !crate::testkit::ffmpeg_or_skip("every_blend_mode_exports_what_the_compositor_paints") { return; }
+        let dir = std::env::temp_dir().join(format!("studio-blend-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (w, h) = (64u32, 48u32);
+        // Channels on both sides of 0.5 in each colour, so the overlay mode's
+        // dark/light switch goes different ways per channel -- testing it on
+        // the WRONG input changes the answer by ~30 levels.
+        let fixture = |name: &str, hex: &str| {
+            let path = dir.join(format!("{name}.mp4"));
+            super::super::run("ffmpeg", &["-y", "-f", "lavfi", "-i", &format!("color=c={hex}:s={w}x{h}:r=20:d=7"),
+                "-c:v", "mpeg4", "-q:v", "2", "-pix_fmt", "yuv420p", "-an", path.to_str().unwrap()]).expect("fixture");
+            path
+        };
+        let (top, low) = (fixture("top", "0x64B4DC"), fixture("low", "0xC86432"));
+        let paths: BTreeMap<SourceId, PathBuf> = [(SourceId(1), top.clone()), (SourceId(2), low.clone())].into();
+        let mut p = project_with(&paths);
+        clip(&mut p, 100, 2, 2, 0.0, 7.0, 0.0);   // the lower track, all the way
+        let cases: [(f64, Vec<studio_core::Effect>, BlendMode, f32, studio_fx::Transform); 7] = [
+            (0.0, vec![fx("blend", &[("opacity", 0.5)])], BlendMode::Normal, 0.5, Default::default()),
+            (1.0, vec![fx("blend", &[("mode", 1.0)])], BlendMode::Add, 1.0, Default::default()),
+            (2.0, vec![fx("blend", &[("mode", 2.0)])], BlendMode::Multiply, 1.0, Default::default()),
+            (3.0, vec![fx("blend", &[("mode", 3.0)])], BlendMode::Screen, 1.0, Default::default()),
+            (4.0, vec![fx("blend", &[("mode", 4.0), ("opacity", 0.75)])], BlendMode::Overlay, 0.75, Default::default()),
+            (5.0, vec![fx("transform", &[("scale_x", 0.5), ("scale_y", 0.5)])], BlendMode::Normal, 1.0,
+             studio_fx::Transform { scale_x: 0.5, scale_y: 0.5, ..Default::default() }),
+            // hanging off the left edge: cropped before pad, and multiplied
+            (6.0, vec![fx("transform", &[("scale_x", 0.5), ("scale_y", 0.5), ("x", -0.5)]), fx("blend", &[("mode", 2.0)])],
+             BlendMode::Multiply, 1.0, studio_fx::Transform { scale_x: 0.5, scale_y: 0.5, x: -0.5, ..Default::default() }),
+        ];
+        for (k, (at, effects, ..)) in cases.iter().enumerate() {
+            clip(&mut p, k as u64 + 1, 1, 1, *at, 1.0, *at);
+            p.apply(&Op::SetEffects { id: ClipId(k as u64 + 1), effects: effects.clone() }).unwrap();
+        }
+        let list = edit_list(&p, &paths, None);
+        assert_eq!(list.len(), cases.len(), "one stack per case: {:?}", stacks(&list));
+        assert!(list.iter().all(|s| matches!(s, Segment::Stack { layers, .. } if layers.len() == 2)), "{:?}", stacks(&list));
+        let out = dir.join("out.mp4");
+        render_with_encoder(&list, None, &out, w, h, 20, VideoEncoder::Mpeg4).expect("render");
+        let (a, b) = (super::super::frame_rgb(&low, s(0.5), w, h).unwrap(), super::super::frame_rgb(&top, s(0.5), w, h).unwrap());
+        let mut checked = 0;
+        for (at, _, mode, opacity, transform) in &cases {
+            let got = super::super::frame_rgb(&out, s(at + 0.5), w, h).unwrap();
+            let want = studio_fx::compositor::composite(w, h, [0, 0, 0], &[
+                studio_fx::compositor::Layer { rgb: &a, w, h, transform: Default::default(), mode: BlendMode::Normal, opacity: 1.0 },
+                studio_fx::compositor::Layer { rgb: &b, w, h, transform: *transform, mode: *mode, opacity: *opacity },
+            ]);
+            // interior of the layer AND outside it; one pixel from each placed edge
+            // is left out (bicubic vs nearest, and 4:2:0 chroma, disagree there)
+            // (3w/8, h/2) is where an off-edge layer lands if it is padded
+            // without being cropped first: shifted right by what hung off
+            for (x, y) in [(w / 2, h / 2), (3, 3), (w - 4, h - 4), (w / 4 - 3, h / 2), (3 * w / 8, h / 2)] {
+                let i = ((y * w + x) * 3) as usize;
+                for c in 0..3 {
+                    assert!((got[i + c] as i32 - want[i + c] as i32).abs() <= 8,
+                        "{mode:?} @{opacity} {transform:?} at ({x},{y}): export {:?} vs compositor {:?}", &got[i..i + 3], &want[i..i + 3]);
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, cases.len() * 5);
+        // the picture-in-picture really shows the lower track around it (the
+        // old export painted black there) and the top inside it
+        let pip = super::super::frame_rgb(&out, s(5.5), w, h).unwrap();
+        assert!(pip[0] > 150 && pip[2] < 100, "corner is the lower track: {:?}", &pip[..3]);
+        let i = (((h / 2) * w + w / 2) * 3) as usize;
+        assert!(pip[i + 2] > 180, "centre is the top clip: {:?}", &pip[i..i + 3]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
