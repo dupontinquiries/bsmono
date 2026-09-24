@@ -176,6 +176,9 @@ pub struct ShellView {
     /// released with a jiggle). Ticked every frame; settled ones are dropped.
     press: HashMap<Id, tideshell_core::anim::Spring>,
     last_frame_ms: Option<u64>,
+    /// Decides when the living palette is written for other apps: a visible
+    /// change, at most twice a second, a light/dark flip at once.
+    palette_pub: ambient_palette::Publisher,
     /// This frame's dt for the springs (set at the top of `ui`).
     frame_dt: f32,
     /// The switcher landed (reveal reached 1): kick the cards once.
@@ -549,6 +552,14 @@ impl ShellView {
         // warmth on the surfaces, its brightness, and its springs.
         let mood = shell.mood();
         let living = Self::living_palette(pal, &mood, shell.accent(), contrast);
+        // Share it: apps reading $XDG_RUNTIME_DIR/tideshell.palette dress to
+        // match (deploy/AMBIENCE-API.md). The publisher throttles; this frame
+        // usually writes nothing.
+        if let Some(line) = self.palette_pub.offer(uikit_egui::theme_bridge::ambient::to_ambient(&living, shell.apps_light()), now_ms) {
+            if let Some(path) = ambient_palette::runtime_path() {
+                let _ = ambient_palette::write_atomic(&path, &line);
+            }
+        }
         let pal = &living;
         self.spring_omega = mood.omega;
         self.spring_zeta = mood.zeta;
