@@ -188,6 +188,9 @@ pub struct Studio {
     /// "S-space menu" and the key did nothing, leaving Ctrl+P — shown
     /// nowhere — as the only way in.
     pub palette_requested: bool,
+    /// Set by the `r` key; the shell starts or stops a take (it owns the
+    /// microphone), as it does for C-r.
+    pub take_requested: bool,
     /// Set by any rack edit; the shell re-renders the loop and clears it.
     pub loop_dirty: bool,
     /// Set by any PROJECT edit (including undo/redo and a bounce); the shell
@@ -390,6 +393,7 @@ impl Studio {
             paint: studio_egui::grid::Paint::default(),
             rack_playing: false,
             palette_requested: false,
+            take_requested: false,
             loop_dirty: true,
             arrangement_dirty: true,
             seek_pending: false,
@@ -1666,13 +1670,254 @@ impl Studio {
                         let d = self.session.doc.project.duration();
                         self.seek(d);
                     }
-                    _ => {}
+                    // Everything below was parsed by the keymap and then
+                    // dropped here by a `_ => {}` until c20 -- the HUD taught
+                    // `x select` and `w/b extend` and neither did anything.
+                    // The match is exhaustive now, so the next Action added
+                    // to the keymap does not compile until it does something.
+                    Action::NextEdit { count, extend } => self.goto_edit(count, true, extend),
+                    Action::PrevEdit { count, extend } => self.goto_edit(count, false, extend),
+                    Action::ClipEnd { extend } => self.goto_clip_end(extend),
+                    Action::GotoPlayhead => self.reveal_playhead(),
+                    Action::SelectClip { extend } => self.select_clip_at_playhead(extend),
+                    Action::AddSelectionBelow => self.add_selection_beside(1),
+                    Action::AddSelectionAbove => self.add_selection_beside(-1),
+                    Action::SetGain { delta } => self.nudge_gain(delta),
+                    Action::ToggleMute => self.toggle_track_flag(true),
+                    Action::ToggleLock => self.toggle_track_flag(false),
+                    Action::ToggleRecord => self.take_requested = true,
+                    Action::ToggleLoop => {
+                        if self.transport.loop_range.is_some() { self.loop_off() } else { self.loop_selection() }
+                    }
+                    Action::EnterMode(m) => self.status = format!("{} mode", m.label()),
+                    // Insert mode is for text fields, which take their own
+                    // input; a literal char reaching here has nowhere to go.
+                    Action::Insert(_) => {}
                 }
                 true
             }
             Resolution::Pending(p) => { self.status = format!("…{p}"); true }
             Resolution::None => false,
         }
+    }
+
+    /// The track motions and selection work on: the last selected clip's,
+    /// else the topmost track with a clip under the playhead, else the first.
+    pub fn focus_track(&self) -> Option<studio_core::TrackId> {
+        let p = &self.session.doc.project;
+        let at = self.transport.position();
+        self.selection.iter().rev().find_map(|id| p.clips.get(id)).map(|c| c.track)
+            .or_else(|| p.tracks.iter()
+                .find(|t| p.track_clips(t.id).iter().any(|c| c.pos <= at && at < c.end())).map(|t| t.id))
+            .or_else(|| p.tracks.first().map(|t| t.id))
+    }
+
+    /// The clip on `track` under `at`, if any.
+    fn clip_at(&self, track: studio_core::TrackId, at: Ticks) -> Option<studio_core::ClipId> {
+        self.session.doc.project.track_clips(track).iter()
+            .find(|c| c.pos <= at && at < c.end()).map(|c| c.id)
+    }
+
+    /// What a clip action applies to: the selection, else the focus track's
+    /// clip under the playhead.
+    fn targets(&self) -> Vec<studio_core::ClipId> {
+        if !self.selection.is_empty() { return self.selection.clone(); }
+        self.focus_track().and_then(|t| self.clip_at(t, self.transport.position())).into_iter().collect()
+    }
+
+    fn select_add(&mut self, id: studio_core::ClipId) {
+        if !self.selection.contains(&id) { self.selection.push(id); }
+    }
+
+    /// `w` / `b`: the playhead to the next / previous cut on the focus track;
+    /// in Select mode the clips passed over join the selection.
+    pub fn goto_edit(&mut self, count: u32, forward: bool, extend: bool) {
+        let Some(track) = self.focus_track() else { self.status = "no tracks".into(); return };
+        let from = self.transport.position();
+        let p = &self.session.doc.project;
+        let to = studio_egui::keys::next_edit(&studio_egui::keys::edit_points(p, track), from, count, forward);
+        if to == from {
+            self.status = format!("no cut {} on this track", if forward { "after" } else { "before" } );
+            return;
+        }
+        if extend {
+            for id in studio_egui::keys::clips_in_span(p, track, from, to) { self.select_add(id); }
+        }
+        self.seek(to);
+        self.status = format!("cut at {:.2}s{}", to.to_seconds(),
+            if extend { format!(" · {} selected", self.selection.len()) } else { String::new() });
+    }
+
+    /// `e`: to the end of the focus track's clip under the playhead.
+    pub fn goto_clip_end(&mut self, extend: bool) {
+        let at = self.transport.position();
+        let Some(id) = self.focus_track().and_then(|t| self.clip_at(t, at)) else {
+            self.status = "no clip under the playhead".into(); return };
+        let end = self.session.doc.project.clips[&id].end();
+        if extend { self.select_add(id); }
+        self.seek(end);
+        self.status = format!("clip end {:.2}s", end.to_seconds());
+    }
+
+    /// `g c`: scroll the timeline so the playhead is in view, a little in
+    /// from the left edge.
+    pub fn reveal_playhead(&mut self) {
+        let at = self.transport.position();
+        let margin = Ticks::from_seconds(80.0 / self.view.px_per_sec.max(1.0) as f64);
+        self.view.scroll = at.saturating_sub(margin);
+        self.status = format!("playhead {:.2}s", at.to_seconds());
+    }
+
+    /// `x`: select the focus track's clip under the playhead. Pressed again
+    /// (or in Select mode) it extends to the next clip on that track, as
+    /// Helix's `x` extends line by line.
+    pub fn select_clip_at_playhead(&mut self, extend: bool) {
+        let Some(track) = self.focus_track() else { self.status = "no tracks".into(); return };
+        let at = self.transport.position();
+        let under = self.clip_at(track, at);
+        let p = &self.session.doc.project;
+        match under {
+            Some(id) if !self.selection.contains(&id) => {
+                if !extend { self.selection.clear(); }
+                self.selection.push(id);
+            }
+            _ => {
+                // repeat: the next clip on this track after the selected ones
+                let after = self.selection.iter().filter_map(|id| p.clips.get(id))
+                    .filter(|c| c.track == track).map(|c| c.end()).max().unwrap_or(at);
+                let next = p.track_clips(track).iter().filter(|c| c.pos >= after)
+                    .min_by_key(|c| c.pos).map(|c| c.id);
+                match next {
+                    Some(id) => self.selection.push(id),
+                    None => { self.status = if under.is_none() { "no clip under the playhead".into() }
+                                            else { "no further clip on this track".into() }; return; }
+                }
+            }
+        }
+        self.status = format!("{} selected", self.selection.len());
+    }
+
+    /// `C` / `alt-C`: add the clip on the track below (`dir` 1) or above
+    /// (-1) that overlaps the last selected clip most -- multi-track selection
+    /// from the keyboard, as Helix's `C` adds a cursor on the next line.
+    pub fn add_selection_beside(&mut self, dir: i32) {
+        let p = &self.session.doc.project;
+        let anchor = self.selection.last().and_then(|id| p.clips.get(id)).cloned()
+            .or_else(|| self.focus_track().and_then(|t| self.clip_at(t, self.transport.position()))
+                .and_then(|id| p.clips.get(&id).cloned()));
+        let Some(a) = anchor else { self.status = "select a clip first (x)".into(); return };
+        let Some(ti) = p.tracks.iter().position(|t| t.id == a.track) else { return };
+        let Some(other) = ti.checked_add_signed(dir as isize).and_then(|i| p.tracks.get(i)) else {
+            self.status = format!("no track {}", if dir > 0 { "below" } else { "above" }); return };
+        let overlap = |c: &studio_core::Clip| c.end().min(a.end()).0 - c.pos.max(a.pos).0;
+        let best = p.track_clips(other.id).into_iter().filter(|c| overlap(c) > 0)
+            .max_by_key(|c| overlap(c)).map(|c| c.id);
+        match best {
+            Some(id) => {
+                self.selection.retain(|x| *x != id);
+                self.selection.push(id); // last = the new anchor, so C repeats downward
+                self.status = format!("{} selected", self.selection.len());
+            }
+            None => self.status = format!("nothing on {} under the selection", other.name),
+        }
+    }
+
+    /// `=` / `-`: clip gain up or down, over the inspector's 0..=1.5 range.
+    /// One undo for the whole selection.
+    pub fn nudge_gain(&mut self, delta: f32) {
+        let ids = self.targets();
+        if ids.is_empty() { self.status = "gain: nothing selected or under the playhead".into(); return; }
+        let p = &self.session.doc.project;
+        let ops: Vec<_> = ids.iter().filter_map(|id| p.clips.get(id))
+            .map(|c| studio_core::Op::SetGain { id: c.id, gain: (c.gain + delta).clamp(0.0, 1.5) }).collect();
+        let shown = match &ops[..] { [studio_core::Op::SetGain { gain, .. }] => format!("gain {gain:.2}"),
+                                     _ => format!("gain {:+.2} on {}", delta, ops.len()) };
+        self.edit_group(ops, &shown);
+    }
+
+    /// `m` / `l`: flip mute (or lock) on the tracks of the target clips.
+    pub fn toggle_track_flag(&mut self, mute: bool) {
+        let p = &self.session.doc.project;
+        let mut tracks: Vec<studio_core::TrackId> = self.targets().iter()
+            .filter_map(|id| p.clips.get(id)).map(|c| c.track).collect();
+        if tracks.is_empty() { tracks.extend(self.focus_track()); }
+        tracks.dedup();
+        let ops: Vec<_> = tracks.iter().filter_map(|id| p.tracks.iter().find(|t| t.id == *id)).map(|t| {
+            let (muted, locked) = if mute { (!t.muted, t.locked) } else { (t.muted, !t.locked) };
+            studio_core::Op::SetTrackFlags { id: t.id, muted, locked }
+        }).collect();
+        if ops.is_empty() { self.status = "no track".into(); return; }
+        let now = match &ops[0] { studio_core::Op::SetTrackFlags { muted, locked, .. } => if mute { *muted } else { *locked }, _ => false };
+        let what = format!("{} {}", if mute { if now { "muted" } else { "unmuted" } } else if now { "locked" } else { "unlocked" },
+                           tracks.iter().filter_map(|id| p.tracks.iter().find(|t| t.id == *id)).map(|t| t.name.clone()).collect::<Vec<_>>().join(", "));
+        self.edit_group(ops, &what);
+    }
+
+    /// `D`: a copy of the selection straight after it -- the arranging move
+    /// (the next four bars are the last four, then change them). Goes through
+    /// `paste_at` so compositions and automation come along; the clipboard is
+    /// left as it was.
+    pub fn duplicate_selected(&mut self) {
+        let p = &self.session.doc.project;
+        let Some(end) = self.selection.iter().filter_map(|id| p.clips.get(id)).map(|c| c.end()).max() else {
+            self.status = "duplicate: nothing selected".into(); return };
+        let saved = std::mem::replace(&mut self.clipboard, self.selection.clone());
+        self.paste_at(end);
+        self.clipboard = saved;
+    }
+
+    /// `[` / `]`: fade the target clips in up to the playhead, or out from
+    /// it -- a fade drawn by standing where it should end. The other fade is
+    /// kept. On a video clip over a lower track this is a dissolve.
+    pub fn fade_to_playhead(&mut self, fade_in: bool) {
+        let at = self.transport.position();
+        let p = &self.session.doc.project;
+        let ops: Vec<_> = self.targets().iter().filter_map(|id| p.clips.get(id))
+            .filter(|c| c.pos < at && at < c.end())
+            .map(|c| {
+                let (fi, fo) = p.fades.get(&c.id).copied().unwrap_or((Ticks::ZERO, Ticks::ZERO));
+                let (fi, fo) = if fade_in { (at.saturating_sub(c.pos), fo.min(c.end().saturating_sub(at))) }
+                               else { (fi.min(at.saturating_sub(c.pos)), c.end().saturating_sub(at)) };
+                studio_core::Op::SetClipFade { id: c.id, fade_in: fi, fade_out: fo }
+            }).collect();
+        if ops.is_empty() {
+            self.status = format!("fade {}: put the playhead inside a selected clip", if fade_in { "in" } else { "out" });
+            return;
+        }
+        let n = ops.len();
+        self.edit_group(ops, &format!("fade {} {:.2}s on {n} clip{}", if fade_in { "in to" } else { "out from" },
+                                      at.to_seconds(), if n == 1 { "" } else { "s" }));
+    }
+
+    /// `n`: set each target clip's gain so its loudest sample -- over the part
+    /// of the source the clip plays -- sits at -1 dBFS, capped at the
+    /// inspector's 1.5 (said out loud when the cap bites). `audio` is the
+    /// shell's decoded sources; a clip whose audio is not decoded is skipped
+    /// and counted.
+    pub fn normalize_selected(&mut self, audio: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>) {
+        const TARGET: f32 = 0.891_250_9; // -1 dBFS
+        let p = &self.session.doc.project;
+        let (mut ops, mut missing, mut capped) = (Vec::new(), 0, 0);
+        for c in self.targets().iter().filter_map(|id| p.clips.get(id)) {
+            let Some(a) = audio.get(&c.source) else { missing += 1; continue };
+            let rate = a.sample_rate.max(1);
+            let from = (c.src_in.to_samples(rate).max(0) as usize).min(a.frames());
+            let to = (from + c.len.to_samples(rate).max(0) as usize).min(a.frames());
+            let peak = a.channels.iter().flat_map(|ch| ch[from..to].iter()).fold(0.0f32, |m, v| m.max(v.abs()));
+            if peak <= 1e-6 { missing += 1; continue; }
+            let g = TARGET / peak;
+            if g > 1.5 { capped += 1; }
+            ops.push(studio_core::Op::SetGain { id: c.id, gain: g.min(1.5) });
+        }
+        if ops.is_empty() {
+            self.status = if missing > 0 { "normalize: no decoded audio under the selection".into() }
+                          else { "normalize: nothing selected or under the playhead".into() };
+            return;
+        }
+        let n = ops.len();
+        self.edit_group(ops, &format!("normalized {n} clip{} to -1 dBFS{}{}", if n == 1 { "" } else { "s" },
+            if capped > 0 { format!(" ({capped} capped at gain 1.5 -- too quiet to reach it)") } else { String::new() },
+            if missing > 0 { format!(" ({missing} skipped: silent or not decoded)") } else { String::new() }));
     }
 
     fn split_at_playhead(&mut self) {
@@ -3658,6 +3903,10 @@ impl eframe::App for App {
             let ms = studio_core::Ticks::from_seconds(0.001);
             match ch {
                 'A' => { self.studio.align_selected(&self.audio); continue; }
+                'n' => { self.studio.normalize_selected(&self.audio); continue; }
+                'D' => { self.studio.duplicate_selected(); continue; }
+                '[' => { self.studio.fade_to_playhead(true); continue; }
+                ']' => { self.studio.fade_to_playhead(false); continue; }
                 'Q' => { self.studio.quantize_selected(); continue; }
                 ',' => { self.studio.nudge_selected(studio_core::Ticks(-step.0)); continue; }
                 '.' => { self.studio.nudge_selected(step); continue; }
@@ -3692,6 +3941,10 @@ impl eframe::App for App {
                 _ => {}
             }
             self.studio.key(studio_egui::keys::Key::c(ch));
+        }
+        // `r` in the keymap: the take lives here, with the microphone.
+        if std::mem::take(&mut self.studio.take_requested) {
+            self.toggle_take();
         }
 
         // ctx variant: same colours, plus the symbol fonts. studio draws a
@@ -10390,7 +10643,7 @@ mod alignment_tests {
         // shipped — the tooltip and the behavior are one source of truth.
         use studio_egui::keys::{Key, Keymap, Resolution};
         let hints = studio_egui::CLIP_HINTS.join(" ");
-        for ch in ['A', 'Q', ',', '.', '<', '>'] {
+        for ch in ['A', 'Q', ',', '.', '<', '>', 'n', 'D', '[', ']'] {
             let mut k = Keymap::new();
             assert!(!matches!(k.feed(Key::c(ch)), Resolution::Act(_)),
                     "'{ch}' must stay free in the keymap");
@@ -10586,4 +10839,165 @@ mod comp_split_tests {
         }
     }
 }
+}
+
+
+/// The timeline's keys, fed through `Studio::key` -- the SHELL, not the
+/// keymap. The keymap's own tests proved every hinted key parsed; eleven of
+/// them then fell into a `_ => {}` here and did nothing (c20).
+#[cfg(test)]
+mod arrange_key_tests {
+    use super::*;
+    use studio_egui::keys::Key;
+    use studio_core::{Clip, ClipId, Op, Source, SourceId, Track, TrackId, TrackKind};
+
+    fn secs(x: f64) -> Ticks { Ticks::from_seconds(x) }
+
+    /// Two tracks far to the right of the demo's content:
+    /// A: 200-202 (#901), 202-204 (#902), 205-206 (#903); B: 201-203 (#904).
+    fn arranged() -> Studio {
+        let mut s = Studio::demo();
+        for (i, (id, name)) in [(900u64, "arr A"), (901, "arr B")].into_iter().enumerate() {
+            let at = s.session.doc.project.tracks.len();
+            s.edit(Op::AddTrack { track: Track { id: TrackId(id), kind: TrackKind::Audio, name: name.into(),
+                muted: false, locked: false, gain: 1.0, route: None }, at }, "t");
+            let _ = i;
+        }
+        s.edit(Op::AddSource { source: Source { id: SourceId(900), path: "arr.wav".into(), len: secs(60.0),
+            sample_rate: 48_000, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }, "src");
+        for (id, track, pos, len) in [(901u64, 900u64, 200.0, 2.0), (902, 900, 202.0, 2.0), (903, 900, 205.0, 1.0), (904, 901, 201.0, 2.0)] {
+            s.edit(Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(900), track: TrackId(track),
+                pos: secs(pos), src_in: secs(pos - 200.0), len: secs(len), gain: 1.0, effects: vec![] } }, "c");
+        }
+        s.selection.clear();
+        s
+    }
+    fn at(s: &mut Studio, x: f64) { s.transport.set_position(secs(x)); }
+    fn clip(s: &Studio, id: u64) -> &Clip { &s.session.doc.project.clips[&ClipId(id)] }
+
+    #[test]
+    fn x_selects_the_clip_under_the_playhead_and_again_extends_along_the_track() {
+        let mut s = arranged();
+        at(&mut s, 200.5);
+        s.key(Key::c('x'));
+        assert_eq!(s.selection, vec![ClipId(901)], "{}", s.status);
+        s.key(Key::c('x'));
+        assert_eq!(s.selection, vec![ClipId(901), ClipId(902)], "{}", s.status);
+        s.key(Key::c('x'));
+        assert_eq!(s.selection, vec![ClipId(901), ClipId(902), ClipId(903)]);
+        s.key(Key::c(';'));
+        assert!(s.selection.is_empty());
+    }
+
+    #[test]
+    fn w_b_and_e_walk_the_cuts_and_select_mode_gathers_what_they_pass() {
+        let mut s = arranged();
+        at(&mut s, 200.5);
+        s.key(Key::c('x'));                       // focus: track A
+        s.key(Key::c('w'));
+        assert_eq!(s.transport.position(), secs(202.0), "{}", s.status);
+        s.key(Key::c('2')); s.key(Key::c('w'));   // a count: two cuts on
+        assert_eq!(s.transport.position(), secs(205.0));
+        s.key(Key::c('b'));
+        assert_eq!(s.transport.position(), secs(204.0));
+        s.key(Key::c('e'));
+        assert_eq!(s.transport.position(), secs(204.0), "no clip under 204: stays, says so ({})", s.status);
+        at(&mut s, 202.5);
+        s.key(Key::c('e'));
+        assert_eq!(s.transport.position(), secs(204.0));
+        // Select mode: w extends over what it passes
+        s.selection.clear();
+        at(&mut s, 200.0);
+        s.selection.push(ClipId(901));
+        s.key(Key::c('v'));
+        s.key(Key::c('w')); s.key(Key::c('w'));
+        assert!(s.selection.contains(&ClipId(902)), "{:?}", s.selection);
+    }
+
+    #[test]
+    fn c_adds_the_overlapping_clip_on_the_track_below() {
+        let mut s = arranged();
+        at(&mut s, 202.5);
+        s.key(Key::c('x'));
+        assert_eq!(s.selection, vec![ClipId(902)]);
+        s.key(Key::shift('c'));
+        assert_eq!(s.selection, vec![ClipId(902), ClipId(904)], "{}", s.status);
+    }
+
+    #[test]
+    fn gain_mute_and_lock_act_on_the_selection_and_undo_in_one() {
+        let mut s = arranged();
+        s.selection = vec![ClipId(901), ClipId(904)];
+        s.key(Key::c('-'));
+        assert!((clip(&s, 901).gain - 0.95).abs() < 1e-6 && (clip(&s, 904).gain - 0.95).abs() < 1e-6);
+        s.key(Key::c('u'));
+        assert_eq!(clip(&s, 901).gain, 1.0, "one undo for the whole selection");
+        s.key(Key::c('m'));
+        let tr = |s: &Studio, id: u64| s.session.doc.project.tracks.iter().find(|t| t.id == TrackId(id)).unwrap().clone();
+        assert!(tr(&s, 900).muted && tr(&s, 901).muted, "{}", s.status);
+        s.key(Key::c('m'));
+        assert!(!tr(&s, 900).muted);
+        s.key(Key::c('l'));
+        assert!(tr(&s, 900).locked && !tr(&s, 900).muted);
+    }
+
+    #[test]
+    fn loop_record_and_goto_playhead_do_what_they_say() {
+        let mut s = arranged();
+        s.selection = vec![ClipId(901), ClipId(902)];
+        s.key(Key::shift('l'));
+        assert_eq!(s.transport.loop_range, Some((secs(200.0), secs(204.0))), "{}", s.status);
+        s.key(Key::shift('l'));
+        assert_eq!(s.transport.loop_range, None);
+        s.key(Key::c('r'));
+        assert!(s.take_requested, "r asks the shell for a take");
+        at(&mut s, 150.0);
+        s.view.scroll = Ticks::ZERO;
+        s.key(Key::c('g')); s.key(Key::c('c'));
+        assert!(s.view.scroll > secs(140.0) && s.view.scroll < secs(150.0), "{:?}", s.view.scroll);
+    }
+
+    #[test]
+    fn duplicate_lands_right_after_the_selection_and_leaves_the_clipboard() {
+        let mut s = arranged();
+        s.clipboard = vec![ClipId(903)];
+        s.selection = vec![ClipId(901), ClipId(902)];
+        s.duplicate_selected();
+        let p = &s.session.doc.project;
+        let copies: Vec<_> = s.selection.iter().map(|id| (p.clips[id].pos, p.clips[id].track)).collect();
+        // the copy of 901 lands at 204 -- where 903 is not (205), so no room needed
+        assert!(copies.contains(&(secs(204.0), TrackId(900))), "{copies:?} ({})", s.status);
+        assert_eq!(s.clipboard, vec![ClipId(903)], "D is not a yank");
+    }
+
+    #[test]
+    fn brackets_fade_in_to_and_out_from_the_playhead() {
+        let mut s = arranged();
+        s.selection = vec![ClipId(902)];          // 202-204
+        at(&mut s, 202.5);
+        s.fade_to_playhead(true);
+        assert_eq!(s.session.doc.project.fades.get(&ClipId(902)), Some(&(secs(0.5), Ticks::ZERO)), "{}", s.status);
+        at(&mut s, 203.25);
+        s.fade_to_playhead(false);
+        assert_eq!(s.session.doc.project.fades.get(&ClipId(902)), Some(&(secs(0.5), secs(0.75))), "the fade-in is kept");
+        at(&mut s, 210.0);
+        s.fade_to_playhead(true);
+        assert!(s.status.contains("inside"), "{}", s.status);
+    }
+
+    #[test]
+    fn normalize_brings_the_played_part_of_the_source_to_minus_one_dbfs() {
+        let mut s = arranged();
+        // the source: 0.25 peak for the first 2 s, 0.8 after -- clip 901
+        // plays 0-2 s, clip 902 plays 2-4 s
+        let rate = 1000;
+        let ch: Vec<f32> = (0..6000).map(|i| if i < 2000 { 0.25 * ((i % 7) as f32 / 7.0) } else { -0.8 }).collect();
+        let peak_a = ch[..2000].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let audio = [(SourceId(900), studio_audio::SourceAudio { sample_rate: rate, channels: vec![ch] })].into();
+        s.selection = vec![ClipId(901), ClipId(902)];
+        s.normalize_selected(&audio);
+        assert!((clip(&s, 901).gain - (0.891_250_9 / peak_a).min(1.5)).abs() < 1e-4, "{} {}", clip(&s, 901).gain, s.status);
+        assert!((clip(&s, 902).gain - 0.891_250_9 / 0.8).abs() < 1e-4, "{}", clip(&s, 902).gain);
+        assert!(s.status.contains("capped"), "0.89/0.21 > 1.5 is capped and said: {}", s.status);
+    }
 }

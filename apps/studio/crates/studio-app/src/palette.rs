@@ -1461,7 +1461,7 @@ mod tests {
         // diverge from the keyboard.
         // And every hint that exists must be a key the keymap or the
         // shell's own interception actually handles — one source of truth.
-        let intercepted = ['A', 'Q', ',', '.', '<', '>', 'g', 'G'];
+        let intercepted = ['A', 'Q', ',', '.', '<', '>', 'g', 'G', 'n', 'D', '[', ']'];
         for c in &r {
             let Some(Act::Key(ch)) = (match &c.then {
                 Then::Do(a) => Some(a.clone()), _ => None }) else { continue };

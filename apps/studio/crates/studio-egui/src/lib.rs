@@ -845,6 +845,9 @@ pub const CLIP_HINTS: &[&str] = &[
     "Q: quantize selected clip starts to the beat grid",
     ", / . : nudge selected by one step · < / > : by 1 ms",
     "g: group selection into a composition · G: ungroup",
+    "D: duplicate selection after itself · n: normalize to -1 dBFS",
+    "[ / ] : fade in to / out from the playhead (over a lower video track: a dissolve)",
+    "= / - : clip gain · m: mute track · l: lock track",
     "C-r: record a take from the microphone at the playhead",
 ];
 
