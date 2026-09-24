@@ -1,0 +1,9 @@
+[package]
+name = "studio-assemble"
+version = "0.1.0"
+edition = "2021"
+description = "A first cut from transcripts: which line, from which take, in what order -- proposed with reasons and a review list, never applied."
+
+[dependencies]
+studio-core = { path = "../studio-core" }
+studio-voice = { path = "../studio-voice" }

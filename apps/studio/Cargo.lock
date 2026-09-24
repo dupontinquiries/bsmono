@@ -3481,6 +3481,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "studio-assemble"
+version = "0.1.0"
+dependencies = [
+ "studio-core",
+ "studio-voice",
+]
+
+[[package]]
 name = "studio-audio"
 version = "0.1.0"
 dependencies = [
