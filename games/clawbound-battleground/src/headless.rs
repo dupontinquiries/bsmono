@@ -468,6 +468,25 @@ pub fn run_rig_sheet() -> Result<(), String> {
     }
     // The authored centre from above: the Hollow, and a run either side of the lane.
     shots.push(Shot { name: "map_centre.png", eye: Vec3::new(0.0, 62.0, -46.0), look: Vec3::new(0.0, 0.0, 8.0) });
+    // A grove (scene::groves): the first bramble bed in the going layer.
+    let grove = scene.blockers.going().all().iter().find_map(|r| match r.shape {
+        // r > 2.5: a bamboo stand is also a 0.55 thicket, 1.5 across.
+        crate::blockers::Shape::Circle { x, z, r: rad } if r.mul == crate::scene::BRAMBLE_MUL && rad > 2.5 => Some(Vec3::new(x, 0.0, z)),
+        _ => None,
+    });
+    if let Some(g) = grove {
+        shots.push(Shot { name: "map_grove.png", eye: g + Vec3::new(-11.0, 5.0, -11.0), look: g + Vec3::Y * 0.5 });
+        shots.push(Shot { name: "map_grove_above.png", eye: g + Vec3::new(-4.0, 42.0, -6.0), look: g });
+    }
+    // The deep jungle ring from above: west of the west river, the ground
+    // JUNGLE_MARGIN added.
+    // The whole valley from straight above (near enough): where the props are.
+    shots.push(Shot { name: "map_overview.png", eye: Vec3::new(0.0, 330.0, -60.0), look: Vec3::ZERO });
+    shots.push(Shot { name: "map_deep_jungle.png", eye: Vec3::new(-150.0, 70.0, -60.0), look: Vec3::new(-135.0, 0.0, 0.0) });
+    // Paws in motion: one cat trotting across open ground, seen side-on at
+    // paw height, captured on several frames (`rig_trot_strip_<step>.png`).
+    let trot_at = Vec3::new(0.0, 0.0, -48.0) + Vec3::X * 20.0;
+    shots.push(Shot { name: "rig_trot_strip.png", eye: trot_at + Vec3::new(0.0, 1.1, -4.2), look: trot_at + Vec3::Y * 0.45 });
     // A strike in the Hollow, a third of a second on: the front is among the
     // trees, the ground is freshly broken, and an older crack beside it is
     // half healed. Gameplay camera distance, so the fitted shadow box is tight.
@@ -498,7 +517,7 @@ pub fn run_rig_sheet() -> Result<(), String> {
         };
         game.blockers = scene.blockers.clone();
         let mut vfx = Vfx::default();
-        let cam = Camera { eye: shot.eye, target: shot.look, fov_y: if si == 0 || si >= sig_first { 1.0 } else { 0.6 } };
+        let cam = Camera { eye: shot.eye, target: shot.look, fov_y: if shot.name == "map_overview.png" { 1.15 } else if si == 0 || si >= sig_first { 1.0 } else { 0.6 } };
         const STEPS: usize = 48;
         for step in 0..STEPS {
             let left = STEPS - 1 - step;
@@ -572,7 +591,15 @@ pub fn run_rig_sheet() -> Result<(), String> {
                     game.gods[0].pos = t + Vec3::X * (crate::consts::TOWER_RANGE - 2.0);
                     game.tick(1.0 / 60.0); // the real sim decides who the tower aims at
                 }
-                k if shots[k].name == "map_centre.png" => {
+                k if shots[k].name == "rig_trot_strip.png" => {
+                    for gi in 1..game.gods.len() {
+                        game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
+                    }
+                    let g = &mut game.gods[0];
+                    g.yaw = 0.0;
+                    g.pos = trot_at - Vec3::X * (left as f32 * (4.5 / 60.0));
+                }
+                k if shots[k].name.starts_with("map_") => {
                     for gi in 0..game.gods.len() {
                         game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
                     }
@@ -644,6 +671,17 @@ pub fn run_rig_sheet() -> Result<(), String> {
             vfx.update(1.0 / 60.0, &[], &game);
             renderer.clear_queues();
             scene.draw(&mut renderer, &game, &mut vfx, cam);
+            if shot.name == "rig_trot_strip.png" && step >= STEPS - 16 && step % 3 == 0 {
+                // follow the cat so every frame frames it
+                let c = Camera { eye: game.gods[0].pos + Vec3::new(0.0, 1.1, -4.2), target: game.gods[0].pos + Vec3::Y * 0.45, fov_y: 0.6 };
+                renderer.clear_queues();
+                scene.draw(&mut renderer, &game, &mut vfx, c);
+                renderer.atmosphere = game.weather.atmosphere();
+                renderer.render_frame(&view, c, 1.0);
+                let name = format!("rig_trot_strip_{step}.png");
+                save_shot(&renderer.device, &renderer.queue, &target, &name)?;
+                println!("saved {name}");
+            }
         }
         // CLAWBOUND_NO_BRUSH=1 renders the same frame with the leaf-bend off,
         // so the two can be diffed: everything else in the frame is identical,
