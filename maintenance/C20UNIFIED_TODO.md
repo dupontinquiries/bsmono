@@ -4,8 +4,9 @@ Same convention as `C9`–`C19`: every item says how far it actually got. Named
 `C20UNIFIED`, not `C20`: `C20_TODO.md` (and `MERGE_GUIDE_C20.md` at the repo root) came
 with the blackstar-rs drop from a DIFFERENT session that also called itself C20.
 
-Session: `0260c59f7..` (50 commits by `c20unified agent`, 4 of them merges), exported as
-`c20unified-001` … `-014`. Per-commit detail is in the commit messages; this file is the
+Session: `0260c59f7..f849dad57` (79 commits by `c20unified agent`, 4 of them merges), exported
+as `c20unified-001` … `-023`; sections 10-12 were added after the first write (`b0135f593`).
+The merge guide for this line is `MERGE_GUIDE_c20unified.md` at the repo root. Per-commit detail is in the commit messages; this file is the
 index and the "verified how", plus what is open. Nothing here was run on a phone by this
 session; phone results came from the operator and are quoted as such.
 
@@ -109,3 +110,67 @@ Point the damaged-file harness (fao `decode.rs`) at the other parsers of user-ch
 depot catalog and packs, gitmind bundle and manifest readers, eink-kit's tablet surveys.
 Both parser bugs found this session were found that way, and neither was reachable by any
 existing test.
+
+## 10. unendlich (after the first write)
+
+- **Its tests run again.** The engine's test crate builds in a 3 GB sandbox with ONE build
+  job (rustc peaks ~2.6 GB, ~3.0 GB with default features) -- the likely reason sessions saw
+  it "die". Found and fixed on first run: an uncompiled proposal shader in `src/shaders/`
+  (`08ffc680f`, now `shaders_proposed/`); the GPU generator's Dome canopy still a cone after
+  the Rust side became a dome (`ad9f3d4e6`, shader + `.spv` regenerated); a test pinning the
+  stuck-button latch (`2bbc77224`); the eink height cache's counter ordering (`206b737f2`).
+- **The default build compiles** (broken since 2026-09-12: ui-overlay-only items ungated,
+  `f19420473`), and so does every target with defaults AND with `ui-overlay` (`0de339fe2`,
+  `99dd6cac0`, `2748218d3`, `a686d7972`, `c656615f7`). bloom/postfx compile again with the
+  three render passes they needed (`262fa8dc2`) -- declared, not wired, not run.
+- **Stale render tests** read the packed mesh now (`d7bc95360`).
+- **First person**: the camera sits in the hero's head (`841d2a4f7`, `b26053a33`); a hero's
+  height is its body, not its props or pose (`dec75fb73`); items in the anatomical right hand
+  and a carry pose that keeps a held item in view (`61d26091c`, switched on in `044f4147e`).
+- **Cloth and waves**: `sim::cloth`, `sim::ripples` (`746a0d3e1`, `708e8b8a0`), `sim::garment`
+  and the heroes' capes / cloak / scarf as cloth in the game (`5bcf10406`, `4cd79cbb1`,
+  `044f4147e`). `044f4147e` also FIXED a break: `61d26091c` added a HeroPose field the game
+  sets by name, and unendlich-fullgame did not compile from `61d26091c` until `044f4147e`
+  (exports `-019`, `-020`).
+- Verified: engine lib (no-default) 8850 passed; with defaults 9232 passed and exactly the 2
+  expected failures (below), measured at `f849dad57`; all
+  targets compile both ways. NOTHING seen on screen: no GPU here.
+- **Open:**
+  - `mesh_tri_regression::sample_grid_worst_case_stays_under_budget` fails ON PURPOSE: one
+    chunk is 443,922 triangles, ~410K of them foliage (~800 per stamped leaf block, 512
+    stamps per chunk by default). Options in `79ab94223`: the cap, culling faces hidden
+    inside a template, skipping enclosed leaves. A decision, not a fix.
+  - `mesher_binary::cross_tufts_are_eight_vertices_and_double_sided` (binary mesher, off by
+    default): hypothesis in KNOWN-TEST-FAILURES -- the stamp budget is charged before the
+    surface checks. Unconfirmed.
+  - Gravitybender's carry is out of frame (named in the test); the landing crouch is shallow
+    and its chest fold may lean back; `sim::ripples` is not wired to the water yet; the
+    wind-to-cloth scale (x3) is a guess; whether the ULTRA-WIDE should be tideshell's
+    default camera (pick_rear takes the first back camera).
+
+## 11. snapclone-egui voice
+
+- Calls send Opus, not raw S16LE (`623f42518`, `53195b3b3`; C14_TODO section 14 closed):
+  `snapclone-audio` got a safe Rust `VoiceEncoder`/`VoiceDecoder`; the app stopped telling the
+  host it had an encoder while it had none. Feature `opus`, default ON: needs libopus
+  (`opus-dev` / `libopus-dev`); `--no-default-features --features app` is the raw fallback.
+- Arriving voice is played in sequence order, gaps concealed (`f849dad57`): the Opus packet
+  carries `voice_send`'s seq and spurt flag (wire kind 4: flags, u32 seq, payload); `voice_rx`
+  feeds the ported jitter scheduler (`voice_playout`, which nothing had fed) and decodes /
+  conceals per speaker per frame interval. Raw frames from older builds keep their path;
+  older builds DROP kind 4 (silence from a newer peer, not noise).
+- Verified: 1746 passed with opus; the no-opus build compiles and its voice tests pass.
+  Recovery after a loss is gradual (0.60 / 0.71 / 0.80 of the true level over three frames).
+- **Open:** a real call between devices, and over a lossy network; in-band FEC is sent but
+  not used on receive (one packet of lookahead would rebuild a lost frame).
+
+## 12. Environment notes for the next session here
+
+- 3 GB RAM: build unendlich with `CARGO_BUILD_JOBS=1`. Disk runs short: build caches in
+  `/tmp/bd*` are disposable (voxel-tools' 62 examples alone are 3.2 GB in debug).
+- Installed this session: cmake, X11 dev headers (xrandr/xinerama/xcursor/xi), libopus-dev,
+  glslang-tools, valgrind. With them GLFW, audiopus and the shader build all work here.
+- The sandbox stops background jobs between turns: anything that temporarily edits source (a
+  mutation check) must start AND restore within one turn. A killed job left `sim/cloth.rs`
+  mutated once; it was caught and restored from backup.
+
