@@ -90,6 +90,7 @@ pub mod pattern_pack;
 pub mod rack_panel;
 pub mod seq_header;
 pub mod assembly;
+pub mod deliver;
 
 /// Everything the running editor holds.
 pub struct Studio {
