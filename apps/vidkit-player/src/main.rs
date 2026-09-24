@@ -27,6 +27,7 @@ use vidkit_core::traits::MediaSource;
 use vidkit_egui::{bottom_bar, next_fit, EguiPresenter, Fit, Transport, VideoView};
 
 mod filepick;
+mod audio_out;
 mod decode;
 mod export;
 mod transcribe;

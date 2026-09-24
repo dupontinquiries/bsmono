@@ -1419,6 +1419,16 @@ impl Drop for CommandSink {
 /// is worse than one that plays quietly and says so. The NAME is what the UI
 /// shows, which is how the difference stays visible.
 pub fn open_sink(rate: u32, channels: u16) -> Box<dyn AudioSink> {
+    // In process first: no player process per seek, and a measured latency
+    // instead of an estimate. VIDKIT_AUDIO=pipe skips it, for comparing the
+    // two on a device.
+    #[cfg(feature = "alsa")]
+    if std::env::var("VIDKIT_AUDIO").as_deref() != Ok("pipe") {
+        match crate::audio_out::open_cpal(rate, channels) {
+            Ok(s) => return Box::new(s),
+            Err(e) => eprintln!("vidkit audio: in-process output unavailable ({e}); trying a player"),
+        }
+    }
     if let Some(player) = find_audio_player() {
         let args = AUDIO_PLAYERS
             .iter()

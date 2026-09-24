@@ -26,6 +26,8 @@ vidkit-core = { path = "../../shared/vidkit/crates/vidkit-core" }
 # default 64 KB pipe holds ~340 ms of 48 kHz stereo, all of it "written" but not
 # yet heard. Already in the lockfile transitively.
 libc = "0.2"
+# Same major as shared/voice-engine-kit. Optional: see the `alsa` feature.
+cpal = { version = "0.15", optional = true }
 # The runtime device probe, which replaces a target-triple guess.
 vidkit-v4l2 = { path = "../../shared/vidkit/crates/vidkit-v4l2" }
 # The IO wrappers in src/io.rs implement its CommandRunner and HttpTransport.
@@ -57,7 +59,7 @@ snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
 # Default-on, matching the other -egui apps: `cargo build --release` in this
 # directory produces the deployable binary with no feature incantation. Off is
 # for a headless build that only wants the library half.
-default = ["app", "https", "whisper"]
+default = ["app", "https", "whisper", "alsa"]
 app = ["dep:eframe"]
 # HTTPS range fetching. Separate from `app` so a headless build that only wants
 # the demuxers does not pull rustls.
@@ -67,6 +69,10 @@ https = ["dep:ureq"]
 # builds without it, and section watching then works from sidecar subtitles
 # only.
 whisper = ["vidkit-transcribe/whisper"]
+# In-process audio output through cpal (ALSA; PipeWire via pipewire-alsa).
+# Needs alsa-lib headers (libasound2-dev / alsa-lib-dev). Without it, audio
+# goes through pw-play / paplay / aplay as before.
+alsa = ["dep:cpal"]
 
 # Monorepo-wide dev policy: full DWARF is the biggest artifact and link cost,
 # and the sandbox boxes are disk-starved.
