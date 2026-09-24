@@ -100,8 +100,14 @@ fn coord_main() {
     // stub (dead code) — body removed; left as a no-op so the file stays structurally valid.
 }
 
+/// The earlier probe: round-trips and reports the plain, naive and downsampled
+/// meshers for one chunk (the live `main` only exercises the greedy one). It
+/// used a `coord` it never defined -- broken since at least the in-tree landing
+/// and unseen, because nothing compiled this example (and the engine's default
+/// build itself failed from 2026-09-12 to f19420473). The chunk is now a
+/// parameter; call it as `old_main(ChunkCoord::new(cx, cy, cz))`.
 #[allow(dead_code)]
-fn old_main() {
+fn old_main(coord: ChunkCoord) {
     let origin = coord.block_origin();
     let c = varied_chunk(coord);
     let mut bad = false;
