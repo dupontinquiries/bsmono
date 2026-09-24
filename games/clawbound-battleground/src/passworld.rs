@@ -425,6 +425,20 @@ fn weathered(mut m: crate::voxel::VoxelMesh, grey: f32, dark: f32) -> crate::vox
 pub fn build() -> (Vec<Piece>, Blockers) {
     let mut blockers = Blockers::new(consts::arena_radius() + 20.0, 6.0);
     blockers.set_floor(pass::floor());
+    // Under a cave roof you are harder to see: cover-only entries (no
+    // collision, `top` = -inf) every 4 u along each cave.
+    for cave in pass::caves() {
+        let len = (cave.b - cave.a).length();
+        let n = (len / 4.0).ceil() as usize;
+        for k in 0..=n {
+            let p = cave.a.lerp(cave.b, k as f32 / n as f32);
+            blockers.push(crate::blockers::Blocker {
+                shape: crate::blockers::Shape::Circle { x: p.x, z: p.z, r: 0.0 },
+                top: f32::NEG_INFINITY,
+                cover: crate::blockers::Cover { x: p.x, z: p.z, radius: cave.half + 0.5, amount: 0.55 },
+            });
+        }
+    }
     let mut pieces = Vec::new();
     // crag meshes by (variant, size step, lean step): a few dozen grids
     // for hundreds of placements
@@ -621,5 +635,32 @@ mod tests {
         assert_eq!(statues, 6, "four cats at the bases, two owls at the boss grounds");
         assert!(arches >= 4, "{arches} arches");
         assert!(gems >= 20 && gems % 2 == 0, "{gems} gems (mirrored pairs)");
+    }
+
+    /// Caves lie over floor, their roof's lowest point (the mouth lip and
+    /// stalactites: height - 1.4 - 0.9 - 1.4) still clears a standing cat,
+    /// inside a cave you are in cover and outside it you are not, and the
+    /// roof is cut away exactly while the player is under it.
+    #[test]
+    fn caves_cover_the_path_hide_who_is_in_them_and_cut_away_for_the_player() {
+        let _pass = on_pass();
+        let f = pass::floor();
+        let (_, blockers) = build();
+        let caves = pass::caves();
+        assert_eq!(caves.len(), 4);
+        for c in &caves {
+            for k in 0..=10 {
+                let p = c.a.lerp(c.b, k as f32 / 10.0);
+                assert!(f.fits(p.x, p.z, 1.0), "cave over rock at {p}");
+            }
+            assert!(c.height - 1.4 - 0.9 - 1.4 > 2.0, "a cat does not fit under the lowest point");
+            let m = c.mid();
+            assert!(blockers.concealment_at(m.x, m.z) >= 0.5, "no cover in the cave at {m}");
+            assert!(crate::scene::cave_drawn(c, Vec3::new(0.0, 0.0, 0.0)), "drawn for a player elsewhere");
+            assert!(!crate::scene::cave_drawn(c, m), "cut away for the player under it");
+        }
+        // cover is the cave's, not the whole map's
+        let mid = pass::along(&crate::consts::Lane::Mid.polyline(), 20.0);
+        assert!(blockers.concealment_at(mid.x, mid.z) < 0.1);
     }
 }

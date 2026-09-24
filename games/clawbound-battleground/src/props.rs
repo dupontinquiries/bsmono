@@ -1098,3 +1098,51 @@ pub fn statue_owl(s: f32, variant: i32) -> VoxelMesh {
     g.ellipsoid(c, u(11.0), c + u(2.7), u(0.35), u(0.6), u(0.5), solid([0.34, 0.33, 0.32]));
     g.mesh(0.6, true)
 }
+
+/// A shallow cave: a rock roof over a corridor segment `len` long and
+/// `width` wide (floor width; the roof rests on the walls beyond it),
+/// running along `yaw` (0 = +z). A slab at `height`, jagged underneath with
+/// short stalactites, a few skylights, and heavier, lower lips at both
+/// mouths. Origin at the segment's midpoint, y = 0 at the floor.
+pub fn cave_roof(len: f32, width: f32, height: f32, yaw: f32, variant: i32) -> VoxelMesh {
+    const VOX: f32 = 0.6;
+    let reach = (len * 0.5 + 2.0).hypot(width * 0.5 + 3.0);
+    let n = ((reach * 2.0 / VOX).ceil() as usize + 2).min(160);
+    let ny = ((height + 4.0) / VOX).ceil() as usize + 1;
+    let mut g = Grid::new(n, ny, n);
+    let c = n as f32 * 0.5;
+    let (sn, cs) = yaw.sin_cos();
+    for x in 0..n as i32 {
+        for z in 0..n as i32 {
+            let px = (x as f32 + 0.5 - c) * VOX;
+            let pz = (z as f32 + 0.5 - c) * VOX;
+            let u = px * cs - pz * sn; // across
+            let w = px * sn + pz * cs; // along
+            if w.abs() > len * 0.5 + 1.0 || u.abs() > width * 0.5 + 3.0 {
+                continue;
+            }
+            // skylights: a few ragged holes along the middle third
+            let hole = [-0.3f32, 0.05, 0.35].iter().any(|&f| {
+                let d = ((w - f * len) / 1.8).powi(2) + (u / 1.4).powi(2);
+                d < 1.0 + (noise3(x / 2, 0, z / 2, variant) - 0.5) * 0.6
+            });
+            if hole {
+                continue;
+            }
+            // mouths: the lip hangs lower within 3 u of either end
+            let lip = (1.0 - ((len * 0.5 - w.abs()) / 3.0).clamp(0.0, 1.0)) * 1.4;
+            let under = height - lip - (noise3(x, 1, z, variant + 3) * 0.9);
+            let top = height + 2.4 + (noise3(x / 3, 2, z / 3, variant + 5) - 0.5) * 1.0;
+            for y in 0..ny as i32 {
+                let py = (y as f32 + 0.5) * VOX;
+                // stalactites: sparse short points below the underside
+                let stal = noise3(x, 9, z, variant + 9) > 0.93 && py > under - 1.4;
+                if (py >= under && py <= top) || stal && py < under {
+                    let v = 0.23 + (py - under).max(0.0) * 0.02 + (noise3(x, y, z, variant + 1) - 0.5) * 0.04;
+                    g.set(x, y, z, solid([v, v * 1.02, v * 1.08]));
+                }
+            }
+        }
+    }
+    g.mesh(VOX, true)
+}

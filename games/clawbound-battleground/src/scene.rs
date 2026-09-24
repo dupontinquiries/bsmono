@@ -48,6 +48,7 @@ pub struct Scene {
     pub titan_body: [u64; 2],
     pub titan_weapon: [u64; 2],
     pub chunks: Vec<PropChunk>,
+    pub caves: Vec<CaveDraw>,
     pub gate: [u64; 2],
     pub fountain: [u64; 2],
     pub pedestal: [u64; 2],
@@ -72,6 +73,22 @@ pub struct Scene {
 }
 
 /// One frustum-cullable batch of static world voxels.
+/// A cave roof (`pass::caves`): drawn on its own, not batched, because it
+/// is cut away while the player is under it -- a third-person camera sits
+/// above the cat, and a solid roof would hide the player from themselves.
+pub struct CaveDraw {
+    pub mesh: u64,
+    pub cave: crate::pass::Cave,
+}
+
+/// Is a cave roof drawn for a player at `player`? Not while they are under
+/// it: a cutaway. Ghosting it (alpha 0.22) was tried first and rendered as
+/// a soup of overlapping translucent cubes -- blending sorts per draw, not
+/// per voxel.
+pub fn cave_drawn(cave: &crate::pass::Cave, player: Vec3) -> bool {
+    !cave.covers(player.x, player.z)
+}
+
 pub struct PropChunk {
     pub mesh: u64,
     pub center: Vec3,
@@ -240,6 +257,20 @@ impl Scene {
         }
         total += bird_mesh.inst.len();
         let bird = r.upload_mesh(&bird_mesh);
+        let caves: Vec<CaveDraw> = if crate::map::active() == crate::map::MapId::Pass {
+            crate::pass::caves()
+                .into_iter()
+                .enumerate()
+                .map(|(i, cave)| {
+                    let d = cave.b - cave.a;
+                    let m = props::cave_roof(d.length(), cave.half * 2.0, cave.height, d.x.atan2(d.z), i as i32);
+                    total += m.inst.len();
+                    CaveDraw { mesh: r.upload_mesh(&m), cave }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let orb = models::build_orb([1.0, 1.0, 1.0]);
         total += orb.inst.len();
@@ -279,6 +310,7 @@ impl Scene {
             titan_body,
             titan_weapon,
             chunks,
+            caves,
             gate,
             fountain,
             pedestal,
@@ -320,6 +352,20 @@ impl Scene {
                     chunk_tint
                 };
                 r.queue_draw(mesh, Mat4::IDENTITY, tint, 0.0, vox, false);
+            }
+        }
+
+        // cave roofs: solid, or cut away while the player is under one
+        if let Some(me) = game.gods.iter().find(|g| g.is_player).or(game.gods.first()) {
+            for cd in &self.caves {
+                let c = cd.cave.mid() + Vec3::Y * cd.cave.height;
+                let rad = (cd.cave.b - cd.cave.a).length() * 0.5 + cd.cave.half + 4.0;
+                if !sphere_in_frustum(&vp, c, rad) {
+                    continue;
+                }
+                if cave_drawn(&cd.cave, me.pos) {
+                    r.queue_draw(cd.mesh, Mat4::from_translation(cd.cave.mid()), chunk_tint, 0.0, 0.6, false);
+                }
             }
         }
 
