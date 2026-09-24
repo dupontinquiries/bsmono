@@ -1,0 +1,8 @@
+[package]
+name = "cosmic-levers"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Read and write COSMIC desktop settings as cosmic-config does (user file over system default, atomic writes), without linking libcosmic. Std only. Each setting is a typed Lever pinned to COSMIC's source."
+
+[dependencies]
