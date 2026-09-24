@@ -925,7 +925,9 @@ pub fn run_pass_shots() -> Result<(), String> {
         let d = (cave.b - cave.a).normalize_or_zero();
         // on the ledge itself, a few units short of the mouth (the first try
         // stood in the clearing, inside a pine)
-        shoot(&mut renderer, &game, &mut vfx, "pass_cave.png", Camera { eye: cave.a - d * 5.0 + Vec3::Y * 2.2, target: cave.a + d * 10.0 + Vec3::Y * 2.5, fov_y: 1.0 })?;
+        // from the far end, looking back in (the near end has a spring
+        // tree by it, and the camera kept standing in it)
+        shoot(&mut renderer, &game, &mut vfx, "pass_cave.png", Camera { eye: cave.b + d * 5.0 + Vec3::Y * 2.2, target: cave.b - d * 10.0 + Vec3::Y * 2.5, fov_y: 1.0 })?;
         let keep = game.gods[0].pos;
         game.gods[0].pos = cave.mid();
         let t = cave.mid() + Vec3::Y * 1.5;
@@ -944,6 +946,19 @@ pub fn run_pass_shots() -> Result<(), String> {
         };
         shoot(&mut renderer, &game, &mut vfx, "pass_climb.png", Camera { eye: at(0.33) + Vec3::Y * 4.0, target: at(0.47) + Vec3::Y * 2.0, fov_y: 0.95 })?;
         shoot(&mut renderer, &game, &mut vfx, "pass_shelf.png", Camera { eye: at(0.5) + Vec3::Y * 5.0, target: at(0.64) + Vec3::Y * 0.0, fov_y: 0.95 })?;
+    }
+    // camps, gaps and niches
+    if let Some(c) = crate::pass::camps().into_iter().next() {
+        let mouth = c.at - c.back * (c.r + 3.0);
+        shoot(&mut renderer, &game, &mut vfx, "pass_camp.png", Camera { eye: crate::map::onto_floor(mouth, 1.0) + Vec3::Y * 4.5, target: c.at + c.back * 3.0, fov_y: 1.0 })?;
+    }
+    if let Some(g) = crate::pass::caps().iter().find(|c| !c.niche) {
+        let d = (g.b - g.a).normalize_or_zero();
+        shoot(&mut renderer, &game, &mut vfx, "pass_gap.png", Camera { eye: g.a - d * 5.0 + Vec3::Y * 2.0, target: g.b + d * 8.0 + Vec3::Y * 1.5, fov_y: 0.95 })?;
+    }
+    if let Some(n) = crate::pass::caps().iter().find(|c| c.niche) {
+        let out = (n.a - n.b).normalize_or_zero();
+        shoot(&mut renderer, &game, &mut vfx, "pass_niche.png", Camera { eye: n.a + out * 3.2 + Vec3::Y * 1.9, target: n.b + Vec3::Y * 1.3, fov_y: 0.9 })?;
     }
     // a choke, from the wide lane looking into the narrows
     let (cp, cd) = crate::pass::choke_points()[2];

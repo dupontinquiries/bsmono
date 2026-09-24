@@ -1146,3 +1146,93 @@ pub fn cave_roof(len: f32, width: f32, height: f32, yaw: f32, variant: i32) -> V
     }
     g.mesh(VOX, true)
 }
+
+/// A vole-monster burrow: a low mound of earth and stones round a dark
+/// hole, facing +z (the camp's mouth). Marks a jungle camp's pocket.
+pub fn burrow(variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(14, 6, 14);
+    let earth = [0.30, 0.25, 0.20];
+    g.ellipsoid(7.0, 0.5, 6.0, 6.2, 3.0, 5.2, solid(earth));
+    // stones on the rim
+    for k in 0..7 {
+        let a = k as f32 / 7.0 * std::f32::consts::TAU + variant as f32;
+        g.ellipsoid(7.0 + a.cos() * 5.0, 1.2, 6.0 + a.sin() * 4.2, 1.1, 0.9, 1.0, solid([0.38, 0.38, 0.40]));
+    }
+    // the hole, opening toward +z
+    g.carve_sphere(7.0, 1.4, 8.8, 2.3);
+    g.ellipsoid(7.0, 0.2, 8.4, 1.8, 0.4, 1.4, solid([0.08, 0.07, 0.06]));
+    g.mesh(0.35, true)
+}
+
+/// A mini diorama for a niche cut into a wall, ~2.5 u across, feet at y = 0,
+/// facing +z. `kind` 0: a shrine -- a ring of pebbles round a tiny seated
+/// cat idol, two small glowing gems. 1: a moss garden -- flat stones, moss,
+/// a miniature pine, pale flowers. 2: a geode -- a split stone lined with
+/// glowing crystals.
+pub fn diorama(kind: u8, variant: i32) -> VoxelMesh {
+    const VOX: f32 = 0.15;
+    let mut g = Grid::new(18, 18, 18);
+    let stone = [0.34, 0.34, 0.36];
+    let mut glow: Vec<(i32, i32, i32)> = Vec::new();
+    match kind % 3 {
+        0 => {
+            g.ellipsoid(9.0, 0.5, 9.0, 8.0, 1.0, 8.0, solid([0.30, 0.30, 0.32]));
+            for k in 0..10 {
+                let a = k as f32 / 10.0 * std::f32::consts::TAU;
+                g.ellipsoid(9.0 + a.cos() * 6.5, 1.3, 9.0 + a.sin() * 6.5, 0.9, 0.7, 0.9, solid([0.52, 0.51, 0.49]));
+            }
+            // the idol: haunches, chest, head, ears
+            let idol = solid([0.62, 0.58, 0.48]);
+            g.ellipsoid(9.0, 3.0, 8.0, 2.0, 1.8, 1.8, idol);
+            g.ellipsoid(9.0, 5.2, 9.0, 1.3, 2.0, 1.2, idol);
+            g.ellipsoid(9.0, 7.6, 9.5, 1.3, 1.2, 1.2, idol);
+            g.set(8, 9, 9, idol);
+            g.set(10, 9, 9, idol);
+            for (x, z) in [(5, 11), (13, 11)] {
+                for y in 2..6 {
+                    g.set(x, y, z, solid([0.62, 0.90, 1.0]));
+                    glow.push((x, y, z));
+                }
+            }
+        }
+        1 => {
+            g.ellipsoid(9.0, 0.6, 9.0, 8.0, 1.2, 7.0, solid([0.28, 0.36, 0.22]));
+            g.ellipsoid(5.0, 1.6, 7.0, 2.4, 1.0, 2.0, solid(stone));
+            g.ellipsoid(12.0, 1.3, 11.0, 2.0, 0.8, 1.8, solid(stone));
+            // the pine
+            g.cyl_y(10.0, 7.0, 0.6, 1, 5, solid([0.36, 0.26, 0.16]));
+            g.cone_y(10.0, 7.0, 2.6, 0.3, 4, 13, solid([0.16, 0.30, 0.20]));
+            // flowers
+            for k in 0..6 {
+                let x = 3 + ((k * 5 + variant) % 12);
+                let z = 4 + ((k * 7 + variant) % 10);
+                g.set(x, 2, z, solid([0.86, 0.84, 0.92]));
+            }
+        }
+        _ => {
+            // a split stone: an ellipsoid shell with the front cut away
+            g.ellipsoid(9.0, 5.0, 9.0, 7.0, 5.5, 6.0, solid(stone));
+            g.carve_sphere(9.0, 5.5, 11.5, 5.0);
+            for k in 0..9 {
+                let a = k as f32 / 9.0 * std::f32::consts::PI;
+                let (x, y) = ((9.0 + a.cos() * 3.8) as i32, (5.5 + a.sin() * 3.6) as i32);
+                for d in 0..3 {
+                    let z = 8 + d;
+                    g.set(x, y, z, solid([0.80, 0.62, 1.0]));
+                    glow.push((x, y, z));
+                }
+            }
+        }
+    }
+    let mut m = g.mesh(VOX, true);
+    let set: std::collections::HashSet<(i32, i32, i32)> = glow.into_iter().collect();
+    for i in m.inst.iter_mut() {
+        let cx = (i.off_ao[0] / VOX + 9.0 - 0.5).round() as i32;
+        let cy = (i.off_ao[1] / VOX - 0.5).round() as i32;
+        let cz = (i.off_ao[2] / VOX + 9.0 - 0.5).round() as i32;
+        if set.contains(&(cx, cy, cz)) {
+            i.misc[2] = 1.2;
+        }
+    }
+    m
+}

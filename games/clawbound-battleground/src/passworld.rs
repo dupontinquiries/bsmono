@@ -40,6 +40,10 @@ pub enum Item {
     Arch { at: Vec3, span: f32, height: f32, yaw: f32, variant: i32 },
     /// An animal god, facing along quarter turn `quarter`.
     Statue { at: Vec3, owl: bool, quarter: u8 },
+    /// A vole-monster burrow at the back of a camp pocket, facing out.
+    Burrow { at: Vec3, facing: Vec3 },
+    /// A mini diorama on a niche's shelf (`pass::caps`), facing out of it.
+    Diorama { at: Vec3, facing: Vec3, kind: u8, variant: i32 },
 }
 
 /// Distinct crag meshes built; placements share them.
@@ -64,6 +68,19 @@ fn clear_of_play(x: f32, z: f32, lane_margin: f32) -> bool {
         && [Team::Blue, Team::Red].iter().all(|t| (t.base_pos() - Vec3::new(x, 0.0, z)).length() > 26.0)
         // the pools under the falls are for looking at
         && pass::streams().iter().all(|s| (s[1] - Vec3::new(x, 0.0, z)).length() > 7.0)
+        && clear_of_features(x, z)
+}
+
+/// Nothing in a camp's pocket (kept for the camp) and nothing in a sightline
+/// gap or niche (kept for what it frames).
+fn clear_of_features(x: f32, z: f32) -> bool {
+    let p = Vec3::new(x, 0.0, z);
+    pass::camps().iter().all(|c| (c.at - p).length() > c.r + 1.5)
+        && pass::caps().iter().all(|c| {
+            let ab = c.b - c.a;
+            let t = ((p - c.a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+            (c.a + ab * t - p).length() > c.r + 2.0
+        })
 }
 
 /// Fold a z onto the blue half, clear of the axis: what is placed there is
@@ -96,7 +113,9 @@ fn placements_here() -> Vec<Item> {
         while x <= lim {
             let (jx, jz) = (x + rng.range(-1.2, 1.2), z + rng.range(-1.2, 1.2));
             let d = f.sdf(jx, jz);
-            if (-3.0..=-1.4).contains(&d) && clear_of_play(jx, jz, 6.5) {
+            // not along the side paths: a scree boulder on a 8 u ledge is
+            // most of the ledge (asked: more space on the pathways)
+            if (-3.0..=-1.4).contains(&d) && clear_of_play(jx, jz, 6.5) && pass::side_path_dist(jx, jz) > pass::SLOT_R + 3.0 {
                 let roll = rng.f32();
                 let q = (rng.f32() * 4.0) as u8;
                 let item = if roll < 0.12 {
@@ -156,7 +175,9 @@ fn placements_here() -> Vec<Item> {
         let mut x = -lim;
         while x <= lim {
             let d = f.sdf(x, z);
-            if (-2.2..=-1.0).contains(&d) && rng.f32() < 0.07 && clear_of_play(x, z, 4.5) {
+            // lanes' margins only: on a side path it was clutter (one fern
+            // hovered over a stream bed at a cave's mouth)
+            if (-2.2..=-1.0).contains(&d) && rng.f32() < 0.07 && clear_of_play(x, z, 4.5) && pass::side_path_dist(x, z) > pass::SLOT_R + 3.0 {
                 let kind = if rng.f32() < 0.3 { PropKind::Bush } else { PropKind::Fern };
                 out.push(Item::Prop { kind, x, z, scale: 1.0, quarter: 0 });
                 if z < -0.5 {
@@ -221,7 +242,13 @@ fn placements_here() -> Vec<Item> {
                 // judged again at the crag's footing below: the sample point
                 // can be outside a choke's radius while the footing it walks
                 // out to is inside it
-                let tight_here = near_choke(jx, jz);
+                // beside a side path a wall crag is small and upright (asked:
+                // more room on the pathways) -- the same treatment as a choke
+                let tight_here = near_choke(jx, jz) || pass::side_path_dist(jx, jz) < pass::SLOT_R + 4.0;
+                if !clear_of_features(jx, jz) {
+                    x += 2.5;
+                    continue;
+                }
                 if (0.6..2.4).contains(&d) && free(jx, jz, 8.5) {
                     let facing = out_of(jx, jz);
                     // Walk out to the face's foot, then find the face at the
@@ -235,6 +262,13 @@ fn placements_here() -> Vec<Item> {
                             break;
                         }
                         foot += facing * 0.1;
+                    }
+                    // the keep-outs judged where the crag will actually stand:
+                    // the search point can be clear of a camp while the wall
+                    // foot it walks out to is on the pocket's edge
+                    if !clear_of_features(foot.x, foot.z) {
+                        x += 2.5;
+                        continue;
                     }
                     let tight = tight_here || near_choke(foot.x, foot.z);
                     let top = pass::cliff_top(foot.x, foot.z).max(2.0);
@@ -266,6 +300,15 @@ fn placements_here() -> Vec<Item> {
                                 }
                                 at -= facing * 0.1;
                             }
+                        }
+                        // a tight crag that could not get 0.5 u into the rock
+                        // (a corner stopped the walk) is skipped, not placed proud
+                        // judged at the FINAL footing, whatever the crag was
+                        // classed as: a footing can slide into a choke's radius
+                        // from a search point outside it (found twice)
+                        if (tight || near_choke(at.x, at.z)) && f.sdf(at.x, at.z) < 0.5 {
+                            x += 2.5;
+                            continue;
                         }
                         let at = at + Vec3::Y * -0.6;
                         out.push(Item::Crag { at, size: sz, lean: ln, facing, variant: v, coarse: false, spiky: false });
@@ -381,14 +424,26 @@ fn placements_here() -> Vec<Item> {
                     }
                     q += across * side * 0.1;
                 }
-                if (0.2..1.0).contains(&f.sdf(q.x, q.z)) && q.z < -0.5 && !crate::bosses::in_pit(q.x, q.z) {
-                    let (size, hue, variant) = (rng.range(0.7, 1.05), (k % 3 == 2) as u8, k);
+                if (0.2..1.0).contains(&f.sdf(q.x, q.z)) && q.z < -0.5 && !crate::bosses::in_pit(q.x, q.z) && clear_of_features(q.x, q.z) && pass::caves().iter().all(|c| !c.covers(q.x, q.z)) {
+                    let (size, hue, variant) = (rng.range(0.55, 0.8), (k % 3 == 2) as u8, k);
                     out.push(Item::Gem { at: q, size, hue, variant });
                     out.push(Item::Gem { at: Vec3::new(q.x, 0.0, -q.z), size, hue, variant });
                 }
                 k += 1;
-                s += 10.0;
+                s += 22.0; // was 10: toned down for room on the paths
             }
+        }
+    }
+
+    // Camps: a burrow at the back of each pocket, facing its mouth.
+    for c in pass::camps() {
+        out.push(Item::Burrow { at: c.at + c.back * (c.r - 2.2), facing: -c.back });
+    }
+    // Dioramas: one on each niche's shelf, facing out toward the path.
+    for (i, c) in pass::caps().iter().enumerate() {
+        if c.niche {
+            let facing = (c.a - c.b).normalize_or_zero();
+            out.push(Item::Diorama { at: c.b - facing * 0.4 + Vec3::Y * c.h, facing, kind: (i % 3) as u8, variant: i as i32 });
         }
     }
 
@@ -430,6 +485,8 @@ fn lifted(it: Item) -> Item {
         Item::Fall { at, height, facing } => Item::Fall { at: up(at), height, facing },
         Item::Arch { at, span, height, yaw, variant } => Item::Arch { at: up(at), span, height, yaw, variant },
         Item::Statue { at, owl, quarter } => Item::Statue { at: up(at), owl, quarter },
+        Item::Burrow { at, facing } => Item::Burrow { at: up(at), facing },
+        Item::Diorama { at, facing, kind, variant } => Item::Diorama { at: up(at), facing, kind, variant },
     }
 }
 
@@ -517,6 +574,16 @@ pub fn build() -> (Vec<Piece>, Blockers) {
                 }
                 pieces.push(Piece { mesh, pos: at, quarter, vsize: V_MED, sway: 0.0 });
             }
+            Item::Burrow { at, facing } => {
+                let dirs = [Vec3::Z, Vec3::X, Vec3::NEG_Z, Vec3::NEG_X];
+                let q = (0..4).max_by(|&a, &b| dirs[a].dot(facing).partial_cmp(&dirs[b].dot(facing)).unwrap()).unwrap_or(0) as u8;
+                pieces.push(Piece { mesh: props::burrow(v), pos: at, quarter: q, vsize: V_SM, sway: 0.0 });
+            }
+            Item::Diorama { at, facing, kind, variant } => {
+                let dirs = [Vec3::Z, Vec3::X, Vec3::NEG_Z, Vec3::NEG_X];
+                let q = (0..4).max_by(|&a, &b| dirs[a].dot(facing).partial_cmp(&dirs[b].dot(facing)).unwrap()).unwrap_or(0) as u8;
+                pieces.push(Piece { mesh: props::diorama(kind, variant), pos: at, quarter: q, vsize: 0.15, sway: 0.0 });
+            }
             Item::Fall { at, height, facing } => {
                 // The mesh's sheet faces -z (it is built against z = 1 of a
                 // 7-deep grid); pick the quarter turn nearest the facing.
@@ -562,7 +629,8 @@ mod tests {
                 }
             }
         }
-        assert!(props > 150, "a bleak pass, not an empty one: {props} props");
+        // 150 before the side paths were decluttered (asked for); 142 after
+        assert!(props > 110, "a bleak pass, not an empty one: {props} props");
     }
 
     #[test]
@@ -679,5 +747,81 @@ mod tests {
         // cover is the cave's, not the whole map's
         let mid = pass::along(&crate::consts::Lane::Mid.polyline(), 20.0);
         assert!(blockers.concealment_at(mid.x, mid.z) < 0.1);
+    }
+
+    /// Camps are clear pockets of floor off the side paths: reachable from
+    /// the base, off the lanes, and empty but for their burrow.
+    #[test]
+    fn camps_are_clear_reachable_pockets_off_the_paths() {
+        let _pass = on_pass();
+        let f = pass::floor();
+        let items = placements();
+        let camps = pass::camps();
+        assert_eq!(camps.len(), 8);
+        for c in &camps {
+            assert!(f.fits(c.at.x, c.at.z, c.r - 1.5), "camp pocket too tight at {}", c.at);
+            assert!(lane_clearance(c.at.x, c.at.z) > pass::SIDE_R + c.r * 0.5, "camp on a lane at {}", c.at);
+            let route = f.route(Team::Blue.base_pos(), c.at);
+            assert_eq!(*route.last().unwrap(), c.at, "camp at {} unreachable", c.at);
+            for it in &items {
+                let (p, what) = match *it {
+                    Item::Prop { x, z, kind, .. } => (Vec3::new(x, 0.0, z), format!("{kind:?}")),
+                    Item::Crag { at, .. } => (at, "crag".into()),
+                    Item::Gem { at, .. } => (at, "gem".into()),
+                    Item::Statue { at, .. } => (at, "statue".into()),
+                    Item::Arch { at, .. } => (at, "arch".into()),
+                    _ => continue,
+                };
+                assert!(Vec3::new(p.x - c.at.x, 0.0, p.z - c.at.z).length() > c.r + 1.0, "{what} in the camp at {}", c.at);
+            }
+        }
+        assert_eq!(items.iter().filter(|i| matches!(i, Item::Burrow { .. })).count(), 8);
+    }
+
+    /// Gaps and niches: rock cut down, never floor made; each gap a sill
+    /// between a side path and a lane; each niche's shelf at its height with
+    /// a diorama on it.
+    #[test]
+    fn gaps_and_niches_cut_the_rock_and_frame_something() {
+        let _pass = on_pass();
+        let f = pass::floor();
+        let caps = pass::caps();
+        let (gaps, niches): (Vec<&pass::Cap>, Vec<&pass::Cap>) = caps.iter().partition(|c| !c.niche);
+        assert!(gaps.len() >= 2, "{} sightline gaps", gaps.len());
+        assert!(niches.len() >= 6, "{} niches", niches.len());
+        for c in &caps[..] {
+            let m = c.a.lerp(c.b, 0.5);
+            assert!(f.sdf(m.x, m.z) > 0.0, "a cap on the floor at {m}");
+            let h = pass::terrain_height(m.x, m.z) - pass::floor_height(m.x, m.z);
+            assert!((h - c.h).abs() < 0.3, "cap at {m} cut to {h}, want {}", c.h);
+        }
+        for g in &gaps {
+            // the rock either side of the gap stays high: it is a gap, not a lowering
+            let across = Vec3::new(-(g.b - g.a).z, 0.0, (g.b - g.a).x).normalize_or_zero();
+            let m = g.a.lerp(g.b, 0.5) + across * (g.r + 3.0);
+            if f.sdf(m.x, m.z) > 2.6 {
+                assert!(pass::terrain_height(m.x, m.z) > 6.0, "the wall beside the gap at {m} is low");
+            }
+        }
+        let dioramas = placements().iter().filter(|i| matches!(i, Item::Diorama { .. })).count();
+        assert_eq!(dioramas, niches.len(), "a diorama in every niche");
+    }
+
+    /// Room on the paths: along every side path's centre-line a cat moves
+    /// freely -- no collision -- over at least 97% of its length.
+    #[test]
+    fn the_side_paths_are_open() {
+        let _pass = on_pass();
+        let (_, blockers) = build();
+        for (a, b, _) in pass::side_paths() {
+            let len = (b - a).length();
+            let n = (len / 0.5) as usize;
+            let blocked = (0..=n).filter(|&k| {
+                let p = a.lerp(b, k as f32 / n as f32);
+                blockers.blocked(p.x, p.z, crate::consts::GOD_RADIUS)
+            });
+            let frac = blocked.count() as f32 / (n + 1) as f32;
+            assert!(frac <= 0.03, "side path {a} -> {b} blocked over {:.0}% of its length", frac * 100.0);
+        }
     }
 }
