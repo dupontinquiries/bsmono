@@ -863,3 +863,10 @@ mod tests {
         assert!(back.channels[0].iter().any(|s| s.abs() > 0.01), "the kit is in the file");
     }
 }
+
+/// Run ffmpeg for a test, panicking with its error text on failure.
+#[cfg(test)]
+pub(crate) fn tests_support_run(args: &[&str]) {
+    let o = std::process::Command::new("ffmpeg").args(args).output().expect("ffmpeg runs");
+    assert!(o.status.success(), "ffmpeg {:?}: {}", args, String::from_utf8_lossy(&o.stderr));
+}

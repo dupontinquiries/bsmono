@@ -95,6 +95,8 @@ pub mod story_check;
 pub mod vfx_setup;
 pub mod flp_import;
 pub mod flp_read;
+pub mod reference_check;
+pub mod note_stacks;
 
 /// Everything the running editor holds.
 pub struct Studio {
