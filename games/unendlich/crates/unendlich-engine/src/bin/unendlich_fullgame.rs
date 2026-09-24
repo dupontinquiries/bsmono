@@ -193,7 +193,17 @@ struct DragonDuel {
     genome: unendlich_engine::sim::dragon_archetype::Genome,
     profile: unendlich_engine::sim::dragon_duel::DuelProfile,
     state: unendlich_engine::sim::dragon_duel::DuelState,
+    /// Last tick's ground steer `(world heading, speed01)`, read by the
+    /// generic locomotion next tick. `None` = not engaged: wander as usual.
+    steer: Option<(f32, f32)>,
+    /// Seconds since the last UNENDLICH_DRAGON_TRACE line for this dragon.
+    trace_t: f32,
 }
+
+/// Top ground speed of an engaged dragon at `speed01 = 1` (blocks/s). Wander
+/// runs ~0.8..2.2; a charging dragon has to outrun a walking player (~4.3), or
+/// stalking someone who walks away never closes (seen in the second soak at 5).
+const DUEL_GROUND_SPEED: f32 = 8.0;
 
 /// The duel record for a creature spawned at `spawn_pos` -- the SAME position
 /// passed to `spawn::spawn`, so the genome is the one its body was built from.
@@ -205,7 +215,17 @@ fn dragon_duel_for(
         return None;
     }
     let genome = unendlich_engine::spawn::dragon_genome_at(spawn_pos);
-    let id = unendlich_engine::spawn::dragon_id_at(spawn_pos);
+    // Mixed (splitmix64 finaliser, a bijection): the spawn seed is FNV over
+    // float bit patterns, whose low bits are constant for positions on a
+    // coarse grid -- the first soak printed "#2fb7" for all twelve dragons,
+    // and DuelState::new reads bit 0 for the circling direction, so every
+    // dragon would have circled the same way.
+    let id = {
+        let mut z = unendlich_engine::spawn::dragon_id_at(spawn_pos);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
     let profile = unendlich_engine::sim::dragon_duel::DuelProfile::from_genome(&genome);
     log::info!(
         "[dragon#{:04x}] {} {:?} size {} — hp {} hide {:.0}, weak at the {}, cunning {:.2} ferocity {:.2} dread {:.2}",
@@ -217,6 +237,8 @@ fn dragon_duel_for(
         genome,
         profile,
         state: unendlich_engine::sim::dragon_duel::DuelState::new(id),
+        steer: None,
+        trace_t: 0.0,
     }))
 }
 
@@ -2499,6 +2521,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // DRAGON DUEL: a melee swing that hit nothing, carried to the next frame's
     // roamer loop (the melee check runs after it). A feinting dragon reads it.
     let mut last_swing_whiffed = false;
+    let dragon_trace = std::env::var("UNENDLICH_DRAGON_TRACE").map_or(false, |v| v == "1");
+    // UNENDLICH_DRAGON_AT=<metres>: 3 s after entering a world, hatch ONE
+    // dragon that far ahead of you. For soaks and for testing a fight without
+    // hunting for one (wild dragons tend to settle 70-100 m out). Fires once.
+    let mut dragon_at_pending: Option<f32> = std::env::var("UNENDLICH_DRAGON_AT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|m| m.is_finite() && *m >= 4.0);
+    let mut dragon_at_ingame_since: Option<Instant> = None;
     // r138: per-dragon bending wind-up state (keyed by flight-phase id bits).
     // r139: artifact imbue — the carried ingot (if any) slowly attunes to the
     // local element; its FieldDelta then adds onto the bending fields.
@@ -4729,6 +4760,30 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 log::info!("[timebend] enter scrub — {} vantages recorded", timebend.len());
             } else {
                 log::info!("[timebend] no history recorded yet — roam a bit first");
+            }
+        }
+        if let Some(m) = dragon_at_pending {
+            if matches!(fg_app.state(), unendlich_engine::sim::game_flow::AppState::InGame) {
+                let since = *dragon_at_ingame_since.get_or_insert_with(Instant::now);
+                if since.elapsed().as_secs_f32() >= 3.0 {
+                    dragon_at_pending = None;
+                    let p = local_player.view.position;
+                    let yaw = local_player.view.yaw;
+                    let (sx, sz) = (p.x + yaw.cos() * m, p.z + yaw.sin() * m);
+                    let sy = chunk_manager
+                        .generator()
+                        .cpu()
+                        .surface_y_at(sx.floor() as i32, sz.floor() as i32, probe_y_min, probe_y_max)
+                        .unwrap_or(p.y as i32)
+                        + 1;
+                    let wseed = fg_world_seed ^ 0xD2A6_A7A7 ^ (sx as i32 as u32 as u64);
+                    roamers.push(build_roamer(
+                        unendlich_engine::item::CreatureKind::Dragon,
+                        [sx, sy as f32, sz],
+                        wseed,
+                    ));
+                    log::info!("[dragon] UNENDLICH_DRAGON_AT: hatched a dragon {:.0} m ahead at ({:.0}, {}, {:.0})", m, sx, sy, sz);
+                }
             }
         }
         if mouse_captured && input.is_key_just_pressed(Keycode::H) {
@@ -9211,9 +9266,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // suspect. Time it to confirm.
             let _t_roamer = Instant::now();
             // DRAGON DUEL: what the dragons see in your hand this frame.
-            let player_threat = Some(player_item_threat(
+            let player_threat = player_item_threat(
                 survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
-            ));
+            );
             // r294: fresh surface memo each tick (the world is mutated between ticks).
             if surface_cache_enabled {
                 surface_cache.borrow_mut().clear();
@@ -10227,6 +10282,22 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         }
                     }
                 }
+                // DRAGON DUEL: an engaged dragon on the ground goes where its
+                // tactic says, through this same locomotion (terrain-aware
+                // sighted_step, large-body carving, surface easing) instead of
+                // wandering. The steer is the previous tick's duel output: the
+                // duel step runs in the dragon block further down, one frame of
+                // latency against a 0.6 s minimum tactic hold.
+                if !*flying {
+                    if let Some((heading, v01)) = duel.as_ref().and_then(|d| d.steer) {
+                        let spd = DUEL_GROUND_SPEED * v01 * tick_dt;
+                        rdx = heading.cos() * spd;
+                        rdz = heading.sin() * spd;
+                        w.heading = heading;
+                        pathing = true; // crisp turning, not wander's detent
+                        rig.resting = false;
+                    }
+                }
                 // Stumble recovery slows the step (and the trip below may start
                 // one). A creature mid-stumble is hobbled until it recovers.
                 let speed_mult = stumble.tick() * rig.status.speed_mult();
@@ -10698,81 +10769,98 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // chooses stalk / circle / feint / lunge / breath / retreat.
                     // Every tactic change is logged with its reasons.
                     let mut duel_steer: Option<(f32, f32, unendlich_engine::sim::dragon_duel::Tactic)> = None;
+                    if dragon_asleep {
+                        if let Some(d) = duel.as_mut() { d.steer = None; }
+                    }
+                    // UNENDLICH_DRAGON_TRACE=1: every 3 s per dragon, where it is
+                    // relative to you and what state gates its fight -- the line
+                    // to read when a dragon is NOT fighting and you want to know
+                    // which gate is holding it (asleep, too far, can't see you).
+                    if dragon_trace {
+                        if let Some(d) = duel.as_mut() {
+                            d.trace_t += dt;
+                            if d.trace_t >= 3.0 {
+                                d.trace_t = 0.0;
+                                let pp = local_player.view.position;
+                                let dist = ((pp.x - cr.body.position[0]).powi(2)
+                                    + (pp.y - cr.body.position[1]).powi(2)
+                                    + (pp.z - cr.body.position[2]).powi(2)).sqrt();
+                                log::info!(
+                                    "[dragon#{:04x}] trace: {:.0} m from you at ({:.0},{:.0},{:.0}) you ({:.0},{:.0},{:.0}) asleep={} flying={} hidden={} tactic={} engaged={} hp {}/{} fuel {:.2}",
+                                    d.id & 0xffff, dist,
+                                    cr.body.position[0], cr.body.position[1], cr.body.position[2],
+                                    pp.x, pp.y, pp.z,
+                                    dragon_asleep, *flying, player_hidden, d.state.tactic.name(), d.state.engaged,
+                                    *hp, d.profile.max_hp, d.state.fuel
+                                );
+                            }
+                        }
+                    }
                     if let Some(d) = duel.as_mut().filter(|_| !dragon_asleep) {
                         use unendlich_engine::sim::dragon_duel as dd;
+                        // All geometry goes through the core's adapter
+                        // (senses_for / strikes), which is tested headlessly;
+                        // this block only moves numbers in and effects out.
                         let pp = local_player.view.position;
-                        let dx = pp.x - cr.body.position[0];
-                        let dy = pp.y - cr.body.position[1];
-                        let dz = pp.z - cr.body.position[2];
-                        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
                         let fwd = local_player.forward();
-                        let flen = (fwd.x * fwd.x + fwd.z * fwd.z).sqrt().max(1e-4);
-                        let hlen = (dx * dx + dz * dz).sqrt().max(1e-4);
-                        // player -> dragon is (-dx, -dz)
-                        let player_facing = (fwd.x * -dx + fwd.z * -dz) / (flen * hlen);
-                        let he = cr.body.half_extents;
-                        let body_radius = he[0].max(he[2]);
-                        let o = dd::step(
-                            &mut d.state,
-                            &d.profile,
-                            &dd::DuelSenses {
-                                dist,
-                                self_yaw: cr.yaw,
-                                to_player_yaw: dz.atan2(dx),
-                                player_facing,
-                                can_see: !player_hidden && dist < 64.0,
-                                item: player_threat,
-                                hp01: (*hp).max(0) as f32 / d.profile.max_hp.max(1) as f32,
-                                player_vitality01: fg_app.vitality().energy,
-                                player_whiffed: last_swing_whiffed,
-                                body_radius,
-                            },
-                            duel_tuning,
-                            dt,
+                        let body = dd::DragonBody {
+                            pos: cr.body.position,
+                            yaw: cr.yaw,
+                            half_extents: cr.body.half_extents,
+                        };
+                        let pv = dd::PlayerView {
+                            eye: [pp.x, pp.y, pp.z],
+                            forward: [fwd.x, fwd.y, fwd.z],
+                            hidden: player_hidden,
+                            vitality01: fg_app.vitality().energy,
+                        };
+                        let senses = dd::senses_for(
+                            &body, *hp, d.profile.max_hp, &pv,
+                            player_threat, last_swing_whiffed,
                         );
+                        let dist = senses.dist;
+                        let o = dd::step(&mut d.state, &d.profile, &senses, duel_tuning, dt);
                         let tag = d.id & 0xffff;
                         if o.changed {
                             log::info!("[dragon#{:04x}] {} — {:.0} m", tag, dd::describe(&o), dist);
                         }
                         if o.roar {
                             log::info!(
-                                "[dragon#{:04x}] ROARS — a {} {} (dread {:.2})",
-                                tag, d.profile.element_name(), d.profile.weak_spot.name(), o.dread
+                                "[dragon#{:04x}] ROARS — a {} {:?} at {:.0} m (dread {:.2})",
+                                tag, d.profile.element_name(), d.profile.build, dist,
+                                d.profile.dread * duel_tuning.dread
                             );
                             if cam_shake_on {
-                                shake_mag = shake_mag.max(0.25 + 0.5 * o.dread.max(d.profile.dread));
+                                shake_mag = shake_mag.max(0.25 + 0.5 * d.profile.dread * duel_tuning.dread);
                             }
                         }
-                        if o.breathe {
-                            let off = {
-                                let mut a = (dz.atan2(dx) - cr.yaw).abs();
-                                if a > std::f32::consts::PI { a = std::f32::consts::TAU - a; }
-                                a
-                            };
-                            let dmg = unendlich_engine::sim::breath_attack::damage_at(&d.profile.breath, off, dist);
-                            if dmg > 0.5 {
-                                if survival_mode {
-                                    fg_app.vitality_mut().tick(1.0, dmg * 0.004 * player_dmg_resist);
+                        for k in dd::strikes(&d.profile, &o, &body, pv.eye) {
+                            match k {
+                                dd::Strike::Breath { damage, dist, .. } => {
+                                    if survival_mode {
+                                        fg_app.vitality_mut().tick(1.0, damage * 0.004 * player_dmg_resist);
+                                    }
+                                    log::info!(
+                                        "[dragon#{:04x}] {} BREATH hits you for {:.0} at {:.0} m — vitality {:.0}%",
+                                        tag, d.profile.element_name(), damage, dist, fg_app.vitality().energy * 100.0
+                                    );
                                 }
-                                log::info!(
-                                    "[dragon#{:04x}] {} BREATH hits you for {:.0} at {:.0} m — vitality {:.0}%",
-                                    tag, d.profile.element_name(), dmg, dist, fg_app.vitality().energy * 100.0
-                                );
-                            } else {
-                                log::info!("[dragon#{:04x}] {} breath misses ({:.0} m, {:.2} rad off)", tag, d.profile.element_name(), dist, off);
-                            }
-                        }
-                        if o.bite {
-                            if dist <= body_radius + dd::LUNGE_REACH {
-                                if survival_mode {
-                                    fg_app.vitality_mut().tick(1.0, d.profile.bite_damage * 0.004 * player_dmg_resist);
+                                dd::Strike::BreathMiss { off_axis, dist } => log::info!(
+                                    "[dragon#{:04x}] {} breath misses ({:.0} m, {:.2} rad off)",
+                                    tag, d.profile.element_name(), dist, off_axis
+                                ),
+                                dd::Strike::Bite { damage } => {
+                                    if survival_mode {
+                                        fg_app.vitality_mut().tick(1.0, damage * 0.004 * player_dmg_resist);
+                                    }
+                                    log::info!(
+                                        "[dragon#{:04x}] BITES you for {:.0} — vitality {:.0}%",
+                                        tag, damage, fg_app.vitality().energy * 100.0
+                                    );
                                 }
-                                log::info!(
-                                    "[dragon#{:04x}] BITES you for {:.0} — vitality {:.0}%",
-                                    tag, d.profile.bite_damage, fg_app.vitality().energy * 100.0
-                                );
-                            } else {
-                                log::info!("[dragon#{:04x}] snaps and misses ({:.1} m)", tag, dist);
+                                dd::Strike::BiteMiss { dist } => {
+                                    log::info!("[dragon#{:04x}] snaps and misses ({:.1} m)", tag, dist)
+                                }
                             }
                         }
                         if o.want_air == Some(true) && !*flying {
@@ -10782,21 +10870,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         if o.tactic != dd::Tactic::Unaware {
                             duel_steer = Some((o.heading, o.speed01, o.tactic));
                         }
-                    }
-                    // Ground steering for an engaged dragon. (Airborne steering is
-                    // folded into the flight block below.) The ordinary ground
-                    // wander has already moved it this tick; this turns it toward
-                    // the tactic's heading and advances it on top.
-                    if let (Some((heading, v01, _)), false) = (duel_steer, *flying) {
-                        let e = {
-                            let d = heading - cr.yaw;
-                            (d + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
-                        };
-                        let max_turn = *turn_rate * dt;
-                        cr.yaw += e.clamp(-max_turn, max_turn);
-                        let spd = 5.0 * v01;
-                        cr.body.position[0] += cr.yaw.cos() * spd * dt;
-                        cr.body.position[2] += cr.yaw.sin() * spd * dt;
+                        d.steer = duel_steer.map(|(h, v, _)| (h, v));
                     }
                     if *flying {
                         // An engaged dragon flies at the fight: low for the
@@ -11468,30 +11542,39 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     for (ri, r) in roamers.iter().enumerate() {
                         let p = r.creature.body.position;
                         let to = glm::vec3(p[0] - eye.x, p[1] - eye.y, p[2] - eye.z);
-                        let along = glm::dot(&to, &dir);
-                        // DRAGON DUEL: a dragon is a big target. The old test
-                        // (centre within weapon reach, 1.2 lateral) made most of
-                        // a large dragon's body unhittable: its centre is metres
-                        // inside it. Dragons use their body radius instead.
-                        let (radius, aim_y) = if r.duel.is_some() {
-                            let he = r.creature.body.half_extents;
-                            (he[0].max(he[2]).max(1.0) + 0.3, 0.0)
-                        } else {
-                            (1.2, 0.5)
-                        };
-                        if r.duel.is_some() && glm::length(&to) < attack_reach + radius + 3.0 {
-                            dragon_near = true;
+                        // DRAGON DUEL: a dragon is a big target, tested against
+                        // its body by the core (dragon_duel::swing_touches). The
+                        // old test (centre within weapon reach, 1.2 lateral) made
+                        // most of a large dragon unhittable: its centre is
+                        // metres inside it.
+                        if r.duel.is_some() {
+                            let body = unendlich_engine::sim::dragon_duel::DragonBody {
+                                pos: p,
+                                yaw: r.creature.yaw,
+                                half_extents: r.creature.body.half_extents,
+                            };
+                            if glm::length(&to) < attack_reach + body.radius() + 3.0 {
+                                dragon_near = true;
+                            }
+                            if let Some(along) = unendlich_engine::sim::dragon_duel::swing_touches(
+                                &body, [eye.x, eye.y, eye.z], [dir.x, dir.y, dir.z], attack_reach,
+                            ) {
+                                if best.map_or(true, |(_, d)| along < d) {
+                                    best = Some((ri, along));
+                                }
+                            }
+                            continue;
                         }
-                        let max_along = if r.duel.is_some() { attack_reach + radius } else { attack_reach };
-                        if !(0.5..=max_along.max(0.5 + 0.01)).contains(&along) {
+                        let along = glm::dot(&to, &dir);
+                        if !(0.5..=attack_reach.max(0.5 + 0.01)).contains(&along) {
                             continue;
                         }
                         let closest = eye + dir * along;
                         let lateral = glm::distance(
                             &closest,
-                            &glm::vec3(p[0], p[1] + aim_y, p[2]),
+                            &glm::vec3(p[0], p[1] + 0.5, p[2]),
                         );
-                        if lateral < radius && best.map_or(true, |(_, d)| along < d) {
+                        if lateral < 1.2 && best.map_or(true, |(_, d)| along < d) {
                             best = Some((ri, along));
                         }
                     }
@@ -11576,17 +11659,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             let threat = player_item_threat(
                                 survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
                             );
-                            let zone = dd::hit_zone(
-                                dp, dyaw, he[1], he[0].max(he[2]),
-                                [eye.x, eye.y, eye.z],
-                            );
-                            let h = dd::resolve_item_hit(&d.profile, &threat, zone);
+                            let body = dd::DragonBody { pos: dp, yaw: dyaw, half_extents: he };
+                            let (zone, h) = dd::take_hit(&d.profile, &mut d.state, &body, [eye.x, eye.y, eye.z], &threat);
                             // No crit roll here: the combat-mods crit is folded into
                             // a mass-armor mitigation above that dragons replace
                             // with hide, and can't be separated back out of it.
                             let dealt = h.damage;
-                            let from = glm::distance(&eye, &glm::vec3(dp[0], dp[1], dp[2]));
-                            d.state.mem.learn_hit(threat.element, dealt, d.profile.max_hp, from);
                             log::info!(
                                 "[dragon#{:04x}] hit on the {:?}{} — item ×{:.1} ({} vs {}), hide {:.0} → {} dmg ({}/{} hp)",
                                 d.id & 0xffff, zone,

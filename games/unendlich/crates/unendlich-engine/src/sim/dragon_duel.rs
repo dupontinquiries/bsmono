@@ -398,6 +398,11 @@ pub struct DuelState {
     pub orbit: f32,
     /// Feint phase: `true` while darting in.
     pub feint_in: bool,
+    /// The current Breath tactic has fired. Breath stays committed until it
+    /// fires or [`BREATH_AIM_TIMEOUT`] passes: a slow-turning (flying) dragon
+    /// needs longer than the draw to bring its snout round, and the first
+    /// in-world soak showed one abandoning every breath before it could aim.
+    pub breath_fired: bool,
     pub mem: DuelMemory,
 }
 
@@ -413,6 +418,7 @@ impl DuelState {
             opening: 0.0,
             orbit: if seed & 1 == 0 { 1.0 } else { -1.0 },
             feint_in: true,
+            breath_fired: false,
             mem: DuelMemory::new(),
         }
     }
@@ -473,6 +479,8 @@ const MIN_HOLD: f32 = 0.6;
 const SWITCH_MARGIN: f32 = 0.15;
 const LUNGE_TIME: f32 = 0.55;
 const LUNGE_COOLDOWN: f32 = 2.2;
+/// Longest a Breath tactic waits to line up its shot before giving up.
+pub const BREATH_AIM_TIMEOUT: f32 = 3.0;
 
 #[inline]
 fn wrap(a: f32) -> f32 {
@@ -619,7 +627,7 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
     // Actions finish before anything else is considered.
     let committed = match st.tactic {
         Tactic::Lunge => st.held < LUNGE_TIME,
-        Tactic::Breath => st.held < 0.8,
+        Tactic::Breath => st.held < 0.8 || (!st.breath_fired && st.held < BREATH_AIM_TIMEOUT),
         _ => false,
     };
     let current = score.iter().find(|(t, _)| *t == st.tactic).map_or(f32::MIN, |x| x.1);
@@ -645,7 +653,13 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
     let mut bite = false;
     let mut want_air = None;
     let (heading, speed01, reason) = match st.tactic {
-        Tactic::Stalk => (toward, 0.45, "your back is turned"),
+        // Close fast, then creep: a fixed 0.45 lost ground to a walking player
+        // for two minutes in the second in-world soak, and a speed that eased
+        // off with distance settled into trailing just outside lunge range.
+        Tactic::Stalk => {
+            let v = if dist > lunge_range + 1.0 { 0.9 } else { 0.45 };
+            (toward, v, "your back is turned")
+        }
         Tactic::Circle => {
             if st.held > 6.0 + 4.0 * cunning {
                 st.orbit = -st.orbit;
@@ -681,11 +695,17 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
             (toward, 1.0, if st.opening > 0.0 { "you swung at nothing — opening" } else if flanked { "you are not facing it" } else { "it thinks it can take you" })
         }
         Tactic::Breath => {
+            if changed {
+                st.breath_fired = false;
+            }
             if st.held < 0.4 {
                 (toward, 0.1, "drawing breath")
             } else {
-                if aim_off < p.breath.cone_half_angle && breath_attack::try_breathe(&mut st.fuel, BREATH_COST) {
+                if aim_off < p.breath.cone_half_angle
+                    && breath_attack::try_breathe(&mut st.fuel, BREATH_COST)
+                {
                     breathe = true;
+                    st.breath_fired = true;
                 }
                 (toward, 0.0, if counter > 1.0 { "your item counters it: fighting from range" } else if respect_reach > 2.5 { "your reach is long: fighting from range" } else { "breathing" })
             }
@@ -734,6 +754,149 @@ pub fn describe(o: &DuelOut) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// World adapter: the geometry between a game loop and the stepper
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Everything here used to be inline in the game binary, where no test could
+// reach it: which way the player faces relative to the dragon, the breath's
+// angle off the dragon's snout, whether a bite reaches, whether a swing's ray
+// touches a big body. A shell hands in plain positions and gets back plain
+// numbers; `arena` tests below drive a whole fight through these functions.
+
+/// A dragon's body as the adapter needs it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DragonBody {
+    pub pos: [f32; 3],
+    pub yaw: f32,
+    pub half_extents: [f32; 3],
+}
+
+impl DragonBody {
+    /// Horizontal body radius for reach arithmetic and hit tests.
+    pub fn radius(&self) -> f32 {
+        self.half_extents[0].max(self.half_extents[2]).max(1.0)
+    }
+}
+
+/// The player as the dragon perceives them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerView {
+    pub eye: [f32; 3],
+    /// View direction (need not be normalised; only x/z are used for facing).
+    pub forward: [f32; 3],
+    pub hidden: bool,
+    pub vitality01: f32,
+}
+
+/// Beyond this a dragon cannot see you however bright the day.
+pub const SIGHT_RANGE: f32 = 64.0;
+
+/// Build the senses for one tick.
+pub fn senses_for(
+    body: &DragonBody,
+    hp: i32,
+    max_hp: i32,
+    player: &PlayerView,
+    item: ItemThreat,
+    whiffed: bool,
+) -> DuelSenses {
+    let dx = player.eye[0] - body.pos[0];
+    let dy = player.eye[1] - body.pos[1];
+    let dz = player.eye[2] - body.pos[2];
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+    let flen = (player.forward[0].powi(2) + player.forward[2].powi(2)).sqrt().max(1e-4);
+    let hlen = (dx * dx + dz * dz).sqrt().max(1e-4);
+    // Player -> dragon is (-dx, -dz).
+    let player_facing = (player.forward[0] * -dx + player.forward[2] * -dz) / (flen * hlen);
+    DuelSenses {
+        dist,
+        self_yaw: body.yaw,
+        to_player_yaw: dz.atan2(dx),
+        player_facing,
+        can_see: !player.hidden && dist < SIGHT_RANGE,
+        item: Some(item),
+        hp01: hp.max(0) as f32 / max_hp.max(1) as f32,
+        player_vitality01: player.vitality01,
+        player_whiffed: whiffed,
+        body_radius: body.radius(),
+    }
+}
+
+/// What one tick's output does to the player, in the profile's damage units
+/// (the shell scales these onto its own health model).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Strike {
+    /// Breath landed: damage after cone and range falloff.
+    Breath { damage: f32, off_axis: f32, dist: f32 },
+    BreathMiss { off_axis: f32, dist: f32 },
+    Bite { damage: f32 },
+    BiteMiss { dist: f32 },
+}
+
+/// Resolve the breath and bite in `o` against where the player actually is.
+/// At most two strikes (a breath and a bite cannot share a tick in practice,
+/// but nothing here assumes it).
+pub fn strikes(p: &DuelProfile, o: &DuelOut, body: &DragonBody, player_eye: [f32; 3]) -> Vec<Strike> {
+    let dx = player_eye[0] - body.pos[0];
+    let dy = player_eye[1] - body.pos[1];
+    let dz = player_eye[2] - body.pos[2];
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+    let mut out = Vec::new();
+    if o.breathe {
+        let off_axis = wrap(dz.atan2(dx) - body.yaw).abs();
+        let damage = breath_attack::damage_at(&p.breath, off_axis, dist);
+        out.push(if damage > 0.5 {
+            Strike::Breath { damage, off_axis, dist }
+        } else {
+            Strike::BreathMiss { off_axis, dist }
+        });
+    }
+    if o.bite {
+        out.push(if dist <= body.radius() + LUNGE_REACH {
+            Strike::Bite { damage: p.bite_damage }
+        } else {
+            Strike::BiteMiss { dist }
+        });
+    }
+    out
+}
+
+/// Does a swing from `eye` along `dir` with `reach` touch this body? Returns
+/// the distance along the ray. The body is treated as a vertical capsule of
+/// the body radius; the old shell test (centre within weapon reach, 1.2 m
+/// lateral) could not touch most of a large dragon, whose centre is metres
+/// inside it.
+pub fn swing_touches(body: &DragonBody, eye: [f32; 3], dir: [f32; 3], reach: f32) -> Option<f32> {
+    let dl = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    if !(dl > 1e-6) {
+        return None;
+    }
+    let d = [dir[0] / dl, dir[1] / dl, dir[2] / dl];
+    let to = [body.pos[0] - eye[0], body.pos[1] - eye[1], body.pos[2] - eye[2]];
+    let r = body.radius() + 0.3;
+    let along = to[0] * d[0] + to[1] * d[1] + to[2] * d[2];
+    if !(0.3..=reach + r).contains(&along) {
+        return None;
+    }
+    let c = [eye[0] + d[0] * along, eye[1] + d[1] * along, eye[2] + d[2] * along];
+    let lat_h = ((c[0] - body.pos[0]).powi(2) + (c[2] - body.pos[2]).powi(2)).sqrt();
+    let lat_v = (c[1] - body.pos[1]).abs();
+    (lat_h < r && lat_v < body.half_extents[1].max(0.5) + 0.3).then_some(along)
+}
+
+/// A landed blow, end to end: zone, damage, and what the dragon learns.
+pub fn take_hit(p: &DuelProfile, st: &mut DuelState, body: &DragonBody, eye: [f32; 3], item: &ItemThreat) -> (HitZone, ItemHit) {
+    let zone = hit_zone(body.pos, body.yaw, body.half_extents[1], body.radius(), eye);
+    let h = resolve_item_hit(p, item, zone);
+    let from = ((eye[0] - body.pos[0]).powi(2) + (eye[1] - body.pos[1]).powi(2) + (eye[2] - body.pos[2]).powi(2)).sqrt();
+    // What the dragon remembers is how far from its BODY you hit it, not from
+    // its centre: a spear jab and a dagger stab at a big dragon differ by the
+    // weapon, not by the dragon's size.
+    st.mem.learn_hit(item.element, h.damage, p.max_hp, (from - body.radius()).max(0.0));
+    (zone, h)
+}
 
 #[cfg(test)]
 mod tests {
@@ -885,6 +1048,8 @@ mod tests {
         item: Option<ItemThreat>,
         start: f32,
         secs: f32,
+        /// Dragon turn rate (rad/s): 3 on foot; flying dragons in the game turn at 1.2.
+        turn: f32,
     }
 
     struct Tally {
@@ -933,7 +1098,7 @@ mod tests {
             };
             let o = step(st, p, &s, DuelTuning::default(), dt);
             let e = wrap(o.heading - yaw);
-            yaw = wrap(yaw + e.clamp(-3.0 * dt, 3.0 * dt));
+            yaw = wrap(yaw + e.clamp(-f.turn * dt, f.turn * dt));
             let v = 7.0 * o.speed01 * dt;
             x += yaw.cos() * v;
             z += yaw.sin() * v;
@@ -964,7 +1129,7 @@ mod tests {
         p.ferocity = 0.6;
         let spear = ItemThreat { element: Some(3), damage: 14.0, reach: 3.5 }; // Dust beats Fire
         let dagger = ItemThreat { element: Some(5), damage: 6.0, reach: 1.0 }; // Fire resists Storm
-        let base = Fight { track: 1.5, swing_at: 0.0, item: None, start: 14.0, secs: 20.0 };
+        let base = Fight { track: 1.5, swing_at: 0.0, item: None, start: 14.0, secs: 20.0 , turn: 3.0 };
         let s = fight(&p, &mut DuelState::new(7), &Fight { item: Some(spear), ..base });
         let d = fight(&p, &mut DuelState::new(7), &Fight { item: Some(dagger), ..base });
         assert!(s.breaths > d.breaths, "breaths: spear {} dagger {}", s.breaths, d.breaths);
@@ -980,7 +1145,7 @@ mod tests {
         p.ferocity = 0.6;
         let counter = ItemThreat { element: Some(3), damage: 12.0, reach: 1.5 }; // Dust ×2
         let neutral = ItemThreat { element: Some(0), damage: 12.0, reach: 1.5 }; // Wood ×1
-        let base = Fight { track: 1.5, swing_at: 0.0, item: None, start: 14.0, secs: 20.0 };
+        let base = Fight { track: 1.5, swing_at: 0.0, item: None, start: 14.0, secs: 20.0 , turn: 3.0 };
         let c = fight(&p, &mut DuelState::new(11), &Fight { item: Some(counter), ..base });
         let n = fight(&p, &mut DuelState::new(11), &Fight { item: Some(neutral), ..base });
         assert!(
@@ -998,7 +1163,7 @@ mod tests {
         p.cunning = 0.3; // under the feint gate: the choice is circle vs lunge
         p.ferocity = 0.35;
         p.breath.max_range = 0.0; // breath off: this test is about closing in
-        let base = Fight { track: 4.0, swing_at: 0.0, item: None, start: 12.0, secs: 12.0 };
+        let base = Fight { track: 4.0, swing_at: 0.0, item: None, start: 12.0, secs: 12.0 , turn: 3.0 };
         let mut st = DuelState::new(9);
         let watched = fight(&p, &mut st, &base);
         assert!(share(&watched, Tactic::Circle) > 0.5, "circle share {:.2}", share(&watched, Tactic::Circle));
@@ -1015,7 +1180,7 @@ mod tests {
         p.ferocity = 0.1; // on its own it would not bite a watching player
         p.breath.max_range = 0.0;
         let dagger = Some(ItemThreat { element: None, damage: 6.0, reach: 1.0 });
-        let base = Fight { track: 4.0, swing_at: 0.0, item: dagger, start: 10.0, secs: 15.0 };
+        let base = Fight { track: 4.0, swing_at: 0.0, item: dagger, start: 10.0, secs: 15.0 , turn: 3.0 };
         let mut st = DuelState::new(5);
         let patient = fight(&p, &mut st, &base);
         assert!(share(&patient, Tactic::Feint) > 0.0, "a cunning dragon should feint");
@@ -1104,6 +1269,291 @@ mod tests {
         assert!(line.starts_with(o.tactic.name()), "{line}");
         assert!(line.contains("| next: "), "{line}");
         assert!(!line.contains(&format!("next: {} ", o.tactic.name())), "{line}");
+    }
+
+    // ── world adapter ───────────────────────────────────────────────────────
+
+    fn big_body() -> DragonBody {
+        DragonBody { pos: [0.0, 70.0, 0.0], yaw: 0.0, half_extents: [5.0, 2.5, 3.0] }
+    }
+
+    fn player_at(eye: [f32; 3], forward: [f32; 3]) -> PlayerView {
+        PlayerView { eye, forward, hidden: false, vitality01: 1.0 }
+    }
+
+    #[test]
+    fn senses_for_reads_facing_sight_and_bearing() {
+        let b = big_body();
+        let item = ItemThreat::BARE_HANDS;
+        // Player 20 m out on +x, looking back at the dragon (-x).
+        let s = senses_for(&b, 100, 200, &player_at([20.0, 71.0, 0.0], [-1.0, 0.0, 0.0]), item, false);
+        assert!(s.player_facing > 0.99, "{}", s.player_facing);
+        assert!(s.to_player_yaw.abs() < 1e-3);
+        assert!(s.can_see);
+        assert!((s.hp01 - 0.5).abs() < 1e-6);
+        assert_eq!(s.body_radius, 5.0);
+        // Back turned.
+        let s = senses_for(&b, 100, 200, &player_at([20.0, 71.0, 0.0], [1.0, 0.0, 0.0]), item, false);
+        assert!(s.player_facing < -0.99);
+        // Hidden, or out of sight range.
+        let mut hid = player_at([20.0, 71.0, 0.0], [-1.0, 0.0, 0.0]);
+        hid.hidden = true;
+        assert!(!senses_for(&b, 1, 1, &hid, item, false).can_see);
+        assert!(!senses_for(&b, 1, 1, &player_at([SIGHT_RANGE + 1.0, 70.0, 0.0], [-1.0, 0.0, 0.0]), item, false).can_see);
+    }
+
+    #[test]
+    fn strikes_use_the_real_angle_and_reach() {
+        let p = DuelProfile::from_genome(&genome(4));
+        let b = big_body();
+        let breath = DuelOut { breathe: true, ..idle_out() };
+        let ahead = [p.breath.max_range * 0.5, 70.0, 0.0];
+        let behind = [-p.breath.max_range * 0.5, 70.0, 0.0];
+        assert!(matches!(strikes(&p, &breath, &b, ahead)[..], [Strike::Breath { .. }]));
+        assert!(matches!(strikes(&p, &breath, &b, behind)[..], [Strike::BreathMiss { .. }]));
+        let bite = DuelOut { bite: true, ..idle_out() };
+        // Reach is measured from the body: 5 m radius + LUNGE_REACH.
+        assert!(matches!(strikes(&p, &bite, &b, [5.0 + LUNGE_REACH - 0.2, 70.0, 0.0])[..], [Strike::Bite { .. }]));
+        assert!(matches!(strikes(&p, &bite, &b, [5.0 + LUNGE_REACH + 0.5, 70.0, 0.0])[..], [Strike::BiteMiss { .. }]));
+        assert!(strikes(&p, &idle_out(), &b, ahead).is_empty());
+    }
+
+    fn idle_out() -> DuelOut {
+        DuelOut {
+            tactic: Tactic::Circle,
+            changed: false,
+            heading: 0.0,
+            speed01: 0.0,
+            want_air: None,
+            breathe: false,
+            bite: false,
+            roar: false,
+            dread: 0.0,
+            why: Why { boldness: 0.0, counter: 1.0, respect_reach: 1.0, safe_gap: 1.0, reason: "" },
+            scores: [(Tactic::Circle, 0.0); 6],
+        }
+    }
+
+    #[test]
+    fn a_swing_reaches_a_big_body_from_outside_it() {
+        let b = big_body();
+        // Eye 6 m from centre = 1 m from the flank-to-snout surface; 1.5 m blade.
+        let eye = [6.0, 70.5, 0.0];
+        assert!(swing_touches(&b, eye, [-1.0, 0.0, 0.0], 1.5).is_some());
+        // The old test (centre within weapon reach) could not: 6 m > 1.5 m.
+        // Swinging at the sky, or away, touches nothing.
+        assert!(swing_touches(&b, eye, [0.0, 1.0, 0.0], 1.5).is_none());
+        assert!(swing_touches(&b, eye, [1.0, 0.0, 0.0], 1.5).is_none());
+        // Too far out for the blade.
+        assert!(swing_touches(&b, [9.0, 70.5, 0.0], [-1.0, 0.0, 0.0], 1.5).is_none());
+        // Well above its back.
+        assert!(swing_touches(&b, [6.0, 76.0, 0.0], [-1.0, 0.0, 0.0], 1.5).is_none());
+        assert!(swing_touches(&b, eye, [0.0, 0.0, 0.0], 1.5).is_none());
+    }
+
+    #[test]
+    fn take_hit_remembers_distance_from_the_body_not_the_centre() {
+        let p = DuelProfile::from_genome(&genome(1));
+        let mut st = DuelState::new(0);
+        let b = big_body();
+        let spear = ItemThreat { element: None, damage: 10.0, reach: 3.5 };
+        let (zone, h) = take_hit(&p, &mut st, &b, [8.0, 70.5, 0.0], &spear);
+        assert_eq!(zone, HitZone::Front);
+        assert!(h.damage > 0);
+        assert!((st.mem.reach_seen - 3.0).abs() < 0.1, "remembered {}", st.mem.reach_seen);
+        assert_eq!(st.mem.hits_taken, 1);
+    }
+
+    /// A whole fight through the adapter: the shell's geometry, the stepper,
+    /// strikes both ways. The player walks at the dragon, keeps facing it, and
+    /// swings a spear whenever `swing_touches`; a swing that touches nothing
+    /// within a few metres of the body is a whiff.
+    struct Bout {
+        dragon_hp: i32,
+        player_hp: f32,
+        player_hits: u32,
+        whiffs: u32,
+        breath_hits: u32,
+        bites: u32,
+        retreated_at: Option<f32>,
+        hp_at_retreat: i32,
+        hits_after_retreat: u32,
+        last_dist: f32,
+        seen: std::collections::BTreeSet<&'static str>,
+    }
+
+    fn bout(p: &DuelProfile, item: ItemThreat, secs: f32) -> (Bout, DuelState) {
+        let dt = 0.05;
+        let mut st = DuelState::new(3);
+        let mut body = DragonBody { pos: [30.0, 70.0, 0.0], yaw: std::f32::consts::PI, half_extents: [3.0, 2.0, 2.0] };
+        let mut eye = [0.0f32, 70.5, 0.0];
+        let mut b = Bout {
+            dragon_hp: p.max_hp,
+            player_hp: 100.0,
+            player_hits: 0,
+            whiffs: 0,
+            breath_hits: 0,
+            bites: 0,
+            retreated_at: None,
+            hp_at_retreat: 0,
+            hits_after_retreat: 0,
+            last_dist: 0.0,
+            seen: Default::default(),
+        };
+        let mut swing_cd = 0.0f32;
+        let mut whiffed = false;
+        for i in 0..(secs / dt) as usize {
+            let t = i as f32 * dt;
+            let to = [body.pos[0] - eye[0], 0.0, body.pos[2] - eye[2]];
+            let hd = (to[0] * to[0] + to[2] * to[2]).sqrt().max(1e-3);
+            let fwd = [to[0] / hd, 0.0, to[2] / hd];
+            // Player: close to just inside spear reach of the body, then hold.
+            let want = body.radius() + item.reach * 0.8;
+            if hd > want {
+                eye[0] += fwd[0] * 4.0 * dt;
+                eye[2] += fwd[2] * 4.0 * dt;
+            }
+            let pv = PlayerView { eye, forward: fwd, hidden: false, vitality01: b.player_hp / 100.0 };
+            let s = senses_for(&body, b.dragon_hp, p.max_hp, &pv, item, whiffed);
+            let o = step(&mut st, p, &s, DuelTuning::default(), dt);
+            b.seen.insert(o.tactic.name());
+            if o.tactic == Tactic::Retreat && b.retreated_at.is_none() {
+                b.retreated_at = Some(t);
+                b.hp_at_retreat = b.dragon_hp;
+            }
+            for k in strikes(p, &o, &body, eye) {
+                match k {
+                    Strike::Breath { damage, .. } => {
+                        b.breath_hits += 1;
+                        b.player_hp -= damage * 0.4;
+                    }
+                    Strike::Bite { damage } => {
+                        b.bites += 1;
+                        b.player_hp -= damage * 0.4;
+                    }
+                    _ => {}
+                }
+            }
+            // Dragon moves by its own output.
+            let e = wrap(o.heading - body.yaw);
+            body.yaw = wrap(body.yaw + e.clamp(-2.5 * dt, 2.5 * dt));
+            body.pos[0] += body.yaw.cos() * 7.0 * o.speed01 * dt;
+            body.pos[2] += body.yaw.sin() * 7.0 * o.speed01 * dt;
+            // Player swings on a cooldown whenever the dragon is anywhere near.
+            swing_cd = (swing_cd - dt).max(0.0);
+            whiffed = false;
+            if swing_cd <= 0.0 && hd < body.radius() + item.reach + 3.0 {
+                swing_cd = 0.7;
+                let dir = [fwd[0], 0.0, fwd[2]];
+                if swing_touches(&body, eye, dir, item.reach).is_some() {
+                    let (_, h) = take_hit(p, &mut st, &body, eye, &item);
+                    b.dragon_hp -= h.damage;
+                    b.player_hits += 1;
+                    if b.retreated_at.is_some() {
+                        b.hits_after_retreat += 1;
+                    }
+                } else {
+                    whiffed = true;
+                    b.whiffs += 1;
+                }
+            }
+            b.last_dist = hd;
+            if b.dragon_hp <= 0 || b.player_hp <= 0.0 {
+                break;
+            }
+        }
+        (b, st)
+    }
+
+    #[test]
+    fn a_whole_fight_runs_both_ways_through_the_adapter() {
+        let mut p = DuelProfile::from_genome(&genome(4)); // Fire
+        p.cunning = 0.6;
+        p.ferocity = 0.7;
+        let spear = ItemThreat { element: Some(3), damage: 30.0, reach: 3.5 }; // Dust: counters Fire
+        let (b, st) = bout(&p, spear, 90.0);
+        assert!(b.player_hits > 0, "the player never landed a blow");
+        assert!(b.breath_hits + b.bites > 0, "the dragon never landed anything");
+        assert!(b.dragon_hp < p.max_hp);
+        assert!(st.mem.hits_taken as u32 == b.player_hits);
+        // It learned the spear from the body surface, near the spear's reach.
+        assert!(st.mem.reach_seen > 1.5 && st.mem.reach_seen < spear.reach + 1.0, "reach_seen {}", st.mem.reach_seen);
+        assert!(b.seen.len() >= 3, "tactics used: {:?}", b.seen);
+    }
+
+    #[test]
+    fn a_losing_dragon_breaks_off() {
+        let mut p = DuelProfile::from_genome(&genome(4));
+        p.cunning = 0.7;
+        p.ferocity = 0.9; // it will come to you, and pay for it
+        p.max_hp = 300; // several blows to get there, so there is a choice to make
+        let spear = ItemThreat { element: Some(3), damage: 25.0, reach: 3.5 };
+        let (b, _) = bout(&p, spear, 120.0);
+        let t = b.retreated_at.expect("a dragon taking counter-element spear hits should retreat");
+        assert!(t > 1.0);
+        assert!(b.dragon_hp > 0, "it should break off before dying (hp {})", b.dragon_hp);
+        // It breaks off inside its threshold (0.18 + 0.2·cunning) plus one blow of slack...
+        assert!(b.hp_at_retreat as f32 / p.max_hp as f32 <= 0.18 + 0.2 * p.cunning + 0.01, "{}", b.hp_at_retreat);
+        // ...and actually gets away from a pursuer on foot.
+        assert!(b.hits_after_retreat <= 2, "hit {} times while fleeing", b.hits_after_retreat);
+        assert!(b.last_dist > 30.0, "only {:.1} m away at the end", b.last_dist);
+    }
+
+    #[test]
+    fn a_committed_breath_waits_for_a_slow_turn() {
+        // Reproduces the first in-world soak: a flying dragon (1.2 rad/s)
+        // entered Breath facing away; before its snout came round the player
+        // turned their back, Stalk outscored Breath, and the breath was
+        // abandoned unfired -- twice. Breath now stays committed until it fires
+        // or BREATH_AIM_TIMEOUT.
+        let mut p = DuelProfile::from_genome(&genome(1));
+        p.cunning = 1.0; // stalk scores 0.8 against breath's 0.45
+        let mut st = DuelState::new(1);
+        st.engaged = true;
+        st.roared = true;
+        st.tactic = Tactic::Breath;
+        let mut s = senses(p.breath.max_range * 0.6);
+        s.player_facing = -1.0;
+        let mut yaw = PI; // facing directly away
+        let (mut shots, mut left_unfired) = (0, false);
+        for _ in 0..(4.0 / 0.05) as usize {
+            s.self_yaw = yaw;
+            let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
+            if o.changed && shots == 0 {
+                left_unfired = true;
+            }
+            shots += o.breathe as usize;
+            yaw = wrap(yaw + wrap(o.heading - yaw).clamp(-1.2 * 0.05, 1.2 * 0.05));
+        }
+        assert!(!left_unfired, "abandoned the breath before it could aim");
+        assert_eq!(shots, 1);
+        assert!(BREATH_AIM_TIMEOUT > PI / 1.2, "timeout must cover a half-turn at flight turn rate");
+    }
+
+    #[test]
+    fn a_stalker_catches_someone_walking_away() {
+        // Player walks away at 4 m/s with their back turned; the dragon runs at
+        // 8 m/s × speed01 (the game's DUEL_GROUND_SPEED).
+        let mut p = DuelProfile::from_genome(&genome(2));
+        p.cunning = 0.8;
+        p.ferocity = 0.5;
+        p.breath.max_range = 0.0;
+        let mut st = DuelState::new(1);
+        let (mut px, mut dx, mut yaw) = (0.0f32, -12.0f32, 0.0f32);
+        let mut bit = false;
+        for _ in 0..(30.0 / 0.05) as usize {
+            px += 4.0 * 0.05;
+            let dist = (px - dx).abs();
+            let mut s = senses(dist);
+            s.self_yaw = yaw;
+            s.to_player_yaw = 0.0;
+            s.player_facing = -1.0;
+            let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
+            bit |= o.bite;
+            yaw = wrap(yaw + wrap(o.heading - yaw).clamp(-3.0 * 0.05, 3.0 * 0.05));
+            dx = (dx + yaw.cos() * 8.0 * o.speed01 * 0.05).min(px - 2.0);
+        }
+        assert!(bit, "never caught up; ended {:.1} m behind", px - dx);
     }
 
     #[test]
