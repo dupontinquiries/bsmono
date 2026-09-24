@@ -11,6 +11,7 @@
 //! default, built-in default) and the file's text, so what the app did is
 //! always checkable on disk.
 
+pub mod scale;
 pub mod speaker;
 
 use cosmic_levers::{Control, Lever, Reading, Source, Store, Value};
@@ -30,12 +31,17 @@ pub enum Action {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Cosmic,
+    Display,
     Speaker,
 }
 
 pub struct App {
     pub screen: Screen,
     pub speaker: speaker::Speaker,
+    /// The shell's own prefs, read from the file the shell reads. Held here
+    /// rather than re-read per frame: the Display screen edits them and
+    /// writes them back, and re-reading under the finger would fight it.
+    pub shell_prefs: tideshell_core::prefs::ShellPrefs,
     pub store: Store,
     pub levers: Vec<Lever>,
     pub readings: Vec<Reading>,
@@ -54,7 +60,7 @@ impl App {
     pub fn new(store: Store) -> App {
         let levers = cosmic_levers::levers();
         let readings = levers.iter().map(|l| store.read(l)).collect();
-        App { screen: Screen::Cosmic, speaker: speaker::Speaker::default(), store, levers, readings, details: None, status: String::new(), last_read: Instant::now() }
+        App { screen: Screen::Cosmic, speaker: speaker::Speaker::default(), shell_prefs: scale::load(), store, levers, readings, details: None, status: String::new(), last_read: Instant::now() }
     }
 
     pub fn reread(&mut self) {
@@ -104,6 +110,9 @@ impl App {
                 if big(ui, "COSMIC", screen == Screen::Cosmic) {
                     want_screen = Screen::Cosmic;
                 }
+                if big(ui, "Display", screen == Screen::Display) {
+                    want_screen = Screen::Display;
+                }
                 if big(ui, "Speaker", screen == Screen::Speaker) {
                     want_screen = Screen::Speaker;
                 }
@@ -112,6 +121,14 @@ impl App {
                 ui.label(egui::RichText::new(&self.status).small());
             }
             ui.add_space(8.0);
+            if screen == Screen::Display {
+                let mut st = std::mem::take(&mut self.status);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    scale::ui(&mut self.shell_prefs, ui, &mut st);
+                });
+                self.status = st;
+                return;
+            }
             if screen == Screen::Speaker {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     speaker::ui(&mut self.speaker, ui, TOUCH_H);

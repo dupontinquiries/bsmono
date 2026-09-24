@@ -70,6 +70,17 @@ pub struct ShellPrefs {
     /// accessibility and off by default: it trades bit depth for a screen
     /// that can be looked at in the dark, which is a choice, not a default.
     pub digital_dim: bool,
+    /// Text size across the shell, 1.0 = the design size. Separate from
+    /// `touch_scale` because they solve different problems: long sight wants
+    /// bigger text, unsteady or gloved hands want bigger targets, and a
+    /// person can need one without the other.
+    pub text_scale: f32,
+    /// Control and hit-target size, 1.0 = the design size.
+    pub touch_scale: f32,
+    /// A floor on interactive size in points, 0 = let the device class
+    /// decide. Set by someone who knows what their hands need better than a
+    /// heuristic does.
+    pub min_target: f32,
     /// Cold mode: auto (battery temperature), on, off.
     pub cold: String,
     /// Ambient loudness from the microphone (notification gain). The mic is
@@ -103,6 +114,9 @@ impl Default for ShellPrefs {
             palette_recent: String::new(),
             brightness_mode: "auto".into(),
             digital_dim: false,
+            text_scale: 1.0,
+            touch_scale: 1.0,
+            min_target: 0.0,
             hemisphere: "north".into(),
             living: true,
             cold: "auto".into(),
@@ -116,7 +130,15 @@ impl Default for ShellPrefs {
     }
 }
 
-pub const KEYS: [&str; 24] = [
+/// A scale multiplier, clamped to what leaves the shell usable. Below about
+/// 0.7 the text stops being legible on a phone and above 2.0 the controls
+/// stop fitting; either extreme makes the settings screen itself unusable,
+/// which is the one screen that must keep working.
+pub fn parse_scale(v: &str) -> Option<f32> {
+    v.parse::<f32>().ok().filter(|f| f.is_finite()).map(|f| f.clamp(0.7, 2.0))
+}
+
+pub const KEYS: [&str; 27] = [
     "shell.layout",
     "shell.bar.widgets",
     "shell.bar.width",
@@ -132,6 +154,9 @@ pub const KEYS: [&str; 24] = [
     "shell.palette.recent",
     "shell.brightness.mode",
     "shell.brightness.digital",
+    "shell.scale.text",
+    "shell.scale.touch",
+    "shell.scale.min_target",
     "shell.hemisphere",
     "shell.living",
     "shell.cold",
@@ -168,6 +193,9 @@ impl ShellPrefs {
             ("shell.palette.recent".into(), self.palette_recent.clone()),
             ("shell.brightness.mode".into(), self.brightness_mode.clone()),
             ("shell.brightness.digital".into(), if self.digital_dim { "on" } else { "off" }.into()),
+            ("shell.scale.text".into(), format!("{:.2}", self.text_scale)),
+            ("shell.scale.touch".into(), format!("{:.2}", self.touch_scale)),
+            ("shell.scale.min_target".into(), format!("{:.0}", self.min_target)),
             ("shell.hemisphere".into(), self.hemisphere.clone()),
             ("shell.living".into(), if self.living { "on" } else { "off" }.into()),
             ("shell.cold".into(), self.cold.clone()),
@@ -221,6 +249,14 @@ impl ShellPrefs {
             "shell.hold_ms" => self.hold_ms = parse_range(key, v, 200.0, 1500.0)? as u64,
             "shell.trackpad.speed" => self.trackpad_speed = parse_range(key, v, 0.25, 4.0)?,
             "shell.brightness.digital" => self.digital_dim = matches!(v, "on" | "true" | "1"),
+            // Clamped rather than rejected. A prefs file edited by hand to
+            // 0.1 should make the shell small, not unusable: a shell nobody
+            // can read cannot be used to fix itself.
+            "shell.scale.text" => self.text_scale = crate::prefs::parse_scale(v).ok_or_else(|| format!("shell.scale.text: '{v}' is not a number"))?,
+            "shell.scale.touch" => self.touch_scale = crate::prefs::parse_scale(v).ok_or_else(|| format!("shell.scale.touch: '{v}' is not a number"))?,
+            "shell.scale.min_target" => {
+                self.min_target = v.parse::<f32>().ok().filter(|f| f.is_finite()).map(|f| f.clamp(0.0, 96.0)).ok_or_else(|| format!("shell.scale.min_target: '{v}' is not a size in points"))?
+            }
             "shell.brightness.auto" => {
                 self.auto_brightness = match v {
                     "on" => true,
@@ -389,5 +425,57 @@ mod tests {
         p.layout = Layout::RightBar;
         let c = p.edge_config();
         assert!(!c.top_enabled && !c.right_enabled, "the bar owns the right edge");
+    }
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    #[test]
+    fn a_hand_edited_extreme_is_clamped_not_rejected() {
+        // A shell nobody can read cannot be used to fix itself, so a silly
+        // number becomes a survivable one rather than an error that leaves
+        // the old value or refuses to load.
+        let mut p = ShellPrefs::default();
+        p.apply("shell.scale.text", "9").unwrap();
+        assert_eq!(p.text_scale, 2.0);
+        p.apply("shell.scale.text", "0.01").unwrap();
+        assert_eq!(p.text_scale, 0.7);
+        p.apply("shell.scale.touch", "1.25").unwrap();
+        assert_eq!(p.touch_scale, 1.25);
+        // Not a number at all is a real error: it is a typo, not a wish.
+        assert!(p.apply("shell.scale.text", "large").is_err());
+        assert!(p.apply("shell.scale.min_target", "").is_err());
+    }
+
+    #[test]
+    fn text_and_target_scale_independently() {
+        // Long sight wants bigger text; unsteady or gloved hands want bigger
+        // targets. A person can need one without the other, so one slider
+        // for both would force a compromise nobody asked for.
+        let mut p = ShellPrefs::default();
+        p.apply("shell.scale.text", "1.6").unwrap();
+        assert_eq!(p.touch_scale, 1.0);
+        assert_eq!(p.min_target, 0.0);
+    }
+
+    #[test]
+    fn the_scale_keys_survive_a_round_trip() {
+        let mut p = ShellPrefs::default();
+        p.text_scale = 1.3;
+        p.touch_scale = 1.5;
+        p.min_target = 56.0;
+        let mut back = ShellPrefs::default();
+        for (k, v) in p.to_kv() {
+            let _ = back.apply(&k, &v);
+        }
+        assert_eq!(back.text_scale, 1.3);
+        assert_eq!(back.touch_scale, 1.5);
+        assert_eq!(back.min_target, 56.0);
+        // And every key is declared, or settingsd would not know about them.
+        for k in ["shell.scale.text", "shell.scale.touch", "shell.scale.min_target"] {
+            assert!(KEYS.contains(&k), "{k} missing from KEYS");
+        }
     }
 }
