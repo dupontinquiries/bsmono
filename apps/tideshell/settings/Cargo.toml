@@ -1,0 +1,21 @@
+[package]
+name = "tideshell-settings"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Touch settings for COSMIC on a phone (cosmic-settings has no touch support): big rows, drag to scroll, each setting shows the file it lives in. Engine: shared/cosmic-levers; UI: egui on uikit-egui."
+
+[[bin]]
+name = "tideshell-settings"
+path = "src/bin/tideshell_settings.rs"
+required-features = ["app"]
+
+[features]
+default = ["app"]
+app = ["dep:eframe"]
+
+[dependencies]
+cosmic-levers = { path = "../../../shared/cosmic-levers" }
+egui = "0.34"
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }

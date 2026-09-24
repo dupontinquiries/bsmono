@@ -17,6 +17,7 @@ podman run --rm --platform linux/arm64 \
     cd /src/apps/tideshell/egui-frontend
     cargo build --release --locked --no-default-features --features layer,ei --bin tideshell
     cp target/release/tideshell /out/
+    cd /src/apps/tideshell/settings && cargo build --release --locked --bin tideshell-settings && cp target/release/tideshell-settings /out/
     cd /src/system/comfortgov && cargo build --release && cp target/release/comfortgov /out/
     file /out/tideshell || true'
 echo "built: $(ls -la out/)"
