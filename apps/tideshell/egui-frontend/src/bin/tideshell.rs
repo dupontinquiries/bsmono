@@ -1073,11 +1073,15 @@ fn main() {
                 continue;
             };
             let events = side_events.remove(&role).unwrap_or_default();
+            // A configure is not an egui event, so a resize arriving while
+            // egui wants no frame would be skipped and never repainted at
+            // the new size. Compare against what was last actually painted.
+            let resized = last_frame_hash.get(&role).is_some_and(|(_, was)| *was != t.size_px());
             // Before prepare and bind, not after: binding is an
             // eglMakeCurrent, and doing one per surface per iteration to
             // then decide there was nothing to draw is the cost this check
             // exists to avoid.
-            if events.is_empty() && side_due.get(&role).is_some_and(|due| now_ms < *due) {
+            if events.is_empty() && !resized && side_due.get(&role).is_some_and(|due| now_ms < *due) {
                 continue;
             }
             t.prepare(&mut io);
