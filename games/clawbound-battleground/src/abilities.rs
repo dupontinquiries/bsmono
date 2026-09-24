@@ -315,8 +315,8 @@ pub fn point_segment_dist(p: Vec3, a: Vec3, b: Vec3) -> f32 {
 
 pub fn clamp_arena(mut p: Vec3) -> Vec3 {
     let r = Vec3::new(p.x, 0.0, p.z).length();
-    if r > crate::consts::ARENA_RADIUS - 2.0 {
-        let s = (crate::consts::ARENA_RADIUS - 2.0) / r;
+    if r > crate::consts::arena_radius() - 2.0 {
+        let s = (crate::consts::arena_radius() - 2.0) / r;
         p.x *= s;
         p.z *= s;
     }

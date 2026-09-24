@@ -32,29 +32,45 @@ use crate::floor::FloorPlan;
 /// Players per team on this map.
 pub const TEAM_SIZE: usize = 15;
 
+/// The map's scale. Every authored point below is multiplied by it: the pass
+/// was laid out at 1.0 for 15 a side and grew by this much so thirty cats
+/// have room to spread. One factor, so the shape is exactly the tested one,
+/// only bigger. Lane WIDTHS grew by more than this (see `floor`).
+pub const S: f32 = 1.3;
+
+/// Playable radius and rendered-terrain half-extent on this map
+/// (`consts::arena_radius`, `consts::ground_half`).
+pub const ARENA_RADIUS: f32 = 218.0;
+pub const GROUND_HALF: f32 = 300.0;
+
 /// The two peaks' centres (x, z) and their height above the plateau.
-pub const PEAKS: [(f32, f32); 2] = [(-60.0, 0.0), (60.0, 0.0)];
-pub const PEAK_HEIGHT: f32 = 96.0;
-pub const PEAK_WIDTH: f32 = 34.0;
+pub const PEAKS: [(f32, f32); 2] = [(-60.0 * S, 0.0), (60.0 * S, 0.0)];
+pub const PEAK_HEIGHT: f32 = 110.0;
+pub const PEAK_WIDTH: f32 = 34.0 * S;
 
 /// Base (nexus) distance from the centre, along z.
-pub const BASE_Z: f32 = 138.0;
+pub const BASE_Z: f32 = 138.0 * S;
 
 pub fn base_pos(team: Team) -> Vec3 {
     Vec3::new(0.0, 0.0, -team.push_z() * BASE_Z)
 }
 pub fn fountain(team: Team) -> Vec3 {
-    Vec3::new(0.0, 0.0, -team.push_z() * (BASE_Z + 9.0))
+    Vec3::new(0.0, 0.0, -team.push_z() * (BASE_Z + 9.0 * S))
 }
 pub fn titan_pos(team: Team) -> Vec3 {
-    Vec3::new(0.0, 0.0, -team.push_z() * (BASE_Z - 12.0))
+    Vec3::new(0.0, 0.0, -team.push_z() * (BASE_Z - 12.0 * S))
+}
+
+/// An authored (blue-half) point in world space.
+fn at(x: f32, z: f32) -> Vec3 {
+    Vec3::new(x * S, 0.0, z * S)
 }
 
 fn mirror_z(pts: &[(f32, f32)]) -> Vec<Vec3> {
     // blue half as given, then the red half reflected, meeting on z = 0
-    let mut v: Vec<Vec3> = pts.iter().map(|&(x, z)| Vec3::new(x, 0.0, z)).collect();
+    let mut v: Vec<Vec3> = pts.iter().map(|&(x, z)| at(x, z)).collect();
     let last_on_axis = pts.last().is_some_and(|p| p.1 == 0.0);
-    let back: Vec<Vec3> = pts.iter().rev().skip(last_on_axis as usize).map(|&(x, z)| Vec3::new(x, 0.0, -z)).collect();
+    let back: Vec<Vec3> = pts.iter().rev().skip(last_on_axis as usize).map(|&(x, z)| at(x, -z)).collect();
     v.extend(back);
     v
 }
@@ -77,7 +93,7 @@ pub fn tower_pos(lane: Lane, team: Team, inner: bool) -> Vec3 {
     if team == Team::Red {
         pts.reverse();
     }
-    let s = match (lane, inner) {
+    let s = S * match (lane, inner) {
         (Lane::Mid, true) => 30.0,
         (Lane::Mid, false) => 62.0,
         (_, true) => 44.0,
@@ -154,52 +170,141 @@ pub fn floor() -> &'static FloorPlan {
         let mut s = Vec::new();
         let seg = |a: Vec3, b: Vec3, r: f32| Shape::Segment { x0: a.x, z0: a.z, x1: b.x, z1: b.z, r };
         for lane in crate::consts::LANES {
-            let pts = lane_polyline(lane);
-            let r = if lane == Lane::Mid { 8.5 } else { 7.5 };
-            for w in pts.windows(2) {
-                s.push(seg(w[0], w[1], r));
-            }
+            s.extend(lane_shapes(lane));
         }
         for team in [Team::Blue, Team::Red] {
             let b = base_pos(team);
-            s.push(Shape::Circle { x: b.x, z: b.z, r: 24.0 });
+            s.push(Shape::Circle { x: b.x, z: b.z, r: 24.0 * S });
             let f = fountain(team);
-            s.push(Shape::Circle { x: f.x, z: f.z, r: 12.0 });
+            s.push(Shape::Circle { x: f.x, z: f.z, r: 12.0 * S });
         }
-        for &(x, z, r) in &CLEARINGS {
-            s.push(Shape::Circle { x, z, r });
-            s.push(Shape::Circle { x, z: -z, r });
-        }
-        for &(x, z, r) in &CENTRE_CLEARINGS {
+        for (x, z, r) in clearings() {
             s.push(Shape::Circle { x, z, r });
         }
         for &((ax, az), (bx, bz)) in &LEDGES {
-            s.push(seg(Vec3::new(ax, 0.0, az), Vec3::new(bx, 0.0, bz), 3.2));
-            s.push(seg(Vec3::new(ax, 0.0, -az), Vec3::new(bx, 0.0, -bz), 3.2));
+            s.push(seg(at(ax, az), at(bx, bz), LEDGE_R));
+            s.push(seg(at(ax, -az), at(bx, -bz), LEDGE_R));
         }
         for &((ax, az), (bx, bz)) in &SLOTS {
-            s.push(seg(Vec3::new(ax, 0.0, az), Vec3::new(bx, 0.0, bz), 4.2));
-            s.push(seg(Vec3::new(ax, 0.0, -az), Vec3::new(bx, 0.0, -bz), 4.2));
+            s.push(seg(at(ax, az), at(bx, bz), SLOT_R));
+            s.push(seg(at(ax, -az), at(bx, -bz), SLOT_R));
         }
         FloorPlan::new(s)
     })
 }
 
+/// Lane half-widths: wider than the scale alone gives (asked for: room for
+/// thirty cats to spread), then pinched to `CHOKE_R` at the chokes.
+pub const MID_R: f32 = 12.0;
+pub const SIDE_R: f32 = 10.5;
+pub const LEDGE_R: f32 = 4.0;
+pub const SLOT_R: f32 = 5.4;
+/// Half-width of a choke's narrows: a 7.6 u gap, room for a few cats
+/// abreast and not a wave.
+pub const CHOKE_R: f32 = 3.8;
+/// Where each lane pinches, as fractions of its length from the blue end.
+/// Mirrored pairs, so both teams meet each choke at the same distance. Just
+/// beyond each outer tower, toward the centre -- and never at a ledge's
+/// mouth: a ledge joining at 0.36 on Top widened that choke to 12.3 u
+/// (`the_chokes_pinch_...` caught it).
+pub const CHOKES: [(Lane, f32); 6] = [(Lane::Mid, 0.32), (Lane::Mid, 0.68), (Lane::Top, 0.3), (Lane::Top, 0.7), (Lane::Bot, 0.3), (Lane::Bot, 0.7)];
+/// Length of the tapered approach either side of a choke's narrowest point.
+const TAPER: f32 = 14.0;
+
+/// A lane's floor: capsules along its centre-line, wide, narrowing into
+/// each choke. A pinch has to be built this way round: the floor is a
+/// UNION, so a narrow capsule over a wide one changes nothing. The wide
+/// runs stop a full lane-width short of the choke (their round ends then
+/// reach exactly its centre, at zero offset only) and short capsules of
+/// shrinking radius fill the gap -- a funnel with curved walls.
+pub fn lane_shapes(lane: Lane) -> Vec<Shape> {
+    let pts = lane_polyline(lane);
+    let r_wide = if lane == Lane::Mid { MID_R } else { SIDE_R };
+    let len: f32 = pts.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+    let chokes: Vec<f32> = CHOKES.iter().filter(|c| c.0 == lane).map(|c| c.1 * len).collect();
+    // width at distance s along the lane
+    let width = |s: f32| {
+        chokes.iter().fold(r_wide, |w, &c| {
+            let d = ((s - c).abs() / TAPER).clamp(0.0, 1.0);
+            let t = d * d * (3.0 - 2.0 * d);
+            w.min(CHOKE_R + (r_wide - CHOKE_R) * t)
+        })
+    };
+    let seg = |a: Vec3, b: Vec3, r: f32| Shape::Segment { x0: a.x, z0: a.z, x1: b.x, z1: b.z, r };
+    let mut out = Vec::new();
+    // breakpoints: wide spans between chokes, fine steps through each funnel
+    let mut marks = vec![0.0f32, len];
+    // the polyline's own corners: a span between two breakpoints is ONE
+    // straight capsule, and without these it cut across the lane's bends
+    // (the first version pinched Top near its start and broke symmetry)
+    let mut acc = 0.0;
+    for w in pts.windows(2) {
+        acc += (w[1] - w[0]).length();
+        marks.push(acc);
+    }
+    for &c in &chokes {
+        let (lo, hi) = (c - TAPER - r_wide, c + TAPER + r_wide);
+        // an exact division of the funnel, so a choke and its mirror are
+        // sampled at mirrored points (stepping 1.5 from `lo` was not, and
+        // the two halves' walls differed by centimetres)
+        let n = ((hi - lo) / 1.5).ceil().max(1.0) as usize;
+        for k in 0..=n {
+            marks.push((lo + (hi - lo) * k as f32 / n as f32).clamp(0.0, len));
+        }
+    }
+    marks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    marks.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+    for w in marks.windows(2) {
+        let (s0, s1) = (w[0], w[1]);
+        let in_funnel = chokes.iter().any(|&c| s1 > c - TAPER - r_wide && s0 < c + TAPER + r_wide);
+        // in a funnel, a piece is as narrow as its narrower end AND must
+        // not let its round cap bulge past the next piece's width
+        let r = if in_funnel { width(s0).min(width(s1)) } else { r_wide };
+        let (a, b) = (along(&pts, s0), along(&pts, s1));
+        if in_funnel {
+            out.push(seg(a, b, r));
+        } else {
+            // a wide span that ends at a funnel is pulled back by its radius
+            // so its cap does not flood the narrows
+            let near = |s: f32| chokes.iter().any(|&c| (s - (c - TAPER - r_wide)).abs() < 1e-3 || (s - (c + TAPER + r_wide)).abs() < 1e-3);
+            let dir = (b - a).normalize_or_zero();
+            let a2 = if near(s0) { a + dir * (r_wide - width(s0)).max(0.0) } else { a };
+            let b2 = if near(s1) { b - dir * (r_wide - width(s1)).max(0.0) } else { b };
+            out.push(seg(a2, b2, r));
+        }
+    }
+    out
+}
+
+/// The narrowest point of every choke, and the lane's direction there.
+pub fn choke_points() -> Vec<(Vec3, Vec3)> {
+    CHOKES
+        .iter()
+        .map(|&(lane, f)| {
+            let pts = lane_polyline(lane);
+            let len: f32 = pts.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+            let p = along(&pts, f * len);
+            let q = along(&pts, f * len + 1.0);
+            (p, (q - p).normalize_or_zero())
+        })
+        .collect()
+}
+
 /// The clearings, both halves: (x, z, radius).
 pub fn clearings() -> Vec<(f32, f32, f32)> {
-    let mut v: Vec<_> = CLEARINGS.iter().flat_map(|&(x, z, r)| [(x, z, r), (x, -z, r)]).collect();
-    v.extend(CENTRE_CLEARINGS);
+    let mut v: Vec<_> = CLEARINGS.iter().flat_map(|&(x, z, r)| [(x * S, z * S, r * S), (x * S, -z * S, r * S)]).collect();
+    v.extend(CENTRE_CLEARINGS.iter().map(|&(x, z, r)| (x * S, z * S, r * S)));
     v
 }
 
 /// Boss grounds: the two slot clearings in the massifs.
 pub fn pit_positions() -> [Vec3; 2] {
-    [Vec3::new(CENTRE_CLEARINGS[0].0, 0.0, 0.0), Vec3::new(CENTRE_CLEARINGS[1].0, 0.0, 0.0)]
+    [at(CENTRE_CLEARINGS[0].0, 0.0), at(CENTRE_CLEARINGS[1].0, 0.0)]
 }
 
 /// Heal trees -- here, sheltered springs: in the six mid-height clearings.
 pub fn heal_tree_positions() -> [Vec3; 6] {
-    let c = |x: f32, z: f32| Vec3::new(x, 0.0, z);
+    let c = at;
     // z-mirrored like everything else: two on the far west ledge, one per half
     // Beside the pools, not in them: the streams run through the clearings'
     // centres, and the first render had a tree standing in the water.
@@ -232,8 +337,8 @@ pub fn streams() -> &'static [Vec<Vec3>] {
     S.get_or_init(|| {
         let mut v = Vec::new();
         for s in STREAMS {
-            v.push(s.iter().map(|&(x, z)| Vec3::new(x, 0.0, z)).collect::<Vec<_>>());
-            v.push(s.iter().map(|&(x, z)| Vec3::new(x, 0.0, -z)).collect());
+            v.push(s.iter().map(|&(x, z)| at(x, z)).collect::<Vec<_>>());
+            v.push(s.iter().map(|&(x, z)| at(x, -z)).collect());
         }
         v
     })
@@ -307,7 +412,7 @@ pub fn cliff_top(x: f32, z: f32) -> f32 {
     // The world does not end at the arena: mountains climb away on every
     // side to the mesh edge.
     let r = x.hypot(z);
-    let out = ((r - crate::consts::ARENA_RADIUS) / (crate::consts::GROUND_HALF - crate::consts::ARENA_RADIUS)).clamp(0.0, 1.0);
+    let out = ((r - ARENA_RADIUS) / (GROUND_HALF - ARENA_RADIUS)).clamp(0.0, 1.0);
     h + out * out * 75.0 * (0.7 + 0.6 * ridge(x * 0.03 + 9.0, z * 0.03))
 }
 
@@ -351,6 +456,39 @@ mod tests {
                 let p = along(&pts, s);
                 assert!(f.fits(p.x, p.z, 1.2), "{lane:?} pinches at {p} (sdf {})", f.sdf(p.x, p.z));
                 s += 1.0;
+            }
+        }
+    }
+
+    /// Width of the floor across the lane at `p` (direction `dir`).
+    fn span(p: Vec3, dir: Vec3) -> f32 {
+        let side = Vec3::new(-dir.z, 0.0, dir.x);
+        let f = floor();
+        let edge = |sgn: f32| {
+            let mut d = 0.0;
+            while f.sdf(p.x + side.x * d * sgn, p.z + side.z * d * sgn) < 0.0 && d < 80.0 {
+                d += 0.1;
+            }
+            d
+        };
+        edge(1.0) + edge(-1.0)
+    }
+
+    /// Every choke is a real narrows -- about 2 * CHOKE_R across -- with the
+    /// full lane either side of it, and a big cat still fits through.
+    #[test]
+    fn the_chokes_pinch_and_the_lanes_are_wide_between_them() {
+        let pts = choke_points();
+        assert_eq!(pts.len(), CHOKES.len());
+        for (p, dir) in pts {
+            let w = span(p, dir);
+            assert!((w - 2.0 * CHOKE_R).abs() < 1.0, "choke at {p} is {w:.1} u across, want ~{}", 2.0 * CHOKE_R);
+            assert!(floor().fits(p.x, p.z, 1.2), "a big cat cannot get through the choke at {p}");
+            // 25 u either way along the lane it is wide again
+            for k in [-25.0f32, 25.0] {
+                let q = p + dir * k;
+                let wq = span(q, dir);
+                assert!(wq > 2.0 * SIDE_R - 2.5, "not wide {k} u from the choke at {p}: {wq:.1}");
             }
         }
     }
@@ -417,7 +555,7 @@ mod tests {
     #[test]
     fn the_floor_is_one_connected_piece() {
         let f = floor();
-        let (cell, n) = (2.0f32, 180i32);
+        let (cell, n) = (2.0f32, 240i32);
         let at = |i: i32, j: i32| ((i - n / 2) as f32 * cell, (j - n / 2) as f32 * cell);
         let mut seen = vec![false; (n * n) as usize];
         let b = base_pos(Team::Blue);

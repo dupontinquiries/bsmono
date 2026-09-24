@@ -569,7 +569,7 @@ fn a_bot_finds_its_way_out_of_the_massif_on_the_pass() {
         assert_eq!(game.gods[bot].ai.as_ref().unwrap().lane, clawbound::consts::Lane::Mid);
         game.gods[1].respawn_t = 999.0;
         game.gods[bot].respawn_t = 0.0;
-        game.gods[bot].pos = glam::Vec3::new(-96.0, 0.0, 0.0);
+        game.gods[bot].pos = glam::Vec3::new(-96.0 * clawbound::pass::S, 0.0, 0.0);
         let mut t = 0.0;
         let mut on_lane = false;
         while t < 30.0 {

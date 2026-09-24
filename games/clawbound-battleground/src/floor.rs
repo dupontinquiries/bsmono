@@ -23,6 +23,25 @@ pub struct FloorPlan {
     pub shapes: Vec<Shape>,
     /// Which shapes open into which, and where: built on first use.
     links: std::sync::OnceLock<Vec<Vec<Link>>>,
+    /// Shapes by grid cell, for `sdf` near the floor (see `GRID_MARGIN`).
+    grid: std::sync::OnceLock<Grid>,
+}
+
+/// Distances are exact up to this far from the floor and clamp to it
+/// beyond. Every caller asks about the first few units (collision radii
+/// < 12, the cliff rise 2.6, colour and prop thresholds < 4); the funnels
+/// of the chokes tripled the shape count, and a full scan per query tripled
+/// the cost of every collision, probe and planner cell.
+pub const GRID_MARGIN: f32 = 24.0;
+const GRID_CELL: f32 = 16.0;
+
+#[derive(Debug, Clone, Default)]
+struct Grid {
+    x0: f32,
+    z0: f32,
+    nx: i32,
+    nz: i32,
+    cells: Vec<Vec<u32>>,
 }
 
 /// Two floor shapes overlap wide enough for a unit to pass: `to`, through
@@ -80,7 +99,42 @@ fn closest(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> (Vec3, Vec3) {
 
 impl FloorPlan {
     pub fn new(shapes: Vec<Shape>) -> FloorPlan {
-        FloorPlan { shapes: shapes.into_iter().filter(|s| shape_ok(s)).collect(), links: Default::default() }
+        FloorPlan { shapes: shapes.into_iter().filter(|s| shape_ok(s)).collect(), links: Default::default(), grid: Default::default() }
+    }
+
+    fn grid(&self) -> &Grid {
+        self.grid.get_or_init(|| {
+            if self.shapes.is_empty() {
+                return Grid::default();
+            }
+            let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            let bounds: Vec<(Vec3, Vec3)> = self
+                .shapes
+                .iter()
+                .map(|s| {
+                    let (a, b, r) = axis(s);
+                    let m = r + GRID_MARGIN;
+                    (a.min(b) - Vec3::new(m, 0.0, m), a.max(b) + Vec3::new(m, 0.0, m))
+                })
+                .collect();
+            for (a, b) in &bounds {
+                lo = lo.min(*a);
+                hi = hi.max(*b);
+            }
+            let nx = ((hi.x - lo.x) / GRID_CELL).ceil() as i32 + 1;
+            let nz = ((hi.z - lo.z) / GRID_CELL).ceil() as i32 + 1;
+            let mut cells = vec![Vec::new(); (nx * nz) as usize];
+            for (i, (a, b)) in bounds.iter().enumerate() {
+                let (ix0, iz0) = (((a.x - lo.x) / GRID_CELL) as i32, ((a.z - lo.z) / GRID_CELL) as i32);
+                let (ix1, iz1) = (((b.x - lo.x) / GRID_CELL) as i32, ((b.z - lo.z) / GRID_CELL) as i32);
+                for iz in iz0.max(0)..=iz1.min(nz - 1) {
+                    for ix in ix0.max(0)..=ix1.min(nx - 1) {
+                        cells[(iz * nx + ix) as usize].push(i as u32);
+                    }
+                }
+            }
+            Grid { x0: lo.x, z0: lo.z, nx, nz, cells }
+        })
     }
 
     /// The shape graph: for each shape, the shapes it opens into.
@@ -205,14 +259,51 @@ impl FloorPlan {
     /// Signed distance to the floor's edge: negative inside the floor.
     /// `+inf` for an empty plan (all rock); a NaN point is treated as rock.
     pub fn sdf(&self, x: f32, z: f32) -> f32 {
-        self.nearest(x, z).map_or(f32::INFINITY, |(d, _)| d)
+        if !(x.is_finite() && z.is_finite()) || self.shapes.is_empty() {
+            return f32::INFINITY;
+        }
+        // Near the floor: exact, through the grid. Farther: clamped -- it is
+        // rock either way, and no caller asks how deep.
+        let g = self.grid();
+        let (ix, iz) = (((x - g.x0) / GRID_CELL).floor() as i32, ((z - g.z0) / GRID_CELL).floor() as i32);
+        if ix < 0 || iz < 0 || ix >= g.nx || iz >= g.nz {
+            return GRID_MARGIN;
+        }
+        let mut best = GRID_MARGIN;
+        for &i in &g.cells[(iz * g.nx + ix) as usize] {
+            let (ax, az, r) = self.shapes[i as usize].nearest_axis(x, z);
+            best = best.min((x - ax).hypot(z - az) - r);
+        }
+        best
     }
 
     /// The shape whose surface is nearest, with the signed distance to it.
+    /// Through the grid near the floor (exact within `GRID_MARGIN`); a full
+    /// scan for a point deep in the rock, so push-in and routing still find
+    /// the floor from anywhere.
     fn nearest(&self, x: f32, z: f32) -> Option<(f32, usize)> {
         if !(x.is_finite() && z.is_finite()) {
             return None;
         }
+        let g = self.grid();
+        let (ix, iz) = (((x - g.x0) / GRID_CELL).floor() as i32, ((z - g.z0) / GRID_CELL).floor() as i32);
+        if ix >= 0 && iz >= 0 && ix < g.nx && iz < g.nz {
+            let mut best: Option<(f32, usize)> = None;
+            for &i in &g.cells[(iz * g.nx + ix) as usize] {
+                let (ax, az, r) = self.shapes[i as usize].nearest_axis(x, z);
+                let d = (x - ax).hypot(z - az) - r;
+                if best.map_or(true, |(b, _)| d < b) {
+                    best = Some((d, i as usize));
+                }
+            }
+            if best.is_some_and(|(d, _)| d <= GRID_MARGIN) {
+                return best;
+            }
+        }
+        self.nearest_scan(x, z)
+    }
+
+    fn nearest_scan(&self, x: f32, z: f32) -> Option<(f32, usize)> {
         let mut best: Option<(f32, usize)> = None;
         for (i, s) in self.shapes.iter().enumerate() {
             let (ax, az, r) = s.nearest_axis(x, z);
@@ -329,6 +420,39 @@ mod tests {
         }
         assert_eq!(p.route(Vec3::new(2.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 30.0)), vec![Vec3::new(0.0, 0.0, 30.0)], "unreachable: just the goal");
         assert_eq!(p.route(Vec3::new(2.0, 0.0, 0.0), Vec3::new(20.0, 0.0, 1.0)).len(), 1, "same shape: straight there");
+    }
+
+    /// The grid changes nothing within the margin: sdf equals a full scan
+    /// at every sampled point up to GRID_MARGIN from the floor, and reads
+    /// GRID_MARGIN (rock) beyond it.
+    #[test]
+    fn the_grid_is_exact_near_the_floor() {
+        let p = FloorPlan::new(
+            (0..40)
+                .map(|i| {
+                    let a = i as f32 * 0.37;
+                    Shape::Segment { x0: a.cos() * i as f32 * 3.0, z0: a.sin() * i as f32 * 3.0, x1: a.cos() * i as f32 * 3.0 + 9.0, z1: a.sin() * i as f32 * 3.0 - 4.0, r: 1.0 + (i % 5) as f32 }
+                })
+                .collect(),
+        );
+        let mut near = 0;
+        let mut x = -150.0;
+        while x < 150.0 {
+            let mut z = -150.0;
+            while z < 150.0 {
+                let full = p.nearest_scan(x, z).unwrap().0;
+                let fast = p.sdf(x, z);
+                if full <= GRID_MARGIN {
+                    assert!((full - fast).abs() < 1e-4, "({x},{z}): grid {fast} vs scan {full}");
+                    near += 1;
+                } else {
+                    assert_eq!(fast, GRID_MARGIN);
+                }
+                z += 2.3;
+            }
+            x += 2.3;
+        }
+        assert!(near > 1000);
     }
 
     #[test]

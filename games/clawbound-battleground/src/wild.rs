@@ -168,7 +168,7 @@ impl Wild {
     fn jungle_spot(rng: &mut Rng) -> Option<Vec3> {
         for _ in 0..40 {
             let a = rng.f32() * std::f32::consts::TAU;
-            let r = 26.0 + rng.f32() * (ARENA_RADIUS - 40.0);
+            let r = 26.0 + rng.f32() * (crate::consts::arena_radius() - 40.0);
             let x = a.cos() * r;
             let z = a.sin() * r;
             if lane_clearance(x, z) > 7.0 && river_dist(x, z) > 8.0 && !crate::bosses::in_pit(x, z) && crate::map::open_ground(x, z, 2.0) {
@@ -376,7 +376,7 @@ impl Game {
                 PreyKind::Glowfish => water_depth(next.x, next.z) < 0.25,
                 _ => p.run.is_none() && river_dist(next.x, next.z) < 6.5,
             };
-            if !blocked && next.length() < ARENA_RADIUS + 60.0 {
+            if !blocked && next.length() < crate::consts::arena_radius() + 60.0 {
                 p.pos = next;
             } else {
                 p.vel *= -0.5;
