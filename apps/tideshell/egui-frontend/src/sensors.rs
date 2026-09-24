@@ -1479,3 +1479,94 @@ mod dbus_tests {
     }
 }
 
+#[cfg(test)]
+mod backlight_merge_tests {
+    //! The writer loop after the c20unified/hive merge: hive's machinery (coalescing through
+    //! WriteGate, display gating, method fallback) with the FP5 write modes as a receiving
+    //! stage. Run for real against a fake sysfs backlight: no bus, no brightnessctl, so the
+    //! only method is the `brightness` file, and what reached the "panel" is its content.
+    use super::*;
+    use std::sync::atomic::{AtomicU64, AtomicU8};
+    use std::sync::mpsc::channel;
+
+    struct Rig {
+        tx: std::sync::mpsc::Sender<BacklightMsg>,
+        file: PathBuf,
+        max: u32,
+        dir: PathBuf,
+    }
+
+    fn rig(tag: &str, mode: WriteMode) -> Rig {
+        let dir = std::env::temp_dir().join(format!("ts-bl-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brightness"), "0").unwrap();
+        let max = 1000;
+        let bl = Backlight { name: "test-backlight".into(), dir: dir.clone(), max };
+        let (tx, rx) = channel();
+        let st = Arc::new(Mutex::new(String::new()));
+        let iv = Arc::new(AtomicU64::new(33_333));
+        let md = Arc::new(AtomicU8::new(match mode { WriteMode::Smooth => 0, WriteMode::Stepped => 1, WriteMode::Safe => 2 }));
+        std::thread::spawn(move || backlight_loop(bl, None, None, rx, st, iv, md));
+        Rig { tx, file: dir.join("brightness"), max, dir }
+    }
+    fn on_panel(r: &Rig) -> u32 { std::fs::read_to_string(&r.file).unwrap().trim().parse().unwrap() }
+    fn burst(r: &Rig) {
+        for i in 1..=10 {
+            r.tx.send(BacklightMsg::Level(i as f32 / 10.0)).unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn smooth_writes_promptly() {
+        let r = rig("smooth", WriteMode::Smooth);
+        burst(&r);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(on_panel(&r), level_to_raw(1.0, r.max), "the burst's last value reached the panel");
+        let _ = std::fs::remove_dir_all(&r.dir);
+    }
+
+    #[test]
+    fn safe_waits_for_quiet_then_writes_once() {
+        let r = rig("safe", WriteMode::Safe);
+        burst(&r);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(on_panel(&r), 0, "nothing written while values are still arriving or settling");
+        std::thread::sleep(Duration::from_millis(SETTLE_MS + 400));
+        assert_eq!(on_panel(&r), level_to_raw(1.0, r.max), "then exactly the last value");
+        let _ = std::fs::remove_dir_all(&r.dir);
+    }
+
+    #[test]
+    fn safe_drops_a_pending_value_when_the_display_goes_off() {
+        let r = rig("safe-off", WriteMode::Safe);
+        r.tx.send(BacklightMsg::Level(0.6)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        r.tx.send(BacklightMsg::Display(false)).unwrap();
+        std::thread::sleep(Duration::from_millis(SETTLE_MS + 400));
+        assert_eq!(on_panel(&r), 0, "no DSI write to a dark panel");
+        // Back on: the latest level is re-asserted (hive's gate), after the wake settle.
+        r.tx.send(BacklightMsg::Display(true)).unwrap();
+        std::thread::sleep(Duration::from_millis(SETTLE_MS + 600));
+        assert_eq!(on_panel(&r), level_to_raw(0.6, r.max));
+        let _ = std::fs::remove_dir_all(&r.dir);
+    }
+
+    #[test]
+    fn stepped_writes_a_real_step_without_waiting_for_quiet() {
+        let r = rig("stepped", WriteMode::Stepped);
+        r.tx.send(BacklightMsg::Level(0.5)).unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        let first = on_panel(&r);
+        assert_eq!(first, level_to_raw(0.5, r.max), "a first value is written (after up to 500 ms)");
+        // A change under 5 % is held while values keep arriving; a >= 5 % step goes out at once.
+        r.tx.send(BacklightMsg::Level(0.505)).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(on_panel(&r), first, "a sub-5 % change is not written yet");
+        r.tx.send(BacklightMsg::Level(0.9)).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(on_panel(&r), level_to_raw(0.9, r.max), "a large step is written before 500 ms of quiet");
+        let _ = std::fs::remove_dir_all(&r.dir);
+    }
+}
