@@ -196,6 +196,10 @@ pub struct Palette {
     pub query: String,
     /// Row under the finger during the hold (Mode or Row).
     pub hover: Option<Hit>,
+    /// How opaque the sheet should be drawn: 1 normally, falling as a held
+    /// thumb travels off the top. Not a spring — it follows the finger, so
+    /// pulling back restores it.
+    pub hold_fade: f32,
     pub reveal: DragTransition,
     /// The three mode buttons, in row order.
     pub modes: [HoldOption; 3],
@@ -209,6 +213,7 @@ pub struct Palette {
 impl Default for Palette {
     fn default() -> Self {
         Palette {
+            hold_fade: 1.0,
             open: false,
             query: String::new(),
             hover: None,
@@ -333,6 +338,42 @@ impl Palette {
             h @ (Hit::Mode(_) | Hit::Row(_)) => Some(h),
             _ => None,
         };
+    }
+
+    /// The same, told in bands, so a thumb leaving the sheet fades it and a
+    /// thumb that has barely moved selects nothing.
+    ///
+    /// Returns the band, and leaves [`Palette::hold_fade`] at how visible
+    /// the sheet should be.
+    pub fn hold_move_banded(&mut self, geom: &Geom, from: (f32, f32), x: f32, y: f32) -> Band {
+        let band = self.hold_band(geom, from, x, y);
+        self.hold_fade = match band {
+            Band::Dismissing(t) => 1.0 - t,
+            _ => 1.0,
+        };
+        self.hover = match band {
+            Band::Mode(i) => Some(Hit::Mode(i)),
+            Band::Row(i) => Some(Hit::Row(i)),
+            // Search, idle and leaving all select nothing: lifting there
+            // must not activate whatever the finger happens to be over.
+            _ => None,
+        };
+        band
+    }
+
+    /// A lift, decided by band. `None` means nothing was chosen; the second
+    /// value is whether the palette should close rather than stay open for
+    /// taps, which is what leaving the sheet asks for.
+    pub fn hold_release_banded(&mut self, geom: &Geom, from: (f32, f32), x: f32, y: f32) -> (Option<PaletteAction>, bool) {
+        let band = self.hold_move_banded(geom, from, x, y);
+        self.hold_fade = 1.0;
+        match band {
+            Band::Dismissing(_) => (None, true),
+            _ => {
+                let picked = self.hover.take().and_then(|h| self.activate_hit(h));
+                (picked, false)
+            }
+        }
     }
 
     /// Where a held finger is, in travel bands. `from` is where the press

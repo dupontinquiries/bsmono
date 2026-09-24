@@ -479,13 +479,24 @@ impl Shell {
             }
             GestureEvent::HoldMove { x, y } => {
                 let g = Geom::new(self.screen);
-                self.palette.hold_move(&g, x, y);
+                let from = self.recognizer.start();
+                self.palette.hold_move_banded(&g, from, x, y);
                 vec![]
             }
             GestureEvent::HoldRelease { x, y } => {
                 let g = Geom::new(self.screen);
-                let pick = self.palette.hold_release(&g, x, y);
+                let from = self.recognizer.start();
+                let (pick, leave) = self.palette.hold_release_banded(&g, from, x, y);
                 self.palette.end_hold();
+                // Lifting above the sheet is "no, none of these": the
+                // palette closes rather than staying open for taps, because
+                // a sheet left behind after a dismissal is a sheet the user
+                // has to dismiss twice.
+                if leave {
+                    self.palette.close();
+                    self.log("hold release -> dismissed");
+                    return vec![];
+                }
                 self.log(format!("hold release -> {pick:?}"));
                 match pick {
                     Some(a) => self.palette_action(a),
@@ -1170,6 +1181,46 @@ mod tests {
         assert!(!sh.palette.open, "activating closes the palette");
         assert!(sh.quick_state(QuickKind::Keyboard));
         assert!(sh.prefs.palette_recent.starts_with("mode:keyboard"), "{}", sh.prefs.palette_recent);
+    }
+
+    #[test]
+    fn sliding_off_the_top_of_the_sheet_dismisses_it() {
+        // "None of these": the sheet fades with the travel and lifting there
+        // closes it, rather than leaving a sheet behind that has to be
+        // dismissed a second time.
+        let mut sh = shell_with_three();
+        sh.on_edge_touch(TouchEvent::Down { slot: 0, x: 204.0, y: 895.0, t: 0 });
+        sh.tick(500);
+        assert!(sh.palette.open);
+        let g = Geom::new(S);
+        // Onto a mode first, so there IS something selected to discard.
+        let (x, y, w, h) = g.mode_rect(1);
+        sh.on_edge_touch(TouchEvent::Move { slot: 0, x: x + w / 2.0, y: y + h / 2.0, t: 600 });
+        assert_eq!(sh.palette.hover, Some(crate::palette::Hit::Mode(1)));
+        assert_eq!(sh.palette.hold_fade, 1.0);
+        // Then off the top: the selection is dropped and the sheet fades.
+        sh.on_edge_touch(TouchEvent::Move { slot: 0, x: 204.0, y: g.sheet_top - 40.0, t: 700 });
+        assert_eq!(sh.palette.hover, None, "nothing is selected while leaving");
+        assert!(sh.palette.hold_fade < 1.0 && sh.palette.hold_fade > 0.0, "fade {}", sh.palette.hold_fade);
+        // Lifting there does nothing and closes it.
+        let out = sh.on_edge_touch(TouchEvent::Up { slot: 0, t: 800 });
+        assert!(out.is_empty(), "{out:?}");
+        assert!(!sh.palette.open, "dismissed, not left open");
+        assert_eq!(sh.modes, Modes::default(), "and no mode was toggled on the way out");
+    }
+
+    #[test]
+    fn a_thumb_that_barely_moves_selects_nothing() {
+        // The dead zone: a hold that wobbles must not pick whatever it is
+        // over when the sheet rises under it.
+        let mut sh = shell_with_three();
+        sh.on_edge_touch(TouchEvent::Down { slot: 0, x: 204.0, y: 895.0, t: 0 });
+        sh.tick(500);
+        sh.on_edge_touch(TouchEvent::Move { slot: 0, x: 210.0, y: 890.0, t: 600 });
+        assert_eq!(sh.palette.hover, None);
+        let out = sh.on_edge_touch(TouchEvent::Up { slot: 0, t: 700 });
+        assert!(out.is_empty(), "{out:?}");
+        assert!(sh.palette.open, "still open for taps, which is the old behaviour");
     }
 
     #[test]

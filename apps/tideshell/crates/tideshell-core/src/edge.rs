@@ -210,6 +210,12 @@ impl Recognizer {
         }
     }
 
+    /// Where the current gesture began. The palette needs it to tell a
+    /// deliberate slide from jitter, and only the recognizer knows it.
+    pub fn start(&self) -> (f32, f32) {
+        self.start
+    }
+
     pub fn on_event(&mut self, ev: TouchEvent) -> Vec<GestureEvent> {
         match ev {
             TouchEvent::Down { slot, x, y, t } => self.down(slot, x, y, t),
