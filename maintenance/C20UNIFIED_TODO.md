@@ -174,3 +174,19 @@ existing test.
   mutation check) must start AND restore within one turn. A killed job left `sim/cloth.rs`
   mutated once; it was caught and restored from backup.
 
+## 13. Merged after the merge-ready export (c20unified-024)
+
+Four incremental bundles on `0d5c2a36f`, each merge message recording what it
+brought and what was run: clawbound-battleground (`9ece7f372`), vidkit
+(`8a5574fcc`), unendlich dragons (`a0f907fc0`), tideshell c20unified-011
+(`3d620722f`, one conflict in the main loop, both sides kept). The merges were
+first done on a scratch branch and tested there; the final branch was rebuilt
+with real messages and its tree checked identical to the tested one.
+Found and fixed: `shared/ambient-palette` missing from tideshell's pack list
+(`162acb640`, a merge interaction) and 31 lockfiles stale on vidkit's branch
+alone (`beb59b21b`; the settings app's lock was also a merge interaction).
+- **Open from those bundles** (their own notes list more): vidkit's whisper
+  path was not built here (no libclang); vidkit-transcribe ran 24 tests
+  without `whisper` (its note: 27 with it); clawbound's three pre-existing
+  failures; dragons audio / ARM / real-GPU items per their handoff.
+

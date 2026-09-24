@@ -5,7 +5,8 @@ repo. The detail of every change is in its commit message; the index, what was
 verified and what is open, is `maintenance/C20UNIFIED_TODO.md`. This file is
 how to apply it and what to watch.
 
-Head: `f849dad57` plus the commit that adds this guide. In the bundle, `main`,
+Head: `beb59b21b` plus the commit that updates this guide (it was `8cc21f04f` at
+`c20unified-023`; since then four more bundles were merged in, below). In the bundle, `main`,
 `integrate` and `tideshell` all point at it; `remarkable` is `c96958c5d`
 (already merged in).
 
@@ -23,6 +24,10 @@ Each of these tips is an ancestor of the head (checked with
 | `1ff18963f` | c19unified-039-hive (the "hive" commit) |
 | `4c10042c3` | tideshell session, c20unified-009 `c20-merge` |
 | `ba4a64aeb` | tideshell session, c20unified-010 `c20-merge` |
+| `5db19cf18` | clawbound c20unified-024 `main` (with `twinfang-pass` `c44478e35`, `clawbound-jungle` `1871f3225`) |
+| `64cf7f3a2` | vidkit-c20-on-0d5c2a36f |
+| `88c05b3df` | unendlich-dragons (c20unified-020 partial) |
+| `4ce40d38c` | tideshell session, c20unified-011 `c20-merge` |
 
 ## Apply
 
@@ -36,6 +41,15 @@ their recorded conflict resolutions are part of this line):
 
     git fetch /path/to/c20unified-NNN.bundle integrate:c20unified
     git merge c20unified
+
+The last four came in as incremental bundles on `0d5c2a36f`; their merges
+(`9ece7f372`, `8a5574fcc`, `a0f907fc0`, `3d620722f`) record what each brought,
+the one conflict (tideshell's loop) and the tests run. They exposed two things
+fixed right after: `shared/ambient-palette` missing from tideshell's
+`pack-src.sh` (`162acb640`) and 31 lockfiles vidkit's branch left stale
+(`beb59b21b` -- `cargo --locked` failed on that branch alone). Re-running the
+section-7 checkers then found one unpinned text field from vidkit, pinned in the
+commit after those.
 
 ## Where a merge is likely to conflict
 
@@ -124,6 +138,11 @@ needs ~3 GB of RAM):
 | fao-codec-egui | `cargo test --release --lib` in `apps/fao-codec/egui-frontend` | 186 passed |
 | tideshell | `cargo test --release --lib` in `apps/tideshell/egui-frontend` | 116 passed |
 | gitmind cockpit | `cargo test -p cockpit` in `apps/gitmind` | 563 passed |
+| unendlich + dragons | `cargo test -p unendlich-engine --lib --no-default-features --features audio` | 8990 passed (after the dragons merge) |
+| tideshell (after its c20unified-011 merge) | lib; `crates/tideshell-core`; `settings` | 119; 269; 23 passed |
+| clawbound-battleground | `cargo test --lib`; `--test game`; `--test shaders` | 381 + 3 pre-existing failures (named in its note); 22; 2 |
+| vidkit | `vidkit-core --lib`; `vidkit-egui --lib --features glow-upload`; player `--no-default-features --features app,https,alsa,bscale` | 114; 168; 195 + 3 ignored |
+| uikit-egui | `cargo test -p uikit-egui --lib` in `shared/uikit` | 551 + the pre-existing callout failure |
 
 Expected failures (documented, not regressions):
 `mesh_tri_regression::sample_grid_worst_case_stays_under_budget` (a real
