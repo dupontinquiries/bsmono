@@ -322,26 +322,27 @@ fn main() {
         print!("{}", tideshell_egui::powerdoctor::report(&tideshell_egui::powerdoctor::gather(bus.as_ref(), home.as_deref())));
         std::process::exit(0);
     }
-    if args.get(1).map(String::as_str) == Some("install-keys") {
+    // `tideshell install-keys` / `remove-keys`: the same lever the shell
+    // pulls at startup, by hand.
+    if matches!(args.get(1).map(String::as_str), Some("install-keys" | "remove-keys")) {
         let Some(home) = effects::cosmic_config_home() else {
-            eprintln!("tideshell install-keys: no config home");
+            eprintln!("tideshell: no config home");
             std::process::exit(1);
         };
         let file = tideshell_egui::ctl::cosmic_custom_shortcuts(&home);
-        let bin = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "tideshell".into());
-        let old = std::fs::read_to_string(&file).unwrap_or_default();
-        if !old.is_empty() {
-            let _ = std::fs::write(file.with_extension("before-tideshell"), &old);
-        }
-        let new = tideshell_egui::ctl::merge_custom_shortcuts(&old, &bin);
-        let r = file.parent().map(std::fs::create_dir_all).unwrap_or(Ok(())).and_then(|_| std::fs::write(&file, &new));
+        let r = if args[1] == "install-keys" {
+            let bin = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "tideshell".into());
+            tideshell_egui::ctl::ensure_keys(&home, &bin).map(|o| format!("{}: {o:?} (power, volume up/down -> `{bin} ctl ...`; cosmic-comp reloads it live)", file.display()))
+        } else {
+            tideshell_egui::ctl::remove_keys(&home).map(|removed| format!("{}: {}", file.display(), if removed { "tideshell's bindings removed; cosmic's defaults apply again (the power key's shutdown dialog included)" } else { "no tideshell bindings to remove" }))
+        };
         match r {
-            Ok(()) => {
-                println!("{}: power, volume up/down now run `{bin} ctl ...` (cosmic-comp reloads it live){}", file.display(), if old.is_empty() { String::new() } else { format!("; previous file saved as {}", file.with_extension("before-tideshell").display()) });
+            Ok(m) => {
+                println!("{m}");
                 std::process::exit(0)
             }
             Err(e) => {
-                eprintln!("tideshell install-keys: {}: {e}", file.display());
+                eprintln!("tideshell {}: {e}", args[1]);
                 std::process::exit(1)
             }
         }
@@ -411,6 +412,22 @@ fn main() {
     {
         let found = tideshell_egui::keys::discover(std::path::Path::new("/sys"), std::path::Path::new("/dev/input"));
         let bus = zbus::blocking::Connection::system().ok();
+        // The first lever: route the keys through cosmic-comp by writing
+        // its custom shortcuts (reloaded live). TIDESHELL_MANAGE_KEYS=0
+        // leaves the file alone; the shell then only reports what it finds.
+        let manage = std::env::var("TIDESHELL_MANAGE_KEYS").map(|v| v != "0").unwrap_or(true);
+        if let Some(h) = effects::cosmic_config_home() {
+            let bin = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "tideshell".into());
+            if manage {
+                match tideshell_egui::ctl::ensure_keys(&h, &bin) {
+                    Ok(o) => sb.shell.note(format!("keys: cosmic custom shortcuts {o:?} ({})", tideshell_egui::ctl::cosmic_custom_shortcuts(&h).display())),
+                    Err(e) => sb.shell.note(format!("keys: could not write cosmic custom shortcuts: {e}")),
+                }
+            } else {
+                let ok = std::fs::read_to_string(tideshell_egui::ctl::cosmic_custom_shortcuts(&h)).map(|t| tideshell_egui::ctl::routes_to(&t, &bin)).unwrap_or(false);
+                sb.shell.note(format!("keys: TIDESHELL_MANAGE_KEYS=0; cosmic routes the keys to this binary: {ok}"));
+            }
+        }
         let via = effects::cosmic_config_home().is_some_and(|h| tideshell_egui::ctl::compositor_route_installed(&h));
         let k = tideshell_egui::keys::Keys::spawn(found, bus.as_ref(), via);
         sb.shell.note(k.status.clone());

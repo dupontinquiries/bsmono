@@ -123,6 +123,81 @@ pub fn map_entries(text: &str) -> Vec<String> {
     out
 }
 
+/// Whether an entry is one tideshell wrote: a `Spawn` of `... ctl <cmd>`
+/// for one of the control commands. Recognised by content, not by a marker,
+/// because cosmic-settings rewrites the file without comments.
+fn is_ours(entry: &str) -> bool {
+    entry.contains("Spawn(") && Command::NAMES.iter().any(|c| entry.contains(&format!(" ctl {c}\"")))
+}
+
+/// The custom map without tideshell's entries; the user's own untouched.
+pub fn unmerge_custom_shortcuts(existing: &str) -> String {
+    let body: Vec<String> = map_entries(existing).into_iter().filter(|e| !is_ours(e)).map(|e| format!("    {e},")).collect();
+    format!("{{\n{}\n}}\n", body.join("\n"))
+}
+
+/// Whether `text` already routes every compositor key to `bin`.
+pub fn routes_to(text: &str, bin: &str) -> bool {
+    let entries = map_entries(text);
+    COMPOSITOR_KEYS.iter().all(|(key, cmd)| {
+        entries.iter().any(|e| {
+            let sq: String = e.chars().filter(|c| !c.is_whitespace()).collect();
+            sq.contains(&format!("key:\"{key}\"")) && sq.contains("modifiers:[]") && e.contains(&format!("Spawn(\"{bin} ctl {cmd}\")"))
+        })
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeysOutcome {
+    /// Already bound to this binary: nothing written.
+    AlreadyBound,
+    /// Written. `backup` is set the first time a user file is replaced;
+    /// later writes never overwrite that backup with tideshell's own file.
+    Written { backup: Option<PathBuf>, replaced_other_path: bool },
+}
+
+/// Make cosmic route the power and volume keys to `bin ctl ...`. Idempotent:
+/// writes only when something differs, so running it at every start is
+/// cheap and leaves the file alone once right. cosmic-comp reloads the file
+/// live (seen on the FP5), so the binding takes effect without a restart.
+pub fn ensure_keys(config_home: &Path, bin: &str) -> Result<KeysOutcome, String> {
+    let file = cosmic_custom_shortcuts(config_home);
+    let old = std::fs::read_to_string(&file).unwrap_or_default();
+    if routes_to(&old, bin) {
+        return Ok(KeysOutcome::AlreadyBound);
+    }
+    let replaced_other_path = map_entries(&old).iter().any(|e| is_ours(e));
+    let bak = file.with_extension("before-tideshell");
+    let backup = if !old.trim().is_empty() && !bak.exists() && !replaced_other_path {
+        std::fs::write(&bak, &old).map_err(|e| format!("{}: {e}", bak.display()))?;
+        Some(bak)
+    } else {
+        None
+    };
+    let new = merge_custom_shortcuts(&old, bin);
+    if let Some(d) = file.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    // Write-then-rename: cosmic watches the file and must never read half of it.
+    let tmp = file.with_extension("tideshell-tmp");
+    std::fs::write(&tmp, &new).and_then(|_| std::fs::rename(&tmp, &file)).map_err(|e| format!("{}: {e}", file.display()))?;
+    Ok(KeysOutcome::Written { backup, replaced_other_path })
+}
+
+/// Take tideshell's bindings out again (the user's stay). With none left
+/// the keys fall back to cosmic's defaults -- the power key's shutdown
+/// dialog included. Returns whether anything was removed.
+pub fn remove_keys(config_home: &Path) -> Result<bool, String> {
+    let file = cosmic_custom_shortcuts(config_home);
+    let Ok(old) = std::fs::read_to_string(&file) else { return Ok(false) };
+    if !map_entries(&old).iter().any(|e| is_ours(e)) {
+        return Ok(false);
+    }
+    let tmp = file.with_extension("tideshell-tmp");
+    std::fs::write(&tmp, unmerge_custom_shortcuts(&old)).and_then(|_| std::fs::rename(&tmp, &file)).map_err(|e| format!("{}: {e}", file.display()))?;
+    Ok(true)
+}
+
 /// Whether the compositor route is installed (the custom file binds the
 /// power key to `tideshell ctl power-key`).
 pub fn compositor_route_installed(config_home: &Path) -> bool {
@@ -227,6 +302,40 @@ mod tests {
         std::fs::write(&f, &fresh).unwrap();
         assert!(compositor_route_installed(&base));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ensure_is_idempotent_keeps_the_first_backup_and_follows_a_moved_binary() {
+        let home = std::env::temp_dir().join(format!("tideshell-ek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let f = cosmic_custom_shortcuts(&home);
+        // No file at all (the FP5's state): created, nothing to back up.
+        assert_eq!(ensure_keys(&home, "/a/tideshell").unwrap(), KeysOutcome::Written { backup: None, replaced_other_path: false });
+        assert!(routes_to(&std::fs::read_to_string(&f).unwrap(), "/a/tideshell"));
+        let t1 = std::fs::metadata(&f).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(ensure_keys(&home, "/a/tideshell").unwrap(), KeysOutcome::AlreadyBound);
+        assert_eq!(std::fs::metadata(&f).unwrap().modified().unwrap(), t1, "not rewritten when already right");
+        // A user's own file with the hand-made Disable: backed up once, Disable replaced.
+        std::fs::write(&f, "{\n    (modifiers: [Super], key: \"t\"): Spawn(\"cosmic-term\"),\n    (modifiers: [], key: \"XF86PowerOff\"): Disable,\n}\n").unwrap();
+        let out = ensure_keys(&home, "/a/tideshell").unwrap();
+        let bak = f.with_extension("before-tideshell");
+        assert_eq!(out, KeysOutcome::Written { backup: Some(bak.clone()), replaced_other_path: false });
+        assert!(std::fs::read_to_string(&bak).unwrap().contains("Disable"));
+        let now = std::fs::read_to_string(&f).unwrap();
+        assert!(now.contains("cosmic-term") && !now.contains("Disable") && routes_to(&now, "/a/tideshell"), "{now}");
+        // The binary moved: rebound to the new path, the first backup kept.
+        assert_eq!(ensure_keys(&home, "/b/tideshell").unwrap(), KeysOutcome::Written { backup: None, replaced_other_path: true });
+        let moved = std::fs::read_to_string(&f).unwrap();
+        assert!(routes_to(&moved, "/b/tideshell") && !moved.contains("/a/tideshell"), "{moved}");
+        assert!(std::fs::read_to_string(&bak).unwrap().contains("Disable"), "the user's original survives later writes");
+        // Remove: ours go, the user's stay.
+        assert!(remove_keys(&home).unwrap());
+        let left = std::fs::read_to_string(&f).unwrap();
+        assert!(left.contains("cosmic-term") && !left.contains(" ctl "), "{left}");
+        assert!(!remove_keys(&home).unwrap(), "nothing left to remove");
+        assert!(!f.with_extension("tideshell-tmp").exists());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
