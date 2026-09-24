@@ -171,6 +171,13 @@ impl SectionsPanel {
             }
             for (i, c) in m.chapters.iter().enumerate() {
                 ui.horizontal(|ui| {
+                    // The theme's inactive checkbox is a fill barely off the
+                    // panel colour: in a screenshot the boxes were invisible
+                    // until ticked. An outline in the weak text colour, for
+                    // this row only.
+                    let edge = Stroke::new(1.0, ui.visuals().weak_text_color());
+                    ui.visuals_mut().widgets.inactive.bg_stroke = edge;
+                    ui.visuals_mut().widgets.hovered.bg_stroke = Stroke::new(1.5, ui.visuals().text_color());
                     let mut ticked = self.selected.contains(&i);
                     if ui.checkbox(&mut ticked, "").changed() {
                         if ticked {

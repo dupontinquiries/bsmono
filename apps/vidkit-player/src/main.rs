@@ -543,7 +543,6 @@ impl eframe::App for Player {
         // I playing" is the primary question a player answers; it does not
         // belong in the first field to be dropped for space.
         self.sections_tick(ctx);
-        self.sections_ui(ctx);
 
         egui::TopBottomPanel::top("what").show(ctx, |ui| match &self.opened {
             Some(Err(e)) => {
@@ -573,6 +572,10 @@ impl eframe::App for Player {
                 ui.small("test pattern — pass a .mp4 or .webm to open one");
             }
         });
+
+        // After the top bar, so the panel sits beside the picture rather than
+        // claiming the full window height and pushing its strip under the bar.
+        self.sections_ui(ctx);
 
         let central = egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(gpu) = self.gpu.clone() {
@@ -1357,7 +1360,10 @@ impl Player {
         let narrow = ctx.content_rect().width() < 700.0;
         let panel = &mut self.sections;
         let actions = if narrow {
-            egui::TopBottomPanel::bottom("sections").resizable(true).default_height(280.0)
+            // Capped at half the screen: sized to its content, a long chapter
+            // list took most of a phone's height and left the picture a strip.
+            let cap = ctx.content_rect().height() * 0.5;
+            egui::TopBottomPanel::bottom("sections").resizable(true).default_height(280.0_f32.min(cap)).max_height(cap)
                 .show(ctx, |ui| panel.ui(ui, &model)).inner
         } else {
             egui::SidePanel::right("sections").resizable(true).default_width(340.0)
