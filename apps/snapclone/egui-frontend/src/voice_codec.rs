@@ -41,6 +41,9 @@ pub struct VoiceCodec {
     encoder: Option<snapclone_audio::codec::VoiceEncoder>,
     #[cfg(feature = "opus")]
     decoders: std::collections::HashMap<String, snapclone_audio::codec::VoiceDecoder>,
+    /// Each speaker's last decoded frame length: what concealment makes.
+    #[cfg(feature = "opus")]
+    last_len: std::collections::HashMap<String, usize>,
 }
 
 fn to_i16(frame: &[f32]) -> Vec<i16> {
@@ -65,6 +68,8 @@ impl VoiceCodec {
             },
             #[cfg(feature = "opus")]
             decoders: std::collections::HashMap::new(),
+            #[cfg(feature = "opus")]
+            last_len: std::collections::HashMap::new(),
         }
     }
 
@@ -78,17 +83,19 @@ impl VoiceCodec {
         { false }
     }
 
-    /// One mic frame to the packet that carries it.
-    pub fn encode(&mut self, frame: &[f32]) -> Packet {
+    /// One mic frame to the packet that carries it. `seq` and `spurt_start` are
+    /// the sender's (`voice_send::Emit::Send`); an Opus packet carries them for
+    /// the receiver's jitter scheduler, a raw one (the old format) cannot.
+    pub fn encode(&mut self, frame: &[f32], seq: u64, spurt_start: bool) -> Packet {
         #[cfg(feature = "opus")]
         if let Some(enc) = self.encoder.as_mut() {
             if frame.len() == self.frame_samples {
                 if let Some(p) = enc.encode(&to_i16(frame)) {
-                    return Packet::VoiceOpus(p);
+                    return Packet::VoiceOpus { seq: seq as u32, spurt_start, data: p };
                 }
             }
         }
-        let _ = self.frame_samples;
+        let _ = (self.frame_samples, seq, spurt_start);
         Packet::VoiceFrame(crate::audio::f32_to_pcm(frame))
     }
 
@@ -112,7 +119,9 @@ impl VoiceCodec {
                     let d = self.decoders.get_mut(peer)?;
                     // Up to 60 ms: the longest frame a sender may have chosen.
                     let max = self.sample_rate as usize * 60 / 1000;
-                    return d.decode(Some(bytes), max).map(|s| to_f32(&s));
+                    let out = d.decode(Some(bytes), max).map(|s| to_f32(&s));
+                    if let Some(o) = &out { self.last_len.insert(peer.to_string(), o.len()); }
+                    return out;
                 }
                 #[cfg(not(feature = "opus"))]
                 {
@@ -120,6 +129,23 @@ impl VoiceCodec {
                     None
                 }
             }
+        }
+    }
+
+    /// A frame this speaker should have sent is missing: Opus packet-loss
+    /// concealment extrapolates one from their last good frame (a slight
+    /// smear, where silence would sound like they stopped). None if nothing
+    /// has been heard from them yet, or without the codec.
+    pub fn conceal(&mut self, peer: &str) -> Option<Vec<f32>> {
+        #[cfg(feature = "opus")]
+        {
+            let n = *self.last_len.get(peer)?;
+            return self.decoders.get_mut(peer)?.decode(None, n).map(|s| to_f32(&s));
+        }
+        #[cfg(not(feature = "opus"))]
+        {
+            let _ = peer;
+            None
         }
     }
 
@@ -131,7 +157,7 @@ impl VoiceCodec {
     /// A speaker left: drop their decoder state.
     pub fn forget(&mut self, peer: &str) {
         #[cfg(feature = "opus")]
-        self.decoders.remove(peer);
+        { self.decoders.remove(peer); self.last_len.remove(peer); }
         let _ = peer;
     }
 
@@ -172,12 +198,12 @@ mod tests {
         assert!(tx.encoder_ready(), "20 ms at 16 kHz is an Opus frame");
         let (mut bytes, mut heard) = (0usize, Vec::new());
         for f in tone(330.0, 50, n) {
-            let p = tx.encode(&f);
-            let Packet::VoiceOpus(b) = &p else { panic!("expected Opus, got {p:?}") };
+            let p = tx.encode(&f, 0, false);
+            let Packet::VoiceOpus { data: b, .. } = &p else { panic!("expected Opus, got {p:?}") };
             bytes += b.len();
             // Through the real wire encoding, as a peer would receive it.
             let back = crate::voice_bridge::decode(&crate::voice_bridge::encode(&p)).unwrap();
-            let Packet::VoiceOpus(b2) = back else { panic!() };
+            let Packet::VoiceOpus { data: b2, .. } = back else { panic!() };
             heard.extend(rx.decode("alice", Codec::Opus, &b2).expect("decodes"));
         }
         assert_eq!(heard.len(), 50 * n);
@@ -198,8 +224,8 @@ mod tests {
         let (mut ha, mut hb) = (Vec::new(), Vec::new());
         for i in 0..30 {
             // Interleaved, as two speakers arrive.
-            if let Packet::VoiceOpus(p) = a.encode(&ta[i]) { ha.extend(rx.decode("a", Codec::Opus, &p).unwrap()); }
-            if let Packet::VoiceOpus(p) = b.encode(&tb[i]) { hb.extend(rx.decode("b", Codec::Opus, &p).unwrap()); }
+            if let Packet::VoiceOpus { data: p, .. } = a.encode(&ta[i], i as u64, i == 0) { ha.extend(rx.decode("a", Codec::Opus, &p).unwrap()); }
+            if let Packet::VoiceOpus { data: p, .. } = b.encode(&tb[i], i as u64, i == 0) { hb.extend(rx.decode("b", Codec::Opus, &p).unwrap()); }
         }
         assert_eq!(rx.speakers(), 2);
         // Each decoded stream is its own speaker's tone, not a smear of both:
@@ -220,7 +246,7 @@ mod tests {
         let n = frame_samples(30); // 30 ms: not an Opus frame
         let mut tx = VoiceCodec::new(SAMPLE_RATE, n);
         assert!(!tx.encoder_ready(), "the host must hear 'no encoder'");
-        assert!(matches!(tx.encode(&vec![0.1; n]), Packet::VoiceFrame(_)));
+        assert!(matches!(tx.encode(&vec![0.1; n], 0, true), Packet::VoiceFrame(_)));
     }
 
     #[cfg(not(feature = "opus"))]
@@ -228,7 +254,7 @@ mod tests {
     fn without_the_codec_it_is_raw_and_honest() {
         let mut tx = VoiceCodec::new(SAMPLE_RATE, frame_samples(20));
         assert!(!tx.encoder_ready());
-        assert!(matches!(tx.encode(&vec![0.1; frame_samples(20)]), Packet::VoiceFrame(_)));
+        assert!(matches!(tx.encode(&vec![0.1; frame_samples(20)], 0, true), Packet::VoiceFrame(_)));
         assert!(tx.decode("a", Codec::Opus, &[1, 2, 3]).is_none(), "Opus without the codec is refused, not played");
     }
 }

@@ -96,8 +96,13 @@ struct VoiceRig {
     mic_thread: Option<std::thread::JoinHandle<()>>,
     speaker: Option<audio::Speaker>,
     speaker_child: Option<audio::Child>,
-    /// Packs mic frames for the wire and unpacks arriving ones (voice_codec).
+    /// Packs mic frames for the wire and unpacks arriving raw ones (voice_codec).
     codec: snapclone_egui::voice_codec::VoiceCodec,
+    /// Arriving Opus: ordered, concealed, decoded per speaker (voice_rx), ticked
+    /// once per frame interval from `rx_clock`.
+    rx: snapclone_egui::voice_rx::VoiceRx,
+    rx_clock: std::time::Instant,
+    rx_frame: std::time::Duration,
     /// Wall-clock of the last `SinkDepth`, so the tick runs at the cushion's
     /// rate rather than the frame rate — a 120 Hz display must not ask the
     /// play-out layer for audio twice per frame.
@@ -121,6 +126,10 @@ impl VoiceRig {
             mic_child: None, mic_thread: None, speaker: None, speaker_child: None,
             codec: snapclone_egui::voice_codec::VoiceCodec::new(
                 snapclone_egui::sink_cushion::SAMPLE_RATE, snapclone_egui::sink_cushion::frame_samples(snapclone_egui::sink_cushion::FRAME_MS)),
+            rx: snapclone_egui::voice_rx::VoiceRx::new(
+                snapclone_egui::sink_cushion::SAMPLE_RATE, snapclone_egui::sink_cushion::frame_samples(snapclone_egui::sink_cushion::FRAME_MS)),
+            rx_clock: std::time::Instant::now(),
+            rx_frame: std::time::Duration::from_millis(snapclone_egui::sink_cushion::FRAME_MS as u64),
             last_sink_tick: std::time::Instant::now(), warned_no_audio: false,
             joined: false, warned_no_socket: false,
         }
@@ -181,6 +190,8 @@ impl VoiceRig {
     /// Both halves of the stop contract for each child, then reap.
     fn stop(&mut self) {
         self.codec.reset();
+        self.rx = snapclone_egui::voice_rx::VoiceRx::new(
+            snapclone_egui::sink_cushion::SAMPLE_RATE, snapclone_egui::sink_cushion::frame_samples(snapclone_egui::sink_cushion::FRAME_MS));
         self.mic_stop.store(true, Ordering::Relaxed);
         if let Some(c) = self.mic_child.take() { c.stop(); c.reap(); }
         if let Some(t) = self.mic_thread.take() { let _ = t.join(); }
@@ -778,6 +789,10 @@ impl App {
                 // sending raw S16LE: the warning could never fire.)
                 self.voice.codec = snapclone_egui::voice_codec::VoiceCodec::new(
                     snapclone_egui::sink_cushion::SAMPLE_RATE, snapclone_egui::sink_cushion::frame_samples(frame_ms));
+                self.voice.rx = snapclone_egui::voice_rx::VoiceRx::new(
+                    snapclone_egui::sink_cushion::SAMPLE_RATE, snapclone_egui::sink_cushion::frame_samples(frame_ms));
+                self.voice.rx_frame = std::time::Duration::from_millis(frame_ms.max(1) as u64);
+                self.voice.rx_clock = std::time::Instant::now();
                 let cmds = self.snap.apply(HostEvent::EncoderReady(self.voice.codec.encoder_ready()));
                 self.handle(cmds);
             }
@@ -835,17 +850,38 @@ impl App {
             // `MicFrame` for a batch and then sending "some" frame would
             // desynchronise the sequence numbers from the audio.
             let cmds = self.snap.apply(HostEvent::MicFrame);
-            let may_send = cmds.iter().any(|c| matches!(
-                c, HostCommand::VoiceEmit(snapclone_egui::voice_send::Emit::Send { .. })));
+            // The sequence number and spurt flag voice_send assigned this frame:
+            // an Opus packet carries them for the receiver's jitter scheduler.
+            let send = cmds.iter().find_map(|c| match c {
+                HostCommand::VoiceEmit(snapclone_egui::voice_send::Emit::Send { seq, talkspurt_start }) => Some((*seq, *talkspurt_start)),
+                _ => None,
+            });
             self.handle(cmds);
-            if may_send {
-                let packet = self.voice.codec.encode(&frame);
+            if let Some((seq, spurt_start)) = send {
+                let packet = self.voice.codec.encode(&frame, seq, spurt_start);
                 let cmds = self.snap.apply(HostEvent::VoiceOutbound(packet));
                 self.handle(cmds);
             }
         }
         if let Some(why) = self.voice.mic.take_error() {
             eprintln!("snapclone: microphone stopped: {why}");
+        }
+
+        // PLAY-OUT: once per frame interval, every speaker's next Opus frame in
+        // sequence order -- decoded, or concealed if it never arrived (voice_rx).
+        // At most 5 intervals per UI frame; further behind than that, resync
+        // the clock rather than dump a burst of catch-up audio.
+        if self.voice.live() {
+            let mut ticks = 0;
+            while self.voice.rx_clock.elapsed() >= self.voice.rx_frame && ticks < 5 {
+                self.voice.rx_clock += self.voice.rx_frame;
+                ticks += 1;
+                for (peer, samples) in self.voice.rx.tick() {
+                    let cmds = self.snap.apply(HostEvent::DecodedAudio { peer, samples });
+                    self.handle(cmds);
+                }
+            }
+            if ticks == 5 { self.voice.rx_clock = std::time::Instant::now(); }
         }
 
         // WIRE → the app. The sender's identity is the source address, which
@@ -1082,6 +1118,11 @@ impl App {
                 // out — matching what this host sends. A payload whose
                 // length is not a whole number of samples is refused rather
                 // than played as a half-sample of noise.
+                HostCommand::OpusArrived { peer, seq, spurt_start, data } => {
+                    // Held until its play-out tick (see the rx tick in the
+                    // voice pump): ordered, and concealed if it never comes.
+                    self.voice.rx.arrive(&peer, seq, spurt_start, data);
+                }
                 HostCommand::DecodeAudio { peer, codec, pcm } => {
                     // Raw or Opus by the packet's kind, one decoder per
                     // speaker; a payload that is not a whole frame of its

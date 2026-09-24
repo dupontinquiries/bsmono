@@ -296,6 +296,10 @@ pub enum HostCommand {
     /// and stopped there, so a call was silent in both directions.
     /// `codec` says what the bytes are: raw S16LE or one Opus packet.
     DecodeAudio { peer: String, codec: crate::voice_codec::Codec, pcm: Vec<u8> },
+    /// An Opus frame with its sequence number and talk-spurt flag, for the
+    /// receive path (`voice_rx`): it is played in sequence order at the next
+    /// play-out tick, and a missing one is concealed.
+    OpusArrived { peer: String, seq: u32, spurt_start: bool, data: Vec<u8> },
     /// Show a notification. Only produced when the app decided one is
     /// warranted — an unfocused window and at least one sender.
     Notify(uikit_egui::notify::Rendered),
@@ -536,8 +540,8 @@ impl Snapclone {
                     crate::voice_bridge::Inbound::Handled { from, packet: crate::voice_bridge::Packet::VoiceFrame(f) } => {
                         out.push(HostCommand::DecodeAudio { peer: from, codec: crate::voice_codec::Codec::RawS16, pcm: f });
                     }
-                    crate::voice_bridge::Inbound::Handled { from, packet: crate::voice_bridge::Packet::VoiceOpus(f) } => {
-                        out.push(HostCommand::DecodeAudio { peer: from, codec: crate::voice_codec::Codec::Opus, pcm: f });
+                    crate::voice_bridge::Inbound::Handled { from, packet: crate::voice_bridge::Packet::VoiceOpus { seq, spurt_start, data } } => {
+                        out.push(HostCommand::OpusArrived { peer: from, seq, spurt_start, data });
                     }
                     _ => {}
                 }

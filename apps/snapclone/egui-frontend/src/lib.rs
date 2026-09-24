@@ -136,6 +136,8 @@ pub mod trace_channels;
 pub mod voice_bridge;
 /// The codec seam: Opus out when the frame allows, raw or Opus in, one decoder per speaker.
 pub mod voice_codec;
+/// The receive path: Opus frames in sequence order, gaps concealed (voice_playout + voice_codec).
+pub mod voice_rx;
 pub mod voice_wire;
 pub mod wire_v3;
 pub mod touch_feedback;
@@ -5149,7 +5151,7 @@ impl Snapclone {
                 // sound.
                 crate::voice_bridge::Packet::VoiceFrame(_) => {}
                 // Same: an Opus frame goes back to the host to decode.
-                crate::voice_bridge::Packet::VoiceOpus(_) => {}
+                crate::voice_bridge::Packet::VoiceOpus { .. } => {}
             }
         }
         out
