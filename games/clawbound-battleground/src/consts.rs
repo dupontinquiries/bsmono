@@ -289,7 +289,12 @@ pub fn lane_path(lane: Lane, team: Team) -> &'static [Vec3] {
         let mut v = Vec::new();
         for lane in LANES {
             for team in [Team::Blue, Team::Red] {
-                v.push(lane.path_for(team));
+                // Waypoints stand ON the ground: the pass's Top lane climbs a
+                // 9 u shelf, and the AI and minions advance waypoints by 3D
+                // distance (< 6 u, < 1.5 u) -- against points at y = 0 they
+                // would never arrive up there, and stall. 0 on the jungle.
+                let path = lane.path_for(team).into_iter().map(|p| Vec3::new(p.x, crate::map::ground_y(p.x, p.z), p.z)).collect();
+                v.push(path);
             }
         }
         v
