@@ -51,8 +51,12 @@ pub fn stereo(
 
     let pan = match (f, dir) {
         (Some(f), Some(d)) => {
-            // right = f × up,  up = (0,1,0)  ⇒  (f.z, 0, -f.x)
-            let right = [f[2], 0.0, -f[0]];
+            // right = f × up, up = (0,1,0) ⇒ (-f.z, 0, f.x) — the same vector
+            // as render::camera::View::right(). This read `(f.z, 0, -f.x)`
+            // (that is up × f, i.e. LEFT) until the first caller (the dragon
+            // roar's terrain echoes) was cross-checked against the camera:
+            // every source would have come from the mirrored side.
+            let right = [-f[2], 0.0, f[0]];
             match norm3(right) {
                 Some(r) => (d[0] * r[0] + d[1] * r[1] + d[2] * r[2]).clamp(-1.0, 1.0),
                 None => 0.0, // forward parallel to up ⇒ no stereo axis
@@ -70,13 +74,29 @@ pub fn stereo(
 mod tests {
     use super::*;
 
-    // listener at origin, facing +Z (so right is −X... verify with the math).
+    // listener at origin, facing +Z. Right = f × up = (-1, 0, 0) = −X.
     fn forward() -> [f32; 3] {
         [0.0, 0.0, 1.0]
     }
 
     fn power(s: StereoGains) -> f32 {
         s.left * s.left + s.right * s.right
+    }
+
+    /// The camera's convention, restated here so this module cannot drift from
+    /// it again: forward = (cos yaw·cos pitch, sin pitch, sin yaw·cos pitch)
+    /// (player.rs / render/camera.rs) and right = forward × up. A source
+    /// placed exactly on that right vector must be hard right, for any yaw.
+    #[test]
+    fn right_matches_the_cameras_forward_cross_up() {
+        for k in 0..12 {
+            let yaw = k as f32 * std::f32::consts::TAU / 12.0;
+            let f = [yaw.cos(), 0.0, yaw.sin()];
+            // f × (0,1,0) = (f.y*0 - f.z*1, f.z*0 - f.x*0, f.x*1 - f.y*0)
+            let r = [-f[2], 0.0, f[0]];
+            let s = stereo(1.0, [0.0; 3], f, [r[0] * 10.0, 0.0, r[2] * 10.0]);
+            assert!(s.right > 0.999 && s.left < 1e-3, "yaw {yaw}: {s:?}");
+        }
     }
 
     #[test]
@@ -87,16 +107,16 @@ mod tests {
 
     #[test]
     fn left_and_right_separate() {
-        // facing +Z, right vector = (f.z,0,-f.x) = (1,0,0) = +X.
-        let right_src = stereo(1.0, [0.0; 3], forward(), [10.0, 0.0, 0.0]); // +X
-        let left_src = stereo(1.0, [0.0; 3], forward(), [-10.0, 0.0, 0.0]); // -X
-        assert!(right_src.right > right_src.left, "+X source favours the right ear");
-        assert!(left_src.left > left_src.right, "-X source favours the left ear");
+        // facing +Z, right vector = f × up = (-1,0,0) = −X.
+        let right_src = stereo(1.0, [0.0; 3], forward(), [-10.0, 0.0, 0.0]); // -X
+        let left_src = stereo(1.0, [0.0; 3], forward(), [10.0, 0.0, 0.0]); // +X
+        assert!(right_src.right > right_src.left, "-X source favours the right ear");
+        assert!(left_src.left > left_src.right, "+X source favours the left ear");
     }
 
     #[test]
     fn hard_pan_is_one_sided() {
-        let r = stereo(1.0, [0.0; 3], forward(), [100.0, 0.0, 0.0]);
+        let r = stereo(1.0, [0.0; 3], forward(), [-100.0, 0.0, 0.0]);
         assert!(r.left < 1e-3, "a hard-right source is silent on the left");
         assert!((r.right - 1.0).abs() < 1e-3);
     }

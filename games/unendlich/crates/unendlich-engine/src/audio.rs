@@ -318,6 +318,119 @@ impl SpatialMusic {
     }
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// One-shot sound effects (the dragon roar is the first user)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Split for the two costs that differ by platform:
+// * RENDER (synthesis + terrain echo) is CPU work of tens to hundreds of ms on
+//   a phone, so it never runs on the frame thread: callers submit a closure,
+//   one worker thread renders it.
+// * PLAY is a hand-off of the finished buffer to rodio's mixer, from the
+//   worker, through a cloned `OutputStreamHandle` (Send + Sync).
+//
+// `rodio::OutputStream` itself is !Send (it owns the cpal stream), so it stays
+// in `Sfx`, held by the game loop. This is a SECOND output stream beside the
+// music's own; on PipeWire/PulseAudio and ALSA dmix two streams on one device
+// mix fine. If the device can't open a second stream, SFX run in dump-only /
+// silent mode and say so once.
+//
+// With no device at all (xvfb soaks) the worker still renders, and
+// UNENDLICH_SFX_DUMP=<dir> writes every rendered effect as a WAV there -- the
+// headless way to hear what the game produced.
+
+/// A render job: returns interleaved stereo f32 and its sample rate, or None
+/// to play nothing. `label` names the dump file and the log line.
+pub struct SfxJob {
+    pub label: String,
+    pub render: Box<dyn FnOnce() -> Option<(Vec<f32>, u32)> + Send>,
+}
+
+pub struct Sfx {
+    _stream: Option<rodio::OutputStream>,
+    jobs: std::sync::mpsc::SyncSender<SfxJob>,
+    master_bits: Arc<std::sync::atomic::AtomicU32>,
+    pub has_device: bool,
+}
+
+/// At most this many effects waiting to render; more are dropped (a flood of
+/// roars at once is noise, not information).
+pub const SFX_QUEUE: usize = 4;
+
+impl Sfx {
+    /// Open an output stream if there is one and start the render worker.
+    /// Never fails: without a device it renders for UNENDLICH_SFX_DUMP only.
+    pub fn start() -> Sfx {
+        let (stream, handle) = match rodio::OutputStream::try_default() {
+            Ok((s, h)) => (Some(s), Some(h)),
+            Err(e) => {
+                log::warn!("sfx: no output stream ({e}); effects render but are not played");
+                (None, None)
+            }
+        };
+        let has_device = handle.is_some();
+        let dump = std::env::var("UNENDLICH_SFX_DUMP").ok().map(std::path::PathBuf::from);
+        if let Some(d) = &dump {
+            let _ = std::fs::create_dir_all(d);
+            log::info!("sfx: UNENDLICH_SFX_DUMP -- writing every effect to {}", d.display());
+        }
+        let master_bits = Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits()));
+        let master = master_bits.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<SfxJob>(SFX_QUEUE);
+        let spawned = std::thread::Builder::new().name("sfx-render".into()).spawn(move || {
+            let mut n = 0u32;
+            while let Ok(job) = rx.recv() {
+                let t0 = std::time::Instant::now();
+                let Some((samples, rate)) = (job.render)() else { continue };
+                let secs = samples.len() as f32 / 2.0 / rate.max(1) as f32;
+                log::info!(
+                    "sfx: {} rendered in {:.0} ms ({:.2} s of audio)",
+                    job.label, t0.elapsed().as_secs_f32() * 1000.0, secs
+                );
+                if let Some(d) = &dump {
+                    n += 1;
+                    let safe: String = job.label.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+                    let path = d.join(format!("{n:03}_{safe}.wav"));
+                    if let Err(e) = std::fs::write(&path, crate::sim::sound_render::wav_bytes(&samples, 2, rate)) {
+                        log::warn!("sfx: dump {} failed: {e}", path.display());
+                    }
+                }
+                if let Some(h) = &handle {
+                    use rodio::Source;
+                    let m = f32::from_bits(master.load(std::sync::atomic::Ordering::Relaxed));
+                    let src = rodio::buffer::SamplesBuffer::new(2, rate, samples).amplify(m);
+                    if let Err(e) = h.play_raw(src) {
+                        log::warn!("sfx: play failed: {e}");
+                    }
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            log::warn!("sfx: could not start the render thread ({e}); effects are off");
+        }
+        Sfx { _stream: stream, jobs: tx, master_bits, has_device }
+    }
+
+    /// Queue an effect. Returns false if the queue is full (it was dropped).
+    pub fn submit(&self, job: SfxJob) -> bool {
+        match self.jobs.try_send(job) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Full(j)) => {
+                log::info!("sfx: queue full, dropped {}", j.label);
+                false
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    /// Master volume for effects (applied when each effect starts).
+    pub fn set_master_volume(&self, v01: f32) {
+        self.master_bits
+            .store(v01.clamp(0.0, 1.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

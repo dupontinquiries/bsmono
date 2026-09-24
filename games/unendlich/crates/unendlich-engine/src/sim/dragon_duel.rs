@@ -387,7 +387,10 @@ pub struct DuelState {
     /// Seconds in the current tactic.
     pub held: f32,
     pub engaged: bool,
-    pub roared: bool,
+    /// Could see the player last tick (for the sighting edge).
+    pub saw_player: bool,
+    /// Seconds until it may roar again.
+    pub roar_cd: f32,
     /// Breath fuel 0..1.
     pub fuel: f32,
     /// Seconds until another lunge may start.
@@ -412,7 +415,8 @@ impl DuelState {
             tactic: Tactic::Unaware,
             held: 0.0,
             engaged: false,
-            roared: false,
+            saw_player: false,
+            roar_cd: 0.0,
             fuel: 1.0,
             lunge_cd: 0.0,
             opening: 0.0,
@@ -451,7 +455,9 @@ pub struct DuelOut {
     pub breathe: bool,
     /// A bite lands this tick if the player is within `body_radius + LUNGE_REACH`.
     pub bite: bool,
-    /// Roar this tick (first engagement of a dreadful dragon).
+    /// Roar this tick: a dreadful dragon has just caught sight of you (any
+    /// distance it can see, well beyond engage range), at most once per
+    /// [`ROAR_COOLDOWN`].
     pub roar: bool,
     /// Nerve pressure on the player this tick, 0..1.
     pub dread: f32,
@@ -473,6 +479,8 @@ pub const LUNGE_REACH: f32 = 2.5;
 pub const ENGAGE_BASE: f32 = 28.0;
 /// Distance past which an engaged dragon gives up (unless it was hurt).
 pub const DISENGAGE: f32 = 70.0;
+/// Least time between two roars of one dragon (s).
+pub const ROAR_COOLDOWN: f32 = 45.0;
 /// Radius of a dragon's nerve pressure (m).
 pub const DREAD_RADIUS: f32 = 30.0;
 const MIN_HOLD: f32 = 0.6;
@@ -505,7 +513,6 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
     st.held += dt;
 
     // ── engagement ──────────────────────────────────────────────────────────
-    let was_engaged = st.engaged;
     let engage_at = ENGAGE_BASE + 20.0 * ferocity;
     if !st.engaged && ((s.can_see && dist < engage_at) || st.mem.hits_taken > 0) {
         st.engaged = true;
@@ -513,9 +520,15 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
     if st.engaged && dist > DISENGAGE && st.mem.total_pain() < 0.05 {
         st.engaged = false;
     }
-    let roar = st.engaged && !was_engaged && !st.roared && dread > 0.3;
+    // Roar on SIGHTING, not on engaging: the moment you come into view, from
+    // as far as it can see you. Losing you and spotting you again roars again,
+    // but not more often than ROAR_COOLDOWN.
+    st.roar_cd = (st.roar_cd - dt).max(0.0);
+    let spotted = s.can_see && !st.saw_player;
+    st.saw_player = s.can_see;
+    let roar = spotted && st.roar_cd <= 0.0 && dread > 0.3;
     if roar {
-        st.roared = true;
+        st.roar_cd = ROAR_COOLDOWN;
     }
 
     // ── what the player's item means to *this* dragon ─────────────────────
@@ -556,7 +569,7 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
             want_air: None,
             breathe: false,
             bite: false,
-            roar: false,
+            roar,
             dread: 0.0,
             why: Why { boldness, counter, respect_reach, safe_gap, reason: "not engaged" },
             scores: [
@@ -1510,7 +1523,8 @@ mod tests {
         p.cunning = 1.0; // stalk scores 0.8 against breath's 0.45
         let mut st = DuelState::new(1);
         st.engaged = true;
-        st.roared = true;
+        st.roar_cd = ROAR_COOLDOWN;
+        st.saw_player = true;
         st.tactic = Tactic::Breath;
         let mut s = senses(p.breath.max_range * 0.6);
         s.player_facing = -1.0;
@@ -1554,6 +1568,42 @@ mod tests {
             dx = (dx + yaw.cos() * 8.0 * o.speed01 * 0.05).min(px - 2.0);
         }
         assert!(bit, "never caught up; ended {:.1} m behind", px - dx);
+    }
+
+    #[test]
+    fn it_roars_when_it_first_sees_you_far_beyond_engage_range() {
+        let mut p = DuelProfile::from_genome(&genome(4));
+        p.dread = 0.8;
+        p.ferocity = 0.0; // engages at ENGAGE_BASE
+        let mut st = DuelState::new(1);
+        let o = step(&mut st, &p, &senses(60.0), DuelTuning::default(), 0.05);
+        assert!(o.roar, "should roar on sighting at 60 m");
+        assert!(!st.engaged, "…without engaging at 60 m");
+        assert_eq!(o.tactic, Tactic::Unaware);
+    }
+
+    #[test]
+    fn losing_and_regaining_sight_roars_again_after_the_cooldown() {
+        let mut p = DuelProfile::from_genome(&genome(4));
+        p.dread = 0.8;
+        p.ferocity = 0.0;
+        let mut st = DuelState::new(1);
+        let seen = senses(55.0);
+        let mut hidden = seen;
+        hidden.can_see = false;
+        let tick = |s: &DuelSenses, secs: f32, st: &mut DuelState| -> usize {
+            (0..(secs / 0.5) as usize).map(|_| step(st, &p, s, DuelTuning::default(), 0.5).roar as usize).sum()
+        };
+        let mut roars = tick(&seen, 2.0, &mut st); // spotted: 1
+        roars += tick(&hidden, 5.0, &mut st);
+        roars += tick(&seen, 2.0, &mut st); // spotted again inside the cooldown: no roar
+        assert_eq!(roars, 1);
+        roars += tick(&hidden, ROAR_COOLDOWN, &mut st);
+        roars += tick(&seen, 2.0, &mut st); // spotted after the cooldown: roar
+        assert_eq!(roars, 2);
+        // Staying in view never re-roars.
+        roars += tick(&seen, ROAR_COOLDOWN * 2.0, &mut st);
+        assert_eq!(roars, 2);
     }
 
     #[test]

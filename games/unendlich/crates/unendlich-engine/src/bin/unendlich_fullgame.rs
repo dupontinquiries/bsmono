@@ -3600,6 +3600,24 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         }
         started
     };
+    // One-shot effects: dragon roars carried over the terrain (sim::roar_synth
+    // -> sim::land_echo -> sim::sound_render, rendered on the sfx worker thread,
+    // played by rodio). UNENDLICH_SFX_VOL=0..1 (default 1; there is no UI
+    // slider for effects yet). UNENDLICH_SFX_DUMP=<dir> writes each as a WAV.
+    // Roars triggered together (a pack spotting you at once) answer each other
+    // ~0.9 s apart instead of stacking; beyond 3 s of backlog, extras are
+    // silent (their ROARS log line still prints).
+    #[cfg(feature = "audio")]
+    let mut fg_roar_stagger = unendlich_engine::sim::sound_render::Stagger::default();
+    #[cfg(feature = "audio")]
+    let fg_sfx_clock = Instant::now();
+    #[cfg(feature = "audio")]
+    let fg_sfx = {
+        let sfx = unendlich_engine::audio::Sfx::start();
+        let vol = std::env::var("UNENDLICH_SFX_VOL").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
+        sfx.set_master_volume(vol);
+        sfx
+    };
 
     // One-shot: once spawn-area chunks have streamed in, drop the UNENDLICH block
     // monument + a flora patch at the player's start position, regardless of whether
@@ -10832,6 +10850,39 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             );
                             if cam_shake_on {
                                 shake_mag = shake_mag.max(0.25 + 0.5 * d.profile.dread * duel_tuning.dread);
+                            }
+                            // The roar itself: synthesised from this dragon's genome,
+                            // carried over the land to where you stand (direct path,
+                            // ridge occlusion, cliff echoes, valley tail), rendered off
+                            // the frame thread. Terrain comes from the world generator,
+                            // not the edited world: dug-out valleys don't echo (yet).
+                            #[cfg(feature = "audio")]
+                            if let Some(pre_delay) = fg_roar_stagger.slot(fg_sfx_clock.elapsed().as_secs_f32(), 0.9, 3.0) {
+                                let voice = unendlich_engine::sim::roar_synth::RoarVoice::from_genome(&d.genome);
+                                let seed = d.id ^ (d.state.mem.hits_taken as u64).rotate_left(17) ^ (lifetime_frame as u64);
+                                let gen = chunk_manager.generator().cpu().clone();
+                                let (ymin, ymax) = (probe_y_min, probe_y_max);
+                                let src = [cr.body.position[0], cr.body.position[1] + cr.body.half_extents[1], cr.body.position[2]];
+                                let (eye, fwd3) = (pv.eye, pv.forward);
+                                let label = format!("roar_dragon{:04x}_{}m_wait{}ms", tag, dist as i32, (pre_delay * 1000.0) as i32);
+                                fg_sfx.submit(unendlich_engine::audio::SfxJob {
+                                    label: label.clone(),
+                                    render: Box::new(move || {
+                                        use unendlich_engine::sim::{land_echo, roar_synth, sound_render};
+                                        const RATE: u32 = 24_000;
+                                        let height = |x: i32, z: i32| gen.surface_y_at(x, z, ymin, ymax).map(|y| y as f32 + 1.0);
+                                        let t = std::time::Instant::now();
+                                        let plan = land_echo::plan(src, eye, fwd3, &height, &land_echo::EchoParams::default());
+                                        log::info!(
+                                            "sfx: {} — {:.0} Hz, {:.1} s, {} (terrain probe {:.0} ms)",
+                                            label, voice.pitch_hz, voice.duration_s, land_echo::describe(&plan),
+                                            t.elapsed().as_secs_f32() * 1000.0
+                                        );
+                                        let dry = roar_synth::render(&voice, RATE, seed);
+                                        let opts = sound_render::RenderOpts { pre_delay_s: pre_delay, ..sound_render::RenderOpts::default() };
+                                        Some((sound_render::render(&dry, RATE, &plan, opts), RATE))
+                                    }),
+                                });
                             }
                         }
                         for k in dd::strikes(&d.profile, &o, &body, pv.eye) {
