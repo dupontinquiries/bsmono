@@ -23,6 +23,7 @@ impl Game {
         }
 
         // 2. AI decisions
+        self.plans_this_tick = 0;
         let n = self.gods.len();
         for i in 0..n {
             if self.gods[i].respawn_t > 0.0 {

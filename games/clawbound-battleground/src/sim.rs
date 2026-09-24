@@ -294,6 +294,8 @@ pub struct Game {
     /// Per-god steering memory (`steer::Memory`): a bot's planned detour.
     /// Sim state, so a replay reproduces the same detours.
     pub steer_mem: Vec<crate::steer::Memory>,
+    /// Plans made this tick, against `steer::PLANS_PER_TICK`.
+    pub plans_this_tick: u32,
 }
 
 impl Game {
@@ -428,6 +430,7 @@ impl Game {
             disasters: crate::disasters::Disasters::default(),
             blockers: std::sync::Arc::new(crate::blockers::Blockers::default()),
             steer_mem: vec![crate::steer::Memory::default(); 10],
+            plans_this_tick: 0,
         };
         // starter items for AI gods (player buys via shop)
         for i in 0..10 {
