@@ -2235,6 +2235,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let mut hero_flight01: f32 = 0.0;
     // r573: flight banking — eased roll into turns, from the view yaw rate.
     let mut hero_bank: f32 = 0.0;
+    // First-person carry (hero_forge::HeroPose::fp_carry01), eased so drawing or
+    // stowing an item swings the arm rather than snapping it.
+    let mut hero_carry01: f32 = 0.0;
+    // The avatar's cloth garments (capes, cloaks, scarf tails): one sim::garment
+    // per piece hero_forge reports, kept across frames.
+    let mut self_garments: Vec<unendlich_engine::sim::garment::Garment> = Vec::new();
     let mut prev_view_yaw: f32 = 0.0;
     // r486: held-item swing — a short arc the viewmodel plays each time a block
     // action fires (mine/place), so the hand item visibly swings on use.
@@ -14194,6 +14200,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         let yaw_rate = if frame_dt_s > 1e-4 { dyaw / frame_dt_s } else { 0.0 };
                         let bank_target = (-yaw_rate * 0.22).clamp(-0.7, 0.7);
                         hero_bank += (bank_target - hero_bank) * (frame_dt_s * 6.0).min(1.0);
+                        let held = held_item_model(
+                            survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
+                        );
+                        // In first person the held item is carried where the eyes
+                        // see it (the camera is in the head); elsewhere the arm
+                        // hangs as the walk rig puts it.
+                        let carry_target = if camera_mode == 0 && held.is_some() { 1.0 } else { 0.0 };
+                        hero_carry01 += (carry_target - hero_carry01) * (frame_dt_s * 8.0).min(1.0);
                         let pose = unendlich_engine::hero_forge::HeroPose {
                             yaw: local_player.view.yaw,
                             gaze_pitch: av.gaze_pitch,
@@ -14201,9 +14215,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             walk_amp: hero_gait_amp,
                             anim_t: start.elapsed().as_secs_f32(),
                             held_color,
-                            held: held_item_model(
-                                survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
-                            ),
+                            held,
                             airborne: hero_airborne01,
                             vertical_vel: vvel,
                             land_crouch: hero_land_crouch,
@@ -14219,8 +14231,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             } else {
                                 0.0
                             },
+                            fp_carry01: hero_carry01,
+                            cloth_garments: true,
                         };
-                        let (hv, hi, anchors) = unendlich_engine::hero_forge::build_rigged(
+                        let (mut hv, mut hi, anchors) = unendlich_engine::hero_forge::build_rigged(
                             kind,
                             &active_character.build,
                             cur,
@@ -14228,6 +14242,27 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         );
                         if camera_mode == 0 {
                             fp_eye_anchor = Some(glm::vec3(anchors.eye[0], anchors.eye[1], anchors.eye[2]));
+                        }
+                        // Cloth garments: hung from where the rig says, in the local
+                        // wind, against the torso, and drawn with the body.
+                        if self_garments.len() != anchors.garments.len() {
+                            self_garments = anchors.garments.iter().map(unendlich_engine::sim::garment::Garment::new).collect();
+                        }
+                        let (wdx, wdz, wmag) = unendlich_engine::wind::wind_at(
+                            cur[0] as f64, cur[1] as f64, cur[2] as f64, sky_state.time_seconds as f64);
+                        // wind_at's magnitude is 0..~3 and unitless; x3 makes it
+                        // blocks/s for cloth -- a tuning guess, not seen on screen.
+                        const CLOTH_WIND_SCALE: f32 = 3.0;
+                        let wind = [wdx * wmag * CLOTH_WIND_SCALE, 0.0, wdz * wmag * CLOTH_WIND_SCALE];
+                        // A hitch would stretch each cloth substep past its stable
+                        // size (64 at most per frame); run slow through it instead.
+                        let cloth_dt = frame_dt_s.min(0.1);
+                        for (g, a) in self_garments.iter_mut().zip(&anchors.garments) {
+                            g.drive(a, &[anchors.torso], wind, cloth_dt);
+                            let (gv, gi) = g.mesh(a.color);
+                            let base = hv.len() as u32;
+                            hv.extend(gv);
+                            hi.extend(gi.iter().map(|k| k + base));
                         }
                         (hv, hi)
                     } else {
