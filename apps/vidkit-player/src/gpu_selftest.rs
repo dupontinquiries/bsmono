@@ -218,6 +218,63 @@ fn check_no_ghost(f: &Frame, got: &[[u8; 3]], (w, _h): (u32, u32)) -> Result<Str
     }
 }
 
+/// A 10-bit P010 frame, BT.2020 limited, with `transfer`: luma ramps across,
+/// chroma varies in both axes so gamut and range constants are exercised.
+fn p010(w: u32, h: u32, transfer: vidkit_core::codec::Transfer) -> Frame {
+    let mut luma = Vec::with_capacity((w * h * 2) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let code = (64 + (x * 876) / (w - 1)).saturating_sub(y % 3).max(64) as u16;
+            luma.extend_from_slice(&(code << 6).to_le_bytes());
+        }
+    }
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let mut chroma = Vec::with_capacity((cw * ch * 4) as usize);
+    for y in 0..ch {
+        for x in 0..cw {
+            let cb = (512 + x as i32 * 300 / cw as i32 - 150) as u16;
+            let cr = (512 + y as i32 * 300 / ch as i32 - 150) as u16;
+            chroma.extend_from_slice(&(cb << 6).to_le_bytes());
+            chroma.extend_from_slice(&(cr << 6).to_le_bytes());
+        }
+    }
+    Frame {
+        data: FrameData::Cpu(CpuPlanes { data: vec![luma, chroma], strides: vec![w * 2, w * 2] }),
+        width: w,
+        height: h,
+        layout: PlaneLayout::P010,
+        color: ColorInfo { matrix: vidkit_core::frame::Matrix::Bt2020Ncl, transfer, range: vidkit_core::frame::Range::Limited },
+        pts: std::time::Duration::ZERO,
+        duration: None,
+        recycle: None,
+    }
+}
+
+/// GPU vs vidkit-core's CPU converter on the whole frame.
+fn check_vs_cpu(f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String, String> {
+    let FrameData::Cpu(pl) = &f.data else { return Err("not cpu".into()) };
+    let cpu = vidkit_core::planes_to_rgba8(pl, f.layout, f.color, w as usize, h as usize).map_err(|e| e.to_string())?;
+    let mut worst = 0u8;
+    let mut at = 0usize;
+    for (i, p) in got.iter().enumerate() {
+        for c in 0..3 {
+            let d = p[c].abs_diff(cpu[i * 4 + c]);
+            if d > worst {
+                worst = d;
+                at = i;
+            }
+        }
+    }
+    let spread = got.iter().map(|p| p[0]).max().unwrap_or(0) as i32 - got.iter().map(|p| p[0]).min().unwrap_or(0) as i32;
+    if worst > 3 {
+        Err(format!("max error {worst}/255 against the CPU converter at pixel {at} (gpu {:?})", got[at]))
+    } else if spread < 100 {
+        Err(format!("output range only {spread}: the fixture did not exercise the curve"))
+    } else {
+        Ok(format!("max error {worst}/255, output spans {spread} codes"))
+    }
+}
+
 fn cases() -> Vec<Case> {
     // 2-D pattern: soft diagonal field plus a bright square near the TOP-LEFT,
     // so a vertical or horizontal flip anywhere shows as a large error.
@@ -241,6 +298,8 @@ fn cases() -> Vec<Case> {
             out: (64, 48),
             check: check_no_ghost,
         },
+        Case { name: "HDR10 PQ, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Pq), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
+        Case { name: "HLG, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Hlg), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
         Case { name: "plain conversion", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance::default(), out: (64, 48), check: check_plain },
         Case { name: "RCAS offscreen pass", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
         Case { name: "bicubic 2x on a ramp", history: vec![], frame: nv12(32, 16, |x, _| (40 + x * 4) as u8), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_ramp },

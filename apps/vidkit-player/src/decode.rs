@@ -35,7 +35,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use vidkit_core::frame::{ColorInfo, CpuPlanes, Frame, FrameData, PlaneLayout};
+use vidkit_core::codec::Transfer;
+use vidkit_core::frame::{ColorInfo, CpuPlanes, Frame, FrameData, Matrix, PlaneLayout, Range};
 
 /// What ffprobe says about a video stream.
 #[derive(Clone, PartialEq, Debug)]
@@ -47,11 +48,58 @@ pub struct Probe {
     /// ffmpeg's codec name (`h264`, `vp9`, `av1`...). Empty when ffprobe did
     /// not say; hardware selection then declines rather than guessing.
     pub codec: String,
+    /// The stream's pixel format (`yuv420p`, `yuv420p10le`, `yuvj420p`...).
+    pub pix_fmt: String,
+    /// ffprobe's colour tags, verbatim; empty when untagged.
+    pub color_space: String,
+    pub color_range: String,
+    pub color_transfer: String,
+}
+
+impl Probe {
+    /// More than 8 bits a sample: decoded to P010, so the precision reaches
+    /// the GPU instead of being rounded (and banded) to 8 bits by ffmpeg.
+    pub fn high_bit_depth(&self) -> bool {
+        ["p10", "p12", "p16", "p010", "p016"].iter().any(|t| self.pix_fmt.contains(t))
+    }
+
+    /// What the pixels mean. Pure.
+    ///
+    /// Frames were tagged BT.709 limited whatever the file said, so BT.601
+    /// SD video and full-range phone recordings were converted with the
+    /// wrong matrix or range. Untagged: the usual convention -- under 720
+    /// lines BT.601, else BT.709 -- and limited, unless the pixel format is
+    /// a `yuvj` (JPEG, full-range) one.
+    pub fn color(&self) -> ColorInfo {
+        let matrix = match self.color_space.as_str() {
+            "bt709" => Matrix::Bt709,
+            "bt470bg" | "smpte170m" | "bt601" => Matrix::Bt601,
+            "bt2020nc" | "bt2020c" | "bt2020_ncl" | "bt2020_cl" => Matrix::Bt2020Ncl,
+            _ if self.height >= 720 => Matrix::Bt709,
+            _ => Matrix::Bt601,
+        };
+        let range = match self.color_range.as_str() {
+            "pc" | "jpeg" | "full" => Range::Full,
+            "tv" | "mpeg" | "limited" => Range::Limited,
+            _ if self.pix_fmt.starts_with("yuvj") => Range::Full,
+            _ => Range::Limited,
+        };
+        let transfer = match self.color_transfer.as_str() {
+            "smpte2084" => Transfer::Pq,
+            "arib-std-b67" => Transfer::Hlg,
+            _ => Transfer::Sdr,
+        };
+        ColorInfo { matrix, transfer, range }
+    }
+
+    pub fn layout(&self) -> PlaneLayout {
+        if self.high_bit_depth() { PlaneLayout::P010 } else { PlaneLayout::Nv12 }
+    }
 }
 
 /// The ffprobe arguments shared by the file and URL probes. `codec_name` is
 /// asked for because hardware decode is chosen per codec.
-const PROBE_ENTRIES: &str = "stream=codec_name,width,height,r_frame_rate";
+const PROBE_ENTRIES: &str = "stream=codec_name,width,height,r_frame_rate,pix_fmt,color_space,color_range,color_transfer";
 
 /// Parse `ffprobe -show_entries stream=...` output.
 ///
@@ -64,12 +112,21 @@ pub fn parse_probe(text: &str) -> Option<Probe> {
     let mut h = None;
     let mut fps = None;
     let mut codec = String::new();
+    let (mut pix_fmt, mut color_space, mut color_range, mut color_transfer) = (String::new(), String::new(), String::new(), String::new());
+    let tag = |v: &str| {
+        let v = v.trim();
+        if v == "unknown" || v == "N/A" { String::new() } else { v.to_string() }
+    };
     for line in text.lines() {
         let (k, v) = line.split_once('=')?;
         match k.trim() {
             "width" => w = v.trim().parse().ok(),
             "height" => h = v.trim().parse().ok(),
             "codec_name" => codec = v.trim().to_string(),
+            "pix_fmt" => pix_fmt = tag(v),
+            "color_space" => color_space = tag(v),
+            "color_range" => color_range = tag(v),
+            "color_transfer" => color_transfer = tag(v),
             "r_frame_rate" => {
                 let v = v.trim();
                 fps = match v.split_once('/') {
@@ -90,6 +147,10 @@ pub fn parse_probe(text: &str) -> Option<Probe> {
         // captures report none, and 24 is a better guess than refusing.
         fps: fps.filter(|f| *f > 0.0).unwrap_or(24.0),
         codec,
+        pix_fmt,
+        color_space,
+        color_range,
+        color_transfer,
     })
 }
 
@@ -399,6 +460,16 @@ impl VideoInput {
 /// an audio stream either decodes it for nothing or — with the rawvideo muxer,
 /// which cannot hold audio — refuses to start at all.
 pub fn video_args(src: &VideoInput, from: Duration, accel: &Accel, scale_to: Option<(u32, u32)>) -> Vec<String> {
+    video_args_fmt(src, from, accel, scale_to, PlaneLayout::Nv12)
+}
+
+/// [`video_args`] for an output layout: NV12, or P010 for a 10/12-bit source
+/// so its precision reaches the GPU.
+pub fn video_args_fmt(src: &VideoInput, from: Duration, accel: &Accel, scale_to: Option<(u32, u32)>, layout: PlaneLayout) -> Vec<String> {
+    let (pix, vaapi_fmt) = match layout {
+        PlaneLayout::P010 => ("p010le", "p010"),
+        _ => ("nv12", "nv12"),
+    };
     let mut a: Vec<String> = vec!["-v".into(), "error".into(), "-nostdin".into()];
     let push = |a: &mut Vec<String>, xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
 
@@ -435,7 +506,7 @@ pub fn video_args(src: &VideoInput, from: Duration, accel: &Accel, scale_to: Opt
 
     if let Some((w, h)) = scale_to {
         let vf = match accel {
-            Accel::Vaapi { .. } => format!("scale_vaapi=w={w}:h={h}:format=nv12,hwdownload,format=nv12"),
+            Accel::Vaapi { .. } => format!("scale_vaapi=w={w}:h={h}:format={vaapi_fmt},hwdownload,format={vaapi_fmt}"),
             // Bilinear, not swscale's bicubic default: for a downscale of two
             // or less the difference is invisible at arm's length and it is
             // roughly half the work per pixel, which on a phone core is the
@@ -445,7 +516,7 @@ pub fn video_args(src: &VideoInput, from: Duration, accel: &Accel, scale_to: Opt
         a.push("-vf".into());
         a.push(vf);
     }
-    push(&mut a, &["-f", "rawvideo", "-pix_fmt", "nv12", "-"]);
+    push(&mut a, &["-f", "rawvideo", "-pix_fmt", pix, "-"]);
     a
 }
 
@@ -530,6 +601,10 @@ pub struct FfmpegFrames {
     pub width: u32,
     pub height: u32,
     pub frame_interval: Duration,
+    /// NV12, or P010 for a high-bit-depth source.
+    pub layout: PlaneLayout,
+    /// What the pixels mean, from the stream's tags.
+    pub color: ColorInfo,
     index: u64,
     pub frames_read: u64,
     /// What is decoding NOW (after any fallback), for the status line.
@@ -621,14 +696,17 @@ impl FfmpegFrames {
     ) -> Result<Self, String> {
         let scale_to = fit_long_edge(p.width, p.height, max_long_edge);
         let (w, h) = scale_to.unwrap_or((p.width, p.height));
-        let args = video_args(src, from, &accel, scale_to);
-        let fallback = accel.is_hardware().then(|| video_args(src, from, &Accel::Software, scale_to));
+        let layout = p.layout();
+        let args = video_args_fmt(src, from, &accel, scale_to, layout);
+        let fallback = accel.is_hardware().then(|| video_args_fmt(src, from, &Accel::Software, scale_to, layout));
         let child = spawn_ffmpeg(&args)?;
         Ok(Self {
             child,
             width: w,
             height: h,
             frame_interval: Duration::from_secs_f64(1.0 / p.fps.max(1.0)),
+            layout,
+            color: p.color(),
             // Timestamps on the MEDIA timeline from the first frame: opened at
             // 2 s, the first frame is stamped 2 s. Starting at zero stamped a
             // seeked decoder's frames 0 s, 0.033 s... against a clock at 2 s,
@@ -640,6 +718,15 @@ impl FfmpegFrames {
             note: None,
             pool: PlanePool::new(),
         })
+    }
+
+    pub fn bytes_per_sample(&self) -> usize {
+        if self.layout == PlaneLayout::P010 { 2 } else { 1 }
+    }
+
+    /// Bytes in one frame of this decoder's output.
+    pub fn frame_bytes(&self) -> usize {
+        frame_bytes(self.width, self.height) * self.bytes_per_sample()
     }
 
     /// Share a pool with the consumer, which returns planes to it.
@@ -661,7 +748,8 @@ impl FfmpegFrames {
     /// The next frame, or `None` at the end of the stream.
     pub fn next_frame(&mut self) -> Option<Frame> {
         let (w, h) = (self.width as usize, self.height as usize);
-        let (luma_len, chroma_len) = (w * h, frame_bytes(self.width, self.height) - w * h);
+        let bps = self.bytes_per_sample();
+        let (luma_len, chroma_len) = (w * h * bps, self.frame_bytes() - w * h * bps);
         loop {
             let mut luma = self.pool.take(luma_len);
             let mut chroma = self.pool.take(chroma_len);
@@ -670,11 +758,12 @@ impl FfmpegFrames {
                 self.index += 1;
                 self.frames_read += 1;
                 return Some(Frame {
-                    data: FrameData::Cpu(CpuPlanes { data: vec![luma, chroma], strides: vec![self.width, self.width] }),
+                    // Strides in BYTES: two per sample for P010.
+                    data: FrameData::Cpu(CpuPlanes { data: vec![luma, chroma], strides: vec![self.width * bps as u32; 2] }),
                     width: self.width,
                     height: self.height,
-                    layout: PlaneLayout::Nv12,
-                    color: ColorInfo::default(),
+                    layout: self.layout,
+                    color: self.color,
                     pts,
                     duration: Some(self.frame_interval),
                     recycle: None,
@@ -1022,6 +1111,65 @@ impl FfmpegFrames {
     pub fn open_streaming(input: &StreamingInput, max_long_edge: Option<u32>) -> Result<Self, String> {
         let p = probe_input(&input.video_url, &input.headers)?;
         Self::open_probed(&VideoInput::url(&input.video_url, &input.headers), &p, max_long_edge, Duration::ZERO, Accel::Software)
+    }
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+
+    fn probe(fields: &str) -> Probe {
+        parse_probe(&format!("codec_name=hevc\nwidth=3840\nheight=2160\nr_frame_rate=24/1\n{fields}")).unwrap()
+    }
+
+    #[test]
+    fn hdr10_is_recognised_and_decoded_to_p010() {
+        let p = probe("pix_fmt=yuv420p10le\ncolor_space=bt2020nc\ncolor_range=tv\ncolor_transfer=smpte2084");
+        assert_eq!(p.color(), ColorInfo { matrix: Matrix::Bt2020Ncl, transfer: Transfer::Pq, range: Range::Limited });
+        assert_eq!(p.layout(), PlaneLayout::P010);
+        let a = video_args_fmt(&VideoInput::file(Path::new("x")), Duration::ZERO, &Accel::Software, None, p.layout());
+        assert!(a.windows(2).any(|w| w[0] == "-pix_fmt" && w[1] == "p010le"), "{a:?}");
+        let v = video_args_fmt(&VideoInput::file(Path::new("x")), Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into() }, Some((1920, 1080)), PlaneLayout::P010);
+        assert!(v.iter().any(|x| x.contains("format=p010,hwdownload,format=p010")), "{v:?}");
+    }
+
+    #[test]
+    fn untagged_and_legacy_streams_get_the_usual_conventions() {
+        let sd = parse_probe("width=720\nheight=576\nr_frame_rate=25/1\npix_fmt=yuv420p\ncolor_space=unknown\ncolor_range=unknown\ncolor_transfer=unknown").unwrap();
+        assert_eq!(sd.color(), ColorInfo { matrix: Matrix::Bt601, transfer: Transfer::Sdr, range: Range::Limited }, "SD: BT.601");
+        assert_eq!(sd.layout(), PlaneLayout::Nv12);
+        let hd = probe("pix_fmt=yuv420p");
+        assert_eq!(hd.color().matrix, Matrix::Bt709, "HD untagged: BT.709");
+        let phone = probe("pix_fmt=yuvj420p");
+        assert_eq!(phone.color().range, Range::Full, "yuvj is full range");
+        let hlg = probe("pix_fmt=yuv420p10le\ncolor_space=bt2020nc\ncolor_transfer=arib-std-b67");
+        assert_eq!(hlg.color().transfer, Transfer::Hlg);
+    }
+
+    /// A real 10-bit PQ-tagged clip through ffprobe and the decoder: P010
+    /// frames of the right size, carrying the stream's colour.
+    #[test]
+    fn a_real_hdr10_clip_decodes_to_tagged_p010() {
+        if Command::new("ffmpeg").arg("-version").stdout(Stdio::null()).status().is_err() { return; }
+        let f = std::env::temp_dir().join(format!("vk-hdr-{}.mkv", std::process::id()));
+        let ok = Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=10:duration=1",
+            "-pix_fmt", "yuv420p10le", "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "-color_range", "tv",
+            "-c:v", "ffv1"]).arg(&f).status().map(|s| s.success()).unwrap_or(false);
+        assert!(ok, "fixture");
+        let p = super::probe(&f).unwrap();
+        assert_eq!((p.layout(), p.color().transfer, p.color().matrix), (PlaneLayout::P010, Transfer::Pq, Matrix::Bt2020Ncl), "{p:?}");
+        let mut d = FfmpegFrames::open_probed(&VideoInput::file(&f), &p, None, Duration::ZERO, Accel::Software).unwrap();
+        let fr = d.next_frame().expect("a frame");
+        assert_eq!(fr.layout, PlaneLayout::P010);
+        assert_eq!(fr.color.transfer, Transfer::Pq);
+        if let FrameData::Cpu(pl) = &fr.data {
+            assert_eq!(pl.data[0].len(), 128 * 72 * 2, "two bytes a luma sample");
+            assert_eq!(pl.strides[0], 256);
+            // P010 keeps its 10 bits HIGH: the low 6 bits of every sample are 0.
+            let low_bits: u32 = pl.data[0].chunks_exact(2).map(|b| (b[0] & 0x3f) as u32).sum();
+            assert_eq!(low_bits, 0, "not P010's layout");
+        }
+        let _ = std::fs::remove_file(&f);
     }
 }
 

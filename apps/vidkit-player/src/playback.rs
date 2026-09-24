@@ -406,7 +406,7 @@ impl Engine {
         if let Ok(mut d) = self.decoder.lock() {
             *d = format!("{} {}x{}", video.accel.label(), video.width, video.height);
         }
-        let fb = crate::decode::frame_bytes(video.width, video.height);
+        let fb = video.frame_bytes();
         self.depth = queue_depth(fb);
         let (tx, rx) = mpsc::sync_channel::<Frame>(channel_depth(fb));
         let (stop, decoder) = (self.stop.clone(), self.decoder.clone());

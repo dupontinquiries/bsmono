@@ -91,6 +91,44 @@ uniform float flip_y;
 // takes its sharpness from luma.
 uniform int scaler;
 uniform vec2 y_size;
+// 0 SDR, 1 PQ, 2 HLG; and whether the planes are 16-bit P010.
+uniform int transfer_id;
+uniform int ten_bit;
+
+// Mirrors vidkit-core's pq_eotf / hlg_eotf / tonemap / hdr_to_sdr exactly.
+float pq_eotf(float e) {
+    float ep = pow(max(e, 0.0), 1.0 / 78.84375);
+    float num = max(ep - 0.8359375, 0.0);
+    float den = max(18.8515625 - 18.6875 * ep, 1e-6);
+    return pow(num / den, 1.0 / 0.1593017578125);
+}
+float hlg_eotf(float e) {
+    return e <= 0.5 ? (e * e) / 3.0 : (exp((e - 0.55991073) / 0.17883277) + 0.28466892) / 12.0;
+}
+float knee(float v) {
+    return v <= 0.8 ? v : 0.8 + 0.2 * ((v - 0.8) / ((v - 0.8) + 0.2));
+}
+vec3 hdr_to_sdr(vec3 rgb) {
+    vec3 lin;
+    if (transfer_id == 1) {
+        lin = vec3(pq_eotf(rgb.r), pq_eotf(rgb.g), pq_eotf(rgb.b)) * (10000.0 / 203.0);
+    } else {
+        vec3 sc = vec3(hlg_eotf(rgb.r), hlg_eotf(rgb.g), hlg_eotf(rgb.b));
+        float ys = dot(sc, vec3(0.2627, 0.6780, 0.0593));
+        float k = ys > 0.0 ? pow(ys, 0.2) : 0.0;
+        lin = sc * k * (1000.0 / 203.0);
+    }
+    if (matrix_id == 2) {
+        lin = vec3(dot(vec3(1.6605, -0.5876, -0.0728), lin),
+                   dot(vec3(-0.1246, 1.1329, -0.0083), lin),
+                   dot(vec3(-0.0182, -0.1006, 1.1187), lin));
+    }
+    lin = max(lin, vec3(0.0));
+    float peak = max(lin.r, max(lin.g, lin.b));
+    float s = peak > 0.0 ? knee(peak) / peak : 0.0;
+    vec3 l = clamp(lin * s, 0.0, 1.0);
+    return mix(1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055, 12.92 * l, vec3(lessThanEqual(l, vec3(0.0031308))));
+}
 
 // Catmull-Rom in 9 bilinear taps instead of 16 point taps: the middle two
 // weights of each axis are merged into one linear fetch (TheRealMJP's
@@ -129,15 +167,22 @@ void main() {
     float y = scaler == 1 ? clamp(bicubic_y(t), 0.0, 1.0) : texture(plane_y, t).r;
     vec2 c = texture(plane_uv, t).rg;
 
+    // Range constants in the planes' own normalisation: 8-bit 16/219/128/224,
+    // P010 (10 bits high in 16) 64/876/512/896 -- the 8-bit set on 10-bit
+    // data is a green cast in PQ (see vidkit-core SampleFormat::limited).
+    float black = ten_bit == 1 ? 4096.0 / 65535.0 : 16.0 / 255.0;
+    float ys = ten_bit == 1 ? 65535.0 / (876.0 * 64.0) : 255.0 / 219.0;
+    float mid = ten_bit == 1 ? 32768.0 / 65535.0 : (range_id == 0 ? 128.0 / 255.0 : 0.5);
+    float cs = ten_bit == 1 ? 65535.0 / (896.0 * 64.0) : 255.0 / 224.0;
     float yv, cb, cr;
     if (range_id == 0) {
-        yv = (y  - 16.0 / 255.0) * (255.0 / 219.0);
-        cb = (c.r - 128.0 / 255.0) * (255.0 / 224.0);
-        cr = (c.g - 128.0 / 255.0) * (255.0 / 224.0);
+        yv = (y - black) * ys;
+        cb = (c.r - mid) * cs;
+        cr = (c.g - mid) * cs;
     } else {
         yv = y;
-        cb = c.r - 0.5;
-        cr = c.g - 0.5;
+        cb = c.r - mid;
+        cr = c.g - mid;
     }
 
     vec3 rgb;
@@ -153,6 +198,9 @@ void main() {
         rgb = vec3(yv + 1.57480 * cr,
                    yv - 0.18732 * cb - 0.46812 * cr,
                    yv + 1.85560 * cb);
+    }
+    if (transfer_id != 0) {
+        rgb = hdr_to_sdr(rgb);
     }
     frag = vec4(clamp(rgb, 0.0, 1.0), 1.0);
 }
@@ -367,6 +415,7 @@ pub struct Nv12Gpu {
     tex_y: glow::Texture,
     tex_uv: glow::Texture,
     size: (u32, u32),
+    layout: PlaneLayout,
     color: ColorInfo,
     uploaded_bytes: u64,
     uploads: u64,
@@ -415,6 +464,7 @@ impl Nv12Gpu {
             tex_y,
             tex_uv,
             size: (0, 0),
+            layout: PlaneLayout::Nv12,
             color: ColorInfo::default(),
             uploaded_bytes: 0,
             uploads: 0,
@@ -438,11 +488,14 @@ impl Nv12Gpu {
     /// # Safety
     /// `gl` must be current.
     pub unsafe fn upload(&mut self, gl: &glow::Context, frame: &Frame) -> Result<(), String> {
-        if frame.layout != PlaneLayout::Nv12 {
-            // Only NV12 for now. Refusing beats uploading a 10-bit plane as if
-            // it were 8-bit, which is a picture of noise.
-            return Err(format!("{:?} is not handled by the GPU path", frame.layout));
-        }
+        // NV12, and P010 as 16-bit normalised textures (R16 / RG16: desktop
+        // GL 3.3 core; GLES needs EXT_texture_norm16). Anything else is
+        // refused -- uploading a 10-bit plane as 8-bit is a picture of noise.
+        let (y_fmt, uv_fmt, ty, bps) = match frame.layout {
+            PlaneLayout::Nv12 => (glow::R8, glow::RG8, glow::UNSIGNED_BYTE, 1u32),
+            PlaneLayout::P010 => (glow::R16, glow::RG16, glow::UNSIGNED_SHORT, 2u32),
+            other => return Err(format!("{other:?} is not handled by the GPU path")),
+        };
         let planes: &CpuPlanes = match &frame.data {
             FrameData::Cpu(p) => p,
             FrameData::DmaBuf(_) => return Err("dma-buf needs the Vulkan path".into()),
@@ -459,26 +512,27 @@ impl Nv12Gpu {
         // frame.
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
 
-        let y_stride = planes.strides.first().copied().unwrap_or(w);
-        gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, y_stride as i32);
+        // Row length is in TEXELS; strides are in BYTES.
+        let y_stride = planes.strides.first().copied().unwrap_or(w * bps);
+        gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, (y_stride / bps) as i32);
         // Same size as last frame: write into the existing storage. A fresh
         // tex_image_2d every frame reallocates both textures sixty times a
         // second, which some drivers turn into a stall on the last frame's
         // draw still reading the old storage.
-        let same = self.size == (w, h);
+        let same = self.size == (w, h) && self.layout == frame.layout;
         gl.bind_texture(glow::TEXTURE_2D, Some(self.tex_y));
         if same {
-            gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, w as i32, h as i32, glow::RED, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(&planes.data[0])));
+            gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, w as i32, h as i32, glow::RED, ty, glow::PixelUnpackData::Slice(Some(&planes.data[0])));
         } else {
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
-                glow::R8 as i32,
+                y_fmt as i32,
                 w as i32,
                 h as i32,
                 0,
                 glow::RED,
-                glow::UNSIGNED_BYTE,
+                ty,
                 glow::PixelUnpackData::Slice(Some(&planes.data[0])),
             );
         }
@@ -487,21 +541,21 @@ impl Nv12Gpu {
         // the row length in TEXELS is half it. Passing the byte stride here
         // doubles the row and skews the colour but not the luma, which reads as
         // a decoder bug rather than an upload one.
-        let uv_stride_bytes = planes.strides.get(1).copied().unwrap_or(cw * 2);
-        gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, (uv_stride_bytes / 2) as i32);
+        let uv_stride_bytes = planes.strides.get(1).copied().unwrap_or(cw * 2 * bps);
+        gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, (uv_stride_bytes / (2 * bps)) as i32);
         gl.bind_texture(glow::TEXTURE_2D, Some(self.tex_uv));
         if same {
-            gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, cw as i32, ch as i32, glow::RG, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(&planes.data[1])));
+            gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, cw as i32, ch as i32, glow::RG, ty, glow::PixelUnpackData::Slice(Some(&planes.data[1])));
         } else {
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
-                glow::RG8 as i32,
+                uv_fmt as i32,
                 cw as i32,
                 ch as i32,
                 0,
                 glow::RG,
-                glow::UNSIGNED_BYTE,
+                ty,
                 glow::PixelUnpackData::Slice(Some(&planes.data[1])),
             );
         }
@@ -511,6 +565,7 @@ impl Nv12Gpu {
         gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
 
         self.size = (w, h);
+        self.layout = frame.layout;
         self.color = frame.color;
         if self.enhance.temporal {
             // A seek, a jump or a size change restarts the average: blending
@@ -528,7 +583,7 @@ impl Nv12Gpu {
         }
         self.last_pts = Some(frame.pts);
         self.uploads += 1;
-        self.uploaded_bytes += upload_bytes(PlaneLayout::Nv12, w as usize, h as usize) as u64;
+        self.uploaded_bytes += upload_bytes(frame.layout, w as usize, h as usize) as u64;
         Ok(())
     }
 
@@ -637,6 +692,13 @@ impl Nv12Gpu {
         if let Some(l) = u("flip_y") { gl.uniform_1_f32(Some(&l), flip_y); }
         if let Some(l) = u("scaler") { gl.uniform_1_i32(Some(&l), (self.enhance.scaler == Scaler::Bicubic) as i32); }
         if let Some(l) = u("y_size") { gl.uniform_2_f32(Some(&l), self.size.0 as f32, self.size.1 as f32); }
+        let tid = match self.color.transfer {
+            vidkit_core::codec::Transfer::Sdr => 0,
+            vidkit_core::codec::Transfer::Pq => 1,
+            vidkit_core::codec::Transfer::Hlg => 2,
+        };
+        if let Some(l) = u("transfer_id") { gl.uniform_1_i32(Some(&l), tid); }
+        if let Some(l) = u("ten_bit") { gl.uniform_1_i32(Some(&l), (self.layout == PlaneLayout::P010) as i32); }
         gl.disable(glow::DEPTH_TEST);
         gl.draw_arrays(glow::TRIANGLES, 0, 3);
     }
