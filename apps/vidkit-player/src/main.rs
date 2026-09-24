@@ -165,6 +165,9 @@ struct Player {
     seen_index: Option<seen::Index>,
     seen_query: String,
     seen_hits: Vec<seen::SeenHit>,
+    /// Picture-in-picture: the video floats, the chapters take the screen.
+    pip: vidkit_egui::Pip,
+    pip_on: bool,
 }
 
 const SPEED_SETTLE: Duration = Duration::from_millis(250);
@@ -330,6 +333,8 @@ impl Player {
             seen_index: None,
             seen_query: String::new(),
             seen_hits: Vec::new(),
+            pip: Default::default(),
+            pip_on: false,
         };
         // A file named on the command line gets its transcript too.
         if let Some(p) = me.path.clone().filter(|_| me.engine.is_some()) {
@@ -612,6 +617,10 @@ impl eframe::App for Player {
                     if ui.selectable_label(self.subtitles, "CC").on_hover_text("subtitles from the transcript").clicked() {
                         self.subtitles = !self.subtitles;
                     }
+                    if ui.selectable_label(self.pip_on, "PiP").on_hover_text("float the video over the chapters; drag it off the side to hide it").clicked() {
+                        self.pip_on = !self.pip_on;
+                        self.pip.unhide();
+                    }
                 });
             }
             None => {
@@ -622,6 +631,18 @@ impl eframe::App for Player {
         // After the top bar, so the panel sits beside the picture rather than
         // claiming the full window height and pushing its strip under the bar.
         self.sections_ui(ctx);
+
+        if self.pip_on {
+            // The chapters are the page; the video floats over it.
+            let page = egui::CentralPanel::default().show(ctx, |ui| self.sections_in(ui));
+            for a in page.inner {
+                self.section_action(a);
+            }
+            self.pip_ui(ctx, page.response.rect);
+            self.palette_ui(ctx);
+            self.picker_ui(ctx);
+            return;
+        }
 
         let central = egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(gpu) = self.gpu.clone() {
@@ -1434,10 +1455,9 @@ impl Player {
         }
     }
 
-    fn sections_ui(&mut self, ctx: &egui::Context) {
-        if !self.sections_open {
-            return;
-        }
+    /// The sections panel's contents into `ui`: beside the video normally,
+    /// the whole page in picture-in-picture.
+    fn sections_in(&mut self, ui: &mut egui::Ui) -> Vec<vidkit_egui::SectionAction> {
         let (status, progress, transcribed, total, mode) = match &self.worker {
             Some(w) => w.with(|s| {
                 let rtf = s.realtime_factor.map(|r| format!(" · {r:.2}× realtime")).unwrap_or_default();
@@ -1462,18 +1482,24 @@ impl Player {
             scope,
             can_export: self.path.is_some(),
         };
+        self.sections.ui(ui, &model)
+    }
+
+    fn sections_ui(&mut self, ctx: &egui::Context) {
+        if !self.sections_open || self.pip_on {
+            return;
+        }
         // A phone in portrait has no room beside the picture: underneath.
         let narrow = ctx.content_rect().width() < 700.0;
-        let panel = &mut self.sections;
         let actions = if narrow {
             // Capped at half the screen: sized to its content, a long chapter
             // list took most of a phone's height and left the picture a strip.
             let cap = ctx.content_rect().height() * 0.5;
             egui::TopBottomPanel::bottom("sections").resizable(true).default_height(280.0_f32.min(cap)).max_height(cap)
-                .show(ctx, |ui| panel.ui(ui, &model)).inner
+                .show(ctx, |ui| self.sections_in(ui)).inner
         } else {
             egui::SidePanel::right("sections").resizable(true).default_width(340.0)
-                .show(ctx, |ui| panel.ui(ui, &model)).inner
+                .show(ctx, |ui| self.sections_in(ui)).inner
         };
         for a in actions {
             self.section_action(a);
@@ -1676,6 +1702,48 @@ impl Player {
         }
         if self.engine.is_some() {
             self.seek_to(at);
+        }
+    }
+}
+
+impl Player {
+    /// The floating video. Tapping it expands back to full screen; flinging
+    /// it off a side hides it behind a tab while the sound carries on.
+    fn pip_ui(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        let size = match &self.gpu {
+            Some(g) => g.lock().map(|g| g.size()).map(|(w, h)| egui::Vec2::new(w as f32, h as f32)).unwrap_or_default(),
+            None => self.presenter.frame_size(),
+        };
+        let aspect = if size.y > 0.0 { size.x / size.y } else { 16.0 / 9.0 };
+        let (gpu, fit) = (self.gpu.clone(), self.view.fit);
+        let tex = self.presenter.texture().map(|t| t.id());
+        if std::env::var_os("VIDKIT_PIP_DEBUG").is_some() {
+            // Read the pointer, THEN ask the context: calling ctx inside
+            // ctx.input deadlocks egui's lock.
+            let pressed = ctx.input(|i| i.pointer.interact_pos().filter(|_| i.pointer.any_pressed() || i.pointer.any_released()));
+            if let Some(p) = pressed {
+                eprintln!("PIPDBG pos={p:?} layer={:?} pip={:?} screen={screen:?}", ctx.layer_id_at(p), self.pip.rect(screen, aspect));
+            }
+        }
+        let (_, action) = self.pip.show(ctx, screen, aspect, |ui, r| {
+            let v = vidkit_egui::fit_rect(r, size, vidkit_egui::PixelAspect::SQUARE, fit);
+            match (&gpu, tex) {
+                (Some(g), _) if v.width() > 0.0 => {
+                    ui.painter().add(vidkit_egui::glow_present::callback(v, g.clone()));
+                }
+                (None, Some(id)) => {
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    ui.painter().image(id, v, uv, egui::Color32::WHITE);
+                }
+                _ => {}
+            }
+        });
+        match action {
+            Some(vidkit_egui::PipAction::Expand) => self.pip_on = false,
+            Some(vidkit_egui::PipAction::Hid(_)) => {
+                self.gpu_error = Some("video hidden — the sound carries on; tap the tab to bring it back".into());
+            }
+            Some(vidkit_egui::PipAction::Unhide) | None => {}
         }
     }
 }
