@@ -91,6 +91,7 @@ pub mod rack_panel;
 pub mod seq_header;
 pub mod assembly;
 pub mod deliver;
+pub mod story_check;
 
 /// Everything the running editor holds.
 pub struct Studio {
@@ -6340,6 +6341,18 @@ impl App {
                     self.studio.status = if self.words_raw.is_empty() {
                         "no transcripts loaded yet — the filter applies once they are".into()
                     } else { self.refilter_words() };
+                }
+                palette::ShellVerb::CheckStory => {
+                    let project = &self.studio.session.doc.project;
+                    let (cs, unread) = story_check::gather(project, &self.words_raw, &self.project_path);
+                    if cs.is_empty() {
+                        self.studio.status = "constraints: nothing to check against -- outline.txt, constraints.txt, a .lrc, or loaded transcripts".into();
+                    } else {
+                        let (report, ops) = story_check::check(project, &cs, &self.words_raw);
+                        if !ops.is_empty() { self.studio.edit_group(ops, "constraints checked"); }
+                        self.studio.status = format!("constraints ({}): {}{}", cs.len(), report.summary(),
+                            if unread.is_empty() { String::new() } else { format!(" -- could not read: {}", unread.join("; ")) });
+                    }
                 }
                 palette::ShellVerb::DraftStory => {
                     self.studio.status = match assembly::draft_story(&self.studio.session.doc.project, &self.words_raw, &self.project_path) {

@@ -126,6 +126,8 @@ pub enum ShellVerb {
     Assemble,
     /// Draft outline.txt from the footage (`assembly::draft_story`).
     DraftStory,
+    /// Check the timeline against its documents and footage (`story_check`).
+    CheckStory,
     /// Give the selected clips the held look, at `pct`% strength.
     StylePaste(u32),
     /// What the selected clips' effects do after the clips end: `ring_ms` of
@@ -385,6 +387,9 @@ pub fn root() -> Vec<Choice> {
         c("story: draft an outline from the footage",
           Some("scenes from what is said; edit outline.txt, then assemble"),
           Then::Do(Act::Shell(ShellVerb::DraftStory))),
+        c("constraints: check the timeline against its documents",
+          Some("outline, constraints.txt, .lrc, and what the takes rule out"),
+          Then::Do(Act::Shell(ShellVerb::CheckStory))),
         c("assemble a first cut from the transcripts",
           Some("order from outline.txt / script.txt; reviews as markers"),
           Then::Do(Act::Shell(ShellVerb::Assemble))),
