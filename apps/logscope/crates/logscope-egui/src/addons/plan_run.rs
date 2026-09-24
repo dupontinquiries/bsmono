@@ -68,7 +68,7 @@ impl Panel {
         if busy { ui.ctx().request_repaint_after(std::time::Duration::from_millis(50)); }
         ui.heading(if self.title.is_empty() { "Plan" } else { &self.title });
         ui.horizontal(|ui| {
-            ui.label("plan file"); ui.add(egui::TextEdit::singleline(&mut self.plan_path).desired_width(220.0).hint_text("plan.json (or :survey in Chat)"));
+            ui.label("plan file"); ui.add(egui::TextEdit::singleline(&mut self.plan_path).id_salt("plan-run-plan-path").desired_width(220.0).hint_text("plan.json (or :survey in Chat)"));
             if ui.add_enabled(!busy && !self.plan_path.is_empty(), egui::Button::new("Load")).clicked() {
                 match Plan::load(&self.plan_path) { Ok(p) => { let t = self.plan_path.clone(); self.set_plan(t, p); } Err(e) => self.error = Some(e) }
             }

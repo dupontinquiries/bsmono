@@ -70,7 +70,7 @@ impl Panel {
         let busy = self.pump();
         if busy { ui.ctx().request_repaint_after(std::time::Duration::from_millis(100)); }
         ui.heading("Mini (logscope-shim)");
-        ui.horizontal(|ui| { ui.label("url"); ui.add(egui::TextEdit::singleline(&mut self.base).desired_width(180.0)); ui.label("token"); ui.add(egui::TextEdit::singleline(&mut self.token).password(true).desired_width(90.0)); });
+        ui.horizontal(|ui| { ui.label("url"); ui.add(egui::TextEdit::singleline(&mut self.base).id_salt("mini-base").desired_width(180.0)); ui.label("token"); ui.add(egui::TextEdit::singleline(&mut self.token).id_salt("mini-token").password(true).desired_width(90.0)); });
         ui.horizontal(|ui| {
             if ui.add_enabled(!busy, egui::Button::new("Status")).clicked() { self.send(Directive::Status); }
             if ui.add_enabled(!busy, egui::Button::new("Models")).clicked() { self.send(Directive::Models); }
@@ -94,7 +94,7 @@ impl Panel {
             });
         }
         ui.horizontal(|ui| {
-            ui.label("plan"); ui.add(egui::TextEdit::singleline(&mut self.plan_path).desired_width(200.0).hint_text("plan.json on this machine"));
+            ui.label("plan"); ui.add(egui::TextEdit::singleline(&mut self.plan_path).id_salt("mini-plan-path").desired_width(200.0).hint_text("plan.json on this machine"));
             if ui.add_enabled(!busy && !self.plan_path.is_empty(), egui::Button::new("Run there")).clicked() {
                 match Plan::load(&self.plan_path) { Ok(p) => self.send(Directive::Run { plan: p }), Err(e) => self.error = Some(e) }
             }
@@ -104,8 +104,8 @@ impl Panel {
         // command, never as a merge.
         ui.separator();
         ui.label(egui::RichText::new("Integrate a bundle where the code lives on the mini").small());
-        ui.horizontal(|ui| { ui.label("bundle"); ui.add(egui::TextEdit::singleline(&mut self.bundle_path).desired_width(200.0).hint_text("exports/logscope-<id>.bundle")); ui.label("branch"); ui.add(egui::TextEdit::singleline(&mut self.branch).desired_width(110.0)); });
-        ui.horizontal(|ui| { ui.label("repo on mini"); ui.add(egui::TextEdit::singleline(&mut self.repo).desired_width(200.0).hint_text("/Users/you/src/c19unified")); ui.label("verify"); ui.add(egui::TextEdit::singleline(&mut self.verify).desired_width(110.0)); });
+        ui.horizontal(|ui| { ui.label("bundle"); ui.add(egui::TextEdit::singleline(&mut self.bundle_path).id_salt("mini-bundle-path").desired_width(200.0).hint_text("exports/logscope-<id>.bundle")); ui.label("branch"); ui.add(egui::TextEdit::singleline(&mut self.branch).id_salt("mini-branch").desired_width(110.0)); });
+        ui.horizontal(|ui| { ui.label("repo on mini"); ui.add(egui::TextEdit::singleline(&mut self.repo).id_salt("mini-repo").desired_width(200.0).hint_text("/Users/you/src/c19unified")); ui.label("verify"); ui.add(egui::TextEdit::singleline(&mut self.verify).id_salt("mini-verify").desired_width(110.0)); });
         if ui.add_enabled(!busy && !self.bundle_path.is_empty() && !self.repo.is_empty(), egui::Button::new("Integrate there")).clicked() {
             match std::fs::read(&self.bundle_path) {
                 Ok(bytes) => {

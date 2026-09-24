@@ -43,13 +43,13 @@ impl Panel {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Status out (liaison → ledger / shim / phone)");
         ui.horizontal(|ui| {
-            ui.label("as"); ui.add(egui::TextEdit::singleline(&mut self.source).desired_width(60.0));
-            ui.label("http sink"); ui.add(egui::TextEdit::singleline(&mut self.sink_http).desired_width(160.0).hint_text("http://mini:8790"));
-            ui.add(egui::TextEdit::singleline(&mut self.sink_token).password(true).desired_width(80.0).hint_text("token"));
+            ui.label("as"); ui.add(egui::TextEdit::singleline(&mut self.source).id_salt("status-source").desired_width(60.0));
+            ui.label("http sink"); ui.add(egui::TextEdit::singleline(&mut self.sink_http).id_salt("status-sink-http").desired_width(160.0).hint_text("http://mini:8790"));
+            ui.add(egui::TextEdit::singleline(&mut self.sink_token).id_salt("status-sink-token").password(true).desired_width(80.0).hint_text("token"));
         });
         #[cfg(feature = "dht")]
         ui.horizontal(|ui| {
-            ui.label("dht channel"); ui.add(egui::TextEdit::singleline(&mut self.channel).password(true).desired_width(160.0));
+            ui.label("dht channel"); ui.add(egui::TextEdit::singleline(&mut self.channel).id_salt("status-channel").password(true).desired_width(160.0));
             let on = self.dht.is_some();
             if ui.button(if on { "disconnect" } else { "connect" }).clicked() {
                 if on { self.dht = None; }
@@ -60,7 +60,7 @@ impl Panel {
             if on { ui.label(egui::RichText::new("publishing").small()); }
         });
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.compose).desired_width(f32::INFINITY).hint_text("say something to the phone"));
+            ui.add(egui::TextEdit::singleline(&mut self.compose).id_salt("status-compose").desired_width(f32::INFINITY).hint_text("say something to the phone"));
             if ui.button("Say").clicked() && !self.compose.trim().is_empty() { let t = std::mem::take(&mut self.compose); self.say(Level::Inference, &t); }
         });
         for (s, e) in &self.errors { ui.colored_label(egui::Color32::LIGHT_RED, format!("{s}: {e}")); }

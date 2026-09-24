@@ -67,9 +67,9 @@ impl Panel {
         if busy { ui.ctx().request_repaint_after(std::time::Duration::from_millis(50)); }
         ui.heading("Claude Code (headless `claude -p`)");
         ui.label(egui::RichText::new("Drives the real binary on this machine with its own login; nothing here touches credentials.").small());
-        ui.horizontal(|ui| { ui.label("cwd"); ui.add(egui::TextEdit::singleline(&mut self.cwd).desired_width(260.0)); });
+        ui.horizontal(|ui| { ui.label("cwd"); ui.add(egui::TextEdit::singleline(&mut self.cwd).id_salt("claude-code-cwd").desired_width(260.0)); });
         ui.horizontal_wrapped(|ui| { ui.label("tools"); for (i, t) in TOOLS.iter().enumerate() { ui.checkbox(&mut self.tools[i], *t); } });
-        ui.add(egui::TextEdit::multiline(&mut self.prompt).desired_rows(3).desired_width(f32::INFINITY).hint_text("What should Claude do in this checkout?"));
+        ui.add(egui::TextEdit::multiline(&mut self.prompt).id_salt("claude-code-prompt").desired_rows(3).desired_width(f32::INFINITY).hint_text("What should Claude do in this checkout?"));
         ui.horizontal(|ui| {
             if ui.add_enabled(!busy && !self.prompt.trim().is_empty(), egui::Button::new("Run")).clicked() { self.start(false); }
             if ui.add_enabled(!busy && self.session.is_some() && !self.prompt.trim().is_empty(), egui::Button::new("Continue session")).clicked() { self.start(true); }
@@ -83,7 +83,7 @@ impl Panel {
         if let Some(m) = &self.last {
             ui.label(egui::RichText::new(format!("{} tok · {:.1} s{}", m.out_tokens, m.total_ms / 1000.0, m.cost_usd.map(|c| format!(" · ${c:.4}")).unwrap_or_default())).small());
             ui.horizontal(|ui| {
-                ui.label("file as"); ui.add(egui::TextEdit::singleline(&mut self.artifact_id).desired_width(100.0));
+                ui.label("file as"); ui.add(egui::TextEdit::singleline(&mut self.artifact_id).id_salt("claude-code-artifact-id").desired_width(100.0));
                 if ui.button("→ ledger artifact").clicked() {
                     if let Ok(p) = hive::ledger::put_artifact(&self.artifact_id, "review", &self.output) {
                         let _ = hive::ledger::append(hive::ledger::Entry::Artifact { task: self.artifact_id.clone(), artifact: "review".into(), r#box: "claude".into(), chars: self.output.chars().count(), path: p.display().to_string() });
