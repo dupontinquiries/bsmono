@@ -51,6 +51,57 @@ pub const QUEUE_DEPTH: usize = 6;
 /// decoder still blocks the moment the consumer is ahead.
 pub const CHANNEL_DEPTH: usize = 2;
 
+/// Display refresh rates, for snapping a measured interval to the rate the
+/// panel really runs at. Up to 540: 500 Hz panels ship, and 540 exists.
+pub const RATES: [u32; 20] = [30, 48, 50, 60, 72, 75, 90, 100, 120, 144, 165, 170, 180, 200, 240, 280, 360, 480, 500, 540];
+
+/// The refresh rate from repaint intervals (seconds), or `None` if there is
+/// not enough to go on. Pure.
+///
+/// Median, not mean: a frame that took long (a seek, a GC in the compositor)
+/// is an outlier the median ignores. Intervals over 50 ms are the app idling
+/// between repaints, not vsync, and are left out. The median is snapped to a
+/// known rate within 4%, or reported as measured -- a 500 Hz panel's 2.0 ms
+/// with scheduler jitter still reads 500.
+pub fn estimate_refresh(intervals: &[f64]) -> Option<u32> {
+    let mut v: Vec<f64> = intervals.iter().copied().filter(|d| *d > 0.0008 && *d < 0.05).collect();
+    if v.len() < 30 {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let hz = 1.0 / v[v.len() / 2];
+    Some(RATES.iter().copied().find(|r| ((*r as f64) - hz).abs() / hz < 0.04).unwrap_or(hz.round() as u32))
+}
+
+static REFRESH_HZ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(60);
+
+/// The refresh rate engines start with; the app measures and updates it.
+pub fn refresh_hz() -> u32 {
+    REFRESH_HZ.load(Ordering::Relaxed)
+}
+
+pub fn set_refresh_hz(hz: u32) {
+    REFRESH_HZ.store(hz.clamp(24, 1000), Ordering::Relaxed);
+}
+
+/// Bytes of decoded frames the queue may hold ahead. Counted in bytes, not
+/// frames: six frames is 18 MB at 1080p and 715 MB at 12K (12288x6480 NV12
+/// is 119 MB a frame).
+pub const QUEUE_BYTES: usize = 256 << 20;
+
+/// Frames to queue ahead for frames of `frame_bytes`: the byte budget, at
+/// least 2 (one showing, one next -- fewer and every late decode is a
+/// visible stall) and at most QUEUE_DEPTH. Pure.
+pub fn queue_depth(frame_bytes: usize) -> usize {
+    (QUEUE_BYTES / frame_bytes.max(1)).clamp(2, QUEUE_DEPTH)
+}
+
+/// Channel slots between decoder and queue: one for frames over 32 MB (8K
+/// and up), where a second is a quarter of a gigabyte more. Pure.
+pub fn channel_depth(frame_bytes: usize) -> usize {
+    if frame_bytes > 32 << 20 { 1 } else { CHANNEL_DEPTH }
+}
+
 /// How far the interpolated audio clock may run past the last reading. The
 /// audio thread advances the clock once per 100 ms block, so a reading older
 /// than that means the audio has stalled, and the video must stall with it
@@ -168,7 +219,8 @@ pub enum Pick {
 
 /// Choose the frame to show at media time `now`. Pure.
 ///
-/// Late frames past the policy's limit are dropped. A frame that is due is
+/// Late frames past the policy's limit are dropped while a newer one is
+/// queued; the newest is shown however late (see below). A frame that is due is
 /// shown -- unless the one after it is due too, in which case this one is
 /// stale and skipped, or a slow repaint would show every frame late forever.
 ///
@@ -179,9 +231,20 @@ pub fn pick(queue: &mut VecDeque<Frame>, now: Duration, policy: &SyncPolicy, on_
     loop {
         let Some(head) = queue.front() else { return Pick::Starved { dropped } };
         match policy.decide(head.pts, now) {
-            Action::Drop => {
+            // Drop a late frame only when a newer one is queued to take its
+            // place. The newest frame available is shown however late it is:
+            // a decoder that cannot keep up then plays at its own pace
+            // instead of showing NOTHING. Measured before this: 500 fps with
+            // the 500 Hz policy (late limit 6 ms) showed 0 of 502 frames,
+            // because ffmpeg's startup put every frame over 6 ms late and the
+            // decoder never got far enough ahead to catch up.
+            Action::Drop if queue.len() > 1 => {
                 on_drop(queue.pop_front().expect("front exists"));
                 dropped += 1;
+            }
+            Action::Drop => {
+                let frame = queue.pop_front().expect("front exists");
+                return Pick::Show { frame, dropped };
             }
             Action::Hold(wait) => return Pick::Hold { wait, dropped },
             Action::Show => {
@@ -275,6 +338,10 @@ pub struct Engine {
     audio_done: Arc<AtomicBool>,
     /// Playback speed, applied at the next (re)start.
     speed: f64,
+    /// Frames queued ahead, from the frame size (queue_depth).
+    depth: usize,
+    /// A wall clock held until the first frame is queued.
+    waiting_first: bool,
     audio_error: Arc<Mutex<Option<String>>>,
     paused: bool,
     frame_interval: Duration,
@@ -302,6 +369,8 @@ impl Engine {
             decoder: Arc::new(Mutex::new(String::new())),
             audio_done: Arc::new(AtomicBool::new(false)),
             speed: 1.0,
+            depth: QUEUE_DEPTH,
+            waiting_first: false,
             audio_error: Arc::new(Mutex::new(None)),
             paused: false,
             frame_interval: Duration::from_millis(33),
@@ -337,7 +406,9 @@ impl Engine {
         if let Ok(mut d) = self.decoder.lock() {
             *d = format!("{} {}x{}", video.accel.label(), video.width, video.height);
         }
-        let (tx, rx) = mpsc::sync_channel::<Frame>(CHANNEL_DEPTH);
+        let fb = crate::decode::frame_bytes(video.width, video.height);
+        self.depth = queue_depth(fb);
+        let (tx, rx) = mpsc::sync_channel::<Frame>(channel_depth(fb));
         let (stop, decoder) = (self.stop.clone(), self.decoder.clone());
         std::thread::Builder::new().name("vidkit-video".into()).spawn(move || {
             let mut video = video;
@@ -377,6 +448,13 @@ impl Engine {
                 self.wall_at(from)
             }
         };
+        // A wall clock waits for the first frame. Started with the engine,
+        // it ran through ffmpeg's startup, so every frame arrived tens of ms
+        // late -- at 500 Hz (a 6 ms late limit) all of them were dropped.
+        self.waiting_first = !self.master.is_audio();
+        if self.waiting_first {
+            self.master.pause();
+        }
         Ok(())
     }
 
@@ -454,7 +532,7 @@ impl Engine {
         }
         let mut disconnected = false;
         if let Some(rx) = &self.video_rx {
-            while self.queue.len() < QUEUE_DEPTH {
+            while self.queue.len() < self.depth {
                 match rx.try_recv() {
                     Ok(f) => self.queue.push_back(f),
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -464,6 +542,10 @@ impl Engine {
         }
         if disconnected {
             self.video_rx = None;
+        }
+        if self.waiting_first && !self.queue.is_empty() && !self.paused {
+            self.master.resume();
+            self.waiting_first = false;
         }
         if self.paused {
             return Tick::Wait(Duration::from_millis(250));
@@ -501,7 +583,9 @@ impl Engine {
         if self.paused {
             self.paused = false;
             self.gate.set(false);
-            self.master.resume();
+            if !self.waiting_first {
+                self.master.resume();
+            }
         }
     }
 
@@ -517,6 +601,17 @@ impl Engine {
     /// Plane buffers waiting for reuse, for the diagnostics line.
     pub fn pooled(&self) -> usize {
         self.pool.len()
+    }
+
+    /// (allocated, reused) plane buffers since start.
+    pub fn pool_stats(&self) -> (u64, u64) {
+        (self.pool.allocated.load(Ordering::Relaxed), self.pool.reused.load(Ordering::Relaxed))
+    }
+
+    /// The display's refresh rate: the sync slack is half its interval. It
+    /// was fixed at 60 Hz, whose 8.3 ms of slack spans four frames at 500 fps.
+    pub fn set_refresh_hz(&mut self, hz: u32) {
+        self.policy = SyncPolicy::for_refresh_hz(hz);
     }
 
     /// Volume, 0..=1 from the transport (values above 1 amplify and clip).
@@ -911,7 +1006,11 @@ mod tests {
             }
         }
         assert!(shown > 10, "played: {shown}");
-        assert!(e.pooled() >= 2, "presented frames came back to the pool: {}", e.pooled());
+        let (alloc, reused) = e.pool_stats();
+        // Two planes a frame; steady state allocates nothing, so the buffers
+        // made are bounded by what is in flight and the rest are reuse.
+        assert!(alloc <= 2 * 12, "{alloc} buffers allocated: not reusing");
+        assert!(reused > alloc, "reused {reused} vs allocated {alloc}");
     }
 
     #[test]
@@ -951,5 +1050,124 @@ mod tests {
         // playback ends with the video, so the sink hears about wall time's
         // worth either way. decode::audio_tests checks the stream directly.
         let _ = &bytes;
+    }
+
+    /// 12K must not take a gigabyte of queue; 1080p keeps its full depth.
+    #[test]
+    fn the_queue_is_bounded_by_bytes_at_every_resolution() {
+        let fb = |w, h| crate::decode::frame_bytes(w, h);
+        assert_eq!(queue_depth(fb(1920, 1080)), QUEUE_DEPTH);
+        assert_eq!(queue_depth(fb(3840, 2160)), QUEUE_DEPTH, "4K: 12 MB frames, 72 MB queued");
+        assert_eq!(queue_depth(fb(7680, 4320)), 5, "8K: 50 MB frames");
+        assert_eq!(queue_depth(fb(12288, 6480)), 2, "12K: 119 MB frames");
+        // Through 12K, everything in flight (queue + channel + the one being
+        // decoded) stays under half a gigabyte: 12K is 476 MB.
+        for (w, h) in [(1920, 1080), (3840, 2160), (7680, 4320), (12288, 6480)] {
+            let held = (queue_depth(fb(w, h)) + channel_depth(fb(w, h)) + 1) * fb(w, h);
+            assert!(held <= 512 << 20, "{w}x{h}: {} MB in flight", held >> 20);
+        }
+        // Past it (16K, 199 MB frames) the floor is structural: two queued,
+        // one in the channel, one decoding -- ~760 MB -- and nothing smaller
+        // plays without stalling on every late frame.
+        let sixteen = fb(15360, 8640);
+        assert_eq!((queue_depth(sixteen), channel_depth(sixteen)), (2, 1));
+        assert_eq!(channel_depth(fb(1920, 1080)), 2);
+        assert_eq!(channel_depth(fb(12288, 6480)), 1);
+    }
+
+    #[test]
+    fn refresh_is_measured_from_repaints_and_snapped() {
+        let jitter = |hz: f64, n: usize| -> Vec<f64> {
+            (0..n).map(|i| 1.0 / hz * (1.0 + 0.03 * ((i * 7 % 11) as f64 / 11.0 - 0.5))).collect()
+        };
+        assert_eq!(estimate_refresh(&jitter(500.0, 120)), Some(500));
+        assert_eq!(estimate_refresh(&jitter(144.0, 120)), Some(144));
+        assert_eq!(estimate_refresh(&jitter(59.94, 120)), Some(60));
+        let mut v = jitter(240.0, 100);
+        v.extend([0.2, 0.5, 0.03, 0.03]); // idle gaps and a slow frame
+        assert_eq!(estimate_refresh(&v), Some(240));
+        assert_eq!(estimate_refresh(&jitter(500.0, 10)), None, "too few to say");
+    }
+
+    /// 500 fps through the whole engine: frames at 2 ms intervals, wall
+    /// clock, a tick loop that sleeps until the next frame is due. With the
+    /// policy sized for 500 Hz, nearly every due frame is shown.
+    #[test]
+    fn five_hundred_fps_plays_at_its_rate() {
+        if !have_ffmpeg() { return; }
+        let dir = std::env::temp_dir();
+        let p = dir.join(format!("vk-500-{}.mkv", std::process::id()));
+        assert!(std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=500:duration=3", "-c:v", "mpeg4", "-q:v", "5"]).arg(&p).status().unwrap().success());
+        for hz in [500u32, 60] {
+            let mut e = Engine::start(opener(p.clone()), null_sink(), Duration::ZERO, hz).unwrap();
+            let _ = run(&mut e, ms(300));
+            let (s0, d0) = (e.shown, e.dropped);
+            let t0 = Instant::now();
+            // Ticked like a 500 Hz display: every 2 ms on the beat, not when
+            // the next frame is due -- the slack only matters then.
+            let (mut pts, mut at) = (vec![], vec![]);
+            let beat = Duration::from_micros(2000);
+            let mut next_tick = Instant::now() + Duration::from_micros(700);
+            while t0.elapsed() < ms(1000) {
+                if let Some(d) = next_tick.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(d);
+                }
+                next_tick += beat;
+                if let Tick::Show { frame, .. } = e.tick() {
+                    pts.push(frame.pts);
+                    at.push(e.position());
+                    e.recycle(frame);
+                }
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            let (shown, dropped) = (e.shown - s0, e.dropped - d0);
+            // How early a frame went up: pts ahead of the clock at showing.
+            let early = pts.iter().zip(&at).map(|(p, a)| p.saturating_sub(*a)).max().unwrap_or_default();
+            eprintln!("DIAG 500 fps, policy for {hz} Hz: shown {shown} dropped {dropped} in {secs:.2} s, worst early {:.2} ms", early.as_secs_f64() * 1e3);
+            assert!(shown as f64 >= 0.85 * 500.0 * secs, "{shown} shown of ~{:.0} due", 500.0 * secs);
+            if hz == 500 {
+                // Half a 2 ms interval: never more than one frame early.
+                assert!(early <= Duration::from_micros(1100), "{early:?} early at 500 Hz");
+            }
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The newest frame is shown however late: dropping it shows nothing.
+    #[test]
+    fn a_lone_late_frame_is_shown_not_dropped() {
+        let mut q: VecDeque<Frame> = VecDeque::new();
+        q.push_back(f(0));
+        match pick(&mut q, ms(500), &SyncPolicy::for_refresh_hz(500), &mut |_| {}) {
+            Pick::Show { frame, dropped } => assert_eq!((frame.pts, dropped), (ms(0), 0)),
+            other => panic!("{other:?}"),
+        }
+        // With a newer one queued the late one still goes.
+        let mut q: VecDeque<Frame> = [f(0), f(490)].into_iter().collect();
+        match pick(&mut q, ms(500), &SyncPolicy::for_refresh_hz(500), &mut |_| {}) {
+            Pick::Show { frame, dropped } => assert_eq!((frame.pts, dropped), (ms(490), 1)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The wall clock starts at the first frame, not at engine start: a
+    /// busy UI (or a slow ffmpeg start) must not put the clock ahead of the
+    /// picture before anything is shown.
+    #[test]
+    fn the_wall_clock_waits_for_the_first_frame() {
+        if !have_ffmpeg() { return; }
+        let p = clip("first.mkv", 2.0, 0.0);
+        let mut e = Engine::start(opener(p), null_sink(), Duration::ZERO, 60).unwrap();
+        std::thread::sleep(ms(200));
+        let t0 = Instant::now();
+        let first = loop {
+            match e.tick() {
+                Tick::Show { frame, .. } => break frame.pts,
+                Tick::Wait(d) => std::thread::sleep(d.min(ms(5))),
+                Tick::Ended => panic!("ended"),
+            }
+            assert!(t0.elapsed() < ms(2000));
+        };
+        assert!(first < ms(50), "the clock ran ahead before the first frame: first shown {first:?}");
     }
 }

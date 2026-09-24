@@ -175,6 +175,13 @@ struct Player {
     /// Enhancement: what analysis learned about the title playing (None =
     /// not analysed, so not enhanced), the plan in force and the output size
     /// it was made for.
+    /// GL_MAX_TEXTURE_SIZE, read once at startup; and the decode cap the
+    /// running decoder was opened with.
+    max_texture: Option<u32>,
+    cap_applied: u32,
+    /// Repaint intervals while playing, for estimating the refresh rate.
+    frame_dts: std::collections::VecDeque<f64>,
+    last_frame_at: Option<Instant>,
     enh_facts: Option<enhance_plan::TitleFacts>,
     enh_plan: Option<enhance_plan::Plan>,
     enh_px: (u32, u32),
@@ -259,6 +266,14 @@ impl Player {
         }
 
         let colors = vidkit_egui::install(&cc.egui_ctx, snapclone_theme::palette_by_id("dark"));
+        // The largest texture the GPU takes: the ceiling on decode size, so a
+        // 12K source on a GPU that stops at 8192 is scaled by ffmpeg rather
+        // than failing at upload.
+        let max_texture = cc.gl.as_ref().map(|gl| {
+            use eframe::glow::HasContext;
+            // SAFETY: the creation context's GL is current.
+            unsafe { gl.get_parameter_i32(eframe::glow::MAX_TEXTURE_SIZE) as u32 }
+        });
 
         // GPU upload by DEFAULT (VIDKIT_GPU=0 opts out): NV12 planes go to the
         // GPU and are converted there, instead of a CPU colour conversion of
@@ -350,6 +365,10 @@ impl Player {
             seen_hits: Vec::new(),
             pip: Default::default(),
             pip_on: false,
+            max_texture,
+            cap_applied: decode::decode_cap(),
+            frame_dts: std::collections::VecDeque::with_capacity(240),
+            last_frame_at: None,
             enh_facts: None,
             enh_plan: None,
             enh_px: (0, 0),
@@ -614,6 +633,8 @@ impl eframe::App for Player {
         // belong in the first field to be dropped for space.
         self.sections_tick(ctx);
         self.follow_shell_colours(ctx);
+        self.follow_display(ctx);
+        self.measure_refresh();
 
         let mut want_analysis = false;
         egui::TopBottomPanel::top("what").show(ctx, |ui| match &self.opened {
@@ -1305,7 +1326,7 @@ impl Player {
             headers: resolved.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         };
 
-        let engine = playback::Engine::start(stream_opener(input, cap), sink_maker(), Duration::ZERO, 60)?;
+        let engine = playback::Engine::start(stream_opener(input, cap), sink_maker(), Duration::ZERO, playback::refresh_hz())?;
         // The length comes from the same yt-dlp JSON (Resolved::duration).
         self.transport.status = "NV12 · CPU convert · streaming".into();
         self.opened = Some(Ok(Opened {
@@ -1378,7 +1399,7 @@ fn file_opener(p: PathBuf) -> playback::Opener {
         let v = decode::FfmpegFrames::open_probed(
             &decode::VideoInput::file(&p),
             &pr,
-            Some(1920),
+            Some(decode::decode_cap()),
             from,
             decode::accel_for(&pr.codec),
         )?;
@@ -1389,14 +1410,16 @@ fn file_opener(p: PathBuf) -> playback::Opener {
 
 /// The engine's opener for a resolved stream: video and audio from the signed
 /// URLs, each with the headers, each fetched by its own process.
-fn stream_opener(input: decode::StreamingInput, cap: Option<u32>) -> playback::Opener {
+fn stream_opener(input: decode::StreamingInput, _format_cap: Option<u32>) -> playback::Opener {
     let cache = std::sync::OnceLock::new();
     Box::new(move |from, speed| {
         let pr = probed(&cache, || decode::probe_input(&input.video_url, &input.headers))?;
         let v = decode::FfmpegFrames::open_probed(
             &decode::VideoInput::url(&input.video_url, &input.headers),
             &pr,
-            cap,
+            // The format was already chosen at the preset's height; this is
+            // the decode size, which follows the display like a file's.
+            Some(decode::decode_cap()),
             from,
             decode::accel_for(&pr.codec),
         )?;
@@ -1410,7 +1433,7 @@ fn sink_maker() -> playback::SinkMaker {
 }
 
 fn start_file(p: PathBuf) -> Result<playback::Engine, String> {
-    playback::Engine::start(file_opener(p), sink_maker(), Duration::ZERO, 60)
+    playback::Engine::start(file_opener(p), sink_maker(), Duration::ZERO, playback::refresh_hz())
 }
 
 /// `1:30–2:00`, for status lines.
@@ -1897,6 +1920,57 @@ impl Player {
                 }
                 running.store(false, Ordering::Relaxed);
             });
+        }
+    }
+}
+
+impl Player {
+    /// Decode at the display's size. The monitor is known only once frames
+    /// flow, so the first open uses the old 1920; when the real cap differs
+    /// the decoder is reopened once, at the current position.
+    fn follow_display(&mut self, ctx: &egui::Context) {
+        let ppp = ctx.pixels_per_point();
+        let display = ctx.input(|i| i.viewport().monitor_size).map(|s| (s.x.max(s.y) * ppp).round() as u32);
+        if display.is_none() {
+            return;
+        }
+        let cap = decode::cap_for(display, self.max_texture, self.settings.quality.max_long_edge());
+        if cap == self.cap_applied {
+            return;
+        }
+        decode::set_decode_cap(cap);
+        self.cap_applied = cap;
+        if self.engine.is_some() {
+            let at = self.transport.position;
+            self.seek_to(at);
+        }
+    }
+}
+
+impl Player {
+    /// While playing, egui repaints at the display's rate: the median
+    /// interval IS the refresh. Re-estimated every 120 frames; the engine's
+    /// sync slack follows it (it was fixed at 60 Hz).
+    fn measure_refresh(&mut self) {
+        let now = Instant::now();
+        let prev = self.last_frame_at.replace(now);
+        if !self.transport.playing {
+            self.frame_dts.clear();
+            return;
+        }
+        if let Some(p) = prev {
+            self.frame_dts.push_back(now.duration_since(p).as_secs_f64());
+        }
+        if self.frame_dts.len() >= 120 {
+            let v: Vec<f64> = self.frame_dts.drain(..).collect();
+            if let Some(hz) = playback::estimate_refresh(&v) {
+                if hz != playback::refresh_hz() {
+                    playback::set_refresh_hz(hz);
+                    if let Some(e) = self.engine.as_mut() {
+                        e.set_refresh_hz(hz);
+                    }
+                }
+            }
         }
     }
 }

@@ -140,6 +140,37 @@ fn header_blob(headers: &[(String, String)]) -> String {
     headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect()
 }
 
+/// The long edge to decode at: the display's, never past the GPU's largest
+/// texture, never past the quality preset. Pure.
+///
+/// This replaced a fixed 1920 in the openers, which threw away everything a
+/// 4K, 8K or 12K panel could show -- while `Quality::Auto`/`High` already
+/// said "the device's own limit". Unknown display: 1920, the old behaviour,
+/// until the first frame reports the monitor. A 12K panel (12288 wide) is
+/// within the 16384 textures desktop GPUs offer; some mobile GPUs stop at
+/// 8192, and the texture limit is what keeps an upload from failing there.
+pub fn cap_for(display_long_px: Option<u32>, max_texture: Option<u32>, quality: Option<u32>) -> u32 {
+    let mut c = display_long_px.unwrap_or(1920).max(640);
+    if let Some(t) = max_texture.filter(|t| *t > 0) {
+        c = c.min(t);
+    }
+    if let Some(q) = quality {
+        c = c.min(q);
+    }
+    c
+}
+
+static DECODE_CAP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1920);
+
+/// The cap the openers read at each open (each seek is one).
+pub fn decode_cap() -> u32 {
+    DECODE_CAP.load(Ordering::Relaxed)
+}
+
+pub fn set_decode_cap(c: u32) {
+    DECODE_CAP.store(c, Ordering::Relaxed);
+}
+
 /// The output size for a long-edge cap, or `None` when no scaling is needed.
 ///
 /// Computed HERE and passed to ffmpeg as explicit numbers. The streaming path
@@ -428,11 +459,17 @@ pub fn video_args(src: &VideoInput, from: Duration, accel: &Accel, scale_to: Opt
 #[derive(Default)]
 pub struct PlanePool {
     free: Mutex<Vec<Vec<u8>>>,
+    /// Buffers made fresh, and buffers handed out again: the ratio is what
+    /// recycling is for. (Whether the pool is non-empty at some instant says
+    /// nothing -- a decoder that keeps up takes spares straight back.)
+    pub allocated: std::sync::atomic::AtomicU64,
+    pub reused: std::sync::atomic::AtomicU64,
 }
 
-/// More than the frames in flight (decoder, channel, queue, screen); past
-/// this a returned buffer is freed rather than hoarded.
-const POOL_MAX: usize = 24;
+/// Bytes of spare planes the pool keeps; past this a returned buffer is
+/// freed. A count (24) was 72 MB at 1080p and 1.9 GB at 12K; bytes are the
+/// same bound at every size. Enough for every frame in flight at 4K.
+pub const POOL_BYTES: usize = 384 << 20;
 
 impl PlanePool {
     pub fn new() -> Arc<Self> {
@@ -448,19 +485,29 @@ impl PlanePool {
         });
         match found {
             Some(mut v) => {
+                self.reused.fetch_add(1, Ordering::Relaxed);
                 v.resize(len, 0);
                 v
             }
-            None => vec![0u8; len],
+            None => {
+                self.allocated.fetch_add(1, Ordering::Relaxed);
+                vec![0u8; len]
+            }
         }
     }
 
     pub fn put(&self, v: Vec<u8>) {
         if let Ok(mut f) = self.free.lock() {
-            if f.len() < POOL_MAX {
+            let held: usize = f.iter().map(|b| b.capacity()).sum();
+            if held + v.capacity() <= POOL_BYTES {
                 f.push(v);
             }
         }
+    }
+
+    /// Bytes held for reuse.
+    pub fn bytes(&self) -> usize {
+        self.free.lock().map(|f| f.iter().map(|b| b.capacity()).sum()).unwrap_or(0)
     }
 
     /// Return a frame's planes.
@@ -495,6 +542,22 @@ pub struct FfmpegFrames {
     pool: Arc<PlanePool>,
 }
 
+/// Grow a pipe's kernel buffer. The default is 64 KiB: a 4K NV12 frame
+/// (12 MB) crosses it in ~190 wakeups of each side, and a 12K frame (119 MB)
+/// in ~1800. A bigger buffer means fewer context switches per frame; the
+/// cap is /proc/sys/fs/pipe-max-size (1 MiB by default), and asking for more
+/// than that fails, so this asks for at most that. Returns the size set.
+pub fn grow_pipe(fd: std::os::fd::RawFd, want: usize) -> Option<usize> {
+    let max = std::fs::read_to_string("/proc/sys/fs/pipe-max-size").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1 << 20);
+    let size = want.min(max) as libc::c_int;
+    // SAFETY: fcntl on an fd we own, with an integer argument.
+    let got = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, size) };
+    (got > 0).then_some(got as usize)
+}
+
+/// The pipe size for frames of `frame_bytes`: a frame's worth, capped.
+pub const PIPE_WANT: usize = 1 << 20;
+
 fn spawn_ffmpeg(args: &[String]) -> Result<Child, String> {
     Command::new("ffmpeg")
         .args(args)
@@ -507,6 +570,20 @@ fn spawn_ffmpeg(args: &[String]) -> Result<Child, String> {
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => "ffmpeg is not installed".to_string(),
             _ => format!("ffmpeg: {e}"),
+        })
+        .map(|c| {
+            // Measured (pipe_bench, 5 alternating pairs, 240 4K frames each):
+            // median 1.62 GB/s default vs 1.66 GB/s grown, ranges overlapping
+            // -- NO measurable difference on the one-core sandbox, where
+            // both processes share a CPU and switch regardless. A first
+            // single pair showed +42%; it was noise. Kept because it cannot
+            // hurt and the per-frame wakeups it removes are real on a
+            // multi-core machine. Unmeasured there: run the bench.
+            if let Some(out) = c.stdout.as_ref() {
+                use std::os::fd::AsRawFd;
+                let _ = grow_pipe(out.as_raw_fd(), PIPE_WANT);
+            }
+            c
         })
 }
 
@@ -945,6 +1022,73 @@ impl FfmpegFrames {
     pub fn open_streaming(input: &StreamingInput, max_long_edge: Option<u32>) -> Result<Self, String> {
         let p = probe_input(&input.video_url, &input.headers)?;
         Self::open_probed(&VideoInput::url(&input.video_url, &input.headers), &p, max_long_edge, Duration::ZERO, Accel::Software)
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    #[test]
+    fn the_cap_follows_the_display_up_to_12k_and_the_gpu_limits_it() {
+        assert_eq!(cap_for(None, None, None), 1920, "unknown display: the old default");
+        assert_eq!(cap_for(Some(3840), Some(16384), None), 3840);
+        assert_eq!(cap_for(Some(12288), Some(16384), None), 12288, "12K panel, desktop GPU");
+        assert_eq!(cap_for(Some(12288), Some(8192), None), 8192, "a GPU that stops at 8K textures");
+        assert_eq!(cap_for(Some(12288), Some(16384), Some(1920)), 1920, "the Medium preset wins");
+        assert_eq!(cap_for(Some(320), None, None), 640, "a tiny window still decodes watchably");
+        // And the decoder scales a 12K source to fit an 8K texture limit.
+        assert_eq!(fit_long_edge(12288, 6480, Some(8192)), Some((8192, 4320)));
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[test]
+    fn the_pool_is_bounded_by_bytes_not_count() {
+        let p = PlanePool::new();
+        let twelve_k_luma = 12288 * 6480;
+        for _ in 0..10 {
+            p.put(vec![0u8; twelve_k_luma]);
+        }
+        assert!(p.bytes() <= POOL_BYTES, "{} MB held", p.bytes() >> 20);
+        assert_eq!(p.len(), POOL_BYTES / twelve_k_luma, "as many 12K planes as fit");
+        let q = PlanePool::new();
+        for _ in 0..40 {
+            q.put(vec![0u8; 1920 * 1080]);
+        }
+        assert_eq!(q.len(), 40, "small planes: far more than the old count of 24");
+    }
+}
+
+#[cfg(test)]
+mod pipe_bench {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    /// Raw NV12 from /dev/zero through ffmpeg: no decode, only the pipe and
+    /// the reads. Prints GB/s with the default pipe and a grown one.
+    #[test]
+    #[ignore]
+    fn pipe_throughput() {
+        let (w, h) = (3840usize, 2160usize);
+        let frame = w * h * 3 / 2;
+        for grow in [false, true, false, true, false, true, false, true, false, true] {
+            let mut child = Command::new("ffmpeg")
+                .args(["-v", "error", "-nostdin", "-f", "rawvideo", "-pix_fmt", "nv12", "-s", &format!("{w}x{h}"), "-r", "500", "-i", "/dev/zero", "-frames:v", "240", "-c:v", "rawvideo", "-f", "rawvideo", "-"])
+                .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+            let mut out = child.stdout.take().unwrap();
+            let size = if grow { grow_pipe(out.as_raw_fd(), PIPE_WANT) } else { None };
+            let mut buf = vec![0u8; frame];
+            let t = std::time::Instant::now();
+            let mut n = 0;
+            while out.read_exact(&mut buf).is_ok() { n += 1; }
+            let s = t.elapsed().as_secs_f64();
+            let _ = child.wait();
+            eprintln!("DIAG pipe {:>8}: {n} 4K frames in {s:.2} s = {:.2} GB/s, {:.0} fps", size.map(|s| format!("{} KiB", s >> 10)).unwrap_or("default".into()), (n * frame) as f64 / s / 1e9, n as f64 / s);
+        }
     }
 }
 
