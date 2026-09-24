@@ -126,7 +126,7 @@ impl SectionsPanel {
         });
 
         ui.separator();
-        let resp = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("find where they discuss…"));
+        let resp = ui.add(egui::TextEdit::singleline(&mut self.query).id_salt("vidkit-sections-query").hint_text("find where they discuss…"));
         if resp.changed() || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
             let q = self.query.trim().to_string();
             if q != self.sent_query {
