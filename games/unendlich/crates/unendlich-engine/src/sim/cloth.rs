@@ -107,6 +107,15 @@ impl Cloth {
                 pos.push(add(origin, add(mul(across, c as f32 * spacing), mul(down, r as f32 * spacing))));
             }
         }
+        Cloth::from_positions(cols, rows, pos, params)
+    }
+
+    /// A sheet from given particle positions (row-major, `cols` x `rows`, at
+    /// least 2 x 2); every rest length is measured from them, so the sheet as
+    /// given is its rest shape. For sheets whose rows and columns are spaced
+    /// differently (a garment: its width and its length).
+    pub fn from_positions(cols: usize, rows: usize, pos: Vec<[f32; 3]>, params: ClothParams) -> Cloth {
+        assert!(cols >= 2 && rows >= 2 && pos.len() == cols * rows, "{cols} x {rows} sheet needs {} positions, got {}", cols * rows, pos.len());
         let idx = |c: usize, r: usize| r * cols + c;
         let mut links = Vec::new();
         let mut link = |a: usize, b: usize, kind: u8, pos: &Vec<[f32; 3]>| links.push(Link { a, b, rest: len(sub(pos[a], pos[b])), kind });
