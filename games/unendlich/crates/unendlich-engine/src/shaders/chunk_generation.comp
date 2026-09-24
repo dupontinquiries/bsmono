@@ -775,17 +775,30 @@ TreeProfile biome_tree_profile(uint biome) {
 }
 
 // r604: canopy silhouette helpers — EXACT mirror of Rust
-// `world::tree_form` (the source of truth; its unit tests pin the Dome
-// path to the pre-r604 formula). Return -1 for "no leaves at this layer".
+// `world::tree_form` (the source of truth; tree_form's
+// glsl_transliteration_matches_rust_exactly test pins this twin).
+// Return -1 for "no leaves at this layer".
 int tree_canopy_v_extent(int form, int r_max) {
     if (form == 0) return max(r_max, 1); // Dome
     return 1;                            // FlatTop / Baobab / Shrub
 }
 int tree_canopy_layer_radius(int form, int dy, int v_extent, int r_max) {
-    if (form == 0) { // Dome — byte-identical to the old inline math
+    if (form == 0) { // Dome: round on top, tapered underneath (77b9ead7f)
+        // The Rust side became a dome in 77b9ead7f and this twin was left a
+        // CONE, so the CPU and GPU paths built different trees from one seed.
+        // Underside: the old linear taper (unchanged). Top: circular,
+        // r * sqrt(1 - (dy/v)^2). floor(x + 0.5), not round(): GLSL leaves
+        // round()'s halves to the implementation, Rust rounds them away from
+        // zero, and for x >= 0 floor(x + 0.5) is exactly Rust's rule.
         if (v_extent <= 1) return 1;
-        float frac = 1.0 - float(abs(dy)) / float(v_extent);
-        return max(int(round(float(r_max) * frac)), 1);
+        float frac;
+        if (dy <= 0) {
+            frac = 1.0 - float(abs(dy)) / float(v_extent);
+        } else {
+            float t = float(dy) / float(v_extent);
+            frac = sqrt(max(1.0 - t * t, 0.0));
+        }
+        return max(int(floor(float(r_max) * frac + 0.5)), 1);
     }
     if (form == 1) { // FlatTop umbrella
         if (dy == 0) return max(r_max, 1);

@@ -210,8 +210,14 @@ mod tests {
         fn g_layer_radius(form: i32, dy: i32, v_extent: i32, r_max: i32) -> i32 {
             if form == 0 {
                 if v_extent <= 1 { return 1; }
-                let frac = 1.0 - (dy.abs() as f32) / (v_extent as f32);
-                return ((r_max as f32 * frac).round() as i32).max(1);
+                // f32 and floor(x + 0.5), as the shader computes it.
+                let frac = if dy <= 0 {
+                    1.0 - (dy.abs() as f32) / (v_extent as f32)
+                } else {
+                    let t = dy as f32 / v_extent as f32;
+                    (1.0 - t * t).max(0.0).sqrt()
+                };
+                return ((r_max as f32 * frac + 0.5).floor() as i32).max(1);
             }
             if form == 1 {
                 if dy == 0 { return r_max.max(1); }
@@ -238,10 +244,12 @@ mod tests {
         for (fi, &form) in forms.iter().enumerate() {
             let fi = fi as i32;
             assert_eq!(g_trunk_thickness(fi), trunk_thickness(form), "thickness form {fi}");
-            for r_max in 1..=6 {
+            // Up to 16, well past any canopy radius, so f32 (the shader) against
+            // f64 (Rust) is checked where the square root has room to disagree.
+            for r_max in 1..=16 {
                 let v = canopy_v_extent(form, r_max);
                 assert_eq!(g_v_extent(fi, r_max), v, "v_extent form {fi} r {r_max}");
-                for dy in -6..=6 {
+                for dy in -16..=16 {
                     let rust = canopy_layer_radius(form, dy, v, r_max)
                         .map(|r| r as i32)
                         .unwrap_or(-1);
