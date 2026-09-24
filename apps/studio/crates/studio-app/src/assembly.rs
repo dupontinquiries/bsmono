@@ -84,6 +84,26 @@ pub fn plan(project: &Project, words: &BTreeMap<SourceId, Vec<Segment>>, outline
     Ok((asm, ops))
 }
 
+/// Draft a story outline from the footage (`studio_assemble::story`) and
+/// write it beside the project: `outline.txt` when there is none, else
+/// `outline.draft.txt` -- an outline the editor has shaped is never
+/// overwritten. Returns the file written and the draft. Scene labels from
+/// slates are not read yet: scenes go in shot order, and the draft says so.
+pub fn draft_story(project: &Project, words: &BTreeMap<SourceId, Vec<Segment>>, project_file: &Path)
+    -> Result<(std::path::PathBuf, studio_assemble::story::Story), String>
+{
+    let takes = takes(project, words);
+    if takes.is_empty() {
+        return Err("story: no transcripts loaded -- load them first (palette: transcripts)".into());
+    }
+    let noise = |t: &str| studio_video::spoken_slate::hallucination(t).is_some();
+    let story = studio_assemble::story::draft(&takes, &BTreeMap::new(), &noise);
+    let dir = project_file.parent().ok_or("story: the project has no folder")?;
+    let file = if dir.join("outline.txt").exists() { dir.join("outline.draft.txt") } else { dir.join("outline.txt") };
+    std::fs::write(&file, story.outline_text()).map_err(|e| format!("story: could not write {}: {e}", file.display()))?;
+    Ok((file, story))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +149,27 @@ mod tests {
         assert_eq!(q.track_clips(track.id).len(), 2);
         assert_eq!(q.track_clips(track.id)[0].pos, Ticks::from_seconds(20.0));
         assert!(q.markers.iter().any(|m| m.name.starts_with("review 1: missing")), "{:?}", q.markers);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_drafted_story_is_written_beside_the_project_never_over_the_editors_outline_and_assembles() {
+        let (p, words, _) = fragile();
+        let tmp = std::env::temp_dir().join(format!("studio-story-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("x.studio");
+        let (written, story) = draft_story(&p, &words, &file).expect("a draft");
+        assert_eq!(written, tmp.join("outline.txt"));
+        assert_eq!(story.scenes.len(), 1, "three angles of one scene");
+        assert_eq!(story.line_count(), 4);
+        // the editor's outline is there now: a second draft goes beside it
+        let (again, _) = draft_story(&p, &words, &file).unwrap();
+        assert_eq!(again, tmp.join("outline.draft.txt"));
+        // and the draft is an outline the assembler takes: all four lines, no reviews
+        let (_, lines) = outline_beside(&file).unwrap();
+        let (asm, _) = plan(&p, &words, &lines, Ticks::ZERO).unwrap();
+        assert_eq!(asm.placements.len(), 4);
+        assert!(asm.reviews.is_empty(), "{:?}", asm.reviews);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

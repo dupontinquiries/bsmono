@@ -452,5 +452,7 @@ pub fn assemble(takes: &[Take], outline: &[String], opts: &Options, noise: &dyn 
     asm
 }
 
+pub mod story;
+
 #[cfg(test)]
 mod tests;

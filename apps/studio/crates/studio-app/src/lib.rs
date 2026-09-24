@@ -6341,6 +6341,15 @@ impl App {
                         "no transcripts loaded yet — the filter applies once they are".into()
                     } else { self.refilter_words() };
                 }
+                palette::ShellVerb::DraftStory => {
+                    self.studio.status = match assembly::draft_story(&self.studio.session.doc.project, &self.words_raw, &self.project_path) {
+                        Ok((file, story)) => format!("drafted {}: {} scene{}, {} lines, {} -- edit it, then \"assemble\"{}",
+                            file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                            story.scenes.len(), if story.scenes.len() == 1 { "" } else { "s" }, story.line_count(), story.order,
+                            if story.reviews.is_empty() { String::new() } else { format!(" ({} to check, listed at its top)", story.reviews.len()) }),
+                        Err(e) => e,
+                    };
+                }
                 palette::ShellVerb::Assemble => {
                     let outline = assembly::outline_beside(&self.project_path);
                     let (from, lines) = match outline {

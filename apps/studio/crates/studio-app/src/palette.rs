@@ -124,6 +124,8 @@ pub enum ShellVerb {
     /// A first cut from the transcripts (`assembly`), at the playhead, on a
     /// new track, reviews as markers.
     Assemble,
+    /// Draft outline.txt from the footage (`assembly::draft_story`).
+    DraftStory,
     /// Give the selected clips the held look, at `pct`% strength.
     StylePaste(u32),
     /// What the selected clips' effects do after the clips end: `ring_ms` of
@@ -380,6 +382,9 @@ pub fn root() -> Vec<Choice> {
         c("show transcripts under clips (load a folder of .srt)",
           Some("what is being said, in the gutter under each clip"),
           Then::Do(Act::Shell(ShellVerb::LoadTranscripts))),
+        c("story: draft an outline from the footage",
+          Some("scenes from what is said; edit outline.txt, then assemble"),
+          Then::Do(Act::Shell(ShellVerb::DraftStory))),
         c("assemble a first cut from the transcripts",
           Some("order from outline.txt / script.txt; reviews as markers"),
           Then::Do(Act::Shell(ShellVerb::Assemble))),
