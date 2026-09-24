@@ -309,6 +309,19 @@ fn main() {
             }
         }
     }
+    // `tideshell doctor power-key`: who consumes the power key here (run
+    // with sudo to see system daemons' file descriptors).
+    if args.get(1).map(String::as_str) == Some("doctor") {
+        if args.get(2).map(String::as_str) != Some("power-key") {
+            eprintln!("usage: tideshell doctor power-key");
+            std::process::exit(2);
+        }
+        let bus = zbus::blocking::Connection::system().ok();
+        // Under sudo, look at the invoking user's cosmic config, not root's.
+        let home = std::env::var("SUDO_USER").ok().filter(|u| !u.is_empty() && u != "root").map(|u| std::path::PathBuf::from(format!("/home/{u}/.config"))).or_else(effects::cosmic_config_home);
+        print!("{}", tideshell_egui::powerdoctor::report(&tideshell_egui::powerdoctor::gather(bus.as_ref(), home.as_deref())));
+        std::process::exit(0);
+    }
     if args.get(1).map(String::as_str) == Some("install-keys") {
         let Some(home) = effects::cosmic_config_home() else {
             eprintln!("tideshell install-keys: no config home");

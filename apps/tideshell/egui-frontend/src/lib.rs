@@ -73,6 +73,8 @@ pub fn key_events(pressed: bool, keysym: u32, utf8: &str, ctrl: bool, alt: bool,
 pub mod sensors;
 #[cfg(feature = "sensors")]
 pub mod keys;
+#[cfg(feature = "sensors")]
+pub mod powerdoctor;
 pub mod ctl;
 pub mod camera;
 
