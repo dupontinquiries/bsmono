@@ -212,6 +212,12 @@ struct DragonDuel {
     /// Where it last heard you (dragon_ears::EarMemory): investigated after
     /// the noise stops.
     ear_mem: unendlich_engine::sim::dragon_ears::EarMemory,
+    /// Its bending, read from the genome (sim::dragon_abilities), and the
+    /// casting state (sim::dragon_cast): cooldowns, a wind-up in progress, and
+    /// the areas it has released that still linger.
+    rep: unendlich_engine::sim::dragon_abilities::Repertoire,
+    caster: unendlich_engine::sim::dragon_cast::Caster,
+    areas: Vec<unendlich_engine::sim::dragon_cast::Area>,
 }
 
 /// Top ground speed of an engaged dragon at `speed01 = 1` (blocks/s). Wander
@@ -241,6 +247,12 @@ fn dragon_duel_for(
         z ^ (z >> 31)
     };
     let profile = unendlich_engine::sim::dragon_duel::DuelProfile::from_genome(&genome);
+    let rep = unendlich_engine::sim::dragon_abilities::repertoire(&genome);
+    log::info!(
+        "[dragon#{:04x}] bends: {}",
+        (id & 0xffff),
+        unendlich_engine::sim::dragon_abilities::describe(&rep)
+    );
     log::info!(
         "[dragon#{:04x}] {} {:?} size {} — hp {} hide {:.0}, weak at the {}, cunning {:.2} ferocity {:.2} dread {:.2}",
         id & 0xffff, profile.element_name(), profile.build, profile.size_class, profile.max_hp, profile.hide,
@@ -260,6 +272,9 @@ fn dragon_duel_for(
         detour_m: 0.0,
         detour_age: f32::INFINITY,
         ear_mem: Default::default(),
+        caster: unendlich_engine::sim::dragon_cast::Caster::new(&rep),
+        rep,
+        areas: Vec::new(),
     }))
 }
 
@@ -2562,6 +2577,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     }
     let mut player_prev_xz: Option<[f32; 2]> = None;
     let mut player_landing_speed: f32 = 0.0;
+    // Dragons' Smoke Walls (sim::smoke_wall): tall volumes that block eyes both
+    // ways. Stepped with the wind each frame; the player's fog thickens inside.
+    let mut smoke_walls: Vec<unendlich_engine::sim::smoke_wall::SmokeVolume> = Vec::new();
+    let mut in_smoke_wall = false;
     // UNENDLICH_DRAGON_AT=<metres>[:downwind]: 3 s after entering a world,
     // hatch ONE dragon that far ahead of you (or downwind of you, where your
     // scent goes). For soaks and for testing a fight without hunting for one
@@ -9341,7 +9360,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // DRAGON SENSES, once per frame: lay your scent, read the wind,
             // and work out how much noise you are making.
             let senses_now = senses_clock.elapsed().as_secs_f32();
-            let (scent_wind, player_noise, noise_ambient) = {
+            let (scent_wind, player_noise, noise_ambient, player_vel) = {
                 use unendlich_engine::sim::dragon_ears as de;
                 let pp = local_player.view.position;
                 player_scent.lay([pp.x, pp.y - 1.4, pp.z], senses_now, 1.0);
@@ -9350,9 +9369,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 );
                 let wu = unendlich_engine::wind::WIND_UNIT_MS;
                 let wind = [wx * wu, wz * wu];
-                let speed = match player_prev_xz {
-                    Some(prev) if dt > 1e-4 => ((pp.x - prev[0]).powi(2) + (pp.z - prev[1]).powi(2)).sqrt() / dt,
-                    _ => 0.0,
+                let (speed, vel) = match player_prev_xz {
+                    Some(prev) if dt > 1e-4 => {
+                        let (vx, vz) = ((pp.x - prev[0]) / dt, (pp.z - prev[1]) / dt);
+                        ((vx * vx + vz * vz).sqrt(), [vx, 0.0, vz])
+                    }
+                    _ => (0.0, [0.0; 3]),
                 };
                 player_prev_xz = Some([pp.x, pp.z]);
                 let gait = de::Gait {
@@ -9364,8 +9386,22 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     wind,
                     de::emit(&player_armor, &gait),
                     de::Ambient { wind: (wind[0] * wind[0] + wind[1] * wind[1]).sqrt(), rain: precip01 },
+                    vel,
                 )
             };
+            for w in smoke_walls.iter_mut() {
+                w.step(scent_wind, dt);
+            }
+            smoke_walls.retain(|w| w.alive());
+            {
+                let pp = local_player.view.position;
+                let d = unendlich_engine::sim::smoke_wall::density_at(&smoke_walls, [pp.x, pp.y, pp.z]);
+                let now_in = d > 0.15;
+                if now_in != in_smoke_wall {
+                    in_smoke_wall = now_in;
+                    log::info!("[smoke] {} a dragon's smoke wall (density {:.2})", if now_in { "inside" } else { "out of" }, d);
+                }
+            }
             // DRAGON DUEL: what the dragons see in your hand this frame.
             let player_threat = player_item_threat(
                 survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
@@ -10762,117 +10798,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // while its eyes hold the player (visible tell = the wind-up
                     // window), then releases a genetics-chosen arc with aim
                     // error. Runs every frame for flying dragons (budget-exempt).
-                    {
-                        use unendlich_engine::sim::dragon_bending_ai as dba;
-                        let ent_id = duel.as_ref().map_or(0, |d| d.id);
-                        let pp2 = local_player.view.position;
-                        let dx = pp2.x - cr.body.position[0];
-                        let dz = pp2.z - cr.body.position[2];
-                        let d2 = dx * dx + dz * dz + (pp2.y - cr.body.position[1]).powi(2);
-                        let bearing = {
-                            let mut b = dz.atan2(dx) - cr.yaw;
-                            while b > std::f32::consts::PI { b -= std::f32::consts::TAU; }
-                            while b < -std::f32::consts::PI { b += std::f32::consts::TAU; }
-                            b
-                        };
-                        // r147: alertness from the REAL dragon_hearing — a
-                        // heard footstep startles and sharpens the aim; move
-                        // quietly and its arcs go wide.
-                        let hearing = unendlich_engine::sim::dragon_hearing::react(
-                            unendlich_engine::sim::sound_masking::Ears {
-                                base_range: 40.0,
-                                sensitivity: 1.2,
-                            },
-                            &[unendlich_engine::sim::dragon_hearing::Noise {
-                                sound: unendlich_engine::sim::sound_masking::Sound {
-                                    // r166: the grass muffles you too
-                                    loudness: player_footstep as f32
-                                        * if player_hidden { 0.25 } else { 1.0 },
-                                    freq01: 0.4,
-                                },
-                                bearing,
-                                dist2: d2,
-                                occlusion: 0.0,
-                            }],
-                            6.0,
-                            false,
-                        );
-                        let perception = dba::Perception {
-                            has_target: d2 < 32.0 * 32.0
-                                && bearing.abs() < 1.2
-                                && !player_hidden, // r166: the grass hides you
-                            target_bearing: bearing,
-                            target_dist2: d2,
-                            willing: if survival_mode { 0.8 } else { 0.35 },
-                            alertness01: (0.35 + hearing.startle01 * 0.6).clamp(0.0, 1.0),
-                        };
-                        let g2 = dragon_genome_of(duel);
-                        let fields2 = unendlich_engine::sim::affinity_access::Fields {
-                            h: 0.5, r: 0.5, w: 0.4, p: 0.6, l: 0.3, s: 0.5, b: 0.6,
-                        };
-                        let prev = session.dragon_bend_intents
-                            .get(&ent_id)
-                            .copied()
-                            .unwrap_or_else(dba::BendIntent::idle);
-                        let stepd = dba::step(
-                            prev, &g2, fields2, 0.5, 1,
-                            &perception, ent_id ^ frame_count as u64, dt,
-                        );
-                        session.dragon_bend_intents.insert(ent_id, stepd.intent);
-                        // r149: GLOW TELL — the wind-up is visible: the dragon
-                        // brightens in its element's hue as charge builds.
-                        {
-                            let base = unendlich_engine::spawn::dragon_tint(&g2);
-                            let dom = g2
-                                .element
-                                .iter()
-                                .enumerate()
-                                .max_by(|a, b| {
-                                    a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)
-                                })
-                                .map(|(i, _)| i)
-                                .unwrap_or(0);
-                            use unendlich_engine::sim::emissive::Element as EmEl;
-                            let em_el = match dom {
-                                0 => EmEl::Wood,
-                                1 => EmEl::Water,
-                                2 => EmEl::Air,
-                                3 => EmEl::Dust,
-                                4 => EmEl::Fire,
-                                _ => EmEl::Storm,
-                            };
-                            let em = unendlich_engine::sim::emissive::emissive_for(
-                                em_el,
-                                stepd.intent.charge01,
-                                0.9,
-                            );
-                            for k in 0..3 {
-                                cr.tint[k] = base[k] * (1.0 + em.intensity * em.color[k] * 1.5);
-                            }
-                        }
-                        if let Some(rel) = stepd.release {
-                            // Hit check: aim bearing within the technique's
-                            // spread of the true bearing -> the cast lands.
-                            let miss = (rel.aim_bearing - bearing).abs();
-                            let spread = 0.12 + 0.05 * rel.technique.scale;
-                            if miss < spread {
-                                let dmg01 = (rel.potency * 0.06).clamp(0.0, 0.18);
-                                if survival_mode {
-                                    fg_app.vitality_mut().tick(1.0, dmg01 * player_dmg_resist);
-                                }
-                                log::info!(
-                                    "[dragon] {:?} BENDING hits you — potency {:.1} (vitality {:.0}%)",
-                                    rel.element, rel.potency,
-                                    fg_app.vitality().energy * 100.0
-                                );
-                            } else {
-                                log::info!(
-                                    "[dragon] {:?} bending arc misses (off by {:.2} rad)",
-                                    rel.element, miss
-                                );
-                            }
-                        }
-                    }
+                    // (r145-r149's parallel dragon_bending_ai attack lived here: a
+                    // second brain that fired a fixed signature arc at you on its
+                    // own timer, beside the duel. Bending is now a duel tactic
+                    // over the dragon's genome-read repertoire -- see Tactic::Cast
+                    // and sim::dragon_abilities / sim::dragon_cast below.)
                     } // r150: end !asleep gate around bending
                     // DRAGON DUEL (sim::dragon_duel) — replaces the r129 breath
                     // timer, which fired every 6 s of the flight cycle regardless
@@ -10916,7 +10846,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         // this block only moves numbers in and effects out.
                         let pp = local_player.view.position;
                         let fwd = local_player.forward();
-                        let body = dd::DragonBody {
+                        let dbody = dd::DragonBody {
                             pos: cr.body.position,
                             yaw: cr.yaw,
                             half_extents: cr.body.half_extents,
@@ -10928,16 +10858,42 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             vitality01: fg_app.vitality().energy,
                         };
                         let mut senses = dd::senses_for(
-                            &body, *hp, d.profile.max_hp, &pv,
+                            &dbody, *hp, d.profile.max_hp, &pv,
                             player_threat, last_swing_whiffed,
                         );
+                        // EYES (design library: mob_brain_object_permanence §8):
+                        // it sees you only along a clear line -- terrain, a
+                        // boulder, a rampart block it; smoke attenuates it by
+                        // Beer-Lambert, scaled by this dragon's sensitivity.
+                        // (senses_for only knew distance and the grass-hide flag.)
+                        if senses.can_see {
+                            let eye = [
+                                cr.body.position[0] + cr.yaw.cos() * dbody.radius() * 0.8,
+                                cr.body.position[1] + cr.body.half_extents[1] * 0.6,
+                                cr.body.position[2] + cr.yaw.sin() * dbody.radius() * 0.8,
+                            ];
+                            let dir = [pv.eye[0] - eye[0], pv.eye[1] - eye[1], pv.eye[2] - eye[2]];
+                            let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+                            let blocked = len > 1.0
+                                && chunk_manager
+                                    .raycast_octree(eye, dir, len - 0.8, |b| b.is_solid() && !matches!(b, BlockId::OakLeaves | BlockId::BirchLeaves | BlockId::Glass))
+                                    .is_some();
+                            let a = unendlich_engine::sim::dragon_archetype::classify(&d.genome);
+                            let sens = unendlich_engine::sim::smoke_wall::sensitivity(
+                                a.size_class, unendlich_engine::sim::dragon_archetype::SIZE_CLASS_MAX, d.profile.element,
+                            );
+                            let t = unendlich_engine::sim::smoke_wall::transmittance(&smoke_walls, eye, pv.eye, sens);
+                            if blocked || t < unendlich_engine::sim::smoke_wall::SIGHT_FLOOR {
+                                senses.can_see = false;
+                            }
+                        }
                         // Smell and hearing, for when it cannot see you.
                         if !senses.can_see {
                             use unendlich_engine::sim::{dragon_ears as de, dragon_nose as dn};
                             let head = [
-                                cr.body.position[0] + cr.yaw.cos() * body.radius(),
+                                cr.body.position[0] + cr.yaw.cos() * dbody.radius(),
                                 cr.body.position[1],
-                                cr.body.position[2] + cr.yaw.sin() * body.radius(),
+                                cr.body.position[2] + cr.yaw.sin() * dbody.radius(),
                             ];
                             let sn = dn::sniff(&player_scent, head, senses_now, scent_wind, d.nose, &dn::ScentPhysics::default());
                             let plan = dn::track(&mut d.track, &sn, d.profile.cunning * duel_tuning.cunning, cr.body.position, scent_wind, dt);
@@ -11006,6 +10962,24 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             }
                         }
                         let dist = senses.dist;
+                        // What its bending offers (only against what it can see:
+                        // no blind casting at a belief).
+                        let cunning_now = (d.profile.cunning * duel_tuning.cunning).clamp(0.0, 1.0);
+                        if senses.can_see || d.caster.busy() {
+                            let r = dbody.radius();
+                            let off = d.caster.choose(&d.rep, senses.dist, r, false);
+                            let def = d.caster.choose(&d.rep, senses.dist, r, true);
+                            let value = off.map_or(0.0, |i| {
+                                let a = &d.rep.abilities[i];
+                                ((a.hit + a.dps * a.linger_s * 0.5) / 60.0).clamp(0.0, 1.0)
+                            });
+                            senses.cast = (off.is_some() || def.is_some() || d.caster.busy()).then_some(dd::CastOption {
+                                offence_ready: off.is_some(),
+                                defence_ready: def.is_some(),
+                                value,
+                                busy: d.caster.busy(),
+                            });
+                        }
                         let o = dd::step(&mut d.state, &d.profile, &senses, duel_tuning, dt);
                         let tag = d.id & 0xffff;
                         if o.changed {
@@ -11056,7 +11030,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 });
                             }
                         }
-                        for k in dd::strikes(&d.profile, &o, &body, pv.eye) {
+                        for k in dd::strikes(&d.profile, &o, &dbody, pv.eye) {
                             match k {
                                 dd::Strike::Breath { damage, dist, .. } => {
                                     if survival_mode {
@@ -11082,6 +11056,130 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 }
                                 dd::Strike::BiteMiss { dist } => {
                                     log::info!("[dragon#{:04x}] snaps and misses ({:.1} m)", tag, dist)
+                                }
+                            }
+                        }
+                        // ── bending: begin, gather, release, linger ──────────────
+                        {
+                            use unendlich_engine::sim::dragon_cast as dc;
+                            let feet = [pp.x, pp.y - 1.6, pp.z];
+                            if let Some(defensive) = o.begin_cast {
+                                if let Some(idx) = d.caster.choose(&d.rep, senses.dist, dbody.radius(), defensive) {
+                                    let a = d.rep.abilities[idx];
+                                    let aim = dc::lead_target(feet, player_vel, a.windup_s, cunning_now);
+                                    if d.caster.begin(idx, cr.body.position, aim) {
+                                        log::info!(
+                                            "[dragon#{:04x}] gathers {} — lands in {:.1} s at ({:.0}, {:.0}), r {:.0} m{}",
+                                            tag, a.form.name(), a.windup_s, aim[0], aim[2], a.radius,
+                                            if cunning_now > 0.3 { " (leading you)" } else { "" }
+                                        );
+                                    }
+                                }
+                            }
+                            let aim_now = d.caster.gathering.map(|g| {
+                                let a = d.rep.abilities[g.idx];
+                                dc::lead_target(feet, player_vel, (a.windup_s - g.t).max(0.0), cunning_now)
+                            });
+                            let charge = match d.caster.tick(&d.rep, cunning_now, aim_now, cr.body.position, dt) {
+                                dc::CastTick::Gathering { charge01, .. } => charge01,
+                                dc::CastTick::Released(area) => {
+                                    let hit = dc::release_hit(&area, feet);
+                                    if hit.inside {
+                                        if survival_mode {
+                                            fg_app.vitality_mut().tick(1.0, hit.damage * 0.004 * player_dmg_resist);
+                                        }
+                                        if let Some(b) = body.as_mut() {
+                                            b.velocity[0] += hit.knock[0];
+                                            b.velocity[1] += hit.knock[1];
+                                            b.velocity[2] += hit.knock[2];
+                                        }
+                                    }
+                                    // Dragon-scale bending reshapes the land. Capped per
+                                    // cast (a phone budget); set_blocks refuses edits in
+                                    // chunks that are not resident.
+                                    let gen = chunk_manager.generator().cpu().clone();
+                                    let ground = |x: i32, z: i32| chunk_manager.surface_y_at(x, z, probe_y_min, probe_y_max)
+                                        .or_else(|| gen.surface_y_at(x, z, probe_y_min, probe_y_max));
+                                    let edits: Vec<(i32, i32, i32, BlockId)> = dc::terrain(&area, &ground, 600)
+                                        .into_iter()
+                                        .map(|e| (e.pos[0], e.pos[1], e.pos[2], match e.mat {
+                                            dc::Mat::Air => BlockId::Air,
+                                            dc::Mat::Stone => BlockId::Stone,
+                                            dc::Mat::Basalt => BlockId::Basalt,
+                                            dc::Mat::Magma => BlockId::Magma,
+                                            dc::Mat::Snow => BlockId::Snow,
+                                            dc::Mat::Clay => BlockId::Clay,
+                                            dc::Mat::Sand => BlockId::Sand,
+                                            dc::Mat::Glass => BlockId::Glass,
+                                            dc::Mat::Obsidian => BlockId::Obsidian,
+                                            dc::Mat::Thorn => BlockId::Vine,
+                                        }))
+                                        .collect();
+                                    let (applied, refused) = if edits.is_empty() { (0, 0) } else { chunk_manager.set_blocks(&edits) };
+                                    log::info!(
+                                        "[dragon#{:04x}] {}! {} — {}; land: {} blocks changed{}",
+                                        tag, area.ability.form.name().to_uppercase(), dc::describe_area(&area),
+                                        if hit.inside {
+                                            format!("hits you for {:.0} (knock {:.0} m/s) — vitality {:.0}%", hit.damage,
+                                                (hit.knock[0].powi(2) + hit.knock[1].powi(2) + hit.knock[2].powi(2)).sqrt(),
+                                                fg_app.vitality().energy * 100.0)
+                                        } else {
+                                            "misses you".to_string()
+                                        },
+                                        applied,
+                                        if refused > 0 { format!(" ({refused} refused: not loaded)") } else { String::new() }
+                                    );
+                                    if area.ability.form == unendlich_engine::sim::dragon_abilities::Form::SmokeWall {
+                                        let len = area.ability.radius * 2.0;
+                                        let height = (area.ability.radius * 2.2).max(14.0);
+                                        smoke_walls.push(unendlich_engine::sim::smoke_wall::SmokeVolume::wall(
+                                            area.center, area.from, feet, len, height, area.ability.linger_s,
+                                        ));
+                                        log::info!(
+                                            "[dragon#{:04x}] a wall of smoke {:.0} m long, {:.0} m tall rises between you — it cannot see you now, nor you it; it still smells and hears",
+                                            tag, len, height
+                                        );
+                                    } else if area.ability.linger_s > 0.0 {
+                                        d.areas.push(area);
+                                    }
+                                    cr.tint = unendlich_engine::spawn::dragon_tint(&d.genome); // the glow goes out
+                                    0.0
+                                }
+                                dc::CastTick::Idle => 0.0,
+                            };
+                            // Lingering areas: burn / slow while you stand in them.
+                            for area in d.areas.iter_mut() {
+                                area.age += dt;
+                                let h = dc::linger_hit(area, feet, dt);
+                                if h.inside {
+                                    if survival_mode && h.damage > 0.0 {
+                                        fg_app.vitality_mut().tick(1.0, h.damage * 0.004 * player_dmg_resist);
+                                    }
+                                    if let Some(b) = body.as_mut() {
+                                        let k = 1.0 - (h.slow01 * (dt * 8.0).min(1.0));
+                                        b.velocity[0] *= k;
+                                        b.velocity[2] *= k;
+                                    }
+                                }
+                            }
+                            d.areas.retain(|a| a.alive());
+                            // The wind-up is visible: it glows in its element's hue
+                            // as the charge builds (was the old bending AI's tell).
+                            if charge > 0.0 {
+                                use unendlich_engine::sim::emissive::Element as EmEl;
+                                let a = d.caster.gathering.map(|g| d.rep.abilities[g.idx]).unwrap_or(d.rep.abilities[0]);
+                                let em_el = match a.primary {
+                                    0 => EmEl::Wood,
+                                    1 => EmEl::Water,
+                                    2 => EmEl::Air,
+                                    3 => EmEl::Dust,
+                                    4 => EmEl::Fire,
+                                    _ => EmEl::Storm,
+                                };
+                                let em = unendlich_engine::sim::emissive::emissive_for(em_el, charge, 0.9);
+                                let base = unendlich_engine::spawn::dragon_tint(&d.genome);
+                                for k in 0..3 {
+                                    cr.tint[k] = base[k] * (1.0 + em.intensity * em.color[k] * 1.5);
                                 }
                             }
                         }
@@ -14038,7 +14136,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // settled look is unaffected.
             // r129: SMOKESCREEN visual — standing in dense smoke multiplies
             // fog density (up to 6x), so the screen actually screens.
-            if in_smoke {
+            if in_smoke || in_smoke_wall {
                 fog_density *= 6.0;
             }
             if load_fog_enabled {

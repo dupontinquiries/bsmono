@@ -297,6 +297,8 @@ pub enum Tactic {
     Retreat,
     /// Can't see you, but smells or hears you: going after the lead.
     Track,
+    /// Bending: gathering one of its `dragon_abilities` (see `dragon_cast`).
+    Cast,
 }
 
 impl Tactic {
@@ -310,6 +312,7 @@ impl Tactic {
             Tactic::Breath => "breath",
             Tactic::Retreat => "retreat",
             Tactic::Track => "track",
+            Tactic::Cast => "cast",
         }
     }
 }
@@ -386,6 +389,22 @@ pub struct DuelSenses {
     /// `dragon_nose::track` / `dragon_ears::hear` in the shell. Used only
     /// while the dragon cannot see you and is not already fighting.
     pub lead: Option<Lead>,
+    /// What its bending offers right now (from `dragon_cast::Caster` in the
+    /// shell): `None` if nothing is ready and nothing is being gathered.
+    pub cast: Option<CastOption>,
+}
+
+/// A bending option, summarised for the tactical choice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CastOption {
+    /// An offensive ability is ready and in range.
+    pub offence_ready: bool,
+    /// A defensive ability (Rampart, Mist Veil) is ready.
+    pub defence_ready: bool,
+    /// 0..1 how strong the ready offensive ability is.
+    pub value: f32,
+    /// It is gathering a cast right now (the Cast tactic holds until release).
+    pub busy: bool,
 }
 
 /// What kind of non-visual lead.
@@ -500,7 +519,10 @@ pub struct DuelOut {
     pub why: Why,
     /// Every tactic's score this tick, so a log or HUD can show the runner-up
     /// and how close it was. All `-1.0` while unaware.
-    pub scores: [(Tactic, f32); 6],
+    pub scores: [(Tactic, f32); 7],
+    /// `Some(defensive)` on the tick it decides to cast: the shell picks the
+    /// ability (`dragon_cast::Caster::choose`) and starts the wind-up.
+    pub begin_cast: Option<bool>,
 }
 
 impl DuelOut {
@@ -682,7 +704,9 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
                 (Tactic::Lunge, -1.0),
                 (Tactic::Breath, -1.0),
                 (Tactic::Retreat, -1.0),
+                (Tactic::Cast, -1.0),
             ],
+            begin_cast: None,
         };
     }
 
@@ -697,7 +721,7 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
     let breath_ok = st.fuel >= BREATH_COST && dist <= p.breath.max_range && dist > lunge_range * 0.8;
     let retreat_hp = 0.18 + 0.2 * cunning;
 
-    let mut score = [(Tactic::Stalk, f32::MIN); 6];
+    let mut score = [(Tactic::Stalk, f32::MIN); 7];
     score[0] = (Tactic::Stalk, if !watched && dist > lunge_range { 0.4 + 0.4 * cunning } else { -1.0 });
     score[1] = (Tactic::Circle, if watched { 0.35 + 0.3 * cunning - boldness * 0.2 } else { 0.1 });
     score[2] = (
@@ -739,11 +763,31 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
         Tactic::Retreat,
         if s.hp01 < retreat_hp { 1.2 + (retreat_hp - s.hp01) * 3.0 } else { -1.0 + (-boldness).max(0.0) },
     );
+    // Bending. Offence: a ready ability in range is a strong option, stronger
+    // when the item in your hand makes closing in costly, and when you
+    // out-reach it. Defence: a wall or veil when it is hurt and your item
+    // counters it -- put the land between you. A cast in progress holds
+    // through `committed` below.
+    let c = s.cast;
+    let defend = c.map_or(false, |c| c.defence_ready) && s.hp01 < 0.55 && (counter > 1.0 || pain_now > 0.08);
+    score[6] = (
+        Tactic::Cast,
+        if defend {
+            1.1 + cunning * 0.3
+        } else if c.map_or(false, |c| c.offence_ready) {
+            0.5 + 0.35 * c.map_or(0.0, |c| c.value)
+                + (counter - 1.0).max(0.0) * 0.3 * cunning
+                + (respect_reach - 1.5).max(0.0) * 0.08
+        } else {
+            -1.0
+        },
+    );
 
     // Actions finish before anything else is considered.
     let committed = match st.tactic {
         Tactic::Lunge => st.held < LUNGE_TIME,
         Tactic::Breath => st.held < 0.8 || (!st.breath_fired && st.held < BREATH_AIM_TIMEOUT),
+        Tactic::Cast => s.cast.map_or(false, |c| c.busy),
         _ => false,
     };
     let current = score.iter().find(|(t, _)| *t == st.tactic).map_or(f32::MIN, |x| x.1);
@@ -767,6 +811,7 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
     let aim_off = wrap(toward - s.self_yaw).abs();
     let mut breathe = false;
     let mut bite = false;
+    let mut begin_cast = None;
     let mut want_air = None;
     let (heading, speed01, reason) = match st.tactic {
         // Close fast, then creep: a fixed 0.45 lost ground to a walking player
@@ -830,6 +875,12 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
             want_air = Some(true);
             (toward + PI, 1.0, "wounded, breaking off")
         }
+        Tactic::Cast => {
+            if changed && !s.cast.map_or(false, |c| c.busy) {
+                begin_cast = Some(defend);
+            }
+            (toward, 0.1, if defend { "raising the land between you" } else { "gathering its bending" })
+        }
         Tactic::Unaware | Tactic::Track => (s.self_yaw, 0.0, "not engaged"),
     };
 
@@ -845,6 +896,7 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
         dread: dread_out,
         why: Why { boldness, counter, respect_reach, safe_gap, reason },
         scores: score,
+        begin_cast,
     }
 }
 
@@ -938,6 +990,7 @@ pub fn senses_for(
         player_whiffed: whiffed,
         body_radius: body.radius(),
         lead: None,
+        cast: None,
     }
 }
 
@@ -1039,6 +1092,7 @@ mod tests {
             player_whiffed: false,
             body_radius: 2.0,
             lead: None,
+            cast: None,
         }
     }
 
@@ -1221,6 +1275,7 @@ mod tests {
                 player_whiffed: whiffed,
                 body_radius: 2.0,
                 lead: None,
+                cast: None,
             };
             let o = step(st, p, &s, DuelTuning::default(), dt);
             let e = wrap(o.heading - yaw);
@@ -1456,7 +1511,8 @@ mod tests {
             roar: false,
             dread: 0.0,
             why: Why { boldness: 0.0, counter: 1.0, respect_reach: 1.0, safe_gap: 1.0, reason: "" },
-            scores: [(Tactic::Circle, 0.0); 6],
+            scores: [(Tactic::Circle, 0.0); 7],
+            begin_cast: None,
         }
     }
 
@@ -1838,6 +1894,57 @@ mod tests {
         }
         assert!(st.engaged, "a live lead keeps it in the fight");
         assert_eq!(st.belief, Some((30.0, 1.2)));
+    }
+
+    #[test]
+    fn a_ready_ability_gets_cast_and_the_cast_holds_until_release() {
+        let mut p = DuelProfile::from_genome(&genome(3));
+        p.ferocity = 0.3;
+        let mut st = DuelState::new(1);
+        st.fuel = 0.0;
+        let mut s = senses(25.0);
+        s.cast = Some(CastOption { offence_ready: true, defence_ready: false, value: 0.8, busy: false });
+        let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
+        assert_eq!(o.tactic, Tactic::Cast);
+        assert_eq!(o.begin_cast, Some(false));
+        // Gathering: nothing else may interrupt, and it does not re-begin.
+        s.cast = Some(CastOption { offence_ready: false, defence_ready: false, value: 0.0, busy: true });
+        let mut near = s;
+        near.dist = 3.0;
+        near.player_facing = -1.0; // a juicy flank for a lunge
+        for _ in 0..30 {
+            let o = step(&mut st, &p, &near, DuelTuning::default(), 0.05);
+            assert_eq!(o.tactic, Tactic::Cast);
+            assert_eq!(o.begin_cast, None);
+        }
+        // Released and on cooldown: something else takes over.
+        near.cast = None;
+        let o = step(&mut st, &p, &near, DuelTuning::default(), 0.05);
+        assert_ne!(o.tactic, Tactic::Cast);
+    }
+
+    #[test]
+    fn hurt_by_a_countering_item_it_walls_itself_off() {
+        let mut p = DuelProfile::from_genome(&genome(4)); // Fire
+        p.cunning = 0.7;
+        let mut st = DuelState::new(1);
+        st.fuel = 0.0;
+        let mut s = senses(12.0);
+        s.hp01 = 0.45;
+        s.item = Some(ItemThreat { element: Some(3), damage: 20.0, reach: 3.0 }); // Dust counters Fire
+        s.cast = Some(CastOption { offence_ready: true, defence_ready: true, value: 0.5, busy: false });
+        let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
+        assert_eq!(o.tactic, Tactic::Cast);
+        assert_eq!(o.begin_cast, Some(true), "defensive");
+        assert_eq!(o.why.reason, "raising the land between you");
+        // Healthy and facing a neutral item: offence instead.
+        let mut st2 = DuelState::new(1);
+        st2.fuel = 0.0;
+        let mut calm = s;
+        calm.hp01 = 1.0;
+        calm.item = None;
+        let o = step(&mut st2, &p, &calm, DuelTuning::default(), 0.05);
+        assert_eq!(o.begin_cast, Some(false));
     }
 
     #[test]
