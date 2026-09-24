@@ -476,6 +476,22 @@ pub struct EffectCache {
     /// Each ducked bus's follower state, kept across contiguous calls like
     /// every other effect's (a duck that re-armed per buffer would click).
     ducks: BTreeMap<studio_core::BusId, Duck>,
+    /// Each bus's stereo imager, with the widths it was built for.
+    imagers: BTreeMap<studio_core::BusId, ([f32; 3], studio_fx::imager::Imager)>,
+}
+
+/// The imager's crossovers: below 200 Hz, 200 Hz - 4 kHz, above 4 kHz.
+pub const IMAGER_SPLITS: [f32; 2] = [200.0, 4000.0];
+
+/// A bus's `imager` effect, if it has an enabled one: widths (low, mid,
+/// high) -- 0 mono, 1 as is, >1 wider. STEREO: it needs L and R together,
+/// which the per-sample effect chain cannot give (see `studio_fx::instantiate`),
+/// so, like `duck`, it runs here, after the chain.
+pub fn imager_of(bus: &studio_core::Bus) -> Option<[f32; 3]> {
+    bus.chain.iter().find(|e| e.kind == "imager" && e.enabled).map(|e| {
+        let w = |k: &str| e.params.get(k).copied().unwrap_or(1.0).clamp(0.0, 2.0);
+        [w("low"), w("mid"), w("high")]
+    })
 }
 
 /// SIDECHAIN DUCK: a bus turned down while ANOTHER bus (the key) is loud --
@@ -559,6 +575,7 @@ impl EffectCache {
         self.clip.clear();
         self.bus.clear();
         self.ducks.clear();
+        self.imagers.clear();
     }
 
     fn build(chain: &[studio_core::Effect], rate: f32) -> Vec<(usize, studio_fx::Instance)> {
@@ -1129,6 +1146,15 @@ pub fn mixdown_into(
                         }
                     }
                 }
+            }
+        }
+        if let Some(widths) = imager_of(bus) {
+            let entry = cache.imagers.entry(id).or_insert_with(|| (widths, studio_fx::imager::Imager::new(rate as f32, &IMAGER_SPLITS)));
+            if entry.0 != widths { *entry = (widths, studio_fx::imager::Imager::new(rate as f32, &IMAGER_SPLITS)); }
+            entry.1.widths = widths.to_vec();
+            for fr in buf.chunks_exact_mut(2) {
+                let (l, r) = entry.1.process(fr[0], fr[1]);
+                fr[0] = l; fr[1] = r;
             }
         }
         if let Some((key, fx)) = duck_of(bus) {
@@ -3114,6 +3140,43 @@ mod duck_tests {
         assert!(db(under, d_under) < -9.0, "ducked on the hit: {:.1} dB", db(under, d_under));
         assert!(db(between, d_between) > -1.0, "back between hits: {:.1} dB", db(between, d_between));
         }
+    }
+
+    /// The imager on a bus: width 0 everywhere folds the bus to mono (L == R),
+    /// and the MONO fold-down is the same with and without it -- the
+    /// imager's own invariant, now through the mixdown.
+    #[test]
+    fn a_bus_imager_at_zero_width_is_mono_and_never_changes_the_fold_down() {
+        let (mut p, _) = project(false);
+        // a stereo source with different L and R
+        let rate = 48_000u32;
+        let n = rate as usize;
+        let l: Vec<f32> = (0..n).map(|i| 0.3 * ((i as f32) * 0.05).sin()).collect();
+        let r: Vec<f32> = (0..n).map(|i| 0.3 * ((i as f32) * 0.031).sin()).collect();
+        let mut audio = BTreeMap::new();
+        audio.insert(SourceId(1), SourceAudio { sample_rate: rate, channels: vec![l, r] });
+        audio.insert(SourceId(2), SourceAudio { sample_rate: rate, channels: vec![vec![0.0; n]] });
+        // The baseline is a NEUTRAL imager (widths 1), not no imager: the
+        // crossovers rotate phase, so the fold-down only matches sample for
+        // sample through the same filters -- the imager's own test compares
+        // two imagers for this reason (the first version of this one did not,
+        // and read a 0.94 error for a fold-down that sounds the same).
+        let set = |p: &mut Project, w: f32| {
+            let chain = vec![Effect { kind: "imager".into(), enabled: true,
+                params: [("low".to_string(), w), ("mid".to_string(), w), ("high".to_string(), w)].into() }];
+            p.apply(&Op::SetBusChain { id: BusId(1), chain }).unwrap();
+        };
+        set(&mut p, 1.0);
+        let plain = mixdown(&p, &audio, &BTreeMap::new(), s(0.2), s(0.6), rate, &[], &[]);
+        set(&mut p, 0.0);
+        let mono = mixdown(&p, &audio, &BTreeMap::new(), s(0.2), s(0.6), rate, &[], &[]);
+        let side = mono.chunks(2).map(|f| (f[0] - f[1]).abs()).fold(0.0f32, f32::max);
+        assert!(side < 1e-4, "width 0: L == R, side {side}");
+        let fold = |v: &[f32]| v.chunks(2).map(|f| f[0] + f[1]).collect::<Vec<f32>>();
+        let (a, b) = (fold(&plain), fold(&mono));
+        let err = a.iter().zip(&b).skip(4800).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let peak = a.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(err < 0.02 * peak, "the mono fold-down is unchanged (after the crossovers settle): {err} of {peak}");
     }
 
     /// Bus pan is a balance: hard left silences the right side and leaves the

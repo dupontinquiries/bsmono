@@ -110,6 +110,12 @@ const NOTE_NAMES: &[&str] = &["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "
 
 /// Every kind `instantiate` knows, with a one-line description for a
 /// picker. Order is the order a chain menu shows.
+/// Kinds that are STEREO and run on a bus's stereo path in the mixdown
+/// (studio-audio), not through `instantiate`'s per-sample chain -- listed so
+/// the schema can offer their controls while the chain contract stays exact.
+/// On a clip they do nothing (clips are processed per sample).
+pub const BUS_STEREO_KINDS: &[&str] = &["imager"];
+
 pub const KINDS: &[(&str, &str)] = &[
     ("gain", "level, in dB"),
     ("eq", "parametric equaliser, up to 8 bands"),
@@ -120,6 +126,7 @@ pub const KINDS: &[(&str, &str)] = &[
     ("saturation", "tube / tape / console / diode colour"),
     ("adaptivesat", "saturation that follows notes and sibilance"),
     ("autotune", "pitch correction to a scale"),
+    ("imager", "stereo width in three bands (busses)"),
     ("comb", "comb delay: metallic resonance"),
     ("sub", "sub-octave"),
     ("shift", "pitch shift, granular"),
@@ -175,6 +182,11 @@ pub fn schema(kind: &str) -> Option<Vec<ParamSpec>> {
             b("tied", "tie channels", false),
             f("bias", "bias", -1.0, 1.0, "", 0.0),
             f("mix", "mix", 0.0, 1.0, "%", 1.0),
+        ],
+        "imager" => vec![
+            f("low", "width below 200 Hz", 0.0, 2.0, "", 1.0),
+            f("mid", "width 200 Hz - 4 kHz", 0.0, 2.0, "", 1.0),
+            f("high", "width above 4 kHz", 0.0, 2.0, "", 1.0),
         ],
         "autotune" => vec![
             e("root", "root", NOTE_NAMES, 0),
@@ -316,6 +328,10 @@ mod tests {
         for (kind, _) in KINDS {
             assert!(schema(kind).is_some(), "{kind} has no schema");
             let fx = studio_core::Effect { kind: (*kind).into(), params: defaults(kind), enabled: true };
+            if BUS_STEREO_KINDS.contains(kind) {
+                assert!(crate::instantiate(&fx, 48_000.0).is_none(), "{kind} runs on the bus's stereo path, not here");
+                continue;
+            }
             assert!(crate::instantiate(&fx, 48_000.0).is_some(), "{kind} did not instantiate from schema defaults");
         }
     }

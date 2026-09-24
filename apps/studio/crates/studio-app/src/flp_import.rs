@@ -123,6 +123,7 @@ pub fn default_params(slot_name: &str) -> BTreeMap<String, f32> {
     match slot_name {
         "Ozone 8 Exciter" => kv(&[("profile", 0.0), ("drive", 0.15), ("mix", 0.35)]),
         "Ozone 8 Vintage Tape" => kv(&[("profile", 1.0), ("drive", 0.2), ("mix", 0.5)]),
+        "Ozone 8 Imager" => kv(&[("low", 0.0), ("mid", 1.0), ("high", 1.3)]),
         _ => BTreeMap::new(),
     }
 }
@@ -149,6 +150,9 @@ pub fn effect_for(plugin: &str) -> Option<(&'static str, &'static str)> {
         "Ozone 8 Equalizer" | "Ozone 8 Dynamic EQ" => ("eq", "approximate: flat until set"),
         "Ozone 8" => ("multiband", "approximate: the whole Ozone suite as a multiband stage"),
         "Neutron 3" => ("compressor", "approximate: Neutron's channel strip as a compressor"),
+        // stereo width, run on the bus's stereo path (studio-audio)
+        "Ozone 8 Imager" => ("imager", "approximate: the mastering move (lows mono, air wider)"),
+        "Fruity Stereo Enhancer" | "Fruity Stereo Shaper" => ("imager", "approximate: width only, neutral until set"),
         "Fruity Multiband Compressor" => ("multiband", "exact kind"),
         _ => return None,
     })

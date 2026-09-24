@@ -1202,6 +1202,13 @@ mod live_param_tests {
         // EQ with three bands, so the digit rule is exercised past 0).
         let mut live_seen = 0;
         for (kind, _) in schema::KINDS {
+            if schema::BUS_STEREO_KINDS.contains(kind) {
+                // stereo, run by the mixdown on a bus: must NOT be buildable
+                // here, or the mono chain would take it and do it wrong
+                let e = studio_core::Effect { kind: (*kind).into(), params: schema::defaults(kind), enabled: true };
+                assert!(instantiate(&e, 48_000.0).is_none(), "{kind} is stereo: not a per-sample instance");
+                continue;
+            }
             let mut params = schema::defaults(kind);
             if *kind == "eq" { params.insert("bands".into(), 3.0); }
             let e = studio_core::Effect { kind: (*kind).into(), params, enabled: true };
