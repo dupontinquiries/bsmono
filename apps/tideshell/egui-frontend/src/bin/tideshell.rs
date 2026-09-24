@@ -424,6 +424,11 @@ fn main() {
 
         // Which camera is the rear one. Asked once: `cam -l` starts a libcamera
     // manager, which is not something to do every window.
+    // How the sensor sits relative to the screen. TIDESHELL_CAMERA_ROTATE
+    // (0/90/180/270) because it is a property of the handset, and guessing
+    // it from the frame is how you get a picture that is sideways in one
+    // orientation and upside down in another.
+    let cam_rot = std::env::var("TIDESHELL_CAMERA_ROTATE").ok().and_then(|v| tideshell_egui::fit::Quarter::parse(&v)).unwrap_or_default();
     let cam_list = std::process::Command::new("cam").arg("-l").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
     let mut sb = Shellbox {
         shell: Shell::new(prefs, (0.0, 0.0)),
@@ -462,6 +467,7 @@ fn main() {
         last_place_poll: 0,
         last_color_note: 0,
     };
+    sb.view.camera_rot = cam_rot;
     sb.shell.set_date(tideshell_egui::sensors::local_yday());
     if let Some(p) = Shellbox::places_path() {
         if let Ok(text) = std::fs::read_to_string(&p) {

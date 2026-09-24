@@ -77,6 +77,7 @@ pub mod keys;
 pub mod powerdoctor;
 pub mod ctl;
 pub mod camera;
+pub mod fit;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
 use std::collections::HashMap;
@@ -144,6 +145,9 @@ pub struct ShellView {
     palette_focused: bool,
     /// The camera pane's latest frame as a texture, with its size.
     camera_tex: Option<(egui::TextureHandle, usize, usize)>,
+    /// How the sensor is mounted relative to the screen. A property of the
+    /// hardware, so it is set once rather than guessed per frame.
+    pub camera_rot: crate::fit::Quarter,
     bar_drag: f32,
     sheet: SettingsSheet,
     /// Press feedback per widget: a spring on its scale (0.94 pressed, 1.0
@@ -752,9 +756,23 @@ impl ShellView {
         let alpha = (1.0 - prog * 0.8).clamp(0.0, 1.0);
         let top = origin + Vec2::new(0.0, -prog * size.y);
         // Background: the camera when it is running (the pane), else a gradient.
-        if let Some((tex, _, _)) = &self.camera_tex {
+        if let Some((tex, fw, fh)) = &self.camera_tex {
             let r = Rect::from_min_size(top, size);
-            p.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::from_white_alpha((alpha * 255.0) as u8));
+            // Not `p.image` with a full 0..1 uv: that stretches the frame to
+            // the pane on BOTH axes independently, so a landscape sensor in
+            // a portrait pane comes out squashed and, with the sensor a
+            // quarter turn from the screen, sideways as well. A mesh lets
+            // each destination corner read a different source corner, which
+            // both turns the image and crops it to one scale factor, so
+            // real-world proportions survive.
+            let uv = crate::fit::corner_uvs((*fw as f32, *fh as f32), (size.x, size.y), self.camera_rot);
+            let tint = Color32::from_white_alpha((alpha * 255.0) as u8);
+            let mut mesh = egui::Mesh::with_texture(tex.id());
+            for (i, corner) in [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()].iter().enumerate() {
+                mesh.vertices.push(egui::epaint::Vertex { pos: *corner, uv: Pos2::new(uv[i][0], uv[i][1]), color: tint });
+            }
+            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+            p.add(egui::Shape::mesh(mesh));
             // Darken for legibility, keep the picture.
             p.rect_filled(r, cr(0), Color32::from_black_alpha((alpha * 90.0) as u8));
             // World anchors: rings where the world says they are.
