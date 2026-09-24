@@ -76,6 +76,18 @@ pub const FANFARE_AT: f32 = PAN + 3.0 * LANE;
 /// Gap between cats appearing in one base.
 pub const SPAWN_STAGGER: f32 = 0.07;
 
+/// Seconds a move between two beats' shots takes (half before, half after
+/// the boundary).
+pub const TRANSITION: f32 = 0.9;
+/// Half-width, in world units, of the moving average a lane run follows.
+pub const LANE_SMOOTH: f32 = 12.0;
+
+/// When each beat after the first begins.
+fn beat_starts() -> [f32; 7] {
+    let l = PAN + 3.0 * LANE;
+    [PAN, PAN + LANE, PAN + 2.0 * LANE, l, l + SPAWN, l + 2.0 * SPAWN, l + 2.0 * SPAWN + VERSUS]
+}
+
 pub fn total() -> f32 {
     PAN + 3.0 * LANE + 2.0 * SPAWN + VERSUS + SETTLE
 }
@@ -148,9 +160,43 @@ impl Intro {
     }
 
     /// Everything the shells need for time `self.t`.
+    /// Everything the shells need for time `self.t`: the beats' shots with
+    /// the cuts between them turned into moves (see `TRANSITION`).
     pub fn frame(&self) -> Frame {
-        let r = consts::arena_radius();
         let t = self.t;
+        let f = self.raw_frame(t);
+        // Across a beat boundary the camera travels from the outgoing shot
+        // to the incoming one instead of cutting: eased both ends, and on a
+        // long move the eye rises on an arc (base to base on the pass is
+        // ~350 u, over the peaks, not through them). Measured before: 137
+        // degrees of turn and 353 u of eye travel in ONE frame.
+        for b in beat_starts() {
+            // a long move takes longer: base to base on the pass is a 180
+            // degree reversal over ~350 u, which in 0.9 s turned 6.3 deg a
+            // frame (the smoothness test's limit is 6)
+            let probe = (self.raw_frame(b - 0.45).shot.eye - self.raw_frame(b + 0.45).shot.eye).length();
+            let dur = (TRANSITION + probe / 350.0 * 0.7).min(1.6);
+            let half = dur * 0.5;
+            if b > half && t > b - half && t < b + half {
+                let from = self.raw_frame(b - half).shot;
+                let to = self.raw_frame(b + half).shot;
+                let u = smooth((t - (b - half)) / dur);
+                let dist = (to.eye - from.eye).length();
+                let arc = (u * std::f32::consts::PI).sin() * (dist * 0.3).min(70.0);
+                let shot = Shot {
+                    eye: from.eye.lerp(to.eye, u) + Vec3::Y * arc,
+                    target: from.target.lerp(to.target, u),
+                    fov_y: from.fov_y + (to.fov_y - from.fov_y) * u,
+                };
+                return Frame { shot, ..f };
+            }
+        }
+        f
+    }
+
+    /// The beats' own shots, cut at the boundaries: `frame` smooths these.
+    fn raw_frame(&self, t: f32) -> Frame {
+        let r = consts::arena_radius();
         let bars_in = smooth(t / 0.6);
         let mut o = Overlay { bars: bars_in, versus: 0.0, line: None, line_alpha: 0.0, caption: None, skip_hint: smooth((t - 1.0) / 0.5) * (1.0 - smooth((t - (total() - SETTLE)) / 0.4)) };
 
@@ -170,7 +216,14 @@ impl Intro {
                 let len: f32 = pts.windows(2).map(|w| (w[1] - w[0]).length()).sum();
                 let at = |d: f32| crate::pass::along(&pts, d.clamp(0.0, len));
                 let d = len * (0.12 + 0.28 * u);
-                let (p, ahead) = (at(d), at(d + 22.0));
+                // the lane smoothed: a moving average along it, so the run
+                // banks through the polyline's corners instead of snapping
+                // its heading at each one
+                let smooth_at = |d: f32| {
+                    let n = 9;
+                    (0..n).map(|k| at(d + (k as f32 / (n - 1) as f32 - 0.5) * 2.0 * LANE_SMOOTH)).fold(Vec3::ZERO, |a, p| a + p) / n as f32
+                };
+                let (p, ahead) = (smooth_at(d), smooth_at(d + 22.0));
                 let side = { let f = (ahead - p).normalize_or_zero(); Vec3::new(-f.z, 0.0, f.x) };
                 let shot = Shot { eye: p + Vec3::Y * 7.0 + side * 3.0, target: ahead + Vec3::Y * 2.0, fov_y: 0.95 };
                 o.caption = Some(match lane {
@@ -274,6 +327,34 @@ mod tests {
             assert!(arrived.iter().all(|&c| c == 1), "{arrived:?}");
         }
         assert!(0.35 + 14.0 * SPAWN_STAGGER < SPAWN, "15 a side fits the spawn beat");
+    }
+
+    /// The camera never cuts: over the whole intro, on both maps, the view
+    /// turns at most MAX_TURN degrees and the eye moves at most MAX_STEP
+    /// units in a frame. Before: 137 degrees and 353 units at the cuts.
+    #[test]
+    fn the_camera_moves_smoothly_through_every_beat() {
+        const MAX_TURN: f32 = 6.0;
+        const MAX_STEP: f32 = 12.0;
+        for m in crate::map::MapId::ALL {
+            crate::map::with(m, || {
+                let n = m.team_size();
+                let mut i = intro(n);
+                let dt = 1.0 / 60.0;
+                let mut prev = i.frame().shot;
+                while !i.done {
+                    i.advance(dt);
+                    let s = i.frame().shot;
+                    let turn = (prev.target - prev.eye).normalize().dot((s.target - s.eye).normalize()).clamp(-1.0, 1.0).acos().to_degrees();
+                    let step = (s.eye - prev.eye).length();
+                    assert!(turn <= MAX_TURN, "{m:?}: the view turned {turn:.1} deg in a frame at t={:.2} ({:?})", i.t, i.frame().beat);
+                    assert!(step <= MAX_STEP, "{m:?}: the eye jumped {step:.1} u in a frame at t={:.2} ({:?})", i.t, i.frame().beat);
+                    let ground = crate::render::terrain_height(s.eye.x, s.eye.z);
+                    assert!(s.eye.y > ground + 1.0, "{m:?}: the camera went into the ground at t={:.2}: eye {} over ground {ground:.1}", i.t, s.eye);
+                    prev = s;
+                }
+            });
+        }
     }
 
     #[test]
