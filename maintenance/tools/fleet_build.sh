@@ -209,7 +209,10 @@ check() {
     # A missing system toolchain is an ENVIRONMENT gap, not code rot, and
     # reporting it as a failure teaches people to ignore this script. Qt, GTK and
     # OpenAL are all legitimately absent in a headless build.
-    if grep -qE 'failed to run custom build command for .(qttypes|qmetaobject|gdk-pixbuf-sys|gtk4-sys|glib-sys|openal|openssl-sys|alsa-sys|libudev-sys|dbus|pango-sys|cairo-sys|atk-sys|gio-sys|gobject-sys|graphene-sys|gdk4-sys)' /tmp/fleet.$$; then
+    # whisper-rs-sys needs libclang (bindgen) and cmake; audiopus_sys builds Opus with cmake.
+    # Without them the build SCRIPT fails, which says nothing about this repo's code -- the
+    # overnight c20unified sweep reported aperture and beatspace "broken" for exactly this.
+    if grep -qE 'failed to run custom build command for .(qttypes|qmetaobject|gdk-pixbuf-sys|gtk4-sys|glib-sys|openal|openssl-sys|alsa-sys|libudev-sys|dbus|pango-sys|cairo-sys|atk-sys|gio-sys|gobject-sys|graphene-sys|gdk4-sys|whisper-rs-sys|audiopus_sys)' /tmp/fleet.$$; then
         local dep; dep=$(grep -oE 'custom build command for `[^`]+`' /tmp/fleet.$$ | head -1)
         echo "  SKIP $label — needs a system toolchain ($dep)"
         rm -f /tmp/fleet.$$
