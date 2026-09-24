@@ -480,11 +480,27 @@ mod tests {
         let phases: Vec<Phase> = p.touches.iter().map(|t| t.phase).collect();
         assert_eq!(phases, vec![Phase::Start, Phase::Move, Phase::End]);
         assert!(p.touches.iter().all(|t| t.id == 1));
-        // a second press while down is ignored
+        // A second press while down means the release was LOST (GLFW sends no
+        // mouse-up when focus leaves mid-drag). It used to be ignored, which
+        // made `down` a latch -- the reported stuck mine button, fixed in
+        // 35d2285ca. This assertion used to pin the latch; it now pins the
+        // recovery: the first contact ends where it was last seen, the new
+        // one starts.
         p.end_frame();
         p.press(100.0, 100.0, &l);
         p.press(900.0, 900.0, &l);
-        assert_eq!(p.touches.len(), 1);
+        let seen: Vec<(Phase, f32, f32)> = p.touches.iter().map(|t| (t.phase, t.x, t.y)).collect();
+        assert_eq!(seen, vec![(Phase::Start, 100.0, 100.0), (Phase::End, 100.0, 100.0), (Phase::Start, 900.0, 900.0)]);
+        assert!(p.down);
+        // The case that was reported: a HELD button whose release was lost is
+        // released (so a consumer holding "mine" stops), not left held.
+        p.release();
+        p.end_frame();
+        p.press(jump.cx, jump.cy, &l);
+        p.press(200.0, 1500.0, &l);
+        assert_eq!(p.released, vec![ButtonKind::Jump], "the lost release is delivered");
+        assert!(p.held_button.is_none());
+        assert_eq!(p.touches.last().map(|t| t.phase), Some(Phase::Start));
     }
 
     #[test]
