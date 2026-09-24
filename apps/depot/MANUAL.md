@@ -110,7 +110,10 @@ Devices need a stable name. Pick one:
     toolchains/{index.json,install.sh,<ver>/<triple>/…}
   keys/depot.key      this depot's signing key (0600)   — never leaves the box
   keys/depot.pub      the matching public key           — give it to receivers
-  keys/admin.token    if present, enables HTTP writes
+  keys/admin.token    if present, enables HTTP writes (the bootstrap / emergency key)
+  keys/clients/<name>.pub   a PAIRED client: its ed25519 public key and scopes (0600)
+  keys/pending/<id>         a pairing request waiting for approval (expires in 15 min)
+  keys/paired/<id>          the outcome, for the client polling its request
   trust/<name>.pub    public keys whose packs `unpack` accepts
   tmp/                in-flight uploads and packs
 ```
@@ -395,6 +398,8 @@ pattern: `APKINDEX.tar.gz` derived from the `.apk` control segments).
 | reclaim space | `depot gc` lists unreferenced objects, `depot gc --delete` removes them |
 | enable HTTP writes | `depot admin-token --new`; delete `keys/admin.token` to disable |
 | rotate the token | delete the file, run `--new` again; takes effect immediately |
+| let a client write without the token | the client asks to pair (`gitmind depot pair`, or POST `/api/pair`) and shows a 6-digit code; on the depot host `depot pair list` shows the same code -- `depot pair approve <id> --code <code>` if they match, `depot pair deny <id>` if not |
+| see / remove paired clients | `depot pair clients`; `depot pair revoke <name>` (its key stops working at once) |
 | back up | `rsync -a <root>/{catalog.json,objects,keys,trust,depot.toml} …` (pub/ and tmp/ are derived) |
 | logs | `journalctl -u depot` — one line per request: method, path, status, bytes, ms |
 | learn / teach | `depot tutorial` lists the guides; `depot tutorial server-setup` prints one; the UI shows them a step at a time, with a live check per step where the depot can verify itself |
@@ -408,7 +413,27 @@ wrong): timestamps are informational, signatures have no expiry, and dnf's
 
 ## 7. HTTP API
 
-Reads are open; writes need `Authorization: Bearer <admin token>`.
+Reads are open. Writes take one of two credentials:
+
+- `Authorization: Bearer <admin token>` -- every write route. The bootstrap and emergency key.
+- `Authorization: Depot-Sig client=<name>,ts=<unix>,nonce=<hex>,sig=<hex>` -- a PAIRED
+  client's ed25519 signature over method, path+query, ts, nonce and content length
+  (shared/depot-auth). Accepted within 300 s of the depot's clock, each nonce once, and only
+  on routes the client's scopes cover:
+
+  | scope | routes |
+  |---|---|
+  | `ingest` | PUT `/api/crates`, POST `/api/crates/<name>/<vers>/yank`·`unyank`, PUT `/api/rpm/<repo>`, PUT `/api/toolchains` |
+  | `packs` | POST `/api/pack`, PUT `/api/packs` |
+  | `approve` | POST `/api/pair/<id>/approve`·`deny` |
+  | `term` | `/api/term/*` |
+
+  Any other route that requires authorization answers a signed request with 403: admin token
+  only. (Some POSTs need none: `/api/niftyplot` renders, `/api/pair` files a request.) The body is not
+  signed -- ingests are content-addressed, and the client checks the sha256 the depot reports
+  storing. Pairing: a client POSTs its name, public key and wanted scopes; both sides derive
+  the same 6-digit code from the key and a depot-chosen nonce, so approving with the code
+  proves the depot holds the key the client made.
 
 | method | path | body / query | result |
 |--------|------|--------------|--------|
@@ -418,8 +443,12 @@ Reads are open; writes need `Authorization: Bearer <admin token>`.
 | POST | `/api/crates/<name>/<vers>/yank` · `/unyank` | | mark |
 | GET | `/api/rpm` · `/api/rpm/<repo>?q=` | | repos / packages |
 | PUT | `/api/rpm/<repo>` | an `.rpm` | ingest + repodata rebuild |
-| GET | `/api/nix` · `/api/toolchains` | | lists |
+| GET | `/api/nix` · `/api/toolchains` · `/api/alpine` | | lists |
 | PUT | `/api/toolchains` | tarball, `X-Filename:` | ingest |
+| POST | `/api/pair` | `name=` `public=` `scopes=` (form lines) | `{id, nonce, expires_in}`; open, at most 16 waiting |
+| GET | `/api/pair` · `/api/pair/<id>` | | waiting requests with their codes / one request's status |
+| POST | `/api/pair/<id>/approve?code=` · `/api/pair/<id>/deny` | | decide (admin token or `approve` scope) |
+| GET | `/api/clients` | | paired clients and scopes |
 | GET | `/api/have` | | hash list, one per line |
 | POST | `/api/pack?select=all\|crates,nix,toolchains,rpm:<id>,rpm:*[&unsigned=1]` | have-list | a pack (streamed) |
 | PUT | `/api/packs[?allow_unsigned=1]` | a pack | unpack |

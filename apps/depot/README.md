@@ -22,6 +22,8 @@ between the online and offline sides as signed, content-deduplicated packs.
 crates/depot-httpd   std-only threaded HTTP/1.1 — the transport seam (hyper/TLS would slot in here)
 crates/depot-core    headless: store, catalog, the four projections, signed packs
 crates/depot         the binary: CLI + `depot serve` (routes in web.rs) + embedded UI (ui/)
+../../shared/depot-auth  the write protocol for PAIRED clients (keys, signed requests, pairing
+                     codes; pure). Clients: gitmind's `gitmind depot`. See MANUAL.md section 7.
 tutorials/           markdown, one `## ` per step, optional `%check:` and niftyplot fences; parsed by crates/depot/src/tutorial.rs
 crates/depot/src/checks.rs   the live check keys (initialised, public_url_set, rpm_keys, trusted_any, …)
 crates/depot/src/terminal.rs the pty session manager behind the in-browser terminal (opt-in)
