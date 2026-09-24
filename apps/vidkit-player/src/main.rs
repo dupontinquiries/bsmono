@@ -1164,23 +1164,30 @@ impl Player {
         };
 
         let engine = playback::Engine::start(stream_opener(input, cap), sink_maker(), Duration::ZERO, 60)?;
-        // Resolved carries no duration; the probe the decoder just did knows
-        // the frame rate but not the length, and asking yt-dlp again for it is
-        // another process. Left as it was rather than guessed.
+        // The length comes from the same yt-dlp JSON (Resolved::duration).
         self.transport.status = "NV12 · CPU convert · streaming".into();
         self.opened = Some(Ok(Opened {
             label: format!(
                 "{} · {}x{} · streaming while it downloads",
                 resolved.video_format_id, resolved.width, resolved.height
             ),
-            duration: None,
+            duration: resolved.duration,
         }));
         self.engine = Some(engine);
         // Transcribe from the audio URL (the video URL when muxed). No cache:
         // the signed URL expires and is no key for anything.
         let audio_url = resolved.audio_url.clone().unwrap_or_else(|| resolved.video_url.clone());
         let headers: Vec<(String, String)> = resolved.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        self.start_transcription(None, transcribe::AudioIn { input: audio_url, headers }, None);
+        let audio = transcribe::AudioIn { input: audio_url, headers: headers.clone() };
+        // The page's own captions when it has them: YouTube's cost nothing,
+        // whisper costs minutes of CPU per hour of lecture on a phone.
+        let factory = match resolved.captions.clone() {
+            Some(c) => transcribe::caption_factory(c, headers),
+            None => transcribe::source_factory(None),
+        };
+        self.transport.duration = resolved.duration;
+        self.worker = Some(transcribe::Worker::start(factory, audio, resolved.duration, None));
+        self.reset_sections();
         self.path = None;
         // The previous download, if any, is no longer needed.
         self.downloaded = None;
@@ -1279,6 +1286,10 @@ impl Player {
     fn start_transcription(&mut self, video: Option<PathBuf>, audio: transcribe::AudioIn, total: Option<Duration>) {
         let cache = video.as_deref().and_then(transcribe::cache_path);
         self.worker = Some(transcribe::Worker::start(transcribe::source_factory(video), audio, total, cache));
+        self.reset_sections();
+    }
+
+    fn reset_sections(&mut self) {
         self.seen_version = 0;
         self.windows.clear();
         self.chapters.clear();

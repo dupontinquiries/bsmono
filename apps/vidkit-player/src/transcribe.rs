@@ -317,6 +317,39 @@ pub fn source_factory(video: Option<PathBuf>) -> Factory {
     })
 }
 
+/// The source for a stream whose page offered captions: fetch the VTT
+/// (tens of KB for an hour) instead of running whisper for tens of minutes.
+/// A failed fetch falls through to whisper rather than to no transcript.
+pub fn caption_factory(caption: vidkit_ytdlp::Caption, headers: Vec<(String, String)>) -> Factory {
+    Box::new(move || match fetch_text(&caption.url, &headers) {
+        Ok(text) => {
+            let kind = if caption.automatic { "auto-captions" } else { "subtitles" };
+            let src = vidkit_transcribe::subtitles::SubtitleSource::from_text(format!("{kind}:{}", caption.lang), &text);
+            if src.all().is_empty() {
+                whisper_source().map_err(|e| format!("the {kind} had no cues, and {e}"))
+            } else {
+                Ok(Box::new(src) as Box<dyn CueSource>)
+            }
+        }
+        Err(e) => whisper_source().map_err(|w| format!("captions: {e}; {w}")),
+    })
+}
+
+/// GET a small text resource over the app's own transports. A range from
+/// zero to 16 MB: a server clamps it to the real length (RFC 9110 14.1.2),
+/// and a caption file bigger than that is not a caption file.
+pub fn fetch_text(url: &str, headers: &[(String, String)]) -> Result<String, String> {
+    let mut t = crate::io::transport_for(url)?;
+    let req = vidkit_ytdlp::RangeRequest {
+        url: url.to_string(),
+        headers: headers.iter().cloned().collect(),
+        start: 0,
+        end: 16 * 1024 * 1024 - 1,
+    };
+    let body = vidkit_ytdlp::HttpTransport::fetch(&mut t, &req).map_err(|e| format!("{e:?}"))?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 #[cfg(feature = "whisper")]
 fn whisper_source() -> Result<Box<dyn CueSource>, String> {
     // All but one core: the playback decoder keeps one, and whisper past
@@ -455,5 +488,32 @@ mod tests {
         assert_eq!(fnv1a(b""), 0xcbf29ce484222325);
         assert_eq!(fnv1a(b"a"), 0xaf63dc4c8601ec8c);
         assert_eq!(fnv1a(b"foobar"), 0x85944171f73967e8);
+    }
+
+    /// A caption track served over real HTTP by a local socket: fetched,
+    /// parsed, and handed to the loop whole, with no audio decoded.
+    #[test]
+    fn page_captions_become_the_transcript_without_decoding_audio() {
+        use std::io::{Read as _, Write as _};
+        let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nhello fourier\n\n00:01:05.000 --> 00:01:07.000\nnow laplace\n";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = vtt.to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut c, _)) = listener.accept() {
+                let mut req = [0u8; 2048];
+                let _ = c.read(&mut req);
+                let head = format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n", body.len(), body.len() - 1, body.len());
+                let _ = c.write_all(head.as_bytes());
+                let _ = c.write_all(body.as_bytes());
+            }
+        });
+        let cap = vidkit_ytdlp::Caption { url: format!("http://127.0.0.1:{port}/cc.vtt"), lang: "en-orig".into(), automatic: true };
+        // The audio input does not exist: if the loop tried to decode it, the
+        // transcript would stay empty.
+        let w = Worker::start(caption_factory(cap, vec![]), AudioIn { input: "/nonexistent.m4a".into(), headers: vec![] }, Some(Duration::from_secs(120)), None);
+        assert!(wait_until(&w, |s| s.transcript.cues().len() == 2), "{}", w.with(|s| s.status.clone()));
+        assert!(w.with(|s| s.status.starts_with("auto-captions:en-orig")), "{}", w.with(|s| s.status.clone()));
+        assert!(w.with(|s| s.coverage.complete()), "all chunks marked done");
     }
 }
