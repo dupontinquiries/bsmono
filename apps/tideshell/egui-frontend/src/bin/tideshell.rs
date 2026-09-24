@@ -622,7 +622,7 @@ fn main() {
     let mut contact_pos: HashMap<i32, Pos2> = HashMap::new();
     let mut last_region: Option<Option<Vec<Rect>>> = None;
     let mut renderer_noted = false;
-    let mut last_frame_hash: HashMap<Role, u64> = HashMap::new();
+    let mut last_frame_hash: HashMap<Role, tideshell_egui::damage::Painted> = HashMap::new();
     let mut last_poll = 0u64;
     // comfortgov reads the mtime of this file as "last user input".
     let hint = std::env::var_os("XDG_RUNTIME_DIR").map(|r| std::path::PathBuf::from(r).join("comfortgov.input"));
@@ -1126,7 +1126,7 @@ fn main() {
             // Skip a surface whose frame is identical to the one already on
             // screen. Tessellation has happened either way; what is saved is
             // the fill and the commit, which is where the pixels are.
-            let h = tideshell_egui::damage::frame_hash(&prims);
+            let h = (tideshell_egui::damage::frame_hash(&prims), size_px);
             if !tideshell_egui::damage::changed(last_frame_hash.get(&role).copied(), h, !out.textures_delta.is_empty()) {
                 sb.execute(actions);
                 continue;
@@ -1211,7 +1211,7 @@ fn main() {
         // and never slept — the loop free-ran at over a thousand iterations
         // a second while nothing moved. Skipping the identical frame is what
         // lets it block.
-        let h = tideshell_egui::damage::frame_hash(&prims);
+        let h = (tideshell_egui::damage::frame_hash(&prims), size_px);
         if !tideshell_egui::damage::changed(last_frame_hash.get(&Role::Overlay).copied(), h, !out.textures_delta.is_empty()) {
             continue;
         }
