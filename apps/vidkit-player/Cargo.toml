@@ -52,6 +52,8 @@ vidkit-webm = { path = "../../shared/vidkit/crates/vidkit-webm" }
 # producer whose loop src/transcribe.rs drives.
 vidkit-relevance = { path = "../../shared/vidkit/crates/vidkit-relevance" }
 vidkit-transcribe = { path = "../../shared/vidkit/crates/vidkit-transcribe" }
+# tideshell's living palette, followed when the shell publishes it.
+ambient-palette = { path = "../../shared/ambient-palette" }
 uikit-egui = { path = "../../shared/uikit/crates/uikit-egui" }
 snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
 

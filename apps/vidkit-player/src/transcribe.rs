@@ -89,7 +89,7 @@ pub struct Shared {
     stop: bool,
 }
 
-type Factory = Box<dyn FnOnce() -> Result<Box<dyn CueSource>, String> + Send>;
+pub type Factory = Box<dyn FnOnce() -> Result<Box<dyn CueSource>, String> + Send>;
 
 pub struct Worker {
     shared: Arc<(Mutex<Shared>, Condvar)>,

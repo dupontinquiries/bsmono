@@ -1795,17 +1795,31 @@ pub fn fetch_to_temp<R: vidkit_ytdlp::CommandRunner>(
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    match fetch_into(runner, url, max_height, &dir) {
+        Ok(file) => Ok(TempMedia { dir, file }),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            Err(e)
+        }
+    }
+}
 
+/// Download `url` into an existing `dir` and return the media file. The
+/// caller owns `dir` and its cleanup (TempMedia deletes it; the media cache
+/// renames it into place).
+pub fn fetch_into<R: vidkit_ytdlp::CommandRunner>(
+    runner: &mut R,
+    url: &str,
+    max_height: Option<u32>,
+    dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
     // A fixed stem, not the video's title: a title can contain slashes,
     // newlines and characters that are illegal on the filesystem, and yt-dlp's
     // own sanitising still leaves something unpredictable to find afterwards.
     let template = dir.join("media.%(ext)s");
     let args = download_args(url, &template.to_string_lossy(), max_height);
 
-    runner.run("yt-dlp", &args).map_err(|e| {
-        let _ = std::fs::remove_dir_all(&dir);
-        format!("{url}: {e:?}")
-    })?;
+    runner.run("yt-dlp", &args).map_err(|e| format!("{url}: {e:?}"))?;
 
     // Find what it actually wrote. The extension depends on the remux and on
     // what the site served, so globbing beats guessing.
@@ -1814,7 +1828,7 @@ pub fn fetch_to_temp<R: vidkit_ytdlp::CommandRunner>(
     // leaves one, it is often the LARGEST thing in the directory, and handing
     // it to the decoder produces a parser error about a truncated container
     // instead of "the download did not finish".
-    let file = std::fs::read_dir(&dir)
+    let file = std::fs::read_dir(dir)
         .ok()
         .and_then(|rd| {
             let mut files: Vec<std::path::PathBuf> = rd
@@ -1834,21 +1848,17 @@ pub fn fetch_to_temp<R: vidkit_ytdlp::CommandRunner>(
                 std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
             })
         })
-        .ok_or_else(|| {
-            let _ = std::fs::remove_dir_all(&dir);
-            format!("{url}: yt-dlp wrote no file")
-        })?;
+        .ok_or_else(|| format!("{url}: yt-dlp wrote no file"))?;
 
     // The same checks a local file gets. yt-dlp can exit zero having written
     // nothing usable -- a zero-byte file when the format selector matched
     // something the site then refused, for one -- and "the download is empty"
     // is a better message than whatever the demuxer says about byte zero.
     if let Err(e) = check_file(&file) {
-        let _ = std::fs::remove_dir_all(&dir);
         return Err(format!("{url}: {e}"));
     }
 
-    Ok(TempMedia { dir, file })
+    Ok(file)
 }
 
 #[cfg(test)]

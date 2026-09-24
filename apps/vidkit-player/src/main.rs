@@ -30,6 +30,8 @@ mod filepick;
 mod audio_out;
 mod decode;
 mod export;
+mod media_cache;
+mod seen;
 mod transcribe;
 mod io;
 mod palette;
@@ -135,7 +137,7 @@ struct Player {
     engine: Option<playback::Engine>,
     /// Kept alive so the downloaded file outlives the decoder reading it.
     /// Dropping it deletes the file, and ffmpeg is still holding it open.
-    downloaded: Option<io::TempMedia>,
+    downloaded: Option<media_cache::Held>,
     /// Section watching: the panel, the loop that feeds it, and what the
     /// loop has produced so far (recomputed only when its version changes).
     sections: vidkit_egui::SectionsPanel,
@@ -154,6 +156,15 @@ struct Player {
     /// decoders, and a vertical drag passes through a detent every few
     /// pixels.
     speed_pending: Option<(f64, Instant)>,
+    /// The app's own palette, and the shell's laid over it when tideshell
+    /// publishes one. `colors` is what is in effect.
+    base_colors: PaletteColors,
+    ambient: Option<ambient_palette::Watcher>,
+    /// Everything watched, loaded when the palette opens and dropped when it
+    /// closes; and the moments matching the palette's query.
+    seen_index: Option<seen::Index>,
+    seen_query: String,
+    seen_hits: Vec<seen::SeenHit>,
 }
 
 const SPEED_SETTLE: Duration = Duration::from_millis(250);
@@ -310,11 +321,20 @@ impl Player {
             plan: Vec::new(),
             export_status: Arc::new(Mutex::new(None)),
             speed_pending: None,
+            base_colors: colors,
+            // Follow the shell unless told not to. With no tideshell running
+            // the file is absent and this is one failed stat a second.
+            ambient: (std::env::var("VIDKIT_AMBIENT").as_deref() != Ok("0"))
+                .then(ambient_palette::Watcher::at_runtime_dir)
+                .flatten(),
+            seen_index: None,
+            seen_query: String::new(),
+            seen_hits: Vec::new(),
         };
         // A file named on the command line gets its transcript too.
         if let Some(p) = me.path.clone().filter(|_| me.engine.is_some()) {
             let total = me.opened.as_ref().and_then(|o| o.as_ref().ok()).and_then(|o| o.duration);
-            me.start_transcription(Some(p.clone()), transcribe::AudioIn { input: p.to_string_lossy().into(), headers: Vec::new() }, total);
+            me.start_transcription(seen::url_for_file(&p), None, Some(p.clone()), transcribe::AudioIn { input: p.to_string_lossy().into(), headers: Vec::new() }, total, None);
         }
         me
     }
@@ -568,6 +588,7 @@ impl eframe::App for Player {
         // I playing" is the primary question a player answers; it does not
         // belong in the first field to be dropped for space.
         self.sections_tick(ctx);
+        self.follow_shell_colours(ctx);
 
         egui::TopBottomPanel::top("what").show(ctx, |ui| match &self.opened {
             Some(Err(e)) => {
@@ -759,7 +780,7 @@ impl Player {
             Ok(e) => { self.transport.playing = true; Some(e) }
             Err(e) => { self.gpu_error = Some(format!("cannot play {}: {e}", path.display())); None }
         };
-        self.start_transcription(Some(path.clone()), transcribe::AudioIn { input: path.to_string_lossy().into(), headers: Vec::new() }, self.transport.duration);
+        self.start_transcription(seen::url_for_file(&path), None, Some(path.clone()), transcribe::AudioIn { input: path.to_string_lossy().into(), headers: Vec::new() }, self.transport.duration, None);
         self.path = Some(path);
         self.opened = Some(result);
     }
@@ -799,25 +820,53 @@ impl Player {
         // The surface is the kit's: placement (turned over on a phone, the usual
         // card on a desk), scrim, keys, focus and one-line rows all come from
         // `command_bar::show`. This supplies the rows and runs the choice.
-        let matches = self.palette.matches();
-        let rows: Vec<uikit_egui::command_bar::Row> = matches
+        // Commands, then the moments in watched videos that match. A leading
+        // `?` searches only what was watched, from two letters.
+        let query = self.palette.bar.query.clone();
+        let seen_only = query.trim_start().starts_with('?');
+        let sq = query.trim_start().trim_start_matches('?').trim().to_string();
+        if self.palette.is_open() {
+            let idx = self.seen_index.get_or_insert_with(|| seen::dir().map(|d| seen::Index::load(&d)).unwrap_or_default());
+            if sq != self.seen_query {
+                let min = if seen_only { 2 } else { 3 };
+                self.seen_hits = if sq.chars().count() >= min { idx.search(&sq, if seen_only { 20 } else { 5 }, 2) } else { Vec::new() };
+                self.seen_query = sq;
+            }
+        } else if self.seen_index.is_some() {
+            self.seen_index = None;
+            self.seen_query.clear();
+            self.seen_hits.clear();
+        }
+        let matches = if seen_only { Vec::new() } else { self.palette.matches() };
+        let mut rows: Vec<uikit_egui::command_bar::Row> = matches
             .iter()
             .map(|c| uikit_egui::command_bar::Row::new(c.label(), c.shortcut().unwrap_or("")))
             .collect();
+        rows.extend(self.seen_hits.iter().map(|h| {
+            uikit_egui::command_bar::Row::new(
+                format!("“{}…” — {}", h.snippet.trim(), h.title),
+                vidkit_egui::format_time(h.at),
+            )
+        }));
         let adaptive = uikit_egui::Adaptive::detect(ctx);
         let out = uikit_egui::command_bar::show(
             ctx,
             "vidkit-palette",
             &mut self.palette.bar,
             &rows,
-            "type a command…",
+            "type a command, or ? to search what you watched",
             &self.colors,
             &adaptive,
             |_| {},
         );
-        if let Some(c) = out.chosen.and_then(|i| matches.get(i).copied()) {
-            self.palette.close();
-            self.run(c);
+        if let Some(i) = out.chosen {
+            if let Some(c) = matches.get(i).copied() {
+                self.palette.close();
+                self.run(c);
+            } else if let Some(h) = self.seen_hits.get(i - matches.len()).cloned() {
+                self.palette.close();
+                self.open_seen(&h.url, h.at);
+            }
         }
     }
 
@@ -1094,6 +1143,12 @@ impl Player {
             }
         };
 
+        self.open_url(url);
+    }
+
+    /// Open a URL: a direct media link over HTTP, a page through yt-dlp --
+    /// from the /tmp copy when one is kept.
+    fn open_url(&mut self, url: String) {
         // A page goes through the extractor; a direct link does not, because
         // spawning a Python interpreter to learn what the URL already said is
         // seconds of latency for nothing.
@@ -1106,6 +1161,13 @@ impl Player {
             // hidden: this waits for the whole download, so the first frame
             // comes after it rather than during.
             let cap = self.settings.quality.max_long_edge();
+            let root = media_cache::root();
+
+            // A copy kept from before: no network, no extractor, no wait.
+            if let Some(m) = media_cache::lookup(&root, &url, cap) {
+                self.play_kept(media_cache::hold(m), &url, true);
+                return;
+            }
 
             // FETCH WHILE PLAYING first. Resolution costs one yt-dlp run; the
             // media itself is then pulled by ffmpeg as it decodes, so the
@@ -1113,24 +1175,17 @@ impl Player {
             // download. Falls back to download-then-play, because a site whose
             // streams ffmpeg cannot read directly still works that way.
             let stream_err = match self.stream_page(&url, cap) {
-                Ok(()) => return,
+                Ok(()) => {
+                    self.keep_in_background(url.clone(), cap);
+                    return;
+                }
                 Err(e) => e,
             };
 
-            match io::fetch_to_temp(&mut io::ProcessRunner::default(), &url, cap) {
-                Ok(media) => {
-                    match start_file(media.path().to_path_buf()) {
-                        Ok(e) => {
-                            self.opened = Some(open_local(&media.file));
-                            self.engine = Some(e);
-                            // Held so the file outlives the decoder reading it.
-                            self.downloaded = Some(media);
-                            self.transport.playing = true;
-                            self.gpu_error = None;
-                        }
-                        Err(e) => self.gpu_error = Some(format!("downloaded, but {e}")),
-                    }
-                }
+            match media_cache::get_or_fetch(&root, &url, cap, |dir| {
+                io::fetch_into(&mut io::ProcessRunner::default(), &url, cap, dir)
+            }) {
+                Ok((held, hit)) => self.play_kept(held, &url, hit),
                 // BOTH reasons, not just the last one. The download error
                 // overwrote the streaming error, so a failure that started in
                 // resolution was reported as a download problem and sent the
@@ -1205,13 +1260,9 @@ impl Player {
         let audio = transcribe::AudioIn { input: audio_url, headers: headers.clone() };
         // The page's own captions when it has them: YouTube's cost nothing,
         // whisper costs minutes of CPU per hour of lecture on a phone.
-        let factory = match resolved.captions.clone() {
-            Some(c) => transcribe::caption_factory(c, headers),
-            None => transcribe::source_factory(None),
-        };
+        let factory = resolved.captions.clone().map(|c| transcribe::caption_factory(c, headers));
         self.transport.duration = resolved.duration;
-        self.worker = Some(transcribe::Worker::start(factory, audio, resolved.duration, None));
-        self.reset_sections();
+        self.start_transcription(url.to_string(), resolved.title.clone(), None, audio, resolved.duration, factory);
         self.path = None;
         // The previous download, if any, is no longer needed.
         self.downloaded = None;
@@ -1307,9 +1358,28 @@ pub(crate) fn fmt_span(a: Duration, b: Duration) -> String {
 impl Player {
     /// (Re)start the transcription loop for what is now playing. The old
     /// worker, if any, is dropped and stops after its current chunk.
-    fn start_transcription(&mut self, video: Option<PathBuf>, audio: transcribe::AudioIn, total: Option<Duration>) {
-        let cache = video.as_deref().and_then(transcribe::cache_path);
-        self.worker = Some(transcribe::Worker::start(transcribe::source_factory(video), audio, total, cache));
+    /// (Re)start the transcription loop for what is now playing, recording
+    /// it in the seen store. `url` identifies it (a page URL, or `file://`);
+    /// its transcript lives in the seen store, keyed by URL, so reopening --
+    /// streamed, re-downloaded or from the /tmp copy -- resumes rather than
+    /// transcribing again.
+    fn start_transcription(
+        &mut self,
+        url: String,
+        title: Option<String>,
+        file: Option<PathBuf>,
+        audio: transcribe::AudioIn,
+        total: Option<Duration>,
+        factory: Option<transcribe::Factory>,
+    ) {
+        // A local file's transcript is keyed by its size and mtime too; a
+        // URL's by the URL alone.
+        let key_file = if url.starts_with("file://") { file.as_deref() } else { None };
+        let cache = seen::dir()
+            .and_then(|d| seen::record(&d, &url, title.as_deref(), key_file))
+            .or_else(|| file.as_deref().and_then(transcribe::cache_path));
+        let factory = factory.unwrap_or_else(|| transcribe::source_factory(file));
+        self.worker = Some(transcribe::Worker::start(factory, audio, total, cache));
         self.reset_sections();
     }
 
@@ -1510,5 +1580,102 @@ impl Player {
         let bg = egui::Rect::from_min_size(pos, galley.size()).expand(6.0);
         painter.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(170));
         painter.galley(pos, galley, egui::Color32::WHITE);
+    }
+}
+
+impl Player {
+    /// tideshell's living palette over our own, when it publishes one; our
+    /// own back when it stops.
+    fn follow_shell_colours(&mut self, ctx: &egui::Context) {
+        let Some(w) = self.ambient.as_mut() else { return };
+        let now = (ctx.input(|i| i.time) * 1000.0) as u64;
+        let was = w.present;
+        if let Some(p) = w.poll(now) {
+            self.colors = uikit_egui::theme_bridge::ambient::merge(&self.base_colors, &p);
+            uikit_egui::theme_bridge::apply_colors(ctx, &self.colors);
+        } else if was && !w.present {
+            self.colors = self.base_colors;
+            uikit_egui::theme_bridge::apply_colors(ctx, &self.colors);
+        }
+        // An idle window repaints only on input, so a shell change would wait
+        // for a touch. Every 2 s while the shell is publishing -- a static
+        // frame, and only on a device running tideshell.
+        if w.present {
+            ctx.request_repaint_after(Duration::from_secs(2));
+        }
+    }
+}
+
+impl Player {
+    /// Play a download from the /tmp cache, identified by its page URL.
+    fn play_kept(&mut self, held: media_cache::Held, url: &str, hit: bool) {
+        let path = held.path().to_path_buf();
+        match start_file(path.clone()) {
+            Ok(e) => {
+                let opened = open_local(&path);
+                self.transport.duration = opened.as_ref().ok().and_then(|o| o.duration);
+                self.opened = Some(opened);
+                self.engine = Some(e);
+                // Held (a lock eviction respects) so the file outlives the
+                // decoder reading it.
+                self.downloaded = Some(held);
+                self.transport.playing = true;
+                self.gpu_error = hit.then(|| "playing the copy kept in /tmp — no download".to_string());
+                self.path = Some(path.clone());
+                let total = self.transport.duration;
+                self.start_transcription(
+                    url.to_string(),
+                    None,
+                    Some(path.clone()),
+                    transcribe::AudioIn { input: path.to_string_lossy().into(), headers: Vec::new() },
+                    total,
+                    None,
+                );
+            }
+            Err(e) => self.gpu_error = Some(format!("downloaded, but {e}")),
+        }
+    }
+
+    /// While a page streams, save it to /tmp for next time.
+    ///
+    /// The cost, stated: the first watch fetches the video twice (ffmpeg's
+    /// ranges for playing, yt-dlp's download for keeping), and on a slow
+    /// link the two compete. After that it plays from /tmp with no network
+    /// at all. VIDKIT_KEEP_STREAMS=0 streams only, as before.
+    fn keep_in_background(&mut self, url: String, cap: Option<u32>) {
+        if std::env::var("VIDKIT_KEEP_STREAMS").as_deref() == Ok("0") {
+            return;
+        }
+        let status = self.export_status.clone();
+        let _ = std::thread::Builder::new().name("vidkit-keep".into()).spawn(move || {
+            // Lower priority than playback, like transcription; inherited by
+            // yt-dlp and the ffmpeg it runs to mux.
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+            }
+            let root = media_cache::root();
+            let r = media_cache::get_or_fetch(&root, &url, cap, |dir| io::fetch_into(&mut io::ProcessRunner::default(), &url, cap, dir));
+            let msg = match r {
+                Ok((held, hit)) => {
+                    drop(held);
+                    (!hit).then(|| "kept a copy in /tmp — next time plays without the network".to_string())
+                }
+                Err(e) => Some(format!("could not keep a copy: {e}")),
+            };
+            if let (Some(m), Ok(mut s)) = (msg, status.lock()) {
+                *s = Some(m);
+            }
+        });
+    }
+
+    /// Open a remembered video at a moment.
+    fn open_seen(&mut self, url: &str, at: Duration) {
+        match url.strip_prefix("file://") {
+            Some(p) => self.load(PathBuf::from(p)),
+            None => self.open_url(url.to_string()),
+        }
+        if self.engine.is_some() {
+            self.seek_to(at);
+        }
     }
 }

@@ -96,6 +96,8 @@ pub struct Resolved {
     /// unnecessary. Both free -- the JSON was already fetched.
     pub duration: Option<std::time::Duration>,
     pub captions: Option<crate::probe::Caption>,
+    /// The page's title, for history and search results.
+    pub title: Option<String>,
 }
 
 /// Build the argument list.
@@ -178,6 +180,7 @@ fn build_resolved(probe: &Probe, sel: &Selection, lang: Option<&str>) -> Option<
         summary: sel.summary.clone(),
         duration: duration_of(probe),
         captions: crate::probe::pick_captions(probe, lang),
+        title: probe.title.clone(),
     })
 }
 
@@ -275,6 +278,7 @@ impl<R: CommandRunner> Resolver<R> {
                         summary: prev.summary.clone(),
                         duration: duration_of(&probe),
                         captions: crate::probe::pick_captions(&probe, self.opts.prefer_language.as_deref()),
+                        title: probe.title.clone(),
                     };
                     self.current = Some(r);
                     return Ok(self.current.as_ref().expect("just set"));
