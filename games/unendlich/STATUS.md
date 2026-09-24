@@ -7,6 +7,15 @@ Last refreshed: v0.20.0.
 
 ## Verified working
 
+- **c20unified (2026-09-24): the engine's own tests run again.** `cargo test -p
+  unendlich-engine --no-default-features --lib` builds in a 3 GB sandbox with ONE build job
+  (the test crate's rustc peaks near 2.6 GB -- the likely reason sessions saw it "die") and
+  runs 8828 tests. Four were failing unseen; all fixed: an uncompiled proposal shader moved
+  out of `src/shaders/`; the GPU generator's Dome canopy was still a cone after the Rust side
+  became a dome (CPU and GPU built different trees from one seed; shader + `.spv` fixed); a
+  test pinning the stuck-button latch updated to the recovery. Now 8828 passed, 0 failed.
+  See `docs/KNOWN-TEST-FAILURES.md`. Not run on a GPU.
+
 - **c16 rig session (2026-09-12):** engine build fixed (`begin()` referenced a
   `surface` it does not have); `Cargo.lock` caught up. New pure cores:
   `item_model` (hand + slot models), `anim_rig` (oriented per-part posing:
