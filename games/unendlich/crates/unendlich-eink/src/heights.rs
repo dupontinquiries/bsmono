@@ -107,8 +107,12 @@ impl HeightCache {
     }
 
     /// Cells computed so far (monotonic): the app re-renders when it moves.
+    ///
+    /// Acquire, paired with the worker's Release: if this has moved, the cell that moved it is
+    /// visible to `lookup`. With Relaxed on both sides that was not guaranteed, and the app
+    /// could re-render on the new count and still miss the cell.
     pub fn filled(&self) -> u64 {
-        self.shared.filled.load(Ordering::Relaxed)
+        self.shared.filled.load(Ordering::Acquire)
     }
 
     pub fn pending(&self) -> usize {
@@ -168,9 +172,12 @@ fn worker(sh: Arc<Shared>, src: Arc<dyn HeightSource>) {
         let (l, cx, cz) = k;
         let s = 1i32 << l;
         let h = src.height(cx * s + s / 2, cz * s + s / 2);
+        // Order matters: the cell becomes visible FIRST, then the count moves (Release), so
+        // an app that re-renders when `filled()` moves always finds the new cell. The other
+        // order could re-render just before the last cell landed and never again for it.
         sh.cells.write().unwrap().insert(k, h);
         sh.queued.lock().unwrap().remove(&k);
-        sh.filled.fetch_add(1, Ordering::Relaxed);
+        sh.filled.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -200,7 +207,9 @@ mod tests {
         assert_eq!(c.lookup(0, 40, 0), None, "never blocks on generation");
         wait_until(|| c.lookup(0, 40, 0).is_some());
         assert_eq!(c.lookup(0, 40, 0), Some(10)); // x = 40 (+0 centre offset at level 0) / 4
-        assert!(c.filled() >= 1);
+        // The count trails the cell by design (see `worker`), so it is waited for, not
+        // asserted the instant the cell appears -- that raced, and failed under load.
+        wait_until(|| c.filled() >= 1);
     }
 
     #[test]
