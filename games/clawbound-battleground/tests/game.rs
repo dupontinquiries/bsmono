@@ -452,3 +452,219 @@ fn a_full_match_tick_is_cheap_enough_to_leave_the_frame_to_the_gpu() {
     println!("sim: {ms:.3} ms/tick over {ticks} ticks, {} minions, {} projectiles (unoptimised profile)", game.minions.len(), game.projectiles.len());
     assert!(ms < 6.0, "a tick costs {ms:.2} ms unoptimised; the budget at 60 Hz is 16.6 for EVERYTHING");
 }
+
+/// Rough ground through the real sim loop: a cat run through a thicket
+/// covers less ground than the same run on open ground, is not stopped, and
+/// a leap over it is not slowed at all (`move_speed` skips the going while
+/// airborne).
+#[test]
+fn a_thicket_slows_a_cat_and_does_not_stop_it() {
+    use clawbound::blockers::{Blockers, Shape};
+    use clawbound::going::{Ground, Rough};
+    use glam::Vec3;
+    let run = |rough: bool| {
+        let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        for g in game.gods.iter_mut().skip(1) {
+            g.respawn_t = 999.0; // alone on the field
+        }
+        game.gods[0].ai = None;
+        let start = game.gods[0].pos;
+        let mut b = Blockers::new(200.0, 6.0);
+        if rough {
+            b.push_rough(Rough { shape: Shape::Circle { x: start.x, z: start.z + 6.0, r: 8.0 }, mul: 0.5, edge: 0.5, ground: Ground::Thicket });
+        }
+        game.blockers = std::sync::Arc::new(b);
+        for _ in 0..60 {
+            game.gods[0].move_dir = Vec3::Z;
+            game.tick(1.0 / 60.0);
+        }
+        (game.gods[0].pos - start).length()
+    };
+    let (open, thick) = (run(false), run(true));
+    assert!(thick > 0.5, "slowed, not stopped: {thick}");
+    let ratio = thick / open;
+    assert!((ratio - 0.5).abs() < 0.08, "a 0.5 thicket halves the run: {thick} vs {open} ({ratio})");
+}
+
+/// Bots look before they commit (`steer`): the same bot in the same state,
+/// with a trunk dropped two units down the line it chose, turns off that
+/// line instead of walking into the trunk and being pushed round it.
+#[test]
+fn a_bot_steers_off_a_line_that_runs_into_a_trunk() {
+    use clawbound::blockers::{Blocker, Blockers, Cover, Shape};
+    use glam::Vec3;
+    let fresh = || {
+        let mut g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        g.blockers = std::sync::Arc::new(Blockers::new(200.0, 6.0));
+        g
+    };
+    let bot = 1;
+    let mut a = fresh();
+    clawbound::ai::think(&mut a, bot);
+    let d1 = a.gods[bot].move_dir;
+    assert!(d1.length() > 0.1, "the bot wants to go somewhere: {d1}");
+    let at = a.gods[bot].pos + d1.normalize() * 2.0;
+    let mut b = fresh();
+    let mut bl = Blockers::new(200.0, 6.0);
+    bl.push(Blocker { shape: Shape::Circle { x: at.x, z: at.z, r: 0.9 }, top: 4.0, cover: Cover::NONE });
+    b.blockers = std::sync::Arc::new(bl);
+    clawbound::ai::think(&mut b, bot);
+    let d2 = b.gods[bot].move_dir;
+    let turn = d1.normalize().dot(d2.normalize()).clamp(-1.0, 1.0).acos();
+    assert!(turn > 0.3, "turned off the line by {turn} rad");
+    let probe = b.gods[bot].pos + d2.normalize() * 1.2;
+    assert!(!b.blockers.blocked(probe.x, probe.z, GOD_RADIUS), "and not into the trunk");
+    let _ = Vec3::ZERO;
+}
+
+/// Twinfang Pass through the real sim: 15 a side, the scene's own
+/// collision (cliffs included), 60 s of bots. No living cat is ever in the
+/// rock, and every lane's wave of cats has left its base.
+#[test]
+fn the_pass_holds_fifteen_a_side_and_nobody_walks_into_the_rock() {
+    use clawbound::map::{self, MapId};
+    map::with(MapId::Pass, || {
+        let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+        let (b, r) = map::team_picks(2, &mut clawbound::sim::Rng::new(5));
+        let mut game = Game::new_teams(&b, &r);
+        assert_eq!(game.gods.len(), 30);
+        game.blockers = blockers;
+        let f = map::floor().unwrap();
+        for _ in 0..(60 * 60) {
+            game.tick(1.0 / 60.0);
+            game.events.clear();
+            for (i, g) in game.gods.iter().enumerate() {
+                if g.respawn_t <= 0.0 {
+                    assert!(f.sdf(g.pos.x, g.pos.z) <= 0.05, "god {i} in the rock at {} (sdf {})", g.pos, f.sdf(g.pos.x, g.pos.z));
+                }
+            }
+        }
+        let left = game.gods.iter().filter(|g| (g.pos - g.team.base_pos()).length() > 40.0).count();
+        assert!(left >= 20, "only {left} of 30 cats got out of their bases in a minute");
+    });
+}
+
+/// A bot on the pass, inside a massif, finds its way out to its lane: the
+/// way starts sideways, round the peak, which local steering alone does not
+/// find (`floor::route`). Break-tested: with routing off the bot is still
+/// pinned at (-24, -43) after 30 s; with it, it is on the lane in < 1 s.
+/// (A shoulder clearing was tried first and did NOT fail without routing,
+/// so it proved nothing.)
+#[test]
+fn a_bot_finds_its_way_out_of_the_massif_on_the_pass() {
+    use clawbound::map::{self, MapId};
+    map::with(MapId::Pass, || {
+        let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+        let (b, r) = map::team_picks(2, &mut clawbound::sim::Rng::new(5));
+        let mut game = Game::new_teams(&b, &r);
+        game.blockers = blockers;
+        // everyone else out of the way
+        for g in game.gods.iter_mut().skip(3) {
+            g.respawn_t = 999.0;
+        }
+        // A mid-lane bot on the boss ground inside the west massif: the peak
+        // stands between it and its lane, and both ways out (the slot round
+        // the peak's flank, the slot to the side lane) start sideways.
+        let bot = 2;
+        assert_eq!(game.gods[bot].ai.as_ref().unwrap().lane, clawbound::consts::Lane::Mid);
+        game.gods[1].respawn_t = 999.0;
+        game.gods[bot].respawn_t = 0.0;
+        game.gods[bot].pos = glam::Vec3::new(-96.0 * clawbound::pass::S, 0.0, 0.0);
+        let mut t = 0.0;
+        let mut on_lane = false;
+        while t < 30.0 {
+            game.tick(1.0 / 60.0);
+            game.events.clear();
+            t += 1.0 / 60.0;
+            let p = game.gods[bot].pos;
+            if clawbound::consts::lane_clearance(p.x, p.z) < 6.0 {
+                on_lane = true;
+                break;
+            }
+        }
+        assert!(on_lane, "still off its lane after {t:.0} s, at {}", game.gods[bot].pos);
+    });
+}
+
+/// Through the real sim: a cat walking the pass's Top lane over the shelf
+/// -- up the ramp, along the crest, down again -- is on the ground every
+/// tick and never enters a fall (walking down a ramp is not falling).
+#[test]
+fn a_cat_walks_the_climbing_lane_on_the_ground_the_whole_way() {
+    use clawbound::map::{self, MapId};
+    map::with(MapId::Pass, || {
+        let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+        let (b, r) = map::team_picks(2, &mut clawbound::sim::Rng::new(5));
+        let mut game = Game::new_teams(&b, &r);
+        game.blockers = blockers;
+        for g in game.gods.iter_mut().skip(1) {
+            g.respawn_t = 999.0;
+        }
+        game.gods[0].ai = None;
+        let top = clawbound::consts::Lane::Top.polyline();
+        let len: f32 = top.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+        let start = clawbound::pass::along(&top, 0.33 * len);
+        game.gods[0].pos = start;
+        let (mut peak, mut s) = (0.0f32, 0.33 * len);
+        for _ in 0..(60 * 60) {
+            // steer along the lane: aim a few units ahead of where we are
+            let p = game.gods[0].pos;
+            let ahead = clawbound::pass::along(&top, s + 6.0);
+            // HORIZONTAL distance: the waypoints are at y = 0 and the cat is
+            // up on the shelf (a 3D distance stalled this test at 0.43)
+            if glam::Vec3::new(ahead.x - p.x, 0.0, ahead.z - p.z).length() < 7.0 {
+                s += 1.0;
+            }
+            game.gods[0].move_dir = glam::Vec3::new(ahead.x - p.x, 0.0, ahead.z - p.z).normalize_or_zero();
+            game.tick(1.0 / 60.0);
+            game.events.clear();
+            let g = &game.gods[0];
+            let ground = map::ground_y(g.pos.x, g.pos.z);
+            assert!(g.fall.is_none(), "fell walking the lane at {} (ground {ground})", g.pos);
+            assert!((g.pos.y - ground).abs() < 0.05, "off the ground at {}: y {} vs {ground}", g.pos, g.pos.y);
+            peak = peak.max(g.pos.y);
+            if s > 0.67 * len {
+                break;
+            }
+        }
+        assert!(s > 0.67 * len, "did not get over the shelf (reached {:.2})", s / len);
+        assert!((peak - clawbound::pass::SHELF_H).abs() < 0.1, "climbed to {peak}");
+    });
+}
+
+/// The same climb for the AI and a minion wave: bots pushing Top and the
+/// minions they walk with get over the shelf. Before waypoints stood on the
+/// ground, both advanced waypoints by 3D distance against points at y = 0
+/// and stalled 9 u above them.
+#[test]
+fn bots_and_minions_get_over_the_shelf() {
+    use clawbound::map::{self, MapId};
+    map::with(MapId::Pass, || {
+        let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+        let (b, r) = map::team_picks(2, &mut clawbound::sim::Rng::new(5));
+        let mut game = Game::new_teams(&b, &r);
+        game.blockers = blockers;
+        // red stays home: an empty lane to walk
+        for g in game.gods.iter_mut() {
+            if g.team == clawbound::consts::Team::Red {
+                g.respawn_t = 9999.0;
+            }
+        }
+        let top = clawbound::consts::Lane::Top.polyline();
+        let len: f32 = top.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+        let past = clawbound::pass::along(&top, 0.66 * len);
+        let (mut god_past, mut minion_past) = (false, false);
+        for _ in 0..(150 * 60) {
+            game.tick(1.0 / 60.0);
+            game.events.clear();
+            let near = |p: glam::Vec3| glam::Vec3::new(p.x - past.x, 0.0, p.z - past.z).length() < 12.0;
+            god_past |= game.gods.iter().any(|g| g.team == clawbound::consts::Team::Blue && g.respawn_t <= 0.0 && near(g.pos));
+            minion_past |= game.minions.iter().any(|m| m.team == clawbound::consts::Team::Blue && near(m.pos));
+            if god_past && minion_past {
+                break;
+            }
+        }
+        assert!(god_past, "no blue bot got over the shelf in 150 s");
+        assert!(minion_past, "no blue minion got over the shelf in 150 s");
+    });
+}

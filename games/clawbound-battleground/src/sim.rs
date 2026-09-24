@@ -291,26 +291,49 @@ pub struct Game {
     /// the pre-collision behaviour rather than silently depending on a world
     /// they never built.
     pub blockers: std::sync::Arc<crate::blockers::Blockers>,
+    /// Per-god steering memory (`steer::Memory`): a bot's planned detour.
+    /// Sim state, so a replay reproduces the same detours.
+    pub steer_mem: Vec<crate::steer::Memory>,
+    /// Plans made this tick, against `steer::PLANS_PER_TICK`.
+    pub plans_this_tick: u32,
 }
 
 impl Game {
     /// Create a 5v5 match. `player_god` = roster id the player controls (index 0),
     /// `ally_picks` / `enemy_picks` = roster ids for the 4 allies / 5 enemies.
     pub fn new(player_god: u32, ally_picks: [u32; 4], enemy_picks: [u32; 5]) -> Game {
+        let mut blue = vec![player_god];
+        blue.extend(ally_picks);
+        Game::new_teams(&blue, &enemy_picks)
+    }
+
+    /// Create a match of any size: `blue[0]` is the player (god index 0),
+    /// the rest of `blue` its allies, `red` the enemies. Gods are laid out
+    /// blue first, then red. Lanes: the 5v5 assignments for the first five
+    /// of each side (so `new` is unchanged), then round-robin.
+    ///
+    /// Roster ids may repeat -- 15 a side is more cats than there are
+    /// ancestors -- and a repeat is just another cat of that line.
+    pub fn new_teams(blue: &[u32], red: &[u32]) -> Game {
+        let player_god = blue.first().copied().unwrap_or(0);
         let mut rng = Rng::new(0xC0FFEE ^ (player_god as u64 + 1));
-        let mut gods = Vec::with_capacity(10);
+        let total = blue.len() + red.len();
+        let mut gods = Vec::with_capacity(total);
 
         // lanes: player mid by default, allies top/bot/mid, enemies top/mid/bot/mid/bot
         let ally_lanes = [Lane::Top, Lane::Mid, Lane::Bot, Lane::Mid];
         let enemy_lanes = [Lane::Top, Lane::Mid, Lane::Bot, Lane::Mid, Lane::Bot];
+        let round = [Lane::Top, Lane::Mid, Lane::Bot];
 
-        for i in 0..10 {
+        for i in 0..total {
             let (def_id, team, is_player, lane) = if i == 0 {
                 (player_god, Team::Blue, true, Lane::Mid)
-            } else if i < 5 {
-                (ally_picks[i - 1], Team::Blue, false, ally_lanes[i - 1])
+            } else if i < blue.len() {
+                let k = i - 1;
+                (blue[i], Team::Blue, false, ally_lanes.get(k).copied().unwrap_or(round[k % 3]))
             } else {
-                (enemy_picks[i - 5], Team::Red, false, enemy_lanes[i - 5])
+                let k = i - blue.len();
+                (red[k], Team::Red, false, enemy_lanes.get(k).copied().unwrap_or(round[k % 3]))
             };
             let def = gods::god(def_id);
             let (hp, mana, _, _, prot) = def.at_level(1);
@@ -424,9 +447,11 @@ impl Game {
             bosses: crate::bosses::Bosses::new(),
             disasters: crate::disasters::Disasters::default(),
             blockers: std::sync::Arc::new(crate::blockers::Blockers::default()),
+            steer_mem: vec![crate::steer::Memory::default(); total],
+            plans_this_tick: 0,
         };
         // starter items for AI gods (player buys via shop)
-        for i in 0..10 {
+        for i in 0..total {
             if !g.gods[i].is_player {
                 g.auto_buy(i);
             }
@@ -581,8 +606,16 @@ impl Game {
         // wading: the rivers are slow going unless you were born to them
         let depth = self.water_depth_now(g.pos.x, g.pos.z);
         let wade = if g.blessing_t > 0.0 || crate::wild::is_riverborn(def) { 1.0 } else { wade_speed_mul(depth) };
-        let stalk = if self.stalking(i) { crate::consts::SNEAK_SPEED } else { 1.0 };
-        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk
+        let stalking = self.stalking(i);
+        let stalk = if stalking { crate::consts::SNEAK_SPEED } else { 1.0 };
+        // Rough ground (`going`). Not while airborne or perched: a leap
+        // clears the thicket, and a boulder's top is not its scree skirt.
+        let going = if g.leap.is_some() || g.dash.is_some() || g.perch.is_some() {
+            1.0
+        } else {
+            self.blockers.going_at(g.pos.x, g.pos.z, crate::going::Carriage { stalking })
+        };
+        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk * going
     }
 
     pub fn auto_interval(&self, i: usize) -> f32 {

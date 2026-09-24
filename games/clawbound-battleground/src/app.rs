@@ -72,11 +72,19 @@ struct AppState {
     #[cfg(feature = "audio")]
     ambience: Option<crate::audio::output::Ambience>,
     thunder_count: u32,
+    /// The match opening, while it runs (`intro`). The sim holds until it
+    /// is done; any key, click or touch skips it.
+    intro: Option<crate::intro::Intro>,
+    skip_intro: bool,
+    /// Counter the audio synth watches: a change starts the fanfare.
+    fanfare_count: u32,
     thunder_dist: f32,
     launch: crate::launch::LaunchOptions,
 }
 
 pub fn run(opts: crate::launch::LaunchOptions) {
+    // Before anything builds geometry: the renderer meshes the terrain.
+    crate::map::set_active(opts.map);
     if let Some(role) = &opts.handoff {
         // The centre handed us a friend session: it becomes a den (see the
         // RESUMED block). This used to log "not wired yet" and start a solo
@@ -370,6 +378,9 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         #[cfg(feature = "audio")]
         ambience: None,
         thunder_count: 0,
+        intro: None,
+        skip_intro: false,
+        fanfare_count: 0,
         thunder_dist: 1.0,
         launch: crate::launch::LaunchOptions::default(),
     })
@@ -482,6 +493,10 @@ fn handle_window_event(s: &mut AppState, event: WindowEvent) {
         }
         WindowEvent::MouseInput { state, button, .. } => {
             let b = bind_of_mouse(button);
+            if state == ElementState::Pressed && s.intro.is_some() {
+                s.skip_intro = true;
+                return;
+            }
             match state {
                 ElementState::Pressed => {
                     if let Some(a) = s.capturing.take() {
@@ -510,6 +525,10 @@ fn handle_window_event(s: &mut AppState, event: WindowEvent) {
             }
         }
         WindowEvent::KeyboardInput { event: KeyEvent { state, logical_key, repeat, .. }, .. } => {
+            if state == ElementState::Pressed && !repeat && s.intro.is_some() {
+                s.skip_intro = true;
+                return;
+            }
             let Some(b) = bind_of_key(&logical_key) else { return };
             match state {
                 ElementState::Pressed if !repeat => {
@@ -528,6 +547,11 @@ fn handle_window_event(s: &mut AppState, event: WindowEvent) {
                 }
                 ElementState::Pressed => {}
                 ElementState::Released => s.input.handle(InputEvent::Release(b)),
+            }
+        }
+        WindowEvent::Touch(t) if s.intro.is_some() => {
+            if t.phase == winit::event::TouchPhase::Started {
+                s.skip_intro = true;
             }
         }
         WindowEvent::Touch(t) => {
@@ -692,12 +716,37 @@ fn compute_aim(s: &AppState) -> Vec3 {
     }
 }
 
+/// Put the world on map `m`: the active map (thread-local), the renderer's
+/// terrain/water/flood meshes, and the scene -- the old scene's GPU meshes
+/// freed first. A no-op when everything is already on `m`.
+fn switch_map(s: &mut AppState, m: crate::map::MapId) {
+    let same = crate::map::active() == m && s.renderer.world_map == m && s.scene.as_ref().map_or(true, |sc| sc.map == m);
+    if same {
+        return;
+    }
+    let t = Instant::now();
+    let old = s.scene.take();
+    s.scene = Some(crate::scene::switch_world(&mut s.renderer, old, m));
+    eprintln!("[clawbound] switched to {} in {:.1} s ({} meshes resident)", m.name(), t.elapsed().as_secs_f32(), s.renderer.mesh_count());
+}
+
 fn start_game(s: &mut AppState) {
+    // The map the select screen chose -- except with a LAN lobby open,
+    // where both peers must be on the same map and the picker is not synced
+    // between them: that match stays on the launch map.
+    let want = if s.lan.is_some() { s.launch.map } else { s.ui.map_choice };
+    switch_map(s, want);
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(42);
     let mut rng = crate::sim::Rng::new(0xBEEF ^ seed);
+    if crate::map::active() != crate::map::MapId::Jungle {
+        let (blue, red) = crate::map::team_picks(s.ui.selected as u32, &mut rng);
+        s.game = Some(Game::new_teams(&blue, &red));
+        finish_start(s);
+        return;
+    }
     let mut pool: Vec<u32> = (0..crate::gods::ROSTER_LEN as u32).filter(|&i| i != s.ui.selected as u32).collect();
     let mut allies = [0u32; 4];
     let mut enemies = [0u32; 5];
@@ -710,6 +759,11 @@ fn start_game(s: &mut AppState) {
         *e = pool.remove(k.min(pool.len() - 1));
     }
     s.game = Some(Game::new(s.ui.selected as u32, allies, enemies));
+    finish_start(s);
+}
+
+/// Everything after the rosters are drawn: shared by every map.
+fn finish_start(s: &mut AppState) {
     s.vfx = Vfx::default();
     s.screen = Screen::Playing;
     // static for the whole match (an ancestor's kit never changes): which
@@ -731,6 +785,20 @@ fn start_game(s: &mut AppState) {
     s.cam_yaw = std::f32::consts::PI;
     s.cam_pitch = 0.38;
     s.walk_to = None;
+    // The opening: every cat held out of the world until the intro brings
+    // it in, and the intro ends on exactly the camera play starts with.
+    if let Some(g) = s.game.as_mut() {
+        for god in g.gods.iter_mut() {
+            god.respawn_t = 999.0;
+        }
+        let teams: Vec<crate::consts::Team> = g.gods.iter().map(|x| x.team).collect();
+        let p0 = g.gods[0].pos;
+        let dir = cam_dir(s.cam_yaw, s.cam_pitch);
+        let target = p0 + Vec3::Y * 1.5;
+        let play = crate::intro::Shot { eye: target - dir * s.cam_dist, target, fov_y: 0.95 };
+        s.intro = Some(crate::intro::Intro::new(&teams, p0, play));
+        s.skip_intro = false;
+    }
     s.controls_open = false;
     if !s.cfg.settings.touch_enabled {
         set_locked(s, true);
@@ -738,7 +806,12 @@ fn start_game(s: &mut AppState) {
 }
 
 fn render(s: &mut AppState) {
-    let dt_frame = s.last_frame.elapsed().as_secs_f32().min(0.05);
+    // The sim's step is capped (a stall must not become a teleport); the
+    // intro is a film, timed in wall-clock seconds. Under lavapipe at ~2 fps
+    // the 0.05 cap ran it at a twentieth of speed -- seen in an Xvfb run of
+    // the real app, where the pan never moved.
+    let dt_wall = s.last_frame.elapsed().as_secs_f32().min(0.5);
+    let dt_frame = dt_wall.min(0.05);
     s.last_frame = Instant::now();
 
     // Hand the world's static collision to the sim.
@@ -807,8 +880,32 @@ fn render(s: &mut AppState) {
                     g.cast_queue.push((0, slot, cast_aim));
                 }
             }
+            // The intro runs instead of the sim: cats appear on its beats,
+            // the fanfare starts on the first spawn, and play begins when
+            // it ends or is skipped.
+            if let Some(it) = s.intro.as_mut() {
+                let before = it.t;
+                let arrived = if s.skip_intro { it.skip() } else { it.advance(dt_wall) };
+                let bursts = !s.skip_intro;
+                for gi in arrived {
+                    g.gods[gi].respawn_t = 0.0;
+                    if bursts {
+                        let c = g.gods[gi].team.rgb();
+                        s.vfx.star_burst(g.gods[gi].pos, c, gi as f32);
+                    }
+                }
+                if before < crate::intro::FANFARE_AT && it.t >= crate::intro::FANFARE_AT && !s.skip_intro {
+                    s.fanfare_count = s.fanfare_count.wrapping_add(1);
+                }
+                s.vfx.update(dt_frame, &[], g);
+                if it.done {
+                    s.intro = None;
+                    s.skip_intro = false;
+                    s.accumulator = 0.0;
+                }
+            }
             s.accumulator = (s.accumulator + dt_frame).min(0.25);
-            while s.accumulator >= 1.0 / 60.0 {
+            while s.intro.is_none() && s.accumulator >= 1.0 / 60.0 {
                 s.accumulator -= 1.0 / 60.0;
                 // camera_basis (input.rs) is verified against the real view
                 // matrix; hand-rolling this vector here is exactly how it
@@ -877,10 +974,16 @@ fn render(s: &mut AppState) {
             let tt = s.last_frame.elapsed().as_secs_f32() * 60.0 + g.t * 47.0;
             let jolt = Vec3::new((tt * 1.7).sin(), (tt * 2.3).cos() * 0.6, (tt * 1.1).sin()) * shake * 0.35;
             let target = player.pos + Vec3::Y * 1.5 + jolt;
-            Camera {
-                eye: target - dir * s.cam_dist + jolt * 0.5,
-                target,
-                fov_y: 0.95,
+            match s.intro.as_ref() {
+                Some(it) => {
+                    let f = it.frame();
+                    Camera { eye: f.shot.eye, target: f.shot.target, fov_y: f.shot.fov_y }
+                }
+                None => Camera {
+                    eye: target - dir * s.cam_dist + jolt * 0.5,
+                    target,
+                    fov_y: 0.95,
+                },
             }
         }
     };
@@ -889,7 +992,8 @@ fn render(s: &mut AppState) {
     // ambience: the listener is the player; the wind pans with the camera
     #[cfg(feature = "audio")]
     if let (Some(g), Some(amb)) = (s.game.as_ref(), s.ambience.as_ref()) {
-        let p = crate::audio::params_for(g, g.gods[0].pos, s.cam_yaw, s.thunder_count, s.thunder_dist);
+        let mut p = crate::audio::params_for(g, g.gods[0].pos, s.cam_yaw, s.thunder_count, s.thunder_dist);
+        p.fanfare_count = s.fanfare_count;
         amb.set(p);
     }
 
@@ -963,7 +1067,9 @@ fn render(s: &mut AppState) {
             }
             Screen::Playing => {
                 if let Some(g) = s.game.as_mut() {
-                    if s.ui.shop_open {
+                    if let Some(it) = s.intro.as_ref() {
+                        ui::draw_intro_overlay(ctx, &it.frame().overlay);
+                    } else if s.ui.shop_open {
                         ui::draw_shop(ctx, g, 0, &mut s.ui);
                     } else {
                         ui::draw_hud(ctx, g, 0, vp, s.renderer.width as f32, s.renderer.height as f32, &mut s.ui);

@@ -13,7 +13,10 @@ pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const SHADOW_SIZE: u32 = 2048;
 /// Three lanes x two teams x inner/outer. terrain.wgsl hard-codes it.
 pub const MAX_TOWER_RINGS: usize = 12;
-pub const MAX_DRAWS: usize = 512;
+/// Draw slots per frame. 512 held a 5v5 (10 cats of ~15 parts, ~120
+/// world chunks, towers, minions); a 15v15 needs about three times the cats.
+/// 256 B each (DYN_ALIGN), so this is 1 MiB of uniform buffer.
+pub const MAX_DRAWS: usize = 4096;
 pub const MAX_PARTICLES: usize = 48000;
 pub const DYN_ALIGN: u64 = 256;
 
@@ -83,11 +86,85 @@ impl Camera {
 pub struct GpuMesh {
     buf: wgpu::Buffer,
     count: u32,
+    /// Bounding sphere of the instances in model space, for shadow culling.
+    bound: (Vec3, f32),
 }
 
 // --- renderer -------------------------------------------------------------------
 
+/// What the last frame drew: for profiling culling and budgets.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FrameStats {
+    pub draws: u32,
+    /// Voxel instances in the main pass (opaque + transparent).
+    pub instances: u64,
+    /// Voxel instances in the shadow pass.
+    pub shadow_instances: u64,
+}
+
+/// The per-map meshes the renderer owns directly: terrain, water, the flood
+/// plane. Built for the active map (`map::active`), rebuilt on a switch.
+struct WorldGeometry {
+    terrain_vbuf: wgpu::Buffer,
+    terrain_ibuf: wgpu::Buffer,
+    terrain_count: u32,
+    water_vbuf: wgpu::Buffer,
+    water_ibuf: wgpu::Buffer,
+    water_count: u32,
+    flood_vbuf: wgpu::Buffer,
+    flood_ibuf: wgpu::Buffer,
+    flood_count: u32,
+}
+
+impl WorldGeometry {
+    fn build(device: &wgpu::Device) -> WorldGeometry {
+        let (tv, ti) = build_terrain();
+        let terrain_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain vbuf"),
+            contents: bytemuck::cast_slice(&tv),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let terrain_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain ibuf"),
+            contents: bytemuck::cast_slice(&ti),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let terrain_count = ti.len() as u32;
+        let (wv, wi) = build_water();
+        let water_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("water vbuf"),
+            contents: bytemuck::cast_slice(&wv),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let water_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("water ibuf"),
+            contents: bytemuck::cast_slice(&wi),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let water_count = wi.len() as u32;
+        let (fv, fi) = build_flood_plane();
+        let flood_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("flood vbuf"),
+            contents: bytemuck::cast_slice(&fv),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let flood_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("flood ibuf"),
+            contents: bytemuck::cast_slice(&fi),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let flood_count = fi.len() as u32;
+        WorldGeometry { terrain_vbuf, terrain_ibuf, terrain_count, water_vbuf, water_ibuf, water_count, flood_vbuf, flood_ibuf, flood_count }
+    }
+}
+
 pub struct Renderer {
+    /// The map the terrain, water and flood meshes were built for.
+    pub world_map: crate::map::MapId,
+    /// Counters for the last `render_frame`.
+    pub stats: FrameStats,
+    /// Draws refused this frame for want of a slot; reported, not silent.
+    pub dropped_draws: u32,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub width: u32,
@@ -566,42 +643,7 @@ impl Renderer {
         });
 
         // terrain
-        let (tv, ti) = build_terrain();
-        let terrain_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("terrain vbuf"),
-            contents: bytemuck::cast_slice(&tv),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let terrain_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("terrain ibuf"),
-            contents: bytemuck::cast_slice(&ti),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let terrain_count = ti.len() as u32;
-        let (wv, wi) = build_water();
-        let water_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("water vbuf"),
-            contents: bytemuck::cast_slice(&wv),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let water_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("water ibuf"),
-            contents: bytemuck::cast_slice(&wi),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let water_count = wi.len() as u32;
-        let (fv, fi) = build_flood_plane();
-        let flood_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("flood vbuf"),
-            contents: bytemuck::cast_slice(&fv),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let flood_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("flood ibuf"),
-            contents: bytemuck::cast_slice(&fi),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let flood_count = fi.len() as u32;
+        let WorldGeometry { terrain_vbuf, terrain_ibuf, terrain_count, water_vbuf, water_ibuf, water_count, flood_vbuf, flood_ibuf, flood_count } = WorldGeometry::build(&device);
 
         let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("post sampler"),
@@ -627,6 +669,7 @@ impl Renderer {
             cube_ibuf,
             meshes: HashMap::new(),
             next_mesh_id: 1,
+            world_map: crate::map::active(),
             main_bgl,
             shadow_bgl,
             post_bgl,
@@ -663,6 +706,8 @@ impl Renderer {
             opaque: Vec::new(),
             transparent: Vec::new(),
             draws: Vec::new(),
+            dropped_draws: 0,
+            stats: FrameStats::default(),
             particles: Vec::new(),
             camera: Camera { eye: Vec3::ZERO, target: Vec3::Y, fov_y: 1.05 },
             time: 0.0,
@@ -686,6 +731,42 @@ impl Renderer {
         r
     }
 
+    /// Rebuild the terrain, water and flood plane for the active map, if
+    /// they were built for another. The map switch: before this the map was
+    /// fixed at launch, because `new` was the only place they were built.
+    pub fn rebuild_world_geometry(&mut self) {
+        let m = crate::map::active();
+        if m == self.world_map {
+            return;
+        }
+        let g = WorldGeometry::build(&self.device);
+        self.terrain_vbuf = g.terrain_vbuf;
+        self.terrain_ibuf = g.terrain_ibuf;
+        self.terrain_count = g.terrain_count;
+        self.water_vbuf = g.water_vbuf;
+        self.water_ibuf = g.water_ibuf;
+        self.water_count = g.water_count;
+        self.flood_vbuf = g.flood_vbuf;
+        self.flood_ibuf = g.flood_ibuf;
+        self.flood_count = g.flood_count;
+        self.world_map = m;
+    }
+
+    /// The id the next uploaded mesh will get: a mark to free back to.
+    pub fn mesh_mark(&self) -> u64 {
+        self.next_mesh_id
+    }
+
+    /// Free every mesh uploaded since `mark` (ids are handed out in
+    /// order): how a scene gives its GPU memory back on a map switch.
+    pub fn free_meshes_from(&mut self, mark: u64) {
+        self.meshes.retain(|&id, _| id < mark);
+    }
+
+    pub fn mesh_count(&self) -> usize {
+        self.meshes.len()
+    }
+
     pub fn upload_mesh(&mut self, mesh: &VoxelMesh) -> u64 {
         let id = self.next_mesh_id;
         self.next_mesh_id += 1;
@@ -694,7 +775,22 @@ impl Renderer {
             contents: bytemuck::cast_slice(&mesh.inst),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
-        self.meshes.insert(id, GpuMesh { buf, count: mesh.inst.len() as u32 });
+        let bound = {
+            let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for i in &mesh.inst {
+                let p = Vec3::new(i.off_ao[0], i.off_ao[1], i.off_ao[2]);
+                lo = lo.min(p);
+                hi = hi.max(p);
+            }
+            if mesh.inst.is_empty() {
+                (Vec3::ZERO, 0.0)
+            } else {
+                let c = (lo + hi) * 0.5;
+                // + a generous voxel: instance scale is per voxel
+                (c, (hi - c).length() + 2.0)
+            }
+        };
+        self.meshes.insert(id, GpuMesh { buf, count: mesh.inst.len() as u32, bound });
         id
     }
 
@@ -776,10 +872,19 @@ impl Renderer {
         self.opaque.clear();
         self.transparent.clear();
         self.draws.clear();
+        if self.dropped_draws > 0 {
+            eprintln!("[clawbound] {} draws dropped last frame (MAX_DRAWS {})", self.dropped_draws, MAX_DRAWS);
+            self.dropped_draws = 0;
+        }
     }
 
     pub fn queue_draw(&mut self, mesh: u64, model: Mat4, tint: [f32; 4], emissive: f32, voxel: f32, alpha: bool) {
-        if self.draws.len() >= MAX_DRAWS {
+        // The LAST slot is the particle draw's (see `render_frame`'s
+        // staging). `>= MAX_DRAWS` let a full frame queue MAX_DRAWS draws and
+        // the particle slot then wrote one past the buffer -- a wgpu
+        // validation panic the first time a frame filled up (a 15v15).
+        if self.draws.len() >= MAX_DRAWS - 1 {
+            self.dropped_draws += 1;
             return;
         }
         let idx = self.draws.len() as u32;
@@ -920,6 +1025,12 @@ impl Renderer {
             label: Some("frame"),
         });
 
+        {
+            let count = |q: &[(u64, u32)]| q.iter().filter_map(|(m, _)| self.meshes.get(m)).map(|m| m.count as u64).sum::<u64>();
+            let (o, t) = (count(&self.opaque), count(&self.transparent));
+            self.stats = FrameStats { draws: self.draws.len() as u32, instances: o + t, shadow_instances: 0 };
+        }
+        let mut shadow_n = 0u64;
         // --- shadow pass ---------------------------------------------------------
         if !self.opaque.is_empty() {
             let mut sp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -940,8 +1051,19 @@ impl Renderer {
             sp.set_bind_group(0, &self.shadow_bind, &[0]);
             sp.set_vertex_buffer(0, self.cube_vbuf.slice(..));
             sp.set_index_buffer(self.cube_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            // Only what can land in the shadow map. It covers a box round
+            // what the camera looks at, and drawing every chunk the CAMERA
+            // sees into it doubled the voxel work of every frame
+            // (CLAWBOUND_SHOTS=perf: "shadow" == "instances" everywhere).
             for (mesh_id, di) in &self.opaque {
                 if let Some(m) = self.meshes.get(mesh_id) {
+                    let model = Mat4::from_cols_array_2d(&self.draws[*di as usize].model);
+                    let c = model.transform_point3(m.bound.0);
+                    let sc = model.x_axis.truncate().length().max(model.y_axis.truncate().length()).max(model.z_axis.truncate().length());
+                    if !sphere_in_frustum(&lvp, c, m.bound.1 * sc) {
+                        continue;
+                    }
+                    shadow_n += m.count as u64;
                     sp.set_bind_group(0, &self.shadow_bind, &[(*di as u32) * DYN_ALIGN as u32]);
                     sp.set_vertex_buffer(1, m.buf.slice(..));
                     sp.draw_indexed(0..36, 0, 0..m.count);
@@ -949,6 +1071,7 @@ impl Renderer {
             }
         }
 
+        self.stats.shadow_instances = shadow_n;
         // --- main scene pass (HDR MSAA) ------------------------------------------
         if let (Some((_, msaa_view)), Some((_, depth_view)), Some((_, resolve_view))) =
             (&self.hdr_msaa, &self.depth, &self.hdr_resolve)
@@ -1350,7 +1473,10 @@ pub fn sort_far_to_near<T>(items: &mut [(f32, T)]) {
 /// beyond the arena bounds, a mountain rim at the horizon, and river valleys
 /// that dip under the lanes (roads stay solid — bridges span the crossings).
 pub fn terrain_height(x: f32, z: f32) -> f32 {
-    use crate::consts::{river_dist, GROUND_HALF, RIVER_HALF_WIDTH, RIVER_DEPTH, ARENA_RADIUS};
+    if crate::map::active() == crate::map::MapId::Pass {
+        return crate::pass::terrain_height(x, z);
+    }
+    use crate::consts::{river_dist, GROUND_HALF, RIVER_HALF_WIDTH, RIVER_DEPTH, ARENA_RADIUS, RIM_RADIUS};
     let r = (x * x + z * z).sqrt();
     let mut h = 0.0f32;
     // rolling jungle hills outside the playable floor
@@ -1362,8 +1488,8 @@ pub fn terrain_height(x: f32, z: f32) -> f32 {
         h = s * (2.2 + n * 6.0 + n2 * 2.2);
     }
     // mountain rim beyond the hills
-    if r > 172.0 {
-        let t = ((r - 172.0) / (GROUND_HALF - 172.0)).clamp(0.0, 1.0);
+    if r > RIM_RADIUS {
+        let t = ((r - RIM_RADIUS) / (GROUND_HALF - RIM_RADIUS)).clamp(0.0, 1.0);
         h += t * t * 30.0 + vnoise(x * 0.05 + 13.0, z * 0.05) * t * 10.0;
     }
     // river valley (masked under lanes so the roads stay solid)
@@ -1443,17 +1569,18 @@ pub fn sphere_in_frustum(vp: &Mat4, center: Vec3, radius: f32) -> bool {
 
 fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
     use crate::consts::{river_dist, GROUND_HALF, RIVER_HALF_WIDTH, ARENA_RADIUS};
-    const HALF: f32 = GROUND_HALF;
+    let half_ground = crate::consts::ground_half();
+    let _ = GROUND_HALF;
     // 1.6 u grid (was 3.2): ~80k verts, fine enough for the river channels
     // and lane edges to read; the fragment shader adds the sub-metre detail.
     const STEP: f32 = 1.6;
-    const N: usize = ((HALF * 2.0) / STEP) as usize + 1;
+    let n_side: usize = ((half_ground * 2.0) / STEP) as usize + 1;
 
-    let mut verts = Vec::with_capacity(N * N);
-    for iz in 0..N {
-        for ix in 0..N {
-            let x = -HALF + ix as f32 * STEP;
-            let z = -HALF + iz as f32 * STEP;
+    let mut verts = Vec::with_capacity(n_side * n_side);
+    for iz in 0..n_side {
+        for ix in 0..n_side {
+            let x = -half_ground + ix as f32 * STEP;
+            let z = -half_ground + iz as f32 * STEP;
             let h = terrain_height(x, z);
             // normal from height diffs
             let hl = terrain_height(x - STEP, z);
@@ -1472,7 +1599,9 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
 
             let mut color;
             let mut mat = 0.0f32;
-            if r > 175.0 && h > 14.0 {
+            if crate::map::active() == crate::map::MapId::Pass {
+                (color, mat) = pass_ground_color(x, z, h, slope, n1, n2, nm);
+            } else if r > crate::consts::RIM_RADIUS + 3.0 && h > 14.0 {
                 // mountain rim: dark jungle rock with forest ledges
                 let rock = [0.24 + n1 * 0.05, 0.24 + n2 * 0.04, 0.22 + n1 * 0.03];
                 let forest = [0.085 + n1 * 0.03, 0.17 + n2 * 0.05, 0.075];
@@ -1537,6 +1666,14 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
                     let t = (1.0 - (rd - RIVER_HALF_WIDTH) / 5.0).clamp(0.0, 1.0);
                     g = [g[0] + (0.46 - g[0]) * t * 0.85, g[1] + (0.40 - g[1]) * t * 0.85, g[2] + (0.27 - g[2]) * t * 0.85];
                 }
+                // The rim of the floor fades into the hill ring's darker
+                // green. It was a hard circle, as visible from above as a
+                // painted line; the arena edge is now a treeline, not a stripe.
+                let edge = smoothstep(ARENA_RADIUS - 14.0, ARENA_RADIUS, r);
+                if edge > 0.0 {
+                    let hill = [0.075 + n1 * 0.035, 0.175 + n2 * 0.06, 0.07 + n2 * 0.02];
+                    g = [g[0] + (hill[0] - g[0]) * edge, g[1] + (hill[1] - g[1]) * edge, g[2] + (hill[2] - g[2]) * edge];
+                }
                 // team base tints
                 for (bz, c) in [
                     (crate::consts::Team::Blue.base_pos().z, [0.20, 0.34, 0.60]),
@@ -1559,13 +1696,13 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
         }
     }
 
-    let mut idx = Vec::with_capacity((N - 1) * (N - 1) * 6);
-    for iz in 0..N - 1 {
-        for ix in 0..N - 1 {
-            let a = (ix + N * iz) as u32;
-            let b = (ix + 1 + N * iz) as u32;
-            let c = (ix + N * (iz + 1)) as u32;
-            let d = (ix + 1 + N * (iz + 1)) as u32;
+    let mut idx = Vec::with_capacity((n_side - 1) * (n_side - 1) * 6);
+    for iz in 0..n_side - 1 {
+        for ix in 0..n_side - 1 {
+            let a = (ix + n_side * iz) as u32;
+            let b = (ix + 1 + n_side * iz) as u32;
+            let c = (ix + n_side * (iz + 1)) as u32;
+            let d = (ix + 1 + n_side * (iz + 1)) as u32;
             idx.extend_from_slice(&[a, c, b, b, c, d]);
         }
     }
@@ -1589,7 +1726,96 @@ struct WaterVert {
     uv: [f32; 2],
 }
 
+/// Twinfang Pass ground: smooth grey stone underfoot, a little tough grass
+/// in the clearings, dark wet rock on the cliff faces, paler weathered rock
+/// on the plateau, snow on the heights and in the high hollows. Cold and
+/// desaturated on purpose; the only saturated colour on this map is a cat.
+fn pass_ground_color(x: f32, z: f32, h: f32, slope: f32, n1: f32, n2: f32, nm: f32) -> ([f32; 3], f32) {
+    let d = crate::pass::floor().sdf(x, z);
+    let lerp = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    if d <= 0.3 {
+        // the floor
+        let stone = [0.40 + n1 * 0.05, 0.41 + n1 * 0.05, 0.43 + n2 * 0.04];
+        let rd = crate::pass::river_dist(x, z);
+        if rd < crate::pass::STREAM_HALF_WIDTH + 1.2 {
+            // stream bed: dark, water-polished pebble
+            return ([0.24 + n2 * 0.05, 0.26 + n2 * 0.05, 0.28 + n1 * 0.04], 2.0);
+        }
+        // grass only away from the lanes, in the clearings' hearts, patchy
+        let away = (crate::consts::lane_clearance(x, z) - 6.0).clamp(0.0, 6.0) / 6.0;
+        let grass_t = (smoothstep(0.55, 0.78, nm) * away * smoothstep(-1.0, -3.5, d)).clamp(0.0, 1.0);
+        let grass = [0.27 + n1 * 0.04, 0.33 + n2 * 0.05, 0.22];
+        // a darker margin where the cliff meets the floor: scree and damp
+        let foot = smoothstep(-2.5, 0.3, d) * 0.25;
+        let c = lerp(stone, grass, grass_t * 0.85);
+        return ([c[0] * (1.0 - foot), c[1] * (1.0 - foot), c[2] * (1.0 - foot * 0.8)], if grass_t > 0.5 { 0.0 } else { 5.0 });
+    }
+    let face = [0.25 + n1 * 0.04, 0.26 + n1 * 0.04, 0.29 + n2 * 0.04];
+    let top = [0.38 + n1 * 0.06, 0.38 + n1 * 0.05, 0.39 + n2 * 0.05];
+    let snow = [0.84 + n2 * 0.06, 0.86 + n2 * 0.06, 0.90 + n2 * 0.05];
+    // faces are the steep parts; tops the flat ones
+    let c = lerp(top, face, smoothstep(0.08, 0.35, slope));
+    // snow: certain above the snowline, in patches on flat high ground below it
+    let snowline = 44.0 + n1 * 10.0;
+    let patchy = smoothstep(20.0, 30.0, h) * smoothstep(0.72, 0.88, nm) * (1.0 - smoothstep(0.1, 0.3, slope));
+    let snow_t = smoothstep(snowline - 6.0, snowline + 4.0, h).max(patchy) * (1.0 - smoothstep(0.35, 0.6, slope) * 0.6);
+    (lerp(c, snow, snow_t), if snow_t > 0.5 { 6.0 } else { 4.0 })
+}
+
+/// The pass's streams: a strip of water over each, 0.5 u cells, cut to the
+/// wet part like the jungle's rivers. The lip-to-pool stretch is the
+/// waterfall and is a prop, not a strip.
+fn build_pass_water() -> (Vec<WaterVert>, Vec<u32>) {
+    use crate::consts::WATER_LEVEL;
+    const STEP: f32 = 0.5;
+    let half_w = crate::pass::STREAM_HALF_WIDTH + 1.4;
+    let mut verts = Vec::new();
+    let mut idx = Vec::new();
+    for s in crate::pass::streams() {
+        for w in s[1..].windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let along = b - a;
+            let len = along.length();
+            if len < 1e-3 {
+                continue;
+            }
+            let dir = along / len;
+            let side = Vec3::new(-dir.z, 0.0, dir.x);
+            // overlap the ends a little so the joints have no gaps
+            let (s0, s1) = (-half_w * 0.6, len + half_w * 0.6);
+            let nl = ((s1 - s0) / STEP) as usize + 1;
+            let nw = (half_w * 2.0 / STEP) as usize + 1;
+            let base = verts.len() as u32;
+            for il in 0..nl {
+                for iw in 0..nw {
+                    let p = a + dir * (s0 + il as f32 * STEP) + side * (-half_w + iw as f32 * STEP);
+                    verts.push(WaterVert {
+                        pos: [p.x, WATER_LEVEL, p.z],
+                        bed: terrain_height(p.x, p.z),
+                        flow: [dir.x, dir.z],
+                        uv: [(iw as f32 * STEP - half_w) / half_w, (s0 + il as f32 * STEP) * 0.05],
+                    });
+                }
+            }
+            for il in 0..nl - 1 {
+                for iw in 0..nw - 1 {
+                    let i = |l: usize, w: usize| base + (w + nw * l) as u32;
+                    let (qa, qb, qc, qd) = (i(il, iw), i(il, iw + 1), i(il + 1, iw), i(il + 1, iw + 1));
+                    let dry = [qa, qb, qc, qd].iter().all(|&k| verts[k as usize].bed > WATER_LEVEL + 0.05);
+                    if !dry {
+                        idx.extend_from_slice(&[qa, qc, qb, qb, qc, qd]);
+                    }
+                }
+            }
+        }
+    }
+    (verts, idx)
+}
+
 fn build_water() -> (Vec<WaterVert>, Vec<u32>) {
+    if crate::map::active() == crate::map::MapId::Pass {
+        return build_pass_water();
+    }
     use crate::consts::{river_x, GROUND_HALF, RIVER_HALF_WIDTH, WATER_LEVEL};
     const STEP: f32 = 1.0;
     let half_w = RIVER_HALF_WIDTH + 6.0;
@@ -1640,7 +1866,8 @@ fn build_water() -> (Vec<WaterVert>, Vec<u32>) {
 fn build_flood_plane() -> (Vec<WaterVert>, Vec<u32>) {
     use crate::consts::{river_dist, ARENA_RADIUS, RIVER_HALF_WIDTH, WATER_LEVEL};
     const STEP: f32 = 2.0;
-    let half = ARENA_RADIUS + 10.0;
+    let half = crate::consts::arena_radius() + 10.0;
+    let _ = ARENA_RADIUS;
     let n = (half * 2.0 / STEP) as usize + 1;
     let mut verts = Vec::with_capacity(n * n);
     let mut idx = Vec::new();

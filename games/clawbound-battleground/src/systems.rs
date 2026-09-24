@@ -23,6 +23,7 @@ impl Game {
         }
 
         // 2. AI decisions
+        self.plans_this_tick = 0;
         let n = self.gods.len();
         for i in 0..n {
             if self.gods[i].respawn_t > 0.0 {
@@ -238,8 +239,17 @@ impl Game {
             }
             g.perch_hp = g.hp;
             if g.perch.is_none() && g.leap.is_none() && g.dash.is_none() {
-                if g.pos.y > 0.0 && g.fall.is_none() {
-                    g.fall = Some(crate::leap::Fall::new(g.pos.y, 0.0)); // e.g. a dash that ended in the air
+                // The ground here: 0 on the jungle, the shelf's height on the
+                // pass's climbing lane (`map::ground_y`). Above it by more
+                // than a step: a fall. Otherwise stand on it -- walking down
+                // a ramp is not falling.
+                let ground = crate::map::ground_y(g.pos.x, g.pos.z);
+                if g.fall.is_none() {
+                    if g.pos.y > ground + crate::map::step_down() {
+                        g.fall = Some(crate::leap::Fall::new(g.pos.y, 0.0)); // e.g. a dash that ended in the air
+                    } else if g.pos.y != ground && (g.pos.y > ground || crate::map::step_down() > 0.0) {
+                        g.pos.y = ground;
+                    }
                 }
                 if let Some(f) = &mut g.fall {
                     let y0 = g.pos.y;
@@ -253,7 +263,7 @@ impl Game {
                     // 0.9 u in radius, and the integration test said so.
                     let from_y = f.from_y;
                     let under = blockers.landing_under(g.pos.x, g.pos.z, y0).filter(|u| u.0 < from_y - 0.05);
-                    let floor = under.map_or(0.0, |u| u.0);
+                    let floor = under.map_or(ground, |u| u.0.max(ground));
                     if y1 <= floor {
                         g.pos.y = floor;
                         g.leap = Some(crate::leap::LeapState::landing(g.pos, under, (f.from_y - floor).max(0.0)));
@@ -266,8 +276,8 @@ impl Game {
 
             // arena bounds
             let r = Vec3::new(g.pos.x, 0.0, g.pos.z).length();
-            if r > ARENA_RADIUS - 2.0 {
-                let s = (ARENA_RADIUS - 2.0) / r;
+            if r > crate::consts::arena_radius() - 2.0 {
+                let s = (crate::consts::arena_radius() - 2.0) / r;
                 g.pos.x *= s;
                 g.pos.z *= s;
             }
@@ -323,6 +333,7 @@ impl Game {
                     // matters because a wave piling into a trunk is what makes
                     // props read as solid from across the map.
                     m.pos = blockers.resolve(m.pos, MINION_RADIUS);
+                    m.pos.y = crate::map::ground_y(m.pos.x, m.pos.z);
                 }
             } else {
                 m.walk_anim += dt * 2.0;
@@ -793,7 +804,7 @@ impl Game {
                 _ => {
                     p.pos += p.vel * dt;
                     p.life -= dt;
-                    if p.life <= 0.0 || p.pos.y < -0.5 || Vec3::new(p.pos.x, 0.0, p.pos.z).length() > ARENA_RADIUS + 4.0 {
+                    if p.life <= 0.0 || p.pos.y < -0.5 || Vec3::new(p.pos.x, 0.0, p.pos.z).length() > crate::consts::arena_radius() + 4.0 {
                         dead[pi] = true;
                         continue;
                     }

@@ -57,6 +57,41 @@ the single highest-value thing anyone can do with this repo next.
 
 ## Known gaps
 
+- **Twinfang Pass (15v15 mountain map, c20unified-015).** `--map pass`.
+  * **The map is chosen at launch only**: the terrain mesh is built in
+    `Renderer::new`. A menu choice needs the terrain (and water, flood
+    plane) rebuilt on map change.
+  * **Map selection is a thread-local** (`map.rs`). The end state is an
+    explicit `Arc<Map>` on `Game`/`Scene`; that refactor starts at `map.rs`.
+  * **30 cats on a phone: unmeasured.** Sim ~5 ms/tick unoptimized on x86
+    (`CLAWBOUND_SHOTS=pass` prints it); render cost not measured anywhere.
+  * **Spring trees use the bright jungle tree mesh** on the pass.
+  * **World nameplates draw over the scoreboard** (pre-existing layering,
+    worse with 30 cats).
+  * **AI buys duplicates** (three Wooden Cleavers seen on one bot) --
+    pre-existing `auto_buy` behaviour, more visible with 30 cats.
+  * **botwalk on the pass: 4.7-6.0% stalled**, clustered near the side
+    lanes' far bends; not investigated.
+
+- **Rough ground, groves, footfall, the Hoard (c20unified-014 session).**
+  Each is in its commit message with what was and was not verified. Open:
+  * **Instance budget**: the static world is 469,478 instances (cap 520k in
+    `the_world_uploads_its_hull_not_its_insides`; 296,629 before the jungle
+    grew). No frame time has been taken on any GPU, let alone a handset.
+  * **Grove interiors have not been seen from ground level** -- two staged
+    cameras hit a trunk and a boulder. From above they read as canopy clumps.
+  * **Footfall has been seen in stills only** (`CLAWBOUND_SHEET=trot`). The
+    paw box tilts with the leg; whether that reads right in motion is open.
+  * **Minions do not read the going or steer.** Lanes carry no rough ground
+    (tested), so this only matters for a minion shoved into the jungle.
+  * **botwalk's remaining ~5% stalls cluster at the bases** (fountain
+    behaviour, not investigated). `cargo run --example botwalk <seed> <min>`.
+  * **Planner cost**: worst case 2500 A* expansions for one bot on one tick,
+    only when the direct fan fails. Not measured on ARM.
+  * **Item names are still generic MOBA stock** ("Bronze Falx"); the Hoard
+    themes shelves and tiers only. Renaming the catalog is a content call.
+  * **The Hoard on a touchscreen**: rendered at phone scale, never touched.
+
 - **AI map backend: the model-driving half exists** (`ChainCompleter` with
   voxel-tools' `complete_chain` shape, `extract_calls`, `Brief`/`readback`,
   `run_chain`), tested against a canned model. STILL no real model attached,

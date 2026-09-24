@@ -42,6 +42,9 @@ pub struct AudioParams {
     /// 0..1: how much water is around the listener (lapping, drips)
     pub water: f32,
     pub master: f32,
+    /// monotonically increasing counter; the synth starts the intro
+    /// fanfare (`brass`) when it changes
+    pub fanfare_count: u32,
 }
 
 impl Default for AudioParams {
@@ -61,6 +64,7 @@ impl Default for AudioParams {
             thunder_dist: 1.0,
             water: 0.0,
             master: 0.8,
+            fanfare_count: 0,
         }
     }
 }
@@ -258,6 +262,10 @@ pub struct WindSynth {
     thunder_env: f32,
     thunder_dist: f32,
     last_thunder: u32,
+    last_fanfare: u32,
+    /// The intro fanfare while it plays (`brass`), mixed over the ambience.
+    fanfare: Option<crate::brass::Fanfare>,
+    fanfare_buf: Vec<f32>,
     lap_phase: f32,
     lfo: f32,
     rev_l: Reverb,
@@ -290,6 +298,9 @@ impl WindSynth {
             thunder_env: 0.0,
             thunder_dist: 1.0,
             last_thunder: 0,
+            last_fanfare: 0,
+            fanfare: None,
+            fanfare_buf: Vec::new(),
             lap_phase: 0.0,
             lfo: 0.0,
             rev_l: Reverb::new(sample_rate, 0),
@@ -336,6 +347,18 @@ impl WindSynth {
         let thunder_decay = (-dt / (1.6 + 2.5 * self.thunder_dist)).exp();
         let lap_hz = 0.6 + self.water * 0.5;
 
+        if p.fanfare_count != self.last_fanfare {
+            self.last_fanfare = p.fanfare_count;
+            self.fanfare = Some(crate::brass::Fanfare::new(sr));
+        }
+        self.fanfare_buf.clear();
+        self.fanfare_buf.resize(n, 0.0);
+        if let Some(f) = self.fanfare.as_mut() {
+            f.render(&mut self.fanfare_buf);
+            if f.finished() {
+                self.fanfare = None;
+            }
+        }
         for i in 0..n {
             let w = self.noise();
             self.lfo += dt;
@@ -393,6 +416,10 @@ impl WindSynth {
             self.dc_r += (r - self.dc_r) * 0.002;
             l = soft_clip((l - self.dc_l) * master * 0.5);
             r = soft_clip((r - self.dc_r) * master * 0.5);
+            // the fanfare over the top, centred, after the ambience's own clip
+            let fan = self.fanfare_buf.get(i).copied().unwrap_or(0.0) * master;
+            l = soft_clip(l + fan);
+            r = soft_clip(r + fan);
 
             let base = i * channels;
             match channels {
@@ -539,6 +566,7 @@ pub fn params_for(game: &crate::sim::Game, listener: Vec3, cam_yaw: f32, thunder
         thunder_dist,
         water: ac.water,
         master: 0.8,
+        fanfare_count: 0, // the app sets this; the sim knows nothing of the intro
     }
 }
 
@@ -633,5 +661,35 @@ mod tests {
         let w = tail(0.9, 1.0) - tail(0.9, 0.0);
         let d = tail(0.0, 1.0) - tail(0.0, 0.0);
         assert!(w > d * 3.0 && w > 0.003, "a bigger room rings longer: wet {w} dry {d}");
+    }
+}
+
+#[cfg(test)]
+mod fanfare_tests {
+    use super::*;
+
+    /// The intro's fanfare plays through the same synth the game hears:
+    /// bumping the counter adds the brass over the ambience, once; leaving
+    /// it alone adds nothing.
+    #[test]
+    fn the_fanfare_plays_through_the_live_synth_once_per_bump() {
+        let sr = 22050.0;
+        let run = |bump: bool| {
+            let mut w = WindSynth::new(sr);
+            let mut p = AudioParams::default();
+            let mut out = vec![0.0f32; 2 * 1024];
+            let mut energy = 0.0f32;
+            for block in 0..((3.0 * sr / 1024.0) as usize) {
+                if bump && block == 2 {
+                    p.fanfare_count = 1;
+                }
+                w.render(&p, &mut out, 2);
+                energy += out.iter().map(|x| x * x).sum::<f32>();
+            }
+            energy
+        };
+        let (quiet, loud) = (run(false), run(true));
+        assert!(loud > quiet * 3.0, "the fanfare is heard: {loud} vs {quiet}");
+        assert!(loud.is_finite());
     }
 }

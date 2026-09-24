@@ -201,7 +201,9 @@ pub fn plan(pos: Vec3, dir: Vec3, standing_on: Option<f32>, blockers: &Blockers)
     while reach >= LEAP_MIN {
         let (x, z) = (pos.x + d.x * reach, pos.z + d.z * reach);
         if !blockers.blocked(x, z, body) {
-            return Some(Plan { to: Vec3::new(x, 0.0, z), perch: None, narrow: false });
+            // open ground lands on the ground there -- the pass's shelf is
+            // not at 0 (`map::ground_y`; 0 on the jungle, unchanged)
+            return Some(Plan { to: Vec3::new(x, crate::map::ground_y(x, z), z), perch: None, narrow: false });
         }
         reach -= 0.5;
     }

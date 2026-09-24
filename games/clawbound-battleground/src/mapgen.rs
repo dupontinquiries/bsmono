@@ -38,16 +38,29 @@ pub const KINDS: [(&str, PropKind); 10] = [
     ("StranglerFig", PropKind::StranglerFig), ("Palm", PropKind::Palm), ("Fern", PropKind::Fern), ("Bush", PropKind::Bush),
 ];
 
+/// Where a placement's twin goes: the active map's own symmetry.
+pub fn mirror(x: f32, z: f32) -> (f32, f32) {
+    match crate::map::active() {
+        crate::map::MapId::Jungle => (-x, -z),
+        crate::map::MapId::Pass => (x, -z),
+    }
+}
+
 /// The tool descriptions, for a system prompt.
 pub fn tools() -> String {
     format!(
-        "You author a jungle arena by calling tools, one per line. You cannot see the map; ask.\n\
-         place <Kind> <x> <z> [quarter 0-3]  -- place a prop AND its mirror through the origin. Kinds: {}.\n\
+        "You author the scenery of {} by calling tools, one per line. You cannot see the map; ask.\n\
+         place <Kind> <x> <z> [quarter 0-3]  -- place a prop AND its mirror ({}). Kinds: {}.\n\
          survey <x> <z> <radius>             -- a digest of what is there.\n\
          undo                                -- take back the last placement (both halves).\n\
          validate                            -- check the whole map.\n\
          done                                -- finish.\n\
          Units are world units; the arena is {:.0} across; +z is the red base. Refusals say why.",
+        crate::map::active().name(),
+        match crate::map::active() {
+            crate::map::MapId::Jungle => "through the origin",
+            crate::map::MapId::Pass => "across z = 0; the ground is a canyon floor and everything else is cliff",
+        },
         KINDS.iter().map(|k| k.0).collect::<Vec<_>>().join(", "),
         consts::ARENA_RADIUS * 2.0
     )
@@ -71,8 +84,21 @@ impl MapDraft {
             return Some("coordinates must be numbers".into());
         }
         let r = kind.footprint().radius;
-        if x.hypot(z) > consts::ARENA_RADIUS - 4.0 {
-            return Some(format!("outside the arena (radius {:.0})", consts::ARENA_RADIUS));
+        if x.hypot(z) > consts::arena_radius() - 4.0 {
+            return Some(format!("outside the arena (radius {:.0})", consts::arena_radius()));
+        }
+        // On a map carved out of rock, the rock is not floor. Without this
+        // the engine accepted a rock on top of Twinfang Pass's 96 u summit
+        // and validate() passed it (examples/mapgen_eval).
+        if let Some(f) = crate::map::floor() {
+            let d = f.sdf(x, z);
+            if d > -(r.max(0.5)) {
+                return Some(if d > 0.0 {
+                    format!("in the rock: that is cliff {d:.1} u from the nearest floor, not ground to stand on")
+                } else {
+                    format!("on the very edge of the floor ({:.1} u in); a {kind:?} needs {:.1}", -d, r.max(0.5))
+                });
+            }
         }
         let lane = consts::lane_clearance(x, z);
         let need = if solid(kind) { r + 3.0 } else { 2.0 };
@@ -107,15 +133,20 @@ impl MapDraft {
         if let Some(why) = self.refusal(kind, x, z) {
             return Err(why);
         }
-        let own_twin = x.hypot(z) < kind.footprint().radius.max(1.0);
+        // The twin is the map's own mirror image: through the origin on the
+        // jungle, across z = 0 on the pass (its lanes and clearings are
+        // laid out that way; a point mirror of a pass clearing can land on
+        // the cliff edge).
+        let (tx, tz) = mirror(x, z);
+        let own_twin = (x - tx).hypot(z - tz) < kind.footprint().radius.max(1.0);
         let before = self.placements.len();
         self.placements.push(Placement { kind, x, z, quarter: quarter % 4, scale: 1.0 });
         if !own_twin {
-            if let Some(why) = self.refusal(kind, -x, -z) {
+            if let Some(why) = self.refusal(kind, tx, tz) {
                 self.placements.truncate(before);
-                return Err(format!("its mirror at ({:.1}, {:.1}) is refused: {why}", -x, -z));
+                return Err(format!("its mirror at ({tx:.1}, {tz:.1}) is refused: {why}"));
             }
-            self.placements.push(Placement { kind, x: -x, z: -z, quarter: (quarter + 2) % 4, scale: 1.0 });
+            self.placements.push(Placement { kind, x: tx, z: tz, quarter: (quarter + 2) % 4, scale: 1.0 });
         }
         self.groups.push(self.placements.len() - before);
         Ok(format!("placed {kind:?} at ({x:.1}, {z:.1}){}", if own_twin { "" } else { " and its mirror" }))
@@ -129,6 +160,11 @@ impl MapDraft {
 
     pub fn blockers(&self) -> Blockers {
         let mut b = Blockers::new(consts::ARENA_RADIUS + 20.0, 6.0);
+        // the survey's "walkable" must count cliffs, or it reports a summit
+        // as 100% walkable
+        if let Some(f) = crate::map::floor() {
+            b.set_floor(f);
+        }
         for p in &self.placements {
             b.push_placed(p.kind, p.x, p.z, 0.0, p.quarter, p.scale);
         }
@@ -176,7 +212,8 @@ impl MapDraft {
     pub fn validate(&self) -> Vec<String> {
         let mut out = Vec::new();
         for p in &self.placements {
-            let twin = self.placements.iter().any(|q| q.kind == p.kind && (q.x + p.x).abs() < 1e-3 && (q.z + p.z).abs() < 1e-3);
+            let (mx, mz) = mirror(p.x, p.z);
+            let twin = self.placements.iter().any(|q| q.kind == p.kind && (q.x - mx).abs() < 1e-3 && (q.z - mz).abs() < 1e-3);
             if !twin {
                 out.push(format!("{:?} at ({:.1}, {:.1}) has no mirror: the map favours one base", p.kind, p.x, p.z));
             }
@@ -576,5 +613,29 @@ mod tests {
             let _ = MapDraft::default().call(junk); // must not panic
         }
         assert!(tools().contains("survey") && tools().contains("StoneHead"));
+    }
+
+    /// On Twinfang Pass the engine knows where the rock is: a placement on
+    /// the summit, the plateau or the gorge wall is refused in words, its
+    /// survey counts cliff as unwalkable, and twins mirror across z = 0.
+    /// (Before: the summit rock was ACCEPTED and validate() passed it.)
+    #[test]
+    fn on_the_pass_the_rock_is_refused_and_twins_mirror_in_z() {
+        crate::map::with(crate::map::MapId::Pass, || {
+            let mut d = MapDraft::default();
+            let k = crate::pass::S;
+            for (x, z) in [(-60.0 * k, 0.0), (24.0 * k, -60.0 * k), (-14.0 * k, -60.0 * k)] {
+                let e = d.place(PropKind::Rock, x, z, 0).unwrap_err();
+                assert!(e.contains("in the rock"), "({x},{z}): {e}");
+            }
+            assert!(d.survey(-60.0 * k, 0.0, 8.0).contains("0% walkable"), "{}", d.survey(-60.0 * k, 0.0, 8.0));
+            // a floor spot: its twin is (x, -z)
+            d.place(PropKind::Bush, -26.0 * k, -38.0 * k, 0).unwrap();
+            assert!(d.placements.iter().any(|p| (p.x + 26.0 * k).abs() < 1e-3 && (p.z - 38.0 * k).abs() < 1e-3), "{:?}", d.placements);
+            assert!(d.validate().is_empty(), "{:?}", d.validate());
+            assert!(tools().contains("Twinfang Pass") && tools().contains("across z = 0"));
+        });
+        // and the jungle is as it was: through the origin
+        assert_eq!(mirror(3.0, 4.0), (-3.0, -4.0));
     }
 }

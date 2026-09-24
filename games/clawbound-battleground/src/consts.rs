@@ -10,7 +10,39 @@ use glam::Vec3;
 /// Global layout scale — expands the whole valley (lanes, bases, towers).
 pub const MAP_SCALE: f32 = 1.42;
 
-pub const ARENA_RADIUS: f32 = 95.0 * MAP_SCALE; // playable floor (~135)
+/// Deep jungle added beyond the lanes, world units. The arena grows by this
+/// much WITHOUT moving a lane, a base or a tower: MAP_SCALE stretches the
+/// whole valley and so changes every walk in the match; this only adds
+/// ground behind the side lanes and rivers to hunt, hide and flank through.
+pub const JUNGLE_MARGIN: f32 = 32.0;
+
+pub const ARENA_RADIUS: f32 = 95.0 * MAP_SCALE + JUNGLE_MARGIN; // playable floor (~167)
+
+/// The playable radius of the active map. One function so a map can differ
+/// in size (the jungle and the pass share `ARENA_RADIUS` today).
+pub fn arena_radius() -> f32 {
+    match crate::map::active() {
+        crate::map::MapId::Jungle => ARENA_RADIUS,
+        crate::map::MapId::Pass => crate::pass::ARENA_RADIUS,
+    }
+}
+
+/// Half the side of the rendered terrain square, for the active map.
+pub fn ground_half() -> f32 {
+    match crate::map::active() {
+        crate::map::MapId::Jungle => GROUND_HALF,
+        crate::map::MapId::Pass => crate::pass::GROUND_HALF,
+    }
+}
+
+/// Everything past the playable floor -- the hill ring, the landmarks, the
+/// mountain rim, the rendered ground -- was authored in world units for a
+/// 135 u arena. It is carried out by this ratio so the ring keeps its shape
+/// round a bigger floor instead of the floor growing into it.
+pub const OUTER_SCALE: f32 = ARENA_RADIUS / (95.0 * MAP_SCALE);
+
+/// Where the mountain rim starts rising.
+pub const RIM_RADIUS: f32 = 172.0 * OUTER_SCALE;
 
 /// Collision radius of a god, for prop push-out.
 ///
@@ -34,7 +66,7 @@ pub const HUSH_DASH_SECS: f32 = 1.5;
 
 /// Collision radius of a minion. Smaller because a minion is a mini cat.
 pub const MINION_RADIUS: f32 = 0.32;
-pub const GROUND_HALF: f32 = 225.0; // rendered terrain half-extent
+pub const GROUND_HALF: f32 = 225.0 * OUTER_SCALE; // rendered terrain half-extent (~279)
 
 /// Base microvoxel edge length (world units) for character voxels.
 pub const VOXEL_SIZE: f32 = 0.14;
@@ -56,6 +88,9 @@ pub fn river_x(side: f32, z: f32) -> f32 {
 
 /// Distance from (x, z) to the nearest river centerline (both rivers).
 pub fn river_dist(x: f32, z: f32) -> f32 {
+    if crate::map::active() == crate::map::MapId::Pass {
+        return crate::pass::river_dist(x, z);
+    }
     (x - river_x(-1.0, z)).abs().min((x - river_x(1.0, z)).abs())
 }
 
@@ -104,27 +139,47 @@ impl Team {
     }
     /// Fountain (heal / respawn) position.
     pub fn fountain(self) -> Vec3 {
+        if crate::map::active() == crate::map::MapId::Pass {
+            return crate::pass::fountain(self);
+        }
         match self {
             Team::Blue => Vec3::new(0.0, 0.0, -88.0 * MAP_SCALE),
             Team::Red => Vec3::new(0.0, 0.0, 88.0 * MAP_SCALE),
         }
     }
     pub fn titan_pos(self) -> Vec3 {
+        if crate::map::active() == crate::map::MapId::Pass {
+            return crate::pass::titan_pos(self);
+        }
         match self {
             Team::Blue => Vec3::new(0.0, 0.0, -74.0 * MAP_SCALE),
             Team::Red => Vec3::new(0.0, 0.0, 74.0 * MAP_SCALE),
         }
     }
     pub fn base_pos(self) -> Vec3 {
+        if crate::map::active() == crate::map::MapId::Pass {
+            return crate::pass::base_pos(self);
+        }
         match self {
             Team::Blue => Vec3::new(0.0, 0.0, -82.0 * MAP_SCALE),
             Team::Red => Vec3::new(0.0, 0.0, 82.0 * MAP_SCALE),
         }
     }
+    /// The two sides. Two-part clan-style names (the Warriors books'
+    /// naming pattern, none of their actual clans), each saying its colour:
+    /// ice-blue and ember-red. One table -- the HUD, scoreboard, announcer
+    /// and intro card all read it.
     pub fn name(self) -> &'static str {
         match self {
-            Team::Blue => "ORDER",
-            Team::Red => "CHAOS",
+            Team::Blue => "FROSTFANG",
+            Team::Red => "EMBERCLAW",
+        }
+    }
+    /// What the intro card says under the name.
+    pub fn motto(self) -> &'static str {
+        match self {
+            Team::Blue => "cold, patient, and never alone",
+            Team::Red => "quick to the hunt, first to the fire",
         }
     }
     pub fn rgb(self) -> [f32; 3] {
@@ -157,6 +212,9 @@ impl Lane {
     }
     /// Canonical polyline from Blue base toward Red base.
     pub fn polyline(self) -> Vec<Vec3> {
+        if crate::map::active() == crate::map::MapId::Pass {
+            return crate::pass::lane_polyline(self);
+        }
         match self {
             Lane::Mid => vec![
                 Vec3::new(0.0, 0.0, -68.0),
@@ -225,12 +283,18 @@ fn push_sampled(out: &mut Vec<Vec3>, from: Vec3, to: Vec3, step: f32) {
 /// Cached per (lane, team) dense waypoints (6 combos, built once).
 pub fn lane_path(lane: Lane, team: Team) -> &'static [Vec3] {
     use std::sync::OnceLock;
-    static PATHS: OnceLock<Vec<Vec<Vec3>>> = OnceLock::new();
-    let all = PATHS.get_or_init(|| {
+    // One cache per map: the paths are the map's.
+    static PATHS: [OnceLock<Vec<Vec<Vec3>>>; 2] = [OnceLock::new(), OnceLock::new()];
+    let all = PATHS[crate::map::active() as usize].get_or_init(|| {
         let mut v = Vec::new();
         for lane in LANES {
             for team in [Team::Blue, Team::Red] {
-                v.push(lane.path_for(team));
+                // Waypoints stand ON the ground: the pass's Top lane climbs a
+                // 9 u shelf, and the AI and minions advance waypoints by 3D
+                // distance (< 6 u, < 1.5 u) -- against points at y = 0 they
+                // would never arrive up there, and stall. 0 on the jungle.
+                let path = lane.path_for(team).into_iter().map(|p| Vec3::new(p.x, crate::map::ground_y(p.x, p.z), p.z)).collect();
+                v.push(path);
             }
         }
         v
@@ -240,6 +304,9 @@ pub fn lane_path(lane: Lane, team: Team) -> &'static [Vec3] {
 
 /// (lane, team) → tower world position. Two towers per lane per team.
 pub fn tower_pos(lane: Lane, team: Team, inner: bool) -> Vec3 {
+    if crate::map::active() == crate::map::MapId::Pass {
+        return crate::pass::tower_pos(lane, team, inner);
+    }
     use Lane::*;
     let zflip = |v: Vec3| -> Vec3 {
         match team {

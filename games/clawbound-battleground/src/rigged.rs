@@ -218,6 +218,11 @@ pub struct LegAdjust {
     pub fold: f32,
     /// Splay outward from the body, radians.
     pub splay: f32,
+    /// Where the sole must BE, in the rig frame after the whole-body
+    /// adjustments (see [`world_to_rig`]). When set, the leg is solved to
+    /// reach it from its hip and `pitch`/`fold`/`splay` are ignored: a
+    /// planted paw is placed, not swung (`footfall`).
+    pub plant: Option<[f32; 3]>,
 }
 
 /// Whole-body and tail deltas from the locomotion layer.
@@ -291,10 +296,42 @@ pub fn slot_transforms(rig: &QuadRig, posed: &[PosedBox], legs: &[LegAdjust; 4],
             * Mat4::from_translation(-Vec3::from_array(rest_c));
     }
 
+    // Whole body: arch shears front up / hind down about the centre, then
+    // pitch/roll/drop. Applied to every slot, so the cat moves as one.
+    let arch = Mat4::from_cols(
+        Vec4::new(1.0, body.arch, 0.0, 0.0),
+        Vec4::Y,
+        Vec4::Z,
+        Vec4::W,
+    );
+    let pivot = Vec3::new(body.pivot[0], body.pivot[1], 0.0);
+    let whole = Mat4::from_translation(Vec3::new(0.0, -body.drop, body.sway) + pivot)
+        * rig_rotation([body.roll, body.pitch, body.yaw])
+        * Mat4::from_translation(-pivot)
+        * arch;
+
+    // The twist splits the body along the spine (the rig X axis through the
+    // centre): front slots lead by half of it, hind slots lag by half. The
+    // torso is one mesh and takes neither, which is where a real cat's spine
+    // would be doing the work.
+    let half = |sign: f32| rig_rotation([-body.twist * 0.5 * sign, 0.0, 0.0]);
+    let (front, hind) = (half(1.0), half(-1.0));
     // Leg deltas, about the hip.
     for (i, adj) in legs.iter().enumerate() {
         if *adj == LegAdjust::default() {
             continue;
+        }
+        if let Some(target) = adj.plant {
+            // Undo what will be done to this leg after its own transform --
+            // the whole-body tilt and this half's twist -- so the leg is
+            // solved in its own frame and lands on the target once they are
+            // applied.
+            let part = if i < 2 { front } else { hind };
+            let pre = (whole * part).inverse().transform_point3(Vec3::from_array(target));
+            if let Some(m) = plant_leg(rig, i, pre) {
+                rig_space[LEG_SLOTS[i] as usize] = m;
+                continue;
+            }
         }
         let hip = Vec3::from_array(rig.hip(i));
         // Outward is −Z for a left leg and +Z for a right one. Roll about
@@ -324,29 +361,9 @@ pub fn slot_transforms(rig: &QuadRig, posed: &[PosedBox], legs: &[LegAdjust; 4],
         }
     }
 
-    // Whole body: arch shears front up / hind down about the centre, then
-    // pitch/roll/drop. Applied to every slot, so the cat moves as one.
-    let arch = Mat4::from_cols(
-        Vec4::new(1.0, body.arch, 0.0, 0.0),
-        Vec4::Y,
-        Vec4::Z,
-        Vec4::W,
-    );
-    let pivot = Vec3::new(body.pivot[0], body.pivot[1], 0.0);
-    let whole = Mat4::from_translation(Vec3::new(0.0, -body.drop, body.sway) + pivot)
-        * rig_rotation([body.roll, body.pitch, body.yaw])
-        * Mat4::from_translation(-pivot)
-        * arch;
-
     let c = rig_to_model();
     let to_model = Mat4::from_translation(rig.body_centre) * c;
     let from_model = c.transpose() * Mat4::from_translation(-rig.body_centre);
-    // The twist splits the body along the spine (the rig X axis through the
-    // centre): front slots lead by half of it, hind slots lag by half. The
-    // torso is one mesh and takes neither, which is where a real cat's spine
-    // would be doing the work.
-    let half = |sign: f32| rig_rotation([-body.twist * 0.5 * sign, 0.0, 0.0]);
-    let (front, hind) = (half(1.0), half(-1.0));
     std::array::from_fn(|i| {
         let part = match slot_from_index(i) {
             Slot::Head | Slot::LegFL | Slot::LegFR => front,
@@ -355,6 +372,34 @@ pub fn slot_transforms(rig: &QuadRig, posed: &[PosedBox], legs: &[LegAdjust; 4],
         };
         to_model * whole * part * rig_space[i] * from_model
     })
+}
+
+/// The rest leg `i`, turned about its hip to point at `sole` and stretched
+/// or shortened to reach it. One bone, so the solve is exact: direction and
+/// length, nothing to iterate. `None` for a target that is not finite or is
+/// on the hip itself. Length is held to what a voxel leg can show
+/// (`0.3..=1.3` of rest), so an impossible target bends the leg toward it
+/// rather than tearing it off the body.
+pub fn plant_leg(rig: &QuadRig, i: usize, sole: Vec3) -> Option<Mat4> {
+    let p = rig.parts.get(i)?;
+    let hip = Vec3::from_array(rig.hip(i));
+    let rest_len = (p.half[1] * 2.0).max(1e-3);
+    let d = sole - hip;
+    let len = d.length();
+    if !(len.is_finite() && len > 1e-4) {
+        return None;
+    }
+    let rot = glam::Quat::from_rotation_arc(Vec3::NEG_Y, d / len);
+    let k = (len / rest_len).clamp(0.3, 1.3);
+    Some(Mat4::from_translation(hip) * Mat4::from_quat(rot) * Mat4::from_scale(Vec3::new(1.0, k, 1.0)) * Mat4::from_translation(-hip))
+}
+
+/// A world point in the rig frame [`LegAdjust::plant`] wants, given the
+/// model-to-world matrix the cat is drawn with.
+pub fn world_to_rig(rig: &QuadRig, model_to_world: Mat4, p: Vec3) -> [f32; 3] {
+    let c = rig_to_model();
+    let from_model = c.transpose() * Mat4::from_translation(-rig.body_centre);
+    (from_model * model_to_world.inverse()).transform_point3(p).to_array()
 }
 
 fn ratio(a: f32, b: f32) -> f32 {
@@ -453,6 +498,46 @@ mod tests {
         let z = Vec3::Z * 0.3;
         assert!(close(fl.transform_vector3(z), hr.transform_vector3(z)), "FL and HR swing together in a trot");
         assert!(!close(fl.transform_vector3(z), fr.transform_vector3(z)), "FL and FR must not");
+    }
+
+    /// A planted sole lands where it was told, in WORLD space, through the
+    /// whole chain the scene draws with: body pitch, roll, drop, twist, and
+    /// the model-to-world placement. A plant solved in the wrong frame is
+    /// right at rest and wrong the moment the body tilts, so it is checked
+    /// tilted.
+    #[test]
+    fn a_planted_sole_lands_on_its_world_target_under_a_tilted_body() {
+        let rig = cat();
+        let mut out = Vec::new();
+        pose(rig.parts(), rig.torso_half, &MotionInput { speed: 4.0, gait_phase: 0.7, ..Default::default() }, None, &mut out);
+        let body = BodyAdjust { drop: 0.12, pitch: 0.2, roll: -0.1, twist: 0.15, arch: 0.05, ..Default::default() };
+        let base = Mat4::from_translation(Vec3::new(10.0, 0.3, -4.0)) * Mat4::from_axis_angle(Vec3::Y, 0.6);
+        let c = rig_to_model();
+        let rest_sole = |i: usize| rig.body_centre + c.transform_vector3(Vec3::new(rig.hip(i)[0], rig.sole(i), rig.hip(i)[2]));
+        let mut legs = [LegAdjust::default(); 4];
+        let mut targets = [Vec3::ZERO; 4];
+        for i in 0..4 {
+            // Somewhere near where the paw is at rest, pushed forward a bit.
+            let w = base.transform_point3(rest_sole(i)) + Vec3::new(0.15, -0.05, 0.1);
+            targets[i] = w;
+            // The puppet ALSO computes a fold and pitch for a walking leg;
+            // a plant must win over them, not be applied beneath them.
+            legs[i] = LegAdjust { pitch: 0.3, fold: 0.2, splay: 0.1, plant: Some(world_to_rig(&rig, base, w)) };
+        }
+        let m = slot_transforms(&rig, &out, &legs, &body);
+        for i in 0..4 {
+            let got = base.transform_point3(m[LEG_SLOTS[i] as usize].transform_point3(rest_sole(i)));
+            assert!((got - targets[i]).length() < 1e-3, "leg {i}: sole at {got}, told {}", targets[i]);
+        }
+        // A plant beyond reach bends toward it and stays attached.
+        let far = base.transform_point3(rest_sole(0)) + Vec3::new(3.0, -2.0, 0.0);
+        let mut legs = [LegAdjust::default(); 4];
+        legs[0].plant = Some(world_to_rig(&rig, base, far));
+        let m = slot_transforms(&rig, &out, &legs, &BodyAdjust::default());
+        let hip_m = rig.body_centre + c.transform_vector3(Vec3::from_array(rig.hip(0)));
+        let moved_hip = (m[LEG_SLOTS[0] as usize].transform_point3(hip_m) - hip_m).length();
+        assert!(moved_hip < 1e-3, "the hip stays on the body: {moved_hip}");
+        assert!(m[LEG_SLOTS[0] as usize].is_finite());
     }
 
     #[test]

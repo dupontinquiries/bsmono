@@ -86,6 +86,9 @@ pub struct Crossing {
 /// Cached: `terrain_height` asks on every call, and that is the hottest
 /// function in world building.
 pub fn crossings() -> &'static [Crossing] {
+    if crate::map::active() != crate::map::MapId::Jungle {
+        return &[]; // the pass's streams are narrow enough to wade
+    }
     static CACHE: std::sync::OnceLock<Vec<Crossing>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| [(-1.0f32, Lane::Top), (1.0, Lane::Bot)].into_iter().filter_map(|(s, l)| find_crossing(s, l)).collect())
 }

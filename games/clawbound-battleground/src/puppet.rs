@@ -53,6 +53,11 @@ pub trait Probe {
     fn stem(&self, _x: f32, _z: f32, _within: f32) -> Option<(f32, f32)> {
         None
     }
+    /// Is there something solid at this point that no paw can stand in: a
+    /// trunk, a boulder's face. `footfall` steers landings off it.
+    fn solid(&self, _x: f32, _z: f32) -> bool {
+        false
+    }
 }
 
 /// Where a leap is in its arc, as the sim reports it.
@@ -134,6 +139,11 @@ pub struct PuppetPose {
     pub body: BodyAdjust,
     /// World Y added to the drawn cat (climbing over roots).
     pub lift: f32,
+    /// World-space sole positions from `footfall`, for the legs that are
+    /// walking (a leg an action has freed -- a swipe, a rear -- is `None`
+    /// and keeps its `legs` delta). `None` for all four in the air, on a
+    /// perch, or before the first grounded frame.
+    pub feet: [Option<Vec3>; 4],
 }
 
 /// How hard a moving cat shoulders what it passes, `0..=1`.
@@ -199,6 +209,10 @@ pub struct Puppet {
     /// separately is all it takes for the body to CURVE round it.
     give: [f32; 2],
     last_cover: f32,
+    /// Ground velocity, measured and smoothed like `speed`.
+    vel: Vec3,
+    /// Paw placement. See `footfall`.
+    pub feet: crate::footfall::Footfall,
 }
 
 impl Puppet {
@@ -227,6 +241,8 @@ impl Puppet {
             sneak: 0.0,
             give: [0.0; 2],
             last_cover: 0.0,
+            vel: Vec3::ZERO,
+            feet: crate::footfall::Footfall::new(),
         }
     }
 
@@ -273,6 +289,11 @@ impl Puppet {
         // A respawn teleports; that is not a 900 u/s sprint.
         let raw_speed = if raw_speed > 60.0 { 0.0 } else { raw_speed };
         self.speed += (raw_speed - self.speed) * (dt * 10.0).min(1.0);
+        let raw_vel = match self.last_pos {
+            Some(p) if raw_speed > 0.0 => Vec3::new(pos.x - p.x, 0.0, pos.z - p.z) / dt,
+            _ => Vec3::ZERO,
+        };
+        self.vel += (raw_vel - self.vel) * (dt * 10.0).min(1.0);
         let dyaw = wrap_pi(inp.yaw - self.last_yaw);
         self.turn += ((dyaw / dt / 6.0).clamp(-1.0, 1.0) - self.turn) * (dt * 8.0).min(1.0);
         self.last_pos = Some(pos);
@@ -336,6 +357,39 @@ impl Puppet {
         }
         let mean = self.foot_h.iter().sum::<f32>() * 0.25;
         self.rise += (mean - self.rise) * (dt * 9.0).min(1.0);
+
+        // ── where the paws go down ────────────────────────────────────
+        // Only on the ground. A leap, a fall, a dash or a perch lets go of
+        // every plant; the first grounded frame after stands where it is.
+        if grounded && inp.leap.is_none() {
+            use crate::anim::Gait;
+            let leg = (rig.hip(0)[1] - rig.sole(0)).max(0.05);
+            // The same table `pose` will hand the rig, so the paws lift in
+            // the pattern the body is moving to.
+            let moving = self.speed > 0.3;
+            let table = if self.crouch > 0.5 && moving && self.anim.gait() != Gait::Bound {
+                Gait::Pace.leg_phases()
+            } else if self.wet > 0.5 && moving {
+                Gait::Walk.leg_phases()
+            } else {
+                self.anim.gait().leg_phases()
+            };
+            let body = crate::footfall::Body {
+                hips: std::array::from_fn(|i| {
+                    let h = rig.hip(i);
+                    pos + fwd * h[0] + right * h[2]
+                }),
+                leg,
+                vel: self.vel,
+                gait_phase: self.anim.gait_phase,
+                offsets: table,
+                hz: self.anim.build.stride_hz(self.anim.smoothed_speed()),
+                lift: creature_rig::anim_rig::SWING_LIFT,
+            };
+            self.feet.advance(dt, &body, world);
+        } else {
+            self.feet.release();
+        }
 
         // ── foliage ───────────────────────────────────────────────────
         let cover = if grounded { finite_or(world.cover(pos.x, pos.z), 0.0).clamp(0.0, 1.0) } else { 0.0 };
@@ -695,7 +749,9 @@ impl Puppet {
         body.twist = finite_or(body.twist, 0.0).clamp(-1.6, 1.6);
         body.yaw = finite_or(body.yaw, 0.0).clamp(-0.7, 0.7);
         body.sway = finite_or(body.sway, 0.0).clamp(-MAX_SWAY, MAX_SWAY);
-        PuppetPose { motion: m, legs, body, lift: finite_or(lift, 0.0) }
+        let soles = self.feet.soles();
+        let feet = std::array::from_fn(|i| if planted[i] && !inp.perched && inp.leap.is_none() { soles[i].filter(|p| p.is_finite()) } else { None });
+        PuppetPose { motion: m, legs, body, lift: finite_or(lift, 0.0), feet }
     }
 }
 

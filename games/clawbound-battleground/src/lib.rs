@@ -16,6 +16,20 @@ pub mod voxel;
 pub mod models;
 pub mod props;
 pub mod blockers;
+/// The walkable floor of a map carved out of rock, as an exact SDF.
+pub mod floor;
+/// Which map this thread is playing; the free map functions dispatch on it.
+pub mod map;
+/// The match opening as a timeline: pan, lanes, spawns, versus card.
+pub mod intro;
+/// The intro's fanfare, synthesized brass.
+pub mod brass;
+/// Twinfang Pass: the mountain canyon map, 15 a side.
+pub mod pass;
+/// The pass's world: where its rocks, scrub, pines and waterfalls stand.
+pub mod passworld;
+/// Rough ground: what the jungle costs to cross, where blockers is what it forbids.
+pub mod going;
 /// The state behind the LAN screen (discovery is `netcode::lan`).
 pub mod lanlobby;
 /// Input-only lockstep: the rule that lets two machines play one match.
@@ -33,6 +47,8 @@ pub mod anim;
 pub mod rigged;
 /// What a cat's body does about roots, ferns, rivers, leaps and fights.
 pub mod puppet;
+/// Where each paw goes down, and keeping it there: stance locks, chosen landings.
+pub mod footfall;
 /// The aimed leap: onto rocks and logs, chained from perch to perch.
 pub mod leap;
 pub mod camps;
@@ -80,6 +96,8 @@ pub mod sim;
 pub mod systems;
 pub mod abilities;
 pub mod ai;
+/// A bot's last look at the ground: skirt small thickets, turn from walls.
+pub mod steer;
 pub mod vfx;
 /// Per-ancestor elemental motifs thrown on every cast.
 pub mod signature;
@@ -88,6 +106,10 @@ pub mod groundfx;
 pub mod render;
 pub mod scene;
 pub mod ui;
+/// The shop's decisions as data: offers, refusals, the clan theme, layout.
+pub mod shopview;
+/// The shop drawn: the Hoard, bark and vine over shopview.
+pub mod shopui;
 pub mod launch;
 pub mod app;
 pub mod headless;

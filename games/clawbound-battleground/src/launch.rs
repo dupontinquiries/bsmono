@@ -36,6 +36,9 @@ pub struct LaunchOptions {
     pub player_name: Option<String>,
     pub player_id: Option<String>,
     pub peer_id: Option<String>,
+    /// `--map <jungle|pass>` (or `CLAWBOUND_MAP`): which map to play. Chosen
+    /// at launch because the terrain mesh is built with the renderer.
+    pub map: crate::map::MapId,
 }
 
 impl LaunchOptions {
@@ -55,6 +58,11 @@ impl LaunchOptions {
                     o.ancestor = it.next();
                     o.quick_match = true;
                 }
+                "--map" => {
+                    if let Some(m) = it.next().as_deref().and_then(crate::map::MapId::from_key) {
+                        o.map = m;
+                    }
+                }
                 _ => {}
             }
         }
@@ -71,6 +79,9 @@ impl LaunchOptions {
             }
         }
         o.peer_id = env("BSGAMES_HANDOFF_PEER");
+        if let Some(m) = env("CLAWBOUND_MAP").as_deref().and_then(crate::map::MapId::from_key) {
+            o.map = m;
+        }
         // a handoff means "we were sent here to play": don't sit at the menu
         if o.handoff.is_some() {
             o.quick_match = true;

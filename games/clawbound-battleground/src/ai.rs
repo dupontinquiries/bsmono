@@ -300,6 +300,53 @@ pub fn think(game: &mut Game, gi: usize) {
         move_dir = Vec3::new(g.pos.x - enemy_f.x, 0.0, g.pos.z - enemy_f.z).normalize_or_zero();
     }
 
+    // Route: on a map carved out of rock, the straight line to a far target
+    // runs through a cliff and the way there may start by walking AWAY from
+    // it (out of a clearing, back along a ledge). The floor plan is a graph
+    // of its shapes; head for the first portal on the route. Not in a
+    // fight -- strafing is meant to be local.
+    let move_dir = match crate::map::floor() {
+        Some(f) if move_dir.length_squared() > 1e-6 && !matches!(game.gods[gi].ai.as_ref().map(|b| b.state), Some(AiState::Fight)) => {
+            let pos = game.gods[gi].pos;
+            if game.steer_mem.len() <= gi {
+                game.steer_mem.resize(gi + 1, Default::default());
+            }
+            let now = game.t;
+            let m = &game.steer_mem[gi];
+            let reached = m.route_wp.is_some_and(|w| Vec3::new(w.x - pos.x, 0.0, w.z - pos.z).length() < 1.5);
+            if !(now - m.route_t < crate::steer::ROUTE_EVERY) || reached {
+                let tgt = game.ai_move_target(gi);
+                let wp = f.next_waypoint(pos, tgt, 0.5);
+                let m = &mut game.steer_mem[gi];
+                m.route_wp = wp;
+                m.route_t = now;
+            }
+            match game.steer_mem[gi].route_wp {
+                Some(wp) => Vec3::new(wp.x - pos.x, 0.0, wp.z - pos.z).normalize_or_zero() * move_dir.length(),
+                None => move_dir,
+            }
+        }
+        _ => move_dir,
+    };
+
+    // Steer: skirt rough ground a sidestep avoids, turn from walls rather
+    // than sliding into them. The brain above says where; this says which
+    // way round.
+    let move_dir = {
+        let g = &game.gods[gi];
+        let who = crate::going::Carriage { stalking: game.stalking(gi) };
+        if game.steer_mem.len() <= gi {
+            game.steer_mem.resize(gi + 1, Default::default());
+        }
+        let blockers = game.blockers.clone();
+        let (pos, prev, now) = (g.pos, g.move_dir, game.t);
+        let may_plan = game.plans_this_tick < crate::steer::PLANS_PER_TICK;
+        let before = game.steer_mem[gi].plans;
+        let d = crate::steer::steer_with(&blockers, pos, move_dir, prev, crate::consts::GOD_RADIUS, who, &mut game.steer_mem[gi], now, may_plan);
+        game.plans_this_tick += game.steer_mem[gi].plans - before;
+        d
+    };
+
     // write back
     {
         let g = &mut game.gods[gi];
