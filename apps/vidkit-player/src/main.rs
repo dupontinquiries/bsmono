@@ -173,6 +173,9 @@ struct Player {
     seen_hits: Vec<seen::SeenHit>,
     /// Sound only, by choice (the palette's "Listen only").
     listen_only: bool,
+    /// Software presenter budget chosen in the palette; None follows the
+    /// power policy (or VIDKIT_SW_BUDGET).
+    sw_budget_user: Option<f32>,
     /// What background work the power supply allows, and when it was read.
     energy: power::EnergyPolicy,
     energy_read: Option<Instant>,
@@ -378,6 +381,7 @@ impl Player {
             seen_query: String::new(),
             seen_hits: Vec::new(),
             listen_only: false,
+            sw_budget_user: None,
             energy: power::policy(power::current()),
             energy_read: None,
             power_state: power::current(),
@@ -872,6 +876,11 @@ impl Player {
             C::PlayClipboard => self.play_clipboard(),
             C::Subtitles => self.subtitles = !self.subtitles,
             C::ListenOnly => self.listen_only = !self.listen_only,
+            C::SwFull | C::SwBalanced | C::SwSaver | C::SwMinimum | C::SwFollowPower => {
+                if let vidkit_egui::Action::SetSwBudget(b) = c.action() {
+                    self.set_sw_budget(if b.is_nan() { None } else { Some(b) });
+                }
+            }
             C::ScrubToSections => self.sections_open = !self.sections_open,
             // The same 5% steps the gestures and the bar use, so the three
             // controls cannot land on different values.
@@ -975,10 +984,34 @@ impl Player {
             self.seen_hits.clear();
         }
         let matches = if seen_only { Vec::new() } else { self.palette.matches() };
-        let mut rows: Vec<uikit_egui::command_bar::Row> = matches
-            .iter()
-            .map(|c| uikit_egui::command_bar::Row::new(c.label(), c.shortcut().unwrap_or("")))
-            .collect();
+        // "budget 30%" typed: a live row at the top that sets exactly that.
+        let typed_budget = if seen_only { None } else { palette::parse_budget(&query) };
+        let mut rows: Vec<uikit_egui::command_bar::Row> = Vec::new();
+        if let Some(b) = typed_budget {
+            rows.push(uikit_egui::command_bar::Row::new(
+                format!("Software budget: {:.0}% of a frame", b * 100.0),
+                self.sw_budget_note(),
+            ));
+        }
+        let head = rows.len();
+        rows.extend(matches.iter().map(|c| {
+            let detail = match c.action() {
+                vidkit_egui::Action::SetSwBudget(b) => {
+                    let current = match (b.is_nan(), self.sw_budget_user) {
+                        (true, None) => true,
+                        (false, Some(u)) => (u - b).abs() < 1e-3,
+                        _ => false,
+                    };
+                    let mark = if current { "● current" } else { "" };
+                    match self.gpu.is_some() {
+                        true => format!("{mark} (GPU presenter: no effect)").trim().to_string(),
+                        false => mark.to_string(),
+                    }
+                }
+                _ => c.shortcut().unwrap_or("").to_string(),
+            };
+            uikit_egui::command_bar::Row::new(c.label(), detail)
+        }));
         rows.extend(self.seen_hits.iter().map(|h| {
             uikit_egui::command_bar::Row::new(
                 format!("“{}…” — {}", h.snippet.trim(), h.title),
@@ -997,10 +1030,13 @@ impl Player {
             |_| {},
         );
         if let Some(i) = out.chosen {
-            if let Some(c) = matches.get(i).copied() {
+            if let (Some(b), 0) = (typed_budget, i) {
+                self.palette.close();
+                self.set_sw_budget(Some(b));
+            } else if let Some(c) = matches.get(i - head).copied() {
                 self.palette.close();
                 self.run(c);
-            } else if let Some(h) = self.seen_hits.get(i - matches.len()).cloned() {
+            } else if let Some(h) = self.seen_hits.get(i - head - matches.len()).cloned() {
                 self.palette.close();
                 self.open_seen(&h.url, h.at);
             }
@@ -2137,7 +2173,7 @@ impl Player {
         }
         let enhance_changed = p.enhance != self.energy.enhance;
         self.energy = p;
-        self.presenter.damage_budget = sw_budget_override().unwrap_or(p.sw_budget);
+        self.presenter.damage_budget = self.effective_sw_budget();
         self.apply_transcribe_policy();
         if enhance_changed {
             // Recompute the plan at the next paint under the new allowance.
@@ -2198,5 +2234,31 @@ impl Player {
         let pw = self.power_state;
         p.acc.power = if pw.on_battery { format!("battery{}", pw.percent.map(|x| format!("@{x}")).unwrap_or_default()) } else { "mains".into() };
         p.frame(shown, dropped, uploaded);
+    }
+}
+
+impl Player {
+    /// Palette choice, then VIDKIT_SW_BUDGET, then the power policy.
+    fn effective_sw_budget(&self) -> f32 {
+        self.sw_budget_user.or_else(sw_budget_override).unwrap_or(self.energy.sw_budget)
+    }
+
+    fn set_sw_budget(&mut self, b: Option<f32>) {
+        self.sw_budget_user = b.map(|b| b.clamp(0.01, 1.0));
+        self.presenter.damage_budget = self.effective_sw_budget();
+        let what = match self.sw_budget_user {
+            Some(b) => format!("software budget {:.0}% of a frame", b * 100.0),
+            None => format!("software budget follows power ({:.0}% now)", self.effective_sw_budget() * 100.0),
+        };
+        self.gpu_error = Some(if self.gpu.is_some() {
+            format!("{what} -- takes effect on the software presenter (VIDKIT_GPU=0); the GPU path is unaffected")
+        } else {
+            what
+        });
+    }
+
+    fn sw_budget_note(&self) -> String {
+        let now = format!("now {:.0}%", self.effective_sw_budget() * 100.0);
+        if self.gpu.is_some() { format!("{now} · GPU presenter: no effect") } else { now }
     }
 }

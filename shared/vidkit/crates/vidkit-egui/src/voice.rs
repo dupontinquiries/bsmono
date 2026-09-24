@@ -42,6 +42,8 @@ mod ev {
     pub const RESET: &str = "reset_view";
     pub const SUBTITLES: &str = "subtitles";
     pub const LISTEN: &str = "listen_only";
+    pub const QUALITY_FULL: &str = "quality_full";
+    pub const SAVER: &str = "battery_saver";
     pub const SETTINGS: &str = "settings";
     pub const QUIT: &str = "quit";
     pub const BACK: &str = "back";
@@ -69,6 +71,9 @@ pub fn phrases() -> Vec<(&'static str, &'static str)> {
         (ev::LISTEN, "listen only"),
         (ev::LISTEN, "audio only"),
         (ev::LISTEN, "turn off the video"),
+        (ev::QUALITY_FULL, "full quality"),
+        (ev::SAVER, "battery saver"),
+        (ev::SAVER, "save battery"),
         (ev::SUBTITLES, "captions"),
         (ev::SETTINGS, "settings"),
         (ev::QUIT, "quit"),
@@ -155,6 +160,8 @@ pub fn route(event_type: &str, slots: &[String]) -> Command {
         ev::RESET => Command::Do(Action::ResetView),
         ev::SUBTITLES => Command::Do(Action::ToggleSubtitles),
         ev::LISTEN => Command::Do(Action::ToggleListenOnly),
+        ev::QUALITY_FULL => Command::Do(Action::SetSwBudget(1.0)),
+        ev::SAVER => Command::Do(Action::SetSwBudget(0.25)),
         ev::SETTINGS => Command::Do(Action::OpenSettings),
         ev::QUIT => Command::Do(Action::Quit),
         ev::OPEN_CLIP => Command::Do(Action::PlayClipboard),
@@ -225,6 +232,8 @@ mod tests {
             ("rotate", Action::Rotate),
             ("subtitles", Action::ToggleSubtitles),
             ("audio only", Action::ToggleListenOnly),
+            ("battery saver", Action::SetSwBudget(0.25)),
+            ("full quality", Action::SetSwBudget(1.0)),
             ("settings", Action::OpenSettings),
             ("reset the view", Action::ResetView),
         ] {
