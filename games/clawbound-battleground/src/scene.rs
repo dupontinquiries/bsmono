@@ -1300,6 +1300,17 @@ mod plan_tests {
         assert_eq!(a.mesh(0.5, true).inst.len(), 125, "nothing behind a translucent voxel is culled");
     }
 
+    /// Twinfang Pass within its budget. The crags first came to 1.07M
+    /// instances; wider spacing and coarse (1.2 u) voxels for the high and
+    /// plateau ones brought them to ~375k with the same silhouette.
+    #[test]
+    fn the_pass_uploads_within_its_budget() {
+        let hull: usize = crate::map::with(crate::map::MapId::Pass, || build_world().0.iter().map(|p| p.0.inst.len()).sum());
+        println!("pass static world: {hull} instances");
+        assert!(hull > 150_000, "{hull}: where did the crags go?");
+        assert!(hull < 450_000, "{hull}: over the pass's budget");
+    }
+
     /// The lanes are the fast ground and stay that way: no rough patch, no
     /// grove, no bramble anywhere on a lane's walk. Minions path by
     /// waypoint and never steer, so this is also what keeps waves on time.
