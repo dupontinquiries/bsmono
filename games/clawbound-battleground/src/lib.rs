@@ -35,6 +35,8 @@ pub mod anim;
 pub mod rigged;
 /// What a cat's body does about roots, ferns, rivers, leaps and fights.
 pub mod puppet;
+/// Where each paw goes down, and keeping it there: stance locks, chosen landings.
+pub mod footfall;
 /// The aimed leap: onto rocks and logs, chained from perch to perch.
 pub mod leap;
 pub mod camps;

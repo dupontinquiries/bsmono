@@ -111,6 +111,9 @@ impl Probe for WorldProbe<'_> {
     fn stem(&self, x: f32, z: f32, within: f32) -> Option<(f32, f32)> {
         self.blockers.nearest_stem(x, z, within)
     }
+    fn solid(&self, x: f32, z: f32) -> bool {
+        self.blockers.blocked(x, z, 0.05)
+    }
 }
 
 fn solid_tint(c: [f32; 3]) -> [f32; 4] {
@@ -489,8 +492,6 @@ impl Scene {
             puppet.advance(dt, &inp, rig, &world, &mut pevents);
             let pose = puppet.pose(&inp, rig);
             creature_rig::pose(rig.parts(), rig.torso_half, &pose.motion, None, &mut posed);
-            let mats = slot_transforms(rig, &posed, &pose.legs, &pose.body);
-
             // wading: sink toward the bed (capped so the head stays clear)
             let sink = consts::water_depth(g.pos.x, g.pos.z).min(0.9);
             // Model faces +Z; glam's rotation_y(t) sends +Z to (sin t, 0,
@@ -499,6 +500,14 @@ impl Scene {
             // on the north-south lanes, backwards on any east-west run.
             let base = Mat4::from_translation(g.pos + Vec3::Y * (pose.lift - sink))
                 * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - g.yaw);
+            // Planted paws (`footfall`): world soles into the rig frame. The
+            // sim's floor is y = 0 through the river too and the drawn cat
+            // is sunk, so the soles sink with it.
+            let mut legs = pose.legs;
+            for (l, f) in legs.iter_mut().zip(pose.feet) {
+                l.plant = f.map(|p| crate::rigged::world_to_rig(rig, base, p - Vec3::Y * sink));
+            }
+            let mats = slot_transforms(rig, &posed, &legs, &pose.body);
             for (s, m) in mats.iter().enumerate() {
                 r.queue_draw(self.god_parts[di][ti][s], base * *m, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
             }
