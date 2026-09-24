@@ -1,7 +1,7 @@
 # tools
 
 Standalone helper binaries used across the monorepo: `astfind`, `drift`,
-`health`, `kbm3`, `kitfinder`, `peek`, `rustcheck`, `sanity`.
+`health`, `kbm3`, `kitfinder`, `peek`, `rustcheck`, `sanity`, `typein`.
 
 ## `cargo-ailite` is NOT here
 
