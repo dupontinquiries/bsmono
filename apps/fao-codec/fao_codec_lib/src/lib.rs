@@ -4065,8 +4065,14 @@ pub fn read_fao_header(data: &[u8]) -> Option<FaoFileHeader> {
 pub fn read_fao_index(data: &[u8], frame_count: usize) -> Vec<FaoFrameEntry> {
     let hdr_sz = 30usize;  // 4+2+2+2+2+2+4+2+1+1+8 = 30 bytes
     let entry_sz = std::mem::size_of::<FaoFrameEntry>();
-    let mut entries = Vec::with_capacity(frame_count);
-    for i in 0..frame_count {
+    // `frame_count` comes from the file's header. Reserve only what the file's bytes can hold:
+    // a damaged or hostile header asked for 68 GB here and the allocator aborted the process
+    // (found by fao-codec-egui's damaged-file test) -- an abort, not a panic, so the Player
+    // vanished instead of saying the file was bad.
+    let fits = data.len().saturating_sub(hdr_sz) / entry_sz.max(1);
+    let n = frame_count.min(fits);
+    let mut entries = Vec::with_capacity(n);
+    for i in 0..n {
         let off = hdr_sz + i * entry_sz;
         if off + entry_sz > data.len() { break; }
         let entry: FaoFrameEntry = unsafe { std::ptr::read_unaligned(data[off..].as_ptr() as *const FaoFrameEntry) };
@@ -4079,7 +4085,10 @@ pub fn read_fao_index(data: &[u8], frame_count: usize) -> Vec<FaoFrameEntry> {
 pub fn read_fao_frame(data: &[u8], entry: &FaoFrameEntry) -> Option<(Vec<u8>, FaoFrameHeader)> {
     let fhdr_sz = 13usize;
     let off = entry.offset as usize;
-    if off + fhdr_sz > data.len() { return None; }
+    // checked_add: `offset` and `compressed_size` come from the file, and on a 32-bit target
+    // (armv7: reMarkable 1/2) usize is 32 bits, so a large value could wrap past the bounds
+    // check and then fail the slice.
+    if off.checked_add(fhdr_sz).is_none_or(|e| e > data.len()) { return None; }
     let d = &data[off..];
     let fhdr = FaoFrameHeader {
         frame_type: d[0],
@@ -4087,12 +4096,16 @@ pub fn read_fao_frame(data: &[u8], entry: &FaoFrameEntry) -> Option<(Vec<u8>, Fa
         recon_size: u32::from_le_bytes([d[5],d[6],d[7],d[8]]),
         psnr_x10: u16::from_le_bytes([d[9],d[10]]),
         skip_pct: d[11],
-        gmx: d[12] as i8, gmy: if off+13 <= data.len() { d[13] as i8 } else { 0 } };
+        // d[13] is past the 13-byte header (the payload's first byte; see write_fao_container's
+        // note on the old 14th byte). The guard was `off+13 <= len`, which admits d.len() == 13
+        // and then indexed d[13]: a file cut right after a frame header panicked (found by
+        // fao-codec-egui's damaged-file test). `get` keeps the value, minus the panic.
+        gmx: d[12] as i8, gmy: d.get(13).map(|b| *b as i8).unwrap_or(0) };
     let payload_off = off + fhdr_sz;
     let compressed_sz = fhdr.compressed_size as usize;
     let decompressed_sz = fhdr.recon_size as usize;
-    if payload_off + compressed_sz > data.len() { return None; }
-    let payload = &data[payload_off..payload_off + compressed_sz];
+    let Some(payload_end) = payload_off.checked_add(compressed_sz).filter(|e| *e <= data.len()) else { return None };
+    let payload = &data[payload_off..payload_end];
     
     // Return raw payload — caller detects format ('P', 'D', or zstd) and decodes
     let pixels = payload.to_vec();
