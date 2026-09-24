@@ -34,6 +34,7 @@ layer = ["wayland", "dep:wayland-client", "dep:wayland-protocols-wlr", "dep:wayl
 
 [dependencies]
 tideshell-core = { path = "../crates/tideshell-core" }
+speaker-pose = { path = "../../../shared/speaker-pose" }
 hatch-core = { path = "../../hatch/crates/hatch-core" }
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 settings-kit = { path = "../../../shared/settings-kit" }

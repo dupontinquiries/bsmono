@@ -54,6 +54,11 @@ struct Shellbox {
     mic: Option<tideshell_egui::sensors::MicFeed>,
     camera: Option<tideshell_egui::camera::ChildSource>,
     cam_duty: tideshell_egui::camera::DutyCycle,
+    /// The speakers follow the screen: the same transform that rotates the
+    /// display decides which driver is on the listener's left.
+    pose: speaker_pose::Mix,
+    /// The matrix last pushed to PipeWire, so nothing is sent per frame.
+    last_pose: Option<speaker_pose::Matrix>,
     /// The rear camera's libcamera id, found once at startup.
     rear_camera: Option<String>,
     /// The last colour grid, for deciding whether the room changed.
@@ -300,6 +305,29 @@ fn print_new_trace(shell: &Shell, printed: &mut Vec<String>) {
     }
 }
 
+/// A display transform in degrees, as the shell emits it, to the screen
+/// orientation the speakers care about.
+fn transform_of(deg: u32) -> speaker_pose::Transform {
+    match deg % 360 {
+        90 => speaker_pose::Transform::Rotate90,
+        180 => speaker_pose::Transform::Rotate180,
+        270 => speaker_pose::Transform::Rotate270,
+        _ => speaker_pose::Transform::Normal,
+    }
+}
+
+/// Is this matrix audibly different from the last one sent? A crossfade
+/// produces a new matrix every frame; only steps worth a round trip to
+/// PipeWire are pushed.
+fn pose_differs(a: &speaker_pose::Matrix, b: &speaker_pose::Matrix) -> bool {
+    const EPS: f32 = 0.01;
+    (a.top.from_left - b.top.from_left).abs() > EPS
+        || (a.top.from_right - b.top.from_right).abs() > EPS
+        || (a.bottom.from_left - b.bottom.from_left).abs() > EPS
+        || (a.bottom.from_right - b.bottom.from_right).abs() > EPS
+        || a.mono != b.mono
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     // `tideshell ctl <command>`: a client, for cosmic-comp's key bindings.
@@ -465,6 +493,8 @@ fn main() {
         mic: None,
         camera: None,
         cam_duty: tideshell_egui::camera::DutyCycle::new(tideshell_egui::camera::Duty::default()),
+        pose: speaker_pose::Mix::new(speaker_pose::Transform::Normal, speaker_pose::Tuning::default()),
+        last_pose: None,
         rear_camera: tideshell_egui::camera::pick_rear(&cam_list),
         last_glass: None,
         prev_frame: None,
@@ -552,6 +582,7 @@ fn main() {
     let mut side_pos: HashMap<(Role, i32), Pos2> = HashMap::new();
 
     let t0 = Instant::now();
+
     let mut overlay_events: Vec<egui::Event> = Vec::new();
     let mut contact_pos: HashMap<i32, Pos2> = HashMap::new();
     let mut last_region: Option<Option<Vec<Rect>>> = None;
@@ -716,7 +747,26 @@ fn main() {
         let readings: Vec<String> = sb.orientation.rx.try_iter().collect();
         for o in readings {
             let out = sb.shell.on_orientation(&o, now_ms);
+            // The speakers turn with the screen. Told from the same rotation
+            // rather than from a sensor of its own, so the audio can never
+            // disagree with what the user is looking at.
+            for a in &out {
+                if let Action::Rotate(deg) = a {
+                    sb.pose.observe(transform_of(*deg), now_ms);
+                }
+            }
             sb.execute(out);
+        }
+        // Crossfade the speaker matrix. Only pushed when it actually moves:
+        // a Props message per frame would be absurd, and the fade is over in
+        // a few hundred ms.
+        {
+            let m = sb.pose.tick(now_ms);
+            if sb.last_pose.map(|p| pose_differs(&p, &m)).unwrap_or(true) {
+                sb.last_pose = Some(m);
+                let out = tideshell_egui::effects::apply_speaker_pose(&m, speaker_pose::Tuning::default().crossover_hz);
+                sb.shell.note(format!("{out:?}"));
+            }
         }
         if let Some(screen) = io.screen() {
             if screen != sb.shell.screen {

@@ -422,6 +422,53 @@ pub fn apply_voicing(tone: f32) -> Outcome {
     }
 }
 
+/// Point the speaker chain's matrix at the screen's current orientation.
+///
+/// The same rotation that turns the display moves the audio, because what
+/// matters is where the listener thinks left is — and on this phone the two
+/// speakers are a top earpiece and a bottom main driver, so upright they are
+/// not a stereo pair at all and the right answer is mono into both with the
+/// bass going where bass can be made (speaker_pose::matrix_for).
+///
+/// Sent as one Props message: two gains per mixer, plus the earpiece's
+/// high-pass corner, so a rotation cannot be seen half-applied.
+pub fn apply_speaker_pose(m: &speaker_pose::Matrix, crossover_hz: f32) -> Outcome {
+    let listing = match Command::new("pw-cli").args(["ls", "Node"]).stdin(Stdio::null()).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => return Outcome::Failed(format!("pw-cli ls: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => return Outcome::Failed(format!("pw-cli: {e}")),
+    };
+    let Some(id) = parse_node_id(&listing, tideshell_core::audio::SPEAKER_SINK) else {
+        return Outcome::Unwired("speaker chain not running (set the warmth slider once to install it)");
+    };
+    let props = speaker_pose_props(m, crossover_hz);
+    match Command::new("pw-cli").args(["set-param", &id.to_string(), "Props", &props]).stdin(Stdio::null()).output() {
+        Ok(o) if o.status.success() => Outcome::Done(format!(
+            "speakers: {} (top {:.2}/{:.2}, bottom {:.2}/{:.2})",
+            if m.mono { "mono, bass to the main driver" } else { "stereo" },
+            m.top.from_left, m.top.from_right, m.bottom.from_left, m.bottom.from_right
+        )),
+        Ok(o) => Outcome::Failed(format!("pw-cli set-param: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => Outcome::Failed(format!("pw-cli: {e}")),
+    }
+}
+
+/// The Props text for a routing matrix. Gains carry the per-speaker trim,
+/// since the mixer is the only place in the graph with a level control.
+pub fn speaker_pose_props(m: &speaker_pose::Matrix, crossover_hz: f32) -> String {
+    let items: Vec<(String, f32)> = vec![
+        ("mixTop:Gain 1".into(), m.top.from_left * m.top.gain),
+        ("mixTop:Gain 2".into(), m.top.from_right * m.top.gain),
+        ("mixBot:Gain 1".into(), m.bottom.from_left * m.bottom.gain),
+        ("mixBot:Gain 2".into(), m.bottom.from_right * m.bottom.gain),
+        // The high-pass follows the SPEAKER, so it stays on the earpiece in
+        // every orientation; only its corner is configurable.
+        ("hpTop:Freq".into(), if m.top.high_pass_hz > 0.0 { m.top.high_pass_hz } else { crossover_hz }),
+    ];
+    let body: Vec<String> = items.iter().map(|(k, v)| format!("\"{k}\" {v:.4}")).collect();
+    format!("{{ params = [ {} ] }}", body.join(" "))
+}
+
 /// Where the speaker chain's config lives.
 pub fn speaker_config_path() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
