@@ -260,3 +260,92 @@ mod tests {
         assert!(!c.is_active());
     }
 }
+
+// ── the bumper in sidebar mode ──────────────────────────────────────────────
+//
+// With the pull-down layout, stepping the carousel is a full-height peek
+// strip down the screen's edge: a wide target that also shows the
+// neighbouring window. On the right-hand bar that strip cannot exist — the
+// bar is already there and already narrow — so the step control becomes a
+// BUTTON inside the bar instead.
+//
+// It is vertically centred because that is the one place a thumb reaches
+// without regripping, whatever the size of the hand or the phone. And it
+// reserves its own space rather than floating over the bar's other widgets:
+// a control that overlaps what it sits on is a control people press by
+// accident.
+
+/// How tall the bumper button is, as a fraction of the bar. Enough to be a
+/// comfortable target, small enough to leave the bar useful.
+pub const BUMPER_FRAC: f32 = 0.18;
+/// It never shrinks below this many logical pixels, however short the bar.
+pub const BUMPER_MIN_PX: f32 = 56.0;
+
+/// Where the bumper sits in a bar of `bar_h` logical pixels starting at
+/// `bar_top`, and what is left for everything else.
+///
+/// Returns `(bumper_top, bumper_h, above_h, below_h)`: the widgets above and
+/// below get the remaining halves, so the bar's own content is laid out
+/// around the button rather than under it.
+pub fn bumper_slot(bar_top: f32, bar_h: f32) -> (f32, f32, f32, f32) {
+    let h = (bar_h * BUMPER_FRAC).max(BUMPER_MIN_PX).min(bar_h);
+    let top = bar_top + (bar_h - h) / 2.0;
+    let above = (top - bar_top).max(0.0);
+    let below = (bar_top + bar_h - (top + h)).max(0.0);
+    (top, h, above, below)
+}
+
+/// Is `y` inside the bumper, for hit testing?
+pub fn bumper_hit(y: f32, bar_top: f32, bar_h: f32) -> bool {
+    let (top, h, _, _) = bumper_slot(bar_top, bar_h);
+    y >= top && y < top + h
+}
+
+#[cfg(test)]
+mod bumper_tests {
+    use super::*;
+
+    #[test]
+    fn the_bumper_is_centred_whatever_the_bar() {
+        for bar_h in [200.0f32, 640.0, 1200.0, 2400.0] {
+            let (top, h, above, below) = bumper_slot(0.0, bar_h);
+            assert!((above - below).abs() < 1e-3, "off centre at {bar_h}: {above} vs {below}");
+            assert!((top + h / 2.0 - bar_h / 2.0).abs() < 1e-3, "the middle is where a thumb reaches");
+        }
+        // An offset bar is centred on itself, not on the screen.
+        let (top, h, _, _) = bumper_slot(100.0, 400.0);
+        assert!((top + h / 2.0 - 300.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn it_makes_space_rather_than_floating_over_the_bar() {
+        let (top, h, above, below) = bumper_slot(0.0, 1000.0);
+        assert!((above + h + below - 1000.0).abs() < 1e-3, "the three regions tile the bar exactly");
+        assert!(above > 0.0 && below > 0.0, "and the bar keeps room on both sides");
+        assert_eq!(top, above);
+    }
+
+    #[test]
+    fn a_short_bar_keeps_a_pressable_target() {
+        // 18% of a short bar would be a sliver; the floor wins, and the
+        // button still fits.
+        let (_, h, above, below) = bumper_slot(0.0, 200.0);
+        assert_eq!(h, BUMPER_MIN_PX);
+        assert!(above >= 0.0 && below >= 0.0);
+        // Absurdly short: the bumper takes what there is rather than
+        // overflowing the bar.
+        let (top, h, above, below) = bumper_slot(0.0, 40.0);
+        assert_eq!(h, 40.0);
+        assert_eq!((top, above, below), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn hit_testing_agrees_with_the_layout() {
+        let (top, h, _, _) = bumper_slot(0.0, 1000.0);
+        assert!(bumper_hit(top + h / 2.0, 0.0, 1000.0));
+        assert!(bumper_hit(top, 0.0, 1000.0), "the top edge belongs to the button");
+        assert!(!bumper_hit(top + h, 0.0, 1000.0), "and the bottom edge to what follows");
+        assert!(!bumper_hit(top - 1.0, 0.0, 1000.0));
+        assert!(!bumper_hit(0.0, 0.0, 1000.0));
+    }
+}

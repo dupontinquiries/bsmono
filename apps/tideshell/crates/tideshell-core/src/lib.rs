@@ -50,6 +50,7 @@ pub mod touchfilter;
 pub mod track;
 pub mod trackpad;
 pub mod voice;
+pub mod volkeys;
 pub mod world;
 
 pub use shell::Shell;
