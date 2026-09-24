@@ -49,6 +49,10 @@ pub struct Scene {
     pub titan_weapon: [u64; 2],
     pub chunks: Vec<PropChunk>,
     pub caves: Vec<CaveDraw>,
+    /// The map this scene was built for, and the first mesh id it uploaded
+    /// (`Renderer::free_meshes_from` gives its meshes back on a switch).
+    pub map: crate::map::MapId,
+    pub first_mesh: u64,
     pub gate: [u64; 2],
     pub fountain: [u64; 2],
     pub pedestal: [u64; 2],
@@ -167,6 +171,7 @@ fn alpha_tint(c: [f32; 3], a: f32) -> [f32; 4] {
 
 impl Scene {
     pub fn new(r: &mut Renderer) -> Scene {
+        let first_mesh = r.mesh_mark();
         let mut total = 0usize;
 
         let mut god_body = [[0u64; 2]; ROSTER_LEN];
@@ -311,6 +316,8 @@ impl Scene {
             titan_weapon,
             chunks,
             caves,
+            map: crate::map::active(),
+            first_mesh,
             gate,
             fountain,
             pedestal,
@@ -1238,7 +1245,13 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
 /// Batch placed pieces into spatial chunks per voxel-size class: what the
 /// renderer uploads. Shared by every map's world builder.
 fn batch(pieces: Vec<Piece>, blockers: Blockers) -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
-    let mut cells: std::collections::HashMap<(i32, i32, u32), Vec<&Piece>> = std::collections::HashMap::new();
+    // Ordered, not hashed: a HashMap iterates in a fresh random order per
+    // build, so chunks came out -- and drew -- in a different order every
+    // time the world was built, and z-fighting between coplanar voxels
+    // resolved differently. Found by the map switch's round trip (a rebuilt
+    // jungle differed from the first by 65 pixels; a re-render without a
+    // rebuild by 0).
+    let mut cells: std::collections::BTreeMap<(i32, i32, u32), Vec<&Piece>> = std::collections::BTreeMap::new();
     for p in &pieces {
         let cls = if p.vsize == V_SM {
             0u32
@@ -1412,6 +1425,18 @@ mod plan_tests {
         assert_eq!(chunk_choice(&coarse, at(300.0)), Some((1, 1.2)));
     }
 
+    /// Building a world twice gives the same chunks in the same order: draw
+    /// order decides z-fighting, and a HashMap-ordered build drew a rebuilt
+    /// map differently from the first build (the map switch's round trip).
+    #[test]
+    fn a_world_builds_the_same_every_time() {
+        let key = |w: &(Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers)| -> Vec<(Vec3, usize, u32)> {
+            w.0.iter().map(|(m, c, _, v)| (*c, m.inst.len(), (*v * 100.0) as u32)).collect()
+        };
+        let (a, b) = (build_world(), build_world());
+        assert_eq!(key(&a), key(&b));
+    }
+
     /// Twinfang Pass within its budget. The crags first came to 1.07M
     /// instances; wider spacing and coarse (1.2 u) voxels for the high and
     /// plateau ones brought them to ~375k with the same silhouette.
@@ -1483,4 +1508,24 @@ mod plan_tests {
         let (_, _, b) = build_world();
         println!("{}", plan(&b, 62.0, 2.0));
     }
+}
+
+/// Put the world on map `m`: the active map (thread-local), the renderer's
+/// terrain/water/flood meshes, and a scene built for it -- the old scene's
+/// GPU meshes freed first. Returns the scene to use (the old one untouched
+/// when everything is already on `m`). The app's map switch and the
+/// headless switch check both run this.
+pub fn switch_world(r: &mut Renderer, old: Option<Scene>, m: crate::map::MapId) -> Scene {
+    if let Some(sc) = old {
+        if crate::map::active() == m && r.world_map == m && sc.map == m {
+            return sc;
+        }
+        crate::map::set_active(m);
+        r.rebuild_world_geometry();
+        r.free_meshes_from(sc.first_mesh);
+    } else {
+        crate::map::set_active(m);
+        r.rebuild_world_geometry();
+    }
+    Scene::new(r)
 }

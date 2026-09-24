@@ -102,7 +102,65 @@ pub struct FrameStats {
     pub shadow_instances: u64,
 }
 
+/// The per-map meshes the renderer owns directly: terrain, water, the flood
+/// plane. Built for the active map (`map::active`), rebuilt on a switch.
+struct WorldGeometry {
+    terrain_vbuf: wgpu::Buffer,
+    terrain_ibuf: wgpu::Buffer,
+    terrain_count: u32,
+    water_vbuf: wgpu::Buffer,
+    water_ibuf: wgpu::Buffer,
+    water_count: u32,
+    flood_vbuf: wgpu::Buffer,
+    flood_ibuf: wgpu::Buffer,
+    flood_count: u32,
+}
+
+impl WorldGeometry {
+    fn build(device: &wgpu::Device) -> WorldGeometry {
+        let (tv, ti) = build_terrain();
+        let terrain_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain vbuf"),
+            contents: bytemuck::cast_slice(&tv),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let terrain_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain ibuf"),
+            contents: bytemuck::cast_slice(&ti),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let terrain_count = ti.len() as u32;
+        let (wv, wi) = build_water();
+        let water_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("water vbuf"),
+            contents: bytemuck::cast_slice(&wv),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let water_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("water ibuf"),
+            contents: bytemuck::cast_slice(&wi),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let water_count = wi.len() as u32;
+        let (fv, fi) = build_flood_plane();
+        let flood_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("flood vbuf"),
+            contents: bytemuck::cast_slice(&fv),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let flood_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("flood ibuf"),
+            contents: bytemuck::cast_slice(&fi),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let flood_count = fi.len() as u32;
+        WorldGeometry { terrain_vbuf, terrain_ibuf, terrain_count, water_vbuf, water_ibuf, water_count, flood_vbuf, flood_ibuf, flood_count }
+    }
+}
+
 pub struct Renderer {
+    /// The map the terrain, water and flood meshes were built for.
+    pub world_map: crate::map::MapId,
     /// Counters for the last `render_frame`.
     pub stats: FrameStats,
     /// Draws refused this frame for want of a slot; reported, not silent.
@@ -585,42 +643,7 @@ impl Renderer {
         });
 
         // terrain
-        let (tv, ti) = build_terrain();
-        let terrain_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("terrain vbuf"),
-            contents: bytemuck::cast_slice(&tv),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let terrain_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("terrain ibuf"),
-            contents: bytemuck::cast_slice(&ti),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let terrain_count = ti.len() as u32;
-        let (wv, wi) = build_water();
-        let water_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("water vbuf"),
-            contents: bytemuck::cast_slice(&wv),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let water_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("water ibuf"),
-            contents: bytemuck::cast_slice(&wi),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let water_count = wi.len() as u32;
-        let (fv, fi) = build_flood_plane();
-        let flood_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("flood vbuf"),
-            contents: bytemuck::cast_slice(&fv),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let flood_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("flood ibuf"),
-            contents: bytemuck::cast_slice(&fi),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let flood_count = fi.len() as u32;
+        let WorldGeometry { terrain_vbuf, terrain_ibuf, terrain_count, water_vbuf, water_ibuf, water_count, flood_vbuf, flood_ibuf, flood_count } = WorldGeometry::build(&device);
 
         let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("post sampler"),
@@ -646,6 +669,7 @@ impl Renderer {
             cube_ibuf,
             meshes: HashMap::new(),
             next_mesh_id: 1,
+            world_map: crate::map::active(),
             main_bgl,
             shadow_bgl,
             post_bgl,
@@ -705,6 +729,42 @@ impl Renderer {
         };
         r.resize(width, height);
         r
+    }
+
+    /// Rebuild the terrain, water and flood plane for the active map, if
+    /// they were built for another. The map switch: before this the map was
+    /// fixed at launch, because `new` was the only place they were built.
+    pub fn rebuild_world_geometry(&mut self) {
+        let m = crate::map::active();
+        if m == self.world_map {
+            return;
+        }
+        let g = WorldGeometry::build(&self.device);
+        self.terrain_vbuf = g.terrain_vbuf;
+        self.terrain_ibuf = g.terrain_ibuf;
+        self.terrain_count = g.terrain_count;
+        self.water_vbuf = g.water_vbuf;
+        self.water_ibuf = g.water_ibuf;
+        self.water_count = g.water_count;
+        self.flood_vbuf = g.flood_vbuf;
+        self.flood_ibuf = g.flood_ibuf;
+        self.flood_count = g.flood_count;
+        self.world_map = m;
+    }
+
+    /// The id the next uploaded mesh will get: a mark to free back to.
+    pub fn mesh_mark(&self) -> u64 {
+        self.next_mesh_id
+    }
+
+    /// Free every mesh uploaded since `mark` (ids are handed out in
+    /// order): how a scene gives its GPU memory back on a map switch.
+    pub fn free_meshes_from(&mut self, mark: u64) {
+        self.meshes.retain(|&id, _| id < mark);
+    }
+
+    pub fn mesh_count(&self) -> usize {
+        self.meshes.len()
     }
 
     pub fn upload_mesh(&mut self, mesh: &VoxelMesh) -> u64 {
