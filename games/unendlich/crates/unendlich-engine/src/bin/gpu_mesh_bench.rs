@@ -780,6 +780,13 @@ fn main() {
                 let req = MeshRequest {
                     coord,
                     chunk: Arc::clone(&chunk_arc),
+                    // epoch and neighbors were added to MeshRequest after this
+                    // bench was written. 0 / none() are what the pool's own test
+                    // uses; none() is documented as byte-identical to every
+                    // request built before the field existed, so the bench
+                    // measures what it always did.
+                    epoch: 0,
+                    neighbors: unendlich_engine::render::mesher::NeighborChunks::none(),
                     version_at_submit: 0,
                     sky: sky.clone(),
                     world_model: None,
