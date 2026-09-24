@@ -65,19 +65,6 @@ fn hlg_eotf(e: f32) -> f32 {
     }
 }
 
-/// Soft-knee roll-off. Mirrors `tonemap`; see that function for why plain
-/// Reinhard is wrong here (it puts reference white at 0.5).
-fn tonemap(x: f32, peak: f32) -> f32 {
-    const KNEE: f32 = 0.8;
-    let v = x / peak.max(1.0);
-    if v <= KNEE {
-        v
-    } else {
-        let e = v - KNEE;
-        KNEE + (1.0 - KNEE) * (e / (e + (1.0 - KNEE)))
-    }
-}
-
 /// Luminance the tonemap treats as SDR white, in nits. ITU reference white.
 pub const REFERENCE_WHITE_NITS: f32 = 203.0;
 
@@ -93,6 +80,53 @@ const BT2020_TO_BT709: [[f32; 3]; 3] = [
     [-0.1246, 1.1329, -0.0083],
     [-0.0182, -0.1006, 1.1187],
 ];
+
+/// SMPTE ST 2084 inverse EOTF: absolute nits -> PQ signal 0..1.
+pub fn pq_oetf(nits: f32) -> f32 {
+    const M1: f32 = 0.1593017578125;
+    const M2: f32 = 78.84375;
+    const C1: f32 = 0.8359375;
+    const C2: f32 = 18.8515625;
+    const C3: f32 = 18.6875;
+    let y = (nits / 10000.0).clamp(0.0, 1.0).powf(M1);
+    ((C1 + C2 * y) / (1.0 + C3 * y)).powf(M2)
+}
+
+/// Content peak assumed when the stream carries no MaxCLL / mastering peak:
+/// 1000 nits, the most common HDR10 grade and HLG's nominal display.
+pub const DEFAULT_HDR_PEAK_NITS: f32 = 1000.0;
+
+/// The display peak an SDR output is tone mapped to: reference white.
+/// BT.2408 puts SDR's 100% at 203 nits, so an SDR display's white IS the
+/// HDR reference white, and everything above it is highlight to compress.
+pub const SDR_PEAK_NITS: f32 = REFERENCE_WHITE_NITS;
+
+/// BT.2390 EETF (ITU-R BT.2390-10, 5.4): map `nits` from content with peak
+/// `src_peak` onto a display with peak `dst_peak`, in the PQ domain. Pure.
+///
+/// Below the knee `KS = 1.5 maxLum - 0.5` the signal passes unchanged, so
+/// midtones and shadows are exactly as graded; above it a Hermite spline
+/// rolls the rest of the content's range onto what the display has left.
+/// Working in PQ (perceptual) rather than linear light is why highlights
+/// keep their gradation: the old knee, in linear light, gave 203..4000 nits
+/// about 11 output codes.
+pub fn bt2390(nits: f32, src_peak: f32, dst_peak: f32) -> f32 {
+    if src_peak <= dst_peak {
+        return nits.min(dst_peak);
+    }
+    let src_max = pq_oetf(src_peak);
+    let e1 = pq_oetf(nits) / src_max;
+    let max_lum = pq_oetf(dst_peak) / src_max;
+    let ks = 1.5 * max_lum - 0.5;
+    let e2 = if e1 < ks {
+        e1
+    } else {
+        let t = ((e1 - ks) / (1.0 - ks)).min(1.0);
+        let (t2, t3) = (t * t, t * t * t);
+        (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks) + (-2.0 * t3 + 3.0 * t2) * max_lum
+    };
+    pq_eotf(e2 * src_max) * 10000.0
+}
 
 /// sRGB encoding of linear light 0..1.
 pub fn srgb_oetf(l: f32) -> f32 {
@@ -118,27 +152,37 @@ pub fn srgb_oetf(l: f32) -> f32 {
 /// 4. sRGB OETF. This step was missing: linear light went straight into a
 ///    gamma-encoded buffer, and 18% grey rendered at 43/255 instead of ~118.
 pub fn hdr_to_sdr(rgb: [f32; 3], transfer: Transfer, bt2020: bool) -> [f32; 3] {
-    let lin = match transfer {
-        Transfer::Pq => rgb.map(|c| pq_eotf(c) * 10000.0 / REFERENCE_WHITE_NITS),
+    hdr_to_sdr_peak(rgb, transfer, bt2020, DEFAULT_HDR_PEAK_NITS)
+}
+
+/// [`hdr_to_sdr`] with the content's peak, from MaxCLL or the mastering
+/// display when the stream has them.
+pub fn hdr_to_sdr_peak(rgb: [f32; 3], transfer: Transfer, bt2020: bool, src_peak: f32) -> [f32; 3] {
+    // Absolute nits first; the EETF works on nits.
+    let (nits, src_peak) = match transfer {
+        Transfer::Pq => (rgb.map(|c| pq_eotf(c) * 10000.0), src_peak),
         Transfer::Hlg => {
             let scene = rgb.map(hlg_eotf);
             // OOTF on luminance: Yd = Ys^1.2, applied as a common scale so
-            // hue is kept. BT.2020 luma weights.
+            // hue is kept. BT.2020 luma weights. HLG's peak IS its nominal
+            // display, whatever MaxCLL says.
             let ys = 0.2627 * scene[0] + 0.6780 * scene[1] + 0.0593 * scene[2];
             let k = if ys > 0.0 { ys.powf(0.2) } else { 0.0 };
-            scene.map(|c| c * k * HLG_PEAK_NITS / REFERENCE_WHITE_NITS)
+            (scene.map(|c| c * k * HLG_PEAK_NITS), HLG_PEAK_NITS)
         }
         Transfer::Sdr => return rgb,
     };
     let lin = if bt2020 {
         let m = BT2020_TO_BT709;
-        [0, 1, 2].map(|r| (m[r][0] * lin[0] + m[r][1] * lin[1] + m[r][2] * lin[2]).max(0.0))
+        [0, 1, 2].map(|r| (m[r][0] * nits[0] + m[r][1] * nits[1] + m[r][2] * nits[2]).max(0.0))
     } else {
-        lin.map(|c| c.max(0.0))
+        nits.map(|c| c.max(0.0))
     };
+    // The EETF on the MAX channel, one scale for all three (hue kept), out
+    // to display-relative linear light (1.0 = the SDR display's white).
     let peak = lin[0].max(lin[1]).max(lin[2]);
-    let scale = if peak > 0.0 { tonemap(peak, 1.0) / peak } else { 0.0 };
-    lin.map(|c| srgb_oetf(c * scale))
+    let scale = if peak > 0.0 { bt2390(peak, src_peak, SDR_PEAK_NITS) / peak } else { 0.0 };
+    lin.map(|c| srgb_oetf(c * scale / SDR_PEAK_NITS))
 }
 
 /// Sample a plane with bilinear filtering at normalised coordinates, matching
@@ -767,8 +811,12 @@ mod tests {
     fn pq_midtones_land_where_bt2408_puts_them() {
         let grey = pq_grey_out(0.18 * 203.0);
         assert!((115..=121).contains(&grey), "18% grey rendered at {grey}/255, want ~118");
+        // Reference white: 229 under BT.2390 onto a 203-nit SDR white (was
+        // 244 under the old knee). The EETF's knee for 1000-nit content sits
+        // near 94 nits, so diffuse white shares the top of the range with
+        // the highlights -- ~6% dimmer, in exchange for their gradation.
         let white = pq_grey_out(203.0);
-        assert!(white > 235, "reference white at {white}/255");
+        assert!(white >= 225, "reference white at {white}/255");
         // Highlights stay ordered and distinct (without the roll-off 600
         // and 4000 nits both clip to 255). The knee curve leaves only ~11
         // codes for 203..4000 nits -- the "placeholder" the WGSL notes admit;
@@ -794,5 +842,37 @@ mod tests {
         let c = ColorInfo { matrix: Matrix::Bt709, transfer: Transfer::Sdr, range: Range::Limited };
         assert_eq!(planes_to_rgba8(&p010_planes(64, 512, 512), PlaneLayout::P010, c, 2, 2).unwrap()[0], 0);
         assert_eq!(planes_to_rgba8(&p010_planes(940, 512, 512), PlaneLayout::P010, c, 2, 2).unwrap()[0], 255);
+    }
+
+    /// The point of BT.2390 over the old linear-light knee: highlights keep
+    /// gradation. Codes spent between reference white and the content peak.
+    #[test]
+    fn bt2390_gives_highlights_their_gradation() {
+        let codes: Vec<u8> = [203.0, 300.0, 400.0, 600.0, 800.0, 1000.0].iter().map(|n| pq_grey_out(*n)).collect();
+        eprintln!("DIAG 203..1000 nits -> {codes:?}");
+        // Distinct up to 800 nits; the spline's slope is zero at the content
+        // peak, so 800..1000 meet display white together.
+        assert!(codes[..5].windows(2).all(|w| w[0] < w[1]), "each step distinct: {codes:?}");
+        let span = codes[codes.len() - 1] - codes[0];
+        assert!(span >= 20, "only {span} codes from 203 to 1000 nits");
+        assert!(codes[5] >= 253, "content peak reaches display white: {}", codes[5]);
+        // Past the content peak there is nothing left to map: it clips.
+        assert!(pq_grey_out(4000.0) >= codes[5]);
+    }
+
+    #[test]
+    fn the_eetf_passes_shadows_and_midtones_untouched_and_is_monotonic() {
+        for n in [0.0, 1.0, 10.0, 36.5, 80.0] {
+            assert!((bt2390(n, 1000.0, 203.0) - n).abs() < 0.05 * n.max(1.0), "{n} moved to {}", bt2390(n, 1000.0, 203.0));
+        }
+        let mut last = 0.0;
+        for i in 0..=100 {
+            let n = i as f32 * 10.0;
+            let o = bt2390(n, 1000.0, 203.0);
+            assert!(o >= last - 1e-3 && o <= 203.0 + 0.05, "{n} -> {o}");
+            last = o;
+        }
+        assert!((bt2390(1000.0, 1000.0, 203.0) - 203.0).abs() < 1.0, "peak onto peak");
+        assert_eq!(bt2390(150.0, 180.0, 203.0), 150.0, "content under the display peak is left alone");
     }
 }

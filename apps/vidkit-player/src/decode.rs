@@ -181,6 +181,47 @@ pub fn probe_input(input: &str, headers: &[(String, String)]) -> Result<Probe, S
     parse_probe(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| format!("{input}: no video stream"))
 }
 
+/// The content peak in nits from ffprobe's first-frame side data. Pure.
+///
+/// MaxCLL (`max_content`) first: it is what the content actually reaches.
+/// Else the mastering display's `max_luminance` (a rational, e.g.
+/// `40000000/10000` = 4000 nits). Zero or absent: `None`, and the EETF uses
+/// its 1000-nit default. A peak of 10000 (PQ's ceiling) from a lazy
+/// encoder is accepted: over-assuming only compresses highlights more.
+pub fn parse_hdr_peak(text: &str) -> Option<f32> {
+    let mut cll = None;
+    let mut master = None;
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        match k.trim() {
+            "max_content" => cll = v.trim().parse::<f32>().ok().filter(|n| *n > 0.0),
+            "max_luminance" => {
+                let v = v.trim();
+                master = match v.split_once('/') {
+                    Some((n, d)) => match (n.parse::<f32>(), d.parse::<f32>()) {
+                        (Ok(n), Ok(d)) if d > 0.0 => Some(n / d),
+                        _ => None,
+                    },
+                    None => v.parse().ok(),
+                }
+                .filter(|n| *n > 0.0);
+            }
+            _ => {}
+        }
+    }
+    cll.or(master).map(|n| n.clamp(100.0, 10000.0))
+}
+
+/// Read the content peak of a PQ stream: one ffprobe of its first frame.
+pub fn probe_hdr_peak(input: &str) -> Option<f32> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1", "-show_entries", "frame_side_data", "-of", "default=noprint_wrappers=1"])
+        .arg(input)
+        .output()
+        .ok()?;
+    parse_hdr_peak(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// The container's duration, if ffprobe knows it.
 pub fn probe_duration(input: &str) -> Option<Duration> {
     let out = Command::new("ffprobe")
@@ -605,6 +646,8 @@ pub struct FfmpegFrames {
     pub layout: PlaneLayout,
     /// What the pixels mean, from the stream's tags.
     pub color: ColorInfo,
+    /// The content's peak in nits, for PQ streams that say.
+    pub hdr_peak: Option<f32>,
     index: u64,
     pub frames_read: u64,
     /// What is decoding NOW (after any fallback), for the status line.
@@ -707,6 +750,7 @@ impl FfmpegFrames {
             frame_interval: Duration::from_secs_f64(1.0 / p.fps.max(1.0)),
             layout,
             color: p.color(),
+            hdr_peak: (p.color().transfer == Transfer::Pq).then(|| probe_hdr_peak(&src.input)).flatten(),
             // Timestamps on the MEDIA timeline from the first frame: opened at
             // 2 s, the first frame is stamped 2 s. Starting at zero stamped a
             // seeked decoder's frames 0 s, 0.033 s... against a clock at 2 s,
@@ -1169,6 +1213,31 @@ mod color_tests {
             let low_bits: u32 = pl.data[0].chunks_exact(2).map(|b| (b[0] & 0x3f) as u32).sum();
             assert_eq!(low_bits, 0, "not P010's layout");
         }
+        let _ = std::fs::remove_file(&f);
+    }
+}
+
+#[cfg(test)]
+mod peak_tests {
+    use super::*;
+
+    #[test]
+    fn maxcll_wins_then_the_mastering_display() {
+        assert_eq!(parse_hdr_peak("side_data_type=Mastering display metadata\nmax_luminance=40000000/10000\nside_data_type=Content light level metadata\nmax_content=1500"), Some(1500.0));
+        assert_eq!(parse_hdr_peak("max_luminance=10000000/10000"), Some(1000.0));
+        assert_eq!(parse_hdr_peak("max_content=0\nmax_luminance=6000000/10000"), Some(600.0), "a zero MaxCLL means unknown");
+        assert_eq!(parse_hdr_peak("side_data_type=H.26[45] User Data Unregistered SEI message"), None);
+    }
+
+    /// A real x265 HDR10 stream with MaxCLL 4000, through ffprobe.
+    #[test]
+    fn a_real_hdr10_stream_reports_its_maxcll() {
+        let f = std::env::temp_dir().join(format!("vk-cll-{}.mkv", std::process::id()));
+        let ok = Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=10:duration=1", "-pix_fmt", "yuv420p10le", "-c:v", "libx265",
+            "-x265-params", "log-level=error:hdr10=1:max-cll=4000,400:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50):colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc"])
+            .arg(&f).status().map(|s| s.success()).unwrap_or(false);
+        if !ok { eprintln!("no libx265; skipping"); return; }
+        assert_eq!(probe_hdr_peak(&f.to_string_lossy()), Some(4000.0));
         let _ = std::fs::remove_file(&f);
     }
 }

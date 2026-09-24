@@ -89,27 +89,33 @@ fn hlg_eotf(e: f32) -> f32 {
     return (exp((e - c) / a) + b) / 12.0;
 }
 
-// Soft-knee roll-off: linear below the knee, hyperbolic above, asymptotic to
-// 1.0. `peak` is the luminance that should render as SDR white.
-//
-// The obvious `v / (1 + v)` Reinhard is wrong here and not subtly: it maps
-// v = 1 — that is, exactly the target luminance — to 0.5. ITU reference white
-// is 203 nits, so every HDR file would render diffuse white as mid-grey and
-// look uniformly dim. Measured at 0.487 before this change; see
-// `pq_reference_white_lands_near_sdr_white`.
-//
-// With knee = 0.8: reference white lands at 0.9, 1000 nits at 0.99, and 10000
-// nits at 0.999, so highlights stay ordered instead of clipping flat.
-// Still a placeholder — a real display-referred tonemap is a tuning exercise —
-// but one whose anchor points are defensible.
-fn tonemap(x: f32, peak: f32) -> f32 {
-    let knee = 0.8;
-    let v = x / max(peak, 1.0);
-    if v <= knee {
-        return v;
+fn pq_oetf(nits: f32) -> f32 {
+    let y = pow(clamp(nits / 10000.0, 0.0, 1.0), 0.1593017578125);
+    return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
+}
+
+// BT.2390 EETF, mirroring vidkit-core's `bt2390`: nits from content with
+// peak `src` onto a display with peak `dst`, in the PQ domain. Replaces the
+// linear-light soft knee, which gave 203..4000 nits about 11 output codes.
+// The content peak is fixed at 1000 nits here (the common HDR10 grade):
+// passing MaxCLL needs a Params field, and the Rust layout is not changed
+// without a Vulkan device to run the parity tests.
+fn bt2390(nits: f32, src: f32, dst: f32) -> f32 {
+    if src <= dst {
+        return min(nits, dst);
     }
-    let e = v - knee;
-    return knee + (1.0 - knee) * (e / (e + (1.0 - knee)));
+    let smax = pq_oetf(src);
+    let e1 = pq_oetf(nits) / smax;
+    let ml = pq_oetf(dst) / smax;
+    let ks = 1.5 * ml - 0.5;
+    var e2 = e1;
+    if e1 >= ks {
+        let t = min((e1 - ks) / (1.0 - ks), 1.0);
+        let t2 = t * t;
+        let t3 = t2 * t;
+        e2 = (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks) + (-2.0 * t3 + 3.0 * t2) * ml;
+    }
+    return pq_eotf(e2 * smax) * 10000.0;
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -170,14 +176,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // field in Params, i.e. the Rust uniform layout, and there is no Vulkan
     // device in the sandbox to run the parity tests that would check it.
     if p.transfer_id == 1u || p.transfer_id == 2u {
-        var lin: vec3<f32>;
+        var lin: vec3<f32>; // absolute nits
         if p.transfer_id == 1u {
-            lin = vec3<f32>(pq_eotf(rgb.r), pq_eotf(rgb.g), pq_eotf(rgb.b)) * 10000.0 / max(p.target_nits, 1.0);
+            lin = vec3<f32>(pq_eotf(rgb.r), pq_eotf(rgb.g), pq_eotf(rgb.b)) * 10000.0;
         } else {
             let scene = vec3<f32>(hlg_eotf(rgb.r), hlg_eotf(rgb.g), hlg_eotf(rgb.b));
             let ys = dot(scene, vec3<f32>(0.2627, 0.6780, 0.0593));
             let k = select(0.0, pow(ys, 0.2), ys > 0.0);
-            lin = scene * k * 1000.0 / max(p.target_nits, 1.0);
+            lin = scene * k * 1000.0;
         }
         if p.matrix_id == 2u {
             // WGSL matrices are column-major: these are BT.2087's rows
@@ -191,8 +197,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         lin = max(lin, vec3<f32>(0.0));
         let peak = max(lin.r, max(lin.g, lin.b));
-        let scale = select(0.0, tonemap(peak, 1.0) / peak, peak > 0.0);
-        let l = clamp(lin * scale, vec3<f32>(0.0), vec3<f32>(1.0));
+        let white = max(p.target_nits, 1.0);
+        let scale = select(0.0, bt2390(peak, 1000.0, white) / peak, peak > 0.0);
+        let l = clamp(lin * scale / white, vec3<f32>(0.0), vec3<f32>(1.0));
         rgb = select(1.055 * pow(l, vec3<f32>(1.0 / 2.4)) - 0.055, 12.92 * l, l <= vec3<f32>(0.0031308));
     }
 

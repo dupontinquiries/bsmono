@@ -335,6 +335,8 @@ pub struct Engine {
     /// What is decoding, for the status line; the video thread rewrites it
     /// if a hardware decoder falls back to software.
     decoder: Arc<Mutex<String>>,
+    /// The playing stream's HDR content peak, for the presenter's EETF.
+    hdr_peak: Option<f32>,
     audio_done: Arc<AtomicBool>,
     /// Playback speed, applied at the next (re)start.
     speed: f64,
@@ -367,6 +369,7 @@ impl Engine {
             gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             pool: PlanePool::new(),
             decoder: Arc::new(Mutex::new(String::new())),
+            hdr_peak: None,
             audio_done: Arc::new(AtomicBool::new(false)),
             speed: 1.0,
             depth: QUEUE_DEPTH,
@@ -402,6 +405,7 @@ impl Engine {
 
         let (mut video, audio) = (self.opener)(from, self.speed)?;
         self.frame_interval = video.frame_interval;
+        self.hdr_peak = video.hdr_peak;
         video.set_pool(self.pool.clone());
         if let Ok(mut d) = self.decoder.lock() {
             *d = format!("{} {}x{}", video.accel.label(), video.width, video.height);
@@ -591,6 +595,11 @@ impl Engine {
 
     pub fn is_paused(&self) -> bool {
         self.paused
+    }
+
+    /// The HDR content peak (MaxCLL / mastering), when the stream has one.
+    pub fn hdr_peak(&self) -> Option<f32> {
+        self.hdr_peak
     }
 
     /// Hand a presented frame's planes back for reuse.

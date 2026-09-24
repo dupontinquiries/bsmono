@@ -434,6 +434,12 @@ impl Player {
             playback::Tick::Show { frame, next } => {
                 self.present(eframe_frame, &frame);
                 if let Some(e) = self.engine.as_ref() {
+                    // The content peak for the GPU's BT.2390 EETF.
+                    if let Some(g) = &self.gpu {
+                        if let Ok(mut g) = g.lock() {
+                            g.hdr_peak_nits = e.hdr_peak().unwrap_or(vidkit_core::convert_cpu::DEFAULT_HDR_PEAK_NITS);
+                        }
+                    }
                     e.recycle(frame);
                 }
                 self.presenter.set_deadline(Some(Instant::now() + next));

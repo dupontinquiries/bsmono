@@ -105,18 +105,39 @@ float pq_eotf(float e) {
 float hlg_eotf(float e) {
     return e <= 0.5 ? (e * e) / 3.0 : (exp((e - 0.55991073) / 0.17883277) + 0.28466892) / 12.0;
 }
-float knee(float v) {
-    return v <= 0.8 ? v : 0.8 + 0.2 * ((v - 0.8) / ((v - 0.8) + 0.2));
+uniform float src_peak;  // content peak, nits (MaxCLL / mastering; default 1000)
+float pq_oetf(float nits) {
+    float y = pow(clamp(nits / 10000.0, 0.0, 1.0), 0.1593017578125);
+    return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
+}
+// BT.2390 EETF onto a 203-nit SDR white; mirrors vidkit-core's bt2390.
+float bt2390(float nits, float peak) {
+    const float dst = 203.0;
+    if (peak <= dst) return min(nits, dst);
+    float smax = pq_oetf(peak);
+    float e1 = pq_oetf(nits) / smax;
+    float ml = pq_oetf(dst) / smax;
+    float ks = 1.5 * ml - 0.5;
+    float e2 = e1;
+    if (e1 >= ks) {
+        float t = min((e1 - ks) / (1.0 - ks), 1.0);
+        float t2 = t * t, t3 = t2 * t;
+        e2 = (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks) + (-2.0 * t3 + 3.0 * t2) * ml;
+    }
+    return pq_eotf(e2 * smax) * 10000.0;
 }
 vec3 hdr_to_sdr(vec3 rgb) {
-    vec3 lin;
+    vec3 lin;       // absolute nits
+    float peak_src;
     if (transfer_id == 1) {
-        lin = vec3(pq_eotf(rgb.r), pq_eotf(rgb.g), pq_eotf(rgb.b)) * (10000.0 / 203.0);
+        lin = vec3(pq_eotf(rgb.r), pq_eotf(rgb.g), pq_eotf(rgb.b)) * 10000.0;
+        peak_src = src_peak;
     } else {
         vec3 sc = vec3(hlg_eotf(rgb.r), hlg_eotf(rgb.g), hlg_eotf(rgb.b));
         float ys = dot(sc, vec3(0.2627, 0.6780, 0.0593));
         float k = ys > 0.0 ? pow(ys, 0.2) : 0.0;
-        lin = sc * k * (1000.0 / 203.0);
+        lin = sc * k * 1000.0;
+        peak_src = 1000.0;
     }
     if (matrix_id == 2) {
         lin = vec3(dot(vec3(1.6605, -0.5876, -0.0728), lin),
@@ -125,8 +146,8 @@ vec3 hdr_to_sdr(vec3 rgb) {
     }
     lin = max(lin, vec3(0.0));
     float peak = max(lin.r, max(lin.g, lin.b));
-    float s = peak > 0.0 ? knee(peak) / peak : 0.0;
-    vec3 l = clamp(lin * s, 0.0, 1.0);
+    float s = peak > 0.0 ? bt2390(peak, peak_src) / peak : 0.0;
+    vec3 l = clamp(lin * s / 203.0, 0.0, 1.0);
     return mix(1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055, 12.92 * l, vec3(lessThanEqual(l, vec3(0.0031308))));
 }
 
@@ -417,6 +438,9 @@ pub struct Nv12Gpu {
     size: (u32, u32),
     layout: PlaneLayout,
     color: ColorInfo,
+    /// The content's peak for the BT.2390 EETF: MaxCLL or the mastering
+    /// display's, set by the app from the stream; 1000 nits when unknown.
+    pub hdr_peak_nits: f32,
     uploaded_bytes: u64,
     uploads: u64,
 }
@@ -466,6 +490,7 @@ impl Nv12Gpu {
             size: (0, 0),
             layout: PlaneLayout::Nv12,
             color: ColorInfo::default(),
+            hdr_peak_nits: vidkit_core::convert_cpu::DEFAULT_HDR_PEAK_NITS,
             uploaded_bytes: 0,
             uploads: 0,
         })
@@ -698,6 +723,7 @@ impl Nv12Gpu {
             vidkit_core::codec::Transfer::Hlg => 2,
         };
         if let Some(l) = u("transfer_id") { gl.uniform_1_i32(Some(&l), tid); }
+        if let Some(l) = u("src_peak") { gl.uniform_1_f32(Some(&l), self.hdr_peak_nits); }
         if let Some(l) = u("ten_bit") { gl.uniform_1_i32(Some(&l), (self.layout == PlaneLayout::P010) as i32); }
         gl.disable(glow::DEPTH_TEST);
         gl.draw_arrays(glow::TRIANGLES, 0, 3);
