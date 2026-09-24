@@ -66,6 +66,12 @@ BIN_PATH = re.compile(r'^\s*path\s*=\s*["\']([^"\']+)["\']', re.M)
 # ANYWHERE in the crate is reachable through that attribute by definition, same simplification the
 # rest of this tool already makes (it compares by file STEM crate-wide, never by directory).
 PATH_ATTR = re.compile(r'#\[\s*path\s*=\s*["\']([^"\']+)["\']\s*\]')
+# `include!("file.rs")` splices a file's text into the including module: its tests compile and
+# run there, so the file is reachable although no `mod` names it. voiceterm-egui's bar_pages.rs
+# does exactly this on purpose (its header explains why `#[path] mod` resolves `crate::` against
+# the wrong root), and this checker reported bar_pages_core.rs as an orphan with "19 tests that
+# never run" -- they do run. Same crate-wide stem rule as #[path].
+INCLUDE = re.compile(r'\binclude!\s*\(\s*["\']([^"\']+)["\']\s*\)')
 
 
 def declarations(text: str) -> set:
@@ -86,7 +92,8 @@ def declarations(text: str) -> set:
     text = BLOCK_COMMENT.sub("", text)
     text = "\n".join(LINE_COMMENT.sub("", ln) for ln in text.splitlines())
     path_stems = {pathlib.Path(p).stem for p in PATH_ATTR.findall(text)}
-    return set(MOD.findall(text)) | path_stems
+    include_stems = {pathlib.Path(p).stem for p in INCLUDE.findall(text) if p.endswith(".rs")}
+    return set(MOD.findall(text)) | path_stems | include_stems
 
 
 def crate_dirs(root: pathlib.Path):
@@ -116,7 +123,11 @@ def scan(crate: pathlib.Path):
     files = sorted(src.rglob("*.rs"))
     targets = target_paths(crate)
     declared = set()
-    for f in files:
+    # Declarations are read from the crate's examples/tests/benches too: an example can mount a
+    # src file with `#[path = "../src/x.rs"] mod x;` (blackstar-rs's rigpose does, for rig.rs),
+    # and that file is reachable although nothing in src/ names it.
+    extra = [f for d in ("examples", "tests", "benches") for f in sorted((crate / d).rglob("*.rs"))]
+    for f in files + extra:
         try:
             declared |= declarations(f.read_text(errors="replace"))
         except OSError:
