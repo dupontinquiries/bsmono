@@ -699,6 +699,8 @@ pub mod dragon_duel;
 pub mod roar_synth;
 pub mod land_echo;
 pub mod sound_render;
+pub mod dragon_nose;
+pub mod dragon_ears;
 pub mod mob_pixel_peeper;
 pub mod camera_tremble;
 pub mod plant_root_system;

@@ -2,7 +2,7 @@
 //!
 //! Renders one dragon's roar (by genome seed) through the same chain the game
 //! uses (`roar_synth` → `land_echo` → `sound_render`) over a few synthetic
-//! landscapes, and writes a WAV per scene. Prints the echo plan for each, so
+//! landscapes, and writes an Ogg-Opus file per scene. Prints the echo plan for each, so
 //! what you hear can be checked against what the model decided.
 //!
 //!     roar-render [OUT_DIR] [GENOME_SEED] [DIST_M]
@@ -34,8 +34,8 @@ fn main() {
     let t = std::time::Instant::now();
     let dry = roar_synth::render(&v, RATE, seed);
     let synth_ms = t.elapsed().as_secs_f32() * 1000.0;
-    write(&out.join("0_dry.wav"), &dry.iter().flat_map(|s| [*s, *s]).collect::<Vec<_>>());
-    println!("  0_dry.wav: the roar at the dragon, no propagation (zero-cross {:.0}/s) — synth {synth_ms:.1} ms", roar_synth::zero_cross_rate(&dry, RATE));
+    write(&out.join("0_dry.opus"), &dry.iter().flat_map(|s| [*s, *s]).collect::<Vec<_>>());
+    println!("  0_dry.opus: the roar at the dragon, no propagation (zero-cross {:.0}/s) — synth {synth_ms:.1} ms", roar_synth::zero_cross_rate(&dry, RATE));
 
     // Listener at the origin facing +x; the dragon ahead-left on the plain.
     let listener = [0.0, 61.6, 0.0];
@@ -50,16 +50,18 @@ fn main() {
     ];
     for (name, h) in scenes {
         let t = std::time::Instant::now();
-        let plan = land_echo::plan(src, listener, fwd, &|x, z| h(x, z), &land_echo::EchoParams::default());
+        let params = land_echo::EchoParams { ref_dist: 20.0, ..land_echo::EchoParams::default() };
+        let plan = land_echo::plan(src, listener, fwd, &|x, z| h(x, z), &params);
         let plan_ms = t.elapsed().as_secs_f32() * 1000.0;
         let t = std::time::Instant::now();
         let wet = sound_render::render(&dry, RATE, &plan, sound_render::RenderOpts { trim_lead: true, lead_keep_s: 0.15, ..sound_render::RenderOpts::default() });
         let render_ms = t.elapsed().as_secs_f32() * 1000.0;
-        write(&out.join(format!("{name}.wav")), &wet);
-        println!("  {name}.wav: {} — plan {plan_ms:.2} ms (synthetic terrain), render {render_ms:.1} ms", land_echo::describe(&plan));
+        write(&out.join(format!("{name}.opus")), &wet);
+        println!("  {name}.opus: {} — plan {plan_ms:.2} ms (synthetic terrain), render {render_ms:.1} ms", land_echo::describe(&plan));
     }
 }
 
 fn write(path: &std::path::Path, stereo: &[f32]) {
-    std::fs::write(path, sound_render::wav_bytes(stereo, 2, RATE)).expect("write wav");
+    let bytes = unendlich_engine::audio::encode_ogg_opus(stereo, 2, RATE).expect("opus encode");
+    std::fs::write(path, bytes).expect("write opus");
 }

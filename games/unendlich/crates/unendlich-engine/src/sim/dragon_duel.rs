@@ -295,6 +295,8 @@ pub enum Tactic {
     Breath,
     /// Breaking off to live.
     Retreat,
+    /// Can't see you, but smells or hears you: going after the lead.
+    Track,
 }
 
 impl Tactic {
@@ -307,6 +309,7 @@ impl Tactic {
             Tactic::Lunge => "lunge",
             Tactic::Breath => "breath",
             Tactic::Retreat => "retreat",
+            Tactic::Track => "track",
         }
     }
 }
@@ -379,6 +382,29 @@ pub struct DuelSenses {
     pub player_whiffed: bool,
     /// The dragon's body radius (m), for reach arithmetic.
     pub body_radius: f32,
+    /// A non-visual lead on the player (smell or hearing), from
+    /// `dragon_nose::track` / `dragon_ears::hear` in the shell. Used only
+    /// while the dragon cannot see you and is not already fighting.
+    pub lead: Option<Lead>,
+}
+
+/// What kind of non-visual lead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LeadKind {
+    /// Smell, with the nose's mode (`dragon_nose::TrackMode::name`).
+    Scent(&'static str),
+    /// Hearing; `metal` = it heard armour.
+    Sound { metal: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Lead {
+    /// World yaw to go.
+    pub heading: f32,
+    pub speed01: f32,
+    /// 0..1.
+    pub confidence: f32,
+    pub kind: LeadKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -514,7 +540,12 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
 
     // ── engagement ──────────────────────────────────────────────────────────
     let engage_at = ENGAGE_BASE + 20.0 * ferocity;
-    if !st.engaged && ((s.can_see && dist < engage_at) || st.mem.hits_taken > 0) {
+    // A dragon that was already tracking you (by smell or ear) engages the
+    // moment it sees you, at any distance: it came for you. Seen from the
+    // first soak with armour, where a dragon tracked the clank 120 m, saw the
+    // player at 64 m, roared -- and then stood watching from 50 m.
+    let hunting_you = st.tactic == Tactic::Track;
+    if !st.engaged && ((s.can_see && (dist < engage_at || hunting_you)) || st.mem.hits_taken > 0) {
         st.engaged = true;
     }
     if st.engaged && dist > DISENGAGE && st.mem.total_pain() < 0.05 {
@@ -556,22 +587,37 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
     };
 
     if !st.engaged {
-        let changed = st.tactic != Tactic::Unaware;
+        // Not fighting. If it cannot see you but has a lead, it follows it.
+        let lead = s.lead.filter(|l| !s.can_see && l.confidence > 0.0 && l.heading.is_finite());
+        let next = if lead.is_some() { Tactic::Track } else { Tactic::Unaware };
+        let changed = st.tactic != next;
         if changed {
-            st.tactic = Tactic::Unaware;
+            st.tactic = next;
             st.held = 0.0;
         }
+        let (heading, speed01, reason) = match lead {
+            Some(l) => (
+                wrap(l.heading),
+                l.speed01.clamp(0.0, 1.0),
+                match l.kind {
+                    LeadKind::Scent(mode) => mode,
+                    LeadKind::Sound { metal: true } => "heard armour clanking",
+                    LeadKind::Sound { metal: false } => "heard footsteps",
+                },
+            ),
+            None => (s.self_yaw, 0.0, "not engaged"),
+        };
         return DuelOut {
-            tactic: Tactic::Unaware,
+            tactic: next,
             changed,
-            heading: s.self_yaw,
-            speed01: 0.0,
+            heading,
+            speed01,
             want_air: None,
             breathe: false,
             bite: false,
             roar,
             dread: 0.0,
-            why: Why { boldness, counter, respect_reach, safe_gap, reason: "not engaged" },
+            why: Why { boldness, counter, respect_reach, safe_gap, reason },
             scores: [
                 (Tactic::Stalk, -1.0),
                 (Tactic::Circle, -1.0),
@@ -727,7 +773,7 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
             want_air = Some(true);
             (toward + PI, 1.0, "wounded, breaking off")
         }
-        Tactic::Unaware => (s.self_yaw, 0.0, "not engaged"),
+        Tactic::Unaware | Tactic::Track => (s.self_yaw, 0.0, "not engaged"),
     };
 
     DuelOut {
@@ -834,6 +880,7 @@ pub fn senses_for(
         player_vitality01: player.vitality01,
         player_whiffed: whiffed,
         body_radius: body.radius(),
+        lead: None,
     }
 }
 
@@ -931,6 +978,7 @@ mod tests {
             player_vitality01: 1.0,
             player_whiffed: false,
             body_radius: 2.0,
+            lead: None,
         }
     }
 
@@ -1108,6 +1156,7 @@ mod tests {
                 player_vitality01: 1.0,
                 player_whiffed: whiffed,
                 body_radius: 2.0,
+                lead: None,
             };
             let o = step(st, p, &s, DuelTuning::default(), dt);
             let e = wrap(o.heading - yaw);
@@ -1604,6 +1653,62 @@ mod tests {
         // Staying in view never re-roars.
         roars += tick(&seen, ROAR_COOLDOWN * 2.0, &mut st);
         assert_eq!(roars, 2);
+    }
+
+    #[test]
+    fn unseen_but_smelled_it_tracks_the_lead() {
+        let p = DuelProfile::from_genome(&genome(1));
+        let mut st = DuelState::new(1);
+        let mut s = senses(90.0);
+        s.can_see = false;
+        s.lead = Some(Lead { heading: 1.0, speed01: 0.7, confidence: 0.5, kind: LeadKind::Scent("following the trail") });
+        let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
+        assert_eq!(o.tactic, Tactic::Track);
+        assert!(o.changed);
+        assert!((o.heading - 1.0).abs() < 1e-5 && (o.speed01 - 0.7).abs() < 1e-5);
+        assert_eq!(o.why.reason, "following the trail");
+        assert!(!st.engaged, "a lead is not a fight");
+        // Heard armour instead.
+        s.lead = Some(Lead { heading: -2.0, speed01: 0.6, confidence: 0.4, kind: LeadKind::Sound { metal: true } });
+        let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
+        assert_eq!(o.why.reason, "heard armour clanking");
+        // Lead gone: back to unaware.
+        s.lead = None;
+        let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
+        assert_eq!(o.tactic, Tactic::Unaware);
+    }
+
+    #[test]
+    fn sight_beats_a_lead() {
+        let p = DuelProfile::from_genome(&genome(1));
+        let mut st = DuelState::new(1);
+        let mut s = senses(90.0); // visible, beyond engage range
+        s.lead = Some(Lead { heading: 1.0, speed01: 0.7, confidence: 0.9, kind: LeadKind::Sound { metal: false } });
+        let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
+        assert_eq!(o.tactic, Tactic::Unaware, "it can see you: the lead adds nothing");
+        let mut near = s;
+        near.dist = 10.0;
+        let o = step(&mut st, &p, &near, DuelTuning::default(), 0.05);
+        assert!(st.engaged && o.tactic != Tactic::Track);
+    }
+
+    #[test]
+    fn a_dragon_that_tracked_you_engages_on_sight_at_any_range() {
+        let mut p = DuelProfile::from_genome(&genome(1));
+        p.ferocity = 0.0; // engage range = ENGAGE_BASE (28 m)
+        let mut st = DuelState::new(1);
+        let mut s = senses(55.0);
+        s.can_see = false;
+        s.lead = Some(Lead { heading: 0.0, speed01: 0.6, confidence: 0.5, kind: LeadKind::Sound { metal: true } });
+        step(&mut st, &p, &s, DuelTuning::default(), 0.05);
+        assert_eq!(st.tactic, Tactic::Track);
+        s.can_see = true;
+        step(&mut st, &p, &s, DuelTuning::default(), 0.05);
+        assert!(st.engaged, "tracked you, then saw you at 55 m: engages");
+        // A dragon that merely sees you at 55 m does not.
+        let mut idle = DuelState::new(1);
+        step(&mut idle, &p, &senses(55.0), DuelTuning::default(), 0.05);
+        assert!(!idle.engaged);
     }
 
     #[test]

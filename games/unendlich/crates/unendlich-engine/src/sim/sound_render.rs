@@ -191,34 +191,6 @@ impl Stagger {
     }
 }
 
-/// Interleaved f32 → i16.
-pub fn to_i16(x: &[f32]) -> Vec<i16> {
-    x.iter().map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16).collect()
-}
-
-/// A 16-bit PCM WAV file in memory (the render tool writes these).
-pub fn wav_bytes(interleaved: &[f32], channels: u16, rate: u32) -> Vec<u8> {
-    let pcm = to_i16(interleaved);
-    let data_len = (pcm.len() * 2) as u32;
-    let mut b = Vec::with_capacity(44 + data_len as usize);
-    b.extend_from_slice(b"RIFF");
-    b.extend_from_slice(&(36 + data_len).to_le_bytes());
-    b.extend_from_slice(b"WAVEfmt ");
-    b.extend_from_slice(&16u32.to_le_bytes());
-    b.extend_from_slice(&1u16.to_le_bytes());
-    b.extend_from_slice(&channels.to_le_bytes());
-    b.extend_from_slice(&rate.to_le_bytes());
-    b.extend_from_slice(&(rate * channels as u32 * 2).to_le_bytes());
-    b.extend_from_slice(&(channels * 2).to_le_bytes());
-    b.extend_from_slice(&16u16.to_le_bytes());
-    b.extend_from_slice(b"data");
-    b.extend_from_slice(&data_len.to_le_bytes());
-    for s in pcm {
-        b.extend_from_slice(&s.to_le_bytes());
-    }
-    b
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,12 +313,4 @@ mod tests {
         assert!(out.iter().all(|s| s.is_finite() && s.abs() <= 1.0 + 1e-6));
     }
 
-    #[test]
-    fn wav_header_is_well_formed() {
-        let b = wav_bytes(&[0.0, 0.5, -0.5, 1.0], 2, R);
-        assert_eq!(&b[0..4], b"RIFF");
-        assert_eq!(&b[8..12], b"WAVE");
-        assert_eq!(u32::from_le_bytes([b[40], b[41], b[42], b[43]]), 8);
-        assert_eq!(b.len(), 44 + 8);
-    }
 }

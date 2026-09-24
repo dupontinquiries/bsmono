@@ -198,6 +198,13 @@ struct DragonDuel {
     steer: Option<(f32, f32)>,
     /// Seconds since the last UNENDLICH_DRAGON_TRACE line for this dragon.
     trace_t: f32,
+    /// Genome-derived senses (dragon_nose::nose_acuity, dragon_ears::ear_acuity).
+    nose: f32,
+    ears: f32,
+    /// Scent-tracking state (the mind's use of the nose).
+    track: unendlich_engine::sim::dragon_nose::TrackState,
+    /// Last lead it logged, so a change of lead is logged once.
+    lead_said: &'static str,
 }
 
 /// Top ground speed of an engaged dragon at `speed01 = 1` (blocks/s). Wander
@@ -239,6 +246,10 @@ fn dragon_duel_for(
         state: unendlich_engine::sim::dragon_duel::DuelState::new(id),
         steer: None,
         trace_t: 0.0,
+        nose: unendlich_engine::sim::dragon_nose::nose_acuity(&genome),
+        ears: unendlich_engine::sim::dragon_ears::ear_acuity(&genome),
+        track: unendlich_engine::sim::dragon_nose::TrackState::new(id),
+        lead_said: "",
     }))
 }
 
@@ -2522,6 +2533,25 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // roamer loop (the melee check runs after it). A feinting dragon reads it.
     let mut last_swing_whiffed = false;
     let dragon_trace = std::env::var("UNENDLICH_DRAGON_TRACE").map_or(false, |v| v == "1");
+    // DRAGON SENSES: your scent trail (sim::dragon_nose) and the noise you make
+    // (sim::dragon_ears). The game has no wearable armour items yet, so what you
+    // wear comes from UNENDLICH_PLAYER_ARMOR ("plate", "chain", "leather",
+    // "cloth", or per slot "chest=plate,feet=chain"); default: none.
+    let mut player_scent = unendlich_engine::sim::dragon_nose::ScentTrail::new(256);
+    let senses_clock = Instant::now();
+    let player_armor = unendlich_engine::sim::dragon_ears::Worn::parse(
+        &std::env::var("UNENDLICH_PLAYER_ARMOR").unwrap_or_default(),
+    );
+    if player_armor != unendlich_engine::sim::dragon_ears::Worn::NONE {
+        use unendlich_engine::sim::dragon_ears as de;
+        let calm = de::Ambient { wind: 0.0, rain: 0.0 };
+        log::info!(
+            "[dragon] UNENDLICH_PLAYER_ARMOR: {:?} — a sharp-eared dragon hears you walk from ~{:.0} m in still air",
+            player_armor.0, de::hearing_range(&player_armor, 1.4, &calm, 0.85)
+        );
+    }
+    let mut player_prev_xz: Option<[f32; 2]> = None;
+    let mut player_landing_speed: f32 = 0.0;
     // UNENDLICH_DRAGON_AT=<metres>: 3 s after entering a world, hatch ONE
     // dragon that far ahead of you. For soaks and for testing a fight without
     // hunting for one (wild dragons tend to settle 70-100 m out). Fires once.
@@ -8852,6 +8882,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         // speed; the gait block decays it back out over ~¼ s.
                         let speed = (-prev_fall_vy).max(0.0);
                         hero_land_crouch = ((speed - 6.0) / 14.0).clamp(0.35, 1.0);
+                        player_landing_speed = speed; // dragon ears: the landing clank
                         // r542: jolt the camera on a hard landing, scaled by impact
                         // speed (landings below the ~9 m/s threshold don't reach here).
                         if cam_shake_on {
@@ -9283,6 +9314,35 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // forage/dragon over ~200 creatures) is the prime remaining
             // suspect. Time it to confirm.
             let _t_roamer = Instant::now();
+            // DRAGON SENSES, once per frame: lay your scent, read the wind,
+            // and work out how much noise you are making.
+            let senses_now = senses_clock.elapsed().as_secs_f32();
+            let (scent_wind, player_noise, noise_ambient) = {
+                use unendlich_engine::sim::dragon_ears as de;
+                let pp = local_player.view.position;
+                player_scent.lay([pp.x, pp.y - 1.4, pp.z], senses_now, 1.0);
+                // wind::wind_at is unitless (|w| ~0..1 in logs); read as ×8 m/s.
+                // An assumption, not a calibration: 1.0 = a fresh breeze.
+                let (wx, wz, _) = unendlich_engine::wind::wind_at(
+                    pp.x as f64, pp.y as f64, pp.z as f64, sky_state.time_seconds as f64,
+                );
+                let wind = [wx * 8.0, wz * 8.0];
+                let speed = match player_prev_xz {
+                    Some(prev) if dt > 1e-4 => ((pp.x - prev[0]).powi(2) + (pp.z - prev[1]).powi(2)).sqrt() / dt,
+                    _ => 0.0,
+                };
+                player_prev_xz = Some([pp.x, pp.z]);
+                let gait = de::Gait {
+                    speed: speed.min(40.0),
+                    crouched: bindings.is_action_pressed(GameAction::Sneak, &input),
+                    landing: std::mem::take(&mut player_landing_speed),
+                };
+                (
+                    wind,
+                    de::emit(&player_armor, &gait),
+                    de::Ambient { wind: (wind[0] * wind[0] + wind[1] * wind[1]).sqrt(), rain: precip01 },
+                )
+            };
             // DRAGON DUEL: what the dragons see in your hand this frame.
             let player_threat = player_item_threat(
                 survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
@@ -10574,11 +10634,23 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         // predator_prey) and the dragon FEEDS.
                         use unendlich_engine::sim::dragon_hunt as dh;
                         let mypos = cr.body.position;
+                        // Prey is FOUND, not known: seen within 32 m, or smelled
+                        // (sim::dragon_nose::sniff_plume -- a live animal's plume
+                        // runs downwind, so a dragon upwind of a herd can pass it
+                        // by). Was: the nearest Fauna within 64 m, always
+                        // "detected", wherever the wind blew.
+                        let nose_acu = duel.as_ref().map_or(0.6, |d| d.nose);
                         let mut nearest: Option<(usize, f32, [f32; 3])> = None;
+                        let mut best_score = 0.0f32;
                         for (oi, (ok, op, _)) in herd_snapshot.iter().enumerate() {
                             if *ok != 0 || prey_killed.contains(&oi) { continue; }
                             let dx2 = (op[0] - mypos[0]).powi(2) + (op[2] - mypos[2]).powi(2);
-                            if dx2 < 64.0 * 64.0 && nearest.map_or(true, |(_, d, _)| dx2 < d) {
+                            if dx2 > 160.0 * 160.0 { continue; }
+                            let seen = dx2 < 32.0 * 32.0;
+                            let smell = unendlich_engine::sim::dragon_nose::sniff_plume(*op, 1.0, mypos, scent_wind, nose_acu);
+                            let score = if seen { 1000.0 / (1.0 + dx2) } else if smell.smells() { smell.over / (1.0 + dx2) } else { 0.0 };
+                            if score > best_score {
+                                best_score = score;
                                 nearest = Some((oi, dx2, *op));
                             }
                         }
@@ -10832,10 +10904,63 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             hidden: player_hidden,
                             vitality01: fg_app.vitality().energy,
                         };
-                        let senses = dd::senses_for(
+                        let mut senses = dd::senses_for(
                             &body, *hp, d.profile.max_hp, &pv,
                             player_threat, last_swing_whiffed,
                         );
+                        // Smell and hearing, for when it cannot see you.
+                        if !senses.can_see {
+                            use unendlich_engine::sim::{dragon_ears as de, dragon_nose as dn};
+                            let head = [
+                                cr.body.position[0] + cr.yaw.cos() * body.radius(),
+                                cr.body.position[1],
+                                cr.body.position[2] + cr.yaw.sin() * body.radius(),
+                            ];
+                            let sn = dn::sniff(&player_scent, head, senses_now, scent_wind, d.nose, &dn::ScentPhysics::default());
+                            let plan = dn::track(&mut d.track, &sn, d.profile.cunning * duel_tuning.cunning, cr.body.position, scent_wind, dt);
+                            let attention = if d.state.tactic == dd::Tactic::Track { 1.0 } else { 0.3 };
+                            let heard = de::hear(&player_noise, pv.eye, head, 0, &noise_ambient, d.ears, attention);
+                            let scent_lead = (plan.mode != dn::TrackMode::Lost).then(|| dd::Lead {
+                                heading: plan.heading,
+                                speed01: plan.speed01,
+                                confidence: plan.confidence.max(0.05),
+                                kind: dd::LeadKind::Scent(plan.mode.name()),
+                            });
+                            let sound_lead = (heard.audible && heard.margin_db > 3.0).then(|| {
+                                // Deterministic jitter inside the bearing error.
+                                let j = ((d.id ^ (senses_now * 4.0) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32
+                                    / (1u64 << 24) as f32 * 2.0 - 1.0;
+                                dd::Lead {
+                                    heading: heard.bearing + j * heard.bearing_err,
+                                    speed01: 0.65,
+                                    confidence: (heard.margin_db / 20.0).clamp(0.05, 1.0),
+                                    kind: dd::LeadKind::Sound { metal: heard.metal },
+                                }
+                            });
+                            senses.lead = match (scent_lead, sound_lead) {
+                                (Some(a), Some(b)) => Some(if b.confidence > a.confidence { b } else { a }),
+                                (a, b) => a.or(b),
+                            };
+                            let said = match senses.lead.map(|l| l.kind) {
+                                Some(dd::LeadKind::Scent(m)) => m,
+                                Some(dd::LeadKind::Sound { metal: true }) => "hears armour clanking",
+                                Some(dd::LeadKind::Sound { metal: false }) => "hears footsteps",
+                                None => "",
+                            };
+                            if said != d.lead_said {
+                                if said.is_empty() {
+                                    log::info!("[dragon#{:04x}] lost you ({})", d.id & 0xffff, d.lead_said);
+                                } else {
+                                    log::info!(
+                                        "[dragon#{:04x}] {} — {:.0} m off (scent {:.1}× threshold, trail {:.0}s old; sound {:+.0} dB, ±{:.0}°; wind {:.1} m/s)",
+                                        d.id & 0xffff, said, senses.dist, sn.over,
+                                        if sn.freshest_age.is_finite() { sn.freshest_age } else { -1.0 },
+                                        heard.margin_db, heard.bearing_err.to_degrees(), noise_ambient.wind
+                                    );
+                                }
+                                d.lead_said = said;
+                            }
+                        }
                         let dist = senses.dist;
                         let o = dd::step(&mut d.state, &d.profile, &senses, duel_tuning, dt);
                         let tag = d.id & 0xffff;
@@ -10872,7 +10997,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                         const RATE: u32 = 24_000;
                                         let height = |x: i32, z: i32| gen.surface_y_at(x, z, ymin, ymax).map(|y| y as f32 + 1.0);
                                         let t = std::time::Instant::now();
-                                        let plan = land_echo::plan(src, eye, fwd3, &height, &land_echo::EchoParams::default());
+                                        // A roar is loud: full level out to 20 m, not the default 6.
+                                        let params = land_echo::EchoParams { ref_dist: 20.0, ..land_echo::EchoParams::default() };
+                                        let plan = land_echo::plan(src, eye, fwd3, &height, &params);
                                         log::info!(
                                             "sfx: {} — {:.0} Hz, {:.1} s, {} (terrain probe {:.0} ms)",
                                             label, voice.pitch_hz, voice.duration_s, land_echo::describe(&plan),
