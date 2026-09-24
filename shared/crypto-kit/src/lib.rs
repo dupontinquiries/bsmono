@@ -117,6 +117,22 @@ pub fn ed25519_keypair() -> (Zeroizing<[u8; PRIV_KEY_LEN]>, [u8; PUB_KEY_LEN]) {
     (Zeroizing::new(sk.to_bytes()), vk.to_bytes())
 }
 
+/// Fill `buf` from the operating system's CSPRNG (getrandom via `OsRng`), the same source
+/// every key in this crate comes from. Panics if the OS has no randomness to give: for ids,
+/// nonces and tokens that is the right failure -- the alternative callers used to write by hand
+/// (fall back to the clock) produces values an attacker can predict.
+pub fn random_bytes(buf: &mut [u8]) {
+    use rand_core::RngCore;
+    OsRng.fill_bytes(buf);
+}
+
+/// `n` random bytes as lowercase hex (2n characters).
+pub fn random_hex(n: usize) -> String {
+    let mut b = vec![0u8; n];
+    random_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 /// The Ed25519 verifying key for a signing key (seed).
 pub fn ed25519_public_from_seed(signing_key: &[u8; PRIV_KEY_LEN]) -> [u8; PUB_KEY_LEN] {
     SigningKey::from_bytes(signing_key).verifying_key().to_bytes()
@@ -187,6 +203,18 @@ mod tests {
         assert!(!verify(&vk, b"other message", &sig), "wrong message must fail");
         let (_, vk2) = ed25519_keypair();
         assert!(!verify(&vk2, msg, &sig), "wrong key must fail");
+    }
+
+    #[test]
+    fn random_hex_is_the_right_length_and_does_not_repeat() {
+        let a = random_hex(16);
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        let many: std::collections::HashSet<String> = (0..200).map(|_| random_hex(8)).collect();
+        assert_eq!(many.len(), 200, "no repeats in 200 draws of 64 bits");
+        let mut z = [0u8; 32];
+        random_bytes(&mut z);
+        assert_ne!(z, [0u8; 32]);
     }
 
     #[test]
