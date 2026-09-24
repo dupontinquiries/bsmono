@@ -88,6 +88,7 @@ pub mod rebinds;
 pub mod scroll_edge;
 pub mod pattern_pack;
 pub mod rack_panel;
+pub mod seq_header;
 
 /// Everything the running editor holds.
 pub struct Studio {
@@ -234,7 +235,13 @@ pub struct Studio {
     pub clip_gain_drag: Option<(studio_core::ClipId, f32)>,
     /// The piano roll's resize-in-progress (a fresh note being drawn out,
     /// or an existing one grabbed by its edge).
-    pub roll_drag: Option<studio_egui::roll::NoteDrag>,
+    pub roll: studio_egui::roll::RollState,
+    /// The step grid's and the piano roll's shared horizontal scroll, so a
+    /// switch between the two views of a pattern keeps the same steps under
+    /// your eye. `seq_scroll_owner` is the view that last wrote it; the other
+    /// adopts it on the frame it appears (see `seq_header::adopt_scroll`).
+    pub seq_scroll_x: f32,
+    pub seq_scroll_owner: Option<Panel>,
     /// Which lane the automation strip under the timeline shows, or `None`
     /// for no strip. Local monitoring-adjacent state like `solo`: what you
     /// are LOOKING at is not a project fact.
@@ -403,7 +410,9 @@ impl Studio {
             solo: Vec::new(),
             mixer_drag: None,
             clip_gain_drag: None,
-            roll_drag: None,
+            roll: Default::default(),
+            seq_scroll_x: 0.0,
+            seq_scroll_owner: None,
             auto_target: None,
             auto_binding: None,
             auto_drag: None,
@@ -3373,6 +3382,8 @@ struct ProvenanceJobResult {
 
 #[cfg(feature = "app")]
 pub struct App {
+    /// A Tab taken out of the input by `raw_input_hook`, for `ui()` to act on.
+    tab_flip: bool,
     pub studio: Studio,
     peaks: std::collections::BTreeMap<studio_core::SourceId, studio_audio::Peaks>,
     /// Background provenance/fingerprint jobs for freshly-imported video
@@ -3755,7 +3766,7 @@ impl App {
               passes: looping::Passes::default(),
               take_from: studio_core::Ticks::ZERO,
               settings_open: false, group_graph_open: false, library_open: ws.library_open,
-              rebinds: rebinds::Rebinds::decode(&ws.rebinds), rebind_capture: None,
+              rebinds: rebinds::Rebinds::decode(&ws.rebinds), rebind_capture: None, tab_flip: false,
               panel_nav: Default::default(),
               zones: studio_egui::playkeys::Zones::decode(&ws.piano_zones),
               piano_cal: None,
@@ -3805,6 +3816,17 @@ impl App {
 
 #[cfg(feature = "app")]
 impl eframe::App for App {
+    /// Tab on the two views of a pattern flips between them. Taken here,
+    /// before egui begins the frame, because egui moves keyboard focus on Tab
+    /// at that point (see `seq_header::take_tab`). Only there, and only with
+    /// nothing focused: in a text field, or on any other tab, Tab keeps its
+    /// meaning of moving focus.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if seq_header::other_view(self.studio.panel).is_some() && ctx.memory(|m| m.focused().is_none()) {
+            self.tab_flip |= seq_header::take_tab(&mut raw_input.events);
+        }
+    }
+
     // eframe 0.34's App trait is `ui(&mut self, ui, frame)`, not the `update(ctx, frame)`
     // of earlier versions — the panels come from the Ui's context.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -3842,6 +3864,15 @@ impl eframe::App for App {
         // to take it — exactly the collision that guard exists to catch.
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::R)) {
             self.toggle_take();
+        }
+        // Tab flips a pattern between its two views (Steps / Notes); the key
+        // was taken out of the input in `raw_input_hook`, before egui could
+        // move focus with it.
+        if std::mem::take(&mut self.tab_flip) {
+            if let Some(other) = seq_header::other_view(self.studio.panel) {
+                self.studio.panel = other;
+                self.studio.status = format!("{} view", seq_header::view_name(other));
+            }
         }
         if std::mem::take(&mut self.studio.palette_requested) && self.palette.is_none() {
             self.palette = Some(palette::Palette::open_with(self.words_raw.clone()));

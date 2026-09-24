@@ -511,6 +511,18 @@ impl Pattern {
         self.roll(ch).iter().filter(|n| n.start == start)
             .map(|n| n.vel).fold(None, |a, v| Some(a.map_or(v, |m: f32| m.max(v))))
     }
+    /// Move the note at (start, key) to (to_start, to_key), keeping its
+    /// length, velocity and slide. A note already at the destination is
+    /// REPLACED (`add_note`'s rule: one placement, one note). Returns whether
+    /// there was a note to move. One edit for a drag-and-drop, not a remove
+    /// and an add a collaborator could see half of.
+    pub fn move_note(&mut self, ch: usize, start: u32, key: i8, to_start: u32, to_key: i8) -> bool {
+        let Some(n) = self.roll(ch).iter().copied().find(|m| m.start == start && m.key == key) else { return false };
+        if (to_start, to_key) == (start, key) { return true; }
+        self.remove_note(ch, start, key);
+        self.add_note(ch, Note { start: to_start, key: to_key, ..n });
+        true
+    }
     /// Flip the slide flag of the note at (start, key).
     pub fn toggle_note_slide(&mut self, ch: usize, start: u32, key: i8) {
         if let Some(notes) = self.rolls.get_mut(&ch) {
@@ -1477,6 +1489,18 @@ impl Recorder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_moved_note_keeps_its_length_velocity_and_slide_and_replaces_what_it_lands_on() {
+        let mut p = Pattern::new("m", 16, 1);
+        p.add_note(0, Note { key: 3, start: 2, len: 4, vel: 0.4, slide: true });
+        p.add_note(0, Note { key: 5, start: 8, len: 1, vel: 1.0, slide: false });
+        assert!(p.move_note(0, 2, 3, 8, 5));
+        assert_eq!(p.roll(0), &[Note { key: 5, start: 8, len: 4, vel: 0.4, slide: true }]);
+        assert!(!p.move_note(0, 2, 3, 0, 0), "nothing left at the old place");
+        assert!(p.move_note(0, 8, 5, 8, 5), "a move to where it is, is a no-op that found the note");
+        assert_eq!(p.roll(0).len(), 1);
+    }
+
     use super::*;
     use studio_core::{ClipId, Op, SourceId, TrackId};
 
