@@ -131,6 +131,12 @@ pub const PATH_TTL: f32 = 4.0;
 /// Planner grid pitch and reach, world units.
 pub const PLAN_CELL: f32 = 1.0;
 pub const PLAN_RADIUS: f32 = 16.0;
+/// Plans the whole match may make in one sim tick. Measured (examples/
+/// planbench, unoptimized crate code on x86): median 150 us, p95 630 us,
+/// worst 3 ms per plan. Two a tick bounds a burst of stuck bots to a few ms
+/// on a slow core instead of nine plans stacking on one frame; the rest
+/// fall back to the fan for a tick and plan on the next.
+pub const PLANS_PER_TICK: u32 = 2;
 
 /// Is the direct fan good enough, or does this need a plan? Good enough
 /// means a heading within ~70 deg of the goal that is walkable at least half
@@ -245,7 +251,11 @@ pub fn plan(world: &Blockers, pos: Vec3, want: Vec3, radius: f32, who: Carriage)
 /// [`steer`], with a memory: when the direct fan cannot make progress (a
 /// concave corner, a long wall across the way), plan a local detour and
 /// follow it for up to [`PATH_TTL`], re-planning if it is exhausted early.
-pub fn steer_with(world: &Blockers, pos: Vec3, want: Vec3, prev: Vec3, radius: f32, who: Carriage, mem: &mut Memory, now: f32) -> Vec3 {
+///
+/// `may_plan` is the caller's budget: when false, a failing fan falls back
+/// to the stateless [`steer`] this tick and the plan waits for a tick with
+/// budget (see `PLANS_PER_TICK`).
+pub fn steer_with(world: &Blockers, pos: Vec3, want: Vec3, prev: Vec3, radius: f32, who: Carriage, mem: &mut Memory, now: f32, may_plan: bool) -> Vec3 {
     let len = Vec3::new(want.x, 0.0, want.z).length();
     if len < 1e-4 || !pos.is_finite() || !want.is_finite() {
         mem.path.clear();
@@ -260,7 +270,7 @@ pub fn steer_with(world: &Blockers, pos: Vec3, want: Vec3, prev: Vec3, radius: f
     }
     if mem.path.is_empty() {
         let f = fan(world, pos, want, prev, radius, who);
-        if fan_is_enough(&f) {
+        if fan_is_enough(&f) || !may_plan {
             return steer(world, pos, want, prev, radius, who);
         }
         mem.path = plan(world, pos, want, radius, who);
@@ -352,7 +362,7 @@ mod tests {
         let mut mem = Memory::default();
         while t < 12.0 && pos.z < 3.0 {
             let want = (goal - pos).normalize_or_zero();
-            let d = steer_with(&w, pos, want, prev, R, RUN, &mut mem, t);
+            let d = steer_with(&w, pos, want, prev, R, RUN, &mut mem, t, true);
             prev = d;
             pos += d.normalize_or_zero() * 6.0 * dt;
             pos = w.resolve(pos, R);
@@ -363,6 +373,20 @@ mod tests {
         assert!(mem.plans >= 1 && mem.plans < 10, "planned, and did not thrash: {} plans", mem.plans);
     }
 
+    /// No budget, no plan: the corner is left to the fan for that tick.
+    #[test]
+    fn without_budget_it_does_not_plan() {
+        let mut w = world();
+        w.push(Blocker { shape: Shape::Segment { x0: -10.0, z0: 1.5, x1: 0.0, z1: 1.5, r: 0.9 }, top: 3.0, cover: Cover::NONE });
+        w.push(Blocker { shape: Shape::Segment { x0: 0.0, z0: -0.3, x1: 0.0, z1: -6.3, r: 0.9 }, top: 3.0, cover: Cover::NONE });
+        let mut mem = Memory::default();
+        let _ = steer_with(&w, Vec3::new(-1.4, 0.0, -0.1), Vec3::Z, Vec3::ZERO, R, RUN, &mut mem, 0.0, false);
+        assert_eq!(mem.plans, 0);
+        assert!(mem.path.is_empty());
+        let _ = steer_with(&w, Vec3::new(-1.4, 0.0, -0.1), Vec3::Z, Vec3::ZERO, R, RUN, &mut mem, 0.016, true);
+        assert_eq!(mem.plans, 1, "and plans once it has budget");
+    }
+
     /// Open ground never plans: the planner is for when the fan fails, and
     /// a bot that planned every tick would cost 2500 cell expansions a tick.
     #[test]
@@ -371,7 +395,7 @@ mod tests {
         let mut mem = Memory::default();
         let mut pos = Vec3::ZERO;
         for k in 0..300 {
-            let d = steer_with(&w, pos, Vec3::X, Vec3::X, R, RUN, &mut mem, k as f32 / 60.0);
+            let d = steer_with(&w, pos, Vec3::X, Vec3::X, R, RUN, &mut mem, k as f32 / 60.0, true);
             pos += d * 0.1;
         }
         assert_eq!(mem.plans, 0);

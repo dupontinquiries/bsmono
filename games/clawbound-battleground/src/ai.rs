@@ -311,7 +311,11 @@ pub fn think(game: &mut Game, gi: usize) {
         }
         let blockers = game.blockers.clone();
         let (pos, prev, now) = (g.pos, g.move_dir, game.t);
-        crate::steer::steer_with(&blockers, pos, move_dir, prev, crate::consts::GOD_RADIUS, who, &mut game.steer_mem[gi], now)
+        let may_plan = game.plans_this_tick < crate::steer::PLANS_PER_TICK;
+        let before = game.steer_mem[gi].plans;
+        let d = crate::steer::steer_with(&blockers, pos, move_dir, prev, crate::consts::GOD_RADIUS, who, &mut game.steer_mem[gi], now, may_plan);
+        game.plans_this_tick += game.steer_mem[gi].plans - before;
+        d
     };
 
     // write back
