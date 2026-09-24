@@ -34,6 +34,10 @@ pub struct CameraChoice {
     /// A libcamera camera id, as `cam -l` prints it in parentheses.
     pub name: Option<String>,
     pub capture: Option<(usize, usize)>,
+    /// Cap the rate at the SOURCE. Frames that would be dropped downstream
+    /// are then never debayered at all, which is the expensive part when
+    /// libcamera has no hardware ISP to hand the work to.
+    pub fps: Option<u32>,
 }
 
 impl CameraChoice {
@@ -46,8 +50,147 @@ impl CameraChoice {
             let (w, h) = c.trim().split_once(['x', 'X'])?;
             Some((w.parse().ok()?, h.parse().ok()?))
         });
-        CameraChoice { name, capture }
+        CameraChoice { name, capture, fps: None }
     }
+}
+
+/// How big a frame needs to be to TINT a lock screen: not very. The pane
+/// blurs it past the point where pixels are visible, so capturing at pane
+/// resolution spends CPU on detail that is thrown away — and on this phone
+/// libcamera runs the `simple` pipeline handler, debayering every frame in
+/// software, so the cost is close to linear in pixels.
+pub const GLASS_W: usize = 32;
+pub const GLASS_H: usize = 40;
+
+/// Choose the rear camera from `cam -l` output, for when the environment
+/// names none.
+///
+/// `CameraChoice` with no name opens whichever camera libcamera lists first,
+/// which on the FP5 is the front one. A lock screen tinting itself from the
+/// room wants the camera pointed AT the room, and a selfie camera aimed at a
+/// face is both the wrong view and unsettling. Several rear cameras exist
+/// here (main and ultra-wide); the first listed is taken, because the choice
+/// must be STABLE across boots or the tint changes character for no visible
+/// reason.
+///
+/// Lines look like:
+/// `1: Internal back camera (/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a)`
+pub fn pick_rear(cam_l_output: &str) -> Option<String> {
+    let id_of = |l: &str| l.rsplit_once('(').and_then(|(_, r)| r.split_once(')')).map(|(id, _)| id.trim().to_string());
+    cam_l_output
+        .lines()
+        .filter(|l| l.to_ascii_lowercase().contains("back camera"))
+        .find_map(id_of)
+        .or_else(|| cam_l_output.lines().find_map(id_of))
+}
+
+/// When the camera may run, so a lock-screen tint costs a sip rather than a
+/// stream.
+///
+/// The tint tracks the room, and a room's light changes over minutes. So the
+/// camera runs for a moment, yields a frame, and is shut off — which powers
+/// the sensor and the ISP down rather than merely ignoring their output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Duty {
+    /// libcamera needs a moment to configure, allocate and let exposure
+    /// settle; a frame grabbed before that is dark or green.
+    pub warmup_ms: u64,
+    pub period_ms: u64,
+}
+
+impl Default for Duty {
+    fn default() -> Duty {
+        Duty { warmup_ms: 1_200, period_ms: 30_000 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DutyAction {
+    Start,
+    Stop,
+    Wait,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DutyCycle {
+    pub duty: Duty,
+    running_since: Option<u64>,
+    last_stop: Option<u64>,
+    got_frame: bool,
+}
+
+impl DutyCycle {
+    pub fn new(duty: Duty) -> DutyCycle {
+        DutyCycle { duty, ..Default::default() }
+    }
+    pub fn running(&self) -> bool {
+        self.running_since.is_some()
+    }
+    /// Note that a frame arrived; the window can end early.
+    pub fn frame(&mut self) {
+        self.got_frame = true;
+    }
+    /// `wanted` is whether the pane is visible at all; when it goes false the
+    /// camera stops at once rather than finishing its window.
+    pub fn tick(&mut self, wanted: bool, now_ms: u64) -> DutyAction {
+        if !wanted {
+            if self.running_since.take().is_some() {
+                self.last_stop = Some(now_ms);
+                self.got_frame = false;
+                return DutyAction::Stop;
+            }
+            return DutyAction::Wait;
+        }
+        match self.running_since {
+            Some(started) => {
+                if self.got_frame || now_ms.saturating_sub(started) >= self.duty.warmup_ms {
+                    self.running_since = None;
+                    self.last_stop = Some(now_ms);
+                    self.got_frame = false;
+                    DutyAction::Stop
+                } else {
+                    DutyAction::Wait
+                }
+            }
+            None => match self.last_stop {
+                Some(t) if now_ms.saturating_sub(t) < self.duty.period_ms => DutyAction::Wait,
+                _ => {
+                    self.running_since = Some(now_ms);
+                    self.got_frame = false;
+                    DutyAction::Start
+                }
+            },
+        }
+    }
+}
+
+/// Reduce a frame to the average colour of a coarse grid — thick frosted
+/// glass rather than a picture. Cheap on an already tiny frame, and it means
+/// no recognisable image of the room ever reaches a LOCK screen.
+pub fn glass(frame: &Frame, cols: usize, rows: usize) -> Vec<[u8; 3]> {
+    let (cols, rows) = (cols.max(1), rows.max(1));
+    let mut out = Vec::with_capacity(cols * rows);
+    for gy in 0..rows {
+        for gx in 0..cols {
+            let (x0, x1) = (gx * frame.w / cols, ((gx + 1) * frame.w / cols).max(gx * frame.w / cols + 1));
+            let (y0, y1) = (gy * frame.h / rows, ((gy + 1) * frame.h / rows).max(gy * frame.h / rows + 1));
+            let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+            for y in y0..y1.min(frame.h) {
+                for x in x0..x1.min(frame.w) {
+                    let i = (y * frame.w + x) * 4;
+                    if i + 2 < frame.rgba.len() {
+                        r += frame.rgba[i] as u64;
+                        g += frame.rgba[i + 1] as u64;
+                        b += frame.rgba[i + 2] as u64;
+                        n += 1;
+                    }
+                }
+            }
+            let n = n.max(1);
+            out.push([(r / n) as u8, (g / n) as u8, (b / n) as u8]);
+        }
+    }
+    out
 }
 
 /// The pipeline the phone runs: libcamera through GStreamer, scaled to the
@@ -60,7 +203,17 @@ pub fn gst_command(choice: &CameraChoice, w: usize, h: usize) -> Vec<String> {
     }
     if let Some((cw, ch)) = choice.capture {
         v.push("!".into());
-        v.push(format!("video/x-raw,width={cw},height={ch}"));
+        v.push(match choice.fps {
+            Some(f) => format!("video/x-raw,width={cw},height={ch},framerate={f}/1"),
+            None => format!("video/x-raw,width={cw},height={ch}"),
+        });
+    } else if let Some(f) = choice.fps {
+        v.push("!".into());
+        v.push(format!("video/x-raw,framerate={f}/1"));
+    }
+    if choice.fps.is_some() {
+        v.push("!".into());
+        v.push("videorate".into());
     }
     for a in ["!", "videoconvert", "!", "videoscale", "!"] {
         v.push(a.into());
@@ -218,7 +371,7 @@ mod tests {
         // The FP5's main rear camera, as `cam -l` printed it there.
         let id = "/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a";
         let c = CameraChoice::from_vars(Some(id), Some("1280x960"));
-        assert_eq!(c, CameraChoice { name: Some(id.into()), capture: Some((1280, 960)) });
+        assert_eq!(c, CameraChoice { name: Some(id.into()), capture: Some((1280, 960)), fps: None });
         let cmd = gst_command(&c, 240, 320);
         let at = |x: &str| cmd.iter().position(|a| a == x).unwrap_or_else(|| panic!("{x} missing: {cmd:?}"));
         assert_eq!(at("libcamerasrc") + 1, at(&format!("camera-name={id}")), "the property belongs to libcamerasrc");
@@ -234,5 +387,81 @@ mod tests {
         assert_ne!(a.rgba, b.rgba);
         let fa = tideshell_core::track::Frame::from_rgba(240, 320, &a.rgba);
         assert!(tideshell_core::track::find_corners(&fa).len() > 10);
+    }
+}
+
+#[cfg(test)]
+mod glass_tests {
+    use super::*;
+
+    const CAM_L: &str = "\
+Available cameras:
+1: Internal back camera (/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a)
+2: Internal back camera (/base/soc@0/cci@ac4a000/i2c-bus@1/camera@29)
+3: Internal front camera (/base/soc@0/cci@ac4b000/i2c-bus@1/camera@10)";
+
+    #[test]
+    fn the_rear_camera_is_chosen_not_whichever_is_first() {
+        let id = pick_rear(CAM_L).unwrap();
+        assert!(id.ends_with("camera@1a"), "got {id}");
+        assert!(!id.contains("cci@ac4b000"), "never the front one");
+        assert_eq!(pick_rear(CAM_L), pick_rear(CAM_L), "stable across boots");
+        // A front-only device still gets a pane rather than nothing.
+        assert_eq!(pick_rear("1: Internal front camera (/base/x/camera@10)").unwrap(), "/base/x/camera@10");
+        assert_eq!(pick_rear(""), None);
+    }
+
+    #[test]
+    fn capping_the_rate_happens_at_the_source() {
+        let c = CameraChoice { name: Some("/base/cam@1a".into()), capture: Some((640, 480)), fps: Some(1) };
+        let line = gst_command(&c, GLASS_W, GLASS_H).join(" ");
+        assert!(line.contains("camera-name=/base/cam@1a"));
+        assert!(line.contains("width=640,height=480,framerate=1/1"), "on the capture caps, not only downstream: {line}");
+        assert!(line.contains("videorate"));
+        assert!(line.contains("width=32,height=40"));
+        // No fps asked for: the pipeline is exactly as it was before.
+        let plain = CameraChoice { name: None, capture: None, fps: None };
+        let l2 = gst_command(&plain, 240, 320).join(" ");
+        assert!(!l2.contains("framerate") && !l2.contains("videorate"));
+    }
+
+    #[test]
+    fn the_camera_sips_rather_than_streams() {
+        let mut d = DutyCycle::new(Duty { warmup_ms: 1_000, period_ms: 10_000 });
+        assert_eq!(d.tick(true, 0), DutyAction::Start);
+        assert_eq!(d.tick(true, 500), DutyAction::Wait, "still warming up");
+        d.frame();
+        assert_eq!(d.tick(true, 600), DutyAction::Stop, "a frame arrived, so stop early");
+        assert_eq!(d.tick(true, 5_000), DutyAction::Wait, "not yet — 10 s period");
+        assert_eq!(d.tick(true, 10_700), DutyAction::Start);
+        // No frame ever: the warmup budget bounds it anyway.
+        assert_eq!(d.tick(true, 11_200), DutyAction::Wait);
+        assert_eq!(d.tick(true, 11_800), DutyAction::Stop);
+    }
+
+    #[test]
+    fn hiding_the_pane_stops_the_camera_at_once() {
+        let mut d = DutyCycle::new(Duty::default());
+        assert_eq!(d.tick(true, 0), DutyAction::Start);
+        assert_eq!(d.tick(false, 10), DutyAction::Stop, "now, not after the warmup");
+        assert_eq!(d.tick(false, 20), DutyAction::Wait);
+    }
+
+    #[test]
+    fn glass_keeps_the_colour_and_loses_the_picture() {
+        let (w, h) = (8usize, 4usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                if x < w / 2 { rgba[i] = 200 } else { rgba[i + 2] = 100 }
+                rgba[i + 3] = 255;
+            }
+        }
+        let f = Frame { w, h, rgba };
+        assert_eq!(glass(&f, 2, 1), vec![[200, 0, 0], [0, 0, 100]]);
+        assert_eq!(glass(&f, 1, 1), vec![[100, 0, 50]], "averaged, so no detail survives");
+        assert_eq!(glass(&f, 0, 0).len(), 1, "degenerate asks do not panic");
+        assert_eq!(glass(&Frame { w: 0, h: 0, rgba: vec![] }, 2, 2).len(), 4);
     }
 }
