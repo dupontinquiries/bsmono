@@ -31,20 +31,29 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use vidkit_core::frame::{ColorInfo, CpuPlanes, Frame, FrameData, PlaneLayout};
 
-/// What ffprobe says about a file.
+/// What ffprobe says about a video stream.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Probe {
     pub width: u32,
     pub height: u32,
     /// Frames per second, as a rational reduced to a float.
     pub fps: f64,
+    /// ffmpeg's codec name (`h264`, `vp9`, `av1`...). Empty when ffprobe did
+    /// not say; hardware selection then declines rather than guessing.
+    pub codec: String,
 }
 
-/// Parse `ffprobe -show_entries stream=width,height,r_frame_rate` output.
+/// The ffprobe arguments shared by the file and URL probes. `codec_name` is
+/// asked for because hardware decode is chosen per codec.
+const PROBE_ENTRIES: &str = "stream=codec_name,width,height,r_frame_rate";
+
+/// Parse `ffprobe -show_entries stream=...` output.
 ///
 /// Separated from the process call so the parsing is tested without spawning
 /// anything — and the rational is the part that goes wrong: `30000/1001` is
@@ -54,11 +63,13 @@ pub fn parse_probe(text: &str) -> Option<Probe> {
     let mut w = None;
     let mut h = None;
     let mut fps = None;
+    let mut codec = String::new();
     for line in text.lines() {
         let (k, v) = line.split_once('=')?;
         match k.trim() {
             "width" => w = v.trim().parse().ok(),
             "height" => h = v.trim().parse().ok(),
+            "codec_name" => codec = v.trim().to_string(),
             "r_frame_rate" => {
                 let v = v.trim();
                 fps = match v.split_once('/') {
@@ -78,32 +89,381 @@ pub fn parse_probe(text: &str) -> Option<Probe> {
         // A stream with no frame rate is not fatal: still images and some
         // captures report none, and 24 is a better guess than refusing.
         fps: fps.filter(|f| *f > 0.0).unwrap_or(24.0),
+        codec,
     })
 }
 
 /// Ask ffprobe about a file.
 pub fn probe(path: &Path) -> Result<Probe, String> {
-    let out = Command::new("ffprobe")
-        .args([
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,r_frame_rate",
-            "-of", "default=noprint_wrappers=1",
-        ])
-        .arg(path)
-        .output()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => "ffprobe is not installed".to_string(),
-            _ => format!("ffprobe: {e}"),
-        })?;
+    probe_input(&path.to_string_lossy(), &[])
+}
+
+/// ffprobe a path or URL, with the headers a signed URL is bound to.
+pub fn probe_input(input: &str, headers: &[(String, String)]) -> Result<Probe, String> {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args(["-v", "error"]);
+    if !headers.is_empty() {
+        cmd.args(["-headers", &header_blob(headers)]);
+    }
+    cmd.args(["-select_streams", "v:0", "-show_entries", PROBE_ENTRIES, "-of", "default=noprint_wrappers=1"])
+        .arg(input);
+    let out = cmd.output().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => "ffprobe is not installed".to_string(),
+        _ => format!("ffprobe: {e}"),
+    })?;
     if !out.status.success() {
         return Err(format!(
-            "ffprobe: {}",
+            "ffprobe {input}: {}",
             String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or("failed")
         ));
     }
-    parse_probe(&String::from_utf8_lossy(&out.stdout))
-        .ok_or_else(|| format!("{}: no video stream", path.display()))
+    parse_probe(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| format!("{input}: no video stream"))
+}
+
+/// Kept for callers that probe a URL by name.
+pub fn probe_url(url: &str, headers: &[(String, String)]) -> Result<Probe, String> {
+    probe_input(url, headers)
+}
+
+fn header_blob(headers: &[(String, String)]) -> String {
+    headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect()
+}
+
+/// The output size for a long-edge cap, or `None` when no scaling is needed.
+///
+/// Computed HERE and passed to ffmpeg as explicit numbers. The streaming path
+/// used to hand ffmpeg a `-2` expression and compute the size separately in
+/// Rust; the two round differently, and a frame one row shorter than the
+/// buffer tears every picture after the first.
+pub fn fit_long_edge(w: u32, h: u32, cap: Option<u32>) -> Option<(u32, u32)> {
+    let cap = cap?;
+    let long = w.max(h);
+    if long <= cap || w == 0 || h == 0 {
+        return None;
+    }
+    let scale = cap as f64 / long as f64;
+    // Even dimensions: NV12 chroma is subsampled by two, and an odd width
+    // makes every row after the first shear.
+    let sw = (((w as f64 * scale).round() as u32) & !1).max(2);
+    let sh = (((h as f64 * scale).round() as u32) & !1).max(2);
+    Some((sw, sh))
+}
+
+// ---------------------------------------------------------------------------
+// hardware decode selection
+// ---------------------------------------------------------------------------
+
+/// How ffmpeg decodes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Accel {
+    Software,
+    /// VAAPI through a DRM render node — Intel and AMD desktops. Scaling runs
+    /// on the GPU too, so a 4K source crosses the bus at the display size.
+    Vaapi { device: String },
+    /// A V4L2 memory-to-memory decoder (`vp9_v4l2m2m`...) — Venus on the
+    /// Fairphone. An INPUT option: it replaces the software decoder.
+    V4l2m2m { decoder: String },
+}
+
+impl Accel {
+    pub fn label(&self) -> String {
+        match self {
+            Accel::Software => "software".into(),
+            Accel::Vaapi { .. } => "VAAPI".into(),
+            Accel::V4l2m2m { decoder } => decoder.clone(),
+        }
+    }
+    pub fn is_hardware(&self) -> bool {
+        !matches!(self, Accel::Software)
+    }
+}
+
+/// What the machine offers, gathered once. Separated from gathering so the
+/// selection table is tested with no hardware.
+#[derive(Clone, Debug, Default)]
+pub struct Machine {
+    pub kind: MachineKind,
+    /// The bound DRM driver (`amdgpu`, `i915`, `asahi`, `msm`...).
+    pub gpu_driver: Option<String>,
+    pub render_node: Option<String>,
+    /// Every decoder `ffmpeg -decoders` lists.
+    pub decoders: Vec<String>,
+    /// `ffmpeg -hwaccels`.
+    pub hwaccels: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MachineKind {
+    /// Apple silicon. The AVD is a STATELESS V4L2 decoder, which mainline
+    /// ffmpeg cannot drive, and there is no VAAPI driver for AGX: software.
+    Asahi,
+    /// Qualcomm Venus: stateful V4L2, which ffmpeg's v4l2m2m decoders drive.
+    QualcommVenus,
+    #[default]
+    Other,
+}
+
+/// DRM drivers that ship a VAAPI implementation. `nvidia` is absent on
+/// purpose: its VAAPI needs a third-party shim that is rarely installed, and
+/// trying it costs a failed spawn per session.
+const VAAPI_DRIVERS: &[&str] = &["i915", "xe", "amdgpu", "radeon"];
+const VAAPI_CODECS: &[&str] = &["h264", "hevc", "vp8", "vp9", "av1", "mpeg2video"];
+
+/// Whether hardware decode is allowed, from `VIDKIT_HWDEC` (`0`/`off` to
+/// refuse). Hardware is the default: every path falls back to software.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AccelPref {
+    Auto,
+    SoftwareOnly,
+}
+
+impl AccelPref {
+    pub fn from_env() -> Self {
+        match std::env::var("VIDKIT_HWDEC").ok().as_deref().map(str::trim) {
+            Some("0") | Some("off") | Some("no") | Some("software") => AccelPref::SoftwareOnly,
+            _ => AccelPref::Auto,
+        }
+    }
+}
+
+/// Choose a decoder. Pure.
+///
+/// V4L2 first: where a machine has a stateful decoder it is the fixed-function
+/// block and the cheapest thing on the board. VAAPI only for a driver known to
+/// have it. Everything else is software, which is also the answer when the
+/// codec is unknown — a guess costs a failed spawn at every open.
+pub fn choose_accel(codec: &str, m: &Machine, pref: AccelPref) -> Accel {
+    if pref == AccelPref::SoftwareOnly || codec.is_empty() {
+        return Accel::Software;
+    }
+    let m2m = format!("{codec}_v4l2m2m");
+    if m.kind == MachineKind::QualcommVenus && m.decoders.iter().any(|d| *d == m2m) {
+        return Accel::V4l2m2m { decoder: m2m };
+    }
+    if m.kind == MachineKind::Asahi {
+        return Accel::Software;
+    }
+    let vaapi_driver = m.gpu_driver.as_deref().is_some_and(|d| VAAPI_DRIVERS.contains(&d));
+    if let (true, Some(node)) = (vaapi_driver, &m.render_node) {
+        if m.hwaccels.iter().any(|h| h == "vaapi") && VAAPI_CODECS.contains(&codec) {
+            return Accel::Vaapi { device: node.clone() };
+        }
+    }
+    Accel::Software
+}
+
+/// Parse `ffmpeg -decoders`: lines like ` V....D h264_v4l2m2m  V4L2 mem2mem...`.
+pub fn parse_decoders(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let flags = it.next()?;
+            let name = it.next()?;
+            // Flags are six characters of capitals and dots; the legend above
+            // the table has "=" in that column and is skipped.
+            (flags.len() == 6 && flags.chars().all(|c| c == '.' || c.is_ascii_uppercase())).then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// Parse `ffmpeg -hwaccels`: a header line, then one name per line.
+pub fn parse_hwaccels(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.contains(':') && !l.contains(' '))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The machine, probed once per process. Two ffmpeg invocations and a few
+/// sysfs reads: cheap, but not something to repeat at every seek.
+pub fn machine() -> &'static Machine {
+    static M: OnceLock<Machine> = OnceLock::new();
+    M.get_or_init(|| {
+        let run = |args: &[&str]| {
+            Command::new("ffmpeg")
+                .args(args)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        let p = vidkit_v4l2::sysprobe::probe(Path::new("/"));
+        use vidkit_v4l2::sysprobe::Detected;
+        let kind = match p.detected {
+            Detected::AsahiM1M2 { .. } | Detected::AsahiM3Plus { .. } => MachineKind::Asahi,
+            Detected::QualcommVenus { .. } => MachineKind::QualcommVenus,
+            _ => MachineKind::Other,
+        };
+        let render_node = (128..136)
+            .map(|n| format!("/dev/dri/renderD{n}"))
+            .find(|p| Path::new(p).exists());
+        Machine {
+            kind,
+            gpu_driver: p.gpu_driver,
+            render_node,
+            decoders: parse_decoders(&run(&["-hide_banner", "-decoders"])),
+            hwaccels: parse_hwaccels(&run(&["-hide_banner", "-hwaccels"])),
+        }
+    })
+}
+
+/// Set once a hardware decoder has failed to produce a first frame, so every
+/// later open (each seek is one) goes straight to software instead of paying
+/// for the failed spawn again.
+static HARDWARE_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// The decoder for this codec on this machine, honouring an earlier failure.
+pub fn accel_for(codec: &str) -> Accel {
+    if HARDWARE_FAILED.load(Ordering::Relaxed) {
+        return Accel::Software;
+    }
+    choose_accel(codec, machine(), AccelPref::from_env())
+}
+
+// ---------------------------------------------------------------------------
+// the video decoder
+// ---------------------------------------------------------------------------
+
+/// Where the video comes from. A path and a signed URL differ only in the
+/// input options ffmpeg needs before `-i`.
+#[derive(Clone, Debug)]
+pub struct VideoInput {
+    pub input: String,
+    /// Sent with every request. Empty for a file.
+    pub headers: Vec<(String, String)>,
+    pub network: bool,
+}
+
+impl VideoInput {
+    pub fn file(path: &Path) -> Self {
+        Self { input: path.to_string_lossy().into_owned(), headers: Vec::new(), network: false }
+    }
+    pub fn url(url: &str, headers: &[(String, String)]) -> Self {
+        // Reconnect and headers are HTTP protocol options: handed a path or a
+        // file:// URL, ffmpeg rejects them and exits before the first frame.
+        let network = url.starts_with("http://") || url.starts_with("https://");
+        Self { input: url.to_string(), headers: headers.to_vec(), network }
+    }
+}
+
+/// ffmpeg arguments to decode one video stream to raw NV12 on stdout. Pure.
+///
+/// The order is what breaks, so every flag's side of `-i` is pinned by a test:
+/// `-ss`, `-headers`, `-reconnect`, `-hwaccel` and `-c:v <decoder>` are INPUT
+/// options and must precede it. `-map 0:v:0 -an -sn -dn` makes the process a
+/// video decoder only: audio has its own process, and letting this one pick
+/// an audio stream either decodes it for nothing or — with the rawvideo muxer,
+/// which cannot hold audio — refuses to start at all.
+pub fn video_args(src: &VideoInput, from: Duration, accel: &Accel, scale_to: Option<(u32, u32)>) -> Vec<String> {
+    let mut a: Vec<String> = vec!["-v".into(), "error".into(), "-nostdin".into()];
+    let push = |a: &mut Vec<String>, xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
+
+    match accel {
+        Accel::Software => {}
+        Accel::Vaapi { device } => {
+            push(&mut a, &["-hwaccel", "vaapi", "-hwaccel_device", device]);
+            if scale_to.is_some() {
+                // Keep frames on the GPU so scale_vaapi can shrink them before
+                // the download; without this ffmpeg downloads full size.
+                push(&mut a, &["-hwaccel_output_format", "vaapi"]);
+            }
+        }
+        Accel::V4l2m2m { decoder } => push(&mut a, &["-c:v", decoder]),
+    }
+    if src.network {
+        if !src.headers.is_empty() {
+            a.push("-headers".into());
+            a.push(header_blob(&src.headers));
+        }
+        // Reconnect on a dropped connection. A CDN closing an idle socket
+        // mid-film is routine, and without this the film simply stops.
+        push(&mut a, &["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]);
+    }
+    if !from.is_zero() {
+        // Before -i: seeks the container to the nearest keyframe. After -i it
+        // would decode from the start and discard -- over HTTP, download too.
+        a.push("-ss".into());
+        a.push(format!("{:.3}", from.as_secs_f64()));
+    }
+    a.push("-i".into());
+    a.push(src.input.clone());
+    push(&mut a, &["-map", "0:v:0", "-an", "-sn", "-dn"]);
+
+    if let Some((w, h)) = scale_to {
+        let vf = match accel {
+            Accel::Vaapi { .. } => format!("scale_vaapi=w={w}:h={h}:format=nv12,hwdownload,format=nv12"),
+            // Bilinear, not swscale's bicubic default: for a downscale of two
+            // or less the difference is invisible at arm's length and it is
+            // roughly half the work per pixel, which on a phone core is the
+            // difference between keeping up and not.
+            _ => format!("scale={w}:{h}:flags=bilinear"),
+        };
+        a.push("-vf".into());
+        a.push(vf);
+    }
+    push(&mut a, &["-f", "rawvideo", "-pix_fmt", "nv12", "-"]);
+    a
+}
+
+/// Reusable plane buffers.
+///
+/// Every NV12 frame is two allocations of up to 3 MB. glibc serves those with
+/// mmap and returns them with munmap, so each frame costs page faults on the
+/// way in and a TLB shootdown on the way out; musl — postmarketOS — does the
+/// same for anything this size (tideshell hit the identical cost). Recycling
+/// makes steady-state playback allocate nothing.
+#[derive(Default)]
+pub struct PlanePool {
+    free: Mutex<Vec<Vec<u8>>>,
+}
+
+/// More than the frames in flight (decoder, channel, queue, screen); past
+/// this a returned buffer is freed rather than hoarded.
+const POOL_MAX: usize = 24;
+
+impl PlanePool {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// A buffer of exactly `len` bytes. Contents are unspecified: the caller
+    /// overwrites all of it with read_exact.
+    pub fn take(&self, len: usize) -> Vec<u8> {
+        let found = self.free.lock().ok().and_then(|mut f| {
+            let i = f.iter().position(|v| v.capacity() >= len)?;
+            Some(f.swap_remove(i))
+        });
+        match found {
+            Some(mut v) => {
+                v.resize(len, 0);
+                v
+            }
+            None => vec![0u8; len],
+        }
+    }
+
+    pub fn put(&self, v: Vec<u8>) {
+        if let Ok(mut f) = self.free.lock() {
+            if f.len() < POOL_MAX {
+                f.push(v);
+            }
+        }
+    }
+
+    /// Return a frame's planes.
+    pub fn recycle(&self, frame: Frame) {
+        if let FrameData::Cpu(p) = frame.data {
+            for v in p.data {
+                self.put(v);
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.free.lock().map(|f| f.len()).unwrap_or(0)
+    }
 }
 
 /// A running ffmpeg, yielding NV12 frames.
@@ -112,131 +472,150 @@ pub struct FfmpegFrames {
     pub width: u32,
     pub height: u32,
     pub frame_interval: Duration,
-    /// Reused between frames: at 1080p this is 3 MB, and allocating it per
-    /// frame is the same waste the CPU converter was fixed for.
-    buf: Vec<u8>,
     index: u64,
     pub frames_read: u64,
+    /// What is decoding NOW (after any fallback), for the status line.
+    pub accel: Accel,
+    /// Software arguments to retry with if the hardware decoder produces
+    /// nothing. Taken on first use; `None` once software is running.
+    fallback: Option<Vec<String>>,
+    /// Why a fallback happened, once, for the UI.
+    pub note: Option<String>,
+    pool: Arc<PlanePool>,
+}
+
+fn spawn_ffmpeg(args: &[String]) -> Result<Child, String> {
+    Command::new("ffmpeg")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        // Inherited stderr would scribble over the UI; ffmpeg is chatty even
+        // at -v error.
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => "ffmpeg is not installed".to_string(),
+            _ => format!("ffmpeg: {e}"),
+        })
 }
 
 impl FfmpegFrames {
-    /// Decode `path` to NV12, optionally scaled down.
-    ///
-    /// `max_long_edge` exists because decoding 1440p in software to throw most
-    /// of it away is the expensive mistake the capability model is there to
-    /// avoid — letting ffmpeg scale costs far less than decoding full size and
-    /// scaling afterwards.
-    /// (Test convenience: the app opens with open_at, from any position.)
+    /// Decode `path` to NV12, optionally scaled down. Probes the file itself.
+    /// (Test convenience: the app opens with open_probed, probing once.)
     #[cfg(test)]
     pub fn open(path: &Path, max_long_edge: Option<u32>) -> Result<Self, String> {
         Self::open_at(path, max_long_edge, Duration::ZERO)
     }
 
-    /// [`open`](Self::open), starting at `from` -- how a seek is done: the
-    /// playback engine reopens at the target (see playback::Opener).
+    /// [`open`](Self::open) from `from`, probing again. Seeks in the app go
+    /// through [`open_probed`](Self::open_probed) instead, which does not.
+    pub fn open_at(path: &Path, max_long_edge: Option<u32>, from: Duration) -> Result<Self, String> {
+        let p = probe(path)?;
+        let accel = accel_for(&p.codec);
+        Self::open_probed(&VideoInput::file(path), &p, max_long_edge, from, accel)
+    }
+
+    /// Start decoding with facts already known.
     ///
-    /// `-ss` goes BEFORE `-i`. After it, ffmpeg decodes from the start and
-    /// throws frames away, which is accurate and turns a scrub into a wait
-    /// proportional to how far you scrubbed. Before it, ffmpeg seeks the
-    /// container and starts at the nearest keyframe, which is what a scrub
-    /// wants.
-    pub fn open_at(
-        path: &Path,
+    /// The probe is the caller's so that a seek — a reopen — does not spawn
+    /// ffprobe each time: that was a process and a container parse per scrub,
+    /// and over HTTP a round trip.
+    ///
+    /// `max_long_edge` exists because decoding 1440p in software to throw most
+    /// of it away is the expensive mistake the capability model is there to
+    /// avoid; letting ffmpeg scale costs far less than scaling afterwards.
+    pub fn open_probed(
+        src: &VideoInput,
+        p: &Probe,
         max_long_edge: Option<u32>,
         from: Duration,
+        accel: Accel,
     ) -> Result<Self, String> {
-        let p = probe(path)?;
-        let (mut w, mut h) = (p.width, p.height);
-        let mut filters: Vec<String> = Vec::new();
-        if let Some(cap) = max_long_edge {
-            let long = w.max(h);
-            if long > cap {
-                let scale = cap as f64 / long as f64;
-                // Even dimensions: NV12 chroma is subsampled by two, and an
-                // odd width makes every row after the first shear.
-                w = ((w as f64 * scale) as u32) & !1;
-                h = ((h as f64 * scale) as u32) & !1;
-                filters.push(format!("scale={w}:{h}"));
-            }
-        }
-
-        let mut cmd = Command::new("ffmpeg");
-        cmd.args(["-v", "error", "-nostdin"]);
-        if !from.is_zero() {
-            // Before -i: seeks the container to the nearest keyframe. After
-            // -i it would decode from the start and discard, making a scrub
-            // cost time proportional to how far you scrubbed.
-            cmd.args(["-ss", &format!("{:.3}", from.as_secs_f64())]);
-        }
-        cmd.arg("-i").arg(path);
-        if !filters.is_empty() {
-            cmd.args(["-vf", &filters.join(",")]);
-        }
-        cmd.args(["-f", "rawvideo", "-pix_fmt", "nv12", "-"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            // Inherited stderr would scribble over the UI; ffmpeg is chatty
-            // even at -v error.
-            .stderr(Stdio::null());
-
-        let child = cmd.spawn().map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => "ffmpeg is not installed".to_string(),
-            _ => format!("ffmpeg: {e}"),
-        })?;
-
+        let scale_to = fit_long_edge(p.width, p.height, max_long_edge);
+        let (w, h) = scale_to.unwrap_or((p.width, p.height));
+        let args = video_args(src, from, &accel, scale_to);
+        let fallback = accel.is_hardware().then(|| video_args(src, from, &Accel::Software, scale_to));
+        let child = spawn_ffmpeg(&args)?;
         Ok(Self {
             child,
             width: w,
             height: h,
             frame_interval: Duration::from_secs_f64(1.0 / p.fps.max(1.0)),
-            buf: vec![0u8; frame_bytes(w, h)],
             // Timestamps on the MEDIA timeline from the first frame: opened at
             // 2 s, the first frame is stamped 2 s. Starting at zero stamped a
             // seeked decoder's frames 0 s, 0.033 s... against a clock at 2 s,
             // so a clock-driven player dropped every one as late.
             index: (from.as_secs_f64() * p.fps.max(1.0)).round() as u64,
             frames_read: 0,
+            accel,
+            fallback,
+            note: None,
+            pool: PlanePool::new(),
         })
     }
 
-    /// Jump to a position.
-    ///
-    /// ffmpeg is restarted with `-ss` rather than asked to seek: a decode
-    /// pipeline reading raw frames off a pipe has no seek, and draining to the
-    /// target would read every frame in between — for a scrub to the end of a
-    /// lecture that is the whole file.
-    ///
+    /// Share a pool with the consumer, which returns planes to it.
+    pub fn set_pool(&mut self, pool: Arc<PlanePool>) {
+        self.pool = pool;
+    }
+
+    /// Read one frame into pooled planes. `false` at end of stream.
+    fn read_planes(&mut self, luma: &mut [u8], chroma: &mut [u8]) -> bool {
+        let Some(stdout) = self.child.stdout.as_mut() else { return false };
+        // read_exact, not read: a pipe hands over whatever is ready, so a
+        // single read returns a partial frame and the picture tears diagonally
+        // — the classic symptom of treating a pipe like a file. Straight into
+        // the planes: the old path read into a scratch buffer and copied both
+        // planes out, touching every byte twice.
+        stdout.read_exact(luma).is_ok() && stdout.read_exact(chroma).is_ok()
+    }
 
     /// The next frame, or `None` at the end of the stream.
     pub fn next_frame(&mut self) -> Option<Frame> {
-        let stdout = self.child.stdout.as_mut()?;
-        // read_exact, not read: a pipe hands over whatever is ready, so a
-        // single read returns a partial frame and the picture tears diagonally
-        // — the classic symptom of treating a pipe like a file.
-        if stdout.read_exact(&mut self.buf).is_err() {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (luma_len, chroma_len) = (w * h, frame_bytes(self.width, self.height) - w * h);
+        loop {
+            let mut luma = self.pool.take(luma_len);
+            let mut chroma = self.pool.take(chroma_len);
+            if self.read_planes(&mut luma, &mut chroma) {
+                let pts = self.frame_interval.mul_f64(self.index as f64);
+                self.index += 1;
+                self.frames_read += 1;
+                return Some(Frame {
+                    data: FrameData::Cpu(CpuPlanes { data: vec![luma, chroma], strides: vec![self.width, self.width] }),
+                    width: self.width,
+                    height: self.height,
+                    layout: PlaneLayout::Nv12,
+                    color: ColorInfo::default(),
+                    pts,
+                    duration: Some(self.frame_interval),
+                    recycle: None,
+                });
+            }
+            self.pool.put(luma);
+            self.pool.put(chroma);
+            // A hardware decoder that produced NOTHING failed to start: no
+            // device, no driver, an unsupported profile. Retry in software
+            // once, and remember, so the next seek does not pay again. After
+            // a first frame an end is a real end.
+            if self.frames_read == 0 {
+                if let Some(args) = self.fallback.take() {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    HARDWARE_FAILED.store(true, Ordering::Relaxed);
+                    self.note = Some(format!("{} produced no frames; decoding in software", self.accel.label()));
+                    self.accel = Accel::Software;
+                    match spawn_ffmpeg(&args) {
+                        Ok(c) => {
+                            self.child = c;
+                            continue;
+                        }
+                        Err(_) => return None,
+                    }
+                }
+            }
             return None;
         }
-        let (w, h) = (self.width as usize, self.height as usize);
-        let luma = self.buf[..w * h].to_vec();
-        let chroma = self.buf[w * h..].to_vec();
-
-        let pts = self.frame_interval.mul_f64(self.index as f64);
-        self.index += 1;
-        self.frames_read += 1;
-
-        Some(Frame {
-            data: FrameData::Cpu(CpuPlanes {
-                data: vec![luma, chroma],
-                strides: vec![self.width, self.width],
-            }),
-            width: self.width,
-            height: self.height,
-            layout: PlaneLayout::Nv12,
-            color: ColorInfo::default(),
-            pts,
-            duration: Some(self.frame_interval),
-            recycle: None,
-        })
     }
 }
 
@@ -537,156 +916,25 @@ pub struct StreamingInput {
     pub headers: Vec<(String, String)>,
 }
 
-/// ffmpeg arguments for streaming inputs.
+/// ffmpeg arguments for the VIDEO of a streamed source. Pure.
 ///
-/// Pure, because the flag order is what breaks: `-headers` and `-user_agent`
-/// are INPUT options and must precede the `-i` they apply to. Placed after,
-/// ffmpeg silently ignores them and the fetch 403s.
-pub fn streaming_args(input: &StreamingInput, max_long_edge: Option<u32>) -> Vec<String> {
-    let mut a: Vec<String> = vec!["-v".into(), "error".into(), "-nostdin".into()];
-
-    let header_blob = |a: &mut Vec<String>| {
-        if !input.headers.is_empty() {
-            let joined: String = input
-                .headers
-                .iter()
-                .map(|(k, v)| format!("{k}: {v}\r\n"))
-                .collect();
-            a.push("-headers".into());
-            a.push(joined);
-        }
-        // Reconnect on a dropped connection. A CDN closing an idle socket
-        // mid-film is routine, and without this the film simply stops.
-        a.push("-reconnect".into());
-        a.push("1".into());
-        a.push("-reconnect_streamed".into());
-        a.push("1".into());
-        a.push("-reconnect_delay_max".into());
-        a.push("5".into());
-    };
-
-    header_blob(&mut a);
-    a.push("-i".into());
-    a.push(input.video_url.clone());
-
-    if let Some(au) = &input.audio_url {
-        header_blob(&mut a);
-        a.push("-i".into());
-        a.push(au.clone());
-        // Take video from the first input and audio from the second.
-        a.push("-map".into());
-        a.push("0:v:0".into());
-        a.push("-map".into());
-        a.push("1:a:0".into());
-    }
-
-    if let Some(cap) = max_long_edge {
-        a.push("-vf".into());
-        // -2 keeps the other axis even and proportional, which NV12 needs.
-        a.push(format!("scale='if(gt(iw,ih),min({cap},iw),-2)':'if(gt(iw,ih),-2,min({cap},ih))'"));
-    }
-    a.push("-f".into());
-    a.push("rawvideo".into());
-    a.push("-pix_fmt".into());
-    a.push("nv12".into());
-    a.push("-".into());
-    a
+/// The video URL only. A separate audio URL is the audio process's to fetch:
+/// this used to map `1:a:0` into the raw-video output as well, and the
+/// rawvideo muxer cannot carry audio, so ffmpeg refused to start and a
+/// YouTube stream with separate audio -- the ordinary case -- produced no
+/// picture at all.
+pub fn streaming_args(input: &StreamingInput, scale_to: Option<(u32, u32)>) -> Vec<String> {
+    video_args(&VideoInput::url(&input.video_url, &input.headers), Duration::ZERO, &Accel::Software, scale_to)
 }
 
 impl FfmpegFrames {
-    /// Start decoding from URLs, fetching as it goes.
-    ///
-    /// The dimensions come from probing the video URL, which costs one small
-    /// HTTP request rather than the whole file.
-    /// (Test convenience: the app opens with open_streaming_at.)
+    /// Start decoding from URLs, fetching as it goes. Probes the URL itself.
+    /// (Test convenience: the app probes once and uses open_probed.)
     #[cfg(test)]
-    pub fn open_streaming(
-        input: &StreamingInput,
-        max_long_edge: Option<u32>,
-    ) -> Result<Self, String> {
-        Self::open_streaming_at(input, max_long_edge, Duration::ZERO)
+    pub fn open_streaming(input: &StreamingInput, max_long_edge: Option<u32>) -> Result<Self, String> {
+        let p = probe_input(&input.video_url, &input.headers)?;
+        Self::open_probed(&VideoInput::url(&input.video_url, &input.headers), &p, max_long_edge, Duration::ZERO, Accel::Software)
     }
-
-    /// [`open_streaming`](Self::open_streaming), starting at `from`.
-    pub fn open_streaming_at(
-        input: &StreamingInput,
-        max_long_edge: Option<u32>,
-        from: Duration,
-    ) -> Result<Self, String> {
-        let p = probe_url(&input.video_url, &input.headers)?;
-        let (mut w, mut h) = (p.width, p.height);
-        if let Some(cap) = max_long_edge {
-            let long = w.max(h);
-            if long > cap {
-                let scale = cap as f64 / long as f64;
-                w = ((w as f64 * scale) as u32) & !1;
-                h = ((h as f64 * scale) as u32) & !1;
-            }
-        }
-
-        let mut args = streaming_args(input, max_long_edge);
-        if !from.is_zero() {
-            // Inserted before the first -i, for the same reason as the file
-            // path: after it, ffmpeg would fetch and discard everything up to
-            // the seek point, which over HTTP means downloading it too.
-            let at = args.iter().position(|a| a == "-i").unwrap_or(0);
-            args.insert(at, format!("{:.3}", from.as_secs_f64()));
-            args.insert(at, "-ss".into());
-        }
-        let child = Command::new("ffmpeg")
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => "ffmpeg is not installed".to_string(),
-                _ => format!("ffmpeg: {e}"),
-            })?;
-
-        Ok(Self {
-            child,
-            width: w,
-            height: h,
-            frame_interval: Duration::from_secs_f64(1.0 / p.fps.max(1.0)),
-            buf: vec![0u8; frame_bytes(w, h)],
-            // Timestamps on the MEDIA timeline from the first frame: opened at
-            // 2 s, the first frame is stamped 2 s. Starting at zero stamped a
-            // seeked decoder's frames 0 s, 0.033 s... against a clock at 2 s,
-            // so a clock-driven player dropped every one as late.
-            index: (from.as_secs_f64() * p.fps.max(1.0)).round() as u64,
-            frames_read: 0,
-        })
-    }
-}
-
-/// ffprobe a URL rather than a path.
-pub fn probe_url(url: &str, headers: &[(String, String)]) -> Result<Probe, String> {
-    let mut cmd = Command::new("ffprobe");
-    cmd.args(["-v", "error"]);
-    if !headers.is_empty() {
-        let joined: String = headers
-            .iter()
-            .map(|(k, v)| format!("{k}: {v}\r\n"))
-            .collect();
-        cmd.args(["-headers", &joined]);
-    }
-    cmd.args([
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate",
-        "-of", "default=noprint_wrappers=1",
-    ])
-    .arg(url);
-
-    let out = cmd.output().map_err(|e| format!("ffprobe: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "ffprobe {url}: {}",
-            String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or("failed")
-        ));
-    }
-    parse_probe(&String::from_utf8_lossy(&out.stdout))
-        .ok_or_else(|| format!("{url}: no video stream"))
 }
 
 #[cfg(test)]
@@ -711,29 +959,40 @@ mod streaming_tests {
         assert!(hi < ii, "headers after -i are ignored: {a:?}");
     }
 
-    /// Two inputs and an explicit map, or ffmpeg picks one file's streams and
-    /// the audio is silently dropped.
+    /// The video process must not touch the audio URL: mapped into the
+    /// rawvideo output, ffmpeg refuses to start and there is no picture.
     #[test]
-    fn separate_audio_becomes_a_second_input_and_a_map() {
+    fn the_video_process_never_fetches_the_audio_url() {
         let mut i = input();
         i.audio_url = Some("http://cdn/a.m4a".into());
         let a = streaming_args(&i, None);
-        assert_eq!(a.iter().filter(|x| *x == "-i").count(), 2, "{a:?}");
+        assert_eq!(a.iter().filter(|x| *x == "-i").count(), 1, "{a:?}");
+        assert!(!a.iter().any(|x| x.contains("a.m4a")), "{a:?}");
         assert!(a.windows(2).any(|w| w[0] == "-map" && w[1] == "0:v:0"));
-        assert!(a.windows(2).any(|w| w[0] == "-map" && w[1] == "1:a:0"));
+        assert!(a.iter().any(|x| x == "-an"), "{a:?}");
     }
 
-    /// Each input needs its own headers; a signed audio URL is signed too.
+    /// The failure itself, against real ffmpeg: two local files stand in for
+    /// the two URLs. The old argument shape produced zero bytes here.
     #[test]
-    fn both_inputs_get_the_headers() {
-        let mut i = input();
-        i.audio_url = Some("http://cdn/a.m4a".into());
-        let a = streaming_args(&i, None);
-        assert_eq!(
-            a.iter().filter(|x| *x == "-headers").count(),
-            2,
-            "the audio input was left unsigned: {a:?}"
-        );
+    fn video_decodes_when_the_site_serves_audio_separately() {
+        if Command::new("ffmpeg").arg("-version").stdout(Stdio::null()).stderr(Stdio::null())
+            .status().map(|s| !s.success()).unwrap_or(true) { return; }
+        let dir = std::env::temp_dir().join(format!("vk_sep_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (v, au) = (dir.join("v.mp4"), dir.join("a.m4a"));
+        assert!(Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p"]).arg(&v).status().unwrap().success());
+        assert!(Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=duration=1", "-c:a", "aac"]).arg(&au).status().unwrap().success());
+        let input = StreamingInput {
+            video_url: v.to_string_lossy().into(),
+            audio_url: Some(au.to_string_lossy().into()),
+            headers: vec![],
+        };
+        let mut d = FfmpegFrames::open_streaming(&input, None).expect("open");
+        let mut n = 0;
+        while d.next_frame().is_some() { n += 1; }
+        assert_eq!(n, 10, "one second at 10 fps");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A CDN closing an idle socket mid-film is routine; without reconnect the
@@ -953,7 +1212,8 @@ impl AudioStream {
     }
 
     /// The next block of PCM, or `None` at the end.
-    pub fn next_block(&mut self) -> Option<&[u8]> {
+    /// Mutable so the engine can apply volume in place, without a copy.
+    pub fn next_block(&mut self) -> Option<&mut [u8]> {
         let stdout = self.child.stdout.as_mut()?;
         // A partial final block is still audio. Reading exactly would discard
         // the tail of every file whose length is not a multiple of the block.
@@ -969,7 +1229,7 @@ impl AudioStream {
             return None;
         }
         self.frames_read += (filled / (self.channels as usize * 2)) as u64;
-        Some(&self.buf[..filled])
+        Some(&mut self.buf[..filled])
     }
 
     /// How much audio has been produced, which is what an audio clock needs.
@@ -1004,6 +1264,16 @@ pub trait AudioSink: Send {
     /// drive the playback clock, or the film would finish in a second.
     fn realtime(&self) -> bool {
         true
+    }
+    /// Stop or restart the device around a pause. A piped player cannot be
+    /// paused (it plays out its buffer and underruns), so the default is to
+    /// do nothing.
+    fn set_paused(&mut self, _paused: bool) {}
+    /// Frames of silence the device inserted because it ran dry, since the
+    /// last call. The audio clock subtracts them, or every underrun would
+    /// permanently shift sync. Only an in-process sink can know this.
+    fn take_underrun_frames(&mut self) -> u64 {
+        0
     }
 }
 

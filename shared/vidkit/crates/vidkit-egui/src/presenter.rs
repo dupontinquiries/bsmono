@@ -160,8 +160,14 @@ impl EguiPresenter {
 /// repaint when it recovers.
 const STALE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 
-impl Presenter for EguiPresenter {
-    fn submit(&mut self, frame: Frame) -> core_traits::Result<Option<RecycleToken>> {
+impl EguiPresenter {
+    /// Put a frame on screen without taking it.
+    ///
+    /// [`Presenter::submit`] consumes the frame, which suits a decoder with
+    /// recycle tokens but throws away the planes of one that pools its own
+    /// buffers (the ffmpeg path, which gets its planes back after this).
+    /// Returns whether an upload happened.
+    pub fn show(&mut self, frame: &Frame) -> bool {
         let (w, h) = (frame.width as usize, frame.height as usize);
 
         // A frame already on screen is a no-op. The player re-submits when a
@@ -171,13 +177,10 @@ impl Presenter for EguiPresenter {
         // and warm.
         if self.shown_pts == Some(frame.pts) && self.texture.is_some() {
             self.skipped_uploads += 1;
-            let mut frame = frame;
-            let previous = self.held.take();
-            self.held = frame.recycle.take();
-            return Ok(previous);
+            return false;
         }
 
-        match vidkit_core::frame_to_rgba8_into(&frame, &mut self.scratch) {
+        match vidkit_core::frame_to_rgba8_into(frame, &mut self.scratch) {
             Ok(()) => {
                 let image = ColorImage::from_rgba_unmultiplied([w, h], &self.scratch);
                 match &mut self.texture {
@@ -197,6 +200,7 @@ impl Presenter for EguiPresenter {
                 self.uploaded_bytes += (w * h * 4) as u64;
                 self.shown_pts = Some(frame.pts);
                 self.last_error = None;
+                true
             }
             Err(e) => {
                 // Drop the picture, keep the buffer. Counting this as a drop
@@ -205,9 +209,15 @@ impl Presenter for EguiPresenter {
                 // the session.
                 self.drops += 1;
                 self.last_error = Some(e.to_string());
+                false
             }
         }
+    }
+}
 
+impl Presenter for EguiPresenter {
+    fn submit(&mut self, frame: Frame) -> core_traits::Result<Option<RecycleToken>> {
+        self.show(&frame);
         let mut frame = frame;
         let previous = self.held.take();
         self.held = frame.recycle.take();

@@ -61,24 +61,18 @@ fn open_local(path: &PathBuf) -> Result<Opened, String> {
             b"ftyp" | b"styp" | b"moov" | b"free" | b"skip" | b"mdat"
         );
 
-    let (kind, profile, dims, dur, packets) = if is_webm {
-        let mut d = vidkit_webm::WebmDemuxer::open(io::FileSource::open(path)?)
+    // Describe, do not read. This used to walk every packet to print a
+    // count -- `next_packet` reads each sample's bytes and rewrites H.264 to
+    // Annex-B -- so opening a two-hour lecture read and converted the whole
+    // file on the UI thread before the first frame could appear.
+    let (kind, profile, dims, dur) = if is_webm {
+        let d = vidkit_webm::WebmDemuxer::open(io::FileSource::open(path)?)
             .map_err(|e| format!("webm: {e}"))?;
-        let (p, dims, dur) = (d.video_profile(), d.dimensions(), d.duration());
-        let mut n = 0;
-        while matches!(d.next_packet(), Ok(Some(_))) {
-            n += 1;
-        }
-        ("WebM", p, dims, dur, n)
+        ("WebM", d.video_profile(), d.dimensions(), d.duration())
     } else if is_mp4 {
-        let mut d =
+        let d =
             vidkit_mp4::Mp4Demuxer::open(io::FileSource::open(path)?).map_err(|e| format!("mp4: {e}"))?;
-        let (p, dims, dur) = (d.video_profile(), d.dimensions(), d.duration());
-        let mut n = 0;
-        while matches!(d.next_packet(), Ok(Some(_))) {
-            n += 1;
-        }
-        ("MP4", p, dims, dur, n)
+        ("MP4", d.video_profile(), d.dimensions(), d.duration())
     } else {
         return Err(format!(
             "{}: not an MP4 or WebM file (first bytes {:02x?})",
@@ -91,10 +85,9 @@ fn open_local(path: &PathBuf) -> Result<Opened, String> {
         .map(|p| format!("{} {}-bit", p.codec, p.bit_depth))
         .unwrap_or_else(|| "unknown codec".into());
 
-    let _ = packets;
     Ok(Opened {
         label: format!(
-            "{} · {kind} · {codec} · {}x{} · {packets} packets",
+            "{} · {kind} · {codec} · {}x{}",
             path.file_name().unwrap_or_default().to_string_lossy(),
             dims.0,
             dims.1
@@ -292,20 +285,24 @@ impl Player {
     fn produce(&mut self, eframe_frame: &eframe::Frame) {
         let Some(engine) = self.engine.as_mut() else {
             let t = self.started.elapsed().as_secs_f32();
-            self.present(eframe_frame, pattern::bars(t * 0.25));
+            self.present(eframe_frame, &pattern::bars(t * 0.25));
             self.presenter.set_deadline(Some(Instant::now() + Duration::from_millis(33)));
             return;
         };
         if let Some(e) = engine.take_audio_error() {
             self.gpu_error = Some(e);
         }
+        // Volume every tick: one atomic store, read by the audio thread per
+        // block. The transport held a volume that nothing ever applied.
+        engine.set_volume(self.transport.volume);
         let tick = engine.tick();
         self.transport.position = engine.position();
         // Say what is timing playback. On a device, "wall clock (no audio
         // player)" versus "audio clock (pw-play)" is the first thing to know
         // when sound and picture disagree.
         let status = format!(
-            "NV12 · {} · {} clock ({})",
+            "{} · NV12 {} · {} clock ({})",
+            engine.decoder(),
             if self.gpu.is_some() { "GPU" } else { "CPU convert" },
             if engine.clock_is_audio() { "audio" } else { "wall" },
             engine.audio_note
@@ -315,7 +312,10 @@ impl Player {
         }
         match tick {
             playback::Tick::Show { frame, next } => {
-                self.present(eframe_frame, frame);
+                self.present(eframe_frame, &frame);
+                if let Some(e) = self.engine.as_ref() {
+                    e.recycle(frame);
+                }
                 self.presenter.set_deadline(Some(Instant::now() + next));
             }
             playback::Tick::Wait(d) => self.presenter.set_deadline(Some(Instant::now() + d)),
@@ -332,11 +332,14 @@ impl Player {
     /// Put one frame on screen: GPU upload when available, CPU otherwise. A
     /// failed upload switches to the CPU path for good and says why, instead
     /// of leaving a black window.
-    fn present(&mut self, eframe_frame: &eframe::Frame, frame: vidkit_core::Frame) {
+    ///
+    /// Borrows the frame: the caller hands its planes back to the decoder's
+    /// pool afterwards.
+    fn present(&mut self, eframe_frame: &eframe::Frame, frame: &vidkit_core::Frame) {
         if let (Some(gpu), Some(gl)) = (&self.gpu, eframe_frame.gl()) {
             let failed = match gpu.lock() {
                 // SAFETY: eframe's glow context is current on the UI thread.
-                Ok(mut g) => unsafe { g.upload(gl, &frame) }.err(),
+                Ok(mut g) => unsafe { g.upload(gl, frame) }.err(),
                 Err(_) => Some("GPU state poisoned".to_string()),
             };
             match failed {
@@ -347,7 +350,7 @@ impl Player {
                 }
             }
         }
-        let _ = self.presenter.submit(frame);
+        self.presenter.show(frame);
     }
 }
 
@@ -1153,21 +1156,52 @@ impl Player {
     }
 }
 
+/// Probe once per source, not once per open. Each seek reopens the decoder,
+/// and re-probing spawned ffprobe and re-parsed the container every time --
+/// over HTTP, a round trip per scrub.
+fn probed(
+    cache: &std::sync::OnceLock<decode::Probe>,
+    probe: impl FnOnce() -> Result<decode::Probe, String>,
+) -> Result<decode::Probe, String> {
+    if let Some(p) = cache.get() {
+        return Ok(p.clone());
+    }
+    let p = probe()?;
+    let _ = cache.set(p.clone());
+    Ok(p)
+}
+
 /// The engine's opener for a local file: video capped at 1920 on the long
-/// edge (as before), audio at 48 kHz stereo, both from `from`.
+/// edge, hardware decode where the machine has it, audio at 48 kHz stereo.
 fn file_opener(p: PathBuf) -> playback::Opener {
+    let cache = std::sync::OnceLock::new();
     Box::new(move |from| {
-        let v = decode::FfmpegFrames::open_at(&p, Some(1920), from)?;
+        let pr = probed(&cache, || decode::probe(&p))?;
+        let v = decode::FfmpegFrames::open_probed(
+            &decode::VideoInput::file(&p),
+            &pr,
+            Some(1920),
+            from,
+            decode::accel_for(&pr.codec),
+        )?;
         let a = decode::AudioStream::open(&p.to_string_lossy(), 48_000, 2, from).ok();
         Ok((v, a))
     })
 }
 
 /// The engine's opener for a resolved stream: video and audio from the signed
-/// URLs, with their headers.
+/// URLs, each with the headers, each fetched by its own process.
 fn stream_opener(input: decode::StreamingInput, cap: Option<u32>) -> playback::Opener {
+    let cache = std::sync::OnceLock::new();
     Box::new(move |from| {
-        let v = decode::FfmpegFrames::open_streaming_at(&input, cap, from)?;
+        let pr = probed(&cache, || decode::probe_input(&input.video_url, &input.headers))?;
+        let v = decode::FfmpegFrames::open_probed(
+            &decode::VideoInput::url(&input.video_url, &input.headers),
+            &pr,
+            cap,
+            from,
+            decode::accel_for(&pr.codec),
+        )?;
         let a = decode::AudioStream::open_streaming(&input, 48_000, 2, from).ok();
         Ok((v, a))
     })
