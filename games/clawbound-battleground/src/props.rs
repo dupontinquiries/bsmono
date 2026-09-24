@@ -764,3 +764,101 @@ pub fn waterfall(h: f32, variant: i32) -> VoxelMesh {
     g.ellipsoid(4.0, 0.8, 2.5, 3.6, 1.4, 2.6, solid(foam));
     g.mesh(VOX, true)
 }
+
+/// A crag: a cluster of broken rock shards, the way a cliff breaks into
+/// strata and blades rather than being one smooth face. 2-4 shards, each a
+/// tapering prism with an IRREGULAR polygon section (so it has flat facets
+/// and sharp edges, not a round cone), leaning toward local +z -- the
+/// direction the placement turns to face out of the wall -- by `lean`
+/// (0 = upright spire, 1 = jutting out at ~50 degrees). Lighter on the top
+/// facets, dark in the creases at the root, cold grey like the cliffs.
+/// `size` ~0.6..1.6. Built with feet at y = 0 and the lean side at +z.
+///
+/// `vox` is the voxel size: 0.6 for crags seen close, 1.2 for distant
+/// spires (same silhouette, an eighth of the instances by volume).
+pub fn crag(size: f32, variant: i32, lean: f32, vox: f32) -> VoxelMesh {
+    let k = 0.6 / vox.max(0.1);
+    let n = ((24.0 * size * k).clamp(6.0, 44.0)) as usize;
+    let ny = ((34.0 * size * k).clamp(8.0, 60.0)) as usize;
+    let mut g = Grid::new(n, ny, n);
+    let h = |k: i32| {
+        let x = ((variant * 7919 + k * 104729) as f32 * 0.6180339).sin() * 43758.547;
+        x - x.floor()
+    };
+    let c = n as f32 * 0.5;
+    let shards = 2 + (h(1) * 3.0) as i32;
+    for s in 0..shards {
+        let k = 10 + s * 13;
+        // base near the centre, spread a little; the main shard biggest
+        let main = s == 0;
+        let bx = c + (h(k) - 0.5) * n as f32 * 0.35;
+        let bz = c + (h(k + 1) - 0.5) * n as f32 * 0.3 - n as f32 * 0.1;
+        let len = ny as f32 * if main { 0.9 } else { 0.45 + h(k + 2) * 0.35 };
+        let tilt = (0.15 + lean * 0.75) * (0.7 + h(k + 3) * 0.6);
+        let yaw = (h(k + 4) - 0.5) * 1.1; // mostly toward +z
+        let dir = glam::Vec3::new(tilt.sin() * yaw.sin(), tilt.cos(), tilt.sin() * yaw.cos()).normalize();
+        let r0 = n as f32 * if main { 0.22 } else { 0.14 + h(k + 5) * 0.08 };
+        // the section: 4..7 corners at irregular angles and radii
+        let corners = 4 + (h(k + 6) * 4.0) as usize;
+        let poly: Vec<(f32, f32)> = (0..corners)
+            .map(|i| {
+                let a = (i as f32 + (h(k + 7 + i as i32) - 0.5) * 0.6) / corners as f32 * std::f32::consts::TAU;
+                (a, 0.65 + h(k + 20 + i as i32) * 0.5)
+            })
+            .collect();
+        // a frame round the axis for the section's angle
+        let up = if dir.y.abs() < 0.95 { glam::Vec3::Y } else { glam::Vec3::X };
+        let e1 = up.cross(dir).normalize();
+        let e2 = dir.cross(e1);
+        let base = glam::Vec3::new(bx, -1.0, bz);
+        for x in 0..n as i32 {
+            for y in 0..ny as i32 {
+                for z in 0..n as i32 {
+                    let p = glam::Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5) - base;
+                    let t = p.dot(dir) / len;
+                    if !(0.0..=1.0).contains(&t) {
+                        continue;
+                    }
+                    let q = p - dir * p.dot(dir);
+                    let (u, v) = (q.dot(e1), q.dot(e2));
+                    let ang = v.atan2(u).rem_euclid(std::f32::consts::TAU);
+                    // radius of the polygon edge at this angle
+                    let mut edge = f32::MAX;
+                    for i in 0..corners {
+                        let (a0, r_a) = poly[i];
+                        let (a1, r_b) = poly[(i + 1) % corners];
+                        let a1 = if a1 < a0 { a1 + std::f32::consts::TAU } else { a1 };
+                        let aa = if ang < a0 { ang + std::f32::consts::TAU } else { ang };
+                        if aa >= a0 && aa <= a1 {
+                            // point on the chord between the two corners, along this angle
+                            let pa = glam::Vec2::new(a0.cos(), a0.sin()) * r_a;
+                            let pb = glam::Vec2::new(a1.cos(), a1.sin()) * r_b;
+                            let dirv = glam::Vec2::new(aa.cos(), aa.sin());
+                            let e = pb - pa;
+                            let den = dirv.x * e.y - dirv.y * e.x;
+                            if den.abs() > 1e-5 {
+                                edge = (pa.x * e.y - pa.y * e.x) / den;
+                            }
+                            break;
+                        }
+                    }
+                    if edge == f32::MAX {
+                        continue;
+                    }
+                    // taper to a broken tip, not a point: sharp but blunt-ended
+                    let taper = (1.0 - t).powf(0.75) * 0.9 + 0.1 * (1.0 - t);
+                    if (u * u + v * v).sqrt() > edge * r0 * taper {
+                        continue;
+                    }
+                    // colour: facets lighter up and on the lit side, creases dark
+                    let facet = ((ang * corners as f32 / std::f32::consts::TAU).floor() as i32 + variant) % 3;
+                    let lift = 0.30 + 0.12 * t + [0.0, 0.03, -0.03][facet as usize];
+                    let root = ((0.18 - t).max(0.0)) * 0.6;
+                    let v0 = (lift - root).clamp(0.12, 0.6);
+                    g.set(x, y, z, solid([v0, v0 * 1.01, v0 * 1.07]));
+                }
+            }
+        }
+    }
+    g.mesh(vox, true)
+}

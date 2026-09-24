@@ -29,7 +29,14 @@ pub enum Item {
     /// A waterfall at a cliff face: `at` is the foot of the face, `height`
     /// the drop, `facing` the unit vector from the face out over the floor.
     Fall { at: Vec3, height: f32, facing: Vec3 },
+    /// Broken rock jutting out of a cliff or standing on the plateau
+    /// (`props::crag`). Rooted in the rock: scenery, not collision -- the
+    /// floor's edge is already the wall.
+    Crag { at: Vec3, size: f32, lean: f32, facing: Vec3, variant: i32, coarse: bool },
 }
+
+/// Distinct crag meshes built; placements share them.
+pub const CRAG_VARIANTS: i32 = 10;
 
 /// Keep off anything a match needs clear: lanes, bases, towers, streams,
 /// boss grounds.
@@ -155,6 +162,62 @@ pub fn placements() -> Vec<Item> {
         z += 8.0;
     }
 
+    // Crags: the walls broken into rock. Three kinds of place:
+    //  - at the foot of a wall, erupting from the ground against it;
+    //  - partway up a face, jutting out and leaning over the floor;
+    //  - on the plateau above, spires on the skyline.
+    // All rooted in the rock (floor sdf > 0.6), so no lane, choke or
+    // clearing gets narrower. Spaced by a coarse hash so they cluster
+    // naturally without piling up.
+    {
+        let out_of = |x: f32, z: f32| {
+            // from the rock toward the floor: down the SDF's slope
+            let e = 0.5;
+            Vec3::new(f.sdf(x - e, z) - f.sdf(x + e, z), 0.0, f.sdf(x, z - e) - f.sdf(x, z + e)).normalize_or_zero()
+        };
+        let mut taken: std::collections::HashSet<(i32, i32)> = Default::default();
+        let mut free = |x: f32, z: f32, cell: f32| {
+            let k = ((x / cell).floor() as i32, (z / cell).floor() as i32);
+            taken.insert(k)
+        };
+        let lim = consts::arena_radius() + 20.0;
+        let chokes = pass::choke_points();
+        let near_choke = |x: f32, z: f32| chokes.iter().any(|(p, _)| (p.x - x).hypot(p.z - z) < 20.0);
+        let mut z = -lim;
+        while z <= lim {
+            let mut x = -lim;
+            while x <= lim {
+                let (jx, jz) = (x + rng.range(-1.0, 1.0), z + rng.range(-1.0, 1.0));
+                let d = f.sdf(jx, jz);
+                let v = (rng.f32() * CRAG_VARIANTS as f32) as i32;
+                // Near a choke the crags stay small and upright: one leaning
+                // out over a 7.6 u narrows hides the gap the choke exists to
+                // show (seen in the first render).
+                let tight = near_choke(jx, jz);
+                if (0.6..2.4).contains(&d) && free(jx, jz, 8.5) {
+                    let top = pass::terrain_height(jx, jz).max(2.0);
+                    let facing = out_of(jx, jz);
+                    if rng.f32() < 0.55 || tight {
+                        // at the foot
+                        let (sz, ln) = if tight { (rng.range(0.55, 0.8), rng.range(0.1, 0.3)) } else { (rng.range(0.65, 1.05), rng.range(0.25, 0.6)) };
+                        out.push(Item::Crag { at: Vec3::new(jx, -0.4, jz), size: sz, lean: ln, facing, variant: v, coarse: false });
+                    } else if top > 6.0 {
+                        // up the face, jutting out
+                        let y = rng.range(2.5, top * 0.7);
+                        out.push(Item::Crag { at: Vec3::new(jx, y, jz), size: rng.range(0.7, 1.25), lean: rng.range(0.7, 1.0), facing, variant: v, coarse: y > 9.0 });
+                    }
+                } else if d > 5.0 && d < 60.0 && rng.f32() < 0.03 && free(jx, jz, 16.0) {
+                    let top = pass::terrain_height(jx, jz);
+                    if top < 60.0 {
+                        out.push(Item::Crag { at: Vec3::new(jx, top - 0.8, jz), size: rng.range(1.0, 1.6), lean: rng.range(0.0, 0.3), facing: out_of(jx, jz), variant: v, coarse: true });
+                    }
+                }
+                x += 2.5;
+            }
+            z += 2.5;
+        }
+    }
+
     // A waterfall at the head of every stream: find the cliff face on the
     // line from the pool back up to the lip.
     for fall in pass::falls() {
@@ -189,6 +252,9 @@ pub fn build() -> (Vec<Piece>, Blockers) {
     let mut blockers = Blockers::new(consts::arena_radius() + 20.0, 6.0);
     blockers.set_floor(pass::floor());
     let mut pieces = Vec::new();
+    // crag meshes by (variant, size step, lean step): a few dozen grids
+    // for hundreds of placements
+    let mut crags: std::collections::HashMap<(i32, i32, i32), crate::voxel::VoxelMesh> = Default::default();
     for (i, it) in placements().into_iter().enumerate() {
         let v = i as i32;
         match it {
@@ -210,6 +276,16 @@ pub fn build() -> (Vec<Piece>, Blockers) {
             }
             Item::HighPine { x, z, y, scale } => {
                 pieces.push(Piece { mesh: weathered(props::pine(scale), 0.4, 0.75), pos: Vec3::new(x, y, z), quarter: 0, vsize: V_MED, sway: 0.4 });
+            }
+            Item::Crag { at, size, lean, facing, variant, coarse } => {
+                let key = (variant * 2 + coarse as i32, (size * 4.0).round() as i32, (lean * 4.0).round() as i32);
+                let vox = if coarse { 1.2 } else { 0.6 };
+                let mesh = crags.entry(key).or_insert_with(|| props::crag(key.1 as f32 / 4.0, key.0 / 2, key.2 as f32 / 4.0, vox)).clone();
+                // the mesh leans toward local +z; turn it to lean out of the
+                // wall (a quarter turn sends +z to +x, then -z, then -x)
+                let dirs = [Vec3::Z, Vec3::X, Vec3::NEG_Z, Vec3::NEG_X];
+                let q = (0..4).max_by(|&a, &b| dirs[a].dot(facing).partial_cmp(&dirs[b].dot(facing)).unwrap()).unwrap_or(0) as u8;
+                pieces.push(Piece { mesh, pos: at, quarter: q, vsize: vox, sway: 0.0 });
             }
             Item::Fall { at, height, facing } => {
                 // The mesh's sheet faces -z (it is built against z = 1 of a
@@ -260,5 +336,25 @@ mod tests {
                 assert!(d > -1.0 && d < 0.5, "a fall stands at the cliff face, not {d} from it");
             }
         }
+    }
+
+    /// Crags are scenery rooted in the rock: every one's footing is behind
+    /// a cliff face (no lane, choke or clearing narrower for them), and none
+    /// near a choke leans out over it.
+    #[test]
+    fn crags_stand_in_the_rock_and_keep_off_the_chokes() {
+        let f = pass::floor();
+        let chokes = pass::choke_points();
+        let mut n = 0;
+        for it in placements() {
+            if let Item::Crag { at, lean, .. } = it {
+                n += 1;
+                assert!(f.sdf(at.x, at.z) >= 0.6, "crag rooted on the floor at {at}");
+                if chokes.iter().any(|(p, _)| (p.x - at.x).hypot(p.z - at.z) < 20.0) {
+                    assert!(lean <= 0.3 + 1e-3, "a crag leaning {lean} over the choke near {at}");
+                }
+            }
+        }
+        assert!(n > 200, "the walls should be broken up: {n} crags");
     }
 }
