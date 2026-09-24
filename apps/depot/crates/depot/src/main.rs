@@ -542,21 +542,9 @@ fn install_stop_handler(stop: Arc<AtomicBool>) {
 #[cfg(not(unix))]
 fn install_stop_handler(_stop: Arc<AtomicBool>) {}
 
+/// Create-once, 0600 (depot_core::create_private): the admin token is never overwritten.
 fn write_private(path: &Path, contents: &str) -> Result<(), String> {
-    if let Some(p) = path.parent() {
-        std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
-    }
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        f.write_all(contents.as_bytes()).and_then(|_| f.write_all(b"\n")).map_err(|e| e.to_string())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, format!("{contents}\n")).map_err(|e| e.to_string())
-    }
+    depot_core::create_private(path, contents).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 pub fn human(n: u64) -> String {

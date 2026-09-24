@@ -41,21 +41,9 @@ pub fn keygen(root: &Path) -> Result<String> {
     Ok(pub_hex)
 }
 
+/// Create-once, 0600 (crate::create_private): the signing key is never overwritten.
 fn write_private(path: &Path, contents: &str) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
-        f.write_all(contents.as_bytes())?;
-        f.write_all(b"\n")?;
-        return Ok(());
-    }
-    #[allow(unreachable_code)]
-    {
-        fs::write(path, format!("{contents}\n"))?;
-        Ok(())
-    }
+    Ok(crate::create_private(path, contents)?)
 }
 
 fn read_hex_key(path: &Path, len: usize) -> Result<Vec<u8>> {

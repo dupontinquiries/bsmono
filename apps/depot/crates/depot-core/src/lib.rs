@@ -152,15 +152,56 @@ pub fn is_sha256_hex(s: &str) -> bool {
 /// the new name can point at zero bytes after a power cut (the classic ext4
 /// data=ordered surprise). Used for catalog.json, index files, repomd.xml.
 pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+    write_atomic_mode(path, data, None)
+}
+
+/// [`write_atomic`] for a file only this user may read (0600 from the moment the temp file
+/// exists, so the content is never readable under a wider mode even briefly). Used for paired
+/// clients' keys and pairing state.
+pub fn write_atomic_private(path: &Path, data: &[u8]) -> io::Result<()> {
+    write_atomic_mode(path, data, Some(0o600))
+}
+
+fn write_atomic_mode(path: &Path, data: &[u8], mode: Option<u32>) -> io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(".{}.tmp-{}", path.file_name().and_then(|n| n.to_str()).unwrap_or("f"), std::process::id()));
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        if let Some(m) = mode {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(m);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        let mut f = o.open(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)
+}
+
+/// Create a SECRET file once: 0600, `contents` plus a newline, and an error
+/// (`AlreadyExists`) if the file is already there -- never an overwrite. For the signing key
+/// and the admin token, where silently replacing an existing one would orphan everything
+/// that trusted it. Parent directories are created.
+pub fn create_private(path: &Path, contents: &str) -> io::Result<()> {
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let mut f = o.open(path)?;
+    f.write_all(contents.as_bytes())?;
+    f.write_all(b"\n")?;
+    f.sync_all()
 }
 
 /// Current unix time in seconds; the one place the clock is read, so tests can
@@ -191,6 +232,26 @@ mod tests {
         assert_eq!(unhex("0"), None);
         assert!(is_sha256_hex(&sha256_hex(b"x")));
         assert!(!is_sha256_hex("BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_writes_are_0600_and_create_private_never_overwrites() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmpdir("private");
+        let p = d.join("sub/key.pub");
+        write_atomic_private(&p, b"one").unwrap();
+        write_atomic_private(&p, b"two").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"two");
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(std::fs::read_dir(p.parent().unwrap()).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(".tmp-")), "no temp left");
+        let s = d.join("deep/signing.key");
+        create_private(&s, "secret").unwrap();
+        assert_eq!(std::fs::read_to_string(&s).unwrap(), "secret\n");
+        assert_eq!(std::fs::metadata(&s).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(create_private(&s, "other").unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&s).unwrap(), "secret\n", "the original survives");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

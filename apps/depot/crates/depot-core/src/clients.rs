@@ -34,18 +34,10 @@ fn random_hex(n: usize) -> String {
     crypto_kit::random_hex(n)
 }
 
+/// Atomic, fsync'd, 0600 (crate::write_atomic_private). This copy used to rename without an
+/// fsync and with a temp name the server and `depot pair` could share.
 fn write_private(p: &Path, text: &str) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    if let Some(d) = p.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let tmp = p.with_extension("tmp");
-    {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        f.write_all(text.as_bytes())?;
-    }
-    std::fs::rename(tmp, p)
+    crate::write_atomic_private(p, text.as_bytes())
 }
 
 pub fn load(root: &Path, name: &str) -> Option<ClientKey> {
