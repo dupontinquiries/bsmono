@@ -9,6 +9,7 @@ pub mod caps;
 pub mod clock;
 pub mod codec;
 pub mod convert_cpu;
+pub mod damage;
 pub mod frame;
 pub mod io;
 pub mod player;

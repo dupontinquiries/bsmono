@@ -42,6 +42,7 @@ mod palette;
 mod pattern;
 mod playback;
 mod power;
+mod profile;
 
 /// What we managed to learn about the file the user named.
 struct Opened {
@@ -175,6 +176,9 @@ struct Player {
     /// What background work the power supply allows, and when it was read.
     energy: power::EnergyPolicy,
     energy_read: Option<Instant>,
+    power_state: power::PowerState,
+    /// VIDKIT_PROFILE: one line a second of what playback costs.
+    profiler: Option<profile::Profiler>,
     /// Picture-in-picture: the video floats, the chapters take the screen.
     pip: vidkit_egui::Pip,
     pip_on: bool,
@@ -376,6 +380,8 @@ impl Player {
             listen_only: false,
             energy: power::policy(power::current()),
             energy_read: None,
+            power_state: power::current(),
+            profiler: profile::Profiler::from_env(),
             pip: Default::default(),
             pip_on: false,
             max_texture,
@@ -388,6 +394,15 @@ impl Player {
             analysis_status: Arc::new(Mutex::new(String::new())),
             analysis_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
+        // The software presenter converts and uploads only what changed
+        // (vidkit_core::damage). VIDKIT_DAMAGE=0 turns it off for comparison;
+        // VIDKIT_SW_BUDGET (0..1 of a frame) caps conversions and lets the
+        // picture degrade under motion; else the power policy's budget.
+        me.presenter.set_damage_rendering(std::env::var("VIDKIT_DAMAGE").as_deref() != Ok("0"));
+        me.presenter.damage_budget = sw_budget_override().unwrap_or(me.energy.sw_budget);
+        if let Some(url) = PENDING_URL.get().cloned() {
+            me.open_url(url);
+        }
         // A file named on the command line gets its transcript too.
         if let Some(p) = me.path.clone().filter(|_| me.engine.is_some()) {
             let total = me.opened.as_ref().and_then(|o| o.as_ref().ok()).and_then(|o| o.duration);
@@ -508,6 +523,7 @@ impl eframe::App for Player {
     #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         stats_tick(ctx);
+        self.profile_frame();
         stats_note(if ctx.current_pass_index() > 0 { "pass>0" } else { "pass0" });
         if self.quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1147,7 +1163,7 @@ fn main() -> eframe::Result<()> {
     let first = args.next();
 
     if matches!(first.as_deref(), Some("-h") | Some("--help")) {
-        println!("vidkit-player [FILE | --clipboard]\n");
+        println!("vidkit-player [FILE | URL | --clipboard | --gpu-selftest]\n");
         println!("  FILE         a local .mp4 or .webm; omit for the built-in test pattern");
         println!("  --clipboard  play what is copied: a file (as a path or file:// URI,");
         println!("               e.g. copied in a file manager) or a video link");
@@ -1171,7 +1187,13 @@ fn main() -> eframe::Result<()> {
     // manager or a link in the browser, tap "Play copied video" -- instead of
     // open the app, open the palette, pick the command.
     let from_clipboard = first.as_deref() == Some("--clipboard");
-    let file = if from_clipboard { None } else { first.map(PathBuf::from) };
+    // A URL (a YouTube page, a direct link) is opened through the same path
+    // as the palette's "Play from clipboard", once the player exists.
+    let is_url = first.as_deref().is_some_and(|f| f.starts_with("http://") || f.starts_with("https://"));
+    if is_url {
+        let _ = PENDING_URL.set(first.clone().unwrap_or_default());
+    }
+    let file = if from_clipboard || is_url { None } else { first.map(PathBuf::from) };
 
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -2108,12 +2130,14 @@ impl Player {
             return;
         }
         self.energy_read = Some(Instant::now());
-        let p = power::policy(power::current());
+        self.power_state = power::current();
+        let p = power::policy(self.power_state);
         if p == self.energy {
             return;
         }
         let enhance_changed = p.enhance != self.energy.enhance;
         self.energy = p;
+        self.presenter.damage_budget = sw_budget_override().unwrap_or(p.sw_budget);
         self.apply_transcribe_policy();
         if enhance_changed {
             // Recompute the plan at the next paint under the new allowance.
@@ -2135,5 +2159,44 @@ impl Player {
                 w.set_mode(mode);
             }
         }
+    }
+}
+
+/// A URL given on the command line, opened once the player exists.
+static PENDING_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn sw_budget_override() -> Option<f32> {
+    std::env::var("VIDKIT_SW_BUDGET").ok().and_then(|v| v.trim().parse::<f32>().ok()).map(|b| b.clamp(0.01, 1.0))
+}
+
+impl Player {
+    fn profile_frame(&mut self) {
+        let Some(p) = self.profiler.as_mut() else { return };
+        if let Some(plan) = self.presenter.last_plan.take() {
+            p.acc.damaged_tiles += plan.damaged as u64;
+            p.acc.leaves += plan.leaves as u64;
+            p.acc.conversions += plan.cost;
+            p.acc.lod_max_seen = p.acc.lod_max_seen.max(plan.damage_lod);
+        }
+        let (shown, dropped, decoder) = match &self.engine {
+            Some(e) => (e.shown, e.dropped, e.decoder()),
+            None => (0, 0, "idle".into()),
+        };
+        let uploaded = match &self.gpu {
+            Some(g) => g.lock().map(|g| g.uploaded_bytes()).unwrap_or(0),
+            None => self.presenter.uploaded_bytes(),
+        };
+        p.acc.decoder = decoder;
+        p.acc.presenter = match &self.gpu {
+            Some(_) => "gpu".into(),
+            None if self.presenter.damage_rendering() => format!("cpu-damage@{:.2}", self.presenter.damage_budget),
+            None => "cpu-whole".into(),
+        };
+        p.acc.enhance = self.enh_plan.as_ref().map(|pl| format!("{:?}", pl.tier)).unwrap_or_else(|| "-".into());
+        // From the 30-second reading: sysfs per frame would be the very
+        // waste this is measuring.
+        let pw = self.power_state;
+        p.acc.power = if pw.on_battery { format!("battery{}", pw.percent.map(|x| format!("@{x}")).unwrap_or_default()) } else { "mains".into() };
+        p.frame(shown, dropped, uploaded);
     }
 }

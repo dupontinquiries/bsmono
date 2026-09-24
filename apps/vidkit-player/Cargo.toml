@@ -103,6 +103,10 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.whisper-rs-sys]
 opt-level = 3
+# The CPU presenter's per-pixel conversion and the damage tree's hashing:
+# unoptimised, whole-frame conversion of 640x360 managed 8 fps.
+[profile.dev.package.vidkit-core]
+opt-level = 3
 
 [dev-dependencies]
 # The URL test serves a real MP4 from the demuxer's own fixture writer.

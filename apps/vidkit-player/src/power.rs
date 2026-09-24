@@ -73,6 +73,9 @@ pub struct EnergyPolicy {
     pub transcribe_ahead: Option<Duration>,
     pub analysis: bool,
     pub enhance: Enhancement,
+    /// Software presenter: conversions a frame may spend, as a fraction of
+    /// a whole frame (vidkit_core::damage). 1.0 never degrades.
+    pub sw_budget: f32,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -84,15 +87,15 @@ pub enum Enhancement {
 
 pub fn policy(p: PowerState) -> EnergyPolicy {
     if !p.on_battery {
-        return EnergyPolicy { keep_download: true, transcribe_ahead: None, analysis: true, enhance: Enhancement::Full };
+        return EnergyPolicy { keep_download: true, transcribe_ahead: None, analysis: true, enhance: Enhancement::Full, sw_budget: 1.0 };
     }
     let pct = p.percent.unwrap_or(50);
-    let (ahead, enhance) = match pct {
-        51.. => (Duration::from_secs(600), Enhancement::Full),
-        20..=50 => (Duration::from_secs(300), Enhancement::SharpenOnly),
-        _ => (Duration::ZERO, Enhancement::Off),
+    let (ahead, enhance, sw_budget) = match pct {
+        51.. => (Duration::from_secs(600), Enhancement::Full, 1.0),
+        20..=50 => (Duration::from_secs(300), Enhancement::SharpenOnly, 0.25),
+        _ => (Duration::ZERO, Enhancement::Off, 1.0 / 16.0),
     };
-    EnergyPolicy { keep_download: false, transcribe_ahead: Some(ahead), analysis: false, enhance }
+    EnergyPolicy { keep_download: false, transcribe_ahead: Some(ahead), analysis: false, enhance, sw_budget }
 }
 
 /// Cut an enhancement down to what the policy allows.
