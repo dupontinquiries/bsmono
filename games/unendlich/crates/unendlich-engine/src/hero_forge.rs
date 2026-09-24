@@ -300,18 +300,25 @@ impl Body {
     /// Ground the feet to y=0, uniformly scale the model to `target_height`
     /// blocks (about the rig's local origin, which is already centred), add the
     /// `bob`, and translate to the origin.
-    fn finalize(mut self, origin: [f32; 3], bob: f32, target_height: f32) -> (Vec<EntityVertex>, Vec<u32>, Vec<[f32; 3]>) {
-        let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
-        for v in &self.verts {
+    /// `scale` is computed by the caller from the REST-pose anatomy (see
+    /// `build_rigged`), not from this frame's mesh: measuring the current mesh
+    /// made every pose rescale to the same height (a crouch drawn at full
+    /// height, raised arms shrinking the body) and let props count as height
+    /// (the Heliographer's staff shrank its body ~30%).
+    ///
+    /// Grounds on the lowest of the first `anatomy_verts` vertices -- the body
+    /// (`build_body`, emitted before `dress`) in THIS pose, i.e. the feet: a prop
+    /// or a cape reaching lower (the Heliographer's) used to hold the body up, so
+    /// bending the knees lifted the feet instead of lowering the hero.
+    fn finalize(mut self, origin: [f32; 3], bob: f32, scale: f32, anatomy_verts: usize) -> (Vec<EntityVertex>, Vec<u32>, Vec<[f32; 3]>) {
+        let n = anatomy_verts.clamp(1, self.verts.len().max(1)).min(self.verts.len());
+        let mut min_y = f32::MAX;
+        for v in &self.verts[..n] {
             min_y = min_y.min(v.position[1]);
-            max_y = max_y.max(v.position[1]);
         }
         if !min_y.is_finite() {
             min_y = 0.0;
-            max_y = 0.0;
         }
-        let span = (max_y - min_y).max(1e-3);
-        let scale = (target_height / span).max(1e-3);
         let to_world = |p: [f32; 3]| [origin[0] + p[0] * scale, origin[1] + bob + (p[1] - min_y) * scale, origin[2] + p[2] * scale];
         for v in self.verts.iter_mut() {
             v.position = to_world(v.position);
@@ -642,6 +649,22 @@ pub struct HeroAnchors {
     pub eye: [f32; 3],
     /// The right hand's grip point, where a held item is attached.
     pub right_hand: [f32; 3],
+    /// Rig units -> world blocks. Constant for a hero and its build: set by the
+    /// rest-pose anatomy, not by the pose or what the hero carries.
+    pub scale: f32,
+}
+
+/// Rig units -> blocks: the stature over the vertical span of the body itself --
+/// `build_body` (anatomy and hair) in the rest pose. Not `dress` (clothes and
+/// props: the Heliographer's staff rose half a block over its head) and not the
+/// current pose.
+fn rest_scale(dim: &HeroDims, col: &HeroColors, target_height: f32) -> f32 {
+    let rest = rig_world(dim, 0.0, &[[0.0f32; 3]; NPIV]);
+    let mut b = Body::new(0.0);
+    build_body(&mut b, &rest, dim, col);
+    let (lo, hi) = b.verts.iter().fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v.position[1]), hi.max(v.position[1])));
+    let span = if lo.is_finite() { (hi - lo).max(1e-3) } else { 1.0 };
+    (target_height / span).max(1e-3)
 }
 
 /// Eye point in HEAD-local units: centred between the two eye boxes (drawn at
@@ -804,6 +827,7 @@ pub fn build_rigged(
 
     let mut body = Body::new(pose.yaw);
     build_body(&mut body, &world, &dim, &col);
+    let anatomy_verts = body.verts.len();
     dress(kind, &mut body, &world, &dim, &col, pose);
 
     // held item in the right hand (engine forward +X of the hand), tracks the arm.
@@ -831,8 +855,9 @@ pub fn build_rigged(
     let bob = (stride2 * 0.5 + 0.5) * amp * 0.10;
     let eye_i = body.mark(&world[HEAD], eye_local(&dim));
     let hand_i = body.mark(&world[HAR], [0.0, -0.10, ff_depth(&dim)]);
-    let (v, i, m) = body.finalize(origin, bob, hero_total_height(params));
-    (v, i, HeroAnchors { eye: m[eye_i], right_hand: m[hand_i] })
+    let scale = rest_scale(&dim, &col, hero_total_height(params));
+    let (v, i, m) = body.finalize(origin, bob, scale, anatomy_verts);
+    (v, i, HeroAnchors { eye: m[eye_i], right_hand: m[hand_i], scale })
 }
 
 #[inline]
@@ -941,7 +966,8 @@ mod anchor_tests {
             b.part(&xf, [2.0, 3.0, 4.0], [1.0, 0.0, 0.0], c);
             b.part(&xf, [1.0, 1.0, 1.0], [0.0, 1.0, 0.0], [0.0, 2.0, 0.0]); // so the span is not the box's
             let m = b.mark(&xf, c);
-            let (v, _, marks) = b.finalize([10.0, 64.0, -3.0], 0.07, 1.8);
+            let n = b.verts.len();
+            let (v, _, marks) = b.finalize([10.0, 64.0, -3.0], 0.07, 0.61, n);
             let mut mean = [0.0f32; 3];
             for vert in &v[..8] { for k in 0..3 { mean[k] += vert.position[k] / 8.0; } }
             for k in 0..3 { assert!((marks[m][k] - mean[k]).abs() < 1e-5, "yaw {yaw} axis {k}: {:?} vs {:?}", marks[m], mean); }
@@ -990,17 +1016,34 @@ mod anchor_tests {
             }
         }
         assert!(bob_range.1 - bob_range.0 > 0.005, "walking moves the eye (the head bobs): range {:?}", bob_range);
-        // Standing still, the anchor is at a plausible eye height for the stature.
-        // Windwalker, not the Heliographer: the Heliographer's sun crown counts
-        // toward the height `finalize` scales to, so its body is drawn ~30% short
-        // and its eyes at 0.67 of the stature (eye_height_by_kind) -- a model
-        // scaling bug the anchor exposed, recorded, not this test's subject.
-        let ww = HeroKind::from_name("Windwalker").unwrap();
-        let wp = default_params(ww);
-        let (_, _, still) = build_rigged(ww, &wp, origin, &HeroPose::default());
-        let h = hero_total_height(&wp);
-        let rel = (still.eye[1] - origin[1]) / h;
-        assert!((0.8..0.97).contains(&rel), "eye at {rel:.3} of the body's height");
+    }
+
+    /// Height is the body's, set by the rest-pose anatomy: every hero's eyes sit
+    /// at a human eye height for its stature (the Heliographer's staff used to
+    /// shrink its body to eyes at 0.67), the scale does not change with the pose,
+    /// and a crouch really is lower (it used to be rescaled back to full height).
+    #[test]
+    fn height_is_the_bodys_not_the_pose_or_the_props() {
+        use HeroKind::*;
+        let origin = [0.0, 50.0, 0.0];
+        for kind in [Heliographer, Windwalker, Tidecaller, Stormweaver, Gravitybender, Brinekeeper, Luminant] {
+            let params = default_params(kind);
+            let h = hero_total_height(&params);
+            let (_, _, still) = build_rigged(kind, &params, origin, &HeroPose::default());
+            let rel = (still.eye[1] - origin[1]) / h;
+            assert!((0.84..0.97).contains(&rel), "{kind:?}: eye at {rel:.3} of the stature");
+            for pose in [HeroPose { walk_amp: 0.5, walk_phase: 1.3, ..Default::default() }, HeroPose { land_crouch: 1.0, ..Default::default() },
+                         HeroPose { flight01: 1.0, ..Default::default() }, HeroPose { airborne: 1.0, vertical_vel: -10.0, ..Default::default() }] {
+                let (_, _, a) = build_rigged(kind, &params, origin, &pose);
+                assert!((a.scale - still.scale).abs() < 1e-6, "{kind:?}: scale {} vs rest {}", a.scale, still.scale);
+            }
+            let (_, _, crouch) = build_rigged(kind, &params, origin, &HeroPose { land_crouch: 1.0, ..Default::default() });
+            // More than 1% of the stature: the drop is small because the landing
+            // crouch is shallow (and its chest fold may lean BACK: -0.30 about X,
+            // where this rig's forward is + -- flight's +1.45 "tilt forward"),
+            // which is animation work. Before grounding on the feet it went UP.
+            assert!(crouch.eye[1] < still.eye[1] - 0.01 * h, "{kind:?}: crouching lowers the eyes ({:.3} vs {:.3})", crouch.eye[1], still.eye[1]);
+        }
     }
 
     #[test]
