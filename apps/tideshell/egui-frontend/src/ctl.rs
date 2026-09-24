@@ -22,6 +22,11 @@ pub enum Command {
     Lock,
     Palette,
     Switcher,
+    /// Re-read the prefs file. Sent by the settings app after it writes, so
+    /// a change applies now rather than at the next launch — which matters
+    /// most for the settings someone reaches for BECAUSE something is wrong
+    /// right now: cold mode with gloves on, a text size they cannot read.
+    ReloadPrefs,
     /// Resolved speaker-chain controls, from the settings app. Carries a
     /// payload, unlike the others, because the sender is deciding values
     /// rather than asking for an action.
@@ -40,11 +45,12 @@ impl Command {
             "lock" => Some(Command::Lock),
             "palette" => Some(Command::Palette),
             "switcher" => Some(Command::Switcher),
+            "reload-prefs" => Some(Command::ReloadPrefs),
             _ => None,
         }
     }
 
-    pub const NAMES: [&'static str; 6] = ["power-key", "volume-up", "volume-down", "lock", "palette", "switcher"];
+    pub const NAMES: [&'static str; 7] = ["power-key", "volume-up", "volume-down", "lock", "palette", "switcher", "reload-prefs"];
 }
 
 /// The keys cosmic-comp should hand to tideshell, as (keysym name, command).

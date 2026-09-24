@@ -184,6 +184,22 @@ pub fn save(p: &ShellPrefs) -> Result<std::path::PathBuf, String> {
     Ok(path)
 }
 
+/// Ask the running shell to re-read the prefs file.
+///
+/// The same socket the power key arrives on. Written after the file, never
+/// instead of it: the file is the truth, and a shell that is not running
+/// must still come up with the new setting. So a failure here is worth
+/// saying but is not a failure to save.
+pub fn nudge_shell() -> Result<(), String> {
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return Err("XDG_RUNTIME_DIR is not set".into());
+    };
+    let path = std::path::PathBuf::from(dir).join("tideshell.ctl");
+    let sock = std::os::unix::net::UnixDatagram::unbound().map_err(|e| e.to_string())?;
+    sock.send_to(b"reload-prefs", &path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(())
+}
+
 pub fn ui(p: &mut ShellPrefs, ui: &mut egui::Ui, status: &mut String) -> Vec<ScaleAction> {
     let mut out = Vec::new();
     let h = row_height(p);
@@ -247,7 +263,12 @@ pub fn ui(p: &mut ShellPrefs, ui: &mut egui::Ui, status: &mut String) -> Vec<Sca
     }
     if !out.is_empty() {
         *status = match save(p) {
-            Ok(path) => format!("saved {} (the shell reads it on its next change)", path.display()),
+            Ok(path) => match nudge_shell() {
+                Ok(()) => format!("saved {} and applied now", path.display()),
+                // Saved is saved: the shell picks it up when it starts, so
+                // this is a note about immediacy rather than an error.
+                Err(e) => format!("saved {} (applies at next start: {e})", path.display()),
+            },
             Err(e) => format!("not saved: {e}"),
         };
     }
@@ -329,5 +350,41 @@ mod cold_tests {
         apply(&mut p, &ScaleAction::Reset);
         assert_eq!(p.cold, "auto");
         assert_eq!(p.text_scale, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod nudge_tests {
+    use super::*;
+
+    #[test]
+    fn the_nudge_is_the_command_the_shell_parses() {
+        // Proved against a real socket, and against the shell's own name for
+        // the command rather than a string typed twice.
+        let dir = std::env::temp_dir().join(format!("ts-nudge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
+        let srv = std::os::unix::net::UnixDatagram::bind(dir.join("tideshell.ctl")).unwrap();
+        nudge_shell().unwrap();
+        let mut buf = [0u8; 64];
+        let n = srv.recv(&mut buf).unwrap();
+        assert_eq!(std::str::from_utf8(&buf[..n]).unwrap(), "reload-prefs");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shell_that_is_not_running_does_not_make_this_a_failure_to_save() {
+        // The file is the truth; the nudge is only about immediacy.
+        let dir = std::env::temp_dir().join(format!("ts-nudge-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        let mut p = ShellPrefs::default();
+        apply(&mut p, &ScaleAction::Cold("on"));
+        assert!(save(&p).is_ok(), "the write still happened");
+        assert!(nudge_shell().is_err(), "and the nudge failed, separately");
+        assert_eq!(load().cold, "on", "so the setting is there for the next start");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -967,6 +967,19 @@ fn main() {
                     Ok(Command::Switcher) => sb.shell.open_switcher(),
                     // The settings app decided what the chain should do; we
                     // are the process with the PipeWire connection.
+                    Ok(Command::ReloadPrefs) => {
+                        let (fresh, errs) = effects::load_prefs();
+                        for e in &errs {
+                            sb.shell.note(format!("prefs: {e}"));
+                        }
+                        // set_prefs is the shell's own path for a settings
+                        // change, so everything that follows from one —
+                        // cold tuning, layout, the ambient band — happens
+                        // exactly as it would from the shell's own sheet.
+                        let out = sb.shell.set_prefs(fresh);
+                        sb.execute(out);
+                        sb.shell.note("prefs reloaded".to_string());
+                    }
                     Ok(Command::SpeakerProps(pairs)) => {
                         let out = tideshell_egui::effects::apply_speaker_props(&pairs);
                         sb.shell.note(format!("{out:?}"));
