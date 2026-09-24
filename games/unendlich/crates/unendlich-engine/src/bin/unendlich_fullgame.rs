@@ -2194,6 +2194,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let cam_shake_on = std::env::var("UNENDLICH_CAM_SHAKE")
         .map(|v| v != "0" && !v.is_empty()).unwrap_or(true);
     let fp_body: bool = true;
+    // First-person camera ON the body: set each frame by the hero rig to where its
+    // eyes are (hero_forge::build_rigged), and used as the render camera, the
+    // head clip and the fade's camera point. One source for the eye, so the body
+    // and the camera can no longer move on different clocks -- the old
+    // first-person camera bobbed on its own `bob_phase` while the body walked on
+    // `hero_gait_phase`, so the two drifted against each other with speed, and a
+    // crouch or flight lean moved the head but not the camera. None (no hero rig
+    // this frame: another view, or a non-hero avatar) = the old camera, unchanged.
+    let mut fp_eye_anchor: Option<glm::Vec3> = None;
     let mut self_avatar: Option<unendlich_engine::creature::Creature> = None;
     let mut self_avatar_dirty = true; // rebuild from active_character on next use
     let mut self_avatar_prev: Option<[f32; 3]> = None; // for deriving avatar velocity
@@ -14024,6 +14033,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // at the player's feet and turned to face the look yaw.
             // r490/r515: the player's own character — shown in third-person and cinematic
             // views, and in first-person when `fp_body` is on (look down to see your body).
+            fp_eye_anchor = None;
             if camera_mode != 0 || fp_body {
                 if self_avatar_dirty || self_avatar.is_none() {
                     let p = local_player.view.position;
@@ -14210,12 +14220,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 0.0
                             },
                         };
-                        unendlich_engine::hero_forge::build(
+                        let (hv, hi, anchors) = unendlich_engine::hero_forge::build_rigged(
                             kind,
                             &active_character.build,
                             cur,
                             &pose,
-                        )
+                        );
+                        if camera_mode == 0 {
+                            fp_eye_anchor = Some(glm::vec3(anchors.eye[0], anchors.eye[1], anchors.eye[2]));
+                        }
+                        (hv, hi)
                     } else {
                         creature_to_vertices(av)
                     };
@@ -14234,7 +14248,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             - local_player.view.forward() * (2.6 * cam_zoom)
                             + local_player.view.right() * 0.9
                             + glm::vec3(0.0, 0.45, 0.0),
-                        _ => local_player.view.position,
+                        _ => fp_eye_anchor.unwrap_or(local_player.view.position),
                     };
                     let cam_fwd = local_player.view.forward();
                     // r562: taller bodies fill the FP view far more, so widen the
@@ -14278,7 +14292,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             v.alpha = opacity;
                         }
                     }
-                    let clip_y = local_player.view.position.y - 0.25; // FP head clip
+                    // FP head clip, at the eye the camera actually uses.
+                    let clip_y = fp_eye_anchor.map(|e| e.y).unwrap_or(local_player.view.position.y) - 0.25;
                     everts.extend(cv.iter().cloned());
                     for tri in ci.chunks_exact(3) {
                         // First-person: drop triangles at/above eye level (r531 head clip).
@@ -14986,7 +15001,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 v.pitch = (v.pitch - cam_tilt).clamp(-1.5, 1.5);
                 v
             }
-            _ => local_player.view,
+            _ => {
+                let mut v = local_player.view;
+                if let Some(e) = fp_eye_anchor {
+                    v.position = e; // the camera is in the head: see fp_eye_anchor
+                }
+                v
+            }
         };
         // r540: CAMERA JUICE (render-only). First-person walk bob + chase-camera
         // smoothing. The logical eye (local_player.view) is untouched, so physics,
@@ -15073,7 +15094,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
                 prev_bob_phase = bob_phase;
             }
-            if camera_mode == 0 && view_bob_on {
+            // The separate walk bob only when the camera is NOT on the rig's eyes:
+            // on the rig, the head's own motion is the bob, in step with the legs.
+            if camera_mode == 0 && view_bob_on && fp_eye_anchor.is_none() {
                 // vertical at 2× stride frequency, lateral at 1× — classic, subtle.
                 let up = (bob_phase * 2.0).sin() * 0.035 * bob_amp_s;
                 let lat = bob_phase.sin() * 0.045 * bob_amp_s;
