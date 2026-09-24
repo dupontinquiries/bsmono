@@ -189,6 +189,9 @@ pub fn floor() -> &'static FloorPlan {
             s.push(seg(at(ax, az), at(bx, bz), SLOT_R));
             s.push(seg(at(ax, -az), at(bx, -bz), SLOT_R));
         }
+        for c in camps() {
+            s.push(Shape::Circle { x: c.at.x, z: c.at.z, r: c.r });
+        }
         FloorPlan::new(s)
     })
 }
@@ -315,6 +318,178 @@ pub fn caves() -> Vec<Cave> {
         }
     }
     v
+}
+
+/// The side paths -- ledges and slots, both halves -- as (a, b, half-width).
+pub fn side_paths() -> Vec<(Vec3, Vec3, f32)> {
+    let mut v = Vec::new();
+    for zs in [1.0f32, -1.0] {
+        for &((ax, az), (bx, bz)) in &LEDGES {
+            v.push((at(ax, az * zs), at(bx, bz * zs), LEDGE_R));
+        }
+        for &((ax, az), (bx, bz)) in &SLOTS {
+            v.push((at(ax, az * zs), at(bx, bz * zs), SLOT_R));
+        }
+    }
+    v
+}
+
+/// Distance from (x, z) to the nearest side path's centre-line.
+pub fn side_path_dist(x: f32, z: f32) -> f32 {
+    let p = Vec3::new(x, 0.0, z);
+    side_paths()
+        .iter()
+        .map(|&(a, b, _)| {
+            let ab = b - a;
+            let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+            (a + ab * t - p).length()
+        })
+        .fold(f32::MAX, f32::min)
+}
+
+/// A pocket of floor off a side path, kept clear for a jungle camp (vole
+/// monsters, when the sim has them): nothing is placed in it but its burrow
+/// mound at the back.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Camp {
+    pub at: Vec3,
+    pub r: f32,
+    /// Unit vector from the path into the pocket (where the burrow is).
+    pub back: Vec3,
+}
+
+/// Camp pockets: one off each of four ledges per half, pushed out to the
+/// side of the path so the path runs past the camp's mouth, not through it.
+/// Blue half authored, mirrored.
+pub fn camps() -> Vec<Camp> {
+    // (ledge index, along 0..1, side +1/-1)
+    const SPOTS: [(usize, f32, f32); 4] = [(0, 0.5, 1.0), (2, 0.5, -1.0), (6, 0.45, -1.0), (7, 0.45, 1.0)];
+    let mut v = Vec::new();
+    for zs in [1.0f32, -1.0] {
+        for &(i, f, side) in &SPOTS {
+            let ((ax, az), (bx, bz)) = LEDGES[i];
+            let (a, b) = (at(ax, az * zs), at(bx, bz * zs));
+            let dir = (b - a).normalize_or_zero();
+            let across = Vec3::new(-dir.z, 0.0, dir.x) * side * zs;
+            let r = 7.5;
+            v.push(Camp { at: a.lerp(b, f) + across * (LEDGE_R + r - 2.5), r, back: across });
+        }
+    }
+    v
+}
+
+/// A place where the rock is cut down: a sightline gap (a low sill where a
+/// thin wall stands between a side path and a lane) or a diorama niche (a
+/// shelf cut into a wall at knee height). Rock only -- the floor plan does
+/// not change, so nothing becomes walkable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Cap {
+    pub a: Vec3,
+    pub b: Vec3,
+    pub r: f32,
+    /// Height the rock is cut down to.
+    pub h: f32,
+    pub niche: bool,
+}
+
+impl Cap {
+    fn dist(&self, x: f32, z: f32) -> f32 {
+        let p = Vec3::new(x, 0.0, z);
+        let ab = self.b - self.a;
+        let t = ((p - self.a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+        (self.a + ab * t - p).length()
+    }
+}
+
+/// Sightline gaps: at the middle of each side path, if a lane runs within
+/// 18 u beside it with only rock between, a sill 1.3 u high and 3.5 u
+/// either side of the line across. Niches: every ~38 u along the side
+/// paths, on alternating walls, clear of camps, gaps and caves.
+pub fn caps() -> &'static [Cap] {
+    static C: OnceLock<Vec<Cap>> = OnceLock::new();
+    C.get_or_init(|| {
+        let f = floor();
+        let mut out: Vec<Cap> = Vec::new();
+        let lanes: Vec<Vec<Vec3>> = crate::consts::LANES.iter().map(|&l| lane_polyline(l)).collect();
+        let near_lane = |p: Vec3| {
+            let mut best = (f32::MAX, Vec3::ZERO);
+            for pts in &lanes {
+                for w in pts.windows(2) {
+                    let ab = w[1] - w[0];
+                    let t = ((p - w[0]).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+                    let q = w[0] + ab * t;
+                    let d = (q - p).length();
+                    if d < best.0 {
+                        best = (d, q);
+                    }
+                }
+            }
+            best
+        };
+        let caves = caves();
+        let camp_list = camps();
+        let clear = |p: Vec3, out: &[Cap]| {
+            camp_list.iter().all(|c| (c.at - p).length() > c.r + 6.0)
+                && caves.iter().all(|c| !c.covers(p.x, p.z) && (c.a - p).length() > 6.0 && (c.b - p).length() > 6.0)
+                && out.iter().all(|c| (c.a.lerp(c.b, 0.5) - p).length() > 12.0)
+        };
+        let mut k = 0;
+        for (a, b, half) in side_paths() {
+            if a.z > 0.5 || b.z > 0.5 {
+                continue; // blue half; mirrored below
+            }
+            let len = (b - a).length();
+            let dir = (b - a).normalize_or_zero();
+            let across = Vec3::new(-dir.z, 0.0, dir.x);
+            // A sightline gap: look sideways from the path, both ways, at a
+            // few points along it. A thin wall -- 3 to 16 u of rock -- with
+            // floor beyond (a lane, a clearing, another path) is cut to a
+            // sill for a stretch. (First version looked only toward the
+            // nearest LANE, which on this layout is always through the
+            // open junction where the path meets it: zero gaps.)
+            'gap: for fr in [0.35f32, 0.5, 0.65, 0.25, 0.75] {
+                for side in [1.0f32, -1.0] {
+                    let m = a.lerp(b, fr);
+                    let from = m + across * side * (half + 0.3);
+                    let mut t = 0.0;
+                    let mut left_floor = false;
+                    let mut to = None;
+                    while t < 18.0 {
+                        let p = from + across * side * t;
+                        let d = f.sdf(p.x, p.z);
+                        if d > 0.0 {
+                            left_floor = true;
+                        } else if left_floor {
+                            to = Some(p);
+                            break;
+                        }
+                        t += 0.5;
+                    }
+                    let Some(to) = to else { continue };
+                    let thick = (to - from).length();
+                    let mid = from.lerp(to, 0.5);
+                    if (3.0..=16.0).contains(&thick) && clear(mid, &out) {
+                        out.push(Cap { a: from, b: to, r: 3.5, h: 1.3, niche: false });
+                        break 'gap;
+                    }
+                }
+            }
+            // niches along it
+            let mut s = 14.0;
+            while s < len - 10.0 {
+                let side = if k % 2 == 0 { 1.0 } else { -1.0 };
+                let p = a + dir * s + across * side * (half + 1.4);
+                if clear(p, &out) && f.sdf(p.x, p.z) > 0.4 && (0.3..3.2).contains(&f.sdf(p.x, p.z)) {
+                    out.push(Cap { a: p, b: p + across * side * 1.6, r: 1.9, h: 1.1, niche: true });
+                }
+                k += 1;
+                s += 38.0;
+            }
+        }
+        let mirrored: Vec<Cap> = out.iter().map(|c| Cap { a: Vec3::new(c.a.x, 0.0, -c.a.z), b: Vec3::new(c.b.x, 0.0, -c.b.z), ..*c }).collect();
+        out.extend(mirrored);
+        out
+    })
 }
 
 /// The climb: the Top lane -- the solo lane round the outside of the west
@@ -543,7 +718,18 @@ fn terrain_height_flat(x: f32, z: f32) -> f32 {
     let t = (d / CLIFF_RISE).clamp(0.0, 1.0);
     // a steep face with a lip, not a slope: most of the rise in the first half
     let s = 1.0 - (1.0 - t).powi(3);
-    cliff_top(x, z) * s
+    let h = cliff_top(x, z) * s;
+    // gaps and niches: the rock cut down, with a short soft edge
+    let mut out = h;
+    for c in caps() {
+        let e = c.dist(x, z) - c.r;
+        if e < 1.2 {
+            let k = (e / 1.2).clamp(0.0, 1.0);
+            let k = k * k * (3.0 - 2.0 * k);
+            out = out.min(c.h + (h - c.h) * k);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
