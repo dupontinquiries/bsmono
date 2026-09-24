@@ -173,6 +173,12 @@ def declared_transitive(crate_dir):
     the visited set.
     """
     seen, names, queue = set(), set(), [(crate_dir, True)]
+    # A WORKSPACE root's lock also covers every member, dev-dependencies included (cargo
+    # resolves them for each member), and members are not path dependencies of the root, so
+    # the walk below never reached them. bo-suite's lock was missing envlock-kit -- a
+    # dev-dependency of the member bo-controller -- while this reported "stale: 0"; the
+    # overnight fleet sweep's `cargo check` rewrote it.
+    queue.extend((m, True) for m in workspace_members(crate_dir))
     while queue:
         d, with_dev = queue.pop()
         if d in seen:
@@ -191,6 +197,29 @@ def declared_transitive(crate_dir):
         # dev-dependencies are out of scope from here down.
         queue.extend((p, False) for p in path_deps(text, d, with_dev))
     return names
+
+
+def workspace_members(root_dir):
+    """Member directories named by `[workspace] members = [...]` in root_dir/Cargo.toml,
+    globs expanded (`crates/*`), `exclude` honoured. Empty when there is no workspace."""
+    try:
+        text = (root_dir / "Cargo.toml").read_text(errors="replace")
+    except OSError:
+        return []
+    ws = re.search(r'^\[workspace\]\s*$(.*?)(?=^\[(?!workspace\.)|\Z)', text, re.S | re.M)
+    if not ws:
+        return []
+    def listed(key):
+        m = re.search(key + r'\s*=\s*\[(.*?)\]', ws.group(1), re.S)
+        return re.findall(r'["\']([^"\']+)["\']', m.group(1)) if m else []
+    excluded = {(root_dir / e).resolve() for e in listed("exclude")}
+    out = []
+    for pat in listed("members"):
+        for d in sorted(root_dir.glob(pat)) if any(c in pat for c in "*?[") else [root_dir / pat]:
+            d = d.resolve()
+            if (d / "Cargo.toml").exists() and d not in excluded and d != root_dir.resolve():
+                out.append(d)
+    return out
 
 
 def is_workspace_member(crate_dir):
