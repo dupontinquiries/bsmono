@@ -61,6 +61,9 @@ const W: u32 = 1280;
 const H: u32 = 720;
 
 pub fn run() -> Result<(), String> {
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("shop") {
+        return run_shop_shots();
+    }
     let (_instance, _adapter, device, queue) =
         make_device().ok_or_else(|| "No suitable GPU backend found (install mesa-vulkan-drivers for lavapipe)".to_string())?;
     let adapter_info = {
@@ -668,4 +671,113 @@ pub fn run_rig_sheet() -> Result<(), String> {
 /// The enemy (Red) mid outer tower, for the staged tower shot.
 fn consts_tower() -> Vec3 {
     crate::consts::tower_pos(crate::consts::Lane::Mid, crate::consts::Team::Red, false)
+}
+
+/// The shop, three ways: desktop over the world, a landscape phone (844 x
+/// 474 pt) over the world, and a portrait phone (390 x 845 pt) on its own.
+/// `CLAWBOUND_SHOTS=shop clawbound-battleground --screenshot`.
+pub fn run_shop_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut egui_renderer = egui_wgpu::Renderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, None, 1);
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let mk = |r: &Renderer, w: u32, h: u32| {
+        r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shop shot"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    };
+    let target = mk(&renderer, W, H);
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    // A mid-game purse: some bought, some affordable, some not, one armed
+    // for sale -- every state a card and a slot can be in.
+    let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    game.blockers = scene.blockers.clone();
+    game.gods[0].gold = 5000.0;
+    let rec = crate::shopview::recommended(&game, 0);
+    let first = crate::shopview::offers(&game, 0, rec[0]);
+    let _ = game.buy_item(0, first[0].item.id);
+    let _ = game.buy_item(0, first[3].item.id);
+    game.gods[0].gold = 1650.0;
+    let mut ui_state = UiState::new();
+    ui_state.shop_open = true;
+    ui_state.shop_tab = rec[0];
+    let mut vfx = Vfx::default();
+    for _ in 0..30 {
+        game.tick(1.0 / 60.0);
+    }
+    let p = game.gods[0].pos;
+    let cam = Camera { eye: p + Vec3::new(6.0, 7.0, -8.0), target: p + Vec3::Y * 1.2, fov_y: 0.95 };
+    let egui_ctx = egui::Context::default();
+    for (name, ppp) in [("clawbound_shop.png", 1.0f32), ("clawbound_shop_landscape_phone.png", W as f32 / 844.0)] {
+        renderer.atmosphere = game.weather.atmosphere();
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.render_frame(&view, cam, 1.0);
+        let out = shop_frame(&egui_ctx, &mut game, &mut ui_state, W, H, ppp);
+        draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &egui_ctx, out, W, H);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+    }
+    // Portrait phone: the shop alone on a cleared frame, on its Shelves
+    // tab and then its Hoard tab.
+    let (pw, ph) = (576u32, 1248u32); // width*4 must be a multiple of 256 for the readback
+    let ptarget = mk(&renderer, pw, ph);
+    let pview = ptarget.create_view(&Default::default());
+    for (name, tab) in [("clawbound_shop_phone.png", crate::shopui::PhoneTab::Shelves), ("clawbound_shop_phone_hoard.png", crate::shopui::PhoneTab::Hoard)] {
+        ui_state.shop_phone_tab = tab;
+        ui_state.sell_armed = if tab == crate::shopui::PhoneTab::Hoard { Some(1) } else { None };
+        clear(&renderer.device, &renderer.queue, &pview);
+        let out = shop_frame(&egui_ctx, &mut game, &mut ui_state, pw, ph, pw as f32 / 390.0);
+        draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &pview, &egui_ctx, out, pw, ph);
+        save_shot(&renderer.device, &renderer.queue, &ptarget, name)?;
+        println!("saved {name}");
+    }
+    Ok(())
+}
+
+/// Two egui passes (the first lays out, the second paints with hover state
+/// settled), returning the second's output.
+fn shop_frame(ctx: &egui::Context, game: &mut Game, st: &mut UiState, w: u32, h: u32, ppp: f32) -> egui::FullOutput {
+    ctx.set_pixels_per_point(ppp);
+    let mut textures = egui::TexturesDelta::default();
+    let mut out = None;
+    for k in 0..2 {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32 / ppp, h as f32 / ppp))),
+            time: Some(k as f64 * 0.016),
+            ..Default::default()
+        };
+        let o = ctx.run(raw, |c| ui::draw_shop(c, game, 0, st));
+        // Every pass's texture updates must reach the renderer, or the font
+        // atlas the first pass created is patched before it exists.
+        textures.append(o.textures_delta.clone());
+        out = Some(o);
+    }
+    let mut out = out.expect("ran");
+    out.textures_delta = textures;
+    out
+}
+
+fn clear(device: &wgpu::Device, queue: &wgpu::Queue, view: &wgpu::TextureView) {
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let _p = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.08, b: 0.05, a: 1.0 }), store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+    }
+    queue.submit([enc.finish()]);
 }
