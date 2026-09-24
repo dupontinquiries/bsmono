@@ -776,7 +776,13 @@ pub fn waterfall(h: f32, variant: i32) -> VoxelMesh {
 ///
 /// `vox` is the voxel size: 0.6 for crags seen close, 1.2 for distant
 /// spires (same silhouette, an eighth of the instances by volume).
-pub fn crag(size: f32, variant: i32, lean: f32, vox: f32) -> VoxelMesh {
+///
+/// `yaw` is the lean direction in the model's xz plane (0 = +z, pi/2 = +x):
+/// built in, not applied as a quarter turn, so a crag leans exactly out of
+/// a curved wall. Shards root at the BACK of the grid (inside the wall the
+/// placement puts it against) and grow forward, so the crag emerges from
+/// the rock instead of hanging on it.
+pub fn crag(size: f32, variant: i32, lean: f32, vox: f32, yaw: f32) -> VoxelMesh {
     let k = 0.6 / vox.max(0.1);
     let n = ((24.0 * size * k).clamp(6.0, 44.0)) as usize;
     let ny = ((34.0 * size * k).clamp(8.0, 60.0)) as usize;
@@ -791,13 +797,21 @@ pub fn crag(size: f32, variant: i32, lean: f32, vox: f32) -> VoxelMesh {
         let k = 10 + s * 13;
         // base near the centre, spread a little; the main shard biggest
         let main = s == 0;
-        let bx = c + (h(k) - 0.5) * n as f32 * 0.35;
-        let bz = c + (h(k + 1) - 0.5) * n as f32 * 0.3 - n as f32 * 0.1;
+        // spread across the wall (perpendicular to the lean); rooted behind
+        // the centre along it -- inside the rock
+        let (fx, fz) = (yaw.sin(), yaw.cos());
+        // ribs, not boulders: little spread along the wall (a curved wall
+        // under a wide crag buries one end and bares the other) and rooted
+        // close to the face line
+        let across = (h(k) - 0.5) * n as f32 * 0.32;
+        let back = -(n as f32) * (0.04 + 0.06 * h(k + 1));
+        let bx = c + fz * across + fx * back;
+        let bz = c - fx * across + fz * back;
         let len = ny as f32 * if main { 0.9 } else { 0.45 + h(k + 2) * 0.35 };
         let tilt = (0.15 + lean * 0.75) * (0.7 + h(k + 3) * 0.6);
-        let yaw = (h(k + 4) - 0.5) * 1.1; // mostly toward +z
-        let dir = glam::Vec3::new(tilt.sin() * yaw.sin(), tilt.cos(), tilt.sin() * yaw.cos()).normalize();
-        let r0 = n as f32 * if main { 0.22 } else { 0.14 + h(k + 5) * 0.08 };
+        let yaw_s = yaw + (h(k + 4) - 0.5) * 0.6; // out of the wall, give or take
+        let dir = glam::Vec3::new(tilt.sin() * yaw_s.sin(), tilt.cos(), tilt.sin() * yaw_s.cos()).normalize();
+        let r0 = n as f32 * if main { 0.15 } else { 0.09 + h(k + 5) * 0.05 };
         // the section: 4..7 corners at irregular angles and radii
         let corners = 4 + (h(k + 6) * 4.0) as usize;
         let poly: Vec<(f32, f32)> = (0..corners)
@@ -852,10 +866,12 @@ pub fn crag(size: f32, variant: i32, lean: f32, vox: f32) -> VoxelMesh {
                     }
                     // colour: facets lighter up and on the lit side, creases dark
                     let facet = ((ang * corners as f32 / std::f32::consts::TAU).floor() as i32 + variant) % 3;
-                    let lift = 0.30 + 0.12 * t + [0.0, 0.03, -0.03][facet as usize];
-                    let root = ((0.18 - t).max(0.0)) * 0.6;
-                    let v0 = (lift - root).clamp(0.12, 0.6);
-                    g.set(x, y, z, solid([v0, v0 * 1.01, v0 * 1.07]));
+                    // the root is the cliff face's own grey (render's
+                    // pass_ground_color: ~0.25-0.29, bluer), lightening only
+                    // toward the tips: no step in colour where crag meets face
+                    let lift = 0.265 + 0.10 * t * t + [0.0, 0.02, -0.02][facet as usize] * t;
+                    let v0 = lift.clamp(0.18, 0.5);
+                    g.set(x, y, z, solid([v0, v0 * 1.02, v0 * 1.10]));
                 }
             }
         }

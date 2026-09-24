@@ -37,6 +37,15 @@ pub enum Item {
 
 /// Distinct crag meshes built; placements share them.
 pub const CRAG_VARIANTS: i32 = 10;
+/// Directions a crag can lean, round the compass.
+pub const CRAG_YAWS: i32 = 16;
+
+/// The lean-direction bucket for an outward direction (0 = +z, as the mesh
+/// builds it, increasing toward +x).
+pub fn yaw_bucket(facing: Vec3) -> i32 {
+    let a = facing.x.atan2(facing.z).rem_euclid(std::f32::consts::TAU);
+    ((a / std::f32::consts::TAU * CRAG_YAWS as f32).round() as i32).rem_euclid(CRAG_YAWS)
+}
 
 /// Keep off anything a match needs clear: lanes, bases, towers, streams,
 /// boss grounds.
@@ -193,18 +202,61 @@ pub fn placements() -> Vec<Item> {
                 // Near a choke the crags stay small and upright: one leaning
                 // out over a 7.6 u narrows hides the gap the choke exists to
                 // show (seen in the first render).
-                let tight = near_choke(jx, jz);
+                // judged again at the crag's footing below: the sample point
+                // can be outside a choke's radius while the footing it walks
+                // out to is inside it
+                let tight_here = near_choke(jx, jz);
                 if (0.6..2.4).contains(&d) && free(jx, jz, 8.5) {
-                    let top = pass::terrain_height(jx, jz).max(2.0);
                     let facing = out_of(jx, jz);
-                    if rng.f32() < 0.55 || tight {
-                        // at the foot
-                        let (sz, ln) = if tight { (rng.range(0.55, 0.8), rng.range(0.1, 0.3)) } else { (rng.range(0.65, 1.05), rng.range(0.25, 0.6)) };
-                        out.push(Item::Crag { at: Vec3::new(jx, -0.4, jz), size: sz, lean: ln, facing, variant: v, coarse: false });
-                    } else if top > 6.0 {
-                        // up the face, jutting out
-                        let y = rng.range(2.5, top * 0.7);
-                        out.push(Item::Crag { at: Vec3::new(jx, y, jz), size: rng.range(0.7, 1.25), lean: rng.range(0.7, 1.0), facing, variant: v, coarse: y > 9.0 });
+                    // Walk out to the face's foot, then find the face at the
+                    // crag's height by inverting the cliff's rise profile
+                    // (h = top * (1 - (1 - d/RISE)^3)): a cliff recedes as it
+                    // rises, and a crag rooted at ground level then lifted
+                    // hung in front of the rock with its shards dangling.
+                    let mut foot = Vec3::new(jx, 0.0, jz);
+                    for _ in 0..40 {
+                        if f.sdf(foot.x, foot.z) <= 0.3 {
+                            break;
+                        }
+                        foot += facing * 0.1;
+                    }
+                    let tight = tight_here || near_choke(foot.x, foot.z);
+                    let top = pass::cliff_top(foot.x, foot.z).max(2.0);
+                    let face_at = |y: f32| {
+                        let u = (y / top).clamp(0.0, 0.95);
+                        pass::CLIFF_RISE * (1.0 - (1.0 - u).powf(1.0 / 3.0))
+                    };
+                    // The face's character comes from the ground up: tall
+                    // blades rising against the base of the wall, rooted in
+                    // the floor-rock junction -- a seam the eye accepts.
+                    // Mid-face crags only high on tall faces, seen from
+                    // across the canyon: at eye level a blade meeting a
+                    // smooth sloped face shows its seam (the choke render,
+                    // twice: hanging shards, then buried ones).
+                    if rng.f32() < 0.7 || tight {
+                        // Ribs on the face line, nearly upright: half in the
+                        // rock, rising visibly from the floor. At a choke
+                        // they stay behind the line (small, and 0.8 u in).
+                        let (sz, ln, back) = if tight { (rng.range(0.55, 0.8), rng.range(0.05, 0.15), 0.8) } else { (rng.range(0.8, 1.35), rng.range(0.05, 0.25), -0.3) };
+                        let mut at = foot - facing * back;
+                        if tight {
+                            // Walk in until the rock is really this deep: a
+                            // fixed step along a direction measured elsewhere
+                            // left one choke crag proud of a curved funnel
+                            // wall (the test caught it).
+                            for _ in 0..60 {
+                                if f.sdf(at.x, at.z) >= 0.9 {
+                                    break;
+                                }
+                                at -= facing * 0.1;
+                            }
+                        }
+                        let at = at + Vec3::Y * -0.6;
+                        out.push(Item::Crag { at, size: sz, lean: ln, facing, variant: v, coarse: false });
+                    } else if top > 18.0 && !tight {
+                        let y = rng.range(10.0, top * 0.75);
+                        let at = foot - facing * (face_at(y) + 0.6) + Vec3::Y * (y - 0.6);
+                        out.push(Item::Crag { at, size: rng.range(0.8, 1.2), lean: rng.range(0.3, 0.5), facing, variant: v, coarse: true });
                     }
                 } else if d > 5.0 && d < 60.0 && rng.f32() < 0.03 && free(jx, jz, 16.0) {
                     let top = pass::terrain_height(jx, jz);
@@ -278,14 +330,22 @@ pub fn build() -> (Vec<Piece>, Blockers) {
                 pieces.push(Piece { mesh: weathered(props::pine(scale), 0.4, 0.75), pos: Vec3::new(x, y, z), quarter: 0, vsize: V_MED, sway: 0.4 });
             }
             Item::Crag { at, size, lean, facing, variant, coarse } => {
-                let key = (variant * 2 + coarse as i32, (size * 4.0).round() as i32, (lean * 4.0).round() as i32);
+                // a rib standing proud of the face has a base cats must
+                // not walk through
+                if !coarse && at.y < 0.0 && pass::floor().sdf(at.x, at.z) < 0.5 {
+                    let b = at + facing * (0.5 * size);
+                    blockers.push(crate::blockers::Blocker { shape: crate::blockers::Shape::Circle { x: b.x, z: b.z, r: 0.8 * size }, top: 4.0, cover: crate::blockers::Cover::NONE });
+                }
+                // The lean is built into the mesh at one of CRAG_YAWS
+                // directions (22.5 deg): quarter turns were up to 45 deg off
+                // a curved wall's real normal, and the blades read as pasted
+                // on sideways.
+                let yb = yaw_bucket(facing);
+                let key = (variant * 2 + coarse as i32, (size * 4.0).round() as i32, (lean * 4.0).round() as i32 * 64 + yb);
                 let vox = if coarse { 1.2 } else { 0.6 };
-                let mesh = crags.entry(key).or_insert_with(|| props::crag(key.1 as f32 / 4.0, key.0 / 2, key.2 as f32 / 4.0, vox)).clone();
-                // the mesh leans toward local +z; turn it to lean out of the
-                // wall (a quarter turn sends +z to +x, then -z, then -x)
-                let dirs = [Vec3::Z, Vec3::X, Vec3::NEG_Z, Vec3::NEG_X];
-                let q = (0..4).max_by(|&a, &b| dirs[a].dot(facing).partial_cmp(&dirs[b].dot(facing)).unwrap()).unwrap_or(0) as u8;
-                pieces.push(Piece { mesh, pos: at, quarter: q, vsize: vox, sway: 0.0 });
+                let yaw = yb as f32 / CRAG_YAWS as f32 * std::f32::consts::TAU;
+                let mesh = crags.entry(key).or_insert_with(|| props::crag(key.1 as f32 / 4.0, key.0 / 2, (key.2 / 64) as f32 / 4.0, vox, yaw)).clone();
+                pieces.push(Piece { mesh, pos: at, quarter: 0, vsize: vox, sway: 0.0 });
             }
             Item::Fall { at, height, facing } => {
                 // The mesh's sheet faces -z (it is built against z = 1 of a
@@ -338,9 +398,9 @@ mod tests {
         }
     }
 
-    /// Crags are scenery rooted in the rock: every one's footing is behind
-    /// a cliff face (no lane, choke or clearing narrower for them), and none
-    /// near a choke leans out over it.
+    /// Crags are rooted at the wall: every footing on the face line or
+    /// behind it, and none near a choke leans out over it or stands proud
+    /// of its wall (a choke's width is set by `pass::CHOKE_R`, not scenery).
     #[test]
     fn crags_stand_in_the_rock_and_keep_off_the_chokes() {
         let f = pass::floor();
@@ -349,9 +409,11 @@ mod tests {
         for it in placements() {
             if let Item::Crag { at, lean, .. } = it {
                 n += 1;
-                assert!(f.sdf(at.x, at.z) >= 0.6, "crag rooted on the floor at {at}");
+                // rooted at the wall: on the face line or behind it
+                assert!(f.sdf(at.x, at.z) >= -0.5, "crag standing out on the floor at {at} (sdf {})", f.sdf(at.x, at.z));
                 if chokes.iter().any(|(p, _)| (p.x - at.x).hypot(p.z - at.z) < 20.0) {
                     assert!(lean <= 0.3 + 1e-3, "a crag leaning {lean} over the choke near {at}");
+                    assert!(f.sdf(at.x, at.z) >= 0.5, "a crag standing proud at a choke, near {at}");
                 }
             }
         }
