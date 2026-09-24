@@ -417,6 +417,9 @@ pub struct TouchOverlay {
 
 /// r-mobile: paint the touch controls. Coordinates in the layout are
 /// framebuffer pixels; the painter works in points, so divide by `ppp`.
+/// (egui: `ui-overlay` only -- ungated, it broke every build with `render` but
+/// without `ui-overlay`, the engine's default feature set among them.)
+#[cfg(feature = "ui-overlay")]
 pub fn paint_touch_overlay(p: &egui::Painter, ov: &TouchOverlay, ppp: f32) {
     use crate::mobile_ui::{ButtonKind, STICK_RADIUS_PT};
     let ppp = if ppp > 0.0 { ppp } else { 1.0 };
@@ -455,13 +458,17 @@ pub struct InvSlotView {
     pub name: String,
     pub count: u32,
     /// r-item-models: the slot's icon quads (`item_icon`); empty = draw the
-    /// flat `color` swatch as before.
+    /// flat `color` swatch as before. `unendlich_ui` exists only with
+    /// `ui-overlay`, and so does this field (the struct itself is used by the
+    /// ungated `backpack` field, so only the icon is gated).
+    #[cfg(feature = "ui-overlay")]
     pub icon: Vec<unendlich_ui::IconQuad>,
 }
 
 /// r-item-models: an item's icon as the UI crate's quads — the seam between
 /// `item_model::icon_quads` (engine, pure) and `unendlich_ui::paint_item_icon`
 /// (egui). Tilted by the class's conventional icon angle.
+#[cfg(feature = "ui-overlay")]
 pub fn item_icon(model: &crate::item_model::ItemModel) -> Vec<unendlich_ui::IconQuad> {
     crate::item_model::icon_quads(model, crate::item_model::icon_tilt(model.class), 0.08)
         .into_iter()
