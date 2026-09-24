@@ -1009,11 +1009,14 @@ fn main() {
                 }
             }
         }
-        if io.config_status() != last_config_status {
+        // Compared by reference: the owning accessors allocated twice each
+        // per iteration, on a path that runs whether anything changed or
+        // not, and a status string changes perhaps once a session.
+        if io.config_status_ref() != last_config_status {
             last_config_status = io.config_status();
             sb.shell.note(last_config_status.clone());
         }
-        if io.power_status() != last_power_status {
+        if io.power_status_ref() != last_power_status {
             last_power_status = io.power_status();
             sb.shell.note(last_power_status.clone());
         }
@@ -1055,22 +1058,25 @@ fn main() {
                 side_due.remove(&role);
                 continue;
             };
+            let events = side_events.remove(&role).unwrap_or_default();
+            // Before prepare and bind, not after: binding is an
+            // eglMakeCurrent, and doing one per surface per iteration to
+            // then decide there was nothing to draw is the cost this check
+            // exists to avoid.
+            if events.is_empty() && side_due.get(&role).is_some_and(|due| now_ms < *due) {
+                continue;
+            }
             t.prepare(&mut io);
             let size_px = t.size_px();
             let (w, h) = t.screen_points();
             if gl.bind(role, &t.surface, size_px).is_err() {
                 continue;
             }
-            let events = side_events.remove(&role).unwrap_or_default();
-            // egui already says when it wants nothing more: `repaint_delay`
-            // from the previous run. Honouring it skips running the UI and
-            // tessellating at all for a surface that has nothing to do —
-            // which is where the per-frame allocations live, so this is a
-            // step earlier than the frame-hash skip, which only saves the
-            // fill. An input event always runs, whatever the delay said.
-            if events.is_empty() && side_due.get(&role).is_some_and(|due| now_ms < *due) {
-                continue;
-            }
+            // egui says when it wants nothing more: `repaint_delay` from
+            // the previous run. Honouring it skips the run and the
+            // tessellation entirely — a step earlier than the frame-hash
+            // skip, which only saves the fill, and the tessellation is
+            // where the per-frame allocations are.
             let mut raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h))),
                 time: Some(t0.elapsed().as_secs_f64()),

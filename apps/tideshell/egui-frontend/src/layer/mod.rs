@@ -590,6 +590,17 @@ impl Io {
         self.st.config_status.clone()
     }
 
+    /// Borrowed, for the loop's "has this changed" check. The owning version
+    /// allocated twice per iteration — once to compare and once to store —
+    /// on a path that runs whether anything changed or not.
+    pub fn config_status_ref(&self) -> &str {
+        &self.st.config_status
+    }
+
+    pub fn power_status_ref(&self) -> &str {
+        &self.st.power_status
+    }
+
     pub fn st_repeat(&self) -> (i32, i32) {
         self.st.repeat
     }
