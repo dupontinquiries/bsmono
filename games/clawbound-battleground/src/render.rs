@@ -1537,6 +1537,14 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
                     let t = (1.0 - (rd - RIVER_HALF_WIDTH) / 5.0).clamp(0.0, 1.0);
                     g = [g[0] + (0.46 - g[0]) * t * 0.85, g[1] + (0.40 - g[1]) * t * 0.85, g[2] + (0.27 - g[2]) * t * 0.85];
                 }
+                // The rim of the floor fades into the hill ring's darker
+                // green. It was a hard circle, as visible from above as a
+                // painted line; the arena edge is now a treeline, not a stripe.
+                let edge = smoothstep(ARENA_RADIUS - 14.0, ARENA_RADIUS, r);
+                if edge > 0.0 {
+                    let hill = [0.075 + n1 * 0.035, 0.175 + n2 * 0.06, 0.07 + n2 * 0.02];
+                    g = [g[0] + (hill[0] - g[0]) * edge, g[1] + (hill[1] - g[1]) * edge, g[2] + (hill[2] - g[2]) * edge];
+                }
                 // team base tints
                 for (bz, c) in [
                     (crate::consts::Team::Blue.base_pos().z, [0.20, 0.34, 0.60]),

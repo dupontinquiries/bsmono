@@ -731,7 +731,9 @@ pub fn groves(rng: &mut Rng, n: usize) -> Vec<Grove> {
             let kind = if bamboo_stand { PropKind::Bamboo } else if k % 3 == 2 { PropKind::StranglerFig } else { PropKind::JungleTree };
             parts.push((kind, tx, tz, 0.9 + rng.f32() * 0.3));
         }
-        let fill = 5 + (rng.f32() * 4.0) as usize;
+        // Dense enough to read as a bed from a raised camera: the first
+        // render at 5..8 small plants showed a bush and a fern on bare grass.
+        let fill = 10 + (rng.f32() * 5.0) as usize;
         for k in 0..fill {
             let a = rng.f32() * TAU;
             let d = bed * rng.f32().sqrt() * 0.85;
@@ -830,6 +832,51 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
             other => panic!("midjungle::layout places {other:?}, which build_world has no mesh arm for"),
         }
     }
+
+    // --- groves: the deep jungle's rooms. A ring of trunks (or a bamboo
+    // stand) round a bramble bed you can push through at half speed. Most of
+    // the added jungle is this rather than more lone trees: it makes the
+    // ground dense without adding walls, which is what `going` is for.
+    // Placed BEFORE the scatter, and the scatter kept out of them: placed
+    // after, the scatter had already dropped boulders and rocks into the
+    // beds, and a grove read as more of the same jungle rather than a room.
+    let grove_list = groves(&mut rng, 26);
+    let rooms: Vec<(f32, f32, f32)> = grove_list.iter().map(|g| (g.x, g.z, g.bed + 1.5)).collect();
+    for gr in grove_list {
+        blockers.push_rough(crate::going::Rough {
+            shape: crate::blockers::Shape::Circle { x: gr.x, z: gr.z, r: gr.bed },
+            mul: BRAMBLE_MUL,
+            edge: 1.2,
+            ground: crate::going::Ground::Thicket,
+        });
+        for (kind, x, z, sc) in gr.parts {
+            let q = (v % 4) as u8;
+            match kind {
+                PropKind::JungleTree => {
+                    plant!(JungleTree; props::jungle_tree(sc, v), x, z, 0.0, q, V_MED, 1.0);
+                    blockers.push_jungle_roots(x, z, 0.0, v);
+                }
+                PropKind::StranglerFig => plant!(StranglerFig; props::strangler_fig(sc, v), x, z, 0.0, q, V_MED, 0.8),
+                PropKind::Bamboo => plant!(Bamboo; props::bamboo(sc, v), x, z, 0.0, q, V_MED, 2.2),
+                PropKind::Bush => plant!(Bush; props::bush(v), x, z, 0.0, 0, V_MED, 1.8),
+                PropKind::Fern => plant!(Fern; props::fern(v), x, z, 0.0, 0, V_SM, 2.6),
+                other => panic!("groves() places {other:?}, which build_world has no mesh arm for"),
+            }
+            v += 1;
+        }
+    }
+
+    // Every scatter pass below goes through this: `jungle_spot`, minus the
+    // grove beds.
+    let jungle_spot = |rng: &mut Rng, min_clear: f32| -> Option<(f32, f32)> {
+        for _ in 0..8 {
+            let (x, z) = jungle_spot(rng, min_clear)?;
+            if !rooms.iter().any(|&(gx, gz, r)| (x - gx).hypot(z - gz) < r) {
+                return Some((x, z));
+            }
+        }
+        None
+    };
 
     // --- playable jungle flora ---
     for _ in 0..70 {
@@ -956,34 +1003,6 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
         v += 1;
     }
 
-    // --- groves: the deep jungle's rooms. A ring of trunks (or a bamboo
-    // stand) round a bramble bed you can push through at half speed. Most of
-    // the added jungle is this rather than more lone trees: it makes the
-    // ground dense without adding walls, which is what `going` is for.
-    for gr in groves(&mut rng, 26) {
-        blockers.push_rough(crate::going::Rough {
-            shape: crate::blockers::Shape::Circle { x: gr.x, z: gr.z, r: gr.bed },
-            mul: BRAMBLE_MUL,
-            edge: 1.2,
-            ground: crate::going::Ground::Thicket,
-        });
-        for (kind, x, z, sc) in gr.parts {
-            let q = (v % 4) as u8;
-            match kind {
-                PropKind::JungleTree => {
-                    plant!(JungleTree; props::jungle_tree(sc, v), x, z, 0.0, q, V_MED, 1.0);
-                    blockers.push_jungle_roots(x, z, 0.0, v);
-                }
-                PropKind::StranglerFig => plant!(StranglerFig; props::strangler_fig(sc, v), x, z, 0.0, q, V_MED, 0.8),
-                PropKind::Bamboo => plant!(Bamboo; props::bamboo(sc, v), x, z, 0.0, q, V_MED, 2.2),
-                PropKind::Bush => plant!(Bush; props::bush(v), x, z, 0.0, 0, V_SM, 1.8),
-                PropKind::Fern => plant!(Fern; props::fern(v), x, z, 0.0, 0, V_SM, 2.6),
-                other => panic!("groves() places {other:?}, which build_world has no mesh arm for"),
-            }
-            v += 1;
-        }
-    }
-
     // --- ruin camps deep in the jungle ---
     let mut camps: Vec<(f32, f32)> = Vec::new();
     let mut tries = 0usize;
@@ -1097,6 +1116,33 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
             plant!(Bush; props::bush(v), x, z, terrain_height(x, z), 0, V_MED, 1.8);
         }
         v += 1;
+    }
+
+    // --- the treeline: the arena's edge as jungle, not as a colour change.
+    // Cheap props only (palm ~170 instances, bamboo ~160, bush ~130, pine
+    // ~380 against a jungle tree's ~1000): the ring is 1080 u round and has
+    // to be dense without spending the instance budget the playable jungle
+    // needs. Outside the floor, so it is scenery and blocks nobody who can
+    // reach it; skipped where the rivers leave the map.
+    {
+        let n = 150;
+        for i in 0..n {
+            let a = (i as f32 + rng.f32() * 0.8) / n as f32 * TAU;
+            let r = ARENA_RADIUS + 1.5 + rng.f32() * 9.0;
+            let (x, z) = (a.cos() * r, a.sin() * r);
+            if consts::river_dist(x, z) < 9.0 {
+                continue;
+            }
+            let y = terrain_height(x, z) - 0.2;
+            let q = (v % 4) as u8;
+            match i % 5 {
+                0 | 3 => plant!(Palm; props::palm(0.9 + rng.f32() * 0.35, v), x, z, y, q, V_MED, 1.6),
+                1 => plant!(Bamboo; props::bamboo(1.0 + rng.f32() * 0.3, v), x, z, y, q, V_MED, 2.2),
+                2 => plant!(Pine; props::pine(0.9 + rng.f32() * 0.5), x, z, y, 0, V_MED, 0.9),
+                _ => plant!(Bush; props::bush(v), x, z, y, 0, V_MED, 1.8),
+            }
+            v += 1;
+        }
     }
 
     // --- batch into spatial chunks per voxel-size class ---
