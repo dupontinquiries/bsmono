@@ -254,9 +254,13 @@ pub struct Limiter {
     release_c: f32,
     gain_db: f32,
     delay: Vec<f32>,
-    /// Gain required by each sample in the lookahead window, parallel to `delay`.
-    need: Vec<f32>,
     head: usize,
+    /// The lookahead window's gain needs as a MONOTONIC DEQUE (index, need),
+    /// needs increasing from the front: the front is the window's minimum.
+    /// Was an O(window) scan per sample -- on Balance, twelve limiters were
+    /// 76% of the whole render (examples/profile_mix). Same answer, exactly.
+    win: std::collections::VecDeque<(u64, f32)>,
+    count: u64,
 }
 
 impl Limiter {
@@ -267,8 +271,9 @@ impl Limiter {
             release_c: time_const(release_ms, rate),
             gain_db: 0.0,
             delay: vec![0.0; n],
-            need: vec![0.0; n],
             head: 0,
+            win: std::collections::VecDeque::with_capacity(n + 1),
+            count: 0,
         }
     }
 
@@ -288,14 +293,17 @@ impl Limiter {
         };
         let delayed = self.delay[self.head];
         self.delay[self.head] = x;
-        self.need[self.head] = need;
         self.head = (self.head + 1) % self.delay.len();
 
-        // Required gain over the whole lookahead window. O(window) per sample —
-        // a monotonic deque would make it O(1), and is the right optimisation
-        // later; being audibly correct first is worth more than being fast at
-        // letting samples through.
-        let target = self.need.iter().copied().fold(0.0f32, f32::min);
+        // Required gain over the whole lookahead window (the last n needs,
+        // this one included): the deque's front, amortised O(1). Slots not
+        // yet filled count as 0 dB, as the zeroed window did before.
+        while self.win.back().is_some_and(|b| b.1 >= need) { self.win.pop_back(); }
+        self.win.push_back((self.count, need));
+        let n = self.delay.len() as u64;
+        while self.win.front().is_some_and(|f| f.0 + n <= self.count) { self.win.pop_front(); }
+        self.count += 1;
+        let target = self.win.front().map_or(0.0, |f| f.1).min(0.0);
         self.gain_db = if target < self.gain_db {
             target // attack is instant: that is what "brickwall" means
         } else {
@@ -846,6 +854,43 @@ pub fn instantiate(effect: &studio_core::Effect, rate: f32) -> Option<Instance> 
         }),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod limiter_deque_tests {
+    use super::*;
+
+    /// The limiter as it was: an O(window) scan per sample.
+    struct Naive { ceiling_db: f32, release_c: f32, gain_db: f32, delay: Vec<f32>, need: Vec<f32>, head: usize }
+    impl Naive {
+        fn process(&mut self, x: f32) -> f32 {
+            let need = { let over = to_db(x) - self.ceiling_db; if over > 0.0 { -over } else { 0.0 } };
+            let delayed = self.delay[self.head];
+            self.delay[self.head] = x;
+            self.need[self.head] = need;
+            self.head = (self.head + 1) % self.delay.len();
+            let target = self.need.iter().copied().fold(0.0f32, f32::min);
+            self.gain_db = if target < self.gain_db { target } else { target + self.release_c * (self.gain_db - target) };
+            delayed * from_db(self.gain_db)
+        }
+    }
+
+    #[test]
+    fn the_deque_limiter_is_bit_identical_to_the_scan_it_replaced() {
+        let rate = 48_000.0;
+        let mut fast = Limiter::new(rate, -0.3, 5.0, 60.0);
+        let n = fast.lookahead_samples();
+        let mut slow = Naive { ceiling_db: -0.3, release_c: time_const(60.0, rate), gain_db: 0.0, delay: vec![0.0; n], need: vec![0.0; n], head: 0 };
+        let mut x = 99u64;
+        let mut rnd = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x % 20_000) as f32 / 10_000.0 - 1.0 };
+        for i in 0..200_000 {
+            // quiet stretches, loud bursts, lone spikes: every path of the deque
+            let amp = if (i / 3000) % 3 == 0 { 0.2 } else if i % 997 == 0 { 4.0 } else { 1.6 };
+            let s = rnd() * amp;
+            let (a, b) = (fast.process(s), slow.process(s));
+            assert_eq!(a.to_bits(), b.to_bits(), "sample {i}: {a} vs {b}");
+        }
+    }
 }
 
 #[cfg(test)]
