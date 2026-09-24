@@ -34,6 +34,8 @@
 //! which is why the cue limits here are about duty and amplitude rather than
 //! about picking a frequency.
 
+pub mod profile;
+
 /// Who wants the lens. Higher ordinal wins; ties go to the incumbent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum User {
