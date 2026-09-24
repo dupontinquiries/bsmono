@@ -149,6 +149,12 @@ pub fn inventory(b: &[u8]) -> Result<Value, FlpError> {
                 c.insert("sample_path".into(), json!(p));
                 if !file.is_empty() { c.insert("sample_file".into(), json!(file)); }
             }
+            // ChannelID.Parameters: byte 80 is the sample's NORMALIZE switch --
+            // on for Blue Moon's quiet female lead, which FL brings up ~19 dB
+            // with it; reading it is the difference between her there or not.
+            Ev::Data(215, d) if !mixer_on && !channels.is_empty() => {
+                if let Some(n) = d.get(80) { channels.last_mut().unwrap().insert("normalize".into(), json!(*n != 0)); }
+            }
             Ev::Data(219, d) if !mixer_on && !channels.is_empty() => {
                 let c = channels.last_mut().unwrap();
                 if let Some(p) = i32at(d, 0) { c.insert("pan".into(), json!(p)); }

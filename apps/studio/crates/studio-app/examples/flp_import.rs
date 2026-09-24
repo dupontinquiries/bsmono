@@ -28,7 +28,8 @@ fn main() {
         let real = opus_for(file).unwrap_or_else(|| file.to_string());
         let m = studio_media::decode_file(&media.join(&real)).ok().map(|s| studio_app::flp_import::Media {
             len: studio_core::Ticks::from_samples(s.frames() as i64, s.sample_rate), rate: s.sample_rate,
-            channels: s.channels.len() as u16 });
+            channels: s.channels.len() as u16,
+            peak: s.channels.iter().flat_map(|c| c.iter()).fold(0.0f32, |m, v| m.max(v.abs())) });
         cache.borrow_mut().insert(file.to_string(), m);
         m
     };

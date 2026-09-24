@@ -49,13 +49,30 @@ use studio_live::{Channel, Note, Pattern, Rack, SynthKind};
 
 /// What a media file is: length, sample rate, channels, has picture.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Media { pub len: Ticks, pub rate: u32, pub channels: u16 }
+pub struct Media {
+    pub len: Ticks, pub rate: u32, pub channels: u16,
+    /// The file's sample peak (0..), for FL's per-channel NORMALIZE; 0 when unknown.
+    pub peak: f32,
+}
 
 pub struct Imported {
     pub project: Project,
     pub rack: Rack,
     /// Everything approximated, skipped or refused, grouped, for a person.
     pub report: Vec<String>,
+}
+
+/// FL's channel pan: 0..=12800 with 6400 CENTRE. Read as signed around 0
+/// until c20, which put every channel of Blue Moon hard right.
+pub fn fl_pan(v: f64) -> f32 { ((v - 6400.0) / 6400.0).clamp(-1.0, 1.0) as f32 }
+
+/// A channel's level on what it plays: its volume (10000 = unity, FL's
+/// default) times, when the sample is NORMALIZEd in FL, the gain that brings
+/// the file's peak to full scale -- FL applies that before the channel.
+pub fn channel_gain(c: &Value, m: Option<Media>) -> f32 {
+    let vol = (c["volume"].as_f64().unwrap_or(10000.0) / 10000.0) as f32;
+    let norm = match m { Some(m) if c["normalize"].as_bool() == Some(true) && m.peak > 1e-4 => 1.0 / m.peak, _ => 1.0 };
+    vol * norm
 }
 
 /// Steps per pattern at most (the rack rows are a u64 bitmask).
@@ -155,9 +172,11 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         // Wrapper" for a VST); the display name is what the person called it
         let internal = s(&c["plugin"]).unwrap_or("").to_string();
         let plugin = if internal == "Fruity Wrapper" { "VST".to_string() } else { internal.clone() };
+        let mut media: Option<Media> = None;
         let kind = if kind_s == "Sampler" || internal == "Fruity slicer" {
             match file_of(c).and_then(|f| source_for(&f, &mut ops, &mut missing)) {
-                Some((id, _)) => {
+                Some((id, m)) => {
+                    media = Some(m);
                     if internal == "Fruity slicer" {
                         report.push(format!("{}: a Fruity Slicer -- plays its whole recording from each note; the slice map is not in the dump", ch_name(c)));
                     }
@@ -172,10 +191,9 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
             if low { SynthKind::Sub { note: 0, glide_from: None, glide_ms: 0.0, drive: 0.0, decay_ms: 400.0 } }
             else { SynthKind::Sine { hz: 261.63 } }
         };
-        let vol = f(&c["volume"]).unwrap_or(10000.0);
         rack_ix.insert(*fl, rack.channels.len());
-        let pan = (f(&c["pan"]).unwrap_or(0.0) / 6400.0).clamp(-1.0, 1.0) as f32;
-        rack.channels.push(Channel { name: ch_name(c), kind, gain: (vol / 10000.0).clamp(0.0, 1.28) as f32,
+        let pan = fl_pan(f(&c["pan"]).unwrap_or(6400.0));
+        rack.channels.push(Channel { name: ch_name(c), kind, gain: channel_gain(c, media).clamp(0.0, 16.0),
                                      pan, muted: false, choke_group: None });
     }
     if !stand_ins.is_empty() {
@@ -302,7 +320,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         for it in items {
             let pos = at(i(&it["pos"]).unwrap_or(0));
             let len_t = at(i(&it["len"]).unwrap_or(0));
-            let mut clips: Vec<(SourceId, Ticks, Ticks, Ticks)> = Vec::new(); // (source, at, src_in, len)
+            let mut clips: Vec<(SourceId, Ticks, Ticks, Ticks, f32)> = Vec::new(); // (source, at, src_in, len, gain)
             match s(&it["kind"]) {
                 Some("ChannelPLItem") => {
                     let Some(c) = i(&it["channel"]).and_then(|c| chans.get(&c)) else { continue };
@@ -312,7 +330,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                     let off = it["offsets"].as_array().and_then(|o| o.first()).and_then(|v| v.as_f64()).unwrap_or(-1.0);
                     let src_in = if off > 0.0 { Ticks::from_seconds(off / 1000.0) } else { Ticks::ZERO };
                     let len = len_t.min(m.len.saturating_sub(src_in));
-                    if len > Ticks::ZERO { clips.push((id, pos, src_in, len)); }
+                    if len > Ticks::ZERO { clips.push((id, pos, src_in, len, channel_gain(c, Some(m)))); }
                     first_insert = first_insert.or(i(&c["insert"]));
                     label.get_or_insert_with(|| ch_name(c));
                 }
@@ -328,7 +346,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                                 channels: 2, has_video: false, kind: SourceKind::Pattern { pattern: *rp, name: rack.patterns[*rp].name.clone() } } });
                             id
                         });
-                        clips.push((id, pos.saturating_add(part_at), Ticks::ZERO, part_len));
+                        clips.push((id, pos.saturating_add(part_at), Ticks::ZERO, part_len, 1.0));
                     }
                     if first_insert.is_none() {
                         let first_ch = patterns.iter().find(|p| i(&p["iid"]) == Some(pid))
@@ -339,7 +357,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                 }
                 _ => continue,
             }
-            for (src, pos, src_in, len) in clips {
+            for (src, pos, src_in, len, gain) in clips {
                 let lane = match lanes.iter().position(|(_, spans)| spans.iter().all(|(a, b)| pos >= *b || pos.saturating_add(len) <= *a)) {
                     Some(l) => l,
                     None => {
@@ -357,7 +375,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                 };
                 lanes[lane].1.push((pos, pos.saturating_add(len)));
                 ops.push(Op::AddClip { clip: Clip { id: ClipId(next_clip), source: src, track: lanes[lane].0, pos, src_in, len,
-                                                    gain: 1.0, effects: vec![] } });
+                                                    gain, effects: vec![] } });
                 next_clip += 1;
                 placed += 1;
             }
@@ -413,8 +431,8 @@ mod tests {
 
     fn probe(file: &str) -> Option<Media> {
         match file {
-            "kick.wav" => Some(Media { len: Ticks::from_seconds(0.4), rate: 44_100, channels: 1 }),
-            "vox.wav" => Some(Media { len: Ticks::from_seconds(30.0), rate: 48_000, channels: 2 }),
+            "kick.wav" => Some(Media { len: Ticks::from_seconds(0.4), rate: 44_100, channels: 1, peak: 0.9 }),
+            "vox.wav" => Some(Media { len: Ticks::from_seconds(30.0), rate: 48_000, channels: 2, peak: 0.125 }),
             _ => None,
         }
     }
@@ -428,7 +446,7 @@ mod tests {
                 {"iid": 0, "kind": "Sampler", "name": "Kick", "sample_file": "kick.wav", "insert": 1, "volume": 10000},
                 {"iid": 1, "kind": "Instrument", "name": "Omnisphere", "plugin": "Fruity Wrapper", "plugin_name": "Omnisphere", "insert": 2, "volume": 10000},
                 {"iid": 2, "kind": "Instrument", "name": "Bass", "plugin": "Fruity Wrapper", "plugin_name": "Omnisphere", "insert": 0, "volume": 10000},
-                {"iid": 3, "kind": "Sampler", "name": "Vox", "sample_file": "vox.wav", "insert": 2},
+                {"iid": 3, "kind": "Sampler", "name": "Vox", "sample_file": "vox.wav", "insert": 2, "volume": 5000, "pan": 6400, "normalize": true},
                 {"iid": 4, "kind": "Automation", "name": "Vox - Volume"}
             ],
             "patterns": [
@@ -500,6 +518,21 @@ mod tests {
         let clips = im.project.track_clips(t.id);
         assert_eq!(clips.len(), 2);
         assert!((secs(clips[1].pos) - 8.0).abs() < 1e-6, "64 steps at 120 BPM = 8 s");
+    }
+
+    /// Blue Moon's female lead: a quiet take (peak -18 dB here), FL channel
+    /// at half volume, NORMALIZE on. The clip carries 0.5 x 1/0.125 = 4.
+    #[test]
+    fn a_normalized_quiet_take_is_brought_up_as_fl_does_and_centre_pan_is_centre() {
+        let im = import(&inventory(), "demo", &probe).unwrap();
+        let vt = im.project.tracks.iter().find(|t| t.name == "Vocals").unwrap();
+        let clip = &im.project.track_clips(vt.id)[0];
+        assert!((clip.gain - 4.0).abs() < 1e-5, "volume 0.5 x normalize 8 = 4, got {}", clip.gain);
+        assert_eq!(fl_pan(6400.0), 0.0);
+        assert_eq!(fl_pan(0.0), -1.0);
+        assert_eq!(fl_pan(12800.0), 1.0);
+        let kick = im.rack.channels.iter().find(|c| c.name == "Kick").unwrap();
+        assert!((kick.gain - 1.0).abs() < 1e-6, "not normalized: its volume alone");
     }
 
     #[test]
