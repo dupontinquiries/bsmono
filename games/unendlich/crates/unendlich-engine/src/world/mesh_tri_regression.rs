@@ -260,4 +260,28 @@ mod tests {
         let chunk = Chunk::from_blocks(coord, blocks);
         assert_eq!(triangle_count_of(&chunk), 0);
     }
+
+    /// DIAGNOSTIC (ignored): where the worst sampled chunk's triangles come from --
+    /// the mesher's per-emission-path counters and the chunk's block histogram.
+    #[test]
+    #[ignore = "diagnostic: cargo test --lib -- --ignored --nocapture where_the_triangles_come_from"]
+    fn where_the_triangles_come_from() {
+        let gen = crate::world::cpu_generator::WorldGenerator::new(1);
+        for coord in [ChunkCoord::new(0, 3, -1), ChunkCoord::new(0, 2, 0)] {
+            let chunk = gen.generate_chunk(coord);
+            crate::render::mesher::mesh_diag_reset();
+            let m = crate::render::mesher::mesh_chunk(&chunk);
+            let d = crate::render::mesher::mesh_diag_snapshot();
+            let mut hist: std::collections::BTreeMap<u32, usize> = Default::default();
+            for y in 0..32 { for z in 0..32 { for x in 0..32 {
+                *hist.entry(chunk.get(x, y, z) as u32).or_default() += 1;
+            }}}
+            let mut top: Vec<(u32, usize)> = hist.into_iter().collect();
+            top.sort_by(|a, b| b.1.cmp(&a.1));
+            eprintln!("DIAG {coord:?}: tris {} verts {} | subdiv_top quads {} blocks {} | jitter_top {} | soft_side {} | plant_stamps {}",
+                m.indices.len() / 3, m.vertices.len(), d.subdivided_top_quads, d.subdivided_top_blocks,
+                d.jittered_top_quads, d.soft_side_faces, d.plant_stamps);
+            eprintln!("DIAG {coord:?}: blocks {:?}", &top[..top.len().min(10)]);
+        }
+    }
 }
