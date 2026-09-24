@@ -77,6 +77,7 @@ pub mod keys;
 pub mod powerdoctor;
 pub mod ctl;
 pub mod camera;
+pub mod devices;
 pub mod fit;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
@@ -148,6 +149,8 @@ pub struct ShellView {
     /// How the sensor is mounted relative to the screen. A property of the
     /// hardware, so it is set once rather than guessed per frame.
     pub camera_rot: crate::fit::Quarter,
+    /// Flip the preview horizontally (front cameras).
+    pub camera_mirror: bool,
     bar_drag: f32,
     sheet: SettingsSheet,
     /// Press feedback per widget: a spring on its scale (0.94 pressed, 1.0
@@ -765,7 +768,13 @@ impl ShellView {
             // each destination corner read a different source corner, which
             // both turns the image and crops it to one scale factor, so
             // real-world proportions survive.
-            let uv = crate::fit::corner_uvs((*fw as f32, *fh as f32), (size.x, size.y), self.camera_rot);
+            let mut uv = crate::fit::corner_uvs((*fw as f32, *fh as f32), (size.x, size.y), self.camera_rot);
+            if self.camera_mirror {
+                // Swap the left and right columns of the quad: a mirror is a
+                // reordering, not a second sampling pass.
+                uv.swap(0, 1);
+                uv.swap(3, 2);
+            }
             let tint = Color32::from_white_alpha((alpha * 255.0) as u8);
             let mut mesh = egui::Mesh::with_texture(tex.id());
             for (i, corner) in [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()].iter().enumerate() {
