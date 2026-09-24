@@ -68,6 +68,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ambient-palette"
+version = "0.1.0"
+
+[[package]]
 name = "analog-kit"
 version = "0.1.0"
 dependencies = [
@@ -4023,6 +4027,7 @@ dependencies = [
 name = "uikit-egui"
 version = "0.1.0"
 dependencies = [
+ "ambient-palette",
  "egui",
  "math-kit",
  "settings-kit",

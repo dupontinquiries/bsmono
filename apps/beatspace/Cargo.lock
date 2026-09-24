@@ -69,6 +69,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ambient-palette"
+version = "0.1.0"
+
+[[package]]
 name = "android-activity"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4599,6 +4603,7 @@ dependencies = [
 name = "uikit-egui"
 version = "0.1.0"
 dependencies = [
+ "ambient-palette",
  "egui",
  "math-kit",
  "settings-kit",
