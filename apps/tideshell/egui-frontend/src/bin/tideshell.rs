@@ -632,9 +632,25 @@ fn main() {
         if trace_stderr {
             print_new_trace(&sb.shell, &mut printed);
         }
-        let busy = !sb.shell.recognizer.is_idle() || sb.view.needs_overlay(&sb.shell) || sb.shell.switcher.is_streaking();
+        // `busy` is about a finger or an animation, NOT about the overlay
+        // being mapped. A mapped overlay is the normal state on this layout
+        // — a locked screen, or the right-hand bar — so treating it as busy
+        // held the loop at 16 ms forever, and with nothing to draw that is
+        // sixty wakeups a second to decide to do nothing.
+        let animating = sb.shell.drawer.is_animating()
+            || sb.shell.switcher.is_animating()
+            || sb.shell.sleep.is_animating()
+            || sb.shell.ambient.is_animating()
+            || (sb.shell.lock.is_locked() && !sb.shell.lock.reveal.is_settled());
+        let busy = !sb.shell.recognizer.is_idle() || sb.shell.switcher.is_streaking() || animating;
         // 90 Hz while brightness is moving: one step per panel frame.
-        let timeout = if sb.shell.ambient.is_animating() { 11 } else if busy { 16 } else { 250 };
+        let timeout = if sb.shell.ambient.is_animating() {
+            11
+        } else if busy {
+            16
+        } else {
+            250
+        };
         let input = io.dispatch(timeout).unwrap_or_else(|e| {
             eprintln!("tideshell: wayland: {e}");
             std::process::exit(1)
@@ -1045,6 +1061,10 @@ fn main() {
         if !want {
             gl.unbind(Role::Overlay);
             io.ensure_overlay(false);
+            // Forget the hash: the surface's contents are gone, so the next
+            // frame is not "identical to what is on screen" — there is
+            // nothing on screen.
+            last_frame_hash.remove(&Role::Overlay);
             last_region = None;
             overlay_events.clear();
             continue;
@@ -1094,6 +1114,17 @@ fn main() {
             CursorWant::Shape(shape_for(out.platform_output.cursor_icon))
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        // The overlay is the big one: full screen, and painted every
+        // iteration whatever it contained. With swap_interval(0) each swap
+        // also produces Wayland events, so the next poll found the fd ready
+        // and never slept — the loop free-ran at over a thousand iterations
+        // a second while nothing moved. Skipping the identical frame is what
+        // lets it block.
+        let h = tideshell_egui::damage::frame_hash(&prims);
+        if !tideshell_egui::damage::changed(last_frame_hash.get(&Role::Overlay).copied(), h, !out.textures_delta.is_empty()) {
+            continue;
+        }
+        last_frame_hash.insert(Role::Overlay, h);
         if let Err(e) = gl.paint(Role::Overlay, size_px, out.pixels_per_point, &prims, &out.textures_delta) {
             eprintln!("tideshell: {e}");
         }
