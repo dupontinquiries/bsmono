@@ -206,6 +206,7 @@ impl Executor for System {
             Action::Pointer(_) => Outcome::Unwired("EI sender not wired (needs cosmic-comp patch 0002 + reis client)"),
             Action::SetQuick(..) => Outcome::Unwired("no system backend for quick toggles yet"),
             Action::SetSlider(tideshell_core::control_center::SliderKind::Volume, v) => fade_volume(*v),
+            Action::SetSlider(tideshell_core::control_center::SliderKind::Warmth, v) => apply_warmth(*v),
             Action::SetSlider(..) => Outcome::Unwired("brightness is applied by the layer runtime"),
             Action::DisplayPower(_) => Outcome::Unwired("display power is handled by the layer runtime"),
             Action::Rotate(deg) => rotate_output(*deg),
@@ -416,6 +417,55 @@ pub fn apply_voicing(tone: f32) -> Outcome {
     let props = tideshell_core::audio::props_text(&p);
     match Command::new("pw-cli").args(["set-param", &id.to_string(), "Props", &props]).stdin(Stdio::null()).output() {
         Ok(o) if o.status.success() => Outcome::Done(format!("voicing {tone:+.2}: hp {:.0} Hz, lp {:.0} Hz, presence {:+.1} dB, trim {:+.1} dB", p.hp_hz, p.lp_hz, p.presence_db, p.trim_db)),
+        Ok(o) => Outcome::Failed(format!("pw-cli set-param: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => Outcome::Failed(format!("pw-cli: {e}")),
+    }
+}
+
+/// Where the speaker chain's config lives.
+pub fn speaker_config_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|c| c.join("pipewire/pipewire.conf.d/tideshell-speaker.conf"))
+}
+
+/// Move the speaker chain's controls. If the sink is not running, write the
+/// config and say what is missing rather than failing silently — the chain
+/// needs plugins that are not builtin (bankstown as LV2, swh-plugins for
+/// the compressor and limiter), so "not running" usually means "not
+/// installed", and that is worth saying out loud.
+pub fn apply_warmth(x: f32) -> Outcome {
+    let w = tideshell_core::audio::warmth(x);
+    let listing = match Command::new("pw-cli").args(["ls", "Node"]).stdin(Stdio::null()).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => return Outcome::Failed(format!("pw-cli ls: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => return Outcome::Failed(format!("pw-cli: {e} (PipeWire tools not installed)")),
+    };
+    let Some(id) = parse_node_id(&listing, tideshell_core::audio::SPEAKER_SINK) else {
+        return match speaker_config_path() {
+            Some(path) if path.exists() => Outcome::Failed(format!(
+                "speaker chain not running; config is at {}. It needs an LV2 bankstown bundle (lv2ls | grep bankstown) and swh-plugins, then: systemctl --user restart pipewire",
+                path.display()
+            )),
+            Some(path) => {
+                if let Some(d) = path.parent() {
+                    let _ = std::fs::create_dir_all(d);
+                }
+                match std::fs::write(&path, tideshell_core::audio::speaker_chain_config()) {
+                    Ok(()) => Outcome::Failed(format!("speaker chain installed at {}; install bankstown (LV2) and swh-plugins, then restart pipewire", path.display())),
+                    Err(e) => Outcome::Failed(format!("cannot write {}: {e}", path.display())),
+                }
+            }
+            None => Outcome::Failed("no config dir for the speaker chain".into()),
+        };
+    };
+    let props = tideshell_core::audio::warmth_props_text(&w);
+    match Command::new("pw-cli").args(["set-param", &id.to_string(), "Props", &props]).stdin(Stdio::null()).output() {
+        Ok(o) if o.status.success() => Outcome::Done(format!(
+            "warmth {x:.2}: harmonics {:.2}, compression {:.1}:1, limit {:.0} dB",
+            w.bass_amt, w.comp_ratio, w.limit_db
+        )),
         Ok(o) => Outcome::Failed(format!("pw-cli set-param: {}", String::from_utf8_lossy(&o.stderr).trim())),
         Err(e) => Outcome::Failed(format!("pw-cli: {e}")),
     }

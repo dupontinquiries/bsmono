@@ -288,3 +288,118 @@ mod warmth_tests {
         assert_eq!(warmth(-1.0).bass_amt, 0.0);
     }
 }
+
+/// The speaker sink: bankstown, a compressor, and a limiter that is never
+/// off. Named so [`warmth_props_text`] can move the controls at runtime.
+pub const SPEAKER_SINK: &str = "tideshell-speaker";
+
+/// The PipeWire user config for the speaker chain.
+///
+/// None of these stages is builtin. PipeWire's own filters are mixers,
+/// copies, biquads and convolvers; harmonics, compression and limiting all
+/// come from plugins, so this config only loads where they are installed:
+///
+/// * bankstown, LV2 `https://chadmed.au/bankstown`, built from source.
+///   Install as a proper bundle — `bankstown.so` (renamed from
+///   `libbankstown.so`), `bankstown.ttl` and `manifest.ttl` — or lilv will
+///   not find it and the chain will not come up.
+/// * swh-plugins for the LADSPA compressor and limiter.
+///
+/// The limiter is last and is not on the slider. bankstown ADDS energy, and
+/// a bass exciter's whole effect is that people then turn the volume up; a
+/// chain without a limiter delivers that to the voice coil as clipping.
+pub fn speaker_chain_config() -> String {
+    format!(
+        r#"# tideshell speaker sink: bankstown -> compressor -> limiter.
+#
+# Needs: an LV2 bankstown bundle, and swh-plugins for the LADSPA stages.
+#   lv2ls | grep bankstown     # must print the plugin URI
+#   listplugins | grep -iE 'limiter|compress'
+#
+# The limiter is deliberately not adjustable from the shell: it exists to
+# keep what the exciter adds off the voice coil.
+context.modules = [
+    {{  name = libpipewire-module-filter-chain
+        args = {{
+            node.description = "tideshell speaker"
+            media.name       = "tideshell speaker"
+            filter.graph = {{
+                nodes = [
+                    {{ type = lv2    plugin = "https://chadmed.au/bankstown" label = bankstown name = bass
+                       control = {{ "bypass" = 1.0 "amt" = 0.0 "blend" = 0.5 "floor" = 45.0 "ceil" = 180.0 "final_hp" = 40.0 "sat_second" = 0.3 "sat_third" = 0.6 }} }}
+                    {{ type = ladspa plugin = "sc4_1882" label = sc4 name = comp
+                       control = {{ "Ratio" = 1.0 "Threshold level (dB)" = 0.0 "Attack time (ms)" = 10.0 "Release time (ms)" = 200.0 "Makeup gain (dB)" = 0.0 }} }}
+                    {{ type = ladspa plugin = "fast_lookahead_limiter_1913" label = fastLookaheadLimiter name = limit
+                       control = {{ "Input gain (dB)" = 0.0 "Limit (dB)" = {limit:.1} "Release time (s)" = 0.1 }} }}
+                ]
+                links = [
+                    {{ output = "bass:Out" input = "comp:In" }}
+                    {{ output = "comp:Out" input = "limit:In" }}
+                ]
+            }}
+            capture.props = {{
+                node.name   = "{sink}"
+                media.class = Audio/Sink
+                audio.position = [ FL FR ]
+            }}
+            playback.props = {{
+                node.name   = "{sink}.out"
+                node.passive = true
+                audio.position = [ FL FR ]
+            }}
+        }}
+    }}
+]
+"#,
+        sink = SPEAKER_SINK,
+        limit = LIMIT_DB
+    )
+}
+
+/// `pw-cli set-param <node> Props` for a warmth position.
+pub fn warmth_props_text(w: &Warmth) -> String {
+    let items = [
+        ("bass:bypass".to_string(), if w.bass_amt <= 0.0 { 1.0 } else { 0.0 }),
+        ("bass:amt".to_string(), w.bass_amt),
+        ("bass:blend".to_string(), w.bass_blend),
+        ("comp:Ratio".to_string(), w.comp_ratio),
+        ("comp:Threshold level (dB)".to_string(), w.comp_threshold_db),
+        ("comp:Makeup gain (dB)".to_string(), 20.0 * w.makeup.log10()),
+        ("limit:Limit (dB)".to_string(), w.limit_db),
+    ];
+    let body: Vec<String> = items.iter().map(|(k, v)| format!("\"{k}\" {v:.3}")).collect();
+    format!("{{ params = [ {} ] }}", body.join(" "))
+}
+
+#[cfg(test)]
+mod speaker_chain_tests {
+    use super::*;
+
+    #[test]
+    fn the_chain_ends_in_a_limiter() {
+        let c = speaker_chain_config();
+        assert!(c.contains("chadmed.au/bankstown"));
+        assert!(c.contains("fastLookaheadLimiter"));
+        assert!(c.contains(r#"output = "comp:Out" input = "limit:In""#), "the limiter is last");
+        assert!(!c.contains(r#"input = "bass:In""#), "and nothing is fed back into the exciter");
+        assert!(c.contains(&format!("{LIMIT_DB:.1}")));
+        // It says what it needs, because none of these stages is builtin.
+        assert!(c.contains("lv2ls") && c.contains("swh-plugins"));
+    }
+
+    #[test]
+    fn the_props_move_every_stage_but_the_limit_stays_put() {
+        let quiet = warmth_props_text(&warmth(0.0));
+        assert!(quiet.contains("\"bass:bypass\" 1.000"), "zero really bypasses: {quiet}");
+        let loud = warmth_props_text(&warmth(1.0));
+        assert!(loud.contains("\"bass:bypass\" 0.000"));
+        assert!(loud.contains("\"comp:Ratio\" 3.500"));
+        for x in [0.0, 0.5, 1.0] {
+            let t = warmth_props_text(&warmth(x));
+            assert!(t.contains(&format!("\"limit:Limit (dB)\" {LIMIT_DB:.3}")), "the limiter never moves, at {x}");
+        }
+        // Make-up is expressed in dB for the LADSPA port, not as the linear
+        // factor the model carries.
+        assert!(warmth_props_text(&warmth(1.0)).contains("\"comp:Makeup gain (dB)\" 1.9"));
+    }
+}
