@@ -94,6 +94,10 @@ pub mod groundfx;
 pub mod render;
 pub mod scene;
 pub mod ui;
+/// The shop's decisions as data: offers, refusals, the clan theme, layout.
+pub mod shopview;
+/// The shop drawn: the Hoard, bark and vine over shopview.
+pub mod shopui;
 pub mod launch;
 pub mod app;
 pub mod headless;
