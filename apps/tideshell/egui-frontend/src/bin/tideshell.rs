@@ -361,6 +361,12 @@ fn main() {
     // "no ambient light sensor" on a phone whose ALS works fine behind
     // iio-sensor-proxy (the sensor hub exposes it over D-Bus, and an IIO
     // sensor in buffered mode has no `_input`/`_raw` attribute to find).
+    // `tideshell speaker-config`: the filter-chain config on stdout, so the
+    // installer can place it without the shell having to be running.
+    if args.get(1).map(String::as_str) == Some("speaker-config") {
+        print!("{}", tideshell_core::audio::speaker_chain_config());
+        std::process::exit(0);
+    }
     if args.get(1).map(String::as_str) == Some("sensors") {
         let sys = std::path::Path::new("/sys");
         let bus = zbus::blocking::Connection::system().ok();
@@ -703,6 +709,11 @@ fn main() {
                     name: std::env::var("TIDESHELL_CAMERA").ok().filter(|v| !v.trim().is_empty()).or_else(|| sb.rear_camera.clone()),
                     capture: camera::CameraChoice::from_vars(None, std::env::var("TIDESHELL_CAMERA_CAPTURE").ok().as_deref()).capture,
                     fps: Some(2),
+                    // Frozen, so a dark room looks dark. Auto exposure
+                    // exists to make every scene look the same, which is
+                    // exactly wrong for a tint that is supposed to mean
+                    // something about the room.
+                    exposure: Some(camera::Exposure::default()),
                 };
                 sb.camera = Some(camera::ChildSource::start(&camera::gst_command(&choice, camera::FRAME_W, camera::FRAME_H), camera::FRAME_W, camera::FRAME_H));
             }
@@ -740,6 +751,14 @@ fn main() {
             // frame: 60 bytes instead of a texture upload, and the GPU does
             // the interpolation.
             sb.view.set_glass(grid.clone(), 4, 5);
+            // With the exposure fixed and known, the mean level is a light
+            // reading: the only one this phone has, since the ambient light
+            // sensor sits behind the low-power island and cannot be read.
+            let mean = grid.iter().map(|c| (c[0] as u32 + c[1] as u32 + c[2] as u32) / 3).sum::<u32>() as f32 / grid.len().max(1) as f32;
+            let ev = camera::scene_ev(mean, &camera::Exposure::default());
+            if now_ms.saturating_sub(sb.last_color_note) >= 5000 {
+                sb.shell.note(format!("scene: mean {mean:.0}, {ev:+.1} EV"));
+            }
             sb.last_glass = Some(grid);
             sb.cam_duty.frame(changed);
             // What this place looks like: its dominant colours, every 5 s.
