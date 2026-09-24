@@ -89,6 +89,21 @@ bscale = ["dep:d2x-core", "dep:anyhow"]
 [profile.dev]
 debug = "line-tables-only"
 
+# The hot numeric code, optimised even in dev builds. The rest stays at
+# opt-level 0 so the app itself still builds fast.
+#
+# - d2x-core: bscale's stage A. Unoptimised, analysing one 6-minute title
+#   took ~145 s (one core, video playing alongside).
+# - whisper-rs-sys: the `cmake` crate maps opt-level 0 to
+#   CMAKE_BUILD_TYPE=Debug, so every dev build transcribed with an
+#   unoptimised whisper.cpp -- several times slower, silently.
+[profile.dev.package.d2x-core]
+opt-level = 3
+[profile.dev.package.rustfft]
+opt-level = 3
+[profile.dev.package.whisper-rs-sys]
+opt-level = 3
+
 [dev-dependencies]
 # The URL test serves a real MP4 from the demuxer's own fixture writer.
 vidkit-mp4 = { path = "../../shared/vidkit/crates/vidkit-mp4", features = ["fixtures"] }
