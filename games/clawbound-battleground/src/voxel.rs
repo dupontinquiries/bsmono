@@ -344,3 +344,65 @@ pub fn merge_xform(meshes: &[VoxelMesh], xf: &[(Vec3, u8)]) -> VoxelMesh {
     }
     out
 }
+
+/// A coarse copy of a mesh for distance: voxels merged into cells of
+/// `2 * vsize` (world units, grid-aligned), one voxel per occupied cell at
+/// the cell's centre, colour and AO averaged, the rest copied from the
+/// first member. Drawn with voxel size `2 * vsize`. Roughly a quarter to an
+/// eighth of the instances; at the distance it is used, the same pixels.
+pub fn downsample(mesh: &VoxelMesh, vsize: f32) -> VoxelMesh {
+    use std::collections::HashMap;
+    let cell = (2.0 * vsize).max(1e-3);
+    let mut acc: HashMap<(i32, i32, i32), (VoxInst, [f32; 5], u32)> = HashMap::new();
+    for i in &mesh.inst {
+        let k = ((i.off_ao[0] / cell).floor() as i32, (i.off_ao[1] / cell).floor() as i32, (i.off_ao[2] / cell).floor() as i32);
+        let e = acc.entry(k).or_insert((*i, [0.0; 5], 0));
+        e.1[0] += i.color[0];
+        e.1[1] += i.color[1];
+        e.1[2] += i.color[2];
+        e.1[3] += i.color[3];
+        e.1[4] += i.off_ao[3];
+        e.2 += 1;
+    }
+    let mut keys: Vec<_> = acc.keys().copied().collect();
+    keys.sort_unstable();
+    let inst = keys
+        .into_iter()
+        .map(|k| {
+            let (first, sum, n) = acc[&k];
+            let n = n as f32;
+            VoxInst {
+                off_ao: [(k.0 as f32 + 0.5) * cell, (k.1 as f32 + 0.5) * cell, (k.2 as f32 + 0.5) * cell, sum[4] / n],
+                color: [sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n],
+                misc: first.misc,
+            }
+        })
+        .collect();
+    VoxelMesh { inst }
+}
+
+#[cfg(test)]
+mod downsample_tests {
+    use super::*;
+
+    #[test]
+    fn a_coarse_copy_is_smaller_covers_the_same_space_and_keeps_colour() {
+        let mut g = Grid::new(20, 20, 20);
+        g.ellipsoid(10.0, 10.0, 10.0, 8.0, 8.0, 8.0, [0.4, 0.5, 0.6, 1.0]);
+        let fine = g.mesh(0.6, true);
+        let coarse = downsample(&fine, 0.6);
+        // meshes are HULLS: a surface merges ~3x (area), not 8x (volume)
+        assert!(coarse.inst.len() * 2 < fine.inst.len(), "{} of {}", coarse.inst.len(), fine.inst.len());
+        // every fine voxel lies inside some coarse voxel (cells of 1.2)
+        for f in &fine.inst {
+            assert!(coarse.inst.iter().any(|c| (0..3).all(|a| (c.off_ao[a] - f.off_ao[a]).abs() <= 0.6 + 1e-4)), "uncovered {:?}", f.off_ao);
+        }
+        // colour is averaged, so the overall colour survives (the mesher
+        // varies voxels slightly, so a uniform input is not uniform output)
+        let mean = |m: &VoxelMesh, k: usize| m.inst.iter().map(|i| i.color[k]).sum::<f32>() / m.inst.len() as f32;
+        for k in 0..3 {
+            assert!((mean(&fine, k) - mean(&coarse, k)).abs() < 0.03, "channel {k}: {} vs {}", mean(&fine, k), mean(&coarse, k));
+        }
+        assert!(downsample(&VoxelMesh::default(), 0.6).inst.is_empty());
+    }
+}
