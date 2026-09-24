@@ -423,6 +423,59 @@ pub fn apply_voicing(tone: f32) -> Outcome {
     }
 }
 
+/// Where the saved chain lives; the settings app writes it.
+pub fn speaker_state_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|c| c.join("tideshell").join("speaker"))
+}
+
+/// Apply the saved chain, so the shell comes up sounding the way it was
+/// left rather than at defaults until someone opens the settings app.
+///
+/// Resolved HERE with the shell's own slider positions, which is the reason
+/// the file stores choices rather than resolved numbers: a parameter that
+/// follows the volume must follow THIS session's volume, not the volume at
+/// the moment it was saved.
+pub fn apply_saved_speaker(warmth: f32, volume: f32) -> Outcome {
+    let Some(path) = speaker_state_path() else { return Outcome::Unwired("no config dir") };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Outcome::Unwired("no saved speaker chain");
+    };
+    let (values, bindings) = tideshell_core::chaingraph::decode_state(&text);
+    if values.is_empty() && bindings.is_empty() {
+        return Outcome::Unwired("saved speaker chain is empty");
+    }
+    apply_speaker_props(&tideshell_core::chaingraph::resolve(&bindings, &values, warmth, volume))
+}
+
+/// Send resolved control/value pairs to the speaker chain.
+///
+/// One Props message for the whole set: the chain is a graph, and half of a
+/// change is a different sound rather than a lesser one.
+pub fn apply_speaker_props(pairs: &[(String, f32)]) -> Outcome {
+    if pairs.is_empty() {
+        return Outcome::Unwired("no speaker props to apply");
+    }
+    let listing = match Command::new("pw-cli").args(["ls", "Node"]).stdin(Stdio::null()).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => return Outcome::Failed(format!("pw-cli ls: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => return Outcome::Failed(format!("pw-cli: {e}")),
+    };
+    let Some(id) = parse_node_id(&listing, tideshell_core::audio::SPEAKER_SINK) else {
+        return Outcome::Unwired("speaker chain not running");
+    };
+    let body: Vec<String> = pairs.iter().map(|(k, v)| format!("\"{k}\" {v:.4}")).collect();
+    let props = format!("{{ params = [ {} ] }}", body.join(" "));
+    match Command::new("pw-cli").args(["set-param", &id.to_string(), "Props", &props]).stdin(Stdio::null()).output() {
+        Ok(o) if o.status.success() => Outcome::Done(format!("speaker: {} control(s) set", pairs.len())),
+        Ok(o) => Outcome::Failed(format!("pw-cli set-param: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => Outcome::Failed(format!("pw-cli: {e}")),
+    }
+}
+
 /// Put the chain's config in place at startup, so the sink exists without
 /// anyone running a script or touching a slider first.
 ///

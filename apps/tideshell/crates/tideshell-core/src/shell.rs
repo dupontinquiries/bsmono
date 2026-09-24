@@ -483,13 +483,24 @@ impl Shell {
             }
             GestureEvent::HoldMove { x, y } => {
                 let g = Geom::new(self.screen);
-                self.palette.hold_move(&g, x, y);
+                let from = self.recognizer.start();
+                self.palette.hold_move_banded(&g, from, x, y);
                 vec![]
             }
             GestureEvent::HoldRelease { x, y } => {
                 let g = Geom::new(self.screen);
-                let pick = self.palette.hold_release(&g, x, y);
+                let from = self.recognizer.start();
+                let (pick, leave) = self.palette.hold_release_banded(&g, from, x, y);
                 self.palette.end_hold();
+                // Lifting above the sheet is "no, none of these": the
+                // palette closes rather than staying open for taps, because
+                // a sheet left behind after a dismissal is a sheet the user
+                // has to dismiss twice.
+                if leave {
+                    self.palette.close();
+                    self.log("hold release -> dismissed");
+                    return vec![];
+                }
                 self.log(format!("hold release -> {pick:?}"));
                 match pick {
                     Some(a) => self.palette_action(a),
@@ -565,6 +576,16 @@ impl Shell {
         items.push(PaletteItem::new("set:autobright", ab, "setting", PaletteAction::ToggleAutoBrightness));
         let fc = if self.prefs.fat_cursor { "Cursor: normal" } else { "Cursor: fat" };
         items.push(PaletteItem::new("set:cursor", fc, "setting", PaletteAction::ToggleFatCursor));
+        // Cold mode cycles rather than toggling, because it has three states
+        // and the middle one matters: "automatic" is not "off", it is the
+        // battery temperature deciding, and someone who has forced it off in
+        // a warm room still wants it back on its own in a cold one.
+        let (cold_label, cold_next) = match self.prefs.cold.as_str() {
+            "on" => ("Cold mode: always on \u{2192} off", "off"),
+            "off" => ("Cold mode: off \u{2192} automatic", "auto"),
+            _ => ("Cold mode: automatic \u{2192} always on", "on"),
+        };
+        items.push(PaletteItem::new("set:cold", cold_label, if self.cold.on { "active" } else { "setting" }, PaletteAction::Cold(cold_next)));
         match self.prefs.layout {
             Layout::PullDown => items.push(PaletteItem::new("set:layout", "Layout: right-hand bar", "setting", PaletteAction::LayoutRightBar)),
             Layout::RightBar => items.push(PaletteItem::new("set:layout", "Layout: pull-down", "setting", PaletteAction::LayoutPullDown)),
@@ -585,6 +606,20 @@ impl Shell {
     }
 
     /// Open the palette from a tap (a bar widget, a tile).
+    /// Walk the palette's selection with the volume keys (volkeys.rs).
+    pub fn palette_step(&mut self, down: bool) {
+        self.palette.step(down);
+        self.log(format!("palette step -> {:?}", self.palette.selected));
+    }
+
+    /// Activate whatever the keys have walked to.
+    pub fn palette_activate_selected(&mut self) -> Vec<Action> {
+        match self.palette.activate_selected() {
+            Some(a) => self.palette_action(a),
+            None => vec![],
+        }
+    }
+
     pub fn open_palette(&mut self) {
         self.drawer.close();
         self.switcher.hide();
@@ -621,6 +656,10 @@ impl Shell {
             PaletteAction::ToggleAutoBrightness => self.tap_quick(QuickKind::AutoBrightness),
             PaletteAction::ToggleFatCursor => {
                 prefs.fat_cursor = !prefs.fat_cursor;
+                self.set_prefs(prefs)
+            }
+            PaletteAction::Cold(next) => {
+                prefs.cold = next.to_string();
                 self.set_prefs(prefs)
             }
             PaletteAction::LayoutPullDown => {
@@ -1191,6 +1230,46 @@ mod tests {
     }
 
     #[test]
+    fn sliding_off_the_top_of_the_sheet_dismisses_it() {
+        // "None of these": the sheet fades with the travel and lifting there
+        // closes it, rather than leaving a sheet behind that has to be
+        // dismissed a second time.
+        let mut sh = shell_with_three();
+        sh.on_edge_touch(TouchEvent::Down { slot: 0, x: 204.0, y: 895.0, t: 0 });
+        sh.tick(500);
+        assert!(sh.palette.open);
+        let g = Geom::new(S);
+        // Onto a mode first, so there IS something selected to discard.
+        let (x, y, w, h) = g.mode_rect(1);
+        sh.on_edge_touch(TouchEvent::Move { slot: 0, x: x + w / 2.0, y: y + h / 2.0, t: 600 });
+        assert_eq!(sh.palette.hover, Some(crate::palette::Hit::Mode(1)));
+        assert_eq!(sh.palette.hold_fade, 1.0);
+        // Then off the top: the selection is dropped and the sheet fades.
+        sh.on_edge_touch(TouchEvent::Move { slot: 0, x: 204.0, y: g.sheet_top - 40.0, t: 700 });
+        assert_eq!(sh.palette.hover, None, "nothing is selected while leaving");
+        assert!(sh.palette.hold_fade < 1.0 && sh.palette.hold_fade > 0.0, "fade {}", sh.palette.hold_fade);
+        // Lifting there does nothing and closes it.
+        let out = sh.on_edge_touch(TouchEvent::Up { slot: 0, t: 800 });
+        assert!(out.is_empty(), "{out:?}");
+        assert!(!sh.palette.open, "dismissed, not left open");
+        assert_eq!(sh.modes, Modes::default(), "and no mode was toggled on the way out");
+    }
+
+    #[test]
+    fn a_thumb_that_barely_moves_selects_nothing() {
+        // The dead zone: a hold that wobbles must not pick whatever it is
+        // over when the sheet rises under it.
+        let mut sh = shell_with_three();
+        sh.on_edge_touch(TouchEvent::Down { slot: 0, x: 204.0, y: 895.0, t: 0 });
+        sh.tick(500);
+        sh.on_edge_touch(TouchEvent::Move { slot: 0, x: 210.0, y: 890.0, t: 600 });
+        assert_eq!(sh.palette.hover, None);
+        let out = sh.on_edge_touch(TouchEvent::Up { slot: 0, t: 700 });
+        assert!(out.is_empty(), "{out:?}");
+        assert!(sh.palette.open, "still open for taps, which is the old behaviour");
+    }
+
+    #[test]
     fn hold_released_in_place_leaves_the_palette_open_for_taps() {
         let mut sh = shell_with_three();
         sh.on_edge_touch(TouchEvent::Down { slot: 0, x: 204.0, y: 895.0, t: 0 });
@@ -1585,5 +1664,65 @@ mod tests {
         sh.open_switcher();
         assert_eq!(sh.launch("org.gnome.Console"), vec![Action::LaunchApp("org.gnome.Console".into())]);
         assert!(!sh.switcher.open);
+    }
+}
+
+#[cfg(test)]
+mod cold_palette_tests {
+    use super::*;
+
+    const S: (f32, f32) = (1080.0, 2400.0);
+
+    fn sh() -> Shell {
+        let mut s = Shell::new(ShellPrefs::default(), S);
+        s.rebuild_palette();
+        s
+    }
+
+    fn cold_row(s: &Shell) -> String {
+        s.palette.rows().find(|r| r.key == "set:cold").map(|r| r.label.clone()).expect("a cold row")
+    }
+
+    #[test]
+    fn cold_mode_cycles_through_three_states_not_two() {
+        // Automatic is not off: it is the battery temperature deciding, and
+        // someone who forced it off in a warm room still wants it back on
+        // its own in a cold one. A toggle would lose that state.
+        let mut s = sh();
+        assert!(cold_row(&s).contains("automatic"), "{}", cold_row(&s));
+        s.palette_action(crate::palette::PaletteAction::Cold("on"));
+        assert_eq!(s.prefs.cold, "on");
+        s.rebuild_palette();
+        assert!(cold_row(&s).contains("always on"), "{}", cold_row(&s));
+        s.palette_action(crate::palette::PaletteAction::Cold("off"));
+        s.rebuild_palette();
+        assert!(cold_row(&s).contains("off"), "{}", cold_row(&s));
+        s.palette_action(crate::palette::PaletteAction::Cold("auto"));
+        assert_eq!(s.prefs.cold, "auto");
+    }
+
+    #[test]
+    fn forcing_it_on_widens_the_targets_immediately() {
+        // The setting is only worth having if it takes effect without a
+        // cold battery to prove it.
+        let mut s = sh();
+        let warm = s.cold_tuning().target_scale;
+        s.palette_action(crate::palette::PaletteAction::Cold("on"));
+        assert!(s.cold.on, "forced on");
+        assert!(s.cold_tuning().target_scale > warm);
+        s.palette_action(crate::palette::PaletteAction::Cold("off"));
+        assert!(!s.cold.on);
+    }
+
+    #[test]
+    fn the_row_says_when_it_is_actually_active() {
+        // "automatic" tells you the policy; the hint tells you what is
+        // happening now, which is the thing you want to know in the cold.
+        let mut s = sh();
+        let hint = |s: &Shell| s.palette.rows().find(|r| r.key == "set:cold").unwrap().hint;
+        assert_eq!(hint(&s), "setting");
+        s.palette_action(crate::palette::PaletteAction::Cold("on"));
+        s.rebuild_palette();
+        assert_eq!(hint(&s), "active");
     }
 }

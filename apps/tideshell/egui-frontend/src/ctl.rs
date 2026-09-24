@@ -14,7 +14,7 @@
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     PowerKey,
     VolumeUp,
@@ -22,10 +22,22 @@ pub enum Command {
     Lock,
     Palette,
     Switcher,
+    /// Re-read the prefs file. Sent by the settings app after it writes, so
+    /// a change applies now rather than at the next launch — which matters
+    /// most for the settings someone reaches for BECAUSE something is wrong
+    /// right now: cold mode with gloves on, a text size they cannot read.
+    ReloadPrefs,
+    /// Resolved speaker-chain controls, from the settings app. Carries a
+    /// payload, unlike the others, because the sender is deciding values
+    /// rather than asking for an action.
+    SpeakerProps(Vec<(String, f32)>),
 }
 
 impl Command {
     pub fn parse(s: &str) -> Option<Command> {
+        if let Some(pairs) = tideshell_core::chaingraph::decode_props(s) {
+            return Some(Command::SpeakerProps(pairs));
+        }
         match s.trim() {
             "power-key" => Some(Command::PowerKey),
             "volume-up" => Some(Command::VolumeUp),
@@ -33,15 +45,26 @@ impl Command {
             "lock" => Some(Command::Lock),
             "palette" => Some(Command::Palette),
             "switcher" => Some(Command::Switcher),
+            "reload-prefs" => Some(Command::ReloadPrefs),
             _ => None,
         }
     }
 
-    pub const NAMES: [&'static str; 6] = ["power-key", "volume-up", "volume-down", "lock", "palette", "switcher"];
+    pub const NAMES: [&'static str; 7] = ["power-key", "volume-up", "volume-down", "lock", "palette", "switcher", "reload-prefs"];
 }
 
 /// The keys cosmic-comp should hand to tideshell, as (keysym name, command).
-pub const COMPOSITOR_KEYS: [(&str, &str); 3] = [("XF86PowerOff", "power-key"), ("XF86AudioRaiseVolume", "volume-up"), ("XF86AudioLowerVolume", "volume-down")];
+///
+/// The power key only. A compositor shortcut fires on PRESS and reports no
+/// release, so anything routed this way can never tell a tap from a hold —
+/// and the volume keys are the shell's hold surface (volkeys.rs), the one
+/// control that works with gloves on and the screen off. They are read from
+/// evdev instead, where releases exist.
+///
+/// The power key has no such need: a short press is the whole gesture, and
+/// the long press belongs to logind, which handles it below us and will
+/// power the phone off even if this shell has hung.
+pub const COMPOSITOR_KEYS: [(&str, &str); 1] = [("XF86PowerOff", "power-key")];
 
 /// Where cosmic reads user shortcuts that override its defaults.
 pub fn cosmic_custom_shortcuts(config_home: &Path) -> PathBuf {
@@ -222,10 +245,19 @@ impl Server {
         Ok(Server { sock, path: path.to_path_buf() })
     }
 
+    /// The socket, so the main loop can sleep on it alongside Wayland
+    /// rather than discovering a command up to a timeout later.
+    pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.sock)
+    }
+
     /// Every command waiting; unknown text is returned as Err for the trace.
     pub fn poll(&self) -> Vec<Result<Command, String>> {
         let mut out = Vec::new();
-        let mut buf = [0u8; 256];
+            // Big enough for a whole chain's props: about twenty short lines.
+        // A datagram is all-or-nothing, so a buffer that is too small would
+        // silently truncate rather than fail.
+        let mut buf = [0u8; 8192];
         while let Ok(n) = self.sock.recv(&mut buf) {
             let text = String::from_utf8_lossy(&buf[..n]).into_owned();
             out.push(Command::parse(&text).ok_or(text));
@@ -262,7 +294,12 @@ mod tests {
         assert!(m.contains("(modifiers: [Super], key: \"t\"): Spawn(\"cosmic-term\"),"), "{m}");
         assert!(!m.contains("System(PowerOff)"), "the old power binding is replaced");
         assert!(m.contains("(modifiers: [], key: \"XF86PowerOff\"): Spawn(\"/home/user/.local/bin/tideshell ctl power-key\"),"));
-        assert!(m.contains("XF86AudioLowerVolume\"): Spawn(\"/home/user/.local/bin/tideshell ctl volume-down\")"));
+        // The volume keys are deliberately NOT bound here: a compositor
+        // shortcut fires on press and never reports the release, so a hold
+        // could not be told from a tap, and the volume keys are the shell's
+        // hold surface. They are read from evdev instead.
+        assert!(!m.contains("XF86AudioLowerVolume"), "volume must stay on evdev: {m}");
+        assert!(!m.contains("XF86AudioRaiseVolume"));
         assert!(m.starts_with("{\n") && m.trim_end().ends_with('}'));
         let twice = merge_custom_shortcuts(&m, "/home/user/.local/bin/tideshell");
         assert_eq!(twice, m, "idempotent");
@@ -285,7 +322,9 @@ mod tests {
 }"#;
         let m2 = merge_custom_shortcuts(pretty, "tideshell");
         let entries = map_entries(&m2);
-        assert_eq!(entries.len(), 4, "{m2}");
+        // One user entry kept, plus ours. Ours is a single binding now:
+        // only the power key goes through the compositor.
+        assert_eq!(entries.len(), 2, "{m2}");
         assert!(entries[0].starts_with('(') && entries[0].contains("Super") && entries[0].contains("Shift") && entries[0].ends_with(r#"Spawn("cosmic-term, --x")"#), "the user's multi-line entry kept whole: {}", entries[0]);
         assert!(!m2.contains("System(PowerOff)") && !m2.contains("(,") && !m2.contains(",,"), "{m2}");
         // A binding of the same key WITH modifiers is a different binding: kept.
@@ -294,7 +333,7 @@ mod tests {
         let tight = merge_custom_shortcuts(r#"{(modifiers:[],key:"XF86PowerOff"):System(PowerOff)}"#, "t");
         assert!(!tight.contains("System(PowerOff)"), "spacing does not hide the default: {tight}");
         let fresh = merge_custom_shortcuts("", "tideshell");
-        assert_eq!(fresh.matches("Spawn(").count(), 3);
+        assert_eq!(fresh.matches("Spawn(").count(), 1, "the power key, and only the power key");
         let base = std::env::temp_dir().join(format!("tideshell-cc-{}", std::process::id()));
         let f = cosmic_custom_shortcuts(&base);
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();

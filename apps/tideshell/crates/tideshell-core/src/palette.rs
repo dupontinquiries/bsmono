@@ -9,6 +9,32 @@
 //! then the search field, then list rows. Lifting off any row leaves the
 //! palette open for taps.
 //!
+//! ## Stillness, aim, and leaving ([`Palette::hold_band`])
+//!
+//! Three things a held thumb can be doing, and they are told apart by where
+//! it is rather than by how long it waits:
+//!
+//! | where the thumb is | what it means |
+//! |---|---|
+//! | barely moved from the press | nothing |
+//! | anywhere on the sheet | whatever it is over: a mode, search, a row |
+//! | above the sheet's top edge | leaving, fading with how far past it goes |
+//!
+//! **Stillness does nothing deliberately.** People pause mid-menu to decide
+//! or to shift their grip, and a gesture that fired when the thumb stopped
+//! would fire on every hesitation.
+//!
+//! **Dismissal is off the top, not "far".** The first version of this used
+//! fractions of the sheet's height — a dead zone, then modes, then search
+//! past them, then dismissal further still. A test caught that the layout
+//! disagrees: the mode row is at the TOP of the sheet, so reaching it is
+//! nearly the whole travel, and a fraction that called that "past the modes"
+//! made the modes unreachable. The sheet's own geometry is the authority, so
+//! the bands are derived from it: everything inside the sheet is aimed at,
+//! and only travel BEYOND the sheet means leaving. Search keeps its place as
+//! a target rather than becoming a gesture, because here it already has
+//! one.
+//!
 //! Filtering: case-insensitive subsequence match, scored (prefix > word
 //! start > consecutive > scattered), ties broken by recency. Empty query:
 //! recents first, then modes, windows, apps, settings, actions.
@@ -28,6 +54,9 @@ pub enum PaletteAction {
     Mode(HoldOption),
     ToggleAutoBrightness,
     ToggleFatCursor,
+    /// Cold/glove mode, as a three-way: automatic (the battery temperature
+    /// decides), forced on, forced off.
+    Cold(&'static str),
     LayoutPullDown,
     LayoutRightBar,
     ClockDigital,
@@ -119,6 +148,28 @@ impl Geom {
     }
 }
 
+/// How far the thumb must move from the press before anything is meant by
+/// it, in logical pixels. Small: this is a dead zone against jitter, not a
+/// threshold to cross deliberately.
+pub const BAND_DEAD_PX: f32 = 24.0;
+/// Travel past the sheet's top edge at which it has fully faded.
+pub const BAND_GONE_PX: f32 = 220.0;
+
+/// What the thumb's travel means during a hold.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Band {
+    /// Not far enough to mean anything, or over nothing in particular.
+    Idle,
+    /// On the mode row.
+    Mode(usize),
+    /// On the search field.
+    Search,
+    /// On a list row.
+    Row(usize),
+    /// Above the sheet: leaving. 0.0 at the top edge, 1.0 when gone.
+    Dismissing(f32),
+}
+
 /// Score a query against a label; None = no match.
 pub fn score(query: &str, label: &str) -> Option<i32> {
     let q: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).filter(|c| !c.is_whitespace()).collect();
@@ -148,6 +199,14 @@ pub struct Palette {
     pub query: String,
     /// Row under the finger during the hold (Mode or Row).
     pub hover: Option<Hit>,
+    /// How opaque the sheet should be drawn: 1 normally, falling as a held
+    /// thumb travels off the top. Not a spring — it follows the finger, so
+    /// pulling back restores it.
+    pub hold_fade: f32,
+    /// The row a keyboard or the volume keys have walked to. Separate from
+    /// `hover`, which belongs to a finger: the two can disagree, and the one
+    /// that acts is whichever the user last used.
+    pub selected: Option<usize>,
     pub reveal: DragTransition,
     /// The three mode buttons, in row order.
     pub modes: [HoldOption; 3],
@@ -161,6 +220,8 @@ pub struct Palette {
 impl Default for Palette {
     fn default() -> Self {
         Palette {
+            hold_fade: 1.0,
+            selected: None,
             open: false,
             query: String::new(),
             hover: None,
@@ -287,11 +348,110 @@ impl Palette {
         };
     }
 
+    /// The same, told in bands, so a thumb leaving the sheet fades it and a
+    /// thumb that has barely moved selects nothing.
+    ///
+    /// Returns the band, and leaves [`Palette::hold_fade`] at how visible
+    /// the sheet should be.
+    pub fn hold_move_banded(&mut self, geom: &Geom, from: (f32, f32), x: f32, y: f32) -> Band {
+        let band = self.hold_band(geom, from, x, y);
+        self.hold_fade = match band {
+            Band::Dismissing(t) => 1.0 - t,
+            _ => 1.0,
+        };
+        self.hover = match band {
+            Band::Mode(i) => Some(Hit::Mode(i)),
+            Band::Row(i) => Some(Hit::Row(i)),
+            // Search, idle and leaving all select nothing: lifting there
+            // must not activate whatever the finger happens to be over.
+            _ => None,
+        };
+        band
+    }
+
+    /// A lift, decided by band. `None` means nothing was chosen; the second
+    /// value is whether the palette should close rather than stay open for
+    /// taps, which is what leaving the sheet asks for.
+    pub fn hold_release_banded(&mut self, geom: &Geom, from: (f32, f32), x: f32, y: f32) -> (Option<PaletteAction>, bool) {
+        let band = self.hold_move_banded(geom, from, x, y);
+        self.hold_fade = 1.0;
+        match band {
+            Band::Dismissing(_) => (None, true),
+            _ => {
+                let picked = self.hover.take().and_then(|h| self.activate_hit(h));
+                (picked, false)
+            }
+        }
+    }
+
+    /// Where a held finger is, in travel bands. `from` is where the press
+    /// started; `y` is now.
+    ///
+    /// Travel is measured VERTICALLY, because the sheet is a vertical stack
+    /// and a thumb sliding up it is the gesture. Horizontal wander chooses
+    /// between the three modes and otherwise means nothing, which is what
+    /// makes the sweep forgiving.
+    pub fn hold_band(&self, geom: &Geom, from: (f32, f32), x: f32, y: f32) -> Band {
+        // Above the sheet entirely: leaving, and the fade follows how far.
+        if y < geom.sheet_top {
+            let t = ((geom.sheet_top - y) / BAND_GONE_PX).clamp(0.0, 1.0);
+            return Band::Dismissing(t);
+        }
+        if (from.0 - x).hypot(from.1 - y) < BAND_DEAD_PX {
+            return Band::Idle;
+        }
+        match geom.hit(x, y, self.row_count()) {
+            Hit::Mode(i) => Band::Mode(i),
+            Hit::Search => Band::Search,
+            Hit::Row(i) => Band::Row(i),
+            _ => Band::Idle,
+        }
+    }
+
+    /// How opaque the sheet should be drawn, from the same travel.
+    pub fn hold_alpha(&self, geom: &Geom, from: (f32, f32), x: f32, y: f32) -> f32 {
+        match self.hold_band(geom, from, x, y) {
+            Band::Dismissing(t) => 1.0 - t,
+            _ => 1.0,
+        }
+    }
+
     /// The held finger lifted: activate what it is on, else stay open.
     pub fn hold_release(&mut self, geom: &Geom, x: f32, y: f32) -> Option<PaletteAction> {
         self.hold_move(geom, x, y);
         let h = self.hover.take()?;
         self.activate_hit(h)
+    }
+
+    /// Move the keyed selection. `down` walks toward the end of the list.
+    ///
+    /// Wraps at both ends, because a key-only user has no other way back and
+    /// pressing past the end to return is how every list of this shape
+    /// behaves.
+    pub fn step(&mut self, down: bool) {
+        let n = self.row_count();
+        if n == 0 {
+            self.selected = None;
+            return;
+        }
+        self.selected = Some(match self.selected {
+            None => {
+                if down {
+                    0
+                } else {
+                    n - 1
+                }
+            }
+            Some(i) if down => (i + 1) % n,
+            Some(0) => n - 1,
+            Some(i) => i - 1,
+        });
+    }
+
+    /// Activate the keyed selection, if any.
+    pub fn activate_selected(&mut self) -> Option<PaletteAction> {
+        let i = self.selected?;
+        self.activate_hit(Hit::Row(i))
     }
 
     /// A tap on the sheet.
@@ -485,5 +645,144 @@ mod tests {
             p.tick(11.1);
         }
         assert!(!p.is_visible());
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+
+    const SCREEN: (f32, f32) = (1080.0, 2400.0);
+
+    fn open_palette() -> (Palette, Geom) {
+        let mut p = Palette::default();
+        p.set_items(vec![
+            PaletteItem::new("a", "Alpha", "", PaletteAction::ToggleFatCursor),
+            PaletteItem::new("b", "Beta", "", PaletteAction::ToggleFatCursor),
+        ]);
+        p.open_by_hold();
+        (p, Geom::new(SCREEN))
+    }
+
+    /// Press near the bottom edge, where a hold starts.
+    fn press() -> (f32, f32) {
+        (540.0, SCREEN.1 - 20.0)
+    }
+
+    fn at_travel(g: &Geom, frac: f32) -> f32 {
+        let span = g.screen.1 - g.sheet_top;
+        press().1 - span * frac
+    }
+
+    #[test]
+    fn a_thumb_that_has_barely_moved_means_nothing() {
+        // People pause to decide and shift their grip mid-gesture; acting on
+        // stillness would fire on every hesitation.
+        let (p, g) = open_palette();
+        assert_eq!(p.hold_band(&g, press(), press().0, press().1), Band::Idle);
+        assert_eq!(p.hold_band(&g, press(), press().0 + 5.0, press().1 - 10.0), Band::Idle, "jitter is not a choice");
+    }
+
+    #[test]
+    fn everything_inside_the_sheet_is_aimed_at() {
+        // The layout is a vertical stack and the sheet is the menu; the hit
+        // test is the authority, not a distance from the press.
+        let (p, g) = open_palette();
+        for i in 0..3 {
+            let (rx, ry, rw, rh) = g.mode_rect(i);
+            assert_eq!(p.hold_band(&g, press(), rx + rw / 2.0, ry + rh / 2.0), Band::Mode(i));
+        }
+        assert_eq!(p.hold_band(&g, press(), 540.0, g.search_y() + SEARCH_H / 2.0), Band::Search);
+        assert_eq!(p.hold_band(&g, press(), 540.0, g.row_y(0) + ROW_H / 2.0), Band::Row(0));
+        // A gap between the mode buttons is nothing, not the nearest button.
+        let (rx, ry, rw, rh) = g.mode_rect(0);
+        assert_eq!(p.hold_band(&g, press(), rx + rw + 2.0, ry + rh / 2.0), Band::Idle);
+    }
+
+    #[test]
+    fn leaving_the_sheet_fades_it_with_the_travel() {
+        let (p, g) = open_palette();
+        let at = |above: f32| p.hold_band(&g, press(), 540.0, g.sheet_top - above);
+        assert_eq!(at(0.5), Band::Dismissing(0.5 / BAND_GONE_PX));
+        assert!(matches!(at(BAND_GONE_PX / 2.0), Band::Dismissing(t) if (t - 0.5).abs() < 1e-5));
+        assert_eq!(at(BAND_GONE_PX * 3.0), Band::Dismissing(1.0), "clamped, not past 1");
+        assert_eq!(p.hold_alpha(&g, press(), 540.0, g.sheet_top - BAND_GONE_PX), 0.0);
+        assert_eq!(p.hold_alpha(&g, press(), 540.0, g.row_y(0)), 1.0, "still on the sheet: fully there");
+    }
+
+    #[test]
+    fn the_dismissal_band_does_not_overlap_the_sheet() {
+        // One pixel inside the sheet is a target; one pixel outside is
+        // leaving. A gesture that dismissed while still over a row would be
+        // unusable.
+        let (p, g) = open_palette();
+        assert!(!matches!(p.hold_band(&g, press(), 540.0, g.sheet_top + 1.0), Band::Dismissing(_)));
+        assert!(matches!(p.hold_band(&g, press(), 540.0, g.sheet_top - 1.0), Band::Dismissing(_)));
+    }
+
+    #[test]
+    fn sliding_back_toward_the_edge_chooses_nothing() {
+        let (p, g) = open_palette();
+        let below = press().1 + 200.0;
+        assert_eq!(p.hold_band(&g, press(), 540.0, below), Band::Idle);
+    }
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+
+    fn p3() -> Palette {
+        let mut p = Palette::default();
+        p.set_items(vec![
+            PaletteItem::new("a", "Alpha", "", PaletteAction::ToggleFatCursor),
+            PaletteItem::new("b", "Beta", "", PaletteAction::ToggleAutoBrightness),
+            PaletteItem::new("c", "Gamma", "", PaletteAction::ToggleFatCursor),
+        ]);
+        p.open_by_hold();
+        p
+    }
+
+    #[test]
+    fn the_keys_walk_the_list_and_wrap_at_both_ends() {
+        // A key-only user — gloves, rain, a screen that will not answer —
+        // has no other way back, so pressing past the end returns.
+        let mut p = p3();
+        assert_eq!(p.selected, None, "nothing is selected until a key is pressed");
+        p.step(true);
+        assert_eq!(p.selected, Some(0));
+        p.step(true);
+        p.step(true);
+        assert_eq!(p.selected, Some(2));
+        p.step(true);
+        assert_eq!(p.selected, Some(0), "wraps forward");
+        p.step(false);
+        assert_eq!(p.selected, Some(2), "and back");
+        // Starting upward from nothing lands on the end, not the start.
+        let mut q = p3();
+        q.step(false);
+        assert_eq!(q.selected, Some(2));
+    }
+
+    #[test]
+    fn stepping_an_empty_list_selects_nothing_rather_than_panicking() {
+        let mut p = Palette::default();
+        p.open_by_hold();
+        p.set_query("no such thing at all");
+        p.step(true);
+        assert_eq!(p.selected, None);
+        assert_eq!(p.activate_selected(), None);
+    }
+
+    #[test]
+    fn the_keyed_selection_is_not_the_finger_hover() {
+        // Both can exist; they answer different questions, and conflating
+        // them would make a thumb resting on the sheet move what the keys
+        // are pointing at.
+        let mut p = p3();
+        p.step(true);
+        p.hover = Some(Hit::Row(2));
+        assert_eq!(p.selected, Some(0));
+        assert!(p.activate_selected().is_some());
     }
 }

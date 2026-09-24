@@ -302,3 +302,225 @@ mod tests {
         assert_eq!(Stage::MixTop.node(), "mixTop");
     }
 }
+
+// ── the wire format ─────────────────────────────────────────────────────────
+//
+// The settings app decides what the chain should do; the shell owns the
+// PipeWire connection. So the app sends the resolved control/value pairs over
+// tideshell's control socket and the shell applies them.
+//
+// Defined here, in the crate both sides already depend on, so there is one
+// definition rather than an encoder and a decoder that drift. Text, because
+// the socket carries text and a human debugging this should be able to read
+// a datagram.
+//
+// Control names contain spaces and parentheses ("Threshold level (dB)"), so
+// the split is on the LAST '=' of a line rather than on whitespace.
+
+/// The first line of a props message.
+pub const PROPS_TAG: &str = "speaker-props";
+
+/// Encode resolved pairs for the socket.
+pub fn encode_props(pairs: &[(String, f32)]) -> String {
+    let mut s = String::from(PROPS_TAG);
+    for (k, v) in pairs {
+        // A newline or an '=' in a control name would make the message
+        // ambiguous. None exist, and a silent corruption later would be
+        // hard to trace, so they are dropped here where it is obvious.
+        if k.contains('\n') {
+            continue;
+        }
+        s.push('\n');
+        s.push_str(k);
+        s.push('=');
+        s.push_str(&format!("{v}"));
+    }
+    s
+}
+
+/// Decode one. `None` when it is not a props message at all.
+pub fn decode_props(text: &str) -> Option<Vec<(String, f32)>> {
+    let mut lines = text.lines();
+    if lines.next()?.trim() != PROPS_TAG {
+        return None;
+    }
+    let mut out = Vec::new();
+    for l in lines {
+        let l = l.trim_end();
+        if l.is_empty() {
+            continue;
+        }
+        // Last '=', not first: "Threshold level (dB)=-12" has one, but a
+        // future name containing '=' would break a first-match split.
+        let Some(at) = l.rfind('=') else { continue };
+        let (k, v) = l.split_at(at);
+        let Ok(v) = v[1..].parse::<f32>() else { continue };
+        if !v.is_finite() {
+            continue;
+        }
+        out.push((k.to_string(), v));
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    #[test]
+    fn a_message_survives_the_round_trip() {
+        let pairs = resolve(&[], &[], 0.5, 0.5);
+        let text = encode_props(&pairs);
+        let back = decode_props(&text).unwrap();
+        assert_eq!(back.len(), pairs.len());
+        for ((a, x), (b, y)) in back.iter().zip(&pairs) {
+            assert_eq!(a, b);
+            assert!((x - y).abs() < 1e-6, "{a}: {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn control_names_with_spaces_and_brackets_survive() {
+        // "Threshold level (dB)" is a real port name; splitting on
+        // whitespace or on the first '=' would mangle it.
+        let pairs = vec![("compT:Threshold level (dB)".to_string(), -12.5), ("mixTop:Gain 1".to_string(), 0.5)];
+        let back = decode_props(&encode_props(&pairs)).unwrap();
+        assert_eq!(back, pairs);
+    }
+
+    #[test]
+    fn anything_that_is_not_a_props_message_is_refused() {
+        assert_eq!(decode_props("power-key"), None);
+        assert_eq!(decode_props(""), None);
+        assert_eq!(decode_props("speaker-propsX\na=1"), None);
+        // A malformed line is dropped rather than poisoning the message: a
+        // chain half-applied is better than one not applied at all, and the
+        // lines are independent.
+        let got = decode_props("speaker-props\ngood=1.5\nnovalue\nbad=zzz\nnan=NaN\n").unwrap();
+        assert_eq!(got, vec![("good".to_string(), 1.5)]);
+    }
+}
+
+// ── saved state ─────────────────────────────────────────────────────────────
+//
+// The props message (above) is what the chain should do RIGHT NOW. This is
+// what the operator chose, which is a different thing and has to outlive
+// both processes: the shell should come up sounding the way it was left.
+//
+// Values and bindings, not resolved props, because a binding is the setting.
+// Saving the resolved numbers would freeze a parameter at whatever the
+// sliders happened to be when it was saved, and quietly turn "follows the
+// volume" into "1.8".
+
+/// One line per value, one per binding, in the same flat text as everything
+/// else here.
+pub fn encode_state(values: &[(Stage, &'static str, f32)], bindings: &[Binding]) -> String {
+    let mut s = String::from("# tideshell speaker chain\n");
+    for (stage, control, v) in values {
+        s.push_str(&format!("value {}:{} = {v}\n", stage.node(), control));
+    }
+    for b in bindings {
+        let src = match b.source {
+            Source::Warmth => "warmth",
+            Source::Volume => "volume",
+        };
+        s.push_str(&format!("bind {}:{} = {src} {} {}\n", b.stage.node(), b.control, b.at_zero, b.at_one));
+    }
+    s
+}
+
+fn stage_by_node(node: &str) -> Option<Stage> {
+    Stage::ALL.into_iter().find(|s| s.node() == node)
+}
+
+/// Read it back. Unknown stages and controls are dropped rather than
+/// refused: a file written by a newer version should still give this one
+/// everything it understands, and a chain missing one parameter is better
+/// than a chain that would not load.
+pub fn decode_state(text: &str) -> (Vec<(Stage, &'static str, f32)>, Vec<Binding>) {
+    let known = params();
+    let lookup = |node: &str, control: &str| -> Option<Param> { stage_by_node(node).and_then(|st| known.iter().find(|p| p.stage == st && p.control == control).copied()) };
+    let (mut values, mut bindings) = (Vec::new(), Vec::new());
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let Some((head, rest)) = line.split_once('=') else { continue };
+        let Some((kind, target)) = head.trim().split_once(' ') else { continue };
+        let Some((node, control)) = target.trim().split_once(':') else { continue };
+        let Some(p) = lookup(node, control) else { continue };
+        let rest = rest.trim();
+        match kind {
+            "value" => {
+                if let Ok(v) = rest.parse::<f32>() {
+                    if v.is_finite() {
+                        values.push((p.stage, p.control, v.clamp(p.min, p.max)));
+                    }
+                }
+            }
+            "bind" => {
+                let mut it = rest.split_whitespace();
+                let source = match it.next() {
+                    Some("warmth") => Source::Warmth,
+                    Some("volume") => Source::Volume,
+                    _ => continue,
+                };
+                let (Some(Ok(lo)), Some(Ok(hi))) = (it.next().map(str::parse::<f32>), it.next().map(str::parse::<f32>)) else { continue };
+                // Through bind(), so a saved file cannot reintroduce a
+                // binding the model refuses — the limiter's ceiling being
+                // the one that matters.
+                if let Ok(b) = bind(p.stage, p.control, source, lo, hi) {
+                    bindings.push(b);
+                }
+            }
+            _ => {}
+        }
+    }
+    (values, bindings)
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn what_is_saved_is_the_choice_not_the_result() {
+        // Saving resolved props would freeze a parameter at whatever the
+        // sliders happened to be, turning "follows the volume" into "1.8".
+        let values = vec![(Stage::HpTop, "Freq", 250.0f32)];
+        let bindings = vec![bind(Stage::CompT, "Ratio", Source::Volume, 4.0, 1.0).unwrap()];
+        let text = encode_state(&values, &bindings);
+        assert!(text.contains("bind compT:Ratio = volume 4 1"), "{text}");
+        let (v, b) = decode_state(&text);
+        assert_eq!(v, values);
+        assert_eq!(b, bindings);
+        // And it still follows, rather than having become a number.
+        let out = resolve(&b, &v, 0.0, 0.0);
+        let hot = resolve(&b, &v, 0.0, 1.0);
+        assert_ne!(out.iter().find(|(k, _)| k == "compT:Ratio"), hot.iter().find(|(k, _)| k == "compT:Ratio"));
+    }
+
+    #[test]
+    fn a_saved_file_cannot_reintroduce_what_the_model_refuses() {
+        // Hand-edited, or written by a version that allowed it.
+        let (_, b) = decode_state("bind limT:Limit (dB) = volume -1 0\n");
+        assert!(b.is_empty(), "the ceiling stays locked whatever the file says");
+        // And a value for it is clamped to its own range rather than taken.
+        let (v, _) = decode_state("value limT:Limit (dB) = 0\n");
+        assert!(v.iter().all(|(_, _, x)| *x <= -0.5), "{v:?}");
+    }
+
+    #[test]
+    fn unknown_and_malformed_lines_are_dropped_not_fatal() {
+        // A file from a newer version should still give this one everything
+        // it understands.
+        let text = "# comment\nvalue future:thing = 1\nvalue hpTop:Freq = 300\nnonsense\nbind hpTop:Freq = sideways 1 2\nvalue hpTop:Freq = NaN\n";
+        let (v, b) = decode_state(text);
+        assert_eq!(v, vec![(Stage::HpTop, "Freq", 300.0)]);
+        assert!(b.is_empty());
+        assert_eq!(decode_state("").0.len(), 0);
+    }
+
+    #[test]
+    fn values_are_clamped_on_the_way_in() {
+        let (v, _) = decode_state("value compT:Ratio = 900\n");
+        assert_eq!(v, vec![(Stage::CompT, "Ratio", 8.0)]);
+    }
+}

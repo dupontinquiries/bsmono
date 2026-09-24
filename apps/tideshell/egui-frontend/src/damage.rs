@@ -64,10 +64,20 @@ pub fn frame_hash(prims: &[egui::ClippedPrimitive]) -> u64 {
     h
 }
 
+/// What was last put on a surface: the frame's hash and the size it was
+/// painted at.
+///
+/// The size has to be part of it. A configure can change the buffer size or
+/// the scale while the CONTENT hashes identically — a bar whose width
+/// changed but whose shapes are laid out the same, a scale change on the
+/// same logical layout — and skipping that repaint leaves the surface at the
+/// old size with the compositor expecting the new one.
+pub type Painted = (u64, (i32, i32));
+
 /// Should this surface be painted? `textures` is whether the frame carries a
 /// texture upload, which must not be skipped even if the geometry matches —
 /// dropping it would leave the painter referencing a texture it never got.
-pub fn changed(last: Option<u64>, now: u64, textures: bool) -> bool {
+pub fn changed(last: Option<Painted>, now: Painted, textures: bool) -> bool {
     textures || last != Some(now)
 }
 
@@ -89,7 +99,18 @@ mod tests {
     #[test]
     fn an_identical_frame_hashes_identically() {
         assert_eq!(frame_hash(&quad(0.0, Color32::RED)), frame_hash(&quad(0.0, Color32::RED)));
-        assert!(!changed(Some(frame_hash(&quad(0.0, Color32::RED))), frame_hash(&quad(0.0, Color32::RED)), false));
+        let h = frame_hash(&quad(0.0, Color32::RED));
+        assert!(!changed(Some((h, (720, 1600))), (h, (720, 1600)), false));
+    }
+
+    #[test]
+    fn the_same_content_at_a_new_size_is_still_a_repaint() {
+        // A configure can change the buffer size or the scale while the
+        // shapes hash the same; skipping then leaves the surface at the old
+        // size with the compositor expecting the new one.
+        let h = frame_hash(&quad(0.0, Color32::RED));
+        assert!(changed(Some((h, (720, 1600))), (h, (1080, 2400)), false));
+        assert!(changed(Some((h, (720, 1600))), (h, (720, 1601)), false), "one pixel is a different surface");
     }
 
     #[test]
@@ -107,7 +128,7 @@ mod tests {
     fn a_texture_upload_is_never_skipped() {
         // Skipping a frame that carries a texture delta would leave the
         // painter referencing a texture it never received.
-        let h = frame_hash(&quad(0.0, Color32::RED));
+        let h = (frame_hash(&quad(0.0, Color32::RED)), (720i32, 1600i32));
         assert!(changed(Some(h), h, true), "identical geometry, but the upload must go");
         assert!(changed(None, h, false), "and the first frame always paints");
     }

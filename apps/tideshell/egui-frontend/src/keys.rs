@@ -10,6 +10,7 @@
 
 use std::io::Read;
 use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -72,7 +73,12 @@ pub enum KeyPress {
 }
 
 pub struct Keys {
-    pub rx: Receiver<KeyPress>,
+    pub rx: Receiver<KeyEvent>,
+    /// Written to by the reader thread whenever it sends an event, so the
+    /// main loop can sleep on it. Without this a key press waits for the
+    /// loop's timeout — a quarter of a second at idle — because an mpsc
+    /// channel is not something poll can wait on.
+    wake: Option<UnixDatagram>,
     pub status: String,
     _inhibit: Option<OwnedFd>,
 }
@@ -84,6 +90,19 @@ impl Keys {
     /// socket (ctl.rs), so the devices are not opened at all (no double
     /// volume steps), and the logind inhibitor is taken regardless of device
     /// access: logind reads the key itself and would still power off.
+    /// The descriptor to sleep on, if there is a reader thread.
+    pub fn wake_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.wake.as_ref().map(std::os::fd::AsFd::as_fd)
+    }
+
+    /// Drain the wake channel. The bytes carry nothing; the events are on
+    /// the mpsc channel. This only stops poll firing again immediately.
+    pub fn drain_wake(&self) {
+        let Some(w) = &self.wake else { return };
+        let mut scratch = [0u8; 64];
+        while w.recv(&mut scratch).is_ok() {}
+    }
+
     pub fn spawn(devices: Vec<KeyDevice>, bus: Option<&zbus::blocking::Connection>, via_compositor: bool) -> Keys {
         if via_compositor {
             let (_tx, rx) = mpsc::channel();
@@ -92,17 +111,30 @@ impl Keys {
                 "keys: from cosmic-comp via tideshell ctl; {}",
                 if inhibit.is_some() { "logind power-key inhibitor held" } else { "NO logind inhibitor (D-Bus refused): install 50-tideshell-powerkey.conf or logind powers off" }
             );
-            return Keys { rx, status, _inhibit: inhibit };
+            return Keys { rx, wake: None, status, _inhibit: inhibit };
         }
         let (tx, rx) = mpsc::channel();
         let mut opened = Vec::new();
         let mut failed = Vec::new();
+        // A socket pair the readers poke after every event, so the main loop
+        // can WAIT for a key instead of noticing one on its next scheduled
+        // pass. Non-blocking on both ends: a full buffer means the loop has
+        // not drained yet, which already means it is about to run.
+        let (wake_main, wake_reader) = match UnixDatagram::pair() {
+            Ok((a, b)) => {
+                let _ = a.set_nonblocking(true);
+                let _ = b.set_nonblocking(true);
+                (Some(a), Some(b))
+            }
+            Err(_) => (None, None),
+        };
         for d in &devices {
             match std::fs::File::open(&d.node) {
                 Ok(f) => {
                     opened.push(format!("{} ({})", d.name, d.node.display()));
-                    let tx: Sender<KeyPress> = tx.clone();
-                    std::thread::Builder::new().name("tideshell-keys".into()).spawn(move || reader(f, tx)).expect("spawn key reader");
+                    let tx: Sender<KeyEvent> = tx.clone();
+                    let wake = wake_reader.as_ref().and_then(|w| w.try_clone().ok());
+                    std::thread::Builder::new().name("tideshell-keys".into()).spawn(move || reader(f, tx, wake)).expect("spawn key reader");
                 }
                 Err(e) => failed.push(format!("{}: {e}", d.node.display())),
             }
@@ -123,11 +155,21 @@ impl Keys {
                 (None, false, _) => "",
             }
         );
-        Keys { rx, status, _inhibit: inhibit }
+        Keys { rx, wake: wake_main, status, _inhibit: inhibit }
     }
 }
 
-fn reader(mut f: std::fs::File, tx: Sender<KeyPress>) {
+/// A key going down or coming up. Releases matter because a HOLD is only
+/// knowable from one: a shortcut that fires on press can never distinguish a
+/// tap from a hold, which is why the volume keys cannot be routed through
+/// the compositor if they are to do more than step the volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyEvent {
+    pub key: KeyPress,
+    pub down: bool,
+}
+
+fn reader(mut f: std::fs::File, tx: Sender<KeyEvent>, wake: Option<UnixDatagram>) {
     let mut buf = [0u8; 24 * 16];
     loop {
         let n = match f.read(&mut buf) {
@@ -135,15 +177,24 @@ fn reader(mut f: std::fs::File, tx: Sender<KeyPress>) {
             Ok(n) => n,
         };
         for chunk in buf[..n].chunks_exact(24) {
-            if let Some((EV_KEY, code, 1)) = decode_event(chunk) {
-                let k = match code {
+            // 2 is autorepeat, which is the kernel's own timer and not the
+            // one this shell wants: holds are timed against the shell's
+            // clock so they behave the same however the key repeat is set.
+            if let Some((EV_KEY, code, v @ (0 | 1))) = decode_event(chunk) {
+                let key = match code {
                     KEY_POWER => KeyPress::Power,
                     KEY_VOLUMEUP => KeyPress::VolumeUp,
                     KEY_VOLUMEDOWN => KeyPress::VolumeDown,
                     _ => continue,
                 };
-                if tx.send(k).is_err() {
+                if tx.send(KeyEvent { key, down: v == 1 }).is_err() {
                     return;
+                }
+                // The event is already on the channel; this only ends the
+                // main loop's sleep. A failed send means the pipe is full,
+                // which means it is waking anyway.
+                if let Some(w) = &wake {
+                    let _ = w.send(b"k");
                 }
             }
         }
@@ -212,5 +263,42 @@ mod tests {
         assert_eq!((d[1].name.as_str(), d[1].power, d[1].volume), ("gpio-keys", false, true));
         assert!(d[0].node.ends_with("event0"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    #[test]
+    fn the_wake_channel_ends_a_sleep_and_drains() {
+        // The events travel on the mpsc channel; this pair exists only so
+        // the main loop can WAIT for one rather than noticing it on its next
+        // scheduled pass, which at idle is a quarter of a second away.
+        let (main, reader) = UnixDatagram::pair().unwrap();
+        main.set_nonblocking(true).unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let k = Keys { rx: mpsc::channel().1, wake: Some(main), status: String::new(), _inhibit: None };
+        assert!(k.wake_fd().is_some());
+        // Nothing yet.
+        k.drain_wake();
+        // A reader poke is readable, and draining clears it so poll does not
+        // fire again on the same byte.
+        reader.send(b"k").unwrap();
+        reader.send(b"k").unwrap();
+        k.drain_wake();
+        let mut scratch = [0u8; 8];
+        assert!(k.wake.as_ref().unwrap().recv(&mut scratch).is_err(), "drained");
+        // Draining when there is nothing does not block or panic.
+        k.drain_wake();
+    }
+
+    #[test]
+    fn without_a_reader_there_is_nothing_to_sleep_on() {
+        // The compositor route opens no devices, so there is no wake
+        // descriptor and the loop simply does not add one.
+        let k = Keys { rx: mpsc::channel().1, wake: None, status: String::new(), _inhibit: None };
+        assert!(k.wake_fd().is_none());
+        k.drain_wake();
     }
 }

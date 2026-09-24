@@ -2263,12 +2263,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tideshell-core"
+version = "0.1.0"
+
+[[package]]
 name = "tideshell-settings"
 version = "0.1.0"
 dependencies = [
  "cosmic-levers",
  "eframe",
  "egui",
+ "tideshell-core",
  "uikit-egui",
 ]
 

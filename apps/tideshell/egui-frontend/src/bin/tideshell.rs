@@ -71,6 +71,7 @@ struct Shellbox {
     /// The speakers follow the screen: the same transform that rotates the
     /// display decides which driver is on the listener's left.
     pose: speaker_pose::Mix,
+    volkeys: tideshell_core::volkeys::VolKeys,
     /// The matrix last pushed to PipeWire, so nothing is sent per frame.
     last_pose: Option<speaker_pose::Matrix>,
     /// The rear camera's libcamera id, found once at startup.
@@ -555,6 +556,7 @@ fn main() {
         camera: None,
         cam_duty: tideshell_egui::camera::DutyCycle::new(tideshell_egui::camera::Duty::default()),
         pose: speaker_pose::Mix::new(speaker_pose::Transform::Normal, speaker_pose::Tuning::default()),
+        volkeys: tideshell_core::volkeys::VolKeys::default(),
         last_pose: None,
         rear_camera: tideshell_egui::camera::pick_rear(&cam_list),
         last_glass: None,
@@ -575,6 +577,10 @@ fn main() {
     // place rather than leaving it to a script the user has to find.
     {
         let out = tideshell_egui::effects::ensure_speaker_chain();
+        sb.shell.note(format!("{out:?}"));
+        // And whatever the operator last chose. Resolved against this
+        // session's sliders, not the ones at the moment it was saved.
+        let out = tideshell_egui::effects::apply_saved_speaker(sb.shell.drawer.warmth, sb.shell.drawer.volume);
         sb.shell.note(format!("{out:?}"));
     }
     sb.view.camera_mirror = cam_mount.mirror;
@@ -649,6 +655,9 @@ fn main() {
     // Side surfaces (bar, peeks) each get their own egui context (own
     // textures, own input), created on first use.
     let mut side_ctx: HashMap<Role, egui::Context> = HashMap::new();
+    /// When each side surface next wants to run, from egui's own
+    /// `repaint_delay`.
+    let mut side_due: HashMap<Role, u64> = HashMap::new();
     let mut side_events: HashMap<Role, Vec<egui::Event>> = HashMap::new();
     let mut side_pos: HashMap<(Role, i32), Pos2> = HashMap::new();
 
@@ -658,7 +667,7 @@ fn main() {
     let mut contact_pos: HashMap<i32, Pos2> = HashMap::new();
     let mut last_region: Option<Option<Vec<Rect>>> = None;
     let mut renderer_noted = false;
-    let mut last_frame_hash: HashMap<Role, u64> = HashMap::new();
+    let mut last_frame_hash: HashMap<Role, tideshell_egui::damage::Painted> = HashMap::new();
     let mut last_poll = 0u64;
     // comfortgov reads the mtime of this file as "last user input".
     let hint = std::env::var_os("XDG_RUNTIME_DIR").map(|r| std::path::PathBuf::from(r).join("comfortgov.input"));
@@ -707,7 +716,18 @@ fn main() {
         } else {
             250
         };
-        let input = io.dispatch(timeout).unwrap_or_else(|e| {
+        // Sleep on everything that can want the loop, not only on Wayland:
+        // the power key arrives on the control socket and the volume keys
+        // come from the evdev reader, and at the idle timeout either would
+        // otherwise wait a quarter of a second before anything happened.
+        let mut wake_fds: Vec<std::os::fd::BorrowedFd> = Vec::new();
+        if let Some(c) = ctl_server.as_ref() {
+            wake_fds.push(c.as_fd());
+        }
+        if let Some(k) = sb.keys.as_ref().and_then(|k| k.wake_fd()) {
+            wake_fds.push(k);
+        }
+        let input = io.dispatch_with(timeout, &wake_fds).unwrap_or_else(|e| {
             eprintln!("tideshell: wayland: {e}");
             std::process::exit(1)
         });
@@ -963,33 +983,90 @@ fn main() {
                 *next = now_ms + (1000 / rate.max(1)) as u64;
             }
         }
-        // Hardware keys: power = sleep/wake, volume = a 5 % fade. From
-        // cosmic-comp through the control socket, or (fallback) evdev.
-        let mut presses: Vec<tideshell_egui::keys::KeyPress> = sb.keys.as_ref().map(|k| k.rx.try_iter().collect()).unwrap_or_default();
+        // Hardware keys. The power key arrives from cosmic-comp through the
+        // control socket; the volume keys come from evdev, because a
+        // compositor shortcut fires on press and reports no release, and a
+        // hold cannot be told from a tap without one.
+        use tideshell_core::volkeys::{Intent, VolKey};
+        use tideshell_egui::keys::{KeyEvent, KeyPress};
+        let mut events: Vec<KeyEvent> = sb.keys.as_ref().map(|k| k.rx.try_iter().collect()).unwrap_or_default();
+        if let Some(k) = sb.keys.as_ref() {
+            k.drain_wake();
+        }
         if let Some(srv) = &ctl_server {
             use tideshell_egui::ctl::Command;
-            use tideshell_egui::keys::KeyPress;
             for c in srv.poll() {
                 match c {
-                    Ok(Command::PowerKey) => presses.push(KeyPress::Power),
-                    Ok(Command::VolumeUp) => presses.push(KeyPress::VolumeUp),
-                    Ok(Command::VolumeDown) => presses.push(KeyPress::VolumeDown),
+                    // A socket command is a complete press: down and up at
+                    // once, so a bound hold can never fire from one.
+                    Ok(Command::PowerKey) => events.push(KeyEvent { key: KeyPress::Power, down: true }),
+                    Ok(Command::VolumeUp) => {
+                        events.push(KeyEvent { key: KeyPress::VolumeUp, down: true });
+                        events.push(KeyEvent { key: KeyPress::VolumeUp, down: false });
+                    }
+                    Ok(Command::VolumeDown) => {
+                        events.push(KeyEvent { key: KeyPress::VolumeDown, down: true });
+                        events.push(KeyEvent { key: KeyPress::VolumeDown, down: false });
+                    }
                     Ok(Command::Lock) => sb.shell.lock_now(),
                     Ok(Command::Palette) => sb.shell.open_palette(),
                     Ok(Command::Switcher) => sb.shell.open_switcher(),
+                    // The settings app decided what the chain should do; we
+                    // are the process with the PipeWire connection.
+                    Ok(Command::ReloadPrefs) => {
+                        let (fresh, errs) = effects::load_prefs();
+                        for e in &errs {
+                            sb.shell.note(format!("prefs: {e}"));
+                        }
+                        // set_prefs is the shell's own path for a settings
+                        // change, so everything that follows from one —
+                        // cold tuning, layout, the ambient band — happens
+                        // exactly as it would from the shell's own sheet.
+                        let out = sb.shell.set_prefs(fresh);
+                        sb.execute(out);
+                        sb.shell.note("prefs reloaded".to_string());
+                    }
+                    Ok(Command::SpeakerProps(pairs)) => {
+                        let out = tideshell_egui::effects::apply_speaker_props(&pairs);
+                        sb.shell.note(format!("{out:?}"));
+                    }
                     Err(t) => sb.shell.note(format!("ctl: unknown command {t:?}")),
                 }
             }
         }
-        for k in presses {
+        // Steering follows cold/glove mode: with the touchscreen unreliable,
+        // the keys move a selection instead of the volume.
+        sb.volkeys.steering = sb.shell.cold.on;
+        let mut intents: Vec<Intent> = Vec::new();
+        for e in events {
+            match (e.key, e.down) {
+                (KeyPress::Power, true) => actions.extend(sb.shell.power_key()),
+                (KeyPress::Power, false) => {}
+                (KeyPress::VolumeUp, d) => intents.extend(if d { sb.volkeys.press(VolKey::Up, now_ms) } else { sb.volkeys.release(VolKey::Up, now_ms) }),
+                (KeyPress::VolumeDown, d) => intents.extend(if d { sb.volkeys.press(VolKey::Down, now_ms) } else { sb.volkeys.release(VolKey::Down, now_ms) }),
+            }
+        }
+        intents.extend(sb.volkeys.tick(now_ms));
+        for i in intents {
             use tideshell_core::control_center::SliderKind;
-            use tideshell_egui::keys::KeyPress;
             let v = sb.shell.drawer.volume;
-            actions.extend(match k {
-                KeyPress::Power => sb.shell.power_key(),
-                KeyPress::VolumeUp => sb.shell.set_slider(SliderKind::Volume, (v + 0.05).min(1.0)),
-                KeyPress::VolumeDown => sb.shell.set_slider(SliderKind::Volume, (v - 0.05).max(0.0)),
-            });
+            match i {
+                Intent::Volume(VolKey::Up) => actions.extend(sb.shell.set_slider(SliderKind::Volume, (v + 0.05).min(1.0))),
+                Intent::Volume(VolKey::Down) => actions.extend(sb.shell.set_slider(SliderKind::Volume, (v - 0.05).max(0.0))),
+                // Steering: the palette is the shell's list of everything,
+                // so it is what the keys walk when a finger will not do.
+                Intent::Step(k) => {
+                    if !sb.shell.palette.open {
+                        sb.shell.open_palette();
+                    }
+                    sb.shell.palette_step(matches!(k, VolKey::Down));
+                }
+                Intent::Activate => actions.extend(sb.shell.palette_activate_selected()),
+                // A hold with no binding opens the palette rather than doing
+                // nothing: it is the one action that leads to every other.
+                Intent::Bound(_) => sb.shell.open_palette(),
+                Intent::Chord => sb.shell.lock_now(),
+            }
         }
         actions.extend(sb.shell.tick(now_ms));
         sb.execute(actions);
@@ -1011,7 +1088,10 @@ fn main() {
                 }
             }
         }
-        if io.config_status() != last_config_status {
+        // Compared by reference: the owning accessors allocated twice each
+        // per iteration, on a path that runs whether anything changed or
+        // not, and a status string changes perhaps once a session.
+        if io.config_status_ref() != last_config_status {
             last_config_status = io.config_status();
             sb.shell.note(last_config_status.clone());
         }
@@ -1025,7 +1105,7 @@ fn main() {
                 sb.backlight.set_display(on);
             }
         }
-        if io.power_status() != last_power_status {
+        if io.power_status_ref() != last_power_status {
             last_power_status = io.power_status();
             sb.shell.note(last_power_status.clone());
         }
@@ -1064,18 +1144,36 @@ fn main() {
             let Some(t) = io.side(role) else {
                 gl.unbind(role);
                 side_events.remove(&role);
+                side_due.remove(&role);
                 continue;
             };
+            let events = side_events.remove(&role).unwrap_or_default();
+            // A configure is not an egui event, so a resize arriving while
+            // egui wants no frame would be skipped and never repainted at
+            // the new size. Compare against what was last actually painted.
+            let resized = last_frame_hash.get(&role).is_some_and(|(_, was)| *was != t.size_px());
+            // Before prepare and bind, not after: binding is an
+            // eglMakeCurrent, and doing one per surface per iteration to
+            // then decide there was nothing to draw is the cost this check
+            // exists to avoid.
+            if events.is_empty() && !resized && side_due.get(&role).is_some_and(|due| now_ms < *due) {
+                continue;
+            }
             t.prepare(&mut io);
             let size_px = t.size_px();
             let (w, h) = t.screen_points();
             if gl.bind(role, &t.surface, size_px).is_err() {
                 continue;
             }
+            // egui says when it wants nothing more: `repaint_delay` from
+            // the previous run. Honouring it skips the run and the
+            // tessellation entirely — a step earlier than the frame-hash
+            // skip, which only saves the fill, and the tessellation is
+            // where the per-frame allocations are.
             let mut raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h))),
                 time: Some(t0.elapsed().as_secs_f64()),
-                events: side_events.remove(&role).unwrap_or_default(),
+                events,
                 focused: true,
                 ..Default::default()
             };
@@ -1097,11 +1195,17 @@ fn main() {
                     };
                 });
             });
+            // When the next frame is due, from egui's own scheduling. A
+            // delay it reports as very large means "never until something
+            // happens"; cap it so a surface cannot wedge itself if a
+            // wake-up is ever missed.
+            let delay_ms = out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay.as_millis()).unwrap_or(0);
+            side_due.insert(role, now_ms + delay_ms.min(1_000) as u64);
             let prims = ctx_side.tessellate(out.shapes, out.pixels_per_point);
             // Skip a surface whose frame is identical to the one already on
             // screen. Tessellation has happened either way; what is saved is
             // the fill and the commit, which is where the pixels are.
-            let h = tideshell_egui::damage::frame_hash(&prims);
+            let h = (tideshell_egui::damage::frame_hash(&prims), size_px);
             if !tideshell_egui::damage::changed(last_frame_hash.get(&role).copied(), h, !out.textures_delta.is_empty()) {
                 sb.execute(actions);
                 continue;
@@ -1186,7 +1290,7 @@ fn main() {
         // and never slept — the loop free-ran at over a thousand iterations
         // a second while nothing moved. Skipping the identical frame is what
         // lets it block.
-        let h = tideshell_egui::damage::frame_hash(&prims);
+        let h = (tideshell_egui::damage::frame_hash(&prims), size_px);
         if !tideshell_egui::damage::changed(last_frame_hash.get(&Role::Overlay).copied(), h, !out.textures_delta.is_empty()) {
             continue;
         }

@@ -16,6 +16,7 @@ app = ["dep:eframe"]
 
 [dependencies]
 cosmic-levers = { path = "../../../shared/cosmic-levers" }
+tideshell-core = { path = "../crates/tideshell-core" }
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }

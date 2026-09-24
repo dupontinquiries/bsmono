@@ -11,6 +11,9 @@
 //! default, built-in default) and the file's text, so what the app did is
 //! always checkable on disk.
 
+pub mod scale;
+pub mod speaker;
+
 use cosmic_levers::{Control, Lever, Reading, Source, Store, Value};
 use std::time::{Duration, Instant};
 
@@ -21,7 +24,24 @@ pub enum Action {
     ToggleDetails(usize),
 }
 
+/// Which screen is showing. Two, because they edit different things: the
+/// levers are COSMIC's settings files, and the speaker is tideshell's own
+/// live audio chain. Mixing them in one list would suggest they save to the
+/// same place and behave the same way, and they do neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    Cosmic,
+    Display,
+    Speaker,
+}
+
 pub struct App {
+    pub screen: Screen,
+    pub speaker: speaker::Speaker,
+    /// The shell's own prefs, read from the file the shell reads. Held here
+    /// rather than re-read per frame: the Display screen edits them and
+    /// writes them back, and re-reading under the finger would fight it.
+    pub shell_prefs: tideshell_core::prefs::ShellPrefs,
     pub store: Store,
     pub levers: Vec<Lever>,
     pub readings: Vec<Reading>,
@@ -40,7 +60,7 @@ impl App {
     pub fn new(store: Store) -> App {
         let levers = cosmic_levers::levers();
         let readings = levers.iter().map(|l| store.read(l)).collect();
-        App { store, levers, readings, details: None, status: String::new(), last_read: Instant::now() }
+        App { screen: Screen::Cosmic, speaker: speaker::load_state(), shell_prefs: scale::load(), store, levers, readings, details: None, status: String::new(), last_read: Instant::now() }
     }
 
     pub fn reread(&mut self) {
@@ -79,12 +99,42 @@ impl App {
         }
         root.ctx().request_repaint_after(REREAD);
         let mut actions = Vec::new();
+        let screen = self.screen;
+        let mut want_screen = screen;
         egui::CentralPanel::default().show_inside(root, |ui| {
             ui.heading("Settings");
+            // Two finger-high tabs rather than a menu: there are two screens
+            // and there will not be many more, and a menu costs a tap to
+            // discover what a tab shows at rest.
+            ui.horizontal(|ui| {
+                if big(ui, "COSMIC", screen == Screen::Cosmic) {
+                    want_screen = Screen::Cosmic;
+                }
+                if big(ui, "Display", screen == Screen::Display) {
+                    want_screen = Screen::Display;
+                }
+                if big(ui, "Speaker", screen == Screen::Speaker) {
+                    want_screen = Screen::Speaker;
+                }
+            });
             if !self.status.is_empty() {
                 ui.label(egui::RichText::new(&self.status).small());
             }
             ui.add_space(8.0);
+            if screen == Screen::Display {
+                let mut st = std::mem::take(&mut self.status);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    scale::ui(&mut self.shell_prefs, ui, &mut st);
+                });
+                self.status = st;
+                return;
+            }
+            if screen == Screen::Speaker {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    speaker::ui(&mut self.speaker, ui, TOUCH_H);
+                });
+                return;
+            }
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let mut section = "";
                 for i in 0..self.levers.len() {
@@ -99,6 +149,7 @@ impl App {
                 }
             });
         });
+        self.screen = want_screen;
         for a in actions.clone() {
             self.apply(a);
         }
@@ -221,5 +272,41 @@ mod tests {
         a.reread();
         assert_eq!(a.readings[i].value, Value::OptMillis(None));
         assert_eq!(a.readings[i].source, Source::User(p));
+    }
+}
+
+#[cfg(test)]
+mod screen_tests {
+    use super::*;
+
+    fn app() -> App {
+        // A store pointed at a scratch directory: the test must not read or
+        // write the machine's real COSMIC config.
+        let dir = std::env::temp_dir().join(format!("ts-settings-{}", std::process::id()));
+        App::new(Store { config_home: dir, data_dirs: vec![] })
+    }
+
+    #[test]
+    fn the_app_opens_on_the_cosmic_screen() {
+        // The settings people came for are COSMIC's; the speaker chain is
+        // the specialist screen and should not be what greets them.
+        let a = app();
+        assert_eq!(a.screen, Screen::Cosmic);
+        assert!(!a.levers.is_empty());
+    }
+
+    #[test]
+    fn the_two_screens_keep_their_own_state() {
+        // They edit different things in different places: COSMIC's files and
+        // tideshell's live chain. Switching must not disturb either.
+        let mut a = app();
+        a.details = Some(0);
+        a.speaker.apply(speaker::SpeakerAction::Set(tideshell_core::chaingraph::Stage::BassL, "amt", 0.6));
+        a.screen = Screen::Speaker;
+        assert_eq!(a.details, Some(0), "the lever row stays open underneath");
+        let amt = a.speaker.resolve(0.0, 0.0).into_iter().find(|(k, _)| k == "bassL:amt").unwrap().1;
+        assert_eq!(amt, 0.6);
+        a.screen = Screen::Cosmic;
+        assert_eq!(a.speaker.values.iter().find(|(_, c, _)| *c == "amt").unwrap().2, 0.6);
     }
 }

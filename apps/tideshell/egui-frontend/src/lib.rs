@@ -996,7 +996,12 @@ impl ShellView {
         use tideshell_core::palette::{Geom, Hit, MODE_ROW_H, PAD, ROW_H, SEARCH_H};
         let mut out = vec![];
         let g = Geom::new((size.x, size.y));
-        let reveal = shell.palette.reveal.progress;
+        // Two separate opacities, and they multiply. `reveal` is the sheet
+        // arriving, a spring the shell drives; `hold_fade` is a held thumb
+        // carrying it back off the top, which follows the finger exactly so
+        // that pulling back restores it. Conflating them would make a
+        // dismissal that changed its mind animate twice.
+        let reveal = shell.palette.reveal.progress * shell.palette.hold_fade.clamp(0.0, 1.0);
         let dy = (1.0 - reveal) * (size.y - g.sheet_top);
         let full = Rect::from_min_size(origin, size);
         let p = ui.painter_at(full);
