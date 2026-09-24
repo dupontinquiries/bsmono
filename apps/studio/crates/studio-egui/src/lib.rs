@@ -428,6 +428,34 @@ pub fn timeline(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, colors.bg_base);
 
+    // ── markers, in the ruler ──────────────────────────────────────────────
+    // They were in the project and reachable from the palette, and drawn
+    // NOWHERE: the assembly's review markers, the constraint check's and the
+    // vfx survey's were invisible on the timeline they were about (c20).
+    // A tick down the ruler and the name beside it, coloured by what made
+    // it; a name longer than the gap to the next marker is cut short.
+    {
+        let mut ms: Vec<&studio_core::Marker> = doc.project.markers.iter().collect();
+        ms.sort_by_key(|m| m.at);
+        for (i, m) in ms.iter().enumerate() {
+            let x = view.time_to_x(m.at, origin.x);
+            if x < origin.x + view.gutter || x > rect.max.x { continue; }
+            let col = match marker_kind(&m.name) {
+                MarkerKind::Review => colors.warning,
+                MarkerKind::Constraint => colors.danger,
+                MarkerKind::Vfx => colors.accent,
+                MarkerKind::Plain => colors.text_weak,
+            };
+            painter.line_segment([Pos2::new(x, origin.y), Pos2::new(x, origin.y + RULER_H)], Stroke::new(2.0_f32, col));
+            let room = ms.get(i + 1).map(|n| view.time_to_x(n.at, origin.x) - x - 6.0).unwrap_or(rect.max.x - x - 6.0);
+            let chars = ((room / 6.0).floor() as usize).clamp(0, 48);
+            if chars >= 4 {
+                let label: String = if m.name.chars().count() > chars { format!("{}…", m.name.chars().take(chars - 1).collect::<String>()) } else { m.name.clone() };
+                painter.text(Pos2::new(x + 3.0, origin.y + RULER_H - 2.0), Align2::LEFT_BOTTOM, label, FontId::proportional(10.0), col);
+            }
+        }
+    }
+
     // ── ruler ──────────────────────────────────────────────────────────────
     if let Some(map) = tempo {
         // Musical ruler: bars labelled, beats as texture, positions from
@@ -863,6 +891,17 @@ pub fn fade_triangles(r: Rect, in_px: f32, out_px: f32) -> Vec<([Pos2; 3], [Pos2
         v.push(([top, r.right_top(), r.right_bottom()], [top, r.right_bottom()]));
     }
     v
+}
+
+/// What made a marker, by its name's prefix -- the prefixes the tools write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerKind { Review, Constraint, Vfx, Plain }
+
+pub fn marker_kind(name: &str) -> MarkerKind {
+    if name.starts_with("review ") { MarkerKind::Review }
+    else if name.starts_with("constraint: ") { MarkerKind::Constraint }
+    else if name.starts_with("vfx: ") { MarkerKind::Vfx }
+    else { MarkerKind::Plain }
 }
 
 /// Height of the mode HUD's strip under the last track.
@@ -1520,6 +1559,15 @@ mod fade_and_hud_tests {
         // longer than the clip: clamped to it; under a pixel: nothing
         assert_eq!(fade_triangles(r, 900.0, 0.0)[0].1[1].x, 300.0);
         assert!(fade_triangles(r, 0.4, 0.0).is_empty());
+    }
+
+    #[test]
+    fn markers_are_coloured_by_the_tool_that_wrote_them() {
+        assert_eq!(marker_kind("review 1: missing: \"x\""), MarkerKind::Review);
+        assert_eq!(marker_kind("constraint: 2 violated by 1.0 s"), MarkerKind::Constraint);
+        assert_eq!(marker_kind("vfx: 1 A001_wide: shake"), MarkerKind::Vfx);
+        assert_eq!(marker_kind("the argument"), MarkerKind::Plain);
+        assert_eq!(marker_kind("reviewed by jo"), MarkerKind::Plain, "a word, not the prefix");
     }
 
     #[test]

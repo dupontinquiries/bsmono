@@ -92,6 +92,7 @@ pub mod seq_header;
 pub mod assembly;
 pub mod deliver;
 pub mod story_check;
+pub mod vfx_setup;
 
 /// Everything the running editor holds.
 pub struct Studio {
@@ -6341,6 +6342,20 @@ impl App {
                     self.studio.status = if self.words_raw.is_empty() {
                         "no transcripts loaded yet — the filter applies once they are".into()
                     } else { self.refilter_words() };
+                }
+                palette::ShellVerb::VfxSurvey => {
+                    let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                    let s = vfx_setup::survey(&self.studio.session.doc.project, &base);
+                    let n = s.problems();
+                    let shots = s.shots.len();
+                    let failed = s.failed.clone();
+                    let written = vfx_setup::write_list(&s, &self.project_path);
+                    if !s.ops.is_empty() { self.studio.edit_group(s.ops, "vfx survey"); }
+                    self.studio.status = format!("vfx: {shots} shot{} surveyed, {n} problem{}{}{}",
+                        if shots == 1 { "" } else { "s" }, if n == 1 { "" } else { "s" },
+                        match written { Ok(f) => format!(" -- list in {}, markers \"vfx:\"", f.file_name().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default()),
+                                        Err(e) => format!(" -- {e}") },
+                        if failed.is_empty() { String::new() } else { format!(" -- could not measure: {}", failed.join("; ")) });
                 }
                 palette::ShellVerb::CheckStory => {
                     let project = &self.studio.session.doc.project;

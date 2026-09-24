@@ -128,6 +128,8 @@ pub enum ShellVerb {
     DraftStory,
     /// Check the timeline against its documents and footage (`story_check`).
     CheckStory,
+    /// Survey the video on the timeline for touch-up (`vfx_setup`).
+    VfxSurvey,
     /// Give the selected clips the held look, at `pct`% strength.
     StylePaste(u32),
     /// What the selected clips' effects do after the clips end: `ring_ms` of
@@ -387,6 +389,9 @@ pub fn root() -> Vec<Choice> {
         c("story: draft an outline from the footage",
           Some("scenes from what is said; edit outline.txt, then assemble"),
           Then::Do(Act::Shell(ShellVerb::DraftStory))),
+        c("vfx: survey the video on the timeline",
+          Some("shake, flicker, short handles -> vfx.md and markers"),
+          Then::Do(Act::Shell(ShellVerb::VfxSurvey))),
         c("constraints: check the timeline against its documents",
           Some("outline, constraints.txt, .lrc, and what the takes rule out"),
           Then::Do(Act::Shell(ShellVerb::CheckStory))),

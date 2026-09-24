@@ -176,7 +176,10 @@ pub fn triage(st: &ShotStats, o: &Options) -> Vec<Finding> {
             technique: "deflicker (ffmpeg deflicker as a v0 -- PLANNED in Studio, not a Fix yet)".into(),
             why: format!("brightness reverses on {:.0}% of frames -- an LED practical at 24 fps", share * 100.0) });
     }
-    if st.room_before < o.handle || st.room_after < o.handle {
+    // Handles matter only to a shot that will be RENDERED: on a clean shot
+    // the warning is noise (the first run in the app flagged every shot of
+    // the fixture, each placed as a whole camera file).
+    if !out.is_empty() && (st.room_before < o.handle || st.room_after < o.handle) {
         out.push(Finding { problem: Problem::ShortHandles { before: st.room_before, after: st.room_after }, fix: None,
             technique: "render what exists; re-trim inside it".into(),
             why: format!("only {:.2} s before / {:.2} s after the trim -- under {:.1} s, a later extension would show unfixed frames",
@@ -243,8 +246,10 @@ mod tests {
         assert!(triage(&stats(vec![0.0; 48], step), &o).is_empty());
         let mut st = stats(vec![0.0; 24], vec![60.0; 24]);
         st.room_after = 0.1;
+        assert!(triage(&st, &o).is_empty(), "a clean shot needs no handles");
+        for x in &mut st.jitter[4..16] { *x = 0.8; }
         let f = triage(&st, &o);
-        assert!(matches!(f[0].problem, Problem::ShortHandles { .. }) && f[0].why.contains("0.10 s after"), "{f:?}");
+        assert!(f.iter().any(|f| matches!(f.problem, Problem::ShortHandles { .. }) && f.why.contains("0.10 s after")), "{f:?}");
     }
 
     /// The fixture's own ground truth: "the wide shakes at 7.5–8.5 s", and the
