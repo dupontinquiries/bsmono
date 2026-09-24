@@ -133,7 +133,7 @@ const CLEARINGS: [(f32, f32, f32); 9] = [
 const CENTRE_CLEARINGS: [(f32, f32, f32); 2] = [(-96.0, 0.0, 12.5), (96.0, 0.0, 12.5)];
 
 /// Narrow ledges joining clearings to lanes (blue half), radius 3.2.
-const LEDGES: [((f32, f32), (f32, f32)); 11] = [
+pub const LEDGES: [((f32, f32), (f32, f32)); 11] = [
     ((-52.0, -62.0), (-28.0, -84.0)),
     ((-28.0, -84.0), (0.0, -92.0)),
     ((52.0, -62.0), (28.0, -84.0)),
@@ -152,7 +152,7 @@ const LEDGES: [((f32, f32), (f32, f32)); 11] = [
 /// Each bends round the peak's lower flank (~33 u from the summit): a
 /// straight cut from the gorge to the boss ground passed 7 u from it, and
 /// the two mirrored cuts would have sliced the mountain into a fin.
-const SLOTS: [((f32, f32), (f32, f32)); 8] = [
+pub const SLOTS: [((f32, f32), (f32, f32)); 8] = [
     ((-2.0, -24.0), (-38.0, -40.0)),
     ((-38.0, -40.0), (-80.0, -34.0)),
     ((-80.0, -34.0), (-96.0, 0.0)),
