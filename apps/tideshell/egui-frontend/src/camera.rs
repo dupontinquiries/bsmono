@@ -29,7 +29,7 @@ pub struct Frame {
 /// capture size libcamera picks its default stream, which on the FP5 main
 /// camera is 4096x3072 (and 8192x6144 on the front), all of it then
 /// converted and scaled on the CPU for a small pane.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CameraChoice {
     /// A libcamera camera id, as `cam -l` prints it in parentheses.
     pub name: Option<String>,
@@ -38,6 +38,51 @@ pub struct CameraChoice {
     /// are then never debayered at all, which is the expensive part when
     /// libcamera has no hardware ISP to hand the work to.
     pub fps: Option<u32>,
+    /// Freeze the exposure. See [`Exposure`].
+    pub exposure: Option<Exposure>,
+}
+
+/// A fixed exposure, so what the pane shows is how bright the room actually
+/// is.
+///
+/// Auto-exposure is the enemy of this whole feature. Its job is to make
+/// every scene look the same, which is exactly wrong for a lock screen
+/// tinting itself from the room: with AE running, a dark room is brightened
+/// until the wash looks like daylight, the tint stops meaning anything, and
+/// the gain ramps produce slow drifts that read as the shell doing something
+/// on its own. Locking exposure and gain makes a dark room look dark.
+///
+/// It also turns the camera into a crude light meter. With exposure and gain
+/// fixed and known, the mean pixel level is comparable between readings and
+/// between sessions ([`scene_ev`]) — which matters here because this phone
+/// has no readable ambient light sensor at all.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Exposure {
+    /// Microseconds. Long enough to see a dim room, short enough that a
+    /// hand-held phone does not smear: this is a light meter, not a photo.
+    pub time_us: u32,
+    /// Analogue gain, 1.0 = none. Kept low; gain is noise, and noise
+    /// averaged over a 4x5 grid becomes a false brightness.
+    pub gain: f32,
+}
+
+impl Default for Exposure {
+    fn default() -> Exposure {
+        Exposure { time_us: 20_000, gain: 2.0 }
+    }
+}
+
+/// A scene's brightness in stops, comparable across different fixed
+/// exposures: doubling the exposure time or the gain is one stop, and a
+/// doubling of measured level is one stop the other way.
+///
+/// Returns roughly "how much light was there", so two readings taken with
+/// different settings can still be compared — and so a future auto-ranging
+/// step could widen the exposure in the dark without the number jumping.
+pub fn scene_ev(mean_level: f32, e: &Exposure) -> f32 {
+    let level = mean_level.clamp(1.0, 255.0) / 255.0;
+    let exposure_stops = (e.time_us.max(1) as f32 / 10_000.0).log2() + e.gain.max(0.01).log2();
+    level.log2() - exposure_stops
 }
 
 impl CameraChoice {
@@ -50,7 +95,7 @@ impl CameraChoice {
             let (w, h) = c.trim().split_once(['x', 'X'])?;
             Some((w.parse().ok()?, h.parse().ok()?))
         });
-        CameraChoice { name, capture, fps: None }
+        CameraChoice { name, capture, fps: None, exposure: None }
     }
 }
 
@@ -252,6 +297,17 @@ pub fn gst_command(choice: &CameraChoice, w: usize, h: usize) -> Vec<String> {
     if let Some(n) = &choice.name {
         v.push(format!("camera-name={n}"));
     }
+    if let Some(e) = &choice.exposure {
+        // libcamerasrc exposes libcamera's controls as element properties.
+        // These must be pushed before the first "!": everything after that
+        // belongs to the next element in the pipeline.
+        v.push("ae-enable=false".into());
+        v.push(format!("exposure-time={}", e.time_us));
+        v.push(format!("analogue-gain={:.3}", e.gain));
+        // Auto white balance is the same problem in colour: it neutralises
+        // the tint, which is the one thing the wash is for.
+        v.push("awb-enable=false".into());
+    }
     if let Some((cw, ch)) = choice.capture {
         v.push("!".into());
         v.push(match choice.fps {
@@ -422,7 +478,7 @@ mod tests {
         // The FP5's main rear camera, as `cam -l` printed it there.
         let id = "/base/soc@0/cci@ac4a000/i2c-bus@0/camera@1a";
         let c = CameraChoice::from_vars(Some(id), Some("1280x960"));
-        assert_eq!(c, CameraChoice { name: Some(id.into()), capture: Some((1280, 960)), fps: None });
+        assert_eq!(c, CameraChoice { name: Some(id.into()), capture: Some((1280, 960)), fps: None, exposure: None });
         let cmd = gst_command(&c, 240, 320);
         let at = |x: &str| cmd.iter().position(|a| a == x).unwrap_or_else(|| panic!("{x} missing: {cmd:?}"));
         assert_eq!(at("libcamerasrc") + 1, at(&format!("camera-name={id}")), "the property belongs to libcamerasrc");
@@ -464,14 +520,14 @@ Available cameras:
 
     #[test]
     fn capping_the_rate_happens_at_the_source() {
-        let c = CameraChoice { name: Some("/base/cam@1a".into()), capture: Some((640, 480)), fps: Some(1) };
+        let c = CameraChoice { name: Some("/base/cam@1a".into()), capture: Some((640, 480)), fps: Some(1), exposure: None };
         let line = gst_command(&c, GLASS_W, GLASS_H).join(" ");
         assert!(line.contains("camera-name=/base/cam@1a"));
         assert!(line.contains("width=640,height=480,framerate=1/1"), "on the capture caps, not only downstream: {line}");
         assert!(line.contains("videorate"));
         assert!(line.contains("width=32,height=40"));
         // No fps asked for: the pipeline is exactly as it was before.
-        let plain = CameraChoice { name: None, capture: None, fps: None };
+        let plain = CameraChoice { name: None, capture: None, fps: None, exposure: None };
         let l2 = gst_command(&plain, 240, 320).join(" ");
         assert!(!l2.contains("framerate") && !l2.contains("videorate"));
     }
@@ -577,5 +633,60 @@ Available cameras:
         assert_eq!(glass(&f, 1, 1), vec![[100, 0, 50]], "averaged, so no detail survives");
         assert_eq!(glass(&f, 0, 0).len(), 1, "degenerate asks do not panic");
         assert_eq!(glass(&Frame { w: 0, h: 0, rgba: vec![] }, 2, 2).len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod exposure_tests {
+    use super::*;
+
+    #[test]
+    fn a_frozen_exposure_reaches_the_pipeline() {
+        let c = CameraChoice { name: None, capture: None, fps: Some(2), exposure: Some(Exposure::default()) };
+        let line = gst_command(&c, GLASS_W, GLASS_H).join(" ");
+        assert!(line.contains("ae-enable=false"), "auto exposure must be off: {line}");
+        assert!(line.contains("awb-enable=false"), "and auto white balance, or the tint is neutralised");
+        assert!(line.contains("exposure-time=20000"));
+        assert!(line.contains("analogue-gain=2.000"));
+        // Not asked for: the pipeline is exactly as before.
+        let plain = CameraChoice { name: None, capture: None, fps: None, exposure: None };
+        assert!(!gst_command(&plain, 240, 320).join(" ").contains("ae-enable"));
+    }
+
+    #[test]
+    fn a_dark_room_reads_as_dark() {
+        // The point of freezing: brightness differences survive instead of
+        // being normalised away.
+        let e = Exposure::default();
+        let dark = scene_ev(12.0, &e);
+        let dim = scene_ev(60.0, &e);
+        let bright = scene_ev(240.0, &e);
+        assert!(dark < dim && dim < bright, "{dark} {dim} {bright}");
+        // Each doubling of measured level is one stop.
+        assert!((scene_ev(120.0, &e) - scene_ev(60.0, &e) - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn the_reading_is_comparable_across_settings() {
+        // The same scene measured with twice the exposure must report the
+        // same light, or a future auto-ranging step would make the tint jump
+        // whenever it changed settings.
+        let short = Exposure { time_us: 10_000, gain: 1.0 };
+        let long = Exposure { time_us: 20_000, gain: 1.0 };
+        let a = scene_ev(50.0, &short);
+        let b = scene_ev(100.0, &long);
+        assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        // Gain counts the same as time: both are stops.
+        let gained = Exposure { time_us: 10_000, gain: 2.0 };
+        assert!((scene_ev(100.0, &gained) - b).abs() < 1e-4);
+    }
+
+    #[test]
+    fn the_meter_does_not_blow_up_at_the_ends() {
+        let e = Exposure::default();
+        assert!(scene_ev(0.0, &e).is_finite(), "a black frame is dark, not negative infinity");
+        assert!(scene_ev(255.0, &e).is_finite());
+        assert!(scene_ev(1e9, &e).is_finite());
+        assert!(scene_ev(100.0, &Exposure { time_us: 0, gain: 0.0 }).is_finite(), "nonsense settings must not poison the number");
     }
 }

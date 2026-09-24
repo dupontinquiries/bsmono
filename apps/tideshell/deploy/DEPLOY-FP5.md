@@ -36,6 +36,7 @@ Everything for deployment is in `apps/tideshell/deploy/`:
 | `preflight.sh` | read-only phone checks, PASS/WARN/FAIL |
 | `fp5-touch-diag.sh` | which layer drops touch; edge-touch test |
 | `fp5-camera-diag.sh` | why the camera works under plasma but not cosmic, link by link |
+| `install-speaker-chain.sh` | build bankstown as a LOADABLE LV2 bundle (the circulating installer produces one lilv cannot read), check the LADSPA stages, install tideshell's speaker sink, verify. `--check` changes nothing |
 | `typein` (built from `tools/typein`) | type text and press keys with dotool under any keyboard layout: reads cosmic's own `xkb_config` and sets `DOTOOL_XKB_LAYOUT`, so `typein warp enter` types "warp" instead of ",apl". Emacs control macros: `C-a`, `M-x`, `C-{x c}` |
 | `focus-probe.sh` | characterise the ultra-wide's VCM: range, step size, resonance, hold current, write rate. Hit Enter when you hear it; the report says which named step made the noise |
 | `50-tideshell-powerkey.conf` | logind: short power press to the shell, long press powers off |

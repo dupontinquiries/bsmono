@@ -14,6 +14,20 @@
 //! gets an egui frame through ShellView -> Actions go to the verified
 //! transports (zcosmic toplevel requests, EI, hatch, rusty-board).
 
+// musl returns modest allocations straight to the kernel rather than
+// retaining them, so a loop that allocates a few 8-32 kB buffers per frame
+// pays an mmap and an munmap for each — measured on the FP5 at about 1400 of
+// each per second, the largest syscall count in the process by a wide
+// margin, and every pair is a page-table walk and a TLB shootdown. A caching
+// allocator keeps those spans in userspace.
+//
+// Global rather than feature-gated: glibc would not have produced the
+// symptom, but it does not suffer from the fix either, and a phone shell
+// that behaves differently on the developer's laptop than on the phone is
+// worse than a megabyte of allocator.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -398,6 +412,12 @@ fn main() {
     // "no ambient light sensor" on a phone whose ALS works fine behind
     // iio-sensor-proxy (the sensor hub exposes it over D-Bus, and an IIO
     // sensor in buffered mode has no `_input`/`_raw` attribute to find).
+    // `tideshell speaker-config`: the filter-chain config on stdout, so the
+    // installer can place it without the shell having to be running.
+    if args.get(1).map(String::as_str) == Some("speaker-config") {
+        print!("{}", tideshell_core::audio::speaker_chain_config());
+        std::process::exit(0);
+    }
     if args.get(1).map(String::as_str) == Some("sensors") {
         let sys = std::path::Path::new("/sys");
         let bus = zbus::blocking::Connection::system().ok();
@@ -551,6 +571,12 @@ fn main() {
     // cost of guessing software on real hardware is a shell that feels
     // sluggish for no reason.
     sb.view.accelerated = true;
+    // The speaker chain is tideshell's own sink, so tideshell puts it in
+    // place rather than leaving it to a script the user has to find.
+    {
+        let out = tideshell_egui::effects::ensure_speaker_chain();
+        sb.shell.note(format!("{out:?}"));
+    }
     sb.view.camera_mirror = cam_mount.mirror;
     sb.shell.note(tideshell_egui::devices::describe(&model, false, cam_mount));
     sb.shell.set_date(tideshell_egui::sensors::local_yday());
@@ -662,9 +688,25 @@ fn main() {
         if trace_stderr {
             print_new_trace(&sb.shell, &mut printed);
         }
-        let busy = !sb.shell.recognizer.is_idle() || sb.view.needs_overlay(&sb.shell) || sb.shell.switcher.is_streaking();
+        // `busy` is about a finger or an animation, NOT about the overlay
+        // being mapped. A mapped overlay is the normal state on this layout
+        // — a locked screen, or the right-hand bar — so treating it as busy
+        // held the loop at 16 ms forever, and with nothing to draw that is
+        // sixty wakeups a second to decide to do nothing.
+        let animating = sb.shell.drawer.is_animating()
+            || sb.shell.switcher.is_animating()
+            || sb.shell.sleep.is_animating()
+            || sb.shell.ambient.is_animating()
+            || (sb.shell.lock.is_locked() && !sb.shell.lock.reveal.is_settled());
+        let busy = !sb.shell.recognizer.is_idle() || sb.shell.switcher.is_streaking() || animating;
         // 90 Hz while brightness is moving: one step per panel frame.
-        let timeout = if sb.shell.ambient.is_animating() { 11 } else if busy { 16 } else { 250 };
+        let timeout = if sb.shell.ambient.is_animating() {
+            11
+        } else if busy {
+            16
+        } else {
+            250
+        };
         let input = io.dispatch(timeout).unwrap_or_else(|e| {
             eprintln!("tideshell: wayland: {e}");
             std::process::exit(1)
@@ -745,6 +787,11 @@ fn main() {
                     name: std::env::var("TIDESHELL_CAMERA").ok().filter(|v| !v.trim().is_empty()).or_else(|| sb.rear_camera.clone()),
                     capture: camera::CameraChoice::from_vars(None, std::env::var("TIDESHELL_CAMERA_CAPTURE").ok().as_deref()).capture,
                     fps: Some(2),
+                    // Frozen, so a dark room looks dark. Auto exposure
+                    // exists to make every scene look the same, which is
+                    // exactly wrong for a tint that is supposed to mean
+                    // something about the room.
+                    exposure: Some(camera::Exposure::default()),
                 };
                 sb.camera = Some(camera::ChildSource::start(&camera::gst_command(&choice, camera::FRAME_W, camera::FRAME_H), camera::FRAME_W, camera::FRAME_H));
             }
@@ -782,6 +829,14 @@ fn main() {
             // frame: 60 bytes instead of a texture upload, and the GPU does
             // the interpolation.
             sb.view.set_glass(grid.clone(), 4, 5);
+            // With the exposure fixed and known, the mean level is a light
+            // reading: the only one this phone has, since the ambient light
+            // sensor sits behind the low-power island and cannot be read.
+            let mean = grid.iter().map(|c| (c[0] as u32 + c[1] as u32 + c[2] as u32) / 3).sum::<u32>() as f32 / grid.len().max(1) as f32;
+            let ev = camera::scene_ev(mean, &camera::Exposure::default());
+            if now_ms.saturating_sub(sb.last_color_note) >= 5000 {
+                sb.shell.note(format!("scene: mean {mean:.0}, {ev:+.1} EV"));
+            }
             sb.last_glass = Some(grid);
             sb.cam_duty.frame(changed);
             // What this place looks like: its dominant colours, every 5 s.
@@ -1072,6 +1127,10 @@ fn main() {
         if !want {
             gl.unbind(Role::Overlay);
             io.ensure_overlay(false);
+            // Forget the hash: the surface's contents are gone, so the next
+            // frame is not "identical to what is on screen" — there is
+            // nothing on screen.
+            last_frame_hash.remove(&Role::Overlay);
             last_region = None;
             overlay_events.clear();
             continue;
@@ -1121,6 +1180,17 @@ fn main() {
             CursorWant::Shape(shape_for(out.platform_output.cursor_icon))
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        // The overlay is the big one: full screen, and painted every
+        // iteration whatever it contained. With swap_interval(0) each swap
+        // also produces Wayland events, so the next poll found the fd ready
+        // and never slept — the loop free-ran at over a thousand iterations
+        // a second while nothing moved. Skipping the identical frame is what
+        // lets it block.
+        let h = tideshell_egui::damage::frame_hash(&prims);
+        if !tideshell_egui::damage::changed(last_frame_hash.get(&Role::Overlay).copied(), h, !out.textures_delta.is_empty()) {
+            continue;
+        }
+        last_frame_hash.insert(Role::Overlay, h);
         if let Err(e) = gl.paint(Role::Overlay, size_px, out.pixels_per_point, &prims, &out.textures_delta) {
             eprintln!("tideshell: {e}");
         }
