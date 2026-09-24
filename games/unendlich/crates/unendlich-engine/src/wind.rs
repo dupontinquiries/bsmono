@@ -29,6 +29,14 @@
 
 use crate::world::noise;
 
+/// Metres per second for a magnitude of 1.0. The field is unitless ("fraction
+/// of max wind", max steady = 1.0, gust peaks to 3.0); anything that needs a
+/// physical speed (scent drift in `sim::dragon_nose`, wind masking in
+/// `sim::dragon_ears`) multiplies by this. 10 m/s is a fresh breeze
+/// (Beaufort 5), so the 0.3 average is a light 3 m/s breeze and a 3.0 gust
+/// a 30 m/s storm. A calibration choice, not a measurement.
+pub const WIND_UNIT_MS: f32 = 10.0;
+
 /// Average wind magnitude (no units; treated as fraction of "max wind").
 const BASE_MAGNITUDE: f32 = 0.3;
 /// How much altitude boosts wind magnitude (per block above sea level).

@@ -205,6 +205,13 @@ struct DragonDuel {
     track: unendlich_engine::sim::dragon_nose::TrackState,
     /// Last lead it logged, so a change of lead is logged once.
     lead_said: &'static str,
+    /// Terrain detour (m) between you and it, for hearing; refreshed every
+    /// 0.5 s (a line of world-gen height lookups is not free on a phone).
+    detour_m: f32,
+    detour_age: f32,
+    /// Where it last heard you (dragon_ears::EarMemory): investigated after
+    /// the noise stops.
+    ear_mem: unendlich_engine::sim::dragon_ears::EarMemory,
 }
 
 /// Top ground speed of an engaged dragon at `speed01 = 1` (blocks/s). Wander
@@ -250,6 +257,9 @@ fn dragon_duel_for(
         ears: unendlich_engine::sim::dragon_ears::ear_acuity(&genome),
         track: unendlich_engine::sim::dragon_nose::TrackState::new(id),
         lead_said: "",
+        detour_m: 0.0,
+        detour_age: f32::INFINITY,
+        ear_mem: Default::default(),
     }))
 }
 
@@ -9335,12 +9345,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 use unendlich_engine::sim::dragon_ears as de;
                 let pp = local_player.view.position;
                 player_scent.lay([pp.x, pp.y - 1.4, pp.z], senses_now, 1.0);
-                // wind::wind_at is unitless (|w| ~0..1 in logs); read as ×8 m/s.
-                // An assumption, not a calibration: 1.0 = a fresh breeze.
                 let (wx, wz, _) = unendlich_engine::wind::wind_at(
                     pp.x as f64, pp.y as f64, pp.z as f64, sky_state.time_seconds as f64,
                 );
-                let wind = [wx * 8.0, wz * 8.0];
+                let wu = unendlich_engine::wind::WIND_UNIT_MS;
+                let wind = [wx * wu, wz * wu];
                 let speed = match player_prev_xz {
                     Some(prev) if dt > 1e-4 => ((pp.x - prev[0]).powi(2) + (pp.z - prev[1]).powi(2)).sqrt() / dt,
                     _ => 0.0,
@@ -10933,22 +10942,43 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             let sn = dn::sniff(&player_scent, head, senses_now, scent_wind, d.nose, &dn::ScentPhysics::default());
                             let plan = dn::track(&mut d.track, &sn, d.profile.cunning * duel_tuning.cunning, cr.body.position, scent_wind, dt);
                             let attention = if d.state.tactic == dd::Tactic::Track { 1.0 } else { 0.3 };
-                            let heard = de::hear(&player_noise, pv.eye, head, 0, &noise_ambient, d.ears, attention);
+                            d.detour_age += dt;
+                            if d.detour_age >= 0.5 {
+                                d.detour_age = 0.0;
+                                let gen = chunk_manager.generator().cpu();
+                                let h = |x: i32, z: i32| gen.surface_y_at(x, z, probe_y_min, probe_y_max).map(|y| y as f32 + 1.0);
+                                d.detour_m = unendlich_engine::sim::land_echo::barrier_path_diff(pv.eye, head, &h, 6.0);
+                            }
+                            let heard = de::hear(&player_noise, pv.eye, head, d.detour_m, &noise_ambient, d.ears, attention);
                             let scent_lead = (plan.mode != dn::TrackMode::Lost).then(|| dd::Lead {
+                                est_dist: plan.goal.map(|g| {
+                                    ((g[0] - cr.body.position[0]).powi(2) + (g[2] - cr.body.position[2]).powi(2)).sqrt()
+                                }),
                                 heading: plan.heading,
                                 speed01: plan.speed01,
                                 confidence: plan.confidence.max(0.05),
                                 kind: dd::LeadKind::Scent(plan.mode.name()),
                             });
-                            let sound_lead = (heard.audible && heard.margin_db > 3.0).then(|| {
-                                // Deterministic jitter inside the bearing error.
-                                let j = ((d.id ^ (senses_now * 4.0) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32
-                                    / (1u64 << 24) as f32 * 2.0 - 1.0;
+                            // Where it judges the sound to be: bearing ± its error,
+                            // range by loudness (a cunning ear within ~10%, a dull
+                            // one ~50%). Remembered after the noise stops, so it
+                            // goes to investigate (dragon_ears::EarMemory).
+                            let j = ((d.id ^ (senses_now * 4.0) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32
+                                / (1u64 << 24) as f32 * 2.0 - 1.0;
+                            let range_err = 0.1 + 0.4 * (1.0 - d.profile.cunning);
+                            let est_d = senses.dist * (1.0 + j * range_err);
+                            let est_b = heard.bearing + j * heard.bearing_err;
+                            let est_pos = [head[0] + est_b.cos() * est_d, pv.eye[1], head[2] + est_b.sin() * est_d];
+                            let clear = de::Heard { audible: heard.audible && heard.margin_db > 3.0, ..heard };
+                            let remembered = d.ear_mem.update(&clear, est_pos, cr.body.position, d.profile.cunning, 6.0, dt);
+                            let sound_lead = remembered.map(|(p, conf, metal)| {
+                                let (dx, dz) = (p[0] - cr.body.position[0], p[2] - cr.body.position[2]);
                                 dd::Lead {
-                                    heading: heard.bearing + j * heard.bearing_err,
+                                    est_dist: Some((dx * dx + dz * dz).sqrt()),
+                                    heading: dz.atan2(dx),
                                     speed01: 0.65,
-                                    confidence: (heard.margin_db / 20.0).clamp(0.05, 1.0),
-                                    kind: dd::LeadKind::Sound { metal: heard.metal },
+                                    confidence: (conf * (0.3 + (heard.margin_db.max(0.0) / 20.0).min(0.7))).max(0.05),
+                                    kind: dd::LeadKind::Sound { metal },
                                 }
                             });
                             senses.lead = match (scent_lead, sound_lead) {
@@ -10966,10 +10996,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     log::info!("[dragon#{:04x}] lost you ({})", d.id & 0xffff, d.lead_said);
                                 } else {
                                     log::info!(
-                                        "[dragon#{:04x}] {} — {:.0} m off (scent {:.1}× threshold, trail {:.0}s old; sound {:+.0} dB, ±{:.0}°; wind {:.1} m/s)",
+                                        "[dragon#{:04x}] {} — {:.0} m off (scent {:.1}× threshold, trail {:.0}s old; sound {:+.0} dB, ±{:.0}°, {:.1} m terrain detour; wind {:.1} m/s)",
                                         d.id & 0xffff, said, senses.dist, sn.over,
                                         if sn.freshest_age.is_finite() { sn.freshest_age } else { -1.0 },
-                                        heard.margin_db, heard.bearing_err.to_degrees(), noise_ambient.wind
+                                        heard.margin_db, heard.bearing_err.to_degrees(), d.detour_m, noise_ambient.wind
                                     );
                                 }
                                 d.lead_said = said;

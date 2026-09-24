@@ -226,6 +226,35 @@ pub fn plan(
     EchoPlan { direct, occluded, ridge_m: ridge, reflections, tail: Tail { level, decay_s, enclosure }, distance: d }
 }
 
+/// Extra path length (m) a sound must travel over the terrain between `a`
+/// and `b`: 0 with a clear line; otherwise the detour over the highest crest
+/// that stands above the line (the input to a diffraction loss, e.g.
+/// `dragon_ears::arriving_db`). Samples every `step` m, at most 48 samples.
+pub fn barrier_path_diff(a: [f32; 3], b: [f32; 3], height: &impl Fn(i32, i32) -> Option<f32>, step: f32) -> f32 {
+    let d = dist3(a, b);
+    if !(d > 1.0) {
+        return 0.0;
+    }
+    let n = ((d / step.max(1.0)) as usize).clamp(2, 48);
+    let mut best: Option<([f32; 3], f32)> = None;
+    for i in 1..n {
+        let t = i as f32 / n as f32;
+        let x = a[0] + (b[0] - a[0]) * t;
+        let y = a[1] + (b[1] - a[1]) * t;
+        let z = a[2] + (b[2] - a[2]) * t;
+        if let Some(h) = height(x.floor() as i32, z.floor() as i32) {
+            let over = h - y;
+            if over > 0.0 && best.map_or(true, |(_, o)| over > o) {
+                best = Some(([x, h, z], over));
+            }
+        }
+    }
+    match best {
+        Some((top, _)) => (dist3(a, top) + dist3(top, b) - d).max(0.0),
+        None => 0.0,
+    }
+}
+
 /// One line for a log.
 pub fn describe(e: &EchoPlan) -> String {
     let echoes: Vec<String> = e
@@ -324,6 +353,19 @@ mod tests {
         let mut d: Vec<f32> = e.reflections.iter().map(|r| r.delay_s).collect();
         d.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert!(d.windows(2).all(|w| w[1] - w[0] >= 0.025 - 1e-6), "{d:?}");
+    }
+
+    #[test]
+    fn barrier_detour_grows_with_the_crest() {
+        let a = [0.0, 61.6, 0.0];
+        let b = [100.0, 62.0, 0.0];
+        assert_eq!(barrier_path_diff(a, b, &flat, 4.0), 0.0);
+        let low = |x: i32, _z: i32| Some(if (48..52).contains(&x) { 66.0 } else { 60.0 });
+        let high = |x: i32, _z: i32| Some(if (48..52).contains(&x) { 90.0 } else { 60.0 });
+        let (dl, dh) = (barrier_path_diff(a, b, &low, 4.0), barrier_path_diff(a, b, &high, 4.0));
+        assert!(dl > 0.0 && dh > dl * 5.0, "low {dl:.2} high {dh:.2}");
+        // Geometry: a 28 m crest halfway along a 100 m line ≈ 2·√(50²+28²) − 100.
+        assert!((dh - (2.0 * (50.0f32 * 50.0 + 28.0 * 28.0).sqrt() - 100.0)).abs() < 3.0);
     }
 
     #[test]

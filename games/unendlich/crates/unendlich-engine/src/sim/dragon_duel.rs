@@ -401,6 +401,8 @@ pub enum LeadKind {
 pub struct Lead {
     /// World yaw to go.
     pub heading: f32,
+    /// Its guess at how far you are (m), if the sense gives one.
+    pub est_dist: Option<f32>,
     pub speed01: f32,
     /// 0..1.
     pub confidence: f32,
@@ -427,6 +429,12 @@ pub struct DuelState {
     pub orbit: f32,
     /// Feint phase: `true` while darting in.
     pub feint_in: bool,
+    /// Where it last knew you to be (distance, world yaw), refreshed by sight
+    /// or by a lead. While it cannot see you mid-fight, it fights THIS, not
+    /// your true position.
+    pub belief: Option<(f32, f32)>,
+    /// Seconds without sight of you.
+    pub unseen_for: f32,
     /// The current Breath tactic has fired. Breath stays committed until it
     /// fires or [`BREATH_AIM_TIMEOUT`] passes: a slow-turning (flying) dragon
     /// needs longer than the draw to bring its snout round, and the first
@@ -448,6 +456,8 @@ impl DuelState {
             opening: 0.0,
             orbit: if seed & 1 == 0 { 1.0 } else { -1.0 },
             feint_in: true,
+            belief: None,
+            unseen_for: 0.0,
             breath_fired: false,
             mem: DuelMemory::new(),
         }
@@ -525,8 +535,46 @@ fn wrap(a: f32) -> f32 {
 }
 
 /// One tick. See the module docs for the shape of the decision.
+/// How long an engaged dragon keeps fighting a belief with no sight or lead
+/// before it decides it has lost you (s).
+pub fn lose_time(cunning: f32) -> f32 {
+    4.0 + 12.0 * cunning.clamp(0.0, 1.0)
+}
+
+/// The senses as the dragon believes them. With sight: the truth, and the
+/// belief is refreshed. Without: a lead's heading and distance guess, or else
+/// the last belief -- never the true position (the shell computes that for
+/// every dragon; before this, one that had lost sight of you mid-fight still
+/// steered by where you really were).
+fn believed(st: &mut DuelState, s: &DuelSenses, dt: f32) -> DuelSenses {
+    if s.can_see {
+        st.unseen_for = 0.0;
+        st.belief = Some((s.dist, s.to_player_yaw));
+        return *s;
+    }
+    st.unseen_for += dt;
+    if let Some(l) = s.lead.filter(|l| l.heading.is_finite()) {
+        let d = l.est_dist.filter(|d| d.is_finite()).or(st.belief.map(|b| b.0)).unwrap_or(ENGAGE_BASE);
+        st.belief = Some((d, l.heading));
+    }
+    let mut b = *s;
+    match st.belief {
+        Some((d, yaw)) => {
+            b.dist = d;
+            b.to_player_yaw = yaw;
+        }
+        None => {
+            b.dist = f32::MAX;
+            b.to_player_yaw = s.self_yaw;
+        }
+    }
+    b.player_facing = 0.0; // it cannot see which way you face
+    b
+}
+
 pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTuning, dt: f32) -> DuelOut {
     let dt = if dt.is_finite() { dt.clamp(0.0, 0.5) } else { 0.0 };
+    let s = &believed(st, s, dt);
     let dist = if s.dist.is_finite() { s.dist.max(0.0) } else { f32::MAX };
     let cunning = c01(p.cunning * tune.cunning);
     let ferocity = c01(p.ferocity * tune.aggression);
@@ -545,11 +593,20 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
     // first soak with armour, where a dragon tracked the clank 120 m, saw the
     // player at 64 m, roared -- and then stood watching from 50 m.
     let hunting_you = st.tactic == Tactic::Track;
-    if !st.engaged && ((s.can_see && (dist < engage_at || hunting_you)) || st.mem.hits_taken > 0) {
+    // Being hit engages too, toward where the blow came from (take_hit sets
+    // the belief). Once it has lost you the belief is gone, so an old hit
+    // does not drag it back into a fight with no one.
+    let hit_from = st.mem.hits_taken > 0 && st.belief.is_some();
+    if !st.engaged && ((s.can_see && (dist < engage_at || hunting_you)) || hit_from) {
         st.engaged = true;
     }
     if st.engaged && dist > DISENGAGE && st.mem.total_pain() < 0.05 {
         st.engaged = false;
+    }
+    // Out of sight, no lead, past its patience: it has lost you.
+    if st.engaged && !s.can_see && s.lead.is_none() && st.unseen_for > lose_time(cunning) {
+        st.engaged = false;
+        st.belief = None;
     }
     // Roar on SIGHTING, not on engaging: the moment you come into view, from
     // as far as it can see you. Losing you and spotting you again roars again,
@@ -955,6 +1012,9 @@ pub fn take_hit(p: &DuelProfile, st: &mut DuelState, body: &DragonBody, eye: [f3
     // its centre: a spear jab and a dagger stab at a big dragon differ by the
     // weapon, not by the dragon's size.
     st.mem.learn_hit(item.element, h.damage, p.max_hp, (from - body.radius()).max(0.0));
+    // A blow tells it where you are, even if it never saw you.
+    st.belief = Some((from, (eye[2] - body.pos[2]).atan2(eye[0] - body.pos[0])));
+    st.unseen_for = 0.0;
     (zone, h)
 }
 
@@ -1071,15 +1131,19 @@ mod tests {
     }
 
     #[test]
-    fn being_hit_engages_even_unseen() {
+    fn being_hit_engages_even_unseen_and_it_knows_where_from() {
         let p = DuelProfile::from_genome(&genome(1));
         let mut st = DuelState::new(1);
-        st.mem.learn_hit(Some(2), 10, p.max_hp, 2.0);
+        let body = DragonBody { pos: [0.0, 70.0, 0.0], yaw: 0.0, half_extents: [2.0, 1.5, 2.0] };
+        let item = ItemThreat { element: Some(2), damage: 12.0, reach: 3.0 };
+        take_hit(&p, &mut st, &body, [0.0, 70.5, 4.0], &item); // from +z, behind its flank
         let mut s = senses(40.0);
         s.can_see = false;
         let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
         assert!(st.engaged);
         assert_ne!(o.tactic, Tactic::Unaware);
+        let (_, yaw) = st.belief.unwrap();
+        assert!((yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-3, "turns toward the blow: {yaw}");
     }
 
     #[test]
@@ -1661,7 +1725,7 @@ mod tests {
         let mut st = DuelState::new(1);
         let mut s = senses(90.0);
         s.can_see = false;
-        s.lead = Some(Lead { heading: 1.0, speed01: 0.7, confidence: 0.5, kind: LeadKind::Scent("following the trail") });
+        s.lead = Some(Lead { est_dist: None, heading: 1.0, speed01: 0.7, confidence: 0.5, kind: LeadKind::Scent("following the trail") });
         let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
         assert_eq!(o.tactic, Tactic::Track);
         assert!(o.changed);
@@ -1669,7 +1733,7 @@ mod tests {
         assert_eq!(o.why.reason, "following the trail");
         assert!(!st.engaged, "a lead is not a fight");
         // Heard armour instead.
-        s.lead = Some(Lead { heading: -2.0, speed01: 0.6, confidence: 0.4, kind: LeadKind::Sound { metal: true } });
+        s.lead = Some(Lead { est_dist: None, heading: -2.0, speed01: 0.6, confidence: 0.4, kind: LeadKind::Sound { metal: true } });
         let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
         assert_eq!(o.why.reason, "heard armour clanking");
         // Lead gone: back to unaware.
@@ -1683,7 +1747,7 @@ mod tests {
         let p = DuelProfile::from_genome(&genome(1));
         let mut st = DuelState::new(1);
         let mut s = senses(90.0); // visible, beyond engage range
-        s.lead = Some(Lead { heading: 1.0, speed01: 0.7, confidence: 0.9, kind: LeadKind::Sound { metal: false } });
+        s.lead = Some(Lead { est_dist: None, heading: 1.0, speed01: 0.7, confidence: 0.9, kind: LeadKind::Sound { metal: false } });
         let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
         assert_eq!(o.tactic, Tactic::Unaware, "it can see you: the lead adds nothing");
         let mut near = s;
@@ -1699,7 +1763,7 @@ mod tests {
         let mut st = DuelState::new(1);
         let mut s = senses(55.0);
         s.can_see = false;
-        s.lead = Some(Lead { heading: 0.0, speed01: 0.6, confidence: 0.5, kind: LeadKind::Sound { metal: true } });
+        s.lead = Some(Lead { est_dist: None, heading: 0.0, speed01: 0.6, confidence: 0.5, kind: LeadKind::Sound { metal: true } });
         step(&mut st, &p, &s, DuelTuning::default(), 0.05);
         assert_eq!(st.tactic, Tactic::Track);
         s.can_see = true;
@@ -1709,6 +1773,71 @@ mod tests {
         let mut idle = DuelState::new(1);
         step(&mut idle, &p, &senses(55.0), DuelTuning::default(), 0.05);
         assert!(!idle.engaged);
+    }
+
+    #[test]
+    fn out_of_sight_mid_fight_it_fights_its_belief_not_your_position() {
+        let mut p = DuelProfile::from_genome(&genome(2));
+        p.cunning = 0.5;
+        let mut st = DuelState::new(1);
+        // Seen at 20 m, bearing 0.3: engaged.
+        let mut s = senses(20.0);
+        s.to_player_yaw = 0.3;
+        step(&mut st, &p, &s, DuelTuning::default(), 0.05);
+        assert!(st.engaged);
+        // You slip behind a hill and actually run the other way.
+        let mut hid = s;
+        hid.can_see = false;
+        hid.to_player_yaw = -2.5;
+        hid.dist = 35.0;
+        let mut outs = vec![];
+        for _ in 0..40 {
+            outs.push(step(&mut st, &p, &hid, DuelTuning::default(), 0.05));
+        }
+        assert!(st.engaged, "2 s unseen: still in the fight");
+        // It cannot see which way you face, so it stalks -- straight at where
+        // it believes you are (0.3), not where you are (-2.5).
+        for o in &outs[20..] {
+            assert_eq!(o.tactic, Tactic::Stalk);
+            assert!(wrap(o.heading - 0.3).abs() < 0.05, "heading {} is not the belief", o.heading);
+        }
+        assert_eq!(st.belief, Some((20.0, 0.3)));
+    }
+
+    #[test]
+    fn with_no_sight_and_no_lead_it_loses_you_later_if_cunning() {
+        let lost_after = |cunning: f32| {
+            let mut p = DuelProfile::from_genome(&genome(2));
+            p.cunning = cunning;
+            let mut st = DuelState::new(1);
+            step(&mut st, &p, &senses(20.0), DuelTuning::default(), 0.05);
+            let mut hid = senses(20.0);
+            hid.can_see = false;
+            let mut t = 0.0;
+            while st.engaged && t < 60.0 {
+                step(&mut st, &p, &hid, DuelTuning::default(), 0.1);
+                t += 0.1;
+            }
+            t
+        };
+        let (dull, sharp) = (lost_after(0.1), lost_after(0.9));
+        assert!((dull - lose_time(0.1)).abs() < 0.3, "dull gave up at {dull}");
+        assert!(sharp > dull + 8.0, "sharp {sharp} vs dull {dull}");
+    }
+
+    #[test]
+    fn a_lead_mid_fight_updates_the_belief() {
+        let p = DuelProfile::from_genome(&genome(2));
+        let mut st = DuelState::new(1);
+        step(&mut st, &p, &senses(20.0), DuelTuning::default(), 0.05);
+        let mut hid = senses(20.0);
+        hid.can_see = false;
+        hid.lead = Some(Lead { est_dist: Some(30.0), heading: 1.2, speed01: 0.6, confidence: 0.5, kind: LeadKind::Sound { metal: true } });
+        for _ in 0..200 {
+            step(&mut st, &p, &hid, DuelTuning::default(), 0.1);
+        }
+        assert!(st.engaged, "a live lead keeps it in the fight");
+        assert_eq!(st.belief, Some((30.0, 1.2)));
     }
 
     #[test]
