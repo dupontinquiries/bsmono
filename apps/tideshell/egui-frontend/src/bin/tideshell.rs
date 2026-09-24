@@ -21,7 +21,7 @@ use egui::{Pos2, Rect, Vec2};
 use tideshell_core::{Action, Shell, TouchEvent};
 use tideshell_egui::effects::{self, Executor, Outcome, System};
 use tideshell_egui::layer::{shape_for, CursorWant, Gl, Input, Io, Role, POINTER_SLOT};
-use tideshell_egui::{key_events, AppTile, FrameInfo, ShellView};
+use tideshell_egui::{camera, key_events, AppTile, FrameInfo, ShellView};
 
 const STRIP_PX: u32 = 28;
 
@@ -53,6 +53,11 @@ struct Shellbox {
     compass: tideshell_egui::sensors::CompassFeed,
     mic: Option<tideshell_egui::sensors::MicFeed>,
     camera: Option<tideshell_egui::camera::ChildSource>,
+    cam_duty: tideshell_egui::camera::DutyCycle,
+    /// The rear camera's libcamera id, found once at startup.
+    rear_camera: Option<String>,
+    /// The last colour grid, for deciding whether the room changed.
+    last_glass: Option<Vec<[u8; 3]>>,
     /// Tracker state: the previous frame, its corners, and the world's
     /// yaw/pitch when it was taken.
     prev_frame: Option<(tideshell_core::track::Frame, Vec<tideshell_core::track::Point>, f32, f32)>,
@@ -417,6 +422,9 @@ fn main() {
         std::process::exit(1)
     });
 
+        // Which camera is the rear one. Asked once: `cam -l` starts a libcamera
+    // manager, which is not something to do every window.
+    let cam_list = std::process::Command::new("cam").arg("-l").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
     let mut sb = Shellbox {
         shell: Shell::new(prefs, (0.0, 0.0)),
         view: ShellView::default(),
@@ -443,6 +451,9 @@ fn main() {
         compass: tideshell_egui::sensors::CompassFeed::spawn(zbus::blocking::Connection::system().ok()),
         mic: None,
         camera: None,
+        cam_duty: tideshell_egui::camera::DutyCycle::new(tideshell_egui::camera::Duty::default()),
+        rear_camera: tideshell_egui::camera::pick_rear(&cam_list),
+        last_glass: None,
         prev_frame: None,
         feed_status: Default::default(),
         notify_gain_written: -1.0,
@@ -624,14 +635,32 @@ fn main() {
                 }
             }
         }
-        // The camera: on only while the cover shows on a lit screen.
+        // The camera: on only while the cover shows on a lit screen, and
+        // then only in short windows (camera::DutyCycle). Continuous capture
+        // for a surface that is blurred to a colour wash costs a software
+        // debayer per frame — libcamera has no hardware ISP on this phone —
+        // for detail nobody sees.
         let want_cam = sb.shell.camera_wanted();
-        if want_cam && sb.camera.is_none() {
-            sb.camera = Some(tideshell_egui::camera::ChildSource::start(&tideshell_egui::camera::gst_command(&tideshell_egui::camera::CameraChoice::from_vars(std::env::var("TIDESHELL_CAMERA").ok().as_deref(), std::env::var("TIDESHELL_CAMERA_CAPTURE").ok().as_deref()), tideshell_egui::camera::FRAME_W, tideshell_egui::camera::FRAME_H), tideshell_egui::camera::FRAME_W, tideshell_egui::camera::FRAME_H));
-        } else if !want_cam && sb.camera.is_some() {
-            sb.camera = None;
-            sb.prev_frame = None;
-            sb.view.clear_camera_frame();
+        match sb.cam_duty.tick(want_cam, now_ms) {
+            camera::DutyAction::Start => {
+                let choice = camera::CameraChoice {
+                    // Auto-pick the REAR camera when nothing names one:
+                    // libcamerasrc's own default is whichever libcamera lists
+                    // first, which here is the selfie camera.
+                    name: std::env::var("TIDESHELL_CAMERA").ok().filter(|v| !v.trim().is_empty()).or_else(|| sb.rear_camera.clone()),
+                    capture: camera::CameraChoice::from_vars(None, std::env::var("TIDESHELL_CAMERA_CAPTURE").ok().as_deref()).capture,
+                    fps: Some(2),
+                };
+                sb.camera = Some(camera::ChildSource::start(&camera::gst_command(&choice, camera::FRAME_W, camera::FRAME_H), camera::FRAME_W, camera::FRAME_H));
+            }
+            camera::DutyAction::Stop => {
+                sb.camera = None;
+                sb.prev_frame = None;
+                if !want_cam {
+                    sb.view.clear_camera_frame();
+                }
+            }
+            camera::DutyAction::Wait => {}
         }
         if let Some(f) = sb.camera.as_mut().and_then(|c| c.poll()) {
             use tideshell_core::track;
@@ -649,6 +678,13 @@ fn main() {
             }
             let pts = track::find_corners(&gray);
             sb.prev_frame = Some((gray, pts, yaw, pitch));
+            // Has the room changed? The only idle signal on a phone whose
+            // accelerometer is unreadable, and the right question anyway:
+            // what matters for a tint is the room, not the handset.
+            let grid = camera::glass(&f, 4, 5);
+            let changed = sb.last_glass.as_ref().map(|prev| camera::scene_changed(prev, &grid, 4.0)).unwrap_or(true);
+            sb.last_glass = Some(grid);
+            sb.cam_duty.frame(changed);
             // What this place looks like: its dominant colours, every 5 s.
             if now_ms.saturating_sub(sb.last_color_note) >= 5000 {
                 sb.last_color_note = now_ms;

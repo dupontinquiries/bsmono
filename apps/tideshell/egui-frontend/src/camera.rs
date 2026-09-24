@@ -95,13 +95,35 @@ pub struct Duty {
     /// libcamera needs a moment to configure, allocate and let exposure
     /// settle; a frame grabbed before that is dark or green.
     pub warmup_ms: u64,
+    /// The gap between windows when something is happening.
     pub period_ms: u64,
+    /// The gap it backs off to when nothing is. Reached by doubling, so the
+    /// first few quiet windows still sample often enough to notice a room
+    /// coming back to life.
+    pub idle_period_ms: u64,
+    /// Quiet windows before the backoff starts. One unchanged frame is not
+    /// evidence; it might be a wall.
+    pub quiet_before_backoff: u32,
 }
 
 impl Default for Duty {
     fn default() -> Duty {
-        Duty { warmup_ms: 1_200, period_ms: 30_000 }
+        Duty { warmup_ms: 1_200, period_ms: 30_000, idle_period_ms: 300_000, quiet_before_backoff: 2 }
     }
+}
+
+/// Did the scene change enough to be worth watching?
+///
+/// Compared on the [`glass`] grid rather than on pixels, because that is
+/// what the pane shows: a change too small to alter the tint is, for this
+/// purpose, not a change. `threshold` is mean absolute difference per
+/// channel, 0..255.
+pub fn scene_changed(a: &[[u8; 3]], b: &[[u8; 3]], threshold: f32) -> bool {
+    if a.len() != b.len() || a.is_empty() {
+        return true;
+    }
+    let total: u32 = a.iter().zip(b).map(|(p, q)| p.iter().zip(q).map(|(x, y)| x.abs_diff(*y) as u32).sum::<u32>()).sum();
+    total as f32 / (a.len() * 3) as f32 > threshold
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +139,8 @@ pub struct DutyCycle {
     running_since: Option<u64>,
     last_stop: Option<u64>,
     got_frame: bool,
+    /// Consecutive windows whose scene looked the same as the last.
+    quiet_windows: u32,
 }
 
 impl DutyCycle {
@@ -126,9 +150,36 @@ impl DutyCycle {
     pub fn running(&self) -> bool {
         self.running_since.is_some()
     }
-    /// Note that a frame arrived; the window can end early.
-    pub fn frame(&mut self) {
+    /// Note that a frame arrived; the window can end early. `changed` is
+    /// whether the scene differs from the last one seen ([`scene_changed`]).
+    ///
+    /// A still scene is the only idle signal available on a phone whose
+    /// accelerometer is not readable, and it is arguably the better one
+    /// anyway: what matters for a tint is whether the ROOM changed, not
+    /// whether the phone was picked up and put down again.
+    pub fn frame(&mut self, changed: bool) {
         self.got_frame = true;
+        if changed {
+            self.quiet_windows = 0;
+        } else {
+            self.quiet_windows = self.quiet_windows.saturating_add(1);
+        }
+    }
+
+    /// Something happened that is not the camera's business to detect — a
+    /// touch, a wake, a notification. Sample promptly again.
+    pub fn wake(&mut self) {
+        self.quiet_windows = 0;
+    }
+
+    /// The gap in force right now: doubling from `period_ms` toward
+    /// `idle_period_ms` once the scene has been still for a few windows.
+    pub fn current_period_ms(&self) -> u64 {
+        let over = self.quiet_windows.saturating_sub(self.duty.quiet_before_backoff);
+        if over == 0 {
+            return self.duty.period_ms;
+        }
+        self.duty.period_ms.saturating_mul(1u64 << over.min(16)).min(self.duty.idle_period_ms)
     }
     /// `wanted` is whether the pane is visible at all; when it goes false the
     /// camera stops at once rather than finishing its window.
@@ -153,7 +204,7 @@ impl DutyCycle {
                 }
             }
             None => match self.last_stop {
-                Some(t) if now_ms.saturating_sub(t) < self.duty.period_ms => DutyAction::Wait,
+                Some(t) if now_ms.saturating_sub(t) < self.current_period_ms() => DutyAction::Wait,
                 _ => {
                     self.running_since = Some(now_ms);
                     self.got_frame = false;
@@ -426,11 +477,74 @@ Available cameras:
     }
 
     #[test]
+    fn a_still_scene_backs_the_camera_right_off() {
+        // No accelerometer on this phone, so "has anything happened" is
+        // answered by the frames themselves — and for a tint, whether the
+        // ROOM changed is the better question anyway.
+        let duty = Duty { warmup_ms: 100, period_ms: 10_000, idle_period_ms: 160_000, quiet_before_backoff: 2 };
+        let mut d = DutyCycle::new(duty);
+        assert_eq!(d.current_period_ms(), 10_000);
+        // Two quiet windows are not yet evidence: it might be a wall.
+        d.frame(false);
+        d.frame(false);
+        assert_eq!(d.current_period_ms(), 10_000, "still sampling normally");
+        // Then it doubles per quiet window, up to the idle ceiling.
+        d.frame(false);
+        assert_eq!(d.current_period_ms(), 20_000);
+        d.frame(false);
+        assert_eq!(d.current_period_ms(), 40_000);
+        for _ in 0..10 {
+            d.frame(false);
+        }
+        assert_eq!(d.current_period_ms(), 160_000, "capped, not runaway");
+        // The room comes back to life: back to normal at once, not by
+        // halving, because the next thing to happen deserves to be seen.
+        d.frame(true);
+        assert_eq!(d.current_period_ms(), 10_000);
+        // A touch or a wake does the same without waiting for a frame.
+        for _ in 0..8 {
+            d.frame(false);
+        }
+        assert!(d.current_period_ms() > 10_000);
+        d.wake();
+        assert_eq!(d.current_period_ms(), 10_000);
+    }
+
+    #[test]
+    fn backoff_actually_lengthens_the_gap() {
+        let mut d = DutyCycle::new(Duty { warmup_ms: 100, period_ms: 10_000, idle_period_ms: 80_000, quiet_before_backoff: 0 });
+        assert_eq!(d.tick(true, 0), DutyAction::Start);
+        d.frame(false);
+        assert_eq!(d.tick(true, 50), DutyAction::Stop);
+        // One quiet window: the gap is already 20 s, so 15 s is too soon.
+        assert_eq!(d.tick(true, 15_000), DutyAction::Wait);
+        assert_eq!(d.tick(true, 20_100), DutyAction::Start);
+        d.frame(true);
+        assert_eq!(d.tick(true, 20_200), DutyAction::Stop);
+        // Changed: back to the base gap.
+        assert_eq!(d.tick(true, 30_300), DutyAction::Start);
+    }
+
+    #[test]
+    fn scene_change_is_judged_on_what_the_pane_shows() {
+        let a = vec![[10u8, 10, 10], [200, 200, 200]];
+        assert!(!scene_changed(&a, &a, 4.0), "identical is not a change");
+        let nudged = vec![[12u8, 11, 10], [199, 200, 201]];
+        assert!(!scene_changed(&a, &nudged, 4.0), "sensor noise is not a change");
+        let lit = vec![[10u8, 10, 10], [40, 40, 40]];
+        assert!(scene_changed(&a, &lit, 4.0), "someone turned a light off");
+        // A first frame, or a resized grid, counts as changed rather than
+        // silently starting in the backed-off state.
+        assert!(scene_changed(&[], &[], 4.0));
+        assert!(scene_changed(&a, &a[..1], 4.0));
+    }
+
+    #[test]
     fn the_camera_sips_rather_than_streams() {
-        let mut d = DutyCycle::new(Duty { warmup_ms: 1_000, period_ms: 10_000 });
+        let mut d = DutyCycle::new(Duty { warmup_ms: 1_000, period_ms: 10_000, ..Duty::default() });
         assert_eq!(d.tick(true, 0), DutyAction::Start);
         assert_eq!(d.tick(true, 500), DutyAction::Wait, "still warming up");
-        d.frame();
+        d.frame(true);
         assert_eq!(d.tick(true, 600), DutyAction::Stop, "a frame arrived, so stop early");
         assert_eq!(d.tick(true, 5_000), DutyAction::Wait, "not yet — 10 s period");
         assert_eq!(d.tick(true, 10_700), DutyAction::Start);
