@@ -97,9 +97,14 @@ def insert(ins):
         slots.append({"index": safe(lambda: s.index), "plugin": plug, "name": safe(lambda: s.name),
                       "enabled": safe(lambda: s.enabled), "mix": num(safe(lambda: s.mix)),
                       "plugin_type": safe(lambda: type(s.plugin).__name__ if s.plugin else None)})
-    return {"iid": ins.iid, "name": safe(lambda: ins.name), "volume": num(safe(lambda: ins.volume)),
-            "pan": num(safe(lambda: ins.pan)), "enabled": safe(lambda: ins.enabled),
-            "routes": safe(lambda: list(ins.routes)), "slots": slots}
+    # FL numbering (master = 0), as channels' `insert` uses: PyFLP numbers
+    # inserts from file position - 1. `routes` left out: PyFLP pairs the
+    # routing flags with the fader and pan params and returns the fader. Its
+    # SLOT grouping is also off by one plugin (it starts a slot at the index
+    # event, which FL writes LAST). The native reader (flp_read) has neither
+    # problem: prefer it; this script is the cross-check.
+    return {"iid": ins.iid + 1, "name": safe(lambda: ins.name), "volume": num(safe(lambda: ins.volume)),
+            "pan": num(safe(lambda: ins.pan)), "enabled": safe(lambda: ins.enabled), "slots": slots}
 
 
 def main(path):

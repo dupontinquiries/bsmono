@@ -27,11 +27,17 @@
 //!   Keys) cannot be hosted here and their sound is not in the file: they
 //!   become STAND-INS -- `Sub` for a channel whose notes all sit below C4 (a
 //!   bass), `Sine` otherwise -- and the report says so, channel by channel.
-//! * **Mixer**: each FL insert a channel uses becomes a bus with its name and
-//!   fader; its effect slots map to Studio effects where there is one, at
-//!   Studio's DEFAULT settings (PyFLP does not decode plugin parameters), and
-//!   the rest are named, not faked. Routing between inserts is not imported
-//!   (PyFLP's `routes` repeat the insert's own fader: not trustworthy).
+//! * **Mixer**: inserts are numbered as FL numbers them (0 = master; the
+//!   native reader does, `flp_dump.py` converts). Every insert a channel uses,
+//!   and every insert those ROUTE to, becomes a bus with its name and fader.
+//!   Routing: an insert that feeds the master keeps the master as its output
+//!   and sends to any other insert at that send's level; one that does not
+//!   feed the master outputs into its first destination (a Studio parent bus)
+//!   and sends to the rest. Effect slots map to Studio effects where there is
+//!   one, at Studio's DEFAULT settings (plugin parameters are not decoded),
+//!   and the rest are named, not faked. Needs `routes` as `[{to, level}]`
+//!   (the native reader); an inventory without them routes to the master and
+//!   the report says so.
 //! * **Not imported, and said**: automation clips, the master chain, slicer
 //!   slices (a slicer channel plays its whole recording), third-party effects.
 
@@ -71,6 +77,18 @@ pub fn effect_for(plugin: &str) -> Option<(&'static str, &'static str)> {
 }
 
 fn s(v: &Value) -> Option<&str> { v.as_str() }
+
+/// A note's key: a MIDI number, or a name as PyFLP writes it ("F#6"; C5 = 60).
+/// The first import read PyFLP's names as numbers, found none, and put every
+/// note at C5 -- found by comparing against the native reader.
+pub fn key_of(v: &Value) -> Option<i64> {
+    if let Some(k) = v.as_i64() { return Some(k); }
+    let t = v.as_str()?;
+    const N: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    let split = t.find(|c: char| c == '-' || c.is_ascii_digit())?;
+    let (name, oct) = t.split_at(split);
+    Some(N.iter().position(|n| *n == name)? as i64 + 12 * oct.parse::<i64>().ok()?)
+}
 fn i(v: &Value) -> Option<i64> { v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)) }
 fn f(v: &Value) -> Option<f64> { v.as_f64() }
 
@@ -121,7 +139,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         for n in pat["notes"].as_array().into_iter().flatten() {
             let Some(r) = i(&n["rack"]) else { continue };
             if !used.contains(&r) { used.push(r); }
-            keys.entry(r).or_default().push(i(&n["key"]).unwrap_or(60));
+            keys.entry(r).or_default().push(key_of(&n["key"]).unwrap_or(60));
         }
     }
     used.sort();
@@ -133,11 +151,14 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     for fl in &used {
         let Some(c) = chans.get(fl) else { continue };
         let kind_s = s(&c["kind"]).unwrap_or("");
-        let plugin = s(&c["plugin_name"]).or(s(&c["plugin"])).unwrap_or("").to_string();
-        let kind = if kind_s == "Sampler" || plugin == "Fruity slicer" {
+        // the INTERNAL name says what the plugin is ("Fruity slicer", "Fruity
+        // Wrapper" for a VST); the display name is what the person called it
+        let internal = s(&c["plugin"]).unwrap_or("").to_string();
+        let plugin = if internal == "Fruity Wrapper" { "VST".to_string() } else { internal.clone() };
+        let kind = if kind_s == "Sampler" || internal == "Fruity slicer" {
             match file_of(c).and_then(|f| source_for(&f, &mut ops, &mut missing)) {
                 Some((id, _)) => {
-                    if plugin == "Fruity slicer" {
+                    if internal == "Fruity slicer" {
                         report.push(format!("{}: a Fruity Slicer -- plays its whole recording from each note; the slice map is not in the dump", ch_name(c)));
                     }
                     SynthKind::Sampler { source: id }
@@ -153,8 +174,9 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         };
         let vol = f(&c["volume"]).unwrap_or(10000.0);
         rack_ix.insert(*fl, rack.channels.len());
+        let pan = (f(&c["pan"]).unwrap_or(0.0) / 6400.0).clamp(-1.0, 1.0) as f32;
         rack.channels.push(Channel { name: ch_name(c), kind, gain: (vol / 10000.0).clamp(0.0, 1.28) as f32,
-                                     pan: 0.0, muted: false, choke_group: None });
+                                     pan, muted: false, choke_group: None });
     }
     if !stand_ins.is_empty() {
         report.push(format!("{} plugin synth{} cannot be hosted and their sound is not in the file -- STAND-INS, notes kept: {}",
@@ -185,7 +207,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                 let step = step_f.round() as i64 - from as i64;
                 if step < 0 || step >= steps as i64 { continue; }
                 if (step_f - step_f.round()).abs() > 1e-6 { off_grid += 1; }
-                let key = i(&n["key"]).unwrap_or(60);
+                let key = key_of(&n["key"]).unwrap_or(60);
                 let is_sampler = matches!(rack.channels[ch].kind, SynthKind::Sampler { .. });
                 if is_sampler && key == 60 {
                     if rp.is_set(ch, step as u32) { collided += 1; }
@@ -211,30 +233,53 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     let mut busses: BTreeMap<i64, BusId> = BTreeMap::new();
     let mut unmapped: BTreeMap<String, usize> = BTreeMap::new();
     let mut approx: Vec<String> = Vec::new();
-    let mut bus_for = |insert: i64, ops: &mut Vec<Op>| -> Option<BusId> {
-        if insert <= 0 { return None; } // 0 is FL's master: route to Studio's master
-        let m = mixer.get(&insert)?;
-        let n = busses.len() as u64 + 1;
-        Some(*busses.entry(insert).or_insert_with(|| {
-            let id = BusId(n);
-            let mut chain = Vec::new();
-            for slot in m["slots"].as_array().into_iter().flatten() {
-                let plug = s(&slot["plugin"]).unwrap_or("");
-                let label = if plug == "Fruity Wrapper" { s(&slot["name"]).unwrap_or("a plugin") } else { plug };
-                match effect_for(plug) {
-                    Some((kind, how)) => {
-                        if how != "exact kind" && !approx.iter().any(|a| a.starts_with(plug)) { approx.push(format!("{plug}: {how}")); }
-                        chain.push(Effect { kind: kind.into(), params: BTreeMap::new(), enabled: slot["enabled"].as_bool().unwrap_or(true) });
-                    }
-                    None => *unmapped.entry(label.to_string()).or_default() += 1,
-                }
+    let has_routes = mixer.values().any(|m| m["routes"].as_array().is_some_and(|r| r.iter().any(|x| x.is_object())));
+    let mut sends_made = 0usize;
+    let mut unroutable = 0usize;
+    // Create the bus for `insert` -- its destinations FIRST, so a parent
+    // always exists when its child is added. FL routing has no cycles; a
+    // depth guard makes a corrupt file an error message, not a stack overflow.
+    fn make(insert: i64, depth: usize, mixer: &BTreeMap<i64, &Value>, busses: &mut BTreeMap<i64, BusId>, ops: &mut Vec<Op>,
+            unmapped: &mut BTreeMap<String, usize>, approx: &mut Vec<String>, sends_made: &mut usize, unroutable: &mut usize) -> Option<BusId> {
+        if insert <= 0 || depth > 32 { return None; } // 0 is FL's master: Studio's master
+        if let Some(b) = busses.get(&insert) { return Some(*b); }
+        let m = *mixer.get(&insert)?;
+        let routes: Vec<(i64, f32)> = m["routes"].as_array().into_iter().flatten()
+            .filter_map(|r| Some((i(&r["to"])?, (f(&r["level"]).unwrap_or(12800.0) / 12800.0) as f32))).collect();
+        let to_master = routes.is_empty() || routes.iter().any(|(t, _)| *t == 0);
+        let mut dests: Vec<(BusId, f32)> = Vec::new();
+        for (t, lvl) in routes.iter().filter(|(t, _)| *t > 0) {
+            match make(*t, depth + 1, mixer, busses, ops, unmapped, approx, sends_made, unroutable) {
+                Some(b) => dests.push((b, *lvl)),
+                None => *unroutable += 1,
             }
-            let name = s(&m["name"]).map(str::to_string).unwrap_or_else(|| format!("Insert {insert}"));
-            let gain = (f(&m["volume"]).unwrap_or(12800.0) / 12800.0) as f32;
-            ops.push(Op::AddBus { bus: Bus { id, name, parent: None, gain, chain, sends: Vec::new(), muted: false,
-                                             silent: false } });
-            id
-        }))
+        }
+        let (parent, sends): (Option<BusId>, Vec<(BusId, f32)>) = if to_master || dests.is_empty() { (None, dests) }
+            else { (Some(dests[0].0), dests[1..].to_vec()) };
+        *sends_made += sends.len();
+        let id = BusId(busses.len() as u64 + 1);
+        busses.insert(insert, id);
+        let mut chain = Vec::new();
+        for slot in m["slots"].as_array().into_iter().flatten() {
+            let plug = s(&slot["plugin"]).unwrap_or("");
+            let label = if plug == "Fruity Wrapper" { s(&slot["name"]).unwrap_or("a plugin") } else { plug };
+            match effect_for(plug) {
+                Some((kind, how)) => {
+                    if how != "exact kind" && !approx.iter().any(|a| a.starts_with(plug)) { approx.push(format!("{plug}: {how}")); }
+                    chain.push(Effect { kind: kind.into(), params: BTreeMap::new(), enabled: slot["enabled"].as_bool().unwrap_or(true) });
+                }
+                None => *unmapped.entry(label.to_string()).or_default() += 1,
+            }
+        }
+        let name = s(&m["name"]).map(str::to_string).unwrap_or_else(|| format!("Insert {insert}"));
+        let gain = (f(&m["volume"]).unwrap_or(12800.0) / 12800.0) as f32;
+        ops.push(Op::AddBus { bus: Bus { id, name, parent, gain, chain,
+            sends: sends.into_iter().map(|(to, level)| studio_core::Send { to, level, pre_fader: false }).collect(),
+            muted: false, silent: false } });
+        Some(id)
+    }
+    let mut bus_for = |insert: i64, ops: &mut Vec<Op>| -> Option<BusId> {
+        make(insert, 0, &mixer, &mut busses, ops, &mut unmapped, &mut approx, &mut sends_made, &mut unroutable)
     };
 
     // ── the playlist ────────────────────────────────────────────────────
@@ -335,18 +380,28 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     report.insert(0, format!("{placed} clips on {} tracks, {} rack channels, {} rack patterns, {} busses; {:.0} BPM",
         p.tracks.len(), rack.channels.len(), rack.patterns.len(), p.busses.len(), bpm));
     if overflowed > 0 { report.push(format!("{overflowed} clip{} overlapped another on its FL track (FL allows it) -- moved to an overflow track, marked (2)", if overflowed == 1 { "" } else { "s" })); }
-    if automation_clips > 0 { report.push(format!("{automation_clips} automation clip{} not imported (PyFLP does not give their points)", if automation_clips == 1 { "" } else { "s" })); }
+    if automation_clips > 0 { report.push(format!("{automation_clips} automation clip{} not imported (their points are not read yet)", if automation_clips == 1 { "" } else { "s" })); }
     if !approx.is_empty() { report.push(format!("approximate effects: {}", approx.join("; "))); }
     report.push("every mapped effect is at Studio's DEFAULT settings -- the plugin parameters are not decoded".into());
     if !unmapped.is_empty() {
         report.push(format!("effects with no Studio counterpart, left out: {}",
             unmapped.iter().map(|(k, n)| if *n > 1 { format!("{k} x{n}") } else { k.clone() }).collect::<Vec<_>>().join(", ")));
     }
-    if let Some(master) = mixer.get(&-1) {
+    if let Some(master) = mixer.get(&0) {
         let slots: Vec<&str> = master["slots"].as_array().into_iter().flatten().filter_map(|x| s(&x["name"]).or(s(&x["plugin"]))).collect();
         if !slots.is_empty() { report.push(format!("master chain not imported: {}", slots.join(" -> "))); }
     }
-    report.push("routing between inserts not imported: every bus goes to master".into());
+    if has_routes {
+        let parented = p.busses.values().filter(|b| b.parent.is_some()).count();
+        report.push(format!("routing: {parented} bus{} output into another bus, {sends_made} send{} at FL's send levels; the rest feed the master{}",
+            if parented == 1 { "" } else { "ses" }, if sends_made == 1 { "" } else { "s" },
+            if unroutable > 0 { format!(" ({unroutable} route{} to an insert not in the file, left out)", if unroutable == 1 { "" } else { "s" }) } else { String::new() }));
+    } else {
+        report.push("no routing in this inventory (PyFLP's is not trustworthy -- use the native reader): every bus feeds the master".into());
+    }
+    let panned = mixer.values().filter(|m| f(&m["pan"]).is_some_and(|p| p != 0.0) && busses.contains_key(&i(&m["iid"]).unwrap_or(-1))).count();
+    if panned > 0 { report.push(format!("{panned} insert pan{} not imported (Studio busses have no pan)", if panned == 1 { "" } else { "s" })); }
+    report.push("faders are FL's value / 12800 as linear gain: FL's fader law is not linear, so levels are close, not exact".into());
     if !missing.is_empty() { report.push(format!("media not found beside the project: {}", missing.join(", "))); }
     Ok(Imported { project: p, rack, report })
 }
@@ -380,7 +435,7 @@ mod tests {
                 {"iid": 1, "name": "Beat", "notes": [
                     {"rack": 0, "pos": 0, "len": 24, "key": 60, "vel": 100},
                     {"rack": 0, "pos": 36, "len": 24, "key": 60, "vel": 100},
-                    {"rack": 1, "pos": 0, "len": 96, "key": 67, "vel": 64},
+                    {"rack": 1, "pos": 0, "len": 96, "key": "G5", "vel": 64},
                     {"rack": 2, "pos": 0, "len": 48, "key": 36, "vel": 100}]},
                 {"iid": 2, "name": "Long", "notes": [{"rack": 0, "pos": 0, "len": 24, "key": 60}, {"rack": 0, "pos": 1536 + 96, "len": 24, "key": 60}]}
             ],
@@ -393,9 +448,13 @@ mod tests {
                 {"iid": 3, "items": [{"kind": "PatternPLItem", "pattern": 2, "pos": 0, "len": 1728}]}
             ]}],
             "mixer": [
-                {"iid": -1, "slots": [{"plugin": "Fruity Limiter"}, {"plugin": "Fruity Wrapper", "name": "Ozone 8"}]},
-                {"iid": 1, "name": "Drums", "volume": 12800, "slots": [{"plugin": "Fruity Parametric EQ 2"}, {"plugin": "Soundgoodizer"}]},
-                {"iid": 2, "name": "Vox bus", "volume": 6400, "slots": [{"plugin": "Pitcher"}, {"plugin": "Fruity Wrapper", "name": "Neutron 3"}, {"plugin": "Fruity Chorus"}]}
+                {"iid": 0, "slots": [{"plugin": "Fruity Limiter"}, {"plugin": "Fruity Wrapper", "name": "Ozone 8"}]},
+                {"iid": 1, "name": "Drums", "volume": 12800, "routes": [{"to": 0, "level": 12800}, {"to": 3, "level": 6400}],
+                 "slots": [{"plugin": "Fruity Parametric EQ 2"}, {"plugin": "Soundgoodizer"}]},
+                {"iid": 2, "name": "Vox bus", "volume": 6400, "pan": -800, "routes": [{"to": 4, "level": 12800}, {"to": 3, "level": 3200}],
+                 "slots": [{"plugin": "Pitcher"}, {"plugin": "Fruity Wrapper", "name": "Neutron 3"}, {"plugin": "Fruity Chorus"}]},
+                {"iid": 3, "name": "Verb send", "routes": [{"to": 0, "level": 12800}], "slots": [{"plugin": "Fruity Reeverb 2"}]},
+                {"iid": 4, "name": "Vocal group", "routes": [{"to": 0, "level": 12800}]}
             ]
         })
     }
@@ -441,6 +500,33 @@ mod tests {
         let clips = im.project.track_clips(t.id);
         assert_eq!(clips.len(), 2);
         assert!((secs(clips[1].pos) - 8.0).abs() < 1e-6, "64 steps at 120 BPM = 8 s");
+    }
+
+    #[test]
+    fn keys_read_as_numbers_or_as_pyflps_names() {
+        assert_eq!(key_of(&json!(60)), Some(60));
+        assert_eq!(key_of(&json!("C5")), Some(60));
+        assert_eq!(key_of(&json!("F#6")), Some(78));
+        assert_eq!(key_of(&json!("A-1")), Some(-3));
+        assert_eq!(key_of(&json!("H2")), None);
+    }
+
+    #[test]
+    fn routing_becomes_parents_and_sends_at_fls_levels() {
+        let im = import(&inventory(), "demo", &probe).unwrap();
+        let p = &im.project;
+        let by = |n: &str| p.busses.values().find(|b| b.name == n).unwrap_or_else(|| panic!("no bus {n}: {:?}", p.busses.values().map(|b| &b.name).collect::<Vec<_>>()));
+        let (drums, vox, verb, group) = (by("Drums"), by("Vox bus"), by("Verb send"), by("Vocal group"));
+        assert_eq!(drums.parent, None, "feeds the master");
+        assert_eq!(drums.sends.len(), 1);
+        assert_eq!((drums.sends[0].to, drums.sends[0].level), (verb.id, 0.5), "and sends to the reverb at half");
+        assert_eq!(vox.parent, Some(group.id), "no master route: its first destination is its output");
+        assert_eq!((vox.sends[0].to, vox.sends[0].level), (verb.id, 0.25));
+        assert_eq!(group.parent, None);
+        assert_eq!(verb.chain[0].kind, "reverb", "a bus nothing but routing reaches is still made");
+        let r = im.report.join("\n");
+        assert!(r.contains("routing: 1 bus output into another bus, 2 sends"), "{r}");
+        assert!(r.contains("1 insert pan not imported"), "{r}");
     }
 
     #[test]

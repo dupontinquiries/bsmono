@@ -11,19 +11,28 @@ reverb, delay, autotune), 21 busses, overlapping clips, long patterns.
 
 ## What is here, and what is not
 
-* `*.flp.json` — the inventories `tools/flp_dump.py` read from the `.flp`s.
+* `*.flp.json` — the inventories the native reader (`flp_read`) takes from
+  the `.flp`s: channels, patterns and notes, the playlist, and the MIXER with
+  its routing (which insert feeds which, at what send level) and every
+  effect slot.
 * `*.import.txt` — exactly what the import approximated or left out. READ IT:
   the synths are STAND-INS (Omnisphere cannot be hosted and its sound is not
-  in the file), effects are at Studio's default settings, automation and the
-  master chain are not imported, hi-hat rolls faster than 16ths are merged.
-* NOT in git: the media (150 MB of the artist's recordings) and the
-  `.studio` files that point at it. They are delivered as a zip; to rebuild:
+  in the file -- the notes are all there, for an in-house synth to play),
+  effects are at Studio's default settings, automation and the master chain
+  are not imported, insert pans are not kept (Studio busses have none).
+* The mix: 27 busses, 12 feeding other busses, 6 sends at FL's levels.
+* NOT in git: the media -- the artist's recordings, as 48 kbit/s Opus
+  (92 MB of WAV -> 1.4 MB) -- and the `.studio` files that point at it. They
+  ship as a zip. To rebuild from the FL package:
 
-      unzip "Blue_Moon__feat__A_M__.zip" -d media           # the FL package
-      flpenv/bin/python tools/flp_dump.py media/untitled.flp > blue-moon.flp.json
-      cargo run -p studio-app --example flp_import -- blue-moon.flp.json media "Blue Moon (feat. A.M.)" media/blue-moon.studio
+      unzip "Blue_Moon__feat__A_M__.zip" -d media
+      for f in media/*.wav; do ffmpeg -i "$f" -c:a libopus -b:a 48k "${f%.wav}.opus"; done
+      cargo run -p studio-app --example flp_import -- media/untitled.flp media "Blue Moon (feat. A.M.)" media/blue-moon.studio
 
-  (`flpenv`: Python 3.10 + pyflp -- see the script's header for why 3.10.)
+No Python needed: the `.flp` is read natively. `tools/flp_dump.py` (PyFLP)
+is kept as a cross-check -- it agreed with the native reader on every
+channel, note, playlist item and fader, and disagreed on the effect slots,
+where PyFLP is wrong (see `flp_read`'s docs).
 
 The instrumental differs from the full song by six playlist tracks switched
 off in FL (the vocals); they import muted, not removed.
