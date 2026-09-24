@@ -81,6 +81,66 @@ fn tonemap(x: f32, peak: f32) -> f32 {
 /// Luminance the tonemap treats as SDR white, in nits. ITU reference white.
 pub const REFERENCE_WHITE_NITS: f32 = 203.0;
 
+/// HLG's nominal display peak for its OOTF (BT.2100: 1000 nits, gamma 1.2).
+const HLG_PEAK_NITS: f32 = 1000.0;
+
+/// Linear BT.2020 -> linear BT.709 (BT.2087). Applied only when the stream's
+/// matrix is BT.2020, used as the proxy for BT.2020 primaries: ColorInfo
+/// carries no separate primaries, and HDR10 and HLG broadcast are BT.2020 in
+/// both. Out-of-gamut results are clipped at 0, the simple choice.
+const BT2020_TO_BT709: [[f32; 3]; 3] = [
+    [1.6605, -0.5876, -0.0728],
+    [-0.1246, 1.1329, -0.0083],
+    [-0.0182, -0.1006, 1.1187],
+];
+
+/// sRGB encoding of linear light 0..1.
+pub fn srgb_oetf(l: f32) -> f32 {
+    let l = l.clamp(0.0, 1.0);
+    if l <= 0.0031308 {
+        12.92 * l
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// HDR R'G'B' (non-linear, as decoded) to SDR sRGB-encoded RGB. The one
+/// definition every path mirrors (GLSL in vidkit-egui, WGSL in vidkit-vk).
+///
+/// 1. EOTF to linear light with ITU reference white (203 nits) at 1.0: PQ
+///    from absolute nits; HLG through its OOTF (system gamma 1.2 at a
+///    1000-nit nominal peak), which puts its reference white (75% signal)
+///    at 1.0 too.
+/// 2. BT.2020 -> BT.709 primaries in linear light, when `bt2020`.
+/// 3. The soft-knee tonemap on the MAX channel, scaling all three by the
+///    same factor: per-channel roll-off shifts the hue of bright saturated
+///    colours (a bright orange drifts to yellow).
+/// 4. sRGB OETF. This step was missing: linear light went straight into a
+///    gamma-encoded buffer, and 18% grey rendered at 43/255 instead of ~118.
+pub fn hdr_to_sdr(rgb: [f32; 3], transfer: Transfer, bt2020: bool) -> [f32; 3] {
+    let lin = match transfer {
+        Transfer::Pq => rgb.map(|c| pq_eotf(c) * 10000.0 / REFERENCE_WHITE_NITS),
+        Transfer::Hlg => {
+            let scene = rgb.map(hlg_eotf);
+            // OOTF on luminance: Yd = Ys^1.2, applied as a common scale so
+            // hue is kept. BT.2020 luma weights.
+            let ys = 0.2627 * scene[0] + 0.6780 * scene[1] + 0.0593 * scene[2];
+            let k = if ys > 0.0 { ys.powf(0.2) } else { 0.0 };
+            scene.map(|c| c * k * HLG_PEAK_NITS / REFERENCE_WHITE_NITS)
+        }
+        Transfer::Sdr => return rgb,
+    };
+    let lin = if bt2020 {
+        let m = BT2020_TO_BT709;
+        [0, 1, 2].map(|r| (m[r][0] * lin[0] + m[r][1] * lin[1] + m[r][2] * lin[2]).max(0.0))
+    } else {
+        lin.map(|c| c.max(0.0))
+    };
+    let peak = lin[0].max(lin[1]).max(lin[2]);
+    let scale = if peak > 0.0 { tonemap(peak, 1.0) / peak } else { 0.0 };
+    lin.map(|c| srgb_oetf(c * scale))
+}
+
 /// Sample a plane with bilinear filtering at normalised coordinates, matching
 /// what `textureSampleLevel` does in the shader.
 ///
@@ -105,6 +165,31 @@ pub enum SampleFormat {
 }
 
 impl SampleFormat {
+    /// Limited-range constants in THIS format's normalisation: (black, luma
+    /// scale, chroma centre, chroma scale). 8-bit is 16/219/128/224; 10-bit
+    /// is 64/876/512/896. Using the 8-bit set on 10-bit data put neutral
+    /// chroma at 0.50196 instead of 0.5 -- invisible in SDR, but PQ's steep
+    /// curve made it a ~5% green cast on every 10-bit HDR frame (a neutral
+    /// 203-nit grey came out R 192.7, G 201.9, B 191.0 nits).
+    pub fn limited(self) -> (f32, f32, f32, f32) {
+        // The normalised value of a 10-bit code under each layout's read().
+        let (unit, max) = match self {
+            SampleFormat::U8 => return (16.0 / 255.0, 255.0 / 219.0, 128.0 / 255.0, 255.0 / 224.0),
+            SampleFormat::U16HighBits => (64.0 / 65535.0, 65535.0 / 64.0),
+            SampleFormat::U16LowBits10 => (1.0 / 1023.0, 1023.0),
+        };
+        (64.0 * unit, max / 876.0, 512.0 * unit, max / 896.0)
+    }
+
+    /// Full-range chroma centre in this format's normalisation.
+    pub fn centre(self) -> f32 {
+        match self {
+            SampleFormat::U8 => 0.5,
+            SampleFormat::U16HighBits => 512.0 * 64.0 / 65535.0,
+            SampleFormat::U16LowBits10 => 512.0 / 1023.0,
+        }
+    }
+
     pub fn bytes(self) -> usize {
         match self {
             SampleFormat::U8 => 1,
@@ -331,12 +416,11 @@ pub fn planes_to_rgba8_into(
             };
 
             let (yv, cb, cr) = match color.range {
-                Range::Limited => (
-                    (y_raw - 16.0 / 255.0) * (255.0 / 219.0),
-                    (cb_raw - 128.0 / 255.0) * (255.0 / 224.0),
-                    (cr_raw - 128.0 / 255.0) * (255.0 / 224.0),
-                ),
-                Range::Full => (y_raw, cb_raw - 0.5, cr_raw - 0.5),
+                Range::Limited => {
+                    let (black, ys, mid, cs) = fmt.limited();
+                    ((y_raw - black) * ys, (cb_raw - mid) * cs, (cr_raw - mid) * cs)
+                }
+                Range::Full => (y_raw, cb_raw - fmt.centre(), cr_raw - fmt.centre()),
             };
 
             let mut rgb = [
@@ -345,21 +429,10 @@ pub fn planes_to_rgba8_into(
                 coeffs[2][0] * yv + coeffs[2][1] * cb + coeffs[2][2] * cr,
             ];
 
-            match color.transfer {
-                Transfer::Pq => {
-                    for c in rgb.iter_mut() {
-                        *c = tonemap(pq_eotf(*c) * 10000.0, REFERENCE_WHITE_NITS);
-                    }
-                }
-                Transfer::Hlg => {
-                    for c in rgb.iter_mut() {
-                        *c = hlg_eotf(*c);
-                    }
-                }
-                // SDR stays gamma-encoded, as in the shader: the swapchain is
-                // non-linear sRGB and converting to linear and back would only
-                // add rounding.
-                Transfer::Sdr => {}
+            // SDR stays gamma-encoded: the swapchain is non-linear sRGB and
+            // converting to linear and back would only add rounding.
+            if color.transfer != Transfer::Sdr {
+                rgb = hdr_to_sdr(rgb, color.transfer, color.matrix == Matrix::Bt2020Ncl);
             }
 
             let o = (py * width + px) * 4;
@@ -662,5 +735,64 @@ mod tests {
             "bottom-left should be black, got {}",
             out[bottom_left]
         );
+    }
+
+    /// PQ code for `nits` absolute. Inverse of pq_eotf, for fixtures.
+    fn pq_encode(nits: f32) -> f32 {
+        const M1: f32 = 0.1593017578125;
+        const M2: f32 = 78.84375;
+        const C1: f32 = 0.8359375;
+        const C2: f32 = 18.8515625;
+        const C3: f32 = 18.6875;
+        let y = (nits / 10000.0).max(0.0).powf(M1);
+        ((C1 + C2 * y) / (1.0 + C3 * y)).powf(M2)
+    }
+
+    /// Render a flat PQ grey of `nits` through the CPU path (10-bit P010,
+    /// BT.2020, limited range) and return the 8-bit output.
+    fn pq_grey_out(nits: f32) -> u8 {
+        let e = pq_encode(nits);
+        let code = (64.0 + e * 876.0).round() as u16; // limited-range 10-bit luma
+        let c = ColorInfo { matrix: Matrix::Bt2020Ncl, transfer: Transfer::Pq, range: Range::Limited };
+        let out = planes_to_rgba8(&p010_planes(code, 512, 512), PlaneLayout::P010, c, 2, 2).unwrap();
+        out[0]
+    }
+
+    /// BT.2408: HDR reference white is 203 nits and should render as SDR
+    /// white; 18% grey at that exposure (36.5 nits) is linear 0.18, which
+    /// the display's sRGB curve encodes at ~118/255. The path wrote linear
+    /// light into a gamma-encoded buffer, so midtones came out far too dark;
+    /// only reference white was ever pinned.
+    #[test]
+    fn pq_midtones_land_where_bt2408_puts_them() {
+        let grey = pq_grey_out(0.18 * 203.0);
+        assert!((115..=121).contains(&grey), "18% grey rendered at {grey}/255, want ~118");
+        let white = pq_grey_out(203.0);
+        assert!(white > 235, "reference white at {white}/255");
+        // Highlights stay ordered and distinct (without the roll-off 600
+        // and 4000 nits both clip to 255). The knee curve leaves only ~11
+        // codes for 203..4000 nits -- the "placeholder" the WGSL notes admit;
+        // a display-referred curve (BT.2390) is the upgrade.
+        let (a, b) = (pq_grey_out(600.0), pq_grey_out(4000.0));
+        assert!(white < a && a < b, "{white} {a} {b}");
+        assert!(pq_grey_out(0.0) <= 1, "black stays black");
+    }
+
+    /// A 10-bit neutral grey is neutral, in SDR and -- where the old 8-bit
+    /// constants made it visibly green -- in PQ.
+    #[test]
+    fn ten_bit_neutral_grey_stays_neutral() {
+        for transfer in [Transfer::Sdr, Transfer::Pq, Transfer::Hlg] {
+            for code in [64u16, 300, 573, 800, 940] {
+                let c = ColorInfo { matrix: Matrix::Bt2020Ncl, transfer, range: Range::Limited };
+                let o = planes_to_rgba8(&p010_planes(code, 512, 512), PlaneLayout::P010, c, 2, 2).unwrap();
+                let spread = o[0].max(o[1]).max(o[2]) - o[0].min(o[1]).min(o[2]);
+                assert!(spread <= 1, "{transfer:?} code {code}: {:?}", &o[..3]);
+            }
+        }
+        // And 10-bit limited black and white hit the ends exactly in SDR.
+        let c = ColorInfo { matrix: Matrix::Bt709, transfer: Transfer::Sdr, range: Range::Limited };
+        assert_eq!(planes_to_rgba8(&p010_planes(64, 512, 512), PlaneLayout::P010, c, 2, 2).unwrap()[0], 0);
+        assert_eq!(planes_to_rgba8(&p010_planes(940, 512, 512), PlaneLayout::P010, c, 2, 2).unwrap()[0], 255);
     }
 }
