@@ -82,6 +82,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("aim") {
         return run_aim_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("spectate") {
+        return run_spectate();
+    }
     let (_instance, _adapter, device, queue) =
         make_device().ok_or_else(|| "No suitable GPU backend found (install mesa-vulkan-drivers for lavapipe)".to_string())?;
     let adapter_info = {
@@ -1399,5 +1402,104 @@ pub fn run_aim_shots() -> Result<(), String> {
         }
         shoot(&mut renderer, &mut vfx, &game, &format!("whiff_{k}.png"), None, close)?;
     }
+    Ok(())
+}
+
+/// The spectator on an all-bot match through the real draw path: 20 s of
+/// the director (reporting how smooth the camera was and how often it
+/// changed fights), then frames of the director, a followed cat and the
+/// free camera, with the spectator overlay.
+/// `CLAWBOUND_SHOTS=spectate clawbound-battleground --screenshot [--map pass]`
+pub fn run_spectate() -> Result<(), String> {
+    use crate::spectator::{Input, Spectator};
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut egui_renderer = egui_wgpu::Renderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, None, 1);
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("spectate"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let (blue, red) = crate::map::team_picks(4, &mut Rng::new(0x5EC7));
+    let mut game = Game::new_teams(&blue, &red);
+    game.blockers = scene.blockers.clone();
+    game.gods[0].ai = Some(crate::sim::AiBrain { lane: crate::consts::Lane::Mid, aggression: 0.8, state: crate::sim::AiState::Push, target: None, strafe_dir: 1.0, strafe_t: 0.0, buy_t: 1.0, wp: 0 });
+    let mut vfx = Vfx::default();
+    for _ in 0..(70 * 60) {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+    }
+    let mut sp = Spectator::new();
+    let dt = 1.0 / 60.0;
+    let (mut worst_turn, mut worst_step, mut switches) = (0.0f32, 0.0f32, 0);
+    let mut prev: Option<crate::intro::Shot> = None;
+    let mut focus = usize::MAX;
+    for k in 0..(20 * 60) {
+        game.tick(dt);
+        let ev: Vec<crate::sim::Event> = game.events.drain(..).collect();
+        vfx.update(dt, &ev, &game);
+        let shot = sp.update(&game, if k == 0 { Input { director: true, ..Default::default() } } else { Input::default() }, dt);
+        if let Some(p) = prev {
+            worst_turn = worst_turn.max((p.target - p.eye).normalize().dot((shot.target - shot.eye).normalize()).clamp(-1.0, 1.0).acos().to_degrees());
+            worst_step = worst_step.max((shot.eye - p.eye).length());
+        }
+        if sp.focus != focus {
+            switches += 1;
+            focus = sp.focus;
+        }
+        prev = Some(shot);
+    }
+    println!("director, 20 s: {} focus changes; worst view turn {:.2} deg/frame, worst eye travel {:.2} u/frame", switches - 1, worst_turn, worst_step);
+    let ctx = egui::Context::default();
+    let mut shoot = |renderer: &mut Renderer, vfx: &mut Vfx, game: &Game, sp: &Spectator, shot: crate::intro::Shot, name: &str| -> Result<(), String> {
+        let cam = Camera { eye: shot.eye, target: shot.target, fov_y: shot.fov_y };
+        renderer.clear_queues();
+        scene.draw(renderer, game, vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        let vp = cam.view_proj(W as f32 / H as f32);
+        let label = sp.label(game);
+        let mut textures = egui::TexturesDelta::default();
+        let mut out = None;
+        for k in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W as f32, H as f32))),
+                time: Some(k as f64 * 0.016),
+                ..Default::default()
+            };
+            let o = ctx.run(raw, |c| ui::draw_spectator_hud(c, game, vp, &label));
+            textures.append(o.textures_delta.clone());
+            out = Some(o);
+        }
+        let mut out = out.expect("ran");
+        out.textures_delta = textures;
+        draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name} ({})", label);
+        Ok(())
+    };
+    let shot = sp.update(&game, Input::default(), dt);
+    shoot(&mut renderer, &mut vfx, &game, &sp, shot, "spectate_director.png")?;
+    sp.update(&game, Input { cycle: 3, ..Default::default() }, dt);
+    let mut shot = shot;
+    for _ in 0..150 {
+        game.tick(dt);
+        game.events.clear();
+        vfx.update(dt, &[], &game);
+        shot = sp.update(&game, Input::default(), dt);
+    }
+    shoot(&mut renderer, &mut vfx, &game, &sp, shot, "spectate_follow.png")?;
+    sp.update(&game, Input { free: true, ..Default::default() }, dt);
+    for _ in 0..90 {
+        shot = sp.update(&game, Input { rise: 1.0, look: glam::Vec2::new(0.0, -0.004), ..Default::default() }, dt);
+    }
+    shoot(&mut renderer, &mut vfx, &game, &sp, shot, "spectate_free.png")?;
     Ok(())
 }

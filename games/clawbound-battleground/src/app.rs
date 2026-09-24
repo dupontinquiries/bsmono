@@ -81,6 +81,12 @@ struct AppState {
     /// The ambience's last params, faded to silence out of a match.
     #[cfg(feature = "audio")]
     audio_last: crate::audio::AudioParams,
+    /// Watching an all-bot match (`spectator`); None when playing.
+    spectator: Option<crate::spectator::Spectator>,
+    /// Spectator switches pressed since last frame (Tab, Z, X).
+    spec_cycle: i32,
+    spec_director: bool,
+    spec_free: bool,
     /// A prepared ability awaiting the attack button (`targeting`).
     targeting: crate::targeting::Targeting,
     /// The attack button as last frame saw it (for its press edge), and
@@ -394,6 +400,10 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         #[cfg(feature = "audio")]
         // silent until a match: the menu has no wind to fade from
         audio_last: crate::audio::AudioParams { master: 0.0, ..crate::audio::AudioParams::default() },
+        spectator: None,
+        spec_cycle: 0,
+        spec_director: false,
+        spec_free: false,
         targeting: Default::default(),
         attack_was: false,
         attack_eaten: false,
@@ -545,6 +555,24 @@ fn handle_window_event(s: &mut AppState, event: WindowEvent) {
                 s.skip_intro = true;
                 return;
             }
+            if state == ElementState::Pressed && !repeat && s.spectator.is_some() {
+                use winit::keyboard::{Key, NamedKey};
+                match &logical_key {
+                    Key::Named(NamedKey::Tab) => {
+                        s.spec_cycle += 1;
+                        return;
+                    }
+                    Key::Character(c) if c.eq_ignore_ascii_case("z") => {
+                        s.spec_director = true;
+                        return;
+                    }
+                    Key::Character(c) if c.eq_ignore_ascii_case("x") => {
+                        s.spec_free = true;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             let Some(b) = bind_of_key(&logical_key) else { return };
             match state {
                 ElementState::Pressed if !repeat => {
@@ -631,7 +659,14 @@ fn gather_controls(s: &mut AppState, dt: f32) {
         return;
     }
     if c.menu && s.capturing.is_none() {
-        if s.targeting.slot.is_some() {
+        if s.spectator.is_some() {
+            // Esc leaves the match being watched
+            s.spectator = None;
+            s.game = None;
+            s.intro = None;
+            s.screen = Screen::Menu;
+            return;
+        } else if s.targeting.slot.is_some() {
             // Esc puts a prepared ability away before it opens anything
             s.targeting.slot = None;
         } else if s.ui.shop_open {
@@ -747,6 +782,20 @@ fn switch_map(s: &mut AppState, m: crate::map::MapId) {
     let old = s.scene.take();
     s.scene = Some(crate::scene::switch_world(&mut s.renderer, old, m));
     eprintln!("[clawbound] switched to {} in {:.1} s ({} meshes resident)", m.name(), t.elapsed().as_secs_f32(), s.renderer.mesh_count());
+}
+
+/// Watch a match: every cat a bot, on the map picked on the select screen,
+/// the intro first, then the director. Esc leaves.
+fn start_spectate(s: &mut AppState) {
+    s.spectator = None;
+    start_game(s);
+    if let Some(g) = s.game.as_mut() {
+        let lane = g.gods[0].ai.as_ref().map(|b| b.lane).unwrap_or(crate::consts::Lane::Mid);
+        g.gods[0].ai = Some(crate::sim::AiBrain { lane, aggression: 0.8, state: crate::sim::AiState::Push, target: None, strafe_dir: 1.0, strafe_t: 0.0, buy_t: 1.0, wp: 0 });
+        g.gods[0].is_player = false;
+    }
+    s.spectator = Some(crate::spectator::Spectator::new());
+    s.screen = Screen::Playing;
 }
 
 fn start_game(s: &mut AppState) {
@@ -874,6 +923,8 @@ fn render(s: &mut AppState) {
         let stalk_on = s.stalk_on;
         let attack_eaten = s.attack_eaten || s.targeting.eats_attack();
         if let Some(g) = s.game.as_mut() {
+            let spectating = s.spectator.is_some();
+            if !spectating {
             // A leap goes where the cat is being steered; standing still,
             // where the camera looks. `leap::plan` turns that direction into
             // a place -- the rock ahead, if there is one.
@@ -919,6 +970,7 @@ fn render(s: &mut AppState) {
                     g.cast_queue.push((0, slot, cast_aim));
                 }
             }
+            } // !spectating
             // The intro runs instead of the sim: cats appear on its beats,
             // the fanfare starts on the first spawn, and play begins when
             // it ends or is skipped.
@@ -963,11 +1015,14 @@ fn render(s: &mut AppState) {
                 // analogue input the magnitude IS the intent, and the sim is
                 // about to throw it away by normalising.
                 let gentle = walk_to.is_none() && c.mv.length() > 0.08 && c.mv.length() < 0.5;
-                let gi = &mut g.gods[0];
-                gi.sneak = stalk_on || c.sneak_held || gentle;
-                gi.move_dir = mv;
-                // the click that fired a prepared ability is not an attack
-                gi.attack_held = c.attack && !attack_eaten;
+                // a spectated match's god 0 is a bot like the rest
+                if s.spectator.is_none() {
+                    let gi = &mut g.gods[0];
+                    gi.sneak = stalk_on || c.sneak_held || gentle;
+                    gi.move_dir = mv;
+                    // the click that fired a prepared ability is not an attack
+                    gi.attack_held = c.attack && !attack_eaten;
+                }
                 g.tick(1.0 / 60.0);
                 let events: Vec<crate::sim::Event> = g.events.drain(..).collect();
                 for e in &events {
@@ -1018,6 +1073,19 @@ fn render(s: &mut AppState) {
                 Some(it) => {
                     let f = it.frame();
                     Camera { eye: f.shot.eye, target: f.shot.target, fov_y: f.shot.fov_y }
+                }
+                None if s.spectator.is_some() => {
+                    let inp = crate::spectator::Input {
+                        cycle: std::mem::take(&mut s.spec_cycle),
+                        director: std::mem::take(&mut s.spec_director),
+                        free: std::mem::take(&mut s.spec_free),
+                        mv: s.controls.mv,
+                        rise: -s.controls.zoom,
+                        look: glam::Vec2::new(s.controls.look.x, -s.controls.look.y),
+                    };
+                    let g = s.game.as_ref().unwrap();
+                    let shot = s.spectator.as_mut().unwrap().update(g, inp, dt_frame);
+                    Camera { eye: shot.eye, target: shot.target, fov_y: shot.fov_y }
                 }
                 None => Camera {
                     eye: target - dir * s.cam_dist + jolt * 0.5,
@@ -1104,6 +1172,7 @@ fn render(s: &mut AppState) {
     let mut play = false;
     let mut quit = false;
     let mut open_lan = false;
+    let mut spectate = false;
     let mut lan_action = crate::lanlobby::Action::None;
     let mut locked_in = false;
     let mut again = false;
@@ -1113,7 +1182,7 @@ fn render(s: &mut AppState) {
     let output = s.egui_ctx.run(raw_input, |ctx| {
         match s.screen {
             Screen::Menu => {
-                ui::draw_menu(ctx, &mut play, &mut quit, &mut open_lan);
+                ui::draw_menu(ctx, &mut play, &mut quit, &mut open_lan, &mut spectate);
                 ui::draw_controls_button(ctx, &mut open_controls);
             }
             Screen::Select => ui::draw_select(ctx, &mut s.ui, &mut locked_in),
@@ -1127,6 +1196,8 @@ fn render(s: &mut AppState) {
                 if let Some(g) = s.game.as_mut() {
                     if let Some(it) = s.intro.as_ref() {
                         ui::draw_intro_overlay(ctx, &it.frame().overlay);
+                    } else if let Some(sp) = s.spectator.as_ref() {
+                        ui::draw_spectator_hud(ctx, g, vp, &sp.label(g));
                     } else if s.ui.shop_open {
                         ui::draw_shop(ctx, g, 0, &mut s.ui);
                     } else {
@@ -1231,6 +1302,9 @@ fn render(s: &mut AppState) {
             }
         }
         crate::lanlobby::Action::None => {}
+    }
+    if spectate {
+        start_spectate(s);
     }
     if play {
         s.screen = Screen::Select;
