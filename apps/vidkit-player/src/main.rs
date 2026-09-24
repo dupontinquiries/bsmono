@@ -149,7 +149,14 @@ struct Player {
     /// Active watch plan; empty plays everything.
     plan: Vec<vidkit_relevance::Section>,
     export_status: Arc<Mutex<Option<String>>>,
+    /// A speed the transport asked for and when it last changed. Applied
+    /// once it has been still for SPEED_SETTLE: a speed change restarts both
+    /// decoders, and a vertical drag passes through a detent every few
+    /// pixels.
+    speed_pending: Option<(f64, Instant)>,
 }
+
+const SPEED_SETTLE: Duration = Duration::from_millis(250);
 
 /// File-picker state. Navigation is uikit-egui's PathPicker; the file list and
 /// the filter are ours, because `Listing` carries directories only.
@@ -302,6 +309,7 @@ impl Player {
             hits: Vec::new(),
             plan: Vec::new(),
             export_status: Arc::new(Mutex::new(None)),
+            speed_pending: None,
         };
         // A file named on the command line gets its transcript too.
         if let Some(p) = me.path.clone().filter(|_| me.engine.is_some()) {
@@ -327,6 +335,22 @@ impl Player {
         // Volume every tick: one atomic store, read by the audio thread per
         // block. The transport held a volume that nothing ever applied.
         engine.set_volume(self.transport.volume);
+        let want = self.transport.speed as f64;
+        if (want - engine.speed()).abs() > 1e-3 {
+            match self.speed_pending {
+                Some((v, since)) if (v - want).abs() < 1e-3 => {
+                    if since.elapsed() >= SPEED_SETTLE {
+                        self.speed_pending = None;
+                        if let Err(e) = engine.set_speed(want) {
+                            self.gpu_error = Some(format!("speed change failed: {e}"));
+                        }
+                    }
+                }
+                _ => self.speed_pending = Some((want, Instant::now())),
+            }
+        } else {
+            self.speed_pending = None;
+        }
         let tick = engine.tick();
         self.transport.position = engine.position();
         // Say what is timing playback. On a device, "wall clock (no audio
@@ -1235,7 +1259,7 @@ fn probed(
 /// edge, hardware decode where the machine has it, audio at 48 kHz stereo.
 fn file_opener(p: PathBuf) -> playback::Opener {
     let cache = std::sync::OnceLock::new();
-    Box::new(move |from| {
+    Box::new(move |from, speed| {
         let pr = probed(&cache, || decode::probe(&p))?;
         let v = decode::FfmpegFrames::open_probed(
             &decode::VideoInput::file(&p),
@@ -1244,7 +1268,7 @@ fn file_opener(p: PathBuf) -> playback::Opener {
             from,
             decode::accel_for(&pr.codec),
         )?;
-        let a = decode::AudioStream::open(&p.to_string_lossy(), 48_000, 2, from).ok();
+        let a = decode::AudioStream::open(&p.to_string_lossy(), 48_000, 2, from, speed).ok();
         Ok((v, a))
     })
 }
@@ -1253,7 +1277,7 @@ fn file_opener(p: PathBuf) -> playback::Opener {
 /// URLs, each with the headers, each fetched by its own process.
 fn stream_opener(input: decode::StreamingInput, cap: Option<u32>) -> playback::Opener {
     let cache = std::sync::OnceLock::new();
-    Box::new(move |from| {
+    Box::new(move |from, speed| {
         let pr = probed(&cache, || decode::probe_input(&input.video_url, &input.headers))?;
         let v = decode::FfmpegFrames::open_probed(
             &decode::VideoInput::url(&input.video_url, &input.headers),
@@ -1262,7 +1286,7 @@ fn stream_opener(input: decode::StreamingInput, cap: Option<u32>) -> playback::O
             from,
             decode::accel_for(&pr.codec),
         )?;
-        let a = decode::AudioStream::open_streaming(&input, 48_000, 2, from).ok();
+        let a = decode::AudioStream::open_streaming(&input, 48_000, 2, from, speed).ok();
         Ok((v, a))
     })
 }

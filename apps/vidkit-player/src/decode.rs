@@ -1153,6 +1153,40 @@ pub fn audio_args(input: &str, rate: u32, channels: u16, from: Duration) -> Vec<
     a
 }
 
+/// `atempo` factors whose product is `speed`, each within 0.5..=2.0.
+///
+/// ffmpeg before 4.3 accepts only that range per instance, and a phone's
+/// distribution may ship one that old; chaining two covers 0.25..4, the
+/// range the speed control allows. `None` at 1.0: no filter, no cost.
+pub fn atempo_chain(speed: f64) -> Option<String> {
+    let s = speed.clamp(0.25, 4.0);
+    if (s - 1.0).abs() < 1e-3 {
+        return None;
+    }
+    let mut factors = Vec::new();
+    let mut rest = s;
+    while rest > 2.0 {
+        factors.push(2.0);
+        rest /= 2.0;
+    }
+    while rest < 0.5 {
+        factors.push(0.5);
+        rest /= 0.5;
+    }
+    factors.push(rest);
+    Some(factors.iter().map(|f| format!("atempo={f:.4}")).collect::<Vec<_>>().join(","))
+}
+
+/// Insert the tempo filter before the output (`-`, always last).
+pub fn with_tempo(mut args: Vec<String>, speed: f64) -> Vec<String> {
+    if let Some(chain) = atempo_chain(speed) {
+        let at = args.len().saturating_sub(1);
+        args.insert(at, chain);
+        args.insert(at, "-af".into());
+    }
+    args
+}
+
 /// Audio-only ffmpeg arguments for a STREAMED source: the audio URL when the
 /// site serves audio separately (YouTube does), the video URL otherwise, with
 /// the resolved headers -- the signed URL is bound to them, and without them
@@ -1183,13 +1217,15 @@ pub fn audio_streaming_args(input: &StreamingInput, rate: u32, channels: u16, fr
 }
 
 impl AudioStream {
-    pub fn open(input: &str, rate: u32, channels: u16, from: Duration) -> Result<Self, String> {
-        Self::open_args(audio_args(input, rate, channels, from), rate, channels)
+    /// `speed` is applied by ffmpeg's `atempo` (pitch kept); 1.0 adds no
+    /// filter at all.
+    pub fn open(input: &str, rate: u32, channels: u16, from: Duration, speed: f64) -> Result<Self, String> {
+        Self::open_args(with_tempo(audio_args(input, rate, channels, from), speed), rate, channels)
     }
 
     /// Audio from a streamed source -- see `audio_streaming_args`.
-    pub fn open_streaming(input: &StreamingInput, rate: u32, channels: u16, from: Duration) -> Result<Self, String> {
-        Self::open_args(audio_streaming_args(input, rate, channels, from), rate, channels)
+    pub fn open_streaming(input: &StreamingInput, rate: u32, channels: u16, from: Duration, speed: f64) -> Result<Self, String> {
+        Self::open_args(with_tempo(audio_streaming_args(input, rate, channels, from), speed), rate, channels)
     }
 
     fn open_args(args: Vec<String>, rate: u32, channels: u16) -> Result<Self, String> {
@@ -1489,6 +1525,24 @@ mod audio_tests {
         assert!(a.windows(2).any(|w| w[0] == "-ac" && w[1] == "2"));
     }
 
+    /// Every factor within old ffmpeg's 0.5..2 limit, the product the speed,
+    /// and no filter at all at 1x.
+    #[test]
+    fn atempo_chains_cover_the_whole_speed_range() {
+        assert_eq!(atempo_chain(1.0), None);
+        for &speed in &[0.25, 0.3, 0.5, 0.75, 1.05, 1.5, 2.0, 2.5, 3.0, 4.0] {
+            let c = atempo_chain(speed).unwrap_or_else(|| panic!("{speed}"));
+            let f: Vec<f64> = c.split(',').map(|x| x.trim_start_matches("atempo=").parse().unwrap()).collect();
+            assert!(!f.is_empty());
+            assert!(f.iter().all(|x| (0.5..=2.0).contains(x)), "{speed}: {c}");
+            let prod: f64 = f.iter().product();
+            assert!((prod - speed).abs() < 1e-3, "{speed}: {c} = {prod}");
+        }
+        let a = with_tempo(audio_args("x", 48_000, 2, Duration::ZERO), 2.0);
+        assert_eq!(a.last().unwrap(), "-", "output stays last");
+        assert_eq!(a[a.len() - 3], "-af");
+    }
+
     /// Audio must seek with the video, or a scrub desynchronises the two.
     #[test]
     fn the_seek_flag_precedes_the_input_here_too() {
@@ -1532,7 +1586,7 @@ mod audio_tests {
             return;
         }
 
-        let mut a = AudioStream::open(&path.to_string_lossy(), 48_000, 2, Duration::ZERO)
+        let mut a = AudioStream::open(&path.to_string_lossy(), 48_000, 2, Duration::ZERO, 1.0)
             .expect("open audio");
         let block = a.next_block().expect("a block of pcm").to_vec();
         assert!(!block.is_empty());
@@ -1561,6 +1615,27 @@ mod audio_tests {
             diff * 10 < expected as i64,
             "got {total} bytes, expected about {expected} — wrong sample width?"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// atempo really compresses the stream: 2 s of media at 2x is 1 s of
+    /// PCM, at 0.5x 4 s -- the only place tempo is observable, since an
+    /// engine-level test ends with the video either way.
+    #[test]
+    fn speed_changes_how_much_audio_the_stream_yields() {
+        if !have_ffmpeg() { return; }
+        let path = std::env::temp_dir().join(format!("vidkit-tempo-{}.wav", std::process::id()));
+        assert!(Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2"]).arg(&path).status().unwrap().success());
+        let secs = |speed: f64| {
+            let mut a = AudioStream::open(&path.to_string_lossy(), 48_000, 2, Duration::ZERO, speed).unwrap();
+            let mut n = 0usize;
+            while let Some(b) = a.next_block() { n += b.len(); }
+            n as f64 / (48_000.0 * 4.0)
+        };
+        let (one, two, half) = (secs(1.0), secs(2.0), secs(0.5));
+        assert!((one - 2.0).abs() < 0.1, "1x: {one}");
+        assert!((two - 1.0).abs() < 0.1, "2x: {two}");
+        assert!((half - 4.0).abs() < 0.15, "0.5x: {half}");
         let _ = std::fs::remove_file(&path);
     }
 

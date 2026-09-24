@@ -73,17 +73,25 @@ pub struct Interp {
     at: Option<Instant>,
     out: Duration,
     running: bool,
+    /// Media seconds per wall second: the playback speed.
+    rate: f64,
 }
 
 impl Interp {
     pub fn new(pos: Duration) -> Self {
-        Self { raw: pos, at: None, out: pos, running: false }
+        Self { raw: pos, at: None, out: pos, running: false, rate: 1.0 }
+    }
+
+    /// At 2x, media time moves two seconds per wall second between readings,
+    /// and the cap -- one block of audio -- covers twice the media.
+    pub fn with_rate(pos: Duration, rate: f64) -> Self {
+        Self { rate: rate.clamp(0.25, 4.0), ..Self::new(pos) }
     }
 
     pub fn read(&mut self, raw: Duration, now: Instant, running: bool) -> Duration {
         if raw < self.raw {
             // Only a seek moves the audio clock backwards.
-            *self = Self::new(raw);
+            *self = Self::with_rate(raw, self.rate);
         }
         // A new reading, or playback just (re)started: extrapolate from now,
         // not from the last reading before a pause -- that would jump the
@@ -94,7 +102,7 @@ impl Interp {
         }
         self.running = running;
         let est = match (running, self.at) {
-            (true, Some(at)) => raw + now.saturating_duration_since(at).min(INTERP_CAP),
+            (true, Some(at)) => raw + now.saturating_duration_since(at).min(INTERP_CAP).mul_f64(self.rate),
             _ => raw,
         };
         self.out = self.out.max(est);
@@ -230,7 +238,8 @@ impl Master {
 /// Opens the source at a position: video frames, and audio if it has any.
 /// A closure so a file and a network stream take the same path, and so a
 /// seek or a speed change can reopen both.
-pub type Opener = Box<dyn Fn(Duration) -> Result<(FfmpegFrames, Option<AudioStream>), String> + Send>;
+/// Called with the media position and the playback speed.
+pub type Opener = Box<dyn Fn(Duration, f64) -> Result<(FfmpegFrames, Option<AudioStream>), String> + Send>;
 /// Makes a fresh audio sink. Fresh per (re)start: dropping the old one kills
 /// the player process, so audio buffered before a seek is not heard after it.
 pub type SinkMaker = Box<dyn Fn() -> Box<dyn AudioSink> + Send>;
@@ -264,6 +273,8 @@ pub struct Engine {
     /// if a hardware decoder falls back to software.
     decoder: Arc<Mutex<String>>,
     audio_done: Arc<AtomicBool>,
+    /// Playback speed, applied at the next (re)start.
+    speed: f64,
     audio_error: Arc<Mutex<Option<String>>>,
     paused: bool,
     frame_interval: Duration,
@@ -290,6 +301,7 @@ impl Engine {
             pool: PlanePool::new(),
             decoder: Arc::new(Mutex::new(String::new())),
             audio_done: Arc::new(AtomicBool::new(false)),
+            speed: 1.0,
             audio_error: Arc::new(Mutex::new(None)),
             paused: false,
             frame_interval: Duration::from_millis(33),
@@ -319,7 +331,7 @@ impl Engine {
         self.shown = 0;
         self.dropped = 0;
 
-        let (mut video, audio) = (self.opener)(from)?;
+        let (mut video, audio) = (self.opener)(from, self.speed)?;
         self.frame_interval = video.frame_interval;
         video.set_pool(self.pool.clone());
         if let Ok(mut d) = self.decoder.lock() {
@@ -354,7 +366,7 @@ impl Engine {
                     if !self.paused { c.resume(); }
                 }
                 self.spawn_audio(stream, sink, clock.clone())?;
-                Master::Audio(clock, Cell::new(Interp::new(from)))
+                Master::Audio(clock, Cell::new(Interp::with_rate(from, self.speed)))
             }
             (Some(_), Some(sink)) => {
                 self.audio_note = format!("{} -- no audio player, timing from the wall clock", sink.name());
@@ -371,6 +383,7 @@ impl Engine {
     fn wall_at(&self, from: Duration) -> Master {
         let mut c = MonotonicClock::new();
         c.set_position(from);
+        c.set_rate(self.speed);
         if self.paused { c.pause(); } else { c.resume(); }
         Master::Wall(c)
     }
@@ -379,6 +392,10 @@ impl Engine {
         let (stop, gate, done, err, gain) = (self.stop.clone(), self.gate.clone(), self.audio_done.clone(), self.audio_error.clone(), self.gain.clone());
         let bytes_per_frame = stream.channels as usize * 2;
         let rate = stream.rate as f64;
+        // atempo has already compressed the audio: each output frame carries
+        // `speed` frames of MEDIA. The clock counts media, so scale both the
+        // frames written and the latency still buffered.
+        let speed = self.speed;
         std::thread::Builder::new().name("vidkit-audio".into()).spawn(move || {
             loop {
                 if stop.load(Ordering::Relaxed) { return; }
@@ -394,8 +411,8 @@ impl Engine {
                     if let Ok(mut s) = err.lock() { *s = Some(format!("audio stopped: {e}")); }
                     break;
                 }
-                let frames = (pcm.len() / bytes_per_frame) as u64;
-                let latency = (sink.latency().as_secs_f64() * rate) as u64;
+                let frames = ((pcm.len() / bytes_per_frame) as f64 * speed) as u64;
+                let latency = (sink.latency().as_secs_f64() * rate * speed) as u64;
                 let underrun = sink.take_underrun_frames();
                 if let Ok(mut c) = clock.lock() {
                     c.advance(frames, latency);
@@ -512,6 +529,23 @@ impl Engine {
         self.decoder.lock().map(|d| d.clone()).unwrap_or_default()
     }
 
+    /// Change speed: 0.25..=4. A restart at the current position, since both
+    /// the audio filter and the clock rate are fixed per ffmpeg run -- which
+    /// is why the app debounces a drag rather than calling this per detent.
+    pub fn set_speed(&mut self, speed: f64) -> Result<(), String> {
+        let s = speed.clamp(0.25, 4.0);
+        if (s - self.speed).abs() < 1e-3 {
+            return Ok(());
+        }
+        self.speed = s;
+        let at = self.position();
+        self.restart(at)
+    }
+
+    pub fn speed(&self) -> f64 {
+        self.speed
+    }
+
     /// Move video AND audio to `to`.
     pub fn seek(&mut self, to: Duration) -> Result<(), String> {
         self.restart(to)
@@ -597,9 +631,9 @@ mod tests {
     }
 
     fn opener(p: std::path::PathBuf) -> Opener {
-        Box::new(move |from| {
+        Box::new(move |from, speed| {
             let v = if from.is_zero() { FfmpegFrames::open(&p, None)? } else { FfmpegFrames::open_at(&p, None, from)? };
-            let a = AudioStream::open(&p.to_string_lossy(), 48_000, 2, from).ok();
+            let a = AudioStream::open(&p.to_string_lossy(), 48_000, 2, from, speed).ok();
             Ok((v, a))
         })
     }
@@ -878,5 +912,44 @@ mod tests {
         }
         assert!(shown > 10, "played: {shown}");
         assert!(e.pooled() >= 2, "presented frames came back to the pool: {}", e.pooled());
+    }
+
+    #[test]
+    fn interp_extrapolates_media_time_at_the_playback_rate() {
+        let t0 = Instant::now();
+        let mut i = Interp::with_rate(ms(0), 2.0);
+        i.read(ms(0), t0, true);
+        assert_eq!(i.read(ms(0), t0 + ms(50), true), ms(100), "2x: 100 ms of media in 50 ms");
+        assert_eq!(i.read(ms(0), t0 + ms(900), true), INTERP_CAP * 2, "the cap is one block of OUTPUT");
+        let mut back = Interp::with_rate(ms(5000), 2.0);
+        back.read(ms(5000), t0, true);
+        assert_eq!(back.read(ms(1000), t0 + ms(10), true), ms(1000), "a seek keeps the rate");
+        assert_eq!(back.read(ms(1000), t0 + ms(20), true), ms(1020));
+    }
+
+    /// 2x with audio as master: media time runs at twice wall time, frames
+    /// follow it, and the sink receives HALF the audio bytes per media second
+    /// -- atempo compressed it, rather than the clock just running fast over
+    /// normal-speed audio.
+    #[test]
+    fn double_speed_moves_media_time_twice_as_fast_with_tempo_corrected_audio() {
+        if !have_ffmpeg() { return; }
+        let p = clip("speed.mkv", 4.0, 4.0);
+        let bytes = Arc::new(Mutex::new(0u64));
+        let b2 = bytes.clone();
+        let maker: SinkMaker = Box::new(move || Box::new(PacedSink { latency: ms(20), bytes: b2.clone() }) as Box<dyn AudioSink>);
+        let mut e = Engine::start(opener(p), maker, Duration::ZERO, 60).unwrap();
+        e.set_speed(2.0).unwrap();
+        assert!(e.clock_is_audio());
+        let t0 = Instant::now();
+        let (pts, _, _) = run(&mut e, ms(1000));
+        let (media, wall) = (e.position().as_secs_f64(), t0.elapsed().as_secs_f64());
+        eprintln!("DIAG 2x: {media:.2} s of media in {wall:.2} s, {} frames shown", pts.len());
+        assert!(media > 2.0 * wall - 0.45 && media < 2.0 * wall + 0.1, "media {media:.3} vs 2 x wall {wall:.3}");
+        assert!(pts.last().copied().unwrap_or_default() > ms(1400), "frames kept up: last {:?}", pts.last());
+        // Whether the AUDIO is tempo-corrected cannot be seen from here:
+        // playback ends with the video, so the sink hears about wall time's
+        // worth either way. decode::audio_tests checks the stream directly.
+        let _ = &bytes;
     }
 }

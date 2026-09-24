@@ -398,9 +398,9 @@ mod tests {
             Box::new(RingSink::new(shared, Box::new(Sim { paused }), 48_000, 2, "sim".into())) as Box<dyn AudioSink>
         });
         let p2 = p.clone();
-        let opener: crate::playback::Opener = Box::new(move |from| {
+        let opener: crate::playback::Opener = Box::new(move |from, speed| {
             let v = crate::decode::FfmpegFrames::open_at(&p2, None, from)?;
-            let a = crate::decode::AudioStream::open(&p2.to_string_lossy(), 48_000, 2, from).ok();
+            let a = crate::decode::AudioStream::open(&p2.to_string_lossy(), 48_000, 2, from, speed).ok();
             Ok((v, a))
         });
         let mut e = crate::playback::Engine::start(opener, maker, Duration::ZERO, 60).unwrap();
