@@ -312,8 +312,10 @@ the model, undo, and convergence. What does not exist yet, in rough order:
    composites them -- blend modes, opacity, and a reframed layer showing
    the track under it -- with each mode's pixels checked against the
    compositor. What the export still cannot do is named per cut by
-   `edit::unsupported` rather than dropped: rotation and retiming; and
-   true dissolves are not built (two abutting fades dip through black).
+   `edit::unsupported` rather than dropped: rotation and retiming. A
+   clip's fade is an opacity ramp, so a fade over a clip on a lower track
+   is a cross-dissolve into it (and over nothing, a fade to black) -- in
+   the preview and the export alike.
 2. **Audio render graph** — `studio_audio::mixdown` mixes tracks, applies
    clip and bus effect chains, handles sends/mute/solo, and is real and
    tested (72 tests) — `studio-live`'s own
@@ -369,7 +371,7 @@ This closes every item that was on this list when this section was last
 written honestly. What's real and load-bearing now, named precisely rather
 than left as a vague "not built yet": real hardware verification for
 `studio-io` (item 3), the network half of DHT publishing (item 4), and
-dissolves and rotation in the EXPORT (item 1's remaining pieces; realtime
+rotation in the EXPORT (item 1's remaining piece; realtime
 video playback in the viewport, rather than a seek per frame, is the other). None of those are guesses — each is
 a concrete next step pinned by a test or a doc comment that says exactly
 what it's waiting on. Item 2's own remaining piece — a streaming render

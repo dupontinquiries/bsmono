@@ -100,12 +100,15 @@ pub struct LayerSpec {
     pub kaleido: Option<studio_video::kaleido::Kaleido>,
     /// The clip's style transfer, applied as its LUT after the grade.
     pub style: Option<studio_video::style::Transfer>,
-    /// The clip's fade at the playhead: 1.0 full picture, 0.0 black.
+    /// The clip's fade at the playhead: 1.0 fully there, 0.0 gone. An
+    /// OPACITY, multiplied into the layer's when it is painted
+    /// ([`LayerSpec::paint_opacity`]): over nothing that fades to black, over
+    /// a lower track's clip it dissolves into it -- the export's rule.
     pub fade: f32,
 }
 
-/// Brightness of a clip at `t` under its fade in / out to black: linear, as
-/// ffmpeg's `fade` filter is, so the preview dims exactly as the file does.
+/// A clip's opacity at `t` under its fade in / out: linear, as ffmpeg's
+/// `fade` filter is, so the preview fades exactly as the file does.
 pub fn fade_gain(pos: Ticks, end: Ticks, fade_in: Ticks, fade_out: Ticks, t: Ticks) -> f32 {
     let mut g = 1.0f64;
     if fade_in.0 > 0 {
@@ -118,17 +121,15 @@ pub fn fade_gain(pos: Ticks, end: Ticks, fade_in: Ticks, fade_out: Ticks, t: Tic
 }
 
 impl LayerSpec {
-    /// Grade a fetched frame in place.
+    /// The opacity this layer is painted with: the blend dial times the fade.
+    /// (The transform's own opacity the compositor multiplies in itself.)
+    pub fn paint_opacity(&self) -> f32 { self.opacity * self.fade }
+
+    /// Grade a fetched frame in place. The fade is NOT applied here: it is an
+    /// opacity, applied when the graded layer is painted -- the export's order
+    /// since c20, so a faded-out clip is black even under a grade that lifts
+    /// blacks (before c20 both lifted it; now neither does).
     pub fn grade(&self, px: &mut [u8]) {
-        // THE FADE FIRST, as the export does it: there it runs on the source
-        // before trim (so a clip split by a higher track fades correctly),
-        // which puts it before the grade. The consequence is shared by both,
-        // and stated: a grade that lifts blacks lifts a faded-out picture too.
-        if self.fade < 1.0 {
-            for v in px.iter_mut() {
-                *v = (*v as f32 * self.fade + 0.5) as u8;
-            }
-        }
         if let Some(c) = &self.color {
             for p in px.chunks_mut(3) {
                 let o = c.apply([p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0]);
@@ -299,7 +300,7 @@ pub fn show(ui: &mut egui::Ui, project: &Project, playhead: Ticks,
         match err {
             None => {
                 let stack: Vec<studio_fx::compositor::Layer<'_>> = frames.iter().map(|(px, l)| studio_fx::compositor::Layer {
-                    rgb: px, w: W, h: H, transform: l.transform, mode: l.mode, opacity: l.opacity }).collect();
+                    rgb: px, w: W, h: H, transform: l.transform, mode: l.mode, opacity: l.paint_opacity() }).collect();
                 let px = studio_fx::compositor::composite(W, H, [0, 0, 0], &stack);
                 let img = egui::ColorImage::from_rgb([W as usize, H as usize], px.as_slice());
                 cache.tex = Some(ui.ctx().load_texture(
@@ -360,7 +361,17 @@ mod tests {
         assert!((l.fade - 0.25).abs() < 1e-3, "{}", l.fade);
         let mut px = vec![200u8; 12];
         l.grade(&mut px);
-        assert!(px.iter().all(|&v| v == 50), "a quarter of 200: {px:?}");
+        assert!(px.iter().all(|&v| v == 200), "the grade leaves the fade to painting: {px:?}");
+        let paint = |under: Option<&[u8]>| {
+            let mut stack = Vec::new();
+            if let Some(u) = under { stack.push(studio_fx::compositor::Layer { rgb: u, w: 2, h: 2,
+                transform: Default::default(), mode: studio_fx::compositor::BlendMode::Normal, opacity: 1.0 }); }
+            stack.push(studio_fx::compositor::Layer { rgb: &px, w: 2, h: 2, transform: l.transform, mode: l.mode,
+                opacity: l.paint_opacity() });
+            studio_fx::compositor::composite(2, 2, [0, 0, 0], &stack)[0]
+        };
+        assert_eq!(paint(None), 50, "over nothing: a quarter of 200, the old fade to black");
+        assert_eq!(paint(Some(&[100u8; 12])), 125, "over a lower clip: a dissolve, 0.25*200 + 0.75*100");
         assert_eq!(layers_at(&p, secs(3.0))[0].fade, 1.0);
     }
 

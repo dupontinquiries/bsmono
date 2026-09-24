@@ -64,7 +64,9 @@ pub struct Picture {
     /// A clip style transfer, run as a 3D LUT after the grade and before the
     /// kaleidoscope -- the viewport's order.
     pub style: Option<crate::style::Transfer>,
-    /// The clip's fade in / out to black, from the model's fades.
+    /// The clip's fade in / out, from the model's fades: an OPACITY ramp. Over
+    /// nothing that is a fade to black (the canvas is black); over a clip on
+    /// a lower track it is a dissolve into it. Runs after the grade.
     pub fade: Option<Fade>,
     /// The clip's `blend` effect, `(mode, opacity)`; `None` is Normal at full
     /// opacity. Honoured where the layer is composited over the ones under it
@@ -80,10 +82,15 @@ pub struct Picture {
 /// A clip's fades, placed on its SOURCE's timeline, in seconds.
 ///
 /// On the source timeline, not the cut's, because `edit_list` can split one
-/// clip into several cuts where a higher track covers part of it -- and a cut
-/// that starts halfway through a fade must start half-faded. Applying the
-/// fade to the source before `trim` makes every piece inherit exactly the
-/// right brightness; a fade computed per cut would restart from black.
+/// clip into several pieces -- a higher track covering part of it, a
+/// dissolve starting -- and a piece that starts halfway through a fade must
+/// start half-faded. The filters run after `trim` but BEFORE `setpts` resets
+/// the clock, so they still see source timestamps and every piece inherits
+/// exactly the right level; a fade computed per piece would restart from 0.
+///
+/// c20 moved them from before the trim to after the picture chain: a fade is
+/// an opacity now, and opacity is applied to the finished (graded) layer --
+/// so a grade that lifts blacks no longer lifts a faded-out picture.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Fade {
     /// Fade in from black over `[in_at, in_at + in_len)`; `in_len` 0 = none.
@@ -106,17 +113,26 @@ impl Fade {
         Some(Fade { in_at: start, in_len: fi, out_at: start + l - fo, out_len: fo })
     }
 
-    /// ffmpeg `fade` filters, each followed by a comma, for the start of a
-    /// cut's chain -- BEFORE its `trim`, so they run on source timestamps.
-    pub fn filters(&self) -> String {
+    /// ffmpeg `fade` filters, each PRECEDED by a comma, for after the picture
+    /// chain and before `setpts` (see the type's docs). `alpha` fades the
+    /// alpha channel -- a layer in a stack, dissolving into what is under it
+    /// -- instead of the picture to black, which is the same thing over black.
+    pub fn filters(&self, alpha: bool) -> String {
+        let a = if alpha { ":alpha=1" } else { "" };
         let mut f = String::new();
         if self.in_len > 0.0 {
-            f.push_str(&format!("fade=t=in:st={:.6}:d={:.6},", self.in_at, self.in_len));
+            f.push_str(&format!(",fade=t=in:st={:.6}:d={:.6}{a}", self.in_at, self.in_len));
         }
         if self.out_len > 0.0 {
-            f.push_str(&format!("fade=t=out:st={:.6}:d={:.6},", self.out_at, self.out_len));
+            f.push_str(&format!(",fade=t=out:st={:.6}:d={:.6}{a}", self.out_at, self.out_len));
         }
         f
+    }
+
+    /// Whether any of source `[from, to)` is partly faded.
+    pub fn touches(&self, from: f64, to: f64) -> bool {
+        let hit = |at: f64, len: f64| len > 0.0 && from < at + len - 1e-9 && at < to - 1e-9;
+        hit(self.in_at, self.in_len) || hit(self.out_at, self.out_len)
     }
 }
 
@@ -164,6 +180,12 @@ impl Picture {
     /// or crop). Where this is false the track below shows, as in the preview.
     pub fn covers(&self) -> bool {
         self.is_opaque() && self.transform.map_or(true, |t| studio_fx::Transform { opacity: 1.0, ..t }.is_identity())
+    }
+
+    /// [`covers`](Self::covers) over source `[from, to)` seconds: not while
+    /// it is fading, when what is under it shows through -- the dissolve.
+    pub fn covers_during(&self, from: f64, to: f64) -> bool {
+        self.covers() && self.fade.map_or(true, |f| !f.touches(from, to))
     }
 
     /// The filter chain from a fitted `w`×`h` frame to the finished picture,
@@ -313,7 +335,10 @@ pub fn edit_list(project: &Project, paths: &BTreeMap<SourceId, PathBuf>, end: Op
     clips.sort_by_key(|(ti, c, _)| (*ti, c.pos));
     let mut edges: Vec<Ticks> = vec![Ticks::ZERO, end];
     for (_, c, _) in &clips {
-        edges.extend([c.pos, c.end()].into_iter().filter(|t| *t < end));
+        // a fade's edges too: a dissolve stacks only while it is fading
+        let (fi, fo) = project.fades.get(&c.id).copied().unwrap_or((Ticks::ZERO, Ticks::ZERO));
+        let (fin, fout) = (c.pos.saturating_add(fi), c.end().saturating_sub(fo));
+        edges.extend([c.pos, c.end(), fin, fout].into_iter().filter(|t| *t >= c.pos && *t <= c.end() && *t < end));
     }
     edges.sort();
     edges.dedup();
@@ -330,7 +355,8 @@ pub fn edit_list(project: &Project, paths: &BTreeMap<SourceId, PathBuf>, end: Op
             if track == Some(*ti) || !(c.pos <= a && a < c.end()) { continue; }
             track = Some(*ti);
             stack.push(entry);
-            if pic.covers() { break; }
+            let from = c.src_in.saturating_add(a.saturating_sub(c.pos)).to_seconds();
+            if pic.covers_during(from, from + b.saturating_sub(a).to_seconds()) { break; }
         }
         let ids: Vec<ClipId> = stack.iter().map(|(_, c, _)| c.id).collect();
         if showing.as_ref() == Some(&ids) {
@@ -512,8 +538,8 @@ pub fn render_args_enc(segments: &[Segment], audio: Option<&Path>, out: &Path, w
             Segment::Cut(c) if !c.picture.is_identity() => {
                 let input = inputs.iter().position(|p| *p == c.path).expect("collected above");
                 let (chain, at) = c.picture.filters(w, h);
-                let fades = c.picture.fade.map(|f| f.filters()).unwrap_or_default();
-                let base = format!("[{input}:v]{fades}trim=start={:.6}:duration={:.6},setpts=PTS-STARTPTS,{fit_rgb}{chain}",
+                let fades = c.picture.fade.map(|f| f.filters(false)).unwrap_or_default();
+                let base = format!("[{input}:v]trim=start={:.6}:duration={:.6},{fit_rgb}{chain}{fades},setpts=PTS-STARTPTS",
                                    c.src_in.to_seconds(), c.len.to_seconds());
                 match at {
                     None => filter.push_str(&format!("{base},format=yuv420p{label};")),
@@ -524,9 +550,9 @@ pub fn render_args_enc(segments: &[Segment], audio: Option<&Path>, out: &Path, w
             }
             Segment::Cut(c) => {
                 let input = inputs.iter().position(|p| *p == c.path).expect("collected above");
-                let fades = c.picture.fade.map(|f| f.filters()).unwrap_or_default();
+                let fades = c.picture.fade.map(|f| f.filters(false)).unwrap_or_default();
                 filter.push_str(&format!(
-                    "[{input}:v]{fades}trim=start={:.6}:duration={:.6},setpts=PTS-STARTPTS,{fit}{label};",
+                    "[{input}:v]trim=start={:.6}:duration={:.6},{fit}{fades},setpts=PTS-STARTPTS{label};",
                     c.src_in.to_seconds(), c.len.to_seconds()));
             }
             Segment::Black { len, .. } => {
@@ -598,11 +624,11 @@ fn stack_filter(i: usize, layers: &[Cut], inputs: &[PathBuf], len: f64, w: u32, 
             layer.push_str(&format!(",pad={w}:{h}:{x}:{y}:color=black@0"));
         }
         let input = inputs.iter().position(|p| *p == c.path).expect("collected by the caller");
-        let fades = c.picture.fade.map(|f| f.filters()).unwrap_or_default();
+        let fades = c.picture.fade.map(|f| f.filters(true)).unwrap_or_default();
         let alpha = c.picture.alpha();
         let dim = if alpha < 1.0 - 1e-4 { format!(",colorchannelmixer=aa={alpha:.6}") } else { String::new() };
         // alpha BEFORE pad, so the padding stays fully transparent
-        f.push_str(&format!("[{input}:v]{fades}trim=start={:.6}:duration={:.6},setpts=PTS-STARTPTS,{fit_rgb}{chain},format=rgba{dim}{layer}[l{i}_{j}];",
+        f.push_str(&format!("[{input}:v]trim=start={:.6}:duration={:.6},{fit_rgb}{chain},format=rgba{fades},setpts=PTS-STARTPTS{dim}{layer}[l{i}_{j}];",
                             c.src_in.to_seconds(), c.len.to_seconds()));
         let (from, to) = (format!("[k{i}_{canvas}]"), format!("[k{i}_{}]", canvas + 1));
         match c.picture.mode() {
@@ -821,7 +847,7 @@ mod tests {
 
     /// A fade reaches the cut, on the SOURCE timeline: a clip at 2 s in its
     /// source, 3 s long, fading in 1 s and out 0.5 s, fades in over source
-    /// 2-3 s and out over 4.5-5 s -- and the filters come BEFORE the trim.
+    /// 2-3 s and out over 4.5-5 s -- after the trim, before the clock resets.
     #[test]
     fn a_clip_fade_reaches_the_export_on_the_source_timeline() {
         let paths: BTreeMap<SourceId, PathBuf> = [(SourceId(1), "a.mp4".into())].into();
@@ -835,8 +861,9 @@ mod tests {
         assert!((f.out_at - 4.5).abs() < 1e-6 && (f.out_len - 0.5).abs() < 1e-6, "{f:?}");
         let fc = render_args(&list, None, Path::new("o.mp4"), 64, 48, 10).into_iter()
             .skip_while(|a| a != "-filter_complex").nth(1).unwrap();
-        let (fi, fo, tr) = (fc.find("fade=t=in:st=2.000000").unwrap(), fc.find("fade=t=out:st=4.500000").unwrap(), fc.find("trim=").unwrap());
-        assert!(fi < tr && fo < tr, "fades run before the trim: {fc}");
+        let (fi, fo, tr, sp) = (fc.find("fade=t=in:st=2.000000").unwrap(), fc.find("fade=t=out:st=4.500000").unwrap(),
+                                fc.find("trim=").unwrap(), fc.find("setpts=").unwrap());
+        assert!(tr < fi && fo < sp, "fades run after the trim, still on source time (before setpts): {fc}");
         assert!(Fade::of(s(0.0), s(1.0), Ticks::ZERO, Ticks::ZERO).is_none(), "no fade, no filter");
     }
 
@@ -1325,6 +1352,109 @@ mod tests {
         assert!(pip[0] > 150 && pip[2] < 100, "corner is the lower track: {:?}", &pip[..3]);
         let i = (((h / 2) * w + w / 2) * 3) as usize;
         assert!(pip[i + 2] > 180, "centre is the top clip: {:?}", &pip[i..i + 3]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fade_over_a_lower_clip_is_a_dissolve_and_stacks_only_while_fading() {
+        let paths: BTreeMap<SourceId, PathBuf> = [(SourceId(1), "top.mp4".into()), (SourceId(2), "low.mp4".into())].into();
+        let mut p = project_with(&paths);
+        // incoming on top: the lower clip 0-4, the top clip 2-5 fading in 1 s.
+        // The lower clip runs a second PAST the fade, so only the fade's own
+        // edge ends the stack there -- without it 2-4 would all be composited
+        // (the same picture, since a faded-in layer covers, but the slow path).
+        clip(&mut p, 1, 1, 1, 2.0, 3.0, 0.0);
+        clip(&mut p, 2, 2, 2, 0.0, 4.0, 0.0);
+        p.apply(&Op::SetClipFade { id: ClipId(1), fade_in: s(1.0), fade_out: Ticks::ZERO }).unwrap();
+        assert_eq!(stacks(&edit_list(&p, &paths, None)), vec![
+            (0.0, 2.0, names(&["low.mp4"])),
+            (2.0, 1.0, names(&["low.mp4", "top.mp4"])),   // the dissolve
+            (3.0, 2.0, names(&["top.mp4"])),              // faded in: covers again, one cut
+        ]);
+        // outgoing on top: the top clip 0-3 fading out 1 s over the lower 2-5
+        let mut q = project_with(&paths);
+        clip(&mut q, 1, 1, 1, 0.0, 3.0, 0.0);
+        clip(&mut q, 2, 2, 2, 2.0, 3.0, 0.0);
+        q.apply(&Op::SetClipFade { id: ClipId(1), fade_in: Ticks::ZERO, fade_out: s(1.0) }).unwrap();
+        assert_eq!(stacks(&edit_list(&q, &paths, None)), vec![
+            (0.0, 2.0, names(&["top.mp4"])),
+            (2.0, 1.0, names(&["low.mp4", "top.mp4"])),
+            (3.0, 2.0, names(&["low.mp4"])),
+        ]);
+        // a fade over nothing adds edges but no segments: still one cut
+        let mut r = project_with(&paths);
+        clip(&mut r, 1, 1, 1, 0.0, 4.0, 0.0);
+        r.apply(&Op::SetClipFade { id: ClipId(1), fade_in: s(1.0), fade_out: s(1.0) }).unwrap();
+        let one = edit_list(&r, &paths, None);
+        assert_eq!(stacks(&one), vec![(0.0, 4.0, names(&["top.mp4"]))]);
+        assert!(matches!(one[0], Segment::Cut(_)));
+    }
+
+    /// RENDERED: red on the lower track, blue on top fading in over it. Half
+    /// way through, the picture is half of each -- not a dip through black,
+    /// which is what two fades used to give -- and it matches the compositor.
+    #[test]
+    fn a_rendered_dissolve_mixes_the_two_clips_instead_of_dipping_to_black() {
+        if !crate::testkit::ffmpeg_or_skip("a_rendered_dissolve_mixes_the_two_clips_instead_of_dipping_to_black") { return; }
+        let dir = std::env::temp_dir().join(format!("studio-dissolve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (w, h) = (64u32, 48u32);
+        let fixture = |colour: &str| {
+            let path = dir.join(format!("{colour}.mp4"));
+            super::super::run("ffmpeg", &["-y", "-f", "lavfi", "-i", &format!("color=c={colour}:s={w}x{h}:r=20:d=5"),
+                "-c:v", "mpeg4", "-q:v", "2", "-pix_fmt", "yuv420p", "-an", path.to_str().unwrap()]).expect("fixture");
+            path
+        };
+        let (blue, red) = (fixture("blue"), fixture("red"));
+        let paths: BTreeMap<SourceId, PathBuf> = [(SourceId(1), blue.clone()), (SourceId(2), red.clone())].into();
+        let mut p = project_with(&paths);
+        clip(&mut p, 1, 1, 1, 1.0, 3.0, 0.0);   // blue on top, 1-4, fading in over 1-3
+        clip(&mut p, 2, 2, 2, 0.0, 4.0, 0.0);   // red below, 0-4
+        p.apply(&Op::SetClipFade { id: ClipId(1), fade_in: s(2.0), fade_out: Ticks::ZERO }).unwrap();
+        let out = dir.join("out.mp4");
+        render_with_encoder(&edit_list(&p, &paths, None), None, &out, w, h, 20, VideoEncoder::Mpeg4).expect("render");
+        let (r, b) = (super::super::frame_rgb(&red, s(0.5), w, h).unwrap(), super::super::frame_rgb(&blue, s(0.5), w, h).unwrap());
+        let i = (((h / 2) * w + w / 2) * 3) as usize;
+        for (t, g) in [(1.5, 0.25f32), (2.0, 0.5), (2.5, 0.75), (3.5, 1.0)] {
+            let got = super::super::frame_rgb(&out, s(t), w, h).unwrap();
+            let want = studio_fx::compositor::composite(w, h, [0, 0, 0], &[
+                studio_fx::compositor::Layer { rgb: &r, w, h, transform: Default::default(), mode: BlendMode::Normal, opacity: 1.0 },
+                studio_fx::compositor::Layer { rgb: &b, w, h, transform: Default::default(), mode: BlendMode::Normal, opacity: g },
+            ]);
+            for c in 0..3 {
+                assert!((got[i + c] as i32 - want[i + c] as i32).abs() <= 10,
+                    "at {t} s (fade {g}): export {:?} vs compositor {:?}", &got[i..i + 3], &want[i..i + 3]);
+            }
+        }
+        // the point of a dissolve: at its middle both are there, not black
+        let mid = super::super::frame_rgb(&out, s(2.0), w, h).unwrap();
+        assert!(mid[i] > 90 && mid[i + 2] > 90, "half red AND half blue at the middle: {:?}", &mid[i..i + 3]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fade is an opacity on the FINISHED layer, so it comes after the
+    /// grade: a grade that lifts blacks does not lift a faded-out clip. (Before
+    /// c20 the fade ran first and the lift showed through it: ~77 of 255 here.)
+    #[test]
+    fn a_faded_out_clip_is_black_even_under_a_grade_that_lifts_blacks() {
+        if !crate::testkit::ffmpeg_or_skip("a_faded_out_clip_is_black_even_under_a_grade_that_lifts_blacks") { return; }
+        let dir = std::env::temp_dir().join(format!("studio-liftfade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("grey.mp4");
+        super::super::run("ffmpeg", &["-y", "-f", "lavfi", "-i", "color=c=gray:s=64x48:r=20:d=3",
+            "-c:v", "mpeg4", "-q:v", "2", "-pix_fmt", "yuv420p", "-an", src.to_str().unwrap()]).expect("fixture");
+        let paths: BTreeMap<SourceId, PathBuf> = [(SourceId(1), src)].into();
+        let mut p = project_with(&paths);
+        clip(&mut p, 1, 1, 1, 0.0, 3.0, 0.0);
+        p.apply(&Op::SetEffects { id: ClipId(1), effects: vec![fx("color", &[("lift_r", 0.3), ("lift_g", 0.3), ("lift_b", 0.3)])] }).unwrap();
+        p.apply(&Op::SetClipFade { id: ClipId(1), fade_in: Ticks::ZERO, fade_out: s(2.0) }).unwrap();
+        let list = edit_list(&p, &paths, None);
+        assert!(list[0].cuts()[0].picture.color.is_some(), "the lift reached the cut");
+        let out = dir.join("out.mp4");
+        render_with_encoder(&list, None, &out, 64, 48, 20, VideoEncoder::Mpeg4).expect("render");
+        let (start, end) = (luma_at(&out, 0.5), luma_at(&out, 2.95));
+        assert!(start > 150.0, "lifted grey before the fade: {start:.0}");
+        assert!(end < 25.0, "faded out to black, the lift faded with it: {end:.0}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
