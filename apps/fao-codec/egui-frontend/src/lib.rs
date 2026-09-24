@@ -18,6 +18,7 @@ pub mod library;
 pub mod player;
 pub mod decode;
 pub mod transcode;
+pub mod encode_page;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 // ── PARITY STATUS, measured 2026-09-16 against fao_app/src/main.rs ──────────
@@ -48,7 +49,15 @@ pub mod transcode;
 // the task a tester sits down to do, because the task lives on a page that was
 // never ported. Adding feedback to the Encode Lab would not fix the report;
 // the Encode page would.
+//
+// UPDATE (c20unified): the Encode page exists now (`encode_page.rs`, the
+// default tab): a real video in, a .fao out, streamed one frame at a time,
+// cancellable, with live progress / per-frame cost / decoded preview, and
+// "Open in Player". It encodes with the one codec the port has (intra DCT);
+// the GTK dialog's v2.0-v8 / v9 codec choices are still not ported and the
+// page says so. The web view and Open Archive / Export remain unported.
 pub enum Tab {
+    Encode,
     Lab,
     SeqLab,
     Library,
@@ -70,13 +79,14 @@ pub struct App {
     pub seq: seq_page::SeqState,
     pub library: library::State,
     pub player: player::State,
+    pub encode: encode_page::State,
 }
 
 impl Default for App {
     fn default() -> Self {
         let mut prefs = settings_kit::Prefs::default();
         prefs.palette = "system".to_string();
-        App { a11y: uikit_egui::a11y::A11yScene::new(), tab: Tab::Lab, prefs, lab: lab::State::default(), seq: seq_page::SeqState::default(), library: library::State::default(), player: player::State::default() }
+        App { a11y: uikit_egui::a11y::A11yScene::new(), tab: Tab::Encode, prefs, lab: lab::State::default(), seq: seq_page::SeqState::default(), library: library::State::default(), player: player::State::default(), encode: encode_page::State::default() }
     }
 }
 
@@ -99,6 +109,7 @@ impl App {
             });
         }
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
+            Tab::Encode => encode_page::ui(self, ui),
             Tab::Lab => lab::ui(self, ui),
             Tab::SeqLab => seq_page::ui(self, ui),
             Tab::Library => library::ui(self, ui),
@@ -111,7 +122,7 @@ impl App {
     }
 
     fn nav(&mut self, ui: &mut egui::Ui) {
-        for (t, label) in [(Tab::Lab, "🎞 Encode Lab"), (Tab::SeqLab, "⏱ Seq Lab"),
+        for (t, label) in [(Tab::Encode, "⏺ Encode"), (Tab::Lab, "🎞 Encode Lab"), (Tab::SeqLab, "⏱ Seq Lab"),
                            (Tab::Library, "🔗 Library"),
                            (Tab::Player, "▶ Player"), (Tab::Settings, "⚙ Settings")] {
             if ui.selectable_label(self.tab == t, label).clicked() {

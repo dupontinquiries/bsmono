@@ -49,6 +49,27 @@ offline Rust 1.96 toolchain — it builds headless, GTK does not.
     frames whose webs are ALL library refs (`V8LR`, needs an external file via `FAO_LIBRARY`
     — not ported); `'V4'`..`'V7'` (fao_app renders nothing for these either).
 
+## Encode page (c20unified)
+
+The tester's report ("I can only do a test frame that doesn't even have feedback") was about
+this page not existing. It does now, as the default tab:
+- a video path (probed with ffprobe as you type: size, fps, duration, codec, frame estimate),
+  quality, a first-N-frames cap, an output path derived from the input unless edited;
+- Encode runs on a worker thread; the page shows a progress bar with fps and ETA, bytes so
+  far, mean and last-frame PSNR, a per-frame cost sparkline, and the DECODED output (what the
+  .fao will show) refreshed every 250 ms; Cancel stops between frames and writes nothing;
+- done: frames, size, ratio against the input file, bpp, mean PSNR, and **Open in Player**.
+
+Underneath, `transcode.rs` now streams: `FrameReader` pulls one frame at a time from ffmpeg's
+pipe (the old path held the whole decoded video in memory — ~3.7 GB for 20 s of 1080p), kills
+ffmpeg on cancel/drop, and drains stderr on a thread. `transcode()` keeps its signature on top
+of the streaming path, so its original tests exercise the new code; a new test checks the
+streamed frames are byte-identical to the old whole-file decode.
+
+Still honest about scope: the codec is intra DCT only. The GTK dialog's v2.0–v8 codec versions
+and the v9 trailer are not ported (their encoders live in fao_app's main.rs), and the page
+states that instead of offering choices that would all do the same thing.
+
 ## Not started
 
 - **World tab** — 3D scene viewer (freecam, orbit, colour modes). The largest remaining gap;
