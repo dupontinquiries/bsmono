@@ -3602,12 +3602,12 @@ fn main() {
             // release landing in the late drain still clears it. (The old
             // `ui_mouse_down` was set only in the top drain, leaving egui stuck
             // "pressed" on late releases → clicks became window drags.)
-            renderer.ui_pointer_down = input.is_mouse_button_pressed(MouseButtonLeft);
+            renderer.ui_pointer_down = input.is_mouse_button_pressed(MouseButtonLeft.into());
             // Clicks whose press+release collapse into one frame (low fps)
             // produce no level edge; forward them as discrete clicks.
             renderer.ui_click_pending =
                 (input.is_mouse_button_just_pressed(MouseButtonLeft.into())
-                    && !input.is_mouse_button_pressed(MouseButtonLeft)) as u32;
+                    && !input.is_mouse_button_pressed(MouseButtonLeft.into())) as u32;
             renderer.ui_pointer_active = ui_panel_open || renderer.settings_open;
         }
         // Bake this frame's entities + creatures and upload before drawing.

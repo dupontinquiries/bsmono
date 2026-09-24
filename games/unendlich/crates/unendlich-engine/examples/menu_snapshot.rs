@@ -139,6 +139,9 @@ fn render_live(kind: u8, mp: &[String], worlds: &[String], rb: &[String], out: &
         egui::CentralPanel::default().show(c, |ui| {
             let s = LiveMenuState {
                 screen_kind: kind,
+                // Nothing hosting or searching (the field's documented None);
+                // the Devices screen (da31e9cec) postdates this example.
+                devices: None,
                 mp_list: mp,
                 world_list: worlds,
                 rollback_list: rb,
