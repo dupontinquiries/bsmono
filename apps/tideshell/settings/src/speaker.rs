@@ -175,6 +175,27 @@ mod tests {
     }
 }
 
+/// Send the resolved controls to the running shell.
+///
+/// tideshell owns the PipeWire connection, so this app decides and the shell
+/// applies. One datagram on the control socket, encoded by the format both
+/// sides share (`tideshell_core::chaingraph::encode_props`) so there is no
+/// encoder here to drift from the decoder there.
+///
+/// Failure is reported, not retried: if the shell is not running there is no
+/// chain to change, and a settings app that silently queued audio changes
+/// for later would be worse than one that says nothing happened.
+pub fn send_to_shell(pairs: &[(String, f32)]) -> Result<(), String> {
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return Err("XDG_RUNTIME_DIR is not set".into());
+    };
+    let path = std::path::PathBuf::from(dir).join("tideshell.ctl");
+    let msg = tideshell_core::chaingraph::encode_props(pairs);
+    let sock = std::os::unix::net::UnixDatagram::unbound().map_err(|e| e.to_string())?;
+    sock.send_to(msg.as_bytes(), &path).map_err(|e| format!("{}: {e} (is tideshell running?)", path.display()))?;
+    Ok(())
+}
+
 // ── the screen ──────────────────────────────────────────────────────────────
 
 /// Draw the speaker screen. Returns what the user asked for; the caller
@@ -255,6 +276,16 @@ pub fn ui(s: &mut Speaker, ui: &mut egui::Ui, touch_h: f32) -> Vec<SpeakerAction
     for a in out.clone() {
         s.apply(a);
     }
+    // Push the whole chain after any change. The resolve is cheap and the
+    // message is one datagram; sending only what moved would mean tracking
+    // what the shell already has, and the two getting out of step is a
+    // worse failure than a few spare bytes.
+    if !out.is_empty() {
+        let pairs = s.resolve(0.5, 0.5);
+        if let Err(e) = send_to_shell(&pairs) {
+            s.status = format!("not applied: {e}");
+        }
+    }
     out
 }
 
@@ -264,4 +295,48 @@ fn button(ui: &mut egui::Ui, text: &str, h: f32) -> bool {
 
 fn button_sel(ui: &mut egui::Ui, text: &str, h: f32, on: bool) -> bool {
     ui.add(egui::Button::new(egui::RichText::new(text).size(15.0)).selected(on).min_size(egui::vec2(h * 2.2, h))).clicked()
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+
+    #[test]
+    fn a_message_reaches_a_listening_socket_and_decodes() {
+        // The shell's end of this is ctl.rs; here we prove the datagram is
+        // what that decoder expects, using the shared format rather than a
+        // second copy of it.
+        let dir = std::env::temp_dir().join(format!("ts-speaker-send-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tideshell.ctl");
+        let _ = std::fs::remove_file(&path);
+        let srv = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        // SAFETY-ish: the test owns this variable for its own process.
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
+
+        let s = Speaker::default();
+        let pairs = s.resolve(0.5, 0.5);
+        send_to_shell(&pairs).unwrap();
+
+        let mut buf = [0u8; 8192];
+        let n = srv.recv(&mut buf).unwrap();
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        let back = tideshell_core::chaingraph::decode_props(text).expect("the shell's decoder accepts it");
+        assert_eq!(back.len(), pairs.len());
+        assert!(back.iter().any(|(k, _)| k == "bassL:amt"));
+        // The whole chain goes, including the locked ceiling, so the shell
+        // never holds a half-set graph.
+        assert!(back.iter().any(|(k, _)| k.ends_with("Limit (dB)")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_no_shell_running_it_says_so_rather_than_queueing() {
+        let dir = std::env::temp_dir().join(format!("ts-speaker-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
+        let e = send_to_shell(&[("a".into(), 1.0)]).unwrap_err();
+        assert!(e.contains("is tideshell running"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

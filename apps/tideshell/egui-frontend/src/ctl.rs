@@ -14,7 +14,7 @@
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     PowerKey,
     VolumeUp,
@@ -22,10 +22,17 @@ pub enum Command {
     Lock,
     Palette,
     Switcher,
+    /// Resolved speaker-chain controls, from the settings app. Carries a
+    /// payload, unlike the others, because the sender is deciding values
+    /// rather than asking for an action.
+    SpeakerProps(Vec<(String, f32)>),
 }
 
 impl Command {
     pub fn parse(s: &str) -> Option<Command> {
+        if let Some(pairs) = tideshell_core::chaingraph::decode_props(s) {
+            return Some(Command::SpeakerProps(pairs));
+        }
         match s.trim() {
             "power-key" => Some(Command::PowerKey),
             "volume-up" => Some(Command::VolumeUp),
@@ -241,7 +248,10 @@ impl Server {
     /// Every command waiting; unknown text is returned as Err for the trace.
     pub fn poll(&self) -> Vec<Result<Command, String>> {
         let mut out = Vec::new();
-        let mut buf = [0u8; 256];
+            // Big enough for a whole chain's props: about twenty short lines.
+        // A datagram is all-or-nothing, so a buffer that is too small would
+        // silently truncate rather than fail.
+        let mut buf = [0u8; 8192];
         while let Ok(n) = self.sock.recv(&mut buf) {
             let text = String::from_utf8_lossy(&buf[..n]).into_owned();
             out.push(Command::parse(&text).ok_or(text));

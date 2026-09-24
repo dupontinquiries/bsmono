@@ -965,6 +965,12 @@ fn main() {
                     Ok(Command::Lock) => sb.shell.lock_now(),
                     Ok(Command::Palette) => sb.shell.open_palette(),
                     Ok(Command::Switcher) => sb.shell.open_switcher(),
+                    // The settings app decided what the chain should do; we
+                    // are the process with the PipeWire connection.
+                    Ok(Command::SpeakerProps(pairs)) => {
+                        let out = tideshell_egui::effects::apply_speaker_props(&pairs);
+                        sb.shell.note(format!("{out:?}"));
+                    }
                     Err(t) => sb.shell.note(format!("ctl: unknown command {t:?}")),
                 }
             }

@@ -302,3 +302,101 @@ mod tests {
         assert_eq!(Stage::MixTop.node(), "mixTop");
     }
 }
+
+// ── the wire format ─────────────────────────────────────────────────────────
+//
+// The settings app decides what the chain should do; the shell owns the
+// PipeWire connection. So the app sends the resolved control/value pairs over
+// tideshell's control socket and the shell applies them.
+//
+// Defined here, in the crate both sides already depend on, so there is one
+// definition rather than an encoder and a decoder that drift. Text, because
+// the socket carries text and a human debugging this should be able to read
+// a datagram.
+//
+// Control names contain spaces and parentheses ("Threshold level (dB)"), so
+// the split is on the LAST '=' of a line rather than on whitespace.
+
+/// The first line of a props message.
+pub const PROPS_TAG: &str = "speaker-props";
+
+/// Encode resolved pairs for the socket.
+pub fn encode_props(pairs: &[(String, f32)]) -> String {
+    let mut s = String::from(PROPS_TAG);
+    for (k, v) in pairs {
+        // A newline or an '=' in a control name would make the message
+        // ambiguous. None exist, and a silent corruption later would be
+        // hard to trace, so they are dropped here where it is obvious.
+        if k.contains('\n') {
+            continue;
+        }
+        s.push('\n');
+        s.push_str(k);
+        s.push('=');
+        s.push_str(&format!("{v}"));
+    }
+    s
+}
+
+/// Decode one. `None` when it is not a props message at all.
+pub fn decode_props(text: &str) -> Option<Vec<(String, f32)>> {
+    let mut lines = text.lines();
+    if lines.next()?.trim() != PROPS_TAG {
+        return None;
+    }
+    let mut out = Vec::new();
+    for l in lines {
+        let l = l.trim_end();
+        if l.is_empty() {
+            continue;
+        }
+        // Last '=', not first: "Threshold level (dB)=-12" has one, but a
+        // future name containing '=' would break a first-match split.
+        let Some(at) = l.rfind('=') else { continue };
+        let (k, v) = l.split_at(at);
+        let Ok(v) = v[1..].parse::<f32>() else { continue };
+        if !v.is_finite() {
+            continue;
+        }
+        out.push((k.to_string(), v));
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    #[test]
+    fn a_message_survives_the_round_trip() {
+        let pairs = resolve(&[], &[], 0.5, 0.5);
+        let text = encode_props(&pairs);
+        let back = decode_props(&text).unwrap();
+        assert_eq!(back.len(), pairs.len());
+        for ((a, x), (b, y)) in back.iter().zip(&pairs) {
+            assert_eq!(a, b);
+            assert!((x - y).abs() < 1e-6, "{a}: {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn control_names_with_spaces_and_brackets_survive() {
+        // "Threshold level (dB)" is a real port name; splitting on
+        // whitespace or on the first '=' would mangle it.
+        let pairs = vec![("compT:Threshold level (dB)".to_string(), -12.5), ("mixTop:Gain 1".to_string(), 0.5)];
+        let back = decode_props(&encode_props(&pairs)).unwrap();
+        assert_eq!(back, pairs);
+    }
+
+    #[test]
+    fn anything_that_is_not_a_props_message_is_refused() {
+        assert_eq!(decode_props("power-key"), None);
+        assert_eq!(decode_props(""), None);
+        assert_eq!(decode_props("speaker-propsX\na=1"), None);
+        // A malformed line is dropped rather than poisoning the message: a
+        // chain half-applied is better than one not applied at all, and the
+        // lines are independent.
+        let got = decode_props("speaker-props\ngood=1.5\nnovalue\nbad=zzz\nnan=NaN\n").unwrap();
+        assert_eq!(got, vec![("good".to_string(), 1.5)]);
+    }
+}
