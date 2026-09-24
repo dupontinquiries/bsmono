@@ -616,3 +616,39 @@ mod automation_file_tests {
         assert!(crate::wire::Packet::decode_stored(&old_packet).is_some(), "a stored one opens");
     }
 }
+
+#[cfg(test)]
+mod source_kind_tests {
+    use super::*;
+    use studio_core::{Op, Project, Source, SourceId, Ticks};
+
+    fn with_pattern_source() -> Project {
+        let mut p = Project::default();
+        p.apply(&Op::AddSource { source: Source::pattern(SourceId(7), 3, "Beat (2/2)", Ticks::ZERO, 48_000, 2) }).unwrap();
+        p.apply(&Op::AddSource { source: Source::file(SourceId(8), "vox.opus", Ticks::from_seconds(2.0), 48_000, 1, false) }).unwrap();
+        p
+    }
+
+    /// A pattern source survives a save: it came back as a FILE with an empty
+    /// path before v20, and a reopened project called it missing.
+    #[test]
+    fn a_pattern_source_is_still_a_pattern_after_a_save() {
+        let p = with_pattern_source();
+        let back = SaveFile::decode(&SaveFile::from_project(&p, Vec::new(), None).encode()).unwrap().to_project();
+        assert_eq!(back.sources[&SourceId(7)].kind, studio_core::SourceKind::Pattern { pattern: 3, name: "Beat (2/2)".into() });
+        assert!(back.sources[&SourceId(7)].is_generator());
+        assert_eq!(back.sources[&SourceId(8)], p.sources[&SourceId(8)]);
+    }
+
+    /// A v19 file still opens (its sources as files, which is all v19 knew).
+    #[test]
+    fn a_v19_file_still_opens() {
+        let p = with_pattern_source();
+        crate::wire::ENCODE_AS.with(|c| c.set(19));
+        let bytes = SaveFile::from_project(&p, Vec::new(), None).encode();
+        crate::wire::ENCODE_AS.with(|c| c.set(crate::wire::WIRE_VERSION));
+        let back = SaveFile::decode(&bytes).expect("a v19 file opens").to_project();
+        assert_eq!(back.sources.len(), 2);
+        assert_eq!(back.sources[&SourceId(8)].path, "vox.opus");
+    }
+}

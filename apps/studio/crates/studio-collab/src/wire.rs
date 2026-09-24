@@ -107,7 +107,13 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// field and desynchronise the whole stream.
 /// v19: `Binding` gained `response` and `fit_span` (a scene's stage signal
 /// driving several targets differently, and surviving a re-trim).
-pub const WIRE_VERSION: u8 = 19;
+/// v20: `Source` carries its KIND. Until now `put_source` wrote no kind and
+/// `get_source` rebuilt every source as `SourceKind::File`, so a linked
+/// pattern clip's source came back from a saved file -- or a peer -- as a
+/// file with an empty path: "missing or undecodable", silent (found when an
+/// FL import saved 51 pattern sources and reopened with 51 missing). A shape
+/// change, so a bump: tag 0 File, 1 Pattern (u64 pattern, str name).
+pub const WIRE_VERSION: u8 = 20;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -422,12 +428,25 @@ fn get_track(r: &mut R) -> Option<Track> {
 fn put_source(o: &mut Vec<u8>, s: &Source) {
     put_u64(o, s.id.0); put_str(o, &s.path); put_ticks(o, s.len);
     put_u32(o, s.sample_rate); put_u16(o, s.channels); put_u8(o, s.has_video as u8);
+    if enc_v() >= 20 {
+        match &s.kind {
+            studio_core::SourceKind::File => put_u8(o, 0),
+            studio_core::SourceKind::Pattern { pattern, name } => { put_u8(o, 1); put_u64(o, *pattern as u64); put_str(o, name); }
+        }
+    }
 }
 fn get_source(r: &mut R) -> Option<Source> {
-    Some(Source {
-        id: SourceId(r.u64()?), path: r.str()?, len: r.ticks()?,
-        sample_rate: r.u32()?, channels: r.u16()?, has_video: r.u8()? != 0, kind: studio_core::SourceKind::File,
-    })
+    let (id, path, len, sample_rate, channels, has_video) =
+        (SourceId(r.u64()?), r.str()?, r.ticks()?, r.u32()?, r.u16()?, r.u8()? != 0);
+    // before v20 no kind was written: every source read as a file (the bug above)
+    let kind = if r.v >= 20 {
+        match r.u8()? {
+            0 => studio_core::SourceKind::File,
+            1 => studio_core::SourceKind::Pattern { pattern: r.u64()? as usize, name: r.str()? },
+            _ => return None,
+        }
+    } else { studio_core::SourceKind::File };
+    Some(Source { id, path, len, sample_rate, channels, has_video, kind })
 }
 
 /// `Option<String>`: 0 = None, 1 + the string = Some. Shared because
@@ -1582,7 +1601,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 19, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 20, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]
