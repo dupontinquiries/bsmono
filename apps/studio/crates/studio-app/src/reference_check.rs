@@ -116,6 +116,42 @@ pub fn compare(reference: &[f32], ours: &[f32], rate: u32, window: f64, max_lag:
              lag: lag as f64 * HOP, corr, sections }
 }
 
+/// A CLICK: a lone high-frequency spike -- a discontinuity in the waveform.
+///
+/// The first detector (a sample-to-sample jump 12x its 10 ms neighbourhood)
+/// could not tell a click from a DRUM ATTACK, and on Blue Moon's files-only
+/// render most of what it found were drum hits. What separates them is what
+/// comes AFTER: an attack is followed by more high-frequency energy (the
+/// hit's noise and ring); a click is one spike and then the waveform goes on
+/// smoothly. So a spike in the second difference counts only when it is
+/// `ratio` times the second difference's RMS on BOTH sides of it (5 ms each,
+/// the spike's own 0.3 ms left out). A clip that starts mid-waveform out of
+/// silence still counts -- smooth after, silent before: that IS a click.
+pub fn clicks(mono: &[f32], rate: u32, ratio: f32) -> Vec<f64> {
+    let d2: Vec<f32> = (2..mono.len()).map(|n| mono[n] - 2.0 * mono[n - 1] + mono[n - 2]).collect();
+    let (w, guard) = ((rate as usize) / 200, (rate as usize) / 3000 + 1);
+    let rms = |a: usize, b: usize| {
+        let (a, b) = (a.min(d2.len()), b.min(d2.len()));
+        if b <= a { return 0.0; }
+        (d2[a..b].iter().map(|x| x * x).sum::<f32>() / (b - a) as f32).sqrt()
+    };
+    let mut out = Vec::new();
+    let mut n = w + guard;
+    while n + w + guard < d2.len() {
+        let v = d2[n].abs();
+        if v > 1e-3 {
+            let (before, after) = (rms(n - w - guard, n - guard), rms(n + guard, n + guard + w));
+            if v > ratio * before.max(after).max(1e-6) {
+                out.push((n + 2) as f64 / rate as f64);
+                n += w; // one click, not its neighbours
+                continue;
+            }
+        }
+        n += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +201,39 @@ mod tests {
         let text = rep.text(&|t| format!("{t:.0} s"));
         assert!(text.lines().any(|l| l.starts_with("10 s") && l.contains("timing +250 ms off the song")), "{text}");
         assert!(!text.lines().any(|l| l.starts_with("0 s") && l.contains("timing")), "{text}");
+    }
+
+    fn tone(rate: u32, secs: f32, hz: f32) -> Vec<f32> {
+        (0..(rate as f32 * secs) as usize).map(|i| 0.4 * (i as f32 / rate as f32 * hz * std::f32::consts::TAU).sin()).collect()
+    }
+
+    #[test]
+    fn a_clean_tone_has_no_clicks_and_a_discontinuity_is_one() {
+        let rate = 48_000;
+        let t = tone(rate, 1.0, 220.0);
+        assert!(clicks(&t, rate, 8.0).is_empty(), "{:?}", clicks(&t, rate, 8.0));
+        let mut j = t.clone();
+        for x in &mut j[24_000..] { *x = -*x; } // a polarity flip mid-cycle: a jump
+        let c = clicks(&j, rate, 8.0);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert!((c[0] - 0.5).abs() < 0.001, "{c:?}");
+    }
+
+    #[test]
+    fn drum_attacks_are_not_clicks_but_a_hard_start_out_of_silence_is() {
+        let rate = 48_000;
+        // noise bursts with a fast decay: attacks, each followed by more HF
+        let mut x = 7u64;
+        let mut rnd = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x % 20_000) as f32 / 10_000.0 - 1.0 };
+        let mut drums = tone(rate, 1.0, 110.0);
+        for hit in [0.2f32, 0.45, 0.7] {
+            let at = (hit * rate as f32) as usize;
+            for k in 0..4800 { drums[at + k] += 0.6 * rnd() * (-(k as f32) / 600.0).exp(); }
+        }
+        assert!(clicks(&drums, rate, 8.0).is_empty(), "attacks read as clicks: {:?}", clicks(&drums, rate, 8.0));
+        // a tone that starts mid-cycle out of silence: a clip cut hard
+        let mut edge = vec![0.0f32; 24_000];
+        edge.extend(tone(rate, 0.5, 220.0).iter().skip(50));
+        assert_eq!(clicks(&edge, rate, 8.0).len(), 1, "{:?}", clicks(&edge, rate, 8.0));
     }
 }

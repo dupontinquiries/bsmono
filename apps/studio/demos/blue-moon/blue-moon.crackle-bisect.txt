@@ -9,3 +9,8 @@ full-v4                peak   0.97  clicks    3  first: [0.17, 1.36, 1.87]
 v4-no-duck             peak   0.97  clicks    0  first: []
 done
 files-only-declicked   peak   2.57  clicks    6  first: [1.35, 1.86, 11.07, 12.26, 15.34, 16.52]
+
+## click detector v2 (reference_check::clicks), and its control
+Blue Moon files-only 60-80 s: 16; Balance master render: 567; Balance mix render: 535;
+CONTROL -- the artist's own clean FL render of Balance (balance18): 643.
+v2 flags real musical transients too; its counts are NOT evidence of crackle.
