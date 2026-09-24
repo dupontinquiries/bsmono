@@ -77,6 +77,33 @@ pub struct Picker {
     /// The account to connect as — `user` on a fresh postmarketOS image.
     pub user: String,
     pub note: String,
+    /// A phone's first contact, served (cockpit::join_server).
+    pub join: JoinPanel,
+}
+
+/// The join server behind the Fleet page's "join a new phone". An `Arc` so the picker
+/// stays `Clone`; dropping the last one stops the listener.
+#[derive(Clone, Default)]
+pub struct JoinPanel {
+    pub running: Option<std::sync::Arc<cockpit::join_server::Running>>,
+    /// The address the phone should use (and the script calls back to).
+    pub host: String,
+    pub error: String,
+}
+
+impl std::fmt::Debug for JoinPanel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinPanel").field("running", &self.running.as_ref().map(|r| r.port)).field("host", &self.host).finish()
+    }
+}
+
+/// Which address to offer first: the USB network link when there is one (a tethered phone
+/// always reaches it; pmOS puts the laptop on 172.16.42.x), else the default route's.
+pub fn preferred_join_host(addrs: &[(String, String)], default_route: Option<&str>) -> Option<String> {
+    addrs.iter().find(|(i, ip)| i.starts_with("usb") || ip.starts_with("172.16.42."))
+        .map(|(_, ip)| ip.clone())
+        .or_else(|| default_route.map(str::to_string))
+        .or_else(|| addrs.first().map(|(_, ip)| ip.clone()))
 }
 
 impl Default for Picker {
@@ -87,6 +114,7 @@ impl Default for Picker {
             selected: None,
             user: "user".into(),
             note: String::new(),
+            join: JoinPanel::default(),
         }
     }
 }
@@ -316,5 +344,14 @@ mod tests {
         p.finished(Job::SetupKey, true, "key installed", true);
         assert_eq!(p.phase, Phase::Selected { trusted: true });
         assert!(!p.busy());
+    }
+
+    #[test]
+    fn the_join_address_prefers_the_usb_link() {
+        let a = vec![("wlan0".to_string(), "192.168.2.10".to_string()), ("usb0".to_string(), "172.16.42.2".to_string())];
+        assert_eq!(preferred_join_host(&a, Some("192.168.2.10")).as_deref(), Some("172.16.42.2"));
+        let w = vec![("wlan0".to_string(), "192.168.2.10".to_string())];
+        assert_eq!(preferred_join_host(&w, Some("192.168.2.10")).as_deref(), Some("192.168.2.10"));
+        assert_eq!(preferred_join_host(&[], None), None);
     }
 }

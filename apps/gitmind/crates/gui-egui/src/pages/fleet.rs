@@ -88,41 +88,7 @@ fn picker_ui(ui: &mut egui::Ui, p: &mut crate::device_picker::Picker) {
     // A command to copy rather than anything automatic: there is no
     // network path to a device that is not listening yet, which is the
     // whole definition of this state.
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("no sshd yet?").weak().small());
-        if ui.small_button("join command").clicked() {
-            // Code derived from the current time. Single-use is enforced
-            // by `JoinCode` on the serving side; this is only the string
-            // the operator carries to the phone.
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let code = cockpit::join::code_from_bytes(&now.to_le_bytes());
-            // A REAL address, not a placeholder. A copied command
-            // containing `<this-host>` gets pasted verbatim and fails on
-            // the phone with a DNS timeout — the least diagnosable error
-            // there is, and on a device with no sshd there is nothing to
-            // log into to find out why.
-            match cockpit::deploy::local_ipv4() {
-                Some(ip) => {
-                    let cmd = cockpit::join::join_command(&format!("http://{ip}:8080"), &code);
-                    ui.ctx().copy_text(cmd);
-                }
-                // Said rather than guessed: on IPv6-only or with no
-                // route there is no address to put in, and a wrong one
-                // is worse than none.
-                None => ui.ctx().copy_text(
-                    "no IPv4 route found — fill in this host's address".to_string()),
-            }
-        }
-    });
-    ui.label(
-        egui::RichText::new(
-            "type it on the phone — it installs your key and starts sshd,              which is what everything below needs")
-            .weak()
-            .small(),
-    );
+    join_ui(ui, &mut p.join);
     ui.separator();
 
     ui.label(egui::RichText::new("Enrol a device").strong());
@@ -710,5 +676,108 @@ fn run_fleet_action(action: crate::fleet_actions::FleetAction, app: &mut App, ui
                 }
             }
         }
+    }
+}
+
+/// "Join a new phone": the join server (cockpit::join_server) for a phone with a browser and
+/// curl and nothing else. The phone opens the URL, types the code, taps the matching number,
+/// and runs the command it is given; this panel shows each step's laptop half.
+fn join_ui(ui: &mut egui::Ui, j: &mut crate::device_picker::JoinPanel) {
+    use cockpit::join_server::Stage;
+    let addrs = cockpit::join_server::local_addresses();
+    if j.host.is_empty() {
+        j.host = crate::device_picker::preferred_join_host(&addrs, cockpit::deploy::local_ipv4().as_deref()).unwrap_or_default();
+    }
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("no sshd yet?").weak().small());
+        if j.running.is_none() {
+            egui::ComboBox::from_id_salt("join-host").selected_text(if j.host.is_empty() { "no address" } else { j.host.as_str() }).show_ui(ui, |ui| {
+                for (ifname, ip) in &addrs {
+                    ui.selectable_value(&mut j.host, ip.clone(), format!("{ip}  ({ifname})"));
+                }
+            });
+            if ui.small_button("join a new phone").clicked() {
+                j.error.clear();
+                match cockpit::deploy::local_identity_pubkey() {
+                    None => j.error = "no ~/.ssh key to install on the phone: run `ssh-keygen -t ed25519` first".into(),
+                    Some(key) if !j.host.is_empty() => {
+                        let user = cockpit::fleet::fleet_user();
+                        let r = cockpit::join_server::serve(8099, &j.host, &user, key.trim())
+                            .or_else(|_| cockpit::join_server::serve(0, &j.host, &user, key.trim()));
+                        match r {
+                            Ok(run) => j.running = Some(std::sync::Arc::new(run)),
+                            Err(e) => j.error = e,
+                        }
+                    }
+                    Some(_) => j.error = "no local IPv4 address to offer the phone".into(),
+                }
+            }
+        } else if ui.small_button("stop join").clicked() {
+            j.running = None;
+        }
+    });
+    if !j.error.is_empty() {
+        ui.colored_label(ui.visuals().warn_fg_color, &j.error);
+    }
+    let Some(run) = &j.running else {
+        ui.label(egui::RichText::new("the phone needs only a browser and curl: open the address, type the code, tap the matching number, run the command it shows").weak().small());
+        return;
+    };
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+    let s = match run.session.lock() { Ok(s) => s, Err(_) => return };
+    ui.label(egui::RichText::new(format!("on the phone, open  http://{}:{}/", j.host, run.port)).monospace());
+    match &s.stage {
+        Stage::Login => {
+            ui.label("code for the phone:");
+            ui.label(egui::RichText::new(&s.code.code).monospace().size(28.0).strong());
+        }
+        Stage::Matching { .. } => {
+            ui.label("the phone is choosing -- tap this number on it:");
+            ui.label(egui::RichText::new(s.laptop_number().map(|n| n.to_string()).unwrap_or_default()).size(40.0).strong());
+        }
+        Stage::Confirmed { .. } => {
+            ui.label("the phone has the command. Script fingerprint -- it must match what the phone shows:");
+            ui.label(egui::RichText::new(s.fingerprint().unwrap_or_default()).monospace().size(22.0).strong());
+        }
+        Stage::Joined { report, peer } => {
+            ui.label(egui::RichText::new(format!("joined: {} ({}) at {peer}", report.hostname, report.arch)).strong());
+            ui.label(egui::RichText::new(format!("host key {}  --  next: trust it and install the key from the list below, as {}@{peer}", report.host_key, cockpit::fleet::fleet_user())).small());
+        }
+        Stage::Closed(why) => {
+            ui.colored_label(ui.visuals().warn_fg_color, format!("join closed: {why}"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod join_panel_tests {
+    use super::*;
+
+    #[test]
+    #[allow(deprecated)]
+    fn the_join_panel_draws_every_stage_of_a_real_session() {
+        let run = cockpit::join_server::serve(0, "127.0.0.1", "gitmind", "ssh-ed25519 AAAAkey t").unwrap();
+        let mut j = crate::device_picker::JoinPanel { running: Some(std::sync::Arc::new(run)), host: "127.0.0.1".into(), error: String::new() };
+        let ctx = egui::Context::default();
+        let mut frame = |j: &mut crate::device_picker::JoinPanel| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| join_ui(ui, j));
+            });
+        };
+        let now = cockpit::join_server::now_secs();
+        let session = j.running.as_ref().unwrap().session.clone();
+        frame(&mut j); // Login: the code
+        let code = session.lock().unwrap().code.code.clone();
+        session.lock().unwrap().handle("POST", "/login", &format!("code={code}"), "x", now);
+        frame(&mut j); // Matching: the number
+        let n = session.lock().unwrap().laptop_number().unwrap();
+        session.lock().unwrap().handle("POST", "/pick", &format!("n={n}"), "x", now);
+        frame(&mut j); // Confirmed: the fingerprint
+        let token = match session.lock().unwrap().stage.clone() { cockpit::join_server::Stage::Confirmed { token } => token, s => panic!("{s:?}") };
+        session.lock().unwrap().handle("POST", &format!("/joined/{token}"), "hostname=fp5&host_key=k&arch=aarch64", "172.16.42.1", now);
+        frame(&mut j); // Joined
+        assert!(matches!(session.lock().unwrap().stage, cockpit::join_server::Stage::Joined { .. }));
+        j.running = None;
+        frame(&mut j); // idle, with the hint
     }
 }
