@@ -163,3 +163,128 @@ mod tests {
         assert!((trim - 0.708).abs() < 0.002, "-3 dB as a linear multiplier: {trim}");
     }
 }
+
+// ── warmth: the speaker slider ───────────────────────────────────────────────
+//
+// A phone speaker cannot move enough air for real bass, so two different
+// tricks are used to fake it, and they fail in opposite directions:
+//
+// * **Harmonics** (bankstown). Synthesises the overtones of a bass note the
+//   driver cannot produce; the ear infers the missing fundamental. Cheap in
+//   excursion — the driver only ever reproduces frequencies it can actually
+//   make — but overdone it sounds buzzy and hollow.
+// * **Compression**. Raises the quiet parts, so everything is closer to the
+//   loudest the speaker can manage. Makes a track feel bigger, but flattens
+//   it, and pushed hard it pumps.
+//
+// One slider, blending between them, because they are complements rather
+// than alternatives: harmonics first (free in excursion), compression
+// second (costly in dynamics).
+//
+// A LIMITER is not on the slider. It is always on and it is not optional:
+// bankstown ADDS energy, so peaks that used to sit at full scale now clip,
+// and the whole point of a bass exciter is that people then turn the volume
+// up because it sounds good. The limiter is what stops that from reaching
+// the voice coil as a square wave.
+
+/// Threshold for the always-on limiter, in dBFS.
+pub const LIMIT_DB: f32 = -1.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Warmth {
+    /// bankstown `amt`, 0..1.
+    pub bass_amt: f32,
+    /// bankstown `blend`, how much of the synthesised signal is mixed in.
+    pub bass_blend: f32,
+    /// Compressor ratio, 1.0 = off.
+    pub comp_ratio: f32,
+    /// Compressor threshold in dBFS; less negative means it acts less.
+    pub comp_threshold_db: f32,
+    /// Make-up gain, linear.
+    pub makeup: f32,
+    /// Always-on, never zero.
+    pub limit_db: f32,
+}
+
+/// The slider, 0..1. Zero is bypass — genuinely bypass, so the setting can
+/// be compared against untouched audio rather than against "a bit less".
+///
+/// The first half adds harmonics only. The second half holds harmonics near
+/// their useful maximum and brings the compressor in, because past a point
+/// more harmonics only buzz.
+pub fn warmth(x: f32) -> Warmth {
+    let x = x.clamp(0.0, 1.0);
+    let first = (x * 2.0).min(1.0);
+    let second = ((x - 0.5) * 2.0).max(0.0);
+    Warmth {
+        bass_amt: 0.75 * first,
+        bass_blend: 0.35 + 0.35 * first,
+        comp_ratio: 1.0 + 2.5 * second,
+        comp_threshold_db: -12.0 * second,
+        // Make-up follows the compression, not the harmonics: bankstown is
+        // already louder by construction.
+        makeup: 1.0 + 0.25 * second,
+        limit_db: LIMIT_DB,
+    }
+}
+
+/// bankstown's own control names, for a filter-chain node.
+pub fn bankstown_controls(w: &Warmth) -> Vec<(String, f32)> {
+    vec![
+        ("bankstown:bypass".into(), if w.bass_amt <= 0.0 { 1.0 } else { 0.0 }),
+        ("bankstown:amt".into(), w.bass_amt),
+        ("bankstown:blend".into(), w.bass_blend),
+        // The band it synthesises into, and the final high-pass that keeps
+        // sub-bass the driver cannot make out of the cone entirely.
+        ("bankstown:floor".into(), 45.0),
+        ("bankstown:ceil".into(), 180.0),
+        ("bankstown:final_hp".into(), 40.0),
+        ("bankstown:sat_second".into(), 0.3),
+        ("bankstown:sat_third".into(), 0.6),
+    ]
+}
+
+#[cfg(test)]
+mod warmth_tests {
+    use super::*;
+
+    #[test]
+    fn zero_is_a_real_bypass() {
+        let w = warmth(0.0);
+        assert_eq!(w.bass_amt, 0.0);
+        assert_eq!(w.comp_ratio, 1.0, "no compression either");
+        assert_eq!(bankstown_controls(&w)[0], ("bankstown:bypass".to_string(), 1.0));
+    }
+
+    #[test]
+    fn harmonics_come_first_and_compression_second() {
+        let lo = warmth(0.25);
+        let mid = warmth(0.5);
+        let hi = warmth(1.0);
+        assert!(lo.bass_amt > 0.0 && lo.comp_ratio == 1.0, "the cheap trick first");
+        assert!((mid.bass_amt - hi.bass_amt).abs() < 1e-6, "harmonics stop climbing past halfway");
+        assert!(hi.comp_ratio > mid.comp_ratio, "and the costly one takes over");
+        assert!(hi.comp_threshold_db < mid.comp_threshold_db);
+        // Monotonic overall, so the slider never reverses under a finger.
+        let mut prev = -1.0;
+        for i in 0..=20 {
+            let w = warmth(i as f32 / 20.0);
+            let loudness = w.bass_amt + (w.comp_ratio - 1.0);
+            assert!(loudness >= prev, "went backwards at {i}");
+            prev = loudness;
+        }
+    }
+
+    #[test]
+    fn the_limiter_is_never_off() {
+        // bankstown adds energy and people then raise the volume; without a
+        // limiter that arrives at the coil as clipping.
+        for i in 0..=10 {
+            let w = warmth(i as f32 / 10.0);
+            assert_eq!(w.limit_db, LIMIT_DB);
+            assert!(w.limit_db < 0.0);
+        }
+        assert!(warmth(2.0).bass_amt <= 0.75, "clamped");
+        assert_eq!(warmth(-1.0).bass_amt, 0.0);
+    }
+}
