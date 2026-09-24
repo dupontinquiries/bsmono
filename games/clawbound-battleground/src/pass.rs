@@ -276,6 +276,47 @@ pub fn lane_shapes(lane: Lane) -> Vec<Shape> {
     out
 }
 
+/// A shallow cave over a stretch of side path: the roof spans the ledge
+/// from `a` to `b` and rests on the walls either side.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Cave {
+    pub a: Vec3,
+    pub b: Vec3,
+    /// Half-width of the floor under the roof.
+    pub half: f32,
+    /// Height of the roof's underside.
+    pub height: f32,
+}
+
+impl Cave {
+    /// Is (x, z) under the roof?
+    pub fn covers(&self, x: f32, z: f32) -> bool {
+        let p = Vec3::new(x, 0.0, z);
+        let ab = self.b - self.a;
+        let t = (p - self.a).dot(ab) / ab.length_squared().max(1e-6);
+        (0.0..=1.0).contains(&t) && (self.a + ab * t - p).length() <= self.half + 0.5
+    }
+    pub fn mid(&self) -> Vec3 {
+        (self.a + self.b) * 0.5
+    }
+}
+
+/// The caves: the middle 60% of the two long shoulder-to-side-lane ledges
+/// (LEDGES 4 and 5), mirrored -- four in all.
+pub fn caves() -> Vec<Cave> {
+    let mut v = Vec::new();
+    for i in [4usize, 5] {
+        let ((ax, az), (bx, bz)) = LEDGES[i];
+        for zs in [1.0f32, -1.0] {
+            let (a, b) = (at(ax, az * zs), at(bx, bz * zs));
+            // 6.2: at a mouth the lip (1.4), its noise (0.9) and a stalactite (1.4)
+            // still leave 2.5 u -- at 5.5 the deepest point was 1.8, under a cat
+            v.push(Cave { a: a.lerp(b, 0.2), b: a.lerp(b, 0.8), half: LEDGE_R, height: 6.2 });
+        }
+    }
+    v
+}
+
 /// The narrowest point of every choke, and the lane's direction there.
 pub fn choke_points() -> Vec<(Vec3, Vec3)> {
     CHOKES

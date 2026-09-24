@@ -919,6 +919,20 @@ pub fn run_pass_shots() -> Result<(), String> {
             shoot(&mut renderer, &game, &mut vfx, "pass_owl.png", Camera { eye: look_from, target: at + Vec3::Y * 7.0, fov_y: 0.95 })?;
         }
     }
+    // a cave: from outside its mouth, then from the gameplay camera with the
+    // player's cat inside it (the roof ghosts)
+    if let Some(cave) = crate::pass::caves().into_iter().next() {
+        let d = (cave.b - cave.a).normalize_or_zero();
+        // on the ledge itself, a few units short of the mouth (the first try
+        // stood in the clearing, inside a pine)
+        shoot(&mut renderer, &game, &mut vfx, "pass_cave.png", Camera { eye: cave.a - d * 5.0 + Vec3::Y * 2.2, target: cave.a + d * 10.0 + Vec3::Y * 2.5, fov_y: 1.0 })?;
+        let keep = game.gods[0].pos;
+        game.gods[0].pos = cave.mid();
+        let t = cave.mid() + Vec3::Y * 1.5;
+        let back = Vec3::new(-d.x, 0.0, -d.z);
+        shoot(&mut renderer, &game, &mut vfx, "pass_cave_inside.png", Camera { eye: t + back * 12.0 + Vec3::Y * 6.0, target: t, fov_y: 0.95 })?;
+        game.gods[0].pos = keep;
+    }
     // a choke, from the wide lane looking into the narrows
     let (cp, cd) = crate::pass::choke_points()[2];
     shoot(&mut renderer, &game, &mut vfx, "pass_choke.png", Camera { eye: cp - cd * 22.0 + Vec3::Y * 6.0, target: cp + cd * 6.0 + Vec3::Y * 2.0, fov_y: 0.95 })?;
