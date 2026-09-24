@@ -44,15 +44,19 @@ pub fn video_at(project: &Project, playhead: Ticks) -> Option<(String, Ticks)> {
 
 /// The coarse cache key: half-second steps, so scrubbing repaints at 2 fps
 /// while a paused playhead costs zero subprocesses per frame.
-/// EVERY video clip under the playhead, one per video track, in track
-/// order — the stack the compositor paints bottom to top. Each carries its
+/// EVERY video clip under the playhead, one per video track, in PAINT
+/// order: bottom first, so the compositor (which paints its slice bottom to
+/// top) ends on the FIRST video track -- the topmost, as `video_at`, the
+/// export and the timeline all have it. This returned track order until
+/// c20, which painted the top track UNDER the others: a full-frame clip on a
+/// lower track hid the one the caption named. Each carries its
 /// source path, media time, the clip's transform (from a `transform`
 /// effect, identity otherwise) and its blend (from a `blend` effect,
 /// Normal at full opacity otherwise). `video_at` is the first of these;
 /// it stays because the cache key and the caption use it.
 pub fn layers_at(project: &Project, playhead: Ticks) -> Vec<LayerSpec> {
     let mut out = Vec::new();
-    for t in project.tracks.iter().filter(|t| t.kind == TrackKind::Video) {
+    for t in project.tracks.iter().rev().filter(|t| t.kind == TrackKind::Video) {
         for c in project.clips.values().filter(|c| c.track == t.id) {
             if c.pos <= playhead && playhead < c.end() {
                 let Some(src) = project.sources.get(&c.source) else { continue };
@@ -413,6 +417,31 @@ mod tests {
         assert_ne!(coarse(Ticks::from_seconds(1.4)), coarse(Ticks::from_seconds(1.6)),
                    "crossing it: a new frame");
     }
+    /// The compositor paints its slice bottom to top, so the LAST layer is
+    /// the one on top -- and that must be the clip `video_at` (and the
+    /// export, and the timeline) call the topmost: the FIRST video track.
+    #[test]
+    fn the_stack_is_painted_so_the_first_video_track_ends_on_top() {
+        let mut p = Project::default();
+        for (i, name) in ["top", "bottom"].iter().enumerate() {
+            p.apply(&Op::AddTrack { track: Track { id: TrackId(10 + i as u64), kind: TrackKind::Video, name: (*name).into(),
+                muted: false, locked: false, gain: 1.0, route: None }, at: i }).unwrap();
+            p.apply(&Op::AddSource { source: Source { id: SourceId(20 + i as u64), path: format!("{name}.mp4"),
+                len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2, has_video: true, kind: studio_core::SourceKind::File } }).unwrap();
+            p.apply(&Op::AddClip { clip: Clip { id: ClipId(30 + i as u64), source: SourceId(20 + i as u64), track: TrackId(10 + i as u64),
+                pos: Ticks::ZERO, src_in: Ticks::ZERO, len: Ticks::from_seconds(5.0), gain: 1.0, effects: vec![] } }).unwrap();
+        }
+        let layers = layers_at(&p, Ticks::from_seconds(1.0));
+        assert_eq!(layers.iter().map(|l| l.path.as_str()).collect::<Vec<_>>(), ["bottom.mp4", "top.mp4"]);
+        assert_eq!(layers.last().unwrap().path, video_at(&p, Ticks::from_seconds(1.0)).unwrap().0);
+        // and through the compositor itself: two opaque full frames, the top one is what shows
+        let (red, blue) = ([255u8, 0, 0].repeat(4), [0u8, 0, 255].repeat(4));
+        let frame = |l: &LayerSpec| if l.path == "top.mp4" { &red } else { &blue };
+        let stack: Vec<_> = layers.iter().map(|l| studio_fx::compositor::Layer { rgb: frame(l), w: 2, h: 2,
+            transform: l.transform, mode: l.mode, opacity: l.opacity }).collect();
+        assert_eq!(&studio_fx::compositor::composite(2, 2, [0, 0, 0], &stack)[..3], &[255, 0, 0]);
+    }
+
     #[test]
     fn a_second_video_track_is_a_second_layer_with_its_blend_and_transform() {
         let mut p = Project::default();
@@ -436,11 +465,12 @@ mod tests {
         }
         let layers = layers_at(&p, Ticks::from_seconds(1.0));
         assert_eq!(layers.len(), 2);
-        assert_eq!(layers[0].path, "v1.mp4");
-        assert_eq!(layers[0].mode, studio_fx::compositor::BlendMode::Normal);
-        assert_eq!(layers[1].mode, studio_fx::compositor::BlendMode::Multiply);
-        assert!((layers[1].opacity - 0.5).abs() < 1e-6);
-        assert!((layers[1].transform.x - 0.25).abs() < 1e-6);
+        // paint order: v2 (the lower track) first, v1 last
+        assert_eq!(layers[1].path, "v1.mp4");
+        assert_eq!(layers[1].mode, studio_fx::compositor::BlendMode::Normal);
+        assert_eq!(layers[0].mode, studio_fx::compositor::BlendMode::Multiply);
+        assert!((layers[0].opacity - 0.5).abs() < 1e-6);
+        assert!((layers[0].transform.x - 0.25).abs() < 1e-6);
         assert!(layers_at(&p, Ticks::from_seconds(7.0)).is_empty());
     }
 
