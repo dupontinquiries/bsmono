@@ -516,6 +516,12 @@ fn main() {
     // cost of guessing software on real hardware is a shell that feels
     // sluggish for no reason.
     sb.view.accelerated = true;
+    // The speaker chain is tideshell's own sink, so tideshell puts it in
+    // place rather than leaving it to a script the user has to find.
+    {
+        let out = tideshell_egui::effects::ensure_speaker_chain();
+        sb.shell.note(format!("{out:?}"));
+    }
     sb.view.camera_mirror = cam_mount.mirror;
     sb.shell.note(tideshell_egui::devices::describe(&model, false, cam_mount));
     sb.shell.set_date(tideshell_egui::sensors::local_yday());

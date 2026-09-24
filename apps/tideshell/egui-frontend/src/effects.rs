@@ -422,6 +422,33 @@ pub fn apply_voicing(tone: f32) -> Outcome {
     }
 }
 
+/// Put the chain's config in place at startup, so the sink exists without
+/// anyone running a script or touching a slider first.
+///
+/// Writes only when the file is absent or its content has changed, because
+/// rewriting it every boot would churn a file PipeWire watches. Says what it
+/// did; the caller decides whether that is worth a note.
+pub fn ensure_speaker_chain() -> Outcome {
+    let Some(path) = speaker_config_path() else {
+        return Outcome::Failed("no config dir for the speaker chain".into());
+    };
+    let want = tideshell_core::audio::speaker_chain_config();
+    if std::fs::read_to_string(&path).is_ok_and(|have| have == want) {
+        return Outcome::Done(format!("speaker chain config already current at {}", path.display()));
+    }
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    match std::fs::write(&path, &want) {
+        // Not restarting PipeWire here on purpose: killing audio out from
+        // under whatever is playing, at login, to install a sink nobody has
+        // asked for yet, would be a worse bug than a sink that appears next
+        // boot.
+        Ok(()) => Outcome::Done(format!("speaker chain written to {}; it appears after `systemctl --user restart pipewire`", path.display())),
+        Err(e) => Outcome::Failed(format!("cannot write {}: {e}", path.display())),
+    }
+}
+
 /// Point the speaker chain's matrix at the screen's current orientation.
 ///
 /// The same rotation that turns the display moves the audio, because what

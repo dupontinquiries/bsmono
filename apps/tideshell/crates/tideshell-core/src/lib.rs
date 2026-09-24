@@ -29,6 +29,7 @@ pub mod anim;
 pub mod audio;
 pub mod bar;
 pub mod carousel;
+pub mod chaingraph;
 pub mod clock;
 pub mod cold;
 pub mod control_center;
