@@ -86,11 +86,25 @@ impl Camera {
 pub struct GpuMesh {
     buf: wgpu::Buffer,
     count: u32,
+    /// Bounding sphere of the instances in model space, for shadow culling.
+    bound: (Vec3, f32),
 }
 
 // --- renderer -------------------------------------------------------------------
 
+/// What the last frame drew: for profiling culling and budgets.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FrameStats {
+    pub draws: u32,
+    /// Voxel instances in the main pass (opaque + transparent).
+    pub instances: u64,
+    /// Voxel instances in the shadow pass.
+    pub shadow_instances: u64,
+}
+
 pub struct Renderer {
+    /// Counters for the last `render_frame`.
+    pub stats: FrameStats,
     /// Draws refused this frame for want of a slot; reported, not silent.
     pub dropped_draws: u32,
     pub device: wgpu::Device,
@@ -669,6 +683,7 @@ impl Renderer {
             transparent: Vec::new(),
             draws: Vec::new(),
             dropped_draws: 0,
+            stats: FrameStats::default(),
             particles: Vec::new(),
             camera: Camera { eye: Vec3::ZERO, target: Vec3::Y, fov_y: 1.05 },
             time: 0.0,
@@ -700,7 +715,22 @@ impl Renderer {
             contents: bytemuck::cast_slice(&mesh.inst),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
-        self.meshes.insert(id, GpuMesh { buf, count: mesh.inst.len() as u32 });
+        let bound = {
+            let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for i in &mesh.inst {
+                let p = Vec3::new(i.off_ao[0], i.off_ao[1], i.off_ao[2]);
+                lo = lo.min(p);
+                hi = hi.max(p);
+            }
+            if mesh.inst.is_empty() {
+                (Vec3::ZERO, 0.0)
+            } else {
+                let c = (lo + hi) * 0.5;
+                // + a generous voxel: instance scale is per voxel
+                (c, (hi - c).length() + 2.0)
+            }
+        };
+        self.meshes.insert(id, GpuMesh { buf, count: mesh.inst.len() as u32, bound });
         id
     }
 
@@ -935,6 +965,12 @@ impl Renderer {
             label: Some("frame"),
         });
 
+        {
+            let count = |q: &[(u64, u32)]| q.iter().filter_map(|(m, _)| self.meshes.get(m)).map(|m| m.count as u64).sum::<u64>();
+            let (o, t) = (count(&self.opaque), count(&self.transparent));
+            self.stats = FrameStats { draws: self.draws.len() as u32, instances: o + t, shadow_instances: 0 };
+        }
+        let mut shadow_n = 0u64;
         // --- shadow pass ---------------------------------------------------------
         if !self.opaque.is_empty() {
             let mut sp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -955,8 +991,19 @@ impl Renderer {
             sp.set_bind_group(0, &self.shadow_bind, &[0]);
             sp.set_vertex_buffer(0, self.cube_vbuf.slice(..));
             sp.set_index_buffer(self.cube_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            // Only what can land in the shadow map. It covers a box round
+            // what the camera looks at, and drawing every chunk the CAMERA
+            // sees into it doubled the voxel work of every frame
+            // (CLAWBOUND_SHOTS=perf: "shadow" == "instances" everywhere).
             for (mesh_id, di) in &self.opaque {
                 if let Some(m) = self.meshes.get(mesh_id) {
+                    let model = Mat4::from_cols_array_2d(&self.draws[*di as usize].model);
+                    let c = model.transform_point3(m.bound.0);
+                    let sc = model.x_axis.truncate().length().max(model.y_axis.truncate().length()).max(model.z_axis.truncate().length());
+                    if !sphere_in_frustum(&lvp, c, m.bound.1 * sc) {
+                        continue;
+                    }
+                    shadow_n += m.count as u64;
                     sp.set_bind_group(0, &self.shadow_bind, &[(*di as u32) * DYN_ALIGN as u32]);
                     sp.set_vertex_buffer(1, m.buf.slice(..));
                     sp.draw_indexed(0..36, 0, 0..m.count);
@@ -964,6 +1011,7 @@ impl Renderer {
             }
         }
 
+        self.stats.shadow_instances = shadow_n;
         // --- main scene pass (HDR MSAA) ------------------------------------------
         if let (Some((_, msaa_view)), Some((_, depth_view)), Some((_, resolve_view))) =
             (&self.hdr_msaa, &self.depth, &self.hdr_resolve)

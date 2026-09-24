@@ -782,7 +782,11 @@ pub fn waterfall(h: f32, variant: i32) -> VoxelMesh {
 /// a curved wall. Shards root at the BACK of the grid (inside the wall the
 /// placement puts it against) and grow forward, so the crag emerges from
 /// the rock instead of hanging on it.
-pub fn crag(size: f32, variant: i32, lean: f32, vox: f32, yaw: f32) -> VoxelMesh {
+///
+/// `spiky`: the wide, bristling cluster -- more spread, rooted further back,
+/// thicker shards. It frames a choke like a gate (preferred there over the
+/// slim ribs on a side-by-side look); the ribs suit the long walls.
+pub fn crag(size: f32, variant: i32, lean: f32, vox: f32, yaw: f32, spiky: bool) -> VoxelMesh {
     let k = 0.6 / vox.max(0.1);
     let n = ((24.0 * size * k).clamp(6.0, 44.0)) as usize;
     let ny = ((34.0 * size * k).clamp(8.0, 60.0)) as usize;
@@ -792,7 +796,7 @@ pub fn crag(size: f32, variant: i32, lean: f32, vox: f32, yaw: f32) -> VoxelMesh
         x - x.floor()
     };
     let c = n as f32 * 0.5;
-    let shards = 2 + (h(1) * 3.0) as i32;
+    let shards = if spiky { 3 + (h(1) * 2.0) as i32 } else { 2 + (h(1) * 3.0) as i32 };
     for s in 0..shards {
         let k = 10 + s * 13;
         // base near the centre, spread a little; the main shard biggest
@@ -803,15 +807,20 @@ pub fn crag(size: f32, variant: i32, lean: f32, vox: f32, yaw: f32) -> VoxelMesh
         // ribs, not boulders: little spread along the wall (a curved wall
         // under a wide crag buries one end and bares the other) and rooted
         // close to the face line
-        let across = (h(k) - 0.5) * n as f32 * 0.32;
-        let back = -(n as f32) * (0.04 + 0.06 * h(k + 1));
+        let across = (h(k) - 0.5) * n as f32 * if spiky { 0.45 } else { 0.32 };
+        let back = -(n as f32) * if spiky { 0.18 + 0.12 * h(k + 1) } else { 0.04 + 0.06 * h(k + 1) };
         let bx = c + fz * across + fx * back;
         let bz = c - fx * across + fz * back;
         let len = ny as f32 * if main { 0.9 } else { 0.45 + h(k + 2) * 0.35 };
         let tilt = (0.15 + lean * 0.75) * (0.7 + h(k + 3) * 0.6);
         let yaw_s = yaw + (h(k + 4) - 0.5) * 0.6; // out of the wall, give or take
         let dir = glam::Vec3::new(tilt.sin() * yaw_s.sin(), tilt.cos(), tilt.sin() * yaw_s.cos()).normalize();
-        let r0 = n as f32 * if main { 0.15 } else { 0.09 + h(k + 5) * 0.05 };
+        let r0 = n as f32 * match (spiky, main) {
+            (true, true) => 0.22,
+            (true, false) => 0.14 + h(k + 5) * 0.08,
+            (false, true) => 0.15,
+            (false, false) => 0.09 + h(k + 5) * 0.05,
+        };
         // the section: 4..7 corners at irregular angles and radii
         let corners = 4 + (h(k + 6) * 4.0) as usize;
         let poly: Vec<(f32, f32)> = (0..corners)

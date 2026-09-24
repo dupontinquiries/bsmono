@@ -32,7 +32,7 @@ pub enum Item {
     /// Broken rock jutting out of a cliff or standing on the plateau
     /// (`props::crag`). Rooted in the rock: scenery, not collision -- the
     /// floor's edge is already the wall.
-    Crag { at: Vec3, size: f32, lean: f32, facing: Vec3, variant: i32, coarse: bool },
+    Crag { at: Vec3, size: f32, lean: f32, facing: Vec3, variant: i32, coarse: bool, spiky: bool },
 }
 
 /// Distinct crag meshes built; placements share them.
@@ -252,21 +252,54 @@ pub fn placements() -> Vec<Item> {
                             }
                         }
                         let at = at + Vec3::Y * -0.6;
-                        out.push(Item::Crag { at, size: sz, lean: ln, facing, variant: v, coarse: false });
+                        out.push(Item::Crag { at, size: sz, lean: ln, facing, variant: v, coarse: false, spiky: false });
                     } else if top > 18.0 && !tight {
                         let y = rng.range(10.0, top * 0.75);
                         let at = foot - facing * (face_at(y) + 0.6) + Vec3::Y * (y - 0.6);
-                        out.push(Item::Crag { at, size: rng.range(0.8, 1.2), lean: rng.range(0.3, 0.5), facing, variant: v, coarse: true });
+                        out.push(Item::Crag { at, size: rng.range(0.8, 1.2), lean: rng.range(0.3, 0.5), facing, variant: v, coarse: true, spiky: false });
                     }
                 } else if d > 5.0 && d < 60.0 && rng.f32() < 0.03 && free(jx, jz, 16.0) {
                     let top = pass::terrain_height(jx, jz);
                     if top < 60.0 {
-                        out.push(Item::Crag { at: Vec3::new(jx, top - 0.8, jz), size: rng.range(1.0, 1.6), lean: rng.range(0.0, 0.3), facing: out_of(jx, jz), variant: v, coarse: true });
+                        out.push(Item::Crag { at: Vec3::new(jx, top - 0.8, jz), size: rng.range(1.0, 1.6), lean: rng.range(0.0, 0.3), facing: out_of(jx, jz), variant: v, coarse: true, spiky: false });
                     }
                 }
                 x += 2.5;
             }
             z += 2.5;
+        }
+    }
+
+    // Gate crags: at every choke, big spiky clusters on both walls either
+    // side of the narrows, jutting out over the approach. They frame the
+    // choke; slim ribs there only decorated it (compared side by side).
+    // Rooted in the rock (sdf >= 0.8) with the lean built in, so the gap
+    // itself -- `pass::CHOKE_R` -- is never narrowed at floor level.
+    for (ci, (p, dir)) in pass::choke_points().into_iter().enumerate() {
+        let side = Vec3::new(-dir.z, 0.0, dir.x);
+        for (k, (along, sgn)) in [(-9.0f32, 1.0f32), (-15.0, -1.0), (8.0, -1.0), (14.0, 1.0), (-4.0, -1.0), (4.0, 1.0)].into_iter().enumerate() {
+            // from the lane's centre, out to that wall, then into the rock
+            let mut q = p + dir * along;
+            for _ in 0..200 {
+                if f.sdf(q.x, q.z) >= 0.0 {
+                    break;
+                }
+                q += side * sgn * 0.1;
+            }
+            for _ in 0..40 {
+                if f.sdf(q.x, q.z) >= 1.0 {
+                    break;
+                }
+                q += side * sgn * 0.1;
+            }
+            // a thin wall with another corridor behind it (a slot passes
+            // close to a mid choke): no solid rock to root in, no gate crag
+            if f.sdf(q.x, q.z) < 0.8 {
+                continue;
+            }
+            let facing = -side * sgn;
+            let y = if k >= 4 { 3.5 } else { rng.range(0.5, 2.5) };
+            out.push(Item::Crag { at: Vec3::new(q.x, y - 0.6, q.z), size: rng.range(1.05, 1.45), lean: rng.range(0.45, 0.7), facing, variant: (ci as i32 * 7 + k as i32) % CRAG_VARIANTS, coarse: false, spiky: true });
         }
     }
 
@@ -329,10 +362,10 @@ pub fn build() -> (Vec<Piece>, Blockers) {
             Item::HighPine { x, z, y, scale } => {
                 pieces.push(Piece { mesh: weathered(props::pine(scale), 0.4, 0.75), pos: Vec3::new(x, y, z), quarter: 0, vsize: V_MED, sway: 0.4 });
             }
-            Item::Crag { at, size, lean, facing, variant, coarse } => {
+            Item::Crag { at, size, lean, facing, variant, coarse, spiky } => {
                 // a rib standing proud of the face has a base cats must
                 // not walk through
-                if !coarse && at.y < 0.0 && pass::floor().sdf(at.x, at.z) < 0.5 {
+                if !coarse && !spiky && at.y < 0.0 && pass::floor().sdf(at.x, at.z) < 0.5 {
                     let b = at + facing * (0.5 * size);
                     blockers.push(crate::blockers::Blocker { shape: crate::blockers::Shape::Circle { x: b.x, z: b.z, r: 0.8 * size }, top: 4.0, cover: crate::blockers::Cover::NONE });
                 }
@@ -341,10 +374,10 @@ pub fn build() -> (Vec<Piece>, Blockers) {
                 // a curved wall's real normal, and the blades read as pasted
                 // on sideways.
                 let yb = yaw_bucket(facing);
-                let key = (variant * 2 + coarse as i32, (size * 4.0).round() as i32, (lean * 4.0).round() as i32 * 64 + yb);
+                let key = (variant * 4 + coarse as i32 + 2 * spiky as i32, (size * 4.0).round() as i32, (lean * 4.0).round() as i32 * 64 + yb);
                 let vox = if coarse { 1.2 } else { 0.6 };
                 let yaw = yb as f32 / CRAG_YAWS as f32 * std::f32::consts::TAU;
-                let mesh = crags.entry(key).or_insert_with(|| props::crag(key.1 as f32 / 4.0, key.0 / 2, (key.2 / 64) as f32 / 4.0, vox, yaw)).clone();
+                let mesh = crags.entry(key).or_insert_with(|| props::crag(key.1 as f32 / 4.0, key.0 / 4, (key.2 / 64) as f32 / 4.0, vox, yaw, spiky)).clone();
                 pieces.push(Piece { mesh, pos: at, quarter: 0, vsize: vox, sway: 0.0 });
             }
             Item::Fall { at, height, facing } => {
@@ -405,8 +438,14 @@ mod tests {
     fn crags_stand_in_the_rock_and_keep_off_the_chokes() {
         let f = pass::floor();
         let chokes = pass::choke_points();
-        let mut n = 0;
+        let (mut n, mut gates) = (0, 0);
         for it in placements() {
+            if let Item::Crag { at, lean, spiky: true, .. } = it {
+                // gate crags: rooted in the rock, never on the floor
+                assert!(f.sdf(at.x, at.z) >= 0.8, "gate crag not rooted in the rock at {at}");
+                gates += 1;
+                continue;
+            }
             if let Item::Crag { at, lean, .. } = it {
                 n += 1;
                 // rooted at the wall: on the face line or behind it
@@ -418,5 +457,6 @@ mod tests {
             }
         }
         assert!(n > 200, "the walls should be broken up: {n} crags");
+        assert!(gates >= 4 * pass::CHOKES.len(), "gate crags at every choke: {gates}");
     }
 }

@@ -77,6 +77,30 @@ pub struct PropChunk {
     pub center: Vec3,
     pub radius: f32,
     pub vsize: f32,
+    /// The coarse copy (`voxel::downsample`, voxel `2 * vsize`), drawn
+    /// beyond `LOD_DIST`. None for chunks already coarse.
+    pub lod: Option<u64>,
+}
+
+/// Beyond this distance (camera to the chunk's sphere) a chunk draws its
+/// coarse copy: at gameplay height most voxel instances were chunks far
+/// down a lane, at full resolution.
+pub const LOD_DIST: f32 = 70.0;
+/// Fine-detail chunks (ferns, scrub, spray: voxel 0.35) are not drawn past
+/// this: a few pixels each by then.
+pub const DETAIL_DIST: f32 = 110.0;
+
+/// Which mesh a chunk draws from a camera at `eye`, and at what voxel size:
+/// None = not at all (fine detail, far away).
+pub fn chunk_choice(ch: &PropChunk, eye: Vec3) -> Option<(u64, f32)> {
+    let d = (eye - ch.center).length() - ch.radius;
+    if ch.vsize < 0.5 && d > DETAIL_DIST {
+        return None;
+    }
+    match ch.lod {
+        Some(l) if d > LOD_DIST => Some((l, ch.vsize * 2.0)),
+        _ => Some((ch.mesh, ch.vsize)),
+    }
 }
 
 /// `puppet::Probe` over the real arena: the terrain height field, the
@@ -208,7 +232,11 @@ impl Scene {
         for (mesh, center, radius, vsize) in chunk_builds {
             total += mesh.inst.len();
             let id = r.upload_mesh(&mesh);
-            chunks.push(PropChunk { mesh: id, center, radius, vsize });
+            let lod = (vsize < 1.0).then(|| {
+                let coarse = crate::voxel::downsample(&mesh, vsize);
+                r.upload_mesh(&coarse)
+            });
+            chunks.push(PropChunk { mesh: id, center, radius, vsize, lod });
         }
         total += bird_mesh.inst.len();
         let bird = r.upload_mesh(&bird_mesh);
@@ -282,6 +310,7 @@ impl Scene {
         let vp = cam.view_proj(r.width as f32 / r.height.max(1) as f32);
         let any_char = !game.disasters.charred.is_empty();
         for ch in &self.chunks {
+            let Some((mesh, vox)) = chunk_choice(ch, cam.eye) else { continue };
             if sphere_in_frustum(&vp, ch.center, ch.radius) {
                 // burnt jungle: the flora in a charred chunk goes black-brown
                 let tint = if any_char {
@@ -290,7 +319,7 @@ impl Scene {
                 } else {
                     chunk_tint
                 };
-                r.queue_draw(ch.mesh, Mat4::IDENTITY, tint, 0.0, ch.vsize, false);
+                r.queue_draw(mesh, Mat4::IDENTITY, tint, 0.0, vox, false);
             }
         }
 
@@ -1201,13 +1230,17 @@ fn batch(pieces: Vec<Piece>, blockers: Blockers) -> (Vec<(VoxelMesh, Vec3, f32, 
             center += p.pos;
         }
         center /= plist.len() as f32;
+        // The sphere must hold every piece in 3D. It assumed everything
+        // sat near the ground (centre y = 8, horizontal distance only):
+        // true on the jungle, false on the pass, whose crags and pines stand
+        // 30-60 u up the plateau -- outside the sphere, so culled while on
+        // screen or drawn while off it.
+        center.y += 8.0;
         let mut radius = 6.0f32;
         for p in &plist {
-            let dxz = (Vec3::new(p.pos.x, 0.0, p.pos.z) - Vec3::new(center.x, 0.0, center.z)).length();
-            radius = radius.max(mesh_radius(&p.mesh) + dxz);
+            radius = radius.max(mesh_radius(&p.mesh) + (p.pos - center).length());
         }
-        center.y = 8.0;
-        radius += 14.0;
+        radius += 6.0;
         out.push((merged, center, radius, plist[0].vsize));
     }
     eprintln!(
@@ -1298,6 +1331,39 @@ mod plan_tests {
         let mut a = crate::voxel::Grid::new(5, 5, 5);
         a.filled_box(0, 0, 0, 4, 4, 4, [0.2, 0.6, 0.2, 0.5]);
         assert_eq!(a.mesh(0.5, true).inst.len(), 125, "nothing behind a translucent voxel is culled");
+    }
+
+    /// Every voxel of every chunk lies inside that chunk's culling sphere,
+    /// on both maps. The spheres assumed everything stood near the ground;
+    /// the pass's plateau crags and pines did not, so they could be culled
+    /// while on screen.
+    #[test]
+    fn every_voxel_is_inside_its_chunks_culling_sphere() {
+        for m in crate::map::MapId::ALL {
+            crate::map::with(m, || {
+                let (chunks, _, _) = build_world();
+                for (mesh, center, radius, _) in &chunks {
+                    for i in &mesh.inst {
+                        let p = Vec3::new(i.off_ao[0], i.off_ao[1], i.off_ao[2]);
+                        assert!((p - *center).length() <= *radius + 1e-3, "{m:?}: voxel at {p} outside its chunk's sphere ({center}, r {radius})");
+                    }
+                }
+            });
+        }
+    }
+
+    /// Near: the full mesh. Past LOD_DIST: the coarse copy at twice the
+    /// voxel size. Fine detail past DETAIL_DIST: nothing.
+    #[test]
+    fn chunks_choose_their_detail_by_distance() {
+        let ch = |vsize: f32| PropChunk { mesh: 1, center: Vec3::ZERO, radius: 10.0, vsize, lod: Some(2) };
+        let at = |d: f32| Vec3::new(10.0 + d, 0.0, 0.0);
+        assert_eq!(chunk_choice(&ch(0.6), at(LOD_DIST - 1.0)), Some((1, 0.6)));
+        assert_eq!(chunk_choice(&ch(0.6), at(LOD_DIST + 1.0)), Some((2, 1.2)));
+        assert_eq!(chunk_choice(&ch(0.35), at(DETAIL_DIST + 1.0)), None);
+        assert_eq!(chunk_choice(&ch(0.6), at(DETAIL_DIST + 50.0)), Some((2, 1.2)), "only fine detail is dropped");
+        let coarse = PropChunk { lod: None, ..ch(1.2) };
+        assert_eq!(chunk_choice(&coarse, at(300.0)), Some((1, 1.2)));
     }
 
     /// Twinfang Pass within its budget. The crags first came to 1.07M

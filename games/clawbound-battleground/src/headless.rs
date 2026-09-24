@@ -70,6 +70,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("intro") {
         return run_intro_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("perf") {
+        return run_perf();
+    }
     let (_instance, _adapter, device, queue) =
         make_device().ok_or_else(|| "No suitable GPU backend found (install mesa-vulkan-drivers for lavapipe)".to_string())?;
     let adapter_info = {
@@ -1041,6 +1044,95 @@ pub fn run_intro_shots() -> Result<(), String> {
             save_shot(&renderer.device, &renderer.queue, &target, caps[next].1)?;
             println!("saved {} (t={:.2}, {:?})", caps[next].1, it.t, f.beat);
             next += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Profiling spot-check: the active map, a gameplay camera (the app's
+/// distance and pitch) at representative places, and per place the CPU
+/// time to build the frame (`Scene::draw`), the time to render it to GPU
+/// completion, the draws and voxel instances drawn, and how many static
+/// chunks survived culling. Plus two high views. lavapipe renders on the
+/// CPU, so the absolute times are not a phone's; the ratios between maps
+/// and places, and the counts, are the point.
+/// `CLAWBOUND_SHOTS=perf clawbound-battleground --screenshot [--map pass]`
+pub fn run_perf() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("perf"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let t0 = std::time::Instant::now();
+    let scene = Scene::new(&mut renderer);
+    let build = t0.elapsed().as_secs_f32();
+    let mut rng = Rng::new(0x9E7F);
+    let (blue, red) = crate::map::team_picks(3, &mut rng);
+    let mut game = Game::new_teams(&blue, &red);
+    game.blockers = scene.blockers.clone();
+    // a minute of play so cats, minions and effects are out on the map
+    for _ in 0..(60 * 60) {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+    }
+    let mut vfx = Vfx::default();
+    let total_chunks = scene.chunks.len();
+    let total_inst: u64 = scene.total_voxels as u64;
+    println!("map {:?}: {} cats, world build {:.1} s, {} static chunks, {} voxel instances uploaded", crate::map::active(), game.gods.len(), build, total_chunks, total_inst);
+    // the app's gameplay camera: yaw pi, pitch 0.38, its default distance
+    let play = |at: Vec3, yaw: f32| {
+        let pitch = 0.38f32;
+        let dir = Vec3::new(yaw.cos() * pitch.cos(), -pitch.sin(), yaw.sin() * pitch.cos());
+        let target = at + Vec3::Y * 1.5;
+        Camera { eye: target - dir * 14.0, target, fov_y: 0.95 }
+    };
+    let lane_mid = |l: crate::consts::Lane, f: f32| {
+        let p = l.polyline();
+        let len: f32 = p.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+        crate::pass::along(&p, len * f)
+    };
+    let base = Team::Blue.base_pos();
+    let spots: Vec<(&str, Camera)> = vec![
+        ("blue base", play(base + Vec3::new(0.0, 0.0, 12.0), std::f32::consts::FRAC_PI_2)),
+        ("mid lane 1/3", play(lane_mid(crate::consts::Lane::Mid, 0.33), std::f32::consts::FRAC_PI_2)),
+        ("top lane 1/2", play(lane_mid(crate::consts::Lane::Top, 0.5), std::f32::consts::FRAC_PI_2)),
+        ("bot lane 1/4", play(lane_mid(crate::consts::Lane::Bot, 0.25), std::f32::consts::FRAC_PI_2)),
+        ("centre", play(Vec3::ZERO, std::f32::consts::FRAC_PI_2)),
+        ("high view", Camera { eye: Vec3::new(0.0, 120.0, -crate::consts::arena_radius()), target: Vec3::ZERO, fov_y: 1.0 }),
+        ("overhead", Camera { eye: Vec3::new(0.0, 380.0, -60.0), target: Vec3::ZERO, fov_y: 1.1 }),
+    ];
+    println!("{:<14} {:>9} {:>9} {:>6} {:>10} {:>10} {:>8}", "place", "build ms", "frame ms", "draws", "instances", "shadow", "chunks");
+    for (name, cam) in spots {
+        let mut best = (f32::MAX, f32::MAX);
+        let mut chunks_drawn = 0;
+        for k in 0..6 {
+            vfx.update(1.0 / 60.0, &[], &game);
+            let a = std::time::Instant::now();
+            scene.draw(&mut renderer, &game, &mut vfx, cam);
+            let b = a.elapsed().as_secs_f32() * 1000.0;
+            renderer.atmosphere = game.weather.atmosphere();
+            let c = std::time::Instant::now();
+            renderer.render_frame(&view, cam, game.t);
+            renderer.device.poll(wgpu::Maintain::Wait);
+            let d = c.elapsed().as_secs_f32() * 1000.0;
+            if k >= 2 {
+                best = (best.0.min(b), best.1.min(d));
+            }
+            let vp = cam.view_proj(W as f32 / H as f32);
+            chunks_drawn = scene.chunks.iter().filter(|ch| crate::render::sphere_in_frustum(&vp, ch.center, ch.radius)).count();
+        }
+        let st = renderer.stats;
+        println!("{:<14} {:>9.2} {:>9.1} {:>6} {:>10} {:>10} {:>4}/{:<4}", name, best.0, best.1, st.draws, st.instances, st.shadow_instances, chunks_drawn, total_chunks);
+        if std::env::var("CLAWBOUND_PERF_SHOTS").is_ok() {
+            save_shot(&renderer.device, &renderer.queue, &target, &format!("perf_{:?}_{}.png", crate::map::active(), name.replace(' ', "_").replace('/', "-")))?;
         }
     }
     Ok(())
