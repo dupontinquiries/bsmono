@@ -28,8 +28,15 @@ pub enum ScaleAction {
     Text(f32),
     Touch(f32),
     MinTarget(f32),
+    /// "auto" | "on" | "off".
+    Cold(&'static str),
     Reset,
 }
+
+/// Cold mode's three states. Automatic is not the same as off: it is the
+/// battery temperature deciding, so someone who forces it off indoors still
+/// gets it back on its own outside.
+pub const COLD: [(&str, &str); 3] = [("auto", "Automatic"), ("on", "Always on"), ("off", "Off")];
 
 /// What the rows offer. Steps rather than a continuous slider: a thin slider
 /// is the wrong control on a phone, and these want a handful of recognisable
@@ -63,11 +70,13 @@ pub fn apply(p: &mut ShellPrefs, a: &ScaleAction) {
         ScaleAction::Text(v) => p.text_scale = tideshell_core::prefs::parse_scale(&v.to_string()).unwrap_or(1.0),
         ScaleAction::Touch(v) => p.touch_scale = tideshell_core::prefs::parse_scale(&v.to_string()).unwrap_or(1.0),
         ScaleAction::MinTarget(v) => p.min_target = v.clamp(0.0, 96.0),
+        ScaleAction::Cold(v) => p.cold = v.to_string(),
         ScaleAction::Reset => {
             let d = ShellPrefs::default();
             p.text_scale = d.text_scale;
             p.touch_scale = d.touch_scale;
             p.min_target = d.min_target;
+            p.cold = d.cold.clone();
         }
     }
 }
@@ -213,6 +222,21 @@ pub fn ui(p: &mut ShellPrefs, ui: &mut egui::Ui, status: &mut String) -> Vec<Sca
         }
     });
 
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Cold and gloves").size(size));
+    ui.label(
+        egui::RichText::new("Widens targets, slows holds, and gives the volume keys the job of moving the selection, for when the touchscreen will not answer.")
+            .size(size * 0.8)
+            .weak(),
+    );
+    ui.horizontal_wrapped(|ui| {
+        for (token, label) in COLD {
+            if pick(ui, label, h, p.cold == token, size) {
+                out.push(ScaleAction::Cold(token));
+            }
+        }
+    });
+
     ui.add_space(14.0);
     if pick(ui, "Reset", h, false, size) {
         out.push(ScaleAction::Reset);
@@ -273,5 +297,37 @@ mod file_tests {
         std::fs::write(&path, "shell.clock.fuzzy = quarters\n").unwrap();
         assert!(!std::fs::read_to_string(save(&load()).unwrap()).unwrap().contains("quarters"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod cold_tests {
+    use super::*;
+
+    #[test]
+    fn cold_mode_has_three_states_and_automatic_is_the_default() {
+        let mut p = ShellPrefs::default();
+        assert_eq!(p.cold, "auto");
+        for (token, _) in COLD {
+            apply(&mut p, &ScaleAction::Cold(token));
+            assert_eq!(p.cold, token);
+        }
+        // Every offered token is one the shell accepts; an unknown string
+        // would be rejected on load and silently fall back.
+        for (token, _) in COLD {
+            assert!(ShellPrefs::default().apply("shell.cold", token).is_ok(), "{token}");
+        }
+    }
+
+    #[test]
+    fn reset_covers_cold_too() {
+        // A Reset that left one setting behind would be worse than no reset:
+        // it is the button people press when they cannot see what is wrong.
+        let mut p = ShellPrefs::default();
+        apply(&mut p, &ScaleAction::Cold("on"));
+        apply(&mut p, &ScaleAction::Text(1.6));
+        apply(&mut p, &ScaleAction::Reset);
+        assert_eq!(p.cold, "auto");
+        assert_eq!(p.text_scale, 1.0);
     }
 }

@@ -572,6 +572,16 @@ impl Shell {
         items.push(PaletteItem::new("set:autobright", ab, "setting", PaletteAction::ToggleAutoBrightness));
         let fc = if self.prefs.fat_cursor { "Cursor: normal" } else { "Cursor: fat" };
         items.push(PaletteItem::new("set:cursor", fc, "setting", PaletteAction::ToggleFatCursor));
+        // Cold mode cycles rather than toggling, because it has three states
+        // and the middle one matters: "automatic" is not "off", it is the
+        // battery temperature deciding, and someone who has forced it off in
+        // a warm room still wants it back on its own in a cold one.
+        let (cold_label, cold_next) = match self.prefs.cold.as_str() {
+            "on" => ("Cold mode: always on \u{2192} off", "off"),
+            "off" => ("Cold mode: off \u{2192} automatic", "auto"),
+            _ => ("Cold mode: automatic \u{2192} always on", "on"),
+        };
+        items.push(PaletteItem::new("set:cold", cold_label, if self.cold.on { "active" } else { "setting" }, PaletteAction::Cold(cold_next)));
         match self.prefs.layout {
             Layout::PullDown => items.push(PaletteItem::new("set:layout", "Layout: right-hand bar", "setting", PaletteAction::LayoutRightBar)),
             Layout::RightBar => items.push(PaletteItem::new("set:layout", "Layout: pull-down", "setting", PaletteAction::LayoutPullDown)),
@@ -642,6 +652,10 @@ impl Shell {
             PaletteAction::ToggleAutoBrightness => self.tap_quick(QuickKind::AutoBrightness),
             PaletteAction::ToggleFatCursor => {
                 prefs.fat_cursor = !prefs.fat_cursor;
+                self.set_prefs(prefs)
+            }
+            PaletteAction::Cold(next) => {
+                prefs.cold = next.to_string();
                 self.set_prefs(prefs)
             }
             PaletteAction::LayoutPullDown => {
@@ -1632,5 +1646,65 @@ mod tests {
         sh.open_switcher();
         assert_eq!(sh.launch("org.gnome.Console"), vec![Action::LaunchApp("org.gnome.Console".into())]);
         assert!(!sh.switcher.open);
+    }
+}
+
+#[cfg(test)]
+mod cold_palette_tests {
+    use super::*;
+
+    const S: (f32, f32) = (1080.0, 2400.0);
+
+    fn sh() -> Shell {
+        let mut s = Shell::new(ShellPrefs::default(), S);
+        s.rebuild_palette();
+        s
+    }
+
+    fn cold_row(s: &Shell) -> String {
+        s.palette.rows().find(|r| r.key == "set:cold").map(|r| r.label.clone()).expect("a cold row")
+    }
+
+    #[test]
+    fn cold_mode_cycles_through_three_states_not_two() {
+        // Automatic is not off: it is the battery temperature deciding, and
+        // someone who forced it off in a warm room still wants it back on
+        // its own in a cold one. A toggle would lose that state.
+        let mut s = sh();
+        assert!(cold_row(&s).contains("automatic"), "{}", cold_row(&s));
+        s.palette_action(crate::palette::PaletteAction::Cold("on"));
+        assert_eq!(s.prefs.cold, "on");
+        s.rebuild_palette();
+        assert!(cold_row(&s).contains("always on"), "{}", cold_row(&s));
+        s.palette_action(crate::palette::PaletteAction::Cold("off"));
+        s.rebuild_palette();
+        assert!(cold_row(&s).contains("off"), "{}", cold_row(&s));
+        s.palette_action(crate::palette::PaletteAction::Cold("auto"));
+        assert_eq!(s.prefs.cold, "auto");
+    }
+
+    #[test]
+    fn forcing_it_on_widens_the_targets_immediately() {
+        // The setting is only worth having if it takes effect without a
+        // cold battery to prove it.
+        let mut s = sh();
+        let warm = s.cold_tuning().target_scale;
+        s.palette_action(crate::palette::PaletteAction::Cold("on"));
+        assert!(s.cold.on, "forced on");
+        assert!(s.cold_tuning().target_scale > warm);
+        s.palette_action(crate::palette::PaletteAction::Cold("off"));
+        assert!(!s.cold.on);
+    }
+
+    #[test]
+    fn the_row_says_when_it_is_actually_active() {
+        // "automatic" tells you the policy; the hint tells you what is
+        // happening now, which is the thing you want to know in the cold.
+        let mut s = sh();
+        let hint = |s: &Shell| s.palette.rows().find(|r| r.key == "set:cold").unwrap().hint;
+        assert_eq!(hint(&s), "setting");
+        s.palette_action(crate::palette::PaletteAction::Cold("on"));
+        s.rebuild_palette();
+        assert_eq!(hint(&s), "active");
     }
 }

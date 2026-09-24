@@ -54,6 +54,9 @@ pub enum PaletteAction {
     Mode(HoldOption),
     ToggleAutoBrightness,
     ToggleFatCursor,
+    /// Cold/glove mode, as a three-way: automatic (the battery temperature
+    /// decides), forced on, forced off.
+    Cold(&'static str),
     LayoutPullDown,
     LayoutRightBar,
     ClockDigital,
