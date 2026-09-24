@@ -235,7 +235,7 @@ pub fn draw_lan(ctx: &egui::Context, lobby: &mut crate::lanlobby::LanLobby) -> c
     action
 }
 
-pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool, lan: &mut bool) {
+pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool, lan: &mut bool, spectate: &mut bool) {
     setup_style(ctx);
     egui::Area::new(egui::Id::new("menu")).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
         ui.vertical_centered(|ui| {
@@ -258,6 +258,12 @@ pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool, lan: &mu
             glow_hover(ui, &lan_btn, GOLD, 5.0);
             if lan_btn.clicked() {
                 *lan = true;
+            }
+            ui.add_space(8.0);
+            let spec_btn = ui.add_sized([260.0, 42.0], egui::Button::new(egui::RichText::new("SPECTATE").size(18.0)));
+            glow_hover(ui, &spec_btn, GOLD, 5.0);
+            if spec_btn.clicked() {
+                *spectate = true;
             }
             ui.add_space(8.0);
             let quit_btn = ui.add_sized([260.0, 34.0], egui::Button::new(egui::RichText::new("Quit").size(16.0)));
@@ -626,27 +632,7 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
 
     // world-space: hp bars + damage floaters
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("world")));
-    // gods hp bars
-    for i in 0..game.gods.len() {
-        let gg = &game.gods[i];
-        if gg.respawn_t > 0.0 {
-            continue;
-        }
-        if let Some((sp, _depth)) = project(vp, gg.pos + Vec3::Y * 2.6, w, h) {
-            let bw = if i == player { 64.0 } else { 52.0 };
-            let r = Rect::from_min_size(sp - Vec2::new(bw / 2.0, 10.0), Vec2::new(bw, 7.0));
-            painter.rect_filled(r, 2.0, Color32::from_rgb(15, 14, 20));
-            painter.rect_filled(Rect::from_min_size(r.left_top(), Vec2::new(r.width() * (gg.hp / gg.max_hp).clamp(0.0, 1.0), 7.0)), 2.0, col(gg.team));
-            if gg.shield > 0.0 {
-                painter.rect_filled(Rect::from_min_size(r.left_top(), Vec2::new(r.width() * (gg.shield / gg.max_hp).clamp(0.0, 1.0), 3.5)), 2.0, Color32::from_rgb(160, 220, 255));
-            }
-            let name = game.god_name(i);
-            painter.text(sp + Vec2::new(0.0, -16.0), Align2::CENTER_CENTER, name, FontId::proportional(11.0), col(gg.team));
-            if i == player {
-                painter.circle_stroke(sp + Vec2::new(0.0, 8.0), 3.0, Stroke::new(1.5_f32, GOLD));
-            }
-        }
-    }
+    draw_god_bars(&painter, game, Some(player), vp, w, h);
     // minions hp bars (only when damaged)
     for m in &game.minions {
         if m.hp < m.max_hp {
@@ -1273,4 +1259,42 @@ mod hidpi_tests {
         let mid = pts.iter().fold(egui::Vec2::ZERO, |a, p| a + p.to_vec2()) / pts.len() as f32;
         assert!((mid.x - pw / 4.0).abs() < 2.0 && (mid.y - ph / 4.0).abs() < 2.0, "crosshair at {mid:?}, screen middle ({}, {})", pw / 4.0, ph / 4.0);
     }
+}
+
+/// Every living cat's health bar, shield and name, over its head; the
+/// player (if any) marked. Shared by the player's HUD and the spectator's.
+pub fn draw_god_bars(painter: &egui::Painter, game: &Game, player: Option<usize>, vp: Mat4, w: f32, h: f32) {
+    for i in 0..game.gods.len() {
+        let gg = &game.gods[i];
+        if gg.respawn_t > 0.0 {
+            continue;
+        }
+        if let Some((sp, _depth)) = project(vp, gg.pos + Vec3::Y * 2.6, w, h) {
+            let bw = if Some(i) == player { 64.0 } else { 52.0 };
+            let r = Rect::from_min_size(sp - Vec2::new(bw / 2.0, 10.0), Vec2::new(bw, 7.0));
+            painter.rect_filled(r, 2.0, Color32::from_rgb(15, 14, 20));
+            painter.rect_filled(Rect::from_min_size(r.left_top(), Vec2::new(r.width() * (gg.hp / gg.max_hp).clamp(0.0, 1.0), 7.0)), 2.0, col(gg.team));
+            if gg.shield > 0.0 {
+                painter.rect_filled(Rect::from_min_size(r.left_top(), Vec2::new(r.width() * (gg.shield / gg.max_hp).clamp(0.0, 1.0), 3.5)), 2.0, Color32::from_rgb(160, 220, 255));
+            }
+            let name = game.god_name(i);
+            painter.text(sp + Vec2::new(0.0, -16.0), Align2::CENTER_CENTER, name, FontId::proportional(11.0), col(gg.team));
+            if Some(i) == player {
+                painter.circle_stroke(sp + Vec2::new(0.0, 8.0), 3.0, Stroke::new(1.5_f32, GOLD));
+            }
+        }
+    }
+}
+
+/// The spectator's overlay: every cat's bar, the minimap, the mode and who
+/// is watched, and the keys. Nothing of any one cat's own HUD.
+pub fn draw_spectator_hud(ctx: &egui::Context, game: &Game, vp: Mat4, label: &str) {
+    setup_style(ctx);
+    let r = ctx.screen_rect();
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("spectator_world")));
+    draw_god_bars(&painter, game, None, vp, r.width(), r.height());
+    draw_minimap(ctx, game, 0);
+    let top = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("spectator")));
+    top.text(egui::pos2(r.center().x, r.top() + 18.0), Align2::CENTER_TOP, label, FontId::proportional(20.0), GOLD);
+    top.text(egui::pos2(r.center().x, r.top() + 44.0), Align2::CENTER_TOP, "Tab next cat  ·  Z director  ·  X free camera (WASD, mouse, wheel)  ·  Esc leave", FontId::proportional(12.5), Color32::from_rgb(190, 186, 176));
 }

@@ -22,6 +22,8 @@ pub mod floor;
 pub mod map;
 /// The match opening as a timeline: pan, lanes, spawns, versus card.
 pub mod intro;
+/// Watching a match: a director, a chase-cam, free flight, all eased.
+pub mod spectator;
 /// The intro's fanfare, synthesized brass.
 pub mod brass;
 /// Twinfang Pass: the mountain canyon map, 15 a side.
