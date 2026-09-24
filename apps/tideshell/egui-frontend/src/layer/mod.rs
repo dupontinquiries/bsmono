@@ -659,14 +659,32 @@ impl Io {
     /// Wait up to `timeout_ms` for events, dispatch them, act on configures,
     /// and return the input gathered.
     pub fn dispatch(&mut self, timeout_ms: i32) -> Result<Vec<Input>, String> {
+        self.dispatch_with(timeout_ms, None)
+    }
+
+    /// The same, also waking on `extra`.
+    ///
+    /// The loop sleeps up to its timeout on the Wayland connection, so
+    /// anything arriving on another descriptor waits for it — and the power
+    /// key comes in on the control socket. At the idle timeout that was a
+    /// quarter of a second between pressing power and the screen reacting,
+    /// which reads as a phone that is thinking about it. Waiting on both
+    /// costs nothing: it is the same poll with one more entry.
+    pub fn dispatch_with(&mut self, timeout_ms: i32, extra: Option<std::os::fd::BorrowedFd<'_>>) -> Result<Vec<Input>, String> {
         self.flush();
         self.queue.dispatch_pending(&mut self.st).map_err(|e| e.to_string())?;
         if let Some(guard) = self.queue.prepare_read() {
             let fd = guard.connection_fd();
-            let mut fds = [rustix::event::PollFd::new(&fd, rustix::event::PollFlags::IN)];
+            let mut fds: Vec<rustix::event::PollFd> = vec![rustix::event::PollFd::new(&fd, rustix::event::PollFlags::IN)];
+            if let Some(e) = extra.as_ref() {
+                fds.push(rustix::event::PollFd::new(e, rustix::event::PollFlags::IN));
+            }
             let ts = rustix::time::Timespec { tv_sec: (timeout_ms / 1000) as i64, tv_nsec: ((timeout_ms % 1000) as i64) * 1_000_000 };
             let ready = rustix::event::poll(&mut fds, Some(&ts)).unwrap_or(0);
-            if ready > 0 {
+            // Only the Wayland guard may be read from; a wake on the extra
+            // descriptor just ends the sleep so the caller can poll it.
+            let wayland_ready = ready > 0 && fds[0].revents().contains(rustix::event::PollFlags::IN);
+            if wayland_ready {
                 match guard.read() {
                     Ok(_) => {}
                     Err(wayland_client::backend::WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}

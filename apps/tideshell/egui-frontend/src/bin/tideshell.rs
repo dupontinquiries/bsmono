@@ -670,7 +670,11 @@ fn main() {
         } else {
             250
         };
-        let input = io.dispatch(timeout).unwrap_or_else(|e| {
+        // Sleep on the control socket as well as on Wayland: the power key
+        // arrives there, and at the idle timeout it would otherwise wait a
+        // quarter of a second before the screen reacted.
+        let ctl_fd = ctl_server.as_ref().map(|s| s.as_fd());
+        let input = io.dispatch_with(timeout, ctl_fd).unwrap_or_else(|e| {
             eprintln!("tideshell: wayland: {e}");
             std::process::exit(1)
         });

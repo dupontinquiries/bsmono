@@ -232,6 +232,12 @@ impl Server {
         Ok(Server { sock, path: path.to_path_buf() })
     }
 
+    /// The socket, so the main loop can sleep on it alongside Wayland
+    /// rather than discovering a command up to a timeout later.
+    pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.sock)
+    }
+
     /// Every command waiting; unknown text is returned as Err for the trace.
     pub fn poll(&self) -> Vec<Result<Command, String>> {
         let mut out = Vec::new();
