@@ -732,6 +732,7 @@ pub mod roamer_cap; // r330-mobs: spawn-admission cap (no despawn)
 pub mod surface_scan; // r330-world: top-solid-Y from generated voxels (FP32/FP64 fix core)
 pub mod foliage_sway; // r330-gpu: foliage wind-sway vertex tag (§4b)
 pub mod cloth; // position-based cloth: capes, banners, flags (constraints, pins, wind, capsules)
+pub mod ripples; // propagating water-surface waves: damped 2D wave equation, banks reflect
 pub mod legendary_loot; // r331: legendary weapon drop-selection core (swords)
 pub mod frame_correlation; // r332-perf: per-frame spike correlation probe (coordinator)
 pub mod mesh_budget; // hh-r332-t1: per-frame near-mesh build budget
