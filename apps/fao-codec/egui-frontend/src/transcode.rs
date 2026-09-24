@@ -90,6 +90,8 @@ pub struct TranscodeReport {
     pub input_bytes: u64,
     pub output_bytes: u64,
     pub mean_psnr: f64,
+    pub i_frames: usize,
+    pub t_frames: usize,
 }
 
 /// One frame from ffmpeg's pipe at a time, so an encode holds ONE decoded frame in memory,
@@ -176,6 +178,105 @@ pub struct FrameStat {
     pub index: usize,
     pub bytes: usize,
     pub psnr: f64,
+    /// `b'D'` (intra, an anchor) or `b'T'` (predicted from `anchor`).
+    pub marker: u8,
+    pub anchor: Option<usize>,
+    /// Why this frame is what it is: "T", "I: first frame", "I: T larger than an I-frame", ...
+    pub why: String,
+}
+
+/// How to encode. `inter: false` is the original intra-only path (every frame `'D'`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EncodeOpts {
+    pub quality: u8,
+    pub inter: bool,
+    /// Longest run from one I-frame to the next; bounds how far back a seek has to go.
+    pub max_gop: usize,
+    /// A T-frame is refused when its PSNR falls more than this below its anchor's.
+    pub max_psnr_drop: f64,
+}
+
+impl EncodeOpts {
+    pub fn intra(quality: u8) -> EncodeOpts { EncodeOpts { quality, inter: false, max_gop: 1, max_psnr_drop: 0.0 } }
+    pub fn inter(quality: u8) -> EncodeOpts { EncodeOpts { quality, inter: true, max_gop: 120, max_psnr_drop: 3.0 } }
+}
+
+struct Anchor {
+    index: usize,
+    /// The anchor as the DECODER will see it: the Player decodes the anchor to RGB and converts
+    /// it back to YUV before predicting (decode.rs, `b'T'`). Predicting from anything else —
+    /// the encoder's own YUV reconstruction — would put the RGB round-trip error into every
+    /// T-frame as a mismatch the residual never saw.
+    pred_yuv: Vec<u8>,
+    bytes: usize,
+    psnr: f64,
+}
+
+/// One frame in, one container frame out, with the I/T decision. Pure: no ffmpeg, no threads,
+/// so the policy is testable on synthetic frames.
+pub struct FrameEncoder {
+    pub w: usize,
+    pub h: usize,
+    pub opts: EncodeOpts,
+    anchor: Option<Anchor>,
+    index: usize,
+}
+
+pub struct Encoded {
+    pub stat: FrameStat,
+    pub payload: Vec<u8>,
+    /// What the Player will show for this frame.
+    pub recon_rgb: Vec<u8>,
+}
+
+impl FrameEncoder {
+    pub fn new(w: usize, h: usize, opts: EncodeOpts) -> FrameEncoder {
+        FrameEncoder { w, h, opts, anchor: None, index: 0 }
+    }
+
+    pub fn encode(&mut self, rgb: &[u8]) -> Encoded {
+        let (w, h, i) = (self.w, self.h, self.index);
+        self.index += 1;
+        let yuv = crate::decode::rgb_to_yuv420p(rgb, w, h);
+        let why_i = match &self.anchor {
+            _ if !self.opts.inter => "I: intra-only".to_string(),
+            None => "I: first frame".to_string(),
+            Some(_) if i > u16::MAX as usize => "I: past frame 65535 (T anchors are 16-bit)".to_string(),
+            Some(a) if i - a.index >= self.opts.max_gop => format!("I: GOP limit {}", self.opts.max_gop),
+            Some(a) => match self.try_t(&yuv, rgb, a) {
+                Ok(e) => return e,
+                Err(why) => why,
+            },
+        };
+        let payload = fao_v1::compress_frame_dct(&yuv, w, h, self.opts.quality);
+        let recon_yuv = fao_v1::decompress_frame_dct(&payload, w, h).unwrap_or_else(|| yuv.clone());
+        let recon_rgb = crate::decode::yuv_to_rgb(&recon_yuv, w, h);
+        let p = psnr(rgb, &recon_rgb);
+        self.anchor = Some(Anchor { index: i, pred_yuv: crate::decode::rgb_to_yuv420p(&recon_rgb, w, h), bytes: payload.len(), psnr: p });
+        Encoded { stat: FrameStat { index: i, bytes: payload.len(), psnr: p, marker: b'D', anchor: None, why: why_i }, payload, recon_rgb }
+    }
+
+    fn try_t(&self, yuv: &[u8], rgb: &[u8], a: &Anchor) -> Result<Encoded, String> {
+        let (w, h) = (self.w, self.h);
+        let q = (self.opts.quality as u32 * 255 / 100) as u8;
+        let (tf, _est) = fao_v1::v21_predictive::TranslatedFrame::encode_from_anchor(yuv, &a.pred_yuv, w, h, a.index as u16, q)
+            .ok_or("I: no usable prediction")?;
+        let payload = tf.to_bytes(w, h);
+        if payload.len() >= a.bytes {
+            return Err(format!("I: T ({} B) not smaller than an I-frame ({} B)", payload.len(), a.bytes));
+        }
+        // Measure what the Player will actually show: parse the bytes and decode against the
+        // anchor the decoder derives, not the encoder's estimate.
+        let (back, fw, fh) = fao_v1::v21_predictive::TranslatedFrame::from_bytes(&payload).ok_or("I: T did not parse back")?;
+        let recon_yuv = back.decode_with_anchor(&a.pred_yuv, fw, fh).ok_or("I: T did not decode")?;
+        let recon_rgb = crate::decode::yuv_to_rgb(&recon_yuv, w, h);
+        let p = psnr(rgb, &recon_rgb);
+        if p < a.psnr - self.opts.max_psnr_drop {
+            return Err(format!("I: T PSNR {:.1} dB, {:.1} below its anchor", p, a.psnr - p));
+        }
+        let i = self.index - 1;
+        Ok(Encoded { stat: FrameStat { index: i, bytes: payload.len(), psnr: p, marker: b'T', anchor: Some(a.index), why: "T".into() }, payload, recon_rgb })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -194,34 +295,32 @@ impl std::fmt::Display for Stop {
 /// back for PSNR, report, repeat. `on_frame` sees each frame's stat and its DECODED image (what
 /// a viewer of the .fao will see), so a UI can show live output without this module knowing
 /// about egui. `cancel` is checked between frames; ffmpeg is killed on cancel.
-pub fn transcode_stream(path: &str, quality: u8, max_frames: Option<usize>, cancel: &std::sync::atomic::AtomicBool,
+pub fn transcode_stream(path: &str, opts: EncodeOpts, max_frames: Option<usize>, cancel: &std::sync::atomic::AtomicBool,
                         mut on_frame: impl FnMut(&FrameStat, &[u8])) -> Result<(Vec<u8>, TranscodeReport), Stop> {
     let info = probe(path).map_err(Stop::Failed)?;
     let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let mut reader = FrameReader::open(path, info.w, info.h, max_frames).map_err(Stop::Failed)?;
     let (w, h) = (reader.w, reader.h);
+    let mut enc = FrameEncoder::new(w, h, opts);
     let mut container_frames = Vec::new();
     let mut psnr_sum = 0.0;
+    let mut t_frames = 0;
     loop {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) { return Err(Stop::Cancelled); }
         let Some(rgb) = reader.next_frame().map_err(Stop::Failed)? else { break };
-        let yuv = decode_yuv_from_rgb(&rgb, w, h);
-        let payload = fao_v1::compress_frame_dct(&yuv, w, h, quality);
-        let recon_yuv = fao_v1::decompress_frame_dct(&payload, w, h).unwrap_or_else(|| yuv.clone());
-        let recon_rgb = crate::decode::yuv_to_rgb(&recon_yuv, w, h);
-        let p = psnr(&rgb, &recon_rgb);
-        psnr_sum += p;
-        let stat = FrameStat { index: container_frames.len(), bytes: payload.len(), psnr: p };
-        let plen = payload.len();
-        container_frames.push((Vec::new(), payload, b'D', plen, 0.0, 0.0));
-        on_frame(&stat, &recon_rgb);
+        let e = enc.encode(&rgb);
+        psnr_sum += e.stat.psnr;
+        if e.stat.marker == b'T' { t_frames += 1; }
+        let plen = e.payload.len();
+        container_frames.push((Vec::new(), e.payload, e.stat.marker, plen, 0.0, 0.0));
+        on_frame(&e.stat, &e.recon_rgb);
     }
     let n = container_frames.len();
     if n == 0 { return Err(Stop::Failed("ffmpeg produced no frames".into())); }
     let mut out = Vec::new();
-    fao_v1::write_fao_container(&mut out, w, h, info.fps, quality as f32 / 100.0, &container_frames)
+    fao_v1::write_fao_container(&mut out, w, h, info.fps, opts.quality as f32 / 100.0, &container_frames)
         .map_err(|e| Stop::Failed(format!("writing the container: {e}")))?;
-    let report = TranscodeReport { frames: n, w, h, input_bytes, output_bytes: out.len() as u64, mean_psnr: psnr_sum / n as f64 };
+    let report = TranscodeReport { frames: n, w, h, input_bytes, output_bytes: out.len() as u64, mean_psnr: psnr_sum / n as f64, i_frames: n - t_frames, t_frames };
     Ok((out, report))
 }
 
@@ -231,7 +330,7 @@ pub fn transcode(path: &str, quality: u8, max_frames: Option<usize>,
                   mut progress: impl FnMut(usize, usize)) -> Result<(Vec<u8>, TranscodeReport), String> {
     let total = probe(path).ok().map(|i| estimated_frames(&i, max_frames)).unwrap_or(0);
     let never = std::sync::atomic::AtomicBool::new(false);
-    transcode_stream(path, quality, max_frames, &never, |s, _| progress(s.index + 1, total.max(s.index + 1)))
+    transcode_stream(path, EncodeOpts::intra(quality), max_frames, &never, |s, _| progress(s.index + 1, total.max(s.index + 1)))
         .map_err(|e| e.to_string())
 }
 
@@ -392,7 +491,7 @@ mod tests {
         // The streaming encode reports every frame, with the decoded image at full size.
         let never = std::sync::atomic::AtomicBool::new(false);
         let mut stats = vec![];
-        let (bytes, rep) = transcode_stream(p, 60, None, &never, |s, img| { assert_eq!(img.len(), 64 * 48 * 3); stats.push(s.clone()); }).unwrap();
+        let (bytes, rep) = transcode_stream(p, EncodeOpts::intra(60), None, &never, |s, img| { assert_eq!(img.len(), 64 * 48 * 3); stats.push(s.clone()); }).unwrap();
         assert_eq!(stats.iter().map(|s| s.index).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
         assert!(stats.iter().all(|s| s.bytes > 0 && s.psnr > 20.0), "{stats:?}");
         assert_eq!(rep.frames, 5);
@@ -410,7 +509,7 @@ mod tests {
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let mut seen = 0;
         let t = std::time::Instant::now();
-        let r = transcode_stream(v.to_str().unwrap(), 60, None, &cancel, |s, _| {
+        let r = transcode_stream(v.to_str().unwrap(), EncodeOpts::intra(60), None, &cancel, |s, _| {
             seen = s.index + 1;
             if seen == 2 { cancel.store(true, std::sync::atomic::Ordering::Relaxed); }
         });
@@ -427,7 +526,7 @@ mod tests {
         let f = dir.join("notes.txt");
         std::fs::write(&f, "not a video").unwrap();
         let never = std::sync::atomic::AtomicBool::new(false);
-        match transcode_stream(f.to_str().unwrap(), 60, None, &never, |_, _| {}) {
+        match transcode_stream(f.to_str().unwrap(), EncodeOpts::intra(60), None, &never, |_, _| {}) {
             Err(Stop::Failed(m)) => assert!(!m.is_empty()),
             other => panic!("{other:?}"),
         }
@@ -436,5 +535,116 @@ mod tests {
         assert_eq!(estimated_frames(&info, Some(10)), 10);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A textured scene panning 2 px per frame: smooth gradients plus a checker, so motion
+    /// search has something to lock onto and the DCT has real detail to pay for.
+    fn pan(w: usize, h: usize, n: usize) -> Vec<Vec<u8>> {
+        (0..n).map(|f| {
+            let mut v = vec![0u8; w * h * 3];
+            for y in 0..h { for x in 0..w {
+                let sx = x + 2 * f;
+                let c = if ((sx / 8) + (y / 8)) % 2 == 0 { 40 } else { 0 };
+                let i = (y * w + x) * 3;
+                v[i] = ((sx * 3) % 200 + c) as u8;
+                v[i + 1] = ((y * 4) % 200 + c) as u8;
+                v[i + 2] = (((sx + y) * 2) % 200) as u8;
+            }}
+            v
+        }).collect()
+    }
+
+    fn container(w: usize, h: usize, q: u8, enc: &[(FrameStat, Vec<u8>)]) -> Vec<u8> {
+        let frames: Vec<_> = enc.iter().map(|(s, p)| (Vec::new(), p.clone(), s.marker, p.len(), 0.0f64, 0.0f64)).collect();
+        let mut out = Vec::new();
+        fao_v1::write_fao_container(&mut out, w, h, 30.0, q as f32 / 100.0, &frames).unwrap();
+        out
+    }
+
+    /// A textured, static background with a 16×16 object moving 2 px per frame: the content
+    /// v2.1's T-frames are built for (screen recordings, a talking head on a still set).
+    fn moving_object(w: usize, h: usize, n: usize) -> Vec<Vec<u8>> {
+        let bg = pan(w, h, 1).remove(0);
+        (0..n).map(|f| {
+            let mut v = bg.clone();
+            let (ox, oy) = (8 + 2 * f, h / 3);
+            for y in oy..(oy + 16).min(h) { for x in ox..(ox + 16).min(w) {
+                let i = (y * w + x) * 3;
+                v[i] = 230; v[i + 1] = 40 + ((x - ox) * 8) as u8; v[i + 2] = 60;
+            }}
+            v
+        }).collect()
+    }
+
+    #[test]
+    fn t_frames_pay_where_prediction_holds() {
+        let (w, h) = (256, 192);
+        let frames = moving_object(w, h, 16);
+        let mut inter = FrameEncoder::new(w, h, EncodeOpts::inter(70));
+        let mut intra = FrameEncoder::new(w, h, EncodeOpts::intra(70));
+        let enc: Vec<FrameStat> = frames.iter().map(|f| inter.encode(f).stat).collect();
+        let intra_bytes: usize = frames.iter().map(|f| intra.encode(f).payload.len()).sum();
+        let inter_bytes: usize = enc.iter().map(|s| s.bytes).sum();
+        let reasons: Vec<&str> = enc.iter().map(|s| s.why.as_str()).collect();
+        let ts = enc.iter().filter(|s| s.marker == b'T').count();
+        assert!(ts >= 12, "a small moving object on a still scene should predict: {reasons:?}");
+        assert!(inter_bytes * 3 < intra_bytes, "inter {inter_bytes} B vs intra {intra_bytes} B; {reasons:?}");
+        for s in enc.iter().filter(|s| s.marker == b'T') {
+            let a = &enc[s.anchor.unwrap()];
+            assert!(s.psnr >= a.psnr - EncodeOpts::inter(70).max_psnr_drop, "frame {}: {:.2} vs anchor {:.2}", s.index, s.psnr, a.psnr);
+        }
+    }
+
+    /// Any content, including a pan whose T-frames the default policy would refuse: accept them
+    /// all (a generous drop) and check the Player sees exactly what the encoder measured.
+    #[test]
+    fn what_the_player_shows_is_exactly_what_the_encoder_measured() {
+        let (w, h) = (128, 96);
+        let mut frames = pan(w, h, 8);
+        frames.extend(moving_object(w, h, 6));
+        let mut inter = FrameEncoder::new(w, h, EncodeOpts { max_psnr_drop: 30.0, ..EncodeOpts::inter(70) });
+        let enc: Vec<(FrameStat, Vec<u8>)> = frames.iter().map(|f| { let e = inter.encode(f); (e.stat, e.payload) }).collect();
+        let ts = enc.iter().filter(|(s, _)| s.marker == b'T').count();
+        assert_eq!(enc[0].0.why, "I: first frame");
+        assert!(ts >= 8, "enough T-frames for the check to mean something: {:?}", enc.iter().map(|(s, _)| s.why.as_str()).collect::<Vec<_>>());
+        // Every T points at an I-frame (one level of recursion in the Player, never a chain).
+        for (s, _) in &enc {
+            if let Some(a) = s.anchor { assert_eq!(enc[a].0.marker, b'D', "frame {} anchors on {a}", s.index); }
+        }
+        // The Player's own parser and decoder see exactly what the encoder measured: the encoder
+        // predicted from the anchor the decoder reconstructs, so there is no mismatch at all.
+        let f = crate::decode::FaoFile::parse(container(w, h, 70, &enc)).expect("parses");
+        assert_eq!(f.frame_count(), frames.len());
+        for (i, (s, _)) in enc.iter().enumerate() {
+            let shown = f.decode_rgb(i).unwrap_or_else(|g| panic!("frame {i} ({}): {g}", s.why));
+            let p = psnr(&frames[i], &shown);
+            assert!((p - s.psnr).abs() < 1e-9, "frame {i} ({}): Player shows {p:.4} dB, encoder reported {:.4}", s.why, s.psnr);
+        }
+    }
+
+    #[test]
+    fn a_scene_cut_and_the_gop_limit_start_new_anchors_with_a_reason() {
+        let (w, h) = (64, 48);
+        let mut frames = pan(w, h, 6);
+        // A cut: pseudo-random noise, unpredictable from the pan.
+        let mut x: u32 = 12345;
+        frames.push((0..w * h * 3).map(|_| { x = x.wrapping_mul(1103515245).wrapping_add(12345); (x >> 16) as u8 }).collect());
+        let mut e = FrameEncoder::new(w, h, EncodeOpts::inter(70));
+        let stats: Vec<FrameStat> = frames.iter().map(|f| e.encode(f).stat).collect();
+        let cut = stats.last().unwrap();
+        assert_eq!(cut.marker, b'D', "{}", cut.why);
+        assert!(cut.why.starts_with("I: "), "{}", cut.why);
+        // GOP limit: a T never sits max_gop or more frames after its anchor (a refused T
+        // starts a new GOP early, so anchors are not at fixed multiples). On a still-scene
+        // clip every T would be accepted, so the limit is what forces the I-frames.
+        let mut g = FrameEncoder::new(256, 192, EncodeOpts { max_gop: 3, ..EncodeOpts::inter(70) });
+        let st: Vec<FrameStat> = moving_object(256, 192, 10).iter().map(|f| g.encode(f).stat).collect();
+        for s in &st {
+            if let Some(a) = s.anchor { assert!(s.index - a < 3, "frame {} is {} after its anchor", s.index, s.index - a); }
+        }
+        assert!(st.iter().filter(|s| s.why == "I: GOP limit 3").count() >= 2, "{:?}", st.iter().map(|s| s.why.as_str()).collect::<Vec<_>>());
+        let mut only_i = FrameEncoder::new(w, h, EncodeOpts::intra(70));
+        assert!(pan(w, h, 3).iter().all(|f| only_i.encode(f).stat.marker == b'D'), "intra-only stays intra");
+    }
+
 }
 

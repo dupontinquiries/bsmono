@@ -70,14 +70,45 @@ Still honest about scope: the codec is intra DCT only. The GTK dialog's v2.0–v
 and the v9 trailer are not ported (their encoders live in fao_app's main.rs), and the page
 states that instead of offering choices that would all do the same thing.
 
+## Inter frames on the Encode page (c20unified)
+
+T-frames are the v2.1 predictive format the Player already decodes (`TranslatedFrame`: anchor
+index, 16×16 motion vectors, luma residual, `'T'`). `transcode::FrameEncoder` decides per frame,
+and every decision carries its reason (shown live on the page):
+- I (`'D'`, DCT) for the first frame, past the GOP limit, past frame 65535 (anchors are u16),
+  or when the T-frame fails the policy;
+- T only if smaller than the anchor's I-frame AND its PSNR -- measured by parsing and decoding
+  the T bytes exactly as the Player will -- is within `max_psnr_drop` (default 3 dB) of the
+  anchor's. The library's own `try_translate_frame` rejects only below 8 dB, which is noise;
+- a T always references an I-frame, never another T: one level of recursion in the Player.
+
+The encoder predicts from the anchor AS THE PLAYER RECONSTRUCTS IT (decode to RGB, back to
+YUV), not from its own YUV reconstruction; a test decodes the written container through the
+Player's FaoFile/decode_rgb and requires every frame's PSNR to equal what the encoder reported
+(1e-9) -- predicting from the encoder's own YUV instead fails it by 0.07 dB on frame 1.
+
+**Library fix found on the way** (`fao_codec_lib/src/v21_predictive.rs`): T-frame motion
+compensation moved only luma; `decode_with_anchor` then copied the anchor's chroma unmoved,
+and the residual is luma-only, so colour stayed where the anchor had it. A 2 px pan decoded
+at 21.6 dB whatever the residual cost; with chroma moved by MV/2 it is 24.7 dB at the same
+61 bytes. Existing files decode with colour that now follows the motion (no residual was ever
+computed against the old chroma). Regression test in the lib.
+
+What v2.1 T-frames are and are not good at, measured: a small object moving over a still,
+textured scene -- T-frames almost everywhere, total size under a third of intra-only. A camera
+pan -- mostly refused by the policy: every T predicts from the anchor, so frame k is shifted
+2k px against it and the uncovered edge is left to a residual the library skips unless a
+block's error is large (its threshold is ~40 luma levels per pixel at quality 70, tuned for
+screen content). That is the format's design, not a bug; a previous-frame reference or a
+denser residual would be a format change.
+
 ## Not started
 
 - **World tab** — 3D scene viewer (freecam, orbit, colour modes). The largest remaining gap;
   the mesh/rasterizer plumbing the v8 Player work exposed (`SceneMesh`, `V8Decoder`,
   `v8_rasterizer`) is the natural foundation for it.
-- **Real inter-frame transcode** — the transcode work below is intra-only by design; wiring
-  `V2Encoder`'s T-frames into it (once its compressed-bytes API exists) is the next step, and
-  `seq_lab`'s K/T cost split is already the right report for when it lands.
+- ~~Real inter-frame transcode~~ — done, above, with v2.1 T-frames. (`V2Encoder` turned out
+  to be `VideoEncoder` plus scene-graph statistics, with no bytes to wire.)
 - **`--v9` options**, AV1 export comparison.
 
 ## Done, added since the above was written
