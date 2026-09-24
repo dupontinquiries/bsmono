@@ -1,0 +1,10 @@
+full                   peak   0.97  clicks    3  first: [0.17, 1.36, 1.87]
+no-autotune            peak   0.97  clicks    3  first: [0.17, 1.36, 1.87]
+no-limiter             peak   4.65  clicks    2  first: [1.35, 1.86]
+no-duck                peak   0.97  clicks    0  first: []
+synths-muted           peak   0.97  clicks    9  first: [0.17, 1.36, 1.87, 5.62, 9.72, 11.07, 12.27, 16.53]
+nothing-but-files      peak   2.57  clicks    6  first: [1.35, 1.86, 11.07, 12.26, 15.34, 16.52]
+done
+full-v4                peak   0.97  clicks    3  first: [0.17, 1.36, 1.87]
+v4-no-duck             peak   0.97  clicks    0  first: []
+done

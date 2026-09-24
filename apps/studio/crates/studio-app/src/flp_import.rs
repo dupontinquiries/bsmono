@@ -109,6 +109,10 @@ pub fn pitcher_params(v: &Value) -> (BTreeMap<String, f32>, String) {
     (q, said.join("; "))
 }
 
+/// The fade put on each imported audio clip's edges (seconds), standing in
+/// for FL's default declicking.
+pub const DECLICK: f64 = 0.003;
+
 /// Steps per pattern at most (the rack rows are a u64 bitmask).
 const MAX_STEPS: u32 = 64;
 
@@ -288,13 +292,52 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     let has_routes = mixer.values().any(|m| m["routes"].as_array().is_some_and(|r| r.iter().any(|x| x.is_object())));
     let mut sends_made = 0usize;
     let mut unroutable = 0usize;
+    // An insert's effect slots as a Studio chain; the rest named in `unmapped`.
+    fn chain_of(m: &Value, label: &str, unmapped: &mut BTreeMap<String, usize>, approx: &mut Vec<String>) -> Vec<Effect> {
+        let mut chain = Vec::new();
+        for slot in m["slots"].as_array().into_iter().flatten() {
+            let plug = s(&slot["plugin"]).unwrap_or("");
+            let name = if plug == "Fruity Wrapper" { s(&slot["name"]).unwrap_or("a plugin") } else { plug };
+            match effect_for(plug) {
+                Some((kind, how)) => {
+                    if how != "exact kind" && !approx.iter().any(|a| a.starts_with(plug)) { approx.push(format!("{plug}: {how}")); }
+                    let mut params = BTreeMap::new();
+                    if plug == "Pitcher" && slot["pitcher"].is_object() {
+                        let (q, said) = pitcher_params(&slot["pitcher"]);
+                        params = q;
+                        approx.push(format!("Pitcher on {label}: {said}"));
+                    }
+                    chain.push(Effect { kind: kind.into(), params, enabled: slot["enabled"].as_bool().unwrap_or(true) });
+                }
+                None => *unmapped.entry(name.to_string()).or_default() += 1,
+            }
+        }
+        chain
+    }
+    // FL's master (insert 0) as a real bus everything else feeds: the artist
+    // ran the whole mix through a final limiter, and Studio has no master
+    // chain of its own. Created FIRST, so every other bus can name it.
+    if let Some(m) = mixer.get(&0) {
+        let chain = chain_of(m, "Master", &mut unmapped, &mut approx);
+        let names: Vec<&str> = chain.iter().map(|e| e.kind.as_str()).collect();
+        report.push(format!("master: FL's master insert is the bus \"Master\" (chain: {}); every bus that fed it feeds this",
+            if names.is_empty() { "none mapped".to_string() } else { names.join(" -> ") }));
+        let id = BusId(1);
+        busses.insert(0, id);
+        ops.push(Op::AddBus { bus: Bus { id, name: "Master".into(), parent: None,
+            gain: (f(&m["volume"]).unwrap_or(12800.0) / 12800.0) as f32, chain, sends: Vec::new(), muted: false, silent: false } });
+    }
+    let mut sidechains: Vec<(i64, i64)> = Vec::new();
     // Create the bus for `insert` -- its destinations FIRST, so a parent
     // always exists when its child is added. FL routing has no cycles; a
     // depth guard makes a corrupt file an error message, not a stack overflow.
+    #[allow(clippy::too_many_arguments)]
     fn make(insert: i64, depth: usize, mixer: &BTreeMap<i64, &Value>, busses: &mut BTreeMap<i64, BusId>, ops: &mut Vec<Op>,
-            unmapped: &mut BTreeMap<String, usize>, approx: &mut Vec<String>, sends_made: &mut usize, unroutable: &mut usize) -> Option<BusId> {
-        if insert <= 0 || depth > 32 { return None; } // 0 is FL's master: Studio's master
+            unmapped: &mut BTreeMap<String, usize>, approx: &mut Vec<String>, sends_made: &mut usize, unroutable: &mut usize,
+            sidechains: &mut Vec<(i64, i64)>) -> Option<BusId> {
+        // the master bus (insert 0) was made first, when the file has one
         if let Some(b) = busses.get(&insert) { return Some(*b); }
+        if insert <= 0 || depth > 32 { return None; }
         let m = *mixer.get(&insert)?;
         let routes: Vec<(i64, f32)> = m["routes"].as_array().into_iter().flatten()
             .filter_map(|r| Some((i(&r["to"])?, (f(&r["level"]).unwrap_or(12800.0) / 12800.0) as f32))).collect();
@@ -307,34 +350,25 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         let to_master = routes.is_empty() || routes.iter().any(|(t, _)| *t == 0);
         let mut dests: Vec<(BusId, f32)> = Vec::new();
         for (t, lvl) in routes.iter().filter(|(t, _)| *t > 0) {
-            match make(*t, depth + 1, mixer, busses, ops, unmapped, approx, sends_made, unroutable) {
-                Some(b) => dests.push((b, *lvl)),
+            match make(*t, depth + 1, mixer, busses, ops, unmapped, approx, sends_made, unroutable, sidechains) {
+                Some(b) => {
+                    dests.push((b, *lvl));
+                    if *lvl == 0.0 { sidechains.push((insert, *t)); }
+                }
                 None => *unroutable += 1,
             }
         }
-        let (parent, sends): (Option<BusId>, Vec<(BusId, f32)>) = if to_master || dests.is_empty() { (None, dests) }
-            else { (Some(dests[0].0), dests[1..].to_vec()) };
+        // a level-0 route is a sidechain, never an output: pick the parent
+        // from the audible routes only
+        let audible: Vec<(BusId, f32)> = dests.iter().copied().filter(|(_, l)| *l > 0.0).collect();
+        let master = busses.get(&0).copied();
+        let (parent, sends): (Option<BusId>, Vec<(BusId, f32)>) = if to_master || audible.is_empty() { (master, audible) }
+            else { (Some(audible[0].0), audible[1..].to_vec()) };
         *sends_made += sends.iter().filter(|(_, l)| *l > 0.0).count();
         let id = BusId(busses.len() as u64 + 1);
         busses.insert(insert, id);
-        let mut chain = Vec::new();
-        for slot in m["slots"].as_array().into_iter().flatten() {
-            let plug = s(&slot["plugin"]).unwrap_or("");
-            let label = if plug == "Fruity Wrapper" { s(&slot["name"]).unwrap_or("a plugin") } else { plug };
-            match effect_for(plug) {
-                Some((kind, how)) => {
-                    if how != "exact kind" && !approx.iter().any(|a| a.starts_with(plug)) { approx.push(format!("{plug}: {how}")); }
-                    let mut params = BTreeMap::new();
-                    if plug == "Pitcher" && slot["pitcher"].is_object() {
-                        let (q, said) = pitcher_params(&slot["pitcher"]);
-                        params = q;
-                        approx.push(format!("Pitcher on {}: {said}", s(&m["name"]).map(str::to_string).unwrap_or_else(|| format!("Insert {insert}"))));
-                    }
-                    chain.push(Effect { kind: kind.into(), params, enabled: slot["enabled"].as_bool().unwrap_or(true) });
-                }
-                None => *unmapped.entry(label.to_string()).or_default() += 1,
-            }
-        }
+        let label = s(&m["name"]).map(str::to_string).unwrap_or_else(|| format!("Insert {insert}"));
+        let chain = chain_of(m, &label, unmapped, approx);
         let name = s(&m["name"]).map(str::to_string).unwrap_or_else(|| format!("Insert {insert}"));
         let gain = (f(&m["volume"]).unwrap_or(12800.0) / 12800.0) as f32;
         ops.push(Op::AddBus { bus: Bus { id, name, parent, gain, chain,
@@ -344,7 +378,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         Some(id)
     }
     let mut bus_for = |insert: i64, ops: &mut Vec<Op>| -> Option<BusId> {
-        make(insert, 0, &mixer, &mut busses, ops, &mut unmapped, &mut approx, &mut sends_made, &mut unroutable)
+        make(insert, 0, &mixer, &mut busses, ops, &mut unmapped, &mut approx, &mut sends_made, &mut unroutable, &mut sidechains)
     };
 
     // ── the playlist ────────────────────────────────────────────────────
@@ -352,7 +386,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     let mut next_track = 1u64;
     let mut next_clip = 1u64;
     let mut pattern_sources: BTreeMap<usize, SourceId> = BTreeMap::new();
-    let (mut automation_clips, mut placed, mut overflowed) = (0usize, 0usize, 0usize);
+    let (mut automation_clips, mut placed, mut overflowed, mut declicked) = (0usize, 0usize, 0usize, 0usize);
     let mut track_at = 0usize;
     for t in arr["tracks"].as_array().into_iter().flatten() {
         let items: Vec<&Value> = t["items"].as_array().into_iter().flatten().collect();
@@ -423,15 +457,45 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                 lanes[lane].1.push((pos, pos.saturating_add(len)));
                 ops.push(Op::AddClip { clip: Clip { id: ClipId(next_clip), source: src, track: lanes[lane].0, pos, src_in, len,
                                                     gain, effects: vec![] } });
+                // FL declicks audio clip edges by default; cut hard, a clip that
+                // starts or ends mid-waveform clicks (two of Blue Moon's did, at a
+                // take's end and at a splice between two clips of one take).
+                if !pattern_sources.values().any(|v| *v == src) && len > Ticks::from_seconds(0.02) {
+                    let d = Ticks::from_seconds(DECLICK);
+                    ops.push(Op::SetClipFade { id: ClipId(next_clip), fade_in: d, fade_out: d });
+                    declicked += 1;
+                }
                 next_clip += 1;
                 placed += 1;
             }
         }
-        if let Some(ins) = first_insert {
-            if let Some(bus) = bus_for(ins, &mut ops) {
-                for (tid, _) in &lanes { ops.push(Op::SetRoute { track: *tid, bus: Some(bus) }); }
+        // FL routes everything somewhere; no insert (or insert 0) is the master
+        if let Some(bus) = bus_for(first_insert.unwrap_or(0), &mut ops) {
+            for (tid, _) in &lanes { ops.push(Op::SetRoute { track: *tid, bus: Some(bus) }); }
+        }
+    }
+    // ── sidechains: a duck on each destination, keyed by the source ──────
+    let mut ducked: Vec<String> = Vec::new();
+    for (src, dst) in &sidechains {
+        let (Some(key), Some(target)) = (busses.get(src).copied(), busses.get(dst).copied()) else { continue };
+        for op in ops.iter_mut() {
+            if let Op::AddBus { bus } = op {
+                if bus.id == target && !bus.chain.iter().any(|e| e.kind == "duck") {
+                    bus.chain.push(Effect { kind: "duck".into(), enabled: true, params: [
+                        ("key".to_string(), key.0 as f32), ("threshold".to_string(), -24.0), ("depth".to_string(), 10.0),
+                        // 5 ms, not 1: a 10 dB pull on a bass in 1 ms is a gain STEP
+                        // and clicks -- the bisect of Blue Moon found every click in
+                        // one window gone with the duck bypassed at 1 ms
+                        ("ratio".to_string(), 4.0), ("attack".to_string(), 5.0), ("release".to_string(), 150.0)].into() });
+                    let n = |i: &i64| mixer.get(i).and_then(|m| s(&m["name"])).unwrap_or("?").to_string();
+                    ducked.push(format!("{} ducks under {}", n(dst), n(src)));
+                }
             }
         }
+    }
+    if !ducked.is_empty() {
+        report.push(format!("SIDECHAIN (FL's level-0 routes) as a duck keyed by the source: {} -- at Studio's defaults \
+(threshold -24 dB, depth 10 dB, attack 5 / release 150 ms): FL's compressor settings on the destination are not decoded", ducked.join(", ")));
     }
     // ── apply, through the model's own checks ───────────────────────────
     let mut refused = 0;
@@ -445,6 +509,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     report.insert(0, format!("{placed} clips on {} tracks, {} rack channels, {} rack patterns, {} busses; {:.0} BPM",
         p.tracks.len(), rack.channels.len(), rack.patterns.len(), p.busses.len(), bpm));
     if overflowed > 0 { report.push(format!("{overflowed} clip{} overlapped another on its FL track (FL allows it) -- moved to an overflow track, marked (2)", if overflowed == 1 { "" } else { "s" })); }
+    if declicked > 0 { report.push(format!("{declicked} audio clips declicked: {:.0} ms fades at each edge, as FL does by default", DECLICK * 1000.0)); }
     if automation_clips > 0 { report.push(format!("{automation_clips} automation clip{} not imported (their points are not read yet)", if automation_clips == 1 { "" } else { "s" })); }
     if !approx.is_empty() { report.push(format!("effects read or approximated: {}", approx.join("; "))); }
     // Which tracks each autotune feeds from -- so "the male takes have their
@@ -470,28 +535,13 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         report.push(format!("effects with no Studio counterpart, left out: {}",
             unmapped.iter().map(|(k, n)| if *n > 1 { format!("{k} x{n}") } else { k.clone() }).collect::<Vec<_>>().join(", ")));
     }
-    if let Some(master) = mixer.get(&0) {
-        let slots: Vec<&str> = master["slots"].as_array().into_iter().flatten().filter_map(|x| s(&x["name"]).or(s(&x["plugin"]))).collect();
-        if !slots.is_empty() { report.push(format!("master chain not imported: {}", slots.join(" -> "))); }
-    }
-    // FL's "sidechain to this track": a route at send level 0 -- the source is
-    // heard by the destination's plugins, not mixed in. Studio has no
-    // audio-keyed sidechain yet: named, so the gap is on the page.
-    let chains: Vec<String> = mixer.values().flat_map(|m| {
-        let from = s(&m["name"]).unwrap_or("?").to_string();
-        m["routes"].as_array().into_iter().flatten().filter(|r| f(&r["level"]) == Some(0.0))
-            .filter_map(|r| mixer.get(&i(&r["to"])?).map(|d| format!("{from} -> {}", s(&d["name"]).unwrap_or("?"))))
-            .collect::<Vec<_>>()
-    }).collect();
-    if !chains.is_empty() {
-        report.push(format!("SIDECHAIN routes (FL send level 0), not reproduced -- Studio has no audio-keyed sidechain yet: {}", chains.join(", ")));
-    }
     let silent_busses: Vec<&str> = p.busses.values().filter(|b| b.silent).map(|b| b.name.as_str()).collect();
     if !silent_busses.is_empty() {
         report.push(format!("silent in FL (no route out), imported silent: {}", silent_busses.join(", ")));
     }
     if has_routes {
-        let parented = p.busses.values().filter(|b| b.parent.is_some()).count();
+        let master = busses.get(&0).copied();
+        let parented = p.busses.values().filter(|b| b.parent.is_some() && b.parent != master).count();
         report.push(format!("routing: {parented} bus{} output into another bus, {sends_made} send{} at FL's send levels; the rest feed the master{}",
             if parented == 1 { "" } else { "ses" }, if sends_made == 1 { "" } else { "s" },
             if unroutable > 0 { format!(" ({unroutable} route{} to an insert not in the file, left out)", if unroutable == 1 { "" } else { "s" }) } else { String::new() }));
@@ -571,6 +621,8 @@ mod tests {
         assert!((secs(first.pos) - 2.0).abs() < 1e-6, "384 ticks at 120 BPM / 96 PPQ = 2 s");
         assert!((secs(first.src_in) - 2.0).abs() < 1e-6, "offset 2000 ms");
         assert!((secs(first.len) - 6.0).abs() < 1e-6);
+        let (fi, fo) = im.project.fades[&first.id];
+        assert!((secs(fi) - DECLICK).abs() < 1e-6 && (secs(fo) - DECLICK).abs() < 1e-6, "declicked at both edges");
         assert!(im.report.iter().any(|r| r.contains("1 automation clip not imported")), "{:?}", im.report);
         assert!(im.report.iter().any(|r| r.contains("overflow track")));
         assert!(vocals.iter().all(|t| t.muted), "a playlist track switched off in FL is muted, overflow lane too");
@@ -648,18 +700,25 @@ mod tests {
         let p = &im.project;
         let by = |n: &str| p.busses.values().find(|b| b.name == n).unwrap_or_else(|| panic!("no bus {n}: {:?}", p.busses.values().map(|b| &b.name).collect::<Vec<_>>()));
         let (drums, vox, verb, group) = (by("Drums"), by("Vox bus"), by("Verb send"), by("Vocal group"));
-        assert_eq!(drums.parent, None, "feeds the master");
+        let master = by("Master");
+        assert_eq!(master.chain.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), vec!["limiter"], "FL's master chain, Ozone left out");
+        assert_eq!(drums.parent, Some(master.id), "feeds the master");
         let meter = by("Meter");
         assert!(meter.silent, "routing known, no route out: silent in FL, silent here");
         assert_eq!(drums.sends.len(), 2, "the reverb and the meter; the level-0 sidechain route is not a send: {:?}", drums.sends);
         assert_eq!((drums.sends[0].to, drums.sends[0].level), (verb.id, 0.5), "and sends to the reverb at half");
         assert_eq!(vox.parent, Some(group.id), "no master route: its first destination is its output");
         assert_eq!((vox.sends[0].to, vox.sends[0].level), (verb.id, 0.25));
-        assert_eq!(group.parent, None);
+        assert_eq!(group.parent, Some(master.id));
+        let duck = group.chain.iter().find(|e| e.kind == "duck").expect("the level-0 route Drums -> Vocal group is a sidechain duck");
+        assert_eq!(duck.params["key"] as u64, drums.id.0, "keyed by the source");
+        // (this inventory has no track whose channel sits on FL's master, so
+        // that path is covered by the Blue Moon import, not here)
+        assert!(p.tracks.iter().all(|t| t.route.is_some()), "every track is routed somewhere");
         assert_eq!(verb.chain[0].kind, "reverb", "a bus nothing but routing reaches is still made");
         let r = im.report.join("\n");
         assert!(r.contains("routing: 1 bus output into another bus, 3 sends"), "{r}");
-        assert!(r.contains("SIDECHAIN routes") && r.contains("Drums -> Vocal group"), "{r}");
+        assert!(r.contains("Vocal group ducks under Drums"), "{r}");
         assert!(r.contains("imported silent: Meter"), "{r}");
         assert!(r.contains("1 insert pan not imported"), "{r}");
     }
@@ -678,7 +737,7 @@ mod tests {
         let r = im.report.join("\n");
         assert!(r.contains("Neutron 3") && r.contains("Fruity Chorus"), "{r}");
         assert!(r.contains("Soundgoodizer: approximate"), "{r}");
-        assert!(r.contains("master chain not imported: Fruity Limiter -> Ozone 8"), "{r}");
+        assert!(r.contains("master: FL's master insert is the bus \"Master\" (chain: limiter)"), "{r}");
         assert!(!r.contains("refused by the model"), "{r}");
     }
 }
