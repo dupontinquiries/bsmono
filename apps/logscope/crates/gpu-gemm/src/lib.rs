@@ -386,6 +386,7 @@ pub fn mmap_ro(path: &str) -> std::io::Result<memmap2::Mmap> {
     let f = std::fs::File::open(path)?;
     unsafe { memmap2::Mmap::map(&f) }
 }
+pub mod sgladder;   // how far the subgroup mat-vec can be trusted on this driver
 pub mod tokenizer;
 pub mod toolpipe;
 
@@ -1167,7 +1168,10 @@ pub struct Gpu {
     subgroups: bool, // adapter supports subgroup arithmetic (subgroupAdd) — enables the sg reduction kernel
     unified: bool,   // unified-memory GPU (Apple/Asahi): host==device RAM, so weight uploads go zero-copy
                      // (map-at-creation) instead of through the staging belt — see zerocopy::upload_path
-    sg_ok: std::sync::atomic::AtomicBool, // sg kernel passed the load-time self-check on THIS driver
+    sg_ok: std::sync::atomic::AtomicBool,
+    /// How far the subgroup matvec is trusted on this driver (see `sgladder`); set at load.
+    /// How far the subgroup matvec is trusted on this driver (see `sgladder`); set at load.
+    sg_verdict: std::sync::OnceLock<crate::sgladder::Verdict>,
     gemm_ok: std::sync::atomic::AtomicBool, // tiled prefill GEMM compiles + matches naive on THIS backend
     valid_gemm_tiles: std::sync::RwLock<Vec<u32>>, // GEMM tiles whose shader actually compiles here (load probe)
     /// NEOX (split-half) RoPE pairing for the CURRENTLY loaded model (qwen/gemma/phi families);
@@ -1879,7 +1883,7 @@ impl Gpu {
         // objects than the window is allowed to assume are free.
         let dims_cap = dims_cap_for(governor.lock().unwrap().budget().soft_object_cap);
         let dims_ring_cap = dims_ring_cap_for(governor.lock().unwrap().budget().soft_object_cap);
-        let gpu = Self { device, queue, adapter_name, dev_errors, iq1_grid: std::sync::OnceLock::new(), pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), dims_cap, dims_ring_cap, bg_cache: Mutex::new(HashMap::new()), bg_shape: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), rope_dims: std::sync::atomic::AtomicU32::new(0), attn_qscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), staging: Mutex::new(Default::default()), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let gpu = Self { device, queue, adapter_name, dev_errors, iq1_grid: std::sync::OnceLock::new(), pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), dims_cap, dims_ring_cap, bg_cache: Mutex::new(HashMap::new()), bg_shape: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_verdict: std::sync::OnceLock::new(), sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), rope_dims: std::sync::atomic::AtomicU32::new(0), attn_qscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), staging: Mutex::new(Default::default()), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -1943,6 +1947,15 @@ impl Gpu {
             } else {
                 let ok = gpu.self_check_sg();
                 gpu.sg_ok.store(ok, std::sync::atomic::Ordering::Relaxed);
+                // …and how far it has been proven at SCALE on this driver. The self-check above is a
+                // correctness check on a tiny shape; the ladder is the memory of what large widths did,
+                // including the ones that took the GPU down (an unanswered `attempting=` line).
+                if ok {
+                    let rec = crate::sgladder::load(&gpu.adapter_name);
+                    let v = crate::sgladder::verdict(&rec, *crate::sgladder::LADDER.last().unwrap());
+                    if rec != Default::default() { eprintln!("wgpu-engine: {} ({})", v.describe(), gpu.adapter_name); }
+                    let _ = gpu.sg_verdict.set(v);
+                }
                 if !ok { eprintln!("wgpu-engine: subgroup decode kernel failed its load-time self-check on {} — using the barrier-reduction kernel instead", gpu.adapter_name); }
             }
         }
@@ -1994,6 +2007,40 @@ impl Gpu {
     /// The sizes below are a real attention projection and a real FFN width, so a driver that passes has
     /// been asked the question that matters. Two shapes rather than one: the failure observed was
     /// size-dependent, so a single shape could still be lucky.
+    /// Walk ONE rung of the subgroup ladder: the next unproven width, probed at decode shape.
+    ///
+    /// The order matters more than the code: the note goes to disk and is fsynced BEFORE the
+    /// dispatch, so if this call never returns — the hang the gate exists for — the next boot finds
+    /// `attempting=N` with no result and caps below N forever. That is the only way to learn where a
+    /// GPU hang lives without a debugger on the firmware.
+    ///
+    /// Returns `(width, ok)` for the rung tried, or None when the ladder is finished or blocked.
+    /// This is deliberately NOT called at load: it risks the machine, so it is an explicit act
+    /// (`kernel-validate --gate-sgladder`).
+    pub fn probe_sg_ladder_step(&self) -> Option<(u32, bool)> {
+        if !self.subgroup_kernel_ok() { return None; }
+        let rec = crate::sgladder::load(&self.adapter_name);
+        let n = crate::sgladder::next_probe(&rec)?;
+        let k = 2048usize;
+        let mut rng = 0x00C0_FFEE_1234_5678u64;
+        let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
+        let w: Vec<f32> = (0..n as usize * k).map(|_| rnd()).collect();
+        let act: Vec<f32> = (0..k).map(|_| rnd()).collect();
+        let qw = self.quantize_q8_resident(&w, n as usize, k);
+        let a = self.upload(&act, 1, k);
+        eprintln!("wgpu-engine: sg ladder — probing n={n} (if this machine stops here, the next start caps below it)");
+        crate::sgladder::note_attempt(&self.adapter_name, n);
+        let base = self.download(&self.matvec_decode_v1(&a, &qw, 1));
+        let sg = self.download(&self.matvec_decode_v2sg(&a, &qw, 4));
+        let ok = base.len() == sg.len() && !base.is_empty() && {
+            let scale = base.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            base.iter().zip(&sg).fold(0f32, |m, (a, b)| m.max((a - b).abs())) / scale < 1e-3
+        };
+        if ok { crate::sgladder::note_ok(&self.adapter_name, n); } else { crate::sgladder::note_failed(&self.adapter_name, n); }
+        eprintln!("wgpu-engine: sg ladder — n={n} {}", if ok { "OK" } else { "WRONG RESULT (capped here)" });
+        Some((n, ok))
+    }
+
     fn self_check_sg(&self) -> bool {
         for (k, n) in [(2048usize, 2048usize), (8192, 1024)] {
             let mut rng = 0x00C0_FFEE_1234_5678u64;
@@ -4132,6 +4179,21 @@ see prefill_chunked_from for the pattern.", std::panic::Location::caller().file(
     /// honours this; the cache-load path did not, which is how a disabled kernel gets selected.
     pub fn subgroup_kernel_ok(&self) -> bool {
         self.sg_ok.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// May the subgroup matvec run at THIS output width?
+    ///
+    /// The self-check above is a correctness check on a tiny shape; on Asahi/Honeykrisp the kernel
+    /// can be correct there and still hang the GPU at a vocabulary-sized projection. `sgladder`
+    /// remembers how far this driver has been proven, including across a hang (it leaves a note
+    /// before each attempt), so the fast kernel stays available at the widths that work instead of
+    /// being switched off wholesale. Drivers with no ladder record behave exactly as before.
+    pub fn subgroup_ok_for_width(&self, n: usize) -> bool {
+        if !self.subgroup_kernel_ok() { return false; }
+        match self.sg_verdict.get() {
+            Some(v) => v.allows(n as u32),
+            None => true,
+        }
     }
 
     /// Has the device reported ANY uncaptured error?
@@ -6578,7 +6640,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let cfg = if let Some(&p) = self.shape_tiles.read().unwrap().get(&(n as u32, k as u32)) { DecodeConfig::unpack(p) } else { self.decode_profile() };
         // Never dispatch the subgroup kernel on a backend that didn't self-check it (no SUBGROUP feature, or
         // it failed the check) — e.g. the default profile or a cache from another GPU. Downgrade to wg128.
-        if cfg.kernel.needs_subgroups() && !self.sg_ok.load(std::sync::atomic::Ordering::Relaxed) {
+        if cfg.kernel.needs_subgroups() && !self.subgroup_ok_for_width(n) {
             return DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: cfg.tile };
         }
         cfg
@@ -18269,6 +18331,19 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
     pub fn generate_kv_stream(
         &self, m: &Model, prompt: &[u32], n_new: usize, eos: Option<u32>,
         sampler: &SamplerParams, rng: &mut u64, cancel: &dyn Fn() -> bool,
+        on_token: impl FnMut(u32) -> bool,
+    ) -> usize {
+        self.generate_kv_stream_constrained(m, prompt, n_new, eos, sampler, rng, cancel, None, on_token)
+    }
+
+    /// `generate_kv_stream` with a constraint on the next token — this engine's answer to llama.cpp's
+    /// grammar sampler. `filter` sees each step's top-k candidates and vetoes the ones that cannot
+    /// continue a legal string; `None` is exactly the unconstrained decode, RNG draw included.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_kv_stream_constrained(
+        &self, m: &Model, prompt: &[u32], n_new: usize, eos: Option<u32>,
+        sampler: &SamplerParams, rng: &mut u64, cancel: &dyn Fn() -> bool,
+        mut filter: Option<&mut dyn TokenFilter>,
         mut on_token: impl FnMut(u32) -> bool,
     ) -> usize {
         let cap = (prompt.len() + n_new).max(1);
@@ -18282,7 +18357,8 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         let mut produced = 0usize;
         for _ in 0..n_new {
             if logits.is_empty() || cancel() { break; }
-            let next = pick(&logits, sampler, &seen, rng);
+            // The reborrow is explicit: `Option<&mut dyn _>` cannot be moved out per iteration.
+            let next = match filter { Some(ref mut f) => pick_constrained(&logits, sampler, &seen, rng, Some(&mut **f)), None => pick(&logits, sampler, &seen, rng) };
             if Some(next) == eos { break; }
             produced += 1;
             seen.push(next);
@@ -18519,12 +18595,25 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
     pub fn stream_session(
         &self, m: &Model, s: &mut Session, seen: &mut Vec<u32>, n_new: usize, eos: Option<u32>,
         sampler: &SamplerParams, rng: &mut u64, cancel: &dyn Fn() -> bool,
+        on_token: impl FnMut(u32) -> bool,
+    ) -> usize {
+        self.stream_session_constrained(m, s, seen, n_new, eos, sampler, rng, cancel, None, on_token)
+    }
+
+    /// `stream_session` with a `TokenFilter` — the path chat actually decodes through, so this is
+    /// where a grammar takes effect for an ordinary agent turn on the wgpu engine. `None` is the
+    /// unconstrained decode, RNG draw included.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_session_constrained(
+        &self, m: &Model, s: &mut Session, seen: &mut Vec<u32>, n_new: usize, eos: Option<u32>,
+        sampler: &SamplerParams, rng: &mut u64, cancel: &dyn Fn() -> bool,
+        mut filter: Option<&mut dyn TokenFilter>,
         mut on_token: impl FnMut(u32) -> bool,
     ) -> usize {
         let mut produced = 0usize;
         for _ in 0..n_new {
             if s.logits.is_empty() || cancel() { break; }
-            let next = pick(&s.logits, sampler, seen, rng);
+            let next = match filter { Some(ref mut f) => pick_constrained(&s.logits, sampler, seen, rng, Some(&mut **f)), None => pick(&s.logits, sampler, seen, rng) };
             if Some(next) == eos { break; }
             produced += 1;
             seen.push(next);
@@ -18811,6 +18900,59 @@ pub fn apply_repeat_penalty(logits: &mut [f32], recent: &[u32], penalty: f32) {
 pub fn pick(logits: &[f32], sampler: &SamplerParams, recent: &[u32], rng: &mut u64) -> u32 {
     if let Some(tok) = pick_without_a_copy(logits, sampler, recent, rng) { return tok; }
     pick_reference(logits, sampler, recent, rng)
+}
+
+/// A caller-supplied constraint on the next token: given a candidate's id, may it come next?
+///
+/// This is the wgpu engine's equivalent of llama.cpp's grammar sampler. The engine cannot know what
+/// a token's TEXT is (the tokenizer lives a layer up), so the decision is delegated: the filter is
+/// asked about candidate ids, and it does the detokenizing and the grammar walk itself. Because the
+/// sampler has already reduced the vocabulary to top-k before this point, a filter sees tens of
+/// candidates per token rather than a quarter of a million.
+pub trait TokenFilter {
+    /// May `token` be emitted next? Called in descending-logit order.
+    fn allows(&mut self, token: u32) -> bool;
+    /// Called with the token that was actually chosen, so the filter can advance its own state.
+    fn accept(&mut self, token: u32);
+    /// Called when every candidate was rejected and the unconstrained pick was used anyway. A
+    /// constraint that can deadlock a decode is worse than one that occasionally lets a token
+    /// through; the caller decides what to do about it.
+    fn on_exhausted(&mut self) {}
+}
+
+/// `pick`, with the candidate set filtered by a constraint. Identical to `pick` when `filter` is
+/// `None`, including the RNG draw, so turning the constraint on cannot change an unconstrained
+/// decode. When the filter rejects every top-k candidate the unconstrained pick stands and
+/// `on_exhausted` fires.
+pub fn pick_constrained(logits: &[f32], sampler: &SamplerParams, recent: &[u32], rng: &mut u64, filter: Option<&mut dyn TokenFilter>) -> u32 {
+    let Some(filter) = filter else { return pick(logits, sampler, recent, rng) };
+    // The candidates the unconstrained sampler would consider, in its own order.
+    let k = if sampler.top_k > 0 && sampler.top_k < logits.len() { sampler.top_k } else { logits.len().min(64) };
+    let idx = crate::topk::top_k_desc(logits, k);
+    let allowed: Vec<usize> = idx.iter().copied().filter(|&i| filter.allows(i as u32)).collect();
+    let tok = if allowed.is_empty() {
+        filter.on_exhausted();
+        pick(logits, sampler, recent, rng)
+    } else if sampler.temperature <= 0.0 || sampler.top_k == 1 {
+        allowed[0] as u32                                  // greedy, within the legal set
+    } else {
+        // Same softmax/min-p/top-p/draw as `sample`, over the legal subset only. Penalties are
+        // applied to the values the way `pick_without_a_copy` does, without copying the vocabulary.
+        let vals: Vec<f32> = allowed.iter().map(|&i| {
+            let mut v = logits[i];
+            if sampler.repeat_penalty != 1.0 && recent.iter().rev().take(sampler.repeat_last_n).any(|&t| t as usize == i) {
+                v = if v > 0.0 { v / sampler.repeat_penalty } else { v * sampler.repeat_penalty };
+            }
+            v
+        }).collect();
+        // vals must be descending for sample_sorted's min-p; the penalty can perturb the order.
+        let mut pairs: Vec<(usize, f32)> = allowed.iter().copied().zip(vals).collect();
+        pairs.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let (sidx, svals): (Vec<usize>, Vec<f32>) = pairs.into_iter().unzip();
+        sample_sorted(sidx, &svals, sampler, rng)
+    };
+    filter.accept(tok);
+    tok
 }
 
 /// The penalized pick WITHOUT cloning the vocabulary.
@@ -24319,5 +24461,66 @@ mod timing_thread_tests {
         let a = timing_thread_count();
         std::thread::spawn(note_timing_thread).join().unwrap();
         assert!(timing_thread_count() >= a);
+    }
+}
+
+#[cfg(test)]
+mod constrained_sampling_tests {
+    use super::*;
+
+    /// A filter that allows only even token ids, and records what it accepted.
+    struct EvenOnly { accepted: Vec<u32>, exhausted: bool }
+    impl TokenFilter for EvenOnly {
+        fn allows(&mut self, t: u32) -> bool { t % 2 == 0 }
+        fn accept(&mut self, t: u32) { self.accepted.push(t); }
+        fn on_exhausted(&mut self) { self.exhausted = true; }
+    }
+    struct NothingAllowed { exhausted: bool }
+    impl TokenFilter for NothingAllowed {
+        fn allows(&mut self, _t: u32) -> bool { false }
+        fn accept(&mut self, _t: u32) {}
+        fn on_exhausted(&mut self) { self.exhausted = true; }
+    }
+
+    fn sp(temp: f32) -> SamplerParams { SamplerParams { temperature: temp, top_k: 8, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 } }
+
+    #[test]
+    fn no_filter_is_bit_identical_to_pick() {
+        let logits: Vec<f32> = (0..64).map(|i| ((i * 37) % 11) as f32 * 0.5).collect();
+        for temp in [0.0, 0.8] {
+            let (mut r1, mut r2) = (12345u64, 12345u64);
+            assert_eq!(pick(&logits, &sp(temp), &[], &mut r1), pick_constrained(&logits, &sp(temp), &[], &mut r2, None));
+            assert_eq!(r1, r2, "the RNG must advance identically");
+        }
+    }
+
+    #[test]
+    fn the_filter_decides_the_token_and_sees_what_was_chosen() {
+        // token 3 has the highest logit; the filter forbids odd ids, so an even one must win.
+        let mut logits = vec![0.0f32; 16];
+        logits[3] = 10.0; logits[4] = 9.0; logits[5] = 8.0;
+        let mut f = EvenOnly { accepted: vec![], exhausted: false };
+        let mut rng = 7u64;
+        let t = pick_constrained(&logits, &sp(0.0), &[], &mut rng, Some(&mut f));
+        assert_eq!(t, 4, "the best LEGAL candidate, not the best candidate");
+        assert_eq!(f.accepted, vec![4]);
+        assert!(!f.exhausted);
+        // sampled decode stays inside the legal set too
+        let mut f2 = EvenOnly { accepted: vec![], exhausted: false };
+        let mut rng2 = 99u64;
+        for _ in 0..20 {
+            let t = pick_constrained(&logits, &sp(1.0), &[], &mut rng2, Some(&mut f2));
+            assert_eq!(t % 2, 0, "sampled a forbidden token {t}");
+        }
+    }
+
+    #[test]
+    fn an_impossible_constraint_does_not_deadlock_the_decode() {
+        let mut logits = vec![0.0f32; 8]; logits[2] = 5.0;
+        let mut f = NothingAllowed { exhausted: false };
+        let mut rng = 1u64;
+        let t = pick_constrained(&logits, &sp(0.0), &[], &mut rng, Some(&mut f));
+        assert_eq!(t, 2, "the unconstrained pick stands rather than stalling");
+        assert!(f.exhausted, "and the caller is told");
     }
 }

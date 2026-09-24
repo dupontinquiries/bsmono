@@ -55,6 +55,26 @@ pub mod library;
 pub mod looping;
 pub mod midi;
 pub mod mix_assistant;
+pub mod multicam_cut;
+pub mod relink;
+pub mod transcripts;
+pub mod overview;
+pub mod insert_by_content;
+pub mod stage;
+pub mod kaleido_gallery;
+pub mod signals_panel;
+pub mod comic_job;
+pub mod track_points;
+pub mod wake;
+pub mod open_project;
+pub mod tracks;
+pub mod thumbs;
+pub mod pattern_clips;
+#[cfg(test)]
+mod abundance_tests;
+#[cfg(test)]
+mod fixture_tests;
+pub mod touchup_job;
 pub mod mixer_panel;
 pub mod morph_pad;
 pub mod program_panel;
@@ -139,6 +159,11 @@ pub struct Studio {
     /// its audio/peaks maps. A queue rather than a callback so the headless
     /// tests can watch the same door the GUI uses.
     pub incoming_audio: Vec<(studio_core::SourceId, studio_audio::SourceAudio)>,
+    /// Video sources whose audio still has to be pulled out with ffmpeg.
+    /// Filled by `load_from`, emptied by the shell onto a worker thread:
+    /// extraction is seconds per file, and doing it inline held the window
+    /// closed for over a minute on a 77-clip card.
+    pub pending_video_audio: Vec<(studio_core::SourceId, std::path::PathBuf)>,
     pub keys: studio_egui::keys::Keymap,
     /// Status line — what just happened, so an action never fails silently.
     pub status: String,
@@ -157,6 +182,12 @@ pub struct Studio {
     /// shell syncs the sink to this every frame, so the headless tests below
     /// can drive the space bar without a sound card existing.
     pub rack_playing: bool,
+    /// Set by the keymap's menu keys (Shift+Space, `:`), read and cleared by
+    /// the shell, which owns the palette. The keymap had resolved both keys
+    /// for a long time while nothing handled them: the corner hint said
+    /// "S-space menu" and the key did nothing, leaving Ctrl+P — shown
+    /// nowhere — as the only way in.
+    pub palette_requested: bool,
     /// Set by any rack edit; the shell re-renders the loop and clears it.
     pub loop_dirty: bool,
     /// Set by any PROJECT edit (including undo/redo and a bounce); the shell
@@ -284,6 +315,9 @@ pub struct Studio {
     /// carrier keys its records by [`Studio::carrier_key`], so setting this
     /// is what "join" means at the wire.
     pub joined_key: Option<[u8; 20]>,
+    /// Wakes the window when a worker the core started has news. Does
+    /// nothing until the app installs one; headless use and tests keep that.
+    pub waker: wake::Wake,
 }
 
 impl Studio {
@@ -329,6 +363,7 @@ impl Studio {
             transport: Transport::new(48_000),
             fx_editor: None,
             joined_key: None,
+            waker: wake::none(),
             view: studio_egui::View::default(),
             song_views: std::collections::BTreeMap::new(),
             active_song: None,
@@ -345,6 +380,7 @@ impl Studio {
             chunk_store: Default::default(),
             pending_assets: Default::default(),
             incoming_audio: Vec::new(),
+            pending_video_audio: Vec::new(),
             keys: studio_egui::keys::Keymap::new(),
             status: "ready".into(),
             rack: studio_live::Rack::trap_kit(),
@@ -353,6 +389,7 @@ impl Studio {
             lane: studio_egui::lanes::Lane::default(),
             paint: studio_egui::grid::Paint::default(),
             rack_playing: false,
+            palette_requested: false,
             loop_dirty: true,
             arrangement_dirty: true,
             seek_pending: false,
@@ -662,6 +699,24 @@ impl Studio {
         archive::pack(&save, audio, &originals, meta)
     }
 
+    /// Pull the audio out of queued video sources, one at a time, sending
+    /// each as it lands so the timeline fills in progressively. `None` for
+    /// a file with no audio stream (a picture, not a failure). Blocking: the
+    /// shell runs it on a worker thread; tests run it inline.
+    ///
+    /// `wake` is called after every delivery. A timed repaint request alone
+    /// did not reliably wake the window: seen on screen, the status sat at
+    /// "1 to go" with the last clip long extracted, until the mouse moved.
+    pub fn extract_video_audio(pending: Vec<(studio_core::SourceId, std::path::PathBuf)>,
+                               tx: std::sync::mpsc::Sender<(studio_core::SourceId, Option<studio_audio::SourceAudio>)>,
+                               wake: impl Fn()) {
+        for (id, path) in pending {
+            let audio = studio_video::extract_audio(&path).ok().flatten();
+            if tx.send((id, audio)).is_err() { return; } // the shell went away
+            wake();
+        }
+    }
+
     pub fn load_from(path: &std::path::Path, site: SiteId, team: Team)
         -> Result<Studio, String>
     {
@@ -676,9 +731,28 @@ impl Studio {
         let sources: Vec<_> = s.session.doc.project.sources.values().cloned().collect();
         let mut missing = 0usize;
         for src in sources {
+            // a pattern source has no file by design: the rack renders it
+            // (pattern_clips), so it is neither read here nor counted missing
+            if src.is_generator() { continue; }
             let p = base.join(&src.path);
+            // Video is checked for, not READ: reading and content-hashing a
+            // whole card of camera files inline (register_asset chunks and
+            // hashes every byte) was the second thing holding the window
+            // closed, after inline extraction — 77 proxies is 355 MB. The
+            // worker needs only the path.
+            if library::is_video_path(&p) {
+                if p.is_file() { s.pending_video_audio.push((src.id, p)); } else { missing += 1; }
+                continue;
+            }
             let Ok(raw) = std::fs::read(&p) else { missing += 1; continue };
             let hint = p.extension().and_then(|e| e.to_str());
+            // Video takes the ffmpeg door, as the import path already did —
+            // symphonia cannot open an mkv, so decoding it here reported every
+            // source of a reopened video project "missing" (77 of 77 on the
+            // Fragile Thing card) and played it silent. But not HERE: the
+            // first version of this fix extracted inline and the window did
+            // not appear for over a minute. The path is queued; the shell
+            // extracts on a worker and the audio arrives like a peer's does.
             match studio_media::decode_bytes(raw.clone(), hint) {
                 Ok(audio) => {
                     s.incoming_audio.push((src.id, audio));
@@ -1531,6 +1605,9 @@ impl Studio {
                             self.transport.play(); self.status = "playing".into();
                         }
                     }
+                    Action::LeaderMenu | Action::Command => {
+                        self.palette_requested = true;
+                    }
                     Action::Undo => {
                         // The inverse goes back through the SAME stamping
                         // door, so peers see the undo as the edit it is. If
@@ -1781,7 +1858,7 @@ impl Studio {
         let name = format!("curve {} over {gname}", curve.0);
         self.edit_group(vec![
             Op::SetCurve { id: curve, name: name.clone() },
-            Op::SetBinding { id: bid, binding: Binding { curve, target, gate: Gate::Group(gid) } },
+            Op::SetBinding { id: bid, binding: Binding { curve, target, gate: Gate::Group(gid), response: None, fit_span: false } },
         ], &format!("{name} bound"));
         if self.session.doc.project.bindings.contains_key(&bid) {
             self.auto_target = None;
@@ -1803,13 +1880,13 @@ impl Studio {
                 self.status = "select clips to gate a curve to, or pick a lane to bind one to".into();
                 return;
             };
-            ops.push(Op::SetBinding { id: first_binding, binding: Binding { curve, target, gate: Gate::Always } });
+            ops.push(Op::SetBinding { id: first_binding, binding: Binding { curve, target, gate: Gate::Always, response: None, fit_span: false } });
         } else {
             for id in &self.selection {
                 let Some(c) = p.clips.get(id) else { continue };
                 let target = target.unwrap_or(studio_core::AutoTarget::TrackGain(c.track));
                 ops.push(Op::SetBinding { id: BindingId(next_binding),
-                    binding: Binding { curve, target, gate: Gate::Clip(*id) } });
+                    binding: Binding { curve, target, gate: Gate::Clip(*id), response: None, fit_span: false } });
                 next_binding += 1;
             }
         }
@@ -1971,7 +2048,9 @@ impl Studio {
         rate: u32,
         sources: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
     ) -> Vec<f32> {
-        let end = self.session.doc.project.duration();
+        // Where the SOUND ends, not the last clip: a ring-out on the final
+        // clip must not be cut off by the render that plays it.
+        let end = studio_audio::audible_end(&self.session.doc.project);
         if end <= Ticks::ZERO { return Vec::new(); }
         studio_audio::mixdown(
             &self.session.doc.project, sources, &std::collections::BTreeMap::new(),
@@ -2870,6 +2949,103 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_saved_project_hears_its_video_sources() {
+        // load_from went straight to symphonia, which cannot open an mkv, so
+        // every video source of a reopened project was "missing" and silent.
+        let ok = std::process::Command::new("ffmpeg").arg("-version").output()
+            .map(|o| o.status.success()).unwrap_or(false);
+        if !ok {
+            assert!(std::env::var("STUDIO_REQUIRE_FFMPEG").as_deref() != Ok("1"), "ffmpeg required");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("open-video-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("take.mkv");
+        let out = std::process::Command::new("ffmpeg").args(["-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=gray:s=64x36:r=12:d=2",
+            "-f", "lavfi", "-i", "sine=f=440:d=2", "-shortest",
+            "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "pcm_s16le"]).arg(&clip).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        let mut p = studio_core::Project { name: "reopened".into(), ..Default::default() };
+        p.apply(&studio_core::Op::AddSource { source: studio_core::Source::file(studio_core::SourceId(1),
+            "take.mkv", studio_core::Ticks::from_seconds(2.0), 48_000, 1, true) }).unwrap();
+        let file = studio_collab::file::SaveFile::from_project(&p, Vec::new(), None);
+        let path = dir.join("reopened.studio");
+        std::fs::write(&path, file.encode()).unwrap();
+
+        let t = std::time::Instant::now();
+        let s = Studio::load_from(&path, SiteId(1), Team::from_contacts("solo", &["sc-local".into()]))
+            .expect("opens");
+        assert!(!s.status.contains("missing"), "{}", s.status);
+        // Opening must not extract: that is ffmpeg per file, and inline it
+        // held a 77-clip project's window closed for over a minute.
+        assert!(s.incoming_audio.is_empty(), "nothing is extracted on the opening path");
+        assert_eq!(s.pending_video_audio.len(), 1, "the video is queued for the worker");
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "opening stays fast: {:?}", t.elapsed());
+        // and the worker delivers it
+        let (tx, rx) = std::sync::mpsc::channel();
+        let woken = std::sync::atomic::AtomicUsize::new(0);
+        Studio::extract_video_audio(s.pending_video_audio.clone(), tx, || { woken.fetch_add(1, std::sync::atomic::Ordering::SeqCst); });
+        assert_eq!(woken.load(std::sync::atomic::Ordering::SeqCst), 1, "the window is woken once per delivery");
+        let (id, audio) = rx.recv().expect("one delivery");
+        assert_eq!(id, studio_core::SourceId(1));
+        let audio = audio.expect("the video's audio came through");
+        assert!(audio.frames() > 40_000, "about two seconds of it: {}", audio.frames());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_ring_out_on_the_last_clip_is_not_cut_off_by_the_render() {
+        // Project::duration is the end of the last CLIP; a tail on that clip
+        // would be truncated by the very render meant to carry it.
+        let mut s = Studio::demo();
+        let last = s.session.doc.project.clips.values().max_by_key(|c| c.end()).unwrap().clone();
+        let before = s.session.doc.project.duration();
+        s.edit(studio_core::Op::SetEffects { id: last.id, effects: vec![
+            studio_audio::ClipTail { ring: 2.0, fade: 1.0 }.effect()] }, "tail");
+        assert_eq!(s.session.doc.project.duration(), before, "the timeline's extent is unchanged");
+        let end = before.saturating_add(studio_core::Ticks::from_seconds(2.0));
+        assert_eq!(studio_audio::audible_end(&s.session.doc.project), end,
+                   "but the sound ends two seconds later");
+        // And the render the transport plays actually goes that far — the
+        // wiring, not just the helper (a test of the helper alone passed with
+        // render_arrangement still stopping at the last clip).
+        let buf = s.render_arrangement(48_000, &Default::default());
+        assert_eq!(buf.len(), end.to_samples(48_000) as usize * 2, "stereo frames to the audible end");
+    }
+
+    #[test]
+    #[cfg(feature = "app")]   // App is the window: no window, no test
+    fn the_status_bar_names_which_clock_is_running() {
+        use crate::App;
+        assert_eq!(App::clock_note(false, false, None, true), "", "stopped says nothing");
+        assert_eq!(App::clock_note(true, false, Some(4800), true), "audio clock");
+        // The reported bug's signature: playing, something loaded, and no
+        // clock coming from the device.
+        assert_eq!(App::clock_note(true, false, None, true), "wall clock — nothing rendered to play");
+        assert_eq!(App::clock_note(true, false, None, false), "no clock — nothing loaded");
+        assert_eq!(App::clock_note(false, true, Some(1), true), "audio clock", "the rack loop counts too");
+    }
+
+    #[test]
+    fn the_menu_keys_the_hint_advertises_actually_open_the_palette() {
+        // The corner hint has said "S-space menu" all along; the keymap
+        // resolved Shift+Space and ':' but no arm handled either, so both
+        // did nothing.
+        use studio_egui::keys::Key;
+        let mut s = Studio::demo();
+        s.key(Key { ch: ' ', shift: true, ctrl: false, alt: false });
+        assert!(s.palette_requested, "Shift+Space asks for the palette");
+        s.palette_requested = false;
+        s.key(Key::c(':'));
+        assert!(s.palette_requested, "':' asks for the palette, as in Helix");
+        s.palette_requested = false;
+        s.key(Key::c(' '));
+        assert!(!s.palette_requested && s.transport.playing, "plain space is still play");
+    }
+
+    #[test]
     fn space_toggles_the_transport_and_says_so() {
         let mut s = Studio::demo();
         assert!(!s.transport.playing);
@@ -3073,6 +3249,59 @@ pub struct App {
     export_note: String,
     /// A render in flight, drained once per frame into the tracker.
     export_run: Option<export::Run>,
+    /// Which band every waveform is drawn from. Per device and per session:
+    /// it is a way of LOOKING at the audio, like a zoom level, not a fact
+    /// about the project.
+    peak_band: studio_audio::Band,
+    /// Audio arriving from the background extraction of video sources, and
+    /// how many are still to come — for the status line.
+    video_audio_rx: Option<std::sync::mpsc::Receiver<(studio_core::SourceId, Option<studio_audio::SourceAudio>)>>,
+    video_audio_left: usize,
+    /// Where background workers find the egui context to wake the window.
+    ui_waker: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>>,
+    /// What was said in each source — whisper transcripts, loaded from a
+    /// folder of `.srt` files beside the media or picked in the palette.
+    /// Session state: a transcript is a reading of the media, rebuildable,
+    /// and not a fact the project should carry or collaborators should sync.
+    words: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
+    /// The transcripts as loaded; `words` is this through `word_filter`.
+    /// Kept apart so switching filters never re-reads a file and never
+    /// loses what the previous filter hid.
+    words_raw: std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
+    word_filter: studio_voice::WordFilter,
+    /// What each pattern clip's cache was rendered from (pattern_clips).
+    pattern_stamps: std::collections::BTreeMap<studio_core::SourceId, pattern_clips::Stamp>,
+    /// The filmstrip's decoded frames and the worker that decodes them.
+    thumbs: thumbs::Cache,
+    /// The project as it was last opened or saved. "Unsaved changes" means
+    /// the live project differs from it -- the question asked before
+    /// switching to another project, so a switch never loses work and never
+    /// rewrites a file (a demo fixture, say) that was only looked at.
+    saved_project: Option<studio_core::Project>,
+    /// A project waiting to be opened while the unsaved-changes question is asked.
+    open_pending: Option<std::path::PathBuf>,
+    /// The track-points window, open over the selected clip's first frame.
+    track_points: Option<track_points::Window>,
+    /// A finger has touched the screen this session: tool windows grow their
+    /// targets to fingertip size even on a wide screen (a touch laptop).
+    touch_seen: bool,
+    /// The comic setup window, open over a camera group.
+    comic_setup: Option<comic_job::SetupWindow>,
+    /// A comic render in flight.
+    comic_run: Option<comic_job::Job>,
+    /// The signals window, open over one camera group.
+    signals_panel: Option<signals_panel::Panel>,
+    /// The look copied by "style: copy", waiting to be pasted.
+    style_ref: Option<studio_video::style::Stats>,
+    /// The kaleidoscope gallery, open over the selected clip's frame.
+    kaleido_gallery: Option<kaleido_gallery::Gallery>,
+    /// Structure view: sections across, lanes down, instead of one row per
+    /// track. View state, per session — a way of looking, like zoom.
+    structure_view: bool,
+    /// The camera group the program monitor is showing as a grid, if any.
+    multiview: Option<studio_core::GroupId>,
+    /// A stabilize/clean-plate render in flight, and the clip it belongs to.
+    touchup_run: Option<touchup_job::Job>,
     export_done: Vec<std::path::PathBuf>,
     export_progress: (usize, usize, f32),
     /// The clip a bscale bounce belongs to while its run is in flight;
@@ -3126,22 +3355,38 @@ enum SinkContent {
 
 #[cfg(feature = "app")]
 impl Default for App {
-    fn default() -> Self {
+    fn default() -> Self { App::with_project(default_project_path()) }
+}
+
+/// Never `./project.studio` any more: an unnamed project gets its OWN
+/// directory under the projects root (see project_dir's containment rule and
+/// the accident that motivated it). The root is $STUDIO_PROJECTS, else the
+/// last place an archive was written -- a person who archives to an SD card
+/// wants the working copy beside it -- else the freedesktop data directory.
+#[cfg(feature = "app")]
+fn default_project_path() -> std::path::PathBuf {
+    // a project named on the command line wins over STUDIO_PROJECT
+    // (`studio film.studio`, or `studio fixtures/cartoon-fragile`); `run`
+    // has already handled --help and anything it refused
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let open_project::Launch::Project(p) = open_project::from_args(&args) { return p; }
+    match std::env::var("STUDIO_PROJECT") {
+        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
+        _ => {
+            let root = last_archive_root().unwrap_or_else(project_dir::projects_root);
+            project_dir::project_dir(&root, "untitled").join("project.studio")
+        }
+    }
+}
+
+#[cfg(feature = "app")]
+impl App {
+    /// The shell, opened on `project_path`: the same path a launch with
+    /// STUDIO_PROJECT takes, and what "open project" switches to -- so a
+    /// project opened from the palette is built exactly like one opened at
+    /// start-up, with nothing of the previous project left behind.
+    pub fn with_project(project_path: std::path::PathBuf) -> App {
         let sink = audition::open_sink();
-        // Never `./project.studio` any more: an unnamed project gets its
-        // OWN directory under the projects root (see project_dir's
-        // containment rule and the accident that motivated it). The root
-        // is $STUDIO_PROJECTS, else the last place an archive was written
-        // — a person who archives to an SD card wants the working copy
-        // beside it — else the freedesktop data directory.
-        let project_path = match std::env::var("STUDIO_PROJECT") {
-            Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
-            _ => {
-                let root = last_archive_root()
-                    .unwrap_or_else(project_dir::projects_root);
-                project_dir::project_dir(&root, "untitled").join("project.studio")
-            }
-        };
         // Open the named project when it exists; a demo otherwise. A load
         // FAILURE is neither: overwriting a damaged-but-real file with a
         // demo on the next Ctrl+S would finish what the damage started, so
@@ -3212,10 +3457,42 @@ impl Default for App {
             studio.status = format!("{} — midi: {}", studio.status, m.port_name());
         }
         let (provenance_tx, provenance_rx) = std::sync::mpsc::channel();
-        App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
+        let beside = transcripts::beside_media(&studio.session.doc.project,
+            project_path.parent().unwrap_or(std::path::Path::new(".")));
+        let pending_video = std::mem::take(&mut studio.pending_video_audio);
+        let video_audio_left = pending_video.len();
+        // The worker wakes the window through this slot; the first frame fills it.
+        let ui_waker: std::sync::Arc<std::sync::Mutex<Option<egui::Context>>> = Default::default();
+        {
+            let w = ui_waker.clone();
+            studio.waker = std::sync::Arc::new(move || { if let Some(c) = w.lock().ok().and_then(|g| g.clone()) { c.request_repaint(); } });
+        }
+        let video_audio_rx = (!pending_video.is_empty()).then(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let w = ui_waker.clone();
+            std::thread::spawn(move || Studio::extract_video_audio(pending_video, tx, move || {
+                if let Some(c) = w.lock().ok().and_then(|g| g.clone()) { c.request_repaint(); }
+            }));
+            rx
+        });
+        let thumb_cache = {
+            let w = ui_waker.clone();
+            thumbs::Cache::new(std::sync::Arc::new(move || { if let Some(c) = w.lock().ok().and_then(|g| g.clone()) { c.request_repaint(); } }))
+        };
+        let mut app = App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
             provenance_tx, provenance_rx,
             follow: None,
-              carrier, project_path, library_roots: library::Roots::from_env(library_root.clone()),
+              carrier, project_path,
+              // The sidecar wins over the environment when it has an answer:
+              // a person who set the libraries in Settings expects them to
+              // still be set next launch, and a launcher script's env var is
+              // the DEFAULT, not an override of what they chose.
+              library_roots: {
+                  let mut r = library::Roots::from_env(library_root.clone());
+                  if !ws.library_audio.is_empty() { r.audio = ws.library_audio.clone().into(); }
+                  if !ws.library_video.is_empty() { r.video = Some(ws.library_video.clone().into()); }
+                  r
+              },
               library_root, library_tree, library_prefs,
               morph: morph_pad::PadState::default(),
               bounce_format,
@@ -3250,13 +3527,34 @@ impl Default for App {
               export_dialog: None,
               export_note: String::new(),
               export_run: None,
+              touchup_run: None,
+              multiview: None,
+              peak_band: studio_audio::Band::Full,
+              video_audio_rx, video_audio_left, ui_waker,
+              // Whisper writes a transcript beside its media by default, so
+              // look there first — no command needed for the common case.
+              words: beside.words.clone(),
+              words_raw: beside.words,
+              word_filter: studio_voice::WordFilter::All,
+              structure_view: false,
+              kaleido_gallery: None,
+              style_ref: None,
+              signals_panel: None,
+              comic_run: None,
+              comic_setup: None,
+              touch_seen: false,
+              track_points: None,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
               upscale_clip: None,
               upscale_settings: upscale::Settings::default(),
               tune_scale: None,
               analog: Box::new(analog),
-              loaded: SinkContent::Nothing, silent_clock: None }
+              loaded: SinkContent::Nothing, silent_clock: None, saved_project: None, open_pending: None,
+              thumbs: thumb_cache, pattern_stamps: Default::default() };
+        // the project as opened: "unsaved changes" means different from this
+        app.saved_project = Some(app.studio.session.doc.project.clone());
+        app
     }
 }
 
@@ -3300,10 +3598,13 @@ impl eframe::App for App {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::R)) {
             self.toggle_take();
         }
+        if std::mem::take(&mut self.studio.palette_requested) && self.palette.is_none() {
+            self.palette = Some(palette::Palette::open_with(self.words_raw.clone()));
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
             self.palette = match self.palette {
                 Some(_) => None, // C-p again closes: a toggle, not a stack
-                None => Some(palette::Palette::open()),
+                None => Some(palette::Palette::open_with(self.words_raw.clone())),
             };
         }
         // C-1..C-4: the workspaces. One keypress per room, the kdenlive
@@ -3403,7 +3704,11 @@ impl eframe::App for App {
         // it is one frame's fact, recomputed from real width every time.
         let mut pages_mode = false;
         egui::Panel::top("bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            // WRAPPED, not one row: on a phone-width window the single row ran
+            // off the right edge and took `film`, `save`, export and every
+            // tool with it -- and the palette's shortcut needs a keyboard a
+            // phone does not have. Wrapping keeps every control reachable.
+            ui.horizontal_wrapped(|ui| {
                 // Tabs when the labels actually fit, a compact picker when
                 // they don't — decided from a WIDTH FIT via responsive_nav,
                 // not a device-class guess (its module doc explains why the
@@ -3526,7 +3831,7 @@ impl eframe::App for App {
                         if let Some((root, mode)) = scale {
                             let scale = studio_fx::retune::Scale { root, mode };
                             if let Some((id, audio)) = self.studio.autotune_selected(&self.audio, scale) {
-                                self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                                self.peaks.insert(id, self.build_peaks(&audio));
                                 if let Ok(bytes) = studio_audio::export::export_wav_dithered_bytes(
                                     &audio.channels[0], audio.channels.len() as u16,
                                     audio.sample_rate, id.0)
@@ -3555,74 +3860,116 @@ impl eframe::App for App {
                         }
                     }
                 }
+                // Film: the ingest and touch-up verbs the palette already
+                // carries, as buttons, because a person who does not know
+                // the palette's words cannot search for a command they have
+                // never heard of. Each one is the SAME shell verb the
+                // palette raises, so the two can never drift.
+                let film_layout = studio_egui::touch::ToolLayout::for_screen(ui.ctx().content_rect().width(), self.touch_seen);
+                ui.menu_button("film", |ui| {
+                    // fingertip rows on a phone or wherever a finger has touched
+                    film_layout.apply(ui);
+                    let selected = !self.studio.selection.is_empty();
+                    let busy = self.touchup_run.is_some();
+                    if ui.add_enabled(selected && !busy, egui::Button::new("stabilize — smooth-cam"))
+                        .on_hover_text("keep the camera move, lose the shake")
+                        .clicked() {
+                        self.run_palette_act(palette::Act::Shell(
+                            palette::ShellVerb::TouchUpStabilize(palette::StabilizeKind::Smooth)));
+                        ui.close();
+                    }
+                    if ui.add_enabled(selected && !busy, egui::Button::new("stabilize — still-cam"))
+                        .on_hover_text("lock off a shot that was handheld by accident")
+                        .clicked() {
+                        self.run_palette_act(palette::Act::Shell(
+                            palette::ShellVerb::TouchUpStabilize(palette::StabilizeKind::Still)));
+                        ui.close();
+                    }
+                    if ui.add_enabled(selected && !busy, egui::Button::new("stabilize — punch-in and de-jerk"))
+                        .on_hover_text("a deliberate pan with a bump in it; the least crop")
+                        .clicked() {
+                        self.run_palette_act(palette::Act::Shell(
+                            palette::ShellVerb::TouchUpStabilize(palette::StabilizeKind::Dejerk)));
+                        ui.close();
+                    }
+                    if ui.add_enabled(selected, egui::Button::new("kaleidoscope gallery…"))
+                        .on_hover_text("every option drawn on this clip's frame, arranged by wedges, turn and centre")
+                        .clicked() {
+                        self.open_kaleido_gallery();
+                        ui.close();
+                    }
+                    if ui.add_enabled(selected && !busy, egui::Button::new("rescue: follow the motion (1.6x)"))
+                        .on_hover_text("punch in on what moves and follow it — covers a weak take with the gesture")
+                        .clicked() {
+                        self.run_palette_act(palette::Act::Shell(palette::ShellVerb::TouchUpFollow { zoom_pct: 160 }));
+                        ui.close();
+                    }
+                    if ui.add_enabled(selected && !busy, egui::Button::new("clean plate (±6 frames)"))
+                        .on_hover_text("remove something crossing the shot, using the frames around it")
+                        .clicked() {
+                        self.run_palette_act(palette::Act::Shell(
+                            palette::ShellVerb::TouchUpCleanPlate { radius: 6, moving: false }));
+                        ui.close();
+                    }
+                    ui.separator();
+                    let groups: Vec<(studio_core::GroupId, String)> = self.studio.session.doc.project
+                        .groups.iter()
+                        .filter(|(id, _)| studio_video::multicam::from_group(
+                            &self.studio.session.doc.project, **id).is_ok())
+                        .map(|(id, g)| (*id, g.name.clone())).collect();
+                    ui.add_enabled_ui(!groups.is_empty(), |ui| {
+                        ui.menu_button("multiview a camera group", |ui| {
+                            for (id, name) in &groups {
+                                let on = self.multiview == Some(*id);
+                                if ui.add(egui::Button::selectable(on, name)).clicked() {
+                                    self.run_palette_act(palette::Act::Shell(
+                                        palette::ShellVerb::Multiview(if on { None } else { Some(*id) })));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
+                    if groups.is_empty() {
+                        ui.colored_label(egui::Color32::GRAY,
+                            "no camera group yet — group the angles of one moment first");
+                    }
+                    ui.separator();
+                    if ui.add(egui::Button::selectable(self.structure_view, "structure view (whole project)"))
+                        .on_hover_text("sections across, lanes down — for projects too big to read track by track")
+                        .clicked() {
+                        self.structure_view = !self.structure_view;
+                        ui.close();
+                    }
+                    if ui.add_enabled(!groups.is_empty() && self.comic_run.is_none(), egui::Button::new("comic: auto layout a camera group…"))
+                        .on_hover_text("wide, page, inset and split from the dialogue; sides from who each mic hears; renders then lands on a new track")
+                        .clicked() {
+                        if let Some((g, _)) = groups.first() { self.open_comic_setup(*g); }
+                        ui.close();
+                    }
+                    if ui.add_enabled(!groups.is_empty(), egui::Button::new("cut a camera group by signals…"))
+                        .on_hover_text("see the lanes — kick, control channels, line starts — weight them, and plan a cut that says why")
+                        .clicked() {
+                        if let Some((g, _)) = groups.first() { self.open_signals(*g); }
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("show transcripts under clips…")
+                        .on_hover_text("load a folder of whisper .srt files; matched to clips by name")
+                        .clicked() {
+                        self.run_palette_act(palette::Act::Shell(palette::ShellVerb::LoadTranscripts));
+                        ui.close();
+                    }
+                    if ui.button("relink media to a folder…")
+                        .on_hover_text("proxies → camera originals; only the paths move")
+                        .clicked() {
+                        self.run_palette_act(palette::Act::Shell(palette::ShellVerb::RelinkToFolder));
+                        ui.close();
+                    }
+                });
                 if ui.button("save").clicked()
                     || ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S))
                 {
-                    let path = self.project_path.clone();
-                    workspace::save(&path, &workspace::WorkspaceState {
-                        combined: self.studio.combined,
-                        panel: self.studio.panel.label().to_string(),
-                        side_slot: match self.side_slot {
-                            SideSlot::Off => "off", SideSlot::Viewport => "viewport",
-                            SideSlot::Mixer => "mixer", SideSlot::Rack => "rack",
-                            SideSlot::Program => "program",
-                        }.to_string(),
-                        px_per_sec: self.studio.current_view().px_per_sec,
-                        scroll_ticks: self.studio.current_view().scroll.0,
-                        closed_groups: self.studio.closed_groups.iter()
-                            .map(|g| g.0).collect(),
-                        bounce_format: self.bounce_format.token().to_string(),
-                        voice_domains: self.lexicon.to_tokens(),
-                        pinned: self.library_prefs.pinned.iter()
-                            .map(|p| p.display().to_string()).collect(),
-                        demoted: self.library_prefs.demoted.iter()
-                            .map(|p| p.display().to_string()).collect(),
-                        library_open: self.library_open,
-                        display_name: self.studio.display_name.clone(),
-                        rebinds: self.rebinds.encode(),
-                        piano_zones: self.zones.encode(),
-                        overlap: self.studio.overlap.name().to_string(),
-                        overlap_tracks: self.studio.overlap_tracks.iter()
-                            .map(|(t, p)| format!("{}:{}", t.0, p.name())).collect::<Vec<_>>().join(","),
-                    });
-                    // The directory must exist (and be ours) BEFORE the
-                    // file is written: a save into a fresh project root
-                    // otherwise fails on the open, and a save into
-                    // someone's source tree must fail here rather than
-                    // after leaving a file in it.
-                    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                        if let Err(e) = project_dir::ensure_project_dir(dir) {
-                            self.studio.status = e;
-                            return;
-                        }
-                    }
-                    if self.studio.save_to(&path).is_ok() {
-                        // The save happened; history is the extra. A missing
-                        // git binary demotes to a note, never a lost save.
-                        let dir = path.parent()
-                            .filter(|p| !p.as_os_str().is_empty())
-                            .map(|p| p.to_path_buf())
-                            .unwrap_or_else(|| std::path::PathBuf::from("."));
-                        let p = &self.studio.session.doc.project;
-                        let meta = project_dir::Meta {
-                            name: p.name.clone(),
-                            bpm: self.studio.rack.tempo_bpm,
-                            tracks: p.tracks.len(),
-                            clips: p.clips.len(),
-                            busses: p.busses.len(),
-                            patterns: self.studio.rack.patterns.len(),
-                            channels: self.studio.rack.channels.len(),
-                        };
-                        match project_dir::save_versioned(
-                            &dir, &meta, project_dir::MediaMode::Committed, "save") {
-                            Ok(Some(id)) => self.studio.status =
-                                format!("{} — commit {id}", self.studio.status),
-                            Ok(None) => {}
-                            Err(e) => self.studio.status =
-                                format!("{} (history skipped: {})",
-                                        self.studio.status, e.lines().next().unwrap_or("git error")),
-                        }
-                    }
+                    let _ = self.save_project();
                 }
                 let mut combined = self.studio.combined;
                 if ui.add(egui::Button::selectable(combined, "workbench"))
@@ -3708,6 +4055,11 @@ impl eframe::App for App {
                 ui.label(&self.studio.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("{} clips", self.studio.session.doc.project.clips.len()));
+                    let note = Self::clock_note(self.studio.transport.playing,
+                                                self.studio.rack_playing,
+                                                self.sink.position(),
+                                                self.loaded != SinkContent::Nothing);
+                    if !note.is_empty() { ui.separator(); ui.label(note); }
                     let call = self.call.describe(&*self.mic);
                     if !call.is_empty() { ui.separator(); ui.label(call); }
                 });
@@ -3783,6 +4135,64 @@ impl eframe::App for App {
                     ui.colored_label(egui::Color32::GRAY,
                         "several keys can share one note — wide regions like real \
                          piano-key spacing. Uncalibrated keys keep the tracker rows.");
+                    ui.separator();
+                    // Libraries: until now these were STUDIO_LIBRARY and
+                    // STUDIO_VIDEO_LIB only, which means "edit your launcher
+                    // script" — fine for the person who wrote it, invisible
+                    // to everyone else. The field shows what is in use and
+                    // what is actually there, because a typo and a real
+                    // folder look identical in a text box.
+                    ui.label("libraries — where sound and picture are browsed from:");
+                    let mut audio = self.library_roots.audio.display().to_string();
+                    let mut video = self.library_roots.video.as_ref()
+                        .map(|p| p.display().to_string()).unwrap_or_default();
+                    let mut changed = false;
+                    ui.horizontal(|ui| {
+                        ui.label("sound");
+                        if ui.add(egui::TextEdit::singleline(&mut audio).desired_width(260.0)
+                            .id_salt("lib-root-audio")).changed() { changed = true; }
+                        if ui.button("browse…").clicked() {
+                            if let Some(d) = export::pick_folder() {
+                                audio = d.display().to_string();
+                                changed = true;
+                            }
+                        }
+                        let state = library::inspect(std::path::Path::new(&audio), false);
+                        ui.colored_label(if state.usable() { colors.text_weak } else { colors.danger },
+                                         state.describe());
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("picture");
+                        if ui.add(egui::TextEdit::singleline(&mut video).desired_width(260.0)
+                            .hint_text("optional — proxies, takes").id_salt("lib-root-video")).changed() {
+                            changed = true;
+                        }
+                        if ui.button("browse…").clicked() {
+                            if let Some(d) = export::pick_folder() {
+                                video = d.display().to_string();
+                                changed = true;
+                            }
+                        }
+                        if !video.is_empty() {
+                            let state = library::inspect(std::path::Path::new(&video), true);
+                            ui.colored_label(if state.usable() { colors.text_weak } else { colors.danger },
+                                             state.describe());
+                        }
+                    });
+                    if changed {
+                        self.library_roots.audio = audio.clone().into();
+                        self.library_roots.video =
+                            (!video.trim().is_empty()).then(|| std::path::PathBuf::from(&video));
+                        self.library_root = self.library_roots.audio.clone();
+                        // The sidebar walks from the root each frame, so resetting its
+                        // open-folder state is all a root change needs.
+                        self.library_tree = library::TreeState::default();
+                        self.studio.status = "library — saved with the workspace on next save".into();
+                    }
+                    ui.colored_label(egui::Color32::GRAY,
+                        "set here, these override STUDIO_LIBRARY / STUDIO_VIDEO_LIB and are \
+                         kept per device with the workspace — a sample drive is not mounted \
+                         in the same place on two machines.");
                     ui.separator();
                     ui.label("your name, as peers see it beside your playhead:");
                     let hint = format!("site {}", self.studio.session.doc.site.0);
@@ -3893,6 +4303,20 @@ impl eframe::App for App {
         self.archive_window(ctx);
         self.export_dialog_window(ctx);
         self.export_tracker_window(ctx);
+        self.touchup_tracker(ctx);
+        self.kaleido_gallery_window(ctx);
+        self.signals_window(ctx);
+        self.comic_tracker();
+        // the filmstrip: take in decoded frames, ask for what the timeline lacked
+        // (paths against the project folder -- relative sources are beside it)
+        {
+            let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            let paths: std::collections::HashMap<studio_core::SourceId, std::path::PathBuf> = self.studio.session.doc.project.sources
+                .iter().filter(|(_, s)| s.has_video).map(|(id, s)| (*id, base.join(&s.path))).collect();
+            self.thumbs.pump(ctx, |id| paths.get(&id).cloned());
+        }
+        self.comic_setup_window(ctx);
+        self.track_points_window(ctx);
 
         // ── files dropped on the window ──────────────────────────────────
         //
@@ -3948,7 +4372,7 @@ impl eframe::App for App {
             if let Some(dir) = f.path.as_ref().filter(|p| p.is_dir()) {
                 match self.studio.import_kit(dir) {
                     Ok(hits) => for (id, audio, raw) in hits {
-                        self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                        self.peaks.insert(id, self.build_peaks(&audio));
                         self.audio.insert(id, audio);
                         self.studio.register_asset(id, &raw);
                     },
@@ -4021,7 +4445,7 @@ impl eframe::App for App {
                         self.studio.import_clip(&name, &path, &audio)
                     };
                     if let Some(id) = id {
-                        self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                        self.peaks.insert(id, self.build_peaks(&audio));
                         self.audio.insert(id, audio);
                         self.studio.register_asset(id, &raw);
                     }
@@ -4181,9 +4605,32 @@ impl eframe::App for App {
             }
         }
 
+        if let Ok(mut w) = self.ui_waker.lock() { if w.is_none() { *w = Some(ctx.clone()); } }
+        if !self.touch_seen && ctx.input(|i| i.any_touches()) { self.touch_seen = true; }
+        // ── video sources' audio, arriving from the extraction worker ────
+        if let Some(rx) = &self.video_audio_rx {
+            let mut got = Vec::new();
+            while let Ok(item) = rx.try_recv() { got.push(item); }
+            for (id, audio) in got {
+                self.video_audio_left = self.video_audio_left.saturating_sub(1);
+                if let Some(a) = audio {
+                    self.peaks.insert(id, self.build_peaks(&a));
+                    self.audio.insert(id, a);
+                    self.studio.arrangement_dirty = true;
+                }
+            }
+            if self.video_audio_left == 0 {
+                self.video_audio_rx = None;
+                self.studio.status = "video audio extracted — waveforms and playback complete".into();
+            } else {
+                self.studio.status = format!("extracting audio from video… {} to go", self.video_audio_left);
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
+        }
+
         // ── media that finished arriving from peers ──────────────────────
         for (id, audio) in std::mem::take(&mut self.studio.incoming_audio) {
-            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+            self.peaks.insert(id, self.build_peaks(&audio));
             self.audio.insert(id, audio);
             // Clips referencing this source were silent until now; racks
             // sampling it were too.
@@ -4208,11 +4655,25 @@ impl eframe::App for App {
             let fresh = self.studio.rerender_pattern_links(rate, &self.audio);
             if !fresh.is_empty() {
                 for (id, audio) in fresh {
-                    self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                    self.peaks.insert(id, self.build_peaks(&audio));
                     self.audio.insert(id, audio);
                 }
                 self.studio.arrangement_dirty = true;
             }
+        }
+        // LINKED PATTERN CLIPS: any pattern source whose rack changed, or whose
+        // clips now need more than was rendered, is rendered again -- the link is
+        // the source kind itself, saved and synced with the project.
+        let redone = pattern_clips::refresh(&self.studio.session.doc.project, &self.studio.rack,
+                                            &mut self.audio, &mut self.pattern_stamps);
+        if !redone.is_empty() {
+            for sid in redone {
+                match self.audio.get(&sid) {
+                    Some(a) => { let pk = self.build_peaks(a); self.peaks.insert(sid, pk); }
+                    None => { self.peaks.remove(&sid); }
+                }
+            }
+            self.studio.arrangement_dirty = true;
         }
         if self.studio.pending_bounce {
             self.studio.pending_bounce = false;
@@ -4227,7 +4688,7 @@ impl eframe::App for App {
             // The timeline's rate, not the sink's: a bounce is project
             // material and must not change length because of the sound card.
             if let Some((id, audio)) = self.studio.place_pattern(index, at, track, 48_000, &self.audio) {
-                self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                self.peaks.insert(id, self.build_peaks(&audio));
                 // The op recorded a path; make it true on disk, so the
                 // project's reference points at a real file rather than a
                 // label. A failed write is a status note, not a lost bounce
@@ -4478,7 +4939,7 @@ impl eframe::App for App {
                                 .unwrap_or("sample").to_owned();
                             let id = self.studio.import_audio(
                                 &name, &p.display().to_string(), &audio);
-                            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                            self.peaks.insert(id, self.build_peaks(&audio));
                             self.audio.insert(id, audio);
                             self.studio.register_asset(id, &raw);
                             let added = self.studio.rack.channels.len().saturating_sub(1);
@@ -4511,7 +4972,7 @@ impl eframe::App for App {
                             self.studio.edit(studio_core::Op::AddBus {
                                 bus: studio_core::Bus { id: b, name: "Drums".into(),
                                     parent: None, gain: 1.0, chain: vec![],
-                                    sends: vec![], muted: false } }, "drum bus");
+                                    sends: vec![], muted: false, silent: false } }, "drum bus");
                             b
                         }
                     };
@@ -4555,7 +5016,7 @@ impl eframe::App for App {
                                     track, pos: self.studio.playhead(),
                                     src_in: studio_core::Ticks::ZERO, len,
                                     gain: 1.0, effects: vec![] } }, "placed");
-                            self.peaks.insert(sid, studio_audio::Peaks::build(&audio, 256, 256));
+                            self.peaks.insert(sid, self.build_peaks(&audio));
                             self.audio.insert(sid, audio);
                             self.studio.register_asset(sid, &raw);
                             self.studio.status = format!(
@@ -4567,47 +5028,11 @@ impl eframe::App for App {
                     return;
                 }
                 library::LibraryAction::PatternToTimeline(i) => {
-                    // Bounds-checked rather than indexed: the action was
-                    // produced from last frame's rack, and the rack can have
-                    // shrunk since (a pattern deleted in the same frame the
-                    // send button was pressed). An out-of-date index is a
-                    // status line, not a panic.
-                    match self.studio.rack.patterns.get(i) {
-                        Some(pat) => {
-                            let name = if pat.name.trim().is_empty() {
-                                format!("pattern {}", i + 1)
-                            } else {
-                                pat.name.clone()
-                            };
-                            // NOT WIRED to a real timeline insert yet, and
-                            // deliberately not faked: placing a pattern needs
-                            // a decision about what a pattern IS on the
-                            // timeline (a clip referencing the rack? a bounced
-                            // audio region? a MIDI-ish region the renderer
-                            // expands?), and each answer implies a different
-                            // studio_core::Op. Guessing one here would put a
-                            // wrong shape into the undo log, which is the one
-                            // structure in this app that must not accumulate
-                            // junk. The sidebar half of the report — patterns
-                            // being invisible — is fixed; this half is
-                            // reported honestly rather than half-built.
-                            let at = self.studio.playhead();
-                            let project = &self.studio.session.doc.project;
-                            let track = project.tracks.iter()
-                                .filter(|t| t.kind == studio_core::TrackKind::Audio)
-                                .find(|t| !project.clips.values().any(|c| c.track == t.id && c.pos <= at && c.end() > at))
-                                .or_else(|| project.tracks.iter().find(|t| t.kind == studio_core::TrackKind::Audio))
-                                .map(|t| t.id);
-                            match track {
-                                Some(track) => self.studio.pending_place = Some((i, at, track)),
-                                None => self.studio.status = format!("\"{name}\" needs an audio track to land on"),
-                            }
-                        }
-                        None => {
-                            self.studio.status =
-                                "that pattern no longer exists".into();
-                        }
-                    }
+                    // A LINKED clip: the pattern source names the rack pattern, and
+                    // the audio is a cache kept current from the rack. (Rendering
+                    // to a file stays the bounce command's job.)
+                    let at = self.studio.playhead();
+                    self.pattern_to_timeline(i, at, None);
                     return;
                 }
                 library::LibraryAction::Preview(p) => {
@@ -4645,7 +5070,7 @@ impl eframe::App for App {
                         if let Some(id) = self.studio.import_video_clip(
                             &name, &path.display().to_string(), pr.duration, meta) {
                             if let Some(a) = audio {
-                                self.peaks.insert(id, studio_audio::Peaks::build(&a, 256, 256));
+                                self.peaks.insert(id, self.build_peaks(&a));
                                 self.audio.insert(id, a);
                             }
                             if let Ok(raw) = std::fs::read(&path) {
@@ -4671,7 +5096,7 @@ impl eframe::App for App {
                                 self.studio.import_clip(&name, &label, &audio)
                             };
                             if let Some(id) = id {
-                                self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                                self.peaks.insert(id, self.build_peaks(&audio));
                                 self.audio.insert(id, audio);
                                 self.studio.register_asset(id, &raw);
                             }
@@ -4763,7 +5188,10 @@ impl eframe::App for App {
                         None => { ui.label(egui::RichText::new("no video under the playhead").weak().small()); }
                     }
                 });
-                viewport::show(ui, project, ph, &base, &mut self.frame_cache, &colors);
+                match self.multiview {
+                    Some(g) => viewport::show_multiview(ui, project, ph, g, &base, &mut self.frame_cache, &colors),
+                    None => viewport::show(ui, project, ph, &base, &mut self.frame_cache, &colors),
+                }
             });
         }
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -4783,11 +5211,30 @@ impl eframe::App for App {
                 Panel::Program => {
                     edge = Some(program_panel::show(ui, &mut self.studio, &colors, playhead_col));
                 }
-                Panel::Timeline => {
+                Panel::Timeline => 'timeline: {
                     // The inspector sits above the arrangement rather than
                     // in a side panel: it is about the thing you just
                     // clicked, so it belongs where your eyes already are,
                     // and it collapses to nothing when nothing is selected.
+                    if self.structure_view {
+                        // The megastructure: the whole project as sections ×
+                        // lanes. Clicking a section drops back to the fine
+                        // timeline at its start — the zoom is a way to find
+                        // where to work, and the work happens in the fine view.
+                        let ov = overview::summarize(&self.studio.session.doc.project, 12);
+                        ui.horizontal(|ui| {
+                            ui.label(format!("structure — {} sections × {} lanes, {} tracks",
+                                ov.sections.len(), ov.lanes.len(), self.studio.session.doc.project.tracks.len()));
+                            if ui.button("back to the timeline").clicked() { self.structure_view = false; }
+                        });
+                        if let Some(t) = overview::show(ui, &ov, self.studio.playhead(), &colors) {
+                            self.studio.seek(t);
+                            self.structure_view = false;
+                        }
+                        // not `return`: that would leave the whole panel closure and
+                        // skip the scroll-edge handling and the workbench below it
+                        break 'timeline;
+                    }
                     clip_inspector::show(ui, &mut self.studio, &colors);
                     let ph = self.studio.playhead();
                     let sel = self.studio.selection.clone();
@@ -4816,7 +5263,8 @@ impl eframe::App for App {
                         .and_then(|g| g.tempo.as_ref());
                     let tr = studio_egui::timeline(ui, &session.doc,
                                                    view,
-                                                   &colors, ph, &sel, &self.peaks,
+                                                   &colors, ph, &sel, &self.peaks, &self.words,
+                                                   &self.thumbs.thumbs,
                                                    *trim_side,
                                                    closed_groups,
                                                    mode, input_mode, &pending,
@@ -4828,7 +5276,8 @@ impl eframe::App for App {
                         self.studio.seek(t);
                     }
                     if let Some((index, at, track)) = tr.pattern_dropped {
-                        self.studio.pending_place = Some((index, at, track));
+                        // linked, not bounced: a pattern clip follows the rack (pattern_clips)
+                        self.pattern_to_timeline(index, at, Some(track));
                     }
                     if let Some(g) = tr.toggled_group {
                         if !self.studio.closed_groups.remove(&g) {
@@ -5233,7 +5682,7 @@ impl App {
                 p.rows.truncate(self.studio.rack.channels.len());
             }
             let ix = self.studio.layer_channel(sel, ch);
-            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+            self.peaks.insert(id, self.build_peaks(&audio));
             self.audio.insert(id, audio);
             self.studio.register_asset(id, &raw);
             self.studio.status = format!(
@@ -5253,7 +5702,7 @@ impl App {
                 self.studio.loop_dirty = true;
                 self.studio.status = format!("channel {} is now '{name}'", sel + 1);
             }
-            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+            self.peaks.insert(id, self.build_peaks(&audio));
             self.audio.insert(id, audio);
             self.studio.register_asset(id, &raw);
         }
@@ -5313,8 +5762,12 @@ impl App {
         }
 
         let width = Self::dialog_width(ctx.content_rect().width(), 420.0);
+        // max_width, not only default_width: a transcript line is as long as
+        // someone talked, and without a cap the window grew to fit the longest
+        // one — anchored at top-centre, it spread off BOTH edges and pushed the
+        // very lines being searched out of view (seen on the Fragile Thing card).
         egui::Window::new("Command palette").open(&mut open).resizable(false)
-            .collapsible(false).default_width(width)
+            .collapsible(false).default_width(width).max_width(width)
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
             .show(ctx, |ui| {
                 if !p.path.is_empty() {
@@ -5333,7 +5786,14 @@ impl App {
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                     for (i, c) in ranked.iter().enumerate() {
                         let row = ui.horizontal(|ui| {
-                            let hit = ui.selectable_label(i == p.selected, &c.label);
+                            // Shortened for DRAWING only: the full label is still what
+                            // the filter matched against, so nothing becomes unfindable.
+                            const MAX_CHARS: usize = 46; // leaves room for the hint column
+                            let shown: std::borrow::Cow<str> = if c.label.chars().count() > MAX_CHARS {
+                                format!("{}…", c.label.chars().take(MAX_CHARS).collect::<String>()).into()
+                            } else { c.label.as_str().into() };
+                            let hit = ui.selectable_label(i == p.selected, shown.as_ref())
+                                .on_hover_text(&c.label);
                             if let Some(h) = &c.hint {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -5406,14 +5866,37 @@ impl App {
                 // changes where the view is pointing, and a person who
                 // cannot tell whether an invite went out will send it
                 // twice.
-                palette::ShellVerb::OpenProject => {
-                    // Deliberately NOT loading here. Choosing a project
-                    // is a file-picker step and the palette's own model
-                    // has a shape for that — `Then::Ask` — which this
-                    // verb does not use yet. Saying so beats loading
-                    // some guessed path over unsaved work.
-                    self.studio.status =
-                        "open project: needs a picker step (C90c)".into();
+                palette::ShellVerb::AddTrack { video } => {
+                    let kind = if video { studio_core::TrackKind::Video } else { studio_core::TrackKind::Audio };
+                    let op = tracks::add_below(&self.studio.session.doc.project, self.studio.selection.first().copied(), kind);
+                    let name = if let studio_core::Op::AddTrack { track, .. } = &op { track.name.clone() } else { String::new() };
+                    self.studio.edit(op, "add track");
+                    self.studio.status = format!("added '{name}'{}", if self.studio.selection.is_empty() { " at the bottom" } else { " below the selected clip's track" });
+                }
+                palette::ShellVerb::OpenProject => self.open_palette_at(palette::Ask::OpenProjectPick, "open project"),
+                palette::ShellVerb::OpenProjectBrowse => match open_project::pick() {
+                    Some(p) => self.request_open(p),
+                    None => {
+                        // cancelled, or no portal on this desktop: the two look the
+                        // same from here, so offer the list either way
+                        self.open_palette_at(palette::Ask::OpenProjectPick, "open project");
+                        self.studio.status = "no project chosen (or no file picker on this desktop) — here are the ones found nearby".into();
+                    }
+                },
+                palette::ShellVerb::OpenProjectFound(i) => match open_project::nearby().get(i as usize).cloned() {
+                    Some(p) => self.request_open(p),
+                    None => self.studio.status = "that project is no longer where it was — open the list again".into(),
+                },
+                palette::ShellVerb::OpenSaveThen => if let Some(p) = self.open_pending.take() {
+                    match self.save_project() {
+                        Ok(()) => self.switch_to(p),
+                        Err(e) => self.studio.status = format!("could not save, so staying on this project: {e}"),
+                    }
+                },
+                palette::ShellVerb::OpenDiscard => if let Some(p) = self.open_pending.take() { self.switch_to(p) },
+                palette::ShellVerb::OpenCancel => {
+                    self.open_pending = None;
+                    self.studio.status = "kept working on this project".into();
                 }
                 palette::ShellVerb::CollabInvite => {
                     // The roster is what an invite would grow, and it is
@@ -5515,6 +5998,222 @@ impl App {
                             else { self.lexicon.to_tokens() });
                     }
                 }
+                palette::ShellVerb::Multiview(group) => {
+                    // Toggling: choosing the group that is already showing
+                    // puts the monitor back on the cut, which is the way out
+                    // without a second command to find.
+                    self.multiview = if self.multiview == group { None } else { group };
+                    self.frame_cache = viewport::FrameCache::default();
+                    self.studio.status = match self.multiview {
+                        Some(g) => format!("multiview: {}", self.studio.session.doc.project.groups
+                            .get(&g).map(|x| x.name.clone()).unwrap_or_default()),
+                        None => "program monitor back on the cut".into(),
+                    };
+                }
+                palette::ShellVerb::ClipTail { ring_ms, fade_ms } => {
+                    let tail = studio_audio::ClipTail {
+                        ring: ring_ms as f64 / 1000.0, fade: fade_ms as f64 / 1000.0 };
+                    let project = &self.studio.session.doc.project;
+                    let ops: Vec<studio_core::Op> = self.studio.selection.iter()
+                        .filter_map(|id| project.clips.get(id))
+                        .map(|c| {
+                            // Replace any previous tail setting; leave every
+                            // real effect exactly where it was in the chain.
+                            let mut fx: Vec<studio_core::Effect> = c.effects.iter()
+                                .filter(|e| e.kind != studio_audio::TAIL_KIND).cloned().collect();
+                            if tail.ring > 0.0 { fx.push(tail.effect()); }
+                            studio_core::Op::SetEffects { id: c.id, effects: fx }
+                        }).collect();
+                    if ops.is_empty() {
+                        self.studio.status = "select the clips whose tail to set".into();
+                    } else {
+                        let n = ops.len();
+                        self.studio.edit_group(ops, "clip tail");
+                        self.studio.status = if tail.ring == 0.0 {
+                            format!("{n} clip(s): effects cut at the clip end")
+                        } else {
+                            format!("{n} clip(s): effects ring {:.1} s past the end{}", tail.ring,
+                                    if tail.fade > 0.0 { format!(", fading the last {:.1} s", tail.fade) }
+                                    else { ", then cut".into() })
+                        };
+                    }
+                }
+                palette::ShellVerb::WordFilter(kind) => {
+                    self.word_filter = match kind {
+                        palette::WordFilterKind::All => studio_voice::WordFilter::All,
+                        palette::WordFilterKind::Filler => studio_voice::WordFilter::Filler,
+                        palette::WordFilterKind::Unique => studio_voice::WordFilter::Unique,
+                        palette::WordFilterKind::Dictionary => match export::pick_file() {
+                            Some(p) => match std::fs::read_to_string(&p) {
+                                Ok(t) => studio_voice::WordFilter::Dictionary(studio_voice::parse_dictionary(&t)),
+                                Err(e) => { self.studio.status = format!("could not read {}: {e}", p.display()); return; }
+                            },
+                            None => { self.studio.status = "no word list chosen".into(); return; }
+                        },
+                    };
+                    self.studio.status = if self.words_raw.is_empty() {
+                        "no transcripts loaded yet — the filter applies once they are".into()
+                    } else { self.refilter_words() };
+                }
+                palette::ShellVerb::StyleCopy => {
+                    let project = &self.studio.session.doc.project;
+                    let ph = self.studio.playhead();
+                    let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                    // the picture actually on screen: the topmost video layer at the playhead
+                    match viewport::video_at(project, ph) {
+                        None => self.studio.status = "no picture under the playhead to copy a look from".into(),
+                        Some((path, media)) => match studio_video::frame_rgb(&base.join(&path), media, 320, 180) {
+                            Ok(px) => {
+                                let st = studio_video::style::stats(&px);
+                                self.studio.status = format!("look copied: median lightness {:.0}, highlights tint a {:+.0} b {:+.0}, shadows a {:+.0} b {:+.0}",
+                                    st.q[4], st.band[2][0], st.band[2][1], st.band[0][0], st.band[0][1]);
+                                self.style_ref = Some(st);
+                            }
+                            Err(e) => self.studio.status = format!("could not read the frame: {e:?}"),
+                        },
+                    }
+                }
+                palette::ShellVerb::StylePaste(pct) => {
+                    let Some(reference) = self.style_ref else {
+                        self.studio.status = "copy a look first (style: copy the look under the playhead)".into();
+                        return;
+                    };
+                    let project = &self.studio.session.doc.project;
+                    let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                    let mut ops = Vec::new();
+                    let mut unread = 0;
+                    for c in self.studio.selection.iter().filter_map(|id| project.clips.get(id)) {
+                        let Some(src) = project.sources.get(&c.source).filter(|s| s.has_video) else { continue };
+                        let mut fx: Vec<studio_core::Effect> = c.effects.iter()
+                            .filter(|e| e.kind != studio_video::style::KIND).cloned().collect();
+                        if pct > 0 {
+                            // each clip is matched from its OWN look, measured mid-clip, so a
+                            // dark take and a bright one both land on the reference
+                            let mid = c.src_in.saturating_add(Ticks(c.len.0 / 2));
+                            match studio_video::frame_rgb(&base.join(&src.path), mid, 320, 180) {
+                                Ok(px) => fx.push(studio_video::style::Transfer::fit(
+                                    &studio_video::style::stats(&px), &reference, pct as f32 / 100.0).effect()),
+                                Err(_) => { unread += 1; continue; }
+                            }
+                        }
+                        ops.push(studio_core::Op::SetEffects { id: c.id, effects: fx });
+                    }
+                    if ops.is_empty() {
+                        self.studio.status = "select the picture clips to give the look to".into();
+                    } else {
+                        let n = ops.len();
+                        self.studio.edit_group(ops, "style");
+                        self.studio.status = format!("{n} clip(s): {} {}", if pct > 0 { format!("look at {pct}%") } else { "look removed".into() },
+                            if unread > 0 { format!("({unread} could not be read)") } else { String::new() });
+                    }
+                }
+                palette::ShellVerb::StageBind { bus, preset } => {
+                    match stage::bind_ops(&self.studio.session.doc.project, &self.studio.selection.clone(), bus, preset as usize) {
+                        Ok((ops, line)) => { self.studio.edit_group(ops, "stage"); self.studio.status = line; }
+                        Err(why) => self.studio.status = why,
+                    }
+                }
+                palette::ShellVerb::Kaleidoscope(segments) => {
+                    let project = &self.studio.session.doc.project;
+                    let ops: Vec<studio_core::Op> = self.studio.selection.iter()
+                        .filter_map(|id| project.clips.get(id))
+                        .filter(|c| project.sources.get(&c.source).map(|s| s.has_video).unwrap_or(false))
+                        .map(|c| {
+                            // replace any previous fold, keep every other effect where it was
+                            let mut fx: Vec<studio_core::Effect> = c.effects.iter()
+                                .filter(|e| e.kind != studio_video::kaleido::KIND).cloned().collect();
+                            if segments >= 2 {
+                                fx.push(studio_video::kaleido::Kaleido { segments, ..Default::default() }.effect());
+                            }
+                            studio_core::Op::SetEffects { id: c.id, effects: fx }
+                        }).collect();
+                    if ops.is_empty() {
+                        self.studio.status = "select the picture clips to fold".into();
+                    } else {
+                        let n = ops.len();
+                        self.studio.edit_group(ops, "kaleidoscope");
+                        self.studio.status = if segments >= 2 {
+                            format!("{n} clip(s): kaleidoscope, {segments} wedges — preview and export")
+                        } else { format!("{n} clip(s): kaleidoscope off") };
+                    }
+                }
+                palette::ShellVerb::InsertRange { source, from_ms, to_ms } => {
+                    let at = self.studio.playhead();
+                    let (a, b) = (insert_by_content::from_ms(from_ms), insert_by_content::from_ms(to_ms));
+                    let ops = insert_by_content::place(&self.studio.session.doc.project, source, a, b, at);
+                    if ops.is_empty() {
+                        self.studio.status = "nothing to insert — the range is empty or the source is gone".into();
+                    } else {
+                        let name = insert_by_content::source_name(&self.studio.session.doc.project, source);
+                        self.studio.edit_group(ops, "insert by content");
+                        self.studio.status = format!("inserted {name} {:.2}–{:.2} s at {:.2} s",
+                            a.to_seconds(), b.to_seconds(), at.to_seconds());
+                    }
+                }
+                palette::ShellVerb::LoadTranscripts => match export::pick_folder() {
+                    None => self.studio.status = "no folder chosen".into(),
+                    Some(dir) => {
+                        let l = transcripts::load(&self.studio.session.doc.project, &dir);
+                        let summary = l.summary();
+                        self.words_raw.extend(l.words);
+                        self.refilter_words();
+                        self.studio.status = summary;
+                    }
+                },
+                palette::ShellVerb::PeakBand(band) => {
+                    self.peak_band = band;
+                    // Rebuilt from the audio already in memory — no decoding,
+                    // no files, so switching bands is as cheap as a zoom.
+                    for (id, audio) in &self.audio {
+                        self.peaks.insert(*id, studio_audio::Peaks::build_band(audio, 256, 256, band));
+                    }
+                    self.studio.status = match band {
+                        studio_audio::Band::Full => "waveforms: everything".into(),
+                        b => format!("waveforms: {} band only — a way of looking, not an edit", b.label()),
+                    };
+                }
+                palette::ShellVerb::RelinkToFolder => {
+                    match export::pick_folder() {
+                        None => self.studio.status = "no folder chosen".into(),
+                        Some(dir) => {
+                            let plan = relink::plan(&self.studio.session.doc.project, &dir);
+                            let line = plan.summary();
+                            if plan.ops.is_empty() {
+                                // Nothing to do is not a failure, but it must
+                                // not look like success either.
+                                self.studio.status = format!("nothing relinked — {line}");
+                            } else {
+                                self.studio.edit(studio_core::Op::Group { ops: plan.ops }, &line);
+                                self.studio.status = line;
+                            }
+                            for (path, found) in &plan.ambiguous {
+                                eprintln!("relink: {path} matches {} files, left alone", found.len());
+                            }
+                        }
+                    }
+                }
+                palette::ShellVerb::TouchUpStabilize(kind) => self.start_stabilize(kind),
+                palette::ShellVerb::TouchUpParticles { preset, drive, ride } => self.start_particles(preset, drive, ride),
+                palette::ShellVerb::TouchUpParticlesPlace { preset, drive } => self.open_track_points(preset, drive),
+                palette::ShellVerb::TouchUpFollow { zoom_pct } => self.start_touchup(
+                    studio_video::touchup::Fix::FollowMotion { zoom: zoom_pct as f32 / 100.0, smooth: 0.5 },
+                    format!("following the motion at {:.1}x", zoom_pct as f32 / 100.0)),
+                palette::ShellVerb::TouchUpCleanPlate { radius, moving } =>
+                    self.start_clean_plate(radius, moving),
+                palette::ShellVerb::MulticamLevel { group, bus } => {
+                    // Defaults chosen to be watchable rather than clever: no
+                    // shot under a second, 3 dB of hysteresis so a level
+                    // sitting on a threshold does not chatter, and a third of
+                    // a second of settle so a rise through a middle band does
+                    // not cut to the middle angle on its way up.
+                    let rules = studio_video::multicam::Rules {
+                        min_shot: 1.0, hysteresis_db: 3.0, settle: 0.3 };
+                    match multicam_cut::ops(&self.studio.session.doc.project, &self.audio, group, bus, rules) {
+                        Ok((ops, note)) => self.studio.edit(
+                            studio_core::Op::Group { ops }, &format!("multicam: {note}")),
+                        Err(why) => self.studio.status = why,
+                    }
+                }
                 palette::ShellVerb::MarkerHere => {
                     let at = self.studio.playhead();
                     let n = self.studio.session.doc.project.markers.len() + 1;
@@ -5577,7 +6276,7 @@ impl App {
                         self.export_done.clear();
                         self.export_run = Some(export::start_video(
                             self.studio.session.doc.project.clone(), self.audio.clone(), out,
-                            self.sink.rate().max(8_000), 1280, 720, 30));
+                            self.sink.rate().max(8_000), 1280, 720, 30, self.waker()));
                     }
                 }
                 palette::ShellVerb::Settings => { self.settings_open = true; }
@@ -5606,7 +6305,7 @@ impl App {
                                 .and_then(|p| self.studio.import_pattern_pack(p)) {
                                 Ok(landed) => for (id, audio, raw) in landed {
                                     self.peaks.insert(id,
-                                        studio_audio::Peaks::build(&audio, 256, 256));
+                                        self.build_peaks(&audio));
                                     self.audio.insert(id, audio);
                                     self.studio.register_asset(id, &raw);
                                 },
@@ -5707,6 +6406,46 @@ impl App {
             SilentFallback::Stop
         } else {
             SilentFallback::WallClock
+        }
+    }
+
+    /// Peaks for a freshly decoded source, in whatever band the waveforms
+    /// are currently showing — so an import lands looking like everything
+    /// else on screen rather than reverting that view one clip at a time.
+    /// Recompute the gutter from the raw transcripts through the current
+    /// filter, and say how much it kept — "fillers: 143 across 55 clips" is
+    /// the number a junk-cutting pass wants before it starts.
+    fn refilter_words(&mut self) -> String {
+        let corpus = studio_voice::corpus_counts(self.words_raw.values());
+        self.words = self.words_raw.iter()
+            .map(|(id, segs)| (*id, studio_voice::filter_words(segs, &self.word_filter, &corpus)))
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
+        let hits: usize = self.words.values().map(|v| v.len()).sum();
+        match &self.word_filter {
+            studio_voice::WordFilter::All => format!("transcript gutter: all words ({} clips)", self.words.len()),
+            f => format!("transcript gutter: {} — {hits} across {} clip(s) (word times are estimated within each line)",
+                         f.label(), self.words.len()),
+        }
+    }
+
+    fn build_peaks(&self, audio: &studio_audio::SourceAudio) -> studio_audio::Peaks {
+        studio_audio::Peaks::build_band(audio, 256, 256, self.peak_band)
+    }
+
+    /// Which clock is driving the playhead right now, in one phrase for the
+    /// status bar.
+    ///
+    /// Written because "play does nothing" is indistinguishable, on screen,
+    /// from "play is running off the wrong clock": both are a playhead that
+    /// does not move the way you expect, and the difference lives in state
+    /// nobody can see. Now the bar says it.
+    fn clock_note(playing: bool, rack: bool, sink_pos: Option<usize>, loaded_anything: bool) -> &'static str {
+        match (playing || rack, sink_pos, loaded_anything) {
+            (false, _, _) => "",
+            (true, Some(_), _) => "audio clock",
+            (true, None, true) => "wall clock — nothing rendered to play",
+            (true, None, false) => "no clock — nothing loaded",
         }
     }
 
@@ -5897,7 +6636,7 @@ impl App {
         if let Ok(bytes) = studio_media::flac::encode_flac(&audio, id.0) {
             self.studio.register_asset(id, &bytes);
         }
-        self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+        self.peaks.insert(id, self.build_peaks(&audio));
         self.audio.insert(id, audio);
         self.studio.status = format!("pass {}: {}", self.passes.done, self.studio.status);
         if take.dropped_blocks > 0 {
@@ -5931,7 +6670,7 @@ impl App {
             if let Ok(bytes) = studio_media::flac::encode_flac(&audio, id.0) {
                 self.studio.register_asset(id, &bytes);
             }
-            self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+            self.peaks.insert(id, self.build_peaks(&audio));
             self.audio.insert(id, audio);
             if dropped > 0 {
                 // Said, not swallowed: a take with holes must not be
@@ -6359,16 +7098,610 @@ impl App {
         self.export_progress = (0, 0, 0.0);
         self.export_run = Some(match planned {
             Planned::Arr(jobs) => export::start_arrangement(
-                *plan, jobs, dest, project.clone(), self.audio.clone()),
+                *plan, jobs, dest, project.clone(), self.audio.clone(), self.waker()),
             Planned::Rack(jobs) => export::start_rack(
                 *plan, jobs, dest, self.studio.current_pattern,
-                self.audio.clone(), project.name.clone()),
+                self.audio.clone(), project.name.clone(), self.waker()),
         });
         true
     }
 
     /// The render tracker: a bar that moves, the files as they land, and a
     /// cancel that means soon. Repaint is requested while a run is live —
+    /// Raise a stabilize ticket for the selected clip and render it on a
+    /// worker. Handles are half a second each side, so a later nudge of the
+    /// trim still lands inside the fixed picture.
+    fn start_stabilize(&mut self, kind: palette::StabilizeKind) {
+        use studio_video::stabilize::{Budget, Flavor};
+        if self.touchup_run.is_some() {
+            self.studio.status = "a touch-up is already rendering".into();
+            return;
+        }
+        let Some(&id) = self.studio.selection.first() else {
+            self.studio.status = "select the clip to stabilize first".into();
+            return;
+        };
+        let project = &self.studio.session.doc.project;
+        let Some(clip) = project.clips.get(&id).cloned() else { return };
+        let Some(src) = project.sources.get(&clip.source).cloned() else { return };
+        if !src.has_video {
+            self.studio.status = "that clip has no picture to stabilize".into();
+            return;
+        }
+        let path = std::path::PathBuf::from(&src.path);
+        let Ok(probe) = studio_video::probe(&path) else {
+            self.studio.status = format!("could not read {}", src.path);
+            return;
+        };
+        let (flavor, budget) = match kind {
+            // Each flavour gets the crop it actually needs: locking a shot
+            // costs the most, de-jerking the least. A single budget for all
+            // three would either starve Still or overspend Dejerk.
+            palette::StabilizeKind::Still => (Flavor::Still, Budget { max_zoom: 1.15 }),
+            palette::StabilizeKind::Smooth => (Flavor::Smooth { sigma: 12.0 }, Budget { max_zoom: 1.10 }),
+            palette::StabilizeKind::Dejerk => (Flavor::Dejerk { threshold: 3.0 }, Budget { max_zoom: 1.04 }),
+        };
+        let _ = (path, probe);
+        self.start_touchup(studio_video::touchup::Fix::Stabilize { flavor, budget },
+                           format!("stabilizing ({kind:?})"));
+    }
+
+    /// Raise a ticket for the selected clip and render it on a worker. The
+    /// selection, source and probe checks are the same for every fix, so
+    /// they live here rather than once per flavour of fix.
+    fn start_touchup(&mut self, fix: studio_video::touchup::Fix, what: String) {
+        if self.touchup_run.is_some() {
+            self.studio.status = "a touch-up is already rendering".into();
+            return;
+        }
+        let Some(&id) = self.studio.selection.first() else {
+            self.studio.status = "select the clip to fix first".into();
+            return;
+        };
+        let project = &self.studio.session.doc.project;
+        let Some(clip) = project.clips.get(&id).cloned() else { return };
+        let Some(src) = project.sources.get(&clip.source).cloned() else { return };
+        if !src.has_video {
+            self.studio.status = "that clip has no picture to fix".into();
+            return;
+        }
+        let path = std::path::PathBuf::from(&src.path);
+        let Ok(probe) = studio_video::probe(&path) else {
+            self.studio.status = format!("could not read {}", src.path);
+            return;
+        };
+        let ticket = studio_video::touchup::Ticket {
+            clip: id, source: clip.source, path: path.clone(),
+            src_in: clip.src_in, len: clip.len, handle: 0.5,
+            fixes: vec![fix], note: what.clone(),
+        };
+        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "shot".into());
+        let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(std::env::temp_dir);
+        let mut out = dir.join(format!("{stem}-touchup.mp4"));
+        let mut n = 2;
+        while out.exists() { out = dir.join(format!("{stem}-touchup-{n}.mp4")); n += 1; }
+        let size = studio_video::framepipe::Size { w: probe.width, h: probe.height };
+        self.touchup_run = Some(touchup_job::start(ticket, out, size, probe.fps.max(1.0), self.waker()));
+        self.studio.status = format!("{what} — this runs in the background");
+    }
+
+    /// Clean-plate the selected clip. Same ticket machinery as the
+    /// stabilizer, a different fix.
+    fn start_clean_plate(&mut self, radius: usize, moving: bool) {
+        let fix = studio_video::touchup::Fix::CleanPlate {
+            settings: studio_video::cleanplate::Settings::default(),
+            radius, align: moving,
+        };
+        self.start_touchup(fix, format!("clean plate ±{radius} frames"));
+    }
+
+    /// Open the gallery on the first selected picture clip's frame at the
+    /// playhead (or its middle, if the playhead is not over it).
+    fn open_kaleido_gallery(&mut self) {
+        let project = &self.studio.session.doc.project;
+        let Some(clip) = self.studio.selection.iter().filter_map(|id| project.clips.get(id))
+            .find(|c| project.sources.get(&c.source).map(|s| s.has_video).unwrap_or(false)).cloned() else {
+            self.studio.status = "select a picture clip for the gallery".into();
+            return;
+        };
+        let src = &project.sources[&clip.source];
+        let ph = self.studio.playhead();
+        let at = if ph >= clip.pos && ph < clip.end() { clip.src_in.saturating_add(ph.saturating_sub(clip.pos)) }
+                 else { clip.src_in.saturating_add(Ticks(clip.len.0 / 2)) };
+        let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        match studio_video::frame_rgb(&base.join(&src.path), at, 320, 180) {
+            Ok(px) => self.kaleido_gallery = Some(kaleido_gallery::Gallery::new(px, 320, 180)),
+            Err(e) => self.studio.status = format!("could not read a frame for the gallery: {e:?}"),
+        }
+    }
+
+    /// Build the lanes for a camera group's span and open the window.
+    fn open_signals(&mut self, group: studio_core::GroupId) {
+        use studio_video::signals;
+        const HOP: f64 = signals_panel::HOP;
+        let project = &self.studio.session.doc.project;
+        let Ok((_, start, end)) = studio_video::multicam::from_group(project, group) else {
+            self.studio.status = "that group is not a camera group".into(); return;
+        };
+        let span = (end.0 - start.0) as f64 / studio_core::TICKS_PER_SECOND as f64;
+        let mut lanes = Vec::new();
+        // the kick: the low band of the mix over the span
+        let mix = self.studio.render_arrangement_range(16_000, &self.audio, start, end);
+        if !mix.is_empty() {
+            let mono: Vec<f32> = mix.chunks(2).map(|p| (p[0] + p.get(1).copied().unwrap_or(0.0)) * 0.5).collect();
+            lanes.push(signals::onset_lane("kick (mix)", &mono, 16_000, HOP, (20.0, 150.0)));
+        }
+        // every control channel's level
+        for b in project.busses.values().filter(|b| b.silent) {
+            if let Some(st) = studio_audio::bus_signal(project, &self.audio, &Default::default(), start, end, 16_000, b.id) {
+                let mono: Vec<f32> = st.chunks(2).map(|p| (p[0] + p.get(1).copied().unwrap_or(0.0)) * 0.5).collect();
+                lanes.push(signals::Signal::new(&format!("level: {}", b.name), HOP,
+                    studio_video::particles::envelope(&mono, 16_000, 1.0 / HOP)));
+            }
+        }
+        // where lines start, from the loaded transcripts
+        let starts = signals_panel::line_starts(project, group, start, &self.words_raw);
+        if !starts.is_empty() { lanes.push(signals::pulses("line start", &starts, span, HOP, 0.12)); }
+        // performer motion per angle: each angle's stretch decoded small, the
+        // camera's own motion cancelled -- the one signal that held up in the
+        // "All My Life" analysis. Also combined into a lane for WHEN.
+        let (angles, _, _) = studio_video::multicam::from_group(project, group).unwrap_or((Vec::new(), start, end));
+        let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let mut angle_motion = Vec::new();
+        const MFPS: f64 = 25.0;
+        for (k, a) in angles.iter().enumerate() {
+            let Some(src) = project.sources.get(&a.source) else { continue };
+            let from = start.to_seconds() + a.offset;
+            let pipe = studio_video::framepipe::Pipe { input: base.join(&src.path), range: Some((from.max(0.0), span)),
+                size: studio_video::framepipe::Size { w: 160, h: 90 }, fps: MFPS };
+            let Ok(grey) = pipe.gray() else { continue };
+            let m = studio_video::action::body_motion(&grey, 10);
+            let mut sorted = m.clone(); sorted.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+            let top = sorted.get((sorted.len() as f32 * 0.95) as usize).copied().unwrap_or(1.0).max(1e-3);
+            angle_motion.push(signals::Signal::new(&format!("motion: angle {}", k + 1), 1.0 / MFPS,
+                m.iter().map(|v| (v / top).min(1.0)).collect()));
+        }
+        let mut angle_inputs = Vec::new();
+        if angle_motion.len() == angles.len() && !angle_motion.is_empty() {
+            let n = angle_motion.iter().map(|s| s.values.len()).min().unwrap_or(0);
+            let any: Vec<f32> = (0..n).map(|i| angle_motion.iter().map(|s| s.values[i]).fold(0.0, f32::max)).collect();
+            let mut lane = signals::Signal::new("motion (any angle)", 1.0 / MFPS, any);
+            lane.weight = 0.5;   // on, but a soft tendency -- as measured
+            lanes.push(lane);
+            angle_inputs.push(signals::AngleInput { name: "motion".into(), per_angle: angle_motion, weight: 1.0 });
+        }
+        // who is heard: each angle's OWN mic in the speech band, relative to the
+        // loudest -- whoever speaks is loudest on the camera nearest them
+        let mut envs = Vec::new();
+        for a in &angles {
+            match self.speech_db(a.source, start.to_seconds() + a.offset, span, MFPS) { Some(e) => envs.push(e), None => break }
+        }
+        if envs.len() == angles.len() && !envs.is_empty() {
+            angle_inputs.push(signals::AngleInput { name: "voice".into(),
+                per_angle: signals::relative_voice(&envs, 1.0 / MFPS, 12.0), weight: 0.0 });
+        }
+        // checked AFTER the motion lanes: a first version gave up here before
+        // building them, so pictures with no audio never got their motion lane
+        if lanes.is_empty() {
+            self.studio.status = "no signals over this group yet: no audio, motion, control channels or transcripts".into();
+            return;
+        }
+        let marks = signals_panel::marks(project, start, end);
+        let prefer = if angle_inputs.is_empty() { signals::Prefer::RoundRobin } else { signals::Prefer::MostMotion };
+        self.signals_panel = Some(signals_panel::Panel { group, lanes, marks, span, threshold: 0.35, min_gap: 1.5,
+            planned: Vec::new(), angle_inputs, prefer, no_repeat: true });
+    }
+
+    /// A source's own speech-band loudness in dB, one value per 1/`fps` s,
+    /// over `span` seconds from `from` in the file: one-pole 300 Hz high-pass
+    /// and 3 kHz low-pass, then RMS. `None` if its audio is not decoded yet.
+    fn speech_db(&self, source: studio_core::SourceId, from: f64, span: f64, fps: f64) -> Option<Vec<f32>> {
+        let au = self.audio.get(&source)?;
+        let sr = au.sample_rate as f64;
+        let a0 = (from.max(0.0) * sr) as usize;
+        let a1 = (a0 as f64 + span * sr) as usize;
+        let chans = au.channels.len().max(1);
+        let len = au.channels.first().map(|c| c.len()).unwrap_or(0);
+        let mono: Vec<f32> = (a0..a1.min(len)).map(|i| au.channels.iter().map(|c| c[i]).sum::<f32>() / chans as f32).collect();
+        let (ah, al) = ((-std::f64::consts::TAU * 300.0 / sr).exp() as f32, (-std::f64::consts::TAU * 3000.0 / sr).exp() as f32);
+        let (mut hy, mut hx, mut ly) = (0.0f32, 0.0f32, 0.0f32);
+        let band: Vec<f32> = mono.iter().map(|&x| { hy = ah * (hy + x - hx); hx = x; ly = (1.0 - al) * hy + al * ly; ly }).collect();
+        let hop = ((sr / fps) as usize).max(1);
+        Some(band.chunks(hop).map(|c| 20.0 * ((c.iter().map(|v| v * v).sum::<f32>() / c.len() as f32).sqrt()).max(1e-6).log10()).collect())
+    }
+
+    /// The comic auto mode on a camera group: plan from its transcripts, sides
+    /// from its mics, render on a worker, land when done.
+    /// Open the comic setup over a camera group: one frame per angle from the
+    /// middle of the group, for choosing roles and regions by looking.
+    fn open_comic_setup(&mut self, group: studio_core::GroupId) {
+        let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let project = &self.studio.session.doc.project;
+        let Ok((angles, start, end)) = studio_video::multicam::from_group(project, group) else {
+            self.studio.status = "that group is not a camera group".into(); return;
+        };
+        let mid = (start.to_seconds() + end.to_seconds()) / 2.0;
+        let mut frames = Vec::new();
+        for a in &angles {
+            let Some(src) = project.sources.get(&a.source) else { continue };
+            match studio_video::frame_rgb(&base.join(&src.path), Ticks::from_seconds((mid + a.offset).max(0.0)), 320, 180) {
+                Ok(px) => frames.push(px),
+                Err(_) => frames.push(vec![20u8; 320 * 180 * 3]),   // unreadable: a dark placeholder, still choosable
+            }
+        }
+        self.comic_setup = Some(comic_job::SetupWindow::new(group, frames));
+    }
+
+    /// Put rack pattern `ix` on the timeline as a LINKED clip at `at`: on
+    /// `on` (a track it was dropped on) or the selected clip's audio track if
+    /// it fits, else a new audio track below. One undo.
+    fn pattern_to_timeline(&mut self, ix: usize, at: Ticks, on: Option<studio_core::TrackId>) {
+        match pattern_clips::place_ops(&self.studio.session.doc.project, &self.studio.rack, ix, at,
+                                       self.studio.selection.first().copied(), on) {
+            Ok(ops) => {
+                let name = self.studio.rack.patterns.get(ix).map(|p| p.name.clone()).unwrap_or_default();
+                self.studio.edit_group(ops, "pattern to timeline");
+                self.studio.status = format!("'{name}' on the timeline, linked to the rack — edit the pattern and the clip follows");
+            }
+            Err(e) => self.studio.status = e,
+        }
+    }
+
+    /// Open the palette straight at one of its questions.
+    fn open_palette_at(&mut self, ask: palette::Ask, crumb: &str) {
+        self.palette = Some(palette::Palette { pending: Some(ask), path: vec![crumb.to_string()], ..Default::default() });
+    }
+
+    /// Open `path`, asking first if the live project has unsaved changes.
+    fn request_open(&mut self, path: std::path::PathBuf) {
+        if !open_project::is_project(&path) || !path.is_file() {
+            self.studio.status = format!("not a Studio project: {}", path.display());
+            return;
+        }
+        // Load it once BEFORE leaving this project. At start-up a file that
+        // will not load falls back to a demo (there is nothing else to show);
+        // from the palette that would throw away the session you are in and
+        // leave you on a demo pointed at the broken file, where Ctrl+S
+        // overwrites it. Here, a file that will not open changes nothing.
+        let team = Team::from_contacts("solo", &["sc-local".into()]);
+        let probe = if path.extension().and_then(|e| e.to_str()) == Some("studioarch") {
+            Studio::open_archive(&path, SiteId(1), team).map(|_| ())
+        } else {
+            Studio::load_from(&path, SiteId(1), team).map(|_| ())
+        };
+        if let Err(e) = probe {
+            self.studio.status = format!("could not open {}: {e} — still on this project", path.display());
+            return;
+        }
+        if open_project::needs_save(&self.studio.session.doc.project, self.saved_project.as_ref()) {
+            self.studio.status = format!("this project has unsaved changes — before opening {}:",
+                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            self.open_pending = Some(path);
+            self.open_palette_at(palette::Ask::UnsavedBeforeOpen, "open project");
+        } else {
+            self.switch_to(path);
+        }
+    }
+
+    /// Replace the whole shell with one opened on `path` -- exactly what a
+    /// launch with that project builds, so nothing of this one lingers.
+    fn switch_to(&mut self, path: std::path::PathBuf) {
+        let touch = self.touch_seen;
+        *self = App::with_project(path.clone());
+        self.touch_seen = touch;
+        self.studio.status = format!("opened {} — {}", path.display(), self.studio.status);
+    }
+
+    /// Save the project where it lives: the workspace sidecar, the file,
+    /// and a history commit. The toolbar's save and the open flow's "save,
+    /// then open" both come here -- one save, not a second simplified one.
+    fn save_project(&mut self) -> Result<(), String> {
+        let path = self.project_path.clone();
+        workspace::save(&path, &workspace::WorkspaceState {
+            library_audio: self.library_roots.audio.display().to_string(),
+            library_video: self.library_roots.video.as_ref()
+                .map(|p| p.display().to_string()).unwrap_or_default(),
+            combined: self.studio.combined,
+            panel: self.studio.panel.label().to_string(),
+            side_slot: match self.side_slot {
+                SideSlot::Off => "off", SideSlot::Viewport => "viewport",
+                SideSlot::Mixer => "mixer", SideSlot::Rack => "rack",
+                SideSlot::Program => "program",
+            }.to_string(),
+            px_per_sec: self.studio.current_view().px_per_sec,
+            scroll_ticks: self.studio.current_view().scroll.0,
+            closed_groups: self.studio.closed_groups.iter()
+                .map(|g| g.0).collect(),
+            bounce_format: self.bounce_format.token().to_string(),
+            voice_domains: self.lexicon.to_tokens(),
+            pinned: self.library_prefs.pinned.iter()
+                .map(|p| p.display().to_string()).collect(),
+            demoted: self.library_prefs.demoted.iter()
+                .map(|p| p.display().to_string()).collect(),
+            library_open: self.library_open,
+            display_name: self.studio.display_name.clone(),
+            rebinds: self.rebinds.encode(),
+            piano_zones: self.zones.encode(),
+            overlap: self.studio.overlap.name().to_string(),
+            overlap_tracks: self.studio.overlap_tracks.iter()
+                .map(|(t, p)| format!("{}:{}", t.0, p.name())).collect::<Vec<_>>().join(","),
+        });
+        // The directory must exist (and be ours) BEFORE the
+        // file is written: a save into a fresh project root
+        // otherwise fails on the open, and a save into
+        // someone's source tree must fail here rather than
+        // after leaving a file in it.
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Err(e) = project_dir::ensure_project_dir(dir) {
+                self.studio.status = e.clone();
+                return Err(e);
+            }
+        }
+        let saved = self.studio.save_to(&path);
+        if saved.is_ok() {
+            self.saved_project = Some(self.studio.session.doc.project.clone());
+            // The save happened; history is the extra. A missing
+            // git binary demotes to a note, never a lost save.
+            let dir = path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let p = &self.studio.session.doc.project;
+            let meta = project_dir::Meta {
+                name: p.name.clone(),
+                bpm: self.studio.rack.tempo_bpm,
+                tracks: p.tracks.len(),
+                clips: p.clips.len(),
+                busses: p.busses.len(),
+                patterns: self.studio.rack.patterns.len(),
+                channels: self.studio.rack.channels.len(),
+            };
+            match project_dir::save_versioned(
+                &dir, &meta, project_dir::MediaMode::Committed, "save") {
+                Ok(Some(id)) => self.studio.status =
+                    format!("{} — commit {id}", self.studio.status),
+                Ok(None) => {}
+                Err(e) => self.studio.status =
+                    format!("{} (history skipped: {})",
+                            self.studio.status, e.lines().next().unwrap_or("git error")),
+            }
+        }
+        saved
+    }
+
+    /// A wake for background workers: after each message they send, the
+    /// window redraws to show it.
+    fn waker(&self) -> wake::Wake {
+        let w = self.ui_waker.clone();
+        std::sync::Arc::new(move || { if let Some(c) = w.lock().ok().and_then(|g| g.clone()) { c.request_repaint(); } })
+    }
+
+    /// How tool windows should present on this screen, and a window built to
+    /// match: a full-screen sheet on a narrow screen (the editor's
+    /// one-thing-at-a-time rule), a floating window elsewhere.
+    fn tool_layout(&self, ctx: &egui::Context) -> studio_egui::touch::ToolLayout {
+        studio_egui::touch::ToolLayout::for_screen(ctx.content_rect().width(), self.touch_seen)
+    }
+    fn tool_window<'a>(ctx: &egui::Context, title: &'a str, layout: studio_egui::touch::ToolLayout, open: &'a mut bool) -> egui::Window<'a> {
+        let w = egui::Window::new(title).open(open).collapsible(false);
+        if layout.sheet {
+            w.fixed_rect(ctx.content_rect().shrink(4.0)).resizable(false).vscroll(true)
+        } else {
+            w.resizable(false)
+        }
+    }
+
+    fn comic_setup_window(&mut self, ctx: &egui::Context) {
+        let Some(w) = &mut self.comic_setup else { return };
+        let mut open = true;
+        let mut go = None;
+        let layout = studio_egui::touch::ToolLayout::for_screen(ctx.content_rect().width(), self.touch_seen);
+        Self::tool_window(ctx, "Comic — who goes where", layout, &mut open).show(ctx, |ui| { go = w.show(ui, layout); });
+        if let Some(setup) = go {
+            let group = w.group;
+            self.comic_setup = None;
+            self.start_comic(group, setup);
+            return;
+        }
+        if !open { self.comic_setup = None; }
+    }
+
+    fn start_comic(&mut self, group: studio_core::GroupId, setup: comic_job::Setup) {
+        if self.comic_run.is_some() { self.studio.status = "a comic is already rendering".into(); return; }
+        let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let project = &self.studio.session.doc.project;
+        let (roles, start, end) = match comic_job::roles_with(project, group, &base, setup) {
+            Ok(r) => r, Err(e) => { self.studio.status = e; return; }
+        };
+        let span = (end.0 - start.0) as f64 / studio_core::TICKS_PER_SECOND as f64;
+        // sides: which side's own mic hears a line louder, when the panels are
+        // different angles (with one angle for both there is no evidence)
+        const FPS: f64 = 25.0;
+        let (angles, _, _) = studio_video::multicam::from_group(project, group).unwrap_or((Vec::new(), start, end));
+        let (ldb, rdb) = match (angles.get(setup.left), angles.get(setup.right)) {
+            (Some(l), Some(r)) if setup.left != setup.right =>
+                (self.speech_db(l.source, start.to_seconds() + l.offset, span, FPS),
+                 self.speech_db(r.source, start.to_seconds() + r.offset, span, FPS)),
+            _ => (None, None),   // one angle for both panels: its mic cannot tell sides apart
+        };
+        let side_at = |a: f64, b: f64| -> Option<studio_video::comic::Side> {
+            let (l, r) = (ldb.as_ref()?, rdb.as_ref()?);
+            let (i0, i1) = ((a * FPS) as usize, ((b * FPS) as usize).max((a * FPS) as usize + 1));
+            let mean = |v: &Vec<f32>| { let s = &v[i0.min(v.len())..i1.min(v.len())]; if s.is_empty() { None } else { Some(s.iter().sum::<f32>() / s.len() as f32) } };
+            let (ml, mr) = (mean(l)?, mean(r)?);
+            if (ml - mr).abs() < 3.0 { None } else if ml > mr { Some(studio_video::comic::Side::Left) } else { Some(studio_video::comic::Side::Right) }
+        };
+        let lines = comic_job::lines(project, group, start, span, &self.words_raw, &side_at);
+        let mut out = base.join(format!("comic-group{}.mp4", group.0));
+        let mut n = 2;
+        while out.exists() { out = base.join(format!("comic-group{}-{n}.mp4", group.0)); n += 1; }
+        let w = self.ui_waker.clone();
+        let nlines = lines.len();
+        self.comic_run = Some(comic_job::start(roles, lines, span, out, group, start, move || {
+            if let Some(c) = w.lock().ok().and_then(|g| g.clone()) { c.request_repaint(); }
+        }));
+        self.studio.status = format!("comic: planning {nlines} line(s) over {span:.1} s — rendering in the background");
+    }
+
+    fn comic_tracker(&mut self) {
+        let Some(job) = &self.comic_run else { return };
+        let Ok(ev) = job.rx.try_recv() else { return };
+        let (start, span) = (job.start, job.span);
+        self.comic_run = None;
+        match ev {
+            comic_job::Event::Done(path, frames) => {
+                let ops = comic_job::land_ops(&self.studio.session.doc.project, &path, start, span);
+                self.studio.edit_group(ops, "comic");
+                self.studio.status = format!("comic landed: {frames} frames on a new 'comic' track");
+            }
+            comic_job::Event::Failed(e) => self.studio.status = format!("comic failed: {e}"),
+        }
+    }
+
+    fn signals_window(&mut self, ctx: &egui::Context) {
+        let Some(p) = &mut self.signals_panel else { return };
+        let mut open = true;
+        let mut go = None;
+        let layout = studio_egui::touch::ToolLayout::for_screen(ctx.content_rect().width(), self.touch_seen);
+        Self::tool_window(ctx, "Signals — when to cut", layout, &mut open).show(ctx, |ui| { layout.apply(ui); go = p.show(ui); });
+        if let Some(cands) = go {
+            match signals_panel::plan_ops(&self.studio.session.doc.project, p.group, &cands, &p.angle_inputs, p.prefer, p.no_repeat) {
+                Ok((ops, shots, lines)) => {
+                    self.studio.edit_group(ops, "multicam by signals");
+                    self.studio.status = format!("{shots} shot(s) on a new track, a 'why' marker at each cut");
+                    p.planned = lines;
+                    let _ = cands;
+                }
+                Err(e) => self.studio.status = e,
+            }
+        }
+        if !open { self.signals_panel = None; }
+    }
+
+    fn kaleido_gallery_window(&mut self, ctx: &egui::Context) {
+        let Some(g) = &mut self.kaleido_gallery else { return };
+        let mut open = true;
+        let mut chosen = None;
+        let layout = studio_egui::touch::ToolLayout::for_screen(ctx.content_rect().width(), self.touch_seen);
+        Self::tool_window(ctx, "Kaleidoscope", layout, &mut open).show(ctx, |ui| { layout.apply(ui); chosen = g.show(ui); });
+        if let Some(k) = chosen {
+            let project = &self.studio.session.doc.project;
+            let ops: Vec<studio_core::Op> = self.studio.selection.iter().filter_map(|id| project.clips.get(id))
+                .filter(|c| project.sources.get(&c.source).map(|s| s.has_video).unwrap_or(false))
+                .map(|c| {
+                    let mut fx: Vec<studio_core::Effect> = c.effects.iter()
+                        .filter(|e| e.kind != studio_video::kaleido::KIND).cloned().collect();
+                    fx.push(k.effect());
+                    studio_core::Op::SetEffects { id: c.id, effects: fx }
+                }).collect();
+            if !ops.is_empty() {
+                self.studio.edit_group(ops, "kaleidoscope");
+                self.studio.status = format!("kaleidoscope: {} wedges, turned {:.0}°, centre at {:.0}% — preview and export",
+                                             k.segments, k.angle, k.cx * 100.0);
+            }
+            open = false;
+        }
+        if !open { self.kaleido_gallery = None; }
+    }
+
+    /// Particles into the selected clip. The drive, if a control channel is
+    /// chosen, is that bus rendered over EXACTLY the stretch the touch-up
+    /// covers -- the clip plus its handles -- so frame i of the render reads
+    /// the sound at frame i. A drive computed for the clip alone would run
+    /// half a second early against the handled render.
+    fn start_particles(&mut self, preset: u8, drive_bus: Option<studio_core::BusId>, ride: bool) {
+        self.start_particles_with(preset, drive_bus, ride, Vec::new());
+    }
+
+    /// Open the track-points window on the selected clip's FIRST RENDERED
+    /// frame -- the render starts half a second (the handle) before the clip,
+    /// and that is the frame the points are tracked from.
+    fn open_track_points(&mut self, preset: u8, drive: Option<studio_core::BusId>) {
+        let project = &self.studio.session.doc.project;
+        let Some(clip) = self.studio.selection.first().and_then(|id| project.clips.get(id)).cloned() else {
+            self.studio.status = "select the clip first".into(); return;
+        };
+        let Some(src) = project.sources.get(&clip.source).filter(|s| s.has_video) else {
+            self.studio.status = "the selected clip has no picture".into(); return;
+        };
+        let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let first = Ticks::from_seconds((clip.src_in.to_seconds() - 0.5).max(0.0));   // 0.5 = start_touchup's handle
+        match studio_video::frame_rgb(&base.join(&src.path), first, 320, 180) {
+            Ok(px) => self.track_points = Some(track_points::Window::new(px, preset, drive)),
+            Err(e) => self.studio.status = format!("could not read the first frame: {e:?}"),
+        }
+    }
+
+    fn track_points_window(&mut self, ctx: &egui::Context) {
+        let Some(w) = &mut self.track_points else { return };
+        let mut open = true;
+        let mut go = None;
+        let layout = studio_egui::touch::ToolLayout::for_screen(ctx.content_rect().width(), self.touch_seen);
+        Self::tool_window(ctx, "Track points", layout, &mut open).show(ctx, |ui| { go = w.show(ui, layout); });
+        if let Some(points) = go {
+            let (preset, drive) = (w.preset, w.drive);
+            self.track_points = None;
+            self.start_particles_with(preset, drive, true, points);
+            return;
+        }
+        if !open { self.track_points = None; }
+    }
+
+    fn start_particles_with(&mut self, preset: u8, drive_bus: Option<studio_core::BusId>, ride: bool, points: Vec<(f32, f32)>) {
+        use studio_video::particles::Params;
+        let params = match preset { 0 => Params::floating_dirt(), 1 => Params::space_dust(), _ => Params::creepy_smoke() };
+        let emitter = match preset { 0 => (0.5, 0.95), 1 => (0.5, 0.5), _ => (0.5, 0.75) };
+        let project = &self.studio.session.doc.project;
+        let Some(&id) = self.studio.selection.first() else { self.studio.status = "select the clip first".into(); return };
+        let Some(clip) = project.clips.get(&id).cloned() else { return };
+        let fps = project.sources.get(&clip.source)
+            .and_then(|s| studio_video::probe(&std::path::PathBuf::from(&s.path)).ok()).map(|p| p.fps).unwrap_or(24.0);
+        let drive = match drive_bus {
+            None => Vec::new(),
+            Some(bus) => {
+                let (from, to, pad) = touchup_job::drive_span(&clip, 0.5, fps);   // 0.5 = start_touchup's handle
+                match studio_audio::bus_signal(project, &self.audio, &Default::default(),
+                        Ticks::from_seconds(from), Ticks::from_seconds(to), 48_000, bus) {
+                    Some(st) => {
+                        let mono: Vec<f32> = st.chunks(2).map(|p| (p[0] + p.get(1).copied().unwrap_or(0.0)) * 0.5).collect();
+                        let mut d = vec![0.0; pad];
+                        d.extend(studio_video::particles::envelope(&mono, 48_000, fps));
+                        if d.iter().all(|v| *v < 0.01) {
+                            self.studio.status = "that control channel is silent over this clip — send something into it".into();
+                            return;
+                        }
+                        d
+                    }
+                    None => { self.studio.status = "that control channel is muted or gone".into(); return; }
+                }
+            }
+        };
+        let what = match preset { 0 => "floating dirt", 1 => "spaceship dust", _ => "creepy smoke" };
+        let placed = points.len();
+        self.start_touchup(studio_video::touchup::Fix::Particles { params, seed: id.0, emitter, drive, ride, points },
+                           format!("{what}{}{}", if drive_bus.is_some() { ", driven by sound" } else { "" },
+                                   if placed > 0 { format!(", riding {placed} placed point(s)") } else { String::new() }));
+    }
+
+    /// Poll the touch-up worker. Same shape as the export tracker: egui only
+    /// repaints on input, and a render is not input.
+    fn touchup_tracker(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.touchup_run else { return };
+        let mut finished = false;
+        while let Ok(e) = job.rx.try_recv() {
+            match e {
+                touchup_job::Event::Note(m) => self.studio.status = m,
+                touchup_job::Event::Done(v) => { self.studio.land_touchup(&v); finished = true; }
+                touchup_job::Event::Failed(e) => {
+                    self.studio.status = format!("touch-up failed: {e}");
+                    finished = true;
+                }
+            }
+        }
+        if finished { self.touchup_run = None; return; }
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    }
+
     /// egui only redraws on input, and a background render is not input.
     fn export_tracker_window(&mut self, ctx: &egui::Context) {
         let Some(run) = &self.export_run else { return };
@@ -6439,6 +7772,18 @@ impl App {
 /// Open a window and run.
 #[cfg(feature = "app")]
 pub fn run(title: &str) -> eframe::Result<()> {
+    // The command line first, before any window: --help, and anything that is
+    // not a project, are answered on the terminal and stop here -- starting a
+    // demo instead of the file someone named would look like the file was lost.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match open_project::from_args(&args) {
+        open_project::Launch::Help => { println!("{}", open_project::USAGE); return Ok(()); }
+        open_project::Launch::Refused(why) => {
+            eprintln!("studio: {why}\n\n{}", open_project::USAGE);
+            std::process::exit(2);
+        }
+        open_project::Launch::Project(_) | open_project::Launch::Default => {}
+    }
     // Why the window will not open, said before the panic in a dependency does. The main
     // here delegates into this function, so the check belongs at the run entry rather than
     // at `fn main` — see `uikit_egui::backend_check`. Silent when the setup is fine.
@@ -6501,7 +7846,7 @@ impl studio_egui::playkeys::AnalogSource for WootingAnalog {
     fn active(&self) -> bool { self.0.active() }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "app"))]   // these drive App, which is the window
 mod sink_resync_tests {
     use super::*;
 
@@ -7096,7 +8441,7 @@ mod mixer_tests {
             id: bus, name: "verb".into(), parent: None, gain: 1.0,
             chain: vec![mixer_panel::effect("delay", &[("time", 100.0), ("feedback", 0.4)]),
                         mixer_panel::effect("gain", &[("db", 0.0)])],
-            sends: vec![], muted: false } }, "bus");
+            sends: vec![], muted: false, silent: false } }, "bus");
         let before = s.session.doc.history().len();
         assert_eq!(s.sync_delays_to_tempo(3), 1, "one chain had a delay");
         let chain = &s.session.doc.project.busses[&bus].chain;
@@ -7674,7 +9019,7 @@ mod bus_routing_tests {
         let bus = studio_core::BusId(1);
         s.edit(studio_core::Op::AddBus { bus: studio_core::Bus {
             id: bus, name: "Drums".into(), parent: None, gain: 1.0,
-            chain: Vec::new(), sends: Vec::new(), muted: false } }, "bus");
+            chain: Vec::new(), sends: Vec::new(), muted: false, silent: false } }, "bus");
         s.edit(studio_core::Op::SetRoute { track, bus: Some(bus) }, "routed");
         let mut params = std::collections::BTreeMap::new();
         params.insert("profile".to_string(), 1.0); // tape
@@ -7871,7 +9216,7 @@ mod bus_sends_tests {
         for (id, name) in [(drums, "Drums"), (fx, "FX")] {
             s.edit(studio_core::Op::AddBus { bus: studio_core::Bus {
                 id, name: name.into(), parent: None, gain: 1.0,
-                chain: Vec::new(), sends: Vec::new(), muted: false } }, "bus");
+                chain: Vec::new(), sends: Vec::new(), muted: false, silent: false } }, "bus");
         }
         s.edit(studio_core::Op::SetRoute { track, bus: Some(drums) }, "routed");
         let dry = s.render_arrangement(48_000, &sources);
@@ -7907,7 +9252,7 @@ mod bus_sends_tests {
         for (id, name) in [(a, "A"), (b, "B")] {
             s.edit(studio_core::Op::AddBus { bus: studio_core::Bus {
                 id, name: name.into(), parent: None, gain: 1.0,
-                chain: Vec::new(), sends: Vec::new(), muted: false } }, "bus");
+                chain: Vec::new(), sends: Vec::new(), muted: false, silent: false } }, "bus");
         }
         s.edit(studio_core::Op::SetRoute { track, bus: Some(a) }, "routed");
         let energy = |v: &[f32]| v.iter().map(|x| x.abs()).sum::<f32>();
@@ -8470,7 +9815,7 @@ mod curve_shell_tests {
         let mut s = Studio::demo();
         let bus = BusId(40);
         s.edit(Op::AddBus { bus: studio_core::Bus { id: bus, name: "verb".into(), parent: None, gain: 1.0,
-            chain: vec![mixer_panel::effect("reverb", &[("mix", 1.0)])], sends: vec![], muted: false } }, "bus");
+            chain: vec![mixer_panel::effect("reverb", &[("mix", 1.0)])], sends: vec![], muted: false, silent: false } }, "bus");
         let clip = studio_core::ClipId(1);
         s.selection = vec![clip];
         let target = AutoTarget::BusParam { bus, effect: 0, key: ParamKey::new("mix").unwrap() };
@@ -8713,7 +10058,7 @@ mod curve_shell_tests {
         // Share it with clip 2, then make clip 2's binding unique.
         s.edit(Op::SetBinding { id: studio_core::BindingId(2), binding: studio_core::Binding {
             curve, target: AutoTarget::TrackGain(s.session.doc.project.clips[&studio_core::ClipId(2)].track),
-            gate: Gate::Clip(studio_core::ClipId(2)) } }, "bound");
+            gate: Gate::Clip(studio_core::ClipId(2)), response: None, fit_span: false } }, "bound");
         assert_eq!(s.session.doc.project.curve_share_count(curve), 2);
         s.make_unique(studio_core::BindingId(2));
         assert_eq!(s.status, "curve made unique — one undo reverses all 5", "status was: {}", s.status);
@@ -9129,7 +10474,7 @@ mod mix_pass_tests {
         let mine = Effect { kind: "reverb".into(), params: Default::default(),
                             enabled: true };
         s.edit(Op::AddBus { bus: Bus { id: bus, name: "master".into(), parent: None,
-            gain: 1.0, chain: vec![mine.clone()], sends: vec![], muted: false } }, "bus");
+            gain: 1.0, chain: vec![mine.clone()], sends: vec![], muted: false, silent: false } }, "bus");
         let before_gain = s.session.doc.project.busses[&bus].gain;
 
         let proposed = vec![
@@ -9164,7 +10509,7 @@ mod mix_pass_tests {
         let mut s = Studio::demo();
         let bus = BusId(91);
         s.edit(Op::AddBus { bus: Bus { id: bus, name: "m".into(), parent: None,
-            gain: 1.0, chain: vec![], sends: vec![], muted: false } }, "bus");
+            gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: false } }, "bus");
         s.edit_group(vec![
             Op::SetBusGain { id: bus, gain: 0.5 },
             Op::SetBusGain { id: BusId(999), gain: 0.5 }, // no such bus

@@ -1,0 +1,14 @@
+[package]
+name = "template-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Chat templates the way the model shipped them: render a GGUF's embedded Jinja (`tokenizer.chat_template`) with minijinja + Python-compat, probe it for the model's tool-call syntax, and size the harness (tool count, system-prompt budget) to the model's tier. Replaces hand-maintained template families."
+
+[dependencies]
+# Jinja in Rust by Jinja's author; `json` gives `tojson`, `loader` is unused, `preserve_order` keeps
+# tool schemas in the order the harness wrote them (models are sensitive to it).
+minijinja = { version = "2.24", features = ["json", "preserve_order", "loop_controls", "builtins", "unicode"] }
+# `.strip()`, `.split()`, `.startswith()`, `dict.items()`… — the Python-isms every chat template uses.
+minijinja-contrib = { version = "2.24", features = ["pycompat", "datetime"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

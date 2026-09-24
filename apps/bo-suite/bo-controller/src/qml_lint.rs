@@ -155,6 +155,38 @@ pub struct LintIssue {
 
 /// Lint the qml/ tree. Returns the list of issues found (empty if
 /// clean). Each issue is one bad property assignment.
+/// The Qt major version of a `qmllint`, from its `--version` output.
+///
+/// Qt 6 prints e.g. `qmllint 6.7.2`; `None` when no version can be read.
+pub fn qmllint_qt_major(version_output: &str) -> Option<u32> {
+    version_output.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .filter(|t| t.contains('.'))
+        .find_map(|t| t.split('.').next()?.parse().ok())
+}
+
+/// Does one line of `qmllint` output fail the build?
+///
+/// THIS PROJECT IS QT 5: qmetaobject 0.2 binds Qt 5. The lint preferred
+/// `qmllint6`, and failed on ANY line starting "Warning". Qt 6's qmllint is far
+/// stricter and warns about idioms that are valid under Qt 5 (unqualified
+/// access, import style), so on a machine with Qt 6 installed -- Homebrew's
+/// `qt` on macOS -- it failed a build that works. Seen: `fleet_build.sh` on a
+/// Mac, "failed to run custom build command for bo-controller", while the pure
+/// property check on the same QML finds 0 issues.
+///
+/// So: hard errors and the binding checks this lint exists for are fatal under
+/// ANY qmllint -- those are real runtime breakage. Plain warnings are fatal only
+/// from a Qt 5 qmllint, the one that speaks this code's dialect. From Qt 6 (or
+/// an unknown version) they are reported, not fatal.
+pub fn qmllint_line_fails(line: &str, qt_major: Option<u32>) -> bool {
+    let binding_bug = line.contains(": Cannot assign")
+        || line.contains(": Connections: Detected function")
+        || line.contains("Unable to assign");
+    let error = line.starts_with("Error") || line.starts_with("[Error]");
+    let warning = line.starts_with("Warning") || line.starts_with("[Warning]");
+    binding_bug || error || (warning && qt_major == Some(5))
+}
+
 pub fn check_qml_properties(qml_dir: &Path) -> Result<Vec<LintIssue>, String> {
     // Pass 1: enumerate every component definition.
     let mut components: BTreeMap<String, ComponentDef> = BTreeMap::new();

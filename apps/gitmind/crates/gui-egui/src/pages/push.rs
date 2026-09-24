@@ -81,15 +81,23 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 app.push.discovering = true;
                 let subnet = app.push.subnet.clone();
                 app.task.run(move || {
-                    let prefix = if subnet.trim().is_empty() {
-                        cockpit::deploy::local_subnet24().unwrap_or_default()
+                    // A typed subnet is an instruction; otherwise EVERY attached
+                    // private /24. Auto-detect used to follow the default route
+                    // only, so a phone on a USB tether -- a second interface --
+                    // was invisible on a machine cabled to it.
+                    let prefixes: Vec<String> = if subnet.trim().is_empty() {
+                        cockpit::deploy::local_subnet24s()
                     } else {
-                        subnet.trim().to_string()
+                        vec![subnet.trim().to_string()]
                     };
-                    if prefix.is_empty() {
-                        return serde_json::json!({"error": "could not detect subnet — type one like 192.168.1"}).to_string();
+                    if prefixes.is_empty() {
+                        return serde_json::json!({
+                            "error": cockpit::deploy::explain_empty_scan(&prefixes)
+                        }).to_string();
                     }
-                    let devs = cockpit::deploy::scan_ssh(&prefix, std::time::Duration::from_millis(300), 64);
+                    let devs: Vec<_> = prefixes.iter()
+                        .flat_map(|p| cockpit::deploy::scan_ssh(p, std::time::Duration::from_millis(300), 64))
+                        .collect();
                     let arr: Vec<_> = devs.iter().map(|d| serde_json::json!({"ip": d.ip, "hostname": d.hostname})).collect();
                     serde_json::json!({"devices": arr}).to_string()
                 });
@@ -140,8 +148,9 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             let host_native = cockpit::buildflags::normalize_native(&cockpit::ops::native_triple_local());
             let path = std::env::var("PATH").unwrap_or_default();
             let have_cross = cockpit::sysdeps::rust_target_installed(&app.push.target, &path);
+            let have_podman = cockpit::podman::which_podman(&path);
             let reachable = !app.push.host.trim().is_empty();
-            let c = cockpit::buildflags::recommend_strategy(&host_native, &app.push.target, have_cross, reachable);
+            let c = cockpit::buildflags::recommend_strategy(&host_native, &app.push.target, have_cross, have_podman, reachable);
             app.push.strategy = format!("{:?} — {}", c.strategy, c.reason);
         }
     });
@@ -286,6 +295,35 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             ui.label("build system");
             ui.label(egui::RichText::new(&app.push.build_system).strong().color(egui::Color32::from_rgb(0x7a, 0xa2, 0xf7)));
         });
+    }
+
+    // A ONE-TAP PRESET for tideshell specifically: wayland+layer together is
+    // what makes it a real docked shell under COSMIC rather than a preview
+    // window with no input method (see cockpit::buildflags's doc on why those
+    // two features do not imply each other). Shown only for tideshell, since
+    // the pairing is meaningless for any other app.
+    if app.push.selected.as_ref().is_some_and(|s| s.name.contains("tideshell")) {
+        let mut on = cockpit::buildflags::is_cosmic_tideshell(
+            app.push.selected.as_ref().map(|s| s.features.as_slice()).unwrap_or(&[]));
+        if ui.checkbox(&mut on, "COSMIC + tideshell (wayland + layer)").changed() {
+            if let Some(sel) = &mut app.push.selected {
+                sel.features = if on {
+                    cockpit::buildflags::with_cosmic_tideshell(sel.features.clone())
+                } else {
+                    sel.features.iter().cloned()
+                        .filter(|f| !cockpit::buildflags::COSMIC_TIDESHELL_FEATURES.contains(&f.as_str()))
+                        .collect()
+                };
+                sel.no_default = true;
+                // Keep the swipe-grid checkboxes in sync, so a person who
+                // opens it afterwards sees the same state this switch set.
+                let now_on: std::collections::HashSet<&String> = sel.features.iter().collect();
+                for f in &mut app.push.flags {
+                    f.on = now_on.contains(&f.id);
+                }
+            }
+        }
+        crate::narrow::desc(ui, "turns on the docked panel AND its input method together — one                                  without the other showed a keyboard that never hid, or a shell                                  with no window focus");
     }
 
     // Build features — hold the button and swipe across the grid to flip features, release to confirm.

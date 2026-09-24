@@ -96,4 +96,11 @@ llamacpp = ["llama-ffi", "llama-cpp-2/vulkan"]
 vk-upload = ["dep:ash"]
 # CPU-only build — validates the FFI without a shader compiler (sandbox-friendly)
 llamacpp-cpu = ["llama-ffi"]
+# Metal build for the Macs: the same ggml backend Ollama runs; needs only Xcode CLT + cmake, no Vulkan SDK.
+# (llama-cpp-2 0.1.150 exposes `metal`; its vendored llama.cpp knows LLM_ARCH_QWEN35MOE, so Ornith 1.5 loads.)
+llamacpp-metal = ["llama-ffi", "llama-cpp-2/metal"]
+# Explicit name for what `llamacpp` already is, so a build log says which GPU path it took.
+llamacpp-vulkan = ["llama-ffi", "llama-cpp-2/vulkan"]
+# One binary, ggml backend .dylib/.so picked at runtime (needs dynamic-link; test before relying on it).
+llamacpp-dyn = ["llama-ffi", "llama-cpp-2/dynamic-backends"]
 

@@ -150,6 +150,8 @@ struct State {
     configured: bool,
     /// A `wl_surface.frame` callback is outstanding — don't paint again until it lands.
     frame_pending: bool,
+    /// When that callback was requested, to notice one that never lands.
+    frame_sent: Option<Instant>,
     /// The compositor closed the layer surface (output gone, shell shutting down).
     closed: bool,
     /// egui input for the next frame.
@@ -222,6 +224,7 @@ pub fn run(title: &str) -> Result<(), LayerError> {
         needs_paint: false,
         configured: false,
         frame_pending: false,
+        frame_sent: None,
         closed: false,
         events: Vec::new(),
         primary_touch: None,
@@ -252,12 +255,30 @@ pub fn run(title: &str) -> Result<(), LayerError> {
 
     tracing::info!("layer-shell shell up: {}x{} @{}x, layer {:?}", state.logical_size().0, state.logical_size().1, state.scale, layer_from_env());
 
+    let mut callback_lost_noted = false;
     while !state.closed {
         // ---- 0. the sink first: Activate/Deactivate are seen on every wake, and a change of
         //         wish is itself a reason to run a frame (which is what emits `Visible`).
         let wanted = feel.pump_sink();
+        // A FRAME CALLBACK THAT NEVER LANDS stalls painting for good: `frame_pending`
+        // stays set and nothing paints again. Treat it as lost after a second, log once
+        // per stall, and paint anyway -- a keyboard stuck on its last (or first, empty)
+        // frame looked exactly like the empty band reported under COSMIC.
+        if state.frame_pending && state.frame_sent.is_some_and(|t| t.elapsed() > FRAME_CALLBACK_GRACE) {
+            if !callback_lost_noted {
+                tracing::warn!("layer: no frame callback for {:?}; treating it as lost and repainting", FRAME_CALLBACK_GRACE);
+                callback_lost_noted = true;
+            }
+            state.frame_pending = false;
+        }
+        // `needs_paint` is due ONLY WHEN A PAINT IS POSSIBLE. It is cleared only by
+        // painting, so while painting was blocked -- callback outstanding, surface not yet
+        // configured -- every iteration counted as due, and the loop ran the whole
+        // keyboard UI about 20 times a second, forever, queueing each frame's textures:
+        // reported as 4+ GB and an overheating phone.
+        let can_paint = mapped && state.configured && !state.frame_pending;
         let due = !state.events.is_empty()
-            || state.needs_paint
+            || (state.needs_paint && can_paint)
             || wanted != mapped
             || Instant::now() >= repaint_at;
         if !due {
@@ -336,7 +357,9 @@ pub fn run(title: &str) -> Result<(), LayerError> {
         // input never went through the painter at all.
         //
         // So: accumulate across skipped frames and apply on the next paint that happens.
-        pending_textures.append(out.textures_delta);
+        // MERGED, NOT APPENDED -- see `merge_textures`. Appending grew without bound
+        // whenever painting stalled.
+        merge_textures(&mut pending_textures, out.textures_delta);
         if mapped && state.configured && !state.frame_pending {
             let px = state.pixel_size();
             gl.resize_if_needed(px).map_err(LayerError::Runtime)?;
@@ -347,6 +370,8 @@ pub fn run(title: &str) -> Result<(), LayerError> {
             // Throttle to the compositor: no more paints until it says it consumed this one.
             state.layer.wl_surface().frame(&qh, state.layer.wl_surface().clone());
             state.frame_pending = true;
+            state.frame_sent = Some(Instant::now());
+            callback_lost_noted = false;
             gl.swap().map_err(LayerError::Runtime)?;
             state.needs_paint = false;
         }
@@ -360,6 +385,37 @@ pub fn run(title: &str) -> Result<(), LayerError> {
     gl.destroy();
     tracing::info!("layer-shell shell: surface closed by the compositor, exiting");
     Ok(())
+}
+
+/// How long a frame callback may take before it is treated as lost.
+const FRAME_CALLBACK_GRACE: Duration = Duration::from_secs(1);
+
+/// Fold a frame's texture delta into the ones still waiting for a paint.
+///
+/// Skipped frames must not DROP their deltas -- the first frame's font atlas arrives
+/// before the surface can paint, and losing it drew a black rectangle (see the loop).
+/// But APPENDING them grows without bound if painting stalls. Merging keeps only what
+/// still matters:
+///   * a newer FULL image for a texture replaces everything queued for it;
+///   * freeing a texture drops its queued uploads (the free itself is kept -- freeing a
+///     texture the GPU never received is a no-op in egui_glow's painter);
+///   * partial updates are kept in order, since each patches the one before.
+/// So memory is bounded by the textures alive, however long a stall lasts.
+pub fn merge_textures(pending: &mut egui::TexturesDelta, newer: egui::TexturesDelta) {
+    for id in &newer.free {
+        pending.set.retain(|(t, _)| t != id);
+        if !pending.free.contains(id) {
+            pending.free.push(*id);
+        }
+    }
+    for (id, delta) in newer.set {
+        if delta.pos.is_none() {
+            pending.set.retain(|(t, _)| *t != id);
+        }
+        // A texture re-created after being freed must not be freed again afterwards.
+        pending.free.retain(|t| *t != id);
+        pending.set.push((id, delta));
+    }
 }
 
 /// How long the loop may sleep: until egui's deadline, capped at IDLE_POLL so the sink is
@@ -742,5 +798,68 @@ mod tests {
         freeing.free.push(TextureId::Managed(1));
         pending.append(freeing);
         assert_eq!(pending.free.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::merge_textures;
+    use egui::epaint::ImageDelta;
+    use egui::{Color32, ColorImage, TextureId, TextureOptions, TexturesDelta};
+
+    fn full(id: u64, px: usize) -> (TextureId, ImageDelta) {
+        (TextureId::Managed(id), ImageDelta::full(ColorImage::new([px, px], vec![Color32::WHITE; px * px]), TextureOptions::LINEAR))
+    }
+    fn part(id: u64) -> (TextureId, ImageDelta) {
+        (TextureId::Managed(id), ImageDelta::partial([0, 0], ColorImage::new([2, 2], vec![Color32::RED; 4]), TextureOptions::LINEAR))
+    }
+    fn delta(set: Vec<(TextureId, ImageDelta)>, free: Vec<u64>) -> TexturesDelta {
+        TexturesDelta { set, free: free.into_iter().map(TextureId::Managed).collect() }
+    }
+
+    /// THE LEAK, bounded: a thousand stalled frames each re-sending one texture in full
+    /// used to queue a thousand copies. Merged, one remains.
+    #[test]
+    fn a_stall_keeps_one_copy_of_a_resent_texture() {
+        let mut p = TexturesDelta::default();
+        for _ in 0..1000 { merge_textures(&mut p, delta(vec![full(1, 64)], vec![])); }
+        assert_eq!(p.set.len(), 1);
+    }
+
+    /// A texture created and freed every frame (a load_texture in the UI) must not
+    /// accumulate either: each free drops the upload it cancels.
+    #[test]
+    fn churned_textures_do_not_accumulate() {
+        let mut p = TexturesDelta::default();
+        for f in 0..1000u64 {
+            merge_textures(&mut p, delta(vec![full(100 + f, 32)], if f > 0 { vec![99 + f] } else { vec![] }));
+        }
+        assert_eq!(p.set.len(), 1, "only the live texture is still queued");
+        assert!(p.set[0].0 == TextureId::Managed(1099));
+    }
+
+    /// The first frame's font atlas must survive skipped frames -- the black-rectangle
+    /// bug this queue exists to prevent -- and partial updates stay after it, in order.
+    #[test]
+    fn the_first_atlas_and_later_patches_survive() {
+        let mut p = TexturesDelta::default();
+        merge_textures(&mut p, delta(vec![full(0, 128)], vec![]));
+        merge_textures(&mut p, delta(vec![part(0)], vec![]));
+        merge_textures(&mut p, delta(vec![], vec![]));
+        merge_textures(&mut p, delta(vec![part(0)], vec![]));
+        assert_eq!(p.set.len(), 3);
+        assert!(p.set[0].1.pos.is_none(), "the full atlas first");
+        assert!(p.set[1].1.pos.is_some() && p.set[2].1.pos.is_some());
+    }
+
+    /// A texture freed and then re-created while stalled must end up uploaded, not freed.
+    #[test]
+    fn recreating_a_freed_texture_cancels_its_free() {
+        let mut p = TexturesDelta::default();
+        merge_textures(&mut p, delta(vec![full(5, 8)], vec![]));
+        merge_textures(&mut p, delta(vec![], vec![5]));
+        merge_textures(&mut p, delta(vec![full(5, 8)], vec![]));
+        assert_eq!(p.set.len(), 1);
+        assert!(!p.free.contains(&TextureId::Managed(5)), "not freed after being re-created");
     }
 }

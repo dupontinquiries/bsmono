@@ -1,0 +1,2 @@
+# The root .gitignore excludes *.mp4; these small proxies are a deliberate exception.
+!*.mp4

@@ -106,10 +106,20 @@ impl Shellbox {
                     self.pending_rotate = Some(*deg);
                     continue;
                 }
+                // Brightness writes stop HERE, before the panel goes dark: a
+                // DSI command to an off panel is the journal's dsi error.
                 Action::DisplayPower(on) => {
+                    self.backlight.set_display(*on);
                     self.pending_display_power = Some(*on);
                     continue;
                 }
+                Action::SetGovernor(wanted) => match tideshell_egui::cpu_governor::apply(*wanted) {
+                    Ok(chosen) if chosen == *wanted => Outcome::Done(format!("cpu governor: {}", chosen.label())),
+                    // The kernel skipped forward past what was asked for (see
+                    // `next_available`) -- worth saying, not worth failing over.
+                    Ok(chosen) => Outcome::Done(format!("cpu governor: {} (kernel lacks {}, used the next available)", chosen.label(), wanted.label())),
+                    Err(e) => Outcome::Failed(format!("cpu governor: {e}")),
+                },
                 // The overlay IS the trackpad surface here; nothing to execute.
                 Action::ShowTrackpad(on) => Outcome::Done(format!("trackpad {}", if *on { "on" } else { "off" })),
                 _ => match self.windows.as_mut() {
@@ -295,7 +305,34 @@ fn print_new_trace(shell: &Shell, printed: &mut Vec<String>) {
     }
 }
 
+/// Give the systemd user manager and D-Bus activation this session's display.
+///
+/// Services started BY systemd or by D-Bus activation -- the on-screen keyboard
+/// among them -- inherit the user manager's environment, not this session's.
+/// Nothing put WAYLAND_DISPLAY there, so on the FP5 the keyboard's unit
+/// crash-looped with no display to connect to. Sway's documentation
+/// recommends exactly this step in every session config; tideshell runs
+/// inside the session and knows the values.
+fn export_session_env() {
+    let vars: Vec<&str> = ["WAYLAND_DISPLAY", "DISPLAY", "XDG_CURRENT_DESKTOP"]
+        .into_iter().filter(|v| std::env::var_os(v).is_some()).collect();
+    if vars.is_empty() {
+        eprintln!("tideshell: session env: no WAYLAND_DISPLAY/DISPLAY to export");
+        return;
+    }
+    for (cmd, pre) in [("systemctl", &["--user", "import-environment"][..]),
+                       ("dbus-update-activation-environment", &["--systemd"][..])] {
+        match std::process::Command::new(cmd).args(pre).args(&vars)
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).output() {
+            Ok(o) if o.status.success() => eprintln!("tideshell: session env: {cmd} {}", vars.join(" ")),
+            Ok(o) => eprintln!("tideshell: session env: {cmd} failed: {}", String::from_utf8_lossy(&o.stderr).trim()),
+            Err(e) => eprintln!("tideshell: session env: {cmd}: {e}"),
+        }
+    }
+}
+
 fn main() {
+    export_session_env();
     let args: Vec<String> = std::env::args().collect();
     // `tideshell ctl <command>`: a client, for cosmic-comp's key bindings.
     // `tideshell install-keys`: write those bindings into cosmic's config.
@@ -365,6 +402,10 @@ fn main() {
         std::process::exit(1)
     });
 
+    // The backlight writer also hears when the COMPOSITOR blanks the screen
+    // (lock screen, idle): the layer runtime's power objects report every
+    // mode change, forwarded in the frame loop (`io.display_on()`).
+    let backlight = tideshell_egui::sensors::BacklightOut::spawn(std::path::Path::new("/sys"), zbus::blocking::Connection::system().ok());
     let mut sb = Shellbox {
         shell: Shell::new(prefs, (0.0, 0.0)),
         view: ShellView::default(),
@@ -374,7 +415,7 @@ fn main() {
         ei_status: None,
         persist,
         ambient: tideshell_egui::sensors::Ambient::spawn("/sys".into(), zbus::blocking::Connection::system().ok()),
-        backlight: tideshell_egui::sensors::BacklightOut::spawn(std::path::Path::new("/sys"), zbus::blocking::Connection::system().ok()),
+        backlight,
         sensor_status: (String::new(), String::new()),
         ei_drop_noted: false,
         filter: tideshell_core::touchfilter::TouchFilter::default(),
@@ -498,6 +539,7 @@ fn main() {
     if let Some(deg) = args.iter().position(|a| a == "--rotate").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()) {
         sb.pending_rotate = Some(deg);
     }
+    let mut last_display_on: Option<bool> = None;
     let trace_stderr = std::env::var("TIDESHELL_TRACE").is_ok_and(|v| v == "stderr");
     let mut printed: Vec<String> = Vec::new();
     loop {
@@ -751,6 +793,16 @@ fn main() {
         if io.config_status() != last_config_status {
             last_config_status = io.config_status();
             sb.shell.note(last_config_status.clone());
+        }
+        // The compositor's view of the display, whoever changed it, reaches
+        // the backlight writer: no DSI commands to a dark panel, and the level
+        // re-asserted when it comes back on.
+        let display_on = io.display_on();
+        if display_on != last_display_on {
+            last_display_on = display_on;
+            if let Some(on) = display_on {
+                sb.backlight.set_display(on);
+            }
         }
         if io.power_status() != last_power_status {
             last_power_status = io.power_status();

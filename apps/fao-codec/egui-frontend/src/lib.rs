@@ -17,6 +17,31 @@ pub mod lab;
 pub mod library;
 pub mod player;
 pub mod decode;
+/// Write frames as a `.fao`. Uses the v1 DCT path because the V2 encoder's
+/// `FrameResult` returns no bitstream -- see the module notes.
+/// Every codec version by codename -- original names, not version numbers --
+/// with what each can actually encode and decode in this frontend.
+pub mod codec_catalog;
+pub mod export;
+/// Seek-based .fao reading in constant memory: 600-hour and 8K files, and
+/// timestamps past the 596.5-hour signed-32-bit overflow.
+pub mod stream;
+/// Reading a remote `.fao` over HTTP byte ranges: a pure block cache plus a
+/// ureq transport, so the streaming player can play files on a dufs server.
+pub mod http_range;
+/// Quiltstone: block-patch frames (marker M) -- only the 16x16 blocks that
+/// changed, over the Keystone DCT codec.
+pub mod patch;
+/// Shiftquilt: patch frames with motion-predicted blocks (marker Q).
+pub mod motion;
+/// The media collection: video files from local folders and dufs servers, with
+/// glob patterns and individual selection. Distinct from the mesh Web Library.
+/// Fast sampled estimate of what a SHARED block dictionary would save across a
+/// selection of files, versus one dictionary per file.
+pub mod analyze;
+pub mod media;
+/// The Media tab: the egui shell over `media`.
+pub mod media_page;
 pub mod transcode;
 pub mod encode_page;
 pub mod archive;
@@ -64,6 +89,7 @@ pub enum Tab {
     Lab,
     SeqLab,
     Library,
+    Media,
     Player,
     Archive,
     Settings,
@@ -82,6 +108,7 @@ pub struct App {
     pub lab: lab::State,
     pub seq: seq_page::SeqState,
     pub library: library::State,
+    pub media: media_page::State,
     pub player: player::State,
     pub encode: encode_page::State,
     pub archive: archive::State,
@@ -91,7 +118,7 @@ impl Default for App {
     fn default() -> Self {
         let mut prefs = settings_kit::Prefs::default();
         prefs.palette = "system".to_string();
-        App { a11y: uikit_egui::a11y::A11yScene::new(), tab: Tab::Encode, prefs, lab: lab::State::default(), seq: seq_page::SeqState::default(), library: library::State::default(), player: player::State::default(), encode: encode_page::State::default(), archive: archive::State::default() }
+        App { a11y: uikit_egui::a11y::A11yScene::new(), tab: Tab::Encode, prefs, lab: lab::State::default(), seq: seq_page::SeqState::default(), library: library::State::default(), media: media_page::State::default(), player: player::State::default(), encode: encode_page::State::default(), archive: archive::State::default() }
     }
 }
 
@@ -118,6 +145,7 @@ impl App {
             Tab::Lab => lab::ui(self, ui),
             Tab::SeqLab => seq_page::ui(self, ui),
             Tab::Library => library::ui(self, ui),
+            Tab::Media => media_page::ui(self, ui),
             Tab::Player => player::ui(self, ui),
             Tab::Archive => archive::ui(self, ui),
             Tab::Settings => {
@@ -129,7 +157,7 @@ impl App {
 
     fn nav(&mut self, ui: &mut egui::Ui) {
         for (t, label) in [(Tab::Encode, "⏺ Encode"), (Tab::Lab, "🎞 Encode Lab"), (Tab::SeqLab, "⏱ Seq Lab"),
-                           (Tab::Library, "🔗 Library"),
+                           (Tab::Library, "🔗 Library"), (Tab::Media, "🗂 Media"),
                            (Tab::Player, "▶ Player"), (Tab::Archive, "🗄 Archive"), (Tab::Settings, "⚙ Settings")] {
             if ui.selectable_label(self.tab == t, label).clicked() {
                 self.tab = t;

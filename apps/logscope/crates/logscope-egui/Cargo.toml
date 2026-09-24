@@ -26,6 +26,10 @@ libc = "0.2"  # fabric daemon: signals (SIGTERM) + double-fork
 repo-map = { path = "../../../../shared/repo-map" }
 # the egui-free orchestration core (fan-out, dispatch, verdicts, command language)
 logscope-fan = { path = "../logscope-fan" }
+# the multi-box session core: the Remote backend is a thin client over its endpoint module
+logscope-hive = { path = "../logscope-hive" }
+# the model's own chat template + the tier budget for tool menus
+template-kit = { path = "../../../../shared/template-kit" }
 # XDG paths + INI, already used by hatch and settingsd — see src/prefs.rs.
 config-kit = { path = "../../../../shared/config-kit" }
 # aperture's completion-reply classifier (zero deps): the tested elision/stub detector
@@ -50,6 +54,7 @@ cli-kit = { path = "../../../../shared/cli-kit" }
 touchkit = { path = "../../../../shared/touchkit", features = ["egui"] }
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
 serde_json = "1"
+ureq = { version = "2.10", features = ["json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # native OS file dialog (XDG portal backend — no GTK, matches the glow/no-GTK stance)
 rfd = { optional = true, version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
@@ -83,6 +88,8 @@ voice-metal = ["voice", "whisper-rs/metal"]    # GPU whisper on macOS
 # uses the same renderer as scene-view — without it the GUI silently falls back to the CPU software path and
 # none of the shader work (pearl/frost/bloom/grade/underwater) appears. CPU-only build: --no-default-features --features gui
 gpu-scene = ["gui", "scene-kit/glow"]  # uses eframe::glow + eframe::egui_glow (re-exported by the glow backend)
+# status lines to the phone over the DHT (snapclone presence node); off by default
+dht = ["logscope-hive/dht"]
 
 [lib]
 name = "logscope_egui"

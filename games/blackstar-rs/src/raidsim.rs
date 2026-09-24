@@ -7,11 +7,11 @@
 //! the loot layer settles the bill. Every decision prints WITH its reason,
 //! because a loop you can read is a loop you can tune.
 //!
-//!     skydribble --raid                      the roster, the log, the seal
-//!     skydribble --raid gigadrill            run one raid end to end
-//!     skydribble --raid gigadrill 42         ... at a seed
-//!     skydribble --raid all                  sweep the roster, one line each
-//!     skydribble --raid codex                relics and shards recovered so far
+//!      blackstar --raid                      the roster, the log, the seal
+//!      blackstar --raid gigadrill            run one raid end to end
+//!      blackstar --raid gigadrill 42         ... at a seed
+//!      blackstar --raid all                  sweep the roster, one line each
+//!      blackstar --raid codex                relics and shards recovered so far
 //!
 //! Steering: `--foothold lz|fort` forces the approach, `--suits` runs a
 //! human-suited team, `--team N` sizes the squad (SYNC wants three;

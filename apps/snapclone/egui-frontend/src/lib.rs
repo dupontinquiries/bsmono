@@ -53,6 +53,10 @@ pub mod ring;
 /// exist. See its header: the kit's QR is a decorative identicon, so this
 /// decodes REAL codes from other apps, which is what scanning a friend's
 /// screen actually involves.
+/// Per-speaker processing on incoming voice: de-bass, de-harsh, compressor.
+/// De-bass helps ambient noise; the compressor HURTS it, since it lifts the
+/// quiet parts and between words the quiet part is the room.
+pub mod voice_fx;
 pub mod qr_decode;
 pub mod qr;
 pub mod wayfinder;
@@ -297,6 +301,9 @@ pub struct Snapclone {
     /// skipped" is actionable and a silent difference is not.
     pub import_report: Option<String>,
     pub group_voice: crate::group_voice::GroupVoice,
+    /// Per-contact processing on incoming voice: the leveler and the 4-band
+    /// EQ, keyed by the authenticated sender. See `voice_fx`.
+    pub voice_fx: crate::voice_fx::VoiceFx,
     pub picker: crate::contacts::Picker,
     pub conversation: crate::conversation::Conversation,
     /// Who the open conversation is with. The Conversation model holds the
@@ -816,6 +823,7 @@ impl Snapclone {
             pending_vcard_text: None,
             import_report: None,
             group_voice: Default::default(),
+            voice_fx: Default::default(),
             picker: Default::default(),
             cards: Default::default(),
             add_form: Default::default(),

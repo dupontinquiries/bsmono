@@ -1,0 +1,25 @@
+[package]
+name = "logscope-hive"
+version = "0.1.0"
+edition = "2021"
+description = "The multi-box session core for logscope: a matrix of boxes (OpenAI-compatible, Anthropic-compatible, Ollama, Claude Code), a DAG dispatcher with declared independence and summary contracts, an append-only ledger with absence records, and a transcript counter. Headless; the egui shell and the CLI are both consumers."
+
+[lib]
+name = "hive"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hive"
+path = "src/bin/hive.rs"
+
+[dependencies]
+ureq = { version = "2.10", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# the DHT status sink: the line the phone shows goes through snapclone's presence node
+snapclone-presence = { path = "../../../snapclone/rust/snapclone-presence", optional = true }
+snapcore = { path = "../../../../shared/snapcore", optional = true }
+
+[features]
+default = []
+dht = ["dep:snapclone-presence", "dep:snapcore"]

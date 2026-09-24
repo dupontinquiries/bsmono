@@ -51,6 +51,241 @@ pub struct Segment {
     pub confidence: f32,
 }
 
+/// Parse a whisper `.srt` file into segments (source time).
+///
+/// Tolerant the way a sidecar has to be: blank lines, a missing index line,
+/// `\r\n`, and a stray block with no timing are all skipped rather than
+/// failing the whole file — one damaged cue must not hide the other four
+/// hundred. Confidence is 1.0 because `.srt` does not carry one; speaker is
+/// taken from a leading `[SPEAKER]` or `NAME:` only when whisper wrote one.
+pub fn parse_srt(text: &str) -> Vec<Segment> {
+    fn stamp(s: &str) -> Option<Ticks> {
+        let s = s.trim().replace(',', ".");
+        let mut parts = s.split(':');
+        let (h, m, sec) = (parts.next()?, parts.next()?, parts.next()?);
+        let secs = h.trim().parse::<f64>().ok()? * 3600.0 + m.trim().parse::<f64>().ok()? * 60.0
+            + sec.trim().parse::<f64>().ok()?;
+        Some(Ticks::from_seconds(secs))
+    }
+    let mut out = Vec::new();
+    let text = text.replace("\r\n", "\n");
+    for block in text.split("\n\n") {
+        let lines: Vec<&str> = block.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let Some(ti) = lines.iter().position(|l| l.contains("-->")) else { continue };
+        let Some((a, b)) = lines[ti].split_once("-->") else { continue };
+        let (Some(start), Some(end)) = (stamp(a), stamp(b)) else { continue };
+        let body = lines[ti + 1..].join(" ");
+        if body.trim().is_empty() { continue; }
+        out.push(Segment { start, end: end.max(start), text: body.trim().to_string(),
+                           speaker: None, confidence: 1.0 });
+    }
+    out
+}
+
+/// Words to show under a clip, laid out so they never collide.
+///
+/// A clip's gutter is a thin strip; a transcript is dense. Drawing every
+/// segment would be an unreadable smear at any zoom where a clip is shorter
+/// than its dialogue, so this places a label at each segment's start (in
+/// pixels from the clip's left edge), clipped to the words that fit before
+/// the NEXT label, and drops a segment entirely when it would start within
+/// `min_gap_px` of the previous one. Zoomed out you get an occasional word
+/// per clip; zoomed in, the whole line — the same data, answering "what is
+/// being said here" at whatever scale you are looking.
+///
+/// `char_px` is the width of one character in the gutter font; the caller
+/// knows it, this does not.
+pub fn gutter_words(segments: &[Segment], src_in: Ticks, len: Ticks, px_per_sec: f32,
+                    char_px: f32, min_gap_px: f32) -> Vec<(f32, String)> {
+    let end = src_in.saturating_add(len);
+    let x_of = |t: Ticks| ((t.saturating_sub(src_in)).to_seconds() as f32 * px_per_sec).max(0.0);
+    let width = len.to_seconds() as f32 * px_per_sec;
+    let live: Vec<&Segment> = segments.iter().filter(|s| s.end > src_in && s.start < end).collect();
+    let mut placed: Vec<(f32, &Segment)> = Vec::new();
+    for s in live {
+        let x = x_of(s.start);
+        if placed.last().map(|(px, _)| x - *px < min_gap_px).unwrap_or(false) { continue; }
+        placed.push((x, s));
+    }
+    let mut out = Vec::new();
+    for (i, (x, s)) in placed.iter().enumerate() {
+        let room = placed.get(i + 1).map(|(nx, _)| *nx).unwrap_or(width) - x - char_px;
+        let max_chars = (room / char_px.max(1.0)).floor() as usize;
+        if max_chars < 3 { continue; }
+        // whole words only: a word cut in half reads as a different word
+        let mut shown = String::new();
+        for w in s.text.split_whitespace() {
+            let next = if shown.is_empty() { w.len() } else { shown.len() + 1 + w.len() };
+            if next > max_chars { break; }
+            if !shown.is_empty() { shown.push(' '); }
+            shown.push_str(w);
+        }
+        if shown.is_empty() { continue; }
+        if shown.len() < s.text.len() { shown.push('…'); }
+        out.push((*x, shown));
+    }
+    out
+}
+
+/// Which words the transcript gutter shows.
+///
+/// The gutter answers a different question depending on the job:
+///
+/// * **All** — what is being said here (the default).
+/// * **Filler** — where the junk is: "um", "uh", "you know", "o sea". For a
+///   pass that cuts hesitations out of an interview or a narration take,
+///   the gutter becomes a list of places to cut.
+/// * **Unique** — the words that carry the content: names, places, the nouns
+///   that occur once or twice in the whole project. Skimming a long take for
+///   the line about the audition is faster when "the", "and" and every
+///   repeated word are gone.
+/// * **Dictionary** — only words from a list you supply: character names,
+///   product names, a scene's key terms, a list of banned words for a
+///   broadcast deliverable.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum WordFilter {
+    #[default]
+    All,
+    Filler,
+    Unique,
+    Dictionary(BTreeSet<String>),
+}
+
+impl WordFilter {
+    pub fn label(&self) -> &'static str {
+        match self {
+            WordFilter::All => "all words",
+            WordFilter::Filler => "filler words",
+            WordFilter::Unique => "unique words",
+            WordFilter::Dictionary(_) => "words from a list",
+        }
+    }
+}
+
+/// Filler words and phrases, English and Spanish (the film's crew speaks
+/// both). Multi-word fillers are matched as phrases, so "you know" is a
+/// filler while "know" alone is not. Deliberately short: a filler list
+/// that also catches "so" and "like" in their real meanings turns the
+/// gutter into noise, so only the words that are almost never content are
+/// here; "like" and "so" are left to a dictionary for people who want them.
+pub const FILLERS: &[&str] = &[
+    "um", "umm", "uh", "uhh", "er", "erm", "ah", "hmm", "mm", "mhm",
+    "you know", "i mean", "kind of", "sort of", "basically", "literally",
+    "este", "o sea", "eh", "em", "pues nada", "digamos",
+];
+
+/// Words too common to ever be "unique", whatever their count.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "that", "this", "with", "have", "what", "your", "you", "are", "for", "was",
+    "but", "not", "just", "they", "there", "then", "them", "from", "will", "would", "could",
+    "about", "been", "were", "when", "which", "their", "i'm", "it's", "don't", "okay",
+    "que", "para", "pero", "como", "esta", "este", "eso", "esto", "una", "los", "las", "del",
+];
+
+/// One word of a segment with an ESTIMATED time span.
+///
+/// Whisper's `.srt` times whole lines, not words. A word's position is
+/// estimated by where it falls in the line's characters, which is right to
+/// within a syllable or two for steady speech and wrong for a line with a
+/// long pause in it. Good enough to put a cut near an "um" and then let
+/// the waveform say exactly where; not good enough to cut on blind. The
+/// confidence is halved to say so.
+fn words_of(seg: &Segment) -> Vec<Segment> {
+    let total = seg.text.chars().count().max(1) as f64;
+    let span = (seg.end.0 - seg.start.0) as f64;
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    for w in seg.text.split_whitespace() {
+        let at = seg.text[pos..].find(w).map(|i| pos + i).unwrap_or(pos);
+        let c0 = seg.text[..at].chars().count() as f64;
+        let c1 = c0 + w.chars().count() as f64;
+        pos = at + w.len();
+        out.push(Segment {
+            start: Ticks(seg.start.0 + (span * c0 / total) as i64),
+            end: Ticks(seg.start.0 + (span * c1 / total) as i64),
+            text: w.to_string(),
+            speaker: seg.speaker.clone(),
+            confidence: seg.confidence * 0.5,
+        });
+    }
+    out
+}
+
+/// How often each normalized word occurs across every transcript given —
+/// the corpus [`WordFilter::Unique`] measures rarity against.
+pub fn corpus_counts<'a>(all: impl IntoIterator<Item = &'a Vec<Segment>>) -> BTreeMap<String, usize> {
+    let mut c = BTreeMap::new();
+    for segs in all {
+        for s in segs {
+            for w in s.text.split_whitespace() {
+                let n = normalize(w);
+                if !n.is_empty() { *c.entry(n).or_insert(0) += 1; }
+            }
+        }
+    }
+    c
+}
+
+/// A transcript reduced to what `filter` keeps, ready for [`gutter_words`].
+///
+/// `All` returns the lines as they are. The other modes return one segment
+/// per kept word (or filler phrase) at its estimated time, so the gutter
+/// shows it where it is said rather than at the start of its line.
+pub fn filter_words(segments: &[Segment], filter: &WordFilter,
+                    corpus: &BTreeMap<String, usize>) -> Vec<Segment> {
+    match filter {
+        WordFilter::All => segments.to_vec(),
+        WordFilter::Filler => {
+            let mut out = Vec::new();
+            for seg in segments {
+                let words = words_of(seg);
+                let norm: Vec<String> = words.iter().map(|w| normalize(&w.text)).collect();
+                let mut i = 0;
+                while i < words.len() {
+                    // longest phrase first, so "you know" wins over nothing
+                    let hit = [2usize, 1].into_iter().find(|&n| {
+                        i + n <= words.len()
+                            && FILLERS.contains(&norm[i..i + n].join(" ").as_str())
+                    });
+                    match hit {
+                        Some(n) => {
+                            out.push(Segment {
+                                start: words[i].start, end: words[i + n - 1].end,
+                                text: words[i..i + n].iter().map(|w| w.text.as_str())
+                                    .collect::<Vec<_>>().join(" "),
+                                speaker: seg.speaker.clone(),
+                                confidence: words[i].confidence,
+                            });
+                            i += n;
+                        }
+                        None => i += 1,
+                    }
+                }
+            }
+            out
+        }
+        WordFilter::Unique => segments.iter().flat_map(words_of).filter(|w| {
+            let n = normalize(&w.text);
+            n.chars().count() >= 4
+                && !STOPWORDS.contains(&n.as_str())
+                && corpus.get(&n).copied().unwrap_or(0) <= 2
+        }).collect(),
+        WordFilter::Dictionary(set) => segments.iter().flat_map(words_of)
+            .filter(|w| set.contains(&normalize(&w.text))).collect(),
+    }
+}
+
+/// A dictionary file: one word per line, `#` comments, case-folded the way
+/// transcript words are, so "Gloria" in the list matches "gloria," in a line.
+pub fn parse_dictionary(text: &str) -> BTreeSet<String> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .map(normalize)
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
 /// A source's transcript plus its search index.
 #[derive(Debug, Clone)]
 pub struct Transcript {
@@ -534,5 +769,111 @@ mod tests {
         let a = rank(&entries, "command", 10);
         let b = rank(&entries, "command", 10);
         assert_eq!(a, b, "equal scores keep source order");
+    }
+}
+
+#[cfg(test)]
+mod gutter_tests {
+    use super::*;
+
+    const SRT: &str = "1\r\n00:00:00,000 --> 00:00:02,000\r\n Good morning, I'm Gloria.\r\n\r\n\
+2\n00:00:02,000 --> 00:00:04,500\nThis is Max.\n\n\
+garbage block with no timing\n\n\
+3\n00:00:05,000 --> 00:00:09,000\nYou will be with other kids and they will take care of you.\n";
+
+    #[test]
+    fn whisper_srt_parses_tolerantly() {
+        let s = parse_srt(SRT);
+        assert_eq!(s.len(), 3, "the untimed block is skipped, not fatal: {s:?}");
+        assert_eq!(s[0].text, "Good morning, I'm Gloria.");
+        assert_eq!(s[1].start, Ticks::from_seconds(2.0));
+        assert_eq!(s[1].end, Ticks::from_seconds(4.5));
+        assert_eq!(s[2].start, Ticks::from_seconds(5.0));
+        assert!(parse_srt("").is_empty() && parse_srt("nonsense").is_empty());
+    }
+
+    #[test]
+    fn zoomed_in_the_whole_line_shows_and_zoomed_out_only_occasional_words() {
+        let s = parse_srt(SRT);
+        // 100 px/s, 7 px per char: plenty of room
+        let wide = gutter_words(&s, Ticks::ZERO, Ticks::from_seconds(10.0), 100.0, 7.0, 40.0);
+        assert_eq!(wide.len(), 3);
+        assert_eq!(wide[0], (0.0, "Good morning, I'm Gloria.".to_string()));
+        // 8 px/s: the whole 10 s clip is 80 px — at most one or two labels,
+        // cut to whole words with an ellipsis, never overlapping
+        let narrow = gutter_words(&s, Ticks::ZERO, Ticks::from_seconds(10.0), 8.0, 7.0, 40.0);
+        assert!(!narrow.is_empty() && narrow.len() < 3, "{narrow:?}");
+        for w in narrow.windows(2) {
+            assert!(w[1].0 - w[0].0 >= 40.0, "labels keep their distance: {narrow:?}");
+        }
+        for (x, t) in &narrow {
+            assert!(x + t.chars().count() as f32 * 7.0 <= 80.0 + 7.0, "{t} overruns the clip");
+            assert!(!t.ends_with(|c: char| c.is_alphabetic()) || s.iter().any(|seg| seg.text.contains(t.as_str())),
+                    "no word is cut in half: {t}");
+        }
+    }
+
+    #[test]
+    fn a_trimmed_clip_shows_only_what_it_plays() {
+        let s = parse_srt(SRT);
+        // clip plays source 4.6..9.0: only the third line is inside it
+        let w = gutter_words(&s, Ticks::from_seconds(4.6), Ticks::from_seconds(4.4), 100.0, 7.0, 40.0);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].1.starts_with("You will be"));
+        assert!((w[0].0 - 40.0).abs() < 1.0, "placed where the line starts inside the clip: {}", w[0].0);
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    fn seg(a: f64, b: f64, text: &str) -> Segment {
+        Segment { start: Ticks::from_seconds(a), end: Ticks::from_seconds(b), text: text.into(),
+                  speaker: None, confidence: 1.0 }
+    }
+
+    #[test]
+    fn filler_mode_finds_the_junk_and_places_it_where_it_is_said() {
+        let s = vec![seg(0.0, 4.0, "So um I went to the uh audition, you know, and Gloria said")];
+        let f = filter_words(&s, &WordFilter::Filler, &BTreeMap::new());
+        let texts: Vec<&str> = f.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(texts, vec!["um", "uh", "you know,"], "phrases matched as phrases; 'so' is not junk");
+        // estimated positions are in order and inside the line
+        assert!(f.windows(2).all(|w| w[0].start < w[1].start));
+        assert!(f[0].start > Ticks::ZERO && f[2].end < Ticks::from_seconds(4.0));
+        assert!(f[0].confidence < 1.0, "an estimated word time says it is an estimate");
+        // Spanish fillers too
+        let es = filter_words(&[seg(0.0, 2.0, "Eh, o sea, este plano")], &WordFilter::Filler, &BTreeMap::new());
+        assert_eq!(es.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), vec!["Eh,", "o sea,", "este"]);
+    }
+
+    #[test]
+    fn unique_mode_keeps_the_rare_content_words() {
+        // "audition" three times: past the rarity bar of two occurrences
+        let a = vec![seg(0.0, 3.0, "the audition was great, the audition was long, another audition")];
+        let b = vec![seg(0.0, 3.0, "Gloria left Max with Sister Frances at the church")];
+        let corpus = corpus_counts([&a, &b]);
+        let ua: Vec<String> = filter_words(&a, &WordFilter::Unique, &corpus).iter().map(|w| w.text.clone()).collect();
+        assert_eq!(ua, vec!["great,", "long,", "another"], "a word said three times is not unique");
+        let ub: Vec<String> = filter_words(&b, &WordFilter::Unique, &corpus).iter().map(|w| w.text.clone()).collect();
+        assert!(ub.contains(&"Gloria".to_string()) && ub.contains(&"Frances".to_string()), "{ub:?}");
+        assert!(!ub.iter().any(|w| w == "the" || w == "with" || w == "at"), "stopwords and short words go: {ub:?}");
+    }
+
+    #[test]
+    fn dictionary_mode_shows_only_listed_words_whatever_their_case() {
+        let dict = parse_dictionary("# characters\nGloria\nMax  # the lead\n\nsister frances\n");
+        assert!(dict.contains("gloria") && dict.contains("max"));
+        let s = vec![seg(0.0, 3.0, "Hi MAX, I'm gloria.")];
+        let got: Vec<String> = filter_words(&s, &WordFilter::Dictionary(dict), &BTreeMap::new())
+            .iter().map(|w| w.text.clone()).collect();
+        assert_eq!(got, vec!["MAX,", "gloria."]);
+    }
+
+    #[test]
+    fn all_mode_is_the_lines_untouched() {
+        let s = vec![seg(0.0, 3.0, "um hello there")];
+        assert_eq!(filter_words(&s, &WordFilter::All, &BTreeMap::new()), s);
     }
 }

@@ -60,6 +60,15 @@ pub struct WorkspaceState {
     /// "kes (phone)" vs "kes", and the sidecar is exactly the file that
     /// distinction lives in. Empty means "site N", never an error.
     pub display_name: String,
+    /// Where the sound and picture libraries live, as the GUI set them.
+    /// Empty means "whatever the environment said" (`STUDIO_LIBRARY` /
+    /// `STUDIO_VIDEO_LIB`), so an existing launcher script keeps working
+    /// and a person who never opens Settings sees no change. Per device,
+    /// like everything else here: two machines editing one project do not
+    /// have the sample drive mounted in the same place, and putting this in
+    /// the project would break exactly that.
+    pub library_audio: String,
+    pub library_video: String,
 }
 
 impl Default for WorkspaceState {
@@ -73,14 +82,15 @@ impl Default for WorkspaceState {
                          voice_domains: "common,instruments".into(),
                          library_open: true, display_name: String::new(),
                          rebinds: String::new(), piano_zones: String::new(),
-                         overlap: "trim".into(), overlap_tracks: String::new() }
+                         overlap: "trim".into(), overlap_tracks: String::new(),
+                         library_audio: String::new(), library_video: String::new() }
     }
 }
 
 impl WorkspaceState {
     pub fn encode(&self) -> String {
         format!("# per-device layout; safe to delete, never load-bearing\n\
-                 combined={}\npanel={}\nside_slot={}\npx_per_sec={}\nscroll_ticks={}\nclosed_groups={}\nbounce_format={}\npinned={}\ndemoted={}\nvoice_domains={}\nlibrary_open={}\ndisplay_name={}\nrebinds={}\npiano_zones={}\noverlap={}\noverlap_tracks={}\n",
+                 combined={}\npanel={}\nside_slot={}\npx_per_sec={}\nscroll_ticks={}\nclosed_groups={}\nbounce_format={}\npinned={}\ndemoted={}\nvoice_domains={}\nlibrary_open={}\ndisplay_name={}\nrebinds={}\npiano_zones={}\noverlap={}\noverlap_tracks={}\nlibrary_audio={}\nlibrary_video={}\n",
                 self.combined, self.panel, self.side_slot,
                 self.px_per_sec, self.scroll_ticks,
                 self.closed_groups.iter().map(|g| g.to_string())
@@ -92,7 +102,8 @@ impl WorkspaceState {
                 self.pinned.join("\t"),
                 self.demoted.join("\t"),
                 self.voice_domains, self.library_open, self.display_name,
-                self.rebinds, self.piano_zones, self.overlap, self.overlap_tracks)
+                self.rebinds, self.piano_zones, self.overlap, self.overlap_tracks,
+                self.library_audio, self.library_video)
     }
     /// Parse leniently: defaults underneath, known keys on top, everything
     /// else ignored. There is no error case ON PURPOSE.
@@ -126,6 +137,11 @@ impl WorkspaceState {
                 "piano_zones" => w.piano_zones = v.trim().to_string(),
                 "overlap" => w.overlap = v.trim().to_string(),
                 "overlap_tracks" => w.overlap_tracks = v.trim().to_string(),
+                // Not trimmed the way the tokens above are: a path may end
+                // in a space on some filesystems, and silently editing
+                // someone's path is worse than carrying an odd one.
+                "library_audio" => w.library_audio = v.trim_end_matches(['\r', '\n']).to_string(),
+                "library_video" => w.library_video = v.trim_end_matches(['\r', '\n']).to_string(),
                 _ => {} // a newer build's key, not our business
             }
         }
@@ -233,7 +249,11 @@ mod tests {
             voice_domains: "trap,film".into(),
             library_open: false, display_name: "kes".into(),
             rebinds: "44>46,107>100".into(), piano_zones: "97>0,115>0".into(),
-            overlap: "lane".into(), overlap_tracks: "3:refuse".into() };
+            overlap: "lane".into(), overlap_tracks: "3:refuse".into(),
+            // A path with a space and a comma in it, because sample drives
+            // have both and the sidecar must not tidy them away.
+            library_audio: "/Volumes/Sound Library/packs, 2019".into(),
+            library_video: "/Volumes/Footage/A Fragile Thing".into() };
         assert_eq!(WorkspaceState::decode(&w.encode()), w);
         // A newer build's key rides along harmlessly; garbage lines too.
         let with_future = format!("{}\nfuture_key=whatever\n<<<garbage", w.encode());

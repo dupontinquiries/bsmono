@@ -222,6 +222,20 @@ pub fn place(order: &[Vec<usize>], n: usize, dir: FlowDirection) -> Vec<Placed> 
 }
 
 /// The whole pipeline.
+/// PRECONDITION: every index in `succ` is `< succ.len()`. An out-of-range edge
+/// panics.
+///
+/// Probed rather than assumed: empty, single, self-loop, 2- and 3-cycles,
+/// disconnected components, five isolated nodes, duplicate edges and an 8-chain
+/// all lay out with every node placed, no NaN, and NO two nodes overlapping. The
+/// out-of-range edge is the one input that fails.
+///
+/// It is left as a precondition rather than guarded because the one caller
+/// (the drawn graph in the binary) already builds `succ` from `idx.get(..)` on
+/// both endpoints and skips an edge unless both resolve -- so a link to a
+/// deleted note never reaches here. A second filter would be dead code
+/// defending a door that is already shut; a NEW caller is where this line
+/// needs reading.
 pub fn layout(succ: &[Vec<usize>], dir: FlowDirection) -> Vec<Placed> {
     let n = succ.len();
     if n == 0 { return Vec::new(); }
@@ -381,4 +395,5 @@ mod tests {
         assert!(p[3].y > p[1].y);
         assert!((p[1].x - p[2].x).abs() > 1.0, "branches on top of each other");
     }
+
 }

@@ -61,6 +61,43 @@ pub mod provenance;
 /// Dual-system sound: aligning a separately-recorded take to picture by the clap. Pure.
 pub mod slate;
 pub mod slate_ocr;
+/// The slate as SPOKEN: scene/shot/take from a transcript's head, into `slate_ocr::Board`.
+pub mod spoken_slate;
+/// A tiny deterministic shoot (camera takes + recorder files) for tests, here and downstream.
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
+/// Warp stabilization: measure the camera path once, solve it per flavour (still/smooth/dejerk/track).
+pub mod stabilize;
+/// Touch-up: a ticket for one shot becomes a fixed version of it, with handles and a report.
+pub mod touchup;
+/// Reverse-engineer an edit: its cuts, short transitions and fades.
+pub mod cuts;
+/// Operator signal lanes: weighted inputs, hard marks, cut candidates that say why.
+pub mod signals;
+#[cfg(test)]
+mod abundance_tests;
+/// Particles: dirt, dust and smoke, deterministic and driven by audio.
+pub mod particles;
+/// Match-move rig: track points sharing one rigid transform, surviving points that disappear.
+pub mod tracker;
+/// Clip style transfer: fit one clip's look onto another, baked into a 3D LUT for live use.
+pub mod style;
+/// Cut on action: the performer's movement accents within a shot, camera motion cancelled.
+pub mod action;
+/// Comic: an auto-mode layout planner and a page compositor (wide, page, inset, split).
+pub mod comic;
+/// Kaleidoscope clip effect: one formula for the preview (Rust) and the export (ffmpeg geq).
+pub mod kaleido;
+/// Temporal clean plate: remove something that passes through a shot, using the frames around it.
+pub mod cleanplate;
+/// Frames out of ffmpeg, through Rust, back into ffmpeg: the one place per-frame pixel work happens.
+pub mod framepipe;
+/// Multiview grid geometry: tiles that cover the canvas exactly, and what they cost in detail.
+pub mod grid;
+/// Multicam: cut between synced angles from a control channel's level and/or beats.
+pub mod multicam;
+/// Many camera takes against many recorder files: which sound is whose, by listening.
+pub mod dualsync;
 /// The timeline's video clips cut into one mp4 over the mixdown — ffmpeg's edit list.
 pub mod edit;
 

@@ -123,6 +123,18 @@ pub struct TouchPad {
     /// screen size in shorter-side units (see `layout`)
     pub extent: Vec2,
     pub scale: f32,
+    /// What a lift does to the look. Copied from settings each frame by app.rs,
+    /// like `enabled` and `scale` beside it.
+    pub glide: crate::glide::Glide,
+    /// The carried look after a lift, and the velocity to launch it with.
+    coast: crate::glide::Coast,
+    /// Look velocity of the steering finger, smoothed over recent frames.
+    ///
+    /// Smoothed because the velocity on the LAST frame before a lift is the
+    /// noisiest one: the finger decelerates and often jitters as it leaves the
+    /// glass. Launching from that single frame gives a glide that is sometimes
+    /// half the flick and sometimes double it.
+    look_vel: Vec2,
     fingers: Vec<Finger>,
     stick: Option<(u64, Vec2, Vec2)>, // id, origin, pos
     edges: Vec<Btn>,
@@ -163,6 +175,9 @@ impl TouchPad {
             enabled: false,
             extent: Vec2::new(16.0 / 9.0, 1.0),
             scale: 1.0,
+            glide: crate::glide::Glide::default(),
+            coast: crate::glide::Coast::new(),
+            look_vel: Vec2::ZERO,
             fingers: Vec::new(),
             stick: None,
             edges: Vec::new(),
@@ -210,6 +225,10 @@ impl TouchPad {
 
     /// A finger touched down at `p` (normalized, y down).
     pub fn down(&mut self, id: u64, p: Vec2) {
+        // ANY new contact ends a glide -- including one landing on an ability
+        // button, which is the whole flick-then-reach gesture. The view
+        // stopping as the thumb lands is the intended end of it.
+        self.coast.stop();
         let btn = self.hit(p);
         let mut on_stick = false;
         if btn.is_none() && p.x < self.extent.x * 0.42 && self.stick.is_none() {
@@ -249,6 +268,13 @@ impl TouchPad {
 
     pub fn up(&mut self, id: u64) {
         if let Some(f) = self.fingers.iter().find(|f| f.id == id).copied() {
+            // Only the STEERING finger glides. A stick thumb or a button press
+            // lifting is not a flick of the view, and launching a coast from
+            // one would swing the camera when a player lets go of an ability.
+            if !f.on_stick && f.btn.is_none() {
+                self.coast.launch((self.look_vel.x, self.look_vel.y), self.glide);
+                self.look_vel = Vec2::ZERO;
+            }
             if let Some(Btn::Ability(i)) = f.btn {
                 if self.drag_capable.get(i).copied().unwrap_or(false) {
                     let d = f.pos - f.start; // screen space, y down
@@ -277,6 +303,20 @@ impl TouchPad {
     /// purposes, matching how the stick already claims the left third).
     pub fn tick(&mut self, dt: f32) {
         self.now_ms += (dt * 1000.0) as f64;
+        // `look` holds this whole frame's steering delta at this point: moves
+        // arrive before tick, and `end_frame` clears it after `resolve` reads
+        // it. So look/dt is this frame's velocity.
+        let steering = self.fingers.iter().any(|f| !f.on_stick && f.btn.is_none());
+        if steering && dt > 0.0 {
+            let v = self.look / dt;
+            // Exponential smoothing over ~3 frames. The final frame before a
+            // lift is the noisiest, and launching from it alone gives a glide
+            // that is sometimes half the flick and sometimes double.
+            self.look_vel = self.look_vel.lerp(v, 0.4);
+        } else if !steering {
+            let (dx, dy) = self.coast.tick(dt, self.glide);
+            self.look += Vec2::new(dx, dy);
+        }
         let touches: Vec<TkTouch> = self
             .fingers
             .iter()
@@ -368,6 +408,73 @@ impl TouchPad {
 
 #[cfg(test)]
 mod tests {
+    /// Steer with an open-area finger for a few frames, then lift. Returns the
+    /// look accumulated on each frame AFTER the lift.
+    fn flick_then_lift(glide: crate::glide::Glide, frames_after: usize) -> Vec<Vec2> {
+        let mut t = TouchPad::new();
+        t.extent = Vec2::new(1.78, 1.0);
+        t.glide = glide;
+        let dt = 1.0 / 60.0;
+        // Right-hand open area: not the stick (x < 0.42 * extent), not a button.
+        let start = Vec2::new(1.2, 0.35);
+        t.down(1, start);
+        t.end_frame();
+        for i in 1..=6 {
+            t.moved(1, start + Vec2::new(0.02 * i as f32, 0.0));
+            t.tick(dt);
+            t.end_frame();
+        }
+        t.up(1);
+        let mut out = Vec::new();
+        for _ in 0..frames_after {
+            t.tick(dt);
+            out.push(t.look);
+            t.end_frame();
+        }
+        out
+    }
+
+    /// THE PLUMBING, not the curve -- `glide`'s own tests cover the decay.
+    /// This proves a lift through the real TouchPad actually carries the view.
+    #[test]
+    fn a_smooth_flick_keeps_steering_after_the_finger_lifts() {
+        let after = flick_then_lift(crate::glide::Glide::Smooth, 5);
+        assert!(after[0].x > 0.0, "the view must still move on the next frame: {after:?}");
+        assert!(after[0].x > after[4].x, "and slow down: {after:?}");
+    }
+
+    /// RIGID IS TODAY'S BEHAVIOUR EXACTLY, through the real pad.
+    #[test]
+    fn a_rigid_lift_stops_the_view_dead() {
+        let after = flick_then_lift(crate::glide::Glide::Rigid, 5);
+        assert!(after.iter().all(|v| *v == Vec2::ZERO), "{after:?}");
+    }
+
+    /// The flick-then-reach gesture: a new finger landing ends the glide, so
+    /// the view stops as the thumb arrives on the button.
+    #[test]
+    fn a_new_touch_ends_the_glide() {
+        let mut t = TouchPad::new();
+        t.extent = Vec2::new(1.78, 1.0);
+        t.glide = crate::glide::Glide::Smooth;
+        let dt = 1.0 / 60.0;
+        let s = Vec2::new(1.2, 0.35);
+        t.down(1, s);
+        t.end_frame();
+        for i in 1..=6 {
+            t.moved(1, s + Vec2::new(0.02 * i as f32, 0.0));
+            t.tick(dt);
+            t.end_frame();
+        }
+        t.up(1);
+        t.tick(dt);
+        assert!(t.look.x > 0.0, "gliding before the second touch");
+        t.end_frame();
+        t.down(2, Vec2::new(1.5, 0.8));
+        t.tick(dt);
+        assert_eq!(t.look, Vec2::ZERO, "a fresh contact must stop the coast");
+    }
+
     /// The leap button must not steal taps from an old one. Hit radii are the
     /// ones `hit` uses (1.15x), on a landscape phone and a portrait one.
     #[test]

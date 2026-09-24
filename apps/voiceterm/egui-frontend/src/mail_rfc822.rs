@@ -28,14 +28,11 @@
 //!
 //! Unfolding, `From`/`To`/`Subject`/`Date`/`Message-ID`, the blank line that
 //! ends the headers, and mbox's `From ` separator. Not implemented: MIME
-//! multipart, transfer encodings, address group syntax. Each of those is a
-//! real thing a real mail file contains, and every one of them degrades to
-//! "shown as written" rather than to a parse failure.
-//!
-//! RFC 2047 encoded words (`=?utf-8?B?…?=`) in Subject, From and To ARE
-//! decoded ([`decode_words`]): B and Q encodings, UTF-8, US-ASCII,
-//! ISO-8859-1 and Windows-1252. Anything else (another charset, a malformed
-//! word) stays as written, the same degrade-to-readable rule.
+//! multipart, transfer encodings, RFC 2047 encoded words, address group
+//! syntax. Each of those is a real thing a real mail file contains, and
+//! every one of them degrades to "shown as written" rather than to a parse
+//! failure — an encoded subject displays as `=?utf-8?B?…?=`, which is ugly
+//! and readable, where refusing the message would lose it.
 //!
 //! ## Dates
 //!
@@ -103,30 +100,6 @@ fn headers_and_body(text: &str) -> (Vec<(String, String)>, String) {
 
 fn header<'a>(h: &'a [(String, String)], name: &str) -> &'a str {
     h.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str()).unwrap_or("")
-}
-
-/// Parse one message.
-pub fn parse_message(text: &str) -> Parsed {
-    let (h, body) = headers_and_body(text);
-    // `References` before `In-Reply-To`: the first entry of References is
-    // the thread ROOT, while In-Reply-To is the immediate parent. Threading
-    // on the parent builds a chain that splits whenever one message in the
-    // middle is missing, which is common.
-    let refs = header(&h, "references");
-    let root = refs.split_whitespace().next().unwrap_or("").to_string();
-    Parsed {
-        message_id: header(&h, "message-id").to_string(),
-        from: decode_words(header(&h, "from")),
-        to: decode_words(header(&h, "to")),
-        subject: decode_words(header(&h, "subject")),
-        date: header(&h, "date").to_string(),
-        in_reply_to: if root.is_empty() {
-            header(&h, "in-reply-to").to_string()
-        } else {
-            root
-        },
-        body,
-    }
 }
 
 /// Decode RFC 2047 encoded words in a header value.
@@ -314,6 +287,32 @@ fn decode_charset(charset: &str, b: &[u8]) -> Option<String> {
             })
             .collect(),
         _ => None,
+    }
+}
+
+/// Parse one message.
+pub fn parse_message(text: &str) -> Parsed {
+    let (h, body) = headers_and_body(text);
+    // `References` before `In-Reply-To`: the first entry of References is
+    // the thread ROOT, while In-Reply-To is the immediate parent. Threading
+    // on the parent builds a chain that splits whenever one message in the
+    // middle is missing, which is common.
+    let refs = header(&h, "references");
+    let root = refs.split_whitespace().next().unwrap_or("").to_string();
+    Parsed {
+        message_id: header(&h, "message-id").to_string(),
+        // DECODED: see `decode_words`. Without it any non-ASCII subject or
+        // sender name rendered as raw `=?UTF-8?B?...?=`.
+        from: decode_words(header(&h, "from")),
+        to: decode_words(header(&h, "to")),
+        subject: decode_words(header(&h, "subject")),
+        date: header(&h, "date").to_string(),
+        in_reply_to: if root.is_empty() {
+            header(&h, "in-reply-to").to_string()
+        } else {
+            root
+        },
+        body,
     }
 }
 
@@ -797,6 +796,74 @@ References: <abc@example.com>\n\nagreed\n");
         assert_eq!(m[0].time, 0);
     }
 
+
+#[cfg(test)]
+mod encoded_word_tests {
+    use super::*;
+
+    /// THE BUG. A French subject arrived as raw base64 in the list.
+    #[test]
+    fn a_base64_utf8_subject_is_decoded() {
+        assert_eq!(decode_words("=?UTF-8?B?w6l0w6k=?="), "été");
+        let m = parse_message("Subject: =?UTF-8?B?w6l0w6k=?=\nFrom: a@b.c\n\nb\n");
+        assert_eq!(m.subject, "été");
+    }
+
+    #[test]
+    fn q_encoding_decodes_hex_and_underscore_spaces() {
+        assert_eq!(decode_words("=?ISO-8859-1?Q?Caf=E9_ouvert?="), "Café ouvert");
+    }
+
+    /// THE WHITESPACE RULE: a long subject is split into several words, and the
+    /// space BETWEEN them is dropped, or "hello" renders as "hel lo".
+    #[test]
+    fn whitespace_between_encoded_words_is_dropped() {
+        // "hel" + "lo", as two adjacent B-words.
+        assert_eq!(decode_words("=?UTF-8?B?aGVs?= =?UTF-8?B?bG8=?="), "hello");
+    }
+
+    /// ...but whitespace between a word and ORDINARY text is kept.
+    #[test]
+    fn whitespace_next_to_plain_text_is_kept() {
+        assert_eq!(decode_words("Re: =?UTF-8?B?w6l0w6k=?= plans"), "Re: été plans");
+    }
+
+    /// A sender's display name is decoded too, not just the subject.
+    #[test]
+    fn an_encoded_sender_name_is_decoded() {
+        let m = parse_message("From: =?UTF-8?B?w4lsaXNl?= <e@x.y>\nSubject: s\n\nb\n");
+        assert!(m.from.starts_with("Élise"), "{}", m.from);
+    }
+
+    /// AN UNKNOWN CHARSET IS LEFT RAW rather than decoded as UTF-8 into
+    /// mojibake: a visible raw word says "undecoded", a garbled one lies about
+    /// what they wrote.
+    #[test]
+    fn an_unsupported_charset_is_left_as_it_was() {
+        let raw = "=?KOI8-R?B?5M/C0s/F?=";
+        assert_eq!(decode_words(raw), raw);
+    }
+
+    /// Plain ASCII and malformed input pass through unharmed.
+    #[test]
+    fn plain_and_malformed_headers_are_untouched() {
+        assert_eq!(decode_words("Just a subject"), "Just a subject");
+        assert_eq!(decode_words("a =? not a word"), "a =? not a word");
+        assert_eq!(decode_words("=?UTF-8?X?bad?="), "=?UTF-8?X?bad?=");
+        assert_eq!(decode_words(""), "");
+    }
+
+    /// Invalid base64 or invalid UTF-8 inside a word must not panic.
+    #[test]
+    fn corrupt_payloads_do_not_panic() {
+        let _ = decode_words("=?UTF-8?B?!!!!?=");
+        let _ = decode_words("=?UTF-8?B?/w==?="); // 0xFF: not UTF-8
+        let _ = decode_words("=?UTF-8?Q?=Z?=");   // bad hex
+        let _ = decode_words("=?UTF-8?Q?=?=");    // truncated escape
+    }
+}
+
+    // ── From the c20 session's own RFC 2047 decoder, kept as tests of this one ──
     #[test]
     fn encoded_words_decode_in_both_encodings_and_common_charsets() {
         assert_eq!(decode_words("=?utf-8?B?SGVsbG8gd8O2cmxk?="), "Hello wörld");

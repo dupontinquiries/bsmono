@@ -68,12 +68,61 @@ pub const SCREEN_X: f32 = 9.6;
 /// Hollow, and out into the jungle behind the far tower line -- so a door
 /// every few units left more gap than screen, and a screen that is mostly
 /// gap hides nobody. This gives two hidden stretches of ~12 u a side.
-pub const DOORS: [f32; 0] = [];
+///
+/// THE ARRAY WAS EMPTY. The doc above says "ONE, in the middle" and the
+/// declaration was `[f32; 0]` -- so `reserved`'s `in_door` term could never be
+/// true, the scatter was free to fill the screen line end to end, and the run
+/// was reachable only from its two ends. Reported as a middle that is "very
+/// tight and unpathable", which is exactly what a sealed corridor plays like.
+///
+/// Placed at the midpoint of the run's z span, which is what "in the middle"
+/// meant: the two hidden stretches either side come out at ~11u each, matching
+/// the ~12 the comment above claims.
+pub const DOORS: [f32; 1] = [(RUN_Z.0 + RUN_Z.1) * 0.5];
 pub const DOOR_HALF: f32 = 2.4;
 
 /// Is `(x, z)` ground the scatter must leave alone? The run floors, the
 /// doorways, and the Hollow — so a random jungle tree cannot wall off a
 /// corridor that the whole design depends on being open.
+/// Half-width of a lane-to-lane connector, in world units.
+///
+/// 3.2: wide enough for two cats to pass without one shoving the other into a
+/// tree, narrow enough to still read as a jungle trail rather than a fourth
+/// lane. A corridor a player mistakes for a lane is a corridor they expect
+/// minions to walk down.
+pub const LINK_HALF_WIDTH: f32 = 3.2;
+
+/// Where the connectors cross, as |z|. Mirrored to both halves of the map.
+///
+/// Two per side, at the quarter points between the river and the tower line,
+/// so a rotation from mid to a side lane does not have to go all the way back
+/// through the Hollow — which is what makes the middle play as a dead end.
+pub const LINKS_Z: [f32; 2] = [26.0, 46.0];
+
+/// The x span a connector covers: from just outside the run to just short of
+/// the side lane's own keep-out.
+///
+/// Stops at 50 rather than 58 because `lane_clearance` already protects the
+/// lane itself; running the reservation into it would carve a permanent notch
+/// in the lane's tree line and make the junction obvious from the lane.
+pub const LINK_X: (f32, f32) = (RUN_X + 2.0, 50.0);
+
+/// Is `(x, z)` on a lane-to-lane connector?
+///
+/// THERE WERE NO CROSS-PATHS. The runs go from the Hollow outward and end in
+/// the jungle behind the tower line; the side lanes are at x = ±58. That left
+/// 42u of unreserved jungle between them, so whether a route from mid to a
+/// side lane existed at all depended on where the scatter happened to drop
+/// trees — which is the "no clear path from one lane to the next" that was
+/// reported.
+pub fn on_link(x: f32, z: f32) -> bool {
+    let (ax, az) = (x.abs(), z.abs());
+    if ax < LINK_X.0 || ax > LINK_X.1 {
+        return false;
+    }
+    LINKS_Z.iter().any(|l| (az - l).abs() < LINK_HALF_WIDTH)
+}
+
 pub fn reserved(x: f32, z: f32) -> bool {
     if x.hypot(z) < HOLLOW_RADIUS {
         return true;
@@ -84,7 +133,7 @@ pub fn reserved(x: f32, z: f32) -> bool {
     // The screen's own strip too: scatter landing ON the screen line would
     // plug doorways from the side.
     let on_screen = (ax - SCREEN_X).abs() < 2.4 && az > RUN_Z.0 - 2.0 && az < RUN_Z.1 + 2.0;
-    in_run || in_door || on_screen
+    in_run || in_door || on_screen || on_link(x, z)
 }
 
 /// The authored half, for z >= 0 (toward Red). [`layout`] mirrors it.
@@ -326,4 +375,85 @@ mod tests {
             assert!(reserved(p.x, p.z) || p.x.abs() > RUN_X, "{:?} at ({}, {}) is authored on unreserved ground, where scatter may land on it", p.kind, p.x, p.z);
         }
     }
+
+#[cfg(test)]
+mod pathing_tests {
+    use super::*;
+
+    /// THE DOOR ARRAY WAS EMPTY. `in_door` could never be true, so the screen
+    /// was solid end to end and the run was reachable only from its two ends.
+    #[test]
+    fn the_screen_has_a_doorway() {
+        assert!(!DOORS.is_empty(), "a screen with no door seals the run");
+        let z = DOORS[0];
+        // On the screen line, at the door: reserved, so scatter keeps off it.
+        assert!(reserved(SCREEN_X, z), "the doorway must be kept clear");
+        assert!(reserved(-SCREEN_X, -z), "and mirrored");
+    }
+
+    /// The door sits INSIDE the run, with screen either side of it.
+    ///
+    /// My first version of this asserted that the screen line away from the
+    /// door is NOT reserved -- and it is, deliberately: `on_screen` reserves
+    /// the whole line so scatter cannot plug a doorway from the side. The
+    /// screen is built geometry, not scatter, so "reserved" here means "the
+    /// random trees keep off", not "it is walkable". Asserting the position
+    /// instead, which is what the door actually has to get right.
+    #[test]
+    fn the_door_sits_inside_the_run_with_screen_either_side() {
+        let z = DOORS[0];
+        assert!(z > RUN_Z.0 && z < RUN_Z.1, "the door must be on the run");
+        let near = z - DOOR_HALF - RUN_Z.0;
+        let far = RUN_Z.1 - (z + DOOR_HALF);
+        assert!(near > 3.0 && far > 3.0, "screen either side: {near} / {far}");
+        assert!((near - far).abs() < 1.0, "and centred: {near} vs {far}");
+    }
+
+    /// THERE WERE NO CROSS-PATHS. 42u of unreserved jungle sat between the
+    /// runs and the side lanes, so a route from mid to a side lane existed
+    /// only if the scatter happened not to fill it.
+    #[test]
+    fn a_connector_spans_from_the_run_to_the_side_lane() {
+        let z = LINKS_Z[0];
+        assert!(on_link(RUN_X + 3.0, z), "starts just outside the run");
+        assert!(on_link(48.0, z), "and reaches out to the lane's own keep-out");
+        assert!(reserved(30.0, z), "so the scatter leaves it alone");
+    }
+
+    /// Mirrored into all four quadrants, or one side of the map plays
+    /// differently from the other.
+    #[test]
+    fn the_connectors_are_mirrored() {
+        let z = LINKS_Z[1];
+        for (sx, sz) in [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+            assert!(on_link(30.0 * sx, z * sz), "quadrant {sx},{sz}");
+        }
+    }
+
+    /// A TRAIL, NOT A FOURTH LANE. A corridor a player reads as a lane is one
+    /// they expect minions to walk down.
+    #[test]
+    fn a_connector_is_narrower_than_a_lane_corridor() {
+        let z = LINKS_Z[0];
+        assert!(on_link(30.0, z), "on the centre line");
+        assert!(!on_link(30.0, z + LINK_HALF_WIDTH + 0.1), "and not far off it");
+        assert!(LINK_HALF_WIDTH < RUN_HALF_WIDTH * 2.0, "still a trail");
+    }
+
+    /// The connectors must not run into the lane's own protected strip, or
+    /// they carve a permanent notch in its tree line.
+    #[test]
+    fn a_connector_stops_short_of_the_lane_itself() {
+        let z = LINKS_Z[0];
+        assert!(!on_link(58.0, z), "the side lane's centre is not a connector");
+        assert!(LINK_X.1 < 58.0 - 5.0, "with room between");
+    }
+
+    /// The Hollow is still open -- the connectors must not have replaced it.
+    #[test]
+    fn the_hollow_is_still_reserved() {
+        assert!(reserved(0.0, 0.0));
+        assert!(reserved(HOLLOW_RADIUS - 1.0, 0.0));
+    }
+}
 }

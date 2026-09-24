@@ -7,6 +7,9 @@ description = "The runnable Studio: an eframe shell that wires the timeline, tra
 [[bin]]
 name = "studio"
 path = "src/main.rs"
+# the binary IS the window: a --no-default-features build (the demo-project
+# examples, headless tools) skips it instead of failing on it
+required-features = ["app"]
 
 [dependencies]
 studio-core = { path = "../studio-core" }

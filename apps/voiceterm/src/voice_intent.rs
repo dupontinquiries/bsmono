@@ -1285,31 +1285,51 @@ fn normalize_natural_language(text: &str) -> String {
 ///   "kessler here"             → ""             (active=Kessler, no command)
 ///   "find here in this page"   → unchanged       (no name+here pattern)
 ///   "bob, here, list files"    → unchanged       (Bob not registered)
-fn strip_floor_claim_prefix(text: &str) -> String {
+/// The pure half of floor-claim stripping: split `"<name>, here, <cmd>"`
+/// against a list of registered names.
+///
+/// Returns `Some((speaker, remainder))` when the utterance opens with a
+/// registered name followed by "here", else `None`.
+///
+/// EXTRACTED SO THE POSITIVE CASES CAN BE TESTED. The wrapper below reads the
+/// global speaker registry AND writes to it (`note_active`), so its own tests
+/// could only cover the early-return negatives; the three positive cases were
+/// `#[ignore]`d with a note to "register 'Test' as a speaker via the UI" first.
+/// They had never run in any automated build. Taking the names as an argument
+/// makes every case deterministic and leaves the side effects where they were.
+///
+/// Behaviour is unchanged, deliberately including the remainder being re-joined
+/// with single spaces -- the original did that too, and "fixing" it here would
+/// silently change what the Qt app hands to the command parser.
+fn split_floor_claim(text: &str, names: &[String]) -> Option<(String, String)> {
     // The text is already lowercased by parse() before this is called.
     // Speakers are stored case-preserved; we lowercase the names for
     // comparison.
     let words: Vec<&str> = text.split_whitespace().collect();
-    if words.len() < 2 { return text.to_string(); }
+    if words.len() < 2 { return None; }
 
     // First token: strip trailing punctuation we accept after the name.
     let name_token = words[0].trim_end_matches(&[',', ':', ';'][..]);
-    if name_token.is_empty() { return text.to_string(); }
+    if name_token.is_empty() { return None; }
 
     // Second token: must be "here" or "here," (the "here" with trailing
     // comma is common in whisper transcription of "<name>, here, ...").
     let here_token = words[1].trim_end_matches(&[',', ':'][..]);
-    if here_token != "here" { return text.to_string(); }
+    if here_token != "here" { return None; }
 
-    // Look up the name in the speaker registry. Case-insensitive match.
-    let registered = crate::speakers::list();
-    let matched_name = registered.iter()
-        .find(|(n, _)| n.to_lowercase() == name_token)
-        .map(|(n, _)| n.clone());
+    // Case-insensitive match against the registered names.
+    let speaker = names.iter().find(|n| n.to_lowercase() == name_token)?.clone();
 
-    let Some(speaker_name) = matched_name else {
-        // Unknown name — leave the prefix in place. The regular parser
-        // will treat it as a normal utterance.
+    // The remainder may be empty (just "<name>, here." -- claim with no command).
+    let rest = if words.len() == 2 { String::new() } else { words[2..].join(" ") };
+    Some((speaker, rest))
+}
+
+fn strip_floor_claim_prefix(text: &str) -> String {
+    let names: Vec<String> = crate::speakers::list().into_iter().map(|(n, _)| n).collect();
+    let Some((speaker_name, rest)) = split_floor_claim(text, &names) else {
+        // Unknown name or no claim -- leave the text in place. The regular
+        // parser will treat it as a normal utterance.
         return text.to_string();
     };
 
@@ -1317,16 +1337,8 @@ fn strip_floor_claim_prefix(text: &str) -> String {
     // before downstream identification, so this overrides whatever
     // the acoustic matcher would have picked.
     crate::speakers::note_active(&speaker_name);
-    crate::clog!("floor-claim", "explicit speaker={} stripped \"{} {}\"",
-              speaker_name, words[0], words[1]);
-
-    // Return the rest of the text. The remainder may be empty (just
-    // "<name>, here." — claim with no command).
-    if words.len() == 2 {
-        String::new()
-    } else {
-        words[2..].join(" ")
-    }
+    crate::clog!("floor-claim", "explicit speaker={} stripped claim prefix", speaker_name);
+    rest
 }
 
 /// v0.1.390: reject names that would confuse the workspace
@@ -3805,37 +3817,55 @@ mod floor_claim_tests {
         );
     }
 
-    // The positive cases below WILL only work if a matching speaker is
-    // registered in the live registry. We can't cleanly mock that,
-    // so leave them as #[ignore] documentation tests — run them
-    // manually after registering "Test" as a speaker via the UI:
-    //
-    //   cargo test --features voice -- --ignored floor_claim
-    //
-    // If you register "Test" first, all three should pass.
+    // THE POSITIVE CASES, NOW RUN EVERY TIME. These three were `#[ignore]`d
+    // with a note to register "Test" as a speaker through the UI and run them
+    // by hand -- because `strip_floor_claim_prefix` reads the global registry.
+    // They had never run in any automated build. They test the pure
+    // `split_floor_claim` directly, handing it the registered names.
+    fn registered() -> Vec<String> { vec!["Test".to_string()] }
+
     #[test]
-    #[ignore]
     fn strip_basic_comma_form() {
         assert_eq!(
-            strip_floor_claim_prefix("test, here, run dust"),
-            "run dust"
+            super::split_floor_claim("test, here, run dust", &registered()),
+            Some(("Test".to_string(), "run dust".to_string()))
         );
     }
 
     #[test]
-    #[ignore]
     fn strip_no_comma_form() {
         assert_eq!(
-            strip_floor_claim_prefix("test here run dust"),
-            "run dust"
+            super::split_floor_claim("test here run dust", &registered()),
+            Some(("Test".to_string(), "run dust".to_string()))
         );
     }
 
     #[test]
-    #[ignore]
     fn strip_with_no_command() {
-        assert_eq!(strip_floor_claim_prefix("test, here"), "");
-        assert_eq!(strip_floor_claim_prefix("test here"), "");
+        assert_eq!(super::split_floor_claim("test, here", &registered()),
+                   Some(("Test".to_string(), String::new())));
+        assert_eq!(super::split_floor_claim("test here", &registered()),
+                   Some(("Test".to_string(), String::new())));
+    }
+
+    /// The case the ignore note could never exercise without a UI: a name that
+    /// is NOT registered must not be stripped, or any utterance starting
+    /// "<word> here" would lose its first two words.
+    #[test]
+    fn an_unregistered_name_is_left_in_place() {
+        assert_eq!(super::split_floor_claim("bob, here, run dust", &registered()), None);
+        assert_eq!(super::split_floor_claim("test, here, run dust", &[]), None,
+                   "an empty registry strips nothing");
+    }
+
+    /// The original returns the speaker CASE-PRESERVED from the registry even
+    /// though it matches against lowercased text -- so `note_active` gets the
+    /// real name.
+    #[test]
+    fn the_matched_speaker_keeps_its_registered_casing() {
+        let names = vec!["McKessler".to_string()];
+        let (who, _) = super::split_floor_claim("mckessler here go", &names).unwrap();
+        assert_eq!(who, "McKessler");
     }
 }
 

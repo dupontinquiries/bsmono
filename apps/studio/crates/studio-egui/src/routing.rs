@@ -191,7 +191,7 @@ mod tests {
         for (id, name, parent) in [(1u64, "Beat", None), (2, "Drums", Some(BusId(1))),
                                     (3, "Verb", None)] {
             p.apply(&Op::AddBus { bus: Bus { id: BusId(id), name: name.into(),
-                parent, gain: 1.0, chain: vec![], sends: vec![], muted: false } }).unwrap();
+                parent, gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: false } }).unwrap();
         }
         p.apply(&Op::SetRoute { track: TrackId(3), bus: Some(BusId(2)) }).unwrap();
         p.apply(&Op::SetBusSends { id: BusId(2), sends: vec![

@@ -112,6 +112,18 @@ pub enum Pick {
     Page(usize),
     /// Exactly these, by name.
     Named(Vec<String>),
+    /// Only generated chassis (name starts with `forge_`).
+    ///
+    /// This is the DEFAULT when any exist, and the reason is not taste: the
+    /// imported roster is 55% rights-holder material by filename and most of
+    /// the rest went through texture_export_v9, which takes whichever .obj
+    /// os.listdir returns first and drops the others -- measured at 8-9% of
+    /// the model kept on multi-file imports. A catalogue whose default view is
+    /// mostly unshippable and partly truncated is worse than a small one.
+    ///
+    /// `--bots all` still loads everything, so nothing is lost, only
+    /// de-defaulted.
+    Forge,
 }
 
 /// Choose chassis until the pose budget is spent.
@@ -130,6 +142,7 @@ pub fn fit(all: &[Chassis], pick: &Pick, budget: usize) -> Vec<Chassis> {
         Pick::All => all.iter().copied().collect(),
         Pick::OnlyTier(t) => all.iter().copied().filter(|c| c.tier == Some(*t)).collect(),
         Pick::Named(names) => all.iter().copied().filter(|c| names.contains(&c.name)).collect(),
+        Pick::Forge => all.iter().copied().filter(|c| c.name.starts_with("forge_")).collect(),
         Pick::Page(n) => {
             // Pages are cut by BUDGET, not by a fixed count, so every page
             // fills the GPU rather than leaving slots empty on a page of
@@ -286,6 +299,7 @@ fn field(line: &str, key: &str) -> Option<String> {
 pub fn parse_pick(s: &str) -> Option<Pick> {
     let s = s.trim();
     if s.is_empty() || s == "all" { return Some(Pick::All); }
+    if s == "forge" { return Some(Pick::Forge); }
     if let Some(t) = Tier::parse(s) { return Some(Pick::OnlyTier(t)); }
     if let Some(n) = s.strip_prefix("page:") {
         return n.parse::<usize>().ok().map(Pick::Page);

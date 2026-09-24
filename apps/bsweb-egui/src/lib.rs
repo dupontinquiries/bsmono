@@ -347,7 +347,7 @@ impl App {
         ui.add_space(a.gutter * 0.5);
         ui.horizontal(|ui| {
             let r = ui.add(
-                egui::TextEdit::singleline(&mut self.query)
+                egui::TextEdit::singleline(&mut self.query).id_salt("bsweb-query")
                     .hint_text("filter parts…")
                     .desired_width(ui.available_width() - 90.0),
             );

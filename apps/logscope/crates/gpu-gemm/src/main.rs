@@ -2037,6 +2037,28 @@ the signal for these models.", m.mla_layers(), m.n_layers, m.deltanet_layers());
         println!("gate-autotune: chosen {} @ tile {} | {}", cfg.kernel.label(), cfg.tile, if ok { "mechanism checks \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
+    // Walk one rung of the subgroup-width ladder. Deliberately separate from the other gates and
+    // never run automatically: on a driver where the subgroup kernel hangs at scale, this is the
+    // call that finds out, and finding out costs a GPU reset. Run it repeatedly — each run proves
+    // one more width — and if a run never returns, just start the engine again: it will read the
+    // unanswered note and cap below the width that killed it.
+    if args.iter().any(|a| a == "--gate-sgladder") {
+        use gpu_kernels::Gpu;
+        let gpu = Gpu::new();
+        let name = gpu.adapter_name.clone();
+        let rec = gpu_kernels::sgladder::load(&name);
+        let before = gpu_kernels::sgladder::verdict(&rec, *gpu_kernels::sgladder::LADDER.last().unwrap());
+        println!("adapter : {name}");
+        println!("record  : {}", gpu_kernels::sgladder::path_for(&name).display());
+        println!("before  : {}", before.describe());
+        match gpu.probe_sg_ladder_step() {
+            None => println!("ladder  : nothing left to probe (finished, or blocked by an earlier failure)"),
+            Some((n, ok)) => println!("probed  : n={n} {}", if ok { "OK" } else { "WRONG" }),
+        }
+        let after = gpu_kernels::sgladder::load(&name);
+        println!("after   : {}", gpu_kernels::sgladder::verdict(&after, *gpu_kernels::sgladder::LADDER.last().unwrap()).describe());
+        return;
+    }
     if args.iter().any(|a| a == "--gate-matvec") {
         // The tiled decode mat-vec (LOGSCOPE_MATVEC_TILE>1) must be BIT-IDENTICAL to the classic
         // one-workgroup-per-column kernel — same per-column accumulation, only the activation read is

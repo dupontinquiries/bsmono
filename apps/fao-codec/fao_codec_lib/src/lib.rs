@@ -2867,6 +2867,45 @@ pub struct FaoFrameHeader {
 /// Reads frames from tmp_file, writes proper .fao container.
 
 /// Simplified: write .fao from raw frame pairs (orig+recon) and stats
+/// A frame rate as the header's `u16 / u16`, choosing the denominator so the
+/// numerator FITS.
+///
+/// THIS WAS `(fps * 1000.0).round() as u16` over a fixed 1000, and `as u16`
+/// WRAPS: anything above 65.535 fps was silently corrupted. 144 fps was stored
+/// as 12928/1000 = 12.9 fps -- playback 11x too slow -- and 120 as 54.5, 240 as
+/// 43.4, 66 as 0.464. Those are exactly the rates games are captured at.
+///
+/// Denominators are tried most-precise first, and the first whose numerator fits
+/// wins, so ordinary rates are unchanged in precision: 1001 keeps NTSC exact
+/// (29.97 = 30000/1001), 1000 keeps anything up to 65.5 fps to a thousandth, and
+/// 100 carries high refresh to 655 fps exactly for whole rates (144 = 14400/100).
+/// Every reader divides num / den, so the choice of denominator is invisible to
+/// them -- checked in fao_app, fao_cli and the egui frontend.
+pub fn fps_ratio(fps: f64) -> (u16, u16) {
+    if !(fps.is_finite() && fps > 0.0) {
+        return (0, 1);
+    }
+    let fits = |den: u32| { let n = (fps * den as f64).round(); (n <= u16::MAX as f64).then_some(n) };
+    // An EXACT representation first. 1000 leads so an ordinary 30 fps stays
+    // 30000/1000 -- existing files' header bytes do not change -- and 1001 then
+    // catches NTSC (30000/1001, 60000/1001, 24000/1001) exactly. Exactness is
+    // not cosmetic at length: a 29.97 approximation of 30000/1001 drifts about
+    // 2 seconds over 600 hours.
+    for den in [1000u32, 1001, 100, 10, 1] {
+        if let Some(n) = fits(den) {
+            if (n / den as f64 - fps).abs() < 1e-9 * fps.max(1.0) {
+                return (n as u16, den as u16);
+            }
+        }
+    }
+    // No exact form: the most precise that fits. 1001 is left out -- it is an
+    // NTSC denominator, not a general-purpose scale.
+    for den in [1000u32, 100, 10, 1] {
+        if let Some(n) = fits(den) { return (n as u16, den as u16); }
+    }
+    (u16::MAX, 1)
+}
+
 pub fn write_fao_container(
     output: &mut dyn std::io::Write,
     w: usize, h: usize, fps: f64, quality: f32,
@@ -2876,13 +2915,13 @@ pub fn write_fao_container(
     let n = frames.len();
 
     // Write header
-    let fps_num = (fps * 1000.0).round() as u16;
+    let (fps_num, fps_den) = fps_ratio(fps);
     let total_comp: u64 = frames.iter().map(|f| f.3 as u64).sum();
     let header = FaoFileHeader {
         magic: *b"FAO2",
         version: 1,
         width: w as u16, height: h as u16,
-        fps_num, fps_den: 1000,
+        fps_num, fps_den,
         frame_count: n as u32,
         gop_size: 30, quality: (quality * 100.0) as u8,
         flags: 0,
@@ -6794,13 +6833,17 @@ pub fn decompress_frame_delta(data: &[u8], expected_size: usize, prev: &[u8]) ->
 /// Format: marker 'D' + dims + zstd(packed coefficients)
 /// Uses fixed JPEG quantization tables, zigzag scan, and RLE.
 /// CRITICAL: Tested for roundtrip correctness on multiple frame sizes.
-pub fn compress_frame_dct(yuv: &[u8], w: usize, h: usize, quality: u8) -> Vec<u8> {
-    let y_sz = w * h;
-    if yuv.len() < y_sz + y_sz / 2 {
-        return compress_frame_disk(yuv);
-    }
-    
-    // Quantization scale: quality 1-100, where 50 is "normal"
+/// Zigzag scan order shared by every DCT plane encoder and decoder.
+const DCT_ZIGZAG: [u8; 64] = [
+     0, 1, 8,16, 9, 2, 3,10, 17,24,32,25,18,11, 4, 5,
+    12,19,26,33,40,48,41,34, 27,20,13, 6, 7,14,21,28,
+    35,42,49,56,57,50,43,36, 29,22,15,23,30,37,44,51,
+    58,59,52,45,38,31,39,46, 53,60,61,54,47,55,62,63];
+
+/// Luma and chroma quantisation tables for a DCT quality (1-100; 50 = the
+/// base tables, 100 = scale 0, i.e. every step clamped to 1). Shared by the
+/// frame and plane codecs so they can never disagree.
+fn dct_tables(quality: u8) -> ([f32; 64], [f32; 64]) {
     let q_scale = if quality >= 50 {
         2.0 - quality as f32 / 50.0  // 50→1.0, 100→0.0 (lossless)
     } else {
@@ -6825,12 +6868,83 @@ pub fn compress_frame_dct(yuv: &[u8], w: usize, h: usize, quality: u8) -> Vec<u8
         for i in 0..64 { q[i] = (base[i] as f32 * q_scale).max(1.0); }
         q
     };
+    (luma_q, chroma_q)
+}
+
+/// Transform, quantise and run-length pack one plane (w, h multiples of 8)
+/// onto `packed`. Lifted verbatim from compress_frame_dct's closure.
+fn dct_encode_plane(packed: &mut Vec<u8>, plane: &[u8], pw: usize, ph: usize, qt: &[f32; 64]) {
+    let zigzag = DCT_ZIGZAG;
+    let bw = pw / 8;
+    let bh = ph / 8;
+    let mut block = [0.0f32; 64];
+    let mut dct_out = [0.0f32; 64];
     
-    let zigzag: [u8; 64] = [
-         0, 1, 8,16, 9, 2, 3,10, 17,24,32,25,18,11, 4, 5,
-        12,19,26,33,40,48,41,34, 27,20,13, 6, 7,14,21,28,
-        35,42,49,56,57,50,43,36, 29,22,15,23,30,37,44,51,
-        58,59,52,45,38,31,39,46, 53,60,61,54,47,55,62,63];
+    for by in 0..bh {
+        for bx in 0..bw {
+            // Extract block (level shift by -128)
+            for r in 0..8 {
+                let py = by * 8 + r;
+                for c in 0..8 {
+                    let px = bx * 8 + c;
+                    block[r * 8 + c] = plane[py * pw + px] as f32 - 128.0;
+                }
+            }
+            
+            dct_fwd(&block, &mut dct_out);
+            
+            // Quantize and zigzag scan
+            let mut coeffs = [0i16; 64];
+            for i in 0..64 {
+                let raw = (dct_out[zigzag[i] as usize] / qt[zigzag[i] as usize]).round();
+                if raw.abs() > 32767.0 {
+                    DEBUG_OVERFLOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                coeffs[i] = raw as i16;
+            }
+            
+            // Find last non-zero
+            let mut last = 0;
+            for i in (0..64).rev() {
+                if coeffs[i] != 0 { last = i + 1; break; }
+            }
+            
+            // RLE: write (run, value) pairs up to 'last'
+            let mut run = 0u32;
+            for i in 0..last {
+                if coeffs[i] == 0 {
+                    run += 1;
+                } else {
+                    // Emit any run > 15 as ZRL markers (run=15, value=0)
+                    while run >= 16 {
+                        packed.push(15);  // run=15 marker
+                        packed.push(0); packed.push(0);  // value=0
+                        run -= 15;
+                    }
+                    packed.push(run as u8);
+                    let v = coeffs[i];
+                    packed.push((v as u16 & 0xFF) as u8);
+                    packed.push(((v as u16 >> 8) & 0xFF) as u8);
+                    run = 0;
+                }
+            }
+            // EOB marker: (0, 0)
+            packed.push(0);
+            packed.push(0);
+            packed.push(0);
+        }
+    }
+}
+
+pub fn compress_frame_dct(yuv: &[u8], w: usize, h: usize, quality: u8) -> Vec<u8> {
+    let y_sz = w * h;
+    if yuv.len() < y_sz + y_sz / 2 {
+        return compress_frame_disk(yuv);
+    }
+    
+    // Quantization scale: quality 1-100, where 50 is "normal"
+    let (luma_q, chroma_q) = dct_tables(quality);
+    
     
     // Pack format: each block = sequence of (run, value) pairs ending with (0,0) EOB
     // run is u8 (0-255), value is i16
@@ -6839,79 +6953,18 @@ pub fn compress_frame_dct(yuv: &[u8], w: usize, h: usize, quality: u8) -> Vec<u8
     let mut block = [0.0f32; 64];
     let mut dct_out = [0.0f32; 64];
     
-    let encode_plane = |packed: &mut Vec<u8>, plane: &[u8], pw: usize, ph: usize, qt: &[f32; 64]| {
-        let bw = pw / 8;
-        let bh = ph / 8;
-        let mut block = [0.0f32; 64];
-        let mut dct_out = [0.0f32; 64];
-        
-        for by in 0..bh {
-            for bx in 0..bw {
-                // Extract block (level shift by -128)
-                for r in 0..8 {
-                    let py = by * 8 + r;
-                    for c in 0..8 {
-                        let px = bx * 8 + c;
-                        block[r * 8 + c] = plane[py * pw + px] as f32 - 128.0;
-                    }
-                }
-                
-                dct_fwd(&block, &mut dct_out);
-                
-                // Quantize and zigzag scan
-                let mut coeffs = [0i16; 64];
-                for i in 0..64 {
-                    let raw = (dct_out[zigzag[i] as usize] / qt[zigzag[i] as usize]).round();
-                    if raw.abs() > 32767.0 {
-                        DEBUG_OVERFLOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    coeffs[i] = raw as i16;
-                }
-                
-                // Find last non-zero
-                let mut last = 0;
-                for i in (0..64).rev() {
-                    if coeffs[i] != 0 { last = i + 1; break; }
-                }
-                
-                // RLE: write (run, value) pairs up to 'last'
-                let mut run = 0u32;
-                for i in 0..last {
-                    if coeffs[i] == 0 {
-                        run += 1;
-                    } else {
-                        // Emit any run > 15 as ZRL markers (run=15, value=0)
-                        while run >= 16 {
-                            packed.push(15);  // run=15 marker
-                            packed.push(0); packed.push(0);  // value=0
-                            run -= 15;
-                        }
-                        packed.push(run as u8);
-                        let v = coeffs[i];
-                        packed.push((v as u16 & 0xFF) as u8);
-                        packed.push(((v as u16 >> 8) & 0xFF) as u8);
-                        run = 0;
-                    }
-                }
-                // EOB marker: (0, 0)
-                packed.push(0);
-                packed.push(0);
-                packed.push(0);
-            }
-        }
-    };
     
     // Encode Y plane
     let y_plane = &yuv[0..y_sz];
-    encode_plane(&mut packed, y_plane, w, h, &luma_q);
+    dct_encode_plane(&mut packed, y_plane, w, h, &luma_q);
     
     // Encode U and V planes (at half resolution)
     let uw = w / 2;
     let uh = h / 2;
     let u_plane = &yuv[y_sz..y_sz + (y_sz / 4)];
     let v_plane = &yuv[y_sz + y_sz / 4..y_sz + y_sz / 2];
-    encode_plane(&mut packed, u_plane, uw, uh, &chroma_q);
-    encode_plane(&mut packed, v_plane, uw, uh, &chroma_q);
+    dct_encode_plane(&mut packed, u_plane, uw, uh, &chroma_q);
+    dct_encode_plane(&mut packed, v_plane, uw, uh, &chroma_q);
     
     // Header + zstd compress
     let mut output = Vec::with_capacity(packed.len() / 2 + 16);
@@ -6927,9 +6980,137 @@ pub fn compress_frame_dct(yuv: &[u8], w: usize, h: usize, quality: u8) -> Vec<u8
     output
 }
 
+/// Code ONE plane -- a residual channel, say -- exactly as `compress_frame_dct`
+/// codes a frame's luma: same transform, luma quantisation, run-length packing
+/// and zstd. `w` and `h` must be multiples of 8. Header: `b'Y'`, u16 w, u16 h,
+/// quality, u32 packed length, then zstd.
+///
+/// Why it exists: coding a lone plane through `compress_frame_dct` means
+/// wrapping it in a 4:2:0 image with neutral chroma planes -- half the plane's
+/// size again, transformed and packed to encode nothing. A third of the work.
+pub fn compress_plane_dct(plane: &[u8], w: usize, h: usize, quality: u8) -> Vec<u8> {
+    let (luma_q, _) = dct_tables(quality);
+    let mut packed: Vec<u8> = Vec::with_capacity(w * h / 4);
+    dct_encode_plane(&mut packed, plane, w, h, &luma_q);
+    let mut output = Vec::with_capacity(packed.len() / 2 + 16);
+    output.push(b'Y');
+    output.extend_from_slice(&(w as u16).to_le_bytes());
+    output.extend_from_slice(&(h as u16).to_le_bytes());
+    output.push(quality);
+    output.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+    let compressed = zstd::encode_all(std::io::Cursor::new(&packed), 3).unwrap_or(packed);
+    output.extend_from_slice(&compressed);
+    output
+}
+
+/// Decode a `compress_plane_dct` payload. `None` for a wrong marker, a size
+/// mismatch, or malformed data.
+pub fn decompress_plane_dct(data: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
+    if data.len() < 10 || data[0] != b'Y' { return None; }
+    let stored_w = u16::from_le_bytes([data[1], data[2]]) as usize;
+    let stored_h = u16::from_le_bytes([data[3], data[4]]) as usize;
+    if stored_w != w || stored_h != h { return None; }
+    let (luma_q, _) = dct_tables(data[5]);
+    let packed_len = u32::from_le_bytes([data[6], data[7], data[8], data[9]]) as usize;
+    let packed = zstd::decode_all(std::io::Cursor::new(&data[10..])).ok()?;
+    if packed.len() != packed_len { return None; }
+    let mut out = vec![128u8; w * h];
+    let mut pos = 0usize;
+    if !dct_decode_plane(&mut out, 0, w, h, &luma_q, &mut pos, &packed) { return None; }
+    Some(out)
+}
+
 /// Decompress DCT-compressed frame to YUV420p.
 pub static DEBUG_ESCAPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static DEBUG_OVERFLOWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Decode one plane from `packed` at `*pos` into `yuv[plane_off..]`. Lifted
+/// verbatim from decompress_frame_dct's closure; `false` on malformed data.
+fn dct_decode_plane(yuv: &mut [u8], plane_off: usize, pw: usize, ph: usize, qt: &[f32; 64], pos: &mut usize, packed: &[u8]) -> bool {
+    let zigzag = DCT_ZIGZAG;
+    let bw = pw / 8;
+    let bh = ph / 8;
+    let mut dct_in = [0.0f32; 64];
+    let mut idct_out = [0.0f32; 64];
+    
+    for by in 0..bh {
+        for bx in 0..bw {
+            // Decode RLE coefficients
+            let mut coeffs = [0i16; 64];
+            let mut idx = 0usize;
+            
+            loop {
+                if *pos + 2 >= packed.len() { return false; }
+                let run = packed[*pos] as usize;
+                let v_lo = packed[*pos + 1];
+                let v_hi = packed[*pos + 2];
+                *pos += 3;
+                
+                if run == 0 && v_lo == 0 && v_hi == 0 {
+                    // EOB
+                    break;
+                }
+                // The encoder's escape/filler for a zero-run of 16+: (run=15, value=0),
+                // meaning "15 more zeros, more run to come" — NOT a coefficient. A real
+                // symbol only ever has value != 0 (the encoder's else-branch that emits one
+                // requires coeffs[i] != 0), so (15, 0) is unambiguous filler. Falling
+                // through to the general branch below — as this used to — places a
+                // spurious zero at `idx` and advances by 16 instead of 15, shifting every
+                // coefficient after it by one position for the rest of the block. Silent at
+                // low quality (few blocks have a run this long) and increasingly
+                // corrupting as more AC coefficients survive quantization: PSNR got WORSE
+                // as quality went up, a cliff a ground-truth comparison caught because
+                // every prior test decoded a payload against ITS OWN encode's expectations
+                // rather than a true original — which a consistent positional shift cannot
+                // fail.
+                if run == 15 && v_lo == 0 && v_hi == 0 {
+                    idx += 15;
+                    DEBUG_ESCAPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                idx += run;
+                if idx < 64 {
+                    let v = i16::from_le_bytes([v_lo, v_hi]);
+                    coeffs[idx] = v;
+                    idx += 1;
+                } else {
+                    DEBUG_OVERFLOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Out of range - skip
+                }
+                // NO "if idx >= 64 { break; }" here. The encoder ALWAYS writes an explicit
+                // (0,0,0) EOB triplet after a block's real symbols, even when the last
+                // stored coefficient fills idx to exactly 64 (zigzag position 63, the
+                // highest-frequency slot). Breaking here on idx==64 exits WITHOUT reading
+                // that triplet, leaving `pos` 3 bytes behind for every plane/block after it
+                // — a whole-frame desync, not a local error. It only shows up once quality
+                // is high enough that position 63 is occupied often, which is why it read
+                // as a quality-vs-PSNR "cliff" (fine through q=77, ~15dB collapse at q=78
+                // on the content that exposed it) rather than a correctness bug: nothing
+                // about the desync is quality-proportional, only its PROBABILITY is. The
+                // loop now always terminates by reading the EOB marker on the next
+                // iteration, which is guaranteed to be there.
+            }
+            
+            // Inverse zigzag and dequantize
+            for i in 0..64 {
+                dct_in[zigzag[i] as usize] = coeffs[i] as f32 * qt[zigzag[i] as usize];
+            }
+            
+            dct_inv(&dct_in, &mut idct_out);
+            
+            // Write back to plane (level shift +128)
+            for r in 0..8 {
+                let py = by * 8 + r;
+                for c in 0..8 {
+                    let px = bx * 8 + c;
+                    let val = (idct_out[r * 8 + c] + 128.0).clamp(0.0, 255.0) as u8;
+                    yuv[plane_off + py * pw + px] = val;
+                }
+            }
+        }
+    }
+    true
+}
+
 pub fn decompress_frame_dct(data: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
     if data.len() < 8 || data[0] != b'D' { return None; }
     let stored_w = u16::from_le_bytes([data[1], data[2]]) as usize;
@@ -6942,36 +7123,8 @@ pub fn decompress_frame_dct(data: &[u8], w: usize, h: usize) -> Option<Vec<u8>> 
     let packed = zstd::decode_all(std::io::Cursor::new(&data[10..])).ok()?;
     if packed.len() != packed_len { return None; }
     
-    let q_scale = if quality >= 50 {
-        2.0 - quality as f32 / 50.0
-    } else {
-        50.0 / quality.max(1) as f32
-    };
+    let (luma_q, chroma_q) = dct_tables(quality);
     
-    let luma_q: [f32; 64] = {
-        let base = [16,11,10,16,24,40,51,61, 12,12,14,19,26,58,60,55,
-                    14,13,16,24,40,57,69,56, 14,17,22,29,51,87,80,62,
-                    18,22,37,56,68,109,103,77, 24,35,55,64,81,104,113,92,
-                    49,64,78,87,103,121,120,101, 72,92,95,98,112,100,103,99];
-        let mut q = [0.0f32; 64];
-        for i in 0..64 { q[i] = (base[i] as f32 * q_scale).max(1.0); }
-        q
-    };
-    let chroma_q: [f32; 64] = {
-        let base = [17,18,24,47,99,99,99,99, 18,21,26,66,99,99,99,99,
-                    24,26,56,99,99,99,99,99, 47,66,99,99,99,99,99,99,
-                    99,99,99,99,99,99,99,99, 99,99,99,99,99,99,99,99,
-                    99,99,99,99,99,99,99,99, 99,99,99,99,99,99,99,99];
-        let mut q = [0.0f32; 64];
-        for i in 0..64 { q[i] = (base[i] as f32 * q_scale).max(1.0); }
-        q
-    };
-    
-    let zigzag: [u8; 64] = [
-         0, 1, 8,16, 9, 2, 3,10, 17,24,32,25,18,11, 4, 5,
-        12,19,26,33,40,48,41,34, 27,20,13, 6, 7,14,21,28,
-        35,42,49,56,57,50,43,36, 29,22,15,23,30,37,44,51,
-        58,59,52,45,38,31,39,46, 53,60,61,54,47,55,62,63];
     
     let y_sz = w * h;
     let mut yuv = vec![128u8; y_sz + y_sz / 2];
@@ -6979,98 +7132,14 @@ pub fn decompress_frame_dct(data: &[u8], w: usize, h: usize) -> Option<Vec<u8>> 
     let mut dct_in = [0.0f32; 64];
     let mut idct_out = [0.0f32; 64];
     
-    let mut decode_plane = |yuv: &mut Vec<u8>, plane_off: usize, pw: usize, ph: usize, qt: &[f32; 64], pos: &mut usize| -> bool {
-        let bw = pw / 8;
-        let bh = ph / 8;
-        let mut dct_in = [0.0f32; 64];
-        let mut idct_out = [0.0f32; 64];
-        
-        for by in 0..bh {
-            for bx in 0..bw {
-                // Decode RLE coefficients
-                let mut coeffs = [0i16; 64];
-                let mut idx = 0usize;
-                
-                loop {
-                    if *pos + 2 >= packed.len() { return false; }
-                    let run = packed[*pos] as usize;
-                    let v_lo = packed[*pos + 1];
-                    let v_hi = packed[*pos + 2];
-                    *pos += 3;
-                    
-                    if run == 0 && v_lo == 0 && v_hi == 0 {
-                        // EOB
-                        break;
-                    }
-                    // The encoder's escape/filler for a zero-run of 16+: (run=15, value=0),
-                    // meaning "15 more zeros, more run to come" — NOT a coefficient. A real
-                    // symbol only ever has value != 0 (the encoder's else-branch that emits one
-                    // requires coeffs[i] != 0), so (15, 0) is unambiguous filler. Falling
-                    // through to the general branch below — as this used to — places a
-                    // spurious zero at `idx` and advances by 16 instead of 15, shifting every
-                    // coefficient after it by one position for the rest of the block. Silent at
-                    // low quality (few blocks have a run this long) and increasingly
-                    // corrupting as more AC coefficients survive quantization: PSNR got WORSE
-                    // as quality went up, a cliff a ground-truth comparison caught because
-                    // every prior test decoded a payload against ITS OWN encode's expectations
-                    // rather than a true original — which a consistent positional shift cannot
-                    // fail.
-                    if run == 15 && v_lo == 0 && v_hi == 0 {
-                        idx += 15;
-                        DEBUG_ESCAPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        continue;
-                    }
-                    idx += run;
-                    if idx < 64 {
-                        let v = i16::from_le_bytes([v_lo, v_hi]);
-                        coeffs[idx] = v;
-                        idx += 1;
-                    } else {
-                        DEBUG_OVERFLOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // Out of range - skip
-                    }
-                    // NO "if idx >= 64 { break; }" here. The encoder ALWAYS writes an explicit
-                    // (0,0,0) EOB triplet after a block's real symbols, even when the last
-                    // stored coefficient fills idx to exactly 64 (zigzag position 63, the
-                    // highest-frequency slot). Breaking here on idx==64 exits WITHOUT reading
-                    // that triplet, leaving `pos` 3 bytes behind for every plane/block after it
-                    // — a whole-frame desync, not a local error. It only shows up once quality
-                    // is high enough that position 63 is occupied often, which is why it read
-                    // as a quality-vs-PSNR "cliff" (fine through q=77, ~15dB collapse at q=78
-                    // on the content that exposed it) rather than a correctness bug: nothing
-                    // about the desync is quality-proportional, only its PROBABILITY is. The
-                    // loop now always terminates by reading the EOB marker on the next
-                    // iteration, which is guaranteed to be there.
-                }
-                
-                // Inverse zigzag and dequantize
-                for i in 0..64 {
-                    dct_in[zigzag[i] as usize] = coeffs[i] as f32 * qt[zigzag[i] as usize];
-                }
-                
-                dct_inv(&dct_in, &mut idct_out);
-                
-                // Write back to plane (level shift +128)
-                for r in 0..8 {
-                    let py = by * 8 + r;
-                    for c in 0..8 {
-                        let px = bx * 8 + c;
-                        let val = (idct_out[r * 8 + c] + 128.0).clamp(0.0, 255.0) as u8;
-                        yuv[plane_off + py * pw + px] = val;
-                    }
-                }
-            }
-        }
-        true
-    };
     
     // Decode Y
-    if !decode_plane(&mut yuv, 0, w, h, &luma_q, &mut pos) { return None; }
+    if !dct_decode_plane(&mut yuv, 0, w, h, &luma_q, &mut pos, &packed) { return None; }
     // Decode U
     let uw = w / 2; let uh = h / 2;
-    if !decode_plane(&mut yuv, y_sz, uw, uh, &chroma_q, &mut pos) { return None; }
+    if !dct_decode_plane(&mut yuv, y_sz, uw, uh, &chroma_q, &mut pos, &packed) { return None; }
     // Decode V
-    if !decode_plane(&mut yuv, y_sz + y_sz / 4, uw, uh, &chroma_q, &mut pos) { return None; }
+    if !dct_decode_plane(&mut yuv, y_sz + y_sz / 4, uw, uh, &chroma_q, &mut pos, &packed) { return None; }
     
     Some(yuv)
 }
@@ -7656,6 +7725,44 @@ mod dct_frame_tests {
         let yuv = decompress_frame_dct(&frame, 16, 8);
         assert!(yuv.is_some(), "a full block followed by a second block must still decode");
     }
+
+#[cfg(test)]
+mod fps_ratio_tests {
+    use super::fps_ratio;
+    fn back(f: f64) -> f64 { let (n, d) = fps_ratio(f); n as f64 / d as f64 }
+
+    /// THE BUG: above 65.535 fps, `as u16` wrapped. 144 read back as 12.9.
+    #[test]
+    fn high_refresh_rates_survive() {
+        for f in [66.0, 120.0, 144.0, 165.0, 240.0, 360.0] {
+            assert!((back(f) - f).abs() < 1e-9, "{f} fps read back as {}", back(f));
+        }
+    }
+
+    /// Ordinary rates keep their old encoding, so existing headers do not change.
+    #[test]
+    fn ordinary_rates_are_unchanged() {
+        assert_eq!(fps_ratio(30.0), (30000, 1000));
+        assert_eq!(fps_ratio(60.0), (60000, 1000));
+        assert_eq!(fps_ratio(25.0), (25000, 1000));
+    }
+
+    /// NTSC is stored exactly, not as a thousandths approximation.
+    #[test]
+    fn ntsc_rates_are_exact() {
+        assert_eq!(fps_ratio(30000.0 / 1001.0), (30000, 1001));
+        assert_eq!(fps_ratio(60000.0 / 1001.0), (60000, 1001));
+        assert_eq!(fps_ratio(24000.0 / 1001.0), (24000, 1001));
+    }
+
+    #[test]
+    fn nonsense_rates_do_not_panic() {
+        assert_eq!(fps_ratio(0.0), (0, 1));
+        assert_eq!(fps_ratio(f64::NAN), (0, 1));
+        assert_eq!(fps_ratio(-5.0), (0, 1));
+        let _ = fps_ratio(1e9);
+    }
+}
 }
 
 

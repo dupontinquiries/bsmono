@@ -130,12 +130,29 @@ pub fn rgb_to_yuv420p(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
 /// An opened .fao: bytes, header, frame index, the block dictionary if the file carries
 /// one, and the anchor cache.
 pub struct FaoFile {
-    data: Vec<u8>,
+    src: Source,
     pub header: fao_v1::FaoFileHeader,
-    pub index: Vec<fao_v1::FaoFrameEntry>,
     block_dict: Option<fao_v1::block_dict::BlockDictionary>,
     v8: Option<fao_v1::v8_reconstruction_codec::V8Decoder>,
     cache: RefCell<Vec<(usize, Vec<u8>)>>,
+}
+
+/// Anything a `.fao` can be streamed from.
+pub trait ReadSeek: std::io::Read + std::io::Seek + Send {}
+impl<T: std::io::Read + std::io::Seek + Send> ReadSeek for T {}
+
+/// Where frame bytes come from.
+///
+/// EVERY DECODE PATH READS THROUGH `payload`, and nothing else touches the
+/// storage -- checked: `index`, `header` and `data` had no users outside this
+/// file. So streaming is a second arm here, and repeat resolution, the block
+/// dictionary, the V8 webs and the anchor cache all run unchanged on top of it.
+enum Source {
+    /// The whole file in memory -- what `parse` has always done.
+    Mem { data: Vec<u8>, index: Vec<fao_v1::FaoFrameEntry> },
+    /// Seek-based, constant memory. `RefCell` because seeking mutates the
+    /// reader while `decode_rgb` takes `&self`, the same reason `cache` is one.
+    Stream { reader: RefCell<crate::stream::FaoReader<Box<dyn ReadSeek>>>, frames: usize },
 }
 
 const ANCHOR_CACHE_CAP: usize = 8;
@@ -149,11 +166,47 @@ impl FaoFile {
         let block_dict = read_block_dict(&data, &index);
         let v8 = read_v8mx_trailer(&data, &index)
             .map(|webs| fao_v1::v8_reconstruction_codec::V8Decoder::new(header.width.into(), header.height.into()).with_webs(webs));
-        Some(FaoFile { data, header, index, block_dict, v8, cache: RefCell::new(Vec::new()) })
+        Some(FaoFile { src: Source::Mem { data, index }, header, block_dict, v8, cache: RefCell::new(Vec::new()) })
+    }
+
+    /// Open for streaming: reads the header and the trailers, nothing else.
+    ///
+    /// For files too large to hold -- a 600-hour video is terabytes. Frames are
+    /// read on demand through `stream::FaoReader`; the block dictionary and V8
+    /// webs come from the same shared searches `parse` uses, over just the tail.
+    pub fn open_stream(src: Box<dyn ReadSeek>) -> Option<Self> {
+        let mut r = crate::stream::FaoReader::open(src).ok()?;
+        if r.frame_count == 0 { return None; }
+        let (w, h) = (r.width, r.height);
+        let header = fao_v1::FaoFileHeader {
+            magic: *b"FAO2", version: 1, width: w, height: h,
+            fps_num: r.fps_num, fps_den: r.fps_den,
+            // u32 in the format, and FaoReader read it from a u32, so this
+            // cannot truncate.
+            frame_count: r.frame_count as u32,
+            gop_size: 0, quality: 0, flags: 0, total_compressed: 0,
+        };
+        let block_dict = r.block_dict().ok().flatten();
+        let v8 = r.v8mx().ok().flatten()
+            .map(|webs| fao_v1::v8_reconstruction_codec::V8Decoder::new(w.into(), h.into()).with_webs(webs));
+        let frames = r.frame_count as usize;
+        Some(FaoFile { src: Source::Stream { reader: RefCell::new(r), frames }, header, block_dict, v8,
+                       cache: RefCell::new(Vec::new()) })
+    }
+
+    /// One frame's codec marker, cheaply. Streaming reads ONE byte; `markers`
+    /// (every frame, whole payloads) is what made opening read the whole file.
+    pub fn marker(&self, idx: usize) -> Option<u8> {
+        match &self.src {
+            Source::Stream { reader, .. } => reader.borrow_mut().marker(idx as u64).ok().flatten(),
+            Source::Mem { .. } => self.payload(idx).and_then(|b| b.first().copied()),
+        }
     }
     pub fn width(&self) -> usize { self.header.width as usize }
     pub fn height(&self) -> usize { self.header.height as usize }
-    pub fn frame_count(&self) -> usize { self.index.len() }
+    pub fn frame_count(&self) -> usize {
+        match &self.src { Source::Mem { index, .. } => index.len(), Source::Stream { frames, .. } => *frames }
+    }
     pub fn fps(&self) -> f64 {
         if self.header.fps_den == 0 { 0.0 } else { self.header.fps_num as f64 / self.header.fps_den as f64 }
     }
@@ -162,8 +215,13 @@ impl FaoFile {
 
     /// Payload bytes of frame `idx` (what the markers are read from).
     pub fn payload(&self, idx: usize) -> Option<Vec<u8>> {
-        let entry = self.index.get(idx)?;
-        fao_v1::read_fao_frame(&self.data, entry).map(|(b, _)| b)
+        match &self.src {
+            Source::Mem { data, index } => {
+                let entry = index.get(idx)?;
+                fao_v1::read_fao_frame(data, entry).map(|(b, _)| b)
+            }
+            Source::Stream { reader, .. } => reader.borrow_mut().payload(idx as u64).ok(),
+        }
     }
     /// First payload byte of every frame — the input `player::build_anchor_map` takes.
     pub fn markers(&self) -> Vec<Option<u8>> {
@@ -192,6 +250,25 @@ impl FaoFile {
             // v10 chains on the previous frame's pixels; the first frame has none.
             let prev = if idx > 0 { self.decode_rgb(idx - 1).ok() } else { None };
             return fao_v1::v10::decode_frame(&bytes, prev.as_deref(), w, h).ok_or(Gap::Failed(marker));
+        }
+        if marker == crate::motion::MARKER || marker == crate::motion::MARKER_Q {
+            // Shiftquilt: changed blocks intra-coded or predicted from the
+            // previous frame's picture. Like M, never first.
+            if idx == 0 {
+                return Err(Gap::Failed(marker));
+            }
+            let prev = self.decode_rgb(idx - 1)?;
+            return crate::motion::decode(&bytes, &prev, w, h).ok_or(Gap::Failed(marker));
+        }
+        if marker == crate::patch::MARKER {
+            // Quiltstone: the changed blocks over the PREVIOUS frame's picture.
+            // A patch frame is never first (the transcoder starts every run with
+            // a keyframe), so frame 0 as M is malformed, not "decode on black".
+            if idx == 0 {
+                return Err(Gap::Failed(marker));
+            }
+            let prev = self.decode_rgb(idx - 1)?;
+            return crate::patch::decode(&bytes, &prev, w, h).ok_or(Gap::Failed(marker));
         }
         if marker == b'R' {
             // v8 repeat marker: show the nearest earlier frame that is not itself a repeat.
@@ -248,8 +325,21 @@ impl FaoFile {
 /// and V8PT (pose track) are not read by this port (see the module doc — `render_frame_rgb`
 /// never consults either), and V8LR/V8AT/V9DC are not searched for at all.
 fn read_v8mx_trailer(data: &[u8], index: &[fao_v1::FaoFrameEntry]) -> Option<Vec<fao_v1::v8_reconstruction_codec::DecodedWeb>> {
-    let frame_data_end: usize = index.iter().map(|e| (e.offset + e.size as u64) as usize).max().unwrap_or(0);
-    let search_start = frame_data_end.min(data.len());
+    v8mx_from(data, frame_data_end(index).min(data.len()))
+}
+
+/// Where frame data ends: the furthest `offset + size` over the index.
+fn frame_data_end(index: &[fao_v1::FaoFrameEntry]) -> usize {
+    index.iter().map(|e| (e.offset + e.size as u64) as usize).max().unwrap_or(0)
+}
+
+/// The V8MX trailer, searched for from `search_start` in `data`.
+///
+/// SPLIT FROM `read_v8mx_trailer` so the streaming reader runs the SAME search
+/// over just the file's tail. It reads a length prefix from the 4 bytes BEFORE
+/// the magic -- so a caller handing it a tail must include those 4 bytes; see
+/// `stream::FaoReader::trailer`.
+pub(crate) fn v8mx_from(data: &[u8], search_start: usize) -> Option<Vec<fao_v1::v8_reconstruction_codec::DecodedWeb>> {
     if data.len() < search_start + 4 { return None; }
     let pos = (search_start..data.len().saturating_sub(4)).find(|&i| &data[i..i + 4] == b"V8MX")?;
     let mut end = data.len();
@@ -268,9 +358,13 @@ fn read_v8mx_trailer(data: &[u8], index: &[fao_v1::FaoFrameEntry]) -> Option<Vec
 /// fao_app's `read_block_dict`: the dictionary trailer is `FAOBKD01` + u32 LE size + bytes,
 /// searched for after the last frame's data.
 fn read_block_dict(data: &[u8], index: &[fao_v1::FaoFrameEntry]) -> Option<fao_v1::block_dict::BlockDictionary> {
+    block_dict_from(data, frame_data_end(index).min(data.len()))
+}
+
+/// The FAOBKD01 trailer, searched for from `search_start`. Split like
+/// `v8mx_from` so both readers share one search.
+pub(crate) fn block_dict_from(data: &[u8], search_start: usize) -> Option<fao_v1::block_dict::BlockDictionary> {
     let needle = b"FAOBKD01";
-    let frame_data_end: usize = index.iter().map(|e| (e.offset + e.size as u64) as usize).max().unwrap_or(0);
-    let search_start = frame_data_end.min(data.len());
     if data.len() < 12 { return None; }
     let at = (search_start..data.len().saturating_sub(needle.len()))
         .find(|&i| &data[i..i + needle.len()] == needle)? + needle.len();
@@ -309,6 +403,43 @@ mod tests {
         let mut out = Vec::new();
         fao_v1::write_fao_container(&mut out, w, h, 30.0, 0.8, &frames).unwrap();
         (out, w, h)
+    }
+
+    /// STREAMED DECODES ARE THE IN-MEMORY DECODES, pixel for pixel, frame for
+    /// frame. Every decode path reads through `payload`, so this is the proof
+    /// that swapping the storage underneath changed nothing above it.
+    #[test]
+    fn a_streamed_file_decodes_identically_to_an_in_memory_one() {
+        let (w, h) = (32usize, 16usize);
+        let frames: Vec<Vec<u8>> = [10u8, 90, 170, 250]
+            .iter().map(|&p| gradient_rgb(w, h, p)).collect();
+        let bytes = crate::export::write_dct_fao(&frames, w, h, 30.0, 80).unwrap();
+        let mem = FaoFile::parse(bytes.clone()).unwrap();
+        let st = FaoFile::open_stream(Box::new(std::io::Cursor::new(bytes))).unwrap();
+        assert_eq!((st.width(), st.height(), st.frame_count()), (mem.width(), mem.height(), mem.frame_count()));
+        assert!((st.fps() - mem.fps()).abs() < 1e-9);
+        for i in 0..mem.frame_count() {
+            assert_eq!(st.marker(i), mem.marker(i), "marker {i}");
+            assert_eq!(st.decode_rgb(i).unwrap(), mem.decode_rgb(i).unwrap(), "frame {i}");
+        }
+        assert_eq!(st.decode_rgb(mem.frame_count()), Err(Gap::OutOfRange));
+    }
+
+    /// And the trailers: a streamed file finds the same block dictionary.
+    #[test]
+    fn a_streamed_file_finds_the_block_dictionary() {
+        let (w, h) = (32usize, 16usize);
+        let mut bytes = crate::export::write_dct_fao(&[gradient_rgb(w, h, 5)], w, h, 30.0, 80).unwrap();
+        let mut dict = fao_v1::block_dict::BlockDictionary::new();
+        for k in 0..4u8 { dict.intern(vec![k; 64]); }
+        let payload = dict.to_bytes();
+        bytes.extend_from_slice(b"FAOBKD01");
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        let mem = FaoFile::parse(bytes.clone()).unwrap();
+        let st = FaoFile::open_stream(Box::new(std::io::Cursor::new(bytes))).unwrap();
+        assert!(mem.has_block_dict(), "fixture must carry a dictionary");
+        assert_eq!(st.has_block_dict(), mem.has_block_dict());
     }
 
     #[test]
@@ -427,5 +558,24 @@ mod tests {
         let rgb: Vec<u8> = (0..w * h).flat_map(|_| [120u8, 60, 200]).collect();
         let back = yuv_to_rgb(&rgb_to_yuv420p(&rgb, w, h), w, h);
         for (a, b) in rgb.iter().zip(&back) { assert!((*a as i32 - *b as i32).abs() <= 3, "{a} vs {b}"); }
+    }
+
+
+    /// The plane codec IS the frame codec's luma path: a plane coded alone
+    /// decodes to exactly the luma the frame codec produces for the same image.
+    #[test]
+    fn a_plane_codes_exactly_like_a_frames_luma() {
+        for (w, h) in [(48usize, 32usize), (512, 64)] {
+            let rgb: Vec<u8> = (0..w * h * 3).map(|i| (((i / 3) % w * 7 ^ (i / 3) / w * 5) % 256) as u8).collect();
+            let yuv = rgb_to_yuv420p(&rgb, w, h);
+            for q in [10u8, 24, 80, 100] {
+                let frame = fao_v1::decompress_frame_dct(&fao_v1::compress_frame_dct(&yuv, w, h, q), w, h).unwrap();
+                let plane = fao_v1::decompress_plane_dct(&fao_v1::compress_plane_dct(&yuv[..w * h], w, h, q), w, h).unwrap();
+                assert_eq!(plane, frame[..w * h], "{w}x{h} q{q}");
+            }
+        }
+        let p = fao_v1::compress_plane_dct(&vec![9u8; 64], 8, 8, 50);
+        assert!(fao_v1::decompress_plane_dct(&p, 16, 8).is_none(), "size mismatch rejected");
+        assert!(fao_v1::decompress_plane_dct(&p[..5], 8, 8).is_none(), "truncated rejected");
     }
 }

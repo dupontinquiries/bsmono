@@ -48,12 +48,23 @@ pub struct Claim {
 }
 
 /// The channel.
+/// How far before the newest seen claim a floor assert may still be honoured.
+///
+/// Thirty seconds: comfortably past any real network delay or clock skew
+/// between phones, and far short of the "claim at zero and hold forever" that
+/// an unbounded value allows.
+pub const CLAIM_SKEW_MS: u64 = 30_000;
+
 #[derive(Debug, Clone, Default)]
 pub struct GroupVoice {
     pub participants: Vec<Participant>,
     pub mode: TalkMode,
     /// Current floor holder in push-to-talk.
     pub floor: Option<Claim>,
+    /// Newest claim timestamp this call has seen, as the anchor for
+    /// [`CLAIM_SKEW_MS`]. Monotonic on purpose: it is what makes the staleness
+    /// test the same on every peer without a shared clock.
+    pub claim_seen_max: u64,
     /// Speaker level 0..1 per participant, for the roster's pulse.
     pub levels: std::collections::BTreeMap<String, f32>,
     pub joined: bool,
@@ -98,9 +109,35 @@ impl GroupVoice {
     /// everywhere. Ties break on id because two claims can carry the same
     /// millisecond, and a coin flip would have peers disagreeing about who is
     /// talking, which is exactly the failure this prevents.
+    /// ## An unbounded timestamp makes "earliest wins" a permanent floor
+    ///
+    /// The convergence rule above is right and the BOUND below is what makes
+    /// it safe. Nothing checked how early `at` could be, so a claim at `at = 0`
+    /// beat every honest claim, and the only way to lose the floor is to
+    /// release it yourself — so one participant could hold the floor for the
+    /// rest of the call and nobody else could ever speak.
+    ///
+    /// That needs no spoofing: any legitimate participant could send it, by
+    /// accident with a broken clock or on purpose. `voice_wire`'s header is
+    /// candid that source addresses are forgeable on a hostile LAN, which
+    /// makes it reachable by an attacker too, but the bug is a plain
+    /// denial-of-service before any of that.
+    ///
+    /// A claim more than [`CLAIM_SKEW_MS`] before the newest claim this call
+    /// has seen is refused. Anchoring on the OBSERVED maximum rather than on a
+    /// local clock keeps the rule computable identically by every peer, which
+    /// is the property the whole design rests on — a wall-clock comparison
+    /// would have peers disagreeing about who is talking, which is exactly
+    /// what "no server, no round trip, same answer everywhere" rules out.
     pub fn floor_assert(&mut self, holder: &str, at: u64) -> bool {
         if self.mode != TalkMode::PushToTalk { return false; }
         if !self.participants.iter().any(|p| p.id == holder) { return false; }
+        // Refuse implausibly old claims before they can win. `seen_max` only
+        // ever rises, so this is the same decision on every peer.
+        if at.saturating_add(CLAIM_SKEW_MS) < self.claim_seen_max {
+            return self.holds_floor(holder);
+        }
+        self.claim_seen_max = self.claim_seen_max.max(at);
         let wins = match &self.floor {
             None => true,
             Some(cur) => at < cur.at || (at == cur.at && holder < cur.holder.as_str()),
@@ -301,5 +338,66 @@ mod tests {
         // and a level for someone not in the channel is refused
         gv.set_level("nobody", 0.9);
         assert!(gv.levels.get("nobody").is_none());
+    }
+
+    /// A CLAIM AT ZERO HELD THE FLOOR FOREVER. "Earliest wins" is the right
+    /// convergence rule and nothing bounded how early -- so one participant
+    /// could take the floor for the rest of the call, and the only way to lose
+    /// it is to release it yourself.
+    ///
+    /// No spoofing needed: a broken clock does it by accident.
+    #[test]
+    fn a_claim_from_the_distant_past_cannot_steal_a_live_floor() {
+        let mut gv = channel();
+        assert!(gv.floor_assert("ada", 1_000_000));
+        // Mallory claims the beginning of time.
+        assert!(!gv.floor_assert("cy", 0), "a zero claim must not win");
+        assert!(gv.holds_floor("ada"), "ada still has the floor");
+    }
+
+    /// The bound is generous enough for real skew between phones -- refusing
+    /// honest late claims would be a worse bug than the one it fixes.
+    #[test]
+    fn an_ordinary_earlier_claim_still_wins() {
+        let mut gv = channel();
+        assert!(gv.floor_assert("ada", 1_000_000));
+        // Five seconds earlier: a real race between two people pressing talk.
+        assert!(gv.floor_assert("bo", 995_000), "a plausible earlier claim wins");
+        assert!(gv.holds_floor("bo"));
+    }
+
+    /// Exactly at the edge, both sides, because an off-by-one here either
+    /// reopens the hole or starts refusing honest claims.
+    #[test]
+    fn the_skew_window_boundary_is_where_it_says() {
+        let mut gv = channel();
+        gv.floor_assert("ada", CLAIM_SKEW_MS + 1_000);
+        // Just inside the window.
+        let inside = (CLAIM_SKEW_MS + 1_000) - CLAIM_SKEW_MS;
+        assert!(gv.floor_assert("bo", inside), "at exactly the bound, honoured");
+        // Just outside.
+        let mut gv2 = channel();
+        gv2.floor_assert("ada", CLAIM_SKEW_MS + 1_000);
+        assert!(!gv2.floor_assert("cy", inside - 1), "one ms past, refused");
+    }
+
+    /// The anchor only RISES, which is what makes the test the same on every
+    /// peer without a shared clock. An old claim must not drag it back.
+    #[test]
+    fn the_anchor_is_monotonic() {
+        let mut gv = channel();
+        gv.floor_assert("ada", 900_000);
+        let after_high = gv.claim_seen_max;
+        gv.floor_assert("cy", 0);
+        assert_eq!(gv.claim_seen_max, after_high, "a refused claim must not lower it");
+    }
+
+    /// The first claim of a call still works -- the anchor starts at zero and
+    /// a guard that refused everything would pass the tests above.
+    #[test]
+    fn the_first_claim_of_a_call_is_honoured() {
+        let mut gv = channel();
+        assert!(gv.floor_assert("ada", 1_700_000_000_000), "a real epoch ms");
+        assert!(gv.holds_floor("ada"));
     }
 }

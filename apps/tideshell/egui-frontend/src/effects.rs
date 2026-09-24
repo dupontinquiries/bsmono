@@ -207,6 +207,7 @@ impl Executor for System {
             Action::SetQuick(..) => Outcome::Unwired("no system backend for quick toggles yet"),
             Action::SetSlider(tideshell_core::control_center::SliderKind::Volume, v) => fade_volume(*v),
             Action::SetSlider(..) => Outcome::Unwired("brightness is applied by the layer runtime"),
+            Action::SetGovernor(_) => Outcome::Unwired("cpu governor: no system backend for this executor"),
             Action::DisplayPower(_) => Outcome::Unwired("display power is handled by the layer runtime"),
             Action::Rotate(deg) => rotate_output(*deg),
             Action::SetVoicing(tone) => apply_voicing(*tone),

@@ -1078,10 +1078,14 @@ impl App {
                 // out — matching what this host sends. A payload whose
                 // length is not a whole number of samples is refused rather
                 // than played as a half-sample of noise.
-                HostCommand::DecodeAudio(bytes) => {
-                    if bytes.len() % 2 == 0 && !bytes.is_empty() {
-                        pending.push(HostEvent::DecodedAudio(
-                            snapclone_egui::audio::pcm_to_f32(&bytes)));
+                HostCommand::DecodeAudio { peer, pcm } => {
+                    if pcm.len() % 2 == 0 && !pcm.is_empty() {
+                        // The peer rides through decode unchanged -- this is
+                        // the boundary that used to drop it.
+                        pending.push(HostEvent::DecodedAudio {
+                            peer,
+                            samples: snapclone_egui::audio::pcm_to_f32(&pcm),
+                        });
                     }
                 }
                 HostCommand::PlayAudio(frames) => {

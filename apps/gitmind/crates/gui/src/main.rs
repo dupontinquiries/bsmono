@@ -1836,11 +1836,13 @@ impl Backend {
         let path = std::env::var("PATH").unwrap_or_default();
         let tgt = target.to_string();
         let have_cross = cockpit::sysdeps::rust_target_installed(&tgt, &path);
-        let choice = cockpit::buildflags::recommend_strategy(&host, &tgt, have_cross, remote_reachable);
+        let have_podman = cockpit::podman::which_podman(&path);
+        let choice = cockpit::buildflags::recommend_strategy(&host, &tgt, have_cross, have_podman, remote_reachable);
         let strat = match choice.strategy {
             cockpit::buildflags::DeployStrategy::LocalNative => "local-native",
             cockpit::buildflags::DeployStrategy::CrossCompile => "cross-compile",
             cockpit::buildflags::DeployStrategy::RemoteNative => "remote-native",
+            cockpit::buildflags::DeployStrategy::PodmanCross => "podman-cross",
         };
         QString::from(
             json!({
@@ -1945,6 +1947,7 @@ impl Backend {
             no_default: !features.to_string().trim().is_empty(),
             target: target.to_string(),
             run_flags: flags.to_string(),
+            bin_name: None,
         };
         if app.name.trim().is_empty() || app.path.trim().is_empty() {
             return err_json("missing app name or path");

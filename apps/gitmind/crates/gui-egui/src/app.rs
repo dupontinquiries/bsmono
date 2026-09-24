@@ -92,6 +92,11 @@ pub struct App {
     /// glyph, and a fleet manager is where pressing the wrong thing reflashes
     /// a device.
     pub a11y: uikit_egui::A11yScene,
+    /// The on-device keystroke probe. "Fields take one character from an
+    /// on-screen keyboard" has survived every synthetic reproduction -- the
+    /// kit's `input_probe` records exactly what a REAL keyboard delivers, and
+    /// this app never called it. Off unless `RUSTY_INPUT_PROBE=1`.
+    pub input_probe: uikit_egui::input_probe::Probe,
     pub prefs: settings_kit::Prefs,
     pub task: Task,
     pub net: pages::network::State,
@@ -116,6 +121,7 @@ impl Default for App {
     fn default() -> Self {
         Self {
             a11y: Default::default(),
+            input_probe: Default::default(),
             artifacts: Default::default(),
             share: Default::default(),
             tab: Tab::Network,
@@ -155,6 +161,18 @@ impl App {
     #[allow(deprecated)]
     pub fn ui(&mut self, ctx: &egui::Context) {
         uikit_egui::apply_prefs(ctx, &self.prefs);
+        // THE KEYSTROKE PROBE. Every synthetic test of the one-character bug
+        // passes -- per-key text, a whole word in one event, an IME commit, a
+        // row-layout change: all correct (narrow.rs). So the next evidence has to
+        // come from the device. With RUSTY_INPUT_PROBE=1 this draws a corner
+        // strip of the raw events and every focus change, which tells apart the
+        // causes still standing: IME not reaching the field, a lone Text event
+        // refused, or focus moving between keystrokes. `enabled()` is one env
+        // read per process, so this is free when off.
+        if uikit_egui::input_probe::enabled() {
+            self.input_probe.observe(ctx);
+            uikit_egui::input_probe::overlay(ctx, &self.input_probe);
+        }
         // The scene is per-frame: it collects what is focusable NOW, so a
         // stale item from a page the user has left cannot be focused or
         // spoken.

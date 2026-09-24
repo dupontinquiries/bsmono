@@ -34,6 +34,61 @@ pub use dht_kit::{InfoHash, Value, HASH_LEN};
 ///
 /// Kept pure so it is testable without a running node — the socket loop feeds
 /// the result to whichever engine it drives.
+/// Why a host is not worth announcing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unannounceable {
+    /// RFC 6598 carrier NAT. Reachable by nobody, including the peer's own ISP
+    /// neighbours.
+    Cgnat,
+    /// RFC 1918. Meaningful on the LAN and meaningless in a global DHT, where
+    /// 192.168.1.4 names a different machine in every house that reads it.
+    Private,
+    /// Loopback. Every reader dials itself.
+    Loopback,
+    /// Not an IP address at all.
+    Unparseable,
+}
+
+impl Unannounceable {
+    /// What to do instead, because "cannot announce" without a next step sends
+    /// the caller to guess.
+    pub fn remedy(self) -> &'static str {
+        match self {
+            Unannounceable::Cgnat =>
+                "behind carrier NAT — announce the STUN reflexive address, or a relay token                  if punching has already failed",
+            Unannounceable::Private =>
+                "a LAN address — announce the reflexive address from STUN, and use mDNS for                  local discovery",
+            Unannounceable::Loopback => "loopback — this build has no externally reachable address",
+            Unannounceable::Unparseable => "not an IP address",
+        }
+    }
+}
+
+/// Is this host worth putting in a global DHT record?
+///
+/// ## Why the DHT is where this belongs
+///
+/// `snapclone_nat::cgnat::AddrClass` has classified addresses since the NAT
+/// port, and NOTHING in `snapclone-presence` referenced it — so a peer behind
+/// carrier NAT published its `100.64/10` address and every peer that found the
+/// record dialled an address that cannot answer. The lookup succeeds, the
+/// connection times out, and the failure looks like the far peer being offline
+/// rather than like a record that was never dialable.
+///
+/// The parameter was already named `public_ip`. Naming is not enforcement.
+pub fn announceable(host: &str) -> Result<(), Unannounceable> {
+    use snapclone_nat::cgnat::AddrClass;
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return Err(Unannounceable::Unparseable);
+    };
+    match AddrClass::of(ip) {
+        AddrClass::Public => Ok(()),
+        AddrClass::Cgnat => Err(Unannounceable::Cgnat),
+        AddrClass::Private => Err(Unannounceable::Private),
+        AddrClass::Loopback => Err(Unannounceable::Loopback),
+    }
+}
+
 pub fn announce_record(
     sc_id: &str,
     display_name: &str,
@@ -94,4 +149,67 @@ mod tests {
         let (_, b) = announce_record("sc-bbbbbbbb", "B", "1.1.1.2", 2);
         assert_ne!(a.id, b.id, "one peer would overwrite the other");
     }
+
+#[cfg(test)]
+mod announceable_tests {
+    use super::*;
+
+    /// THE CGNAT CASE THIS EXISTS FOR. A peer on carrier NAT published
+    /// 100.64/10 and every reader dialled an address that cannot answer --
+    /// which times out looking like the far peer is offline.
+    #[test]
+    fn a_carrier_nat_address_is_refused_and_says_what_to_do() {
+        let e = announceable("100.64.1.1").unwrap_err();
+        assert_eq!(e, Unannounceable::Cgnat);
+        assert!(e.remedy().contains("reflexive"), "{}", e.remedy());
+        // The whole /10, not just the first octet.
+        assert_eq!(announceable("100.127.255.255").unwrap_err(), Unannounceable::Cgnat);
+    }
+
+    /// The range's EDGES, because an off-by-one here silently drops real
+    /// public addresses or admits unroutable ones.
+    #[test]
+    fn the_cgnat_range_stops_where_rfc_6598_says() {
+        assert!(announceable("100.63.255.255").is_ok(), "below the range is public");
+        assert!(announceable("100.128.0.1").is_ok(), "above the range is public");
+        assert!(announceable("100.64.0.0").is_err());
+    }
+
+    /// A LAN address in a GLOBAL dht names a different machine in every house
+    /// that reads it.
+    #[test]
+    fn a_private_address_is_refused() {
+        for h in ["192.168.1.4", "10.0.0.7", "172.16.5.9"] {
+            assert_eq!(announceable(h).unwrap_err(), Unannounceable::Private, "{h}");
+        }
+    }
+
+    #[test]
+    fn loopback_and_nonsense_are_refused_distinctly() {
+        assert_eq!(announceable("127.0.0.1").unwrap_err(), Unannounceable::Loopback);
+        assert_eq!(announceable("not-an-ip").unwrap_err(), Unannounceable::Unparseable);
+        assert_eq!(announceable("").unwrap_err(), Unannounceable::Unparseable);
+    }
+
+    /// A real public address still passes -- a guard that refused everything
+    /// would pass every test above and stop the app working.
+    #[test]
+    fn a_public_address_is_announceable() {
+        for h in ["8.8.8.8", "1.1.1.1", "203.0.113.5"] {
+            assert!(announceable(h).is_ok(), "{h} should announce");
+        }
+        // IPv6 is not CGNAT and is routable.
+        assert!(announceable("2001:db8::1").is_ok());
+    }
+
+    /// Every refusal names a next step: "cannot announce" alone sends the
+    /// caller to guess.
+    #[test]
+    fn every_refusal_carries_a_remedy() {
+        for e in [Unannounceable::Cgnat, Unannounceable::Private,
+                  Unannounceable::Loopback, Unannounceable::Unparseable] {
+            assert!(e.remedy().len() > 10, "{e:?}");
+        }
+    }
+}
 }

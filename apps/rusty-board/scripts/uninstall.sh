@@ -62,6 +62,11 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 # 2. Remove systemd unit
+DBUS_ACT="${PREFIX:-$HOME/.local}/share/dbus-1/services/io.rustyboard.Keyboard.service"
+if [[ -f "$DBUS_ACT" ]]; then
+    echo "    rm $DBUS_ACT"
+    rm -f "$DBUS_ACT"
+fi
 if [[ -f "$SYSTEMD_USER_DIR/rusty-board.service" ]]; then
     echo "    rm $SYSTEMD_USER_DIR/rusty-board.service"
     rm -f "$SYSTEMD_USER_DIR/rusty-board.service"

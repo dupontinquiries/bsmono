@@ -44,11 +44,14 @@ pub struct State {
     pub outcome: Option<Outcome>,
     pub view: View,
     pub tex: Option<(View, egui::TextureHandle)>,
+    /// The codec to encode with, by codename. See `codec_catalog`.
+    pub codec: &'static str,
 }
 impl Default for State {
     fn default() -> Self {
         State { quality: 0.7, dead_zone: 1.0, chroma_boost: 0, size: 128, source: Source::pattern(128),
-                image_path: String::new(), load_error: None, report: None, outcome: None, view: View::Decoded, tex: None }
+                image_path: String::new(), load_error: None, report: None, outcome: None, view: View::Decoded, tex: None,
+                codec: "Keystone" }
     }
 }
 
@@ -133,6 +136,10 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     if let Some(e) = &s.load_error { ui.colored_label(ui.visuals().error_fg_color, e); }
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(format!("source: {} ({}×{})", s.source.name, s.source.w, s.source.h)).weak().small());
+        // EVERY codec is listed; only the ones that write real bytes are
+        // selectable, the rest greyed with why. Today that is Keystone alone --
+        // see `codec_catalog` for the trace behind each capability.
+        crate::codec_catalog::picker(ui, "lab_codec", crate::codec_catalog::Purpose::Encode, &mut s.codec);
         if ui.button("▶ encode").clicked() {
             let (r, o) = run_source(&s.source, s.quality, s.dead_zone, s.chroma_boost);
             s.report = Some(r); s.outcome = Some(o); s.tex = None;

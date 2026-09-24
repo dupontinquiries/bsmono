@@ -24,7 +24,7 @@ path. Expect surprises there; the trace is designed to explain them.
 ## Stage 0 — get the code (on the Mac)
 
 ```sh
-git clone -b tideshell c19unified-025-tideshell-deploy.bundle mono
+git clone c19unified-038-tideshell-merged.bundle mono   # main: the tideshell branch is merged into it
 cd mono && git log --oneline -1          # note this commit in your report
 ```
 
@@ -169,13 +169,15 @@ Try each, and for each note what happened on screen **and** the trace lines:
 | 13 | turn the phone to landscape, hold it there | `orientation: iio-sensor-proxy accelerometer` at start; after ~0.5 s in landscape `rotate LeftUp` (or RightUp) then `ok: rotated DSI-1 to 90`; the screen rotates. If it rotates the WRONG way, set `shell.rotate.flip = on`. Needs `wlr-randr` (`apk add wlr-randr`); a 45° tilt or laying it flat must not rotate. `shell.rotate.auto = off` disables |
 | 21 | brightness on this panel: read `backlight write mode:` at start | `Safe` on the FP5 (its backlight is `ae94000.dsi.0`): one write per settled value, because the DPU driver corrupts the display under a stream of changes (pmaports #4274: garbage bars, flicker, the panel switching off). The slider still animates; the panel steps once when you let go. `shell.brightness.mode = smooth` re-enables the ramp only on a kernel with Marcel's DPU patch from that issue |
 | 10 | at start: read the `ambient:` and `backlight:` lines; then cover the light sensor (top bezel) for 5 s, uncover | ideally `ambient: iio-sensor-proxy (lux)` and `backlight: <name> (max N) via logind ...`; screen dims ~3 s after covering, brightens quickly after uncovering. `no light sensor found` = time of day only (report it); `cannot set` = neither logind nor sysfs worked (report the line) |
+| 14 | lock the phone (let cosmic blank it, or the power key), wait 10 s, wake it; then leave it in a dark place 30 s and look | on lock `output power: compositor reports Off (output 0)`, on wake `... On (output 0)` -- tideshell now SEES cosmic's own blanking. While off, auto-brightness must write nothing: `journalctl -k -b \| grep -ci dsi` should not grow across the lock (it grew constantly before). After wake the brightness is re-asserted (screen not stuck dark). In the dark the screen is DIM, never black: the floor is raw 16 of 4095 (was 1, visually off) -- if 16 is still too dark or too bright, report it; it is one constant, `raw_floor` in sensors.rs |
+| 15 | at start: read the `session env:` lines; then open the Keyboard mode (row 7) | `tideshell: session env: systemctl WAYLAND_DISPLAY ...` and `... dbus-update-activation-environment ...` (each `failed:` line names why). Re-run rusty-board's `scripts/install.sh` first so it installs the D-Bus activation file; then `busctl --user list --activatable \| grep -i rustyboard` lists it, and the keyboard starts on demand instead of `not activatable` |
 
 Also capture screenshots if `grim` is available
 (`WAYLAND_DISPLAY=... grim ~/ts-N.png`) for #2, #5, #9.
 
 **Gate:** tideshell stays running, strips visible, #2 and #5 work.
 
-**Report:** `~/tideshell-run.log`, the table filled in, screenshots, and for row 10 the output of `busctl --system list | grep -i sensorproxy` and `ls /sys/class/backlight/`; for row 11, `id` and `ls -l /dev/input/`.
+**Report:** `~/tideshell-run.log`, the table filled in, screenshots, the `journalctl -k -b | grep -ci dsi` count before and after row 14, and for row 10 the output of `busctl --system list | grep -i sensorproxy` and `ls /sys/class/backlight/`; for row 11, `id` and `ls -l /dev/input/`.
 
 If a gesture does nothing, the trace says why: no `edge pending` line = the
 touch never reached the strip (edge dead zone / cosmic-panel on top); an

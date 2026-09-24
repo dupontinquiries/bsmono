@@ -356,7 +356,7 @@ impl Gpu {
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    label: Some("skydribble"),
+                    label: Some("blackstar"),
                     required_features: wgpu::Features::empty(),
                     // ASK FOR THE ADAPTER'S 3D TEXTURE LIMIT, not just its
                     // resolution.

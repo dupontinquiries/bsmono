@@ -120,9 +120,18 @@ pub fn threshold(g: &Gray, r: Rect) -> u8 {
 /// screws, tape, glare and the edge of someone's thumb in it, and every
 /// one of those is a connected component.
 pub fn glyph_boxes(g: &Gray, r: Rect, ink: Ink, t: u8) -> Vec<Rect> {
+    // INCLUSIVE ON THE DARK SIDE. Otsu returns the last value of the LOW
+    // class, so on a clean render -- ink at 0, board at 255 -- it returns 0,
+    // and `< 0` is never true: every glyph box came back empty and the reader
+    // returned a blank Board for a perfectly legible frame.
+    //
+    // Nothing in between moves the answer either: the histogram is empty
+    // between the two modes, so `between > best` is never strictly greater and
+    // the threshold stays at the first mode. That is correct Otsu; the bug was
+    // reading its output as an exclusive bound.
     let is_ink = |x: usize, y: usize| match ink {
-        Ink::DarkOnLight => g.at(x, y) < t,
-        Ink::LightOnDark => g.at(x, y) >= t,
+        Ink::DarkOnLight => g.at(x, y) <= t,
+        Ink::LightOnDark => g.at(x, y) > t,
     };
     let (x0, y0) = (r.x, r.y);
     let (x1, y1) = ((r.x + r.w).min(g.w), (r.y + r.h).min(g.h));
@@ -159,7 +168,14 @@ pub fn glyph_boxes(g: &Gray, r: Rect, ink: Ink, t: u8) -> Vec<Rect> {
             let tall_enough = bh * 8 >= rh;
             let not_a_speck = n >= 6 && bw >= 2 && bh >= 4;
             let not_a_smear = bw <= rw / 2 && bh <= rh;
-            let plausible_aspect = bw * 4 >= bh && bh >= bw;
+            // Down to a stroke a TWENTY-FOURTH of its height. A "1" is a lone
+            // vertical stroke -- measured at 2 x 44 on the test board (1/22) --
+            // and `bw * 4 >= bh` rejected it as not glyph-shaped, so no scene
+            // number containing a 1 could ever be read. 1/12 was tried first
+            // and still dropped it. The cost is real: a hairline on a physical
+            // board (the hinge, a scratch) can now be a candidate, left to the
+            // recogniser's margin to reject.
+            let plausible_aspect = bw * 24 >= bh && bh >= bw;
             if tall_enough && not_a_speck && not_a_smear && plausible_aspect {
                 out.push(Rect { x: x0 + lo_x, y: y0 + lo_y, w: bw, h: bh });
             }
@@ -169,15 +185,62 @@ pub fn glyph_boxes(g: &Gray, r: Rect, ink: Ink, t: u8) -> Vec<Rect> {
     out
 }
 
+/// The tight bounding box of ALL ink in `r`, unfiltered. For templates, whose
+/// only ink is the glyph: `glyph_boxes` applies shape filters meant for a
+/// cluttered board, and an earlier attempt to use it here returned nothing
+/// and silently fell back to the full rect.
+pub fn ink_bbox(g: &Gray, r: Rect, ink: Ink, t: u8) -> Option<Rect> {
+    let (mut lo_x, mut lo_y, mut hi_x, mut hi_y) = (usize::MAX, usize::MAX, 0, 0);
+    for y in r.y..(r.y + r.h).min(g.h) {
+        for x in r.x..(r.x + r.w).min(g.w) {
+            let v = g.at(x, y);
+            if match ink { Ink::DarkOnLight => v <= t, Ink::LightOnDark => v > t } {
+                lo_x = lo_x.min(x); hi_x = hi_x.max(x);
+                lo_y = lo_y.min(y); hi_y = hi_y.max(y);
+            }
+        }
+    }
+    (lo_x <= hi_x).then(|| Rect { x: lo_x, y: lo_y, w: hi_x - lo_x + 1, h: hi_y - lo_y + 1 })
+}
+
 /// The size every glyph is normalised to before comparison.
 pub const CELL: usize = 8;
 
 /// A glyph as a small binary grid, which is what gets compared.
-pub type Cell = [bool; CELL * CELL];
+///
+/// COVERAGE, not a bit: each entry is the fraction of its patch that is ink,
+/// 0..=255. With binary cells a stroke that straddled a row boundary was
+/// counted in full or lost by a vote threshold -- and which, depended on the
+/// exact framing. '8' and 'O' differ ONLY by the middle bar; it was tuned
+/// back into view once (the 25% vote), then vanished again the moment the
+/// framing changed, taking seven template pairs to IDENTICAL cells with it.
+/// Coverage cannot lose a stroke: split across two rows, it shows in both.
+pub type Cell = [u8; CELL * CELL];
 
 /// Scale a glyph box into the comparison grid.
 pub fn normalise(g: &Gray, b: Rect, ink: Ink, t: u8) -> Cell {
-    let mut c = [false; CELL * CELL];
+    // THE SAME FRAME ON BOTH SIDES. `b` is a tight ink box -- from
+    // `glyph_boxes` for a glyph off a frame, from `ink_bbox` for a template.
+    // It is widened (or heightened) around its centre to the glyphs' nominal
+    // 3:4 before sampling. Squeezing the tight box itself into the square
+    // would stretch a "1" (a lone stroke) into a solid block; normalising
+    // templates from their full drawing rect while glyphs used the tight box
+    // compared two differently distorted pictures ('1', 'V', 'I' for "14B").
+    let (bw, bh) = (b.w.max(1) as i64, b.h.max(1) as i64);
+    let (fx, fy, fw, fh) = if bw * 4 < bh * 3 {
+        let fw = bh * 3 / 4;
+        (b.x as i64 + bw / 2 - fw / 2, b.y as i64, fw, bh)
+    } else {
+        let fh = bw * 4 / 3;
+        (b.x as i64, b.y as i64 + bh / 2 - fh / 2, bw, fh)
+    };
+    // Outside the image is background, never ink.
+    let is_ink = |x: i64, y: i64| {
+        if x < 0 || y < 0 || x >= g.w as i64 || y >= g.h as i64 { return false; }
+        let v = g.at(x as usize, y as usize);
+        match ink { Ink::DarkOnLight => v <= t, Ink::LightOnDark => v > t }
+    };
+    let mut c = [0u8; CELL * CELL];
     for cy in 0..CELL {
         for cx in 0..CELL {
             // sample the source box and light the cell on a 25% vote
@@ -208,16 +271,19 @@ pub fn normalise(g: &Gray, b: Rect, ink: Ink, t: u8) -> Cell {
             // pixel in an otherwise-dark cell -- 25% keeps that
             // rejection, just not so strict that a stroke exactly this
             // thin can fall entirely between two votes.
-            let sx0 = b.x + cx * b.w / CELL;
-            let sx1 = (b.x + (cx + 1) * b.w / CELL).max(sx0 + 1);
-            let sy0 = b.y + cy * b.h / CELL;
-            let sy1 = (b.y + (cy + 1) * b.h / CELL).max(sy0 + 1);
+            let k = CELL as i64;
+            let sx0 = fx + cx as i64 * fw / k;
+            let sx1 = (fx + (cx as i64 + 1) * fw / k).max(sx0 + 1);
+            let sy0 = fy + cy as i64 * fh / k;
+            let sy1 = (fy + (cy as i64 + 1) * fh / k).max(sy0 + 1);
             let mut lit = 0;
             let mut n = 0;
             for y in sy0..sy1 { for x in sx0..sx1 {
                 n += 1;
-                let v = g.at(x, y);
-                if match ink { Ink::DarkOnLight => v < t, Ink::LightOnDark => v >= t } { lit += 1; }
+                // Same inclusive bound as `glyph_boxes` -- Otsu returns the
+                // last value of the LOW class, so `< t` with t=0 counted no
+                // ink and every glyph normalised to the same empty cell.
+                if is_ink(x, y) { lit += 1; }
             }}
             // ANY-INK (`lit > 0`) was tried first and reverted: it fixed
             // '0' vs '8' but fattened every stroke enough that OTHER
@@ -230,15 +296,20 @@ pub fn normalise(g: &Gray, b: Rect, ink: Ink, t: u8) -> Cell {
             // pixels (25% exactly) on each side of the boundary, so this
             // is the lowest threshold that captures them without also
             // capturing a single stray noise pixel the way `lit > 0` does.
-            c[cy * CELL + cx] = n > 0 && lit * 4 >= n;
+            c[cy * CELL + cx] = if n == 0 { 0 } else { (lit * 255 / n) as u8 };
         }
     }
     c
 }
 
+/// Summed coverage difference: 0 for identical cells, `MAX_DISTANCE` for
+/// all-ink against no-ink.
 fn distance(a: &Cell, b: &Cell) -> usize {
-    a.iter().zip(b.iter()).filter(|(x, y)| x != y).count()
+    a.iter().zip(b.iter()).map(|(x, y)| x.abs_diff(*y) as usize).sum()
 }
+
+/// The largest possible `distance`.
+const MAX_DISTANCE: usize = CELL * CELL * 255;
 
 /// What a glyph was read as, and how sure.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -261,7 +332,7 @@ pub fn recognise(c: &Cell, templates: &[(char, Cell)]) -> Option<Read> {
     // three from `B` is not an 8 -- it is unreadable, and reporting it
     // as an 8 with high confidence because the distance was small is
     // how a take gets filed under the wrong number.
-    let runner = scored.iter().find(|(_, c2)| *c2 != ch).map(|(d, _)| *d).unwrap_or(CELL * CELL);
+    let runner = scored.iter().find(|(_, c2)| *c2 != ch).map(|(d, _)| *d).unwrap_or(MAX_DISTANCE);
     // RELATIVE margin, normalised by the runner-up rather than by a fixed
     // fraction of the cell.
     //
@@ -286,7 +357,7 @@ pub fn recognise(c: &Cell, templates: &[(char, Cell)]) -> Option<Read> {
     } else {
         runner.saturating_sub(best) as f32 / runner as f32
     };
-    let closeness = 1.0 - (best as f32 / (CELL * CELL) as f32);
+    let closeness = 1.0 - (best as f32 / MAX_DISTANCE as f32);
     Some(Read { ch, sure: (margin.min(1.0) * closeness).clamp(0.0, 1.0) })
 }
 
@@ -297,11 +368,39 @@ pub fn recognise(c: &Cell, templates: &[(char, Cell)]) -> Option<Read> {
 /// against a reader that fails on any real frame.
 pub fn templates() -> Vec<(char, Cell)> {
     "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().map(|ch| {
-        let mut g = Gray::new(CELL * 3, CELL * 4);
+        // Drawn at a real board size WITH A MARGIN, so the glyph's own ink
+        // box can be measured -- and normalised exactly as a glyph read off a
+        // frame is. (The size matters: stroke width is relative, so a tiny
+        // template rasterises differently from the glyph it must match.)
+        let (m, gw, gh) = (8usize, 30usize, 44usize);
+        let mut g = Gray::new(gw + 2 * m, gh + 2 * m);
         for p in g.px.iter_mut() { *p = 255; }
-        draw_glyph(&mut g, ch, 0, 0, CELL * 3, CELL * 4);
-        let cell = normalise(&g, Rect { x: 0, y: 0, w: CELL * 3, h: CELL * 4 },
-                             Ink::DarkOnLight, 128);
+        draw_glyph(&mut g, ch, m, m, gw, gh);
+        // ## Why matching still fails, measured
+        //
+        // A glyph read off a frame is normalised from `glyph_boxes`' output,
+        // which is the bounding box of the INK -- tight on all four sides. A
+        // template is normalised from the full 3:4 rect it was drawn into.
+        // Measured on the test board: template 0.750 aspect against a real
+        // glyph box at 0.591. Both squash into the same CELL x CELL square, so
+        // every stroke lands in a different row and the comparison is between
+        // two differently-distorted pictures. Reads come back '1', 'V', 'I'
+        // for "14B" at 0.08-0.34 confidence: a shape mismatch, not a threshold
+        // to tune.
+        //
+        // The obvious fix -- take the template's own ink box -- was tried and
+        // does NOTHING: `glyph_boxes`' `not_a_smear` filter is `bw <= rw / 2`,
+        // and a template glyph drawn across the full width of its rect fails
+        // it, so the call returns nothing and falls back to the full rect.
+        // Identical output, and the fallback hid that it had no effect.
+        //
+        // So the fix is one of: draw templates into a rect with margin so
+        // their ink box is findable, or normalise BOTH sides from the same
+        // kind of rect. Both change every template, which wants a measurement
+        // pass rather than a guess.
+        let whole = Rect { x: 0, y: 0, w: g.w, h: g.h };
+        let bbox = ink_bbox(&g, whole, Ink::DarkOnLight, 128).unwrap_or(whole);
+        let cell = normalise(&g, bbox, Ink::DarkOnLight, 128);
         (ch, cell)
     }).collect()
 }
@@ -657,7 +756,7 @@ mod tests {
         assert_eq!(b.label(), "unread");
         // and the margin rule: a glyph equally close to two templates
         // is unread however close it is to both
-        let ambiguous = [true; CELL * CELL];
+        let ambiguous = [255u8; CELL * CELL];
         let r = recognise(&ambiguous, &templates()).unwrap();
         assert!(r.sure < MIN_SURE, "all-ink is not a character: {r:?}");
     }
@@ -740,7 +839,7 @@ mod tests {
         // And none is blank -- an all-false cell would tie with any other
         // blank and is a glyph that draws nothing.
         for (ch, cell) in &t {
-            assert!(cell.iter().any(|b| *b), "{ch} rendered nothing");
+            assert!(cell.iter().any(|&b| b > 0), "{ch} rendered nothing");
         }
     }
 

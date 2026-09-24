@@ -12,3 +12,10 @@ path = "src/lib.rs"
 # XDG base dirs + the flat [section] key=value store. Same persistence plumbing
 # as the rest of the fleet, so hatch's config sits where the settings app looks.
 config-kit = { path = "../../../../shared/config-kit" }
+# status feed off the DHT: the same presence node snapclone uses. Optional, so the launcher's
+# default build stays free of sockets.
+snapclone-presence = { path = "../../../snapclone/rust/snapclone-presence", optional = true }
+snapcore = { path = "../../../../shared/snapcore", optional = true }
+
+[features]
+status-dht = ["dep:snapclone-presence", "dep:snapcore"]

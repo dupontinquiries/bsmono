@@ -21,333 +21,568 @@ pub struct VideoInfo {
     pub w: usize,
     pub h: usize,
     pub fps: f64,
+    /// The rate EXACTLY as the header will store it. From the stream's own
+    /// rational where it fits (30000/1001, 144/1), else `fps_ratio(fps)`. Kept as
+    /// a rational because the float path is where 144 fps used to wrap to 12.9.
+    pub rate: (u16, u16),
     pub duration_s: f64,
     pub codec: String,
+    /// ffprobe's absolute stream index -- handed to ffmpeg as `-map 0:N` so the
+    /// stream decoded is the stream probed.
+    pub stream: usize,
 }
 
-/// `ffprobe -show_streams`, the same call `fao_app::probe_video` makes, parsed with `serde_json`
-/// rather than the ad hoc string slicing this needed anyway once `fps_num`/`fps_den` (an `N/D`
-/// string in ffprobe's own output) had to be split.
+/// Parse `ffprobe -show_streams -show_format` JSON.
+///
+/// Picks the first VIDEO stream that is not cover art. Two traps, both real:
+///   * stream 0 is often AUDIO in an OBS capture -- fao_app's `streams[0]` then
+///     reads no width and silently substitutes 640x480, slicing every 1080p frame
+///     as 640x480 (confirmed on an audio-first MKV);
+///   * an MKV's cover art is a `video` stream with `disposition.attached_pic`, so
+///     "first video stream" can be a 300x300 thumbnail while ffmpeg decodes the
+///     real picture -- a frame-size mismatch on every frame.
+/// No video stream is an ERROR, never a default size.
+pub fn parse_probe(json: &str) -> Result<VideoInfo, String> {
+    let info: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("ffprobe JSON: {e}"))?;
+    let streams = info["streams"].as_array().ok_or("no streams")?;
+    let v = streams.iter()
+        .find(|s| s["codec_type"] == "video" && s["disposition"]["attached_pic"].as_u64() != Some(1))
+        .ok_or("no video stream (only audio or cover art)")?;
+    let w = v["width"].as_u64().ok_or("video stream has no width")? as usize;
+    let h = v["height"].as_u64().ok_or("video stream has no height")? as usize;
+    let stream = v["index"].as_u64().ok_or("video stream has no index")? as usize;
+    let rat = v["avg_frame_rate"].as_str().and_then(parse_ratio).filter(|&(n, d)| n > 0 && d > 0)
+        .or_else(|| v["r_frame_rate"].as_str().and_then(parse_ratio).filter(|&(n, d)| n > 0 && d > 0))
+        .ok_or("no usable frame rate")?;
+    let fps = rat.0 as f64 / rat.1 as f64;
+    let rate = fit_u16(rat).unwrap_or_else(|| fao_v1::fps_ratio(fps));
+    let duration_s = info["format"]["duration"].as_str().and_then(|s| s.parse().ok())
+        .or_else(|| v["duration"].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(0.0);
+    let codec = v["codec_name"].as_str().unwrap_or("?").to_string();
+    Ok(VideoInfo { w, h, fps, rate, duration_s, codec, stream })
+}
+
+/// "30000/1001" -> (30000, 1001), reduced.
+fn parse_ratio(s: &str) -> Option<(u64, u64)> {
+    let (n, d) = s.split_once('/')?;
+    let (n, d): (u64, u64) = (n.trim().parse().ok()?, d.trim().parse().ok()?);
+    if d == 0 { return None; }
+    let g = gcd(n, d).max(1);
+    Some((n / g, d / g))
+}
+
+fn gcd(a: u64, b: u64) -> u64 { if b == 0 { a } else { gcd(b, a % b) } }
+
+fn fit_u16((n, d): (u64, u64)) -> Option<(u16, u16)> {
+    (n <= u16::MAX as u64 && d <= u16::MAX as u64).then(|| (n as u16, d as u16))
+}
+
+/// `ffprobe`, then [`parse_probe`].
 pub fn probe(path: &str) -> Result<VideoInfo, String> {
     let out = Command::new("ffprobe")
         .args(["-v", "quiet", "-print_format", "json", "-show_streams", "-show_format"])
         .arg(path).output().map_err(|e| format!("ffprobe: {e}"))?;
     if !out.status.success() { return Err("ffprobe failed (not a media file?)".into()); }
-    let info: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("ffprobe JSON: {e}"))?;
-    let streams = info["streams"].as_array().ok_or("no streams")?;
-    let v = streams.iter().find(|s| s["codec_type"] == "video").ok_or("no video stream")?;
-    let w = v["width"].as_u64().ok_or("no width")? as usize;
-    let h = v["height"].as_u64().ok_or("no height")? as usize;
-    let fps = v["avg_frame_rate"].as_str().and_then(parse_rational)
-        .filter(|f| *f > 0.0 && *f < 1000.0)
-        .or_else(|| v["r_frame_rate"].as_str().and_then(parse_rational))
-        .unwrap_or(30.0);
-    let duration_s = info["format"]["duration"].as_str().and_then(|s| s.parse().ok())
-        .or_else(|| v["duration"].as_str().and_then(|s| s.parse().ok()))
-        .unwrap_or(0.0);
-    let codec = v["codec_name"].as_str().unwrap_or("?").to_string();
-    Ok(VideoInfo { w, h, fps, duration_s, codec })
+    parse_probe(&String::from_utf8_lossy(&out.stdout))
 }
 
-fn parse_rational(s: &str) -> Option<f64> {
-    let (n, d) = s.split_once('/')?;
-    let (n, d): (f64, f64) = (n.parse().ok()?, d.parse().ok()?);
-    (d != 0.0).then_some(n / d)
-}
-
-/// Decode every frame to packed RGB8 in ONE ffmpeg process (a `rawvideo` pipe to stdout) rather
-/// than fao_app's one-`Command`-per-frame pattern, which is fine for a single still but not for
-/// a sequence. Width/height are rounded down to even numbers — the encoder's chroma planes are
-/// half-size in both axes, the same crop `lab::Source::load` applies to a loaded image.
-/// `max_frames` bounds memory for the egui page (a 1080p minute is ~11 GB uncompressed); `None`
-/// decodes the whole file.
-pub fn decode_frames_rgb(path: &str, w: usize, h: usize, max_frames: Option<usize>) -> Result<Vec<Vec<u8>>, String> {
-    let (w, h) = (w & !1, h & !1);
-    if w < 8 || h < 8 { return Err(format!("{w}x{h} is too small to encode")); }
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-i").arg(path);
-    if let Some(n) = max_frames { cmd.args(["-vframes", &n.to_string()]); }
-    cmd.args(["-vf", &format!("scale={w}:{h}")])
-       .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-v", "error", "-"])
-       .stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd.output().map_err(|e| format!("ffmpeg: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("ffmpeg decode failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+/// Index slots to reserve: duration x rate with a quarter's margin plus a
+/// floor, since variable-rate captures run over their average. Or exactly the
+/// cap, when one is set.
+pub fn reserve_for(info: &VideoInfo, max_frames: Option<usize>) -> u64 {
+    if let Some(n) = max_frames { return n.max(1) as u64; }
+    if info.duration_s > 0.0 && info.fps > 0.0 {
+        (info.duration_s * info.fps * 1.25).ceil() as u64 + 1024
+    } else {
+        // Unknown length: 16 bytes a slot, so 4 MB of index covers ~73 min at 60.
+        262_144
     }
-    let fsz = w * h * 3;
-    if out.stdout.is_empty() { return Err("ffmpeg produced no frames".into()); }
-    if out.stdout.len() % fsz != 0 {
-        return Err(format!("ffmpeg output {} bytes, not a multiple of the {fsz}-byte frame size", out.stdout.len()));
-    }
-    Ok(out.stdout.chunks_exact(fsz).map(|c| c.to_vec()).collect())
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TranscodeReport {
     pub frames: usize,
+    /// Of `frames`, how many were exact repeats stored as one-byte `R` frames.
+    pub repeats: usize,
+    /// Of `frames`, how many were Quiltstone patch frames (`M`).
+    pub patches: usize,
     pub w: usize,
     pub h: usize,
     pub input_bytes: u64,
     pub output_bytes: u64,
     pub mean_psnr: f64,
-    pub i_frames: usize,
-    pub t_frames: usize,
 }
 
-/// One frame from ffmpeg's pipe at a time, so an encode holds ONE decoded frame in memory,
-/// not the whole video (`decode_frames_rgb` holds all of them: fine for a test clip, ~3.7 GB for
-/// twenty seconds of 1080p). stderr is drained on a thread (a full stderr pipe would stall
-/// ffmpeg), and ffmpeg is killed when the reader is dropped, so a cancelled encode does not
-/// leave it running.
-pub struct FrameReader {
-    child: std::process::Child,
-    out: std::process::ChildStdout,
-    err: std::sync::Arc<std::sync::Mutex<String>>,
-    pub w: usize,
-    pub h: usize,
-    finished: bool,
+/// Transcode into any `Write + Seek`, ONE FRAME AT A TIME.
+///
+/// The old path called `ffmpeg ... .output()`, which buffers ffmpeg's ENTIRE
+/// decoded output, then copied it into a Vec per frame, kept every payload for
+/// the container, and returned the file as one Vec -- its own doc put a 1080p
+/// minute at ~11 GB, so an hour-long match could not run at all. This reads
+/// frames off ffmpeg's pipe with `read_exact` and writes each straight into a
+/// `FaoStreamWriter`: memory is one frame, whatever the length.
+pub fn transcode_to_writer<W: std::io::Write + std::io::Seek>(
+    path: &str, out: W, quality: u8, max_frames: Option<usize>,
+    progress: impl FnMut(usize, usize),
+) -> Result<(W, TranscodeReport), String> {
+    transcode_cancellable(path, out, quality, max_frames, progress, None)
 }
 
-impl FrameReader {
-    pub fn open(path: &str, w: usize, h: usize, max_frames: Option<usize>) -> Result<FrameReader, String> {
-        let (w, h) = (w & !1, h & !1);
-        if w < 8 || h < 8 { return Err(format!("{w}x{h} is too small to encode")); }
-        let mut cmd = Command::new("ffmpeg");
-        cmd.arg("-i").arg(path);
-        if let Some(n) = max_frames { cmd.args(["-vframes", &n.to_string()]); }
-        cmd.args(["-vf", &format!("scale={w}:{h}")])
-           .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-v", "error", "-"])
-           .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| format!("ffmpeg: {e}"))?;
-        let out = child.stdout.take().ok_or("ffmpeg: no stdout")?;
-        let mut stderr = child.stderr.take().ok_or("ffmpeg: no stderr")?;
-        let err = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let sink = err.clone();
-        std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = std::io::Read::read_to_string(&mut stderr, &mut s);
-            if let Ok(mut e) = sink.lock() { *e = s; }
-        });
-        Ok(FrameReader { child, out, err, w, h, finished: false })
-    }
+/// [`transcode_to_writer`], stoppable between frames by setting `cancel`.
+///
+/// A folder of matches is hours of work; a job that cannot be stopped holds the
+/// machine hostage. Checked once per frame, so it stops within one frame's
+/// encode, and the partial output is discarded by the caller rather than left
+/// behind looking like a finished file.
+pub fn transcode_cancellable<W: std::io::Write + std::io::Seek>(
+    path: &str, out: W, quality: u8, max_frames: Option<usize>,
+    progress: impl FnMut(usize, usize), cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(W, TranscodeReport), String> {
+    transcode_cancellable_with(path, out, quality, max_frames, progress, cancel, MOTION_DEFAULT)
+}
 
-    pub fn frame_bytes(&self) -> usize { self.w * self.h * 3 }
+/// Whether transcodes predict changed blocks from the previous frame (motion
+/// patches, marker Q) unless told otherwise. See `transcode_cancellable_with`.
+///
+/// ON, because at the same quality setting compact was smaller on every 1080p
+/// scene measured, at equal or better quality on both the mean and the worst
+/// frame (q80, every frame compared with the source):
+///
+///   scene          fast                 compact              size
+///   test pattern   8.99 MB, 52.9 fps    7.74 MB, 25.9 fps    -14%, equal quality
+///   static scene   4.36 MB, 61.3 fps    2.75 MB, 38.0 fps    -37%, +0.15 dB mean
+///   camera pan    11.50 MB, 40.5 fps    6.90 MB, 16.4 fps    -40%, +2.0 dB mean
+///
+/// The cost is SPEED: frames encode one after another (each predicted from
+/// the decoded one before), so compact runs 0.4-0.6x fast mode on one core,
+/// and the gap is larger on many cores, where fast mode encodes in parallel.
+/// (Static-scene figures predate the motion search's early exit.)
+pub const MOTION_DEFAULT: bool = true;
 
-    /// The next w×h RGB24 frame; `None` at a clean end. A short final read, or ffmpeg exiting
-    /// with an error, is an `Err` carrying ffmpeg's own message.
-    pub fn next_frame(&mut self) -> Result<Option<Vec<u8>>, String> {
-        if self.finished { return Ok(None); }
-        let mut buf = vec![0u8; self.frame_bytes()];
-        let mut got = 0;
-        while got < buf.len() {
-            match std::io::Read::read(&mut self.out, &mut buf[got..]) {
-                Ok(0) => break,
-                Ok(n) => got += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(format!("reading ffmpeg: {e}")),
+/// [`transcode_cancellable`] with the motion choice explicit.
+///
+/// `motion`: COMPACT (smaller files; frames encode one after another, because
+/// each is predicted from the decoded picture of the one before) versus FAST
+/// (patches coded from scratch; frames encode in parallel).
+pub fn transcode_cancellable_with<W: std::io::Write + std::io::Seek>(
+    path: &str, out: W, quality: u8, max_frames: Option<usize>,
+    mut progress: impl FnMut(usize, usize), cancel: Option<&std::sync::atomic::AtomicBool>,
+    motion: bool,
+) -> Result<(W, TranscodeReport), String> {
+    use std::io::Read;
+    let info = probe(path)?;
+    let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let (w, h) = (info.w & !1, info.h & !1);
+    if w < 8 || h < 8 { return Err(format!("{w}x{h} is too small to encode")); }
+    let reserve = reserve_for(&info, max_frames);
+    let estimate = reserve.saturating_sub(1024).max(1) as usize;
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error", "-i"]).arg(path)
+       .args(["-map", &format!("0:{}", info.stream)]);
+    if let Some(n) = max_frames { cmd.args(["-frames:v", &n.to_string()]); }
+    // CROP an odd edge, never scale: every even size round-trips through this
+    // codec unchanged (tested down to 18x16 and 1366x768), and a scale filter
+    // would resample every pixel of a frame that needed no change.
+    if (w, h) != (info.w, info.h) { cmd.args(["-vf", &format!("crop={w}:{h}:0:0")]); }
+    cmd.args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+       .stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("ffmpeg: {e}"))?;
+    let mut stdout = child.stdout.take().ok_or("no ffmpeg stdout")?;
+    // DRAIN stderr on a thread: undrained, a chatty decode fills the pipe and
+    // ffmpeg blocks writing to it while we block reading stdout -- deadlock.
+    let mut stderr = child.stderr.take().ok_or("no ffmpeg stderr")?;
+    let err_thread = std::thread::spawn(move || {
+        let mut e = String::new();
+        let _ = stderr.read_to_string(&mut e);
+        e
+    });
+
+    let mut writer = crate::export::FaoStreamWriter::new(out, w, h, info.rate.0, info.rate.1, quality, reserve)
+        .map_err(|e| format!("starting the file: {e}"))?;
+    let fsz = w * h * 3;
+    let workers = encode_workers();
+    let batch_size = (workers * 2).max(1);
+    let mut n = 0usize;
+    let mut psnr_sum = 0.0;
+    let mut psnr_n = 0usize;
+    // EXACT REPEATS become `R` frames: a one-byte payload the decoder resolves
+    // to the previous real frame. Game captures are full of them -- a 30 fps
+    // game recorded into a 60 fps file repeats every other frame; pauses,
+    // menus and loading screens repeat for seconds -- and each was being
+    // re-encoded in full. Detection is sequential (each frame against the one
+    // before), so it runs BEFORE the parallel encode, which then only sees the
+    // frames that differ.
+    let mut prev: Option<Vec<u8>> = None;
+    let mut run = 0usize;
+    let mut repeats = 0usize;
+    // QUILTSTONE PATCH FRAMES between keyframes (see `patch`): each block is
+    // judged against the source pixels it had when last SENT (`reference`), so
+    // skipping cannot accumulate error. `since_key` bounds seek cost.
+    let tol = crate::patch::tolerance(quality);
+    let n_blocks = { let (c, r) = crate::patch::grid(w, h); c * r };
+    let mut reference: Option<Vec<u8>> = None;
+    let mut since_key = 0usize;
+    let mut patches = 0usize;
+    // Size of the last keyframe written, for the patch-versus-keyframe check.
+    let mut last_key_len: Option<usize> = None;
+    // MOTION MODE ONLY: the decoder's picture of the last real frame, obtained
+    // by decoding the bytes just written -- the closed loop.
+    let mut prev_dec: Option<Vec<u8>> = None;
+    // BATCHED, PARALLEL. Every frame here is an intra DCT frame, so frames are
+    // independent -- the ideal case for encoding several at once. A batch of
+    // `2 x workers` frames is read, encoded across `workers` threads, then
+    // written IN ORDER (each worker fills fixed slots; see `encode_batch`).
+    // Cancellation is checked per batch, so it lands within one batch.
+    let result: Result<(), String> = loop {
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            break Err(CANCELLED.into());
+        }
+        let (mut batch, ended) = match read_batch(&mut stdout, fsz, batch_size) {
+            Ok(b) => b,
+            Err(e) => break Err(e),
+        };
+        if batch.is_empty() {
+            break Ok(());
+        }
+        let (dups, carried) = mark_repeats(&batch, prev.as_deref(), run);
+        run = carried;
+        // PLAN, sequentially and cheaply: each non-repeat frame becomes a
+        // keyframe or a patch of its changed blocks. The expensive compression
+        // below only needs each job's own frame, so it stays parallel.
+        let mut jobs: Vec<Job> = Vec::new();
+        for (f, dup) in batch.iter().zip(&dups) {
+            if *dup {
+                since_key += 1;
+                continue;
+            }
+            let job = match reference.as_mut() {
+                Some(r) if since_key < KEY_EVERY => {
+                    let blocks = crate::patch::changed_blocks(f, r, w, h, tol);
+                    // Not in motion mode: a camera PAN changes every block yet
+                    // nearly all of them are predictable, and this rule would turn
+                    // every pan into keyframes. There the size check (a patch no
+                    // smaller than a keyframe is sent as one) decides instead.
+                    if !motion && blocks.len() * 100 > n_blocks * KEY_IF_CHANGED_PCT {
+                        None
+                    } else {
+                        crate::patch::update_reference(r, f, w, h, &blocks);
+                        Some(Job::Patch(f.as_slice(), blocks))
+                    }
+                }
+                _ => None,
+            };
+            match job {
+                Some(j) => { since_key += 1; patches += 1; jobs.push(j); }
+                None => {
+                    reference = Some(f.clone());
+                    since_key = 1;
+                    jobs.push(Job::Key(f.as_slice()));
+                }
             }
         }
-        if got == buf.len() { return Ok(Some(buf)); }
-        self.finished = true;
-        let status = self.child.wait().map_err(|e| format!("ffmpeg: {e}"))?;
-        // Give the stderr thread a moment to hand over ffmpeg's last words.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let msg = self.err.lock().map(|e| e.trim().to_string()).unwrap_or_default();
-        if !status.success() {
-            return Err(format!("ffmpeg decode failed: {}", if msg.is_empty() { status.to_string() } else { msg }));
-        }
-        if got != 0 {
-            return Err(format!("ffmpeg ended mid-frame ({got} of {} bytes)", self.frame_bytes()));
-        }
-        Ok(None)
-    }
-}
-
-impl Drop for FrameReader {
-    fn drop(&mut self) {
-        if !self.finished {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
-/// Per-frame result, for a live report.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FrameStat {
-    pub index: usize,
-    pub bytes: usize,
-    pub psnr: f64,
-    /// `b'D'` (intra, an anchor) or `b'T'` (predicted from `anchor`).
-    pub marker: u8,
-    pub anchor: Option<usize>,
-    /// Why this frame is what it is: "T", "I: first frame", "I: T larger than an I-frame", ...
-    pub why: String,
-}
-
-/// How to encode. `inter: false` is the original intra-only path (every frame `'D'`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct EncodeOpts {
-    pub quality: u8,
-    pub inter: bool,
-    /// Longest run from one I-frame to the next; bounds how far back a seek has to go.
-    pub max_gop: usize,
-    /// A T-frame is refused when its PSNR falls more than this below its anchor's.
-    pub max_psnr_drop: f64,
-}
-
-impl EncodeOpts {
-    pub fn intra(quality: u8) -> EncodeOpts { EncodeOpts { quality, inter: false, max_gop: 1, max_psnr_drop: 0.0 } }
-    pub fn inter(quality: u8) -> EncodeOpts { EncodeOpts { quality, inter: true, max_gop: 120, max_psnr_drop: 3.0 } }
-}
-
-struct Anchor {
-    index: usize,
-    /// The anchor as the DECODER will see it: the Player decodes the anchor to RGB and converts
-    /// it back to YUV before predicting (decode.rs, `b'T'`). Predicting from anything else —
-    /// the encoder's own YUV reconstruction — would put the RGB round-trip error into every
-    /// T-frame as a mismatch the residual never saw.
-    pred_yuv: Vec<u8>,
-    bytes: usize,
-    psnr: f64,
-}
-
-/// One frame in, one container frame out, with the I/T decision. Pure: no ffmpeg, no threads,
-/// so the policy is testable on synthetic frames.
-pub struct FrameEncoder {
-    pub w: usize,
-    pub h: usize,
-    pub opts: EncodeOpts,
-    anchor: Option<Anchor>,
-    index: usize,
-}
-
-pub struct Encoded {
-    pub stat: FrameStat,
-    pub payload: Vec<u8>,
-    /// What the Player will show for this frame.
-    pub recon_rgb: Vec<u8>,
-}
-
-impl FrameEncoder {
-    pub fn new(w: usize, h: usize, opts: EncodeOpts) -> FrameEncoder {
-        FrameEncoder { w, h, opts, anchor: None, index: 0 }
-    }
-
-    pub fn encode(&mut self, rgb: &[u8]) -> Encoded {
-        let (w, h, i) = (self.w, self.h, self.index);
-        self.index += 1;
-        let yuv = crate::decode::rgb_to_yuv420p(rgb, w, h);
-        let why_i = match &self.anchor {
-            _ if !self.opts.inter => "I: intra-only".to_string(),
-            None => "I: first frame".to_string(),
-            Some(_) if i > u16::MAX as usize => "I: past frame 65535 (T anchors are 16-bit)".to_string(),
-            Some(a) if i - a.index >= self.opts.max_gop => format!("I: GOP limit {}", self.opts.max_gop),
-            Some(a) => match self.try_t(&yuv, rgb, a) {
-                Ok(e) => return e,
-                Err(why) => why,
-            },
+        let encoded_vec = if motion {
+            // SEQUENTIAL, CLOSED LOOP. Each patch is planned against the
+            // decoder's own picture of the previous frame, and the frame's
+            // bytes are then DECODED to become the next frame's reference --
+            // so encoder and decoder predict from identical pixels.
+            //
+            // The patch-versus-keyframe check lives HERE in this mode: the
+            // choice must be made before the frame is decoded, or the next
+            // frame's prediction would come from a payload that was not sent.
+            let mut v = Vec::with_capacity(jobs.len());
+            for (k, job) in jobs.iter().enumerate() {
+                let measure = (n + k) % PSNR_EVERY == 0;
+                let r = match job {
+                    Job::Key(f) => encode_one(f, w, h, quality, measure),
+                    Job::Patch(f, blocks) => {
+                        let pd = prev_dec.as_deref().expect("a keyframe precedes every patch");
+                        let modes = crate::motion::plan(f, pd, w, h, blocks);
+                        let intra = modes.iter().filter(|m| m.is_none()).count();
+                        // A SCENE CUT, not a size comparison, triggers the keyframe
+                        // here: prediction failing for most of the frame. Size is the
+                        // wrong signal in this mode -- the first predicted frame after
+                        // a keyframe is EXPENSIVE because its full-resolution residual
+                        // repairs colour detail the keyframe's 4:2:0 lost (measured:
+                        // 4,497 bytes after a 2,848-byte key, then 1,232-2,012). A
+                        // size rule promoted it, restarted that same first step, and
+                        // cascaded: every frame became a keyframe.
+                        if intra * 100 > n_blocks * KEY_IF_CHANGED_PCT {
+                            patches -= 1;
+                            encode_one(f, w, h, quality, false)
+                        } else if intra == modes.len() || !crate::motion::fits(modes.len() - intra) {
+                            // (or too many predicted blocks for the stacked residual's
+                            // u16 height -- beyond 4K -- in which case plain intra)
+                            // NOTHING PREDICTED: a plain M patch -- the same intra blocks
+                            // without Q's per-block modes, length fields and three
+                            // residual headers. Measured: on a scene whose moving part
+                            // animates (so little is predictable) compact was 5% larger
+                            // than fast at equal quality, and it was that overhead.
+                            (crate::patch::encode(f, w, h, blocks, quality), None)
+                        } else {
+                            (crate::motion::encode(f, pd, w, h, blocks, &modes, quality), None)
+                        }
+                    }
+                };
+                // Decode with whichever decoder the WRITTEN marker selects -- the
+                // same dispatch the player makes.
+                let next = match r.0.first() {
+                    Some(&b'D') => {
+                        last_key_len = Some(r.0.len());
+                        fao_v1::decompress_frame_dct(&r.0, w, h).map(|yuv| crate::decode::yuv_to_rgb(&yuv, w, h))
+                    }
+                    Some(&m) if m == crate::patch::MARKER =>
+                        crate::patch::decode(&r.0, prev_dec.as_deref().expect("reference"), w, h),
+                    _ => crate::motion::decode(&r.0, prev_dec.as_deref().expect("reference"), w, h),
+                };
+                prev_dec = Some(next.ok_or("a frame this encoder wrote did not decode")?);
+                v.push(r);
+            }
+            v
+        } else {
+            encode_jobs(&jobs, n, w, h, quality, workers, PSNR_EVERY)
         };
-        let payload = fao_v1::compress_frame_dct(&yuv, w, h, self.opts.quality);
-        let recon_yuv = fao_v1::decompress_frame_dct(&payload, w, h).unwrap_or_else(|| yuv.clone());
-        let recon_rgb = crate::decode::yuv_to_rgb(&recon_yuv, w, h);
-        let p = psnr(rgb, &recon_rgb);
-        self.anchor = Some(Anchor { index: i, pred_yuv: crate::decode::rgb_to_yuv420p(&recon_rgb, w, h), bytes: payload.len(), psnr: p });
-        Encoded { stat: FrameStat { index: i, bytes: payload.len(), psnr: p, marker: b'D', anchor: None, why: why_i }, payload, recon_rgb }
-    }
-
-    fn try_t(&self, yuv: &[u8], rgb: &[u8], a: &Anchor) -> Result<Encoded, String> {
-        let (w, h) = (self.w, self.h);
-        let q = (self.opts.quality as u32 * 255 / 100) as u8;
-        let (tf, _est) = fao_v1::v21_predictive::TranslatedFrame::encode_from_anchor(yuv, &a.pred_yuv, w, h, a.index as u16, q)
-            .ok_or("I: no usable prediction")?;
-        let payload = tf.to_bytes(w, h);
-        if payload.len() >= a.bytes {
-            return Err(format!("I: T ({} B) not smaller than an I-frame ({} B)", payload.len(), a.bytes));
+        let mut encoded = encoded_vec.into_iter();
+        let mut job_of = jobs.iter();
+        let mut failed = None;
+        for dup in &dups {
+            let (payload, p) = if *dup {
+                repeats += 1;
+                (vec![b'R'], None)
+            } else {
+                let job = job_of.next().expect("one job per fresh frame");
+                let mut r = encoded.next().expect("one encoded result per fresh frame");
+                // A PATCH NO SMALLER THAN A KEYFRAME IS SENT AS A KEYFRAME. On a
+                // near-flat scene a keyframe is already tiny (flat DCT blocks are
+                // nearly free) and a patch adds fixed overhead: measured ~1,350
+                // vs 1,125 bytes. Re-encoding only happens in that losing case.
+                //
+                // The reference is deliberately NOT reset: planning already
+                // advanced it for later frames in this batch. It stays safe --
+                // for blocks the patch skipped, the reference is within `tol` of
+                // this frame, so a later skip is within 2*tol plus one coding.
+                if let (false, Job::Patch(f, _), Some(k)) = (motion, job, last_key_len) {
+                    if r.0.len() >= k {
+                        r = encode_one(f, w, h, quality, false);
+                        patches -= 1;
+                    }
+                }
+                r
+            };
+            if payload.first() == Some(&b'D') {
+                last_key_len = Some(payload.len());
+            }
+            if let Some(p) = p {
+                psnr_sum += p;
+                psnr_n += 1;
+            }
+            // 0 = "not measured" for unsampled frames. Nothing reads the
+            // per-frame header PSNR back from a file (checked: every PSNR shown
+            // in the UI comes from an in-memory encode result).
+            if let Err(e) = writer.push(&payload, b'D', p.unwrap_or(0.0)) {
+                failed = Some(format!("writing frame {n}: {e}"));
+                break;
+            }
+            n += 1;
+            progress(n, estimate.max(n));
         }
-        // Measure what the Player will actually show: parse the bytes and decode against the
-        // anchor the decoder derives, not the encoder's estimate.
-        let (back, fw, fh) = fao_v1::v21_predictive::TranslatedFrame::from_bytes(&payload).ok_or("I: T did not parse back")?;
-        let recon_yuv = back.decode_with_anchor(&a.pred_yuv, fw, fh).ok_or("I: T did not decode")?;
-        let recon_rgb = crate::decode::yuv_to_rgb(&recon_yuv, w, h);
-        let p = psnr(rgb, &recon_rgb);
-        if p < a.psnr - self.opts.max_psnr_drop {
-            return Err(format!("I: T PSNR {:.1} dB, {:.1} below its anchor", p, a.psnr - p));
+        prev = batch.pop();
+        if let Some(e) = failed {
+            break Err(e);
         }
-        let i = self.index - 1;
-        Ok(Encoded { stat: FrameStat { index: i, bytes: payload.len(), psnr: p, marker: b'T', anchor: Some(a.index), why: "T".into() }, payload, recon_rgb })
+        if ended {
+            break Ok(());
+        }
+    };
+    if result.is_err() { let _ = child.kill(); }
+    let status = child.wait().map_err(|e| format!("ffmpeg wait: {e}"))?;
+    let errtext = err_thread.join().unwrap_or_default();
+    result?;
+    if !status.success() {
+        return Err(format!("ffmpeg decode failed: {}", errtext.trim()));
+    }
+    if n == 0 { return Err("ffmpeg produced no frames".into()); }
+    progress(n, n);
+    let mut out = writer.finish().map_err(|e| format!("finishing the file: {e}"))?;
+    let output_bytes = out.stream_position().unwrap_or(0);
+    Ok((out, TranscodeReport { frames: n, repeats, patches, w, h, input_bytes, output_bytes,
+                               mean_psnr: if psnr_n == 0 { 0.0 } else { psnr_sum / psnr_n as f64 } }))
+}
+
+/// The error a cancelled transcode returns, so callers can tell it from a failure.
+pub const CANCELLED: &str = "cancelled";
+
+/// Longest run of repeat (`R`) frames before a real frame is re-encoded.
+/// The decoder walks back from an `R` to the last real frame but only up to
+/// `decode::MAX_R_WALKBACK` (600) frames, then reports `RepeatUnresolved` -- so
+/// a long static stretch (a paused game) must still get a real frame now and
+/// then. 300 keeps well inside that: 5 s at 60 fps.
+pub const MAX_REPEAT_RUN: usize = 300;
+
+/// Which frames of `batch` are exact repeats of the frame before them, given
+/// the last frame of the previous batch (`prev`) and the repeat run so far.
+/// Returns the flags and the run length carried out of the batch. Pure.
+fn mark_repeats(batch: &[Vec<u8>], prev: Option<&[u8]>, mut run: usize) -> (Vec<bool>, usize) {
+    let mut out = Vec::with_capacity(batch.len());
+    let mut before = prev;
+    for f in batch {
+        let dup = before == Some(f.as_slice()) && run < MAX_REPEAT_RUN;
+        run = if dup { run + 1 } else { 0 };
+        out.push(dup);
+        before = Some(f.as_slice());
+    }
+    (out, run)
+}
+
+/// A keyframe at least this often, so seeking into a run decodes at most this
+/// many (cheap) patch frames forward from its keyframe.
+pub const KEY_EVERY: usize = 60;
+/// Past this share of blocks changed, a patch saves nothing: send a keyframe,
+/// which also resets every block's reference exactly.
+pub const KEY_IF_CHANGED_PCT: usize = 70;
+
+/// One frame's encoding work.
+pub(crate) enum Job<'a> {
+    Key(&'a [u8]),
+    Patch(&'a [u8], Vec<usize>),
+}
+
+/// Measure PSNR on one frame in this many. Measuring means DECODING the frame
+/// again and comparing -- pure overhead in a batch encode, only there for the
+/// report. Sampled, the report's mean is an estimate; frame 0 is always in it.
+const PSNR_EVERY: usize = 8;
+
+/// Encode threads: the machine's parallelism, capped -- beyond 8 the batch's
+/// memory (two raw frames per worker) grows faster than the gain.
+fn encode_workers() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8)
+}
+
+/// Read up to `max` frames. `(frames, ended)`: `ended` when ffmpeg's output
+/// finished within this batch.
+fn read_batch(r: &mut impl std::io::Read, fsz: usize, max: usize) -> Result<(Vec<Vec<u8>>, bool), String> {
+    let mut batch = Vec::with_capacity(max);
+    while batch.len() < max {
+        let mut buf = vec![0u8; fsz];
+        if !read_frame(r, &mut buf)? {
+            return Ok((batch, true));
+        }
+        batch.push(buf);
+    }
+    Ok((batch, false))
+}
+
+/// One frame: its DCT payload, and its PSNR if this frame is sampled.
+fn encode_one(rgb: &[u8], w: usize, h: usize, quality: u8, measure: bool) -> (Vec<u8>, Option<f64>) {
+    let yuv = crate::decode::rgb_to_yuv420p(rgb, w, h);
+    let payload = fao_v1::compress_frame_dct(&yuv, w, h, quality);
+    let p = measure.then(|| {
+        let recon = fao_v1::decompress_frame_dct(&payload, w, h).unwrap_or_else(|| yuv.clone());
+        psnr(rgb, &crate::decode::yuv_to_rgb(&recon, w, h))
+    });
+    (payload, p)
+}
+
+/// Encode a batch across `workers` threads, results IN INPUT ORDER.
+///
+/// Each worker takes a CONTIGUOUS run of frames and writes into the matching
+/// run of output slots, so order is fixed by index, not by which thread
+/// finishes first -- the output is byte-identical to encoding one at a time
+/// (tested). `first` is the batch's first frame number, for PSNR sampling.
+fn encode_batch<T: AsRef<[u8]> + Sync>(batch: &[T], first: usize, w: usize, h: usize, quality: u8,
+                workers: usize, psnr_every: usize) -> Vec<(Vec<u8>, Option<f64>)> {
+    let jobs: Vec<Job> = batch.iter().map(|f| Job::Key(f.as_ref())).collect();
+    encode_jobs(&jobs, first, w, h, quality, workers, psnr_every)
+}
+
+/// One job: a keyframe (PSNR if sampled) or a patch frame (never measured --
+/// its quality is the keyframe path's, on fewer blocks).
+fn encode_job(job: &Job, w: usize, h: usize, quality: u8, measure: bool) -> (Vec<u8>, Option<f64>) {
+    match job {
+        Job::Key(f) => encode_one(f, w, h, quality, measure),
+        Job::Patch(f, blocks) => (crate::patch::encode(f, w, h, blocks, quality), None),
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Stop {
-    Cancelled,
-    Failed(String),
-}
-
-impl std::fmt::Display for Stop {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { Stop::Cancelled => write!(f, "cancelled"), Stop::Failed(e) => write!(f, "{e}") }
+/// `encode_batch` over mixed jobs: same contiguous-run, fixed-slot scheme, so
+/// results come back in job order whichever thread finishes first.
+fn encode_jobs(jobs: &[Job], first: usize, w: usize, h: usize, quality: u8,
+               workers: usize, psnr_every: usize) -> Vec<(Vec<u8>, Option<f64>)> {
+    let every = psnr_every.max(1);
+    if workers <= 1 || jobs.len() <= 1 {
+        return jobs.iter().enumerate()
+            .map(|(k, j)| encode_job(j, w, h, quality, (first + k) % every == 0))
+            .collect();
     }
+    let chunk = jobs.len().div_ceil(workers);
+    let mut out: Vec<Option<(Vec<u8>, Option<f64>)>> = (0..jobs.len()).map(|_| None).collect();
+    std::thread::scope(|sc| {
+        for (ci, (js, slots)) in jobs.chunks(chunk).zip(out.chunks_mut(chunk)).enumerate() {
+            sc.spawn(move || {
+                for (k, (j, slot)) in js.iter().zip(slots.iter_mut()).enumerate() {
+                    let idx = first + ci * chunk + k;
+                    *slot = Some(encode_job(j, w, h, quality, idx % every == 0));
+                }
+            });
+        }
+    });
+    out.into_iter().map(|o| o.expect("every slot is filled by its worker")).collect()
 }
 
-/// Probe, then stream: decode one frame, encode it intra (see the module doc for why), decode it
-/// back for PSNR, report, repeat. `on_frame` sees each frame's stat and its DECODED image (what
-/// a viewer of the .fao will see), so a UI can show live output without this module knowing
-/// about egui. `cancel` is checked between frames; ffmpeg is killed on cancel.
-pub fn transcode_stream(path: &str, opts: EncodeOpts, max_frames: Option<usize>, cancel: &std::sync::atomic::AtomicBool,
-                        mut on_frame: impl FnMut(&FrameStat, &[u8])) -> Result<(Vec<u8>, TranscodeReport), Stop> {
-    let info = probe(path).map_err(Stop::Failed)?;
-    let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let mut reader = FrameReader::open(path, info.w, info.h, max_frames).map_err(Stop::Failed)?;
-    let (w, h) = (reader.w, reader.h);
-    let mut enc = FrameEncoder::new(w, h, opts);
-    let mut container_frames = Vec::new();
-    let mut psnr_sum = 0.0;
-    let mut t_frames = 0;
-    loop {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) { return Err(Stop::Cancelled); }
-        let Some(rgb) = reader.next_frame().map_err(Stop::Failed)? else { break };
-        let e = enc.encode(&rgb);
-        psnr_sum += e.stat.psnr;
-        if e.stat.marker == b'T' { t_frames += 1; }
-        let plen = e.payload.len();
-        container_frames.push((Vec::new(), e.payload, e.stat.marker, plen, 0.0, 0.0));
-        on_frame(&e.stat, &e.recon_rgb);
+/// Read exactly one frame. `Ok(false)` at a clean end; a PARTIAL frame is an
+/// error, not a frame padded with the previous one's bytes.
+fn read_frame(r: &mut impl std::io::Read, buf: &mut [u8]) -> Result<bool, String> {
+    let mut got = 0;
+    while got < buf.len() {
+        match r.read(&mut buf[got..]) {
+            Ok(0) => return if got == 0 { Ok(false) }
+                            else { Err(format!("ffmpeg stopped mid-frame ({got} of {} bytes)", buf.len())) },
+            Ok(k) => got += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("reading ffmpeg: {e}")),
+        }
     }
-    let n = container_frames.len();
-    if n == 0 { return Err(Stop::Failed("ffmpeg produced no frames".into())); }
-    let mut out = Vec::new();
-    fao_v1::write_fao_container(&mut out, w, h, info.fps, opts.quality as f32 / 100.0, &container_frames)
-        .map_err(|e| Stop::Failed(format!("writing the container: {e}")))?;
-    let report = TranscodeReport { frames: n, w, h, input_bytes, output_bytes: out.len() as u64, mean_psnr: psnr_sum / n as f64, i_frames: n - t_frames, t_frames };
-    Ok((out, report))
+    Ok(true)
 }
 
-/// The whole-file call kept for its callers and tests: `transcode_stream`, never cancelled,
-/// with `progress(done, total)` where total is the frame count known from the probe.
+/// Transcode to a file on disk -- the path the Media tab uses for real matches.
+pub fn transcode_to_file(path: &str, out_path: &std::path::Path, quality: u8, max_frames: Option<usize>,
+                         progress: impl FnMut(usize, usize)) -> Result<TranscodeReport, String> {
+    transcode_to_file_cancellable(path, out_path, quality, max_frames, progress, None)
+}
+
+/// [`transcode_to_file`], stoppable. On any error -- cancellation included --
+/// the partial file is REMOVED, so a half-written match never sits in the
+/// folder looking like a finished one.
+pub fn transcode_to_file_cancellable(path: &str, out_path: &std::path::Path, quality: u8,
+        max_frames: Option<usize>, progress: impl FnMut(usize, usize),
+        cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<TranscodeReport, String> {
+    transcode_to_file_with(path, out_path, quality, max_frames, progress, cancel, MOTION_DEFAULT)
+}
+
+/// [`transcode_to_file_cancellable`] with the motion choice explicit.
+pub fn transcode_to_file_with(path: &str, out_path: &std::path::Path, quality: u8,
+        max_frames: Option<usize>, progress: impl FnMut(usize, usize),
+        cancel: Option<&std::sync::atomic::AtomicBool>, motion: bool) -> Result<TranscodeReport, String> {
+    let f = std::fs::File::create(out_path).map_err(|e| format!("creating {}: {e}", out_path.display()))?;
+    let r = transcode_cancellable_with(path, std::io::BufWriter::new(f), quality, max_frames, progress, cancel, motion)
+        .map(|(_, rep)| rep);
+    if r.is_err() { let _ = std::fs::remove_file(out_path); }
+    r
+}
+
+/// The in-memory form, for small previews: the SAME streaming loop into a
+/// Vec, so there is one frame path, not two.
 pub fn transcode(path: &str, quality: u8, max_frames: Option<usize>,
-                  mut progress: impl FnMut(usize, usize)) -> Result<(Vec<u8>, TranscodeReport), String> {
-    let total = probe(path).ok().map(|i| estimated_frames(&i, max_frames)).unwrap_or(0);
-    let never = std::sync::atomic::AtomicBool::new(false);
-    transcode_stream(path, EncodeOpts::intra(quality), max_frames, &never, |s, _| progress(s.index + 1, total.max(s.index + 1)))
-        .map_err(|e| e.to_string())
+                 progress: impl FnMut(usize, usize)) -> Result<(Vec<u8>, TranscodeReport), String> {
+    transcode_to_writer(path, std::io::Cursor::new(Vec::new()), quality, max_frames, progress)
+        .map(|(c, r)| (c.into_inner(), r))
 }
 
-/// Frames the file should yield: duration × fps, capped by `max_frames`. An estimate (ffprobe's
-/// duration is container-level); the stream's actual end is authoritative.
-pub fn estimated_frames(info: &VideoInfo, max_frames: Option<usize>) -> usize {
-    let n = (info.duration_s * info.fps).round().max(0.0) as usize;
-    match max_frames { Some(m) => n.min(m), None => n }
+fn decode_yuv_from_rgb(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
+    crate::decode::rgb_to_yuv420p(rgb, w, h)
 }
-
-/// Write `bytes` to `out` via a temporary file in the same directory, so a failed or
-/// interrupted write never leaves a half .fao where the Player would open it.
-pub fn write_atomic(out: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = out.with_extension("fao.part");
-    std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, out)).map_err(|e| format!("{}: {e}", out.display()))
-}
-
 
 fn psnr(a: &[u8], b: &[u8]) -> f64 {
     let n = a.len().min(b.len()).max(1);
@@ -358,6 +593,681 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One raw source frame, for tests only. The public in-memory decoder is gone
+    /// -- unbounded, it was how an hour of 1080p became terabytes -- so a test that
+    /// needs a single frame asks ffmpeg for exactly one.
+    fn first_frame(path: &std::path::Path, w: usize, h: usize) -> Vec<u8> {
+        let out = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(path)
+            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .output().expect("ffmpeg");
+        assert_eq!(out.stdout.len(), w * h * 3, "one {w}x{h} frame");
+        out.stdout
+    }
+
+    // ── the probe traps, pure ──
+
+    fn stream(i: u64, kind: &str, w: u64, h: u64, rate: &str, attached: u64) -> String {
+        format!(r#"{{"index":{i},"codec_type":"{kind}","codec_name":"x","width":{w},"height":{h},
+                    "avg_frame_rate":"{rate}","disposition":{{"attached_pic":{attached}}}}}"#)
+    }
+
+    /// Stream 0 is audio in an OBS capture. fao_app took streams[0] and
+    /// substituted 640x480; this must find the video.
+    #[test]
+    fn an_audio_first_file_probes_its_video_stream() {
+        let j = format!(r#"{{"streams":[{{"index":0,"codec_type":"audio"}},{}],"format":{{"duration":"2.0"}}}}"#,
+                        stream(1, "video", 1920, 1080, "60/1", 0));
+        let v = parse_probe(&j).unwrap();
+        assert_eq!((v.w, v.h, v.stream), (1920, 1080, 1));
+    }
+
+    /// MKV cover art is a `video` stream with attached_pic. Taking it would size
+    /// every frame as a thumbnail while ffmpeg decodes the real picture.
+    #[test]
+    fn cover_art_is_skipped() {
+        let j = format!(r#"{{"streams":[{},{}],"format":{{}}}}"#,
+                        stream(0, "video", 300, 300, "0/0", 1), stream(1, "video", 2560, 1440, "144/1", 0));
+        let v = parse_probe(&j).unwrap();
+        assert_eq!((v.w, v.h, v.stream), (2560, 1440, 1));
+    }
+
+    /// No video is an ERROR -- never a made-up size.
+    #[test]
+    fn audio_only_is_an_error_not_640x480() {
+        let j = r#"{"streams":[{"index":0,"codec_type":"audio"}],"format":{}}"#;
+        assert!(parse_probe(j).unwrap_err().contains("no video stream"));
+    }
+
+    /// The rate stays an exact rational: NTSC and 144 fps both survive.
+    #[test]
+    fn rates_are_kept_exact() {
+        let ntsc = parse_probe(&format!(r#"{{"streams":[{}],"format":{{}}}}"#,
+                                        stream(0, "video", 64, 64, "30000/1001", 0))).unwrap();
+        assert_eq!(ntsc.rate, (30000, 1001));
+        let hi = parse_probe(&format!(r#"{{"streams":[{}],"format":{{}}}}"#,
+                                      stream(0, "video", 64, 64, "144/1", 0))).unwrap();
+        assert_eq!(hi.rate, (144, 1));
+    }
+
+    // ── end to end, real ffmpeg ──
+
+    /// A 144 fps capture keeps 144 fps. Through the old float path it was
+    /// written as 12.9 and played eleven times too slow.
+    #[test]
+    fn a_144fps_capture_keeps_its_rate_on_disk() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-144-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mp4");
+        make_test_video(&src, 64, 48, 12, 144);
+        let out = dir.join("out.fao");
+        let rep = transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        assert_eq!(rep.frames, 12);
+        let f = crate::decode::FaoFile::open_stream(Box::new(std::fs::File::open(&out).unwrap())).unwrap();
+        assert!((f.fps() - 144.0).abs() < 1e-6, "stored as {} fps", f.fps());
+        assert_eq!(f.frame_count(), 12);
+        assert!(f.decode_rgb(11).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real bug file: audio first. Transcodes at its true size.
+    #[test]
+    fn an_audio_first_mkv_transcodes_at_its_real_size() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-af-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("af.mkv");
+        let ok = Command::new("ffmpeg").args(["-v", "error", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=0.3",
+            "-map", "0:a", "-map", "1:v", "-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-c:a", "flac"])
+            // Native encoders only: libx264 is absent from Fedora's ffmpeg-free, and
+            // flac sidesteps whether a build has AAC. The test needs only an audio
+            // stream FIRST, not a particular codec.
+            .arg(&src).status().unwrap().success();
+        assert!(ok, "fixture");
+        let (bytes, rep) = transcode(src.to_str().unwrap(), 80, None, |_, _| {}).unwrap();
+        assert_eq!((rep.w, rep.h), (320, 240), "not the 640x480 fao_app would have guessed");
+        let f = crate::decode::FaoFile::parse(bytes).unwrap();
+        assert_eq!((f.width(), f.height()), (320, 240));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cancelling stops the job AND removes the partial file -- a half-written
+    /// match must not be left looking like a finished one.
+    #[test]
+    fn a_cancelled_transcode_leaves_no_partial_file() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mp4");
+        make_test_video(&src, 64, 48, 30, 30);
+        let out = dir.join("out.fao");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let r = transcode_to_file_cancellable(src.to_str().unwrap(), &out, 80, None,
+            |done, _| if done == 5 { stop.store(true, std::sync::atomic::Ordering::Relaxed) }, Some(&stop));
+        assert_eq!(r.unwrap_err(), CANCELLED);
+        assert!(!out.exists(), "the partial file must be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BENCHMARK, not a check: 1080p60 transcode speed and size, for sizing a
+    /// real batch ("hundreds of GB of matches"). Ignored by default; run in
+    /// release, since debug speed says nothing:
+    ///
+    ///     cargo test --release -- --ignored --nocapture bench_1080p
+    ///
+    /// The source is ffmpeg's synthetic `testsrc2`, encoded with whatever H.264
+    /// or MPEG-4 encoder this ffmpeg has -- so the SPEED is representative (the
+    /// DCT path's cost is per block, not per content), but the SIZE RATIO is
+
+    fn frames(n: usize, w: usize, h: usize) -> Vec<Vec<u8>> {
+        (0..n).map(|k| (0..w * h * 3).map(|i| ((i * 13 + k * 57 + (i / w) * 3) % 256) as u8).collect()).collect()
+    }
+
+    /// PARALLEL IS BYTE-IDENTICAL TO SEQUENTIAL. 7 frames over 4 workers gives
+    /// uneven runs (2,2,2,1), and the batch starts at frame 5 rather than 0 --
+    /// the cases where a slot-indexing mistake would reorder or mis-sample.
+    #[test]
+    fn a_parallel_batch_matches_one_at_a_time_exactly() {
+        let (w, h) = (48, 32);
+        let batch = frames(7, w, h);
+        let seq = encode_batch(&batch, 5, w, h, 80, 1, 3);
+        for workers in [2, 3, 4, 8] {
+            let par = encode_batch(&batch, 5, w, h, 80, workers, 3);
+            assert_eq!(par.len(), seq.len());
+            for (i, (a, b)) in par.iter().zip(&seq).enumerate() {
+                assert_eq!(a.0, b.0, "payload {i} with {workers} workers");
+                assert_eq!(a.1.is_some(), b.1.is_some(), "sampling {i} with {workers} workers");
+            }
+        }
+    }
+
+    /// Frames sampled for PSNR are exactly those whose GLOBAL index is a
+    /// multiple of `every` -- so batch boundaries do not shift the sample.
+    #[test]
+    fn psnr_is_sampled_by_global_frame_index() {
+        let (w, h) = (32, 16);
+        let got: Vec<bool> = encode_batch(&frames(6, w, h), 5, w, h, 80, 3, 4)
+            .iter().map(|(_, p)| p.is_some()).collect();
+        // Global indices 5..=10; multiples of 4 there: 8 only.
+        assert_eq!(got, vec![false, false, false, true, false, false]);
+        let first: Vec<bool> = encode_batch(&frames(3, w, h), 0, w, h, 80, 2, 8)
+            .iter().map(|(_, p)| p.is_some()).collect();
+        assert_eq!(first, vec![true, false, false], "frame 0 is always measured");
+    }
+
+    #[test]
+    fn a_batch_reader_reports_where_the_stream_ends() {
+        let data = vec![7u8; 10 * 3];
+        let mut r = std::io::Cursor::new(data);
+        let (b, ended) = read_batch(&mut r, 10, 2).unwrap();
+        assert_eq!((b.len(), ended), (2, false));
+        let (b, ended) = read_batch(&mut r, 10, 2).unwrap();
+        assert_eq!((b.len(), ended), (1, true), "one frame left, then the end");
+    }
+
+    #[test]
+    fn repeats_are_marked_against_the_previous_frame_across_batches() {
+        let (a, b) = (vec![1u8; 4], vec![2u8; 4]);
+        // prev = a: [a, a, b, b, a] -> repeats at 0,1 (vs prev / vs a), 3 (b after b).
+        let (d, run) = mark_repeats(&[a.clone(), a.clone(), b.clone(), b.clone(), a.clone()], Some(&a), 0);
+        assert_eq!(d, vec![true, true, false, true, false]);
+        assert_eq!(run, 0, "the last frame differed, so no run carries out");
+        let (d, _) = mark_repeats(&[a.clone()], None, 0);
+        assert_eq!(d, vec![false], "the first frame of a file is never a repeat");
+    }
+
+    /// The run cap: at MAX_REPEAT_RUN repeats in a row, the next identical
+    /// frame is encoded for real, and the run restarts -- including across a
+    /// batch boundary, via the carried run length.
+    #[test]
+    fn a_long_run_of_repeats_is_broken_by_a_real_frame() {
+        let a = vec![9u8; 4];
+        let (d, run) = mark_repeats(&vec![a.clone(); 3], Some(&a), MAX_REPEAT_RUN - 2);
+        assert_eq!(d, vec![true, true, false], "two more repeats reach the cap; the third is real");
+        assert_eq!(run, 0);
+    }
+
+    fn make(path: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("ffmpeg").args(["-v", "error", "-y"]).args(args).arg(path).status().unwrap().success();
+        assert!(ok, "fixture {}", path.display());
+    }
+
+    /// REAL: a 30 fps clip stored at 60 fps -- every other frame a duplicate,
+    /// exactly what a 30 fps game recorded at 60 looks like. Lossless (ffv1),
+    /// so duplicates are byte-identical after decoding. Exactly the frames
+    /// ffmpeg's own hashes call repeats become one-byte R frames, and every frame still decodes, each repeat to
+    /// the same picture as the frame before it.
+    #[test]
+    fn a_30fps_clip_at_60fps_stores_its_duplicates_as_repeats() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-rep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mkv");
+        make(&src, &["-f", "lavfi", "-i", "testsrc2=size=64x48:rate=30:duration=1", "-r", "60", "-c:v", "ffv1"]);
+        let out = dir.join("out.fao");
+        let rep = transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        assert_eq!(rep.frames, 60);
+        // GROUND TRUTH FROM FFMPEG, not a guess. A first version asserted
+        // "about half" (~30) and got 47 -- and ffmpeg's own per-frame hashes
+        // agreed: at 64x48 testsrc2's slow motion collapses 30 source frames to
+        // 13 distinct pictures. So: hash every decoded frame in the SAME format
+        // the transcoder compares (rgb24) and count consecutive equal hashes.
+        let hashes = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&src)
+            .args(["-pix_fmt", "rgb24", "-f", "framemd5", "-"]).output().unwrap();
+        let hs: Vec<String> = String::from_utf8_lossy(&hashes.stdout).lines()
+            .filter(|l| !l.starts_with('#')).map(|l| l.rsplit(',').next().unwrap().trim().to_string()).collect();
+        assert_eq!(hs.len(), 60);
+        let expected = hs.windows(2).filter(|w| w[0] == w[1]).count();
+        assert!(expected >= 30, "the fixture must actually contain duplicates: {expected}");
+        assert_eq!(rep.repeats, expected, "exactly the frames ffmpeg says repeat");
+        let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        let mut repeats_seen = 0;
+        for i in 0..f.frame_count() {
+            let px = f.decode_rgb(i).expect("every frame decodes");
+            if f.marker(i) == Some(b'R') {
+                repeats_seen += 1;
+                assert_eq!(px, f.decode_rgb(i - 1).unwrap(), "repeat {i} shows the frame before it");
+            }
+        }
+        assert_eq!(repeats_seen, rep.repeats);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REAL: a static picture held for 320 frames -- a paused game. Real frames
+    /// at 0 and 301 (the cap), repeats between, and the LAST frame still decodes:
+    /// its walk back is 18 frames, far inside the decoder's 600.
+    #[test]
+    fn a_long_static_stretch_stays_decodable_to_the_end() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-static-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mkv");
+        make(&src, &["-f", "lavfi", "-i", "color=c=0x336699:size=64x48:rate=60", "-frames:v", "320", "-c:v", "ffv1"]);
+        let out = dir.join("out.fao");
+        let rep = transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        assert_eq!((rep.frames, rep.repeats), (320, 318), "real frames at 0 and at the cap");
+        let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        assert_ne!(f.marker(MAX_REPEAT_RUN + 1), Some(b'R'), "a real frame at the cap");
+        assert_eq!(f.decode_rgb(319).unwrap(), f.decode_rgb(0).unwrap(), "the last frame decodes to the picture");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A DETAILED static background with a small moving, animating box -- the
+    /// shape of game footage patches are for (a textured scene and HUD that sit
+    /// still, a part that moves). Lossless (ffv1), so decoded frames can be
+    /// compared with the true source.
+    ///
+    /// DETAILED ON PURPOSE. A first version used a flat grey background, and
+    /// patches came out LARGER than whole keyframes (~1,350 vs 1,125 bytes):
+    /// in a DCT codec flat blocks are nearly free, so a keyframe of a flat
+    /// scene is already mostly the moving box, and a patch carries that same
+    /// detail plus its own fixed overhead. Patches win where keyframes keep
+    /// paying for STATIC DETAIL -- `geq` draws a pattern that is a pure
+    /// function of position: detailed, and truly static.
+    fn moving_box_source(dir: &std::path::Path) -> (std::path::PathBuf, Vec<Vec<u8>>, usize, usize) {
+        let (w, h) = (160usize, 96usize);
+        let src = dir.join("box.mkv");
+        make(&src, &["-f", "lavfi", "-i",
+            "nullsrc=s=160x96:r=30,geq=r='mod(X*7+Y*3,256)':g='mod(X*3+Y*11,256)':b='mod(X*13+Y*5,256)'[bg];\
+             testsrc2=s=32x32:r=30[fg];[bg][fg]overlay=x='t*30':y=30",
+            "-t", "3", "-c:v", "ffv1"]);
+        let raw = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&src)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]).output().unwrap().stdout;
+        let frames: Vec<Vec<u8>> = raw.chunks(w * h * 3).map(|c| c.to_vec()).collect();
+        (src, frames, w, h)
+    }
+
+    /// PATCHES ARE USED, AND ARE SMALL: most frames become patch frames, and
+    /// the file is a fraction of what keyframes alone would take.
+    #[test]
+    fn a_mostly_static_scene_becomes_small_patch_frames() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-patch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, frames, w, h) = moving_box_source(&dir);
+        let out = dir.join("out.fao");
+        let rep = transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        assert_eq!(rep.frames, frames.len());
+        let keys = rep.frames - rep.repeats - rep.patches;
+        assert!(keys >= 2 && keys <= 3, "a keyframe per {KEY_EVERY} frames over 90: {keys}");
+        // Everything else is a patch or a REPEAT -- and this source has exact
+        // repeats (the overlay's frame sync duplicates frames). A first version
+        // asserted 80+ patches and got 54; ffmpeg's framemd5 counts 34 repeats,
+        // and 54 + 34 + 2 keyframes = 90. So: repeats must match ffmpeg's own
+        // count, and every other non-keyframe must be a patch.
+        let hashes = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&src)
+            .args(["-pix_fmt", "rgb24", "-f", "framemd5", "-"]).output().unwrap();
+        let hs: Vec<String> = String::from_utf8_lossy(&hashes.stdout).lines()
+            .filter(|l| !l.starts_with('#')).map(|l| l.rsplit(',').next().unwrap().trim().to_string()).collect();
+        let expected_repeats = hs.windows(2).filter(|w| w[0] == w[1]).count();
+        assert_eq!(rep.repeats, expected_repeats, "repeats per ffmpeg");
+        assert_eq!(rep.patches, rep.frames - rep.repeats - keys, "every other non-keyframe is a patch");
+        assert!(rep.patches >= 40, "and there are plenty of them: {}", rep.patches);
+        let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        let key_bytes = f.payload(0).unwrap().len();
+        let all_keys = key_bytes * rep.frames;
+        assert!((rep.output_bytes as usize) * 3 < all_keys,
+                "patches must cut the file well below keyframes-only: {} vs ~{}", rep.output_bytes, all_keys);
+        let _ = (w, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NO DRIFT: every decoded frame stays close to its TRUE source, and the
+    /// last frame before a keyframe is no worse than the first after one. A
+    /// codec predicting from the previous SOURCE would degrade across the run.
+    #[test]
+    fn patch_frames_do_not_drift_from_the_source() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-drift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, frames, w, h) = moving_box_source(&dir);
+        let out = dir.join("out.fao");
+        transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        let ps: Vec<f64> = (0..f.frame_count()).map(|i| psnr(&frames[i], &f.decode_rgb(i).unwrap())).collect();
+        let worst = ps.iter().cloned().fold(f64::INFINITY, f64::min);
+        // RELATIVE TO THE KEYFRAME, not an absolute floor: this pattern is hard
+        // for 8x8 DCT, so a keyframe itself measures ~26 dB. Measured: key 26.08,
+        // frame 30 26.03, frame 59 26.00, worst 25.90 -- flat across the run.
+        let key = ps[0];
+        assert!(worst > key - 1.0, "no frame much worse than a keyframe: key {key:.2}, worst {worst:.2} dB");
+        let (first, last) = (ps[1], ps[KEY_EVERY - 1]);
+        assert!(last > first - 1.0, "no degradation across a run: frame 1 {first:.2} dB, frame {} {last:.2} dB", KEY_EVERY - 1);
+        let _ = (w, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ON A FLAT SCENE, patches lose to keyframes (flat DCT blocks are nearly
+    /// free, so a keyframe is already mostly the moving part). Such frames must
+    /// go out as keyframes: in the file, no patch is as large as the keyframe
+    /// before it -- and every frame still decodes.
+    #[test]
+    fn a_patch_never_outweighs_the_keyframe_before_it() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-flat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("flat.mkv");
+        make(&src, &["-f", "lavfi", "-i",
+            "color=c=0x404850:s=160x96:r=30[bg];testsrc2=s=32x32:r=30[fg];[bg][fg]overlay=x='t*30':y=30",
+            "-t", "3", "-c:v", "ffv1"]);
+        let out = dir.join("out.fao");
+        // FAST mode's rule, named explicitly: compact mode promotes on a scene
+        // cut instead (see transcode_cancellable_with).
+        let rep = transcode_to_file_with(src.to_str().unwrap(), &out, 80, None, |_, _| {}, None, false).unwrap();
+        let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        let mut last_key = None;
+        let mut promoted_keys = 0;
+        for i in 0..f.frame_count() {
+            let len = f.payload(i).unwrap().len();
+            match f.marker(i) {
+                Some(b'D') => { last_key = Some(len); if i > 0 { promoted_keys += 1; } }
+                Some(m) if m == crate::patch::MARKER => {
+                    let k = last_key.expect("a keyframe comes first");
+                    assert!(len < k, "patch {i} ({len} bytes) is not smaller than the keyframe before it ({k})");
+                }
+                _ => {}
+            }
+            f.decode_rgb(i).expect("every frame decodes");
+        }
+        assert!(promoted_keys > 2, "this scene should promote patches to keyframes: {promoted_keys} keyframes after frame 0");
+        assert_eq!(rep.frames - rep.repeats - rep.patches, promoted_keys + 1, "report counts what the file holds");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE TEST THAT SEPARATES THE DESIGNS: a slow fade, one level per frame --
+    /// under the skip tolerance (2 at quality 80). Judging each block against
+    /// the PREVIOUS frame would skip every step and the error would climb a
+    /// level per frame, silently, for the whole run. Judging it against what was
+    /// LAST SENT resends after a few frames, so error stays bounded.
+    #[test]
+    fn a_slow_fade_under_the_tolerance_does_not_accumulate() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-fade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (w, h) = (64usize, 48usize);
+        let src = dir.join("fade.mkv");
+        make(&src, &["-f", "lavfi", "-i", "nullsrc=s=64x48:r=30,geq=r='60+N':g='60+N':b='60+N'",
+                     "-frames:v", "59", "-c:v", "ffv1"]);
+        let raw = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&src)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]).output().unwrap().stdout;
+        let frames: Vec<&[u8]> = raw.chunks(w * h * 3).collect();
+        let out = dir.join("out.fao");
+        transcode_to_file(src.to_str().unwrap(), &out, 80, None, |_, _| {}).unwrap();
+        let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        let last = f.frame_count() - 1;
+        let err = f.decode_rgb(last).unwrap().iter().zip(frames[last]).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        assert!(err <= 6, "the fade's last frame is within a few levels of its source, not {last} behind: max error {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEEKING into a run -- a fresh reader asked for frame 45 first -- decodes
+    /// the same picture as playing 0..=45 in order.
+    #[test]
+    fn seeking_into_a_run_matches_playing_up_to_it() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-seek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, _frames, _w, _h) = moving_box_source(&dir);
+        // BOTH MODES: a patch (M) and a motion patch (Q) must each decode the
+        // same picture when reached by seeking as when played up to.
+        for (motion, marker) in [(false, crate::patch::MARKER), (true, crate::motion::MARKER)] {
+        let out = dir.join("out.fao");
+        transcode_to_file_with(src.to_str().unwrap(), &out, 80, None, |_, _| {}, None, motion).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let played = crate::decode::FaoFile::parse(bytes.clone()).unwrap();
+        let mut last = Vec::new();
+        for i in 0..=45 { last = played.decode_rgb(i).unwrap(); }
+        let seeked = crate::decode::FaoFile::parse(bytes).unwrap();
+        assert_eq!(seeked.marker(45), Some(marker), "frame 45 is a patch, so the seek walks back");
+        assert_eq!(seeked.decode_rgb(45).unwrap(), last, "motion mode {motion}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BENCHMARK: 1080p60 with PATCH FRAMES doing their job -- detailed static
+    /// scenery (a `geq` pattern, a pure function of position) with a moving,
+    /// animating 320x240 window, the shape of a game with a still scene and HUD.
+    /// Reports speed, size against the source, and the frame-type mix.
+    ///
+
+    /// Encode the same source both ways; `(fast, compact)` reports and files.
+    fn both_modes(src: &std::path::Path, dir: &std::path::Path) -> ((TranscodeReport, Vec<u8>), (TranscodeReport, Vec<u8>)) {
+        let run = |motion: bool, name: &str| {
+            let out = dir.join(name);
+            let rep = transcode_to_file_with(src.to_str().unwrap(), &out, 80, None, |_, _| {}, None, motion).unwrap();
+            (rep, std::fs::read(&out).unwrap())
+        };
+        (run(false, "fast.fao"), run(true, "compact.fao"))
+    }
+
+    /// NOTHING PREDICTABLE -- fresh noise every frame over a static scene --
+    /// so compact mode writes plain M patches, not Q frames carrying modes and
+    /// residual headers for no prediction. Every frame still decodes.
+    #[test]
+    fn unpredictable_frames_are_written_as_plain_patches() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-noise-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("noise.mkv");
+        make(&src, &["-f", "lavfi", "-i",
+            "nullsrc=s=96x64:r=30,geq=r='mod(X*7+Y*3,256)':g='mod(X*3+Y*11,256)':b='mod(X*13+Y*5,256)'[bg];\
+             nullsrc=s=32x32:r=30,geq=r='random(1)*255':g='random(2)*255':b='random(3)*255'[fg];[bg][fg]overlay=x=32:y=16",
+            "-frames:v", "20", "-c:v", "ffv1"]);
+        let out = dir.join("out.fao");
+        let rep = transcode_to_file_with(src.to_str().unwrap(), &out, 80, None, |_, _| {}, None, true).unwrap();
+        let f = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        let (m, q) = (0..f.frame_count()).fold((0, 0), |(m, q), i| match f.marker(i) {
+            Some(x) if x == crate::patch::MARKER => (m + 1, q),
+            Some(x) if x == crate::motion::MARKER => (m, q + 1),
+            _ => (m, q),
+        });
+        assert!(m >= 15, "noise cannot be predicted: {m} M frames, {q} Q frames");
+        assert_eq!(q, 0, "no Q frame without a predicted block");
+        for i in 0..f.frame_count() { f.decode_rgb(i).expect("every frame decodes"); }
+        assert_eq!(rep.patches, m);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A CAMERA PAN, the case motion is for: the whole scene slides 3 px per
+    /// frame. Fast mode can only send keyframes (every block changed); compact
+    /// mode predicts every frame. The promise, at the SAME quality setting:
+    /// smaller, with a mean AND a worst frame at least as good, and no decline
+    /// through the run.
+    ///
+    /// Residuals are coded at 30% of the setting, so predicted frames HOLD the
+    /// keyframe's quality rather than overshooting it; the mean margin is
+    /// smaller than it was (measured +2.7 dB, from +5.9 with residuals at
+    /// q - 20), and the file much smaller.
+    ///
+    /// History: with residuals coded through 4:2:0 and a colour transform,
+    /// this pan ran ~30 dB early and ~26.6 late, and lost to keyframes at high
+    /// quality. Full-resolution per-channel residuals fixed both.
+    #[test]
+    fn a_camera_pan_is_far_smaller_with_motion() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-pan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (w, h) = (160usize, 96usize);
+        let src = dir.join("pan.mkv");
+        make(&src, &["-f", "lavfi", "-i",
+            "nullsrc=s=160x96:r=30,geq=r='128+90*sin((X+N*3)*0.11)*cos(Y*0.07)':g='128+70*sin((X+N*3+Y)*0.05)':b='100+mod((X+N*3)*3+Y*2,80)'",
+            "-frames:v", "45", "-c:v", "ffv1"]);
+        let ((fast, fb), (compact, cb)) = both_modes(&src, &dir);
+        assert_eq!(fast.patches, 0, "fast mode: every block changed, so keyframes only");
+        assert!(compact.patches >= 40, "compact mode predicts the pan: {} patch frames", compact.patches);
+        assert!(cb.len() * 10 < fb.len() * 7, "compact {} bytes vs fast {} bytes", cb.len(), fb.len());
+        let raw = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&src)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]).output().unwrap().stdout;
+        let frames: Vec<&[u8]> = raw.chunks(w * h * 3).collect();
+        let mean = |b: Vec<u8>| {
+            let f = crate::decode::FaoFile::parse(b).unwrap();
+            (0..f.frame_count()).map(|i| psnr(frames[i], &f.decode_rgb(i).unwrap())).collect::<Vec<f64>>()
+        };
+        let (pf, pc) = (mean(fb), mean(cb));
+        let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let low = |v: &[f64]| v.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(avg(&pc) > avg(&pf) + 1.0, "mean: compact {:.2} dB vs fast {:.2} dB", avg(&pc), avg(&pf));
+        assert!(low(&pc) > low(&pf) - 0.5, "worst frame: compact {:.2} dB vs fast {:.2} dB", low(&pc), low(&pf));
+        let (early, late) = (avg(&pc[1..6]), avg(&pc[pc.len() - 5..]));
+        assert!(late > early - 0.5, "no decline through the pan: first frames {early:.2} dB, last {late:.2} dB");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Compact mode on the moving-window scene and the slow fade.
+    ///
+    /// * The FADE stays strict: it guards the skip mechanism, which must not
+    ///   accumulate at all, motion or not.
+    /// * The moving window: its box ANIMATES, so little is predictable, and
+    ///   compact is roughly neutral against fast -- measured 122,001 vs 116,262
+    ///   bytes (+4.9%, ~64 bytes a frame of Q-format overhead) at 25.99 vs 26.00
+    ///   dB. Asserted as such: close in size, equal in quality.
+    #[test]
+    fn compact_mode_stays_within_its_measured_bounds() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-cmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, frames, _w, _h) = moving_box_source(&dir);
+        let ((_fast, fb), (_compact, cb)) = both_modes(&src, &dir);
+        assert!(cb.len() * 100 < fb.len() * 110, "compact {} vs fast {}: more than 10% larger", cb.len(), fb.len());
+        let f = crate::decode::FaoFile::parse(cb).unwrap();
+        let key = psnr(&frames[0], &f.decode_rgb(0).unwrap());
+        for i in 0..f.frame_count() {
+            let p = psnr(&frames[i], &f.decode_rgb(i).unwrap());
+            assert!(p > key - 2.0, "frame {i}: {p:.2} dB vs keyframe {key:.2} dB -- worse than measured");
+        }
+        let fade = dir.join("fade.mkv");
+        make(&fade, &["-f", "lavfi", "-i", "nullsrc=s=64x48:r=30,geq=r='60+N':g='60+N':b='60+N'",
+                      "-frames:v", "59", "-c:v", "ffv1"]);
+        let raw = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&fade)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]).output().unwrap().stdout;
+        let out = dir.join("fade.fao");
+        transcode_to_file_with(fade.to_str().unwrap(), &out, 80, None, |_, _| {}, None, true).unwrap();
+        let ff = crate::decode::FaoFile::parse(std::fs::read(&out).unwrap()).unwrap();
+        let last = ff.frame_count() - 1;
+        let err = ff.decode_rgb(last).unwrap().iter().zip(&raw[last * 64 * 48 * 3..]).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        assert!(err <= 6, "compact-mode fade stays within a few levels: max error {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// Quality of EVERY frame of `fao` against the frames the transcoder read
+    /// from `src` -- streamed, so 1080p never holds a whole clip in memory
+    /// (120 frames would be ~750 MB). `(mean, worst)` PSNR.
+    ///
+    /// The old benchmarks reported only KEYFRAME PSNR (sampled at encode), so
+    /// comparisons between modes at 1080p were size-only -- and on the pan,
+    /// quality was where compact mode won by 6 dB.
+    fn stream_quality(src: &std::path::Path, fao: &std::path::Path, w: usize, h: usize) -> (f64, f64) {
+        let mut child = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(src)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]).stdout(Stdio::piped()).spawn().unwrap();
+        let mut pipe = child.stdout.take().unwrap();
+        let f = crate::decode::FaoFile::open_stream(Box::new(std::fs::File::open(fao).unwrap())).unwrap();
+        let mut buf = vec![0u8; w * h * 3];
+        let (mut sum, mut worst, mut n) = (0.0, f64::INFINITY, 0usize);
+        while read_frame(&mut pipe, &mut buf).unwrap() {
+            let p = psnr(&buf, &f.decode_rgb(n).unwrap());
+            sum += p;
+            worst = worst.min(p);
+            n += 1;
+        }
+        let _ = child.wait();
+        assert_eq!(n, f.frame_count(), "every frame compared");
+        (sum / n as f64, worst)
+    }
+
+    /// Encode `src` in FAST and COMPACT mode and report, for each: speed, size
+    /// against the source, and the quality of EVERY frame.
+    fn bench_both_modes(name: &str, src: &std::path::Path, dir: &std::path::Path, w: usize, h: usize) {
+        let in_b = std::fs::metadata(src).unwrap().len();
+        for motion in [false, true] {
+            let out = dir.join(if motion { "compact.fao" } else { "fast.fao" });
+            let t = std::time::Instant::now();
+            let rep = transcode_to_file_with(src.to_str().unwrap(), &out, 80, None, |_, _| {}, None, motion).unwrap();
+            let secs = t.elapsed().as_secs_f64();
+            let (mean, worst) = stream_quality(src, &out, w, h);
+            eprintln!("BENCH {name} {:>7}: {:5.1} fps ({:.2}x realtime) | {:6.2} MB ({:.2}x source) | \
+                       all frames {mean:.2} dB mean, {worst:.2} worst | key {} patch {} repeat {}",
+                      if motion { "compact" } else { "fast" }, rep.frames as f64 / secs, (rep.frames as f64 / 60.0) / secs,
+                      rep.output_bytes as f64 / 1e6, rep.output_bytes as f64 / in_b as f64,
+                      rep.frames - rep.patches - rep.repeats, rep.patches, rep.repeats);
+            assert_eq!(rep.frames, 120);
+        }
+    }
+
+    /// BENCHMARK: 1080p60 synthetic test pattern (testsrc2: moving elements over
+    /// the whole frame), both modes. Run in release, one test at a time -- the
+    /// harness runs tests concurrently, which on a small machine skews timings:
+    ///
+    ///     cargo test --release -- --ignored --nocapture --test-threads=1 bench_1080p
+    ///
+    /// The source is encoded with whatever H.264/MPEG-4 encoder this ffmpeg has
+    /// (no -c:v), so it runs on builds without libx264 too.
+    #[test]
+    #[ignore = "benchmark: cargo test --release -- --ignored --nocapture --test-threads=1 bench_1080p"]
+    fn bench_1080p_test_pattern() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-bench-tp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mp4");
+        make(&src, &["-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=60:duration=2", "-pix_fmt", "yuv420p"]);
+        bench_both_modes("1080p test pattern", &src, &dir, 1920, 1080);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BENCHMARK: 1080p60 detailed static scenery with a moving, animating
+    /// 320x240 window -- the shape of a game with a still scene and HUD.
+    #[test]
+    #[ignore = "benchmark: cargo test --release -- --ignored --nocapture --test-threads=1 bench_1080p"]
+    fn bench_1080p_static_scene() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-bench-ss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mp4");
+        make(&src, &["-f", "lavfi", "-i",
+            "nullsrc=s=1920x1080:r=60,geq=r='mod(X*7+Y*3,256)':g='mod(X*3+Y*11,256)':b='mod(X*13+Y*5,256)'[bg];\
+             testsrc2=s=320x240:r=60[fg];[bg][fg]overlay=x='200+t*300':y=400",
+            "-t", "2", "-pix_fmt", "yuv420p"]);
+        bench_both_modes("1080p static scene", &src, &dir, 1920, 1080);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BENCHMARK: 1080p60 CAMERA PAN over detailed scenery, 6 px per frame --
+    /// the case compact mode is for, at real resolution.
+    #[test]
+    #[ignore = "benchmark: cargo test --release -- --ignored --nocapture --test-threads=1 bench_1080p"]
+    fn bench_1080p_pan() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-bench-pan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // ONE wide still, then a 1080p window slid across it with `crop`. A first
+        // version evaluated sin/cos per pixel for all 120 frames with `geq`, and
+        // generating the source alone outlasted a five-minute run.
+        let still = dir.join("still.png");
+        make(&still, &["-f", "lavfi", "-i",
+            "nullsrc=s=2640x1080,geq=r='128+90*sin(X*0.03)*cos(Y*0.02)':g='128+70*sin((X+Y)*0.015)':b='100+mod(X*3+Y*2,80)'",
+            "-frames:v", "1"]);
+        let src = dir.join("in.mp4");
+        make(&src, &["-loop", "1", "-i", still.to_str().unwrap(), "-vf", "crop=1920:1080:x='n*6':y=0",
+                     "-r", "60", "-frames:v", "120", "-pix_fmt", "yuv420p"]);
+        bench_both_modes("1080p camera pan", &src, &dir, 1920, 1080);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn have_ffmpeg() -> bool {
         Command::new("ffmpeg").arg("-version").output().map(|o| o.status.success()).unwrap_or(false)
@@ -445,10 +1355,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("in.mp4");
         make_test_video(&path, 64, 48, 1, 10);
-        let frames = decode_frames_rgb(path.to_str().unwrap(), 64, 48, Some(1)).expect("decode");
-        let rgb = &frames[0];
+        let rgb = &first_frame(&path, 64, 48);
         let (w, h) = (64usize, 48usize);
-        let yuv = crate::decode::rgb_to_yuv420p(rgb, w, h);
+        let yuv = decode_yuv_from_rgb(rgb, w, h);
         for q in [10u8, 50, 80, 95] {
             fao_v1::DEBUG_ESCAPES.store(0, std::sync::atomic::Ordering::Relaxed);
             fao_v1::DEBUG_OVERFLOWS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -469,179 +1378,5 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    #[test]
-    fn streamed_frames_are_byte_identical_to_the_whole_file_decode() {
-        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
-        let dir = std::env::temp_dir().join(format!("fao-stream-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let v = dir.join("in.mp4");
-        make_test_video(&v, 64, 48, 5, 10);
-        let p = v.to_str().unwrap();
-        let whole = decode_frames_rgb(p, 64, 48, None).unwrap();
-        let mut r = FrameReader::open(p, 64, 48, None).unwrap();
-        let mut streamed = vec![];
-        while let Some(f) = r.next_frame().unwrap() { streamed.push(f); }
-        assert_eq!(streamed.len(), 5);
-        assert!(streamed == whole, "same frames, same bytes");
-        assert_eq!(r.next_frame().unwrap(), None, "stays ended");
-        // The streaming encode reports every frame, with the decoded image at full size.
-        let never = std::sync::atomic::AtomicBool::new(false);
-        let mut stats = vec![];
-        let (bytes, rep) = transcode_stream(p, EncodeOpts::intra(60), None, &never, |s, img| { assert_eq!(img.len(), 64 * 48 * 3); stats.push(s.clone()); }).unwrap();
-        assert_eq!(stats.iter().map(|s| s.index).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
-        assert!(stats.iter().all(|s| s.bytes > 0 && s.psnr > 20.0), "{stats:?}");
-        assert_eq!(rep.frames, 5);
-        assert_eq!(rep.output_bytes as usize, bytes.len());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn cancel_stops_between_frames_and_writes_nothing() {
-        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
-        let dir = std::env::temp_dir().join(format!("fao-cancel-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let v = dir.join("in.mp4");
-        make_test_video(&v, 64, 48, 40, 10);
-        let cancel = std::sync::atomic::AtomicBool::new(false);
-        let mut seen = 0;
-        let t = std::time::Instant::now();
-        let r = transcode_stream(v.to_str().unwrap(), EncodeOpts::intra(60), None, &cancel, |s, _| {
-            seen = s.index + 1;
-            if seen == 2 { cancel.store(true, std::sync::atomic::Ordering::Relaxed); }
-        });
-        assert_eq!(r.unwrap_err(), Stop::Cancelled);
-        assert_eq!(seen, 2, "no frame after the cancel");
-        assert!(t.elapsed() < std::time::Duration::from_secs(10), "returns promptly (ffmpeg killed, not drained)");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_non_video_is_a_failure_with_a_reason_and_estimates_are_capped() {
-        let dir = std::env::temp_dir().join(format!("fao-bad-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let f = dir.join("notes.txt");
-        std::fs::write(&f, "not a video").unwrap();
-        let never = std::sync::atomic::AtomicBool::new(false);
-        match transcode_stream(f.to_str().unwrap(), EncodeOpts::intra(60), None, &never, |_, _| {}) {
-            Err(Stop::Failed(m)) => assert!(!m.is_empty()),
-            other => panic!("{other:?}"),
-        }
-        let info = VideoInfo { w: 64, h: 48, fps: 30.0, duration_s: 2.0, codec: "h264".into() };
-        assert_eq!(estimated_frames(&info, None), 60);
-        assert_eq!(estimated_frames(&info, Some(10)), 10);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A textured scene panning 2 px per frame: smooth gradients plus a checker, so motion
-    /// search has something to lock onto and the DCT has real detail to pay for.
-    fn pan(w: usize, h: usize, n: usize) -> Vec<Vec<u8>> {
-        (0..n).map(|f| {
-            let mut v = vec![0u8; w * h * 3];
-            for y in 0..h { for x in 0..w {
-                let sx = x + 2 * f;
-                let c = if ((sx / 8) + (y / 8)) % 2 == 0 { 40 } else { 0 };
-                let i = (y * w + x) * 3;
-                v[i] = ((sx * 3) % 200 + c) as u8;
-                v[i + 1] = ((y * 4) % 200 + c) as u8;
-                v[i + 2] = (((sx + y) * 2) % 200) as u8;
-            }}
-            v
-        }).collect()
-    }
-
-    fn container(w: usize, h: usize, q: u8, enc: &[(FrameStat, Vec<u8>)]) -> Vec<u8> {
-        let frames: Vec<_> = enc.iter().map(|(s, p)| (Vec::new(), p.clone(), s.marker, p.len(), 0.0f64, 0.0f64)).collect();
-        let mut out = Vec::new();
-        fao_v1::write_fao_container(&mut out, w, h, 30.0, q as f32 / 100.0, &frames).unwrap();
-        out
-    }
-
-    /// A textured, static background with a 16×16 object moving 2 px per frame: the content
-    /// v2.1's T-frames are built for (screen recordings, a talking head on a still set).
-    fn moving_object(w: usize, h: usize, n: usize) -> Vec<Vec<u8>> {
-        let bg = pan(w, h, 1).remove(0);
-        (0..n).map(|f| {
-            let mut v = bg.clone();
-            let (ox, oy) = (8 + 2 * f, h / 3);
-            for y in oy..(oy + 16).min(h) { for x in ox..(ox + 16).min(w) {
-                let i = (y * w + x) * 3;
-                v[i] = 230; v[i + 1] = 40 + ((x - ox) * 8) as u8; v[i + 2] = 60;
-            }}
-            v
-        }).collect()
-    }
-
-    #[test]
-    fn t_frames_pay_where_prediction_holds() {
-        let (w, h) = (256, 192);
-        let frames = moving_object(w, h, 16);
-        let mut inter = FrameEncoder::new(w, h, EncodeOpts::inter(70));
-        let mut intra = FrameEncoder::new(w, h, EncodeOpts::intra(70));
-        let enc: Vec<FrameStat> = frames.iter().map(|f| inter.encode(f).stat).collect();
-        let intra_bytes: usize = frames.iter().map(|f| intra.encode(f).payload.len()).sum();
-        let inter_bytes: usize = enc.iter().map(|s| s.bytes).sum();
-        let reasons: Vec<&str> = enc.iter().map(|s| s.why.as_str()).collect();
-        let ts = enc.iter().filter(|s| s.marker == b'T').count();
-        assert!(ts >= 12, "a small moving object on a still scene should predict: {reasons:?}");
-        assert!(inter_bytes * 3 < intra_bytes, "inter {inter_bytes} B vs intra {intra_bytes} B; {reasons:?}");
-        for s in enc.iter().filter(|s| s.marker == b'T') {
-            let a = &enc[s.anchor.unwrap()];
-            assert!(s.psnr >= a.psnr - EncodeOpts::inter(70).max_psnr_drop, "frame {}: {:.2} vs anchor {:.2}", s.index, s.psnr, a.psnr);
-        }
-    }
-
-    /// Any content, including a pan whose T-frames the default policy would refuse: accept them
-    /// all (a generous drop) and check the Player sees exactly what the encoder measured.
-    #[test]
-    fn what_the_player_shows_is_exactly_what_the_encoder_measured() {
-        let (w, h) = (128, 96);
-        let mut frames = pan(w, h, 8);
-        frames.extend(moving_object(w, h, 6));
-        let mut inter = FrameEncoder::new(w, h, EncodeOpts { max_psnr_drop: 30.0, ..EncodeOpts::inter(70) });
-        let enc: Vec<(FrameStat, Vec<u8>)> = frames.iter().map(|f| { let e = inter.encode(f); (e.stat, e.payload) }).collect();
-        let ts = enc.iter().filter(|(s, _)| s.marker == b'T').count();
-        assert_eq!(enc[0].0.why, "I: first frame");
-        assert!(ts >= 8, "enough T-frames for the check to mean something: {:?}", enc.iter().map(|(s, _)| s.why.as_str()).collect::<Vec<_>>());
-        // Every T points at an I-frame (one level of recursion in the Player, never a chain).
-        for (s, _) in &enc {
-            if let Some(a) = s.anchor { assert_eq!(enc[a].0.marker, b'D', "frame {} anchors on {a}", s.index); }
-        }
-        // The Player's own parser and decoder see exactly what the encoder measured: the encoder
-        // predicted from the anchor the decoder reconstructs, so there is no mismatch at all.
-        let f = crate::decode::FaoFile::parse(container(w, h, 70, &enc)).expect("parses");
-        assert_eq!(f.frame_count(), frames.len());
-        for (i, (s, _)) in enc.iter().enumerate() {
-            let shown = f.decode_rgb(i).unwrap_or_else(|g| panic!("frame {i} ({}): {g}", s.why));
-            let p = psnr(&frames[i], &shown);
-            assert!((p - s.psnr).abs() < 1e-9, "frame {i} ({}): Player shows {p:.4} dB, encoder reported {:.4}", s.why, s.psnr);
-        }
-    }
-
-    #[test]
-    fn a_scene_cut_and_the_gop_limit_start_new_anchors_with_a_reason() {
-        let (w, h) = (64, 48);
-        let mut frames = pan(w, h, 6);
-        // A cut: pseudo-random noise, unpredictable from the pan.
-        let mut x: u32 = 12345;
-        frames.push((0..w * h * 3).map(|_| { x = x.wrapping_mul(1103515245).wrapping_add(12345); (x >> 16) as u8 }).collect());
-        let mut e = FrameEncoder::new(w, h, EncodeOpts::inter(70));
-        let stats: Vec<FrameStat> = frames.iter().map(|f| e.encode(f).stat).collect();
-        let cut = stats.last().unwrap();
-        assert_eq!(cut.marker, b'D', "{}", cut.why);
-        assert!(cut.why.starts_with("I: "), "{}", cut.why);
-        // GOP limit: a T never sits max_gop or more frames after its anchor (a refused T
-        // starts a new GOP early, so anchors are not at fixed multiples). On a still-scene
-        // clip every T would be accepted, so the limit is what forces the I-frames.
-        let mut g = FrameEncoder::new(256, 192, EncodeOpts { max_gop: 3, ..EncodeOpts::inter(70) });
-        let st: Vec<FrameStat> = moving_object(256, 192, 10).iter().map(|f| g.encode(f).stat).collect();
-        for s in &st {
-            if let Some(a) = s.anchor { assert!(s.index - a < 3, "frame {} is {} after its anchor", s.index, s.index - a); }
-        }
-        assert!(st.iter().filter(|s| s.why == "I: GOP limit 3").count() >= 2, "{:?}", st.iter().map(|s| s.why.as_str()).collect::<Vec<_>>());
-        let mut only_i = FrameEncoder::new(w, h, EncodeOpts::intra(70));
-        assert!(pan(w, h, 3).iter().all(|f| only_i.encode(f).stat.marker == b'D'), "intra-only stays intra");
-    }
-
 }
 

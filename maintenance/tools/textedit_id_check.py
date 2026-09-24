@@ -99,8 +99,25 @@ def main():
                     src = open(path, encoding="utf-8", errors="replace").read()
                 except OSError:
                     continue
-                if "TextEdit::" not in src:
+                # BLIND SPOT, closed. This used to skip any file without the
+                # string "TextEdit::" and match only the builder form -- so
+                # `ui.text_edit_singleline(&mut s)` was never seen at all, and a
+                # file using ONLY that form was never even opened. That form
+                # cannot carry an id (it has no builder), so every use is
+                # unpinned by construction. Five were hiding: bo-suite's tag
+                # editor (Title/Artist/Album/Year) and photosync's album name.
+                if "TextEdit::" not in src and "text_edit_" not in src:
                     continue
+                for m in re.finditer(r"\.text_edit_(?:singleline|multiline)\s*\(", src):
+                    total += 1
+                    if in_test_or_doc(src, m.start()):
+                        continue
+                    rel = os.path.relpath(path, root)
+                    if rel in KNOWN:
+                        continue
+                    ln = src[: m.start()].count("\n") + 1
+                    bad.append((rel, ln, src.splitlines()[ln - 1].strip()[:88]
+                                + "   <- convenience form: cannot take an id; use TextEdit::singleline(..).id_salt(..)"))
                 for m in re.finditer(r"TextEdit::(?:singleline|multiline)\s*\(", src):
                     total += 1
                     if in_test_or_doc(src, m.start()):

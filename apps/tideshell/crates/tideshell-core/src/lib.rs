@@ -102,6 +102,7 @@ pub enum Action {
     /// A quick-settings toggle changed. Backends (NetworkManager, BlueZ, ...)
     /// are per-kind transports.
     SetQuick(control_center::QuickKind, bool),
+    SetGovernor(control_center::CpuGovernor),
     SetSlider(control_center::SliderKind, f32),
     /// Prefs changed; persist `ShellPrefs::to_kv()` through settingsd.
     SavePrefs,

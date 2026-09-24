@@ -66,6 +66,9 @@ pub const WIDE_TAIL: char = '\0';
 #[derive(Debug, Clone)]
 struct AltSave {
     cells: Vec<Cell>,
+    /// The parked primary's soft-wrap flags, so it can be REFLOWED on a resize
+    /// while a full-screen program has the alternate screen.
+    wrapped: Vec<bool>,
     cur_row: usize,
     cur_col: usize,
     pen: Style,
@@ -101,6 +104,16 @@ pub struct Grid {
     /// Lines that scrolled off the top (most-recent last), capped.
     pub scrollback: Vec<Vec<Cell>>,
     scrollback_cap: usize,
+    /// Per screen row: `true` when the row ended because text reached the right
+    /// margin and CONTINUED on the next row (a soft wrap), `false` for a real
+    /// line end. The one bit reflow needs and nothing recorded: without it a
+    /// wrapped line and two short lines are indistinguishable, so a resize can
+    /// only truncate -- and growing the pane back never restored the text.
+    /// Moves with its row through every scroll; cleared when a row's end is
+    /// erased (how a shell redraws a line).
+    wrapped: Vec<bool>,
+    /// The same flag for each `scrollback` row, kept parallel by `sb_push`.
+    scrollback_wrapped: Vec<bool>,
     /// DEC private modes the KEY ENCODER needs.
     ///
     /// These live on the grid because the program running in the terminal sets
@@ -167,6 +180,8 @@ impl Grid {
             pen: Style::default(),
             scrollback: Vec::new(),
             scrollback_cap: 1000,
+            wrapped: vec![false; rows],
+            scrollback_wrapped: Vec::new(),
             app_cursor: false,
             bracketed_paste: false,
             scroll_top: 0,
@@ -261,6 +276,9 @@ impl Grid {
         // A wide glyph needs two columns, so it must not START in the last one:
         // half of it would land on the next row. Wrapping first keeps it whole.
         if self.cur_col + w > self.cols {
+            // A SOFT wrap: this row continues on the next. Recorded BEFORE the
+            // line feed, so if it scrolls the flag travels with the row.
+            self.wrapped[self.cur_row] = true;
             self.cur_col = 0;
             self.line_feed();
         }
@@ -320,6 +338,7 @@ impl Grid {
         }
         self.alt_saved = Some(AltSave {
             cells: self.cells.clone(),
+            wrapped: self.wrapped.clone(),
             cur_row: self.cur_row,
             cur_col: self.cur_col,
             pen: self.pen,
@@ -345,6 +364,7 @@ impl Grid {
         for c in &mut self.cells {
             *c = Cell::default();
         }
+        self.wrapped.iter_mut().for_each(|w| *w = false);
         self.cur_row = 0;
         self.cur_col = 0;
     }
@@ -356,6 +376,7 @@ impl Grid {
     pub fn leave_alt_screen(&mut self, restore_cursor: bool) {
         let Some(saved) = self.alt_saved.take() else { return };
         self.cells = saved.cells;
+        self.wrapped = saved.wrapped;
         self.scroll_top = saved.scroll_top;
         self.scroll_bot = saved.scroll_bot;
         if restore_cursor {
@@ -439,8 +460,10 @@ impl Grid {
         for r in top..=bot - n {
             let (src, dst) = (self.idx(r + n, 0), self.idx(r, 0));
             self.cells.copy_within(src..src + self.cols, dst);
+            self.wrapped[r] = self.wrapped[r + n];
         }
         for r in bot + 1 - n..=bot {
+            self.wrapped[r] = false;
             let base = self.idx(r, 0);
             for c in 0..self.cols {
                 self.cells[base + c] = Cell::default();
@@ -455,8 +478,10 @@ impl Grid {
         for r in (top + n..=bot).rev() {
             let (src, dst) = (self.idx(r - n, 0), self.idx(r, 0));
             self.cells.copy_within(src..src + self.cols, dst);
+            self.wrapped[r] = self.wrapped[r - n];
         }
         for r in top..top + n {
+            self.wrapped[r] = false;
             let base = self.idx(r, 0);
             for c in 0..self.cols {
                 self.cells[base + c] = Cell::default();
@@ -523,10 +548,8 @@ impl Grid {
             && self.alt_saved.is_none();
         if full {
             let top: Vec<Cell> = self.cells[0..self.cols].to_vec();
-            self.scrollback.push(top);
-            if self.scrollback.len() > self.scrollback_cap {
-                self.scrollback.remove(0);
-            }
+            let w = self.wrapped[0];
+            self.sb_push(top, w);
             // pin the view while scrolled back: the bottom moved one line away, so keep pointing at
             // the same content (clamped — eviction above can shrink what's reachable)
             if self.view_offset > 0 {
@@ -611,6 +634,7 @@ impl Grid {
         for c in &mut self.cells {
             *c = Cell::default();
         }
+        self.wrapped.iter_mut().for_each(|w| *w = false);
         self.cur_row = 0;
         self.cur_col = 0;
     }
@@ -631,6 +655,11 @@ impl Grid {
         let base = self.idx(self.cur_row, 0);
         for c in from..to.min(self.cols) {
             self.cells[base + c] = Cell { ch: ' ', style: self.pen };
+        }
+        // The row's END was erased (modes 0 and 2): it no longer runs on into
+        // the next row. Mode 1 erases the start and leaves the end alone.
+        if mode != 1 {
+            self.wrapped[self.cur_row] = false;
         }
     }
 
@@ -688,6 +717,12 @@ impl Grid {
 
     /// Erase in display: 0 = cursor→end, 1 = start→cursor, 2 = whole screen.
     pub fn erase_in_display(&mut self, mode: u16) {
+        let (cr, rows) = (self.cur_row, self.rows);
+        match mode {
+            2 => self.wrapped.iter_mut().for_each(|w| *w = false),
+            1 => self.wrapped[..cr].iter_mut().for_each(|w| *w = false),
+            _ => self.wrapped[cr..rows].iter_mut().for_each(|w| *w = false),
+        }
         match mode {
             2 => {
                 for c in &mut self.cells {
@@ -711,45 +746,82 @@ impl Grid {
         }
     }
 
-    /// Resize the grid, preserving the top-left content.
+    /// Push a row into scrollback with its wrap flag, evicting the oldest past
+    /// the cap. The one place scrollback grows, so the flags stay parallel.
+    fn sb_push(&mut self, row: Vec<Cell>, wrapped: bool) {
+        self.scrollback.push(row);
+        self.scrollback_wrapped.push(wrapped);
+        while self.scrollback.len() > self.scrollback_cap {
+            self.scrollback.remove(0);
+            if !self.scrollback_wrapped.is_empty() {
+                self.scrollback_wrapped.remove(0);
+            }
+        }
+    }
+
+    /// Resize the grid, REFLOWING the primary screen and its scrollback.
     ///
-    /// Column-shrinking is destructive in the ACTIVE view (a narrower row cannot show what a
-    /// wider one did without real reflow, which needs to track wrap continuations across the
-    /// whole grid+scrollback and is a substantially larger change than this method's scope) —
-    /// but it no longer DISCARDS what it can't show: any row whose truncated tail is non-blank
-    /// is preserved verbatim, at its original width, as a scrollback entry inserted just above
-    /// that row, before the row itself gets copied into the resized (narrower) buffer below.
-    /// So a pane shrunk mid-output loses nothing permanently — scroll up to see the un-chopped
-    /// line — even though the live screen still wraps/truncates at the new width until real
-    /// reflow exists. Growing the pane back does not un-truncate the live row (it was already
-    /// copied narrow into `next`), but the scrollback copy survives regardless of later resizes.
+    /// Soft-wrapped lines (see `wrapped`) are joined and rewrapped at the new
+    /// width: narrowing wraps them further, and widening UNWRAPS them again.
+    /// This replaces a resize that could only truncate -- growing a pane back
+    /// after shrinking it never restored the text -- and a workaround that
+    /// pushed every truncated row onto the END of scrollback while its narrow
+    /// copy stayed on screen, leaving out-of-order duplicates in the history.
+    ///
+    /// The primary screen is reflowed wherever it is: live, or PARKED while a
+    /// full-screen program has the alternate screen (so the shell is intact
+    /// when it exits). The alternate screen itself is only resized -- its
+    /// program redraws it on SIGWINCH, as every terminal assumes.
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let (old_cols, old_rows) = (self.cols, self.rows);
-        if cols < self.cols {
-            for r in 0..self.rows {
-                let tail_has_content = (cols..self.cols).any(|c| self.cell(r, c).ch != ' ');
-                if tail_has_content {
-                    let full_row: Vec<Cell> = (0..self.cols).map(|c| self.cell(r, c)).collect();
-                    self.scrollback.push(full_row);
-                    if self.scrollback.len() > self.scrollback_cap {
-                        self.scrollback.remove(0);
-                    }
+        // Scrollback flags are kept parallel; a mismatch (which nothing should
+        // produce) is repaired rather than trusted, treating extras as hard ends.
+        self.scrollback_wrapped.resize(self.scrollback.len(), false);
+        let sb = std::mem::take(&mut self.scrollback);
+        let sbw = std::mem::take(&mut self.scrollback_wrapped);
+
+        if let Some(saved) = self.alt_saved.take() {
+            let r = reflow_primary(sb, sbw, &saved.cells, &saved.wrapped, old_cols,
+                                   (saved.cur_row, saved.cur_col), cols, rows, self.scrollback_cap);
+            self.scrollback = r.scrollback;
+            self.scrollback_wrapped = r.scrollback_wrapped;
+            self.alt_saved = Some(AltSave {
+                cells: r.cells,
+                wrapped: r.wrapped,
+                cur_row: r.cursor.0,
+                cur_col: r.cursor.1.min(cols - 1),
+                pen: saved.pen,
+                scroll_top: 0,
+                scroll_bot: rows - 1,
+            });
+            // The alternate screen: resized, not reflowed.
+            let mut next = vec![Cell::default(); cols * rows];
+            for r in 0..rows.min(old_rows) {
+                for c in 0..cols.min(old_cols) {
+                    next[r * cols + c] = self.cells[r * old_cols + c];
                 }
             }
+            self.cells = next;
+            self.wrapped = vec![false; rows];
+            self.cur_row = self.cur_row.min(rows - 1);
+            self.cur_col = self.cur_col.min(cols - 1);
+        } else {
+            let r = reflow_primary(sb, sbw, &self.cells, &self.wrapped, old_cols,
+                                   (self.cur_row, self.cur_col), cols, rows, self.scrollback_cap);
+            self.scrollback = r.scrollback;
+            self.scrollback_wrapped = r.scrollback_wrapped;
+            self.cells = r.cells;
+            self.wrapped = r.wrapped;
+            self.cur_row = r.cursor.0;
+            // `cols` itself is the pending-wrap position `put` already uses
+            // after writing the last column; clamping to `cols - 1` would make
+            // the next character overwrite the last one.
+            self.cur_col = r.cursor.1.min(cols);
         }
-        let mut next = vec![Cell::default(); cols * rows];
-        for r in 0..rows.min(self.rows) {
-            for c in 0..cols.min(self.cols) {
-                next[r * cols + c] = self.cell(r, c);
-            }
-        }
-        self.cells = next;
         self.cols = cols;
         self.rows = rows;
-        self.cur_row = self.cur_row.min(rows - 1);
-        self.cur_col = self.cur_col.min(cols - 1);
         // A region that outlived the rows it named would make `line_feed`
         // compare the cursor against a row that no longer exists, and the
         // screen would stop scrolling entirely. A resize is also when a shell
@@ -757,24 +829,156 @@ impl Grid {
         // what the next escape will correct.
         self.scroll_top = 0;
         self.scroll_bot = rows - 1;
-        // The PARKED primary buffer is sized for the old grid. Leaving it
-        // would make `leave_alt_screen` install a Vec of the wrong length and
-        // every subsequent index land on the wrong row — a corruption that
-        // appears minutes later, when the pager exits.
-        if let Some(saved) = &mut self.alt_saved {
-            let mut next = vec![Cell::default(); cols * rows];
-            for r in 0..rows.min(old_rows) {
-                for c in 0..cols.min(old_cols) {
-                    next[r * cols + c] = saved.cells[r * old_cols + c];
-                }
+        // A DECSC position from the old geometry must not restore off-screen.
+        if let Some((r, c, pen)) = self.saved_cursor {
+            self.saved_cursor = Some((r.min(rows - 1), c.min(cols - 1), pen));
+        }
+        // The content under a scrolled-back view has moved; show the live end.
+        self.view_offset = 0;
+    }
+}
+
+/// A cell that is empty in every visible way: trimmed from line ends.
+fn is_blank_cell(c: &Cell) -> bool {
+    c.ch == ' ' && c.style == Style::default()
+}
+
+/// The result of reflowing a primary screen with its scrollback.
+struct Reflowed {
+    scrollback: Vec<Vec<Cell>>,
+    scrollback_wrapped: Vec<bool>,
+    cells: Vec<Cell>,
+    wrapped: Vec<bool>,
+    cursor: (usize, usize),
+}
+
+/// Rewrap `src` rows (oldest first, each with its soft-wrap flag) to `cols`.
+/// `cursor` is a row index into `src` and a column. Returns the new rows and
+/// where the cursor landed -- its column may be `cols`, the pending-wrap spot.
+///
+/// Logical lines are rows joined through their wrap flags. Each is trimmed of
+/// trailing blank cells (never past the cursor, which may sit in them) and
+/// split at `cols`, never splitting a wide character: one that would straddle
+/// the margin moves whole to the next row. An empty line is one empty row.
+fn reflow_rows(src: Vec<(Vec<Cell>, bool)>, cursor: (usize, usize), cols: usize)
+    -> (Vec<(Vec<Cell>, bool)>, (usize, usize))
+{
+    let cols = cols.max(1);
+    let mut out: Vec<(Vec<Cell>, bool)> = Vec::new();
+    let mut cur = (0usize, 0usize);
+    let mut line: Vec<Cell> = Vec::new();
+    let mut cursor_off: Option<usize> = None;
+    let n = src.len();
+    // A wide character that did not fit at a row's end was pushed to the next
+    // row, leaving ONE blank pad cell behind. Joined back verbatim, that pad
+    // became a stray space on every widen ("ab 中 文cd"). Recognised as: a
+    // wrapped row ending in one blank cell, followed by a row that STARTS with
+    // a wide character. Trade-off: a genuine space in exactly that spot would
+    // also go; a true marker (as Alacritty keeps) would need every renderer
+    // to learn a new cell kind.
+    let starts_wide = |r: &Vec<Cell>| r.len() >= 2 && r[1].ch == WIDE_TAIL;
+    let pads: Vec<bool> = (0..n).map(|i| {
+        src[i].1 && i + 1 < n && starts_wide(&src[i + 1].0)
+            && src[i].0.last().is_some_and(is_blank_cell)
+    }).collect();
+    for (i, (mut row, wrapped)) in src.into_iter().enumerate() {
+        if pads[i] {
+            row.pop();
+        }
+        if i == cursor.0 {
+            cursor_off = Some(line.len() + cursor.1.min(row.len()));
+        }
+        line.extend(row);
+        if wrapped && i + 1 < n {
+            continue;
+        }
+        let keep = cursor_off.unwrap_or(0);
+        while line.len() > keep && line.last().is_some_and(is_blank_cell) {
+            line.pop();
+        }
+        let mut row: Vec<Cell> = Vec::with_capacity(cols);
+        let mut k = 0;
+        while k < line.len() {
+            let wide = k + 1 < line.len() && line[k + 1].ch == WIDE_TAIL && cols >= 2;
+            let w = if wide { 2 } else { 1 };
+            if row.len() + w > cols && !row.is_empty() {
+                row.resize(cols, Cell::default());
+                out.push((std::mem::replace(&mut row, Vec::with_capacity(cols)), true));
             }
-            saved.cells = next;
-            saved.cur_row = saved.cur_row.min(rows - 1);
-            saved.cur_col = saved.cur_col.min(cols - 1);
-            saved.scroll_top = 0;
-            saved.scroll_bot = rows - 1;
+            if cursor_off == Some(k) {
+                cur = (out.len(), row.len());
+            }
+            row.push(line[k]);
+            if wide {
+                if cursor_off == Some(k + 1) {
+                    cur = (out.len(), row.len());
+                }
+                row.push(line[k + 1]);
+            }
+            // A wide head with no room for its tail (cols < 2) drops the tail.
+            k += if line.get(k + 1).is_some_and(|c| c.ch == WIDE_TAIL) && !wide { 2 } else { w };
+        }
+        if cursor_off == Some(line.len()) {
+            cur = (out.len(), row.len());
+        }
+        row.resize(cols, Cell::default());
+        out.push((row, false));
+        line.clear();
+        cursor_off = None;
+    }
+    (out, cur)
+}
+
+/// Reflow a primary screen (`cells`, `old_cols` wide) together with its
+/// scrollback into a `cols` x `rows` screen, the surplus going to scrollback.
+///
+/// Blank rows BELOW the cursor are free space, not lines: they are dropped
+/// before reflowing and the screen is padded again after, so a fresh
+/// terminal's few lines stay at the top instead of sinking to the bottom.
+/// The screen then shows the last `rows` rows, cursor always visible.
+fn reflow_primary(sb: Vec<Vec<Cell>>, sbw: Vec<bool>, cells: &[Cell], wrapped: &[bool], old_cols: usize,
+                  cursor: (usize, usize), cols: usize, rows: usize, cap: usize) -> Reflowed {
+    let old_rows = if old_cols == 0 { 0 } else { cells.len() / old_cols };
+    let sb_len = sb.len();
+    let mut src: Vec<(Vec<Cell>, bool)> = sb.into_iter().zip(sbw).collect();
+    let mut screen: Vec<(Vec<Cell>, bool)> = (0..old_rows)
+        .map(|r| (cells[r * old_cols..(r + 1) * old_cols].to_vec(), wrapped.get(r).copied().unwrap_or(false)))
+        .collect();
+    let cur_row = cursor.0.min(old_rows.saturating_sub(1));
+    while screen.len() > cur_row + 1
+        && screen.last().is_some_and(|(r, w)| !w && r.iter().all(is_blank_cell))
+    {
+        screen.pop();
+    }
+    src.extend(screen);
+    let (all, cur) = reflow_rows(src, (sb_len + cur_row, cursor.1), cols);
+    let total = all.len();
+    let mut start = total.saturating_sub(rows);
+    if cur.0 < start {
+        start = cur.0;
+    }
+    let mut out = Reflowed {
+        scrollback: Vec::new(),
+        scrollback_wrapped: Vec::new(),
+        cells: Vec::with_capacity(cols * rows),
+        wrapped: Vec::with_capacity(rows),
+        cursor: (cur.0 - start, cur.1),
+    };
+    for (i, (row, w)) in all.into_iter().enumerate() {
+        if i < start {
+            out.scrollback.push(row);
+            out.scrollback_wrapped.push(w);
+        } else if i < start + rows {
+            out.cells.extend(row);
+            out.wrapped.push(w);
         }
     }
+    let excess = out.scrollback.len().saturating_sub(cap);
+    out.scrollback.drain(..excess);
+    out.scrollback_wrapped.drain(..excess);
+    out.cells.resize(cols * rows, Cell::default());
+    out.wrapped.resize(rows, false);
+    out
 }
 
 // ── the VT/ANSI parser ───────────────────────────────────────────────────────
@@ -824,12 +1028,47 @@ pub struct Parser {
     params: Vec<u16>,
     /// True when the current CSI began `CSI ?` — a DEC PRIVATE sequence.
     private: bool,
+    /// The `>` / `=` markers of the current CSI. Tracked because DA1 (`CSI c`),
+    /// DA2 (`CSI > c`) and DA3 (`CSI = c`) share a final byte and differ ONLY
+    /// here -- dropping them as generic intermediates answered DA2 with DA1.
+    gt: bool,
+    eq: bool,
     cur: Option<u16>,
+    /// Bytes the TERMINAL must send back to the program: answers to queries.
+    ///
+    /// ## Why this exists: the helix start-up delay
+    ///
+    /// Reported as "the hx command has a delay in the egui version, fixed in
+    /// the Qt predecessor". It was fixed there in `pty_term.rs` v0.1.784, and
+    /// that comment is the diagnosis: crossterm's
+    /// `supports_keyboard_enhancement()`, called at start-up by helix, gitui
+    /// and other ratatui/crossterm TUIs, sends `CSI ? u` then `CSI c` and BLOCKS
+    /// waiting for the Device Attributes reply as a sync marker. With no reply
+    /// it stalls ~2-3 s before giving up.
+    ///
+    /// This parser had no outbound channel at all, so it could not have
+    /// answered even if it had recognised the query. The host drains this with
+    /// [`Parser::take_replies`] and writes it to the PTY master.
+    replies: Vec<u8>,
 }
 
 impl Default for Parser {
     fn default() -> Self {
-        Parser { state: State::Ground, params: Vec::new(), cur: None, private: false }
+        Parser {
+            state: State::Ground, params: Vec::new(), cur: None, private: false,
+            gt: false, eq: false, replies: Vec::new(),
+        }
+    }
+}
+
+impl Parser {
+    /// Bytes to write back to the PTY: answers to terminal queries, in order.
+    ///
+    /// Must be drained and written after every feed. A reply that is queued
+    /// and never sent is exactly as slow as no reply -- the program is still
+    /// waiting on the other end of the PTY.
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.replies)
     }
 }
 
@@ -871,6 +1110,8 @@ impl Parser {
                 '[' => {
                     self.params.clear();
                     self.private = false;
+                    self.gt = false;
+                    self.eq = false;
                     self.cur = None;
                     self.state = State::Csi;
                 }
@@ -921,6 +1162,8 @@ impl Parser {
                         self.params.push(self.cur.take().unwrap_or(0));
                     }
                     '?' => { self.private = true; }
+                    '>' => { self.gt = true; }
+                    '=' => { self.eq = true; }
                     '@'..='~' => {
                         let params = self.take_params();
                         if self.private {
@@ -1040,6 +1283,35 @@ impl Parser {
             'J' => grid.erase_in_display(params.first().copied().unwrap_or(0)),
             'K' => grid.erase_in_line(params.first().copied().unwrap_or(0)),
             'm' => self.apply_sgr(params, grid),
+            // DEVICE ATTRIBUTES. Answered exactly as Qt's `pty_term.rs` does:
+            //   DA1 `CSI c` / `CSI 0 c` -> `ESC [ ? 1 ; 2 c` (VT100 + advanced
+            //       video). The content is irrelevant to crossterm, which only
+            //       needs SOME reply as a sync marker; kept conservative so
+            //       programs do not assume features this terminal lacks.
+            //   DA2 `CSI > c`           -> `ESC [ > 0 ; 276 ; 0 c`
+            //   DA3 `CSI = c`           -> left unanswered, as in Qt (rare, no
+            //       known blocker).
+            // NOT answering `CSI ? u` is deliberate and correct: silence there
+            // means "no kitty keyboard protocol", which is true.
+            'c' => {
+                if self.gt {
+                    self.replies.extend_from_slice(b"\x1b[>0;276;0c");
+                } else if !self.eq && params.first().copied().unwrap_or(0) == 0 {
+                    self.replies.extend_from_slice(b"\x1b[?1;2c");
+                }
+            }
+            // DEVICE STATUS REPORT. Tools that ask where the cursor is block
+            // for the answer too (Qt's v0.1.418 names ollama's spinner).
+            //   DSR 5 -> `ESC [ 0 n` (status OK)
+            //   DSR 6 -> `ESC [ row ; col R`, 1-based, as the query expects.
+            'n' => match params.first().copied().unwrap_or(0) {
+                5 => self.replies.extend_from_slice(b"\x1b[0n"),
+                6 => {
+                    let r = format!("\x1b[{};{}R", grid.cur_row + 1, grid.cur_col + 1);
+                    self.replies.extend_from_slice(r.as_bytes());
+                }
+                _ => {}
+            },
             _ => {} // unsupported CSI: ignore
         }
     }
@@ -1134,6 +1406,16 @@ impl Terminal {
     /// Feed already-decoded text.
     pub fn feed(&mut self, text: &str) {
         self.parser.feed(text, &mut self.grid);
+    }
+
+    /// Answers to terminal queries that must be written back to the PTY.
+    ///
+    /// CALL AFTER EVERY FEED AND WRITE THE RESULT TO THE PTY MASTER. See
+    /// `Parser::replies` for why: helix and other crossterm programs block on
+    /// start-up waiting for these, and a reply that is queued but never sent
+    /// is exactly as slow as none.
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        self.parser.take_replies()
     }
 
     /// Place a command on the input line **without running it** — the cross-app action
@@ -2156,6 +2438,122 @@ impl SearchState {
 
 #[cfg(test)]
 mod tests {
+    // ── reflow on resize ─────────────────────────────────────────────────────
+
+    /// History and screen as text, blank rows dropped: what a user would read.
+    fn text(t: &Terminal) -> Vec<String> {
+        t.grid.all_lines().into_iter().filter(|l| !l.is_empty()).collect()
+    }
+
+    /// THE REPORTED BUG: shrink a pane so a line wraps, grow it back, and the
+    /// line is whole again -- before, it stayed chopped at the narrow width.
+    #[test]
+    fn a_line_shrunk_then_grown_back_is_whole_again() {
+        let mut t = Terminal::new(20, 5);
+        t.feed("the quick brown fox\r\n$ ");
+        t.resize(8, 5);
+        assert_eq!(t.grid.row_text(0), "the quic");
+        assert_eq!(t.grid.row_text(1), "k brown");
+        assert_eq!(t.grid.row_text(2), "fox", "narrowing wraps the line, it does not cut it");
+        t.resize(20, 5);
+        assert_eq!(t.grid.row_text(0), "the quick brown fox", "widening unwraps it again");
+        assert_eq!(t.grid.row_text(1), "$");
+    }
+
+    /// Split panes shrink and grow repeatedly: the history keeps its ORDER and
+    /// gains no duplicates. The old workaround appended every truncated
+    /// mid-screen row to the end of scrollback, while its narrow copy stayed.
+    #[test]
+    fn history_survives_repeated_resizes_in_order_without_duplicates() {
+        let mut t = Terminal::new(30, 4);
+        let lines: Vec<String> = (0..12).map(|i| format!("line {i:02} with some words")).collect();
+        for l in &lines {
+            t.feed(&format!("{l}\r\n"));
+        }
+        let before = text(&t);
+        for &(c, r) in &[(10, 4), (7, 6), (30, 4), (13, 3), (30, 4)] {
+            t.resize(c, r);
+        }
+        assert_eq!(text(&t), before, "same lines, same order, nothing lost or duplicated");
+        assert_eq!(before, lines);
+    }
+
+    #[test]
+    fn real_line_breaks_are_never_joined() {
+        let mut t = Terminal::new(10, 4);
+        t.feed("ab\r\ncd\r\n");
+        t.resize(40, 4);
+        assert_eq!((t.grid.row_text(0).as_str(), t.grid.row_text(1).as_str()), ("ab", "cd"));
+    }
+
+    /// The cursor follows its text: typing after a round trip continues the
+    /// same line, not somewhere the old geometry left it.
+    #[test]
+    fn the_cursor_follows_its_text_through_a_reflow() {
+        let mut t = Terminal::new(8, 4);
+        t.feed("$ abcdefghij"); // wraps: "$ abcdef" / "ghij"
+        assert_eq!((t.grid.cur_row, t.grid.cur_col), (1, 4));
+        t.resize(20, 4);
+        assert_eq!((t.grid.cur_row, t.grid.cur_col), (0, 12));
+        t.feed("K");
+        assert_eq!(t.grid.row_text(0), "$ abcdefghijK");
+        t.resize(5, 4);
+        t.feed("L");
+        assert_eq!(text(&t).concat(), "$ abcdefghijKL", "still one line, cursor at its end");
+    }
+
+    /// A wide character is never split across the margin, and a round trip
+    /// restores the text exactly.
+    #[test]
+    fn wide_characters_are_never_split_by_a_reflow() {
+        let mut t = Terminal::new(12, 4);
+        t.feed("ab\u{4e2d}\u{6587}cd");
+        t.resize(3, 6);
+        for r in 0..t.grid.rows {
+            let last = t.grid.cell(r, 2).ch;
+            let wide_head = Grid::char_width(last) == 2;
+            assert!(!wide_head, "row {r} ends with half a wide character");
+        }
+        t.resize(12, 4);
+        assert_eq!(t.grid.row_text(0), "ab\u{4e2d}\u{6587}cd");
+    }
+
+    /// The shell UNDER a full-screen program is reflowed too, and is whole
+    /// when the program exits.
+    #[test]
+    fn the_parked_shell_is_reflowed_while_vim_has_the_screen() {
+        let mut t = Terminal::new(20, 4);
+        t.feed("the quick brown fox\r\n$ \x1b[?1049h");
+        t.resize(8, 4);
+        t.resize(20, 4);
+        t.feed("\x1b[?1049l");
+        assert_eq!(t.grid.row_text(0), "the quick brown fox");
+    }
+
+    /// A row whose end was erased no longer continues onto the next, so a
+    /// reflow must not glue them together.
+    #[test]
+    fn an_erased_line_end_is_not_rejoined() {
+        let mut t = Terminal::new(8, 4);
+        t.feed("abcdefghij"); // soft-wrapped at 8
+        t.feed("\x1b[1;5H\x1b[K"); // row 0: erase from column 5 to the end
+        t.resize(20, 4);
+        assert_eq!(t.grid.row_text(0), "abcd");
+        assert_eq!(t.grid.row_text(1), "ij");
+    }
+
+    /// Blank rows below the cursor are space, not lines: a fresh terminal's
+    /// few lines stay at the top instead of sinking to the bottom.
+    #[test]
+    fn a_short_screen_stays_at_the_top_after_a_resize() {
+        let mut t = Terminal::new(20, 10);
+        t.feed("one\r\ntwo\r\n$ ");
+        t.resize(12, 8);
+        assert_eq!(t.grid.row_text(0), "one");
+        assert_eq!(t.grid.cur_row, 2);
+        assert!(t.grid.scrollback.is_empty());
+    }
+
     use super::*;
 
     #[test]
@@ -3296,4 +3694,69 @@ mod wide_char_tests {
         assert_eq!(Grid::char_width('\u{1F600}'), 2);
         assert_eq!(Grid::char_width('\u{1F9F0}'), 2);
     }
+
+#[cfg(test)]
+mod query_reply_tests {
+    use super::*;
+
+    fn replies_for(input: &str) -> Vec<u8> {
+        let mut t = Terminal::new(80, 24);
+        t.feed(input);
+        t.take_replies()
+    }
+
+    /// THE HELIX DELAY. crossterm sends `CSI c` at start-up and blocks until
+    /// the terminal answers. The answer is Qt's, byte for byte.
+    #[test]
+    fn device_attributes_are_answered() {
+        assert_eq!(replies_for("\x1b[c"), b"\x1b[?1;2c");
+        assert_eq!(replies_for("\x1b[0c"), b"\x1b[?1;2c", "the explicit-zero form too");
+    }
+
+    /// crossterm's exact start-up pair: `CSI ? u` then `CSI c`. The keyboard
+    /// query must stay UNANSWERED -- silence means "no kitty protocol", which
+    /// is true -- and only the DA1 marker comes back.
+    #[test]
+    fn crosstermss_startup_probe_gets_exactly_the_da1_reply() {
+        assert_eq!(replies_for("\x1b[?u\x1b[c"), b"\x1b[?1;2c");
+    }
+
+    /// DA2 differs from DA1 ONLY by the `>` marker. Dropping it as a generic
+    /// intermediate answered DA2 with a DA1 reply.
+    #[test]
+    fn secondary_attributes_get_their_own_reply() {
+        assert_eq!(replies_for("\x1b[>c"), b"\x1b[>0;276;0c");
+        assert_eq!(replies_for("\x1b[=c"), b"", "DA3 left unanswered, as in Qt");
+    }
+
+    /// Where is the cursor? Answered 1-based, as the query expects.
+    #[test]
+    fn a_cursor_position_query_is_answered_one_based() {
+        // Move to row 5, col 10 (1-based), then ask.
+        assert_eq!(replies_for("\x1b[5;10H\x1b[6n"), b"\x1b[5;10R");
+        assert_eq!(replies_for("\x1b[5n"), b"\x1b[0n", "status: OK");
+    }
+
+    /// The marker state must RESET per sequence, or a DA2 would turn the next
+    /// plain DA1 into a DA2 too.
+    #[test]
+    fn markers_do_not_leak_into_the_next_sequence() {
+        assert_eq!(replies_for("\x1b[>c\x1b[c"), b"\x1b[>0;276;0c\x1b[?1;2c");
+    }
+
+    /// Replies are drained, not accumulated -- a second take is empty.
+    #[test]
+    fn replies_are_taken_once() {
+        let mut t = Terminal::new(80, 24);
+        t.feed("\x1b[c");
+        assert!(!t.take_replies().is_empty());
+        assert!(t.take_replies().is_empty(), "must not be sent twice");
+    }
+
+    /// Ordinary output produces no replies at all.
+    #[test]
+    fn plain_output_sends_nothing_back() {
+        assert!(replies_for("hello\r\n\x1b[31mred\x1b[0m\x1b[2J").is_empty());
+    }
+}
 }

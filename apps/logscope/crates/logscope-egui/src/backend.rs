@@ -41,14 +41,51 @@ pub trait Backend {
     /// to report, and a fabricated "no gaps" would be exactly the ungrounded claim the Liaison
     /// refuses to make.
     fn model_status(&self) -> Option<logscope::liaison::ModelStatus> { None }
+
+    /// Generate from a STRUCTURED chat history, letting a backend that has the model's chat template
+    /// apply it itself. This is the path that makes Qwen/Ornith tool-calling reliable: the server
+    /// wraps the messages in the exact turn markers the model trained on, rather than the app
+    /// flattening them into one Plain string and hoping.
+    ///
+    /// The default flattens to `generate()`, so backends that cannot use messages (the wgpu engine,
+    /// which builds its own prompt) lose nothing. Only `Remote` overrides it (llama-server's
+    /// `/v1/chat/completions` applies the template server-side).
+    fn generate_chat(&mut self, messages: &[ChatTurn], params: &GenParams, cancel: &dyn Fn() -> bool, on_token: &mut dyn FnMut(&str) -> bool) -> Result<usize, String> {
+        self.generate(&flatten_chat(messages), params, cancel, on_token)
+    }
+}
+
+/// One turn for `generate_chat`. Role plus text; tool results ride as a `tool` role so a server that
+/// templates them (Qwen, Llama-3 ipython) frames them correctly.
+#[derive(Debug, Clone)]
+pub struct ChatTurn { pub role: ChatRole, pub content: String }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatRole { System, User, Assistant, Tool }
+
+impl ChatTurn {
+    pub fn system(s: impl Into<String>) -> Self { Self { role: ChatRole::System, content: s.into() } }
+    pub fn user(s: impl Into<String>) -> Self { Self { role: ChatRole::User, content: s.into() } }
+    pub fn assistant(s: impl Into<String>) -> Self { Self { role: ChatRole::Assistant, content: s.into() } }
+}
+
+/// The fallback rendering when a backend has no template: a neutral, readable transcript. Not a
+/// model-specific format — backends that need one override `generate_chat`.
+pub fn flatten_chat(messages: &[ChatTurn]) -> String {
+    let mut s = String::new();
+    for m in messages {
+        let tag = match m.role { ChatRole::System => "System", ChatRole::User => "User", ChatRole::Assistant => "Assistant", ChatRole::Tool => "Tool result" };
+        s.push_str(&format!("{tag}: {}\n\n", m.content));
+    }
+    s.push_str("Assistant: ");
+    s
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BackendKind { LlamaCpp, Wgpu, Daemon }
+pub enum BackendKind { LlamaCpp, Wgpu, Daemon, Remote }
 impl BackendKind {
-    pub const ALL: [BackendKind; 3] = [BackendKind::LlamaCpp, BackendKind::Wgpu, BackendKind::Daemon];
+    pub const ALL: [BackendKind; 4] = [BackendKind::LlamaCpp, BackendKind::Wgpu, BackendKind::Daemon, BackendKind::Remote];
     pub fn label(self) -> &'static str {
-        match self { BackendKind::LlamaCpp => "llama.cpp · Vulkan", BackendKind::Wgpu => "wgpu/Burn (experimental)", BackendKind::Daemon => "shared daemon (one copy of the weights)" }
+        match self { BackendKind::LlamaCpp => "llama.cpp · Vulkan", BackendKind::Wgpu => "wgpu/Burn (experimental)", BackendKind::Daemon => "shared daemon (one copy of the weights)", BackendKind::Remote => "remote server (llama-server / Anthropic / Ollama over HTTP)" }
     }
     /// The backend to use by default: llama.cpp when its FFI is compiled in (mature,
     /// fast), otherwise the clean-room wgpu engine. Loading and chatting must agree on
@@ -75,6 +112,12 @@ impl BackendKind {
     /// one with no daemon: the failure is invisible and looks like the
     /// app's fault. So this is an ordering, not a switch.
     pub fn preferred_reachable() -> Self {
+        // Explicit beats discovered: LOGSCOPE_REMOTE names a server (or a matrix box) and that is
+        // a decision the person made, so it wins even over a local daemon. Unreachable → fall
+        // through, same rule as the daemon: an absent server must not be an error path.
+        if Remote::spec_from_env().map(|spec| Remote::resolve(&spec).map(|(ep, _, _)| hive::endpoint::probe(&ep).is_ok()).unwrap_or(false)).unwrap_or(false) {
+            return BackendKind::Remote;
+        }
         if std::os::unix::net::UnixStream::connect(daemon_socket_path()).is_ok() {
             BackendKind::Daemon
         } else {
@@ -113,6 +156,34 @@ pub(crate) mod engine {
     use gpu_kernels::{Gpu, Model, SamplerParams, Session};
     use logscope::llm_backend::GenParams;
     use std::time::Instant;
+
+    /// Say what the constraint did, once per turn, to the diagnostics AND the hive ledger — the
+    /// ledger because `exhausted` steps are the signal that the grammar is overriding nothing and
+    /// nobody watches stderr during an agent run.
+    pub(crate) fn report_constraint(engine: &str, filt: Option<&crate::toolfilter::ToolFenceFilter>) {
+        let Some(line) = filt.and_then(|f| f.report()) else { return };
+        crate::diag!("wgpu-engine: [{engine}] {line}");
+        let _ = hive::ledger::append(hive::ledger::Entry::Note { text: format!("{engine} {line}") });
+    }
+
+    /// The tool names a generated GBNF allows: the quoted literals on its `name ::=` alternation,
+    /// e.g. `name ::= "\"read_file\"" | "\"run\""` → ["read_file", "run"]. Empty when the grammar
+    /// is not one of ours, which the acceptor reads as "any name".
+    pub(crate) fn grammar_tool_names(gbnf: &str) -> Vec<String> {
+        let Some(line) = gbnf.lines().find(|l| l.trim_start().starts_with("name ::=")) else { return Vec::new() };
+        // Everything after `::=` — otherwise the rule's own name rides along with the first alternative.
+        let Some((_, line)) = line.split_once("::=") else { return Vec::new() };
+        let mut out = Vec::new();
+        // each alternative is "\"NAME\"" — the inner escaped quotes are what we key on
+        for part in line.split('|') {
+            let p = part.trim();
+            let inner = p.trim_start_matches('"').trim_end_matches('"');
+            let inner = inner.trim_start_matches("\\\"").trim_end_matches("\\\"");
+            let name: String = inner.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+            if !name.is_empty() && name != "name" { out.push(name); }
+        }
+        out
+    }
     /// Prefill block size. Attention scratch peaks at O(PREFILL_CHUNK · prompt_len), so this bounds
     /// the memory a long context can demand (vs O(prompt_len²) for a single batched prefill). ALSO caps
     /// how much work lands in each prefill dispatch: a GPU watchdog (Windows TDR, or the Asahi/Linux
@@ -976,6 +1047,19 @@ would mislead every later load",
             crate::diag!("wgpu-engine: fast-decode A/B — off {off:.1} ms/tok, on {on:.1} ms/tok → levers {} (cached for {})",
                 if decision { "ON" } else { "OFF" }, self.gpu.adapter_name);
         }
+
+        /// The constraint for this turn, if the caller set one. `GenParams.grammar` holds the GBNF
+        /// the harness generated from the run's tool whitelist; this engine does not interpret GBNF,
+        /// so the names are read back out of it (they are the quoted literals on the `name ::=` line)
+        /// and handed to the acceptor, which enforces the same shape natively in Rust.
+        ///
+        /// A grammar with no recognisable names still constrains the FENCE (any name allowed), which
+        /// is the part that stops a malformed block; nothing here can make a decode fail.
+        fn tool_filter<'t>(&self, tok: &'t Tokenizer, p: &GenParams) -> Option<crate::toolfilter::ToolFenceFilter<'t>> {
+            let g = p.grammar.as_deref()?;
+            let names = grammar_tool_names(g);
+            Some(crate::toolfilter::ToolFenceFilter::new(tok, &names))
+        }
         pub fn generate(&mut self, prompt: &str, p: &GenParams, cancel: &dyn Fn() -> bool, on: &mut dyn FnMut(&str) -> bool) -> Result<usize, String> {
             let toks = self.tok.encode(prompt);
             let mut prompt_ids = if toks.is_empty() { vec![0] } else { toks };
@@ -1501,6 +1585,10 @@ continue, keeping the first {keep_prefix} tokens{}: {why}", self.name,
             // CPU sort. Eligibility + lazy int8-embed build live in `windowed_ready` so the resume
             // path shares them exactly. LOGSCOPE_SAMPLE_WINDOW (default 4; 0/1 disables).
             let sample_win_opt = self.windowed_ready(&sp);
+            // The grammar for this turn, if any: on the wgpu engine this is what makes a malformed
+            // tool block impossible rather than merely detectable afterwards. Built AFTER the last
+            // `&mut self` above, because it borrows the tokenizer for the whole decode.
+            let mut filt = self.tool_filter(&self.tok, p);
             let embed_q8 = self.embed_q8.as_ref();
             let (gpu, model, tok, eos, stop) = (&self.gpu, &self.model, &self.tok, self.eos, &self.stop_ids);
             // Diagnostic: which stop token (if any) ended the stream, captured from the decode callback —
@@ -1641,9 +1729,13 @@ continue, keeping the first {keep_prefix} tokens{}: {why}", self.name,
                             0
                         } else { w }
                     }
-                    _ => gpu.stream_session(model, s, &mut seen, n_new, eos, &sp, rng, cancel, step),
+                    _ => match filt.as_mut() {
+                        Some(f) => gpu.stream_session_constrained(model, s, &mut seen, n_new, eos, &sp, rng, cancel, Some(f), step),
+                        None => gpu.stream_session(model, s, &mut seen, n_new, eos, &sp, rng, cancel, step),
+                    },
                 };
                 if !pending.is_empty() { let _ = on(&String::from_utf8_lossy(&pending)); }
+                report_constraint(&self.name, filt.as_ref());
                 p
             };
             let mut rng = self.rng;
@@ -1677,6 +1769,16 @@ continue, keeping the first {keep_prefix} tokens{}: {why}", self.name,
             // Below this the two candidates really could swap under a different prefill path, which
             // is the only case the retry was ever meant to cover.
             const NEAR_TIE_LOGITS: f32 = 0.5;
+            // RESTORED. f7fb925314 replaced these four lines with the comment
+            // below, whose own words are "NOT CHANGED HERE, deliberately" -- it
+            // meant to document, not to change behaviour, and left both uses of
+            // `stopped_decisively` pointing at nothing. Unseen because this path
+            // compiles only with `wgpu-engine`; found by fleet_build.sh's
+            // logscope+features build ("cannot find value `stopped_decisively`").
+            let stopped_decisively = match stop_margin(&s.logits) {
+                Some((top, margin)) => stop.contains(&top) && margin >= NEAR_TIE_LOGITS,
+                None => false,
+            };
             // MARGIN IS CONFIDENCE, NOT CORRECTNESS, and that is where the
             // skip above overreached. Its premise — "when the model wants to
             // stop by a wide margin a clean prefill reproduces it exactly" —
@@ -2245,6 +2347,10 @@ attention dispatches [LOGSCOPE_BG_CACHE]", self.name);
             // Same windowed-decode eligibility as the fresh path (this is the fix for auto-continue
             // reverting to token-by-token: it used to call stream_session unconditionally).
             let sample_win_opt = self.windowed_ready(&sp);
+            // The grammar for this turn, if any: on the wgpu engine this is what makes a malformed
+            // tool block impossible rather than merely detectable afterwards. Built AFTER the last
+            // `&mut self` above, because it borrows the tokenizer for the whole decode.
+            let mut filt = self.tool_filter(&self.tok, p);
             let embed_q8 = self.embed_q8.as_ref();
             let (gpu, model, tok, eos, stop) = (&self.gpu, &self.model, &self.tok, self.eos, &self.stop_ids);
             let mut seen = toks;
@@ -2313,9 +2419,13 @@ attention dispatches [LOGSCOPE_BG_CACHE]", self.name);
                         0
                     } else { w }
                 }
-                _ => gpu.stream_session(model, &mut s, &mut seen, n_new, eos, &sp, &mut rng, cancel, step),
+                _ => match filt.as_mut() {
+                    Some(f) => gpu.stream_session_constrained(model, &mut s, &mut seen, n_new, eos, &sp, &mut rng, cancel, Some(f), step),
+                    None => gpu.stream_session(model, &mut s, &mut seen, n_new, eos, &sp, &mut rng, cancel, step),
+                },
             };
             if !pending.is_empty() { let _ = on(&String::from_utf8_lossy(&pending)); }
+            report_constraint(&self.name, filt.as_ref());
             self.rng = rng;
             let secs = td.elapsed().as_secs_f32().max(1e-3);
             crate::diag!("wgpu-engine: [{}] continued {produced} tokens in {secs:.1}s = {:.2} tok/s (warm resume, no prefill{})",
@@ -2457,6 +2567,7 @@ pub fn make(kind: BackendKind) -> Box<dyn Backend> {
         BackendKind::LlamaCpp => Box::new(LlamaCpp { model: None }),
         BackendKind::Wgpu => Box::new(Wgpu { #[cfg(feature = "wgpu-engine")] engine: None }),
         BackendKind::Daemon => Box::new(Daemon::default()),
+        BackendKind::Remote => Box::new(Remote::default()),
     }
 }
 
@@ -2562,6 +2673,152 @@ impl Backend for Daemon {
     }
 }
 
+
+/// Talk to a server over HTTP instead of loading weights: llama-server (OpenAI or Anthropic
+/// protocol, MTP included when it was started with `--spec-type draft-mtp`), optiq, Ollama, or
+/// the Studio across the mesh. A thin client over `hive::endpoint`; the bespoke
+/// `/generate` protocol stays with `Daemon` for the unix-socket wgpu server.
+///
+/// Configured by `LOGSCOPE_REMOTE`, one of
+///   openai:http://ultra:8080[/model]      anthropic:http://ultra:8080[/model]
+///   ollama:http://mini:11434/model        matrix:<box-name>   matrix:   (first healthy worker)
+/// The model segment is optional for llama-server (it serves what it loaded); when absent, the
+/// `load(path)` argument's file stem is sent, which llama-server ignores and Ollama needs.
+#[derive(Default)]
+pub struct Remote {
+    ep: Option<hive::endpoint::Endpoint>,
+    label: String,
+    concurrency: usize,
+}
+
+impl Remote {
+    pub fn spec_from_env() -> Option<String> { std::env::var("LOGSCOPE_REMOTE").ok().filter(|s| !s.trim().is_empty()) }
+
+    /// (endpoint, label, concurrency) from a spec string. Pure apart from reading the matrix file
+    /// for `matrix:` specs.
+    pub fn resolve(spec: &str) -> Result<(hive::endpoint::Endpoint, String, usize), String> {
+        use hive::endpoint::Endpoint;
+        let (kind, rest) = spec.split_once(':').ok_or_else(|| format!("LOGSCOPE_REMOTE '{spec}': expected kind:target"))?;
+        if kind == "matrix" {
+            let m = hive::matrix::Matrix::load();
+            let b = if rest.is_empty() {
+                m.with_role(hive::matrix::Role::Worker).first().cloned().cloned().ok_or("matrix: no healthy worker box (run `hive matrix probe`)")?
+            } else {
+                m.get(rest).cloned().ok_or_else(|| format!("matrix: no box named '{rest}'"))?
+            };
+            return Ok((b.endpoint.clone(), format!("{} ({})", b.name, kind_name(&b.endpoint)), b.concurrency.max(1)));
+        }
+        // kind:http://host:port[/model] — split the model off the path only after the authority
+        let (base, model) = match rest.find("://").map(|i| i + 3).and_then(|a| rest[a..].find('/').map(|p| a + p)) {
+            Some(p) => (rest[..p].to_string(), Some(rest[p + 1..].to_string()).filter(|m| !m.is_empty())),
+            None => (rest.to_string(), None),
+        };
+        let model = model.unwrap_or_else(|| "default".into());
+        let ep = match kind {
+            "openai" => Endpoint::OpenAi { base, model, key: std::env::var("OPENAI_API_KEY").ok() },
+            "anthropic" => Endpoint::Anthropic { base, model, key: std::env::var("ANTHROPIC_API_KEY").ok() },
+            "ollama" => Endpoint::Ollama { base, model },
+            k => return Err(format!("LOGSCOPE_REMOTE kind '{k}': openai | anthropic | ollama | matrix")),
+        };
+        Ok((ep.clone(), format!("{} {}", kind, kind_base(&ep)), std::env::var("LOGSCOPE_REMOTE_NP").ok().and_then(|s| s.parse().ok()).unwrap_or(2)))
+    }
+}
+
+fn kind_name(ep: &hive::endpoint::Endpoint) -> &'static str {
+    use hive::endpoint::Endpoint::*;
+    match ep { OpenAi { .. } => "openai", Anthropic { .. } => "anthropic", Ollama { .. } => "ollama", ClaudeCode { .. } => "claude-code" }
+}
+fn kind_base(ep: &hive::endpoint::Endpoint) -> String {
+    use hive::endpoint::Endpoint::*;
+    match ep { OpenAi { base, .. } | Anthropic { base, .. } | Ollama { base, .. } => base.clone(), ClaudeCode { .. } => "claude".into() }
+}
+
+impl Backend for Remote {
+    fn name(&self) -> &'static str { "remote" }
+    fn loaded(&self) -> bool { self.ep.is_some() }
+
+    fn load(&mut self, path: &str, _params: &GenParams) -> Result<(), String> {
+        use hive::endpoint::Endpoint;
+        let spec = Remote::spec_from_env().ok_or("LOGSCOPE_REMOTE is not set (openai:http://host:port, anthropic:…, ollama:…/model, matrix:name)")?;
+        let (mut ep, label, np) = Remote::resolve(&spec)?;
+        // The model name: what the spec said, else the file stem of whatever the UI asked to load.
+        let stem = std::path::Path::new(path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
+        match &mut ep {
+            Endpoint::OpenAi { model, .. } | Endpoint::Anthropic { model, .. } | Endpoint::Ollama { model, .. } if model == "default" && !stem.is_empty() => *model = stem,
+            _ => {}
+        }
+        // Fail FAST and name the target, like the daemon: the caller uses this to fall back.
+        hive::endpoint::probe(&ep).map_err(|e| format!("remote {label}: {e}"))?;
+        self.ep = Some(ep); self.label = label; self.concurrency = np;
+        Ok(())
+    }
+
+    /// Structured chat straight to the server's chat endpoint, so llama-server applies the model's
+    /// own template (Qwen/Ornith turn markers, tool framing). Uses the same grammar and cache path
+    /// as `generate`; falls back to the flattened prompt for the Ollama endpoint, which this
+    /// `hive::endpoint` client drives through /api/generate rather than a chat route.
+    fn generate_chat(&mut self, messages: &[ChatTurn], params: &GenParams, cancel: &dyn Fn() -> bool, on_token: &mut dyn FnMut(&str) -> bool) -> Result<usize, String> {
+        use hive::endpoint::{generate_messages, ChatMessage, Event, Request};
+        let ep = self.ep.clone().ok_or("no remote server connected")?;
+        // Ollama's endpoint here is /api/generate (no messages): flatten for it.
+        if matches!(ep, hive::endpoint::Endpoint::Ollama { .. }) {
+            return self.generate(&flatten_chat(messages), params, cancel, on_token);
+        }
+        let msgs: Vec<ChatMessage> = messages.iter().map(|m| ChatMessage {
+            role: match m.role { ChatRole::System => "system", ChatRole::User => "user", ChatRole::Assistant => "assistant", ChatRole::Tool => "tool" }.to_string(),
+            content: m.content.clone(),
+        }).collect();
+        let req = Request { prompt: String::new(), system: None, max_tokens: params.max_tokens.clamp(1, 32768) as u32, temperature: params.temperature, resume: None, grammar: params.grammar.clone() };
+        let mut n = 0usize;
+        let mut on = |e: Event| -> bool { if let Event::Delta(s) = e { n += 1; if cancel() { return false; } return on_token(&s); } true };
+        let m = generate_messages(&ep, &msgs, &req, &mut on)?;
+        Ok(if m.out_tokens as usize > 0 { m.out_tokens as usize } else { n })
+    }
+
+    fn generate(&mut self, prompt: &str, params: &GenParams, cancel: &dyn Fn() -> bool,
+                on_token: &mut dyn FnMut(&str) -> bool) -> Result<usize, String> {
+        use hive::endpoint::{generate, Event, Request};
+        let ep = self.ep.clone().ok_or("no remote server connected")?;
+        let req = Request { prompt: prompt.to_string(), system: None, max_tokens: params.max_tokens.clamp(1, 32768) as u32, temperature: params.temperature, resume: None, grammar: params.grammar.clone() };
+        let mut n = 0usize;
+        let mut on = |e: Event| -> bool {
+            if let Event::Delta(s) = e { n += 1; if cancel() { return false; } return on_token(&s); }
+            true
+        };
+        let m = generate(&ep, &req, &mut on)?;
+        Ok(if m.out_tokens as usize > 0 { m.out_tokens as usize } else { n })
+    }
+
+    /// Fan out across the server's slots (`llama-server -np N`, `OLLAMA_NUM_PARALLEL`) instead of
+    /// looping: the Ultra decodes them as a batch, which is the whole point of `:fa`/`:ca` there.
+    fn generate_batched(&mut self, prompts: &[String], params: &GenParams, cancel: &dyn Fn() -> bool) -> Vec<String> {
+        use hive::endpoint::{generate, Event, Request};
+        let Some(ep) = self.ep.clone() else { return prompts.iter().map(|_| String::new()).collect() };
+        let width = self.concurrency.max(1);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut out: Vec<String> = prompts.iter().map(|_| String::new()).collect();
+        for chunk in (0..prompts.len()).collect::<Vec<_>>().chunks(width) {
+            if cancel() { cancelled.store(true, Ordering::Relaxed); break; }
+            let handles: Vec<_> = chunk.iter().map(|&i| {
+                let (ep, p, c) = (ep.clone(), prompts[i].clone(), cancelled.clone());
+                let req = Request { prompt: p, system: None, max_tokens: params.max_tokens.clamp(1, 32768) as u32, temperature: params.temperature, resume: None, grammar: params.grammar.clone() };
+                std::thread::spawn(move || {
+                    let mut text = String::new();
+                    let mut on = |e: Event| -> bool { if let Event::Delta(s) = e { text.push_str(&s); } !c.load(Ordering::Relaxed) };
+                    let _ = generate(&ep, &req, &mut on);
+                    (i, text)
+                })
+            }).collect();
+            for h in handles { if let Ok((i, text)) = h.join() { out[i] = text.trim().to_string(); } }
+        }
+        out
+    }
+
+    /// The server applies its own chat template to the message we send, so the app must not
+    /// wrap the prompt in one: Plain is the truthful answer here.
+    fn template(&self) -> TemplateKind { TemplateKind::Plain }
+}
+
 /// Where the daemon listens. Must agree with `netserve::default_socket_path`
 /// and `aperture-engine`'s client, or the halves never meet — the rule is
 /// duplicated here rather than imported because this crate does not
@@ -2614,7 +2871,21 @@ pub struct LoadInfo { pub path: String, pub template: TemplateKind,
     /// (llama.cpp, the daemon path) rather than a fabricated "no gaps".
     pub model_status: Option<logscope::liaison::ModelStatus> }
 
-pub enum Cmd { SetBackend(BackendKind), SetParams(GenParams), Load(String), Generate(String), Continue(String) }
+impl LoadInfo {
+    /// One line for a status sink: the file stem, the template, and the Liaison's gap count when it
+    /// had one — `Ornith-1.5-35B-A3B-Q4 (ChatML, 2 gaps)`. Never invents "fully supported" for a
+    /// backend that did not say so.
+    pub fn summary(&self) -> String {
+        let stem = std::path::Path::new(&self.path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| self.path.clone());
+        match &self.model_status {
+            Some(ms) if ms.gaps.is_empty() => format!("{stem} ({:?}, {} · no gaps)", self.template, ms.arch),
+            Some(ms) => format!("{stem} ({:?}, {} · {} gaps)", self.template, ms.arch, ms.gaps.len()),
+            None => format!("{stem} ({:?})", self.template),
+        }
+    }
+}
+
+pub enum Cmd { SetBackend(BackendKind), SetParams(GenParams), Load(String), Generate(String), GenerateChat(Vec<ChatTurn>), Continue(String) }
 pub enum Evt { Loaded(Result<LoadInfo, String>), Token(String), Done { tokens: usize, secs: f32 }, Error(String) }
 
 pub struct Inference { tx: Sender<Cmd>, pub rx: Receiver<Evt>, cancel: Arc<AtomicBool>,
@@ -2840,6 +3111,10 @@ impl Inference {
     }
     pub fn load(&self, path: String) { let _ = self.tx.send(Cmd::Load(path)); }
     pub fn generate(&self, prompt: String) { self.cancel.store(false, Ordering::Relaxed); let _ = self.tx.send(Cmd::Generate(prompt)); }
+    /// Structured chat: the worker calls `Backend::generate_chat`, so a server with the model's
+    /// template applies it. Used for the Remote backend; other backends flatten it identically to
+    /// the prompt path, so callers can always prefer this when they have the turns.
+    pub fn generate_chat(&self, turns: Vec<ChatTurn>) { self.cancel.store(false, Ordering::Relaxed); let _ = self.tx.send(Cmd::GenerateChat(turns)); }
     /// Resume the last reply in place (warm KV); `fallback` is used only if the backend can't resume.
     pub fn continue_stream(&self, fallback: String) { self.cancel.store(false, Ordering::Relaxed); let _ = self.tx.send(Cmd::Continue(fallback)); }
     pub fn set_params(&self, p: GenParams) { let _ = self.tx.send(Cmd::SetParams(p)); }
@@ -3002,6 +3277,9 @@ fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>, temp
     let mut kind = BackendKind::preferred_reachable();
     let mut backend = make(kind);
     crate::diag!("worker: default backend = {} ({})", kind.label(), backend.name());
+    if kind == BackendKind::Remote {
+        crate::diag!("worker: using a remote server (LOGSCOPE_REMOTE) — this process holds no weights");
+    }
     if kind == BackendKind::Daemon {
         // Say so plainly. "Why is startup instant today" and "why did my
         // model selection do nothing" have the same answer and it is
@@ -3118,6 +3396,22 @@ lands; until then the translation is total and this is not a fault.",
                     }
                 } else {
                     simulate(&prompt, &evt, start, &cancel);
+                }
+            }
+            Cmd::GenerateChat(turns) => {
+                if backend.loaded() {
+                    cancel.store(false, Ordering::Relaxed);
+                    let (evt2, cancel2) = (evt.clone(), cancel.clone());
+                    let start = std::time::Instant::now();
+                    let mut cb = move |p: &str| -> bool { let _ = evt2.send(Evt::Token(p.to_string())); !cancel2.load(Ordering::Relaxed) };
+                    let cancel3 = cancel.clone();
+                    let is_cancelled = move || cancel3.load(Ordering::Relaxed);
+                    match backend.generate_chat(&turns, &params, &is_cancelled, &mut cb) {
+                        Ok(n) => { let _ = evt.send(Evt::Done { tokens: n, secs: start.elapsed().as_secs_f32() }); }
+                        Err(e) => { let _ = evt.send(Evt::Error(e)); }
+                    }
+                } else {
+                    simulate(&flatten_chat(&turns), &evt, std::time::Instant::now(), &cancel);
                 }
             }
             Cmd::Continue(prompt) => {
@@ -3479,6 +3773,50 @@ either wire it up or delete it, but a measurement nobody reads is not a feature"
 }
 
 #[cfg(test)]
+mod grammar_names_tests {
+    #[cfg(feature = "wgpu-engine")]
+    #[test]
+    fn names_are_read_back_out_of_the_harness_grammar() {
+        use crate::backend::engine::grammar_tool_names;
+        // exactly what llm_remote::tool_fence_grammar emits
+        let g = crate::llm_remote::tool_fence_grammar(&["read_file", "run"]);
+        let mut names = grammar_tool_names(&g);
+        names.sort();
+        assert_eq!(names, vec!["read_file".to_string(), "run".to_string()], "grammar was:\n{g}");
+        // a grammar that is not ours constrains the fence but names nothing
+        assert!(grammar_tool_names("root ::= \"x\"").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod chat_flatten_tests {
+    use super::*;
+
+    struct Recorder { last: std::rc::Rc<std::cell::RefCell<String>> }
+    impl Backend for Recorder {
+        fn name(&self) -> &'static str { "rec" }
+        fn loaded(&self) -> bool { true }
+        fn load(&mut self, _p: &str, _g: &GenParams) -> Result<(), String> { Ok(()) }
+        fn generate(&mut self, prompt: &str, _g: &GenParams, _c: &dyn Fn() -> bool, on: &mut dyn FnMut(&str) -> bool) -> Result<usize, String> {
+            *self.last.borrow_mut() = prompt.to_string(); on(prompt); Ok(1)
+        }
+    }
+
+    #[test]
+    fn default_generate_chat_flattens_to_generate() {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let mut b = Recorder { last: seen.clone() };
+        let turns = vec![ChatTurn::system("be brief"), ChatTurn::user("hi"), ChatTurn::assistant("hello"), ChatTurn { role: ChatRole::Tool, content: "42".into() }];
+        let mut out = String::new();
+        let n = b.generate_chat(&turns, &GenParams::default(), &|| false, &mut |t| { out.push_str(t); true }).unwrap();
+        assert_eq!(n, 1);
+        let p = seen.borrow();
+        assert!(p.contains("System: be brief") && p.contains("User: hi") && p.contains("Assistant: hello") && p.contains("Tool result: 42"));
+        assert!(p.trim_end().ends_with("Assistant:"), "the flattened prompt ends with the assistant primer: {p:?}");
+    }
+}
+
+#[cfg(test)]
 mod daemon_tests {
     use super::*;
 
@@ -3510,6 +3848,25 @@ mod daemon_tests {
         assert_ne!(BackendKind::preferred_reachable(), BackendKind::Daemon);
         match prev { Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
                      None => std::env::remove_var("XDG_RUNTIME_DIR") }
+    }
+
+    #[test]
+    fn remote_spec_parses_and_an_unreachable_server_fails_fast() {
+        let _serial = env_lock();
+        let (ep, label, np) = Remote::resolve("openai:http://ultra:8080").unwrap();
+        assert!(matches!(ep, hive::endpoint::Endpoint::OpenAi { ref base, ref model, .. } if base == "http://ultra:8080" && model == "default"));
+        assert!(label.starts_with("openai") && np == 2);
+        let (ep, _, _) = Remote::resolve("ollama:http://mini:11434/qwen3.6:35b-a3b").unwrap();
+        assert!(matches!(ep, hive::endpoint::Endpoint::Ollama { ref base, ref model } if base == "http://mini:11434" && model == "qwen3.6:35b-a3b"));
+        assert!(Remote::resolve("ftp:x").is_err() && Remote::resolve("nocolon").is_err());
+        // Loading against a dead port must fail fast and name the target: the worker uses the
+        // error to fall back, exactly as it does for a missing daemon.
+        let prev = std::env::var("LOGSCOPE_REMOTE").ok();
+        std::env::set_var("LOGSCOPE_REMOTE", "openai:http://127.0.0.1:9");
+        let err = Remote::default().load("/models/x.gguf", &GenParams::default()).unwrap_err();
+        assert!(err.contains("remote openai"), "{err}");
+        assert_ne!(BackendKind::preferred_reachable(), BackendKind::Remote, "an unreachable LOGSCOPE_REMOTE must not be preferred");
+        match prev { Some(v) => std::env::set_var("LOGSCOPE_REMOTE", v), None => std::env::remove_var("LOGSCOPE_REMOTE") }
     }
 
     #[test]

@@ -1,0 +1,29 @@
+{
+  "fps": 24, "length": 24, "bpm": 92,
+  "cuts": [
+    {"at": 2.8587, "frame": 69, "kind": "hard", "on_kick": true, "on_move": false},
+    {"at": 5.0500, "frame": 121, "kind": "hard", "on_kick": false, "on_move": true},
+    {"at": 7.4239, "frame": 178, "kind": "hard", "on_kick": true, "on_move": true},
+    {"at": 9.3000, "frame": 223, "kind": "hard", "on_kick": false, "on_move": false},
+    {"at": 11.9891, "frame": 288, "kind": "hard", "on_kick": true, "on_move": true},
+    {"at": 13.6000, "frame": 326, "kind": "glitch", "on_kick": false, "on_move": false},
+    {"at": 15.2500, "frame": 366, "kind": "hard", "on_kick": true, "on_move": true},
+    {"at": 17.9000, "frame": 430, "kind": "hard", "on_kick": false, "on_move": true},
+    {"at": 19.8152, "frame": 476, "kind": "hard", "on_kick": true, "on_move": false},
+    {"at": 21.8000, "frame": 523, "kind": "fade", "on_kick": false, "on_move": false}
+  ],
+  "shots": [
+    {"start": 0.0000, "end": 2.8587, "place": "Field", "look": "Daylight", "fx": "None"},
+    {"start": 2.8587, "end": 5.0500, "place": "Roof", "look": "Pink", "fx": "None"},
+    {"start": 5.0500, "end": 7.4239, "place": "Field", "look": "Daylight", "fx": "None"},
+    {"start": 7.4239, "end": 9.3000, "place": "Lot", "look": "Daylight", "fx": "None"},
+    {"start": 9.3000, "end": 11.9891, "place": "Roof", "look": "Pink", "fx": "None"},
+    {"start": 11.9891, "end": 13.6000, "place": "Roof", "look": "Pink", "fx": "Kaleido(6)"},
+    {"start": 13.6000, "end": 15.2500, "place": "Roof", "look": "Pink", "fx": "Close"},
+    {"start": 15.2500, "end": 17.9000, "place": "Field", "look": "Daylight", "fx": "Clone"},
+    {"start": 17.9000, "end": 19.8152, "place": "Roof", "look": "Pink", "fx": "Kaleido(8)"},
+    {"start": 19.8152, "end": 21.8000, "place": "Lot", "look": "Daylight", "fx": "None"},
+    {"start": 21.8000, "end": 24.0000, "place": "Lot", "look": "Daylight", "fx": "None"}
+  ],
+  "kicks": [0.2500, 0.9022, 1.5543, 2.2065, 2.8587, 3.5109, 4.1630, 4.8152, 5.4674, 6.1196, 6.7717, 7.4239, 8.0761, 8.7283, 9.3804, 10.0326, 10.6848, 11.3370, 11.9891, 12.6413, 13.2935, 13.9457, 14.5978, 15.2500, 15.9022, 16.5543, 17.2065, 17.8587, 18.5109, 19.1630, 19.8152, 20.4674, 21.1196, 21.7717]
+}

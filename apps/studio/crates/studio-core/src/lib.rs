@@ -43,7 +43,7 @@ use std::collections::BTreeMap;
 mod curves;
 mod grouping;
 pub use grouping::GroupTangle;
-pub use curves::{Binding, Curve, Gate, Opening, Sweep};
+pub use curves::{Binding, Curve, Gate, Opening, Response, Sweep};
 mod batch;
 mod room;
 pub use room::{Overlap, LANE_SUFFIX};
@@ -184,6 +184,19 @@ pub struct Bus {
     /// solo, which keeps the two rules independent rather than needing a
     /// combined truth table.
     pub muted: bool,
+    /// A SILENT bus sums, processes and fades exactly as usual, and then
+    /// feeds nothing: not its parent, not its sends. It is a measurement
+    /// tap — a "dummy channel" in the FL Studio sense. Tracks and busses
+    /// feed it through ordinary sends (the splitter: a send is already a
+    /// parallel copy), it renders like any other bus, and
+    /// `studio_audio::bus_signal` reads its output to drive something —
+    /// a meter, a sidechain, or the multicam switcher's camera choice.
+    ///
+    /// Distinct from `muted`, and deliberately not the same flag: a muted
+    /// bus is DROPPED before its chain runs, so it costs nothing and has no
+    /// output to read. A silent bus is fully rendered and then not mixed.
+    #[serde(default)]
+    pub silent: bool,
 }
 
 /// The project: tracks, clips, the sources they reference, and the bus graph
@@ -846,6 +859,14 @@ pub enum Op {
     /// delivery, not a real undo), which meant recording a source and then
     /// undoing left the source permanently in the project. This is the fix.
     RemoveSource { id: SourceId },
+    /// Point a source at a different file: the same media somewhere else, or
+    /// the camera original in place of the proxy that was cut with.
+    ///
+    /// Only the path moves. Length, rate, channels and `has_video` stay as
+    /// they are, because every clip's trim was validated against them — a
+    /// relink that silently changed the length would move cuts. A file that
+    /// really is a different length is an import, not a relink.
+    SetSourcePath { id: SourceId, path: String },
     /// Refused if `bus.parent` doesn't exist, or is the bus's own id (a
     /// direct self-loop) — see `Project::apply`'s cycle check for why a
     /// longer cycle can never arise from `AddBus` alone.
@@ -861,6 +882,10 @@ pub enum Op {
     /// a listening choice for right now, not an edit worth undoing or
     /// shipping to a collaborator.
     SetBusFlags { id: BusId, muted: bool },
+    /// See [`Bus::silent`]. A separate op rather than another field on
+    /// `SetBusFlags` so journals and macros written before silent busses
+    /// existed still deserialize.
+    SetBusSilent { id: BusId, silent: bool },
     SetBusChain { id: BusId, chain: Vec<Effect> },    /// Replaces the whole sends list, like `SetEffects` does for a clip's
     /// effects — the inverse is then just "the old vector," no per-send
     /// add/remove bookkeeping needed.
@@ -1249,6 +1274,12 @@ impl Project {
                 self.sources.insert(source.id, source.clone());
                 Ok(Op::RemoveSource { id: source.id })
             }
+            Op::SetSourcePath { id, path } => {
+                let s = self.sources.get_mut(id).ok_or(EditError::NoSuchSource(*id))?;
+                let inv = Op::SetSourcePath { id: *id, path: s.path.clone() };
+                s.path = path.clone();
+                Ok(inv)
+            }
             Op::RemoveSource { id } => {
                 if self.clips.values().any(|c| c.source == *id) {
                     return Err(EditError::SourceInUse(*id));
@@ -1302,6 +1333,12 @@ impl Project {
                 let b = self.busses.get_mut(id).ok_or(EditError::NoSuchBus(*id))?;
                 let inv = Op::SetBusFlags { id: *id, muted: b.muted };
                 b.muted = *muted;
+                Ok(inv)
+            }
+            Op::SetBusSilent { id, silent } => {
+                let b = self.busses.get_mut(id).ok_or(EditError::NoSuchBus(*id))?;
+                let inv = Op::SetBusSilent { id: *id, silent: b.silent };
+                b.silent = *silent;
                 Ok(inv)
             }
             Op::SetBusChain { id, chain } => {
@@ -2106,7 +2143,7 @@ mod tests {
     }
 
     fn bus(id: u64, name: &str, parent: Option<u64>) -> Bus {
-        Bus { id: BusId(id), name: name.into(), parent: parent.map(BusId), gain: 1.0, chain: Vec::new(), sends: Vec::new(), muted: false }
+        Bus { id: BusId(id), name: name.into(), parent: parent.map(BusId), gain: 1.0, chain: Vec::new(), sends: Vec::new(), muted: false, silent: false }
     }
 
     #[test]
@@ -2265,6 +2302,39 @@ mod tests {
     }
 
     #[test]
+    fn relinking_a_source_moves_the_path_and_nothing_else() {
+        let mut p = Project::default();
+        p.apply(&Op::AddSource { source: Source::file(SourceId(1), "/proxies/C0057.mkv",
+            Ticks::from_seconds(54.0), 48_000, 2, true) }).unwrap();
+        let before = p.sources[&SourceId(1)].clone();
+        let inv = p.apply(&Op::SetSourcePath { id: SourceId(1),
+            path: "/card/A001/C0057.MXF".into() }).expect("relinks");
+        let now = &p.sources[&SourceId(1)];
+        assert_eq!(now.path, "/card/A001/C0057.MXF");
+        assert_eq!((now.len, now.sample_rate, now.channels, now.has_video),
+                   (before.len, before.sample_rate, before.channels, before.has_video),
+                   "a relink must not move a single cut");
+        p.apply(&inv).unwrap();
+        assert_eq!(p.sources[&SourceId(1)], before, "undo puts the proxy back");
+        assert!(p.apply(&Op::SetSourcePath { id: SourceId(9), path: "/x".into() }).is_err());
+    }
+
+    #[test]
+    fn silent_is_its_own_flag_undoes_and_loads_from_a_project_that_predates_it() {
+        let mut p = Project::default();
+        p.apply(&Op::AddBus { bus: bus(1, "Control", None) }).unwrap();
+        let inv = p.apply(&Op::SetBusSilent { id: BusId(1), silent: true }).unwrap();
+        assert!(p.busses[&BusId(1)].silent && !p.busses[&BusId(1)].muted, "silent is not mute");
+        p.apply(&inv).unwrap();
+        assert!(!p.busses[&BusId(1)].silent, "undo restores it");
+        assert!(p.apply(&Op::SetBusSilent { id: BusId(9), silent: true }).is_err());
+        // a bus serialized before silent existed still loads
+        let old = r#"{"id":4,"name":"Drums","parent":null,"gain":1.0,"chain":[],"sends":[],"muted":false}"#;
+        let b: Bus = serde_json::from_str(old).expect("loads");
+        assert!(!b.silent);
+    }
+
+    #[test]
     fn default_route_is_master_and_costs_nothing() {
         // A project with zero busses must still be exactly as valid as
         // before busses existed — the whole point of `route: None` meaning
@@ -2342,8 +2412,8 @@ mod tests {
         // `apply` refuses to create one — simulate that by building the
         // graph directly rather than through ops.
         let mut p = proj();
-        p.busses.insert(BusId(1), Bus { id: BusId(1), name: "A".into(), parent: Some(BusId(2)), gain: 1.0, chain: vec![], sends: vec![], muted: false });
-        p.busses.insert(BusId(2), Bus { id: BusId(2), name: "B".into(), parent: Some(BusId(1)), gain: 1.0, chain: vec![], sends: vec![], muted: false });
+        p.busses.insert(BusId(1), Bus { id: BusId(1), name: "A".into(), parent: Some(BusId(2)), gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: false });
+        p.busses.insert(BusId(2), Bus { id: BusId(2), name: "B".into(), parent: Some(BusId(1)), gain: 1.0, chain: vec![], sends: vec![], muted: false, silent: false });
         assert!(matches!(p.bus_order(), Err(EditError::BusCycle { .. })));
     }
 }
@@ -2489,7 +2559,7 @@ mod group_and_bus_input_tests {
     fn project() -> Project {
         let mut p = Project::default();
         for id in [1u64, 2, 3] {
-            p.apply(&Op::AddBus { bus: Bus { id: BusId(id), name: format!("B{id}"),
+            p.apply(&Op::AddBus { bus: Bus { id: BusId(id), name: format!("B{id}"), silent: false,
                 parent: None, gain: 1.0, chain: vec![], sends: vec![], muted: false } }).unwrap();
         }
         p
@@ -3352,6 +3422,62 @@ mod fade_tests {
         assert!(matches!(
             p.apply(&Op::SetClipFade { id: ClipId(99), fade_in: Ticks(1), fade_out: Ticks(0) }),
             Err(EditError::NoSuchClip(_))));
+    }
+}
+
+#[cfg(test)]
+mod abundance_tests {
+    //! A big project in the model itself: many sources, tracks, clips, a big
+    //! group, many bindings -- every edit undoable, nothing quadratic.
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn timed<T>(what: &str, limit: Duration, f: impl FnOnce() -> T) -> T {
+        let t = Instant::now(); let r = f(); let e = t.elapsed();
+        eprintln!("abundance: {what}: {e:?}");
+        assert!(e < limit, "{what} took {e:?} (limit {limit:?})");
+        r
+    }
+
+    #[test]
+    fn twenty_thousand_clips_build_undo_and_stay_consistent() {
+        let mut p = Project::default();
+        let mut undo = Vec::new();
+        timed("build 500 sources, 200 tracks, 20,000 clips", Duration::from_secs(30), || {
+            for s in 0..500u64 {
+                undo.push(p.apply(&Op::AddSource { source: Source::file(SourceId(s + 1), format!("C{s}.mkv"), Ticks::from_seconds(600.0), 48_000, 2, true) }).unwrap());
+            }
+            for t in 0..200u64 {
+                undo.push(p.apply(&Op::AddTrack { track: Track { id: TrackId(t + 1), kind: TrackKind::Audio, name: format!("mic {t}"),
+                    muted: false, locked: false, gain: 1.0, route: None }, at: t as usize }).unwrap());
+            }
+            for c in 0..20_000u64 {
+                undo.push(p.apply(&Op::AddClip { clip: Clip { id: ClipId(c + 1), source: SourceId(c % 500 + 1), track: TrackId(c % 200 + 1),
+                    pos: Ticks::from_seconds((c / 200) as f64 * 3.0), src_in: Ticks::ZERO, len: Ticks::from_seconds(2.5), gain: 1.0, effects: vec![] } }).unwrap());
+            }
+        });
+        assert_eq!(p.clips.len(), 20_000);
+        assert_eq!(p.duration(), Ticks::from_seconds(99.0 * 3.0 + 2.5));
+        // a group of 5,000 members and its hull
+        let members: Vec<ClipId> = (1..=5000).map(ClipId).collect();
+        undo.push(p.apply(&Op::SetGroup { id: GroupId(1), name: "scene".into(), clips: members }).unwrap());
+        let hull = timed("hull of a 5,000-clip group", Duration::from_secs(2), || p.group_hull(GroupId(1)));
+        assert_eq!(hull.map(|h| h.0), Some(Ticks::ZERO));
+        // 200 bindings on one target, read 1,000 times
+        undo.push(p.apply(&Op::SetCurve { id: CurveId(1), name: "ride".into() }).unwrap());
+        undo.push(p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::ZERO, value: 0.5 }).unwrap());
+        for b in 0..200u64 {
+            undo.push(p.apply(&Op::SetBinding { id: BindingId(b + 1), binding: Binding { curve: CurveId(1),
+                target: AutoTarget::TrackGain(TrackId(1)), gate: Gate::Always, response: None, fit_span: false } }).unwrap());
+        }
+        let v = timed("1,000 reads through 200 bindings", Duration::from_secs(5),
+            || (0..1000).map(|i| p.auto_value(AutoTarget::TrackGain(TrackId(1)), Ticks::from_seconds(i as f64 * 0.1))).last());
+        assert!(v.unwrap() < 1e-30, "200 bindings of 0.5 multiply (0.5^200): {v:?}");
+        // and every single edit undoes, in reverse, back to empty
+        timed("undo all of it", Duration::from_secs(30), || {
+            for inv in undo.into_iter().rev() { p.apply(&inv).expect("each inverse applies"); }
+        });
+        assert!(p.clips.is_empty() && p.tracks.is_empty() && p.sources.is_empty() && p.bindings.is_empty() && p.groups.is_empty());
     }
 }
 }

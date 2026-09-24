@@ -1,0 +1,2 @@
+# cartoon fixture video: a deliberate exception to the root *.mp4 ignore
+!*.mp4

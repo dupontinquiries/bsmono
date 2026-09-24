@@ -201,6 +201,24 @@ impl VoicetermApp {
         // while I worked out which one reaches the screen.
         self.app.terminal.feed(&String::from_utf8_lossy(bytes));
 
+        // ANSWER THE PROGRAM'S QUERIES, back down the same PTY, immediately.
+        //
+        // This is the helix start-up delay. crossterm programs -- helix, gitui
+        // -- send `CSI c` at launch and BLOCK ~2-3 s until the terminal answers.
+        // The Qt terminal fixed it in `pty_term.rs` v0.1.784; the egui terminal
+        // parsed the query and had nowhere to put an answer. It now queues one,
+        // and this is the half that sends it: a reply that is queued and not
+        // written is exactly as slow as no reply at all.
+        //
+        // Right after the feed, not batched to the next frame: the program is
+        // already blocked waiting, and every frame of delay is visible as lag.
+        let replies = self.app.terminal.take_replies();
+        if !replies.is_empty() {
+            if let Some(host) = &self.pty {
+                let _ = host.write(&replies);
+            }
+        }
+
         // THE SHELL'S WORKING DIRECTORY, from the stream it is already sending.
         //
         // `uikit_term::blocks` records a cwd per block and its doc says the value comes from
@@ -697,7 +715,7 @@ struct VoicetermApp {
     ctrl_p_gesture: uikit_egui::ctrl_p_gesture::GestureTracker,
     /// State for the voice popup Ctrl+P opens (via palette_flow's
     /// SwitchedToVoice transition).
-    voice_popup: uikit_egui::voice_popup::VoicePopup,
+    voice_popup: voiceterm_egui::voice_popup::VoicePopup,
     /// The "about to switch on" / "listening" badge drawn beside the
     /// palette's own query box, with its own hold-to-cancel timer.
     mic_indicator: uikit_egui::mic_indicator::MicIndicator,
@@ -3079,13 +3097,34 @@ impl eframe::App for VoicetermApp {
                 .frame(tabbar_frame)
                 .exact_width(adaptive.min_touch_target)
         };
-        let pinned = self.tabbar_width;
+        // (No `pinned` capture: the content fills the panel instead -- see below.)
         let tabbar_out = tabbar_panel.show(ctx, |ui| {
             if self.tabbar_open && !resizing {
-                // The frame's inner margin is inside the panel rect; the
-                // content min is the rest. This is the line that pins the width.
-                let margin = tabbar_frame.inner_margin.sum().x; // the panel's own margin, not the window's
-                ui.set_min_width((pinned - margin).max(0.0));
+                // FILL THE PANEL -- NEVER EXCEED IT. This used to pin the
+                // content to `pinned`, the REMEMBERED width, and that is the
+                // thin black strip that appeared on shrink and swallowed
+                // terminal scrolling. From egui's own panel.rs (0.34):
+                //
+                //   * the panel's rect comes from its stored width, and its
+                //     content is CLIPPED to that rect ("If we overflow, don't
+                //     do so visibly (#4475)");
+                //   * but the width the panel ALLOCATES is taken from the
+                //     content's response, and the central panel starts at
+                //     that edge (`cursor.min.x = rect.max.x`).
+                //
+                // On the frame a drag ends, `pinned` is still the OLD wider
+                // width (it is only read back after `show`). The content
+                // demanded that width, the panel allocated it, the fill was
+                // clipped short of it -- and the gap between was painted by
+                // nothing, so the window's black showed. Because it belonged to
+                // the sidebar's allocation, the terminal was not under the
+                // pointer there, which is why scrolling over it went nowhere.
+                //
+                // `ui.max_rect()` is the panel's own inner rect, so this is the
+                // idiom egui itself uses for horizontal panels: content fills
+                // exactly the space the panel has, and cannot push its
+                // allocation past its paint.
+                ui.set_min_width(ui.max_rect().width());
             }
             // The chevron points the way the panel will move, which is the
             // convention `rail` already set two panels over.
@@ -5081,7 +5120,10 @@ impl eframe::App for VoicetermApp {
                                 });
                                 if let Some(w) = word_tap {
                                     let corpus = voiceterm_egui::note_store::documents();
-                                    let hits = voiceterm_egui::note_search::search(&w, &corpus, 3);
+                                    // `search_tapped`, not `search`: a tap is one chosen
+                                    // word, and `search` drops anything under three
+                                    // characters -- so tapping "AI" or "UI" found nothing.
+                                    let hits = voiceterm_egui::note_search::search_tapped(&w, &corpus, 3);
                                     // HELD, not toasted. A toast names the related notes and
                                     // then takes them away — the answer to "what does this
                                     // belong with" is only useful if you can go there, and a
@@ -5758,6 +5800,13 @@ impl eframe::App for VoicetermApp {
                 // the parked half of the same rule.
                 if let Some(app) = self.pane_apps.get_mut(id) {
                     app.terminal.feed(&String::from_utf8_lossy(&out));
+                    // And answer its queries on ITS OWN pty. Without this,
+                    // helix started in a background split still stalls 2-3 s,
+                    // and the fix above would only cover the focused pane.
+                    let replies = app.terminal.take_replies();
+                    if !replies.is_empty() {
+                        let _ = h.write(&replies);
+                    }
                 }
                 // `h.ended()` (shell exited while backgrounded) is intentionally not surfaced
                 // here: the toast path above is keyed to the single focused-pane pty_ended_noted

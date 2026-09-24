@@ -12,6 +12,10 @@ mod micsession;
 mod arrange;
 mod audio_io;
 mod config;
+/// Where checkpoints, mel caches and scratch go. Training used `./checkpoints`
+/// and `./cache` relative to the CURRENT DIRECTORY, so a run started from
+/// elsewhere silently trained from scratch instead of resuming.
+mod paths;
 mod dataset;
 mod device_prefs;
 mod upscale;
@@ -147,11 +151,18 @@ struct TrainArgs {
     #[arg(long, default_value = "./data")]
     data_dir: PathBuf,
     /// Where checkpoints + config.json are written.
-    #[arg(long, default_value = "./checkpoints")]
-    ckpt_dir: PathBuf,
+    ///
+    /// Defaults to `~/models/beatgen` (or `$BEATSPACE_CKPT_DIR`). NOT under
+    /// `~/.cache`: see `paths` for why a cache cleaner must not be able to
+    /// delete a week of GPU time.
+    #[arg(long)]
+    ckpt_dir: Option<PathBuf>,
     /// Mel-cache directory.
-    #[arg(long, default_value = "./cache")]
-    cache_dir: PathBuf,
+    ///
+    /// Defaults to `$XDG_CACHE_HOME/beatspace` (or `$BEATSPACE_CACHE_DIR`).
+    /// Losing this costs a re-decode, which is what a cache is for.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
     /// Number of epochs.
     #[arg(long)]
     epochs: Option<usize>,
@@ -252,8 +263,11 @@ struct SmokeArgs {
 #[derive(Args)]
 struct GuiArgs {
     /// Directory containing config.json + gen_latest.safetensors.
-    #[arg(long, default_value = "./checkpoints")]
-    ckpt_dir: PathBuf,
+    ///
+    /// Same default as training and generate: `~/models/beatgen`, or
+    /// `$BEATSPACE_CKPT_DIR`.
+    #[arg(long)]
+    ckpt_dir: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -269,8 +283,21 @@ fn main() -> Result<()> {
             if a.no_rollout { cfg.rollout = false; }
             if let Some(v) = a.overlap_frames { cfg.overlap_frames = v; }
             cfg.data_dir = a.data_dir;
-            cfg.ckpt_dir = a.ckpt_dir;
-            cfg.cache_dir = a.cache_dir;
+            // An explicit flag is an instruction; otherwise the XDG-aware
+            // default. Resolved HERE rather than as a clap `default_value` so
+            // the value depends on the environment at run time, not on the
+            // string baked in at compile time.
+            cfg.ckpt_dir = a.ckpt_dir.clone().unwrap_or_else(crate::paths::checkpoints);
+            cfg.cache_dir = a.cache_dir.clone().unwrap_or_else(crate::paths::mel_cache);
+            // An override into cache territory is ALLOWED and warned about:
+            // losing a week of GPU time to `rm -rf ~/.cache` deserves one line
+            // first, and refusing outright would break a deliberate choice on
+            // a box where that is the only large disk.
+            if crate::paths::is_cache_territory(&cfg.ckpt_dir) {
+                eprintln!("beatspace: checkpoints are going to {} — that is a cache \
+                           directory and something else may delete it",
+                          cfg.ckpt_dir.display());
+            }
             if let Some(v) = a.epochs {
                 cfg.epochs = v;
             }
@@ -402,27 +429,28 @@ proceeding, but a shape mismatch will now fail inside the loader",
         Cmd::Gui(a) => {
             // Prefer the config saved alongside the checkpoints so the model
             // shape matches what was trained; fall back to defaults.
-            let cfg_path = a.ckpt_dir.join("config.json");
+            let ckpt_dir = a.ckpt_dir.clone().unwrap_or_else(crate::paths::checkpoints);
+            let cfg_path = ckpt_dir.join("config.json");
             let mut cfg = if cfg_path.exists() {
                 match Config::load_json(&cfg_path) {
                     Ok(mut c) => {
-                        c.ckpt_dir = a.ckpt_dir.clone();
+                        c.ckpt_dir = ckpt_dir.clone();
                         println!("[gui] loaded {cfg_path:?}");
                         c
                     }
                     Err(e) => {
                         eprintln!("[gui] couldn't read {cfg_path:?}: {e}; using defaults");
                         let mut c = Config::default();
-                        c.ckpt_dir = a.ckpt_dir.clone();
+                        c.ckpt_dir = ckpt_dir.clone();
                         c
                     }
                 }
             } else {
                 let mut c = Config::default();
-                c.ckpt_dir = a.ckpt_dir.clone();
+                c.ckpt_dir = ckpt_dir.clone();
                 c
             };
-            cfg.ckpt_dir = a.ckpt_dir;
+            cfg.ckpt_dir = ckpt_dir;
             gui::run(cfg)?;
         }
         #[cfg(feature = "app")]

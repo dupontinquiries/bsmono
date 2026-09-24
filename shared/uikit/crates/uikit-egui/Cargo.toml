@@ -33,7 +33,16 @@ touchkit = { path = "../../../touchkit", features = ["egui"] }
 # voiceterm's frontend all already spell it "glow", "wayland", "x11"; this was
 # the outlier. Found by feature_sweep.sh, which is the reason that tool checks
 # non-default features.
-eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
+# Backends are NOT named here. `wayland` and `x11` were both hardcoded, and
+# because cargo unifies features across the graph that silently overrode the
+# app's choice -- voiceterm asking for x11 only still got wayland linked, which
+# on static musl is a binary that dlopens libwayland at startup and dies with
+# NoWaylandLib.
+#
+# A library crate has no business choosing the display server. The APP picks,
+# via its own `eframe?/x11` / `eframe?/wayland` features; anything that needs
+# both says so itself.
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow"] }
 egui = "0.34"
 uikit-gesture = { path = "../uikit-gesture" }
 
@@ -65,3 +74,27 @@ voice-popup = ["dep:voice-engine-kit"]
 [[example]]
 name = "logscope_touch"
 required-features = ["demo"]
+
+[dev-dependencies]
+# A BACKEND FOR THIS CRATE'S `demo` EXAMPLE, and only for it.
+#
+# Here it is the example, not the tests: eframe is optional and off by default,
+# so the unit tests never compile winit. But `--features demo` enables eframe to
+# run the `logscope_touch` example, which needs a window -- and examples, unlike
+# binaries, receive dev-dependencies.
+#
+# The normal `eframe` dependency above names no windowing backend, on purpose:
+# a library that names one forces it onto every app through feature
+# unification (see 70895dc53 -- voiceterm on static musl could not exclude
+# Wayland). But built STANDALONE, eframe with no backend makes winit refuse to
+# compile ("platform not supported"), so a standalone demo build broke.
+#
+# That standalone break was fixed once before (097fe78aa9, by putting the
+# backends on the normal dependency) and then UNDONE by 70895dc53, which moved
+# them off again without reading that history. Both goals are right; they
+# only collided because they shared one line.
+#
+# A dev-dependency serves both. It is active when THIS crate's tests build,
+# and is never passed on to crates that depend on this one -- so apps still
+# choose their own backend, and this crate still builds alone.
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }

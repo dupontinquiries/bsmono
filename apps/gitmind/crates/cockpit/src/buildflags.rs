@@ -49,6 +49,41 @@ fn parse_inline_array(s: &str) -> Vec<String> {
 
 /// Scan a Cargo.toml's `[features]` table. Pure — unit-tested. (Single-line feature
 /// definitions, which is the overwhelmingly common form.)
+/// tideshell's `Cargo.toml` for reference: `layer` does NOT imply `wayland`
+/// (they gate different subsystems -- the docked panel vs. the toplevel/input
+/// method connection), so ticking only `layer` in the Push page's feature grid
+/// silently builds a keyboard that shows and never hides, or a shell with no
+/// window focus tracking. That exact gap shipped once already (the fleet
+/// store's own tideshell/rusty-board entries had it, fixed separately) -- this
+/// is the same mistake, available again through the OTHER path to a build: a
+/// person hand-picking flags on the Push page.
+///
+/// "COSMIC + tideshell" in the UI is this pair, named for what it is for
+/// rather than what it does technically -- the person picking it should not
+/// need to already know these two features interact.
+pub const COSMIC_TIDESHELL_FEATURES: [&str; 2] = ["wayland", "layer"];
+
+/// Turn a feature selection into one with `COSMIC_TIDESHELL_FEATURES` present,
+/// preserving every other feature and their relative order, and never
+/// duplicating one already on. Pure, so the Push page's switch is testable
+/// without a Cargo.toml or a build.
+pub fn with_cosmic_tideshell(mut features: Vec<String>) -> Vec<String> {
+    for f in COSMIC_TIDESHELL_FEATURES {
+        if !features.iter().any(|x| x == f) {
+            features.push(f.to_string());
+        }
+    }
+    features
+}
+
+/// Is a feature selection ALREADY the COSMIC + tideshell one -- both required
+/// features present? Order-independent and ignores extras (dictation's
+/// `voice`, say), so the switch reflects reality even after a person adds
+/// something on top of it.
+pub fn is_cosmic_tideshell(features: &[String]) -> bool {
+    COSMIC_TIDESHELL_FEATURES.iter().all(|f| features.iter().any(|x| x == f))
+}
+
 pub fn scan_cargo_features(toml: &str) -> CargoFeatures {
     let mut out = CargoFeatures::default();
     let mut in_features = false;
@@ -397,6 +432,64 @@ pub fn build_env_on_path(
 
 /// [`build_env_on_path`] with the GUI answer already decided — by [`is_gui_app_dir`], when
 /// the caller has a directory rather than one manifest.
+/// [`build_env_for`], knowing the host triple as well as the `--target` one.
+///
+/// TWO DIFFERENT QUESTIONS NEED TWO DIFFERENT TRIPLES, and conflating them is the
+/// bug this exists to fix.
+///
+/// * "Which cross LINKER?" wants the `--target` string. A native build passes
+///   no `--target`, `cargo_target` is "", and `cross_env("")` correctly returns
+///   nothing. Feed it the host triple instead and a native build on the phone
+///   would be told to use `aarch64-linux-musl-gcc` as a CROSS linker.
+/// * "Is this musl, so does a windowed app need -crt-static?" wants the
+///   EFFECTIVE triple. For a native build that is the host. `gui_env` decides
+///   on `triple.contains("musl")`, and "" contains nothing -- so on the phone,
+///   the exact case the flag was written for, a native build never got it and
+///   shipped a static binary that died with NoWaylandLib. The reported log
+///   showed no environment lines at all, which is this.
+pub fn build_env_for_native(
+    cargo_target: &str,
+    native: &str,
+    gui: bool,
+    inherited_rustflags: Option<&str>,
+    path_env: &str,
+) -> Vec<(String, String)> {
+    let mut env = if path_env.is_empty() { cross_env(cargo_target) } else { cross_env_on_path(cargo_target, path_env) };
+    let effective = if cargo_target.is_empty() { native } else { cargo_target };
+    // `RUSTFLAGS` DOES NOT REACH BUILD SCRIPTS UNDER --target. Passing a target
+    // puts cargo in cross mode, where RUSTFLAGS applies to the target only;
+    // build scripts and proc-macros are built for the host without it. So a
+    // cross build targeting static musl got a dynamic BINARY and a static
+    // BUILD SCRIPT -- and whisper-rs-sys's build script is what dlopens
+    // libclang, which is exactly where it failed.
+    //
+    // The per-triple variable is the one that covers both: cargo reads
+    // CARGO_TARGET_<TRIPLE>_RUSTFLAGS for the target, and for a native build
+    // (host == target) it applies to build scripts as well. On a genuine
+    // cross build the host side is a different triple and is correctly left
+    // alone -- a glibc host's build script does not need -crt-static.
+    let triple_var = format!(
+        "CARGO_TARGET_{}_RUSTFLAGS",
+        effective.to_ascii_uppercase().replace('-', "_")
+    );
+    if gui {
+        for (k, v) in gui_env(effective) {
+            let merged = match inherited_rustflags.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(existing) if k == "RUSTFLAGS" => format!("{existing} {v}"),
+                _ => v,
+            };
+            // Both: RUSTFLAGS for tools that read only that, and the
+            // per-triple variable so a static-musl HOST's build scripts get it
+            // too. Same value, so they cannot disagree.
+            if k == "RUSTFLAGS" && effective.contains("musl") {
+                env.push((triple_var.clone(), merged.clone()));
+            }
+            env.push((k, merged));
+        }
+    }
+    env
+}
+
 pub fn build_env_for(
     triple: &str,
     gui: bool,
@@ -776,6 +869,15 @@ pub enum DeployStrategy {
     /// Build on the target device itself (native there) — the fallback when we can't cross-compile
     /// (e.g. no musl linker on the desktop) but can reach the device over ssh.
     RemoteNative,
+    /// Build inside a container with a NATIVE toolchain for the target's libc
+    /// (musl-in-musl, not cross-gcc) -- see `podman`. The fleet's actual answer
+    /// for aarch64-musl on a glibc/gnu desktop: Debian's archive has no
+    /// `aarch64-linux-musl-gcc` (see `cross_linker`'s doc), so `CrossCompile`
+    /// is UNREACHABLE for that pairing on a typical dev host, and this is what
+    /// stands in for it -- no host cross-linker needed, no phone reachability
+    /// needed, and (unlike `RemoteNative`) not limited to what a phone's CPU
+    /// and RAM can compile in a reasonable time.
+    PodmanCross,
 }
 
 /// A chosen strategy plus the reasoning, so the UI can explain *why* a device deploys the way it
@@ -789,15 +891,22 @@ pub struct StrategyChoice {
 }
 
 /// Recommend a deploy strategy for a target device given this host's native triple, whether a
-/// cross-linker for the target is available, and whether the device is reachable over ssh.
+/// cross-linker for the target is available, whether a podman-buildable NATIVE
+/// image exists for it (see `podman::image_for`) and podman itself is on this
+/// machine, and whether the device is reachable over ssh.
 ///
-/// The fleet's common case is same-arch (aarch64) but different libc (gnu desktop → musl phone):
-/// with a musl linker present we cross-compile and copy; without one we build on the phone itself
-/// (native there), which is slower but needs no cross toolchain. Pure — unit-tested.
+/// FALLBACK ORDER, cheapest and least fragile first: same arch+libc needs no
+/// toolchain at all; a real cross-linker builds fastest when one exists (rare
+/// for musl -- see `PodmanCross`'s doc); podman needs neither a host
+/// cross-linker nor the phone being reachable RIGHT NOW; building on the
+/// device itself is the fallback of last resort (slow, and asks a phone's CPU
+/// to compile a GUI toolkit); with none of these, the blocker names every
+/// option, since which one to unblock is the person's call. Pure -- unit-tested.
 pub fn recommend_strategy(
     host_native: &str,
     target: &str,
     have_cross_linker: bool,
+    have_podman: bool,
     remote_reachable: bool,
 ) -> StrategyChoice {
     let same_arch = arch_of(host_native) == arch_of(target);
@@ -814,24 +923,33 @@ pub fn recommend_strategy(
     } else {
         format!("{} vs {} libc", target_libc(host_native), target_libc(target))
     };
+    let podman_ready = have_podman && crate::podman::image_for(target).is_some();
     if have_cross_linker {
         StrategyChoice {
             strategy: DeployStrategy::CrossCompile,
             reason: format!("differs from host ({mismatch}); cross-linker present → cross-compile + copy"),
             needs_cross_linker: true,
         }
+    } else if podman_ready {
+        StrategyChoice {
+            strategy: DeployStrategy::PodmanCross,
+            reason: format!("differs from host ({mismatch}), no cross-linker, podman has a native {} image → build in a container", target_libc(target)),
+            needs_cross_linker: false,
+        }
     } else if remote_reachable {
         StrategyChoice {
             strategy: DeployStrategy::RemoteNative,
-            reason: format!("differs from host ({mismatch}) and no cross-linker → build on the device (native there)"),
+            reason: format!("differs from host ({mismatch}), no cross-linker or podman image → build on the device (native there)"),
             needs_cross_linker: false,
         }
     } else {
-        // can't cross, can't reach — surface the blocker; cross-compile is the only path once a
-        // linker is installed.
+        // can't cross, can't reach, no podman image — surface the blocker and name every way out.
         StrategyChoice {
             strategy: DeployStrategy::CrossCompile,
-            reason: format!("differs from host ({mismatch}), device unreachable, no cross-linker — install a {} linker to cross-compile", target_libc(target)),
+            reason: format!(
+                "differs from host ({mismatch}), device unreachable, no cross-linker or podman image — install a {} linker, or podman + a native image, to unblock",
+                target_libc(target)
+            ),
             needs_cross_linker: true,
         }
     }
@@ -916,6 +1034,27 @@ pub fn install_dir(home: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cosmic_tideshell_adds_both_features_without_duplicating() {
+        use super::{with_cosmic_tideshell, is_cosmic_tideshell};
+        assert_eq!(with_cosmic_tideshell(vec![]), vec!["wayland", "layer"]);
+        // Already-present features are kept, in their original order, and not doubled.
+        assert_eq!(with_cosmic_tideshell(vec!["voice".into(), "wayland".into()]),
+                   vec!["voice", "wayland", "layer"]);
+        assert_eq!(with_cosmic_tideshell(vec!["wayland".into(), "layer".into()]),
+                   vec!["wayland", "layer"], "already the pair: unchanged");
+    }
+
+    #[test]
+    fn is_cosmic_tideshell_ignores_order_and_extras() {
+        use super::is_cosmic_tideshell;
+        assert!(is_cosmic_tideshell(&["layer".into(), "wayland".into()]), "order-independent");
+        assert!(is_cosmic_tideshell(&["wayland".into(), "voice".into(), "layer".into()]), "extras don't disqualify it");
+        assert!(!is_cosmic_tideshell(&["layer".into()]), "missing wayland");
+        assert!(!is_cosmic_tideshell(&["wayland".into()]), "missing layer");
+        assert!(!is_cosmic_tideshell(&[]));
+    }
+
     #[test]
     fn workspace_root_builds_bin_not_package() {
         use super::{cargo_build_argv_kind, declares_workspace, crate_name};
@@ -1389,21 +1528,58 @@ logging = []
         let desktop = "aarch64-unknown-linux-gnu"; // Asahi Fedora
         let phone = "aarch64-unknown-linux-musl"; // postmarketOS/Alpine
         // desktop -> desktop: local native
-        assert_eq!(recommend_strategy(desktop, desktop, false, true).strategy, DeployStrategy::LocalNative);
+        assert_eq!(recommend_strategy(desktop, desktop, false, false, true).strategy, DeployStrategy::LocalNative);
         // desktop -> phone with a musl linker: cross-compile + copy
-        let cc = recommend_strategy(desktop, phone, true, true);
+        let cc = recommend_strategy(desktop, phone, true, false, true);
         assert_eq!(cc.strategy, DeployStrategy::CrossCompile);
         assert!(cc.needs_cross_linker);
         // desktop -> phone, no linker but reachable: build on the phone (native there)
-        assert_eq!(recommend_strategy(desktop, phone, false, true).strategy, DeployStrategy::RemoteNative);
+        assert_eq!(recommend_strategy(desktop, phone, false, false, true).strategy, DeployStrategy::RemoteNative);
         // desktop -> phone, no linker AND unreachable: surface the blocker (cross is the only path)
-        let blocked = recommend_strategy(desktop, phone, false, false);
+        let blocked = recommend_strategy(desktop, phone, false, false, false);
         assert_eq!(blocked.strategy, DeployStrategy::CrossCompile);
         assert!(blocked.reason.contains("musl"));
         // cross-arch (x86 desktop -> aarch64 phone) with a linker: cross-compile, reason names the arch gap
-        let xarch = recommend_strategy("x86_64-unknown-linux-gnu", phone, true, true);
+        let xarch = recommend_strategy("x86_64-unknown-linux-gnu", phone, true, false, true);
         assert_eq!(xarch.strategy, DeployStrategy::CrossCompile);
         assert!(xarch.reason.contains("x86_64") && xarch.reason.contains("aarch64"));
+    }
+
+    #[test]
+    fn podman_is_preferred_over_building_on_the_phone() {
+        let desktop = "aarch64-unknown-linux-gnu";
+        let phone = "aarch64-unknown-linux-musl";
+        // No cross-linker, but podman + a native image exist: use the container,
+        // not RemoteNative -- faster and does not need the phone reachable now.
+        let c = recommend_strategy(desktop, phone, false, true, true);
+        assert_eq!(c.strategy, DeployStrategy::PodmanCross);
+        assert!(!c.needs_cross_linker);
+        assert!(c.reason.contains("podman"));
+    }
+
+    #[test]
+    fn a_real_cross_linker_still_wins_over_podman() {
+        let desktop = "aarch64-unknown-linux-gnu";
+        let phone = "aarch64-unknown-linux-musl";
+        let c = recommend_strategy(desktop, phone, true, true, true);
+        assert_eq!(c.strategy, DeployStrategy::CrossCompile, "a real linker is faster than a container");
+    }
+
+    #[test]
+    fn podman_present_but_no_image_for_this_target_falls_back_to_remote() {
+        let desktop = "aarch64-unknown-linux-gnu";
+        // gnu-on-gnu already HAS a real cross-linker path in this fleet
+        // (buildflags::cross_linker), so podman offering no image for it must
+        // not block the remote fallback.
+        let c = recommend_strategy("x86_64-unknown-linux-gnu", desktop, false, true, true);
+        assert_eq!(c.strategy, DeployStrategy::RemoteNative);
+    }
+
+    #[test]
+    fn no_podman_falls_back_to_remote_exactly_as_before() {
+        let desktop = "aarch64-unknown-linux-gnu";
+        let phone = "aarch64-unknown-linux-musl";
+        assert_eq!(recommend_strategy(desktop, phone, false, false, true).strategy, DeployStrategy::RemoteNative);
     }
 
 }
@@ -1661,4 +1837,67 @@ mod artifact_name_tests {
         assert!(f.all.iter().any(|x| x == "ai-engine"),
                 "ai-engine must stay offered as a toggle, not hidden");
     }
+
+#[cfg(test)]
+mod native_musl_tests {
+    use super::*;
+
+    fn has(env: &[(String, String)], k: &str) -> Option<String> {
+        env.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone())
+    }
+
+    /// THE REPORTED BUG. A native build on the phone passes no --target, so
+    /// `cargo_target` is "", and the flag decision read `"".contains("musl")`.
+    /// The build log showed no environment at all and the binary was static.
+    #[test]
+    fn a_native_musl_gui_build_gets_the_dynamic_flag() {
+        let env = build_env_for_native("", "aarch64-unknown-linux-musl", true, None, "");
+        let rf = has(&env, "RUSTFLAGS").expect("a native musl GUI build must set RUSTFLAGS");
+        assert!(rf.contains("-crt-static"), "{rf}");
+    }
+
+    /// ...and the BUILD SCRIPT gets it too, via the per-triple variable --
+    /// whisper-rs-sys's build script is what dlopens libclang.
+    #[test]
+    fn a_native_musl_build_covers_build_scripts() {
+        let env = build_env_for_native("", "aarch64-unknown-linux-musl", true, None, "");
+        let v = has(&env, "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS")
+            .expect("the per-triple variable must be set for the host's build scripts");
+        assert!(v.contains("-crt-static"), "{v}");
+    }
+
+    /// THE TRAP IN THE OBVIOUS FIX. Passing the host triple to `cross_env`
+    /// would tell a native build to use a CROSS linker. The linker decision
+    /// must still see "" for native.
+    #[test]
+    fn a_native_build_is_not_given_a_cross_linker() {
+        let env = build_env_for_native("", "aarch64-unknown-linux-musl", true, None, "");
+        assert!(!env.iter().any(|(k, _)| k.ends_with("_LINKER")),
+                "native build got a linker variable: {env:?}");
+    }
+
+    /// A glibc host needs none of this.
+    #[test]
+    fn a_native_glibc_build_is_left_alone() {
+        let env = build_env_for_native("", "aarch64-unknown-linux-gnu", true, None, "");
+        assert!(has(&env, "RUSTFLAGS").is_none(), "{env:?}");
+    }
+
+    /// A headless app never needed a window, so it keeps whatever linking it
+    /// had -- the flag is about dlopening display libraries.
+    #[test]
+    fn a_non_gui_musl_build_is_unchanged() {
+        let env = build_env_for_native("", "aarch64-unknown-linux-musl", false, None, "");
+        assert!(has(&env, "RUSTFLAGS").is_none());
+    }
+
+    /// An operator's own RUSTFLAGS is merged, not dropped.
+    #[test]
+    fn existing_rustflags_are_kept() {
+        let env = build_env_for_native("", "aarch64-unknown-linux-musl", true,
+                                       Some("-C opt-level=s"), "");
+        let rf = has(&env, "RUSTFLAGS").unwrap();
+        assert!(rf.contains("opt-level=s") && rf.contains("-crt-static"), "{rf}");
+    }
+}
 }

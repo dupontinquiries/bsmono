@@ -1407,10 +1407,38 @@ pub fn sphere_in_frustum(vp: &Mat4, center: Vec3, radius: f32) -> bool {
     let m = vp.to_cols_array_2d();
     let row = |j: usize| Vec4::new(m[0][j], m[1][j], m[2][j], m[3][j]);
     let (r0, r1, r2, r3) = (row(0), row(1), row(2), row(3));
-    let planes = [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r3 + r2, r3 - r2];
-    planes
-        .iter()
-        .all(|p| p.x * center.x + p.y * center.y + p.z * center.z + p.w > -radius)
+    // NEAR IS `r2`, NOT `r3 + r2`. wgpu clip space is 0 <= z <= w (the D3D
+    // convention); `r3 + r2` is the OpenGL near plane for -w <= z <= w. The
+    // function's own comment already said wgpu.
+    //
+    // MEASURED RATHER THAN ASSERTED, because I first wrote that this made the
+    // near plane "far too permissive -- geometry behind the camera passes",
+    // and that is wrong. Sweeping a point along the view axis, the two forms
+    // differ over about 0.1 units just in front of the camera: the old one
+    // additionally passes objects between the eye and the near plane, which
+    // are clipped by the rasteriser anyway. Real, tiny, and not what I claimed
+    // before checking.
+    //
+    // Corrected because a cull test should agree with the clip space it names,
+    // not because it was costing frames.
+    let planes = [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2];
+    planes.iter().all(|p| {
+        // NORMALISE. The test compares a plane equation against `-radius`,
+        // which is only a DISTANCE if the plane normal is unit length. The
+        // rows of a view-projection are not, so without this the effective
+        // cull radius is scaled by each plane's normal magnitude -- different
+        // per plane, and wrong by more the further the projection is from
+        // square. Conservative enough to hide on a 30-unit chunk; not on a
+        // 2.2-unit minion.
+        let n = (p.x * p.x + p.y * p.y + p.z * p.z).sqrt();
+        if n <= f32::EPSILON {
+            // A degenerate plane cannot reject anything; treating it as a pass
+            // over-draws, where treating it as a fail would make objects
+            // disappear on a bad matrix.
+            return true;
+        }
+        (p.x * center.x + p.y * center.y + p.z * center.z + p.w) / n > -radius
+    })
 }
 
 fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {

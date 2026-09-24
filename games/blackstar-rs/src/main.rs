@@ -10,6 +10,7 @@ use shellkit::{academy, analog, custom, gamepad, net, partdata, replay, stream, 
 
 mod align;
 mod anim;
+mod rigmotion;
 mod approach;
 mod actuator;
 mod aboard;
@@ -776,6 +777,45 @@ struct CarModels {
     cycle: Vec<usize>,
 }
 
+/// Which catalogue family an imported model belongs in.
+///
+/// `catalog_menu` already groups by `info[i].0` and inserts a header wherever
+/// it changes — but `cars.info` was only ever pushed for the built-in hover
+/// cars, so every imported model got `""` from `info.get(i)` and the whole
+/// import block collapsed into one ungrouped run. The grouping was never
+/// broken; it was starved.
+///
+/// Four families, ordered so the ones you want are at the top and the ones
+/// you cannot ship are at the bottom:
+///
+///   FORGE  generated originals (tools/forge) — no rights holder
+///   FIXED  re-exported with texture_export v13+, which merges every piece of
+///          a multi-file OBJ; v9 took whichever piece os.listdir returned
+///          first and dropped the rest (measured: 8-9% of the model kept)
+///   OLD    imported, not re-exported
+///   IP     filename matches a rights holder — visible, deliberately, rather
+///          than scattered through eleven hundred entries
+fn model_family(name: &str, forge: &HashSet<String>, fixed: &HashSet<String>) -> &'static str {
+    // the marks live in vocab.rs, the one file the licensed-vocabulary census
+    // exempts: listed here, each raised its count by one and failed the census
+    use vocab::IP_MARKS;
+    let n = name.to_ascii_lowercase().replace([' ', '-'], "_");
+    // IP wins over everything: a model that is both re-exported and
+    // rights-holder material is still unshippable.
+    if IP_MARKS.iter().any(|m| n.contains(m)) {
+        return "IP";
+    }
+    // The directory prefix is the reliable signal: strips live in
+    // assets/bots/forge_<name>/ while the GLB set is keyed on bare stems, so
+    // matching only the set would miss every strip. Both are checked.
+    if name.starts_with("forge_") || forge.contains(name)
+        || forge.contains(name.trim_start_matches("forge_")) {
+        return "FORGE";
+    }
+    if fixed.contains(name) { return "FIXED"; }
+    "OLD"
+}
+
 impl CarModels {
     fn class_of(&self, i: usize) -> &'static str {
         self.info.get(i).map(|x| x.0).unwrap_or("")
@@ -860,6 +900,10 @@ struct Game {
     loco: anim::Locomotion,
     /// the pose it produced this frame
     loco_pose: anim::Pose,
+    /// the 22-bone rig the gait drives (rigmotion.rs): what the limb channels
+    /// were waiting for
+    rig: rigmotion::RigMotion,
+    rig_frame: Option<rigmotion::Frame>,
     ball_model: model::Model,
     decor_model: model::Model,
     fx: fx::Fx,
@@ -1904,6 +1948,19 @@ fn main() {
             ));
         }
         cars.active = sv.car.min(cars.models.len() - 1);
+        // MOIRE IS THE DEFAULT, when no save says otherwise.
+        //
+        // The built-in hover cars come first in cars.models, so index 0 is
+        // whatever happened to be listed first -- fine when there were nine
+        // cars and arbitrary now. MOIRE is written to be the opening car:
+        // mid-set hitbox, forgiving roof, enough shape to read at a glance,
+        // and nothing a player has to unlearn when they switch to a
+        // specialist. Resolved by NAME so it survives reordering.
+        if sv.car == 0 {
+            if let Some(i) = cars.names.iter().position(|n| *n == "MOIRE") {
+                cars.active = i;
+            }
+        }
     }
 
     // ---- BLACKSTAR BOTS -------------------------------------------------
@@ -1964,7 +2021,24 @@ fn main() {
                               morph_ok: morph.get(name).copied() }
         }).collect();
 
-        let pick = opts.bots.clone().unwrap_or(roster::Pick::All);
+        // DEFAULT IS FORGE when any generated chassis exist.
+        //
+        // Pick::All loads 126 arbitrary chassis off a 268-entry roster that is
+        // 55% rights-holder material by filename, and whose multi-file imports
+        // went through texture_export_v9 -- one `break` in a directory walk,
+        // so it keeps whichever .obj os.listdir returned first and drops the
+        // rest (measured: 8-9% of the model). That is the catalogue you see
+        // today, and it is not a good default.
+        //
+        // `--bots all` is unchanged and still loads everything.
+        let has_forge = std::fs::read_dir(&bots_dir)
+            .into_iter().flatten().flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("forge_"));
+        let pick = opts.bots.clone().unwrap_or(if has_forge {
+            roster::Pick::Forge
+        } else {
+            roster::Pick::All
+        });
         let chosen = roster::fit(&inventory, &pick, roster::SDF_BUDGET);
         let dropped = inventory.len() - chosen.len();
         if dropped > 0 {
@@ -1974,10 +2048,29 @@ fn main() {
             let pages = roster::page_count(&inventory, roster::SDF_BUDGET);
             eprintln!("bots: loaded {} of {} chassis ({dropped} over the {} SDF budget)",
                       chosen.len(), inventory.len(), roster::SDF_BUDGET);
+            eprintln!("      --bots all for the imported roster, forge for generated only,");
             eprintln!("      --bots page:0..{} to step through, or --bots high|broken",
                       pages.saturating_sub(1));
         }
         let bots: Vec<String> = chosen.into_iter().map(|c| c.name).collect();
+
+        // FORGE: anything with a matching GLB in assets/forge. FIXED: listed
+        // in assets/fixed.txt, which texture_export_v13 writes when it
+        // re-exports a multi-file model. Both are plain name sets so the
+        // classifier stays a pure function of strings.
+        let forge_names: HashSet<String> = std::fs::read_dir("assets/forge")
+            .into_iter().flatten().flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                (p.extension().is_some_and(|x| x == "glb"))
+                    .then(|| p.file_stem()?.to_str().map(str::to_string))
+                    .flatten()
+            })
+            .collect();
+        let fixed_names: HashSet<String> = std::fs::read_to_string("assets/fixed.txt")
+            .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty())
+                      .map(str::to_string).collect())
+            .unwrap_or_default();
 
         for bot in bots {
             let bdir = bots_dir.join(&bot);
@@ -2008,7 +2101,14 @@ fn main() {
             // `floats() == self.hover >= 0.5` is fleet.json's own
             // "hoverer"/"hovertank" category speaking, not a guess.
             let floats = traits.floats();
-            let label = bot.trim_start_matches("jet_").to_string();
+            // `forge_` is a FAMILY marker on the directory, not part of the
+            // name: the catalogue already shows the family in its own column,
+            // so carrying the prefix into the label would print it twice and
+            // waste the 28 characters the row has.
+            let label = bot
+                .trim_start_matches("jet_")
+                .trim_start_matches("forge_")
+                .to_string();
             let cid = cars.chassis.len();
             let mut strip = Vec::new();
             let mut dirs: Vec<(PathBuf, f32)> = Vec::new();
@@ -2051,6 +2151,15 @@ fn main() {
                     format!("{} FOLD {k}", label.to_uppercase())
                 };
                 cars.names.push(Box::leak(nm.into_boxed_str()));
+                // info MUST be pushed once per name or the two vectors drift
+                // and every model after the gap is labelled with its
+                // neighbour's family.
+                cars.info.push((
+                    model_family(&bot, &forge_names, &fixed_names),
+                    Box::leak(
+                        format!("{} pose {}/{}", label, k + 1, poses.len()).into_boxed_str(),
+                    ) as &'static str,
+                ));
                 cars.xform.insert(idx, (cid, k));
             }
             // THE WALK STRIP, four phases at the robot end. Loaded at the
@@ -2311,6 +2420,8 @@ fn main() {
         sight: chord::Sight::new(),
         loco: anim::Locomotion::new(),
         loco_pose: anim::Pose::default(),
+        rig: rigmotion::RigMotion::new(3.9),
+        rig_frame: None,
         ball_model,
         decor_model,
         fx: fx::Fx::new(seed),
@@ -4421,6 +4532,12 @@ impl Game {
         self.loco_pose = self
             .loco
             .update(dt, horiz, vert, self.car.on_ground, boosting, self.car.climbing > 0.5);
+        // THE RIG, driven by the same truth: the gait the machine chose, the
+        // ground speed, the gravity where the body is, and the damage -- with
+        // limp()'s SIGN (the gait machine above clamps it to 0..1, which drops
+        // a hurt LEFT leg entirely; the rig reads the side from the sign).
+        let (_gd, gmul) = self.world.gravity_field(self.car.pos);
+        self.rig_frame = Some(self.rig.update(dt, self.loco.gait, horiz, gmul * self.cfg.arena.gravity, hurt));
         // element movement also belongs here: Air runs, Rock does not
         let _ = self.wep.move_mul();
 

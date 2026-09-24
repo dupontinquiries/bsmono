@@ -31,6 +31,7 @@ mod decode;
 mod io;
 mod palette;
 mod pattern;
+mod playback;
 
 /// What we managed to learn about the file the user named.
 struct Opened {
@@ -133,18 +134,12 @@ struct Player {
     /// knowing about. The cost is honest: "play from clipboard" works after a
     /// paste, not before one.
     last_paste: Option<String>,
-    /// Real decoded frames, when ffmpeg could be started for the open file.
-    /// `None` falls back to the test pattern, which is what every build before
-    /// this one did for everything.
-    frames: Option<decode::FfmpegFrames>,
+    /// The realtime engine: decoding on its own threads, audio on its own,
+    /// frames presented against the audio clock. `None` shows the test pattern.
+    engine: Option<playback::Engine>,
     /// Kept alive so the downloaded file outlives the decoder reading it.
     /// Dropping it deletes the file, and ffmpeg is still holding it open.
     downloaded: Option<io::TempMedia>,
-    /// Audio alongside the video. `None` when the source has no audio track.
-    audio: Option<decode::AudioStream>,
-    /// Where PCM goes. Always present -- the null sink is the honest fallback
-    /// on a machine with no sound daemon.
-    sink: Box<dyn decode::AudioSink>,
 }
 
 /// File-picker state. Navigation is uikit-egui's PathPicker; the file list and
@@ -220,10 +215,14 @@ impl Player {
 
         let colors = vidkit_egui::install(&cc.egui_ctx, snapclone_theme::palette_by_id("dark"));
 
-        // Opt-in while it is unproven on hardware. The glow context is handed
-        // over HERE, in CreationContext -- not in `update` -- which is the
-        // detail that stalled the first attempt at this.
-        let (gpu, gpu_error) = if std::env::var("VIDKIT_GPU").as_deref() == Ok("1") {
+        // GPU upload by DEFAULT (VIDKIT_GPU=0 opts out): NV12 planes go to the
+        // GPU and are converted there, instead of a CPU colour conversion of
+        // every frame. It falls back to the CPU path by itself -- here if it
+        // cannot initialise, in `produce` if an upload fails -- and says why.
+        // Verified pixel-identical to the CPU path on llvmpipe; not yet on the
+        // phones' drivers. The glow context is handed over HERE, in
+        // CreationContext -- not in `update` -- which stalled the first attempt.
+        let (gpu, gpu_error) = if std::env::var("VIDKIT_GPU").as_deref() != Ok("0") {
             match cc.gl.as_ref() {
                 Some(gl) => match unsafe { vidkit_egui::glow_present::Nv12Gpu::new(gl) } {
                     Ok(g) => (Some(Arc::new(Mutex::new(g))), None),
@@ -240,17 +239,12 @@ impl Player {
         // opens, is described, and falls back to the test pattern -- which is
         // what this player did for everything until now.
         // Built here, before `file` is moved into the struct.
-        let audio = file.as_ref().and_then(|p| {
-            decode::AudioStream::open(&p.to_string_lossy(), 48_000, 2, Duration::ZERO).ok()
-        });
-        let mut frames = None;
+        let mut engine = None;
         let mut decode_error = None;
         if let Some(p) = &file {
-            match decode::FfmpegFrames::open(p, Some(1920)) {
-                Ok(f) => frames = Some(f),
-                Err(e) => {
-                    decode_error = Some(format!("no decode: {e}"));
-                }
+            match start_file(p.clone()) {
+                Ok(e) => engine = Some(e),
+                Err(e) => decode_error = Some(format!("no decode: {e}")),
             }
         }
 
@@ -283,10 +277,8 @@ impl Player {
             quit: false,
             gpu,
             gpu_error: gpu_error.or(decode_error),
-            frames,
+            engine,
             downloaded: None,
-            audio,
-            sink: decode::open_sink(48_000, 2),
             chrome: Default::default(),
             settings: Default::default(),
             settings_open: false,
@@ -294,55 +286,68 @@ impl Player {
         }
     }
 
-    /// Feed the presenter. Until a decoder exists this is the test pattern —
-    /// stated on screen rather than implied.
+    /// Feed the presenter from the engine: the frame the clock says is due,
+    /// and when to ask again. Never blocks -- decoding and audio run on the
+    /// engine's own threads. Without an engine, the test pattern.
     fn produce(&mut self, eframe_frame: &eframe::Frame) {
-        // A real frame if there is one, the test pattern otherwise. The
-        // pattern is no longer the only thing this player can show.
-        let frame = match self.frames.as_mut().and_then(|f| f.next_frame()) {
-            Some(f) => f,
-            None => {
-                // End of stream. The decoder is dropped rather than left to
-                // fall back to the test pattern every frame: silently
-                // reverting to the pattern at the end of a clip is what
-                // convinced me for an hour that decoding was broken, when a
-                // six-second clip had simply finished before I looked.
-                if self.frames.is_some() {
-                    self.frames = None;
-                    self.transport.playing = false;
-                }
-                let t = self.started.elapsed().as_secs_f32();
-                pattern::bars(t * 0.25)
-            }
+        let Some(engine) = self.engine.as_mut() else {
+            let t = self.started.elapsed().as_secs_f32();
+            self.present(eframe_frame, pattern::bars(t * 0.25));
+            self.presenter.set_deadline(Some(Instant::now() + Duration::from_millis(33)));
+            return;
         };
-
-        // Audio first: the sink blocks when its buffer is full, which is what
-        // paces playback on the machines that have one. Video after, so a
-        // stalled sink does not also stall the picture on machines that do
-        // not.
-        if let Some(a) = self.audio.as_mut() {
-            if let Some(pcm) = a.next_block() {
-                if let Err(e) = self.sink.play(pcm) {
-                    // Report once and stop trying: a broken pipe per frame
-                    // fills the log and the banner.
-                    self.gpu_error = Some(format!("audio stopped: {e}"));
-                    self.audio = None;
-                }
+        if let Some(e) = engine.take_audio_error() {
+            self.gpu_error = Some(e);
+        }
+        let tick = engine.tick();
+        self.transport.position = engine.position();
+        // Say what is timing playback. On a device, "wall clock (no audio
+        // player)" versus "audio clock (pw-play)" is the first thing to know
+        // when sound and picture disagree.
+        let status = format!(
+            "NV12 · {} · {} clock ({})",
+            if self.gpu.is_some() { "GPU" } else { "CPU convert" },
+            if engine.clock_is_audio() { "audio" } else { "wall" },
+            engine.audio_note
+        );
+        if self.transport.status != status {
+            self.transport.status = status;
+        }
+        match tick {
+            playback::Tick::Show { frame, next } => {
+                self.present(eframe_frame, frame);
+                self.presenter.set_deadline(Some(Instant::now() + next));
+            }
+            playback::Tick::Wait(d) => self.presenter.set_deadline(Some(Instant::now() + d)),
+            playback::Tick::Ended => {
+                // Dropped rather than left to fall back to the test pattern:
+                // a clip that has finished must not look like a broken decoder.
+                self.engine = None;
+                self.transport.playing = false;
+                self.presenter.idle();
             }
         }
+    }
 
+    /// Put one frame on screen: GPU upload when available, CPU otherwise. A
+    /// failed upload switches to the CPU path for good and says why, instead
+    /// of leaving a black window.
+    fn present(&mut self, eframe_frame: &eframe::Frame, frame: vidkit_core::Frame) {
         if let (Some(gpu), Some(gl)) = (&self.gpu, eframe_frame.gl()) {
-            if let Ok(mut g) = gpu.lock() {
+            let failed = match gpu.lock() {
                 // SAFETY: eframe's glow context is current on the UI thread.
-                if let Err(e) = unsafe { g.upload(gl, &frame) } {
-                    self.gpu_error = Some(e);
+                Ok(mut g) => unsafe { g.upload(gl, &frame) }.err(),
+                Err(_) => Some("GPU state poisoned".to_string()),
+            };
+            match failed {
+                None => return,
+                Some(e) => {
+                    self.gpu_error = Some(format!("GPU upload failed, using the CPU path: {e}"));
+                    self.gpu = None;
                 }
             }
-        } else {
-            let _ = self.presenter.submit(frame);
         }
-        self.presenter
-            .set_deadline(Some(Instant::now() + Duration::from_millis(33)));
+        let _ = self.presenter.submit(frame);
     }
 }
 
@@ -356,11 +361,13 @@ impl eframe::App for Player {
         }
         self.handle_keys(ctx);
 
+        // Play/pause is toggled from many places (keys, taps, palette); the
+        // engine follows the transport here, once, rather than at each site.
+        if let Some(e) = self.engine.as_mut() {
+            if self.transport.playing && e.is_paused() { e.resume(); }
+            if !self.transport.playing && !e.is_paused() { e.pause(); }
+        }
         if self.transport.playing {
-            let t = self.started.elapsed().as_secs_f64() * self.transport.speed;
-            if let Some(d) = self.transport.duration {
-                self.transport.position = Duration::from_secs_f64(t % d.as_secs_f64().max(1.0));
-            }
             self.produce(_f);
         } else {
             // Paused: stop asking for repaints. Without this the deadline from
@@ -511,7 +518,7 @@ impl eframe::App for Player {
                     ui.separator();
                     // Said plainly rather than left to be inferred from a
                     // picture that does not match the file's dimensions.
-                    ui.small(if self.frames.is_some() {
+                    ui.small(if self.engine.is_some() {
                         "decoding via ffmpeg"
                     } else {
                         "not decoding — showing the test pattern"
@@ -671,8 +678,14 @@ impl Player {
         // step, so nothing ever actually played after the first file --
         // confirmed against the reported "not playing anything from
         // files or clipboard," which routes through this exact function.
-        self.frames = decode::FfmpegFrames::open(&path, Some(1920)).ok();
-        self.audio = decode::AudioStream::open(&path.to_string_lossy(), 48_000, 2, Duration::ZERO).ok();
+        //
+        // Now an engine: video and audio on their own threads, the audio clock
+        // as master. A failure is REPORTED -- `.ok()` here used to leave a file
+        // that would not decode showing nothing and saying nothing.
+        self.engine = match start_file(path.clone()) {
+            Ok(e) => { self.transport.playing = true; Some(e) }
+            Err(e) => { self.gpu_error = Some(format!("cannot play {}: {e}", path.display())); None }
+        };
         self.path = Some(path);
         self.opened = Some(result);
     }
@@ -890,15 +903,22 @@ fn main() -> eframe::Result<()> {
     let first = args.next();
 
     if matches!(first.as_deref(), Some("-h") | Some("--help")) {
-        println!("vidkit-player [FILE]\n");
-        println!("  FILE   a local .mp4 or .webm; omit for the built-in test pattern");
+        println!("vidkit-player [FILE | --clipboard]\n");
+        println!("  FILE         a local .mp4 or .webm; omit for the built-in test pattern");
+        println!("  --clipboard  play what is copied: a file (as a path or file:// URI,");
+        println!("               e.g. copied in a file manager) or a video link");
         println!("\nGestures: drag to scrub (rate rises with height), left half");
         println!("vertical for volume, right half for speed, right edge to rotate,");
         println!("pinch to zoom, tap to play/pause.");
         return Ok(());
     }
 
-    let file = first.map(PathBuf::from);
+    // `--clipboard`: the palette's "Play from clipboard", at launch. On a phone
+    // that is one tap on a launcher shortcut -- copy a video in the file
+    // manager or a link in the browser, tap "Play copied video" -- instead of
+    // open the app, open the palette, pick the command.
+    let from_clipboard = first.as_deref() == Some("--clipboard");
+    let file = if from_clipboard { None } else { first.map(PathBuf::from) };
 
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -910,7 +930,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "vidkit-player",
         opts,
-        Box::new(|cc| Ok(Box::new(Player::new(cc, file)))),
+        Box::new(move |cc| {
+            let mut p = Player::new(cc, file);
+            if from_clipboard {
+                p.play_clipboard();
+            }
+            Ok(Box::new(p))
+        }),
     )
 }
 
@@ -1019,10 +1045,10 @@ impl Player {
 
             match io::fetch_to_temp(&mut io::ProcessRunner::default(), &url, cap) {
                 Ok(media) => {
-                    match decode::FfmpegFrames::open(media.path(), Some(1920)) {
-                        Ok(f) => {
+                    match start_file(media.path().to_path_buf()) {
+                        Ok(e) => {
                             self.opened = Some(open_local(&media.file));
-                            self.frames = Some(f);
+                            self.engine = Some(e);
                             // Held so the file outlives the decoder reading it.
                             self.downloaded = Some(media);
                             self.transport.playing = true;
@@ -1087,7 +1113,7 @@ impl Player {
             headers: resolved.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         };
 
-        let frames = decode::FfmpegFrames::open_streaming(&input, cap)?;
+        let engine = playback::Engine::start(stream_opener(input, cap), sink_maker(), Duration::ZERO, 60)?;
         // Resolved carries no duration; the probe the decoder just did knows
         // the frame rate but not the length, and asking yt-dlp again for it is
         // another process. Left as it was rather than guessed.
@@ -1099,7 +1125,7 @@ impl Player {
             ),
             duration: None,
         }));
-        self.frames = Some(frames);
+        self.engine = Some(engine);
         // The previous download, if any, is no longer needed.
         self.downloaded = None;
         self.transport.playing = true;
@@ -1116,8 +1142,8 @@ impl Player {
     /// nothing, which is worse than a control that is visibly disabled.
     fn seek_to(&mut self, to: Duration) {
         self.transport.position = to;
-        if let Some(frames) = self.frames.as_mut() {
-            if let Err(e) = frames.seek(to) {
+        if let Some(engine) = self.engine.as_mut() {
+            if let Err(e) = engine.seek(to) {
                 // A failed seek leaves the decoder where it was rather than
                 // killing playback: the film carries on from the old position,
                 // which is a better outcome than a black window.
@@ -1125,4 +1151,32 @@ impl Player {
             }
         }
     }
+}
+
+/// The engine's opener for a local file: video capped at 1920 on the long
+/// edge (as before), audio at 48 kHz stereo, both from `from`.
+fn file_opener(p: PathBuf) -> playback::Opener {
+    Box::new(move |from| {
+        let v = decode::FfmpegFrames::open_at(&p, Some(1920), from)?;
+        let a = decode::AudioStream::open(&p.to_string_lossy(), 48_000, 2, from).ok();
+        Ok((v, a))
+    })
+}
+
+/// The engine's opener for a resolved stream: video and audio from the signed
+/// URLs, with their headers.
+fn stream_opener(input: decode::StreamingInput, cap: Option<u32>) -> playback::Opener {
+    Box::new(move |from| {
+        let v = decode::FfmpegFrames::open_streaming_at(&input, cap, from)?;
+        let a = decode::AudioStream::open_streaming(&input, 48_000, 2, from).ok();
+        Ok((v, a))
+    })
+}
+
+fn sink_maker() -> playback::SinkMaker {
+    Box::new(|| decode::open_sink(48_000, 2))
+}
+
+fn start_file(p: PathBuf) -> Result<playback::Engine, String> {
+    playback::Engine::start(file_opener(p), sink_maker(), Duration::ZERO, 60)
 }

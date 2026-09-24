@@ -107,21 +107,8 @@ pub fn probe(path: &Path) -> Result<Probe, String> {
 }
 
 /// A running ffmpeg, yielding NV12 frames.
-/// Where the frames come from, so a seek can restart the same source.
-#[derive(Clone, Debug)]
-enum Source {
-    File(std::path::PathBuf),
-    Streaming {
-        video_url: String,
-        audio_url: Option<String>,
-        headers: Vec<(String, String)>,
-    },
-}
-
 pub struct FfmpegFrames {
     child: Child,
-    source: Source,
-    cap: Option<u32>,
     pub width: u32,
     pub height: u32,
     pub frame_interval: Duration,
@@ -139,11 +126,20 @@ impl FfmpegFrames {
     /// of it away is the expensive mistake the capability model is there to
     /// avoid — letting ffmpeg scale costs far less than decoding full size and
     /// scaling afterwards.
+    /// (Test convenience: the app opens with open_at, from any position.)
+    #[cfg(test)]
     pub fn open(path: &Path, max_long_edge: Option<u32>) -> Result<Self, String> {
         Self::open_at(path, max_long_edge, Duration::ZERO)
     }
 
-    /// [`open`](Self::open), starting at `from`.
+    /// [`open`](Self::open), starting at `from` -- how a seek is done: the
+    /// playback engine reopens at the target (see playback::Opener).
+    ///
+    /// `-ss` goes BEFORE `-i`. After it, ffmpeg decodes from the start and
+    /// throws frames away, which is accurate and turns a scrub into a wait
+    /// proportional to how far you scrubbed. Before it, ffmpeg seeks the
+    /// container and starts at the nearest keyframe, which is what a scrub
+    /// wants.
     pub fn open_at(
         path: &Path,
         max_long_edge: Option<u32>,
@@ -190,13 +186,15 @@ impl FfmpegFrames {
 
         Ok(Self {
             child,
-            source: Source::File(path.to_path_buf()),
-            cap: max_long_edge,
             width: w,
             height: h,
             frame_interval: Duration::from_secs_f64(1.0 / p.fps.max(1.0)),
             buf: vec![0u8; frame_bytes(w, h)],
-            index: 0,
+            // Timestamps on the MEDIA timeline from the first frame: opened at
+            // 2 s, the first frame is stamped 2 s. Starting at zero stamped a
+            // seeked decoder's frames 0 s, 0.033 s... against a clock at 2 s,
+            // so a clock-driven player dropped every one as late.
+            index: (from.as_secs_f64() * p.fps.max(1.0)).round() as u64,
             frames_read: 0,
         })
     }
@@ -208,31 +206,6 @@ impl FfmpegFrames {
     /// target would read every frame in between — for a scrub to the end of a
     /// lecture that is the whole file.
     ///
-    /// `-ss` goes BEFORE `-i`. After it, ffmpeg decodes from the start and
-    /// throws frames away, which is accurate and turns a scrub into a wait
-    /// proportional to how far you scrubbed. Before it, ffmpeg seeks the
-    /// container and starts at the nearest keyframe, which is what a scrub
-    /// wants.
-    pub fn seek(&mut self, to: Duration) -> Result<(), String> {
-        let source = self.source.clone();
-        let cap = self.cap;
-        let mut next = match &source {
-            Source::File(p) => Self::open_at(p, cap, to)?,
-            Source::Streaming { video_url, audio_url, headers } => {
-                let input = StreamingInput {
-                    video_url: video_url.clone(),
-                    audio_url: audio_url.clone(),
-                    headers: headers.clone(),
-                };
-                Self::open_streaming_at(&input, cap, to)?
-            }
-        };
-        // Timestamps continue from where the seek landed, not from zero, or
-        // the transport jumps back to the start of the film every scrub.
-        next.index = (to.as_secs_f64() / next.frame_interval.as_secs_f64().max(1e-9)) as u64;
-        *self = next;
-        Ok(())
-    }
 
     /// The next frame, or `None` at the end of the stream.
     pub fn next_frame(&mut self) -> Option<Frame> {
@@ -475,7 +448,8 @@ mod tests {
         let start = mean(&d.next_frame().expect("first frame"));
 
         let began = std::time::Instant::now();
-        d.seek(Duration::from_secs(8)).expect("seek");
+        // A seek is a reopen at the target (the engine's Opener does this).
+        d = FfmpegFrames::open_at(&path, None, Duration::from_secs(8)).expect("open at 8 s");
         let after = d.next_frame().expect("a frame after seeking");
         let took = began.elapsed();
 
@@ -624,6 +598,8 @@ impl FfmpegFrames {
     ///
     /// The dimensions come from probing the video URL, which costs one small
     /// HTTP request rather than the whole file.
+    /// (Test convenience: the app opens with open_streaming_at.)
+    #[cfg(test)]
     pub fn open_streaming(
         input: &StreamingInput,
         max_long_edge: Option<u32>,
@@ -670,17 +646,15 @@ impl FfmpegFrames {
 
         Ok(Self {
             child,
-            source: Source::Streaming {
-                video_url: input.video_url.clone(),
-                audio_url: input.audio_url.clone(),
-                headers: input.headers.clone(),
-            },
-            cap: max_long_edge,
             width: w,
             height: h,
             frame_interval: Duration::from_secs_f64(1.0 / p.fps.max(1.0)),
             buf: vec![0u8; frame_bytes(w, h)],
-            index: 0,
+            // Timestamps on the MEDIA timeline from the first frame: opened at
+            // 2 s, the first frame is stamped 2 s. Starting at zero stamped a
+            // seeked decoder's frames 0 s, 0.033 s... against a clock at 2 s,
+            // so a clock-driven player dropped every one as late.
+            index: (from.as_secs_f64() * p.fps.max(1.0)).round() as u64,
             frames_read: 0,
         })
     }
@@ -920,10 +894,48 @@ pub fn audio_args(input: &str, rate: u32, channels: u16, from: Duration) -> Vec<
     a
 }
 
+/// Audio-only ffmpeg arguments for a STREAMED source: the audio URL when the
+/// site serves audio separately (YouTube does), the video URL otherwise, with
+/// the resolved headers -- the signed URL is bound to them, and without them
+/// the fetch is a 403 -- and the same reconnect flags the video side uses.
+pub fn audio_streaming_args(input: &StreamingInput, rate: u32, channels: u16, from: Duration) -> Vec<String> {
+    let mut a: Vec<String> = vec!["-v".into(), "error".into(), "-nostdin".into()];
+    if !from.is_zero() {
+        a.push("-ss".into());
+        a.push(format!("{:.3}", from.as_secs_f64()));
+    }
+    if !input.headers.is_empty() {
+        a.push("-headers".into());
+        a.push(input.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect());
+    }
+    for f in ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"] {
+        a.push(f.into());
+    }
+    a.push("-i".into());
+    a.push(input.audio_url.clone().unwrap_or_else(|| input.video_url.clone()));
+    for f in ["-vn", "-f", AUDIO_FORMAT, "-acodec", "pcm_s16le", "-ar"] {
+        a.push(f.into());
+    }
+    a.push(rate.to_string());
+    a.push("-ac".into());
+    a.push(channels.to_string());
+    a.push("-".into());
+    a
+}
+
 impl AudioStream {
     pub fn open(input: &str, rate: u32, channels: u16, from: Duration) -> Result<Self, String> {
+        Self::open_args(audio_args(input, rate, channels, from), rate, channels)
+    }
+
+    /// Audio from a streamed source -- see `audio_streaming_args`.
+    pub fn open_streaming(input: &StreamingInput, rate: u32, channels: u16, from: Duration) -> Result<Self, String> {
+        Self::open_args(audio_streaming_args(input, rate, channels, from), rate, channels)
+    }
+
+    fn open_args(args: Vec<String>, rate: u32, channels: u16) -> Result<Self, String> {
         let child = Command::new("ffmpeg")
-            .args(audio_args(input, rate, channels, from))
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -979,9 +991,20 @@ impl Drop for AudioStream {
 /// and a sink that cannot be tested is a sink that does not work. Everything
 /// above it — decoding, block sizing, the position an audio clock reads — is
 /// exercised against a recording sink.
-pub trait AudioSink {
+pub trait AudioSink: Send {
     fn play(&mut self, pcm: &[u8]) -> Result<(), String>;
     fn name(&self) -> &str;
+    /// Audio written but not yet heard: what the audio clock must SUBTRACT
+    /// (see vidkit_core::audio_clock). An estimate for a piped player.
+    fn latency(&self) -> Duration {
+        Duration::ZERO
+    }
+    /// Does `play` consume audio at the device's real rate? A sink that does
+    /// not -- the silent fallback swallows everything instantly -- must never
+    /// drive the playback clock, or the film would finish in a second.
+    fn realtime(&self) -> bool {
+        true
+    }
 }
 
 /// Discards audio, and says so. Used when no player is installed.
@@ -997,6 +1020,9 @@ impl AudioSink for NullSink {
     fn name(&self) -> &str {
         "none (silent)"
     }
+    fn realtime(&self) -> bool {
+        false
+    }
 }
 
 /// The command-line players, in preference order.
@@ -1004,11 +1030,23 @@ impl AudioSink for NullSink {
 /// Same shelling-out pattern as the clipboard: no crate dependency, and on a
 /// PipeWire system the socket protocol is not something an application should
 /// speak directly.
+///
+/// Each asks for an explicit output latency of PLAYER_LATENCY_MS, so the audio
+/// clock subtracts a known figure rather than a default that differs per
+/// player (pw-play's is 100 ms). The flags are from each tool's documentation;
+/// they have not been run here -- this sandbox has no audio device.
 pub const AUDIO_PLAYERS: &[(&str, &[&str])] = &[
-    ("pw-play", &["--format", "s16", "--rate", "{rate}", "--channels", "{ch}", "-"]),
-    ("paplay", &["--format=s16le", "--rate={rate}", "--channels={ch}", "--raw"]),
-    ("aplay", &["-q", "-f", "S16_LE", "-r", "{rate}", "-c", "{ch}", "-"]),
+    ("pw-play", &["--format", "s16", "--rate", "{rate}", "--channels", "{ch}", "--latency", "{lat}ms", "-"]),
+    ("paplay", &["--format=s16le", "--rate={rate}", "--channels={ch}", "--latency-msec={lat}", "--raw"]),
+    ("aplay", &["-q", "-f", "S16_LE", "-r", "{rate}", "-c", "{ch}", "--buffer-time={lat_us}", "-"]),
 ];
+
+/// The output latency every player is asked for.
+pub const PLAYER_LATENCY_MS: u32 = 40;
+
+/// The pipe to the player is shrunk to this. Linux's default 64 KB holds
+/// ~340 ms of 48 kHz stereo s16 -- written, not yet heard.
+pub const PIPE_BYTES: i32 = 8192;
 
 /// Fill in the rate and channel placeholders.
 pub fn player_args(args: &[&str], rate: u32, channels: u16) -> Vec<String> {
@@ -1016,6 +1054,8 @@ pub fn player_args(args: &[&str], rate: u32, channels: u16) -> Vec<String> {
         .map(|a| {
             a.replace("{rate}", &rate.to_string())
                 .replace("{ch}", &channels.to_string())
+                .replace("{lat_us}", &(PLAYER_LATENCY_MS * 1000).to_string())
+                .replace("{lat}", &PLAYER_LATENCY_MS.to_string())
         })
         .collect()
 }
@@ -1037,10 +1077,13 @@ pub fn find_audio_player() -> Option<&'static str> {
 pub struct CommandSink {
     child: Child,
     player: &'static str,
+    latency: Duration,
 }
 
 impl CommandSink {
-    pub fn open(player: &'static str, args: &[String]) -> Result<Self, String> {
+    /// Open, shrink the pipe, and derive the latency from the pipe size the
+    /// kernel ACTUALLY granted (read back, not assumed) plus the player's.
+    pub fn open_with_format(player: &'static str, args: &[String], rate: u32, channels: u16) -> Result<Self, String> {
         let child = Command::new(player)
             .args(args)
             .stdin(Stdio::piped())
@@ -1048,7 +1091,11 @@ impl CommandSink {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("{player}: {e}"))?;
-        Ok(Self { child, player })
+        let pipe = child.stdin.as_ref().map(|s| shrink_pipe(s)).unwrap_or(65_536);
+        let per_sec = rate.max(1) as f64 * channels.max(1) as f64 * 2.0;
+        let latency = Duration::from_secs_f64(pipe as f64 / per_sec)
+            + Duration::from_millis(PLAYER_LATENCY_MS as u64);
+        Ok(Self { child, player, latency })
     }
 }
 
@@ -1069,6 +1116,22 @@ impl AudioSink for CommandSink {
     }
     fn name(&self) -> &str {
         self.player
+    }
+    fn latency(&self) -> Duration {
+        self.latency
+    }
+}
+
+/// Ask for a PIPE_BYTES pipe and return the size actually in force. Falls back
+/// to reporting Linux's 64 KB default if the calls fail.
+pub fn shrink_pipe(stdin: &std::process::ChildStdin) -> usize {
+    use std::os::unix::io::AsRawFd;
+    let fd = stdin.as_raw_fd();
+    // SAFETY: fcntl on a valid, owned pipe fd with integer arguments only.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETPIPE_SZ, PIPE_BYTES);
+        let got = libc::fcntl(fd, libc::F_GETPIPE_SZ);
+        if got > 0 { got as usize } else { 65_536 }
     }
 }
 
@@ -1092,7 +1155,7 @@ pub fn open_sink(rate: u32, channels: u16) -> Box<dyn AudioSink> {
             .find(|(c, _)| *c == player)
             .map(|(_, a)| player_args(a, rate, channels))
             .unwrap_or_default();
-        if let Ok(s) = CommandSink::open(player, &args) {
+        if let Ok(s) = CommandSink::open_with_format(player, &args, rate, channels) {
             return Box::new(s);
         }
     }
@@ -1101,6 +1164,29 @@ pub fn open_sink(rate: u32, channels: u16) -> Box<dyn AudioSink> {
 
 #[cfg(test)]
 mod audio_tests {
+
+    /// Streamed audio: the separate audio URL is preferred, the headers apply
+    /// to it (placed BEFORE its -i -- after, ffmpeg treats them as output
+    /// options and the fetch is a 403), a seek lands before -i, and -vn is there.
+    #[test]
+    fn streamed_audio_takes_the_audio_url_with_its_headers() {
+        let input = StreamingInput {
+            video_url: "https://v.example/video".into(),
+            audio_url: Some("https://a.example/audio".into()),
+            headers: vec![("User-Agent".into(), "UA/1".into())],
+        };
+        let a = audio_streaming_args(&input, 48_000, 2, Duration::from_millis(2500));
+        let at = |s: &str| a.iter().position(|x| x == s).unwrap_or_else(|| panic!("{s} missing: {a:?}"));
+        assert_eq!(a[at("-i") + 1], "https://a.example/audio");
+        assert!(at("-headers") < at("-i") && a[at("-headers") + 1].contains("User-Agent: UA/1\r\n"));
+        assert!(at("-ss") < at("-i") && a[at("-ss") + 1] == "2.500");
+        assert!(at("-vn") > at("-i"), "audio only");
+        assert!(!a.iter().any(|x| x.contains("v.example")), "the video URL is not fetched for audio");
+        let muxed = StreamingInput { audio_url: None, ..input };
+        let m = audio_streaming_args(&muxed, 48_000, 2, Duration::ZERO);
+        assert!(m.contains(&"https://v.example/video".to_string()), "no separate audio: the one URL");
+        assert!(!m.contains(&"-ss".to_string()), "no seek from zero");
+    }
     use super::*;
 
     fn have_ffmpeg() -> bool {

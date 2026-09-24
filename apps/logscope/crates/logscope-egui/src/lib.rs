@@ -283,3 +283,9 @@ pub mod matrix;  // rows a message falls through, columns it can take, a directo
 pub mod liaison; // operator-said vs organization-knows; the narrow protocol from the design note
 #[allow(dead_code)] pub mod lanes; // concurrent generation lanes over one resident model (scheduling tested via the LaneGen seam)
 #[cfg(feature = "gui")] pub mod tabs;
+
+#[cfg(feature = "gui")]
+pub mod addons;
+#[cfg(feature = "wgpu-engine")]
+pub mod toolfilter;   // the wgpu engine's grammar sampler: acceptor + tokenizer
+pub mod llm_remote;   // an `Llm` on a llama-server: grammar-constrained tool fences + prompt cache

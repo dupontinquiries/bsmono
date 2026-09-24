@@ -71,6 +71,12 @@ pub fn key_events(pressed: bool, keysym: u32, utf8: &str, ctrl: bool, alt: bool,
 }
 #[cfg(feature = "sensors")]
 pub mod sensors;
+/// cpupower's scaling governor, over sysfs. Pure std, no feature gate needed.
+pub mod cpu_governor;
+/// Hardware keys -- power and volume -- from evdev, with the logind power-key
+/// inhibitor. (Supersedes this branch's `power_key`, which handled power only;
+/// screen power likewise lives in the layer runtime now, replacing the
+/// separate-connection `output_power`.)
 #[cfg(feature = "sensors")]
 pub mod keys;
 #[cfg(feature = "sensors")]
@@ -986,7 +992,10 @@ impl ShellView {
             let r = self.pressed_rect(ui, Id::new(("ts-tile-j", i)), r, dt);
             pc.rect_filled(r, cr(16), if on { pal.accent } else { pal.bg_raised });
             pc.text(r.center() - Vec2::new(0.0, 8.0), Align2::CENTER_CENTER, initial(kind.label()), FontId::proportional(20.0), if on { pal.bg_base } else { pal.text });
-            pc.text(r.center_bottom() - Vec2::new(0.0, 13.0), Align2::CENTER_CENTER, short(kind.label()), FontId::proportional(10.0), if on { pal.bg_base } else { pal.text_weak });
+            // CpuGovernor has no off state -- ITS label is which mode is
+            // current, not a fixed short name every other tile uses.
+            let sub = if *kind == QuickKind::CpuGovernor { shell.drawer.governor.label().to_string() } else { short(kind.label()).to_string() };
+            pc.text(r.center_bottom() - Vec2::new(0.0, 13.0), Align2::CENTER_CENTER, sub, FontId::proportional(10.0), if on { pal.bg_base } else { pal.text_weak });
             if visible && hit.height() > 20.0 && ui.interact(hit, Id::new(("ts-tile", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 out.extend(shell.tap_quick(*kind));
             }

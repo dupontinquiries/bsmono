@@ -7,8 +7,16 @@
 //! is due. That is what keeps an idle app from draining the battery.
 
 pub mod mem;
+// THE TABLET BACKENDS ARE LINUX-ONLY: qtfb (AppLoad's framebuffer socket),
+// Blight and evdev use SOCK_CLOEXEC, pipe2, input_event and Linux ioctls. They
+// were compiled everywhere, so any crate depending on eink-kit failed to build
+// on macOS -- gitmind did, for a single PNG icon helper. Seen on a Mac running
+// fleet_build.sh. `mem` and everything else here is portable.
+#[cfg(target_os = "linux")]
 pub mod qtfb;
+#[cfg(target_os = "linux")]
 pub mod blight;
+#[cfg(target_os = "linux")]
 pub mod evdev;
 
 use crate::format::PixelFormat;
@@ -90,9 +98,7 @@ impl InputSender {
 impl InputHub {
     pub fn new() -> io::Result<InputHub> {
         let mut fds = [0 as RawFd; 2];
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        wake_pipe(&mut fds)?;
         let (tx, rx) = mpsc::channel();
         Ok(InputHub { rx, tx, wake_r: fds[0], wake_w: fds[1] })
     }
@@ -112,6 +118,41 @@ impl InputHub {
     pub fn drain(&self) -> Vec<Input> {
         self.rx.try_iter().collect()
     }
+}
+
+/// A non-blocking, close-on-exec pipe for the hub's wake-ups.
+///
+/// Every presenter uses the hub, the portable `mem` one included, so this must
+/// work everywhere. Linux keeps `pipe2`, which sets both flags ATOMICALLY -- a
+/// concurrent fork cannot inherit the descriptors in between. macOS has no
+/// `pipe2`, so elsewhere it is POSIX `pipe` then `fcntl`.
+#[cfg(target_os = "linux")]
+fn wake_pipe(fds: &mut [RawFd; 2]) -> io::Result<()> {
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wake_pipe(fds: &mut [RawFd; 2]) -> io::Result<()> {
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for &fd in fds.iter() {
+        let ok = unsafe {
+            let fl = libc::fcntl(fd, libc::F_GETFL);
+            fl >= 0
+                && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) == 0
+                && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == 0
+        };
+        if !ok {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(fds[0]); libc::close(fds[1]); }
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 impl Drop for InputHub {

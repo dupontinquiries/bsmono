@@ -34,6 +34,8 @@ pub mod deltahostile;
 pub mod device;
 pub mod integrity;
 pub mod smart;
+pub mod wear;
+pub mod announce;   // one status line to the shim / the phone, std only   // NVMe health over time: wear ledger, rates, projections, swap
 pub mod video;
 
 use std::process::Command;

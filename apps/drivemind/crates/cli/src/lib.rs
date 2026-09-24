@@ -4,7 +4,7 @@
 // prefixed `!`), so a user watching the terminal sees the same loop the
 // egui shell renders — one engine, two honest windows onto it.
 
-use drivemind_core::{
+use drivemind_core::{announce, wear, 
     advisor, cleanup, cloneop, deltahostile, device, human_bytes, integrity, smart, video, Event,
     HostRunner,
 };
@@ -30,6 +30,8 @@ pub fn run() -> i32 {
             None => err("usage: dvm smart /dev/<disk>"),
         },
         "health" => cmd_health(),
+        "nvme" => cmd_nvme(&rest),
+        "scrub" => cmd_scrub(&rest),
         "verify" => cmd_verify(&rest),
         "cleanup" => match rest.first() {
             Some(p) => cmd_cleanup(p),
@@ -180,6 +182,98 @@ fn cmd_selftest(dev: &str) -> i32 {
 
 /// Probe everything probeable; return worst severity as the exit code
 /// signal (0 clean, 1 something ≥ Warning) so this drops into cron/scripts.
+/// `dvm nvme record [dev…]` appends one wear snapshot per SMART-capable device (or the given ones);
+/// `dvm nvme trend [key]` prints rates, projections and the "since last time" counters;
+/// `dvm nvme swap` is the hygiene check. `--announce URL [--token T] [--source NAME]` sends the
+/// worst finding as a status line to the shim, which relays it to the phone.
+fn cmd_nvme(rest: &[String]) -> i32 {
+    let announce = rest.iter().position(|a| a == "--announce").and_then(|i| rest.get(i + 1).cloned());
+    let token = rest.iter().position(|a| a == "--token").and_then(|i| rest.get(i + 1).cloned());
+    let source = rest.iter().position(|a| a == "--source").and_then(|i| rest.get(i + 1).cloned()).unwrap_or_else(|| "drivemind".into());
+    let positional: Vec<&String> = { let mut skip = false; rest.iter().filter(|a| { if skip { skip = false; return false; } if a.starts_with("--") { skip = true; return false; } true }).collect() };
+    let mut s = sink();
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    match positional.first().map(|s| s.as_str()) {
+        Some("record") => {
+            let devs: Vec<String> = if positional.len() > 1 { positional[1..].iter().map(|s| s.to_string()).collect() } else {
+                match device::enumerate(&HostRunner) { Ok(d) => d.into_iter().filter(|d| d.smart_capable()).map(|d| d.path).collect(), Err(e) => return err(&e) }
+            };
+            let mut worst = smart::Severity::Ok;
+            let mut worst_msg = String::new();
+            for dev in devs {
+                match smart::probe(&HostRunner, &dev, &mut s) {
+                    Ok(rep) => {
+                        let snap = wear::Snapshot::from_report(&rep, at);
+                        if let Err(e) = wear::record(&snap) { return err(&e); }
+                        let hist = wear::history();
+                        let t = hist.get(&snap.key()).and_then(|h| wear::trend(&snap.key(), h, snap.model.as_deref().and_then(wear::rated_tbw_for)));
+                        let fs = t.as_ref().map(wear::findings).unwrap_or_default();
+                        let w = fs.iter().map(|f| f.severity).max().unwrap_or(smart::Severity::Ok).max(rep.worst());
+                        if w >= worst { worst = w; worst_msg = fs.iter().chain(rep.findings.iter()).filter(|f| f.severity == w).map(|f| format!("{}: {}", snap.key(), f.message)).next().unwrap_or_default(); }
+                        println!("{:<14} {:<22} [{:<8}] {:>5}% used  {:>8} TB written  temp {:>3} °C  unsafe {:>4}  media {:>3}",
+                            dev, snap.key(), sev_tag(w), snap.percentage_used.map(|p| p.to_string()).unwrap_or("?".into()), snap.tb_written().map(|t| format!("{t:.2}")).unwrap_or("?".into()),
+                            snap.temperature_c.map(|t| t.to_string()).unwrap_or("?".into()), snap.unsafe_shutdowns.map(|t| t.to_string()).unwrap_or("?".into()), snap.media_errors.map(|t| t.to_string()).unwrap_or("?".into()));
+                        for f in fs.iter().filter(|f| f.severity >= smart::Severity::Advisory) { println!("{:<14}   {}", "", f.message); }
+                    }
+                    Err(e) => println!("{:<14} [UNPROBED] {e}", dev),
+                }
+            }
+            if let Some(url) = announce {
+                let text = if worst_msg.is_empty() { "nvme: all recorded, nothing to report".to_string() } else { format!("nvme {}: {}", sev_tag(worst).trim(), worst_msg) };
+                match announce::post_status(&url, token.as_deref(), &source, &text) { Ok(c) => eprintln!("announced ({c})"), Err(e) => eprintln!("announce failed: {e}") }
+            }
+            if worst >= smart::Severity::Warning { 1 } else { 0 }
+        }
+        Some("trend") => {
+            let hist = wear::history();
+            if hist.is_empty() { println!("no snapshots yet: `dvm nvme record` first (ledger at {})", wear::ledger_path().display()); return 0; }
+            let mut worst = smart::Severity::Ok;
+            for (key, snaps) in hist.iter().filter(|(k, _)| positional.get(1).map(|want| k.contains(want.as_str())).unwrap_or(true)) {
+                let model = snaps.last().and_then(|s| s.model.clone()).unwrap_or_default();
+                let Some(t) = wear::trend(key, snaps, wear::rated_tbw_for(&model)) else { continue };
+                println!("{key}  {model}
+  {} snapshots over {:.1} days · {} TB written{}{}",
+                    t.snapshots, t.span_days, t.tb_written_total.map(|x| format!("{x:.2}")).unwrap_or("?".into()),
+                    t.tb_written_per_day.map(|r| format!(" · {r:.3} TB/day")).unwrap_or_default(),
+                    t.rated_tbw.map(|r| format!(" · rated {r:.0} TBW")).unwrap_or_default());
+                if let Some(d) = t.days_to_rated_tbw.or(t.days_to_100_percent) { println!("  ~{:.0} days of endurance left at this rate ({:.1} years)", d, d / 365.0); }
+                for f in wear::findings(&t) { worst = worst.max(f.severity); println!("  [{:<8}] {}", sev_tag(f.severity), f.message); }
+            }
+            if worst >= smart::Severity::Warning { 1 } else { 0 }
+        }
+        Some("swap") => match wear::swap_status(&HostRunner) {
+            Ok(st) => { let f = wear::swap_finding(&st); println!("[{:<8}] {} ({})", sev_tag(f.severity), f.message, st.source); if f.severity >= smart::Severity::Warning { 1 } else { 0 } }
+            Err(e) => err(&e),
+        },
+        _ => err("usage: dvm nvme record [dev…] | trend [key] | swap   [--announce URL --token T --source NAME]"),
+    }
+}
+
+/// `dvm scrub ROOT MANIFEST [--announce URL --token T --source NAME]`: verify a BLAKE3 manifest,
+/// record the result in the wear ledger's neighbour (`scrubs.jsonl`), and say one line about it.
+/// Read errors are the drive's problem; drift is yours; both are named.
+fn cmd_scrub(rest: &[String]) -> i32 {
+    let announce = rest.iter().position(|a| a == "--announce").and_then(|i| rest.get(i + 1).cloned());
+    let token = rest.iter().position(|a| a == "--token").and_then(|i| rest.get(i + 1).cloned());
+    let source = rest.iter().position(|a| a == "--source").and_then(|i| rest.get(i + 1).cloned()).unwrap_or_else(|| "drivemind".into());
+    let positional: Vec<&String> = { let mut skip = false; rest.iter().filter(|a| { if skip { skip = false; return false; } if a.starts_with("--") { skip = true; return false; } true }).collect() };
+    let (Some(root), Some(manifest)) = (positional.first(), positional.get(1)) else { return err("usage: dvm scrub ROOT MANIFEST [--announce URL --token T --source NAME]") };
+    let mut s = sink();
+    let rep = match integrity::verify(Path::new(root), Path::new(manifest), &mut s) { Ok(r) => r, Err(e) => return err(&e) };
+    let (ok, changed, missing, read_errors) = (rep.ok as usize, rep.changed.len(), rep.missing.len(), rep.read_errors.len());
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let line = serde_json::json!({"at_unix": at, "root": root, "manifest": manifest, "ok": ok, "changed": changed, "missing": missing, "read_errors": read_errors}).to_string();
+    let scrubs = wear::ledger_path().with_file_name("scrubs.jsonl");
+    if let Some(d) = scrubs.parent() { let _ = std::fs::create_dir_all(d); }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&scrubs) { let _ = writeln!(f, "{line}"); }
+    let text = if read_errors > 0 { format!("scrub {root}: {read_errors} READ ERRORS ({changed} changed, {missing} missing, {ok} ok) — the drive, not the files") }
+        else if changed + missing > 0 { format!("scrub {root}: {changed} changed, {missing} missing, {ok} ok — drift, not rot") }
+        else { format!("scrub {root}: {ok} files intact") };
+    println!("{text}");
+    if let Some(url) = announce { match announce::post_status(&url, token.as_deref(), &source, &text) { Ok(c) => eprintln!("announced ({c})"), Err(e) => eprintln!("announce failed: {e}") } }
+    if read_errors > 0 { 2 } else if changed + missing > 0 { 1 } else { 0 }
+}
+
 fn cmd_health() -> i32 {
     let devs = match device::enumerate(&HostRunner) {
         Ok(d) => d,

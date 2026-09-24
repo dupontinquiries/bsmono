@@ -1,0 +1,15 @@
+[package]
+name = "boneforge"
+version = "0.1.0"
+edition = "2021"
+description = "Turn a vehicle mesh into a rigged bot: islands, anatomy, skeleton, plate armour."
+
+# No dependencies. The whole pipeline -- GLB parse, island segmentation,
+# anatomy, forward kinematics, plate generation -- builds and tests in about a
+# second with no GPU. That is what makes it possible to run it over a library
+# of models and know whether the answers are right.
+[dependencies]
+
+[[bin]]
+name = "boneforge"
+path = "src/main.rs"

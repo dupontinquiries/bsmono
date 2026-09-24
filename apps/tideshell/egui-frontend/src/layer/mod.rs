@@ -259,6 +259,11 @@ pub struct State {
     pub repeat: (i32, i32),
     /// zwlr_output_power_v1 per output, and the last mode each reported.
     powers: Vec<ZwlrOutputPowerV1>,
+    /// Per output, by index: the last mode the COMPOSITOR reported (Some(on)).
+    /// These power objects live for the connection, so the compositor reports
+    /// every change -- including its own lock-screen and idle blanking, which
+    /// tideshell did not ask for and otherwise would not know about.
+    power_modes: Vec<Option<bool>>,
     pub power_status: String,
     /// wlr-output-management: the heads the compositor listed, the serial
     /// of the latest `done`, and the result of our last configuration.
@@ -358,6 +363,7 @@ impl Io {
             xkb: None,
             repeat: (25, 400),
             powers: Vec::new(),
+            power_modes: Vec::new(),
             power_status: String::new(),
             out_mgr: None,
             heads: Vec::new(),
@@ -372,7 +378,8 @@ impl Io {
         let mut io = Io { conn, queue, qh, st, compositor, shm, layer_shell, _seat: seat, frac_mgr, viewporter, strip_px, show_strips, right_enabled: false, side_sizes: HashMap::new(), _outputs: outputs, overlay_keyboard: false };
         io.st.out_mgr = out_mgr;
         if let Some(m) = &power_mgr {
-            io.st.powers = io._outputs.iter().map(|o| m.get_output_power(o, &io.qh, ())).collect();
+            io.st.powers = io._outputs.iter().enumerate().map(|(i, o)| m.get_output_power(o, &io.qh, i)).collect();
+            io.st.power_modes = vec![None; io.st.powers.len()];
             io.st.power_status = format!("output power: {} output(s)", io.st.powers.len());
         } else {
             io.st.power_status = "output power: zwlr_output_power_manager_v1 not offered".into();
@@ -613,6 +620,13 @@ impl Io {
         }
     }
 
+    /// Whether the display is on, as the COMPOSITOR last reported it (see
+    /// `combine`); `None` until every output has reported. The backlight
+    /// writer follows this, so it stops writing when cosmic blanks the screen.
+    pub fn display_on(&self) -> Option<bool> {
+        combine(&self.st.power_modes)
+    }
+
     /// Panel on or off (all outputs). Returns what happened, for the trace.
     pub fn set_display_power(&mut self, on: bool) -> String {
         if self.st.powers.is_empty() {
@@ -781,10 +795,15 @@ impl Dispatch<ZwlrOutputConfigurationV1, ()> for State {
 }
 noop!(WlOutput);
 
-impl Dispatch<ZwlrOutputPowerV1, ()> for State {
-    fn event(st: &mut Self, _: &ZwlrOutputPowerV1, e: zwlr_output_power_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+impl Dispatch<ZwlrOutputPowerV1, usize> for State {
+    fn event(st: &mut Self, _: &ZwlrOutputPowerV1, e: zwlr_output_power_v1::Event, idx: &usize, _: &Connection, _: &QueueHandle<Self>) {
         match e {
-            zwlr_output_power_v1::Event::Mode { mode } => st.power_status = format!("output power: compositor reports {mode:?}"),
+            zwlr_output_power_v1::Event::Mode { mode } => {
+                if let Some(m) = st.power_modes.get_mut(*idx) {
+                    *m = Some(matches!(mode, wayland_client::WEnum::Value(PowerMode::On)));
+                }
+                st.power_status = format!("output power: compositor reports {mode:?} (output {idx})");
+            }
             zwlr_output_power_v1::Event::Failed => st.power_status = "output power: compositor reported failure (object dead)".into(),
             _ => {}
         }
@@ -1076,9 +1095,31 @@ impl Gl {
     }
 }
 
+/// Whether the display counts as on, from each output's last reported mode:
+/// on if ANY output is on, off once EVERY output has said off, unknown until
+/// then. Pure.
+pub fn combine(modes: &[Option<bool>]) -> Option<bool> {
+    if modes.iter().any(|m| *m == Some(true)) {
+        Some(true)
+    } else if !modes.is_empty() && modes.iter().all(|m| *m == Some(false)) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_display_is_on_if_any_output_is_and_off_only_when_all_say_so() {
+        assert_eq!(combine(&[Some(true)]), Some(true));
+        assert_eq!(combine(&[Some(false)]), Some(false));
+        assert_eq!(combine(&[Some(false), None]), None, "not all known yet: no claim");
+        assert_eq!(combine(&[Some(false), Some(true)]), Some(true), "an external screen still on");
+        assert_eq!(combine(&[]), None);
+    }
 
     #[test]
     fn buffer_rounds_up_at_fractional_scales() {

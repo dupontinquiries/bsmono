@@ -1,0 +1,20 @@
+[package]
+name = "logscope-shim"
+version = "0.1.0"
+edition = "2021"
+description = "The model-manager shim that runs on a headless box (the M5 Pro mini): rotates GGUFs from an NVMe library into local cache under a byte budget, supervises llama-server, executes directives from logscope on another box, and publishes status lines to the ledger / HTTP / DHT."
+
+[[bin]]
+name = "logscope-shim"
+path = "src/main.rs"
+
+[dependencies]
+logscope-hive = { path = "../logscope-hive" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2.10", features = ["json"] }
+tiny_http = "0.12"
+
+[features]
+default = []
+dht = ["logscope-hive/dht"]

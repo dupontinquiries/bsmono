@@ -157,9 +157,88 @@ pub struct Backlight {
 pub const GAMMA: f32 = 2.2;
 
 pub fn level_to_raw(level: f32, max: u32) -> u32 {
-    // Never 0: on some panels (OLED, the FP5's) 0 can switch the panel off.
-    ((level.clamp(0.0, 1.0).powf(GAMMA) * max as f32).round() as u32).clamp(1, max.max(1))
+    ((level.clamp(0.0, 1.0).powf(GAMMA) * max as f32).round() as u32).clamp(raw_floor(max), max.max(1))
 }
+
+/// The dimmest raw value ever sent: 1/256 of the panel's range (16 of the
+/// FP5's 4095), never less than 1.
+///
+/// It was 1 -- chosen so an OLED is not switched OFF by a 0. But 1 of 4095 is
+/// 0.02% of full brightness, indistinguishable from off: auto-brightness in a
+/// dark room (or in a pocket, face down) drove the screen BLACK, and the
+/// ambient core's MIN_LEVEL (0.02) maps to exactly that through the gamma.
+/// 1/256 is dim but visibly lit. A judgement, not a measurement of this panel.
+pub fn raw_floor(max: u32) -> u32 {
+    max.div_ceil(256).max(1)
+}
+
+/// Whether a brightness value should be written NOW. Pure, so the rules are
+/// tested without a panel.
+///
+/// * Never while the display is OFF. On this panel (`ae94000.dsi.0`) a
+///   brightness write is a command over the DSI link; sent to a powered-down
+///   panel it fails, and the DSI host logs the error -- the "dsi err worker"
+///   lines in the journal. Auto-brightness kept writing through every screen-
+///   off, including cosmic's own lock-screen and idle blanking.
+/// * Never the raw value already written. A small level change often maps
+///   to the same raw value, and each redundant write is still a DSI command.
+/// * On power-ON, the latest level is written even if unchanged: the panel
+///   was re-powered, and the value it holds is not to be trusted.
+#[derive(Debug, Clone, Default)]
+pub struct WriteGate {
+    display_on: bool,
+    last_written: Option<u32>,
+    latest: Option<u32>,
+}
+
+impl WriteGate {
+    pub fn new() -> Self {
+        WriteGate { display_on: true, last_written: None, latest: None }
+    }
+    pub fn display_on(&self) -> bool {
+        self.display_on
+    }
+    /// A new wanted value; `Some(raw)` if it should be written now.
+    pub fn level(&mut self, raw: u32) -> Option<u32> {
+        self.latest = Some(raw);
+        (self.display_on && self.last_written != Some(raw)).then_some(raw)
+    }
+    /// The display changed power; `Some(raw)` to re-assert on power-on.
+    pub fn display(&mut self, on: bool) -> Option<u32> {
+        let was = self.display_on;
+        self.display_on = on;
+        if !on {
+            return None;
+        }
+        // Newly on: re-assert. Already on but nothing written since waking (a
+        // re-assert that failed because the panel was not ready yet): the
+        // compositor's later confirmation re-asserts again. This also makes
+        // the gate safe to feed from both tideshell and the compositor.
+        if !was {
+            self.last_written = None;
+        }
+        if self.last_written.is_none() { self.latest } else { None }
+    }
+    /// A write of `raw` succeeded.
+    pub fn written(&mut self, raw: u32) {
+        self.last_written = Some(raw);
+    }
+}
+
+/// What the writer thread is told.
+#[derive(Debug, Clone, Copy)]
+pub enum BacklightMsg {
+    Level(f32),
+    Display(bool),
+}
+
+/// A panel just powered up needs a moment before it accepts commands.
+pub const WAKE_SETTLE: Duration = Duration::from_millis(120);
+/// Consecutive failures before a write method is abandoned for the next.
+/// It was ONE: a single failure (a write racing a screen-off, say) moved on
+/// for good -- logind, then brightnessctl, then sysfs, which a normal user
+/// usually cannot write -- and brightness could never be set again.
+pub const DEMOTE_AFTER: u32 = 3;
 
 pub fn raw_to_level(raw: u32, max: u32) -> f32 {
     (raw.min(max) as f32 / max.max(1) as f32).powf(1.0 / GAMMA)
@@ -648,7 +727,7 @@ fn ambient_loop(sys: PathBuf, bus: Option<Connection>, tx: Sender<f32>, st: Arc<
 /// Background writer: `set(level)` coalesces to the newest value; `status()`
 /// says how brightness is being applied (or why it cannot be).
 pub struct BacklightOut {
-    tx: Option<Sender<f32>>,
+    tx: Option<Sender<BacklightMsg>>,
     status: Arc<Mutex<String>>,
     /// Write interval in microseconds; `set_rate` changes it live.
     interval_us: Arc<std::sync::atomic::AtomicU64>,
@@ -674,7 +753,7 @@ impl BacklightOut {
             return BacklightOut { tx: None, status, interval_us, mode, initial: None, backlight_name: String::new() };
         };
         let initial = bl.read_level();
-        let (tx, rx) = mpsc::channel::<f32>();
+        let (tx, rx) = mpsc::channel::<BacklightMsg>();
         let st = status.clone();
         let iv = interval_us.clone();
         let md = mode.clone();
@@ -689,7 +768,15 @@ impl BacklightOut {
 
     pub fn set(&self, level: f32) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(level);
+            let _ = tx.send(BacklightMsg::Level(level));
+        }
+    }
+
+    /// The display's power changed -- by tideshell or by the compositor.
+    /// While off nothing is written; on power-on the level is re-asserted.
+    pub fn set_display(&self, on: bool) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(BacklightMsg::Display(on));
         }
     }
 
@@ -725,6 +812,10 @@ pub enum Method {
 /// Minimum spacing between writes: brightnessctl is a process per call and
 /// a ramp produces many steps; coalescing keeps only the newest value.
 pub const MIN_WRITE_INTERVAL: Duration = Duration::from_millis(50);
+// The write rate on the cheap paths is `BacklightOut::set_rate` (default
+// 30 Hz). It was one frame of a 90 Hz panel: on the FP5 every write is a DSI
+// command to the panel, and up to 90 a second competed with the display's own
+// traffic.
 
 /// `brightnessctl` on PATH, if installed.
 pub fn find_brightnessctl() -> Option<PathBuf> {
@@ -783,7 +874,9 @@ impl WriteMode {
     }
 }
 
-fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>, rx: Receiver<f32>, st: Arc<Mutex<String>>, interval_us: Arc<std::sync::atomic::AtomicU64>, mode: Arc<std::sync::atomic::AtomicU8>) {
+fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>, rx: Receiver<BacklightMsg>,
+                  st: Arc<Mutex<String>>, interval_us: Arc<std::sync::atomic::AtomicU64>,
+                  mode: Arc<std::sync::atomic::AtomicU8>) {
     let set = |s: String| *st.lock().unwrap() = s;
     let session = bus.as_ref().map(logind_graphical_session);
     // Candidate methods in order; the first that works stays in use, and a
@@ -815,39 +908,11 @@ fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>,
     };
     set(note(cur, &skipped));
     let mut last_write: Option<std::time::Instant> = None;
+    let mut gate = WriteGate::new();
+    let mut failures = 0u32;
     let mut backoff: Option<Duration> = None;
     let mut last_raw: Option<u32> = None;
-    loop {
-        let mode_now = match mode.load(std::sync::atomic::Ordering::Relaxed) {
-            2 => WriteMode::Safe,
-            1 => WriteMode::Stepped,
-            _ => WriteMode::Smooth,
-        };
-        let Ok(mut level) = rx.recv() else { return };
-        if mode_now != WriteMode::Smooth {
-            // Keep taking values until none has arrived for SETTLE_MS (Safe),
-            // or a >= 5% step has accumulated (Stepped): the panel gets one
-            // write per gesture or per real change, never a stream.
-            loop {
-                let wait = if mode_now == WriteMode::Safe { Duration::from_millis(SETTLE_MS) } else { Duration::from_millis(500) };
-                match rx.recv_timeout(wait) {
-                    Ok(v) => {
-                        level = v;
-                        if mode_now == WriteMode::Stepped {
-                            let raw = level_to_raw(level, bl.max);
-                            if last_raw.is_some_and(|l| (raw as i64 - l as i64).unsigned_abs() as f32 >= bl.max as f32 * 0.05) {
-                                break;
-                            }
-                        }
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(_) => return,
-                }
-            }
-        }
-        if last_raw == Some(level_to_raw(level, bl.max)) {
-            continue;
-        }
+    while let Ok(first) = rx.recv() {
         // The configured rate on the cheap paths (logind is one D-Bus call,
         // sysfs one write); brightnessctl is a process per call, so <= 20 Hz.
         let configured = Duration::from_micros(interval_us.load(std::sync::atomic::Ordering::Relaxed));
@@ -861,14 +926,64 @@ fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>,
                 std::thread::sleep(interval - since);
             }
         }
-        // Coalesce: a ramp sends many values; only the newest matters.
-        while let Ok(newer) = rx.try_recv() {
-            level = newer;
+        // Coalesce: apply every waiting message in order; the gate decides
+        // what (if anything) to write once they are all in.
+        let mut want: Option<u32> = None;
+        let mut woke = false;
+        for msg in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
+            match msg {
+                BacklightMsg::Level(l) => {
+                    if let Some(r) = gate.level(level_to_raw(l, bl.max)) { want = Some(r); }
+                }
+                BacklightMsg::Display(on) => {
+                    want = gate.display(on);
+                    woke |= on && want.is_some();
+                    if !on { want = None; }
+                }
+            }
         }
-        let raw = level_to_raw(level, bl.max);
-        last_raw = Some(raw);
+        // The write mode (FP5, pmaports #4274): the DPU driver misbehaves under a STREAM of
+        // brightness changes even when rate-limited, while single writes are fine. Safe keeps
+        // taking messages until none has arrived for SETTLE_MS; Stepped until a >= 5% step
+        // against the last written value has built up. Display messages keep their meaning
+        // (through the same gate); a display-off ends the wait with nothing to write.
+        let mode_now = match mode.load(std::sync::atomic::Ordering::Relaxed) {
+            2 => WriteMode::Safe,
+            1 => WriteMode::Stepped,
+            _ => WriteMode::Smooth,
+        };
+        if mode_now != WriteMode::Smooth && want.is_some() && !woke {
+            let wait = if mode_now == WriteMode::Safe { Duration::from_millis(SETTLE_MS) } else { Duration::from_millis(500) };
+            loop {
+                match rx.recv_timeout(wait) {
+                    Ok(BacklightMsg::Level(l)) => {
+                        if let Some(r) = gate.level(level_to_raw(l, bl.max)) { want = Some(r); }
+                        if mode_now == WriteMode::Stepped {
+                            if let (Some(w), Some(lw)) = (want, last_raw) {
+                                if (w as i64 - lw as i64).unsigned_abs() as f32 >= bl.max as f32 * 0.05 { break; }
+                            }
+                        }
+                    }
+                    Ok(BacklightMsg::Display(on)) => {
+                        want = gate.display(on);
+                        woke |= on && want.is_some();
+                        if !on { want = None; break; }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(_) => return,
+                }
+            }
+        }
+        let Some(raw) = want else { continue };
+        if woke {
+            std::thread::sleep(WAKE_SETTLE);
+        }
+        // Try from the current method; later ones only for THIS write until
+        // the current one has failed DEMOTE_AFTER times in a row.
+        let mut i = cur;
+        let mut cur_err: Option<String> = None;
         loop {
-            let r = match methods[cur] {
+            let r = match methods[i] {
                 Method::Logind => match (&bus, &session) {
                     (Some(b), Some(Ok(p))) => logind_set_brightness(b, p, &bl.name, raw),
                     _ => Err("no logind session".into()),
@@ -878,19 +993,43 @@ fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>,
             };
             match r {
                 Ok(()) => {
+                    gate.written(raw);
+                    last_raw = Some(raw);
                     backoff = backoff.and_then(|b| (b > interval * 2).then_some(b / 2));
+                    if i == cur {
+                        if failures > 0 { set(note(cur, &skipped)); }
+                        failures = 0;
+                    } else if let Some(e) = &cur_err {
+                        // Say what ACTUALLY applied this write, and why the
+                        // preferred method did not -- not a status claiming
+                        // a method works while writes go elsewhere.
+                        let mut extra = skipped.clone();
+                        extra.push(format!("{e} ({failures} of {DEMOTE_AFTER} before abandoning it)"));
+                        set(note(i, &extra));
+                    }
                     break;
-                }
-                Err(e) if cur + 1 < methods.len() => {
-                    backoff = Some(backoff.map_or(interval * 2, |b| (b * 2).min(BACKOFF_MAX)));
-                    skipped.push(e);
-                    cur += 1;
-                    set(note(cur, &skipped));
                 }
                 Err(e) => {
-                    backoff = Some(backoff.map_or(interval * 2, |b| (b * 2).min(BACKOFF_MAX)));
-                    set(format!("backlight: cannot set {} (all methods failed; last: {e}; backing off to {:?}) [{}]", bl.name, backoff.unwrap(), skipped.join("; ")));
-                    break;
+                    if i == cur {
+                        cur_err = Some(e.clone());
+                        failures += 1;
+                        if failures >= DEMOTE_AFTER && cur + 1 < methods.len() {
+                            skipped.push(format!("{e} ({failures} in a row)"));
+                            cur += 1;
+                            failures = 0;
+                            set(note(cur, &skipped));
+                        }
+                    }
+                    if i + 1 < methods.len() {
+                        i += 1;
+                    } else {
+                        // Every method failed for this write: back off, so a
+                        // driver that objects is not hammered.
+                        backoff = Some(backoff.map_or(interval * 2, |b| (b * 2).min(BACKOFF_MAX)));
+                        set(format!("backlight: cannot set {} (all methods failed; last: {e}; backing off to {:?}) [{}]",
+                                    bl.name, backoff.unwrap(), skipped.join("; ")));
+                        break;
+                    }
                 }
             }
         }
@@ -901,6 +1040,48 @@ fn backlight_loop(bl: Backlight, bus: Option<Connection>, tool: Option<PathBuf>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE BLACK SCREEN: the ambient core's floor (MIN_LEVEL 0.02) went to
+    /// raw 1 of 4095 through the gamma -- 0.02%, indistinguishable from off.
+    #[test]
+    fn the_dimmest_setting_is_visibly_lit_not_black() {
+        assert_eq!(level_to_raw(0.02, 4095), 16, "was 1");
+        assert_eq!(level_to_raw(0.0, 4095), 16);
+        assert_eq!(raw_floor(255), 1, "a small range keeps its own floor");
+        assert!(level_to_raw(0.5, 4095) > 16, "above the floor the curve is unchanged");
+    }
+
+    /// NO WRITES TO A DARK PANEL: while the display is off nothing is written
+    /// (a DSI command to a powered-down panel is the journal's dsi error), and
+    /// on power-on the newest level is re-asserted even if unchanged.
+    #[test]
+    fn nothing_is_written_while_the_display_is_off_and_power_on_reasserts() {
+        let mut g = WriteGate::new();
+        assert_eq!(g.level(500), Some(500));
+        g.written(500);
+        assert_eq!(g.display(false), None);
+        assert_eq!(g.level(900), None, "off: not written");
+        assert_eq!(g.level(40), None, "still off");
+        assert_eq!(g.display(true), Some(40), "on: the NEWEST level, re-asserted");
+        // That write FAILED (panel not ready): the compositor's confirmation
+        // that the display is on re-asserts again.
+        assert_eq!(g.display(true), Some(40), "confirmation retries a failed re-assert");
+        g.written(40);
+        assert_eq!(g.display(true), None, "written since waking: nothing to re-assert");
+    }
+
+    /// NO REDUNDANT COMMANDS: the same raw value twice is one write.
+    #[test]
+    fn an_unchanged_raw_value_is_not_written_again() {
+        let mut g = WriteGate::new();
+        assert_eq!(g.level(300), Some(300));
+        g.written(300);
+        assert_eq!(g.level(300), None);
+        assert_eq!(g.level(301), Some(301));
+        // A write that FAILED leaves nothing recorded, so the value is retried.
+        assert_eq!(g.level(302), Some(302));
+        assert_eq!(g.level(302), Some(302), "not written yet: still wanted");
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("tideshell-sensors-{tag}-{}", std::process::id()));
@@ -965,13 +1146,13 @@ mod tests {
             for i in 1..=20 {
                 let l = i as f32 / 20.0;
                 let raw = level_to_raw(l, max);
-                if raw < 4 {
-                    continue; // below the scale's resolution
+                if raw < 4 || raw <= raw_floor(max) {
+                    continue; // below the scale's resolution, or clamped to the floor on purpose
                 }
                 let back = raw_to_level(raw, max);
                 assert!((back - l).abs() < 0.03, "{l} -> {back} at max {max}");
             }
-            assert_eq!(level_to_raw(0.0, max), 1, "never 0: an OLED can switch off");
+            assert_eq!(level_to_raw(0.0, max), raw_floor(max), "the floor, never 0 (an OLED can switch off)");
             assert_eq!(level_to_raw(1.0, max), max);
         }
         assert!(level_to_raw(0.5, 4095) < 4095 / 2, "gamma: half perceived is well under half raw");
@@ -1030,8 +1211,16 @@ mod tests {
         out.set(1.0);
         let path = sys.join("class/backlight/panel/brightness");
         assert!(wait_for(|| std::fs::read_to_string(&path).unwrap_or_default() == "4095"));
+        // The write landed via sysfs, and the status says so, and why.
+        assert!(wait_for(|| out.status().contains("via sysfs")), "{}", out.status());
         let st = out.status();
-        assert!(st.contains("via sysfs") && st.contains("brightnessctl exited 1"), "{st}");
+        assert!(st.contains("brightnessctl exited 1") && st.contains("1 of 3"), "{st}");
+        // ONE failure no longer abandons a method for good; THREE in a row do.
+        for (level, raw) in [(0.6f32, level_to_raw(0.6, 4095)), (0.3, level_to_raw(0.3, 4095))] {
+            out.set(level);
+            assert!(wait_for(|| std::fs::read_to_string(&path).unwrap_or_default() == raw.to_string()));
+        }
+        assert!(wait_for(|| out.status().contains("3 in a row")), "abandoned after three: {}", out.status());
         let _ = std::fs::remove_dir_all(&sys);
     }
 
@@ -1289,3 +1478,4 @@ mod dbus_tests {
         let _ = std::fs::remove_dir_all(&sys);
     }
 }
+

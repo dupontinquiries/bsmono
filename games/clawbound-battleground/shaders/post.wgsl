@@ -79,7 +79,17 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // --- single-pass bloom: a 12-tap ring at two radii, weighted to a soft disc.
     // Cheap enough for a phone GPU; the MSAA resolve already softened the source.
     let texel = vec2(1.0) / vec2<f32>(textureDimensions(hdr));
+    // LOW GRAPHICS SKIPS THE WHOLE RING. 12 iterations x 2 taps = 24 texture
+    // samples per pixel, and at 1080p that is ~50M samples a frame before the
+    // god rays add 22 more. Scaling the strength toward zero still pays for
+    // every one of them; branching out does not.
+    //
+    // Zero bloom strength is the signal rather than a new uniform slot: `b`
+    // is full, and "no bloom" and "bloom at zero intensity" are the same
+    // picture -- so the low setting sets the strength it already has to 0 and
+    // this reads it.
     var glow = vec3(0.0);
+    if (pp.b.x > 0.001) {
     for (var i: i32 = 0; i < 12; i = i + 1) {
         let a = f32(i) * 0.5236;
         let dir = vec2(cos(a), sin(a));
@@ -87,6 +97,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         glow = glow + bright(textureSample(hdr, samp, uv0 + dir * texel * 7.5).rgb) * 0.4;
     }
     glow = glow / 12.0;
+    }
     col = col + glow * pp.b.x;
 
     // --- light shafts: radial samples of the bright pass toward the sun's

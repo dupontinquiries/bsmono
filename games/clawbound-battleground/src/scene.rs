@@ -15,6 +15,24 @@ use crate::sim::{Game, ProjKind, Rng};
 use crate::vfx::Vfx;
 use crate::voxel::{merge_xform, VoxelMesh};
 
+/// Cull radius for a minion-sized actor, in world units.
+///
+/// GENEROUS ON PURPOSE. A sphere fitted to the body pops when an arm, a tail
+/// or a weapon swings outside it, and a pop at the screen edge is far more
+/// noticeable than the handful of extra draws a loose radius lets through.
+/// The cost of being wrong in each direction is not symmetric.
+pub const ACTOR_CULL_R: f32 = 2.2;
+
+/// Half the height of a tower, so the cull sphere sits at its middle.
+///
+/// A tower's `pos` is its BASE. Culling against a sphere there makes a tower
+/// whose base is just off the bottom of the screen vanish while its crystal is
+/// still plainly in view.
+pub const TOWER_HALF_H: f32 = 3.0;
+
+/// Cull radius for a tower, covering the structure and its crystal.
+pub const TOWER_CULL_R: f32 = 5.0;
+
 pub struct Scene {
     /// Ancestors cut into posable parts: `[ancestor][team][slot]`.
     pub god_parts: Vec<[[u64; SLOTS]; 2]>,
@@ -357,6 +375,13 @@ impl Scene {
         // towers
         let pulse = 0.55 + 0.45 * (vfx.time * 2.6).sin();
         for tw in &game.towers {
+            // Towers are tall, so their centre is well below their top: cull
+            // against a sphere around the MIDDLE of the structure, or a tower
+            // whose base is off-screen vanishes while its crystal is still in
+            // view.
+            if !sphere_in_frustum(&vp, tw.pos + Vec3::Y * TOWER_HALF_H, TOWER_CULL_R) {
+                continue;
+            }
             // WHO it is after: a tether from the crystal to whatever it is
             // aiming at, live -- it appears the tick you cross the line, not
             // when the first bolt lands. Hot and thick when it is the player.
@@ -427,6 +452,12 @@ impl Scene {
         let mut pevents = std::mem::take(&mut vfx.puppets.events);
         pevents.clear();
         let mut posed = Vec::new();
+        // GODS ARE DELIBERATELY NOT CULLED. There are ten of them, so the
+        // saving is negligible, and they carry effects -- tethers, auras, the
+        // beam a channelled ability draws -- that legitimately extend far past
+        // the body. A god culled by their own bounds takes their ability's
+        // visuals with them, and an ability that stops rendering while it is
+        // still hitting you is worse than ten extra draw calls.
         for i in 0..game.gods.len() {
             let g = &game.gods[i];
             if g.respawn_t > 0.0 {
@@ -514,6 +545,19 @@ impl Scene {
 
         // minions
         for m in &game.minions {
+            // ACTORS WERE NOT CULLED AT ALL. The static chunks above have gone
+            // through `sphere_in_frustum` since it was written; the minions,
+            // gods and towers never did. In a three-lane MOBA roughly two
+            // thirds of the minions are in lanes the camera is not looking at,
+            // and every one of them was posed, skinned and submitted.
+            //
+            // The radius is generous on purpose -- see `ACTOR_CULL_R`. A sphere
+            // fitted to the body pops when an arm or a tail swings outside it,
+            // and a pop at the screen edge is far more noticeable than the
+            // handful of extra draws a loose radius lets through.
+            if !sphere_in_frustum(&vp, m.pos, ACTOR_CULL_R) {
+                continue;
+            }
             let ti = m.team as usize;
             let bob = (m.walk_anim * 2.0).sin().abs() * 0.10;
             let lean = (m.walk_anim * 2.0).sin() * 0.06;

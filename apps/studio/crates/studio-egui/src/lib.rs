@@ -12,6 +12,7 @@
 //! collaborative editor whose collaboration is invisible is just an editor with
 //! a surprising undo history.
 
+pub mod filmstrip;
 pub mod beatgrid;
 pub mod group_graph;
 pub mod touch;
@@ -370,6 +371,12 @@ pub fn timeline(
     // clip whose audio has not been scanned yet is still editable — analysis
     // must never gate editing.
     peaks: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::Peaks>,
+    // What was said in each source, in source time. Sources without one draw
+    // no words — like peaks, a transcript must never gate editing.
+    words: &std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>,
+    // Decoded picture previews for video clips, and where the timeline lists
+    // the ones it wanted but did not have -- like peaks, never gating editing.
+    thumbs: &filmstrip::Thumbs,
     trim_side: TrimSide,
     // Compositions folded CLOSED on this device — view state, passed in
     // because open-or-closed is the workspace sidecar's business while
@@ -496,6 +503,28 @@ pub fn timeline(
             if !doc.peers_on(clip.id).is_empty() {
                 painter.rect_stroke(r.expand(1.5), 4.0, Stroke::new(2.0_f32, colors.warning), egui::StrokeKind::Outside);
             }
+            // picture previews along video clips: laid from the clip's own start,
+            // only the visible ones, decoded elsewhere (filmstrip.rs)
+            let has_video = track.kind == TrackKind::Video
+                && doc.project.sources.get(&clip.source).map(|s| s.has_video).unwrap_or(false);
+            if has_video && r.height() > 24.0 {
+                let body = Rect::from_min_max(Pos2::new(r.min.x, r.min.y + 15.0), Pos2::new(r.max.x, r.max.y - 1.0));
+                let tile_w = body.height() * 16.0 / 9.0;
+                let vis_x0 = r.min.x.max(origin.x + view.gutter);
+                let vis_x1 = r.max.x.min(rect.max.x);
+                let clip_painter = painter.with_clip_rect(Rect::from_min_max(Pos2::new(vis_x0, body.min.y), Pos2::new(vis_x1, body.max.y)));
+                for t in filmstrip::tiles(r.min.x, r.max.x, vis_x0, vis_x1, clip.src_in, clip.len, view.px_per_sec, tile_w) {
+                    let tr = Rect::from_min_size(Pos2::new(t.x, body.min.y), Vec2::new(t.w, body.height()));
+                    match thumbs.tex.get(&(clip.source, t.ms)) {
+                        Some(id) => {
+                            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new((t.w / tile_w).min(1.0), 1.0));
+                            clip_painter.image(*id, tr, uv, egui::Color32::from_white_alpha(if selected { 235 } else { 200 }));
+                        }
+                        None => thumbs.wanted.borrow_mut().push((clip.source, t.ms)),
+                    }
+                    clip_painter.line_segment([tr.left_top(), tr.left_bottom()], Stroke::new(1.0_f32, colors.bg_base.gamma_multiply(0.6)));
+                }
+            }
             // waveform, from the peak pyramid — one column per pixel, so the
             // cost of drawing a clip is its WIDTH, not its duration. This is
             // the whole reason Audacity's summary blocks are worth copying:
@@ -505,15 +534,22 @@ pub fn timeline(
                     Pos2::new(origin.x + view.gutter, r.min.y), r.max));
                 let cols = vis.width().floor() as usize;
                 if cols > 1 && vis.width() > 0.0 {
-                    let rate = doc.project.sources.get(&clip.source).map(|s| s.sample_rate).unwrap_or(48_000);
+                    // the rate the PEAKS were built at, not the one the project
+                    // records for the source -- they can disagree (the cartoon
+                    // fixture recorded 48 kHz over 16 kHz audio)
+                    let rate = if peaks.rate > 0 { peaks.rate }
+                        else { doc.project.sources.get(&clip.source).map(|s| s.sample_rate).unwrap_or(48_000) };
                     // sample range of the VISIBLE part of the clip
                     let skip = Ticks(((vis.min.x - r.min.x) / view.px_per_sec
                         * TICKS_PER_SECOND as f32) as i64);
                     let s0 = clip.src_in.saturating_add(skip).to_samples(rate) as usize;
                     let s1 = s0 + Ticks(((vis.width() / view.px_per_sec)
                         * TICKS_PER_SECOND as f32) as i64).to_samples(rate) as usize;
-                    let mid = vis.center().y;
-                    let half = (vis.height() * 0.5 - 3.0).max(1.0);
+                    let (mid, half) = if has_video && r.height() > 24.0 {
+                        let band = Rect::from_min_max(Pos2::new(vis.min.x, vis.center().y + 2.0), Pos2::new(vis.max.x, vis.max.y - 13.0));
+                        painter.rect_filled(band, 0.0, colors.bg_base.gamma_multiply(0.55));
+                        (band.center().y, (band.height() * 0.5 - 1.0).max(1.0))
+                    } else { (vis.center().y, (vis.height() * 0.5 - 3.0).max(1.0)) };
                     let wave = colors.text.gamma_multiply(0.55);
                     for (i, mm) in peaks.window(s0, s1, cols).iter().enumerate() {
                         let x = vis.min.x + i as f32;
@@ -524,11 +560,37 @@ pub fn timeline(
                     }
                 }
             }
+            // What is being said, along the clip's bottom edge — the gutter
+            // between this lane and the next. Laid out by
+            // `studio_voice::gutter_words`, so zoomed out it is an occasional
+            // word and zoomed in the whole line, and labels never collide.
+            if let Some(segs) = words.get(&clip.source) {
+                const CHAR_PX: f32 = 6.2;
+                let strip_y = r.max.y - 12.0;
+                if r.height() > 30.0 {
+                    painter.rect_filled(Rect::from_min_max(Pos2::new(r.min.x, strip_y - 1.0), r.max),
+                                        0.0, colors.bg_base.gamma_multiply(0.75));
+                }
+                for (dx, text) in studio_voice::gutter_words(segs, clip.src_in, clip.len,
+                                                              view.px_per_sec, CHAR_PX, 48.0) {
+                    let x = r.min.x + dx + 3.0;
+                    if x < origin.x + view.gutter || x > rect.max.x { continue; }
+                    painter.text(Pos2::new(x, strip_y), Align2::LEFT_TOP, text,
+                                 FontId::proportional(10.0), colors.text_weak);
+                }
+            }
             if r.width() > 34.0 {
+                // a pattern clip names its pattern ("Trap A"): it has no file, and
+                // labelled by path it showed no name at all
                 let name = doc.project.sources.get(&clip.source)
-                    .map(|s| s.path.rsplit('/').next().unwrap_or("clip").to_string())
+                    .map(|s| if s.is_generator() { s.display_name().to_string() }
+                             else { s.path.rsplit('/').next().unwrap_or("clip").to_string() })
                     .unwrap_or_else(|| "clip".into());
-                painter.text(r.left_top() + Vec2::new(4.0, 3.0), Align2::LEFT_TOP,
+                // pinned to the VISIBLE left edge: drawn at the clip's true edge, a
+                // clip scrolled off the left showed a cut-off fragment of its name
+                // behind the track header
+                let name_x = r.min.x.max(origin.x + view.gutter);
+                painter.text(Pos2::new(name_x, r.min.y) + Vec2::new(4.0, 3.0), Align2::LEFT_TOP,
                              name, FontId::proportional(11.0), colors.text);
             }
         }
@@ -1122,8 +1184,8 @@ mod drag_lifecycle_tests {
         // fixture to be wrong.
         ctx.run(input, |ctx| {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
-                out = timeline(ui, doc, view, &colors, Ticks::ZERO, &[], &peaks,
-                               TrimSide::Left, &closed, keys::Mode::Normal,
+                out = timeline(ui, doc, view, &colors, Ticks::ZERO, &[], &peaks, &Default::default(),
+                               &filmstrip::Thumbs::default(), TrimSide::Left, &closed, keys::Mode::Normal,
                                playkeys::InputMode::Motions, "", None);
             });
         });

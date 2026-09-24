@@ -56,10 +56,14 @@ pub struct GenParams {
     pub n_threads: i32,
     /// -1 = offload all layers to the GPU.
     pub n_gpu_layers: i32,
+    /// A GBNF grammar the sampler must obey (llama.cpp in-process and llama-server both honour it;
+    /// the wgpu engine ignores it). The agent loop sets it to the tool-fence grammar so a small model
+    /// cannot emit a malformed tool block. `None` for ordinary chat.
+    pub grammar: Option<String>,
 }
 impl Default for GenParams {
     fn default() -> Self {
-        Self { max_tokens: 512, reply_ceiling: 512, n_ctx: 4096, n_batch: 4096, temperature: 0.7, repeat_penalty: 1.15, min_p: 0.05, summarize_instead_of_squeeze: false, n_threads: 4, n_gpu_layers: -1 }
+        Self { max_tokens: 512, reply_ceiling: 512, n_ctx: 4096, n_batch: 4096, temperature: 0.7, repeat_penalty: 1.15, min_p: 0.05, summarize_instead_of_squeeze: false, n_threads: 4, n_gpu_layers: -1, grammar: None }
     }
 }
 
@@ -237,11 +241,16 @@ pub fn generate_stream(loaded: &LoadedModel, prompt: &str, params: &GenParams, c
     // Repetition penalty (params.repeat_penalty, default 1.15) FIRST in the chain — without it small/quant
     // models (e.g. Gemma) run away into repeated loops. penalty_last_n=64; freq/present penalties off.
     let penalties = LlamaSampler::penalties(64, params.repeat_penalty, 0.0, 0.0);
-    let mut sampler = if params.temperature <= 0.01 {
-        LlamaSampler::chain_simple([penalties, LlamaSampler::greedy()])
-    } else {
-        LlamaSampler::chain_simple([penalties, LlamaSampler::temp(params.temperature), LlamaSampler::dist(1234)])
-    };
+    // The grammar goes FIRST when set: it masks the vocabulary before penalties or temperature see
+    // it, which is what makes a malformed tool fence impossible rather than merely unlikely.
+    let mut chain: Vec<LlamaSampler> = Vec::new();
+    if let Some(g) = &params.grammar {
+        chain.push(LlamaSampler::grammar(&loaded.model, g, "root").map_err(|e| format!("grammar rejected by llama.cpp: {e}"))?);
+    }
+    chain.push(penalties);
+    if params.temperature <= 0.01 { chain.push(LlamaSampler::greedy()); }
+    else { chain.push(LlamaSampler::temp(params.temperature)); chain.push(LlamaSampler::dist(1234)); }
+    let mut sampler = LlamaSampler::chain_simple(chain);
 
     let mut n_cur = n_prompt as i32;
     let mut n_decoded = 0usize;

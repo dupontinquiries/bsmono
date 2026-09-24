@@ -288,3 +288,143 @@ mod tests {
                 "a refused finding justified a read: {:?}", s.ran);
     }
 }
+
+// ── the queen's output as a plan ──────────────────────────────────────────────────────────────────
+//
+// docs/12 says the Queen's output is a data structure. This is that structure: the probes were
+// deterministic (no model spent), so what is left for models is one cheap read per distinct file
+// and one integration, which is exactly a `hive::plan::Plan` with a fan-out wave and a dependent
+// wave. The roster supplies a persona per read task when it has one, and every survey miss is
+// written to the ledger as an absence — with the command that re-checks it — because "looked for
+// X, not there" is the cheapest evidence the survey produced and the first thing a reset loses.
+
+/// The shell command that re-runs a probe by hand. Not what the engine ran (that was in-process);
+/// what a person or `hive recheck` runs to see whether the absence still holds.
+pub fn probe_command(p: &Probe, scope: &str) -> String {
+    match p {
+        Probe::Grep { pattern, glob, .. } => match glob {
+            Some(g) => format!("rg -n -e {} -g '*{}' {}", shell_quote(pattern), g, scope),
+            None => format!("rg -n -e {} {}", shell_quote(pattern), scope),
+        },
+        Probe::Outline { path } => format!("rg -n '^\\s*(pub(\\([^)]*\\))? )?(fn|struct|enum|trait|impl|mod|type|const) ' {}", shell_quote(path)),
+        Probe::Symbol { name, path_hint } => format!("rg -n -w {} {}", shell_quote(name), path_hint.as_deref().unwrap_or(scope)),
+        Probe::Slice { path, first, last } => format!("sed -n '{first},{last}p' {}", shell_quote(path)),
+        Probe::Deps { krate, depth } => format!("cargo tree -p {} --depth {depth}", shell_quote(krate)),
+    }
+}
+
+fn shell_quote(s: &str) -> String { format!("'{}'", s.replace('\'', "'\\''")) }
+
+/// What a probe was looking for, in words, for the absence record.
+pub fn probe_subject(p: &Probe) -> String {
+    match p {
+        Probe::Grep { pattern, .. } => format!("`{pattern}` in the tree"),
+        Probe::Outline { path } => format!("symbols in {path}"),
+        Probe::Symbol { name, .. } => format!("symbol `{name}`"),
+        Probe::Slice { path, first, last } => format!("{path}:{first}-{last}"),
+        Probe::Deps { krate, .. } => format!("dependencies of {krate}"),
+    }
+}
+
+/// Every miss becomes an absence in the hive ledger. Returns how many were written.
+pub fn record_absences(s: &Session, scope: &str) -> usize {
+    let mut n = 0;
+    for (p, why) in &s.misses {
+        if hive::ledger::append(hive::ledger::Entry::Absence {
+            looked_for: probe_subject(p), did_not_find: why.clone(), command: probe_command(p, scope), scope: scope.to_string(), task: Some("queen".into()),
+        }).is_ok() { n += 1; }
+    }
+    n
+}
+
+/// Chars of finding text one read task gets: enough to answer from, small enough for a 3B.
+pub const READ_TASK_CHARS: usize = 3_000;
+
+/// The plan: one `read-<i>` worker per distinct file the survey admitted, then `answer`, an
+/// integrator that sees only the forwarded summaries and the list of what was looked for and not
+/// found. Personas come from the roster when it has one that fits.
+pub fn to_plan(question: &str, s: &Session, roster: Option<&crate::workerroster::WorkerRoster>) -> hive::plan::Plan {
+    use hive::plan::{Forward, Function, Plan, Route, Task};
+    let mut by_path: Vec<(String, String)> = Vec::new();
+    for f in &s.findings {
+        let text = format!("[{}:{}-{}]\n{}\n", f.path, f.first, f.last, f.text);
+        match by_path.iter_mut().find(|(p, _)| *p == f.path) {
+            Some((_, acc)) => { if acc.chars().count() < READ_TASK_CHARS { acc.push_str(&text); } }
+            None => by_path.push((f.path.clone(), text)),
+        }
+    }
+    let mut tasks = Vec::new();
+    for (i, (path, text)) in by_path.iter().enumerate() {
+        let text: String = text.chars().take(READ_TASK_CHARS).collect();
+        let prompt = format!("Question: {question}\n\nFrom this part of `{path}`, list only the facts that bear on the question, one per line, each with its line number. Say \"nothing relevant\" if that is true. Wrap the list in <forward></forward>.\n\n{text}");
+        tasks.push(Task { id: format!("read-{i}"), deps: vec![], role: hive::matrix::Role::Worker, function: Function::Build, route: Route::default(),
+            prompt, system: roster.and_then(|r| r.system_prompt(question)), max_tokens: 400, temperature: 0.0, forward: Forward { max_chars: 700 }, premise: vec![], verify: None });
+    }
+    let deps: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+    let evidence = if deps.is_empty() { "(no file evidence: the survey found nothing it could afford to read)".to_string() }
+        else { deps.iter().map(|d| format!("{{{{dep:{d}}}}}")).collect::<Vec<_>>().join("\n") };
+    let misses = if s.misses.is_empty() { String::new() } else {
+        format!("\n\nLooked for and did not find (do not guess about these):\n{}", s.misses.iter().map(|(p, why)| format!("- {}: {why}", probe_subject(p))).collect::<Vec<_>>().join("\n"))
+    };
+    let budget = if s.budget_exhausted { "\n\nThe survey ran out of budget, so the evidence is incomplete; say so." } else { "" };
+    tasks.push(Task { id: "answer".into(), deps, role: hive::matrix::Role::Integrator, function: Function::Integrate,
+        route: Route { min_tier: hive::matrix::Tier::Small, max_tier: hive::matrix::Tier::Large, allow_external: false, escalate_on_fail: true },
+        prompt: format!("Question: {question}\n\nEvidence, one block per file:\n{evidence}{misses}{budget}\n\nAnswer the question from the evidence only. Cite `path:line`. If the evidence does not settle it, say what would."),
+        system: None, max_tokens: 900, temperature: 0.0, forward: Forward { max_chars: 1_200 }, premise: vec![], verify: Some("test -n \"$OUT\"".into()) });
+    Plan { tasks }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn session() -> Session {
+        let mut s = Session::default();
+        s.findings.push(Finding { path: "src/a.rs".into(), first: 10, last: 14, text: "fn parse() {}".into() });
+        s.findings.push(Finding { path: "src/a.rs".into(), first: 40, last: 41, text: "parse(x)".into() });
+        s.findings.push(Finding { path: "src/b.rs".into(), first: 1, last: 3, text: "use a::parse;".into() });
+        s.misses.push((Probe::Grep { pattern: "frobnicate".into(), glob: Some(".rs".into()), max_hits: 12 }, "no matches".into()));
+        s
+    }
+
+    #[test]
+    fn one_read_per_file_then_an_integrator_that_sees_only_summaries() {
+        let plan = to_plan("where is parse defined?", &session(), None);
+        assert!(plan.validate().is_ok());
+        let waves = plan.waves().unwrap();
+        assert_eq!(waves, vec![vec!["read-0".to_string(), "read-1".to_string()], vec!["answer".to_string()]]);
+        let answer = plan.tasks.iter().find(|t| t.id == "answer").unwrap();
+        assert!(answer.prompt.contains("{{dep:read-0}}") && answer.prompt.contains("{{dep:read-1}}"));
+        assert!(answer.prompt.contains("did not find") && answer.prompt.contains("frobnicate"));
+        assert!(answer.route.escalate_on_fail);
+        let r0 = &plan.tasks[0];
+        assert!(r0.prompt.contains("src/a.rs") && r0.prompt.contains("[src/a.rs:10-14]") && r0.prompt.contains("[src/a.rs:40-41]"), "both findings of a file land in one read task");
+        assert!(r0.prompt.contains("<forward>"));
+    }
+
+    #[test]
+    fn misses_become_recheckable_absences() {
+        let dir = std::env::temp_dir().join(format!("queen-ledger-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("LOGSCOPE_LEDGER", dir.join("ledger.jsonl"));
+        let n = record_absences(&session(), "apps/logscope");
+        assert_eq!(n, 1);
+        let lines = hive::ledger::read_all();
+        let last = lines.last().unwrap();
+        match &last.entry {
+            hive::ledger::Entry::Absence { looked_for, command, scope, .. } => {
+                assert!(looked_for.contains("frobnicate"));
+                assert!(command.starts_with("rg -n -e 'frobnicate' -g '*.rs' apps/logscope"), "{command}");
+                assert_eq!(scope, "apps/logscope");
+            }
+            other => panic!("{other:?}"),
+        }
+        std::env::remove_var("LOGSCOPE_LEDGER");
+    }
+
+    #[test]
+    fn probe_commands_quote_what_a_shell_would_eat() {
+        assert_eq!(probe_command(&Probe::Grep { pattern: "it's".into(), glob: None, max_hits: 1 }, "."), "rg -n -e 'it'\\''s' .");
+        assert_eq!(probe_command(&Probe::Slice { path: "src/x.rs".into(), first: 5, last: 9 }, "."), "sed -n '5,9p' 'src/x.rs'");
+    }
+}

@@ -1,0 +1,242 @@
+{
+ "rod_l": {
+  "b": "spine",
+  "o": [
+   0,
+   38.98,
+   14.15
+  ],
+  "s": 0.5809,
+  "f": "stow",
+  "dis": [
+   0.28,
+   0.44
+  ],
+  "mo": null,
+  "src": "flyer:missile_l"
+ },
+ "side_rl": {
+  "b": "thigh_l",
+  "o": [
+   0,
+   -38.08,
+   -21.51
+  ],
+  "s": 0.5457,
+  "f": "armour",
+  "dis": [
+   0.7,
+   0.26
+  ],
+  "mo": "trim",
+  "src": "flyer:quarter_l"
+ },
+ "side_rr": {
+  "b": "thigh_r",
+  "o": [
+   0,
+   -38.08,
+   21.51
+  ],
+  "s": 0.5458,
+  "f": "armour",
+  "dis": [
+   0.71,
+   0.26
+  ],
+  "mo": "trim",
+  "src": "flyer:quarter_r"
+ },
+ "rod_r": {
+  "b": "spine",
+  "o": [
+   0,
+   38.98,
+   -14.15
+  ],
+  "s": 0.5809,
+  "f": "stow",
+  "dis": [
+   0.28,
+   0.44
+  ],
+  "mo": null,
+  "src": "flyer:missile_l"
+ },
+ "tail": {
+  "b": "chest",
+  "o": [
+   22.25,
+   36.72,
+   0
+  ],
+  "s": 0.5452,
+  "f": "stow",
+  "dis": [
+   0.26,
+   0.5
+  ],
+  "mo": null,
+  "src": "orion:roof"
+ },
+ "side_fl": {
+  "b": "shin_l",
+  "o": [
+   -19.89,
+   -34.05,
+   0
+  ],
+  "s": 0.3651,
+  "f": "armour",
+  "dis": [
+   0.37,
+   0.54
+  ],
+  "mo": "spike",
+  "src": "falcon:fender_r"
+ },
+ "fin_l": {
+  "b": "thigh_l",
+  "o": [
+   -13.83,
+   -52.84,
+   13.83
+  ],
+  "s": 0.7,
+  "f": "stow",
+  "dis": [
+   0.34,
+   0.6
+  ],
+  "mo": null,
+  "src": "falcon:frame_l"
+ },
+ "deck": {
+  "b": "chest",
+  "o": [
+   18.77,
+   36.72,
+   0
+  ],
+  "s": 0.4158,
+  "f": "stow",
+  "dis": [
+   0.26,
+   0.5
+  ],
+  "mo": null,
+  "src": "falcon:roof"
+ },
+ "fin_r": {
+  "b": "thigh_r",
+  "o": [
+   -13.83,
+   -52.84,
+   -13.83
+  ],
+  "s": 0.7,
+  "f": "stow",
+  "dis": [
+   0.34,
+   0.6
+  ],
+  "mo": null,
+  "src": "falcon:frame_l"
+ },
+ "side_fr": {
+  "b": "shin_r",
+  "o": [
+   -19.89,
+   -34.05,
+   0
+  ],
+  "s": 0.3651,
+  "f": "armour",
+  "dis": [
+   0.37,
+   0.54
+  ],
+  "mo": "spike",
+  "src": "falcon:fender_r"
+ },
+ "dome": {
+  "b": "pelvis",
+  "o": [
+   13.69,
+   18.38,
+   0
+  ],
+  "s": 0.3725,
+  "f": "stow",
+  "dis": [
+   0.28,
+   0.64
+  ],
+  "mo": null,
+  "src": "falcon:undertray"
+ },
+ "nose": {
+  "b": "head",
+  "o": [
+   -26.66,
+   15.6,
+   0
+  ],
+  "s": 0.2047,
+  "f": "armour",
+  "dis": [
+   0.4,
+   0.22
+  ],
+  "mo": null,
+  "src": "orion:lamp"
+ },
+ "pod_r": {
+  "b": "chest",
+  "o": [
+   17.21,
+   30.72,
+   17.21
+  ],
+  "s": 0.62,
+  "f": "stow",
+  "dis": [
+   0.19,
+   0.6
+  ],
+  "mo": null,
+  "src": "falcon:seat_r"
+ },
+ "pod_l": {
+  "b": "chest",
+  "o": [
+   17.21,
+   30.72,
+   -17.21
+  ],
+  "s": 0.62,
+  "f": "stow",
+  "dis": [
+   0.19,
+   0.6
+  ],
+  "mo": null,
+  "src": "falcon:seat_r"
+ },
+ "spoiler": {
+  "b": "spine",
+  "o": [
+   0,
+   38.98,
+   13.45
+  ],
+  "s": 0.3254,
+  "f": "stow",
+  "dis": [
+   0.2,
+   0.58
+  ],
+  "mo": null,
+  "src": "falcon:glass_front"
+ }
+}

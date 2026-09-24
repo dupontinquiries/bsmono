@@ -177,16 +177,14 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcode::{EncodeOpts, FrameEncoder};
 
-    /// A real .fao written by the same encoder the Encode page uses (no ffmpeg needed).
+    /// A real .fao of DCT key frames (no ffmpeg needed).
     fn make_fao(path: &Path, frames: usize) {
         let (w, h) = (64, 48);
-        let mut enc = FrameEncoder::new(w, h, EncodeOpts::inter(70));
         let cf: Vec<_> = (0..frames).map(|f| {
             let rgb: Vec<u8> = (0..w * h * 3).map(|i| ((i / 3 + f * 5) % 256) as u8).collect();
-            let e = enc.encode(&rgb);
-            (Vec::new(), e.payload.clone(), e.stat.marker, e.payload.len(), 0.0f64, 0.0f64)
+            let p = fao_v1::compress_frame_dct(&crate::decode::rgb_to_yuv420p(&rgb, w, h), w, h, 70);
+            (Vec::new(), p.clone(), b'D', p.len(), 0.0f64, 0.0f64)
         }).collect();
         let mut out = Vec::new();
         fao_v1::write_fao_container(&mut out, w, h, 25.0, 0.7, &cf).unwrap();
@@ -276,7 +274,7 @@ mod tests {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 uikit_egui::fonts::install(ctx);
                 if frame == 1 {
-                    for c in ['⏺', '🎞', '⏱', '🔗', '▶', '🗄', '⚙'] {
+                    for c in ['⏺', '🎞', '⏱', '🔗', '🗂', '▶', '🗄', '⚙'] {
                         // epaint's glyph table is the authority; uikit's metric probe can
                         // report a real glyph as tofu when their advances coincide (its doc
                         // says so). Record both so a disagreement is visible.

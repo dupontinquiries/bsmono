@@ -470,6 +470,7 @@ version = "0.1.0"
 dependencies = [
  "drivemind-core",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

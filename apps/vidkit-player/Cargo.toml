@@ -22,6 +22,10 @@ egui = "0.34"
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
 
 vidkit-core = { path = "../../shared/vidkit/crates/vidkit-core" }
+# fcntl(F_SETPIPE_SZ / F_GETPIPE_SZ) on the audio player's stdin: Linux's
+# default 64 KB pipe holds ~340 ms of 48 kHz stereo, all of it "written" but not
+# yet heard. Already in the lockfile transitively.
+libc = "0.2"
 # The runtime device probe, which replaces a target-triple guess.
 vidkit-v4l2 = { path = "../../shared/vidkit/crates/vidkit-v4l2" }
 # The IO wrappers in src/io.rs implement its CommandRunner and HttpTransport.

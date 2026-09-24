@@ -586,13 +586,21 @@ pub struct Settings {
     pub invert_y: bool,
     pub touch_enabled: bool,
     pub touch_scale: f32,
+    /// What a flick does when the finger lifts. See `crate::glide`.
+    ///
+    /// `Light` by default rather than `Rigid`: the carry is short enough that
+    /// a player who never flicks will not notice it, and long enough that one
+    /// who does gets the overlap. Someone who wants the old behaviour exactly
+    /// picks Rigid, and someone who wants to flick-and-reach picks Smooth.
+    pub touch_glide: crate::glide::Glide,
     /// Hold-to-aim vs tap: abilities fire on press (true) or on release (false).
     pub cast_on_press: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { mouse_sens: 1.0, pad_sens: 1.0, invert_y: false, touch_enabled: false, touch_scale: 1.0, cast_on_press: true }
+        Settings { mouse_sens: 1.0, pad_sens: 1.0, invert_y: false, touch_enabled: false, touch_scale: 1.0, cast_on_press: true,
+                   touch_glide: crate::glide::Glide::Light }
     }
 }
 
@@ -604,6 +612,14 @@ impl Settings {
         let _ = writeln!(out, "invert_y {}", self.invert_y as u8);
         let _ = writeln!(out, "touch {}", self.touch_enabled as u8);
         let _ = writeln!(out, "touch_scale {:.3}", self.touch_scale);
+        // Saved by NAME, not by index. An enum written as 0/1/2 silently
+        // changes meaning the day a mode is inserted, and the player's config
+        // would then mean something they never chose.
+        let _ = writeln!(out, "touch_glide {}", match self.touch_glide {
+            crate::glide::Glide::Smooth => "smooth",
+            crate::glide::Glide::Light => "light",
+            crate::glide::Glide::Rigid => "rigid",
+        });
         let _ = writeln!(out, "cast_on_press {}", self.cast_on_press as u8);
     }
     pub fn load_line(&mut self, key: &str, rest: &str) -> bool {
@@ -614,6 +630,13 @@ impl Settings {
             "pad_sens" => self.pad_sens = f().unwrap_or(1.0).clamp(0.1, 5.0),
             "invert_y" => self.invert_y = b(),
             "touch" => self.touch_enabled = b(),
+            "touch_glide" => self.touch_glide = match rest.trim() {
+                "smooth" => crate::glide::Glide::Smooth,
+                "rigid" => crate::glide::Glide::Rigid,
+                // An unknown value is the default, not a parse failure: a
+                // config from a newer build should not stop this one loading.
+                _ => crate::glide::Glide::Light,
+            },
             "touch_scale" => self.touch_scale = f().unwrap_or(1.0).clamp(0.5, 2.0),
             "cast_on_press" => self.cast_on_press = b(),
             _ => return false,

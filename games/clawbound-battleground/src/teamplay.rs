@@ -152,7 +152,16 @@ impl Call {
                 return Call { objective: d, made_t: now_t, committed: v.available };
             }
         }
-        if held < CALL_MIN_HOLD && still_possible {
+        // FARM IS NOT A COMMITMENT, so it never holds. Holding exists to stop
+        // the team abandoning a walk halfway; farming is what the team does
+        // when it has nowhere to be, and there is nothing to abandon.
+        //
+        // Without this, `Call::default()` -- Farm at made_t 0.0 -- counted as
+        // a call being held, so at game start the team was pinned to Farm for
+        // the first six seconds and ignored a titan it could have taken. The
+        // default state was masquerading as a decision.
+        let committed_to_something = self.objective.is_grouped();
+        if committed_to_something && held < CALL_MIN_HOLD && still_possible {
             return self;
         }
 
@@ -348,6 +357,35 @@ mod tests {
     fn farming_never_binds() {
         let call = Call { objective: Objective::Farm, made_t: 0.0, committed: 5 };
         assert!(!call.binds(1.0, false));
+    }
+
+    /// THE DEFAULT STATE IS NOT A DECISION. `Call::default()` is Farm at
+    /// made_t 0.0, and treating that as a held call pinned the team to farming
+    /// for the first six seconds of the match -- ignoring a titan it could
+    /// have taken, at exactly the moment a fresh team is grouped.
+    ///
+    /// Five tests failed on this and all five were this one rule. Written
+    /// before the module ever ran, which is how it shipped.
+    #[test]
+    fn farming_never_holds_so_the_opening_is_not_wasted() {
+        let mut v = view(4, 0);
+        v.titan_exposed = Some(0.1);
+        // t = 0, straight from default: inside any hold window.
+        let call = Call::default().decide(&v, 0.0);
+        assert_eq!(call.objective, Objective::Titan,
+                   "a fresh team must be able to act immediately");
+    }
+
+    /// ...but a real commitment still holds, or the fix would have removed
+    /// hysteresis altogether.
+    #[test]
+    fn a_grouped_call_still_holds_after_the_fix() {
+        let mut v = view(4, 0);
+        let pushing = Call::default().decide(&v, 0.0);
+        assert!(pushing.objective.is_grouped());
+        v.boss_up = true;
+        assert_eq!(pushing.decide(&v, 1.0).objective, pushing.objective,
+                   "a commitment is not abandoned one second in");
     }
 
     /// A held call keeps its timestamp, so "held for 9 seconds" is readable

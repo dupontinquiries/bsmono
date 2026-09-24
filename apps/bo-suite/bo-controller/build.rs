@@ -68,6 +68,18 @@ fn run_qml_lint() {
                   (install qt6-base-dev or qt5-qttools to enable)");
         return;
     };
+    // WHICH Qt this qmllint belongs to decides what is fatal -- see
+    // `qmllint_line_fails`. This code is Qt 5; a Qt 6 qmllint's style warnings
+    // are reported, not treated as breakage.
+    let qt_major = Command::new(bin).arg("--version").output().ok().and_then(|o| {
+        qmllint_qt_major(&format!("{}{}", String::from_utf8_lossy(&o.stdout),
+                                          String::from_utf8_lossy(&o.stderr)))
+    });
+    if qt_major != Some(5) {
+        println!("cargo:warning={bin} is Qt {} — this code is Qt 5, so its warnings \
+                  are shown but not fatal; errors and binding bugs still fail the build",
+                 qt_major.map(|m| m.to_string()).unwrap_or_else(|| "?".into()));
+    }
     let qml_dir = std::path::Path::new("qml");
     let entries = match std::fs::read_dir(qml_dir) {
         Ok(e) => e,
@@ -77,6 +89,10 @@ fn run_qml_lint() {
         }
     };
     let mut failures: Vec<(String, String)> = Vec::new();
+    // Warnings a non-Qt-5 qmllint raised: reported, not fatal. Kept rather
+    // than dropped -- a first version of this dropped them silently while its
+    // own message claimed they were shown.
+    let mut advisories: Vec<(String, String)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("qml") {
@@ -96,17 +112,22 @@ fn run_qml_lint() {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
-        let has_issue = combined.lines().any(|line| {
-            line.starts_with("Error")
-                || line.starts_with("Warning")
-                || line.starts_with("[Warning]")
-                || line.starts_with("[Error]")
-                || line.contains(": Cannot assign")
-                || line.contains(": Connections: Detected function")
-                || line.contains("Unable to assign")
-        });
+        let has_issue = combined.lines().any(|line| qmllint_line_fails(line, qt_major));
         if has_issue {
             failures.push((basename.to_string(), combined));
+        } else if combined.lines().any(|l| l.starts_with("Warning") || l.starts_with("[Warning]")) {
+            advisories.push((basename.to_string(), combined));
+        }
+    }
+    if !advisories.is_empty() {
+        // Capped: a Qt 6 lint flags nearly every file of Qt 5 code, and
+        // forty-odd files of it would bury the rest of the build log.
+        println!("cargo:warning={bin} (Qt {}) flagged {} file(s) -- advisory for this Qt 5 code; first few:",
+                 qt_major.map(|m| m.to_string()).unwrap_or_else(|| "?".into()), advisories.len());
+        for (name, out) in advisories.iter().take(3) {
+            for line in out.lines().filter(|l| !l.trim().is_empty()).take(2) {
+                println!("cargo:warning=    {name}: {line}");
+            }
         }
     }
     if !failures.is_empty() {

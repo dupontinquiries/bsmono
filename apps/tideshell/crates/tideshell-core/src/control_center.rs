@@ -27,10 +27,68 @@ pub enum QuickKind {
     Carousel,
     /// Ambient light + time of day brightness (shell-owned, see `ambient`).
     AutoBrightness,
+    /// cpupower's scaling governor. A three-way CYCLE, not an on/off toggle --
+    /// see `CpuGovernor` -- so it is a mode tile like Keyboard/Trackpad/Carousel:
+    /// routed specially in `Shell::tap_quick`, skipped by `toggle_system`.
+    CpuGovernor,
+}
+
+/// The three governors this shell offers, in cycle order.
+///
+/// Not the FULL set cpufreq supports -- `schedutil`, `userspace` and `ondemand`
+/// exist too -- but the three a person actually reasons about day to day, named
+/// the way `cpupower frequency-set -g <name>` and every kernel's
+/// `scaling_available_governors` name them. `conservative` is common on
+/// mobile/ARM cpufreq drivers but ABSENT on some modern desktop kernels that
+/// dropped it for `schedutil`; the executor (tideshell-egui) is what checks
+/// the running kernel's `scaling_available_governors` and skips a name it does
+/// not actually offer -- this cycle is unconditional and pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CpuGovernor {
+    /// Lowest clocks the driver allows; `powersave`.
+    Powersave,
+    /// Scales with load more cautiously than `ondemand`; `conservative`.
+    Conservative,
+    /// Highest clocks the driver allows; `performance`.
+    Performance,
+}
+
+impl CpuGovernor {
+    pub const ALL: [CpuGovernor; 3] = [CpuGovernor::Powersave, CpuGovernor::Conservative, CpuGovernor::Performance];
+
+    /// The exact string a kernel's `scaling_governor` file takes and
+    /// `scaling_available_governors` reports.
+    pub fn token(self) -> &'static str {
+        match self {
+            CpuGovernor::Powersave => "powersave",
+            CpuGovernor::Conservative => "conservative",
+            CpuGovernor::Performance => "performance",
+        }
+    }
+    pub fn from_token(s: &str) -> Option<CpuGovernor> {
+        CpuGovernor::ALL.into_iter().find(|g| g.token() == s)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            CpuGovernor::Powersave => "Power saver",
+            CpuGovernor::Conservative => "Balanced",
+            CpuGovernor::Performance => "Performance",
+        }
+    }
+    /// The next state in the cycle, wrapping. Unconditional -- whether the
+    /// RUNNING kernel actually offers it is the executor's question, not this
+    /// pure rotation's.
+    pub fn next(self) -> CpuGovernor {
+        match self {
+            CpuGovernor::Powersave => CpuGovernor::Conservative,
+            CpuGovernor::Conservative => CpuGovernor::Performance,
+            CpuGovernor::Performance => CpuGovernor::Powersave,
+        }
+    }
 }
 
 impl QuickKind {
-    pub const ALL: [QuickKind; 11] = [
+    pub const ALL: [QuickKind; 12] = [
         QuickKind::Wifi,
         QuickKind::Bluetooth,
         QuickKind::MobileData,
@@ -42,6 +100,7 @@ impl QuickKind {
         QuickKind::Trackpad,
         QuickKind::Carousel,
         QuickKind::AutoBrightness,
+        QuickKind::CpuGovernor,
     ];
 
     pub fn token(self) -> &'static str {
@@ -57,6 +116,7 @@ impl QuickKind {
             QuickKind::Trackpad => "trackpad",
             QuickKind::Carousel => "carousel",
             QuickKind::AutoBrightness => "auto-brightness",
+            QuickKind::CpuGovernor => "cpu-governor",
         }
     }
 
@@ -77,12 +137,14 @@ impl QuickKind {
             QuickKind::Trackpad => "Trackpad",
             QuickKind::Carousel => "Carousel",
             QuickKind::AutoBrightness => "Auto bright",
+            QuickKind::CpuGovernor => "CPU mode",
         }
     }
 
     /// Shell-mode tiles are owned by `Shell::modes`, not by this drawer.
     pub fn is_mode(self) -> bool {
-        matches!(self, QuickKind::Keyboard | QuickKind::Trackpad | QuickKind::Carousel | QuickKind::AutoBrightness)
+        matches!(self, QuickKind::Keyboard | QuickKind::Trackpad | QuickKind::Carousel
+                     | QuickKind::AutoBrightness | QuickKind::CpuGovernor)
     }
 }
 
@@ -134,6 +196,11 @@ pub struct ControlCenter {
     system: Vec<(QuickKind, bool)>,
     pub brightness: f32,
     pub volume: f32,
+    /// The DISPLAYED governor. A placeholder at startup -- the executor
+    /// corrects it once the running kernel's actual value is read back (see
+    /// `set_governor_state`), the same "reported by a backend" pattern
+    /// `set_system_state` documents for the boolean tiles.
+    pub governor: CpuGovernor,
 }
 
 impl Default for ControlCenter {
@@ -148,6 +215,7 @@ impl Default for ControlCenter {
             system: Vec::new(),
             brightness: 0.6,
             volume: 0.5,
+            governor: CpuGovernor::Powersave,
         }
     }
 }
@@ -232,6 +300,19 @@ impl ControlCenter {
         }
     }
 
+    /// The governor as read back from the kernel -- see `governor`'s doc.
+    pub fn set_governor_state(&mut self, g: CpuGovernor) {
+        self.governor = g;
+    }
+
+    /// Advance the displayed governor and emit the action; `Shell::tap_quick`
+    /// routes `CpuGovernor` here instead of `toggle_system`, the same way it
+    /// routes the other mode tiles.
+    pub fn cycle_governor(&mut self) -> Action {
+        self.governor = self.governor.next();
+        Action::SetGovernor(self.governor)
+    }
+
     /// Tap on a system tile. Mode tiles are routed by the shell instead.
     pub fn toggle_system(&mut self, kind: QuickKind) -> Option<Action> {
         if kind.is_mode() {
@@ -271,6 +352,49 @@ impl ControlCenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cycle_visits_all_three_and_wraps() {
+        let g = CpuGovernor::Powersave;
+        let a = g.next();
+        let b = a.next();
+        let c = b.next();
+        assert_eq!([g, a, b, c], [CpuGovernor::Powersave, CpuGovernor::Conservative,
+                                   CpuGovernor::Performance, CpuGovernor::Powersave]);
+    }
+
+    #[test]
+    fn tokens_round_trip_through_from_token() {
+        for g in CpuGovernor::ALL {
+            assert_eq!(CpuGovernor::from_token(g.token()), Some(g));
+        }
+        assert_eq!(CpuGovernor::from_token("schedutil"), None, "not one of the three offered");
+    }
+
+    #[test]
+    fn cycle_governor_advances_and_reports_the_action() {
+        let mut cc = ControlCenter::default();
+        assert_eq!(cc.governor, CpuGovernor::Powersave, "default");
+        assert_eq!(cc.cycle_governor(), Action::SetGovernor(CpuGovernor::Conservative));
+        assert_eq!(cc.governor, CpuGovernor::Conservative);
+        assert_eq!(cc.cycle_governor(), Action::SetGovernor(CpuGovernor::Performance));
+        assert_eq!(cc.cycle_governor(), Action::SetGovernor(CpuGovernor::Powersave), "wraps");
+    }
+
+    /// A tile the SHELL routes specially, not the drawer's own boolean toggle.
+    #[test]
+    fn cpu_governor_is_a_mode_tile_not_a_system_toggle() {
+        assert!(QuickKind::CpuGovernor.is_mode());
+        let mut cc = ControlCenter::default();
+        assert_eq!(cc.toggle_system(QuickKind::CpuGovernor), None, "mode tiles are routed by the shell");
+    }
+
+    #[test]
+    fn a_backend_reported_governor_updates_the_display() {
+        let mut cc = ControlCenter::default();
+        cc.set_governor_state(CpuGovernor::Performance);
+        assert_eq!(cc.governor, CpuGovernor::Performance);
+    }
 
     fn settle(cc: &mut ControlCenter) {
         for _ in 0..200 {

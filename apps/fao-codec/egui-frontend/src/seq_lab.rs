@@ -31,6 +31,37 @@
 //! encoder unmodified, so a regression in the codec shows up here rather than
 //! being smoothed out by the page displaying it.
 
+/// T-FRAME SIZES IN THIS LAB ARE ESTIMATED, NOT MEASURED.
+///
+/// Traced through `fao_codec_lib`. `V2Encoder::encode_frame` does its scene-
+/// graph analysis and then encodes through `self.v1_fallback` -- "Encode using
+/// v1 (for now -- graph guidance will replace this)" -- so every number here is
+/// v1's. And in v1's `VideoEncoder::encode_frame`:
+///
+///   * a K (I) frame is REALLY serialised: `encode_iframe_420` returns a
+///     `stream`, and its size is `stream.len()`.
+///   * a T (P) frame is NEVER serialised. Its size is modelled: on the CPU path
+///     by `est_bits_dpcm` over the residual coefficients, and on the GPU path
+///     by a flat `total_bits += 200` per coded block and 2 per skip.
+///
+/// Consequences worth knowing before trusting a run:
+///
+///   * the picture IS reconstructed, so PSNR and skip % are real;
+///   * T/K divides a measured size by a modelled one;
+///   * the CPU and GPU paths model differently, so the SAME video can report
+///     different T sizes depending on whether a GPU was present;
+///   * there are no T-frame bytes, so a temporal encode cannot be exported --
+///     which is why `export` writes DCT I-frames only.
+///
+/// Making T sizes real means writing a P-frame bitstream serialiser and a
+/// decoder that reads it back: codec work, not a frontend fix.
+pub const T_BITS_ARE_ESTIMATED: bool = true;
+
+/// The hover text on the estimated rows. Short, because it is a tooltip.
+pub const T_BITS_NOTE: &str = "T-frame sizes are modelled by the encoder, not measured: \
+P-frames are never serialised. PSNR is real; T bits and T/K are estimates, and \
+differ between the CPU and GPU paths.";
+
 /// One frame's report, as `FrameResult` gives it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrameStat {
@@ -90,6 +121,11 @@ impl SeqRun {
     }
 
     /// How much cheaper a T-frame is than a K-frame, as a ratio.
+    ///
+    /// A MEASURED NUMBER DIVIDED BY AN ESTIMATE -- see [`T_BITS_ARE_ESTIMATED`].
+    /// K bits are the real length of a serialised I-frame; T bits are modelled.
+    /// It is a useful signal about the encoder's decisions, and it is not a
+    /// compression ratio anyone could reproduce from a file.
     ///
     /// The single number this page exists to produce. `None` when the run has
     /// no frames of one kind, because a ratio against nothing is not a ratio.
@@ -163,10 +199,13 @@ pub fn seq_lab_ui(ui: &mut egui::Ui, run: &SeqRun, c: &uikit_egui::PaletteColors
         ui.colored_label(c.text_weak, "Mean K bits");
         ui.colored_label(c.text, dash(run.mean_bits(true), ""));
         ui.end_row();
-        ui.colored_label(c.text_weak, "Mean T bits");
+        // ESTIMATED, and labelled so. See `T_BITS_ARE_ESTIMATED`.
+        ui.colored_label(c.text_weak, "Mean T bits (est.)")
+            .on_hover_text(T_BITS_NOTE);
         ui.colored_label(c.text, dash(run.mean_bits(false), ""));
         ui.end_row();
-        ui.colored_label(c.text_weak, "T/K ratio");
+        ui.colored_label(c.text_weak, "T/K ratio (est.)")
+            .on_hover_text(T_BITS_NOTE);
         ui.colored_label(c.text, dash(run.temporal_ratio(), ""));
         ui.end_row();
         ui.colored_label(c.text_weak, "Mean PSNR");

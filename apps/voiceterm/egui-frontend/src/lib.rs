@@ -443,6 +443,42 @@ pub mod action_compass;
 pub mod shell;
 pub mod surface;   // which transient surface is up — the QML's modality, as state (C10-0a)
 pub mod overlay;   // how each surface draws — the QML's modal forms (drawer/sheet/popup)
+/// The voice popup, or an inert stand-in for it.
+///
+/// `voice` is on in `app` because this is a voice terminal. It is separable
+/// because dictation is the only thing here that needs whisper-rs, which needs
+/// bindgen, which must dlopen libclang at build time — impossible on a
+/// static-musl target, reported from aarch64-unknown-linux-musl as "Dynamic
+/// loading not supported".
+///
+/// The stub carries the SAME API rather than the call sites being gated. Nine
+/// `#[cfg]`s through a draw loop is how a build configuration nobody runs
+/// stops compiling without anyone noticing; one stub is checked by the
+/// compiler on every build.
+#[cfg(feature = "voice")]
+pub use uikit_egui::voice_popup;
+
+#[cfg(not(feature = "voice"))]
+pub mod voice_popup {
+    /// Inert stand-in. Every method is the "nothing happened" answer, which is
+    /// what the callers already do when a dictation attempt fails.
+    #[derive(Debug, Default)]
+    pub struct VoicePopup;
+
+    impl VoicePopup {
+        /// `false` — the same answer as a microphone that would not open, so
+        /// the caller's existing failure path handles it.
+        pub fn start(&mut self, _password_mode: bool) -> bool { false }
+        pub fn cancel(&mut self) {}
+        pub fn finish(&mut self) {}
+        /// `false` — nothing became ready.
+        pub fn tick(&mut self) -> bool { false }
+        /// Draws nothing. Not even a "voice unavailable" notice: this build
+        /// has no voice controls to press, so there is nothing to explain.
+        pub fn draw(&mut self, _ui: &mut egui::Ui, _colors: &uikit_egui::PaletteColors) {}
+    }
+}
+
 // ctrl_p_gesture and voice_popup moved to shared/uikit/crates/uikit-egui
 // (voice-popup feature) -- generic, zero voiceterm-specific dependencies,
 // so every egui app gets the same API instead of a per-app copy. Used

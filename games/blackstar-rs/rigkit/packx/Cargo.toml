@@ -1,0 +1,11 @@
+[package]
+name = "packx"
+version = "0.1.0"
+edition = "2021"
+
+# Borrows blackstar-rs's own botpack reader rather than reimplementing it: the
+# format has v3 delta-coded indices, v4 zstd frames and quantised positions,
+# and the repo's reader is the one that is known to be right.
+[dependencies]
+miniz_oxide = "0.8"
+ruzstd = "0.7"

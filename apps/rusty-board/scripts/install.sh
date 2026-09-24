@@ -170,6 +170,21 @@ $SUDO cp -R "$PROJECT_ROOT/resources/." "$SHARE_DIR/"
 # the keyboard disappears from SystemSettings → Virtual Keyboard.
 # Past regression: this template lacked the magic line and broke
 # registration after a re-install.
+# D-Bus ACTIVATION. tideshell (and anything else) asks for the keyboard by its
+# bus name, io.rustyboard.Keyboard. Without this file the bus answers "not
+# activatable" and nothing starts it -- found on the FP5, where the keyboard,
+# once OOM-killed, never came back. SystemdService hands the start to the user
+# unit, so its resource limits and restart policy apply.
+DBUS_SERVICES_DIR="$PREFIX/share/dbus-1/services"
+$SUDO install -d "$DBUS_SERVICES_DIR"
+cat > "$DBUS_SERVICES_DIR/io.rustyboard.Keyboard.service" <<DBUS
+[D-BUS Service]
+Name=io.rustyboard.Keyboard
+Exec=$BIN_DIR/rusty-board
+SystemdService=rusty-board.service
+DBUS
+echo "==> D-Bus activation: $DBUS_SERVICES_DIR/io.rustyboard.Keyboard.service"
+
 DESKTOP_FILE="$APPLICATIONS_DIR/io.rustyboard.Keyboard.desktop"
 $SUDO tee "$DESKTOP_FILE" >/dev/null <<EOF
 [Desktop Entry]
