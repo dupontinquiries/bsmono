@@ -610,6 +610,9 @@ fn main() {
     // Side surfaces (bar, peeks) each get their own egui context (own
     // textures, own input), created on first use.
     let mut side_ctx: HashMap<Role, egui::Context> = HashMap::new();
+    /// When each side surface next wants to run, from egui's own
+    /// `repaint_delay`.
+    let mut side_due: HashMap<Role, u64> = HashMap::new();
     let mut side_events: HashMap<Role, Vec<egui::Event>> = HashMap::new();
     let mut side_pos: HashMap<(Role, i32), Pos2> = HashMap::new();
 
@@ -1049,6 +1052,7 @@ fn main() {
             let Some(t) = io.side(role) else {
                 gl.unbind(role);
                 side_events.remove(&role);
+                side_due.remove(&role);
                 continue;
             };
             t.prepare(&mut io);
@@ -1057,10 +1061,20 @@ fn main() {
             if gl.bind(role, &t.surface, size_px).is_err() {
                 continue;
             }
+            let events = side_events.remove(&role).unwrap_or_default();
+            // egui already says when it wants nothing more: `repaint_delay`
+            // from the previous run. Honouring it skips running the UI and
+            // tessellating at all for a surface that has nothing to do —
+            // which is where the per-frame allocations live, so this is a
+            // step earlier than the frame-hash skip, which only saves the
+            // fill. An input event always runs, whatever the delay said.
+            if events.is_empty() && side_due.get(&role).is_some_and(|due| now_ms < *due) {
+                continue;
+            }
             let mut raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h))),
                 time: Some(t0.elapsed().as_secs_f64()),
-                events: side_events.remove(&role).unwrap_or_default(),
+                events,
                 focused: true,
                 ..Default::default()
             };
@@ -1082,6 +1096,12 @@ fn main() {
                     };
                 });
             });
+            // When the next frame is due, from egui's own scheduling. A
+            // delay it reports as very large means "never until something
+            // happens"; cap it so a surface cannot wedge itself if a
+            // wake-up is ever missed.
+            let delay_ms = out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay.as_millis()).unwrap_or(0);
+            side_due.insert(role, now_ms + delay_ms.min(1_000) as u64);
             let prims = ctx_side.tessellate(out.shapes, out.pixels_per_point);
             // Skip a surface whose frame is identical to the one already on
             // screen. Tessellation has happened either way; what is saved is
