@@ -250,11 +250,26 @@ fn rig_world(dim: &HeroDims, base_y: f32, rot: &[[f32; 3]; NPIV]) -> [Xf; NPIV] 
 // the feet can be grounded to y=0 for any dims/pose). Three→engine axis remap:
 // the forge character faces +Z, so engine forward(X)=three Z, up(Y)=three Y,
 // width(Z)=−three X (a proper 90° turn so the hero faces the look direction).
-struct Body { verts: Vec<EntityVertex>, indices: Vec<u32>, cy: f32, sy: f32 }
+struct Body { verts: Vec<EntityVertex>, indices: Vec<u32>, cy: f32, sy: f32, markers: Vec<[f32; 3]> }
 
 impl Body {
     fn new(yaw: f32) -> Self {
-        Body { verts: Vec::new(), indices: Vec::new(), cy: yaw.cos(), sy: yaw.sin() }
+        Body { verts: Vec::new(), indices: Vec::new(), cy: yaw.cos(), sy: yaw.sin(), markers: Vec::new() }
+    }
+    /// The pivot-local point `lp`, through EXACTLY the steps a vertex takes in
+    /// `part` (pivot world xf, three->engine remap, body yaw). Kept separate
+    /// from `part` only so no box is emitted.
+    fn place(&self, xf: &Xf, lp: [f32; 3]) -> [f32; 3] {
+        let w = xf.apply(lp);
+        let (ex, ey, ez) = (w[2], w[1], -w[0]);
+        [ex * self.cy - ez * self.sy, ey, ex * self.sy + ez * self.cy]
+    }
+    /// Record a named point (an anchor: the eyes, a hand) that `finalize` moves
+    /// with the vertices, so it can never disagree with the drawn body.
+    fn mark(&mut self, xf: &Xf, lp: [f32; 3]) -> usize {
+        let p = self.place(xf, lp);
+        self.markers.push(p);
+        self.markers.len() - 1
     }
     /// Emit one box: `size` in voxel units, `center` in the pivot's local frame
     /// (world units), transformed by the pivot's world `xf`.
@@ -265,13 +280,10 @@ impl Body {
             for &dy in &[-1.0f32, 1.0] {
                 for &dz in &[-1.0f32, 1.0] {
                     let lp = [center[0] + dx * h[0], center[1] + dy * h[1], center[2] + dz * h[2]];
-                    let w = xf.apply(lp); // three-space world
-                    // remap three → engine: ex = tz, ey = ty, ez = -tx
-                    let (ex, ey, ez) = (w[2], w[1], -w[0]);
-                    // body yaw about engine Y
-                    let rx = ex * self.cy - ez * self.sy;
-                    let rz = ex * self.sy + ez * self.cy;
-                    self.verts.push(EntityVertex { position: [rx, ey, rz], color, alpha: 1.0 });
+                    // three-space world, remapped to engine (ex = tz, ey = ty,
+                    // ez = -tx), then body yaw about engine Y -- see `place`.
+                    let position = self.place(xf, lp);
+                    self.verts.push(EntityVertex { position, color, alpha: 1.0 });
                 }
             }
         }
@@ -288,7 +300,7 @@ impl Body {
     /// Ground the feet to y=0, uniformly scale the model to `target_height`
     /// blocks (about the rig's local origin, which is already centred), add the
     /// `bob`, and translate to the origin.
-    fn finalize(mut self, origin: [f32; 3], bob: f32, target_height: f32) -> (Vec<EntityVertex>, Vec<u32>) {
+    fn finalize(mut self, origin: [f32; 3], bob: f32, target_height: f32) -> (Vec<EntityVertex>, Vec<u32>, Vec<[f32; 3]>) {
         let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
         for v in &self.verts {
             min_y = min_y.min(v.position[1]);
@@ -300,12 +312,12 @@ impl Body {
         }
         let span = (max_y - min_y).max(1e-3);
         let scale = (target_height / span).max(1e-3);
+        let to_world = |p: [f32; 3]| [origin[0] + p[0] * scale, origin[1] + bob + (p[1] - min_y) * scale, origin[2] + p[2] * scale];
         for v in self.verts.iter_mut() {
-            v.position[0] = origin[0] + v.position[0] * scale;
-            v.position[1] = origin[1] + bob + (v.position[1] - min_y) * scale;
-            v.position[2] = origin[2] + v.position[2] * scale;
+            v.position = to_world(v.position);
         }
-        (self.verts, self.indices)
+        let markers = self.markers.iter().map(|&m| to_world(m)).collect();
+        (self.verts, self.indices, markers)
     }
 }
 
@@ -620,12 +632,41 @@ pub fn height_range(kind: HeroKind) -> (f32, f32) {
 /// Build a forge hero: a jointed voxel humanoid (ported skeleton + buildBody),
 /// posed by the walk gait + an idle sway, coloured per [`HeroKind`]. `origin` =
 /// feet position; feet are auto-grounded to it. Returns engine entity geometry.
+/// Where the rig's head and hand ARE this frame, in world space, from the same
+/// solve and the same transform as the drawn mesh.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeroAnchors {
+    /// Between the eyes, just behind the face surface: where a first-person
+    /// camera belongs so it moves with the head (walk bob, lean, crouch, flight)
+    /// instead of on a clock of its own.
+    pub eye: [f32; 3],
+    /// The right hand's grip point, where a held item is attached.
+    pub right_hand: [f32; 3],
+}
+
+/// Eye point in HEAD-local units: centred between the two eye boxes (drawn at
+/// x = +-0.12, y = 0.20 on the face at z = ff + 0.01), a little behind the face.
+fn eye_local(dim: &HeroDims) -> [f32; 3] {
+    [0.0, 0.20, ff_depth(dim) - 0.05 - 0.02]
+}
+
 pub fn build(
     kind: HeroKind,
     params: &BuildParams,
     origin: [f32; 3],
     pose: &HeroPose,
 ) -> (Vec<EntityVertex>, Vec<u32>) {
+    let (v, i, _) = build_rigged(kind, params, origin, pose);
+    (v, i)
+}
+
+/// `build`, plus where the eyes and the right hand are (see `HeroAnchors`).
+pub fn build_rigged(
+    kind: HeroKind,
+    params: &BuildParams,
+    origin: [f32; 3],
+    pose: &HeroPose,
+) -> (Vec<EntityVertex>, Vec<u32>, HeroAnchors) {
     let col = kind.colors();
     let mut dim = kind.dims();
     // BuildParams sliders scale the ported proportions.
@@ -788,7 +829,10 @@ pub fn build(
     // a small vertical bounce on the walk (applied after grounding so the planted
     // pose still rests at the origin at mid-stride).
     let bob = (stride2 * 0.5 + 0.5) * amp * 0.10;
-    body.finalize(origin, bob, hero_total_height(params))
+    let eye_i = body.mark(&world[HEAD], eye_local(&dim));
+    let hand_i = body.mark(&world[HAR], [0.0, -0.10, ff_depth(&dim)]);
+    let (v, i, m) = body.finalize(origin, bob, hero_total_height(params));
+    (v, i, HeroAnchors { eye: m[eye_i], right_hand: m[hand_i] })
 }
 
 #[inline]
@@ -877,6 +921,115 @@ mod default_param_tests {
             if k != HeroKind::Gravitybender {
                 assert!(default_params(HeroKind::Gravitybender).bulk > default_params(k).bulk);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+
+    /// The mean of the 8 vertices of the box emitted at `center` equals a marker
+    /// placed at `center`: markers take the vertices' exact path (pivot xf, axis
+    /// remap, yaw, then finalize's ground / scale / bob).
+    #[test]
+    fn a_marker_takes_exactly_the_path_a_vertex_takes() {
+        let xf = Xf { r: [[0.8, -0.6, 0.0], [0.6, 0.8, 0.0], [0.0, 0.0, 1.0]], t: [0.3, 1.1, -0.2] };
+        for yaw in [0.0f32, 0.7, -2.4] {
+            let mut b = Body::new(yaw);
+            let c = [0.12, -0.4, 0.33];
+            b.part(&xf, [2.0, 3.0, 4.0], [1.0, 0.0, 0.0], c);
+            b.part(&xf, [1.0, 1.0, 1.0], [0.0, 1.0, 0.0], [0.0, 2.0, 0.0]); // so the span is not the box's
+            let m = b.mark(&xf, c);
+            let (v, _, marks) = b.finalize([10.0, 64.0, -3.0], 0.07, 1.8);
+            let mut mean = [0.0f32; 3];
+            for vert in &v[..8] { for k in 0..3 { mean[k] += vert.position[k] / 8.0; } }
+            for k in 0..3 { assert!((marks[m][k] - mean[k]).abs() < 1e-5, "yaw {yaw} axis {k}: {:?} vs {:?}", marks[m], mean); }
+        }
+    }
+
+    fn eye_centroid(kind: HeroKind, v: &[EntityVertex]) -> [f32; 3] {
+        let eye = kind.colors().eye;
+        let pts: Vec<[f32; 3]> = v.iter().filter(|x| x.color == eye).map(|x| x.position).collect();
+        assert!(pts.len() >= 16, "both eye boxes drawn ({} verts)", pts.len());
+        let n = pts.len() as f32;
+        [pts.iter().map(|p| p[0]).sum::<f32>() / n, pts.iter().map(|p| p[1]).sum::<f32>() / n, pts.iter().map(|p| p[2]).sum::<f32>() / n]
+    }
+
+    /// The first-person bug in one property: the camera's eye must move WITH the
+    /// drawn head. Over a whole walk cycle, and in crouch / flight / head pitch,
+    /// the eye anchor's displacement between poses equals the drawn eyes'.
+    #[test]
+    fn the_eye_anchor_moves_with_the_drawn_eyes_through_every_pose() {
+        let kind = HeroKind::from_name("Heliographer").expect("a hero kind");
+        let params = default_params(kind);
+        let origin = [5.0, 70.0, -2.0];
+        let mut poses: Vec<HeroPose> = (0..16).map(|i| HeroPose { walk_phase: i as f32 * std::f32::consts::TAU / 16.0, walk_amp: 0.5, yaw: 0.9, ..Default::default() }).collect();
+        poses.push(HeroPose { land_crouch: 1.0, ..Default::default() });
+        poses.push(HeroPose { airborne: 1.0, vertical_vel: -9.0, ..Default::default() });
+        poses.push(HeroPose { flight01: 1.0, bank: 0.4, ..Default::default() });
+        poses.push(HeroPose { gaze_pitch: 0.9, ..Default::default() });
+        poses.push(HeroPose { gaze_pitch: -0.9, yaw: -1.3, ..Default::default() });
+        let mut prev: Option<([f32; 3], [f32; 3])> = None;
+        let mut bob_range = (f32::MAX, f32::MIN);
+        for (i, pose) in poses.iter().enumerate() {
+            let (v, _, a) = build_rigged(kind, &params, origin, pose);
+            let drawn = eye_centroid(kind, &v);
+            // Near the drawn eyes (they sit on the face; the anchor is a hair behind).
+            let d = ((a.eye[0] - drawn[0]).powi(2) + (a.eye[1] - drawn[1]).powi(2) + (a.eye[2] - drawn[2]).powi(2)).sqrt();
+            assert!(d < 0.08, "pose {i}: eye anchor {:?} is {d:.3} from the drawn eyes {:?}", a.eye, drawn);
+            if i < 16 {
+                bob_range = (bob_range.0.min(a.eye[1]), bob_range.1.max(a.eye[1]));
+                if let Some((pa, pd)) = prev {
+                    for k in 0..3 {
+                        let (da, dd) = (a.eye[k] - pa[k], drawn[k] - pd[k]);
+                        assert!((da - dd).abs() < 0.01, "pose {i} axis {k}: anchor moved {da:.4}, drawn eyes {dd:.4}");
+                    }
+                }
+                prev = Some((a.eye, drawn));
+            }
+        }
+        assert!(bob_range.1 - bob_range.0 > 0.005, "walking moves the eye (the head bobs): range {:?}", bob_range);
+        // Standing still, the anchor is at a plausible eye height for the stature.
+        // Windwalker, not the Heliographer: the Heliographer's sun crown counts
+        // toward the height `finalize` scales to, so its body is drawn ~30% short
+        // and its eyes at 0.67 of the stature (eye_height_by_kind) -- a model
+        // scaling bug the anchor exposed, recorded, not this test's subject.
+        let ww = HeroKind::from_name("Windwalker").unwrap();
+        let wp = default_params(ww);
+        let (_, _, still) = build_rigged(ww, &wp, origin, &HeroPose::default());
+        let h = hero_total_height(&wp);
+        let rel = (still.eye[1] - origin[1]) / h;
+        assert!((0.8..0.97).contains(&rel), "eye at {rel:.3} of the body's height");
+    }
+
+    #[test]
+    #[ignore = "diagnostic: eye height and what is above the head, per hero kind"]
+    fn eye_height_by_kind() {
+        use HeroKind::*;
+        for kind in [Heliographer, Windwalker, Tidecaller, Stormweaver, Gravitybender, Brinekeeper, Luminant] {
+            let params = default_params(kind);
+            let (v, _, a) = build_rigged(kind, &params, [0.0, 0.0, 0.0], &HeroPose::default());
+            let h = hero_total_height(&params);
+            let top = v.iter().fold(f32::MIN, |m, x| m.max(x.position[1]));
+            let top_col = v.iter().find(|x| x.position[1] >= top - 1e-4).map(|x| x.color).unwrap();
+            let skin = kind.colors().skin;
+            let head_top = v.iter().filter(|x| x.color == skin).fold(f32::MIN, |m, x| m.max(x.position[1]));
+            eprintln!("KIND {kind:?}: height {h:.2} | eye {:.2} ({:.3} of h) | skin top {:.2} | top {:.2} colour {:?}", a.eye[1], a.eye[1] / h, head_top, top, top_col);
+        }
+    }
+
+    #[test]
+    fn the_hand_anchor_sits_where_the_held_item_is_drawn() {
+        let kind = HeroKind::from_name("Heliographer").unwrap();
+        let params = default_params(kind);
+        let held = [0.9f32, 0.1, 0.8];
+        for pose in [HeroPose { held_color: Some(held), ..Default::default() }, HeroPose { held_color: Some(held), swing01: 1.0, walk_amp: 0.4, walk_phase: 1.0, ..Default::default() }] {
+            let (v, _, a) = build_rigged(kind, &params, [0.0, 10.0, 0.0], &pose);
+            let pts: Vec<[f32; 3]> = v.iter().filter(|x| x.color == held).map(|x| x.position).collect();
+            assert_eq!(pts.len(), 8, "one held box");
+            let c = [pts.iter().map(|p| p[0]).sum::<f32>() / 8.0, pts.iter().map(|p| p[1]).sum::<f32>() / 8.0, pts.iter().map(|p| p[2]).sum::<f32>() / 8.0];
+            for k in 0..3 { assert!((a.right_hand[k] - c[k]).abs() < 1e-4, "axis {k}: {:?} vs {:?}", a.right_hand, c); }
         }
     }
 }
