@@ -52,21 +52,75 @@ pub fn cosmic_custom_shortcuts(config_home: &Path) -> PathBuf {
 /// entries of the form `(modifiers: [], key: "XF86PowerOff"): Spawn("..."),`.
 /// Merge ours in, keeping the user's other bindings and replacing any
 /// existing binding of the same keys. Returns the new text.
+///
+/// Entries are split at top-level commas (depth-aware, strings respected),
+/// NOT per line: cosmic-settings writes pretty RON with one entry over
+/// several lines, and cosmic drops the WHOLE custom file if it fails to
+/// parse, which brings the default `System(PowerOff)` back silently.
 pub fn merge_custom_shortcuts(existing: &str, bin: &str) -> String {
     let mut body: Vec<String> = Vec::new();
-    let inner = existing.trim().trim_start_matches('{').trim_end_matches('}');
-    // One entry per line in files cosmic-settings writes; keep those lines
-    // whose key is not one of ours.
-    for line in inner.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        if COMPOSITOR_KEYS.iter().any(|(k, _)| line.contains(&format!("key: \"{k}\""))) {
+    for entry in map_entries(existing) {
+        let squashed: String = entry.chars().filter(|c| !c.is_whitespace()).collect();
+        if COMPOSITOR_KEYS.iter().any(|(k, _)| squashed.contains(&format!("key:\"{k}\"")) && squashed.contains("modifiers:[]")) {
             continue;
         }
-        body.push(format!("    {}", line.trim_end_matches(',').to_string() + ","));
+        body.push(format!("    {entry},"));
     }
     for (key, cmd) in COMPOSITOR_KEYS {
         body.push(format!("    (modifiers: [], key: \"{key}\"): Spawn(\"{bin} ctl {cmd}\"),"));
     }
     format!("{{\n{}\n}}\n", body.join("\n"))
+}
+
+/// The entries of a RON map `{ a: b, c: d, }`, each trimmed, without the
+/// separating commas. Tracks (), [], {} depth and "..." strings (with
+/// escapes) so commas inside an entry do not split it.
+pub fn map_entries(text: &str) -> Vec<String> {
+    let t = text.trim();
+    let inner = t.strip_prefix('{').and_then(|x| x.strip_suffix('}')).unwrap_or(if t.is_empty() { "" } else { t });
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut depth, mut in_str, mut esc) = (0i32, false, false);
+    for c in inner.chars() {
+        if in_str {
+            cur.push(c);
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                cur.push(c);
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if depth == 0 => {
+                let e = cur.trim().to_string();
+                if !e.is_empty() {
+                    out.push(e);
+                }
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    let e = cur.trim().to_string();
+    if !e.is_empty() {
+        out.push(e);
+    }
+    out
 }
 
 /// Whether the compositor route is installed (the custom file binds the
@@ -137,6 +191,33 @@ mod tests {
         assert!(m.starts_with("{\n") && m.trim_end().ends_with('}'));
         let twice = merge_custom_shortcuts(&m, "/home/user/.local/bin/tideshell");
         assert_eq!(twice, m, "idempotent");
+        // Pretty RON as cosmic-settings writes it: one entry over several
+        // lines, commas inside the entry. The per-line merge this replaces
+        // turned "(" into "(," here, cosmic dropped the file, and the
+        // default power-off popup came back.
+        let pretty = r#"{
+    (
+        modifiers: [
+            Super,
+            Shift,
+        ],
+        key: "t",
+    ): Spawn("cosmic-term, --x"),
+    (
+        modifiers: [],
+        key: "XF86PowerOff",
+    ): System(PowerOff),
+}"#;
+        let m2 = merge_custom_shortcuts(pretty, "tideshell");
+        let entries = map_entries(&m2);
+        assert_eq!(entries.len(), 4, "{m2}");
+        assert!(entries[0].starts_with('(') && entries[0].contains("Super") && entries[0].contains("Shift") && entries[0].ends_with(r#"Spawn("cosmic-term, --x")"#), "the user's multi-line entry kept whole: {}", entries[0]);
+        assert!(!m2.contains("System(PowerOff)") && !m2.contains("(,") && !m2.contains(",,"), "{m2}");
+        // A binding of the same key WITH modifiers is a different binding: kept.
+        let modded = merge_custom_shortcuts(r#"{(modifiers: [Ctrl], key: "XF86PowerOff"): System(LockScreen),}"#, "t");
+        assert!(modded.contains("System(LockScreen)"), "{modded}");
+        let tight = merge_custom_shortcuts(r#"{(modifiers:[],key:"XF86PowerOff"):System(PowerOff)}"#, "t");
+        assert!(!tight.contains("System(PowerOff)"), "spacing does not hide the default: {tight}");
         let fresh = merge_custom_shortcuts("", "tideshell");
         assert_eq!(fresh.matches("Spawn(").count(), 3);
         let base = std::env::temp_dir().join(format!("tideshell-cc-{}", std::process::id()));
