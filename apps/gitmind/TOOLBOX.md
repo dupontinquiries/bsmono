@@ -8,10 +8,14 @@ Rust tools cross-compile cleanly; the Qt GUI builds natively where Qt6 lives.
 | binary        | crate         | needs Qt | what it is                                   |
 |---------------|---------------|----------|----------------------------------------------|
 | `gitmind`     | gitmind-cli   | no       | CLI + frontend dispatcher (launches GUI on touch) |
-| `gitmind-gui` | gitmind-gui   | **yes**  | qmetaobject + QML touch UI                   |
+| `gitmind-egui` | gitmind-egui | no       | the primary GUI (egui): Fleet, store, Tablets, depot pairing |
+| `gitmind-gui` | gitmind-gui   | **yes**  | qmetaobject + QML touch UI (the original; gitmind-egui is the default) |
 | `peek`        | peek          | no       | fast line-range file viewer                  |
 | `peek2`       | peek          | no       | indexed viewer (buckets, `@symbol`, context) |
 | `gitmind-sim` | gitmind-sim   | no       | storage benchmark harness                    |
+
+Getting a phone into the fleet (first contact over a browser, enrolment, depot
+credentials): [DEPLOY_TO_A_PHONE.md](DEPLOY_TO_A_PHONE.md).
 
 `cargo build --release` builds everything **except** `gitmind-gui` (it's
 excluded from `default-members` so a plain build never needs Qt). Build the

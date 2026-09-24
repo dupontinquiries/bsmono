@@ -28,6 +28,10 @@ Rollback is one line per stage (table in DEPLOY-FP5.md); a failed gate stops
 the plan and shows the raw output, the same rule the AI followed.
 
 ## What gitmind needs (not built yet)
+(Since written, c20unified: the step BEFORE this plan exists -- a phone with no sshd joins
+from its browser, and gitmind can hold depot credentials without the admin token. See
+[apps/gitmind/DEPLOY_TO_A_PHONE.md](../../gitmind/DEPLOY_TO_A_PHONE.md). The items below are
+still unbuilt.)
 - fleet entry with `via` (the fp5 is reachable only through fp5-blue);
 - a "plan" type whose steps are `scp` + `ssh` commands with a gate regex,
   run in order, each step's output kept;
