@@ -578,4 +578,61 @@ mod tests {
         assert!(fao_v1::decompress_plane_dct(&p, 16, 8).is_none(), "size mismatch rejected");
         assert!(fao_v1::decompress_plane_dct(&p[..5], 8, 8).is_none(), "truncated rejected");
     }
+
+    /// Every truncation and a sweep of single-byte corruptions of a REAL .fao (key, patch and
+    /// repeat frames from the transcoder), through parse and every frame's decode. The Player
+    /// opens whatever file it is given -- and, since streaming playback, partial downloads -- so
+    /// damaged input must come back as `None` / a `Gap`, never a panic.
+    #[test]
+    fn damaged_files_are_refused_not_panicked_on() {
+        let have = std::process::Command::new("ffmpeg").arg("-version").output().map(|o| o.status.success()).unwrap_or(false);
+        if !have { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-damage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mp4");
+        assert!(std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=1.2", "-frames:v", "12", "-pix_fmt", "yuv420p"]).arg(&src).status().unwrap().success());
+        let out = dir.join("clip.fao");
+        crate::transcode::transcode_to_file_with(src.to_str().unwrap(), &out, 70, None, |_, _| {}, None, true).unwrap();
+        let good = std::fs::read(&out).unwrap();
+        let f = FaoFile::parse(good.clone()).expect("the undamaged file parses");
+        let n = f.frame_count();
+        assert!(n >= 10);
+        for i in 0..n { f.decode_rgb(i).unwrap_or_else(|g| panic!("undamaged frame {i}: {g}")); }
+
+        let mut cases: Vec<(String, Vec<u8>)> = (0..good.len()).map(|k| (format!("truncated to {k}"), good[..k].to_vec())).collect();
+        for k in 0..good.len() {
+            for v in [0x00u8, 0xFF] {
+                if good[k] != v {
+                    let mut c = good.clone();
+                    c[k] = v;
+                    cases.push((format!("byte {k} = {v:#04x}"), c));
+                }
+            }
+        }
+        let prev = std::panic::take_hook();
+        // Silence the per-case output, but keep WHERE each panic happened for the report.
+        static LAST_AT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+        std::panic::set_hook(Box::new(|info| {
+            if let Ok(mut l) = LAST_AT.lock() { *l = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default(); }
+        }));
+        let mut panics: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        for (what, data) in &cases {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(f) = FaoFile::parse(data.clone()) {
+                    for i in 0..f.frame_count().min(64) { let _ = f.decode_rgb(i); }
+                }
+            }));
+            if let Err(e) = r {
+                let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+                let at = LAST_AT.lock().map(|l| l.clone()).unwrap_or_default();
+                let key: String = format!("{at}  {}", msg.chars().take(90).collect::<String>());
+                panics.entry(key).or_insert((0, what.clone())).0 += 1;
+            }
+        }
+        std::panic::set_hook(prev);
+        let _ = std::fs::remove_dir_all(&dir);
+        let report: Vec<String> = panics.iter().map(|(m, (c, first))| format!("{c:5}x  first: {first:<22}  {m}")).collect();
+        assert!(panics.is_empty(), "{} of {} damaged files panicked:\n{}", panics.values().map(|v| v.0).sum::<usize>(), cases.len(), report.join("\n"));
+    }
 }
+
