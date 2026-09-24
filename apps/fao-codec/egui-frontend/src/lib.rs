@@ -19,6 +19,7 @@ pub mod player;
 pub mod decode;
 pub mod transcode;
 pub mod encode_page;
+pub mod archive;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 // ── PARITY STATUS, measured 2026-09-16 against fao_app/src/main.rs ──────────
@@ -55,13 +56,16 @@ pub mod encode_page;
 // cancellable, with live progress / per-frame cost / decoded preview, and
 // "Open in Player". It encodes with the one codec the port has (intra DCT);
 // the GTK dialog's v2.0-v8 / v9 codec choices are still not ported and the
-// page says so. The web view and Open Archive / Export remain unported.
+// page says so. Since then: T-frames (v2.1) on that page, and the Archive
+// tab (New / Open Archive, Add Video, finished encodes added -- the GTK
+// Export flow). The web view remains unported.
 pub enum Tab {
     Encode,
     Lab,
     SeqLab,
     Library,
     Player,
+    Archive,
     Settings,
 }
 
@@ -80,13 +84,14 @@ pub struct App {
     pub library: library::State,
     pub player: player::State,
     pub encode: encode_page::State,
+    pub archive: archive::State,
 }
 
 impl Default for App {
     fn default() -> Self {
         let mut prefs = settings_kit::Prefs::default();
         prefs.palette = "system".to_string();
-        App { a11y: uikit_egui::a11y::A11yScene::new(), tab: Tab::Encode, prefs, lab: lab::State::default(), seq: seq_page::SeqState::default(), library: library::State::default(), player: player::State::default(), encode: encode_page::State::default() }
+        App { a11y: uikit_egui::a11y::A11yScene::new(), tab: Tab::Encode, prefs, lab: lab::State::default(), seq: seq_page::SeqState::default(), library: library::State::default(), player: player::State::default(), encode: encode_page::State::default(), archive: archive::State::default() }
     }
 }
 
@@ -114,6 +119,7 @@ impl App {
             Tab::SeqLab => seq_page::ui(self, ui),
             Tab::Library => library::ui(self, ui),
             Tab::Player => player::ui(self, ui),
+            Tab::Archive => archive::ui(self, ui),
             Tab::Settings => {
                 ui.heading("Settings");
                 ui.label(egui::RichText::new("palette / text follow the shared prefs").weak().small());
@@ -124,7 +130,7 @@ impl App {
     fn nav(&mut self, ui: &mut egui::Ui) {
         for (t, label) in [(Tab::Encode, "⏺ Encode"), (Tab::Lab, "🎞 Encode Lab"), (Tab::SeqLab, "⏱ Seq Lab"),
                            (Tab::Library, "🔗 Library"),
-                           (Tab::Player, "▶ Player"), (Tab::Settings, "⚙ Settings")] {
+                           (Tab::Player, "▶ Player"), (Tab::Archive, "🗄 Archive"), (Tab::Settings, "⚙ Settings")] {
             if ui.selectable_label(self.tab == t, label).clicked() {
                 self.tab = t;
             }

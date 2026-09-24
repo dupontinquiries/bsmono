@@ -96,12 +96,16 @@ pub struct State {
     pub outcome: Option<Outcome>,
     pub preview: Option<(usize, usize, Vec<u8>)>,
     preview_dirty: bool,
+    /// Set once when an encode finishes; taken by `add_finished_to_archive`.
+    pub finished: Option<PathBuf>,
+    /// What happened with the archive for the last encode ("added to archive X").
+    pub archive_note: String,
     tex: Option<egui::TextureHandle>,
 }
 
 impl Default for State {
     fn default() -> Self {
-        State { input: String::new(), info: None, probed: String::new(), quality: 75, inter: true, max_gop: EncodeOpts::inter(75).max_gop, max_psnr_drop: EncodeOpts::inter(75).max_psnr_drop, max_frames: 0, output: String::new(), output_edited: false, job: None, outcome: None, preview: None, preview_dirty: false, tex: None }
+        State { input: String::new(), info: None, probed: String::new(), quality: 75, inter: true, max_gop: EncodeOpts::inter(75).max_gop, max_psnr_drop: EncodeOpts::inter(75).max_psnr_drop, max_frames: 0, output: String::new(), output_edited: false, job: None, outcome: None, preview: None, preview_dirty: false, finished: None, archive_note: String::new(), tex: None }
     }
 }
 
@@ -171,8 +175,9 @@ impl State {
         }
         if let Some(r) = finished {
             let job = self.job.take().expect("job");
+            self.archive_note.clear();
             self.outcome = Some(match r {
-                Ok((rep, path)) => Outcome::Done(rep, path, job.started.elapsed()),
+                Ok((rep, path)) => { self.finished = Some(path.clone()); Outcome::Done(rep, path, job.started.elapsed()) }
                 Err(Stop::Cancelled) => Outcome::Cancelled(job.stats.len()),
                 Err(Stop::Failed(e)) => Outcome::Failed(e),
             });
@@ -211,11 +216,23 @@ fn sparkline(ui: &mut egui::Ui, stats: &[FrameStat]) {
     p.add(egui::Shape::line(pts, egui::Stroke::new(1.5, ui.visuals().selection.bg_fill)));
 }
 
+/// fao_app's Export adds the file to the active archive; so does a finished encode here.
+pub fn add_finished_to_archive(app: &mut crate::App) {
+    let Some(path) = app.encode.finished.take() else { return };
+    if !app.archive.is_open() { return; }
+    let name = app.archive.archive.as_ref().map(|a| a.name.clone()).unwrap_or_default();
+    app.encode.archive_note = match app.archive.add(&path, app.encode.input.trim()) {
+        Ok(_) => format!("added to archive {name}"),
+        Err(e) => format!("not added to archive {name}: {e}"),
+    };
+}
+
 pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
-    let s = &mut app.encode;
-    if s.poll() || s.job.is_some() {
+    if app.encode.poll() || app.encode.job.is_some() {
         ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
+    add_finished_to_archive(app);
+    let s = &mut app.encode;
     ui.heading("Encode");
     ui.label(egui::RichText::new("A video file in, a .fao out. I-frames: FAO DCT ('D'). T-frames: v2.1 predictive \
         ('T', motion vectors + residual against the last I-frame), used where smaller and close enough in quality. \
@@ -294,6 +311,7 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
             ui.label(egui::RichText::new(format!("Done: {} frames {}×{} in {:.1} s", r.frames, r.w, r.h, took.as_secs_f64())).strong());
             ui.label(format!("{} → {} ({:.2}× vs the input file) · {:.3} bpp · mean PSNR {:.2} dB · {} I-frames, {} T-frames", bytes_h(r.input_bytes), bytes_h(r.output_bytes), ratio, bpp, r.mean_psnr, r.i_frames, r.t_frames));
             ui.label(egui::RichText::new(path.display().to_string()).monospace().small());
+            if !s.archive_note.is_empty() { ui.label(egui::RichText::new(&s.archive_note).small()); }
             if ui.button("Open in Player").clicked() {
                 let p = path.display().to_string();
                 app.player.path = p.clone();

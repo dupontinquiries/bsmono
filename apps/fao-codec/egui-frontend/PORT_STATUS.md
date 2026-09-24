@@ -102,6 +102,24 @@ block's error is large (its threshold is ~40 luma levels per pixel at quality 70
 screen content). That is the format's design, not a bug; a previous-frame reference or a
 denser residual would be a format change.
 
+## Archive (c20unified)
+
+fao_app's video library -- "+ New Archive" (a folder, `archive.fao_lib` written there),
+"Open Archive" (the manifest, or its folder), "+ Add Video" (a .fao; title, size, rate, frames,
+length from its header), rows that open in the Player -- over the same `fao_codec_lib::Archive`
+calls. Every change is saved at once, as in GTK. An encode finished on the Encode page is added
+to the open archive, as fao_app's Export does, and the page says so.
+
+Divergences, recorded in `archive.rs`: path fields for the native choosers; metadata read from
+the .fao's first 4 KB plus its size from the filesystem (fao_app read the whole file); missing
+files marked in the list; "Remove" drops the entry, never the file.
+
+**Library fix found on the way**: `Archive::load_manifest` sliced unchecked past a 28-byte
+length guard, so a truncated or damaged manifest -- a file the user picks -- panicked instead of
+returning an error (first panic at a 28-byte truncation). Rewritten over a bounds-checked cursor,
+same format; counts bounded by the bytes left. Test: every truncation of a real manifest plus
+four corrupted length fields load without panicking, and the full file round-trips.
+
 ## Not started
 
 - **World tab** — 3D scene viewer (freecam, orbit, colour modes). The largest remaining gap;

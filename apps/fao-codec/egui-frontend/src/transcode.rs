@@ -348,9 +348,6 @@ pub fn write_atomic(out: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, out)).map_err(|e| format!("{}: {e}", out.display()))
 }
 
-fn decode_yuv_from_rgb(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
-    crate::decode::rgb_to_yuv420p(rgb, w, h)
-}
 
 fn psnr(a: &[u8], b: &[u8]) -> f64 {
     let n = a.len().min(b.len()).max(1);
@@ -451,7 +448,7 @@ mod tests {
         let frames = decode_frames_rgb(path.to_str().unwrap(), 64, 48, Some(1)).expect("decode");
         let rgb = &frames[0];
         let (w, h) = (64usize, 48usize);
-        let yuv = decode_yuv_from_rgb(rgb, w, h);
+        let yuv = crate::decode::rgb_to_yuv420p(rgb, w, h);
         for q in [10u8, 50, 80, 95] {
             fao_v1::DEBUG_ESCAPES.store(0, std::sync::atomic::Ordering::Relaxed);
             fao_v1::DEBUG_OVERFLOWS.store(0, std::sync::atomic::Ordering::Relaxed);
