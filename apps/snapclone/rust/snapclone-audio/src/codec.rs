@@ -222,3 +222,135 @@ pub unsafe extern "C" fn sc_opus_decode(
         Err(_) => -1,
     }
 }
+
+// ── The same encoder and decoder for Rust callers ───────────────────────────
+//
+// The functions above are the C ABI the Qt app links. A Rust app (snapclone-egui)
+// wants owned values, `Option` for failure and no raw pointers; these wrap the
+// same audiopus handles, so both front doors run one implementation.
+
+/// Opus frame durations, in tenths of a millisecond: 2.5, 5, 10, 20, 40, 60 ms.
+const OPUS_FRAME_TENTHS_MS: [u32; 6] = [25, 50, 100, 200, 400, 600];
+
+/// Is `samples` (per channel) one whole Opus frame at `sample_rate`? Opus
+/// refuses every other length, so a caller whose frame size is a user setting
+/// must check and fall back rather than fail every frame.
+pub fn is_opus_frame(sample_rate: u32, samples: usize) -> bool {
+    OPUS_FRAME_TENTHS_MS.iter().any(|t| sample_rate as usize * *t as usize == samples * 10_000)
+}
+
+/// A speech encoder (VOIP application, voice signal hint, in-band FEC on).
+pub struct VoiceEncoder {
+    inner: OpusEncoder,
+    sample_rate: u32,
+}
+
+impl VoiceEncoder {
+    /// `bitrate` in bits/s; <= 0 leaves the Opus default. None on an
+    /// unsupported rate / channel count or an init error.
+    pub fn new(sample_rate: u32, channels: u32, bitrate: i32) -> Option<VoiceEncoder> {
+        let (sr, ch) = (map_sample_rate(sample_rate)?, map_channels(channels)?);
+        let mut enc = Encoder::new(sr, ch, Application::Voip).ok()?;
+        let _ = enc.set_signal(Signal::Voice);
+        if bitrate > 0 {
+            let _ = enc.set_bitrate(Bitrate::BitsPerSecond(bitrate));
+        }
+        let _ = enc.set_inband_fec(true);
+        Some(VoiceEncoder { inner: OpusEncoder { enc }, sample_rate })
+    }
+
+    /// One frame of mono i16 PCM to one packet. None if the frame is not an
+    /// Opus frame length (`is_opus_frame`) or the encoder fails.
+    pub fn encode(&mut self, pcm: &[i16]) -> Option<Vec<u8>> {
+        if !is_opus_frame(self.sample_rate, pcm.len()) {
+            return None;
+        }
+        let mut out = [0u8; 1275]; // the largest Opus packet for one frame
+        let n = self.inner.enc.encode(pcm, &mut out).ok()?;
+        Some(out[..n].to_vec())
+    }
+}
+
+/// A speech decoder. Keep ONE per remote speaker: Opus is stateful across
+/// packets, so feeding two speakers' packets into one decoder smears them.
+pub struct VoiceDecoder {
+    inner: OpusDecoder,
+}
+
+impl VoiceDecoder {
+    pub fn new(sample_rate: u32, channels: u32) -> Option<VoiceDecoder> {
+        let (sr, ch) = (map_sample_rate(sample_rate)?, map_channels(channels)?);
+        Some(VoiceDecoder { inner: OpusDecoder { dec: Decoder::new(sr, ch).ok()? } })
+    }
+
+    /// One packet to `frame_samples` of mono i16 PCM. `None` for `packet`
+    /// conceals a LOST frame (packet-loss concealment); an empty or corrupt
+    /// packet returns None rather than noise.
+    pub fn decode(&mut self, packet: Option<&[u8]>, frame_samples: usize) -> Option<Vec<i16>> {
+        let mut out = vec![0i16; frame_samples.max(1)];
+        let n = match packet {
+            Some(p) if p.is_empty() => return None,
+            Some(p) => self.inner.dec.decode(Some(p), &mut out[..], false).ok()?,
+            None => self.inner.dec.decode(None::<&[u8]>, &mut out[..], false).ok()?,
+        };
+        out.truncate(n);
+        Some(out)
+    }
+}
+
+#[cfg(test)]
+mod voice_tests {
+    use super::*;
+
+    const RATE: u32 = 16_000;
+    const FRAME: usize = 320; // 20 ms
+
+    fn tone(frames: usize) -> Vec<Vec<i16>> {
+        (0..frames).map(|f| (0..FRAME).map(|i| {
+            let t = (f * FRAME + i) as f32 / RATE as f32;
+            ((t * 440.0 * std::f32::consts::TAU).sin() * 0.3 * i16::MAX as f32
+             + (t * 1300.0 * std::f32::consts::TAU).sin() * 0.1 * i16::MAX as f32) as i16
+        }).collect()).collect()
+    }
+    fn rms(x: &[i16]) -> f32 { (x.iter().map(|&s| (s as f32).powi(2)).sum::<f32>() / x.len().max(1) as f32).sqrt() }
+
+    #[test]
+    fn frame_lengths_opus_accepts() {
+        for (ms10, ok) in [(25u32, true), (50, true), (100, true), (200, true), (400, true), (600, true), (150, false), (300, false), (1000, false)] {
+            let samples = RATE as usize * ms10 as usize / 10_000;
+            assert_eq!(is_opus_frame(RATE, samples), ok, "{} ms", ms10 as f32 / 10.0);
+        }
+    }
+
+    #[test]
+    fn speech_band_audio_round_trips_at_a_fraction_of_the_raw_size() {
+        let mut enc = VoiceEncoder::new(RATE, 1, 24_000).expect("encoder");
+        let mut dec = VoiceDecoder::new(RATE, 1).expect("decoder");
+        let frames = tone(50); // 1 s
+        let (mut bytes, mut out) = (0usize, Vec::new());
+        for f in &frames {
+            let p = enc.encode(f).expect("a 20 ms frame encodes");
+            bytes += p.len();
+            out.extend(dec.decode(Some(&p), FRAME).expect("decodes"));
+        }
+        assert_eq!(out.len(), 50 * FRAME);
+        let raw = 50 * FRAME * 2;
+        assert!(bytes * 8 < raw, "Opus {bytes} B/s vs raw {raw} B/s");
+        // Past the codec's start-up delay the level is the input's.
+        let (a, b) = (rms(&frames.concat()[4000..]), rms(&out[4000..]));
+        assert!((b / a - 1.0).abs() < 0.35, "level in {a:.0}, out {b:.0}");
+    }
+
+    #[test]
+    fn a_lost_frame_is_concealed_and_bad_input_is_refused() {
+        let mut enc = VoiceEncoder::new(RATE, 1, 24_000).unwrap();
+        let mut dec = VoiceDecoder::new(RATE, 1).unwrap();
+        for f in tone(10) { let p = enc.encode(&f).unwrap(); dec.decode(Some(&p), FRAME).unwrap(); }
+        let concealed = dec.decode(None, FRAME).expect("concealment");
+        assert_eq!(concealed.len(), FRAME);
+        assert!(rms(&concealed) > 100.0, "concealment continues the sound rather than dropping to silence");
+        assert!(enc.encode(&vec![0i16; 300]).is_none(), "not an Opus frame length");
+        assert!(dec.decode(Some(&[]), FRAME).is_none(), "an empty packet is not a frame");
+        assert!(VoiceEncoder::new(44_100, 1, 0).is_none(), "44.1 kHz is not an Opus rate");
+    }
+}
