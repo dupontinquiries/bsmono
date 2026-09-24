@@ -92,36 +92,161 @@ pub struct TranscodeReport {
     pub mean_psnr: f64,
 }
 
-/// Probe, decode, encode every frame intra (see the module doc for why), and return a real
-/// `.fao` file's bytes plus a report. `progress(done, total)` is called after every frame so a
-/// caller on a worker thread can report back to the UI without this module knowing about egui.
-pub fn transcode(path: &str, quality: u8, max_frames: Option<usize>,
-                  mut progress: impl FnMut(usize, usize)) -> Result<(Vec<u8>, TranscodeReport), String> {
-    let info = probe(path)?;
+/// One frame from ffmpeg's pipe at a time, so an encode holds ONE decoded frame in memory,
+/// not the whole video (`decode_frames_rgb` holds all of them: fine for a test clip, ~3.7 GB for
+/// twenty seconds of 1080p). stderr is drained on a thread (a full stderr pipe would stall
+/// ffmpeg), and ffmpeg is killed when the reader is dropped, so a cancelled encode does not
+/// leave it running.
+pub struct FrameReader {
+    child: std::process::Child,
+    out: std::process::ChildStdout,
+    err: std::sync::Arc<std::sync::Mutex<String>>,
+    pub w: usize,
+    pub h: usize,
+    finished: bool,
+}
+
+impl FrameReader {
+    pub fn open(path: &str, w: usize, h: usize, max_frames: Option<usize>) -> Result<FrameReader, String> {
+        let (w, h) = (w & !1, h & !1);
+        if w < 8 || h < 8 { return Err(format!("{w}x{h} is too small to encode")); }
+        let mut cmd = Command::new("ffmpeg");
+        cmd.arg("-i").arg(path);
+        if let Some(n) = max_frames { cmd.args(["-vframes", &n.to_string()]); }
+        cmd.args(["-vf", &format!("scale={w}:{h}")])
+           .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-v", "error", "-"])
+           .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| format!("ffmpeg: {e}"))?;
+        let out = child.stdout.take().ok_or("ffmpeg: no stdout")?;
+        let mut stderr = child.stderr.take().ok_or("ffmpeg: no stderr")?;
+        let err = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = err.clone();
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut stderr, &mut s);
+            if let Ok(mut e) = sink.lock() { *e = s; }
+        });
+        Ok(FrameReader { child, out, err, w, h, finished: false })
+    }
+
+    pub fn frame_bytes(&self) -> usize { self.w * self.h * 3 }
+
+    /// The next w×h RGB24 frame; `None` at a clean end. A short final read, or ffmpeg exiting
+    /// with an error, is an `Err` carrying ffmpeg's own message.
+    pub fn next_frame(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if self.finished { return Ok(None); }
+        let mut buf = vec![0u8; self.frame_bytes()];
+        let mut got = 0;
+        while got < buf.len() {
+            match std::io::Read::read(&mut self.out, &mut buf[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(format!("reading ffmpeg: {e}")),
+            }
+        }
+        if got == buf.len() { return Ok(Some(buf)); }
+        self.finished = true;
+        let status = self.child.wait().map_err(|e| format!("ffmpeg: {e}"))?;
+        // Give the stderr thread a moment to hand over ffmpeg's last words.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let msg = self.err.lock().map(|e| e.trim().to_string()).unwrap_or_default();
+        if !status.success() {
+            return Err(format!("ffmpeg decode failed: {}", if msg.is_empty() { status.to_string() } else { msg }));
+        }
+        if got != 0 {
+            return Err(format!("ffmpeg ended mid-frame ({got} of {} bytes)", self.frame_bytes()));
+        }
+        Ok(None)
+    }
+}
+
+impl Drop for FrameReader {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// Per-frame result, for a live report.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameStat {
+    pub index: usize,
+    pub bytes: usize,
+    pub psnr: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Stop {
+    Cancelled,
+    Failed(String),
+}
+
+impl std::fmt::Display for Stop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { Stop::Cancelled => write!(f, "cancelled"), Stop::Failed(e) => write!(f, "{e}") }
+    }
+}
+
+/// Probe, then stream: decode one frame, encode it intra (see the module doc for why), decode it
+/// back for PSNR, report, repeat. `on_frame` sees each frame's stat and its DECODED image (what
+/// a viewer of the .fao will see), so a UI can show live output without this module knowing
+/// about egui. `cancel` is checked between frames; ffmpeg is killed on cancel.
+pub fn transcode_stream(path: &str, quality: u8, max_frames: Option<usize>, cancel: &std::sync::atomic::AtomicBool,
+                        mut on_frame: impl FnMut(&FrameStat, &[u8])) -> Result<(Vec<u8>, TranscodeReport), Stop> {
+    let info = probe(path).map_err(Stop::Failed)?;
     let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let frames = decode_frames_rgb(path, info.w, info.h, max_frames)?;
-    let (w, h) = (info.w & !1, info.h & !1);
-    let n = frames.len();
-    let mut container_frames = Vec::with_capacity(n);
+    let mut reader = FrameReader::open(path, info.w, info.h, max_frames).map_err(Stop::Failed)?;
+    let (w, h) = (reader.w, reader.h);
+    let mut container_frames = Vec::new();
     let mut psnr_sum = 0.0;
-    for (i, rgb) in frames.iter().enumerate() {
-        let yuv = decode_yuv_from_rgb(rgb, w, h);
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) { return Err(Stop::Cancelled); }
+        let Some(rgb) = reader.next_frame().map_err(Stop::Failed)? else { break };
+        let yuv = decode_yuv_from_rgb(&rgb, w, h);
         let payload = fao_v1::compress_frame_dct(&yuv, w, h, quality);
         let recon_yuv = fao_v1::decompress_frame_dct(&payload, w, h).unwrap_or_else(|| yuv.clone());
         let recon_rgb = crate::decode::yuv_to_rgb(&recon_yuv, w, h);
-        psnr_sum += psnr(rgb, &recon_rgb);
+        let p = psnr(&rgb, &recon_rgb);
+        psnr_sum += p;
+        let stat = FrameStat { index: container_frames.len(), bytes: payload.len(), psnr: p };
         let plen = payload.len();
         container_frames.push((Vec::new(), payload, b'D', plen, 0.0, 0.0));
-        progress(i + 1, n);
+        on_frame(&stat, &recon_rgb);
     }
+    let n = container_frames.len();
+    if n == 0 { return Err(Stop::Failed("ffmpeg produced no frames".into())); }
     let mut out = Vec::new();
     fao_v1::write_fao_container(&mut out, w, h, info.fps, quality as f32 / 100.0, &container_frames)
-        .map_err(|e| format!("writing the container: {e}"))?;
-    let report = TranscodeReport {
-        frames: n, w, h, input_bytes, output_bytes: out.len() as u64,
-        mean_psnr: if n > 0 { psnr_sum / n as f64 } else { 0.0 },
-    };
+        .map_err(|e| Stop::Failed(format!("writing the container: {e}")))?;
+    let report = TranscodeReport { frames: n, w, h, input_bytes, output_bytes: out.len() as u64, mean_psnr: psnr_sum / n as f64 };
     Ok((out, report))
+}
+
+/// The whole-file call kept for its callers and tests: `transcode_stream`, never cancelled,
+/// with `progress(done, total)` where total is the frame count known from the probe.
+pub fn transcode(path: &str, quality: u8, max_frames: Option<usize>,
+                  mut progress: impl FnMut(usize, usize)) -> Result<(Vec<u8>, TranscodeReport), String> {
+    let total = probe(path).ok().map(|i| estimated_frames(&i, max_frames)).unwrap_or(0);
+    let never = std::sync::atomic::AtomicBool::new(false);
+    transcode_stream(path, quality, max_frames, &never, |s, _| progress(s.index + 1, total.max(s.index + 1)))
+        .map_err(|e| e.to_string())
+}
+
+/// Frames the file should yield: duration × fps, capped by `max_frames`. An estimate (ffprobe's
+/// duration is container-level); the stream's actual end is authoritative.
+pub fn estimated_frames(info: &VideoInfo, max_frames: Option<usize>) -> usize {
+    let n = (info.duration_s * info.fps).round().max(0.0) as usize;
+    match max_frames { Some(m) => n.min(m), None => n }
+}
+
+/// Write `bytes` to `out` via a temporary file in the same directory, so a failed or
+/// interrupted write never leaves a half .fao where the Player would open it.
+pub fn write_atomic(out: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = out.with_extension("fao.part");
+    std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, out)).map_err(|e| format!("{}: {e}", out.display()))
 }
 
 fn decode_yuv_from_rgb(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
@@ -246,6 +371,69 @@ mod tests {
             // quality, which is backwards for any real codec. 20 dB is a floor, not a target.
             assert!(p > 20.0, "q={q}: PSNR {p:.2} dB — DCT round trip should not degrade with quality");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn streamed_frames_are_byte_identical_to_the_whole_file_decode() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-stream-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = dir.join("in.mp4");
+        make_test_video(&v, 64, 48, 5, 10);
+        let p = v.to_str().unwrap();
+        let whole = decode_frames_rgb(p, 64, 48, None).unwrap();
+        let mut r = FrameReader::open(p, 64, 48, None).unwrap();
+        let mut streamed = vec![];
+        while let Some(f) = r.next_frame().unwrap() { streamed.push(f); }
+        assert_eq!(streamed.len(), 5);
+        assert!(streamed == whole, "same frames, same bytes");
+        assert_eq!(r.next_frame().unwrap(), None, "stays ended");
+        // The streaming encode reports every frame, with the decoded image at full size.
+        let never = std::sync::atomic::AtomicBool::new(false);
+        let mut stats = vec![];
+        let (bytes, rep) = transcode_stream(p, 60, None, &never, |s, img| { assert_eq!(img.len(), 64 * 48 * 3); stats.push(s.clone()); }).unwrap();
+        assert_eq!(stats.iter().map(|s| s.index).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+        assert!(stats.iter().all(|s| s.bytes > 0 && s.psnr > 20.0), "{stats:?}");
+        assert_eq!(rep.frames, 5);
+        assert_eq!(rep.output_bytes as usize, bytes.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_stops_between_frames_and_writes_nothing() {
+        if !have_ffmpeg() { eprintln!("no ffmpeg; skipping"); return; }
+        let dir = std::env::temp_dir().join(format!("fao-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = dir.join("in.mp4");
+        make_test_video(&v, 64, 48, 40, 10);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut seen = 0;
+        let t = std::time::Instant::now();
+        let r = transcode_stream(v.to_str().unwrap(), 60, None, &cancel, |s, _| {
+            seen = s.index + 1;
+            if seen == 2 { cancel.store(true, std::sync::atomic::Ordering::Relaxed); }
+        });
+        assert_eq!(r.unwrap_err(), Stop::Cancelled);
+        assert_eq!(seen, 2, "no frame after the cancel");
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "returns promptly (ffmpeg killed, not drained)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_non_video_is_a_failure_with_a_reason_and_estimates_are_capped() {
+        let dir = std::env::temp_dir().join(format!("fao-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("notes.txt");
+        std::fs::write(&f, "not a video").unwrap();
+        let never = std::sync::atomic::AtomicBool::new(false);
+        match transcode_stream(f.to_str().unwrap(), 60, None, &never, |_, _| {}) {
+            Err(Stop::Failed(m)) => assert!(!m.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        let info = VideoInfo { w: 64, h: 48, fps: 30.0, duration_s: 2.0, codec: "h264".into() };
+        assert_eq!(estimated_frames(&info, None), 60);
+        assert_eq!(estimated_frames(&info, Some(10)), 10);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
