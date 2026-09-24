@@ -777,6 +777,14 @@ fn bird_mesh() -> VoxelMesh {
     g.mesh(0.5, true)
 }
 
+/// The real world's collision and going, without a renderer: what a
+/// headless match must run against to be the match anyone plays. Builds the
+/// meshes too (they are what the placements come from) and drops them; a few
+/// seconds of CPU.
+pub fn world_blockers() -> Blockers {
+    build_world().2
+}
+
 fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
     const TAU: f32 = std::f32::consts::TAU;
     let mut pieces: Vec<Piece> = Vec::new();

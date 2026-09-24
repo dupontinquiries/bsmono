@@ -291,6 +291,9 @@ pub struct Game {
     /// the pre-collision behaviour rather than silently depending on a world
     /// they never built.
     pub blockers: std::sync::Arc<crate::blockers::Blockers>,
+    /// Per-god steering memory (`steer::Memory`): a bot's planned detour.
+    /// Sim state, so a replay reproduces the same detours.
+    pub steer_mem: Vec<crate::steer::Memory>,
 }
 
 impl Game {
@@ -424,6 +427,7 @@ impl Game {
             bosses: crate::bosses::Bosses::new(),
             disasters: crate::disasters::Disasters::default(),
             blockers: std::sync::Arc::new(crate::blockers::Blockers::default()),
+            steer_mem: vec![crate::steer::Memory::default(); 10],
         };
         // starter items for AI gods (player buys via shop)
         for i in 0..10 {

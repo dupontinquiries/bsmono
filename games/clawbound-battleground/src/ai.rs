@@ -306,7 +306,12 @@ pub fn think(game: &mut Game, gi: usize) {
     let move_dir = {
         let g = &game.gods[gi];
         let who = crate::going::Carriage { stalking: game.stalking(gi) };
-        crate::steer::steer(&game.blockers, g.pos, move_dir, g.move_dir, crate::consts::GOD_RADIUS, who)
+        if game.steer_mem.len() <= gi {
+            game.steer_mem.resize(gi + 1, Default::default());
+        }
+        let blockers = game.blockers.clone();
+        let (pos, prev, now) = (g.pos, g.move_dir, game.t);
+        crate::steer::steer_with(&blockers, pos, move_dir, prev, crate::consts::GOD_RADIUS, who, &mut game.steer_mem[gi], now)
     };
 
     // write back
