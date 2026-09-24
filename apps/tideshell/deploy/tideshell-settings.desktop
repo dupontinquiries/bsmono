@@ -1,0 +1,10 @@
+# Install: install -Dm644 tideshell-settings.desktop ~/.local/share/applications/tideshell-settings.desktop
+# (and the binary: install -Dm755 out/tideshell-settings ~/.local/bin/tideshell-settings)
+[Desktop Entry]
+Type=Application
+Name=Settings (touch)
+Comment=COSMIC settings for the phone: theme, screen off, suspend
+Exec=tideshell-settings
+Icon=preferences-system
+Categories=Settings;
+StartupWMClass=tideshell-settings
