@@ -303,7 +303,9 @@ pub enum Accel {
     Software,
     /// VAAPI through a DRM render node — Intel and AMD desktops. Scaling runs
     /// on the GPU too, so a 4K source crosses the bus at the display size.
-    Vaapi { device: String, codec: String },
+    /// `vpp`: the driver has video processing, so scale_vaapi can shrink
+    /// frames before the download. Asahi's VA layer does not.
+    Vaapi { device: String, codec: String, vpp: bool },
     /// A V4L2 memory-to-memory decoder (`vp9_v4l2m2m`...) — Venus on the
     /// Fairphone. An INPUT option: it replaces the software decoder.
     V4l2m2m { decoder: String },
@@ -337,6 +339,8 @@ pub struct Machine {
     /// What the VAAPI driver really decodes, from `vainfo`; `None` when
     /// vainfo is not installed (then the driver name is all there is).
     pub vaapi: Option<Vec<(vidkit_core::codec::Codec, u8)>>,
+    /// The VA driver offers video processing (scale_vaapi).
+    pub vaapi_vpp: bool,
 }
 
 /// ffprobe's codec name as vidkit's codec.
@@ -355,13 +359,27 @@ pub fn codec_of(name: &str) -> Option<vidkit_core::codec::Codec> {
 /// `vainfo`'s decode profiles, run once per process. `None` if vainfo is
 /// missing or found no driver.
 pub fn vaapi_profiles() -> Option<Vec<(vidkit_core::codec::Codec, u8)>> {
-    static P: OnceLock<Option<Vec<(vidkit_core::codec::Codec, u8)>>> = OnceLock::new();
+    vainfo().as_ref().map(|(p, _)| p.clone())
+}
+
+/// `vainfo`, once: (decode profiles, has video processing). The DRM display
+/// first, as Asahi's AVD instructions use it: under Wayland, X or headless
+/// the default display can be absent or the wrong one. The environment is
+/// inherited, so a session's LIBVA_DRIVER_NAME (Asahi's v4l2_request layer)
+/// applies.
+fn vainfo() -> &'static Option<(Vec<(vidkit_core::codec::Codec, u8)>, bool)> {
+    static P: OnceLock<Option<(Vec<(vidkit_core::codec::Codec, u8)>, bool)>> = OnceLock::new();
     P.get_or_init(|| {
-        let out = Command::new("vainfo").stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
-        let p = vidkit_core::caps::parse_vainfo(&String::from_utf8_lossy(&out.stdout));
-        (!p.is_empty()).then_some(p)
+        for args in [&["--display", "drm"][..], &[][..]] {
+            let Ok(out) = Command::new("vainfo").args(args).stdin(Stdio::null()).stderr(Stdio::null()).output() else { return None };
+            let text = String::from_utf8_lossy(&out.stdout);
+            let p = vidkit_core::caps::parse_vainfo(&text);
+            if !p.is_empty() {
+                return Some((p, vidkit_core::caps::vainfo_has_video_proc(&text)));
+            }
+        }
+        None
     })
-    .clone()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -413,7 +431,15 @@ pub fn choose_accel(codec: &str, m: &Machine, pref: AccelPref) -> Accel {
         return Accel::V4l2m2m { decoder: m2m };
     }
     if m.kind == MachineKind::Asahi {
-        return Accel::Software;
+        // AVD is a V4L2 STATELESS decoder, which stock ffmpeg cannot drive.
+        // It is reachable only through the VA-API layer (libva-v4l2_request,
+        // sofus13's fork), and only for what that layer lists. The DRM node
+        // is AGX's; the VA driver is the V4L2 one, so no GPU-driver check.
+        let listed = matches!((&m.vaapi, codec_of(codec)), (Some(list), Some(c)) if list.iter().any(|(lc, _)| *lc == c));
+        return match (&m.render_node, listed && m.hwaccels.iter().any(|h| h == "vaapi")) {
+            (Some(node), true) => Accel::Vaapi { device: node.clone(), codec: codec.to_string(), vpp: m.vaapi_vpp },
+            _ => Accel::Software,
+        };
     }
     let vaapi_driver = m.gpu_driver.as_deref().is_some_and(|d| VAAPI_DRIVERS.contains(&d));
     if let (true, Some(node)) = (vaapi_driver, &m.render_node) {
@@ -427,7 +453,7 @@ pub fn choose_accel(codec: &str, m: &Machine, pref: AccelPref) -> Accel {
             (None, _) => true,
         };
         if listed && m.hwaccels.iter().any(|h| h == "vaapi") && VAAPI_CODECS.contains(&codec) {
-            return Accel::Vaapi { device: node.clone(), codec: codec.to_string() };
+            return Accel::Vaapi { device: node.clone(), codec: codec.to_string(), vpp: m.vaapi_vpp || m.vaapi.is_none() };
         }
     }
     Accel::Software
@@ -487,6 +513,7 @@ pub fn machine() -> &'static Machine {
             decoders: parse_decoders(&run(&["-hide_banner", "-decoders"])),
             hwaccels: parse_hwaccels(&run(&["-hide_banner", "-hwaccels"])),
             vaapi: vaapi_profiles(),
+            vaapi_vpp: vainfo().as_ref().is_some_and(|(_, v)| *v),
         }
     })
 }
@@ -554,7 +581,7 @@ pub fn video_args_fmt(src: &VideoInput, from: Duration, accel: &Accel, scale_to:
 
     match accel {
         Accel::Software => {}
-        Accel::Vaapi { device, codec } => {
+        Accel::Vaapi { device, codec, vpp } => {
             push(&mut a, &["-hwaccel", "vaapi", "-hwaccel_device", device]);
             // ffmpeg's DEFAULT AV1 decoder is libdav1d (registered first),
             // a software decoder that ignores -hwaccel: without naming the
@@ -564,7 +591,7 @@ pub fn video_args_fmt(src: &VideoInput, from: Duration, accel: &Accel, scale_to:
             if codec == "av1" {
                 push(&mut a, &["-c:v", "av1"]);
             }
-            if scale_to.is_some() {
+            if scale_to.is_some() && *vpp {
                 // Keep frames on the GPU so scale_vaapi can shrink them before
                 // the download; without this ffmpeg downloads full size.
                 push(&mut a, &["-hwaccel_output_format", "vaapi"]);
@@ -593,7 +620,7 @@ pub fn video_args_fmt(src: &VideoInput, from: Duration, accel: &Accel, scale_to:
 
     if let Some((w, h)) = scale_to {
         let vf = match accel {
-            Accel::Vaapi { .. } => format!("scale_vaapi=w={w}:h={h}:format={vaapi_fmt},hwdownload,format={vaapi_fmt}"),
+            Accel::Vaapi { vpp: true, .. } => format!("scale_vaapi=w={w}:h={h}:format={vaapi_fmt},hwdownload,format={vaapi_fmt}"),
             // Bilinear, not swscale's bicubic default: for a downscale of two
             // or less the difference is invisible at arm's length and it is
             // roughly half the work per pixel, which on a phone core is the
@@ -1219,7 +1246,7 @@ mod color_tests {
         assert_eq!(p.layout(), PlaneLayout::P010);
         let a = video_args_fmt(&VideoInput::file(Path::new("x")), Duration::ZERO, &Accel::Software, None, p.layout());
         assert!(a.windows(2).any(|w| w[0] == "-pix_fmt" && w[1] == "p010le"), "{a:?}");
-        let v = video_args_fmt(&VideoInput::file(Path::new("x")), Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "hevc".into() }, Some((1920, 1080)), PlaneLayout::P010);
+        let v = video_args_fmt(&VideoInput::file(Path::new("x")), Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "hevc".into(), vpp: true }, Some((1920, 1080)), PlaneLayout::P010);
         assert!(v.iter().any(|x| x.contains("format=p010,hwdownload,format=p010")), "{v:?}");
     }
 
@@ -1304,6 +1331,7 @@ mod vaapi_tests {
             decoders: vec![],
             hwaccels: vec!["vaapi".into()],
             vaapi: Some(vec![(Codec::H264, 8), (Codec::Vp9, 10)]),
+            vaapi_vpp: true,
         };
         assert_eq!(choose_accel("av1", &m, AccelPref::Auto), Accel::Software);
         assert!(matches!(choose_accel("vp9", &m, AccelPref::Auto), Accel::Vaapi { .. }));
@@ -1323,15 +1351,55 @@ mod av1_tests {
     #[test]
     fn vaapi_av1_names_the_native_decoder() {
         let src = VideoInput::file(Path::new("x.webm"));
-        let a = video_args(&src, Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "av1".into() }, None);
+        let a = video_args(&src, Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "av1".into(), vpp: true }, None);
         let (cv, i) = (a.windows(2).position(|w| w[0] == "-c:v" && w[1] == "av1"), a.iter().position(|x| x == "-i"));
         assert!(cv.is_some() && cv < i, "{a:?}");
         // VP9 needs nothing: the native vp9 decoder is the default.
-        let v = video_args(&src, Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "vp9".into() }, None);
+        let v = video_args(&src, Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "vp9".into(), vpp: true }, None);
         assert!(!v.iter().any(|x| x == "-c:v"), "{v:?}");
         // Software AV1 is left to ffmpeg's default -- libdav1d, the fastest.
         let sw = video_args(&src, Duration::ZERO, &Accel::Software, None);
         assert!(!sw.iter().any(|x| x == "-c:v"));
+    }
+}
+
+#[cfg(test)]
+mod asahi_tests {
+    use super::*;
+    use vidkit_core::codec::Codec;
+
+    fn asahi(vaapi: Option<Vec<(Codec, u8)>>) -> Machine {
+        Machine {
+            kind: MachineKind::Asahi,
+            gpu_driver: Some("asahi".into()),
+            render_node: Some("/dev/dri/renderD128".into()),
+            decoders: vec![],
+            hwaccels: vec!["vaapi".into()],
+            vaapi,
+            vaapi_vpp: false,
+        }
+    }
+
+    /// With the VA layer (the published M2 vainfo: H.264, HEVC, VP9), VP9
+    /// goes to VAAPI; AV1 on an M2 is software; without the layer, all is.
+    #[test]
+    fn asahi_uses_the_va_layer_for_what_it_lists() {
+        let with = asahi(Some(vec![(Codec::H264, 8), (Codec::Hevc, 10), (Codec::Vp9, 10)]));
+        assert!(matches!(choose_accel("vp9", &with, AccelPref::Auto), Accel::Vaapi { vpp: false, .. }));
+        assert_eq!(choose_accel("av1", &with, AccelPref::Auto), Accel::Software);
+        assert_eq!(choose_accel("vp9", &asahi(None), AccelPref::Auto), Accel::Software);
+    }
+
+    /// No video processing: a downscale must not go through scale_vaapi
+    /// (the filter fails on Asahi's VA layer); decode on the VA side, let
+    /// ffmpeg download, scale in software.
+    #[test]
+    fn without_video_processing_scaling_is_done_in_software() {
+        let src = VideoInput::file(Path::new("x.webm"));
+        let a = video_args(&src, Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "vp9".into(), vpp: false }, Some((1280, 720)));
+        assert!(a.iter().any(|x| x == "-hwaccel"), "still hardware decode: {a:?}");
+        assert!(!a.iter().any(|x| x.contains("scale_vaapi") || x == "-hwaccel_output_format"), "{a:?}");
+        assert!(a.iter().any(|x| x.starts_with("scale=1280:720")), "{a:?}");
     }
 }
 

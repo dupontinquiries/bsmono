@@ -165,9 +165,14 @@ pub fn probe(root: &Path) -> Probe {
 
     let lower: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
     let has_avd = lower.iter().any(|n| n.contains("avd") || n.contains("apple"));
-    let has_venus = lower
-        .iter()
-        .any(|n| n.contains("venus") || n.contains("qcom"));
+    // Venus, and Iris: the SC7280/QCM6490 video core moves from the Venus
+    // driver to Iris ("flip the switch", 2026; default from 6.21 when both
+    // are built). Iris reports as iris_driver / "Iris Decoder", which a
+    // venus|qcom match misses -- and on a cold boot no decoder may be bound
+    // at all, so the SoC's own compatible counts too.
+    let qcom_video_soc = compat.iter().any(|c| c == "qcom,qcm6490" || c == "qcom,sc7280");
+    let has_venus = qcom_video_soc
+        || lower.iter().any(|n| n.contains("venus") || n.contains("qcom") || n.contains("iris"));
 
     let detected = if let Some(soc) = apple_soc(&compat) {
         // Keyed on the SoC, not on the decoder node: the AVD may not be bound
@@ -183,7 +188,7 @@ pub fn probe(root: &Path) -> Probe {
                 .iter()
                 .find(|n| {
                     let l = n.to_lowercase();
-                    l.contains("venus") || l.contains("qcom")
+                    l.contains("venus") || l.contains("qcom") || l.contains("iris")
                 })
                 .cloned()
                 .unwrap_or_default(),
@@ -350,6 +355,20 @@ mod tests {
             "j274 was read as an SoC: {:?}",
             p.detected
         );
+    }
+
+    #[test]
+    fn an_iris_kernel_fp5_is_still_a_fairphone() {
+        for name in ["qcom-iris-decoder", "Iris Decoder", "iris_driver"] {
+            let r = FakeRoot::new(&format!("iris-{}", name.len()));
+            r.write("proc/device-tree/compatible", b"fairphone,fp5\0qcom,qcm6490\0").v4l2("video0", name);
+            let p = probe(r.path());
+            assert!(matches!(p.detected, Detected::QualcommVenus { .. }), "{name}: {:?}", p.detected);
+        }
+        // No decoder bound yet (cold boot): the SoC compatible alone says it.
+        let r = FakeRoot::new("iris-unbound");
+        r.write("proc/device-tree/compatible", b"fairphone,fp5\0qcom,qcm6490\0");
+        assert!(matches!(probe(r.path()).detected, Detected::QualcommVenus { .. }));
     }
 
     #[test]

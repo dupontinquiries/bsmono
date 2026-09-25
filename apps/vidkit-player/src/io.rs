@@ -1095,7 +1095,9 @@ pub fn assumed_caps() -> vidkit_core::caps::DeviceCaps {
     // this player targets.
     let p = vidkit_v4l2::sysprobe::probe(std::path::Path::new("/"));
     if let Some(caps) = vidkit_v4l2::sysprobe::caps_for(&p) {
-        return caps;
+        // What THIS player can use of it: a stateless decoder (Asahi's AVD)
+        // only through a VA-API layer that vainfo lists.
+        return vidkit_core::caps::usable_by_ffmpeg(caps, crate::decode::vaapi_profiles().as_deref());
     }
     // Unidentified. The probe refuses to guess and so does this: a desktop
     // profile is the safe default because it assumes the least about what is

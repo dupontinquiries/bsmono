@@ -581,6 +581,63 @@ pub fn parse_vainfo(text: &str) -> Vec<(Codec, u8)> {
     out
 }
 
+/// Whether the VA driver offers video processing (`VAProfileNone :
+/// VAEntrypointVideoProc`) -- what `scale_vaapi` needs. Pure.
+///
+/// Intel and AMD drivers list it; Asahi's VA-API-over-V4L2-stateless layer
+/// (libva-v4l2_request, sofus13's AVD fork) does not: its published vainfo
+/// has decode profiles only. Scaling on the VA side there fails outright.
+pub fn vainfo_has_video_proc(text: &str) -> bool {
+    text.lines().any(|l| {
+        let mut p = l.split(':').map(str::trim);
+        matches!((p.next(), p.next()), (Some("VAProfileNone"), Some("VAEntrypointVideoProc")))
+    })
+}
+
+/// What an ffmpeg-based player can actually USE of a device's decoders.
+/// Pure.
+///
+/// Stock ffmpeg cannot drive a V4L2 STATELESS decoder (Asahi's AVD; the
+/// Request API) without out-of-tree patches -- Asahi's own August 2026
+/// report says so. Such a decoder is usable here only through a VA-API
+/// translation layer (libva-v4l2_request), i.e. when `vainfo` lists the
+/// codec: then it becomes a VAAPI path. Otherwise it is software, costed as
+/// software, so the selector's cost-first order stops choosing streams as
+/// if they were hardware-decoded. Stateful V4L2 (Qualcomm Venus/Iris) is
+/// untouched: ffmpeg's *_v4l2m2m decoders drive it.
+pub fn usable_by_ffmpeg(mut caps: DeviceCaps, vaapi: Option<&[(Codec, u8)]>) -> DeviceCaps {
+    for cap in caps.caps.iter_mut().filter(|c| c.backend == Backend::V4l2Stateless) {
+        match vaapi.and_then(|v| v.iter().find(|(c, _)| *c == cap.codec)) {
+            Some(&(_, depth)) => {
+                cap.backend = Backend::Vaapi;
+                cap.max_bit_depth = cap.max_bit_depth.min(depth);
+            }
+            None => {
+                cap.cost = Cost::SoftwareSimd;
+                cap.delivery = Delivery::CpuPlanes;
+                cap.backend = if cap.codec == Codec::Av1 { Backend::Dav1d } else { Backend::FfmpegSw };
+            }
+        }
+    }
+    // vainfo is authoritative over the static table: a codec the VA layer
+    // lists is hardware here even where the table only knows software.
+    // (asahi_m_series predates AVD's HEVC and VP9 support, which Asahi's
+    // August 2026 report calls "mostly reliable on all machines", and which
+    // the published M2 vainfo lists.)
+    for &(codec, depth) in vaapi.unwrap_or(&[]) {
+        let has_hw = caps.caps.iter().any(|c| c.codec == codec && c.cost == Cost::Fixed);
+        if let (false, Some(tpl)) = (has_hw, caps.caps.iter().find(|c| c.codec == codec).cloned()) {
+            caps.caps.push(DecodeCap { cost: Cost::Fixed, backend: Backend::Vaapi, delivery: Delivery::CpuPlanes, max_bit_depth: depth, ..tpl });
+        }
+    }
+    let how = match vaapi {
+        Some(v) if !v.is_empty() => "stateless decode via VA-API",
+        _ => "no VA-API layer: stateless decode unusable, software",
+    };
+    caps.name = format!("{} [{how}]", caps.name);
+    caps
+}
+
 /// A desktop/laptop's caps from what its VAAPI driver really decodes.
 ///
 /// `desktop_full_hw` ASSUMES fixed-function AV1, VP9, HEVC and H.264. Most
@@ -1053,5 +1110,55 @@ vainfo: Supported profile and entrypoints
         assert_eq!(cost(Codec::H264), Some(Cost::Fixed));
         assert!(Cost::Fixed < Cost::SoftwareSimd, "the selector's order relies on this");
         assert!(caps.name.contains("Vp9 10-bit") && !caps.name.contains("Av1"), "{}", caps.name);
+    }
+
+    /// Verbatim from nixos-apple-silicon PR #544 (2026-09-09): an M2 MacBook
+    /// Air (t8112-j413) with the sofus13 libva-v4l2_request layer. Note the
+    /// missing space before the colon on the first profile line, and no
+    /// VideoProc entrypoint at all.
+    const VAINFO_ASAHI_M2: &str = "Trying display: wayland
+libva info: VA-API version 1.24.0
+libva info: User environment variable requested driver 'v4l2_request-sofus13'
+libva info: Trying to open /run/opengl-driver/lib/dri/v4l2_request-sofus13_drv_video.so
+libva info: Found init function __vaDriverInit_1_24
+libva-v4l2request: detected 1 Request API decoder
+libva info: va_openDriver() returns 0
+vainfo: VA-API version: 1.24 (libva 2.24.0)
+vainfo: Driver version: v4l2-request
+vainfo: Supported profile and entrypoints
+      VAProfileH264ConstrainedBaseline: VAEntrypointVLD
+      VAProfileH264Main               : VAEntrypointVLD
+      VAProfileH264High               : VAEntrypointVLD
+      VAProfileHEVCMain               : VAEntrypointVLD
+      VAProfileHEVCMain10             : VAEntrypointVLD
+      VAProfileVP9Profile0            : VAEntrypointVLD
+      VAProfileVP9Profile2            : VAEntrypointVLD
+";
+
+    #[test]
+    fn the_real_asahi_vainfo_parses_and_has_no_video_processing() {
+        let p = parse_vainfo(VAINFO_ASAHI_M2);
+        assert_eq!(p, vec![(Codec::H264, 8), (Codec::Hevc, 10), (Codec::Vp9, 10)]);
+        assert!(!vainfo_has_video_proc(VAINFO_ASAHI_M2), "no scale_vaapi on Asahi");
+        let intel = format!("{VAINFO_KABY_LAKE}      VAProfileNone                   :\tVAEntrypointVideoProc\n");
+        assert!(vainfo_has_video_proc(&intel));
+    }
+
+    /// Asahi without the VA-API layer: every stateless codec is software for
+    /// an ffmpeg player. With it: exactly the listed ones are hardware.
+    #[test]
+    fn stateless_decoders_count_only_through_va_api() {
+        // The cheapest path per codec -- what the selector uses; caps list a
+        // hardware path and a software fallback side by side.
+        let cost = |c: &DeviceCaps, k: Codec| c.caps.iter().filter(|x| x.codec == k).min_by_key(|x| x.cost).map(|x| (x.cost, x.backend));
+        let bare = usable_by_ffmpeg(asahi_m_series(), None);
+        assert_eq!(cost(&bare, Codec::H264), Some((Cost::SoftwareSimd, Backend::FfmpegSw)));
+        assert!(bare.name.contains("no VA-API layer"));
+        let with = usable_by_ffmpeg(asahi_m_series(), Some(&parse_vainfo(VAINFO_ASAHI_M2)));
+        assert_eq!(cost(&with, Codec::H264), Some((Cost::Fixed, Backend::Vaapi)));
+        assert_eq!(cost(&with, Codec::Vp9), Some((Cost::Fixed, Backend::Vaapi)));
+        // Stateful (the FP5's Venus/Iris) is left alone: v4l2m2m drives it.
+        let fp5 = usable_by_ffmpeg(fairphone_venus(), None);
+        assert_eq!(cost(&fp5, Codec::Vp9), Some((Cost::Fixed, Backend::V4l2Stateful)));
     }
 }
