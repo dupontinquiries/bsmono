@@ -1954,11 +1954,30 @@ pub fn run_abilityfx_shots() -> Result<(), String> {
         renderer.render_frame(&view, cam, game.t);
         save_shot(&renderer.device, &renderer.queue, &target, name)?;
         println!("saved {name} ({} afterimages, {} particles)", vfx.afterimages.len(), vfx.particles.len());
+        // and the same frame without the dust, to find it by difference
+        if !vfx.dust.is_empty() {
+            let mut nodust = std::mem::take(&mut vfx.dust);
+            scene.draw(renderer, &game, &mut vfx, cam);
+            renderer.render_frame(&view, cam, game.t);
+            save_shot(&renderer.device, &renderer.queue, &target, &name.replace(".png", "_nodust.png"))?;
+            println!("  ({} dust)", nodust.len());
+            std::mem::swap(&mut vfx.dust, &mut nodust);
+        }
+        // and without the rings, to identify what is left
+        if name.contains("nova") {
+            let rings = std::mem::take(&mut vfx.rings);
+            let n_rings = rings.len();
+            scene.draw(renderer, &game, &mut vfx, cam);
+            renderer.render_frame(&view, cam, game.t);
+            save_shot(&renderer.device, &renderer.queue, &target, &name.replace(".png", "_norings.png"))?;
+            println!("  ({n_rings} rings)");
+            vfx.rings = rings;
+        }
         Ok(())
     };
     let side = Camera { eye: spot + Vec3::new(4.5, 3.0, -7.5), target: spot + Vec3::new(4.5, 0.8, 0.0), fov_y: 0.9 };
     run(&mut renderer, "Goldenmane", |a| matches!(a, crate::gods::Archetype::Dash { .. }), 12, "abilityfx_dash.png", side)?;
-    run(&mut renderer, "Oldroar", |a| matches!(a, crate::gods::Archetype::Nova { .. }), 25, "abilityfx_nova.png", side)?;
+    run(&mut renderer, "Oldroar", |a| matches!(a, crate::gods::Archetype::Nova { .. }), 42, "abilityfx_nova.png", side)?;
     run(&mut renderer, "Suneye", |a| matches!(a, crate::gods::Archetype::Bolt { .. }), 22, "abilityfx_bolt.png", side)?;
     Ok(())
 }

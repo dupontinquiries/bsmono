@@ -77,9 +77,7 @@ the single highest-value thing anyone can do with this repo next.
   (nothing off-screen reflects). Ability visuals beyond channels and storms
   are unchanged -- each archetype's cast/impact wants its own upgrade pass.
   Done since: dash/blink afterimages, bolt trails, a nova dust wave (lit,
-  non-emissive -- `Vfx::dust`). The nova's dust has NOT been confirmed on
-  screen: in the abilityfx frame the nova's older ring (cream cubes in
-  Oldroar's pale colour) dominates; its size and colour want a look.
+  non-emissive -- `Vfx::dust`; confirmed on screen mid-blast: 45k pixels).
   Still to upgrade: volleys, lobs, beams (heat haze), rings, pulls, heals,
   shields (a glass dome), buffs.
 
