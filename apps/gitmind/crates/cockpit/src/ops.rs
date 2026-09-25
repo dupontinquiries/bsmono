@@ -36,6 +36,45 @@ pub fn cargo_bin() -> String {
     "cargo".to_string()
 }
 
+/// The toolchain name in `rustup show active-toolchain`'s reply: its first
+/// token. Current rustup prints `stable-aarch64-unknown-linux-gnu (default)` or
+/// `1.96.0-x86_64-unknown-linux-gnu (overridden by '/path/rust-toolchain.toml')`;
+/// `info:` / `error:` lines and blanks are skipped. None when there is no name.
+pub fn parse_active_toolchain(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("info:") && !l.starts_with("error:") && !l.starts_with("warning:"))
+        .and_then(|l| l.split_whitespace().next())
+        .map(str::to_string)
+}
+
+/// `RUSTUP_TOOLCHAIN=<the toolchain active for app_dir>`, to pin every nested
+/// rustc. Cargo runs `rustc` for each registry crate FROM THAT CRATE'S source
+/// directory, and the rustup proxy picks a toolchain from a `rust-toolchain`
+/// file found there unless RUSTUP_TOOLCHAIN says otherwise: hound 3.5.1 ships
+/// one pinning 1.40.0, dashmap 5.5.3 one pinning 1.65 with clippy -- and a
+/// build of unendlich or studio launched from gitmind on Fedora Asahi tried to
+/// install both and failed in `hound`. Resolved for the APP's directory, so the
+/// app's own pin (or the user's default) is what everything builds with.
+/// None when the caller already set RUSTUP_TOOLCHAIN (theirs passes through),
+/// or rustup is absent or says nothing usable.
+pub fn rustup_pin(app_dir: &Path, path_env: &str) -> Option<(String, String)> {
+    if std::env::var_os("RUSTUP_TOOLCHAIN").is_some() {
+        return None;
+    }
+    let out = std::process::Command::new("rustup")
+        .args(["show", "active-toolchain"])
+        .current_dir(app_dir)
+        .env("PATH", path_env)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_active_toolchain(&String::from_utf8_lossy(&out.stdout)).map(|t| ("RUSTUP_TOOLCHAIN".to_string(), t))
+}
+
 /// A PATH that includes ~/.cargo/bin and the standard locations, so a build (and its
 /// rustc/linker subprocesses) resolves even from a launcher.
 pub fn tool_path_env() -> String {
@@ -371,13 +410,18 @@ pub fn build_locally_cancellable(
     // case this flag was written for, a native build never got -crt-static and
     // shipped a static binary that died with NoWaylandLib. Reported as exactly
     // that, with the build log showing NO environment lines at all.
-    let build_env = crate::buildflags::build_env_for_native(
+    let mut build_env = crate::buildflags::build_env_for_native(
         &cargo_target,
         &native,
         gui,
         std::env::var("RUSTFLAGS").ok().as_deref(),
         &path_env,
     );
+    // Pin nested rustc proxies to the app's toolchain (see rustup_pin): a
+    // dependency's own rust-toolchain file must not pick the compiler.
+    if let Some(pin) = rustup_pin(app_dir, &path_env) {
+        build_env.push(pin);
+    }
     on_line(&format!("$ cargo {}", argv[1..].join(" ")));
     on_line(&format!("  (in {})", app_dir.display()));
     for (k, v) in &build_env {
@@ -898,5 +942,21 @@ mod fallback_tests {
         assert!(err.contains("no Cargo.toml"), "{err}");
         assert!(!err.contains("podman"), "no fallback was attempted, so podman must not appear: {err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod rustup_pin_tests {
+    use super::parse_active_toolchain;
+
+    #[test]
+    fn the_active_toolchain_is_read_from_rustups_reply() {
+        assert_eq!(parse_active_toolchain("stable-aarch64-unknown-linux-gnu (default)\n").as_deref(), Some("stable-aarch64-unknown-linux-gnu"));
+        assert_eq!(parse_active_toolchain("1.96.0-x86_64-unknown-linux-gnu (overridden by '/src/app/rust-toolchain.toml')\n").as_deref(),
+                   Some("1.96.0-x86_64-unknown-linux-gnu"));
+        assert_eq!(parse_active_toolchain("info: syncing channel updates for 'stable'\nstable-x86_64-unknown-linux-gnu (default)\n").as_deref(),
+                   Some("stable-x86_64-unknown-linux-gnu"), "info lines are skipped");
+        assert_eq!(parse_active_toolchain(""), None);
+        assert_eq!(parse_active_toolchain("error: no default toolchain configured\n"), None);
     }
 }
