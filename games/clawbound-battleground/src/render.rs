@@ -258,6 +258,8 @@ pub struct Renderer {
     shadow_tex: wgpu::Texture,
     shadow_view: wgpu::TextureView,
     shadow_sampler: wgpu::Sampler,
+    /// The shadow map's side, texels (`Quality::shadow_size`; `set_shadow_size`).
+    pub shadow_size: u32,
 
     terrain_vbuf: wgpu::Buffer,
     terrain_ibuf: wgpu::Buffer,
@@ -845,6 +847,7 @@ impl Renderer {
             shadow_tex,
             shadow_view,
             shadow_sampler,
+            shadow_size: SHADOW_SIZE,
             terrain_vbuf,
             terrain_ibuf,
             terrain_count,
@@ -1042,6 +1045,40 @@ impl Renderer {
         out
     }
 
+    /// Resize the shadow map (the quality setting): a new texture, and the
+    /// main bind group that samples it, rebuilt. A no-op at the same size.
+    pub fn set_shadow_size(&mut self, size: u32) {
+        let size = size.clamp(256, 4096);
+        if size == self.shadow_size {
+            return;
+        }
+        self.shadow_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow map"),
+            size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.shadow_view = self.shadow_tex.create_view(&Default::default());
+        self.main_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("main bind"),
+            layout: &self.main_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.frame_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &self.draw_buf, offset: 0, size: std::num::NonZeroU64::new(std::mem::size_of::<DrawData>() as u64) }),
+                },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.shadow_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.shadow_sampler) },
+            ],
+        });
+        self.shadow_size = size;
+    }
+
     pub fn set_fur_style(&mut self, s: FurStyle) {
         self.fur_style = s;
         (self.fur_shells, self.fur_density) = s.shells_density();
@@ -1118,6 +1155,15 @@ impl Renderer {
     }
 
     pub fn set_particles(&mut self, p: Vec<VoxInst>) {
+        // the quality setting thins the particles: every Nth kept, so each
+        // effect keeps its shape with fewer cubes (Low: a third)
+        let keep = self.quality.particle_scale().clamp(0.05, 1.0);
+        let p: Vec<VoxInst> = if keep >= 0.999 {
+            p
+        } else {
+            let step = (1.0 / keep).round().max(1.0) as usize;
+            p.into_iter().enumerate().filter(|(k, _)| k % step == 0).map(|(_, v)| v).collect()
+        };
         self.particles = p;
     }
 
@@ -1150,7 +1196,7 @@ impl Renderer {
         // texel, a third of a voxel, so every shadow was a blob. It is now
         // aimed at what the camera is looking at and sized to the view.
         let half = crate::groundfx::shadow_half_extent(cam.eye.distance(cam.target));
-        let lvp = crate::groundfx::fit_shadow(cam.target, sun, half, SHADOW_SIZE);
+        let lvp = crate::groundfx::fit_shadow(cam.target, sun, half, self.shadow_size);
 
         let fog_color = [atm.fog_color[0], atm.fog_color[1], atm.fog_color[2], 1.0];
         let frame = FrameUniform {
