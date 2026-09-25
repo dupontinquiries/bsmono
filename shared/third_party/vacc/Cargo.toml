@@ -1,0 +1,40 @@
+# Vendored: upstream's root is also a package (`vacc`, a unified API over the
+# backends with automatic fallback) depending on the NVDEC and VAAPI crates
+# not vendored here; only the workspace definition is kept. See VENDORED.md.
+[workspace]
+members = [
+    "crates/vacc-core",
+    "crates/vacc-common",
+    "crates/vacc-parser",
+    "crates/vacc-vulkan",
+    "crates/vacc-vulkan-decode",
+    "crates/vacc-vulkan-common",
+    "crates/vacc-software-decode",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Vulkan Video Decoder library in Rust"
+repository = "https://github.com/andreytkachenko/vacc"
+
+[workspace.dependencies]
+vacc-core = { path = "crates/vacc-core", version = "0.1.1" }
+vacc-common = { path = "crates/vacc-common", version = "0.1.1" }
+vacc-vulkan = { path = "crates/vacc-vulkan", version = "0.1.1" }
+vacc-parser = { path = "crates/vacc-parser", version = "0.1.1" }
+vacc-nvdec-decode = { path = "crates/vacc-nvdec-decode", version = "0.1.1" }
+vacc-vaapi-decode = { path = "crates/vacc-vaapi-decode", version = "0.1.1" }
+vacc-software-decode = { path = "crates/vacc-software-decode", version = "0.1.1" }
+vacc-vulkan-decode = { path = "crates/vacc-vulkan-decode", version = "0.1.1" }
+vacc-vulkan-common = { path = "crates/vacc-vulkan-common", version = "0.1.1" }
+ash = "0.38"
+bytemuck = { version = "1", features = ["derive"] }
+rayon = "1"
+bitflags = "2"
+thiserror = "2"
+log = "0.4"
+tracing = "0.1"
+libloading = "0.8"

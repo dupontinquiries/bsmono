@@ -1,0 +1,14 @@
+[package]
+name = "vacc-software-decode"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Software (CPU) video decode backends for vacc: H.264/AVC (edge264 port) and H.265/HEVC (hevc.js port)"
+
+[dependencies]
+vacc-common = { workspace = true }
+vacc-core = { workspace = true }
+vacc-parser = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }

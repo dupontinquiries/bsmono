@@ -1,0 +1,17 @@
+[package]
+name = "vidkit-vacc"
+version = "0.1.0"
+edition = "2021"
+description = "In-process decode through vendored vacc (Vulkan Video, CPU): its frames as vidkit frames, streaming."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+vidkit-core = { path = "../vidkit-core" }
+vacc-core = { path = "../../../third_party/vacc/crates/vacc-core" }
+vacc-software-decode = { path = "../../../third_party/vacc/crates/vacc-software-decode" }
+# Vulkan Video through ash. Builds without a GPU (libvulkan is loaded at
+# runtime); does not stream yet -- see third_party/vacc/VENDORED.md.
+vacc-vulkan-decode = { path = "../../../third_party/vacc/crates/vacc-vulkan-decode", optional = true }
+
+[features]
+vulkan = ["dep:vacc-vulkan-decode"]
