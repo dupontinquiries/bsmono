@@ -379,7 +379,7 @@ pub fn stamp_template(
 
 /// Same fallback brightness as the chunk mesher uses when no sky is
 /// available (used in tests + headless paths).
-fn fallback_face_brightness(normal: [f32; 3]) -> f32 {
+pub(crate) fn fallback_face_brightness(normal: [f32; 3]) -> f32 {
     // Roughly match FACE_LIGHT in mesher.rs.
     if normal[1] > 0.5 { return 1.0; }      // +Y top
     if normal[1] < -0.5 { return 0.5; }     // -Y bottom

@@ -2826,17 +2826,40 @@ pub(crate) fn decorate_chunk_styled(
     ];
     let plant_budget = plant_stamp_budget_for_chunk(chunk_center);
     let mut plant_stamps_used: u32 = 0;
+    // Canopy depth (world::foliage_depth): leaves more than FULL_DEPTH blocks
+    // from the air are drawn as a cheap filled core instead of a ~800-triangle
+    // template, and do not use the stamp budget -- it goes to leaves that can
+    // be seen. Computed only for chunks that hold leaves.
+    let is_leaf_block = |b: BlockId| matches!(b, BlockId::OakLeaves | BlockId::BirchLeaves);
+    let leaf_depth = chunk.plant_indices.iter().any(|&i| is_leaf_block(chunk.blocks[i as usize]))
+        .then(|| crate::world::foliage_depth::leaf_depths(n as usize, |x, y, z| is_leaf_block(chunk.get(x as i32, y as i32, z as i32))));
     // Iterate the inverted plant index instead of scanning every cell.
     // For a chunk with no plants this loop is empty (zero cost). For a
     // forested surface chunk with ~200 plant blocks, we visit 200 cells
     // instead of 32k. Big win for tick perf too once lifecycle handlers
     // share this same indexing.
     for &plant_idx in &chunk.plant_indices {
-        if plant_stamps_used >= plant_budget {
-            break;
-        }
         let (lx, ly, lz) = Chunk::index_to_xyz(plant_idx);
         let block = chunk.blocks[plant_idx as usize];
+        if let (Some(depths), true) = (&leaf_depth, is_leaf_block(block)) {
+            use crate::world::foliage_depth as fd;
+            let (ux, uy, uz) = (lx as usize, ly as usize, lz as usize);
+            if fd::depth_at(depths, n as usize, ux, uy, uz) > fd::FULL_DEPTH {
+                let faces = fd::fill_faces(depths, n as usize, ux, uy, uz);
+                let age = chunk.instance_state.get(&plant_idx).copied().unwrap_or_default().age_ticks;
+                let decay = crate::world::leaf_decay::decay_color_modulation(age);
+                let org = [(origin[0] + lx) as f32, (origin[1] + ly) as f32, (origin[2] + lz) as f32];
+                fd::emit_fill(&mut mesh.vertices, &mut mesh.indices, org, faces, decay, |nrm| match sky {
+                    Some(s) => s.face_brightness(nrm),
+                    None => crate::world::subvoxel_templates::fallback_face_brightness(nrm), // the templates' own
+                });
+                continue; // the core: not a stamp, not counted against the budget
+            }
+        }
+        // Over budget: skip (not break) -- a core leaf further on still needs its fill.
+        if plant_stamps_used >= plant_budget {
+            continue;
+        }
         // Defensive: if the index got stale (shouldn't happen — set()
         // maintains it), skip. has_subvoxels is the gate.
         if !block.has_subvoxels() { continue; }

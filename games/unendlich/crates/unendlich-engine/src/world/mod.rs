@@ -34,6 +34,8 @@ pub mod entity_sanitize; // r-exploding-tris: NaN/Inf guard for the entity rende
 pub mod fields;
 pub mod flight;
 pub mod leaf_decay;
+/// Canopy depth: full leaf templates near the air, a cheap filled core inside.
+pub mod foliage_depth;
 pub mod lod;
 pub mod material_response;
 pub mod noise;
