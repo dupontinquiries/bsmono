@@ -1360,6 +1360,15 @@ fn save_snap(enc: &snapclone_egui::media_encode::Encoded) -> Result<String, Stri
 impl eframe::App for App {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // SNAPCLONE_INPUT_LOG=1: each frame's keys / text / IME / clicks /
+        // window focus, and focus changes, on stderr (input_log). For the
+        // one-character fields no harness reproduces.
+        let log_input = std::env::var_os("SNAPCLONE_INPUT_LOG").is_some();
+        let (log_events, focus_before) = if log_input {
+            (ctx.input(|i| i.events.clone()), ctx.memory(|m| m.focused()))
+        } else {
+            (Vec::new(), None)
+        };
         let prefs = settings_kit::Prefs::default();
         self.snap.apply_settings(ctx, &prefs);
 
@@ -1419,6 +1428,12 @@ impl eframe::App for App {
         // from sitting unhandled for a frame.
         let cmds = self.snap.drain_commands();
         self.handle(cmds);
+
+        if log_input {
+            if let Some(l) = snapclone_egui::input_log::line(&log_events, focus_before, ctx.memory(|m| m.focused())) {
+                eprintln!("input: {l}");
+            }
+        }
     }
 }
 

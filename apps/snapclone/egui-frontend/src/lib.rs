@@ -136,6 +136,8 @@ pub mod trace_channels;
 pub mod voice_bridge;
 /// The codec seam: Opus out when the frame allows, raw or Opus in, one decoder per speaker.
 pub mod voice_codec;
+/// SNAPCLONE_INPUT_LOG: what the platform delivers, per frame (see the binary).
+pub mod input_log;
 /// The receive path: Opus frames in sequence order, gaps concealed (voice_playout + voice_codec).
 pub mod voice_rx;
 pub mod voice_wire;
@@ -6220,6 +6222,157 @@ mod tests {
         }
         assert_eq!(landed.as_deref(), Some("abc"),
                    "a field reached by Tab must keep every character, not the first");
+    }
+
+    /// The same field, reached and typed into the way a person does it: a
+    /// CLICK to focus (pointer moved, pressed, released) and, per character,
+    /// the three events winit delivers -- Key pressed, Text, Key released --
+    /// rather than Tab and a bare Event::Text.
+    #[test]
+    fn typing_after_a_click_with_real_key_events_keeps_every_character() {
+        use egui::{Context, Event, Key, PointerButton, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        app.nav.go_page(2);
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let mut frame = |ctx: &Context, app: &mut Snapclone, events: Vec<Event>| {
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        };
+        frame(&ctx, &mut app, vec![]);
+        // Find the field and its rect (Tab until typing lands in it).
+        let tab = Event::Key { key: Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        let mut field = None;
+        for _ in 0..20 {
+            frame(&ctx, &mut app, vec![tab.clone()]);
+            let id = ctx.memory(|m| m.focused());
+            frame(&ctx, &mut app, vec![Event::Text("x".into())]);
+            if app.picker.query == "x" { field = id; break; }
+        }
+        let id = field.expect("the picker query field is reachable");
+        let rect = ctx.read_response(id).expect("the field drew last frame").rect;
+        app.picker.query.clear();
+        // Drop focus with a click on empty space, then click the field.
+        let click = |p: Pos2| vec![
+            vec![Event::PointerMoved(p), Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: true, modifiers: Default::default() }],
+            vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: false, modifiers: Default::default() }],
+        ];
+        ctx.memory_mut(|m| m.surrender_focus(id));
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(ctx.memory(|m| m.focused()), None);
+        for ev in click(rect.center()) { frame(&ctx, &mut app, ev); }
+        assert_eq!(ctx.memory(|m| m.focused()), Some(id), "a click focuses the field");
+        for (ch, key) in [('a', Key::A), ('b', Key::B), ('c', Key::C)] {
+            let k = |pressed| Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: Default::default() };
+            frame(&ctx, &mut app, vec![k(true), Event::Text(ch.to_string())]);
+            frame(&ctx, &mut app, vec![k(false)]);
+        }
+        assert_eq!(app.picker.query, "abc", "typed after a click, with key events, every character must land");
+    }
+
+    /// Diagnostic: every focus stop on pages 1-3, typed into with real key
+    /// events; prints whether focus survives each character, and the four
+    /// reported fields' text.
+    #[test]
+    #[ignore = "diagnostic: which text fields lose focus after one character"]
+    fn which_fields_keep_focus_while_typing() {
+        use egui::{Context, Event, Key, Pos2, RawInput};
+        let adaptive = Adaptive::default();
+        for (w, h) in [(400.0f32, 800.0f32)] {
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(w, h));
+        for page in 1..=3usize {
+            let ctx = Context::default();
+            let mut app = app();
+            app.conversation_peer = "sc-11223344".into();
+            app.add_landmark = Some(crate::landmark::AddLandmark::new(None));
+            app.nav.go_page(page);
+            let mut frame = |app: &mut Snapclone, events: Vec<Event>| {
+                let _ = ctx.run(RawInput { events, screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                    app.apply_settings(ctx, &settings_kit::Prefs::default());
+                    egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+                });
+            };
+            frame(&mut app, vec![]);
+            let tab = Event::Key { key: Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+            let mut seen = std::collections::HashSet::new();
+            for stop in 0..40 {
+                frame(&mut app, vec![tab.clone()]);
+                let Some(id) = ctx.memory(|m| m.focused()) else { continue };
+                if !seen.insert(id) { continue; }
+                let before = (app.conversation.draft.clone(), app.add_form.host.clone(), app.add_form.port.clone(),
+                              app.add_landmark.as_ref().map(|d| d.name.clone()).unwrap_or_default(), app.picker.query.clone());
+                let mut trail = Vec::new();
+                // What is painted inside the widget: its hint or label names it.
+                let label = {
+                    let r = ctx.read_response(id).map(|r| r.rect).unwrap_or(egui::Rect::NOTHING);
+                    let out = ctx.run(RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+                    });
+                    out.shapes.iter().filter_map(|c| match &c.shape {
+                        egui::epaint::Shape::Text(t) if r.expand(2.0).contains(t.pos + egui::vec2(1.0, 1.0)) => Some(t.galley.text().to_string()),
+                        _ => None,
+                    }).collect::<Vec<_>>().join(" | ")
+                };
+                eprintln!("  stop {stop} {id:?} shows [{label}]");
+                for (ch, key) in [('a', Key::A), ('b', Key::B), ('c', Key::C)] {
+                    let k = |pressed| Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: Default::default() };
+                    frame(&mut app, vec![k(true), Event::Text(ch.to_string())]);
+                    frame(&mut app, vec![k(false)]);
+                    trail.push(ctx.memory(|m| m.focused()) == Some(id));
+                }
+                let after = (app.conversation.draft.clone(), app.add_form.host.clone(), app.add_form.port.clone(),
+                             app.add_landmark.as_ref().map(|d| d.name.clone()).unwrap_or_default(), app.picker.query.clone());
+                if before != after || trail.iter().any(|k| !k) {
+                    let rect = ctx.read_response(id).map(|r| r.rect);
+                    eprintln!("SIZE {w}x{h} PAGE {page} stop {stop} {id:?} at {rect:?}: focus kept per char {trail:?}; draft/host/port/landmark/picker {after:?}");
+                }
+            }
+        }
+        }
+    }
+
+    /// The "search friends" field typed into the way winit delivers keys under an
+    /// input method (IBus on Wayland): Enabled, then per key a Preedit and a
+    /// Commit, with the Key events around them. Written for the Fedora Asahi
+    /// report of fields keeping one character; it passes -- the UI layer
+    /// accepts IME input -- which is what points the search below it (see
+    /// the binary's SNAPCLONE_INPUT_LOG).
+    #[test]
+    fn typing_through_an_input_method() {
+        use egui::{Context, Event, ImeEvent, Key, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        app.nav.go_page(2);
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let mut frame = |app: &mut Snapclone, events: Vec<Event>| {
+            let out = ctx.run(RawInput { events, screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+            out.platform_output.ime
+        };
+        frame(&mut app, vec![]);
+        let tab = Event::Key { key: Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        for _ in 0..20 {
+            frame(&mut app, vec![tab.clone()]);
+            frame(&mut app, vec![Event::Text("x".into())]);
+            if app.picker.query == "x" { break; }
+        }
+        let field = ctx.memory(|m| m.focused());
+        app.picker.query.clear();
+        let ime = frame(&mut app, vec![Event::Ime(ImeEvent::Enabled)]);
+        assert!(ime.is_some(), "a focused field asks the platform for its input method");
+        for (ch, key) in [('a', Key::A), ('b', Key::B), ('c', Key::C)] {
+            let k = |pressed| Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: Default::default() };
+            let ime = frame(&mut app, vec![k(true), Event::Ime(ImeEvent::Preedit(ch.to_string()))]);
+            let ime2 = frame(&mut app, vec![Event::Ime(ImeEvent::Commit(ch.to_string())), Event::Ime(ImeEvent::Preedit(String::new()))]);
+            frame(&mut app, vec![k(false)]);
+            assert_eq!(ctx.memory(|m| m.focused()), field, "focus kept after {ch}");
+            assert!(ime.is_some() && ime2.is_some(), "the field keeps the input method open");
+        }
+        assert_eq!(app.picker.query, "abc", "every committed character lands");
     }
 
     #[test]
