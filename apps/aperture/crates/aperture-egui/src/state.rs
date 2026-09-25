@@ -2273,6 +2273,16 @@ impl AppState {
 
     fn key(&mut self, key: K, ctrl: bool, shift: bool, alt: bool, now_ms: u64, fx: &mut Effects) {
         use K::*;
+        // A key that edits or moves ends any composition on screen. The
+        // preedit was cleared only by an empty Preedit or a TEXT insertion,
+        // so Enter / Tab / Backspace / arrows left the last composing text
+        // painted at the NEW caret -- the Fedora (IBus) report: `"strings"`,
+        // Enter, and `ngs"` drawn on the new indented line, not in the
+        // buffer. A composition that really continues sends its preedit
+        // again and is shown again.
+        if !self.preedit.is_empty() && !matches!(key, Escape) {
+            self.preedit.clear();
+        }
         // Popup first: an explicit list outranks the speculative ghost.
         if self.popup_key(key, shift, now_ms) {
             return;
@@ -5184,6 +5194,23 @@ mod tests {
         assert!(got, "note arrived");
         assert_eq!(s2.rev_note.chars().count(), 60, "truncated to the StreetSign budget, not 160 or the full 200");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_key_that_edits_or_moves_ends_the_composition_on_screen() {
+        // The screenshot: composing text left over, then Enter -- the new
+        // line must not show the old composition at its caret.
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "import (\n    \"strings\"", 0);
+        s.handle(Ev::Preedit("ngs\"".into()), 10);
+        assert_eq!(s.preedit, "ngs\"");
+        s.handle(Ev::Key { key: K::Enter, ctrl: false, shift: false, alt: false }, 20);
+        assert!(s.preedit.is_empty(), "Enter cleared the stale composition: {:?}", s.preedit);
+        for key in [K::Tab, K::Backspace, K::Left] {
+            s.handle(Ev::Preedit("x".into()), 30);
+            s.handle(Ev::Key { key, ctrl: false, shift: false, alt: false }, 40);
+            assert!(s.preedit.is_empty(), "{key:?} cleared it");
+        }
     }
 
     #[test]
