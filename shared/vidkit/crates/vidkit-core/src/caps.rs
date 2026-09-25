@@ -638,6 +638,72 @@ pub fn usable_by_ffmpeg(mut caps: DeviceCaps, vaapi: Option<&[(Codec, u8)]>) -> 
     caps
 }
 
+/// Codecs a Vulkan device decodes, from `vulkaninfo` device extensions
+/// (`VK_KHR_video_decode_h264` ...). Pure.
+///
+/// Vulkan Video decode, as of Sept 2026: Mesa RADV and ANV (H.264, H.265,
+/// AV1, VP9), NVIDIA's driver and NVK; FFmpeg decodes H.264/H.265/AV1 from
+/// 6.1 and VP9 from 8.0. Not on the targets' mobile GPUs: Turnip (Adreno)
+/// and Honeykrisp (Asahi) expose none -- their video blocks are separate
+/// V4L2 devices. Only the first device's list is taken: vulkaninfo prints
+/// one block per GPU and the player decodes on device 0.
+pub fn parse_vulkaninfo_video(text: &str) -> Vec<Codec> {
+    let mut out = Vec::new();
+    let mut seen_device = 0;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with("GPU id") || l.starts_with("VkPhysicalDeviceProperties") {
+            seen_device += 1;
+            if seen_device > 1 && !out.is_empty() {
+                break;
+            }
+        }
+        let c = if l.starts_with("VK_KHR_video_decode_h264") {
+            Codec::H264
+        } else if l.starts_with("VK_KHR_video_decode_h265") {
+            Codec::Hevc
+        } else if l.starts_with("VK_KHR_video_decode_av1") {
+            Codec::Av1
+        } else if l.starts_with("VK_KHR_video_decode_vp9") {
+            Codec::Vp9
+        } else {
+            continue;
+        };
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Desktop caps from what the machine's decode APIs report: a codec listed
+/// by VAAPI or by Vulkan Video is fixed-function (VAAPI named when both, the
+/// more mature path on Intel/AMD); the rest is software. With neither
+/// probe available, the old full-hardware assumption. Pure.
+pub fn desktop_from_probes(vaapi: Option<&[(Codec, u8)]>, vulkan: Option<&[Codec]>) -> DeviceCaps {
+    if vaapi.is_none() && vulkan.is_none() {
+        return desktop_full_hw();
+    }
+    let mut caps = desktop_from_vaapi(vaapi.unwrap_or(&[]));
+    for cap in caps.caps.iter_mut() {
+        if cap.cost != Cost::Fixed && vulkan.is_some_and(|v| v.contains(&cap.codec)) {
+            cap.cost = Cost::Fixed;
+            cap.backend = Backend::VulkanVideo;
+            cap.delivery = Delivery::CpuPlanes;
+            cap.max_width = 7680;
+            cap.max_height = 4320;
+            cap.max_fps_at_max_size = 60;
+            // Vulkan Video profiles carry 10-bit for HEVC/VP9/AV1 on every
+            // driver listed above; H.264 is 8-bit everywhere.
+            cap.max_bit_depth = if cap.codec == Codec::H264 { 8 } else { 10 };
+        }
+    }
+    if let Some(v) = vulkan.filter(|v| !v.is_empty()) {
+        caps.name = format!("{} + Vulkan Video: {}", caps.name, v.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(", "));
+    }
+    caps
+}
+
 /// A desktop/laptop's caps from what its VAAPI driver really decodes.
 ///
 /// `desktop_full_hw` ASSUMES fixed-function AV1, VP9, HEVC and H.264. Most
@@ -1160,5 +1226,45 @@ vainfo: Supported profile and entrypoints
         // Stateful (the FP5's Venus/Iris) is left alone: v4l2m2m drives it.
         let fp5 = usable_by_ffmpeg(fairphone_venus(), None);
         assert_eq!(cost(&fp5, Codec::Vp9), Some((Cost::Fixed, Backend::V4l2Stateful)));
+    }
+
+    /// CONSTRUCTED, not captured: the shape of `vulkaninfo`'s device
+    /// extension list (names are the Khronos ones) for an NVIDIA GPU with
+    /// no VA-API driver. Replace with a real capture when one is to hand.
+    const VULKANINFO_SHAPE: &str = "GPU id : 0 (NVIDIA GeForce RTX 4070):
+Device Extensions: count = 220
+	VK_KHR_video_decode_av1                     : extension revision 1
+	VK_KHR_video_decode_h264                    : extension revision 9
+	VK_KHR_video_decode_h265                    : extension revision 8
+	VK_KHR_video_decode_queue                   : extension revision 8
+	VK_KHR_video_decode_vp9                     : extension revision 1
+	VK_KHR_video_encode_h264                    : extension revision 14
+GPU id : 1 (llvmpipe (LLVM 19.1.7, 256 bits)):
+Device Extensions: count = 150
+	VK_KHR_swapchain                            : extension revision 70
+";
+
+    #[test]
+    fn vulkan_video_decoders_are_read_from_device_zero_only() {
+        let v = parse_vulkaninfo_video(VULKANINFO_SHAPE);
+        assert_eq!(v, vec![Codec::Av1, Codec::H264, Codec::Hevc, Codec::Vp9]);
+        assert!(parse_vulkaninfo_video("GPU id : 0 (llvmpipe):\n\tVK_KHR_swapchain : 70\n").is_empty());
+    }
+
+    /// The gaming PC: NVIDIA, no VA-API. Vulkan Video makes its codecs
+    /// fixed-function; without any probe, the old assumption stands.
+    #[test]
+    fn an_nvidia_machine_gets_hardware_through_vulkan_video() {
+        let caps = desktop_from_probes(None, Some(&parse_vulkaninfo_video(VULKANINFO_SHAPE)));
+        let best = |k: Codec| caps.caps.iter().filter(|x| x.codec == k).min_by_key(|x| x.cost).map(|x| (x.cost, x.backend));
+        assert_eq!(best(Codec::Av1), Some((Cost::Fixed, Backend::VulkanVideo)));
+        assert_eq!(best(Codec::Vp9), Some((Cost::Fixed, Backend::VulkanVideo)));
+        // A laptop whose VA driver lacks AV1 but whose Vulkan driver has it:
+        // VAAPI for what VA lists, Vulkan fills the gap.
+        let mix = desktop_from_probes(Some(&parse_vainfo(VAINFO_KABY_LAKE)), Some(&[Codec::Av1]));
+        let b = |k: Codec| mix.caps.iter().filter(|x| x.codec == k).min_by_key(|x| x.cost).map(|x| x.backend);
+        assert_eq!(b(Codec::Vp9), Some(Backend::Vaapi));
+        assert_eq!(b(Codec::Av1), Some(Backend::VulkanVideo));
+        assert_eq!(desktop_from_probes(None, None).name, desktop_full_hw().name);
     }
 }

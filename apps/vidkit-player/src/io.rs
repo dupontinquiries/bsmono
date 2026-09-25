@@ -1104,11 +1104,14 @@ pub fn assumed_caps() -> vidkit_core::caps::DeviceCaps {
     // present, and the evidence goes in the name so a bug report is one paste.
     // A laptop or desktop: ask the VAAPI driver what it decodes rather than
     // assume everything (see desktop_from_vaapi for what assuming cost).
-    if let Some(profiles) = crate::decode::vaapi_profiles() {
-        return vidkit_core::caps::desktop_from_vaapi(&profiles);
+    // ...and the Vulkan driver: Vulkan Video covers NVIDIA, which has no
+    // native VA-API, and codecs an Intel/AMD VA driver lacks.
+    let (va, vk) = (crate::decode::vaapi_profiles(), crate::decode::vulkan_video_codecs());
+    if va.is_some() || vk.is_some() {
+        return vidkit_core::caps::desktop_from_probes(va.as_deref(), vk.as_deref());
     }
     let mut fallback = vidkit_core::caps::desktop_full_hw();
-    fallback.name = format!("unrecognised device ({:?}); ASSUMED full hardware decode -- install vainfo (libva-utils) to check", p.detected);
+    fallback.name = format!("unrecognised device ({:?}); ASSUMED full hardware decode -- install vainfo (libva-utils) or vulkaninfo (vulkan-tools) to check", p.detected);
     fallback
 }
 

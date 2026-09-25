@@ -306,6 +306,9 @@ pub enum Accel {
     /// `vpp`: the driver has video processing, so scale_vaapi can shrink
     /// frames before the download. Asahi's VA layer does not.
     Vaapi { device: String, codec: String, vpp: bool },
+    /// Vulkan Video (VK_KHR_video_decode_*): Mesa RADV/ANV, NVK and NVIDIA's
+    /// driver. The route NVIDIA has, which has no native VA-API.
+    Vulkan { codec: String },
     /// A V4L2 memory-to-memory decoder (`vp9_v4l2m2m`...) — Venus on the
     /// Fairphone. An INPUT option: it replaces the software decoder.
     V4l2m2m { decoder: String },
@@ -316,6 +319,7 @@ impl Accel {
         match self {
             Accel::Software => "software".into(),
             Accel::Vaapi { .. } => "VAAPI".into(),
+            Accel::Vulkan { .. } => "Vulkan Video".into(),
             Accel::V4l2m2m { decoder } => decoder.clone(),
         }
     }
@@ -341,6 +345,20 @@ pub struct Machine {
     pub vaapi: Option<Vec<(vidkit_core::codec::Codec, u8)>>,
     /// The VA driver offers video processing (scale_vaapi).
     pub vaapi_vpp: bool,
+    /// Codecs device 0 decodes through Vulkan Video, from `vulkaninfo`.
+    pub vulkan: Option<Vec<vidkit_core::codec::Codec>>,
+}
+
+/// `vulkaninfo`'s Vulkan Video decode codecs for device 0, once. `None` when
+/// vulkaninfo is missing or lists none.
+pub fn vulkan_video_codecs() -> Option<Vec<vidkit_core::codec::Codec>> {
+    static V: OnceLock<Option<Vec<vidkit_core::codec::Codec>>> = OnceLock::new();
+    V.get_or_init(|| {
+        let out = Command::new("vulkaninfo").stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+        let v = vidkit_core::caps::parse_vulkaninfo_video(&String::from_utf8_lossy(&out.stdout));
+        (!v.is_empty()).then_some(v)
+    })
+    .clone()
 }
 
 /// ffprobe's codec name as vidkit's codec.
@@ -456,6 +474,13 @@ pub fn choose_accel(codec: &str, m: &Machine, pref: AccelPref) -> Accel {
             return Accel::Vaapi { device: node.clone(), codec: codec.to_string(), vpp: m.vaapi_vpp || m.vaapi.is_none() };
         }
     }
+    // Vulkan Video where VAAPI does not cover it: NVIDIA (no native VA-API),
+    // and Intel/AMD for a codec their VA driver lacks. ffmpeg must have the
+    // vulkan hwaccel and device 0 must list the codec.
+    let vk_listed = matches!((&m.vulkan, codec_of(codec)), (Some(list), Some(c)) if list.contains(&c));
+    if vk_listed && m.hwaccels.iter().any(|h| h == "vulkan") {
+        return Accel::Vulkan { codec: codec.to_string() };
+    }
     Accel::Software
 }
 
@@ -514,6 +539,7 @@ pub fn machine() -> &'static Machine {
             hwaccels: parse_hwaccels(&run(&["-hide_banner", "-hwaccels"])),
             vaapi: vaapi_profiles(),
             vaapi_vpp: vainfo().as_ref().is_some_and(|(_, v)| *v),
+            vulkan: vulkan_video_codecs(),
         }
     })
 }
@@ -598,6 +624,16 @@ pub fn video_args_fmt(src: &VideoInput, from: Duration, accel: &Accel, scale_to:
             }
         }
         Accel::V4l2m2m { decoder } => push(&mut a, &["-c:v", decoder]),
+        Accel::Vulkan { codec } => {
+            // Frames are downloaded to system memory by ffmpeg (no
+            // hwaccel_output_format) and scaled in software after.
+            push(&mut a, &["-hwaccel", "vulkan"]);
+            // Same trap as VAAPI: the default AV1 decoder is libdav1d, which
+            // never touches the hardware.
+            if codec == "av1" {
+                push(&mut a, &["-c:v", "av1"]);
+            }
+        }
     }
     if src.network {
         if !src.headers.is_empty() {
@@ -1332,6 +1368,7 @@ mod vaapi_tests {
             hwaccels: vec!["vaapi".into()],
             vaapi: Some(vec![(Codec::H264, 8), (Codec::Vp9, 10)]),
             vaapi_vpp: true,
+            vulkan: None,
         };
         assert_eq!(choose_accel("av1", &m, AccelPref::Auto), Accel::Software);
         assert!(matches!(choose_accel("vp9", &m, AccelPref::Auto), Accel::Vaapi { .. }));
@@ -1377,6 +1414,7 @@ mod asahi_tests {
             hwaccels: vec!["vaapi".into()],
             vaapi,
             vaapi_vpp: false,
+            vulkan: None,
         }
     }
 
@@ -1400,6 +1438,61 @@ mod asahi_tests {
         assert!(a.iter().any(|x| x == "-hwaccel"), "still hardware decode: {a:?}");
         assert!(!a.iter().any(|x| x.contains("scale_vaapi") || x == "-hwaccel_output_format"), "{a:?}");
         assert!(a.iter().any(|x| x.starts_with("scale=1280:720")), "{a:?}");
+    }
+}
+
+#[cfg(test)]
+mod vulkan_tests {
+    use super::*;
+    use vidkit_core::codec::Codec;
+
+    fn nvidia() -> Machine {
+        Machine {
+            kind: MachineKind::Other,
+            gpu_driver: Some("nvidia".into()),
+            render_node: Some("/dev/dri/renderD128".into()),
+            decoders: vec![],
+            hwaccels: vec!["vaapi".into(), "vulkan".into(), "cuda".into()],
+            vaapi: None,
+            vaapi_vpp: false,
+            vulkan: Some(vec![Codec::Av1, Codec::H264, Codec::Hevc, Codec::Vp9]),
+        }
+    }
+
+    /// The gaming PC: NVIDIA was software before (no VA driver in the
+    /// list); with Vulkan Video it decodes in hardware.
+    #[test]
+    fn nvidia_decodes_through_vulkan_video() {
+        assert_eq!(choose_accel("av1", &nvidia(), AccelPref::Auto), Accel::Vulkan { codec: "av1".into() });
+        let no_vk = Machine { vulkan: None, ..nvidia() };
+        assert_eq!(choose_accel("av1", &no_vk, AccelPref::Auto), Accel::Software);
+        let no_hwaccel = Machine { hwaccels: vec!["vaapi".into()], ..nvidia() };
+        assert_eq!(choose_accel("vp9", &no_hwaccel, AccelPref::Auto), Accel::Software, "an ffmpeg built without vulkan");
+    }
+
+    /// Intel with a VA driver lacking AV1 but Vulkan having it: VAAPI for
+    /// VP9, Vulkan for AV1.
+    #[test]
+    fn vaapi_first_vulkan_fills_the_gap() {
+        let m = Machine {
+            gpu_driver: Some("i915".into()),
+            vaapi: Some(vec![(Codec::H264, 8), (Codec::Vp9, 10)]),
+            vaapi_vpp: true,
+            vulkan: Some(vec![Codec::Av1, Codec::H264, Codec::Hevc]),
+            ..nvidia()
+        };
+        assert!(matches!(choose_accel("vp9", &m, AccelPref::Auto), Accel::Vaapi { .. }));
+        assert_eq!(choose_accel("av1", &m, AccelPref::Auto), Accel::Vulkan { codec: "av1".into() });
+    }
+
+    #[test]
+    fn vulkan_args_name_the_native_av1_decoder_and_scale_in_software() {
+        let src = VideoInput::file(Path::new("x.webm"));
+        let a = video_args(&src, Duration::ZERO, &Accel::Vulkan { codec: "av1".into() }, Some((1280, 720)));
+        let (hw, cv, i) = (a.iter().position(|x| x == "vulkan"), a.windows(2).position(|w| w[0] == "-c:v" && w[1] == "av1"), a.iter().position(|x| x == "-i"));
+        assert!(hw < i && cv.is_some() && cv < i, "{a:?}");
+        assert!(a.iter().any(|x| x.starts_with("scale=1280:720")), "{a:?}");
+        assert!(!a.iter().any(|x| x == "-hwaccel_output_format"));
     }
 }
 
