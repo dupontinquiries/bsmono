@@ -1239,6 +1239,7 @@ fn send_keymap(vkbd: &ZwpVirtualKeyboardV1, keymap: &KeymapTable) -> Result<()> 
 /// Create an anonymous file via memfd_create syscall. We can't use a
 /// regular tempfile because the compositor may keep the fd around past
 /// our process exit, and we don't want the file lingering on disk.
+#[cfg(target_os = "linux")]
 fn memfd_create(name: &str) -> Result<std::fs::File> {
     use std::ffi::CString;
     use std::os::unix::io::FromRawFd;
@@ -1250,6 +1251,25 @@ fn memfd_create(name: &str) -> Result<std::fs::File> {
         bail!("memfd_create failed: {}", std::io::Error::last_os_error());
     }
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Outside Linux there is no memfd_create (libc has neither it nor MFD_CLOEXEC:
+/// a macOS build of rusty-board-egui with `wayland` stopped here). The same
+/// anonymous, fd-only file: a temporary file UNLINKED as soon as it is open,
+/// so nothing lingers on disk however long the compositor keeps the fd.
+#[cfg(not(target_os = "linux"))]
+fn memfd_create(name: &str) -> Result<std::fs::File> {
+    unlinked_tempfile(name)
+}
+
+/// Compiled everywhere (used off Linux) so it is tested here.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn unlinked_tempfile(name: &str) -> Result<std::fs::File> {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("{name}-{}-{nanos}", std::process::id()));
+    let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
+    std::fs::remove_file(&path)?;
+    Ok(f)
 }
 
 // ---- GLib integration ----------------------------------------------------
@@ -1396,3 +1416,28 @@ mod tests {
         assert!(table.lookup_char(' ').is_some());
     }
 }
+
+#[cfg(test)]
+mod unlinked_tempfile_tests {
+    use super::unlinked_tempfile;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    /// The off-Linux keymap buffer: readable and writable through the fd, and
+    /// nothing left on disk.
+    #[test]
+    fn the_keymap_buffer_lives_only_in_its_fd() {
+        let name = "rusty-board-keymap-test";
+        let mut f = unlinked_tempfile(name).unwrap();
+        f.write_all(b"xkb_keymap { };").unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let mut back = String::new();
+        f.read_to_string(&mut back).unwrap();
+        assert_eq!(back, "xkb_keymap { };");
+        let left: Vec<_> = std::fs::read_dir(std::env::temp_dir()).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{name}-{}", std::process::id())))
+            .collect();
+        assert!(left.is_empty(), "unlinked at once: {left:?}");
+    }
+}
+
