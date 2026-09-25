@@ -85,6 +85,8 @@ pub struct Shared {
     /// Seconds of compute per second of audio for the last chunk. Below 1 the
     /// transcript outruns playback; above it, it falls behind.
     pub realtime_factor: Option<f32>,
+    /// Chunks skipped by the silence gate: no whisper run at all.
+    pub skipped_silent: u32,
     playhead: Duration,
     stop: bool,
 }
@@ -115,6 +117,7 @@ impl Worker {
                 status: "starting".into(),
                 version: 1,
                 realtime_factor: None,
+                skipped_silent: 0,
                 playhead: Duration::ZERO,
                 stop: false,
             }),
@@ -238,6 +241,12 @@ fn run(shared: Arc<(Mutex<Shared>, Condvar)>, make: Factory, audio: AudioIn, cac
         let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
         match result {
             Ok(pcm) if pcm.is_empty() => g.coverage.mark_end(chunk.index),
+            Ok(pcm) if vidkit_transcribe::speech_fraction(&pcm) < vidkit_transcribe::MIN_SPEECH_FRACTION => {
+                // Silence (a pause, a quiet intro): whisper would spend its
+                // full encoder here and then invent "Thank you.". Skipped.
+                g.skipped_silent += 1;
+                g.coverage.finish(chunk.index);
+            }
             Ok(pcm) => {
                 drop(g);
                 let heard = pcm.len() as f32 / SAMPLE_RATE as f32;
@@ -515,5 +524,23 @@ mod tests {
         assert!(wait_until(&w, |s| s.transcript.cues().len() == 2), "{}", w.with(|s| s.status.clone()));
         assert!(w.with(|s| s.status.starts_with("auto-captions:en-orig")), "{}", w.with(|s| s.status.clone()));
         assert!(w.with(|s| s.coverage.complete()), "all chunks marked done");
+    }
+
+    /// A silent stretch never reaches the source: the gate skips it, and
+    /// counts it.
+    #[test]
+    fn silent_chunks_skip_the_source() {
+        if !have_ffmpeg() { return; }
+        let p = std::env::temp_dir().join(format!("vk_silent_{}.mkv", std::process::id()));
+        // 30 s of tone, then 30 s of silence.
+        assert!(Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=300:duration=30", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-filter_complex", "[1]atrim=duration=30[s];[0][s]concat=n=2:v=0:a=1"]).arg(&p).status().unwrap().success());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let o2 = order.clone();
+        let w = Worker::start(Box::new(move || Ok(Box::new(Script(o2)) as Box<dyn CueSource>)), AudioIn { input: p.to_string_lossy().into(), headers: vec![] }, Some(Duration::from_secs(60)), None);
+        assert!(wait_until(&w, |s| s.coverage.complete()));
+        let ran: Vec<u64> = order.lock().unwrap().iter().map(|d| d.as_secs()).collect();
+        assert_eq!(ran, vec![0], "only the chunk with sound reached the source");
+        assert_eq!(w.with(|s| s.skipped_silent), 1);
+        let _ = std::fs::remove_file(&p);
     }
 }

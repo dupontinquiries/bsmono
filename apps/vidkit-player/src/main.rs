@@ -176,6 +176,9 @@ struct Player {
     /// Software presenter budget chosen in the palette; None follows the
     /// power policy (or VIDKIT_SW_BUDGET).
     sw_budget_user: Option<f32>,
+    /// A transcription scope chosen in the Sections panel: kept, and the
+    /// power policy leaves it alone.
+    scope_user: bool,
     /// What background work the power supply allows, and when it was read.
     energy: power::EnergyPolicy,
     energy_read: Option<Instant>,
@@ -382,6 +385,7 @@ impl Player {
             seen_hits: Vec::new(),
             listen_only: false,
             sw_budget_user: None,
+            scope_user: false,
             energy: power::policy(power::current()),
             energy_read: None,
             power_state: power::current(),
@@ -1635,6 +1639,7 @@ impl Player {
         let (status, progress, transcribed, total, mode) = match &self.worker {
             Some(w) => w.with(|s| {
                 let rtf = s.realtime_factor.map(|r| format!(" · {r:.2}× realtime")).unwrap_or_default();
+                let rtf = if s.skipped_silent > 0 { format!("{rtf} · {} silent skipped", s.skipped_silent) } else { rtf };
                 (format!("{}{rtf}", s.status), s.coverage.progress(), s.coverage.spans(), s.coverage.total(), s.coverage.mode)
             }),
             None => ("nothing open".into(), None, Vec::new(), None, vidkit_transcribe::coverage::Mode::Paused),
@@ -1732,6 +1737,7 @@ impl Player {
                 });
             }
             A::SetScope(scope) => {
+                self.scope_user = true;
                 if let Some(w) = &self.worker {
                     w.set_mode(match scope {
                         vidkit_egui::Scope::Paused => vidkit_transcribe::coverage::Mode::Paused,
@@ -2185,6 +2191,9 @@ impl Player {
     /// On battery, whisper works only ahead of the playhead, or not at all.
     fn apply_transcribe_policy(&mut self) {
         use vidkit_transcribe::coverage::Mode;
+        if self.scope_user {
+            return;
+        }
         if let Some(w) = &self.worker {
             let mode = match self.energy.transcribe_ahead {
                 None => Mode::All,

@@ -77,6 +77,9 @@ https = ["dep:ureq"]
 # builds without it, and section watching then works from sidecar subtitles
 # only.
 whisper = ["vidkit-transcribe/whisper"]
+# Whisper on the GPU through Vulkan (laptop iGPUs included). Needs the Vulkan
+# headers and glslc. Untested: no Vulkan device where this was written.
+whisper-vulkan = ["whisper", "vidkit-transcribe/whisper-vulkan"]
 # In-process audio output through cpal (ALSA; PipeWire via pipewire-alsa).
 # Needs alsa-lib headers (libasound2-dev / alsa-lib-dev). Without it, audio
 # goes through pw-play / paplay / aplay as before.

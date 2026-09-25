@@ -3,8 +3,9 @@
 //! On mains everything is allowed. On battery the background work that costs
 //! the most for the least is cut back, and more of it as the charge falls:
 //!
-//! | on battery          | keep-download | transcribe      | analysis | enhance |
+//! | power               | keep-download | transcribe      | analysis | enhance |
 //! |---------------------|---------------|-----------------|----------|---------|
+//! | mains               | on            | 10 min ahead    | on       | on      |
 //! | > 50%               | off           | 10 min ahead    | off      | on      |
 //! | 20..50%             | off           | 5 min ahead     | off      | sharpen only |
 //! | < 20%               | off           | paused          | off      | off     |
@@ -87,7 +88,10 @@ pub enum Enhancement {
 
 pub fn policy(p: PowerState) -> EnergyPolicy {
     if !p.on_battery {
-        return EnergyPolicy { keep_download: true, transcribe_ahead: None, analysis: true, enhance: Enhancement::Full, sw_budget: 1.0 };
+        // Ahead, even on mains: transcribing a whole video at once is what
+        // heated a laptop (reported: base model, plugged in). "All" in the
+        // Sections panel builds the full chapter list when it is wanted.
+        return EnergyPolicy { keep_download: true, transcribe_ahead: Some(Duration::from_secs(600)), analysis: true, enhance: Enhancement::Full, sw_budget: 1.0 };
     }
     let pct = p.percent.unwrap_or(50);
     let (ahead, enhance, sw_budget) = match pct {
@@ -163,7 +167,8 @@ mod tests {
     fn the_policy_cuts_back_in_steps_as_the_charge_falls() {
         let b = |p| policy(PowerState { on_battery: true, percent: Some(p) });
         let mains = policy(PowerState::MAINS);
-        assert!(mains.keep_download && mains.analysis && mains.transcribe_ahead.is_none());
+        assert!(mains.keep_download && mains.analysis);
+        assert_eq!(mains.transcribe_ahead, Some(Duration::from_secs(600)), "never the whole video unasked");
         assert_eq!(b(80).enhance, Enhancement::Full);
         assert!(!b(80).keep_download && !b(80).analysis, "background work stops first");
         assert_eq!(b(80).transcribe_ahead, Some(Duration::from_secs(600)));
