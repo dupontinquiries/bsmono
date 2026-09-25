@@ -334,6 +334,34 @@ pub struct Machine {
     pub decoders: Vec<String>,
     /// `ffmpeg -hwaccels`.
     pub hwaccels: Vec<String>,
+    /// What the VAAPI driver really decodes, from `vainfo`; `None` when
+    /// vainfo is not installed (then the driver name is all there is).
+    pub vaapi: Option<Vec<(vidkit_core::codec::Codec, u8)>>,
+}
+
+/// ffprobe's codec name as vidkit's codec.
+pub fn codec_of(name: &str) -> Option<vidkit_core::codec::Codec> {
+    use vidkit_core::codec::Codec;
+    Some(match name {
+        "h264" => Codec::H264,
+        "hevc" => Codec::Hevc,
+        "vp8" => Codec::Vp8,
+        "vp9" => Codec::Vp9,
+        "av1" => Codec::Av1,
+        _ => return None,
+    })
+}
+
+/// `vainfo`'s decode profiles, run once per process. `None` if vainfo is
+/// missing or found no driver.
+pub fn vaapi_profiles() -> Option<Vec<(vidkit_core::codec::Codec, u8)>> {
+    static P: OnceLock<Option<Vec<(vidkit_core::codec::Codec, u8)>>> = OnceLock::new();
+    P.get_or_init(|| {
+        let out = Command::new("vainfo").stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+        let p = vidkit_core::caps::parse_vainfo(&String::from_utf8_lossy(&out.stdout));
+        (!p.is_empty()).then_some(p)
+    })
+    .clone()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -389,7 +417,16 @@ pub fn choose_accel(codec: &str, m: &Machine, pref: AccelPref) -> Accel {
     }
     let vaapi_driver = m.gpu_driver.as_deref().is_some_and(|d| VAAPI_DRIVERS.contains(&d));
     if let (true, Some(node)) = (vaapi_driver, &m.render_node) {
-        if m.hwaccels.iter().any(|h| h == "vaapi") && VAAPI_CODECS.contains(&codec) {
+        // Only a codec the driver lists. Asked for one it cannot do, ffmpeg
+        // falls back to software INSIDE the process: frames arrive, the
+        // status says VAAPI, and the CPU decodes -- 1080p AV1 on a laptop
+        // without AV1 hardware, which is what heated one.
+        let listed = match (&m.vaapi, codec_of(codec)) {
+            (Some(list), Some(c)) => list.iter().any(|(lc, _)| *lc == c),
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if listed && m.hwaccels.iter().any(|h| h == "vaapi") && VAAPI_CODECS.contains(&codec) {
             return Accel::Vaapi { device: node.clone() };
         }
     }
@@ -449,6 +486,7 @@ pub fn machine() -> &'static Machine {
             render_node,
             decoders: parse_decoders(&run(&["-hide_banner", "-decoders"])),
             hwaccels: parse_hwaccels(&run(&["-hide_banner", "-hwaccels"])),
+            vaapi: vaapi_profiles(),
         }
     })
 }
@@ -1239,6 +1277,32 @@ mod peak_tests {
         if !ok { eprintln!("no libx265; skipping"); return; }
         assert_eq!(probe_hdr_peak(&f.to_string_lossy()), Some(4000.0));
         let _ = std::fs::remove_file(&f);
+    }
+}
+
+#[cfg(test)]
+mod vaapi_tests {
+    use super::*;
+    use vidkit_core::codec::Codec;
+
+    /// The heat bug, pinned: a driver that does not list AV1 gets software
+    /// for AV1 (honestly labelled) and VAAPI for what it does list.
+    #[test]
+    fn vaapi_is_only_asked_for_codecs_the_driver_lists() {
+        let m = Machine {
+            kind: MachineKind::Other,
+            gpu_driver: Some("i915".into()),
+            render_node: Some("/dev/dri/renderD128".into()),
+            decoders: vec![],
+            hwaccels: vec!["vaapi".into()],
+            vaapi: Some(vec![(Codec::H264, 8), (Codec::Vp9, 10)]),
+        };
+        assert_eq!(choose_accel("av1", &m, AccelPref::Auto), Accel::Software);
+        assert!(matches!(choose_accel("vp9", &m, AccelPref::Auto), Accel::Vaapi { .. }));
+        assert_eq!(choose_accel("hevc", &m, AccelPref::Auto), Accel::Software, "not listed");
+        // Without vainfo, the old behaviour: trust the driver name.
+        let unknown = Machine { vaapi: None, ..m };
+        assert!(matches!(choose_accel("av1", &unknown, AccelPref::Auto), Accel::Vaapi { .. }));
     }
 }
 

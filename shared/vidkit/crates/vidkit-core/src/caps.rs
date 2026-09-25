@@ -542,6 +542,79 @@ pub fn fairphone_no_venus() -> DeviceCaps {
 }
 
 /// Desktop AMD RDNA2+ / Intel Arc / recent iGPU: everything in fixed function.
+/// Decode profiles from `vainfo`: (codec, max bit depth) for every profile
+/// with a VLD (decode) entrypoint. Pure.
+///
+/// ```text
+///       VAProfileH264High               :	VAEntrypointVLD
+///       VAProfileHEVCMain10             :	VAEntrypointVLD
+///       VAProfileVP9Profile2            :	VAEntrypointVLD
+///       VAProfileAV1Profile0            :	VAEntrypointVLD
+///       VAProfileH264High               :	VAEntrypointEncSlice   <- encode, ignored
+/// ```
+pub fn parse_vainfo(text: &str) -> Vec<(Codec, u8)> {
+    let mut out: Vec<(Codec, u8)> = Vec::new();
+    for line in text.lines() {
+        let Some((prof, entry)) = line.split_once(':') else { continue };
+        if entry.trim() != "VAEntrypointVLD" {
+            continue;
+        }
+        let prof = prof.trim();
+        let found = match prof {
+            p if p.starts_with("VAProfileH264") => Some((Codec::H264, 8)),
+            "VAProfileHEVCMain" => Some((Codec::Hevc, 8)),
+            p if p.starts_with("VAProfileHEVCMain10") => Some((Codec::Hevc, 10)),
+            "VAProfileVP9Profile0" => Some((Codec::Vp9, 8)),
+            "VAProfileVP9Profile2" => Some((Codec::Vp9, 10)),
+            "VAProfileVP8Version0_3" => Some((Codec::Vp8, 8)),
+            // AV1 Main (Profile0) is 8- and 10-bit 4:2:0.
+            "VAProfileAV1Profile0" => Some((Codec::Av1, 10)),
+            _ => None,
+        };
+        if let Some((c, d)) = found {
+            match out.iter_mut().find(|(oc, _)| *oc == c) {
+                Some(e) => e.1 = e.1.max(d),
+                None => out.push((c, d)),
+            }
+        }
+    }
+    out
+}
+
+/// A desktop/laptop's caps from what its VAAPI driver really decodes.
+///
+/// `desktop_full_hw` ASSUMES fixed-function AV1, VP9, HEVC and H.264. Most
+/// laptops older than Intel's 11th generation (and AMD before RDNA2) have no
+/// AV1 decoder, so the picker chose YouTube's AV1 stream, VAAPI init failed
+/// inside ffmpeg, and ffmpeg fell back to software decode in the same
+/// process -- frames still came, the status still said VAAPI, and the CPU
+/// decoded 1080p AV1. Here: what `vainfo` lists is Fixed; every other codec
+/// is software (dav1d for AV1, libavcodec otherwise) -- still playable, but
+/// the selector's cost-first ordering now prefers the hardware ones.
+pub fn desktop_from_vaapi(profiles: &[(Codec, u8)]) -> DeviceCaps {
+    let mut caps = desktop_full_hw();
+    caps.name = format!(
+        "Desktop (VAAPI: {})",
+        if profiles.is_empty() { "no decode profiles".to_string() } else { profiles.iter().map(|(c, d)| format!("{c:?} {d}-bit")).collect::<Vec<_>>().join(", ") }
+    );
+    for cap in caps.caps.iter_mut() {
+        match profiles.iter().find(|(c, _)| *c == cap.codec) {
+            Some(&(_, depth)) => cap.max_bit_depth = depth,
+            None => {
+                cap.cost = Cost::SoftwareSimd;
+                cap.delivery = Delivery::CpuPlanes;
+                cap.backend = if cap.codec == Codec::Av1 { Backend::Dav1d } else { Backend::FfmpegSw };
+                // Software 1080p60 is realistic on a laptop; 4K is where the
+                // fans start. The picker compares cost first anyway.
+                cap.max_width = 3840;
+                cap.max_height = 2160;
+                cap.max_fps_at_max_size = 30;
+            }
+        }
+    }
+    caps
+}
+
 pub fn desktop_full_hw() -> DeviceCaps {
     let mk = |codec, depth| DecodeCap {
         codec,
@@ -945,5 +1018,40 @@ mod tests {
             level: None,
         };
         assert!(d.best_path(&p, 1920, 1080, 30).is_none());
+    }
+
+    const VAINFO_KABY_LAKE: &str = "vainfo: Driver version: Intel iHD driver
+vainfo: Supported profile and entrypoints
+      VAProfileNone                   :	VAEntrypointVideoProc
+      VAProfileMPEG2Main              :	VAEntrypointVLD
+      VAProfileH264Main               :	VAEntrypointVLD
+      VAProfileH264High               :	VAEntrypointVLD
+      VAProfileH264High               :	VAEntrypointEncSlice
+      VAProfileHEVCMain               :	VAEntrypointVLD
+      VAProfileHEVCMain10             :	VAEntrypointVLD
+      VAProfileVP9Profile0            :	VAEntrypointVLD
+      VAProfileVP9Profile2            :	VAEntrypointVLD
+";
+
+    #[test]
+    fn vainfo_decode_profiles_are_read_and_encode_ignored() {
+        let p = parse_vainfo(VAINFO_KABY_LAKE);
+        assert_eq!(p, vec![(Codec::H264, 8), (Codec::Hevc, 10), (Codec::Vp9, 10)]);
+        let tgl = format!("{VAINFO_KABY_LAKE}      VAProfileAV1Profile0            :	VAEntrypointVLD\n");
+        assert!(parse_vainfo(&tgl).contains(&(Codec::Av1, 10)));
+        assert!(parse_vainfo("libva error: vaGetDriverNameByIndex() failed").is_empty());
+    }
+
+    /// A laptop without AV1 decode: AV1 stays playable but costs software,
+    /// so the selector's cost-first order picks VP9/H.264 over it.
+    #[test]
+    fn a_laptop_without_av1_hardware_prefers_what_it_can_decode() {
+        let caps = desktop_from_vaapi(&parse_vainfo(VAINFO_KABY_LAKE));
+        let cost = |c: Codec| caps.caps.iter().find(|x| x.codec == c).map(|x| x.cost);
+        assert_eq!(cost(Codec::Av1), Some(Cost::SoftwareSimd));
+        assert_eq!(cost(Codec::Vp9), Some(Cost::Fixed));
+        assert_eq!(cost(Codec::H264), Some(Cost::Fixed));
+        assert!(Cost::Fixed < Cost::SoftwareSimd, "the selector's order relies on this");
+        assert!(caps.name.contains("Vp9 10-bit") && !caps.name.contains("Av1"), "{}", caps.name);
     }
 }

@@ -1100,8 +1100,13 @@ pub fn assumed_caps() -> vidkit_core::caps::DeviceCaps {
     // Unidentified. The probe refuses to guess and so does this: a desktop
     // profile is the safe default because it assumes the least about what is
     // present, and the evidence goes in the name so a bug report is one paste.
+    // A laptop or desktop: ask the VAAPI driver what it decodes rather than
+    // assume everything (see desktop_from_vaapi for what assuming cost).
+    if let Some(profiles) = crate::decode::vaapi_profiles() {
+        return vidkit_core::caps::desktop_from_vaapi(&profiles);
+    }
     let mut fallback = vidkit_core::caps::desktop_full_hw();
-    fallback.name = format!("unrecognised device ({:?})", p.detected);
+    fallback.name = format!("unrecognised device ({:?}); ASSUMED full hardware decode -- install vainfo (libva-utils) to check", p.detected);
     fallback
 }
 
