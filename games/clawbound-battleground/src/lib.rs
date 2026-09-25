@@ -28,6 +28,8 @@ pub mod spectator;
 pub mod brass;
 /// Loaded clips played in the audio callback: realtime-safe, three buses, ducking.
 pub mod mixer;
+/// The space sounds happen in: stereo reverb and echo, set by place.
+pub mod reverb;
 /// Music, sfx and voices loaded from .opus/.wav in the background.
 pub mod soundbank;
 /// Which sounds a game event asks for; placement; voice gating.

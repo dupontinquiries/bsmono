@@ -90,6 +90,8 @@ struct AppState {
     music_on: bool,
     /// The game-state announcer (`announcer`).
     announcer: crate::announcer::Announcer,
+    /// Frames since the listener's space was last sent to the mixer.
+    space_tick: u32,
     /// Intros played this session: the first is the full, narrated one.
     intros_played: u32,
     /// A scored intro track is playing (it replaces the synthesized fanfare).
@@ -418,6 +420,7 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         voice_gate: Default::default(),
         music_on: false,
         announcer: Default::default(),
+        space_tick: 0,
         intros_played: 0,
         intro_music: false,
         spectator: None,
@@ -1200,6 +1203,12 @@ fn render(s: &mut AppState) {
                 let f = cam.target - cam.eye;
                 let right = Vec3::new(f.x, 0.0, f.z).normalize_or_zero().cross(Vec3::Y).normalize_or_zero();
                 let ear = if s.spectator.is_some() { cam.target } else { g.gods[0].pos };
+                // the space the listener is in: reverb and echo, a few times
+                // a second (it glides between places on its own)
+                s.space_tick = s.space_tick.wrapping_add(1);
+                if s.space_tick % 6 == 0 {
+                    amb.mixer.send(Cmd::Space(crate::reverb::space_at(ear)));
+                }
                 if let Some(w) = g.over {
                     let me = if s.spectator.is_some() { None } else { Some(g.gods[0].team) };
                     s.announcer.end(w, me, g.t);

@@ -492,7 +492,7 @@ pub mod output {
             if let Some(n) = buffer_frames {
                 config.buffer_size = cpal::BufferSize::Fixed(n);
             }
-            let (mixer_handle, mut mixer) = crate::mixer::new();
+            let (mixer_handle, mut mixer) = crate::mixer::new_at(config.sample_rate.0);
             let channels = config.channels as usize;
             let sr = config.sample_rate.0 as f32;
             let params = Arc::new(Mutex::new(AudioParams::default()));

@@ -58,7 +58,17 @@ pub enum Cmd {
     Play(Play),
     StopBus(Bus),
     BusGain(Bus, f32),
+    /// The space the listener is in: the reverb and echo (`reverb`).
+    Space(crate::reverb::Space),
 }
+
+/// How much of each bus feeds the space (reverb and echo): sound effects
+/// fully, voices less (lines stay clear), music barely (it is not IN the
+/// canyon). The announcer and narrator send nothing: they are not in the
+/// world.
+pub const SEND: [f32; 3] = [0.12, 0.75, 0.5];
+/// Frames the send buffer holds; a longer callback is processed in parts.
+const SEND_FRAMES: usize = 4096;
 
 #[derive(Clone)]
 struct Voice {
@@ -106,13 +116,29 @@ pub struct Mixer {
     bus_gain: [f32; 3],
     duck: f32,
     clock: u64,
+    space: crate::reverb::SpaceFx,
+    send: Vec<f32>,
 }
 
 pub fn new() -> (MixerHandle, Mixer) {
+    new_at(48_000)
+}
+
+/// A mixer for a device running at `rate`.
+pub fn new_at(rate: u32) -> (MixerHandle, Mixer) {
     let (tx, rx) = rtrb::RingBuffer::new(RING);
     (
         MixerHandle { tx, dropped: 0 },
-        Mixer { rx, clips: vec![None; MAX_CLIPS], voices: vec![Voice::idle(); MAX_VOICES], bus_gain: [0.55, 0.9, 1.0], duck: 1.0, clock: 0 },
+        Mixer {
+            rx,
+            clips: vec![None; MAX_CLIPS],
+            voices: vec![Voice::idle(); MAX_VOICES],
+            bus_gain: [0.55, 0.9, 1.0],
+            duck: 1.0,
+            clock: 0,
+            space: crate::reverb::SpaceFx::new(rate),
+            send: vec![0.0; SEND_FRAMES * 2],
+        },
     )
 }
 
@@ -157,6 +183,7 @@ impl Mixer {
                 }
             }
             Cmd::BusGain(b, g) => self.bus_gain[b as usize] = g.clamp(0.0, 2.0),
+            Cmd::Space(sp) => self.space.target = sp,
         }
     }
 
@@ -172,6 +199,23 @@ impl Mixer {
             self.apply(c);
         }
         let channels = channels.max(1);
+        // a long callback in parts, so the send buffer never grows
+        let total = out.len() / channels;
+        if total > SEND_FRAMES {
+            let mut f = 0;
+            while f < total {
+                let n = (total - f).min(SEND_FRAMES);
+                self.render_part(&mut out[f * channels..(f + n) * channels], channels);
+                f += n;
+            }
+            return;
+        }
+        self.render_part(out, channels);
+    }
+
+    fn render_part(&mut self, out: &mut [f32], channels: usize) {
+        let send = &mut self.send[..(out.len() / channels) * 2];
+        send.iter_mut().for_each(|x| *x = 0.0);
         let frames = out.len() / channels;
         // duck toward its target once per block (smooth enough at ~5 ms)
         let talking = self.voices.iter().any(|v| v.clip.is_some() && v.p.bus == Bus::Voice);
@@ -186,6 +230,10 @@ impl Mixer {
             let g = v.p.gain * self.bus_gain[v.p.bus as usize] * duck;
             let a = (v.p.pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
             let (gl, gr) = (a.cos() * g, a.sin() * g);
+            // the space's share of this voice (the announcer and narrator
+            // -- speakers at the top of the range -- stay dry)
+            let offstage = v.p.bus == Bus::Voice && v.p.speaker.is_some_and(|s| s >= u16::MAX - 1);
+            let sk = if offstage { 0.0 } else { SEND[v.p.bus as usize] };
             let mut ended = false;
             for f in 0..frames {
                 if v.pos >= len {
@@ -198,6 +246,8 @@ impl Mixer {
                 }
                 let (l, r) = if ch == 2 { (pcm[v.pos * 2], pcm[v.pos * 2 + 1]) } else { (pcm[v.pos], pcm[v.pos]) };
                 v.pos += 1;
+                send[f * 2] += l * gl * sk;
+                send[f * 2 + 1] += r * gr * sk;
                 let o = &mut out[f * channels..f * channels + channels];
                 if channels == 1 {
                     o[0] += (l * gl + r * gr) * std::f32::consts::FRAC_1_SQRT_2;
@@ -212,9 +262,11 @@ impl Mixer {
                 v.clip = None;
             }
         }
+        // the space: reverb and echo from the sends, added in
+        let frames = out.len() / channels;
+        self.space.process_add(&self.send[..frames * 2], out, channels);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,5 +392,37 @@ mod tests {
         m.render_add(&mut out, 1);
         assert_eq!(m.active(), 0);
         assert_eq!(Arc::strong_count(&bank_ref), 2, "bank + clip table");
+    }
+
+    /// In a wet space a sound effect rings on after it ends; the announcer
+    /// (offstage) stays dry in the same space.
+    #[test]
+    fn effects_ring_in_the_space_and_the_announcer_stays_dry() {
+        let tail_after = |speaker: Option<u16>, bus: Bus| {
+            let (mut h, mut m) = new_at(48_000);
+            h.send(Cmd::Load { id: 0, pcm: tone(2_400, 0.5), channels: 1 });
+            h.send(Cmd::Space(crate::reverb::Space { room: 0.9, damp: 0.2, wet: 0.8, echo_time: 0.2, echo_fb: 0.4, echo_wet: 0.5 }));
+            let mut out = vec![0.0f32; 2 * 256];
+            // let the space glide in
+            for _ in 0..40 {
+                out.iter_mut().for_each(|x| *x = 0.0);
+                m.render_add(&mut out, 2);
+            }
+            h.play(Play { speaker, ..play(0, bus) });
+            let mut tail = 0.0f32;
+            for k in 0..200 {
+                out.iter_mut().for_each(|x| *x = 0.0);
+                m.render_add(&mut out, 2);
+                if k > 20 {
+                    // well after the 50 ms clip has ended
+                    tail += out.iter().map(|x| x * x).sum::<f32>();
+                }
+            }
+            tail
+        };
+        let fx = tail_after(None, Bus::Sfx);
+        let announcer = tail_after(Some(u16::MAX), Bus::Voice);
+        assert!(fx > 1e-3, "no tail on an effect: {fx}");
+        assert!(announcer < 1e-9, "the announcer echoed: {announcer}");
     }
 }
