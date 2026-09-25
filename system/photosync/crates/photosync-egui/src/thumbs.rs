@@ -45,10 +45,68 @@ pub struct ImageDecode;
 
 impl Decode for ImageDecode {
     fn decode(&self, path: &str, max_side: u32) -> Result<Thumb, String> {
-        let img = image::open(path).map_err(|e| format!("{path}: {e}"))?;
-        let small = img.thumbnail(max_side, max_side).to_rgba8();
+        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let img = image::load_from_memory(&bytes).map_err(|e| format!("{path}: {e}"))?;
+        // Upright: phones store the pixels as the sensor saw them and the turn in
+        // EXIF, which image 0.24 does not apply -- so portrait shots came out
+        // sideways. Applied to the small image, where turning is cheap.
+        let small = orient(img.thumbnail(max_side, max_side), exif_orientation(&bytes)).to_rgba8();
         let (w, h) = small.dimensions();
         Ok(Thumb { w, h, rgba: small.into_raw() })
+    }
+}
+
+/// EXIF orientation (1..=8) of a JPEG, or 1 when there is none or it cannot be
+/// read: APP1 "Exif\0\0", a TIFF header (II / MM), IFD0's tag 0x0112. Reads
+/// only the headers; anything malformed is "no rotation", never an error.
+pub fn exif_orientation(bytes: &[u8]) -> u16 {
+    fn u16_at(b: &[u8], i: usize, le: bool) -> Option<u16> {
+        let v = b.get(i..i + 2)?;
+        Some(if le { u16::from_le_bytes([v[0], v[1]]) } else { u16::from_be_bytes([v[0], v[1]]) })
+    }
+    fn u32_at(b: &[u8], i: usize, le: bool) -> Option<u32> {
+        let v = b.get(i..i + 4)?;
+        Some(if le { u32::from_le_bytes([v[0], v[1], v[2], v[3]]) } else { u32::from_be_bytes([v[0], v[1], v[2], v[3]]) })
+    }
+    fn find(b: &[u8]) -> Option<u16> {
+        if b.get(0..2)? != [0xFF, 0xD8] { return None; } // not a JPEG
+        let mut i = 2;
+        while i + 4 <= b.len() && b[i] == 0xFF {
+            let marker = b[i + 1];
+            let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+            if marker == 0xDA || len < 2 { return None; } // image data: no EXIF before it
+            if marker == 0xE1 && b.get(i + 4..i + 10)? == b"Exif\0\0" {
+                let t = i + 10; // the TIFF header
+                let le = match b.get(t..t + 2)? { b"II" => true, b"MM" => false, _ => return None };
+                let ifd = t + u32_at(b, t + 4, le)? as usize;
+                let n = u16_at(b, ifd, le)? as usize;
+                for k in 0..n.min(512) {
+                    let e = ifd + 2 + k * 12;
+                    if u16_at(b, e, le)? == 0x0112 {
+                        let v = u16_at(b, e + 8, le)?;
+                        return (1..=8).contains(&v).then_some(v);
+                    }
+                }
+                return None;
+            }
+            i += 2 + len;
+        }
+        None
+    }
+    find(bytes).unwrap_or(1)
+}
+
+/// Apply an EXIF orientation so the picture is upright.
+pub fn orient(img: image::DynamicImage, orientation: u16) -> image::DynamicImage {
+    match orientation {
+        2 => img.fliph(),
+        3 => img.rotate180(),
+        4 => img.flipv(),
+        5 => img.rotate90().fliph(),
+        6 => img.rotate90(),
+        7 => img.rotate270().fliph(),
+        8 => img.rotate270(),
+        _ => img,
     }
 }
 
@@ -328,6 +386,67 @@ mod tests {
         let start = Instant::now();
         drop(t);
         assert!(start.elapsed() < Duration::from_secs(1), "workers exit promptly");
+    }
+
+    /// A minimal JPEG header carrying only an EXIF orientation, in either byte order.
+    fn exif_app1(orientation: u16, le: bool) -> Vec<u8> {
+        let w16 = |v: u16| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+        let w32 = |v: u32| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(if le { b"II" } else { b"MM" });
+        tiff.extend_from_slice(&w16(42));
+        tiff.extend_from_slice(&w32(8)); // IFD0 right after the header
+        tiff.extend_from_slice(&w16(1)); // one entry
+        tiff.extend_from_slice(&w16(0x0112)); tiff.extend_from_slice(&w16(3)); tiff.extend_from_slice(&w32(1));
+        tiff.extend_from_slice(&w16(orientation)); tiff.extend_from_slice(&[0, 0]);
+        tiff.extend_from_slice(&w32(0));
+        let mut seg = vec![0xFF, 0xE1];
+        seg.extend_from_slice(&((2 + 6 + tiff.len()) as u16).to_be_bytes());
+        seg.extend_from_slice(b"Exif\0\0");
+        seg.extend_from_slice(&tiff);
+        seg
+    }
+
+    #[test]
+    fn the_exif_orientation_is_read_in_both_byte_orders_and_malformed_is_upright() {
+        for le in [true, false] {
+            let mut j = vec![0xFF, 0xD8];
+            j.extend(exif_app1(6, le));
+            j.extend_from_slice(&[0xFF, 0xDA, 0, 2]);
+            assert_eq!(exif_orientation(&j), 6, "le={le}");
+        }
+        assert_eq!(exif_orientation(&[0xFF, 0xD8, 0xFF, 0xDA, 0, 2]), 1, "no EXIF");
+        assert_eq!(exif_orientation(b"\x89PNG\r\n"), 1, "not a JPEG");
+        let mut cut = vec![0xFF, 0xD8];
+        cut.extend(&exif_app1(6, true)[..14]);
+        assert_eq!(exif_orientation(&cut), 1, "truncated");
+        let mut odd = vec![0xFF, 0xD8];
+        odd.extend(exif_app1(9, true));
+        assert_eq!(exif_orientation(&odd), 1, "out of range");
+    }
+
+    #[test]
+    fn a_portrait_phone_photo_is_decoded_upright() {
+        // A 400x200 JPEG whose left half is red, stored with orientation 6 (turn 90
+        // degrees clockwise): upright it is 200 wide and 400 tall, red on TOP.
+        let mut img = image::RgbImage::new(400, 200);
+        for (x, _, p) in img.enumerate_pixels_mut() { *p = if x < 200 { image::Rgb([220, 20, 20]) } else { image::Rgb([20, 20, 220]) }; }
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95).encode_image(&img).unwrap();
+        let mut with_exif = jpeg[..2].to_vec();
+        with_exif.extend(exif_app1(6, false));
+        with_exif.extend_from_slice(&jpeg[2..]);
+        let dir = std::env::temp_dir().join(format!("photosync-orient-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("portrait.jpg");
+        std::fs::write(&p, &with_exif).unwrap();
+        let t = ImageDecode.decode(p.to_str().unwrap(), 128).unwrap();
+        assert_eq!((t.w, t.h), (64, 128), "upright: portrait");
+        let top = &t.rgba[(8 * t.w as usize + 32) * 4..][..3];
+        let bottom = &t.rgba[(120 * t.w as usize + 32) * 4..][..3];
+        assert!(top[0] > 150 && top[2] < 100, "red on top: {top:?}");
+        assert!(bottom[2] > 150 && bottom[0] < 100, "blue below: {bottom:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
