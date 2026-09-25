@@ -4949,15 +4949,27 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         local_player.view.yaw
                     };
                     let (mut sx, mut sz) = (p.x + yaw.cos() * m, p.z + yaw.sin() * m);
+                    // The LOADED world's surface first: the generator's own probe
+                    // sits ~15 m under it (a soak hatched a dragon at y=61 under a
+                    // player at y=76). Scan and spawn must use the same height --
+                    // the genome is a function of the exact spawn position.
+                    let gen = chunk_manager.generator().cpu().clone();
+                    let top = |x: f32, z: f32| {
+                        chunk_manager
+                            .surface_y_at(x.floor() as i32, z.floor() as i32, probe_y_min, probe_y_max)
+                            .or_else(|| gen.surface_y_at(x.floor() as i32, z.floor() as i32, probe_y_min, probe_y_max))
+                    };
+                    // "Your level" is the ground under you, not your eye: 3 s into a
+                    // world you may still be dropping in from the spawn height.
+                    let ground_ref = top(p.x, p.z).map(|y| (y + 1) as f32).unwrap_or(p.y - 1.6);
                     if let Some(el) = dragon_at_element {
                         use unendlich_engine::sim::dragon_abilities as da;
-                        let gen = chunk_manager.generator().cpu().clone();
                         let found = (0..400).find_map(|k| {
                             let (ox, oz) = (((k % 20) as f32 - 10.0) * 3.0, ((k / 20) as f32 - 10.0) * 3.0);
                             let (x, z) = (sx + ox, sz + oz);
-                            let y = gen.surface_y_at(x.floor() as i32, z.floor() as i32, probe_y_min, probe_y_max)? + 1;
+                            let y = top(x, z)? + 1;
                             // On your level: a master on a peak 90 m up never sees you.
-                            if (y as f32 - (p.y - 1.6)).abs() > 8.0 {
+                            if (y as f32 - ground_ref).abs() > 8.0 {
                                 return None;
                             }
                             let g = unendlich_engine::spawn::dragon_genome_at([x, y as f32, z]);
@@ -4969,15 +4981,28 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 sx = x;
                                 sz = z;
                             }
-                            None => log::warn!("[dragon] UNENDLICH_DRAGON_AT: no {} master within 30 m; hatching what is there", unendlich_engine::sim::dragon_archetype::ELEMENT_NAMES[el as usize]),
+                            None => {
+                                // Say why: how many spots were at your level, and what grew there.
+                                let mut level_ok = 0;
+                                let mut by_el = [0u32; 6];
+                                for k in 0..400 {
+                                    let (x, z) = (sx + ((k % 20) as f32 - 10.0) * 3.0, sz + ((k / 20) as f32 - 10.0) * 3.0);
+                                    if let Some(y) = top(x, z).map(|y| y + 1) {
+                                        if (y as f32 - ground_ref).abs() <= 8.0 {
+                                            level_ok += 1;
+                                            let r = da::repertoire(&unendlich_engine::spawn::dragon_genome_at([x, y as f32, z]));
+                                            by_el[r.dominant.0 as usize % 6] += 1;
+                                        }
+                                    }
+                                }
+                                log::warn!(
+                                    "[dragon] UNENDLICH_DRAGON_AT: no {} master within 30 m ({} of 400 spots at your level; dominant elements there {:?}); hatching what is there",
+                                    unendlich_engine::sim::dragon_archetype::ELEMENT_NAMES[el as usize], level_ok, by_el
+                                )
+                            }
                         }
                     }
-                    let sy = chunk_manager
-                        .generator()
-                        .cpu()
-                        .surface_y_at(sx.floor() as i32, sz.floor() as i32, probe_y_min, probe_y_max)
-                        .unwrap_or(p.y as i32)
-                        + 1;
+                    let sy = top(sx, sz).unwrap_or(p.y as i32) + 1;
                     let wseed = fg_world_seed ^ 0xD2A6_A7A7 ^ (sx as i32 as u32 as u64);
                     roamers.push(build_roamer(
                         unendlich_engine::item::CreatureKind::Dragon,
@@ -11255,7 +11280,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             });
                             let charge = match d.caster.tick(&d.rep, cunning_now, aim_now, cr.body.position, dt) {
                                 dc::CastTick::Gathering { charge01, .. } => charge01,
-                                dc::CastTick::Released(area) => {
+                                dc::CastTick::Released(mut area) => {
+                                    // Areas sit on the ground under where they land: the aim
+                                    // was your feet, which may be mid-jump or mid-fall (a soak
+                                    // put a Smoke Wall at y=98 while you dropped in at spawn).
+                                    if let Some(gy) = chunk_manager.surface_y_at(
+                                        area.center[0].floor() as i32, area.center[2].floor() as i32, probe_y_min, probe_y_max,
+                                    ) {
+                                        area.center[1] = gy as f32 + 1.0;
+                                    }
                                     let hit = dc::release_hit(&area, feet);
                                     if hit.inside {
                                         if survival_mode {
@@ -15426,7 +15459,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     right[0] * f.y - right[1] * f.x,
                 ];
                 let lit = smoke_flash_shown * 0.6;
-                for c in wisps.cards(&looks) {
+                // Far to near: this pass writes depth, so a nearer card drawn
+                // first would hide the cards behind it instead of blending over them.
+                let eye = local_player.view.position;
+                let mut cards = wisps.cards(&looks);
+                let d2 = |c: &sw::Card| (c.center[0] - eye.x).powi(2) + (c.center[1] - eye.y).powi(2) + (c.center[2] - eye.z).powi(2);
+                cards.sort_by(|a, b| d2(b).partial_cmp(&d2(a)).unwrap_or(std::cmp::Ordering::Equal));
+                for c in cards {
                     if c.alpha <= 0.01 {
                         continue;
                     }

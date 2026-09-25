@@ -928,7 +928,7 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
             if changed && !s.cast.map_or(false, |c| c.busy) {
                 begin_cast = Some(defend);
             }
-            (toward, 0.1, if defend { "raising the land between you" } else { "gathering its bending" })
+            (toward, 0.1, if defend { "putting cover between you" } else { "gathering its bending" })
         }
         Tactic::Reposition => {
             let want = if hurt { safe_gap + 10.0 } else { safe_gap + 2.0 };
@@ -2022,7 +2022,7 @@ mod tests {
         let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
         assert_eq!(o.tactic, Tactic::Cast);
         assert_eq!(o.begin_cast, Some(true), "defensive");
-        assert_eq!(o.why.reason, "raising the land between you");
+        assert_eq!(o.why.reason, "putting cover between you");
         // Healthy and facing a neutral item: offence instead.
         let mut st2 = DuelState::new(1);
         st2.fuel = 0.0;

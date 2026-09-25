@@ -139,5 +139,12 @@ void main() {
 
     // r535: real per-vertex transparency. Fog is composited into rgb above; the
     // alpha here drives the hardware blend (opaque entities pass v_alpha = 1.0).
+    // Near-clear fragments (soft rims of smoke wisps) must not write depth:
+    // this pipeline writes depth for everything it draws, so an invisible rim
+    // would still hide whatever is drawn behind it and turn soft wisps into
+    // hard-edged panes. (A separate no-depth-write effects pass is the full fix.)
+    if (v_alpha < 0.03) {
+        discard;
+    }
     out_color = vec4(color, v_alpha);
 }
