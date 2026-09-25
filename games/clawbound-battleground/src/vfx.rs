@@ -38,6 +38,10 @@ pub struct Ring {
     pub pos: Vec3,
     pub r0: f32,
     pub r1: f32,
+    /// Seconds LEFT: counts down to 0 (unlike `Beam::until`, an absolute
+    /// time). The channel sigil and the lightning ring were given absolute
+    /// times -- stuck at their smallest radius for the whole game clock, a
+    /// cream doughnut hiding a nova's dust and its caster.
     pub until: f32,
     pub dur: f32,
     pub color: [f32; 3],
@@ -314,7 +318,7 @@ impl Vfx {
                     self.channels.retain(|c| c.god != *god);
                     self.channels.push(Channel { god: *god, color: ab.color, t: 0.0, dur: dur.max(0.05), big });
                     // the sigil: grows from nothing to full at the release
-                    self.rings.push(Ring { pos: g.pos + Vec3::Y * 0.06, r0: 0.3, r1: if big { 2.6 } else { 1.6 }, until: self.time + dur, dur: *dur, color: ab.color, thick: if big { 0.22 } else { 0.14 } });
+                    self.rings.push(Ring { pos: g.pos + Vec3::Y * 0.06, r0: 0.3, r1: if big { 2.6 } else { 1.6 }, until: *dur, dur: *dur, color: ab.color, thick: if big { 0.22 } else { 0.14 } });
                 }
                 Event::Cast { god, .. } => self.channels.retain(|c| c.god != *god),
                 _ => {}
@@ -406,7 +410,7 @@ impl Vfx {
             out.push(Particle { pos: at + Vec3::Y * 0.2, vel: Vec3::new(a.cos() * 5.0, 3.0 + rng.f32() * 3.0, a.sin() * 5.0), life: 0.35, max_life: 0.35, size: 0.1, color: white, alpha: 1.0, gravity: 14.0, drag: 0.5 });
         }
         self.particles.extend(out);
-        self.rings.push(Ring { pos: at + Vec3::Y * 0.08, r0: 0.3, r1: 2.8, until: self.time + 0.28, dur: 0.28, color: [color[0] * 0.5 + 0.5, color[1] * 0.5 + 0.5, 1.0], thick: 0.2 });
+        self.rings.push(Ring { pos: at + Vec3::Y * 0.08, r0: 0.3, r1: 2.8, until: 0.28, dur: 0.28, color: [color[0] * 0.5 + 0.5, color[1] * 0.5 + 0.5, 1.0], thick: 0.2 });
     }
 
     /// Speed made visible: while a cat dashes it leaves a ghost of itself
@@ -650,21 +654,26 @@ impl Vfx {
                     // makes an impact feel heavy
                     // earth, barely tinted: particles draw with a glow, and the
                     // first mid-tone dust came out as bright cream puffs
-                    let dust = [0.52 + color[0] * 0.06, 0.44 + color[1] * 0.06, 0.33 + color[2] * 0.06];
-                    for k in 0..40 {
-                        let a = k as f32 / 40.0 * std::f32::consts::TAU + self.perturb(0.08);
+                    // Real impact dust LAGS the shockwave: slower than the
+                    // ring, billowing up, hanging -- and darker than the path
+                    // so it reads. (Racing out with the ring, pale, it was a
+                    // 2.7k-pixel rim hidden inside the ring's cubes.)
+                    let dust = [0.36 + color[0] * 0.05, 0.28 + color[1] * 0.05, 0.2 + color[2] * 0.05];
+                    for k in 0..24 {
+                        let a = k as f32 / 24.0 * std::f32::consts::TAU + self.perturb(0.12);
                         let d = Vec3::new(a.cos(), 0.0, a.sin());
-                        let up = 0.6 + self.perturb(0.4);
+                        let up = 1.1 + self.perturb(0.5);
+                        let reach = 0.45 + self.perturb(0.1).abs();
                         self.dust.push(Particle {
-                            pos: *pos + d * 0.8 + Vec3::Y * 0.25,
-                            vel: d * (*radius * 1.7) + Vec3::Y * up,
-                            life: 0.7,
-                            max_life: 0.7,
-                            size: 0.34,
+                            pos: *pos + d * 0.6 + Vec3::Y * 0.3,
+                            vel: d * (*radius * reach * 1.6) + Vec3::Y * up,
+                            life: 1.3,
+                            max_life: 1.3,
+                            size: 0.62,
                             color: dust,
-                            alpha: 0.6,
-                            gravity: 1.2,
-                            drag: 3.2,
+                            alpha: 0.72,
+                            gravity: 0.35,
+                            drag: 2.4,
                         });
                     }
                     self.quake(*pos, *radius * 0.6, (*radius / 9.0).clamp(0.2, 0.9));
@@ -1845,7 +1854,7 @@ mod ability_fx_tests {
         let c = Vec3::new(3.0, 0.0, 3.0);
         v.update(1.0 / 60.0, &[Event::NovaFx { pos: c, radius: 6.0, color: [1.0, 0.6, 0.2] }], &game);
         let dust: Vec<&Particle> = v.dust.iter().collect();
-        assert!(dust.len() >= 40);
+        assert!(dust.len() >= 24);
         assert!(dust.iter().all(|p| Vec3::new(p.vel.x, 0.0, p.vel.z).dot(p.pos - c) > 0.0 && p.pos.y < 0.5), "outward, low");
         let mut game = Game::new_teams(&[0], &[1]);
         let def = &crate::gods::ROSTER[game.gods[0].def_id as usize];
@@ -1862,5 +1871,25 @@ mod ability_fx_tests {
             }
             assert!(!v.particles.is_empty(), "the bolt trailed");
         }
+    }
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+
+    /// The channel sigil and a lightning ring grow and are gone on time
+    /// -- even late in a match, when the game clock is large.
+    #[test]
+    fn rings_expire_on_time_late_in_a_match() {
+        let (game, _, _) = (Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]), 0, 0);
+        let mut v = Vfx::default();
+        v.time = 900.0; // fifteen minutes in
+        v.update(0.0, &[Event::CastStart { god: 0, slot: 3, aim: Vec3::ZERO, dur: 0.6 }, Event::StrikeFx { at: Vec3::X * 5.0, color: [0.6, 0.6, 1.0] }], &game);
+        assert_eq!(v.rings.len(), 2);
+        for _ in 0..45 {
+            v.update(1.0 / 60.0, &[], &game);
+        }
+        assert!(v.rings.is_empty(), "rings still alive after 0.75 s: {:?}", v.rings.iter().map(|r| r.until).collect::<Vec<_>>());
     }
 }
