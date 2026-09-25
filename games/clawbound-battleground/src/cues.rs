@@ -15,10 +15,12 @@
 //! | cast fires       | `sfx/cast/<ancestor>/<N>`, `sfx/cast/<archetype>`, `sfx/cast` | sfx |
 //! | attack, nothing  | `sfx/whiff`                                                 | sfx   |
 //! | hit              | `sfx/hit_big` (big), `sfx/hit`                              | sfx   |
-//! | kill             | `voice/<killer>/kill`; `voice/<victim>/death`; `announcer/kill` | voice |
-//! | tower down       | `announcer/tower_down`, `sfx/tower_down`                    | voice/sfx |
+//! | kill             | `voice/<killer>/kill`; `voice/<victim>/death`               | voice |
+//! | tower down       | `sfx/tower_down`                                            | sfx   |
 //! | level up         | `sfx/levelup`                                               | sfx   |
-//! | boss appears     | `announcer/boss`                                            | voice |
+//!
+//! The announcer's calls (first blood, multi-kills, towers, ...) are not
+//! here: `announcer` decides those, one at a time.
 //!
 //! `<ancestor>` is the ancestor's name, lower case, no spaces
 //! ("goldenmane"); `<N>` is the ability slot, 1-4; `<archetype>` is the
@@ -77,15 +79,10 @@ pub fn cues_for(ev: &Event, game: &Game) -> Vec<Cue> {
             if let Some(d) = by_name(victim) {
                 v.push(Cue { keys: vec![format!("voice/{}/death", ancestor_key(game, d))], bus: Bus::Voice, gain: 1.0, pos: god_pos(d), speaker: Some(d), priority: 7 });
             }
-            v.push(Cue { keys: vec!["announcer/kill".into()], bus: Bus::Voice, gain: 1.0, pos: None, speaker: None, priority: 8 });
             v
         }
-        Event::TowerDown { pos, .. } => vec![
-            Cue { keys: vec!["announcer/tower_down".into()], bus: Bus::Voice, gain: 1.0, pos: None, speaker: None, priority: 8 },
-            Cue { keys: vec!["sfx/tower_down".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 6 },
-        ],
+        Event::TowerDown { pos, .. } => vec![Cue { keys: vec!["sfx/tower_down".into()], bus: Bus::Sfx, gain: 1.0, pos: Some(*pos), speaker: None, priority: 6 }],
         Event::LevelUp { pos } => vec![Cue { keys: vec!["sfx/levelup".into()], bus: Bus::Sfx, gain: 0.7, pos: Some(*pos), speaker: None, priority: 3 }],
-        Event::BossSpawn { .. } => vec![Cue { keys: vec!["announcer/boss".into()], bus: Bus::Voice, gain: 1.0, pos: None, speaker: None, priority: 8 }],
         _ => Vec::new(),
     }
 }
@@ -159,13 +156,12 @@ mod tests {
     }
 
     #[test]
-    fn a_kill_is_the_killer_the_victim_and_the_announcer() {
+    fn a_kill_is_the_killer_and_the_victim() {
         let g = game();
         let c = cues_for(&Event::Kill { killer: g.god_name(0).to_string(), victim: g.god_name(5).to_string(), victim_team: g.gods[5].team, is_god: true }, &g);
-        assert_eq!(c.len(), 3);
+        assert_eq!(c.len(), 2, "the announcer's call is the announcer's, not a cue");
         assert!(c[0].keys[0].ends_with("/kill") && c[0].speaker == Some(0));
         assert!(c[1].keys[0].ends_with("/death") && c[1].speaker == Some(5));
-        assert_eq!(c[2].keys[0], "announcer/kill");
         assert!(cues_for(&Event::Kill { killer: "x".into(), victim: "y".into(), victim_team: g.gods[5].team, is_god: false }, &g).is_empty(), "a minion kill says nothing");
     }
 
