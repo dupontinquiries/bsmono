@@ -15,6 +15,9 @@
 //!   [`StreamDecoder::open`] refuses it, with the reason, until the
 //!   streaming patch exists.
 
+pub mod batch;
+pub mod rap;
+
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::time::Duration;
