@@ -47,12 +47,6 @@ fn world_at(uv: vec2<f32>, dims: vec2<f32>) -> vec4<f32> {
     return vec4(w.xyz / w.w, d);
 }
 
-fn vnoise(p: vec2<f32>) -> f32 {
-    let i = floor(p);
-    let f = fract(p);
-    let u = f * f * (3.0 - 2.0 * f);
-    return mix(mix(hash21(i), hash21(i + vec2(1.0, 0.0)), u.x), mix(hash21(i + vec2(0.0, 1.0)), hash21(i + vec2(1.0, 1.0)), u.x), u.y);
-}
 
 // Wet ground as a mirror (ultra): screen-space reflection of a level wet
 // surface. The pixel's world point and normal come from the depth buffer;
@@ -106,9 +100,12 @@ fn wet_reflection(uv: vec2<f32>, dims: vec2<f32>) -> vec4<f32> {
         t = t * 1.22 + 0.12;
     }
     let fres = 0.02 + 0.98 * pow(1.0 - max(dot(-V, N), 0.0), 5.0);
-    let puddle = smoothstep(0.45 - wet * 0.35, 0.7 - wet * 0.3, vnoise(P.xz * 0.35) * 0.7 + vnoise(P.xz * 1.3) * 0.3);
+    // exactly where the terrain shows water: the same height field and
+    // water level (common_surface.wgsl); the terrain also cuts its cracks
+    // into it, which are too thin to matter here
+    let puddle = water_fill(surface_height(P.xz), wet, N.y);
     let far_fade = 1.0 - smoothstep(40.0, 90.0, dist0);
-    return vec4(hit, found * fres * puddle * wet * far_fade * 0.95);
+    return vec4(hit, found * fres * puddle * far_fade * 0.95);
 }
 
 // The world-space direction of the view ray through `uv`.

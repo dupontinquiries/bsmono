@@ -83,6 +83,16 @@ impl Camera {
 
 // --- mesh cache ----------------------------------------------------------------
 
+/// Shader sources as compiled: shared parts prepended -- the sun's
+/// contact-hardening shadow (common_shadow.wgsl) and the ground's height
+/// field (common_surface.wgsl). tests/shaders.rs validates exactly these.
+pub mod shader_src {
+    pub const VOXEL: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/voxel.wgsl"));
+    pub const TERRAIN: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/common_surface.wgsl"), include_str!("../shaders/terrain.wgsl"));
+    pub const SMOOTH: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/smooth.wgsl"));
+    pub const POST: &str = concat!(include_str!("../shaders/common_surface.wgsl"), include_str!("../shaders/post.wgsl"));
+}
+
 /// A smooth mesh on the GPU (`smoothvox`): vertices and triangle indices.
 struct SmoothGpu {
     vbuf: wgpu::Buffer,
@@ -399,7 +409,7 @@ impl Renderer {
 
         let voxel_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("voxel.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/voxel.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::render::shader_src::VOXEL.into()),
         });
         let shadow_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadow.wgsl"),
@@ -407,7 +417,7 @@ impl Renderer {
         });
         let terrain_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("terrain.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/terrain.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::render::shader_src::TERRAIN.into()),
         });
         let water_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("water"),
@@ -419,7 +429,7 @@ impl Renderer {
         });
         let post_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("post.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/post.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::render::shader_src::POST.into()),
         });
 
         let voxel_vbl = wgpu::VertexBufferLayout {
@@ -610,7 +620,7 @@ impl Renderer {
         // bind group, plus the coloured lights and their occluders
         let smooth_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("smooth"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/smooth.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::render::shader_src::SMOOTH.into()),
         });
         let lights_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("lights"),

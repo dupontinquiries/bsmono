@@ -99,10 +99,7 @@ fn hash3(p: vec3<f32>) -> f32 {
     return fract((q.x + q.y) * q.z);
 }
 
-fn shadow_edge(uv: vec2<f32>) -> f32 {
-    let e = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-    return 1.0 - smoothstep(0.0, 0.08, e);
-}
+// shadow_edge, sun_shadow: common_shadow.wgsl
 
 // Soft shadow of a sphere along a ray, closed form (after Inigo Quilez):
 // how nearly the ray passes the sphere, relative to how far along it the
@@ -171,19 +168,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let ndl = max(dot(N, sun), 0.0);
 
     // the sun's shadow map, as the voxels read it
-    var sp = in.shadow_pos;
-    sp = sp / sp.w;
-    let uv = sp.xy * vec2(0.5, -0.5) + vec2(0.5);
-    var shadow = 1.0;
-    if (uv.x > 0.002 && uv.x < 0.998 && uv.y > 0.002 && uv.y < 0.998 && sp.z <= 1.0) {
-        var s = 0.0;
-        for (var i: i32 = -1; i <= 1; i = i + 1) {
-            for (var j: i32 = -1; j <= 1; j = j + 1) {
-                s = s + textureSampleCompare(shadow_map, shadow_sampler, uv + vec2(f32(i), f32(j)) * 0.0012, sp.z - 0.0032);
-            }
-        }
-        shadow = mix(s / 9.0, 1.0, shadow_edge(uv));
-    }
+    // contact-hardening: crisp where a shadow meets its caster (common_shadow.wgsl)
+    let shadow = sun_shadow(in.shadow_pos, 0.0032, in.clip.xy);
 
     // the game's sky and ground (voxel.wgsl), so ultra cats share its world
     let night = frame.params.w;

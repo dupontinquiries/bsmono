@@ -233,10 +233,7 @@ fn shaft_light(world: vec3<f32>) -> f32 {
 
 // The fitted shadow box ends somewhere. Fade to "lit" over its last tenth so
 // the edge is a gradient on the ground and not a line.
-fn shadow_edge(uv: vec2<f32>) -> f32 {
-    let m = max(abs(uv.x - 0.5), abs(uv.y - 0.5)) * 2.0;
-    return smoothstep(0.88, 0.99, m);
-}
+// shadow_edge, sun_shadow: common_shadow.wgsl
 
 // Shattered ground: the edges of a cell pattern, strongest at the impact and
 // fading to its rim. `open` runs 1 -> 0 as it heals: the cracks NARROW first
@@ -338,26 +335,34 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let mat_id = round(in.mat);
     let purity = clamp(1.0 - 2.0 * abs(in.mat - mat_id), 0.0, 1.0);
     let n0 = normalize(in.normal);
-    let det = mix(tri_detail(in.world, n0, 0.0, cam_d), tri_detail(in.world, n0, mat_id, cam_d), purity);
-    let N = normalize(in.normal + det.yzw);
+    // Materials meet by HEIGHT, not by a fade: each side has a height (the
+    // surface field, the material's own pattern raising its stones), and
+    // where they meet the higher wins, with a thin transition -- a ragged,
+    // natural border (stones poking through, moss creeping over a lane's
+    // edge) instead of a smudge.
+    let det_a = tri_detail(in.world, n0, 0.0, cam_d);
+    let det_b = tri_detail(in.world, n0, mat_id, cam_d);
+    let h_a = surface_height(in.world.xz + vec2(17.3, 5.1));
+    let h_b = surface_height(in.world.xz) * 0.7 + det_b.x * 0.3;
+    let wb = smoothstep(-0.06, 0.06, (purity - 0.5) * 1.6 + (h_b - h_a));
+    let det = mix(det_a, det_b, wb);
+    // the seam itself darkens a little, so the edge reads as an edge
+    let seam = 1.0 - 0.14 * (1.0 - abs(wb * 2.0 - 1.0)) * (1.0 - purity);
+    let broken = cracked(in.world.xz);
+    // Standing water in the lows of the height field -- the cracks deepest
+    // -- flat, dark and glossy; the high ground only damp. Replaces blocky
+    // hash-cell puddles over a ground at least 55% wet everywhere: an even
+    // gloss over everything.
+    let wet = frame.weather.z;
+    let h_wet = surface_height(in.world.xz) - broken.x * 0.5 - broken.y * 0.2;
+    let pud = water_fill(h_wet, wet, n0.y);
+    var N = normalize(in.normal + det.yzw);
+    N = normalize(mix(N, vec3(0.0, 1.0, 0.0), pud * 0.9));
     let sun = normalize(frame.sun_dir.xyz);
     let ndl = max(dot(N, sun), 0.0);
 
-    var sp = in.shadow_pos;
-    sp = sp / sp.w;
-    let uv = sp.xy * vec2(0.5, -0.5) + vec2(0.5);
-    var shadow = 1.0;
-    if (uv.x > 0.002 && uv.x < 0.998 && uv.y > 0.002 && uv.y < 0.998 && sp.z <= 1.0) {
-        let bias = 0.0030;
-        var s = 0.0;
-        for (var i: i32 = -1; i <= 1; i = i + 1) {
-            for (var j: i32 = -1; j <= 1; j = j + 1) {
-                s = s + textureSampleCompare(shadow_map, shadow_sampler,
-                    uv + vec2(f32(i), f32(j)) * 0.0010, sp.z - bias);
-            }
-        }
-        shadow = mix(s / 9.0, 1.0, shadow_edge(uv));
-    }
+    // contact-hardening: crisp where a shadow meets its caster (common_shadow.wgsl)
+    let shadow = sun_shadow(in.shadow_pos, 0.0030, in.clip.xy);
 
     let night = frame.params.w;
     let cloud = frame.sun_col.w;
@@ -377,9 +382,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
     // wet ground: darken albedo, add a broad sky reflection + sun glint;
     // puddles pool in a low-frequency noise pattern so it reads as water
-    let wet = frame.weather.z;
-    let pud = smoothstep(0.55, 0.8, hash21(floor(in.world.xz * 0.35)) * 0.5 + 0.5 * hash21(floor(in.world.xz * 0.9 + 3.1)));
-    let wetness = wet * (0.55 + 0.45 * pud);
+    // damp everywhere a little, water where it pools
+    let wetness = wet * 0.18 + pud * 0.82;
     // Ground noise, three scales: broad patches of richer and poorer ground,
     // a mid scale that breaks up the vertex grid, and grain up close. Faded
     // with distance so far terrain does not shimmer.
@@ -391,10 +395,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // Where materials meet, let the mid noise decide per pixel which side
     // wins, so the join is scuffed and patchy rather than a gradient.
     let scuff = (1.0 - purity) * (mid - 0.5) * 0.45;
-    var albedo = in.color * det.x * (ground + scuff) * (1.0 - 0.32 * wetness);
+    var albedo = in.color * det.x * (ground + scuff) * seam * (1.0 - 0.18 * wet - 0.3 * pud);
     // a little hue drift with the broad noise: sun-bleached vs damp
     albedo = albedo * mix(vec3(1.05, 1.0, 0.90), vec3(0.93, 1.0, 1.04), broad);
-    let broken = cracked(in.world.xz);
     albedo = albedo * (1.0 - 0.45 * broken.y) * (1.0 - 0.9 * broken.x);
     // snow cover settles on up-facing ground, patchy by the same noise as the puddles
     let snow = frame.weather.y;
