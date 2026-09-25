@@ -90,6 +90,10 @@ struct AppState {
     music_on: bool,
     /// The game-state announcer (`announcer`).
     announcer: crate::announcer::Announcer,
+    /// Intros played this session: the first is the full, narrated one.
+    intros_played: u32,
+    /// A scored intro track is playing (it replaces the synthesized fanfare).
+    intro_music: bool,
     /// Watching an all-bot match (`spectator`); None when playing.
     spectator: Option<crate::spectator::Spectator>,
     /// Spectator switches pressed since last frame (Tab, Z, X).
@@ -414,6 +418,8 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         voice_gate: Default::default(),
         music_on: false,
         announcer: Default::default(),
+        intros_played: 0,
+        intro_music: false,
         spectator: None,
         spec_cycle: 0,
         spec_director: false,
@@ -884,7 +890,10 @@ fn finish_start(s: &mut AppState) {
         let dir = cam_dir(s.cam_yaw, s.cam_pitch);
         let target = p0 + Vec3::Y * 1.5;
         let play = crate::intro::Shot { eye: target - dir * s.cam_dist, target, fov_y: 0.95 };
-        s.intro = Some(crate::intro::Intro::new(&teams, p0, play));
+        // the session's first match opens with the narrated prologue
+        s.intro = Some(if s.intros_played == 0 { crate::intro::Intro::full(&teams, p0, play) } else { crate::intro::Intro::new(&teams, p0, play) });
+        s.intros_played += 1;
+        s.intro_music = false;
         s.skip_intro = false;
     }
     s.controls_open = false;
@@ -1005,7 +1014,31 @@ fn render(s: &mut AppState) {
                         s.vfx.star_burst(g.gods[gi].pos, c, gi as f32);
                     }
                 }
-                if before < crate::intro::FANFARE_AT && it.t >= crate::intro::FANFARE_AT && !s.skip_intro {
+                // The intro's score and narration (studio files, if loaded):
+                // `music/intro_full` for the narrated intro, `music/intro` for
+                // the short one, from its first frame; the narrator's lines
+                // on their schedule. A skip silences both.
+                #[cfg(feature = "audio")]
+                if let (Some(amb), Some(bank)) = (s.ambience.as_mut(), s.bank.as_mut()) {
+                    use crate::mixer::{Bus, Cmd, Play};
+                    if before == 0.0 {
+                        let key = if it.is_full() { "music/intro_full" } else { "music/intro" };
+                        if let Some(id) = bank.pick(key) {
+                            s.intro_music = amb.mixer.play(Play { clip: id, bus: Bus::Music, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: None });
+                        }
+                    }
+                    for key in it.narration_due(before, it.t) {
+                        if let Some(id) = bank.pick(&format!("narrator/{key}")) {
+                            amb.mixer.play(Play { clip: id, bus: Bus::Voice, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: Some(u16::MAX - 1) });
+                        }
+                    }
+                    if s.skip_intro {
+                        amb.mixer.send(Cmd::StopBus(Bus::Music));
+                        amb.mixer.send(Cmd::StopBus(Bus::Voice));
+                        s.intro_music = false;
+                    }
+                }
+                if before < it.fanfare_at() && it.t >= it.fanfare_at() && !s.skip_intro && !s.intro_music {
                     // a studio fanfare, if one is loaded; else the synthesized one
                     let mut played = false;
                     #[cfg(feature = "audio")]
@@ -1157,7 +1190,8 @@ fn render(s: &mut AppState) {
         bank.poll(&mut amb.mixer);
         match s.game.as_ref() {
             Some(g) if s.screen == Screen::Playing => {
-                if !s.music_on {
+                // the map's music waits for the intro (and its score) to end
+                if !s.music_on && s.intro.is_none() {
                     if let Some(id) = bank.pick(&format!("music/{}", crate::map::active().key())) {
                         amb.mixer.play(Play { clip: id, bus: Bus::Music, gain: 0.8, pan: 0.0, priority: 9, looped: true, speaker: None });
                     }

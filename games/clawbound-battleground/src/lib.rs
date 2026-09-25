@@ -34,6 +34,8 @@ pub mod soundbank;
 pub mod cues;
 /// Every line the game voices, as data: the recording script.
 pub mod voicescript;
+/// Who the ancestors are: species, age, land, gender, story, music; checked against the game.
+pub mod lore;
 /// The announcer: game-state calls, prioritized, never overlapping.
 pub mod announcer;
 /// The game's sound effects, designed in code (rendered by examples/gen_sfx).
