@@ -88,6 +88,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("ultra") {
         return run_ultra_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("thunder") {
+        return run_thunder_shots();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("spectate") {
         return run_spectate();
     }
@@ -1648,5 +1651,90 @@ pub fn run_ultra_shots() -> Result<(), String> {
         }
         println!("frame, 4 cats, {}: {best:.0} ms (lavapipe)", if ultra { "ultra" } else { "voxel" });
     }
+    Ok(())
+}
+
+/// Stillsmoke's Ninth Thunder among three other cats, in the ultra preview:
+/// the channel mid-gather (motes, sigil, column), then a lightning strike
+/// landing (the bolt, and its light throwing the cats' traced shadows),
+/// and the same strike as voxels.
+/// `CLAWBOUND_SHOTS=thunder clawbound-battleground --screenshot`
+pub fn run_thunder_shots() -> Result<(), String> {
+    std::env::set_var("CLAWBOUND_QUALITY", "ultra");
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("thunder"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let mut scene = Scene::new(&mut renderer);
+    let id = |n: &str| crate::gods::ROSTER.iter().position(|d| d.name == n).unwrap() as u32;
+    let mut game = Game::new_teams(&[id("Stillsmoke"), id("Goldenmane")], &[id("Duskstripe"), id("Faryowl")]);
+    game.blockers = scene.blockers.clone();
+    let spot = Vec3::new(0.0, 0.0, -40.0);
+    let aim = spot + Vec3::new(0.0, 0.0, 6.0);
+    let places = [spot, spot + Vec3::new(-2.5, 0.0, 1.0), aim + Vec3::new(1.4, 0.0, 0.3), aim + Vec3::new(-1.6, 0.0, 1.2)];
+    for (g, p) in game.gods.iter_mut().zip(places) {
+        g.ai = None;
+        g.pos = p;
+        g.yaw = std::f32::consts::FRAC_PI_2; // facing +z, toward the storm
+        g.mana = 10_000.0;
+    }
+    let mut vfx = Vfx::default();
+    let step = |game: &mut Game, vfx: &mut Vfx| -> Vec<crate::sim::Event> {
+        game.tick(1.0 / 60.0);
+        let ev: Vec<crate::sim::Event> = game.events.drain(..).collect();
+        vfx.update(1.0 / 60.0, &ev, game);
+        ev
+    };
+    for _ in 0..20 {
+        step(&mut game, &mut vfx);
+    }
+    let def = &crate::gods::ROSTER[game.gods[0].def_id as usize];
+    let slot = (0..4).find(|&s| def.abilities[s].ult).unwrap() as u32;
+    game.cast_queue.push((0, slot, aim));
+    let cam = Camera { eye: spot + Vec3::new(5.5, 4.2, -6.5), target: spot + Vec3::new(-0.3, 1.2, 3.5), fov_y: 0.95 };
+    let mut shoot = |renderer: &mut Renderer, scene: &Scene, vfx: &mut Vfx, game: &Game, name: &str| -> Result<(), String> {
+        scene.draw(renderer, game, vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name} ({} lights)", renderer.lights.len());
+        Ok(())
+    };
+    // mid-channel: 60% of the wind-up
+    let wind = crate::abilities::cast_timing(&def.abilities[slot as usize]).0;
+    for _ in 0..((wind * 0.6) * 60.0) as usize {
+        step(&mut game, &mut vfx);
+    }
+    shoot(&mut renderer, &scene, &mut vfx, &game, "thunder_1_channel.png")?;
+    // then on to the first strike that lands, a beat into the storm
+    let mut seen = 0;
+    for _ in 0..600 {
+        let ev = step(&mut game, &mut vfx);
+        if ev.iter().any(|e| matches!(e, crate::sim::Event::StrikeFx { .. })) {
+            seen += 1;
+            if seen == 3 {
+                break;
+            }
+        }
+    }
+    shoot(&mut renderer, &scene, &mut vfx, &game, "thunder_2_strike.png")?;
+    // the strike's shadows, measured: the same frame without the cats'
+    // spheres (nothing to trace against)
+    scene.draw(&mut renderer, &game, &mut vfx, cam);
+    renderer.occluders.clear();
+    renderer.atmosphere = game.weather.atmosphere();
+    renderer.render_frame(&view, cam, game.t);
+    save_shot(&renderer.device, &renderer.queue, &target, "thunder_2b_no_occluders.png")?;
+    scene.ultra = false;
+    shoot(&mut renderer, &scene, &mut vfx, &game, "thunder_3_strike_voxel.png")?;
     Ok(())
 }

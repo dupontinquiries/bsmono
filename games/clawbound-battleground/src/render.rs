@@ -531,9 +531,25 @@ impl Renderer {
             multiview: None,
         });
 
+        // the terrain receives the coloured point lights too (ultra), so it
+        // shares the lights layout with the smooth characters
+        let lights_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lights bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            }],
+        });
+        let lit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("lit layout"),
+            bind_group_layouts: &[&main_bgl, &lights_bgl],
+            push_constant_ranges: &[],
+        });
         let terrain_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("terrain"),
-            layout: Some(&main_pl),
+            layout: Some(&lit_pl),
             vertex: wgpu::VertexState { module: &terrain_module, entry_point: "vs_main", buffers: &[terrain_vbl] },
             fragment: Some(wgpu::FragmentState {
                 module: &terrain_module,
@@ -594,15 +610,6 @@ impl Renderer {
             label: Some("smooth"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/smooth.wgsl").into()),
         });
-        let lights_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("lights bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                count: None,
-            }],
-        });
         let lights_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("lights"),
             size: LIGHTS_BYTES,
@@ -614,11 +621,7 @@ impl Renderer {
             layout: &lights_bgl,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: lights_buf.as_entire_binding() }],
         });
-        let smooth_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("smooth layout"),
-            bind_group_layouts: &[&main_bgl, &lights_bgl],
-            push_constant_ranges: &[],
-        });
+        let smooth_pl = &lit_pl;
         let smooth_vbl = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<crate::smoothvox::SmoothVert>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -631,7 +634,7 @@ impl Renderer {
         };
         let smooth_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("smooth"),
-            layout: Some(&smooth_pl),
+            layout: Some(smooth_pl),
             vertex: wgpu::VertexState { module: &smooth_module, entry_point: "vs_main", buffers: &[smooth_vbl] },
             fragment: Some(wgpu::FragmentState {
                 module: &smooth_module,
@@ -1174,8 +1177,10 @@ impl Renderer {
             },
         );
 
-        // the ultra preview's lights and occluders (smooth.wgsl `Lights`)
-        if !self.smooth_queue.is_empty() {
+        // the coloured lights and occluders (smooth.wgsl / terrain.wgsl
+        // `Lights`): written every frame -- the terrain reads them too, and
+        // outside ultra they are empty
+        {
             let mut l = vec![0.0f32; (LIGHTS_BYTES / 4) as usize];
             let nl = self.lights.len().min(8);
             let no = self.occluders.len().min(32);
@@ -1277,6 +1282,7 @@ impl Renderer {
             // terrain
             rp.set_pipeline(&self.terrain_pipe);
             rp.set_bind_group(0, &self.main_bind, &[0]);
+            rp.set_bind_group(1, &self.lights_bind, &[]);
             rp.set_vertex_buffer(0, self.terrain_vbuf.slice(..));
             rp.set_index_buffer(self.terrain_ibuf.slice(..), wgpu::IndexFormat::Uint32);
             rp.draw_indexed(0..self.terrain_count, 0, 0..1);

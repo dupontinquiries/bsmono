@@ -983,7 +983,7 @@ impl Game {
                     let ang = self.rng.f32() * std::f32::consts::TAU;
                     let r = self.rng.f32() * zradius * 0.8;
                     let at = zpos + Vec3::new(ang.cos() * r, 0.0, ang.sin() * r);
-                    self.events.push(Event::BoltFx { from: at + Vec3::Y * 9.0, to: at, color: zcolor, thick: 0.35 });
+                    self.events.push(Event::StrikeFx { at, color: zcolor });
                     self.aoe_damage(at, 1.8, zteam, val * 0.5, owner, 0.0, 0.0);
                 }
                 if new_timer <= 0.0 {
