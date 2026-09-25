@@ -12,6 +12,8 @@ pub mod toml_io;
 pub mod dispatch;
 pub mod key;
 pub mod state;
+/// A positional symbol layer on the standard letter layouts (long-press).
+pub mod second_layer;
 
 use crate::key::{Key, KeyAction, KeyGestures};
 use anyhow::{Context, Result};

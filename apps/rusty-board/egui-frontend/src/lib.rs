@@ -342,7 +342,7 @@ fn emit_for_action(kind: &str) -> Option<String> {
 /// binary always carries an exact, byte-identical copy of whatever the GTK app ships.
 fn layout_from_json(text: &str) -> Result<Layout, serde_json::Error> {
     let parsed: JsonLayout = serde_json::from_str(text)?;
-    let rows = parsed.rows.into_iter().map(|r| Row {
+    let rows: Vec<Row> = parsed.rows.into_iter().map(|r| Row {
         weight: r.weight,
         keys: r.keys.into_iter().map(|k| {
             let emit = k
@@ -356,6 +356,18 @@ fn layout_from_json(text: &str) -> Result<Layout, serde_json::Error> {
             key
         }).collect(),
     }).collect();
+    // The second layer (board_layouts::second_layer), by the same table the real
+    // board uses: each letter key's positional symbol first in its long-press list.
+    let mut rows = rows;
+    let labels: Vec<Vec<&str>> = rows.iter().map(|r: &Row| r.keys.iter().map(|k| k.label.as_str()).collect()).collect();
+    let plan = board_layouts::second_layer::plan(&labels);
+    for (row, syms) in rows.iter_mut().zip(plan) {
+        for (key, sym) in row.keys.iter_mut().zip(syms) {
+            if let Some(sym) = sym {
+                key.variants = board_layouts::second_layer::merged(&key.variants, sym);
+            }
+        }
+    }
     Ok(Layout { hints: false, name: if parsed.name.is_empty() { "qwerty".into() } else { parsed.name }, rows })
 }
 
@@ -1341,6 +1353,24 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
         let text_color = if pressed { c.bg_base } else { c.text };
         paint_cap_label(painter, rect, &key.label, morph, font.clone(), text_color);
     }
+    // THE SECOND LAYER, visible: a key's first long-press character small in its top-right
+    // corner (Gboard's hint), so the layer is found by looking rather than by holding every
+    // key. Not where compass glyphs are drawn at rest -- the two would collide in the corner.
+    if !key.variants.is_empty() && !(hints && !key.cardinal.is_empty()) {
+        // 10pt floor: nothing on a cap is smaller (every_cap_label_is_rasterised_on_the_pixel_grid).
+        // Snapped to whole device pixels, and the floor applied AFTER snapping: 10pt at 1.25x is
+        // 12.5px, which snaps down to 12px = 9.6pt -- so round up to the next whole pixel.
+        let pt = uikit_egui::crisp::snap_font_pt((size.y * 0.2).clamp(10.0, 12.0), ppp);
+        let pt = if pt < 10.0 { (10.0 * ppp).ceil() / ppp } else { pt };
+        let hint = FontId::proportional(pt);
+        painter.text(
+            rect.right_top() + egui::vec2(-size.y * 0.12, size.y * 0.08),
+            egui::Align2::RIGHT_TOP,
+            &key.variants[0],
+            hint,
+            c.text.gamma_multiply(0.5),
+        );
+    }
     // The compass hints, drawn small around the tap label so a cardinal key advertises its
     // swipes at rest (FlickBoard/MessagEase draw every direction's glyph in its corner). Only the
     // four cardinals ride the edges; diagonals sit in their corners.
@@ -1646,6 +1676,24 @@ mod tests {
         let l = Layout::qwerty();
         let e = l.rows[0].keys.iter().find(|k| k.label == "e").unwrap();
         assert!(e.variants.contains(&"é".to_string()), "expected é among e's real extended entries: {:?}", e.variants);
+    }
+
+    #[test]
+    fn the_standard_layouts_carry_a_second_layer_on_every_letter() {
+        // Demo board (Layout::qwerty) and the real board (real_layout::builtin) load the same
+        // files through different paths; both get the positional layer.
+        let q = Layout::qwerty();
+        let key = |l: &Layout, lab: &str| l.rows.iter().flat_map(|r| &r.keys).find(|k| k.label == lab).cloned().unwrap();
+        assert_eq!(key(&q, "s").variants.first().map(String::as_str), Some("#"));
+        assert_eq!(key(&q, "m").variants.first().map(String::as_str), Some("?"));
+        assert!(key(&q, "e").variants.contains(&"é".to_string()), "accents kept");
+        let files = crate::real_layout::builtin();
+        let dv = files.iter().find(|f| f.name.contains("dvorak")).expect("dvorak ships");
+        let p = dv.rows.iter().flat_map(|r| &r.keys).find(|k| k.label == "p").unwrap();
+        assert_eq!(p.extended.first().map(String::as_str), Some("4"), "p is in QWERTY's r column");
+        let sym = files.iter().find(|f| f.name.contains("symbol")).expect("symbols ships");
+        let untouched = crate::real_layout::parse(crate::real_layout::SYMBOLS_JSON).unwrap();
+        assert_eq!(sym.rows.len(), untouched.rows.len());
     }
 
     #[test]

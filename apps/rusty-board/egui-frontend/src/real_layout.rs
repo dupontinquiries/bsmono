@@ -24,7 +24,9 @@ pub const SYMBOLS_JSON: &str = include_str!("../../resources/layouts/symbols.jso
 /// Parse one layout file — `board_layouts::io::import_from_string`, stringly-errored for the
 /// frontend's plumbing.
 pub fn parse(json: &str) -> Result<LayoutFile, String> {
-    board_layouts::io::import_from_string(json).map_err(|e| e.to_string())
+    // With the second layer (board_layouts::second_layer): a positional symbol
+    // on every letter key's long-press. A page without letters is untouched.
+    board_layouts::io::import_from_string(json).map(|l| l.with_second_layer()).map_err(|e| e.to_string())
 }
 
 /// The three shipped layouts, parsed (and validated by the shared `io::validate`) from the
