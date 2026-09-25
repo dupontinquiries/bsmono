@@ -36,6 +36,13 @@ pub const TOWER_CULL_R: f32 = 5.0;
 pub struct Scene {
     /// Ancestors cut into posable parts: `[ancestor][team][slot]`.
     pub god_parts: Vec<[[u64; SLOTS]; 2]>,
+    /// The same parts as smooth, furred surfaces (the ultra preview;
+    /// `smoothvox`); empty unless ultra was asked for at build.
+    pub god_smooth: Vec<[[u64; SLOTS]; 2]>,
+    /// Draw the ancestors smooth and furred, with coloured lights and
+    /// traced shadows (`quality::Quality::Ultra`). A plain flag, so a
+    /// harness can compare the two on one frame.
+    pub ultra: bool,
     /// One rig per ancestor (teams share anatomy).
     pub god_rig: Vec<QuadRig>,
     /// The uncut body. Still what the portrait renderer draws.
@@ -203,6 +210,27 @@ impl Scene {
             god_parts.push(parts);
         }
         assert_eq!((god_parts.len(), god_rig.len()), (ROSTER_LEN, ROSTER_LEN), "one cut body and one rig per ancestor");
+        // the ultra preview: every part smoothed and furred, once
+        let ultra = crate::quality::Quality::requested().is_some_and(|q| q.smooth_characters());
+        let mut god_smooth = Vec::new();
+        if ultra {
+            let t = std::time::Instant::now();
+            let mut tris = 0;
+            for def in ROSTER.iter() {
+                let mut parts = [[0u64; SLOTS]; 2];
+                for team in [Team::Blue, Team::Red] {
+                    let rigged = models::build_god_rigged(def, team);
+                    for (s, m) in rigged.meshes.iter().enumerate() {
+                        let mut sm = crate::smoothvox::smooth(m, models::GOD_DRAW_VOXEL, 2);
+                        crate::smoothvox::fur_for_part(def, s, &mut sm);
+                        tris += sm.tris();
+                        parts[team as usize][s] = r.upload_smooth(&sm);
+                    }
+                }
+                god_smooth.push(parts);
+            }
+            eprintln!("[clawbound] ultra preview: {tris} smooth triangles built in {:.1} s", t.elapsed().as_secs_f32());
+        }
 
         let mut minion_melee = [0u64; 2];
         let mut minion_caster = [0u64; 2];
@@ -312,6 +340,8 @@ impl Scene {
 
         Scene {
             god_parts,
+            god_smooth,
+            ultra,
             god_rig,
             god_body,
             god_weapon,
@@ -347,6 +377,16 @@ impl Scene {
     }
 
     pub fn draw(&self, r: &mut Renderer, game: &Game, vfx: &mut Vfx, cam: Camera) {
+        // the ultra preview's coloured lights (ability effects, the ones
+        // brightest where the camera looks) and the spheres their shadows
+        // are traced against (every cat standing)
+        if self.ultra {
+            r.lights = vfx.lights(cam.target, 8);
+            r.occluders = game.gods.iter().filter(|g| g.respawn_t <= 0.0).map(|g| [g.pos.x, g.pos.y + 0.9, g.pos.z, 0.95]).collect();
+        } else {
+            r.lights.clear();
+            r.occluders.clear();
+        }
         r.clear_queues();
 
         // static world chunks — frustum culled. Snow cover frosts the flora
@@ -598,8 +638,15 @@ impl Scene {
                 l.plant = f.map(|p| crate::rigged::world_to_rig(rig, base, p - Vec3::Y * sink));
             }
             let mats = slot_transforms(rig, &posed, &legs, &pose.body);
+            let smooth = self.ultra && di < self.god_smooth.len();
             for (s, m) in mats.iter().enumerate() {
-                r.queue_draw(self.god_parts[di][ti][s], base * *m, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
+                if smooth {
+                    // smooth and furred; the voxel part casts its shadow
+                    r.queue_smooth(self.god_smooth[di][ti][s], base * *m, [1.0; 4]);
+                    r.queue_shadow_only(self.god_parts[di][ti][s], base * *m, models::GOD_DRAW_VOXEL);
+                } else {
+                    r.queue_draw(self.god_parts[di][ti][s], base * *m, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
+                }
             }
 
             if self.god_weapon[di][ti] != 0 {

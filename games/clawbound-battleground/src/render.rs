@@ -83,6 +83,16 @@ impl Camera {
 
 // --- mesh cache ----------------------------------------------------------------
 
+/// A smooth mesh on the GPU (`smoothvox`): vertices and triangle indices.
+struct SmoothGpu {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    count: u32,
+}
+
+/// Bytes in the smooth pipeline's `Lights` uniform (smooth.wgsl).
+const LIGHTS_BYTES: u64 = 16 + 16 * 8 + 16 * 8 + 16 * 32;
+
 pub struct GpuMesh {
     buf: wgpu::Buffer,
     count: u32,
@@ -219,6 +229,22 @@ pub struct Renderer {
     transparent: Vec<(u64, u32)>,
     draws: Vec<DrawData>,
     particles: Vec<VoxInst>,
+    // --- ultra preview: smooth, furred, PBR characters ------------------
+    smooth_pipe: wgpu::RenderPipeline,
+    lights_buf: wgpu::Buffer,
+    lights_bind: wgpu::BindGroup,
+    smooth_meshes: HashMap<u64, SmoothGpu>,
+    smooth_queue: Vec<(u64, u32)>,
+    /// Voxel draws that only cast shadows (an ultra cat's shadow is its
+    /// voxel parts': the same shape, and no second shadow pipeline).
+    shadow_only: Vec<(u64, u32)>,
+    /// Coloured point lights this frame: (xyz, radius), (rgb * intensity).
+    pub lights: Vec<([f32; 4], [f32; 4])>,
+    /// Spheres the coloured lights' shadows are traced against (the cats).
+    pub occluders: Vec<[f32; 4]>,
+    /// Fur shells per smooth draw, and strands per unit of model space.
+    pub fur_shells: u32,
+    pub fur_density: f32,
     camera: Camera,
     time: f32,
     pub exposure: f32,
@@ -562,6 +588,62 @@ impl Renderer {
             multiview: None,
         });
 
+        // the ultra preview's smooth characters (smooth.wgsl): the world's
+        // bind group, plus the coloured lights and their occluders
+        let smooth_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("smooth"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/smooth.wgsl").into()),
+        });
+        let lights_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lights bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            }],
+        });
+        let lights_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lights"),
+            size: LIGHTS_BYTES,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let lights_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lights bind"),
+            layout: &lights_bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: lights_buf.as_entire_binding() }],
+        });
+        let smooth_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("smooth layout"),
+            bind_group_layouts: &[&main_bgl, &lights_bgl],
+            push_constant_ranges: &[],
+        });
+        let smooth_vbl = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<crate::smoothvox::SmoothVert>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 24, shader_location: 2 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 40, shader_location: 3 },
+            ],
+        };
+        let smooth_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("smooth"),
+            layout: Some(&smooth_pl),
+            vertex: wgpu::VertexState { module: &smooth_module, entry_point: "vs_main", buffers: &[smooth_vbl] },
+            fragment: Some(wgpu::FragmentState {
+                module: &smooth_module,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
+            depth_stencil: Some(depth_state_write.clone()),
+            multisample: msaa,
+            multiview: None,
+        });
+
         let post_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("post"),
             layout: Some(&post_pl),
@@ -721,6 +803,16 @@ impl Renderer {
             dropped_draws: 0,
             stats: FrameStats::default(),
             particles: Vec::new(),
+            smooth_pipe,
+            lights_buf,
+            lights_bind,
+            smooth_meshes: HashMap::new(),
+            smooth_queue: Vec::new(),
+            shadow_only: Vec::new(),
+            lights: Vec::new(),
+            occluders: Vec::new(),
+            fur_shells: 10,
+            fur_density: 95.0,
             camera: Camera { eye: Vec3::ZERO, target: Vec3::Y, fov_y: 1.05 },
             time: 0.0,
             exposure: 0.92,
@@ -773,10 +865,11 @@ impl Renderer {
     /// order): how a scene gives its GPU memory back on a map switch.
     pub fn free_meshes_from(&mut self, mark: u64) {
         self.meshes.retain(|&id, _| id < mark);
+        self.smooth_meshes.retain(|&id, _| id < mark);
     }
 
     pub fn mesh_count(&self) -> usize {
-        self.meshes.len()
+        self.meshes.len() + self.smooth_meshes.len()
     }
 
     pub fn upload_mesh(&mut self, mesh: &VoxelMesh) -> u64 {
@@ -883,9 +976,47 @@ impl Renderer {
         out
     }
 
+    /// Upload a smooth mesh (ultra preview); ids share the voxel meshes'
+    /// counter, so `free_meshes_from` frees these too.
+    pub fn upload_smooth(&mut self, m: &crate::smoothvox::SmoothMesh) -> u64 {
+        let id = self.next_mesh_id;
+        self.next_mesh_id += 1;
+        if m.indices.is_empty() {
+            return id;
+        }
+        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("smooth vbuf"), contents: bytemuck::cast_slice(&m.verts), usage: wgpu::BufferUsages::VERTEX });
+        let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("smooth ibuf"), contents: bytemuck::cast_slice(&m.indices), usage: wgpu::BufferUsages::INDEX });
+        self.smooth_meshes.insert(id, SmoothGpu { vbuf, ibuf, count: m.indices.len() as u32 });
+        id
+    }
+
+    /// Queue a smooth, furred draw (ultra preview).
+    pub fn queue_smooth(&mut self, mesh: u64, model: Mat4, tint: [f32; 4]) {
+        if self.draws.len() >= MAX_DRAWS - 1 {
+            self.dropped_draws += 1;
+            return;
+        }
+        let idx = self.draws.len() as u32;
+        self.draws.push(DrawData { model: model.to_cols_array_2d(), tint, params: [0.0, 0.0, 0.0, 0.0] });
+        self.smooth_queue.push((mesh, idx));
+    }
+
+    /// Queue a voxel draw that only casts a shadow.
+    pub fn queue_shadow_only(&mut self, mesh: u64, model: Mat4, voxel: f32) {
+        if self.draws.len() >= MAX_DRAWS - 1 {
+            self.dropped_draws += 1;
+            return;
+        }
+        let idx = self.draws.len() as u32;
+        self.draws.push(DrawData { model: model.to_cols_array_2d(), tint: [1.0; 4], params: [0.0, voxel, 0.0, 0.0] });
+        self.shadow_only.push((mesh, idx));
+    }
+
     pub fn clear_queues(&mut self) {
         self.opaque.clear();
         self.transparent.clear();
+        self.smooth_queue.clear();
+        self.shadow_only.clear();
         self.draws.clear();
         if self.dropped_draws > 0 {
             eprintln!("[clawbound] {} draws dropped last frame (MAX_DRAWS {})", self.dropped_draws, MAX_DRAWS);
@@ -1042,6 +1173,22 @@ impl Renderer {
             },
         );
 
+        // the ultra preview's lights and occluders (smooth.wgsl `Lights`)
+        if !self.smooth_queue.is_empty() {
+            let mut l = vec![0.0f32; (LIGHTS_BYTES / 4) as usize];
+            let nl = self.lights.len().min(8);
+            let no = self.occluders.len().min(32);
+            l[0..4].copy_from_slice(&[nl as f32, no as f32, self.fur_shells as f32, self.fur_density]);
+            for (k, (p, c)) in self.lights.iter().take(8).enumerate() {
+                l[4 + k * 4..8 + k * 4].copy_from_slice(p);
+                l[36 + k * 4..40 + k * 4].copy_from_slice(c);
+            }
+            for (k, o) in self.occluders.iter().take(32).enumerate() {
+                l[68 + k * 4..72 + k * 4].copy_from_slice(o);
+            }
+            self.queue.write_buffer(&self.lights_buf, 0, bytemuck::cast_slice(&l));
+        }
+
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
         });
@@ -1076,7 +1223,7 @@ impl Renderer {
             // what the camera looks at, and drawing every chunk the CAMERA
             // sees into it doubled the voxel work of every frame
             // (CLAWBOUND_SHOTS=perf: "shadow" == "instances" everywhere).
-            for (mesh_id, di) in &self.opaque {
+            for (mesh_id, di) in self.opaque.iter().chain(self.shadow_only.iter()) {
                 if let Some(m) = self.meshes.get(mesh_id) {
                     let model = Mat4::from_cols_array_2d(&self.draws[*di as usize].model);
                     let c = model.transform_point3(m.bound.0);
@@ -1142,6 +1289,21 @@ impl Renderer {
                     rp.set_bind_group(0, &self.main_bind, &[(*di as u32) * DYN_ALIGN as u32]);
                     rp.set_vertex_buffer(1, m.buf.slice(..));
                     rp.draw_indexed(0..36, 0, 0..m.count);
+                }
+            }
+
+            // the ultra preview's smooth, furred characters: the skin and
+            // `fur_shells` shells in one instanced draw per part
+            if !self.smooth_queue.is_empty() {
+                rp.set_pipeline(&self.smooth_pipe);
+                rp.set_bind_group(1, &self.lights_bind, &[]);
+                for (mesh_id, di) in &self.smooth_queue {
+                    if let Some(m) = self.smooth_meshes.get(mesh_id) {
+                        rp.set_bind_group(0, &self.main_bind, &[(*di as u32) * DYN_ALIGN as u32]);
+                        rp.set_vertex_buffer(0, m.vbuf.slice(..));
+                        rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.draw_indexed(0..m.count, 0, 0..(1 + self.fur_shells));
+                    }
                 }
             }
 

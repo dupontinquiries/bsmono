@@ -57,6 +57,18 @@ the single highest-value thing anyone can do with this repo next.
 
 ## Known gaps
 
+- **Ultra graphics: a PREVIEW** (`--ultra` / `CLAWBOUND_QUALITY=ultra`).
+  Characters only: smoothed (smoothvox), shell fur with manes, GGX PBR in
+  the game's lighting model, coloured lights from ability effects, and
+  ray-traced soft shadows between the cats against sphere proxies. Not yet:
+  (1) real ray tracing of the scene -- wgpu 0.19 exposes no ray queries;
+  the next step is a wgpu with `EXPERIMENTAL_RAY_QUERY` (or a compute BVH
+  tracer) for shadows and reflections everywhere; (2) PBR and smoothing for
+  the world, minions and props; (3) a settings entry (Quality is not in the
+  menu at all yet); (4) cost on a real GPU -- +12% frame on lavapipe with 4
+  cats close up; fur shells are fill-heavy, 30 cats is unmeasured; (5) the
+  lights are ability effects only: gems, towers and the sun-disc don't emit.
+
 - **Twinfang Pass (15v15 mountain map, c20unified-015).** `--map pass`.
   * **The map is chosen at launch only**: the terrain mesh is built in
     `Renderer::new`. A menu choice needs the terrain (and water, flood

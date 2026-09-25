@@ -44,8 +44,22 @@ pub struct Ring {
     pub thick: f32,
 }
 
+/// A coloured light an ability effect gives off, for a moment (the ultra
+/// preview lights its smooth characters with these: `Vfx::lights`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Glow {
+    pub pos: Vec3,
+    pub color: [f32; 3],
+    pub radius: f32,
+    pub life: f32,
+    pub max: f32,
+    pub power: f32,
+}
+
 #[derive(Default)]
 pub struct Vfx {
+    /// Coloured light from ability effects, fading (`glow_events`).
+    pub glows: Vec<Glow>,
     pub particles: Vec<Particle>,
     pub beams: Vec<Beam>,
     pub rings: Vec<Ring>,
@@ -187,7 +201,61 @@ impl Vfx {
         }
     }
 
+    /// Turn this frame's effects into coloured glows, and fade the old ones.
+    pub fn glow_events(&mut self, dt: f32, events: &[Event], game: &Game) {
+        for g in self.glows.iter_mut() {
+            g.life -= dt;
+        }
+        self.glows.retain(|g| g.life > 0.0);
+        let mut add = |pos: Vec3, color: [f32; 3], radius: f32, life: f32, power: f32| {
+            if pos.is_finite() && radius > 0.0 && life > 0.0 {
+                self.glows.push(Glow { pos, color, radius, life, max: life, power });
+            }
+        };
+        for e in events {
+            match e {
+                Event::Cast { god, slot, .. } => {
+                    if let (Some(g), Some(def)) = (game.gods.get(*god), crate::gods::ROSTER.get(game.gods.get(*god).map_or(0, |g| g.def_id as usize))) {
+                        let c = def.abilities[(*slot as usize).min(3)].color;
+                        add(g.pos + Vec3::Y * 1.2, c, 7.0, 0.45, 3.0);
+                    }
+                }
+                Event::Explosion { pos, radius, color } | Event::NovaFx { pos, radius, color } => add(*pos + Vec3::Y, *color, radius * 2.2, 0.5, 5.0),
+                Event::BoltFx { to, color, .. } => add(*to + Vec3::Y, *color, 5.0, 0.3, 3.0),
+                Event::StormFx { pos, radius, color, dur } => add(*pos + Vec3::Y * 2.0, *color, radius * 1.8, dur.min(3.0), 2.5),
+                Event::HealFx { pos, radius } => add(*pos + Vec3::Y, [0.45, 1.0, 0.55], radius * 1.5, 0.6, 2.0),
+                Event::ShieldFx { pos, dur, color } => add(*pos + Vec3::Y, *color, 4.0, dur.min(1.5), 1.5),
+                Event::BeamFx { from, dir, length, color, dur, .. } => add(*from + *dir * (length * 0.5) + Vec3::Y, *color, length * 0.6 + 2.0, dur.min(2.0), 3.0),
+                _ => {}
+            }
+        }
+        // a flurry must not grow without bound
+        if self.glows.len() > 64 {
+            self.glows.drain(0..self.glows.len() - 64);
+        }
+    }
+
+    /// Up to `max` coloured lights for the renderer, the ones that matter
+    /// most at `near` (the brightest there, not merely the closest): each
+    /// (xyz, radius) and (rgb * intensity, fading out over its life).
+    pub fn lights(&self, near: Vec3, max: usize) -> Vec<([f32; 4], [f32; 4])> {
+        let mut v: Vec<(f32, ([f32; 4], [f32; 4]))> = self
+            .glows
+            .iter()
+            .map(|g| {
+                let fade = (g.life / g.max).clamp(0.0, 1.0);
+                let i = g.power * fade * fade;
+                let d = (g.pos - near).length();
+                let weight = i / (1.0 + d * d * 0.01);
+                (weight, ([g.pos.x, g.pos.y, g.pos.z, g.radius], [g.color[0] * i, g.color[1] * i, g.color[2] * i, 0.0]))
+            })
+            .collect();
+        v.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        v.into_iter().take(max).map(|x| x.1).collect()
+    }
+
     pub fn update(&mut self, dt: f32, events: &[Event], game: &Game) {
+        self.glow_events(dt, events, game);
         self.time += dt;
         let atm = game.weather.atmosphere();
         self.ground.tick(dt, atm.rain, atm.wetness);
@@ -1316,4 +1384,43 @@ impl Vfx {
 fn rnd_jitter(seed: f32) -> f32 {
     let x = (seed * 12.9898).sin() * 43758.5453;
     (x - x.floor()) * 2.0 - 1.0
+}
+
+#[cfg(test)]
+mod glow_tests {
+    use super::*;
+
+    /// A cast lights its caster in its ability's colour; the glow fades
+    /// and goes; the lights handed on are the brightest at the camera's
+    /// target, not merely the nearest.
+    #[test]
+    fn a_cast_glows_in_its_colour_then_fades() {
+        let game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        let mut v = Vfx::default();
+        v.glow_events(0.0, &[Event::Cast { god: 0, slot: 1, aim: Vec3::ZERO }], &game);
+        assert_eq!(v.glows.len(), 1);
+        let want = crate::gods::ROSTER[game.gods[0].def_id as usize].abilities[1].color;
+        assert_eq!(v.glows[0].color, want);
+        let l = v.lights(game.gods[0].pos, 8);
+        assert_eq!(l.len(), 1);
+        assert!(l[0].1[0] > 0.0 || l[0].1[1] > 0.0 || l[0].1[2] > 0.0);
+        v.glow_events(1.0, &[], &game);
+        assert!(v.glows.is_empty(), "faded and gone");
+    }
+
+    #[test]
+    fn the_brightest_lights_win_and_there_are_never_too_many() {
+        let game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        let mut v = Vfx::default();
+        let near = Vec3::ZERO;
+        let dim_close = Event::HealFx { pos: Vec3::new(1.0, 0.0, 0.0), radius: 2.0 };
+        let bright_far = Event::Explosion { pos: Vec3::new(12.0, 0.0, 0.0), radius: 6.0, color: [1.0, 0.5, 0.2] };
+        v.glow_events(0.0, &[dim_close, bright_far], &game);
+        let l = v.lights(near, 1);
+        assert_eq!(l[0].0[0], 12.0, "the explosion outshines the heal at the target");
+        let flurry: Vec<Event> = (0..200).map(|k| Event::BoltFx { from: Vec3::ZERO, to: Vec3::X * k as f32, color: [1.0; 3], thick: 1.0 }).collect();
+        v.glow_events(0.0, &flurry, &game);
+        assert!(v.glows.len() <= 64);
+        assert_eq!(v.lights(near, 8).len(), 8);
+    }
 }
