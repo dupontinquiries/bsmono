@@ -88,6 +88,8 @@ struct AppState {
     voice_gate: crate::cues::VoiceGate,
     /// Whether this match's music has been started.
     music_on: bool,
+    /// The game-state announcer (`announcer`).
+    announcer: crate::announcer::Announcer,
     /// Watching an all-bot match (`spectator`); None when playing.
     spectator: Option<crate::spectator::Spectator>,
     /// Spectator switches pressed since last frame (Tab, Z, X).
@@ -411,6 +413,7 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         audio_events: Vec::new(),
         voice_gate: Default::default(),
         music_on: false,
+        announcer: Default::default(),
         spectator: None,
         spec_cycle: 0,
         spec_director: false,
@@ -1017,6 +1020,8 @@ fn render(s: &mut AppState) {
                 }
                 s.vfx.update(dt_frame, &[], g);
                 if it.done {
+                    s.announcer = Default::default();
+                    s.announcer.start(g.t);
                     s.intro = None;
                     s.skip_intro = false;
                     s.accumulator = 0.0;
@@ -1161,6 +1166,24 @@ fn render(s: &mut AppState) {
                 let f = cam.target - cam.eye;
                 let right = Vec3::new(f.x, 0.0, f.z).normalize_or_zero().cross(Vec3::Y).normalize_or_zero();
                 let ear = if s.spectator.is_some() { cam.target } else { g.gods[0].pos };
+                if let Some(w) = g.over {
+                    let me = if s.spectator.is_some() { None } else { Some(g.gods[0].team) };
+                    s.announcer.end(w, me, g.t);
+                }
+                for ev in s.audio_events.iter() {
+                    s.announcer.hear(ev, g);
+                }
+                if let Some(call) = s.announcer.next(g.t) {
+                    let key = format!("announcer/{}", call.key);
+                    let secs = match bank.pick(&key) {
+                        Some(id) => {
+                            amb.mixer.play(Play { clip: id, bus: Bus::Voice, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: Some(u16::MAX) });
+                            bank.secs(id, amb.sample_rate)
+                        }
+                        None => 1.2, // unrecorded: keep the pacing anyway
+                    };
+                    s.announcer.playing(g.t, secs);
+                }
                 for ev in s.audio_events.drain(..) {
                     for cue in crate::cues::cues_for(&ev, g) {
                         let Some((gain, pan)) = crate::cues::place(&cue, ear, right) else { continue };
@@ -1382,6 +1405,17 @@ fn render(s: &mut AppState) {
         s.exiting = true;
     }
     if locked_in || again {
+        // the chosen ancestor answers the lock-in (voicescript: "select")
+        #[cfg(feature = "audio")]
+        if locked_in {
+            if let (Some(amb), Some(bank)) = (s.ambience.as_mut(), s.bank.as_mut()) {
+                let def = &crate::gods::ROSTER[(s.ui.selected as usize).min(crate::gods::ROSTER.len() - 1)];
+                let who = def.name.to_ascii_lowercase().replace([' ', '\''], "");
+                if let Some(id) = bank.pick(&format!("voice/{who}/select")) {
+                    amb.mixer.play(crate::mixer::Play { clip: id, bus: crate::mixer::Bus::Voice, gain: 1.0, pan: 0.0, priority: 9, looped: false, speaker: None });
+                }
+            }
+        }
         start_game(s);
     }
     if menu {

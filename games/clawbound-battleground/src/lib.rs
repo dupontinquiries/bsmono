@@ -32,6 +32,12 @@ pub mod mixer;
 pub mod soundbank;
 /// Which sounds a game event asks for; placement; voice gating.
 pub mod cues;
+/// Every line the game voices, as data: the recording script.
+pub mod voicescript;
+/// The announcer: game-state calls, prioritized, never overlapping.
+pub mod announcer;
+/// The game's sound effects, designed in code (rendered by examples/gen_sfx).
+pub mod sfxgen;
 /// Twinfang Pass: the mountain canyon map, 15 a side.
 pub mod pass;
 /// The pass's world: where its rocks, scrub, pines and waterfalls stand.

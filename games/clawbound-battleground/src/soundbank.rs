@@ -287,6 +287,11 @@ impl Bank {
         id
     }
 
+    /// How long clip `id` plays, in seconds, at `rate`.
+    pub fn secs(&self, id: u32, rate: u32) -> f32 {
+        self.clips.get(id as usize).map_or(0.0, |c| c.frames() as f32 / rate.max(1) as f32)
+    }
+
     pub fn has(&self, key: &str) -> bool {
         self.keys.contains_key(key)
     }
