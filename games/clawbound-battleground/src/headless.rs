@@ -1644,6 +1644,12 @@ pub fn run_ultra_shots() -> Result<(), String> {
     scene.ultra = false;
     shoot(&mut renderer, &scene, &mut vfx, "ultra_3b_mane_voxel.png", close)?;
     scene.ultra = true;
+    // the other fur style, for comparison
+    let mine = renderer.fur_style;
+    let other = if mine == crate::render::FurStyle::Tape { crate::render::FurStyle::Locks } else { crate::render::FurStyle::Tape };
+    renderer.set_fur_style(other);
+    shoot(&mut renderer, &scene, &mut vfx, "ultra_3c_mane_other_style.png", close)?;
+    renderer.set_fur_style(mine);
     // what it costs: the wide frame, voxel against ultra, best of 4
     for ultra in [false, true] {
         scene.ultra = ultra;

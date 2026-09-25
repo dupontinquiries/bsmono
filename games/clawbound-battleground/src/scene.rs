@@ -222,7 +222,7 @@ impl Scene {
                     let rigged = models::build_god_rigged(def, team);
                     for (s, m) in rigged.meshes.iter().enumerate() {
                         let mut sm = crate::smoothvox::smooth(m, models::GOD_DRAW_VOXEL, 2);
-                        crate::smoothvox::fur_for_part(def, s, &mut sm);
+                        crate::smoothvox::fur_for_part(def, s, &mut sm, crate::render::FurStyle::from_env() == crate::render::FurStyle::Locks);
                         tris += sm.tris();
                         parts[team as usize][s] = r.upload_smooth(&sm);
                     }

@@ -37,6 +37,7 @@ struct Lights {
     pos: array<vec4<f32>, 8>,      // xyz, w radius
     col: array<vec4<f32>, 8>,      // rgb * intensity
     occ: array<vec4<f32>, 32>,     // xyz centre, w radius
+    fur: vec4<f32>,                // x style: 0 tape, 1 locks
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameData;
@@ -74,8 +75,10 @@ fn vs_main(in: VSIn) -> VSOut {
     // STYLIZED locks, combed: each shell steps out along the normal bent
     // back toward the tail and a little down (model space faces +z), so a
     // lock leans the way fur lies instead of bristling straight out
+    // (tape hair stands straight out; the locks are combed)
     let comb = normalize(vec3(0.0, -0.55, -1.0));
-    let dir = normalize(in.normal + comb * 0.9 * h);
+    let locks = lights.fur.x > 0.5;
+    let dir = select(in.normal, normalize(in.normal + comb * 0.9 * h), locks);
     let local = in.pos + dir * in.fur * h;
     var world = (d.model * vec4(local, 1.0)).xyz;
     world = world - vec3(0.0, in.fur * h * h * 0.6, 0.0);
@@ -148,6 +151,17 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         if (in.fur < 0.012) {
             discard;
         }
+        if (lights.fur.x < 0.5) {
+            // TAPE HAIR (the default, and the first look): each strand a
+            // whole square cell of model space, so the hairs are flat
+            // ribbons standing out from the skin -- the cutest on a voxel
+            // cat (the player's pick over the locks below)
+            let cell = floor(in.local * lights.info.w);
+            let strand = hash3(cell);
+            if (strand < in.h * 1.05 || strand < 0.18) {
+                discard;
+            }
+        } else {
         let lock = clamp(in.fur / 0.05, 1.0, 3.0);
         let q = in.local * lights.info.w / lock;
         let cell = floor(q);
@@ -160,6 +174,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         let reach = 0.65 + 0.35 * seed; // this lock's length, of the fur's
         if (length(fract(q) - centre) > r || in.h > reach) {
             discard;
+        }
         }
     }
     var N = normalize(in.normal);
@@ -186,7 +201,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // the fur darkens toward the root (self-shadowing among the strands)
     // two-tone locks: darker at the root, lighter at the tip -- the
     // stylized gradient that reads at a distance
-    let albedo = in.color.rgb * select(1.0, mix(0.84, 1.12, in.h), in.h > 0.0);
+    let albedo = in.color.rgb * select(1.0, mix(0.84, 1.12, in.h), in.h > 0.0 && lights.fur.x > 0.5);
     // the darkest features (eyes, nose) are glossy: they catch a highlight
     // and read as alive, not as holes
     let feat = 1.0 - smoothstep(0.06, 0.16, dot(albedo, vec3(0.2126, 0.7152, 0.0722)));
