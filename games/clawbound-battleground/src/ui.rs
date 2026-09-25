@@ -941,9 +941,13 @@ pub fn draw_controls(ctx: &egui::Context, cfg: &mut crate::input::Config, captur
     setup_style(ctx);
     egui::Area::new(egui::Id::new("controls")).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
         egui::Frame::default().fill(PANEL).stroke(Stroke::new(1.5_f32, GOLD)).inner_margin(16.0).show(ui, |ui| {
+            // scrolls when the screen is short (a phone in landscape): the
+            // graphics and audio settings made it taller than 720 px
+            let max_h = (ctx.screen_rect().height() - 48.0).max(200.0);
+            egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
             ui.set_width(560.0);
             ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new("CONTROLS").size(22.0).color(GOLD));
+                ui.heading(egui::RichText::new("CONTROLS & SETTINGS").size(22.0).color(GOLD));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("  ✕  ").clicked() {
                         out.close = true;
@@ -999,10 +1003,33 @@ pub fn draw_controls(ctx: &egui::Context, cfg: &mut crate::input::Config, captur
                 changed |= ui.checkbox(&mut st.touch_enabled, "on-screen touch controls").changed();
                 changed |= ui.add(egui::Slider::new(&mut st.touch_scale, 0.6..=1.8).text("size")).changed();
             });
+            // graphics and audio
+            ui.add_space(8.0);
+            ui.separator();
+            ui.label(egui::RichText::new("GRAPHICS & AUDIO").size(15.0).color(GOLD));
+            egui::ComboBox::from_label("graphics").selected_text(st.quality.label()).show_ui(ui, |ui| {
+                for q in crate::quality::Quality::ALL {
+                    changed |= ui.selectable_value(&mut st.quality, q, q.label()).changed();
+                }
+            });
+            if st.quality == crate::quality::Quality::Ultra {
+                ui.horizontal(|ui| {
+                    ui.label("fur");
+                    changed |= ui.radio_value(&mut st.fur, crate::render::FurStyle::Tape, "tape").changed();
+                    changed |= ui.radio_value(&mut st.fur, crate::render::FurStyle::Locks, "locks").changed();
+                });
+                ui.label(egui::RichText::new("Ultra is a preview: smooth, furred cats, coloured light, traced shadows, wet reflections. Applies from the next match.").size(11.0).color(Color32::from_rgb(170, 166, 156)));
+            }
+            changed |= ui.add(egui::Slider::new(&mut st.vol_master, 0.0..=1.0).text("master volume")).changed();
+            changed |= ui.add(egui::Slider::new(&mut st.vol_music, 0.0..=1.0).text("music")).changed();
+            changed |= ui.add(egui::Slider::new(&mut st.vol_sfx, 0.0..=1.0).text("effects")).changed();
+            changed |= ui.add(egui::Slider::new(&mut st.vol_voice, 0.0..=1.0).text("voices")).changed();
+            changed |= ui.checkbox(&mut st.show_fps, "show frame rate").changed();
             if changed {
                 cfg.save();
             }
             let _ = Action::Menu;
+            });
         });
     });
 }
@@ -1300,4 +1327,11 @@ pub fn draw_spectator_hud(ctx: &egui::Context, game: &Game, vp: Mat4, label: &st
     let top = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("spectator")));
     top.text(egui::pos2(r.center().x, r.top() + 18.0), Align2::CENTER_TOP, label, FontId::proportional(20.0), GOLD);
     top.text(egui::pos2(r.center().x, r.top() + 44.0), Align2::CENTER_TOP, "Tab next cat  ·  Z director  ·  X free camera (WASD, mouse, wheel)  ·  Esc leave", FontId::proportional(12.5), Color32::from_rgb(190, 186, 176));
+}
+
+/// The frame-rate readout (a setting).
+pub fn draw_fps(ctx: &egui::Context, fps: f32, ms: f32) {
+    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("fps")));
+    let r = ctx.screen_rect();
+    p.text(r.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, format!("{fps:.0} fps  {ms:.1} ms"), FontId::monospace(13.0), Color32::from_rgb(220, 230, 200));
 }

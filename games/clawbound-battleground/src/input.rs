@@ -595,12 +595,25 @@ pub struct Settings {
     pub touch_glide: crate::glide::Glide,
     /// Hold-to-aim vs tap: abilities fire on press (true) or on release (false).
     pub cast_on_press: bool,
+    /// Graphics quality (`--ultra` / CLAWBOUND_QUALITY override it).
+    pub quality: crate::quality::Quality,
+    /// The ultra preview's fur (CLAWBOUND_FUR overrides it).
+    pub fur: crate::render::FurStyle,
+    /// Volumes, 0..1: everything, then each bus.
+    pub vol_master: f32,
+    pub vol_music: f32,
+    pub vol_sfx: f32,
+    pub vol_voice: f32,
+    /// A frame-rate readout in the corner.
+    pub show_fps: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings { mouse_sens: 1.0, pad_sens: 1.0, invert_y: false, touch_enabled: false, touch_scale: 1.0, cast_on_press: true,
-                   touch_glide: crate::glide::Glide::Light }
+                   touch_glide: crate::glide::Glide::Light,
+                   quality: crate::quality::Quality::High, fur: crate::render::FurStyle::Tape,
+                   vol_master: 0.8, vol_music: 0.7, vol_sfx: 1.0, vol_voice: 1.0, show_fps: false }
     }
 }
 
@@ -621,6 +634,17 @@ impl Settings {
             crate::glide::Glide::Rigid => "rigid",
         });
         let _ = writeln!(out, "cast_on_press {}", self.cast_on_press as u8);
+        // by name, as touch_glide is
+        let _ = writeln!(out, "quality {}", self.quality.key());
+        let _ = writeln!(out, "fur {}", match self.fur {
+            crate::render::FurStyle::Tape => "tape",
+            crate::render::FurStyle::Locks => "locks",
+        });
+        let _ = writeln!(out, "vol_master {:.3}", self.vol_master);
+        let _ = writeln!(out, "vol_music {:.3}", self.vol_music);
+        let _ = writeln!(out, "vol_sfx {:.3}", self.vol_sfx);
+        let _ = writeln!(out, "vol_voice {:.3}", self.vol_voice);
+        let _ = writeln!(out, "show_fps {}", self.show_fps as u8);
     }
     pub fn load_line(&mut self, key: &str, rest: &str) -> bool {
         let f = || rest.trim().parse::<f32>().ok();
@@ -639,6 +663,13 @@ impl Settings {
             },
             "touch_scale" => self.touch_scale = f().unwrap_or(1.0).clamp(0.5, 2.0),
             "cast_on_press" => self.cast_on_press = b(),
+            "quality" => self.quality = crate::quality::Quality::from_key(rest.trim()).unwrap_or(crate::quality::Quality::High),
+            "fur" => self.fur = if rest.trim() == "locks" { crate::render::FurStyle::Locks } else { crate::render::FurStyle::Tape },
+            "vol_master" => self.vol_master = f().unwrap_or(0.8).clamp(0.0, 1.0),
+            "vol_music" => self.vol_music = f().unwrap_or(0.7).clamp(0.0, 1.0),
+            "vol_sfx" => self.vol_sfx = f().unwrap_or(1.0).clamp(0.0, 1.0),
+            "vol_voice" => self.vol_voice = f().unwrap_or(1.0).clamp(0.0, 1.0),
+            "show_fps" => self.show_fps = b(),
             _ => return false,
         }
         true
@@ -1024,5 +1055,38 @@ mod tests {
         let pad = PadState { connected: true, stick_x: 0.0, stick_y: 0.8, rstick_x: 0.5, rstick_y: 0.0, throttle: 0.9, pressed: 1 << crate::gamepad::PB_WEST, just_pressed: 1 << crate::gamepad::PB_WEST, start_pressed: false };
         let c = resolve(&st, &cfg, &pad, None, true);
         assert!(c.mv.y > 0.7 && c.attack && c.cast[0] && c.look.x < 0.0);
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    /// Everything new in the settings survives a save and a load, by name;
+    /// an unknown quality from a newer build loads as High, not an error.
+    #[test]
+    fn graphics_and_audio_settings_round_trip() {
+        let mut a = Settings::default();
+        a.quality = crate::quality::Quality::Ultra;
+        a.fur = crate::render::FurStyle::Locks;
+        a.vol_master = 0.4;
+        a.vol_music = 0.2;
+        a.vol_sfx = 0.9;
+        a.vol_voice = 0.6;
+        a.show_fps = true;
+        let mut text = String::new();
+        a.save_lines(&mut text);
+        let mut b = Settings::default();
+        for line in text.lines() {
+            let (k, rest) = line.split_once(' ').unwrap();
+            assert!(b.load_line(k, rest), "unknown key {k}");
+        }
+        assert_eq!((b.quality, b.fur, b.show_fps), (a.quality, a.fur, a.show_fps));
+        assert!((b.vol_master - 0.4).abs() < 1e-3 && (b.vol_music - 0.2).abs() < 1e-3 && (b.vol_voice - 0.6).abs() < 1e-3);
+        let mut c = Settings::default();
+        c.load_line("quality", "hyper");
+        assert_eq!(c.quality, crate::quality::Quality::High);
+        c.load_line("vol_sfx", "7");
+        assert_eq!(c.vol_sfx, 1.0, "clamped");
     }
 }

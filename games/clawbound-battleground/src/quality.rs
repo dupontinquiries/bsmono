@@ -35,8 +35,37 @@ pub enum Quality {
     Ultra,
 }
 
+/// The player's chosen quality (an index into `Quality::ALL`; High).
+static CHOSEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
 impl Quality {
     pub const ALL: [Quality; 4] = [Quality::Ultra, Quality::High, Quality::Medium, Quality::Low];
+
+    /// Its name in the config file.
+    pub fn key(self) -> &'static str {
+        match self {
+            Quality::Ultra => "ultra",
+            Quality::High => "high",
+            Quality::Medium => "medium",
+            Quality::Low => "low",
+        }
+    }
+
+    pub fn from_key(k: &str) -> Option<Quality> {
+        Quality::ALL.into_iter().find(|q| q.key() == k)
+    }
+
+    /// The quality in effect: `--ultra` or CLAWBOUND_QUALITY if given, else
+    /// the player's setting (`set_chosen`).
+    pub fn effective() -> Quality {
+        Quality::requested().unwrap_or_else(|| Quality::ALL[CHOSEN.load(std::sync::atomic::Ordering::Relaxed) as usize % Quality::ALL.len()])
+    }
+
+    /// The player's setting, from the config (the app sets it).
+    pub fn set_chosen(q: Quality) {
+        let i = Quality::ALL.iter().position(|x| *x == q).unwrap_or(1) as u8;
+        CHOSEN.store(i, std::sync::atomic::Ordering::Relaxed);
+    }
 
     /// The ultra preview's smooth, furred characters.
     pub fn smooth_characters(self) -> bool {
