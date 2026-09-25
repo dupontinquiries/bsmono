@@ -95,3 +95,31 @@ mod tests {
         assert!(clean_text("thank you very much for the question about entropy").is_some());
     }
 }
+
+/// The language to give whisper: the caller's, else "auto" for a multilingual
+/// model and "en" for an English-only one (`*.en` models). Detection on an
+/// English-only model is meaningless -- its language probabilities are flat:
+/// on a Smite video (Fedora Asahi, ggml-base.en-q5_1) every chunk logged
+/// "auto-detected language: nl (p = 0.010000)", 1/99, i.e. chance -- and it is
+/// still work done per chunk.
+pub fn effective_language(requested: Option<&str>, multilingual: bool) -> &str {
+    match requested {
+        Some(l) if !l.is_empty() => l,
+        _ if multilingual => "auto",
+        _ => "en",
+    }
+}
+
+#[cfg(test)]
+mod language_tests {
+    use super::*;
+
+    #[test]
+    fn an_english_only_model_is_not_asked_to_detect_a_language() {
+        assert_eq!(effective_language(None, false), "en");
+        assert_eq!(effective_language(None, true), "auto");
+        assert_eq!(effective_language(Some(""), false), "en");
+        assert_eq!(effective_language(Some("de"), true), "de");
+        assert_eq!(effective_language(Some("de"), false), "de", "an explicit choice wins");
+    }
+}

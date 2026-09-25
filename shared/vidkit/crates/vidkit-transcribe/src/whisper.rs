@@ -40,7 +40,9 @@ pub struct WhisperSource {
     model: PathBuf,
     threads: i32,
     language: Option<String>,
+    multilingual: bool,
 }
+
 
 impl WhisperSource {
     /// Load `model`. `threads`: whisper scales well to the big cores and
@@ -49,7 +51,8 @@ impl WhisperSource {
         let ctx = WhisperContext::new_with_params(model, WhisperContextParameters::default())
             .map_err(|e| format!("{}: {e:?}", model.display()))?;
         let state = ctx.create_state().map_err(|e| format!("whisper state: {e:?}"))?;
-        Ok(Self { _ctx: ctx, state, model: model.to_path_buf(), threads: threads.max(1), language })
+        let multilingual = ctx.is_multilingual();
+        Ok(Self { _ctx: ctx, state, model: model.to_path_buf(), threads: threads.max(1), language, multilingual })
     }
 
     /// Find a model in the shared store (`~/models/whisper`, or the legacy
@@ -82,7 +85,7 @@ impl CueSource for WhisperSource {
         // voice-kit's filter exists for, fed by the previous chunk.
         p.set_no_context(true);
         p.set_suppress_blank(true);
-        p.set_language(self.language.as_deref().or(Some("auto")));
+        p.set_language(Some(crate::effective_language(self.language.as_deref(), self.multilingual)));
         self.state.full(p, pcm).map_err(|e| format!("whisper: {e:?}"))?;
         let n = self.state.full_n_segments();
         let mut out = Vec::new();
@@ -123,5 +126,4 @@ mod tests {
     fn inverted_or_negative_stamps_are_clamped() {
         let c = segment_cue(Duration::from_secs(1), -5, -10, "x y z", 0.0).unwrap();
         assert_eq!((c.start, c.end), (Duration::from_secs(1), Duration::from_secs(1)));
-    }
-}
+    }}
