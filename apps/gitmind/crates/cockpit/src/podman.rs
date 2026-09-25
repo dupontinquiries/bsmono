@@ -57,9 +57,33 @@ pub fn image_for(triple: &str) -> Option<&'static str> {
         // exact tag with them). A local `podman build` from that file, tagged
         // over this same name, upgrades every build transparently; nothing
         // here needs to know which one is actually present.
-        "aarch64-unknown-linux-musl" => Some("messense/rust-musl-cross:aarch64-musl"),
+        //
+        // FULLY QUALIFIED: podman on Fedora (and anything with
+        // short-name-mode = "enforcing") refuses an unqualified name when it
+        // cannot prompt for a registry -- "short-name resolution enforced but
+        // cannot prompt without a TTY" -- which is always, run from the GUI.
+        "aarch64-unknown-linux-musl" => Some("docker.io/messense/rust-musl-cross:aarch64-musl"),
         _ => None,
     }
+}
+
+/// Where podman keeps a LOCAL build tagged with the upstream image's short name:
+/// `podman build -t messense/rust-musl-cross:aarch64-musl` stores it as
+/// `localhost/messense/...`. A qualified docker.io name would never find it,
+/// so the upgrade `image_for`'s doc promises needs this.
+pub fn local_override(image: &str) -> String {
+    let short = image.strip_prefix("docker.io/").unwrap_or(image);
+    format!("localhost/{short}")
+}
+
+/// The image to run: the local build when there is one (it adds what the bare
+/// upstream image lacks), else the upstream image.
+pub fn choose_image(image: &str, local_exists: bool) -> String {
+    if local_exists { local_override(image) } else { image.to_string() }
+}
+
+fn local_image_exists(name: &str) -> bool {
+    Command::new("podman").args(["image", "exists", name]).status().map(|s| s.success()).unwrap_or(false)
 }
 
 /// Does a `podman machine list --format json` reply show a running machine?
@@ -146,7 +170,9 @@ pub fn build_in_container_cancellable(
     app: &str, app_dir: &Path, triple: &str, features: &[String], no_default: bool,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<(PathBuf, u64), String> {
-    let image = image_for(triple).ok_or_else(|| format!("no podman image known for {triple}"))?;
+    let upstream = image_for(triple).ok_or_else(|| format!("no podman image known for {triple}"))?;
+    let chosen = choose_image(upstream, local_image_exists(&local_override(upstream)));
+    let image = chosen.as_str();
     on_line(&format!("• waiting for podman to be ready…"));
     wait_until_ready(Duration::from_secs(30))?;
     let argv = build_argv(app, app_dir, triple, features, no_default, image);
@@ -181,7 +207,7 @@ mod tests {
 
     #[test]
     fn image_for_only_names_the_target_this_fleet_actually_has_an_image_for() {
-        assert_eq!(image_for("aarch64-unknown-linux-musl"), Some("messense/rust-musl-cross:aarch64-musl"));
+        assert_eq!(image_for("aarch64-unknown-linux-musl"), Some("docker.io/messense/rust-musl-cross:aarch64-musl"));
         assert_eq!(image_for("aarch64-unknown-linux-gnu"), None, "has a real cross-linker (buildflags::cross_linker) -- no image needed");
         assert_eq!(image_for("x86_64-unknown-linux-gnu"), None);
     }
@@ -231,15 +257,15 @@ mod tests {
         let dir = Path::new("/repo/apps/tideshell/egui-frontend");
         let argv = build_argv("tideshell", dir, "aarch64-unknown-linux-musl",
                                &["wayland".to_string(), "layer".to_string()], true,
-                               "messense/rust-musl-cross:aarch64-musl");
+                               "docker.io/messense/rust-musl-cross:aarch64-musl");
         assert_eq!(argv[0], "run");
         assert!(argv.contains(&"--rm".to_string()));
         assert!(argv.iter().any(|a| a == "-v"));
         let mount = argv.iter().find(|a| a.contains(":/home/rust/src:z")).expect("a mount arg");
         assert!(mount.starts_with("/repo/apps/tideshell/egui-frontend:"));
-        assert!(argv.contains(&"messense/rust-musl-cross:aarch64-musl".to_string()));
+        assert!(argv.contains(&"docker.io/messense/rust-musl-cross:aarch64-musl".to_string()));
         // The same argv cargo_build_argv would produce, appended after the image.
-        let image_pos = argv.iter().position(|a| a == "messense/rust-musl-cross:aarch64-musl").unwrap();
+        let image_pos = argv.iter().position(|a| a == "docker.io/messense/rust-musl-cross:aarch64-musl").unwrap();
         let cargo_part = &argv[image_pos + 1..];
         assert_eq!(cargo_part, &crate::buildflags::cargo_build_argv("tideshell", "aarch64-unknown-linux-musl",
                                                                      &["wayland".to_string(), "layer".to_string()], true));
@@ -259,5 +285,15 @@ mod tests {
         let r = wait_until_ready(Duration::from_secs(5));
         assert!(r.is_ok(), "{r:?}");
         assert!(start.elapsed() < Duration::from_secs(1), "must return immediately, not wait out the timeout");
+    }
+
+    #[test]
+    fn image_names_are_fully_qualified_and_a_local_build_is_preferred() {
+        let up = image_for("aarch64-unknown-linux-musl").unwrap();
+        // Enforcing short-name mode (Fedora) rejects a bare "name:tag" without a TTY.
+        assert!(up.starts_with("docker.io/"), "{up}");
+        assert_eq!(local_override(up), "localhost/messense/rust-musl-cross:aarch64-musl");
+        assert_eq!(choose_image(up, false), up);
+        assert_eq!(choose_image(up, true), "localhost/messense/rust-musl-cross:aarch64-musl");
     }
 }

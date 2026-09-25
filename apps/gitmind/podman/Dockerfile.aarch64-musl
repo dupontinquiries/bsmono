@@ -1,5 +1,12 @@
 # gitmind's aarch64-unknown-linux-musl build image.
 #
+# Build it once so gitmind uses it (cockpit::podman::choose_image prefers
+# this local tag over the bare upstream image):
+#   podman build -t localhost/messense/rust-musl-cross:aarch64-musl -f Dockerfile.aarch64-musl .
+# (the explicit localhost/ is what podman stores a local tag as). Names
+# are fully qualified here: Fedora's podman enforces short names and cannot
+# prompt for a registry without a terminal.
+#
 # Built ON: this fleet's musl phone target has no cross-linker in Debian's
 # archive (see cockpit::buildflags::cross_linker's doc) -- podman + this image
 # is the fallback cockpit::podman uses automatically when a local/cross build
@@ -17,7 +24,7 @@
 # coded on in voiceterm's own Cargo.toml -- see its rfcomm feature). Extend
 # this list here, in one place, rather than live-patching a running
 # container by hand.
-FROM messense/rust-musl-cross:aarch64-musl
+FROM docker.io/messense/rust-musl-cross:aarch64-musl
 
 RUN apk add --no-cache pkgconf dbus-dev dbus-static
 
