@@ -83,6 +83,13 @@ pub fn tool_path_env() -> String {
     format!("{home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin{}", if cur.is_empty() { String::new() } else { format!(":{cur}") })
 }
 
+/// Build in the app's own container BEFORE trying locally: it ships one for
+/// this target, the target is not this host's own (a native build needs no
+/// container), and podman is there to run it.
+pub fn container_first(app_ships_container: bool, target: &str, host_triple: &str, podman_available: bool) -> bool {
+    app_ships_container && podman_available && !target.is_empty() && target != host_triple
+}
+
 /// This device's native target triple, normalized to the gitmind vocabulary (e.g.
 /// Alpine's `aarch64-alpine-linux-musl` → `aarch64-unknown-linux-musl`). From rustc;
 /// falls back to an Alpine check only if rustc isn't reachable.
@@ -291,6 +298,23 @@ pub fn build_with_fallback_logged(
     no_default: bool,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<(PathBuf, u64), String> {
+    // An app that ships its OWN container for a cross target has said how it
+    // must be built: go there first, rather than through a local build that
+    // fails first (tideshell: at wayland-sys, every push). Local is still
+    // tried if the container fails, and both errors are reported.
+    let has_own = crate::podman::app_containerfile(app_dir, target).is_some();
+    let podman = crate::podman::which_podman(&tool_path_env());
+    if container_first(has_own, target, &native_triple_local(), podman) {
+        on_line(&format!("• {app} ships its own build container for {target} -- using it first"));
+        return match crate::podman::build_in_container_cancellable(app, app_dir, target, feats, no_default, on_line) {
+            Ok(r) => Ok(r),
+            Err(podman_err) => {
+                on_line(&format!("• its container failed ({podman_err}); trying a local build"));
+                build_locally_logged(app, app_dir, target, feats, no_default, on_line)
+                    .map_err(|local_err| format!("podman: {podman_err}\nlocal: {local_err}"))
+            }
+        };
+    }
     match build_locally_logged(app, app_dir, target, feats, no_default, on_line) {
         Ok(r) => Ok(r),
         Err(local_err) => {
@@ -971,3 +995,19 @@ mod rustup_pin_tests {
         assert_eq!(parse_active_toolchain("error: no default toolchain configured\n"), None);
     }
 }
+
+#[cfg(test)]
+mod container_first_tests {
+    use super::container_first;
+
+    #[test]
+    fn an_app_with_its_own_container_is_built_there_first_only_when_cross() {
+        let (musl, asahi) = ("aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu");
+        assert!(container_first(true, musl, asahi, true), "tideshell for the phone from Asahi");
+        assert!(!container_first(false, musl, asahi, true), "no container of its own: local first, as before");
+        assert!(!container_first(true, musl, asahi, false), "no podman: local");
+        assert!(!container_first(true, musl, musl, true), "already on the target (the phone itself): native");
+        assert!(!container_first(true, "", asahi, true), "a native build names no target");
+    }
+}
+
