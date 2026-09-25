@@ -103,6 +103,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("abilityfx") {
         return run_abilityfx_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("quality") {
+        return run_quality_shots();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("spectate") {
         return run_spectate();
     }
@@ -1979,5 +1982,52 @@ pub fn run_abilityfx_shots() -> Result<(), String> {
     run(&mut renderer, "Goldenmane", |a| matches!(a, crate::gods::Archetype::Dash { .. }), 12, "abilityfx_dash.png", side)?;
     run(&mut renderer, "Oldroar", |a| matches!(a, crate::gods::Archetype::Nova { .. }), 42, "abilityfx_nova.png", side)?;
     run(&mut renderer, "Suneye", |a| matches!(a, crate::gods::Archetype::Bolt { .. }), 22, "abilityfx_bolt.png", side)?;
+    Ok(())
+}
+
+/// One scene at each quality: the shadow map rebuilt as the quality
+/// changes (in one run -- the rebuild is what could go wrong), bloom and
+/// particles scaled. `CLAWBOUND_SHOTS=quality clawbound-battleground --screenshot`
+pub fn run_quality_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("quality"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let mut game = Game::new_teams(&[0, 1], &[2, 3]);
+    game.blockers = scene.blockers.clone();
+    let spot = Vec3::new(0.0, 0.0, -40.0);
+    for (k, g) in game.gods.iter_mut().enumerate() {
+        g.ai = None;
+        g.pos = spot + Vec3::new(k as f32 * 2.2 - 3.3, 0.0, 0.0);
+        g.yaw = -1.1;
+    }
+    let mut vfx = Vfx::default();
+    for _ in 0..20 {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+        vfx.update(1.0 / 60.0, &[], &game);
+    }
+    vfx.update(0.0, &[crate::sim::Event::NovaFx { pos: spot + Vec3::Z * 3.0, radius: 5.0, color: [1.0, 0.6, 0.2] }], &game);
+    let cam = Camera { eye: spot + Vec3::new(0.5, 3.0, -7.5), target: spot + Vec3::Y * 0.8, fov_y: 0.9 };
+    for q in [crate::quality::Quality::High, crate::quality::Quality::Medium, crate::quality::Quality::Low, crate::quality::Quality::High] {
+        renderer.quality = q;
+        renderer.set_shadow_size(q.shadow_size());
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, 1.0);
+        let name = format!("quality_{}.png", q.key());
+        save_shot(&renderer.device, &renderer.queue, &target, &name)?;
+        println!("saved {name}: shadow map {} px", renderer.shadow_size);
+    }
     Ok(())
 }

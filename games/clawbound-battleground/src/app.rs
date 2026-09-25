@@ -1198,6 +1198,9 @@ fn render(s: &mut AppState) {
         crate::quality::Quality::set_chosen(st.quality);
         crate::render::FurStyle::set_chosen(st.fur);
         s.renderer.quality = crate::quality::Quality::effective();
+        // the shadow map follows the quality (rebuilt only when it changes)
+        let size = s.renderer.quality.shadow_size();
+        s.renderer.set_shadow_size(size);
         let vols = [st.vol_master, st.vol_music, st.vol_sfx, st.vol_voice];
         #[cfg(feature = "audio")]
         if vols != s.vol_sent {
