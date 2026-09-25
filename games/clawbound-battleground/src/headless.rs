@@ -97,6 +97,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("surface") {
         return run_surface_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("settings") {
+        return run_settings_shot();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("spectate") {
         return run_spectate();
     }
@@ -1853,5 +1856,51 @@ pub fn run_surface_shots() -> Result<(), String> {
         save_shot(&renderer.device, &renderer.queue, &target, name)?;
         println!("saved {name}");
     }
+    Ok(())
+}
+
+/// The controls and settings panel, Ultra selected (so the fur choice and
+/// its note show). `CLAWBOUND_SHOTS=settings clawbound-battleground --screenshot`
+pub fn run_settings_shot() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut egui_renderer = egui_wgpu::Renderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, None, 1);
+    let renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("settings"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let ctx = egui::Context::default();
+    let mut cfg = crate::input::Config::default();
+    cfg.settings.quality = crate::quality::Quality::Ultra;
+    cfg.settings.show_fps = true;
+    clear(&renderer.device, &renderer.queue, &view);
+    let mut textures = egui::TexturesDelta::default();
+    let mut out = None;
+    for k in 0..3 {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W as f32, H as f32))),
+            time: Some(k as f64 * 0.016),
+            ..Default::default()
+        };
+        let mut panel = ui::ControlsPanel { close: false, capture: None, clear: None, scheme: None, reset: false };
+        let o = ctx.run(raw, |c| {
+            ui::draw_fps(c, 60.0, 16.7);
+            ui::draw_controls(c, &mut cfg, None, false, &mut panel);
+        });
+        textures.append(o.textures_delta.clone());
+        out = Some(o);
+    }
+    let mut out = out.expect("ran");
+    out.textures_delta = textures;
+    draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
+    save_shot(&renderer.device, &renderer.queue, &target, "settings_panel.png")?;
+    println!("saved settings_panel.png");
     Ok(())
 }

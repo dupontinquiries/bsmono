@@ -92,6 +92,10 @@ struct AppState {
     announcer: crate::announcer::Announcer,
     /// Frames since the listener's space was last sent to the mixer.
     space_tick: u32,
+    /// The volumes last sent to the mixer (master, music, sfx, voice).
+    vol_sent: [f32; 4],
+    /// Smoothed frame time, seconds (the frame-rate readout).
+    frame_s: f32,
     /// Intros played this session: the first is the full, narrated one.
     intros_played: u32,
     /// A scored intro track is playing (it replaces the synthesized fanfare).
@@ -421,6 +425,8 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         music_on: false,
         announcer: Default::default(),
         space_tick: 0,
+        vol_sent: [-1.0; 4],
+        frame_s: 1.0 / 60.0,
         intros_played: 0,
         intro_music: false,
         spectator: None,
@@ -821,12 +827,31 @@ fn start_spectate(s: &mut AppState) {
     s.screen = Screen::Playing;
 }
 
+/// The scene fits the graphics setting: Ultra needs smooth parts built (and
+/// built for the chosen fur -- the face's fur differs); switching Ultra off
+/// only turns it off.
+fn fit_scene_to_quality(s: &mut AppState) {
+    let want = crate::quality::Quality::effective().smooth_characters();
+    let fur = crate::render::FurStyle::from_env();
+    s.renderer.set_fur_style(fur);
+    let rebuild = s.scene.as_ref().is_some_and(|sc| want && (sc.god_smooth.is_empty() || sc.fur_built != fur));
+    if rebuild {
+        let old = s.scene.take().expect("scene");
+        s.renderer.free_meshes_from(old.first_mesh);
+        s.scene = Some(Scene::new(&mut s.renderer));
+    }
+    if let Some(sc) = s.scene.as_mut() {
+        sc.ultra = want && !sc.god_smooth.is_empty();
+    }
+}
+
 fn start_game(s: &mut AppState) {
     // The map the select screen chose -- except with a LAN lobby open,
     // where both peers must be on the same map and the picker is not synced
     // between them: that match stays on the launch map.
     let want = if s.lan.is_some() { s.launch.map } else { s.ui.map_choice };
     switch_map(s, want);
+    fit_scene_to_quality(s);
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1166,6 +1191,29 @@ fn render(s: &mut AppState) {
     };
     let vp = cam.view_proj(s.renderer.width as f32 / s.renderer.height as f32);
 
+    // the player's settings, applied: quality and fur (a command-line or
+    // environment override still wins), volumes when they change
+    {
+        let st = &s.cfg.settings;
+        crate::quality::Quality::set_chosen(st.quality);
+        crate::render::FurStyle::set_chosen(st.fur);
+        s.renderer.quality = crate::quality::Quality::effective();
+        let vols = [st.vol_master, st.vol_music, st.vol_sfx, st.vol_voice];
+        #[cfg(feature = "audio")]
+        if vols != s.vol_sent {
+            if let Some(amb) = s.ambience.as_mut() {
+                use crate::mixer::{Bus, Cmd};
+                // the mixer's own balance, times the player's volumes
+                amb.mixer.send(Cmd::BusGain(Bus::Music, 0.55 * vols[1] * vols[0]));
+                amb.mixer.send(Cmd::BusGain(Bus::Sfx, 0.9 * vols[2] * vols[0]));
+                amb.mixer.send(Cmd::BusGain(Bus::Voice, 1.0 * vols[3] * vols[0]));
+                s.vol_sent = vols;
+            }
+        }
+        let _ = vols;
+        s.frame_s += (dt_frame.clamp(0.0, 0.5) - s.frame_s) * 0.08;
+    }
+
     // ambience: the listener is the player; the wind pans with the camera
     // Out of a match -- the menu, the select screen, after a match -- the
     // ambience fades to silence (`audio::fade_out`) instead of holding the
@@ -1180,7 +1228,10 @@ fn render(s: &mut AppState) {
             }
             _ => crate::audio::fade_out(s.audio_last, dt_frame),
         };
+        // the master volume scales the synthesized ambience too
+        let mut p = p;
         s.audio_last = p;
+        p.master *= s.cfg.settings.vol_master;
         amb.set(p);
     }
 
@@ -1314,7 +1365,11 @@ fn render(s: &mut AppState) {
     let mut menu = false;
     let mut open_controls = false;
     let mut panel = ui::ControlsPanel { close: false, capture: None, clear: None, scheme: None, reset: false };
+    let (show_fps, frame_s) = (s.cfg.settings.show_fps, s.frame_s);
     let output = s.egui_ctx.run(raw_input, |ctx| {
+        if show_fps {
+            ui::draw_fps(ctx, 1.0 / frame_s.max(1e-4), frame_s * 1000.0);
+        }
         match s.screen {
             Screen::Menu => {
                 ui::draw_menu(ctx, &mut play, &mut quit, &mut open_lan, &mut spectate);

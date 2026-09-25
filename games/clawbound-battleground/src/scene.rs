@@ -43,6 +43,9 @@ pub struct Scene {
     /// traced shadows (`quality::Quality::Ultra`). A plain flag, so a
     /// harness can compare the two on one frame.
     pub ultra: bool,
+    /// The fur style the smooth parts were built for (the face's fur
+    /// depends on it): a different one needs a rebuild.
+    pub fur_built: crate::render::FurStyle,
     /// One rig per ancestor (teams share anatomy).
     pub god_rig: Vec<QuadRig>,
     /// The uncut body. Still what the portrait renderer draws.
@@ -211,7 +214,7 @@ impl Scene {
         }
         assert_eq!((god_parts.len(), god_rig.len()), (ROSTER_LEN, ROSTER_LEN), "one cut body and one rig per ancestor");
         // the ultra preview: every part smoothed and furred, once
-        let ultra = crate::quality::Quality::requested().is_some_and(|q| q.smooth_characters());
+        let ultra = crate::quality::Quality::effective().smooth_characters();
         let mut god_smooth = Vec::new();
         if ultra {
             let t = std::time::Instant::now();
@@ -342,6 +345,7 @@ impl Scene {
             god_parts,
             god_smooth,
             ultra,
+            fur_built: crate::render::FurStyle::from_env(),
             god_rig,
             god_body,
             god_weapon,

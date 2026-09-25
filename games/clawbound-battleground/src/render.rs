@@ -114,12 +114,27 @@ pub enum FurStyle {
     Locks,
 }
 
+/// The player's chosen fur (0 tape, 1 locks).
+static FUR_CHOSEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 impl FurStyle {
+    /// CLAWBOUND_FUR if given, else the player's setting (`set_chosen`).
     pub fn from_env() -> FurStyle {
         match std::env::var("CLAWBOUND_FUR").ok().as_deref() {
             Some("locks") => FurStyle::Locks,
-            _ => FurStyle::Tape,
+            Some("tape") => FurStyle::Tape,
+            _ => {
+                if FUR_CHOSEN.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+                    FurStyle::Locks
+                } else {
+                    FurStyle::Tape
+                }
+            }
         }
+    }
+
+    pub fn set_chosen(f: FurStyle) {
+        FUR_CHOSEN.store((f == FurStyle::Locks) as u8, std::sync::atomic::Ordering::Relaxed);
     }
     /// (shells, cells per unit)
     pub fn shells_density(self) -> (u32, f32) {
@@ -279,6 +294,10 @@ pub struct Renderer {
     pub lights: Vec<([f32; 4], [f32; 4])>,
     /// Spheres the coloured lights' shadows are traced against (the cats).
     pub occluders: Vec<[f32; 4]>,
+    /// The graphics quality in effect (the app sets it each frame): scales
+    /// bloom and god rays; Ultra's own effects are `ultra_post` and the
+    /// scene's smooth characters.
+    pub quality: crate::quality::Quality,
     /// The ultra post effects: wet ground as a mirror, sky-occluded god rays.
     pub ultra_post: bool,
     /// The fur's look (shells and density follow it: `set_fur_style`).
@@ -855,6 +874,7 @@ impl Renderer {
             shadow_only: Vec::new(),
             lights: Vec::new(),
             occluders: Vec::new(),
+            quality: crate::quality::Quality::High,
             ultra_post: false,
             fur_style: FurStyle::from_env(),
             fur_shells: FurStyle::from_env().shells_density().0,
@@ -1201,14 +1221,15 @@ impl Renderer {
                     0.55 + atm.night * 0.2,
                     time,
                     atm.lightning,
-                    0.55 + atm.night * 0.3,
+                    // bloom, by the quality setting (Low: none)
+                    (0.55 + atm.night * 0.3) * self.quality.bloom_scale(),
                     atm.night,
                     atm.rain,
                     // heat shimmer: fire near the camera (the wildfire's glow)
                     self.event.2.clamp(0.0, 1.0),
                     sun_uv[0],
                     sun_uv[1],
-                    ray,
+                    ray * self.quality.ray_scale(),
                     0.22,
                     // d: wetness, the ultra reflections and god rays
                     atm.wetness,
