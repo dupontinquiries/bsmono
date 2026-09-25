@@ -68,6 +68,14 @@ the single highest-value thing anyone can do with this repo next.
   menu at all yet); (4) cost on a real GPU -- +12% frame on lavapipe with 4
   cats close up; fur shells are fill-heavy, 30 cats is unmeasured; (5) the
   lights are ability effects only: gems, towers and the sun-disc don't emit.
+  Since: stylized fur (locks, not hairs) and faces with eyes; channels and
+  lightning give light; the TERRAIN receives it with traced shadows
+  (lightning throws the cats' shadows across the ground); wet ground is a
+  screen-space mirror; god rays are sky-occluded. Still to do there: voxel
+  props do not receive the point lights; shadows are sphere proxies; weather
+  lightning does not strike anywhere; SSR has the usual screen-space limits
+  (nothing off-screen reflects). Ability visuals beyond channels and storms
+  are unchanged -- each archetype's cast/impact wants its own upgrade pass.
 
 - **Twinfang Pass (15v15 mountain map, c20unified-015).** `--map pass`.
   * **The map is chosen at launch only**: the terrain mesh is built in

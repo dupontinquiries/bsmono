@@ -7,6 +7,7 @@ struct PostParams {
     a: vec4<f32>, // exposure, vignette, time, lightning
     b: vec4<f32>, // bloom strength, night, rain, heat
     c: vec4<f32>, // sun screen x, sun screen y (uv), ray strength, contrast
+    d: vec4<f32>, // x wetness, y ultra reflections (0/1), z ultra god rays (0/1)
     vp: mat4x4<f32>,
     inv_vp: mat4x4<f32>,
     cam: vec4<f32>,                 // xyz: the camera
@@ -36,6 +37,78 @@ fn shell_path(ro: vec3<f32>, rd: vec3<f32>, c: vec3<f32>, radius: f32, th: f32, 
     let outer = sphere_span(ro, rd, c, radius + th * 0.5, t_scene);
     let inner = sphere_span(ro, rd, c, max(radius - th * 0.5, 0.0), t_scene);
     return max(outer - inner, 0.0);
+}
+
+// The world point behind a pixel, from the depth buffer.
+fn world_at(uv: vec2<f32>, dims: vec2<f32>) -> vec4<f32> {
+    let px = vec2<i32>(clamp(uv * dims, vec2(0.0), dims - vec2(1.0)));
+    let d = textureLoad(scene_depth, px, 0);
+    let w = pp.inv_vp * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
+    return vec4(w.xyz / w.w, d);
+}
+
+fn vnoise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash21(i), hash21(i + vec2(1.0, 0.0)), u.x), mix(hash21(i + vec2(0.0, 1.0)), hash21(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+
+// Wet ground as a mirror (ultra): screen-space reflection of a level wet
+// surface. The pixel's world point and normal come from the depth buffer;
+// the reflected ray is marched through it and what it meets is mirrored,
+// by Fresnel (glancing views reflect most), in puddle-like patches that
+// grow with the wetness. Returns the reflected colour and its weight.
+fn wet_reflection(uv: vec2<f32>, dims: vec2<f32>) -> vec4<f32> {
+    let wet = pp.d.x;
+    let here = world_at(uv, dims);
+    if (here.w >= 0.99999) {
+        return vec4(0.0);
+    }
+    let P = here.xyz;
+    let a = world_at(uv + vec2(1.0 / dims.x, 0.0), dims).xyz;
+    let b = world_at(uv + vec2(0.0, 1.0 / dims.y), dims).xyz;
+    var N = normalize(cross(b - P, a - P));
+    if (N.y < 0.0) {
+        N = -N;
+    }
+    if (N.y < 0.85) {
+        return vec4(0.0); // only level ground holds water
+    }
+    let V = normalize(P - pp.cam.xyz);
+    let R = reflect(V, N);
+    let dist0 = length(P - pp.cam.xyz);
+    var t = 0.25;
+    var hit = vec3(0.0);
+    var found = 0.0;
+    for (var i = 0; i < 24; i = i + 1) {
+        let q = P + R * t;
+        let c = pp.vp * vec4(q, 1.0);
+        if (c.w <= 0.05) {
+            break;
+        }
+        let quv = vec2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+        if (any(quv < vec2(0.0)) || any(quv > vec2(1.0))) {
+            break;
+        }
+        let s = world_at(quv, dims);
+        let dq = length(q - pp.cam.xyz);
+        let ds = select(length(s.xyz - pp.cam.xyz), 1.0e6, s.w >= 0.99999);
+        if (dq > ds && dq - ds < 0.6 + t * 0.15) {
+            // explicit level: this runs after a data-dependent break
+            // (non-uniform), where implicit-derivative sampling is not safe
+            hit = textureSampleLevel(hdr, samp, quv, 0.0).rgb;
+            // fade near the screen's edge, where the march runs out
+            let e = min(min(quv.x, 1.0 - quv.x), min(quv.y, 1.0 - quv.y));
+            found = smoothstep(0.0, 0.08, e);
+            break;
+        }
+        t = t * 1.22 + 0.12;
+    }
+    let fres = 0.02 + 0.98 * pow(1.0 - max(dot(-V, N), 0.0), 5.0);
+    let puddle = smoothstep(0.45 - wet * 0.35, 0.7 - wet * 0.3, vnoise(P.xz * 0.35) * 0.7 + vnoise(P.xz * 1.3) * 0.3);
+    let far_fade = 1.0 - smoothstep(40.0, 90.0, dist0);
+    return vec4(hit, found * fres * puddle * wet * far_fade * 0.95);
 }
 
 // The world-space direction of the view ray through `uv`.
@@ -150,6 +223,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     }
     let uv0 = clamp(in.uv + bend, vec2(0.001), vec2(0.999));
     var col = textureSample(hdr, samp, uv0).rgb;
+    if (pp.d.y > 0.5 && pp.d.x > 0.02) {
+        let r = wet_reflection(uv0, dims);
+        col = mix(col, r.rgb, r.a);
+    }
 
     // --- single-pass bloom: a 12-tap ring at two radii, weighted to a soft disc.
     // Cheap enough for a phone GPU; the MSAA resolve already softened the source.
@@ -186,10 +263,22 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         var wgt = 1.0;
         let dither = hash21(in.uv * 640.0 + fract(pp.a.z) * 37.0) * 0.8;
         uvr = uvr + step * dither;
+        let god = pp.d.z > 0.5;
         for (var i: i32 = 0; i < 22; i = i + 1) {
             uvr = uvr + step;
-            let s = textureSample(hdr, samp, clamp(uvr, vec2(0.0), vec2(1.0))).rgb;
-            acc = acc + bright(s) * wgt;
+            let cuv = clamp(uvr, vec2(0.0), vec2(1.0));
+            let s = textureSample(hdr, samp, cuv).rgb;
+            if (god) {
+                // Ultra: only open SKY lets sunlight through (depth at the
+                // far plane); leaves, trunks and peaks block it -- rays
+                // stream through the gaps. The bright-pixel version sprayed
+                // rays off anything white: a cat, a bolt, a gem.
+                let px = vec2<i32>(clamp(cuv * dims, vec2(0.0), dims - vec2(1.0)));
+                let open = select(0.0, 1.0, textureLoad(scene_depth, px, 0) >= 0.99999);
+                acc = acc + min(s, vec3(4.0)) * open * wgt * 0.4;
+            } else {
+                acc = acc + bright(s) * wgt;
+            }
             wgt = wgt * 0.93;
         }
         let fade = smoothstep(1.4, 0.2, distance(in.uv, sun_uv));

@@ -242,6 +242,8 @@ pub struct Renderer {
     pub lights: Vec<([f32; 4], [f32; 4])>,
     /// Spheres the coloured lights' shadows are traced against (the cats).
     pub occluders: Vec<[f32; 4]>,
+    /// The ultra post effects: wet ground as a mirror, sky-occluded god rays.
+    pub ultra_post: bool,
     /// Fur shells per smooth draw, and strands per unit of model space.
     pub fur_shells: u32,
     pub fur_density: f32,
@@ -751,7 +753,7 @@ impl Renderer {
             label: Some("post params"),
             // 3 vec4, view-proj, its inverse, the camera, and per blast a
             // world centre+radius and a strength+thickness
-            size: 48 + 64 * 2 + 16 + 32 * crate::groundfx::MAX_RINGS as u64,
+            size: 64 + 64 * 2 + 16 + 32 * crate::groundfx::MAX_RINGS as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -815,6 +817,7 @@ impl Renderer {
             lights: Vec::new(),
             occluders: Vec::new(),
             // stylized locks: few shells, chunky cells (smooth.wgsl)
+            ultra_post: false,
             fur_shells: 7,
             fur_density: 24.0,
             camera: Camera { eye: Vec3::ZERO, target: Vec3::Y, fov_y: 1.05 },
@@ -1163,6 +1166,11 @@ impl Renderer {
                     sun_uv[1],
                     ray,
                     0.22,
+                    // d: wetness, the ultra reflections and god rays
+                    atm.wetness,
+                    self.ultra_post as u32 as f32,
+                    self.ultra_post as u32 as f32,
+                    0.0,
                 ]);
                 post_data.extend_from_slice(&vp.to_cols_array());
                 post_data.extend_from_slice(&vp.inverse().to_cols_array());
