@@ -1,6 +1,6 @@
 # zk-fp5 — a Fairphone 5 demo vault
 
-Nine interlinked notes built from *Fairphone 5: Information on how to repair
+Eleven interlinked notes built from *Fairphone 5: Information on how to repair
 and recycle* (95 pp, rev. 2025-07-23). Drop the directory into a vault root
 and open `202310150900 Fairphone 5.md`.
 
@@ -21,6 +21,7 @@ the note graph already expects.
 | …0907 mainline Linux gaps | table + graph | a note that is half prose, half diagram; the graph is 11/8 |
 | …0909 camera pipeline | measured device findings | tables plus shell blocks; the only note with runnable commands |
 | …0908 capture damage sample | broken on purpose | `docingest::diagnose` — empty refs, base64 asset names, split table cells |
+| …0910 deploy tideshell and COSMIC by hand | a runbook: numbered stages, shell blocks, an unverified section | code blocks in notes; a procedure as a note |
 
 ## Test suite notes
 
