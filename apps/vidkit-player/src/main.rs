@@ -191,6 +191,10 @@ struct Player {
     energy: power::EnergyPolicy,
     energy_read: Option<Instant>,
     power_state: power::PowerState,
+    /// Software decode unpinned from the efficiency cores because frames
+    /// dropped there; stays off for the session.
+    cores_gave_up: bool,
+    core_check: Option<(Instant, u64, u64)>,
     /// VIDKIT_PROFILE: one line a second of what playback costs.
     profiler: Option<profile::Profiler>,
     /// Picture-in-picture: the video floats, the chapters take the screen.
@@ -400,6 +404,8 @@ impl Player {
             energy: power::policy(power::current()),
             energy_read: None,
             power_state: power::current(),
+            cores_gave_up: false,
+            core_check: None,
             profiler: profile::Profiler::from_env(),
             pip: Default::default(),
             pip_on: false,
@@ -419,6 +425,7 @@ impl Player {
         // picture degrade under motion; else the power policy's budget.
         me.presenter.set_damage_rendering(std::env::var("VIDKIT_DAMAGE").as_deref() != Ok("0"));
         me.presenter.damage_budget = sw_budget_override().unwrap_or(me.energy.sw_budget);
+        me.apply_core_policy(false);
         if let Some(url) = PENDING_URL.get().cloned() {
             me.open_url(url);
         }
@@ -702,6 +709,7 @@ impl eframe::App for Player {
         self.follow_visibility(ctx);
         self.follow_power();
         self.measure_refresh();
+        self.watch_pinned_drops();
 
         let mut want_analysis = false;
         egui::TopBottomPanel::top("what").show(ctx, |ui| match &self.opened {
@@ -2267,6 +2275,7 @@ impl Player {
         let enhance_changed = p.enhance != self.energy.enhance;
         self.energy = p;
         self.presenter.damage_budget = self.effective_sw_budget();
+        self.apply_core_policy(true);
         self.apply_transcribe_policy();
         if enhance_changed {
             // Recompute the plan at the next paint under the new allowance.
@@ -2329,6 +2338,9 @@ impl Player {
         // waste this is measuring.
         let pw = self.power_state;
         p.acc.power = if pw.on_battery { format!("battery{}", pw.percent.map(|x| format!("@{x}")).unwrap_or_default()) } else { "mains".into() };
+        if let Some(c) = decode::decode_cpus() {
+            p.acc.power.push_str(&format!("+ecores{}", c.len()));
+        }
         p.frame(shown, dropped, uploaded);
     }
 }
@@ -2393,4 +2405,57 @@ enum TypedPick {
     Watch(String),
     Seek(Duration),
     Upgrade(prefs::ModelTier),
+}
+
+impl Player {
+    /// Software decode on the efficiency cores when the policy (or
+    /// VIDKIT_DECODE_CORES=efficiency|all) says so and the machine has them.
+    /// `restart`: reopen the decoder now rather than at the next open.
+    fn apply_core_policy(&mut self, restart: bool) {
+        let want = match std::env::var("VIDKIT_DECODE_CORES").as_deref() {
+            Ok("efficiency") => true,
+            Ok("all") => false,
+            _ => self.energy.efficiency_cores,
+        } && !self.cores_gave_up;
+        let cpus = if want { decode::efficiency_cpus(&decode::cpu_capacities()) } else { Vec::new() };
+        let next = (!cpus.is_empty()).then_some(cpus);
+        if next != decode::decode_cpus() {
+            decode::set_decode_cpus(next);
+            self.core_check = None;
+            if restart && self.engine.is_some() {
+                let at = self.transport.position;
+                self.seek_to(at);
+            }
+        }
+    }
+
+    /// Pinned and dropping frames: the little cores cannot keep up with this
+    /// stream. Unpin (for the session), reopen, and say so.
+    fn watch_pinned_drops(&mut self) {
+        let (Some(cpus), Some(e)) = (decode::decode_cpus(), self.engine.as_ref()) else {
+            self.core_check = None;
+            return;
+        };
+        let now = Instant::now();
+        let (shown, dropped) = (e.shown, e.dropped);
+        match self.core_check {
+            None => self.core_check = Some((now, shown, dropped)),
+            Some((t, s0, d0)) if now.duration_since(t) >= Duration::from_secs(5) => {
+                let (ds, dd) = (shown.saturating_sub(s0), dropped.saturating_sub(d0));
+                self.core_check = Some((now, shown, dropped));
+                if ds + dd >= 30 && dd * 20 > ds + dd {
+                    self.cores_gave_up = true;
+                    decode::set_decode_cpus(None);
+                    let at = self.transport.position;
+                    self.seek_to(at);
+                    self.gpu_error = Some(format!(
+                        "decode moved off the {} efficiency cores: {dd} of {} frames dropped there",
+                        cpus.len(),
+                        ds + dd
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
 }

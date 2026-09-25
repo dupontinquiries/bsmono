@@ -77,6 +77,8 @@ pub struct EnergyPolicy {
     /// Software presenter: conversions a frame may spend, as a fraction of
     /// a whole frame (vidkit_core::damage). 1.0 never degrades.
     pub sw_budget: f32,
+    /// Run software decode on the efficiency cores (big.LITTLE machines).
+    pub efficiency_cores: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -91,7 +93,7 @@ pub fn policy(p: PowerState) -> EnergyPolicy {
         // Ahead, even on mains: transcribing a whole video at once is what
         // heated a laptop (reported: base model, plugged in). "All" in the
         // Sections panel builds the full chapter list when it is wanted.
-        return EnergyPolicy { keep_download: true, transcribe_ahead: Some(Duration::from_secs(600)), analysis: true, enhance: Enhancement::Full, sw_budget: 1.0 };
+        return EnergyPolicy { keep_download: true, transcribe_ahead: Some(Duration::from_secs(600)), analysis: true, enhance: Enhancement::Full, sw_budget: 1.0, efficiency_cores: false };
     }
     let pct = p.percent.unwrap_or(50);
     let (ahead, enhance, sw_budget) = match pct {
@@ -99,7 +101,7 @@ pub fn policy(p: PowerState) -> EnergyPolicy {
         20..=50 => (Duration::from_secs(300), Enhancement::SharpenOnly, 0.25),
         _ => (Duration::ZERO, Enhancement::Off, 1.0 / 16.0),
     };
-    EnergyPolicy { keep_download: false, transcribe_ahead: Some(ahead), analysis: false, enhance, sw_budget }
+    EnergyPolicy { keep_download: false, transcribe_ahead: Some(ahead), analysis: false, enhance, sw_budget, efficiency_cores: true }
 }
 
 /// Cut an enhancement down to what the policy allows.
@@ -176,6 +178,7 @@ mod tests {
         assert_eq!(b(35).transcribe_ahead, Some(Duration::from_secs(300)));
         assert_eq!(b(10).enhance, Enhancement::Off);
         assert_eq!(b(10).transcribe_ahead, Some(Duration::ZERO), "whisper paused");
+        assert!(b(80).efficiency_cores && !mains.efficiency_cores, "decode on the little cores on battery");
     }
 
     #[test]

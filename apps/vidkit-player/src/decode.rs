@@ -829,9 +829,82 @@ pub fn grow_pipe(fd: std::os::fd::RawFd, want: usize) -> Option<usize> {
 /// The pipe size for frames of `frame_bytes`: a frame's worth, capped.
 pub const PIPE_WANT: usize = 1 << 20;
 
+/// The efficiency cores of a big.LITTLE machine: the CPUs in the LOWEST
+/// `cpu_capacity` tier, when capacities differ at all. Pure.
+///
+/// Measured on a 720p SVT-AV1 stream (rav1d, callgrind): 73% of AV1 decode
+/// is entropy decoding, serial and CPU-only, so a GPU decoder could take at
+/// most ~a quarter off the CPU. On an M2 (no AV1 block) the lever is the
+/// other way round: run the software decoder on the cores that do a unit of
+/// work for the least energy. M2 Max: 4 efficiency + 8 performance cores;
+/// Fairphone 5: A55 / A78 / X1, three tiers -- the A55s are the lowest.
+/// A symmetric machine returns nothing: nothing to pin to.
+pub fn efficiency_cpus(capacities: &[(usize, u32)]) -> Vec<usize> {
+    let (Some(min), Some(max)) = (capacities.iter().map(|c| c.1).min(), capacities.iter().map(|c| c.1).max()) else { return Vec::new() };
+    if min == max {
+        return Vec::new();
+    }
+    capacities.iter().filter(|c| c.1 == min).map(|c| c.0).collect()
+}
+
+/// `/sys/devices/system/cpu/cpu*/cpu_capacity`.
+pub fn cpu_capacities() -> Vec<(usize, u32)> {
+    let Ok(rd) = std::fs::read_dir("/sys/devices/system/cpu") else { return Vec::new() };
+    let mut v: Vec<(usize, u32)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().strip_prefix("cpu")?.parse::<usize>().ok()?;
+            let c = std::fs::read_to_string(e.path().join("cpu_capacity")).ok()?.trim().parse().ok()?;
+            Some((n, c))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+static DECODE_CPUS: Mutex<Option<Vec<usize>>> = Mutex::new(None);
+
+/// Pin every ffmpeg the player starts from now on to these CPUs (`None`:
+/// anywhere). Takes effect at the next (re)open.
+pub fn set_decode_cpus(cpus: Option<Vec<usize>>) {
+    if let Ok(mut c) = DECODE_CPUS.lock() {
+        *c = cpus.filter(|v| !v.is_empty());
+    }
+}
+
+pub fn decode_cpus() -> Option<Vec<usize>> {
+    DECODE_CPUS.lock().ok().and_then(|c| c.clone())
+}
+
+/// Restrict a child to `cpus` before it execs, and size ffmpeg's threads to
+/// match (more threads than cores only adds switching).
+fn pin(cmd: &mut Command, cpus: &[usize]) {
+    use std::os::unix::process::CommandExt;
+    let cpus = cpus.to_vec();
+    // SAFETY: sched_setaffinity on the calling (child) thread between fork
+    // and exec touches no locks or allocations beyond the stack set.
+    unsafe {
+        cmd.pre_exec(move || {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            for &c in &cpus {
+                libc::CPU_SET(c, &mut set);
+            }
+            if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 fn spawn_ffmpeg(args: &[String]) -> Result<Child, String> {
-    Command::new("ffmpeg")
-        .args(args)
+    let mut cmd = Command::new("ffmpeg");
+    let pinned = decode_cpus();
+    if let Some(cpus) = &pinned {
+        pin(&mut cmd, cpus);
+        cmd.args(["-threads", &cpus.len().to_string()]);
+    }
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Inherited stderr would scribble over the UI; ffmpeg is chatty even
@@ -1585,6 +1658,36 @@ mod fedora_tests {
         };
         assert_eq!(choose_accel("h264", &m, AccelPref::Auto), Accel::Software);
         assert!(matches!(choose_accel("vp9", &m, AccelPref::Auto), Accel::Vaapi { .. }));
+    }
+}
+
+#[cfg(test)]
+mod core_tests {
+    use super::*;
+
+    #[test]
+    fn the_lowest_capacity_tier_is_the_efficiency_cores() {
+        // M2 Max-shaped: 4 efficiency, 8 performance (capacities invented;
+        // the SHAPE is the point).
+        let m2max: Vec<(usize, u32)> = (0..4).map(|c| (c, 380)).chain((4..12).map(|c| (c, 1024))).collect();
+        assert_eq!(efficiency_cpus(&m2max), vec![0, 1, 2, 3]);
+        // Fairphone 5-shaped: 4 x A55, 3 x A78, 1 x X1.
+        let fp5: Vec<(usize, u32)> = (0..4).map(|c| (c, 260)).chain((4..7).map(|c| (c, 870))).chain([(7, 1024)]).collect();
+        assert_eq!(efficiency_cpus(&fp5), vec![0, 1, 2, 3]);
+        let x86: Vec<(usize, u32)> = (0..8).map(|c| (c, 1024)).collect();
+        assert!(efficiency_cpus(&x86).is_empty(), "symmetric: nothing to pin to");
+        assert!(efficiency_cpus(&[]).is_empty());
+    }
+
+    /// The mechanics, for real: a child pinned to CPU 0 is allowed only CPU 0.
+    #[test]
+    fn a_pinned_child_really_is_pinned() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "grep Cpus_allowed_list /proc/self/status"]);
+        pin(&mut cmd, &[0]);
+        let out = cmd.output().unwrap();
+        let line = String::from_utf8_lossy(&out.stdout);
+        assert!(line.trim().ends_with("\t0") || line.trim().ends_with(" 0"), "{line}");
     }
 }
 
