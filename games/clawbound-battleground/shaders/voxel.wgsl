@@ -131,10 +131,7 @@ fn shaft_light(world: vec3<f32>) -> f32 {
 
 // The fitted shadow box ends somewhere. Fade to "lit" over its last tenth so
 // the edge is a gradient on the ground and not a line.
-fn shadow_edge(uv: vec2<f32>) -> f32 {
-    let m = max(abs(uv.x - 0.5), abs(uv.y - 0.5)) * 2.0;
-    return smoothstep(0.88, 0.99, m);
-}
+// shadow_edge, sun_shadow: common_shadow.wgsl
 
 // A cat going through the flora. Same rule as the wind -- `sway` is the
 // piece's weight, the base stays planted, the tips move most -- but local:
@@ -241,21 +238,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let sun = normalize(frame.sun_dir.xyz);
     let ndl = max(dot(N, sun), 0.0);
 
-    var sp = in.shadow_pos;
-    sp = sp / sp.w;
-    let uv = sp.xy * vec2(0.5, -0.5) + vec2(0.5);
-    var shadow = 1.0;
-    if (uv.x > 0.002 && uv.x < 0.998 && uv.y > 0.002 && uv.y < 0.998 && sp.z <= 1.0) {
-        let bias = 0.0032;
-        var s = 0.0;
-        for (var i: i32 = -1; i <= 1; i = i + 1) {
-            for (var j: i32 = -1; j <= 1; j = j + 1) {
-                s = s + textureSampleCompare(shadow_map, shadow_sampler,
-                    uv + vec2(f32(i), f32(j)) * 0.0012, sp.z - bias);
-            }
-        }
-        shadow = mix(s / 9.0, 1.0, shadow_edge(uv));
-    }
+    // contact-hardening: crisp where a shadow meets its caster (common_shadow.wgsl)
+    let shadow = sun_shadow(in.shadow_pos, 0.0032, in.clip.xy);
 
     // --- lighting model ----------------------------------------------------
     // Three-point-ish: a warm key (sun), a cool sky fill from above, a

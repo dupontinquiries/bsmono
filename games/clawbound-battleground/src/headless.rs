@@ -94,6 +94,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("wet") {
         return run_wet_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("surface") {
+        return run_surface_shots();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("spectate") {
         return run_spectate();
     }
@@ -1783,6 +1786,62 @@ pub fn run_wet_shots() -> Result<(), String> {
     for (ultra, name) in [(false, "wet_high.png"), (true, "wet_ultra.png")] {
         scene.ultra = ultra;
         scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = atm;
+        renderer.render_frame(&view, cam, 1.0);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+    }
+    Ok(())
+}
+
+/// The ground's surface: a cat at a lane's edge, a low sun. Dry (material
+/// borders, contact-hardening shadows), light rain (water in the cracks and
+/// hollows), heavy rain (more floods; in ultra, puddles reflect), and a
+/// close-up of the paws.
+/// `CLAWBOUND_SHOTS=surface clawbound-battleground --screenshot`
+pub fn run_surface_shots() -> Result<(), String> {
+    std::env::set_var("CLAWBOUND_QUALITY", "ultra");
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("surface"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let mut game = Game::new_teams(&[0], &[1]);
+    game.blockers = scene.blockers.clone();
+    // the mid lane's edge: the path at x ~ 0, grass beyond ~ +7
+    let spot = Vec3::new(5.5, 0.0, -30.0);
+    game.gods[0].pos = spot;
+    game.gods[0].yaw = 0.3;
+    game.gods[1].respawn_t = 999.0;
+    game.gods[0].ai = None;
+    let mut vfx = Vfx::default();
+    for _ in 0..20 {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+        vfx.update(1.0 / 60.0, &[], &game);
+    }
+    // diagnostics: CLAWBOUND_SURFACE_NOCAT renders the scene without the cat
+    if std::env::var("CLAWBOUND_SURFACE_NOCAT").is_ok() {
+        game.gods[0].respawn_t = 999.0;
+    }
+    let mut atm = game.weather.atmosphere();
+    atm.rain = 0.0;
+    atm.cloud_cover = 0.1;
+    atm.sun_dir = Vec3::new(-0.7, 0.45, 0.35).normalize();
+    let wide = Camera { eye: spot + Vec3::new(-3.0, 4.0, -7.0), target: spot + Vec3::new(0.5, 0.3, 2.0), fov_y: 1.0 };
+    let close = Camera { eye: spot + Vec3::new(-1.2, 1.1, -2.2), target: spot + Vec3::new(0.3, 0.2, 0.3), fov_y: 0.8 };
+    for (wet, cam, name) in [(0.0f32, wide, "surface_dry.png"), (0.35, wide, "surface_rain_light.png"), (0.9, wide, "surface_rain_heavy.png"), (0.0, close, "surface_paws.png")] {
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        atm.wetness = wet;
         renderer.atmosphere = atm;
         renderer.render_frame(&view, cam, 1.0);
         save_shot(&renderer.device, &renderer.queue, &target, name)?;
