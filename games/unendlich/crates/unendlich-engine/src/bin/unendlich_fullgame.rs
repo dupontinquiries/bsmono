@@ -225,6 +225,9 @@ struct DragonDuel {
     /// renderer to fade the body and draw the eyes.
     view_t: f32,
     eyes: f32,
+    /// The cups-and-ball smoke game (sim::smoke_shells): identical dense
+    /// drafts circling you, the dragon hidden in one.
+    shells: Option<unendlich_engine::sim::smoke_shells::Shells>,
 }
 
 /// Top ground speed of an engaged dragon at `speed01 = 1` (blocks/s). Wander
@@ -291,6 +294,7 @@ fn dragon_duel_with(genome: unendlich_engine::sim::dragon_archetype::Genome, id_
         mantle: None,
         view_t: 1.0,
         eyes: 0.0,
+        shells: None,
     })
 }
 
@@ -2642,6 +2646,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // ways. Stepped with the wind each frame; the player's fog thickens inside.
     let mut smoke_walls: Vec<unendlich_engine::sim::smoke_wall::SmokeVolume> = Vec::new();
     let mut in_smoke_wall = false;
+    // Every dragon's shell-game drafts, rebuilt each frame from the roamer loop
+    // (used the next frame, like the wisps' feelings).
+    let mut shell_vols_next: Vec<unendlich_engine::sim::smoke_wall::SmokeVolume> = Vec::new();
     // Brightest directionless flash leaking from a dragon's smoke this frame
     // (sim::smoke_tells); lifts the ambient light for that frame.
     let mut smoke_flash: f32 = 0.0;
@@ -5023,8 +5030,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         if let Some(r) = roamers.last_mut() {
                             let he = r.creature.body.half_extents;
                             if let Some(d) = r.duel.as_mut() {
-                                d.mantle = Some(unendlich_engine::sim::smoke_wall::Mantle::new(30.0, he[0].max(he[2])));
-                                log::info!("[dragon] UNENDLICH_DRAGON_AT …:smoke — it hatches smoking");
+                                let feet = [p.x, (sy as f32).min(p.y - 1.6), p.z];
+                                d.shells = Some(unendlich_engine::sim::smoke_shells::Shells::new(
+                                    feet, he[0].max(he[2]), he[1] * 2.0, d.profile.cunning, 45.0, d.id,
+                                ));
+                                log::info!("[dragon] UNENDLICH_DRAGON_AT …:smoke — it hatches in its shell game");
                             }
                         }
                     }
@@ -9551,13 +9561,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 w.step(scent_wind, dt);
             }
             smoke_walls.retain(|w| w.alive());
+            // All smoke that blocks sight this frame: walls and puffs, plus the
+            // shell-game drafts laid down by last frame's roamer loop.
+            let smoke_all: Vec<unendlich_engine::sim::smoke_wall::SmokeVolume> =
+                smoke_walls.iter().cloned().chain(std::mem::take(&mut shell_vols_next)).collect();
             {
                 use unendlich_engine::sim::smoke_wisps as sw;
                 let calm = sw::look(&sw::Feeling::default());
                 let looks = |o: u64| dragon_looks.get(&o).copied().unwrap_or(calm);
-                let owners: Vec<u64> = smoke_walls.iter().map(|w| w.owner).collect();
+                let owners: Vec<u64> = smoke_all.iter().map(|w| w.owner).collect();
                 let pp = local_player.view.position;
-                wisps.emit(&smoke_walls, &owners, &looks, dt);
+                wisps.emit(&smoke_all, &owners, &looks, dt);
                 wisps.step(&looks, scent_wind, Some([pp.x, pp.y - 1.4, pp.z]), dt);
                 if dragon_trace && !wisps.wisps.is_empty() && (wisps.time % 5.0) < dt {
                     log::info!("[smoke] {} wisps over {} volumes", wisps.wisps.len(), smoke_walls.len());
@@ -9565,7 +9579,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
             {
                 let pp = local_player.view.position;
-                let d = unendlich_engine::sim::smoke_wall::density_at(&smoke_walls, [pp.x, pp.y, pp.z]);
+                let d = unendlich_engine::sim::smoke_wall::density_at(&smoke_all, [pp.x, pp.y, pp.z]);
                 let now_in = d > 0.15;
                 if now_in != in_smoke_wall {
                     in_smoke_wall = now_in;
@@ -11055,7 +11069,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             let sens = unendlich_engine::sim::smoke_wall::sensitivity(
                                 a.size_class, unendlich_engine::sim::dragon_archetype::SIZE_CLASS_MAX, d.profile.element,
                             );
-                            let t = unendlich_engine::sim::smoke_wall::transmittance(&smoke_walls, eye, pv.eye, sens);
+                            let t = unendlich_engine::sim::smoke_wall::transmittance(&smoke_all, eye, pv.eye, sens);
                             if blocked || t < unendlich_engine::sim::smoke_wall::SIGHT_FLOOR {
                                 senses.can_see = false;
                             }
@@ -11139,7 +11153,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         // (sensitivity 1). In its smoke it is hidden from you;
                         // it outpositions (Tactic::Reposition) rather than charging.
                         d.view_t = unendlich_engine::sim::smoke_wall::transmittance(
-                            &smoke_walls,
+                            &smoke_all,
                             pv.eye,
                             [cr.body.position[0], cr.body.position[1] + cr.body.half_extents[1] * 0.5, cr.body.position[2]],
                             1.0,
@@ -11181,6 +11195,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 value,
                                 busy: d.caster.busy(),
                             });
+                        }
+                        // Playing its shell game: not duelling -- the drafts carry it,
+                        // and it strikes on the shell game's own clock.
+                        if d.shells.as_ref().map_or(false, |sh| sh.active()) {
+                            d.state.engaged = false;
+                            senses.can_see = false;
+                            senses.lead = None;
+                            senses.cast = None;
                         }
                         let o = dd::step(&mut d.state, &d.profile, &senses, duel_tuning, dt);
                         let tag = d.id & 0xffff;
@@ -11340,22 +11362,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                         if refused > 0 { format!(" ({refused} refused: not loaded)") } else { String::new() }
                                     );
                                     if area.ability.form == unendlich_engine::sim::dragon_abilities::Form::SmokeWall {
-                                        let len = area.ability.radius * 2.0;
-                                        let height = (area.ability.radius * 2.2).max(14.0);
-                                        let mut wall = unendlich_engine::sim::smoke_wall::SmokeVolume::wall(
-                                            area.center, area.from, feet, len, height, area.ability.linger_s,
+                                        let sh = unendlich_engine::sim::smoke_shells::Shells::new(
+                                            feet, dbody.radius(), cr.body.half_extents[1] * 2.0, cunning_now,
+                                            area.ability.linger_s * 1.5, d.id ^ (senses_now.to_bits() as u64),
                                         );
-                                        wall.owner = d.id;
-                                        smoke_walls.push(wall);
-                                        // …and it keeps smoking as it moves: its cover goes
-                                        // with it, so the wall is not yours to camp behind.
-                                        d.mantle = Some(unendlich_engine::sim::smoke_wall::Mantle::new(
-                                            area.ability.linger_s * 0.6, dbody.radius(),
-                                        ));
                                         log::info!(
-                                            "[dragon#{:04x}] a wall of smoke {:.0} m long, {:.0} m tall rises between you — it cannot see you now, nor you it; it still smells and hears",
-                                            tag, len, height
+                                            "[dragon#{:04x}] raises {} identical drafts of smoke around you and vanishes into one",
+                                            tag, sh.drafts.len()
                                         );
+                                        d.shells = Some(sh);
                                     } else if area.ability.linger_s > 0.0 {
                                         d.areas.push(area);
                                     }
@@ -11393,12 +11408,62 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             }
                             // What leaks out of the smoke: directionless flashes
                             // while it charges, its eyes just before a lunge or breath.
-                            let strike_in = match d.state.tactic {
+                            let mut strike_in = match d.state.tactic {
                                 dd::Tactic::Lunge if d.state.held < dd::LUNGE_TIME * 0.5 => Some(dd::LUNGE_TIME * 0.5 - d.state.held),
                                 dd::Tactic::Breath if d.state.held < 0.4 => Some(0.4 - d.state.held),
                                 _ => None,
                             };
-                            let tell = unendlich_engine::sim::smoke_tells::tell(d.view_t, charge, strike_in, cunning_now, senses_now);
+                            let mut eye_view_t = d.view_t;
+                            // ── the shell game ────────────────────────────────
+                            if let Some(sh) = d.shells.as_mut() {
+                                let ground = [pp.x, pp.y - 1.6, pp.z];
+                                let tick = sh.step(ground, dt);
+                                let dp = sh.dragon_pos();
+                                let gy = chunk_manager
+                                    .surface_y_at(dp[0].floor() as i32, dp[2].floor() as i32, probe_y_min, probe_y_max)
+                                    .map(|y| y as f32 + 1.0)
+                                    .unwrap_or(dp[1]);
+                                cr.body.position = [dp[0], gy + cr.body.half_extents[1], dp[2]];
+                                cr.yaw = (pp.z - dp[2]).atan2(pp.x - dp[0]);
+                                *flying = false;
+                                for v in sh.volumes(d.id) {
+                                    shell_vols_next.push(v);
+                                }
+                                if tick.switched.is_some() {
+                                    log::info!("[dragon#{:04x}] (slips into another draft where two crossed)", tag);
+                                }
+                                if let Some(si) = tick.strike_in {
+                                    strike_in = Some(si);
+                                    // Its eyes lead the strike: seen from the front edge
+                                    // of the draft, not through the whole of it.
+                                    let head = [
+                                        cr.body.position[0] + cr.yaw.cos() * sh.radius * 0.9,
+                                        cr.body.position[1],
+                                        cr.body.position[2] + cr.yaw.sin() * sh.radius * 0.9,
+                                    ];
+                                    eye_view_t = unendlich_engine::sim::smoke_wall::transmittance(&smoke_all, pv.eye, head, 1.0);
+                                }
+                                if tick.struck {
+                                    let reach = dbody.radius() + dd::LUNGE_REACH + sh.radius * 0.6;
+                                    let dist = ((pp.x - dp[0]).powi(2) + (pp.z - dp[2]).powi(2)).sqrt();
+                                    if dist <= reach {
+                                        if survival_mode {
+                                            fg_app.vitality_mut().tick(1.0, d.profile.bite_damage * 0.004 * player_dmg_resist);
+                                        }
+                                        log::info!(
+                                            "[dragon#{:04x}] strikes out of the smoke for {:.0} — vitality {:.0}%",
+                                            tag, d.profile.bite_damage, fg_app.vitality().energy * 100.0
+                                        );
+                                    } else {
+                                        log::info!("[dragon#{:04x}] strikes out of the smoke and misses ({:.0} m)", tag, dist);
+                                    }
+                                }
+                                if !sh.active() {
+                                    log::info!("[dragon#{:04x}] its drafts break up", tag);
+                                    d.shells = None;
+                                }
+                            }
+                            let tell = unendlich_engine::sim::smoke_tells::tell(d.view_t, eye_view_t, charge, strike_in, cunning_now, senses_now);
                             if tell.eyes > 0.0 && d.eyes == 0.0 {
                                 log::info!("[dragon#{:04x}] eyes open in the smoke ({:.0}% through)", tag, tell.eyes * 100.0);
                             }
@@ -12277,6 +12342,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             );
                             let body = dd::DragonBody { pos: dp, yaw: dyaw, half_extents: he };
                             let (zone, h) = dd::take_hit(&d.profile, &mut d.state, &body, [eye.x, eye.y, eye.z], &threat);
+                            if d.shells.take().is_some() {
+                                log::info!("[dragon#{:04x}] you found it — its shell game is over", d.id & 0xffff);
+                            }
                             // No crit roll here: the combat-mods crit is folded into
                             // a mass-armor mitigation above that dragons replace
                             // with hide, and can't be separated back out of it.
@@ -14442,7 +14510,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // r129: SMOKESCREEN visual — standing in dense smoke multiplies
             // fog density (up to 6x), so the screen actually screens.
             if in_smoke || in_smoke_wall {
-                fog_density *= 6.0;
+                // x2, not the old x6: a black screen kills immersion. The smoke
+                // that matters is the drafts you can see and track.
+                fog_density *= if in_smoke_wall && !in_smoke { 2.0 } else { 6.0 };
             }
             if load_fog_enabled {
                 fog_density *= unendlich_engine::visual_fade::load_fog_boost(
@@ -15469,6 +15539,33 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // to near so the blend order is right too.
                 let eye = local_player.view.position;
                 let mut cards = wisps.cards(&looks);
+                // The shell-game drafts: each a dense column of soft cards,
+                // IDENTICAL across a dragon's drafts (same layout, same motion,
+                // same colour) -- so which one holds the dragon is yours to track.
+                for r in roamers.iter() {
+                    let Some(d) = r.duel.as_ref() else { continue };
+                    let Some(sh) = d.shells.as_ref() else { continue };
+                    let lk = looks(d.id);
+                    let t = wisps.time;
+                    let breath = 1.0 + lk.breath_depth * (std::f32::consts::TAU * lk.breath_hz * t).sin();
+                    for dr in &sh.drafts {
+                        for k in 0..10u32 {
+                            let a = k as f32 * 2.399 + t * (0.15 + 0.25 * lk.churn.min(2.0));
+                            let h = (k as f32 + 0.5) / 10.0;
+                            let rr = sh.radius * (0.25 + 0.45 * ((k * 7 % 10) as f32 / 10.0));
+                            cards.push(sw::Card {
+                                center: [
+                                    dr.pos[0] + a.cos() * rr,
+                                    dr.pos[1] + sh.height * h,
+                                    dr.pos[2] + a.sin() * rr,
+                                ],
+                                radius: sh.radius * 0.95 * breath,
+                                color: lk.color,
+                                alpha: (0.55 * lk.opacity.max(0.4)).min(0.7),
+                            });
+                        }
+                    }
+                }
                 let d2 = |c: &sw::Card| (c.center[0] - eye.x).powi(2) + (c.center[1] - eye.y).powi(2) + (c.center[2] - eye.z).powi(2);
                 cards.sort_by(|a, b| d2(b).partial_cmp(&d2(a)).unwrap_or(std::cmp::Ordering::Equal));
                 for c in cards {

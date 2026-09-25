@@ -706,6 +706,7 @@ pub mod dragon_cast;
 pub mod smoke_wall;
 pub mod smoke_tells;
 pub mod smoke_wisps;
+pub mod smoke_shells;
 pub mod mob_pixel_peeper;
 pub mod camera_tremble;
 pub mod plant_root_system;
