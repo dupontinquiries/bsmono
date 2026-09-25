@@ -303,7 +303,7 @@ pub enum Accel {
     Software,
     /// VAAPI through a DRM render node — Intel and AMD desktops. Scaling runs
     /// on the GPU too, so a 4K source crosses the bus at the display size.
-    Vaapi { device: String },
+    Vaapi { device: String, codec: String },
     /// A V4L2 memory-to-memory decoder (`vp9_v4l2m2m`...) — Venus on the
     /// Fairphone. An INPUT option: it replaces the software decoder.
     V4l2m2m { decoder: String },
@@ -427,7 +427,7 @@ pub fn choose_accel(codec: &str, m: &Machine, pref: AccelPref) -> Accel {
             (None, _) => true,
         };
         if listed && m.hwaccels.iter().any(|h| h == "vaapi") && VAAPI_CODECS.contains(&codec) {
-            return Accel::Vaapi { device: node.clone() };
+            return Accel::Vaapi { device: node.clone(), codec: codec.to_string() };
         }
     }
     Accel::Software
@@ -554,8 +554,16 @@ pub fn video_args_fmt(src: &VideoInput, from: Duration, accel: &Accel, scale_to:
 
     match accel {
         Accel::Software => {}
-        Accel::Vaapi { device } => {
+        Accel::Vaapi { device, codec } => {
             push(&mut a, &["-hwaccel", "vaapi", "-hwaccel_device", device]);
+            // ffmpeg's DEFAULT AV1 decoder is libdav1d (registered first),
+            // a software decoder that ignores -hwaccel: without naming the
+            // native decoder, "VAAPI" AV1 was dav1d on the CPU even on
+            // hardware that decodes AV1. VP9/HEVC/H.264 default to the native
+            // decoders already.
+            if codec == "av1" {
+                push(&mut a, &["-c:v", "av1"]);
+            }
             if scale_to.is_some() {
                 // Keep frames on the GPU so scale_vaapi can shrink them before
                 // the download; without this ffmpeg downloads full size.
@@ -1211,7 +1219,7 @@ mod color_tests {
         assert_eq!(p.layout(), PlaneLayout::P010);
         let a = video_args_fmt(&VideoInput::file(Path::new("x")), Duration::ZERO, &Accel::Software, None, p.layout());
         assert!(a.windows(2).any(|w| w[0] == "-pix_fmt" && w[1] == "p010le"), "{a:?}");
-        let v = video_args_fmt(&VideoInput::file(Path::new("x")), Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into() }, Some((1920, 1080)), PlaneLayout::P010);
+        let v = video_args_fmt(&VideoInput::file(Path::new("x")), Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "hevc".into() }, Some((1920, 1080)), PlaneLayout::P010);
         assert!(v.iter().any(|x| x.contains("format=p010,hwdownload,format=p010")), "{v:?}");
     }
 
@@ -1303,6 +1311,27 @@ mod vaapi_tests {
         // Without vainfo, the old behaviour: trust the driver name.
         let unknown = Machine { vaapi: None, ..m };
         assert!(matches!(choose_accel("av1", &unknown, AccelPref::Auto), Accel::Vaapi { .. }));
+    }
+}
+
+#[cfg(test)]
+mod av1_tests {
+    use super::*;
+
+    /// VAAPI AV1 must name the native decoder, BEFORE -i: ffmpeg's default
+    /// AV1 decoder is libdav1d, which never touches the hardware.
+    #[test]
+    fn vaapi_av1_names_the_native_decoder() {
+        let src = VideoInput::file(Path::new("x.webm"));
+        let a = video_args(&src, Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "av1".into() }, None);
+        let (cv, i) = (a.windows(2).position(|w| w[0] == "-c:v" && w[1] == "av1"), a.iter().position(|x| x == "-i"));
+        assert!(cv.is_some() && cv < i, "{a:?}");
+        // VP9 needs nothing: the native vp9 decoder is the default.
+        let v = video_args(&src, Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "vp9".into() }, None);
+        assert!(!v.iter().any(|x| x == "-c:v"), "{v:?}");
+        // Software AV1 is left to ffmpeg's default -- libdav1d, the fastest.
+        let sw = video_args(&src, Duration::ZERO, &Accel::Software, None);
+        assert!(!sw.iter().any(|x| x == "-c:v"));
     }
 }
 
