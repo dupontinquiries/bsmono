@@ -239,6 +239,9 @@ pub fn is_opus_frame(sample_rate: u32, samples: usize) -> bool {
     OPUS_FRAME_TENTHS_MS.iter().any(|t| sample_rate as usize * *t as usize == samples * 10_000)
 }
 
+/// The loss rate the encoder plans for (percent): what makes it embed FEC.
+pub const EXPECTED_LOSS_PERC: u8 = 10;
+
 /// A speech encoder (VOIP application, voice signal hint, in-band FEC on).
 pub struct VoiceEncoder {
     inner: OpusEncoder,
@@ -256,6 +259,10 @@ impl VoiceEncoder {
             let _ = enc.set_bitrate(Bitrate::BitsPerSecond(bitrate));
         }
         let _ = enc.set_inband_fec(true);
+        // In-band FEC is only EMBEDDED when the encoder expects loss: with the
+        // default 0% it spends nothing on it and the receiver has nothing to
+        // rebuild from. 10% is the common VoIP setting.
+        let _ = enc.set_packet_loss_perc(EXPECTED_LOSS_PERC);
         Some(VoiceEncoder { inner: OpusEncoder { enc }, sample_rate })
     }
 
@@ -281,6 +288,20 @@ impl VoiceDecoder {
     pub fn new(sample_rate: u32, channels: u32) -> Option<VoiceDecoder> {
         let (sr, ch) = (map_sample_rate(sample_rate)?, map_channels(channels)?);
         Some(VoiceDecoder { inner: OpusDecoder { dec: Decoder::new(sr, ch).ok()? } })
+    }
+
+    /// Rebuild a LOST frame from the packet that followed it: Opus in-band FEC
+    /// (a low-bitrate copy of the previous frame inside each packet). Better
+    /// than `decode(None, ..)`'s extrapolation when that next packet is already
+    /// here. Call it for the lost frame, then `decode(Some(next))` as usual.
+    pub fn recover(&mut self, next_packet: &[u8], frame_samples: usize) -> Option<Vec<i16>> {
+        if next_packet.is_empty() {
+            return None;
+        }
+        let mut out = vec![0i16; frame_samples.max(1)];
+        let n = self.inner.dec.decode(Some(next_packet), &mut out[..], true).ok()?;
+        out.truncate(n);
+        Some(out)
     }
 
     /// One packet to `frame_samples` of mono i16 PCM. `None` for `packet`
@@ -339,6 +360,29 @@ mod voice_tests {
         // Past the codec's start-up delay the level is the input's.
         let (a, b) = (rms(&frames.concat()[4000..]), rms(&out[4000..]));
         assert!((b / a - 1.0).abs() < 0.35, "level in {a:.0}, out {b:.0}");
+    }
+
+    /// Against what a decoder that got EVERY packet produced, a frame rebuilt
+    /// from the next packet's FEC is closer than one extrapolated by PLC.
+    #[test]
+    fn fec_rebuilds_a_lost_frame_better_than_concealment_guesses_it() {
+        let frames = tone(20);
+        let mut enc = VoiceEncoder::new(RATE, 1, 24_000).unwrap();
+        let packets: Vec<Vec<u8>> = frames.iter().map(|f| enc.encode(f).unwrap()).collect();
+        let lost = 10;
+        let mut reference = VoiceDecoder::new(RATE, 1).unwrap();
+        let heard: Vec<Vec<i16>> = packets.iter().map(|p| reference.decode(Some(p), FRAME).unwrap()).collect();
+        let err = |a: &[i16], b: &[i16]| (a.iter().zip(b).map(|(x, y)| ((*x as f32) - (*y as f32)).powi(2)).sum::<f32>() / a.len() as f32).sqrt();
+        let run = |fec: bool| {
+            let mut d = VoiceDecoder::new(RATE, 1).unwrap();
+            for p in &packets[..lost] { d.decode(Some(p), FRAME).unwrap(); }
+            let slot = if fec { d.recover(&packets[lost + 1], FRAME).unwrap() } else { d.decode(None, FRAME).unwrap() };
+            assert_eq!(slot.len(), FRAME);
+            err(&slot, &heard[lost])
+        };
+        let (with_fec, plc) = (run(true), run(false));
+        assert!(with_fec < plc * 0.8, "FEC error {with_fec:.0} vs PLC {plc:.0} (against the full-decode reference)");
+        assert!(VoiceDecoder::new(RATE, 1).unwrap().recover(&[], FRAME).is_none());
     }
 
     #[test]
