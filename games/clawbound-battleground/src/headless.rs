@@ -85,6 +85,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("blast") {
         return run_blast_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("ultra") {
+        return run_ultra_shots();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("spectate") {
         return run_spectate();
     }
@@ -1559,6 +1562,88 @@ pub fn run_blast_shots() -> Result<(), String> {
         renderer.render_frame(&view, cam, 1.0);
         save_shot(&renderer.device, &renderer.queue, &target, name)?;
         println!("saved {name}");
+    }
+    Ok(())
+}
+
+/// The ultra preview beside today's look: four ancestors (two maned) on
+/// one frame drawn as voxels, then smooth and furred, then under a coloured
+/// ability light with a cat between it and another (the traced shadow), and
+/// a close-up of the manes.
+/// `CLAWBOUND_SHOTS=ultra clawbound-battleground --screenshot`
+pub fn run_ultra_shots() -> Result<(), String> {
+    std::env::set_var("CLAWBOUND_QUALITY", "ultra");
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ultra"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let mut scene = Scene::new(&mut renderer);
+    let id = |n: &str| crate::gods::ROSTER.iter().position(|d| d.name == n).unwrap() as u32;
+    let mut game = Game::new_teams(&[id("Goldenmane"), id("Duskstripe")], &[id("Oldroar"), id("Faryowl")]);
+    game.blockers = scene.blockers.clone();
+    let spot = Vec3::new(0.0, 0.0, -40.0);
+    for (k, g) in game.gods.iter_mut().enumerate() {
+        g.ai = None;
+        g.pos = spot + Vec3::new(k as f32 * 2.6 - 3.9, 0.0, 0.0);
+        g.yaw = -std::f32::consts::FRAC_PI_2 + 0.5; // three-quarters to camera
+    }
+    let mut vfx = Vfx::default();
+    for _ in 0..30 {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+        vfx.update(1.0 / 60.0, &[], &game);
+    }
+    let wide = Camera { eye: spot + Vec3::new(0.5, 2.6, -7.5), target: spot + Vec3::Y * 0.8, fov_y: 0.8 };
+    let close = Camera { eye: game.gods[0].pos + Vec3::new(1.2, 1.5, -2.6), target: game.gods[0].pos + Vec3::new(0.3, 1.1, 0.0), fov_y: 0.7 };
+    let mut shoot = |renderer: &mut Renderer, scene: &Scene, vfx: &mut Vfx, name: &str, cam: Camera| -> Result<(), String> {
+        scene.draw(renderer, &game, vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, 1.0);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name} ({} coloured lights, {} occluders)", renderer.lights.len(), renderer.occluders.len());
+        Ok(())
+    };
+    scene.ultra = false;
+    shoot(&mut renderer, &scene, &mut vfx, "ultra_0_voxel.png", wide)?;
+    scene.ultra = true;
+    shoot(&mut renderer, &scene, &mut vfx, "ultra_1_smooth.png", wide)?;
+    // a violet ability light beyond the right-hand cat, a little low: the
+    // cat between it and the next one casts a traced shadow onto it
+    let right = game.gods[3].pos;
+    vfx.glows.push(crate::vfx::Glow { pos: right + Vec3::new(1.6, 0.9, 0.4), color: [0.7, 0.35, 1.0], radius: 9.0, life: 1.0, max: 1.0, power: 9.0 });
+    vfx.glows.push(crate::vfx::Glow { pos: game.gods[0].pos + Vec3::new(-1.5, 1.4, -1.0), color: [1.0, 0.55, 0.15], radius: 7.0, life: 1.0, max: 1.0, power: 5.0 });
+    shoot(&mut renderer, &scene, &mut vfx, "ultra_2_lit.png", wide)?;
+    // the traced shadow, measured: the same lit frame with the cats'
+    // spheres taken away (no occluders: the light passes through)
+    scene.draw(&mut renderer, &game, &mut vfx, wide);
+    renderer.occluders.clear();
+    renderer.atmosphere = game.weather.atmosphere();
+    renderer.render_frame(&view, wide, 1.0);
+    save_shot(&renderer.device, &renderer.queue, &target, "ultra_2b_lit_no_occluders.png")?;
+    println!("saved ultra_2b_lit_no_occluders.png");
+    vfx.glows.clear();
+    shoot(&mut renderer, &scene, &mut vfx, "ultra_3_mane.png", close)?;
+    // what it costs: the wide frame, voxel against ultra, best of 4
+    for ultra in [false, true] {
+        scene.ultra = ultra;
+        let mut best = f32::MAX;
+        for _ in 0..4 {
+            scene.draw(&mut renderer, &game, &mut vfx, wide);
+            let t = std::time::Instant::now();
+            renderer.render_frame(&view, wide, 1.0);
+            renderer.device.poll(wgpu::Maintain::Wait);
+            best = best.min(t.elapsed().as_secs_f32() * 1000.0);
+        }
+        println!("frame, 4 cats, {}: {best:.0} ms (lavapipe)", if ultra { "ultra" } else { "voxel" });
     }
     Ok(())
 }

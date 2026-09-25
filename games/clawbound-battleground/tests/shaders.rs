@@ -17,6 +17,7 @@ fn all_shaders_validate() {
     check("water", include_str!("../shaders/water.wgsl"));
     check("sky", include_str!("../shaders/sky.wgsl"));
     check("post", include_str!("../shaders/post.wgsl"));
+    check("smooth", include_str!("../shaders/smooth.wgsl"));
 }
 
 /// The frame uniform must be exactly the size WGSL expects (3 mat4 + 8 vec4).
