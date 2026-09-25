@@ -37,6 +37,7 @@ struct Lights {
     pos: array<vec4<f32>, 8>,
     col: array<vec4<f32>, 8>,
     occ: array<vec4<f32>, 32>,
+    fur: vec4<f32>,
 };
 @group(1) @binding(0) var<uniform> lights: Lights;
 

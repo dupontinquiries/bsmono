@@ -287,7 +287,10 @@ pub fn set_fur(m: &mut SmoothMesh, base: f32, extra: f32, more: impl Fn(glam::Ve
 /// pelt, Oldroar's Hulk -- "a ragged mane"; dev/LORE.md holds the same
 /// line): long fur round the back of the head -- not the face -- and on the
 /// front of the chest. The model faces +z.
-pub fn fur_for_part(def: &crate::gods::GodDef, slot: usize, m: &mut SmoothMesh) {
+/// `bare_face`: the locks style keeps the face short and sleek; tape hair
+/// (the default, the player's pick) furs the whole head, as it first did --
+/// the eyes still show, their colour kept in the vertices the strands take.
+pub fn fur_for_part(def: &crate::gods::GodDef, slot: usize, m: &mut SmoothMesh, bare_face: bool) {
     use crate::rigged::Slot;
     if m.verts.is_empty() {
         return;
@@ -319,7 +322,13 @@ pub fn fur_for_part(def: &crate::gods::GodDef, slot: usize, m: &mut SmoothMesh) 
         for v in m.verts.iter_mut() {
             let f = (v.pos[2] - lo.z) / span_z; // 0 back .. 1 face
             let behind = (1.0 - (f - 0.1) / 0.45).clamp(0.0, 1.0);
-            v.fur = if f > 0.55 { 0.004 } else { base * behind + mane * behind };
+            v.fur = if !bare_face {
+                base + mane * behind
+            } else if f > 0.55 {
+                0.004
+            } else {
+                base * behind + mane * behind
+            };
         }
     } else if maned && slot == Slot::Torso as usize {
         // the front of the chest and shoulders
@@ -472,7 +481,7 @@ mod tests {
         let longest = |def: &crate::gods::GodDef, slot: Slot| {
             let rigged = crate::models::build_god_rigged(def, crate::consts::Team::Blue);
             let mut m = smooth(&rigged.meshes[slot as usize], crate::models::GOD_DRAW_VOXEL, 2);
-            fur_for_part(def, slot as usize, &mut m);
+            fur_for_part(def, slot as usize, &mut m, false);
             m.verts.iter().map(|v| v.fur).fold(0.0f32, f32::max)
         };
         let find = |n: &str| crate::gods::ROSTER.iter().find(|d| d.name == n).unwrap();

@@ -101,7 +101,34 @@ struct SmoothGpu {
 }
 
 /// Bytes in the smooth pipeline's `Lights` uniform (smooth.wgsl).
-const LIGHTS_BYTES: u64 = 16 + 16 * 8 + 16 * 8 + 16 * 32;
+const LIGHTS_BYTES: u64 = 16 + 16 * 8 + 16 * 8 + 16 * 32 + 16;
+
+/// How the ultra preview's fur is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FurStyle {
+    /// Flat square strands standing straight out (the default: the look
+    /// the player liked best -- 10 shells, 55 cells a unit).
+    Tape,
+    /// Chunky tapered locks combed toward the tail, two-tone (7 shells,
+    /// 24 cells a unit). `CLAWBOUND_FUR=locks`.
+    Locks,
+}
+
+impl FurStyle {
+    pub fn from_env() -> FurStyle {
+        match std::env::var("CLAWBOUND_FUR").ok().as_deref() {
+            Some("locks") => FurStyle::Locks,
+            _ => FurStyle::Tape,
+        }
+    }
+    /// (shells, cells per unit)
+    pub fn shells_density(self) -> (u32, f32) {
+        match self {
+            FurStyle::Tape => (10, 55.0),
+            FurStyle::Locks => (7, 24.0),
+        }
+    }
+}
 
 pub struct GpuMesh {
     buf: wgpu::Buffer,
@@ -254,6 +281,8 @@ pub struct Renderer {
     pub occluders: Vec<[f32; 4]>,
     /// The ultra post effects: wet ground as a mirror, sky-occluded god rays.
     pub ultra_post: bool,
+    /// The fur's look (shells and density follow it: `set_fur_style`).
+    pub fur_style: FurStyle,
     /// Fur shells per smooth draw, and strands per unit of model space.
     pub fur_shells: u32,
     pub fur_density: f32,
@@ -826,10 +855,10 @@ impl Renderer {
             shadow_only: Vec::new(),
             lights: Vec::new(),
             occluders: Vec::new(),
-            // stylized locks: few shells, chunky cells (smooth.wgsl)
             ultra_post: false,
-            fur_shells: 7,
-            fur_density: 24.0,
+            fur_style: FurStyle::from_env(),
+            fur_shells: FurStyle::from_env().shells_density().0,
+            fur_density: FurStyle::from_env().shells_density().1,
             camera: Camera { eye: Vec3::ZERO, target: Vec3::Y, fov_y: 1.05 },
             time: 0.0,
             exposure: 0.92,
@@ -991,6 +1020,11 @@ impl Renderer {
             *slot = *b;
         }
         out
+    }
+
+    pub fn set_fur_style(&mut self, s: FurStyle) {
+        self.fur_style = s;
+        (self.fur_shells, self.fur_density) = s.shells_density();
     }
 
     /// Upload a smooth mesh (ultra preview); ids share the voxel meshes'
@@ -1210,6 +1244,7 @@ impl Renderer {
             for (k, o) in self.occluders.iter().take(32).enumerate() {
                 l[68 + k * 4..72 + k * 4].copy_from_slice(o);
             }
+            l[196] = (self.fur_style == FurStyle::Locks) as u32 as f32;
             self.queue.write_buffer(&self.lights_buf, 0, bytemuck::cast_slice(&l));
         }
 
