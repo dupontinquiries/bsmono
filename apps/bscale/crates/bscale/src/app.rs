@@ -511,6 +511,16 @@ impl Shell {
     }
 
     fn start(&mut self, analyze_only: bool) {
+        // A chosen model that cannot run is refused here, with the file and
+        // the reason, rather than failing later at the config stage.
+        let refused = [("model", self.model_key.as_deref()), ("cascade model", self.cascade_key.as_deref())]
+            .into_iter()
+            .find_map(|(what, key)| d2x_core::registry::refusal(&self.catalogue, key)
+                .map(|why| format!("{what}: {why} -- choose another in the picker")));
+        if let Some(msg) = refused {
+            self.push_log(LogLevel::Error, msg);
+            return;
+        }
         let mut job = self.job.clone();
         job.input = self.input.trim().into();
         job.output = self.output.trim().into();

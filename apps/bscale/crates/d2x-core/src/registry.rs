@@ -253,17 +253,58 @@ pub fn ladder(models: &[ModelInfo], scale: u32) -> Option<(&ModelInfo, &ModelInf
 /// Restore a selection by identity after a rescan; falls back to the cheapest
 /// usable model. Index-based restoration is the bug logscope documented.
 pub fn select_by_key<'a>(models: &'a [ModelInfo], key: Option<&str>) -> Option<&'a ModelInfo> {
+    // Restore only a USABLE model. A scan keeps broken entries on purpose (a
+    // folder with a bad file should say so), so the saved key can name one --
+    // e.g. after pointing the models dir at ~/models, where the only .json was
+    // another program's config -- and restoring it handed the job a file that
+    // then failed at "model json: expected a top-level array of layers".
     if let Some(k) = key {
-        if let Some(m) = models.iter().find(|m| m.key() == k) {
+        if let Some(m) = models.iter().find(|m| m.key() == k && m.status.usable()) {
             return Some(m);
         }
     }
     models.iter().find(|m| m.status.usable())
 }
 
+/// Why the model `key` names cannot run, or None if it can (or none is
+/// chosen). What a job start says instead of failing at the config stage.
+pub fn refusal(models: &[ModelInfo], key: Option<&str>) -> Option<String> {
+    let k = key?;
+    let m = models.iter().find(|m| m.key() == k)?;
+    if m.status.usable() {
+        return None;
+    }
+    Some(format!("{} is not a model this can run ({})", m.path.display(), m.status.detail().unwrap_or("unusable")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ~/models as reported: a language model's config.json beside nothing
+    /// bscale can run. Kept in the list (as unusable), never restored, and a
+    /// start that still names it is refused with the reason.
+    #[test]
+    fn a_stray_json_is_listed_but_never_restored_or_run() {
+        let dir = std::env::temp_dir().join(format!("d2x-stray-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("qwen")).unwrap();
+        let stray = dir.join("qwen/config.json");
+        std::fs::write(&stray, r#"{"model_type":"qwen3","hidden_size":4096}"#).unwrap();
+        let mut found = scan(&dir, true);
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].status.usable(), "listed as unusable, not hidden");
+        let key = found[0].key();
+        assert!(select_by_key(&found, Some(&key)).is_none(), "an unusable model is never restored");
+        let why = refusal(&found, Some(&key)).expect("a start naming it is refused");
+        assert!(why.contains("config.json"), "{why}");
+        // Beside real models, the saved key falls back to a usable one.
+        found.extend(scan(&models_dir(), true));
+        let pick = select_by_key(&found, Some(&key)).expect("a usable model");
+        assert!(pick.status.usable() && pick.key() != key);
+        assert!(refusal(&found, Some(&pick.key())).is_none());
+        assert!(refusal(&found, None).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn models_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models")
