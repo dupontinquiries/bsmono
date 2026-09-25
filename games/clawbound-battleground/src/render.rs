@@ -356,6 +356,16 @@ impl Renderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: true,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -654,7 +664,9 @@ impl Renderer {
 
         let post_params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("post params"),
-            size: 48 + 16 * crate::groundfx::MAX_RINGS as u64,
+            // 3 vec4, view-proj, its inverse, the camera, and per blast a
+            // world centre+radius and a strength+thickness
+            size: 48 + 64 * 2 + 16 + 32 * crate::groundfx::MAX_RINGS as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -831,14 +843,16 @@ impl Renderer {
             sample_count: 4,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // sampled by the post pass: blast fronts are occluded by what
+            // stands in front of them (post.wgsl)
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let depth_view = depth_tex.create_view(&Default::default());
         self.hdr_msaa = Some((msaa_tex, msaa_view));
         self.hdr_resolve = Some((resolve_tex, resolve_view));
         self.depth = Some((depth_tex, depth_view));
-        if let Some((_, rview)) = &self.hdr_resolve {
+        if let (Some((_, rview)), Some((_, dview))) = (&self.hdr_resolve, &self.depth) {
             self.post_bind = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("post bind"),
                 layout: &self.post_bgl,
@@ -846,6 +860,7 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(rview) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
                     wgpu::BindGroupEntry { binding: 2, resource: self.post_params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(dview) },
                 ],
             }));
         }
@@ -996,8 +1011,8 @@ impl Renderer {
                 } else {
                     ([0.5, 0.5], 0.0)
                 };
-                let cam_right = (cam.target - cam.eye).cross(Vec3::Y);
-                let rings = crate::groundfx::screen_rings(&self.blast_a, &self.blast_b, vp, cam_right, aspect);
+                let (shell_a, shell_b) = crate::groundfx::shell_blasts(&self.blast_a, &self.blast_b);
+                let _ = aspect;
                 post_data.clear();
                 post_data.extend_from_slice(&[
                     self.exposure * (1.0 + atm.night * 0.35),
@@ -1014,7 +1029,13 @@ impl Renderer {
                     ray,
                     0.22,
                 ]);
-                for r in rings {
+                post_data.extend_from_slice(&vp.to_cols_array());
+                post_data.extend_from_slice(&vp.inverse().to_cols_array());
+                post_data.extend_from_slice(&[cam.eye.x, cam.eye.y, cam.eye.z, 0.0]);
+                for r in shell_a {
+                    post_data.extend_from_slice(&r);
+                }
+                for r in shell_b {
                     post_data.extend_from_slice(&r);
                 }
                 bytemuck::cast_slice(&post_data)
