@@ -106,7 +106,14 @@ the single highest-value thing anyone can do with this repo next.
   for leap chains, sight lines and camps; (4) derive `KINDS` and build_world's
   mesh match from one table so they cannot drift.
 
-- **Lockstep: the rule exists, the wire does not.** `lockstep.rs` proves the
+- **Netplay: the wire exists, the game does not use it yet.** `netplay.rs`
+  carries lockstep inputs (redundant windows, adaptive delay, time
+  dilation, checksums), measured by `examples/netbench` against a naive
+  stack and tested over real UDP on loopback. NOT done: the LAN lobby's
+  START (fix the slot order, hand both games the socket and a Session), a
+  "waiting for ..." overlay, and a match between two real machines.
+  Everything below about cross-architecture determinism still stands.
+- **Lockstep: the rule exists, the wire does not.** (superseded above) `lockstep.rs` proves the
   sim deterministic (1800 ticks, bit-identical) and implements
   advance-only-when-complete with stall, input delay and a desync checksum.
   Next: carry `Input` over the den's socket, a "waiting for ..." overlay, and

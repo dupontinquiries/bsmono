@@ -42,6 +42,8 @@ pub mod going;
 pub mod lanlobby;
 /// Input-only lockstep: the rule that lets two machines play one match.
 pub mod lockstep;
+/// The lockstep wire: redundant inputs, adaptive delay, time dilation, a network simulator.
+pub mod netplay;
 /// Oriented capsule hit tests for the cats.
 pub mod hitbox;
 /// The river crossings: fallen logs that can be worked loose and roll.

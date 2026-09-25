@@ -889,3 +889,57 @@ fn the_audio_engine_voices_a_cast_end_to_end() {
     assert!(place(&far, p, Vec3::X).is_none());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The netplay stack over REAL UDP sockets (loopback): two sessions, two
+/// games, real time. They stay in sync, keep advancing, and settle on the
+/// minimum input delay, as on a LAN.
+#[test]
+fn netplay_over_real_udp_sockets_stays_in_sync_at_minimum_delay() {
+    use clawbound::lockstep::Input;
+    use clawbound::netplay::{Packet, Session, Tuning};
+    use std::net::UdpSocket;
+    let socks = [UdpSocket::bind("127.0.0.1:0").unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap()];
+    for s in &socks {
+        s.set_nonblocking(true).unwrap();
+    }
+    let addr = [socks[0].local_addr().unwrap(), socks[1].local_addr().unwrap()];
+    let mut games = [Game::new_teams(&[0], &[1]), Game::new_teams(&[0], &[1])];
+    for g in games.iter_mut() {
+        for god in g.gods.iter_mut() {
+            god.ai = None;
+        }
+    }
+    let mut sess = [Session::new(0, 2, Tuning::TUNED), Session::new(1, 2, Tuning::TUNED)];
+    let t0 = std::time::Instant::now();
+    let mut next = [0.0f64, 0.004];
+    let mut buf = [0u8; 1500];
+    while t0.elapsed().as_secs_f64() < 2.5 {
+        let now_ms = (t0.elapsed().as_secs_f64() * 1000.0) as u32;
+        for m in 0..2 {
+            while let Ok((n, _)) = socks[m].recv_from(&mut buf) {
+                if let Some(p) = Packet::decode(&buf[..n]) {
+                    sess[m].receive(&p, now_ms);
+                }
+            }
+            if t0.elapsed().as_secs_f64() < next[m] {
+                continue;
+            }
+            next[m] += 1.0 / 60.0;
+            if sess[m].ready() {
+                let tick = sess[m].lockstep.tick;
+                let inp = Input { mv: [(((tick * 7 + m as u32 * 3) % 200) as i32 - 100) as i8, 40], attack: tick % 5 == 0, ..Default::default() };
+                sess[m].stamp(inp, tick % 30 == 0, now_ms);
+                sess[m].step(&mut games[m], 1.0 / 60.0, now_ms);
+            }
+            for p in sess[m].packets_for(1 - m, now_ms) {
+                socks[m].send_to(&p.encode(), addr[1 - m]).unwrap();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_micros(500));
+    }
+    let ticks = [sess[0].lockstep.tick, sess[1].lockstep.tick];
+    assert!(ticks[0] > 100 && ticks[1] > 100, "did not keep advancing: {ticks:?}");
+    assert!(sess[0].stats.desync.is_none() && sess[1].stats.desync.is_none(), "desync");
+    assert_eq!([sess[0].delay(), sess[1].delay()], [1, 1], "loopback should settle on 1 tick; rtt {:?}", sess[0].rtt);
+    assert!(sess[0].rtt.samples > 50, "no round trips measured");
+}
