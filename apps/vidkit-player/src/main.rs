@@ -35,6 +35,8 @@ mod enhance_plan;
 mod decode;
 mod export;
 mod media_cache;
+/// One loaded transcription model, handed from worker to worker.
+mod model_pool;
 mod seen;
 mod transcribe;
 mod io;
@@ -526,6 +528,8 @@ impl eframe::App for Player {
 
     #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
+        // A whisper model nobody has borrowed for two minutes is let go.
+        transcribe::trim_idle_model();
         stats_tick(ctx);
         self.profile_frame();
         stats_note(if ctx.current_pass_index() > 0 { "pass>0" } else { "pass0" });

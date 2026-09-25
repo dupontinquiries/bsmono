@@ -350,13 +350,29 @@ pub fn fetch_text(url: &str, headers: &[(String, String)]) -> Result<String, Str
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
+/// The loaded whisper model, shared by workers (model_pool): the stream's
+/// worker hands it to the file's worker when a download finishes, instead of
+/// the second one loading its own.
+#[cfg(feature = "whisper")]
+static WHISPER: crate::model_pool::Pool = crate::model_pool::Pool::new();
+
 #[cfg(feature = "whisper")]
 fn whisper_source() -> Result<Box<dyn CueSource>, String> {
     // All but one core: the playback decoder keeps one, and whisper past
     // the big cores gets slower rather than faster on a phone.
     let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
     let threads = (n.saturating_sub(1)).clamp(1, 4) as i32;
-    vidkit_transcribe::whisper::WhisperSource::from_store(threads).map(|s| Box::new(s) as Box<dyn CueSource>)
+    // Up to 20 s for a worker still mid-chunk to hand it over: a CPU whisper
+    // chunk takes seconds, a fresh load about as long and twice the memory.
+    WHISPER.take_or(std::time::Duration::from_secs(20), || {
+        vidkit_transcribe::whisper::WhisperSource::from_store(threads).map(|s| Box::new(s) as Box<dyn CueSource>)
+    })
+}
+
+/// Let go of a whisper model nobody has used for two minutes (the UI loop).
+pub fn trim_idle_model() {
+    #[cfg(feature = "whisper")]
+    WHISPER.trim(std::time::Duration::from_secs(120));
 }
 
 #[cfg(not(feature = "whisper"))]
