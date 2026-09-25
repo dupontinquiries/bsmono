@@ -50,7 +50,11 @@ impl Decode for ImageDecode {
         // Upright: phones store the pixels as the sensor saw them and the turn in
         // EXIF, which image 0.24 does not apply -- so portrait shots came out
         // sideways. Applied to the small image, where turning is cheap.
-        let small = orient(img.thumbnail(max_side, max_side), exif_orientation(&bytes)).to_rgba8();
+        // Shrink only: image 0.24's thumbnail() also ENLARGES a smaller picture to
+        // fill the box (a 600x400 photo came back 2048x1365 for the viewer) --
+        // memory spent on no extra detail.
+        let fitted = if img.width().max(img.height()) > max_side { img.thumbnail(max_side, max_side) } else { img };
+        let small = orient(fitted, exif_orientation(&bytes)).to_rgba8();
         let (w, h) = small.dimensions();
         Ok(Thumb { w, h, rgba: small.into_raw() })
     }

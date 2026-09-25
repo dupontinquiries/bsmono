@@ -57,6 +57,21 @@ pub struct App {
     pub thumbs: Option<thumbs::Thumbs>,
     /// Uploaded thumbnails by path; entries leave when `thumbs` evicts them.
     pub textures: std::collections::HashMap<String, egui::TextureHandle>,
+    /// The photo open in the full-size viewer (double-click a tile).
+    pub viewing: Option<String>,
+    /// Large decodes for the viewer: the same engine as `thumbs`, its own small
+    /// budget, so it never competes with the grid's cache.
+    pub full: Option<thumbs::Thumbs>,
+    /// The viewer's current large picture, by path.
+    pub full_tex: Option<(String, egui::TextureHandle)>,
+}
+
+/// The photo `delta` steps from `current` in `order`, clamped at the ends;
+/// None if `current` is not in it.
+pub fn step(order: &[String], current: &str, delta: i32) -> Option<String> {
+    let i = order.iter().position(|p| p == current)? as i64;
+    let j = (i + delta as i64).clamp(0, order.len() as i64 - 1) as usize;
+    Some(order[j].clone())
 }
 
 impl App {
@@ -76,7 +91,10 @@ impl App {
             status: String::new(),
             settings: settings::Settings::default(),
             thumbs: None,
-            textures: std::collections::HashMap::new()
+            textures: std::collections::HashMap::new(),
+            viewing: None,
+            full: None,
+            full_tex: None
         }
     }
 

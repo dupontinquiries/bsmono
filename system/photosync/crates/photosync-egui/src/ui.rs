@@ -16,6 +16,10 @@ use photosync::gallery_grid;
 
 pub fn draw(app: &mut App, ctx: &Context) {
     sync_thumbnails(app, ctx);
+    if app.viewing.is_some() {
+        viewer(app, ctx);
+        return;
+    }
     let colors = uikit_egui::apply_palette(ctx, snapclone_theme::palette_by_id("minimal"));
     app.backdrop.paint(ctx, &colors);
 
@@ -197,6 +201,7 @@ fn gallery(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors)
     let width = ui.available_width() - 32.0;
     let target = app.tile_target;
     let mut toggled: Option<String> = None;
+    let mut open: Option<String> = None;
 
     ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         ui.add_space(8.0);
@@ -232,7 +237,13 @@ fn gallery(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors)
                     // texture once it has been uploaded.
                     if let Some(t) = &app.thumbs { let _ = t.get(&item.path); }
                     let thumb = app.textures.get(&item.path).map(|h| (h.id(), h.size_vec2()));
-                    if paint_tile(ui, cell_rect, item, thumb, app.selected.contains(&item.path), colors, app.settings.thumb_style) {
+                    let hit = paint_tile(ui, cell_rect, item, thumb, app.selected.contains(&item.path), colors, app.settings.thumb_style);
+                    if hit.double_clicked() {
+                        // Open it. The double-click's FIRST click already toggled
+                        // the selection; toggling again leaves it as it was.
+                        open = Some(item.path.clone());
+                        toggled = Some(item.path.clone());
+                    } else if hit.clicked() {
                         toggled = Some(item.path.clone());
                     }
                 }
@@ -241,6 +252,9 @@ fn gallery(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors)
         }
     });
 
+    if let Some(path) = open {
+        app.viewing = Some(path);
+    }
     if let Some(path) = toggled {
         if !app.selected.remove(&path) {
             app.selected.insert(path);
@@ -262,7 +276,7 @@ fn paint_tile(
     selected: bool,
     colors: &uikit_egui::PaletteColors,
     style: crate::settings::ThumbStyle,
-) -> bool {
+) -> egui::Response {
     let resp = ui.interact(rect, ui.id().with(("tile", &item.path)), Sense::click());
     let painter = ui.painter();
 
@@ -339,7 +353,7 @@ fn paint_tile(
         painter.text(center, egui::Align2::CENTER_CENTER, "✓", egui::FontId::proportional(11.0), Color32::WHITE);
     }
 
-    resp.clicked()
+    resp
 }
 
 /// The Settings tab. A plain scrolling page reached from the rail, the same
@@ -455,6 +469,68 @@ fn sync_thumbnails(app: &mut App, ctx: &Context) {
     }
 }
 
+/// The full-size viewer: the photo fitted to the window (never cropped), the
+/// large decode when it has arrived and the grid's thumbnail scaled up until
+/// then, Left/Right through the library in the grid's order, Esc or the close
+/// button back to the grid.
+fn viewer(app: &mut App, ctx: &Context) {
+    let Some(path) = app.viewing.clone() else { return };
+    if app.full.is_none() {
+        let repaint = ctx.clone();
+        app.full = Some(crate::thumbs::Thumbs::new(std::sync::Arc::new(crate::thumbs::ImageDecode), 1, FULL_SIDE,
+            FULL_BUDGET_BYTES, 2, Some(std::sync::Arc::new(move || repaint.request_repaint()))));
+    }
+    if let Some(f) = &app.full {
+        let _ = f.get(&path);
+        for (p, img) in f.take_fresh() {
+            if p == path {
+                let ci = egui::ColorImage::from_rgba_unmultiplied([img.w as usize, img.h as usize], &img.rgba);
+                app.full_tex = Some((p.clone(), ctx.load_texture(format!("full:{p}"), ci, egui::TextureOptions::LINEAR)));
+            }
+        }
+    }
+    let order: Vec<String> = app.library.by_day().into_iter().flat_map(|(_, items)| items.into_iter().map(|i| i.path.clone())).collect();
+    let (esc, left, right) = ctx.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight)));
+    let mut close = esc;
+    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::from_black_alpha(245))).show(ctx, |ui| {
+        let area = ui.max_rect();
+        let tex = match &app.full_tex {
+            Some((p, t)) if *p == path => Some((t.id(), t.size_vec2())),
+            _ => app.textures.get(&path).map(|t| (t.id(), t.size_vec2())),
+        };
+        match tex {
+            Some((id, size)) => {
+                let fit = (area.width() / size.x).min(area.height() / size.y);
+                let r = Rect::from_center_size(area.center(), size * fit);
+                ui.painter().image(id, r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            }
+            None => {
+                ui.painter().text(area.center(), egui::Align2::CENTER_CENTER, "loading…", egui::FontId::proportional(16.0), Color32::GRAY);
+            }
+        }
+        let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        ui.painter().text(area.left_top() + Vec2::new(16.0, 14.0), egui::Align2::LEFT_TOP, name, egui::FontId::proportional(14.0), Color32::from_gray(210));
+        let close_rect = Rect::from_min_size(area.right_top() + Vec2::new(-52.0, 8.0), Vec2::splat(44.0));
+        if ui.put(close_rect, egui::Button::new("✕").frame(false)).on_hover_text("Back to the grid (Esc)").clicked() {
+            close = true;
+        }
+    });
+    if close {
+        app.viewing = None;
+        app.full_tex = None;
+    } else if left || right {
+        if let Some(next) = crate::step(&order, &path, if right { 1 } else { -1 }) {
+            app.viewing = Some(next);
+        }
+    }
+}
+
+/// Long side of the viewer's decode: sharp on a large window, not the camera's
+/// full 12+ MP (that would be a ~50 MB texture for one photo).
+const FULL_SIDE: u32 = 2048;
+/// The viewer holds the photo on screen and its neighbours' leftovers.
+const FULL_BUDGET_BYTES: usize = 64 << 20;
+
 /// Decoder threads: the UI keeps a core, and a phone has few.
 const THUMB_THREADS: usize = 2;
 /// Long side in px: a cell is ~168 pt, so this is sharp at 1.5x.
@@ -532,6 +608,43 @@ mod draw_tests {
             let s = tex.size();
             assert!(s[0].max(s[1]) <= THUMB_SIDE as usize && s[0].max(s[1]) > 0, "{path}: {s:?}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The viewer, through the real frame function: opened on a photo, the
+    /// large decode arrives at the picture's own size (it is under FULL_SIDE),
+    /// the arrow keys step in the grid's order, Escape closes.
+    #[test]
+    fn the_viewer_shows_the_photo_large_steps_and_closes() {
+        let dir = std::env::temp_dir().join(format!("photosync-view-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut items = Vec::new();
+        for i in 0..3 {
+            let p = dir.join(format!("v{i}.png"));
+            image::RgbaImage::from_pixel(600, 400, image::Rgba([30 * i as u8, 90, 160, 255])).save(&p).unwrap();
+            items.push(photosync::album::Item { path: p.to_string_lossy().into(), taken_at: 1_726_000_000 + i as i64 * 60,
+                thumbnail: None, bytes: 1, metadata_json: None });
+        }
+        let mut app = App::new(photosync::album::Library::new(items));
+        let order: Vec<String> = app.library.by_day().into_iter().flat_map(|(_, v)| v.into_iter().map(|i| i.path.clone())).collect();
+        app.viewing = Some(order[1].clone());
+        let ctx = egui::Context::default();
+        let screen = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1040.0, 720.0)));
+        let key = |k| egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        let start = std::time::Instant::now();
+        while app.full_tex.as_ref().map(|(p, _)| p != &order[1]).unwrap_or(true) {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10), "the large decode never arrived");
+            let _ = ctx.run(egui::RawInput { screen_rect: screen, ..Default::default() }, |ctx| draw(&mut app, ctx));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.full_tex.as_ref().unwrap().1.size(), [600, 400], "full size, not the thumbnail");
+        let _ = ctx.run(egui::RawInput { screen_rect: screen, events: vec![key(egui::Key::ArrowRight)], ..Default::default() }, |ctx| draw(&mut app, ctx));
+        assert_eq!(app.viewing.as_deref(), Some(order[2].as_str()));
+        let _ = ctx.run(egui::RawInput { screen_rect: screen, events: vec![key(egui::Key::ArrowRight)], ..Default::default() }, |ctx| draw(&mut app, ctx));
+        assert_eq!(app.viewing.as_deref(), Some(order[2].as_str()), "clamped at the end");
+        let _ = ctx.run(egui::RawInput { screen_rect: screen, events: vec![key(egui::Key::Escape)], ..Default::default() }, |ctx| draw(&mut app, ctx));
+        assert_eq!(app.viewing, None);
+        assert_eq!(crate::step(&order, "missing", 1), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
