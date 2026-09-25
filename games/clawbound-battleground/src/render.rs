@@ -811,8 +811,9 @@ impl Renderer {
             shadow_only: Vec::new(),
             lights: Vec::new(),
             occluders: Vec::new(),
-            fur_shells: 10,
-            fur_density: 95.0,
+            // stylized locks: few shells, chunky cells (smooth.wgsl)
+            fur_shells: 7,
+            fur_density: 24.0,
             camera: Camera { eye: Vec3::ZERO, target: Vec3::Y, fov_y: 1.05 },
             time: 0.0,
             exposure: 0.92,

@@ -1632,6 +1632,9 @@ pub fn run_ultra_shots() -> Result<(), String> {
     println!("saved ultra_2b_lit_no_occluders.png");
     vfx.glows.clear();
     shoot(&mut renderer, &scene, &mut vfx, "ultra_3_mane.png", close)?;
+    scene.ultra = false;
+    shoot(&mut renderer, &scene, &mut vfx, "ultra_3b_mane_voxel.png", close)?;
+    scene.ultra = true;
     // what it costs: the wide frame, voxel against ultra, best of 4
     for ultra in [false, true] {
         scene.ultra = ultra;

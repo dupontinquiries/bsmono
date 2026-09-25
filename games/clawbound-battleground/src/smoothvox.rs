@@ -17,6 +17,10 @@ use std::collections::HashMap;
 
 use crate::voxel::VoxelMesh;
 
+/// How far (in luminance) a voxel must stand out from its neighbours to be
+/// a feature -- an eye, a nose, a stripe -- that keeps its colour and shape.
+pub const FEATURE_CONTRAST: f32 = 0.22;
+
 /// One vertex of a smooth mesh (matches the smooth pipeline's layout).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -120,6 +124,9 @@ pub fn smooth(mesh: &VoxelMesh, voxel: f32, iterations: usize) -> SmoothMesh {
     // surface nets: a vertex per cell of 8 samples with both solid and air
     let mut vert_of: HashMap<(usize, usize, usize), u32> = HashMap::new();
     let mut pos: Vec<[f32; 3]> = Vec::new();
+    // vertices on a feature (see below): smoothed only a little, so an eye
+    // keeps its shape
+    let mut feature: Vec<bool> = Vec::new();
     let mut col: Vec<[f32; 4]> = Vec::new();
     for z in 0..dims[2] - 1 {
         for y in 0..dims[1] - 1 {
@@ -144,6 +151,7 @@ pub fn smooth(mesh: &VoxelMesh, voxel: f32, iterations: usize) -> SmoothMesh {
                 }
                 let mut c = [0.0f32; 4];
                 let mut kc = 0.0;
+                let mut solid_cols: Vec<[f32; 4]> = Vec::with_capacity(8);
                 for (j, (a, b, cz)) in corners.iter().enumerate() {
                     if s[j] {
                         let cc = color[idx(x + a, y + b, z + cz)];
@@ -151,8 +159,20 @@ pub fn smooth(mesh: &VoxelMesh, voxel: f32, iterations: usize) -> SmoothMesh {
                             c[t] += cc[t];
                         }
                         kc += 1.0;
+                        solid_cols.push(cc);
                     }
                 }
+                // A feature -- an eye, a nose, a stripe: one voxel standing out
+                // from those round it -- keeps its colour instead of being
+                // averaged into the fur (the first close-up had no eyes).
+                let lum = |c: [f32; 4]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+                let mean_l = lum([c[0] / kc, c[1] / kc, c[2] / kc, 1.0]);
+                let standout = solid_cols.iter().copied().max_by(|a, b| (lum(*a) - mean_l).abs().partial_cmp(&(lum(*b) - mean_l).abs()).unwrap());
+                let is_feature = standout.is_some_and(|f| (lum(f) - mean_l).abs() > FEATURE_CONTRAST);
+                if let (true, Some(f)) = (is_feature, standout) {
+                    c = [f[0] * kc, f[1] * kc, f[2] * kc, f[3] * kc];
+                }
+                feature.push(is_feature);
                 vert_of.insert((x, y, z), pos.len() as u32);
                 // sample (x,y,z) sits at the voxel centre of cell (x-pad+lo)
                 let world = |a: usize, v: f32, axis: usize| ((a as i32 - pad + lo[axis]) as f32 + 0.5 + v) * voxel;
@@ -223,8 +243,9 @@ pub fn smooth(mesh: &VoxelMesh, voxel: f32, iterations: usize) -> SmoothMesh {
                     m[a] += prev[j as usize][a];
                 }
             }
+            let w = if feature[i] { 0.12 } else { 0.5 };
             for a in 0..3 {
-                pos[i][a] = prev[i][a] * 0.5 + m[a] / ns.len() as f32 * 0.5;
+                pos[i][a] = prev[i][a] * (1.0 - w) + m[a] / ns.len() as f32 * w;
             }
         }
     }
@@ -290,9 +311,16 @@ pub fn fur_for_part(def: &crate::gods::GodDef, slot: usize, m: &mut SmoothMesh) 
     if slot == Slot::Tail3 as usize {
         // the brush: longest toward the free end (the tail runs away, -z)
         set_fur(m, base, 0.06, |p| 1.0 - (p.z - lo.z) / span_z);
-    } else if maned && slot == Slot::Head as usize {
-        // round the back of the head and the neck, not the face
-        set_fur(m, base, 0.13, |p| 1.0 - ((p.z - lo.z) / span_z - 0.1) / 0.5);
+    } else if slot == Slot::Head as usize {
+        // The face is BARE -- a cat's face fur is short and sleek -- and a
+        // mane frames it from behind. Fur over the whole head buried the
+        // eyes and made a featureless mask (the first close-up).
+        let mane = if maned { 0.13 } else { 0.0 };
+        for v in m.verts.iter_mut() {
+            let f = (v.pos[2] - lo.z) / span_z; // 0 back .. 1 face
+            let behind = (1.0 - (f - 0.1) / 0.45).clamp(0.0, 1.0);
+            v.fur = if f > 0.55 { 0.004 } else { base * behind + mane * behind };
+        }
     } else if maned && slot == Slot::Torso as usize {
         // the front of the chest and shoulders
         set_fur(m, base, 0.09, |p| ((p.z - lo.z) / span_z - 0.65) / 0.25);
