@@ -454,6 +454,11 @@ pub mod output {
     pub struct Ambience {
         _stream: cpal::Stream,
         pub params: Arc<Mutex<AudioParams>>,
+        /// Loaded clips (music, sfx, voices) go to the callback through this.
+        pub mixer: crate::mixer::MixerHandle,
+        pub sample_rate: u32,
+        /// The fixed buffer asked for (frames), if the device offered a range.
+        pub buffer_frames: Option<u32>,
     }
 
     impl Ambience {
@@ -476,7 +481,18 @@ pub mod output {
                 }
             };
             let sample_format = cfg.sample_format();
-            let config: cpal::StreamConfig = cfg.into();
+            // A small fixed buffer when the device allows one: the time from
+            // a cue to its sound is at most one buffer. The default on ALSA /
+            // Pulse can be 1024-4096 frames (20-90 ms).
+            let buffer_frames = match cfg.buffer_size() {
+                cpal::SupportedBufferSize::Range { min, max } => Some(super::pick_buffer(*min, *max)),
+                cpal::SupportedBufferSize::Unknown => None,
+            };
+            let mut config: cpal::StreamConfig = cfg.into();
+            if let Some(n) = buffer_frames {
+                config.buffer_size = cpal::BufferSize::Fixed(n);
+            }
+            let (mixer_handle, mut mixer) = crate::mixer::new();
             let channels = config.channels as usize;
             let sr = config.sample_rate.0 as f32;
             let params = Arc::new(Mutex::new(AudioParams::default()));
@@ -493,6 +509,7 @@ pub mod output {
                             snapshot = *p;
                         }
                         synth.render(&snapshot, data, channels);
+                        mixer.render_add(data, channels);
                     },
                     err_fn,
                     None,
@@ -507,6 +524,7 @@ pub mod output {
                             }
                             scratch.resize(data.len(), 0.0);
                             synth.render(&snapshot, &mut scratch, channels);
+                            mixer.render_add(&mut scratch, channels);
                             for (o, s) in data.iter_mut().zip(scratch.iter()) {
                                 *o = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                             }
@@ -532,7 +550,7 @@ pub mod output {
                 return None;
             }
             eprintln!("[clawbound] audio: {sr} Hz, {channels} ch, {sample_format:?}");
-            Some(Ambience { _stream: stream, params })
+            Some(Ambience { _stream: stream, params, mixer: mixer_handle, sample_rate: sr as u32, buffer_frames })
         }
 
         pub fn set(&self, p: AudioParams) {
@@ -541,6 +559,12 @@ pub mod output {
             }
         }
     }
+}
+
+/// The fixed audio buffer to ask a device for, in frames, given the range
+/// it supports: 256 (~5 ms at 48 kHz) where allowed, else the nearest end.
+pub fn pick_buffer(min: u32, max: u32) -> u32 {
+    256u32.clamp(min.max(1), max.max(min.max(1)))
 }
 
 /// Seconds the ambience takes to fade to silence when a match ends.
@@ -737,5 +761,16 @@ mod fade_tests {
             w.render(&p, &mut out, 2);
         }
         assert!(out.iter().all(|x| x.abs() < 1e-6), "wind audible at master 0");
+    }
+}
+
+#[cfg(test)]
+mod buffer_tests {
+    #[test]
+    fn the_buffer_is_small_where_the_device_allows() {
+        assert_eq!(super::pick_buffer(64, 8192), 256);
+        assert_eq!(super::pick_buffer(512, 8192), 512, "the device's floor wins");
+        assert_eq!(super::pick_buffer(16, 128), 128);
+        assert_eq!(super::pick_buffer(0, 0), 1);
     }
 }

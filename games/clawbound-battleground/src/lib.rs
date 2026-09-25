@@ -26,6 +26,12 @@ pub mod intro;
 pub mod spectator;
 /// The intro's fanfare, synthesized brass.
 pub mod brass;
+/// Loaded clips played in the audio callback: realtime-safe, three buses, ducking.
+pub mod mixer;
+/// Music, sfx and voices loaded from .opus/.wav in the background.
+pub mod soundbank;
+/// Which sounds a game event asks for; placement; voice gating.
+pub mod cues;
 /// Twinfang Pass: the mountain canyon map, 15 a side.
 pub mod pass;
 /// The pass's world: where its rocks, scrub, pines and waterfalls stand.

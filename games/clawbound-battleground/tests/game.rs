@@ -806,3 +806,86 @@ fn movement_faces_within_the_view_cone_and_casts_hold_the_cat() {
     assert_eq!(facing_yaw(Vec3::X, Vec3::ZERO), 0.0, "no view (a bot): face the move");
     assert!(BACKPEDAL > FACE_CONE);
 }
+
+/// The audio engine end to end, everything but the device: a real match, a
+/// cat casting; its events through the cues; a folder of real .opus/.wav
+/// files loaded in the background; the mixer rendering. The cat's own voice
+/// line plays; with no specific cast sound on disk the generic one fills
+/// in; and a cat far from the listener is not heard speaking.
+#[test]
+fn the_audio_engine_voices_a_cast_end_to_end() {
+    use clawbound::cues::{cues_for, place, VoiceGate};
+    use clawbound::mixer::{self, Play};
+    use clawbound::soundbank::{Bank, Loader};
+    use glam::Vec3;
+    let dir = std::env::temp_dir().join(format!("cb_e2e_audio_{}", std::process::id()));
+    let mut game = Game::new_teams(&[0], &[1]);
+    let a = clawbound::cues::ancestor_key(&game, 0);
+    std::fs::create_dir_all(dir.join(format!("voice/{a}"))).unwrap();
+    std::fs::create_dir_all(dir.join("sfx")).unwrap();
+    // a voice line: a 440 Hz tone, as Opus; a generic cast sound, as WAV
+    let tone: Vec<f32> = (0..24_000).map(|i| (i as f32 / 48_000.0 * 440.0 * std::f32::consts::TAU).sin() * 0.5).collect();
+    {
+        use opus_pure::{Application, OggOpusWriter, OpusEncoder, OpusHead, MAX_PACKET_BYTES};
+        let mut enc = OpusEncoder::new(48_000, 1, Application::Voip).unwrap();
+        let head = OpusHead::for_encoder(&enc, 48_000);
+        let mut out = Vec::new();
+        {
+            let mut w = OggOpusWriter::new(&mut out, head).unwrap();
+            let mut pk = vec![0u8; MAX_PACKET_BYTES];
+            for block in tone.chunks_exact(960) {
+                let n = enc.encode(block, 960, &mut pk).unwrap();
+                w.write_packet(&pk[..n]).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        std::fs::write(dir.join(format!("voice/{a}/cast.opus")), out).unwrap();
+    }
+    std::fs::write(dir.join("sfx/cast.wav"), clawbound::brass::wav_bytes(&tone[..4800], 48_000)).unwrap();
+
+    let (mut h, mut m) = mixer::new();
+    let mut bank = Bank::loading(Loader::start(dir.clone(), 48_000));
+    let t0 = std::time::Instant::now();
+    while bank.len() < 2 && t0.elapsed().as_secs() < 10 {
+        bank.poll(&mut h);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(bank.len(), 2, "errors: {:?}", bank.errors);
+
+    // a cast with a wind-up, so there is a CastStart (voice) and a Cast (sfx)
+    game.gods[1].respawn_t = 999.0;
+    game.gods[0].ai = None;
+    game.gods[0].mana = 10_000.0;
+    let slot = (0..4u32).find(|&s| clawbound::abilities::cast_timing(&game.def(0).abilities[s as usize]).0 > 0.0).unwrap();
+    let p = game.gods[0].pos;
+    game.cast_queue.push((0, slot, p + Vec3::Z * 8.0));
+    let mut gate = VoiceGate::default();
+    let mut played = Vec::new();
+    for _ in 0..60 {
+        game.tick(1.0 / 60.0);
+        let evs: Vec<_> = game.events.drain(..).collect();
+        for ev in evs {
+            for cue in cues_for(&ev, &game) {
+                let Some((gain, pan)) = place(&cue, p, Vec3::X) else { continue };
+                if !gate.allow(&cue, game.t) {
+                    continue;
+                }
+                if let Some(id) = bank.first(&cue.keys) {
+                    played.push(cue.keys.clone());
+                    h.play(Play { clip: id, bus: cue.bus, gain, pan, priority: cue.priority, looped: false, speaker: cue.speaker.map(|x| x as u16) });
+                }
+            }
+        }
+    }
+    assert!(played.iter().any(|k| k.iter().any(|x| x.ends_with("/cast"))), "the voice line did not play: {played:?}");
+    assert!(played.iter().any(|k| k.last().map(String::as_str) == Some("sfx/cast")), "the generic cast sound did not fill in: {played:?}");
+    let mut out = vec![0.0f32; 2 * 4096];
+    m.render_add(&mut out, 2);
+    let energy: f32 = out.iter().map(|x| x * x).sum();
+    assert!(energy > 1.0, "nothing audible came out of the mixer: {energy}");
+
+    // far away: the same cat's line is not spoken
+    let far = clawbound::cues::Cue { pos: Some(p + Vec3::X * 80.0), ..cues_for(&clawbound::sim::Event::CastStart { god: 0, slot, aim: p, dur: 0.3 }, &game)[0].clone() };
+    assert!(place(&far, p, Vec3::X).is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
