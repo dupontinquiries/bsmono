@@ -90,8 +90,11 @@ bloc  = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python", "d
 # local GGUF inference via llama.cpp (Vulkan). Needs clang + Vulkan SDK to build.
 # FFI body (shared by both backends)
 llama-ffi = ["dep:llama-cpp-2", "dep:encoding_rs"]
-# GPU (Vulkan) build — needs clang + Vulkan SDK + glslc on the build host
-llamacpp = ["llama-ffi", "llama-cpp-2/vulkan"]
+# GPU build: THIS platform's backend -- Metal on macOS (Xcode CLT + cmake), Vulkan
+# elsewhere (clang + Vulkan SDK + glslc). Through `llama-cpp-2-gpu`, the same crate
+# declared per target below; `llamacpp-cpu` never enables it, so it stays CPU-only.
+# (It was Vulkan everywhere: a macOS build stopped in cmake for want of glslc.)
+llamacpp = ["llama-ffi", "dep:llama-cpp-2-gpu"]
 # opt-in Vulkan upload-staging exec body in memplan (draft; needs the Vulkan SDK on the build host)
 vk-upload = ["dep:ash"]
 # CPU-only build — validates the FFI without a shader compiler (sandbox-friendly)
@@ -104,3 +107,10 @@ llamacpp-vulkan = ["llama-ffi", "llama-cpp-2/vulkan"]
 # One binary, ggml backend .dylib/.so picked at runtime (needs dynamic-link; test before relying on it).
 llamacpp-dyn = ["llama-ffi", "llama-cpp-2/dynamic-backends"]
 
+# `llamacpp`'s GPU backend per platform: the same llama-cpp-2 (Cargo unifies the
+# two keys into one crate), with the backend feature for this target.
+[target.'cfg(target_os = "macos")'.dependencies]
+llama-cpp-2-gpu = { package = "llama-cpp-2", version = "0.1.150", optional = true, features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+llama-cpp-2-gpu = { package = "llama-cpp-2", version = "0.1.150", optional = true, features = ["vulkan"] }

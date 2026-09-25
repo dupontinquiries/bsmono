@@ -78,8 +78,10 @@ gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:async-std", "dep:tree-sitter", 
 wgpu-engine = ["dep:gpu-gemm"]
 # Forward the core's local GGML/GGUF inference so the egui app can build with `--features llamacpp`
 # (Vulkan) or `--features llamacpp-cpu`, matching the logscope core's feature names.
-llamacpp = ["logscope/llamacpp"]
+llamacpp = ["logscope/llamacpp"]            # this platform's GPU: Metal on macOS, Vulkan elsewhere
 llamacpp-cpu = ["logscope/llamacpp-cpu"]
+llamacpp-metal = ["logscope/llamacpp-metal"]
+llamacpp-vulkan = ["logscope/llamacpp-vulkan"]
 # Speech-to-text base: whisper worker pool (whisper_pool) + mic capture (voice.rs) → voice_ingest::Pass.
 voice = ["dep:whisper-rs", "dep:cpal"]
 voice-vulkan = ["voice", "whisper-rs/vulkan"]  # GPU whisper on the Asahi M2 (recommended there)
