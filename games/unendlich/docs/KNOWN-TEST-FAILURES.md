@@ -19,6 +19,23 @@ Four failures on first run, all fixed:
   test pinned the latch that `35d2285ca` removed (the stuck mine button); now pins the
   recovery (`2bbc77224`).
 
+### Update (c20unified, leaf templates merged): 9372 passed, 3 failed (default features)
+
+- `world::mesh_tri_regression::sample_grid_worst_case_stays_under_budget` -- still over, much
+  less: the worst sample chunk was 443,922 triangles; canopy depth (`e92b8b962`) and merged
+  leaf templates (411 -> 160 quads per leaf block, no visual change) bring that chunk to
+  181,430, and the grid's worst is now 213,550. Two sources remain: leaf stamps (512 x ~320)
+  and, independently, weathered-top subdivision (chunk (0,2,0): 55,296 quads, ~110K triangles,
+  no leaves involved). The 90K budget is self-described as uncalibrated.
+- `render::mesher::tests::isolated_soft_block_sags_more_than_buried` -- a MASKED failure, now
+  visible. It averaged every vertex over the block, grass tufts included, and the tufts on the
+  buried block carried it past its 0.10 threshold. Measured on the block's own top surface
+  (undecorated, the lowest point -- the corner the note says sags ~0.225): isolated 8.786
+  (sag 0.214, as the note says) but buried 8.837 (sag 0.163), where the test expects "near
+  9.0". The claim that a buried soft block barely sags does not hold for the current mesher;
+  a soft-block question, not a template one. The threshold was NOT lowered.
+- `render::mesher_binary::tests::cross_tufts_are_eight_vertices_and_double_sided` -- as below.
+
 ### With the DEFAULT features (render tests included): 9208 passed, 4 failed of 9212
 
 Once the engine's default build compiled again (f19420473), its render tests ran for the first

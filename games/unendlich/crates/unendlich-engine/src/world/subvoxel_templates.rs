@@ -115,7 +115,92 @@ fn bake_variant(host_id: BlockId, seed: [i32; 3]) -> SubVoxelTemplate {
 /// Equivalent to `emit_subvoxel_grid` but writes into a local
 /// template buffer instead of a ChunkMesh, and **stores sway weights
 /// per vertex** so stamping can sway without re-deriving sub_y.
+/// Bake a grid into a template with coplanar, same-colour faces MERGED into
+/// rectangles. The per-cell bake (`bake_from_grid_per_cell`, kept as the
+/// reference) emits one quad per exposed sub-voxel face: an 8^3 leaf pattern is
+/// ~400 quads, ~800 triangles, per stamped leaf block (the foliage triangle
+/// budget, mesh_tri_regression). Faces merge only with the same direction,
+/// plane and colour, and sway weight is linear in height (y / denom at each
+/// vertex), so a merged face looks and moves exactly like the cells it covers.
 pub fn bake_from_grid(grid: &SubVoxelGrid) -> SubVoxelTemplate {
+    use std::collections::BTreeMap;
+    let mut t = SubVoxelTemplate::empty();
+    if grid.cells.is_empty() { return t; }
+    let n = SUBVOXEL_RESOLUTION;
+    let mut filled = [false; 16 * 16 * 16];
+    for c in &grid.cells {
+        filled[(c.sub_x as usize) + (c.sub_y as usize) * 16 + (c.sub_z as usize) * 256] = true;
+    }
+    let lookup = |x: i32, y: i32, z: i32| -> bool {
+        if x < 0 || y < 0 || z < 0 || x as usize >= n || y as usize >= n || z as usize >= n { return false; }
+        filled[(x as usize) + (y as usize) * 16 + (z as usize) * 256]
+    };
+    // dir: 0 +Y, 1 -Y, 2 +X, 3 -X, 4 +Z, 5 -Z. (a, b) are the face's in-plane
+    // axes: Y faces (x, z); X faces (z, y); Z faces (x, y). `plane` is the
+    // sub-voxel coordinate of the face along its normal.
+    type Key = (u8, i32, [u32; 3]);
+    let mut groups: BTreeMap<Key, std::collections::BTreeMap<(i32, i32), bool>> = BTreeMap::new();
+    for cell in &grid.cells {
+        let (x, y, z) = (cell.sub_x as i32, cell.sub_y as i32, cell.sub_z as i32);
+        let col = [cell.color[0].to_bits(), cell.color[1].to_bits(), cell.color[2].to_bits()];
+        let faces: [(u8, bool, i32, i32, i32); 6] = [
+            (0, !lookup(x, y + 1, z), y + 1, x, z),
+            (1, !lookup(x, y - 1, z), y, x, z),
+            (2, !lookup(x + 1, y, z), x + 1, z, y),
+            (3, !lookup(x - 1, y, z), x, z, y),
+            (4, !lookup(x, y, z + 1), z + 1, x, y),
+            (5, !lookup(x, y, z - 1), z, x, y),
+        ];
+        for (dir, exposed, plane, a, b) in faces {
+            if exposed {
+                groups.entry((dir, plane, col)).or_default().insert((a, b), false);
+            }
+        }
+    }
+    let denom = (SUBVOXEL_RESOLUTION as f32 - 1.0).max(1.0);
+    let sz = SUBVOXEL_SIZE;
+    for ((dir, plane, col), mut cells) in groups {
+        let color = [f32::from_bits(col[0]), f32::from_bits(col[1]), f32::from_bits(col[2])];
+        let keys: Vec<(i32, i32)> = cells.keys().copied().collect();
+        for (a0, b0) in keys {
+            if cells.get(&(a0, b0)) != Some(&false) { continue; }
+            // Grow along a, then along b while the whole row is free.
+            let mut a1 = a0;
+            while cells.get(&(a1 + 1, b0)) == Some(&false) { a1 += 1; }
+            let mut b1 = b0;
+            'grow: loop {
+                for a in a0..=a1 {
+                    if cells.get(&(a, b1 + 1)) != Some(&false) { break 'grow; }
+                }
+                b1 += 1;
+            }
+            for a in a0..=a1 { for b in b0..=b1 { cells.insert((a, b), true); } }
+            let (fa0, fa1, fb0, fb1, fp) = (a0 as f32 * sz, (a1 + 1) as f32 * sz, b0 as f32 * sz, (b1 + 1) as f32 * sz, plane as f32 * sz);
+            // Corner order per direction, as the per-cell bake writes it.
+            let (corners, normal): ([[f32; 3]; 4], [f32; 3]) = match dir {
+                0 => ([[fa0, fp, fb0], [fa1, fp, fb0], [fa1, fp, fb1], [fa0, fp, fb1]], [0.0, 1.0, 0.0]),
+                1 => ([[fa0, fp, fb1], [fa1, fp, fb1], [fa1, fp, fb0], [fa0, fp, fb0]], [0.0, -1.0, 0.0]),
+                2 => ([[fp, fb0, fa0], [fp, fb0, fa1], [fp, fb1, fa1], [fp, fb1, fa0]], [1.0, 0.0, 0.0]),
+                3 => ([[fp, fb0, fa1], [fp, fb0, fa0], [fp, fb1, fa0], [fp, fb1, fa1]], [-1.0, 0.0, 0.0]),
+                4 => ([[fa1, fb0, fp], [fa0, fb0, fp], [fa0, fb1, fp], [fa1, fb1, fp]], [0.0, 0.0, 1.0]),
+                _ => ([[fa0, fb0, fp], [fa1, fb0, fp], [fa1, fb1, fp], [fa0, fb1, fp]], [0.0, 0.0, -1.0]),
+            };
+            let base = t.positions.len() as u32;
+            for c in corners {
+                t.positions.push(c);
+                t.colors.push(color);
+                t.normals.push(normal);
+                t.sway_weights.push((c[1] / sz) / denom);
+            }
+            t.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+    t
+}
+
+/// The per-cell bake: one quad per exposed sub-voxel face. The reference the
+/// merged bake is tested against.
+pub fn bake_from_grid_per_cell(grid: &SubVoxelGrid) -> SubVoxelTemplate {
     let mut t = SubVoxelTemplate::empty();
     if grid.cells.is_empty() { return t; }
 
@@ -520,3 +605,60 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    /// Every (normal, unit face, colour) the template covers, at sub-voxel
+    /// resolution: the merged and per-cell bakes must cover exactly the same.
+    fn coverage(t: &SubVoxelTemplate) -> std::collections::BTreeSet<(i32, i32, i32, i32, i32, i32, [u32; 3])> {
+        let mut out = std::collections::BTreeSet::new();
+        let q = |v: f32| (v / SUBVOXEL_SIZE).round() as i32;
+        for f in 0..t.positions.len() / 4 {
+            let p = &t.positions[f * 4..f * 4 + 4];
+            let nrm = t.normals[f * 4];
+            let col = t.colors[f * 4];
+            let key = [col[0].to_bits(), col[1].to_bits(), col[2].to_bits()];
+            let (lo, hi) = (|i: usize| p.iter().map(|c| q(c[i])).min().unwrap(), |i: usize| p.iter().map(|c| q(c[i])).max().unwrap());
+            let (n0, n1, n2) = (nrm[0] as i32, nrm[1] as i32, nrm[2] as i32);
+            for x in lo(0)..hi(0).max(lo(0) + 1) { for y in lo(1)..hi(1).max(lo(1) + 1) { for z in lo(2)..hi(2).max(lo(2) + 1) {
+                out.insert((n0, n1, n2, x, y, z, key));
+            }}}
+        }
+        out
+    }
+
+    #[test]
+    fn merged_leaves_cover_exactly_what_per_cell_faces_did() {
+        for host in [BlockId::OakLeaves, BlockId::BirchLeaves, BlockId::Grass, BlockId::Fern] {
+            for seed in 0..6 {
+                let Some(grid) = procedural_subgrid(host, seed * 7, 64, seed * 13) else { continue };
+                let (merged, per_cell) = (bake_from_grid(&grid), bake_from_grid_per_cell(&grid));
+                assert_eq!(coverage(&merged), coverage(&per_cell), "{host:?} seed {seed}: same faces, colours, normals");
+                assert!(merged.positions.len() <= per_cell.positions.len());
+                // Sway: every vertex's weight is its height over the denominator.
+                let denom = (SUBVOXEL_RESOLUTION as f32 - 1.0).max(1.0);
+                for (p, w) in merged.positions.iter().zip(&merged.sway_weights) {
+                    assert!((w - (p[1] / SUBVOXEL_SIZE) / denom).abs() < 1e-5);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic: leaf template quads before and after merging"]
+    fn leaf_quads_before_and_after() {
+        for host in [BlockId::OakLeaves, BlockId::BirchLeaves] {
+            let (mut before, mut after, mut k) = (0usize, 0usize, 0usize);
+            for seed in 0..8 {
+                let Some(grid) = procedural_subgrid(host, seed * 7, 64, seed * 13) else { continue };
+                before += bake_from_grid_per_cell(&grid).positions.len() / 4;
+                after += bake_from_grid(&grid).positions.len() / 4;
+                k += 1;
+            }
+            eprintln!("QUADS {host:?}: {} -> {} per template (avg of {k})", before / k.max(1), after / k.max(1));
+        }
+    }
+}
+

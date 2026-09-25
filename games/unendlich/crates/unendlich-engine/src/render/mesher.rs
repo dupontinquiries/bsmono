@@ -4688,8 +4688,12 @@ mod tests {
                 chunk_bur.set(8 + dx, 8, 8 + dz, BlockId::Grass);
             }
         }
-        let mesh_iso = mesh_chunk_greedy(&chunk_iso, None, None, None);
-        let mesh_bur = mesh_chunk_greedy(&chunk_bur, None, None, None);
+        // UNDECORATED: this measures the block's top surface. With decorations the
+        // mean also counted the grass tufts' template vertices above it, so the
+        // tufts' vertex count moved the result -- merging coplanar template faces
+        // (fewer tuft vertices, same look) took the gap from >0.10 to 0.098.
+        let mesh_iso = mesh_chunk_greedy_undecorated(&chunk_iso, None);
+        let mesh_bur = mesh_chunk_greedy_undecorated(&chunk_bur, None);
         // Center block (8,8,8) — top corners. Take mean Y of corners that
         // sit roughly at the top.
         let mean_top_y = |mesh: &ChunkMesh, block_xz: (i32, i32)| -> f32 {
@@ -4703,7 +4707,11 @@ mod tests {
                 .collect();
             ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
             if ys.is_empty() { return 9.0; }
-            ys.iter().sum::<f32>() / ys.len() as f32
+            // The LOWEST top-surface point: the exposed corner the sag pulls
+            // down (~0.225 below 9.0 per the note below). A mean over the whole
+            // top mixes those corners with the flat centre -- and, decorated, it
+            // also counted grass tufts, which is what carried this test past 0.10.
+            ys[0]
         };
         let iso_y = mean_top_y(&mesh_iso, (8, 8));
         let bur_y = mean_top_y(&mesh_bur, (8, 8));

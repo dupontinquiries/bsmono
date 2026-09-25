@@ -566,8 +566,11 @@ mod tests {
         // the mesh is decoration (grass tufts), which the stats separate.
         assert_eq!(st.face_vertices, st.plain_quads * 4);
         assert_eq!(m.vertices.len() as u32, st.face_vertices + st.decoration_vertices);
-        assert!(st.decoration_vertices > st.face_vertices,
-            "on a grass surface the tufts outweigh the terrain: {} vs {}", st.decoration_vertices, st.face_vertices);
+        // The tufts are there. (They used to OUTWEIGH the terrain; since leaf and
+        // tuft templates merge coplanar same-colour faces -- same look, fewer
+        // vertices -- they no longer do: 27,616 tuft vs 29,160 terrain vertices
+        // here. What this test checks is the plain-quad accounting above.)
+        assert!(st.decoration_vertices > 0, "the grass surface carries its tufts");
     }
 
     #[test]
