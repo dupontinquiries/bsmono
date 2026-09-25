@@ -100,6 +100,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("settings") {
         return run_settings_shot();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("abilityfx") {
+        return run_abilityfx_shots();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("spectate") {
         return run_spectate();
     }
@@ -1902,5 +1905,60 @@ pub fn run_settings_shot() -> Result<(), String> {
     draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
     save_shot(&renderer.device, &renderer.queue, &target, "settings_panel.png")?;
     println!("saved settings_panel.png");
+    Ok(())
+}
+
+/// The upgraded ability effects: a dash's afterimages, a nova's dust wave,
+/// a bolt's trail. `CLAWBOUND_SHOTS=abilityfx clawbound-battleground --screenshot`
+pub fn run_abilityfx_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("abilityfx"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let spot = Vec3::new(0.0, 0.0, -40.0);
+    let run = |renderer: &mut Renderer, who: &str, arch: fn(&crate::gods::Archetype) -> bool, frames: usize, name: &str, cam: Camera| -> Result<(), String> {
+        let id = crate::gods::ROSTER.iter().position(|d| d.name == who).unwrap() as u32;
+        let mut game = Game::new_teams(&[id], &[(id + 1) % 13]);
+        game.blockers = scene.blockers.clone();
+        game.gods[1].respawn_t = 999.0;
+        game.gods[0].ai = None;
+        game.gods[0].pos = spot;
+        game.gods[0].yaw = 0.0;
+        game.gods[0].mana = 10_000.0;
+        let mut vfx = Vfx::default();
+        for _ in 0..10 {
+            game.tick(1.0 / 60.0);
+            game.events.clear();
+            vfx.update(1.0 / 60.0, &[], &game);
+        }
+        let def = &crate::gods::ROSTER[id as usize];
+        let slot = (0..4).find(|&s| arch(&def.abilities[s].arch)).expect("archetype") as u32;
+        game.cast_queue.push((0, slot, spot + Vec3::X * 9.0));
+        for _ in 0..frames {
+            game.tick(1.0 / 60.0);
+            let ev: Vec<crate::sim::Event> = game.events.drain(..).collect();
+            vfx.update(1.0 / 60.0, &ev, &game);
+        }
+        scene.draw(renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name} ({} afterimages, {} particles)", vfx.afterimages.len(), vfx.particles.len());
+        Ok(())
+    };
+    let side = Camera { eye: spot + Vec3::new(4.5, 3.0, -7.5), target: spot + Vec3::new(4.5, 0.8, 0.0), fov_y: 0.9 };
+    run(&mut renderer, "Goldenmane", |a| matches!(a, crate::gods::Archetype::Dash { .. }), 12, "abilityfx_dash.png", side)?;
+    run(&mut renderer, "Oldroar", |a| matches!(a, crate::gods::Archetype::Nova { .. }), 25, "abilityfx_nova.png", side)?;
+    run(&mut renderer, "Suneye", |a| matches!(a, crate::gods::Archetype::Bolt { .. }), 22, "abilityfx_bolt.png", side)?;
     Ok(())
 }

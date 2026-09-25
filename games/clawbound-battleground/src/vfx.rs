@@ -69,8 +69,29 @@ pub struct Channel {
     pub big: bool,
 }
 
+/// A fading copy of a cat where it just was: a dash leaves a string of
+/// them, a blink one at its origin. The scene draws the cat's current pose
+/// there, transparent, in `color`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Afterimage {
+    pub god: usize,
+    pub pos: Vec3,
+    pub yaw: f32,
+    pub life: f32,
+    pub max: f32,
+    pub color: [f32; 3],
+}
+
 #[derive(Default)]
 pub struct Vfx {
+    /// Particles that are NOT light -- dust, grit: lit by the sun and shaded
+    /// like the ground they came from. Every entry in `particles` is drawn
+    /// self-lit (the magic), which turned a nova's dust into cream puffs.
+    pub dust: Vec<Particle>,
+    /// Afterimages of dashes and blinks (`tick_afterimages`).
+    pub afterimages: Vec<Afterimage>,
+    ghost_last: Vec<Vec3>,
+    ghost_t: Vec<f32>,
     /// Casts being gathered, until they fire or are broken off.
     pub channels: Vec<Channel>,
     /// Coloured light from ability effects, fading (`glow_events`).
@@ -388,8 +409,75 @@ impl Vfx {
         self.rings.push(Ring { pos: at + Vec3::Y * 0.08, r0: 0.3, r1: 2.8, until: self.time + 0.28, dur: 0.28, color: [color[0] * 0.5 + 0.5, color[1] * 0.5 + 0.5, 1.0], thick: 0.2 });
     }
 
+    /// Speed made visible: while a cat dashes it leaves a ghost of itself
+    /// every 45 ms along its path; a blink -- a jump further in one frame
+    /// than a cat can run, short of a respawn -- leaves a longer-lived one
+    /// at its origin. In the cat's accent colour, fading.
+    pub fn tick_afterimages(&mut self, dt: f32, game: &Game) {
+        for a in self.afterimages.iter_mut() {
+            a.life -= dt;
+        }
+        self.afterimages.retain(|a| a.life > 0.0);
+        let n = game.gods.len();
+        if self.ghost_last.len() != n {
+            self.ghost_last = game.gods.iter().map(|g| g.pos).collect();
+            self.ghost_t = vec![0.0; n];
+        }
+        for (i, g) in game.gods.iter().enumerate() {
+            let last = self.ghost_last[i];
+            self.ghost_last[i] = g.pos;
+            if g.respawn_t > 0.0 {
+                continue;
+            }
+            let color = crate::gods::ROSTER.get(g.def_id as usize).map_or([0.8, 0.9, 1.0], |d| d.palette[3]);
+            let jump = (g.pos - last).length();
+            if jump > 2.5 && jump < 30.0 {
+                self.afterimages.push(Afterimage { god: i, pos: last, yaw: g.yaw, life: 0.5, max: 0.5, color });
+            }
+            if g.dash.is_some() {
+                self.ghost_t[i] -= dt;
+                if self.ghost_t[i] <= 0.0 {
+                    self.ghost_t[i] = 0.045;
+                    self.afterimages.push(Afterimage { god: i, pos: g.pos, yaw: g.yaw, life: 0.3, max: 0.3, color });
+                }
+            } else {
+                self.ghost_t[i] = 0.0;
+            }
+        }
+        if self.afterimages.len() > 48 {
+            self.afterimages.drain(0..self.afterimages.len() - 48);
+        }
+    }
+
+    /// A glowing trail streaming behind every magic bolt in flight (they
+    /// were bare orbs: a fast one read as a dot).
+    pub fn tick_trails(&mut self, game: &Game) {
+        for p in &game.projectiles {
+            if !matches!(p.kind, crate::sim::ProjKind::Bolt) {
+                continue;
+            }
+            let back = -p.vel.normalize_or_zero();
+            for k in 0..2 {
+                let j = Vec3::new(self.perturb(0.08 + k as f32), self.perturb(0.08 + k as f32 * 3.1), self.perturb(0.08 + k as f32 * 7.3));
+                self.particles.push(Particle {
+                    pos: p.pos + back * (0.15 * k as f32) + j,
+                    vel: back * 1.5,
+                    life: 0.24,
+                    max_life: 0.24,
+                    size: 0.15,
+                    color: [p.color[0] * 1.6, p.color[1] * 1.6, p.color[2] * 1.6],
+                    alpha: 0.8,
+                    gravity: 0.0,
+                    drag: 2.0,
+                });
+            }
+        }
+    }
+
     pub fn update(&mut self, dt: f32, events: &[Event], game: &Game) {
         self.glow_events(dt, events, game);
+        self.tick_afterimages(dt, game);
+        self.tick_trails(game);
         self.tick_channels(dt, events, game);
         self.time += dt;
         let atm = game.weather.atmosphere();
@@ -558,6 +646,27 @@ impl Vfx {
                     }
                 }
                 Event::NovaFx { pos, radius, color } => {
+                    // a ground-hugging dust wave thrown out to the ring: what
+                    // makes an impact feel heavy
+                    // earth, barely tinted: particles draw with a glow, and the
+                    // first mid-tone dust came out as bright cream puffs
+                    let dust = [0.52 + color[0] * 0.06, 0.44 + color[1] * 0.06, 0.33 + color[2] * 0.06];
+                    for k in 0..40 {
+                        let a = k as f32 / 40.0 * std::f32::consts::TAU + self.perturb(0.08);
+                        let d = Vec3::new(a.cos(), 0.0, a.sin());
+                        let up = 0.6 + self.perturb(0.4);
+                        self.dust.push(Particle {
+                            pos: *pos + d * 0.8 + Vec3::Y * 0.25,
+                            vel: d * (*radius * 1.7) + Vec3::Y * up,
+                            life: 0.7,
+                            max_life: 0.7,
+                            size: 0.34,
+                            color: dust,
+                            alpha: 0.6,
+                            gravity: 1.2,
+                            drag: 3.2,
+                        });
+                    }
                     self.quake(*pos, *radius * 0.6, (*radius / 9.0).clamp(0.2, 0.9));
                     self.rings.push(Ring { pos: *pos, r0: 0.5, r1: *radius, until: 0.55, dur: 0.55, color: *color, thick: 0.45 });
                     for _ in 0..(*radius * 4.0).min(60.0) as usize {
@@ -836,7 +945,7 @@ impl Vfx {
         }
 
         // physics update
-        for p in self.particles.iter_mut() {
+        for p in self.particles.iter_mut().chain(self.dust.iter_mut()) {
             p.life -= dt;
             p.vel.y -= p.gravity * dt;
             p.vel *= 1.0 / (1.0 + p.drag * dt);
@@ -847,6 +956,7 @@ impl Vfx {
             }
         }
         self.particles.retain(|p| p.life > 0.0);
+        self.dust.retain(|p| p.life > 0.0);
         if self.particles.len() > MAX_PARTICLES {
             self.particles.drain(0..self.particles.len() - MAX_PARTICLES);
         }
@@ -1122,6 +1232,16 @@ impl Vfx {
                 off_ao: [p.pos.x, p.pos.y, p.pos.z, 1.0],
                 color: [p.color[0], p.color[1], p.color[2], p.alpha * lf],
                 misc: [p.size * (0.4 + 0.6 * lf), 0.0, 0.0, 0.0],
+            });
+        }
+        // dust: misc.z adds to the particle draw's emissive (1.0) -- minus
+        // one makes it an ordinary lit surface
+        for p in &self.dust {
+            let lf = (p.life / p.max_life).clamp(0.0, 1.0);
+            out.push(VoxInst {
+                off_ao: [p.pos.x, p.pos.y, p.pos.z, 1.0],
+                color: [p.color[0], p.color[1], p.color[2], p.alpha * lf],
+                misc: [p.size * (0.5 + 0.5 * lf), 0.0, -1.0, 0.0],
             });
         }
 
@@ -1664,5 +1784,83 @@ mod lightning_tests {
             strikes += game.events.drain(..).filter(|e| matches!(e, Event::StrikeFx { .. })).count();
         }
         assert!(strikes >= 3, "{strikes} strikes in 4 s");
+    }
+}
+
+#[cfg(test)]
+mod ability_fx_tests {
+    use super::*;
+
+    /// A dash leaves a string of ghosts along its path; a blink leaves one
+    /// where it started; a respawn (a far jump) leaves none; they fade.
+    #[test]
+    fn dashes_and_blinks_leave_afterimages() {
+        let mut game = Game::new_teams(&[0], &[1]);
+        let mut v = Vfx::default();
+        v.tick_afterimages(1.0 / 60.0, &game);
+        // a blink: 6 u in one frame
+        let from = game.gods[0].pos;
+        game.gods[0].pos += Vec3::X * 6.0;
+        v.tick_afterimages(1.0 / 60.0, &game);
+        assert_eq!(v.afterimages.len(), 1);
+        assert!((v.afterimages[0].pos - from).length() < 1e-4, "the ghost is where it started");
+        // a respawn-sized jump is not a blink
+        game.gods[0].pos += Vec3::X * 80.0;
+        v.tick_afterimages(1.0 / 60.0, &game);
+        assert_eq!(v.afterimages.len(), 1);
+        // fading out
+        for _ in 0..40 {
+            v.tick_afterimages(1.0 / 60.0, &game);
+        }
+        assert!(v.afterimages.is_empty(), "faded");
+    }
+
+    #[test]
+    fn a_real_dash_leaves_a_string_of_ghosts() {
+        let mut game = Game::new_teams(&[0], &[1]);
+        game.gods[1].respawn_t = 999.0;
+        game.gods[0].ai = None;
+        game.gods[0].mana = 10_000.0;
+        let def = &crate::gods::ROSTER[game.gods[0].def_id as usize];
+        let slot = (0..4).find(|&s| matches!(def.abilities[s].arch, crate::gods::Archetype::Dash { .. })).expect("Goldenmane dashes") as u32;
+        let p = game.gods[0].pos;
+        game.cast_queue.push((0, slot, p + Vec3::Z * 8.0));
+        let mut v = Vfx::default();
+        let mut most = 0;
+        for _ in 0..40 {
+            game.tick(1.0 / 60.0);
+            let ev: Vec<Event> = game.events.drain(..).collect();
+            v.update(1.0 / 60.0, &ev, &game);
+            most = most.max(v.afterimages.len());
+        }
+        assert!(most >= 3, "{most} ghosts along the dash");
+    }
+
+    /// A nova throws dust outward along the ground; a bolt in flight
+    /// streams a trail behind it.
+    #[test]
+    fn novas_throw_dust_and_bolts_trail() {
+        let game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        let mut v = Vfx::default();
+        let c = Vec3::new(3.0, 0.0, 3.0);
+        v.update(1.0 / 60.0, &[Event::NovaFx { pos: c, radius: 6.0, color: [1.0, 0.6, 0.2] }], &game);
+        let dust: Vec<&Particle> = v.dust.iter().collect();
+        assert!(dust.len() >= 40);
+        assert!(dust.iter().all(|p| Vec3::new(p.vel.x, 0.0, p.vel.z).dot(p.pos - c) > 0.0 && p.pos.y < 0.5), "outward, low");
+        let mut game = Game::new_teams(&[0], &[1]);
+        let def = &crate::gods::ROSTER[game.gods[0].def_id as usize];
+        if let Some(slot) = (0..4).find(|&s| matches!(def.abilities[s].arch, crate::gods::Archetype::Bolt { .. })) {
+            game.gods[0].mana = 10_000.0;
+            game.gods[0].ai = None;
+            let p = game.gods[0].pos;
+            game.cast_queue.push((0, slot as u32, p + Vec3::Z * 10.0));
+            let mut v = Vfx::default();
+            for _ in 0..30 {
+                game.tick(1.0 / 60.0);
+                game.events.clear();
+                v.tick_trails(&game);
+            }
+            assert!(!v.particles.is_empty(), "the bolt trailed");
+        }
     }
 }

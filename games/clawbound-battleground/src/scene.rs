@@ -653,6 +653,16 @@ impl Scene {
                     r.queue_draw(self.god_parts[di][ti][s], base * *m, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
                 }
             }
+            // afterimages of a dash or a blink: this pose, where the cat
+            // just was, transparent and fading in its accent colour
+            for gh in vfx.afterimages.iter().filter(|a| a.god == i) {
+                let k = (gh.life / gh.max).clamp(0.0, 1.0);
+                let ghost = Mat4::from_translation(gh.pos + Vec3::Y * (pose.lift - sink)) * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - gh.yaw);
+                let tint = [gh.color[0] * 1.3, gh.color[1] * 1.3, gh.color[2] * 1.3, 0.42 * k];
+                for (s, m) in mats.iter().enumerate() {
+                    r.queue_draw(self.god_parts[di][ti][s], ghost * *m, tint, 0.8 * k, models::GOD_DRAW_VOXEL, true);
+                }
+            }
 
             if self.god_weapon[di][ti] != 0 {
                 // The weapon rides the torso, so it lunges and rears with it.
