@@ -65,27 +65,28 @@ after it passes.
 
 ## 5. Getting onto the COSMIC session (from Plasma Mobile)
 
-**Unverified throughout** -- postmarketOS's package and session names for
-COSMIC have not been checked from here, and a wrong guess in a step that
-restarts the display manager leaves the phone without a UI. Discover first,
-keep Plasma installed, and keep an ssh session open while switching:
+**Verified:** COSMIC is packaged in Alpine and postmarketOS (announced in the
+postmarketOS 2025-03 update), and the UI metapackage is
+`postmarketos-ui-cosmic` -- built for aarch64 (`main/aarch64/
+postmarketos-ui-cosmic-2-r4` on build.postmarketos.org); it pulls in
+`cosmic-session`. The postmarketOS wiki has a COSMIC page (wiki.postmarketos.org,
+"COSMIC") -- read it for the current details before switching.
+
+**Still unverified here:** how the installed login manager picks the session
+on the FP5 image. Keep Plasma Mobile installed and an ssh session open:
 
 ```sh
 ssh -p 8022 user@127.0.0.1
-apk search postmarketos-ui            # the UI metapackages this release offers
-apk search cosmic                     # what COSMIC packages exist
-apk info -v cosmic-comp 2>/dev/null   # already installed?
-ls /usr/share/wayland-sessions/       # the sessions the login manager can start
+sudo apk add postmarketos-ui-cosmic   # alongside Plasma Mobile, not instead
+ls /usr/share/wayland-sessions/       # a cosmic entry should now be listed
 ```
 
-Install the COSMIC UI package the search shows (alongside Plasma Mobile, not
-instead of it), then choose the COSMIC session at the login manager, or set it
-as the default the way that release's login manager documents. Log in and run
-step 1 from inside it.
+Then choose the COSMIC session at the login screen (or set it as the default
+the way the wiki page describes), log in, and run step 1 from inside it.
 
-If COSMIC does not come up: from the still-open ssh session, choose the Plasma
-session again (or remove the COSMIC UI package) and restart the display
-manager. This is why Plasma stays installed until COSMIC has been seen working.
+If COSMIC does not come up: from the open ssh session, choose Plasma Mobile
+again, or `sudo apk del postmarketos-ui-cosmic`, and restart the display
+manager. Plasma stays installed until COSMIC has been seen working.
 
 ## What gitmind does and does not do
 
