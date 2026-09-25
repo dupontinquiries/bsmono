@@ -38,6 +38,8 @@ pub enum Msg {
     Verify(integrity::VerifyReport),
     Cleanup(Vec<cleanup::Suggestion>),
     Videos(video::VideoScan),
+    /// A manifest was written: how many files it records, and where.
+    Created { files: u64, manifest: PathBuf },
     Failed(String),
     Idle,
 }
@@ -55,9 +57,7 @@ pub fn worker(tasks: Receiver<Task>, out: Sender<Msg>, repaint: impl Fn() + Send
             Task::Enumerate => device::enumerate(&sys).map(Msg::Devices),
             Task::Smart(dev) => smart::probe(&sys, &dev, &mut sink).map(Msg::Smart),
             Task::VerifyCreate { root, manifest } => integrity::create(&root, &manifest, &mut sink)
-                .map(|n| {
-                    Msg::Ev(Event::Note(format!("manifest written: {n} file(s)")))
-                }),
+                .map(|n| Msg::Created { files: n as u64, manifest: manifest.clone() }),
             Task::VerifyCheck { root, manifest } => {
                 integrity::verify(&root, &manifest, &mut sink).map(Msg::Verify)
             }
@@ -91,6 +91,13 @@ pub struct ShellState {
     pub log: Vec<uikit_egui::log_view::LogEntry>,
     log_id: u64,
     pub progress: Option<(u64, Option<u64>)>,
+    /// What the last action came to, in plain words (ux.rs), and since when.
+    pub banner: Option<(crate::ux::Tone, String, std::time::Instant)>,
+    /// "Create manifest" would replace an existing manifest: the warning, until
+    /// answered.
+    pub confirm_overwrite: Option<String>,
+    /// The getting-started checklist was dismissed.
+    pub guide_hidden: bool,
 }
 
 impl ShellState {
@@ -112,9 +119,35 @@ impl ShellState {
             log: Vec::new(),
             log_id: 0,
             progress: None,
+            banner: None,
+            confirm_overwrite: None,
+            guide_hidden: false,
         };
         let _ = s.tasks.send(Task::Enumerate);
         s
+    }
+
+    /// Show a banner (replacing any before it).
+    pub fn say(&mut self, (tone, text): (crate::ux::Tone, String)) {
+        self.banner = Some((tone, text, std::time::Instant::now()));
+    }
+
+    /// "Create manifest": asks first when one already exists at the path
+    /// (`confirm_overwrite` is set and nothing runs); true when it was started.
+    pub fn request_create(&mut self) -> bool {
+        if let Some(w) = crate::ux::overwrite_warning(std::path::Path::new(&self.manifest_path)) {
+            self.confirm_overwrite = Some(w);
+            return false;
+        }
+        self.start_create();
+        true
+    }
+
+    /// The overwrite was confirmed (or nothing was there): write the manifest.
+    pub fn start_create(&mut self) {
+        self.confirm_overwrite = None;
+        let (root, manifest) = (PathBuf::from(&self.scan_root), PathBuf::from(&self.manifest_path));
+        self.send(Task::VerifyCreate { root, manifest });
     }
 
     pub fn send(&mut self, t: Task) {
@@ -158,6 +191,7 @@ impl ShellState {
                         },
                         format!("{}: {:?}", rep.device, rep.worst()),
                     );
+                    self.say(crate::ux::smart_banner(&rep));
                     self.smart = Some(rep);
                 }
                 Msg::Verify(rep) => {
@@ -171,6 +205,7 @@ impl ShellState {
                             rep.read_errors.len()
                         ),
                     );
+                    self.say(crate::ux::verify_banner(&rep));
                     self.verify = Some(rep);
                 }
                 Msg::Cleanup(s) => {
@@ -179,6 +214,7 @@ impl ShellState {
                         LogLevel::Info,
                         format!("cleanup: {} suggestion(s), {}", s.len(), human_bytes(total)),
                     );
+                    self.say(crate::ux::cleanup_banner(s.len(), total));
                     self.cleanup = s;
                 }
                 Msg::Videos(v) => {
@@ -190,9 +226,17 @@ impl ShellState {
                             human_bytes(v.est_savings_bytes())
                         ),
                     );
+                    self.say(crate::ux::videos_banner(v.candidates.len(), v.est_savings_bytes()));
                     self.videos = Some(v);
                 }
-                Msg::Failed(e) => self.push_log(LogLevel::Error, e),
+                Msg::Created { files, manifest } => {
+                    self.push_log(LogLevel::Info, format!("manifest written: {files} file(s) -> {}", manifest.display()));
+                    self.say(crate::ux::created_banner(files, &manifest));
+                }
+                Msg::Failed(e) => {
+                    self.say((crate::ux::Tone::Bad, format!("That did not work: {e}")));
+                    self.push_log(LogLevel::Error, e);
+                }
                 Msg::Idle => {
                     self.busy = false;
                     self.progress = None;
@@ -215,3 +259,34 @@ impl ShellState {
         })
     }
 }
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+
+    /// An existing manifest is never replaced without a yes: request_create sends
+    /// nothing and sets the warning; the confirmation then starts the write.
+    #[test]
+    fn replacing_a_manifest_waits_for_a_yes() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (_mtx, mrx) = std::sync::mpsc::channel();
+        let mut st = ShellState::new(tx, mrx);
+        let _ = rx.try_recv(); // the startup Enumerate
+        let dir = std::env::temp_dir().join(format!("drivemind-confirm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        st.scan_root = dir.to_string_lossy().into();
+        st.manifest_path = dir.join("m.jsonl").to_string_lossy().into();
+        assert!(st.request_create(), "no manifest yet: it just runs");
+        assert!(matches!(rx.try_recv(), Ok(Task::VerifyCreate { .. })));
+        std::fs::write(dir.join("m.jsonl"), "x").unwrap();
+        st.busy = false;
+        assert!(!st.request_create(), "one exists: ask first");
+        assert!(st.confirm_overwrite.as_deref().unwrap_or("").contains("already exists"));
+        assert!(rx.try_recv().is_err(), "nothing sent before the yes");
+        st.start_create();
+        assert!(st.confirm_overwrite.is_none());
+        assert!(matches!(rx.try_recv(), Ok(Task::VerifyCreate { .. })), "the yes starts it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
