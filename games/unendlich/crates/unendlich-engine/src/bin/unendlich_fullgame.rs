@@ -1716,6 +1716,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // this block accumulates everything else into).
     let mut cmesh_everts: Vec<unendlich_engine::world::entity::EntityVertex> = Vec::new();
     let mut cmesh_eindices: Vec<u32> = Vec::new();
+    // Translucent effects (smoke wisps, dragons' eyes), reused like the above;
+    // uploaded to the renderer's no-depth-write effects pipeline.
+    let mut fx_verts: Vec<unendlich_engine::world::entity::EntityVertex> = Vec::new();
+    let mut fx_indices: Vec<u32> = Vec::new();
     log::info!("Test creatures disabled (was demo Dragon + Späher)");
 
     // Ambient ecosystem, STREAMED around the player. The SpawnStreamer tracks
@@ -14961,6 +14965,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // (computed relative to an empty base) don't need rebasing.
             cmesh_everts.clear();
             cmesh_eindices.clear();
+            fx_verts.clear();
+            fx_indices.clear();
             let (snap_verts, snap_indices) = snapshot_to_vertices(&snap, default_color_for_kind);
             cmesh_everts.extend(snap_verts);
             cmesh_eindices.extend(snap_indices);
@@ -15434,7 +15440,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 hy,
                                 cr.body.position[2] + fz * hr * 0.95 + fx * side * hr * 0.12,
                             ];
-                            push_glow_box(everts, eindices, c, [0.14 * hr.max(1.0) * 0.3; 3], [1.0 + glow[0], 0.9 + glow[1] * 0.5, 0.4], d.eyes);
+                            push_glow_box(&mut fx_verts, &mut fx_indices, c, [0.14 * hr.max(1.0) * 0.3; 3], [1.0 + glow[0], 0.9 + glow[1] * 0.5, 0.4], d.eyes);
                         }
                     }
                 }
@@ -15459,8 +15465,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     right[0] * f.y - right[1] * f.x,
                 ];
                 let lit = smoke_flash_shown * 0.6;
-                // Far to near: this pass writes depth, so a nearer card drawn
-                // first would hide the cards behind it instead of blending over them.
+                // Drawn in the effects pass (depth test, no depth write), far
+                // to near so the blend order is right too.
                 let eye = local_player.view.position;
                 let mut cards = wisps.cards(&looks);
                 let d2 = |c: &sw::Card| (c.center[0] - eye.x).powi(2) + (c.center[1] - eye.y).powi(2) + (c.center[2] - eye.z).powi(2);
@@ -15470,8 +15476,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         continue;
                     }
                     let col = [c.color[0] + lit, c.color[1] + lit * 0.85, c.color[2] + lit * 0.6];
-                    let base = everts.len() as u32;
-                    everts.push(unendlich_engine::world::entity::EntityVertex { position: c.center, color: col, alpha: c.alpha });
+                    let base = fx_verts.len() as u32;
+                    fx_verts.push(unendlich_engine::world::entity::EntityVertex { position: c.center, color: col, alpha: c.alpha });
                     // Two rings: an inner one at 45% radius keeping 60% of the
                     // alpha, then a clear rim -- a falloff close to a Gaussian,
                     // so overlapping cards don't show their polygon edges.
@@ -15481,7 +15487,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         for k in 0..SEG {
                             let a = std::f32::consts::TAU * (k as f32 + 0.5 * ring as f32) / SEG as f32;
                             let (ca, sa) = (a.cos() * c.radius * rr, a.sin() * c.radius * rr);
-                            everts.push(unendlich_engine::world::entity::EntityVertex {
+                            fx_verts.push(unendlich_engine::world::entity::EntityVertex {
                                 position: [
                                     c.center[0] + right[0] * ca + up[0] * sa,
                                     c.center[1] + right[1] * ca + up[1] * sa,
@@ -15496,8 +15502,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     let outer = |k: u32| base + 1 + SEG + (k % SEG);
                     for k in 0..SEG {
                         for t in [[base, inner(k), inner(k + 1)], [inner(k), outer(k), inner(k + 1)], [inner(k + 1), outer(k), outer(k + 1)]] {
-                            eindices.extend(t);
-                            eindices.extend([t[0], t[2], t[1]]); // both faces
+                            fx_indices.extend(t);
+                            fx_indices.extend([t[0], t[2], t[1]]); // both faces
                         }
                     }
                 }
@@ -15717,6 +15723,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 eindices.extend(mi.iter().map(|i| i + base));
             }
             renderer.upload_entities(&ctx, everts.as_slice(), eindices.as_slice());
+            renderer.upload_effects(&ctx, fx_verts.as_slice(), fx_indices.as_slice());
             if profile_on {
                 prof.record("creature_mesh", _t_cmesh.elapsed().as_secs_f64() * 1e3);
             }

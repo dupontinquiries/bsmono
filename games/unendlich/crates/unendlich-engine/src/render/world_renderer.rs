@@ -475,6 +475,9 @@ pub struct WorldRenderer {
     pub depth: DepthBuffer,
     pub pipeline: ChunkPipeline,
     pub entity_pipeline: EntityPipeline,
+    /// Translucent effects (dragon smoke wisps, glowing eyes): the entity
+    /// shaders with depth WRITE off, drawn after the entities.
+    pub effects_pipeline: EntityPipeline,
     pub command_pool: vk::CommandPool,
     descriptor_pool: vk::DescriptorPool,
     frames: Vec<FrameSync>,
@@ -1301,6 +1304,12 @@ impl WorldRenderer {
             unsafe { ctx.instance.get_physical_device_memory_properties(ctx.physical_device) },
             frames_in_flight,
         )?;
+        let effects_pipeline = EntityPipeline::new_with(
+            &ctx.device, render_pass, pipeline.descriptor_set_layout,
+            unsafe { ctx.instance.get_physical_device_memory_properties(ctx.physical_device) },
+            frames_in_flight,
+            false,
+        )?;
 
         let command_pool = unsafe {
             ctx.device.create_command_pool(
@@ -1745,7 +1754,7 @@ impl WorldRenderer {
         let egui_overlay = crate::render::egui_overlay::EguiOverlay::new(ctx, render_pass, frames.len())?;
 
         Ok(Self {
-            render_pass, swapchain, depth, pipeline, entity_pipeline, command_pool, descriptor_pool,
+            render_pass, swapchain, depth, pipeline, entity_pipeline, effects_pipeline, command_pool, descriptor_pool,
             frames, current_frame: 0, frames_in_flight,
             framebuffer_size,
             water_flow_coverage: [0.0; 4],
@@ -3511,6 +3520,18 @@ impl WorldRenderer {
     /// is retired and reclaimed later by `process_retired`, which
     /// `draw_frame_with_view_and_atmos` already calls every frame. Infallible:
     /// a failed upload just skips the mobs this frame rather than killing it.
+    /// Upload this frame's translucent effects (drawn with depth write off).
+    pub fn upload_effects(
+        &mut self,
+        ctx: &VulkanContext,
+        verts: &[crate::world::entity::EntityVertex],
+        indices: &[u32],
+    ) {
+        if let Err(e) = self.effects_pipeline.upload(&ctx.device, verts, indices) {
+            log::warn!("effects upload failed, skipping effects this frame: {e:?}");
+        }
+    }
+
     pub fn upload_entities(
         &mut self,
         ctx: &VulkanContext,
@@ -3610,6 +3631,7 @@ impl WorldRenderer {
         // r-entity-uaf: same deferred-free discipline, same timing, for the
         // entity/creature vertex+index buffers' retired-on-growth pairs.
         self.entity_pipeline.process_retired(&ctx.device);
+        self.effects_pipeline.process_retired(&ctx.device);
 
         let aspect = self.swapchain.extent.width as f32 / self.swapchain.extent.height as f32;
         let vp = view.view_projection(aspect);
@@ -7134,6 +7156,8 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
 
             // Entities (mobs / dropped items): draw after the world, before the UI.
             self.entity_pipeline.record(&ctx.device, cmd, frame.descriptor_set);
+            // Translucent effects last, depth-tested but not depth-writing.
+            self.effects_pipeline.record(&ctx.device, cmd, frame.descriptor_set);
 
             // ── In-game egui overlay: IN-PASS record. Replays the UI draw list
             // prepared above, on top of the world, still inside the main subpass.
@@ -7590,6 +7614,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             ctx.device.destroy_command_pool(self.command_pool, None);
             self.pipeline.destroy(&ctx.device);
             self.entity_pipeline.destroy(&ctx.device);
+            self.effects_pipeline.destroy(&ctx.device);
             self.shadow_pipeline.destroy(&ctx.device);
             self.shadow.destroy(&ctx.device);
             self.froxel_fill_pipeline.destroy(&ctx.device);
