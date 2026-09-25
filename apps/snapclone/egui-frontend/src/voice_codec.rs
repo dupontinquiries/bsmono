@@ -149,6 +149,24 @@ impl VoiceCodec {
         }
     }
 
+    /// This speaker's frame is missing but the packet AFTER it is here: rebuild
+    /// the missing frame from that packet's in-band FEC (the encoder embeds it:
+    /// snapclone_audio::codec::EXPECTED_LOSS_PERC). Closer to what was said than
+    /// `conceal`'s extrapolation. The next packet is still decoded normally in
+    /// its own slot afterwards. None without history or without the codec.
+    pub fn recover(&mut self, peer: &str, next_packet: &[u8]) -> Option<Vec<f32>> {
+        #[cfg(feature = "opus")]
+        {
+            let n = *self.last_len.get(peer)?;
+            return self.decoders.get_mut(peer)?.recover(next_packet, n).map(|s| to_f32(&s));
+        }
+        #[cfg(not(feature = "opus"))]
+        {
+            let _ = (peer, next_packet);
+            None
+        }
+    }
+
     /// The call ended: every speaker's decoder state goes with it.
     pub fn reset(&mut self) {
         *self = VoiceCodec::new(self.sample_rate, self.frame_samples);

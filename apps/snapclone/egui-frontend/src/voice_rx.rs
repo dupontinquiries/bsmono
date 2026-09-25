@@ -25,13 +25,20 @@ pub struct VoiceRx {
     codec: VoiceCodec,
     playout: VoicePlayout,
     store: HashMap<String, BTreeMap<u64, Vec<u8>>>,
+    /// Each speaker's next expected sequence number: after a Play, or after a
+    /// concealed slot (which used that number). Tells `tick` WHICH frame a
+    /// `Conceal` stands for, so it can look for the packet after it.
+    next: HashMap<String, u64>,
+    /// Rebuild a lost frame from the next packet's FEC when that packet is here
+    /// (default); off = plain concealment (for comparison in tests).
+    pub fec: bool,
 }
 
 impl VoiceRx {
     pub fn new(sample_rate: u32, frame_samples: usize) -> VoiceRx {
         let mut playout = VoicePlayout::default();
         playout.start();
-        VoiceRx { codec: VoiceCodec::new(sample_rate, frame_samples), playout, store: HashMap::new() }
+        VoiceRx { codec: VoiceCodec::new(sample_rate, frame_samples), playout, store: HashMap::new(), next: HashMap::new(), fec: true }
     }
 
     /// One Opus packet from `peer`.
@@ -43,6 +50,7 @@ impl VoiceRx {
             // A new spurt restarts sequence numbers: whatever is stored belongs
             // to the previous one (the scheduler discards those frames too).
             store.clear();
+            self.next.remove(peer);
         }
         if self.playout.on_frame(peer, frame) {
             store.insert(seq, data);
@@ -56,6 +64,7 @@ impl VoiceRx {
         for (peer, decision) in self.playout.tick() {
             let samples = match decision {
                 Playout::Play { seq, .. } => {
+                    self.next.insert(peer.clone(), seq + 1);
                     let store = self.store.entry(peer.clone()).or_default();
                     let bytes = store.remove(&seq);
                     // Anything older than what just played can never play.
@@ -63,7 +72,17 @@ impl VoiceRx {
                     for k in stale { store.remove(&k); }
                     bytes.and_then(|b| self.codec.decode(&peer, Codec::Opus, &b))
                 }
-                Playout::Conceal => self.codec.conceal(&peer),
+                Playout::Conceal => {
+                    // The frame this slot was for; if the one after it is
+                    // already here, rebuild from its FEC rather than guess.
+                    let missing = self.next.get(&peer).copied();
+                    if let Some(m) = missing { self.next.insert(peer.clone(), m + 1); }
+                    let after = missing.and_then(|m| self.store.get(&peer).and_then(|s| s.get(&(m + 1)).cloned()));
+                    match after {
+                        Some(next_packet) if self.fec => self.codec.recover(&peer, &next_packet).or_else(|| self.codec.conceal(&peer)),
+                        _ => self.codec.conceal(&peer),
+                    }
+                }
                 Playout::Silence => None,
             };
             if let Some(s) = samples { out.push((peer, s)); }
@@ -104,7 +123,20 @@ mod tests {
 
     /// Drive: packets arrive in `order` (index = seq), one per tick, then drain.
     fn run(order: &[usize], packets: &[Vec<u8>], lose: &[usize]) -> Vec<Vec<f32>> {
+        // The DEFAULT receive path, as the app gets it.
         let mut rx = VoiceRx::new(SAMPLE_RATE, n());
+        let mut heard = Vec::new();
+        for (k, &seq) in order.iter().enumerate() {
+            if !lose.contains(&seq) { rx.arrive("ann", seq as u32, seq == 0, packets[seq].clone()); }
+            if k >= 1 { for (_, s) in rx.tick() { heard.push(s); } }
+        }
+        for _ in 0..4 { for (_, s) in rx.tick() { heard.push(s); } }
+        heard
+    }
+
+    fn run_fec(order: &[usize], packets: &[Vec<u8>], lose: &[usize], fec: bool) -> Vec<Vec<f32>> {
+        let mut rx = VoiceRx::new(SAMPLE_RATE, n());
+        rx.fec = fec;
         let mut heard = Vec::new();
         for (k, &seq) in order.iter().enumerate() {
             if !lose.contains(&seq) { rx.arrive("ann", seq as u32, seq == 0, packets[seq].clone()); }
@@ -136,7 +168,9 @@ mod tests {
         let p = ramp(12);
         let order: Vec<usize> = (0..12).collect();
         let full = run(&order, &p, &[]);
-        let lossy = run(&order, &p, &[6]);
+        // Concealment on its own (FEC off): the path taken when the packet after
+        // the gap has NOT arrived yet. With FEC see the next test.
+        let lossy = run_fec(&order, &p, &[6], false);
         assert_eq!(lossy.len(), full.len(), "the lost frame's slot is filled, not skipped");
         assert!(lossy.iter().all(|f| f.len() == n()));
         let slot = lossy.iter().position(|f| rms(f) > 0.0).map(|start| start + 6).unwrap();
@@ -171,5 +205,27 @@ mod tests {
         assert!(played >= 5, "the second spurt played ({played} frames)");
         rx.forget("bo");
         assert_eq!(rx.held("bo"), 0);
+    }
+
+    /// On the receive path: a lost frame whose successor is already buffered is
+    /// rebuilt from that packet's FEC, closer to the full stream than
+    /// concealment, and the audio after the gap recovers sooner.
+    #[test]
+    fn a_lost_frame_is_rebuilt_from_the_next_packets_fec() {
+        let p = ramp(12);
+        let order: Vec<usize> = (0..12).collect();
+        let full = run(&order, &p, &[]);
+        let (fec, plc) = (run(&order, &p, &[6]), run_fec(&order, &p, &[6], false));
+        let slot = full.iter().position(|f| rms(f) > 0.0).unwrap() + 6;
+        let err = |a: &[f32], b: &[f32]| (a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>() / a.len() as f32).sqrt();
+        let (e_fec, e_plc) = (err(&fec[slot], &full[slot]), err(&plc[slot], &full[slot]));
+        assert!(e_fec < e_plc * 0.8, "slot error FEC {e_fec:.4} vs concealment {e_plc:.4}");
+        // And the audio after the gap is back at once: measured 1.00 of the full
+        // stream over the next three frames with FEC, against 0.60 / 0.71 / 0.80
+        // after concealment (the decoder no longer re-converges from a guess).
+        for k in 1..=3 {
+            let r = rms(&fec[slot + k]) / rms(&full[slot + k]);
+            assert!(r > 0.95, "frame {k} after the gap at {r:.2} of the full stream");
+        }
     }
 }
