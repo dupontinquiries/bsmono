@@ -457,8 +457,20 @@ impl Vfx {
     /// were bare orbs: a fast one read as a dot).
     pub fn tick_trails(&mut self, game: &Game) {
         for p in &game.projectiles {
-            if !matches!(p.kind, crate::sim::ProjKind::Bolt) {
-                continue;
+            match p.kind {
+                crate::sim::ProjKind::Arrow => {
+                    // a short thin streak
+                    let back = -p.vel.normalize_or_zero();
+                    self.particles.push(Particle { pos: p.pos + back * 0.2, vel: Vec3::ZERO, life: 0.12, max_life: 0.12, size: 0.06, color: [0.95, 0.95, 0.9], alpha: 0.6, gravity: 0.0, drag: 0.0 });
+                    continue;
+                }
+                crate::sim::ProjKind::Lob { .. } => {
+                    // a boulder smokes through its arc (lit dust, not light)
+                    let j = Vec3::new(self.perturb(0.2), self.perturb(0.2), self.perturb(0.2));
+                    self.dust.push(Particle { pos: p.pos + j, vel: Vec3::Y * 0.4, life: 0.8, max_life: 0.8, size: 0.28, color: [0.42, 0.38, 0.33], alpha: 0.55, gravity: -0.2, drag: 1.5 });
+                    continue;
+                }
+                crate::sim::ProjKind::Bolt => {}
             }
             let back = -p.vel.normalize_or_zero();
             for k in 0..2 {
@@ -629,6 +641,13 @@ impl Vfx {
                     }
                 }
                 Event::Explosion { pos, radius, color } => {
+                    // every impact kicks up earth (lit dust)
+                    for k in 0..12 {
+                        let a = k as f32 / 12.0 * std::f32::consts::TAU + self.perturb(0.2);
+                        let d = Vec3::new(a.cos(), 0.0, a.sin());
+                        let up = 1.4 + self.perturb(0.6);
+                        self.dust.push(Particle { pos: *pos + d * 0.5 + Vec3::Y * 0.2, vel: d * (*radius * 0.9) + Vec3::Y * up, life: 1.0, max_life: 1.0, size: 0.45, color: [0.38 + color[0] * 0.05, 0.31 + color[1] * 0.05, 0.23 + color[2] * 0.05], alpha: 0.65, gravity: 0.5, drag: 2.2 });
+                    }
                     self.quake(*pos, *radius, (*radius / 6.0).clamp(0.2, 1.0));
                     let n = (*radius * 10.0).min(90.0) as usize;
                     for i in 0..n {
@@ -746,7 +765,29 @@ impl Vfx {
                     }
                 }
                 Event::HealFx { pos, radius } => {
-                    for _ in 0..40 {
+                    // a green glyph spreading on the ground (a countdown ring)
+                    self.rings.push(Ring { pos: *pos + Vec3::Y * 0.05, r0: 0.4, r1: *radius, until: 0.7, dur: 0.7, color: [0.45, 1.0, 0.6], thick: 0.16 });
+                    // motes climbing a helix, three strands, round the centre
+                    for k in 0..36 {
+                        let strand = (k % 3) as f32 * std::f32::consts::TAU / 3.0;
+                        let h = (k / 3) as f32 / 12.0;
+                        let a = strand + h * std::f32::consts::TAU * 1.5;
+                        let r = 0.9;
+                        let p = *pos + Vec3::new(a.cos() * r, 0.2 + h * 0.4, a.sin() * r);
+                        let tangent = Vec3::new(-a.sin(), 0.0, a.cos());
+                        self.particles.push(Particle {
+                            pos: p,
+                            vel: tangent * 2.2 + Vec3::Y * 2.6,
+                            life: 1.0,
+                            max_life: 1.0,
+                            size: 0.18,
+                            color: [0.6, 1.3, 0.7],
+                            alpha: 0.9,
+                            gravity: -0.5,
+                            drag: 0.8,
+                        });
+                    }
+                    for _ in 0..24 {
                         let a = self.perturb(std::f32::consts::TAU);
                         let r = self.perturb(*radius);
                         self.particles.push(Particle {
@@ -1289,23 +1330,14 @@ impl Vfx {
             }
         }
 
-        // persistent shield shells on shielded gods
+        // Shields: a GLASS DOME round the cat -- a sphere of small facets,
+        // nearly clear face-on and bright at its rim (Fresnel: glass seen
+        // edge-on reflects), slowly turning. It was 30 cubes orbiting.
         for g in &game.gods {
             if g.shield > 0.0 && g.respawn_t <= 0.0 {
-                let color = if g.team == crate::consts::Team::Blue { [0.45, 0.75, 1.0] } else { [1.0, 0.5, 0.45] };
-                for i in 0..30 {
-                    let a = i as f32 / 30.0 * std::f32::consts::TAU + self.time * 1.6;
-                    let wob = (self.time * 3.0 + i as f32).sin() * 0.12;
-                    out.push(VoxInst {
-                        off_ao: [
-                            g.pos.x + a.cos() * 1.25,
-                            g.pos.y + 1.15 + wob + ((i % 3) as f32 - 1.0) * 0.55,
-                            g.pos.z + a.sin() * 1.25,
-                            1.0,
-                        ],
-                        color: [color[0], color[1], color[2], 0.5],
-                        misc: [0.3, 0.0, 0.0, 0.0],
-                    });
+                let color = if g.team == crate::consts::Team::Blue { [0.35, 0.7, 1.0] } else { [1.0, 0.45, 0.35] };
+                for f in shield_facets(g.pos + Vec3::Y * 1.0, 1.35, self.time, cam_eye) {
+                    out.push(VoxInst { off_ao: [f.0.x, f.0.y, f.0.z, 1.0], color: [color[0] * 1.6, color[1] * 1.6, color[2] * 1.6, f.1], misc: [0.17, 0.0, 0.0, 0.0] });
                 }
             }
         }
@@ -1891,5 +1923,68 @@ mod ring_tests {
             v.update(1.0 / 60.0, &[], &game);
         }
         assert!(v.rings.is_empty(), "rings still alive after 0.75 s: {:?}", v.rings.iter().map(|r| r.until).collect::<Vec<_>>());
+    }
+}
+
+/// The shield dome's facets: points on a sphere about `c` (a Fibonacci
+/// spiral, turning with `time`), each with its alpha -- faint where the
+/// dome faces the camera, bright where it is seen edge-on.
+pub fn shield_facets(c: Vec3, r: f32, time: f32, eye: Vec3) -> Vec<(Vec3, f32)> {
+    let n = 110;
+    let golden = std::f32::consts::PI * (3.0 - 5.0f32.sqrt());
+    let spin = time * 0.35;
+    let to_eye = (eye - c).normalize_or_zero();
+    (0..n)
+        .filter_map(|i| {
+            let y = 1.0 - (i as f32 + 0.5) / n as f32 * 2.0;
+            let rr = (1.0 - y * y).max(0.0).sqrt();
+            let a = golden * i as f32 + spin;
+            let nrm = Vec3::new(a.cos() * rr, y, a.sin() * rr);
+            // the dome sits on the ground: nothing below it
+            let p = c + nrm * r;
+            if p.y < c.y - r * 0.75 {
+                return None;
+            }
+            let facing = nrm.dot(to_eye).abs();
+            let alpha = 0.1 + 0.75 * (1.0 - facing).powi(2);
+            Some((p, alpha))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod more_fx_tests {
+    use super::*;
+
+    /// A shield is a glass dome: faint where it faces the camera, bright
+    /// edge-on, on a sphere round the cat, nothing below the ground.
+    #[test]
+    fn a_shield_is_a_glass_dome() {
+        let c = Vec3::new(0.0, 1.0, 0.0);
+        let eye = Vec3::new(0.0, 1.0, -10.0);
+        let f = shield_facets(c, 1.35, 0.0, eye);
+        assert!(f.len() > 50);
+        assert!(f.iter().all(|(p, _)| ((*p - c).length() - 1.35).abs() < 1e-3 && p.y >= c.y - 1.35 * 0.75 - 1e-3));
+        let facing: Vec<f32> = f.iter().filter(|(p, _)| (*p - c).normalize().dot((eye - c).normalize()).abs() > 0.9).map(|x| x.1).collect();
+        let edge: Vec<f32> = f.iter().filter(|(p, _)| (*p - c).normalize().dot((eye - c).normalize()).abs() < 0.2).map(|x| x.1).collect();
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
+        assert!(!facing.is_empty() && !edge.is_empty());
+        assert!(mean(&edge) > mean(&facing) * 3.0, "rim {} vs face-on {}", mean(&edge), mean(&facing));
+    }
+
+    /// A heal spreads a ring and sends motes up a helix; an explosion
+    /// kicks up lit dust.
+    #[test]
+    fn heals_spiral_and_impacts_raise_dust() {
+        let game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        let mut v = Vfx::default();
+        v.update(1.0 / 60.0, &[Event::HealFx { pos: Vec3::ZERO, radius: 4.0 }], &game);
+        assert_eq!(v.rings.len(), 1);
+        // the helix motes move round the centre, not straight up
+        let turning = v.particles.iter().filter(|p| Vec3::new(p.vel.x, 0.0, p.vel.z).length() > 1.0).count();
+        assert!(turning >= 30, "{turning} motes turning");
+        let mut v = Vfx::default();
+        v.update(1.0 / 60.0, &[Event::Explosion { pos: Vec3::ZERO, radius: 3.0, color: [1.0, 0.5, 0.2] }], &game);
+        assert!(v.dust.len() >= 12, "impact dust: {}", v.dust.len());
     }
 }

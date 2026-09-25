@@ -78,8 +78,10 @@ the single highest-value thing anyone can do with this repo next.
   are unchanged -- each archetype's cast/impact wants its own upgrade pass.
   Done since: dash/blink afterimages, bolt trails, a nova dust wave (lit,
   non-emissive -- `Vfx::dust`; confirmed on screen mid-blast: 45k pixels).
-  Still to upgrade: volleys, lobs, beams (heat haze), rings, pulls, heals,
-  shields (a glass dome), buffs.
+  Then: shields are a glass dome (Fresnel rim), heals a helix and a
+  glyph ring, arrows streak, lobbed boulders smoke (no ancestor lobs --
+  towers/sim do), explosions raise lit dust.
+  Still to upgrade: volleys, beams (heat haze), rings, pulls, buffs.
 
 - **Twinfang Pass (15v15 mountain map, c20unified-015).** `--map pass`.
   * **The map is chosen at launch only**: the terrain mesh is built in

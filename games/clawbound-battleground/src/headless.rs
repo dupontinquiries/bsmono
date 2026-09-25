@@ -1956,7 +1956,7 @@ pub fn run_abilityfx_shots() -> Result<(), String> {
         renderer.atmosphere = game.weather.atmosphere();
         renderer.render_frame(&view, cam, game.t);
         save_shot(&renderer.device, &renderer.queue, &target, name)?;
-        println!("saved {name} ({} afterimages, {} particles)", vfx.afterimages.len(), vfx.particles.len());
+        println!("saved {name} ({} afterimages, {} particles; caster shield {:.0})", vfx.afterimages.len(), vfx.particles.len(), game.gods[0].shield);
         // and the same frame without the dust, to find it by difference
         if !vfx.dust.is_empty() {
             let mut nodust = std::mem::take(&mut vfx.dust);
@@ -1982,6 +1982,11 @@ pub fn run_abilityfx_shots() -> Result<(), String> {
     run(&mut renderer, "Goldenmane", |a| matches!(a, crate::gods::Archetype::Dash { .. }), 12, "abilityfx_dash.png", side)?;
     run(&mut renderer, "Oldroar", |a| matches!(a, crate::gods::Archetype::Nova { .. }), 42, "abilityfx_nova.png", side)?;
     run(&mut renderer, "Suneye", |a| matches!(a, crate::gods::Archetype::Bolt { .. }), 22, "abilityfx_bolt.png", side)?;
+    // whoever has each of these (the first ancestor with one)
+    let who = |f: fn(&crate::gods::Archetype) -> bool| crate::gods::ROSTER.iter().find(|d| d.abilities.iter().any(|a| f(&a.arch))).map(|d| d.name).unwrap();
+    let close = Camera { eye: spot + Vec3::new(2.5, 2.4, -5.0), target: spot + Vec3::new(0.3, 0.9, 0.0), fov_y: 0.9 };
+    run(&mut renderer, who(|a| matches!(a, crate::gods::Archetype::Shield { .. })), |a| matches!(a, crate::gods::Archetype::Shield { .. }), 40, "abilityfx_shield.png", close)?;
+    run(&mut renderer, who(|a| matches!(a, crate::gods::Archetype::Heal { .. })), |a| matches!(a, crate::gods::Archetype::Heal { .. }), 34, "abilityfx_heal.png", close)?;
     Ok(())
 }
 
