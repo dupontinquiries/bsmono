@@ -119,11 +119,35 @@ pub fn parse_machine_running(json: &str) -> Option<bool> {
 /// features/`--no-default-features` logic is not duplicated between the
 /// local and containerised build paths.
 pub fn build_argv(app: &str, app_dir: &Path, triple: &str, features: &[String], no_default: bool, image: &str) -> Vec<String> {
+    build_argv_at(app, app_dir, &mount_root(app_dir), triple, features, no_default, image)
+}
+
+/// What to mount: the repository the app lives in (the nearest ancestor with
+/// a `.git`), else the app's own directory. An app's `path =` dependencies
+/// point OUTSIDE its directory (tideshell: ../crates/tideshell-core,
+/// ../../../shared/...), so mounting only the app left every one of them
+/// missing inside the container.
+pub fn mount_root(app_dir: &Path) -> PathBuf {
+    app_dir.ancestors()
+        .find(|d| d.join(".git").exists())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| app_dir.to_path_buf())
+}
+
+/// The podman argv, mounting `root` and building from `app_dir`'s place in it.
+/// `--security-opt label=disable` rather than `:z`: on SELinux hosts (Fedora)
+/// `:z` relabels every file under the mount -- the whole checkout -- which is
+/// slow and changes the user's files; disabling labelling for this one
+/// container touches nothing.
+pub fn build_argv_at(app: &str, app_dir: &Path, root: &Path, triple: &str, features: &[String], no_default: bool, image: &str) -> Vec<String> {
     let cargo_argv = crate::buildflags::cargo_build_argv(app, triple, features, no_default);
+    let rel = app_dir.strip_prefix(root).unwrap_or(Path::new(""));
+    let workdir = Path::new("/home/rust/src").join(rel);
     let mut argv = vec![
         "run".to_string(), "--rm".to_string(),
-        "-v".to_string(), format!("{}:/home/rust/src:z", app_dir.display()),
-        "-w".to_string(), "/home/rust/src".to_string(),
+        "--security-opt".to_string(), "label=disable".to_string(),
+        "-v".to_string(), format!("{}:/home/rust/src", root.display()),
+        "-w".to_string(), workdir.to_string_lossy().into_owned(),
         image.to_string(),
     ];
     argv.extend(cargo_argv);
@@ -254,15 +278,21 @@ mod tests {
 
     #[test]
     fn build_argv_mounts_the_app_dir_and_reuses_the_cargo_argv() {
+        // Mounting the REPOSITORY: tideshell's path dependencies live outside its
+        // directory (../crates/tideshell-core, ../../../shared/...).
         let dir = Path::new("/repo/apps/tideshell/egui-frontend");
-        let argv = build_argv("tideshell", dir, "aarch64-unknown-linux-musl",
+        let argv = build_argv_at("tideshell", dir, Path::new("/repo"), "aarch64-unknown-linux-musl",
                                &["wayland".to_string(), "layer".to_string()], true,
                                "docker.io/messense/rust-musl-cross:aarch64-musl");
         assert_eq!(argv[0], "run");
         assert!(argv.contains(&"--rm".to_string()));
-        assert!(argv.iter().any(|a| a == "-v"));
-        let mount = argv.iter().find(|a| a.contains(":/home/rust/src:z")).expect("a mount arg");
-        assert!(mount.starts_with("/repo/apps/tideshell/egui-frontend:"));
+        let v = argv.iter().position(|a| a == "-v").unwrap();
+        assert_eq!(argv[v + 1], "/repo:/home/rust/src", "the repository, not just the app");
+        let w = argv.iter().position(|a| a == "-w").unwrap();
+        assert_eq!(argv[w + 1], "/home/rust/src/apps/tideshell/egui-frontend");
+        let so = argv.iter().position(|a| a == "--security-opt").unwrap();
+        assert_eq!(argv[so + 1], "label=disable", "no recursive :z relabel of the checkout");
+        assert!(!argv.iter().any(|a| a.ends_with(":z")));
         assert!(argv.contains(&"docker.io/messense/rust-musl-cross:aarch64-musl".to_string()));
         // The same argv cargo_build_argv would produce, appended after the image.
         let image_pos = argv.iter().position(|a| a == "docker.io/messense/rust-musl-cross:aarch64-musl").unwrap();
@@ -295,5 +325,19 @@ mod tests {
         assert_eq!(local_override(up), "localhost/messense/rust-musl-cross:aarch64-musl");
         assert_eq!(choose_image(up, false), up);
         assert_eq!(choose_image(up, true), "localhost/messense/rust-musl-cross:aarch64-musl");
+    }
+
+    #[test]
+    fn the_mount_is_the_repository_the_app_lives_in() {
+        let base = std::env::temp_dir().join(format!("cockpit-mount-{}", std::process::id()));
+        let app = base.join("repo/apps/tideshell/egui-frontend");
+        std::fs::create_dir_all(&app).unwrap();
+        assert_eq!(mount_root(&app), app, "no .git anywhere: the app's own directory");
+        std::fs::create_dir_all(base.join("repo/.git")).unwrap();
+        assert_eq!(mount_root(&app), base.join("repo"));
+        let argv = build_argv("tideshell", &app, "aarch64-unknown-linux-musl", &[], true, "img");
+        let w = argv.iter().position(|a| a == "-w").unwrap();
+        assert_eq!(argv[w + 1], "/home/rust/src/apps/tideshell/egui-frontend");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
