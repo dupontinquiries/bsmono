@@ -381,16 +381,8 @@ pub fn build_locally_cancellable(
     // Workspace root with no [package] (gitmind: package `gitmind-cli`, binary `gitmind`) → build
     // `--bin <name>`, since `-p <name>` names a package that doesn't exist. The binary is still
     // named <name>, so binary resolution is unchanged.
+    let (build_id, as_bin) = cargo_selector(app, app_dir);
     let root_toml = std::fs::read_to_string(app_dir.join("Cargo.toml")).unwrap_or_default();
-    let as_bin = crate::buildflags::declares_workspace(&root_toml)
-        && crate::buildflags::crate_name(&root_toml).is_none()
-        && !has_member_package(app_dir, app); // logscope HAS a member pkg `logscope` → keep -p
-    // The REAL cargo package (and, absent an explicit [[bin]] override, binary) name — this can
-    // differ from `app`, the manifest/display id (e.g. voiceterm's crate is still named "web2qml"
-    // from before the app was renamed; `-p voiceterm`/a `target/release/voiceterm` lookup both
-    // fail even though the app itself builds fine). Falls back to `app` when there's no [package]
-    // name to read at all (the as_bin workspace-root case above, where `app` IS the real bin name).
-    let build_id = crate::buildflags::build_id(app, &root_toml);
     let argv = crate::buildflags::cargo_build_argv_kind(&build_id, &cargo_target, feats, no_default, as_bin);
     // The environment the target needs. For a WINDOWED app on musl this adds
     // `-C target-feature=-crt-static`, without which the build succeeds and the app cannot
@@ -607,6 +599,25 @@ pub fn run_build_all_script(repo_root: &Path, only: Option<&str>, on_line: &mut 
 /// Does a workspace under `dir` contain a MEMBER package literally named `name`? If so, `-p name`
 /// resolves (build that member); if not (gitmind: members are `gitmind-cli` etc., no `gitmind`), we
 /// must build `--bin name` instead. Bounded walk; skips target/.git.
+/// How cargo is told which package to build for `app` in `app_dir`: the REAL
+/// package name and whether to select it with `--bin` instead of `-p`. Shared by
+/// the local build and the podman build -- the podman path passed the raw app id
+/// (`-p tideshell`, where the package is `tideshell-egui`) and cargo refused it
+/// as "cannot specify features for packages outside of workspace".
+///
+/// Workspace root with no [package] (gitmind: package `gitmind-cli`, binary
+/// `gitmind`) → `--bin <name>`, since `-p <name>` names a package that doesn't
+/// exist. Otherwise the real [package] name, which can differ from `app`, the
+/// manifest/display id (voiceterm's crate is still named "web2qml"); `app` when
+/// there is no [package] name to read.
+pub fn cargo_selector(app: &str, app_dir: &Path) -> (String, bool) {
+    let root_toml = std::fs::read_to_string(app_dir.join("Cargo.toml")).unwrap_or_default();
+    let as_bin = crate::buildflags::declares_workspace(&root_toml)
+        && crate::buildflags::crate_name(&root_toml).is_none()
+        && !has_member_package(app_dir, app); // logscope HAS a member pkg `logscope` → keep -p
+    (crate::buildflags::build_id(app, &root_toml), as_bin)
+}
+
 fn has_member_package(dir: &Path, name: &str) -> bool {
     fn walk(dir: &Path, name: &str, depth: u32) -> bool {
         if depth > 3 {

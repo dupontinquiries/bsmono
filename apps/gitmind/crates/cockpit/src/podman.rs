@@ -119,7 +119,10 @@ pub fn parse_machine_running(json: &str) -> Option<bool> {
 /// features/`--no-default-features` logic is not duplicated between the
 /// local and containerised build paths.
 pub fn build_argv(app: &str, app_dir: &Path, triple: &str, features: &[String], no_default: bool, image: &str) -> Vec<String> {
-    build_argv_at(app, app_dir, &mount_root(app_dir), triple, features, no_default, image)
+    // The package cargo is told to build, chosen exactly as the local build
+    // chooses it (ops::cargo_selector).
+    let (id, as_bin) = crate::ops::cargo_selector(app, app_dir);
+    build_argv_at(&id, as_bin, app_dir, &mount_root(app_dir), triple, features, no_default, image)
 }
 
 /// What to mount: the repository the app lives in (the nearest ancestor with
@@ -139,8 +142,8 @@ pub fn mount_root(app_dir: &Path) -> PathBuf {
 /// `:z` relabels every file under the mount -- the whole checkout -- which is
 /// slow and changes the user's files; disabling labelling for this one
 /// container touches nothing.
-pub fn build_argv_at(app: &str, app_dir: &Path, root: &Path, triple: &str, features: &[String], no_default: bool, image: &str) -> Vec<String> {
-    let cargo_argv = crate::buildflags::cargo_build_argv(app, triple, features, no_default);
+pub fn build_argv_at(cargo_id: &str, as_bin: bool, app_dir: &Path, root: &Path, triple: &str, features: &[String], no_default: bool, image: &str) -> Vec<String> {
+    let cargo_argv = crate::buildflags::cargo_build_argv_kind(cargo_id, triple, features, no_default, as_bin);
     let rel = app_dir.strip_prefix(root).unwrap_or(Path::new(""));
     let workdir = Path::new("/home/rust/src").join(rel);
     let mut argv = vec![
@@ -281,7 +284,7 @@ mod tests {
         // Mounting the REPOSITORY: tideshell's path dependencies live outside its
         // directory (../crates/tideshell-core, ../../../shared/...).
         let dir = Path::new("/repo/apps/tideshell/egui-frontend");
-        let argv = build_argv_at("tideshell", dir, Path::new("/repo"), "aarch64-unknown-linux-musl",
+        let argv = build_argv_at("tideshell", false, dir, Path::new("/repo"), "aarch64-unknown-linux-musl",
                                &["wayland".to_string(), "layer".to_string()], true,
                                "docker.io/messense/rust-musl-cross:aarch64-musl");
         assert_eq!(argv[0], "run");
@@ -338,6 +341,23 @@ mod tests {
         let argv = build_argv("tideshell", &app, "aarch64-unknown-linux-musl", &[], true, "img");
         let w = argv.iter().position(|a| a == "-w").unwrap();
         assert_eq!(argv[w + 1], "/home/rust/src/apps/tideshell/egui-frontend");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The report: `-p tideshell` inside the container, where the package is
+    /// `tideshell-egui` -- "cannot specify features for packages outside of
+    /// workspace". The container build now names the package the local build does.
+    #[test]
+    fn the_container_build_names_the_real_package() {
+        let base = std::env::temp_dir().join(format!("cockpit-pkg-{}", std::process::id()));
+        let app = base.join("repo/apps/tideshell/egui-frontend");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(base.join("repo/.git")).unwrap();
+        std::fs::write(app.join("Cargo.toml"), "[package]\nname = \"tideshell-egui\"\nversion = \"0.1.0\"\n").unwrap();
+        let argv = build_argv("tideshell", &app, "aarch64-unknown-linux-musl", &["wayland".into()], true, "img");
+        let p = argv.iter().position(|a| a == "-p").expect("-p");
+        assert_eq!(argv[p + 1], "tideshell-egui", "{argv:?}");
+        assert_eq!(crate::ops::cargo_selector("tideshell", &app), ("tideshell-egui".to_string(), false));
         let _ = std::fs::remove_dir_all(&base);
     }
 }
