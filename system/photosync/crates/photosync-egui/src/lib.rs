@@ -64,6 +64,9 @@ pub struct App {
     pub full: Option<thumbs::Thumbs>,
     /// The viewer's current large picture, by path.
     pub full_tex: Option<(String, egui::TextureHandle)>,
+    /// The service's database this library came from (`from_path`), whose
+    /// stored thumbnails the grid uses; None for the demo.
+    pub db_path: Option<std::path::PathBuf>,
 }
 
 /// The photo `delta` steps from `current` in `order`, clamped at the ends;
@@ -94,7 +97,8 @@ impl App {
             textures: std::collections::HashMap::new(),
             viewing: None,
             full: None,
-            full_tex: None
+            full_tex: None,
+            db_path: None
         }
     }
 
@@ -113,7 +117,9 @@ impl App {
         let conn = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| format!("{}: {e}", db.display()))?;
         let lib = photosync::album::load(&conn).map_err(|e| format!("{}: {e}", db.display()))?;
-        Ok(App::new(lib))
+        let mut app = App::new(lib);
+        app.db_path = Some(db.to_path_buf());
+        Ok(app)
     }
 
     /// A library with no real store behind it — see `from_db` for the real

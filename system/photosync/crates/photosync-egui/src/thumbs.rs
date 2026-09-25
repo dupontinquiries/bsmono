@@ -60,6 +60,59 @@ impl Decode for ImageDecode {
     }
 }
 
+/// Thumbnails the photosync service already made, from its database, instead
+/// of decoding every original (a 12 MP JPEG per tile, on a phone).
+///
+/// The service stores `thumbnails(hash, data)` as JPEG made with image's
+/// `thumbnail()`: it does not apply EXIF orientation, and re-encoding drops the
+/// EXIF -- so each stored thumbnail keeps the sensor's orientation with nothing
+/// saying so. The turn is read from the ORIGINAL file's header (its first
+/// 128 KB) and applied here, which is right for every thumbnail already
+/// stored. No stored thumbnail (not generated yet): the original is decoded.
+pub struct StoreDecode {
+    conn: Mutex<rusqlite::Connection>,
+    hashes: HashMap<String, String>,
+}
+
+impl StoreDecode {
+    /// Read-only on the service's database; `hashes` maps a file's path to its
+    /// thumbnail hash (from the library's items).
+    pub fn open(db: &std::path::Path, hashes: HashMap<String, String>) -> Result<StoreDecode, String> {
+        let conn = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("{}: {e}", db.display()))?;
+        Ok(StoreDecode { conn: Mutex::new(conn), hashes })
+    }
+
+    fn stored(&self, hash: &str) -> Option<Vec<u8>> {
+        let conn = self.conn.lock().ok()?;
+        conn.query_row("SELECT data FROM thumbnails WHERE hash = ?1", [hash], |r| r.get::<_, Vec<u8>>(0)).ok()
+    }
+}
+
+/// The first bytes of a file -- enough for its EXIF header.
+fn head(path: &str, n: u64) -> Vec<u8> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    if let Ok(f) = std::fs::File::open(path) {
+        let _ = f.take(n).read_to_end(&mut buf);
+    }
+    buf
+}
+
+impl Decode for StoreDecode {
+    fn decode(&self, path: &str, max_side: u32) -> Result<Thumb, String> {
+        if let Some(bytes) = self.hashes.get(path).and_then(|h| self.stored(h)) {
+            if let Ok(img) = image::load_from_memory(&bytes) {
+                let fitted = if img.width().max(img.height()) > max_side { img.thumbnail(max_side, max_side) } else { img };
+                let small = orient(fitted, exif_orientation(&head(path, 128 * 1024))).to_rgba8();
+                let (w, h) = small.dimensions();
+                return Ok(Thumb { w, h, rgba: small.into_raw() });
+            }
+        }
+        ImageDecode.decode(path, max_side)
+    }
+}
+
 /// EXIF orientation (1..=8) of a JPEG, or 1 when there is none or it cannot be
 /// read: APP1 "Exif\0\0", a TIFF header (II / MM), IFD0's tag 0x0112. Reads
 /// only the headers; anything malformed is "no rotation", never an error.
@@ -450,6 +503,42 @@ mod tests {
         let bottom = &t.rgba[(120 * t.w as usize + 32) * 4..][..3];
         assert!(top[0] > 150 && top[2] < 100, "red on top: {top:?}");
         assert!(bottom[2] > 150 && bottom[0] < 100, "blue below: {bottom:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The service's stored thumbnail is used (green: the original is red and
+    /// blue), turned by the ORIGINAL's EXIF orientation (the stored JPEG has
+    /// none); a file without one falls back to decoding the original.
+    #[test]
+    fn stored_thumbnails_are_used_and_turned_by_the_originals_orientation() {
+        let dir = std::env::temp_dir().join(format!("photosync-store-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("blocks")).unwrap();
+        let db = dir.join("photosync.db");
+        let mut service = photosync::PhotoSyncDB::new(&db, &dir.join("blocks")).unwrap();
+        // The original: 400x200 sensor pixels, left half red, EXIF orientation 6.
+        let mut img = image::RgbImage::new(400, 200);
+        for (x, _, px) in img.enumerate_pixels_mut() { *px = if x < 200 { image::Rgb([220, 20, 20]) } else { image::Rgb([20, 20, 220]) }; }
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95).encode_image(&img).unwrap();
+        let mut original = jpeg[..2].to_vec();
+        original.extend(exif_app1(6, true));
+        original.extend_from_slice(&jpeg[2..]);
+        let photo = dir.join("IMG_0001.jpg");
+        std::fs::write(&photo, &original).unwrap();
+        // The service's thumbnail of it: sensor orientation (landscape), no EXIF.
+        let mut thumb = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut thumb, 95)
+            .encode_image(&image::RgbImage::from_pixel(200, 100, image::Rgb([20, 200, 20]))).unwrap();
+        service.store_thumbnail("h1", &thumb, 400, 200).unwrap();
+        drop(service);
+        let key = photo.to_string_lossy().into_owned();
+        let d = StoreDecode::open(&db, [(key.clone(), "h1".to_string())].into_iter().collect()).unwrap();
+        let t = d.decode(&key, 256).unwrap();
+        assert_eq!((t.w, t.h), (100, 200), "the stored thumbnail, turned upright by the original's EXIF");
+        assert!(t.rgba[1] > 150 && t.rgba[0] < 100, "green: it came from the store, not the original");
+        let none = StoreDecode::open(&db, HashMap::new()).unwrap().decode(&key, 128).unwrap();
+        assert_eq!((none.w, none.h), (64, 128), "no stored thumbnail: the original, upright");
+        assert!(none.rgba[0] > 150, "red on top: decoded from the original");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

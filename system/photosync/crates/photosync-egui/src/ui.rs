@@ -449,8 +449,19 @@ fn settings_view(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteC
 fn sync_thumbnails(app: &mut App, ctx: &Context) {
     if app.thumbs.is_none() {
         let repaint = ctx.clone();
+        // The service's stored thumbnails when this library came from its
+        // database (StoreDecode falls back to the original per file); else
+        // decode originals.
+        let decoder: std::sync::Arc<dyn crate::thumbs::Decode> = app.db_path.as_ref()
+            .and_then(|db| {
+                let hashes = app.library.by_day().into_iter().flat_map(|(_, items)| items.into_iter()
+                    .filter_map(|i| i.thumbnail.clone().map(|h| (i.path.clone(), h)))).collect();
+                crate::thumbs::StoreDecode::open(db, hashes).ok()
+            })
+            .map(|d| std::sync::Arc::new(d) as std::sync::Arc<dyn crate::thumbs::Decode>)
+            .unwrap_or_else(|| std::sync::Arc::new(crate::thumbs::ImageDecode));
         app.thumbs = Some(crate::thumbs::Thumbs::new(
-            std::sync::Arc::new(crate::thumbs::ImageDecode),
+            decoder,
             THUMB_THREADS,
             THUMB_SIDE,
             THUMB_BUDGET_BYTES,
