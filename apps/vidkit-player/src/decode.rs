@@ -308,7 +308,8 @@ pub enum Accel {
     Vaapi { device: String, codec: String, vpp: bool },
     /// Vulkan Video (VK_KHR_video_decode_*): Mesa RADV/ANV, NVK and NVIDIA's
     /// driver. The route NVIDIA has, which has no native VA-API.
-    Vulkan { codec: String },
+    /// `device`: the Vulkan device index -- the integrated GPU when it can.
+    Vulkan { codec: String, device: usize },
     /// A V4L2 memory-to-memory decoder (`vp9_v4l2m2m`...) — Venus on the
     /// Fairphone. An INPUT option: it replaces the software decoder.
     V4l2m2m { decoder: String },
@@ -345,20 +346,37 @@ pub struct Machine {
     pub vaapi: Option<Vec<(vidkit_core::codec::Codec, u8)>>,
     /// The VA driver offers video processing (scale_vaapi).
     pub vaapi_vpp: bool,
-    /// Codecs device 0 decodes through Vulkan Video, from `vulkaninfo`.
+    /// Codecs some device decodes through Vulkan Video, from `vulkaninfo`.
     pub vulkan: Option<Vec<vidkit_core::codec::Codec>>,
+    /// Each Vulkan device's type and decode codecs, to pick the iGPU.
+    pub vulkan_devices: Vec<vidkit_core::caps::VkVideoDevice>,
 }
 
 /// `vulkaninfo`'s Vulkan Video decode codecs for device 0, once. `None` when
 /// vulkaninfo is missing or lists none.
 pub fn vulkan_video_codecs() -> Option<Vec<vidkit_core::codec::Codec>> {
-    static V: OnceLock<Option<Vec<vidkit_core::codec::Codec>>> = OnceLock::new();
+    let mut all: Vec<vidkit_core::codec::Codec> = Vec::new();
+    for d in vulkan_devices() {
+        for c in &d.codecs {
+            if !all.contains(c) {
+                all.push(*c);
+            }
+        }
+    }
+    (!all.is_empty()).then_some(all)
+}
+
+/// Every Vulkan device with its type and decode codecs, once.
+pub fn vulkan_devices() -> &'static [vidkit_core::caps::VkVideoDevice] {
+    static V: OnceLock<Vec<vidkit_core::caps::VkVideoDevice>> = OnceLock::new();
     V.get_or_init(|| {
-        let out = Command::new("vulkaninfo").stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
-        let v = vidkit_core::caps::parse_vulkaninfo_video(&String::from_utf8_lossy(&out.stdout));
-        (!v.is_empty()).then_some(v)
+        Command::new("vulkaninfo")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map(|o| vidkit_core::caps::parse_vulkaninfo_devices(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or_default()
     })
-    .clone()
 }
 
 /// ffprobe's codec name as vidkit's codec.
@@ -477,9 +495,10 @@ pub fn choose_accel(codec: &str, m: &Machine, pref: AccelPref) -> Accel {
     // Vulkan Video where VAAPI does not cover it: NVIDIA (no native VA-API),
     // and Intel/AMD for a codec their VA driver lacks. ffmpeg must have the
     // vulkan hwaccel and device 0 must list the codec.
+    let vk_dev = codec_of(codec).and_then(|c| vidkit_core::caps::pick_vulkan_decoder(&m.vulkan_devices, Some(c)).map(|d| d.index));
     let vk_listed = matches!((&m.vulkan, codec_of(codec)), (Some(list), Some(c)) if list.contains(&c));
     if vk_listed && m.hwaccels.iter().any(|h| h == "vulkan") {
-        return Accel::Vulkan { codec: codec.to_string() };
+        return Accel::Vulkan { codec: codec.to_string(), device: vk_dev.unwrap_or(0) };
     }
     Accel::Software
 }
@@ -528,9 +547,21 @@ pub fn machine() -> &'static Machine {
             Detected::QualcommVenus { .. } => MachineKind::QualcommVenus,
             _ => MachineKind::Other,
         };
-        let render_node = (128..136)
-            .map(|n| format!("/dev/dri/renderD{n}"))
-            .find(|p| Path::new(p).exists());
+        // The INTEGRATED GPU's node on a hybrid laptop: decoding on the
+        // discrete one keeps a second GPU powered for the whole video.
+        let nodes: Vec<vidkit_core::caps::RenderNode> = (128..136)
+            .map(|n| format!("renderD{n}"))
+            .filter(|n| Path::new("/dev/dri").join(n).exists())
+            .map(|n| {
+                let dev = Path::new("/sys/class/drm").join(&n).join("device");
+                vidkit_core::caps::RenderNode {
+                    path: format!("/dev/dri/{n}"),
+                    driver: std::fs::read_link(dev.join("driver")).ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned())).unwrap_or_default(),
+                    vram: std::fs::read_to_string(dev.join("mem_info_vram_total")).ok().and_then(|v| v.trim().parse().ok()),
+                }
+            })
+            .collect();
+        let render_node = vidkit_core::caps::pick_render_node(&nodes).map(|n| n.path.clone());
         Machine {
             kind,
             gpu_driver: p.gpu_driver,
@@ -540,6 +571,7 @@ pub fn machine() -> &'static Machine {
             vaapi: vaapi_profiles(),
             vaapi_vpp: vainfo().as_ref().is_some_and(|(_, v)| *v),
             vulkan: vulkan_video_codecs(),
+            vulkan_devices: vulkan_devices().to_vec(),
         }
     })
 }
@@ -624,10 +656,12 @@ pub fn video_args_fmt(src: &VideoInput, from: Duration, accel: &Accel, scale_to:
             }
         }
         Accel::V4l2m2m { decoder } => push(&mut a, &["-c:v", decoder]),
-        Accel::Vulkan { codec } => {
+        Accel::Vulkan { codec, device } => {
             // Frames are downloaded to system memory by ffmpeg (no
-            // hwaccel_output_format) and scaled in software after.
-            push(&mut a, &["-hwaccel", "vulkan"]);
+            // hwaccel_output_format) and scaled in software after. The
+            // device is named: ffmpeg's default is device 0, which on a
+            // hybrid laptop is often the discrete GPU.
+            push(&mut a, &["-init_hw_device", &format!("vulkan=vk:{device}"), "-hwaccel", "vulkan", "-hwaccel_device", "vk"]);
             // Same trap as VAAPI: the default AV1 decoder is libdav1d, which
             // never touches the hardware.
             if codec == "av1" {
@@ -1369,6 +1403,7 @@ mod vaapi_tests {
             vaapi: Some(vec![(Codec::H264, 8), (Codec::Vp9, 10)]),
             vaapi_vpp: true,
             vulkan: None,
+            vulkan_devices: vec![],
         };
         assert_eq!(choose_accel("av1", &m, AccelPref::Auto), Accel::Software);
         assert!(matches!(choose_accel("vp9", &m, AccelPref::Auto), Accel::Vaapi { .. }));
@@ -1415,6 +1450,7 @@ mod asahi_tests {
             vaapi,
             vaapi_vpp: false,
             vulkan: None,
+            vulkan_devices: vec![],
         }
     }
 
@@ -1456,6 +1492,7 @@ mod vulkan_tests {
             vaapi: None,
             vaapi_vpp: false,
             vulkan: Some(vec![Codec::Av1, Codec::H264, Codec::Hevc, Codec::Vp9]),
+            vulkan_devices: vec![vidkit_core::caps::VkVideoDevice { index: 0, integrated: false, codecs: vec![Codec::Av1, Codec::H264, Codec::Hevc, Codec::Vp9] }],
         }
     }
 
@@ -1463,7 +1500,7 @@ mod vulkan_tests {
     /// list); with Vulkan Video it decodes in hardware.
     #[test]
     fn nvidia_decodes_through_vulkan_video() {
-        assert_eq!(choose_accel("av1", &nvidia(), AccelPref::Auto), Accel::Vulkan { codec: "av1".into() });
+        assert_eq!(choose_accel("av1", &nvidia(), AccelPref::Auto), Accel::Vulkan { codec: "av1".into(), device: 0 });
         let no_vk = Machine { vulkan: None, ..nvidia() };
         assert_eq!(choose_accel("av1", &no_vk, AccelPref::Auto), Accel::Software);
         let no_hwaccel = Machine { hwaccels: vec!["vaapi".into()], ..nvidia() };
@@ -1479,16 +1516,36 @@ mod vulkan_tests {
             vaapi: Some(vec![(Codec::H264, 8), (Codec::Vp9, 10)]),
             vaapi_vpp: true,
             vulkan: Some(vec![Codec::Av1, Codec::H264, Codec::Hevc]),
+            vulkan_devices: vec![vidkit_core::caps::VkVideoDevice { index: 0, integrated: true, codecs: vec![Codec::Av1, Codec::H264, Codec::Hevc] }],
             ..nvidia()
         };
         assert!(matches!(choose_accel("vp9", &m, AccelPref::Auto), Accel::Vaapi { .. }));
-        assert_eq!(choose_accel("av1", &m, AccelPref::Auto), Accel::Vulkan { codec: "av1".into() });
+        assert_eq!(choose_accel("av1", &m, AccelPref::Auto), Accel::Vulkan { codec: "av1".into(), device: 0 });
+    }
+
+    /// A hybrid laptop, dGPU as device 0: H.264 decodes on the iGPU
+    /// (device 1), and that index reaches ffmpeg.
+    #[test]
+    fn hybrid_decode_goes_to_the_igpu_and_ffmpeg_is_told() {
+        let m = Machine {
+            vulkan: Some(vec![Codec::Av1, Codec::H264]),
+            vulkan_devices: vec![
+                vidkit_core::caps::VkVideoDevice { index: 0, integrated: false, codecs: vec![Codec::Av1, Codec::H264] },
+                vidkit_core::caps::VkVideoDevice { index: 1, integrated: true, codecs: vec![Codec::H264] },
+            ],
+            ..nvidia()
+        };
+        let acc = choose_accel("h264", &m, AccelPref::Auto);
+        assert_eq!(acc, Accel::Vulkan { codec: "h264".into(), device: 1 });
+        let a = video_args(&VideoInput::file(Path::new("x.mp4")), Duration::ZERO, &acc, None);
+        assert!(a.windows(2).any(|w| w[0] == "-init_hw_device" && w[1] == "vulkan=vk:1"), "{a:?}");
+        assert_eq!(choose_accel("av1", &m, AccelPref::Auto), Accel::Vulkan { codec: "av1".into(), device: 0 }, "only the dGPU has AV1");
     }
 
     #[test]
     fn vulkan_args_name_the_native_av1_decoder_and_scale_in_software() {
         let src = VideoInput::file(Path::new("x.webm"));
-        let a = video_args(&src, Duration::ZERO, &Accel::Vulkan { codec: "av1".into() }, Some((1280, 720)));
+        let a = video_args(&src, Duration::ZERO, &Accel::Vulkan { codec: "av1".into(), device: 0 }, Some((1280, 720)));
         let (hw, cv, i) = (a.iter().position(|x| x == "vulkan"), a.windows(2).position(|w| w[0] == "-c:v" && w[1] == "av1"), a.iter().position(|x| x == "-i"));
         assert!(hw < i && cv.is_some() && cv < i, "{a:?}");
         assert!(a.iter().any(|x| x.starts_with("scale=1280:720")), "{a:?}");

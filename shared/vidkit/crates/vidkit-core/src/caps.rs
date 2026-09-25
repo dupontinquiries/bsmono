@@ -648,15 +648,34 @@ pub fn usable_by_ffmpeg(mut caps: DeviceCaps, vaapi: Option<&[(Codec, u8)]>) -> 
 /// V4L2 devices. Only the first device's list is taken: vulkaninfo prints
 /// one block per GPU and the player decodes on device 0.
 pub fn parse_vulkaninfo_video(text: &str) -> Vec<Codec> {
-    let mut out = Vec::new();
-    let mut seen_device = 0;
+    let devs = parse_vulkaninfo_devices(text);
+    pick_vulkan_decoder(&devs, None).map(|d| d.codecs.clone()).unwrap_or_default()
+}
+
+/// One Vulkan device as `vulkaninfo` describes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VkVideoDevice {
+    /// The index ffmpeg's `-init_hw_device vulkan=vk:N` takes.
+    pub index: usize,
+    pub integrated: bool,
+    pub codecs: Vec<Codec>,
+}
+
+/// Every device `vulkaninfo` lists, with its type and decode codecs. Pure.
+/// Blocks start at `GPU id : N (...)` (or `GPUN:`); the type is the
+/// `deviceType = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU` line.
+pub fn parse_vulkaninfo_devices(text: &str) -> Vec<VkVideoDevice> {
+    let mut out: Vec<VkVideoDevice> = Vec::new();
     for line in text.lines() {
         let l = line.trim();
-        if l.starts_with("GPU id") || l.starts_with("VkPhysicalDeviceProperties") {
-            seen_device += 1;
-            if seen_device > 1 && !out.is_empty() {
-                break;
-            }
+        let new_block = l.starts_with("GPU id") || (l.starts_with("GPU") && l.ends_with(':') && l[3..l.len() - 1].chars().all(|c| c.is_ascii_digit()) && l.len() > 4);
+        if new_block {
+            out.push(VkVideoDevice { index: out.len(), integrated: false, codecs: Vec::new() });
+            continue;
+        }
+        let Some(d) = out.last_mut() else { continue };
+        if l.starts_with("deviceType") && l.contains("INTEGRATED_GPU") {
+            d.integrated = true;
         }
         let c = if l.starts_with("VK_KHR_video_decode_h264") {
             Codec::H264
@@ -669,11 +688,40 @@ pub fn parse_vulkaninfo_video(text: &str) -> Vec<Codec> {
         } else {
             continue;
         };
-        if !out.contains(&c) {
-            out.push(c);
+        if !d.codecs.contains(&c) {
+            d.codecs.push(c);
         }
     }
     out
+}
+
+/// The device to decode on: an INTEGRATED GPU that decodes the codec, else
+/// any device that does. On a hybrid laptop decoding on the discrete GPU
+/// keeps a whole second GPU powered for the length of the video. `None`
+/// codec: the first integrated device with any decode, else any. Pure.
+pub fn pick_vulkan_decoder(devs: &[VkVideoDevice], codec: Option<Codec>) -> Option<&VkVideoDevice> {
+    let can = |d: &&VkVideoDevice| match codec {
+        Some(c) => d.codecs.contains(&c),
+        None => !d.codecs.is_empty(),
+    };
+    devs.iter().filter(can).find(|d| d.integrated).or_else(|| devs.iter().find(can))
+}
+
+/// A DRM render node, for choosing where VA-API decodes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderNode {
+    pub path: String,
+    pub driver: String,
+    /// Dedicated VRAM, where the driver reports it (amdgpu).
+    pub vram: Option<u64>,
+}
+
+/// The render node to decode on: an integrated GPU (Intel i915/xe, or
+/// amdgpu with an APU-sized carve-out of 2 GiB or less) before a discrete
+/// one, else the first. Pure.
+pub fn pick_render_node(nodes: &[RenderNode]) -> Option<&RenderNode> {
+    let integrated = |n: &&RenderNode| matches!(n.driver.as_str(), "i915" | "xe") || (n.driver == "amdgpu" && n.vram.is_some_and(|v| v <= 2 << 30));
+    nodes.iter().find(integrated).or_else(|| nodes.first())
 }
 
 /// Desktop caps from what the machine's decode APIs report: a codec listed
@@ -1266,5 +1314,38 @@ Device Extensions: count = 150
         assert_eq!(b(Codec::Vp9), Some(Backend::Vaapi));
         assert_eq!(b(Codec::Av1), Some(Backend::VulkanVideo));
         assert_eq!(desktop_from_probes(None, None).name, desktop_full_hw().name);
+    }
+
+    /// A hybrid laptop: NVIDIA first (device 0), Intel second. Decode goes
+    /// to the Intel iGPU when it has the codec; to NVIDIA for what only it
+    /// has. CONSTRUCTED from vulkaninfo's field names, like the fixture
+    /// above.
+    #[test]
+    fn hybrid_laptops_decode_on_the_integrated_gpu() {
+        let text = "GPU id : 0 (NVIDIA GeForce RTX 4060 Laptop GPU):
+	deviceType        = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+	VK_KHR_video_decode_av1 : extension revision 1
+	VK_KHR_video_decode_h264 : extension revision 9
+GPU id : 1 (Intel(R) Graphics (ADL GT2)):
+	deviceType        = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+	VK_KHR_video_decode_h264 : extension revision 9
+	VK_KHR_video_decode_h265 : extension revision 8
+";
+        let devs = parse_vulkaninfo_devices(text);
+        assert_eq!(devs.len(), 2);
+        assert!(!devs[0].integrated && devs[1].integrated);
+        assert_eq!(pick_vulkan_decoder(&devs, Some(Codec::H264)).unwrap().index, 1, "the iGPU, not device 0");
+        assert_eq!(pick_vulkan_decoder(&devs, Some(Codec::Av1)).unwrap().index, 0, "only the dGPU has AV1");
+        assert_eq!(pick_vulkan_decoder(&devs, Some(Codec::Vp9)), None);
+        let nodes = [
+            RenderNode { path: "/dev/dri/renderD128".into(), driver: "nvidia".into(), vram: None },
+            RenderNode { path: "/dev/dri/renderD129".into(), driver: "i915".into(), vram: None },
+        ];
+        assert_eq!(pick_render_node(&nodes).unwrap().path, "/dev/dri/renderD129");
+        let amd = [
+            RenderNode { path: "/dev/dri/renderD128".into(), driver: "amdgpu".into(), vram: Some(8 << 30) },
+            RenderNode { path: "/dev/dri/renderD129".into(), driver: "amdgpu".into(), vram: Some(512 << 20) },
+        ];
+        assert_eq!(pick_render_node(&amd).unwrap().path, "/dev/dri/renderD129", "the APU");
     }
 }
