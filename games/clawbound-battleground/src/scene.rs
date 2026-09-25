@@ -380,6 +380,7 @@ impl Scene {
         // the ultra preview's coloured lights (ability effects, the ones
         // brightest where the camera looks) and the spheres their shadows
         // are traced against (every cat standing)
+        r.ultra_post = self.ultra;
         if self.ultra {
             r.lights = vfx.lights(cam.target, 8);
             r.occluders = game.gods.iter().filter(|g| g.respawn_t <= 0.0).map(|g| [g.pos.x, g.pos.y + 0.9, g.pos.z, 0.95]).collect();
