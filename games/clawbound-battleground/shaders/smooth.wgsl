@@ -61,6 +61,7 @@ struct VSOut {
     @location(3) shadow_pos: vec4<f32>,
     @location(4) local: vec3<f32>,
     @location(5) h: f32,
+    @location(6) fur: f32,
 };
 
 @vertex
@@ -70,7 +71,12 @@ fn vs_main(in: VSIn) -> VSOut {
     // drooping a little under its own weight toward the tips
     let shells = max(lights.info.z, 1.0);
     let h = f32(in.shell) / shells;
-    let local = in.pos + in.normal * in.fur * h;
+    // STYLIZED locks, combed: each shell steps out along the normal bent
+    // back toward the tail and a little down (model space faces +z), so a
+    // lock leans the way fur lies instead of bristling straight out
+    let comb = normalize(vec3(0.0, -0.55, -1.0));
+    let dir = normalize(in.normal + comb * 0.9 * h);
+    let local = in.pos + dir * in.fur * h;
     var world = (d.model * vec4(local, 1.0)).xyz;
     world = world - vec3(0.0, in.fur * h * h * 0.6, 0.0);
     // the wind combs the tips
@@ -83,6 +89,7 @@ fn vs_main(in: VSIn) -> VSOut {
     out.shadow_pos = frame.light_view_proj * vec4(world, 1.0);
     out.local = in.pos;
     out.h = h;
+    out.fur = in.fur;
     return out;
 }
 
@@ -135,17 +142,25 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // fur: shell h keeps only the strands that reach it, thinner toward the
     // tips (a strand is a cell of object space; the skin keeps everything)
     if (in.h > 0.0) {
-        // Round strands that taper: each cell of model space holds one
-        // strand, jittered off the cell's centre; a shell keeps the pixels
-        // within the strand's radius at that height, the radius shrinking
-        // toward the tip, and short strands stop early. (Whole cells made
-        // square, blocky strands -- seen in the close-up.)
-        let q = in.local * lights.info.w;
+        // STYLIZED LOCKS, not hairs: a few chunky cones, each filling most of
+        // its cell at the root and coming to a point -- they echo the voxels
+        // the cats are made of. Longer fur makes bigger locks (the mane).
+        // Fine realistic strands read as uncanny on a voxel character.
+        // no fur, no shells: shells collapsed onto bare skin (the face)
+        // showed their lighter tips as dots
+        if (in.fur < 0.012) {
+            discard;
+        }
+        let lock = clamp(in.fur / 0.05, 1.0, 3.0);
+        let q = in.local * lights.info.w / lock;
         let cell = floor(q);
         let seed = hash3(cell);
-        let centre = vec3(hash3(cell + 7.1), hash3(cell + 13.7), hash3(cell + 29.3)) * 0.5 + 0.25;
-        let r = 0.42 * (1.0 - in.h) * (0.6 + 0.4 * seed);
-        let reach = 0.45 + 0.55 * seed; // this strand's length, of the fur's
+        let centre = vec3(hash3(cell + 7.1), hash3(cell + 13.7), hash3(cell + 29.3)) * 0.3 + 0.35;
+        // wide roots that overlap their neighbours, so the fur reads as
+        // clumps parting toward their tips -- separate thin cones seen
+        // head-on read as polka dots
+        let r = 0.86 * pow(1.0 - in.h, 0.9) * (0.85 + 0.15 * seed);
+        let reach = 0.65 + 0.35 * seed; // this lock's length, of the fur's
         if (length(fract(q) - centre) > r || in.h > reach) {
             discard;
         }
@@ -183,8 +198,13 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
     // material: fur is rough and dielectric; the skin a little less rough;
     // the fur darkens toward the root (self-shadowing among the strands)
-    let albedo = in.color.rgb;
-    let rough = mix(0.55, 0.85, in.h);
+    // two-tone locks: darker at the root, lighter at the tip -- the
+    // stylized gradient that reads at a distance
+    let albedo = in.color.rgb * select(1.0, mix(0.84, 1.12, in.h), in.h > 0.0);
+    // the darkest features (eyes, nose) are glossy: they catch a highlight
+    // and read as alive, not as holes
+    let feat = 1.0 - smoothstep(0.06, 0.16, dot(albedo, vec3(0.2126, 0.7152, 0.0722)));
+    let rough = mix(mix(0.55, 0.85, in.h), 0.18, feat * select(0.0, 1.0, in.h == 0.0));
     let f0 = vec3(0.04);
     let fur_ao = mix(0.55, 1.0, in.h) * select(1.0, 0.85, in.h == 0.0);
 
