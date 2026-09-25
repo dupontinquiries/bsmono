@@ -42,6 +42,7 @@ mod palette;
 mod pattern;
 mod playback;
 mod power;
+mod prefs;
 mod profile;
 
 /// What we managed to learn about the file the user named.
@@ -176,6 +177,13 @@ struct Player {
     /// Software presenter budget chosen in the palette; None follows the
     /// power policy (or VIDKIT_SW_BUDGET).
     sw_budget_user: Option<f32>,
+    /// The palette is showing "What can I type?" examples.
+    palette_help: bool,
+    /// Transcription model and language, persisted.
+    prefs: prefs::Prefs,
+    /// The current whisper transcription's inputs, to restart it with a
+    /// bigger model: (file, audio, total, cache).
+    transcribe_args: Option<(Option<PathBuf>, transcribe::AudioIn, Option<Duration>, Option<PathBuf>)>,
     /// A transcription scope chosen in the Sections panel: kept, and the
     /// power policy leaves it alone.
     scope_user: bool,
@@ -385,6 +393,9 @@ impl Player {
             seen_hits: Vec::new(),
             listen_only: false,
             sw_budget_user: None,
+            palette_help: false,
+            prefs: prefs::Prefs::load(),
+            transcribe_args: None,
             scope_user: false,
             energy: power::policy(power::current()),
             energy_read: None,
@@ -880,6 +891,17 @@ impl Player {
             C::PlayClipboard => self.play_clipboard(),
             C::Subtitles => self.subtitles = !self.subtitles,
             C::ListenOnly => self.listen_only = !self.listen_only,
+            C::TranscribeQuick => self.transcribe_with(prefs::ModelTier::Quick),
+            C::TranscribeBetter => self.transcribe_with(prefs::ModelTier::Better),
+            C::TranscribeBest => self.transcribe_with(prefs::ModelTier::Best),
+            C::LangEnglish => self.set_language_mode(prefs::LanguageMode::English),
+            C::LangDetectOnce => self.set_language_mode(prefs::LanguageMode::DetectOnce),
+            C::LangEveryChunk => self.set_language_mode(prefs::LanguageMode::EveryChunk),
+            C::Help => {
+                // Stays open, showing worked examples instead of commands.
+                self.palette_help = true;
+                self.palette.open();
+            }
             C::SwFull | C::SwBalanced | C::SwSaver | C::SwMinimum | C::SwFollowPower => {
                 if let vidkit_egui::Action::SetSwBudget(b) = c.action() {
                     self.set_sw_budget(if b.is_nan() { None } else { Some(b) });
@@ -982,20 +1004,60 @@ impl Player {
                 self.seen_hits = if sq.chars().count() >= min { idx.search(&sq, if seen_only { 20 } else { 5 }, 2) } else { Vec::new() };
                 self.seen_query = sq;
             }
-        } else if self.seen_index.is_some() {
+        } else if self.seen_index.is_some() || self.palette_help {
+            self.palette_help = false;
             self.seen_index = None;
             self.seen_query.clear();
             self.seen_hits.clear();
         }
-        let matches = if seen_only { Vec::new() } else { self.palette.matches() };
-        // "budget 30%" typed: a live row at the top that sets exactly that.
-        let typed_budget = if seen_only { None } else { palette::parse_budget(&query) };
+        let matches = if seen_only || self.palette_help { Vec::new() } else { self.palette.matches() };
+        // Typed commands get live rows at the top that say, in words, what
+        // Enter will do -- "watch goes down" is not a command name anyone
+        // could guess, so the palette spells out what it understood.
+        let typed = if seen_only || self.palette_help { None } else { palette::parse_typed(&query) };
         let mut rows: Vec<uikit_egui::command_bar::Row> = Vec::new();
-        if let Some(b) = typed_budget {
-            rows.push(uikit_egui::command_bar::Row::new(
-                format!("Software budget: {:.0}% of a frame", b * 100.0),
-                self.sw_budget_note(),
-            ));
+        let mut typed_actions: Vec<TypedPick> = Vec::new();
+        if self.palette_help {
+            for (ex, what) in palette::EXAMPLES {
+                rows.push(uikit_egui::command_bar::Row::new(ex, what));
+                typed_actions.push(TypedPick::Fill(ex.to_string()));
+            }
+        }
+        match &typed {
+            Some(palette::Typed::Budget(b)) => {
+                rows.push(uikit_egui::command_bar::Row::new(format!("Software budget: {:.0}% of a frame", b * 100.0), self.sw_budget_note()));
+                typed_actions.push(TypedPick::Budget(*b));
+            }
+            Some(palette::Typed::Watch(p)) | Some(palette::Typed::Find(p)) => {
+                let hits = vidkit_relevance::sections::search(&self.windows, p, 8);
+                let watch = matches!(typed, Some(palette::Typed::Watch(_)));
+                if watch {
+                    let n = hits.len();
+                    rows.push(uikit_egui::command_bar::Row::new(
+                        format!("\u{25b6} Play only the moments that mention \u{201c}{p}\u{201d}, back to back"),
+                        if n == 0 { "no matches yet".to_string() } else { format!("{n} moment{}", if n == 1 { "" } else { "s" }) },
+                    ));
+                    typed_actions.push(TypedPick::Watch(p.clone()));
+                } else {
+                    for h in hits.iter().take(6) {
+                        let snip: String = h.text.chars().take(60).collect();
+                        rows.push(uikit_egui::command_bar::Row::new(format!("\u{201c}{}\u{2026}\u{201d}", snip.trim()), vidkit_egui::format_time(h.at)));
+                        typed_actions.push(TypedPick::Seek(h.at));
+                    }
+                }
+                // Nothing found: offer the bigger model, when there is one and
+                // this transcript is whisper's (not the page's captions).
+                if hits.is_empty() && self.transcribe_args.is_some() {
+                    if let Some(bigger) = self.prefs.model.bigger() {
+                        rows.push(uikit_egui::command_bar::Row::new(
+                            format!("No match in the {} transcript \u{2014} transcribe again with {}", self.prefs.model.name(), bigger.name()),
+                            "slower; catches more words",
+                        ));
+                        typed_actions.push(TypedPick::Upgrade(bigger));
+                    }
+                }
+            }
+            None => {}
         }
         let head = rows.len();
         rows.extend(matches.iter().map(|c| {
@@ -1012,7 +1074,8 @@ impl Player {
                         false => mark.to_string(),
                     }
                 }
-                _ => c.shortcut().unwrap_or("").to_string(),
+                // The shortcut if there is one, else what it does in words.
+                _ => c.shortcut().map(str::to_string).unwrap_or_else(|| c.hint().to_string()),
             };
             uikit_egui::command_bar::Row::new(c.label(), detail)
         }));
@@ -1028,15 +1091,36 @@ impl Player {
             "vidkit-palette",
             &mut self.palette.bar,
             &rows,
-            "type a command, or ? to search what you watched",
+            "a command, or: watch goes down \u{b7} find goes down \u{b7} help",
             &self.colors,
             &adaptive,
             |_| {},
         );
         if let Some(i) = out.chosen {
-            if let (Some(b), 0) = (typed_budget, i) {
-                self.palette.close();
-                self.set_sw_budget(Some(b));
+            if let Some(pick) = typed_actions.get(i).cloned() {
+                match pick {
+                    TypedPick::Fill(q) => {
+                        // An example: into the box to edit, not run.
+                        self.palette_help = false;
+                        self.palette.bar.query = q;
+                    }
+                    TypedPick::Budget(b) => {
+                        self.palette.close();
+                        self.set_sw_budget(Some(b));
+                    }
+                    TypedPick::Watch(p) => {
+                        self.palette.close();
+                        self.section_action(vidkit_egui::SectionAction::WatchMatching(p));
+                    }
+                    TypedPick::Seek(t) => {
+                        self.palette.close();
+                        self.seek_to(t);
+                    }
+                    TypedPick::Upgrade(t) => {
+                        self.palette.close();
+                        self.transcribe_with(t);
+                    }
+                }
             } else if let Some(c) = matches.get(i - head).copied() {
                 self.palette.close();
                 self.run(c);
@@ -1452,7 +1536,7 @@ impl Player {
         let audio = transcribe::AudioIn { input: audio_url, headers: headers.clone() };
         // The page's own captions when it has them: YouTube's cost nothing,
         // whisper costs minutes of CPU per hour of lecture on a phone.
-        let factory = resolved.captions.clone().map(|c| transcribe::caption_factory(c, headers));
+        let factory = resolved.captions.clone().map(|c| transcribe::caption_factory(c, headers, self.prefs));
         self.transport.duration = resolved.duration;
         self.start_transcription(url.to_string(), resolved.title.clone(), None, audio, resolved.duration, factory);
         self.path = None;
@@ -1572,7 +1656,10 @@ impl Player {
         let cache = seen::dir()
             .and_then(|d| seen::record(&d, &url, title.as_deref(), key_file))
             .or_else(|| file.as_deref().and_then(transcribe::cache_path));
-        let factory = factory.unwrap_or_else(|| transcribe::source_factory(file));
+        // Remembered for "transcribe again with a bigger model" (not for page
+        // captions: those are the page's own transcript).
+        self.transcribe_args = factory.is_none().then(|| (file.clone(), audio.clone(), total, cache.clone()));
+        let factory = factory.unwrap_or_else(|| transcribe::source_factory(file, self.prefs));
         self.worker = Some(transcribe::Worker::start(factory, audio, total, cache));
         self.apply_transcribe_policy();
         self.reset_sections();
@@ -2270,4 +2357,40 @@ impl Player {
         let now = format!("now {:.0}%", self.effective_sw_budget() * 100.0);
         if self.gpu.is_some() { format!("{now} · GPU presenter: no effect") } else { now }
     }
+}
+
+impl Player {
+    /// Re-transcribe the current video with `tier`, keeping what is there
+    /// for search meanwhile; each chunk is replaced as the new model reaches
+    /// it. Saved as the preference, so the next video starts with it too.
+    fn transcribe_with(&mut self, tier: prefs::ModelTier) {
+        self.prefs.model = tier;
+        self.prefs.save();
+        let Some((file, audio, total, cache)) = self.transcribe_args.clone() else {
+            self.gpu_error = Some(format!("transcription model set to {}; this video's transcript came from the page", tier.name()));
+            return;
+        };
+        let factory = transcribe::source_factory(file, self.prefs);
+        self.worker = Some(transcribe::Worker::start_with(factory, audio, total, cache, true));
+        self.apply_transcribe_policy();
+        self.seen_version = 0;
+        self.gpu_error = Some(format!("transcribing again with the {} model; the current transcript stays searchable meanwhile", tier.name()));
+    }
+
+    fn set_language_mode(&mut self, mode: prefs::LanguageMode) {
+        self.prefs.language = mode;
+        self.prefs.save();
+        let tier = self.prefs.model;
+        self.transcribe_with(tier);
+    }
+}
+
+/// What choosing a typed row does.
+#[derive(Clone, Debug)]
+enum TypedPick {
+    Fill(String),
+    Budget(f32),
+    Watch(String),
+    Seek(Duration),
+    Upgrade(prefs::ModelTier),
 }

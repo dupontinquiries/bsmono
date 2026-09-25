@@ -54,6 +54,11 @@ pub struct Coverage {
     done: BTreeSet<u32>,
     in_flight: Option<u32>,
     pub mode: Mode,
+    /// Per-chunk priority (loudness) once measured: in `All` mode, after
+    /// the playhead's chunk and the next, loudest first. In a game video the
+    /// loud stretches are the fights and the casters shouting over them --
+    /// what a search like "goes down" is for.
+    priority: Option<Vec<f32>>,
 }
 
 impl Coverage {
@@ -74,6 +79,7 @@ impl Coverage {
             done: BTreeSet::new(),
             in_flight: None,
             mode: Mode::All,
+            priority: None,
         }
     }
 
@@ -127,6 +133,20 @@ impl Coverage {
                 let last = self.index_at(playhead + horizon);
                 (here..=last).find(|&i| self.eligible(i)).map(|i| self.chunk(i))
             }
+            Mode::All if self.priority.is_some() && self.count().is_some() => {
+                let pr = self.priority.as_ref().expect("checked");
+                let n = self.count().expect("checked");
+                // What is on screen now, and what comes next, before anything.
+                if let Some(i) = [here, here + 1].into_iter().find(|&i| self.eligible(i)) {
+                    return Some(self.chunk(i));
+                }
+                let p = |i: u32| pr.get(i as usize).copied().unwrap_or(0.0);
+                let ahead = |i: u32| if i >= here { i - here } else { i + n };
+                (0..n)
+                    .filter(|&i| self.eligible(i))
+                    .max_by(|&a, &b| p(a).partial_cmp(&p(b)).unwrap_or(std::cmp::Ordering::Equal).then(ahead(b).cmp(&ahead(a))))
+                    .map(|i| self.chunk(i))
+            }
             Mode::All => {
                 // Forward from the playhead; for an unknown length, forward
                 // is open-ended until mark_end closes it.
@@ -136,6 +156,14 @@ impl Coverage {
                     .map(|i| self.chunk(i))
             }
         }
+    }
+
+    pub fn set_priority(&mut self, p: Vec<f32>) {
+        self.priority = Some(p);
+    }
+
+    pub fn has_priority(&self) -> bool {
+        self.priority.is_some()
     }
 
     pub fn begin(&mut self, c: &Chunk) {
@@ -346,5 +374,20 @@ mod tests {
         c.restore_done([0, 1, 7]);
         assert!(c.complete());
         assert_eq!(c.done_indices().collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    /// With loudness known: the playhead's chunk and the next first, then
+    /// loudest first, ties toward what is coming next.
+    #[test]
+    fn with_loudness_known_the_fights_come_first() {
+        let mut c = cov(300); // 10 chunks
+        c.set_priority(vec![0.1, 0.1, 0.9, 0.2, 0.1, 0.1, 0.8, 0.1, 0.3, 0.1]);
+        let got = order(&mut c, s(125)); // playhead in chunk 4
+        assert_eq!(&got[..2], &[4, 5], "what is on screen, then what is next");
+        assert_eq!(&got[2..5], &[2, 6, 8], "then the loudest");
+        assert_eq!(got.len(), 10);
+        // Ties go to the chunk nearest ahead of the playhead.
+        let tail: Vec<u32> = got[5..].to_vec();
+        assert_eq!(tail, vec![3, 7, 9, 0, 1], "0.2 first, then the 0.1s from the playhead onward");
     }
 }

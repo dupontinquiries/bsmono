@@ -42,6 +42,9 @@ pub struct WhisperSource {
     /// The language whisper is told. `None` = detect, which runs an extra
     /// encoder pass; so it is detected ONCE, on the first chunk, and pinned.
     language: Option<String>,
+    /// Keep the language detected on the first chunk. False for videos that
+    /// switch language: detect on every chunk, at an encoder pass each.
+    pin_detected: bool,
 }
 
 /// An English-only model (`ggml-base.en.bin`) needs no detection at all.
@@ -61,7 +64,14 @@ impl WhisperSource {
             .map_err(|e| format!("{}: {e:?}", model.display()))?;
         let state = ctx.create_state().map_err(|e| format!("whisper state: {e:?}"))?;
         let language = language_for_model(model, language);
-        Ok(Self { _ctx: ctx, state, model: model.to_path_buf(), threads: threads.max(1), language })
+        Ok(Self { _ctx: ctx, state, model: model.to_path_buf(), threads: threads.max(1), language, pin_detected: true })
+    }
+
+    /// Detect the language on every chunk instead of pinning the first.
+    pub fn detect_every_chunk(mut self) -> Self {
+        self.pin_detected = false;
+        self.language = None;
+        self
     }
 
     /// Find a model in the shared store (`~/models/whisper`, or the legacy
@@ -98,7 +108,7 @@ impl CueSource for WhisperSource {
         // EVERY chunk. Detected once below and pinned after that.
         p.set_language(self.language.as_deref().or(Some("auto")));
         self.state.full(p, pcm).map_err(|e| format!("whisper: {e:?}"))?;
-        if self.language.is_none() {
+        if self.language.is_none() && self.pin_detected {
             let id = self.state.full_lang_id_from_state();
             self.language = whisper_rs::get_lang_str(id).map(str::to_string);
         }

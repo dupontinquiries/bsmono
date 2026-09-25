@@ -54,6 +54,9 @@ vidkit-relevance = { path = "../../shared/vidkit/crates/vidkit-relevance" }
 vidkit-transcribe = { path = "../../shared/vidkit/crates/vidkit-transcribe" }
 # tideshell's living palette, followed when the shell publishes it.
 ambient-palette = { path = "../../shared/ambient-palette" }
+# Where whisper models live (~/models/whisper and the legacy places), for
+# choosing a model by tier.
+models-kit = { path = "../../shared/models-kit" }
 # bscale's headless engine: stage A analysis (which blocks the CNN would
 # run on) and the reference RCAS. An app depending on an app's crate, as
 # studio does with d2x-job; the shared vidkit kits stay clear of it.

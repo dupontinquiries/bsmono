@@ -74,6 +74,55 @@ pub fn decode_chunk(src: &AudioIn, start: Duration, len: Duration) -> Result<Vec
     Ok(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
 }
 
+/// Per-chunk (speech fraction, mean RMS) from 8 kHz mono s16 samples. Pure.
+///
+/// 40 ms windows (320 samples at 8 kHz); a window is speech-level above
+/// -45 dBFS RMS, the same floor as vidkit_transcribe::speech_fraction.
+pub fn chunk_loudness(samples: &[i16], rate: u32, chunk: Duration) -> Vec<(f32, f32)> {
+    const WIN: usize = 320;
+    const FLOOR: f32 = 0.005_6;
+    let per_chunk = (rate as f64 * chunk.as_secs_f64()) as usize;
+    if per_chunk == 0 {
+        return Vec::new();
+    }
+    samples
+        .chunks(per_chunk)
+        .map(|c| {
+            let (mut loud, mut wins, mut sum) = (0usize, 0usize, 0.0f64);
+            for w in c.chunks_exact(WIN) {
+                let rms = (w.iter().map(|&v| (v as f32 / 32768.0).powi(2)).sum::<f32>() / WIN as f32).sqrt();
+                wins += 1;
+                sum += rms as f64;
+                if rms > FLOOR {
+                    loud += 1;
+                }
+            }
+            if wins == 0 {
+                (0.0, 0.0)
+            } else {
+                (loud as f32 / wins as f32, (sum / wins as f64) as f32)
+            }
+        })
+        .collect()
+}
+
+/// Measure a local file's loudness per chunk: one ffmpeg pass to 8 kHz mono
+/// -- seconds for an hour of audio, against minutes of whisper. Not for
+/// streams: it would download the whole audio track to measure it.
+pub fn measure_loudness(src: &AudioIn, chunk: Duration) -> Option<Vec<(f32, f32)>> {
+    if src.input.starts_with("http://") || src.input.starts_with("https://") {
+        return None;
+    }
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-i", &src.input, "-vn", "-sn", "-dn", "-ac", "1", "-ar", "8000", "-f", "s16le", "-"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let samples: Vec<i16> = out.stdout.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    (!samples.is_empty()).then(|| chunk_loudness(&samples, 8000, chunk))
+}
+
 /// What the UI reads.
 pub struct Shared {
     pub transcript: Transcript,
@@ -102,11 +151,20 @@ impl Worker {
     /// Start. `make` runs ON the worker thread: loading a whisper model takes
     /// seconds and must not freeze the window.
     pub fn start(make: Factory, audio: AudioIn, total: Option<Duration>, cache: Option<PathBuf>) -> Self {
+        Self::start_with(make, audio, total, cache, false)
+    }
+
+    /// `redo`: keep the cached transcript for display and search, but not
+    /// its done list, so every chunk is run again (a bigger model) and
+    /// replaced as it goes (`Transcript::accept` replaces a chunk's cues).
+    pub fn start_with(make: Factory, audio: AudioIn, total: Option<Duration>, cache: Option<PathBuf>, redo: bool) -> Self {
         let mut coverage = Coverage::new(total);
         let mut transcript = Transcript::new("");
         if let Some(text) = cache.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
             if let Ok(c) = Transcript::from_cache(&text) {
-                coverage.restore_done(c.done_for(coverage.chunk_len()));
+                if !redo {
+                    coverage.restore_done(c.done_for(coverage.chunk_len()));
+                }
                 transcript = c.transcript;
             }
         }
@@ -268,6 +326,35 @@ fn run(shared: Arc<(Mutex<Shared>, Condvar)>, make: Factory, audio: AudioIn, cac
             }
         }
         g.version += 1;
+        // After the first chunk (the one on screen, so it is not delayed):
+        // measure loudness once, pre-skip silent chunks, and order the rest
+        // loudest first.
+        if !g.coverage.has_priority() && g.coverage.total().is_some() {
+            let chunk_len = g.coverage.chunk_len();
+            drop(g);
+            let measured = measure_loudness(&audio, chunk_len);
+            g = m.lock().unwrap_or_else(|e| e.into_inner());
+            match measured {
+                Some(l) => {
+                    // Only chunks that exist: the audio can run a hair past
+                    // the container's duration and yield a sliver of a chunk
+                    // beyond the end.
+                    let total = g.coverage.total().unwrap_or_default();
+                    for (i, (speech, _)) in l.iter().enumerate() {
+                        if g.coverage.chunk(i as u32).start >= total {
+                            break;
+                        }
+                        if *speech < vidkit_transcribe::MIN_SPEECH_FRACTION && !g.coverage.is_done(i as u32) {
+                            g.coverage.finish(i as u32);
+                            g.skipped_silent += 1;
+                        }
+                    }
+                    g.coverage.set_priority(l.iter().map(|(_, rms)| *rms).collect());
+                }
+                // Streams, or ffmpeg failed: order by position, as before.
+                None => g.coverage.set_priority(Vec::new()),
+            }
+        }
         if let Some(p) = &cache {
             let text = g.transcript.to_cache(g.coverage.chunk_len(), g.coverage.done_indices());
             drop(g);
@@ -311,7 +398,7 @@ pub fn cache_path(video: &Path) -> Option<PathBuf> {
 
 /// The source for a video: a sidecar subtitle file if one exists (free),
 /// else whisper when built in. Runs on the worker thread.
-pub fn source_factory(video: Option<PathBuf>) -> Factory {
+pub fn source_factory(video: Option<PathBuf>, prefs: crate::prefs::Prefs) -> Factory {
     Box::new(move || {
         if let Some(v) = &video {
             for p in vidkit_transcribe::subtitles::sidecar_candidates(v) {
@@ -322,25 +409,25 @@ pub fn source_factory(video: Option<PathBuf>) -> Factory {
                 }
             }
         }
-        whisper_source()
+        whisper_source(prefs)
     })
 }
 
 /// The source for a stream whose page offered captions: fetch the VTT
 /// (tens of KB for an hour) instead of running whisper for tens of minutes.
 /// A failed fetch falls through to whisper rather than to no transcript.
-pub fn caption_factory(caption: vidkit_ytdlp::Caption, headers: Vec<(String, String)>) -> Factory {
+pub fn caption_factory(caption: vidkit_ytdlp::Caption, headers: Vec<(String, String)>, prefs: crate::prefs::Prefs) -> Factory {
     Box::new(move || match fetch_text(&caption.url, &headers) {
         Ok(text) => {
             let kind = if caption.automatic { "auto-captions" } else { "subtitles" };
             let src = vidkit_transcribe::subtitles::SubtitleSource::from_text(format!("{kind}:{}", caption.lang), &text);
             if src.all().is_empty() {
-                whisper_source().map_err(|e| format!("the {kind} had no cues, and {e}"))
+                whisper_source(prefs).map_err(|e| format!("the {kind} had no cues, and {e}"))
             } else {
                 Ok(Box::new(src) as Box<dyn CueSource>)
             }
         }
-        Err(e) => whisper_source().map_err(|w| format!("captions: {e}; {w}")),
+        Err(e) => whisper_source(prefs).map_err(|w| format!("captions: {e}; {w}")),
     })
 }
 
@@ -360,16 +447,30 @@ pub fn fetch_text(url: &str, headers: &[(String, String)]) -> Result<String, Str
 }
 
 #[cfg(feature = "whisper")]
-fn whisper_source() -> Result<Box<dyn CueSource>, String> {
+fn whisper_source(prefs: crate::prefs::Prefs) -> Result<Box<dyn CueSource>, String> {
+    use crate::prefs::{find_model, model_dirs, LanguageMode};
     // All but one core: the playback decoder keeps one, and whisper past
     // the big cores gets slower rather than faster on a phone.
     let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
     let threads = (n.saturating_sub(1)).clamp(1, 4) as i32;
-    vidkit_transcribe::whisper::WhisperSource::from_store(threads).map(|s| Box::new(s) as Box<dyn CueSource>)
+    let (path, _found) = find_model(&model_dirs(), prefs.model, prefs.language).ok_or_else(|| {
+        format!(
+            "no whisper model for the {} tier: put e.g. {} in ~/models/whisper",
+            prefs.model.name(),
+            crate::prefs::candidates(prefs.model, prefs.language)[0]
+        )
+    })?;
+    let lang = match prefs.language {
+        LanguageMode::English => Some("en".to_string()),
+        _ => None,
+    };
+    let s = vidkit_transcribe::whisper::WhisperSource::load(&path, threads, lang)?;
+    let s = if prefs.language == LanguageMode::EveryChunk { s.detect_every_chunk() } else { s };
+    Ok(Box::new(s) as Box<dyn CueSource>)
 }
 
 #[cfg(not(feature = "whisper"))]
-fn whisper_source() -> Result<Box<dyn CueSource>, String> {
+fn whisper_source(_prefs: crate::prefs::Prefs) -> Result<Box<dyn CueSource>, String> {
     Err("no subtitles beside the file, and this build has no whisper (feature `whisper`)".into())
 }
 
@@ -520,7 +621,7 @@ mod tests {
         let cap = vidkit_ytdlp::Caption { url: format!("http://127.0.0.1:{port}/cc.vtt"), lang: "en-orig".into(), automatic: true };
         // The audio input does not exist: if the loop tried to decode it, the
         // transcript would stay empty.
-        let w = Worker::start(caption_factory(cap, vec![]), AudioIn { input: "/nonexistent.m4a".into(), headers: vec![] }, Some(Duration::from_secs(120)), None);
+        let w = Worker::start(caption_factory(cap, vec![], crate::prefs::Prefs::default()), AudioIn { input: "/nonexistent.m4a".into(), headers: vec![] }, Some(Duration::from_secs(120)), None);
         assert!(wait_until(&w, |s| s.transcript.cues().len() == 2), "{}", w.with(|s| s.status.clone()));
         assert!(w.with(|s| s.status.starts_with("auto-captions:en-orig")), "{}", w.with(|s| s.status.clone()));
         assert!(w.with(|s| s.coverage.complete()), "all chunks marked done");
@@ -541,6 +642,49 @@ mod tests {
         let ran: Vec<u64> = order.lock().unwrap().iter().map(|d| d.as_secs()).collect();
         assert_eq!(ran, vec![0], "only the chunk with sound reached the source");
         assert_eq!(w.with(|s| s.skipped_silent), 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn loudness_per_chunk_separates_silence_quiet_and_loud() {
+        let rate = 8000;
+        let tone = |amp: f32, secs: usize| -> Vec<i16> { (0..rate * secs).map(|i| ((i as f32 * 0.07).sin() * amp * 32767.0) as i16).collect() };
+        let mut v = vec![0i16; rate * 30];
+        v.extend(tone(0.02, 30));
+        v.extend(tone(0.5, 30));
+        let l = chunk_loudness(&v, rate as u32, Duration::from_secs(30));
+        assert_eq!(l.len(), 3);
+        assert_eq!(l[0].0, 0.0, "silence has no speech");
+        assert!(l[1].0 > 0.9 && l[2].0 > 0.9);
+        assert!(l[2].1 > 10.0 * l[1].1, "loud ranks far above quiet: {l:?}");
+    }
+
+    /// End to end: silence pre-skipped, and after the playhead chunk the
+    /// loud chunk is transcribed before the quiet one.
+    #[test]
+    fn the_loud_chunk_is_transcribed_before_the_quiet_one() {
+        if !have_ffmpeg() { return; }
+        let p = std::env::temp_dir().join(format!("vk_loud_{}.mkv", std::process::id()));
+        // 0-30 quiet tone, 30-60 silence, 60-90 quiet, 90-120 LOUD. (lavfi's
+        // sine is already at 1/8 amplitude: volume=0.05 was -47 dB, below the
+        // speech floor, and the "quiet" chunks were -- correctly -- skipped.)
+        assert!(Command::new("ffmpeg").args(["-v", "error", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=300:duration=30,volume=0.5",
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+            "-f", "lavfi", "-i", "sine=frequency=300:duration=30,volume=0.5",
+            "-f", "lavfi", "-i", "sine=frequency=300:duration=30,volume=6",
+            "-filter_complex", "[1]atrim=duration=30[s];[0][s][2][3]concat=n=4:v=0:a=1"]).arg(&p).status().unwrap().success());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let o2 = order.clone();
+        let w = Worker::start(Box::new(move || Ok(Box::new(Script(o2)) as Box<dyn CueSource>)), AudioIn { input: p.to_string_lossy().into(), headers: vec![] }, Some(Duration::from_secs(120)), None);
+        assert!(wait_until(&w, |s| s.coverage.complete()));
+        let ran: Vec<u64> = order.lock().unwrap().iter().map(|d| d.as_secs()).collect();
+        // Chunk 0 is the playhead's. Then 1 (the "next") is silent and was
+        // pre-skipped or gated; after that loudest first: 90 before 60.
+        assert_eq!(ran[0], 0);
+        assert!(!ran.contains(&30), "the silent chunk never reached whisper: {ran:?}");
+        let (loud, quiet) = (ran.iter().position(|&t| t == 90), ran.iter().position(|&t| t == 60));
+        assert!(loud < quiet, "loud before quiet: {ran:?}");
         let _ = std::fs::remove_file(&p);
     }
 }
