@@ -29,6 +29,8 @@ pub struct Shot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Beat {
+    /// The first match's prologue: the world from high above, narrated.
+    Prologue,
     /// The whole map, turning slowly.
     Pan,
     /// Low along one lane, from the blue end toward the centre.
@@ -88,6 +90,19 @@ fn beat_starts() -> [f32; 7] {
     [PAN, PAN + LANE, PAN + 2.0 * LANE, l, l + SPAWN, l + 2.0 * SPAWN, l + 2.0 * SPAWN + VERSUS]
 }
 
+/// The prologue's length (the full intro only), and when each narrator line
+/// starts within it (`voicescript`, part "narrator").
+/// Spaced by each line's own length at a storyteller's ~15 characters a
+/// second plus a breath (0.6 s): the first schedule gave 61 characters 3.5 s
+/// (the pacing test caught it), and the whole monologue needs ~36 s.
+pub const PROLOGUE: f32 = 44.0;
+pub const NARRATION: [(f32, &str); 8] = [(1.5, "prologue1"), (6.2, "prologue2"), (10.6, "prologue3"), (15.9, "prologue4"), (21.8, "prologue5"), (26.2, "prologue6"), (32.8, "prologue7"), (38.6, "prologue8")];
+
+/// The narrator's words for a line, for the subtitles.
+pub fn narration_text(key: &str) -> &'static str {
+    crate::voicescript::part("narrator").and_then(|p| p.lines.iter().find(|l| l.key == key)).map_or("", |l| l.text)
+}
+
 pub fn total() -> f32 {
     PAN + 3.0 * LANE + 2.0 * SPAWN + VERSUS + SETTLE
 }
@@ -114,6 +129,9 @@ pub struct Intro {
     teams: Vec<Team>,
     player_start: Vec3,
     play: Shot,
+    /// Seconds of prologue before the short intro's timeline (0, or
+    /// PROLOGUE for the full intro).
+    lead: f32,
 }
 
 impl Intro {
@@ -130,7 +148,39 @@ impl Intro {
                 beat + 0.35 + i as f32 * SPAWN_STAGGER
             })
             .collect();
-        Intro { t: 0.0, done: false, arrive, teams: teams.to_vec(), player_start, play }
+        Intro { t: 0.0, done: false, arrive, teams: teams.to_vec(), player_start, play, lead: 0.0 }
+    }
+
+    /// The full intro: the narrated prologue, then the short intro.
+    pub fn full(teams: &[Team], player_start: Vec3, play: Shot) -> Intro {
+        let mut i = Intro::new(teams, player_start, play);
+        i.lead = PROLOGUE;
+        for a in i.arrive.iter_mut() {
+            *a += PROLOGUE;
+        }
+        i
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.lead > 0.0
+    }
+
+    /// The whole intro's length.
+    pub fn length(&self) -> f32 {
+        total() + self.lead
+    }
+
+    /// When the first cats appear (the fanfare's cue).
+    pub fn fanfare_at(&self) -> f32 {
+        FANFARE_AT + self.lead
+    }
+
+    /// Narrator lines whose start falls in (before, now].
+    pub fn narration_due(&self, before: f32, now: f32) -> Vec<&'static str> {
+        if self.lead <= 0.0 {
+            return Vec::new();
+        }
+        NARRATION.iter().filter(|(at, _)| *at > before && *at <= now).map(|(_, k)| *k).collect()
     }
 
     /// Advance; returns the gods (indices) that appear during this step.
@@ -140,7 +190,7 @@ impl Intro {
         }
         let before = self.t;
         self.t += dt.max(0.0);
-        if self.t >= total() {
+        if self.t >= self.length() {
             self.done = true;
         }
         (0..self.arrive.len()).filter(|&i| self.arrive[i] > before && self.arrive[i] <= self.t).collect()
@@ -150,7 +200,7 @@ impl Intro {
     /// shell can put them in (without the fanfare of a burst each).
     pub fn skip(&mut self) -> Vec<usize> {
         let t = self.t;
-        self.t = total();
+        self.t = self.length();
         self.done = true;
         (0..self.arrive.len()).filter(|&i| self.arrive[i] > t).collect()
     }
@@ -170,7 +220,9 @@ impl Intro {
         // long move the eye rises on an arc (base to base on the pass is
         // ~350 u, over the peaks, not through them). Measured before: 137
         // degrees of turn and 353 u of eye travel in ONE frame.
-        for b in beat_starts() {
+        let lead = self.lead;
+        let starts: Vec<f32> = std::iter::once(lead).filter(|l| *l > 0.0).chain(beat_starts().into_iter().map(|b| b + lead)).collect();
+        for b in starts {
             // a long move takes longer: base to base on the pass is a 180
             // degree reversal over ~350 u, which in 0.9 s turned 6.3 deg a
             // frame (the smoothness test's limit is 6)
@@ -196,6 +248,41 @@ impl Intro {
 
     /// The beats' own shots, cut at the boundaries: `frame` smooths these.
     fn raw_frame(&self, t: f32) -> Frame {
+        if t < self.lead {
+            return self.prologue_frame(t);
+        }
+        self.raw_short(t - self.lead)
+    }
+
+    /// The prologue: the world seen from far and high, a slow sweep that
+    /// descends toward where the pan begins; bars in; the narrator's words
+    /// as subtitles.
+    fn prologue_frame(&self, t: f32) -> Frame {
+        let r = consts::arena_radius();
+        let u = smooth(t / self.lead);
+        // from far beyond the south rim, high, round toward the pan's start
+        let a0 = -std::f32::consts::FRAC_PI_2 - 0.9;
+        let a1 = -1.9;
+        let a = a0 + (a1 - a0) * u;
+        // inside the terrain the whole way: starting 1.9 r out (414 u on
+        // the pass, whose ground reaches 300) looked past the world's edge
+        // into bare void
+        let dist = r * (1.25 - 0.3 * u);
+        let height = r * (1.05 - 0.2 * u);
+        let shot = Shot { eye: Vec3::new(a.cos() * dist, height, a.sin() * dist), target: Vec3::new(0.0, r * 0.05 * (1.0 - u), 0.0), fov_y: 0.95 + 0.05 * u };
+        let mut o = Overlay { bars: smooth(t / 1.2), versus: 0.0, line: None, line_alpha: 0.0, caption: None, skip_hint: smooth((t - 1.0) / 0.5) };
+        // the subtitle: the line that started last, faded in and out
+        if let Some(k) = NARRATION.iter().rposition(|(at, _)| *at <= t) {
+            let (at, key) = NARRATION[k];
+            let end = NARRATION.get(k + 1).map_or(self.lead, |n| n.0) - 0.3;
+            o.line = Some(narration_text(key));
+            o.line_alpha = smooth((t - at) / 0.4) * (1.0 - smooth((t - (end - 0.4)) / 0.4));
+        }
+        Frame { shot, beat: Beat::Prologue, overlay: o, beat_t: t }
+    }
+
+    /// The short intro's shots at `t` (seconds from its own start).
+    fn raw_short(&self, t: f32) -> Frame {
         let r = consts::arena_radius();
         let bars_in = smooth(t / 0.6);
         let mut o = Overlay { bars: bars_in, versus: 0.0, line: None, line_alpha: 0.0, caption: None, skip_hint: smooth((t - 1.0) / 0.5) * (1.0 - smooth((t - (total() - SETTLE)) / 0.4)) };
@@ -280,6 +367,37 @@ impl Intro {
 mod tests {
     use super::*;
 
+    fn intro_full(n_per: usize) -> Intro {
+        let teams: Vec<Team> = (0..2 * n_per).map(|i| if i < n_per { Team::Blue } else { Team::Red }).collect();
+        let play = Shot { eye: Vec3::new(0.0, 8.0, -150.0), target: Vec3::new(0.0, 1.5, -140.0), fov_y: 0.95 };
+        Intro::full(&teams, Vec3::new(0.0, 0.0, -140.0), play)
+    }
+
+    /// The prologue's narration: every line in the script, each inside the
+    /// prologue, each given time to be said (~15 characters a second, a
+    /// slow storyteller) before the next, and shown as a subtitle.
+    #[test]
+    fn the_prologue_is_narrated_line_by_line() {
+        let f = intro_full(5);
+        let script = crate::voicescript::part("narrator").unwrap();
+        assert_eq!(script.lines.len(), NARRATION.len());
+        for (k, (at, key)) in NARRATION.iter().enumerate() {
+            assert!(script.lines.iter().any(|l| l.key == *key), "{key} not scripted");
+            assert!(*at > 0.0 && *at < PROLOGUE, "{key} outside the prologue");
+            let next = NARRATION.get(k + 1).map_or(PROLOGUE, |n| n.0);
+            let need = narration_text(key).len() as f32 / 15.0;
+            assert!(next - at >= need, "{key}: {:.1} s to say {} characters", next - at, narration_text(key).len());
+        }
+        let mut g = intro_full(5);
+        g.t = 16.4;
+        let o = g.frame().overlay;
+        assert_eq!(o.line, Some(narration_text("prologue4")));
+        assert!(o.line_alpha > 0.5);
+        assert_eq!(f.narration_due(0.0, 6.5), vec!["prologue1", "prologue2"]);
+        assert!(intro(5).narration_due(0.0, 40.0).is_empty(), "the short intro is not narrated");
+        assert!((f.length() - total() - PROLOGUE).abs() < 1e-4 && (f.fanfare_at() - FANFARE_AT - PROLOGUE).abs() < 1e-4);
+    }
+
     fn intro(n_per: usize) -> Intro {
         let teams: Vec<Team> = (0..2 * n_per).map(|i| if i < n_per { Team::Blue } else { Team::Red }).collect();
         let play = Shot { eye: Vec3::new(0.0, 8.0, -150.0), target: Vec3::new(0.0, 1.5, -140.0), fov_y: 0.95 };
@@ -301,6 +419,18 @@ mod tests {
         }
         use Beat::*;
         assert_eq!(seen, vec![Pan, Lane(consts::Lane::Top), Lane(consts::Lane::Mid), Lane(consts::Lane::Bot), Spawn(Team::Blue), Spawn(Team::Red), Versus, Settle]);
+        // and the full intro: the prologue first, then the same
+        let mut f = intro_full(5);
+        let mut seen_full: Vec<Beat> = Vec::new();
+        while !f.done {
+            let b = f.frame().beat;
+            if seen_full.last() != Some(&b) {
+                seen_full.push(b);
+            }
+            f.advance(1.0 / 60.0);
+        }
+        assert_eq!(seen_full[0], Prologue);
+        assert_eq!(&seen_full[1..], &seen[..]);
         // the last frame is (nearly) the gameplay camera
         let mut j = intro(5);
         j.t = total() - 1e-4;
@@ -339,7 +469,8 @@ mod tests {
         for m in crate::map::MapId::ALL {
             crate::map::with(m, || {
                 let n = m.team_size();
-                let mut i = intro(n);
+                for full in [false, true] {
+                let mut i = if full { intro_full(n) } else { intro(n) };
                 let dt = 1.0 / 60.0;
                 let mut prev = i.frame().shot;
                 while !i.done {
@@ -349,9 +480,12 @@ mod tests {
                     let step = (s.eye - prev.eye).length();
                     assert!(turn <= MAX_TURN, "{m:?}: the view turned {turn:.1} deg in a frame at t={:.2} ({:?})", i.t, i.frame().beat);
                     assert!(step <= MAX_STEP, "{m:?}: the eye jumped {step:.1} u in a frame at t={:.2} ({:?})", i.t, i.frame().beat);
+                    let flat = Vec3::new(s.eye.x, 0.0, s.eye.z).length();
+                    assert!(flat < crate::consts::ground_half() * 0.97, "{m:?}: the camera left the world at t={:.2}: {:.0} u out, the ground ends at {:.0}", i.t, flat, crate::consts::ground_half());
                     let ground = crate::render::terrain_height(s.eye.x, s.eye.z);
                     assert!(s.eye.y > ground + 1.0, "{m:?}: the camera went into the ground at t={:.2}: eye {} over ground {ground:.1}", i.t, s.eye);
                     prev = s;
+                }
                 }
             });
         }

@@ -1075,11 +1075,18 @@ pub fn run_intro_shots() -> Result<(), String> {
     let teams: Vec<Team> = game.gods.iter().map(|g| g.team).collect();
     let p0 = game.gods[0].pos;
     let play = intro::Shot { eye: p0 + Vec3::new(0.0, 6.5, -9.0), target: p0 + Vec3::Y * 1.5, fov_y: 0.95 };
-    let mut it = Intro::new(&teams, p0, play);
+    // CLAWBOUND_INTRO_FULL=1: the narrated first-match intro
+    let full = std::env::var("CLAWBOUND_INTRO_FULL").is_ok();
+    let mut it = if full { Intro::full(&teams, p0, play) } else { Intro::new(&teams, p0, play) };
+    let lead = if full { intro::PROLOGUE } else { 0.0 };
     let mut vfx = Vfx::default();
     let ctx = egui::Context::default();
     let dt = 1.0 / 60.0;
-    let caps = [
+    let mut caps: Vec<(f32, &str)> = Vec::new();
+    if full {
+        caps.extend([(3.0, "intro_0a_prologue.png"), (17.0, "intro_0b_prologue.png"), (30.0, "intro_0c_prologue.png"), (42.5, "intro_0d_prologue.png")]);
+    }
+    let short = [
         (2.2, "intro_1_pan.png"),
         (intro::PAN + 0.9, "intro_2_lane_top.png"),
         (intro::PAN + intro::LANE + 0.9, "intro_3_lane_mid.png"),
@@ -1088,6 +1095,7 @@ pub fn run_intro_shots() -> Result<(), String> {
         (intro::FANFARE_AT + 2.0 * intro::SPAWN + intro::VERSUS * 0.5, "intro_6_versus.png"),
         (intro::total() - 0.35, "intro_7_settle.png"),
     ];
+    caps.extend(short.iter().map(|(t, n)| (t + lead, *n)));
     let mut next = 0;
     while !it.done && next < caps.len() {
         for gi in it.advance(dt) {

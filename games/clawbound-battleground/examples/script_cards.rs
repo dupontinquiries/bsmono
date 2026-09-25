@@ -45,13 +45,18 @@ fn card(p: &Part) -> String {
     let def = ROSTER.iter().find(|d| d.name.to_ascii_lowercase().replace([' ', '\''], "") == p.who);
     let (title, name, motto, pelt, accent) = match def {
         Some(d) => (d.title.to_string(), d.name.to_string(), format!("\u{201c}{}\u{201d}", d.philosophy), d.palette[0], d.palette[3]),
+        None if p.who == "narrator" => ("the storyteller of the clans".into(), "The Narrator".into(), "The prologue of the first match: the world, the clans, the Gathering.".into(), [0.28, 0.22, 0.16], [0.86, 0.72, 0.48]),
         None => ("the voice of the battleground".into(), "The Announcer".into(), "Frostfang and Emberclaw, and everything between them.".into(), [0.30, 0.34, 0.52], [0.95, 0.78, 0.36]),
     };
+    // who they are, from the lore: kind, age, land, pronouns
+    let about = def.and_then(|d| clawbound::lore::of(d.name)).map(|a| format!("{} \u{b7} {} \u{b7} {} \u{b7} {}", a.species, a.age, a.land, a.gender.pronouns()));
     let accent = legible(accent);
     let w = 1000;
     let voice = wrap(p.voice, 78);
-    let head = 250 + voice.len() as i32 * 26;
-    let row = 112;
+    let head = 250 + voice.len() as i32 * 26 + if about.is_some() { 30 } else { 0 };
+    // the narrator's sentences wrap onto two lines: taller rows
+    let wraps = p.lines.iter().any(|l| l.text.len() > 46);
+    let row = if wraps { 142 } else { 112 };
     let h = head + p.lines.len() as i32 * row + 110;
     let mut s = String::new();
     s += &format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" font-family="DejaVu Sans, Helvetica, Arial, sans-serif">"#);
@@ -66,8 +71,13 @@ fn card(p: &Part) -> String {
     s += &format!(r##"<text x="48" y="92" font-size="64" font-weight="bold" fill="#fbf6ea">{}</text>"##, esc(&name));
     s += &format!(r##"<text x="50" y="132" font-size="24" fill="#e8dcc0">{}</text>"##, esc(&title));
     s += &format!(r##"<text x="50" y="176" font-size="22" font-style="italic" fill="{}">{}</text>"##, hex(accent, 1.0), esc(&motto));
+    let mut vy = 218;
+    if let Some(a) = &about {
+        s += &format!(r##"<text x="50" y="{vy}" font-size="18" font-weight="bold" fill="#f3ead4">{}</text>"##, esc(a));
+        vy += 30;
+    }
     for (i, l) in voice.iter().enumerate() {
-        s += &format!(r##"<text x="50" y="{}" font-size="19" fill="#d8d2c4">{}</text>"##, 218 + i as i32 * 26, esc(l));
+        s += &format!(r##"<text x="50" y="{}" font-size="19" fill="#d8d2c4">{}</text>"##, vy + i as i32 * 26, esc(l));
     }
     for (i, l) in p.lines.iter().enumerate() {
         let y = head + 24 + i as i32 * row;
@@ -80,9 +90,23 @@ fn card(p: &Part) -> String {
             let fill = if b < l.energy { hex(accent, 1.0) } else { "#34323d".to_string() };
             s += &format!(r#"<rect x="{}" y="{}" width="11" height="{bh}" rx="2" fill="{fill}"/>"#, 50 + b as i32 * 15, y + 44 - bh);
         }
-        // long lines step down so they stay on the card
-        let size = if l.text.len() > 34 { 31 } else if l.text.len() > 28 { 34 } else { 38 };
-        s += &format!(r##"<text x="138" y="{}" font-size="{size}" font-weight="bold" fill="#fbf6ea">{}</text>"##, y + 30, esc(l.text));
+        // long lines step down so they stay on the card; a sentence too
+        // long for one line wraps onto two (the narrator's were cut off at
+        // the card's edge)
+        let mut y = y;
+        if l.text.len() > 46 {
+            let parts = wrap(l.text, 50);
+            // never drop words from a script: the first version kept two
+            // lines of three and lost "Gathering."
+            assert!(parts.len() <= 2, "{}/{}: needs {} lines: {}", p.who, l.key, parts.len(), l.text);
+            for (k, part) in parts.iter().enumerate() {
+                s += &format!(r##"<text x="138" y="{}" font-size="28" font-weight="bold" fill="#fbf6ea">{}</text>"##, y + 28 + k as i32 * 33, esc(part));
+            }
+            y += 30;
+        } else {
+            let size = if l.text.len() > 34 { 31 } else if l.text.len() > 28 { 34 } else { 38 };
+            s += &format!(r##"<text x="138" y="{}" font-size="{size}" font-weight="bold" fill="#fbf6ea">{}</text>"##, y + 30, esc(l.text));
+        }
         s += &format!(
             r##"<text x="140" y="{}" font-size="17" fill="#9e98a8"><tspan font-family="DejaVu Sans Mono, monospace" fill="{}">{}</tspan>  ·  <tspan font-style="italic" fill="#cfc7b6">{}</tspan></text>"##,
             y + 60,

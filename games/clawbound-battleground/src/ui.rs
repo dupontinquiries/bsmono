@@ -1152,7 +1152,10 @@ pub fn draw_intro_overlay(ctx: &egui::Context, o: &crate::intro::Overlay) {
     }
     if let Some(line) = o.line {
         if o.line_alpha > 0.01 {
-            let y = screen.max.y - bar.max(h * 0.06) - 26.0;
+            // inside the bottom bar when it is there (legible over any
+            // scene: pale subtitles over the pass's snow could not be read);
+            // just above the edge when it is not
+            let y = if bar > 30.0 { screen.max.y - bar * 0.5 + 12.0 } else { screen.max.y - h * 0.06 - 26.0 };
             p.text(Pos2::new(screen.center().x + 1.5, y + 1.5), Align2::CENTER_BOTTOM, line, FontId::proportional((h * 0.034).clamp(16.0, 30.0)), Color32::from_black_alpha(a(o.line_alpha * 0.7)));
             p.text(Pos2::new(screen.center().x, y), Align2::CENTER_BOTTOM, line, FontId::proportional((h * 0.034).clamp(16.0, 30.0)), Color32::from_rgba_unmultiplied(240, 232, 214, a(o.line_alpha)));
         }

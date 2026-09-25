@@ -240,6 +240,20 @@ pub const PARTS: &[Part] = &[
         ],
     },
     Part {
+        who: "narrator",
+        voice: "The storyteller of the clans, over the first match's prologue: unhurried, weighty, a little in awe. Let each line breathe; the music leaves room between them. Record each as its own file.",
+        lines: &[
+            l("prologue1", "Before any word was written, the world belonged to the clans.", "hushed, as if starting an old story", 2, "the prologue opens, line 1 of 8 (first match of a session)"),
+            l("prologue2", "No hand raised a wall. No fire burned but the lightning's.", "slow, each sentence its own image", 2, "the prologue, line 2 of 8"),
+            l("prologue3", "From the frozen long-ago to the endless dunes, the great cats kept it.", "growing, sweeping", 3, "the prologue, line 3 of 8"),
+            l("prologue4", "Lions of the golden plains. Tigers of the dusk. Sabre-fangs of the elder dawn.", "a roll-call, each name a beat", 3, "the prologue, line 4 of 8"),
+            l("prologue5", "Their bones are ice and sand now. Their stories never were.", "quiet, then warm on the last phrase", 2, "the prologue, line 5 of 8"),
+            l("prologue6", "When a thing cannot be divided, and must not be warred over, the clans hold the Gathering.", "measured, the law of the clans", 3, "the prologue, line 6 of 8"),
+            l("prologue7", "They split by lot -- Frostfang and Emberclaw -- and call their ancestors home.", "rising, naming the two halves with weight", 4, "the prologue, line 7 of 8"),
+            l("prologue8", "Beasts of power. Beasts of glory. Let the ages meet.", "the peak: full voice on the last four words", 5, "line 8 of 8: the prologue ends, the world comes into view"),
+        ],
+    },
+    Part {
         who: "announcer",
         voice: "The voice of the battleground: big, warm, theatrical, like a sports caller who loves these cats. Leave half a second of silence before and after every line.",
         lines: &[
@@ -274,8 +288,8 @@ pub fn part(who: &str) -> Option<&'static Part> {
 
 /// The file a line is recorded to, under the audio root.
 pub fn file_for(who: &str, key: &str) -> String {
-    if who == "announcer" {
-        format!("announcer/{key}.opus")
+    if who == "announcer" || who == "narrator" {
+        format!("{who}/{key}.opus")
     } else {
         format!("voice/{who}/{key}.opus")
     }
@@ -284,8 +298,8 @@ pub fn file_for(who: &str, key: &str) -> String {
 /// The bank key a file plays as (a take's `.N` is not part of it).
 pub fn bank_key(who: &str, key: &str) -> String {
     let stem = key.split('.').next().unwrap_or(key);
-    if who == "announcer" {
-        format!("announcer/{stem}")
+    if who == "announcer" || who == "narrator" {
+        format!("{who}/{stem}")
     } else {
         format!("voice/{who}/{stem}")
     }
@@ -315,7 +329,7 @@ mod tests {
                 assert_eq!(crate::cues::ancestor_key(&game, g), who);
             }
         }
-        assert_eq!(PARTS.len(), ROSTER.len() + 1, "13 ancestors and the announcer");
+        assert_eq!(PARTS.len(), ROSTER.len() + 2, "13 ancestors, the narrator and the announcer");
     }
 
     #[test]
@@ -323,7 +337,9 @@ mod tests {
         for p in PARTS {
             for l in p.lines {
                 assert!((1..=5).contains(&l.energy), "{}/{}", p.who, l.key);
-                assert!(!l.text.is_empty() && l.text.len() <= 48, "{}/{}: too long to shout: {}", p.who, l.key, l.text);
+                // shouted lines are short; the narrator tells a story
+                let max = if p.who == "narrator" { 100 } else { 48 };
+                assert!(!l.text.is_empty() && l.text.len() <= max, "{}/{}: too long: {}", p.who, l.key, l.text);
                 assert!(!l.direction.is_empty() && !l.trigger.is_empty());
             }
             let mut keys: Vec<_> = p.lines.iter().map(|l| l.key).collect();
