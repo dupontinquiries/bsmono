@@ -14,6 +14,8 @@
 //! over it.
 
 pub mod ui;
+/// Real thumbnails, decoded off the UI thread (headless; ui.rs uploads and draws).
+pub mod thumbs;
 pub mod settings;
 
 use photosync::album::{Item, Library};
@@ -50,6 +52,11 @@ pub struct App {
     pub rail: uikit_egui::sidebar::Sidebar,
     pub status: String,
     pub settings: settings::Settings,
+    /// Background thumbnail decoding; started by the first frame (`ui::draw`),
+    /// which has the repaint callback to give it.
+    pub thumbs: Option<thumbs::Thumbs>,
+    /// Uploaded thumbnails by path; entries leave when `thumbs` evicts them.
+    pub textures: std::collections::HashMap<String, egui::TextureHandle>,
 }
 
 impl App {
@@ -68,6 +75,8 @@ impl App {
                 .reserve(360.0),
             status: String::new(),
             settings: settings::Settings::default(),
+            thumbs: None,
+            textures: std::collections::HashMap::new()
         }
     }
 
@@ -78,6 +87,15 @@ impl App {
     /// shell before a store exists to point it at.
     pub fn from_db(db: &photosync::PhotoSyncDB) -> Result<App, rusqlite::Error> {
         Ok(App::new(photosync::album::load(db.connection())?))
+    }
+
+    /// The daemon's library, opened READ-ONLY: a viewer never creates or
+    /// changes the daemon's store (`PhotoSyncDB::new` would create it).
+    pub fn from_path(db: &std::path::Path) -> Result<App, String> {
+        let conn = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("{}: {e}", db.display()))?;
+        let lib = photosync::album::load(&conn).map_err(|e| format!("{}: {e}", db.display()))?;
+        Ok(App::new(lib))
     }
 
     /// A library with no real store behind it — see `from_db` for the real
@@ -108,3 +126,32 @@ impl App {
         App::new(library)
     }
 }
+
+#[cfg(test)]
+mod from_path_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_library_is_an_error_and_is_not_created() {
+        let dir = std::env::temp_dir().join(format!("photosync-egui-nodb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("photosync.db");
+        assert!(App::from_path(&db).is_err());
+        assert!(!db.exists(), "a viewer must never create the daemon's store");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_daemons_library_opens_read_only() {
+        let dir = std::env::temp_dir().join(format!("photosync-egui-db-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("blocks")).unwrap();
+        let db = dir.join("photosync.db");
+        drop(photosync::PhotoSyncDB::new(&db, &dir.join("blocks")).expect("the daemon's schema"));
+        let before = std::fs::metadata(&db).unwrap().modified().unwrap();
+        let app = App::from_path(&db).expect("opens");
+        assert!(app.library.is_empty());
+        assert_eq!(std::fs::metadata(&db).unwrap().modified().unwrap(), before, "not written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+

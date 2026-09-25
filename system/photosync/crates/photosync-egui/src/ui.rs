@@ -15,6 +15,7 @@ use photosync::album::Item;
 use photosync::gallery_grid;
 
 pub fn draw(app: &mut App, ctx: &Context) {
+    sync_thumbnails(app, ctx);
     let colors = uikit_egui::apply_palette(ctx, snapclone_theme::palette_by_id("minimal"));
     app.backdrop.paint(ctx, &colors);
 
@@ -226,7 +227,12 @@ fn gallery(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors)
                         Pos2::new(origin.x + x, origin.y + y),
                         Vec2::splat(grid.cell),
                     );
-                    if paint_tile(ui, cell_rect, item, app.selected.contains(&item.path), colors, app.settings.thumb_style) {
+                    // Ask for its thumbnail (only visible tiles get here, so
+                    // the newest requests are what is on screen), and draw the
+                    // texture once it has been uploaded.
+                    if let Some(t) = &app.thumbs { let _ = t.get(&item.path); }
+                    let thumb = app.textures.get(&item.path).map(|h| (h.id(), h.size_vec2()));
+                    if paint_tile(ui, cell_rect, item, thumb, app.selected.contains(&item.path), colors, app.settings.thumb_style) {
                         toggled = Some(item.path.clone());
                     }
                 }
@@ -252,6 +258,7 @@ fn paint_tile(
     ui: &mut egui::Ui,
     rect: Rect,
     item: &Item,
+    thumb: Option<(egui::TextureId, Vec2)>,
     selected: bool,
     colors: &uikit_egui::PaletteColors,
     style: crate::settings::ThumbStyle,
@@ -265,6 +272,10 @@ fn paint_tile(
     let hue = uikit_egui::mono_tile::hue(&item.path);
     let base = uikit_egui::mono_tile::hsla(hue, 0.42, 0.55, 1.0);
 
+    if let Some((tex, size)) = thumb {
+        // The real picture, cropped to fill the square cell.
+        painter.image(tex, rect, cover_uv(size, rect.size()), egui::Color32::WHITE);
+    } else {
     match style {
         crate::settings::ThumbStyle::Solid => {
             painter.rect_filled(rect, CornerRadius::same(8), base);
@@ -314,6 +325,7 @@ fn paint_tile(
                 }
             }
         }
+    }
     }
 
     if resp.hovered() {
@@ -417,3 +429,110 @@ fn settings_view(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteC
         });
     });
 }
+
+/// Upload thumbnails finished since last frame and free evicted ones; start
+/// the decoder on the first frame (it needs this context to request repaints).
+fn sync_thumbnails(app: &mut App, ctx: &Context) {
+    if app.thumbs.is_none() {
+        let repaint = ctx.clone();
+        app.thumbs = Some(crate::thumbs::Thumbs::new(
+            std::sync::Arc::new(crate::thumbs::ImageDecode),
+            THUMB_THREADS,
+            THUMB_SIDE,
+            THUMB_BUDGET_BYTES,
+            THUMB_MAX_PENDING,
+            Some(std::sync::Arc::new(move || repaint.request_repaint())),
+        ));
+    }
+    let Some(t) = &app.thumbs else { return };
+    for (path, img) in t.take_fresh() {
+        let ci = egui::ColorImage::from_rgba_unmultiplied([img.w as usize, img.h as usize], &img.rgba);
+        let tex = ctx.load_texture(format!("thumb:{path}"), ci, egui::TextureOptions::LINEAR);
+        app.textures.insert(path, tex);
+    }
+    for path in t.take_evicted() {
+        app.textures.remove(&path);
+    }
+}
+
+/// Decoder threads: the UI keeps a core, and a phone has few.
+const THUMB_THREADS: usize = 2;
+/// Long side in px: a cell is ~168 pt, so this is sharp at 1.5x.
+const THUMB_SIDE: u32 = 256;
+/// Resident thumbnails, bytes: ~96 MB, a few hundred at 256 px.
+const THUMB_BUDGET_BYTES: usize = 96 << 20;
+/// Waiting requests kept: more than a screenful, fewer than a fast fling.
+const THUMB_MAX_PENDING: usize = 256;
+
+/// UV rect that crops an image of `img` size to fill a cell of `cell` size,
+/// centred ("cover"): the long axis is trimmed evenly, nothing is stretched.
+pub fn cover_uv(img: Vec2, cell: Vec2) -> Rect {
+    if img.x <= 0.0 || img.y <= 0.0 || cell.x <= 0.0 || cell.y <= 0.0 {
+        return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    }
+    let (ia, ca) = (img.x / img.y, cell.x / cell.y);
+    if ia > ca {
+        let keep = ca / ia; // fraction of the width kept
+        let m = (1.0 - keep) / 2.0;
+        Rect::from_min_max(Pos2::new(m, 0.0), Pos2::new(1.0 - m, 1.0))
+    } else {
+        let keep = ia / ca;
+        let m = (1.0 - keep) / 2.0;
+        Rect::from_min_max(Pos2::new(0.0, m), Pos2::new(1.0, 1.0 - m))
+    }
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+
+    #[test]
+    fn cover_crops_the_long_side_evenly_and_never_stretches() {
+        let sq = Vec2::splat(100.0);
+        let wide = cover_uv(Vec2::new(400.0, 200.0), sq);
+        assert!((wide.min.x - 0.25).abs() < 1e-6 && (wide.max.x - 0.75).abs() < 1e-6 && wide.min.y == 0.0 && wide.max.y == 1.0, "{wide:?}");
+        let tall = cover_uv(Vec2::new(200.0, 400.0), sq);
+        assert!((tall.min.y - 0.25).abs() < 1e-6 && (tall.max.y - 0.75).abs() < 1e-6 && tall.min.x == 0.0, "{tall:?}");
+        assert_eq!(cover_uv(Vec2::new(300.0, 300.0), sq), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
+        assert_eq!(cover_uv(Vec2::ZERO, sq), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), "degenerate: whole image");
+        // The kept region has the cell's aspect: nothing is stretched.
+        let r = cover_uv(Vec2::new(640.0, 480.0), Vec2::new(90.0, 160.0));
+        assert!(((r.width() * 640.0) / (r.height() * 480.0) - 90.0 / 160.0).abs() < 1e-4);
+    }
+}
+
+#[cfg(test)]
+mod draw_tests {
+    use super::*;
+
+    /// End to end through the real frame function: picture files on disk, a
+    /// library pointing at them, `draw` run headless until the decoder's
+    /// thumbnails come back and are uploaded as textures.
+    #[test]
+    fn the_grid_turns_files_on_disk_into_textures() {
+        let dir = std::env::temp_dir().join(format!("photosync-draw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut items = Vec::new();
+        for (i, (w, h)) in [(320u32, 200u32), (200, 320), (240, 240)].into_iter().enumerate() {
+            let p = dir.join(format!("p{i}.png"));
+            image::RgbaImage::from_pixel(w, h, image::Rgba([40 * i as u8, 120, 200, 255])).save(&p).unwrap();
+            items.push(photosync::album::Item { path: p.to_string_lossy().into(), taken_at: 1_726_000_000 + i as i64 * 60,
+                thumbnail: None, bytes: 1, metadata_json: None });
+        }
+        let mut app = App::new(photosync::album::Library::new(items));
+        let ctx = egui::Context::default();
+        let start = std::time::Instant::now();
+        while app.textures.len() < 3 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10), "only {} textures", app.textures.len());
+            let _ = ctx.run(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1040.0, 720.0))), ..Default::default() },
+                            |ctx| draw(&mut app, ctx));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for (path, tex) in &app.textures {
+            let s = tex.size();
+            assert!(s[0].max(s[1]) <= THUMB_SIDE as usize && s[0].max(s[1]) > 0, "{path}: {s:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+

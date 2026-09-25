@@ -15,6 +15,8 @@ required-features = ["app"]
 # see the module docs on both for why that split is load-bearing here.
 photosync = { package = "photosync-system", path = "../..", default-features = false }
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Thumbnail decoding (thumbs.rs). The version photosync-system already builds.
+image = "0.24"
 
 # THE SHARED KIT, per house convention: palette, tokens, sidebar, backdrop.
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }

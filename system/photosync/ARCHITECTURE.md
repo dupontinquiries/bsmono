@@ -342,11 +342,15 @@ server, CLI). `crates/photosync-egui/` is the renderer: an egui shell on
 the fleet's shared `uikit-egui` kit, styled after Fotema's camera-roll
 shape — Library/Albums/Settings as ordinary rail destinations (Settings
 is a ordinary tab, not a separate window the way GTK/libadwaita apps
-place it), thumbnails as procedural placeholders (`settings::ThumbStyle`
-— Solid/Blur/Tileset, all pure per-frame painting, no thumbnail cache on
-disk to grow over time) since no decoder is wired in yet. `App::demo()`
-is what it runs on today; `App::from_db()` is the real path once a
-`PhotoSyncDB` is available to point it at.
+place it). Thumbnails are the real pictures: `thumbs.rs` decodes the
+visible tiles' files off the UI thread (newest request first, a
+byte-bounded LRU in memory, no cache on disk to grow over time) and the
+grid draws them cropped to fill; the procedural styles
+(`settings::ThumbStyle`) remain as the placeholder while one loads or when a
+file does not decode. The binary opens the daemon's library READ-ONLY
+(`App::from_path`: `--db PATH`, `$PHOTOSYNC_DB`, or the daemon's default);
+`--demo`, or a library that cannot be opened, shows `App::demo()` with a
+status line saying so.
 
 **Per-device permissions.** `Permission` (`ReadOnly < Contribute <
 FullSync`, real `Ord`-based capability checks) plus a `permissions` table

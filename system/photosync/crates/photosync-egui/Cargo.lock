@@ -2380,6 +2380,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "image 0.24.9",
  "photosync-system",
  "rusqlite",
  "snapclone-theme",
