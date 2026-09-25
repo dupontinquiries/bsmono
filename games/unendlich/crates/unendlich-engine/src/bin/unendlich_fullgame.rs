@@ -242,13 +242,19 @@ fn dragon_duel_for(
         return None;
     }
     let genome = unendlich_engine::spawn::dragon_genome_at(spawn_pos);
+    Some(dragon_duel_with(genome, unendlich_engine::spawn::dragon_id_at(spawn_pos)))
+}
+
+/// The duel record for a dragon with a KNOWN genome (bred offspring), and a
+/// raw id seed (mixed below).
+fn dragon_duel_with(genome: unendlich_engine::sim::dragon_archetype::Genome, id_seed: u64) -> Box<DragonDuel> {
     // Mixed (splitmix64 finaliser, a bijection): the spawn seed is FNV over
     // float bit patterns, whose low bits are constant for positions on a
     // coarse grid -- the first soak printed "#2fb7" for all twelve dragons,
     // and DuelState::new reads bit 0 for the circling direction, so every
     // dragon would have circled the same way.
     let id = {
-        let mut z = unendlich_engine::spawn::dragon_id_at(spawn_pos);
+        let mut z = id_seed;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
@@ -265,7 +271,7 @@ fn dragon_duel_for(
         id & 0xffff, profile.element_name(), profile.build, profile.size_class, profile.max_hp, profile.hide,
         profile.weak_spot.name(), profile.cunning, profile.ferocity, profile.dread
     );
-    Some(Box::new(DragonDuel {
+    Box::new(DragonDuel {
         id,
         genome,
         profile,
@@ -285,7 +291,7 @@ fn dragon_duel_for(
         mantle: None,
         view_t: 1.0,
         eyes: 0.0,
-    }))
+    })
 }
 
 /// An axis-aligned glowing box (a dragon's eye), appended to the entity stream.
@@ -2652,6 +2658,26 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // fight (hidden, repositioning, flashes, eyes) without waiting for a Fire
     // master to decide to smoke.
     let dragon_at_smoke = dragon_at_raw.contains(":smoke");
+    // …[:fire|:dust|:<element>]: hatch it where the genome is a MASTER of that
+    // element (knows its defensive form: Smoke Wall, Rampart; Dust also
+    // Boulder) -- searched over nearby spots, since a wild genome follows its
+    // position. …[:hurt]: it starts at 45% health (defensive casting).
+    let dragon_at_element: Option<u8> = dragon_at_raw.split(':').skip(1).find_map(|t| {
+        unendlich_engine::sim::dragon_archetype::ELEMENT_NAMES
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(t))
+            .map(|i| i as u8)
+    });
+    let dragon_at_hurt = dragon_at_raw.contains(":hurt");
+    // UNENDLICH_PLAYER_ELEMENT=<Wood|Water|Air|Dust|Fire|Storm>: what the dragons
+    // believe your held item is aligned with (a test knob, for provoking the
+    // counter-element behaviour without forging a weapon).
+    let player_element_override: Option<u8> = std::env::var("UNENDLICH_PLAYER_ELEMENT").ok().and_then(|t| {
+        unendlich_engine::sim::dragon_archetype::ELEMENT_NAMES
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(t.trim()))
+            .map(|i| i as u8)
+    });
     let mut dragon_at_pending: Option<f32> = dragon_at_raw
         .split(':')
         .next()
@@ -4922,7 +4948,30 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     } else {
                         local_player.view.yaw
                     };
-                    let (sx, sz) = (p.x + yaw.cos() * m, p.z + yaw.sin() * m);
+                    let (mut sx, mut sz) = (p.x + yaw.cos() * m, p.z + yaw.sin() * m);
+                    if let Some(el) = dragon_at_element {
+                        use unendlich_engine::sim::dragon_abilities as da;
+                        let gen = chunk_manager.generator().cpu().clone();
+                        let found = (0..400).find_map(|k| {
+                            let (ox, oz) = (((k % 20) as f32 - 10.0) * 3.0, ((k / 20) as f32 - 10.0) * 3.0);
+                            let (x, z) = (sx + ox, sz + oz);
+                            let y = gen.surface_y_at(x.floor() as i32, z.floor() as i32, probe_y_min, probe_y_max)? + 1;
+                            // On your level: a master on a peak 90 m up never sees you.
+                            if (y as f32 - (p.y - 1.6)).abs() > 8.0 {
+                                return None;
+                            }
+                            let g = unendlich_engine::spawn::dragon_genome_at([x, y as f32, z]);
+                            let r = da::repertoire(&g);
+                            (r.dominant.0 == el && r.abilities.iter().any(|a| a.defensive)).then_some((x, z))
+                        });
+                        match found {
+                            Some((x, z)) => {
+                                sx = x;
+                                sz = z;
+                            }
+                            None => log::warn!("[dragon] UNENDLICH_DRAGON_AT: no {} master within 30 m; hatching what is there", unendlich_engine::sim::dragon_archetype::ELEMENT_NAMES[el as usize]),
+                        }
+                    }
                     let sy = chunk_manager
                         .generator()
                         .cpu()
@@ -4935,6 +4984,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         [sx, sy as f32, sz],
                         wseed,
                     ));
+                    if dragon_at_hurt {
+                        if let Some(r) = roamers.last_mut() {
+                            r.hp = (r.hp as f32 * 0.45) as i32;
+                            log::info!("[dragon] UNENDLICH_DRAGON_AT …:hurt — it hatches at {} hp", r.hp);
+                        }
+                    }
                     if dragon_at_smoke {
                         if let Some(r) = roamers.last_mut() {
                             let he = r.creature.body.half_extents;
@@ -9489,9 +9544,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
             }
             // DRAGON DUEL: what the dragons see in your hand this frame.
-            let player_threat = player_item_threat(
+            let mut player_threat = player_item_threat(
                 survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
             );
+            if player_element_override.is_some() {
+                player_threat.element = player_element_override;
+            }
             // r294: fresh surface memo each tick (the world is mutated between ticks).
             if surface_cache_enabled {
                 surface_cache.borrow_mut().clear();
@@ -11057,7 +11115,26 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             [cr.body.position[0], cr.body.position[1] + cr.body.half_extents[1] * 0.5, cr.body.position[2]],
                             1.0,
                         );
-                        senses.hidden = d.view_t < unendlich_engine::sim::smoke_wall::SIGHT_FLOOR;
+                        // …and terrain: a hill, a boulder, a rampart between you
+                        // hides it from you exactly as it hides you from it. (Only
+                        // for the tactic: the renderer's depth test already hides
+                        // what terrain covers, and a fade here would erase a big
+                        // dragon whose centre is behind a ridge but whose wings aren't.)
+                        let mut terrain_hides = false;
+                        if d.view_t >= unendlich_engine::sim::smoke_wall::SIGHT_FLOOR {
+                            let c = [cr.body.position[0], cr.body.position[1] + cr.body.half_extents[1] * 0.5, cr.body.position[2]];
+                            let dir = [c[0] - pv.eye[0], c[1] - pv.eye[1], c[2] - pv.eye[2]];
+                            let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+                            let body_r = cr.body.half_extents[0].max(cr.body.half_extents[2]);
+                            if len > body_r + 1.0
+                                && chunk_manager
+                                    .raycast_octree(pv.eye, dir, len - body_r, |b| b.is_solid() && !matches!(b, BlockId::OakLeaves | BlockId::BirchLeaves | BlockId::Glass))
+                                    .is_some()
+                            {
+                                terrain_hides = true;
+                            }
+                        }
+                        senses.hidden = terrain_hides || d.view_t < unendlich_engine::sim::smoke_wall::SIGHT_FLOOR;
                         // What its bending offers (only against what it can see:
                         // no blind casting at a belief).
                         let cunning_now = (d.profile.cunning * duel_tuning.cunning).clamp(0.0, 1.0);
@@ -11364,6 +11441,23 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         };
                         cr.body.position[0] += cr.yaw.cos() * spd * dt;
                         cr.body.position[2] += cr.yaw.sin() * spd * dt;
+                        // Never inside the ground: flight had no floor, and a soak
+                        // trace caught an engaged dragon at y=53 under a player on
+                        // the surface at y=65 (its "fly low at you" target plus
+                        // terrain rising under it). Floor on the column it is over now.
+                        {
+                            let (fx, fz) = (cr.body.position[0].floor() as i32, cr.body.position[2].floor() as i32);
+                            let ground_here = chunk_manager
+                                .surface_y_at(fx, fz, probe_y_min, probe_y_max)
+                                .map(|y| y as f32 + 1.0)
+                                .unwrap_or(surf);
+                            // Same reference the landing uses (it descends to `surf`
+                            // and lands within 1.5), so this cannot block a landing.
+                            let floor = ground_here.max(surf) - 0.5;
+                            if cr.body.position[1] < floor {
+                                cr.body.position[1] = floor;
+                            }
+                        }
                         cr.body.velocity = [cr.yaw.cos() * spd, vy, cr.yaw.sin() * spd];
                         cr.pitch = (vy / 10.0).clamp(-0.35, 0.35);
                         cr.roll = 0.22; // bank into the turn
@@ -11502,6 +11596,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         {
                             continue;
                         }
+                        // Dragon parents pass on their GENES (sim::dragon_breeding::
+                        // cross): the clutch carries both parents' element channels,
+                        // so a Fire × Storm pair can hatch a Plasma Lance bender.
+                        // Before, a hatchling's genome came from where it hatched.
+                        let bred_genome = match (roamers[i].duel.as_ref(), roamers[j].duel.as_ref()) {
+                            (Some(da), Some(db)) => Some(unendlich_engine::sim::dragon_breeding::cross(&da.genome, &db.genome, mseed)),
+                            _ => None,
+                        };
                         let (left, right) = roamers.split_at_mut(j);
                         let a = &mut left[i];
                         let b = &mut right[0];
@@ -11510,8 +11612,26 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         ) {
                             let kind = a.kind;
                             let pos = a.creature.body.position;
-                            let mut cr = unendlich_engine::spawn::spawn(kind, [pos[0], pos[1], pos[2]]);
-                            let duel = dragon_duel_for(kind, [pos[0], pos[1], pos[2]]);
+                            let (mut cr, duel) = match bred_genome {
+                                Some(g) => {
+                                    let d = dragon_duel_with(g, mseed ^ 0xC1_7C4);
+                                    log::info!(
+                                        "[dragon#{:04x}] hatched from a clutch — {} (parents' channels crossed)",
+                                        d.id & 0xffff,
+                                        unendlich_engine::sim::dragon_abilities::describe(&d.rep)
+                                    );
+                                    (
+                                        unendlich_engine::spawn::spawn_dragon_with_genome_grown(
+                                            [pos[0], pos[1], pos[2]], &g, unendlich_engine::spawn::DRAGON_FORGE_RES, 0.36,
+                                        ),
+                                        Some(d),
+                                    )
+                                }
+                                None => (
+                                    unendlich_engine::spawn::spawn(kind, [pos[0], pos[1], pos[2]]),
+                                    dragon_duel_for(kind, [pos[0], pos[1], pos[2]]),
+                                ),
+                            };
                             cr.body.position[1] = cr.grounded_y(pos[1]);
                             let cseed = mseed ^ 0x5DEE_CE15;
                             let ph = child.express(cseed, 0);
