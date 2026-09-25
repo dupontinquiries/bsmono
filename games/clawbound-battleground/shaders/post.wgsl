@@ -7,9 +7,43 @@ struct PostParams {
     a: vec4<f32>, // exposure, vignette, time, lightning
     b: vec4<f32>, // bloom strength, night, rain, heat
     c: vec4<f32>, // sun screen x, sun screen y (uv), ray strength, contrast
-    rings: array<vec4<f32>, 8>, // blast fronts on screen: u, v, radius (v-units), strength
+    vp: mat4x4<f32>,
+    inv_vp: mat4x4<f32>,
+    cam: vec4<f32>,                 // xyz: the camera
+    blast_a: array<vec4<f32>, 8>,   // blast fronts in the world: centre xyz, radius
+    blast_b: array<vec4<f32>, 8>,   // strength, shell thickness
 };
 @group(0) @binding(2) var<uniform> pp: PostParams;
+// The scene's depth (MSAA; sample 0 is plenty for a refraction mask).
+@group(0) @binding(3) var scene_depth: texture_depth_multisampled_2d;
+
+// How far along the ray one sphere lies, clipped to [0, t_max]
+// (groundfx::sphere_span).
+fn sphere_span(ro: vec3<f32>, rd: vec3<f32>, c: vec3<f32>, r: f32, t_max: f32) -> f32 {
+    let oc = ro - c;
+    let b = dot(oc, rd);
+    let disc = b * b - (dot(oc, oc) - r * r);
+    if (disc <= 0.0) {
+        return 0.0;
+    }
+    let h = sqrt(disc);
+    return max(min(-b + h, t_max) - max(-b - h, 0.0), 0.0);
+}
+
+// Blast-front air crossed by the ray before the scene surface
+// (groundfx::shell_path, which the tests check).
+fn shell_path(ro: vec3<f32>, rd: vec3<f32>, c: vec3<f32>, radius: f32, th: f32, t_scene: f32) -> f32 {
+    let outer = sphere_span(ro, rd, c, radius + th * 0.5, t_scene);
+    let inner = sphere_span(ro, rd, c, max(radius - th * 0.5, 0.0), t_scene);
+    return max(outer - inner, 0.0);
+}
+
+// The world-space direction of the view ray through `uv`.
+fn function_ray(uv: vec2<f32>, ro: vec3<f32>) -> vec3<f32> {
+    let w = pp.inv_vp * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0, 1.0);
+    return normalize(w.xyz / w.w - ro);
+}
+
 
 struct VSOut {
     @builtin(position) clip: vec4<f32>,
@@ -48,23 +82,64 @@ fn bright(c: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let params = pp.a;
-    // --- the air moving. A blast front is denser air: it bends what is seen
-    // through it, outward, in a thin band at the ring. Heat does the same
-    // thing gently and everywhere at once, rising. Both are one UV offset
-    // applied before anything is sampled, so bloom and shafts bend with it.
+    // --- the air moving. A blast front is a SHELL of denser air in the
+    // world: each pixel's view ray is tested against it, and only the air
+    // the ray crosses BEFORE it hits the scene bends the view -- so what
+    // stands in front of a blast is not warped, a ground blast is a dome
+    // the ground cuts, and the shell is strongest at its silhouette, where
+    // the ray grazes the most air. The bend is outward along the shell's
+    // normal as the screen sees it. (It was a flat screen-space ring, bent
+    // over everything; groundfx::shell_path is the same maths, tested.)
+    // Heat shimmer does its own thing gently and everywhere. Both are one
+    // UV offset before anything is sampled, so bloom and shafts bend too.
     var bend = vec2(0.0);
-    let aspect = f32(textureDimensions(hdr).x) / f32(textureDimensions(hdr).y);
+    let dims = vec2<f32>(textureDimensions(hdr));
+    let aspect = dims.x / dims.y;
+    var any_blast = false;
     for (var i = 0; i < 8; i = i + 1) {
-        let r = pp.rings[i];
-        if (r.w <= 0.002) {
-            continue;
+        if (pp.blast_b[i].x > 0.002) {
+            any_blast = true;
         }
-        let d = (in.uv - r.xy) * vec2(aspect, 1.0);
-        let dist = length(d);
-        let x = (dist - r.z) / (0.018 + r.z * 0.10);
-        if (abs(x) < 3.0) {
-            // push pixels outward ahead of the front, pull behind it
-            bend = bend - (d / max(dist, 0.001)) * vec2(1.0 / aspect, 1.0) * (-x * exp(-x * x)) * r.w * 0.030;
+    }
+    if (any_blast) {
+        let px = vec2<i32>(clamp(in.uv * dims, vec2(0.0), dims - vec2(1.0)));
+        let d = textureLoad(scene_depth, px, 0);
+        let ndc = vec4(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0, d, 1.0);
+        let wp = pp.inv_vp * ndc;
+        let world = wp.xyz / wp.w;
+        let ro = pp.cam.xyz;
+        let rd = normalize(world - ro);
+        // the sky (depth at the far plane) is infinitely far
+        let t_scene = select(length(world - ro), 1.0e6, d >= 0.99999);
+        // neighbouring pixels' rays, for the gradient of the air crossed
+        let ray_at = function_ray(in.uv + vec2(1.0 / dims.x, 0.0), ro);
+        let ray_up = function_ray(in.uv + vec2(0.0, 1.0 / dims.y), ro);
+        for (var i = 0; i < 8; i = i + 1) {
+            let strength = pp.blast_b[i].x;
+            if (strength <= 0.002) {
+                continue;
+            }
+            let c = pp.blast_a[i].xyz;
+            let radius = pp.blast_a[i].w;
+            let th = pp.blast_b[i].y;
+            let path = shell_path(ro, rd, c, radius, th, t_scene);
+            let px_path = shell_path(ro, ray_at, c, radius, th, t_scene);
+            let py_path = shell_path(ro, ray_up, c, radius, th, t_scene);
+            if (path <= 0.0 && px_path <= 0.0 && py_path <= 0.0) {
+                continue;
+            }
+            // Light bends where the THICKNESS of air changes across the view
+            // -- steep at the shell's silhouette, near zero straight through
+            // its middle (front and back walls cancel). The first version
+            // bent along the shell's normal wherever it was crossed, and the
+            // whole inside of the dome slid sideways. Bend along the
+            // gradient, in pixels of path per pixel, capped.
+            let g = vec2(px_path - path, py_path - path) / max(th, 0.05);
+            let m = length(g);
+            if (m > 1e-5) {
+                let amt = min(m, 0.35) * strength * 0.06;
+                bend = bend - (g / m) * vec2(1.0 / aspect, 1.0) * amt;
+            }
         }
     }
     let heat = pp.b.w;

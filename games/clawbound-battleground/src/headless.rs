@@ -82,6 +82,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("aim") {
         return run_aim_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("blast") {
+        return run_blast_shots();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("spectate") {
         return run_spectate();
     }
@@ -1509,5 +1512,53 @@ pub fn run_spectate() -> Result<(), String> {
         shot = sp.update(&game, Input { rise: 1.0, look: glam::Vec2::new(0.0, -0.004), ..Default::default() }, dt);
     }
     shoot(&mut renderer, &mut vfx, &game, &sp, shot, "spectate_free.png")?;
+    Ok(())
+}
+
+/// A blast front behind a cat, rendered with and without it, so the
+/// difference shows exactly which pixels the shell bends: a dome of air
+/// round the blast, and the cat standing in front of it untouched.
+/// `CLAWBOUND_SHOTS=blast clawbound-battleground --screenshot`
+pub fn run_blast_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("blast"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let mut game = Game::new_teams(&[0], &[1]);
+    game.blockers = scene.blockers.clone();
+    game.gods[1].respawn_t = 999.0;
+    let cat = Vec3::new(0.0, 0.0, -40.0);
+    game.gods[0].pos = cat;
+    game.gods[0].yaw = -std::f32::consts::FRAC_PI_2;
+    let mut vfx = Vfx::default();
+    for _ in 0..20 {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+        vfx.update(1.0 / 60.0, &[], &game);
+    }
+    let cam = Camera { eye: cat + Vec3::new(0.0, 3.2, -9.0), target: cat + Vec3::new(0.0, 2.0, 12.0), fov_y: 0.95 };
+    for (name, strength) in [("blast_off.png", 0.0f32), ("blast_on.png", 1.0)] {
+        renderer.clear_queues();
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        // a nova 11 u behind the cat, its front 7 u out
+        renderer.blast_a = Default::default();
+        renderer.blast_b = Default::default();
+        renderer.blast_a[0] = [cat.x, 0.0, cat.z + 11.0, 7.0];
+        renderer.blast_b[0] = [strength, 0.0, 0.0, 0.0];
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, 1.0);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+    }
     Ok(())
 }

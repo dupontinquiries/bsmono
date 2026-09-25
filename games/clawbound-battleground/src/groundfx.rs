@@ -141,35 +141,57 @@ impl GroundFx {
     }
 }
 
-/// Project blast fronts to the screen for `post.wgsl`:
-/// `(centre u, centre v, ring radius in v-units, strength)`.
+/// A blast's shock shell: its thickness for a front of `radius`.
+pub fn shell_thickness(radius: f32) -> f32 {
+    0.6 + radius * 0.12
+}
+
+/// How far along a ray one sphere of radius `r` about `c` lies, clipped to
+/// [0, `t_max`]: the part in front of the camera and in front of the scene.
+fn sphere_span(ro: Vec3, rd: Vec3, c: Vec3, r: f32, t_max: f32) -> f32 {
+    let oc = ro - c;
+    let b = oc.dot(rd);
+    let disc = b * b - (oc.length_squared() - r * r);
+    if disc <= 0.0 {
+        return 0.0;
+    }
+    let h = disc.sqrt();
+    let (t0, t1) = ((-b - h).max(0.0), (-b + h).min(t_max));
+    (t1 - t0).max(0.0)
+}
+
+/// How much blast-front air a view ray crosses: the length of the ray
+/// inside the shell between `radius - th/2` and `radius + th/2` about `c`,
+/// counting only what lies in front of the scene surface (`t_scene` along
+/// the ray; a large number for sky). `post.wgsl` computes exactly this per
+/// pixel against the depth buffer.
 ///
-/// Radius is measured by projecting a second point one ring-radius to the
-/// camera's right of the centre, so a far blast is a small ring and a near
-/// one fills the frame. A blast behind the camera is dropped: its projection
-/// is a mirror image, and distorting the frame round that is a glitch.
-pub fn screen_rings(blast_a: &[[f32; 4]], blast_b: &[[f32; 4]], view_proj: Mat4, cam_right: Vec3, aspect: f32) -> [[f32; 4]; MAX_RINGS] {
-    let mut out = [[0.0; 4]; MAX_RINGS];
+/// What it changes from the old screen-space rings: a surface in front of
+/// the blast occludes it (a cat between you and a nova is not warped); the
+/// shell has perspective (a ground blast is a dome, cut by the ground); and
+/// it is strongest where the ray grazes the shell -- its silhouette -- as
+/// real refraction through a shell of denser air is.
+pub fn shell_path(ro: Vec3, rd: Vec3, c: Vec3, radius: f32, t_scene: f32) -> f32 {
+    let th = shell_thickness(radius);
+    let outer = sphere_span(ro, rd, c, radius + th * 0.5, t_scene);
+    let inner = sphere_span(ro, rd, c, (radius - th * 0.5).max(0.0), t_scene);
+    (outer - inner).max(0.0)
+}
+
+/// The blasts for `post.wgsl`, in world space: per blast `(centre xyz,
+/// radius)` and `(strength, thickness, 0, 0)`; dead slots have strength 0.
+pub fn shell_blasts(blast_a: &[[f32; 4]], blast_b: &[[f32; 4]]) -> ([[f32; 4]; MAX_RINGS], [[f32; 4]; MAX_RINGS]) {
+    let (mut a_out, mut b_out) = ([[0.0; 4]; MAX_RINGS], [[0.0; 4]; MAX_RINGS]);
     let mut n = 0;
     for (a, b) in blast_a.iter().zip(blast_b) {
-        if b[0] <= 0.002 || n >= MAX_RINGS {
+        if b[0] <= 0.002 || n >= MAX_RINGS || !a[3].is_finite() {
             continue;
         }
-        let centre = Vec3::new(a[0], a[1] + 1.0, a[2]);
-        let project = |p: Vec3| -> Option<(f32, f32)> {
-            let c: Vec4 = view_proj * p.extend(1.0);
-            (c.w > 0.05).then(|| (c.x / c.w * 0.5 + 0.5, 1.0 - (c.y / c.w * 0.5 + 0.5)))
-        };
-        let (Some(c), Some(e)) = (project(centre), project(centre + cam_right.normalize_or_zero() * a[3].max(0.01))) else { continue };
-        // u is stretched by the aspect; measure in v-units so the ring is round.
-        let r = ((e.0 - c.0) * aspect).hypot(e.1 - c.1);
-        if !r.is_finite() || r > 3.0 {
-            continue;
-        }
-        out[n] = [c.0, c.1, r, b[0]];
+        a_out[n] = [a[0], a[1] + 1.0, a[2], a[3].max(0.01)];
+        b_out[n] = [b[0], shell_thickness(a[3]), 0.0, 0.0];
         n += 1;
     }
-    out
+    (a_out, b_out)
 }
 
 /// Half-extent of the shadow box for a camera this far from its subject.
@@ -311,18 +333,75 @@ mod tests {
         assert!(fit_shadow(Vec3::splat(f32::NAN), Vec3::ZERO, half, size).is_finite());
     }
 
+    /// The old screen-ring test's promise, for the world-space shells: a
+    /// blast behind the camera does not bend the frame (every view ray
+    /// points ahead of the camera and misses it), and a blast ahead does.
     #[test]
     fn a_blast_behind_the_camera_does_not_bend_the_frame() {
         let eye = Vec3::new(0.0, 6.0, -10.0);
-        let vp = Mat4::perspective_rh(0.9, 16.0 / 9.0, 0.25, 500.0) * Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
-        let right = Vec3::X;
-        let ahead = ([[0.0, 0.0, 0.0, 4.0]], [[0.8, 2.6, 0.0, 0.0]]);
-        let behind = ([[0.0, 0.0, -40.0, 4.0]], [[0.8, 2.6, 0.0, 0.0]]);
-        let r = screen_rings(&ahead.0, &ahead.1, vp, right, 16.0 / 9.0);
-        assert!((0.3..0.7).contains(&r[0][0]) && (0.3..0.9).contains(&r[0][1]), "in front: on screen at {:?}", r[0]);
-        assert!(r[0][2] > 0.05 && r[0][3] == 0.8);
-        let far = screen_rings(&[[0.0, 0.0, 120.0, 4.0]], &ahead.1, vp, right, 16.0 / 9.0);
-        assert!(far[0][2] < r[0][2] * 0.3, "the same ring far away is small on screen");
-        assert_eq!(screen_rings(&behind.0, &behind.1, vp, right, 16.0 / 9.0)[0], [0.0; 4]);
+        let ahead = Vec3::new(0.0, 1.0, 10.0);
+        let behind = Vec3::new(0.0, 1.0, -40.0);
+        let mut hit_ahead = 0;
+        for k in 0..400 {
+            // a fan of view rays across a 90-degree field
+            let a = (k % 20) as f32 / 19.0 - 0.5;
+            let b = (k / 20) as f32 / 19.0 - 0.5;
+            let rd = (Vec3::Z + Vec3::X * a * 1.8 + Vec3::Y * b * 1.0).normalize();
+            assert_eq!(shell_path(eye, rd, behind, 4.0, 1.0e6), 0.0, "a ray ahead crossed a blast behind");
+            hit_ahead += (shell_path(eye, rd, ahead, 4.0, 1.0e6) > 0.0) as u32;
+        }
+        assert!(hit_ahead > 20, "the blast ahead is seen");
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    const FAR: f32 = 1.0e6;
+
+    /// A surface between the camera and the blast hides it entirely: the
+    /// old rings bent whatever stood in front of them.
+    #[test]
+    fn a_surface_in_front_occludes_the_blast() {
+        let (ro, rd, c) = (Vec3::ZERO, Vec3::Z, Vec3::new(0.0, 0.0, 20.0));
+        assert!(shell_path(ro, rd, c, 5.0, FAR) > 0.5, "open air: the shell is crossed");
+        assert_eq!(shell_path(ro, rd, c, 5.0, 10.0), 0.0, "a wall at 10 u, the blast at 15-25 u: nothing");
+        // a surface INSIDE the shell's hollow: only the near wall counts
+        let near_wall = shell_path(ro, rd, c, 5.0, 20.0);
+        assert!((near_wall - shell_thickness(5.0)).abs() < 1e-3, "{near_wall}");
+    }
+
+    /// Straight through the middle: two walls. Grazing the edge: more --
+    /// the silhouette is where the air is thickest along the view.
+    #[test]
+    fn the_shell_is_strongest_at_its_silhouette() {
+        let (c, r) = (Vec3::new(0.0, 0.0, 30.0), 6.0);
+        let th = shell_thickness(r);
+        let through = shell_path(Vec3::ZERO, Vec3::Z, c, r, FAR);
+        assert!((through - 2.0 * th).abs() < 1e-3, "{through} vs {}", 2.0 * th);
+        let graze_dir = (c + Vec3::X * (r + th * 0.25)).normalize();
+        let graze = shell_path(Vec3::ZERO, graze_dir, c, r, FAR);
+        assert!(graze > through * 1.5, "grazing {graze} vs through {through}");
+        let miss = shell_path(Vec3::ZERO, (c + Vec3::X * (r + th)).normalize(), c, r, FAR);
+        assert_eq!(miss, 0.0);
+    }
+
+    /// Behind the camera is nothing; inside the blast, the far wall only.
+    #[test]
+    fn behind_and_inside() {
+        assert_eq!(shell_path(Vec3::ZERO, Vec3::Z, Vec3::new(0.0, 0.0, -30.0), 5.0, FAR), 0.0);
+        let inside = shell_path(Vec3::ZERO, Vec3::Z, Vec3::ZERO, 5.0, FAR);
+        assert!((inside - shell_thickness(5.0)).abs() < 1e-3, "{inside}");
+    }
+
+    #[test]
+    fn only_live_blasts_are_sent() {
+        let a = [[1.0, 0.0, 2.0, 4.0], [5.0, 0.0, 5.0, 3.0]];
+        let b = [[0.0, 0.0, 0.0, 0.0], [0.8, 0.0, 0.0, 0.0]];
+        let (sa, sb) = shell_blasts(&a, &b);
+        assert_eq!(sa[0], [5.0, 1.0, 5.0, 3.0]);
+        assert_eq!(sb[0][0], 0.8);
+        assert_eq!(sb[1][0], 0.0);
     }
 }
