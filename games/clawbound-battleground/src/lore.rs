@@ -1,7 +1,7 @@
 //! lore -- who the ancestors are, as data, so the lore can be checked
 //! against everything else the game says about them.
 //!
-//! The world (LORE.md tells it at length): there were never humans. The
+//! The world (dev/LORE.md tells it at length): there were never humans. The
 //! great cats inherited the world and kept it through every age -- the
 //! frozen long-ago, the elder dawn, the green ages after. Each ancestor here
 //! founded or embodies a clan of its age and land. When the living clans

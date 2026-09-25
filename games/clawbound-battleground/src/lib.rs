@@ -36,6 +36,8 @@ pub mod cues;
 pub mod voicescript;
 /// Who the ancestors are: species, age, land, gender, story, music; checked against the game.
 pub mod lore;
+/// The generated preparation documents in dev/ (cue cards, recording sheet, cue sheet).
+pub mod devdocs;
 /// The announcer: game-state calls, prioritized, never overlapping.
 pub mod announcer;
 /// The game's sound effects, designed in code (rendered by examples/gen_sfx).

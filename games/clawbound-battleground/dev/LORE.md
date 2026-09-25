@@ -163,5 +163,5 @@ bone flute, singing bowls, wind over ice. **Emberclaw** colours: kora,
 balafon, ney and darbuka, talking drum, udu, hot wind and cicadas. The brass
 belongs to the Gathering itself — to both halves at once.
 
-The intro's cue sheet (`examples/intro_cue_sheet`) lays these against the
+The intro's cue sheet (`dev/music/intro_cue_sheet.svg`) lays these against the
 intro's timeline.
