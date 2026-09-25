@@ -51,6 +51,9 @@ pub enum Event {
     LevelUp { pos: Vec3 },
     Explosion { pos: Vec3, radius: f32, color: [f32; 3] },
     BoltFx { from: Vec3, to: Vec3, color: [f32; 3], thick: f32 },
+    /// A storm's lightning strike landing at `at` (a storm zone's strikes:
+    /// jagged, forked, a blinding light that throws shadows).
+    StrikeFx { at: Vec3, color: [f32; 3] },
     BeamFx { from: Vec3, dir: Vec3, length: f32, width: f32, color: [f32; 3], dur: f32 },
     ShieldFx { pos: Vec3, dur: f32, color: [f32; 3] },
     DashFx { pos: Vec3, dir: Vec3, color: [f32; 3] },

@@ -56,8 +56,23 @@ pub struct Glow {
     pub power: f32,
 }
 
+/// A cast winding up or channelling (Event::CastStart), drawn until it
+/// fires: see `tick_channels`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Channel {
+    pub god: usize,
+    pub color: [f32; 3],
+    pub t: f32,
+    pub dur: f32,
+    /// A rooted channel (the caster cannot move) or an ultimate: the
+    /// bigger telling -- a rising column as well.
+    pub big: bool,
+}
+
 #[derive(Default)]
 pub struct Vfx {
+    /// Casts being gathered, until they fire or are broken off.
+    pub channels: Vec<Channel>,
     /// Coloured light from ability effects, fading (`glow_events`).
     pub glows: Vec<Glow>,
     pub particles: Vec<Particle>,
@@ -222,6 +237,12 @@ impl Vfx {
                 }
                 Event::Explosion { pos, radius, color } | Event::NovaFx { pos, radius, color } => add(*pos + Vec3::Y, *color, radius * 2.2, 0.5, 5.0),
                 Event::BoltFx { to, color, .. } => add(*to + Vec3::Y, *color, 5.0, 0.3, 3.0),
+                // lightning: blinding, blue-white, brief -- the brightest light
+                // there is, so in ultra every cat near it throws a shadow
+                Event::StrikeFx { at, color } => {
+                    let c = [0.72 + color[0] * 0.28, 0.8 + color[1] * 0.2, 1.0];
+                    add(*at + Vec3::Y * 3.0, c, 18.0, 0.2, 16.0);
+                }
                 Event::StormFx { pos, radius, color, dur } => add(*pos + Vec3::Y * 2.0, *color, radius * 1.8, dur.min(3.0), 2.5),
                 Event::HealFx { pos, radius } => add(*pos + Vec3::Y, [0.45, 1.0, 0.55], radius * 1.5, 0.6, 2.0),
                 Event::ShieldFx { pos, dur, color } => add(*pos + Vec3::Y, *color, 4.0, dur.min(1.5), 1.5),
@@ -254,8 +275,122 @@ impl Vfx {
         v.into_iter().take(max).map(|x| x.1).collect()
     }
 
+    /// Channelling, made visible: while a cast winds up, motes of its colour
+    /// spiral in to the caster's chest -- faster and thicker as the charge
+    /// builds, so its timing can be read -- a sigil ring grows under it to
+    /// full size at the moment of release, and a coloured light brightens
+    /// (in ultra it casts traced shadows). A rooted channel or an ultimate
+    /// raises a column of motes too. It ends when the cast fires, or just
+    /// stops if the caster dies.
+    pub fn tick_channels(&mut self, dt: f32, events: &[Event], game: &Game) {
+        for e in events {
+            match e {
+                Event::CastStart { god, slot, dur, .. } => {
+                    let Some(g) = game.gods.get(*god) else { continue };
+                    let ab = crate::gods::ROSTER[g.def_id as usize].abilities[(*slot as usize).min(3)];
+                    let (_, move_mul) = crate::abilities::cast_timing(&ab);
+                    let big = move_mul <= 0.0 || ab.ult;
+                    self.channels.retain(|c| c.god != *god);
+                    self.channels.push(Channel { god: *god, color: ab.color, t: 0.0, dur: dur.max(0.05), big });
+                    // the sigil: grows from nothing to full at the release
+                    self.rings.push(Ring { pos: g.pos + Vec3::Y * 0.06, r0: 0.3, r1: if big { 2.6 } else { 1.6 }, until: self.time + dur, dur: *dur, color: ab.color, thick: if big { 0.22 } else { 0.14 } });
+                }
+                Event::Cast { god, .. } => self.channels.retain(|c| c.god != *god),
+                _ => {}
+            }
+        }
+        let mut rng = crate::sim::Rng(((self.time * 1000.0) as u64) ^ 0x51ED_C0DE | 1);
+        let mut born: Vec<Particle> = Vec::new();
+        let mut lights: Vec<Glow> = Vec::new();
+        self.channels.retain_mut(|c| {
+            let Some(g) = game.gods.get(c.god) else { return false };
+            if g.respawn_t > 0.0 || c.t > c.dur + 0.3 {
+                return false;
+            }
+            c.t += dt;
+            let charge = (c.t / c.dur).clamp(0.0, 1.0);
+            let core = g.pos + Vec3::Y * 1.0;
+            let bright = [c.color[0] * 1.4, c.color[1] * 1.4, c.color[2] * 1.4];
+            // gathering motes: more, and quicker, as the charge builds
+            let rate = (40.0 + 140.0 * charge) * if c.big { 1.6 } else { 1.0 };
+            let n = (rate * dt + rng.f32()) as usize;
+            for _ in 0..n {
+                let a = rng.f32() * std::f32::consts::TAU;
+                let r = 1.4 + rng.f32() * (if c.big { 1.4 } else { 0.8 });
+                let from = core + Vec3::new(a.cos() * r, (rng.f32() - 0.3) * 1.4, a.sin() * r);
+                let life = 0.45 - 0.2 * charge;
+                // inward, with a swirl
+                let inward = (core - from) / life;
+                let swirl = Vec3::new(-a.sin(), 0.0, a.cos()) * (2.0 + 2.0 * charge);
+                born.push(Particle { pos: from, vel: inward + swirl, life, max_life: life, size: 0.10 + 0.08 * charge, color: bright, alpha: 0.9, gravity: 0.0, drag: 0.0 });
+            }
+            if c.big {
+                let n = ((30.0 + 60.0 * charge) * dt + rng.f32()) as usize;
+                for _ in 0..n {
+                    let a = rng.f32() * std::f32::consts::TAU;
+                    let from = g.pos + Vec3::new(a.cos() * 0.8, 0.1, a.sin() * 0.8);
+                    born.push(Particle { pos: from, vel: Vec3::new(0.0, 3.5 + 2.0 * charge, 0.0), life: 0.7, max_life: 0.7, size: 0.09, color: bright, alpha: 0.8, gravity: 0.0, drag: 0.0 });
+                }
+            }
+            // the charge's light: a glow that lives one frame, re-lit each
+            lights.push(Glow { pos: core, color: c.color, radius: 6.0 + 4.0 * charge, life: dt * 1.5 + 0.001, max: dt * 1.5 + 0.001, power: 1.0 + 5.0 * charge * charge });
+            true
+        });
+        self.particles.extend(born);
+        self.glows.extend(lights);
+    }
+
+    /// A lightning strike: a jagged bolt from the sky with a fork or two,
+    /// drawn in HDR white tinted by the storm (it blooms), a flash ring and
+    /// sparks where it lands. Its light is `glow_events`'.
+    pub fn lightning(&mut self, at: Vec3, color: [f32; 3]) {
+        let mut rng = crate::sim::Rng(((self.time * 7919.0) as u64) ^ ((at.x * 131.0) as i64 as u64) ^ 0xB017 | 1);
+        let white = [2.6 + color[0] * 0.8, 2.8 + color[1] * 0.6, 3.4];
+        let top = at + Vec3::Y * 14.0;
+        // the main channel: zigzag, wildest in the middle, pinned at both ends
+        let segs = 12;
+        let mut path = vec![top];
+        for k in 1..segs {
+            let u = k as f32 / segs as f32;
+            let wild = (u * std::f32::consts::PI).sin() * 0.9;
+            let p = top.lerp(at, u) + Vec3::new((rng.f32() - 0.5) * 2.0 * wild, 0.0, (rng.f32() - 0.5) * 2.0 * wild);
+            path.push(p);
+        }
+        path.push(at);
+        let mut bolt = |a: Vec3, b: Vec3, size: f32, v: &mut Vec<Particle>| {
+            let n = ((b - a).length() / 0.14).ceil().max(1.0) as usize;
+            for i in 0..=n {
+                let p = a.lerp(b, i as f32 / n as f32);
+                v.push(Particle { pos: p, vel: Vec3::ZERO, life: 0.16, max_life: 0.16, size, color: white, alpha: 1.0, gravity: 0.0, drag: 0.0 });
+            }
+        };
+        let mut out = Vec::new();
+        for w in path.windows(2) {
+            bolt(w[0], w[1], 0.16, &mut out);
+        }
+        // a fork or two off the upper half
+        for f in 0..2 {
+            let from = path[2 + f * 3];
+            let dir = Vec3::new(rng.f32() - 0.5, -0.9, rng.f32() - 0.5).normalize();
+            let mut p = from;
+            for _ in 0..4 {
+                let q = p + dir * 1.1 + Vec3::new((rng.f32() - 0.5) * 0.8, 0.0, (rng.f32() - 0.5) * 0.8);
+                bolt(p, q, 0.09, &mut out);
+                p = q;
+            }
+        }
+        // sparks where it lands
+        for i in 0..18 {
+            let a = i as f32 / 18.0 * std::f32::consts::TAU;
+            out.push(Particle { pos: at + Vec3::Y * 0.2, vel: Vec3::new(a.cos() * 5.0, 3.0 + rng.f32() * 3.0, a.sin() * 5.0), life: 0.35, max_life: 0.35, size: 0.1, color: white, alpha: 1.0, gravity: 14.0, drag: 0.5 });
+        }
+        self.particles.extend(out);
+        self.rings.push(Ring { pos: at + Vec3::Y * 0.08, r0: 0.3, r1: 2.8, until: self.time + 0.28, dur: 0.28, color: [color[0] * 0.5 + 0.5, color[1] * 0.5 + 0.5, 1.0], thick: 0.2 });
+    }
+
     pub fn update(&mut self, dt: f32, events: &[Event], game: &Game) {
         self.glow_events(dt, events, game);
+        self.tick_channels(dt, events, game);
         self.time += dt;
         let atm = game.weather.atmosphere();
         self.ground.tick(dt, atm.rain, atm.wetness);
@@ -527,6 +662,7 @@ impl Vfx {
                         });
                     }
                 }
+                Event::StrikeFx { at, color } => self.lightning(*at, *color),
                 Event::LevelUp { pos } => {
                     for i in 0..26 {
                         let a = i as f32 * 0.24;
@@ -1422,5 +1558,111 @@ mod glow_tests {
         v.glow_events(0.0, &flurry, &game);
         assert!(v.glows.len() <= 64);
         assert_eq!(v.lights(near, 8).len(), 8);
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    fn caster() -> (Game, usize, u32) {
+        let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        // find a cat with a rooted channel (Beam/Storm, or an ultimate)
+        for (i, g) in game.gods.iter().enumerate() {
+            let def = &crate::gods::ROSTER[g.def_id as usize];
+            if let Some(s) = (0..4).find(|&s| def.abilities[s].ult) {
+                return (game, i, s as u32);
+            }
+        }
+        game.t = 0.0;
+        (game, 0, 3)
+    }
+
+    /// A wind-up shows: a sigil ring timed to the release, motes gathering
+    /// more thickly as the charge builds, a brightening light; the cast
+    /// firing ends it.
+    #[test]
+    fn a_channel_gathers_builds_and_ends_on_the_cast() {
+        let (game, god, slot) = caster();
+        let mut v = Vfx::default();
+        let dur = 0.9;
+        v.update(0.0, &[Event::CastStart { god, slot, aim: Vec3::ZERO, dur }], &game);
+        assert_eq!(v.channels.len(), 1);
+        assert!(v.channels[0].big, "an ultimate is the big telling");
+        let ring = v.rings.last().unwrap();
+        assert!((ring.dur - dur).abs() < 1e-6, "the sigil fills at the release");
+        let count = |v: &mut Vfx, secs: f32| {
+            let before = v.particles.len();
+            let mut n = 0;
+            for _ in 0..(secs * 60.0) as usize {
+                let b = v.particles.len();
+                v.tick_channels(1.0 / 60.0, &[], &game);
+                n += v.particles.len() - b;
+            }
+            let _ = before;
+            n
+        };
+        let early = count(&mut v, 0.2);
+        let _mid = count(&mut v, 0.4);
+        let late = count(&mut v, 0.2);
+        assert!(late > early, "the gathering thickens as the charge builds: {early} then {late}");
+        let lit = v.lights(game.gods[god].pos, 8);
+        assert!(!lit.is_empty(), "the charge gives light");
+        v.update(1.0 / 60.0, &[Event::Cast { god, slot, aim: Vec3::ZERO }], &game);
+        assert!(v.channels.is_empty(), "the cast fired: the channel is over");
+    }
+
+    #[test]
+    fn a_channel_stops_if_the_caster_dies() {
+        let (mut game, god, slot) = caster();
+        let mut v = Vfx::default();
+        v.update(0.0, &[Event::CastStart { god, slot, aim: Vec3::ZERO, dur: 0.9 }], &game);
+        game.gods[god].respawn_t = 5.0;
+        v.tick_channels(1.0 / 60.0, &[], &game);
+        assert!(v.channels.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod lightning_tests {
+    use super::*;
+
+    /// A strike draws a jagged bolt from the sky to the ground -- pinned at
+    /// the strike, wandering in between, forked -- bright enough to bloom,
+    /// and gives the brightest light of any effect.
+    #[test]
+    fn a_strike_is_a_jagged_forked_blinding_bolt() {
+        let game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        let mut v = Vfx::default();
+        let at = Vec3::new(4.0, 0.0, -7.0);
+        v.update(1.0 / 60.0, &[Event::StrikeFx { at, color: [0.6, 0.6, 1.0] }], &game);
+        let bolt: Vec<&Particle> = v.particles.iter().filter(|p| p.vel == Vec3::ZERO).collect();
+        assert!(bolt.len() > 80, "{} bolt motes", bolt.len());
+        assert!(bolt.iter().any(|p| p.pos.y > 12.0) && bolt.iter().any(|p| p.pos.y < 0.5), "sky to ground");
+        let wander = bolt.iter().map(|p| Vec3::new(p.pos.x - at.x, 0.0, p.pos.z - at.z).length()).fold(0.0f32, f32::max);
+        assert!(wander > 0.4, "jagged, not a straight line: {wander}");
+        assert!(bolt.iter().all(|p| p.color[2] > 1.5), "HDR white: it blooms");
+        let strike = v.lights(at, 8)[0];
+        assert!(strike.1[2] > 10.0, "the brightest light: {:?}", strike.1);
+        assert_eq!(v.rings.len(), 1, "a flash ring where it lands");
+    }
+
+    /// The sim's storms strike with StrikeFx, not a projectile bolt.
+    #[test]
+    fn storms_strike_with_lightning() {
+        let mut game = Game::new_teams(&[11], &[0]); // Stillsmoke
+        game.gods[1].respawn_t = 999.0;
+        game.gods[0].ai = None;
+        game.gods[0].mana = 10_000.0;
+        let def = &crate::gods::ROSTER[game.gods[0].def_id as usize];
+        let slot = (0..4).find(|&s| matches!(def.abilities[s].arch, crate::gods::Archetype::Storm { .. })).expect("a storm") as u32;
+        let p = game.gods[0].pos;
+        game.cast_queue.push((0, slot, p + Vec3::Z * 6.0));
+        let mut strikes = 0;
+        for _ in 0..240 {
+            game.tick(1.0 / 60.0);
+            strikes += game.events.drain(..).filter(|e| matches!(e, Event::StrikeFx { .. })).count();
+        }
+        assert!(strikes >= 3, "{strikes} strikes in 4 s");
     }
 }

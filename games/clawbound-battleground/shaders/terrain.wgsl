@@ -29,6 +29,59 @@ fn hash21(p: vec2<f32>) -> f32 {
 @group(0) @binding(2) var shadow_map: texture_depth_2d;
 @group(0) @binding(3) var shadow_sampler: sampler_comparison;
 
+// Coloured point lights (ability glows, channels, lightning) and the cats'
+// spheres their shadows are traced against: the smooth pipeline's own
+// (smooth.wgsl). Empty outside the ultra preview.
+struct Lights {
+    info: vec4<f32>,
+    pos: array<vec4<f32>, 8>,
+    col: array<vec4<f32>, 8>,
+    occ: array<vec4<f32>, 32>,
+};
+@group(1) @binding(0) var<uniform> lights: Lights;
+
+fn sphere_soft_shadow(ro: vec3<f32>, rd: vec3<f32>, sph: vec4<f32>, k: f32, t_max: f32) -> f32 {
+    let oc = ro - sph.xyz;
+    let b = dot(oc, rd);
+    let c = dot(oc, oc) - sph.w * sph.w;
+    let h = b * b - c;
+    if (b > 0.0 || -b - sph.w > t_max) {
+        return 1.0;
+    }
+    return smoothstep(0.0, 1.0, h * k / b);
+}
+
+// The point lights on the ground, each shadow ray-traced against the cats:
+// a lightning strike throws every cat's shadow across the ground.
+fn point_lights(world: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+    var sum = vec3(0.0);
+    let nl = i32(lights.info.x);
+    let no = i32(lights.info.y);
+    for (var i = 0; i < 8; i = i + 1) {
+        if (i >= nl) {
+            break;
+        }
+        let lp = lights.pos[i];
+        let to_l = lp.xyz - world;
+        let dist = length(to_l);
+        if (dist >= lp.w) {
+            continue;
+        }
+        let L = to_l / dist;
+        let win = clamp(1.0 - pow(dist / lp.w, 4.0), 0.0, 1.0);
+        let atten = win * win / (dist * dist * 0.25 + 1.0);
+        var vis = 1.0;
+        for (var k = 0; k < 32; k = k + 1) {
+            if (k >= no) {
+                break;
+            }
+            vis = vis * sphere_soft_shadow(world + N * 0.05, L, lights.occ[k], 8.0, dist);
+        }
+        sum = sum + lights.col[i].rgb * atten * vis * max(dot(N, L), 0.0);
+    }
+    return sum;
+}
+
 struct VSIn {
     @location(0) pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
@@ -348,6 +401,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let snow_cov = snow * smoothstep(0.35, 0.9, N.y) * (0.6 + 0.4 * (1.0 - pud));
     albedo = mix(albedo, vec3(0.88, 0.92, 0.98), snow_cov * 0.85);
     var lit = albedo * (sun_col * mix(wrap * wrap, ndl, 0.7) * shadow + hemi * 0.9 + sky * 0.2 * (1.0 - shadow));
+    lit = lit + albedo * point_lights(in.world, N);
     let V = normalize(frame.cam_pos.xyz - in.world);
     let Hv = normalize(V + sun);
     let fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
