@@ -411,7 +411,7 @@ pub fn caps() -> &'static [Cap] {
         let f = floor();
         let mut out: Vec<Cap> = Vec::new();
         let lanes: Vec<Vec<Vec3>> = crate::consts::LANES.iter().map(|&l| lane_polyline(l)).collect();
-        let near_lane = |p: Vec3| {
+        let _near_lane = |p: Vec3| {
             let mut best = (f32::MAX, Vec3::ZERO);
             for pts in &lanes {
                 for w in pts.windows(2) {

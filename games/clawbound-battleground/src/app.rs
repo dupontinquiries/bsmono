@@ -81,6 +81,13 @@ struct AppState {
     /// The ambience's last params, faded to silence out of a match.
     #[cfg(feature = "audio")]
     audio_last: crate::audio::AudioParams,
+    /// Loaded audio (`soundbank`), decoding in the background.
+    bank: Option<crate::soundbank::Bank>,
+    /// This tick's events, for the audio cues.
+    audio_events: Vec<crate::sim::Event>,
+    voice_gate: crate::cues::VoiceGate,
+    /// Whether this match's music has been started.
+    music_on: bool,
     /// Watching an all-bot match (`spectator`); None when playing.
     spectator: Option<crate::spectator::Spectator>,
     /// Spectator switches pressed since last frame (Tab, Z, X).
@@ -400,6 +407,10 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         #[cfg(feature = "audio")]
         // silent until a match: the menu has no wind to fade from
         audio_last: crate::audio::AudioParams { master: 0.0, ..crate::audio::AudioParams::default() },
+        bank: None,
+        audio_events: Vec::new(),
+        voice_gate: Default::default(),
+        music_on: false,
         spectator: None,
         spec_cycle: 0,
         spec_director: false,
@@ -846,6 +857,12 @@ fn finish_start(s: &mut AppState) {
     #[cfg(feature = "audio")]
     if s.ambience.is_none() {
         s.ambience = crate::audio::output::Ambience::start();
+        #[cfg(feature = "audio")]
+        if let Some(amb) = s.ambience.as_ref() {
+            let root = crate::soundbank::default_root();
+            eprintln!("[clawbound] audio: {} Hz, buffer {:?} frames; loading {}", amb.sample_rate, amb.buffer_frames, root.display());
+            s.bank = Some(crate::soundbank::Bank::loading(crate::soundbank::Loader::start(root, amb.sample_rate)));
+        }
     }
     s.ui.floaters.clear();
     s.ui.announce = None;
@@ -986,7 +1003,17 @@ fn render(s: &mut AppState) {
                     }
                 }
                 if before < crate::intro::FANFARE_AT && it.t >= crate::intro::FANFARE_AT && !s.skip_intro {
-                    s.fanfare_count = s.fanfare_count.wrapping_add(1);
+                    // a studio fanfare, if one is loaded; else the synthesized one
+                    let mut played = false;
+                    #[cfg(feature = "audio")]
+                    if let (Some(amb), Some(bank)) = (s.ambience.as_mut(), s.bank.as_mut()) {
+                        if let Some(id) = bank.pick("music/fanfare") {
+                            played = amb.mixer.play(crate::mixer::Play { clip: id, bus: crate::mixer::Bus::Music, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: None });
+                        }
+                    }
+                    if !played {
+                        s.fanfare_count = s.fanfare_count.wrapping_add(1);
+                    }
                 }
                 s.vfx.update(dt_frame, &[], g);
                 if it.done {
@@ -1025,6 +1052,7 @@ fn render(s: &mut AppState) {
                 }
                 g.tick(1.0 / 60.0);
                 let events: Vec<crate::sim::Event> = g.events.drain(..).collect();
+                s.audio_events.extend(events.iter().cloned());
                 for e in &events {
                     match e {
                         crate::sim::Event::Damage { pos, amount, big } => {
@@ -1113,6 +1141,47 @@ fn render(s: &mut AppState) {
         };
         s.audio_last = p;
         amb.set(p);
+    }
+
+    // Loaded audio: take what the loader has finished, and play this frame's
+    // cues -- placed round the listener (the player's cat, or where the
+    // spectator looks), voice lines gated per cat. Music loops per map.
+    #[cfg(feature = "audio")]
+    if let (Some(amb), Some(bank)) = (s.ambience.as_mut(), s.bank.as_mut()) {
+        use crate::mixer::{Bus, Cmd, Play};
+        bank.poll(&mut amb.mixer);
+        match s.game.as_ref() {
+            Some(g) if s.screen == Screen::Playing => {
+                if !s.music_on {
+                    if let Some(id) = bank.pick(&format!("music/{}", crate::map::active().key())) {
+                        amb.mixer.play(Play { clip: id, bus: Bus::Music, gain: 0.8, pan: 0.0, priority: 9, looped: true, speaker: None });
+                    }
+                    s.music_on = true;
+                }
+                let f = cam.target - cam.eye;
+                let right = Vec3::new(f.x, 0.0, f.z).normalize_or_zero().cross(Vec3::Y).normalize_or_zero();
+                let ear = if s.spectator.is_some() { cam.target } else { g.gods[0].pos };
+                for ev in s.audio_events.drain(..) {
+                    for cue in crate::cues::cues_for(&ev, g) {
+                        let Some((gain, pan)) = crate::cues::place(&cue, ear, right) else { continue };
+                        if !s.voice_gate.allow(&cue, g.t) {
+                            continue;
+                        }
+                        if let Some(id) = bank.first(&cue.keys) {
+                            amb.mixer.play(Play { clip: id, bus: cue.bus, gain, pan, priority: cue.priority, looped: false, speaker: cue.speaker.map(|x| x as u16) });
+                        }
+                    }
+                }
+            }
+            _ => {
+                s.audio_events.clear();
+                if s.music_on {
+                    amb.mixer.send(Cmd::StopBus(Bus::Music));
+                    amb.mixer.send(Cmd::StopBus(Bus::Voice));
+                    s.music_on = false;
+                }
+            }
+        }
     }
 
     // world draws (+ this frame's sky state)
