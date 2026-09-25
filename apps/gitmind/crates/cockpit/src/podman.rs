@@ -197,6 +197,9 @@ pub fn build_in_container_cancellable(
     app: &str, app_dir: &Path, triple: &str, features: &[String], no_default: bool,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<(PathBuf, u64), String> {
+    if let Some(cf) = app_containerfile(app_dir, triple) {
+        return build_in_app_container(app, app_dir, triple, &cf, features, no_default, on_line);
+    }
     let upstream = image_for(triple).ok_or_else(|| format!("no podman image known for {triple}"))?;
     let chosen = choose_image(upstream, local_image_exists(&local_override(upstream)));
     let image = chosen.as_str();
@@ -216,9 +219,136 @@ pub fn build_in_container_cancellable(
     Ok((bin, size))
 }
 
+// ── an app's OWN build container ────────────────────────────────────────────
+//
+// The generic musl image above is a cross toolchain on a glibc host: it has no
+// musl libwayland, so an app whose wayland-sys is built without dlopen
+// (tideshell) cannot build in it. tideshell ships the right one:
+// apps/tideshell/deploy/Containerfile.aarch64, Alpine aarch64 with the same
+// musl, libwayland and libEGL as postmarketOS. An app that ships
+// `deploy/Containerfile.<arch>` is built in THAT, natively -- no --target,
+// the container's own target is the phone's -- and on an aarch64 host
+// (Asahi) with no emulation at all.
+
+/// The app's own Containerfile for `triple`'s architecture: `deploy/` next to
+/// the app directory or its parent (tideshell: the app is
+/// apps/tideshell/egui-frontend, the file apps/tideshell/deploy/...).
+pub fn app_containerfile(app_dir: &Path, triple: &str) -> Option<PathBuf> {
+    let arch = triple.split('-').next().filter(|a| !a.is_empty())?;
+    app_dir.ancestors().take(2)
+        .map(|d| d.join("deploy").join(format!("Containerfile.{arch}")))
+        .find(|f| f.is_file())
+}
+
+/// podman's --platform for a Rust triple's architecture.
+pub fn platform_for(triple: &str) -> String {
+    let arch = triple.split('-').next().unwrap_or("");
+    match arch {
+        "aarch64" => "linux/arm64".into(),
+        "x86_64" => "linux/amd64".into(),
+        "armv7" | "arm" => "linux/arm/v7".into(),
+        other => format!("linux/{other}"),
+    }
+}
+
+/// Does building for `triple` on this host run natively (no emulation)?
+pub fn native_on(triple: &str, host_arch: &str) -> bool {
+    triple.split('-').next() == Some(host_arch)
+}
+
+/// The tag gitmind builds an app's Containerfile under.
+pub fn app_image_tag(app: &str, triple: &str) -> String {
+    format!("localhost/{app}-build-{}", triple.split('-').next().unwrap_or("native"))
+}
+
+/// The run argv for an app container: the repository mounted (path
+/// dependencies), cargo run from the app's place in it, the registry cached on
+/// the host, and NO --target (the container's native target is the target).
+#[allow(clippy::too_many_arguments)]
+pub fn app_container_argv(cargo_id: &str, as_bin: bool, app_dir: &Path, root: &Path, image: &str, platform: &str,
+                          registry_cache: &Path, features: &[String], no_default: bool) -> Vec<String> {
+    let rel = app_dir.strip_prefix(root).unwrap_or(Path::new(""));
+    let mut argv = vec![
+        "run".to_string(), "--rm".to_string(),
+        "--platform".to_string(), platform.to_string(),
+        "--security-opt".to_string(), "label=disable".to_string(),
+        "-v".to_string(), format!("{}:/home/rust/src", root.display()),
+        "-v".to_string(), format!("{}:/root/.cargo/registry", registry_cache.display()),
+        "-w".to_string(), Path::new("/home/rust/src").join(rel).to_string_lossy().into_owned(),
+        image.to_string(),
+    ];
+    argv.extend(crate::buildflags::cargo_build_argv_kind(cargo_id, "", features, no_default, as_bin));
+    argv
+}
+
+fn build_in_app_container(
+    app: &str, app_dir: &Path, triple: &str, containerfile: &Path, features: &[String], no_default: bool,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<(PathBuf, u64), String> {
+    let platform = platform_for(triple);
+    let tag = app_image_tag(app, triple);
+    let native = native_on(triple, std::env::consts::ARCH);
+    on_line(&format!("• building in {app}'s own container ({}) -- {}", containerfile.display(),
+        if native { "native on this host" } else { "EMULATED on this host: slow, and needs qemu-user-static" }));
+    on_line("• waiting for podman to be ready…");
+    wait_until_ready(Duration::from_secs(30))?;
+    if !local_image_exists(&tag) {
+        let ctx = containerfile.parent().unwrap_or(Path::new("."));
+        let argv = ["build", "--platform", &platform, "-t", &tag, "-f", &containerfile.to_string_lossy(), &ctx.to_string_lossy()]
+            .iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        on_line(&format!("• podman {} (once; later pushes reuse it)", argv.join(" ")));
+        let out = Command::new("podman").args(&argv).output().map_err(|e| format!("running podman build: {e}"))?;
+        for line in String::from_utf8_lossy(&out.stderr).lines() { on_line(line); }
+        if !out.status.success() {
+            return Err(format!("podman build of {tag} failed (exit {})", out.status));
+        }
+    }
+    let cache = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir())
+        .join(".cache/gitmind").join(format!("cargo-registry-{}", triple.split('-').next().unwrap_or("x")));
+    let _ = std::fs::create_dir_all(&cache);
+    let (id, as_bin) = crate::ops::cargo_selector(app, app_dir);
+    let argv = app_container_argv(&id, as_bin, app_dir, &mount_root(app_dir), &tag, &platform, &cache, features, no_default);
+    on_line(&format!("• podman {}", argv.join(" ")));
+    let out = Command::new("podman").args(&argv).output().map_err(|e| format!("running podman: {e}"))?;
+    for line in String::from_utf8_lossy(&out.stderr).lines() { on_line(line); }
+    if !out.status.success() {
+        return Err(format!("podman build failed (exit {})", out.status));
+    }
+    // Native build: target/release, not target/<triple>/release.
+    let bin = app_dir.join("target").join("release").join(app);
+    let size = std::fs::metadata(&bin).map(|m| m.len()).map_err(|e| format!("no binary at {}: {e}", bin.display()))?;
+    Ok((bin, size))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_app_that_ships_its_container_is_built_in_it_natively() {
+        let base = std::env::temp_dir().join(format!("cockpit-appimg-{}", std::process::id()));
+        let app = base.join("repo/apps/tideshell/egui-frontend");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(base.join("repo/.git")).unwrap();
+        assert_eq!(app_containerfile(&app, "aarch64-unknown-linux-musl"), None, "none shipped: the generic image");
+        let cf = base.join("repo/apps/tideshell/deploy/Containerfile.aarch64");
+        std::fs::create_dir_all(cf.parent().unwrap()).unwrap();
+        std::fs::write(&cf, "FROM docker.io/alpine:edge\n").unwrap();
+        assert_eq!(app_containerfile(&app, "aarch64-unknown-linux-musl"), Some(cf.clone()));
+        assert_eq!(app_containerfile(&app, "x86_64-unknown-linux-musl"), None, "only for its own architecture");
+        assert_eq!(platform_for("aarch64-unknown-linux-musl"), "linux/arm64");
+        assert!(native_on("aarch64-unknown-linux-musl", "aarch64") && !native_on("aarch64-unknown-linux-musl", "x86_64"));
+        assert_eq!(app_image_tag("tideshell", "aarch64-unknown-linux-musl"), "localhost/tideshell-build-aarch64");
+        let argv = app_container_argv("tideshell-egui", false, &app, &base.join("repo"), "localhost/tideshell-build-aarch64",
+                                      "linux/arm64", Path::new("/home/u/.cache/gitmind/reg"), &["wayland".into(), "layer".into()], true);
+        assert!(!argv.iter().any(|a| a == "--target"), "native: the container's target is the phone's");
+        let p = argv.iter().position(|a| a == "-p").unwrap();
+        assert_eq!(argv[p + 1], "tideshell-egui");
+        assert!(argv.contains(&"/home/u/.cache/gitmind/reg:/root/.cargo/registry".to_string()), "registry cached across pushes");
+        let w = argv.iter().position(|a| a == "-w").unwrap();
+        assert_eq!(argv[w + 1], "/home/rust/src/apps/tideshell/egui-frontend");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn which_podman_checks_every_path_entry() {

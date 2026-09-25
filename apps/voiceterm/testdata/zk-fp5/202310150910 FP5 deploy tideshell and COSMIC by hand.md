@@ -1,8 +1,9 @@
 # FP5 deploy tideshell and COSMIC by hand
 
-The manual path from a Linux machine to tideshell running on the phone, for
-when gitmind's one-button push is not available (its podman fallback cannot
-build tideshell yet -- see *What gitmind does and does not do* below). Every
+The manual path from a Linux machine to tideshell running on the phone -- the
+same build gitmind's push now runs for you (see *What gitmind does and does not
+do* below), spelled out for when it is not available or something needs
+checking by hand. Every
 command here is lifted from `apps/tideshell/deploy/DEPLOY-FP5.md` unless it
 is marked **unverified**; that file is the authority and has the per-row
 checks this note leaves out.
@@ -39,8 +40,9 @@ build ON the phone: copy the tarball over and follow DEPLOY-FP5 stage 4
 (`sudo apk add wayland-dev mesa-dev pkgconf` -- names **unverified**; add what
 the linker asks for).
 
-Do not use gitmind's generic musl image for tideshell: it is a cross toolchain
-without musl libwayland, and tideshell's `wayland-sys` needs it at build time.
+Not gitmind's generic musl image: it is a cross toolchain without musl
+libwayland, and tideshell's `wayland-sys` needs it at build time. (gitmind now
+picks tideshell's own Containerfile instead -- the same image as this script.)
 
 ## 3. Install
 
@@ -93,8 +95,12 @@ manager. This is why Plasma stays installed until COSMIC has been seen working.
 - Its push page has a "COSMIC + tideshell (wayland + layer)" feature choice
   and installs launchers.
 - It does **not** install COSMIC or switch the session from Plasma Mobile.
-- Its podman fallback cannot build tideshell yet (no musl libwayland in its
-  image); making it use tideshell's own Alpine image is the open work.
+- Its push builds tideshell in **tideshell's own container**
+  (`deploy/Containerfile.aarch64`, built once as
+  `localhost/tideshell-build-aarch64`), natively on an aarch64 host, with the
+  crate registry cached in `~/.cache/gitmind/`. It still tries a local build
+  first and falls back to the container when that fails (for tideshell, early,
+  at `wayland-sys`).
 
 Up: [[202310150900 Fairphone 5]]. Related: [[202310150907 FP5 mainline Linux gaps]] (why stock and
 postmarketOS differ), [[202310150909 FP5 camera pipeline]] (the camera works
