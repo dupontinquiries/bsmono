@@ -143,7 +143,10 @@ uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui", features = ["qr
 # thread in bt_send.rs, not made the app's concurrency model; see that
 # file's header for why (pty_host.rs already established std::thread as the
 # pattern here, and one Bluetooth transfer at a time doesn't need more).
-bt-kit = { path = "../../../shared/bt-kit", features = ["rfcomm"] }
+# The framing and resume protocol everywhere; the RFCOMM transport (bluer:
+# BlueZ, Linux-only, a compile_error! elsewhere) on Linux only -- a macOS build
+# failed in bluer (M4 report).
+bt-kit = { path = "../../../shared/bt-kit" }
 # Matches the QML crate's own cpal version exactly (apps/voiceterm/
 # Cargo.toml) -- handshake_audio.rs ports that crate's device-negotiation
 # logic, and pinning a different cpal version here would risk the two
@@ -188,3 +191,6 @@ eframe = { version = "0.34", default-features = false, features = ["glow"] }
 # CARGO_PROFILE_DEV_DEBUG=2 when a debugger session needs full types.
 [profile.dev]
 debug = "line-tables-only"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bt-kit = { path = "../../../shared/bt-kit", features = ["rfcomm"] }

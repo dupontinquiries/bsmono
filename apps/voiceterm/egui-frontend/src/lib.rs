@@ -13,6 +13,8 @@
 //! rather than mis-rendered.
 
 pub mod iio_light;
+/// Sending over Bluetooth RFCOMM (BlueZ): Linux only.
+#[cfg(target_os = "linux")]
 pub mod bt_send;
 pub mod light_kit_bridge;
 pub mod handshake_audio;
