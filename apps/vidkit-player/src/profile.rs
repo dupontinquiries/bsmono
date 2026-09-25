@@ -67,11 +67,19 @@ fn thread_ticks() -> BTreeMap<&'static str, u64> {
     m
 }
 
+fn page_size() -> u64 {
+    // SAFETY: sysconf with a constant.
+    let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if p > 0 { p as u64 } else { 4096 }
+}
+
 fn rss_mb() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
         .ok()
         .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .map(|pages| pages * 4096 / (1 << 20))
+        // The real page size: Asahi kernels use 16 KiB pages, and a fixed
+        // 4096 read a quarter of the true RSS there.
+        .map(|pages| pages * page_size() / (1 << 20))
         .unwrap_or(0)
 }
 

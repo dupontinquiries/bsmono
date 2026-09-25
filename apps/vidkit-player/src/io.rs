@@ -1088,6 +1088,12 @@ impl vidkit_stream::TransportFactory<Box<dyn HttpTransport + Send>> for SchemeFa
 /// the decoder cannot manage, so it is one function to replace rather than a
 /// choice scattered through the app.
 pub fn assumed_caps() -> vidkit_core::caps::DeviceCaps {
+    // ...and never a stream the installed ffmpeg cannot decode (Fedora's
+    // ffmpeg-free: no H.264/HEVC code).
+    vidkit_core::caps::restrict_to_decoders(probed_caps(), &crate::decode::machine().decoders)
+}
+
+fn probed_caps() -> vidkit_core::caps::DeviceCaps {
     // Probed, not guessed. `sysprobe` reads the device-tree SoC id, the V4L2
     // driver names and the bound DRM driver, all of which the kernel already
     // knows — where the target triple could not tell an M1 from an M3 from a

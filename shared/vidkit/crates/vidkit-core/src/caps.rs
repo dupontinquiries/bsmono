@@ -724,6 +724,68 @@ pub fn pick_render_node(nodes: &[RenderNode]) -> Option<&RenderNode> {
     nodes.iter().find(integrated).or_else(|| nodes.first())
 }
 
+/// ffmpeg's native decoder for a codec -- the only kind hwaccel (VAAPI,
+/// Vulkan, VideoToolbox...) works through.
+pub fn native_decoder(c: Codec) -> &'static str {
+    match c {
+        Codec::H264 => "h264",
+        Codec::Hevc => "hevc",
+        Codec::Vp8 => "vp8",
+        Codec::Vp9 => "vp9",
+        Codec::Av1 => "av1",
+    }
+}
+
+/// Any software decoder ffmpeg might have for a codec, native or library.
+fn any_decoder(c: Codec) -> &'static [&'static str] {
+    match c {
+        Codec::H264 => &["h264", "libopenh264"],
+        Codec::Hevc => &["hevc"],
+        Codec::Vp8 => &["vp8", "libvpx"],
+        Codec::Vp9 => &["vp9", "libvpx-vp9"],
+        Codec::Av1 => &["libdav1d", "libaom-av1", "av1"],
+    }
+}
+
+/// Keep only what the installed ffmpeg can actually decode. Pure.
+///
+/// Fedora's default `ffmpeg-free` has VP9 and AV1 but the H.264 and HEVC
+/// code physically removed; H.264 comes only through OpenH264
+/// (`libopenh264`), a software library hwaccel cannot use. So: a codec with
+/// no decoder at all loses every path (the selector must never pick it);
+/// a codec without its NATIVE decoder keeps its software paths and loses
+/// its hardware ones.
+pub fn restrict_to_decoders(mut caps: DeviceCaps, decoders: &[String]) -> DeviceCaps {
+    if decoders.is_empty() {
+        return caps; // no information: leave it alone
+    }
+    let has = |n: &str| decoders.iter().any(|d| d == n);
+    caps.caps.retain(|cap| {
+        let any = any_decoder(cap.codec).iter().any(|n| has(n));
+        let hw = !matches!(cap.backend, Backend::Dav1d | Backend::FfmpegSw);
+        any && (!hw || has(native_decoder(cap.codec)))
+    });
+    // A codec with a software library but no software entry left (its only
+    // entry was a hardware one): give it a software path back.
+    for c in [Codec::H264, Codec::Hevc, Codec::Vp9, Codec::Av1] {
+        let listed = caps.caps.iter().any(|x| x.codec == c);
+        if !listed && any_decoder(c).iter().any(|n| has(n)) {
+            if let Some(tpl) = desktop_full_hw().caps.into_iter().find(|x| x.codec == c) {
+                caps.caps.push(DecodeCap {
+                    cost: if c == Codec::H264 && !has("h264") { Cost::SoftwareSlow } else { Cost::SoftwareSimd },
+                    delivery: Delivery::CpuPlanes,
+                    backend: if c == Codec::Av1 { Backend::Dav1d } else { Backend::FfmpegSw },
+                    max_width: 3840,
+                    max_height: 2160,
+                    max_fps_at_max_size: 30,
+                    ..tpl
+                });
+            }
+        }
+    }
+    caps
+}
+
 /// Desktop caps from what the machine's decode APIs report: a codec listed
 /// by VAAPI or by Vulkan Video is fixed-function (VAAPI named when both, the
 /// more mature path on Intel/AMD); the rest is software. With neither
@@ -1347,5 +1409,21 @@ GPU id : 1 (Intel(R) Graphics (ADL GT2)):
             RenderNode { path: "/dev/dri/renderD129".into(), driver: "amdgpu".into(), vram: Some(512 << 20) },
         ];
         assert_eq!(pick_render_node(&amd).unwrap().path, "/dev/dri/renderD129", "the APU");
+    }
+
+    /// Fedora's ffmpeg-free on an Asahi Mac with the AVD VA layer: VP9 stays
+    /// hardware, AV1 is dav1d, H.264 exists only as OpenH264 in software,
+    /// HEVC not at all -- even though vainfo lists both.
+    #[test]
+    fn fedora_ffmpeg_free_cannot_decode_what_it_lacks() {
+        let decoders: Vec<String> = ["vp9", "libvpx-vp9", "av1", "libdav1d", "libopenh264", "vp8"].iter().map(|s| s.to_string()).collect();
+        let caps = restrict_to_decoders(usable_by_ffmpeg(asahi_m_series(), Some(&parse_vainfo(VAINFO_ASAHI_M2))), &decoders);
+        let best = |k: Codec| caps.caps.iter().filter(|x| x.codec == k).min_by_key(|x| x.cost).map(|x| (x.cost, x.backend));
+        assert_eq!(best(Codec::Vp9), Some((Cost::Fixed, Backend::Vaapi)), "YouTube VP9 on AVD");
+        assert_eq!(best(Codec::Av1).map(|b| b.1), Some(Backend::Dav1d), "M2: no AV1 block");
+        assert_eq!(best(Codec::H264).map(|b| b.1), Some(Backend::FfmpegSw), "OpenH264 only, no hwaccel");
+        assert_eq!(best(Codec::Hevc), None, "no HEVC decoder at all: never selected");
+        // No information: unchanged.
+        assert_eq!(restrict_to_decoders(desktop_full_hw(), &[]).caps.len(), desktop_full_hw().caps.len());
     }
 }

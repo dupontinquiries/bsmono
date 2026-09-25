@@ -466,6 +466,16 @@ pub fn choose_accel(codec: &str, m: &Machine, pref: AccelPref) -> Accel {
     if m.kind == MachineKind::QualcommVenus && m.decoders.iter().any(|d| *d == m2m) {
         return Accel::V4l2m2m { decoder: m2m };
     }
+    // Hardware decode goes only through ffmpeg's NATIVE decoder. Fedora's
+    // ffmpeg-free has no native h264/hevc (patents; H.264 only as
+    // OpenH264, software): asking VAAPI for them fails, so don't.
+    if !m.decoders.is_empty() {
+        if let Some(c) = codec_of(codec) {
+            if !m.decoders.iter().any(|d| d == vidkit_core::caps::native_decoder(c)) {
+                return Accel::Software;
+            }
+        }
+    }
     if m.kind == MachineKind::Asahi {
         // AVD is a V4L2 STATELESS decoder, which stock ffmpeg cannot drive.
         // It is reachable only through the VA-API layer (libva-v4l2_request,
@@ -1550,6 +1560,31 @@ mod vulkan_tests {
         assert!(hw < i && cv.is_some() && cv < i, "{a:?}");
         assert!(a.iter().any(|x| x.starts_with("scale=1280:720")), "{a:?}");
         assert!(!a.iter().any(|x| x == "-hwaccel_output_format"));
+    }
+}
+
+#[cfg(test)]
+mod fedora_tests {
+    use super::*;
+    use vidkit_core::codec::Codec;
+
+    /// Asahi with the VA layer listing H.264, but Fedora's ffmpeg-free has
+    /// no native h264 decoder: software (OpenH264), not a VAAPI that fails.
+    #[test]
+    fn no_native_decoder_no_hardware_path() {
+        let m = Machine {
+            kind: MachineKind::Asahi,
+            gpu_driver: Some("asahi".into()),
+            render_node: Some("/dev/dri/renderD128".into()),
+            decoders: ["vp9", "av1", "libdav1d", "libopenh264"].iter().map(|s| s.to_string()).collect(),
+            hwaccels: vec!["vaapi".into()],
+            vaapi: Some(vec![(Codec::H264, 8), (Codec::Hevc, 10), (Codec::Vp9, 10)]),
+            vaapi_vpp: false,
+            vulkan: None,
+            vulkan_devices: vec![],
+        };
+        assert_eq!(choose_accel("h264", &m, AccelPref::Auto), Accel::Software);
+        assert!(matches!(choose_accel("vp9", &m, AccelPref::Auto), Accel::Vaapi { .. }));
     }
 }
 

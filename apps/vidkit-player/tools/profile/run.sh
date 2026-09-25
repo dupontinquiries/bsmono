@@ -2,6 +2,11 @@
 # Profile vidkit-player on one video under four presenter configurations.
 #
 #   tools/profile/run.sh URL|FILE [MINUTES] [OUT_DIR]
+#   FORMAT=vp9 tools/profile/run.sh URL ...   # or FORMAT=av1: force the codec
+#
+# FORMAT matters on machines where one codec is hardware and the other is
+# not (an M2 Max: VP9 on AVD through the VA layer, AV1 in dav1d); without
+# it yt-dlp takes whichever YouTube ranks best.
 #
 # MINUTES (default 30) is split evenly across the configurations. The video
 # is fetched ONCE (yt-dlp, <=1080p) so every configuration plays the same
@@ -27,7 +32,12 @@ mkdir -p "$OUT"
 case "$SRC" in
   http://*|https://*)
     echo "fetching $SRC ..."
-    yt-dlp -q -f 'bv*[height<=1080]+ba/b[height<=1080]/b' --merge-output-format mkv \
+    case "${FORMAT:-}" in
+      vp9) SEL='bv*[vcodec^=vp09][height<=1080]+ba/bv*[vcodec^=vp9][height<=1080]+ba' ;;
+      av1) SEL='bv*[vcodec^=av01][height<=1080]+ba' ;;
+      *)   SEL='bv*[height<=1080]+ba/b[height<=1080]/b' ;;
+    esac
+    yt-dlp -q -f "$SEL" --merge-output-format mkv \
       -o "$OUT/video.%(ext)s" --print-to-file '%(title)s' "$OUT/title.txt" "$SRC"
     VIDEO=$(ls "$OUT"/video.* | head -1) ;;
   *) VIDEO=$SRC; echo "$SRC" > "$OUT/title.txt" ;;
