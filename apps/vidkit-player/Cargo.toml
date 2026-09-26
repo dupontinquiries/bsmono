@@ -49,6 +49,10 @@ vidkit-stream = { path = "../../shared/vidkit/crates/vidkit-stream" }
 # all. Reading /etc/ssl/certs is also what every other Linux client does.
 ureq = { version = "2", optional = true, features = ["native-certs"] }
 vidkit-egui = { path = "../../shared/vidkit/crates/vidkit-egui", features = ["glow-upload"] }
+# Presentation feedback / content type / commit timing on the window's own
+# wl_surface, reached through eframe's raw handles (same major as winit's).
+vidkit-wayland = { path = "../../shared/vidkit/crates/vidkit-wayland", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
 vidkit-mp4 = { path = "../../shared/vidkit/crates/vidkit-mp4" }
 vidkit-webm = { path = "../../shared/vidkit/crates/vidkit-webm" }
 # Section watching: chapters, search and plans (pure), and the transcript
@@ -74,7 +78,7 @@ snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
 # directory produces the deployable binary with no feature incantation. Off is
 # for a headless build that only wants the library half.
 default = ["app", "https", "whisper", "alsa", "bscale"]
-app = ["dep:eframe"]
+app = ["dep:eframe", "dep:vidkit-wayland", "dep:raw-window-handle"]
 # HTTPS range fetching. Separate from `app` so a headless build that only wants
 # the demuxers does not pull rustls.
 https = ["dep:ureq"]

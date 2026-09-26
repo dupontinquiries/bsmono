@@ -197,6 +197,16 @@ struct Player {
     core_check: Option<(Instant, u64, u64)>,
     /// VIDKIT_PROFILE: one line a second of what playback costs.
     profiler: Option<profile::Profiler>,
+    /// Presentation feedback and hints on the window's wl_surface (Wayland
+    /// only; None on X11 or when the compositor offers nothing).
+    wl: Option<vidkit_wayland::surface::SurfaceLink>,
+    /// What the feedback says: refresh, holds per frame, lateness, discards.
+    present_log: vidkit_wayland::cadence::PresentLog,
+    /// The display pipeline's latency, learned from the feedback; frames
+    /// are picked for when they will be seen.
+    latency: vidkit_wayland::cadence::LatencyTracker,
+    /// The last frame shown carried film grain for the GPU to add.
+    last_grain: bool,
     /// Picture-in-picture: the video floats, the chapters take the screen.
     pip: vidkit_egui::Pip,
     pip_on: bool,
@@ -417,6 +427,10 @@ impl Player {
             cores_gave_up: false,
             core_check: None,
             profiler: profile::Profiler::from_env(),
+            wl: wayland_link(cc),
+            present_log: vidkit_wayland::cadence::PresentLog::new(240),
+            last_grain: false,
+            latency: vidkit_wayland::cadence::LatencyTracker::new(15, 100_000_000),
             pip: Default::default(),
             pip_on: false,
             max_texture,
@@ -505,6 +519,13 @@ impl Player {
         }
         match tick {
             playback::Tick::Show { frame, next } => {
+                // Feedback for this frame's commit, and (with commit timing)
+                // its target: the time it was picked for.
+                if let Some(wl) = self.wl.as_mut() {
+                    let target = wl.clock_now_ns().map(|n| n + lead.as_nanos() as u64 + self.latency.comp_ns() as u64);
+                    wl.before_commit(target);
+                }
+                self.last_grain = frame.grain.is_some();
                 self.present(eframe_frame, &frame);
                 if let Some(e) = self.engine.as_ref() {
                     // The content peak for the GPU's BT.2390 EETF.
@@ -563,6 +584,17 @@ impl eframe::App for Player {
     #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         stats_tick(ctx);
+        if let Some(wl) = self.wl.as_mut() {
+            for o in wl.poll() {
+                self.latency.observe(&o);
+                self.present_log.push(o);
+            }
+            // Every update, not on change: a seek or a new file is a new
+            // engine, which starts at zero.
+            if let Some(e) = self.engine.as_mut() {
+                e.set_display_latency(Duration::from_nanos(self.latency.comp_ns() as u64));
+            }
+        }
         self.profile_frame();
         stats_note(if ctx.current_pass_index() > 0 { "pass>0" } else { "pass0" });
         if self.quit {
@@ -2189,7 +2221,13 @@ impl Player {
         }
         if self.frame_dts.len() >= 120 {
             let v: Vec<f64> = self.frame_dts.drain(..).collect();
-            if let Some(hz) = playback::estimate_refresh(&v) {
+            // Presentation feedback, when there is any, is the display's own
+            // word. The repaint intervals stopped being the refresh when the
+            // player stopped repainting between frames: they are now the
+            // CONTENT's interval (24 fps read as "24 Hz"). Without feedback
+            // (X11) that is still what is used -- a known inaccuracy.
+            let fed = self.present_log.refresh_ns().filter(|_| self.present_log.variable() != Some(true)).map(|r| (1e9 / r as f64).round() as u32);
+            if let Some(hz) = fed.or_else(|| playback::estimate_refresh(&v)) {
                 if hz != playback::refresh_hz() {
                     playback::set_refresh_hz(hz);
                     if let Some(e) = self.engine.as_mut() {
@@ -2222,6 +2260,40 @@ fn stats_note(kind: &'static str) {
 
 /// `VIDKIT_STATS=1`: repaints per second to stderr, once a second. For
 /// measuring what the UI costs in each state; off, it is one relaxed load.
+/// Presentation feedback on the window's own wl_surface, when on Wayland.
+/// Says "video" to compositors that take a content-type hint (KWin,
+/// wlroots). Commit timing is opt-in (VIDKIT_COMMIT_TIMING=1): a surface
+/// takes one timer and a second is a fatal protocol error -- see
+/// vidkit-wayland's surface module.
+fn wayland_link(cc: &eframe::CreationContext<'_>) -> Option<vidkit_wayland::surface::SurfaceLink> {
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+    if std::env::var("VIDKIT_WAYLAND_FEEDBACK").as_deref() == Ok("0") {
+        return None;
+    }
+    let (RawDisplayHandle::Wayland(d), RawWindowHandle::Wayland(w)) = (cc.display_handle().ok()?.as_raw(), cc.window_handle().ok()?.as_raw()) else {
+        return None;
+    };
+    // SAFETY: winit's live display and surface; the link lives in the
+    // Player, which eframe drops before the window.
+    let mut link = match unsafe { vidkit_wayland::surface::SurfaceLink::from_raw(d.display.as_ptr(), w.surface.as_ptr()) } {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("vidkit: no presentation feedback: {e}");
+            return None;
+        }
+    };
+    let caps = link.caps();
+    link.set_content(vidkit_wayland::surface::Content::Video);
+    let timing = std::env::var("VIDKIT_COMMIT_TIMING").as_deref() == Ok("1") && link.enable_commit_timing();
+    eprintln!(
+        "vidkit: wayland presentation {} · content-type {} · commit timing {}",
+        if caps.presentation { "yes" } else { "no" },
+        if caps.content_type { "video" } else { "unsupported" },
+        if timing { "on" } else if caps.commit_timing { "available (VIDKIT_COMMIT_TIMING=1)" } else { "unsupported" },
+    );
+    Some(link)
+}
+
 fn stats_tick(ctx: &egui::Context) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2343,7 +2415,10 @@ impl Player {
             None => self.presenter.uploaded_bytes(),
         };
         p.acc.decoder = decoder;
+        let fps = self.engine.as_ref().map(|e| 1.0 / e.frame_interval().as_secs_f64().max(1e-3));
+        p.acc.display = if self.wl.is_some() { format!("{} · comp {:.1} ms", self.present_log.summary(fps), self.latency.comp_ns() as f64 / 1e6) } else { String::new() };
         p.acc.presenter = match &self.gpu {
+            Some(_) if self.last_grain => "gpu+grain".into(),
             Some(_) => "gpu".into(),
             None if self.presenter.damage_rendering() => format!("cpu-damage@{:.2}", self.presenter.damage_budget),
             None => "cpu-whole".into(),

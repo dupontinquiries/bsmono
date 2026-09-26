@@ -54,6 +54,9 @@ def summarise(path):
     s["lods"] = " ".join(f"L{k}:{v}" for k, v in sorted(lods.items()))
     s["presenter"] = Counter(r.get("presenter", "") for r in rows).most_common(1)[0][0]
     s["decoder"] = Counter(r.get("decoder", "") for r in rows).most_common(1)[0][0]
+    # Presentation feedback (Wayland): the LAST row -- the log is cumulative
+    # over a rolling window, and the latency compensation has settled by then.
+    s["display"] = rows[-1].get("display") or "-"
     return s
 
 
@@ -75,7 +78,7 @@ def main():
         ]) + " |")
     print()
     for s in runs:
-        print(f"- **{s['name']}**: presenter `{s['presenter']}`, decoder `{s['decoder']}`")
+        print(f"- **{s['name']}**: presenter `{s['presenter']}`, decoder `{s['decoder']}`, {s['display']}")
     base = next((s for s in runs if s["name"] == "cpu-whole"), None)
     if base and base["cpu_per_frame"]:
         print()

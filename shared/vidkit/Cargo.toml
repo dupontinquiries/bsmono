@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/vidkit-core", "crates/vidkit-ytdlp", "crates/vidkit-v4l2", "crates/vidkit-mp4", "crates/vidkit-webm", "crates/vidkit-vk", "crates/vidkit-egui", "crates/vidkit-stream", "crates/vidkit-relevance", "crates/vidkit-transcribe", "crates/vidkit-vacc"]
+members = ["crates/vidkit-core", "crates/vidkit-ytdlp", "crates/vidkit-v4l2", "crates/vidkit-mp4", "crates/vidkit-webm", "crates/vidkit-vk", "crates/vidkit-egui", "crates/vidkit-stream", "crates/vidkit-relevance", "crates/vidkit-transcribe", "crates/vidkit-vacc", "crates/vidkit-wayland"]
 # crates/vidkit-vk is intentionally NOT a member yet: it needs ash + a Vulkan
 # loader that is not present in this sandbox. See crates/vidkit-vk/README.
 

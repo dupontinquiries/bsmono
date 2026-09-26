@@ -98,6 +98,9 @@ pub struct Sample {
     pub enhance: String,
     pub power: String,
     pub presenter: String,
+    /// What presentation feedback says about the display (vidkit-wayland's
+    /// PresentLog summary); "-" without it.
+    pub display: String,
 }
 
 pub struct Profiler {
@@ -117,7 +120,7 @@ impl Profiler {
         let mut header = vec!["t_s", "repaints", "shown", "dropped", "upload_kb", "damaged_pct", "conv_kpx", "lod_max"];
         let cpu_cols: Vec<String> = GROUPS.iter().map(|g| format!("cpu_{g}")).collect();
         header.extend(cpu_cols.iter().map(String::as_str));
-        header.extend(["rss_mb", "presenter", "decoder", "enhance", "power"]);
+        header.extend(["rss_mb", "presenter", "decoder", "enhance", "power", "display"]);
         let _ = writeln!(out, "{}", header.join("\t"));
         // SAFETY: sysconf with a constant.
         let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
@@ -151,13 +154,13 @@ impl Profiler {
             a.lod_max_seen.to_string(),
         ];
         cols.extend(GROUPS.iter().map(|g| format!("{:.1}", cpu(g))));
-        cols.extend([rss_mb().to_string(), a.presenter.clone(), a.decoder.clone(), a.enhance.clone(), a.power.clone()]);
+        cols.extend([rss_mb().to_string(), a.presenter.clone(), a.decoder.clone(), a.enhance.clone(), a.power.clone(), if a.display.is_empty() { "-".into() } else { a.display.clone() }]);
         let _ = writeln!(self.out, "{}", cols.join("\t"));
         self.last = Instant::now();
         self.last_ticks = ticks;
         self.last_totals = (shown_total, dropped_total, uploaded_total);
-        let keep = (a.decoder.clone(), a.enhance.clone(), a.power.clone(), a.presenter.clone());
-        self.acc = Sample { decoder: keep.0, enhance: keep.1, power: keep.2, presenter: keep.3, ..Sample::default() };
+        let keep = (a.decoder.clone(), a.enhance.clone(), a.power.clone(), a.presenter.clone(), a.display.clone());
+        self.acc = Sample { decoder: keep.0, enhance: keep.1, power: keep.2, presenter: keep.3, display: keep.4, ..Sample::default() };
     }
 }
 

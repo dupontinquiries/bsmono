@@ -367,6 +367,9 @@ pub struct Engine {
     audio_error: Arc<Mutex<Option<String>>>,
     paused: bool,
     frame_interval: Duration,
+    /// How long after its commit a frame reaches the screen (learned from
+    /// presentation feedback): frames are picked for then.
+    display_latency: Duration,
     /// Frames shown and dropped since the last (re)start.
     pub shown: u64,
     pub dropped: u64,
@@ -400,6 +403,7 @@ impl Engine {
             audio_error: Arc::new(Mutex::new(None)),
             paused: false,
             frame_interval: Duration::from_millis(33),
+            display_latency: Duration::ZERO,
             shown: 0,
             dropped: 0,
             audio_note: String::new(),
@@ -628,7 +632,9 @@ impl Engine {
             return Tick::Wait(Duration::from_millis(250));
         }
         let pool = self.pool.clone();
-        let at = self.master.now() + lead;
+        // Seen at: now + the wake's lead + the compositor's pipeline. The
+        // audio clock is what is HEARD, so the picture must be what is SEEN.
+        let at = self.master.now() + lead + self.display_latency;
         match pick(&mut self.queue, at, &self.policy, &mut |f| pool.recycle(f)) {
             Pick::Show { frame, dropped } => {
                 self.dropped += dropped as u64;
@@ -637,7 +643,7 @@ impl Engine {
                 // the current instant for its deadline. Only the pick uses
                 // the presentation time.
                 let next = self.queue.front()
-                    .map(|n| n.pts.saturating_sub(self.master.now()))
+                    .map(|n| n.pts.saturating_sub(self.master.now() + self.display_latency))
                     .unwrap_or(self.frame_interval);
                 Tick::Show { frame, next: next.max(Duration::from_millis(1)) }
             }
@@ -725,6 +731,17 @@ impl Engine {
     /// effect from the next (re)start of the decoder thread.
     pub fn set_waker(&mut self, w: Waker) {
         self.waker = Some(w);
+    }
+
+    /// Pick frames for `d` after their commit: the display pipeline's
+    /// latency, measured by the app from presentation feedback.
+    pub fn set_display_latency(&mut self, d: Duration) {
+        self.display_latency = d.min(Duration::from_millis(150));
+    }
+
+    /// The video's nominal frame interval (33 ms until the decoder says).
+    pub fn frame_interval(&self) -> Duration {
+        self.frame_interval
     }
 
     /// The display's refresh rate: the sync slack is half its interval. It

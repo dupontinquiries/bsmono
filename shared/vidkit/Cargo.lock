@@ -2921,6 +2921,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vidkit-wayland"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+]
+
+[[package]]
 name = "vidkit-webm"
 version = "0.1.0"
 dependencies = [

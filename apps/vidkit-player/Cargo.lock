@@ -3144,6 +3144,7 @@ dependencies = [
  "egui",
  "libc",
  "models-kit",
+ "raw-window-handle",
  "snapclone-theme",
  "uikit-egui",
  "ureq",
@@ -3155,6 +3156,7 @@ dependencies = [
  "vidkit-transcribe",
  "vidkit-v4l2",
  "vidkit-vacc",
+ "vidkit-wayland",
  "vidkit-webm",
  "vidkit-ytdlp",
 ]
@@ -3198,6 +3200,16 @@ dependencies = [
  "vacc-parser",
  "vacc-software-decode",
  "vidkit-core",
+]
+
+[[package]]
+name = "vidkit-wayland"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]
