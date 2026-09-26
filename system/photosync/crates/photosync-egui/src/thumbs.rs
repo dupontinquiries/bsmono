@@ -114,43 +114,10 @@ impl Decode for StoreDecode {
 }
 
 /// EXIF orientation (1..=8) of a JPEG, or 1 when there is none or it cannot be
-/// read: APP1 "Exif\0\0", a TIFF header (II / MM), IFD0's tag 0x0112. Reads
-/// only the headers; anything malformed is "no rotation", never an error.
+/// read. The parser is `photosync::exif` — shared with the service, which
+/// reads the date taken from the same header; this crate had its own copy.
 pub fn exif_orientation(bytes: &[u8]) -> u16 {
-    fn u16_at(b: &[u8], i: usize, le: bool) -> Option<u16> {
-        let v = b.get(i..i + 2)?;
-        Some(if le { u16::from_le_bytes([v[0], v[1]]) } else { u16::from_be_bytes([v[0], v[1]]) })
-    }
-    fn u32_at(b: &[u8], i: usize, le: bool) -> Option<u32> {
-        let v = b.get(i..i + 4)?;
-        Some(if le { u32::from_le_bytes([v[0], v[1], v[2], v[3]]) } else { u32::from_be_bytes([v[0], v[1], v[2], v[3]]) })
-    }
-    fn find(b: &[u8]) -> Option<u16> {
-        if b.get(0..2)? != [0xFF, 0xD8] { return None; } // not a JPEG
-        let mut i = 2;
-        while i + 4 <= b.len() && b[i] == 0xFF {
-            let marker = b[i + 1];
-            let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
-            if marker == 0xDA || len < 2 { return None; } // image data: no EXIF before it
-            if marker == 0xE1 && b.get(i + 4..i + 10)? == b"Exif\0\0" {
-                let t = i + 10; // the TIFF header
-                let le = match b.get(t..t + 2)? { b"II" => true, b"MM" => false, _ => return None };
-                let ifd = t + u32_at(b, t + 4, le)? as usize;
-                let n = u16_at(b, ifd, le)? as usize;
-                for k in 0..n.min(512) {
-                    let e = ifd + 2 + k * 12;
-                    if u16_at(b, e, le)? == 0x0112 {
-                        let v = u16_at(b, e + 8, le)?;
-                        return (1..=8).contains(&v).then_some(v);
-                    }
-                }
-                return None;
-            }
-            i += 2 + len;
-        }
-        None
-    }
-    find(bytes).unwrap_or(1)
+    photosync::exif::orientation(bytes)
 }
 
 /// Apply an EXIF orientation so the picture is upright.
@@ -445,23 +412,9 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1), "workers exit promptly");
     }
 
-    /// A minimal JPEG header carrying only an EXIF orientation, in either byte order.
+    /// A JPEG APP1 segment carrying only an EXIF orientation, in either byte order.
     fn exif_app1(orientation: u16, le: bool) -> Vec<u8> {
-        let w16 = |v: u16| if le { v.to_le_bytes() } else { v.to_be_bytes() };
-        let w32 = |v: u32| if le { v.to_le_bytes() } else { v.to_be_bytes() };
-        let mut tiff = Vec::new();
-        tiff.extend_from_slice(if le { b"II" } else { b"MM" });
-        tiff.extend_from_slice(&w16(42));
-        tiff.extend_from_slice(&w32(8)); // IFD0 right after the header
-        tiff.extend_from_slice(&w16(1)); // one entry
-        tiff.extend_from_slice(&w16(0x0112)); tiff.extend_from_slice(&w16(3)); tiff.extend_from_slice(&w32(1));
-        tiff.extend_from_slice(&w16(orientation)); tiff.extend_from_slice(&[0, 0]);
-        tiff.extend_from_slice(&w32(0));
-        let mut seg = vec![0xFF, 0xE1];
-        seg.extend_from_slice(&((2 + 6 + tiff.len()) as u16).to_be_bytes());
-        seg.extend_from_slice(b"Exif\0\0");
-        seg.extend_from_slice(&tiff);
-        seg
+        photosync::exif::app1_segment(orientation, None, None, le)
     }
 
     #[test]
