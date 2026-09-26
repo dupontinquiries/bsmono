@@ -73,6 +73,7 @@ pub mod scroll_areas;
 pub mod mobile_dialog;
 pub mod glass;
 pub mod swipe_physics;
+pub mod page_step;
 pub mod video_viewer;
 pub mod posture;
 pub mod camera_policy;
@@ -746,6 +747,8 @@ pub struct Snapclone {
     /// the release clears the lock in the same frame the layer reports the
     /// jump — which turned two pages per swipe.
     pub swipe_claimed: bool,
+    /// One step per trackpad/wheel burst — see `page_step::Gate`.
+    pub scroll_gate: crate::page_step::Gate,
     /// This touch has already gone back one level.
     pub back_armed: bool,
     /// Accent and background derived from the photos in the inbox, so the app
@@ -999,6 +1002,7 @@ impl Snapclone {
             touch_origin: None,
             swipe_settle: None,
             swipe_claimed: false,
+            scroll_gate: Default::default(),
             back_armed: false,
             ambient: None,
             // Written here rather than in HelpManual::default(): the widget is
@@ -2567,7 +2571,16 @@ impl Snapclone {
                         // twelve pixels of travel, so the page would jump
                         // by that much the moment it took over.
                         if self.swipe.is_none() && !self.modal.blocks_input() {
-                            self.begin_swipe(origin.x, surface.width(), t_ms);
+                            // Bounds from the STEP, not the page list: the
+                            // last page still gives way while it has
+                            // sections left, and a page mid-sections is not
+                            // an end.
+                            let bounds = crate::swipe_physics::Bounds {
+                                can_prev: self.can_step(-1),
+                                can_next: self.can_step(1),
+                            };
+                            self.swipe = Some(crate::swipe_physics::Swipe::begin(
+                                surface.width(), bounds, origin.x, t_ms));
                             self.swipe_settle = None;
                         }
                         if let Some(sw) = self.swipe.as_mut() {
@@ -2582,18 +2595,17 @@ impl Snapclone {
                 self.swipe_claimed = true;
                 let from = self.swipe.as_ref().map(|s| s.offset()).unwrap_or(0.0);
                 let ms = self.swipe.as_ref().map(|s| s.settle_ms(t_ms)).unwrap_or(200.0);
-                let before = self.nav.page();
-                let tab = self.end_swipe(t_ms);
-                // `end_swipe` moves `tabs`; the page the app draws from is
-                // `nav`, and they are kept in step elsewhere by
-                // `tabs.set_current(nav.page())`. Pushing it the other way
-                // here is what makes the gesture actually turn the page —
-                // and going through `swipe_page` rather than `nav.go_page`
-                // keeps the modal guard and the peel-hint bookkeeping in
-                // one place.
-                if tab != before {
-                    self.swipe_page(if tab > before { 1 } else { -1 });
+                // One release, one step: the physics picks the direction
+                // (distance or flick), `swipe_step` picks whether that is a
+                // section or a page, and keeps the modal guard and the
+                // peel-hint bookkeeping in one place.
+                let commit = self.swipe.take().map(|mut sw| sw.release(t_ms));
+                match commit {
+                    Some(crate::swipe_physics::Commit::Next) => { self.swipe_step(1); }
+                    Some(crate::swipe_physics::Commit::Prev) => { self.swipe_step(-1); }
+                    _ => {}
                 }
+                self.tabs.set_current(self.nav.page());
                 // Settle from wherever the finger left it, so a cancelled
                 // swipe springs back rather than vanishing.
                 self.swipe_settle = Some((from, ms, ms));
@@ -2674,6 +2686,65 @@ impl Snapclone {
         if next != self.nav.page() { self.peel.note_swipe(); }
         self.nav.go_page(next);
         self.peel.set_page(next, PAGES.len());
+    }
+
+    /// How many sections a page SHOWS — the ones a swipe walks through
+    /// before leaving it. Inbox's segments are the ribbon's; Settings' are
+    /// its tab row. Friends declares All/Online/Pending in `sub_tabs` but
+    /// draws no control for them, and stepping through sections the user
+    /// cannot see would read as swipes that do nothing.
+    pub fn sections(page: usize) -> usize {
+        match page {
+            1 => crate::unified_nav::sub_tabs(1).len(),
+            4 => crate::settings_page::Tab::ALL.len(),
+            _ => 0,
+        }
+    }
+
+    pub fn position(&self) -> crate::page_step::Pos {
+        let page = self.nav.page();
+        let section = match page {
+            1 => self.bar.sub[1],
+            4 => self.settings.tab.index(),
+            _ => 0,
+        };
+        crate::page_step::Pos { page, section }
+    }
+
+    fn set_section(&mut self, page: usize, section: usize) {
+        match page {
+            1 => {
+                self.bar.sub[1] = section;
+                self.ribbon.set_current(section);
+            }
+            4 => self.settings.tab = crate::settings_page::Tab::from_index(section),
+            _ => {}
+        }
+    }
+
+    /// Would a swipe in `sign`'s direction go anywhere? The live swipe asks
+    /// this for its rubber band, so the last page still gives way when it
+    /// has sections left to show.
+    pub fn can_step(&self, sign: i32) -> bool {
+        if self.modal.blocks_input() || self.nav.can_go_back() { return false; }
+        let here = self.position();
+        crate::page_step::step(here, sign, PAGES.len(), Self::sections) != here
+    }
+
+    /// One swipe: the next section of this page, else the next page. Every
+    /// swipe gesture — touch release, trackpad detent, wheel past the strip —
+    /// ends here, so they agree on what a step is. Returns whether anything
+    /// moved.
+    pub fn swipe_step(&mut self, sign: i32) -> bool {
+        if !self.can_step(sign) { return false; }
+        let here = self.position();
+        let to = crate::page_step::step(here, sign, PAGES.len(), Self::sections);
+        if to.page != here.page {
+            self.swipe_page(if to.page > here.page { 1 } else { -1 });
+            if self.nav.page() != to.page { return false; }
+        }
+        self.set_section(to.page, to.section);
+        true
     }
 
     /// Advance the animation; call once per frame with the frame delta.
@@ -3411,18 +3482,23 @@ impl Snapclone {
         // one drag turns two pages.
         let frame = self.gesture.update(ui, surface, true);
         let claimed = std::mem::take(&mut self.swipe_claimed);
-        if let Some(dir) = frame.page_jump {
-            if !claimed && self.axis_lock.intent() != crate::swipe_physics::Intent::Page {
-                self.swipe_page(dir.sign());
-            }
-        }
-        // The detent: two-finger scroll along the page axis, accumulated
-        // past the threshold, clicks over to the next page — the Qt
-        // build's way of turning pages from a trackpad, ported to the
-        // gesture model a session ago and read by nothing until now.
+        // Pointer drags belong to the touch path above, which steps once at
+        // release. The layer ALSO feeds a pointer drag into its detent
+        // model, and each detent it fired mid-drag turned a whole page —
+        // with the release's own step on top, one swipe travelled three.
+        // So the layer's `page_jump` (a second opinion on the same drag) and
+        // any detent during a press are ignored; only scroll-driven detents
+        // step, and through the gate, once per burst.
+        let _ = frame.page_jump;
+        let (pressed, scrolling, now_ms) = ui.input(|i| (
+            i.pointer.primary_down(),
+            i.smooth_scroll_delta.x.abs() > 0.01,
+            i.time * 1000.0,
+        ));
+        self.scroll_gate.observe(now_ms, scrolling);
         if let Some(dir) = frame.detent {
-            if !claimed {
-                self.swipe_page(dir.sign());
+            if !claimed && !pressed && self.scroll_gate.try_step(now_ms) {
+                self.swipe_step(dir.sign());
             }
         }
 
@@ -5843,10 +5919,15 @@ impl Snapclone {
                             self.strip_active = self.strip_scroll.value.round() as usize;
                         }
                         // Past the end: the swipe layer owns it now.
+                        // Through the same gate as the trackpad: this ran on
+                        // every frame of a wheel burst past the end, so one
+                        // flick at the last tile walked off several pages.
                         crate::scroll_passthrough::Handled::PassThrough => {
                             let dir = if py + px > 0.0 { -1 } else { 1 };
-                            let next = (self.nav.page() as i32 + dir).clamp(0, 4);
-                            self.nav.go_page(next as usize);
+                            let now_ms = ui.input(|i| i.time) * 1000.0;
+                            if self.scroll_gate.try_step(now_ms) {
+                                self.swipe_step(dir);
+                            }
                         }
                     }
                 }
@@ -6414,6 +6495,123 @@ mod tests {
         assert!(mid < -50.0, "the page did not follow the finger: {mid}");
         frame(&mut app, vec![at(60.0), release(60.0)]);
         assert_eq!(app.nav.page(), 1, "a drag most of the way across turned nothing");
+    }
+
+    /// A test harness that drives `ui()` with a real clock, so the gesture
+    /// layer's detent timing runs as it does on a device.
+    struct Drive {
+        ctx: egui::Context,
+        t: f64,
+    }
+
+    impl Drive {
+        fn new() -> Self { Drive { ctx: egui::Context::default(), t: 0.0 } }
+        fn frame(&mut self, app: &mut Snapclone, events: Vec<egui::Event>) {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 800.0));
+            let adaptive = Adaptive::default();
+            self.t += 1.0 / 60.0;
+            let _ = self.ctx.run(egui::RawInput { events, screen_rect: Some(screen),
+                time: Some(self.t), predicted_dt: 1.0 / 60.0, ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.ui(ui, &adaptive));
+            });
+        }
+        /// A finger dragging from `x0` to `x1` over `frames` frames, then
+        /// lifting — the pace of a real swipe, not three big jumps.
+        fn drag(&mut self, app: &mut Snapclone, x0: f32, x1: f32, frames: usize) {
+            use egui::{Event, PointerButton, Pos2};
+            let y = 400.0;
+            self.frame(app, vec![Event::PointerMoved(Pos2::new(x0, y)), Event::PointerButton {
+                pos: Pos2::new(x0, y), button: PointerButton::Primary, pressed: true,
+                modifiers: Default::default() }]);
+            for f in 1..=frames {
+                let x = x0 + (x1 - x0) * f as f32 / frames as f32;
+                self.frame(app, vec![Event::PointerMoved(Pos2::new(x, y))]);
+            }
+            self.frame(app, vec![Event::PointerButton { pos: Pos2::new(x1, y),
+                button: PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
+            for _ in 0..20 { self.frame(app, vec![]); }
+        }
+    }
+
+    /// Position as a single index along the whole page-and-section walk.
+    fn flat(p: crate::page_step::Pos) -> usize {
+        (0..p.page).map(|q| Snapclone::sections(q).max(1)).sum::<usize>() + p.section
+    }
+
+    #[test]
+    fn one_drag_is_one_step_however_slowly_it_crosses_the_page() {
+        // "I frequently want to swipe one page and travel three." The layer
+        // fed the drag into its detent model and every detent it fired mid-
+        // drag turned a page, with the release's own step on top.
+        let mut d = Drive::new();
+        let mut app = app();
+        d.frame(&mut app, vec![]);
+        assert_eq!(flat(app.position()), 0);
+        d.drag(&mut app, 380.0, 20.0, 40);
+        assert_eq!((app.position().page, app.position().section), (1, 0),
+            "a single slow swipe from Camera did not land on Inbox's first section");
+    }
+
+    #[test]
+    fn a_swipe_walks_a_pages_sections_before_the_next_page() {
+        let mut d = Drive::new();
+        let mut app = app();
+        d.frame(&mut app, vec![]);
+        let mut seen = vec![];
+        for _ in 0..4 {
+            d.drag(&mut app, 360.0, 60.0, 24);
+            let p = app.position();
+            seen.push((p.page, p.section));
+        }
+        assert_eq!(seen, [(1, 0), (1, 1), (1, 2), (2, 0)]);
+        // And back: into Inbox at its LAST section.
+        d.drag(&mut app, 60.0, 360.0, 24);
+        assert_eq!((app.position().page, app.position().section), (1, 2));
+        assert_eq!(app.bar.sub[1], 2, "the section moved but the Inbox segment did not");
+    }
+
+    #[test]
+    fn the_last_page_still_swipes_through_its_sections() {
+        // Settings is the last page. The rubber band came from the page
+        // list, so a leftward swipe there had nowhere to commit to and the
+        // four tabs past General were unreachable by swiping.
+        let mut d = Drive::new();
+        let mut app = app();
+        app.nav.go_page(4);
+        d.frame(&mut app, vec![]);
+        d.drag(&mut app, 360.0, 60.0, 24);
+        assert_eq!(app.settings.tab, crate::settings_page::Tab::Camera);
+        assert_eq!(app.nav.page(), 4);
+    }
+
+    #[test]
+    fn a_long_trackpad_swipe_steps_once_and_a_second_swipe_steps_again() {
+        use egui::{Event, MouseWheelUnit, Pos2, TouchPhase};
+        let mut d = Drive::new();
+        let mut app = app();
+        app.nav.go_page(1);
+        app.bar.sub[1] = 1;
+        d.frame(&mut app, vec![Event::PointerMoved(Pos2::new(200.0, 400.0))]);
+        let wheel = |dx: f32| Event::MouseWheel { unit: MouseWheelUnit::Point,
+            delta: egui::vec2(dx, 0.0), phase: TouchPhase::Move, modifiers: Default::default() };
+        let start = flat(app.position());
+        // A second of two-finger swipe, then a kinetic tail: long enough
+        // that the detent model's own 350 ms takeover lock expires and it
+        // fires again inside the one gesture — which is what it did on a
+        // trackpad with kinetic scrolling, and why the lock alone is not
+        // the fix.
+        for f in 0..105 {
+            let dx = if f < 60 { -60.0 } else { -60.0 * (105 - f) as f32 / 45.0 };
+            d.frame(&mut app, vec![wheel(dx)]);
+        }
+        for _ in 0..30 { d.frame(&mut app, vec![]); }
+        let after_one = flat(app.position());
+        assert_eq!(after_one.abs_diff(start), 1,
+            "one trackpad swipe travelled {} steps", after_one.abs_diff(start));
+        for _ in 0..30 { d.frame(&mut app, vec![wheel(-60.0)]); }
+        for _ in 0..30 { d.frame(&mut app, vec![]); }
+        assert_eq!(flat(app.position()).abs_diff(after_one), 1,
+            "a second swipe after a pause did not step again");
     }
 
     #[test]
