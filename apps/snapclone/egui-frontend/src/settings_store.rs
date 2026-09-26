@@ -54,8 +54,8 @@ pub fn render(s: &Settings) -> String {
 
     let g = &s.general;
     out.push_str("[general]\n");
-    out.push_str(&format!("display_name = {}\n", g.display_name));
-    out.push_str(&format!("palette = {}\n", g.palette));                            // ui/palette
+    out.push_str(&format!("display_name = {}\n", quote(&g.display_name)));
+    out.push_str(&format!("palette = {}\n", quote(&g.palette)));                            // ui/palette
     out.push_str(&format!("unified_nav = {}\n", g.unified_nav));                    // ui/unified_nav
     out.push_str(&format!("scroll_invert_trackpad = {}\n", g.scroll_invert_trackpad)); // ui/scroll_detent_invert
     out.push_str(&format!("scroll_invert_mouse = {}\n", g.scroll_invert_mouse));    // ui/scroll_detent_invert_mouse
@@ -66,15 +66,15 @@ pub fn render(s: &Settings) -> String {
     out.push_str(&format!("share_location = {}\n", g.share_location));              // privacy/shareLocation
     out.push_str(&format!("share_photo_location = {}\n", g.share_photo_location));  // privacy/sharePhotoLocation
     out.push_str(&format!("record_audio = {}\n", g.record_audio));                  // video/recordAudio
-    out.push_str(&format!("manual_lat = {}\n", g.manual_lat));                      // location/manualLat
-    out.push_str(&format!("manual_lon = {}\n", g.manual_lon));                      // location/manualLon
+    out.push_str(&format!("manual_lat = {}\n", quote(&g.manual_lat)));                      // location/manualLat
+    out.push_str(&format!("manual_lon = {}\n", quote(&g.manual_lon)));                      // location/manualLon
     out.push_str(&format!("ringtone_gain = {}\n", g.ringtone_gain));                // sounds/ringtoneGain
     out.push_str(&format!("ringtone_muted = {}\n", g.ringtone_muted));              // sounds/ringtoneMuted
     out.push_str(&format!("mic_pipeline_off = {}\n", g.mic_pipeline_off));          // sounds/micPipelineOff
 
     let c = &s.camera;
     out.push_str("\n[camera]\n");
-    out.push_str(&format!("device = {}\n", c.device));
+    out.push_str(&format!("device = {}\n", quote(&c.device)));
     out.push_str(&format!("mirror_front = {}\n", c.mirror_front));
     out.push_str(&format!("shutter_sound = {}\n", c.shutter_sound));
     out.push_str(&format!("rear_backend = {}\n", c.rear_backend.key()));            // camera/rearBackend
@@ -83,7 +83,7 @@ pub fn render(s: &Settings) -> String {
     out.push_str(&format!("speech_boost_auto_only = {}\n", c.speech_boost_auto_only)); // audio/speechBoostAutoOnly
     out.push_str(&format!("face_library = {}\n", c.face_library));                  // face/enabled
     out.push_str(&format!("capture_flash_bright = {}\n", c.capture_flash_bright));
-    out.push_str(&format!("face_consent = {}\n", c.face_consent));                  // no Qt twin — the Qt app has no consent gate   // no Qt twin — the Qt app flashes white unconditionally
+    out.push_str(&format!("face_consent = {}\n", quote(&c.face_consent)));                  // no Qt twin — the Qt app has no consent gate   // no Qt twin — the Qt app flashes white unconditionally
 
     let n = &s.network;
     out.push_str("\n[network]\n");
@@ -92,8 +92,8 @@ pub fn render(s: &Settings) -> String {
     out.push_str(&format!("jami_enabled = {}\n", n.jami_enabled));                  // network/jamiEnabled
     out.push_str(&format!("upnp = {}\n", n.upnp));                                  // network/upnpEnabled
     out.push_str(&format!("stun_servers = {}\n", n.stun_mask));                     // network/stunServers
-    out.push_str(&format!("stun_extra = {}\n", n.stun_extra));
-    out.push_str(&format!("relay_url = {}\n", n.relay_url));                        // network/relayUrl
+    out.push_str(&format!("stun_extra = {}\n", quote(&n.stun_extra)));
+    out.push_str(&format!("relay_url = {}\n", quote(&n.relay_url)));                        // network/relayUrl
     out.push_str(&format!("crypto_backend = {}\n", n.crypto_backend.index()));      // crypto/backend
     out.push_str(&format!("require_encryption = {}\n", n.require_encryption));
     out.push_str(&format!("ws_port = {}\n", n.ws_port));                            // network/wsPort
@@ -103,8 +103,8 @@ pub fn render(s: &Settings) -> String {
     out.push_str("\n[storage]\n");
     out.push_str(&format!("keep_days = {}\n", st.keep_days));
     out.push_str(&format!("keep_everything = {}\n", st.keep_everything));           // storage/keepEverything
-    out.push_str(&format!("export_dir = {}\n", st.export_dir));
-    out.push_str(&format!("auto_sync_path = {}\n", st.auto_sync_path));
+    out.push_str(&format!("export_dir = {}\n", quote(&st.export_dir)));
+    out.push_str(&format!("auto_sync_path = {}\n", quote(&st.auto_sync_path)));
     out.push_str(&format!("ambient_enabled = {}\n", st.ambient_enabled));           // ui/ambient_enabled
 
     let a = &s.about;
@@ -115,7 +115,56 @@ pub fn render(s: &Settings) -> String {
     out.push_str(&format!("verbose_fsm = {}\n", a.verbose_fsm));
     out.push_str(&format!("mobile_display_debug = {}\n", a.mobile_display_debug));
     out.push_str(&format!("micro_dht_enabled = {}\n", a.micro_dht_enabled));        // beta/micro_dht_enabled
-    out.push_str(&format!("micro_dht_host = {}\n", a.micro_dht_host));              // beta/micro_dht_host
+    out.push_str(&format!("micro_dht_host = {}\n", quote(&a.micro_dht_host)));              // beta/micro_dht_host
+    out
+}
+
+/// A string value as the file carries it: in double quotes, with `\\`, `\"` and `\n`
+/// escaped.
+///
+/// Written bare, a value was cut short on load wherever it held a character the flat
+/// format gives a meaning: `#` and `;` start a comment (display name "Ada #1" came back
+/// as "Ada"; a relay URL with a #fragment lost it), surrounding quotes were stripped, and
+/// leading/trailing spaces were trimmed. Inside quotes `config_kit::Ini` keeps `#`, `;`
+/// and spaces, and skips backslash-escaped quotes; `unquote_escapes` decodes the escapes.
+pub fn quote(v: &str) -> String {
+    let mut out = String::with_capacity(v.len() + 2);
+    out.push('"');
+    for ch in v.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => {}
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The inverse of [`quote`]'s escapes (the quotes themselves are already gone: `Ini`
+/// strips them). An unknown escape is kept as written, so a hand-edited or pre-quoting
+/// value with a stray backslash loads as it was.
+pub fn unquote_escapes(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut chars = v.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('n') => out.push('\n'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
     out
 }
 
@@ -126,7 +175,9 @@ pub fn render(s: &Settings) -> String {
 /// the user every other setting in the file.
 pub fn parse(text: &str) -> Settings {
     let ini = config_kit::Ini::parse(text);
-    let get = |sec: &str, key: &str| ini.get(sec, key).map(|v| v.to_string());
+    // Every value goes through `unquote_escapes`: string fields are written quoted and
+    // escaped (see `quote`), and for the numbers and booleans it is the identity.
+    let get = |sec: &str, key: &str| ini.get(sec, key).map(unquote_escapes);
     let b = |v: Option<String>, d: bool| v.and_then(|x| x.parse().ok()).unwrap_or(d);
 
     let mut g = General::default();
@@ -226,8 +277,10 @@ pub fn load() -> Settings {
     }
 }
 
-/// Write to disk. The io::Result is returned rather than swallowed, because a
-/// Save that silently fails is the same lie as one that never wrote.
+/// Write to disk -- atomically (`config_kit::write_atomic`), because a phone app is
+/// killed rather than closed and a torn file loads as all-defaults. The io::Result is
+/// returned rather than swallowed, because a Save that silently fails is the same lie as
+/// one that never wrote.
 pub fn store(s: &Settings) -> std::io::Result<()> {
     config_kit::save(APP, FILE, &render(s))
 }
@@ -324,6 +377,29 @@ mod tests {
 
 #[cfg(test)]
 mod roundtrip_tests {
+
+    /// Values holding the characters the flat format gives a meaning survive a round
+    /// trip exactly: `#` and `;` (comments), quotes, backslashes, edge spaces, newlines.
+    #[test]
+    fn string_values_with_special_characters_round_trip() {
+        let mut s = crate::settings_page::Settings::default();
+        s.general.display_name = "  Ada #1; \"the\" one \\ ok  ".into();
+        s.network.relay_url = "wss://relay.example/ws#frag;x=1".into();
+        s.storage.export_dir = "/media/sd card/snaps;2026".into();
+        s.storage.auto_sync_path = "line1\nline2".into();
+        s.about.micro_dht_host = "\"quoted\"".into();
+        let back = super::parse(&super::render(&s));
+        assert_eq!(back.general.display_name, s.general.display_name);
+        assert_eq!(back.network.relay_url, s.network.relay_url);
+        assert_eq!(back.storage.export_dir, s.storage.export_dir);
+        assert_eq!(back.storage.auto_sync_path, s.storage.auto_sync_path);
+        assert_eq!(back.about.micro_dht_host, s.about.micro_dht_host);
+        assert_eq!(back, s, "the whole struct round-trips");
+        // A file written before quoting (bare values) still loads.
+        let old = super::parse("[general]\ndisplay_name = Bob\n[storage]\nexport_dir = /tmp/x\n");
+        assert_eq!(old.general.display_name, "Bob");
+        assert_eq!(old.storage.export_dir, "/tmp/x");
+    }
     use super::*;
     use crate::settings_page::{CameraBackend, CryptoBackend, DiscoveryBackend, Settings, SpeechBoost};
 

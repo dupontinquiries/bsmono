@@ -277,6 +277,93 @@ impl CameraHealth {
     }
 }
 
+/// The Tuning controls, persisted.
+///
+/// The settings page edits these on the live policy (so there is one copy of each
+/// timeout), and nothing ever wrote them: every launch started from `Default`. They live
+/// in their own file rather than in `settings.conf` so the two are never written by two
+/// code paths over each other -- a page Save cannot clobber a tuning change or the
+/// reverse. Only the fields the page exposes are stored; the rest stay code defaults.
+pub mod store {
+    use super::CameraPolicy;
+
+    pub const FILE: &str = "camera_policy.conf";
+
+    pub fn render(p: &CameraPolicy) -> String {
+        format!(
+            "# snapclone camera tuning -- the Settings page's Camera > Tuning controls\n\
+             startup_timeout_ms = {}\n\
+             first_frame_timeout_ms = {}\n\
+             early_exit_window_ms = {}\n\
+             rotation = {}\n\
+             auto_retry_alternate = {}\n\
+             prefer_gpu_convert = {}\n\
+             simultaneous_capture = {}\n",
+            p.startup_timeout_ms,
+            p.first_frame_timeout_ms,
+            p.early_exit_window_ms,
+            crate::settings_store::quote(&p.rotation),
+            p.auto_retry_alternate,
+            p.prefer_gpu_convert,
+            p.simultaneous_capture,
+        )
+    }
+
+    /// Unknown or unreadable keys keep their defaults, as `settings_store::parse` does.
+    /// Timeouts are clamped to the page's own ranges, so a hand edit cannot set a zero
+    /// watchdog the UI would never have allowed.
+    pub fn parse(text: &str) -> CameraPolicy {
+        let ini = config_kit::Ini::parse(text);
+        let get = |k: &str| ini.top(k).map(crate::settings_store::unquote_escapes);
+        let mut p = CameraPolicy::default();
+        let ms = |v: Option<String>, lo: u32, d: u32| {
+            v.and_then(|x| x.parse::<u32>().ok()).map(|x| x.clamp(lo, 60_000)).unwrap_or(d)
+        };
+        let b = |v: Option<String>, d: bool| v.and_then(|x| x.parse().ok()).unwrap_or(d);
+        p.startup_timeout_ms = ms(get("startup_timeout_ms"), 50, p.startup_timeout_ms);
+        p.first_frame_timeout_ms = ms(get("first_frame_timeout_ms"), 50, p.first_frame_timeout_ms);
+        p.early_exit_window_ms = ms(get("early_exit_window_ms"), 0, p.early_exit_window_ms);
+        if let Some(r) = get("rotation") {
+            p.rotation = r;
+        }
+        p.auto_retry_alternate = b(get("auto_retry_alternate"), p.auto_retry_alternate);
+        p.prefer_gpu_convert = b(get("prefer_gpu_convert"), p.prefer_gpu_convert);
+        p.simultaneous_capture = b(get("simultaneous_capture"), p.simultaneous_capture);
+        p
+    }
+
+    pub fn load() -> CameraPolicy {
+        config_kit::load(crate::settings_store::APP, FILE).map(|t| parse(&t)).unwrap_or_default()
+    }
+
+    pub fn store(p: &CameraPolicy) -> std::io::Result<()> {
+        config_kit::save(crate::settings_store::APP, FILE, &render(p))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_tuning_round_trips_and_hand_edits_are_clamped() {
+            let mut p = CameraPolicy::default();
+            p.startup_timeout_ms = 3_250;
+            p.first_frame_timeout_ms = 9_000;
+            p.early_exit_window_ms = 0;
+            p.rotation = "90".into();
+            p.auto_retry_alternate = !p.auto_retry_alternate;
+            p.prefer_gpu_convert = true;
+            p.simultaneous_capture = true;
+            assert_ne!(p, CameraPolicy::default(), "the test data must differ from the defaults");
+            assert_eq!(parse(&render(&p)), p);
+            let hand = parse("startup_timeout_ms = 0\nfirst_frame_timeout_ms = 999999\nprefer_gpu_convert = maybe\n");
+            assert_eq!(hand.startup_timeout_ms, 50);
+            assert_eq!(hand.first_frame_timeout_ms, 60_000);
+            assert_eq!(hand.prefer_gpu_convert, CameraPolicy::default().prefer_gpu_convert);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -471,6 +471,21 @@ impl SettingsPage {
 
     pub fn revert(&mut self) { self.current = self.saved.clone(); }
 
+    /// The last saved values -- what is on disk, and what `settings_store::store` writes.
+    pub fn saved(&self) -> &Settings { &self.saved }
+
+    /// Change ONE setting and treat it as saved at once, leaving every other pending edit
+    /// pending. For the controls that persist on change (the capture flash, the face
+    /// consent) rather than through the page's Save.
+    ///
+    /// These used to set `current` and call `save()`, which committed EVERY half-edited
+    /// value on the page along with them, unvalidated, and cleared the page's dirty marks
+    /// so Revert no longer knew what to revert.
+    pub fn persist_field(&mut self, f: impl Fn(&mut Settings)) {
+        f(&mut self.saved);
+        f(&mut self.current);
+    }
+
     /// Validate before saving. Returns the problems, empty when fine.
     ///
     /// Reported as a list rather than refusing at the first fault, because
@@ -542,10 +557,19 @@ impl SettingsPage {
 /// `A11yScene` keeps focus across frames by id — a position-derived id
 /// would move focus to a different control whenever a section above it
 /// grew, and this page has tabs that change length.
+/// What the user asked the page to do this frame. The page does not save itself: saving
+/// means writing the file and applying the result to the running app, which is the
+/// caller's job -- see `Snapclone::save_settings`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageAction {
+    Save,
+    Revert,
+}
+
 pub fn settings_ui(ui: &mut egui::Ui, page: &mut SettingsPage,
                    policy: &mut crate::camera_policy::CameraPolicy,
                    colors: &uikit_egui::PaletteColors,
-                   a11y: &mut uikit_egui::a11y::A11yScene) {
+                   a11y: &mut uikit_egui::a11y::A11yScene) -> Option<PageAction> {
     let dirty = page.dirty_tabs();
     ui.horizontal(|ui| {
         for t in Tab::ALL {
@@ -573,16 +597,22 @@ pub fn settings_ui(ui: &mut egui::Ui, page: &mut SettingsPage,
         }
     }
     ui.separator();
+    // ONE Save. There used to be two: this one only committed the in-memory snapshot,
+    // which cleared the dirty marks and greyed out the "Save to disk" button below it --
+    // so the natural tap lost every change on restart. Now the page reports the request
+    // and the caller writes the file.
+    let mut action = None;
     ui.horizontal(|ui| {
         // Saving with problems is refused, but the button explains itself
         // rather than being mysteriously grey.
         let can = page.is_dirty() && problems.is_empty();
-        if ui.add_enabled(can, egui::Button::new("Save")).clicked() { page.save(); }
-        if ui.add_enabled(page.is_dirty(), egui::Button::new("Revert")).clicked() { page.revert(); }
+        if ui.add_enabled(can, egui::Button::new("Save")).clicked() { action = Some(PageAction::Save); }
+        if ui.add_enabled(page.is_dirty(), egui::Button::new("Revert")).clicked() { action = Some(PageAction::Revert); }
         if page.is_dirty() {
             ui.label(egui::RichText::new("unsaved changes").color(colors.warning).small());
         }
     });
+    action
 }
 
 /// A section heading, so the four sections in a tab are visibly four sections

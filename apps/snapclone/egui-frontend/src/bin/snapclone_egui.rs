@@ -1376,7 +1376,10 @@ impl eframe::App for App {
         } else {
             (Vec::new(), None)
         };
-        let prefs = settings_kit::Prefs::default();
+        // The widget visuals follow this app's palette choice too, not only the custom
+        // painting: `apply_settings` themes egui from `prefs.palette`.
+        let mut prefs = settings_kit::Prefs::default();
+        prefs.palette = self.snap.active_palette().to_string();
         self.snap.apply_settings(ctx, &prefs);
 
         // Wall clock, not frame time. `ui()` already advances gossip, sends,

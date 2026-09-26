@@ -504,6 +504,8 @@ pub struct Snapclone {
     /// editing this mid-capture does not retune a running pipeline, matching
     /// the Qt policy's own threading rule.
     pub camera_policy: crate::camera_policy::CameraPolicy,
+    /// The tuning as last written to `camera_policy.conf`, to notice an edit.
+    camera_policy_saved: crate::camera_policy::CameraPolicy,
     /// Which cameras are known to work. Consulted before opening one.
     pub camera_health: crate::camera_policy::CameraHealth,
     /// The receive half's scheduling. Decode and the audio sink stay with the
@@ -876,7 +878,10 @@ impl Snapclone {
             glove_input: Default::default(),
             voice_field: None,
             dictated: Vec::new(),
-            camera_policy: Default::default(),
+            // From disk: the Tuning controls were edited and never written, so every
+            // launch started from the defaults.
+            camera_policy: crate::camera_policy::store::load(),
+            camera_policy_saved: crate::camera_policy::store::load(),
             camera_health: Default::default(),
             playout: Default::default(),
             sink: Default::default(),
@@ -3077,7 +3082,7 @@ impl Snapclone {
     }
 
     pub fn ui(&mut self, ui: &mut Ui, adaptive: &Adaptive) {
-        let colors = uikit_egui::palette_colors(&self.palette);
+        let colors = uikit_egui::palette_colors(self.active_palette());
         // The kit's readability floor: `.small()` is 9 pt in egui's default
         // style, under 10 pt on a phone. Measured by the layout probe test.
         uikit_egui::adaptive::apply_text_floor(ui.ctx(), adaptive);
@@ -4962,31 +4967,25 @@ impl Snapclone {
         // reading and writing CameraPolicyStore::instance() directly. Two
         // structs holding a startup timeout would disagree the first time
         // one of them was saved and the other was not.
-        crate::settings_page::settings_ui(ui, &mut self.settings,
+        let action = crate::settings_page::settings_ui(ui, &mut self.settings,
                                           &mut self.camera_policy, c, &mut self.a11y);
-        // Persist. The io error is SHOWN rather than swallowed — a Save that
-        // silently fails is the same lie as one that never wrote, and a
-        // read-only config dir is a real thing on locked-down devices.
-        if ui.add_enabled(self.settings.is_dirty(), egui::Button::new("Save to disk")).clicked() {
-            self.settings.save();
-            match crate::settings_store::store(&self.settings.current) {
-                Ok(()) => {
-                    self.settings_error = None;
-                    // Was missing entirely: Save committed the in-memory
-                    // snapshot and wrote it to disk, but never pushed the
-                    // new value into `self.palette` -- the field
-                    // `uikit_egui::palette_colors(&self.palette)` actually
-                    // renders from (populated from the SEPARATE, cross-app
-                    // `settings_kit::Prefs.palette` via `apply_settings`,
-                    // not from this page's own `General.palette` at all).
-                    // The saved file was correct; the RUNNING session kept
-                    // showing the old theme until next launch, when
-                    // `settings_store::load()` happened to repopulate
-                    // things. Reported as "no color theme applied when it
-                    // is changed." Fixed by applying it live here too.
-                    self.palette = self.settings.current.general.palette.clone();
+        match action {
+            Some(crate::settings_page::PageAction::Save) => self.save_settings(),
+            Some(crate::settings_page::PageAction::Revert) => self.settings.revert(),
+            None => {}
+        }
+        // The Tuning controls edit the live policy, outside the page's Save (see the
+        // Camera struct's doc). Written when they change -- once the finger is up, so a
+        // DragValue being dragged is one write, not sixty a second.
+        if self.camera_policy != self.camera_policy_saved && !ui.input(|i| i.pointer.any_down()) {
+            match crate::camera_policy::store::store(&self.camera_policy) {
+                Ok(()) => self.camera_policy_saved = self.camera_policy.clone(),
+                Err(e) => {
+                    self.settings_error = Some(format!("camera tuning not saved: {e}"));
+                    // Not retried every frame: the error is on screen, and the next edit
+                    // tries again.
+                    self.camera_policy_saved = self.camera_policy.clone();
                 }
-                Err(e) => self.settings_error = Some(format!("could not save: {e}")),
             }
         }
         if let Some(err) = &self.settings_error {
@@ -5210,10 +5209,45 @@ impl Snapclone {
     /// them together; a switch on a different page has already been committed
     /// by being flipped, and showing "unsaved changes" for it would be a lie
     /// about what the app is going to do.
+    /// The page's Save: validate, write the file, and apply the result to the running app.
+    ///
+    /// One function, so "saved" means all three. The page's own Save once did only the
+    /// first half (an in-memory commit), and the live theme was applied only by a second
+    /// button; either half alone reads to the user as a setting that did not stick.
+    pub fn save_settings(&mut self) {
+        let problems = self.settings.problems();
+        if !problems.is_empty() {
+            self.settings_error = Some(format!("not saved: {}", problems.join("; ")));
+            return;
+        }
+        if !self.settings.save() {
+            return;
+        }
+        match crate::settings_store::store(self.settings.saved()) {
+            Ok(()) => self.settings_error = None,
+            // SHOWN, not swallowed -- a read-only config dir is a real thing on
+            // locked-down devices, and a Save that silently fails is the same lie as
+            // one that never wrote.
+            Err(e) => self.settings_error = Some(format!("could not save: {e}")),
+        }
+    }
+
+    /// The palette the app draws with: this app's own choice (Settings > General >
+    /// palette, live while it is being picked, so the picker previews), else the
+    /// cross-app `settings_kit` palette.
+    ///
+    /// The frame loop calls `apply_settings` with the cross-app prefs EVERY frame, which
+    /// overwrote `self.palette`; the page's choice survived one frame after Save and was
+    /// never loaded at startup, so a saved theme was on disk and never on screen.
+    pub fn active_palette(&self) -> &str {
+        let own = &self.settings.current.general.palette;
+        if own.is_empty() { &self.palette } else { own }
+    }
+
     pub fn set_capture_flash_bright(&mut self, on: bool) {
-        self.settings.current.camera.capture_flash_bright = on;
-        self.settings.save();
-        if let Err(e) = crate::settings_store::store(&self.settings.current) {
+        // This one setting, saved now; any other pending page edit stays pending.
+        self.settings.persist_field(|s| s.camera.capture_flash_bright = on);
+        if let Err(e) = crate::settings_store::store(self.settings.saved()) {
             // Said, not swallowed. A preference that silently does not stick
             // is the failure this whole path exists to prevent.
             self.shutter_note = format!("setting not saved — {e}");
@@ -5224,9 +5258,9 @@ impl Snapclone {
         self.face_consent = c;
         // Persisted on change, same rule as the flash: a phone app is killed
         // rather than closed, so a shutdown-path write never happens.
-        self.settings.current.camera.face_consent = c.as_key().to_string();
-        self.settings.save();
-        if let Err(e) = crate::settings_store::store(&self.settings.current) {
+        let key = c.as_key().to_string();
+        self.settings.persist_field(|s| s.camera.face_consent = key.clone());
+        if let Err(e) = crate::settings_store::store(self.settings.saved()) {
             self.shutter_note = format!("consent not saved — {e}");
         }
         c.owes_erase()

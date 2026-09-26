@@ -64,10 +64,42 @@ pub fn load_or(app: &str, file: &str, default: &str) -> String {
     load(app, file).unwrap_or_else(|| default.to_string())
 }
 
-/// Write `<config_dir>/<file>`, creating the directory first.
+/// Write `<config_dir>/<file>`, creating the directory first. Atomic: see [`write_atomic`].
 pub fn save(app: &str, file: &str, contents: &str) -> std::io::Result<()> {
     let d = ensure_config_dir(app)?;
-    std::fs::write(d.join(file), contents)
+    write_atomic(&d.join(file), contents)
+}
+
+/// Replace `path` with `contents` so a reader sees the old file or the new one, never a
+/// torn one.
+///
+/// `std::fs::write` truncates and then writes. A process killed in between -- which on a
+/// phone is how apps END, not an accident -- leaves an empty or half-written config, and
+/// every loader here treats unreadable keys as defaults: the user's settings silently
+/// reset. So: write a sibling temp file, flush it to disk, rename it over the target
+/// (atomic within a directory on POSIX), then sync the directory so the rename itself
+/// survives a power cut.
+pub fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        // Best effort: not every filesystem lets a directory be opened for sync.
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// A parsed minimal config: `[section]` headers and `key = value` lines. Values are
@@ -116,10 +148,19 @@ impl Ini {
 }
 
 fn strip_comment(line: &str) -> &str {
-    // only strip comments that aren't inside quotes; simple heuristic good enough for flat configs
+    // Only strip comments that aren't inside quotes. A backslash inside quotes escapes the
+    // next character, so `"say \"hi\" #1"` stays one value: without that, an escaped quote
+    // flipped the state and the `#` after it cut the value off. Escapes are NOT decoded
+    // here -- a caller that writes them decodes them.
     let mut in_q = false;
+    let mut escaped = false;
     for (i, c) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
         match c {
+            '\\' if in_q => escaped = true,
             '"' => in_q = !in_q,
             '#' | ';' if !in_q => return &line[..i],
             _ => {}
@@ -178,6 +219,36 @@ lang = en";
         assert_eq!(ini.get("audio", "gain"), Some("0.8"));
         assert_eq!(ini.get("voice", "lang"), Some("en"));
         assert_eq!(ini.get("audio", "missing"), None);
+    }
+
+    #[test]
+    fn a_quoted_value_keeps_hash_semicolon_and_escaped_quotes() {
+        let ini = Ini::parse("name = \"Ada #1; \\\"the\\\" one\"  # real comment\nx = 1");
+        assert_eq!(ini.top("name"), Some("Ada #1; \\\"the\\\" one"), "escapes are kept for the caller to decode");
+        assert_eq!(ini.top("x"), Some("1"));
+        // Unquoted, # still starts a comment -- unchanged for every existing file.
+        assert_eq!(Ini::parse("y = a # b").top("y"), Some("a"));
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("config-kit-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("settings.conf");
+        write_atomic(&p, "a = 1\n").unwrap();
+        write_atomic(&p, "a = 2\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a = 2\n");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp.")).collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        // A failed write (target is a directory) leaves the temp file cleaned up too.
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(write_atomic(&sub, "x").is_err());
+        let leftovers = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp.")).count();
+        assert_eq!(leftovers, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
