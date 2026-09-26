@@ -231,6 +231,9 @@ pub struct DuelMemory {
     pub hits_taken: u16,
     /// Swings a feint drew that hit nothing. Raises feint preference.
     pub whiffs_baited: u16,
+    /// Blows from a weapon coming back to the player's hand. Teaches it that
+    /// an empty hand is not an unarmed player.
+    pub returning_hits: u16,
 }
 
 /// Seconds for remembered pain to halve.
@@ -238,7 +241,7 @@ pub const PAIN_HALF_LIFE: f32 = 25.0;
 
 impl DuelMemory {
     pub const fn new() -> DuelMemory {
-        DuelMemory { pain: [0.0; NUM_ELEMENTS], pain_plain: 0.0, reach_seen: 0.0, hits_taken: 0, whiffs_baited: 0 }
+        DuelMemory { pain: [0.0; NUM_ELEMENTS], pain_plain: 0.0, reach_seen: 0.0, hits_taken: 0, whiffs_baited: 0, returning_hits: 0 }
     }
 
     /// Record a landed blow: `dmg` against `max_hp`, from `dist` away.
@@ -399,9 +402,18 @@ pub struct DuelSenses {
     /// YOU cannot see IT (its smoke, terrain between) -- the shell computes
     /// this with the same Beer-Lambert model as the dragon's eyes.
     pub hidden: bool,
+    /// The dragon's own position on the ground plane (x, z), for keeping its
+    /// belief of where you are in world space.
+    pub self_xz: [f32; 2],
     /// World yaw you face (from your view). Only trusted while it can see you;
     /// out of sight it uses the last facing it saw.
     pub player_yaw: f32,
+    /// The player's weapon is out of their hand (thrown, or standing guard).
+    /// Only acted on while it can see you.
+    pub disarmed: bool,
+    /// Seconds until a blow the player is winding up lands (`None` = not
+    /// attacking). A slow wind-up it can see is something it can read.
+    pub winding: Option<f32>,
 }
 
 /// A bending option, summarised for the tactical choice.
@@ -461,7 +473,11 @@ pub struct DuelState {
     /// Where it last knew you to be (distance, world yaw), refreshed by sight
     /// or by a lead. While it cannot see you mid-fight, it fights THIS, not
     /// your true position.
-    pub belief: Option<(f32, f32)>,
+    /// Where it believes you are, as a WORLD position (x, z) -- so its own
+    /// movement is accounted for. (Was a (distance, yaw) pair relative to the
+    /// dragon: a soak caught a hurt dragon "falling back" 70 m, because the
+    /// remembered player moved with it and the wanted distance never arrived.)
+    pub belief: Option<[f32; 2]>,
     /// Seconds without sight of you.
     pub unseen_for: f32,
     /// The way you were facing when it last saw you.
@@ -585,20 +601,25 @@ pub fn lose_time(cunning: f32) -> f32 {
 fn believed(st: &mut DuelState, s: &DuelSenses, dt: f32) -> DuelSenses {
     if s.can_see {
         st.unseen_for = 0.0;
-        st.belief = Some((s.dist, s.to_player_yaw));
+        st.belief = Some([
+            s.self_xz[0] + s.dist.min(1e4) * s.to_player_yaw.cos(),
+            s.self_xz[1] + s.dist.min(1e4) * s.to_player_yaw.sin(),
+        ]);
         st.last_player_yaw = s.player_yaw;
         return *s;
     }
     st.unseen_for += dt;
     if let Some(l) = s.lead.filter(|l| l.heading.is_finite()) {
-        let d = l.est_dist.filter(|d| d.is_finite()).or(st.belief.map(|b| b.0)).unwrap_or(ENGAGE_BASE);
-        st.belief = Some((d, l.heading));
+        let old = st.belief.map(|b| ((b[0] - s.self_xz[0]).powi(2) + (b[1] - s.self_xz[1]).powi(2)).sqrt());
+        let d = l.est_dist.filter(|d| d.is_finite()).or(old).unwrap_or(ENGAGE_BASE);
+        st.belief = Some([s.self_xz[0] + d * l.heading.cos(), s.self_xz[1] + d * l.heading.sin()]);
     }
     let mut b = *s;
     match st.belief {
-        Some((d, yaw)) => {
-            b.dist = d;
-            b.to_player_yaw = yaw;
+        Some(p) => {
+            let (dx, dz) = (p[0] - s.self_xz[0], p[1] - s.self_xz[1]);
+            b.dist = (dx * dx + dz * dz).sqrt();
+            b.to_player_yaw = dz.atan2(dx);
         }
         None => {
             b.dist = f32::MAX;
@@ -660,9 +681,16 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
     // ── what the player's item means to *this* dragon ─────────────────────
     let item = s.item.unwrap_or(ItemThreat::BARE_HANDS);
     let counter = item.element.map_or(1.0, |e| elemental_multiplier::multiplier(e, p.element));
+    // An empty hand it can see: your weapon is out there somewhere. Until a
+    // weapon coming home has hit it, that reads as an opening; after, a cunning
+    // dragon knows better.
+    let wary = (st.mem.returning_hits as f32 * 0.6 * (0.4 + cunning)).min(1.0);
+    let disarmed = s.disarmed && s.can_see;
     // A cunning dragon respects the longest reach it has been hit from, even
-    // if the player has switched to something shorter.
-    let respect_reach = item.reach.max(st.mem.reach_seen * cunning);
+    // if the player has switched to something shorter -- unless the hand is
+    // empty and it has not learned what that means.
+    let remembered = st.mem.reach_seen * cunning * if disarmed { wary } else { 1.0 };
+    let respect_reach = item.reach.max(remembered);
     let safe_gap = s.body_radius.max(0.5) + respect_reach + 1.5;
     let lunge_range = s.body_radius.max(0.5) + LUNGE_REACH;
     // Pain from the element in hand matters more than pain in general.
@@ -673,7 +701,12 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
         - (counter - 1.0) * 0.35 * (0.3 + cunning)
         - pain_now * 1.5 * cunning
         - st.mem.total_pain() * 0.4
-        + (1.0 - c01(s.player_vitality01)) * 0.4;
+        + (1.0 - c01(s.player_vitality01)) * 0.4
+        + if disarmed { 0.45 * (1.0 - wary) } else { 0.0 };
+    // A slow blow it can see coming, from close enough to land.
+    let reading = s.can_see
+        && s.winding.map_or(false, |w| w.is_finite() && w > 0.3)
+        && dist < s.body_radius.max(0.5) + item.reach + 2.5;
 
     let dread_out = if st.engaged {
         dread * c01(1.0 - dist / DREAD_RADIUS) * if st.tactic == Tactic::Stalk { 0.3 } else { 1.0 }
@@ -740,7 +773,12 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
 
     let mut score = [(Tactic::Stalk, f32::MIN); 8];
     score[0] = (Tactic::Stalk, if !watched && dist > lunge_range { 0.4 + 0.4 * cunning } else { -1.0 });
-    score[1] = (Tactic::Circle, if watched { 0.35 + 0.3 * cunning - boldness * 0.2 } else { 0.1 });
+    score[1] = (
+        Tactic::Circle,
+        (if watched { 0.35 + 0.3 * cunning - boldness * 0.2 } else { 0.1 })
+            // Reading the wind-up: step out of the arc and let it fall short.
+            + if reading { 0.9 * cunning } else { 0.0 },
+    );
     score[2] = (
         Tactic::Feint,
         if cunning > 0.45 && watched && dist < safe_gap + 5.0 && st.lunge_cd <= 0.0 {
@@ -766,6 +804,8 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
             // Lunging at a player who is facing it is lunging onto the weapon.
             boldness + if flanked { 0.4 } else if watched { -0.35 } else { 0.0 }
                 + if st.opening > 0.0 { 0.8 } else { 0.0 }
+                // A bold dragon punishes a long wind-up by going in under it.
+                + if reading && boldness > 0.6 { 0.5 } else { 0.0 }
         } else {
             -1.0
         },
@@ -916,7 +956,7 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
             if changed && !s.cast.map_or(false, |c| c.busy) {
                 begin_cast = Some(defend);
             }
-            (toward, 0.1, if defend { "raising the land between you" } else { "gathering its bending" })
+            (toward, 0.1, if defend { "putting cover between you" } else { "gathering its bending" })
         }
         Tactic::Reposition => {
             let want = if hurt { safe_gap + 10.0 } else { safe_gap + 2.0 };
@@ -924,9 +964,15 @@ pub fn step(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, tune: DuelTunin
             // Go round the way that reaches your back soonest.
             let dir = if around < 0.0 { 1.0 } else { -1.0 };
             let h = toward - dir * (FRAC_PI_2 - radial * 0.7);
-            (h, 0.8, if hurt { "falling back into the smoke" } else { "slipping round behind you in the smoke" })
+            (h, 0.8, if hurt { "falling back out of your sight" } else { "slipping round behind you unseen" })
         }
         Tactic::Unaware | Tactic::Track => (s.self_yaw, 0.0, "not engaged"),
+    };
+    let reason = match st.tactic {
+        Tactic::Lunge | Tactic::Stalk | Tactic::Feint if disarmed && wary < 0.5 => "your hands are empty: it closes",
+        Tactic::Circle if reading => "reading your wind-up: out of the arc",
+        Tactic::Lunge if reading => "going in under your wind-up",
+        _ => reason,
     };
 
     DuelOut {
@@ -1037,7 +1083,10 @@ pub fn senses_for(
         lead: None,
         cast: None,
         hidden: false,
+        self_xz: [body.pos[0], body.pos[2]],
         player_yaw: player.forward[2].atan2(player.forward[0]),
+        disarmed: false,
+        winding: None,
     }
 }
 
@@ -1103,17 +1152,50 @@ pub fn swing_touches(body: &DragonBody, eye: [f32; 3], dir: [f32; 3], reach: f32
     (lat_h < r && lat_v < body.half_extents[1].max(0.5) + 0.3).then_some(along)
 }
 
+/// How a blow arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// A swing from the hand.
+    Melee,
+    /// A thrown weapon on its way out.
+    Thrown,
+    /// A thrown weapon on its way back to the hand (a recalled axe, the
+    /// chain-knife's chain, the Flying Sword's guard).
+    Returning,
+}
+
 /// A landed blow, end to end: zone, damage, and what the dragon learns.
 pub fn take_hit(p: &DuelProfile, st: &mut DuelState, body: &DragonBody, eye: [f32; 3], item: &ItemThreat) -> (HitZone, ItemHit) {
-    let zone = hit_zone(body.pos, body.yaw, body.half_extents[1], body.radius(), eye);
+    take_hit_from(p, st, body, eye, eye, item, Delivery::Melee)
+}
+
+/// A landed blow that may not have come from the hand: the zone is the side
+/// `strike_from` arrived on, while the reach it learns and where it believes
+/// you are come from `thrower` (a thrown axe tells it the direction you threw
+/// from and how far; it does not tell it where you went next).
+pub fn take_hit_from(
+    p: &DuelProfile,
+    st: &mut DuelState,
+    body: &DragonBody,
+    strike_from: [f32; 3],
+    thrower: [f32; 3],
+    item: &ItemThreat,
+    delivery: Delivery,
+) -> (HitZone, ItemHit) {
+    let eye = thrower;
+    let zone = hit_zone(body.pos, body.yaw, body.half_extents[1], body.radius(), strike_from);
     let h = resolve_item_hit(p, item, zone);
+    if delivery == Delivery::Returning {
+        st.mem.returning_hits = st.mem.returning_hits.saturating_add(1);
+    }
     let from = ((eye[0] - body.pos[0]).powi(2) + (eye[1] - body.pos[1]).powi(2) + (eye[2] - body.pos[2]).powi(2)).sqrt();
     // What the dragon remembers is how far from its BODY you hit it, not from
     // its centre: a spear jab and a dagger stab at a big dragon differ by the
     // weapon, not by the dragon's size.
     st.mem.learn_hit(item.element, h.damage, p.max_hp, (from - body.radius()).max(0.0));
     // A blow tells it where you are, even if it never saw you.
-    st.belief = Some((from, (eye[2] - body.pos[2]).atan2(eye[0] - body.pos[0])));
+    let _ = from;
+    st.belief = Some([eye[0], eye[2]]);
     st.unseen_for = 0.0;
     (zone, h)
 }
@@ -1141,13 +1223,102 @@ mod tests {
             lead: None,
             cast: None,
             hidden: false,
+            self_xz: [0.0, 0.0],
             player_yaw: PI, // at +x from the dragon, facing it
+            disarmed: false,
+            winding: None,
         }
     }
 
     fn run(st: &mut DuelState, p: &DuelProfile, s: &DuelSenses, t: DuelTuning, secs: f32) -> Vec<DuelOut> {
         let n = (secs / 0.05) as usize;
         (0..n).map(|_| step(st, p, s, t, 0.05)).collect()
+    }
+
+    fn duel_once(p: &DuelProfile, st: &mut DuelState, s: &DuelSenses) -> DuelOut {
+        step(st, p, s, DuelTuning::default(), 0.05)
+    }
+
+    #[test]
+    fn an_empty_hand_is_an_opening_until_the_weapon_comes_back_at_it() {
+        let mut p = DuelProfile::from_genome(&genome(2));
+        p.cunning = 0.3;
+        let mut s = senses(8.0);
+        s.item = Some(ItemThreat::BARE_HANDS);
+        let fresh = || {
+            let mut st = DuelState::new(1);
+            st.mem.reach_seen = 15.0; // it was hit by a throw from 15 m
+            st
+        };
+        let armed = duel_once(&p, &mut fresh(), &s);
+        s.disarmed = true;
+        let open = duel_once(&p, &mut fresh(), &s);
+        assert!(open.why.boldness > armed.why.boldness + 0.4, "{} vs {}", open.why.boldness, armed.why.boldness);
+        assert!(open.why.respect_reach < 1.5 && armed.why.respect_reach > 4.0, "{} vs {}", open.why.respect_reach, armed.why.respect_reach);
+        // Out of sight, an empty hand means nothing to it.
+        s.can_see = false;
+        let unseen = duel_once(&p, &mut fresh(), &s);
+        assert!(unseen.why.boldness < open.why.boldness - 0.4);
+        // Hit twice by a weapon coming home, a cunning dragon has learned.
+        s.can_see = true;
+        p.cunning = 0.8;
+        let mut st = fresh();
+        st.mem.returning_hits = 2;
+        let learned = duel_once(&p, &mut st, &s);
+        let mut st = fresh();
+        st.mem.returning_hits = 2;
+        let mut armed_s = s;
+        armed_s.disarmed = false;
+        let learned_armed = duel_once(&p, &mut st, &armed_s);
+        assert!((learned.why.boldness - learned_armed.why.boldness).abs() < 0.05);
+        assert!((learned.why.respect_reach - 12.0).abs() < 0.5, "{}", learned.why.respect_reach);
+    }
+
+    #[test]
+    fn a_cunning_dragon_reads_a_slow_wind_up() {
+        let mut p = DuelProfile::from_genome(&genome(1));
+        p.cunning = 0.9;
+        let mut s = senses(4.0);
+        s.item = Some(ItemThreat { element: None, damage: 30.0, reach: 1.5 });
+        let calm = duel_once(&p, &mut DuelState::new(3), &s);
+        s.winding = Some(0.7);
+        let read = duel_once(&p, &mut DuelState::new(3), &s);
+        let d = read.score(Tactic::Circle) - calm.score(Tactic::Circle);
+        assert!((d - 0.81).abs() < 0.05, "circle +{d}");
+        // A quick jab gives nothing to read, nor does a wind-up it cannot see.
+        s.winding = Some(0.2);
+        let jab = duel_once(&p, &mut DuelState::new(3), &s);
+        assert!((jab.score(Tactic::Circle) - calm.score(Tactic::Circle)).abs() < 1e-4);
+        s.winding = Some(0.7);
+        s.dist = 30.0;
+        let far = duel_once(&p, &mut DuelState::new(3), &s);
+        let mut far_calm_s = s;
+        far_calm_s.winding = None;
+        let far_calm = duel_once(&p, &mut DuelState::new(3), &far_calm_s);
+        assert!((far.score(Tactic::Circle) - far_calm.score(Tactic::Circle)).abs() < 1e-4, "out of range");
+    }
+
+    #[test]
+    fn a_thrown_blow_lands_where_it_arrived_and_teaches_the_throwers_reach() {
+        let p = DuelProfile::from_genome(&genome(3));
+        let body = DragonBody { pos: [0.0, 10.0, 0.0], yaw: 0.0, half_extents: [3.0, 2.0, 3.0] };
+        let item = ItemThreat { element: None, damage: 20.0, reach: 1.2 };
+        let thrower = [15.0, 10.0, 0.0];
+        let mut st = DuelState::new(1);
+        // Arrived from behind it (-x is its rear with yaw 0), thrown from in front.
+        let (zone, _) = take_hit_from(&p, &mut st, &body, [-4.0, 10.0, 0.0], thrower, &item, Delivery::Thrown);
+        assert_eq!(zone, HitZone::Rear);
+        assert!((st.mem.reach_seen - (15.0 - body.radius())).abs() < 0.01);
+        assert_eq!(st.belief, Some([15.0, 0.0]));
+        assert_eq!(st.mem.returning_hits, 0);
+        take_hit_from(&p, &mut st, &body, [4.0, 10.0, 0.0], thrower, &item, Delivery::Returning);
+        assert_eq!(st.mem.returning_hits, 1);
+        // A melee blow is the old path exactly.
+        let mut a = DuelState::new(9);
+        let mut b = DuelState::new(9);
+        let eye = [3.5, 10.0, 1.0];
+        assert_eq!(take_hit(&p, &mut a, &body, eye, &item), take_hit_from(&p, &mut b, &body, eye, eye, &item, Delivery::Melee));
+        assert_eq!(a, b);
     }
 
     #[test]
@@ -1245,7 +1416,8 @@ mod tests {
         let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
         assert!(st.engaged);
         assert_ne!(o.tactic, Tactic::Unaware);
-        let (_, yaw) = st.belief.unwrap();
+        let b = st.belief.unwrap();
+        let yaw = (b[1] - body.pos[2]).atan2(b[0] - body.pos[0]);
         assert!((yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-3, "turns toward the blow: {yaw}");
     }
 
@@ -1326,7 +1498,10 @@ mod tests {
                 lead: None,
                 cast: None,
                 hidden: false,
+                self_xz: [x, z],
                 player_yaw: pyaw,
+                disarmed: false,
+                winding: None,
             };
             let o = step(st, p, &s, DuelTuning::default(), dt);
             let e = wrap(o.heading - yaw);
@@ -1908,7 +2083,8 @@ mod tests {
             assert_eq!(o.tactic, Tactic::Stalk);
             assert!(wrap(o.heading - 0.3).abs() < 0.05, "heading {} is not the belief", o.heading);
         }
-        assert_eq!(st.belief, Some((20.0, 0.3)));
+        let b = st.belief.unwrap();
+        assert!((b[0] - 20.0 * 0.3f32.cos()).abs() < 1e-3 && (b[1] - 20.0 * 0.3f32.sin()).abs() < 1e-3);
     }
 
     #[test]
@@ -1933,6 +2109,22 @@ mod tests {
     }
 
     #[test]
+    fn the_belief_stays_put_in_the_world_while_it_moves() {
+        // Regression (soak): a hurt dragon falling back never reached its
+        // wanted distance, because the remembered player moved with it.
+        let mut st = DuelState::new(0);
+        let mut s = senses(20.0);
+        s.self_xz = [0.0, 0.0];
+        s.to_player_yaw = 0.0; // you at (20, 0)
+        believed(&mut st, &s, 0.05);
+        s.can_see = false;
+        s.self_xz = [-30.0, 0.0]; // it backed off 30 m
+        let b = believed(&mut st, &s, 0.05);
+        assert!((b.dist - 50.0).abs() < 1e-3, "believed {}", b.dist);
+        assert!(b.to_player_yaw.abs() < 1e-3);
+    }
+
+    #[test]
     fn a_lead_mid_fight_updates_the_belief() {
         let p = DuelProfile::from_genome(&genome(2));
         let mut st = DuelState::new(1);
@@ -1944,7 +2136,8 @@ mod tests {
             step(&mut st, &p, &hid, DuelTuning::default(), 0.1);
         }
         assert!(st.engaged, "a live lead keeps it in the fight");
-        assert_eq!(st.belief, Some((30.0, 1.2)));
+        let b = st.belief.unwrap();
+        assert!((b[0] - 30.0 * 1.2f32.cos()).abs() < 1e-3 && (b[1] - 30.0 * 1.2f32.sin()).abs() < 1e-3);
     }
 
     #[test]
@@ -1987,7 +2180,7 @@ mod tests {
         let o = step(&mut st, &p, &s, DuelTuning::default(), 0.05);
         assert_eq!(o.tactic, Tactic::Cast);
         assert_eq!(o.begin_cast, Some(true), "defensive");
-        assert_eq!(o.why.reason, "raising the land between you");
+        assert_eq!(o.why.reason, "putting cover between you");
         // Healthy and facing a neutral item: offence instead.
         let mut st2 = DuelState::new(1);
         st2.fuel = 0.0;
@@ -2008,6 +2201,7 @@ mod tests {
         let mut st = DuelState::new(2);
         // It saw you once at 15 m, in front of you (you face +x, it is at +x).
         let mut s0 = senses(15.0);
+        s0.self_xz = [15.0, 0.0];
         s0.to_player_yaw = PI;
         s0.player_yaw = 0.0;
         step(&mut st, &p, &s0, DuelTuning::default(), 0.05);
@@ -2020,6 +2214,7 @@ mod tests {
             min_d = min_d.min(d);
             let toward = (-z).atan2(-x);
             let mut s = senses(d);
+            s.self_xz = [x, z];
             s.can_see = !hidden;
             s.hidden = hidden;
             s.self_yaw = yaw;
@@ -2093,7 +2288,7 @@ mod tests {
     fn hurt_and_unseen_it_opens_distance_instead_of_pressing() {
         let (outs, _, min_d) = smoke_bout(true, 0.45, 12.0);
         assert!(outs.iter().filter(|o| o.tactic == Tactic::Reposition).count() > outs.len() / 2);
-        assert!(outs.iter().any(|o| o.why.reason == "falling back into the smoke"));
+        assert!(outs.iter().any(|o| o.why.reason == "falling back out of your sight"));
         assert!(!outs.iter().any(|o| o.bite), "hurt, it does not press in");
         assert!(min_d > 8.0, "came within {min_d:.1} m");
     }

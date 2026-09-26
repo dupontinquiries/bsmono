@@ -76,6 +76,21 @@ impl EntityPipeline {
         mem_props: vk::PhysicalDeviceMemoryProperties,
         frames_in_flight: usize,
     ) -> Result<Self, vk::Result> {
+        Self::new_with(device, render_pass, camera_set_layout, mem_props, frames_in_flight, true)
+    }
+
+    /// `depth_write = false` makes an EFFECTS pipeline: same shaders, vertex
+    /// format and blending, depth-tested against the world but not writing
+    /// depth, so overlapping translucent effects (dragon smoke wisps) blend
+    /// through each other instead of the nearest one hiding the rest.
+    pub fn new_with(
+        device: &Device,
+        render_pass: vk::RenderPass,
+        camera_set_layout: vk::DescriptorSetLayout,
+        mem_props: vk::PhysicalDeviceMemoryProperties,
+        frames_in_flight: usize,
+        depth_write: bool,
+    ) -> Result<Self, vk::Result> {
         let vert_module = create_shader_module(device, VERT_SPV)?;
         let frag_module = create_shader_module(device, FRAG_SPV)?;
         let entry = unsafe { CStr::from_bytes_with_nul_unchecked(b"main\0") };
@@ -130,7 +145,7 @@ impl EntityPipeline {
         // Depth like chunks so entities occlude / are occluded by the world.
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::builder()
             .depth_test_enable(true)
-            .depth_write_enable(true)
+            .depth_write_enable(depth_write)
             .depth_compare_op(vk::CompareOp::LESS)
             .depth_bounds_test_enable(false)
             .stencil_test_enable(false);

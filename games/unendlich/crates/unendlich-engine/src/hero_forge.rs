@@ -596,12 +596,19 @@ pub struct HeroPose {
     /// hangs (`HeroAnchors::garments`) so the caller can drape a `sim::garment`
     /// there. false = the static boxes, exactly as before.
     pub cloth_garments: bool,
+    /// The weapon's own move (`sim::weapon_motion`): wind-up, blow and
+    /// follow-through deltas for the right arm and torso, sampled from the same
+    /// timeline as the first-person viewmodel. Zero = no attack in progress.
+    /// Adds on top of `swing01` (callers use one or the other).
+    pub arm: crate::sim::weapon_motion::ArmPose,
 }
 
 impl Default for HeroPose {
     fn default() -> Self {
         HeroPose { yaw: 0.0, gaze_pitch: 0.0, walk_phase: 0.0, walk_amp: 0.0, anim_t: 0.0, held_color: None, held: None,
-            airborne: 0.0, vertical_vel: 0.0, land_crouch: 0.0, flight01: 0.0, bank: 0.0, swing01: 0.0, fp_carry01: 0.0, cloth_garments: false }
+            airborne: 0.0, vertical_vel: 0.0, land_crouch: 0.0, flight01: 0.0, bank: 0.0, swing01: 0.0,
+            fp_carry01: 0.0, cloth_garments: false,
+            arm: crate::sim::weapon_motion::ArmPose::default() }
     }
 }
 
@@ -893,6 +900,20 @@ pub fn build_rigged(
         rot[ITEM_EL][0] -= 0.90 * swing;  // elbow follows through
         rot[CHEST][1] -= 0.15 * swing; // torso twists into the swing
     }
+    // The weapon's move: the right arm carries it, the torso turns and leans
+    // into the blow. While a move is on, the walk's counter-swing of that arm
+    // fades out so a chop mid-stride still reads as a chop.
+    let a = pose.arm;
+    let busy = (a.sh_pitch.abs() + a.elbow.abs() + a.sh_roll.abs() + a.wrist.abs()).min(1.0);
+    if busy > 0.001 {
+        rot[SHR][0] = rot[SHR][0] * (1.0 - busy) + a.sh_pitch;
+        rot[SHR][1] += a.sh_yaw;
+        rot[SHR][2] += a.sh_roll;
+        rot[ELR][0] += a.elbow;
+        rot[HAR][0] += a.wrist;
+        rot[CHEST][1] += a.chest_twist;
+        rot[CHEST][0] += a.chest_lean;
+    }
 
     let base_y = 0.0; // feet auto-grounded at finalize
     let world = rig_world(&dim, base_y, &rot);
@@ -900,7 +921,17 @@ pub fn build_rigged(
     let mut body = Body::new(pose.yaw);
     build_body(&mut body, &world, &dim, &col);
     let anatomy_verts = body.verts.len();
-    dress(kind, &mut body, &world, &dim, &col, pose);
+    // A weapon in the right hand replaces the hero's signature piece there
+    // (lantern, rod, trident, tome): a hand holds one thing. Collapsing the
+    // hand's frame to a point makes those boxes degenerate, so `dress` itself
+    // stays one list of parts per hero.
+    if pose.held.is_some() || pose.held_color.is_some() {
+        let mut busy = world;
+        busy[HAR] = Xf { r: [[0.0; 3]; 3], t: world[HAR].t };
+        dress(kind, &mut body, &busy, &dim, &col, pose);
+    } else {
+        dress(kind, &mut body, &world, &dim, &col, pose);
+    }
 
     // held item in the right hand (engine forward +X of the hand), tracks the arm.
     // r-item-models: a full item model when the caller has one (blade, guard,

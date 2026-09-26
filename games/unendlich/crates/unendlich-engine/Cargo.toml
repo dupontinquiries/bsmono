@@ -187,6 +187,10 @@ path = "src/bin/roar_render.rs"
 required-features = ["audio"]
 
 [[bin]]
+name = "hand-pose-sheet"
+path = "src/bin/hand_pose_sheet.rs"
+
+[[bin]]
 name = "world-bench"
 path = "src/bin/world_bench.rs"
 
