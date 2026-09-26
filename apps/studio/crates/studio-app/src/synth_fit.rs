@@ -319,3 +319,100 @@ mod tests {
         assert!(profile_error_db(&a, &c) < 1.0, "a harmonic at the -40 dB floor in both is a match");
     }
 }
+
+/// The complex DFT of `v` at frequency `f` (re, im) -- per channel, so the
+/// SIDE (L - R) can be told from the MID.
+pub fn dft(v: &[f32], f: f32, rate: f32) -> (f32, f32) {
+    let w = std::f32::consts::TAU * f / rate;
+    let (mut re, mut im) = (0.0f32, 0.0f32);
+    for (n, x) in v.iter().enumerate() { let a = w * n as f32; re += x * a.cos(); im -= x * a.sin(); }
+    (re / v.len().max(1) as f32, im / v.len().max(1) as f32)
+}
+
+/// A channel's stereo IMAGE, measured at its notes' clear harmonics.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Image {
+    /// -1 (left) ..= 1 (right): the mean balance.
+    pub pan: f32,
+    /// |side| / |mid| above and below 250 Hz (0 = mono; 1 = as much side as mid).
+    pub width_high: f32,
+    pub width_low: f32,
+    /// Mean |pan change| from a note's first half to its second: TRAVEL.
+    pub travel: f32,
+    /// Pan per octave from middle C (least squares over the notes).
+    pub key_pan: f32,
+    pub notes: usize,
+}
+
+/// Measure the image from stereo windows (left, right, rate, pitch, others).
+pub fn stereo_image(windows: &[(Vec<f32>, Vec<f32>, u32, f32, Vec<f32>)]) -> Option<Image> {
+    let (mut pans, mut octs, mut travel) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut sh, mut mh, mut sl, mut ml) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for (l, r, rate, hz, others) in windows {
+        let skip = (*rate as usize * 6 / 100).min(l.len());
+        let (l, r) = (&l[skip..], &r[skip..r.len().min(l.len() + skip)]);
+        if l.len() < *rate as usize / 10 { continue; }
+        let half = l.len() / 2;
+        let bal = |a: &[f32], b: &[f32]| -> Option<f32> {
+            let (mut el, mut er) = (0.0f32, 0.0f32);
+            for k in 1..=8 {
+                let f = hz * k as f32;
+                if f >= 0.45 * *rate as f32 || !clear_of(f, others, 0.015) { continue; }
+                let (x, y) = (dft(a, f, *rate as f32), dft(b, f, *rate as f32));
+                el += x.0 * x.0 + x.1 * x.1; er += y.0 * y.0 + y.1 * y.1;
+            }
+            (el + er > 1e-12).then(|| (er - el) / (er + el))
+        };
+        let Some(p) = bal(l, r) else { continue };
+        if let (Some(a), Some(b)) = (bal(&l[..half], &r[..half]), bal(&l[half..], &r[half..])) { travel.push((b - a).abs()); }
+        for k in 1..=8 {
+            let f = hz * k as f32;
+            if f >= 0.45 * *rate as f32 || !clear_of(f, others, 0.015) { continue; }
+            let (x, y) = (dft(l, f, *rate as f32), dft(r, f, *rate as f32));
+            let m = ((x.0 + y.0) as f64).powi(2) + ((x.1 + y.1) as f64).powi(2);
+            let s = ((x.0 - y.0) as f64).powi(2) + ((x.1 - y.1) as f64).powi(2);
+            if f < 250.0 { sl += s; ml += m; } else { sh += s; mh += m; }
+        }
+        pans.push(p);
+        octs.push((hz / 261.63).log2());
+    }
+    if pans.is_empty() { return None; }
+    let n = pans.len() as f32;
+    let (mp, mo) = (pans.iter().sum::<f32>() / n, octs.iter().sum::<f32>() / n);
+    let var: f32 = octs.iter().map(|o| (o - mo).powi(2)).sum();
+    let key_pan = if var > 0.25 { pans.iter().zip(&octs).map(|(p, o)| (p - mp) * (o - mo)).sum::<f32>() / var } else { 0.0 };
+    // all side and no mid (fully out of phase -- the artist's wide bass
+    // texture) is not "mono": capped at 100, not 0
+    let w = |s: f64, m: f64| if m > 1e-18 { ((s / m).sqrt() as f32).min(100.0) } else if s > 1e-18 { 100.0 } else { 0.0 };
+    Some(Image { pan: mp, width_high: w(sh, mh), width_low: w(sl, ml),
+                 travel: if travel.is_empty() { 0.0 } else { travel.iter().sum::<f32>() / travel.len() as f32 }, key_pan, notes: pans.len() })
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    fn tone(hz: f32, n: usize) -> Vec<f32> { (0..n).map(|i| (std::f32::consts::TAU * hz * i as f32 / 48_000.0).sin()).collect() }
+
+    /// Hard right is pan ~1 and no width; a note with an out-of-phase
+    /// (inverted) right channel is ALL side; pan rising with pitch is key_pan.
+    #[test]
+    fn pan_width_and_key_pan_are_read_from_left_and_right() {
+        let t = tone(440.0, 24_000);
+        let right = stereo_image(&[(vec![0.0; 24_000], t.clone(), 48_000, 440.0, vec![])]).unwrap();
+        assert!(right.pan > 0.95, "{right:?}");
+        let mono = stereo_image(&[(t.clone(), t.clone(), 48_000, 440.0, vec![])]).unwrap();
+        assert!(mono.pan.abs() < 0.01 && mono.width_high < 0.01, "{mono:?}");
+        let inv: Vec<f32> = t.iter().map(|x| -x).collect();
+        let wide = stereo_image(&[(t.clone(), inv, 48_000, 440.0, vec![])]).unwrap();
+        assert!(wide.width_high > 10.0, "out of phase: all side {wide:?}");
+        // three notes, an octave apart, panned -0.5, 0, +0.5 by pitch
+        let wins: Vec<_> = [(130.8f32, -0.5f32), (261.6, 0.0), (523.3, 0.5)].iter().map(|(hz, p)| {
+            let (gl, gr) = studio_live::pan_gains(*p);
+            let s = tone(*hz, 24_000);
+            (s.iter().map(|x| x * gl).collect::<Vec<f32>>(), s.iter().map(|x| x * gr).collect::<Vec<f32>>(), 48_000u32, *hz, vec![])
+        }).collect();
+        let k = stereo_image(&wins).unwrap();
+        assert!(k.key_pan > 0.3, "pan rises with pitch: {k:?}");
+    }
+}
