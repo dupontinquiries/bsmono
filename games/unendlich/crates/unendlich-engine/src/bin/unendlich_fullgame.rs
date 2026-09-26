@@ -100,6 +100,10 @@ const MESH_QUEUE_CAPACITY: usize = 64;
 /// its ecology — energy reserve, sex, species, and genome (for grazing,
 /// starvation, and mating).
 struct Roamer {
+    /// A stable identity for the roamer's lifetime (indices shift on
+    /// `swap_remove`): what a thrown weapon lodged in it, or struck it on a
+    /// leg of its flight, refers to.
+    uid: u64,
     /// r143: taming state (sim::bond_tame) — Feed/Gift raise trust, Harm
     /// tanks it; Tamed creatures follow the player.
     bond: unendlich_engine::sim::bond_tame::Bond,
@@ -494,6 +498,7 @@ fn build_roamer(kind: unendlich_engine::item::CreatureKind, pos: [f32; 3], wseed
         flying: false,
         flight_phase: (wseed % 30) as f32,
         last_tick_frame: 0,
+        uid: next_roamer_uid(),
         aggro: 0.0,
         prev_behavior: 0,
         combat_habit: 0.0,
@@ -705,6 +710,530 @@ fn legendary_element_color(element_idx: u8, tier: u8) -> [f32; 3] {
         (base[1] + boost).min(1.0),
         (base[2] + boost).min(1.0),
     ]
+}
+
+
+/// A fresh roamer id (process-unique, never reused).
+fn next_roamer_uid() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Would this roamer fight the player? Dragons always; anything provoked;
+/// never a tamed companion.
+fn roamer_hostile(r: &Roamer) -> bool {
+    r.hp > 0
+        && r.rig.dying.is_none()
+        && r.bond != unendlich_engine::sim::bond_tame::Bond::Tamed
+        && (r.duel.is_some() || r.aggro > 0.35)
+}
+
+/// A roamer's hit volume for thrown weapons: (centre, horizontal radius, half height).
+fn roamer_volume(r: &Roamer) -> ([f32; 3], f32, f32) {
+    let he = r.creature.body.half_extents;
+    let p = r.creature.body.position;
+    if r.duel.is_some() {
+        // Same body the melee test uses (dragon_duel::DragonBody::radius).
+        let body = unendlich_engine::sim::dragon_duel::DragonBody { pos: p, yaw: r.creature.yaw, half_extents: he };
+        (p, body.radius(), he[1].max(0.5))
+    } else {
+        ([p[0], p[1] + he[1] * 0.5, p[2]], he[0].max(he[2]).max(0.3), he[1].max(0.3))
+    }
+}
+
+/// The world a thrown weapon flies through: voxels from the chunk octree,
+/// bodies from the roamer list.
+struct FgArena<'a> {
+    chunks: &'a ChunkManager,
+    roamers: &'a [Roamer],
+}
+
+impl unendlich_engine::sim::thrown_weapon::Arena for FgArena<'_> {
+    fn solid(&self, a: [f32; 3], b: [f32; 3]) -> Option<(f32, [f32; 3])> {
+        let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if !(len > 1e-5) {
+            return None;
+        }
+        let hit = self.chunks.raycast_octree(a, d, len, |b| b.is_solid())?;
+        Some(((hit.t / len).clamp(0.0, 1.0), [hit.normal.0 as f32, hit.normal.1 as f32, hit.normal.2 as f32]))
+    }
+    fn creature(&self, a: [f32; 3], b: [f32; 3], pad: f32, skip: &[u64]) -> Option<(u64, f32)> {
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let l2 = (ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2]).max(1e-9);
+        let mut best: Option<(u64, f32)> = None;
+        for r in self.roamers {
+            if r.hp <= 0 || r.rig.dying.is_some() || skip.contains(&r.uid) {
+                continue;
+            }
+            let (c, rad, hh) = roamer_volume(r);
+            let f = (((c[0] - a[0]) * ab[0] + (c[1] - a[1]) * ab[1] + (c[2] - a[2]) * ab[2]) / l2).clamp(0.0, 1.0);
+            let p = [a[0] + ab[0] * f, a[1] + ab[1] * f, a[2] + ab[2] * f];
+            // A vertical capsule: radius sideways, half height up and down.
+            let horiz = ((p[0] - c[0]).powi(2) + (p[2] - c[2]).powi(2)).sqrt();
+            if horiz <= rad + pad && (p[1] - c[1]).abs() <= hh + pad && best.map_or(true, |(_, bf)| f < bf) {
+                best = Some((r.uid, f));
+            }
+        }
+        best
+    }
+    fn position_of(&self, id: u64) -> Option<[f32; 3]> {
+        self.roamers.iter().find(|r| r.uid == id && r.hp > 0 && r.rig.dying.is_none()).map(|r| roamer_volume(r).0)
+    }
+    fn hostiles_near(&self, p: [f32; 3], rad: f32) -> Vec<(u64, [f32; 3])> {
+        let mut v: Vec<(u64, [f32; 3], f32)> = self
+            .roamers
+            .iter()
+            .filter(|r| roamer_hostile(r))
+            .map(|r| {
+                let c = roamer_volume(r).0;
+                (r.uid, c, (c[0] - p[0]).powi(2) + (c[1] - p[1]).powi(2) + (c[2] - p[2]).powi(2))
+            })
+            .filter(|x| x.2 <= rad * rad)
+            .collect();
+        v.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        v.into_iter().map(|x| (x.0, x.1)).collect()
+    }
+}
+
+/// What the hand's current move is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandMove {
+    /// Mining / placing: the quick work swing, no blow.
+    Work,
+    /// A fighting move: its strike moment resolves a blow.
+    Attack,
+    /// A throw: its strike moment is the release.
+    Throw,
+    /// A returning weapon landing in the palm.
+    Catch,
+    /// Pointing the Flying Sword from guard.
+    Gesture,
+}
+
+/// Metres per `item_model` voxel: `hero_forge::U`, which is private there.
+/// Items in the world are drawn at the size the hero's hand draws them.
+const HERO_VOXEL_M: f32 = 0.072;
+
+/// The creative pick, unless it is the weapon that is out of the hand (then
+/// the hand is empty until it comes back or another slot is chosen).
+fn creative_in_hand(
+    picked: Option<unendlich_engine::item::ItemKind>,
+    thrown: &Option<ThrownItem>,
+) -> Option<unendlich_engine::item::ItemKind> {
+    match thrown {
+        Some(t) if t.creative_kind.is_some() && t.creative_kind == picked => None,
+        _ => picked,
+    }
+}
+
+/// A weapon out of the player's hand, plus what it takes to give it back.
+struct ThrownItem {
+    t: unendlich_engine::sim::thrown_weapon::Thrown,
+    /// The boxes to draw it with (the same model the hand held).
+    model: unendlich_engine::item_model::ItemModel,
+    /// Survival: the stack taken out of the inventory, and the slot it left.
+    stack: Option<(usize, unendlich_engine::items::ItemStack)>,
+    /// Creative: the picked catalog item (the hand shows empty while that is
+    /// still the selection).
+    creative_kind: Option<unendlich_engine::item::ItemKind>,
+    /// What the dragons see of it (its element and damage).
+    threat: unendlich_engine::sim::dragon_duel::ItemThreat,
+    /// Where the player stood when it left the hand (a dragon learns this).
+    thrown_from: [f32; 3],
+}
+
+/// One blow on a roamer, from the hand or from a weapon in flight.
+struct Blow {
+    weapon: Option<unendlich_engine::sim::legendary_weapon::Weapon>,
+    threat: unendlich_engine::sim::dragon_duel::ItemThreat,
+    /// Where it arrived from: the zone on a dragon is this side.
+    from: [f32; 3],
+    /// Where the player stood: what a dragon learns (reach, where you are).
+    thrower: [f32; 3],
+    /// Direction of travel (knockback, cone procs).
+    dir: [f32; 3],
+    /// × damage (a throw, a rip-out, a blow on the way home).
+    mult: f32,
+    delivery: unendlich_engine::sim::dragon_duel::Delivery,
+    /// The weapon's element proc fires (not on a rip-out or a return pass).
+    procs: bool,
+    what: &'static str,
+}
+
+/// What a blow needs from the game loop besides the roamers.
+struct StrikeCtx<'a> {
+    app: &'a mut unendlich_engine::app::App,
+    attack_events: &'a mut Vec<([f32; 3], u8)>,
+    combat_mods_enabled: bool,
+    witness_enabled: bool,
+    aggro_enabled: bool,
+    frame_count: u64,
+    knockback_dealt: f32,
+    dt: f32,
+}
+
+/// Land `blow` on roamer `ri`: damage (a dragon through its own genetics),
+/// the weapon's ability, aggression, recoil, knockback, and death with its
+/// loot. Returns the damage dealt. Extracted from the melee click so a thrown
+/// axe and a swung one resolve through exactly the same rules.
+fn strike_roamer(ctx: &mut StrikeCtx, roamers: &mut Vec<Roamer>, ri: usize, blow: &Blow) -> i32 {
+    if ri >= roamers.len() || roamers[ri].hp <= 0 || roamers[ri].rig.dying.is_some() {
+        return 0;
+    }
+    let mult = if blow.mult.is_finite() { blow.mult.max(0.0) } else { 1.0 };
+    let attack = match &blow.weapon {
+        Some(w) => unendlich_engine::sim::combat::Attack {
+            element: legendary_element_to_combat_element(w.element_idx),
+            magnitude: (w.base_damage * mult).round().max(1.0) as u16,
+            affliction_ticks: 0,
+        },
+        // Bare-fist fallback — deliberately weaker than any forged weapon's
+        // damage range (4..45 across classes/tiers).
+        None => unendlich_engine::sim::combat::Attack {
+            element: unendlich_engine::sim::elemental::Element::Earth,
+            magnitude: (4.0 * mult).round().max(1.0) as u16,
+            affliction_ticks: 0,
+        },
+    };
+    let mut aff = unendlich_engine::sim::affliction::Afflicted::new();
+    let hit = unendlich_engine::sim::combat::resolve(&attack, None, None, &mut aff);
+    let (crit_chance, crit_mult) = blow.weapon.as_ref().map_or((0.2, 1.8), |w| (w.crit_chance, w.crit_mult));
+    let dmg_dealt: i32 = if ctx.combat_mods_enabled {
+        let raw = hit.health_damage as f32;
+        let roll_seed = ctx.frame_count.wrapping_mul(0x9E37_79B9).wrapping_add(ri as u64);
+        let roll = ((roll_seed >> 40) & 0xFFFF) as f32 / 65535.0;
+        let crit_dmg = unendlich_engine::sim::crit_roll::crit(roll, crit_chance, crit_mult);
+        let armor = (roamers[ri].creature.mass * 2.0).clamp(0.0, 30.0);
+        let mitig = unendlich_engine::sim::damage_after_armor::mitigated(raw * crit_dmg, armor, 20.0);
+        if crit_dmg > 1.0 {
+            log::info!("[combat] CRIT ×{:.1} (raw {} → {:.0} after armor {:.0})", crit_dmg, hit.health_damage, mitig, armor);
+        }
+        mitig.round().max(1.0) as i32
+    } else {
+        hit.health_damage as i32
+    };
+    {
+        // r143: violence is remembered — Harm event.
+        let (nb, nt) = unendlich_engine::sim::bond_tame::advance(
+            roamers[ri].bond,
+            unendlich_engine::sim::bond_tame::Event::Harm,
+            roamers[ri].trust,
+        );
+        roamers[ri].bond = nb;
+        roamers[ri].trust = nt;
+    }
+    // DRAGON DUEL: a dragon takes the hit through its own genetics — the
+    // item's element against its element, the side the blow landed on
+    // against its build's weak spot, and its hide — and remembers it.
+    let target = &mut roamers[ri];
+    let (dp, dyaw, he, hp_now) = (
+        target.creature.body.position,
+        target.creature.yaw,
+        target.creature.body.half_extents,
+        target.hp,
+    );
+    let dmg_dealt = if let Some(d) = target.duel.as_mut() {
+        use unendlich_engine::sim::dragon_duel as dd;
+        let threat = dd::ItemThreat { damage: blow.threat.damage * mult, ..blow.threat };
+        let body = dd::DragonBody { pos: dp, yaw: dyaw, half_extents: he };
+        let (zone, h) = dd::take_hit_from(&d.profile, &mut d.state, &body, blow.from, blow.thrower, &threat, blow.delivery);
+        if d.shells.take().is_some() {
+            log::info!("[dragon#{:04x}] you found it — its shell game is over", d.id & 0xffff);
+        }
+        let dealt = h.damage;
+        log::info!(
+            "[dragon#{:04x}] {} on the {:?}{} — item ×{:.1} ({} vs {}), hide {:.0} → {} dmg ({}/{} hp)",
+            d.id & 0xffff, blow.what, zone,
+            if h.weak_spot { format!(" — its {}!", d.profile.weak_spot.name()) } else { String::new() },
+            h.element_mult,
+            threat.element.map_or("unaligned", |e| unendlich_engine::sim::dragon_archetype::ELEMENT_NAMES[e as usize % 6]),
+            d.profile.element_name(), h.hide, dealt,
+            (hp_now - dealt).max(0), d.profile.max_hp
+        );
+        dealt
+    } else {
+        dmg_dealt
+    };
+    roamers[ri].hp -= dmg_dealt;
+    // r-legendary: THE WEAPON'S ABILITY (sim::weapon_ability::on_hit).
+    let mut ability_kb_mult = 1.0f32;
+    let mut ability_launch = 0.0f32;
+    if let (Some(w), true) = (blow.weapon.as_ref(), blow.procs) {
+        use unendlich_engine::sim::weapon_ability as wa;
+        let origin = roamers[ri].creature.body.position;
+        let mut cand_idx: Vec<usize> = Vec::new();
+        let mut cand_pos: Vec<[f32; 3]> = Vec::new();
+        for (rj, rr) in roamers.iter().enumerate() {
+            if rj == ri || rr.hp <= 0 || rr.rig.dying.is_some() {
+                continue;
+            }
+            let p = rr.creature.body.position;
+            let d2 = (p[0] - origin[0]).powi(2) + (p[1] - origin[1]).powi(2) + (p[2] - origin[2]).powi(2);
+            if d2 <= 14.0 * 14.0 {
+                cand_idx.push(rj);
+                cand_pos.push(p);
+            }
+        }
+        let roll_seed = ctx.frame_count.wrapping_mul(0x9E37_79B9).wrapping_add(ri as u64 * 7919);
+        let roll = ((roll_seed >> 40) & 0xFFFF) as f32 / 65535.0;
+        let dir = [blow.dir[0], 0.0, blow.dir[2]];
+        let out = wa::on_hit(w, origin, dir, &cand_pos, roll);
+        ability_kb_mult = out.knockback_mult;
+        ability_launch = out.launch_up;
+        if let Some(st) = out.target_status {
+            roamers[ri].rig.status.apply(st);
+        }
+        for sp in &out.splash {
+            let rj = cand_idx[sp.idx];
+            if sp.damage > 0.0 {
+                roamers[rj].hp -= sp.damage.round().max(1.0) as i32;
+            }
+            if let Some(st) = sp.status {
+                roamers[rj].rig.status.apply(st);
+            }
+            if sp.shove > 0.0 {
+                let q = roamers[rj].creature.body.position;
+                let (dx, dz) = (q[0] - origin[0], q[2] - origin[2]);
+                let d = (dx * dx + dz * dz).sqrt().max(0.01);
+                let v = &mut roamers[rj].creature.body.velocity;
+                v[0] += dx / d * sp.shove;
+                v[1] += 0.4;
+                v[2] += dz / d * sp.shove;
+            }
+            if ctx.witness_enabled {
+                ctx.attack_events.push((roamers[rj].creature.body.position, witness_kind(&roamers[rj])));
+            }
+        }
+        if out.proc != unendlich_engine::sim::legendary_weapon::ProcKind::None {
+            log::info!(
+                "[ability] {} — {:?} on the target{}",
+                out.label, out.target_status,
+                if out.splash.is_empty() { String::new() } else { format!(", {} other(s) caught", out.splash.len()) }
+            );
+        }
+    }
+    if ctx.witness_enabled {
+        ctx.attack_events.push((roamers[ri].creature.body.position, witness_kind(&roamers[ri])));
+    }
+    // r268: being hit stokes aggression.
+    if ctx.aggro_enabled {
+        let hp_frac = (roamers[ri].hp.max(0) as f32 / 40.0).clamp(0.0, 1.0);
+        let ceil = unendlich_engine::sim::aggression_level::aggression(hp_frac, 0, 1);
+        roamers[ri].aggro = (roamers[ri].aggro + 0.5).min(ceil.max(0.3));
+        log::info!("[aggro] {:?} provoked → aggro {:.2} (ceil {:.2})", roamers[ri].kind, roamers[ri].aggro, ceil);
+    }
+    // r129: swipe-claw recoil.
+    let curl = unendlich_engine::sim::claw_curl::claw_curl(1.0, roamers[ri].creature.gait_phase, 3);
+    roamers[ri].creature.torso_bend = curl.iter().sum::<f32>() / curl.len().max(1) as f32 * 0.6;
+    // r566: KNOCKBACK along the blow.
+    let dl = (blow.dir[0] * blow.dir[0] + blow.dir[2] * blow.dir[2]).sqrt().max(1e-4);
+    let (kx, kz) = (blow.dir[0] / dl, blow.dir[2] / dl);
+    {
+        let kb = 3.0 * ctx.knockback_dealt * ability_kb_mult * mult.min(1.5);
+        let v = &mut roamers[ri].creature.body.velocity;
+        v[0] += kx * kb;
+        v[1] += 1.2 + ability_launch;
+        v[2] += kz * kb;
+    }
+    let p = roamers[ri].creature.body.position;
+    log::info!("[combat] {}: {:?} for {} (hp {})", blow.what, roamers[ri].kind, dmg_dealt, roamers[ri].hp.max(0));
+    if roamers[ri].hp <= 0 {
+        log::info!("[combat] {:?} slain — meat dropped", roamers[ri].kind);
+        if matches!(roamers[ri].kind, unendlich_engine::item::CreatureKind::Dragon) {
+            use unendlich_engine::sim::dragon_material_yield as dmy;
+            let g2 = dragon_genome_of(&roamers[ri].duel);
+            let elem = g2
+                .element
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u8)
+                .unwrap_or(0);
+            let y = dmy::material_yield(&dmy::DragonMaterial { element: elem, attunement01: 0.6, rarity_tier: 3 });
+            let total: u32 = y.essence.iter().sum();
+            let count = ((total / 20).clamp(1, 8)) as u16;
+            ctx.app.drops_mut().spawn(
+                unendlich_engine::items::ItemStack {
+                    item: unendlich_engine::items::ItemId(3000 + elem as u32),
+                    count,
+                    weapon_instance: None,
+                },
+                [p[0], p[1] + 1.0, p[2]],
+                [0.4, 2.4, -0.3],
+            );
+            log::info!("[loot] dragon essence x{} (element {}) — a rare prize", count, elem);
+        }
+        let tier = ((roamers[ri].creature.mass * 0.4) as u32).min(4);
+        let luck = 0.25;
+        let meat_n = unendlich_engine::sim::loot_quantity::quantity(tier, luck, 5).max(1) as u16;
+        ctx.app.drops_mut().spawn(
+            unendlich_engine::items::ItemStack { item: unendlich_engine::items::ItemId(MEAT_ITEM), count: meat_n, weapon_instance: None },
+            [p[0], p[1] + 0.6, p[2]],
+            [0.0, 2.0, 0.0],
+        );
+        let egg_p = unendlich_engine::sim::drop_chance::drop_chance(0.12, luck, 0.0);
+        let roll = {
+            let s = (p[0].to_bits() as u64) ^ ((p[2].to_bits() as u64) << 17) ^ ctx.frame_count.wrapping_mul(0x9E37_79B1);
+            ((s >> 33) & 0xFFFF) as f32 / 65535.0
+        };
+        if roll < egg_p {
+            ctx.app.drops_mut().spawn(
+                unendlich_engine::items::ItemStack { item: unendlich_engine::items::ItemId(999), count: 1, weapon_instance: None },
+                [p[0] + 0.3, p[1] + 0.7, p[2]],
+                [0.5, 2.2, 0.2],
+            );
+            log::info!("[loot] …and an egg");
+        }
+        log::info!("[loot] {} meat (tier {})", meat_n, tier);
+        let kb = 3.0 * ctx.knockback_dealt;
+        begin_death(roamers, ri, [kx * kb, 2.0, kz * kb], ctx.dt);
+    }
+    dmg_dealt
+}
+
+/// The witnessed-attack kind code (r284): 1 dinosaur, 2 dragon, 0 other.
+fn witness_kind(r: &Roamer) -> u8 {
+    match r.kind {
+        unendlich_engine::item::CreatureKind::Dinosaur => 1,
+        unendlich_engine::item::CreatureKind::Dragon => 2,
+        _ => 0,
+    }
+}
+
+/// Which roamer a swing from `eye` along `dir` with `reach` connects with
+/// (index, distance along the view), and whether a dragon is close enough that
+/// a miss counts as a whiff it can exploit.
+fn melee_pick(roamers: &[Roamer], eye: [f32; 3], dir: [f32; 3], reach: f32) -> (Option<(usize, f32)>, bool) {
+    let mut best: Option<(usize, f32)> = None;
+    let mut dragon_near = false;
+    for (ri, r) in roamers.iter().enumerate() {
+        if r.hp <= 0 || r.rig.dying.is_some() {
+            continue;
+        }
+        let p = r.creature.body.position;
+        let to = [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];
+        let tl = (to[0] * to[0] + to[1] * to[1] + to[2] * to[2]).sqrt();
+        // DRAGON DUEL: a dragon is a big target, tested against its body by
+        // the core (dragon_duel::swing_touches).
+        if r.duel.is_some() {
+            let body = unendlich_engine::sim::dragon_duel::DragonBody {
+                pos: p,
+                yaw: r.creature.yaw,
+                half_extents: r.creature.body.half_extents,
+            };
+            if tl < reach + body.radius() + 3.0 {
+                dragon_near = true;
+            }
+            if let Some(along) = unendlich_engine::sim::dragon_duel::swing_touches(&body, eye, dir, reach) {
+                if best.map_or(true, |(_, d)| along < d) {
+                    best = Some((ri, along));
+                }
+            }
+            continue;
+        }
+        let along = to[0] * dir[0] + to[1] * dir[1] + to[2] * dir[2];
+        if !(0.5..=reach.max(0.5 + 0.01)).contains(&along) {
+            continue;
+        }
+        let closest = [eye[0] + dir[0] * along, eye[1] + dir[1] * along, eye[2] + dir[2] * along];
+        let lateral = ((closest[0] - p[0]).powi(2) + (closest[1] - p[1] - 0.5).powi(2) + (closest[2] - p[2]).powi(2)).sqrt();
+        if lateral < 1.2 && best.map_or(true, |(_, d)| along < d) {
+            best = Some((ri, along));
+        }
+    }
+    (best, dragon_near)
+}
+
+/// Draw an item model at a world pose: grip at `origin`, item axes `basis`
+/// (columns: +X thickness, +Y along the item, +Z the edge), in `item_model`'s
+/// voxel units scaled by `unit` metres.
+fn push_item_model(
+    everts: &mut Vec<unendlich_engine::world::entity::EntityVertex>,
+    eindices: &mut Vec<u32>,
+    model: &unendlich_engine::item_model::ItemModel,
+    origin: [f32; 3],
+    basis: [[f32; 3]; 3],
+    unit: f32,
+    tint: Option<([f32; 3], f32)>,
+) {
+    let [bx, by, bz] = basis;
+    let at = |l: [f32; 3]| {
+        [
+            origin[0] + (bx[0] * l[0] + by[0] * l[1] + bz[0] * l[2]) * unit,
+            origin[1] + (bx[1] * l[0] + by[1] * l[1] + bz[1] * l[2]) * unit,
+            origin[2] + (bx[2] * l[0] + by[2] * l[1] + bz[2] * l[2]) * unit,
+        ]
+    };
+    for b in &model.boxes {
+        let h = b.half();
+        let base = everts.len() as u32;
+        // Corner order matches push_oriented_box: (X, Z) around, Y as its "up",
+        // so the index winding below is the same one.
+        for &(sa, sc, sy) in &[
+            (-1.0f32, -1.0f32, -1.0f32), (1.0, -1.0, -1.0), (1.0, 1.0, -1.0), (-1.0, 1.0, -1.0),
+            (-1.0, -1.0, 1.0), (1.0, -1.0, 1.0), (1.0, 1.0, 1.0), (-1.0, 1.0, 1.0),
+        ] {
+            let l = [b.center[0] + sa * h[0], b.center[1] + sy * h[1], b.center[2] + sc * h[2]];
+            let color = match tint {
+                Some((c, w)) => [
+                    b.color[0] + (c[0] - b.color[0]) * w,
+                    b.color[1] + (c[1] - b.color[1]) * w,
+                    b.color[2] + (c[2] - b.color[2]) * w,
+                ],
+                None => b.color,
+            };
+            everts.push(unendlich_engine::world::entity::EntityVertex { position: at(l), color, alpha: 1.0 });
+        }
+        for f in [[0u32, 1, 2, 0, 2, 3], [4, 6, 5, 4, 7, 6], [0, 4, 5, 0, 5, 1], [3, 2, 6, 3, 6, 7], [0, 3, 7, 0, 7, 4], [1, 5, 6, 1, 6, 2]] {
+            eindices.extend(f.iter().map(|i| i + base));
+        }
+    }
+}
+
+/// `UNENDLICH_DEBUG_WEAPON`: `1` (a Storm blade, the old grant) or
+/// `<class>[:<element>][:<tier>]`, e.g. `axe:fire`, `sword:storm` (the Flying
+/// Sword), `dagger:water` (the chain-knife), `spear`.
+fn debug_weapon_spec(v: &str) -> Option<unendlich_engine::item::LegendarySpec> {
+    use unendlich_engine::sim::legendary_weapon::WeaponClass as C;
+    let v = v.trim().to_ascii_lowercase();
+    if v == "1" {
+        return Some(unendlich_engine::item::LegendarySpec { seed: 0x7EA1_F1DE, class: C::Blade, element_idx: 5, tier: 2 });
+    }
+    let mut it = v.split(':');
+    let class = match it.next()? {
+        "dagger" | "knife" | "chainknife" => C::Dagger,
+        "blade" | "sword" | "flyingsword" => C::Blade,
+        "greatsword" => C::Greatsword,
+        "axe" | "hatchet" => C::Axe,
+        "greataxe" => C::Greataxe,
+        "spear" => C::Spear,
+        "staff" => C::Staff,
+        "wand" => C::Wand,
+        _ => return None,
+    };
+    let mut element_idx = match class {
+        C::Blade => 5,
+        C::Dagger if v.starts_with("chainknife") => 1,
+        _ => 3,
+    };
+    let mut tier = 2u8;
+    for part in it {
+        match part {
+            "wood" => element_idx = 0,
+            "water" => element_idx = 1,
+            "air" => element_idx = 2,
+            "dust" => element_idx = 3,
+            "fire" => element_idx = 4,
+            "storm" => element_idx = 5,
+            t => {
+                if let Ok(n) = t.parse::<u8>() {
+                    tier = n.min(9);
+                }
+            }
+        }
+    }
+    Some(unendlich_engine::item::LegendarySpec { seed: 0x7EA1_F1DE, class, element_idx, tier })
 }
 
 
@@ -1675,13 +2204,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // through the inventory, not collapsed to a bare class id) is actually
     // reachable and testable in survival tonight. Opt-in, same pattern as
     // `UNENDLICH_COMBAT_MODS`/`UNENDLICH_LIGHTNING_ARC` above.
-    if std::env::var("UNENDLICH_DEBUG_WEAPON").map(|v| v == "1").unwrap_or(false) {
-        use unendlich_engine::item::LegendarySpec;
-        use unendlich_engine::sim::legendary_weapon::WeaponClass;
+    // `1` keeps the old Storm-blade grant; `<class>[:<element>][:<tier>]`
+    // picks one (see debug_weapon_spec). Survival gets it in slot 1; creative
+    // gets it in creative hotbar slot 1, selected.
+    if let Some(spec) = std::env::var("UNENDLICH_DEBUG_WEAPON").ok().and_then(|v| debug_weapon_spec(&v)) {
         use unendlich_engine::items::{ItemId, ItemStack};
-        let spec = LegendarySpec { seed: 0x7EA1_F1DE, class: WeaponClass::Blade, element_idx: 5, tier: 2 };
         let id = ItemId(unendlich_engine::sim::viewmodel::weapon_id_for_class(spec.class));
         fg_app.inventory_mut().set(0, Some(ItemStack::new_weapon(id, 1, spec)));
+        if let Some(slot) = renderer.creative_hotbar.get_mut(0) {
+            *slot = Some(unendlich_engine::item::ItemKind::Legendary(spec));
+            renderer.creative_place_item = *slot;
+        }
         log::info!(
             "[debug] UNENDLICH_DEBUG_WEAPON granted a {} {} (tier {}) in hotbar slot 1",
             spec.element_name(), spec.class_name(), spec.tier
@@ -2377,7 +2910,52 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // 2 = cinematic over-the-shoulder. F5 toggles first/third; Y toggles the cinematic shoulder
     // cam. `fp_body` renders your own avatar in first-person so you can look down and see your
     // body (the hand viewmodel is hidden then to avoid a second floating arm). Default on.
-    let mut camera_mode: u8 = 0;
+    // UNENDLICH_CAMERA=third|shoulder starts in that view (soak screenshots).
+    // UNENDLICH_CAMERA=portrait:<deg>:<m> is a still camera at <deg> round
+    // from the player's facing (0 = in front, 90 = their right side), <m> away,
+    // looking back at them: for screenshots of the hands and what they hold.
+    let cam_env = std::env::var("UNENDLICH_CAMERA").unwrap_or_default();
+    let mut camera_mode: u8 = match cam_env.split(':').next().unwrap_or("") {
+        "third" => 1,
+        "shoulder" => 2,
+        "portrait" => 3,
+        _ => 0,
+    };
+    let portrait: (f32, f32) = {
+        let mut it = cam_env.split(':').skip(1);
+        let deg = it.next().and_then(|x| x.parse::<f32>().ok()).unwrap_or(60.0);
+        let dist = it.next().and_then(|x| x.parse::<f32>().ok()).unwrap_or(3.0);
+        (deg.to_radians(), dist.clamp(0.8, 20.0))
+    };
+    // UNENDLICH_HAND_POSE=<motion>:<0..1> holds the hand at that point of that
+    // move (chop, slashr, slashl, thrust, sweep, flick, throw, catch, work) --
+    // for looking at a pose, not for playing.
+    // UNENDLICH_HAND_POSE=file:<path> re-reads the same `<motion>:<u>` from
+    // that file every frame, so one soak can be posed and screenshotted many
+    // times without a restart.
+    let hand_pose_file: Option<String> = std::env::var("UNENDLICH_HAND_POSE")
+        .ok()
+        .and_then(|v| v.strip_prefix("file:").map(|p| p.to_string()));
+    let parse_hand_pose = |v: &str| -> Option<(unendlich_engine::sim::weapon_motion::Motion, f32)> {
+        use unendlich_engine::sim::weapon_motion::Motion as M;
+        let mut it = v.trim().split(':');
+        let m = match it.next()?.to_ascii_lowercase().as_str() {
+            "chop" => M::Chop,
+            "slashr" => M::SlashR,
+            "slashl" => M::SlashL,
+            "thrust" => M::Thrust,
+            "sweep" => M::Sweep,
+            "flick" => M::Flick,
+            "throw" => M::Throw,
+            "catch" => M::Catch,
+            "work" => M::Work,
+            _ => return None,
+        };
+        let u = it.next().and_then(|x| x.parse::<f32>().ok()).unwrap_or(0.5).clamp(0.0, 1.0);
+        Some((m, u))
+    };
+    let mut hand_pose_debug: Option<(unendlich_engine::sim::weapon_motion::Motion, f32)> =
+        std::env::var("UNENDLICH_HAND_POSE").ok().and_then(|v| parse_hand_pose(&v));
     // r534: third-person / cinematic camera-distance zoom (+/- keys). 1.0 = default
     // pull-back; clamped so the camera can't clip into the player or fly too far.
     let mut cam_zoom: f32 = 1.0;
@@ -2434,10 +3012,24 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // r573: flight banking — eased roll into turns, from the view yaw rate.
     let mut hero_bank: f32 = 0.0;
     let mut prev_view_yaw: f32 = 0.0;
-    // r486: held-item swing — a short arc the viewmodel plays each time a block
-    // action fires (mine/place), so the hand item visibly swings on use.
-    let mut swing_timer: f32 = 0.0;
-    const SWING_DURATION: f32 = 0.24;
+    // ITEMS IN HAND: the move the hand is making (sim::weapon_motion), what it
+    // is for, the combo it continues, and the weapon out of the hand, if any.
+    let mut hand_swing: Option<unendlich_engine::sim::weapon_motion::Swing> = None;
+    let mut hand_move = HandMove::Work;
+    let mut hand_combo = unendlich_engine::sim::weapon_motion::Combo::default();
+    let mut thrown: Option<ThrownItem> = None;
+    let mut pending_thrown_events: Vec<unendlich_engine::sim::thrown_weapon::Event> = Vec::new();
+    // The weapon captured at the start of a throw's wind-up.
+    let mut throw_pending: Option<unendlich_engine::sim::legendary_weapon::Weapon> = None;
+    // 0..1 blend of the open-hand reach while a recalled weapon flies home.
+    let mut hand_reach01: f32 = 0.0;
+    // Lightning links to draw: (from, to, seconds left).
+    let mut arc_flashes: Vec<([f32; 3], [f32; 3], f32)> = Vec::new();
+    // What the dragons read of the hand (set here, read by next frame's duel).
+    let mut hand_disarmed = false;
+    let mut hand_winding: Option<f32> = None;
+    // One "not a throwing weapon" line per class, not one per press.
+    let mut throw_refusal_said: Option<unendlich_engine::sim::legendary_weapon::WeaponClass> = None;
     let mut prev_fall_vy: f32 = 0.0; // r141: landing speed for fall impact
     // r508: tracks an in-progress jump ascent so releasing Jump early can cut it short
     // (variable jump height — tap = short hop, hold = full jump).
@@ -3829,13 +4421,23 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // "1" = create a world AND walk; "walk" = walk only once InGame (the
     // JOINER's mode in dual-process soaks — its world comes from the host).
     let fg_autoplay_raw = std::env::var("UNENDLICH_AUTOPLAY").unwrap_or_default();
-    let fg_autoplay: bool = fg_autoplay_raw == "1" || fg_autoplay_raw == "fight";
-    let fg_autoplay_walk: bool = fg_autoplay || fg_autoplay_raw == "walk";
+    // "stand" = create a world and stay put (posing / screenshots).
+    let fg_autoplay: bool = fg_autoplay_raw == "1"
+        || fg_autoplay_raw == "fight"
+        || fg_autoplay_raw == "throw"
+        || fg_autoplay_raw == "stand";
+    let fg_autoplay_walk: bool = (fg_autoplay && fg_autoplay_raw != "stand") || fg_autoplay_raw == "walk";
     // UNENDLICH_AUTOPLAY=fight: a soak DRIVER, not a player -- it knows where the
     // nearest dragon truly is, walks to it, faces it and swings. Exists to put
     // the real melee path (swing_touches, item vs genome, the dragon's memory,
     // a hit ending its shell game) through the running game.
-    let fg_autoplay_fight: bool = fg_autoplay_raw == "fight";
+    let fg_autoplay_fight: bool = fg_autoplay_raw == "fight" || fg_autoplay_raw == "throw";
+    // UNENDLICH_AUTOPLAY=throw: the same driver, but it stands off at throwing
+    // range, throws the weapon in hand, and calls it back once it has struck
+    // (or stuck), so the thrown/recalled path runs through the live game.
+    let fg_autoplay_throw: bool = fg_autoplay_raw == "throw";
+    let mut autoplay_throw_press = false;
+    let mut autoplay_throw_t = 0.0f32;
     let mut autoplay_swing: bool;
     // 0 = idle, 1 = wizard requested (waiting for the panel to show it),
     // 2 = spree armed. Two stages because the panel reflects the app ONE
@@ -4817,7 +5419,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         hand_item = if survival_mode {
             fg_app.inventory().slot(selected_palette_idx).map(|s| s.item)
         } else {
-            renderer.creative_place_item.map(|kind| unendlich_engine::items::ItemId(kind.to_item_id()))
+            // The weapon out of the hand leaves it empty (creative_in_hand).
+            creative_in_hand(renderer.creative_place_item, &thrown).map(|kind| unendlich_engine::items::ItemId(kind.to_item_id()))
         };
         // r509: keep the equipped-weapon durability tracker in sync with what's held —
         // (re)initialise to full when a different forged weapon becomes the hand item, clear
@@ -6400,6 +7003,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         flying: false,
                         flight_phase: (wseed % 30) as f32,
                         last_tick_frame: 0,
+        uid: next_roamer_uid(),
                         aggro: 0.0,
                         prev_behavior: 0,
                         combat_habit: 0.0,
@@ -7366,6 +7970,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         flying: false,
                         flight_phase: (wseed % 30) as f32,
                         last_tick_frame: 0,
+        uid: next_roamer_uid(),
                         aggro: 0.0,
                         prev_behavior: 0,
                         combat_habit: 0.0,
@@ -8901,12 +9506,35 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 local_player.view.yaw = dz.atan2(dx);
                 local_player.view.pitch = dy.atan2(horiz.max(0.1)).clamp(-1.2, 1.2);
                 let r = he[0].max(he[2]);
-                // Press in to arm's length; the dragon keeps its gap just outside
-                // a bare hand's reach, so hits land when it commits to a lunge.
-                if horiz > r + 0.3 {
-                    move_local.x += 1.0;
+                if fg_autoplay_throw {
+                    // Stand off at throwing range, throw, and call it back
+                    // once it has struck or stuck (or the sword has taken guard).
+                    use unendlich_engine::sim::thrown_weapon::Phase;
+                    if horiz > r + 12.0 {
+                        move_local.x += 1.0;
+                    } else if horiz < r + 6.0 {
+                        move_local.x -= 1.0;
+                    }
+                    autoplay_throw_t += dt;
+                    match thrown.as_ref().map(|t| t.t.phase) {
+                        None if hand_swing.is_none() && horiz < r + 16.0 && autoplay_throw_t > 1.2 => {
+                            autoplay_throw_press = true;
+                            autoplay_throw_t = 0.0;
+                        }
+                        Some(Phase::Lodged { .. }) | Some(Phase::Guarding) | Some(Phase::Flying) if autoplay_throw_t > 2.0 => {
+                            autoplay_throw_press = true;
+                            autoplay_throw_t = 0.0;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    // Press in to arm's length; the dragon keeps its gap just outside
+                    // a bare hand's reach, so hits land when it commits to a lunge.
+                    if horiz > r + 0.3 {
+                        move_local.x += 1.0;
+                    }
+                    autoplay_swing = horiz < r + 4.0;
                 }
-                autoplay_swing = horiz < r + 4.0;
             }
         }
 
@@ -9467,6 +10095,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             flying: false,
                             flight_phase: (wseed % 30) as f32,
                             last_tick_frame: 0,
+        uid: next_roamer_uid(),
                             aggro: 0.0,
                             prev_behavior: 0,
                             combat_habit: 0.0,
@@ -9622,7 +10251,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
             // DRAGON DUEL: what the dragons see in your hand this frame.
             let mut player_threat = player_item_threat(
-                survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
+                survival_mode, creative_in_hand(renderer.creative_place_item, &thrown), hand_item, &fg_app, selected_palette_idx,
             );
             if player_element_override.is_some() {
                 player_threat.element = player_element_override;
@@ -11082,6 +11711,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             &dbody, *hp, d.profile.max_hp, &pv,
                             player_threat, last_swing_whiffed,
                         );
+                        // What it can read of your hand: empty (your weapon is
+                        // out there), or a blow being wound up.
+                        senses.disarmed = hand_disarmed;
+                        senses.winding = hand_winding;
                         // EYES (design library: mob_brain_object_permanence §8):
                         // it sees you only along a clear line -- terrain, a
                         // boulder, a rampart block it; smoke attenuates it by
@@ -11804,6 +12437,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 posture: unendlich_engine::sim::posture::Posture::new(0.0),
                                 stumble: unendlich_engine::sim::stumble::Stumble::new(),
                                 last_tick_frame: 0,
+        uid: next_roamer_uid(),
                                 aggro: 0.0,
                                 prev_behavior: 0,
                                 combat_habit: 0.0,
@@ -12091,6 +12725,426 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
         }
 
+        // ---- ITEMS IN HAND: the weapon's own moves, throws, recalls ----
+        // sim::weapon_motion times every swing (wind-up, the strike moment,
+        // follow-through, combos); the hit is tested when the blow lands, along
+        // the view at that moment. sim::thrown_weapon flies whatever leaves the
+        // hand. Mining keeps its instant click below; only fighting waits for
+        // the blow.
+        {
+            use unendlich_engine::sim::thrown_weapon as tw;
+            use unendlich_engine::sim::weapon_motion as wm;
+            let mut melee_strike_now = false;
+            let mut throw_release_now = false;
+            let mut guard_send_now = false;
+            let eye = local_player.view.position;
+            let fwd = local_player.forward();
+            let right = glm::normalize(&glm::cross(&fwd, &glm::vec3(0.0, 1.0, 0.0)));
+            let hand = eye + right * 0.32 - glm::vec3(0.0, 0.30, 0.0) + fwd * 0.35;
+            let owner = tw::Owner {
+                hand: [hand.x, hand.y, hand.z],
+                eye: [eye.x, eye.y, eye.z],
+                forward: [fwd.x, fwd.y, fwd.z],
+                right: [right.x, right.y, right.z],
+            };
+            let in_game = mouse_captured || fg_autoplay_fight;
+            let creative_hand = creative_in_hand(renderer.creative_place_item, &thrown);
+            let in_hand = equipped_weapon(survival_mode, creative_hand, hand_item, &fg_app, selected_palette_idx);
+            let class = in_hand.map(|w| w.class);
+            let swing_time = in_hand.map_or(0.0, |w| w.swing_time);
+
+            // Advance the current move.
+            match hand_swing.as_mut() {
+                Some(sw) => {
+                    if sw.tick(dt) == wm::Tick::Strike {
+                        match hand_move {
+                            HandMove::Attack => melee_strike_now = true,
+                            HandMove::Throw => throw_release_now = true,
+                            _ => {}
+                        }
+                    }
+                }
+                None => hand_combo.idle(dt),
+            }
+            // The move that just struck is still needed below (its motion
+            // names the blow); it is cleared at the end of this block.
+
+            let throw_bound = !bindings.keys_for_action(GameAction::ThrowItem).is_empty()
+                || !bindings.mouse_buttons_for_action(GameAction::ThrowItem).is_empty();
+            let throw_pressed = autoplay_throw_press
+                || (mouse_captured
+                    && (bindings.is_action_just_pressed(GameAction::ThrowItem, &input)
+                        || bindings.is_action_just_pressed_mouse(GameAction::ThrowItem, &input)
+                        // A bindings file saved before ThrowItem existed has no
+                        // entry for it: middle mouse still works.
+                        || (!throw_bound && input.is_mouse_button_just_pressed(MouseBtn::Middle))));
+            autoplay_throw_press = false;
+
+            if throw_pressed && in_game {
+                if let Some(ti) = thrown.as_mut() {
+                    // It is out: call it back.
+                    let arena = FgArena { chunks: &chunk_manager, roamers: &roamers };
+                    let mut ev = Vec::new();
+                    let answer = ti.t.recall(&owner, &arena, &mut ev);
+                    drop(arena);
+                    match answer {
+                        tw::RecallAnswer::Coming => log::info!("[throw] recall: it comes"),
+                        tw::RecallAnswer::CannotRecall => log::info!("[throw] recall: it does not answer — walk over and pick it up"),
+                        tw::RecallAnswer::Refused | tw::RecallAnswer::Already => {}
+                    }
+                    pending_thrown_events.extend(ev);
+                } else if hand_swing.is_none() {
+                    match in_hand {
+                        Some(w) if tw::profile(&w).is_some() => {
+                            hand_swing = Some(wm::Swing::of(class, wm::Motion::Throw, swing_time, 0));
+                            hand_move = HandMove::Throw;
+                            throw_pending = Some(w);
+                            hand_combo.reset();
+                        }
+                        Some(w) => {
+                            if throw_refusal_said != Some(w.class) {
+                                log::info!("[throw] a {:?} is not a throwing weapon (axes, daggers, spears and the Flying Sword are)", w.class);
+                                throw_refusal_said = Some(w.class);
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+
+            // Left click: the Flying Sword on guard with an empty hand is sent
+            // along the view; otherwise start an attack when there is
+            // something to fight or nothing to mine.
+            let left_down = input.is_mouse_button_pressed(MouseBtn::Left) || autoplay_swing;
+            let left = (mouse_captured || autoplay_swing)
+                && left_down
+                && local_player.permissions.can_break_block
+                && in_game;
+            let guarding = thrown.as_ref().map_or(false, |t| t.t.phase == tw::Phase::Guarding);
+            if left && in_hand.is_none() && guarding && hand_swing.is_none() {
+                guard_send_now = true;
+                hand_swing = Some(wm::Swing::of(None, wm::Motion::Flick, 0.4, 0));
+                hand_move = HandMove::Gesture;
+            } else if left && hand_swing.is_none() {
+                let reach = in_hand.map_or(1.2, |w| w.reach);
+                let e = [eye.x, eye.y, eye.z];
+                let d = [fwd.x, fwd.y, fwd.z];
+                let (pick, dragon_near) = melee_pick(&roamers, e, d, reach + 1.5);
+                let block_reach = (6.0 + 1.2 * (player_stature.height
+                    - unendlich_engine::sim::stature::BASE_HEIGHT).max(0.0)).max(6.0);
+                let block_close = chunk_manager.raycast_octree(e, d, block_reach, |b| b.is_solid()).is_some();
+                if pick.is_some() || dragon_near || !block_close {
+                    let step = hand_combo.next(class);
+                    hand_swing = Some(wm::Swing::attack(class, swing_time, step));
+                    hand_move = HandMove::Attack;
+                }
+            }
+
+            // What the dragons can read of the hand next frame.
+            hand_disarmed = thrown.is_some() && in_hand.is_none();
+            hand_winding = hand_swing
+                .filter(|sw| matches!(hand_move, HandMove::Attack | HandMove::Throw) && !sw.struck)
+                .map(|sw| sw.strike_in());
+
+            // The blow lands: test along the view as it is NOW.
+            if melee_strike_now {
+                let weapon = in_hand;
+                let attack_reach = weapon.as_ref().map_or(1.2, |w| w.reach);
+                let e = [eye.x, eye.y, eye.z];
+                let (best, dragon_near) = melee_pick(&roamers, e, [fwd.x, fwd.y, fwd.z], attack_reach);
+                // A blow that found no creature with a dragon close by is a
+                // whiff; next frame's roamer loop hands it to the duel.
+                last_swing_whiffed = best.is_none() && dragon_near;
+                if autoplay_swing && best.is_none() {
+                    let near_dragon = roamers.iter().filter(|r| r.duel.is_some()).map(|r| {
+                        let p = r.creature.body.position;
+                        (((p[0] - eye.x).powi(2) + (p[2] - eye.z).powi(2)).sqrt(), p[1] - eye.y, r.creature.body.half_extents)
+                    }).min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    log::info!(
+                        "[autoplay-fight] swing: reach {:.1}, dragon near {}, hit {} (dragon {:?} = horiz m, dy m, half-extents)",
+                        attack_reach, dragon_near, best.is_some(), near_dragon
+                    );
+                }
+                if let Some((ri, _)) = best {
+                    let mut threat = player_item_threat(survival_mode, creative_hand, hand_item, &fg_app, selected_palette_idx);
+                    if player_element_override.is_some() {
+                        threat.element = player_element_override;
+                    }
+                    let what = match hand_swing.map(|s| s.motion) {
+                        Some(wm::Motion::Chop) => "chop",
+                        Some(wm::Motion::Thrust) => "thrust",
+                        Some(wm::Motion::Sweep) => "sweep",
+                        Some(wm::Motion::SlashR) | Some(wm::Motion::SlashL) => "slash",
+                        Some(wm::Motion::Flick) => "flick",
+                        _ => "hit",
+                    };
+                    let blow = Blow {
+                        weapon,
+                        threat,
+                        from: e,
+                        thrower: e,
+                        dir: [fwd.x, fwd.y, fwd.z],
+                        mult: 1.0,
+                        delivery: unendlich_engine::sim::dragon_duel::Delivery::Melee,
+                        procs: true,
+                        what,
+                    };
+                    let mut ctx = StrikeCtx {
+                        app: &mut fg_app,
+                        attack_events: &mut attack_events,
+                        combat_mods_enabled,
+                        witness_enabled,
+                        aggro_enabled,
+                        frame_count: frame_count as u64,
+                        knockback_dealt: player_stature.knockback_dealt,
+                        dt,
+                    };
+                    strike_roamer(&mut ctx, &mut roamers, ri, &blow);
+                    // r509: the weapon wears with each blow; at 0 it breaks (survival only).
+                    if survival_mode {
+                        if let Some((wid, cur, max)) = equipped_weapon_dura {
+                            let (nc, broke) = unendlich_engine::sim::item_durability::apply_wear(cur, max, WEAR_PER_ATTACK);
+                            equipped_weapon_dura = Some((wid, nc, max));
+                            if broke {
+                                let _ = fg_app.inventory_mut().remove_item(wid, 1);
+                                equipped_weapon_dura = None;
+                                log::info!("[durability] your weapon shattered from the blow");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // The throw leaves the hand.
+            if throw_release_now {
+                if let Some(w) = throw_pending.take() {
+                    let model = held_item_model(survival_mode, creative_hand, hand_item, &fg_app, selected_palette_idx);
+                    let mut threat = player_item_threat(survival_mode, creative_hand, hand_item, &fg_app, selected_palette_idx);
+                    if player_element_override.is_some() {
+                        threat.element = player_element_override;
+                    }
+                    let model = model.unwrap_or_else(|| {
+                        unendlich_engine::item::ItemKind::Legendary(unendlich_engine::item::LegendarySpec {
+                            seed: 0,
+                            class: w.class,
+                            element_idx: w.element_idx,
+                            tier: w.tier,
+                        })
+                        .model()
+                    });
+                    let len_m = model.bounds().1[1].max(1.0) * HERO_VOXEL_M;
+                    let dir = glm::normalize(&(fwd + glm::vec3(0.0, 0.06, 0.0)));
+                    let arena = FgArena { chunks: &chunk_manager, roamers: &roamers };
+                    let mut ev = Vec::new();
+                    let seed = (frame_count as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x7A11;
+                    let launched = tw::Thrown::launch(w, owner.hand, [dir.x, dir.y, dir.z], len_m, seed, &arena, &mut ev);
+                    drop(arena);
+                    if let Some(t) = launched {
+                        let stack = if survival_mode {
+                            let taken = fg_app.inventory_mut().take(selected_palette_idx);
+                            taken.map(|mut st| {
+                                if st.count > 1 {
+                                    let mut rest = st.clone();
+                                    rest.count -= 1;
+                                    fg_app.inventory_mut().set(selected_palette_idx, Some(rest));
+                                    st.count = 1;
+                                }
+                                (selected_palette_idx, st)
+                            })
+                        } else {
+                            None
+                        };
+                        log::info!(
+                            "[throw] {} leaves the hand ({:?}, {:.0} m/s{})",
+                            if tw::is_flying_sword(&w) {
+                                "the Flying Sword"
+                            } else if tw::is_chainknife(&w) {
+                                "the chain-knife"
+                            } else {
+                                "the weapon"
+                            },
+                            w.class,
+                            t.profile.speed,
+                            if t.quarry.is_some() { ", it has chosen a quarry" } else { "" }
+                        );
+                        thrown = Some(ThrownItem {
+                            t,
+                            model,
+                            stack,
+                            creative_kind: if survival_mode { None } else { creative_hand },
+                            threat,
+                            thrown_from: [eye.x, eye.y, eye.z],
+                        });
+                        pending_thrown_events.extend(ev);
+                    }
+                }
+            }
+            if guard_send_now {
+                if let Some(ti) = thrown.as_mut() {
+                    let arena = FgArena { chunks: &chunk_manager, roamers: &roamers };
+                    let mut ev = Vec::new();
+                    if ti.t.send_from_guard([fwd.x, fwd.y, fwd.z], &arena, &mut ev) {
+                        log::info!(
+                            "[flying sword] sent from guard{}",
+                            if ti.t.quarry.is_some() { " — it has a quarry" } else { "" }
+                        );
+                        ti.thrown_from = [eye.x, eye.y, eye.z];
+                    }
+                    drop(arena);
+                    pending_thrown_events.extend(ev);
+                }
+            }
+
+            // The weapon in flight.
+            if let Some(ti) = thrown.as_mut() {
+                let arena = FgArena { chunks: &chunk_manager, roamers: &roamers };
+                let mut ev = Vec::new();
+                ti.t.step(dt, &owner, &arena, &mut ev);
+                drop(arena);
+                pending_thrown_events.extend(ev);
+            }
+            let reach_want = if thrown.as_ref().map_or(false, |t| matches!(t.t.phase, tw::Phase::Returning { .. })) {
+                1.0
+            } else {
+                0.0
+            };
+            hand_reach01 += (reach_want - hand_reach01) * (dt * 10.0).min(1.0);
+
+            // Resolve what it did.
+            for e in std::mem::take(&mut pending_thrown_events) {
+                let Some(ti) = thrown.as_ref() else { break };
+                let w = ti.t.weapon;
+                let sword = tw::is_flying_sword(&w);
+                let (threat, thrown_from) = (ti.threat, ti.thrown_from);
+                match e {
+                    tw::Event::Hit { target, at, dir, mult, leg } => {
+                        let returning = leg.returning();
+                        let Some(ri) = roamers.iter().position(|r| r.uid == target) else { continue };
+                        let delivery = if returning || sword {
+                            unendlich_engine::sim::dragon_duel::Delivery::Returning
+                        } else {
+                            unendlich_engine::sim::dragon_duel::Delivery::Thrown
+                        };
+                        let blow = Blow {
+                            weapon: Some(w),
+                            threat,
+                            from: [at[0] - dir[0] * 1.5, at[1] - dir[1] * 1.5, at[2] - dir[2] * 1.5],
+                            thrower: if returning { [eye.x, eye.y, eye.z] } else { thrown_from },
+                            dir,
+                            mult,
+                            delivery,
+                            procs: !returning,
+                            what: match leg {
+                                _ if sword => "flying sword",
+                                tw::Leg::RipOut => "rip-out",
+                                tw::Leg::Home => "return pass",
+                                tw::Leg::Out => "thrown",
+                            },
+                        };
+                        let mut ctx = StrikeCtx {
+                            app: &mut fg_app,
+                            attack_events: &mut attack_events,
+                            combat_mods_enabled,
+                            witness_enabled,
+                            aggro_enabled,
+                            frame_count: frame_count as u64,
+                            knockback_dealt: player_stature.knockback_dealt,
+                            dt,
+                        };
+                        strike_roamer(&mut ctx, &mut roamers, ri, &blow);
+                    }
+                    tw::Event::Arc { from, target, to } => {
+                        arc_flashes.push((from, to, 0.35));
+                        let Some(ri) = roamers.iter().position(|r| r.uid == target) else { continue };
+                        let blow = Blow {
+                            weapon: Some(w),
+                            threat,
+                            from,
+                            thrower: [eye.x, eye.y, eye.z],
+                            dir: [to[0] - from[0], to[1] - from[1], to[2] - from[2]],
+                            mult: (0.35 * w.proc_power).clamp(0.2, 1.2),
+                            delivery: unendlich_engine::sim::dragon_duel::Delivery::Returning,
+                            procs: false,
+                            what: "lightning arc",
+                        };
+                        let mut ctx = StrikeCtx {
+                            app: &mut fg_app,
+                            attack_events: &mut attack_events,
+                            combat_mods_enabled,
+                            witness_enabled,
+                            aggro_enabled,
+                            frame_count: frame_count as u64,
+                            knockback_dealt: player_stature.knockback_dealt * 0.3,
+                            dt,
+                        };
+                        strike_roamer(&mut ctx, &mut roamers, ri, &blow);
+                        if let Some(r) = roamers.get_mut(ri) {
+                            r.rig.status.apply(unendlich_engine::sim::weapon_ability::Status::Stagger { secs: 0.4 });
+                        }
+                    }
+                    tw::Event::Lodged { at, in_creature } => log::info!(
+                        "[throw] it sticks fast {} {:.1} m out",
+                        if in_creature.is_some() { "in its quarry" } else { "in the ground" },
+                        ((at[0] - thrown_from[0]).powi(2) + (at[1] - thrown_from[1]).powi(2) + (at[2] - thrown_from[2]).powi(2)).sqrt()
+                    ),
+                    tw::Event::Glanced { at } => log::info!(
+                        "[flying sword] it glances off stone {:.1} m out and turns back to guard",
+                        ((at[0] - thrown_from[0]).powi(2) + (at[1] - thrown_from[1]).powi(2) + (at[2] - thrown_from[2]).powi(2)).sqrt()
+                    ),
+                    tw::Event::Refused { hostile_near } => log::info!(
+                        "[flying sword] recall refused — {}",
+                        if hostile_near {
+                            "it keeps guard while something hostile is this close"
+                        } else {
+                            "it will come when it is done"
+                        }
+                    ),
+                    tw::Event::Guarding => log::info!("[flying sword] it takes up its guard at your shoulder"),
+                    tw::Event::Caught | tw::Event::PickedUp => {
+                        let caught = e == tw::Event::Caught;
+                        if let Some(ti) = thrown.take() {
+                            if let Some((slot, stack)) = ti.stack {
+                                let inv = fg_app.inventory_mut();
+                                if inv.slot(slot).is_none() {
+                                    inv.set(slot, Some(stack));
+                                } else if let Some(over) = inv.add_stack(stack, &fg_item_registry) {
+                                    fg_app.drops_mut().spawn(over, [eye.x, eye.y - 1.0, eye.z], [0.0, 1.0, 0.0]);
+                                    log::warn!("[throw] no room in the bag — it drops at your feet");
+                                }
+                            }
+                        }
+                        if caught {
+                            hand_swing = Some(wm::Swing::of(Some(w.class), wm::Motion::Catch, 0.0, 0));
+                            hand_move = HandMove::Catch;
+                        }
+                        log::info!("[throw] {} — back in hand", if caught { "caught" } else { "picked up" });
+                    }
+                }
+            }
+            for a in arc_flashes.iter_mut() {
+                a.2 -= dt;
+            }
+            arc_flashes.retain(|a| a.2 > 0.0);
+            if hand_swing.map_or(false, |sw| sw.done()) {
+                hand_swing = None;
+            }
+            if let Some(path) = hand_pose_file.as_ref() {
+                hand_pose_debug = std::fs::read_to_string(path).ok().and_then(|v| parse_hand_pose(&v));
+                // Posing: hover high in open sky, level gaze, so every shot has
+                // the same plain background whatever world the soak rolled.
+                if body.is_none() {
+                    local_player.view.position.y = local_player.view.position.y.max(160.0);
+                    local_player.view.pitch = 0.0;
+                }
+            }
+            if let Some((m, u)) = hand_pose_debug {
+                let mut sw = wm::Swing::of(class, m, 1.0, 0);
+                sw.t = u * sw.dur;
+                hand_swing = Some(sw);
+                hand_move = HandMove::Gesture;
+            }
+        }
+
         // ---- Block edit input ----
         //
         // Left mouse: break the block we're aiming at (set to Air).
@@ -12115,7 +13169,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // shouldn't even raycast (saves cycles). Single-player default
         // permissions grant both, so behavior is unchanged. Multiplayer
         // server pushes restrictive permissions to e.g. spectators.
-        let break_allowed = mouse_left_held && local_player.permissions.can_break_block;
+        // A fighting move owns the left button until it ends: no mining mid-swing.
+        let hand_fighting = hand_swing.is_some() && !matches!(hand_move, HandMove::Work);
+        let break_allowed = mouse_left_held && local_player.permissions.can_break_block && !hand_fighting;
         let place_allowed = mouse_right_held && local_player.permissions.can_place_block;
         // r565: radius scales ~ceil((h−4)·¼) above a stature of 5 (1 at 5–8 blocks,
         // 2 at 12, 3 at 16, 4 at 20, 6 at 25), capped at 6. Drives the place-mound
@@ -12246,401 +13302,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         }
                     }
                 }
-                // r127: COMBAT — a creature in punching range along the view
-                // ray takes the hit instead of the block behind it. Damage runs
-                // through the REAL sim::combat::resolve (no shield/armor, fresh
-                // affliction set), so the elemental pipeline is live.
-                let mut creature_hit = click_fed_creature; // feeding consumed the click
-                // r-weapon-fix: build the real weapon stat-block ONCE per swing
-                // (needed for both the hit-detection reach below and the damage/
-                // crit resolution after) instead of every hit using a fixed
-                // reach/damage/crit regardless of what's equipped.
-                let weapon = equipped_weapon(survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx);
-                let attack_reach = weapon.as_ref().map_or(1.2, |w| w.reach);
-                if break_allowed && !click_fed_creature {
-                    let eye = local_player.view.position;
-                    let dir = cam_forward;
-                    let mut best: Option<(usize, f32)> = None;
-                    // Nearest dragon centre, for whiff detection below.
-                    let mut dragon_near = false;
-                    for (ri, r) in roamers.iter().enumerate() {
-                        let p = r.creature.body.position;
-                        let to = glm::vec3(p[0] - eye.x, p[1] - eye.y, p[2] - eye.z);
-                        // DRAGON DUEL: a dragon is a big target, tested against
-                        // its body by the core (dragon_duel::swing_touches). The
-                        // old test (centre within weapon reach, 1.2 lateral) made
-                        // most of a large dragon unhittable: its centre is
-                        // metres inside it.
-                        if r.duel.is_some() {
-                            let body = unendlich_engine::sim::dragon_duel::DragonBody {
-                                pos: p,
-                                yaw: r.creature.yaw,
-                                half_extents: r.creature.body.half_extents,
-                            };
-                            if glm::length(&to) < attack_reach + body.radius() + 3.0 {
-                                dragon_near = true;
-                            }
-                            if let Some(along) = unendlich_engine::sim::dragon_duel::swing_touches(
-                                &body, [eye.x, eye.y, eye.z], [dir.x, dir.y, dir.z], attack_reach,
-                            ) {
-                                if best.map_or(true, |(_, d)| along < d) {
-                                    best = Some((ri, along));
-                                }
-                            }
-                            continue;
-                        }
-                        let along = glm::dot(&to, &dir);
-                        if !(0.5..=attack_reach.max(0.5 + 0.01)).contains(&along) {
-                            continue;
-                        }
-                        let closest = eye + dir * along;
-                        let lateral = glm::distance(
-                            &closest,
-                            &glm::vec3(p[0], p[1] + 0.5, p[2]),
-                        );
-                        if lateral < 1.2 && best.map_or(true, |(_, d)| along < d) {
-                            best = Some((ri, along));
-                        }
-                    }
-                    // A swing that found no creature with a dragon close by is
-                    // a whiff; next frame's roamer loop hands it to the duel.
-                    last_swing_whiffed = best.is_none() && dragon_near;
-                    // Fight-driver diagnostics only (autoplay_swing is set only by
-                    // UNENDLICH_AUTOPLAY=fight); hits are logged anyway.
-                    if autoplay_swing && best.is_none() {
-                        let near_dragon = roamers.iter().filter(|r| r.duel.is_some()).map(|r| {
-                            let p = r.creature.body.position;
-                            (((p[0] - eye.x).powi(2) + (p[2] - eye.z).powi(2)).sqrt(), p[1] - eye.y, r.creature.body.half_extents)
-                        }).min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                        log::info!(
-                            "[autoplay-fight] swing: reach {:.1}, dragon near {}, hit {} (dragon {:?} = horiz m, dy m, half-extents)",
-                            attack_reach, dragon_near, best.is_some(), near_dragon
-                        );
-                    }
-                    if let Some((ri, _)) = best {
-                        // r-weapon-fix: was a fixed `{ element: Earth, magnitude: 12 }`
-                        // regardless of what was equipped, so every attack — bare
-                        // hands, dagger, or greatsword — dealt identical damage.
-                        // See `equipped_weapon`'s doc comment for the two fidelity
-                        // tiers (full spec in creative, class-only default in
-                        // survival until the inventory carries per-instance data).
-                        let attack = match &weapon {
-                            Some(w) => unendlich_engine::sim::combat::Attack {
-                                element: legendary_element_to_combat_element(w.element_idx),
-                                magnitude: w.base_damage.round().max(1.0) as u16,
-                                affliction_ticks: 0,
-                            },
-                            // Bare-fist fallback — deliberately weaker than any
-                            // forged weapon's damage range (4..45 across classes/
-                            // tiers), so equipping something is felt as an upgrade.
-                            None => unendlich_engine::sim::combat::Attack {
-                                element: unendlich_engine::sim::elemental::Element::Earth,
-                                magnitude: 4,
-                                affliction_ticks: 0,
-                            },
-                        };
-                        let mut aff = unendlich_engine::sim::affliction::Afflicted::new();
-                        let hit = unendlich_engine::sim::combat::resolve(&attack, None, None, &mut aff);
-                        // r268: crit + armor modifiers (off by default → flat damage).
-                        // r-weapon-fix: crit chance/multiplier now come from the
-                        // equipped weapon's own archetype (a dagger crits far more
-                        // often than a greataxe) instead of a fixed 0.2/1.8 for
-                        // every weapon and bare hands alike.
-                        let (crit_chance, crit_mult) = weapon.as_ref()
-                            .map_or((0.2, 1.8), |w| (w.crit_chance, w.crit_mult));
-                        let dmg_dealt: i32 = if combat_mods_enabled {
-                            let raw = hit.health_damage as f32;
-                            // deterministic crit roll from frame + target identity
-                            let roll_seed = (frame_count as u64)
-                                .wrapping_mul(0x9E37_79B9)
-                                .wrapping_add(ri as u64);
-                            let roll = ((roll_seed >> 40) & 0xFFFF) as f32 / 65535.0;
-                            let crit_dmg = unendlich_engine::sim::crit_roll::crit(roll, crit_chance, crit_mult);
-                            // natural armor from body mass (bigger = tougher hide)
-                            let armor = (roamers[ri].creature.mass * 2.0).clamp(0.0, 30.0);
-                            let mitig = unendlich_engine::sim::damage_after_armor::mitigated(
-                                raw * crit_dmg, armor, 20.0,
-                            );
-                            let was_crit = crit_dmg > 1.0;
-                            if was_crit {
-                                log::info!("[combat] CRIT ×{:.1} (raw {} → {:.0} after armor {:.0})", crit_dmg, hit.health_damage, mitig, armor);
-                            }
-                            mitig.round().max(1.0) as i32
-                        } else {
-                            hit.health_damage as i32
-                        };
-                        {
-                            // r143: violence is remembered — Harm event.
-                            let (nb, nt) = unendlich_engine::sim::bond_tame::advance(
-                                roamers[ri].bond,
-                                unendlich_engine::sim::bond_tame::Event::Harm,
-                                roamers[ri].trust,
-                            );
-                            roamers[ri].bond = nb;
-                            roamers[ri].trust = nt;
-                        }
-                        // DRAGON DUEL: a dragon takes the hit through its own
-                        // genetics — the item's element against its element, the
-                        // side the blow landed on against its build's weak spot,
-                        // and its hide — and remembers it (element, reach).
-                        let target = &mut roamers[ri];
-                        let (dp, dyaw, he, hp_now) = (
-                            target.creature.body.position,
-                            target.creature.yaw,
-                            target.creature.body.half_extents,
-                            target.hp,
-                        );
-                        let dmg_dealt = if let Some(d) = target.duel.as_mut() {
-                            use unendlich_engine::sim::dragon_duel as dd;
-                            let mut threat = player_item_threat(
-                                survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
-                            );
-                            // The same test override the dragons' senses see.
-                            if player_element_override.is_some() {
-                                threat.element = player_element_override;
-                            }
-                            let body = dd::DragonBody { pos: dp, yaw: dyaw, half_extents: he };
-                            let (zone, h) = dd::take_hit(&d.profile, &mut d.state, &body, [eye.x, eye.y, eye.z], &threat);
-                            if d.shells.take().is_some() {
-                                log::info!("[dragon#{:04x}] you found it — its shell game is over", d.id & 0xffff);
-                            }
-                            // No crit roll here: the combat-mods crit is folded into
-                            // a mass-armor mitigation above that dragons replace
-                            // with hide, and can't be separated back out of it.
-                            let dealt = h.damage;
-                            log::info!(
-                                "[dragon#{:04x}] hit on the {:?}{} — item ×{:.1} ({} vs {}), hide {:.0} → {} dmg ({}/{} hp)",
-                                d.id & 0xffff, zone,
-                                if h.weak_spot { format!(" — its {}!", d.profile.weak_spot.name()) } else { String::new() },
-                                h.element_mult,
-                                threat.element.map_or("unaligned", |e| unendlich_engine::sim::dragon_archetype::ELEMENT_NAMES[e as usize % 6]),
-                                d.profile.element_name(), h.hide, dealt,
-                                (hp_now - dealt).max(0), d.profile.max_hp
-                            );
-                            dealt
-                        } else {
-                            dmg_dealt
-                        };
-                        roamers[ri].hp -= dmg_dealt;
-                        // r509: the weapon wears with each swing; at 0 it breaks (survival only).
-                        if survival_mode {
-                            if let Some((wid, cur, max)) = equipped_weapon_dura {
-                                let (nc, broke) = unendlich_engine::sim::item_durability::apply_wear(
-                                    cur, max, WEAR_PER_ATTACK,
-                                );
-                                equipped_weapon_dura = Some((wid, nc, max));
-                                if broke {
-                                    let _ = fg_app.inventory_mut().remove_item(wid, 1);
-                                    equipped_weapon_dura = None;
-                                    log::info!("[durability] your weapon shattered from the blow");
-                                }
-                            }
-                        }
-                        // r-legendary: THE EQUIPPED WEAPON'S ABILITY. Every proc is
-                        // resolved by sim::weapon_ability::on_hit from the weapon in
-                        // hand (the previous arc demo forged a fixed Storm blade
-                        // whatever was equipped, behind UNENDLICH_LIGHTNING_ARC, and
-                        // the other five procs did nothing). Frost chills, the jet
-                        // shoves, gale launches, spikes stagger a radius, flame
-                        // burns a cone, lightning chains. Statuses land on
-                        // RoamerRig.status and tick in the roamer loop.
-                        let mut ability_kb_mult = 1.0f32;
-                        let mut ability_launch = 0.0f32;
-                        if let Some(w) = weapon.as_ref() {
-                            use unendlich_engine::sim::weapon_ability as wa;
-                            let origin = roamers[ri].creature.body.position;
-                            let mut cand_idx: Vec<usize> = Vec::new();
-                            let mut cand_pos: Vec<[f32; 3]> = Vec::new();
-                            for (rj, rr) in roamers.iter().enumerate() {
-                                if rj == ri || rr.hp <= 0 || rr.rig.dying.is_some() { continue; }
-                                let p = rr.creature.body.position;
-                                let d2 = (p[0] - origin[0]).powi(2)
-                                    + (p[1] - origin[1]).powi(2)
-                                    + (p[2] - origin[2]).powi(2);
-                                if d2 <= 14.0 * 14.0 {
-                                    cand_idx.push(rj);
-                                    cand_pos.push(p);
-                                }
-                            }
-                            let roll_seed = (frame_count as u64)
-                                .wrapping_mul(0x9E37_79B9)
-                                .wrapping_add(ri as u64 * 7919);
-                            let roll = ((roll_seed >> 40) & 0xFFFF) as f32 / 65535.0;
-                            let dir = [cam_forward.x, 0.0, cam_forward.z];
-                            let out = wa::on_hit(w, origin, dir, &cand_pos, roll);
-                            ability_kb_mult = out.knockback_mult;
-                            ability_launch = out.launch_up;
-                            if let Some(st) = out.target_status {
-                                roamers[ri].rig.status.apply(st);
-                            }
-                            for sp in &out.splash {
-                                let rj = cand_idx[sp.idx];
-                                if sp.damage > 0.0 {
-                                    roamers[rj].hp -= sp.damage.round().max(1.0) as i32;
-                                }
-                                if let Some(st) = sp.status {
-                                    roamers[rj].rig.status.apply(st);
-                                }
-                                if sp.shove > 0.0 {
-                                    let q = roamers[rj].creature.body.position;
-                                    let (dx, dz) = (q[0] - origin[0], q[2] - origin[2]);
-                                    let d = (dx * dx + dz * dz).sqrt().max(0.01);
-                                    let v = &mut roamers[rj].creature.body.velocity;
-                                    v[0] += dx / d * sp.shove;
-                                    v[1] += 0.4;
-                                    v[2] += dz / d * sp.shove;
-                                }
-                                if witness_enabled {
-                                    let vk = match roamers[rj].kind {
-                                        unendlich_engine::item::CreatureKind::Dinosaur => 1u8,
-                                        unendlich_engine::item::CreatureKind::Dragon => 2u8,
-                                        _ => 0u8,
-                                    };
-                                    attack_events.push((roamers[rj].creature.body.position, vk));
-                                }
-                            }
-                            if out.proc != unendlich_engine::sim::legendary_weapon::ProcKind::None {
-                                log::info!(
-                                    "[ability] {} — {:?} on the target{}",
-                                    out.label, out.target_status,
-                                    if out.splash.is_empty() { String::new() } else { format!(", {} other(s) caught", out.splash.len()) }
-                                );
-                            }
-                        }
-                        let _ = lightning_arc_enabled;
-                        // r284: record this attack so creatures that can see it can
-                        // react (witnessed-attack reaction, below). Position + kind.
-                        if witness_enabled {
-                            let vk = match roamers[ri].kind {
-                                unendlich_engine::item::CreatureKind::Dinosaur => 1u8,
-                                unendlich_engine::item::CreatureKind::Dragon => 2u8,
-                                _ => 0u8,
-                            };
-                            attack_events.push((roamers[ri].creature.body.position, vk));
-                        }
-                        // r268: being hit stokes aggression. The ceiling comes from
-                        // aggression_level (health + 1v1 numbers); a hit pushes
-                        // aggro toward it. High aggro → approach instead of flee.
-                        if aggro_enabled {
-                            let hp_frac = (roamers[ri].hp.max(0) as f32 / 40.0).clamp(0.0, 1.0);
-                            let ceil = unendlich_engine::sim::aggression_level::aggression(hp_frac, 0, 1);
-                            roamers[ri].aggro = (roamers[ri].aggro + 0.5).min(ceil.max(0.3));
-                            log::info!("[aggro] {:?} provoked → aggro {:.2} (ceil {:.2})", roamers[ri].kind, roamers[ri].aggro, ceil);
-                        }
-                        // r129: swipe-claw recoil — the struck creature flinches
-                        // (claw_curl curve drives a torso_bend impulse that the
-                        // per-frame decay relaxes).
-                        let curl = unendlich_engine::sim::claw_curl::claw_curl(
-                            1.0, roamers[ri].creature.gait_phase, 3,
-                        );
-                        roamers[ri].creature.torso_bend =
-                            curl.iter().sum::<f32>() / curl.len().max(1) as f32 * 0.6;
-                        // r566: KNOCKBACK — the blow shoves the struck creature along the
-                        // punch direction (+ a small upward pop), scaled by the attacker's
-                        // stature (knockback_dealt = 1.0 default → a giant sends them flying).
-                        {
-                            let kb = 3.0 * player_stature.knockback_dealt * ability_kb_mult;
-                            let v = &mut roamers[ri].creature.body.velocity;
-                            v[0] += cam_forward.x * kb;
-                            v[1] += 1.2 + ability_launch;
-                            v[2] += cam_forward.z * kb;
-                        }
-                        let p = roamers[ri].creature.body.position;
-                        log::info!(
-                            "[combat] punched {:?} for {} (hp {})",
-                            roamers[ri].kind, dmg_dealt, roamers[ri].hp.max(0)
-                        );
-                        if roamers[ri].hp <= 0 {
-                            log::info!("[combat] {:?} slain — meat dropped", roamers[ri].kind);
-                            // r146: DRAGON ESSENCE — dragons also yield
-                            // elemental essence per the engine's material
-                            // model (element from the archetype genome).
-                            if matches!(
-                                roamers[ri].kind,
-                                unendlich_engine::item::CreatureKind::Dragon
-                            ) {
-                                use unendlich_engine::sim::dragon_material_yield as dmy;
-                                let g2 = dragon_genome_of(&roamers[ri].duel);
-                                let elem = g2
-                                    .element
-                                    .iter()
-                                    .enumerate()
-                                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                                    .map(|(i, _)| i as u8)
-                                    .unwrap_or(0);
-                                let y = dmy::material_yield(&dmy::DragonMaterial {
-                                    element: elem,
-                                    attunement01: 0.6,
-                                    rarity_tier: 3,
-                                });
-                                let total: u32 = y.essence.iter().sum();
-                                let count = ((total / 20).clamp(1, 8)) as u16;
-                                fg_app.drops_mut().spawn(
-                                    unendlich_engine::items::ItemStack {
-                                        item: unendlich_engine::items::ItemId(3000 + elem as u32),
-                                        count,
-                                        weapon_instance: None,
-                                    },
-                                    [p[0], p[1] + 1.0, p[2]],
-                                    [0.4, 2.4, -0.3],
-                                );
-                                log::info!(
-                                    "[loot] dragon essence x{} (element {}) — a rare prize",
-                                    count, elem
-                                );
-                            }
-                            // r511: VARIED LOOT — meat count scales with the creature's bulk
-                            // (tier) via sim::loot_quantity, and a luck-boosted sim::drop_chance
-                            // roll adds an occasional egg. A small fish yields one scrap; a big
-                            // beast yields a haul.
-                            let tier = ((roamers[ri].creature.mass * 0.4) as u32).min(4);
-                            let luck = 0.25;
-                            let meat_n = unendlich_engine::sim::loot_quantity::quantity(tier, luck, 5)
-                                .max(1) as u16;
-                            fg_app.drops_mut().spawn(
-                                unendlich_engine::items::ItemStack {
-                                    item: unendlich_engine::items::ItemId(MEAT_ITEM),
-                                    count: meat_n,
-                                    weapon_instance: None,
-                                },
-                                [p[0], p[1] + 0.6, p[2]],
-                                [0.0, 2.0, 0.0],
-                            );
-                            let egg_p =
-                                unendlich_engine::sim::drop_chance::drop_chance(0.12, luck, 0.0);
-                            let roll = {
-                                let s = (p[0].to_bits() as u64)
-                                    ^ ((p[2].to_bits() as u64) << 17)
-                                    ^ (frame_count as u64).wrapping_mul(0x9E37_79B1);
-                                ((s >> 33) & 0xFFFF) as f32 / 65535.0
-                            };
-                            if roll < egg_p {
-                                fg_app.drops_mut().spawn(
-                                    unendlich_engine::items::ItemStack {
-                                        item: unendlich_engine::items::ItemId(999),
-                                        count: 1,
-                                        weapon_instance: None,
-                                    },
-                                    [p[0] + 0.3, p[1] + 0.7, p[2]],
-                                    [0.5, 2.2, 0.2],
-                                );
-                                log::info!("[loot] …and an egg");
-                            }
-                            log::info!("[loot] {} meat (tier {})", meat_n, tier);
-                            // r-rig: the body falls as a ragdoll, carrying the blow's
-                            // knockback, instead of vanishing on the hit frame.
-                            let kb = 3.0 * player_stature.knockback_dealt;
-                            begin_death(
-                                &mut roamers,
-                                ri,
-                                [cam_forward.x * kb, 2.0, cam_forward.z * kb],
-                                dt,
-                            );
-                        }
-                        last_block_action = Instant::now();
-                        creature_hit = true;
-                    }
-                }
+                // Fighting moved out of this click path: an attack is a timed
+                // move (see ITEMS IN HAND above) whose blow is resolved by
+                // strike_roamer when it lands. Here only feeding claims the click.
+                let creature_hit = click_fed_creature;
+                let _ = lightning_arc_enabled;
                 if break_allowed && !creature_hit {
                     // r-wendigo: vine cells need real continuous mining time
                     // (tool-dependent, see vine_mine_seconds) before they
@@ -15239,7 +15905,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         // a Fire dagger and a Storm dagger now visibly differ in the
                         // third-person hand, not just in the inventory icon and damage.
                         let held_color = if let Some(w) = equipped_weapon(
-                            survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
+                            survival_mode, creative_in_hand(renderer.creative_place_item, &thrown), hand_item, &fg_app, selected_palette_idx,
                         ) {
                             Some(legendary_element_color(w.element_idx, w.tier))
                         } else {
@@ -15289,7 +15955,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             anim_t: start.elapsed().as_secs_f32(),
                             held_color,
                             held: held_item_model(
-                                survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
+                                survival_mode, creative_in_hand(renderer.creative_place_item, &thrown), hand_item, &fg_app, selected_palette_idx,
                             ),
                             airborne: hero_airborne01,
                             vertical_vel: vvel,
@@ -15300,11 +15966,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             // person viewmodel's swing overlay a few hundred lines
                             // below, so the hero's arm and the held item in first
                             // person move through the exact same arc in lockstep.
-                            swing01: if swing_timer > 0.0 {
-                                let prog = 1.0 - (swing_timer / SWING_DURATION).clamp(0.0, 1.0);
-                                (prog * std::f32::consts::PI).sin()
-                            } else {
-                                0.0
+                            // The weapon's own move now drives the arm (`arm`), from
+                            // the same timeline as the first-person hand below.
+                            swing01: 0.0,
+                            arm: {
+                                use unendlich_engine::sim::weapon_motion as wm;
+                                let a = hand_swing.map(|sw| sw.arm()).unwrap_or_default();
+                                wm::mix_arm(a, wm::REACH_ARM, hand_reach01)
                             },
                         };
                         unendlich_engine::hero_forge::build(
@@ -15314,7 +15982,58 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             &pose,
                         )
                     } else {
-                        creature_to_vertices(av)
+                        // A body with no rig of its own (the default Wanderer and
+                        // every blueprint avatar) still holds what the hand holds:
+                        // placed by weapon_motion::hand_frame on a simple arm, so
+                        // it moves through the same wind-up, blow and catch.
+                        // Third-person only: in first person the viewmodel draws
+                        // it (below), and both at once would show two.
+                        let (mut cv, mut ci) = creature_to_vertices(av);
+                        let dragon_body = matches!(
+                            active_character.arche(),
+                            unendlich_engine::creature_design::Arche::Dragon
+                        );
+                        if camera_mode != 0 && !dragon_body {
+                            if let Some(model) = held_item_model(
+                                survival_mode,
+                                creative_in_hand(renderer.creative_place_item, &thrown),
+                                hand_item,
+                                &fg_app,
+                                selected_palette_idx,
+                            ) {
+                                use unendlich_engine::sim::weapon_motion as wm;
+                                let arm = wm::mix_arm(
+                                    hand_swing.map(|sw| sw.arm()).unwrap_or_default(),
+                                    wm::REACH_ARM,
+                                    hand_reach01,
+                                );
+                                // Body frame (+X forward, +Y up, +Z right) to world.
+                                let (sy, cy) = av.yaw.sin_cos();
+                                let to_w = |v: [f32; 3]| [v[0] * cy - v[2] * sy, v[1], v[0] * sy + v[2] * cy];
+                                // Size the arm from the body actually drawn (a
+                                // blueprint body is not built to the stature), so
+                                // the hand sits at its shoulder, not inside it.
+                                let feet = av.body.position;
+                                let rgt = [-sy, 0.0, cy];
+                                let (mut lo, mut hi, mut side) = (f32::MAX, f32::MIN, 0.0f32);
+                                for v in &cv {
+                                    lo = lo.min(v.position[1]);
+                                    hi = hi.max(v.position[1]);
+                                    let d = (v.position[0] - feet[0]) * rgt[0] + (v.position[2] - feet[2]) * rgt[2];
+                                    side = side.max(d);
+                                }
+                                let h = if hi > lo { hi - lo } else { player_stature.height }.max(0.5);
+                                let (hand, b) = wm::hand_frame(&arm, 0.19 * h, 0.17 * h);
+                                let sh = to_w([0.0, 0.0, side.clamp(0.1 * h, 0.4 * h) * 0.85]);
+                                let hw = to_w(hand);
+                                let origin = [feet[0] + sh[0] + hw[0], lo + 0.78 * h + hw[1], feet[2] + sh[2] + hw[2]];
+                                let basis = [to_w(b[0]), to_w(b[1]), to_w(b[2])];
+                                // The item keeps a human hand's proportion to the body.
+                                let unit = HERO_VOXEL_M * (h / 1.8).clamp(0.5, 4.0);
+                                push_item_model(&mut cv, &mut ci, &model, origin, basis, unit, None);
+                            }
+                        }
+                        (cv, ci)
                     };
                     let base = everts.len() as u32;
                     // r535: AVATAR FADE (real alpha). As the body obscures more of the
@@ -15331,9 +16050,19 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             - local_player.view.forward() * (2.6 * cam_zoom)
                             + local_player.view.right() * 0.9
                             + glm::vec3(0.0, 0.45, 0.0),
+                        3 => {
+                            let yaw = local_player.view.yaw + portrait.0;
+                            local_player.view.position - glm::vec3(0.0, 0.2, 0.0)
+                                + glm::vec3(yaw.cos(), 0.0, yaw.sin()) * portrait.1
+                        }
                         _ => local_player.view.position,
                     };
-                    let cam_fwd = local_player.view.forward();
+                    let cam_fwd = if camera_mode == 3 {
+                        let yaw = local_player.view.yaw + portrait.0;
+                        -glm::vec3(yaw.cos(), 0.0, yaw.sin())
+                    } else {
+                        local_player.view.forward()
+                    };
                     // r562: taller bodies fill the FP view far more, so widen the
                     // coverage net AND deepen the fade with height (= 1.0 at default).
                     let fade_r = (player_stature.height
@@ -15783,12 +16512,28 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
                 // held-item model with walk bob + per-form pose, placed in
                 // camera space and pushed through the same entity stream.
-                // r486: advance the held-item swing — fire on a block action, decay each frame.
+                // r486: a block action (mine/place) swings the hand: the work
+                // swing, when no other move is on (sim::weapon_motion, which
+                // replaced the fixed 0.24 s swing_timer arc).
                 if last_block_action != prev_block_action {
-                    swing_timer = SWING_DURATION;
+                    if hand_swing.is_none() {
+                        let c = hand_item.and_then(|h| unendlich_engine::sim::viewmodel::weapon_class_for_id(h.0));
+                        hand_swing = Some(unendlich_engine::sim::weapon_motion::Swing::of(
+                            c, unendlich_engine::sim::weapon_motion::Motion::Work, 0.0, 0,
+                        ));
+                        hand_move = HandMove::Work;
+                    }
                 }
-                swing_timer = (swing_timer - frame_dt_s).max(0.0);
-                if mouse_captured && camera_mode == 0 && !fp_body && (hand_item.is_some() || debug_weapon_class.is_some()) {
+                // In first person the body is drawn (fp_body), and a forge hero's
+                // own hand carries the item; a body without a rigged hand (the
+                // default Wanderer, a blueprint avatar) would show nothing in hand,
+                // so for those the viewmodel draws it.
+                let rigged_hand = unendlich_engine::hero_forge::HeroKind::from_name(&active_character.name).is_some();
+                if (mouse_captured || fg_autoplay_fight || hand_pose_debug.is_some())
+                    && camera_mode == 0
+                    && (!fp_body || !rigged_hand)
+                    && (hand_item.is_some() || debug_weapon_class.is_some())
+                {
                     use unendlich_engine::sim::viewmodel as vm;
                     use unendlich_engine::sim::elemental::ItemForm;
                     let fwd = local_player.forward();
@@ -15829,17 +16574,56 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         _ => ItemForm::Tool,
                     };
                     let mut pose = vm::viewmodel_pose(form, walk_phase, speed01, [0.0, 0.0]);
-                    // r486: overlay the use-swing — a quick down-forward arc that
-                    // peaks mid-swing, on top of the walk pose.
-                    if swing_timer > 0.0 {
-                        let prog = 1.0 - (swing_timer / SWING_DURATION).clamp(0.0, 1.0);
-                        let arc = (prog * std::f32::consts::PI).sin();
-                        pose.pitch += arc * 0.95;
-                        pose.roll += arc * 0.15;
-                        pose.offset[1] -= arc * 0.10;
-                        pose.offset[2] -= arc * 0.06;
+                    // The hand's move (sim::weapon_motion): the same timeline the
+                    // third-person arm plays, projected into view space.
+                    {
+                        use unendlich_engine::sim::weapon_motion as wm;
+                        let d = wm::mix_view(
+                            hand_swing.map(|sw| sw.view()).unwrap_or_default(),
+                            wm::REACH_VIEW,
+                            hand_reach01,
+                        );
+                        pose.offset[0] += d.offset[0];
+                        pose.offset[1] += d.offset[1];
+                        pose.offset[2] += d.offset[2];
+                        pose.pitch += d.pitch;
+                        pose.yaw += d.yaw;
+                        pose.roll += d.roll;
                     }
-                    let hand_boxes = if let Some(c) = weapon {
+                    // The item as the hero's hand draws it (item_model: element
+                    // colours, the same boxes as third person), turned into the
+                    // viewmodel's frame. item_model runs +Y along the item, +Z
+                    // across the edge, +X through it; the viewmodel runs +Z along,
+                    // +X across, +Y through -- a cyclic swap, so handedness holds.
+                    let model_boxes = if debug_weapon_class.is_none() {
+                        held_item_model(
+                            survival_mode,
+                            creative_in_hand(renderer.creative_place_item, &thrown),
+                            hand_item,
+                            &fg_app,
+                            selected_palette_idx,
+                        )
+                        .filter(|m| m.class.is_weapon())
+                        .map(|m| {
+                            m.boxes
+                                .iter()
+                                .map(|b| {
+                                    let h = b.half();
+                                    let u8c = |x: f32| (x.clamp(0.0, 1.0) * 255.0) as u8;
+                                    vm::ItemBox {
+                                        center: [b.center[2] * HERO_VOXEL_M, b.center[0] * HERO_VOXEL_M, b.center[1] * HERO_VOXEL_M],
+                                        half: [h[2] * HERO_VOXEL_M, h[0] * HERO_VOXEL_M, h[1] * HERO_VOXEL_M],
+                                        color: [u8c(b.color[0]), u8c(b.color[1]), u8c(b.color[2])],
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    } else {
+                        None
+                    };
+                    let hand_boxes = if let Some(mb) = model_boxes {
+                        mb
+                    } else if let Some(c) = weapon {
                         vm::weapon_model(c)
                     } else if let Some(b) = held_block {
                         vm::block_model(b.base_color())
@@ -15858,16 +16642,24 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     col[1] as f32 / 255.0,
                                     col[2] as f32 / 255.0,
                                 ],
-                                alpha: 1.0,
+                                // > 1: "at the eye" -- opaque and exempt from
+                                // entity.frag's near cutout, which would
+                                // otherwise discard an item this close.
+                                alpha: 2.0,
                             });
                         }
+                        // box_corners_in_view orders corners x-major, then y,
+                        // then z (index = 4x + 2y + z); these are its six faces.
+                        // (The list here before assumed a ring order and drew
+                        // four faces as slivers across the box -- unseen while
+                        // this path never ran.)
                         for &i in &[
-                            0u32, 1, 2, 0, 2, 3,
-                            4, 6, 5, 4, 7, 6,
-                            0, 4, 5, 0, 5, 1,
-                            1, 5, 6, 1, 6, 2,
-                            2, 6, 7, 2, 7, 3,
-                            3, 7, 4, 3, 4, 0,
+                            0u32, 2, 3, 0, 3, 1, // -x
+                            4, 5, 7, 4, 7, 6, // +x
+                            0, 1, 5, 0, 5, 4, // -y
+                            2, 6, 7, 2, 7, 3, // +y
+                            0, 4, 6, 0, 6, 2, // -z
+                            1, 3, 7, 1, 7, 5, // +z
                         ] {
                             eindices.push(base + i);
                         }
@@ -15877,6 +16669,39 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 let base = everts.len() as u32;
                 everts.extend(mv);
                 eindices.extend(mi.iter().map(|i| i + base));
+            }
+            // The weapon out of the hand, at its own pose (spinning, lodged,
+            // on guard), and the Flying Sword's lightning links.
+            if let Some(ti) = thrown.as_ref() {
+                let sword = unendlich_engine::sim::thrown_weapon::is_flying_sword(&ti.t.weapon);
+                let tint = if sword { Some(([0.80, 0.78, 1.0], 0.18)) } else { None };
+                push_item_model(everts, eindices, &ti.model, ti.t.pos, ti.t.basis(), HERO_VOXEL_M, tint);
+            }
+            for (k, &(a, b, life)) in arc_flashes.iter().enumerate() {
+                // A jagged line: kinks re-rolled every frame so it crackles.
+                let n = 9usize;
+                let mut prev = a;
+                let alpha = (life / 0.35).clamp(0.0, 1.0);
+                for i in 1..=n {
+                    let t = i as f32 / n as f32;
+                    let h = (frame_count as u64 ^ (k as u64 * 0x9E37) ^ (i as u64 * 0x85EB_CA6B))
+                        .wrapping_mul(0x2545_F491_4F6C_DD1D);
+                    let j = |sh: u32| (((h >> sh) & 0xFF) as f32 / 255.0 - 0.5) * 0.9 * (1.0 - (2.0 * t - 1.0).powi(2));
+                    let p = if i == n {
+                        b
+                    } else {
+                        [a[0] + (b[0] - a[0]) * t + j(8), a[1] + (b[1] - a[1]) * t + j(24), a[2] + (b[2] - a[2]) * t + j(40)]
+                    };
+                    let seg = [p[0] - prev[0], p[1] - prev[1], p[2] - prev[2]];
+                    let len = (seg[0] * seg[0] + seg[1] * seg[1] + seg[2] * seg[2]).sqrt();
+                    let steps = ((len / 0.18).ceil() as usize).clamp(1, 40);
+                    for q in 0..steps {
+                        let u = (q as f32 + 0.5) / steps as f32;
+                        let c = [prev[0] + seg[0] * u, prev[1] + seg[1] * u, prev[2] + seg[2] * u];
+                        push_glow_box(&mut fx_verts, &mut fx_indices, c, [0.07; 3], [0.85, 0.80, 1.0], alpha);
+                    }
+                    prev = p;
+                }
             }
             renderer.upload_entities(&ctx, everts.as_slice(), eindices.as_slice());
             renderer.upload_effects(&ctx, fx_verts.as_slice(), fx_indices.as_slice());
@@ -16193,6 +17018,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 });
                 v.position = eye + dir * pinched;
                 v.pitch = (v.pitch - cam_tilt).clamp(-1.5, 1.5);
+                v
+            }
+            3 => {
+                let mut v = local_player.view;
+                let eye = local_player.view.position;
+                let yaw = local_player.view.yaw + portrait.0;
+                let at = eye - glm::vec3(0.0, 0.45, 0.0);
+                v.position = at + glm::vec3(yaw.cos(), 0.0, yaw.sin()) * portrait.1 + glm::vec3(0.0, 0.25 + 0.35 * portrait.1, 0.0);
+                let d = at - v.position;
+                v.yaw = d.z.atan2(d.x);
+                v.pitch = d.y.atan2((d.x * d.x + d.z * d.z).sqrt());
                 v
             }
             _ => local_player.view,
@@ -17264,6 +18100,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             unendlich_engine::sim::command_parse::GameMode::Survival
                                 | unendlich_engine::sim::command_parse::GameMode::Adventure
                         );
+                        // Posing (UNENDLICH_HAND_POSE=file:..) wants a steady
+                        // shot: creative, hovering where the world put the eye,
+                        // clear of water and slopes.
+                        if hand_pose_file.is_some() {
+                            survival_mode = false;
+                        }
                         local_player.permissions.can_toggle_flight = !survival_mode;
                         // r195: launching SURVIVAL must also END active flight,
                         // not merely forbid toggling it. Previously you could
