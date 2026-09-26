@@ -209,65 +209,39 @@ fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
         ui.colored_label(c.text_weak, "No tracks.");
         return;
     }
-    for t in &tracks {
-        ui.horizontal(|ui| {
-            let kind = match t.kind {
-                studio_core::TrackKind::Audio => "♪",
-                studio_core::TrackKind::Video => "▣",
-            };
-            ui.label(format!("{kind} {}", t.name));
-
-            // Mute is a project fact: an op, so it undoes and travels.
-            let mut audible = !t.muted;
-            if ui.checkbox(&mut audible, "M").on_hover_text("muted (an edit)").changed() {
-                s.edit(studio_core::Op::SetTrackFlags {
-                    id: t.id, muted: !audible, locked: t.locked,
-                }, if audible { "unmuted" } else { "muted" });
-            }
-
-            // Solo is a listening fact: local, dirty-only.
-            let soloed = s.solo.contains(&t.id);
-            if ui.add(egui::Button::selectable(soloed, "S"))
-                .on_hover_text("solo (monitoring only — not an edit)").clicked()
-            {
-                if soloed { s.solo.retain(|id| *id != t.id); }
-                else { s.solo.push(t.id); }
-                s.arrangement_dirty = true;
-            }
-
-            // The fader: preview locally while dragging, one op on release.
-            let mut shown = match s.mixer_drag {
-                Some((id, v)) if id == t.id => v,
-                _ => t.gain,
-            };
-            let resp = ui.add(egui::Slider::new(&mut shown, 0.0..=1.5)
-                .text("gain").custom_formatter(|v, _| {
-                    if v <= 0.0 { "-inf dB".into() }
-                    else { format!("{:+.1} dB", 20.0 * v.log10()) }
-                }));
-            if resp.dragged() {
-                // Visual preview only: the AUDIO follows on release, because
-                // "audible while dragging" here would mean a full arrangement
-                // re-render per frame (this shell's whole-buffer trade), and
-                // the project wouldn't even hold the preview value to render
-                // from. A live fader ride is the streaming DeviceEngine's
-                // job, named as future work — not something to fake badly.
-                s.mixer_drag = Some((t.id, shown));
-            }
-            if resp.drag_stopped() {
-                s.mixer_drag = None;
-                s.edit(studio_core::Op::SetTrackGain { id: t.id, gain: shown },
-                       "gain");
-            } else if resp.changed() && !resp.dragged() {
-                // Keyboard / click-set: no drag lifecycle, commit at once.
-                s.edit(studio_core::Op::SetTrackGain { id: t.id, gain: shown },
-                       "gain");
-            }
-            // Right-click the parameter to automate it — the fader is the
-            // ingress point, not a separate routing matrix. The strip lives
-            // under the timeline; the status line says so.
-            automate_menu(&resp, s, studio_core::AutoTarget::TrackGain(t.id));
-        });
+    // FOLDED into families (studio_egui::routing), the same toggles as the
+    // routing map above: A Top A Tower's 159 lane rows become ~26 headers,
+    // each opening onto its lanes; an all-muted family hides unless "show
+    // muted". Single-lane families and video tracks stay plain rows.
+    let (fold, show_muted) = ui.data(|d| (d.get_temp::<bool>(egui::Id::new("routing-fold")).unwrap_or(true),
+                                          d.get_temp::<bool>(egui::Id::new("routing-show-muted")).unwrap_or(false)));
+    if !fold {
+        for t in &tracks { track_row(ui, s, c, t); }
+    } else {
+        for t in tracks.iter().filter(|t| t.kind != studio_core::TrackKind::Audio) { track_row(ui, s, c, t); }
+        for f in studio_egui::routing::families(&s.session.doc.project) {
+            if f.all_muted() && !show_muted { continue; }
+            let lanes: Vec<studio_core::Track> = f.tracks.iter().filter_map(|id| tracks.iter().find(|t| t.id == *id).cloned()).collect();
+            if lanes.len() == 1 { track_row(ui, s, c, &lanes[0]); continue; }
+            ui.horizontal(|ui| {
+                // One mute for the family: ONE grouped edit, one undo. Unmuting
+                // brings back only the lanes that were not muted IN FL -- the
+                // ideas the artist switched off stay a mute away, each on its
+                // own row inside, instead of all coming back at once (the first
+                // version unmuted all 19 of Triplit's lanes, 17 of them FL-muted).
+                let mut audible = !f.all_muted();
+                if ui.checkbox(&mut audible, "").on_hover_text("mute / unmute this family (one edit); unmuting leaves the lanes muted in FL muted").changed() {
+                    let ops: Vec<studio_core::Op> = lanes.iter()
+                        .filter(|t| !audible || !t.name.contains("(muted in FL)"))
+                        .map(|t| studio_core::Op::SetTrackFlags { id: t.id, muted: !audible, locked: t.locked }).collect();
+                    s.edit_group(ops, if audible { "family unmuted" } else { "family muted" });
+                }
+                egui::CollapsingHeader::new(f.label()).id_salt(("mixer-family", f.name.clone(), f.route.map(|b| b.0)))
+                    .default_open(false).show(ui, |ui| {
+                        ui.vertical(|ui| { for t in &lanes { track_row(ui, s, c, t); } });
+                    });
+            });
+        }
     }
     // ── busses ──────────────────────────────────────────────────────────
     // The routing half the model always had and this panel never showed:
@@ -488,4 +462,66 @@ mod send_defaults_tests {
             assert!(ADDABLE_FX.iter().any(|(kind, _)| kind == k), "{k} is addable");
         }
     }
+}
+
+/// One track's row: name, mute, solo, fader -- the unit a family folds.
+fn track_row(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, t: &studio_core::Track) {
+    ui.horizontal(|ui| {
+        let kind = match t.kind {
+            studio_core::TrackKind::Audio => "♪",
+            studio_core::TrackKind::Video => "▣",
+        };
+        ui.label(format!("{kind} {}", t.name));
+
+        // Mute is a project fact: an op, so it undoes and travels.
+        let mut audible = !t.muted;
+        if ui.checkbox(&mut audible, "M").on_hover_text("muted (an edit)").changed() {
+            s.edit(studio_core::Op::SetTrackFlags {
+                id: t.id, muted: !audible, locked: t.locked,
+            }, if audible { "unmuted" } else { "muted" });
+        }
+
+        // Solo is a listening fact: local, dirty-only.
+        let soloed = s.solo.contains(&t.id);
+        if ui.add(egui::Button::selectable(soloed, "S"))
+            .on_hover_text("solo (monitoring only — not an edit)").clicked()
+        {
+            if soloed { s.solo.retain(|id| *id != t.id); }
+            else { s.solo.push(t.id); }
+            s.arrangement_dirty = true;
+        }
+
+        // The fader: preview locally while dragging, one op on release.
+        let mut shown = match s.mixer_drag {
+            Some((id, v)) if id == t.id => v,
+            _ => t.gain,
+        };
+        let resp = ui.add(egui::Slider::new(&mut shown, 0.0..=1.5)
+            .text("gain").custom_formatter(|v, _| {
+                if v <= 0.0 { "-inf dB".into() }
+                else { format!("{:+.1} dB", 20.0 * v.log10()) }
+            }));
+        if resp.dragged() {
+            // Visual preview only: the AUDIO follows on release, because
+            // "audible while dragging" here would mean a full arrangement
+            // re-render per frame (this shell's whole-buffer trade), and
+            // the project wouldn't even hold the preview value to render
+            // from. A live fader ride is the streaming DeviceEngine's
+            // job, named as future work — not something to fake badly.
+            s.mixer_drag = Some((t.id, shown));
+        }
+        if resp.drag_stopped() {
+            s.mixer_drag = None;
+            s.edit(studio_core::Op::SetTrackGain { id: t.id, gain: shown },
+                   "gain");
+        } else if resp.changed() && !resp.dragged() {
+            // Keyboard / click-set: no drag lifecycle, commit at once.
+            s.edit(studio_core::Op::SetTrackGain { id: t.id, gain: shown },
+                   "gain");
+        }
+        // Right-click the parameter to automate it — the fader is the
+        // ingress point, not a separate routing matrix. The strip lives
+        // under the timeline; the status line says so.
+        automate_menu(&resp, s, studio_core::AutoTarget::TrackGain(t.id));
+    });
 }
