@@ -1247,13 +1247,10 @@ impl App {
                     // the image (`renderComposed`) — rasterising text onto the
                     // JPEG is the next step, in media_encode. Said in the log
                     // so it is not mistaken for sent.
-                    let (duration_secs, caption) = match &snap {
-                        Some(c) => (c.duration.to_secs().min(u16::MAX as u32) as u16, c.caption.clone()),
-                        None => (snapclone_egui::composer::Composer::default().duration.to_secs() as u16, String::new()),
+                    let duration_secs = match &snap {
+                        Some(c) => c.duration.to_secs().min(u16::MAX as u32) as u16,
+                        None => snapclone_egui::composer::Composer::default().duration.to_secs() as u16,
                     };
-                    if !caption.is_empty() {
-                        eprintln!("snapclone: caption {caption:?} not on the wire yet (no text field in SnapFrame; bake into the image is the next step)");
-                    }
                     // Open the path first: on a port-preserving NAT the TCP
                     // SYN that follows rides the UDP mapping the volley
                     // makes (the C++ comment on why TCP works afterwards).
@@ -1265,6 +1262,20 @@ impl App {
                     let Some(bytes) = self.last_snap.clone() else {
                         eprintln!("snapclone: nothing to send — take a photo first");
                         continue;
+                    };
+                    // THE CAPTION GOES INTO THE PIXELS, as the Qt build's
+                    // renderComposed does: SnapFrame has no text field, and a
+                    // caption shown to the sender must be what the recipient
+                    // sees. Failing to bake sends the photo without it -- and
+                    // says so -- rather than not sending.
+                    let bytes = match &snap {
+                        Some(c) if !c.caption.trim().is_empty() => {
+                            match snapclone_egui::media_encode::bake_caption_jpeg(&bytes, &c.caption, c.color, c.caption_y, 85) {
+                                Ok(b) => b,
+                                Err(e) => { eprintln!("snapclone: caption not drawn ({e}); sending the photo without it"); bytes }
+                            }
+                        }
+                        _ => bytes,
                     };
                     let me = self.snap.local_id.clone();
                     let name = self.snap.settings.current.general.display_name.clone();
