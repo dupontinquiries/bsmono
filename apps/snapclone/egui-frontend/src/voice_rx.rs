@@ -186,7 +186,7 @@ mod tests {
         // than extrapolated.)
         let ratio = |k: usize| rms(&lossy[slot + k]) / rms(&full[slot + k]).max(1e-6);
         assert!(ratio(1) > 0.4 && ratio(2) > ratio(1) && ratio(3) > ratio(2) && ratio(3) > 0.7,
-                "real audio returns after the gap: {:.2} {:.2} {:.2}", ratio(1), ratio(2), ratio(3));
+                "real audio returns after the gap: {:.2} {:.2} {:.2} (these measurements need libopus >= 1.4: without libopus-dev at build time audiopus_sys silently builds its bundled Opus 1.3, which codes this test tone without usable FEC -- install libopus-dev and `cargo clean -p audiopus_sys`)", ratio(1), ratio(2), ratio(3));
     }
 
     #[test]
@@ -219,7 +219,7 @@ mod tests {
         let slot = full.iter().position(|f| rms(f) > 0.0).unwrap() + 6;
         let err = |a: &[f32], b: &[f32]| (a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>() / a.len() as f32).sqrt();
         let (e_fec, e_plc) = (err(&fec[slot], &full[slot]), err(&plc[slot], &full[slot]));
-        assert!(e_fec < e_plc * 0.8, "slot error FEC {e_fec:.4} vs concealment {e_plc:.4}");
+        assert!(e_fec < e_plc * 0.8, "slot error FEC {e_fec:.4} vs concealment {e_plc:.4} (these measurements need libopus >= 1.4: without libopus-dev at build time audiopus_sys silently builds its bundled Opus 1.3, which codes this test tone without usable FEC -- install libopus-dev and `cargo clean -p audiopus_sys`)");
         // And the audio after the gap is back at once: measured 1.00 of the full
         // stream over the next three frames with FEC, against 0.60 / 0.71 / 0.80
         // after concealment (the decoder no longer re-converges from a guess).
