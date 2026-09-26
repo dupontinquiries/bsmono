@@ -3333,6 +3333,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // puddles; it cannot raise a lake.
     let water_sim_enabled =
         std::env::var("UNENDLICH_WATER_SIM").map(|v| v != "0" && !v.is_empty()).unwrap_or(true);
+    // UNENDLICH_WATER_TRACE=1: one log line per sim tick with the cell budget — gathered cells,
+    // the quantized target, rain/boil/evap, the planned and applied adds/removes.
+    let water_trace = std::env::var("UNENDLICH_WATER_TRACE").map_or(false, |v| v == "1");
+    // Lava flows by default (UNENDLICH_LAVA_FLOW=0 freezes it as before), every third water tick.
+    let lava_flow_enabled = std::env::var("UNENDLICH_LAVA_FLOW").map_or(true, |v| v != "0");
+    let mut lava_tick: u32 = 0;
     // r637: DEFAULT ON. Water lateral spread (settle toward level) was gated off since
     // r539 for perf; the operator wants water to flow to the sides, so it's on by default now.
     // It's budgeted/throttled (radius/budget/interval below). Disable with UNENDLICH_WATER_SIM=0
@@ -17368,51 +17374,46 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 };
 
                 // opt-3: gather each column's (floor, water-count) — parallel above 2048 cols.
+                // The scan itself is `water_sim_core::gather` (the tested copy): the floor is
+                // the solid the water RESTS ON — the topmost solid BELOW the topmost water
+                // (r445: a solid ABOVE the water, an overhang or cave roof, is not the floor).
+                // r448: only SOLID blocks (and lava, which water rests on and boils) count as
+                // a floor; non-solid decorations are open, so water floods them (waterlogging).
+                use unendlich_engine::sim::water_sim_core as wsc;
                 let cols: Vec<usize> = (0..n).collect();
-                let gathered: Vec<(i32, f32, bool)> =
+                let gathered: Vec<wsc::Gathered> =
                     unendlich_engine::util::task_lanes::map_pure_threshold(&cols, 2048, |&i| {
                         let cj = (i % side) as i32;
                         let ci = (i / side) as i32;
                         let wx = px - rh + cj;
                         let wz = pz - rh + ci;
-                        // r445: the floor is the solid the water RESTS ON — the topmost solid
-                        // BELOW the topmost water cell — NOT the topmost solid overall. The old
-                        // code took the highest solid, so a column with a solid ABOVE the water (an
-                        // overhang, a cave ceiling, a placed block, a terrain lip) set base above
-                        // that solid and the write-back stacked the water on top of it → the
-                        // "water rises occasionally" reports. Track the last solid seen scanning up
-                        // and commit it as the floor each time water appears above it.
-                        let mut floor_y = i32::MIN;
-                        let mut last_solid = i32::MIN;
-                        let mut last_solid_lava = false;
-                        let mut wc = 0.0f32;
-                        let mut lava = false;
-                        for wy in win_lo..win_hi {
-                            let b = read(wx, wy, wz);
-                            if b == BlockId::Water || b == BlockId::Ice {
-                                wc += 1.0;
-                                floor_y = last_solid; // bed under the (highest-so-far) water
-                                lava = last_solid_lava; // water boils if its BED is lava
-                            } else if b.is_solid() || b == BlockId::Lava {
-                                // r448: only SOLID blocks (and lava, which water rests on + boils)
-                                // count as a floor. Non-solid decorations — grass, flowers, ferns,
-                                // vines, mushrooms, … — fall through and are treated like air, so
-                                // water flows into and floods them (waterlogging) instead of perching
-                                // on top of them.
-                                last_solid = wy;
-                                last_solid_lava = b == BlockId::Lava;
-                            }
-                        }
-                        (floor_y, wc, lava)
+                        let cells: Vec<wsc::Cell> = (win_lo..win_hi)
+                            .map(|wy| match read(wx, wy, wz) {
+                                BlockId::Water | BlockId::Ice => wsc::Cell::Water,
+                                BlockId::Lava => wsc::Cell::Lava,
+                                b if b.is_solid() => wsc::Cell::Solid,
+                                _ => wsc::Cell::Air,
+                            })
+                            .collect();
+                        wsc::gather(&cells, win_lo, wsc::Cell::Water)
                     });
-                let mut floor: Vec<i32> = Vec::with_capacity(n);
+                let mut floor_opt: Vec<Option<i32>> = Vec::with_capacity(n);
                 let mut depth: Vec<f32> = Vec::with_capacity(n);
                 let mut on_lava: Vec<bool> = Vec::with_capacity(n);
-                for (t, d, l) in gathered {
-                    floor.push(t);
-                    depth.push(d);
-                    on_lava.push(l);
+                let mut tops: Vec<Vec<(i32, i32)>> = Vec::with_capacity(n);
+                for g in gathered {
+                    floor_opt.push(g.sample.floor);
+                    depth.push(g.sample.depth);
+                    on_lava.push(g.sample.on_lava);
+                    tops.push(g.tops);
                 }
+                // Dry columns come back floorless from the gather; give the ones water can
+                // reach a floor, or water never runs into a trench, over a ledge, or into a
+                // puddle on dry ground (they were all bottomless = inert before this).
+                wsc::resolve_dry_floors(side, &mut floor_opt, &depth, &tops);
+                let floor: Vec<i32> = floor_opt.iter().map(|f| f.unwrap_or(i32::MIN)).collect();
+                // Cell counts as gathered, before rain/boil/settle: the quantizer's tie-break.
+                let gathered_depth: Vec<f32> = depth.clone();
                 // r424: rain adds shallow water to exposed columns before settling.
                 let rain_added = if water_rain && precip01 > 0.05 {
                     unendlich_engine::world::water_sources::apply_rain(
@@ -17472,99 +17473,25 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     })
                     .collect();
 
-                // Settle (gather-form: per-cell outflux then per-cell net; volume-conserving).
-                // r417: also accumulate the per-column flow vectors for the surface shader.
+                // Settle: `water_sim_core::ColumnGrid::settle_with` (gather-form, volume-
+                // conserving; r680 bottomless columns are infinite sources; r442 per-tick
+                // shed cap). r417: each iteration's sends feed the surface shader's flow field.
                 water_flow.reset(px - rh, pz - rh);
                 let settle_iters = if freezing { 0 } else { water_settle_iters };
-                // r442: cap total water a column may shed per TICK (summed across iters) so a dug
-                // hole fills over a few ticks instead of in one — visible flow, still volume-safe.
-                let mut sent_this_tick = vec![0.0f32; n];
-                for _ in 0..settle_iters {
-                    let mut send = vec![[0.0f32; 4]; n]; // +x, -x, +z, -z
-                    for zz in 0..side {
-                        for xx in 0..side {
-                            let i = xx + zz * side;
-                            let d = depth[i];
-                            if d <= 0.0 {
-                                continue;
-                            }
-                            // r680: a bottomless column (deep ocean, floor below the
-                            // sim window) now acts as an INFINITE SOURCE: it may SEND
-                            // downhill into a lower non-bottomless neighbour (so ocean
-                            // water pours into an adjacent cave / cliff gap until that
-                            // neighbour reaches sea level), but it never depletes (its
-                            // depth is held constant in the write-back below) and never
-                            // receives (neighbours skip `floor[j]==MIN` targets). Its
-                            // gather surface `base+depth` already equals the true sea
-                            // level, so it fills caves TO sea level and then stops
-                            // (df→0) — no runaway rise (the r441 concern) and no ocean
-                            // drain. Previously it was fully inert (`continue`), which is
-                            // why cave/ocean borders never poured.
-                            let is_source = floor[i] == i32::MIN;
-                            let surf = base[i] + d + steam[i];
-                            let mut want = [0.0f32; 4];
-                            let mut wt = 0.0f32;
-                            if xx + 1 < side {
-                                let j = i + 1;
-                                if floor[j] != i32::MIN {
-                                    let df = surf - (base[j] + depth[j] + steam[j]);
-                                    if df > 0.0 { want[0] = water_settle_f * df; wt += want[0]; }
-                                }
-                            }
-                            if xx > 0 {
-                                let j = i - 1;
-                                if floor[j] != i32::MIN {
-                                    let df = surf - (base[j] + depth[j] + steam[j]);
-                                    if df > 0.0 { want[1] = water_settle_f * df; wt += want[1]; }
-                                }
-                            }
-                            if zz + 1 < side {
-                                let j = i + side;
-                                if floor[j] != i32::MIN {
-                                    let df = surf - (base[j] + depth[j] + steam[j]);
-                                    if df > 0.0 { want[2] = water_settle_f * df; wt += want[2]; }
-                                }
-                            }
-                            if zz > 0 {
-                                let j = i - side;
-                                if floor[j] != i32::MIN {
-                                    let df = surf - (base[j] + depth[j] + steam[j]);
-                                    if df > 0.0 { want[3] = water_settle_f * df; wt += want[3]; }
-                                }
-                            }
-                            if wt <= 0.0 {
-                                continue;
-                            }
-                            let scale = if wt > d && !is_source { d / wt } else { 1.0 };
-                            // r442: also cap by remaining per-tick flow budget for this column.
-                            let total = wt * scale;
-                            let cap = (water_max_flow - sent_this_tick[i]).max(0.0);
-                            let scale = if total > cap && total > 0.0 {
-                                scale * (cap / total)
-                            } else {
-                                scale
-                            };
-                            sent_this_tick[i] += wt * scale;
-                            send[i] = [want[0] * scale, want[1] * scale, want[2] * scale, want[3] * scale];
-                        }
-                    }
-                    water_flow.accumulate(&send); // r417: fold this step's transfers into the flow field
-                    for zz in 0..side {
-                        for xx in 0..side {
-                            let i = xx + zz * side;
-                            let mut net = -(send[i][0] + send[i][1] + send[i][2] + send[i][3]);
-                            if xx + 1 < side { net += send[i + 1][1]; }
-                            if xx > 0 { net += send[i - 1][0]; }
-                            if zz + 1 < side { net += send[i + side][3]; }
-                            if zz > 0 { net += send[i - side][2]; }
-                            // r680: a bottomless source holds its level (infinite ocean) —
-                            // discard its own net so it never drains; real columns settle.
-                            if floor[i] != i32::MIN {
-                                depth[i] = (depth[i] + net).max(0.0).min((win_hi - win_lo) as f32);
-                            }
-                        }
-                    }
-                }
+                let mut grid = wsc::ColumnGrid::new(side);
+                grid.base = base;
+                grid.depth = depth;
+                grid.steam = steam;
+                grid.bottomless = floor.iter().map(|&f| f == i32::MIN).collect();
+                let params = wsc::FluidParams {
+                    f: water_settle_f,
+                    max_flow: water_max_flow,
+                    max_depth: (win_hi - win_lo) as f32,
+                    yield_h: 0.0,
+                    infinite_sources: true,
+                };
+                grid.settle_with(settle_iters, &params, |send| water_flow.accumulate(send));
+                let mut depth = std::mem::take(&mut grid.depth);
 
                 // r423: dry isolated shallow puddles (guarded so lakes are never eroded).
                 let evap_removed = if water_evap {
@@ -17575,14 +17502,22 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     0.0
                 };
 
-                // Write back: water from floor+1 up to +depth (rounded); Air<->Water only.
-                let mut budget = water_sim_budget;
-                let mut changes: usize = 0;
-                'wb: for ci in 0..side {
+                // Write back: water from floor+1 up to +q (whole cells); Air<->Water only.
+                // `quantize` shares round(total) cells by largest remainder: per-column
+                // rounding wrote 3+1 cells for a 2.5/0.5 split of 3, and the error compounded
+                // every tick because the next tick gathers what was written.
+                grid.depth = depth.clone();
+                let q: Vec<i32> = grid.quantize(&gathered_depth);
+                // Plan first, then apply within the budget with `split_budget`, which keeps
+                // the tick's net change (sources, rain, boiling) and spends the rest in
+                // matched add/remove pairs. Applying the first `budget` changes in scan order
+                // gave a drained column its removal and the column it drained into nothing,
+                // so water vanished until a later tick caught up.
+                let mut adds: Vec<(i32, i32, i32, BlockId)> = Vec::new();
+                let mut removes: Vec<(i32, i32, i32)> = Vec::new();
+                let mut swaps: Vec<(i32, i32, i32, BlockId)> = Vec::new(); // Water<->Ice, no volume change
+                for ci in 0..side {
                     for cj in 0..side {
-                        if budget == 0 {
-                            break 'wb;
-                        }
                         let i = cj + ci * side;
                         if floor[i] == i32::MIN {
                             continue;
@@ -17590,43 +17525,66 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         let wx = px - rh + cj as i32;
                         let wz = pz - rh + ci as i32;
                         let b0 = floor[i] + 1;
-                        let top = b0 + depth[i].round() as i32;
+                        let top = b0 + q[i];
                         for wy in b0..win_hi {
-                            if budget == 0 {
-                                break;
-                            }
                             let cur = read(wx, wy, wz);
-                            let want = wy < top;
-                            if want {
+                            if wy < top {
                                 // r425: surface cell is Ice when frozen, else Water.
                                 let desired = if freezing && wy == top - 1 {
                                     BlockId::Ice
                                 } else {
                                     BlockId::Water
                                 };
-                                let replaceable = cur == BlockId::Air
-                                    || cur == BlockId::Water
-                                    || cur == BlockId::Ice
+                                if cur == desired {
+                                    continue;
+                                }
+                                if cur == BlockId::Water || cur == BlockId::Ice {
+                                    swaps.push((wx, wy, wz, desired));
+                                } else if cur == BlockId::Air
                                     // r448: flood non-solid decorations (grass, flowers, ferns,
                                     // vines, mushrooms, …) — waterlogging. Never lava (that's the
                                     // lava↔water reaction) or any solid.
-                                    || (!cur.is_solid()
-                                        && cur != BlockId::Lava
-                                        && cur != BlockId::Air);
-                                if cur != desired && replaceable {
-                                    if chunk_manager.set_block(wx, wy, wz, desired) {
-                                        budget -= 1;
-                                        changes += 1;
-                                    }
+                                    || (!cur.is_solid() && cur != BlockId::Lava)
+                                {
+                                    adds.push((wx, wy, wz, desired));
                                 }
                             } else if cur == BlockId::Water || cur == BlockId::Ice {
-                                if chunk_manager.set_block(wx, wy, wz, BlockId::Air) {
-                                    budget -= 1;
-                                    changes += 1;
-                                }
+                                removes.push((wx, wy, wz));
                             }
                         }
                     }
+                }
+                let (n_add, n_rem) =
+                    wsc::split_budget(adds.len(), removes.len(), water_sim_budget);
+                adds.sort_by_key(|a| a.1); // fill from the bottom
+                removes.sort_by_key(|r| std::cmp::Reverse(r.1)); // drain from the top
+                let mut changes: usize = 0;
+                for &(wx, wy, wz, b) in adds.iter().take(n_add) {
+                    if chunk_manager.set_block(wx, wy, wz, b) {
+                        changes += 1;
+                    }
+                }
+                for &(wx, wy, wz) in removes.iter().take(n_rem) {
+                    if chunk_manager.set_block(wx, wy, wz, BlockId::Air) {
+                        changes += 1;
+                    }
+                }
+                let swap_budget = water_sim_budget.saturating_sub(n_add + n_rem);
+                for &(wx, wy, wz, b) in swaps.iter().take(swap_budget) {
+                    if chunk_manager.set_block(wx, wy, wz, b) {
+                        changes += 1;
+                    }
+                }
+                if water_trace {
+                    let real: f32 = gathered_depth.iter().zip(&floor).filter(|(_, &f)| f != i32::MIN).map(|(d, _)| *d).sum();
+                    let target: i32 = q.iter().zip(&floor).filter(|(_, &f)| f != i32::MIN).map(|(c, _)| *c).sum();
+                    log::info!(
+                        "water: cols {} wet {} cells {} -> {} (rain +{:.2} boil -{:.2} evap -{:.2}) plan +{} -{} ~{} applied +{} -{} budget {}",
+                        n,
+                        depth.iter().filter(|&&d| d > 0.0).count(),
+                        real as i64, target, rain_added, boil_removed, evap_removed,
+                        adds.len(), removes.len(), swaps.len(), n_add, n_rem, water_sim_budget
+                    );
                 }
                 // opt-1: keep simulating while water is still moving; otherwise go idle.
                 // r433: shoreline erosion — waves wash exposed Grass/Dirt at the waterline into
@@ -17641,7 +17599,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         if ebudget == 0 { break; }
                         let i = (estart + off) % n;
                         if depth[i] <= 0.0 || floor[i] == i32::MIN { continue; }
-                        let top_i = floor[i] + depth[i].round() as i32; // water surface level
+                        let top_i = floor[i] + q[i]; // water surface level
                         let cj = (i % side) as i32;
                         let ci = (i / side) as i32;
                         // 4 neighbours; erode a land neighbour's surface block at the waterline
@@ -17755,7 +17713,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         let wx = px - rh + cx as i32;
                         let wz = pz - rh + cz as i32;
                         // check a couple of water cells in this column against lava neighbours
-                        let surf_y = floor[i] + depth[i].round() as i32;
+                        let surf_y = floor[i] + q[i];
                         let y_lo = (floor[i] + 1).max(surf_y - 3);
                         for wy in y_lo..=surf_y {
                             if read(wx, wy, wz) != BlockId::Water { continue; }
@@ -17796,6 +17754,95 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 }
                             }
                             if lbudget == 0 { break; }
+                        }
+                    }
+                }
+                // LAVA FLOW. Lava never moved before: worldgen pockets and poured lava stood
+                // as placed. Same column settle as water, with `FluidParams::lava` (slow, a
+                // one-block yield so it stands in steps and a one-deep sheet does not creep,
+                // no infinite reservoir). Every third water tick. Water counts as open space
+                // here; where lava meets water the r444 reaction above solidifies it. Its
+                // changes keep the sim awake, so an opened pocket drains to rest.
+                if lava_flow_enabled {
+                    lava_tick = lava_tick.wrapping_add(1);
+                    if lava_tick % 3 == 0 {
+                        let lg: Vec<wsc::Gathered> =
+                            unendlich_engine::util::task_lanes::map_pure_threshold(&cols, 2048, |&i| {
+                                let wx = px - rh + (i % side) as i32;
+                                let wz = pz - rh + (i / side) as i32;
+                                let cells: Vec<wsc::Cell> = (win_lo..win_hi)
+                                    .map(|wy| match read(wx, wy, wz) {
+                                        BlockId::Lava => wsc::Cell::Lava,
+                                        BlockId::Water | BlockId::Ice => wsc::Cell::Water,
+                                        b if b.is_solid() => wsc::Cell::Solid,
+                                        _ => wsc::Cell::Air,
+                                    })
+                                    .collect();
+                                wsc::gather(&cells, win_lo, wsc::Cell::Lava)
+                            });
+                        if lg.iter().any(|g| g.sample.depth > 0.0) {
+                            let mut lfloor: Vec<Option<i32>> = lg.iter().map(|g| g.sample.floor).collect();
+                            let ldepth: Vec<f32> = lg.iter().map(|g| g.sample.depth).collect();
+                            let ltops: Vec<Vec<(i32, i32)>> = lg.iter().map(|g| g.tops.clone()).collect();
+                            wsc::resolve_dry_floors(side, &mut lfloor, &ldepth, &ltops);
+                            let mut lgrid = wsc::ColumnGrid::new(side);
+                            for i in 0..n {
+                                lgrid.depth[i] = ldepth[i];
+                                match lfloor[i] {
+                                    Some(f) => lgrid.base[i] = f as f32 + 1.0,
+                                    None => {
+                                        lgrid.base[i] = win_lo as f32;
+                                        lgrid.bottomless[i] = true;
+                                    }
+                                }
+                            }
+                            let lp = wsc::FluidParams::lava((win_hi - win_lo) as f32);
+                            let st = lgrid.settle_with(4, &lp, |_| {});
+                            if st.changed > 0 {
+                                let lq = lgrid.quantize(&ldepth);
+                                let mut ladd: Vec<(i32, i32, i32)> = Vec::new();
+                                let mut lrem: Vec<(i32, i32, i32)> = Vec::new();
+                                for i in 0..n {
+                                    let Some(f) = lfloor[i] else { continue };
+                                    let wx = px - rh + (i % side) as i32;
+                                    let wz = pz - rh + (i / side) as i32;
+                                    let top = f + 1 + lq[i];
+                                    for wy in (f + 1)..win_hi {
+                                        let cur = read(wx, wy, wz);
+                                        if wy < top {
+                                            if cur == BlockId::Air
+                                                || (!cur.is_solid() && !cur.is_fluid() && cur != BlockId::Ice)
+                                            {
+                                                ladd.push((wx, wy, wz));
+                                            }
+                                        } else if cur == BlockId::Lava {
+                                            lrem.push((wx, wy, wz));
+                                        }
+                                    }
+                                }
+                                let lbud = (water_sim_budget / 4).max(8);
+                                let (na, nr) = wsc::split_budget(ladd.len(), lrem.len(), lbud);
+                                ladd.sort_by_key(|a| a.1);
+                                lrem.sort_by_key(|r| std::cmp::Reverse(r.1));
+                                for &(wx, wy, wz) in ladd.iter().take(na) {
+                                    if chunk_manager.set_block(wx, wy, wz, BlockId::Lava) {
+                                        changes += 1;
+                                    }
+                                }
+                                for &(wx, wy, wz) in lrem.iter().take(nr) {
+                                    if chunk_manager.set_block(wx, wy, wz, BlockId::Air) {
+                                        changes += 1;
+                                    }
+                                }
+                                if water_trace {
+                                    log::info!(
+                                        "lava: cells {} -> {} plan +{} -{} applied +{} -{}",
+                                        ldepth.iter().sum::<f32>() as i64,
+                                        lq.iter().zip(&lfloor).filter(|(_, f)| f.is_some()).map(|(c, _)| *c).sum::<i32>(),
+                                        ladd.len(), lrem.len(), na, nr
+                                    );
+                                }
+                            }
                         }
                     }
                 }
