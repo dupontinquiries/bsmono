@@ -16,6 +16,24 @@ fn main() {
     let inv: serde_json::Value = if a[1].to_lowercase().ends_with(".flp") {
         studio_app::flp_read::inventory(&bytes).unwrap_or_else(|e| panic!("{}: {}", a[1], e.0))
     } else { serde_json::from_slice(&bytes).expect("json") };
+    // EXPERIMENT: `--drop-flag N` leaves out playlist items whose flags word has
+    // bit(s) N (FL writes 0x40 on every item, 0x2000 on some -- meaning not
+    // known yet; this is how to test it against a reference render).
+    let mut inv = inv;
+    if let Some(n) = a.iter().position(|x| x == "--drop-flag").and_then(|i| a.get(i + 1)) {
+        let bit = u64::from_str_radix(n.trim_start_matches("0x"), 16).expect("hex flag");
+        let mut dropped = 0;
+        for arr in inv["arrangements"].as_array_mut().into_iter().flatten() {
+            for t in arr["tracks"].as_array_mut().into_iter().flatten() {
+                if let Some(items) = t["items"].as_array_mut() {
+                    let before = items.len();
+                    items.retain(|it| it["flags"].as_u64().is_none_or(|f| f & bit == 0));
+                    dropped += before - items.len();
+                }
+            }
+        }
+        eprintln!("dropped {dropped} items with flag {n}");
+    }
     let media = std::path::PathBuf::from(&a[2]);
     let opus_for = |file: &str| -> Option<String> {
         let stem = std::path::Path::new(file).file_stem()?.to_string_lossy().into_owned();

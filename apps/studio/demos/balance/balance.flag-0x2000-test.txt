@@ -1,0 +1,6 @@
+# Balance 60-84 s against the artist's FL mix (18): playlist items WITH flag 0x2000 kept vs dropped
+FL mix:  level -14.0 dB, low end -17.4 dB
+kept:    level -12.0 dB, low end -14.9 dB, rhythm corr 0.12 at +170 ms
+dropped: level -16.0 dB, low end -19.6 dB, rhythm corr 0.20 at -20 ms (the offset every correct section shows)
+Blue Moon's 9 flagged clips (vocal takes 42-88 s): vocal band -17.38 (kept) vs -17.65 dB (dropped), FL -16.09; envelope corr 0.353 vs 0.336 -- no decision.
+UNDECIDED: 0x2000 may be FL's clip MUTE or its SELECTION. The artist's ear decides (A/B excerpts).

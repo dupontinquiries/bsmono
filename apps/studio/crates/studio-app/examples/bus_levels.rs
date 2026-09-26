@@ -11,6 +11,7 @@ fn main() {
     let rack = save.rack.clone().unwrap_or_else(studio_live::Rack::trap_kit);
     let mut project = save.to_project();
     for b in project.busses.values_mut().filter(|b| b.name == "Master") { b.chain.clear(); }
+    if a.iter().any(|x| x == "--no-duck") { for b in project.busses.values_mut() { b.chain.retain(|e| e.kind != "duck"); } }
     let base = path.parent().unwrap();
     let mut audio = BTreeMap::new();
     for s in project.sources.values().filter(|s| !s.is_generator()) {
@@ -32,5 +33,5 @@ fn main() {
         rows.push((db(&out), b.name.clone(), b.gain, feeds.join(", ")));
     }
     rows.sort_by(|a, b| b.0.total_cmp(&a.0));
-    for (l, n, g, f) in rows.iter().take(14) { println!("  {l:6.1} dB  {n:<18} fader {g:.2}  <- {f}"); }
+    for (l, n, g, f) in rows.iter().take(40).filter(|r| a.iter().all(|x| x != "--only") || ["808", "Kck", "KckLo", "KckTrans", "Snr"].iter().any(|k| r.1.contains(k))) { println!("  {l:6.1} dB  {n:<18} fader {g:.2}  <- {f}"); }
 }

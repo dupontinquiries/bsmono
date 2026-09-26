@@ -255,7 +255,7 @@ pub fn inventory(b: &[u8]) -> Result<Value, FlpError> {
         for it in pl.chunks_exact(size) {
             let (base, idx) = (u16at(it, 4).unwrap_or(20480) as u32, u16at(it, 6).unwrap_or(0) as u32);
             let track = 500 - u16at(it, 12).unwrap_or(0) as u32; // stored reversed from 499; iids start at 1
-            let mut v = json!({"pos": u32at(it, 0), "len": u32at(it, 8),
+            let mut v = json!({"pos": u32at(it, 0), "len": u32at(it, 8), "flags": u16at(it, 18),
                                "offsets": [f32at(it, 24).map(|x| x as f64).filter(|x| x.is_finite()), f32at(it, 28).map(|x| x as f64).filter(|x| x.is_finite())]});
             let o = v.as_object_mut().unwrap();
             if idx <= base { o.insert("kind".into(), json!("ChannelPLItem")); o.insert("channel".into(), json!(idx)); }
