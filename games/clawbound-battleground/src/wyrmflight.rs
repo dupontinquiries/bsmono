@@ -41,6 +41,9 @@ pub const DROP_EVERY: f32 = 0.7;
 pub const TELEGRAPH: f32 = 1.8;
 /// A fallen star burns everyone within this.
 pub const IMPACT_R: f32 = 6.5;
+/// How far above or below its landing a star's burst reaches: its own
+/// layer (the islands or the Aerie, `sky::UPPER_Y` apart), not the other.
+pub const IMPACT_LAYER: f32 = 8.0;
 /// Stars fall within this of the ground under it...
 pub const DROP_SPREAD: f32 = 55.0;
 /// ...and this share of them is aimed where a cat stands.
@@ -78,11 +81,14 @@ fn track(a: f32) -> Vec3 {
     Vec3::new(230.0 * a.sin(), 8.0 + 50.0 * (3.0 * a + 0.6).sin(), 165.0 * (2.0 * a).sin())
 }
 
-/// How high the wyrm must stay over (x, z): clear of the terrain round it.
+/// How high the wyrm must stay over (x, z): clear of the islands round it.
+/// The Aerie it never meets: the loop keeps well wide of it in plan
+/// (`tests::the_flight_leaves_the_well_and_comes_back_to_it`), so the
+/// islands alone set its height.
 fn clearance(x: f32, z: f32) -> f32 {
     let mut h = f32::MIN;
     for (dx, dz) in [(0.0, 0.0), (10.0, 0.0), (-10.0, 0.0), (0.0, 10.0), (0.0, -10.0), (7.0, 7.0), (-7.0, 7.0), (7.0, -7.0), (-7.0, -7.0)] {
-        h = h.max(crate::sky::terrain_height(x + dx, z + dz));
+        h = h.max(crate::sky::islands_height(x + dx, z + dz));
     }
     h + 9.0
 }
@@ -211,6 +217,7 @@ impl Game {
     /// Where the next star falls, from a wyrm at `over`: on the floor, near
     /// the ground under it, clear of the fountains; sometimes on a cat.
     fn pick_starfall(&mut self, over: Vec3) -> Option<Vec3> {
+        let on_floor = |p: Vec3| Vec3::new(p.x, crate::sky::floor_height(p.x, p.z), p.z);
         let floor = crate::sky::floor();
         let ok = |p: Vec3| floor.sdf(p.x, p.z) < -1.0 && [crate::consts::Team::Blue, crate::consts::Team::Red].iter().all(|t| t.fountain().distance(p) > FOUNTAIN_CLEAR);
         let ground = Vec3::new(over.x, 0.0, over.z);
@@ -224,7 +231,7 @@ impl Game {
             if !cats.is_empty() {
                 let k = ((self.rng.f32() * cats.len() as f32) as usize).min(cats.len() - 1);
                 if ok(cats[k]) {
-                    return Some(cats[k]);
+                    return Some(on_floor(cats[k]));
                 }
             }
         }
@@ -233,7 +240,7 @@ impl Game {
             let r = DROP_SPREAD * self.rng.f32().sqrt();
             let p = ground + Vec3::new(a.cos() * r, 0.0, a.sin() * r);
             if ok(p) {
-                return Some(p);
+                return Some(on_floor(p));
             }
         }
         None
@@ -255,7 +262,9 @@ impl Game {
         });
         for s in landed {
             self.events.push(Event::StarfallFx { at: s.at, radius: IMPACT_R });
-            let near = |p: Vec3| Vec3::new(p.x - s.at.x, 0.0, p.z - s.at.z).length() < IMPACT_R;
+            // on its own layer: a star on the Aerie does not burn the
+            // islands under its rim, nor one below a cat up there
+            let near = |p: Vec3| Vec3::new(p.x - s.at.x, 0.0, p.z - s.at.z).length() < IMPACT_R && (p.y - s.at.y).abs() < IMPACT_LAYER;
             let cats: Vec<usize> = self.gods.iter().enumerate().filter(|(_, g)| g.respawn_t <= 0.0 && g.skyfall.is_none() && near(g.pos)).map(|(i, _)| i).collect();
             for gi in cats {
                 self.deal_damage(TargetRef::God(gi), s.dmg, true, None, 0.0, 0.0);
@@ -293,7 +302,7 @@ mod tests {
                     far = far.max(Vec3::new(p.x, 0.0, p.z).length());
                     high = high.max(p.y);
                     low = low.min(p.y);
-                    assert!(p.y >= crate::sky::terrain_height(p.x, p.z) + 8.0, "never through the ground: {p}");
+                    assert!(p.y >= crate::sky::islands_height(p.x, p.z) + 8.0, "never through the ground: {p}");
                 }
             }
             // the loop is ~1800 u long: about 50 u/s at its fastest, and a jump
@@ -302,6 +311,13 @@ mod tests {
             assert!(far > 200.0, "over the whole map: {far}");
             assert!(high > 50.0, "up over the islands: {high}");
             assert!(low < -5.0, "and down into the chasms, below the bridges: {low}");
+            // wide of the Aerie all the way round: its keels hang deep
+            // (`sky::underside`), and its head, body and stars stay clear of
+            // them (the chasm it dives through is the one beside them)
+            for i in 0..=ALT_N {
+                let p = track(i as f32 / ALT_N as f32 * std::f32::consts::TAU);
+                assert!(crate::sky::upper_floor().sdf(p.x, p.z) > 10.0 + crate::wyrmbody::BODY_R, "the loop meets the Aerie at {p}");
+            }
         });
     }
 

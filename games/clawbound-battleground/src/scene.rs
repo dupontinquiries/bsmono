@@ -782,7 +782,7 @@ impl Scene {
                 let a = (d.t / d.dur.max(1e-3)).clamp(0.0, 1.0);
                 let run = Vec3::new(d.to.x - d.from.x, 0.0, d.to.z - d.from.z).length().max(0.5);
                 LeapView::Flight { t: a, climb: 1.4 * (1.0 - 2.0 * a) / run * 2.0 }
-            }));
+            })).or_else(|| g.lift.as_ref().map(|r| LeapView::Flight { t: r.t / crate::lift::RIDE_SECS, climb: r.climb() }));
             let inp = PuppetInput {
                 pos: g.pos,
                 yaw: g.yaw,

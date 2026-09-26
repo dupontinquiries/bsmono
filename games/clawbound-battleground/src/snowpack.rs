@@ -483,8 +483,9 @@ mod tests {
             v.iter().sum::<f32>() / v.len().max(1) as f32
         };
         assert!(mean(&|k| s.blow[k] > 0.7) < mean(&|k| s.blow[k] < 0.2) * 0.4);
-        // none in the void or the pool
-        assert!(s.depth_at(0.0, -95.0) < 1e-3 && s.depth_at(0.0, 0.0) < 0.05);
+        // none in the void or the pool; some on the Aerie
+        assert!(s.depth_at(0.0, -120.0) < 1e-3 && s.depth_at(0.0, 0.0) < 0.05);
+        assert!(s.depth_at(0.0, -100.0) > 0.05, "snow on the Aerie");
     }
 
     #[test]

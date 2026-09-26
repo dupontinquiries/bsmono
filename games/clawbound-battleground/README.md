@@ -44,6 +44,14 @@ what else is known-but-unresolved.
   be auto-attacked, bots do not go for it); a thick wisp between two groups
   hides each from the other. Towers and bases see through cloud; minions
   give no sight.
+- **The Aerie** (Starwell's upper layer): three small islets a side, 20 u
+  above the islands over the inner chasms, every islet bridged to both
+  others and served by its own updraft. Step onto a starlit pad on the
+  islands and the updraft carries you up a column of starlight and sets you
+  down on the Aerie's pad (3.2 s, unsteerable, and you can be hit on the
+  way); step off and back on to ride down. The Aerie stands above the
+  cloud, so a cat up there is in plain sight -- a lookout, not a hideout.
+  Bots do not use the lifts.
 - **The Elders move**: each guards its ground -- a circle round its pedestal
   and a push lane out toward the enemy, marked with faint stones of light.
   It turns to face what steps onto its ground, strides out to meet it,
@@ -320,6 +328,7 @@ src/
 ├── weather.rs     weather state machine → `Atmosphere` sample (plain numbers)
 ├── map_events.rs  event scheduler + effects; `speed_mul` / `gold_mul` hooks
 ├── wild.rs        heal trees, prey (hare / stag / glowfish), the hunt, Riverblessing
+├── lift.rs        Starwell's updrafts: pads, rides up to the Aerie and down
 ├── bosses.rs      the Elder Boar + Storm Drake: pits, AI, rewards, TargetRef::Boss
 ├── disasters.rs   wildfire / tempest / earthquake / flood / tornado + map scars
 ├── audio.rs       acoustics_at(pos) → howl/reverb voicing; WindSynth DSP; cpal shell

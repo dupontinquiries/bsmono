@@ -404,6 +404,38 @@ pub fn star_lantern(variant: i32) -> VoxelMesh {
     m
 }
 
+/// A lift pad (`lift`): a low marble dais `r` across, a gold ring round
+/// its rim and a four-pointed star of starlight set in it -- the mark of an
+/// updraft. Origin at the centre of its top face.
+pub fn lift_pad(r: f32, variant: i32) -> VoxelMesh {
+    let v = 0.15;
+    let k = 1.0 / v;
+    let n = (2.0 * (r + 0.5) * k) as usize;
+    let mut g = Grid::new(n, (0.6 * k) as usize, n);
+    let c = n as f32 * 0.5;
+    let white = [0.93, 0.92, 0.88, 1.0];
+    g.cyl_y(c, c, (r + 0.4) * k, 0, (0.3 * k) as i32, white);
+    g.cyl_y(c, c, r * k, (0.3 * k) as i32, (0.45 * k) as i32, white);
+    let mut m = marble(g.mesh(v, true), variant as f32);
+    let top = m.inst.iter().map(|i| i.off_ao[1]).fold(f32::MIN, f32::max);
+    for i in m.inst.iter_mut() {
+        i.off_ao[1] -= top;
+        let (x, z) = (i.off_ao[0], i.off_ao[2]);
+        let rr = x.hypot(z);
+        // the star: four arms narrowing to points along the axes
+        let (ax, az) = (x.abs(), z.abs());
+        let arm = (ax < 0.35 * (1.0 - az / r).max(0.0) + 0.05) || (az < 0.35 * (1.0 - ax / r).max(0.0) + 0.05);
+        if i.off_ao[1] > -0.2 && arm && rr < r * 0.9 {
+            i.color = [0.80, 0.90, 1.0, 1.0];
+            i.misc[2] = 2.0;
+        } else if (rr - r).abs() < 0.2 || (rr > r + 0.1 && rr < r + 0.35) {
+            i.color = [0.86, 0.70, 0.36, 1.0];
+            i.misc[2] = 0.3;
+        }
+    }
+    m
+}
+
 /// Voxel size of the floating stone and the drifting cloud.
 pub const DRIFT_VOX: f32 = 0.3;
 pub const PUFF_VOX: f32 = 0.6;

@@ -342,7 +342,12 @@ impl Game {
                 g.ride_plan = ride.map(|k| k as u8);
             }
         }
+        // the starlight lifts (lift.rs): riders are carried, not walked
+        self.lifts_tick(dt);
         for i in 0..self.gods.len() {
+            if self.gods[i].lift.is_some() {
+                continue;
+            }
             if self.gods[i].respawn_t > 0.0 {
                 // A cat that dies mid-leap respawns on the ground.
                 self.gods[i].leap = None;
