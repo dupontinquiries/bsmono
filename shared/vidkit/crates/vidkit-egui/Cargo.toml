@@ -15,6 +15,9 @@ vidkit-relevance = { path = "../vidkit-relevance" }
 # The voice grammar/matcher, rather than a second one here.
 voiced-core = { path = "../../../voiced-core" }
 egui = "0.34"
+# dlopen of the libEGL eframe already loaded, mmap/fstat for dma-bufs
+# (glow-upload only).
+libc = { version = "0.2", optional = true }
 
 # shared/uikit is a separate nested workspace; a path dependency across the two
 # is fine and is how the rest of this tree reaches its kits.
@@ -66,7 +69,7 @@ vidkit-webm = { path = "../vidkit-webm", features = ["fixtures"] }
 demo = ["dep:eframe"]
 # NV12 upload + shader conversion through an egui_glow paint callback. Needs
 # eframe for its glow/egui_glow re-exports, same as scene-kit's `glow` feature.
-glow-upload = ["dep:eframe"]
+glow-upload = ["dep:eframe", "dep:libc"]
 
 [[example]]
 name = "video_demo"

@@ -11,6 +11,7 @@ pub mod codec;
 pub mod av1_grain;
 pub mod convert_cpu;
 pub mod damage;
+pub mod dmabuf;
 pub mod frame;
 pub mod io;
 pub mod player;

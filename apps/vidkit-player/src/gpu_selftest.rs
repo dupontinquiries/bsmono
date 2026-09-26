@@ -276,6 +276,41 @@ fn i420(w: u32, h: u32) -> Frame {
     }
 }
 
+/// The I420 pattern as a single-fd, padded-stride NV12 "dma-buf" -- a memfd,
+/// since this machine has no dma-buf exporter (no /dev/dri, no udmabuf).
+/// EGL refuses to import it, which exercises the path a real driver takes
+/// when it cannot import: the mmap fallback, then an upload.
+fn dmabuf_nv12(w: u32, h: u32) -> Frame {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let src = i420(w, h);
+    let FrameData::Cpu(p) = &src.data else { unreachable!() };
+    let (cw, ch) = (w.div_ceil(2) as usize, h.div_ceil(2) as usize);
+    let stride = (w as usize + 32 + 63) & !63;
+    let mut buf = vec![0u8; stride * h as usize + stride * ch];
+    for y in 0..h as usize {
+        buf[y * stride..y * stride + w as usize].copy_from_slice(&p.data[0][y * w as usize..(y + 1) * w as usize]);
+    }
+    for y in 0..ch {
+        for x in 0..cw {
+            let o = stride * h as usize + y * stride + 2 * x;
+            buf[o] = p.data[1][y * cw + x];
+            buf[o + 1] = p.data[2][y * cw + x];
+        }
+    }
+    // SAFETY: memfd_create returns a new fd we own.
+    let fd = unsafe { OwnedFd::from_raw_fd(libc::memfd_create(c"vk-selftest".as_ptr(), 0)) };
+    std::io::Write::write_all(&mut std::fs::File::from(fd.try_clone().expect("dup")), &buf).expect("memfd write");
+    Frame {
+        data: FrameData::DmaBuf(vidkit_core::frame::DmaBufImage {
+            planes: vec![vidkit_core::frame::DmaBufPlane { fd, offset: 0, stride: stride as u32 }],
+            modifier: vidkit_core::dmabuf::DRM_FORMAT_MOD_LINEAR,
+            fourcc: vidkit_core::dmabuf::DRM_FORMAT_NV12,
+        }),
+        layout: PlaneLayout::Nv12,
+        ..src
+    }
+}
+
 /// The frame carrying its grain, as a decoder exporting grain delivers it.
 fn with_grain(mut f: Frame) -> Frame {
     f.grain = Some(Arc::new(grain_params()));
@@ -348,8 +383,20 @@ fn check_grain(f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String,
 
 /// GPU vs vidkit-core's CPU converter on the whole frame.
 fn check_vs_cpu(f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String, String> {
+    // A dma-buf is checked against the pattern it was built from, NOT read
+    // back through the same plane mapping the import used (a wrong chroma
+    // offset would then agree with itself -- it did, until this).
+    let source;
+    let f = match &f.data {
+        FrameData::DmaBuf(_) => {
+            source = i420(f.width, f.height);
+            &source
+        }
+        _ => f,
+    };
     let FrameData::Cpu(pl) = &f.data else { return Err("not cpu".into()) };
-    let cpu = vidkit_core::planes_to_rgba8(pl, f.layout, f.color, w as usize, h as usize).map_err(|e| e.to_string())?;
+    let layout = f.layout;
+    let cpu = vidkit_core::planes_to_rgba8(pl, layout, f.color, w as usize, h as usize).map_err(|e| e.to_string())?;
     let mut worst = 0u8;
     let mut at = 0usize;
     for (i, p) in got.iter().enumerate() {
@@ -401,6 +448,7 @@ fn cases() -> Vec<Case> {
         Case { two_pass: false, grain: None, name: "HDR10 PQ, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Pq), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
         Case { two_pass: false, grain: None, name: "HLG, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Hlg), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
         Case { two_pass: false, grain: Some(grain_params()), name: "AV1 film grain", history: vec![], frame: with_grain(i420(256, 160)), enhance: Enhance::default(), out: (256, 160), check: check_grain },
+        Case { two_pass: false, grain: None, name: "dma-buf NV12", history: vec![], frame: dmabuf_nv12(66, 48), enhance: Enhance::default(), out: (66, 48), check: check_vs_cpu },
         Case { two_pass: false, grain: None, name: "I420, three planes", history: vec![], frame: i420(64, 48), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
         Case { two_pass: false, grain: None, name: "plain conversion", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance::default(), out: (64, 48), check: check_plain },
         Case { two_pass: true, grain: None, name: "RCAS two-pass (offscreen)", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
@@ -470,6 +518,9 @@ impl eframe::App for SelfTest {
                 if let Err(e) = unsafe { g.upload(gl, f) } {
                     println!("GPU SELFTEST FAIL: upload: {e}");
                     std::process::exit(1);
+                }
+                if f.is_zero_copy() {
+                    println!("       dma-buf: {} zero-copy frames; import: {}", g.zero_copy_frames, g.import_note.as_deref().unwrap_or("ok"));
                 }
                 // The grain stage itself, exactly: the GPU's grained planes
                 // against vidkit-core's reference (byte-identical to dav1d).

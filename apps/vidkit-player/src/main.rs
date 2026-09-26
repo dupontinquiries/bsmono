@@ -205,6 +205,9 @@ struct Player {
     /// The display pipeline's latency, learned from the feedback; frames
     /// are picked for when they will be seen.
     latency: vidkit_wayland::cadence::LatencyTracker,
+    /// The dma-buf frame on screen (zero-copy), returned to its decoder when
+    /// the next frame replaces it.
+    held: Option<vidkit_core::Frame>,
     /// The last frame shown carried film grain for the GPU to add.
     last_grain: bool,
     /// Picture-in-picture: the video floats, the chapters take the screen.
@@ -430,6 +433,7 @@ impl Player {
             wl: wayland_link(cc),
             present_log: vidkit_wayland::cadence::PresentLog::new(240),
             last_grain: false,
+            held: None,
             latency: vidkit_wayland::cadence::LatencyTracker::new(15, 100_000_000),
             pip: Default::default(),
             pip_on: false,
@@ -534,7 +538,19 @@ impl Player {
                             g.hdr_peak_nits = e.hdr_peak().unwrap_or(vidkit_core::convert_cpu::DEFAULT_HDR_PEAK_NITS);
                         }
                     }
-                    e.recycle(frame);
+                    // A dma-buf frame on the GPU path is ON SCREEN until the
+                    // next one: its textures alias the decoder's buffer, and
+                    // every repaint samples it. Returned when replaced.
+                    if frame.is_zero_copy() && self.gpu.is_some() {
+                        if let Some(old) = self.held.replace(frame) {
+                            e.recycle(old);
+                        }
+                    } else {
+                        e.recycle(frame);
+                        if let Some(old) = self.held.take() {
+                            e.recycle(old);
+                        }
+                    }
                 }
                 self.presenter.set_deadline(Some(Instant::now() + next));
             }
@@ -542,6 +558,7 @@ impl Player {
             playback::Tick::Ended => {
                 // Dropped rather than left to fall back to the test pattern:
                 // a clip that has finished must not look like a broken decoder.
+                self.drop_held();
                 self.engine = None;
                 self.transport.playing = false;
                 self.presenter.idle();
@@ -574,7 +591,40 @@ impl Player {
                 }
             }
         }
+        // The CPU presenter reads planes: a LINEAR dma-buf through mmap.
+        if let vidkit_core::frame::FrameData::DmaBuf(img) = &frame.data {
+            match vidkit_egui::dmabuf_gl::map_linear(img, frame.width, frame.height) {
+                Ok((layout, planes)) => {
+                    let cpu = vidkit_core::Frame {
+                        data: vidkit_core::frame::FrameData::Cpu(planes),
+                        width: frame.width,
+                        height: frame.height,
+                        layout,
+                        color: frame.color,
+                        pts: frame.pts,
+                        duration: frame.duration,
+                        recycle: None,
+                        grain: None,
+                    };
+                    self.presenter.show(&cpu);
+                }
+                Err(e) => self.gpu_error = Some(format!("cannot show a dma-buf frame on the CPU path: {e}")),
+            }
+            return;
+        }
         self.presenter.show(frame);
+    }
+
+    /// The decoder is being replaced: the held frame's buffer belongs to
+    /// the old one (dropped, not recycled), and the GPU's cached imports of
+    /// its pool go at the next upload.
+    fn drop_held(&mut self) {
+        self.held = None;
+        if let Some(g) = &self.gpu {
+            if let Ok(mut g) = g.lock() {
+                g.drop_imports = true;
+            }
+        }
     }
 }
 
@@ -1002,6 +1052,7 @@ impl Player {
         // Now an engine: video and audio on their own threads, the audio clock
         // as master. A failure is REPORTED -- `.ok()` here used to leave a file
         // that would not decode showing nothing and saying nothing.
+        self.drop_held();
         self.engine = match start_file(path.clone()) {
             Ok(e) => { self.transport.playing = true; Some(e) }
             Err(e) => { self.gpu_error = Some(format!("cannot play {}: {e}", path.display())); None }
@@ -1583,6 +1634,7 @@ impl Player {
             ),
             duration: resolved.duration,
         }));
+        self.drop_held();
         self.engine = Some(engine);
         // Transcribe from the audio URL (the video URL when muxed). No cache:
         // the signed URL expires and is no key for anything.
@@ -1963,6 +2015,7 @@ impl Player {
                 let opened = open_local(&path);
                 self.transport.duration = opened.as_ref().ok().and_then(|o| o.duration);
                 self.opened = Some(opened);
+                self.drop_held();
                 self.engine = Some(e);
                 // Held (a lock eviction respects) so the file outlives the
                 // decoder reading it.
