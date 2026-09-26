@@ -88,6 +88,9 @@ pub struct Input {
     pub look: glam::Vec2,
 }
 
+/// A new shot this far from the current one is cut to, not flown to.
+pub const CUT_DIST: f32 = 40.0;
+
 /// The director holds a fight at least this long before it considers
 /// another, and switches only for one clearly better (`SWITCH_MARGIN`).
 pub const DIRECTOR_HOLD: f32 = 4.0;
@@ -106,12 +109,17 @@ pub struct Spectator {
     free_yaw: f32,
     free_pitch: f32,
     started: bool,
+    /// Deliberate cuts made (a switch too far to fly: see CUT_DIST).
+    pub cuts: u32,
+    /// How far the eye is lifted clear of the ground (rises fast but not
+    /// instantly: see `update`).
+    lift: f32,
 }
 
 impl Spectator {
     pub fn new() -> Spectator {
         let s = Shot { eye: Vec3::new(0.0, 60.0, -80.0), target: Vec3::ZERO, fov_y: 1.0 };
-        Spectator { mode: Mode::Director, cam: SmoothCam::new(s, 3.0), focus: 0, held: 0.0, free_eye: s.eye, free_yaw: 0.0, free_pitch: -0.5, started: false }
+        Spectator { mode: Mode::Director, cam: SmoothCam::new(s, 3.0), focus: 0, held: 0.0, free_eye: s.eye, free_yaw: 0.0, free_pitch: -0.5, started: false, cuts: 0, lift: 0.0 }
     }
 
     /// How much is going on around god `i`: enemies close by, damage taken
@@ -150,9 +158,12 @@ impl Spectator {
         let spread = near.iter().map(|p| (*p - c).length()).fold(0.0f32, f32::max);
         let back = 14.0 + spread * 1.2;
         // from the side the fight is fought across, and a little behind the
-        // focus cat's team (blue attacks +z)
+        // focus cat's team (blue attacks +z) -- unless rock is in the way:
+        // on the pass that framing put the camera INSIDE a cliff. Then round
+        // the fight, and closer, until the fight is in plain view.
         let side = Vec3::new(0.7, 0.0, -0.7 * game.gods[focus].team.push_z()).normalize();
-        Shot { eye: c - side * back + Vec3::Y * (back * 0.7), target: c + Vec3::Y * 1.2, fov_y: 1.0 }
+        let target = c + Vec3::Y * 1.2;
+        clear_shot(target, side, back, 0.7).unwrap_or(Shot { eye: c - side * back + Vec3::Y * (back * 0.7), target, fov_y: 1.0 })
     }
 
     /// Behind cat `i`, a little above, looking past it.
@@ -161,7 +172,12 @@ impl Spectator {
         let facing = crate::abilities::facing_of(g.yaw);
         // a dead cat: watch where it will come back
         let at = if g.respawn_t > 0.0 { g.team.fountain() } else { g.pos };
-        Shot { eye: at - facing * 11.0 + Vec3::Y * 6.5, target: at + facing * 4.0 + Vec3::Y * 1.2, fov_y: 0.95 }
+        let target = at + facing * 4.0 + Vec3::Y * 1.2;
+        let eye = at - facing * 11.0 + Vec3::Y * 6.5;
+        if crate::map::line_clear(eye, target) && eye.y > crate::map::surface_y(eye.x, eye.z) + 1.5 {
+            return Shot { eye, target, fov_y: 0.95 };
+        }
+        clear_shot(target, facing, 11.0, 0.6).unwrap_or(Shot { eye, target, fov_y: 0.95 })
     }
 
     pub fn update(&mut self, game: &Game, inp: Input, dt: f32) -> Shot {
@@ -234,13 +250,23 @@ impl Spectator {
             self.cam.snap(want);
             return want;
         }
-        let mut s = self.cam.update(dt, want);
-        // never inside the ground, even mid-move
-        let ground = crate::render::terrain_height(s.eye.x, s.eye.z);
-        if s.eye.y < ground + 1.5 {
-            s.eye.y = ground + 1.5;
-            self.cam.eye.y = s.eye.y;
+        // A switch too far to fly CUTS, as a broadcast director would: on
+        // the pass a flight between two fights crossed the peaks, and the
+        // ground clamp shoved the eye up a cliff's height in one frame
+        // (measured: 17.8 deg and 49 u in a frame).
+        if (want.target - self.cam.target).length() > CUT_DIST {
+            self.cam.snap(want);
+            self.cuts += 1;
+            self.lift = 0.0;
+            return want;
         }
+        let mut s = self.cam.update(dt, want);
+        // clear of the ground: a lift that rises fast (60 u/s) and settles,
+        // not an instant shove
+        let ground = crate::map::surface_y(s.eye.x, s.eye.z) + 1.5;
+        let need = (ground - s.eye.y).max(0.0);
+        self.lift = if need > self.lift { (self.lift + 60.0 * dt).min(need) } else { (self.lift - 20.0 * dt).max(need) };
+        s.eye.y += self.lift;
         s
     }
 
@@ -252,6 +278,24 @@ impl Spectator {
             Mode::Free => "FREE CAMERA".to_string(),
         }
     }
+}
+
+/// A camera looking at `target`: from `side` (pulled back `back`, raised
+/// `rise` of that), else turned round the target in eighths, else closer --
+/// the first above the ground with a clear view of the target.
+fn clear_shot(target: Vec3, side: Vec3, back: f32, rise: f32) -> Option<Shot> {
+    for pull in [1.0f32, 0.75, 0.5, 0.35] {
+        for turn in [0.0f32, 0.785, -0.785, 1.571, -1.571, 2.356, -2.356, 3.1416] {
+            let (c, sn) = (turn.cos(), turn.sin());
+            let dir = Vec3::new(side.x * c - side.z * sn, 0.0, side.x * sn + side.z * c).normalize_or_zero();
+            let b = back * pull;
+            let eye = target - dir * b + Vec3::Y * (b * rise);
+            if eye.y > crate::map::surface_y(eye.x, eye.z) + 1.5 && crate::map::line_clear(eye, target) {
+                return Some(Shot { eye, target, fov_y: 1.0 });
+            }
+        }
+    }
+    None
 }
 
 impl Default for Spectator {

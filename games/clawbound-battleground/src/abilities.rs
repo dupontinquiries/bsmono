@@ -116,6 +116,9 @@ impl Game {
         let (from, power, pen_pct, pen_flat) = (g.pos, g.power, g.pen_pct, g.pen_flat);
         let team = g.team;
         let pos_y = from + Vec3::Y * 1.3;
+        // how steeply to fire at the aim's HEIGHT (aim is on the real
+        // terrain): bolts, volleys and beams pitch toward it
+        let aim_slope = |dist: f32| ((aim.y + 1.0) - (from.y + 1.3)) / dist.max(3.0);
         let aim_flat = Vec3::new(aim.x, 0.0, aim.z);
         let mut dir = aim_flat - Vec3::new(from.x, 0.0, from.z);
         let dist = dir.length();
@@ -149,10 +152,13 @@ impl Game {
         match ab.arch {
             Archetype::Bolt { speed, dmg, radius } => {
                 let d = dmg_scale(dmg, ab.power_scale);
+                // toward the aimed HEIGHT too: a bolt from the shelf at a cat
+                // below flew level over its head (aim is on the terrain now)
+                let v3 = (dir + Vec3::Y * aim_slope(dist)).normalize_or_zero();
                 self.projectiles.push(Projectile {
                     team,
                     pos: pos_y,
-                    vel: dir * speed,
+                    vel: v3 * speed,
                     dmg: d,
                     radius,
                     life: 1.6,
@@ -174,7 +180,7 @@ impl Game {
                     self.projectiles.push(Projectile {
                         team,
                         pos: pos_y,
-                        vel: d2 * speed,
+                        vel: (d2 + Vec3::Y * aim_slope(dist)).normalize_or_zero() * speed,
                         dmg: d,
                         radius: 0.5,
                         life: 1.4,
@@ -205,6 +211,7 @@ impl Game {
                 self.events.push(Event::RingTelegraph { pos: clamped, radius, delay: 0.75, color: ab.color });
             }
             Archetype::Beam { length, width, dmg } => {
+                let dir = (dir + Vec3::Y * aim_slope(dist)).normalize_or_zero();
                 let d = dmg_scale(dmg, ab.power_scale);
                 self.events.push(Event::BeamFx { from: pos_y, dir, length, width, color: ab.color, dur: 0.45 });
                 // damage everything in the slab
@@ -293,6 +300,8 @@ impl Game {
             Archetype::Blink { dist: dd, dmg } => {
                 let d = if dmg > 0.0 { dmg_scale(dmg, ab.power_scale) } else { 0.0 };
                 let dest = clamp_arena(from + dir * dd);
+                // land ON the ground there (the pass has heights)
+                let dest = Vec3::new(dest.x, crate::map::ground_y(dest.x, dest.z), dest.z);
                 self.events.push(Event::NovaFx { pos: from, radius: 2.0, color: ab.color });
                 self.gods[gi].pos = dest;
                 self.events.push(Event::NovaFx { pos: dest, radius: 2.0, color: ab.color });

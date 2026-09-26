@@ -4,13 +4,14 @@ use clawbound::items;
 use clawbound::sim::{AiState, Game, Team};
 
 #[test]
-fn catalog_has_exactly_100_items() {
+fn catalog_has_exactly_102_items() {
+    // 100 across the stat categories, and the two Siphon items (brawl)
     let cat = items::all();
-    assert_eq!(cat.len(), 100, "item catalog must have exactly 100 items");
+    assert_eq!(cat.len(), 102, "item catalog must have exactly 102 items");
     let mut ids: Vec<u16> = cat.iter().map(|i| i.id).collect();
     ids.sort();
     ids.dedup();
-    assert_eq!(ids.len(), 100, "item ids must be unique");
+    assert_eq!(ids.len(), 102, "item ids must be unique");
     for it in cat {
         assert!(it.cost > 0.0, "item {} must cost something", it.name);
         assert!(it.tier >= 1 && it.tier <= 3);
@@ -942,4 +943,259 @@ fn netplay_over_real_udp_sockets_stays_in_sync_at_minimum_delay() {
     assert!(sess[0].stats.desync.is_none() && sess[1].stats.desync.is_none(), "desync");
     assert_eq!([sess[0].delay(), sess[1].delay()], [1, 1], "loopback should settle on 1 tick; rtt {:?}", sess[0].rtt);
     assert!(sess[0].rtt.samples > 50, "no round trips measured");
+}
+
+mod brawls {
+    use clawbound::gods::{Archetype, Role, ROSTER};
+    use clawbound::sim::Game;
+    use glam::Vec3;
+
+    fn id_where(f: impl Fn(&clawbound::gods::GodDef) -> bool) -> u32 {
+        ROSTER.iter().position(|d| f(d)).expect("an ancestor") as u32
+    }
+    fn slot_of(g: &Game, i: usize, f: impl Fn(&Archetype) -> bool) -> Option<u32> {
+        let d = &ROSTER[g.gods[i].def_id as usize];
+        (0..4).find(|&s| f(&d.abilities[s].arch)).map(|s| s as u32)
+    }
+    fn quiet(g: &mut Game) {
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+            c.move_dir = Vec3::ZERO;
+            c.attack_held = false;
+        }
+    }
+    fn run(g: &mut Game, secs: f32) {
+        for _ in 0..(secs * 60.0) as usize {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+        }
+    }
+
+    /// Two enemy cats walking into each other stop body to body: they do
+    /// not pass through.
+    #[test]
+    fn cats_collide_body_to_body() {
+        let mut g = Game::new_teams(&[0], &[1]);
+        quiet(&mut g);
+        let c = Vec3::new(0.0, 0.0, -40.0);
+        g.gods[0].pos = c - Vec3::X * 3.0;
+        g.gods[1].pos = c + Vec3::X * 3.0;
+        g.gods[0].move_dir = Vec3::X;
+        g.gods[1].move_dir = -Vec3::X;
+        let mut closest = f32::MAX;
+        for _ in 0..180 {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+            let d = Vec3::new(g.gods[1].pos.x - g.gods[0].pos.x, 0.0, g.gods[1].pos.z - g.gods[0].pos.z).length();
+            closest = closest.min(d);
+        }
+        assert!(closest > clawbound::brawl::BODY_R * 2.0 * 0.85, "they overlapped to {closest}");
+        assert!(g.gods[0].pos.x < g.gods[1].pos.x, "they passed through each other");
+    }
+
+    /// A dash into an enemy stops on the body and knocks it back.
+    #[test]
+    fn a_dash_into_an_enemy_is_a_tackle() {
+        let dasher = id_where(|d| d.abilities.iter().any(|a| matches!(a.arch, Archetype::Dash { .. })));
+        let mut g = Game::new_teams(&[dasher], &[(dasher + 1) % 13]);
+        quiet(&mut g);
+        let c = Vec3::new(0.0, 0.0, -40.0);
+        g.gods[0].pos = c;
+        g.gods[0].mana = 10_000.0;
+        g.gods[1].pos = c + Vec3::Z * 2.5;
+        let before = g.gods[1].pos;
+        let slot = slot_of(&g, 0, |a| matches!(a, Archetype::Dash { .. })).unwrap();
+        g.cast_queue.push((0, slot, c + Vec3::Z * 9.0));
+        run(&mut g, 0.6);
+        assert!(g.gods[0].pos.z < before.z, "the dasher stopped short of passing through: {}", g.gods[0].pos.z);
+        assert!(g.gods[1].pos.z > before.z + 0.4, "the target was knocked back: {} from {}", g.gods[1].pos.z, before.z);
+    }
+
+    /// A guardian's sweep catches two enemies side by side; an assassin's
+    /// bite catches one -- but bites harder from behind.
+    #[test]
+    fn melee_differs_by_cat() {
+        let hits = |who: u32, behind: bool| -> (u32, f32) {
+            let mut g = Game::new_teams(&[who], &[0, 1]);
+            quiet(&mut g);
+            let c = Vec3::new(0.0, 0.0, -40.0);
+            g.gods[0].pos = c;
+            g.gods[0].yaw = std::f32::consts::FRAC_PI_2;
+            let r = ROSTER[who as usize].auto_range * 0.7;
+            g.gods[1].pos = c + Vec3::new(-0.35, 0.0, r);
+            g.gods[2].pos = c + Vec3::new(0.35, 0.0, r);
+            // facing away from the attacker (behind) or toward it
+            for k in [1, 2] {
+                g.gods[k].yaw = if behind { std::f32::consts::FRAC_PI_2 } else { -std::f32::consts::FRAC_PI_2 };
+                g.gods[k].max_hp = 1.0e6;
+                g.gods[k].hp = 1.0e6;
+            }
+            g.gods[0].attack_held = true;
+            run(&mut g, 0.05);
+            let hit = [1usize, 2].iter().filter(|&&k| g.gods[k].hp < 1.0e6).count() as u32;
+            let most = [1usize, 2].iter().map(|&k| 1.0e6 - g.gods[k].hp).fold(0.0f32, f32::max);
+            (hit, most)
+        };
+        let guardian = id_where(|d| d.role == Role::Guardian && d.auto_range < 4.5);
+        let assassin = id_where(|d| d.role == Role::Assassin && d.auto_range < 4.5);
+        assert_eq!(hits(guardian, false).0, 2, "the sweep catches both");
+        assert_eq!(hits(assassin, false).0, 1, "the bite catches one");
+        let (_, front) = hits(assassin, false);
+        let (_, back) = hits(assassin, true);
+        assert!(back > front * 1.25, "from behind {back} vs front {front}");
+    }
+
+    /// A nova into a crowd of cats deals each less than into one cat.
+    #[test]
+    fn area_damage_thins_in_a_crowd() {
+        let nova = id_where(|d| d.abilities.iter().any(|a| matches!(a.arch, Archetype::Nova { .. }) && !a.ult));
+        let per_cat = |crowd: usize| -> f32 {
+            let reds: Vec<u32> = (0..crowd as u32).map(|k| (nova + 1 + k) % 13).collect();
+            let mut g = Game::new_teams(&[nova], &reds);
+            quiet(&mut g);
+            let c = Vec3::new(0.0, 0.0, -40.0);
+            g.gods[0].pos = c;
+            g.gods[0].mana = 10_000.0;
+            for k in 1..=crowd {
+                let a = k as f32 / crowd as f32 * std::f32::consts::TAU;
+                g.gods[k].pos = c + Vec3::new(a.cos(), 0.0, a.sin()) * 1.6;
+                g.gods[k].max_hp = 1.0e6;
+                g.gods[k].hp = 1.0e6;
+            }
+            let slot = slot_of(&g, 0, |a| matches!(a, Archetype::Nova { .. })).unwrap();
+            g.cast_queue.push((0, slot, c));
+            run(&mut g, 1.0);
+            (1..=crowd).map(|k| 1.0e6 - g.gods[k].hp).sum::<f32>() / crowd as f32
+        };
+        let one = per_cat(1);
+        let six = per_cat(6);
+        assert!(one > 0.0);
+        assert!(six < one * 0.75, "six caught: {six} each vs one alone: {one}");
+    }
+
+    /// Taking ability damage from an enemy cat returns mana (the siphon).
+    #[test]
+    fn the_siphon_pays_back_ability_damage_as_mana() {
+        let bolt = id_where(|d| d.abilities.iter().any(|a| matches!(a.arch, Archetype::Bolt { .. })));
+        let mut g = Game::new_teams(&[bolt], &[(bolt + 1) % 13]);
+        quiet(&mut g);
+        let c = Vec3::new(0.0, 0.0, -40.0);
+        g.gods[0].pos = c;
+        g.gods[0].mana = 10_000.0;
+        g.gods[1].pos = c + Vec3::Z * 6.0;
+        g.gods[1].mana = 0.0;
+        g.gods[1].max_hp = 1.0e6;
+        g.gods[1].hp = 1.0e6;
+        let slot = slot_of(&g, 0, |a| matches!(a, Archetype::Bolt { .. })).unwrap();
+        g.cast_queue.push((0, slot, c + Vec3::Z * 6.0));
+        run(&mut g, 1.2);
+        let dealt = 1.0e6 - g.gods[1].hp;
+        assert!(dealt > 0.0, "the bolt hit");
+        assert!(g.gods[1].mana > dealt * 0.05, "mana {} from {dealt} damage", g.gods[1].mana);
+    }
+
+    /// Winded, for real: a cat hit just before it lands from a leap cools
+    /// twice as long as one that was not.
+    #[test]
+    fn a_winded_landing_cools_twice_as_long() {
+        let landing_cd = |hurt: bool| -> f32 {
+            let mut g = Game::new_teams(&[0], &[1]);
+            quiet(&mut g);
+            g.gods[1].respawn_t = 999.0;
+            g.gods[0].pos = Vec3::new(0.0, 0.0, -40.0);
+            g.leap_queue.push((0, Vec3::Z));
+            for _ in 0..240 {
+                if hurt {
+                    g.gods[0].last_dmg_t = g.t; // under fire the whole way
+                }
+                let was = g.gods[0].leap.is_some();
+                g.tick(1.0 / 60.0);
+                g.events.clear();
+                if was && g.gods[0].leap.is_none() {
+                    return g.gods[0].leap_cd;
+                }
+            }
+            panic!("never landed");
+        };
+        let (calm, hurt) = (landing_cd(false), landing_cd(true));
+        assert!(hurt > calm * 1.8, "winded cooldown {hurt} vs {calm}");
+    }
+
+    /// A dash up the pass's rising lane stays on or above the ground the
+    /// whole way (it went into the slope, then snapped up).
+    #[test]
+    fn a_dash_uphill_stays_above_the_ground() {
+        clawbound::map::with(clawbound::map::MapId::Pass, || {
+            let dasher = id_where(|d| d.abilities.iter().any(|a| matches!(a.arch, Archetype::Dash { .. })));
+            let mut g = Game::new_teams(&[dasher], &[(dasher + 1) % 13]);
+            quiet(&mut g);
+            g.gods[1].respawn_t = 999.0;
+            // find the ramp: along the Top lane where the ground climbs
+            let pts = clawbound::pass::lane_polyline(clawbound::consts::Lane::Top);
+            let mut foot = None;
+            'find: for w in pts.windows(2) {
+                for k in 0..40 {
+                    let p = w[0].lerp(w[1], k as f32 / 40.0);
+                    let q = w[0].lerp(w[1], (k + 4) as f32 / 40.0);
+                    let (a, b) = (clawbound::map::ground_y(p.x, p.z), clawbound::map::ground_y(q.x, q.z));
+                    if a < 1.0 && b > a + 1.0 {
+                        foot = Some((p, (q - p).normalize()));
+                        break 'find;
+                    }
+                }
+            }
+            let (p, up) = foot.expect("the ramp");
+            g.gods[0].pos = Vec3::new(p.x, clawbound::map::ground_y(p.x, p.z), p.z);
+            g.gods[0].mana = 10_000.0;
+            let slot = slot_of(&g, 0, |a| matches!(a, Archetype::Dash { .. })).unwrap();
+            g.cast_queue.push((0, slot, p + up * 10.0));
+            let mut deepest = 0.0f32;
+            let mut biggest_jump = 0.0f32;
+            let mut last_y = g.gods[0].pos.y;
+            for _ in 0..40 {
+                g.tick(1.0 / 60.0);
+                g.events.clear();
+                let c = &g.gods[0];
+                deepest = deepest.min(c.pos.y - clawbound::map::ground_y(c.pos.x, c.pos.z));
+                biggest_jump = biggest_jump.max((c.pos.y - last_y).abs());
+                last_y = c.pos.y;
+            }
+            assert!(deepest > -0.05, "the cat went {deepest} into the ground");
+            assert!(biggest_jump < 1.0, "a teleport of {biggest_jump} u in one frame");
+        });
+    }
+
+    /// A bolt fired from the top of the pass's ramp at a cat at its foot
+    /// hits: it pitches toward the aimed height (it flew level, over the
+    /// target's head, and the aim itself was on the plane y = 0).
+    #[test]
+    fn a_bolt_downhill_hits() {
+        clawbound::map::with(clawbound::map::MapId::Pass, || {
+            let shooter = id_where(|d| d.abilities.iter().any(|a| matches!(a.arch, Archetype::Bolt { .. })));
+            let pts = clawbound::pass::lane_polyline(clawbound::consts::Lane::Top);
+            // walk the lane: the last low point before the shelf, and the first high one
+            let mut samples = Vec::new();
+            for w in pts.windows(2) {
+                for k in 0..60 {
+                    let p = w[0].lerp(w[1], k as f32 / 60.0);
+                    samples.push(Vec3::new(p.x, clawbound::map::ground_y(p.x, p.z), p.z));
+                }
+            }
+            let top = samples.iter().position(|p| p.y > 8.5).expect("the shelf");
+            let foot = samples[..top].iter().rposition(|p| p.y < 0.3).expect("the ramp's foot");
+            let (hi, lo) = (samples[top], samples[foot]);
+            let mut g = Game::new_teams(&[shooter], &[(shooter + 1) % 13]);
+            quiet(&mut g);
+            g.gods[0].pos = hi;
+            g.gods[0].mana = 10_000.0;
+            g.gods[1].pos = lo;
+            g.gods[1].max_hp = 1.0e6;
+            g.gods[1].hp = 1.0e6;
+            let slot = slot_of(&g, 0, |a| matches!(a, Archetype::Bolt { .. })).unwrap();
+            // aim as the camera now does: at the target's point on the ground
+            g.cast_queue.push((0, slot, lo));
+            run(&mut g, 2.0);
+            assert!(g.gods[1].hp < 1.0e6, "the bolt missed the cat below ({} u down, {:.0} u away)", hi.y - lo.y, (hi - lo).length());
+        });
+    }
 }

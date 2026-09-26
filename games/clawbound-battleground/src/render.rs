@@ -307,7 +307,7 @@ pub struct Renderer {
     /// Fur shells per smooth draw, and strands per unit of model space.
     pub fur_shells: u32,
     pub fur_density: f32,
-    camera: Camera,
+    pub camera: Camera,
     time: f32,
     pub exposure: f32,
     /// Sky state for this frame — set by the caller each frame (see weather.rs).
