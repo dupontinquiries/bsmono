@@ -240,6 +240,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     rack.channels.clear();
     rack.patterns.clear();
     let mut rack_ix: BTreeMap<i64, usize> = BTreeMap::new();
+    let mut switched_off: Vec<String> = Vec::new();
     let mut stand_ins: Vec<String> = Vec::new();
     for fl in &used {
         let Some(c) = chans.get(fl) else { continue };
@@ -269,8 +270,14 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         };
         rack_ix.insert(*fl, rack.channels.len());
         let pan = fl_pan(f(&c["pan"]).unwrap_or(6400.0));
+        // FL's channel on/off switch: OFF comes in MUTED -- still there, a mute
+        // away. Ignored until c20, which played Balance's switched-off Slicex
+        // vocal chop (an idea the artist never committed to) through its
+        // busiest pattern on a full-level stand-in: the loudest thing in the mix.
+        let off = c["enabled"].as_bool() == Some(false);
+        if off { switched_off.push(ch_name(c)); }
         rack.channels.push(Channel { name: ch_name(c), kind, gain: channel_gain(c, media).clamp(0.0, 16.0),
-                                     pan, muted: false, choke_group: None });
+                                     pan, muted: off, choke_group: None });
     }
     if !stand_ins.is_empty() {
         report.push(format!("{} plugin synth{} cannot be hosted and their sound is not in the file -- STAND-INS, notes kept: {}",
@@ -427,6 +434,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     let mut pattern_sources: BTreeMap<usize, SourceId> = BTreeMap::new();
     let (mut automation_clips, mut placed, mut overflowed, mut declicked) = (0usize, 0usize, 0usize, 0usize);
     let mut stretches: Vec<(String, f64, String)> = Vec::new();
+    let mut off_clips = 0usize;
     let mut stretch_modes: BTreeMap<String, i64> = BTreeMap::new();
     let mut track_at = 0usize;
     for t in arr["tracks"].as_array().into_iter().flatten() {
@@ -447,6 +455,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                 Some("ChannelPLItem") => {
                     let Some(c) = i(&it["channel"]).and_then(|c| chans.get(&c)) else { continue };
                     if s(&c["kind"]) == Some("Automation") { automation_clips += 1; continue; }
+                    if c["enabled"].as_bool() == Some(false) { off_clips += 1; continue; }
                     let Some(file) = file_of(c) else { continue };
                     let Some((id, m)) = source_for(&file, &mut ops, &mut missing, None) else { continue };
                     let offs: Vec<f64> = it["offsets"].as_array().into_iter().flatten().map(|v| v.as_f64().unwrap_or(-1.0)).collect();
@@ -591,6 +600,10 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         report.push(format!("time-stretched in FL (fit to tempo), played from stretched copies, pitch kept: {} -- FL's stretch modes here {:?} (0 would be Resample, which shifts pitch)",
             by.keys().cloned().collect::<Vec<_>>().join(", "), stretch_modes.values().collect::<std::collections::BTreeSet<_>>()));
     }
+    if !switched_off.is_empty() || off_clips > 0 {
+        report.push(format!("switched off in FL: {} -- muted in the rack{}", if switched_off.is_empty() { "(no rack channels)".to_string() } else { switched_off.join(", ") },
+            if off_clips > 0 { format!("; {off_clips} of their audio clips not placed") } else { String::new() }));
+    }
     if declicked > 0 { report.push(format!("{declicked} audio clips declicked: {:.0} ms fades at each edge, as FL does by default", DECLICK * 1000.0)); }
     if automation_clips > 0 { report.push(format!("{automation_clips} automation clip{} not imported (their points are not read yet)", if automation_clips == 1 { "" } else { "s" })); }
     if !approx.is_empty() { report.push(format!("effects read or approximated: {}", approx.join("; "))); }
@@ -658,7 +671,7 @@ mod tests {
             "channels": [
                 {"iid": 0, "kind": "Sampler", "name": "Kick", "sample_file": "kick.wav", "insert": 1, "volume": 10000},
                 {"iid": 1, "kind": "Instrument", "name": "Omnisphere", "plugin": "Fruity Wrapper", "plugin_name": "Omnisphere", "insert": 2, "volume": 10000},
-                {"iid": 2, "kind": "Instrument", "name": "Bass", "plugin": "Fruity Wrapper", "plugin_name": "Omnisphere", "insert": 0, "volume": 10000},
+                {"iid": 2, "kind": "Instrument", "name": "Bass", "plugin": "Fruity Wrapper", "plugin_name": "Omnisphere", "insert": 0, "volume": 10000, "enabled": false},
                 {"iid": 3, "kind": "Sampler", "name": "Vox", "sample_file": "vox.wav", "insert": 2, "volume": 5000, "pan": 6400, "normalize": true},
                 {"iid": 4, "kind": "Automation", "name": "Vox - Volume"}
             ],
@@ -726,6 +739,9 @@ mod tests {
         assert!(matches!(im.rack.channels[omni].kind, SynthKind::Sine { .. }));
         let bass = im.rack.channels.iter().position(|c| c.name == "Bass").unwrap();
         assert!(matches!(im.rack.channels[bass].kind, SynthKind::Sub { .. }), "all notes below C4: a Sub stand-in");
+        assert!(im.rack.channels[bass].muted, "switched off in FL: muted here, not dropped");
+        assert!(!im.rack.channels[omni].muted);
+        assert!(im.report.iter().any(|r| r.contains("switched off in FL: Bass")), "{:?}", im.report);
         let long: Vec<&Pattern> = im.rack.patterns.iter().filter(|p| p.name.starts_with("Long")).collect();
         assert_eq!(long.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["Long (1/2)", "Long (2/2)"]);
         assert!(long[1].is_set(kick, 4), "step 68 is step 4 of part 2");
