@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Clawbound — Battleground: the thirteen legendary ancestors in a microvoxel 5v5 arena, Rust + wgpu"
 license = "MIT"
+# Two binaries (the game and lanbot): plain `cargo run` runs the game.
+default-run = "clawbound-battleground"
 
 [lib]
 name = "clawbound"
