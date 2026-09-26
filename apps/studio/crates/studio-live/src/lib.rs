@@ -886,6 +886,48 @@ pub struct PolyPatch {
     pub pan_end: f32,
     #[serde(default)]
     pub pan_time_ms: f32,
+    /// BODY (c20): three resonances at FIXED frequencies (Hz, gain dB, shared
+    /// Q) -- a violin's air and wood modes, its bridge hill: the part of an
+    /// acoustic timbre that does NOT move with the note (the harmonic profile
+    /// does). 0 Hz = off.
+    #[serde(default)]
+    pub body_hz: [f32; 3],
+    #[serde(default)]
+    pub body_db: [f32; 3],
+    #[serde(default)]
+    pub body_q: f32,
+    /// Vibrato that ARRIVES: it fades in over 300 ms after this delay (a
+    /// player's held note), at `vib_rate` Hz (0 = 5 Hz).
+    #[serde(default)]
+    pub vib_delay_ms: f32,
+    #[serde(default)]
+    pub vib_rate: f32,
+    /// Each unison voice WANDERS, slowly, this many cents -- players are not
+    /// a fixed detune.
+    #[serde(default)]
+    pub drift: f32,
+    /// Bow / breath noise through the body, strongest at the attack.
+    #[serde(default)]
+    pub bow_noise: f32,
+}
+
+/// An RBJ peaking biquad (the body's resonances).
+#[derive(Clone, Copy)]
+struct Peak { b0: f32, b1: f32, b2: f32, a1: f32, a2: f32, z1: f32, z2: f32 }
+impl Peak {
+    fn new(f: f32, db: f32, q: f32, rate: f32) -> Peak {
+        let a = 10f32.powf(db / 40.0);
+        let w = std::f32::consts::TAU * f.clamp(20.0, 0.45 * rate) / rate;
+        let al = w.sin() / (2.0 * q.max(0.3));
+        let a0 = 1.0 + al / a;
+        Peak { b0: (1.0 + al * a) / a0, b1: -2.0 * w.cos() / a0, b2: (1.0 - al * a) / a0, a1: -2.0 * w.cos() / a0, a2: (1.0 - al / a) / a0, z1: 0.0, z2: 0.0 }
+    }
+    fn run(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        y
+    }
 }
 
 impl Default for PolyPatch {
@@ -894,7 +936,8 @@ impl Default for PolyPatch {
                     cutoff: 3000.0, resonance: 0.2, env_amount: 1.0, vibrato: 0.0, gain: 0.5,
                     partials: [0; 16], noise: 0.0, fm_ratio: 0.0, fm_index: 0.0, drive: 0.0,
                     width: 0.0, low_width: 1.0, key_pan: 0.0, pan_lfo_hz: 0.0, pan_lfo_depth: 0.0,
-                    phase: 0.0, pan_start: 0.0, pan_end: 0.0, pan_time_ms: 0.0 }
+                    phase: 0.0, pan_start: 0.0, pan_end: 0.0, pan_time_ms: 0.0,
+                    body_hz: [0.0; 3], body_db: [0.0; 3], body_q: 0.0, vib_delay_ms: 0.0, vib_rate: 0.0, drift: 0.0, bow_noise: 0.0 }
     }
 }
 
@@ -963,6 +1006,10 @@ pub fn poly_voice_st(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], out_r: 
     let note_pan = (p.key_pan * (hz / 261.63).log2()).clamp(-1.0, 1.0);
     let side_hp = (-std::f32::consts::TAU * 250.0 / r).exp(); // one-pole: side's lows
     let mut side_lp = 0.0f32;
+    let mk_body = || -> Vec<Peak> { (0..3).filter(|k| p.body_hz[*k] > 0.0 && p.body_db[*k] != 0.0)
+        .map(|k| Peak::new(p.body_hz[k], p.body_db[k], if p.body_q > 0.0 { p.body_q } else { 4.0 }, r)).collect() };
+    let (mut body_l, mut body_r) = (mk_body(), mk_body());
+    let vib_hz = if p.vib_rate > 0.0 { p.vib_rate } else { 5.0 };
     let mut noise_state = 0x2545_f491_u32;
     let drive_k = 1.0 + p.drive.clamp(0.0, 1.0) * 4.0;
     for (i, s) in out.iter_mut().enumerate() {
@@ -976,7 +1023,9 @@ pub fn poly_voice_st(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], out_r: 
             let d = (i - gate) as f32 / rel as f32;
             if d >= 1.0 { 0.0 } else { level_at_gate * (1.0 - d).powi(2) }
         };
-        let vib = if p.vibrato > 0.0 { 2f32.powf(p.vibrato / 1200.0 * (i as f32 / r * 5.0 * std::f32::consts::TAU).sin()) } else { 1.0 };
+        let t = i as f32 / r;
+        let vib_amt = if p.vib_delay_ms > 0.0 { ((t - p.vib_delay_ms * 0.001) / 0.3).clamp(0.0, 1.0) } else { 1.0 };
+        let vib = if p.vibrato > 0.0 { 2f32.powf(p.vibrato * vib_amt / 1200.0 * (t * vib_hz * std::f32::consts::TAU).sin()) } else { 1.0 };
         let (mut x, mut xr) = (0.0f32, 0.0f32);
         let fm = if p.fm_index > 0.0 && p.fm_ratio > 0.0 {
             let m = p.fm_index * (fm_phase * std::f32::consts::TAU).sin();
@@ -984,7 +1033,8 @@ pub fn poly_voice_st(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], out_r: 
             m / std::f32::consts::TAU
         } else { 0.0 };
         for (k, ph) in phase.iter_mut().enumerate() {
-            let f = hz * vib * 2f32.powf(spread(k) / 1200.0);
+            let wander = if p.drift > 0.0 { p.drift * (t * (0.13 + 0.07 * k as f32) * std::f32::consts::TAU + k as f32 * 1.7).sin() } else { 0.0 };
+            let f = hz * vib * 2f32.powf((spread(k) + wander) / 1200.0);
             let dt = (f / r).min(0.49);
             let v = if let Some(t) = &table { read(t, *ph + fm) } else if fm != 0.0 { (((*ph + fm) * std::f32::consts::TAU).sin()) } else { match p.wave {
                 0 => (*ph * std::f32::consts::TAU).sin(),
@@ -1009,6 +1059,11 @@ pub fn poly_voice_st(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], out_r: 
             let v = p.noise * (noise_state as f32 / u32::MAX as f32 * 2.0 - 1.0);
             x += v * c; xr += v * c;
         }
+        if p.bow_noise > 0.0 {
+            noise_state ^= noise_state << 13; noise_state ^= noise_state >> 17; noise_state ^= noise_state << 5;
+            let v = p.bow_noise * (1.0 + 2.0 * (-t / 0.08).exp()) * (noise_state as f32 / u32::MAX as f32 * 2.0 - 1.0);
+            x += v * c; xr += v * c;
+        }
         if p.drive > 0.0 {
             let k = drive_k * std::f32::consts::SQRT_2;
             // /tanh(drive_k), not /tanh(k): the fold (L+R)/sqrt2 stays exactly the old mono voice
@@ -1027,6 +1082,8 @@ pub fn poly_voice_st(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], out_r: 
         jc1 = 2.0 * w1 - jc1;
         jc2 = 2.0 * w2 - jc2;
         let (mut l, mut rr) = (v2 * env * p.gain, w2 * env * p.gain);
+        for b in body_l.iter_mut() { l = b.run(l); }
+        for b in body_r.iter_mut() { rr = b.run(rr); }
         // the side's LOWS, kept by low_width
         if p.low_width < 1.0 {
             let (m, side) = ((l + rr) * 0.5, (l - rr) * 0.5);
@@ -3489,6 +3546,43 @@ mod poly_tests {
         let bal = |a: usize, b: usize| (e(&r[a..b]) - e(&l[a..b])) / (e(&r[a..b]) + e(&l[a..b]));
         assert!(bal(500, 2_000) > 0.6, "starts right: {}", bal(500, 2_000));
         assert!(bal(24_000, 26_000) < -0.1, "ends left of centre: {}", bal(24_000, 26_000));
+    }
+
+    /// A BODY resonance is fixed in Hz: +12 dB at 1 kHz lifts the harmonic
+    /// NEAREST 1 kHz whatever the note (the 5th of 200 Hz, the 4th of 250 Hz),
+    /// relative to the same note without it; with no body, nothing changes.
+    #[test]
+    fn a_body_resonance_stays_at_its_frequency_across_notes() {
+        let saw = PolyPatch { wave: 2, voices: 1, detune: 0.0, attack_ms: 2.0, sustain: 1.0, cutoff: 20_000.0, env_amount: 0.0, gain: 1.0, ..Default::default() };
+        let body = PolyPatch { body_hz: [1000.0, 0.0, 0.0], body_db: [12.0, 0.0, 0.0], body_q: 6.0, ..saw };
+        for (hz, near) in [(200.0f32, 5.0f32), (250.0, 4.0)] {
+            let (a, _) = st(hz, &saw, 24_000);
+            let (b, _) = st(hz, &body, 24_000);
+            let m = |v: &[f32], f: f32| mag(&v[4_000..20_000], f, 48_000.0);
+            let lift = |k: f32| m(&b, hz * k) / m(&a, hz * k);
+            assert!(lift(near) > 2.5, "{hz} Hz: harmonic {near} (~1 kHz) lifted x{}", lift(near));
+            assert!(lift(1.0) < 1.3, "{hz} Hz: the fundamental is not: x{}", lift(1.0));
+        }
+        let (a, _) = st(220.0, &saw, 12_000);
+        let (b, _) = st(220.0, &PolyPatch { body_q: 5.0, ..saw }, 12_000);
+        assert_eq!(a, b, "no resonance set: identity");
+    }
+
+    /// Vibrato that ARRIVES: none in the first 200 ms of a 400 ms-delayed
+    /// vibrato, plenty after 700 ms.
+    #[test]
+    fn a_delayed_vibrato_arrives() {
+        let p = PolyPatch { wave: 0, voices: 1, detune: 0.0, attack_ms: 2.0, sustain: 1.0, cutoff: 20_000.0, env_amount: 0.0, gain: 1.0,
+                            vibrato: 60.0, vib_delay_ms: 400.0, vib_rate: 6.0, ..Default::default() };
+        let (l, _) = st(440.0, &p, 60_000);
+        // instantaneous frequency spread via zero-crossing intervals
+        let spread = |a: usize, b: usize| {
+            let z: Vec<usize> = (a..b).filter(|i| l[*i - 1] <= 0.0 && l[*i] > 0.0).collect();
+            let d: Vec<f32> = z.windows(2).map(|w| (w[1] - w[0]) as f32).collect();
+            d.iter().cloned().fold(0.0, f32::max) - d.iter().cloned().fold(f32::MAX, f32::min)
+        };
+        assert!(spread(1_000, 9_600) <= 1.0, "steady before the delay: {}", spread(1_000, 9_600));
+        assert!(spread(34_000, 44_000) >= 2.0, "vibrato after it: {}", spread(34_000, 44_000));
     }
 
     /// The mono voice is the stereo one folded: for a centred patch the fold

@@ -11,7 +11,14 @@ use studio_app::synth_fit::{masked_profile, notes_with_company};
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let (path, refp) = (std::path::PathBuf::from(&a[1]), std::path::PathBuf::from(&a[2]));
-    let out = a.get(3).map(std::path::PathBuf::from).unwrap_or_else(|| path.clone());
+    let _ = &refp;
+    // positional: song.studio reference [out.studio]; --keep NAME (repeatable):
+    // before refitting NAME, keep its current patch as a MUTED, unused rack
+    // channel "NAME [kept: Studio take]" -- a version worth keeping, buried in
+    // the project, while parity is chased (the artist's Blue Moon piano)
+    let keep: Vec<String> = a.windows(2).filter(|w| w[0] == "--keep").map(|w| w[1].clone()).collect();
+    let pos: Vec<&String> = a.iter().enumerate().skip(1).filter(|(i, x)| !x.starts_with("--") && a[i - 1] != "--keep").map(|(_, x)| x).collect();
+    let out = pos.get(2).map(|x| std::path::PathBuf::from(x.as_str())).unwrap_or_else(|| path.clone());
     let save = studio_collab::file::SaveFile::decode(&std::fs::read(&path).unwrap()).expect("project");
     let project = save.to_project();
     let mut rack = save.rack.clone().expect("a rack");
@@ -23,6 +30,13 @@ fn main() {
     let fitted: Vec<usize> = notes_with_company(&project, &rack).iter().map(|(c, _)| *c).collect();
     for (ch, items) in notes_with_company(&project, &rack) {
         let studio_live::SynthKind::Poly { hz, patch } = rack.channels[ch].kind.clone() else { continue };
+        if keep.contains(&rack.channels[ch].name) {
+            let mut kept = rack.channels[ch].clone();
+            kept.name = format!("{} [kept: Studio take]", kept.name);
+            kept.muted = true;
+            rack.add_channel(kept);
+            println!("{:<28} kept as a muted, unused channel before refitting", rack.channels[ch].name);
+        }
         // each note measured in its longest stretch clear of drum hits
         let mut use_items: Vec<(studio_app::synth_fit::NoteAt, Vec<f32>)> = items.iter().filter_map(|c|
             studio_app::synth_fit::clean_window(c, 0.8).map(|(a, b)| (studio_app::synth_fit::NoteAt { start: a, end: b, hz: c.note.hz }, c.others.clone()))).collect();
@@ -56,6 +70,24 @@ fn main() {
                     np.pan_start = im.pan_start; np.pan_end = im.pan_end; np.pan_time_ms = 1500.0;
                     println!("{:<28} image: pan {:+.2} width hi {:.2} lo {:.2} key_pan {:+.2} env {:+.2} -> {:+.2} ({} notes) => width {:.2} phase {:.2} low_width {:.2}",
                              "", im.pan, im.width_high, im.width_low, im.key_pan, im.pan_start, im.pan_end, im.notes, np.width, np.phase, np.low_width);
+                }
+                // BODY or PARTIALS: whichever explains the render better. A body
+                // (fixed-Hz resonances over a saw) is how an acoustic instrument's
+                // timbre behaves -- it does not move with the note; the human
+                // motion comes with it (vibrato that arrives, drift, bow noise).
+                if let Some(b) = studio_app::synth_fit::body_fit(&wins) {
+                    let choose = b.err_body < 0.85 * b.err_partials && !b.peaks.is_empty();
+                    println!("{:<28} body model err {:.1} dB vs partials {:.1} dB -> {}  peaks {:?}", "", b.err_body, b.err_partials,
+                             if choose { "BODY" } else { "partials" }, b.peaks.iter().map(|(f, d)| (f.round(), (d * 10.0).round() / 10.0)).collect::<Vec<_>>());
+                    if choose {
+                        np.partials = [0; 16]; np.wave = 2;
+                        for (k, (f, d)) in b.peaks.iter().enumerate() { np.body_hz[k] = *f; np.body_db[k] = *d; }
+                        np.body_q = 4.0;
+                        if np.vibrato == 0.0 { np.vibrato = 12.0; }
+                        np.vib_delay_ms = 300.0; np.vib_rate = 5.5; np.drift = 5.0; np.bow_noise = 0.015;
+                        np.voices = np.voices.max(3); np.detune = np.detune.max(8.0);
+                        np.cutoff = 9_000.0; np.env_amount = 0.3;
+                    }
                 }
                 rack.channels[ch].kind = studio_live::SynthKind::Poly { hz, patch: np };
             }

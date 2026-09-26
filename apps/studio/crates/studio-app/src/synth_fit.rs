@@ -429,3 +429,92 @@ mod image_tests {
         assert!(k.key_pan > 0.3, "pan rises with pitch: {k:?}");
     }
 }
+
+/// A BODY fit: the spectral envelope in HERTZ above a saw-like source, its
+/// strongest resonances, and how well it predicts the render against the
+/// pitch-relative harmonic model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BodyFit {
+    /// Third-octave bins, 100 Hz..8 kHz: (centre Hz, dB above the source).
+    pub bins: Vec<(f32, f32)>,
+    /// Up to three resonances: (Hz, dB > 0).
+    pub peaks: Vec<(f32, f32)>,
+    /// RMS dB error, over the measured harmonics, of the BODY model (a saw
+    /// through the fixed-Hz envelope) and of the PARTIALS model (one profile
+    /// per harmonic number) -- the smaller one describes this sound.
+    pub err_body: f32,
+    pub err_partials: f32,
+}
+
+/// Fit a body from windows (samples, rate, pitch, other pitches): harmonics
+/// 1..=24, clear of the others', measured at their real frequencies.
+pub fn body_fit(windows: &[(Vec<f32>, u32, f32, Vec<f32>)]) -> Option<BodyFit> {
+    // per note: (freq, harmonic k, residual dB after the saw slope and the note's mean)
+    let mut pts: Vec<(f32, usize, f32)> = Vec::new();
+    for (w, rate, hz, others) in windows {
+        let skip = (*rate as usize * 6 / 100).min(w.len());
+        let w = &w[skip..];
+        if w.len() < *rate as usize / 10 { continue; }
+        let mut v = Vec::new();
+        for k in 1..=24usize {
+            let f = hz * k as f32;
+            if f >= 0.45 * *rate as f32 || f > 9_000.0 || !clear_of(f, others, 0.015) { continue; }
+            let m = goertzel(w, f, *rate as f32);
+            if m <= 1e-9 { continue; }
+            v.push((f, k, 20.0 * m.log10() + 20.0 * (k as f32).log10()));
+        }
+        if v.len() < 3 { continue; }
+        let mean = v.iter().map(|x| x.2).sum::<f32>() / v.len() as f32;
+        pts.extend(v.into_iter().map(|(f, k, d)| (f, k, d - mean)));
+    }
+    if pts.len() < 12 { return None; }
+    let centres: Vec<f32> = (0..20).map(|i| 100.0 * 2f32.powf(i as f32 / 3.0)).filter(|f| *f <= 8_000.0).collect();
+    let bin_of = |f: f32| ((f / 100.0).log2() * 3.0).round().clamp(0.0, (centres.len() - 1) as f32) as usize;
+    let (mut sum, mut cnt) = (vec![0.0f32; centres.len()], vec![0usize; centres.len()]);
+    for (f, _, d) in &pts { let b = bin_of(*f); sum[b] += d; cnt[b] += 1; }
+    let bins: Vec<(f32, f32)> = centres.iter().enumerate().filter(|(i, _)| cnt[*i] > 0).map(|(i, c)| (*c, sum[i] / cnt[i] as f32)).collect();
+    let env_at = |f: f32| { let b = bin_of(f); if cnt[b] > 0 { sum[b] / cnt[b] as f32 } else { 0.0 } };
+    // the partials model: one value per harmonic number
+    let (mut ks, mut kc) = (vec![0.0f32; 25], vec![0usize; 25]);
+    for (_, k, d) in &pts { ks[*k] += d; kc[*k] += 1; }
+    let (mut eb, mut ep) = (0.0f32, 0.0f32);
+    for (f, k, d) in &pts {
+        eb += (d - env_at(*f)).powi(2);
+        ep += (d - ks[*k] / kc[*k].max(1) as f32).powi(2);
+    }
+    let n = pts.len() as f32;
+    // peaks: local maxima above the mean, the three largest, >= 1.5 dB
+    let base = bins.iter().map(|b| b.1).sum::<f32>() / bins.len() as f32;
+    let mut peaks: Vec<(f32, f32)> = (0..bins.len()).filter(|&i| {
+        let v = bins[i].1;
+        (i == 0 || v >= bins[i - 1].1) && (i + 1 == bins.len() || v >= bins[i + 1].1) && v - base >= 1.5
+    }).map(|i| (bins[i].0, (bins[i].1 - base).min(12.0))).collect();
+    peaks.sort_by(|a, b| b.1.total_cmp(&a.1));
+    peaks.truncate(3);
+    Some(BodyFit { bins, peaks, err_body: (eb / n).sqrt(), err_partials: (ep / n).sqrt() })
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+
+    /// Saw-like notes at four pitches through a +10 dB resonance at 1 kHz:
+    /// the fit finds a peak within a third of an octave of 1 kHz, and the
+    /// BODY model explains them better than one profile per harmonic.
+    #[test]
+    fn a_fixed_resonance_is_found_and_the_body_model_wins() {
+        let rate = 48_000u32;
+        let res = |f: f32| 1.0 + 2.16 * (-((f / 1000.0).log2() * 3.0).powi(2)).exp(); // ~+10 dB at 1 kHz
+        let wins: Vec<(Vec<f32>, u32, f32, Vec<f32>)> = [147.0f32, 196.0, 262.0, 330.0, 415.0].iter().map(|hz| {
+            let n = 24_000;
+            let v: Vec<f32> = (0..n).map(|i| { let t = i as f32 / rate as f32;
+                (1..=24).map(|k| { let f = hz * k as f32; if f > 20_000.0 { 0.0 } else { res(f) / k as f32 * (std::f32::consts::TAU * f * t).sin() } }).sum::<f32>() }).collect();
+            (v, rate, *hz, vec![])
+        }).collect();
+        let b = body_fit(&wins).expect("a fit");
+        let top = b.peaks.first().expect("a peak");
+        assert!((top.0 / 1000.0).log2().abs() < 0.34, "peak near 1 kHz: {:?}", b.peaks);
+        assert!(top.1 > 4.0, "a real lift: {:?}", b.peaks);
+        assert!(b.err_body < b.err_partials, "body {} vs partials {}", b.err_body, b.err_partials);
+    }
+}

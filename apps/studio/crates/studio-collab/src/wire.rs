@@ -118,7 +118,9 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// v23: a Poly patch's TEXTURE -- harmonic profile, noise, FM, drive.
 /// v24: a Poly patch's IMAGE -- width, low width, pan by key, pan LFO.
 /// v25: PHASE and the per-trigger PAN ENVELOPE on a Poly patch.
-pub const WIRE_VERSION: u8 = 25;
+/// v26: a Poly patch's BODY (fixed-Hz resonances) and its human motion --
+/// delayed vibrato, drift, bow noise.
+pub const WIRE_VERSION: u8 = 26;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -833,6 +835,10 @@ fn put_synthkind(o: &mut Vec<u8>, k: &SynthKind) {
             if enc_v() >= 25 {
                 for v in [p.phase, p.pan_start, p.pan_end, p.pan_time_ms] { put_f32(o, v); }
             }
+            if enc_v() >= 26 {
+                for v in p.body_hz.iter().chain(p.body_db.iter()) { put_f32(o, *v); }
+                for v in [p.body_q, p.vib_delay_ms, p.vib_rate, p.drift, p.bow_noise] { put_f32(o, v); }
+            }
         }
         SynthKind::Sine { hz } => { put_u8(o, 0); put_f32(o, *hz); }
         SynthKind::Sampler { source } => { put_u8(o, 1); put_u64(o, source.0); }
@@ -911,6 +917,11 @@ fn get_synthkind(r: &mut R) -> Option<SynthKind> {
             }
             if r.v >= 25 {
                 patch.phase = r.f32()?; patch.pan_start = r.f32()?; patch.pan_end = r.f32()?; patch.pan_time_ms = r.f32()?;
+            }
+            if r.v >= 26 {
+                for k in 0..3 { patch.body_hz[k] = r.f32()?; }
+                for k in 0..3 { patch.body_db[k] = r.f32()?; }
+                patch.body_q = r.f32()?; patch.vib_delay_ms = r.f32()?; patch.vib_rate = r.f32()?; patch.drift = r.f32()?; patch.bow_noise = r.f32()?;
             }
             SynthKind::Poly { hz, patch }
         }
@@ -1646,7 +1657,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 25, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 26, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]
@@ -1912,10 +1923,12 @@ mod poly_wire_tests {
         let k = SynthKind::Poly { hz: 261.63, patch: studio_live::PolyPatch { wave: 3, voices: 5, detune: 14.0, sub: 0.3, cutoff: 900.0,
             partials, noise: 0.1, fm_ratio: 2.0, fm_index: 1.5, drive: 0.4,
             width: 0.7, low_width: 0.3, key_pan: 0.25, pan_lfo_hz: 0.2, pan_lfo_depth: 0.4,
-            phase: 0.6, pan_start: 0.5, pan_end: 0.0, pan_time_ms: 1500.0, ..Default::default() } };
+            phase: 0.6, pan_start: 0.5, pan_end: 0.0, pan_time_ms: 1500.0,
+            body_hz: [290.0, 470.0, 2600.0], body_db: [6.0, 4.0, 8.0], body_q: 4.0, vib_delay_ms: 300.0, vib_rate: 5.5, drift: 6.0, bow_noise: 0.03,
+            ..Default::default() } };
         let mut o = Vec::new();
         put_synthkind(&mut o, &k);
-        assert!(o.len() <= 140, "a patch WITH its texture and image: {} bytes", o.len());
+        assert!(o.len() <= 200, "a patch WITH texture, image and body: {} bytes", o.len());
         let mut r = R { b: &o, i: 0, v: WIRE_VERSION };
         assert_eq!(get_synthkind(&mut r), Some(k));
     }
