@@ -87,6 +87,15 @@ impl StoreDecode {
         let conn = self.conn.lock().ok()?;
         conn.query_row("SELECT data FROM thumbnails WHERE hash = ?1", [hash], |r| r.get::<_, Vec<u8>>(0)).ok()
     }
+
+    /// A path's thumbnail hash: from the map it was opened with, else asked of
+    /// the database — a photo imported after the gallery opened is not in the
+    /// map, and without this it decoded its full original.
+    fn hash_of(&self, path: &str) -> Option<String> {
+        if let Some(h) = self.hashes.get(path) { return Some(h.clone()); }
+        let conn = self.conn.lock().ok()?;
+        conn.query_row("SELECT thumbnail_hash FROM files WHERE path = ?1", [path], |r| r.get::<_, Option<String>>(0)).ok().flatten()
+    }
 }
 
 /// The first bytes of a file -- enough for its EXIF header.
@@ -101,7 +110,7 @@ fn head(path: &str, n: u64) -> Vec<u8> {
 
 impl Decode for StoreDecode {
     fn decode(&self, path: &str, max_side: u32) -> Result<Thumb, String> {
-        if let Some(bytes) = self.hashes.get(path).and_then(|h| self.stored(h)) {
+        if let Some(bytes) = self.hash_of(path).and_then(|h| self.stored(&h)) {
             if let Ok(img) = image::load_from_memory(&bytes) {
                 let fitted = if img.width().max(img.height()) > max_side { img.thumbnail(max_side, max_side) } else { img };
                 let small = orient(fitted, exif_orientation(&head(path, 128 * 1024))).to_rgba8();
@@ -492,6 +501,14 @@ mod tests {
         let none = StoreDecode::open(&db, HashMap::new()).unwrap().decode(&key, 128).unwrap();
         assert_eq!((none.w, none.h), (64, 128), "no stored thumbnail: the original, upright");
         assert!(none.rgba[0] > 150, "red on top: decoded from the original");
+        // A photo the service registered AFTER the decoder was opened (not in
+        // its map): the hash is asked of the database, and the stored
+        // thumbnail is still what is used.
+        let mut service = photosync::PhotoSyncDB::new(&db, &dir.join("blocks")).unwrap();
+        service.register_photo(&key, 1, &[], "t", &photosync::Photo { taken_at: 0, thumbnail_hash: Some("h1"), metadata_json: None }).unwrap();
+        drop(service);
+        let late = StoreDecode::open(&db, HashMap::new()).unwrap().decode(&key, 256).unwrap();
+        assert!(late.rgba[1] > 150 && late.rgba[0] < 100, "green: found through the files row, not decoded from the original");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

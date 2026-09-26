@@ -10,6 +10,7 @@ use egui::{Color32, Context, CornerRadius, Pos2, Rect, ScrollArea, Sense, Stroke
 use photosync::gallery_grid;
 
 pub fn draw(app: &mut App, ctx: &Context) {
+    sync_library(app, ctx);
     sync_thumbnails(app, ctx);
     if app.viewing.is_some() {
         viewer(app, ctx);
@@ -638,6 +639,21 @@ fn settings_view(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteC
     });
 }
 
+/// Start watching the service's database on the first frame (it needs this
+/// context to request a repaint), and swap in a library it has reloaded.
+fn sync_library(app: &mut App, ctx: &Context) {
+    if app.watch.is_none() {
+        if let Some(db) = app.db_path.clone() {
+            let repaint = ctx.clone();
+            app.watch = crate::watch::Watch::start(db, app.watch_every,
+                Some(std::sync::Arc::new(move || repaint.request_repaint()))).ok();
+        }
+    }
+    if let Some(fresh) = app.watch.as_ref().and_then(|w| w.take()) {
+        app.replace_library(fresh);
+    }
+}
+
 /// Upload thumbnails finished since last frame and free evicted ones; start
 /// the decoder on the first frame (it needs this context to request repaints).
 fn sync_thumbnails(app: &mut App, ctx: &Context) {
@@ -1112,6 +1128,44 @@ mod draw_tests {
         let new_bottom = app.last_tiles.iter().filter(|t| t.0.starts_with("/new/")).map(|t| t.1.max.y).fold(0.0, f32::max);
         let old_top = app.last_tiles.iter().filter(|t| t.0.starts_with("/old/")).map(|t| t.1.min.y).fold(f32::INFINITY, f32::min);
         assert!(old_top - new_bottom >= 22.0 + 20.0, "a gap and a heading between the days: {new_bottom} -> {old_top}");
+    }
+
+    /// A photo the service imports while the gallery is open appears, without
+    /// losing the album, the selection or the open album view.
+    #[test]
+    fn a_photo_imported_while_open_appears_and_nothing_is_lost() {
+        let (dir, db) = service_library("live", 2);
+        let albums = dir.join("albums.db");
+        let mut app = App::from_path(&db).unwrap();
+        app.open_albums(&albums).unwrap();
+        app.watch_every = std::time::Duration::from_millis(30);
+        let order = app.visible_order();
+        app.selected.set([order[0].clone()]);
+        app.new_album("Kept");
+        app.selected.set([order[1].clone()]);
+        let mut f = Frames::new();
+        f.run(&mut app, vec![]);
+        assert!(app.watch.is_some(), "the first frame starts watching");
+
+        let mut service = photosync::PhotoSyncDB::new(&db, &dir.join("blocks")).unwrap();
+        let p = dir.join("late.png");
+        image::RgbImage::from_pixel(80, 60, image::Rgb([200, 200, 20])).save(&p).unwrap();
+        service.import_photo(&p, "test", 64).unwrap();
+        drop(service);
+
+        let start = std::time::Instant::now();
+        while app.library.len() < 3 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "the new photo never appeared");
+            f.run(&mut app, vec![]);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(app.status, "1 new photo");
+        assert_eq!(app.view, View::Album("Kept".into()), "still in the album");
+        assert_eq!(app.library.album_items("Kept").len(), 1, "the album survived the reload");
+        assert!(app.selected.contains(&order[1]), "and so did the selection");
+        app.view = View::Library;
+        assert!(app.visible_order().contains(&p.to_string_lossy().into_owned()), "and the grid shows it");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// In an album the viewer's arrows stay in the album; they used to walk

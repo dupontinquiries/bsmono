@@ -19,6 +19,8 @@ pub mod thumbs;
 pub mod settings;
 /// What a press on a tile means (tap opens, long-press selects) — headless.
 pub mod selection;
+/// New photos while the gallery is open: polls the service's database off the UI thread.
+pub mod watch;
 
 use photosync::album::{Item, Library};
 
@@ -86,6 +88,11 @@ pub struct App {
     /// part of the key `groups` is cached under.
     pub generation: u64,
     groups_cache: Option<(GroupsKey, std::rc::Rc<Groups>)>,
+    /// Watching the service's database for new photos (started by the first
+    /// frame, when there is a database: `db_path`).
+    pub watch: Option<watch::Watch>,
+    /// How often `watch` looks.
+    pub watch_every: std::time::Duration,
 }
 
 /// The grid's content for one view: days, newest first, each with its
@@ -213,6 +220,8 @@ impl App {
             viewer_dx: 0.0,
             generation: 0,
             groups_cache: None,
+            watch: None,
+            watch_every: std::time::Duration::from_secs(3),
         }
     }
 
@@ -307,6 +316,47 @@ impl App {
         let g = std::rc::Rc::new(Groups { days });
         self.groups_cache = Some((key, g.clone()));
         g
+    }
+
+    /// Swap in a freshly loaded library (the service imported or removed
+    /// photos) without losing what the user has: albums (from the albums
+    /// file, else carried over), the selection and the open album or photo
+    /// where they still exist.
+    pub fn replace_library(&mut self, mut fresh: Library) {
+        let kept_from_file = self.albums_db.as_ref()
+            .and_then(|p| rusqlite::Connection::open_with_flags(p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok())
+            .and_then(|c| photosync::album::load_albums(&c, &mut fresh).ok())
+            .unwrap_or(false);
+        if !kept_from_file {
+            for name in self.library.album_names() {
+                let paths: Vec<String> = self.library.album(name).map(|a| a.items.iter().cloned().collect()).unwrap_or_default();
+                fresh.create_album(name);
+                // Without an albums file (the demo) a photo the service
+                // removed leaves its albums here; with one, the file keeps
+                // the membership for when the photo returns.
+                fresh.add_to_album(name, &paths);
+            }
+        }
+        let (before, after) = (self.library.len(), fresh.len());
+        self.library = fresh;
+        let exists: std::collections::HashSet<String> = self.library.by_day().into_iter()
+            .flat_map(|(_, v)| v.into_iter().map(|i| i.path.clone())).collect();
+        self.selected.retain(|p| exists.contains(p));
+        if let View::Album(name) = &self.view {
+            if self.library.album(name).is_none() { self.view = View::Library; }
+        }
+        if self.viewing.as_ref().is_some_and(|p| !exists.contains(p)) {
+            self.viewing = None;
+            self.full_tex = None;
+        }
+        self.generation += 1;
+        if after > before {
+            let n = after - before;
+            self.status = format!("{n} new photo{}", plural(n));
+        } else if after < before {
+            let n = before - after;
+            self.status = format!("{n} photo{} removed from the library", plural(n));
+        }
     }
 
     /// Make an album, with the selection in it if there is one, and show it.
@@ -474,5 +524,50 @@ mod layout_tests {
             assert_eq!(g.columns, cols, "width {w}");
             assert!(g.cell * cols as f32 + 3.0 * (cols + 1) as f32 <= w + 0.01, "fits: {w} {g:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+    use photosync::album::Item;
+
+    fn lib(n: usize) -> Library {
+        Library::new((0..n).map(|i| Item { path: format!("/p/{i}"), taken_at: 1_750_000_000 + i as i64,
+            thumbnail: None, bytes: 1, metadata_json: None }).collect())
+    }
+
+    #[test]
+    fn without_an_albums_file_the_albums_are_carried_over() {
+        let mut app = App::new(lib(3));
+        app.selected.set(["/p/0".to_string(), "/p/2".to_string()]);
+        app.new_album("Mine");
+        app.replace_library(lib(4));
+        assert_eq!(app.library.album_items("Mine").len(), 2, "carried over into the new library");
+        assert_eq!(app.status, "1 new photo");
+        app.replace_library(lib(2));
+        assert_eq!(app.library.album_items("Mine").len(), 1, "a removed photo leaves the album with the rest");
+        assert_eq!(app.status, "2 photos removed from the library");
+    }
+
+    #[test]
+    fn with_an_albums_file_the_file_is_what_counts() {
+        // Another window (or a sync of the albums file) changed it: the reload
+        // shows the file's albums, not this window's memory of them.
+        let dir = std::env::temp_dir().join(format!("photosync-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("albums.db");
+        let mut app = App::new(lib(3));
+        app.open_albums(&path).unwrap();
+        app.selected.set(["/p/1".to_string()]);
+        app.new_album("Here");
+        let mut other = App::new(lib(3));
+        other.open_albums(&path).unwrap();
+        other.selected.set(["/p/0".to_string(), "/p/2".to_string()]);
+        other.new_album("There");
+        app.replace_library(lib(3));
+        assert_eq!(app.library.album_names(), vec!["Here", "There"]);
+        assert_eq!(app.library.album_items("There").len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
