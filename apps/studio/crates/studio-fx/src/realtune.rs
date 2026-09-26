@@ -315,6 +315,10 @@ impl RealtimeTune {
     /// The correction being applied right now, in cents.
     pub fn correction_cents(&self) -> f32 { self.cents }
 
+    /// The input period (samples) the shifter's taps are kept in phase with:
+    /// the last voiced analysis, `None` while unvoiced.
+    pub fn period_samples(&self) -> Option<f32> { self.period }
+
     /// One interleaved sample. Channel 0's stream drives detection; every
     /// channel gets the same ratio.
     pub fn process(&mut self, x: f32) -> f32 {

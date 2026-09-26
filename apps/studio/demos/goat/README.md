@@ -88,3 +88,31 @@ aligned tap spacing. Likely part of the "barren vocals".
 A second, smaller start-dependence remains OUTSIDE the effects (all fx
 bypassed: whole-song -32.6 vs window -38.3 dB at 63 Hz), not yet found.
 Window renders are not safe stand-ins for the song until it is.
+
+## Re-measured after the rebuild (autotune fix in; importer one-shot/rolls not)
+
+FFT bands (tools/analysis/bands.py), release build, fresh import of the
+uploaded Goat_v5-2026.zip.
+
+* The render-START dependence is GONE here. 3:04-3:14 from a 0:00-3:14
+  render vs a 3:04 window: identical in every band with all effects
+  bypassed, within 0.6 dB with the full chain. Neither the 10 dB (effects)
+  nor the 6 dB (no effects) difference the lost session measured
+  reproduces, so window renders are usable stand-ins for Goat again.
+* voxmel (per-track probe, solo, fresh vs from-0): -29.0 / -29.0 dB, with
+  the fixed shifter, with the OLD fixed-spacing shifter, and with the
+  autotune bypassed alike. The lost session's 8 dB loss depended on state
+  this import does not have (it was imported with the lost importer
+  changes). The tap-phase fix is verified on synthetic notes only.
+* Whole song, 2 s blocks where voxmel sounds, level vs dry: 3:00 onward
+  within 0.2 dB (both shifters); 0:22-1:48 dips of 1-4 dB, BOTH shifters
+  (mean over the song -0.56 new, -0.59 old). A trace of the tuner there
+  (the chopped Slicer vocal): voicing flickers 0-100% within 50 ms, the
+  detected pitch jumps between unrelated values (312 / 164 / 96 Hz inside
+  half a second), and the correction swings -79..+81 cents block to block.
+  That is a DETECTION problem on chopped audio -- probably audible as
+  warble -- not tap phase. Open.
+* Mix vs the artist at 3:04-3:14 (Studio minus artist, dB): 63 Hz -3.0,
+  125 Hz -8.6, 250 Hz -1.8, 500 Hz +7.1, 1 kHz +3.3, 2 kHz -0.9, 4 kHz
+  -5.7, 8 kHz -7.6. The mix at 3:04 is two playlist tracks: voxmel and
+  "sinister" (the rack patterns -- drums and 808).
