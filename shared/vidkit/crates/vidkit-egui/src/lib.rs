@@ -39,6 +39,8 @@ pub mod voice;
 pub mod glow_present;
 #[cfg(feature = "glow-upload")]
 pub mod dmabuf_gl;
+#[cfg(feature = "glow-upload")]
+pub mod aiframes_gl;
 pub mod gestures;
 pub mod presenter;
 pub mod pip;

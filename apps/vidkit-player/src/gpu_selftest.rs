@@ -459,6 +459,112 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+/// The AI half-rate synthesiser's GLSL against PyTorch's own output on the
+/// committed fixture (a held-out, high-motion 256x144 crop), and against
+/// the real middle frame: parity first, then that it still beats a blend.
+fn ai_frames_parity(gl: &eframe::glow::Context) -> Result<String, String> {
+    use eframe::glow::{self, HasContext};
+    use vidkit_core::aiframes::{fixture, psnr, Plane};
+    let (w, h, p, m, q, want) = fixture();
+    unsafe {
+        let up = |d: &[u8]| -> Result<glow::Texture, String> {
+            let t = gl.create_texture()?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(t));
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::R8 as i32, w as i32, h as i32, 0, glow::RED, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(d)));
+            for (k, v) in [(glow::TEXTURE_MIN_FILTER, glow::LINEAR), (glow::TEXTURE_MAG_FILTER, glow::LINEAR), (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE), (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE)] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, k, v as i32);
+            }
+            Ok(t)
+        };
+        let (t0, t2) = (up(&p)?, up(&q)?);
+        let mut ai = vidkit_egui::aiframes_gl::AiFramesGl::new(gl)?;
+        let t = std::time::Instant::now();
+        ai.run(gl, t0, t2, w as u32, h as u32)?;
+        let got = ai.synth_luma_readback(gl, t0, t2, w as u32, h as u32)?;
+        gl.finish();
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let resid = ai.mean_residual(gl).unwrap_or(f32::NAN);
+        if std::env::var_os("VIDKIT_AI_DEBUG").is_some() {
+            ai_debug(gl, &ai, w, h, &p, &q);
+        }
+        let passes = ai.passes;
+        ai.release(gl);
+        gl.delete_texture(t0);
+        gl.delete_texture(t2);
+        let got = Plane { w, h, px: got };
+        let py = Plane { w, h, px: want };
+        let real = Plane::from_u8(w, h, &m);
+        let (y0, y2) = (Plane::from_u8(w, h, &p), Plane::from_u8(w, h, &q));
+        let blend = Plane { w, h, px: y0.px.iter().zip(&y2.px).map(|(a, b)| (a + b) / 2.0).collect() };
+        let (agree, vs_real, vs_blend) = (psnr(&got, &py), psnr(&got, &real), psnr(&blend, &real));
+        let max = got.px.iter().zip(&py.px).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let line = format!("GLSL vs PyTorch {agree:.1} dB (max |d| {max:.4}); vs real {vs_real:.2} dB, blend {vs_blend:.2} dB; residual {resid:.4}; {passes} passes, {ms:.1} ms");
+        // The cut test's input, against the CPU reference. (Not against
+        // CUT_RESIDUAL: this crop is the fixture's highest-motion 256x144,
+        // and its residual, 0.024, is above the whole-frame threshold.)
+        let cpu_resid = vidkit_core::aiframes::residual(&y0, &y2, &vidkit_core::aiframes::model_flow(&y0, &y2));
+        let line = format!("{line}; CPU residual {cpu_resid:.4}");
+        // fp16 intermediates: measured 50.6 dB (llvmpipe). Break-tested:
+        // dilation ignored 38.5, regularizer 1e-5 39.2, mask ignored 38.6,
+        // coarse flow not doubled 24.9, LK sign 18.2 -- all fail at 45.
+        // NOT caught: leaky slope 0.1 -> 0 (46.7; the CNN adds ~0.1-0.3 dB
+        // over plain LK, so its internals barely move the output). The CPU
+        // reference's own test does catch that one.
+        if agree > 45.0 && vs_real > vs_blend + 1.0 && (resid - cpu_resid).abs() < 0.002 {
+            Ok(line)
+        } else {
+            Err(line)
+        }
+    }
+}
+
+/// Stage-by-stage GLSL vs the CPU reference (VIDKIT_AI_DEBUG=1).
+unsafe fn ai_debug(gl: &eframe::glow::Context, ai: &vidkit_egui::aiframes_gl::AiFramesGl, w: usize, h: usize, p: &[u8], q: &[u8]) {
+    use vidkit_core::aiframes::{lk_flow, model_flow, pool, Plane};
+    let (y0, y2) = (Plane::from_u8(w, h, p), Plane::from_u8(w, h, q));
+    let cmp = |name: &str, got: Option<(i32, i32, Vec<[f32; 4]>)>, want: &[&Plane]| {
+        let Some((gw, gh, px)) = got else { return println!("   {name}: no readback") };
+        let ok = gw as usize == want[0].w && gh as usize == want[0].h;
+        let mut max = 0.0f32;
+        let mut sum = 0.0f64;
+        let mut at = (0, 0, 0);
+        if ok {
+            for (ch, pl) in want.iter().enumerate() {
+                for (i, v) in pl.px.iter().enumerate() {
+                    let d = (px[i][ch] - v).abs();
+                    sum += d as f64;
+                    if d > max {
+                        max = d;
+                        at = (ch, i % pl.w, i / pl.w);
+                    }
+                }
+            }
+        }
+        println!("   {name}: {gw}x{gh} (want {}x{}) max |d| {max:.5} mean {:.5} at ch{} ({},{})", want[0].w, want[0].h, sum / (want.len() * want[0].px.len()) as f64, at.0, at.1, at.2);
+    };
+    for (li, &lv) in vidkit_core::aiframes_weights::LEVELS.iter().enumerate() {
+        let (a, c) = (pool(&y0, lv), pool(&y2, lv));
+        cmp(&format!("a 1/{lv}"), ai.debug_read(gl, "a", li), &[&a]);
+        cmp(&format!("c 1/{lv}"), ai.debug_read(gl, "c", li), &[&c]);
+    }
+    let lk = lk_flow(&y0, &y2);
+    cmp("lk 1/4", ai.debug_read(gl, "lk", vidkit_core::aiframes_weights::LEVELS.len() - 1), &[&lk[0], &lk[1], &lk[2], &lk[3]]);
+    let m = model_flow(&y0, &y2);
+    cmp("flow", ai.debug_read(gl, "flow", 0), &[&m[0], &m[1], &m[2], &m[3]]);
+    cmp("mask", ai.debug_read(gl, "mask", 0), &[&m[4]]);
+    println!("   CPU residual {:.4} (cut above {})", vidkit_core::aiframes::residual(&y0, &y2, &m), vidkit_core::aiframes::CUT_RESIDUAL);
+    // The full-size synthesis alone: the CPU synth from the GPU's own flow.
+    if let (Some((fw, fh, f)), Some((_, _, mk))) = (ai.debug_read(gl, "flow", 0), ai.debug_read(gl, "mask", 0)) {
+        let (fw, fh) = (fw as usize, fh as usize);
+        let ch = |k: usize| Plane { w: fw, h: fh, px: f.iter().map(|v| v[k]).collect() };
+        let out = vec![ch(0), ch(1), ch(2), ch(3), Plane { w: fw, h: fh, px: mk.iter().map(|v| v[0]).collect() }];
+        let cpu = vidkit_core::aiframes::synth(&out, &y0, &y2);
+        let want = vidkit_core::aiframes::synth(&m, &y0, &y2);
+        println!("   synth from GPU flow vs from CPU flow: {:.1} dB", vidkit_core::aiframes::psnr(&cpu, &want));
+    }
+}
+
 pub struct SelfTest {
     gpu: Option<Arc<Mutex<Nv12Gpu>>>,
     cases: Vec<Case>,
@@ -471,7 +577,16 @@ pub struct SelfTest {
 impl SelfTest {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let gpu = cc.gl.as_ref().and_then(|gl| unsafe { Nv12Gpu::new(gl) }.map_err(|e| eprintln!("GPU SELFTEST: shader build failed: {e}")).ok());
-        Self { gpu: gpu.map(|g| Arc::new(Mutex::new(g))), cases: cases(), at: 0, shown: 0, readback: Arc::new(Mutex::new(None)), failed: false }
+        let mut failed = false;
+        match cc.gl.as_ref().map(|gl| ai_frames_parity(gl)) {
+            Some(Ok(m)) => println!("  ok   {:<24} {m}", "AI half-rate synth"),
+            Some(Err(m)) => {
+                println!("  FAIL {:<24} {m}", "AI half-rate synth");
+                failed = true;
+            }
+            None => {}
+        }
+        Self { gpu: gpu.map(|g| Arc::new(Mutex::new(g))), cases: cases(), at: 0, shown: 0, readback: Arc::new(Mutex::new(None)), failed }
     }
 }
 
