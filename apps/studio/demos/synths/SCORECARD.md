@@ -9,6 +9,32 @@ harmonic profile measured from the artist's render at the same solo notes.
 (Octave bands measure tonal balance, not timbre: Blue Moon's keys were ~2 dB
 RMS in bands both ways, which is why this metric exists.)
 
+## Run 2 -- LAYERED notes (masked profile), wavydrizzy's inaudible channel excluded
+
+Notes layered with other synth notes now count: each harmonic measured only
+where it is clear (> ~25 cents) of every harmonic of the other sounding
+notes, relative to the note's own fundamental; the SAME masking on the
+artist's render and on Studio's. Channels quieter than -40 dB in FL are not
+fitted or scored (wavydrizzy's "Omnisphere #24": volume 900 of 12800,
+~-56 dB -- run 1's "15.6 -> 6.4 dB" there measured sound that was not it,
+and is WITHDRAWN).
+
+| song | channels scored | median timbre error guessed -> fitted | better / worse |
+|---|---|---|---|
+| Blue Moon | 4 | 8.5 -> **5.4 dB** | 2 / 0 |
+| Goat v5 | 2 | 18.5 -> **4.3 dB** | 2 / 0 |
+| Red Roses, pianovibes, wavydrizzy, Balance | 0 | -- | -- |
+| A Top A Tower | (still running) | | |
+| **all** | **6** | **13.6 -> 4.8 dB** | 4 / 0 |
+
+Blue Moon's Omnisphere channels -- never alone -- now fit from layered
+notes (Omnisphere: 40, #3: 33). THE COVERAGE BLOCKER: a note overlapping a
+DRUM hit or an audio clip is excluded whole, and in a beat the drums almost
+always play -- four songs score nothing. Next: exclude only ~100 ms after
+each drum hit, not the note.
+
+## Run 1 -- solo notes only (kept for the record)
+
 | song | channel | solo notes | timbre guessed -> fitted | level guessed -> fitted |
 |---|---|---|---|---|
 | Goat v5 | Omnisphere #3 | 24 | 18.8 -> **1.9 dB** | +4.0 -> -0.9 dB |

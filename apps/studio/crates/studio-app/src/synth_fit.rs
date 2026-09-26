@@ -29,6 +29,22 @@ pub struct NoteAt { pub start: f64, pub end: f64, pub hz: f32 }
 /// patch's `hz` and the note's key). The fitter and the scorecard use the SAME
 /// notes. Channels with none are listed with none.
 pub fn solo_notes(project: &studio_core::Project, rack: &studio_live::Rack) -> Vec<(usize, Vec<NoteAt>)> {
+    notes_with_company(project, rack).into_iter()
+        .map(|(ch, v)| (ch, v.into_iter().filter(|(_, others)| others.is_empty()).map(|(n, _)| n).collect()))
+        .collect()
+}
+
+/// A channel this quiet in FL (by its gain in the rack) is inaudible there
+/// too: fitting it would measure whatever ELSE the render has at its notes.
+/// (wavydrizzy's "Omnisphere #24": channel volume 900 of 12800, ~-56 dB --
+/// its first "fit" scored 15.6 -> 6.4 dB against sound that was not it.)
+pub const INAUDIBLE_GAIN: f32 = 0.01;
+
+/// Every Poly channel's notes, each with the PITCHES of the other synth notes
+/// sounding with it (empty = alone). A note that overlaps a DRUM hit or an
+/// AUDIO clip is left out: their spectra are broad and cannot be masked
+/// harmonic by harmonic. Channels below `INAUDIBLE_GAIN` are left out.
+pub fn notes_with_company(project: &studio_core::Project, rack: &studio_live::Rack) -> Vec<(usize, Vec<(NoteAt, Vec<f32>)>)> {
     use studio_core::SourceKind;
     let step = 60.0 / rack.tempo_bpm as f64 / 4.0;
     let muted: std::collections::BTreeSet<_> = project.tracks.iter().filter(|t| t.muted).map(|t| t.id).collect();
@@ -52,14 +68,64 @@ pub fn solo_notes(project: &studio_core::Project, rack: &studio_live::Rack) -> V
         }
     }
     let overlaps = |a: (f64, f64), b: (f64, f64)| a.0 < b.1 && b.0 < a.1;
+    let pitch = |ch: usize, key: i32| match rack.channels[ch].kind {
+        studio_live::SynthKind::Poly { hz, .. } | studio_live::SynthKind::Sine { hz } => Some(hz * 2f32.powf(key as f32 / 12.0)),
+        _ => None, // a drum / sampler: broadband
+    };
     (0..rack.channels.len()).filter_map(|ch| {
         let studio_live::SynthKind::Poly { hz, .. } = rack.channels[ch].kind else { return None };
-        let alone = notes[ch].iter().filter(|n| {
-            !audio_busy.iter().any(|b| overlaps((n.0, n.1), *b))
-                && !notes.iter().enumerate().any(|(o, v)| o != ch && v.iter().any(|m| overlaps((n.0, n.1), (m.0, m.1))))
-        }).map(|n| NoteAt { start: n.0, end: n.1, hz: hz * 2f32.powf(n.2 as f32 / 12.0) }).collect();
-        Some((ch, alone))
+        if rack.channels[ch].gain < INAUDIBLE_GAIN { return None; }
+        let v = notes[ch].iter().filter_map(|n| {
+            if audio_busy.iter().any(|b| overlaps((n.0, n.1), *b)) { return None; }
+            let mut others = Vec::new();
+            for (o, list) in notes.iter().enumerate() {
+                if o == ch { continue; }
+                for m in list.iter().filter(|m| overlaps((n.0, n.1), (m.0, m.1))) {
+                    match pitch(o, m.2) { Some(p) => others.push(p), None => return None }
+                }
+            }
+            Some((NoteAt { start: n.0, end: n.1, hz: hz * 2f32.powf(n.2 as f32 / 12.0) }, others))
+        }).collect();
+        Some((ch, v))
     }).collect()
+}
+
+/// Is harmonic `f` clear of every harmonic (1..=16) of the `others`, by more
+/// than `tol` (relative: 0.015 = ~25 cents)?
+pub fn clear_of(f: f32, others: &[f32], tol: f32) -> bool {
+    others.iter().all(|o| (1..=16).all(|k| ((o * k as f32) - f).abs() > tol * f))
+}
+
+/// A MASKED profile: at each window, only harmonics clear of the other
+/// sounding notes' harmonics count, each relative to the note's own
+/// FUNDAMENTAL (a window whose fundamental collides is skipped); averaged per
+/// harmonic over the windows where it was clear (at least 2), else 0 -- which
+/// then means UNKNOWN, not absent: the scorer masks both renders alike, but a
+/// FITTED patch lacks a harmonic that was never clear.
+/// Windows: (samples, rate, pitch, other pitches). With no others it
+/// measures like `profile_of`, relative to the fundamental.
+pub fn masked_profile(windows: &[(Vec<f32>, u32, f32, Vec<f32>)]) -> Option<[u8; 16]> {
+    const TOL: f32 = 0.015;
+    let (mut sum, mut cnt) = ([0.0f64; 16], [0u32; 16]);
+    for (w, rate, hz, others) in windows {
+        let skip = (*rate as usize * 6 / 100).min(w.len());
+        let w = &w[skip..];
+        if w.len() < *rate as usize / 10 || !clear_of(*hz, others, TOL) { continue; }
+        let f0 = goertzel(w, *hz, *rate as f32) as f64;
+        if f0 <= 1e-9 { continue; }
+        for k in 0..16 {
+            let f = hz * (k + 1) as f32;
+            if f >= 0.45 * *rate as f32 || !clear_of(f, others, TOL) { continue; }
+            sum[k] += goertzel(w, f, *rate as f32) as f64 / f0;
+            cnt[k] += 1;
+        }
+    }
+    if cnt[0] == 0 { return None; }
+    let rel: Vec<f64> = (0..16).map(|k| if cnt[k] >= 2 || k == 0 { sum[k] / cnt[k] as f64 } else { 0.0 }).collect();
+    let peak = rel.iter().cloned().fold(0.0, f64::max).max(1e-12);
+    let mut out = [0u8; 16];
+    for k in 0..16 { out[k] = (rel[k] / peak * 255.0).round().clamp(0.0, 255.0) as u8; }
+    Some(out)
 }
 
 /// A profile from separately rendered windows: (samples, rate, pitch), each
@@ -157,6 +223,30 @@ mod tests {
         let wins: Vec<(Vec<f32>, u32, f32)> = notes.iter().map(|n| (audio[(n.start * 48_000.0) as usize..(n.end * 48_000.0) as usize].to_vec(), rate, n.hz)).collect();
         let q = profile_of(&wins).unwrap();
         assert!(profile_error_db(&p, &q) < 0.5, "{p:?} vs {q:?}");
+    }
+
+    /// LAYERED: notes of timbre 1 : 0.5 : 0.25 under ANOTHER note (1 : 0.8 :
+    /// 0.6 : 0.4) at a major third, a fifth, a fourth -- as a song varies its
+    /// intervals. Each harmonic is clear in SOME windows (a fifth masks the 3rd
+    /// harmonic -- it IS the other note's 2nd -- the third and fourth do not),
+    /// and the masked profile gets the timbre back. (The first version used a
+    /// fifth in every window: the 3rd was never clear and came out 0.)
+    #[test]
+    fn a_layered_note_is_measured_away_from_the_other_notes_harmonics() {
+        let rate = 48_000u32;
+        let tone = |hz: f32, amps: &[f32], n: usize| -> Vec<f32> { (0..n).map(|i| { let t = i as f32 / rate as f32;
+            amps.iter().enumerate().map(|(k, a)| a * (std::f32::consts::TAU * hz * (k + 1) as f32 * t).sin()).sum::<f32>() }).collect() };
+        let wins: Vec<(Vec<f32>, u32, f32, Vec<f32>)> = [(220.0f32, 1.2599f32), (247.0, 1.4983), (196.0, 1.3348), (233.0, 1.2599)].iter().map(|(hz, iv)| {
+            let other = hz * iv;
+            let a = tone(*hz, &[1.0, 0.5, 0.25], 38_400);
+            let b = tone(other, &[1.0, 0.8, 0.6, 0.4], 38_400);
+            (a.iter().zip(&b).map(|(x, y)| x + y).collect(), rate, *hz, vec![other])
+        }).collect();
+        let p = masked_profile(&wins).expect("a profile");
+        let want = [255u8, 128, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(profile_error_db(&p, &want) < 3.0, "{p:?}");
+        // and a harmonic that collides with the other note's is NOT counted
+        assert!(!clear_of(660.0, &[330.0], 0.015) && clear_of(440.0, &[330.0], 0.015));
     }
 
     #[test]

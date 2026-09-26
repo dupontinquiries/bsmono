@@ -1,11 +1,11 @@
-//! How capable are the synth stand-ins, measured: for every Poly channel with
-//! notes it plays ALONE, the TIMBRE error (dB RMS over harmonics 1-8) and the
-//! LEVEL error between the artist's render and Studio's, at those notes.
+//! How capable are the synth stand-ins, measured: for every Poly channel, at
+//! its notes -- alone, or LAYERED with other synth notes (harmonics measured
+//! where they are clear of theirs) -- the TIMBRE error (dB RMS over harmonics
+//! 1-8) between the artist's render and Studio's, the SAME masking on both.
 //!     cargo run -p studio-app --example synth_score -- song.studio reference.opus
-//! Only the solo-note windows are rendered. Run on a guessed project and on a
-//! fitted one (examples/fit_synths) to see what fitting buys.
+//! Only the note windows are rendered.
 use std::collections::BTreeMap;
-use studio_app::synth_fit::{harmonic_profile, profile_error_db, profile_of, solo_notes};
+use studio_app::synth_fit::{masked_profile, notes_with_company, profile_error_db};
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -22,31 +22,36 @@ fn main() {
     }
     let mut st = BTreeMap::new();
     studio_app::pattern_clips::refresh(&project, &rack, &mut audio, &mut st);
-    let rms_db = |v: &[f32]| 10.0 * (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).max(1e-12).log10();
     let mut errs = Vec::new();
-    println!("{:<30} {:>5} {:>10} {:>9}", "channel", "solo", "timbre dB", "level dB");
-    for (ch, notes) in solo_notes(&project, &rack) {
+    println!("{:<30} {:>5} {:>7} {:>10}", "channel", "solo", "layered", "timbre dB");
+    for (ch, items) in notes_with_company(&project, &rack) {
         let name = &rack.channels[ch].name;
-        let use_notes: Vec<_> = notes.iter().filter(|n| n.end - n.start >= 0.2).take(24).copied().collect();
-        if use_notes.is_empty() { println!("{name:<30} {:>5} {:>10} {:>9}", notes.len(), "-", "-"); continue; }
-        let Some(want) = harmonic_profile(&mono, r.sample_rate, &use_notes) else { continue };
-        let mut wins = Vec::new();
-        let (mut lr, mut lo) = (Vec::new(), Vec::new());
-        for n in &use_notes {
-            let (t0, t1) = (studio_core::Ticks::from_seconds(n.start), studio_core::Ticks::from_seconds(n.end.min(n.start + 0.8)));
-            let mix = studio_audio::mixdown(&project, &audio, &BTreeMap::new(), t0, t1, 48_000, &[], &[]);
-            let m: Vec<f32> = mix.chunks(2).map(|c| 0.5 * (c[0] + c[1])).collect();
-            let (i0, i1) = ((n.start * r.sample_rate as f64) as usize, ((n.end.min(n.start + 0.8)) * r.sample_rate as f64) as usize);
-            if i1 <= mono.len() { lr.extend_from_slice(&mono[i0..i1]); }
-            lo.extend_from_slice(&m);
-            wins.push((m, 48_000u32, n.hz));
+        let mut use_items: Vec<_> = items.iter().filter(|(n, _)| n.end - n.start >= 0.2).collect();
+        use_items.sort_by(|a, b| a.1.len().cmp(&b.1.len()).then((b.0.end - b.0.start).total_cmp(&(a.0.end - a.0.start))));
+        use_items.truncate(24);
+        let (solo, layered) = (use_items.iter().filter(|(_, o)| o.is_empty()).count(), use_items.iter().filter(|(_, o)| !o.is_empty()).count());
+        let (mut wr, mut wo) = (Vec::new(), Vec::new());
+        for (n, o) in &use_items {
+            let end = n.end.min(n.start + 0.8);
+            let (i0, i1) = ((n.start * r.sample_rate as f64) as usize, (end * r.sample_rate as f64) as usize);
+            if i1 > mono.len() || i1 <= i0 { continue; }
+            wr.push((mono[i0..i1].to_vec(), r.sample_rate, n.hz, o.clone()));
+            let mix = studio_audio::mixdown(&project, &audio, &BTreeMap::new(), studio_core::Ticks::from_seconds(n.start),
+                                            studio_core::Ticks::from_seconds(end), 48_000, &[], &[]);
+            wo.push((mix.chunks(2).map(|c| 0.5 * (c[0] + c[1])).collect(), 48_000u32, n.hz, o.clone()));
         }
-        let Some(got) = profile_of(&wins) else { continue };
-        let (e, l) = (profile_error_db(&want, &got), rms_db(&lo) - rms_db(&lr));
-        errs.push(e);
-        println!("{name:<30} {:>5} {:>10.1} {:>+9.1}", use_notes.len(), e, l);
+        match (masked_profile(&wr), masked_profile(&wo)) {
+            (Some(want), Some(got)) => {
+                let e = profile_error_db(&want, &got);
+                errs.push(e);
+                println!("{name:<30} {solo:>5} {layered:>7} {e:>10.1}");
+            }
+            _ => println!("{name:<30} {solo:>5} {layered:>7} {:>10}", "-"),
+        }
     }
     errs.sort_by(f32::total_cmp);
-    if let Some(m) = errs.get(errs.len() / 2) { println!("median timbre error over {} scored channels: {m:.1} dB", errs.len()); }
-    else { println!("no channel plays alone long enough to score"); }
+    match errs.get(errs.len() / 2) {
+        Some(m) => println!("median timbre error over {} scored channels: {m:.1} dB", errs.len()),
+        None => println!("no channel has a usable note to score"),
+    }
 }
