@@ -579,7 +579,16 @@ impl Player {
         if let (Some(gpu), Some(gl)) = (&self.gpu, eframe_frame.gl()) {
             let failed = match gpu.lock() {
                 // SAFETY: eframe's glow context is current on the UI thread.
-                Ok(mut g) => unsafe { g.upload(gl, frame) }.err(),
+                Ok(mut g) => {
+                    let r = unsafe { g.upload(gl, frame) }.err();
+                    // Why a dma-buf was NOT imported (read back through mmap
+                    // instead), once: the first thing to know on new hardware.
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    if let Some(n) = g.import_note.take() {
+                        SAID.call_once(|| eprintln!("vidkit: dma-buf import failed, mmap fallback: {n}"));
+                    }
+                    r
+                }
                 Err(_) => Some("GPU state poisoned".to_string()),
             };
             match failed {
@@ -2477,8 +2486,7 @@ impl Player {
         let fps = self.engine.as_ref().map(|e| 1.0 / e.frame_interval().as_secs_f64().max(1e-3));
         p.acc.display = if self.wl.is_some() { format!("{} · comp {:.1} ms", self.present_log.summary(fps), self.latency.comp_ns() as f64 / 1e6) } else { String::new() };
         p.acc.presenter = match &self.gpu {
-            Some(_) if self.last_grain => "gpu+grain".into(),
-            Some(_) => "gpu".into(),
+            Some(_) => format!("gpu{}{}", if self.held.is_some() { "+zerocopy" } else { "" }, if self.last_grain { "+grain" } else { "" }),
             None if self.presenter.damage_rendering() => format!("cpu-damage@{:.2}", self.presenter.damage_budget),
             None => "cpu-whole".into(),
         };
