@@ -185,10 +185,10 @@ float bicubic_y(vec2 t) {
     return r;
 }
 
-void main() {
+vec3 convert_at(vec2 uvp) {
     // egui's framebuffer has its origin at the top left and GL samples from the
     // bottom, so the picture arrives upside down unless one of them is flipped.
-    vec2 t = vec2(uv.x, mix(uv.y, 1.0 - uv.y, flip_y));
+    vec2 t = vec2(uvp.x, mix(uvp.y, 1.0 - uvp.y, flip_y));
 
     float y = scaler == 1 ? clamp(bicubic_y(t), 0.0, 1.0) : texture(plane_y, t).r;
     vec2 c = planar == 1 ? vec2(texture(plane_uv, t).r, texture(plane_v, t).r) : texture(plane_uv, t).rg;
@@ -228,7 +228,49 @@ void main() {
     if (transfer_id != 0) {
         rgb = hdr_to_sdr(rgb);
     }
-    frag = vec4(clamp(rgb, 0.0, 1.0), 1.0);
+    return clamp(rgb, 0.0, 1.0);
+}
+
+// Fused RCAS: sharpen WITHOUT an offscreen intermediate. The two-pass path
+// wrote the converted frame to a full-size RGBA texture and read it back --
+// on a tile-based GPU (Apple, Adreno, PowerVR) that is a round trip out of
+// tile memory to DRAM and back, ~31 MB each way per frame at 3456x2234.
+// Here each pixel converts its four RCAS neighbours itself: ~4x the
+// conversion arithmetic, no intermediate at all. Same maths as RCAS_FRAG
+// (bscale's rcas.rs); only the intermediate's 8-bit rounding is gone.
+uniform int fused;
+uniform vec2 out_texel;
+uniform float rcas_scale;
+float luma2(vec3 p) { return p.b * 0.5 + (p.r * 0.5 + p.g); }
+vec3 rcas(vec3 b, vec3 d, vec3 e, vec3 f, vec3 h, float scale) {
+    float bl = luma2(b), dl = luma2(d), el = luma2(e), fl = luma2(f), hl = luma2(h);
+    float spread = max(max(max(bl, dl), max(el, fl)), hl) - min(min(min(bl, dl), min(el, fl)), hl);
+    float nz = 0.25 * bl + 0.25 * dl + 0.25 * fl + 0.25 * hl - el;
+    nz = spread > 0.0 ? clamp(abs(nz) / spread, 0.0, 1.0) : 0.0;
+    nz = -0.5 * nz + 1.0;
+    vec3 mn4 = min(min(b, d), min(f, h));
+    vec3 mx4 = max(max(b, d), max(f, h));
+    vec3 hit_min = mn4 / max(4.0 * mx4, vec3(1e-6));
+    hit_min = mix(vec3(0.0), hit_min, step(vec3(1e-6), mx4));
+    vec3 den = 4.0 * mn4 - 4.0;
+    vec3 hit_max = (1.0 - mx4) / min(den, vec3(-1e-6));
+    vec3 l3 = max(-hit_min, hit_max);
+    float lobe = max(max(l3.r, l3.g), l3.b);
+    lobe = max(min(lobe, 0.0), -0.1875) * scale * nz;
+    float rcp = 1.0 / (4.0 * lobe + 1.0);
+    return clamp((lobe * (b + d + h + f) + e) * rcp, 0.0, 1.0);
+}
+void main() {
+    vec3 e = convert_at(uv);
+    if (fused == 0 || rcas_scale <= 0.0) {
+        frag = vec4(e, 1.0);
+        return;
+    }
+    vec3 b = convert_at(uv + vec2(0.0, -out_texel.y));
+    vec3 d = convert_at(uv + vec2(-out_texel.x, 0.0));
+    vec3 f = convert_at(uv + vec2(out_texel.x, 0.0));
+    vec3 h = convert_at(uv + vec2(0.0, out_texel.y));
+    frag = vec4(rcas(b, d, e, f, h, rcas_scale), 1.0);
 }
 "#;
 
@@ -429,6 +471,9 @@ pub struct Nv12Gpu {
     /// first use and resized with the output, never when sharpening is off.
     target: Option<(glow::Framebuffer, glow::Texture, (i32, i32))>,
     pub enhance: Enhance,
+    /// Sharpen in the conversion pass itself (no offscreen round trip).
+    /// Default on; false uses the two-pass path.
+    pub fused_rcas: bool,
     temporal_prog: glow::Program,
     /// Ping-pong running averages at source size, and which is current.
     acc: Option<([(glow::Framebuffer, glow::Texture); 2], (u32, u32))>,
@@ -486,6 +531,7 @@ impl Nv12Gpu {
             rcas,
             target: None,
             enhance: Enhance::default(),
+            fused_rcas: std::env::var("VIDKIT_RCAS_TWO_PASS").as_deref() != Ok("1"),
             temporal_prog,
             acc: None,
             acc_cur: 0,
@@ -724,6 +770,12 @@ impl Nv12Gpu {
     }
 
     unsafe fn draw_convert(&self, gl: &glow::Context, flip_y: f32) {
+        self.draw_convert_fused(gl, flip_y, None);
+    }
+
+    /// `fused`: (RCAS scale, one output pixel in uv) -- sharpen in this same
+    /// pass, no offscreen target.
+    unsafe fn draw_convert_fused(&self, gl: &glow::Context, flip_y: f32, fused: Option<(f32, (f32, f32))>) {
         gl.use_program(Some(self.program));
         gl.bind_vertex_array(Some(self.vao));
         gl.active_texture(glow::TEXTURE0);
@@ -755,6 +807,11 @@ impl Nv12Gpu {
         };
         if let Some(l) = u("transfer_id") { gl.uniform_1_i32(Some(&l), tid); }
         if let Some(l) = u("src_peak") { gl.uniform_1_f32(Some(&l), self.hdr_peak_nits); }
+        if let Some(l) = u("fused") { gl.uniform_1_i32(Some(&l), fused.is_some() as i32); }
+        if let Some((scale, (tx, ty))) = fused {
+            if let Some(l) = u("rcas_scale") { gl.uniform_1_f32(Some(&l), scale); }
+            if let Some(l) = u("out_texel") { gl.uniform_2_f32(Some(&l), tx, ty); }
+        }
         if let Some(l) = u("ten_bit") { gl.uniform_1_i32(Some(&l), (self.layout == PlaneLayout::P010) as i32); }
         gl.disable(glow::DEPTH_TEST);
         gl.draw_arrays(glow::TRIANGLES, 0, 3);
@@ -813,6 +870,14 @@ impl Nv12Gpu {
         let (w, h) = out_px;
         if scale <= 0.0 || w < 3 || h < 3 {
             self.draw_convert(gl, 1.0);
+            gl.bind_vertex_array(None);
+            return;
+        }
+        if self.fused_rcas {
+            // One pass straight into egui's framebuffer: nothing leaves tile
+            // memory. The two-pass path below stays for comparison and as
+            // a fallback (VIDKIT_RCAS_TWO_PASS=1).
+            self.draw_convert_fused(gl, 1.0, Some((scale, (1.0 / w as f32, 1.0 / h as f32))));
             gl.bind_vertex_array(None);
             return;
         }

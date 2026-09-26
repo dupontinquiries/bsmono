@@ -42,6 +42,8 @@ fn nv12(w: u32, h: u32, y: impl Fn(u32, u32) -> u8) -> Frame {
 }
 
 struct Case {
+    /// Run sharpening as the old two-pass (offscreen) path, for comparison.
+    two_pass: bool,
     name: &'static str,
     /// The frame checked against. Multi-frame cases upload `history` first,
     /// one per update, then this.
@@ -302,6 +304,7 @@ fn cases() -> Vec<Case> {
     };
     vec![
         Case {
+            two_pass: false,
             name: "temporal denoise, board",
             frame: at_pts(noisy_board(9), 9),
             history: (0..9).map(|i| at_pts(noisy_board(i), i as usize)).collect(),
@@ -310,6 +313,7 @@ fn cases() -> Vec<Case> {
             check: check_denoise,
         },
         Case {
+            two_pass: false,
             name: "temporal, no ghosting",
             frame: at_pts(square_at(40), 8),
             history: (0..8).map(|i| at_pts(square_at(8), i)).collect(),
@@ -317,13 +321,14 @@ fn cases() -> Vec<Case> {
             out: (64, 48),
             check: check_no_ghost,
         },
-        Case { name: "HDR10 PQ, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Pq), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
-        Case { name: "HLG, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Hlg), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
-        Case { name: "I420, three planes", history: vec![], frame: i420(64, 48), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
-        Case { name: "plain conversion", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance::default(), out: (64, 48), check: check_plain },
-        Case { name: "RCAS offscreen pass", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
-        Case { name: "bicubic 2x on a ramp", history: vec![], frame: nv12(32, 16, |x, _| (40 + x * 4) as u8), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_ramp },
-        Case { name: "bicubic 2x on a step", history: vec![], frame: nv12(32, 16, |x, _| if x < 16 { 60 } else { 200 }), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_step_overshoot },
+        Case { two_pass: false, name: "HDR10 PQ, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Pq), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
+        Case { two_pass: false, name: "HLG, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Hlg), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
+        Case { two_pass: false, name: "I420, three planes", history: vec![], frame: i420(64, 48), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
+        Case { two_pass: false, name: "plain conversion", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance::default(), out: (64, 48), check: check_plain },
+        Case { two_pass: true, name: "RCAS two-pass (offscreen)", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
+        Case { two_pass: false, name: "RCAS fused (one pass)", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
+        Case { two_pass: false, name: "bicubic 2x on a ramp", history: vec![], frame: nv12(32, 16, |x, _| (40 + x * 4) as u8), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_ramp },
+        Case { two_pass: false, name: "bicubic 2x on a step", history: vec![], frame: nv12(32, 16, |x, _| if x < 16 { 60 } else { 200 }), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_step_overshoot },
     ]
 }
 
@@ -380,6 +385,7 @@ impl eframe::App for SelfTest {
             let f = if self.shown < n { &c.history[self.shown as usize] } else { &c.frame };
             if let (Ok(mut g), Some(gl)) = (gpu.lock(), frame.gl()) {
                 g.enhance = c.enhance;
+                g.fused_rcas = !c.two_pass;
                 if let Err(e) = unsafe { g.upload(gl, f) } {
                     println!("GPU SELFTEST FAIL: upload: {e}");
                     std::process::exit(1);
