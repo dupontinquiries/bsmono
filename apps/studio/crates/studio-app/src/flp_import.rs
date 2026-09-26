@@ -651,7 +651,11 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                         }
                         let stem = std::path::Path::new(&file).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|| file.clone());
                         let variant = format!("{stem}.auto{}.opus", bakes.len() + 1);
-                        let Some((sid, _)) = source_for(&file, &mut ops, &mut missing, Some((&variant, 1.0))) else { continue };
+                        // the rendered copy is exactly the CLIP's length -- declared as the
+                        // file's until flp-batch's verify caught it (Pattern 2: 70.45 s
+                        // decoded, 50.98 s declared): pass the ratio that makes it so
+                        let as_long = (m.len.to_seconds() / len_t.to_seconds().max(1e-6)).max(1e-9);
+                        let Some((sid, _)) = source_for(&file, &mut ops, &mut missing, Some((&variant, as_long))) else { continue };
                         bakes.push(Bake { file: file.clone(), variant, start: 0.0, len: len_t.to_seconds(), cents, gain });
                         clips.push((sid, pos, Ticks::ZERO, len_t, channel_gain_for(c, Some(m), true)));
                         first_insert = first_insert.or(i(&c["insert"]));
@@ -1117,6 +1121,8 @@ mod tests {
         assert!((at(4.0) + 280.0).abs() < 1.0, "halfway: {}", at(4.0));
         assert!((at(6.0) + 560.0).abs() < 1.0 && (at(9.0) + 560.0).abs() < 1.0, "the dive's end, and held: {} {}", at(6.0), at(9.0));
         assert!(b.gain.iter().all(|g| (g.1 - 1.0).abs() < 1e-6), "no volume automation: unity");
+        let src = im.project.sources.values().find(|s| s.path == "vox.auto1.opus").unwrap();
+        assert!((src.len.to_seconds() - 10.0).abs() < 1e-6, "the rendered copy is the clip's length, not the file's: {}", src.len.to_seconds());
         assert!(!im.varispeeds.iter().any(|(f, _, _)| f == "vox.wav" && im.bakes.iter().any(|b| b.file == *f) && false));
         assert!(im.report.iter().any(|r| r.contains("AUTOMATION rendered into 1 clip") && r.contains("+-560 cents")), "{:?}", im.report);
     }

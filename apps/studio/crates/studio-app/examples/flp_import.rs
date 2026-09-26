@@ -52,78 +52,7 @@ fn main() {
         m
     };
     let mut im = studio_app::flp_import::import(&inv, &a[3], &probe).expect("import");
-    // FL's time-stretched audio: make each stretched copy once (atempo keeps
-    // pitch; FL's modes here are the pitch-keeping ones -- the report says).
-    for (file, r, variant) in &im.stretches {
-        let out = media.join(variant);
-        if out.is_file() { continue; }
-        let input = media.join(opus_for(file).unwrap_or_else(|| file.clone()));
-        let ok = std::process::Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-y", "-i"]).arg(&input)
-            .args(["-filter:a", &format!("atempo={r}"), "-c:a", "libopus", "-b:a", "48k"]).arg(&out)
-            .status().map(|s| s.success()).unwrap_or(false);
-        if !ok { im.report.push(format!("could not make the stretched copy {variant}")); }
-    }
-    // VARISPEED copies: pitch and speed together (asetrate), as FL plays a
-    // pitch-shifted sampler
-    for (file, r, variant) in &im.varispeeds {
-        let out = media.join(variant);
-        if out.is_file() { continue; }
-        let input = media.join(opus_for(file).unwrap_or_else(|| file.clone()));
-        let rate = probe(file).map(|m| m.rate).unwrap_or(48_000) as f64;
-        let ok = std::process::Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-y", "-i"]).arg(&input)
-            .args(["-af", &format!("asetrate={},aresample=48000", (rate * r).round()), "-c:a", "libopus", "-b:a", "48k"]).arg(&out)
-            .status().map(|s| s.success()).unwrap_or(false);
-        if !ok { im.report.push(format!("could not make the varispeed copy {variant}")); }
-    }
-    // AUTOMATED clips: render each through its curves -- varispeed (the file
-    // advances 2^(cents/1200) per output second) and gain -- into its own copy.
-    // Always regenerated: the copy depends on the curve, not only the name.
-    for b in &im.bakes {
-        let input = media.join(opus_for(&b.file).unwrap_or_else(|| b.file.clone()));
-        let Ok(src) = studio_media::decode_file(&input) else { im.report.push(format!("could not decode {} to render {}", b.file, b.variant)); continue };
-        let (sr, out_sr) = (src.sample_rate as f64, 48_000f64);
-        let frames = src.frames();
-        let ch = |k: usize| &src.channels[k.min(src.channels.len() - 1)];
-        let read = |c: &Vec<f32>, p: f64| -> f32 {
-            let i = p.floor();
-            if i < 0.0 || i as usize + 1 >= frames { return 0.0; }
-            let (a, t) = (i as usize, (p - i) as f32);
-            c[a] * (1.0 - t) + c[a + 1] * t
-        };
-        let curve = |v: &Vec<(f64, f64)>, t: f64| -> f64 {
-            let k = t / studio_app::flp_import::BAKE_STEP;
-            let i = (k.floor() as usize).min(v.len().saturating_sub(1));
-            let j = (i + 1).min(v.len().saturating_sub(1));
-            let u = (k - k.floor()).clamp(0.0, 1.0);
-            v.get(i).map(|a| a.1).unwrap_or(0.0) * (1.0 - u) + v.get(j).map(|b| b.1).unwrap_or(0.0) * u
-        };
-        let gains: Vec<(f64, f64)> = b.gain.iter().map(|(t, g)| (*t, *g as f64)).collect();
-        let n = (b.len * out_sr).round() as usize;
-        let mut pcm: Vec<u8> = Vec::with_capacity(n * 8);
-        let mut pos = b.start * sr;
-        for k in 0..n {
-            let t = k as f64 / out_sr;
-            let g = curve(&gains, t) as f32;
-            let (l, r) = (read(ch(0), pos) * g, read(ch(1), pos) * g);
-            pcm.extend_from_slice(&l.to_le_bytes());
-            pcm.extend_from_slice(&r.to_le_bytes());
-            pos += 2f64.powf(curve(&b.cents, t) / 1200.0) * sr / out_sr;
-        }
-        let out = media.join(&b.variant);
-        let mut child = std::process::Command::new("ffmpeg")
-            .args(["-nostdin", "-v", "error", "-y", "-f", "f32le", "-ar", "48000", "-ac", "2", "-i", "-", "-c:a", "libopus", "-b:a", "96k"]).arg(&out)
-            .stdin(std::process::Stdio::piped()).spawn().expect("ffmpeg");
-        {
-            use std::io::Write;
-            let _ = child.stdin.take().expect("stdin").write_all(&pcm);
-        }
-        if !child.wait().map(|s| s.success()).unwrap_or(false) { im.report.push(format!("could not write the automated copy {}", b.variant)); }
-    }
-    let mut swapped = 0;
-    for src in im.project.sources.values_mut() {
-        if let Some(o) = opus_for(&src.path) { src.path = o; src.sample_rate = 48_000; swapped += 1; }
-    }
-    if swapped > 0 { im.report.push(format!("media: {swapped} files as Opus (the .wav names FL used map to the .opus beside them)")); }
+    studio_app::flp_batch::materialize(&mut im, &media, &probe);
     let f = studio_collab::file::SaveFile::from_project(&im.project, Vec::new(), Some(im.rack));
     std::fs::write(&a[4], f.encode()).expect("write project");
     let report = im.report.join("\n");

@@ -7,11 +7,18 @@ description = "The runnable Studio: an eframe shell that wires the timeline, tra
 [[bin]]
 name = "studio"
 path = "src/main.rs"
+
+# A library of FL Studio zipped loop packages -> verified .studio projects
+[[bin]]
+name = "flp-batch"
+path = "src/bin/flp_batch.rs"
 # the binary IS the window: a --no-default-features build (the demo-project
 # examples, headless tools) skips it instead of failing on it
 required-features = ["app"]
 
 [dependencies]
+# FL Studio zipped loop packages (flp_batch): deflate only, like tomescope
+zip = { version = "2", default-features = false, features = ["deflate"] }
 studio-assemble = { path = "../studio-assemble" }
 studio-core = { path = "../studio-core" }
 studio-collab = { path = "../studio-collab" }
