@@ -60,6 +60,7 @@ impl Permission {
 }
 
 pub mod album;
+pub mod exif;
 pub mod gallery_grid;
 pub mod peers;
 pub mod chunk_sync;
@@ -86,6 +87,18 @@ impl Default for DeduplicationConfig {
             max_chunk_size: 8 * 1024 * 1024,  // 8 MiB
         }
     }
+}
+
+/// What `register_photo` records beyond the bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct Photo<'a> {
+    /// Unix seconds when the picture was taken — `exif::taken_at`, else the
+    /// file's modification time. Stored as `created_at`, which the gallery
+    /// groups by (`album::load`).
+    pub taken_at: i64,
+    /// Hash of the thumbnail already passed to `store_thumbnail`.
+    pub thumbnail_hash: Option<&'a str>,
+    pub metadata_json: Option<&'a str>,
 }
 
 pub struct PhotoSyncDB {
@@ -150,7 +163,7 @@ impl PhotoSyncDB {
         &self.conn
     }
 
-    pub fn new(db_path: &Path, block_store: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(db_path: &Path, block_store: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         fs::create_dir_all(block_store)?;
         let conn = Connection::open(db_path)?;
         
@@ -167,13 +180,13 @@ impl PhotoSyncDB {
         db_path: &Path,
         block_store: &Path,
         config: DeduplicationConfig,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut db = Self::new(db_path, block_store)?;
         db.config = config;
         Ok(db)
     }
     
-    fn create_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    fn create_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Blocks table with hash algorithm tracking
         conn.execute(
             "CREATE TABLE IF NOT EXISTS blocks (
@@ -254,7 +267,7 @@ impl PhotoSyncDB {
         Ok(())
     }
     
-    pub fn chunk_and_store(&mut self, file_path: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    pub fn chunk_and_store(&mut self, file_path: &Path) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         println!("[Dedup] Processing file: {:?}", file_path);
         println!("[Dedup] Strategy: {:?}", self.config.chunking_strategy);
         println!("[Dedup] Hash algorithm: {:?}", self.config.hash_algorithm);
@@ -293,7 +306,7 @@ impl PhotoSyncDB {
         Ok(chunk_hashes)
     }
     
-    fn chunk_fixed_size(&self, file_path: &Path) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    fn chunk_fixed_size(&self, file_path: &Path) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
         let mut file = fs::File::open(file_path)?;
         let mut chunks = Vec::new();
         let mut buffer = vec![0u8; self.config.chunk_size];
@@ -309,7 +322,7 @@ impl PhotoSyncDB {
         Ok(chunks)
     }
     
-    fn chunk_content_defined(&self, file_path: &Path) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    fn chunk_content_defined(&self, file_path: &Path) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
         let file = fs::File::open(file_path)?;
         let mut reader = BufReader::new(file);
         let mut chunks = Vec::new();
@@ -360,12 +373,12 @@ impl PhotoSyncDB {
         }
     }
     
-    fn block_exists(&self, hash: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    fn block_exists(&self, hash: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let mut stmt = self.conn.prepare("SELECT 1 FROM blocks WHERE hash = ?")?;
         Ok(stmt.exists(params![hash])?)
     }
     
-    fn store_block(&mut self, hash: &str, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    fn store_block(&mut self, hash: &str, data: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let compressed = zstd::encode_all(data, self.config.compression_level)?;
         let block_path = self.block_store.join(hash.replace(":", "_"));
         
@@ -387,7 +400,7 @@ impl PhotoSyncDB {
         Ok(())
     }
     
-    fn increment_ref_count(&mut self, hash: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn increment_ref_count(&mut self, hash: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
@@ -399,7 +412,7 @@ impl PhotoSyncDB {
         Ok(())
     }
     
-    pub fn reconstruct_file(&self, chunk_hashes: &[String], output_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn reconstruct_file(&self, chunk_hashes: &[String], output_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut output = fs::File::create(output_path)?;
         
         for hash in chunk_hashes {
@@ -419,10 +432,70 @@ impl PhotoSyncDB {
         chunks: &[String],
         device_id: &str,
         metadata_json: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        self.register_photo(path, size, chunks, device_id, &Photo { taken_at: now, thumbnail_hash: None, metadata_json })
+    }
+
+    /// Import one photo the way the daemon does: store its thumbnail, chunk
+    /// and deduplicate its bytes, and register it dated by when it was TAKEN
+    /// (`exif::taken_at`, else the file's modification time) with its
+    /// thumbnail hash in `thumbnail_hash`, where `album::load` reads it.
+    ///
+    /// Lived in the daemon binary, untested, which is how it came to pass the
+    /// thumbnail hash in `register_file`'s METADATA position: every imported
+    /// photo had `thumbnail_hash` NULL, a hash string for metadata, and
+    /// `created_at` set to the import time — so the gallery filed a whole
+    /// library under the day it was imported and never found a stored
+    /// thumbnail.
+    ///
+    /// The thumbnail is made from the sensor pixels, as before (EXIF
+    /// orientation not applied; the JPEG re-encode drops it). The gallery
+    /// turns it using the original's header, which is right for thumbnails
+    /// already stored by older daemons too.
+    pub fn import_photo(&mut self, image_path: &Path, device_id: &str, thumbnail_size: u32)
+        -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let thumbnail_hash = image::open(image_path).ok().and_then(|img| {
+            let thumb = img.thumbnail(thumbnail_size, thumbnail_size);
+            let mut buf = Vec::new();
+            thumb.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg).ok()?;
+            let hash = format!("{:x}", Sha256::digest(&buf));
+            self.store_thumbnail(&hash, &buf, img.width(), img.height()).ok()?;
+            Some(hash)
+        });
+        let meta = fs::metadata(image_path)?;
+        let mut head = Vec::new();
+        fs::File::open(image_path)?.take(256 * 1024).read_to_end(&mut head)?;
+        let taken_at = exif::taken_at(&head)
+            .or_else(|| meta.modified().ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64))
+            .unwrap_or(0);
+        let chunks = self.chunk_and_store(image_path)?;
+        self.register_photo(&image_path.to_string_lossy(), meta.len() as i64, &chunks, device_id,
+            &Photo { taken_at, thumbnail_hash: thumbnail_hash.as_deref(), metadata_json: None })
+    }
+
+    /// Register a file with what the gallery shows: when it was TAKEN and
+    /// its stored thumbnail. `register_file` has neither — it stamps
+    /// `created_at` with the time of the call and leaves `thumbnail_hash`
+    /// empty, which is right for a sync upload that carries no pixels and
+    /// wrong for the daemon, whose every photo then filed under the day it
+    /// was imported, with no thumbnail the gallery could find.
+    pub fn register_photo(
+        &mut self,
+        path: &str,
+        size: i64,
+        chunks: &[String],
+        device_id: &str,
+        photo: &Photo,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
+        let (created_at, thumbnail_hash, metadata_json) = (photo.taken_at, photo.thumbnail_hash, photo.metadata_json);
         
         let chunks_json = serde_json::to_string(chunks)?;
         let chunking_strategy = format!("{:?}", self.config.chunking_strategy);
@@ -431,12 +504,12 @@ impl PhotoSyncDB {
         self.conn.execute(
             "INSERT OR REPLACE INTO files 
              (path, size, chunks, chunk_count, chunking_strategy, hash_algorithm, 
-              device_id, modified_at, created_at, metadata_json) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              device_id, modified_at, created_at, thumbnail_hash, metadata_json) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 path, size, chunks_json, chunks.len() as i64,
                 chunking_strategy, hash_algorithm,
-                device_id, timestamp, timestamp, metadata_json
+                device_id, timestamp, created_at, thumbnail_hash, metadata_json
             ],
         )?;
         
@@ -456,7 +529,7 @@ impl PhotoSyncDB {
     /// display, use `album::load(db.connection())` instead: it returns the
     /// same rows shaped as `album::Item` and also loads albums, which this
     /// deliberately doesn't.
-    pub fn list_files(&self) -> Result<Vec<FileRecord>, Box<dyn std::error::Error>> {
+    pub fn list_files(&self) -> Result<Vec<FileRecord>, Box<dyn std::error::Error + Send + Sync>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, size, device_id, modified_at, created_at, thumbnail_hash, metadata_json
              FROM files ORDER BY created_at DESC",
@@ -483,7 +556,7 @@ impl PhotoSyncDB {
     /// device updates `granted_at` — there's no history kept here; an
     /// audit log of grants, if wanted, is a different table wrapping this
     /// one, not a job for the permission check itself.
-    pub fn set_permission(&mut self, device_id: &str, level: Permission) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn set_permission(&mut self, device_id: &str, level: Permission) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
@@ -497,7 +570,7 @@ impl PhotoSyncDB {
 
     /// `None` means no grant exists — see the schema note on `permissions`
     /// for why that is kept distinct from `Some(Permission::ReadOnly)`.
-    pub fn permission_for(&self, device_id: &str) -> Result<Option<Permission>, Box<dyn std::error::Error>> {
+    pub fn permission_for(&self, device_id: &str) -> Result<Option<Permission>, Box<dyn std::error::Error + Send + Sync>> {
         let level: Option<String> = self.conn
             .query_row(
                 "SELECT level FROM permissions WHERE device_id = ?",
@@ -515,11 +588,11 @@ impl PhotoSyncDB {
     /// `garbage_collect` themselves, so a purely local, single-device use of
     /// this library (the CLI, today) is never blocked by a permission
     /// system it never asked for.
-    pub fn authorize(&self, device_id: &str, required: Permission) -> Result<bool, Box<dyn std::error::Error>> {
+    pub fn authorize(&self, device_id: &str, required: Permission) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.permission_for(device_id)?.map_or(false, |granted| granted >= required))
     }
     
-    pub fn get_storage_stats(&self) -> Result<StorageStats, Box<dyn std::error::Error>> {
+    pub fn get_storage_stats(&self) -> Result<StorageStats, Box<dyn std::error::Error + Send + Sync>> {
         let mut stmt = self.conn.prepare(
             "SELECT SUM(size), SUM(compressed_size), COUNT(*), SUM(ref_count) FROM blocks"
         )?;
@@ -538,7 +611,7 @@ impl PhotoSyncDB {
         }
     }
     
-    pub fn garbage_collect(&mut self, dry_run: bool) -> Result<GCStats, Box<dyn std::error::Error>> {
+    pub fn garbage_collect(&mut self, dry_run: bool) -> Result<GCStats, Box<dyn std::error::Error + Send + Sync>> {
         let mut stmt = self.conn.prepare(
             "SELECT hash, size, compressed_size FROM blocks WHERE ref_count = 0"
         )?;
@@ -567,7 +640,7 @@ impl PhotoSyncDB {
         Ok(stats)
     }
     
-    pub fn store_thumbnail(&mut self, hash: &str, data: &[u8], width: u32, height: u32) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn store_thumbnail(&mut self, hash: &str, data: &[u8], width: u32, height: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.conn.execute(
             "INSERT OR REPLACE INTO thumbnails (hash, data, width, height, format) VALUES (?, ?, ?, ?, 'jpeg')",
             params![hash, data, width as i64, height as i64],
@@ -575,7 +648,7 @@ impl PhotoSyncDB {
         Ok(())
     }
     
-    pub fn get_thumbnail(&self, hash: &str) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    pub fn get_thumbnail(&self, hash: &str) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
         let mut stmt = self.conn.prepare("SELECT data FROM thumbnails WHERE hash = ?")?;
         let mut rows = stmt.query(params![hash])?;
         
@@ -637,4 +710,56 @@ pub struct GCStats {
     pub blocks_removed: i64,
     pub space_reclaimed: i64,
     pub compressed_space_reclaimed: i64,
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    /// What the daemon writes is what the gallery reads: a photo's
+    /// `created_at` is when it was TAKEN, and `thumbnail_hash` names a stored
+    /// thumbnail — checked through `album::load`, the gallery's own reader.
+    #[test]
+    fn an_imported_photo_is_dated_by_exif_and_its_thumbnail_is_findable() {
+        let dir = std::env::temp_dir().join(format!("photosync-import-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("blocks")).unwrap();
+        let mut db = PhotoSyncDB::new(&dir.join("p.db"), &dir.join("blocks")).unwrap();
+
+        // A JPEG taken 2024-07-14 21:30:05 on the camera's clock.
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+            .encode_image(&image::RgbImage::from_pixel(640, 480, image::Rgb([200, 40, 40]))).unwrap();
+        let mut with_exif = jpeg[..2].to_vec();
+        with_exif.extend(exif::app1_segment(6, Some("2024:07:14 21:30:05"), None, false));
+        with_exif.extend_from_slice(&jpeg[2..]);
+        let shot = dir.join("IMG_0001.jpg");
+        fs::write(&shot, &with_exif).unwrap();
+
+        // A PNG with no EXIF, last modified 2020-01-02 03:04:05 UTC.
+        let png = dir.join("scan.png");
+        image::RgbImage::from_pixel(300, 200, image::Rgb([40, 40, 200])).save(&png).unwrap();
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_934_245);
+        fs::File::options().write(true).open(&png).unwrap().set_modified(mtime).unwrap();
+
+        db.import_photo(&shot, "phone", 256).unwrap();
+        db.import_photo(&png, "phone", 256).unwrap();
+
+        let lib = album::load(db.connection()).unwrap();
+        let by_path = |p: &Path| lib.by_day().into_iter().flat_map(|(_, v)| v.into_iter().cloned())
+            .find(|i| i.path == p.to_string_lossy()).expect("imported");
+        let a = by_path(&shot);
+        assert_eq!(a.day(), "2024-07-14", "dated by EXIF, not by the import");
+        assert_eq!(a.taken_at, exif::parse_datetime("2024:07:14 21:30:05").unwrap());
+        let hash = a.thumbnail.clone().expect("thumbnail_hash is set");
+        let stored = db.get_thumbnail(&hash).unwrap().expect("and names a stored thumbnail");
+        let t = image::load_from_memory(&stored).unwrap();
+        assert!(t.width() <= 256 && t.height() <= 256 && t.width() > 0);
+        assert_eq!(a.metadata_json, None, "the hash is no longer written as metadata");
+
+        let b = by_path(&png);
+        assert_eq!(b.taken_at, 1_577_934_245, "no EXIF: the file's modification time");
+        assert!(b.thumbnail.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

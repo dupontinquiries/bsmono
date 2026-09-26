@@ -79,7 +79,7 @@ fn format_size(bytes: i64) -> String {
 }
 
 fn show_stats(db: &PhotoSyncDB) -> Result<()> {
-    let stats = db.get_storage_stats()?;
+    let stats = db.get_storage_stats().map_err(|e| anyhow::anyhow!(e))?;
     
     println!("PhotoSync Storage Statistics");
     println!("============================");
@@ -103,7 +103,7 @@ fn show_stats(db: &PhotoSyncDB) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     
-    let db = PhotoSyncDB::new(&cli.db_path, &cli.block_store)?;
+    let db = PhotoSyncDB::new(&cli.db_path, &cli.block_store).map_err(|e| anyhow::anyhow!(e))?;
     
     match cli.command {
         Commands::Stats => {
@@ -118,7 +118,7 @@ fn main() -> Result<()> {
         }
         
         Commands::ShowThumbnail { file, output } => {
-            if let Some(thumb_data) = db.get_thumbnail(&file)? {
+            if let Some(thumb_data) = db.get_thumbnail(&file).map_err(|e| anyhow::anyhow!(e))? {
                 std::fs::write(&output, thumb_data)?;
                 println!("Thumbnail saved to {}", output.display());
             } else {

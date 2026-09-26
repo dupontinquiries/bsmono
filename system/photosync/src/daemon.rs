@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use notify::{Watcher, RecursiveMode, Event};
 use walkdir::WalkDir;
-use image::imageops::FilterType;
 use clap::Parser;
 use anyhow::Result;
 
@@ -46,16 +45,8 @@ fn is_image_file(path: &Path) -> bool {
     }
 }
 
-fn generate_thumbnail(image_path: &Path, max_size: u32) -> Result<Vec<u8>> {
-    let img = image::open(image_path)?;
-    let thumbnail = img.thumbnail(max_size, max_size);
-    
-    let mut buffer = Vec::new();
-    thumbnail.write_to(&mut std::io::Cursor::new(&mut buffer), image::ImageFormat::Jpeg)?;
-    
-    Ok(buffer)
-}
-
+/// The whole import is `PhotoSyncDB::import_photo`, in the library where it
+/// is tested; this only logs.
 fn process_image(
     db: &mut PhotoSyncDB,
     image_path: &Path,
@@ -63,34 +54,7 @@ fn process_image(
     thumbnail_size: u32,
 ) -> Result<()> {
     println!("Processing: {}", image_path.display());
-    
-    // Generate thumbnail
-    let thumbnail_hash = if let Ok(thumb_data) = generate_thumbnail(image_path, thumbnail_size) {
-        let hash = format!("{:x}", sha2::Sha256::digest(&thumb_data));
-        
-        if let Ok(img) = image::open(image_path) {
-            db.store_thumbnail(&hash, &thumb_data, img.width(), img.height())?;
-        }
-        
-        Some(hash)
-    } else {
-        None
-    };
-    
-    // Chunk and deduplicate
-    let chunk_hashes = db.chunk_and_store(image_path)?;
-    
-    // Register file
-    let metadata = std::fs::metadata(image_path)?;
-    db.register_file(
-        &image_path.to_string_lossy(),
-        metadata.len() as i64,
-        &chunk_hashes,
-        device_id,
-        thumbnail_hash.as_deref(),
-    )?;
-    
-    Ok(())
+    db.import_photo(image_path, device_id, thumbnail_size).map_err(|e| anyhow::anyhow!(e))
 }
 
 fn process_directory(
@@ -120,8 +84,10 @@ fn process_directory(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+// Not async: the loop below blocks on a std channel and nothing awaits. It was
+// `#[tokio::main]` with tokio an optional dependency no default feature
+// enables, so the daemon did not build at all without `websocket-sync`.
+fn main() -> Result<()> {
     let args = Args::parse();
     
     // Ensure directories exist
@@ -129,14 +95,14 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&args.block_store)?;
     std::fs::create_dir_all(&args.watch_dir)?;
     
-    let mut db = PhotoSyncDB::new(&args.db_path, &args.block_store)?;
+    let mut db = PhotoSyncDB::new(&args.db_path, &args.block_store).map_err(|e| anyhow::anyhow!(e))?;
     
     // Process existing files if requested
     if args.process_existing {
         println!("Processing existing files...");
         process_directory(&mut db, &args.watch_dir, &args.device_id, args.thumbnail_size)?;
         
-        let stats = db.get_storage_stats()?;
+        let stats = db.get_storage_stats().map_err(|e| anyhow::anyhow!(e))?;
         println!("\nStorage Statistics:");
         println!("  Total size: {} MB", stats.total_size / (1024 * 1024));
         println!("  Compressed: {} MB", stats.compressed_size / (1024 * 1024));
