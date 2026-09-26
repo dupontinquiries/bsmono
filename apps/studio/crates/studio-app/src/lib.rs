@@ -9959,7 +9959,7 @@ mod chord_tool_tests {
         let mut s = Studio::demo();
         let ch = s.selected_channel;
         let pat = s.current_pattern;
-        let note = |key: i8, start: u32| studio_live::Note { key, start, len: 4, vel: 0.8, slide: false };
+        let note = |key: i8, start: u32| studio_live::Note { key, start, len: 4, vel: 0.8, slide: false, nudge: 0.0 };
         s.rack.patterns[pat].add_note(ch, note(3, 0));
         s.rack.patterns[pat].add_note(ch, note(3, 8));
         s.loop_dirty = false;

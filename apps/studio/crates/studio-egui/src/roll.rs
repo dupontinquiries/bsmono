@@ -492,7 +492,7 @@ pub fn roll(ui: &mut egui::Ui, pattern: &Pattern, channel: usize,
                     // Draw the note out in one gesture: add it at a step,
                     // and let the rest of the drag be its resize.
                     edits.push(RollEdit::Add { channel, note: Note {
-                        key, start: step, len: 1, vel: 1.0, slide: false } });
+                        key, start: step, len: 1, vel: 1.0, slide: false, nudge: 0.0 } });
                     state.gesture = Some(Gesture::Draw(NoteDrag { start: step, key, last_len: 1 }));
                     state.selected = Some((step, key));
                 }
@@ -531,7 +531,7 @@ pub fn roll(ui: &mut egui::Ui, pattern: &Pattern, channel: usize,
             match here {
                 Some(RollHit::Empty { key, step }) => {
                     let len = state.last_len.max(1).min(steps - step);
-                    edits.push(RollEdit::Add { channel, note: Note { key, start: step, len, vel: 1.0, slide: false } });
+                    edits.push(RollEdit::Add { channel, note: Note { key, start: step, len, vel: 1.0, slide: false, nudge: 0.0 } });
                     state.selected = Some((step, key));
                     state.just_added = Some((step, key));
                 }
@@ -572,7 +572,7 @@ mod tests {
 
     fn pattern_with_note() -> Pattern {
         let mut p = Pattern::new("A", 16, 2);
-        p.add_note(0, Note { key: 3, start: 4, len: 3, vel: 1.0, slide: false });
+        p.add_note(0, Note { key: 3, start: 4, len: 3, vel: 1.0, slide: false, nudge: 0.0 });
         p
     }
 
@@ -642,9 +642,9 @@ mod tests {
     #[test]
     fn a_chord_shares_one_dynamic_and_its_neighbours_keep_theirs() {
         let mut p = Pattern::new("A", 16, 1);
-        p.add_note(0, Note { key: 0, start: 4, len: 2, vel: 1.0, slide: false });
-        p.add_note(0, Note { key: 7, start: 4, len: 2, vel: 0.8, slide: false });
-        p.add_note(0, Note { key: 0, start: 8, len: 1, vel: 0.6, slide: false });
+        p.add_note(0, Note { key: 0, start: 4, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
+        p.add_note(0, Note { key: 7, start: 4, len: 2, vel: 0.8, slide: false, nudge: 0.0 });
+        p.add_note(0, Note { key: 0, start: 8, len: 1, vel: 0.6, slide: false, nudge: 0.0 });
         assert!((p.start_vel(0, 4).unwrap() - 1.0).abs() < 1e-6, "the bar draws the loudest");
         p.set_start_vel(0, 4, 0.3);
         for n in p.roll(0).iter().filter(|n| n.start == 4) {
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn keys_move_transpose_and_resize_the_selected_note_and_refuse_to_leave_the_pattern() {
-        let n = Note { key: 3, start: 0, len: 2, vel: 1.0, slide: false };
+        let n = Note { key: 3, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 };
         let mv = |k| key_edit(0, n, k, 16).map(|(e, s)| (e, s));
         assert_eq!(mv(RollKey::Up), Some((RollEdit::Move { channel: 0, start: 0, key: 3, to_start: 0, to_key: 4 }, Some((0, 4)))));
         assert_eq!(mv(RollKey::OctaveDown).unwrap().1, Some((0, -9)));
@@ -741,8 +741,8 @@ mod gesture_tests {
     impl Rig {
         fn new() -> Rig {
             let mut p = Pattern::new("g", 16, 1);
-            p.add_note(0, Note { key: 3, start: 4, len: 3, vel: 0.7, slide: false });   // 4-6
-            p.add_note(0, Note { key: 3, start: 10, len: 1, vel: 1.0, slide: false });  // 10
+            p.add_note(0, Note { key: 3, start: 4, len: 3, vel: 0.7, slide: false, nudge: 0.0 });   // 4-6
+            p.add_note(0, Note { key: 3, start: 10, len: 1, vel: 1.0, slide: false, nudge: 0.0 });  // 10
             let mut r = Rig { ctx: egui::Context::default(), p, st: RollState::default(), t: 0.0, all: vec![] };
             // egui hit-tests against the PREVIOUS frame's widget rects, and a
             // new Area spends its first appearance on a sizing pass: a press
@@ -825,7 +825,7 @@ mod gesture_tests {
         assert_eq!(r.st.last_len, 3);
         r.t += 1.0; // well past double-click time
         let e = r.click(Rig::at(12.0, 5), Primary);
-        assert_eq!(e, vec![RollEdit::Add { channel: 0, note: Note { key: 5, start: 12, len: 3, vel: 1.0, slide: false } }]);
+        assert_eq!(e, vec![RollEdit::Add { channel: 0, note: Note { key: 5, start: 12, len: 3, vel: 1.0, slide: false, nudge: 0.0 } }]);
     }
 
     #[test]
@@ -842,7 +842,7 @@ mod gesture_tests {
         let e = r.button(Rig::at(12.0, 5), Primary, false);
         // grabbed one step in, so it lands one step behind the pointer: 11
         assert_eq!(e, vec![RollEdit::Move { channel: 0, start: 4, key: 3, to_start: 11, to_key: 5 }]);
-        assert_eq!(r.p.note_at(0, 5, 11), Some(Note { key: 5, start: 11, len: 3, vel: 0.7, slide: false }));
+        assert_eq!(r.p.note_at(0, 5, 11), Some(Note { key: 5, start: 11, len: 3, vel: 0.7, slide: false, nudge: 0.0 }));
         assert!(r.p.note_at(0, 3, 10).is_some());
         assert_eq!(r.st.selected, Some((11, 5)));
     }

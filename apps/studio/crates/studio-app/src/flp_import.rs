@@ -655,14 +655,24 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                     }
                     continue; // the roll's other hits ARE the ratchet
                 }
-                if is_sampler && key == 60 {
-                    if rp.is_set(ch, step as u32) { collided += 1; }
+                // MICRO-TIMING: where between the 16ths FL has it, kept (a step
+                // fraction, -0.5..0.5) -- snapped to the grid until c20, which
+                // put Balance's played-in lead and every hat roll "off beat"
+                let nudge = (step_f - step_f.round()) as f32;
+                let nudge = if nudge.abs() < 1e-4 { 0.0 } else { nudge };
+                let len = ((i(&n["len"]).unwrap_or(0) as f64 / step_ticks).round() as u32).max(1);
+                let vel = (f(&n["vel"]).unwrap_or(100.0) / 128.0).clamp(0.05, 1.0) as f32;
+                if is_sampler && key == 60 && !rp.is_set(ch, step as u32) {
                     rp.set(ch, step as u32, true);
+                    if nudge != 0.0 { rp.set_mod(ch, step as u32, studio_live::StepMod { nudge, ..Default::default() }); }
+                } else if is_sampler && key == 60 {
+                    // the step is taken (a 32nd / triplet partner of a hit on it):
+                    // a NOTE at the same place, not merged away
+                    collided += 1;
+                    rp.add_note(ch, Note { key: 0, start: step as u32, len, vel, slide: false, nudge });
                 } else {
-                    let len = ((i(&n["len"]).unwrap_or(0) as f64 / step_ticks).round() as u32).max(1);
-                    let vel = (f(&n["vel"]).unwrap_or(100.0) / 128.0).clamp(0.05, 1.0) as f32;
                     let slide = n["slide"].as_bool().unwrap_or(false);
-                    rp.add_note(ch, Note { key: (key - 60).clamp(-127, 127) as i8, start: step as u32, len, vel, slide });
+                    rp.add_note(ch, Note { key: (key - 60).clamp(-127, 127) as i8, start: step as u32, len, vel, slide, nudge });
                 }
             }
             parts.entry(pid).or_default().push((rack.patterns.len(), from));
@@ -674,7 +684,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
             rolls_kept.iter().map(|(r, n)| format!("{n} x{r}{}", if *r == 3 { " (16th-note triplets)" } else { "" })).collect::<Vec<_>>().join(", ")));
     }
     if off_grid > 0 || collided > 0 {
-        report.push(format!("patterns are on 16th steps: {off_grid} note{} off the grid moved to the nearest step, {collided} hit{} landed on an already-set step (merged)",
+        report.push(format!("MICRO-TIMING kept: {off_grid} note{} between the 16th steps play at their exact place (a step fraction); {collided} hit{} sharing a step with another became a note there, not merged",
             if off_grid == 1 { "" } else { "s" }, if collided == 1 { "" } else { "s" }));
     }
 
@@ -1341,7 +1351,7 @@ mod tests {
         let long: Vec<&Pattern> = im.rack.patterns.iter().filter(|p| p.name.starts_with("Long")).collect();
         assert_eq!(long.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["Long (1/2)", "Long (2/2)"]);
         assert!(long[1].is_set(kick, 4), "step 68 is step 4 of part 2");
-        assert!(im.report.iter().any(|r| r.contains("1 note off the grid")), "{:?}", im.report);
+        assert!(im.report.iter().any(|r| r.contains("MICRO-TIMING kept: 1 note between")), "{:?}", im.report);
         assert!(im.report.iter().any(|r| r.contains("STAND-INS") && r.contains("Omnisphere")));
         // the long pattern's parts sit end to end on the timeline
         let t = im.project.tracks.iter().find(|t| t.name.starts_with("Long")).unwrap();
@@ -1528,9 +1538,10 @@ mod tests {
         assert!(p.is_set(0, 0) && p.mod_at(0, 0).ratchet == 3, "the roll is a ratchet 3: {:?}", p.mod_at(0, 0));
         assert!(!p.is_set(0, 1), "its other hits are not separate steps");
         assert!(p.is_set(0, 2) && p.mod_at(0, 2).ratchet <= 1, "the plain hit stays plain");
-        assert!(p.is_set(0, 3), "the lone off-grid hit (77 ticks) snaps to step 3");
+        assert!(p.is_set(0, 3), "the lone off-grid hit (77 ticks) is step 3, nudged");
+        assert!((p.mod_at(0, 3).nudge - (77.0 / 24.0 - 3.0)).abs() < 1e-5, "at its exact place: {:?}", p.mod_at(0, 3));
         assert!(im.report.iter().any(|r| r.contains("1 x3 (16th-note triplets)")), "{:?}", im.report);
-        assert!(im.report.iter().any(|r| r.contains("1 note off the grid")), "only the lone hit counts as off-grid: {:?}", im.report);
+        assert!(im.report.iter().any(|r| r.contains("MICRO-TIMING kept: 1 note between")), "only the lone hit counts as off-grid: {:?}", im.report);
     }
 
     /// A Fruity Slicer with its slice map read: keys root+2 and root+4 play
@@ -1633,6 +1644,35 @@ mod tests {
         assert!(im.report.iter().any(|r| r.contains("no bus or slot to land on") && r.contains("Balance - Nowhere - Volume x1")), "{:?}", im.report);
         assert!(im.report.iter().any(|r| r.starts_with("2 automation clips not applied")), "Nowhere + Kick - Volume: {:?}", im.report);
         assert!(!im.report.iter().any(|r| r.starts_with("refused")), "{:?}", im.report);
+    }
+
+    /// Off-grid notes keep their place: a hat hit a third of a step after an
+    /// on-grid one (their step is taken) becomes a NOTE there with its nudge;
+    /// a lone hit a quarter step late is a nudged step hit; a synth note
+    /// played in 1.25 steps late keeps +0.25.
+    #[test]
+    fn off_grid_notes_keep_their_exact_place() {
+        let inv = json!({
+            "project": {"ppq": 96, "tempo": 120.0},
+            "channels": [{"iid": 0, "kind": "Sampler", "name": "Hat", "sample_file": "kick.wav"},
+                         {"iid": 1, "kind": "Instrument", "name": "Omnisphere", "plugin": "Fruity Wrapper"}],
+            "patterns": [{"iid": 1, "name": "P", "notes": [
+                {"rack": 0, "pos": 0, "len": 0, "key": 60}, {"rack": 0, "pos": 8, "len": 0, "key": 60},
+                {"rack": 0, "pos": 102, "len": 0, "key": 60},
+                {"rack": 1, "pos": 30, "len": 96, "key": 64}]}],
+            "arrangements": [{"tracks": [{"iid": 1, "name": "P", "items": [{"kind": "PatternPLItem", "pattern": 1, "pos": 0, "len": 384}]}]}],
+            "mixer": []
+        });
+        let im = import(&inv, "nudge", &probe).unwrap();
+        let p = &im.rack.patterns[0];
+        assert!(p.is_set(0, 0) && p.mod_at(0, 0).nudge == 0.0, "the on-grid hit");
+        let partner: Vec<(u32, f32)> = p.roll(0).iter().map(|n| (n.start, n.nudge)).collect();
+        assert_eq!(partner.len(), 1);
+        assert!(partner[0].0 == 0 && (partner[0].1 - 1.0 / 3.0).abs() < 1e-5, "the partner as a note: {partner:?}");
+        assert!(p.is_set(0, 4) && (p.mod_at(0, 4).nudge - 0.25).abs() < 1e-5, "102 ticks = step 4 + 1/4: {:?}", p.mod_at(0, 4));
+        let synth: Vec<(u32, f32)> = p.roll(1).iter().map(|n| (n.start, n.nudge)).collect();
+        assert!(synth.len() == 1 && synth[0].0 == 1 && (synth[0].1 - 0.25).abs() < 1e-5, "{synth:?}");
+        assert!(im.report.iter().any(|r| r.contains("MICRO-TIMING kept: 3 notes") && r.contains("1 hit sharing a step")), "{:?}", im.report);
     }
 
     #[test]

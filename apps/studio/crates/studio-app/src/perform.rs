@@ -89,8 +89,7 @@ pub fn quantise(played: &[Played], origin_ms: u64, tempo_bpm: f32, steps_per_bea
             // stream says whether the player meant that. Left false for
             // the editor to set rather than guessed from note overlap,
             // which would turn every legato passage into a portamento.
-            slide: false,
-        })
+            slide: false, nudge: 0.0 })
         .collect();
     // `Pattern::rolls` documents its notes as sorted by (start, key). A
     // caller must not have to know to re-sort.

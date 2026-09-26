@@ -302,11 +302,18 @@ pub struct StepMod {
     /// other bar," "the 3rd of 4." `None` (the common case) fires on every
     /// pass, subject to `prob`.
     pub every: Option<(u8, u8)>,
+    /// MICRO-TIMING: where the hit sits relative to its step, as a fraction of
+    /// a step, -0.5..0.5 (0 = on the grid). An FL hit between 16ths -- a 32nd,
+    /// a triplet, a part played in by hand -- keeps its place instead of being
+    /// snapped (Balance's lead: 209 of 237 notes off the grid, heard as the
+    /// loop "just off beat"). `serde(default)`: older racks are on the grid.
+    #[serde(default)]
+    pub nudge: f32,
 }
 
 impl Default for StepMod {
     fn default() -> StepMod {
-        StepMod { vel: 1.0, ratchet: 1, tune: 0, slide: false, prob: 1.0, every: None }
+        StepMod { vel: 1.0, ratchet: 1, tune: 0, slide: false, prob: 1.0, every: None, nudge: 0.0 }
     }
 }
 
@@ -339,6 +346,11 @@ pub struct Note {
     /// property, which is where FL puts it. A channel's first roll note
     /// ignores it, same as [`StepMod::slide`].
     pub slide: bool,
+    /// MICRO-TIMING, as [`StepMod::nudge`]: the note starts this fraction of a
+    /// step after (or before) `start`. Two notes on one key within one step
+    /// (a 32nd pair, a triplet) are two notes: identity is (start, nudge, key).
+    #[serde(default)]
+    pub nudge: f32,
 }
 
 /// The order an arpeggio runs its chord in.
@@ -484,9 +496,9 @@ impl Pattern {
     pub fn add_note(&mut self, ch: usize, mut n: Note) {
         n.len = n.len.max(1);
         let notes = self.rolls.entry(ch).or_default();
-        notes.retain(|m| !(m.start == n.start && m.key == n.key));
+        notes.retain(|m| !(m.start == n.start && m.key == n.key && m.nudge == n.nudge));
         notes.push(n);
-        notes.sort_by_key(|m| (m.start, m.key));
+        notes.sort_by(|a, b| (a.start, a.key).cmp(&(b.start, b.key)).then(a.nudge.total_cmp(&b.nudge)));
     }
     /// Remove the note at (start, key). Returns whether one was there. An
     /// emptied channel drops its map entry, keeping `rolls` sparse the way
@@ -614,7 +626,7 @@ impl Pattern {
             let mut i = 0;
             while t < span {
                 let len = note_len.min(span - t);
-                self.add_note(ch, Note { key: keys[i % keys.len()], start: start + t, len, vel, slide: false });
+                self.add_note(ch, Note { key: keys[i % keys.len()], start: start + t, len, vel, slide: false, nudge: 0.0 });
                 t += note_len;
                 i += 1;
             }
@@ -1451,6 +1463,13 @@ fn strip_glide(kind: &SynthKind) -> SynthKind {
     }
 }
 
+/// A grid position moved by a step fraction (clamped to +-0.5, and never
+/// before the pattern's first sample).
+fn nudged(at: usize, nudge: f32, step: usize) -> usize {
+    if nudge == 0.0 { return at; }
+    (at as i64 + (nudge.clamp(-0.5, 0.5) as f64 * step as f64).round() as i64).max(0) as usize
+}
+
 /// Render a pattern to mono samples — the bounce that turns a rack into a clip.
 ///
 /// `pass` is which loop iteration this bounce represents (0 for a one-shot
@@ -1572,7 +1591,7 @@ pub fn render_pattern_stereo(
             let this_kind = if r == 0 { kind.clone() } else { strip_glide(&kind) };
             placed.push(Placed {
                 pan: ch.pan,
-                at: step_i as usize * step + swing + r * sub_step,
+                at: nudged(step_i as usize * step + swing + r * sub_step, m.nudge, step),
                 kind: this_kind,
                 amp: ch.gain * m.vel,
                 group: ch.choke_group,
@@ -1636,7 +1655,7 @@ pub fn render_pattern_stereo(
             };
             placed.push(Placed {
                 pan: ch.pan,
-                at: n.start as usize * step + swing,
+                at: nudged(n.start as usize * step + swing, n.nudge, step),
                 kind,
                 amp: ch.gain * n.vel.clamp(0.0, 1.0),
                 group: ch.choke_group,
@@ -1886,10 +1905,10 @@ mod tests {
     #[test]
     fn a_moved_note_keeps_its_length_velocity_and_slide_and_replaces_what_it_lands_on() {
         let mut p = Pattern::new("m", 16, 1);
-        p.add_note(0, Note { key: 3, start: 2, len: 4, vel: 0.4, slide: true });
-        p.add_note(0, Note { key: 5, start: 8, len: 1, vel: 1.0, slide: false });
+        p.add_note(0, Note { key: 3, start: 2, len: 4, vel: 0.4, slide: true, nudge: 0.0 });
+        p.add_note(0, Note { key: 5, start: 8, len: 1, vel: 1.0, slide: false, nudge: 0.0 });
         assert!(p.move_note(0, 2, 3, 8, 5));
-        assert_eq!(p.roll(0), &[Note { key: 5, start: 8, len: 4, vel: 0.4, slide: true }]);
+        assert_eq!(p.roll(0), &[Note { key: 5, start: 8, len: 4, vel: 0.4, slide: true, nudge: 0.0 }]);
         assert!(!p.move_note(0, 2, 3, 0, 0), "nothing left at the old place");
         assert!(p.move_note(0, 8, 5, 8, 5), "a move to where it is, is a no-op that found the note");
         assert_eq!(p.roll(0).len(), 1);
@@ -2281,8 +2300,8 @@ mod tests {
         });
         let ch = rack.channels.len() - 1;
         let mut pattern = Pattern::new("keys", 16, rack.channels.len());
-        pattern.add_note(ch, Note { key: 3, start: 0, len: 4, vel: 0.9, slide: false });  // C2 on the roll
-        pattern.add_note(ch, Note { key: 7, start: 4, len: 4, vel: 0.9, slide: false });  // E2
+        pattern.add_note(ch, Note { key: 3, start: 0, len: 4, vel: 0.9, slide: false, nudge: 0.0 });  // C2 on the roll
+        pattern.add_note(ch, Note { key: 7, start: 4, len: 4, vel: 0.9, slide: false, nudge: 0.0 });  // E2
         pattern.toggle(ch, 8);
         pattern.set_mod(ch, 8, StepMod { tune: -5, ..StepMod::default() });                  // a step hit, tuned
         let tempo = Tempo { bpm: 120.0, steps_per_beat: 4, swing: 0.0 };
@@ -2913,7 +2932,7 @@ mod choke_tests {
 mod roll_tests {
     use super::*;
 
-    fn note(key: i8, start: u32, len: u32) -> Note { Note { key, start, len, vel: 0.8, slide: false } }
+    fn note(key: i8, start: u32, len: u32) -> Note { Note { key, start, len, vel: 0.8, slide: false, nudge: 0.0 } }
 
     #[test]
     fn harmonize_adds_the_interval_in_key_and_never_stacks() {
@@ -3005,7 +3024,7 @@ mod roll_tests {
         // 808 must stop at 2 steps, faded, not ring out its whole decay.
         let rack = sub_rack(2000.0, 0.0);
         let mut p = Pattern::new("A", 6, 1);
-        p.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false });
+        p.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
         let (out, step) = render(&rack, &p);
         let sounding = energy(&out, 0, step);
         let after = energy(&out, step * 3, step * 4);
@@ -3020,7 +3039,7 @@ mod roll_tests {
         // also pins the scratch buffer actually growing past `voice_len`.
         let rack = sub_rack(2000.0, 0.0);
         let mut held = Pattern::new("held", 8, 1);
-        held.add_note(0, Note { key: 0, start: 0, len: 8, vel: 1.0, slide: false });
+        held.add_note(0, Note { key: 0, start: 0, len: 8, vel: 1.0, slide: false, nudge: 0.0 });
         let mut hit = Pattern::new("hit", 8, 1);
         hit.set(0, 0, true);
         let (held_out, step) = render(&rack, &held);
@@ -3038,12 +3057,12 @@ mod roll_tests {
         // must layer, not interact. Compared sample-for-sample, not by energy.
         let rack = sub_rack(400.0, 0.0);
         let mut chord = Pattern::new("chord", 4, 1);
-        chord.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false });
-        chord.add_note(0, Note { key: 7, start: 0, len: 2, vel: 1.0, slide: false });
+        chord.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
+        chord.add_note(0, Note { key: 7, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
         let mut root = Pattern::new("root", 4, 1);
-        root.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false });
+        root.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
         let mut fifth = Pattern::new("fifth", 4, 1);
-        fifth.add_note(0, Note { key: 7, start: 0, len: 2, vel: 1.0, slide: false });
+        fifth.add_note(0, Note { key: 7, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
         let (c, _) = render(&rack, &chord);
         let (r, _) = render(&rack, &root);
         let (f, _) = render(&rack, &fifth);
@@ -3061,8 +3080,8 @@ mod roll_tests {
         // instrument-blind yardstick the realtune tests use.
         let rack = sub_rack(2000.0, 200.0);
         let mut slid = Pattern::new("slide", 4, 1);
-        slid.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false });
-        slid.add_note(0, Note { key: 12, start: 2, len: 2, vel: 1.0, slide: true });
+        slid.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
+        slid.add_note(0, Note { key: 12, start: 2, len: 2, vel: 1.0, slide: true, nudge: 0.0 });
         let mut plain = slid.clone();
         plain.toggle_note_slide(0, 2, 12);
         let (s, step) = render(&rack, &slid);
@@ -3085,7 +3104,7 @@ mod roll_tests {
             gain: 1.0, pan: 0.0, muted: false, choke_group: Some(1), one_shot: false,
         });
         let mut cut = Pattern::new("cut", 8, 2);
-        cut.add_note(0, Note { key: 0, start: 0, len: 8, vel: 1.0, slide: false });
+        cut.add_note(0, Note { key: 0, start: 0, len: 8, vel: 1.0, slide: false, nudge: 0.0 });
         cut.set(1, 2, true);
         let mut free = cut.clone();
         free.set(1, 2, false);
@@ -3104,7 +3123,7 @@ mod roll_tests {
         // but survives, so shorten-then-lengthen round-trips.
         let rack = sub_rack(400.0, 0.0);
         let mut p = Pattern::new("A", 16, 1);
-        p.add_note(0, Note { key: 0, start: 12, len: 2, vel: 1.0, slide: false });
+        p.add_note(0, Note { key: 0, start: 12, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
         p.steps = 8;
         let (short, _) = render(&rack, &p);
         assert!(short.iter().all(|s| s.abs() < 1e-6), "a hidden note renders nothing");
@@ -3117,13 +3136,13 @@ mod roll_tests {
     #[test]
     fn adding_at_the_same_start_and_key_replaces_rather_than_stacks() {
         let mut p = Pattern::new("A", 16, 1);
-        p.add_note(0, Note { key: 0, start: 0, len: 1, vel: 1.0, slide: false });
-        p.add_note(0, Note { key: 0, start: 0, len: 4, vel: 0.5, slide: false });
+        p.add_note(0, Note { key: 0, start: 0, len: 1, vel: 1.0, slide: false, nudge: 0.0 });
+        p.add_note(0, Note { key: 0, start: 0, len: 4, vel: 0.5, slide: false, nudge: 0.0 });
         assert_eq!(p.roll(0).len(), 1, "one intention, one note");
         assert_eq!(p.roll(0)[0].len, 4);
         assert!((p.roll(0)[0].vel - 0.5).abs() < 1e-6);
         // A different key at the same start is a chord, not a replacement.
-        p.add_note(0, Note { key: 7, start: 0, len: 1, vel: 1.0, slide: false });
+        p.add_note(0, Note { key: 7, start: 0, len: 1, vel: 1.0, slide: false, nudge: 0.0 });
         assert_eq!(p.roll(0).len(), 2);
         // And removing the last note drops the channel's entry entirely,
         // keeping `rolls` sparse the way `set_mod` keeps `mods` sparse.
@@ -3145,6 +3164,44 @@ mod roll_tests {
     }
 
     #[test]
+    fn a_nudged_hit_and_a_nudged_note_start_off_the_grid() {
+        // a click (one sample at 1.0) as the sample, so a voice's start is
+        // the index of its first nonzero sample
+        let mut click = vec![0.0f32; 4_800];
+        click[0] = 1.0;
+        let mut sources = std::collections::BTreeMap::new();
+        sources.insert(studio_core::SourceId(1), SourceAudio { sample_rate: 48_000, channels: vec![click] });
+        let rack = Rack {
+            channels: vec![Channel { name: "hat".into(), kind: SynthKind::Sampler { source: studio_core::SourceId(1) },
+                                     gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false }],
+            patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
+        let mut synth = BuiltinSynth { sources: &sources };
+        let step = rack.tempo().step_len().to_samples(48_000) as usize; // 6000 at 120 BPM
+        let mut starts = |p: &Pattern| -> Vec<usize> {
+            let out = render_pattern(p, &rack, &mut synth, &rack.tempo(), 48_000, 0);
+            (0..out.len()).filter(|&i| out[i].abs() > 0.1 && (i == 0 || out[i - 1].abs() <= 0.1)).collect()
+        };
+        let mut p = Pattern::new("t", 16, 1);
+        p.set(0, 2, true);
+        p.set_mod(0, 2, StepMod { nudge: 1.0 / 3.0, ..Default::default() });
+        p.set(0, 5, true);
+        p.set_mod(0, 5, StepMod { nudge: -0.25, ..Default::default() });
+        p.add_note(0, Note { key: 0, start: 8, len: 1, vel: 1.0, slide: false, nudge: 0.5 });
+        assert_eq!(starts(&p), vec![2 * step + step / 3, 5 * step - step / 4, 8 * step + step / 2]);
+        // before the first sample: clamped to it, not wrapped or dropped
+        let mut q = Pattern::new("t", 16, 1);
+        q.set(0, 0, true);
+        q.set_mod(0, 0, StepMod { nudge: -0.5, ..Default::default() });
+        assert_eq!(starts(&q), vec![0]);
+        // a 32nd pair on ONE key in ONE step: two notes, both heard
+        let mut r = Pattern::new("t", 16, 1);
+        r.add_note(0, Note { key: 0, start: 4, len: 1, vel: 1.0, slide: false, nudge: 0.0 });
+        r.add_note(0, Note { key: 0, start: 4, len: 1, vel: 1.0, slide: false, nudge: 0.5 });
+        assert_eq!(r.roll(0).len(), 2);
+        assert_eq!(starts(&r), vec![4 * step, 4 * step + step / 2]);
+    }
+
+    #[test]
     fn one_shot_note_rings_its_whole_sample_and_a_gated_one_does_not() {
         // a 1 s tone, a 1-step note (125 ms at 120 BPM): gated, silent after
         // the step; ONE-SHOT, still ringing at 0.5 s -- FL's sampler, envelope off
@@ -3156,7 +3213,7 @@ mod roll_tests {
                                      gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot }],
             patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
         let mut p = Pattern::new("808", 16, 1);
-        p.add_note(0, Note { key: 0, start: 0, len: 1, vel: 1.0, slide: false });
+        p.add_note(0, Note { key: 0, start: 0, len: 1, vel: 1.0, slide: false, nudge: 0.0 });
         let mut synth = BuiltinSynth { sources: &sources };
         let (g, o) = (rack_with(false), rack_with(true));
         let gated = render_pattern(&p, &g, &mut synth, &g.tempo(), 48_000, 0);
@@ -3191,9 +3248,9 @@ mod roll_tests {
             patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
         let t = rack.tempo();
         let mut up = Pattern::new("up", 4, 1);
-        up.add_note(0, Note { key: 12, start: 0, len: 2, vel: 1.0, slide: false });
+        up.add_note(0, Note { key: 12, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
         let mut flat = Pattern::new("flat", 4, 1);
-        flat.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false });
+        flat.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
         let mut synth = BuiltinSynth { sources: &sources };
         let u = render_pattern(&up, &rack, &mut synth, &t, 48_000, 0);
         let f = render_pattern(&flat, &rack, &mut synth, &t, 48_000, 0);
@@ -3302,7 +3359,7 @@ mod gated_synth_tests {
         // release.
         let rack = sub_rack_decay(120.0);
         let mut p = Pattern::new("hold", 8, 1);
-        p.add_note(0, Note { key: 0, start: 0, len: 6, vel: 1.0, slide: false });
+        p.add_note(0, Note { key: 0, start: 0, len: 6, vel: 1.0, slide: false, nudge: 0.0 });
         let sources = std::collections::BTreeMap::new();
         let mut synth = BuiltinSynth { sources: &sources };
         let tempo = rack.tempo();
@@ -3325,7 +3382,7 @@ mod gated_synth_tests {
             sustain: 0.8, release_ms: 300.0, cutoff: 20_000.0, env_amount: 0.0, gain: 1.0, ..Default::default() } };
         rack.channels[0].choke_group = None;
         let mut p = Pattern::new("pad", 16, rack.channels.len());
-        p.add_note(0, Note { key: 0, start: 0, len: 6, vel: 1.0, slide: false });
+        p.add_note(0, Note { key: 0, start: 0, len: 6, vel: 1.0, slide: false, nudge: 0.0 });
         let sources = std::collections::BTreeMap::new();
         let mut synth = BuiltinSynth { sources: &sources };
         let tempo = rack.tempo();
@@ -3349,7 +3406,7 @@ mod gated_synth_tests {
         let rack = sub_rack_decay(200.0);
         let zc_of = |key: i8| {
             let mut p = Pattern::new("k", 8, 1);
-            p.add_note(0, Note { key, start: 0, len: 8, vel: 1.0, slide: false });
+            p.add_note(0, Note { key, start: 0, len: 8, vel: 1.0, slide: false, nudge: 0.0 });
             let sources = std::collections::BTreeMap::new();
         let mut synth = BuiltinSynth { sources: &sources };
             let tempo = rack.tempo();

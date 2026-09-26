@@ -121,7 +121,8 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// v26: a Poly patch's BODY (fixed-Hz resonances) and its human motion --
 /// delayed vibrato, drift, bow noise.
 /// v27: a rack channel's ONE-SHOT flag.
-pub const WIRE_VERSION: u8 = 27;
+/// v28: a step modifier's and a roll note's MICRO-TIMING (nudge).
+pub const WIRE_VERSION: u8 = 28;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -989,6 +990,7 @@ fn put_stepmod(o: &mut Vec<u8>, m: &StepMod) {
     let (n, k) = m.every.unwrap_or((0, 0));
     put_u8(o, n);
     put_u8(o, k);
+    if enc_v() >= 28 { put_f32(o, m.nudge); }
 }
 fn get_stepmod(r: &mut R) -> Option<StepMod> {
     let vel = r.f32()?;
@@ -999,7 +1001,8 @@ fn get_stepmod(r: &mut R) -> Option<StepMod> {
     let has_every = r.u8()? != 0;
     let n = r.u8()?;
     let k = r.u8()?;
-    Some(StepMod { vel, ratchet, tune, slide, prob, every: has_every.then_some((n, k)) })
+    let nudge = if r.v >= 28 { r.f32()? } else { 0.0 };
+    Some(StepMod { vel, ratchet, tune, slide, prob, every: has_every.then_some((n, k)), nudge })
 }
 
 fn put_pattern(o: &mut Vec<u8>, pat: &Pattern) {
@@ -1025,6 +1028,7 @@ fn put_pattern(o: &mut Vec<u8>, pat: &Pattern) {
             put_u32(o, n.len);
             put_f32(o, n.vel);
             put_u8(o, n.slide as u8);
+            if enc_v() >= 28 { put_f32(o, n.nudge); }
         }
     }
 }
@@ -1049,13 +1053,9 @@ fn get_pattern(r: &mut R) -> Option<Pattern> {
         let nn = r.u16()? as usize;
         let mut notes = Vec::with_capacity(nn.min(4096));
         for _ in 0..nn {
-            notes.push(Note {
-                key: r.u8()? as i8,
-                start: r.u32()?,
-                len: r.u32()?,
-                vel: r.f32()?,
-                slide: r.u8()? != 0,
-            });
+            let (key, start, len, vel, slide) = (r.u8()? as i8, r.u32()?, r.u32()?, r.f32()?, r.u8()? != 0);
+            let nudge = if r.v >= 28 { r.f32()? } else { 0.0 };
+            notes.push(Note { key, start, len, vel, slide, nudge });
         }
         rolls.insert(ch, notes);
     }
@@ -1520,12 +1520,12 @@ mod tests {
         let mut pattern = Pattern::new("beat", 16, 3);
         pattern.toggle(0, 0);
         pattern.toggle(1, 4);
-        pattern.set_mod(1, 4, StepMod { vel: 0.7, ratchet: 4, tune: -5, slide: true, prob: 0.8, every: Some((1, 2)) });
+        pattern.set_mod(1, 4, StepMod { vel: 0.7, ratchet: 4, tune: -5, slide: true, prob: 0.8, every: Some((1, 2)), nudge: -0.25 });
         // v9: a roll with the awkward parts — a negative key, a chord, and
         // a slide — so every rack round trip exercises the note codec.
-        pattern.add_note(1, Note { key: -12, start: 0, len: 4, vel: 0.9, slide: false });
-        pattern.add_note(1, Note { key: 7, start: 0, len: 2, vel: 0.5, slide: false });
-        pattern.add_note(1, Note { key: 3, start: 6, len: 1, vel: 1.0, slide: true });
+        pattern.add_note(1, Note { key: -12, start: 0, len: 4, vel: 0.9, slide: false, nudge: 0.0 });
+        pattern.add_note(1, Note { key: 7, start: 0, len: 2, vel: 0.5, slide: false, nudge: 0.0 });
+        pattern.add_note(1, Note { key: 3, start: 6, len: 1, vel: 1.0, slide: true, nudge: 1.0 / 3.0 });
         Rack {
             channels: vec![
                 Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: Some(2), one_shot: false },
@@ -1573,7 +1573,28 @@ mod tests {
         assert!(r.channels.iter().all(|c| !c.one_shot), "v26 knew no one-shots");
         let mut expect = rack;
         expect.channels[2].one_shot = false;
+        // (nor did v26 know nudges, v28's)
+        for m in expect.patterns[0].mods.values_mut() { m.nudge = 0.0; }
+        for ns in expect.patterns[0].rolls.values_mut() { for n in ns.iter_mut() { n.nudge = 0.0; } }
         assert_eq!(r, expect, "and nothing else moved");
+    }
+
+    /// v28: nudges round-trip (the sample rack carries a -0.25 step mod and
+    /// a +1/3 note); a v27 rack opens with everything on the grid, the rest
+    /// unchanged.
+    #[test]
+    fn nudges_round_trip_and_a_v27_rack_opens_on_the_grid() {
+        let rack = sample_rack();
+        let p = Packet::Rack(RackSync { rack: rack.clone(), seq: 7, site: SiteId(2) });
+        assert_eq!(Packet::decode(&p.encode()), Some(p.clone()));
+        ENCODE_AS.with(|c| c.set(27));
+        let old = p.encode();
+        ENCODE_AS.with(|c| c.set(WIRE_VERSION));
+        let Some(Packet::Rack(RackSync { rack: r, .. })) = Packet::decode_stored(&old) else { panic!("a v27 rack opens") };
+        let mut want = rack;
+        for m in want.patterns[0].mods.values_mut() { m.nudge = 0.0; }
+        for ns in want.patterns[0].rolls.values_mut() { for n in ns.iter_mut() { n.nudge = 0.0; } }
+        assert_eq!(r, want);
     }
 
     #[test]
@@ -1683,7 +1704,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 27, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 28, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]

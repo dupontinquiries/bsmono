@@ -125,8 +125,8 @@ mod tests {
         let mut p = studio_live::Pattern::new("a", 8, 2);
         p.set(0, 1, true);
         p.set(0, 5, true);
-        p.add_note(0, studio_live::Note { key: 0, start: 2, len: 1, vel: 1.0, slide: false });
-        p.add_note(0, studio_live::Note { key: 0, start: 12, len: 1, vel: 1.0, slide: false }); // past the end
+        p.add_note(0, studio_live::Note { key: 0, start: 2, len: 1, vel: 1.0, slide: false, nudge: 0.0 });
+        p.add_note(0, studio_live::Note { key: 0, start: 12, len: 1, vel: 1.0, slide: false, nudge: 0.0 }); // past the end
         assert_eq!(channel_summary(&p, 0), (2, 1));
         assert_eq!(channel_summary(&p, 1), (0, 0));
         p.steps = 4;
