@@ -867,6 +867,27 @@ pub trait VideoSource: Send {
     fn take_note(&mut self) -> Option<String>;
 }
 
+static AI_FRAMES: AtomicBool = AtomicBool::new(false);
+
+/// AI in-between frames (experimental): decoders skip AV1's non-reference
+/// frames and the presenter synthesises them. Read at open, like the cap.
+pub fn set_ai_frames(on: bool) {
+    AI_FRAMES.store(on, Ordering::Relaxed);
+}
+
+pub fn ai_frames() -> bool {
+    AI_FRAMES.load(Ordering::Relaxed)
+}
+
+/// Whether an in-process decode of this stream skips non-reference frames
+/// for AI in-between frames: 8-bit AV1 in software, at a rate where half
+/// is still smooth to synthesise between (>= 45 fps), onto the GPU
+/// presenter. Pure. (Film grain is not exported then: the synthesised
+/// frames would be grainless, flickering at half the rate.)
+pub fn ai_skips(ai: bool, gpu: bool, software: bool, codec: &str, fps: f64, high_bit_depth: bool) -> bool {
+    ai && gpu && software && codec == "av1" && fps >= 45.0 && !high_bit_depth
+}
+
 static FPS_CAP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The frame rate to show at most (the viewer's cap, or the battery

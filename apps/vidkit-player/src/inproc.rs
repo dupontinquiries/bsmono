@@ -165,14 +165,16 @@ pub fn open_input(input: &str, headers: &[(String, String)], p: &Probe, from: Du
     };
     // AV1 grain for the GPU, as the ffmpeg path does with its feed -- here
     // the decoder hands the parameters over itself.
-    let export_grain = gpu && hw == Hw::Software && p.codec == "av1" && !p.high_bit_depth() && std::env::var("VIDKIT_GRAIN_CPU").as_deref() != Ok("1");
+    let ai = decode::ai_skips(decode::ai_frames(), gpu, hw == Hw::Software, &p.codec, p.fps, p.high_bit_depth());
+    let export_grain = !ai && gpu && hw == Hw::Software && p.codec == "av1" && !p.high_bit_depth() && std::env::var("VIDKIT_GRAIN_CPU").as_deref() != Ok("1");
     let input_options = if network { stream_options(headers) } else { Vec::new() };
     // Showing at most `cap` fps of a stream with more than half again as
     // many: frames nothing references are frames nobody will see -- don't
     // decode them. Drift-free (no reference changes). Measured, SVT-AV1
     // 1080p60 (mini-GOP 16): half the frames skipped, -41..46% decode CPU.
     // YouTube's libvpx VP9 has no non-reference frames: no effect there.
-    let skip_nonref = decode::fps_cap().is_some_and(|c| (c as f64) * 1.5 < p.fps);
+    // AI in-between frames: the same skip, the presenter fills the gaps.
+    let skip_nonref = ai || decode::fps_cap().is_some_and(|c| (c as f64) * 1.5 < p.fps);
     let opts = Options { hw: hw.clone(), from, threads, export_grain, input_options, skip_nonref, codec_options: Vec::new() };
     // libavcodec's worker threads are created in open and inherit the
     // opening thread's affinity: pin this thread around it, as the ffmpeg

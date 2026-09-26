@@ -93,6 +93,9 @@ pub struct Settings {
     /// controls back: ignores a bumped couch mouse or a brushed trackpad.
     /// 0 = any motion.
     pub pointer_deadzone: f32,
+    /// Experimental: decode half of an AV1 50/60 fps stream and synthesise
+    /// the other half on the GPU (needs `gpu_convert`).
+    pub ai_frames: bool,
 }
 
 impl Default for Settings {
@@ -110,6 +113,7 @@ impl Default for Settings {
             // Off until it has run on real hardware; llvmpipe is not turnip.
             gpu_convert: false,
             pointer_deadzone: 6.0,
+            ai_frames: false,
         }
     }
 }
@@ -365,6 +369,8 @@ fn panel_body(ui: &mut egui::Ui, s: &mut Settings, glass: &crate::glass::GlassSt
             }
         });
     hint(ui, "a lower frame rate costs less than a lower resolution, and text stays sharp");
+    ui.checkbox(&mut s.ai_frames, "AI in-between frames (experimental)")
+        .on_hover_text("AV1 at 50/60 fps: decode every other frame (about 40% less decoding) and draw the rest from their neighbours on the GPU. Needs \"convert on the GPU\". Softer on fast motion; a frame-rate cap wins over it.");
 
     ui.separator();
     ui.label("picture");

@@ -29,6 +29,7 @@ use vidkit_egui::{bottom_bar, next_fit, EguiPresenter, Fit, Transport, VideoView
 mod filepick;
 #[cfg(feature = "bscale")]
 mod analysis;
+mod aimode;
 mod audio_out;
 mod gpu_selftest;
 #[cfg(feature = "libav")]
@@ -230,6 +231,8 @@ struct Player {
     held: Option<vidkit_core::Frame>,
     /// The last frame shown carried film grain for the GPU to add.
     last_grain: bool,
+    /// AI in-between frames: which gap gets one, and when.
+    ai: aimode::Schedule,
     /// Picture-in-picture: the video floats, the chapters take the screen.
     pip: vidkit_egui::Pip,
     pip_on: bool,
@@ -459,6 +462,7 @@ impl Player {
             scanout_why: String::new(),
             present_log: vidkit_wayland::cadence::PresentLog::new(240),
             last_grain: false,
+            ai: aimode::Schedule::default(),
             deadzone: vidkit_egui::chrome::PointerDeadzone::new(6.0),
             chrome_overlay_h: 0.0,
             held: None,
@@ -477,6 +481,7 @@ impl Player {
         };
         me.wl = wayland_link(cc);
         me.settings.pointer_deadzone = me.prefs.pointer_deadzone as f32;
+        me.settings.ai_frames = me.prefs.ai_frames;
         // The video plane, when asked for (VIDKIT_SCANOUT=1|force) and the
         // GL presenter is up (it paints the hole).
         if me.gpu.is_some() && vidkit_wayland::scanout::Mode::parse(std::env::var("VIDKIT_SCANOUT").ok().as_deref()) != vidkit_wayland::scanout::Mode::Off {
@@ -579,7 +584,18 @@ impl Player {
                     wl.before_commit(target);
                 }
                 self.last_grain = frame.grain.is_some();
-                self.present(eframe_frame, &frame);
+                // The in-between frame's right-hand neighbour is already on
+                // the GPU: promote it rather than upload it again.
+                let promoted = decode::ai_frames()
+                    && match (&self.gpu, eframe_frame.gl()) {
+                        // SAFETY: eframe's glow context is current on the UI thread.
+                        (Some(g), Some(gl)) => g.lock().map(|mut g| unsafe { g.promote(gl, &frame) }).unwrap_or(false),
+                        _ => false,
+                    };
+                if !promoted {
+                    self.present(eframe_frame, &frame);
+                }
+                self.ai.shown_real(frame.pts);
                 if let Some(e) = self.engine.as_ref() {
                     // The content peak for the GPU's BT.2390 EETF.
                     if let Some(g) = &self.gpu {
@@ -601,9 +617,13 @@ impl Player {
                         }
                     }
                 }
+                let next = self.ai_between(eframe_frame, lead).map_or(next, |w| w.min(next));
                 self.presenter.set_deadline(Some(Instant::now() + next));
             }
-            playback::Tick::Wait(d) => self.presenter.set_deadline(Some(Instant::now() + d)),
+            playback::Tick::Wait(d) => {
+                let d = self.ai_between(eframe_frame, lead).map_or(d, |w| w.min(d));
+                self.presenter.set_deadline(Some(Instant::now() + d));
+            }
             playback::Tick::Ended => {
                 // Dropped rather than left to fall back to the test pattern:
                 // a clip that has finished must not look like a broken decoder.
@@ -611,6 +631,37 @@ impl Player {
                 self.engine = None;
                 self.transport.playing = false;
                 self.presenter.idle();
+            }
+        }
+    }
+
+    /// AI in-between frames: show the synthesised frame between the one on
+    /// screen and the next queued one when its time has come; else how
+    /// long until it will (None: nothing to do for this gap).
+    fn ai_between(&mut self, eframe_frame: &eframe::Frame, lead: Duration) -> Option<Duration> {
+        if !decode::ai_frames() {
+            return None;
+        }
+        let (Some(engine), Some(gpu), Some(gl)) = (self.engine.as_ref(), self.gpu.as_ref(), eframe_frame.gl()) else { return None };
+        if engine.is_paused() || self.plane_on {
+            return None;
+        }
+        let front = engine.peek_front()?;
+        match aimode::step(&self.ai, front.pts, engine.frame_interval(), engine.seen_at(lead)) {
+            aimode::Step::None => None,
+            // `d` is from the time a frame drawn now is seen; deadlines
+            // are set as tick_ahead's are, from now (egui wakes `lead` early).
+            aimode::Step::WakeIn(d) => Some((d + lead.min(engine.max_lead())).max(Duration::from_millis(1))),
+            aimode::Step::ShowNow => {
+                let t = Instant::now();
+                // SAFETY: eframe's glow context is current on the UI thread.
+                let r = gpu.lock().map_err(|_| "GPU state poisoned".to_string()).and_then(|mut g| unsafe { g.show_between(gl, front) });
+                let (pts, native) = (front.pts, engine.frame_interval());
+                if r.is_ok() {
+                    self.ai.record_cost(t.elapsed(), native);
+                }
+                self.ai.attempted(pts, r);
+                None
             }
         }
     }
@@ -857,8 +908,9 @@ impl eframe::App for Player {
         self.deadzone.px = self.settings.pointer_deadzone;
         let moved = self.deadzone.moved(now, pos) || intent;
         let dz = self.settings.pointer_deadzone.round().clamp(0.0, 40.0) as u8;
-        if dz != self.prefs.pointer_deadzone {
+        if dz != self.prefs.pointer_deadzone || self.settings.ai_frames != self.prefs.ai_frames {
             self.prefs.pointer_deadzone = dz;
+            self.prefs.ai_frames = self.settings.ai_frames;
             self.prefs.save();
         }
         if moved {
@@ -988,6 +1040,7 @@ impl eframe::App for Player {
         self.follow_visibility(ctx);
         self.follow_power();
         self.follow_fps_cap();
+        self.follow_ai_frames();
         self.measure_refresh();
         self.watch_pinned_drops();
 
@@ -1889,6 +1942,7 @@ impl Player {
     /// nothing, which is worse than a control that is visibly disabled.
     fn seek_to(&mut self, to: Duration) {
         self.transport.position = to;
+        self.ai.reset();
         if let Some(engine) = self.engine.as_mut() {
             if let Err(e) = engine.seek(to) {
                 // A failed seek leaves the decoder where it was rather than
@@ -2684,6 +2738,30 @@ impl Player {
         }
     }
 
+    /// AI in-between frames (Settings, or VIDKIT_AI_FRAMES=1/0): on only
+    /// with the GPU presenter. A change reopens the decoder at the current
+    /// position, since the non-reference skip is fixed at open.
+    fn follow_ai_frames(&mut self) {
+        let want = match std::env::var("VIDKIT_AI_FRAMES").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => self.settings.ai_frames,
+        } && self.gpu.is_some()
+            && !self.ai.too_slow;
+        if want == decode::ai_frames() {
+            return;
+        }
+        if self.ai.too_slow {
+            self.gpu_error = Some(format!("AI in-between frames off: {:.0} ms each on this GPU, over half a frame -- decoding every frame again", self.ai.cost.as_secs_f64() * 1e3));
+        }
+        decode::set_ai_frames(want);
+        self.ai.reset();
+        if self.engine.is_some() {
+            let at = self.transport.position;
+            self.seek_to(at);
+        }
+    }
+
     fn follow_power(&mut self) {
         if self.energy_read.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
             return;
@@ -2754,7 +2832,23 @@ impl Player {
         p.acc.display = if self.wl.is_some() { format!("{} · comp {:.1} ms", self.present_log.summary(fps), self.latency.comp_ns() as f64 / 1e6) } else { String::new() };
         p.acc.presenter = match &self.gpu {
             Some(_) if self.plane_on => "plane".into(),
-            Some(_) => format!("gpu{}{}", if self.held.is_some() { "+zerocopy" } else { "" }, if self.last_grain { "+grain" } else { "" }),
+            Some(_) => format!(
+                "gpu{}{}{}",
+                if self.held.is_some() { "+zerocopy" } else { "" },
+                if self.last_grain { "+grain" } else { "" },
+                if decode::ai_frames() || self.ai.too_slow {
+                    format!(
+                        "+ai({} synth {:.1}ms, {} refused{}{})",
+                        self.ai.shown,
+                        self.ai.cost.as_secs_f64() * 1e3,
+                        self.ai.refused,
+                        self.ai.last_refusal.as_deref().map(|r| format!(": {r}")).unwrap_or_default(),
+                        if self.ai.too_slow { ", OFF: too slow" } else { "" }
+                    )
+                } else {
+                    String::new()
+                }
+            ),
             None if self.presenter.damage_rendering() => format!("cpu-damage@{:.2}", self.presenter.damage_budget),
             None => "cpu-whole".into(),
         };

@@ -699,6 +699,18 @@ impl Engine {
         self.hdr_peak
     }
 
+    /// The next queued frame, without taking it (AI in-between frames
+    /// need it before it is due). Call after a tick, which fills the queue.
+    pub fn peek_front(&self) -> Option<&Frame> {
+        self.queue.front()
+    }
+
+    /// The media time a frame drawn now is SEEN at: what tick_ahead picks
+    /// for, with the same lead cap.
+    pub fn seen_at(&self, lead: Duration) -> Duration {
+        self.master.now() + lead.min(self.max_lead()) + self.display_latency
+    }
+
     /// Hand a presented frame's planes back for reuse.
     pub fn recycle(&self, frame: Frame) {
         self.pool.recycle(frame);

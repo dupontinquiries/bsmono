@@ -80,17 +80,20 @@ pub struct Prefs {
     /// control setting kept across runs (a couch mouse is a fact about the
     /// room, not the session).
     pub pointer_deadzone: u8,
+    /// Settings > frame rate > AI in-between frames (experimental). Kept so
+    /// it can be tried across runs on the device.
+    pub ai_frames: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { model: ModelTier::Quick, language: LanguageMode::English, pointer_deadzone: 6 }
+        Prefs { model: ModelTier::Quick, language: LanguageMode::English, pointer_deadzone: 6, ai_frames: false }
     }
 }
 
 impl Prefs {
     pub fn to_text(&self) -> String {
-        format!("transcribe_model={}\ntranscribe_language={}\npointer_deadzone={}\n", self.model.name(), self.language.name(), self.pointer_deadzone)
+        format!("transcribe_model={}\ntranscribe_language={}\npointer_deadzone={}\nai_frames={}\n", self.model.name(), self.language.name(), self.pointer_deadzone, self.ai_frames as u8)
     }
 
     /// Unknown keys and bad values are ignored (defaults kept): a prefs file
@@ -102,6 +105,7 @@ impl Prefs {
             match k.trim() {
                 "transcribe_model" => p.model = ModelTier::parse(v.trim()).unwrap_or(p.model),
                 "transcribe_language" => p.language = LanguageMode::parse(v.trim()).unwrap_or(p.language),
+                "ai_frames" => p.ai_frames = v.trim() == "1",
                 "pointer_deadzone" => p.pointer_deadzone = v.trim().parse::<u8>().map(|n| n.min(40)).unwrap_or(p.pointer_deadzone),
                 _ => {}
             }
@@ -184,10 +188,10 @@ mod tests {
 
     #[test]
     fn prefs_round_trip_and_survive_junk() {
-        let p = Prefs { model: ModelTier::Best, language: LanguageMode::EveryChunk, pointer_deadzone: 12 };
+        let p = Prefs { model: ModelTier::Best, language: LanguageMode::EveryChunk, pointer_deadzone: 12, ai_frames: true };
         assert_eq!(Prefs::from_text(&p.to_text()), p);
         let junk = Prefs::from_text("transcribe_model=gigantic\nfuture_key=1\ntranscribe_language=detect\npointer_deadzone=-3\n");
-        assert_eq!(junk, Prefs { model: ModelTier::Quick, language: LanguageMode::DetectOnce, pointer_deadzone: 6 });
+        assert_eq!(junk, Prefs { model: ModelTier::Quick, language: LanguageMode::DetectOnce, pointer_deadzone: 6, ai_frames: false });
         assert_eq!(Prefs::from_text("pointer_deadzone=200").pointer_deadzone, 40, "clamped to the slider's range");
         assert_eq!(Prefs::default().model, ModelTier::Quick, "tiny over the whole video by default");
     }
