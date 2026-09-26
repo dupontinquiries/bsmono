@@ -85,6 +85,40 @@ pub fn unwrap_vorbis_wav(b: &[u8]) -> Option<Vec<u8>> {
     (!out.is_empty()).then_some(out)
 }
 
+/// An automated clip's audio (48 kHz stereo f32le bytes): `src` read through
+/// the bake's varispeed and gain curves from its start.
+pub fn bake_pcm(b: &crate::flp_import::Bake, src: &studio_audio::SourceAudio) -> Vec<u8> {
+    let (sr, out_sr) = (src.sample_rate as f64, 48_000f64);
+    let frames = src.frames();
+    let ch = |k: usize| &src.channels[k.min(src.channels.len() - 1)];
+    let read = |c: &Vec<f32>, p: f64| -> f32 {
+        let i = p.floor();
+        if i < 0.0 || i as usize + 1 >= frames { return 0.0; }
+        let (a, t) = (i as usize, (p - i) as f32);
+        c[a] * (1.0 - t) + c[a + 1] * t
+    };
+    let curve = |v: &Vec<(f64, f64)>, t: f64| -> f64 {
+        let k = t / crate::flp_import::BAKE_STEP;
+        let i = (k.floor() as usize).min(v.len().saturating_sub(1));
+        let j = (i + 1).min(v.len().saturating_sub(1));
+        let u = (k - k.floor()).clamp(0.0, 1.0);
+        v.get(i).map(|a| a.1).unwrap_or(0.0) * (1.0 - u) + v.get(j).map(|b| b.1).unwrap_or(0.0) * u
+    };
+    let gains: Vec<(f64, f64)> = b.gain.iter().map(|(t, g)| (*t, *g as f64)).collect();
+    let n = (b.len * out_sr).round() as usize;
+    let mut pcm: Vec<u8> = Vec::with_capacity(n * 8);
+    let mut pos = b.start * sr;
+    for k in 0..n {
+        let t = k as f64 / out_sr;
+        let g = curve(&gains, t) as f32;
+        let (l, r) = (read(ch(0), pos) * g, read(ch(1), pos) * g);
+        pcm.extend_from_slice(&l.to_le_bytes());
+        pcm.extend_from_slice(&r.to_le_bytes());
+        pos += 2f64.powf(curve(&b.cents, t) / 1200.0) * sr / out_sr;
+    }
+    pcm
+}
+
 /// ffmpeg's `atempo` takes 0.5..=100 per stage: a ratio outside that is a
 /// CHAIN of stages whose product is the ratio (pianovibes' cool-riff, stretched
 /// 0.424 in FL, was refused outright and went missing from the song).
@@ -99,28 +133,26 @@ pub fn atempo_chain(r: f64) -> String {
 /// Make every copy the import asked for, and point sources at the .opus
 /// beside any name FL used. Problems go into the report.
 pub fn materialize(im: &mut Imported, media: &Path, probe: &dyn Fn(&str) -> Option<Media>) {
-    // FL's time-stretched audio: make each stretched copy once (atempo keeps
-    // pitch; FL's modes here are the pitch-keeping ones -- the report says).
+    // Every copy is independent: they run on every core. (One after another
+    // they were most of A Top A Tower's 3-minute import -- and each automated
+    // clip DECODED its source again: ~36 bakes of the one "Pattern 2".)
+    enum Job<'a> { Ffmpeg { input: std::path::PathBuf, af: String, kbps: &'static str, out: std::path::PathBuf, what: String }, Bake(&'a crate::flp_import::Bake) }
+    let mut jobs: Vec<Job> = Vec::new();
+    let src_of = |file: &str| media.join(opus_for(media, file).unwrap_or_else(|| file.to_string()));
+    // FL's time-stretched audio: each stretched copy once (atempo keeps pitch;
+    // FL's modes here are the pitch-keeping ones -- the report says)
     for (file, r, variant) in &im.stretches {
         let out = media.join(variant);
         if out.is_file() { continue; }
-        let input = media.join(opus_for(media, file).unwrap_or_else(|| file.clone()));
-        let ok = std::process::Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-y", "-i"]).arg(&input)
-            .args(["-filter:a", &atempo_chain(*r), "-c:a", "libopus", "-b:a", "48k"]).arg(&out)
-            .status().map(|s| s.success()).unwrap_or(false);
-        if !ok { im.report.push(format!("could not make the stretched copy {variant}")); }
+        jobs.push(Job::Ffmpeg { input: src_of(file), af: atempo_chain(*r), kbps: "48k", out, what: format!("the stretched copy {variant}") });
     }
     // VARISPEED copies: pitch and speed together (asetrate), as FL plays a
     // pitch-shifted sampler
     for (file, r, variant) in &im.varispeeds {
         let out = media.join(variant);
         if out.is_file() { continue; }
-        let input = media.join(opus_for(media, file).unwrap_or_else(|| file.clone()));
         let rate = probe(file).map(|m| m.rate).unwrap_or(48_000) as f64;
-        let ok = std::process::Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-y", "-i"]).arg(&input)
-            .args(["-af", &format!("asetrate={},aresample=48000", (rate * r).round()), "-c:a", "libopus", "-b:a", "48k"]).arg(&out)
-            .status().map(|s| s.success()).unwrap_or(false);
-        if !ok { im.report.push(format!("could not make the varispeed copy {variant}")); }
+        jobs.push(Job::Ffmpeg { input: src_of(file), af: format!("asetrate={},aresample=48000", (rate * r).round()), kbps: "48k", out, what: format!("the varispeed copy {variant}") });
     }
     // SLICES of a Fruity Slicer's recording: each trimmed exactly (atrim is
     // sample-accurate where -ss seeking in Opus is not), 96 kbps -- these are
@@ -128,56 +160,71 @@ pub fn materialize(im: &mut Imported, media: &Path, probe: &dyn Fn(&str) -> Opti
     for (file, a, b, variant) in &im.slices {
         let out = media.join(variant);
         if out.is_file() { continue; }
-        let input = media.join(opus_for(media, file).unwrap_or_else(|| file.clone()));
-        let ok = std::process::Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-y", "-i"]).arg(&input)
-            .args(["-af", &format!("atrim=start={a:.6}:end={b:.6},asetpts=N/SR/TB,aresample=48000"), "-c:a", "libopus", "-b:a", "96k"]).arg(&out)
-            .status().map(|s| s.success()).unwrap_or(false);
-        if !ok { im.report.push(format!("could not make the slice copy {variant}")); }
+        jobs.push(Job::Ffmpeg { input: src_of(file), af: format!("atrim=start={a:.6}:end={b:.6},asetpts=N/SR/TB,aresample=48000"), kbps: "96k", out, what: format!("the slice copy {variant}") });
     }
-        // AUTOMATED clips: render each through its curves -- varispeed (the file
+    // AUTOMATED clips: render each through its curves -- varispeed (the file
     // advances 2^(cents/1200) per output second) and gain -- into its own copy.
     // Always regenerated: the copy depends on the curve, not only the name.
-    for b in &im.bakes {
-        let input = media.join(opus_for(media, &b.file).unwrap_or_else(|| b.file.clone()));
-        let Ok(src) = studio_media::decode_file(&input) else { im.report.push(format!("could not decode {} to render {}", b.file, b.variant)); continue };
-        let (sr, out_sr) = (src.sample_rate as f64, 48_000f64);
-        let frames = src.frames();
-        let ch = |k: usize| &src.channels[k.min(src.channels.len() - 1)];
-        let read = |c: &Vec<f32>, p: f64| -> f32 {
-            let i = p.floor();
-            if i < 0.0 || i as usize + 1 >= frames { return 0.0; }
-            let (a, t) = (i as usize, (p - i) as f32);
-            c[a] * (1.0 - t) + c[a + 1] * t
-        };
-        let curve = |v: &Vec<(f64, f64)>, t: f64| -> f64 {
-            let k = t / crate::flp_import::BAKE_STEP;
-            let i = (k.floor() as usize).min(v.len().saturating_sub(1));
-            let j = (i + 1).min(v.len().saturating_sub(1));
-            let u = (k - k.floor()).clamp(0.0, 1.0);
-            v.get(i).map(|a| a.1).unwrap_or(0.0) * (1.0 - u) + v.get(j).map(|b| b.1).unwrap_or(0.0) * u
-        };
-        let gains: Vec<(f64, f64)> = b.gain.iter().map(|(t, g)| (*t, *g as f64)).collect();
-        let n = (b.len * out_sr).round() as usize;
-        let mut pcm: Vec<u8> = Vec::with_capacity(n * 8);
-        let mut pos = b.start * sr;
-        for k in 0..n {
-            let t = k as f64 / out_sr;
-            let g = curve(&gains, t) as f32;
-            let (l, r) = (read(ch(0), pos) * g, read(ch(1), pos) * g);
-            pcm.extend_from_slice(&l.to_le_bytes());
-            pcm.extend_from_slice(&r.to_le_bytes());
-            pos += 2f64.powf(curve(&b.cents, t) / 1200.0) * sr / out_sr;
+    for b in &im.bakes { jobs.push(Job::Bake(b)); }
+    // each bake SOURCE decoded once, shared
+    let mut files: Vec<&str> = im.bakes.iter().map(|b| b.file.as_str()).collect();
+    files.sort(); files.dedup();
+    let decoded: BTreeMap<&str, Option<studio_audio::SourceAudio>> = {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(files.len()).max(1);
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..n).map(|_| sc.spawn(|| {
+                let mut mine = Vec::new();
+                while let Some(f) = files.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                    mine.push((*f, studio_media::decode_file(&src_of(f)).ok()));
+                }
+                mine
+            })).collect();
+            hs.into_iter().flat_map(|h| h.join().expect("a decode thread")).collect()
+        })
+    };
+    let run = |job: &Job| -> Option<String> {
+        match job {
+            Job::Ffmpeg { input, af, kbps, out, what } => {
+                let ok = std::process::Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-y", "-i"]).arg(input)
+                    .args(["-af", af, "-c:a", "libopus", "-b:a", kbps]).arg(out)
+                    .status().map(|s| s.success()).unwrap_or(false);
+                (!ok).then(|| format!("could not make {what}"))
+            }
+            Job::Bake(b) => {
+                let Some(Some(src)) = decoded.get(b.file.as_str()) else { return Some(format!("could not decode {} to render {}", b.file, b.variant)) };
+                let pcm = bake_pcm(b, src);
+                let out = media.join(&b.variant);
+                let mut child = std::process::Command::new("ffmpeg")
+                    .args(["-nostdin", "-v", "error", "-y", "-f", "f32le", "-ar", "48000", "-ac", "2", "-i", "-", "-c:a", "libopus", "-b:a", "96k"]).arg(&out)
+                    .stdin(std::process::Stdio::piped()).spawn().expect("ffmpeg");
+                {
+                    use std::io::Write;
+                    let _ = child.stdin.take().expect("stdin").write_all(&pcm);
+                }
+                (!child.wait().map(|s| s.success()).unwrap_or(false)).then(|| format!("could not write the automated copy {}", b.variant))
+            }
         }
-        let out = media.join(&b.variant);
-        let mut child = std::process::Command::new("ffmpeg")
-            .args(["-nostdin", "-v", "error", "-y", "-f", "f32le", "-ar", "48000", "-ac", "2", "-i", "-", "-c:a", "libopus", "-b:a", "96k"]).arg(&out)
-            .stdin(std::process::Stdio::piped()).spawn().expect("ffmpeg");
-        {
-            use std::io::Write;
-            let _ = child.stdin.take().expect("stdin").write_all(&pcm);
-        }
-        if !child.wait().map(|s| s.success()).unwrap_or(false) { im.report.push(format!("could not write the automated copy {}", b.variant)); }
-    }
+    };
+    let problems: Vec<String> = {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(jobs.len()).max(1);
+        let mut out: Vec<(usize, String)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..n).map(|_| sc.spawn(|| {
+                let mut mine = Vec::new();
+                loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(j) = jobs.get(k) else { break };
+                    if let Some(p) = run(j) { mine.push((k, p)); }
+                }
+                mine
+            })).collect();
+            hs.into_iter().flat_map(|h| h.join().expect("a copy thread")).collect()
+        });
+        out.sort(); // the report in the jobs' order, whatever finished first
+        out.into_iter().map(|(_, p)| p).collect()
+    };
+    im.report.extend(problems);
     let mut swapped = 0;
     for src in im.project.sources.values_mut() {
         if let Some(o) = opus_for(media, &src.path) { if o != src.path { src.path = o; src.sample_rate = 48_000; swapped += 1; } }
