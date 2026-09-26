@@ -44,6 +44,8 @@ fn nv12(w: u32, h: u32, y: impl Fn(u32, u32) -> u8) -> Frame {
 struct Case {
     /// Run sharpening as the old two-pass (offscreen) path, for comparison.
     two_pass: bool,
+    /// AV1 film grain to apply on the GPU before conversion.
+    grain: Option<vidkit_core::av1_grain::GrainParams>,
     name: &'static str,
     /// The frame checked against. Multi-frame cases upload `history` first,
     /// one per update, then this.
@@ -271,6 +273,70 @@ fn i420(w: u32, h: u32) -> Frame {
     }
 }
 
+/// Film grain parameters shaped like SVT-AV1's (lag 3, overlap, all planes).
+fn grain_params() -> vidkit_core::av1_grain::GrainParams {
+    let mut y = [0i8; 24];
+    for (i, c) in y.iter_mut().enumerate() {
+        *c = ((i as i32 * 7) % 19 - 9) as i8;
+    }
+    let mut uv = [[0i8; 25]; 2];
+    for i in 0..25 {
+        uv[0][i] = ((i as i32 * 5) % 17 - 8) as i8;
+        uv[1][i] = ((i as i32 * 3) % 13 - 6) as i8;
+    }
+    vidkit_core::av1_grain::GrainParams {
+        seed: 20915,
+        // Strong grain: at weak amplitudes a wrong overlap weight rarely
+        // flips a rounded sample, and the test could not see it.
+        y_points: vec![[0, 180], [54, 200], [134, 220], [255, 255]],
+        cb_points: vec![[0, 200], [81, 230], [255, 255]],
+        cr_points: vec![[0, 190], [134, 210], [255, 240]],
+        chroma_scaling_from_luma: false,
+        scaling_shift: 8,
+        ar_coeff_lag: 3,
+        ar_coeffs_y: y,
+        ar_coeffs_uv: uv,
+        ar_coeff_shift: 7,
+        grain_scale_shift: 0,
+        uv_mult: [0, 0],
+        uv_luma_mult: [64, 64],
+        uv_offset: [0, 0],
+        overlap: true,
+        clip_to_restricted_range: false,
+    }
+}
+
+/// GPU-grained output vs the CPU reference: grain applied by vidkit-core
+/// (byte-identical to dav1d), then the CPU converter.
+fn check_grain(f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String, String> {
+    let FrameData::Cpu(pl) = &f.data else { return Err("not cpu".into()) };
+    let (mut y, mut u, mut v) = (pl.data[0].clone(), pl.data[1].clone(), pl.data[2].clone());
+    vidkit_core::av1_grain::apply_i420(&grain_params(), &mut y, &mut u, &mut v, w as usize, h as usize, false);
+    let grained = CpuPlanes { data: vec![y, u, v], strides: pl.strides.clone() };
+    let cpu = vidkit_core::planes_to_rgba8(&grained, f.layout, f.color, w as usize, h as usize).map_err(|e| e.to_string())?;
+    let plain = vidkit_core::planes_to_rgba8(pl, f.layout, f.color, w as usize, h as usize).map_err(|e| e.to_string())?;
+    let mut worst = 0u8;
+    for (i, p) in got.iter().enumerate() {
+        for c in 0..3 {
+            worst = worst.max(p[c].abs_diff(cpu[i * 4 + c]));
+        }
+    }
+    let changed = (0..got.len()).filter(|&i| (0..3).any(|c| cpu[i * 4 + c] != plain[i * 4 + c])).count();
+    // A COARSE wiring check (the grained textures reach the conversion),
+    // not the grain check: the grain itself is compared EXACTLY on the
+    // planes ("grain planes exact"). Here the texture unit's fixed-point
+    // bilinear chroma weights meet strong, high-frequency grained chroma --
+    // measured 3/255 on correct planes -- and one chroma code becomes ~2 RGB
+    // codes through the x2.02 blue coefficient.
+    if worst > 4 {
+        Err(format!("max error {worst}/255 against the CPU grain reference"))
+    } else if changed * 2 < got.len() {
+        Err(format!("grain changed only {changed} of {} pixels: the fixture is not exercising it", got.len()))
+    } else {
+        Ok(format!("max error {worst}/255, grain on {changed} of {} pixels", got.len()))
+    }
+}
+
 /// GPU vs vidkit-core's CPU converter on the whole frame.
 fn check_vs_cpu(f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String, String> {
     let FrameData::Cpu(pl) = &f.data else { return Err("not cpu".into()) };
@@ -305,6 +371,7 @@ fn cases() -> Vec<Case> {
     vec![
         Case {
             two_pass: false,
+            grain: None,
             name: "temporal denoise, board",
             frame: at_pts(noisy_board(9), 9),
             history: (0..9).map(|i| at_pts(noisy_board(i), i as usize)).collect(),
@@ -314,6 +381,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             two_pass: false,
+            grain: None,
             name: "temporal, no ghosting",
             frame: at_pts(square_at(40), 8),
             history: (0..8).map(|i| at_pts(square_at(8), i)).collect(),
@@ -321,14 +389,15 @@ fn cases() -> Vec<Case> {
             out: (64, 48),
             check: check_no_ghost,
         },
-        Case { two_pass: false, name: "HDR10 PQ, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Pq), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
-        Case { two_pass: false, name: "HLG, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Hlg), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
-        Case { two_pass: false, name: "I420, three planes", history: vec![], frame: i420(64, 48), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
-        Case { two_pass: false, name: "plain conversion", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance::default(), out: (64, 48), check: check_plain },
-        Case { two_pass: true, name: "RCAS two-pass (offscreen)", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
-        Case { two_pass: false, name: "RCAS fused (one pass)", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
-        Case { two_pass: false, name: "bicubic 2x on a ramp", history: vec![], frame: nv12(32, 16, |x, _| (40 + x * 4) as u8), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_ramp },
-        Case { two_pass: false, name: "bicubic 2x on a step", history: vec![], frame: nv12(32, 16, |x, _| if x < 16 { 60 } else { 200 }), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_step_overshoot },
+        Case { two_pass: false, grain: None, name: "HDR10 PQ, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Pq), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
+        Case { two_pass: false, grain: None, name: "HLG, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Hlg), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
+        Case { two_pass: false, grain: Some(grain_params()), name: "AV1 film grain", history: vec![], frame: i420(256, 160), enhance: Enhance::default(), out: (256, 160), check: check_grain },
+        Case { two_pass: false, grain: None, name: "I420, three planes", history: vec![], frame: i420(64, 48), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
+        Case { two_pass: false, grain: None, name: "plain conversion", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance::default(), out: (64, 48), check: check_plain },
+        Case { two_pass: true, grain: None, name: "RCAS two-pass (offscreen)", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
+        Case { two_pass: false, grain: None, name: "RCAS fused (one pass)", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
+        Case { two_pass: false, grain: None, name: "bicubic 2x on a ramp", history: vec![], frame: nv12(32, 16, |x, _| (40 + x * 4) as u8), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_ramp },
+        Case { two_pass: false, grain: None, name: "bicubic 2x on a step", history: vec![], frame: nv12(32, 16, |x, _| if x < 16 { 60 } else { 200 }), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_step_overshoot },
     ]
 }
 
@@ -386,9 +455,31 @@ impl eframe::App for SelfTest {
             if let (Ok(mut g), Some(gl)) = (gpu.lock(), frame.gl()) {
                 g.enhance = c.enhance;
                 g.fused_rcas = !c.two_pass;
+                g.grain_params = c.grain.clone();
                 if let Err(e) = unsafe { g.upload(gl, f) } {
                     println!("GPU SELFTEST FAIL: upload: {e}");
                     std::process::exit(1);
+                }
+                // The grain stage itself, exactly: the GPU's grained planes
+                // against vidkit-core's reference (byte-identical to dav1d).
+                if c.grain.is_some() {
+                    if let (Some((gy, gc)), FrameData::Cpu(pl)) = (unsafe { g.read_grain_planes(gl) }, &f.data) {
+                        let (w, h) = (f.width as usize, f.height as usize);
+                        let (mut y, mut u, mut v) = (pl.data[0].clone(), pl.data[1].clone(), pl.data[2].clone());
+                        vidkit_core::av1_grain::apply_i420(c.grain.as_ref().unwrap(), &mut y, &mut u, &mut v, w, h, false);
+                        let bad_y: Vec<(usize, usize, u8, u8)> = (0..w * h).filter(|&i| gy[i] != y[i]).map(|i| (i % w, i / w, gy[i], y[i])).collect();
+                        let cw = w.div_ceil(2);
+                        let bad_c: Vec<(usize, usize, usize, u8, u8)> = (0..u.len()).flat_map(|i| [(0, i), (1, i)]).filter(|&(k, i)| gc[i * 2 + k] != if k == 0 { u[i] } else { v[i] }).map(|(k, i)| (k, i % cw, i / cw, gc[i * 2 + k], if k == 0 { u[i] } else { v[i] })).collect();
+                        if bad_y.is_empty() && bad_c.is_empty() {
+                            println!("  ok   grain planes exact      {}x{} luma + chroma byte-identical to the CPU reference", w, h);
+                        } else {
+                            println!("  FAIL grain planes exact      luma {} / chroma {} samples differ; first {:?} {:?}", bad_y.len(), bad_c.len(), bad_y.first(), bad_c.first());
+                            self.failed = true;
+                        }
+                    } else {
+                        println!("  FAIL grain planes exact      the GPU grain pass did not run");
+                        self.failed = true;
+                    }
                 }
             }
         }

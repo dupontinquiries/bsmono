@@ -2905,6 +2905,7 @@ name = "vidkit-vacc"
 version = "0.1.0"
 dependencies = [
  "vacc-core",
+ "vacc-parser",
  "vacc-software-decode",
  "vacc-vulkan-decode",
  "vidkit-core",

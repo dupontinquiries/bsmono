@@ -1314,7 +1314,8 @@ fn main() -> eframe::Result<()> {
 
     if first.as_deref() == Some("--gpu-selftest") {
         let opts = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([200.0, 140.0]),
+            // Room for the largest case (256x160 grain) at (20, 20).
+            viewport: egui::ViewportBuilder::default().with_inner_size([300.0, 200.0]),
             renderer: eframe::Renderer::Glow,
             ..Default::default()
         };

@@ -380,6 +380,130 @@ void main() {
 }
 "#;
 
+/// AV1 film grain, applied on the GPU at SOURCE resolution: a mirror of
+/// vidkit-core's av1_grain::grain_at / luma_grain / chroma_grain (itself
+/// rav1d's port of dav1d, byte-identical to dav1d -- vidkit-vacc's oracle
+/// test). mode 0 writes grained luma (R8, luma size); mode 1 writes grained
+/// cb,cr (RG8, chroma size) from the UNGRAINED luma, as the spec requires.
+/// No variable-amount shifts (the AGX miscompile, ASAHI_VULKAN_LESSONS K2):
+/// round2 by the scaling shift is a floor division by a uniform power of two.
+const GRAIN_FRAG: &str = r#"
+precision highp float;
+precision highp int;
+in vec2 uv;
+out vec4 frag;
+uniform sampler2D src_y;
+uniform sampler2D src_c1;      // U (planar) or UV (interleaved)
+uniform sampler2D src_c2;      // V (planar)
+uniform int src_planar;
+uniform sampler2D lut;         // 82 x 219: templates y, cb, cr stacked; value + 128
+uniform sampler2D scaling;     // 256 x 3
+uniform sampler2D offs;        // one byte per 32x32 luma block
+uniform ivec2 luma_size;
+uniform int mode;
+uniform int scaling_pow2;
+uniform int overlap;
+uniform int clip_rr;
+uniform int identity;
+uniform ivec3 has;             // luma, cb, cr points present
+uniform int csfl;
+uniform ivec2 uv_mult;
+uniform ivec2 uv_luma_mult;
+uniform ivec2 uv_offset;
+
+int byte_at(sampler2D t, ivec2 p) { return int(texelFetch(t, p, 0).r * 255.0 + 0.5); }
+int floor_div(int a, int b) { int q = a / b; return (q * b > a) ? q - 1 : q; }
+int round2c(int x, int shift_pow2) { return floor_div(x + shift_pow2 / 2, shift_pow2); }
+
+int sample_lut(int k, int rv, int subx, int suby, int bxf, int byf, int x, int y) {
+    int offx = 3 + (subx == 1 ? 1 : 2) * (3 + rv / 16);
+    int offy = 3 + (suby == 1 ? 1 : 2) * (3 + (rv - (rv / 16) * 16));
+    int bsx = subx == 1 ? 16 : 32;
+    int bsy = suby == 1 ? 16 : 32;
+    return byte_at(lut, ivec2(offx + x + bsx * bxf, k * 73 + offy + y + bsy * byf)) - 128;
+}
+
+int mixw(int old_v, int new_v, int w0, int w1) { return clamp(round2c(old_v * w0 + new_v * w1, 32), -128, 127); }
+
+int grain_at(int k, int sub, int px, int py, int pw) {
+    int bs = sub == 1 ? 16 : 32;
+    int col = px / bs, row = py / bs;
+    int x = px - col * bs, y = py - row * bs;
+    int cols = (luma_size.x + 31) / 32;
+    int bh = min(luma_size.y - row * 32, 32);
+    if (sub == 1) bh = (bh + 1) / 2;
+    int bw = min(pw - col * bs, bs);
+    int ystart = (overlap == 1 && row > 0) ? min(sub == 1 ? 1 : 2, bh) : 0;
+    int xstart = (overlap == 1 && col > 0) ? min(sub == 1 ? 1 : 2, bw) : 0;
+    int o00 = byte_at(offs, ivec2(col, row));
+    int o10 = col > 0 ? byte_at(offs, ivec2(col - 1, row)) : 0;
+    int o01 = row > 0 ? byte_at(offs, ivec2(col, row - 1)) : 0;
+    int o11 = (col > 0 && row > 0) ? byte_at(offs, ivec2(col - 1, row - 1)) : 0;
+    // W[sub][i]: [[27,17],[17,27]] or, subsampled, [[23,22],..].
+    int wx0 = sub == 1 ? 23 : (x == 0 ? 27 : 17);
+    int wx1 = sub == 1 ? 22 : (x == 0 ? 17 : 27);
+    int wy0 = sub == 1 ? 23 : (y == 0 ? 27 : 17);
+    int wy1 = sub == 1 ? 22 : (y == 0 ? 17 : 27);
+    int s00 = sample_lut(k, o00, sub, sub, 0, 0, x, y);
+    bool oy = y < ystart, ox = x < xstart;
+    if (!oy && !ox) return s00;
+    if (!oy && ox) return mixw(sample_lut(k, o10, sub, sub, 1, 0, x, y), s00, wx0, wx1);
+    if (oy && !ox) return mixw(sample_lut(k, o01, sub, sub, 0, 1, x, y), s00, wy0, wy1);
+    int top = mixw(sample_lut(k, o11, sub, sub, 1, 1, x, y), sample_lut(k, o01, sub, sub, 0, 1, x, y), wx0, wx1);
+    int cur = mixw(sample_lut(k, o10, sub, sub, 1, 0, x, y), s00, wx0, wx1);
+    return mixw(top, cur, wy0, wy1);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    if (mode == 0) {
+        int src = byte_at(src_y, p);
+        int v = src;
+        if (has.x == 1) {
+            int g = grain_at(0, 0, p.x, p.y, luma_size.x);
+            int noise = round2c(byte_at(scaling, ivec2(src, 0)) * g, scaling_pow2);
+            v = clamp(src + noise, clip_rr == 1 ? 16 : 0, clip_rr == 1 ? 235 : 255);
+        }
+        frag = vec4(float(v) / 255.0, 0.0, 0.0, 1.0);
+        return;
+    }
+    int cw = (luma_size.x + 1) / 2;
+    int l0 = byte_at(src_y, ivec2(min(2 * p.x, luma_size.x - 1), 2 * p.y));
+    int l1 = byte_at(src_y, ivec2(min(2 * p.x + 1, luma_size.x - 1), 2 * p.y));
+    int avg = (l0 + l1 + 1) / 2;
+    int out_c[2];
+    for (int k = 0; k < 2; k++) {
+        int src = src_planar == 1
+            ? (k == 0 ? byte_at(src_c1, p) : byte_at(src_c2, p))
+            : int(texelFetch(src_c1, p, 0)[k] * 255.0 + 0.5);
+        bool on = (k == 0 ? has.y == 1 : has.z == 1) || csfl == 1;
+        int v = src;
+        if (on) {
+            int g = grain_at(1 + k, 1, p.x, p.y, cw);
+            int val = avg;
+            if (csfl == 0) {
+                int combined = avg * uv_luma_mult[k] + src * uv_mult[k];
+                val = clamp(floor_div(combined, 64) + uv_offset[k], 0, 255);
+            }
+            int tbl = csfl == 1 ? 0 : 1 + k;
+            int noise = round2c(byte_at(scaling, ivec2(val, tbl)) * g, scaling_pow2);
+            v = clamp(src + noise, clip_rr == 1 ? 16 : 0, clip_rr == 1 ? (identity == 1 ? 235 : 240) : 255);
+        }
+        out_c[k] = v;
+    }
+    frag = vec4(float(out_c[0]) / 255.0, float(out_c[1]) / 255.0, 0.0, 1.0);
+}
+"#;
+
+struct GrainGl {
+    lut: glow::Texture,
+    scaling: glow::Texture,
+    offs: glow::Texture,
+    y: (glow::Framebuffer, glow::Texture),
+    c: (glow::Framebuffer, glow::Texture),
+    size: (u32, u32),
+}
+
 /// Temporal denoise strength: threshold (0..1 luma) and blend weight.
 pub const TEMPORAL_THR: f32 = 8.0 / 255.0;
 pub const TEMPORAL_K: f32 = 0.2;
@@ -475,6 +599,14 @@ pub struct Nv12Gpu {
     /// Default on; false uses the two-pass path.
     pub fused_rcas: bool,
     temporal_prog: glow::Program,
+    grain_prog: glow::Program,
+    /// AV1 film grain for the NEXT uploaded frame (8-bit); None = no grain.
+    /// Set by the caller from the stream's frame headers.
+    pub grain_params: Option<vidkit_core::av1_grain::GrainParams>,
+    /// Tables (lut, scaling, offsets) and targets (grained luma, grained
+    /// chroma) with their size, created on first use.
+    grain_gl: Option<GrainGl>,
+    grain_valid: bool,
     /// Ping-pong running averages at source size, and which is current.
     acc: Option<([(glow::Framebuffer, glow::Texture); 2], (u32, u32))>,
     acc_cur: usize,
@@ -511,6 +643,7 @@ impl Nv12Gpu {
         let program = link(gl, version, FRAG)?;
         let rcas = link(gl, version, RCAS_FRAG)?;
         let temporal_prog = link(gl, version, TEMPORAL_FRAG)?;
+        let grain_prog = link(gl, version, GRAIN_FRAG)?;
 
         let vao = gl.create_vertex_array()?;
         let tex_y = gl.create_texture()?;
@@ -533,6 +666,10 @@ impl Nv12Gpu {
             enhance: Enhance::default(),
             fused_rcas: std::env::var("VIDKIT_RCAS_TWO_PASS").as_deref() != Ok("1"),
             temporal_prog,
+            grain_prog,
+            grain_params: None,
+            grain_gl: None,
+            grain_valid: false,
             acc: None,
             acc_cur: 0,
             acc_valid: false,
@@ -665,7 +802,13 @@ impl Nv12Gpu {
         self.size = (w, h);
         self.layout = frame.layout;
         self.color = frame.color;
-        if self.enhance.temporal {
+        self.grain_valid = false;
+        if let Some(p) = self.grain_params.clone() {
+            if matches!(frame.layout, PlaneLayout::Nv12 | PlaneLayout::I420) {
+                self.grain_pass(gl, &p, w, h);
+            }
+        }
+        if self.enhance.temporal && !self.grain_valid {
             // A seek, a jump or a size change restarts the average: blending
             // across a cut is exactly the ghost the threshold exists to stop.
             let jump = match self.last_pts {
@@ -683,6 +826,142 @@ impl Nv12Gpu {
         self.uploads += 1;
         self.uploaded_bytes += upload_bytes(frame.layout, w as usize, h as usize) as u64;
         Ok(())
+    }
+
+    /// One R8/RG8 texture with nearest filtering, optionally filled.
+    unsafe fn small_tex(gl: &glow::Context, internal: u32, format: u32, w: i32, h: i32, data: Option<&[u8]>) -> Result<glow::Texture, String> {
+        let t = gl.create_texture()?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(t));
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        gl.tex_image_2d(glow::TEXTURE_2D, 0, internal as i32, w, h, 0, format, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(data));
+        for (k, v) in [(glow::TEXTURE_MIN_FILTER, glow::NEAREST), (glow::TEXTURE_MAG_FILTER, glow::NEAREST), (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE), (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE)] {
+            gl.tex_parameter_i32(glow::TEXTURE_2D, k, v as i32);
+        }
+        Ok(t)
+    }
+
+    unsafe fn target_tex(gl: &glow::Context, internal: u32, format: u32, w: i32, h: i32) -> Result<(glow::Framebuffer, glow::Texture), String> {
+        let t = Self::small_tex(gl, internal, format, w, h, None)?;
+        // Sampled by the conversion pass: linear, like the plane textures.
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        let fb = gl.create_framebuffer()?;
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fb));
+        gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(t), 0);
+        if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
+            return Err("grain target incomplete".into());
+        }
+        Ok((fb, t))
+    }
+
+    /// AV1 film grain on the GPU, once per decoded frame: tables from
+    /// vidkit-core's CPU reference (templates are serial but tiny), the per-
+    /// pixel work in GRAIN_FRAG. Leaves egui's GL state as it found it. On
+    /// any GL failure the frame is shown ungrained rather than not at all.
+    unsafe fn grain_pass(&mut self, gl: &glow::Context, p: &vidkit_core::av1_grain::GrainParams, w: u32, h: u32) {
+        use vidkit_core::av1_grain::{block_offsets, prepare, GRAIN_H, GRAIN_W};
+        let g = prepare(p, true, true);
+        let (cols, rows, offs) = block_offsets(p, w as usize, h as usize);
+        let mut lut = Vec::with_capacity(GRAIN_W * GRAIN_H * 3);
+        for plane in g.lut.iter() {
+            for row in plane.iter() {
+                lut.extend(row.iter().map(|&v| (v as i32 + 128) as u8));
+            }
+        }
+        let scaling: Vec<u8> = g.scaling.iter().flat_map(|r| r.iter().copied()).collect();
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let prev_fb = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
+        let mut vp = [0i32; 4];
+        gl.get_parameter_i32_slice(glow::VIEWPORT, &mut vp);
+        let scissor = gl.is_enabled(glow::SCISSOR_TEST);
+        let ok = (|| -> Result<(), String> {
+            if self.grain_gl.as_ref().is_some_and(|g| g.size != (w, h)) {
+                if let Some(old) = self.grain_gl.take() {
+                    for t in [old.lut, old.scaling, old.offs, old.y.1, old.c.1] {
+                        gl.delete_texture(t);
+                    }
+                    gl.delete_framebuffer(old.y.0);
+                    gl.delete_framebuffer(old.c.0);
+                }
+            }
+            if self.grain_gl.is_none() {
+                self.grain_gl = Some(GrainGl {
+                    lut: Self::small_tex(gl, glow::R8, glow::RED, GRAIN_W as i32, (GRAIN_H * 3) as i32, None)?,
+                    scaling: Self::small_tex(gl, glow::R8, glow::RED, 256, 3, None)?,
+                    offs: Self::small_tex(gl, glow::R8, glow::RED, cols as i32, rows as i32, None)?,
+                    y: Self::target_tex(gl, glow::R8, glow::RED, w as i32, h as i32)?,
+                    c: Self::target_tex(gl, glow::RG8, glow::RG, cw as i32, ch as i32)?,
+                    size: (w, h),
+                });
+            }
+            let gg = self.grain_gl.as_ref().ok_or("no grain targets")?;
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+            for (tex, tw, th, data) in [(gg.lut, GRAIN_W as i32, (GRAIN_H * 3) as i32, &lut), (gg.scaling, 256, 3, &scaling), (gg.offs, cols as i32, rows as i32, &offs)] {
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, tw, th, glow::RED, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(data)));
+            }
+            gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::BLEND);
+            gl.disable(glow::DEPTH_TEST);
+            gl.use_program(Some(self.grain_prog));
+            gl.bind_vertex_array(Some(self.vao));
+            let pr = self.grain_prog;
+            let u = |n: &str| gl.get_uniform_location(pr, n);
+            for (unit, tex, name) in [(0, self.tex_y, "src_y"), (1, self.tex_uv, "src_c1"), (2, self.tex_v, "src_c2"), (3, gg.lut, "lut"), (4, gg.scaling, "scaling"), (5, gg.offs, "offs")] {
+                gl.active_texture(glow::TEXTURE0 + unit);
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                if let Some(l) = u(name) { gl.uniform_1_i32(Some(&l), unit as i32); }
+            }
+            let set_i = |n: &str, v: i32| if let Some(l) = u(n) { gl.uniform_1_i32(Some(&l), v); };
+            set_i("src_planar", (self.layout == PlaneLayout::I420) as i32);
+            set_i("scaling_pow2", 1 << p.scaling_shift);
+            set_i("overlap", p.overlap as i32);
+            set_i("clip_rr", p.clip_to_restricted_range as i32);
+            set_i("identity", 0);
+            set_i("csfl", p.chroma_scaling_from_luma as i32);
+            if let Some(l) = u("luma_size") { gl.uniform_2_i32(Some(&l), w as i32, h as i32); }
+            if let Some(l) = u("has") { gl.uniform_3_i32(Some(&l), !p.y_points.is_empty() as i32, !p.cb_points.is_empty() as i32, !p.cr_points.is_empty() as i32); }
+            if let Some(l) = u("uv_mult") { gl.uniform_2_i32(Some(&l), p.uv_mult[0], p.uv_mult[1]); }
+            if let Some(l) = u("uv_luma_mult") { gl.uniform_2_i32(Some(&l), p.uv_luma_mult[0], p.uv_luma_mult[1]); }
+            if let Some(l) = u("uv_offset") { gl.uniform_2_i32(Some(&l), p.uv_offset[0], p.uv_offset[1]); }
+            for (mode, (fb, _), tw, th) in [(0, gg.y, w, h), (1, gg.c, cw, ch)] {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fb));
+                gl.viewport(0, 0, tw as i32, th as i32);
+                set_i("mode", mode);
+                gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            }
+            gl.bind_vertex_array(None);
+            Ok(())
+        })();
+        let fb = std::num::NonZeroU32::new(prev_fb as u32).map(glow::NativeFramebuffer);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, fb);
+        gl.viewport(vp[0], vp[1], vp[2], vp[3]);
+        if scissor {
+            gl.enable(glow::SCISSOR_TEST);
+        }
+        self.grain_valid = ok.is_ok();
+    }
+
+    /// The grained planes as the GPU produced them: (luma, interleaved
+    /// chroma), for tests comparing against the CPU reference.
+    ///
+    /// # Safety
+    /// `gl` must be current.
+    pub unsafe fn read_grain_planes(&self, gl: &glow::Context) -> Option<(Vec<u8>, Vec<u8>)> {
+        let g = self.grain_gl.as_ref().filter(|_| self.grain_valid)?;
+        let (w, h) = g.size;
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let prev = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
+        gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+        let mut y = vec![0u8; (w * h * 4) as usize];
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(g.y.0));
+        gl.read_pixels(0, 0, w as i32, h as i32, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut y)));
+        let mut c = vec![0u8; (cw * ch * 4) as usize];
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(g.c.0));
+        gl.read_pixels(0, 0, cw as i32, ch as i32, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut c)));
+        gl.bind_framebuffer(glow::FRAMEBUFFER, std::num::NonZeroU32::new(prev as u32).map(glow::NativeFramebuffer));
+        Some((y.chunks_exact(4).map(|p| p[0]).collect(), c.chunks_exact(4).flat_map(|p| [p[0], p[1]]).collect()))
     }
 
     /// The two running-average textures at `w x h`: R16F where the driver
@@ -780,13 +1059,15 @@ impl Nv12Gpu {
         gl.bind_vertex_array(Some(self.vao));
         gl.active_texture(glow::TEXTURE0);
         // The running average in place of the raw luma when denoising.
-        let luma = match (&self.acc, self.enhance.temporal && self.acc_valid) {
-            (Some((pair, _)), true) => pair[self.acc_cur].1,
+        let grained = self.grain_valid.then(|| self.grain_gl.as_ref()).flatten();
+        let luma = match (grained, &self.acc, self.enhance.temporal && self.acc_valid) {
+            (Some(g), _, _) => g.y.1,
+            (None, Some((pair, _)), true) => pair[self.acc_cur].1,
             _ => self.tex_y,
         };
         gl.bind_texture(glow::TEXTURE_2D, Some(luma));
         gl.active_texture(glow::TEXTURE1);
-        gl.bind_texture(glow::TEXTURE_2D, Some(self.tex_uv));
+        gl.bind_texture(glow::TEXTURE_2D, Some(grained.map(|g| g.c.1).unwrap_or(self.tex_uv)));
         let p = self.program;
         let u = |n: &str| gl.get_uniform_location(p, n);
         if let Some(l) = u("plane_y") { gl.uniform_1_i32(Some(&l), 0); }
@@ -794,7 +1075,8 @@ impl Nv12Gpu {
         gl.active_texture(glow::TEXTURE2);
         gl.bind_texture(glow::TEXTURE_2D, Some(self.tex_v));
         if let Some(l) = u("plane_v") { gl.uniform_1_i32(Some(&l), 2); }
-        if let Some(l) = u("planar") { gl.uniform_1_i32(Some(&l), (self.layout == PlaneLayout::I420) as i32); }
+        // Grained chroma is written interleaved (RG), whatever the source.
+        if let Some(l) = u("planar") { gl.uniform_1_i32(Some(&l), (self.layout == PlaneLayout::I420 && !self.grain_valid) as i32); }
         if let Some(l) = u("matrix_id") { gl.uniform_1_i32(Some(&l), matrix_id(self.color.matrix)); }
         if let Some(l) = u("range_id") { gl.uniform_1_i32(Some(&l), range_id(self.color.range)); }
         if let Some(l) = u("flip_y") { gl.uniform_1_f32(Some(&l), flip_y); }
@@ -930,6 +1212,14 @@ impl Nv12Gpu {
         gl.delete_program(self.program);
         gl.delete_program(self.rcas);
         gl.delete_program(self.temporal_prog);
+        gl.delete_program(self.grain_prog);
+        if let Some(g) = &self.grain_gl {
+            for t in [g.lut, g.scaling, g.offs, g.y.1, g.c.1] {
+                gl.delete_texture(t);
+            }
+            gl.delete_framebuffer(g.y.0);
+            gl.delete_framebuffer(g.c.0);
+        }
         if let Some((pair, _)) = self.acc {
             for (fb, t) in pair {
                 gl.delete_framebuffer(fb);
@@ -1043,7 +1333,7 @@ mod tests {
     /// desktop and fails on the phone.
     #[test]
     fn the_shader_source_is_es3_compatible() {
-        for src in [VERT, FRAG, RCAS_FRAG, TEMPORAL_FRAG] {
+        for src in [VERT, FRAG, RCAS_FRAG, TEMPORAL_FRAG, GRAIN_FRAG] {
             assert!(!src.contains("texture2D("), "texture2D is GLSL 1.20");
             assert!(!src.contains("varying "), "varying is GLSL 1.20");
             assert!(!src.contains("gl_FragColor"), "gl_FragColor is GLSL 1.20");

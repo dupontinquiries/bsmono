@@ -16,6 +16,7 @@
 //!   streaming patch exists.
 
 pub mod batch;
+pub mod grain;
 pub mod rap;
 
 use std::cmp::Reverse;

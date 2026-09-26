@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 vidkit-core = { path = "../vidkit-core" }
 vacc-core = { path = "../../../third_party/vacc/crates/vacc-core" }
+vacc-parser = { path = "../../../third_party/vacc/crates/vacc-parser" }
 vacc-software-decode = { path = "../../../third_party/vacc/crates/vacc-software-decode" }
 # Vulkan Video through ash. Builds without a GPU (libvulkan is loaded at
 # runtime); does not stream yet -- see third_party/vacc/VENDORED.md.
