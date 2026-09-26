@@ -9,6 +9,8 @@
 # next by ear: a render is only turned DOWN, and only if its peak is above
 # -1 dBFS (to avoid clipping the encode). Never normalized up.
 #
+# Songs render JOBS at a time (default: the core count), one core each.
+#
 # BIN_DIR holds flp-batch and examples/render_project (a release build):
 #   CARGO_TARGET_DIR=... cargo build --release -p studio-app \
 #       --bin flp-batch --example render_project
@@ -18,14 +20,22 @@ mkdir -p "$work" "$out"
 "$bin/flp-batch" "$lib" "$work" --store "$work/.store" > "$work/batch.log" 2>&1 || true
 tail -n +1 "$work/BATCH.md" | sed -n '1,40p'
 : > "$out/levels.txt"
-for proj in "$work"/*/*.studio; do
+# one song: render, measure, encode (run JOBS at a time -- one core each)
+render_one() {
+  proj=$1; out=$2; bin=$3
   name=$(basename "$proj" .studio)
   raw=$(mktemp --suffix=.f32)
-  ( cd "$(dirname "$proj")" && "$bin/examples/render_project" "$(basename "$proj")" "$raw" ) 2>&1 | grep '^timing' || true
-  peak=$(ffmpeg -nostdin -f f32le -ar 48000 -ac 2 -i "$raw" -af astats -f null - 2>&1 | grep 'Peak level dB' | tail -1 | awk '{print $NF}')
-  rms=$(ffmpeg -nostdin -f f32le -ar 48000 -ac 2 -i "$raw" -af astats -f null - 2>&1 | grep 'RMS level dB' | tail -1 | awk '{print $NF}')
+  ( cd "$(dirname "$proj")" && "$bin/examples/render_project" "$(basename "$proj")" "$raw" ) 2>&1 | grep '^timing' | sed "s/^/$name: /" || true
+  stats=$(ffmpeg -nostdin -f f32le -ar 48000 -ac 2 -i "$raw" -af astats -f null - 2>&1)
+  peak=$(grep 'Peak level dB' <<< "$stats" | tail -1 | awk '{print $NF}')
+  rms=$(grep 'RMS level dB' <<< "$stats" | tail -1 | awk '{print $NF}')
   gain=$(python3 -c "print(round(min(0.0, -1.0 - float('$peak')), 2))")
   ffmpeg -nostdin -v error -y -f f32le -ar 48000 -ac 2 -i "$raw" -af "volume=${gain}dB" -c:a libopus -b:a 160k "$out/$name.opus"
   rm -f "$raw"
-  printf '%-40s peak %7s dBFS  rms %7s dBFS  encode gain %s dB\n' "$name" "$peak" "$rms" "$gain" | tee -a "$out/levels.txt"
-done
+  printf '%-40s peak %7s dBFS  rms %7s dBFS  encode gain %s dB\n' "$name" "$peak" "$rms" "$gain" >> "$out/levels.txt"
+}
+export -f render_one
+jobs=${JOBS:-$(nproc)}
+printf '%s\0' "$work"/*/*.studio | xargs -0 -P "$jobs" -I{} bash -c 'render_one "$1" "$2" "$3"' _ {} "$out" "$bin"
+sort -o "$out/levels.txt" "$out/levels.txt"
+cat "$out/levels.txt"
