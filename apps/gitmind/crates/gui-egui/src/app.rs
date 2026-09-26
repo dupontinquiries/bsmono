@@ -291,12 +291,22 @@ impl App {
             egui::Panel::bottom("task_strip").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spinner();
+                    // The whole log, full window, from any tab: the strip is
+                    // what you see when something is running somewhere else.
+                    if ui.button("log").on_hover_text("show the whole log").clicked() {
+                        crate::show::open_overlay(ctx, "strip");
+                    }
                     let tail = self.task.log();   // Vec<String>, one entry per log line
                     let last = tail.last().map(String::as_str).unwrap_or("working…");
-                    ui.label(egui::RichText::new(last).monospace().small().weak());
+                    ui.add(egui::Label::new(egui::RichText::new(last).monospace().size(crate::show::LOG_TEXT - 1.0).weak()).truncate());
                 });
             });
             ctx.request_repaint();
+        }
+        // Drawn whether or not the task is still running: the overlay stays up
+        // to read a failure after it has finished.
+        if crate::show::overlay_open(ctx, "strip") {
+            crate::show::log_overlay(ctx, "strip", &self.task.log());
         }
 
         // The focus ring, over the page. paint_focus_ring is the module's one
