@@ -799,6 +799,7 @@ pub mod dht_join;
 
 pub mod shader_from_image;
 pub mod viewmodel;
+pub mod weapon_motion;
 pub mod voxel_model;
 pub mod wendigo;
 pub mod sabretooth;
