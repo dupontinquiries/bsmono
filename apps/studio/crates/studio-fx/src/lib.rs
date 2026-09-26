@@ -486,7 +486,7 @@ pub enum Instance {
     /// codebase's own README describes) had no way to land anywhere in
     /// `Bus.chain` at all — mirrors `chain::Module::Gain`, the same concept
     /// `Chain`'s own strip already has.
-    Gain(f32),
+    Gain(f32, f32),
     Transform(Transform),
     Color(Color),
     /// A feedback comb whose loop is low-passed — the tuned-comb voice, not a
@@ -534,7 +534,7 @@ impl Instance {
             Instance::Limiter(l) => l.process(x),
             Instance::Multiband(m) => m.process(x),
             Instance::Saturator(s) => s.process(x),
-            Instance::Gain(db) => x * from_db_pub(*db),
+            Instance::Gain(db, level) => x * from_db_pub(*db) * *level,
             Instance::Blend(..) => x, // a layer instruction: silence for audio, per the doc above
             Instance::RealTune(t) => t.process(x),
             Instance::AdaptiveSat(a) => a.process(x),
@@ -561,7 +561,7 @@ impl Instance {
     pub fn is_live_param(kind: &str, key: &str) -> bool {
         let stem = key.trim_end_matches(|c: char| c.is_ascii_digit());
         let live: &[&str] = match kind {
-            "gain" => &["db"],
+            "gain" => &["db", "level"],
             "eq" => return key != stem && matches!(stem, "freq" | "q" | "gain"),
             "compressor" => &["threshold", "ratio", "knee", "makeup"],
             "limiter" => &["ceiling"],
@@ -589,7 +589,11 @@ impl Instance {
     /// delay's damping; every other setter is rate-free.
     pub fn set_param(&mut self, key: &str, v: f32, rate: f32) -> bool {
         match self {
-            Instance::Gain(db) => { if key == "db" { *db = v; true } else { false } }
+            Instance::Gain(db, level) => match key {
+                "db" => { *db = v; true }
+                "level" => { *level = v.max(0.0); true }
+                _ => false,
+            },
             Instance::Eq(eq) => {
                 let (which, i) = match key.find(|c: char| c.is_ascii_digit()) {
                     Some(n) => (&key[..n], key[n..].parse::<usize>().ok()),
@@ -762,7 +766,7 @@ pub fn instantiate(effect: &studio_core::Effect, rate: f32) -> Option<Instance> 
             sat.auto_gain = p(q, "auto_gain", 1.0) > 0.5;
             Instance::Saturator(sat)
         }
-        "gain" => Instance::Gain(p(q, "db", 0.0)),
+        "gain" => Instance::Gain(p(q, "db", 0.0), p(q, "level", 1.0).max(0.0)),
         "transform" => Instance::Transform(Transform {
             x: p(q, "x", 0.0), y: p(q, "y", 0.0),
             scale_x: p(q, "scale_x", 1.0), scale_y: p(q, "scale_y", 1.0),

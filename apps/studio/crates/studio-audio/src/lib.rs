@@ -2514,6 +2514,30 @@ mod automation_render_tests {
         for i in 0..plain.len() { assert!((plain[i] - same[i]).abs() < 1e-6, "unity ride is transparent at {i}"); }
     }
 
+    /// A lane on a gain effect's LINEAR `level` is the gain itself: 0 is
+    /// silence and 1 unity, which a lane on `db` cannot reach (it
+    /// multiplies the stored dB: 0 dB x anything is 0 dB). FL's Fruity
+    /// Balance volume rides -- mutes included -- land here.
+    #[test]
+    fn a_level_lane_on_a_gain_effect_reaches_silence_and_unity() {
+        use studio_core::ParamKey;
+        let (mut p, audio) = one_clip_project();
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0, silent: false, muted: false,
+            chain: vec![effect("gain", &[("db", 0.0)])], sends: vec![], parent: None } }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        let plain = render(&p, &audio);
+        let level = AutoTarget::BusParam { bus: BusId(1), effect: 0, key: ParamKey::new("level").unwrap() };
+        let mut ridden = p.clone();
+        ridden.apply(&Op::SetAutoPoint { target: level, at: Ticks::ZERO, value: 0.0 }).unwrap();
+        ridden.apply(&Op::SetAutoPoint { target: level, at: Ticks::from_seconds(0.5), value: 0.0 }).unwrap();
+        ridden.apply(&Op::SetAutoPoint { target: level, at: Ticks::from_seconds(0.5).saturating_add(Ticks(1)), value: 1.0 }).unwrap();
+        let out = render(&ridden, &audio);
+        assert!(plain[1000].abs() > 0.1, "the clip is audible unridden: {}", plain[1000]);
+        assert_eq!(out[1000], 0.0, "level 0: silence");
+        let n = out.len();
+        assert!((out[n - 1000] - plain[n - 1000]).abs() < 1e-6, "level 1: exactly as unridden");
+    }
+
     #[test]
     fn a_dangling_or_unknown_parameter_target_changes_nothing() {
         use studio_core::ParamKey;

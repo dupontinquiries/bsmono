@@ -147,7 +147,11 @@ pub const KINDS: &[(&str, &str)] = &[
 /// know — the editor then shows the raw map, which is not nothing.
 pub fn schema(kind: &str) -> Option<Vec<ParamSpec>> {
     Some(match kind {
-        "gain" => vec![f("db", "gain", -60.0, 24.0, "dB", 0.0)],
+        // `level`: a LINEAR multiplier on top of `db` (1 = as set). An automation
+        // lane MULTIPLIES a parameter's value, so a ride on `db` cannot reach
+        // silence (0 dB x anything is 0 dB); a ride on `level` is the linear
+        // gain itself -- FL's Fruity Balance volume rides, mutes included.
+        "gain" => vec![f("db", "gain", -60.0, 24.0, "dB", 0.0), f("level", "level", 0.0, 4.0, "x", 1.0)],
         "eq" => vec![count("bands", "bands", 1, 8, 1)],
         "compressor" => vec![
             f("threshold", "threshold", -60.0, 0.0, "dB", -18.0),
