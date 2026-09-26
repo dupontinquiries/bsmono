@@ -29,7 +29,7 @@ pub fn marble(mut m: VoxelMesh, seed: f32) -> VoxelMesh {
         let band = ((x * 1.3 + y * 0.7 + (z * 0.9 + y * 0.4).sin() * 1.7 + seed).sin()).abs();
         let vein = band < 0.07;
         let gold = vein && h3((x * 2.0).floor(), (y * 2.0).floor(), (z * 2.0).floor(), seed) > 0.8;
-        let base = 0.84 + (l - 0.44) * 0.8 + 0.04 * h3(x, y, z, seed);
+        let base = 0.93 + (l - 0.44) * 0.5 + 0.04 * h3(x, y, z, seed);
         i.color = if gold {
             [0.86, 0.70, 0.36, 1.0]
         } else if vein {
@@ -37,9 +37,8 @@ pub fn marble(mut m: VoxelMesh, seed: f32) -> VoxelMesh {
         } else {
             [base, base * 0.985, base * 0.95, 1.0]
         };
-        if gold {
-            i.misc[2] = 0.25;
-        }
+        // moonlit marble holds a little light of its own; gold more
+        i.misc[2] = if gold { 0.35 } else { 0.07 };
     }
     m
 }

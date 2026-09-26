@@ -463,9 +463,12 @@ impl Scene {
                 crate::bosses::BossKind::Boar => 0.0,
             };
             let fwd = Vec3::new(b.yaw.cos(), 0.0, b.yaw.sin());
+            // the Moonwyrm is the map's centrepiece: drawn half again as big
+            // as its mesh, which keeps the voxels fine
+            let size = if b.kind == crate::bosses::BossKind::Moonwyrm { 1.7 } else { 1.0 };
             let m = Mat4::from_translation(b.pos + fwd * lunge + Vec3::Y * (breathe + hover))
                 * Mat4::from_axis_angle(Vec3::Y, -b.yaw + std::f32::consts::FRAC_PI_2)
-                * Mat4::from_scale(Vec3::splat(1.0 + breathe));
+                * Mat4::from_scale(Vec3::splat((1.0 + breathe) * size));
             let glow = match b.kind {
                 crate::bosses::BossKind::Drake => 0.25,
                 crate::bosses::BossKind::Moonwyrm => 0.06 + atm.night * 0.08,

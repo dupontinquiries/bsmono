@@ -77,6 +77,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let cloud = frame.sun_col.w;
     let flash = frame.weather.w;
     let rain = frame.weather.x;
+    // the spirit sky of Starwell Glacier: above the clouds there are no
+    // mountains, the stars come down to the horizon, and the aurora walks
+    let spirit = frame.sun_dir.w;
 
     // --- sky gradient: deep jungle-teal zenith → hot golden horizon,
     // greying under cloud, sinking to indigo for the Long Night
@@ -138,24 +141,42 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // rain veil: a grey sheet low on the horizon
     col = mix(col, vec3(0.42, 0.44, 0.48) * (1.0 - night * 0.85), rain * 0.35 * smoothstep(0.35, 0.0, h));
 
-    // --- distant mountain silhouettes beyond the physical terrain ring
+    // --- aurora: tall curtains along the sky, teal to violet, slowly
+    // walking and rippling (spirit sky only)
     let ra = atan2(ray.z, ray.x);
+    if (spirit > 0.5 && h > 0.0) {
+        let wave = fbm(vec2(ra * 2.3 + t * 0.012, t * 0.02)) * 1.8;
+        let fold = abs(sin(ra * 5.0 + wave * 3.0 + t * 0.03));
+        let curtain = pow(1.0 - fold, 6.0) + 0.35 * pow(1.0 - abs(sin(ra * 11.0 + wave * 5.0)), 10.0);
+        let band = smoothstep(0.06, 0.26, h) * (1.0 - smoothstep(0.34 + wave * 0.12, 0.75, h));
+        let flick = 0.75 + 0.25 * fbm(vec2(ra * 30.0, h * 40.0 - t * 0.6));
+        let aur = mix(vec3(0.15, 0.95, 0.70), vec3(0.62, 0.35, 1.0), smoothstep(0.22, 0.6, h));
+        col = col + aur * curtain * band * flick * 0.55 * (1.0 - cloud * 0.8);
+    }
+
+    // --- distant mountain silhouettes beyond the physical terrain ring
+    // (not in the spirit sky: there, the far horizon is the cloud sea's
+    // glow)
     let r1 = fbm(vec2(ra * 3.1, 4.2)) * 0.10 + 0.050;
     let r2 = fbm(vec2(ra * 4.7, 9.1)) * 0.085 + 0.030;
     let r3 = fbm(vec2(ra * 7.3, 17.0)) * 0.05 + 0.015;
     let nd = 1.0 - night * 0.85;
-    if (h < r1) {
-        col = mix(col, mix(vec3(0.36, 0.37, 0.44), frame.fog_color.xyz, 0.35) * nd, 0.82); // far — sun haze
-    }
-    if (h < r2) {
-        col = mix(col, vec3(0.23, 0.27, 0.31) * nd, 0.86);
-    }
-    if (h < r3) {
-        col = mix(col, vec3(0.11, 0.155, 0.145) * nd, 0.92); // near — jungle dark
+    if (spirit > 0.5) {
+        col = mix(col, vec3(0.62, 0.62, 0.86), smoothstep(0.06, -0.02, h) * 0.7);
+    } else {
+        if (h < r1) {
+            col = mix(col, mix(vec3(0.36, 0.37, 0.44), frame.fog_color.xyz, 0.35) * nd, 0.82); // far — sun haze
+        }
+        if (h < r2) {
+            col = mix(col, vec3(0.23, 0.27, 0.31) * nd, 0.86);
+        }
+        if (h < r3) {
+            col = mix(col, vec3(0.11, 0.155, 0.145) * nd, 0.92); // near — jungle dark
+        }
     }
 
     // --- circling birds (tiny flapping silhouettes)
-    for (var bi: i32 = 0; bi < 3; bi = bi + 1) {
+    for (var bi: i32 = 0; bi < 3 - 3 * i32(spirit); bi = bi + 1) {
         let fb = f32(bi);
         let ba = t * (0.05 + fb * 0.013) + fb * 2.1;
         // lightning scatters the flock upward; night grounds it
@@ -175,15 +196,19 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     col = col + vec3(0.7, 0.72, 0.95) * flash * (0.35 + 0.65 * smoothstep(0.6, 0.0, h));
 
     // --- stars high up (the Long Night brings them down to the horizon)
-    if (h > 0.28 - night * 0.22) {
+    // (the spirit sky: stars all the way down, more of them, and some warm)
+    let floor_h = mix(0.28 - night * 0.22, 0.0, spirit);
+    if (h > floor_h) {
         let sp = ray.xz / (ray.y + 0.4) * 24.0;
         let cell = floor(sp);
         let f = hash21(cell);
-        if (f > 0.975) {
+        if (f > mix(0.975, 0.955, spirit)) {
             let tw = 0.5 + 0.5 * sin(t * 2.2 + f * 90.0);
             let dist2 = length(fract(sp) - vec2(0.5));
-            let star = smoothstep(0.28, 0.0, dist2) * max(h - 0.28 + night * 0.22, 0.0) * mix(2.2, 5.5, night) * tw * (1.0 - cloud);
-            col = col + vec3(0.9, 0.95, 1.0) * star;
+            let lift = max(h - floor_h, 0.0) + spirit * 0.25;
+            let star = smoothstep(0.28, 0.0, dist2) * lift * mix(2.2, 5.5, night) * tw * (1.0 - cloud);
+            let warm = step(0.992, f) * spirit;
+            col = col + mix(vec3(0.9, 0.95, 1.0), vec3(1.0, 0.85, 0.55), warm) * star;
         }
     }
 

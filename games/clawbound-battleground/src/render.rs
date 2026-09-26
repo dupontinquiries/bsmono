@@ -76,7 +76,10 @@ pub struct Camera {
 impl Camera {
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         let view = Mat4::look_at_rh(self.eye, self.target, Vec3::Y);
-        let proj = Mat4::perspective_rh(self.fov_y, aspect, 0.25, 500.0);
+        // the sky map's cloud sea runs to the horizon: at 500 u it ended in
+        // a straight cut across the view
+        let far = if crate::map::active() == crate::map::MapId::Sky { 950.0 } else { 500.0 };
+        let proj = Mat4::perspective_rh(self.fov_y, aspect, 0.25, far);
         proj * view
     }
 }
@@ -1203,7 +1206,9 @@ impl Renderer {
             view_proj: vp.to_cols_array_2d(),
             inv_view_proj: inv.to_cols_array_2d(),
             light_view_proj: lvp.to_cols_array_2d(),
-            sun_dir: [sun.x, sun.y, sun.z, 0.0],
+            // w: the spirit sky (Starwell Glacier) -- no mountains on the
+            // horizon, aurora, stars to the horizon (sky.wgsl)
+            sun_dir: [sun.x, sun.y, sun.z, if crate::map::active() == crate::map::MapId::Sky { 1.0 } else { 0.0 }],
             cam_pos: [cam.eye.x, cam.eye.y, cam.eye.z, 1.0],
             fog_color,
             params: [time, atm.fog_density, self.exposure, atm.night],
@@ -2097,7 +2102,8 @@ fn sky_ground_color(x: f32, z: f32, h: f32, slope: f32, n1: f32, n2: f32, nm: f3
         let road = crate::render::lane_road(x, z);
         let stone = [0.70 + n1 * 0.05, 0.72 + n1 * 0.05, 0.76 + n2 * 0.04];
         let snow = [0.86 + n2 * 0.05, 0.89 + n2 * 0.05, 0.95 + n2 * 0.03];
-        let meadow = [0.22 + n1 * 0.05, 0.42 + n2 * 0.06, 0.40 + n1 * 0.05];
+        // alpine meadow: sage, frosted (a saturated teal read as water)
+        let meadow = [0.40 + n1 * 0.05, 0.52 + n2 * 0.05, 0.38 + n1 * 0.04];
         if road < sky::LANE_R - 1.5 {
             // flagstones: faint joints every ~3 u
             let joint = ((x * 0.33).fract() < 0.06) as i32 as f32 * 0.5 + ((z * 0.33).fract() < 0.06) as i32 as f32 * 0.5;

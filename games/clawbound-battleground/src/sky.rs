@@ -248,6 +248,10 @@ pub fn statues() -> Vec<(Vec3, f32)> {
             let side = Vec3::new(-dir.z, 0.0, dir.x);
             for s in [1.0f32, -1.0] {
                 let at = p + side * s * (LANE_R - 2.5);
+                // not in the mouth of a star-bridge or a causeway
+                if bridge_dist(at.x, at.z) < BRIDGE_R + 6.0 || causeway_dist(at.x, at.z) < CAUSEWAY_R + 6.0 {
+                    continue;
+                }
                 // facing the road: yaw 0 is +z, as the statue mesh faces
                 v.push((at, (-side.x * s).atan2(-side.z * s)));
             }
@@ -260,6 +264,30 @@ pub fn statues() -> Vec<(Vec3, f32)> {
         v.push((p, (-p.x).atan2(-p.z)));
     }
     v
+}
+
+fn seg_dist(p: Vec3, a: Vec3, b: Vec3) -> f32 {
+    let ab = b - a;
+    let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+    (a + ab * t - p).length()
+}
+
+/// Distance to the nearest star-bridge's centre-line.
+pub fn bridge_dist(x: f32, z: f32) -> f32 {
+    let p = at(x, z);
+    BRIDGES.iter().map(|&((ax, az), (bx, bz))| seg_dist(p, at(ax, az), at(bx, bz))).fold(f32::MAX, f32::min)
+}
+
+/// Distance to the nearest causeway's centre-line (both halves).
+pub fn causeway_dist(x: f32, z: f32) -> f32 {
+    let p = at(x, z);
+    let mut best = f32::MAX;
+    for zs in [1.0f32, -1.0] {
+        for &((ax, az), (bx, bz)) in &CAUSEWAYS {
+            best = best.min(seg_dist(p, at(ax, az * zs), at(bx, bz * zs)));
+        }
+    }
+    best
 }
 
 fn hash2(x: f32, z: f32) -> f32 {
@@ -368,6 +396,7 @@ mod tests {
         }
         for (p, _) in statues() {
             assert!(f.fits(p.x, p.z, 1.0), "statue at {p}");
+            assert!(bridge_dist(p.x, p.z) > BRIDGE_R + 4.0 && causeway_dist(p.x, p.z) > CAUSEWAY_R + 4.0, "a statue in a way onto the lane at {p}");
         }
     }
 
