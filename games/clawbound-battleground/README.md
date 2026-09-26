@@ -130,6 +130,20 @@ or GL. For audio on Linux, ALSA headers (`libasound2-dev`) at build time —
 or build with `--no-default-features` for a silent binary. macOS needs
 nothing extra (CoreAudio, Metal).
 
+### Bot styles and the arena
+
+Each match, both sides draw a page from the playbook (Pride Hunt, Shadow
+Stalk, Thornwall, ...); the scoreboard and the spectator HUD say which.
+Force a pairing with `CLAWBOUND_PLAYBOOK="Pride Hunt,Storm Front"` (blue, red).
+
+```bash
+cargo run --release --example arena -- 10 10 --write   # 10 generations, 10-min cap
+cargo run --release --example aiprobe -- 12 8          # circling / tower-death / retreat counts
+```
+
+`--write` puts the league's best strains into `dev/arena/booklet.txt`,
+which the playbook reads at build time.
+
 ### A high-end test (e.g. an M2 Ultra)
 
 ```bash
@@ -285,7 +299,10 @@ src/
 ├── sim.rs         entities, economy, damage pipeline, kills
 ├── systems.rs     tick: waves, movement, auto-attacks, projectiles, zones, sky
 ├── abilities.rs   cast execution for all 13 archetypes
-├── ai.rs          9 AI ancestors: lane push, orbit fights, sieging, retreat, buys
+├── ai.rs          AI ancestors: lane push, fights in stances, tower discipline, retreat, buys
+├── tactics.rs     fight decisions: dive / hold / regroup / retreat from a Lanchester edge
+├── playbook.rs    the booklet of team styles each side draws per match (+ dev/arena/booklet.txt)
+├── arena.rs       league: styles play headless, Elo, PFSP matchmaking, mutation
 ── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
 ├── voxel.rs       microvoxel core: dense grids → instanced cubes + baked AO
 ├── models.rs      procedural feline ancestor / minion / tower / Elder builders
