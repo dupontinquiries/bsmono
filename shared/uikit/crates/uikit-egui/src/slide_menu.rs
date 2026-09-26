@@ -913,25 +913,45 @@ pub fn peek_cardinal(ctx: &egui::Context, id: Id, deadzone: f32) -> Option<Cardi
     Some(cardinal_preview(pointer - st.origin, deadzone, CARDINAL_COMMIT_FACTOR))
 }
 
-/// Draw a cardinal press AS A SUBSTITUTION ON THE HOST ITSELF: the resting
-/// glyph slides out against the swipe and fades, while the glyph the gesture
-/// is activating slides in from that direction and takes its place.
+/// Where the two glyphs of a cardinal slide sit, as offsets from the cap's centre:
+/// `(outgoing, incoming)`.
 ///
-/// The alternative this replaces is a floating compass drawn over the press
-/// point, which has two problems on a keyboard. It occludes — nine cells appear
-/// on top of the neighbouring keys at the moment you most want to see them. And
-/// its centre cell, the tap glyph, is drawn exactly under the finger that is
-/// hiding it, so the one option rendered in the most prominent position is the
-/// only one you cannot see.
+/// A PULL, in the direction of the finger. Dragging down moves the resting glyph down and
+/// out through the bottom edge while the armed glyph enters through the TOP -- a strip of
+/// film being pulled through the cap, which is what a user reading the key expects from a
+/// drag. The first version slid the resting glyph AGAINST the swipe and brought the new
+/// one in from the swipe side (where its hint is printed), which reads as the key pushing
+/// back at the finger.
 ///
-/// A keycap that already prints its eight directions around the edge (which
-/// rusty-board's does) has no need to be told what the options are a second
-/// time; what it needs to say is *which one is armed right now*, and the
-/// clearest place to say that is the cap itself. So this paints no chrome at
-/// all: it moves two glyphs.
+/// The travel is the whole cap along each axis the direction has, so at `progress = 1`
+/// the outgoing glyph has fully left and the incoming one is exactly centred; with the
+/// painter clipped to the cap nothing is drawn outside the key. Diagonals move on both
+/// axes by the full width and height (not by the unit vector's 0.707), so they also
+/// finish exactly off-cap.
+pub fn cardinal_slide_offsets(size: Vec2, dir: Dir8, progress: f32) -> (Vec2, Vec2) {
+    let p = progress.clamp(0.0, 1.0);
+    let o = dir.offset();
+    // f32::signum(0.0) is 1.0, so a zero component is kept zero explicitly.
+    let axis = |c: f32| if c.abs() < 1e-3 { 0.0 } else { c.signum() };
+    let full = Vec2::new(axis(o.x) * size.x, axis(o.y) * size.y);
+    (full * p, -full * (1.0 - p))
+}
+
+/// Draw a cardinal press AS A SUBSTITUTION ON THE HOST ITSELF: the resting glyph is pulled
+/// out of the cap in the direction of the drag while the armed glyph slides in behind it
+/// from the opposite edge. See [`cardinal_slide_offsets`] for the geometry.
 ///
-/// `progress` drives both halves, so the swap is continuous rather than a
-/// switch — the reader can see how far in they are, and back out.
+/// The alternative this replaces is a floating compass drawn over the press point, which
+/// has two problems on a keyboard. It occludes -- nine cells appear on top of the
+/// neighbouring keys at the moment you most want to see them. And its centre cell, the tap
+/// glyph, is drawn exactly under the finger that is hiding it.
+///
+/// Nothing about the CAP changes -- not its size, not the font -- only the two glyphs move,
+/// clipped to `rect`. A cap that shrinks or grows while you are trying to read it is
+/// harder to read than one that holds still (the rusty-board report that asked for this).
+///
+/// `progress` drives both halves, so the swap is continuous rather than a switch: the
+/// reader can see how far in they are, and back out.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_cardinal_morph(
     painter: &egui::Painter,
@@ -944,32 +964,14 @@ pub fn paint_cardinal_morph(
     color: Color32,
 ) {
     let p = progress.clamp(0.0, 1.0);
-    let off = dir.offset();
-    // Far enough that the outgoing glyph has cleared the cap by p = 1, and the
-    // incoming one started from off-cap rather than appearing mid-air.
-    let travel = rect.height() * 0.46;
+    let (out_off, in_off) = cardinal_slide_offsets(rect.size(), dir, p);
+    let clipped = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
     let center = rect.center();
-
-    // Fade the outgoing glyph faster than it travels: two glyphs at similar
-    // weight in the same small cap read as a smear rather than a swap.
-    let out_alpha = (1.0 - p * 1.4).clamp(0.0, 1.0);
-    if out_alpha > 0.01 {
-        painter.text(
-            center - off * travel * p,
-            Align2::CENTER_CENTER,
-            resting,
-            font.clone(),
-            color.gamma_multiply(out_alpha),
-        );
+    if p < 1.0 {
+        clipped.text(center + out_off, Align2::CENTER_CENTER, resting, font.clone(), color);
     }
     if p > 0.0 {
-        painter.text(
-            center + off * travel * (1.0 - p),
-            Align2::CENTER_CENTER,
-            incoming,
-            font,
-            color.gamma_multiply(p.clamp(0.15, 1.0)),
-        );
+        clipped.text(center + in_off, Align2::CENTER_CENTER, incoming, font, color);
     }
 }
 
@@ -1085,6 +1087,31 @@ pub fn farther(peak: Vec2, delta: Vec2) -> Vec2 {
 
 #[cfg(test)]
 mod tests {
+    /// The pull follows the finger: a drag DOWN moves the resting glyph down and brings the
+    /// armed one in from the TOP; at full progress the incoming glyph is centred and the
+    /// outgoing one is a whole cap away (so the clip hides it).
+    #[test]
+    fn a_cardinal_slide_pulls_in_the_direction_of_the_drag() {
+        let size = Vec2::new(40.0, 46.0);
+        let (out0, in0) = cardinal_slide_offsets(size, Dir8::S, 0.0);
+        assert_eq!(out0, Vec2::ZERO, "at rest the resting glyph is centred");
+        assert_eq!(in0, Vec2::new(0.0, -46.0), "the incoming glyph waits above the cap");
+        let (out_h, in_h) = cardinal_slide_offsets(size, Dir8::S, 0.5);
+        assert!(out_h.y > 0.0, "dragging down must move the resting glyph DOWN, got {out_h:?}");
+        assert!(in_h.y < 0.0 && in_h.y > -46.0, "the incoming glyph comes from the top: {in_h:?}");
+        assert_eq!(out_h.x, 0.0);
+        let (out1, in1) = cardinal_slide_offsets(size, Dir8::S, 1.0);
+        assert_eq!(in1, Vec2::ZERO, "fully armed, the incoming glyph is centred");
+        assert_eq!(out1, Vec2::new(0.0, 46.0), "and the resting one has left the cap");
+        // Horizontal and diagonal: the same rule on each axis the direction has.
+        let (o, i) = cardinal_slide_offsets(size, Dir8::W, 0.25);
+        assert!(o.x < 0.0 && o.y == 0.0 && i.x > 0.0, "W: {o:?} {i:?}");
+        let (o, _) = cardinal_slide_offsets(size, Dir8::NE, 1.0);
+        assert_eq!(o, Vec2::new(40.0, -46.0), "a diagonal clears the cap on both axes");
+        // Clamped: overshoot does not carry the glyph past centre.
+        assert_eq!(cardinal_slide_offsets(size, Dir8::S, 3.0), cardinal_slide_offsets(size, Dir8::S, 1.0));
+    }
+
     use super::*;
 
     #[test]
