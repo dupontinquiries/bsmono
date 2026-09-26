@@ -56,6 +56,12 @@ struct Case {
     /// Output size in pixels.
     out: (u32, u32),
     check: fn(&Frame, &[[u8; 3]], (u32, u32)) -> Result<String, String>,
+    /// AI half-rate: after `frame`, `show_between` this next frame (and,
+    /// with `promote`, then promote it: the check then gets the next frame).
+    ai_next: Option<Frame>,
+    promote: bool,
+    /// The presenter's cut threshold for this case (None: its default).
+    cut: Option<f32>,
 }
 
 fn luma_of(f: &Frame, x: u32, y: u32) -> u8 {
@@ -419,6 +425,98 @@ fn check_vs_cpu(f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String
     }
 }
 
+/// Chroma planes (U, V) for a fixture luma plane: derived from the luma so
+/// they move with the picture -- neutral chroma would let a shader that
+/// never warps chroma pass.
+fn fixture_chroma(w: usize, h: usize, y: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let (cw, ch) = (w / 2, h / 2);
+    let u = (0..cw * ch).map(|i| 64 + y[(i / cw) * 2 * w + (i % cw) * 2] / 2).collect();
+    let v = (0..cw * ch).map(|i| 191 - y[((i / cw) * 2 + 1) * w + (i % cw) * 2 + 1] / 2).collect();
+    (u, v)
+}
+
+/// The AI fixture's previous (0), real middle (1) or next (2) frame as NV12,
+/// 1/60 s apart.
+fn fixture_frame(k: usize) -> Frame {
+    let (w, h, p, m, q, _) = vidkit_core::aiframes::fixture();
+    let y = [p, m, q][k].clone();
+    let mut f = nv12(w as u32, h as u32, |x, yy| y[yy as usize * w + x as usize]);
+    let (u, v) = fixture_chroma(w, h, &y);
+    if let FrameData::Cpu(pl) = &mut f.data {
+        pl.data[1] = u.iter().zip(&v).flat_map(|(a, b)| [*a, *b]).collect();
+    }
+    f.pts = std::time::Duration::from_micros(16_667 * k as u64);
+    f
+}
+
+/// Expected RGB of a frame given as float planes (luma full size, chroma
+/// half, sampled bilinearly at the luma pixel's centre as the GPU does),
+/// through the CPU colour conversion at 8 bits.
+fn rgb_of<'a>(w: usize, y: &'a [f32], u: &'a [f32], v: &'a [f32]) -> impl Fn(usize) -> [u8; 3] + 'a {
+    use vidkit_core::aiframes::Plane;
+    let q = |x: f32| (x * 255.0).round().clamp(0.0, 255.0) as u8;
+    let (cw, ch) = (w / 2, u.len() / (w / 2));
+    let (up, vp) = (Plane { w: cw, h: ch, px: u.to_vec() }, Plane { w: cw, h: ch, px: v.to_vec() });
+    move |i| {
+        let (cx, cy) = (((i % w) as f32 + 0.5) / 2.0 - 0.5, ((i / w) as f32 + 0.5) / 2.0 - 0.5);
+        expected_rgb(q(y[i]), q(up.sample(cx, cy)), q(vp.sample(cx, cy)), ColorInfo::default())
+    }
+}
+
+fn psnr_rgb(got: &[[u8; 3]], want: &dyn Fn(usize) -> [u8; 3]) -> f64 {
+    let mse = got.iter().enumerate().map(|(i, g)| {
+        let e = want(i);
+        (0..3).map(|c| (g[c] as f64 - e[c] as f64).powi(2)).sum::<f64>()
+    }).sum::<f64>() / (got.len() * 3) as f64;
+    10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
+}
+
+/// The fixture as float planes: (w, h, [prev, middle, next] x [y, u, v]).
+fn fixture_planes() -> (usize, usize, Vec<[vidkit_core::aiframes::Plane; 3]>, Vec<f32>) {
+    use vidkit_core::aiframes::{fixture, Plane};
+    let (w, h, p, m, q, py) = fixture();
+    let planes = [p, m, q].iter().map(|y| {
+        let (u, v) = fixture_chroma(w, h, y);
+        [Plane::from_u8(w, h, y), Plane::from_u8(w / 2, h / 2, &u), Plane::from_u8(w / 2, h / 2, &v)]
+    }).collect();
+    (w, h, planes, py)
+}
+
+/// The cut fallback: the in-between frame is the plain blend.
+fn check_ai_blend(_f: &Frame, got: &[[u8; 3]], _out: (u32, u32)) -> Result<String, String> {
+    let (w, _, f, _) = fixture_planes();
+    let mix = |k: usize| f[0][k].px.iter().zip(&f[2][k].px).map(|(a, b)| (a + b) / 2.0).collect::<Vec<f32>>();
+    let (y, u, v) = (mix(0), mix(1), mix(2));
+    let want = rgb_of(w, &y, &u, &v);
+    let worst = got.iter().enumerate().map(|(i, g)| (0..3).map(|c| g[c].abs_diff(want(i)[c])).max().unwrap_or(0)).max().unwrap_or(255);
+    let msg = format!("max {worst}/255 from the blend (colour)");
+    if worst <= 3 { Ok(msg) } else { Err(msg) }
+}
+
+/// The presenter's in-between frame (conversion shader, synth branch)
+/// against the synthesised frame: PyTorch's own luma, and chroma from
+/// vidkit-core's reference (which matches PyTorch at 120 dB) -- through the
+/// same colour conversion.
+fn check_ai_between(_f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String, String> {
+    use vidkit_core::aiframes::{model_flow, synth};
+    let (fw, fh, f, py) = fixture_planes();
+    if (w as usize, h as usize) != (fw, fh) {
+        return Err("output size is not the fixture's".into());
+    }
+    let out = model_flow(&f[0][0], &f[2][0]);
+    let (su, sv) = (synth(&out, &f[0][1], &f[2][1]), synth(&out, &f[0][2], &f[2][2]));
+    let agree = psnr_rgb(got, &rgb_of(fw, &py, &su.px, &sv.px));
+    let real = psnr_rgb(got, &rgb_of(fw, &f[1][0].px, &f[1][1].px, &f[1][2].px));
+    let mix = |k: usize| f[0][k].px.iter().zip(&f[2][k].px).map(|(a, b)| (a + b) / 2.0).collect::<Vec<f32>>();
+    let (by, bu, bv) = (mix(0), mix(1), mix(2));
+    let blend = psnr_rgb(&(0..got.len()).map(rgb_of(fw, &by, &bu, &bv)).collect::<Vec<_>>(), &rgb_of(fw, &f[1][0].px, &f[1][1].px, &f[1][2].px));
+    let msg = format!("vs the model {agree:.1} dB (colour); vs the real middle {real:.2} dB, where a blend scores {blend:.2}");
+    // 8-bit output of a limited-range expansion: ~45 dB is exact here.
+    // Breaks measured: offsets or mask wrong 21-32 dB, chroma not warped
+    // (see the commit).
+    if agree > 38.0 && real > blend + 0.5 { Ok(msg) } else { Err(msg) }
+}
+
 fn cases() -> Vec<Case> {
     // 2-D pattern: soft diagonal field plus a bright square near the TOP-LEFT,
     // so a vertical or horizontal flip anywhere shows as a large error.
@@ -427,7 +525,7 @@ fn cases() -> Vec<Case> {
     };
     vec![
         Case {
-            two_pass: false,
+            two_pass: false, ai_next: None, promote: false, cut: None,
             grain: None,
             name: "temporal denoise, board",
             frame: at_pts(noisy_board(9), 9),
@@ -437,7 +535,7 @@ fn cases() -> Vec<Case> {
             check: check_denoise,
         },
         Case {
-            two_pass: false,
+            two_pass: false, ai_next: None, promote: false, cut: None,
             grain: None,
             name: "temporal, no ghosting",
             frame: at_pts(square_at(40), 8),
@@ -446,16 +544,22 @@ fn cases() -> Vec<Case> {
             out: (64, 48),
             check: check_no_ghost,
         },
-        Case { two_pass: false, grain: None, name: "HDR10 PQ, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Pq), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
-        Case { two_pass: false, grain: None, name: "HLG, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Hlg), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
-        Case { two_pass: false, grain: Some(grain_params()), name: "AV1 film grain", history: vec![], frame: with_grain(i420(256, 160)), enhance: Enhance::default(), out: (256, 160), check: check_grain },
-        Case { two_pass: false, grain: None, name: "dma-buf NV12", history: vec![], frame: dmabuf_nv12(66, 48), enhance: Enhance::default(), out: (66, 48), check: check_vs_cpu },
-        Case { two_pass: false, grain: None, name: "I420, three planes", history: vec![], frame: i420(64, 48), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
-        Case { two_pass: false, grain: None, name: "plain conversion", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance::default(), out: (64, 48), check: check_plain },
-        Case { two_pass: true, grain: None, name: "RCAS two-pass (offscreen)", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
-        Case { two_pass: false, grain: None, name: "RCAS fused (one pass)", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
-        Case { two_pass: false, grain: None, name: "bicubic 2x on a ramp", history: vec![], frame: nv12(32, 16, |x, _| (40 + x * 4) as u8), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_ramp },
-        Case { two_pass: false, grain: None, name: "bicubic 2x on a step", history: vec![], frame: nv12(32, 16, |x, _| if x < 16 { 60 } else { 200 }), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_step_overshoot },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "HDR10 PQ, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Pq), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "HLG, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Hlg), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: Some(grain_params()), name: "AV1 film grain", history: vec![], frame: with_grain(i420(256, 160)), enhance: Enhance::default(), out: (256, 160), check: check_grain },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "dma-buf NV12", history: vec![], frame: dmabuf_nv12(66, 48), enhance: Enhance::default(), out: (66, 48), check: check_vs_cpu },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "I420, three planes", history: vec![], frame: i420(64, 48), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
+        // This crop's residual is 0.024, over the whole-frame cut threshold
+        // (0.02): at the default the shader must show the blend...
+        Case { two_pass: false, ai_next: Some(fixture_frame(2)), promote: false, cut: None, grain: None, name: "AI cut falls back", history: vec![], frame: fixture_frame(0), enhance: Enhance::default(), out: (256, 144), check: check_ai_blend },
+        // ...and with the threshold raised, the synthesised frame.
+        Case { two_pass: false, ai_next: Some(fixture_frame(2)), promote: false, cut: Some(1.0), grain: None, name: "AI in-between frame", history: vec![], frame: fixture_frame(0), enhance: Enhance::default(), out: (256, 144), check: check_ai_between },
+        Case { two_pass: false, ai_next: Some(fixture_frame(2)), promote: true, cut: None, grain: None, name: "AI next promoted", history: vec![], frame: fixture_frame(0), enhance: Enhance::default(), out: (256, 144), check: check_vs_cpu },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "plain conversion", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance::default(), out: (64, 48), check: check_plain },
+        Case { two_pass: true, ai_next: None, promote: false, cut: None, grain: None, name: "RCAS two-pass (offscreen)", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "RCAS fused (one pass)", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "bicubic 2x on a ramp", history: vec![], frame: nv12(32, 16, |x, _| (40 + x * 4) as u8), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_ramp },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "bicubic 2x on a step", history: vec![], frame: nv12(32, 16, |x, _| if x < 16 { 60 } else { 200 }), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_step_overshoot },
     ]
 }
 
@@ -607,7 +711,8 @@ impl eframe::App for SelfTest {
         }
         if let Some(px) = self.readback.lock().ok().and_then(|mut r| r.take()) {
             let c = &self.cases[self.at];
-            match (c.check)(&c.frame, &px, c.out) {
+            let checked = c.ai_next.as_ref().filter(|_| c.promote).unwrap_or(&c.frame);
+            match (c.check)(checked, &px, c.out) {
                 Ok(m) => println!("  ok   {:<24} {m}", c.name),
                 Err(m) => {
                     println!("  FAIL {:<24} {m}", c.name);
@@ -637,6 +742,24 @@ impl eframe::App for SelfTest {
                 }
                 if f.is_zero_copy() {
                     println!("       dma-buf: {} zero-copy frames; import: {}", g.zero_copy_frames, g.import_note.as_deref().unwrap_or("ok"));
+                }
+                if let (true, Some(next)) = (self.shown == n, c.ai_next.as_ref()) {
+                    let before = g.uploads();
+                    g.ai_cut_residual = c.cut.unwrap_or(vidkit_core::aiframes::CUT_RESIDUAL);
+                    if let Err(e) = unsafe { g.show_between(gl, next) } {
+                        println!("  FAIL {:<24} show_between: {e}", c.name);
+                        self.failed = true;
+                    }
+                    if c.promote {
+                        let ok = unsafe { g.promote(gl, next) };
+                        if !ok || g.uploads() != before + 1 || g.synth_pts().is_some() {
+                            println!("  FAIL {:<24} promote: {ok}, {} uploads (want 1), synth {:?}", c.name, g.uploads() - before, g.synth_pts());
+                            self.failed = true;
+                        }
+                    } else if g.synth_pts() != Some(next.pts) {
+                        println!("  FAIL {:<24} no in-between frame pending", c.name);
+                        self.failed = true;
+                    }
                 }
                 // The grain stage itself, exactly: the GPU's grained planes
                 // against vidkit-core's reference (byte-identical to dav1d).
