@@ -836,7 +836,7 @@ fn start_spectate(s: &mut AppState) {
     start_game(s);
     if let Some(g) = s.game.as_mut() {
         let lane = g.gods[0].ai.as_ref().map(|b| b.lane).unwrap_or(crate::consts::Lane::Mid);
-        g.gods[0].ai = Some(crate::sim::AiBrain { lane, aggression: 0.8, state: crate::sim::AiState::Push, target: None, strafe_dir: 1.0, strafe_t: 0.0, buy_t: 1.0, wp: 0 });
+        g.gods[0].ai = Some({ let mut b = crate::sim::AiBrain::new(lane, 0.8); b.buy_t = 1.0; b });
         g.gods[0].is_player = false;
     }
     s.spectator = Some(crate::spectator::Spectator::new());
@@ -875,7 +875,9 @@ fn start_game(s: &mut AppState) {
     let mut rng = crate::sim::Rng::new(0xBEEF ^ seed);
     if crate::map::active() != crate::map::MapId::Jungle {
         let (blue, red) = crate::map::team_picks(s.ui.selected as u32, &mut rng);
-        s.game = Some(Game::new_teams(&blue, &red));
+        let mut game = Game::new_teams(&blue, &red);
+        open_playbook(s, &mut game, &mut rng);
+        s.game = Some(game);
         finish_start(s);
         return;
     }
@@ -890,8 +892,33 @@ fn start_game(s: &mut AppState) {
         let k = (rng.next_u() % pool.len() as u64) as usize;
         *e = pool.remove(k.min(pool.len() - 1));
     }
-    s.game = Some(Game::new(s.ui.selected as u32, allies, enemies));
+    let mut game = Game::new(s.ui.selected as u32, allies, enemies);
+    open_playbook(s, &mut game, &mut rng);
+    s.game = Some(game);
     finish_start(s);
+}
+
+/// Each side opens the playbook: a fresh draw every match. In a LAN match
+/// both peers must agree, so the draw comes from the game's own
+/// (deterministic) generator rather than the clock.
+fn open_playbook(s: &AppState, game: &mut Game, rng: &mut crate::sim::Rng) {
+    if s.lan.is_some() {
+        let mut own = game.rng.clone();
+        game.open_playbook(&mut own);
+        game.rng = own;
+    } else {
+        game.open_playbook(rng);
+    }
+    if let Ok(v) = std::env::var("CLAWBOUND_PLAYBOOK") {
+        // "Pride Hunt,Storm Front": force the pages (blue, red) by name
+        let book = crate::playbook::booklet();
+        let names: Vec<&str> = v.split(',').map(str::trim).collect();
+        let find = |n: &str| book.iter().find(|p| p.name.eq_ignore_ascii_case(n)).cloned();
+        if let (Some(a), Some(b)) = (names.first().and_then(|n| find(n)), names.get(1).and_then(|n| find(n))) {
+            game.set_styles([a, b], rng);
+        }
+    }
+    eprintln!("playbook: blue plays {}, red plays {}", game.styles[0].name, game.styles[1].name);
 }
 
 /// Everything after the rosters are drawn: shared by every map.

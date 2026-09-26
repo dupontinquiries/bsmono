@@ -1,7 +1,7 @@
 use clawbound::consts::*;
 use clawbound::gods::{AutoKind, ROSTER};
 use clawbound::items;
-use clawbound::sim::{AiState, Game, Team};
+use clawbound::sim::{Game, Team};
 
 #[test]
 fn catalog_has_exactly_102_items() {
@@ -86,20 +86,15 @@ fn towers_exist_for_all_lanes_and_teams() {
 }
 
 #[test]
-fn simulation_runs_120s_without_panic_and_progresses() {
+fn simulation_runs_three_minutes_without_panic_and_progresses() {
     let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
     // give the player slot an AI brain so it fights too
-    game.gods[0].ai = Some(clawbound::sim::AiBrain {
-        lane: Lane::Mid,
-        aggression: 0.9,
-        state: AiState::Push,
-        target: None,
-        strafe_dir: 1.0,
-        strafe_t: 0.0,
-        buy_t: 1.0,
-        wp: 0,
-    });
-    for step in 0..(120 * 120) {
+    game.gods[0].ai = Some({ let mut b = clawbound::sim::AiBrain::new(Lane::Mid, 0.9); b.buy_t = 1.0; b });
+    // Three minutes, not two: since bots stopped sieging towers alone
+    // (ai.rs, tower discipline) this roster's first tower falls at 163 s
+    // rather than 72 s -- though the AI-only average across six other
+    // rosters barely moved (examples/aiprobe: 116 s before, 120 s after).
+    for step in 0..(180 * 120) {
         game.tick(1.0 / 120.0);
         if game.over.is_some() {
             break;
@@ -1197,5 +1192,95 @@ mod brawls {
             run(&mut g, 2.0);
             assert!(g.gods[1].hp < 1.0e6, "the bolt missed the cat below ({} u down, {:.0} u away)", hi.y - lo.y, (hi - lo).length());
         });
+    }
+}
+
+/// The fight brain in a real game (`tactics` decides, `ai` carries it out).
+mod fights {
+    use clawbound::consts::{tower_pos, Team, TOWER_RANGE};
+    use clawbound::sim::{AiState, Game};
+    use clawbound::tactics::Stance;
+    use glam::Vec3;
+
+    fn run(g: &mut Game, secs: f32, mut each: impl FnMut(&Game)) {
+        for _ in 0..(secs * 60.0) as usize {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+            each(g);
+        }
+    }
+
+    /// Park a god at its fountain, out of the way and brainless.
+    fn park(g: &mut Game, i: usize) {
+        let f = g.gods[i].team.fountain();
+        g.gods[i].ai = None;
+        g.gods[i].pos = Vec3::new(f.x, 0.0, f.z);
+        g.gods[i].move_dir = Vec3::ZERO;
+        g.gods[i].attack_held = false;
+    }
+
+    /// Three on one: the three dive, the one gives ground.
+    #[test]
+    fn outnumbering_dives_and_outnumbered_regroups() {
+        let mut g = Game::new_teams(&[0, 1, 2, 3], &[4]);
+        park(&mut g, 0);
+        for (i, p) in [(1, Vec3::new(-3.0, 0.0, 0.0)), (2, Vec3::new(-3.0, 0.0, 2.0)), (3, Vec3::new(-3.0, 0.0, -2.0)), (4, Vec3::new(4.0, 0.0, 0.0))] {
+            g.gods[i].pos = p;
+        }
+        let mut dove = [false; 5];
+        let mut gave = false;
+        run(&mut g, 0.6, |g| {
+            // a dive on the numbers, not the kill clause: the red cat is
+            // still above half health
+            let fresh = g.gods[4].hp / g.gods[4].max_hp > 0.5;
+            for i in 1..4 {
+                dove[i] |= fresh && g.gods[i].ai.as_ref().unwrap().stance == Stance::Dive;
+            }
+            let red = g.gods[4].ai.as_ref().unwrap();
+            gave |= matches!(red.stance, Stance::Regroup | Stance::Retreat) || red.state == AiState::Retreat;
+        });
+        assert!(dove[1..4].iter().filter(|&&d| d).count() >= 2, "the three commit: {dove:?}");
+        assert!(gave, "the one does not stand and trade");
+    }
+
+    /// Tower discipline: alone, a bot does not walk into an enemy tower's
+    /// range to siege it; with its minions under the tower, it does.
+    #[test]
+    fn a_bot_sieges_only_behind_its_minions() {
+        let setup = || {
+            let mut g = Game::new_teams(&[0, 1], &[2]);
+            park(&mut g, 0);
+            park(&mut g, 2);
+            let lane = g.gods[1].ai.as_ref().unwrap().lane;
+            let tw = tower_pos(lane, Team::Red, false);
+            let home = Team::Blue.fountain();
+            let back = Vec3::new(home.x - tw.x, 0.0, home.z - tw.z).normalize();
+            g.gods[1].pos = Vec3::new(tw.x, 0.0, tw.z) + back * (TOWER_RANGE + 6.0);
+            let path = clawbound::consts::lane_path(lane, Team::Blue);
+            let wp = (0..path.len()).min_by(|&a, &b| path[a].distance(tw).total_cmp(&path[b].distance(tw))).unwrap();
+            g.gods[1].ai.as_mut().unwrap().wp = wp;
+            (g, tw, lane)
+        };
+        let flat = |a: Vec3, b: Vec3| Vec3::new(a.x - b.x, 0.0, a.z - b.z).length();
+
+        let (mut g, tw, _) = setup();
+        let mut closest = f32::MAX;
+        run(&mut g, 8.0, |g| closest = closest.min(flat(g.gods[1].pos, tw)));
+        assert!(closest > TOWER_RANGE - 0.75, "alone, it waits at the edge: came within {closest:.1} of {TOWER_RANGE}");
+
+        // now a wave of its own minions under the tower
+        let (mut g, tw, lane) = setup();
+        g.next_wave_t = g.t;
+        run(&mut g, 0.05, |_| {});
+        let back = (g.gods[1].pos - tw).normalize();
+        let mut k = 0;
+        for m in g.minions.iter_mut().filter(|m| m.team == Team::Blue && m.lane == lane) {
+            m.pos = Vec3::new(tw.x, 0.0, tw.z) + back * (8.0 + k as f32 * 0.8);
+            k += 1;
+        }
+        assert!(k >= 2, "a wave spawned: {k}");
+        let mut closest = f32::MAX;
+        run(&mut g, 8.0, |g| closest = closest.min(flat(g.gods[1].pos, tw)));
+        assert!(closest < TOWER_RANGE - 4.0, "behind its minions it sieges: closest {closest:.1}");
     }
 }

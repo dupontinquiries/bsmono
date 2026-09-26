@@ -114,6 +114,29 @@ pub struct AiBrain {
     pub strafe_t: f32,
     pub buy_t: f32,
     pub wp: usize,
+    /// How the current fight is being fought (`tactics`), and for how long.
+    pub stance: crate::tactics::Stance,
+    pub stance_t: f32,
+    /// Where the current fight began: the leash is measured from here.
+    pub anchor: Option<Vec3>,
+}
+
+impl AiBrain {
+    pub fn new(lane: Lane, aggression: f32) -> AiBrain {
+        AiBrain {
+            lane,
+            aggression,
+            state: AiState::Push,
+            target: None,
+            strafe_dir: 1.0,
+            strafe_t: 0.0,
+            buy_t: 1.5,
+            wp: 0,
+            stance: crate::tactics::Stance::Hold,
+            stance_t: 0.0,
+            anchor: None,
+        }
+    }
 }
 
 /// A cast in its wind-up or channel (`GodUnit::casting`).
@@ -331,6 +354,11 @@ pub struct Game {
     pub steer_mem: Vec<crate::steer::Memory>,
     /// Plans made this tick, against `steer::PLANS_PER_TICK`.
     pub plans_this_tick: u32,
+    /// Each side's page of the playbook (`playbook`), indexed by team.
+    pub styles: [crate::playbook::Page; 2],
+    /// A bot's dive on an enemy god, for its teammates to answer:
+    /// (target god, when). Indexed by the diving team.
+    pub calls: [Option<(usize, f32)>; 2],
 }
 
 impl Game {
@@ -422,7 +450,7 @@ impl Game {
                 sneak: false,
                 hush_t: 0.0,
                 last_act_t: -99.0,
-                ai: if is_player { None } else { Some(AiBrain { lane, aggression: 0.45 + rng.f32() * 0.5, state: AiState::Push, target: None, strafe_dir: 1.0, strafe_t: 0.0, buy_t: 1.5, wp: 0 }) },
+                ai: if is_player { None } else { Some(AiBrain::new(lane, 0.45 + rng.f32() * 0.5)) },
                 prot,
                 pen_pct: 0.0,
                 pen_flat: 0.0,
@@ -489,6 +517,8 @@ impl Game {
             blockers: std::sync::Arc::new(crate::blockers::Blockers::default()),
             steer_mem: vec![crate::steer::Memory::default(); total],
             plans_this_tick: 0,
+            styles: [crate::playbook::even_keel(), crate::playbook::even_keel()],
+            calls: [None, None],
         };
         // starter items for AI gods (player buys via shop)
         for i in 0..total {
@@ -508,6 +538,31 @@ impl Game {
             Lane::Mid => Vec3::ZERO,
         };
         base + jitter + lane_off
+    }
+
+    /// Give each side its page of the playbook, and move the bots to the
+    /// lanes the page plays (`playbook::lanes_for`). Announced at the start.
+    pub fn set_styles(&mut self, pages: [crate::playbook::Page; 2], rng: &mut Rng) {
+        for team in [Team::Blue, Team::Red] {
+            let genes = pages[team as usize].genes;
+            let bots: Vec<usize> = (0..self.gods.len()).filter(|&i| self.gods[i].team == team && self.gods[i].ai.is_some() && !self.gods[i].is_player).collect();
+            let now: Vec<Lane> = bots.iter().map(|&i| self.gods[i].ai.as_ref().unwrap().lane).collect();
+            let want = crate::playbook::lanes_for(&genes, &now, rng);
+            for (k, &i) in bots.iter().enumerate() {
+                let b = self.gods[i].ai.as_mut().unwrap();
+                if b.lane != want[k] {
+                    b.lane = want[k];
+                    b.wp = 0;
+                }
+            }
+        }
+        self.styles = pages;
+    }
+
+    /// Draw both sides' pages from the booklet.
+    pub fn open_playbook(&mut self, rng: &mut Rng) {
+        let pages = crate::playbook::draw_pair(rng);
+        self.set_styles(pages, rng);
     }
 
     pub fn def(&self, i: usize) -> &'static GodDef {

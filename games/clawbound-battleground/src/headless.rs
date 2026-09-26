@@ -153,16 +153,8 @@ pub fn run() -> Result<(), String> {
     game.blockers = scene.blockers.clone();
     // drive the player slot with AI for the demo
     let lane = crate::consts::Lane::Mid;
-    game.gods[0].ai = Some(crate::sim::AiBrain {
-        lane,
-        aggression: 0.9,
-        state: crate::sim::AiState::Push,
-        target: None,
-        strafe_dir: 1.0,
-        strafe_t: 0.0,
-        buy_t: 1.0,
-        wp: 0,
-    });
+    game.gods[0].ai = Some({ let mut b = crate::sim::AiBrain::new(lane, 0.9); b.buy_t = 1.0; b });
+    game.open_playbook(&mut Rng::new(0x9A6F));
 
     // egui for HUD in screenshots
     let egui_ctx = egui::Context::default();
@@ -893,16 +885,7 @@ pub fn run_pass_shots() -> Result<(), String> {
     let (blue, red) = crate::map::team_picks(3, &mut rng);
     let mut game = Game::new_teams(&blue, &red);
     game.blockers = scene.blockers.clone();
-    game.gods[0].ai = Some(crate::sim::AiBrain {
-        lane: crate::consts::Lane::Mid,
-        aggression: 0.9,
-        state: crate::sim::AiState::Push,
-        target: None,
-        strafe_dir: 1.0,
-        strafe_t: 0.0,
-        buy_t: 1.0,
-        wp: 0,
-    });
+    game.gods[0].ai = Some({ let mut b = crate::sim::AiBrain::new(crate::consts::Lane::Mid, 0.9); b.buy_t = 1.0; b });
     let mut vfx = Vfx::default();
     let only: Vec<String> = std::env::var("CLAWBOUND_SHEET").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default();
     let want = |n: &str| only.is_empty() || only.iter().any(|o| n.contains(o.as_str()));
@@ -1462,7 +1445,8 @@ pub fn run_spectate() -> Result<(), String> {
     let (blue, red) = crate::map::team_picks(4, &mut Rng::new(0x5EC7));
     let mut game = Game::new_teams(&blue, &red);
     game.blockers = scene.blockers.clone();
-    game.gods[0].ai = Some(crate::sim::AiBrain { lane: crate::consts::Lane::Mid, aggression: 0.8, state: crate::sim::AiState::Push, target: None, strafe_dir: 1.0, strafe_t: 0.0, buy_t: 1.0, wp: 0 });
+    game.gods[0].ai = Some({ let mut b = crate::sim::AiBrain::new(crate::consts::Lane::Mid, 0.8); b.buy_t = 1.0; b });
+    game.open_playbook(&mut Rng::new(0x9A6E));
     let mut vfx = Vfx::default();
     for _ in 0..(70 * 60) {
         game.tick(1.0 / 60.0);
