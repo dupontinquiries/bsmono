@@ -7,7 +7,6 @@
 
 use crate::{App, View};
 use egui::{Color32, Context, CornerRadius, Pos2, Rect, ScrollArea, Sense, Stroke, Vec2};
-use photosync::album::Item;
 use photosync::gallery_grid;
 
 pub fn draw(app: &mut App, ctx: &Context) {
@@ -284,9 +283,10 @@ fn header(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) 
     ui.add_space(10.0);
     ui.horizontal(|ui| {
         ui.add_space(16.0);
+        let n = app.groups().len();
         let title = match &app.view {
-            View::Library => format!("Library — {} items", app.library.len()),
-            View::Album(name) => format!("{name} — {} items", app.library.album_items(name).len()),
+            View::Library => format!("Library — {n} items"),
+            View::Album(name) => format!("{name} — {n} items"),
             View::Settings => "Settings".to_string(),
         };
         ui.heading(egui::RichText::new(title).color(colors.text));
@@ -366,22 +366,7 @@ fn gallery(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors)
     const GAP: f32 = 6.0;
     let group_gap: f32 = if app.compact { 12.0 } else { 22.0 };
 
-    let groups: Vec<(String, Vec<&Item>)> = match &app.view {
-        View::Library => app.library.by_day(),
-        // An album by day too (it was one group headed "Selected"), in the
-        // same newest-first order `visible_order` walks.
-        View::Album(name) => {
-            let mut out: Vec<(String, Vec<&Item>)> = Vec::new();
-            for i in app.library.album_items(name) {
-                match out.last_mut() {
-                    Some((d, v)) if *d == i.day() => v.push(i),
-                    _ => out.push((i.day(), vec![i])),
-                }
-            }
-            out
-        }
-        View::Settings => Vec::new(), // unreachable: draw() routes Settings to settings_view instead
-    };
+    let groups = app.groups();
 
     if app.library.is_empty() || groups.is_empty() {
         let msg = if app.library.is_empty() { "No photos yet" }
@@ -403,54 +388,60 @@ fn gallery(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors)
     let mut pressed: Option<(String, crate::selection::Press)> = None;
     let mods = ui.input(|i| i.modifiers);
 
-    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        ui.add_space(8.0);
-        for (day, items) in &groups {
-            ui.horizontal(|ui| {
-                ui.add_space(margin + 4.0);
-                ui.label(egui::RichText::new(day).color(colors.text_weak).size(12.0).strong());
-            });
-            ui.add_space(6.0);
+    // Where each day sits, computed for the whole library from arithmetic
+    // alone (no widgets): the scroll area is given the total height and only
+    // the days that intersect the viewport are laid out. Laying out every
+    // day's heading every frame cost as much as the grouping did.
+    const TOP: f32 = 8.0;
+    const HEADING: f32 = 26.0;
+    let grid = gallery_grid::grid_for(width, target, gap);
+    let mut spans = Vec::with_capacity(groups.days.len());
+    let mut y = TOP;
+    for (_, paths) in &groups.days {
+        let h = HEADING + gallery_grid::grid_height(&grid, paths.len());
+        spans.push((y, h));
+        y += h + group_gap;
+    }
+    let total = y;
 
-            let grid = gallery_grid::grid_for(width, target, gap);
-            let height = gallery_grid::grid_height(&grid, items.len());
-            let (rect, _resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
-            let origin = Pos2::new(rect.min.x + margin, rect.min.y);
-
-            // Only paint what's actually in the visible band — the point of
+    ScrollArea::vertical().auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
+        let (content, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), total), Sense::hover());
+        let first = spans.partition_point(|(y, h)| y + h < viewport.min.y);
+        for (gi, (day, paths)) in groups.days.iter().enumerate().skip(first) {
+            let (gy, _) = spans[gi];
+            if gy > viewport.max.y { break; }
+            let top = content.min + Vec2::new(0.0, gy);
+            ui.painter().text(top + Vec2::new(margin + 4.0, 4.0), egui::Align2::LEFT_TOP, day,
+                egui::FontId::proportional(12.5), colors.text_weak);
+            let origin = top + Vec2::new(margin, HEADING);
+            // Only the rows in the visible band — the point of
             // `visible_range` is that this stays cheap into the thousands.
-            let clip = ui.clip_rect();
-            let scroll_y = (clip.min.y - rect.min.y).max(0.0);
-            let viewport_h = clip.height();
-            let (lo, hi) = gallery_grid::visible_range(&grid, items.len(), scroll_y, viewport_h);
-
-            if ui.is_rect_visible(rect) {
-                for idx in lo..hi {
-                    let item = items[idx];
-                    let (x, y) = gallery_grid::cell_pos(&grid, idx);
-                    let cell_rect = Rect::from_min_size(
-                        Pos2::new(origin.x + x, origin.y + y),
-                        Vec2::splat(grid.cell),
-                    );
-                    // Ask for its thumbnail (only visible tiles get here, so
-                    // the newest requests are what is on screen), and draw the
-                    // texture once it has been uploaded.
-                    if let Some(t) = &app.thumbs { let _ = t.get(&item.path); }
-                    let thumb = app.textures.get(&item.path).map(|h| (h.id(), h.size_vec2()));
-                    app.last_tiles.push((item.path.clone(), cell_rect));
-                    let hit = paint_tile(ui, cell_rect, item, thumb, app.selected.contains(&item.path), colors, app.settings.thumb_style);
-                    // Long-press on a touch screen and right-click both arrive
-                    // as secondary_clicked, and neither as clicked() (checked:
-                    // swapping these two tests fails nothing).
-                    if hit.secondary_clicked() {
-                        pressed = Some((item.path.clone(), crate::selection::Press::Secondary));
-                    } else if hit.clicked() {
-                        pressed = Some((item.path.clone(), crate::selection::Press::Primary {
-                            ctrl: mods.command, shift: mods.shift }));
-                    }
+            // The band of THIS grid inside the viewport: from its top or the
+            // viewport's, to the viewport's bottom (a day starting halfway
+            // down gets half a screen, not a whole one).
+            let scroll_y = (viewport.min.y - (gy + HEADING)).max(0.0);
+            let band = (viewport.max.y - (gy + HEADING) - scroll_y).max(0.0);
+            let (lo, hi) = gallery_grid::visible_range(&grid, paths.len(), scroll_y, band);
+            for idx in lo..hi {
+                let path = &paths[idx];
+                let (x, y) = gallery_grid::cell_pos(&grid, idx);
+                let cell_rect = Rect::from_min_size(origin + Vec2::new(x, y), Vec2::splat(grid.cell));
+                // Ask for its thumbnail (only visible tiles get here, so the
+                // newest requests are what is on screen), and draw the texture
+                // once it has been uploaded.
+                if let Some(t) = &app.thumbs { let _ = t.get(path); }
+                let thumb = app.textures.get(path).map(|h| (h.id(), h.size_vec2()));
+                app.last_tiles.push((path.clone(), cell_rect));
+                let hit = paint_tile(ui, cell_rect, path, thumb, app.selected.contains(path), colors, app.settings.thumb_style);
+                // Long-press on a touch screen and right-click both arrive as
+                // secondary_clicked, and neither as clicked() (checked:
+                // swapping these two tests fails nothing).
+                if hit.secondary_clicked() {
+                    pressed = Some((path.clone(), crate::selection::Press::Secondary));
+                } else if hit.clicked() {
+                    pressed = Some((path.clone(), crate::selection::Press::Primary { ctrl: mods.command, shift: mods.shift }));
                 }
             }
-            ui.add_space(group_gap);
         }
     });
 
@@ -474,19 +465,19 @@ fn gallery(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors)
 fn paint_tile(
     ui: &mut egui::Ui,
     rect: Rect,
-    item: &Item,
+    path: &str,
     thumb: Option<(egui::TextureId, Vec2)>,
     selected: bool,
     colors: &uikit_egui::PaletteColors,
     style: crate::settings::ThumbStyle,
 ) -> egui::Response {
-    let resp = ui.interact(rect, ui.id().with(("tile", &item.path)), Sense::click());
+    let resp = ui.interact(rect, ui.id().with(("tile", path)), Sense::click());
     let painter = ui.painter();
 
     // Deterministic placeholder colour — same FNV-1a + HSL trick as
     // `mono_tile`, seeded on the path, so a given photo always renders the
     // same hue until a real thumbnail replaces it.
-    let hue = uikit_egui::mono_tile::hue(&item.path);
+    let hue = uikit_egui::mono_tile::hue(path);
     let base = uikit_egui::mono_tile::hsla(hue, 0.42, 0.55, 1.0);
 
     if let Some((tex, size)) = thumb {
@@ -525,7 +516,7 @@ fn paint_tile(
             let rows = 5i32;
             let cell_w = rect.width() / cols as f32;
             let cell_h = rect.height() / rows as f32;
-            let mut seed = uikit_egui::mono_tile::hue(&item.path) as u64;
+            let mut seed = uikit_egui::mono_tile::hue(path) as u64;
             for row in 0..rows {
                 for col in 0..cols {
                     // xorshift-ish mix so nearby cells don't look correlated
@@ -1062,6 +1053,65 @@ mod draw_tests {
         drag(&mut f, &mut app, 300.0, 800.0);
         assert_eq!(app.viewing.as_deref(), Some(order[0].as_str()), "and back");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only the days in view are laid out, from arithmetic: scrolled far down
+    /// a large library, the tiles drawn are the ones at that depth, in the
+    /// grid's order, and a tap opens the photo under the finger.
+    #[test]
+    fn scrolled_deep_the_right_tiles_are_drawn_and_tapped() {
+        let items: Vec<photosync::album::Item> = (0..3000).map(|i| photosync::album::Item { path: format!("/p/{i:05}.jpg"),
+            taken_at: 1_600_000_000 + i * 20_000, thumbnail: None, bytes: 1, metadata_json: None }).collect();
+        let mut app = App::new(photosync::album::Library::new(items));
+        let mut f = Frames::new();
+        f.run(&mut app, vec![]);
+        let top: Vec<String> = app.last_tiles.iter().map(|t| t.0.clone()).collect();
+        let order = app.visible_order();
+        assert_eq!(top[0], order[0]);
+        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -60_000.0),
+            phase: egui::TouchPhase::Move, modifiers: Default::default() };
+        f.run(&mut app, vec![egui::Event::PointerMoved(Pos2::new(600.0, 400.0)), wheel]);
+        for _ in 0..30 { f.run(&mut app, vec![]); }
+        let drawn: Vec<usize> = app.last_tiles.iter().map(|(p, _)| order.iter().position(|o| o == p).unwrap()).collect();
+        assert!(!drawn.is_empty() && drawn.len() < 80, "a screenful, not the library: {}", drawn.len());
+        assert!(drawn[0] > 200, "deep in the library: first drawn is #{}", drawn[0]);
+        assert!(drawn.windows(2).all(|w| w[0] < w[1]), "in the grid's order");
+        // Every drawn tile is on screen or within the one row of overscan
+        // `visible_range` adds to decode ahead, and they do not overlap.
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1040.0, 720.0));
+        let row = app.last_tiles[0].1.height() + 6.0;
+        assert!(app.last_tiles.iter().all(|(_, r)| r.intersects(screen.expand2(Vec2::new(0.0, row + 1.0)))),
+            "{:?}", app.last_tiles.iter().map(|t| t.1.min.y).collect::<Vec<_>>());
+        for (i, (_, a)) in app.last_tiles.iter().enumerate() {
+            for (_, b) in &app.last_tiles[i + 1..] { assert!(!a.shrink(0.5).intersects(b.shrink(0.5)), "{a:?} {b:?}"); }
+        }
+        let (path, rect) = app.last_tiles.iter().find(|(_, r)| screen.shrink(60.0).contains_rect(*r)).cloned().expect("a whole tile in view");
+        f.click(&mut app, rect.center(), egui::PointerButton::Primary);
+        assert_eq!(app.viewing.as_deref(), Some(path.as_str()), "the tap opens the tile under it");
+    }
+
+    /// A big day that starts halfway down the screen: only its rows that are
+    /// on screen (plus the overscan row) are drawn — not a screenful counted
+    /// from where it starts — and there is room for its heading between the
+    /// days.
+    #[test]
+    fn a_long_day_below_a_short_one_draws_only_what_is_on_screen() {
+        let day = 86_400;
+        let mut items: Vec<photosync::album::Item> = (0..2).map(|i| photosync::album::Item { path: format!("/new/{i}"),
+            taken_at: 1_750_000_000 + day + i, thumbnail: None, bytes: 1, metadata_json: None }).collect();
+        items.extend((0..400).map(|i| photosync::album::Item { path: format!("/old/{i:03}"),
+            taken_at: 1_750_000_000 + i, thumbnail: None, bytes: 1, metadata_json: None }));
+        let mut app = App::new(photosync::album::Library::new(items));
+        let mut f = Frames::new();
+        f.run(&mut app, vec![]);
+        f.run(&mut app, vec![]);
+        let row = app.last_tiles[0].1.height() + 6.0;
+        let bottom = 720.0 + row + 1.0;
+        assert!(app.last_tiles.iter().all(|(_, r)| r.min.y < bottom),
+            "drawn below the screen and its overscan row: {:?}", app.last_tiles.iter().map(|t| t.1.min.y).collect::<Vec<_>>());
+        let new_bottom = app.last_tiles.iter().filter(|t| t.0.starts_with("/new/")).map(|t| t.1.max.y).fold(0.0, f32::max);
+        let old_top = app.last_tiles.iter().filter(|t| t.0.starts_with("/old/")).map(|t| t.1.min.y).fold(f32::INFINITY, f32::min);
+        assert!(old_top - new_bottom >= 22.0 + 20.0, "a gap and a heading between the days: {new_bottom} -> {old_top}");
     }
 
     /// In an album the viewer's arrows stay in the album; they used to walk

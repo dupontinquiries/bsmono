@@ -82,7 +82,30 @@ pub struct App {
     /// The drawer (the rail's contents, on a phone) is open.
     pub drawer_open: bool,    /// The viewer's photo, dragged sideways this far (px) by a swipe in progress.
     pub viewer_dx: f32,
+    /// Bumped by every change to albums or the library made through `App`;
+    /// part of the key `groups` is cached under.
+    pub generation: u64,
+    groups_cache: Option<(GroupsKey, std::rc::Rc<Groups>)>,
 }
+
+/// The grid's content for one view: days, newest first, each with its
+/// heading and its photos' paths in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Groups {
+    pub days: Vec<(String, Vec<String>)>,
+}
+
+impl Groups {
+    pub fn len(&self) -> usize { self.days.iter().map(|(_, v)| v.len()).sum() }
+    pub fn is_empty(&self) -> bool { self.days.is_empty() }
+    pub fn order(&self) -> Vec<String> { self.days.iter().flat_map(|(_, v)| v.iter().cloned()).collect() }
+}
+
+/// What `groups` depends on. The library's and the album's sizes are in it
+/// as well as the generation so a change made directly on `app.library`
+/// (tests do) is not served stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupsKey { view: View, generation: u64, items: usize, in_album: usize, today: i64 }
 
 /// Below this window width the rail becomes a drawer, the header condenses
 /// and tiles size themselves to the screen. The rail (200) beside two
@@ -111,6 +134,35 @@ pub fn swipe_step(dx: f32, width: f32, velocity_x: f32) -> i32 {
     let far = dx.abs() > 0.2 * width;
     let flick = velocity_x.abs() > 500.0 && dx.abs() > 24.0 && dx.signum() == velocity_x.signum();
     if far || flick { if dx < 0.0 { 1 } else { -1 } } else { 0 }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// A day's heading: "Today", "Yesterday", "Saturday 20 September" within the
+/// year, "20 September 2025" before it. `day` and `today` are days since
+/// the epoch in the library's frame (UTC of the camera's clock — see
+/// `photosync::exif::taken_at`), so "Today" is the camera-clock day too.
+pub fn day_heading(day: i64, today: i64) -> String {
+    const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July",
+        "August", "September", "October", "November", "December"];
+    const WEEKDAYS: [&str; 7] = ["Thursday", "Friday", "Saturday", "Sunday", "Monday", "Tuesday", "Wednesday"];
+    if day == today { return "Today".into(); }
+    if day == today - 1 { return "Yesterday".into(); }
+    let ymd = |d: i64| {
+        let item = photosync::album::Item { path: String::new(), taken_at: d * 86_400, thumbnail: None, bytes: 0, metadata_json: None };
+        let s = item.day();
+        (s[..s.len() - 6].parse::<i64>().unwrap_or(0), s[s.len() - 5..s.len() - 3].parse::<usize>().unwrap_or(1),
+         s[s.len() - 2..].parse::<u32>().unwrap_or(1))
+    };
+    let (y, m, d) = ymd(day);
+    let month = MONTHS[(m.clamp(1, 12)) - 1];
+    if y == ymd(today).0 && day <= today {
+        format!("{} {d} {month}", WEEKDAYS[day.rem_euclid(7) as usize])
+    } else {
+        format!("{d} {month} {y}")
+    }
 }
 
 fn plural(n: usize) -> &'static str { if n == 1 { "" } else { "s" } }
@@ -159,6 +211,8 @@ impl App {
             compact: false,
             drawer_open: false,
             viewer_dx: 0.0,
+            generation: 0,
+            groups_cache: None,
         }
     }
 
@@ -194,6 +248,7 @@ impl App {
         let conn = rusqlite::Connection::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         photosync::album::load_albums(&conn, &mut self.library).map_err(|e| format!("{}: {e}", path.display()))?;
         self.albums_db = Some(path.to_path_buf());
+        self.generation += 1;
         Ok(())
     }
 
@@ -214,11 +269,44 @@ impl App {
     /// The photos the grid shows now, in its order: the library by day, or
     /// the open album. Shift-selection ranges and the viewer's arrows walk
     /// this — so stepping through an album stays in the album.
-    pub fn visible_order(&self) -> Vec<String> {
-        match &self.view {
-            View::Album(name) => self.library.album_items(name).into_iter().map(|i| i.path.clone()).collect(),
-            _ => self.library.by_day().into_iter().flat_map(|(_, v)| v.into_iter().map(|i| i.path.clone())).collect(),
+    pub fn visible_order(&mut self) -> Vec<String> {
+        self.groups().order()
+    }
+
+    /// The grid's days for the current view, cached. Grouping walks every
+    /// photo and formats its date: 15 ms for 20 000 photos in a debug build,
+    /// half of every frame when it ran per frame — on a phone's CPU, the
+    /// whole budget.
+    pub fn groups(&mut self) -> std::rc::Rc<Groups> {
+        let today = now_secs().div_euclid(86_400);
+        let key = GroupsKey {
+            view: self.view.clone(),
+            generation: self.generation,
+            items: self.library.len(),
+            in_album: match &self.view { View::Album(n) => self.library.album(n).map_or(0, |a| a.items.len()), _ => 0 },
+            today,
+        };
+        if let Some((k, g)) = &self.groups_cache {
+            if *k == key { return g.clone(); }
         }
+        let items: Vec<&photosync::album::Item> = match &self.view {
+            View::Album(name) => self.library.album_items(name),
+            View::Library => self.library.by_day().into_iter().flat_map(|(_, v)| v).collect(),
+            View::Settings => Vec::new(),
+        };
+        let mut days: Vec<(String, Vec<String>)> = Vec::new();
+        let mut last_day = None;
+        for i in items {
+            let d = i.taken_at.div_euclid(86_400);
+            if last_day != Some(d) {
+                days.push((day_heading(d, today), Vec::new()));
+                last_day = Some(d);
+            }
+            days.last_mut().unwrap().1.push(i.path.clone());
+        }
+        let g = std::rc::Rc::new(Groups { days });
+        self.groups_cache = Some((key, g.clone()));
+        g
     }
 
     /// Make an album, with the selection in it if there is one, and show it.
@@ -233,6 +321,7 @@ impl App {
         self.status = if n > 0 { format!("Created album \"{name}\" with {n} photo{}", plural(n)) }
                       else { format!("Created album \"{name}\"") };
         self.view = View::Album(name);
+        self.generation += 1;
         self.persist_albums();
         true
     }
@@ -246,6 +335,7 @@ impl App {
             (n, 0) => format!("Added {n} photo{} to \"{album}\"", plural(n)),
             (n, already) => format!("Added {n} to \"{album}\" ({already} already in it)"),
         };
+        self.generation += 1;
         self.persist_albums();
         n
     }
@@ -256,6 +346,7 @@ impl App {
         let n = self.selected.paths().iter().filter(|p| self.library.remove_from_album(album, p)).count();
         self.selected.clear();
         self.status = format!("Removed {n} photo{} from \"{album}\" (the photos are kept)", plural(n));
+        self.generation += 1;
         self.persist_albums();
         n
     }
@@ -267,6 +358,7 @@ impl App {
         self.selected.clear();
         if self.view == View::Album(album.to_string()) { self.view = View::Library; }
         self.status = format!("Deleted album \"{album}\" (its photos are still in the library)");
+        self.generation += 1;
         self.persist_albums();
         true
     }
@@ -332,6 +424,37 @@ mod from_path_tests {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[test]
+    fn day_headings_read_like_a_camera_roll() {
+        let today = 20_716; // 2026-09-20, a Sunday
+        assert_eq!(day_heading(today, today), "Today");
+        assert_eq!(day_heading(today - 1, today), "Yesterday");
+        assert_eq!(day_heading(today - 2, today), "Friday 18 September");
+        assert_eq!(day_heading(today - 262, today), "Thursday 1 January");
+        assert_eq!(day_heading(today - 263, today), "31 December 2025");
+        assert_eq!(day_heading(-1, today), "31 December 1969");
+        assert_eq!(day_heading(today + 3, today), "23 September 2026", "a camera clock ahead of ours: no weekday guess");
+    }
+
+    #[test]
+    fn groups_are_cached_and_follow_changes_made_through_the_app() {
+        let items: Vec<photosync::album::Item> = (0..6).map(|i| photosync::album::Item { path: format!("/p/{i}"),
+            taken_at: 1_750_000_000 + i * 40_000, thumbnail: None, bytes: 1, metadata_json: None }).collect();
+        let mut app = App::new(photosync::album::Library::new(items));
+        let a = app.groups();
+        assert!(std::rc::Rc::ptr_eq(&a, &app.groups()), "the second call is the cache");
+        assert_eq!(a.len(), 6);
+        assert_eq!(a.order()[0], "/p/5", "newest first");
+        app.selected.set(["/p/1".to_string(), "/p/4".to_string()]);
+        app.new_album("Two");
+        assert_eq!(app.groups().order(), vec!["/p/4", "/p/1"], "the album's view");
+        app.selected.set(["/p/4".to_string()]);
+        app.remove_selection_from("Two");
+        assert_eq!(app.groups().order(), vec!["/p/1"], "a removal shows");
+        app.view = View::Library;
+        assert_eq!(app.groups().len(), 6);
+    }
 
     #[test]
     fn a_swipe_steps_when_far_or_flicked_and_springs_back_otherwise() {
