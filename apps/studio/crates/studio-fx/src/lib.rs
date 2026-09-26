@@ -100,6 +100,21 @@ impl Biquad {
                  x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0 }
     }
 
+    /// The RBJ second-order ALLPASS: unity magnitude, a phase turn about
+    /// `freq`. At Q = 1/sqrt(2) it is EXACTLY an LR4 crossover's low + high
+    /// halves summed (analog: (s^4 + 1)/(s^2 + sqrt2 s + 1)^2 = (s^2 - sqrt2 s
+    /// + 1)/(s^2 + sqrt2 s + 1); the bilinear transform keeps it) -- one
+    /// section where the multiband ran four.
+    pub fn allpass(rate: f32, freq: f32, q: f32) -> Biquad {
+        let f = freq.clamp(1.0, rate * 0.49);
+        let w = std::f32::consts::TAU * f / rate;
+        let (sn, cs) = (w.sin(), w.cos());
+        let alpha = sn / (2.0 * q.max(0.01));
+        let a0 = 1.0 + alpha;
+        Biquad { b0: (1.0 - alpha) / a0, b1: -2.0 * cs / a0, b2: 1.0, a1: -2.0 * cs / a0, a2: (1.0 - alpha) / a0,
+                 x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0 }
+    }
+
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
