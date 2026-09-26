@@ -456,7 +456,13 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         if choke.is_some() && c["fade_out"].as_u64().unwrap_or(0) > 0 {
             choke_fades.push(format!("{} ({})", ch_name(c), c["fade_out"].as_u64().unwrap_or(0)));
         }
-        rack.channels.push(Channel { name: ch_name(c), kind, gain: (channel_gain(c, media) * trim).clamp(0.0, 64.0),
+        // a SAMPLER plays at unity at the knob's 78% default, as an audio clip
+        // does (Image-Line forum: "a normalized audio clip [in Sampler] peaks at
+        // 0 dB on the meter with Channel Volume at 78%"). The +5.2 dB went to
+        // playlist clips only, leaving every pattern-played drum 5.2 dB short.
+        // Stand-in synths keep the knob's own law: their level is a guess anyway.
+        let sample_level = matches!(kind, SynthKind::Sampler { .. });
+        rack.channels.push(Channel { name: ch_name(c), kind, gain: (channel_gain_for(c, media, sample_level) * trim).clamp(0.0, 64.0),
                                      pan, muted: off, choke_group: choke, one_shot: false });
     }
     if !choke_ids.is_empty() {
@@ -1175,7 +1181,11 @@ mod tests {
         assert_eq!(fl_pan(0.0), -1.0);
         assert_eq!(fl_pan(12800.0), 1.0);
         let kick = im.rack.channels.iter().find(|c| c.name == "Kick").unwrap();
-        assert!((20.0 * kick.gain.log10() + 5.2).abs() < 0.05, "a rack channel at the default knob is -5.2 dB, as FL says: {}", kick.gain);
+        assert!((20.0 * kick.gain.log10()).abs() < 0.05, "a SAMPLER at the default knob plays at unity (knob -5.2 dB, +5.2 for samples): {}", kick.gain);
+        // ...and only a sampler: a stand-in synth at the same knob stays at the knob's -5.2 dB
+        let synth = im.rack.channels.iter().find(|c| c.name == "Omnisphere").unwrap();
+        assert!(matches!(synth.kind, SynthKind::Poly { .. }), "the fixture's stand-in is a Poly: {:?}", synth.kind);
+        assert!((20.0 * synth.gain.log10() + 5.2).abs() < 0.05, "a stand-in synth at the default knob is -5.2 dB: {}", synth.gain);
         assert!((fl_knob_gain(12800.0) - 1.0).abs() < 1e-6 && (20.0 * fl_fader_gain(16000.0).log10() - 5.6).abs() < 0.05, "the published points");
     }
 
