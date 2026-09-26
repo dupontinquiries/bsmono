@@ -113,6 +113,7 @@ pub fn guide_for(ab: &AbilityDef, from: Vec3, aim: Vec3) -> Guide {
         Archetype::Ring { radius, .. } => Guide::Circle { at: at(14.0), radius },
         Archetype::Storm { radius, .. } => Guide::Circle { at: at(12.0), radius },
         Archetype::Pull { radius, .. } => Guide::Circle { at: at(radius), radius },
+        Archetype::Meteor { range, radius, .. } => Guide::Circle { at: at(range), radius },
         Archetype::Nova { radius, .. } | Archetype::Heal { radius, .. } => Guide::Around { at: from, radius },
         Archetype::Shield { .. } | Archetype::Buff { .. } => Guide::Around { at: from, radius: 1.6 },
     }
@@ -203,6 +204,7 @@ mod tests {
                             Archetype::Ring { .. } => 14.0,
                             Archetype::Storm { .. } => 12.0,
                             Archetype::Pull { radius, .. } => radius,
+                            Archetype::Meteor { range, .. } => range,
                             _ => unreachable!(),
                         };
                         let v = at - from;

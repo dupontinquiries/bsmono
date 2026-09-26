@@ -50,7 +50,7 @@ pub struct Ancestor {
     pub instruments: &'static str,
 }
 
-pub const ANCESTORS: [Ancestor; 13] = [
+pub const ANCESTORS: [Ancestor; 14] = [
     Ancestor {
         name: "Goldenmane",
         species: "lion",
@@ -168,6 +168,15 @@ pub const ANCESTORS: [Ancestor; 13] = [
         story: "The grey ghost of the crags, seldom seen and never late. She crossed the high passes in every weather; the mountain taught her not to hurry.",
         instruments: "long mountain horns, singing bowls, damaru drum, low chant; high wind, falling scree",
     },
+    Ancestor {
+        name: "Cometail",
+        species: "caracal",
+        age: "the elder dawn",
+        land: "the glacier-sky above the cloud sea, where the Starwell is",
+        gender: Gender::Male,
+        story: "A caracal who leapt so high after the birds that he caught the tail of a falling comet, and came down with it onto the glacier. Where he landed, the Starwell opened, and he has been a little made of starlight ever since. He never once asked where he might land.",
+        instruments: "glass harmonica, crystal bowls, frame drum, overtone singing; the hiss of a meteor, ice cracking in the cold",
+    },
 ];
 
 pub fn of(name: &str) -> Option<&'static Ancestor> {
@@ -245,6 +254,6 @@ mod tests {
     #[test]
     fn the_cast_is_balanced() {
         let f = ANCESTORS.iter().filter(|a| a.gender == Gender::Female).count();
-        assert!((6..=7).contains(&f), "{f} of 13 female");
+        assert!((6..=8).contains(&f) && (f as i32 - (ANCESTORS.len() - f) as i32).abs() <= 1, "{f} of {} female", ANCESTORS.len());
     }
 }

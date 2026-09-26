@@ -17,6 +17,11 @@ use clawbound::consts::{Lane, Team, TOWER_RANGE};
 use clawbound::sim::*;
 
 fn main() {
+    // CLAWBOUND_MAP=starwell (or pass): the probe on another map, with its
+    // floor as collision (what keeps cats off the sky map's void)
+    if let Some(m) = std::env::var("CLAWBOUND_MAP").ok().as_deref().and_then(clawbound::map::MapId::from_key) {
+        clawbound::map::set_active(m);
+    }
     let args: Vec<f32> = std::env::args().skip(1).filter_map(|a| a.parse().ok()).collect();
     let matches = args.first().copied().unwrap_or(6.0) as u64;
     let max_t = args.get(1).copied().unwrap_or(8.0) * 60.0;
@@ -24,8 +29,17 @@ fn main() {
     let t0 = std::time::Instant::now();
     let mut why: std::collections::BTreeMap<String, u32> = Default::default();
     for m in 0..matches {
-        let (blue, red) = rosters(m * 17 + 3);
+        let (blue, red) = if clawbound::map::active() == clawbound::map::MapId::Jungle {
+            rosters(m * 17 + 3)
+        } else {
+            clawbound::map::team_picks((m % 13) as u32, &mut Rng::new(m * 17 + 3))
+        };
         let mut game = Game::new_teams(&blue, &red);
+        if let Some(f) = clawbound::map::floor() {
+            let mut b = clawbound::blockers::Blockers::new(clawbound::consts::arena_radius() + 20.0, 6.0);
+            b.set_floor(f);
+            game.blockers = std::sync::Arc::new(b);
+        }
         game.rng = Rng::new(0xB0B ^ m.wrapping_mul(7919));
         game.gods[0].is_player = false;
         game.gods[0].ai = Some(AiBrain::new(Lane::Mid, 0.7));
@@ -36,11 +50,12 @@ fn main() {
         let mut last_target: Vec<Option<TargetRef>> = vec![None; n];
         let dt = 1.0 / 60.0;
         let mut first_tower = None;
+        let towers0 = game.tower_alive[0] + game.tower_alive[1];
         while game.over.is_none() && game.t < max_t {
             game.tick(dt);
             game.events.clear();
             let t = game.t;
-            if first_tower.is_none() && game.tower_alive[0] + game.tower_alive[1] < 12 {
+            if first_tower.is_none() && game.tower_alive[0] + game.tower_alive[1] < towers0 {
                 first_tower = Some(t);
             }
             for i in 0..n {
@@ -90,7 +105,16 @@ fn main() {
             Some(Team::Red) => 1,
             None => 2,
         }] += 1;
-        eprintln!("  match {m}: {:.0}s over={:?} towers={:?} first tower at {:?}", game.t, game.over, game.tower_alive, first_tower.map(|t| t as i32));
+        eprintln!(
+            "  match {m}: {:.0}s over={:?} towers={:?} first tower at {:?} minions {} boss kills {:?} titans {:?}",
+            game.t,
+            game.over,
+            game.tower_alive,
+            first_tower.map(|t| t as i32),
+            game.minions.len(),
+            game.bosses.list.iter().map(|b| (b.kind, b.kills)).collect::<Vec<_>>(),
+            game.titans.iter().map(|t| t.hp as i32).collect::<Vec<_>>()
+        );
     }
     let per = |x: f32| x / matches as f32;
     println!(

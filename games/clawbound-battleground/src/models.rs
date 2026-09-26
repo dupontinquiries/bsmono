@@ -276,6 +276,28 @@ fn god_grid(def: &GodDef, team: Team) -> Grid {
             }
             g.set(cx, hy as i32 + 3, hz as i32 + 4, solid(accent));
         }
+        PeltKind::Comet => {
+            // stars on the back: accent specks on the upper shell
+            paint_shell(&mut g, |x, y, z| {
+                if y < 24 || (z - cz).abs() > 18 {
+                    return false;
+                }
+                let h = ((x * 31 + z * 17 + y * 7) as u32).wrapping_mul(2654435761) >> 24;
+                h > 238
+            }, solid(accent));
+            // a starmark blaze on the brow
+            g.set(cx, hy as i32 + 3, hz as i32 + 4, solid(accent));
+            g.set(cx, hy as i32 + 4, hz as i32 + 3, solid(accent));
+            // the tail streams light: a comet's plume rising off its tip,
+            // fading from the accent to the belly's pale silver (up, not
+            // back: the grid ends a few cells behind the tail)
+            for i in 0..8 {
+                let t = i as f32 / 7.0;
+                let (x, y, z) = (cxf + (t * 5.0).sin() * 0.8, 33.0 + t * 7.0, czf - 24.0 - t * 1.5);
+                let r = 1.4 * (1.0 - t * 0.6);
+                g.ellipsoid(x, y, z, r, r, r * 1.3, solid(mix(accent, second, t)));
+            }
+        }
         PeltKind::Antlers => {
             // antlers: a main beam sweeping up and back with two tines each
             for sx in [-1i32, 1] {
@@ -336,7 +358,7 @@ mod rig_tests {
     /// a hole that only shows in one pose.
     #[test]
     fn every_ancestor_cuts_into_ten_nonempty_parts_and_loses_nothing() {
-        assert_eq!(ROSTER.len(), 13);
+        assert_eq!(ROSTER.len(), 14);
         for def in ROSTER.iter() {
             let grid = god_grid(def, Team::Blue);
             let plan = feline_cut_plan(role_bulk(def.role), matches!(def.pelt, PeltKind::Antlers));

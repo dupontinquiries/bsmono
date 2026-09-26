@@ -46,8 +46,10 @@ pub struct HealTree {
 /// pockets clear of lanes, rivers and bases, then mirrored through the
 /// centre so both sides have the same walk.
 pub fn heal_tree_positions() -> [Vec3; 6] {
-    if crate::map::active() == crate::map::MapId::Pass {
-        return crate::pass::heal_tree_positions();
+    match crate::map::active() {
+        crate::map::MapId::Pass => return crate::pass::heal_tree_positions(),
+        crate::map::MapId::Sky => return crate::sky::heal_tree_positions(),
+        crate::map::MapId::Jungle => {}
     }
     let mut rng = Rng::new(0x7EE5);
     let s = MAP_SCALE;

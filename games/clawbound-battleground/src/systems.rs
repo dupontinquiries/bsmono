@@ -15,7 +15,7 @@ impl Game {
         // 1. minion waves
         if self.t >= self.next_wave_t {
             self.next_wave_t = self.t + WAVE_INTERVAL;
-            for lane in LANES {
+            for &lane in crate::map::lanes() {
                 for team in [Team::Blue, Team::Red] {
                     self.spawn_wave(lane, team);
                 }
@@ -30,7 +30,7 @@ impl Game {
             if self.gods[i].respawn_t > 0.0 {
                 continue;
             }
-            if self.gods[i].ai.is_some() {
+            if self.gods[i].ai.is_some() && self.gods[i].skyfall.is_none() {
                 crate::ai::think(self, i);
             }
         }
@@ -64,6 +64,7 @@ impl Game {
         self.wild_tick(dt);
         // 6d. objectives (bosses.rs)
         self.bosses_tick(dt);
+        self.moonwell_tick(dt);
         // 6e. catastrophes (disasters.rs)
         self.disasters_tick(dt);
 
@@ -75,10 +76,14 @@ impl Game {
         let path = lane.path_for(team);
         let scale = 1.0 + (self.t / 60.0).min(15.0) * 0.07;
         let hp = MINION_HP * scale;
-        // melee in a loose front of three, casters behind them
-        let front = [[0.0f32, 0.0], [1.3, 0.9], [1.3, -0.9]];
-        let back = [[-1.6f32, 0.5], [-1.6, -0.5]];
-        let (melee, casters) = crate::minionai::wave_for(self.waves);
+        // melee in ranks of up to four abreast, casters in ranks behind
+        let (melee, casters) = crate::map::active().wave(self.waves);
+        let rank = |k: usize, n: usize, back: f32| -> [f32; 2] {
+            let per = n.min(4).max(1);
+            let (row, col) = (k / per, k % per);
+            let across = (col as f32 - (per as f32 - 1.0) * 0.5) * 1.3 + if row % 2 == 1 { 0.4 } else { 0.0 };
+            [back - row as f32 * 1.4, across]
+        };
         let ahead = {
             let d = path[1.min(path.len() - 1)] - path[0];
             Vec3::new(d.x, 0.0, d.z).normalize_or(Vec3::Z)
@@ -86,7 +91,16 @@ impl Game {
         let side = Vec3::new(-ahead.z, 0.0, ahead.x);
         for k in 0..melee + casters {
             let caster = k >= melee;
-            let o = if caster { back[(k - melee) % 2] } else { front[k % 3] };
+            // a small wave keeps the wedge it had (a front of three, the
+            // casters behind); a big one marches in ranks
+            let o = if melee + casters <= 5 {
+                const FRONT: [[f32; 2]; 3] = [[0.0, 0.0], [1.3, 0.9], [1.3, -0.9]];
+                const BACK: [[f32; 2]; 2] = [[-1.6, 0.5], [-1.6, -0.5]];
+                if caster { BACK[(k - melee) % 2] } else { FRONT[k % 3] }
+            } else {
+                let melee_rows = ((melee + 3) / 4) as f32;
+                if caster { rank(k - melee, casters, -melee_rows * 1.4 - 0.4) } else { rank(k, melee, 0.0) }
+            };
             let id = self.next_minion_id;
             self.next_minion_id += 1;
             let think_t = self.rng.f32() * crate::minionai::THINK_EVERY;
@@ -259,9 +273,24 @@ impl Game {
         // Leap requests. Refused silently when the cat cannot leap right
         // now; the binding is a press, not a promise.
         let now = self.t;
+        // The sky map's clouds this tick: where each deck is, how far it
+        // moved since last tick (riders are carried by that), and which pier
+        // it is docked at.
+        let ferries = self.ferries.clone();
+        let clouds: Vec<(Vec3, Vec3, Option<u8>)> = ferries
+            .iter()
+            .map(|f| {
+                let c = f.at(now);
+                (c.pos, c.pos - f.at(now - dt).pos, c.docked)
+            })
+            .collect();
+        let sky = crate::map::active() == crate::map::MapId::Sky;
+        // dashes that finish this tick: their damage is dealt after the
+        // movement loop (it needs the whole game, the loop holds one cat)
+        let mut dash_ends: Vec<(usize, Team, Vec3, Vec3, f32, Option<(f32, f32)>)> = Vec::new();
         for (i, aim) in std::mem::take(&mut self.leap_queue) {
             let Some(g) = self.gods.get_mut(i) else { continue };
-            if g.respawn_t > 0.0 || g.dash.is_some() || g.fall.is_some() {
+            if g.respawn_t > 0.0 || g.dash.is_some() || g.fall.is_some() || g.skyfall.is_some() {
                 continue;
             }
             // Bounding: from a perch, or buffered during a landing, the next
@@ -271,10 +300,20 @@ impl Game {
                 continue;
             };
             let aim = if aim.length_squared() > 1e-4 { aim } else { Vec3::new(g.yaw.cos(), 0.0, g.yaw.sin()) };
-            if let Some(plan) = crate::leap::plan(g.pos, aim, g.perch, &blockers) {
+            // each cloud where it will be when a leap from here to it lands
+            let platforms: Vec<crate::ferry::Platform> = ferries
+                .iter()
+                .map(|f| {
+                    let run = (f.at(now).pos - g.pos).length().min(crate::leap::LEAP_RANGE);
+                    crate::ferry::Platform { at: f.at(now + crate::leap::time_to_land(run, chained)).pos, r: crate::ferry::CLOUD_R }
+                })
+                .collect();
+            if let Some((plan, ride)) = crate::leap::plan_onto(g.pos, aim, g.perch, &blockers, &platforms) {
                 g.yaw = (plan.to.z - g.pos.z).atan2(plan.to.x - g.pos.x);
                 g.leap = Some(crate::leap::LeapState::begin(g.pos, plan, chained));
                 g.perch = None;
+                g.riding = None;
+                g.ride_plan = ride.map(|k| k as u8);
             }
         }
         for i in 0..self.gods.len() {
@@ -283,7 +322,36 @@ impl Game {
                 self.gods[i].leap = None;
                 self.gods[i].perch = None;
                 self.gods[i].fall = None;
+                self.gods[i].riding = None;
+                self.gods[i].ride_plan = None;
+                self.gods[i].skyfall = None;
                 continue;
+            }
+            // Falling into the cloud sea: down through the clouds, then the
+            // Starwell sets the cat down at its fountain (not a death).
+            if let Some(left) = self.gods[i].skyfall {
+                let g = &mut self.gods[i];
+                let fallen = crate::ferry::SKYFALL_SECS - left;
+                g.pos.y = -0.5 * crate::leap::GRAVITY * 0.4 * fallen * fallen;
+                g.move_dir = Vec3::ZERO;
+                if left - dt <= 0.0 {
+                    let f = g.team.fountain();
+                    g.pos = Vec3::new(f.x, crate::map::ground_y(f.x, f.z), f.z);
+                    g.hp = (g.hp - g.max_hp * crate::ferry::SKYFALL_COST).max(1.0);
+                    g.skyfall = None;
+                    self.events.push(Event::Announce { text: format!("{} is carried home by the Starwell", self.def(i).name) });
+                } else {
+                    g.skyfall = Some(left - dt);
+                }
+                continue;
+            }
+            // a rider is carried with its cloud (not while in the air)
+            if let Some(k) = self.gods[i].riding {
+                if self.gods[i].leap.is_none() {
+                    if let Some(&(_, delta, _)) = clouds.get(k as usize) {
+                        self.gods[i].pos += Vec3::new(delta.x, 0.0, delta.z);
+                    }
+                }
             }
             // a wind-up slows the caster; a channel roots it
             let speed = self.move_speed(i) * self.gods[i].casting.map_or(1.0, |c| c.move_mul);
@@ -305,6 +373,15 @@ impl Game {
                 if done {
                     g.perch = l.perch;
                     g.leap = None;
+                    // aimed at a cloud: on it, or missed it
+                    if let Some(k) = g.ride_plan.take() {
+                        let on = ferries.get(k as usize).is_some_and(|f| f.on_deck(now, g.pos.x, g.pos.z, -0.6));
+                        if on {
+                            g.riding = Some(k);
+                        } else if blockers.floor().is_some_and(|f| !f.fits(g.pos.x, g.pos.z, GOD_RADIUS * 0.5)) {
+                            g.skyfall = Some(crate::ferry::SKYFALL_SECS);
+                        }
+                    }
                     // winded: the next leap cools twice as long
                     g.leap_cd = crate::leap::LEAP_COOLDOWN * if now - g.last_dmg_t < crate::brawl::WINDED_SECS { crate::brawl::WINDED_COOLDOWN } else { 1.0 };
                 }
@@ -315,10 +392,11 @@ impl Game {
                 // went INTO the slope, then snapped up at the end
                 let p = d.from.lerp(d.to, a);
                 let gy = crate::map::ground_y(p.x, p.z);
-                g.pos = Vec3::new(p.x, p.y.max(gy), p.z) + Vec3::Y * (a * (1.0 - a) * 4.0 * 0.35);
+                g.pos = Vec3::new(p.x, p.y.max(gy), p.z) + Vec3::Y * (a * (1.0 - a) * 4.0 * d.arc);
                 if a >= 1.0 {
                     let gy = crate::map::ground_y(d.to.x, d.to.z);
                     g.pos = Vec3::new(d.to.x, d.to.y.max(gy), d.to.z);
+                    dash_ends.push((i, g.team, d.from, d.to, d.dmg, d.blast));
                     g.dash = None;
                 }
                 g.walk_anim += dt * 12.0;
@@ -363,7 +441,36 @@ impl Game {
                 _ if g.dash.is_some() || g.fall.is_some() => g.pos.y,
                 _ => f32::NEG_INFINITY,
             };
-            g.pos = blockers.resolve_at(g.pos, GOD_RADIUS, feet);
+            // In the air over the sky map's chasms, or riding a cloud across
+            // one, the floor's edge does not apply (it would drag the cat
+            // back to the nearest island); props still do.
+            g.pos = if sky && (g.riding.is_some() || g.leap.is_some() || g.skyfall.is_some()) {
+                blockers.resolve_free(g.pos, GOD_RADIUS, feet)
+            } else {
+                blockers.resolve_at(g.pos, GOD_RADIUS, feet)
+            };
+            // On a cloud: stay on the deck, or step off onto a pier it is
+            // docked at.
+            if let Some(k) = g.riding {
+                if g.leap.is_none() {
+                    if let Some(&(deck, _, docked)) = clouds.get(k as usize) {
+                        let off = Vec3::new(g.pos.x - deck.x, 0.0, g.pos.z - deck.z).length();
+                        let onto_pier = docked.is_some() && blockers.floor().is_some_and(|f| f.fits(g.pos.x, g.pos.z, GOD_RADIUS));
+                        if off > crate::ferry::CLOUD_R - GOD_RADIUS {
+                            if onto_pier {
+                                g.riding = None;
+                            } else {
+                                g.pos = crate::ferry::clamp_to_deck(g.pos, deck, GOD_RADIUS);
+                            }
+                        }
+                        if g.riding.is_some() {
+                            g.pos.y = deck.y;
+                        }
+                    } else {
+                        g.riding = None;
+                    }
+                }
+            }
             // Perch upkeep: still over the thing we are standing on?
             if let Some(top) = g.perch {
                 use crate::leap::{Fall, KNOCK_OFF_FRAC};
@@ -437,6 +544,9 @@ impl Game {
                 g.pos.x *= s;
                 g.pos.z *= s;
             }
+        }
+        for (gi, team, from, to, dmg, blast) in dash_ends {
+            self.dash_strikes(gi, team, from, to, dmg, blast);
         }
         // separation
         for a in 0..self.gods.len() {
@@ -1169,8 +1279,10 @@ impl Game {
 
             {
                 let g = &mut self.gods[i];
+                // Quickening (the Moonwell): cooldowns at double speed
+                let rate = crate::moonwell::cooldown_rate(g.boon.map(|b| b.0));
                 for c in g.cds.iter_mut() {
-                    *c = (*c - dt).max(0.0);
+                    *c = (*c - dt * rate).max(0.0);
                 }
                 if g.buff_t > 0.0 {
                     g.buff_t -= dt;

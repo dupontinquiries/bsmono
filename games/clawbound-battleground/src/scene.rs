@@ -79,6 +79,12 @@ pub struct Scene {
     pub orb: u64,
     pub arrow: [u64; 2],
     pub boulder: u64,
+    /// A sky-map ferry cloud, and the height of its deck above the mesh's
+    /// feet (`skyprops::ferry_cloud`).
+    pub cloud: u64,
+    pub cloud_top: f32,
+    /// The Moonwyrm (sky map).
+    pub moonwyrm: u64,
     /// The crossing log: `props::fallen_log`, drawn per frame because it rolls.
     pub river_log: u64,
     pub total_voxels: usize,
@@ -337,6 +343,12 @@ impl Scene {
         let boulder = models::build_boulder();
         total += boulder.inst.len();
         let boulder = r.upload_mesh(&boulder);
+        let (cloud_m, cloud_top) = crate::skyprops::ferry_cloud(crate::ferry::CLOUD_R, 1);
+        total += cloud_m.inst.len();
+        let cloud = r.upload_mesh(&cloud_m);
+        let wyrm_m = crate::skyprops::moonwyrm();
+        total += wyrm_m.inst.len();
+        let moonwyrm = r.upload_mesh(&wyrm_m);
         let river_log_mesh = props::crossing_log();
         total += river_log_mesh.inst.len();
         let river_log = r.upload_mesh(&river_log_mesh);
@@ -374,6 +386,9 @@ impl Scene {
             orb,
             arrow,
             boulder,
+            cloud,
+            cloud_top,
+            moonwyrm,
             river_log,
             total_voxels: total,
             blockers: std::sync::Arc::new(blockers),
@@ -437,15 +452,26 @@ impl Scene {
             let (mesh, vs) = match b.kind {
                 crate::bosses::BossKind::Boar => (self.boar, models::BOAR_VOXEL),
                 crate::bosses::BossKind::Drake => (self.drake, models::DRAKE_VOXEL),
+                crate::bosses::BossKind::Moonwyrm => (self.moonwyrm, crate::skyprops::WYRM_VOX),
             };
             let breathe = (b.anim * 0.7).sin() * 0.03;
             let lunge = b.atk_anim * 0.8;
-            let hover = if b.kind == crate::bosses::BossKind::Drake { 0.4 + (b.anim * 0.5).sin() * 0.25 } else { 0.0 };
+            let hover = match b.kind {
+                crate::bosses::BossKind::Drake => 0.4 + (b.anim * 0.5).sin() * 0.25,
+                // sunk to the water line, rising and settling as it breathes
+                crate::bosses::BossKind::Moonwyrm => -0.35 + (b.anim * 0.4).sin() * 0.15,
+                crate::bosses::BossKind::Boar => 0.0,
+            };
             let fwd = Vec3::new(b.yaw.cos(), 0.0, b.yaw.sin());
             let m = Mat4::from_translation(b.pos + fwd * lunge + Vec3::Y * (breathe + hover))
                 * Mat4::from_axis_angle(Vec3::Y, -b.yaw + std::f32::consts::FRAC_PI_2)
                 * Mat4::from_scale(Vec3::splat(1.0 + breathe));
-            r.queue_draw(mesh, m, [1.0; 4], if b.kind == crate::bosses::BossKind::Drake { 0.25 } else { 0.0 }, vs, false);
+            let glow = match b.kind {
+                crate::bosses::BossKind::Drake => 0.25,
+                crate::bosses::BossKind::Moonwyrm => 0.06 + atm.night * 0.08,
+                crate::bosses::BossKind::Boar => 0.0,
+            };
+            r.queue_draw(mesh, m, [1.0; 4], glow, vs, false);
         }
 
         // heal trees: the crown frosts like the rest, the fruit glows —
@@ -481,9 +507,17 @@ impl Scene {
         }
         for team in [Team::Blue, Team::Red] {
             let ti = team as usize;
-            r.queue_draw(self.gate[ti], Mat4::IDENTITY, [1.0; 4], 0.0, 0.24, false);
-            r.queue_draw(self.fountain[ti], Mat4::IDENTITY, [1.0; 4], 0.25, 0.2, false);
-            r.queue_draw(self.pedestal[ti], Mat4::IDENTITY, [1.0; 4], 0.0, 0.22, false);
+            // At the base, not the origin: all three were drawn with the
+            // identity matrix from the first commit, so both teams' gates,
+            // fountains and pedestals stood stacked at the map's centre (on
+            // the sky map, in the middle of the Moonwell). The gate faces
+            // down the lanes, a little past the Elder; the mesh faces +z.
+            let face = if team == Team::Blue { 0.0 } else { std::f32::consts::PI };
+            let gate_at = team.titan_pos() + Vec3::new(0.0, 0.0, team.push_z() * 12.0);
+            let ground = |p: Vec3| Vec3::new(p.x, crate::map::ground_y(p.x, p.z), p.z);
+            r.queue_draw(self.gate[ti], Mat4::from_translation(ground(gate_at)) * Mat4::from_axis_angle(Vec3::Y, face), [1.0; 4], 0.0, 0.24, false);
+            r.queue_draw(self.fountain[ti], Mat4::from_translation(ground(team.fountain())), [1.0; 4], 0.25, 0.2, false);
+            r.queue_draw(self.pedestal[ti], Mat4::from_translation(ground(team.titan_pos())), [1.0; 4], 0.0, 0.22, false);
         }
 
         // birds circling high above the valley + the ziggurats
@@ -688,6 +722,18 @@ impl Scene {
         vfx.puppets.events = pevents;
 
         // the crossing logs: on the lane, or wherever the river left them
+        // the sky map's clouds, drifting over the chasms on their timetable;
+        // a slow bob and turn so they read as cloud, not platform
+        for (k, f) in game.ferries.iter().enumerate() {
+            let at = f.at(game.t).pos;
+            if !sphere_in_frustum(&vp, at, crate::ferry::CLOUD_R + 3.0) {
+                continue;
+            }
+            let bob = (vfx.time * 0.9 + k as f32 * 1.7).sin() * 0.06;
+            let m = Mat4::from_translation(at + Vec3::Y * (bob - self.cloud_top))
+                * Mat4::from_axis_angle(Vec3::Y, vfx.time * 0.05 + k as f32);
+            r.queue_draw(self.cloud, m, [1.0; 4], 0.35 + atm.night * 0.25, crate::skyprops::CLOUD_VOX, false);
+        }
         for l in &game.logs {
             use crate::logs::{LOG_RADIUS, LOG_TOP};
             let c = l.centre();
@@ -938,9 +984,16 @@ pub fn world_blockers() -> Blockers {
 }
 
 fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
-    if crate::map::active() == crate::map::MapId::Pass {
-        let (pieces, blockers) = crate::passworld::build();
-        return batch(pieces, blockers);
+    match crate::map::active() {
+        crate::map::MapId::Pass => {
+            let (pieces, blockers) = crate::passworld::build();
+            return batch(pieces, blockers);
+        }
+        crate::map::MapId::Sky => {
+            let (pieces, blockers) = crate::skyworld::build();
+            return batch(pieces, blockers);
+        }
+        crate::map::MapId::Jungle => {}
     }
     const TAU: f32 = std::f32::consts::TAU;
     let mut pieces: Vec<Piece> = Vec::new();

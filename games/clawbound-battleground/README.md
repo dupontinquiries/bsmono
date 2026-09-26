@@ -1,6 +1,6 @@
 # Clawbound — Battleground · Rust + wgpu Microvoxel Edition
 
-A 5v5 three-lane arena for the **thirteen legendary ancestors of Clawbound**,
+A three-map arena for the **fourteen legendary ancestors of Clawbound**,
 built as a native Linux game in Rust + wgpu. No engine, no assets — every
 ancestor, minion, tower, Elder, projectile and ability effect is procedurally
 generated microvoxels: tens of thousands of instanced cubes with baked ambient
@@ -24,9 +24,18 @@ what else is known-but-unresolved.
   waves of four (five every third: 3 melee + 1–2 casters) that hold targets,
   answer a hit on their cats, and chase within a leash; 12 towers, two Elders
   gated behind tower kills.
-- **13 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
+- **Three maps** — the jungle valley (5v5, three lanes), Twinfang Pass (15v15
+  mountain canyon), and **Starwell Glacier** (15v15): two wide lanes over
+  glacier islands in a starlit sky, 32 minions in each lane when the waves
+  meet, cloud ferries you leap onto to ride across the chasms (miss, and the
+  Starwell carries you home), and the Moonwell at the centre -- healing water
+  where the Moonwyrm sleeps; kill it and your team claims the well for two
+  minutes of random boons (90% less damage taken, halved cooldowns, +40%
+  speed, +50% damage).
+- **14 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
   Windclaw, Faryowl, Oldroar, Twofang, Suneye, Snowhush, Riptail, Stillsmoke,
-  Stonewhisper — across 5 roles (Warrior / Guardian / Mage / Hunter / Assassin).
+  Stonewhisper, Cometail (the star-fallen caracal: Starshot, Meteor Pounce,
+  Flare, and the Falling Star ultimate) — across 5 roles (Warrior / Guardian / Mage / Hunter / Assassin).
   Each is a quadruped feline voxel body with a pelt signature (mane, stripes,
   rosettes, saber fangs, antlers, sun disc, ear tufts…) and its crest colour,
   plus **4 mechanical abilities** (52 total) built from 13 archetype systems.

@@ -185,7 +185,17 @@ pub fn space_at(pos: Vec3) -> Space {
     match crate::map::active() {
         crate::map::MapId::Pass => pass_space(pos),
         crate::map::MapId::Jungle => jungle_space(pos),
+        crate::map::MapId::Sky => sky_space(pos),
     }
+}
+
+/// Open sky: nothing near to answer but the ice. A big, soft hall -- the
+/// spirit world should sound wider than it looks -- with a long, faint
+/// echo off the far islands; closer and brighter by the Moonwell's ring of
+/// statues.
+fn sky_space(pos: Vec3) -> Space {
+    let well = (1.0 - (pos.x.hypot(pos.z) / (crate::sky::WELL_ISLAND_R + 10.0))).clamp(0.0, 1.0);
+    Space { room: 0.9, damp: 0.35 - 0.1 * well, wet: 0.3 + 0.12 * well, echo_time: 0.55 - 0.2 * well, echo_fb: 0.32, echo_wet: 0.14 + 0.08 * well }
 }
 
 fn jungle_space(pos: Vec3) -> Space {

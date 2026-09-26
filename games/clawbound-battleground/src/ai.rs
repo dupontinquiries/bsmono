@@ -31,6 +31,7 @@ impl Game {
                 // handled directly via move_dir (orbit strafe)
                 g.pos
             }
+            AiState::Push if brain.goal.is_some() => brain.goal.unwrap(),
             AiState::Push => {
                 let path = brain.lane.path_for(g.team);
                 let mut wp = brain.wp.min(path.len() - 1);
@@ -155,6 +156,7 @@ pub fn think(game: &mut Game, gi: usize) {
     let mut stance = Stance::Hold;
     let mut new_anchor: Option<Vec3> = None;
     let mut new_call: Option<(usize, f32)> = None;
+    let mut goal: Option<Vec3> = None;
 
     match state {
         AiState::Retreat => {
@@ -319,8 +321,10 @@ pub fn think(game: &mut Game, gi: usize) {
             if let Some(bi) = game.contestable_boss(g.pos, team, hp_frac) {
                 let b = &game.bosses.list[bi];
                 let engaged = b.last_hit_team == Some(team) && t - b.last_dmg_t < 6.0;
-                let reach_ok = engaged || b.pos.distance(g.pos) < 14.0 + genes.objective * 28.0 + g.ai.as_ref().unwrap().aggression * 12.0;
+                let far = if b.kind == crate::bosses::BossKind::Moonwyrm { 4.0 } else { 1.0 };
+                let reach_ok = engaged || b.pos.distance(g.pos) < (14.0 + genes.objective * 28.0 + g.ai.as_ref().unwrap().aggression * 12.0) * far;
                 if reach_ok {
+                    goal = Some(b.pos);
                     let d = Vec3::new(b.pos.x - g.pos.x, 0.0, b.pos.z - g.pos.z);
                     if d.length() > def.auto_range * 0.8 {
                         move_dir = d.normalize_or_zero();
@@ -333,6 +337,22 @@ pub fn think(game: &mut Game, gi: usize) {
                     }
                 }
             }
+        }
+    }
+
+    // The Moonwell: the team holds a claim and this cat has not had its
+    // boon -- go and wade in (sky map). Not with enemies close; not when a
+    // fight or a boss already has it.
+    if state == AiState::Push && goal.is_none() && crate::map::active() == crate::map::MapId::Sky {
+        let ti = team as usize;
+        let me = &game.gods[gi];
+        let owed = crate::moonwell::grants(game.bosses.claim_t[ti], game.bosses.claim_id[ti], me.boon_claim, me.boon.is_some());
+        let enemy_near = (0..game.gods.len()).any(|j| game.gods[j].team != team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(me.pos) < 14.0);
+        if owed && !enemy_near {
+            let well = crate::sky::well_pos();
+            let d = Vec3::new(well.x - me.pos.x, 0.0, well.z - me.pos.z);
+            move_dir = d.normalize_or_zero();
+            goal = Some(well);
         }
     }
 
@@ -502,6 +522,7 @@ pub fn think(game: &mut Game, gi: usize) {
                 b.stance_t = 0.0;
             }
             b.anchor = if fighting_god { new_anchor } else { None };
+            b.goal = goal;
             b.state = new_state;
             b.target = target;
             b.wp = new_wp;
@@ -545,6 +566,7 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             Archetype::Blink { dist: dd, .. } => if dist > 9.0 { dd } else { 0.0 },
             Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } => f32::INFINITY,
             Archetype::Pull { radius, .. } => radius + 4.0,
+            Archetype::Meteor { range, .. } => range,
         };
         let pri = match ab.arch {
             Archetype::Nova { .. } => {
@@ -567,6 +589,10 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             }
             Archetype::Pull { .. } => {
                 if engage && is_god_target && dist < range { 0.85 } else { 0.0 }
+            }
+            // a falling star on a fight worth it: a dive on a god
+            Archetype::Meteor { .. } => {
+                if engage && is_god_target && dist < range { 0.92 } else { 0.0 }
             }
             Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } => {
                 let hurt = g.hp / g.max_hp;

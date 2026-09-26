@@ -242,7 +242,7 @@ pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool, lan: &mu
             ui.add_space(30.0);
             ui.heading(egui::RichText::new("CLAWBOUND").size(74.0).color(GOLD).strong());
             ui.label(egui::RichText::new("B A T T L E G R O U N D").size(30.0).color(Color32::from_rgb(200, 195, 180)));
-            ui.label(egui::RichText::new("Rust · wgpu · Microvoxels — the thirteen legendary ancestors").size(15.0).color(Color32::from_rgb(150, 148, 140)));
+            ui.label(egui::RichText::new("Rust · wgpu · Microvoxels — the fourteen legendary ancestors").size(15.0).color(Color32::from_rgb(150, 148, 140)));
             ui.add_space(28.0);
             let play_btn = ui.add_sized([260.0, 52.0], egui::Button::new(egui::RichText::new("▶  PLAY").size(24.0).color(Color32::BLACK).strong()).fill(GOLD));
             let t = hover_t(ctx, play_btn.id, play_btn.hovered());
@@ -273,7 +273,7 @@ pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool, lan: &mu
             }
             ui.add_space(20.0);
             ui.label(egui::RichText::new("Move · Mouse look · Attack · 1-4 abilities · Shop · Scoreboard — all rebindable in CONTROLS; gamepad and touch supported").size(13.0).color(Color32::from_rgb(160, 158, 150)));
-            ui.label(egui::RichText::new("5v5 · three lanes · destroy towers to unshield the enemy Elder · watch the sky").size(13.0).color(Color32::from_rgb(160, 158, 150)));
+            ui.label(egui::RichText::new("three maps · destroy towers to unshield the enemy Elder · watch the sky").size(13.0).color(Color32::from_rgb(160, 158, 150)));
         });
     });
 }
@@ -597,7 +597,7 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
             line = format!("{}   ·   RIVERBLESSED {:.0}s", line, g.blessing_t);
         }
         for b in &game.bosses.list {
-            let short = match b.kind { crate::bosses::BossKind::Boar => "BOAR", crate::bosses::BossKind::Drake => "DRAKE" };
+            let short = match b.kind { crate::bosses::BossKind::Boar => "BOAR", crate::bosses::BossKind::Drake => "DRAKE", crate::bosses::BossKind::Moonwyrm => "WYRM" };
             if b.alive {
                 line = format!("{}   ·   {} {:.0}%", line, short, b.hp / b.max_hp * 100.0);
             } else {
@@ -608,6 +608,12 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
         let ti = g.team as usize;
         if game.bosses.bounty_t[ti] > 0.0 {
             line = format!("{}   ·   BOUNTY {:.0}s", line, game.bosses.bounty_t[ti]);
+        }
+        if game.bosses.claim_t[ti] > 0.0 {
+            line = format!("{}   ·   MOONWELL CLAIMED {:.0}s", line, game.bosses.claim_t[ti]);
+        }
+        if let Some((b, left)) = g.boon {
+            line = format!("{}   ·   {} ({}) {:.0}s", line, b.name(), b.what(), left);
         }
         if game.bosses.stormfire_t[ti] > 0.0 {
             line = format!("{}   ·   STORMFIRE {:.0}s", line, game.bosses.stormfire_t[ti]);
@@ -1204,17 +1210,22 @@ pub fn map_blurb(m: crate::map::MapId) -> &'static str {
     match m {
         crate::map::MapId::Jungle => "the valley: three lanes through deep jungle",
         crate::map::MapId::Pass => "the mountains: a canyon between twin peaks",
+        crate::map::MapId::Sky => "the spirit sky: two wide lanes, glacier islands, clouds to ride",
     }
 }
 
 /// The map picker on the select screen: a card per map, the chosen one lit.
 pub fn map_picker(ui: &mut egui::Ui, choice: &mut crate::map::MapId) {
     ui.label(egui::RichText::new("BATTLEGROUND").size(16.0).color(GOLD));
+    // as many cards as there are maps, sharing the panel's width (three at
+    // a fixed 236 ran off the right edge); the blurb wraps onto two lines
+    let n_maps = crate::map::MapId::ALL.len() as f32;
+    let gap = 6.0 + 2.0 * ui.spacing().item_spacing.x;
+    let w = ((ui.available_width() - gap * (n_maps - 1.0) - 4.0) / n_maps).clamp(150.0, 236.0);
     ui.horizontal(|ui| {
         for m in crate::map::MapId::ALL {
             let sel = *choice == m;
-            // wide enough for the blurb (210 overflowed it)
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(236.0, 58.0), Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 66.0), Sense::click());
             let t = hover_t(ui.ctx(), egui::Id::new("map_card").with(m.key()), resp.hovered());
             let p = ui.painter();
             p.rect_filled(rect, 8.0, if sel { Color32::from_rgb(58, 52, 36) } else { Color32::from_rgb(34, 33, 40).linear_multiply(1.0 + 0.3 * t) });
@@ -1222,7 +1233,8 @@ pub fn map_picker(ui: &mut egui::Ui, choice: &mut crate::map::MapId) {
             let n = m.team_size();
             p.text(rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, m.name(), FontId::proportional(15.0), if sel { GOLD } else { Color32::from_rgb(220, 216, 205) });
             p.text(rect.right_top() + Vec2::new(-10.0, 9.0), Align2::RIGHT_TOP, format!("{n} v {n}"), FontId::proportional(12.0), Color32::from_rgb(180, 176, 165));
-            p.text(rect.left_top() + Vec2::new(10.0, 32.0), Align2::LEFT_TOP, map_blurb(m), FontId::proportional(10.5), Color32::from_rgb(160, 156, 146));
+            let blurb = p.layout(map_blurb(m).to_string(), FontId::proportional(10.5), Color32::from_rgb(160, 156, 146), w - 20.0);
+            p.galley(rect.left_top() + Vec2::new(10.0, 30.0), blurb, Color32::from_rgb(160, 156, 146));
             if resp.clicked() {
                 *choice = m;
             }

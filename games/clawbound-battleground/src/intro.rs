@@ -318,10 +318,15 @@ impl Intro {
                 let (p, ahead) = (smooth_at(d), smooth_at(d + 22.0));
                 let side = { let f = (ahead - p).normalize_or_zero(); Vec3::new(-f.z, 0.0, f.x) };
                 let shot = Shot { eye: p + Vec3::Y * 7.0 + side * 3.0, target: ahead + Vec3::Y * 2.0, fov_y: 0.95 };
-                o.caption = Some(match lane {
-                    Lane::Top => "TOP LANE",
-                    Lane::Mid => "MID LANE",
-                    Lane::Bot => "BOT LANE",
+                let sky = crate::map::active() == crate::map::MapId::Sky;
+                o.caption = Some(match (lane, sky) {
+                    (Lane::Top, false) => "TOP LANE",
+                    (Lane::Mid, false) => "MID LANE",
+                    (Lane::Bot, false) => "BOT LANE",
+                    // two lanes, and between them the sky route to the well
+                    (Lane::Top, true) => "WEST LANE",
+                    (Lane::Mid, true) => "THE MOONWELL",
+                    (Lane::Bot, true) => "EAST LANE",
                 });
                 let _ = i;
                 return Frame { shot, beat: Beat::Lane(lane), overlay: o, beat_t: s };
@@ -486,7 +491,12 @@ mod tests {
                     let turn = (prev.target - prev.eye).normalize().dot((s.target - s.eye).normalize()).clamp(-1.0, 1.0).acos().to_degrees();
                     let step = (s.eye - prev.eye).length();
                     assert!(turn <= MAX_TURN, "{m:?}: the view turned {turn:.1} deg in a frame at t={:.2} ({:?})", i.t, i.frame().beat);
-                    assert!(step <= MAX_STEP, "{m:?}: the eye jumped {step:.1} u in a frame at t={:.2} ({:?})", i.t, i.frame().beat);
+                    // The beats are fixed by the music (2.4 s is the shortest,
+                    // and flights may not overlap), so a map twice the
+                    // Pass's area crosses more ground in the same flight:
+                    // the eye's speed limit scales with the map's size.
+                    let max_step = MAX_STEP * (crate::consts::arena_radius() / crate::pass::ARENA_RADIUS).max(1.0);
+                    assert!(step <= max_step, "{m:?}: the eye jumped {step:.1} u in a frame at t={:.2} ({:?})", i.t, i.frame().beat);
                     let flat = Vec3::new(s.eye.x, 0.0, s.eye.z).length();
                     assert!(flat < crate::consts::ground_half() * 0.97, "{m:?}: the camera left the world at t={:.2}: {:.0} u out, the ground ends at {:.0}", i.t, flat, crate::consts::ground_half());
                     let ground = crate::render::terrain_height(s.eye.x, s.eye.z);

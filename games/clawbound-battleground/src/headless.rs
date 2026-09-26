@@ -9,7 +9,7 @@ use crate::sim::{Game, Rng, Team};
 use crate::ui::{self, UiState};
 use crate::vfx::Vfx;
 
-fn make_device() -> Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+pub(crate) fn make_device() -> Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
     // Metal on macOS, then Vulkan → GL elsewhere; never fail with a panic.
     let mut masks = Vec::new();
     if cfg!(target_os = "macos") {
@@ -108,6 +108,9 @@ pub fn run() -> Result<(), String> {
     }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("spectate") {
         return run_spectate();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("sky") {
+        return crate::skyshots::run();
     }
     let (_instance, _adapter, device, queue) =
         make_device().ok_or_else(|| "No suitable GPU backend found (install mesa-vulkan-drivers for lavapipe)".to_string())?;
@@ -341,7 +344,7 @@ pub fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn draw_egui(
+pub(crate) fn draw_egui(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     egui_renderer: &mut egui_wgpu::Renderer,
@@ -382,7 +385,7 @@ fn draw_egui(
     }
 }
 
-fn save_shot(device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::Texture, path: &str) -> Result<(), String> {
+pub(crate) fn save_shot(device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::Texture, path: &str) -> Result<(), String> {
     let (w, h) = (target.width(), target.height());
     let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("shot read"),
@@ -583,7 +586,7 @@ pub fn run_rig_sheet() -> Result<(), String> {
                     let from = row + Vec3::X * 9.7;
                     let to = from + Vec3::X * 6.0;
                     let a = 0.3;
-                    game.gods[5].dash = Some(DashState { from, to, t: a * 0.4, dur: 0.4, dmg: 0.0 });
+                    game.gods[5].dash = Some(DashState { from, to, t: a * 0.4, dur: 0.4, dmg: 0.0, arc: 0.35, blast: None });
                     game.gods[5].pos = from.lerp(to, a) + Vec3::Y * (a * (1.0 - a) * 4.0 * 0.35);
                 }
                 1 => {
@@ -1328,7 +1331,8 @@ pub fn run_select_shot() -> Result<(), String> {
     let view = target.create_view(&Default::default());
     let ctx = egui::Context::default();
     let mut st = UiState::new();
-    st.map_choice = crate::map::MapId::Pass;
+    st.map_choice = crate::map::MapId::Sky;
+    st.selected = crate::gods::ROSTER_LEN - 1; // the newest ancestor
     clear(&renderer.device, &renderer.queue, &view);
     let mut textures = egui::TexturesDelta::default();
     let mut out = None;
