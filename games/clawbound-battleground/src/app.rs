@@ -35,6 +35,10 @@ struct AppState {
     window: &'static Window,
     surface: wgpu::Surface<'static>,
     surface_format: wgpu::TextureFormat,
+    /// The present modes the surface offers, and the one in use (vsync on:
+    /// Fifo; off: `present_mode_for`).
+    present_modes: Vec<wgpu::PresentMode>,
+    present: wgpu::PresentMode,
     renderer: Renderer,
     scene: Option<Scene>,
     egui_ctx: egui::Context,
@@ -348,12 +352,17 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
             }
         }
     }
-    let GpuInit { surface, device, queue, format, .. } = gpu.ok_or_else(|| {
+    let GpuInit { surface, device, queue, format, adapter, .. } = gpu.ok_or_else(|| {
         format!(
             "no usable GPU backend (tried {}). Set WGPU_BACKEND=metal|vulkan|dx12|gl|all to override, and update your GPU drivers.",
             errors.join(" | ")
         )
     })?;
+    // the present modes this surface offers (vsync off picks from these)
+    let present_modes = surface.get_capabilities(&adapter).present_modes;
+    let cfg0 = Config::load();
+    let present = present_mode_for(cfg0.settings.vsync, &present_modes);
+    eprintln!("[clawbound] present modes {present_modes:?}; using {present:?}");
 
     surface.configure(
         &device,
@@ -362,7 +371,7 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode: present,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -378,6 +387,8 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         window,
         surface,
         surface_format: format,
+        present_modes,
+        present,
         renderer,
         scene: None,
         egui_ctx,
@@ -539,7 +550,7 @@ fn handle_window_event(s: &mut AppState, event: WindowEvent) {
                     format: s.surface_format,
                     width: size.width.max(1),
                     height: size.height.max(1),
-                    present_mode: wgpu::PresentMode::Fifo,
+                    present_mode: s.present,
                     alpha_mode: wgpu::CompositeAlphaMode::Auto,
                     view_formats: vec![],
                     desired_maximum_frame_latency: 2,
@@ -1198,6 +1209,25 @@ fn render(s: &mut AppState) {
         crate::quality::Quality::set_chosen(st.quality);
         crate::render::FurStyle::set_chosen(st.fur);
         s.renderer.quality = crate::quality::Quality::effective();
+        // vsync follows the setting: the surface is reconfigured on change
+        let want = present_mode_for(s.cfg.settings.vsync, &s.present_modes);
+        if want != s.present {
+            s.present = want;
+            s.surface.configure(
+                &s.renderer.device,
+                &wgpu::SurfaceConfiguration {
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    format: s.surface_format,
+                    width: s.renderer.width.max(1),
+                    height: s.renderer.height.max(1),
+                    present_mode: want,
+                    alpha_mode: wgpu::CompositeAlphaMode::Auto,
+                    view_formats: vec![],
+                    desired_maximum_frame_latency: 2,
+                },
+            );
+            eprintln!("[clawbound] present mode -> {want:?}");
+        }
         // the shadow map follows the quality (rebuilt only when it changes)
         let size = s.renderer.quality.shadow_size();
         s.renderer.set_shadow_size(size);
@@ -1338,7 +1368,7 @@ fn render(s: &mut AppState) {
                     format: s.surface_format,
                     width: s.renderer.width,
                     height: s.renderer.height,
-                    present_mode: wgpu::PresentMode::Fifo,
+                    present_mode: s.present,
                     alpha_mode: wgpu::CompositeAlphaMode::Auto,
                     view_formats: vec![],
                     desired_maximum_frame_latency: 2,
@@ -1534,5 +1564,30 @@ fn render_portraits(s: &mut AppState) {
         let image = egui::ColorImage::from_rgba_unmultiplied([128, 128], &pixels);
         let tid = s.egui_ctx.load_texture(format!("ancestor{}", i), image, egui::TextureOptions::LINEAR);
         s.ui.portraits.insert(i as u32, tid.id());
+    }
+}
+
+/// The present mode for the vsync setting: on, Fifo (always offered); off,
+/// uncapped -- Immediate if the surface offers it (Metal does), else
+/// Mailbox, else Fifo after all.
+pub fn present_mode_for(vsync: bool, offered: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    use wgpu::PresentMode::*;
+    if vsync {
+        return Fifo;
+    }
+    [Immediate, Mailbox].into_iter().find(|m| offered.contains(m)).unwrap_or(Fifo)
+}
+
+#[cfg(test)]
+mod present_tests {
+    use super::present_mode_for;
+    use wgpu::PresentMode::*;
+
+    #[test]
+    fn vsync_off_uncaps_where_the_surface_allows() {
+        assert_eq!(present_mode_for(true, &[Fifo, Immediate]), Fifo);
+        assert_eq!(present_mode_for(false, &[Fifo, Immediate, Mailbox]), Immediate);
+        assert_eq!(present_mode_for(false, &[Fifo, Mailbox]), Mailbox);
+        assert_eq!(present_mode_for(false, &[Fifo]), Fifo, "nothing better offered");
     }
 }

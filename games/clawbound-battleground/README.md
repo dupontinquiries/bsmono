@@ -125,9 +125,36 @@ what else is known-but-unresolved.
 
 ## Build & Run
 
-Requirements: Rust 1.75+, a GPU with Vulkan (or GL). For audio on Linux,
-ALSA headers (`libasound2-dev`) at build time — or build with
-`--no-default-features` for a silent binary.
+Requirements: Rust (stable, via rustup), a GPU with Metal (macOS), Vulkan
+or GL. For audio on Linux, ALSA headers (`libasound2-dev`) at build time —
+or build with `--no-default-features` for a silent binary. macOS needs
+nothing extra (CoreAudio, Metal).
+
+### A high-end test (e.g. an M2 Ultra)
+
+```bash
+cd games/clawbound-battleground
+cargo run --release                       # then set things in the game
+cargo run --release -- --ultra --map pass # or force Ultra on the 15-v-15 map
+```
+
+- **Settings** (Controls & Settings: the button on the main menu, or **Esc**
+  during a match): graphics **Ultra (preview)** / High / Medium / Low, fur
+  (tape / locks), volumes, **show frame rate**, and **vsync** — turn it off
+  to see uncapped frame times. Saved between runs.
+- **Ultra** applies from the next match (it builds the smooth, furred
+  characters: ~2 s); the rest applies at once. `CLAWBOUND_QUALITY=ultra|
+  high|medium|low` and `CLAWBOUND_FUR=tape|locks` override the settings.
+- **What Ultra adds:** smooth furred cats with PBR shading; coloured light
+  from abilities, channels and lightning, with ray-traced shadows between
+  the cats and onto the ground; wet ground as a mirror; god rays the canopy
+  blocks. Good things to look at: Stillsmoke's ultimate (lightning), any
+  cast in the rain, the pass at a low sun.
+- **Numbers:** the frame-rate readout shows fps and ms. For a repeatable
+  benchmark: `CLAWBOUND_SHOTS=perf cargo run --release -- --screenshot
+  --map pass` (draws, instances and frame times per shot, headless).
+- On startup the log prints the GPU backend and the present modes the
+  display offers (`[clawbound] present modes ...`).
 
 ```bash
 cargo run --release          # windowed game

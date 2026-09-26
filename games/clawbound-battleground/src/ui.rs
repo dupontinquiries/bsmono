@@ -1007,6 +1007,7 @@ pub fn draw_controls(ctx: &egui::Context, cfg: &mut crate::input::Config, captur
             ui.add_space(8.0);
             ui.separator();
             ui.label(egui::RichText::new("GRAPHICS & AUDIO").size(15.0).color(GOLD));
+            ui.label(egui::RichText::new("Esc opens this panel during a match too.").size(11.0).color(Color32::from_rgb(170, 166, 156)));
             egui::ComboBox::from_label("graphics").selected_text(st.quality.label()).show_ui(ui, |ui| {
                 for q in crate::quality::Quality::ALL {
                     changed |= ui.selectable_value(&mut st.quality, q, q.label()).changed();
@@ -1025,6 +1026,7 @@ pub fn draw_controls(ctx: &egui::Context, cfg: &mut crate::input::Config, captur
             changed |= ui.add(egui::Slider::new(&mut st.vol_sfx, 0.0..=1.0).text("effects")).changed();
             changed |= ui.add(egui::Slider::new(&mut st.vol_voice, 0.0..=1.0).text("voices")).changed();
             changed |= ui.checkbox(&mut st.show_fps, "show frame rate").changed();
+            changed |= ui.checkbox(&mut st.vsync, "vsync (off: uncapped, to measure the machine)").changed();
             if changed {
                 cfg.save();
             }
