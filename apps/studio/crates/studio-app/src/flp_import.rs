@@ -217,12 +217,33 @@ fn auto_value(segs: &[AutoSeg], t: f64) -> Option<f64> {
     pts.last().map(|p| p.1)
 }
 
+/// WARMTH, calibrated: A Top A Tower's synths-only stretch (5:18-5:40), octave
+/// bands 63 Hz..8 kHz, the first patches minus the artist's render:
+/// -9.8 -5.1 -1.4 0.0 +2.9 +7.1 +9.5 +7.1 dB -- far too bright, far too thin
+/// beside Omnisphere / FLEX. Every non-bass patch's cutoff is scaled by this,
+/// its filter envelope by `POLY_ENV_SCALE`, and it gets `POLY_SUB_ADD` of sub.
+pub const POLY_CUTOFF_SCALE: f32 = 0.5;
+pub const POLY_ENV_SCALE: f32 = 0.6;
+pub const POLY_SUB_ADD: f32 = 0.3;
+/// ...and this much gain: after the three above the same stretch measured
+/// -5.7 -4.4 -4.2 -5.0 -2.4 -2.4 -2.1 -1.8 dB -- the TILT gone (from -10..+9.5),
+/// ~3.5 dB of level lost to the darker filters.
+pub const POLY_WARM_GAIN_DB: f32 = 3.5;
+
 /// A plugin synth's stand-in: a POLY patch guessed from the channel's name
 /// (Omnisphere and VST channels are usually named for their patch --
 /// "pain_bass", "batman_strings", "lotusflute"), or a bass when every note sits
 /// below C4. A few dozen bytes instead of a sample library; a guess by name,
 /// to be tuned against the artist's renders. Returns (family, patch).
 pub fn patch_for(name: &str, all_low: bool) -> (&'static str, studio_live::PolyPatch) {
+    let (family, p) = patch_family(name, all_low);
+    if family == "bass" { return (family, p); }
+    (family, studio_live::PolyPatch { cutoff: p.cutoff * POLY_CUTOFF_SCALE, env_amount: p.env_amount * POLY_ENV_SCALE,
+                                      sub: (p.sub + POLY_SUB_ADD).min(1.0), gain: p.gain * 10f32.powf(POLY_WARM_GAIN_DB / 20.0), ..p })
+}
+
+/// The family and its patch before the warmth calibration.
+fn patch_family(name: &str, all_low: bool) -> (&'static str, studio_live::PolyPatch) {
     use studio_live::PolyPatch as P;
     let n = name.to_lowercase();
     let has = |ws: &[&str]| ws.iter().any(|w| n.contains(w));
@@ -386,11 +407,15 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         let internal = s(&c["plugin"]).unwrap_or("").to_string();
         let plugin = if internal == "Fruity Wrapper" { "VST".to_string() } else { internal.clone() };
         let mut media: Option<Media> = None;
-        let kind = if kind_s == "Sampler" || internal == "Fruity slicer" {
+        // a SLICER plays its sample, whatever FL version spells it: "Fruity
+        // slicer" (20.x), "Fruity Slicer" (24.x -- missed until c20, which made A
+        // Top A Tower's sliced beat a bright "lead" synth), Slicex
+        let is_slicer = { let l = internal.to_lowercase(); l == "fruity slicer" || l == "slicex" };
+        let kind = if kind_s == "Sampler" || is_slicer {
             match file_of(c).and_then(|f| source_for(&f, &mut ops, &mut missing, None)) {
                 Some((id, m)) => {
                     media = Some(m);
-                    if internal == "Fruity slicer" {
+                    if is_slicer {
                         report.push(format!("{}: a Fruity Slicer -- plays its whole recording from each note; the slice map is not in the dump", ch_name(c)));
                     }
                     SynthKind::Sampler { source: id }
