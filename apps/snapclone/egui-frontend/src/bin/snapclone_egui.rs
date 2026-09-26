@@ -208,6 +208,10 @@ impl VoiceRig {
 
 struct App {
     snap: Snapclone,
+    /// On-screen keyboard commits -> text, before egui sees them. Without it every text
+    /// field keeps only the first character typed on a Wayland on-screen keyboard; see
+    /// `uikit_egui::ime::ImeRepair`.
+    ime_repair: uikit_egui::ime::ImeRepair,
     /// The accelerometer, once. `None` on a machine without one, and that
     /// case must cost nothing per frame.
     accel: Option<snapclone_egui::glove_input::SysfsAccel>,
@@ -380,7 +384,7 @@ impl App {
             }
         };
 
-        Self { snap, snaps_in, accel: None, glove_probed: false,
+        Self { snap, ime_repair: Default::default(), snaps_in, accel: None, glove_probed: false,
                last_snap: None, last_live: None, scan_frames: 0, sending: Vec::new(),
                send_results: Arc::new(Mutex::new(Vec::new())),
                voice: VoiceRig::idle(), rig: CaptureRig::idle(),
@@ -1359,6 +1363,9 @@ fn save_snap(enc: &snapclone_egui::media_encode::Encoded) -> Result<String, Stri
 
 impl eframe::App for App {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.ime_repair.repair(&mut raw.events);
+    }
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // SNAPCLONE_INPUT_LOG=1: each frame's keys / text / IME / clicks /
         // window focus, and focus changes, on stderr (input_log). For the

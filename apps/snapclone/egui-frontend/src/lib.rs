@@ -6375,6 +6375,54 @@ mod tests {
         assert_eq!(app.picker.query, "abc", "every committed character lands");
     }
 
+    /// The same field typed into by an ON-SCREEN keyboard (rusty-board, squeekboard) on
+    /// Wayland. Those commit text without composing, and winit + egui-winit deliver that as
+    /// a bare `Commit` followed by `Disabled` -- no `Enabled` (egui-winit ignores winit's
+    /// on Linux) and no empty `Preedit` (dropped off macOS). egui's TextEdit inserts a
+    /// commit only when the cursor is where it was at the last Enabled/Preedit, so the first
+    /// character lands at 0 and every later one is dropped: the one-character fields.
+    ///
+    /// `repair` is `ImeRepair` -- what the binary's `raw_input_hook` runs -- or nothing, to
+    /// show the fault is real without it.
+    fn type_commit_only(repair: bool) -> String {
+        use egui::{Context, Event, ImeEvent, Key, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        app.nav.go_page(2);
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let mut fix = uikit_egui::ime::ImeRepair::default();
+        let mut frame = |app: &mut Snapclone, mut events: Vec<Event>| {
+            if repair {
+                fix.repair(&mut events);
+            }
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        };
+        frame(&mut app, vec![]);
+        let tab = Event::Key { key: Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        for _ in 0..20 {
+            frame(&mut app, vec![tab.clone()]);
+            frame(&mut app, vec![Event::Text("x".into())]);
+            if app.picker.query == "x" { break; }
+        }
+        assert_eq!(app.picker.query, "x", "the harness never reached the search field");
+        for ch in ["h", "e", "l", "l", "o"] {
+            frame(&mut app, vec![Event::Ime(ImeEvent::Commit(ch.into())), Event::Ime(ImeEvent::Disabled)]);
+            frame(&mut app, vec![]);
+        }
+        app.picker.query.clone()
+    }
+
+    #[test]
+    fn typing_through_an_on_screen_keyboard() {
+        assert_eq!(type_commit_only(true), "xhello", "every committed character lands");
+        // The premise: without the repair, egui drops the commits -- if this starts
+        // passing, egui fixed it upstream and the repair can go.
+        assert_ne!(type_commit_only(false), "xhello", "egui now accepts bare commits; ImeRepair may be obsolete");
+    }
+
     #[test]
     fn the_receipt_describes_one_send_rather_than_three_moments() {
         // Filling the facts from three places is how a receipt shows last
