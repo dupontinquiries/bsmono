@@ -46,6 +46,10 @@
 
 layout(location = 0) in vec3 v_color;
 layout(location = 1) in vec3 v_world_pos;
+// r-ctm: connected-face flags from chunk.vert (0 = none: bevel every edge).
+// bits 0..3: the -u, +u, -v, +v edge continues into the same material's
+// exposed face; bit 4: seamless (no bevel at all); bit 8: flags present.
+layout(location = 2) flat in uint v_ctm;
 
 layout(location = 0) out vec4 out_color;
 
@@ -281,6 +285,10 @@ vec3 seasonal_foliage(vec3 c, float season01) {
 vec3 apply_block_texture(vec3 base, vec3 wpos, vec3 n) {
     vec3 qc = floor(base * 6.0 + 0.5);
     float seed = hash12(qc.xy + qc.z * 23.0);
+    // r-ctm: a connected face's grain is seeded by nothing that changes from
+    // block to block (its colour now does, smoothly), so the world-space grain
+    // runs straight across a slope instead of restarting at every block.
+    if (v_ctm != 0u) seed = 0.0;
     vec2 uv; float face_salt; float face_shade;
     if (n.y > 0.5) {            // TOP — brightest, horizontal grid
         uv = wpos.xz; face_salt = 0.0; face_shade = 1.04;
@@ -686,6 +694,21 @@ void main() {
     float edge = min(d.x, d.y);
     float aa = max(fwidth(edge), 1e-5);
     float bevel = smoothstep(0.0, 0.03 + aa, edge);  // 0 at border → 1 inside
+    // r-ctm: connected textures. Bevel only the edges that are real edges: a
+    // step, a corner, a change of material. An edge whose neighbour in the
+    // same plane is the same exposed material draws no line, and a seamless
+    // (greedy-merged) face draws none inside.
+    if (v_ctm != 0u) {
+        if ((v_ctm & 16u) != 0u) {
+            bevel = 1.0;
+        } else {
+            bool cu = (cell.x < 0.5) ? ((v_ctm & 1u) != 0u) : ((v_ctm & 2u) != 0u);
+            bool cv = (cell.y < 0.5) ? ((v_ctm & 4u) != 0u) : ((v_ctm & 8u) != 0u);
+            float bu = cu ? 1.0 : smoothstep(0.0, 0.03 + aa, d.x);
+            float bv = cv ? 1.0 : smoothstep(0.0, 0.03 + aa, d.y);
+            bevel = min(bu, bv);
+        }
+    }
 
     // r311: foliage skips the block-edge bevel — no hard cube outline on leaves etc.
     if (is_foliage(v_color)) bevel = 1.0;
