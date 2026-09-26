@@ -70,21 +70,14 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("no apps installed yet — build some from the Fleet tab").weak());
     }
 
-    // The list scrolls; the confirmation below it does not.
-    //
-    // Without this the page simply grew past the window and the later apps were
-    // unreachable — no scrollbar, no clipping, just gone. `auto_shrink` off on
-    // the vertical axis so a short list does not collapse the area and make the
-    // separator jump around as apps are installed.
-    //
-    // The confirmation deliberately stays OUTSIDE: it appears at the bottom in
-    // response to a button that may be scrolled anywhere, and a confirmation
-    // that can itself scroll out of view is one a user answers by guessing.
+    // No scroll area of its own: the page scrolls (app.rs wraps every page
+    // in one). This list was a second ScrollArea inside that one, bounded to
+    // the viewport less 96 px - two scroll regions, one inside the other,
+    // which on a phone means a drag scrolls whichever it started in. The
+    // reason it had one (an inline confirmation that must not scroll away)
+    // went when the confirmation became the kit's modal dialog.
     let rows = app.apps.versions.clone();
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .max_height(ui.available_height() - 96.0)
-        .show(ui, |ui| {
+    {
     let mut last_app = String::new();
     for (name, label, is_current) in rows {
         // Group by app: three pins of one app under one heading reads as one
@@ -141,19 +134,18 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                     Err(e) => format!("error: {e}"),
                 };
             }
-            if !is_current && ui.small_button("make current").clicked() {
+            if !is_current && ui.button("make current").clicked() {
                 match gitmind_core::binpin::use_version(&name, &label) {
                     Ok(()) => { app.apps.note = format!("{name} → {label}"); app.apps.loaded = false; }
                     Err(e) => app.apps.note = format!("error: {e}"),
                 }
             }
-            if ui.small_button("remove").clicked() {
+            if ui.button("remove").clicked() {
                 app.apps.confirm = Some((name.clone(), label.clone()));
             }
         });
     }
-
-        });
+    }
 
     // Confirmation, through the KIT rather than an inline row. Asked because
     // removing a pin is not undoable: the bytes are content-addressed, but the
@@ -231,6 +223,16 @@ mod tests {
                 "the kit dialog is not used");
         assert!(!prod.contains(r#"ui.button("cancel").clicked() { app.apps.confirm = None"#),
                 "the inline confirmation row is back");
+    }
+
+    #[test]
+    fn the_list_scrolls_with_the_page_not_inside_it() {
+        // app.rs puts every page in a ScrollArea; a second one here made the
+        // installed list a box scrolling inside a scrolling page.
+        let src = include_str!("apps.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert!(!prod.contains("ScrollArea::"), "a nested scroll area is back");
+        assert!(include_str!("../app.rs").contains("egui::ScrollArea::vertical()"), "and the page's own scroll is still there");
     }
 
     #[test]
