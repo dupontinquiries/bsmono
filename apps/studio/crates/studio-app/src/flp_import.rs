@@ -137,6 +137,14 @@ pub fn pitcher_params(v: &Value) -> (BTreeMap<String, f32>, String) {
 /// for FL's default declicking.
 pub const DECLICK: f64 = 0.003;
 
+/// A playlist item's flags word: 0x40 on every item; with 0x2000 the item is
+/// MUTED in FL's playlist. Decided by ear, not by a spec: Balance's 979 such
+/// items imported playing sounded like "multiple concepts" at once; the
+/// artist heard the render without them and called it the direction of the
+/// mix (and it matched FL's rhythm better: onset corr 0.20 at -20 ms vs 0.12).
+/// PyFLP's `muted` never decoded this (it reads a field its struct lacks).
+pub const FL_ITEM_MUTED: u64 = 0x2000;
+
 /// Steps per pattern at most (the rack rows are a u64 bitmask).
 const MAX_STEPS: u32 = 64;
 
@@ -454,12 +462,15 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     let (mut automation_clips, mut placed, mut overflowed, mut declicked) = (0usize, 0usize, 0usize, 0usize);
     let mut stretches: Vec<(String, f64, String)> = Vec::new();
     let mut off_clips = 0usize;
+    let (mut muted_items, mut flag_1000) = (0usize, 0usize);
     let mut stretch_modes: BTreeMap<String, i64> = BTreeMap::new();
     let mut track_at = 0usize;
     for t in arr["tracks"].as_array().into_iter().flatten() {
         let items: Vec<&Value> = t["items"].as_array().into_iter().flatten().collect();
         // (studio track, occupied spans) -- a new overflow track when a clip would overlap
         let mut lanes: Vec<(TrackId, Vec<(Ticks, Ticks)>)> = Vec::new();
+        // clips muted in FL's playlist: on their own MUTED lanes -- kept, a mute away
+        let mut mlanes: Vec<(TrackId, Vec<(Ticks, Ticks)>)> = Vec::new();
         let fl_iid = i(&t["iid"]).unwrap_or(0);
         // A track switched off in FL's playlist is how an instrumental is
         // made from the full song: muted here, never dropped.
@@ -467,6 +478,8 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         let mut first_insert: Option<i64> = None;
         let mut label: Option<String> = s(&t["name"]).map(str::to_string);
         for it in items {
+            let item_muted = it["flags"].as_u64().is_some_and(|f| f & FL_ITEM_MUTED != 0);
+            if it["flags"].as_u64().is_some_and(|f| f & 0x1000 != 0) { flag_1000 += 1; }
             let pos = at(i(&it["pos"]).unwrap_or(0));
             let len_t = at(i(&it["len"]).unwrap_or(0));
             let mut clips: Vec<(SourceId, Ticks, Ticks, Ticks, f32)> = Vec::new(); // (source, at, src_in, len, gain)
@@ -536,23 +549,26 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                 _ => continue,
             }
             for (src, pos, src_in, len, gain) in clips {
-                let lane = match lanes.iter().position(|(_, spans)| spans.iter().all(|(a, b)| pos >= *b || pos.saturating_add(len) <= *a)) {
+                if item_muted { muted_items += 1; }
+                let pool = if item_muted { &mut mlanes } else { &mut lanes };
+                let lane = match pool.iter().position(|(_, spans)| spans.iter().all(|(a, b)| pos >= *b || pos.saturating_add(len) <= *a)) {
                     Some(l) => l,
                     None => {
-                        if !lanes.is_empty() { overflowed += 1; }
+                        if !pool.is_empty() && !item_muted { overflowed += 1; }
                         let id = TrackId(next_track);
                         next_track += 1;
-                        let nm = format!("{}{}", label.clone().unwrap_or_else(|| format!("FL track {fl_iid}")),
-                                         if lanes.is_empty() { String::new() } else { format!(" ({})", lanes.len() + 1) });
-                        ops.push(Op::AddTrack { track: Track { id, kind: TrackKind::Audio, name: nm, muted: off, locked: false,
+                        let base = label.clone().unwrap_or_else(|| format!("FL track {fl_iid}"));
+                        let nm = if item_muted { format!("{base} (muted in FL){}", if pool.is_empty() { String::new() } else { format!(" ({})", pool.len() + 1) }) }
+                                 else { format!("{base}{}", if pool.is_empty() { String::new() } else { format!(" ({})", pool.len() + 1) }) };
+                        ops.push(Op::AddTrack { track: Track { id, kind: TrackKind::Audio, name: nm, muted: off || item_muted, locked: false,
                                                                gain: 1.0, route: None }, at: track_at });
                         track_at += 1;
-                        lanes.push((id, Vec::new()));
-                        lanes.len() - 1
+                        pool.push((id, Vec::new()));
+                        pool.len() - 1
                     }
                 };
-                lanes[lane].1.push((pos, pos.saturating_add(len)));
-                ops.push(Op::AddClip { clip: Clip { id: ClipId(next_clip), source: src, track: lanes[lane].0, pos, src_in, len,
+                pool[lane].1.push((pos, pos.saturating_add(len)));
+                ops.push(Op::AddClip { clip: Clip { id: ClipId(next_clip), source: src, track: pool[lane].0, pos, src_in, len,
                                                     gain, effects: vec![] } });
                 // FL declicks audio clip edges by default; cut hard, a clip that
                 // starts or ends mid-waveform clicks (two of Blue Moon's did, at a
@@ -568,7 +584,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         }
         // FL routes everything somewhere; no insert (or insert 0) is the master
         if let Some(bus) = bus_for(first_insert.unwrap_or(0), &mut ops) {
-            for (tid, _) in &lanes { ops.push(Op::SetRoute { track: *tid, bus: Some(bus) }); }
+            for (tid, _) in lanes.iter().chain(mlanes.iter()) { ops.push(Op::SetRoute { track: *tid, bus: Some(bus) }); }
         }
     }
     // ── sidechains: a duck on each destination, keyed by the source ──────
@@ -622,6 +638,10 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     if !switched_off.is_empty() || off_clips > 0 {
         report.push(format!("switched off in FL: {} -- muted in the rack{}", if switched_off.is_empty() { "(no rack channels)".to_string() } else { switched_off.join(", ") },
             if off_clips > 0 { format!("; {off_clips} of their audio clips not placed") } else { String::new() }));
+    }
+    if muted_items > 0 {
+        report.push(format!("{muted_items} clips muted in FL's playlist (item flag 0x2000) -- placed on MUTED lanes \"(muted in FL)\", kept, a mute away{}",
+            if flag_1000 > 0 { format!("; {flag_1000} items also carry flag 0x1000, meaning not known") } else { String::new() }));
     }
     if declicked > 0 { report.push(format!("{declicked} audio clips declicked: {:.0} ms fades at each edge, as FL does by default", DECLICK * 1000.0)); }
     if automation_clips > 0 { report.push(format!("{automation_clips} automation clip{} not imported (their points are not read yet)", if automation_clips == 1 { "" } else { "s" })); }
@@ -709,7 +729,8 @@ mod tests {
                     {"kind": "ChannelPLItem", "channel": 3, "pos": 768, "len": 192, "offsets": [-1.0, -1.0]},
                     {"kind": "ChannelPLItem", "channel": 4, "pos": 0, "len": 192}]},
                 {"iid": 3, "items": [{"kind": "PatternPLItem", "pattern": 2, "pos": 0, "len": 1728}]},
-                {"iid": 4, "name": "Loops", "items": [{"kind": "ChannelPLItem", "channel": 3, "pos": 0, "len": 1152, "offsets": [1000.0, 13000.0]}]},
+                {"iid": 4, "name": "Loops", "items": [{"kind": "ChannelPLItem", "channel": 3, "pos": 0, "len": 1152, "offsets": [1000.0, 13000.0]},
+                    {"kind": "ChannelPLItem", "channel": 3, "pos": 0, "len": 384, "offsets": [-1.0, -1.0], "flags": 8256}]},
                 {"iid": 5, "name": "Beat x3", "items": [{"kind": "PatternPLItem", "pattern": 1, "pos": 0, "len": 1152}]}
             ]}],
             "mixer": [
@@ -742,7 +763,8 @@ mod tests {
         assert!(im.report.iter().any(|r| r.contains("1 automation clip not imported")), "{:?}", im.report);
         assert!(im.report.iter().any(|r| r.contains("overflow track")));
         assert!(vocals.iter().all(|t| t.muted), "a playlist track switched off in FL is muted, overflow lane too");
-        assert!(p.tracks.iter().filter(|t| !t.name.starts_with("Vocals")).all(|t| !t.muted));
+        assert!(p.tracks.iter().filter(|t| !t.name.starts_with("Vocals") && !t.name.contains("(muted in FL)")).all(|t| !t.muted),
+                "only the switched-off FL track and lanes of clips muted in FL are muted");
     }
 
     #[test]
@@ -821,6 +843,11 @@ mod tests {
         assert!((src.len.to_seconds() - 15.0).abs() < 1e-6, "30 s at ratio 2");
         assert!((c.src_in.to_seconds() - 0.5).abs() < 1e-6 && (c.len.to_seconds() - 6.0).abs() < 1e-6, "{:?}", c);
         assert!(im.report.iter().any(|r| r.contains("vox x2.000")), "{:?}", im.report);
+        // the item muted in FL (flags 0x2040) is kept, on a muted lane of its track
+        let m = im.project.tracks.iter().find(|t| t.name == "Loops (muted in FL)").expect("a muted lane");
+        assert!(m.muted && im.project.track_clips(m.id).len() == 1);
+        assert!(!t.muted, "the playing lane is not muted");
+        assert!(im.report.iter().any(|r| r.contains("1 clips muted in FL's playlist")), "{:?}", im.report);
         let b = im.project.tracks.iter().find(|t| t.name == "Beat x3").unwrap();
         let clips = im.project.track_clips(b.id);
         assert_eq!(clips.len(), 1, "one pass, not three: {clips:?}");
