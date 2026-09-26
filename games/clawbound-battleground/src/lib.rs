@@ -66,6 +66,8 @@ pub mod skydrift;
 pub mod snowpack;
 /// Cloud banks and wisps drifting over the sky map, and who they hide.
 pub mod skycloud;
+/// A clan's camp at each home base: leader's rock, dens, brambles.
+pub mod clancamp;
 /// The generated preparation documents in dev/ (cue cards, recording sheet, cue sheet).
 pub mod devdocs;
 /// Character voxels as smooth surfaces with fur lengths, for the ultra preview.

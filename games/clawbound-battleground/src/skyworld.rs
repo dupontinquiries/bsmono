@@ -32,6 +32,13 @@ pub enum Item {
     Larch { at: Vec3, scale: f32, variant: i32 },
     /// Fallen starlight.
     Shard { at: Vec3, size: f32, variant: i32 },
+    /// A nook in a cliff face under an island's lip, a tiny scene on its
+    /// shelf (`skyprops::cliff_nook`), facing out along `facing`.
+    Nook { at: Vec3, facing: Vec3, kind: u8, variant: i32 },
+    /// A star lantern at a road's edge.
+    Lantern { at: Vec3, variant: i32 },
+    /// A broken marble column of the old ones.
+    Column { at: Vec3, variant: i32 },
 }
 
 /// Keep off what a match needs clear: roads, bases, towers, the pool, the
@@ -48,24 +55,10 @@ fn clear_of_play(x: f32, z: f32) -> bool {
         && causeway_dist(x, z) > sky::CAUSEWAY_R + 2.0
 }
 
+/// Distance to the nearest linking way (causeway or star-bridge), as it
+/// bends (`sky::ways`).
 fn causeway_dist(x: f32, z: f32) -> f32 {
-    let p = Vec3::new(x, 0.0, z);
-    let mut best = f32::MAX;
-    for zs in [1.0f32, -1.0] {
-        for &((ax, az), (bx, bz)) in &sky::CAUSEWAYS {
-            let (a, b) = (Vec3::new(ax, 0.0, az * zs), Vec3::new(bx, 0.0, bz * zs));
-            let ab = b - a;
-            let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
-            best = best.min((a + ab * t - p).length());
-        }
-    }
-    for &((ax, az), (bx, bz)) in &sky::BRIDGES {
-        let (a, b) = (Vec3::new(ax, 0.0, az), Vec3::new(bx, 0.0, bz));
-        let ab = b - a;
-        let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
-        best = best.min((a + ab * t - p).length());
-    }
-    best
+    sky::causeway_dist(x, z).min(sky::bridge_dist(x, z))
 }
 
 /// Everything placed on the sky map. Computed AS the sky map whatever is
@@ -86,10 +79,11 @@ fn placements_here() -> Vec<Item> {
             Item::Spire { at, size, lean, yaw, variant } => Item::Spire { at: flip(at), size, lean, yaw: std::f32::consts::PI - yaw, variant },
             Item::Larch { at, scale, variant } => Item::Larch { at: flip(at), scale, variant },
             Item::Shard { at, size, variant } => Item::Shard { at: flip(at), size, variant },
+            Item::Nook { at, facing, kind, variant } => Item::Nook { at: flip(at), facing: flip(facing), kind, variant },
+            Item::Lantern { at, variant } => Item::Lantern { at: flip(at), variant },
+            Item::Column { at, variant } => Item::Column { at: flip(at), variant },
         };
-        let on_axis = match it {
-            Item::Statue { at, .. } | Item::Arch { at, .. } | Item::Spire { at, .. } | Item::Larch { at, .. } | Item::Shard { at, .. } => at.z.abs() < 0.5,
-        };
+        let on_axis = item_at(&it).z.abs() < 0.5;
         out.push(it);
         if !on_axis {
             out.push(twin);
@@ -137,7 +131,106 @@ fn placements_here() -> Vec<Item> {
         }
         z += 4.0;
     }
+
+    // Nooks in the cliff faces: walk the blue half's island edges, one
+    // every 75 u or so, not at a way onto an island or a ferry pier.
+    let mut nooks: Vec<Vec3> = Vec::new();
+    let mut z = -lim;
+    while z < -8.0 {
+        let mut x = -lim;
+        while x <= lim {
+            let d = f.sdf(x, z);
+            if (sky::EDGE - 1.2..sky::EDGE).contains(&d)
+                && nooks.iter().all(|n| n.distance(Vec3::new(x, 0.0, z)) > 75.0)
+                && sky::causeway_dist(x, z) > sky::CAUSEWAY_R * 1.5 + 8.0
+                && sky::bridge_dist(x, z) > 14.0
+                && sky::ferry_routes().iter().all(|(a, b)| a.distance(Vec3::new(x, 0.0, z)) > 14.0 && b.distance(Vec3::new(x, 0.0, z)) > 14.0)
+                && crate::render::lane_road(x, z) > 6.0
+            {
+                let e = 0.5;
+                let face = Vec3::new(f.sdf(x + e, z) - f.sdf(x - e, z), 0.0, f.sdf(x, z + e) - f.sdf(x, z - e)).normalize_or_zero();
+                if face.length() > 0.5 {
+                    nooks.push(Vec3::new(x, 0.0, z));
+                    // on the face a little under the lip, its back against
+                    // the rock (which curls in beneath the lip, ~1 u in at
+                    // this depth: `sky::underside`), shelf and hood out in
+                    // the air
+                    let at = Vec3::new(x, -4.2, z) + face * 0.8;
+                    let k = nooks.len();
+                    both(&mut out, Item::Nook { at, facing: face, kind: (k % 3) as u8, variant: k as i32 });
+                }
+            }
+            x += 2.0;
+        }
+        z += 2.0;
+    }
+
+    // Star lanterns along both lanes' edges, between the statues.
+    let statues: Vec<Vec3> = out.iter().filter_map(|it| if let Item::Statue { at, .. } = it { Some(*at) } else { None }).collect();
+    for (li, lane) in [crate::consts::Lane::Top, crate::consts::Lane::Bot].into_iter().enumerate() {
+        let pts = lane.polyline();
+        let len: f32 = pts.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+        for (k, fr) in [0.09f32, 0.27, 0.43, 0.57, 0.73, 0.91].into_iter().enumerate() {
+            let p = crate::pass::along(&pts, fr * len);
+            let q = crate::pass::along(&pts, fr * len + 1.0);
+            let dir = (q - p).normalize_or_zero();
+            let side = Vec3::new(-dir.z, 0.0, dir.x);
+            for s in [1.0f32, -1.0] {
+                let at = p + side * s * (sky::LANE_R - 1.2);
+                if f.sdf(at.x, at.z) < -0.8
+                    && statues.iter().all(|st| st.distance(at) > 7.0)
+                    && sky::bridge_dist(at.x, at.z) > sky::BRIDGE_R + 5.0
+                    && sky::causeway_dist(at.x, at.z) > sky::CAUSEWAY_R + 5.0
+                    && !consts::in_tower_clearing(at.x, at.z)
+                {
+                    out.push(Item::Lantern { at, variant: (li * 12 + k * 2 + (s > 0.0) as usize) as i32 });
+                }
+            }
+        }
+    }
+
+    // Broken marble columns on the glades and the terrace.
+    let mut rng = Rng::new(0xC0_1C0);
+    for isl in sky::ISLANDS.iter().filter(|i| i.r > 20.0) {
+        let mut placed = 0;
+        for _ in 0..40 {
+            if placed >= 3 {
+                break;
+            }
+            let a = rng.f32() * std::f32::consts::TAU;
+            let r = rng.range(6.0, isl.r - 6.0);
+            let at = Vec3::new(isl.x + a.cos() * r, 0.0, isl.z + a.sin() * r);
+            if clear_of_play(at.x, at.z) && out.iter().all(|it| item_at(it).distance(at) > 4.0) {
+                both(&mut out, Item::Column { at, variant: (rng.f32() * 8.0) as i32 });
+                placed += 1;
+            }
+        }
+    }
     out
+}
+
+fn item_at(it: &Item) -> Vec3 {
+    match *it {
+        Item::Statue { at, .. }
+        | Item::Arch { at, .. }
+        | Item::Spire { at, .. }
+        | Item::Larch { at, .. }
+        | Item::Shard { at, .. }
+        | Item::Nook { at, .. }
+        | Item::Lantern { at, .. }
+        | Item::Column { at, .. } => at,
+    }
+}
+
+/// Turn a mesh made facing +z to face `yaw` (0 = +z) about its origin.
+fn turned(mut m: crate::voxel::VoxelMesh, yaw: f32) -> crate::voxel::VoxelMesh {
+    let (s, c) = yaw.sin_cos();
+    for i in m.inst.iter_mut() {
+        let (x, z) = (i.off_ao[0], i.off_ao[2]);
+        i.off_ao[0] = x * c + z * s;
+        i.off_ao[2] = -x * s + z * c;
+    }
+    m
 }
 
 /// Meshes and collision for everything in [`placements`].
@@ -177,6 +270,18 @@ pub fn build() -> (Vec<Piece>, Blockers) {
             Item::Shard { at, size, variant } => {
                 pieces.push(Piece { mesh: skyprops::star_shard(size, variant), pos: at - Vec3::Y * 0.3, quarter: (variant % 4) as u8, vsize: V_SM, sway: 0.0 });
             }
+            Item::Nook { at, facing, kind, variant } => {
+                let yaw = facing.x.atan2(facing.z);
+                pieces.push(Piece { mesh: turned(skyprops::cliff_nook(kind, variant), yaw), pos: at, quarter: 0, vsize: skyprops::NOOK_VOX, sway: 0.0 });
+            }
+            Item::Lantern { at, variant } => {
+                blockers.push(Blocker { shape: Shape::Circle { x: at.x, z: at.z, r: 0.45 }, top: 2.8, cover: Cover::NONE });
+                pieces.push(Piece { mesh: skyprops::star_lantern(variant), pos: at, quarter: (variant % 4) as u8, vsize: 0.12, sway: 0.0 });
+            }
+            Item::Column { at, variant } => {
+                blockers.push(Blocker { shape: Shape::Circle { x: at.x, z: at.z, r: 1.3 }, top: 6.0, cover: Cover::NONE });
+                pieces.push(Piece { mesh: skyprops::marble(crate::props::ruin_pillar(1.0, variant), variant as f32 * 0.9), pos: at, quarter: (variant % 4) as u8, vsize: V_MED, sway: 0.0 });
+            }
         }
     }
     (pieces, blockers)
@@ -189,9 +294,7 @@ mod tests {
     #[test]
     fn the_dressing_is_fair_and_keeps_off_the_roads() {
         let items = placements();
-        let at = |it: &Item| match *it {
-            Item::Statue { at, .. } | Item::Arch { at, .. } | Item::Spire { at, .. } | Item::Larch { at, .. } | Item::Shard { at, .. } => at,
-        };
+        let at = item_at;
         let count = |f: &dyn Fn(&Item) -> bool| items.iter().filter(|i| f(i)).count();
         let (statues, spires, larches, shards) = (
             count(&|i| matches!(i, Item::Statue { .. })),
@@ -203,6 +306,10 @@ mod tests {
         assert!((60..1500).contains(&spires), "spires {spires}");
         assert!((20..600).contains(&larches), "larches {larches}");
         assert!(shards >= 10, "shards {shards}");
+        let (nooks, lanterns, columns) = (count(&|i| matches!(i, Item::Nook { .. })), count(&|i| matches!(i, Item::Lantern { .. })), count(&|i| matches!(i, Item::Column { .. })));
+        assert!((16..=50).contains(&nooks), "nooks in the cliffs {nooks}");
+        assert!(lanterns >= 8, "lanterns {lanterns}");
+        assert!(columns >= 6, "columns {columns}");
         // every item off the axis has a mirror twin
         for it in &items {
             let p = at(it);
@@ -218,6 +325,14 @@ mod tests {
                 }
                 if let Item::Spire { at, .. } = it {
                     assert!(sky::floor().sdf(at.x, at.z) > 0.5, "a spire on the floor at {at}");
+                }
+                if let Item::Nook { at, facing, .. } = it {
+                    // under the lip, set into the face, looking out
+                    assert!(at.y < -2.0 && (sky::floor().sdf(at.x, at.z) - sky::EDGE).abs() < 2.5, "a nook on the face at {at}");
+                    assert!(sky::floor().sdf(at.x + facing.x * 4.0, at.z + facing.z * 4.0) > sky::floor().sdf(at.x, at.z), "facing out at {at}");
+                }
+                if let Item::Lantern { at, .. } | Item::Column { at, .. } = it {
+                    assert!(sky::floor().fits(at.x, at.z, 0.8), "on the floor at {at}");
                 }
             }
         });

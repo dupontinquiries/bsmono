@@ -142,6 +142,81 @@ pub const FERRIES: [((f32, f32), (f32, f32)); 3] = [
     ((-197.0, -130.0), (-228.0, -133.0)),
 ];
 
+/// A linking way (causeway or star-bridge) as walked: a polyline of
+/// centre points, and the half-width at each.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Way {
+    pub pts: Vec<Vec3>,
+    pub r: Vec<f32>,
+}
+
+/// Points along a way.
+const WAY_STEPS: usize = 14;
+
+/// A causeway from `a` to `b`, `r` wide, as it is walked: not a ruler line
+/// but a gentle bend (one way or the other by `k`), a second smaller
+/// wander, and a widening near the middle -- a landing where it is wide
+/// enough to fight -- narrowing again toward each end.
+fn causeway_way(a: Vec3, b: Vec3, r: f32, k: usize) -> Way {
+    let d = b - a;
+    let len = d.length();
+    let side = Vec3::new(-d.z, 0.0, d.x) / len.max(1e-3);
+    let bend = if k % 2 == 0 { 0.09 } else { -0.08 } * len;
+    let wander = (0.03 + 0.01 * (k % 3) as f32) * len;
+    let (mut pts, mut rr) = (Vec::new(), Vec::new());
+    for i in 0..=WAY_STEPS {
+        let t = i as f32 / WAY_STEPS as f32;
+        let s = (std::f32::consts::PI * t).sin();
+        pts.push(a + d * t + side * (bend * s + wander * (2.0 * std::f32::consts::PI * t + k as f32).sin() * s));
+        rr.push(r * (0.85 + 0.45 * s.powi(4)));
+    }
+    Way { pts, r: rr }
+}
+
+/// A star-bridge: it stays on z = 0 (the line between the halves, so
+/// neither team's approach is shorter) and varies in width instead, swelling
+/// into three small landings along its span.
+fn bridge_way(a: Vec3, b: Vec3, r: f32) -> Way {
+    let (mut pts, mut rr) = (Vec::new(), Vec::new());
+    for i in 0..=WAY_STEPS {
+        let t = i as f32 / WAY_STEPS as f32;
+        pts.push(a.lerp(b, t));
+        rr.push(r * (0.9 + 0.55 * (3.0 * std::f32::consts::PI * t).sin().abs().powi(3)));
+    }
+    Way { pts, r: rr }
+}
+
+/// Every linking way: the causeways of both halves (the red half the blue
+/// half mirrored, so the two are the same walk), then the two star-bridges.
+pub fn ways() -> Vec<Way> {
+    static W: OnceLock<Vec<Way>> = OnceLock::new();
+    W.get_or_init(ways_built).clone()
+}
+
+fn ways_built() -> Vec<Way> {
+    let mut v = Vec::new();
+    for zs in [1.0f32, -1.0] {
+        for (k, &((ax, az), (bx, bz))) in CAUSEWAYS.iter().enumerate() {
+            v.push(causeway_way(at(ax, az * zs), at(bx, bz * zs), CAUSEWAY_R, k));
+        }
+    }
+    // the mirror of a bend is a bend the other way: mirror the points, not
+    // the recipe
+    let n = CAUSEWAYS.len();
+    for k in 0..n {
+        let blue = v[k].clone();
+        v[n + k] = Way { pts: blue.pts.iter().map(|p| Vec3::new(p.x, p.y, -p.z)).collect(), r: blue.r };
+    }
+    for &((ax, az), (bx, bz)) in &BRIDGES {
+        v.push(bridge_way(at(ax, az), at(bx, bz), BRIDGE_R));
+    }
+    v
+}
+
+fn way_dist(w: &Way, p: Vec3) -> f32 {
+    w.pts.windows(2).map(|s| seg_dist(p, s[0], s[1])).fold(f32::MAX, f32::min)
+}
+
 /// All ferry routes, both halves.
 pub fn ferry_routes() -> Vec<(Vec3, Vec3)> {
     let mut v = Vec::new();
@@ -185,13 +260,16 @@ pub fn floor() -> &'static FloorPlan {
         for i in islands() {
             s.push(Shape::Circle { x: i.x, z: i.z, r: i.r });
         }
-        for zs in [1.0f32, -1.0] {
-            for &((ax, az), (bx, bz)) in &CAUSEWAYS {
-                s.push(seg(at(ax, az * zs), at(bx, bz * zs), CAUSEWAY_R));
+        // the linking ways, bending and swelling (`ways`): a segment per
+        // step at the mean of its ends' widths, and a disc at each joint so
+        // the edge runs smooth
+        for w in ways() {
+            for i in 0..w.pts.len() - 1 {
+                s.push(seg(w.pts[i], w.pts[i + 1], (w.r[i] + w.r[i + 1]) * 0.5));
             }
-        }
-        for &((ax, az), (bx, bz)) in &BRIDGES {
-            s.push(seg(at(ax, az), at(bx, bz), BRIDGE_R));
+            for (p, r) in w.pts.iter().zip(&w.r) {
+                s.push(Shape::Circle { x: p.x, z: p.z, r: *r });
+            }
         }
         FloorPlan::new(s)
     })
@@ -275,19 +353,14 @@ fn seg_dist(p: Vec3, a: Vec3, b: Vec3) -> f32 {
 /// Distance to the nearest star-bridge's centre-line.
 pub fn bridge_dist(x: f32, z: f32) -> f32 {
     let p = at(x, z);
-    BRIDGES.iter().map(|&((ax, az), (bx, bz))| seg_dist(p, at(ax, az), at(bx, bz))).fold(f32::MAX, f32::min)
+    ways().iter().skip(2 * CAUSEWAYS.len()).map(|w| way_dist(w, p)).fold(f32::MAX, f32::min)
 }
 
-/// Distance to the nearest causeway's centre-line (both halves).
+/// Distance to the nearest causeway's centre-line (both halves), as it
+/// bends.
 pub fn causeway_dist(x: f32, z: f32) -> f32 {
     let p = at(x, z);
-    let mut best = f32::MAX;
-    for zs in [1.0f32, -1.0] {
-        for &((ax, az), (bx, bz)) in &CAUSEWAYS {
-            best = best.min(seg_dist(p, at(ax, az * zs), at(bx, bz * zs)));
-        }
-    }
-    best
+    ways().iter().take(2 * CAUSEWAYS.len()).map(|w| way_dist(w, p)).fold(f32::MAX, f32::min)
 }
 
 fn hash2(x: f32, z: f32) -> f32 {
@@ -473,6 +546,38 @@ mod tests {
             assert!(in_void(mid.x, mid.z), "and nothing below it but cloud");
             assert!(terrain_height(mid.x, mid.z) < -12.0);
         }
+    }
+
+    /// The linking ways are not ruler lines: causeways bend and swell, the
+    /// halves mirror each other exactly, and the star-bridges stay on the
+    /// line between the halves (fair) but swell into landings.
+    #[test]
+    fn the_ways_bend_and_swell_and_stay_fair() {
+        let v = ways();
+        let n = CAUSEWAYS.len();
+        assert_eq!(v.len(), 2 * n + BRIDGES.len());
+        for (k, w) in v.iter().take(2 * n).enumerate() {
+            let (a, b) = (w.pts[0], *w.pts.last().unwrap());
+            let off = w.pts.iter().map(|p| seg_dist(*p, a, b)).fold(0.0f32, f32::max);
+            assert!(off > 4.0, "causeway {k} bends: {off}");
+            let (lo, hi) = w.r.iter().fold((f32::MAX, f32::MIN), |(l, h), &r| (l.min(r), h.max(r)));
+            assert!(hi > lo * 1.3, "causeway {k} swells: {lo}..{hi}");
+        }
+        for k in 0..n {
+            for (p, q) in v[k].pts.iter().zip(&v[n + k].pts) {
+                assert!((p.x - q.x).abs() < 1e-4 && (p.z + q.z).abs() < 1e-4, "mirrored");
+            }
+        }
+        for w in v.iter().skip(2 * n) {
+            assert!(w.pts.iter().all(|p| p.z.abs() < 1e-4), "a bridge stays on z = 0");
+            let (lo, hi) = w.r.iter().fold((f32::MAX, f32::MIN), |(l, h), &r| (l.min(r), h.max(r)));
+            assert!(hi > lo * 1.3, "and swells: {lo}..{hi}");
+        }
+        // the floor follows them: the middle of a bent causeway is floor,
+        // the old straight line there is not always
+        let w = &v[1];
+        let mid = w.pts[WAY_STEPS / 2];
+        assert!(floor().sdf(mid.x, mid.z) < -2.0);
     }
 
     #[test]

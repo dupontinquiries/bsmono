@@ -305,6 +305,105 @@ pub fn wyrm_segment(fin: bool, variant: i32) -> VoxelMesh {
     m
 }
 
+/// Voxel size of a cliff nook (the same as `props::diorama`'s, which it
+/// holds).
+pub const NOOK_VOX: f32 = 0.15;
+
+/// A nook in an island's cliff face, under the lip: a shelf of stone
+/// jutting out of the rock with a hood of rock over it, icicles hanging
+/// from its underside, and on it a tiny scene -- `kind` 0 a marble shrine
+/// with its cat idol and two starlit stones, 1 a frosted moss garden with
+/// its pine, 2 a split geode of starlight. Faces +z; origin at the middle
+/// of the shelf's top, which is where the scene stands.
+pub fn cliff_nook(kind: u8, variant: i32) -> VoxelMesh {
+    let k = 1.0 / NOOK_VOX;
+    let (nx, ny, nz) = ((4.4 * k) as usize, (6.0 * k) as usize, (3.6 * k) as usize);
+    let mut g = Grid::new(nx, ny, nz);
+    let c = nx as f32 * 0.5;
+    let shelf_top = 2.2 * k; // grid cells above the grid floor: room for icicles
+    let back = 0.3 * k;
+    let rock = [0.30, 0.34, 0.46, 1.0];
+    let rock_d = [0.22, 0.25, 0.36, 1.0];
+    let icicle = [0.62, 0.84, 0.97, 1.0];
+    let snow = [0.90, 0.92, 0.98, 1.0];
+    // the shelf, its front edge a little rounded
+    g.filled_box((c - 1.9 * k) as i32, (shelf_top - 0.5 * k) as i32, back as i32, (c + 1.9 * k) as i32, shelf_top as i32 - 1, (nz as f32 - 0.3 * k) as i32, rock);
+    g.filled_box((c - 1.8 * k) as i32, shelf_top as i32 - 1, back as i32, (c + 1.8 * k) as i32, shelf_top as i32, (nz as f32 - 0.5 * k) as i32, snow);
+    // the hood: a shell of rock over the back half, open to the front
+    g.ellipsoid(c, shelf_top, back, 2.2 * k, 3.3 * k, 1.9 * k, rock_d);
+    g.carve_sphere(c, shelf_top + 0.2 * k, back + 1.2 * k, 1.9 * k);
+    g.carve_sphere(c, shelf_top + 0.6 * k, back + 2.2 * k, 1.8 * k);
+    // snow on the hood's brow
+    g.ellipsoid(c, shelf_top + 2.8 * k, back + 0.9 * k, 1.8 * k, 0.35 * k, 0.7 * k, snow);
+    // icicles hanging from the shelf's front
+    for q in 0..7 {
+        let x = c + (q as f32 / 6.0 * 3.2 - 1.6) * k;
+        let len = (0.6 + h3(q as f32, 0.0, 0.0, variant as f32) * 1.4) * k;
+        let z = nz as f32 - (0.6 + h3(q as f32, 1.0, 0.0, variant as f32) * 0.6) * k;
+        g.cone_y(x, z, 0.22 * k, 0.03 * k, (shelf_top - 0.5 * k - len) as i32, (shelf_top - 0.5 * k) as i32, icicle);
+    }
+    let mut m = g.mesh(NOOK_VOX, true);
+    let top = shelf_top * NOOK_VOX;
+    let zc = (nz as f32 * 0.5 - (back + 1.6 * k)) * NOOK_VOX; // shelf middle sits at z = 0
+    for i in m.inst.iter_mut() {
+        i.off_ao[1] -= top;
+        i.off_ao[2] += zc;
+        if i.color[2] > 0.95 && i.color[0] < 0.7 {
+            i.misc[2] = 0.3; // icicles catch the light
+        }
+    }
+    // the scene on the shelf, dressed for the glacier
+    let mut d = props::diorama(kind, variant);
+    match kind % 3 {
+        0 => d = marble(d, variant as f32),
+        1 => {
+            let hi = d.inst.iter().map(|i| i.off_ao[1]).fold(0.0f32, f32::max).max(0.1);
+            for i in d.inst.iter_mut() {
+                if i.off_ao[1] > hi * 0.3 && h3(i.off_ao[0], i.off_ao[1], i.off_ao[2], 5.0) < 0.5 {
+                    i.color = [0.90, 0.92, 0.98, 1.0];
+                }
+            }
+        }
+        _ => {}
+    }
+    crate::voxel::merge(&[m, d], &[glam::Vec3::ZERO, glam::Vec3::new(0.0, 0.0, 0.2)])
+}
+
+/// A star lantern: a marble post, a cage of four gold ribs at its head,
+/// and in it a caught star. About 2.8 u tall, feet at y = 0.
+pub fn star_lantern(variant: i32) -> VoxelMesh {
+    let k = 1.0 / 0.12;
+    let n = (1.4 * k) as usize;
+    let mut g = Grid::new(n, (3.0 * k) as usize, n);
+    let c = n as f32 * 0.5;
+    let white = [0.93, 0.92, 0.88, 1.0];
+    let gold = [0.86, 0.70, 0.36, 1.0];
+    let star = [1.0, 0.95, 0.80, 1.0];
+    g.cyl_y(c, c, 0.5 * k, 0, (0.25 * k) as i32, white);
+    g.cyl_y(c, c, 0.16 * k, (0.25 * k) as i32, (2.1 * k) as i32, white);
+    g.cyl_y(c, c, 0.35 * k, (2.1 * k) as i32, (2.25 * k) as i32, gold);
+    for (dx, dz) in [(1.0f32, 0.0f32), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+        for y in (2.25 * k) as i32..(2.85 * k) as i32 {
+            g.set((c + dx * 0.32 * k) as i32, y, (c + dz * 0.32 * k) as i32, gold);
+        }
+    }
+    g.ellipsoid(c, 2.55 * k, c, 0.2 * k, 0.2 * k, 0.2 * k, star);
+    let mut m = marble(g.mesh(0.12, true), variant as f32);
+    // the marble pass recolours everything: put the star and the gold back
+    for i in m.inst.iter_mut() {
+        let y = i.off_ao[1];
+        let r = i.off_ao[0].hypot(i.off_ao[2]);
+        if y > 2.35 && y < 2.75 && r < 0.25 {
+            i.color = star;
+            i.misc[2] = 2.0;
+        } else if y > 2.1 && r > 0.25 {
+            i.color = gold;
+            i.misc[2] = 0.3;
+        }
+    }
+    m
+}
+
 /// Voxel size of the floating stone and the drifting cloud.
 pub const DRIFT_VOX: f32 = 0.3;
 pub const PUFF_VOX: f32 = 0.6;

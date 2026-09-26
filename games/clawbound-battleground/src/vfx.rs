@@ -127,6 +127,45 @@ pub struct Vfx {
     snow_map: Option<crate::map::MapId>,
     snow_last: Vec<Vec3>,
     snow_wind: Vec3,
+    /// Dashes through the sky map's cloud, parting it as they pass: the
+    /// scene pushes the billows aside along each (`Gust::push`).
+    pub gusts: Vec<Gust>,
+    crumble_t: f32,
+    crumble_seed: u64,
+}
+
+/// A dash's wake through cloud: from `from` to `to`, `age` seconds ago.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Gust {
+    pub from: Vec3,
+    pub to: Vec3,
+    pub age: f32,
+}
+
+/// How long a dash's wake holds the cloud open.
+pub const GUST_SECS: f32 = 3.5;
+
+impl Gust {
+    /// How far a billow at `p` is pushed aside by this wake, and which way:
+    /// out from the dash's line, strongest along it and just after, closing
+    /// back over `GUST_SECS` with a little swirl.
+    pub fn push(&self, p: Vec3) -> Vec3 {
+        let ab = Vec3::new(self.to.x - self.from.x, 0.0, self.to.z - self.from.z);
+        let ap = Vec3::new(p.x - self.from.x, 0.0, p.z - self.from.z);
+        let t = (ap.dot(ab) / ab.length_squared().max(1e-4)).clamp(0.0, 1.0);
+        let off = ap - ab * t;
+        let d = off.length();
+        let reach = 12.0;
+        if d > reach || self.age > GUST_SECS {
+            return Vec3::ZERO;
+        }
+        let fade = 1.0 - self.age / GUST_SECS;
+        let near = 1.0 - d / reach;
+        let away = if d > 1e-3 { off / d } else { Vec3::new(-ab.z, 0.0, ab.x).normalize_or_zero() };
+        // swirl: the parted cloud curls round behind the dash
+        let curl = Vec3::new(-away.z, 0.0, away.x) * (self.age * 2.0).sin() * 0.5;
+        (away + curl) * 8.0 * near * fade * fade
+    }
 }
 
 /// One trail of mist: a point that wanders a curling path, leaving a
@@ -527,6 +566,115 @@ impl Vfx {
         self.particles.extend(motes);
     }
 
+    /// The sky map, alive: dashes through cloud part it (a wake of mist,
+    /// `gusts` for the scene), and bits of the islands' edges crumble off
+    /// and fall away into the sky near the player.
+    pub fn tick_sky_life(&mut self, dt: f32, events: &[Event], game: &Game) {
+        if crate::map::active() != crate::map::MapId::Sky {
+            self.gusts.clear();
+            return;
+        }
+        self.gusts.retain_mut(|g| {
+            g.age += dt;
+            g.age < GUST_SECS
+        });
+        let mut cs: Option<Vec<crate::skycloud::Cloud>> = None;
+        for e in events {
+            if let Event::DashFx { pos, dir, .. } = *e {
+                let cs = cs.get_or_insert_with(|| crate::skycloud::clouds(game.cloud_seed, game.t));
+                let from = pos - dir * 6.0;
+                let fog = crate::skycloud::density(cs, pos.x, pos.z).max(crate::skycloud::density(cs, from.x, from.z));
+                if fog < 0.1 {
+                    continue;
+                }
+                self.gusts.push(Gust { from, to: pos + dir * 2.0, age: 0.0 });
+                if self.gusts.len() > 24 {
+                    self.gusts.remove(0);
+                }
+                // the wake: mist torn off and curling behind the dash
+                for k in 0..(24.0 * fog) as usize {
+                    let t = k as f32 / 24.0;
+                    let p = from.lerp(pos, t);
+                    let side = Vec3::new(-dir.z, 0.0, dir.x) * if k % 2 == 0 { 1.0 } else { -1.0 };
+                    let j = self.perturb(0.4 + k as f32 * 0.1);
+                    self.particles.push(Particle {
+                        pos: p + Vec3::Y * (0.8 + j.abs() * 2.0) + side * 0.6,
+                        vel: side * (2.5 + j.abs() * 3.0) + dir * 1.5 + Vec3::Y * 0.4,
+                        life: 1.4,
+                        max_life: 1.4,
+                        size: 0.35,
+                        color: [0.92, 0.94, 1.0],
+                        alpha: 0.45 * fog,
+                        gravity: -0.2,
+                        drag: 1.6,
+                    });
+                }
+            }
+        }
+        // crumbling: now and then a piece of an island's edge near the
+        // player breaks away and falls, shedding snow as it goes
+        self.crumble_t -= dt;
+        if self.crumble_t > 0.0 || game.gods.is_empty() {
+            return;
+        }
+        let mut s = self.crumble_seed | 1;
+        let mut rnd = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as f32) / (1u64 << 31) as f32
+        };
+        self.crumble_t = 0.35 + rnd() * 0.9;
+        let focus = game.gods[0].pos;
+        let floor = crate::sky::floor();
+        let mut edge = None;
+        for _ in 0..24 {
+            let a = rnd() * std::f32::consts::TAU;
+            let r = 8.0 + rnd() * 55.0;
+            let p = Vec3::new(focus.x + a.cos() * r, 0.0, focus.z + a.sin() * r);
+            let d = floor.sdf(p.x, p.z);
+            if (crate::sky::EDGE - 1.5..crate::sky::EDGE).contains(&d) {
+                let e = 0.5;
+                let out = Vec3::new(floor.sdf(p.x + e, p.z) - floor.sdf(p.x - e, p.z), 0.0, floor.sdf(p.x, p.z + e) - floor.sdf(p.x, p.z - e)).normalize_or_zero();
+                edge = Some((p, out));
+                break;
+            }
+        }
+        let big = rnd() < 0.2;
+        let seed_out = rnd();
+        self.crumble_seed = s;
+        let Some((p, out)) = edge else { return };
+        let n = if big { 9 } else { 3 };
+        for k in 0..n {
+            let j = Vec3::new(self.perturb(0.8 + k as f32), self.perturb(0.3 + k as f32 * 0.7).abs() * -1.0, self.perturb(0.8 + k as f32 * 1.3));
+            let rock = if (k as f32 + seed_out * 3.0) as usize % 3 == 0 { [0.62, 0.80, 0.94] } else { [0.26, 0.30, 0.42] };
+            self.dust.push(Particle {
+                pos: p + out * 0.6 + j * 0.8 - Vec3::Y * 0.5,
+                vel: out * (0.8 + j.x.abs()) + Vec3::new(j.x, 0.2, j.z) * 0.6,
+                life: 4.0,
+                max_life: 4.0,
+                size: if big { 0.28 + 0.12 * (k % 3) as f32 } else { 0.18 + 0.06 * (k % 2) as f32 },
+                color: rock,
+                alpha: 1.0,
+                gravity: 9.0,
+                drag: 0.1,
+            });
+        }
+        // a puff of snow off the lip
+        for k in 0..(if big { 14 } else { 6 }) {
+            let j = self.perturb(0.6 + k as f32 * 0.4);
+            self.dust.push(Particle {
+                pos: p + out * 0.3 + Vec3::Y * 0.2,
+                vel: out * (1.0 + j.abs() * 2.0) + Vec3::new(j, 0.6 + j.abs(), -j) * 0.8,
+                life: 1.6,
+                max_life: 1.6,
+                size: 0.12,
+                color: [0.92, 0.94, 1.0],
+                alpha: 0.8,
+                gravity: 2.5,
+                drag: 1.4,
+            });
+        }
+    }
+
     /// The snowpack (ultra): laid when the map changes, stepped (fall,
     /// drift, marks filling), ploughed by cats wading drifts, and struck by
     /// what abilities do to the ground -- a blast throws a crater, heat
@@ -775,6 +923,7 @@ impl Vfx {
         self.tick_channels(dt, events, game);
         self.tick_wisps(dt, game);
         self.tick_snow(dt, events, game);
+        self.tick_sky_life(dt, events, game);
         self.time += dt;
         let atm = game.weather.atmosphere();
         self.ground.tick(dt, atm.rain, atm.wetness);
@@ -2339,5 +2488,59 @@ mod snow_tests {
             let s = v.snow.as_ref().unwrap();
             assert!(s.press_at(c.x + 2.5, c.z) > 0.6, "a trench behind it: {}", s.press_at(c.x + 2.5, c.z));
         });
+    }
+}
+
+#[cfg(test)]
+mod sky_life_tests {
+    use super::*;
+
+    /// A dash's wake pushes billows aside -- near the line, not far off it
+    /// -- and closes again.
+    #[test]
+    fn a_dash_parts_the_cloud_and_it_closes() {
+        let g = Gust { from: Vec3::ZERO, to: Vec3::X * 10.0, age: 0.1 };
+        let near = g.push(Vec3::new(5.0, 2.0, 2.0));
+        assert!(near.z > 2.0, "pushed away from the line: {near}");
+        assert_eq!(g.push(Vec3::new(5.0, 2.0, 20.0)), Vec3::ZERO, "not far off it");
+        let later = Gust { age: GUST_SECS * 0.9, ..g }.push(Vec3::new(5.0, 2.0, 2.0));
+        assert!(later.length() < near.length() * 0.2, "closing again: {later}");
+    }
+
+    /// On the sky map, a dash through a bank leaves a wake; the edges near
+    /// the player crumble now and then; off it, neither.
+    #[test]
+    fn the_sky_map_is_alive() {
+        crate::map::with(crate::map::MapId::Sky, || {
+            let mut game = Game::new_teams(&[0], &[1]);
+            // a time and place with a thick bank
+            let (t, bank) = (60..900)
+                .map(|s| s as f32 * 4.0)
+                .find_map(|t| crate::skycloud::clouds(game.cloud_seed, t).into_iter().find(|c| c.kind == crate::skycloud::Kind::Bank && c.thick > 0.9).map(|c| (t, c)))
+                .expect("a bank");
+            game.t = t;
+            // the player's cat on an island's edge, for the crumbling
+            let floor = crate::sky::floor();
+            let edge = (0..4000).map(|k| Vec3::new((k % 80) as f32 * 8.0 - 320.0, 0.0, (k / 80) as f32 * 8.0 - 200.0)).find(|p| floor.sdf(p.x, p.z) < -4.0 && floor.sdf(p.x + 10.0, p.z) > 5.0).expect("an edge");
+            game.gods[0].pos = edge;
+            let mut v = Vfx::default();
+            let d0 = v.dust.len();
+            for _ in 0..(6 * 60) {
+                v.tick_sky_life(1.0 / 60.0, &[], &game);
+            }
+            assert!(v.dust.len() > d0 + 10, "bits crumbled off: {}", v.dust.len() - d0);
+            v.tick_sky_life(1.0 / 60.0, &[Event::DashFx { pos: bank.pos, dir: Vec3::X, color: [1.0; 3] }], &game);
+            assert_eq!(v.gusts.len(), 1, "a dash through the bank parts it");
+            let cs = crate::skycloud::clouds(game.cloud_seed, game.t);
+            let far = (1..40).map(|k| bank.pos + Vec3::new(k as f32 * 20.0, 0.0, 30.0)).find(|p| crate::skycloud::density(&cs, p.x, p.z) < 0.01 && crate::skycloud::density(&cs, p.x - 6.0, p.z) < 0.01).expect("clear air");
+            v.tick_sky_life(1.0 / 60.0, &[Event::DashFx { pos: far, dir: Vec3::X, color: [1.0; 3] }], &game);
+            assert_eq!(v.gusts.len(), 1, "a dash in clear air parts nothing");
+        });
+        let mut v = Vfx::default();
+        let game = Game::new_teams(&[0], &[1]);
+        for _ in 0..300 {
+            v.tick_sky_life(1.0 / 60.0, &[], &game);
+        }
+        assert!(v.dust.is_empty(), "the jungle does not crumble");
     }
 }

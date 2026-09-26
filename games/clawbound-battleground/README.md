@@ -44,6 +44,14 @@ what else is known-but-unresolved.
   be auto-attacked, bots do not go for it); a thick wisp between two groups
   hides each from the other. Towers and bases see through cloud; minions
   give no sight.
+- **The Elders move**: each guards its ground -- a circle round its pedestal
+  and a push lane out toward the enemy, marked with faint stones of light.
+  It turns to face what steps onto its ground, strides out to meet it,
+  strikes only what it faces, and walks home to its pedestal when the ground
+  is clear.
+- **Clan camps** behind every base, on every map: a leader's rock, a
+  medicine den with its pool and herbs, warriors', apprentices' and elders'
+  dens, a mossy nursery, a fresh-kill pile, and a bramble wall round the back.
 - **Ultra snow** (Ultra preset only; looks, not rules): snow lies on the snowy
   maps, deep in the sheltered hollows and blown thin where the wind scours;
   it keeps falling, the wind drifts it from the blown stretches into the lee,

@@ -64,8 +64,9 @@ pub struct Cloud {
     pub thick: f32,
     /// A number of its own, for the shape of its edge and the scene's puffs.
     pub seed: u32,
-    /// Seconds since it formed.
+    /// Seconds since it formed, and how long it lasts in all.
     pub age: f32,
+    pub life: f32,
 }
 
 fn hash(a: u64, b: u64) -> u64 {
@@ -112,7 +113,7 @@ pub fn clouds(seed: u64, t: f32) -> Vec<Cloud> {
             continue;
         }
         let thick = smooth(age / FADE).min(smooth((life - age) / FADE));
-        out.push(Cloud { kind: Kind::Bank, pos: start + dir * speed * age, dir: dir * speed, r, w: r, thick, seed: rng.next_u() as u32, age });
+        out.push(Cloud { kind: Kind::Bank, pos: start + dir * speed * age, dir: dir * speed, r, w: r, thick, seed: rng.next_u() as u32, age, life });
     }
     // wisps: short-lived streams blowing through anywhere over the islands
     let e_now = (t / WISP_EPOCH).floor() as i64;
@@ -149,6 +150,7 @@ pub fn clouds(seed: u64, t: f32) -> Vec<Cloud> {
             thick,
             seed: rng.next_u() as u32,
             age,
+            life,
         });
     }
     out
@@ -322,7 +324,7 @@ mod tests {
 
     #[test]
     fn a_bank_breaks_sight_and_near_is_always_seen() {
-        let bank = Cloud { kind: Kind::Bank, pos: Vec3::ZERO, dir: Vec3::X, r: 40.0, w: 40.0, thick: 1.0, seed: 1, age: 100.0 };
+        let bank = Cloud { kind: Kind::Bank, pos: Vec3::ZERO, dir: Vec3::X, r: 40.0, w: 40.0, thick: 1.0, seed: 1, age: 100.0, life: 300.0 };
         let cs = [bank];
         // from outside into the middle, and right through it
         assert!(!sees(&cs, Vec3::new(-44.0, 0.0, 0.0), Vec3::ZERO), "cannot see into a bank");
@@ -339,7 +341,7 @@ mod tests {
 
     #[test]
     fn a_wisp_cuts_a_line_only_while_it_is_thick() {
-        let w = Cloud { kind: Kind::Wisp, pos: Vec3::ZERO, dir: Vec3::X * 5.0, r: 30.0, w: 7.0, thick: 1.0, seed: 0, age: 10.0 };
+        let w = Cloud { kind: Kind::Wisp, pos: Vec3::ZERO, dir: Vec3::X * 5.0, r: 30.0, w: 7.0, thick: 1.0, seed: 0, age: 10.0, life: 60.0 };
         // a line across the stream
         let (a, b) = (Vec3::new(0.0, 0.0, -20.0), Vec3::new(0.0, 0.0, 20.0));
         assert!(!sees(&[w], a, b), "thick: cut");
