@@ -105,7 +105,7 @@ mod tests {
     }
 
     fn img(fourcc: u32, planes: &[(u32, u32)]) -> DmaBufImage {
-        DmaBufImage { planes: planes.iter().map(|&(offset, stride)| DmaBufPlane { fd: fd(), offset, stride }).collect(), modifier: 0, fourcc }
+        DmaBufImage { planes: planes.iter().map(|&(offset, stride)| DmaBufPlane { fd: fd(), offset, stride }).collect(), modifier: 0, fourcc, owner: None }
     }
 
     #[test]

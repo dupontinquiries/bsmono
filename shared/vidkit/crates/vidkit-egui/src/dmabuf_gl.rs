@@ -244,7 +244,7 @@ mod tests {
         }
         let fd = unsafe { OwnedFd::from_raw_fd(libc::memfd_create(c"vk-dmabuf".as_ptr(), 0)) };
         std::io::Write::write_all(&mut std::fs::File::from(fd.try_clone().unwrap()), &buf).unwrap();
-        let img = DmaBufImage { planes: vec![DmaBufPlane { fd, offset: 0, stride }], modifier: 0, fourcc: DRM_FORMAT_NV12 };
+        let img = DmaBufImage { planes: vec![DmaBufPlane { fd, offset: 0, stride }], modifier: 0, fourcc: DRM_FORMAT_NV12, owner: None };
         let (layout, cpu) = map_linear(&img, w, h).unwrap();
         assert_eq!(layout, PlaneLayout::Nv12);
         assert_eq!(cpu.strides, vec![64, 64]);

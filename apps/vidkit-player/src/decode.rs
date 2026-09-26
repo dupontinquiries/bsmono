@@ -303,6 +303,15 @@ pub fn worth_scaling(src: (u32, u32), fit: Option<(u32, u32)>, max_texture: u32)
     (ratio < 0.6).then_some((tw, th))
 }
 
+/// The size ffmpeg would scale `p` to at the current cap, or `None`.
+pub fn scale_plan(p: &Probe) -> Option<(u32, u32)> {
+    worth_scaling((p.width, p.height), fit_long_edge(p.width, p.height, Some(decode_cap())), texture_limit())
+}
+
+pub fn texture_limit() -> u32 {
+    TEXTURE_LIMIT.load(Ordering::Relaxed)
+}
+
 static TEXTURE_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 static PREFER_PLANAR: AtomicBool = AtomicBool::new(false);
 
@@ -840,6 +849,48 @@ impl PlanePool {
     }
 }
 
+/// What the engine's video thread pulls frames from: the ffmpeg child
+/// process ([`FfmpegFrames`]) or an in-process decoder.
+pub trait VideoSource: Send {
+    fn next_frame(&mut self) -> Option<Frame>;
+    fn frame_interval(&self) -> Duration;
+    fn hdr_peak(&self) -> Option<f32>;
+    /// Share the consumer's plane pool.
+    fn set_pool(&mut self, pool: Arc<PlanePool>);
+    /// "software 1920x1080", "VAAPI zero-copy 3840x2160"... for the status.
+    fn label(&self) -> String;
+    /// Bytes of one CPU frame (queue sizing); a dma-buf source still says
+    /// what the frame would weigh, since the pool of surfaces is what bounds
+    /// its queue.
+    fn frame_bytes(&self) -> usize;
+    /// A one-off note (a fallback happened), taken once.
+    fn take_note(&mut self) -> Option<String>;
+}
+
+impl VideoSource for FfmpegFrames {
+    fn next_frame(&mut self) -> Option<Frame> {
+        FfmpegFrames::next_frame(self)
+    }
+    fn frame_interval(&self) -> Duration {
+        self.frame_interval
+    }
+    fn hdr_peak(&self) -> Option<f32> {
+        self.hdr_peak
+    }
+    fn set_pool(&mut self, pool: Arc<PlanePool>) {
+        FfmpegFrames::set_pool(self, pool)
+    }
+    fn label(&self) -> String {
+        format!("{} {}x{}", self.accel.label(), self.width, self.height)
+    }
+    fn frame_bytes(&self) -> usize {
+        FfmpegFrames::frame_bytes(self)
+    }
+    fn take_note(&mut self) -> Option<String> {
+        self.note.take()
+    }
+}
+
 /// A running ffmpeg, yielding NV12 frames.
 pub struct FfmpegFrames {
     child: Child,
@@ -1165,6 +1216,17 @@ impl FfmpegFrames {
 }
 
 static GPU_GRAIN: AtomicBool = AtomicBool::new(false);
+static GPU_PRESENTER: AtomicBool = AtomicBool::new(false);
+
+/// Whether frames go to the GL presenter (which imports dma-bufs). Set by
+/// the app at startup and cleared if the GPU path fails.
+pub fn set_gpu_presenter(on: bool) {
+    GPU_PRESENTER.store(on, Ordering::Relaxed);
+}
+
+pub fn gpu_presenter() -> bool {
+    GPU_PRESENTER.load(Ordering::Relaxed)
+}
 
 /// Whether the presenter synthesises AV1 film grain itself (the GPU
 /// presenter does; the CPU one does not). Takes effect at the next open.

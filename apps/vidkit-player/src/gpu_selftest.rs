@@ -305,6 +305,7 @@ fn dmabuf_nv12(w: u32, h: u32) -> Frame {
             planes: vec![vidkit_core::frame::DmaBufPlane { fd, offset: 0, stride: stride as u32 }],
             modifier: vidkit_core::dmabuf::DRM_FORMAT_MOD_LINEAR,
             fourcc: vidkit_core::dmabuf::DRM_FORMAT_NV12,
+            owner: None,
         }),
         layout: PlaneLayout::Nv12,
         ..src

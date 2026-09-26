@@ -1,0 +1,16 @@
+[package]
+name = "vidkit-libav"
+version = "0.1.0"
+edition = "2021"
+description = "In-process demux + decode through libavcodec: frames without a pipe, and VAAPI frames exported as dma-bufs (zero copy)."
+license = "MPL-2.0"
+
+[dependencies]
+vidkit-core = { path = "../vidkit-core" }
+# Raw FFI, bindgen against the SYSTEM headers at build time: the struct
+# layouts (AVFrame, AVCodecContext) change between FFmpeg majors, so they
+# must come from the headers the binary will run against, not be written
+# by hand. Needs libav*-dev (Debian/Ubuntu) or ffmpeg-free-devel (Fedora)
+# and libclang.
+ffmpeg-sys-next = { version = "8", default-features = false, features = ["avcodec", "avformat"] }
+libc = "0.2"

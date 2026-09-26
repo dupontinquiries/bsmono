@@ -401,7 +401,7 @@ mod tests {
         let opener: crate::playback::Opener = Box::new(move |from, speed| {
             let v = crate::decode::FfmpegFrames::open_at(&p2, None, from)?;
             let a = crate::decode::AudioStream::open(&p2.to_string_lossy(), 48_000, 2, from, speed).ok();
-            Ok((v, a))
+            Ok((Box::new(v) as Box<dyn crate::decode::VideoSource>, a))
         });
         let mut e = crate::playback::Engine::start(opener, maker, Duration::ZERO, 60).unwrap();
         assert!(e.clock_is_audio());

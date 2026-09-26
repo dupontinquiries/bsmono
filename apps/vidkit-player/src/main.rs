@@ -31,6 +31,8 @@ mod filepick;
 mod analysis;
 mod audio_out;
 mod gpu_selftest;
+#[cfg(feature = "libav")]
+mod inproc;
 mod enhance_plan;
 mod decode;
 mod export;
@@ -348,6 +350,7 @@ impl Player {
         // ...and synthesises AV1 film grain, so software AV1 exports the
         // grain instead of dav1d adding it on the CPU.
         decode::set_gpu_grain(gpu.is_some());
+        decode::set_gpu_presenter(gpu.is_some());
         let opened = file.as_ref().map(|p| open_local(p));
 
         // Try to decode it for real. A failure is not fatal: the file still
@@ -588,6 +591,7 @@ impl Player {
                     // from the next open (a seek). Until then the film is
                     // shown without grain -- rare, and said above.
                     decode::set_gpu_grain(false);
+                    decode::set_gpu_presenter(false);
                 }
             }
         }
@@ -1695,13 +1699,15 @@ fn file_opener(p: PathBuf) -> playback::Opener {
     let cache = std::sync::OnceLock::new();
     Box::new(move |from, speed| {
         let pr = probed(&cache, || decode::probe(&p))?;
-        let v = decode::FfmpegFrames::open_probed(
-            &decode::VideoInput::file(&p),
-            &pr,
-            Some(decode::decode_cap()),
-            from,
-            decode::accel_for(&pr.codec),
-        )?;
+        let accel = decode::accel_for(&pr.codec);
+        #[cfg(feature = "libav")]
+        let inproc = inproc::open(&p, &pr, from, &accel);
+        #[cfg(not(feature = "libav"))]
+        let inproc: Option<Box<dyn decode::VideoSource>> = None;
+        let v: Box<dyn decode::VideoSource> = match inproc {
+            Some(v) => v,
+            None => Box::new(decode::FfmpegFrames::open_probed(&decode::VideoInput::file(&p), &pr, Some(decode::decode_cap()), from, accel)?),
+        };
         let a = decode::AudioStream::open(&p.to_string_lossy(), 48_000, 2, from, speed).ok();
         Ok((v, a))
     })
@@ -1713,7 +1719,7 @@ fn stream_opener(input: decode::StreamingInput, _format_cap: Option<u32>) -> pla
     let cache = std::sync::OnceLock::new();
     Box::new(move |from, speed| {
         let pr = probed(&cache, || decode::probe_input(&input.video_url, &input.headers))?;
-        let v = decode::FfmpegFrames::open_probed(
+        let v: Box<dyn decode::VideoSource> = Box::new(decode::FfmpegFrames::open_probed(
             &decode::VideoInput::url(&input.video_url, &input.headers),
             &pr,
             // The format was already chosen at the preset's height; this is
@@ -1721,7 +1727,7 @@ fn stream_opener(input: decode::StreamingInput, _format_cap: Option<u32>) -> pla
             Some(decode::decode_cap()),
             from,
             decode::accel_for(&pr.codec),
-        )?;
+        )?);
         let a = decode::AudioStream::open_streaming(&input, 48_000, 2, from, speed).ok();
         Ok((v, a))
     })

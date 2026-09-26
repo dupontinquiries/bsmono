@@ -35,6 +35,14 @@ done
 echo "  (no native h264/hevc = Fedora ffmpeg-free: the player will not pick those streams for hardware;"
 echo "   'dnf swap ffmpeg-free ffmpeg --allowerasing' from RPM Fusion adds them)"
 ffmpeg -hide_banner -hwaccels 2>/dev/null | grep -q vaapi && say "  hwaccel vaapi" "yes" || say "  hwaccel vaapi" "NO: no hardware decode at all"
+# The default build decodes in process (vidkit-libav, bindgen at build
+# time): the headers and libclang must be there, or build with
+#   cargo build --release --no-default-features --features app,https,whisper,alsa,bscale
+if pkg-config --exists libavcodec libavformat libavutil 2>/dev/null; then
+  say "  libav headers (in-process build)" "yes ($(pkg-config --modversion libavcodec))"
+else
+  say "  libav headers (in-process build)" "NO: dnf install ffmpeg-free-devel clang-devel"
+fi
 
 echo "--- yt-dlp"
 command -v yt-dlp >/dev/null && say "  version" "$(yt-dlp --version)  (YouTube breaks old ones: keep it current)" || say "  yt-dlp" "missing: no YouTube"

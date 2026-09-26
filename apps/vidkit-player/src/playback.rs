@@ -31,7 +31,9 @@
 //! `Decoder`, and this app decodes in an ffmpeg process that emits finished
 //! frames. Its clocks and sync policy are exactly what is needed, and are.
 
-use crate::decode::{AudioSink, AudioStream, FfmpegFrames, PlanePool};
+use crate::decode::{AudioSink, AudioStream, PlanePool, VideoSource};
+#[cfg(test)]
+use crate::decode::FfmpegFrames;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -316,7 +318,7 @@ impl Master {
 /// A closure so a file and a network stream take the same path, and so a
 /// seek or a speed change can reopen both.
 /// Called with the media position and the playback speed.
-pub type Opener = Box<dyn Fn(Duration, f64) -> Result<(FfmpegFrames, Option<AudioStream>), String> + Send>;
+pub type Opener = Box<dyn Fn(Duration, f64) -> Result<(Box<dyn VideoSource>, Option<AudioStream>), String> + Send>;
 /// Makes a fresh audio sink. Fresh per (re)start: dropping the old one kills
 /// the player process, so audio buffered before a seek is not heard after it.
 pub type SinkMaker = Box<dyn Fn() -> Box<dyn AudioSink> + Send>;
@@ -431,12 +433,12 @@ impl Engine {
         self.dropped = 0;
 
         let (mut video, audio) = (self.opener)(from, self.speed)?;
-        self.frame_interval = video.frame_interval;
-        self.hdr_peak = video.hdr_peak;
+        self.frame_interval = video.frame_interval();
+        self.hdr_peak = video.hdr_peak();
         if self.video_enabled {
         video.set_pool(self.pool.clone());
         if let Ok(mut d) = self.decoder.lock() {
-            *d = format!("{} {}x{}", video.accel.label(), video.width, video.height);
+            *d = video.label();
         }
         let fb = video.frame_bytes();
         self.depth = queue_depth(fb);
@@ -447,9 +449,9 @@ impl Engine {
             let mut video = video;
             while !stop.load(Ordering::Relaxed) {
                 let Some(f) = video.next_frame() else { break };
-                if let Some(note) = video.note.take() {
+                if let Some(note) = video.take_note() {
                     if let Ok(mut d) = decoder.lock() {
-                        *d = format!("{} {}x{} ({note})", video.accel.label(), video.width, video.height);
+                        *d = format!("{} ({note})", video.label());
                     }
                 }
                 if tx.send(f).is_err() {
@@ -863,7 +865,7 @@ mod tests {
 
     fn opener(p: std::path::PathBuf) -> Opener {
         Box::new(move |from, speed| {
-            let v = if from.is_zero() { FfmpegFrames::open(&p, None)? } else { FfmpegFrames::open_at(&p, None, from)? };
+            let v: Box<dyn VideoSource> = Box::new(if from.is_zero() { FfmpegFrames::open(&p, None)? } else { FfmpegFrames::open_at(&p, None, from)? });
             let a = AudioStream::open(&p.to_string_lossy(), 48_000, 2, from, speed).ok();
             Ok((v, a))
         })

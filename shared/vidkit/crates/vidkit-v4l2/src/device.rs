@@ -528,6 +528,7 @@ impl V4l2Api for Device {
                 planes: dma_planes,
                 modifier: self.modifier,
                 fourcc,
+                owner: None,
             }),
             pts: Duration::new(
                 buf.timestamp.tv_sec.max(0) as u64,
