@@ -317,6 +317,37 @@ pub struct ChannelFx {
     filters: [Biquad; 4],
     tuned: Option<Eq4>,
     leveler: Leveler,
+    /// The app-wide speech boost (Settings > Camera > Accessibility), added on
+    /// top of this contact's own EQ. Separate from `eq` so the per-contact store
+    /// never saves a global setting as a personal one.
+    boost: Boost,
+}
+
+/// The speech-boost setting: a presence lift and a boom cut, applied to every
+/// incoming voice. `auto_only` applies it only to frames loud enough to be
+/// speech (`SPEECH_GATE_DB`), so a quiet line's hiss is not boosted with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Boost {
+    /// dB added to the presence band (3 kHz) and removed from the body band
+    /// (180 Hz, at half the amount).
+    pub presence_db: f32,
+    pub auto_only: bool,
+}
+
+impl Boost {
+    pub const OFF: Boost = Boost { presence_db: 0.0, auto_only: false };
+    /// From the setting's key: off / mild / strong.
+    pub fn from_setting(key: &str, auto_only: bool) -> Boost {
+        let presence_db = match key { "mild" => 4.0, "strong" => 8.0, _ => 0.0 };
+        Boost { presence_db, auto_only }
+    }
+    /// The EQ actually run: `base` with the boost folded into its bands.
+    fn apply(self, base: &Eq4) -> Eq4 {
+        let mut e = *base;
+        e.bands[0].gain_db -= self.presence_db / 2.0;
+        e.bands[1].gain_db += self.presence_db;
+        e
+    }
 }
 
 impl ChannelFx {
@@ -341,19 +372,32 @@ impl ChannelFx {
 
     /// Re-design the filters if the EQ changed since the last block, keeping
     /// their history so a drag in the panel does not click.
-    fn sync(&mut self) {
-        if self.tuned == Some(self.eq) {
+    fn sync(&mut self, target: Eq4) {
+        if self.tuned == Some(target) {
             return;
         }
-        for (f, band) in self.filters.iter_mut().zip(self.eq.bands.iter()) {
+        for (f, band) in self.filters.iter_mut().zip(target.bands.iter()) {
             f.retune(Biquad::peaking(band.hz, band.q, band.gain_db));
         }
-        self.tuned = Some(self.eq);
+        self.tuned = Some(target);
     }
 
+    pub fn set_boost(&mut self, b: Boost) { self.boost = b; }
+
     pub fn process(&mut self, buf: &mut [f32]) {
-        if !self.eq.is_flat() {
-            self.sync();
+        // The boost applies to this block unless it is auto-only and the block
+        // is below the speech gate.
+        let speech = {
+            let ms = buf.iter().map(|s| s * s).sum::<f32>() / buf.len().max(1) as f32;
+            10.0 * ms.max(1e-12).log10() >= SPEECH_GATE_DB
+        };
+        let target = if self.boost.presence_db != 0.0 && (!self.boost.auto_only || speech) {
+            self.boost.apply(&self.eq)
+        } else {
+            self.eq
+        };
+        if !target.is_flat() {
+            self.sync(target);
             for s in buf.iter_mut() {
                 let mut v = *s;
                 for f in self.filters.iter_mut() {
@@ -372,6 +416,7 @@ impl ChannelFx {
 #[derive(Debug, Clone, Default)]
 pub struct VoiceFx {
     channels: BTreeMap<String, ChannelFx>,
+    boost: Boost,
 }
 
 impl VoiceFx {
@@ -380,7 +425,20 @@ impl VoiceFx {
     }
 
     pub fn channel(&mut self, contact: &str) -> &mut ChannelFx {
-        self.channels.entry(contact.to_string()).or_insert_with(ChannelFx::new)
+        let boost = self.boost;
+        self.channels.entry(contact.to_string()).or_insert_with(|| {
+            let mut c = ChannelFx::new();
+            c.set_boost(boost);
+            c
+        })
+    }
+
+    /// Apply the speech-boost setting to every contact, current and future.
+    pub fn set_boost(&mut self, b: Boost) {
+        self.boost = b;
+        for c in self.channels.values_mut() {
+            c.set_boost(b);
+        }
     }
 
     pub fn process(&mut self, contact: &str, buf: &mut [f32]) {
@@ -422,6 +480,38 @@ impl VoiceFx {
 
 #[cfg(test)]
 mod tests {
+    /// The boost lifts the presence band of incoming voice, only when on, for
+    /// every contact (new ones too), never into the per-contact store, and --
+    /// auto-only -- not on frames below the speech gate.
+    #[test]
+    fn speech_boost_lifts_presence_only_when_on() {
+        let tone = |hz: f32, amp: f32| -> Vec<f32> {
+            (0..4800).map(|i| (i as f32 / SAMPLE_RATE * hz * std::f32::consts::TAU).sin() * amp).collect()
+        };
+        let rms = |x: &[f32]| (x[2400..].iter().map(|s| s * s).sum::<f32>() / 2400.0).sqrt();
+        let run = |fx: &mut VoiceFx, who: &str, x: &[f32]| { let mut b = x.to_vec(); fx.process(who, &mut b); rms(&b) };
+        let mut fx = VoiceFx::new();
+        fx.channel("a").level = false;
+        let loud = tone(3_000.0, 0.1);
+        let flat = run(&mut fx, "a", &loud);
+        assert!((flat / rms(&loud) - 1.0).abs() < 0.01, "boost off must be unity");
+        fx.set_boost(Boost::from_setting("strong", false));
+        let boosted = run(&mut fx, "a", &loud);
+        assert!(boosted / flat > 1.8, "strong boost at 3 kHz: {:.2}x", boosted / flat);
+        // A contact first heard AFTER the setting gets it too.
+        fx.channel("b").level = false;
+        assert!(run(&mut fx, "b", &loud) / flat > 1.8);
+        // Auto-only: a quiet (non-speech) block is not boosted.
+        fx.set_boost(Boost::from_setting("strong", true));
+        let hiss = tone(3_000.0, 0.001);
+        let q = run(&mut fx, "a", &hiss);
+        assert!((q / rms(&hiss) - 1.0).abs() < 0.05, "auto-only boosted a sub-gate block: {:.2}x", q / rms(&hiss));
+        // The global setting is not saved as anyone's personal EQ.
+        assert!(fx.channel("a").eq.is_flat(), "the boost was written into the contact's own EQ");
+        let _ = run(&mut fx, "c", &loud);
+        assert!(!fx.save().contains("c\t"), "an untouched contact was saved because of the global boost: {}", fx.save());
+    }
+
     use super::*;
 
     fn sine(hz: f32, amp: f32, secs: f32) -> Vec<f32> {

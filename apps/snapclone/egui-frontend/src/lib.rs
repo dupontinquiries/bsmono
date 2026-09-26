@@ -5472,6 +5472,10 @@ impl Snapclone {
         if !s.about.debug_trace {
             self.trace.set_mobile_display_debug(s.about.mobile_display_debug);
         }
+        // Camera > Accessibility > speech boost: a presence lift on every
+        // incoming voice, optionally only on speech-loud frames.
+        self.voice_fx.set_boost(crate::voice_fx::Boost::from_setting(
+            s.camera.speech_boost.key(), s.camera.speech_boost_auto_only));
         // Storage > auto-sync path: a synced folder means the export reminder
         // has nothing to remind about.
         self.reminder.auto_sync_path = s.storage.auto_sync_path.clone();
