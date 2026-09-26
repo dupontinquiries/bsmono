@@ -175,6 +175,23 @@ pub fn inventory(b: &[u8]) -> Result<Value, FlpError> {
                 // writes 12, which PyFLP's list does not name)
                 if let Some(m) = i32at(d, 112) { channels.last_mut().unwrap().insert("stretch_mode".into(), json!(m)); }
             }
+            // AUTOMATION points (event 234): a 21-byte header (point count at
+            // 17), then 24-byte points -- x as a DELTA from the previous point, in
+            // BEATS (A Top A Tower's 19.9 s pitch clip spans 48 at 145 BPM), the
+            // value 0..1 (f64), the tension (f32). Kept as absolute beats.
+            Ev::Data(234, d) if !mixer_on && !channels.is_empty() => {
+                let n = u32at(d, 17).unwrap_or(0) as usize;
+                let mut x = 0.0f64;
+                let pts: Vec<Value> = (0..n).filter_map(|k| {
+                    let o = 21 + 24 * k;
+                    let dx = f64::from_le_bytes(d.get(o..o + 8)?.try_into().ok()?);
+                    let v = f64::from_le_bytes(d.get(o + 8..o + 16)?.try_into().ok()?);
+                    let t = f32at(d, o + 16)? as f64;
+                    x += dx;
+                    Some(json!([x, v, t]))
+                }).collect();
+                channels.last_mut().unwrap().insert("points".into(), Value::Array(pts));
+            }
             Ev::Data(219, d) if !mixer_on && !channels.is_empty() => {
                 let c = channels.last_mut().unwrap();
                 if let Some(p) = i32at(d, 0) { c.insert("pan".into(), json!(p)); }
@@ -182,6 +199,9 @@ pub fn inventory(b: &[u8]) -> Result<Value, FlpError> {
                 // a sampler's fixed PITCH SHIFT, cents (A Top A Tower's "Pattern 2":
                 // -560, which FL plays as varispeed -- slower and lower together)
                 if let Some(v) = i32at(d, 8) { c.insert("pitch_shift".into(), json!(v)); }
+                // for an AUTOMATION channel the same two words are its Min and Max
+                // knobs (0..12800) -- the slice of the target's range it sweeps
+                if let (Some(a), Some(b)) = (i32at(d, 0), u32at(d, 4)) { c.insert("auto_range".into(), json!([a, b])); }
             }
             // ── arrangements ──
             Ev::Num(99, v) => {
@@ -432,6 +452,24 @@ mod tests {
         assert_eq!(vst_name_from_path(&blob).as_deref(), Some("Vocal Doubler"));
         assert_eq!(vst_name_from_path(b"C:\\VST\\Serum_x64.dll\0").as_deref(), Some("Serum_x64"));
         assert_eq!(vst_name_from_path(b"no path here"), None);
+    }
+
+    /// Automation points as FL writes them: deltas in beats, absolute here.
+    #[test]
+    fn automation_points_read_as_absolute_beats_with_value_and_tension() {
+        let mut d = vec![1, 0, 0, 0, 64, 0, 0, 0, 1, 4, 0, 0, 0, 3, 0, 0, 0];
+        d.extend(2u32.to_le_bytes());
+        for (dx, v, t) in [(0.0f64, 0.5f64, 0.0f32), (48.0, 0.0, -0.145)] {
+            d.extend(dx.to_le_bytes()); d.extend(v.to_le_bytes()); d.extend(t.to_le_bytes()); d.extend([0u8; 4]);
+        }
+        let f = file(&[ev_num(64, 7), ev_num(21, 5), ev_data(203, &utf16("Beat - Channel pitch")),
+                       ev_data(219, &[5200i32.to_le_bytes(), 7600u32.to_le_bytes(), 0i32.to_le_bytes()].concat()),
+                       ev_data(234, &d)]);
+        let inv = inventory(&f).unwrap();
+        let c = &inv["channels"][0];
+        assert_eq!(c["kind"], json!("Automation"));
+        assert_eq!(c["points"], json!([[0.0, 0.5, 0.0], [48.0, 0.0, -0.14499999582767487]]));
+        assert_eq!(c["auto_range"], json!([5200, 7600]));
     }
 
     #[test]

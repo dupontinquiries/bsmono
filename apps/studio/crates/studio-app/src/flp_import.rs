@@ -67,6 +67,9 @@ pub struct Imported {
     /// fixed pitch shift, as (file FL named, speed ratio, the copy to read). The
     /// caller makes each (the example: ffmpeg `asetrate`).
     pub varispeeds: Vec<(String, f64, String)>,
+    /// Clips rendered THROUGH their channel's automation (a pitch curve as
+    /// varispeed, a volume curve as gain): the caller makes each copy.
+    pub bakes: Vec<Bake>,
     /// Everything approximated, skipped or refused, grouped, for a person.
     pub report: Vec<String>,
 }
@@ -155,6 +158,64 @@ pub const FL_ITEM_MUTED: u64 = 0x2000;
 /// Studio -10.2 dB, the artist's render -20.4 dB). One song's measurement,
 /// said in the report; a guess better than full scale.
 pub const STAND_IN_TRIM_DB: f32 = -10.0;
+
+/// A clip to render through its channel's automation, into `variant`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bake {
+    /// The file FL named.
+    pub file: String,
+    /// The copy the clip reads.
+    pub variant: String,
+    /// Seconds into the file where the clip starts reading (at speed 1).
+    pub start: f64,
+    /// The clip's length on the timeline, seconds.
+    pub len: f64,
+    /// (seconds from the clip's start, cents), every `BAKE_STEP`; varispeed:
+    /// the file advances 2^(cents/1200) seconds per second.
+    pub cents: Vec<(f64, f64)>,
+    /// (seconds from the clip's start, gain multiplier) on the same grid.
+    pub gain: Vec<(f64, f32)>,
+}
+
+/// The automation curves are sampled this often (seconds).
+pub const BAKE_STEP: f64 = 0.01;
+
+/// One automation clip placed on the playlist: from `t0` (s) to `t1`, points
+/// as (seconds from `t0`, value 0..1, tension).
+#[derive(Debug, Clone)]
+struct AutoSeg { t0: f64, t1: f64, pts: Vec<(f64, f64, f64)> }
+
+/// FL's value between two points, with TENSION approximated as a power curve
+/// (FL's exact curve law is not decoded): tension < 0 starts slow and
+/// steepens, > 0 the reverse, 0 is a line.
+fn tension_shape(u: f64, tension: f64) -> f64 { u.clamp(0.0, 1.0).powf(2f64.powf(-tension * FL_TENSION_K)) }
+
+/// The tension curve's steepness, CALIBRATED against the artist's own render of
+/// A Top A Tower (the intro's pitch dive, tension -0.145): onset correlation in
+/// bars 9-16 was 0.48 at k = 3, against 0.27 at 1.5, 0.16 at 6, 0.15 for a
+/// straight line and 0.11-0.12 curved the other way. One curve, one song.
+pub const FL_TENSION_K: f64 = 3.0;
+
+/// The automated value at `t` (song seconds) from time-ordered segments:
+/// before the first, its first value; inside one, its points; between or
+/// after, the last value reached -- a parameter HOLDS where automation left it.
+fn auto_value(segs: &[AutoSeg], t: f64) -> Option<f64> {
+    let first = segs.first()?;
+    if t < first.t0 { return first.pts.first().map(|p| p.1); }
+    let seg = segs.iter().rev().find(|s| s.t0 <= t)?;
+    let local = (t.min(seg.t1) - seg.t0).max(0.0);
+    let pts = &seg.pts;
+    if pts.is_empty() { return None; }
+    if local <= pts[0].0 { return Some(pts[0].1); }
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if local <= b.0 {
+            let u = if b.0 > a.0 { (local - a.0) / (b.0 - a.0) } else { 1.0 };
+            return Some(a.1 + (b.1 - a.1) * tension_shape(u, b.2));
+        }
+    }
+    pts.last().map(|p| p.1)
+}
 
 /// Steps per pattern at most (the rack rows are a u64 bitmask).
 const MAX_STEPS: u32 = 64;
@@ -478,15 +539,43 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     let (mut automation_clips, mut placed, mut overflowed, mut declicked) = (0usize, 0usize, 0usize, 0usize);
     let mut stretches: Vec<(String, f64, String)> = Vec::new();
     let mut varispeeds: Vec<(String, f64, String)> = Vec::new();
+    // ── AUTOMATION curves by target channel name, from the playlist ──────
+    // (pitch and volume -- "<channel> - Channel pitch[ #n]" / "... volume[ #n]")
+    let beat = 60.0 / bpm;
+    let mut pitch_segs: BTreeMap<String, Vec<AutoSeg>> = BTreeMap::new();
+    let mut vol_segs: BTreeMap<String, Vec<AutoSeg>> = BTreeMap::new();
+    let mut auto_range: BTreeMap<(String, bool), (f64, f64)> = BTreeMap::new(); // (target, is_pitch) -> min, max (0..1)
+    if let Some(arr) = inv["arrangements"].as_array().and_then(|a| a.first()) {
+        for t in arr["tracks"].as_array().into_iter().flatten() {
+            if t["enabled"].as_bool() == Some(false) { continue; }
+            for it in t["items"].as_array().into_iter().flatten() {
+                if s(&it["kind"]) != Some("ChannelPLItem") || it["flags"].as_u64().is_some_and(|f| f & FL_ITEM_MUTED != 0) { continue; }
+                let Some(c) = i(&it["channel"]).and_then(|c| chans.get(&c)) else { continue };
+                if s(&c["kind"]) != Some("Automation") { continue; }
+                let name = s(&c["name"]).unwrap_or("");
+                let (target, is_pitch) = if let Some(x) = name.split(" - Channel pitch").next().filter(|_| name.contains(" - Channel pitch")) { (x.to_string(), true) }
+                    else if let Some(x) = name.split(" - Channel volume").next().filter(|_| name.contains(" - Channel volume")) { (x.to_string(), false) }
+                    else { continue };
+                let pts: Vec<(f64, f64, f64)> = c["points"].as_array().into_iter().flatten()
+                    .filter_map(|p| Some((p[0].as_f64()? * beat, p[1].as_f64()?, p[2].as_f64().unwrap_or(0.0)))).collect();
+                if pts.is_empty() { continue; }
+                let t0 = at(i(&it["pos"]).unwrap_or(0)).to_seconds();
+                let t1 = t0 + at(i(&it["len"]).unwrap_or(0)).to_seconds();
+                let r = c["auto_range"].as_array().map(|r| (r[0].as_f64().unwrap_or(0.0) / 12800.0, r[1].as_f64().unwrap_or(12800.0) / 12800.0)).unwrap_or((0.0, 1.0));
+                auto_range.insert((target.clone(), is_pitch), r);
+                (if is_pitch { &mut pitch_segs } else { &mut vol_segs }).entry(target).or_default().push(AutoSeg { t0, t1, pts });
+            }
+        }
+    }
+    for v in pitch_segs.values_mut().chain(vol_segs.values_mut()) { v.sort_by(|a, b| a.t0.total_cmp(&b.t0)); }
+    let mut bakes: Vec<Bake> = Vec::new();
+    let mut range_notes: Vec<String> = Vec::new();
     // channels whose pitch has an automation clip ("<channel> - Channel pitch[ #n]")
     let pitch_automated: std::collections::BTreeSet<String> = chans.values()
         .filter(|c| s(&c["kind"]) == Some("Automation"))
         .filter_map(|c| s(&c["name"])?.split(" - Channel pitch").next().filter(|n| s(&c["name"]).is_some_and(|x| x.contains(" - Channel pitch"))).map(str::to_string))
         .collect();
-    if !pitch_automated.is_empty() {
-        report.push(format!("PITCH AUTOMATION not applied yet (played at native speed; the saved pitch is only where the automation left it): {}",
-            pitch_automated.iter().cloned().collect::<Vec<_>>().join(", ")));
-    }
+
     let mut off_clips = 0usize;
     let (mut muted_items, mut flag_1000) = (0usize, 0usize);
     let mut stretch_modes: BTreeMap<String, i64> = BTreeMap::new();
@@ -512,7 +601,13 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
             match s(&it["kind"]) {
                 Some("ChannelPLItem") => {
                     let Some(c) = i(&it["channel"]).and_then(|c| chans.get(&c)) else { continue };
-                    if s(&c["kind"]) == Some("Automation") { automation_clips += 1; continue; }
+                    if s(&c["kind"]) == Some("Automation") {
+                        // channel pitch / volume automation is APPLIED (rendered into
+                        // the target's clips); anything else is not yet
+                        let n = s(&c["name"]).unwrap_or("");
+                        if !(n.contains(" - Channel pitch") || n.contains(" - Channel volume")) { automation_clips += 1; }
+                        continue;
+                    }
                     if c["enabled"].as_bool() == Some(false) { off_clips += 1; continue; }
                     let Some(file) = file_of(c) else { continue };
                     let Some((id, m)) = source_for(&file, &mut ops, &mut missing, None) else { continue };
@@ -521,11 +616,54 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                     // FL TIME-STRETCH: the file span a clip plays (its offsets, ms)
                     // against its length on the timeline. Balance's "WHAM 100bpm"
                     // plays 19.2 s of file in 12 s -- 100 -> 160 BPM.
+                    // AUTOMATED: render the clip through its channel's pitch and volume
+                    // curves (A Top A Tower's "Pattern 2": native speed, then the dive).
+                    let cname = ch_name(c);
+                    let (t0, t1) = (pos.to_seconds(), pos.to_seconds() + len_t.to_seconds());
+                    let touches = |segs: Option<&Vec<AutoSeg>>| segs.is_some_and(|v| v.iter().any(|s| s.t0 < t1) );
+                    let baked = (touches(pitch_segs.get(&cname)) || touches(vol_segs.get(&cname))) && offs.iter().all(|o| *o < 0.0);
+                    if baked {
+                        // pitch: the automation's slice of the knob, times the bend range --
+                        // inferred as the one that puts the SAVED pitch on an extreme of
+                        // that slice (Pattern 2: 5200..7600 of 12800 and a saved -560 ->
+                        // +-560 cents); without a saved pitch, 1200 cents, said.
+                        let (pmin, pmax) = auto_range.get(&(cname.clone(), true)).copied().unwrap_or((0.0, 1.0));
+                        let reach = ((pmin - 0.5).abs().max((pmax - 0.5).abs()) * 2.0).max(1e-6);
+                        let saved = i(&c["pitch_shift"]).unwrap_or(0) as f64;
+                        let range = if saved != 0.0 { saved.abs() / reach } else { 1200.0 };
+                        let note = format!("{cname}: pitch automation reaches +-{:.0} cents ({})", reach * range,
+                            if saved != 0.0 { "range inferred from the saved pitch" } else { "range ASSUMED 1200 cents" });
+                        if !range_notes.contains(&note) && pitch_segs.contains_key(&cname) { range_notes.push(note); }
+                        let (vmin, vmax) = auto_range.get(&(cname.clone(), false)).copied().unwrap_or((0.0, 1.0));
+                        let static_gain = fl_knob_gain(c["volume"].as_f64().unwrap_or(10000.0)).max(1e-6);
+                        let n = (len_t.to_seconds() / BAKE_STEP).ceil() as usize + 1;
+                        let mut cents = Vec::with_capacity(n);
+                        let mut gain = Vec::with_capacity(n);
+                        for k in 0..n {
+                            let lt = k as f64 * BAKE_STEP;
+                            let t = t0 + lt;
+                            let cv = pitch_segs.get(&cname).and_then(|v| auto_value(v, t))
+                                .map(|v| ((pmin + v * (pmax - pmin)) - 0.5) * 2.0 * range).unwrap_or(0.0);
+                            let gv = vol_segs.get(&cname).and_then(|v| auto_value(v, t))
+                                .map(|v| fl_knob_gain((vmin + v * (vmax - vmin)) * 12800.0) / static_gain).unwrap_or(1.0);
+                            cents.push((lt, cv));
+                            gain.push((lt, gv));
+                        }
+                        let stem = std::path::Path::new(&file).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|| file.clone());
+                        let variant = format!("{stem}.auto{}.opus", bakes.len() + 1);
+                        let Some((sid, _)) = source_for(&file, &mut ops, &mut missing, Some((&variant, 1.0))) else { continue };
+                        bakes.push(Bake { file: file.clone(), variant, start: 0.0, len: len_t.to_seconds(), cents, gain });
+                        clips.push((sid, pos, Ticks::ZERO, len_t, channel_gain_for(c, Some(m), true)));
+                        first_insert = first_insert.or(i(&c["insert"]));
+                        label.get_or_insert_with(|| ch_name(c));
+                    }
                     let ratio = match offs.as_slice() {
                         [a, b] if *a >= 0.0 && *b > *a && len_t > Ticks::from_seconds(0.05) => (b - a) / 1000.0 / len_t.to_seconds(),
                         _ => 1.0,
                     };
-                    if (ratio - 1.0).abs() > 0.02 && (0.25..=4.0).contains(&ratio) {
+                    if baked {
+                        // placed above, through its automation
+                    } else if (ratio - 1.0).abs() > 0.02 && (0.25..=4.0).contains(&ratio) {
                         let r = (ratio * 1000.0).round() / 1000.0;
                         let stem = std::path::Path::new(&file).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|| file.clone());
                         let variant = format!("{stem}.stretch{r:.3}.opus");
@@ -702,7 +840,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
             varispeeds.iter().map(|(f, r, _)| format!("{} x{r:.4}", std::path::Path::new(f).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default())).collect::<Vec<_>>().join(", ")));
     }
     if declicked > 0 { report.push(format!("{declicked} audio clips declicked: {:.0} ms fades at each edge, as FL does by default", DECLICK * 1000.0)); }
-    if automation_clips > 0 { report.push(format!("{automation_clips} automation clip{} not imported (their points are not read yet)", if automation_clips == 1 { "" } else { "s" })); }
+    if automation_clips > 0 { report.push(format!("{automation_clips} automation clip{} not applied (mixer, plugin and other targets -- only channel pitch and volume are, so far)", if automation_clips == 1 { "" } else { "s" })); }
     if !approx.is_empty() { report.push(format!("effects read or approximated: {}", approx.join("; "))); }
     // Which tracks each autotune feeds from -- so "the male takes have their
     // own" is checked, not assumed.
@@ -744,7 +882,11 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     if panned > 0 { report.push(format!("{panned} insert pan{} imported as bus balance", if panned == 1 { "" } else { "s" })); }
     report.push(format!("levels by FL's volume laws: channel knob (v/12800)^{FL_KNOB_EXP} (78% = -5.2 dB; audio clips +{FL_CLIP_OFFSET_DB} dB), mixer fader and sends (v/12800)^{FL_FADER_EXP} (80% = 0 dB, 100% = +5.6 dB) -- through Image-Line's published points; the curve between them is assumed, so close, not exact"));
     if !missing.is_empty() { report.push(format!("media not found beside the project: {}", missing.join(", "))); }
-    Ok(Imported { project: p, rack, report, stretches, varispeeds })
+    if !bakes.is_empty() {
+        report.push(format!("AUTOMATION rendered into {} clip{} (varispeed pitch, gain): {}", bakes.len(), if bakes.len() == 1 { "" } else { "s" },
+            if range_notes.is_empty() { "volume only".to_string() } else { range_notes.join("; ") }));
+    }
+    Ok(Imported { project: p, rack, report, stretches, varispeeds, bakes })
 }
 
 #[cfg(test)]
@@ -773,7 +915,10 @@ mod tests {
                 {"iid": 4, "kind": "Automation", "name": "Vox - Volume"},
                 {"iid": 5, "kind": "Sampler", "name": "Beat", "sample_file": "vox.wav", "insert": 1, "pitch_shift": -1200},
                 {"iid": 6, "kind": "Sampler", "name": "Dive", "sample_file": "kick.wav", "insert": 1, "pitch_shift": -560},
-                {"iid": 7, "kind": "Automation", "name": "Dive - Channel pitch"}
+                {"iid": 7, "kind": "Automation", "name": "Dive - Channel pitch"},
+                {"iid": 8, "kind": "Sampler", "name": "Tape", "sample_file": "vox.wav", "insert": 1, "pitch_shift": -560},
+                {"iid": 9, "kind": "Automation", "name": "Tape - Channel pitch", "auto_range": [5200, 7600],
+                 "points": [[0.0, 0.5, 0.0], [8.0, 0.0, 0.0]]}
             ],
             "patterns": [
                 {"iid": 1, "name": "Beat", "notes": [
@@ -793,6 +938,8 @@ mod tests {
                 {"iid": 4, "name": "Loops", "items": [{"kind": "ChannelPLItem", "channel": 3, "pos": 0, "len": 1152, "offsets": [1000.0, 13000.0]},
                     {"kind": "ChannelPLItem", "channel": 3, "pos": 0, "len": 384, "offsets": [-1.0, -1.0], "flags": 8256}]},
                 {"iid": 7, "name": "Slowed", "items": [{"kind": "ChannelPLItem", "channel": 5, "pos": 0, "len": 4800, "offsets": [-1.0, -1.0]}]},
+                {"iid": 8, "name": "Tape", "items": [{"kind": "ChannelPLItem", "channel": 8, "pos": 0, "len": 1920, "offsets": [-1.0, -1.0]},
+                                                     {"kind": "ChannelPLItem", "channel": 9, "pos": 384, "len": 768}]},
                 {"iid": 5, "name": "Beat x3", "items": [{"kind": "PatternPLItem", "pattern": 1, "pos": 0, "len": 1152}]},
                 {"iid": 6, "name": "Cut beat", "items": [{"kind": "PatternPLItem", "pattern": 2, "pos": 384, "len": 1536, "start_ticks": 1344, "end_ticks": 2880}]}
             ]}],
@@ -823,7 +970,7 @@ mod tests {
         assert!((secs(first.len) - 6.0).abs() < 1e-6);
         let (fi, fo) = im.project.fades[&first.id];
         assert!((secs(fi) - DECLICK).abs() < 1e-6 && (secs(fo) - DECLICK).abs() < 1e-6, "declicked at both edges");
-        assert!(im.report.iter().any(|r| r.contains("1 automation clip not imported")), "{:?}", im.report);
+        assert!(im.report.iter().any(|r| r.contains("1 automation clip not applied")), "the Vox volume ride (a mixer-style target); the applied channel-pitch clip is not counted: {:?}", im.report);
         assert!(im.report.iter().any(|r| r.contains("overflow track")));
         assert!(vocals.iter().all(|t| t.muted), "a playlist track switched off in FL is muted, overflow lane too");
         assert!(p.tracks.iter().filter(|t| !t.name.starts_with("Vocals") && !t.name.contains("(muted in FL)")).all(|t| !t.muted),
@@ -950,7 +1097,28 @@ mod tests {
         assert!(im.report.iter().any(|r| r.contains("VARISPEED") && r.contains("x0.5000")), "{:?}", im.report);
         // a channel whose pitch is AUTOMATED keeps native speed: its saved shift is automation state
         assert!(!im.varispeeds.iter().any(|(f, _, _)| f == "kick.wav"), "{:?}", im.varispeeds);
-        assert!(im.report.iter().any(|r| r.contains("PITCH AUTOMATION not applied yet") && r.contains("Dive")), "{:?}", im.report);
+        // (Dive has no clip of its own on the playlist here: nothing to bake)
+    }
+
+    /// A Top A Tower's intro in miniature: a sampler with a saved -560 cents,
+    /// a pitch automation 0.5 -> 0.0 over 8 beats placed at 2 s (4 s at 120
+    /// BPM), the sampler's clip 0-10 s. The clip is rendered through the curve:
+    /// native speed before 2 s, -280 cents halfway (tension 0: a line), -560 at
+    /// the end -- and HELD after it, as FL leaves a knob where automation left it.
+    #[test]
+    fn an_automated_clip_is_baked_through_its_pitch_curve() {
+        let im = import(&inventory(), "demo", &probe).unwrap();
+        assert_eq!(im.bakes.len(), 1, "{:?}", im.bakes.iter().map(|b| &b.variant).collect::<Vec<_>>());
+        let b = &im.bakes[0];
+        assert_eq!(b.variant, "vox.auto1.opus");
+        assert!((b.len - 10.0).abs() < 1e-9);
+        let at = |t: f64| b.cents[(t / BAKE_STEP).round() as usize].1;
+        assert!(at(0.0).abs() < 1e-6 && at(1.9).abs() < 1e-6, "native speed before the automation");
+        assert!((at(4.0) + 280.0).abs() < 1.0, "halfway: {}", at(4.0));
+        assert!((at(6.0) + 560.0).abs() < 1.0 && (at(9.0) + 560.0).abs() < 1.0, "the dive's end, and held: {} {}", at(6.0), at(9.0));
+        assert!(b.gain.iter().all(|g| (g.1 - 1.0).abs() < 1e-6), "no volume automation: unity");
+        assert!(!im.varispeeds.iter().any(|(f, _, _)| f == "vox.wav" && im.bakes.iter().any(|b| b.file == *f) && false));
+        assert!(im.report.iter().any(|r| r.contains("AUTOMATION rendered into 1 clip") && r.contains("+-560 cents")), "{:?}", im.report);
     }
 
     #[test]
