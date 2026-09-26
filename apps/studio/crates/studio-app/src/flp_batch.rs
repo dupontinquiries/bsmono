@@ -144,14 +144,27 @@ pub struct Outcome {
     pub song_seconds: f64,
     /// The folder the project, media and report went into.
     pub folder: PathBuf,
+    /// Media bytes this package added to the store (or wrote, without one),
+    /// and bytes it found already there.
+    pub media_new: u64,
+    pub media_reused: u64,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Options {
-    /// Re-encode WAV / FLAC / MP3 / AIFF media as 48 kbit/s Opus.
+    /// Re-encode WAV / FLAC / MP3 / AIFF media as Opus at `kbps`.
     pub opus: bool,
+    /// Opus bitrate for WORKING media (0 = 48). Final renders are an export
+    /// matter, not the library's.
+    pub kbps: u32,
+    /// A CONTENT-ADDRESSED store shared by every package: each media file is
+    /// kept ONCE, named by the SHA-256 of its original bytes, and hard-linked
+    /// into each project folder under the name FL used (copied where links
+    /// cannot be made). A song and its instrumental, an album reusing sounds,
+    /// a year of beats on one kit: the second copy of a sound costs nothing.
     /// Mix a few seconds from the first clip and check the samples.
     pub render_check: bool,
+    pub store: Option<PathBuf>,
 }
 
 /// The .zip packages directly in `dir`, by name.
@@ -174,7 +187,8 @@ pub fn convert_package(zip_path: &Path, out_root: &Path, o: &Options) -> Outcome
     let name = zip_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let folder = out_root.join(&name);
     let mut out = Outcome { package: name.clone(), status: Status::Pass, seconds: 0.0, tracks: 0, clips: 0, sources: 0, busses: 0,
-                            song_seconds: 0.0, folder: folder.clone() };
+                            song_seconds: 0.0, folder: folder.clone(), media_new: 0, media_reused: 0 };
+    let (mut media_new, mut media_reused) = (0u64, 0u64);
     let r = (|| -> Result<Vec<String>, String> {
         let f = std::fs::File::open(zip_path).map_err(|e| format!("cannot open: {e}"))?;
         let mut z = zip::ZipArchive::new(f).map_err(|e| format!("not a readable zip: {e}"))?;
@@ -192,18 +206,48 @@ pub fn convert_package(zip_path: &Path, out_root: &Path, o: &Options) -> Outcome
                 flps.push((base, b));
                 continue;
             }
-            let dst = folder.join(&base);
             let opus = o.opus && is_audio(&base) && !base.to_lowercase().ends_with(".opus");
-            let target = if opus { folder.join(format!(".{base}.tmp")) } else { dst.clone() };
-            let mut w = std::fs::File::create(&target).map_err(|x| format!("{base}: {x}"))?;
-            std::io::copy(&mut e, &mut w).map_err(|x| format!("{base}: {x}"))?;
-            if opus {
-                let stem = Path::new(&base).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
-                let ok = std::process::Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-y", "-i"]).arg(&target)
-                    .args(["-c:a", "libopus", "-b:a", "48k"]).arg(folder.join(format!("{stem}.opus")))
-                    .status().map(|s| s.success()).unwrap_or(false);
-                let _ = std::fs::remove_file(&target);
-                if !ok { return Err(format!("{base}: ffmpeg could not convert it (is ffmpeg installed?)")); }
+            let stem = Path::new(&base).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
+            let name_out = if opus { format!("{stem}.opus") } else { base.clone() };
+            let mut bytes = Vec::with_capacity(e.size() as usize);
+            e.read_to_end(&mut bytes).map_err(|x| format!("{base}: {x}"))?;
+            // where the (possibly encoded) file lives: the store, or the folder
+            let (home, fresh) = match &o.store {
+                Some(store) => {
+                    use sha2::Digest;
+                    let id = format!("{:x}", sha2::Sha256::digest(&bytes));
+                    let ext = Path::new(&name_out).extension().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
+                    let kbps = if opus { format!(".{}k", if o.kbps == 0 { 48 } else { o.kbps }) } else { String::new() };
+                    std::fs::create_dir_all(store).map_err(|x| format!("store: {x}"))?;
+                    let at = store.join(format!("{}{kbps}.{ext}", &id[..32]));
+                    let fresh = !at.is_file();
+                    (at, fresh)
+                }
+                None => (folder.join(&name_out), true),
+            };
+            if fresh {
+                if opus {
+                    let tmp = home.with_extension("src.tmp");
+                    std::fs::write(&tmp, &bytes).map_err(|x| format!("{base}: {x}"))?;
+                    let kb = format!("{}k", if o.kbps == 0 { 48 } else { o.kbps });
+                    let ok = std::process::Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-y", "-i"]).arg(&tmp)
+                        .args(["-c:a", "libopus", "-b:a", &kb]).arg(&home)
+                        .status().map(|s| s.success()).unwrap_or(false);
+                    let _ = std::fs::remove_file(&tmp);
+                    if !ok { return Err(format!("{base}: ffmpeg could not convert it (is ffmpeg installed?)")); }
+                } else {
+                    std::fs::write(&home, &bytes).map_err(|x| format!("{base}: {x}"))?;
+                }
+                media_new += std::fs::metadata(&home).map(|m| m.len()).unwrap_or(0);
+            } else {
+                media_reused += std::fs::metadata(&home).map(|m| m.len()).unwrap_or(0);
+            }
+            if o.store.is_some() {
+                let dst = folder.join(&name_out);
+                let _ = std::fs::remove_file(&dst);
+                if std::fs::hard_link(&home, &dst).is_err() {
+                    std::fs::copy(&home, &dst).map_err(|x| format!("{name_out}: cannot link or copy from the store: {x}"))?;
+                }
             }
         }
         let mut warns = Vec::new();
@@ -225,6 +269,8 @@ pub fn convert_package(zip_path: &Path, out_root: &Path, o: &Options) -> Outcome
         out.sources = im.project.sources.len();
         out.busses = im.project.busses.len();
         out.song_seconds = im.project.duration().to_seconds();
+        out.media_new = media_new;
+        out.media_reused = media_reused;
         warns.extend(verify(&studio, &im, o)?);
         Ok(warns)
     })();
@@ -289,11 +335,13 @@ pub fn summary(outcomes: &[Outcome]) -> String {
     let (p, w, f) = (outcomes.iter().filter(|o| o.status == Status::Pass).count(),
                      outcomes.iter().filter(|o| matches!(o.status, Status::Warn(_))).count(),
                      outcomes.iter().filter(|o| matches!(o.status, Status::Fail(_))).count());
-    let mut t = format!("# FL batch: {} packages -- {p} pass, {w} warn, {f} fail\n\n| package | status | tracks | clips | sources | busses | song | took | notes |\n|---|---|---|---|---|---|---|---|---|\n", outcomes.len());
+    let (new, reused): (u64, u64) = (outcomes.iter().map(|o| o.media_new).sum(), outcomes.iter().map(|o| o.media_reused).sum());
+    let mut t = format!("# FL batch: {} packages -- {p} pass, {w} warn, {f} fail\n\nmedia: {:.1} MB stored, {:.1} MB found already stored ({:.0}% of the library's media was a repeat)\n\n| package | status | tracks | clips | sources | busses | song | new media | reused | took | notes |\n|---|---|---|---|---|---|---|---|---|---|---|\n",
+        outcomes.len(), new as f64 / 1e6, reused as f64 / 1e6, if new + reused > 0 { 100.0 * reused as f64 / (new + reused) as f64 } else { 0.0 });
     for o in v {
         let (st, notes) = match &o.status { Status::Pass => ("PASS", String::new()), Status::Warn(w) => ("WARN", w.join("; ")), Status::Fail(e) => ("FAIL", e.clone()) };
-        t.push_str(&format!("| {} | {st} | {} | {} | {} | {} | {:.0} s | {:.1} s | {} |\n", o.package, o.tracks, o.clips, o.sources, o.busses,
-                            o.song_seconds, o.seconds, notes.replace('|', "/")));
+        t.push_str(&format!("| {} | {st} | {} | {} | {} | {} | {:.0} s | {:.1} MB | {:.1} MB | {:.1} s | {} |\n", o.package, o.tracks, o.clips, o.sources, o.busses,
+                            o.song_seconds, o.media_new as f64 / 1e6, o.media_reused as f64 / 1e6, o.seconds, notes.replace('|', "/")));
     }
     t
 }
@@ -368,7 +416,7 @@ mod tests {
         zip_of(&lib.join("noflp.zip"), &[("x/tone.wav", tone_wav())]);
         let pk = packages(&lib);
         assert_eq!(pk.len(), 3);
-        let o = Options { opus: false, render_check: true };
+        let o = Options { opus: false, render_check: true, ..Default::default() };
         let outs: Vec<Outcome> = pk.iter().map(|p| convert_package(p, &out, &o)).collect();
         let get = |n: &str| outs.iter().find(|o| o.package == n).unwrap();
         let good = get("good");
@@ -380,8 +428,36 @@ mod tests {
         assert!(matches!(&get("noflp").status, Status::Fail(e) if e.contains("no .flp")), "{:?}", get("noflp").status);
         let md = summary(&outs);
         assert!(md.starts_with("# FL batch: 3 packages -- 1 pass, 0 warn, 2 fail"), "{md}");
-        let first_row = md.lines().nth(4).unwrap();
+        let first_row = md.lines().find(|l| l.starts_with("| ") && !l.starts_with("| package")).unwrap();
         assert!(first_row.contains("FAIL"), "worst first: {first_row}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A song and its instrumental share their media: with a STORE, the second
+    /// package stores nothing new and links the first one's file.
+    #[test]
+    fn a_shared_sound_is_stored_once_across_packages() {
+        let root = std::env::temp_dir().join(format!("flp-batch-s-{}", std::process::id()));
+        let lib = root.join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        for n in ["song", "song-instrumental"] {
+            zip_of(&lib.join(format!("{n}.zip")), &[("p/untitled.flp", tiny_flp()), ("p/tone.wav", tone_wav())]);
+        }
+        let o = Options { store: Some(root.join("store")), ..Default::default() };
+        let outs: Vec<Outcome> = packages(&lib).iter().map(|p| convert_package(p, &root.join("out"), &o)).collect();
+        assert!(outs.iter().all(|x| x.status == Status::Pass), "{:?}", outs.iter().map(|x| &x.status).collect::<Vec<_>>());
+        let (a, b) = (&outs[0], &outs[1]);
+        assert!(a.media_new > 0 && a.media_reused == 0, "{a:?}");
+        assert!(b.media_new == 0 && b.media_reused == a.media_new, "the second copy costs nothing: {b:?}");
+        assert_eq!(std::fs::read_dir(root.join("store")).unwrap().count(), 1, "one file in the store");
+        assert!(a.folder.join("tone.wav").is_file() && b.folder.join("tone.wav").is_file(), "each project still has its file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let (x, y) = (std::fs::metadata(a.folder.join("tone.wav")).unwrap(), std::fs::metadata(b.folder.join("tone.wav")).unwrap());
+            assert_eq!(x.ino(), y.ino(), "the same bytes on disk, not a copy");
+        }
+        assert!(summary(&outs).contains("50% of the library's media was a repeat"), "{}", summary(&outs));
         let _ = std::fs::remove_dir_all(&root);
     }
 

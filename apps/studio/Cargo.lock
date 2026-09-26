@@ -3485,6 +3485,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "sha2",
  "studio-assemble",
  "studio-audio",
  "studio-collab",

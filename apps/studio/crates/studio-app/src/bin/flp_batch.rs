@@ -1,7 +1,10 @@
 //! flp-batch -- a library of FL Studio zipped loop packages into Studio
 //! projects, each verified (studio_app::flp_batch).
 //!
-//!     flp-batch LIBRARY_DIR OUT_DIR [--opus] [--render-check]
+//!     flp-batch LIBRARY_DIR OUT_DIR [--opus] [--kbps N] [--store DIR] [--render-check]
+//!
+//! --store DIR keeps each media file ONCE for the whole library (by content),
+//! hard-linked into each project folder; --kbps sets the working Opus bitrate.
 //!
 //! Every .zip directly in LIBRARY_DIR becomes OUT_DIR/<name>/ with its media,
 //! <name>.studio and <name>.import.txt. OUT_DIR/BATCH.md is the summary, worst
@@ -12,13 +15,16 @@ use studio_app::flp_batch::{convert_package, packages, summary, Options, Status}
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let pos: Vec<&String> = a.iter().skip(1).filter(|x| !x.starts_with("--")).collect();
+    let val = |k: &str| a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).cloned();
+    let takes_value = |i: usize| i > 0 && (a[i - 1] == "--store" || a[i - 1] == "--kbps");
+    let pos: Vec<&String> = a.iter().enumerate().skip(1).filter(|(i, x)| !x.starts_with("--") && !takes_value(*i)).map(|(_, x)| x).collect();
     if pos.len() != 2 {
-        eprintln!("usage: flp-batch LIBRARY_DIR OUT_DIR [--opus] [--render-check]");
+        eprintln!("usage: flp-batch LIBRARY_DIR OUT_DIR [--opus] [--kbps N] [--store DIR] [--render-check]");
         std::process::exit(2);
     }
     let (lib, out) = (std::path::PathBuf::from(pos[0]), std::path::PathBuf::from(pos[1]));
-    let o = Options { opus: a.iter().any(|x| x == "--opus"), render_check: a.iter().any(|x| x == "--render-check") };
+    let o = Options { opus: a.iter().any(|x| x == "--opus"), render_check: a.iter().any(|x| x == "--render-check"),
+                      kbps: val("--kbps").and_then(|v| v.parse().ok()).unwrap_or(0), store: val("--store").map(std::path::PathBuf::from) };
     let pkgs = packages(&lib);
     if pkgs.is_empty() { eprintln!("no .zip packages in {}", lib.display()); std::process::exit(2); }
     std::fs::create_dir_all(&out).expect("create OUT_DIR");
