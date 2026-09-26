@@ -8,6 +8,9 @@ pub mod audio_clock;
 pub mod caps;
 pub mod clock;
 pub mod codec;
+pub mod aiframes;
+#[rustfmt::skip]
+pub mod aiframes_weights;
 pub mod av1_grain;
 pub mod convert_cpu;
 pub mod damage;
