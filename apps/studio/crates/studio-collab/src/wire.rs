@@ -116,7 +116,8 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// v21: `Op::SetBusPan` (tag 47) -- Studio's first pan in the timeline mix.
 /// v22: `SynthKind::Poly` (tag 6) -- the compact generated synth.
 /// v23: a Poly patch's TEXTURE -- harmonic profile, noise, FM, drive.
-pub const WIRE_VERSION: u8 = 23;
+/// v24: a Poly patch's IMAGE -- width, low width, pan by key, pan LFO.
+pub const WIRE_VERSION: u8 = 24;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -825,6 +826,9 @@ fn put_synthkind(o: &mut Vec<u8>, k: &SynthKind) {
                 o.extend_from_slice(&p.partials);
                 for v in [p.noise, p.fm_ratio, p.fm_index, p.drive] { put_f32(o, v); }
             }
+            if enc_v() >= 24 {
+                for v in [p.width, p.low_width, p.key_pan, p.pan_lfo_hz, p.pan_lfo_depth] { put_f32(o, v); }
+            }
         }
         SynthKind::Sine { hz } => { put_u8(o, 0); put_f32(o, *hz); }
         SynthKind::Sampler { source } => { put_u8(o, 1); put_u64(o, source.0); }
@@ -896,6 +900,10 @@ fn get_synthkind(r: &mut R) -> Option<SynthKind> {
             if r.v >= 23 {
                 patch.partials.copy_from_slice(r.take(16)?);
                 patch.noise = r.f32()?; patch.fm_ratio = r.f32()?; patch.fm_index = r.f32()?; patch.drive = r.f32()?;
+            }
+            if r.v >= 24 {
+                patch.width = r.f32()?; patch.low_width = r.f32()?; patch.key_pan = r.f32()?;
+                patch.pan_lfo_hz = r.f32()?; patch.pan_lfo_depth = r.f32()?;
             }
             SynthKind::Poly { hz, patch }
         }
@@ -1631,7 +1639,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 23, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 24, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]
@@ -1895,10 +1903,11 @@ mod poly_wire_tests {
         let mut partials = [0u8; 16];
         partials[0] = 255; partials[4] = 90;
         let k = SynthKind::Poly { hz: 261.63, patch: studio_live::PolyPatch { wave: 3, voices: 5, detune: 14.0, sub: 0.3, cutoff: 900.0,
-            partials, noise: 0.1, fm_ratio: 2.0, fm_index: 1.5, drive: 0.4, ..Default::default() } };
+            partials, noise: 0.1, fm_ratio: 2.0, fm_index: 1.5, drive: 0.4,
+            width: 0.7, low_width: 0.3, key_pan: 0.25, pan_lfo_hz: 0.2, pan_lfo_depth: 0.4, ..Default::default() } };
         let mut o = Vec::new();
         put_synthkind(&mut o, &k);
-        assert!(o.len() <= 100, "a patch WITH its texture: {} bytes", o.len());
+        assert!(o.len() <= 120, "a patch WITH its texture and image: {} bytes", o.len());
         let mut r = R { b: &o, i: 0, v: WIRE_VERSION };
         assert_eq!(get_synthkind(&mut r), Some(k));
     }

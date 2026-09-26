@@ -848,13 +848,34 @@ pub struct PolyPatch {
     /// Saturation before the filter, 0..=1 -- thickness.
     #[serde(default)]
     pub drive: f32,
+    /// IMAGE (c20): the unison voices spread across left..right, 0..=1 --
+    /// detuned copies, decorrelated: out of the listener's skull.
+    #[serde(default)]
+    pub width: f32,
+    /// How much of `width` survives BELOW ~250 Hz, 0..=1: 0 folds the lows
+    /// toward mono, 1 keeps them as wide (and as out of phase) as the rest --
+    /// the artist's wide textural bass "tapers closer on the low but still out
+    /// of phase": a lever, not a rule.
+    #[serde(default)]
+    pub low_width: f32,
+    /// Pan by pitch: -1..=1 of pan per OCTAVE from middle C (FL Keys' own
+    /// behaviour -- low notes one side, high the other).
+    #[serde(default)]
+    pub key_pan: f32,
+    /// Stereo TRAVEL: the note's pan moves, `pan_lfo_depth` (0..=1) at
+    /// `pan_lfo_hz` -- the bowed-violin drift from left-centre to the right.
+    #[serde(default)]
+    pub pan_lfo_hz: f32,
+    #[serde(default)]
+    pub pan_lfo_depth: f32,
 }
 
 impl Default for PolyPatch {
     fn default() -> PolyPatch {
         PolyPatch { wave: 2, voices: 2, detune: 8.0, sub: 0.0, attack_ms: 5.0, decay_ms: 300.0, sustain: 0.7, release_ms: 250.0,
                     cutoff: 3000.0, resonance: 0.2, env_amount: 1.0, vibrato: 0.0, gain: 0.5,
-                    partials: [0; 16], noise: 0.0, fm_ratio: 0.0, fm_index: 0.0, drive: 0.0 }
+                    partials: [0; 16], noise: 0.0, fm_ratio: 0.0, fm_index: 0.0, drive: 0.0,
+                    width: 0.0, low_width: 1.0, key_pan: 0.0, pan_lfo_hz: 0.0, pan_lfo_depth: 0.0 }
     }
 }
 
@@ -868,6 +889,23 @@ fn poly_blep(t: f32, dt: f32) -> f32 {
 /// Render one Poly note into `out`: held for `hold` samples (the gate), then
 /// released; `None` = a hit (the gate closes after attack + decay).
 pub fn poly_voice(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], hold: Option<usize>) {
+    // the MONO voice is the stereo one folded: for a centred, un-widened patch
+    // (L = R = x / sqrt2) this is exactly the old mono voice
+    let mut r = vec![0.0f32; out.len()];
+    poly_voice_st(hz, p, rate, out, &mut r, hold);
+    for (l, r) in out.iter_mut().zip(&r) { *l = (*l + r) * std::f32::consts::FRAC_1_SQRT_2; }
+}
+
+/// Constant-power gains for pan `x` in -1..=1: (left, right), each 1/sqrt2 at 0.
+pub fn pan_gains(x: f32) -> (f32, f32) {
+    let a = (x.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
+    (a.cos(), a.sin())
+}
+
+/// A Poly note in STEREO: unison voices spread by `width`, the whole note
+/// panned by `key_pan` (octaves from middle C) and moved by the pan LFO, the
+/// side signal's lows kept by `low_width`.
+pub fn poly_voice_st(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], out_r: &mut [f32], hold: Option<usize>) {
     let r = rate as f32;
     let ms = |x: f32| ((x.max(0.0) * 0.001 * r) as usize).max(1);
     let (att, dec, rel) = (ms(p.attack_ms), ms(p.decay_ms), ms(p.release_ms));
@@ -899,6 +937,13 @@ pub fn poly_voice(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], hold: Opti
     let read = |t: &[f32], ph: f32| { let x = ph.rem_euclid(1.0) * TABLE as f32; let i = x as usize % TABLE; let f = x - x.floor();
                                      t[i] * (1.0 - f) + t[(i + 1) % TABLE] * f };
     let mut fm_phase = 0.0f32;
+    // stereo: each unison voice's pan, and a second filter state
+    let width = p.width.clamp(0.0, 1.0);
+    let vpan: Vec<(f32, f32)> = (0..voices).map(|k| pan_gains(if voices == 1 { 0.0 } else { (k as f32 / (voices - 1) as f32 * 2.0 - 1.0) * width })).collect();
+    let (mut jc1, mut jc2) = (0.0f32, 0.0f32);
+    let note_pan = (p.key_pan * (hz / 261.63).log2()).clamp(-1.0, 1.0);
+    let side_hp = (-std::f32::consts::TAU * 250.0 / r).exp(); // one-pole: side's lows
+    let mut side_lp = 0.0f32;
     let mut noise_state = 0x2545_f491_u32;
     let drive_k = 1.0 + p.drive.clamp(0.0, 1.0) * 4.0;
     for (i, s) in out.iter_mut().enumerate() {
@@ -913,7 +958,7 @@ pub fn poly_voice(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], hold: Opti
             if d >= 1.0 { 0.0 } else { level_at_gate * (1.0 - d).powi(2) }
         };
         let vib = if p.vibrato > 0.0 { 2f32.powf(p.vibrato / 1200.0 * (i as f32 / r * 5.0 * std::f32::consts::TAU).sin()) } else { 1.0 };
-        let mut x = 0.0f32;
+        let (mut x, mut xr) = (0.0f32, 0.0f32);
         let fm = if p.fm_index > 0.0 && p.fm_ratio > 0.0 {
             let m = p.fm_index * (fm_phase * std::f32::consts::TAU).sin();
             fm_phase = (fm_phase + hz * p.fm_ratio / r).fract();
@@ -928,19 +973,28 @@ pub fn poly_voice(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], hold: Opti
                 3 => { let sq = if *ph < 0.5 { 1.0 } else { -1.0 }; sq + poly_blep(*ph, dt) - poly_blep((*ph + 0.5).fract(), dt) }
                 _ => 2.0 * *ph - 1.0 - poly_blep(*ph, dt),
             } };
-            x += v;
+            x += v * vpan[k].0;
+            xr += v * vpan[k].1;
             *ph = (*ph + dt).fract();
         }
         x *= norm;
+        xr *= norm;
+        let c = std::f32::consts::FRAC_1_SQRT_2; // centred content, as a centred voice
         if p.sub > 0.0 {
-            x += p.sub * (sub_phase * std::f32::consts::TAU).sin();
+            let v = p.sub * (sub_phase * std::f32::consts::TAU).sin();
+            x += v * c; xr += v * c;
             sub_phase = (sub_phase + hz * 0.5 / r).fract();
         }
         if p.noise > 0.0 {
             noise_state ^= noise_state << 13; noise_state ^= noise_state >> 17; noise_state ^= noise_state << 5;
-            x += p.noise * (noise_state as f32 / u32::MAX as f32 * 2.0 - 1.0);
+            let v = p.noise * (noise_state as f32 / u32::MAX as f32 * 2.0 - 1.0);
+            x += v * c; xr += v * c;
         }
-        if p.drive > 0.0 { x = (x * drive_k).tanh() / drive_k.tanh(); }
+        if p.drive > 0.0 {
+            let k = drive_k * std::f32::consts::SQRT_2;
+            // /tanh(drive_k), not /tanh(k): the fold (L+R)/sqrt2 stays exactly the old mono voice
+            x = (x * k).tanh() / drive_k.tanh() * c; xr = (xr * k).tanh() / drive_k.tanh() * c;
+        }
         // filter, opened by the envelope
         let fc = (p.cutoff * 2f32.powf(p.env_amount * env)).clamp(20.0, 0.45 * r);
         let g = (std::f32::consts::PI * fc / r).tan();
@@ -949,7 +1003,27 @@ pub fn poly_voice(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], hold: Opti
         let v2 = ic2 + g * v1;
         ic1 = 2.0 * v1 - ic1;
         ic2 = 2.0 * v2 - ic2;
-        *s = v2 * env * p.gain;
+        let w1 = a1 * (jc1 + g * (xr - jc2));
+        let w2 = jc2 + g * w1;
+        jc1 = 2.0 * w1 - jc1;
+        jc2 = 2.0 * w2 - jc2;
+        let (mut l, mut rr) = (v2 * env * p.gain, w2 * env * p.gain);
+        // the side's LOWS, kept by low_width
+        if p.low_width < 1.0 {
+            let (m, side) = ((l + rr) * 0.5, (l - rr) * 0.5);
+            side_lp = side_hp * side_lp + (1.0 - side_hp) * side;
+            let side2 = side - (1.0 - p.low_width.clamp(0.0, 1.0)) * side_lp;
+            l = m + side2; rr = m - side2;
+        }
+        // the note's pan: by key, plus travel -- a balance on the stereo pair
+        let pan = (note_pan + p.pan_lfo_depth * (std::f32::consts::TAU * p.pan_lfo_hz * i as f32 / r).sin()).clamp(-1.0, 1.0);
+        if pan != 0.0 {
+            let (gl, gr) = pan_gains(pan);
+            let k = std::f32::consts::SQRT_2;
+            l *= gl * k; rr *= gr * k;
+        }
+        *s = l;
+        out_r[i] = rr;
     }
 }
 
@@ -1292,6 +1366,22 @@ pub fn render_pattern(
     rate: u32,
     pass: u32,
 ) -> Vec<f32> {
+    // the MONO render is the stereo one folded -- for centred, un-widened
+    // voices exactly the renderer as it was (L = R = v / sqrt2)
+    let (l, r) = render_pattern_stereo(pattern, rack, synth, tempo, rate, pass);
+    l.iter().zip(&r).map(|(a, b)| (a + b) * std::f32::consts::FRAC_1_SQRT_2).collect()
+}
+
+/// The pattern in STEREO: each voice at its channel's pan (constant power); a
+/// Poly voice rendered in stereo itself (width, pan by key, travel).
+pub fn render_pattern_stereo(
+    pattern: &Pattern,
+    rack: &Rack,
+    synth: &mut dyn Synth,
+    tempo: &Tempo,
+    rate: u32,
+    pass: u32,
+) -> (Vec<f32>, Vec<f32>) {
     let step = tempo.step_len().to_samples(rate).max(1) as usize;
     let total = step * pattern.steps as usize;
     let mut out = vec![0.0f32; total];
@@ -1309,6 +1399,8 @@ pub fn render_pattern(
     // are cut.
     struct Placed {
         at: usize,
+        /// The channel's pan, -1..=1 (constant power in the stereo render).
+        pan: f32,
         kind: SynthKind,
         amp: f32,
         group: Option<u8>,
@@ -1370,6 +1462,7 @@ pub fn render_pattern(
         for r in 0..ratchet {
             let this_kind = if r == 0 { kind.clone() } else { strip_glide(&kind) };
             placed.push(Placed {
+                pan: ch.pan,
                 at: step_i as usize * step + swing + r * sub_step,
                 kind: this_kind,
                 amp: ch.gain * m.vel,
@@ -1428,6 +1521,7 @@ pub fn render_pattern(
                 _ => (gate_len, None),
             };
             placed.push(Placed {
+                pan: ch.pan,
                 at: n.start as usize * step + swing,
                 kind,
                 amp: ch.gain * n.vel.clamp(0.0, 1.0),
@@ -1445,7 +1539,9 @@ pub fn render_pattern(
     // placement knows the answer.
     let scratch_len = placed.iter().map(|p| p.window).max().unwrap_or(voice_len).max(1);
     let mut scratch = vec![0.0f32; scratch_len];
+    let mut scratch_r = vec![0.0f32; scratch_len];
     let mut pitched = vec![0.0f32; scratch_len];
+    let mut out_r = vec![0.0f32; out.len()];
 
     // Every group's hit-start list, sorted, so "when does the group fire
     // next" is a partition-point lookup per voice.
@@ -1487,10 +1583,18 @@ pub fn render_pattern(
         // the longest voice in the pattern happened to be.
         let sw = p.window.min(scratch.len());
         scratch[..sw].fill(0.0);
-        match p.hold {
-            Some(h) => synth.render_gated(&p.kind, rate, &mut scratch[..sw], h.min(sw)),
-            None => synth.render(&p.kind, rate, &mut scratch[..sw]),
-        }
+        // a Poly voice renders its own stereo; everything else mono, then panned
+        let stereo_voice = if let SynthKind::Poly { hz, patch } = &p.kind {
+            scratch_r[..sw].fill(0.0);
+            poly_voice_st(*hz, patch, rate, &mut scratch[..sw], &mut scratch_r[..sw], p.hold.map(|h| h.min(sw)));
+            true
+        } else {
+            match p.hold {
+                Some(h) => synth.render_gated(&p.kind, rate, &mut scratch[..sw], h.min(sw)),
+                None => synth.render(&p.kind, rate, &mut scratch[..sw]),
+            }
+            false
+        };
         let voice: &[f32] = if p.pitch != 0 {
             // Repitch by reading the rendered voice at a fractional rate —
             // up consumes the material sooner (silence after), down means
@@ -1510,17 +1614,27 @@ pub fn render_pattern(
             &scratch[..sw]
         };
         let choked = allowed < natural;
+        let (gl, gr) = pan_gains(p.pan);
         for (i, v) in voice[..allowed.min(sw)].iter().enumerate() {
-            let mut v = *v;
+            let mut k = p.amp;
             if (choked || p.gate) && allowed >= fade && i >= allowed - fade {
                 // Linear ramp over the last ~2ms before the cut: choke's cut
                 // and a note's gate must not click.
-                v *= (allowed - i) as f32 / fade as f32;
+                k *= (allowed - i) as f32 / fade as f32;
             }
-            out[p.at + i] += v * p.amp;
+            if stereo_voice {
+                // already stereo (centred = 1/sqrt2 each side): the channel pan
+                // as a balance on it
+                let s2 = std::f32::consts::SQRT_2;
+                out[p.at + i] += v * k * gl * s2;
+                out_r[p.at + i] += scratch_r[i] * k * gr * s2;
+            } else {
+                out[p.at + i] += v * k * gl;
+                out_r[p.at + i] += v * k * gr;
+            }
         }
     }
-    out
+    (out, out_r)
 }
 
 /// The ops that land a pattern's render onto the timeline as a clip —
@@ -3288,6 +3402,48 @@ mod poly_tests {
         assert!(mag(body, 220.0 * 3.0, 48_000.0) > 5.0 * mag(&plain[2_000..18_000], 660.0, 48_000.0), "FM makes a sideband at 220 + 2x220");
         let driven = render(&PolyPatch { drive: 1.0, ..base });
         assert!(mag(&driven[2_000..18_000], 660.0, 48_000.0) > 5.0 * mag(&plain[2_000..18_000], 660.0, 48_000.0), "drive makes a 3rd harmonic");
+    }
+
+    fn st(hz: f32, p: &PolyPatch, n: usize) -> (Vec<f32>, Vec<f32>) {
+        let (mut l, mut r) = (vec![0.0f32; n], vec![0.0f32; n]);
+        poly_voice_st(hz, p, 48_000, &mut l, &mut r, Some(n * 3 / 4));
+        (l, r)
+    }
+    fn e(v: &[f32]) -> f32 { v.iter().map(|x| x * x).sum::<f32>() }
+
+    /// IMAGE: width 0 is centred (L = R); width spreads the unison voices so
+    /// the SIDE carries energy; pan by key sends a note two octaves up to the
+    /// right; travel moves the balance over the note; low_width 0 empties the
+    /// side's lows.
+    #[test]
+    fn width_key_pan_travel_and_low_width_shape_the_image() {
+        let base = PolyPatch { wave: 2, voices: 5, detune: 14.0, attack_ms: 5.0, sustain: 1.0, cutoff: 8000.0, env_amount: 0.0, gain: 1.0, ..Default::default() };
+        let (l, r) = st(220.0, &base, 24_000);
+        assert!(l.iter().zip(&r).all(|(a, b)| (a - b).abs() < 1e-6), "width 0: centred");
+        let (l, r) = st(220.0, &PolyPatch { width: 1.0, ..base }, 24_000);
+        let side: Vec<f32> = l.iter().zip(&r).map(|(a, b)| a - b).collect();
+        let mid: Vec<f32> = l.iter().zip(&r).map(|(a, b)| a + b).collect();
+        assert!(e(&side) > 0.05 * e(&mid), "wide: the side carries energy ({} vs {})", e(&side), e(&mid));
+        let (l, r) = st(1046.5, &PolyPatch { key_pan: 0.5, ..base }, 24_000);
+        assert!(e(&r) > 3.0 * e(&l), "two octaves above middle C, key_pan 0.5/oct: right");
+        let (l, r) = st(220.0, &PolyPatch { pan_lfo_hz: 1.0, pan_lfo_depth: 0.8, ..base }, 48_000);
+        let bal = |a: usize, b: usize| (e(&r[a..b]) - e(&l[a..b])) / (e(&r[a..b]) + e(&l[a..b]));
+        assert!(bal(9_000, 15_000) - bal(33_000, 39_000) > 0.5, "travel: right at 1/4 s, left at 3/4 s");
+        // low_width: a wide LOW note -- the side's energy mostly gone at 0
+        let low = PolyPatch { width: 1.0, wave: 0, cutoff: 400.0, ..base };
+        let side_of = |p: &PolyPatch| { let (l, r) = st(80.0, p, 24_000); e(&l.iter().zip(&r).map(|(a, b)| a - b).collect::<Vec<_>>()) };
+        assert!(side_of(&PolyPatch { low_width: 0.0, ..low }) < 0.3 * side_of(&PolyPatch { low_width: 1.0, ..low }), "the lows fold toward mono");
+    }
+
+    /// The mono voice is the stereo one folded: for a centred patch the fold
+    /// is exactly L * sqrt2 (L = R).
+    #[test]
+    fn the_mono_voice_is_the_centred_stereo_one_folded() {
+        let p = PolyPatch { voices: 3, drive: 0.5, sub: 0.3, noise: 0.05, ..Default::default() };
+        let mut m = vec![0.0f32; 12_000];
+        poly_voice(220.0, &p, 48_000, &mut m, Some(9_000));
+        let (l, _) = st(220.0, &p, 12_000);
+        assert!(m.iter().zip(&l).all(|(a, b)| (a - b * std::f32::consts::SQRT_2).abs() < 1e-4));
     }
 
     #[test]
