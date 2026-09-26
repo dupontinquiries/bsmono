@@ -1334,12 +1334,16 @@ pub(crate) fn block_color(b: BlockId) -> Option<[f32; 3]> {
         DarkOakPlanks       => [0.32, 0.22, 0.13],
         PolishedBasalt      => [0.22, 0.21, 0.24],
 
-        // v0.24.57-berry-items: small decorative berry-bush blocks
-        // scattered sparsely on grass surfaces during world gen.
-        // Deep wine-red default for any block without a specific colour above.
-        // (Was written as `BerryBush =>`, but BlockId has no BerryBush variant, so
-        // it silently became a catch-all binding — made explicit here.)
-        _ => [0.55, 0.10, 0.20],
+        // Every block without an arm above takes its palette colour from
+        // `BlockId::base_color`. This used to be a wine-red `[0.55, 0.10, 0.20]`
+        // (left over from a `BerryBush =>` arm that named no variant), which
+        // painted copper ore, quartz, sandstone, obsidian, selenite, magma and
+        // glow crystal the same dark red once the underground pass started
+        // generating them.
+        other => {
+            let c = other.base_color();
+            [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]
+        }
     })
 }
 
