@@ -85,7 +85,13 @@ pub struct Scene {
     pub cloud_top: f32,
     /// The Moonwyrm (sky map), and one of its stars.
     pub moonwyrm: u64,
+    /// Its body's segments: [with a crest fin?][variant].
+    pub wyrm_seg: [[u64; 2]; 2],
     pub star: u64,
+    /// The sky map's drifting stone and cloud (`skydrift`), and their meshes
+    /// by kind (anchor, fragment, puff) and variant.
+    pub drift: Vec<crate::skydrift::Drift>,
+    pub drift_mesh: [[u64; DRIFT_VARIANTS]; 3],
     /// The crossing log: `props::fallen_log`, drawn per frame because it rolls.
     pub river_log: u64,
     pub total_voxels: usize,
@@ -94,6 +100,9 @@ pub struct Scene {
     /// `Game::blockers`.
     pub blockers: std::sync::Arc<Blockers>,
 }
+
+/// Mesh variants per kind of drifting piece.
+pub const DRIFT_VARIANTS: usize = 6;
 
 /// One frustum-cullable batch of static world voxels.
 /// A cave roof (`pass::caves`): drawn on its own, not batched, because it
@@ -350,7 +359,26 @@ impl Scene {
         let wyrm_m = crate::skyprops::moonwyrm();
         total += wyrm_m.inst.len();
         let moonwyrm = r.upload_mesh(&wyrm_m);
+        let mut wyrm_seg = [[0u64; 2]; 2];
+        for fin in [false, true] {
+            for v in 0..2 {
+                let m = crate::skyprops::wyrm_segment(fin, v as i32);
+                total += m.inst.len();
+                wyrm_seg[fin as usize][v] = r.upload_mesh(&m);
+            }
+        }
         let star = r.upload_mesh(&crate::skyprops::star_mote());
+        let sky = crate::map::active() == crate::map::MapId::Sky;
+        let drift = if sky { crate::skydrift::placements() } else { Vec::new() };
+        let mut drift_mesh = [[0u64; DRIFT_VARIANTS]; 3];
+        if sky {
+            for v in 0..DRIFT_VARIANTS {
+                for (k, m) in [crate::skyprops::anchor_tile(v as i32), crate::skyprops::edge_fragment(v as i32), crate::skyprops::cloud_puff(v as i32)].iter().enumerate() {
+                    total += m.inst.len();
+                    drift_mesh[k][v] = r.upload_mesh(m);
+                }
+            }
+        }
         let river_log_mesh = props::crossing_log();
         total += river_log_mesh.inst.len();
         let river_log = r.upload_mesh(&river_log_mesh);
@@ -391,7 +419,10 @@ impl Scene {
             cloud,
             cloud_top,
             moonwyrm,
+            wyrm_seg,
             star,
+            drift,
+            drift_mesh,
             river_log,
             total_voxels: total,
             blockers: std::sync::Arc::new(blockers),
@@ -466,29 +497,45 @@ impl Scene {
                 crate::bosses::BossKind::Boar => 0.0,
             };
             let fwd = Vec3::new(b.yaw.cos(), 0.0, b.yaw.sin());
-            // aloft (the Moonwyrm's flights, wyrmflight.rs): grown to its
-            // full size, pitched along its climb and dive
-            let (aloft, pitch) = match b.flight {
-                Some(secs) => {
-                    let (_, dir, blend) = crate::wyrmflight::pose(b.home, secs);
-                    // the mesh is a climbing coil, head at the top: aloft it
-                    // leans forward into its flight, so the body streams out
-                    // behind the head instead of standing up like a spring
-                    (blend, (dir.y.clamp(-1.0, 1.0).asin() * 0.6 - 0.95) * blend)
+            if b.kind == crate::bosses::BossKind::Moonwyrm {
+                // 400 u of it: the head, then the body laid along its spine
+                // (coiled over the well, or streaming behind the head in
+                // flight -- wyrmbody.rs)
+                let since_land = game.t - (b.next_flight_t - crate::wyrmflight::FLIGHT_EVERY);
+                let segs = crate::wyrmbody::segments(b.home, b.flight, since_land, fwd, game.t);
+                let glow = 0.06 + atm.night * 0.08;
+                let frame = |f: Vec3| {
+                    let z = f.normalize_or(Vec3::Z);
+                    let x = Vec3::Y.cross(z).normalize_or(Vec3::X);
+                    (x, z.cross(x), z)
+                };
+                for (i, sg) in segs.iter().enumerate().skip(1) {
+                    let rad = crate::wyrmbody::BODY_R * sg.r;
+                    if !sg.shown || !sphere_in_frustum(&vp, sg.pos, rad + 3.5) {
+                        continue;
+                    }
+                    let (x, y, z) = frame(sg.fwd);
+                    let m = Mat4::from_cols((x * sg.r).extend(0.0), (y * sg.r).extend(0.0), z.extend(0.0), sg.pos.extend(1.0));
+                    r.queue_draw(self.wyrm_seg[(i % 3 == 0) as usize][i % 2], m, [1.0; 4], glow, crate::skyprops::WYRM_SEG_VOX, false);
                 }
-                None => (0.0, 0.0),
-            };
-            // the Moonwyrm is the map's centrepiece: drawn half again as big
-            // as its mesh, which keeps the voxels fine
-            let size = if b.kind == crate::bosses::BossKind::Moonwyrm { 1.35 * (1.0 + (crate::wyrmflight::FLIGHT_SCALE - 1.0) * aloft) } else { 1.0 };
-            let m = Mat4::from_translation(b.pos + fwd * lunge + Vec3::Y * (breathe + hover * (1.0 - aloft)))
+                if let Some(h) = segs.first().filter(|h| h.shown) {
+                    // at rest it looks where it is angry, lunging when it bites;
+                    // in flight, where it is going
+                    let look = if b.flight.is_some() { h.fwd } else { fwd };
+                    let (x, y, z) = frame(look);
+                    let pos = h.pos + z * lunge + Vec3::Y * (breathe * 8.0);
+                    let m = Mat4::from_cols(x.extend(0.0), y.extend(0.0), z.extend(0.0), pos.extend(1.0));
+                    r.queue_draw(mesh, m, [1.0; 4], glow, vs, false);
+                }
+                continue;
+            }
+            let _ = hover;
+            let m = Mat4::from_translation(b.pos + fwd * lunge + Vec3::Y * (breathe + hover))
                 * Mat4::from_axis_angle(Vec3::Y, -b.yaw + std::f32::consts::FRAC_PI_2)
-                * Mat4::from_axis_angle(Vec3::X, -pitch)
-                * Mat4::from_scale(Vec3::splat((1.0 + breathe) * size));
+                * Mat4::from_scale(Vec3::splat(1.0 + breathe));
             let glow = match b.kind {
                 crate::bosses::BossKind::Drake => 0.25,
-                crate::bosses::BossKind::Moonwyrm => 0.06 + atm.night * 0.08,
-                crate::bosses::BossKind::Boar => 0.0,
+                _ => 0.0,
             };
             r.queue_draw(mesh, m, [1.0; 4], glow, vs, false);
         }
@@ -496,8 +543,8 @@ impl Scene {
         // the Moonwyrm's stars: the ring it has ready, turning round it, and
         // the ones it has thrown, spinning in flight
         for b in game.bosses.list.iter().filter(|b| b.alive && b.kind == crate::bosses::BossKind::Moonwyrm) {
-            // aloft, the ring flies with it, round its middle
-            let centre = if b.flight.is_some() { b.pos - Vec3::Y * 6.0 } else { b.home };
+            // round its head: aloft, the ring flies with it
+            let centre = if b.flight.is_some() { b.pos - Vec3::Y * 6.0 } else { b.home + crate::wyrmbody::REST_HEAD - Vec3::Y * 4.0 };
             for k in 0..b.stars as usize {
                 let p = crate::moonwell::orbit_star(centre, game.t, k, crate::moonwell::STARS as usize);
                 let m = Mat4::from_translation(p) * Mat4::from_axis_angle(Vec3::Y, game.t * 2.0 + k as f32) * Mat4::from_scale(Vec3::splat(1.0 + 0.15 * (game.t * 5.0 + k as f32).sin()));
@@ -773,6 +820,30 @@ impl Scene {
             let m = Mat4::from_translation(at + Vec3::Y * (bob - self.cloud_top))
                 * Mat4::from_axis_angle(Vec3::Y, vfx.time * 0.05 + k as f32);
             r.queue_draw(self.cloud, m, [1.0; 4], 0.35 + atm.night * 0.25, crate::skyprops::CLOUD_VOX, false);
+        }
+        // the sky map's drifting stone and cloud, rising and falling on the
+        // slow air (skydrift.rs); an anchor stone rests on a little cloud
+        for d in &self.drift {
+            use crate::skydrift::DriftKind;
+            let at = d.at(vfx.time);
+            let (k, vox, reach) = match d.kind {
+                DriftKind::Anchor => (0, crate::skyprops::DRIFT_VOX, 4.0),
+                DriftKind::Fragment => (1, crate::skyprops::DRIFT_VOX, 3.0),
+                DriftKind::Puff => (2, crate::skyprops::PUFF_VOX, 8.0),
+            };
+            if !sphere_in_frustum(&vp, at.pos, reach * at.scale.max_element() + 2.0) {
+                continue;
+            }
+            let mesh = self.drift_mesh[k][d.variant.rem_euclid(DRIFT_VARIANTS as i32) as usize];
+            let m = Mat4::from_translation(at.pos) * Mat4::from_axis_angle(Vec3::Y, at.yaw) * Mat4::from_scale(at.scale);
+            let glow = if d.kind == DriftKind::Puff { 0.25 + atm.night * 0.2 } else { 0.0 };
+            r.queue_draw(mesh, m, [1.0; 4], glow, vox, false);
+            if d.kind == DriftKind::Anchor {
+                let under = Mat4::from_translation(at.pos - Vec3::Y * 3.2 * at.scale.y)
+                    * Mat4::from_axis_angle(Vec3::Y, at.yaw * 0.5 + 1.0)
+                    * Mat4::from_scale(at.scale * Vec3::new(0.55, 0.4, 0.55));
+                r.queue_draw(self.drift_mesh[2][(d.variant as usize + 1) % DRIFT_VARIANTS], under, [1.0; 4], 0.25 + atm.night * 0.2, crate::skyprops::PUFF_VOX, false);
+            }
         }
         for l in &game.logs {
             use crate::logs::{LOG_RADIUS, LOG_TOP};

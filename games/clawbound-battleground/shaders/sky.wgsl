@@ -162,7 +162,29 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let r3 = fbm(vec2(ra * 7.3, 17.0)) * 0.05 + 0.015;
     let nd = 1.0 - night * 0.85;
     if (spirit > 0.5) {
-        col = mix(col, vec3(0.62, 0.62, 0.86), smoothstep(0.06, -0.02, h) * 0.7);
+        // below the horizon there is no ground: the cloud deck lies far
+        // beneath the islands (y -260), billows lit pearl by the moon over a
+        // deep violet void, with a thinner layer of wisps drifting between
+        // (y -110) the other way; both melt into haze toward the horizon.
+        // Ray-plane intersections from the real camera, so the deck sits
+        // where it should at any camera height.
+        if (h < 0.02) {
+            let cam = frame.cam_pos.xyz;
+            let dy = min(ray.y, -0.004);
+            let t1 = (-260.0 - cam.y) / dy;
+            let p1 = (cam.xz + ray.xz * t1) * 0.0045 + vec2(t * 0.0040, t * 0.0015);
+            let c1 = fbm(p1);
+            let dens1 = smoothstep(0.34, 0.72, c1);
+            let billow = mix(vec3(0.40, 0.42, 0.66), vec3(0.94, 0.93, 1.0), smoothstep(0.42, 0.86, c1));
+            var dc = mix(vec3(0.13, 0.13, 0.30), billow, dens1);
+            let t2 = (-110.0 - cam.y) / dy;
+            let p2 = (cam.xz + ray.xz * t2) * 0.011 + vec2(-t * 0.010, t * 0.006);
+            let c2 = fbm(p2);
+            dc = mix(dc, vec3(0.86, 0.87, 0.98), smoothstep(0.56, 0.86, c2) * 0.65);
+            let far = 1.0 - exp(-t1 * 0.0011);
+            dc = mix(dc, vec3(0.72, 0.72, 0.92), far);
+            col = mix(col, dc * (1.0 - night * 0.4), smoothstep(0.02, -0.03, h));
+        }
     } else {
         if (h < r1) {
             col = mix(col, mix(vec3(0.36, 0.37, 0.44), frame.fog_color.xyz, 0.35) * nd, 0.82); // far — sun haze
@@ -213,6 +235,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     }
 
     // --- horizon haze band melts into the world fog
-    col = mix(col, frame.fog_color.xyz, smoothstep(0.20, -0.05, h) * 0.6);
+    // (the spirit sky's deck carries its own haze: fogging it again washed
+    // the clouds out)
+    col = mix(col, frame.fog_color.xyz, smoothstep(0.20, -0.05, h) * 0.6 * (1.0 - spirit * 0.75));
     return vec4(col, 1.0);
 }

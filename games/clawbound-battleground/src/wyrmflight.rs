@@ -4,8 +4,10 @@
 //! uncoils from the Moonwell and flies one long figure-of-eight over the
 //! whole of Starwell Glacier: over the islands, and down into the chasms
 //! between them, below the bridges and the ferry clouds, skimming the cloud
-//! sea. Aloft it is drawn [`FLIGHT_SCALE`] times its size in the well and
-//! cannot be struck. As it flies it lets its stars fall: each lands where a
+//! sea -- its body (`wyrmbody`, 400 u of it) paying out of its coil and
+//! streaming along the path behind its head. Aloft it cannot be struck.
+//! Home again, it dives into the well, the whole length of it following
+//! its head down ([`DIVE_SECS`]), and rises again coiled. As it flies it lets its stars fall: each lands where a
 //! ring of light has marked it for [`TELEGRAPH`] seconds, and bursts in a
 //! column of light that burns every cat and minion in [`IMPACT_R`] --
 //! either side, anyone's fight. Most fall at random; some are aimed where a
@@ -29,8 +31,10 @@ pub const FLIGHT_SECS: f32 = 70.0;
 pub const RISE: f32 = 0.1;
 /// It takes wing only once nobody has struck it for this long.
 pub const CALM_SECS: f32 = 8.0;
-/// Aloft it is drawn this much bigger than in the well.
-pub const FLIGHT_SCALE: f32 = 2.2;
+/// After the loop: the head dives into the well and the body follows it
+/// down, this long (long enough for all of it: `wyrmbody::BODY_LEN` at
+/// `wyrmbody::DIVE_SPEED`, and a little more).
+pub const DIVE_SECS: f32 = 11.0;
 /// A star falls this often while it flies.
 pub const DROP_EVERY: f32 = 0.7;
 /// Seconds between the mark appearing and the star landing.
@@ -123,10 +127,12 @@ fn smooth(x: f32) -> f32 {
     x * x * (3.0 - 2.0 * x)
 }
 
-/// Where the wyrm is `secs` into a flight from the well at `home`: its
-/// position, the way it faces, and how far aloft it is (0 in the well, 1 on
-/// the loop) -- which the scene uses for its size.
+/// Where the wyrm's head is `secs` into a flight from the well at `home`:
+/// its position, the way it faces, and how far aloft it is (0 in the well,
+/// 1 on the loop). It leaves from where its head rests
+/// (`wyrmbody::REST_HEAD` above the well) and comes back to it.
 pub fn pose(home: Vec3, secs: f32) -> (Vec3, Vec3, f32) {
+    let home = home + crate::wyrmbody::REST_HEAD;
     let u = (secs / FLIGHT_SECS).clamp(0.0, 1.0);
     let at = |u: f32| {
         let on_loop = on_loop(u);
@@ -173,7 +179,7 @@ impl Game {
             return false;
         };
         let secs = secs + dt;
-        if secs >= FLIGHT_SECS {
+        if secs >= FLIGHT_SECS + DIVE_SECS {
             let b = &mut self.bosses.list[bi];
             b.flight = None;
             b.pos = home;
@@ -181,7 +187,8 @@ impl Game {
             self.events.push(Event::NovaFx { pos: home, radius: crate::sky::POOL_R, color: [0.85, 0.92, 1.0] });
             return false;
         }
-        let (pos, dir, _) = pose(home, secs);
+        // back over the well, diving: it is home, and still out of reach
+        let (pos, dir, _) = if secs >= FLIGHT_SECS { (home, Vec3::Z, 0.0) } else { pose(home, secs) };
         {
             let b = &mut self.bosses.list[bi];
             b.flight = Some(secs);
@@ -271,8 +278,9 @@ mod tests {
     fn the_flight_leaves_the_well_and_comes_back_to_it() {
         crate::map::with(crate::map::MapId::Sky, || {
             let home = crate::sky::well_pos();
-            assert!(pose(home, 0.0).0.distance(home) < 1e-3);
-            assert!(pose(home, FLIGHT_SECS).0.distance(home) < 1e-3);
+            let head = home + crate::wyrmbody::REST_HEAD;
+            assert!(pose(home, 0.0).0.distance(head) < 1e-3, "it leaves from where its head rests");
+            assert!(pose(home, FLIGHT_SECS).0.distance(head) < 1e-3);
             // continuous, and it really goes somewhere
             let mut last = pose(home, 0.0).0;
             let (mut top, mut far, mut high, mut low) = (0.0f32, 0.0f32, f32::MIN, f32::MAX);

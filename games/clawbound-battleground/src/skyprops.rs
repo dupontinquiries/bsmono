@@ -153,106 +153,79 @@ pub fn ferry_cloud(r: f32, variant: i32) -> (VoxelMesh, f32) {
     (m, top_y)
 }
 
-/// Voxel size of the Moonwyrm.
+/// Voxel size of the Moonwyrm's head, and of its body's segments (coarser:
+/// there are ~150 of them, each ~7 u thick).
 pub const WYRM_VOX: f32 = 0.3;
+pub const WYRM_SEG_VOX: f32 = 0.6;
 
-/// The Moonwyrm: a sky-serpent with a cat's head, made of moonlight. Its
-/// body rises out of the well in a great climbing coil into the air --
-/// the tail's tip still in the water, the neck arching out over it -- with
-/// a crest of glowing fins down the spine, two small clawed forelegs under
-/// the neck, a cat's head held out (ears, a short muzzle, gold eyes),
-/// swept-back horns, long trailing whiskers, and stars in its hide. An
-/// original design in the moon's palette: pearl, silver-blue, starlight
-/// gold. Faces +z; the water line at y = 0.
+/// The Moonwyrm's head, in world units: a cat's head on a sky-serpent --
+/// ears, a short muzzle, gold eyes, horns swept back, long whiskers, a
+/// glowing mane down the back of the neck, and two small clawed forelegs
+/// under the chest. Origin at the base of the skull (where the body
+/// joins), facing +z. Its body is `wyrm_segment`s laid along
+/// `wyrmbody::segments`.
 pub fn moonwyrm() -> VoxelMesh {
     let k = 1.0 / WYRM_VOX;
-    let (nx, ny, nz) = ((13.0 * k) as usize, (16.0 * k) as usize, (14.0 * k) as usize);
+    let hs = 2.7f32; // the old head's proportions, at this scale
+    let (nx, ny, nz) = ((22.0 * k) as usize, (18.0 * k) as usize, (24.0 * k) as usize);
     let mut g = Grid::new(nx, ny, nz);
-    let (cx, cz0) = (nx as f32 * 0.5, nz as f32 * 0.5);
-    let at = |x: f32, y: f32, z: f32| (cx + x * k, y * k, cz0 + z * k);
+    // grid origin: the skull base sits here
+    let (ox, oy, oz) = (nx as f32 * 0.5, 7.5 * k, 11.0 * k);
+    let at = |x: f32, y: f32, z: f32| (ox + x * hs * k, oy + y * hs * k, oz + z * hs * k);
+    let r = |v: f32| v * hs * k;
     let pearl = [0.88, 0.91, 0.98, 1.0];
     let belly = [0.66, 0.78, 0.95, 1.0];
     let mane = [0.45, 0.85, 1.0, 1.0];
     let horn = [0.93, 0.93, 0.98, 1.0];
     let eye = [1.0, 0.82, 0.30, 1.0];
     let claw = [0.95, 0.86, 0.60, 1.0];
-    // the body's path, tail tip (s = 0) to the base of the skull (s = 1):
-    // a coil climbing round a vertical axis, then the neck bending out
-    let path = |s: f32| -> (f32, f32, f32) {
-        let turns = 1.6;
-        let a = s * turns * std::f32::consts::TAU - 1.2;
-        let r = 3.6 * (1.0 - 0.35 * s);
-        let (x, z) = (a.cos() * r, a.sin() * r - 1.0);
-        let y = 0.3 + s.powf(0.9) * 11.0;
-        // the last stretch leans out toward +z: the neck over the water
-        let lean = ((s - 0.85) / 0.15).clamp(0.0, 1.0);
-        (x * (1.0 - lean), y + lean * 0.8, z * (1.0 - lean) + lean * 3.2)
-    };
-    let steps = 360;
-    for i in 0..=steps {
-        let s = i as f32 / steps as f32;
-        let (x, y, z) = path(s);
-        // thick through the middle, a thin tail, a slimmer neck
-        let r = 0.25 + 1.05 * (s * 3.0).min(1.0) * (1.0 - 0.3 * ((s - 0.7) / 0.3).clamp(0.0, 1.0));
-        let (px, py, pz) = at(x, y, z);
-        g.ellipsoid(px, py, pz, r * k, r * k, r * k, pearl);
-        // the belly: a paler stripe on the coil's inner side
-        let (bx, by, bz) = at(x * 0.82, y - r * 0.35, z * 0.82 - 0.18);
-        g.ellipsoid(bx, by, bz, r * 0.7 * k, r * 0.55 * k, r * 0.7 * k, belly);
-        // the crest: glowing fins along the spine, every so often
-        if i % 9 == 0 && s > 0.12 {
-            let h = 0.5 + 0.9 * (1.0 - (s - 0.6).abs());
-            for u in 0..6 {
-                let f = u as f32 / 5.0;
-                let (qx, qy, qz) = at(x * (1.0 + 0.08 * f), y + r * 0.85 + h * f, z * (1.0 + 0.08 * f) - 0.15 * f);
-                g.ellipsoid(qx, qy, qz, 0.22 * k * (1.0 - f * 0.6), 0.3 * k, 0.35 * k * (1.0 - f * 0.5), mane);
-            }
-        }
-    }
-    let (hx0, hy0, hz0) = path(1.0);
-    // head
-    let (hx, hy, hz) = at(hx0, hy0 + 0.3, hz0 + 0.9);
-    g.ellipsoid(hx, hy, hz, 1.55 * k, 1.35 * k, 1.5 * k, pearl);
-    let (mx, my, mz) = at(hx0, hy0 - 0.15, hz0 + 2.3);
-    g.ellipsoid(mx, my, mz, 0.85 * k, 0.65 * k, 0.8 * k, belly);
+    // skull and muzzle
+    let (hx, hy, hz) = at(0.0, 0.3, 0.9);
+    g.ellipsoid(hx, hy, hz, r(1.55), r(1.35), r(1.5), pearl);
+    let (mx, my, mz) = at(0.0, -0.15, 2.3);
+    g.ellipsoid(mx, my, mz, r(0.85), r(0.65), r(0.8), belly);
+    // the throat, joining the body
+    let (tx, ty, tz) = at(0.0, -0.1, -0.2);
+    g.ellipsoid(tx, ty, tz, r(1.05), r(1.05), r(1.2), pearl);
     for side in [-1.0f32, 1.0] {
         // ears
-        let (ex, _, ez) = at(hx0 + side * 0.9, 0.0, hz0 + 0.5);
-        g.cone_y(ex, ez, 0.6 * k, 0.05 * k, ((hy0 + 1.3) * k) as i32, ((hy0 + 2.7) * k) as i32, pearl);
+        for t in 0..10 {
+            let u = t as f32 / 9.0;
+            let (ex, ey, ez) = at(side * (0.9 + 0.1 * u), 1.3 + 1.4 * u, 0.5);
+            g.ellipsoid(ex, ey, ez, r(0.55 * (1.0 - u) + 0.05), r(0.2), r(0.35 * (1.0 - u) + 0.05), pearl);
+        }
         // horns, swept back
-        for t in 0..16 {
-            let u = t as f32 / 15.0;
-            let (qx, qy, qz) = at(hx0 + side * (0.6 + 0.4 * u), hy0 + 1.2 + 1.0 * u, hz0 + 0.1 - 2.2 * u);
-            let rr = (0.3 - 0.2 * u) * k;
+        for t in 0..20 {
+            let u = t as f32 / 19.0;
+            let (qx, qy, qz) = at(side * (0.6 + 0.4 * u), 1.2 + 1.0 * u, 0.1 - 2.2 * u);
+            let rr = r(0.3 - 0.2 * u);
             g.ellipsoid(qx, qy, qz, rr, rr, rr, horn);
         }
         // eyes
-        let (ix, iy, iz) = at(hx0 + side * 0.65, hy0 + 0.55, hz0 + 2.05);
-        g.ellipsoid(ix, iy, iz, 0.24 * k, 0.2 * k, 0.12 * k, eye);
+        let (ix, iy, iz) = at(side * 0.65, 0.55, 2.05);
+        g.ellipsoid(ix, iy, iz, r(0.24), r(0.2), r(0.12), eye);
         // whiskers: long, trailing back and down, a little wavy
-        for t in 0..30 {
-            let u = t as f32 / 29.0;
-            let (bx, by, bz) = at(hx0 + side * (0.8 + 2.6 * u), hy0 - 0.2 - 1.6 * u + 0.35 * (u * 7.0).sin(), hz0 + 2.4 - 1.2 * u);
-            g.set(bx as i32, by as i32, bz as i32, mane);
+        for t in 0..40 {
+            let u = t as f32 / 39.0;
+            let (bx, by, bz) = at(side * (0.8 + 2.6 * u), -0.2 - 1.6 * u + 0.35 * (u * 7.0).sin(), 2.4 - 1.2 * u);
+            g.ellipsoid(bx, by, bz, r(0.07), r(0.07), r(0.07), mane);
         }
-        // forelegs under the neck, reaching forward, claws out
-        let (sx, sy, sz) = path(0.9);
+        // forelegs under the chest, reaching forward, claws out
         for t in 0..10 {
             let u = t as f32 / 9.0;
-            let (lx, ly, lz) = at(sx + side * (0.8 + 0.5 * u), sy - 0.6 - 1.2 * u, sz + 0.5 + 1.0 * u);
-            g.ellipsoid(lx, ly, lz, 0.32 * k, 0.32 * k, 0.32 * k, pearl);
+            let (lx, ly, lz) = at(side * (0.8 + 0.5 * u), -0.8 - 1.2 * u, -1.6 + 1.0 * u);
+            g.ellipsoid(lx, ly, lz, r(0.32), r(0.32), r(0.32), pearl);
         }
         for c in -1..=1 {
-            let (lx, ly, lz) = at(sx + side * 1.3 + c as f32 * 0.18, sy - 1.9, sz + 1.7);
-            g.ellipsoid(lx, ly, lz, 0.1 * k, 0.1 * k, 0.25 * k, claw);
+            let (lx, ly, lz) = at(side * 1.3 + c as f32 * 0.18, -2.1, -0.4);
+            g.ellipsoid(lx, ly, lz, r(0.1), r(0.1), r(0.25), claw);
         }
     }
     // a mane down the back of the neck
-    for i in 0..40 {
-        let s = 0.8 + 0.2 * i as f32 / 39.0;
-        let (x, y, z) = path(s);
-        let (qx, qy, qz) = at(x, y + 1.0, z - 0.3);
-        g.ellipsoid(qx, qy, qz, 0.45 * k, 0.5 * k, 0.4 * k, mane);
+    for i in 0..12 {
+        let u = i as f32 / 11.0;
+        let (qx, qy, qz) = at(0.0, 1.0 - 0.3 * u, -0.3 - 1.4 * u);
+        g.ellipsoid(qx, qy, qz, r(0.45), r(0.5), r(0.4), mane);
     }
     // what glows, by grid cell (the mesh shades its colours, so they cannot
     // be matched after meshing -- `props::gem_cluster` does the same)
@@ -266,8 +239,6 @@ pub fn moonwyrm() -> VoxelMesh {
                         0.9
                     } else if same(c, eye) {
                         1.4
-                    } else if same(c, pearl) && h3(x as f32, y as f32, z as f32, 11.0) > 0.93 {
-                        -1.2 // a star: white and bright
                     } else if same(c, pearl) {
                         0.04
                     } else {
@@ -279,16 +250,164 @@ pub fn moonwyrm() -> VoxelMesh {
         }
     }
     let mut m = g.mesh(WYRM_VOX, true);
-    let off = (nx as f32 * 0.5, 0.0, nz as f32 * 0.5);
     for i in m.inst.iter_mut() {
-        let cx = (i.off_ao[0] / WYRM_VOX + off.0 - 0.5).round() as i32;
+        let cx = (i.off_ao[0] / WYRM_VOX + nx as f32 * 0.5 - 0.5).round() as i32;
         let cy = (i.off_ao[1] / WYRM_VOX - 0.5).round() as i32;
-        let cz = (i.off_ao[2] / WYRM_VOX + off.2 - 0.5).round() as i32;
+        let cz = (i.off_ao[2] / WYRM_VOX + nz as f32 * 0.5 - 0.5).round() as i32;
         if let Some(&v) = glow.get(&(cx, cy, cz)) {
-            if v < 0.0 {
-                i.color = [1.0, 1.0, 1.0, 1.0];
-            }
-            i.misc[2] = v.abs();
+            i.misc[2] = v;
+        }
+        // move the origin to the skull base
+        i.off_ao[1] -= oy * WYRM_VOX;
+        i.off_ao[2] -= (oz - nz as f32 * 0.5) * WYRM_VOX;
+    }
+    m
+}
+
+/// A piece of the Moonwyrm's body, `wyrmbody::BODY_R` thick and a little
+/// longer than `wyrmbody::SEG_STEP` so neighbours overlap: pearl, a pale
+/// belly, a scatter of star-bright scales, and (with `fin`) a glowing crest
+/// fin along the spine. Centred, running along z, back up.
+pub fn wyrm_segment(fin: bool, variant: i32) -> VoxelMesh {
+    let k = 1.0 / WYRM_SEG_VOX;
+    let rad = crate::wyrmbody::BODY_R;
+    let half = crate::wyrmbody::SEG_STEP * 0.8;
+    let (nx, ny, nz) = (((rad * 2.0 + 1.0) * k) as usize, ((rad * 2.0 + 3.2) * k) as usize, ((half * 2.0 + 1.0) * k) as usize);
+    let mut g = Grid::new(nx, ny, nz);
+    let (cx, cy, cz) = (nx as f32 * 0.5, (rad + 0.5) * k, nz as f32 * 0.5);
+    let pearl = [0.88, 0.91, 0.98, 1.0];
+    let belly = [0.66, 0.78, 0.95, 1.0];
+    let mane = [0.45, 0.85, 1.0, 1.0];
+    g.ellipsoid(cx, cy, cz, rad * k, rad * k, half * k, pearl);
+    g.ellipsoid(cx, cy - rad * 0.45 * k, cz, rad * 0.75 * k, rad * 0.6 * k, half * 0.95 * k, belly);
+    if fin {
+        for t in 0..8 {
+            let u = t as f32 / 7.0;
+            g.ellipsoid(cx, cy + (rad * 0.85 + 2.4 * u) * k, cz - u * 0.8 * k, 0.35 * k, 0.45 * k, (1.3 - 0.9 * u) * k, mane);
+        }
+    }
+    let mut m = g.mesh(WYRM_SEG_VOX, false);
+    let v = variant as f32;
+    // the mesher centres the grid; put the origin on the body's axis
+    let lift = (cy - ny as f32 * 0.5) * WYRM_SEG_VOX;
+    for i in m.inst.iter_mut() {
+        i.off_ao[1] -= lift;
+        let [x, y, z, _] = i.off_ao;
+        if fin && y > rad * 0.85 && x.abs() < 0.6 {
+            i.misc[2] = 0.9; // the crest
+        } else if h3((x * 3.0).floor(), (y * 3.0).floor(), (z * 3.0).floor(), 11.0 + v) > 0.96 && i.color[2] > 0.9 && i.color[0] > 0.8 {
+            i.color = [1.0, 1.0, 1.0, 1.0];
+            i.misc[2] = 1.2; // a star-bright scale
+        } else {
+            i.misc[2] = 0.04;
+        }
+    }
+    m
+}
+
+/// Voxel size of the floating stone and the drifting cloud.
+pub const DRIFT_VOX: f32 = 0.3;
+pub const PUFF_VOX: f32 = 0.6;
+
+/// An anchor stone: a flat, broken tile of old flagstone drifting in the
+/// sky, about 4 u across -- snow on top, blue rock and a hanging root of
+/// ice beneath, and on some a stub of marble column from whatever stood
+/// there once. Origin at the centre of its top face.
+pub fn anchor_tile(variant: i32) -> VoxelMesh {
+    let k = 1.0 / DRIFT_VOX;
+    let (n, ny) = ((8.0 * k) as usize, (7.0 * k) as usize);
+    let mut g = Grid::new(n, ny, n);
+    let c = n as f32 * 0.5;
+    let top = ny as f32 - 2.2 * k; // leave room above for a column stub
+    let v = variant as f32;
+    let stone = [0.56, 0.60, 0.70, 1.0];
+    let snow = [0.90, 0.92, 0.98, 1.0];
+    let rock = [0.50, 0.55, 0.68, 1.0];
+    let ice = [0.55, 0.78, 0.95, 1.0];
+    // the tile: two or three overlapping slabs, not quite level
+    for s in 0..3 {
+        let a = h3(v, s as f32, 0.0, 1.0) * std::f32::consts::TAU;
+        let off = h3(v, s as f32, 1.0, 1.0) * 0.8 * k;
+        let (rx, rz) = ((2.2 + h3(v, s as f32, 2.0, 1.0) * 0.9) * k, (2.0 + h3(v, s as f32, 3.0, 1.0) * 0.8) * k);
+        g.ellipsoid(c + a.cos() * off, top - 0.45 * k, c + a.sin() * off, rx, 0.5 * k, rz, stone);
+        g.ellipsoid(c + a.cos() * off, top - 0.05 * k, c + a.sin() * off, rx * 0.85, 0.22 * k, rz * 0.85, snow);
+    }
+    // the root beneath: rock tapering to an icicle
+    g.cone_y(c, c, 1.0 * k, 0.15 * k, (top - 2.0 * k) as i32, (top - 0.7 * k) as i32, rock);
+    g.cone_y(c + 0.3 * k, c - 0.2 * k, 0.3 * k, 0.05 * k, (top - 3.2 * k) as i32, (top - 1.9 * k) as i32, ice);
+    // a broken column on every third
+    if variant.rem_euclid(3) == 0 {
+        g.cyl_y(c + 0.5 * k, c - 0.3 * k, 0.45 * k, top as i32, (top + 1.2 * k + h3(v, 9.0, 0.0, 1.0) * 0.9 * k) as i32, [0.93, 0.92, 0.88, 1.0]);
+    }
+    // (the mesher centres x and z already; y from the grid's floor)
+    let mut m = g.mesh(DRIFT_VOX, true);
+    let top_y = top * DRIFT_VOX;
+    for i in m.inst.iter_mut() {
+        i.off_ao[1] -= top_y;
+        let l = luma(i.color);
+        if l > 0.85 {
+            i.misc[2] = 0.08; // snow and marble, moonlit
+        } else if i.color[2] > 0.9 {
+            i.misc[2] = 0.3; // the icicle holds a little light
+        }
+    }
+    m
+}
+
+/// A drifting cloud: a loose cluster of billows about 10 u across, pearl
+/// on top, lavender beneath. Origin at its centre. Drawn scaled and
+/// breathing (`skydrift`), so it changes shape as it goes.
+pub fn cloud_puff(variant: i32) -> VoxelMesh {
+    let k = 1.0 / PUFF_VOX;
+    let (n, ny) = ((11.0 * k) as usize, (5.0 * k) as usize);
+    let mut g = Grid::new(n, ny, n);
+    let (c, cy) = (n as f32 * 0.5, ny as f32 * 0.45);
+    let v = variant as f32;
+    let white = [0.95, 0.95, 1.0, 1.0];
+    let blobs = 6 + variant.rem_euclid(4);
+    for b in 0..blobs {
+        let a = h3(v, b as f32, 0.0, 3.0) * std::f32::consts::TAU;
+        let r = h3(v, b as f32, 1.0, 3.0) * 3.2 * k;
+        let size = (1.3 + h3(v, b as f32, 2.0, 3.0) * 1.3) * k;
+        g.ellipsoid(c + a.cos() * r, cy + (h3(v, b as f32, 3.0, 3.0) - 0.4) * 1.2 * k, c + a.sin() * r, size, size * 0.7, size, white);
+    }
+    // (centred by the mesher)
+    let mut m = g.mesh(PUFF_VOX, false);
+    let top = 2.4f32;
+    for i in m.inst.iter_mut() {
+        let t = ((i.off_ao[1] + top) / (2.0 * top)).clamp(0.0, 1.0);
+        let under = [0.62, 0.64, 0.86];
+        let over = [0.97, 0.97, 1.0];
+        i.color = [under[0] + (over[0] - under[0]) * t, under[1] + (over[1] - under[1]) * t, under[2] + (over[2] - under[2]) * t, 1.0];
+        i.misc[2] = 0.15 + 0.15 * t;
+    }
+    m
+}
+
+/// A fragment of an island's edge, broken off and hanging in the air
+/// beside it: a chunk of glacier ice and rock with snow on it, 2-4 u.
+/// Origin at the centre of its top.
+pub fn edge_fragment(variant: i32) -> VoxelMesh {
+    let k = 1.0 / DRIFT_VOX;
+    let n = (4.4 * k) as usize;
+    let mut g = Grid::new(n, n, n);
+    let c = n as f32 * 0.5;
+    let top = n as f32 - 0.6 * k;
+    let v = variant as f32;
+    let rock = [0.22, 0.26, 0.38, 1.0];
+    let ice = [0.50, 0.74, 0.92, 1.0];
+    let snow = [0.90, 0.92, 0.98, 1.0];
+    let body = if variant.rem_euclid(2) == 0 { ice } else { rock };
+    let (rx, rz) = ((1.0 + h3(v, 0.0, 0.0, 5.0) * 0.8) * k, (0.9 + h3(v, 1.0, 0.0, 5.0) * 0.8) * k);
+    g.ellipsoid(c, top - 0.9 * k, c, rx, 0.9 * k, rz, body);
+    g.cone_y(c, c, rx.min(rz) * 0.9, 0.1 * k, (top - 3.8 * k).max(0.0) as i32, (top - 0.8 * k) as i32, body);
+    g.ellipsoid(c, top - 0.1 * k, c, rx * 0.8, 0.3 * k, rz * 0.8, snow);
+    let mut m = g.mesh(DRIFT_VOX, true);
+    let ty = top * DRIFT_VOX;
+    for i in m.inst.iter_mut() {
+        i.off_ao[1] -= ty;
+        if i.color[2] > 0.9 && i.color[0] < 0.6 {
+            i.misc[2] = 0.2;
         }
     }
     m
@@ -335,13 +454,18 @@ mod tests {
 
     #[test]
     fn the_moonwyrm_is_big_and_glows() {
+        let seg = wyrm_segment(true, 0);
+        let lo = seg.inst.iter().map(|i| i.off_ao[0]).fold(f32::MAX, f32::min);
+        let hi = seg.inst.iter().map(|i| i.off_ao[0]).fold(f32::MIN, f32::max);
+        assert!((hi - lo - crate::wyrmbody::BODY_R * 2.0).abs() < 1.5, "a segment is the body's thickness: {}", hi - lo);
+        assert!(seg.inst.iter().any(|i| i.misc[2] > 0.5), "the crest glows");
         let m = moonwyrm();
         let (lo, hi) = m.inst.iter().fold((glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)), |(lo, hi), i| {
             let p = glam::Vec3::new(i.off_ao[0], i.off_ao[1], i.off_ao[2]);
             (lo.min(p), hi.max(p))
         });
         let size = hi - lo;
-        assert!(size.z > 11.0 && size.y > 6.0, "a long beast with its head held high: {size}");
+        assert!(size.x > 14.0 && size.y > 10.0 && size.z > 10.0, "a head for a 400 u body: {size}");
         let glowing = m.inst.iter().filter(|i| i.misc[2] > 0.5).count();
         assert!(glowing > 50, "mane, eyes and stars glow: {glowing}");
     }
