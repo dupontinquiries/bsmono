@@ -68,10 +68,12 @@ pub struct Frame {
 
 /// Beat lengths, seconds. Short enough to sit through twice; skippable.
 pub const PAN: f32 = 4.0;
-pub const LANE: f32 = 1.6;
-pub const SPAWN: f32 = 1.8;
+// Longer beats (were 1.6 / 1.8 / 1.4) to make room for slower flights
+// between them: the big moves read as jumps (reported).
+pub const LANE: f32 = 2.4;
+pub const SPAWN: f32 = 2.6;
 pub const VERSUS: f32 = 3.6;
-pub const SETTLE: f32 = 1.4;
+pub const SETTLE: f32 = 2.0;
 /// When the fanfare starts, relative to the start of the intro: on the
 /// first spawn, so the brass swells as the cats appear and peaks on the card.
 pub const FANFARE_AT: f32 = PAN + 3.0 * LANE;
@@ -227,7 +229,10 @@ impl Intro {
             // degree reversal over ~350 u, which in 0.9 s turned 6.3 deg a
             // frame (the smoothness test's limit is 6)
             let probe = (self.raw_frame(b - 0.45).shot.eye - self.raw_frame(b + 0.45).shot.eye).length();
-            let dur = (TRANSITION + probe / 350.0 * 0.7).min(1.6);
+            // slower, and longer the further: 1.3 s, to 2.4 s for the pass's
+            // base-to-base flight (was 0.9 to 1.6 -- the big moves read as
+            // jumps). 2.4 is the shortest beat: two flights never overlap.
+            let dur = (1.3 + probe / 350.0 * 1.5).min(2.4);
             let half = dur * 0.5;
             if b > half && t > b - half && t < b + half {
                 let from = self.raw_frame(b - half).shot;
@@ -464,8 +469,10 @@ mod tests {
     /// units in a frame. Before: 137 degrees and 353 units at the cuts.
     #[test]
     fn the_camera_moves_smoothly_through_every_beat() {
-        const MAX_TURN: f32 = 6.0;
-        const MAX_STEP: f32 = 12.0;
+        // tightened with the slower flights (were 6 and 12; measured now
+        // 2.3 deg and 3.7 u at worst): the big moves must stay unhurried
+        const MAX_TURN: f32 = 3.0;
+        const MAX_STEP: f32 = 4.5;
         for m in crate::map::MapId::ALL {
             crate::map::with(m, || {
                 let n = m.team_size();
