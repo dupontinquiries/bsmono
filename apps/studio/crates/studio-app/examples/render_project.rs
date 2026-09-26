@@ -10,6 +10,9 @@
 //!   --from S --to S          render only that window
 //!   --bypass kind,kind       remove those effect kinds from every bus and clip
 //!   --mute-synths            mute the rack's stand-in synths (Sine / Sub)
+//!   --solo TEXT[,TEXT]       only the tracks whose name contains any TEXT
+//!                            (through their busses and the master, as heard
+//!                            soloed); the matches are printed
 //!   --dry-master             bypass the "Master" bus's chain: the MIX, from the
 //!                            same project that renders the master -- one project,
 //!                            both deliverables, no re-export between them
@@ -52,10 +55,20 @@ fn main() {
     let t_mix = std::time::Instant::now();
     let mut cache = studio_audio::EffectCache::new();
     let start = opt("--from").and_then(|v| v.parse().ok()).map(studio_core::Ticks::from_seconds).unwrap_or(studio_core::Ticks::ZERO);
+    let solo: Vec<studio_core::TrackId> = match opt("--solo") {
+        Some(v) => {
+            let want: Vec<&str> = v.split(',').collect();
+            let hit: Vec<&studio_core::Track> = project.tracks.iter().filter(|t| want.iter().any(|w| t.name.contains(w))).collect();
+            eprintln!("solo: {}", hit.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(" | "));
+            assert!(!hit.is_empty(), "--solo matched no track");
+            hit.iter().map(|t| t.id).collect()
+        }
+        None => Vec::new(),
+    };
     let (mut t, step, mut peak) = (start, studio_core::Ticks::from_seconds(5.0), 0.0f32);
     while t < end {
         let to = t.saturating_add(step).min(end);
-        let mix = studio_audio::mixdown_with_cache(&project, &audio, &fades, t, to, rate, &[], &[], &mut cache);
+        let mix = studio_audio::mixdown_with_cache(&project, &audio, &fades, t, to, rate, &solo, &[], &mut cache);
         for x in &mix { peak = peak.max(x.abs()); out.write_all(&x.to_le_bytes()).unwrap(); }
         t = to;
         eprint!("\r{:.0} / {:.0} s", t.to_seconds(), end.to_seconds());
