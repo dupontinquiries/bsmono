@@ -51,6 +51,40 @@ pub fn media_probe(media: PathBuf) -> impl Fn(&str) -> Option<Media> {
     }
 }
 
+/// OGG VORBIS INSIDE A WAV -- format tags 0x674F..0x6771 (the "Vorbis ACM"
+/// modes Edison writes) with an Ogg stream as the data chunk -- as a plain Ogg
+/// file: the pages of the FIRST logical stream only. pianovibes' "DL Groover.wav"
+/// carries a second stream (Image-Line's, a 32-byte packet ffmpeg cannot
+/// identify) that made the whole file unreadable, so the loop never played.
+/// `None` for anything else, including an ordinary WAV.
+pub fn unwrap_vorbis_wav(b: &[u8]) -> Option<Vec<u8>> {
+    if b.len() < 12 || &b[..4] != b"RIFF" || &b[8..12] != b"WAVE" { return None; }
+    let (mut i, mut tag, mut data) = (12usize, None, None);
+    while i + 8 <= b.len() {
+        let n = u32::from_le_bytes(b[i + 4..i + 8].try_into().ok()?) as usize;
+        let body = b.get(i + 8..(i + 8 + n).min(b.len()))?;
+        match &b[i..i + 4] {
+            b"fmt " => tag = body.get(..2).map(|t| u16::from_le_bytes([t[0], t[1]])),
+            b"data" => data = Some(body),
+            _ => {}
+        }
+        i += 8 + n + (n & 1);
+    }
+    if !matches!(tag?, 0x674F | 0x6750 | 0x6751 | 0x676F | 0x6770 | 0x6771) { return None; }
+    let d = data?;
+    if !d.starts_with(b"OggS") { return None; }
+    let (mut j, mut out, mut first) = (0usize, Vec::with_capacity(d.len()), None);
+    while j + 27 <= d.len() && &d[j..j + 4] == b"OggS" {
+        let nseg = d[j + 26] as usize;
+        let size: usize = d.get(j + 27..j + 27 + nseg)?.iter().map(|x| *x as usize).sum();
+        let page = d.get(j..j + 27 + nseg + size)?;
+        let serial = u32::from_le_bytes(d[j + 14..j + 18].try_into().ok()?);
+        if *first.get_or_insert(serial) == serial { out.extend_from_slice(page); }
+        j += page.len();
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// ffmpeg's `atempo` takes 0.5..=100 per stage: a ratio outside that is a
 /// CHAIN of stages whose product is the ratio (pianovibes' cool-riff, stretched
 /// 0.424 in FL, was refused outright and went missing from the song).
@@ -230,11 +264,15 @@ pub fn convert_package(zip_path: &Path, out_root: &Path, o: &Options) -> Outcome
                 flps.push((base, b));
                 continue;
             }
-            let opus = o.opus && is_audio(&base) && !base.to_lowercase().ends_with(".opus");
-            let stem = Path::new(&base).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
-            let name_out = if opus { format!("{stem}.opus") } else { base.clone() };
             let mut bytes = Vec::with_capacity(e.size() as usize);
             e.read_to_end(&mut bytes).map_err(|x| format!("{base}: {x}"))?;
+            // Ogg Vorbis inside a WAV (Edison's format 0x674F): the Vorbis pages
+            // alone, encoded to the .opus the importer reads instead of the .wav
+            let rewrapped = unwrap_vorbis_wav(&bytes);
+            let opus = rewrapped.is_some() || (o.opus && is_audio(&base) && !base.to_lowercase().ends_with(".opus"));
+            if let Some(ogg) = rewrapped.as_ref() { bytes = ogg.clone(); }
+            let stem = Path::new(&base).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
+            let name_out = if opus { format!("{stem}.opus") } else { base.clone() };
             // where the (possibly encoded) file lives: the store, or the folder
             let (home, fresh) = match &o.store {
                 Some(store) => {
@@ -253,7 +291,7 @@ pub fn convert_package(zip_path: &Path, out_root: &Path, o: &Options) -> Outcome
                 if opus {
                     let tmp = home.with_extension("src.tmp");
                     std::fs::write(&tmp, &bytes).map_err(|x| format!("{base}: {x}"))?;
-                    let kb = format!("{}k", if o.kbps == 0 { 48 } else { o.kbps });
+                    let kb = if rewrapped.is_some() { "128k".to_string() } else { format!("{}k", if o.kbps == 0 { 48 } else { o.kbps }) };
                     let run = std::process::Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-y", "-i"]).arg(&tmp)
                         .args(["-c:a", "libopus", "-b:a", &kb]).arg(&home).output();
                     let _ = std::fs::remove_file(&tmp);
@@ -385,6 +423,37 @@ pub fn summary(outcomes: &[Outcome]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A WAV wrapping Ogg Vorbis (tag 0x674F) comes out as the first logical
+    /// stream's pages; a second stream's pages are dropped; an ordinary WAV,
+    /// a non-Ogg payload and a truncated page are None.
+    #[test]
+    fn a_vorbis_wav_unwraps_to_its_first_ogg_stream() {
+        fn page(serial: u32, body: &[u8]) -> Vec<u8> {
+            let mut p = b"OggS".to_vec();
+            p.extend_from_slice(&[0, 2]); p.extend_from_slice(&[0; 8]);
+            p.extend_from_slice(&serial.to_le_bytes()); p.extend_from_slice(&[0; 8]);
+            p.push(1); p.push(body.len() as u8); p.extend_from_slice(body);
+            p
+        }
+        fn wav(tag: u16, data: &[u8]) -> Vec<u8> {
+            let mut fmt = tag.to_le_bytes().to_vec(); fmt.extend_from_slice(&[2, 0, 0x44, 0xac, 0, 0, 0, 0, 0, 0, 1, 0, 16, 0]);
+            let mut b = b"RIFF".to_vec(); b.extend_from_slice(&0u32.to_le_bytes()); b.extend_from_slice(b"WAVE");
+            b.extend_from_slice(b"fmt "); b.extend_from_slice(&(fmt.len() as u32).to_le_bytes()); b.extend_from_slice(&fmt);
+            b.extend_from_slice(b"data"); b.extend_from_slice(&(data.len() as u32).to_le_bytes()); b.extend_from_slice(data);
+            if data.len() % 2 == 1 { b.push(0); }
+            b.extend_from_slice(b"smpl"); b.extend_from_slice(&4u32.to_le_bytes()); b.extend_from_slice(&[0; 4]);
+            b
+        }
+        let (a, x, a2) = (page(0, b"\x01vorbis"), page(16, b" ietf"), page(0, b"audio"));
+        let ogg: Vec<u8> = [a.clone(), x.clone(), a2.clone()].concat();
+        assert_eq!(unwrap_vorbis_wav(&wav(0x674F, &ogg)), Some([a, a2].concat()), "the first stream's pages, in order");
+        assert_eq!(unwrap_vorbis_wav(&wav(0x0001, &ogg)), None, "PCM is not unwrapped");
+        assert_eq!(unwrap_vorbis_wav(&wav(0x674F, b"not ogg at all")), None);
+        assert_eq!(unwrap_vorbis_wav(b"RIFF"), None);
+        let mut cut = ogg.clone(); cut.truncate(ogg.len() - 3);
+        assert_eq!(unwrap_vorbis_wav(&wav(0x674F, &cut)), None, "a truncated page is refused, not half-read");
+    }
+
     /// Every stage inside ffmpeg's 0.5..=100 and the product the ratio -- the
     /// 0.424 that was refused, an in-range one untouched, a huge one.
     #[test]
