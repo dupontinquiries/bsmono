@@ -83,8 +83,9 @@ pub struct Scene {
     /// feet (`skyprops::ferry_cloud`).
     pub cloud: u64,
     pub cloud_top: f32,
-    /// The Moonwyrm (sky map).
+    /// The Moonwyrm (sky map), and one of its stars.
     pub moonwyrm: u64,
+    pub star: u64,
     /// The crossing log: `props::fallen_log`, drawn per frame because it rolls.
     pub river_log: u64,
     pub total_voxels: usize,
@@ -349,6 +350,7 @@ impl Scene {
         let wyrm_m = crate::skyprops::moonwyrm();
         total += wyrm_m.inst.len();
         let moonwyrm = r.upload_mesh(&wyrm_m);
+        let star = r.upload_mesh(&crate::skyprops::star_mote());
         let river_log_mesh = props::crossing_log();
         total += river_log_mesh.inst.len();
         let river_log = r.upload_mesh(&river_log_mesh);
@@ -389,6 +391,7 @@ impl Scene {
             cloud,
             cloud_top,
             moonwyrm,
+            star,
             river_log,
             total_voxels: total,
             blockers: std::sync::Arc::new(blockers),
@@ -459,15 +462,28 @@ impl Scene {
             let hover = match b.kind {
                 crate::bosses::BossKind::Drake => 0.4 + (b.anim * 0.5).sin() * 0.25,
                 // sunk to the water line, rising and settling as it breathes
-                crate::bosses::BossKind::Moonwyrm => -0.35 + (b.anim * 0.4).sin() * 0.15,
+                crate::bosses::BossKind::Moonwyrm => -0.2 + (b.anim * 0.4).sin() * 0.25,
                 crate::bosses::BossKind::Boar => 0.0,
             };
             let fwd = Vec3::new(b.yaw.cos(), 0.0, b.yaw.sin());
+            // aloft (the Moonwyrm's flights, wyrmflight.rs): grown to its
+            // full size, pitched along its climb and dive
+            let (aloft, pitch) = match b.flight {
+                Some(secs) => {
+                    let (_, dir, blend) = crate::wyrmflight::pose(b.home, secs);
+                    // the mesh is a climbing coil, head at the top: aloft it
+                    // leans forward into its flight, so the body streams out
+                    // behind the head instead of standing up like a spring
+                    (blend, (dir.y.clamp(-1.0, 1.0).asin() * 0.6 - 0.95) * blend)
+                }
+                None => (0.0, 0.0),
+            };
             // the Moonwyrm is the map's centrepiece: drawn half again as big
             // as its mesh, which keeps the voxels fine
-            let size = if b.kind == crate::bosses::BossKind::Moonwyrm { 1.7 } else { 1.0 };
-            let m = Mat4::from_translation(b.pos + fwd * lunge + Vec3::Y * (breathe + hover))
+            let size = if b.kind == crate::bosses::BossKind::Moonwyrm { 1.35 * (1.0 + (crate::wyrmflight::FLIGHT_SCALE - 1.0) * aloft) } else { 1.0 };
+            let m = Mat4::from_translation(b.pos + fwd * lunge + Vec3::Y * (breathe + hover * (1.0 - aloft)))
                 * Mat4::from_axis_angle(Vec3::Y, -b.yaw + std::f32::consts::FRAC_PI_2)
+                * Mat4::from_axis_angle(Vec3::X, -pitch)
                 * Mat4::from_scale(Vec3::splat((1.0 + breathe) * size));
             let glow = match b.kind {
                 crate::bosses::BossKind::Drake => 0.25,
@@ -475,6 +491,27 @@ impl Scene {
                 crate::bosses::BossKind::Boar => 0.0,
             };
             r.queue_draw(mesh, m, [1.0; 4], glow, vs, false);
+        }
+
+        // the Moonwyrm's stars: the ring it has ready, turning round it, and
+        // the ones it has thrown, spinning in flight
+        for b in game.bosses.list.iter().filter(|b| b.alive && b.kind == crate::bosses::BossKind::Moonwyrm) {
+            // aloft, the ring flies with it, round its middle
+            let centre = if b.flight.is_some() { b.pos - Vec3::Y * 6.0 } else { b.home };
+            for k in 0..b.stars as usize {
+                let p = crate::moonwell::orbit_star(centre, game.t, k, crate::moonwell::STARS as usize);
+                let m = Mat4::from_translation(p) * Mat4::from_axis_angle(Vec3::Y, game.t * 2.0 + k as f32) * Mat4::from_scale(Vec3::splat(1.0 + 0.15 * (game.t * 5.0 + k as f32).sin()));
+                r.queue_draw(self.star, m, [1.0; 4], 1.2, crate::skyprops::STAR_VOX, false);
+            }
+        }
+        // the stars it lets fall as it flies, dropping onto their marks
+        for s in &game.starfalls {
+            let m = Mat4::from_translation(s.pos()) * Mat4::from_axis_angle(Vec3::Y, game.t * 7.0) * Mat4::from_scale(Vec3::splat(2.0));
+            r.queue_draw(self.star, m, [1.0; 4], 2.0, crate::skyprops::STAR_VOX, false);
+        }
+        for s in &game.star_bolts {
+            let m = Mat4::from_translation(s.pos) * Mat4::from_axis_angle(s.vel.normalize_or_zero().cross(Vec3::Y).normalize_or(Vec3::X), game.t * 9.0) * Mat4::from_scale(Vec3::splat(1.3));
+            r.queue_draw(self.star, m, [1.0; 4], 1.6, crate::skyprops::STAR_VOX, false);
         }
 
         // heal trees: the crown frosts like the rest, the fruit glows —

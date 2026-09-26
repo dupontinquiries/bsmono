@@ -22,6 +22,9 @@ use std::cell::Cell;
 
 use glam::Vec3;
 
+/// When the sky map's overtime begins, match seconds (see [`MapId::overtime`]).
+pub const OVERTIME_AT: f32 = 18.0 * 60.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum MapId {
     /// The 5v5 jungle valley.
@@ -77,18 +80,52 @@ impl MapId {
     pub fn wave(self, n: u32) -> (usize, usize) {
         match self {
             MapId::Jungle | MapId::Pass => crate::minionai::wave_for(n),
-            // sixteen a side: thirty-two in each lane when the waves meet
-            MapId::Sky => (12, 4),
+            // thirty-two a side in each lane (sixty-four when the waves meet)
+            MapId::Sky => (24, 8),
         }
     }
     /// Towers and Elders are this much tougher than `TOWER_HP`/`TITAN_HP`.
-    /// The sky map's waves are four times the jungle's (sixteen a side):
-    /// at x1 a broken lane let one wave kill the Elder, and AI-only matches
-    /// ended at three minutes.
+    /// The sky map's waves are eight times the jungle's (32 a side): at x1
+    /// a broken lane let one wave kill the Elder (AI-only matches ended at
+    /// three minutes, with 16-a-side waves); at x3 with 32 a side, all
+    /// three stalled to the cap.
     pub fn structure_hp_mul(self) -> f32 {
         match self {
             MapId::Jungle | MapId::Pass => 1.0,
-            MapId::Sky => 3.0,
+            MapId::Sky => 2.0,
+        }
+    }
+    /// Minion damage to towers and Elders, on top of the usual x2.4. The sky
+    /// map's waves are eight times the jungle's; at x1 a wave that reached
+    /// an open Elder killed it in seconds (AI-only matches won at 2:13).
+    /// At 0.3 a sky wave hits a structure about twice as hard as a jungle
+    /// wave does, against twice the health.
+    pub fn minion_structure_mul(self) -> f32 {
+        match self {
+            MapId::Jungle | MapId::Pass => 1.0,
+            MapId::Sky => 0.3,
+        }
+    }
+    /// Siege surge: a team's minions in a lane hit and last this much
+    /// harder for each enemy tower already fallen in that lane. On the sky
+    /// map, 32-a-side waves otherwise cancel each other in the middle
+    /// forever: AI-only matches stalled at 30 min with two towers a side
+    /// standing (the super-minion answer, cut down). 0 elsewhere.
+    pub fn siege_surge(self) -> f32 {
+        match self {
+            MapId::Jungle | MapId::Pass => 0.0,
+            MapId::Sky => 0.4,
+        }
+    }
+    /// Overtime: every blow on a tower or Elder is multiplied by this at
+    /// match time `t`. On the sky map, 32-a-side waves and full-health
+    /// Elders let AI-only matches run to the 30-minute cap even with every
+    /// tower down (probe: Elders at 7290 and 2592 of 9200 at 30:00). From
+    /// `OVERTIME_AT` the multiplier climbs 12% a minute, to x4. 1 elsewhere.
+    pub fn overtime(self, t: f32) -> f32 {
+        match self {
+            MapId::Jungle | MapId::Pass => 1.0,
+            MapId::Sky => (1.0 + (t - OVERTIME_AT).max(0.0) / 60.0 * 0.12).min(4.0),
         }
     }
     /// A team's Elder is shielded while it has at least this many towers
@@ -265,8 +302,8 @@ mod tests {
         assert_eq!(active(), MapId::Jungle);
     }
 
-    /// The sky map: two lanes, four towers a side that take three times the
-    /// beating, an Elder that opens when two fall, and waves of sixteen.
+    /// The sky map: two lanes, four towers a side that take more of a
+    /// beating, an Elder that opens when two fall, and waves of 32 a side.
     #[test]
     fn the_sky_map_has_its_own_rules() {
         use crate::consts::{Lane, TITAN_HP, TOWER_HP};
@@ -275,15 +312,36 @@ mod tests {
             assert_eq!(lanes(), &[Lane::Top, Lane::Bot]);
             assert_eq!(g.towers.len(), 8);
             assert_eq!(g.tower_alive, [4, 4]);
-            assert!(g.towers.iter().all(|t| (t.max_hp - TOWER_HP * 3.0).abs() < 1e-3));
-            assert!((g.titans[0].hp - TITAN_HP * 3.0).abs() < 1e-3 && (g.titan_max_hp() - TITAN_HP * 3.0).abs() < 1e-3);
+            let mul = MapId::Sky.structure_hp_mul();
+            assert!(mul > 1.0);
+            assert!(g.towers.iter().all(|t| (t.max_hp - TOWER_HP * mul).abs() < 1e-3));
+            assert!((g.titans[0].hp - TITAN_HP * mul).abs() < 1e-3 && (g.titan_max_hp() - TITAN_HP * mul).abs() < 1e-3);
+            // the siege surge: none while every tower stands
+            assert_eq!(g.lane_surge(crate::consts::Team::Blue, Lane::Top), 1.0);
             let (m, c) = MapId::Sky.wave(0);
-            assert_eq!(m + c, 16, "sixteen a side: thirty-two in a lane");
+            assert_eq!(m + c, 32, "thirty-two a side in each lane");
             assert!(g.titan_shielded(crate::consts::Team::Blue));
         });
         let g = crate::sim::Game::new_teams(&[0], &[1]);
         assert_eq!((g.towers.len(), g.tower_alive), (12, [6, 6]), "the jungle is unchanged");
         assert!((g.titans[0].hp - crate::consts::TITAN_HP).abs() < 1e-3);
+    }
+
+    #[test]
+    fn overtime_weakens_structures_on_the_sky_only() {
+        use crate::sim::TargetRef;
+        let hit = |t: f32| {
+            let mut g = crate::sim::Game::new_teams(&[0], &[1]);
+            g.t = t;
+            let before = g.towers[0].hp;
+            g.deal_damage(TargetRef::Tower(0), 100.0, false, None, 0.0, 0.0);
+            before - g.towers[0].hp
+        };
+        let (early, late, very) = with(MapId::Sky, || (hit(60.0), hit(OVERTIME_AT + 300.0), hit(OVERTIME_AT + 3600.0)));
+        assert!((early - 100.0).abs() < 1e-3, "no overtime before {OVERTIME_AT}s: {early}");
+        assert!((late - 160.0).abs() < 1e-2, "five minutes in, x1.6: {late}");
+        assert!((very - 400.0).abs() < 1e-2, "capped at x4: {very}");
+        assert!((hit(OVERTIME_AT + 300.0) - 100.0).abs() < 1e-3, "the jungle has no overtime");
     }
 
     #[test]

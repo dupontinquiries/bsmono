@@ -127,6 +127,23 @@ pub struct Boss {
     pub target: Option<usize>,
     pub last_hit_team: Option<Team>,
     pub kills: u32,
+    /// The Moonwyrm's orbiting stars ready to throw (`moonwell::STARS`),
+    /// and seconds until the next one gathers / the next throw.
+    pub stars: u8,
+    pub star_regen_t: f32,
+    pub star_throw_t: f32,
+    /// The Moonwyrm aloft: seconds into its flight (`wyrmflight`); when
+    /// the next is due; seconds to its next falling star.
+    pub flight: Option<f32>,
+    pub next_flight_t: f32,
+    pub drop_t: f32,
+}
+
+impl Boss {
+    /// Up, and within reach: alive and not aloft (the Moonwyrm's flights).
+    pub fn grounded(&self) -> bool {
+        self.alive && self.flight.is_none()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -197,6 +214,12 @@ impl Bosses {
             target: None,
             last_hit_team: None,
             kills: 0,
+            stars: crate::moonwell::STARS,
+            star_regen_t: 0.0,
+            star_throw_t: 2.0,
+            flight: None,
+            next_flight_t: kind.first_spawn() + crate::wyrmflight::FIRST_FLIGHT,
+            drop_t: 0.0,
         };
         let mut list = vec![mk(BossKind::Boar, pits[0]), mk(BossKind::Drake, pits[1])];
         if crate::map::active() == crate::map::MapId::Sky {
@@ -235,10 +258,17 @@ impl Game {
                     b.pos = b.home;
                     b.target = None;
                     b.last_hit_team = None;
+                    b.stars = crate::moonwell::STARS;
+                    b.flight = None;
+                    b.next_flight_t = now + crate::wyrmflight::FIRST_FLIGHT;
                     let (kind, pos) = (b.kind, b.home);
                     self.events.push(Event::Announce { text: format!("{} has risen", kind.name()) });
                     self.events.push(Event::BossSpawn { kind, pos });
                 }
+                continue;
+            }
+            // the Moonwyrm aloft: no fighting, only flying (wyrmflight.rs)
+            if self.bosses.list[bi].kind == BossKind::Moonwyrm && self.wyrm_flight_tick(bi, dt) {
                 continue;
             }
 
@@ -413,7 +443,7 @@ impl Game {
 
     /// Called from `deal_damage` for `TargetRef::Boss`.
     pub fn boss_take_damage(&mut self, bi: usize, dmg: f32, source: Option<usize>) {
-        if !self.bosses.list[bi].alive {
+        if !self.bosses.list[bi].grounded() {
             return;
         }
         let now = self.t;
@@ -478,7 +508,7 @@ impl Game {
             .list
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.alive)
+            .filter(|(_, b)| b.grounded())
             .filter_map(|(i, b)| {
                 let engaged = b.last_hit_team == Some(team) && now - b.last_dmg_t < 6.0;
                 // the Moonwyrm is worth a long walk: the map's centrepiece

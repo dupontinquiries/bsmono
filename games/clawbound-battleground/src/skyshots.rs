@@ -97,8 +97,79 @@ pub fn run() -> Result<(), String> {
         shoot(&mut renderer, &game, &mut vfx, "sky_cometail.png", cam(at + Vec3::new(-3.0, 2.2, 4.5), at + Vec3::Y * 0.9, 0.8))?;
         game.gods[0].pos = keep;
     }
-    // the Moonwyrm in its well, from the rim
-    shoot(&mut renderer, &game, &mut vfx, "sky_wyrm.png", cam(Vec3::new(8.0, 7.0, 26.0), Vec3::new(0.0, 4.0, 0.0), 0.95))?;
+    // the Moonwyrm in its well, from the rim, its stars about it
+    shoot(&mut renderer, &game, &mut vfx, "sky_wyrm.png", cam(Vec3::new(10.0, 9.0, 40.0), Vec3::new(0.0, 10.0, 0.0), 0.95))?;
+    // ...and throwing them: a cat on the rim, a star or two in flight
+    {
+        let keep = (game.gods[0].pos, game.t, game.gods[0].hp);
+        let rim = Vec3::new(20.0, 0.0, 18.0);
+        game.gods[0].pos = rim;
+        let mut k = 0;
+        while (game.star_bolts.is_empty() || game.star_bolts.iter().all(|s| s.pos.distance(rim) < 6.0)) && k < 600 {
+            game.gods[0].pos = rim;
+            game.tick(1.0 / 60.0);
+            let ev: Vec<crate::sim::Event> = game.events.drain(..).collect();
+            vfx.update(1.0 / 60.0, &ev, &game);
+            k += 1;
+        }
+        for _ in 0..12 {
+            game.gods[0].pos = rim;
+            game.tick(1.0 / 60.0);
+            let ev: Vec<crate::sim::Event> = game.events.drain(..).collect();
+            vfx.update(1.0 / 60.0, &ev, &game);
+        }
+        shoot(&mut renderer, &game, &mut vfx, "sky_starthrow.png", cam(rim + Vec3::new(12.0, 6.0, 16.0), Vec3::new(4.0, 7.0, 4.0), 1.0))?;
+        game.gods[0].pos = keep.0;
+        game.gods[0].hp = keep.2;
+        game.star_bolts.clear();
+    }
+    // the Moonwyrm aloft (wyrmflight.rs): send it off a third of the way
+    // round its loop, let it fly a few seconds dropping stars, and look up
+    // at it; then wait for a star to land and look at the burst
+    {
+        let w = game.bosses.list.iter().position(|b| b.kind == crate::bosses::BossKind::Moonwyrm).ok_or("no wyrm")?;
+        let keep: Vec<f32> = game.gods.iter().map(|g| g.hp).collect();
+        let secs = crate::wyrmflight::FLIGHT_SECS * 0.3;
+        game.bosses.list[w].flight = Some(secs);
+        game.bosses.list[w].drop_t = 0.0;
+        let step = |game: &mut Game, vfx: &mut Vfx| -> Vec<crate::sim::Event> {
+            game.tick(1.0 / 60.0);
+            let ev: Vec<crate::sim::Event> = game.events.drain(..).collect();
+            vfx.update(1.0 / 60.0, &ev, game);
+            ev
+        };
+        for _ in 0..(5 * 60) {
+            step(&mut game, &mut vfx);
+        }
+        let b = &game.bosses.list[w];
+        let (p, dir, _) = crate::wyrmflight::pose(b.home, b.flight.unwrap_or(secs));
+        let side = Vec3::new(-dir.z, 0.0, dir.x).normalize_or_zero();
+        let ground = Vec3::new(p.x, 0.0, p.z);
+        shoot(&mut renderer, &game, &mut vfx, "sky_wyrmflight.png", cam(ground + side * 70.0 - dir * 25.0 + Vec3::Y * 12.0, p.lerp(ground, 0.35), 1.15))?;
+        let mut hit = None;
+        for _ in 0..(6 * 60) {
+            let ev = step(&mut game, &mut vfx);
+            if let Some(at) = ev.iter().find_map(|e| if let crate::sim::Event::StarfallFx { at, .. } = e { Some(*at) } else { None }) {
+                hit = Some(at);
+                break;
+            }
+        }
+        if let Some(at) = hit {
+            for _ in 0..5 {
+                step(&mut game, &mut vfx);
+            }
+            let wp = game.bosses.list[w].pos;
+            let away = Vec3::new(at.x - wp.x, 0.0, at.z - wp.z).normalize_or(Vec3::X);
+            shoot(&mut renderer, &game, &mut vfx, "sky_starfall.png", cam(at + away * 28.0 + Vec3::Y * 10.0, at + Vec3::Y * 6.0, 1.1))?;
+        }
+        let b = &mut game.bosses.list[w];
+        b.flight = None;
+        b.pos = b.home;
+        game.starfalls.clear();
+        for (g, hp) in game.gods.iter_mut().zip(keep) {
+            g.hp = hp.max(g.hp);
+        }
+    }
     // a ferry mid-crossing with a cat aboard: run the clock until the first
     // cloud is halfway over, and put the player's cat on it
     {
@@ -141,6 +212,6 @@ pub fn run() -> Result<(), String> {
     let ms: Vec<Vec3> = game.minions.iter().map(|m| m.pos).collect();
     let clash = ms.iter().copied().max_by_key(|p| ms.iter().filter(|q| (**q - *p).length() < 12.0).count()).unwrap_or(Vec3::ZERO);
     let out = Vec3::new(clash.x, 0.0, clash.z).normalize_or(Vec3::Z);
-    shoot(&mut renderer, &game, &mut vfx, "sky_clash.png", cam(clash - out * 26.0 + Vec3::Y * 16.0, clash, 1.0))?;
+    shoot(&mut renderer, &game, &mut vfx, "sky_clash.png", cam(clash - out * 34.0 + Vec3::Y * 30.0, clash, 1.0))?;
     Ok(())
 }

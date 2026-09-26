@@ -61,6 +61,8 @@ pub enum Event {
     PullFx { pos: Vec3, radius: f32, color: [f32; 3] },
     HealFx { pos: Vec3, radius: f32 },
     NovaFx { pos: Vec3, radius: f32, color: [f32; 3] },
+    /// A star the flying Moonwyrm let fall has landed (`wyrmflight`).
+    StarfallFx { at: Vec3, radius: f32 },
     StormFx { pos: Vec3, radius: f32, color: [f32; 3], dur: f32 },
     TowerDown { pos: Vec3, team: Team },
     TitanVulnerable { team: Team },
@@ -282,6 +284,10 @@ pub struct Minion {
     pub foe: Option<crate::minionai::Foe>,
     pub think_t: f32,
     pub left_at: Option<Vec3>,
+    /// Its place across the lane, u from the centre-line: a wave keeps its
+    /// ranks down the lane instead of threading onto one line of
+    /// waypoints (thirty-two a side on the sky map became a single file).
+    pub lane_off: f32,
 }
 
 pub struct Tower {
@@ -389,6 +395,10 @@ pub struct Game {
     pub plans_this_tick: u32,
     /// Each side's page of the playbook (`playbook`), indexed by team.
     pub styles: [crate::playbook::Page; 2],
+    /// Stars the Moonwyrm has thrown, in flight (`moonwell`).
+    pub star_bolts: Vec<crate::moonwell::StarBolt>,
+    /// Stars the flying Moonwyrm let fall, on their way down (`wyrmflight`).
+    pub starfalls: Vec<crate::wyrmflight::Starfall>,
     /// The sky map's cloud ferries (`ferry`); empty elsewhere.
     pub ferries: Vec<crate::ferry::Ferry>,
     /// Minion ids handed out so far, and waves spawned (`minionai::wave_for`).
@@ -566,6 +576,8 @@ impl Game {
             styles: [crate::playbook::even_keel(), crate::playbook::even_keel()],
             calls: [None, None],
             ferries: crate::ferry::for_map(),
+            star_bolts: Vec::new(),
+            starfalls: Vec::new(),
             next_minion_id: 0,
             waves: 0,
         };
@@ -802,6 +814,10 @@ impl Game {
                 }
             }
         }
+        // overtime (the sky map): structures give way as the match runs long
+        if matches!(target, TargetRef::Tower(_) | TargetRef::Titan(_)) {
+            dmg *= crate::map::active().overtime(self.t);
+        }
         match target {
             TargetRef::Boss(bi) => {
                 self.boss_take_damage(bi, dmg, source);
@@ -956,7 +972,9 @@ impl Game {
         {
             let g = &mut self.gods[gi];
             g.deaths += 1;
-            g.respawn_t = respawn_time(g.level);
+            // overtime (the sky map) stretches the wait too: a won fight then
+            // opens the base long enough for a wave to reach the Elder
+            g.respawn_t = respawn_time(g.level) * crate::map::active().overtime(self.t).min(2.0);
             g.hp = 0.0;
             g.shield = 0.0;
             g.dash = None;
