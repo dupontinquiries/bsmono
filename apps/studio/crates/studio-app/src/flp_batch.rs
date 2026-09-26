@@ -189,6 +189,7 @@ pub fn convert_package(zip_path: &Path, out_root: &Path, o: &Options) -> Outcome
     let mut out = Outcome { package: name.clone(), status: Status::Pass, seconds: 0.0, tracks: 0, clips: 0, sources: 0, busses: 0,
                             song_seconds: 0.0, folder: folder.clone(), media_new: 0, media_reused: 0 };
     let (mut media_new, mut media_reused) = (0u64, 0u64);
+    let mut media_warns: Vec<String> = Vec::new();
     let r = (|| -> Result<Vec<String>, String> {
         let f = std::fs::File::open(zip_path).map_err(|e| format!("cannot open: {e}"))?;
         let mut z = zip::ZipArchive::new(f).map_err(|e| format!("not a readable zip: {e}"))?;
@@ -230,11 +231,24 @@ pub fn convert_package(zip_path: &Path, out_root: &Path, o: &Options) -> Outcome
                     let tmp = home.with_extension("src.tmp");
                     std::fs::write(&tmp, &bytes).map_err(|x| format!("{base}: {x}"))?;
                     let kb = format!("{}k", if o.kbps == 0 { 48 } else { o.kbps });
-                    let ok = std::process::Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-y", "-i"]).arg(&tmp)
-                        .args(["-c:a", "libopus", "-b:a", &kb]).arg(&home)
-                        .status().map(|s| s.success()).unwrap_or(false);
+                    let run = std::process::Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-y", "-i"]).arg(&tmp)
+                        .args(["-c:a", "libopus", "-b:a", &kb]).arg(&home).output();
                     let _ = std::fs::remove_file(&tmp);
-                    if !ok { return Err(format!("{base}: ffmpeg could not convert it (is ffmpeg installed?)")); }
+                    match run {
+                        Err(e) => return Err(format!("ffmpeg could not be run ({e}) -- is it installed?")),
+                        Ok(o) if !o.status.success() => {
+                            // ONE unreadable file is a WARNING, not a failed package
+                            // (pianovibes' "DL Groover.wav" is Ogg Vorbis inside a WAV
+                            // -- format 0x674F -- which ffmpeg cannot open): kept as it
+                            // is, under its own name, and said
+                            let _ = std::fs::remove_file(&home);
+                            std::fs::write(folder.join(&base), &bytes).map_err(|x| format!("{base}: {x}"))?;
+                            let why = String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or("").to_string();
+                            media_warns.push(format!("{base}: could not convert ({why}); kept as is -- it will not play"));
+                            continue;
+                        }
+                        Ok(_) => {}
+                    }
                 } else {
                     std::fs::write(&home, &bytes).map_err(|x| format!("{base}: {x}"))?;
                 }
@@ -250,7 +264,7 @@ pub fn convert_package(zip_path: &Path, out_root: &Path, o: &Options) -> Outcome
                 }
             }
         }
-        let mut warns = Vec::new();
+        let mut warns = std::mem::take(&mut media_warns);
         if flps.is_empty() { return Err("no .flp in the package".into()); }
         if flps.len() > 1 { warns.push(format!("{} .flp files; converted the largest", flps.len())); }
         flps.sort_by_key(|(_, b)| std::cmp::Reverse(b.len()));
