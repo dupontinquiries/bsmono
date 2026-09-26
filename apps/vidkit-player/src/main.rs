@@ -1831,7 +1831,17 @@ fn file_opener(p: PathBuf) -> playback::Opener {
         let pr = probed(&cache, || decode::probe(&p))?;
         let accel = decode::accel_for(&pr.codec);
         #[cfg(feature = "libav")]
-        let inproc = v4l2src::open(&p.to_string_lossy(), &[], &pr, from).or_else(|| inproc::open(&p, &pr, from, &accel));
+        let inproc = match v4l2src::open(&p.to_string_lossy(), &[], &pr, from) {
+            // A decoder that opens but gives nothing falls back to the
+            // other paths instead of ending the film.
+            Some(v) => {
+                let (p2, pr2, accel2) = (p.clone(), pr.clone(), accel.clone());
+                Some(Box::new(decode::FallbackSource::new(v, Box::new(move || {
+                    inproc::open(&p2, &pr2, from, &accel2).or_else(|| decode::FfmpegFrames::open_probed(&decode::VideoInput::file(&p2), &pr2, Some(decode::decode_cap()), from, accel2).ok().map(|f| Box::new(f) as Box<dyn decode::VideoSource>))
+                }))) as Box<dyn decode::VideoSource>)
+            }
+            None => inproc::open(&p, &pr, from, &accel),
+        };
         #[cfg(not(feature = "libav"))]
         let inproc: Option<Box<dyn decode::VideoSource>> = None;
         let v: Box<dyn decode::VideoSource> = match inproc {
@@ -1851,7 +1861,15 @@ fn stream_opener(input: decode::StreamingInput, _format_cap: Option<u32>) -> pla
         let pr = probed(&cache, || decode::probe_input(&input.video_url, &input.headers))?;
         let accel = decode::accel_for(&pr.codec);
         #[cfg(feature = "libav")]
-        let inproc = v4l2src::open(&input.video_url, &input.headers, &pr, from).or_else(|| inproc::open_input(&input.video_url, &input.headers, &pr, from, &accel));
+        let inproc = match v4l2src::open(&input.video_url, &input.headers, &pr, from) {
+            Some(v) => {
+                let (i2, pr2, accel2) = (input.clone(), pr.clone(), accel.clone());
+                Some(Box::new(decode::FallbackSource::new(v, Box::new(move || {
+                    inproc::open_input(&i2.video_url, &i2.headers, &pr2, from, &accel2).or_else(|| decode::FfmpegFrames::open_probed(&decode::VideoInput::url(&i2.video_url, &i2.headers), &pr2, Some(decode::decode_cap()), from, accel2).ok().map(|f| Box::new(f) as Box<dyn decode::VideoSource>))
+                }))) as Box<dyn decode::VideoSource>)
+            }
+            None => inproc::open_input(&input.video_url, &input.headers, &pr, from, &accel),
+        };
         #[cfg(not(feature = "libav"))]
         let inproc: Option<Box<dyn decode::VideoSource>> = None;
         let v: Box<dyn decode::VideoSource> = match inproc {

@@ -867,6 +867,60 @@ pub trait VideoSource: Send {
     fn take_note(&mut self) -> Option<String>;
 }
 
+/// A source that hands over to another if it ends before its first frame:
+/// a hardware path that opened but cannot decode this stream (a pixel
+/// format it will not give, a profile it refuses) falls back instead of
+/// playing nothing. The fallback is opened only when needed.
+pub struct FallbackSource {
+    current: Box<dyn VideoSource>,
+    fallback: Option<Box<dyn FnOnce() -> Option<Box<dyn VideoSource>> + Send>>,
+    got_frame: bool,
+    note: Option<String>,
+}
+
+impl FallbackSource {
+    pub fn new(primary: Box<dyn VideoSource>, fallback: Box<dyn FnOnce() -> Option<Box<dyn VideoSource>> + Send>) -> Self {
+        Self { current: primary, fallback: Some(fallback), got_frame: false, note: None }
+    }
+}
+
+impl VideoSource for FallbackSource {
+    fn next_frame(&mut self) -> Option<Frame> {
+        loop {
+            if let Some(f) = self.current.next_frame() {
+                self.got_frame = true;
+                return Some(f);
+            }
+            if self.got_frame {
+                return None;
+            }
+            let fb = self.fallback.take()?;
+            let why = self.current.take_note().unwrap_or_else(|| "no frames".into());
+            let was = self.current.label();
+            self.current = fb()?;
+            self.note = Some(format!("{was} failed ({why}); now {}", self.current.label()));
+        }
+    }
+    fn frame_interval(&self) -> Duration {
+        self.current.frame_interval()
+    }
+    fn hdr_peak(&self) -> Option<f32> {
+        self.current.hdr_peak()
+    }
+    fn set_pool(&mut self, pool: Arc<PlanePool>) {
+        self.current.set_pool(pool)
+    }
+    fn label(&self) -> String {
+        self.current.label()
+    }
+    fn frame_bytes(&self) -> usize {
+        self.current.frame_bytes()
+    }
+    fn take_note(&mut self) -> Option<String> {
+        self.note.take().or_else(|| self.current.take_note())
+    }
+}
+
 impl VideoSource for FfmpegFrames {
     fn next_frame(&mut self) -> Option<Frame> {
         FfmpegFrames::next_frame(self)
@@ -1577,6 +1631,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    struct Fake {
+        n: u32,
+        name: &'static str,
+        note: Option<String>,
+    }
+    impl VideoSource for Fake {
+        fn next_frame(&mut self) -> Option<Frame> {
+            (self.n > 0).then(|| {
+                self.n -= 1;
+                crate::pattern::bars(0.0)
+            })
+        }
+        fn frame_interval(&self) -> Duration { Duration::from_millis(40) }
+        fn hdr_peak(&self) -> Option<f32> { None }
+        fn set_pool(&mut self, _: Arc<PlanePool>) {}
+        fn label(&self) -> String { self.name.into() }
+        fn frame_bytes(&self) -> usize { 0 }
+        fn take_note(&mut self) -> Option<String> { self.note.take() }
+    }
+
+    /// A hardware path that opens but gives nothing hands over; one that
+    /// played and ended does not (that is the end of the film).
+    #[test]
+    fn a_source_that_gives_nothing_falls_back_once() {
+        let mut s = FallbackSource::new(Box::new(Fake { n: 0, name: "V4L2", note: Some("pixel format QC08C".into()) }), Box::new(|| Some(Box::new(Fake { n: 3, name: "libav", note: None }) as Box<dyn VideoSource>)));
+        let mut n = 0;
+        while s.next_frame().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 3);
+        let note = s.take_note().unwrap();
+        assert!(note.contains("V4L2 failed (pixel format QC08C); now libav"), "{note}");
+        let mut t = FallbackSource::new(Box::new(Fake { n: 2, name: "V4L2", note: None }), Box::new(|| panic!("must not fall back after frames")));
+        assert!(t.next_frame().is_some() && t.next_frame().is_some() && t.next_frame().is_none());
+    }
+
     /// `30000/1001` is 29.97 and `30/1` is 30. A parser that splits on `/` and
     /// takes the first number gets 30000 fps and every frame is due
     /// immediately.
@@ -1833,6 +1923,7 @@ mod tests {
 /// Video and audio arrive as separate URLs. ffmpeg takes both as inputs and
 /// maps one stream from each — the same muxing yt-dlp would have done, done
 /// while playing instead of before it.
+#[derive(Clone)]
 pub struct StreamingInput {
     pub video_url: String,
     /// Separate audio, when the site serves it that way.

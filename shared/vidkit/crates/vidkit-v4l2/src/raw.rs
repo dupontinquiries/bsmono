@@ -76,6 +76,11 @@ pub const VIDIOC_STREAMON: u32 = iow(18, sz!(i32));
 pub const VIDIOC_STREAMOFF: u32 = iow(19, sz!(i32));
 pub const VIDIOC_G_CTRL: u32 = iowr(27, sz!(v4l2_control));
 pub const VIDIOC_ENUM_FRAMESIZES: u32 = iowr(74, sz!(v4l2_frmsizeenum));
+pub const VIDIOC_G_SELECTION: u32 = iowr(94, sz!(v4l2_selection));
+/// The visible picture inside the (padded) decoded buffer.
+pub const V4L2_SEL_TGT_COMPOSE: u32 = 0x0100;
+/// Selection takes the single-planar buffer type even for mplane queues.
+pub const V4L2_BUF_TYPE_VIDEO_CAPTURE: u32 = 1;
 pub const VIDIOC_DQEVENT: u32 = ior(89, sz!(v4l2_event));
 pub const VIDIOC_SUBSCRIBE_EVENT: u32 = iow(90, sz!(v4l2_event_subscription));
 pub const VIDIOC_DECODER_CMD: u32 = iowr(96, sz!(v4l2_decoder_cmd));
@@ -412,6 +417,25 @@ impl v4l2_decoder_cmd {
 
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
+pub struct v4l2_rect {
+    pub left: i32,
+    pub top: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct v4l2_selection {
+    pub type_: u32,
+    pub target: u32,
+    pub flags: u32,
+    pub r: v4l2_rect,
+    pub reserved: [u32; 9],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
 pub struct v4l2_control {
     pub id: u32,
     pub value: i32,
@@ -429,6 +453,9 @@ mod layout {
     fn struct_sizes_match_the_kernel_header() {
         assert_eq!(size_of::<v4l2_requestbuffers>(), 20);
         assert_eq!(size_of::<v4l2_plane>(), 64);
+        // gcc against linux/videodev2.h: 64, VIDIOC_G_SELECTION 0xc040565e.
+        assert_eq!(size_of::<v4l2_selection>(), 64);
+        assert_eq!(VIDIOC_G_SELECTION, 0xc040_565e);
         assert_eq!(size_of::<v4l2_buffer>(), 88);
         assert_eq!(size_of::<v4l2_format>(), 208);
         assert_eq!(size_of::<v4l2_pix_format_mplane>(), 192);
