@@ -21,7 +21,9 @@ what else is known-but-unresolved.
 ## Features
 
 - **5v5, three lanes** — TOP / MID / BOT with waypoint pathing, per-lane minion
-  waves (melee + casters), 12 towers, two Elders gated behind tower kills.
+  waves of four (five every third: 3 melee + 1–2 casters) that hold targets,
+  answer a hit on their cats, and chase within a leash; 12 towers, two Elders
+  gated behind tower kills.
 - **13 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
   Windclaw, Faryowl, Oldroar, Twofang, Suneye, Snowhush, Riptail, Stillsmoke,
   Stonewhisper — across 5 roles (Warrior / Guardian / Mage / Hunter / Assassin).
