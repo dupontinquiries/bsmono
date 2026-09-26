@@ -987,6 +987,7 @@ impl eframe::App for Player {
         self.follow_display(ctx);
         self.follow_visibility(ctx);
         self.follow_power();
+        self.follow_fps_cap();
         self.measure_refresh();
         self.watch_pinned_drops();
 
@@ -1940,7 +1941,7 @@ fn file_opener(p: PathBuf) -> playback::Opener {
             None => Box::new(decode::FfmpegFrames::open_probed(&decode::VideoInput::file(&p), &pr, Some(decode::decode_cap()), from, accel)?),
         };
         let a = decode::AudioStream::open(&p.to_string_lossy(), 48_000, 2, from, speed).ok();
-        Ok((v, a))
+        Ok((Box::new(decode::RateCapped::new(v)) as Box<dyn decode::VideoSource>, a))
     })
 }
 
@@ -1976,7 +1977,7 @@ fn stream_opener(input: decode::StreamingInput, _format_cap: Option<u32>) -> pla
             )?),
         };
         let a = decode::AudioStream::open_streaming(&input, 48_000, 2, from, speed).ok();
-        Ok((v, a))
+        Ok((Box::new(decode::RateCapped::new(v)) as Box<dyn decode::VideoSource>, a))
     })
 }
 
@@ -2663,6 +2664,26 @@ impl Player {
 
 impl Player {
     /// Re-read the power supply every 30 s and apply what changed.
+    /// The frame-rate cap: the viewer's (Settings > fps) under the battery
+    /// policy's. A change reopens the decoder at the current position,
+    /// since whether it skips non-reference frames is fixed at open.
+    fn follow_fps_cap(&mut self) {
+        // VIDKIT_FPS_CAP=N overrides the setting (profiling runs).
+        let setting = std::env::var("VIDKIT_FPS_CAP").ok().and_then(|v| v.parse().ok()).or(self.settings.fps_cap.hz());
+        let cap = match (setting, self.energy.max_fps) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if cap == decode::fps_cap() {
+            return;
+        }
+        decode::set_fps_cap(cap);
+        if self.engine.is_some() {
+            let at = self.transport.position;
+            self.seek_to(at);
+        }
+    }
+
     fn follow_power(&mut self) {
         if self.energy_read.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
             return;

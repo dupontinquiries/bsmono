@@ -867,6 +867,92 @@ pub trait VideoSource: Send {
     fn take_note(&mut self) -> Option<String>;
 }
 
+static FPS_CAP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The frame rate to show at most (the viewer's cap, or the battery
+/// policy's); `None`: every frame. Read per frame by [`RateCapped`], and at
+/// open by decoders that can skip work for it.
+pub fn set_fps_cap(cap: Option<u32>) {
+    FPS_CAP.store(cap.unwrap_or(0), Ordering::Relaxed);
+}
+
+pub fn fps_cap() -> Option<u32> {
+    Some(FPS_CAP.load(Ordering::Relaxed)).filter(|&c| c > 0)
+}
+
+/// Whether a frame at `pts` is shown under `cap`, the last shown being at
+/// `last`. A tenth of an interval of slack, so 60 -> 30 keeps every other
+/// frame rather than drifting to every third on timestamp rounding. Pure.
+pub fn keep_frame(pts: Duration, last: Option<Duration>, cap: Option<u32>) -> bool {
+    match (cap, last) {
+        (Some(c), Some(l)) if pts > l => (pts - l).as_secs_f64() >= 0.9 / c as f64,
+        _ => true,
+    }
+}
+
+/// Frames above the cap never reach the queue: no upload, no conversion,
+/// no composite, no wakeup for them. (Decoding them is the decoder's
+/// business: in process, AV1 skips non-reference frames outright.)
+pub struct RateCapped {
+    inner: Box<dyn VideoSource>,
+    pool: Option<Arc<PlanePool>>,
+    last: Option<Duration>,
+    pub skipped: u64,
+}
+
+impl RateCapped {
+    pub fn new(inner: Box<dyn VideoSource>) -> Self {
+        Self { inner, pool: None, last: None, skipped: 0 }
+    }
+}
+
+impl VideoSource for RateCapped {
+    fn next_frame(&mut self) -> Option<Frame> {
+        loop {
+            let f = self.inner.next_frame()?;
+            // A seek or a loop goes backwards: start over.
+            if self.last.is_some_and(|l| f.pts < l) {
+                self.last = None;
+            }
+            if keep_frame(f.pts, self.last, fps_cap()) {
+                self.last = Some(f.pts);
+                return Some(f);
+            }
+            self.skipped += 1;
+            match &self.pool {
+                Some(p) => p.recycle(f),
+                None => drop(f),
+            }
+        }
+    }
+    fn frame_interval(&self) -> Duration {
+        let i = self.inner.frame_interval();
+        match fps_cap() {
+            Some(c) => i.max(Duration::from_secs_f64(1.0 / c as f64)),
+            None => i,
+        }
+    }
+    fn hdr_peak(&self) -> Option<f32> {
+        self.inner.hdr_peak()
+    }
+    fn set_pool(&mut self, pool: Arc<PlanePool>) {
+        self.pool = Some(pool.clone());
+        self.inner.set_pool(pool)
+    }
+    fn label(&self) -> String {
+        match fps_cap() {
+            Some(c) => format!("{} @≤{c} fps", self.inner.label()),
+            None => self.inner.label(),
+        }
+    }
+    fn frame_bytes(&self) -> usize {
+        self.inner.frame_bytes()
+    }
+    fn take_note(&mut self) -> Option<String> {
+        self.inner.take_note()
+    }
+}
+
 /// A source that hands over to another if it ends before its first frame:
 /// a hardware path that opened but cannot decode this stream (a pixel
 /// format it will not give, a profile it refuses) falls back instead of
@@ -1649,6 +1735,25 @@ mod tests {
         fn label(&self) -> String { self.name.into() }
         fn frame_bytes(&self) -> usize { 0 }
         fn take_note(&mut self) -> Option<String> { self.note.take() }
+    }
+
+    #[test]
+    fn a_cap_keeps_every_other_frame_of_sixty() {
+        let ms = |n: u64| Duration::from_micros(n * 16_667);
+        let mut last = None;
+        let mut kept = 0;
+        for k in 0..60 {
+            if keep_frame(ms(k), last, Some(30)) {
+                last = Some(ms(k));
+                kept += 1;
+            }
+        }
+        assert_eq!(kept, 30);
+        assert!(keep_frame(ms(1), Some(ms(0)), None), "no cap, every frame");
+        assert!(keep_frame(ms(0), Some(ms(5)), Some(30)), "backwards (a seek) is shown");
+        // 24 fps content under a 30 cap: nothing dropped.
+        let f24 = |n: u64| Duration::from_micros(n * 41_667);
+        assert!((1..48).all(|k| keep_frame(f24(k), Some(f24(k - 1)), Some(30))));
     }
 
     /// A hardware path that opens but gives nothing hands over; one that

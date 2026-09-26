@@ -31,6 +31,71 @@ pub struct LibavSource {
     /// a machine with no hardware decoder (llvmpipe and weston's GL
     /// renderer map memfds). A test knob: it adds a copy.
     emulate_dmabuf: Option<EmuRing>,
+    /// Thread learning: decoder threads in use, wall time spent inside
+    /// next_frame (the decoder being the bottleneck), video time covered.
+    threads: u32,
+    busy: Duration,
+    span: (Option<Duration>, Duration),
+    key: String,
+}
+
+/// Decoder threads that keep up with room to spare, from a run at
+/// `used` threads that was busy `busy` of `video` seconds. Pure.
+///
+/// Frame threads cost CPU of their own -- synchronisation, a frame in
+/// flight each, colder caches. Measured here (2 cores): 2 threads over 1
+/// cost +13% CPU on 1080p60 AV1 and +8% on 4K60 VP9 for the same frames.
+/// libavcodec's default is one per core, 12 on an M2 Max, whatever the
+/// stream needs. Target: the decoder busy 60% of real time. Under 5 s of
+/// video says too little; keep what was used.
+pub fn recommend_threads(used: u32, busy: f64, video: f64, cores: u32) -> u32 {
+    if video < 5.0 || used == 0 {
+        return used;
+    }
+    let u = busy / video;
+    ((used as f64 * u / 0.6 - 1e-9).ceil() as u32).clamp(1, cores.max(1))
+}
+
+fn threads_cache() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .map(|d| d.join("vidkit/decode-threads"))
+}
+
+/// The learned thread count for a kind of stream (codec, size, rate).
+pub fn learned_threads(key: &str) -> Option<u32> {
+    let text = std::fs::read_to_string(threads_cache()?).ok()?;
+    text.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('=')?.trim().parse().ok())
+}
+
+fn learn_threads(key: &str, n: u32) {
+    let Some(path) = threads_cache() else { return };
+    let mut lines: Vec<String> = std::fs::read_to_string(&path).unwrap_or_default().lines().filter(|l| !l.starts_with(&format!("{key}="))).map(str::to_string).collect();
+    lines.push(format!("{key}={n}"));
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(&path, lines.join("\n") + "\n");
+}
+
+/// The kind of stream, for learning: codec, height to the nearest 360
+/// lines, frame rate to the nearest 10. Pure.
+pub fn stream_key(codec: &str, height: u32, fps: f64) -> String {
+    format!("{codec}:{}p:{}fps", (height as f64 / 360.0).round() as u32 * 360, (fps / 10.0).round() as u32 * 10)
+}
+
+impl Drop for LibavSource {
+    fn drop(&mut self) {
+        let (Some(first), last) = self.span else { return };
+        let video = last.saturating_sub(first).as_secs_f64();
+        let cores = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
+        let n = recommend_threads(self.threads, self.busy.as_secs_f64(), video, cores);
+        if n != self.threads && video >= 5.0 {
+            eprintln!("vidkit: {}: {} decoder threads were busy {:.0}% of real time; next time {n}", self.key, self.threads, self.busy.as_secs_f64() / video * 100.0);
+            learn_threads(&self.key, n);
+        }
+    }
 }
 
 /// The emulated decoder's buffer pool: a ring of memfds, reused like a
@@ -88,12 +153,27 @@ pub fn open_input(input: &str, headers: &[(String, String)], p: &Probe, from: Du
     if p.width.max(p.height) > decode::texture_limit() {
         return None;
     }
-    let threads = decode::decode_cpus().map(|c| c.len() as u32).unwrap_or(0);
+    // Pinned: one per pinned core. Otherwise what this kind of stream was
+    // learned to need, else one per core (libavcodec's default) for the
+    // first run to learn from.
+    let key = stream_key(&p.codec, p.height, p.fps);
+    let cores = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
+    let threads = match (decode::decode_cpus(), hw == Hw::Software) {
+        (Some(c), _) => c.len() as u32,
+        (None, true) => learned_threads(&key).unwrap_or(cores).min(cores),
+        (None, false) => 0,
+    };
     // AV1 grain for the GPU, as the ffmpeg path does with its feed -- here
     // the decoder hands the parameters over itself.
     let export_grain = gpu && hw == Hw::Software && p.codec == "av1" && !p.high_bit_depth() && std::env::var("VIDKIT_GRAIN_CPU").as_deref() != Ok("1");
     let input_options = if network { stream_options(headers) } else { Vec::new() };
-    let opts = Options { hw: hw.clone(), from, threads, export_grain, input_options };
+    // Showing at most `cap` fps of a stream with more than half again as
+    // many: frames nothing references are frames nobody will see -- don't
+    // decode them. Drift-free (no reference changes). Measured, SVT-AV1
+    // 1080p60 (mini-GOP 16): half the frames skipped, -41..46% decode CPU.
+    // YouTube's libvpx VP9 has no non-reference frames: no effect there.
+    let skip_nonref = decode::fps_cap().is_some_and(|c| (c as f64) * 1.5 < p.fps);
+    let opts = Options { hw: hw.clone(), from, threads, export_grain, input_options, skip_nonref, codec_options: Vec::new() };
     // libavcodec's worker threads are created in open and inherit the
     // opening thread's affinity: pin this thread around it, as the ffmpeg
     // child was pinned, and put it back.
@@ -114,6 +194,10 @@ pub fn open_input(input: &str, headers: &[(String, String)], p: &Probe, from: Du
             note: None,
             failed: false,
             emulate_dmabuf: (std::env::var("VIDKIT_DMABUF_EMULATE").as_deref() == Ok("1")).then(EmuRing::default),
+            threads,
+            busy: Duration::ZERO,
+            span: (None, Duration::ZERO),
+            key,
         })),
         Err(e) => {
             eprintln!("vidkit: in-process decode unavailable ({e}); using ffmpeg");
@@ -148,9 +232,13 @@ impl VideoSource for LibavSource {
             return None;
         }
         let pool = self.pool.clone();
-        match self.dec.next_frame(&mut |n| pool.take(n)) {
+        let t0 = std::time::Instant::now();
+        let r = self.dec.next_frame(&mut |n| pool.take(n));
+        self.busy += t0.elapsed();
+        match r {
             Ok(Some(mut f)) => {
                 f.color = self.color;
+                self.span = (self.span.0.or(Some(f.pts)), f.pts);
                 if let Some(ring) = self.emulate_dmabuf.as_mut() {
                     f = emulate_dmabuf(f, ring);
                 }
@@ -394,5 +482,16 @@ mod tests {
         assert_eq!(got.len(), want.len(), "frame count after the seek");
         assert!(got == want, "stream pictures differ from the file's");
         assert!(ranged.load(std::sync::atomic::Ordering::SeqCst) > 0, "the seek was a range request, not a read from the start");
+    }
+
+    #[test]
+    fn threads_follow_how_busy_the_decoder_was() {
+        assert_eq!(recommend_threads(12, 1.0, 10.0, 12), 2, "12 threads busy 10%: 2 do it at 60%");
+        assert_eq!(recommend_threads(2, 9.5, 10.0, 12), 4, "saturated: more");
+        assert_eq!(recommend_threads(1, 0.5, 10.0, 12), 1, "never below one");
+        assert_eq!(recommend_threads(4, 1.0, 3.0, 12), 4, "too little video to judge");
+        assert_eq!(recommend_threads(2, 9.9, 10.0, 2), 2, "never past the cores");
+        assert_eq!(stream_key("vp9", 2160, 59.94), "vp9:2160p:60fps");
+        assert_eq!(stream_key("av1", 1080, 30.0), "av1:1080p:30fps");
     }
 }

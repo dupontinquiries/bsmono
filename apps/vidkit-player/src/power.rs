@@ -79,6 +79,10 @@ pub struct EnergyPolicy {
     pub sw_budget: f32,
     /// Run software decode on the efficiency cores (big.LITTLE machines).
     pub efficiency_cores: bool,
+    /// Show at most this many frames a second. Only when the battery is
+    /// nearly flat: 60 fps content at 30 skips half the decode (AV1) and
+    /// half of everything after it -- the last big lever before stopping.
+    pub max_fps: Option<u32>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -93,7 +97,7 @@ pub fn policy(p: PowerState) -> EnergyPolicy {
         // Ahead, even on mains: transcribing a whole video at once is what
         // heated a laptop (reported: base model, plugged in). "All" in the
         // Sections panel builds the full chapter list when it is wanted.
-        return EnergyPolicy { keep_download: true, transcribe_ahead: Some(Duration::from_secs(600)), analysis: true, enhance: Enhancement::Full, sw_budget: 1.0, efficiency_cores: false };
+        return EnergyPolicy { keep_download: true, transcribe_ahead: Some(Duration::from_secs(600)), analysis: true, enhance: Enhancement::Full, sw_budget: 1.0, efficiency_cores: false, max_fps: None };
     }
     let pct = p.percent.unwrap_or(50);
     let (ahead, enhance, sw_budget) = match pct {
@@ -101,7 +105,8 @@ pub fn policy(p: PowerState) -> EnergyPolicy {
         20..=50 => (Duration::from_secs(300), Enhancement::SharpenOnly, 0.25),
         _ => (Duration::ZERO, Enhancement::Off, 1.0 / 16.0),
     };
-    EnergyPolicy { keep_download: false, transcribe_ahead: Some(ahead), analysis: false, enhance, sw_budget, efficiency_cores: true }
+    let max_fps = (pct < 20).then_some(30);
+    EnergyPolicy { keep_download: false, transcribe_ahead: Some(ahead), analysis: false, enhance, sw_budget, efficiency_cores: true, max_fps }
 }
 
 /// Cut an enhancement down to what the policy allows.
@@ -179,6 +184,7 @@ mod tests {
         assert_eq!(b(10).enhance, Enhancement::Off);
         assert_eq!(b(10).transcribe_ahead, Some(Duration::ZERO), "whisper paused");
         assert!(b(80).efficiency_cores && !mains.efficiency_cores, "decode on the little cores on battery");
+        assert_eq!((mains.max_fps, b(35).max_fps, b(10).max_fps), (None, None, Some(30)), "frame rate halves only near empty");
     }
 
     #[test]

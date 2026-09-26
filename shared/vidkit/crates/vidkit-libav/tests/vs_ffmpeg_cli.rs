@@ -39,7 +39,7 @@ fn cli(f: &std::path::Path, from: Option<&str>) -> Vec<u8> {
 }
 
 fn ours(f: &std::path::Path, from: Duration) -> (Vec<u8>, Vec<Duration>) {
-    let mut d = Decoder::open(f.to_str().unwrap(), &Options { hw: Hw::Software, from, threads: 0, export_grain: false, input_options: vec![] }).unwrap();
+    let mut d = Decoder::open(f.to_str().unwrap(), &Options { hw: Hw::Software, from, threads: 0, export_grain: false, input_options: vec![], skip_nonref: false, codec_options: vec![] }).unwrap();
     let (mut out, mut pts) = (Vec::new(), Vec::new());
     while let Some(fr) = d.next_frame(&mut |n| Vec::with_capacity(n)).unwrap() {
         let FrameData::Cpu(p) = fr.data else { panic!("software frames are CPU planes") };
@@ -88,7 +88,7 @@ fn a_missing_vaapi_device_is_an_error() {
         return;
     }
     let f = make("d.mp4", &["-c:v", "libx264"]);
-    let e = Decoder::open(f.to_str().unwrap(), &Options { hw: Hw::Vaapi { device: "/dev/dri/renderD199".into() }, from: Duration::ZERO, threads: 0, export_grain: false, input_options: vec![] }).err().expect("no such device");
+    let e = Decoder::open(f.to_str().unwrap(), &Options { hw: Hw::Vaapi { device: "/dev/dri/renderD199".into() }, from: Duration::ZERO, threads: 0, export_grain: false, input_options: vec![], skip_nonref: false, codec_options: vec![] }).err().expect("no such device");
     assert!(e.contains("VAAPI device"), "{e}");
 }
 
@@ -106,7 +106,7 @@ fn exported_grain_plus_ours_is_dav1ds_picture() {
     let (w, h) = (352usize, 198usize);
     assert!(Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=352x198:rate=30:duration=2,noise=alls=14:allf=t", "-c:v", "libsvtav1", "-preset", "10", "-g", "30", "-svtav1-params", "film-grain=10", "-pix_fmt", "yuv420p"]).arg(&f).stderr(Stdio::null()).status().unwrap().success());
     let run = |export: bool| {
-        let mut d = Decoder::open(f.to_str().unwrap(), &Options { hw: Hw::Software, from: Duration::from_millis(700), threads: 0, export_grain: export, input_options: vec![] }).unwrap();
+        let mut d = Decoder::open(f.to_str().unwrap(), &Options { hw: Hw::Software, from: Duration::from_millis(700), threads: 0, export_grain: export, input_options: vec![], skip_nonref: false, codec_options: vec![] }).unwrap();
         let mut frames = Vec::new();
         while let Some(fr) = d.next_frame(&mut |n| Vec::with_capacity(n)).unwrap() {
             frames.push(fr);

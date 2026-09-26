@@ -48,6 +48,12 @@ pub struct Options {
     /// libavformat input options (`headers`, `reconnect`, `user_agent`...):
     /// what a signed stream URL needs to be fetched at all.
     pub input_options: Vec<(String, String)>,
+    /// Skip decoding frames nothing else references (AVDISCARD_NONREF):
+    /// drift-free, and for a display showing fewer frames than the stream
+    /// has (a 30 fps cap on 60 fps content) they are frames no one sees.
+    pub skip_nonref: bool,
+    /// Decoder private options (libdav1d `max_frame_delay`...).
+    pub codec_options: Vec<(String, String)>,
 }
 
 fn err(code: i32) -> String {
@@ -207,10 +213,19 @@ impl Decoder {
             } else {
                 (*d.dec).thread_count = opts.threads as i32;
             }
+            if opts.skip_nonref {
+                (*d.dec).skip_frame = ff::AVDiscard::AVDISCARD_NONREF;
+            }
             if opts.export_grain {
                 (*d.dec).export_side_data |= ff::AV_CODEC_EXPORT_DATA_FILM_GRAIN;
             }
-            let r = ff::avcodec_open2(d.dec, codec, ptr::null_mut());
+            let mut copts: *mut ff::AVDictionary = ptr::null_mut();
+            for (k, v) in &opts.codec_options {
+                let (k, v) = (CString::new(k.as_str()).map_err(|_| "NUL")?, CString::new(v.as_str()).map_err(|_| "NUL")?);
+                ff::av_dict_set(&mut copts, k.as_ptr(), v.as_ptr(), 0);
+            }
+            let r = ff::avcodec_open2(d.dec, codec, &mut copts);
+            ff::av_dict_free(&mut copts);
             if r < 0 {
                 return Err(format!("open {}: {}", d.codec, err(r)));
             }

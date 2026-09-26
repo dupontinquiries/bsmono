@@ -21,7 +21,7 @@ fn main() {
     for round in 0..2 {
         // In process.
         let (c0, t0) = (cpu(libc::RUSAGE_SELF), Instant::now());
-        let mut d = vidkit_libav::Decoder::open(path, &vidkit_libav::Options { hw: vidkit_libav::Hw::Software, from: Default::default(), threads: 0, export_grain: false, input_options: vec![] }).unwrap();
+        let mut d = vidkit_libav::Decoder::open(path, &vidkit_libav::Options { hw: vidkit_libav::Hw::Software, from: Default::default(), threads: 0, export_grain: false, input_options: vec![], skip_nonref: false, codec_options: vec![] }).unwrap();
         let mut pool: Vec<Vec<u8>> = Vec::new();
         let mut k = 0;
         while k < n {
