@@ -182,6 +182,20 @@ pub fn run() -> Result<(), String> {
         game.gods[0].yaw = keep.1;
         game.gods[0].move_dir = keep.2;
     }
+    // a nook in a cliff face, from out in the air before it
+    if let Some(crate::skyworld::Item::Nook { at, facing, .. }) = crate::skyworld::placements().into_iter().find(|i| matches!(i, crate::skyworld::Item::Nook { kind: 0, .. })) {
+        shoot(&mut renderer, &game, &mut vfx, "sky_nook.png", cam(at + facing * 8.0 + Vec3::Y * 2.5 + Vec3::new(facing.z, 0.0, -facing.x) * 3.0, at + Vec3::Y * 1.0, 0.9))?;
+    }
+    // the blue clan's camp behind its base (clancamp.rs)
+    {
+        let f = crate::consts::Team::Blue.fountain();
+        shoot(&mut renderer, &game, &mut vfx, "sky_camp.png", cam(f + Vec3::new(26.0, 20.0, -52.0), f + Vec3::new(0.0, 1.0, -16.0), 1.0))?;
+    }
+    // the Elder on its ground, the push lane marked out before it
+    {
+        let h = crate::consts::Team::Blue.titan_pos();
+        shoot(&mut renderer, &game, &mut vfx, "sky_elder.png", cam(h + Vec3::new(-24.0, 16.0, 40.0), h + Vec3::new(0.0, 3.0, 8.0), 1.0))?;
+    }
     // a glade with its larches
     shoot(&mut renderer, &game, &mut vfx, "sky_glade.png", cam(Vec3::new(-80.0, 8.0, -120.0), Vec3::new(-104.0, 3.0, -96.0), 1.0))?;
     // Cometail, close, on the well island's rim
@@ -323,8 +337,18 @@ pub fn run() -> Result<(), String> {
             k += 1;
         }
         let cs = crate::skycloud::clouds(game.cloud_seed, game.t);
-        if let Some(b) = cs.iter().find(|c| c.kind == crate::skycloud::Kind::Bank && over_floor(c)) {
+        if let Some(b) = cs.iter().find(|c| c.kind == crate::skycloud::Kind::Bank && over_floor(c)).copied() {
             shoot(&mut renderer, &game, &mut vfx, "sky_cloudbank.png", cam(b.pos + Vec3::new(0.0, 70.0, 95.0), b.pos, 1.05))?;
+            // three dashes through it, a moment apart: the cloud parts in
+            // their wake (vfx::Gust)
+            for (k, z) in [-10.0f32, 0.0, 10.0].into_iter().enumerate() {
+                let ev = vec![crate::sim::Event::DashFx { pos: b.pos + Vec3::new(8.0, 0.0, z), dir: Vec3::X, color: [0.9, 0.9, 1.0] }];
+                vfx.update(1.0 / 60.0, &ev, &game);
+                for _ in 0..(8 + k * 4) {
+                    vfx.update(1.0 / 60.0, &[], &game);
+                }
+            }
+            shoot(&mut renderer, &game, &mut vfx, "sky_cloudpart.png", cam(b.pos + Vec3::new(0.0, 45.0, 60.0), b.pos, 1.05))?;
         }
         if let Some(w) = cs.iter().filter(|c| c.kind == crate::skycloud::Kind::Wisp && over_floor(c)).max_by(|a, b| a.thick.total_cmp(&b.thick)) {
             let side = Vec3::new(-w.dir.z, 0.0, w.dir.x).normalize_or_zero();

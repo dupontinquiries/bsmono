@@ -677,17 +677,58 @@ impl Scene {
                 continue;
             }
             let ti = titan.team as usize;
-            let flip = if titan.team == Team::Blue { 0.0 } else { std::f32::consts::PI };
-            let base = Mat4::from_translation(titan.pos)
-                * Mat4::from_axis_angle(Vec3::Y, flip)
-                * Mat4::from_axis_angle(Vec3::Z, (vfx.time * 1.1).sin() * 0.02);
+            // Its walk: a heavy rolling gait -- a bob with each footfall, a
+            // sway side to side, a lean into the stride -- and at rest,
+            // breathing and a slow look round. It leans into a blow as it
+            // swings. (The model faces +z: turn by pi/2 - yaw.)
+            let go = (titan.stride / crate::consts::TITAN_SPEED).clamp(0.0, 1.0);
+            let bob = titan.walk.sin().abs() * 0.35 * go;
+            let sway = titan.walk.cos() * 0.05 * go;
+            let look = (1.0 - go) * (vfx.time * 0.23 + ti as f32).sin() * 0.12 * (1.0 - titan.atk_anim);
+            let breathe = (vfx.time * 1.1).sin() * 0.02 * (1.0 - go);
+            let lean = 0.08 * go + 0.18 * titan.atk_anim;
+            let base = Mat4::from_translation(titan.pos + Vec3::Y * bob)
+                * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - titan.yaw + look)
+                * Mat4::from_axis_angle(Vec3::X, lean)
+                * Mat4::from_axis_angle(Vec3::Z, breathe + sway);
             r.queue_draw(self.titan_body[ti], base, [1.0; 4], 0.0, 0.145, false);
-            let swing = -titan.atk_anim * 1.6;
+            let swing = -titan.atk_anim * 1.6 - (titan.walk.sin() * 0.25 * go);
             let wm = base
                 * Mat4::from_translation(Vec3::new(1.85, 2.4, 0.0))
                 * Mat4::from_axis_angle(Vec3::X, swing)
                 * Mat4::from_translation(Vec3::new(0.0, 0.6, 0.0));
             r.queue_draw(self.titan_weapon[ti], wm, [1.0; 4], 0.0, 0.145, false);
+
+            // its ground (systems::titan_zone), marked faintly with stones
+            // of light: the circle round the pedestal and the push lane
+            // out toward the enemy -- step inside and it comes for you
+            {
+                let (home, pz) = (titan.home, titan.team.push_z());
+                let c = titan.team.rgb();
+                let mut mark = |p: Vec3| {
+                    if crate::systems::titan_zone(home, titan.team, p - Vec3::new(0.0, 0.0, pz * 0.01)) {
+                        r.queue_draw(self.orb, Mat4::from_translation(Vec3::new(p.x, crate::map::ground_y(p.x, p.z) + 0.12, p.z)), alpha_tint(c, 0.35), 1.0, 0.06, true);
+                    }
+                };
+                let rr = crate::consts::TITAN_MOVE_R;
+                for k in 0..36 {
+                    let a = k as f32 / 36.0 * std::f32::consts::TAU;
+                    let p = home + Vec3::new(a.cos(), 0.0, a.sin()) * rr;
+                    // only where the circle is the edge (not inside the lane)
+                    if (p.z - home.z) * pz <= 0.0 || (p.x - home.x).abs() > crate::consts::TITAN_PUSH_HALF - 0.5 {
+                        mark(p);
+                    }
+                }
+                let (hx, len) = (crate::consts::TITAN_PUSH_HALF, crate::consts::TITAN_PUSH);
+                let n = 12;
+                for k in 0..=n {
+                    let f = k as f32 / n as f32;
+                    for side in [-1.0f32, 1.0] {
+                        mark(home + Vec3::new(side * hx, 0.0, pz * (rr * 0.5 + f * (len - rr * 0.5))));
+                    }
+                    mark(home + Vec3::new((f * 2.0 - 1.0) * hx, 0.0, pz * len));
+                }
+            }
 
             // invulnerability shell
             if game.titan_shielded(titan.team) {
@@ -853,11 +894,30 @@ impl Scene {
                     continue;
                 }
                 let yaw = c.dir.z.atan2(c.dir.x);
+                // forming: each billow condenses on its own (staggered), small
+                // at first; dissipating: they spread, rise and thin. Both from
+                // the cloud's own clock.
+                let smooth = |x: f32| {
+                    let x = x.clamp(0.0, 1.0);
+                    x * x * (3.0 - 2.0 * x)
+                };
+                let leaving = smooth((c.age - (c.life - 20.0)) / 20.0);
                 for (k, (off, scale, edge)) in crate::skycloud::puffs(&c).into_iter().enumerate() {
-                    let at = c.pos + off;
+                    let stagger = ((k as f32 * 0.618 + c.seed as f32 * 0.001).fract()) * 0.5;
+                    let formed = if leaving > 0.0 { 1.0 } else { smooth((c.thick - stagger) / (1.0 - stagger).max(0.2)) };
+                    let grow = 0.35 + 0.65 * formed + 0.45 * leaving;
+                    // a dash through it pushes the billows aside (vfx::Gust)
+                    let mut at = c.pos + off + Vec3::Y * (1.5 * leaving);
+                    let mut parted = 0.0f32;
+                    for gu in &vfx.gusts {
+                        let d = gu.push(at);
+                        parted = parted.max(d.length() / 8.0);
+                        at += d;
+                    }
                     let near_cam = ((at.distance(cam.eye) - 4.0) / 10.0).clamp(0.0, 1.0);
                     let near_me = me.map_or(1.0, |p| ((Vec3::new(at.x - p.x, 0.0, at.z - p.z).length() - 3.0) / 9.0).clamp(0.0, 1.0));
-                    let a = c.thick * edge * 0.75 * near_cam * near_me;
+                    let scale = scale * grow;
+                    let a = c.thick * edge * 0.75 * near_cam * near_me * formed.max(0.2) * (1.0 - 0.5 * parted.min(1.0));
                     if a < 0.02 {
                         continue;
                     }
@@ -1523,7 +1583,9 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
 
 /// Batch placed pieces into spatial chunks per voxel-size class: what the
 /// renderer uploads. Shared by every map's world builder.
-fn batch(pieces: Vec<Piece>, blockers: Blockers) -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
+fn batch(mut pieces: Vec<Piece>, mut blockers: Blockers) -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
+    // every map: the clans' camps behind the bases (clancamp.rs)
+    crate::clancamp::build(&mut pieces, &mut blockers);
     // Ordered, not hashed: a HashMap iterates in a fresh random order per
     // build, so chunks came out -- and drew -- in a different order every
     // time the world was built, and z-fighting between coplanar voxels

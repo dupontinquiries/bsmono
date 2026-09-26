@@ -314,6 +314,26 @@ pub struct Titan {
     pub hp: f32,
     pub atk_timer: f32,
     pub atk_anim: f32,
+    /// Its pedestal: where it stands guard and goes back to (`titan_zone`).
+    pub home: Vec3,
+    /// Facing (radians, 0 = +x), and how fast it is walking now (u/s).
+    pub yaw: f32,
+    pub stride: f32,
+    /// The walk cycle's phase (radians), for the scene.
+    pub walk: f32,
+}
+
+impl Titan {
+    pub fn new(team: Team, hp: f32) -> Titan {
+        let home = team.titan_pos();
+        // it stands facing the enemy
+        let yaw = if team.push_z() > 0.0 { std::f32::consts::FRAC_PI_2 } else { -std::f32::consts::FRAC_PI_2 };
+        Titan { team, pos: home, hp, atk_timer: 0.0, atk_anim: 0.0, home, yaw, stride: 0.0, walk: 0.0 }
+    }
+    /// The way it faces.
+    pub fn fwd(&self) -> Vec3 {
+        Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin())
+    }
 }
 
 pub struct Projectile {
@@ -544,8 +564,8 @@ impl Game {
         }
 
         let titans = [
-            Titan { team: Team::Blue, pos: Team::Blue.titan_pos(), hp: TITAN_HP * crate::map::active().structure_hp_mul(), atk_timer: 0.0, atk_anim: 0.0 },
-            Titan { team: Team::Red, pos: Team::Red.titan_pos(), hp: TITAN_HP * crate::map::active().structure_hp_mul(), atk_timer: 0.0, atk_anim: 0.0 },
+            Titan::new(Team::Blue, TITAN_HP * crate::map::active().structure_hp_mul()),
+            Titan::new(Team::Red, TITAN_HP * crate::map::active().structure_hp_mul()),
         ];
 
         let wild = crate::wild::Wild::new(&mut rng);

@@ -1010,6 +1010,17 @@ impl Game {
         }
     }
 
+    /// Is `p` on the Elder's ground: within `TITAN_MOVE_R` of its pedestal,
+    /// or in the push lane running `TITAN_PUSH` out from it toward the enemy.
+    pub fn titan_zone(&self, t: usize, p: Vec3) -> bool {
+        titan_zone(self.titans[t].home, self.titans[t].team, p)
+    }
+
+    /// The Elders: each guards its ground. It notices an enemy cat (else a
+    /// minion) within `TITAN_SIGHT` that stands on its ground, turns to it,
+    /// strides after it -- never off its ground -- and strikes when it is in
+    /// reach and faced. With nothing to fight it walks home to its pedestal
+    /// and turns to face the enemy again.
     fn titan_attacks(&mut self, dt: f32) {
         for t in 0..2 {
             let titan = self.titans[t];
@@ -1017,47 +1028,82 @@ impl Game {
                 continue;
             }
             let team = titan.team;
-            let mut target: Option<TargetRef> = None;
-            let mut bd = TITAN_RANGE;
+            let mut target: Option<(TargetRef, Vec3)> = None;
+            let mut bd = TITAN_SIGHT;
             for gi in 0..self.gods.len() {
                 let g = &self.gods[gi];
-                if g.team != team && g.respawn_t <= 0.0 {
-                    let d = g.pos.distance(titan.pos);
+                if g.team != team && g.respawn_t <= 0.0 && titan_zone(titan.home, team, g.pos) {
+                    let d = flat(g.pos - titan.pos);
                     if d < bd {
                         bd = d;
-                        target = Some(TargetRef::God(gi));
+                        target = Some((TargetRef::God(gi), g.pos));
                     }
                 }
             }
             if target.is_none() {
                 for mi in 0..self.minions.len() {
                     let m = &self.minions[mi];
-                    if m.team != team {
-                        let d = m.pos.distance(titan.pos);
+                    if m.team != team && titan_zone(titan.home, team, m.pos) {
+                        let d = flat(m.pos - titan.pos);
                         if d < bd {
                             bd = d;
-                            target = Some(TargetRef::Minion(mi));
+                            target = Some((TargetRef::Minion(mi), m.pos));
                         }
                     }
                 }
             }
-            let timer_next = self.titans[t].atk_timer - dt;
-            let anim_next = (self.titans[t].atk_anim - dt * 3.0).max(0.0);
-            if timer_next > 0.0 || target.is_none() {
-                let titan = &mut self.titans[t];
-                titan.atk_timer = timer_next.max(0.0);
-                titan.atk_anim = anim_next;
+            // where to stand and which way to face
+            let (goal, face) = match target {
+                Some((_, p)) => {
+                    let to = Vec3::new(p.x - titan.pos.x, 0.0, p.z - titan.pos.z);
+                    let stop = if to.length() > TITAN_RANGE * 0.8 { p - to.normalize_or_zero() * (TITAN_RANGE * 0.7) } else { titan.pos };
+                    (stop, to.z.atan2(to.x))
+                }
+                None => {
+                    let home = titan.home;
+                    let at_home = flat(home - titan.pos) < 0.6;
+                    let to = home - titan.pos;
+                    let rest = if team.push_z() > 0.0 { std::f32::consts::FRAC_PI_2 } else { -std::f32::consts::FRAC_PI_2 };
+                    (home, if at_home { rest } else { to.z.atan2(to.x) })
+                }
+            };
+            let mut ti = self.titans[t];
+            // turn, at a heavy pace
+            let dyaw = (face - ti.yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+            let turn = dyaw.clamp(-TITAN_TURN * dt, TITAN_TURN * dt);
+            ti.yaw = (ti.yaw + turn + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+            // stride: slower while it is still turning to face its way
+            let to = Vec3::new(goal.x - ti.pos.x, 0.0, goal.z - ti.pos.z);
+            let want = if to.length() > 0.3 { TITAN_SPEED * (1.0 - (dyaw.abs() / 1.2).min(0.8)) } else { 0.0 };
+            ti.stride += (want - ti.stride) * (dt * 3.0).min(1.0);
+            if to.length() > 0.05 && ti.stride > 0.01 {
+                let step = to.normalize_or_zero() * (ti.stride * dt).min(to.length());
+                let next = ti.pos + step;
+                // never off its ground, never into rock
+                if titan_zone(ti.home, team, next) && !self.blockers.blocked(next.x, next.z, 1.5) {
+                    ti.pos = next;
+                } else {
+                    ti.stride = 0.0;
+                }
+            }
+            ti.walk = (ti.walk + ti.stride * dt * 1.3).rem_euclid(std::f32::consts::TAU);
+            ti.atk_anim = (ti.atk_anim - dt * 3.0).max(0.0);
+            ti.atk_timer = (ti.atk_timer - dt).max(0.0);
+            self.titans[t] = ti;
+            // strike what is in reach and faced
+            let Some((tr, p)) = target else { continue };
+            let in_reach = flat(p - ti.pos) < TITAN_RANGE;
+            if ti.atk_timer > 0.0 || !in_reach || dyaw.abs() > TITAN_FACE {
                 continue;
             }
-            let tpos = self.titans[t].pos;
-            let tteam = self.titans[t].team;
             {
                 let titan = &mut self.titans[t];
                 titan.atk_timer = TITAN_ATK_CD;
                 titan.atk_anim = 1.0;
             }
-            self.deal_damage(target.unwrap(), TITAN_DMG, false, None, 0.0, 0.0);
-            self.events.push(Event::NovaFx { pos: tpos + Vec3::Y * 1.0, radius: 3.0, color: tteam.rgb() });
+            self.deal_damage(tr, TITAN_DMG, false, None, 0.0, 0.0);
+            let slam = ti.pos + ti.fwd() * 3.0;
+            self.events.push(Event::NovaFx { pos: slam + Vec3::Y * 0.2, radius: 3.0, color: team.rgb() });
         }
     }
 
@@ -1455,4 +1501,15 @@ pub fn facing_yaw(move_dir: Vec3, view: Vec3) -> f32 {
 /// heights on sloped ground, and reach is measured across the ground.
 fn flat(v: Vec3) -> f32 {
     Vec3::new(v.x, 0.0, v.z).length()
+}
+
+/// The Elder's ground (see `Game::titan_zone`), for an Elder whose pedestal
+/// is `home`: a disc round it, and a lane out from it toward the enemy.
+pub fn titan_zone(home: Vec3, team: Team, p: Vec3) -> bool {
+    let d = Vec3::new(p.x - home.x, 0.0, p.z - home.z);
+    if d.length() <= TITAN_MOVE_R {
+        return true;
+    }
+    let ahead = d.z * team.push_z();
+    ahead >= 0.0 && ahead <= TITAN_PUSH && d.x.abs() <= TITAN_PUSH_HALF
 }

@@ -2003,3 +2003,103 @@ mod clouds {
         });
     }
 }
+
+mod elder {
+    /// The blue Elder's blows on cat 1 this tick: damage of exactly an
+    /// Elder's blow through that cat's protections (other things hurt a
+    /// cat in a base -- towers, the fountain -- for other amounts).
+    fn blows(g: &Game) -> u32 {
+        let want = clawbound::consts::TITAN_DMG * 100.0 / (100.0 + g.gods[1].prot);
+        g.events
+            .iter()
+            .filter(|e| matches!(e, clawbound::sim::Event::Damage { amount, .. } if (*amount - want).abs() < 0.5))
+            .count() as u32
+    }
+    /// It turns before it strikes: a cat right behind it has a moment.
+    #[test]
+    fn the_elder_turns_to_strike() {
+        use clawbound::consts::{TITAN_FACE, TITAN_TURN};
+        let mut g = Game::new_teams(&[0], &[1]);
+        quiet(&mut g);
+        let home = g.titans[0].home;
+        let behind = home - Vec3::Z * Team::Blue.push_z() * 4.0;
+        let mut first = None;
+        for k in 0..(4 * 60) {
+            g.gods[1].pos = behind;
+            g.gods[1].hp = g.gods[1].max_hp;
+            g.tick(1.0 / 60.0);
+            if blows(&g) > 0 && first.is_none() {
+                first = Some(k as f32 / 60.0);
+            }
+            g.events.clear();
+        }
+        let t = first.expect("it struck in the end");
+        let turn = (std::f32::consts::PI - TITAN_FACE) / TITAN_TURN;
+        assert!(t > turn * 0.8, "not before it had turned round: struck at {t} s, a turn takes {turn} s");
+    }
+
+    use clawbound::consts::{TITAN_PUSH, TITAN_RANGE};
+    use clawbound::map::{self, MapId};
+    use clawbound::sim::{Game, Team};
+    use clawbound::systems::titan_zone;
+    use glam::Vec3;
+
+    fn quiet(g: &mut Game) {
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+            c.is_player = false;
+            c.move_dir = Vec3::ZERO;
+        }
+        g.minions.clear();
+    }
+
+    /// The Elder comes out along its push lane to meet a cat standing on its
+    /// ground, turns to it and strikes; never leaves its ground; ignores one
+    /// just off it; and walks home to its pedestal, facing the enemy, once
+    /// there is nothing to fight. On every map.
+    #[test]
+    fn the_elder_guards_its_ground_and_goes_home() {
+        for m in [MapId::Jungle, MapId::Sky] {
+            map::with(m, || {
+                let mut g = Game::new_teams(&[0], &[1]);
+                quiet(&mut g);
+                let red = 1usize;
+                let blue_elder = Team::Blue as usize;
+                let home = g.titans[blue_elder].home;
+                let pz = Team::Blue.push_z();
+                // a red cat out in the push lane, well beyond reach
+                let spot = home + Vec3::new(2.0, 0.0, pz * (TITAN_PUSH - 4.0));
+                let mut left = false;
+                let mut struck = 0;
+                for _ in 0..(8 * 60) {
+                    // (kept whole, so it stays to be fought)
+                    g.gods[red].pos = spot;
+                    g.gods[red].hp = g.gods[red].max_hp;
+                    g.tick(1.0 / 60.0);
+                    struck += blows(&g);
+                    g.events.clear();
+                    left |= !titan_zone(home, Team::Blue, g.titans[blue_elder].pos);
+                }
+                let el = g.titans[blue_elder];
+                assert!(!left, "{m:?}: it never left its ground");
+                assert!(el.pos.distance(home) > 8.0, "{m:?}: it came out: {}", el.pos.distance(home));
+                assert!(Vec3::new(spot.x - el.pos.x, 0.0, spot.z - el.pos.z).length() < TITAN_RANGE, "{m:?}: into reach");
+                let to = (spot - el.pos).normalize();
+                assert!(el.fwd().dot(to) > 0.85, "{m:?}: facing it");
+                assert!(struck >= 2, "{m:?}: and struck ({struck} blows)");
+                // off its ground, beside it: ignored; it goes home and faces
+                // the enemy again
+                let aside = home + Vec3::new(18.0, 0.0, 0.0);
+                for _ in 0..(20 * 60) {
+                    g.gods[red].pos = aside;
+                    g.tick(1.0 / 60.0);
+                    g.events.clear();
+                }
+                let el = g.titans[blue_elder];
+                assert!(el.pos.distance(home) < 1.0, "{m:?}: home again: {}", el.pos.distance(home));
+                assert!(el.fwd().z * pz > 0.95, "{m:?}: facing the enemy's side");
+                assert!(el.stride < 0.2, "{m:?}: standing");
+            });
+        }
+    }
+}
