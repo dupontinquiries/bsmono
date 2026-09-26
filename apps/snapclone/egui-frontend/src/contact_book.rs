@@ -58,6 +58,10 @@ pub struct Contact {
     /// Trust on first use, with everything that implies: the FIRST sighting is
     /// the one that cannot be checked.
     pub public: Option<[u8; 32]>,
+    /// Their X25519 mailbox key (`mailbox.rs`), learned from their DHT record.
+    /// Kept on disk because it is needed exactly when they are OFFLINE -- the
+    /// moment their record has expired and a lookup can no longer supply it.
+    pub mailbox: Option<[u8; 32]>,
     /// A signed announcement arrived for this id under a DIFFERENT key and was
     /// refused.
     ///
@@ -124,7 +128,7 @@ impl ContactBook {
         }
         self.entries.push(Contact {
             sc_id: sc_id.to_string(), nickname: String::new(), port, added_ms,
-            public: None, conflict: false,
+            public: None, mailbox: None, conflict: false,
         });
         true
     }
@@ -157,6 +161,18 @@ impl ContactBook {
             // when this edit silently failed to apply and `trust()` went on
             // reporting Pinned for a contact whose key had just been refused.
             Some(_) => { c.conflict = true; Pin::Changed }
+        }
+    }
+
+    /// Record a contact's mailbox key. Returns whether it changed (so the caller
+    /// writes the file only when it did). The caller has already judged the key
+    /// (`mailbox::accept_peer_key`); a contact whose key legitimately rotates
+    /// (a reinstall) is updated, which is the Qt build's behaviour too -- the
+    /// pinned IDENTITY key is what refuses impersonation, via the signature.
+    pub fn set_mailbox(&mut self, sc_id: &str, key: [u8; 32]) -> bool {
+        match self.entries.iter_mut().find(|c| c.sc_id == sc_id) {
+            Some(c) if c.mailbox != Some(key) => { c.mailbox = Some(key); true }
+            _ => false,
         }
     }
 
@@ -242,6 +258,10 @@ pub fn render(book: &ContactBook) -> String {
             out.push_str(&format!("public = {}\n",
                                   k.iter().map(|b| format!("{b:02x}")).collect::<String>()));
         }
+        if let Some(k) = c.mailbox {
+            out.push_str(&format!("mailbox = {}\n",
+                                  k.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+        }
     }
     out
 }
@@ -266,7 +286,7 @@ pub fn parse(text: &str) -> ContactBook {
         // A malformed key is dropped rather than kept: half a pin is worse than
         // none, because the next verified sighting would read as a key CHANGE
         // and refuse a peer who did nothing wrong.
-        let public = ini.get(sc_id, "public").and_then(|v| {
+        let key32 = |field: &str| ini.get(sc_id, field).and_then(|v| {
             let v = v.trim();
             if v.len() != 64 { return None; }
             let mut out = [0u8; 32];
@@ -275,12 +295,15 @@ pub fn parse(text: &str) -> ContactBook {
             }
             Some(out)
         });
+        let public = key32("public");
+        let mailbox = key32("mailbox");
         book.entries.push(Contact {
             sc_id: sc_id.to_string(),
             nickname: ini.get(sc_id, "nickname").unwrap_or("").trim().to_string(),
             port,
             added_ms,
             public,
+            mailbox,
             conflict: ini.get(sc_id, "conflict").map(|v| v.trim() == "true").unwrap_or(false),
         });
     }
@@ -302,6 +325,20 @@ pub fn store(book: &ContactBook) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The mailbox key persists: it is needed when the contact is offline and a
+    /// lookup can no longer supply it.
+    #[test]
+    fn a_mailbox_key_survives_a_restart() {
+        let mut b = ContactBook::default();
+        b.upsert("sc-aabbccdd", 9876, 1);
+        assert!(b.set_mailbox("sc-aabbccdd", [9u8; 32]));
+        assert!(!b.set_mailbox("sc-aabbccdd", [9u8; 32]), "an unchanged key is not a change");
+        assert!(!b.set_mailbox("sc-00000000", [9u8; 32]), "a stranger is not stored");
+        let back = parse(&render(&b));
+        assert_eq!(back.get("sc-aabbccdd").unwrap().mailbox, Some([9u8; 32]));
+        assert_eq!(parse("[sc-aabbccdd]\nmailbox = beef\n").get("sc-aabbccdd").unwrap().mailbox, None);
+    }
+
     use super::*;
 
     fn book() -> ContactBook {

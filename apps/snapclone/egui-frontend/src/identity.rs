@@ -72,6 +72,26 @@ pub struct Identity {
     pub public: [u8; 32],
     /// Ed25519 signing key. Never leaves this machine.
     pub secret: [u8; 32],
+    /// X25519 key for the DHT mailbox (`mailbox.rs`). A SEPARATE key rather than
+    /// the Ed25519 one converted: reusing a signing key for key agreement is
+    /// what ed25519-dalek's own docs advise against. It is bound to the identity
+    /// by a signature in the presence record (`#xsig:`), made with `secret`.
+    pub x_public: [u8; 32],
+    /// X25519 private key. Never leaves this machine.
+    pub x_secret: [u8; 32],
+}
+
+impl Identity {
+    /// The `#xsig:` signature: the identity key vouching for the mailbox key.
+    pub fn xsig(&self) -> [u8; 64] {
+        crypto_kit::sign(&self.secret, &crate::mailbox::xsig_message(&self.x_public))
+    }
+}
+
+/// A fresh X25519 pair, as `(secret, public)`.
+fn x25519_pair() -> ([u8; 32], [u8; 32]) {
+    let (s, p) = crypto_kit::x25519_keypair();
+    (*s, p)
 }
 
 /// Redacted by hand rather than derived, so a stray `{:?}` in a log line
@@ -84,6 +104,8 @@ impl std::fmt::Debug for Identity {
             .field("sc_id", &self.sc_id)
             .field("public", &hex(&self.public))
             .field("secret", &"<redacted>")
+            .field("x_public", &hex(&self.x_public))
+            .field("x_secret", &"<redacted>")
             .finish()
     }
 }
@@ -200,7 +222,8 @@ pub fn is_valid(s: &str) -> bool {
 pub fn create() -> Option<Identity> {
     read_urandom(&mut [0u8; 1])?;
     let (secret, public) = crypto_kit::ed25519_keypair();
-    Some(Identity { sc_id: fingerprint(&public), public, secret: *secret })
+    let (x_secret, x_public) = x25519_pair();
+    Some(Identity { sc_id: fingerprint(&public), public, secret: *secret, x_public, x_secret })
 }
 
 fn read_urandom(buf: &mut [u8]) -> Option<()> {
@@ -221,8 +244,10 @@ pub fn render(id: &Identity) -> String {
          [identity]\n\
          sc_id = {}\n\
          public = {}\n\
-         secret = {}\n",
-        id.sc_id, hex(&id.public), hex(&id.secret)
+         secret = {}\n\
+         x_public = {}\n\
+         x_secret = {}\n",
+        id.sc_id, hex(&id.public), hex(&id.secret), hex(&id.x_public), hex(&id.x_secret)
     )
 }
 
@@ -241,7 +266,32 @@ pub fn parse(text: &str) -> Option<Identity> {
     // claim — every peer would refuse us, with the failure appearing on their
     // side rather than ours.
     if fingerprint(&public) != raw { return None; }
-    Some(Identity { sc_id: raw, public, secret })
+    // The mailbox key arrived after the identity format: a file from before it
+    // has none, and gets one here (`load_or_create` writes it back). A file
+    // whose x_public does not match its x_secret is repaired the same way -- a
+    // mismatched pair would publish a key nobody can seal to us under.
+    let x = (|| {
+        let xs: [u8; 32] = unhex(ini.get("identity", "x_secret")?)?;
+        let xp: [u8; 32] = unhex(ini.get("identity", "x_public")?)?;
+        let derived = x25519_dalek_public(&xs);
+        (derived == xp).then_some((xs, xp))
+    })();
+    let (x_secret, x_public) = x.unwrap_or_else(x25519_pair);
+    Some(Identity { sc_id: raw, public, secret, x_public, x_secret })
+}
+
+/// The X25519 public key for a secret, via the DH with the base point: the
+/// shared secret of `secret` with the generator IS its public key.
+fn x25519_dalek_public(secret: &[u8; 32]) -> [u8; 32] {
+    let mut base = [0u8; 32];
+    base[0] = 9;
+    *crypto_kit::x25519_shared(secret, &base)
+}
+
+/// Does this file already carry a mailbox key? A `false` means `parse` minted
+/// one, and the file should be rewritten so it survives the next launch.
+fn has_mailbox_key(text: &str) -> bool {
+    text.contains("x_secret")
 }
 
 /// What happened when the app asked who it is.
@@ -274,8 +324,15 @@ impl Loaded {
 /// identity for this session, it simply will not be the same one next launch.
 /// Losing the session to a read-only config dir would be the worse trade.
 pub fn load_or_create() -> Loaded {
-    if let Some(id) = config_kit::load(crate::settings_store::APP, FILE).as_deref().and_then(parse) {
-        return Loaded::Existing(id);
+    if let Some(text) = config_kit::load(crate::settings_store::APP, FILE) {
+        if let Some(id) = parse(&text) {
+            if !has_mailbox_key(&text)
+                && config_kit::save(crate::settings_store::APP, FILE, &render(&id)).is_ok()
+            {
+                restrict(&config_kit::config_dir(crate::settings_store::APP).join(FILE));
+            }
+            return Loaded::Existing(id);
+        }
     }
     match create() {
         Some(id) => {
@@ -307,6 +364,28 @@ pub fn restrict(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The mailbox key: minted with the identity, persisted, signed by it, and
+    /// added to a file written before it existed.
+    #[test]
+    fn the_mailbox_key_is_minted_persisted_and_vouched_for() {
+        let id = create().unwrap();
+        assert_ne!(id.x_public, [0u8; 32]);
+        assert_eq!(x25519_dalek_public(&id.x_secret), id.x_public, "a mismatched X25519 pair");
+        let back = parse(&render(&id)).unwrap();
+        assert_eq!(back, id, "the mailbox key did not survive a round trip");
+        assert!(crypto_kit::verify(&id.public, &crate::mailbox::xsig_message(&id.x_public), &id.xsig()));
+        // A pre-mailbox file: same identity, a new valid mailbox key.
+        let old = format!("[identity]\nsc_id = {}\npublic = {}\nsecret = {}\n",
+                          id.sc_id, hex(&id.public), hex(&id.secret));
+        assert!(!has_mailbox_key(&old));
+        let up = parse(&old).unwrap();
+        assert_eq!((up.sc_id.as_str(), up.public, up.secret), (id.sc_id.as_str(), id.public, id.secret));
+        assert_eq!(x25519_dalek_public(&up.x_secret), up.x_public);
+        assert!(has_mailbox_key(&render(&up)));
+        // The secret stays out of Debug.
+        assert!(!format!("{id:?}").contains(&hex(&id.x_secret)));
+    }
+
 
     #[test]
     fn a_node_id_is_stable_across_restarts() {

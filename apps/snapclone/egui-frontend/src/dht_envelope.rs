@@ -366,6 +366,7 @@ mod tests {
                         Addr::new("10.8.0.3", 9876, 9876),
                         Addr::new("203.0.113.9", 9876, 33445)],
             stamp: 1_700_000_000,
+            ..Default::default()
         };
         let sealed = seal_with_nonce(ID, V_MULTI, [4u8; NONCE_BYTES],
                                      render(&ann).as_bytes());
@@ -396,6 +397,7 @@ mod tests {
             addrs: vec![Addr::new("192.168.1.42", 9876, 9876),
                         Addr::new("203.0.113.9", 9876, 33445)],
             stamp: 1_700_000_000,
+            ..Default::default()
         };
         let sealed = seal_with_nonce(ID, V_MULTI, random_nonce().expect("urandom"),
                                      render(&a).as_bytes());

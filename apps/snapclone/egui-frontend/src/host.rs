@@ -375,6 +375,9 @@ impl Snapclone {
             }
             HostEvent::LoggedIn => self.login_succeeded(),
             HostEvent::IdentityLoaded(loaded) => {
+                if let identity::Loaded::Existing(i) | identity::Loaded::Created(i) = &loaded {
+                    self.identity = Some(i.clone());
+                }
                 match loaded.sc_id() {
                     Some(id) => self.local_id = id.to_string(),
                     // Left empty deliberately and reported, rather than

@@ -401,6 +401,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto-kit"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "ed25519-dalek",
+ "fips203",
+ "getrandom 0.2.15",
+ "hkdf",
+ "rand_core 0.6.4",
+ "sha2",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "cssparser"
 version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2665,6 +2680,7 @@ dependencies = [
  "aes-gcm",
  "cbindgen",
  "cc",
+ "crypto-kit",
  "ed25519-dalek",
  "fips203",
  "getrandom 0.2.15",

@@ -96,12 +96,24 @@ impl Addr {
 }
 
 /// One announcement: who, where, and when it was made.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Announcement {
     pub user_id: String,
     pub addrs: Vec<Addr>,
     /// Epoch seconds. 0 means an unstamped legacy record.
     pub stamp: i64,
+    /// The X25519 mailbox key, base64 as the FOURTH field of the first address
+    /// line -- exactly where the Qt build puts it (`makeMultiAddrPayload`), so a
+    /// Qt peer can seal a connection request to us. See `mailbox.rs`.
+    pub x_public: Option<[u8; 32]>,
+    /// `#ed:` -- the Ed25519 identity key, so a contact never seen on the LAN
+    /// can be pinned (its fingerprint must equal the sc-ID; checked by the
+    /// caller). Ignored by the Qt parser, which skips unknown `#` lines.
+    pub ed_public: Option<[u8; 32]>,
+    /// `#xsig:` -- the identity key's signature over the mailbox key
+    /// (`mailbox::xsig_message`). What turns the Qt build's trust-on-first-use
+    /// into a check, for a peer whose identity key is pinned.
+    pub xsig: Option<[u8; 64]>,
 }
 
 /// Build the v2 plaintext: `snapclone\nuserId\nhost:ws:punch\n…\n#ts:epoch`.
@@ -112,6 +124,7 @@ pub struct Announcement {
 pub fn render(a: &Announcement) -> String {
     let mut out = String::from("snapclone\n");
     out.push_str(&a.user_id);
+    let mut first = true;
     for ad in &a.addrs {
         if ad.host.trim().is_empty() || ad.ws_port == 0 {
             continue;
@@ -119,6 +132,19 @@ pub fn render(a: &Announcement) -> String {
         out.push('\n');
         out.push_str(&format!("{}:{}:{}", ad.host, ad.ws_port,
                               if ad.punch_port == 0 { ad.ws_port } else { ad.punch_port }));
+        if first {
+            if let Some(k) = &a.x_public {
+                out.push(':');
+                out.push_str(&crate::mailbox::b64_encode(k));
+            }
+            first = false;
+        }
+    }
+    if let Some(k) = &a.ed_public {
+        out.push_str(&format!("\n#ed:{}", crate::mailbox::b64_encode(k)));
+    }
+    if let Some(sig) = &a.xsig {
+        out.push_str(&format!("\n#xsig:{}", crate::mailbox::b64_encode(sig)));
     }
     // LAST, and '#'-prefixed. See the module docs: an older parser treats
     // this as an address line, fails to parse the port, and skips it.
@@ -146,8 +172,7 @@ pub fn parse(text: &str) -> Option<Announcement> {
         if user_id.is_empty() {
             return None;
         }
-        let mut addrs = Vec::new();
-        let mut stamp = 0i64;
+        let mut ann = Announcement { user_id, ..Default::default() };
         for line in &lines[2..] {
             let line = line.trim();
             if line.is_empty() {
@@ -157,15 +182,25 @@ pub fn parse(text: &str) -> Option<Announcement> {
             // unknown '#' line never displaces a real address.
             if let Some(rest) = line.strip_prefix('#') {
                 if let Some(ts) = rest.strip_prefix("ts:") {
-                    stamp = ts.trim().parse().unwrap_or(0);
+                    ann.stamp = ts.trim().parse().unwrap_or(0);
+                } else if let Some(k) = rest.strip_prefix("ed:") {
+                    ann.ed_public = crate::mailbox::b64_key(k);
+                } else if let Some(sig) = rest.strip_prefix("xsig:") {
+                    ann.xsig = crate::mailbox::b64_decode(sig).and_then(|v| v.try_into().ok());
                 }
                 continue;
             }
-            if let Some(a) = parse_addr_line(line) {
-                addrs.push(a);
+            // The mailbox key rides on the FIRST address line only, as in
+            // the Qt build -- by content, so a metadata line cannot take the
+            // slot.
+            if let Some((a, key)) = parse_addr_line(line) {
+                if ann.addrs.is_empty() && ann.x_public.is_none() {
+                    ann.x_public = key;
+                }
+                ann.addrs.push(a);
             }
         }
-        return Some(Announcement { user_id, addrs, stamp });
+        return Some(ann);
     }
 
     // v1.
@@ -183,13 +218,16 @@ pub fn parse(text: &str) -> Option<Announcement> {
         user_id,
         addrs: vec![Addr::new(&host, ws, punch)],
         stamp: 0,
+        // v1 carried the key as its fifth line.
+        x_public: lines.get(4).and_then(|k| crate::mailbox::b64_key(k)),
+        ..Default::default()
     })
 }
 
-/// `host:ws:punch[:pubkey]`. The optional trailing pubkey is tolerated and
-/// ignored: the C++ puts it on the first address line, and a parser that
-/// choked on the extra field would reject every record that carries a key.
-fn parse_addr_line(line: &str) -> Option<Addr> {
+/// `host:ws:punch[:pubkey]`, and the X25519 key when the fourth field is one.
+/// The C++ puts the key on the first address line; a parser that choked on the
+/// extra field would reject every record that carries a key.
+fn parse_addr_line(line: &str) -> Option<(Addr, Option<[u8; 32]>)> {
     let mut it = line.split(':');
     let host = it.next()?.trim();
     let ws: u16 = it.next()?.trim().parse().ok()?;
@@ -197,7 +235,8 @@ fn parse_addr_line(line: &str) -> Option<Addr> {
         return None;
     }
     let punch = it.next().and_then(|p| p.trim().parse().ok()).unwrap_or(ws);
-    Some(Addr::new(host, ws, punch))
+    let key = it.next().and_then(crate::mailbox::b64_key);
+    Some((Addr::new(host, ws, punch), key))
 }
 
 /// Keep only the addresses from the freshest announcement.
@@ -397,7 +436,7 @@ mod tests {
                 Addr::new("10.8.0.3", 9876, 41234),
                 Addr::new("203.0.113.9", 9876, 33445),
             ],
-            stamp: 1_700_000_000,
+            stamp: 1_700_000_000, ..Default::default()
         };
         let got = parse(&render(&a)).expect("did not parse");
         assert_eq!(got, a);
@@ -411,7 +450,7 @@ mod tests {
         let text = render(&Announcement {
             user_id: "sc-aabbccdd".into(),
             addrs: vec![Addr::new("192.168.1.42", 9876, 9876)],
-            stamp: 1_700_000_000,
+            stamp: 1_700_000_000, ..Default::default()
         });
         assert!(text.ends_with("\n#ts:1700000000"), "{text:?}");
         // A real epoch does not fit in a u16, so an old parser's port field
@@ -435,9 +474,9 @@ mod tests {
         // still there this afternoon pointing at an address that now
         // belongs to somebody else's printer.
         let old = Announcement { user_id: "u".into(),
-            addrs: vec![Addr::new("192.168.1.42", 9876, 9876)], stamp: 1_000 };
+            addrs: vec![Addr::new("192.168.1.42", 9876, 9876)], stamp: 1_000, ..Default::default() };
         let new = Announcement { user_id: "u".into(),
-            addrs: vec![Addr::new("10.0.0.5", 9876, 9876)], stamp: 2_000 };
+            addrs: vec![Addr::new("10.0.0.5", 9876, 9876)], stamp: 2_000, ..Default::default() };
         let picked = newest(&[old, new]);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].host, "10.0.0.5");
@@ -449,9 +488,9 @@ mod tests {
         // arrives back as several records sharing a stamp. Taking only the
         // first would throw away the address the asking peer can reach.
         let a = Announcement { user_id: "u".into(),
-            addrs: vec![Addr::new("192.168.1.42", 9876, 9876)], stamp: 5 };
+            addrs: vec![Addr::new("192.168.1.42", 9876, 9876)], stamp: 5, ..Default::default() };
         let b = Announcement { user_id: "u".into(),
-            addrs: vec![Addr::new("10.8.0.3", 9876, 9876)], stamp: 5 };
+            addrs: vec![Addr::new("10.8.0.3", 9876, 9876)], stamp: 5, ..Default::default() };
         let picked = newest(&[a.clone(), b, a]);
         assert_eq!(picked.len(), 2, "duplicates survived or an address was lost: {picked:?}");
     }
@@ -466,7 +505,7 @@ mod tests {
         assert_eq!(newest(&[legacy.clone()]).len(), 1, "an old peer became unreachable");
 
         let fresh = Announcement { user_id: "sc-aabbccdd".into(),
-            addrs: vec![Addr::new("10.0.0.5", 9876, 9876)], stamp: 1 };
+            addrs: vec![Addr::new("10.0.0.5", 9876, 9876)], stamp: 1, ..Default::default() };
         assert_eq!(newest(&[legacy, fresh])[0].host, "10.0.0.5");
     }
 
@@ -480,13 +519,41 @@ mod tests {
         assert_eq!(a.stamp, 9);
     }
 
+    /// The mailbox key and its binding survive the round trip, the key sits
+    /// where the Qt parser reads it (fourth field of the FIRST address line),
+    /// and a record with every field still fits the 512-byte presence cap once
+    /// sealed.
+    #[test]
+    fn the_mailbox_key_rides_where_the_qt_build_reads_it() {
+        let a = Announcement {
+            user_id: "sc-aabbccdd".into(),
+            addrs: vec![Addr::new("192.168.1.42", 9876, 9876), Addr::new("10.8.0.3", 9876, 41234),
+                        Addr::new("100.64.12.200", 9876, 50000), Addr::new("203.0.113.9", 9876, 33445)],
+            stamp: 1_790_000_000,
+            x_public: Some([0x5a; 32]),
+            ed_public: Some([0x11; 32]),
+            xsig: Some([0x77; 64]),
+        };
+        let text = render(&a);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[2], format!("192.168.1.42:9876:9876:{}", crate::mailbox::b64_encode(&[0x5a; 32])));
+        assert!(!lines[3].contains(&crate::mailbox::b64_encode(&[0x5a; 32])), "the key went on a second line too");
+        assert!(text.ends_with("\n#ts:1790000000"), "the stamp must stay last: {text:?}");
+        assert_eq!(parse(&text).unwrap(), a);
+        let sealed = crate::dht_envelope::seal_with_nonce("sc-aabbccdd", crate::dht_envelope::V_MULTI,
+                                                         [3u8; crate::dht_envelope::NONCE_BYTES], text.as_bytes());
+        assert!(sealed.len() <= 512, "{} bytes sealed: over the Qt reader's 512-byte cap", sealed.len());
+        // A key-less record is the same as before.
+        assert_eq!(parse(&render(&Announcement { x_public: None, ed_public: None, xsig: None, ..a.clone() })).unwrap().x_public, None);
+    }
+
     #[test]
     fn an_address_with_no_host_or_port_is_dropped_rather_than_written_empty() {
         let text = render(&Announcement {
             user_id: "u".into(),
             addrs: vec![Addr::new("", 9876, 0), Addr::new("10.0.0.1", 0, 0),
                         Addr::new("10.0.0.2", 9876, 0)],
-            stamp: 1,
+            stamp: 1, ..Default::default()
         });
         let got = parse(&text).unwrap();
         assert_eq!(got.addrs, vec![Addr::new("10.0.0.2", 9876, 9876)]);

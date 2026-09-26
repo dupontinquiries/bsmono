@@ -63,3 +63,9 @@ zeroize       = { version = "1",    features = ["derive"] }
 [build-dependencies]
 cbindgen = "0.26"
 cc = "1"
+
+[dev-dependencies]
+# Parity only: the egui build seals mailbox requests with crypto-kit, and the
+# Qt build opens them with THIS crate's FFI. tests/crypto_kit_parity.rs proves
+# the two agree byte for byte.
+crypto-kit = { path = "../../../../shared/crypto-kit" }

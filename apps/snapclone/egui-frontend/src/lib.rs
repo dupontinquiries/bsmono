@@ -91,6 +91,8 @@ pub mod chevron_confirm;
 pub mod dht_announce;
 pub mod dht_bootstrap;
 pub mod dht_envelope;
+/// Connection requests left in the DHT for an offline contact (the Qt build's /connreq mailbox).
+pub mod mailbox;
 pub mod dht_presence;
 pub mod hint;
 pub mod palette;
@@ -287,6 +289,19 @@ pub struct Snapclone {
     /// The punch socket's STUN-mapped address (`nat_traversal`). Announced
     /// in our record so a peer's volley hits the mapping that exists.
     pub reflexive: Option<std::net::SocketAddr>,
+    /// This installation's keys, for the mailbox (`mailbox.rs`) and the
+    /// presence record's key binding. `None` until the identity is loaded.
+    pub identity: Option<crate::identity::Identity>,
+    /// Contacts we are leaving connection requests for while unreachable.
+    pub mailbox_out: crate::mailbox::Outbox,
+    /// Nonces of requests already acted on (replay protection).
+    mailbox_seen: crate::mailbox::Seen,
+    /// When our own mailbox was last polled.
+    mailbox_checked_ms: Option<u64>,
+    /// Requests from a contact whose mailbox key we do not have yet, kept until a
+    /// lookup of that contact supplies it (the Qt build retries the decrypt the
+    /// same way, after fetching the sender's record). Bounded.
+    mailbox_waiting: Vec<Vec<u8>>,
     /// STUN was asked and nobody answered (cleared when a server does).
     pub stun_failed: bool,
     /// Peers the node reported on its last publish or bootstrap.
@@ -826,6 +841,11 @@ impl Snapclone {
             dht_schedule: Default::default(),
             dht_keepalive: None,
             reflexive: None,
+            identity: None,
+            mailbox_out: Default::default(),
+            mailbox_seen: Default::default(),
+            mailbox_checked_ms: None,
+            mailbox_waiting: Vec::new(),
             stun_failed: false,
             dht_peers: 0,
             dht_publish_pending: false,
@@ -1623,6 +1643,13 @@ impl Snapclone {
                         user_id: self.local_id.clone(),
                         addrs,
                         stamp: self.now_secs.max(0),
+                        // The mailbox key where the Qt build reads it, the
+                        // identity key, and the identity's signature binding
+                        // the two -- so a request can be sealed to us, and a
+                        // peer that has pinned us can check the key is ours.
+                        x_public: self.identity.as_ref().map(|i| i.x_public),
+                        ed_public: self.identity.as_ref().map(|i| i.public),
+                        xsig: self.identity.as_ref().map(|i| i.xsig()),
                     };
                     let plain = crate::dht_announce::render(&ann);
                     match crate::dht_envelope::random_nonce() {
@@ -1655,6 +1682,16 @@ impl Snapclone {
                 // `dht::publish_raw`.
                 h.resolve_raw(id);
             }
+            // OUR MAILBOX, every 90 s (the Qt build's kMailboxCheckMs): the
+            // requests contacts left while we were offline. Not scheduled
+            // through `dht_schedule`, which rotates CONTACTS; its answer is
+            // recognised by the key and never ends a contact lookup.
+            if !self.local_id.is_empty()
+                && self.mailbox_checked_ms.is_none_or(|t| now_ms.saturating_sub(t) >= crate::mailbox::CHECK_EVERY_MS)
+            {
+                self.mailbox_checked_ms = Some(now_ms);
+                h.resolve_raw(&crate::mailbox::mailbox_key(&self.local_id));
+            }
         }
 
         let Some(h) = self.dht.as_ref() else { return };
@@ -1662,6 +1699,9 @@ impl Snapclone {
         for ev in events {
             use snapclone_presence::node_host::Event;
             match ev {
+                Event::ResolvedRaw { sc_id, values } if crate::mailbox::is_mailbox_key(&sc_id) => {
+                    self.read_mailbox(values, now_ms);
+                }
                 Event::ResolvedRaw { sc_id, values } => {
                     self.dht_schedule.finished(&sc_id, !values.is_empty());
                     // Unwrap, parse, then take only the FRESHEST
@@ -1682,13 +1722,24 @@ impl Snapclone {
                             "{sc_id}: found {} DHT record(s) this build cannot read",
                             values.len());
                     }
+                    self.learn_mailbox_key(&sc_id, &anns);
                     let candidates = crate::dht_announce::newest(&anns);
                     let ours = crate::dht_announce::local_ipv4s();
+                    let mut reached = false;
                     if let Some(best) = crate::dht_announce::best_for(&ours, &candidates) {
                         if let Some(ip) = parse_dotted_quad(&best.host) {
                             self.note_peer_addr(&sc_id, ip, best.punch_port, now_ms);
                             self.feed_note = format!("{sc_id} found via DHT");
+                            reached = true;
                         }
+                    }
+                    if reached {
+                        self.mailbox_out.reached(&sc_id);
+                    } else {
+                        // NOBODY THERE: leave a request in their mailbox, so
+                        // they connect back when they come online -- no need
+                        // for both to be online at once.
+                        self.leave_request(&sc_id, now_ms);
                     }
                     if self.dht_schedule.silent() {
                         self.feed_note =
@@ -1781,6 +1832,155 @@ impl Snapclone {
                     self.dht_schedule.reset();
                 }
             }
+        }
+    }
+
+    /// Learn a contact's mailbox key from their presence records, judged
+    /// against what we know of them (`mailbox::accept_peer_key`).
+    ///
+    /// An identity key in the record whose fingerprint IS the sc-ID pins that
+    /// contact if nothing is pinned yet -- trust on first use, the same bargain
+    /// LAN gossip makes, and after it every later mailbox key must be signed by
+    /// that identity.
+    pub fn learn_mailbox_key(&mut self, sc_id: &str, anns: &[crate::dht_announce::Announcement]) {
+        if self.contact_book.get(sc_id).is_none() {
+            return;
+        }
+        let Some(ann) = anns.iter().filter(|a| a.x_public.is_some()).max_by_key(|a| a.stamp) else { return };
+        let x = ann.x_public.expect("filtered");
+        if let Some(ed) = ann.ed_public {
+            if crate::identity::fingerprint(&ed) == sc_id
+                && self.contact_book.get(sc_id).is_some_and(|c| c.public.is_none())
+                && self.contact_book.pin(sc_id, ed) == crate::contact_book::Pin::First
+            {
+                self.contacts_dirty = true;
+            }
+        }
+        let pinned = self.contact_book.get(sc_id).and_then(|c| c.public);
+        match crate::mailbox::accept_peer_key(&x, ann.xsig.as_ref(), pinned.as_ref()) {
+            crate::mailbox::PeerKey::Verified | crate::mailbox::PeerKey::Unverified => {
+                if self.contact_book.set_mailbox(sc_id, x) {
+                    self.contacts_dirty = true;
+                }
+                self.retry_waiting_mail(sc_id);
+            }
+            crate::mailbox::PeerKey::Refused => {
+                self.feed_note = format!(
+                    "{sc_id}: a DHT record offered a mailbox key their identity did not sign — ignored");
+            }
+        }
+    }
+
+    /// The request we would leave: where to reach us, as the Qt build fills it
+    /// (`AppController_connect.cpp`): a TCP address (public if known), a punch
+    /// address (the STUN-reflexive one), the time, and our LAN address.
+    fn own_connreq(&self) -> Option<crate::mailbox::ConnReq> {
+        let port = self.settings.current.network.listen_port;
+        let lan = crate::dht_announce::local_ipv4s().into_iter().next().map(|ip| (ip.to_string(), port));
+        let public = self.dht.as_ref().and_then(|h| h.public_ip()).map(|ip| ip.to_string());
+        let tcp_host = public.clone().or_else(|| lan.as_ref().map(|l| l.0.clone()))?;
+        let punch = match self.reflexive {
+            Some(r) => (r.ip().to_string(), r.port()),
+            None => (tcp_host.clone(), port),
+        };
+        Some(crate::mailbox::ConnReq {
+            from: self.local_id.clone(),
+            tcp: (tcp_host.clone(), port),
+            punch,
+            ts: self.now_secs.max(0),
+            // Omitted when it is the same as the TCP host, as the Qt build does.
+            lan: lan.filter(|l| l.0 != tcp_host),
+        })
+    }
+
+    /// Leave (or re-leave) a connection request for an unreachable contact, if
+    /// one is due and we hold their mailbox key.
+    pub fn leave_request(&mut self, target: &str, now_ms: u64) {
+        let Some(id) = self.identity.as_ref() else { return };
+        let Some(their) = self.contact_book.get(target).and_then(|c| c.mailbox) else { return };
+        if !self.mailbox_out.unreachable(target, now_ms) {
+            return;
+        }
+        let _ = (id, their);
+        let Some(req) = self.own_connreq() else { return };
+        let Some(blob) = self.seal_request(target, &req) else { return };
+        if let Some(h) = self.dht.as_ref() {
+            // One value per (sender, target), so a republish replaces rather
+            // than accumulates where the DHT honours value ids.
+            let vid = crate::identity::dht_value_id(&format!("{}->{target}", self.local_id));
+            h.publish_raw(&crate::mailbox::mailbox_key(target), vid, blob);
+            self.feed_note = format!("{target} is offline — left a connection request in their mailbox");
+        }
+    }
+
+    /// Seal `req` for `target` with our mailbox key and theirs: the Qt blob.
+    /// `None` without an identity or without their key.
+    pub fn seal_request(&self, target: &str, req: &crate::mailbox::ConnReq) -> Option<Vec<u8>> {
+        let id = self.identity.as_ref()?;
+        let their = self.contact_book.get(target)?.mailbox?;
+        let key = crate::mailbox::session_key(&id.x_secret, &their);
+        Some(crate::mailbox::seal_blob(&self.local_id, &key, crate::mailbox::render(req).as_bytes()))
+    }
+
+    /// What our mailbox held.
+    pub fn read_mailbox(&mut self, values: Vec<Vec<u8>>, now_ms: u64) {
+        for blob in values {
+            self.open_mail(blob, now_ms);
+        }
+    }
+
+    /// Open one request and act on it: learn the sender's address so the dial
+    /// path connects to them. A request from someone who is not a contact is
+    /// ignored (no key to open it with, and a stranger's request is the friend-
+    /// request flow's business, not this one); one from a contact whose key we
+    /// lack waits for a lookup of them to supply it.
+    fn open_mail(&mut self, blob: Vec<u8>, now_ms: u64) {
+        let Some(id) = self.identity.as_ref() else { return };
+        let Some((sender, _)) = crate::mailbox::blob_sender(&blob) else { return };
+        let sender = sender.to_string();
+        let Some(contact) = self.contact_book.get(&sender) else { return };
+        let Some(their) = contact.mailbox else {
+            if self.mailbox_waiting.len() < 16 && !self.mailbox_waiting.contains(&blob) {
+                self.mailbox_waiting.push(blob);
+                if let Some(h) = self.dht.as_ref() { h.resolve_raw(&sender); }
+            }
+            return;
+        };
+        let key = crate::mailbox::session_key(&id.x_secret, &their);
+        let Some(plain) = crate::mailbox::open_blob(&blob, &key) else { return };
+        let Some(req) = std::str::from_utf8(&plain).ok().and_then(crate::mailbox::parse) else { return };
+        // The sealed `from` must be the claimed sender: the blob's prefix is
+        // outside the AEAD, so a mismatch is somebody else's request re-labelled.
+        if req.from != sender || self.now_secs - req.ts > crate::mailbox::MAX_AGE_SECS {
+            return;
+        }
+        let Some(nonce) = crate::mailbox::blob_nonce(&blob) else { return };
+        if !self.mailbox_seen.first(nonce) {
+            return;
+        }
+        let ours = crate::dht_announce::local_ipv4s();
+        let mut candidates = vec![crate::dht_announce::Addr::new(&req.tcp.0, req.tcp.1, req.punch.1)];
+        if let Some((h, p)) = &req.lan {
+            candidates.push(crate::dht_announce::Addr::new(h, *p, *p));
+        }
+        if let Some(best) = crate::dht_announce::best_for(&ours, &candidates) {
+            if let Some(ip) = parse_dotted_quad(&best.host) {
+                self.note_peer_addr(&sender, ip, best.punch_port, now_ms);
+            }
+        }
+        self.mailbox_out.reached(&sender);
+        self.feed_note = format!("{sender} left a connection request — connecting");
+    }
+
+    /// A contact's mailbox key just arrived: open what was waiting on it.
+    fn retry_waiting_mail(&mut self, sc_id: &str) {
+        let (mine, rest): (Vec<Vec<u8>>, Vec<Vec<u8>>) = std::mem::take(&mut self.mailbox_waiting)
+            .into_iter()
+            .partition(|b| crate::mailbox::blob_sender(b).is_some_and(|(s, _)| s == sc_id));
+        self.mailbox_waiting = rest;
+        let now_ms = (self.now_secs.max(0) as u64) * 1000;
+        for b in mine {
+            self.open_mail(b, now_ms);
         }
     }
 
@@ -6457,6 +6657,80 @@ mod tests {
             frame(&mut app, vec![]);
         }
         app.picker.query.clone()
+    }
+
+    /// Two installations, contacts of each other, one offline: A seals a request
+    /// for B, B opens it from its mailbox and learns where A is. Then the ways a
+    /// request must NOT be acted on: replayed, re-labelled with another sender,
+    /// stale, or sealed with a key B does not hold.
+    #[test]
+    fn a_connection_request_left_in_the_mailbox_reaches_its_contact() {
+        let ida = crate::identity::create().unwrap();
+        let idb = crate::identity::create().unwrap();
+        let mk = |me: &crate::identity::Identity, other: &crate::identity::Identity| {
+            let mut s = app();
+            s.local_id = me.sc_id.clone();
+            s.identity = Some(me.clone());
+            s.now_secs = 1_790_000_000;
+            s.contact_book.upsert(&other.sc_id, 9876, 1);
+            s
+        };
+        let mut a = mk(&ida, &idb);
+        let mut b = mk(&idb, &ida);
+        let req = crate::mailbox::ConnReq {
+            from: ida.sc_id.clone(),
+            tcp: ("203.0.113.7".into(), 9876),
+            punch: ("203.0.113.7".into(), 41000),
+            ts: 1_790_000_000,
+            lan: None,
+        };
+        assert!(a.seal_request(&idb.sc_id, &req).is_none(), "sealed without B's mailbox key");
+
+        // Each learns the other's mailbox key from a presence record, signed
+        // by the identity -- and B, with no pin yet, pins A's identity from it.
+        let ann = |id: &crate::identity::Identity| crate::dht_announce::Announcement {
+            user_id: id.sc_id.clone(),
+            addrs: vec![], stamp: 1,
+            x_public: Some(id.x_public), ed_public: Some(id.public), xsig: Some(id.xsig()),
+        };
+        a.learn_mailbox_key(&idb.sc_id, &[ann(&idb)]);
+        let blob = a.seal_request(&idb.sc_id, &req).expect("A holds B's key now");
+
+        // B has not learned A's key yet: the request waits, then opens when the key arrives.
+        b.read_mailbox(vec![blob.clone()], 1);
+        assert!(b.punch.get(&ida.sc_id).is_none(), "opened without A's key");
+        b.learn_mailbox_key(&ida.sc_id, &[ann(&ida)]);
+        assert_eq!(b.contact_book.get(&ida.sc_id).unwrap().public, Some(ida.public), "A's identity was not pinned");
+        let got = b.punch.get(&ida.sc_id).expect("the waiting request was not opened when the key arrived");
+        assert_eq!(got.ip, [203, 0, 113, 7]);
+        assert_eq!(got.port, 41000, "the punch port, not the TCP one");
+
+        // Replayed: acted on once.
+        b.punch = Default::default();
+        b.read_mailbox(vec![blob.clone()], 2);
+        assert!(b.punch.get(&ida.sc_id).is_none(), "a replayed request was acted on");
+
+        // Re-labelled: the sealed `from` must match the claimed sender.
+        let mut forged = req.clone();
+        forged.from = "sc-99999999".into();
+        let fb = a.seal_request(&idb.sc_id, &forged).unwrap();
+        b.read_mailbox(vec![fb], 3);
+        assert!(b.punch.get(&ida.sc_id).is_none(), "a request claiming another sender was acted on");
+
+        // Stale: older than the value lifetime.
+        let mut old = req.clone();
+        old.ts -= crate::mailbox::MAX_AGE_SECS + 1;
+        b.read_mailbox(vec![a.seal_request(&idb.sc_id, &old).unwrap()], 4);
+        assert!(b.punch.get(&ida.sc_id).is_none(), "a stale request was acted on");
+
+        // A key B does not hold: a record planted under A's key with a
+        // different mailbox key and no valid signature is REFUSED, because A's
+        // identity is pinned now.
+        let (_, planted) = crypto_kit::x25519_keypair();
+        let mut bad = ann(&ida);
+        bad.x_public = Some(planted);
+        b.learn_mailbox_key(&ida.sc_id, &[bad]);
+        assert_eq!(b.contact_book.get(&ida.sc_id).unwrap().mailbox, Some(ida.x_public), "a planted key replaced the real one");
     }
 
     #[test]
