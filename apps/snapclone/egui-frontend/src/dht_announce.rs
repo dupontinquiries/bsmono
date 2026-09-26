@@ -62,11 +62,15 @@
 
 use std::net::{Ipv4Addr, UdpSocket};
 
-/// Re-announce interval. The C++ uses 55 minutes against a DHT value
-/// lifetime of about an hour, and the margin is the point: republishing at
-/// the TTL means every peer has a window where your record has expired and
-/// the new one has not propagated. My first version used five minutes,
-/// which is eleven times the traffic for a record that lasts an hour.
+/// The Qt build's re-announce interval (`Timings::kDhtReannounceMs`), kept for
+/// reference -- NOT this build's republish cadence.
+///
+/// This comment used to say the C++ uses 55 minutes "against a DHT value lifetime
+/// of about an hour". An OpenDHT value lives 10 minutes (`value.h`,
+/// `DEFAULT_VALUE_EXPIRATION`); the Qt presence put is `permanent=true`, which the
+/// local OpenDHT node refreshes on its own, and this timer only re-announces on
+/// top of that. The Rust node has no permanent puts, so it republishes every 8
+/// minutes -- see `dht_presence::PUBLISH_EVERY_MS`.
 pub const REANNOUNCE_MS: u64 = 55 * 60 * 1000;
 
 /// One reachable address.

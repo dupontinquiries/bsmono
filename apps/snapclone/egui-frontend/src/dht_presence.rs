@@ -44,18 +44,21 @@
 /// someone who came online is found within a coffee break.
 pub const LOOKUP_COOLDOWN_MS: u64 = 10 * 60 * 1000;
 
-/// How often to republish our own presence.
+/// How often to republish our own presence: every 8 minutes
+/// (`node_host::REPUBLISH_WITHIN`).
 ///
-/// 55 minutes, from the Qt build (`Timings::kDhtReannounceMs`) against a
-/// DHT value lifetime of about an hour. The margin is the point:
-/// republishing AT the TTL leaves every peer a window where the old record
-/// has expired and the new one has not propagated.
+/// This was 55 minutes, copied from the Qt build's `kDhtReannounceMs` on the
+/// belief that a DHT value lives about an hour. It does not: OpenDHT expires a
+/// value 10 minutes after it was stored (`DEFAULT_VALUE_EXPIRATION`,
+/// vendor/opendht/include/opendht/value.h). The Qt build gets away with 55
+/// because its presence put is `permanent=true`, and a permanent put is
+/// refreshed by the local OpenDHT node itself before it expires; the 55-minute
+/// timer only re-announces on top of that. This node has no such machinery, so
+/// the record was findable for 10 minutes out of every 55.
 ///
-/// My first version used five minutes on the reasoning that "a stale record
-/// makes US unreachable, which is the failure the user notices". True, and
-/// it does not follow — the record lasts an hour, so five minutes is eleven
-/// times the traffic for no extra reachability, on a phone radio.
-pub const PUBLISH_EVERY_MS: u64 = crate::dht_announce::REANNOUNCE_MS;
+/// 8 minutes is what the Qt build uses for its own non-permanent records
+/// (the connection-request mailbox) against the same 10-minute expiry.
+pub const PUBLISH_EVERY_MS: u64 = snapclone_presence::node_host::REPUBLISH_WITHIN * 1000;
 
 /// A lookup that has not answered in this long is presumed lost, so the
 /// scheduler is not wedged forever on one unlucky id. The DHT layer has no
@@ -155,6 +158,14 @@ impl Schedule {
             plan.resolve = Some(id);
         }
         plan
+    }
+
+    /// Publish on the next tick instead of waiting out the interval. For a
+    /// publish that reached nobody (the node had no usable peers yet): once the
+    /// table recovers, waiting eight more minutes to be findable is the same as
+    /// having failed.
+    pub fn republish_soon(&mut self) {
+        self.last_publish_ms = None;
     }
 
     /// Has this node asked enough times, and heard nothing at all, that
@@ -261,6 +272,18 @@ mod tests {
         let next = s.tick(LOOKUP_TIMEOUT_MS, &c, false).resolve
             .expect("still wedged after the timeout");
         assert_ne!(next, stuck);
+    }
+
+    /// The record must be republished before OpenDHT expires it (10 minutes).
+    #[test]
+    fn the_republish_interval_beats_the_value_lifetime() {
+        assert!(PUBLISH_EVERY_MS < 10 * 60 * 1000, "republishing every {PUBLISH_EVERY_MS} ms outlives the record");
+        assert!(PUBLISH_EVERY_MS >= 5 * 60 * 1000, "republishing every {PUBLISH_EVERY_MS} ms is radio for nothing");
+        let mut s = Schedule::new();
+        assert!(s.tick(0, &[], true).publish);
+        assert!(!s.tick(60_000, &[], true).publish);
+        s.republish_soon();
+        assert!(s.tick(61_000, &[], true).publish, "republish_soon did not publish on the next tick");
     }
 
     #[test]

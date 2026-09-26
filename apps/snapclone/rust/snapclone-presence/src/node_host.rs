@@ -72,14 +72,21 @@ enum Req {
     Resolve { sc_id: String },
     ResolveRaw { sc_id: String },
     Bootstrap { addr: SocketAddr, id: NodeId },
+    /// A `host:port` to resolve ON THE WORKER. DNS blocks for as long as the
+    /// resolver likes, and the app used to do it on its UI thread at spawn.
+    BootstrapHost { host: String },
 }
 
 /// Something that happened, polled by the app.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// Published to this many peers. Zero is normal on a fresh node —
-    /// see `dht::publish`.
+    /// Published: this many peers ACCEPTED the record (see `dht::publish`).
+    /// Zero is normal on a fresh node.
     Published { sc_id: String, peers: usize },
+    /// The routing table changed size: `usable` contacts that are not Bad.
+    /// Sent after bootstrap entries are added, after the find-self walk that
+    /// follows them, and after maintenance. Zero means the node is cut off.
+    Table { usable: usize },
     /// Resolved. An empty vec means the lookup finished and found
     /// nothing, which is different from never having asked.
     Resolved { sc_id: String, found: Vec<crate::presence::Presence> },
@@ -119,7 +126,40 @@ fn with_rt<R>(node: &std::sync::Mutex<Node>, now: u64,
             n.rt.saw(c.id, c.addr, c.last_seen);
         }
     }
+    // And the STRIKES. A lookup that found a node dead marked it on the copy;
+    // merging only the contacts it saw alive threw that away, so the shared
+    // table kept offering the same dead node to every lookup.
+    let before: std::collections::HashMap<NodeId, u32> = n.rt.failures().into_iter().collect();
+    for (id, f) in rt.failures() {
+        let had = before.get(&id).copied().unwrap_or(0);
+        for _ in had..f {
+            n.rt.failed(&id, now);
+        }
+    }
     r
+}
+
+/// Walk toward our own id: the Kademlia join. It is what turns a bootstrap
+/// entry -- an address under a GUESSED id -- into a real contact (the reply
+/// names the responder), and what fills the buckets near us, which are the ones
+/// asked about our key. Adding the entry alone taught the table one address and
+/// nothing else.
+fn find_self(node: &std::sync::Mutex<Node>, tx: &UdpTransport, id: NodeId, local: SocketAddr) -> usize {
+    let now = now_secs();
+    let me = me_contact(id, local, now);
+    with_rt(node, now, |rt| {
+        snapcore::lookup::lookup_nodes(&me, rt, &id, tx, snapcore::lookup::ALPHA, now);
+    });
+    usable(node)
+}
+
+fn usable(node: &std::sync::Mutex<Node>) -> usize {
+    match node.lock() { Ok(n) => n.rt.usable(), Err(p) => p.into_inner().rt.usable() }
+}
+
+/// Resolve `host:port` to its first address, if any.
+fn resolve_host(host: &str) -> Option<SocketAddr> {
+    std::net::ToSocketAddrs::to_socket_addrs(host).ok()?.find(|a| a.is_ipv4())
 }
 
 impl NodeHost {
@@ -136,6 +176,12 @@ impl NodeHost {
     /// `spawn` with the keepalive period chosen — tests use a short one.
     pub fn spawn_with_keepalive(id: NodeId, bind: SocketAddr, keepalive: std::time::Duration)
         -> std::io::Result<NodeHost> {
+        Self::spawn_tuned(id, bind, keepalive, REJOIN_EVERY)
+    }
+
+    /// `spawn` with both maintenance periods chosen — tests use short ones.
+    pub fn spawn_tuned(id: NodeId, bind: SocketAddr, keepalive: std::time::Duration,
+                       rejoin_every: std::time::Duration) -> std::io::Result<NodeHost> {
         let tx_udp = std::sync::Arc::new(UdpTransport::bind(id, bind)?);
         let local = tx_udp.local_addr()?;
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Req>();
@@ -145,28 +191,57 @@ impl NodeHost {
 
         let transport = tx_udp.clone();
         std::thread::spawn(move || {
+            // Everything we were ever told to bootstrap from, so a node whose
+            // table empties (a network change, a long sleep) can join again.
+            // The reference re-bootstraps on its own (`BOOTSTRAP_PERIOD`); this
+            // node used to add the list once at spawn and never again.
+            let mut seeds: Vec<Seed> = Vec::new();
+            let mut need_join = false;
+            let mut last_rejoin: Option<std::time::Instant> = None;
+            // The table size last reported, so a keepalive that strikes the last
+            // peer out says so (Event::Table { usable: 0 }) rather than leaving
+            // the app to infer it from a run of unanswered pings.
+            let mut reported_usable: Option<usize> = None;
             loop {
-                // Blocking recv, not a poll loop: an idle node should
-                // cost nothing. A DHT that burns a core waiting for
-                // something to do is a battery bug on a phone, and this
-                // is a phone app.
-                // Blocking with a period, not a poll loop: the thread
-                // wakes once per keepalive when idle, and that wake is the
-                // keepalive. See `KEEPALIVE` for why it exists at all.
-                let req = match req_rx.recv_timeout(keepalive) {
-                    Ok(r) => r,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        let now = now_secs();
-                        let me = me_contact(id, local, now);
-                        let targets = {
-                            let n = match node.lock() { Ok(n) => n, Err(p) => p.into_inner() };
-                            // The peers most likely to hold our mapping and
-                            // to be asked about us: the ones nearest our
-                            // own id. Bounded, because this runs for the
-                            // life of the app.
-                            n.rt.closest(&id, KEEPALIVE_PEERS)
-                        };
-                        if targets.is_empty() { continue; }
+                // A join is due once the burst of bootstrap requests the app
+                // sends at spawn has drained -- one walk for the lot, not one
+                // per entry.
+                let next = if need_join {
+                    match req_rx.try_recv() {
+                        Ok(r) => Some(r),
+                        Err(TryRecvError::Empty) => None,
+                        Err(TryRecvError::Disconnected) => return,
+                    }
+                } else {
+                    // Blocking with a period, not a poll loop: the thread
+                    // wakes once per keepalive when idle, and that wake is the
+                    // keepalive and the table maintenance. An idle node costs
+                    // one wake every 25 s -- see `KEEPALIVE`.
+                    match req_rx.recv_timeout(keepalive) {
+                        Ok(r) => Some(r),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                        // NodeHost was dropped; nobody is listening.
+                        Err(_) => return,
+                    }
+                };
+                let Some(req) = next else {
+                    if need_join {
+                        need_join = false;
+                        let n = find_self(&node, &tx_udp, id, local);
+                        if ev_tx.send(Event::Table { usable: n }).is_err() { return; }
+                        continue;
+                    }
+                    // Idle: keepalive, then maintenance.
+                    let now = now_secs();
+                    let me = me_contact(id, local, now);
+                    let targets = {
+                        let n = match node.lock() { Ok(n) => n, Err(p) => p.into_inner() };
+                        // The peers most likely to hold our mapping and to be
+                        // asked about us: the ones nearest our own id. Bounded,
+                        // because this runs for the life of the app.
+                        n.rt.closest(&id, KEEPALIVE_PEERS)
+                    };
+                    if !targets.is_empty() {
                         let mut answered = 0;
                         for c in &targets {
                             if snapcore::node::Transport::ping(&*tx_udp, &me, c) {
@@ -179,25 +254,59 @@ impl NodeHost {
                         if ev_tx.send(Event::Keepalive { pinged: targets.len(), answered }).is_err() {
                             return;
                         }
-                        continue;
                     }
-                    // The sender is gone, which means NodeHost was
-                    // dropped. Exit rather than report — nobody is
-                    // listening to the event channel either.
-                    Err(_) => return,
+                    // Outside the ping block: the tick that finds NO usable
+                    // target is exactly the one that has to report zero.
+                    let u = usable(&node);
+                    if reported_usable != Some(u) {
+                        reported_usable = Some(u);
+                        if ev_tx.send(Event::Table { usable: u }).is_err() { return; }
+                    }
+                    // A THIN TABLE REJOINS. Below MIN_USABLE contacts a lookup
+                    // has too few starting points to converge (and at zero,
+                    // none); re-add every seed -- re-resolving hostnames, whose
+                    // addresses may have changed with the network -- and walk
+                    // to ourselves again. Paced by REJOIN_EVERY so a node with no
+                    // network at all is not hammering a dead resolver.
+                    let thin = usable(&node) < MIN_USABLE;
+                    let due = last_rejoin.map_or(true, |t| t.elapsed() >= rejoin_every);
+                    if thin && due && !seeds.is_empty() {
+                        last_rejoin = Some(std::time::Instant::now());
+                        let now = now_secs();
+                        {
+                            let mut n = match node.lock() { Ok(n) => n, Err(p) => p.into_inner() };
+                            for s in &seeds {
+                                if let Some((addr, sid)) = s.resolve() { n.rt.saw(sid, addr, now); }
+                            }
+                        }
+                        let n = find_self(&node, &tx_udp, id, local);
+                        if ev_tx.send(Event::Table { usable: n }).is_err() { return; }
+                    }
+                    continue;
                 };
                 let now = now_secs();
                 let ev = match req {
                     Req::Bootstrap { addr, id: peer } => {
-                        // A routing table with no contacts can find
-                        // nobody, so this is the step that makes every
-                        // other one possible. Recorded as a publish of
-                        // zero rather than a distinct event: the app's
-                        // question is "can I reach anyone", and the
-                        // table size answers it.
+                        // A routing table with no contacts can find nobody, so
+                        // this is the step that makes every other one possible.
+                        // The join walk follows once the burst has drained.
+                        seeds.push(Seed::Addr(addr, peer));
                         let mut n = match node.lock() { Ok(n) => n, Err(p) => p.into_inner() };
                         n.rt.saw(peer, addr, now);
-                        Event::Published { sc_id: String::new(), peers: n.rt.len() }
+                        need_join = true;
+                        Event::Table { usable: n.rt.usable() }
+                    }
+                    Req::BootstrapHost { host } => {
+                        let seed = Seed::Host(host);
+                        if let Some((addr, sid)) = seed.resolve() {
+                            let mut n = match node.lock() { Ok(n) => n, Err(p) => p.into_inner() };
+                            n.rt.saw(sid, addr, now);
+                            need_join = true;
+                        }
+                        // Kept even when it did not resolve now: DNS may come
+                        // back with the network, and maintenance retries it.
+                        seeds.push(seed);
+                        Event::Table { usable: usable(&node) }
                     }
                     Req::Publish { sc_id, name, ip, port } => {
                         let me = me_contact(id, local, now);
@@ -261,9 +370,17 @@ impl NodeHost {
         self.local
     }
 
-    /// Add a known peer so lookups have somewhere to start.
+    /// Add a known peer so lookups have somewhere to start. Remembered, and
+    /// re-added whenever the table runs thin (see `MIN_USABLE`).
     pub fn bootstrap(&self, addr: SocketAddr, id: NodeId) -> bool {
         self.tx.send(Req::Bootstrap { addr, id }).is_ok()
+    }
+
+    /// Bootstrap from a `host:port`, resolved on the worker thread -- never on
+    /// the caller's. The peer's id is guessed from the name until it answers
+    /// (the join walk corrects it). Remembered and re-resolved on rejoin.
+    pub fn bootstrap_host(&self, host: &str) -> bool {
+        self.tx.send(Req::BootstrapHost { host: host.to_string() }).is_ok()
     }
 
     pub fn publish(&self, sc_id: &str, name: &str, ip: &str, port: u16) -> bool {
@@ -337,12 +454,55 @@ pub const KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(25);
 /// them answer.
 pub const KEEPALIVE_PEERS: usize = 3;
 
-/// How long a published record lives, in seconds.
+/// How long a published record lives, in seconds: OpenDHT's
+/// `DEFAULT_VALUE_EXPIRATION` (10 min, `value.h`), which is what every reference
+/// node storing our record applies whatever we send. Used for our OWN copy, so
+/// we stop answering with a record at the same moment the network does.
 ///
-/// Short enough that a device that goes away stops being advertised
-/// within a few minutes; long enough that a phone does not have to wake
-/// up constantly to republish. Republishing is the caller's job.
-pub const DEFAULT_TTL: u64 = 300;
+/// Republishing is the caller's job and must come in under this -- see
+/// `REPUBLISH_WITHIN`. It was 300 here while the app republished every 55
+/// minutes, so our record existed on the network about one minute in five.
+pub const DEFAULT_TTL: u64 = 600;
+
+/// The latest a caller should republish, in seconds: the value lifetime less a
+/// margin for the walk and for peers whose clocks run ahead. The C++ build
+/// republishes its non-permanent records every 8 minutes against the same
+/// 10-minute expiry (`JamiAdapter_dht_impl.cpp`).
+pub const REPUBLISH_WITHIN: u64 = 8 * 60;
+
+/// Below this many usable contacts the node rejoins from its seeds. A lookup
+/// wants `ALPHA` starting points at the very least, and a table this thin is one
+/// dead router away from none.
+pub const MIN_USABLE: usize = 8;
+
+/// The shortest interval between rejoins. The reference's `BOOTSTRAP_PERIOD` is
+/// 10 s; this node rejoins from the keepalive tick (25 s) and no more often than
+/// this, so a phone with no network is not waking to hammer a dead resolver.
+pub const REJOIN_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A remembered bootstrap source.
+#[derive(Clone, Debug)]
+enum Seed {
+    Addr(SocketAddr, NodeId),
+    Host(String),
+}
+
+impl Seed {
+    fn resolve(&self) -> Option<(SocketAddr, NodeId)> {
+        match self {
+            Seed::Addr(a, id) => Some((*a, *id)),
+            // The id is unknown until the node answers. Derived from the name so
+            // two servers do not collide in the table; the reply corrects it.
+            Seed::Host(h) => resolve_host(h).map(|a| (a, guessed_id(h))),
+        }
+    }
+}
+
+/// A placeholder id for a seed known only by name: SHA-1 of the name (the same
+/// derivation sc-ID keys use), so it is stable and spread across the keyspace.
+fn guessed_id(name: &str) -> NodeId {
+    NodeId(crate::presence::key_for_scid(name).0)
+}
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -429,7 +589,36 @@ mod tests {
         let h = host();
         h.bootstrap("127.0.0.1:9".parse().unwrap(), id(2));
         match wait_for(&h) {
-            Some(Event::Published { peers, .. }) => assert_eq!(peers, 1),
+            Some(Event::Table { usable }) => assert_eq!(usable, 1),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Strikes a lookup records on its COPY of the table reach the shared table.
+    /// Only contacts seen alive used to be merged back, so a dead node found by
+    /// one lookup was offered to the next one fresh.
+    #[test]
+    fn a_lookups_strikes_are_merged_back() {
+        let node = std::sync::Mutex::new(Node::new(id(1), "127.0.0.1:1".parse().unwrap()));
+        let dead = id(9);
+        node.lock().unwrap().rt.saw(dead, "127.0.0.1:9".parse().unwrap(), 0);
+        for round in 1..=3u32 {
+            with_rt(&node, 10, |rt| rt.failed(&dead, 10));
+            let f = node.lock().unwrap().rt.failures().into_iter().find(|(i, _)| *i == dead).unwrap().1;
+            assert_eq!(f, round, "strike {round} was lost in the merge");
+        }
+        assert_eq!(node.lock().unwrap().rt.usable(), 0, "three merged strikes should make it Bad");
+    }
+
+    /// A hostname is resolved by the worker, not the caller, and reaches the table.
+    #[test]
+    fn a_hostname_seed_is_resolved_off_the_callers_thread() {
+        let h = host();
+        let started = std::time::Instant::now();
+        assert!(h.bootstrap_host("localhost:9"));
+        assert!(started.elapsed() < std::time::Duration::from_millis(50), "bootstrap_host blocked the caller");
+        match wait_for(&h) {
+            Some(Event::Table { usable }) => assert_eq!(usable, 1, "localhost did not reach the table"),
             other => panic!("{other:?}"),
         }
     }

@@ -50,17 +50,21 @@ pub fn key_of(h: &crate::InfoHash) -> Key {
     NodeId(h.0)
 }
 
+/// How many of the closest nodes a record is stored on -- OpenDHT's
+/// `TARGET_NODES`. The lookup finds `k` (20); storing to all of them is 2.5x the
+/// traffic of the reference for no extra findability, since a `get` walks to the
+/// same few nodes nearest the key.
+pub const STORE_ON: usize = 8;
+
 /// Publish this device's presence.
 ///
-/// Stores to the k closest peers `lookup_nodes` can find. Returns how
-/// many were told.
+/// Stores to the [`STORE_ON`] closest peers `lookup_nodes` can find. Returns how
+/// many ACCEPTED the put (`Transport::store_acked`) -- it used to be how many were
+/// asked, so a publish every peer refused (a stale token, a record too big)
+/// reported the same number as one that worked.
 ///
 /// **Zero is not an error.** A node that has just started, or one on a
-/// network with no other peers, legitimately knows nobody — and
-/// `store` is fire-and-forget over UDP, so even a positive count is
-/// "asked", not "stored". Reporting the count rather than a bool is what
-/// lets a caller tell "no peers yet" from "told eight peers" without
-/// either being a failure.
+/// network with no other peers, legitimately knows nobody.
 pub fn publish<T: Transport>(
     me: &Contact,
     rt: &mut RoutingTable,
@@ -75,11 +79,18 @@ pub fn publish<T: Transport>(
     let (hash, value) = crate::announce_record(sc_id, display_name, public_ip, punch_port);
     let key = key_of(&hash);
     let bytes = value.data.clone();
-    let peers = snapcore::lookup::lookup_nodes(me, rt, &key, tx, rt.params().k, now);
-    for p in &peers {
-        tx.store(me, p, key, bytes.clone(), ttl);
-    }
-    peers.len()
+    store_closest(me, rt, tx, key, bytes, ttl, now)
+}
+
+/// Walk to `key` and store `bytes` on the nearest [`STORE_ON`] nodes; how many
+/// accepted. One implementation for `publish` and `publish_raw`.
+fn store_closest<T: Transport>(me: &Contact, rt: &mut RoutingTable, tx: &T, key: Key,
+                               bytes: Vec<u8>, ttl: u64, now: u64) -> usize {
+    let peers = snapcore::lookup::lookup_nodes(me, rt, &key, tx, snapcore::lookup::ALPHA, now);
+    peers.iter()
+        .take(STORE_ON)
+        .filter(|p| tx.store_acked(me, p, key, bytes.clone(), ttl))
+        .count()
 }
 
 /// Publish a payload the CALLER built, under the sc-ID's key.
@@ -112,11 +123,7 @@ pub fn publish_raw<T: Transport>(
 ) -> usize {
     let key = key_of(&crate::presence::key_for_scid(sc_id));
     let _ = value_id; // carried by the transport's own value framing
-    let peers = snapcore::lookup::lookup_nodes(me, rt, &key, tx, rt.params().k, now);
-    for p in &peers {
-        tx.store(me, p, key, payload.clone(), ttl);
-    }
-    peers.len()
+    store_closest(me, rt, tx, key, payload, ttl, now)
 }
 
 /// Fetch the raw values stored under an sc-ID's key.
@@ -134,7 +141,7 @@ pub fn resolve_raw<T: Transport>(
     now: u64,
 ) -> Option<Vec<Vec<u8>>> {
     let key = key_of(&crate::presence::key_for_scid(sc_id));
-    let found = snapcore::lookup::lookup_value(me, rt, &key, tx, rt.params().k, now)?;
+    let found = snapcore::lookup::lookup_value(me, rt, &key, tx, snapcore::lookup::ALPHA, now)?;
     if found.is_empty() { None } else { Some(found) }
 }
 
@@ -173,7 +180,7 @@ pub fn resolve<T: Transport>(
     // the sc-ID alone.
     let (hash, _) = crate::announce_record(sc_id, "", "", 0);
     let key = key_of(&hash);
-    let found = snapcore::lookup::lookup_value(me, rt, &key, tx, rt.params().k, now)?;
+    let found = snapcore::lookup::lookup_value(me, rt, &key, tx, snapcore::lookup::ALPHA, now)?;
     let parsed: Vec<crate::presence::Presence> = found
         .iter()
         // A record that does not parse is SKIPPED, not fatal. Anyone can
@@ -263,6 +270,28 @@ mod tests {
         assert!(!stored.is_empty(), "nothing was published");
         let (hash, _) = crate::announce_record("sc-abcd", "", "", 0);
         assert_eq!(stored[0].0, key_of(&hash), "resolve would look under a different key");
+    }
+
+    /// The count is ACCEPTANCES. A peer that refuses the put (a stale token, a 413)
+    /// is not a peer that holds our record.
+    #[test]
+    fn a_refused_store_is_not_counted() {
+        struct Refuses(Recorder);
+        impl Transport for Refuses {
+            fn find_node(&self, f: &Contact, t: &Contact, g: &NodeId) -> Vec<Contact> { self.0.find_node(f, t, g) }
+            fn find_value(&self, f: &Contact, t: &Contact, k: &Key) -> FindValue { self.0.find_value(f, t, k) }
+            fn store(&self, f: &Contact, t: &Contact, k: Key, v: Vec<u8>, ttl: u64) { self.0.store(f, t, k, v, ttl) }
+            fn ping(&self, f: &Contact, t: &Contact) -> bool { self.0.ping(f, t) }
+            fn store_acked(&self, _: &Contact, _: &Contact, _: Key, _: Vec<u8>, _: u64) -> bool { false }
+        }
+        let me = contact(1, 100);
+        let peer = contact(2, 200);
+        let tx = Refuses(Recorder { known: vec![peer.clone()], ..Default::default() });
+        let mut rt = table(&me, &[peer.clone()]);
+        assert_eq!(publish(&me, &mut rt, &tx, "sc-abcd", "Ada", "10.0.0.2", 5000, 60, 0), 0);
+        let accepting = Recorder { known: vec![peer.clone()], ..Default::default() };
+        let mut rt = table(&me, &[peer]);
+        assert_eq!(publish(&me, &mut rt, &accepting, "sc-abcd", "Ada", "10.0.0.2", 5000, 60, 0), 1);
     }
 
     #[test]

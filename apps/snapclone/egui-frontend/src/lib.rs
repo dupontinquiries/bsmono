@@ -291,6 +291,8 @@ pub struct Snapclone {
     pub stun_failed: bool,
     /// Peers the node reported on its last publish or bootstrap.
     pub dht_peers: usize,
+    /// The last publish reached nobody; republish once the table has peers.
+    dht_publish_pending: bool,
     /// The "reachable from outside" hint has been shown this session.
     pub reachable_shown: bool,
     /// The accessibility scene the settings toggles register with.
@@ -826,6 +828,7 @@ impl Snapclone {
             reflexive: None,
             stun_failed: false,
             dht_peers: 0,
+            dht_publish_pending: false,
             reachable_shown: false,
             a11y: uikit_egui::a11y::A11yScene::new(),
             pending_vcard_text: None,
@@ -1523,22 +1526,14 @@ impl Snapclone {
                     // guessing it here would be a second, worse copy of
                     // it.
                     for addr in self.bootstrap_addresses(true, false) {
-                        // Resolution can fail — a hostname with no DNS,
-                        // an IPv6-only network. Skipped rather than
-                        // fatal: the list exists precisely so one dead
-                        // entry is not the end of it.
-                        if let Ok(mut it) = std::net::ToSocketAddrs::to_socket_addrs(&addr) {
-                            if let Some(sa) = it.next() {
-                                // The peer's real node id is unknown
-                                // until it answers. Derived from its
-                                // address so two bootstrap servers do
-                                // not collide in the routing table —
-                                // the id is corrected when the node
-                                // actually replies.
-                                let id = crate::identity::dht_node_id(&addr);
-                                h.bootstrap(sa, id);
-                            }
-                        }
+                        // Resolved by the NODE's worker thread, not here:
+                        // `to_socket_addrs` is blocking DNS, and this runs on
+                        // the UI thread -- a slow resolver froze the first
+                        // frame. The node also remembers each entry and
+                        // re-resolves it when its table runs thin, so a
+                        // network that comes back is joined again. An entry
+                        // that never resolves costs nothing but itself.
+                        h.bootstrap_host(&addr);
                     }
                     // And every peer we remember, under its real id. On a
                     // network without the servers above, this is the
@@ -1670,10 +1665,10 @@ impl Snapclone {
                 Event::ResolvedRaw { sc_id, values } => {
                     self.dht_schedule.finished(&sc_id, !values.is_empty());
                     // Unwrap, parse, then take only the FRESHEST
-                    // announcement: values live about an hour, so this
-                    // morning's record is still there this afternoon
-                    // pointing at an address that now belongs to somebody
-                    // else.
+                    // announcement: a lookup can return a record that has
+                    // not expired yet (up to 10 minutes) from before a
+                    // network change, pointing at an address that now
+                    // belongs to somebody else.
                     let anns: Vec<crate::dht_announce::Announcement> = values.iter()
                         .filter_map(|v| crate::dht_envelope::open(&sc_id, v).ok())
                         .filter_map(|(_, plain)| String::from_utf8(plain).ok())
@@ -1750,7 +1745,22 @@ impl Snapclone {
                 // Zero peers is the normal state of a node that has just
                 // started and knows nobody, so it is not reported as a
                 // problem.
-                Event::Published { peers, .. } => { self.dht_peers = peers; }
+                // How many peers ACCEPTED our record. Zero with a usable table
+                // is a refusal; zero with an empty one is "not yet" -- either
+                // way it is republished as soon as there are peers, rather than
+                // after the full interval.
+                Event::Published { peers, .. } => {
+                    if peers == 0 {
+                        self.dht_publish_pending = true;
+                    }
+                }
+                Event::Table { usable } => {
+                    self.dht_peers = usable;
+                    if usable > 0 && self.dht_publish_pending {
+                        self.dht_publish_pending = false;
+                        self.dht_schedule.republish_soon();
+                    }
+                }
                 Event::Keepalive { pinged, answered } => {
                     self.dht_keepalive = Some((pinged, answered));
                     if pinged > 0 && answered == 0 {
