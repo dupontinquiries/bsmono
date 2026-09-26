@@ -65,6 +65,11 @@ impl Game {
         // 6d. objectives (bosses.rs)
         self.bosses_tick(dt);
         self.moonwell_tick(dt);
+        // overtime (the sky map): said once, as it begins
+        let ot = crate::map::OVERTIME_AT;
+        if crate::map::active().overtime(ot + 60.0) > 1.0 && self.t >= ot && self.t - dt < ot {
+            self.events.push(Event::Announce { text: "OVERTIME: THE BASTIONS WEAKEN".into() });
+        }
         // 6e. catastrophes (disasters.rs)
         self.disasters_tick(dt);
 
@@ -75,11 +80,12 @@ impl Game {
     fn spawn_wave(&mut self, lane: Lane, team: Team) {
         let path = lane.path_for(team);
         let scale = 1.0 + (self.t / 60.0).min(15.0) * 0.07;
-        let hp = MINION_HP * scale;
-        // melee in ranks of up to four abreast, casters in ranks behind
+        let hp = MINION_HP * scale * self.lane_surge(team, lane);
+        // melee in ranks (four abreast, eight for a big wave), casters behind
         let (melee, casters) = crate::map::active().wave(self.waves);
         let rank = |k: usize, n: usize, back: f32| -> [f32; 2] {
-            let per = n.min(4).max(1);
+            // eight abreast for a big wave (the sky's 32 u lanes), else four
+            let per = if n > 8 { 8 } else { n.min(4).max(1) };
             let (row, col) = (k / per, k % per);
             let across = (col as f32 - (per as f32 - 1.0) * 0.5) * 1.3 + if row % 2 == 1 { 0.4 } else { 0.0 };
             [back - row as f32 * 1.4, across]
@@ -121,8 +127,21 @@ impl Game {
                 foe: None,
                 think_t,
                 left_at: None,
+                // ranks spread wider on a wide lane
+                lane_off: o[1] * if melee + casters > 5 { 1.6 } else { 1.0 },
             });
         }
+    }
+
+    /// How much harder `team`'s minions in `lane` hit and last: 1 plus the
+    /// map's siege surge for each enemy tower fallen in that lane.
+    pub fn lane_surge(&self, team: Team, lane: Lane) -> f32 {
+        let per = crate::map::active().siege_surge();
+        if per <= 0.0 {
+            return 1.0;
+        }
+        let standing = self.towers.iter().filter(|t| t.team != team && t.lane == lane && t.hp > 0.0).count();
+        1.0 + per * 2usize.saturating_sub(standing) as f32
     }
 
     /// The index of the minion with this id (the Vec is sorted by id).
@@ -223,10 +242,15 @@ impl Game {
                         }
                     }
                 }
+                // A tower is seen from further off: a wave marching its
+                // ranks down a wide lane passes a tower on the centre-line
+                // up to eight u to one side, and at the plain aggro range
+                // the outer ranks walked straight past it (the sky map's
+                // lanes stalled with every tower at full health).
                 for (ti, tw) in self.towers.iter().enumerate() {
                     if tw.team != m.team && tw.hp > 0.0 {
                         let d = flat(tw.pos - m.pos);
-                        if d < aggro {
+                        if d < aggro + 10.0 {
                             seen.push(Seen { foe: Foe::Tower(ti), class: Class::Structure, dist: d });
                         }
                     }
@@ -585,11 +609,18 @@ impl Game {
                         _ => {
                             m.left_at = None;
                             let path = crate::consts::lane_path(mlane, mteam);
-                            let target = path[m.wp.min(path.len() - 1)];
-                            if flat(target - m.pos) < 1.5 && m.wp + 1 < path.len() {
+                            // its own line down the lane, `lane_off` across
+                            let slot = |wp: usize| {
+                                let w = wp.min(path.len() - 1);
+                                let a = path[w.saturating_sub(1)];
+                                let b = path[(w + 1).min(path.len() - 1)];
+                                let d = Vec3::new(b.x - a.x, 0.0, b.z - a.z).normalize_or_zero();
+                                path[w] + Vec3::new(-d.z, 0.0, d.x) * m.lane_off
+                            };
+                            if flat(slot(m.wp) - m.pos) < 1.5 && m.wp + 1 < path.len() {
                                 m.wp += 1;
                             }
-                            Some(path[m.wp.min(path.len() - 1)])
+                            Some(slot(m.wp))
                         }
                     }
                 }
@@ -818,6 +849,7 @@ impl Game {
                     (flat(p - m.pos) < Self::minion_reach(m, f)).then_some(t)
                 })
             };
+            let surge = self.lane_surge(self.minions[mi].team, self.minions[mi].lane);
             let m = &mut self.minions[mi];
             m.atk_timer -= dt;
             m.atk_anim = (m.atk_anim - dt * 4.0).max(0.0);
@@ -828,9 +860,10 @@ impl Game {
             m.atk_anim = 1.0;
             let mut dmg = if m.caster { MINION_CASTER_DMG } else { MINION_DMG };
             dmg *= 1.0 + (self.t / 60.0).min(15.0) * 0.08;
+            dmg *= surge;
             // structures take bonus minion damage so lanes actually fall
             if matches!(target.unwrap(), TargetRef::Tower(_) | TargetRef::Titan(_)) {
-                dmg *= 2.4;
+                dmg *= 2.4 * crate::map::active().minion_structure_mul();
             }
             match target.unwrap() {
                 TargetRef::God(gi) => {
@@ -1106,7 +1139,7 @@ impl Game {
             }
             if hit.is_none() {
                 for (bi, b) in self.bosses.list.iter().enumerate() {
-                    if b.alive && (b.pos + Vec3::Y * 2.0 - p.pos).length() < p.radius + 2.2 {
+                    if b.grounded() && (b.pos + Vec3::Y * 2.0 - p.pos).length() < p.radius + 2.2 {
                         hit = Some(TargetRef::Boss(bi));
                         break;
                     }
@@ -1158,7 +1191,7 @@ impl Game {
             }
         }
         for (bi, b) in self.bosses.list.iter().enumerate() {
-            if b.alive && b.pos.distance(center) <= radius + 2.0 {
+            if b.grounded() && b.pos.distance(center) <= radius + 2.0 {
                 hits.push(TargetRef::Boss(bi));
             }
         }

@@ -56,6 +56,8 @@ pub mod skyprops;
 pub mod ferry;
 /// The Moonwell: healing water, the Moonwyrm's claim, and its boons.
 pub mod moonwell;
+/// The Moonwyrm's flights over the sky map, and the stars it lets fall.
+pub mod wyrmflight;
 /// The generated preparation documents in dev/ (cue cards, recording sheet, cue sheet).
 pub mod devdocs;
 /// Character voxels as smooth surfaces with fur lengths, for the ultra preview.

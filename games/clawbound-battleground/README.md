@@ -26,12 +26,17 @@ what else is known-but-unresolved.
   gated behind tower kills.
 - **Three maps** — the jungle valley (5v5, three lanes), Twinfang Pass (15v15
   mountain canyon), and **Starwell Glacier** (15v15): two wide lanes over
-  glacier islands in a starlit sky, 32 minions in each lane when the waves
-  meet, cloud ferries you leap onto to ride across the chasms (miss, and the
+  glacier islands in a starlit sky, waves of 32 minions a side in each lane
+  (64 when they meet), cloud ferries you leap onto to ride across the chasms (miss, and the
   Starwell carries you home), and the Moonwell at the centre -- healing water
-  where the Moonwyrm sleeps; kill it and your team claims the well for two
+  where the Moonwyrm -- a sky-serpent with a cat's head -- coils, hurling the
+  stars that circle it at anyone who comes near; kill it and your team claims the well for two
   minutes of random boons (90% less damage taken, halved cooldowns, +40%
-  speed, +50% damage).
+  speed, +50% damage). Every few minutes, if left alone, it takes wing and
+  flies a loop over the whole map, over the islands and down through the
+  chasms, untouchable, letting stars fall on marked spots (a ring of light,
+  then a column of it that burns either side). From 18 minutes, overtime:
+  towers and Elders take 12% more damage a minute, and deaths last longer.
 - **14 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
   Windclaw, Faryowl, Oldroar, Twofang, Suneye, Snowhush, Riptail, Stillsmoke,
   Stonewhisper, Cometail (the star-fallen caracal: Starshot, Meteor Pounce,

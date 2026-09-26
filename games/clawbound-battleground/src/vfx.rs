@@ -269,6 +269,8 @@ impl Vfx {
                     add(*at + Vec3::Y * 3.0, c, 18.0, 0.2, 16.0);
                 }
                 Event::StormFx { pos, radius, color, dur } => add(*pos + Vec3::Y * 2.0, *color, radius * 1.8, dur.min(3.0), 2.5),
+                // a fallen star: as bright as lightning, and wider
+                Event::StarfallFx { at, radius } => add(*at + Vec3::Y * 3.0, [0.88, 0.94, 1.0], radius * 4.0, 0.6, 18.0),
                 Event::HealFx { pos, radius } => add(*pos + Vec3::Y, [0.45, 1.0, 0.55], radius * 1.5, 0.6, 2.0),
                 Event::ShieldFx { pos, dur, color } => add(*pos + Vec3::Y, *color, 4.0, dur.min(1.5), 1.5),
                 Event::BeamFx { from, dir, length, color, dur, .. } => add(*from + *dir * (length * 0.5) + Vec3::Y, *color, length * 0.6 + 2.0, dur.min(2.0), 3.0),
@@ -413,6 +415,33 @@ impl Vfx {
         self.rings.push(Ring { pos: at + Vec3::Y * 0.08, r0: 0.3, r1: 2.8, until: 0.28, dur: 0.28, color: [color[0] * 0.5 + 0.5, color[1] * 0.5 + 0.5, 1.0], thick: 0.2 });
     }
 
+    /// A star the Moonwyrm let fall lands: a straight column of white light
+    /// out of the sky, a flash ring thrown out to the edge of the burn, and
+    /// a spray of sparks.
+    pub fn starfall(&mut self, at: Vec3, radius: f32) {
+        let white = [2.4, 2.6, 3.2];
+        let mut out = Vec::new();
+        // a column about a cat wide: a dense white core and a softer halo
+        let hash = |k: f32| ((k * 12.9898 + at.x * 0.37).sin() * 43758.547).fract().abs() * 2.0 - 1.0;
+        for i in 0..300 {
+            let h = hash(i as f32 + 0.5).abs() * 44.0;
+            let halo = i % 3 == 0;
+            let w = if halo { 1.6 } else { 0.7 };
+            let j = Vec3::new(hash(i as f32), 0.0, hash(i as f32 + 91.3)) * w;
+            let life = 0.35 + 0.3 * (1.0 - h / 44.0);
+            let (size, alpha) = if halo { (0.9, 0.45) } else { (0.5, 1.0) };
+            out.push(Particle { pos: at + Vec3::Y * h + j, vel: Vec3::Y * 3.0, life, max_life: life, size, color: white, alpha, gravity: 0.0, drag: 0.0 });
+        }
+        for i in 0..40 {
+            let a = i as f32 / 40.0 * std::f32::consts::TAU + self.perturb(0.1);
+            let s = 6.0 + self.perturb(2.0).abs() * 3.0;
+            out.push(Particle { pos: at + Vec3::Y * 0.3, vel: Vec3::new(a.cos() * s, 4.0 + self.perturb(2.0).abs() * 2.0, a.sin() * s), life: 0.6, max_life: 0.6, size: 0.14, color: if i % 3 == 0 { [2.2, 2.0, 1.4] } else { white }, alpha: 1.0, gravity: 12.0, drag: 0.6 });
+        }
+        self.particles.extend(out);
+        self.rings.push(Ring { pos: at + Vec3::Y * 0.08, r0: 0.5, r1: radius, until: 0.35, dur: 0.35, color: [1.0, 1.0, 1.0], thick: 0.55 });
+        self.rings.push(Ring { pos: at + Vec3::Y * 0.1, r0: radius * 0.8, r1: radius * 1.7, until: 0.6, dur: 0.6, color: [0.75, 0.85, 1.0], thick: 0.3 });
+    }
+
     /// Speed made visible: while a cat dashes it leaves a ghost of itself
     /// every 45 ms along its path; a blink -- a jump further in one frame
     /// than a cat can run, short of a respawn -- leaves a longer-lived one
@@ -456,6 +485,45 @@ impl Vfx {
     /// A glowing trail streaming behind every magic bolt in flight (they
     /// were bare orbs: a fast one read as a dot).
     pub fn tick_trails(&mut self, game: &Game) {
+        // the stars the flying Moonwyrm lets fall: a bright tail back up
+        // toward it
+        for sf in &game.starfalls {
+            let p = sf.pos();
+            let back = (sf.from - sf.at).normalize_or_zero();
+            for k in 0..4 {
+                let j = Vec3::new(self.perturb(0.4 + k as f32), self.perturb(0.4 + k as f32 * 2.3), self.perturb(0.4 + k as f32 * 5.1));
+                self.particles.push(Particle {
+                    pos: p + back * (0.8 * k as f32) + j,
+                    vel: back * 1.5,
+                    life: 0.5,
+                    max_life: 0.5,
+                    size: 0.2,
+                    color: if k == 0 { [2.0, 1.9, 1.5] } else { [1.2, 1.4, 2.0] },
+                    alpha: 0.95,
+                    gravity: 0.0,
+                    drag: 1.0,
+                });
+            }
+        }
+        // the Moonwyrm's thrown stars: a long glittering tail, like a
+        // shooting star's
+        for st in &game.star_bolts {
+            let back = -st.vel.normalize_or_zero();
+            for k in 0..3 {
+                let j = Vec3::new(self.perturb(0.25 + k as f32), self.perturb(0.25 + k as f32 * 2.3), self.perturb(0.25 + k as f32 * 5.1));
+                self.particles.push(Particle {
+                    pos: st.pos + back * (0.4 * k as f32) + j,
+                    vel: back * 2.0 + Vec3::Y * 0.3,
+                    life: 0.55,
+                    max_life: 0.55,
+                    size: 0.13,
+                    color: if k == 0 { [1.8, 1.7, 1.3] } else { [1.1, 1.35, 1.9] },
+                    alpha: 0.9,
+                    gravity: -0.4,
+                    drag: 1.2,
+                });
+            }
+        }
         for p in &game.projectiles {
             match p.kind {
                 crate::sim::ProjKind::Arrow => {
@@ -822,6 +890,7 @@ impl Vfx {
                     }
                 }
                 Event::StrikeFx { at, color } => self.lightning(*at, *color),
+                Event::StarfallFx { at, radius } => self.starfall(*at, *radius),
                 Event::LevelUp { pos } => {
                     for i in 0..26 {
                         let a = i as f32 * 0.24;

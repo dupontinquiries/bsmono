@@ -156,75 +156,103 @@ pub fn ferry_cloud(r: f32, variant: i32) -> (VoxelMesh, f32) {
 /// Voxel size of the Moonwyrm.
 pub const WYRM_VOX: f32 = 0.3;
 
-/// The Moonwyrm: a cat-dragon of starlight, coiled in the Moonwell. A long
-/// pearl body rising out of the water in arches, a cat's head held high
-/// (ears, a short muzzle, gold eyes), swept-back horns, a glowing blue mane
-/// down the neck, fin-wings at the shoulders, and stars in its hide. Faces
-/// +z; feet (the water line) at y = 0.
+/// The Moonwyrm: a sky-serpent with a cat's head, made of moonlight. Its
+/// body rises out of the well in a great climbing coil into the air --
+/// the tail's tip still in the water, the neck arching out over it -- with
+/// a crest of glowing fins down the spine, two small clawed forelegs under
+/// the neck, a cat's head held out (ears, a short muzzle, gold eyes),
+/// swept-back horns, long trailing whiskers, and stars in its hide. An
+/// original design in the moon's palette: pearl, silver-blue, starlight
+/// gold. Faces +z; the water line at y = 0.
 pub fn moonwyrm() -> VoxelMesh {
     let k = 1.0 / WYRM_VOX;
-    let (nx, ny, nz) = ((12.0 * k) as usize, (9.0 * k) as usize, (17.0 * k) as usize);
+    let (nx, ny, nz) = ((13.0 * k) as usize, (16.0 * k) as usize, (14.0 * k) as usize);
     let mut g = Grid::new(nx, ny, nz);
-    let (cx, cz0) = (nx as f32 * 0.5, 11.0 * k); // z = 0 in world is cell cz0
+    let (cx, cz0) = (nx as f32 * 0.5, nz as f32 * 0.5);
     let at = |x: f32, y: f32, z: f32| (cx + x * k, y * k, cz0 + z * k);
     let pearl = [0.88, 0.91, 0.98, 1.0];
     let belly = [0.66, 0.78, 0.95, 1.0];
     let mane = [0.45, 0.85, 1.0, 1.0];
-    let horn = [0.96, 0.90, 0.72, 1.0];
+    let horn = [0.93, 0.93, 0.98, 1.0];
     let eye = [1.0, 0.82, 0.30, 1.0];
-    // the body: a tube along a path from the neck (s = 0) to the tail tip
+    let claw = [0.95, 0.86, 0.60, 1.0];
+    // the body's path, tail tip (s = 0) to the base of the skull (s = 1):
+    // a coil climbing round a vertical axis, then the neck bending out
     let path = |s: f32| -> (f32, f32, f32) {
-        let x = 2.4 * (s * 2.6 * std::f32::consts::PI).sin() * (0.35 + s);
-        let z = 3.2 - 12.5 * s;
-        // the neck rises to the head; behind, the body arches out of the
-        // water and dips back under
-        let y = if s < 0.18 { 1.4 + (0.18 - s) / 0.18 * 3.6 } else { 0.9 + 1.1 * ((s - 0.18) * 3.4 * std::f32::consts::PI).sin().max(-0.6) };
-        (x, y, z)
+        let turns = 1.6;
+        let a = s * turns * std::f32::consts::TAU - 1.2;
+        let r = 3.6 * (1.0 - 0.35 * s);
+        let (x, z) = (a.cos() * r, a.sin() * r - 1.0);
+        let y = 0.3 + s.powf(0.9) * 11.0;
+        // the last stretch leans out toward +z: the neck over the water
+        let lean = ((s - 0.85) / 0.15).clamp(0.0, 1.0);
+        (x * (1.0 - lean), y + lean * 0.8, z * (1.0 - lean) + lean * 3.2)
     };
-    let steps = 220;
+    let steps = 360;
     for i in 0..=steps {
         let s = i as f32 / steps as f32;
         let (x, y, z) = path(s);
-        let r = 1.25 * (1.0 - s * 0.82) + 0.12;
+        // thick through the middle, a thin tail, a slimmer neck
+        let r = 0.25 + 1.05 * (s * 3.0).min(1.0) * (1.0 - 0.3 * ((s - 0.7) / 0.3).clamp(0.0, 1.0));
         let (px, py, pz) = at(x, y, z);
         g.ellipsoid(px, py, pz, r * k, r * k, r * k, pearl);
-        // the mane: a ridge of glow down the neck and back, fading by mid-body
-        if s < 0.5 && i % 2 == 0 {
-            let (mx, my, mz) = at(x, y + r * 0.9, z);
-            g.ellipsoid(mx, my, mz, 0.35 * k * (1.0 - s), 0.55 * k * (1.0 - s), 0.35 * k, mane);
-        }
-    }
-    // head: a cat's, held high
-    let (hx, hy, hz) = at(0.0, 5.3, 3.9);
-    g.ellipsoid(hx, hy, hz, 1.45 * k, 1.25 * k, 1.35 * k, pearl);
-    let (mx, my, mz) = at(0.0, 4.9, 5.2);
-    g.ellipsoid(mx, my, mz, 0.8 * k, 0.6 * k, 0.75 * k, belly);
-    for side in [-1.0f32, 1.0] {
-        // ears
-        let (ex, _, ez) = at(side * 0.85, 0.0, 3.6);
-        g.cone_y(ex, ez, 0.55 * k, 0.05 * k, (6.2 * k) as i32, (7.4 * k) as i32, pearl);
-        // horns: swept back from behind the ears
-        for t in 0..14 {
-            let u = t as f32 / 13.0;
-            let (qx, qy, qz) = at(side * (0.6 + 0.3 * u), 6.1 + 0.9 * u, 3.1 - 1.9 * u);
-            g.ellipsoid(qx, qy, qz, (0.28 - 0.18 * u) * k, (0.28 - 0.18 * u) * k, (0.28 - 0.18 * u) * k, horn);
-        }
-        // eyes
-        let (ix, iy, iz) = at(side * 0.62, 5.5, 5.0);
-        g.ellipsoid(ix, iy, iz, 0.22 * k, 0.18 * k, 0.12 * k, eye);
-        // barbels: long whiskers trailing from the muzzle
-        for t in 0..16 {
-            let u = t as f32 / 15.0;
-            let (bx, by, bz) = at(side * (0.7 + 1.6 * u), 4.8 - 0.9 * u + 0.4 * (u * 6.0).sin() * u, 5.3 - 0.8 * u);
-            g.set(bx as i32, by as i32, bz as i32, mane);
-        }
-        // fin-wings at the shoulders
-        for a in 0..10 {
-            for b in 0..(10 - a) {
-                let (wx, wy, wz) = at(side * (1.1 + a as f32 * 0.28), 2.6 + b as f32 * 0.24 - a as f32 * 0.1, 1.2 - a as f32 * 0.22);
-                g.set(wx as i32, wy as i32, wz as i32, if b > 6 - a / 2 { mane } else { belly });
+        // the belly: a paler stripe on the coil's inner side
+        let (bx, by, bz) = at(x * 0.82, y - r * 0.35, z * 0.82 - 0.18);
+        g.ellipsoid(bx, by, bz, r * 0.7 * k, r * 0.55 * k, r * 0.7 * k, belly);
+        // the crest: glowing fins along the spine, every so often
+        if i % 9 == 0 && s > 0.12 {
+            let h = 0.5 + 0.9 * (1.0 - (s - 0.6).abs());
+            for u in 0..6 {
+                let f = u as f32 / 5.0;
+                let (qx, qy, qz) = at(x * (1.0 + 0.08 * f), y + r * 0.85 + h * f, z * (1.0 + 0.08 * f) - 0.15 * f);
+                g.ellipsoid(qx, qy, qz, 0.22 * k * (1.0 - f * 0.6), 0.3 * k, 0.35 * k * (1.0 - f * 0.5), mane);
             }
         }
+    }
+    let (hx0, hy0, hz0) = path(1.0);
+    // head
+    let (hx, hy, hz) = at(hx0, hy0 + 0.3, hz0 + 0.9);
+    g.ellipsoid(hx, hy, hz, 1.55 * k, 1.35 * k, 1.5 * k, pearl);
+    let (mx, my, mz) = at(hx0, hy0 - 0.15, hz0 + 2.3);
+    g.ellipsoid(mx, my, mz, 0.85 * k, 0.65 * k, 0.8 * k, belly);
+    for side in [-1.0f32, 1.0] {
+        // ears
+        let (ex, _, ez) = at(hx0 + side * 0.9, 0.0, hz0 + 0.5);
+        g.cone_y(ex, ez, 0.6 * k, 0.05 * k, ((hy0 + 1.3) * k) as i32, ((hy0 + 2.7) * k) as i32, pearl);
+        // horns, swept back
+        for t in 0..16 {
+            let u = t as f32 / 15.0;
+            let (qx, qy, qz) = at(hx0 + side * (0.6 + 0.4 * u), hy0 + 1.2 + 1.0 * u, hz0 + 0.1 - 2.2 * u);
+            let rr = (0.3 - 0.2 * u) * k;
+            g.ellipsoid(qx, qy, qz, rr, rr, rr, horn);
+        }
+        // eyes
+        let (ix, iy, iz) = at(hx0 + side * 0.65, hy0 + 0.55, hz0 + 2.05);
+        g.ellipsoid(ix, iy, iz, 0.24 * k, 0.2 * k, 0.12 * k, eye);
+        // whiskers: long, trailing back and down, a little wavy
+        for t in 0..30 {
+            let u = t as f32 / 29.0;
+            let (bx, by, bz) = at(hx0 + side * (0.8 + 2.6 * u), hy0 - 0.2 - 1.6 * u + 0.35 * (u * 7.0).sin(), hz0 + 2.4 - 1.2 * u);
+            g.set(bx as i32, by as i32, bz as i32, mane);
+        }
+        // forelegs under the neck, reaching forward, claws out
+        let (sx, sy, sz) = path(0.9);
+        for t in 0..10 {
+            let u = t as f32 / 9.0;
+            let (lx, ly, lz) = at(sx + side * (0.8 + 0.5 * u), sy - 0.6 - 1.2 * u, sz + 0.5 + 1.0 * u);
+            g.ellipsoid(lx, ly, lz, 0.32 * k, 0.32 * k, 0.32 * k, pearl);
+        }
+        for c in -1..=1 {
+            let (lx, ly, lz) = at(sx + side * 1.3 + c as f32 * 0.18, sy - 1.9, sz + 1.7);
+            g.ellipsoid(lx, ly, lz, 0.1 * k, 0.1 * k, 0.25 * k, claw);
+        }
+    }
+    // a mane down the back of the neck
+    for i in 0..40 {
+        let s = 0.8 + 0.2 * i as f32 / 39.0;
+        let (x, y, z) = path(s);
+        let (qx, qy, qz) = at(x, y + 1.0, z - 0.3);
+        g.ellipsoid(qx, qy, qz, 0.45 * k, 0.5 * k, 0.4 * k, mane);
     }
     // what glows, by grid cell (the mesh shades its colours, so they cannot
     // be matched after meshing -- `props::gem_cluster` does the same)
@@ -262,6 +290,31 @@ pub fn moonwyrm() -> VoxelMesh {
             }
             i.misc[2] = v.abs();
         }
+    }
+    m
+}
+
+/// Voxel size of a Moonwyrm star.
+pub const STAR_VOX: f32 = 0.14;
+
+/// One of the Moonwyrm's stars: a bright core with four points, a little
+/// warm at the heart. Centred on its origin.
+pub fn star_mote() -> VoxelMesh {
+    let n = 15usize;
+    let mut g = Grid::new(n, n, n);
+    let c = n as f32 * 0.5;
+    let core = [1.0, 0.95, 0.80, 1.0];
+    let ray = [0.85, 0.92, 1.0, 1.0];
+    g.ellipsoid(c, c, c, 2.2, 2.2, 2.2, core);
+    for t in 0..7 {
+        let f = t as i32;
+        for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
+            g.set(c as i32 + dx * f, c as i32 + dy * f, c as i32 + dz * f, ray);
+        }
+    }
+    let mut m = g.mesh(STAR_VOX, false);
+    for i in m.inst.iter_mut() {
+        i.misc[2] = 2.2;
     }
     m
 }

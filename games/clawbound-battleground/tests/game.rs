@@ -1633,6 +1633,105 @@ mod moonwell {
         });
     }
 
+    /// The Moonwyrm keeps a ring of stars and throws them at cats near the
+    /// well -- either side -- and they home in; the ring gathers back.
+    #[test]
+    fn the_wyrm_throws_its_stars() {
+        map::with(MapId::Sky, || {
+            let mut g = sky_game();
+            let w = wyrm(&g);
+            g.bosses.list[w].spawn_t = g.t;
+            tick(&mut g, 0.1);
+            assert_eq!(g.bosses.list[w].stars, clawbound::moonwell::STARS);
+            // a blue cat on the rim, a red one across the well, both out of
+            // its bite; both keep circling so it is homing that hits
+            g.gods[0].pos = Vec3::new(26.0, 0.0, 0.0);
+            g.gods[2].pos = Vec3::new(-26.0, 0.0, 6.0);
+            let (h0, h2) = (g.gods[0].hp, g.gods[2].hp);
+            let mut thrown = 0;
+            let mut least = u8::MAX;
+            for k in 0..(8 * 60) {
+                let a = k as f32 / 60.0 * 0.35; // ~9 u/s, a running cat
+                g.gods[0].pos = Vec3::new(26.0 * a.cos(), 0.0, 26.0 * a.sin());
+                g.tick(1.0 / 60.0);
+                g.events.clear();
+                thrown = thrown.max(g.star_bolts.len());
+                least = least.min(g.bosses.list[w].stars);
+            }
+            assert!(thrown >= 1 && least < clawbound::moonwell::STARS, "stars thrown (in flight at once: {thrown}, ring down to {least})");
+            assert!(g.gods[0].hp < h0 || g.gods[2].hp < h2, "and they struck: {h0} -> {}, {h2} -> {}", g.gods[0].hp, g.gods[2].hp);
+            // everyone leaves: nothing more thrown, the ring gathers back
+            for c in g.gods.iter_mut() {
+                c.pos = c.team.fountain();
+            }
+            tick(&mut g, clawbound::moonwell::STAR_REGEN * clawbound::moonwell::STARS as f32 + 1.0);
+            assert_eq!(g.bosses.list[w].stars, clawbound::moonwell::STARS);
+            assert!(g.star_bolts.is_empty());
+        });
+    }
+
+    /// Every few minutes the Moonwyrm flies a loop over the map (not while
+    /// it is being fought), untouchable, letting stars fall on marked spots;
+    /// a cat standing on a mark is burned; then it settles back in the well.
+    #[test]
+    fn the_wyrm_takes_wing_and_lets_its_stars_fall() {
+        use clawbound::wyrmflight::{FLIGHT_SECS, TELEGRAPH};
+        map::with(MapId::Sky, || {
+            let mut g = sky_game();
+            let w = wyrm(&g);
+            g.bosses.list[w].spawn_t = g.t;
+            tick(&mut g, 0.1);
+            assert!(g.bosses.list[w].alive && g.bosses.list[w].flight.is_none());
+            // due, but struck a moment ago: it stays to fight
+            g.bosses.list[w].next_flight_t = g.t;
+            g.bosses.list[w].last_dmg_t = g.t;
+            tick(&mut g, 2.0);
+            assert!(g.bosses.list[w].flight.is_none(), "no flight mid-fight");
+            // left alone, it takes wing
+            tick(&mut g, clawbound::wyrmflight::CALM_SECS);
+            assert!(g.bosses.list[w].flight.is_some(), "aloft once calm");
+            let hp = g.bosses.list[w].hp;
+            g.deal_damage(TargetRef::Boss(w), 500.0, false, Some(0), 0.0, 0.0);
+            assert_eq!(g.bosses.list[w].hp, hp, "untouchable aloft");
+            // fly it out: the blue cat steps onto the first mark it sees
+            let (mut marks, mut bursts, mut far) = (0usize, 0usize, 0.0f32);
+            let (mut mark, mut burn) = (None, None);
+            while g.bosses.list[w].flight.is_some() {
+                let before = g.gods[0].hp;
+                g.tick(1.0 / 60.0);
+                use clawbound::sim::Event;
+                if let Some(m) = mark {
+                    if g.events.iter().any(|e| matches!(e, Event::StarfallFx { at, .. } if *at == m)) {
+                        burn.get_or_insert(before - g.gods[0].hp);
+                    }
+                }
+                marks += g.events.iter().filter(|e| matches!(e, Event::RingTelegraph { .. })).count();
+                bursts += g.events.iter().filter(|e| matches!(e, Event::StarfallFx { .. })).count();
+                g.events.clear();
+                if mark.is_none() {
+                    if let Some(s) = g.starfalls.last() {
+                        assert!(s.left > TELEGRAPH - 0.1, "marked well before it lands");
+                        g.gods[0].pos = s.at;
+                        mark = Some(s.at);
+                    }
+                }
+                far = far.max(Vec3::new(g.bosses.list[w].pos.x, 0.0, g.bosses.list[w].pos.z).length());
+                assert!(g.t < 200.0, "it came back");
+            }
+            assert!(far > 150.0, "it flew out over the map: {far}");
+            assert!((30..=120).contains(&marks), "stars fell over a {FLIGHT_SECS} s flight: {marks}");
+            assert!(bursts + g.starfalls.len() == marks, "each landed: {bursts} (+{} falling) of {marks}", g.starfalls.len());
+            // the frame its star landed, the cat standing on the mark lost at
+            // least a star's worth (from anything else too, but mostly that)
+            let burn = burn.expect("the marked star landed");
+            assert!(burn > 100.0, "the cat on the mark was burned: {burn}");
+            // home again, and the next flight is some way off
+            let b = &g.bosses.list[w];
+            assert!(b.pos.distance(b.home) < 1e-3);
+            assert!(b.next_flight_t > g.t + 60.0);
+        });
+    }
+
     /// A bot whose team holds the claim walks to the well for its boon.
     #[test]
     fn a_bot_goes_to_the_well_for_its_boon() {
@@ -1722,5 +1821,68 @@ mod cometail {
         g.cast_queue.push((0, s, Vec3::new(0.0, 0.0, 20.0)));
         run(&mut g, 1.0);
         assert!(g.gods[1].hp < h - 50.0, "the pounce scorched what it passed: {} -> {}", h, g.gods[1].hp);
+    }
+}
+
+/// The sky map's siege surge: a lane whose enemy towers have fallen sends
+/// harder waves down it.
+mod surge {
+    use clawbound::consts::{Lane, Team};
+    use clawbound::map::{self, MapId};
+    use clawbound::sim::Game;
+
+    #[test]
+    fn fallen_towers_empower_the_lane() {
+        map::with(MapId::Sky, || {
+            let mut g = Game::new_teams(&[0], &[1]);
+            assert_eq!(g.lane_surge(Team::Blue, Lane::Top), 1.0);
+            // red loses its west outer tower
+            let i = g.towers.iter().position(|t| t.team == Team::Red && t.lane == Lane::Top && !t.inner).unwrap();
+            g.towers.remove(i);
+            let per = MapId::Sky.siege_surge();
+            assert!((g.lane_surge(Team::Blue, Lane::Top) - (1.0 + per)).abs() < 1e-5, "blue's west waves surge");
+            assert_eq!(g.lane_surge(Team::Blue, Lane::Bot), 1.0, "not the east");
+            assert_eq!(g.lane_surge(Team::Red, Lane::Top), 1.0, "not red's");
+            // and the next wave down that lane is tougher
+            g.next_wave_t = g.t;
+            g.tick(1.0 / 60.0);
+            let west = g.minions.iter().find(|m| m.team == Team::Blue && m.lane == Lane::Top).unwrap().max_hp;
+            let east = g.minions.iter().find(|m| m.team == Team::Blue && m.lane == Lane::Bot).unwrap().max_hp;
+            assert!((west / east - (1.0 + per)).abs() < 1e-3, "{west} vs {east}");
+        });
+        let g = Game::new_teams(&[0], &[1]);
+        assert_eq!(clawbound::map::MapId::Jungle.siege_surge(), 0.0);
+        assert_eq!(g.lane_surge(Team::Blue, Lane::Mid), 1.0);
+    }
+}
+
+/// A wide wave's outer ranks: a minion marching eight u to one side of a
+/// tower on the centre-line still turns on it.
+mod wide_waves {
+    use clawbound::consts::{tower_pos, Lane, Team};
+    use clawbound::map::{self, MapId};
+    use clawbound::minionai::Foe;
+    use clawbound::sim::Game;
+    use glam::Vec3;
+
+    #[test]
+    fn an_outer_rank_sees_the_tower_it_passes() {
+        map::with(MapId::Sky, || {
+            let mut g = Game::new_teams(&[0], &[1]);
+            for c in g.gods.iter_mut() {
+                c.ai = None;
+                c.pos = c.team.fountain();
+            }
+            g.next_wave_t = g.t;
+            g.tick(1.0 / 60.0);
+            g.minions.retain(|m| m.team == Team::Blue && m.lane == Lane::Top && !m.caster);
+            g.minions.truncate(1);
+            let tw = tower_pos(Lane::Top, Team::Red, false);
+            // twelve u off, level with it across the lane
+            g.minions[0].pos = Vec3::new(tw.x - 12.0, 0.0, tw.z);
+            g.minions[0].think_t = 0.0;
+            g.tick(1.0 / 60.0);
+            assert!(matches!(g.minions[0].foe, Some(Foe::Tower(_))), "{:?}", g.minions[0].foe);
+        });
     }
 }

@@ -96,10 +96,117 @@ pub fn grants(claim_left: f32, claim_id: u32, last_claim: u32, has_boon: bool) -
     claim_left > 0.0 && claim_id != 0 && last_claim != claim_id && !has_boon
 }
 
+/// Stars circling the Moonwyrm when it is whole.
+pub const STARS: u8 = 7;
+/// One gathers back into the ring this often.
+pub const STAR_REGEN: f32 = 2.5;
+/// It throws one this often while it has someone to throw at...
+pub const STAR_THROW: f32 = 1.3;
+/// ...within this far of the well.
+pub const STAR_REACH: f32 = 34.0;
+/// A thrown star: speed, how hard it turns after its mark, how close is a
+/// hit, how long it lasts.
+pub const STAR_SPEED: f32 = 17.0;
+pub const STAR_TURN: f32 = 3.0;
+pub const STAR_HIT: f32 = 1.3;
+pub const STAR_LIFE: f32 = 3.5;
+
+/// Where orbiting star `k` of `n` is at time `t`, round a wyrm at `at`: a
+/// tilted ring above the water, turning slowly, each star bobbing.
+pub fn orbit_star(at: glam::Vec3, t: f32, k: usize, n: usize) -> glam::Vec3 {
+    let a = t * 0.45 + k as f32 / n.max(1) as f32 * std::f32::consts::TAU;
+    let r = 10.0 + 1.5 * (t * 0.7 + k as f32).sin();
+    let tilt = 0.35 * a.sin();
+    at + glam::Vec3::new(a.cos() * r, 8.0 + r * tilt + 0.6 * (t * 1.9 + k as f32 * 2.1).sin(), a.sin() * r)
+}
+
+/// A star the Moonwyrm has thrown: homing, slowly, on a cat.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StarBolt {
+    pub pos: glam::Vec3,
+    pub vel: glam::Vec3,
+    pub target: usize,
+    pub life: f32,
+    pub dmg: f32,
+}
+
+/// Steer a thrown star toward `aim` by at most `STAR_TURN` rad/s; advance.
+pub fn steer_star(b: &mut StarBolt, aim: glam::Vec3, dt: f32) {
+    let want = (aim - b.pos).normalize_or_zero();
+    let have = b.vel.normalize_or_zero();
+    let ang = have.dot(want).clamp(-1.0, 1.0).acos();
+    let dir = if ang < 1e-4 { want } else { have.lerp(want, ((STAR_TURN * dt) / ang).min(1.0)).normalize_or_zero() };
+    b.vel = dir * STAR_SPEED;
+    b.pos += b.vel * dt;
+    b.life -= dt;
+}
+
 impl crate::sim::Game {
+    /// The Moonwyrm's stars: while it lives and someone is near the well it
+    /// throws one of its ring at them now and then; the ring gathers back;
+    /// thrown stars home in, and burst on whoever they reach. Neutral: they
+    /// strike either side.
+    pub fn wyrm_stars_tick(&mut self, dt: f32) {
+        use crate::bosses::BossKind;
+        let now = self.t;
+        for bi in 0..self.bosses.list.len() {
+            let b = &self.bosses.list[bi];
+            if b.kind != BossKind::Moonwyrm || !b.grounded() {
+                continue;
+            }
+            let home = b.home;
+            // the angriest cat, else the nearest within reach
+            let pick = b.target.filter(|&i| self.gods.get(i).is_some_and(|g| g.respawn_t <= 0.0 && g.pos.distance(home) < STAR_REACH)).or_else(|| {
+                self.gods
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, g)| g.respawn_t <= 0.0 && g.skyfall.is_none() && g.pos.distance(home) < STAR_REACH)
+                    .min_by(|a, c| a.1.pos.distance(home).total_cmp(&c.1.pos.distance(home)))
+                    .map(|(i, _)| i)
+            });
+            let b = &mut self.bosses.list[bi];
+            b.star_regen_t -= dt;
+            if b.star_regen_t <= 0.0 {
+                b.star_regen_t = STAR_REGEN;
+                b.stars = (b.stars + 1).min(STARS);
+            }
+            b.star_throw_t -= dt;
+            if let Some(ti) = pick {
+                if b.star_throw_t <= 0.0 && b.stars > 0 {
+                    b.star_throw_t = STAR_THROW;
+                    b.stars -= 1;
+                    let k = b.stars as usize;
+                    let from = orbit_star(home, now, k, STARS as usize);
+                    let at = self.gods[ti].pos + glam::Vec3::Y;
+                    let vel = ((at - from).normalize_or_zero() + glam::Vec3::Y * 0.6).normalize_or_zero() * STAR_SPEED;
+                    let dmg = 85.0 + now * 0.05;
+                    self.star_bolts.push(StarBolt { pos: from, vel, target: ti, life: STAR_LIFE, dmg });
+                }
+            }
+        }
+        // the thrown stars
+        let mut hits: Vec<(usize, f32, glam::Vec3)> = Vec::new();
+        let gods = &self.gods;
+        self.star_bolts.retain_mut(|s| {
+            let Some(g) = gods.get(s.target).filter(|g| g.respawn_t <= 0.0) else { return false };
+            steer_star(s, g.pos + glam::Vec3::Y, dt);
+            if s.pos.distance(g.pos + glam::Vec3::Y) < STAR_HIT {
+                hits.push((s.target, s.dmg, s.pos));
+                return false;
+            }
+            s.life > 0.0
+        });
+        for (ti, dmg, at) in hits {
+            self.events.push(crate::sim::Event::NovaFx { pos: at - glam::Vec3::Y, radius: 1.8, color: [0.85, 0.92, 1.0] });
+            self.deal_damage(crate::sim::TargetRef::God(ti), dmg, true, None, 0.0, 0.0);
+        }
+    }
+
     /// The well, each tick: wading cats mend; a claiming team's cats that
     /// wade in are granted a boon; boons run down. Nothing on other maps.
     pub fn moonwell_tick(&mut self, dt: f32) {
+        self.wyrm_stars_tick(dt);
+        self.starfalls_tick(dt);
         for g in self.gods.iter_mut() {
             if let Some((b, left)) = g.boon {
                 g.boon = if left - dt > 0.0 { Some((b, left - dt)) } else { None };

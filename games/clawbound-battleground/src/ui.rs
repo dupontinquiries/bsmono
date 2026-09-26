@@ -598,7 +598,9 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
         }
         for b in &game.bosses.list {
             let short = match b.kind { crate::bosses::BossKind::Boar => "BOAR", crate::bosses::BossKind::Drake => "DRAKE", crate::bosses::BossKind::Moonwyrm => "WYRM" };
-            if b.alive {
+            if b.flight.is_some() {
+                line = format!("{}   ·   {} ALOFT", line, short);
+            } else if b.alive {
                 line = format!("{}   ·   {} {:.0}%", line, short, b.hp / b.max_hp * 100.0);
             } else {
                 let left = (b.spawn_t - game.t).max(0.0);
@@ -712,7 +714,11 @@ fn draw_minimap(ctx: &egui::Context, game: &Game, player: usize) {
             let c = b.kind.color();
             let cc = Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8);
             let pts = vec![s + Vec2::new(0.0, -7.0), s + Vec2::new(7.0, 0.0), s + Vec2::new(0.0, 7.0), s + Vec2::new(-7.0, 0.0)];
-            if b.alive {
+            if b.flight.is_some() {
+                // the Moonwyrm aloft: its home hollow, and where it flies
+                p.add(egui::Shape::closed_line(pts, Stroke::new(1.5_f32, cc.gamma_multiply(0.6))));
+                p.circle(to_map(b.pos), 5.0, cc, Stroke::new(1.5_f32, Color32::WHITE));
+            } else if b.alive {
                 p.add(egui::Shape::convex_polygon(pts, cc, Stroke::new(1.5_f32, Color32::BLACK)));
             } else {
                 p.add(egui::Shape::closed_line(pts, Stroke::new(1.5_f32, cc.gamma_multiply(0.6))));
