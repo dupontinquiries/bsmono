@@ -254,12 +254,67 @@ impl TapResult {
 /// this paints only what the layer model is responsible for.
 pub fn scrims_ui(ui: &mut egui::Ui, s: &ModalSurface) {
     let rect = ui.max_rect();
-    for layer in Layer::ALL {
-        let a = s.scrim_alpha(layer);
-        if a == 0 { continue; }
-        ui.painter().rect_filled(rect, 0.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, a));
+    if Layer::ALL.iter().all(|l| s.scrim_alpha(*l) == 0) { return; }
+    // In its own Area on egui's MIDDLE order: above the pages (Background,
+    // drawn later in the frame than this call) and below every dialog body
+    // (`body_ui`, Foreground and up). Painted into the page's own layer, as
+    // it was, it sat under the pages — and over any dialog body drawn
+    // before it in the frame.
+    egui::Area::new(egui::Id::new("snapclone-modal-scrim"))
+        .order(egui::Order::Middle)
+        .fixed_pos(rect.min)
+        .constrain(false)
+        .show(ui.ctx(), |ui| {
+            for layer in Layer::ALL {
+                let a = s.scrim_alpha(layer);
+                if a == 0 { continue; }
+                ui.painter().rect_filled(rect, 0.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, a));
+            }
+            // Swallow presses: the page behind a dialog is inert, and a
+            // scrim that only LOOKS inert lets a tap land on a button the
+            // user cannot properly see.
+            ui.allocate_rect(egui::Rect::from_min_size(rect.min, rect.size()),
+                egui::Sense::click_and_drag());
+        });
+}
+
+/// egui's paint order for a modal layer's body. Everything a dialog sits on
+/// is Background (the pages) or Middle (the scrim); Confirm and above go one
+/// order higher than Dialog so a ringing call or a delete confirmation is
+/// never under a sheet someone left open.
+pub fn egui_order(layer: Layer) -> egui::Order {
+    match layer {
+        Layer::Ambient | Layer::Hint | Layer::Dialog => egui::Order::Foreground,
+        Layer::Confirm | Layer::Toast | Layer::Critical => egui::Order::Tooltip,
     }
+}
+
+/// Draw a modal body at `rect`, above the page and the scrim whatever the
+/// call order. `key` names the dialog (one Area per key); `fill` is the
+/// card colour. The closure gets a Ui inset 12px inside the card.
+///
+/// Every body used to paint with `ui.painter()` into the PAGE's layer,
+/// before the pages were drawn — so the pages painted over it and took its
+/// clicks ("edit contact popup appearing behind other elements").
+pub fn body_ui<R>(ctx: &egui::Context, key: &str, layer: Layer, rect: egui::Rect,
+                  fill: egui::Color32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Area::new(egui::Id::new(("snapclone-modal-body", key)))
+        .order(egui_order(layer))
+        .fixed_pos(rect.min)
+        .constrain(false)
+        .show(ctx, |ui| {
+            // Claim the whole card, so a press on its empty parts is the
+            // dialog's and not the scrim's.
+            ui.allocate_rect(rect, egui::Sense::click());
+            ui.painter().rect_filled(rect, 8.0, fill);
+            ui.painter().rect_stroke(rect, 8.0,
+                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(24)),
+                egui::StrokeKind::Inside);
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(12.0)));
+            add(&mut child)
+        })
+        .inner
 }
 
 #[cfg(test)]

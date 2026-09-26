@@ -3534,26 +3534,27 @@ impl Snapclone {
             if let Some(r) = r {
                 let area = egui::Rect::from_min_size(
                     egui::pos2(r.x, r.y), egui::vec2(r.w, r.h));
-                ui.painter().rect_filled(area, 8.0, colors.bg_base);
-                let mut child = ui.new_child(
-                    egui::UiBuilder::new().max_rect(area.shrink(12.0)));
-                child.colored_label(colors.text, format!("rename {}", self.editor_id));
-                child.add(egui::TextEdit::singleline(&mut self.editor_name).id_salt("lib-editor_name"));
-                let ok = !self.editor_name.trim().is_empty();
-                child.horizontal(|ui| {
-                    // Disabled on empty rather than accepting and silently
-                    // ignoring: a save button that does nothing is the same
-                    // dead control the video scrubber avoided.
-                    if ui.add_enabled(ok, egui::Button::new("save")).clicked() {
-                        let (id, to) = (self.editor_id.clone(), self.editor_name.clone());
-                        self.apply_friends(crate::friends::Action::Rename(id, to));
-                        self.editor_id.clear();
-                        self.modal.dismiss(&want);
-                    }
-                    if ui.button("cancel").clicked() {
-                        self.editor_id.clear();
-                        self.modal.dismiss(&want);
-                    }
+                let ctx = ui.ctx().clone();
+                crate::modal::body_ui(&ctx, "editor", crate::modal::Layer::Dialog, area,
+                        colors.bg_base, |child: &mut egui::Ui| {
+                    child.colored_label(colors.text, format!("rename {}", self.editor_id));
+                    child.add(egui::TextEdit::singleline(&mut self.editor_name).id_salt("lib-editor_name"));
+                    let ok = !self.editor_name.trim().is_empty();
+                    child.horizontal(|ui| {
+                        // Disabled on empty rather than accepting and silently
+                        // ignoring: a save button that does nothing is the same
+                        // dead control the video scrubber avoided.
+                        if ui.add_enabled(ok, egui::Button::new("save")).clicked() {
+                            let (id, to) = (self.editor_id.clone(), self.editor_name.clone());
+                            self.apply_friends(crate::friends::Action::Rename(id, to));
+                            self.editor_id.clear();
+                            self.modal.dismiss(&want);
+                        }
+                        if ui.button("cancel").clicked() {
+                            self.editor_id.clear();
+                            self.modal.dismiss(&want);
+                        }
+                    });
                 });
             }
         }
@@ -3573,22 +3574,23 @@ impl Snapclone {
             if let Some(r) = r {
                 let area = egui::Rect::from_min_size(
                     egui::pos2(r.x, r.y), egui::vec2(r.w, r.h));
-                ui.painter().rect_filled(area, 8.0, colors.bg_base);
-                let mut child = ui.new_child(
-                    egui::UiBuilder::new().max_rect(area.shrink(12.0)));
-                let ev = self.video.as_mut().and_then(|v|
-                    crate::video_viewer::video_viewer_ui(&mut child, v, "~/Videos", &colors));
-                let vid = self.modal.topmost(crate::modal::Layer::Dialog)
-                    .and_then(|p| p.id.strip_prefix("video:").map(String::from)).unwrap_or_default();
-                // close_video carries no wipe, by design — the snap outlives
-                // the viewer. One path for the button and the viewer's own
-                // Closed event.
-                if child.button("close").clicked() {
-                    self.close_video(&vid);
-                }
-                if let Some(crate::video_viewer::VideoEvent::Closed) = ev {
-                    self.close_video(&vid);
-                }
+                let ctx = ui.ctx().clone();
+                crate::modal::body_ui(&ctx, "video", crate::modal::Layer::Dialog, area,
+                        colors.bg_base, |child: &mut egui::Ui| {
+                    let ev = self.video.as_mut().and_then(|v|
+                        crate::video_viewer::video_viewer_ui(child, v, "~/Videos", &colors));
+                    let vid = self.modal.topmost(crate::modal::Layer::Dialog)
+                        .and_then(|p| p.id.strip_prefix("video:").map(String::from)).unwrap_or_default();
+                    // close_video carries no wipe, by design — the snap outlives
+                    // the viewer. One path for the button and the viewer's own
+                    // Closed event.
+                    if child.button("close").clicked() {
+                        self.close_video(&vid);
+                    }
+                    if let Some(crate::video_viewer::VideoEvent::Closed) = ev {
+                        self.close_video(&vid);
+                    }
+                });
             }
         }
 
@@ -3605,14 +3607,15 @@ impl Snapclone {
             if let Some(r) = r {
                 let area = egui::Rect::from_min_size(
                     egui::pos2(r.x, r.y), egui::vec2(r.w, r.h));
-                ui.painter().rect_filled(area, 8.0, colors.bg_base);
-                let mut child = ui.new_child(
-                    egui::UiBuilder::new().max_rect(area.shrink(12.0)));
-                let evs = crate::snaps::viewer_ui(&mut child, &mut self.viewer, &colors);
-                if child.button("close").clicked() { self.close_snap(); }
-                // Events go through the SAME handler open_snap uses, so a snap
-                // viewed and one expired reach storage by one path.
-                for ev in evs { self.apply_snap_event(ev); }
+                let ctx = ui.ctx().clone();
+                crate::modal::body_ui(&ctx, "snap", crate::modal::Layer::Dialog, area,
+                        colors.bg_base, |child: &mut egui::Ui| {
+                    let evs = crate::snaps::viewer_ui(child, &mut self.viewer, &colors);
+                    if child.button("close").clicked() { self.close_snap(); }
+                    // Events go through the SAME handler open_snap uses, so a snap
+                    // viewed and one expired reach storage by one path.
+                    for ev in evs { self.apply_snap_event(ev); }
+                });
             }
         }
 
@@ -3636,28 +3639,29 @@ impl Snapclone {
             if let Some(r) = r {
                 let area = egui::Rect::from_min_size(
                     egui::pos2(r.x, r.y), egui::vec2(r.w, r.h));
-                ui.painter().rect_filled(area, 8.0, colors.bg_base);
-                let mut child = ui.new_child(
-                    egui::UiBuilder::new().max_rect(area.shrink(12.0)));
-                let id = self.confirm_id.clone();
-                let what = format!("delete {id}?");
-                let outcome = self.confirm.as_mut()
-                    .and_then(|cc| crate::chevron_confirm::chevron_confirm_ui(
-                        &mut child, cc, &what, &colors));
-                match outcome {
-                    Some(crate::chevron_confirm::Outcome::Confirmed) => {
-                        self.confirm_delete(&id);
+                let ctx = ui.ctx().clone();
+                crate::modal::body_ui(&ctx, "confirm-delete", crate::modal::Layer::Confirm, area,
+                        colors.bg_base, |child: &mut egui::Ui| {
+                    let id = self.confirm_id.clone();
+                    let what = format!("delete {id}?");
+                    let outcome = self.confirm.as_mut()
+                        .and_then(|cc| crate::chevron_confirm::chevron_confirm_ui(
+                            child, cc, &what, &colors));
+                    match outcome {
+                        Some(crate::chevron_confirm::Outcome::Confirmed) => {
+                            self.confirm_delete(&id);
+                        }
+                        // Cancelled and TimedOut both close WITHOUT deleting, and
+                        // they stay distinct in the enum for the caller's benefit —
+                        // but here they mean the same thing, and conflating them at
+                        // the point of action would be the one place it is safe to.
+                        Some(_) => {
+                            self.confirm = None;
+                            self.modal.dismiss(&want);
+                        }
+                        None => {}
                     }
-                    // Cancelled and TimedOut both close WITHOUT deleting, and
-                    // they stay distinct in the enum for the caller's benefit —
-                    // but here they mean the same thing, and conflating them at
-                    // the point of action would be the one place it is safe to.
-                    Some(_) => {
-                        self.confirm = None;
-                        self.modal.dismiss(&want);
-                    }
-                    None => {}
-                }
+                });
             }
         }
 
@@ -3676,19 +3680,20 @@ impl Snapclone {
             if let Some(r) = r {
                 let area = egui::Rect::from_min_size(
                     egui::pos2(r.x, r.y), egui::vec2(r.w, r.h));
-                ui.painter().rect_filled(area, 8.0, colors.bg_base);
-                let mut child = ui.new_child(
-                    egui::UiBuilder::new().max_rect(area.shrink(12.0)));
-                let answered = self.incoming_call.as_ref()
-                    .and_then(|call| crate::ring::ring_ui(&mut child, call, &colors));
-                // THROUGH answer_call, not around it. The sheet used to apply
-                // the answer itself and the shell then called finish_call,
-                // which left `answer_call` — the app's only non-UI way to
-                // answer — permanently unreachable AND made a second
-                // implementation of the same transition. One path now: the
-                // sheet reports the press, this applies it, and answer_call
-                // owns the guard against answering twice.
-                if let Some(a) = answered { self.answer_call(a); }
+                let ctx = ui.ctx().clone();
+                crate::modal::body_ui(&ctx, "call", crate::modal::Layer::Confirm, area,
+                        colors.bg_base, |child: &mut egui::Ui| {
+                    let answered = self.incoming_call.as_ref()
+                        .and_then(|call| crate::ring::ring_ui(child, call, &colors));
+                    // THROUGH answer_call, not around it. The sheet used to apply
+                    // the answer itself and the shell then called finish_call,
+                    // which left `answer_call` — the app's only non-UI way to
+                    // answer — permanently unreachable AND made a second
+                    // implementation of the same transition. One path now: the
+                    // sheet reports the press, this applies it, and answer_call
+                    // owns the guard against answering twice.
+                    if let Some(a) = answered { self.answer_call(a); }
+                });
             }
         }
 
@@ -3713,45 +3718,46 @@ impl Snapclone {
                 // the cards painted over it (seen: "SCAN A CODE" under "find").
                 // A dialog is a thing above the page; egui's layer order says
                 // so, not the call order.
-                let layer = egui::LayerId::new(egui::Order::Foreground, ui.id().with("qr-dialog"));
-                let mut child = ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(area));
-                child.painter().rect_filled(area, uikit_egui::tokens::RADIUS_MD as f32, colors.bg_card);
-                child.painter().rect_stroke(area, uikit_egui::tokens::RADIUS_MD as f32,
-                    egui::Stroke::new(1.0, egui::Color32::from_white_alpha(uikit_egui::glass::GlassAlphas::HAIRLINE)),
-                    egui::StrokeKind::Inside);
-                let mut child = child.new_child(egui::UiBuilder::new().max_rect(area.shrink(12.0)));
-                let mut scanned = None;
-                if let Some(q) = self.qr.as_mut() {
-                    // With the diagnosis, so the scanner can say whether it is looking or
-                    // broken. Computed here because the counters live on the app and the
-                    // scanner has no business owning them.
-                    let diag = crate::qr_scan_status::status(
-                        q.is_scanning(),
-                        self.scan_counts,
-                        self.scan_hit.as_deref(),
-                    );
-                    scanned = crate::qr::qr_ui_diag(&mut child, q, &colors, diag);
-                }
-                // BOTH HALVES. qr_ui reads somebody else's code; my_code_ui
-                // shows yours so they can read it back. With only the scanner,
-                // an exchange needs a third device.
-                child.separator();
-                let shown = *self.qr_shown_at.get_or_insert(ui.input(|i| i.time));
-                let tilt = self.glove_input.raw().map(|_| self.tilt);
-                if crate::qr::my_code_ui(&mut child, &self.local_id, &colors, Some(shown), tilt) {
-                    self.qr_expanded = Some(uikit_egui::qr::Expanded::open(ui.input(|i| i.time)));
-                }
-                if child.button("close").clicked() {
-                    self.qr = None;
-                    self.qr_shown_at = None;
-                    self.modal.dismiss("qr");
-                }
-                // apply_scan is the EXISTING path — it adds the peer the same
-                // way a typed address does and dismisses the dialog itself. I
-                // had written on_scanned_contact(), which does not exist;
-                // adding a second entry point would have made a scanned contact
-                // a different kind of contact from a typed one, which is
-                // exactly what apply_scan's doc says it exists to prevent.
+                // (Now through modal::body_ui like the other five: a bare
+                // Foreground LayerId is not an Area, so egui paints and
+                // hit-tests it in hash order among other layers.)
+                let ctx = ui.ctx().clone();
+                let scanned = crate::modal::body_ui(&ctx, "qr", crate::modal::Layer::Dialog, area,
+                        colors.bg_card, |child: &mut egui::Ui| {
+                    let mut scanned = None;
+                    if let Some(q) = self.qr.as_mut() {
+                        // With the diagnosis, so the scanner can say whether it is looking or
+                        // broken. Computed here because the counters live on the app and the
+                        // scanner has no business owning them.
+                        let diag = crate::qr_scan_status::status(
+                            q.is_scanning(),
+                            self.scan_counts,
+                            self.scan_hit.as_deref(),
+                        );
+                        scanned = crate::qr::qr_ui_diag(child, q, &colors, diag);
+                    }
+                    // BOTH HALVES. qr_ui reads somebody else's code; my_code_ui
+                    // shows yours so they can read it back. With only the scanner,
+                    // an exchange needs a third device.
+                    child.separator();
+                    let shown = *self.qr_shown_at.get_or_insert(ui.input(|i| i.time));
+                    let tilt = self.glove_input.raw().map(|_| self.tilt);
+                    if crate::qr::my_code_ui(child, &self.local_id, &colors, Some(shown), tilt) {
+                        self.qr_expanded = Some(uikit_egui::qr::Expanded::open(ui.input(|i| i.time)));
+                    }
+                    if child.button("close").clicked() {
+                        self.qr = None;
+                        self.qr_shown_at = None;
+                        self.modal.dismiss("qr");
+                    }
+                    // apply_scan is the EXISTING path — it adds the peer the same
+                    // way a typed address does and dismisses the dialog itself. I
+                    // had written on_scanned_contact(), which does not exist;
+                    // adding a second entry point would have made a scanned contact
+                    // a different kind of contact from a typed one, which is
+                    // exactly what apply_scan's doc says it exists to prevent.
+                    scanned
+                });
                 if let Some(sc) = scanned {
                     self.apply_scan(sc);
                 }
@@ -6582,6 +6588,36 @@ mod tests {
         d.drag(&mut app, 360.0, 60.0, 24);
         assert_eq!(app.settings.tab, crate::settings_page::Tab::Camera);
         assert_eq!(app.nav.page(), 4);
+    }
+
+    #[test]
+    fn the_contact_editor_is_above_the_page_and_takes_the_typing() {
+        // "Edit contact popup appearing behind other elements." Its body
+        // was painted into the page's own layer BEFORE the Friends page was
+        // drawn, so the page's cards painted over it and took its presses;
+        // the scrim, drawn after it, darkened it too.
+        use egui::{Event, PointerButton, Pos2};
+        let mut d = Drive::new();
+        let mut app = app();
+        app.nav.go_page(2);
+        d.frame(&mut app, vec![]);
+        app.apply_friends(crate::friends::Action::Invoke("bob".into(), "edit".into()));
+        d.frame(&mut app, vec![]);
+        d.frame(&mut app, vec![]);
+        // The editor's card is at modal Rect(20, 80, 340, 400): whatever is
+        // topmost in the middle of it must be the editor's own Area.
+        let mid = Pos2::new(190.0, 280.0);
+        let top = d.ctx.layer_id_at(mid).expect("nothing at all under the editor");
+        assert_eq!(top.order, egui::Order::Foreground, "under the editor is {top:?}");
+        // And typing reaches its field: tap the field, type, the name changes.
+        let field = Pos2::new(100.0, 121.0);
+        d.frame(&mut app, vec![Event::PointerMoved(field), Event::PointerButton { pos: field,
+            button: PointerButton::Primary, pressed: true, modifiers: Default::default() }]);
+        d.frame(&mut app, vec![Event::PointerButton { pos: field,
+            button: PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
+        d.frame(&mut app, vec![Event::Text("!".into())]);
+        assert!(app.editor_name.contains('!'),
+            "the tap on the editor's field did not focus it: {:?}", app.editor_name);
     }
 
     #[test]
