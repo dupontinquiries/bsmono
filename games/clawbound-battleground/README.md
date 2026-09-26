@@ -100,7 +100,7 @@ what else is known-but-unresolved.
 - **Ambient life** — ground-bird flocks that flush when you come near and
   settle elsewhere, glow-moths around the heal trees at night, fireflies that
   come out under cloud, sky birds that scatter at lightning and roost at night.
-- **100-item shop** in 8 stat categories, three tiers, 8 stacking items,
+- **102-item shop** in 8 stat categories (100, plus the two Siphon items that raise every cat's base Siphon defence), three tiers, 8 stacking items,
   searchable (type to filter, arrow keys + Enter to buy), with hover-lift and
   a green purchase flash on item cards, a gold dot marking categories
   recommended for your role, and sell-back (click an owned slot to arm it,
@@ -202,7 +202,7 @@ input model the monorepo's other games (skydribble, unendlich) use.
 | `Space` / pad `A` / touch `^` | Leap: onto the rock, log, wall top or pillar cap you are steering at (up to 5.5 u above your paws), else up to 9 u forward. From a perch the next leap is free |
 | `1 2 3 4` or `Q E R F` | Cast abilities at crosshair ground point (4 = ultimate) |
 | `Z` / pad `LB` / a gentle stick | Stalk: a quarter speed, low, silent, threading between stems. A toggle, and deliberately not a held modifier. Attacking, casting or being hit suspends it for 1.5 s; dashes, blinks and buffs grant a hush at full speed; under 35% HP a cat slinks on its own |
-| `B` | Toggle the 100-item shop |
+| `B` | Toggle the shop |
 | `Tab` / `C` (hold) | Scoreboard |
 | Mouse wheel / `PgUp` `PgDn` | Zoom |
 | `X` | Camera behind me |
@@ -266,7 +266,7 @@ Headless core first, GPU shell on top — everything above the line runs under
 src/
 ├── consts.rs      arena layout (3-lane polylines, 12 towers), tuning, XP curve
 ├── gods.rs        13-ancestor roster (from Clawbound), 52 ability defs over 13 archetypes
-├── items.rs       the 100-item catalog, stat model, stacking rules, AI builds
+├── items.rs       the 102-item catalog, stat model, stacking rules, AI builds
 ├── weather.rs     weather state machine → `Atmosphere` sample (plain numbers)
 ├── map_events.rs  event scheduler + effects; `speed_mul` / `gold_mul` hooks
 ├── wild.rs        heal trees, prey (hare / stag / glowfish), the hunt, Riverblessing

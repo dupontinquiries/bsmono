@@ -1,4 +1,5 @@
-// Shop catalog — exactly 100 items across 8 stat categories
+// Shop catalog — 102 items: 100 across 8 stat categories, and the two Siphon
+// items (brawl: they raise the base Siphon defence every cat has)
 // (Strength, Intelligence, Scaling/Spell Power, Protection, Penetration,
 //  Attack Speed, Health, Stacking) in three tiers.
 
@@ -267,6 +268,9 @@ fn build() -> Vec<Item> {
     push(&mut v, "Beacon of Ages", 3, 2800., Cat::Stacking, s(0.,40.,0.,0.,0.,0.,0.,0.,0.,0.,0.), st(StackKind::Time, 3.0, 60.0, 60.0), "+40 INT. Gains +3 INT every minute (max 60).");
     push(&mut v, "Monument of Ruin", 3, 3100., Cat::Stacking, s(0.,0.,0.,0.,0.,0.,0.,500.,0.,0.,0.), st(StackKind::MinionKill, 4.0, 320.0, 0.0), "+500 HP. Gains +4 HP per minion kill (max 320).");
 
+    // ── Siphon (2): raise the base defence every cat has (brawl) ─────────────
+    push(&mut v, "Siphon Charm", 1, 700., Cat::Protection, s(0.,0.,0.,8.,0.,0.,0.,75.,0.,0.,0.), None, "A charm that drinks the storm. Ability damage from enemy ancestors returns 18% as mana (from 10%). +8 Protection, +75 HP.");
+    push(&mut v, "Soulwell Talisman", 2, 1900., Cat::Protection, s(0.,0.,0.,22.,0.,0.,0.,200.,150.,0.,0.), None, "A well that fills in a barrage. Ability damage from enemy ancestors returns 30% as mana. +22 Protection, +200 HP, +150 Mana.");
     v
 }
 

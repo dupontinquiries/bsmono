@@ -43,6 +43,7 @@ impl Game {
 
         // 4. movement
         self.move_gods(dt);
+        self.resolve_bodies();
         self.move_minions(dt);
         self.logs_tick(dt);
 
@@ -118,6 +119,7 @@ impl Game {
         let blockers = self.blockers.clone();
         // Leap requests. Refused silently when the cat cannot leap right
         // now; the binding is a press, not a promise.
+        let now = self.t;
         for (i, aim) in std::mem::take(&mut self.leap_queue) {
             let Some(g) = self.gods.get_mut(i) else { continue };
             if g.respawn_t > 0.0 || g.dash.is_some() || g.fall.is_some() {
@@ -126,10 +128,9 @@ impl Game {
             // Bounding: from a perch, or buffered during a landing, the next
             // leap needs no cooldown and barely a gather.
             let landing = matches!(g.leap, Some(l) if l.phase == crate::leap::Phase::Land);
-            let chained = g.perch.is_some() || landing;
-            if (g.leap.is_some() && !landing) || (!chained && g.leap_cd > 0.0) {
+            let Some(chained) = crate::brawl::may_leap(g.leap.is_some(), landing, g.perch.is_some(), g.leap_cd, now - g.last_dmg_t) else {
                 continue;
-            }
+            };
             let aim = if aim.length_squared() > 1e-4 { aim } else { Vec3::new(g.yaw.cos(), 0.0, g.yaw.sin()) };
             if let Some(plan) = crate::leap::plan(g.pos, aim, g.perch, &blockers) {
                 g.yaw = (plan.to.z - g.pos.z).atan2(plan.to.x - g.pos.x);
@@ -165,14 +166,20 @@ impl Game {
                 if done {
                     g.perch = l.perch;
                     g.leap = None;
-                    g.leap_cd = crate::leap::LEAP_COOLDOWN;
+                    // winded: the next leap cools twice as long
+                    g.leap_cd = crate::leap::LEAP_COOLDOWN * if now - g.last_dmg_t < crate::brawl::WINDED_SECS { crate::brawl::WINDED_COOLDOWN } else { 1.0 };
                 }
             } else if let Some(d) = &mut g.dash {
                 d.t += dt;
                 let a = (d.t / d.dur).min(1.0);
-                g.pos = d.from.lerp(d.to, a) + Vec3::Y * (a * (1.0 - a) * 4.0 * 0.35);
+                // over the ground the whole way: a straight line up a ramp
+                // went INTO the slope, then snapped up at the end
+                let p = d.from.lerp(d.to, a);
+                let gy = crate::map::ground_y(p.x, p.z);
+                g.pos = Vec3::new(p.x, p.y.max(gy), p.z) + Vec3::Y * (a * (1.0 - a) * 4.0 * 0.35);
                 if a >= 1.0 {
-                    g.pos = d.to;
+                    let gy = crate::map::ground_y(d.to.x, d.to.z);
+                    g.pos = Vec3::new(d.to.x, d.to.y.max(gy), d.to.z);
                     g.dash = None;
                 }
                 g.walk_anim += dt * 12.0;
@@ -473,7 +480,25 @@ impl Game {
                     let to = self.target_pos(target.unwrap());
                     let dir = (to - from).normalize_or_zero();
                     self.events.push(Event::DashFx { pos: from + dir * 1.2, dir, color: team.rgb() });
-                    self.deal_damage(target.unwrap(), dmg, def.dmg_type == crate::gods::DmgType::Magical, Some(i), pen_pct, pen_flat);
+                    let magic = def.dmg_type == crate::gods::DmgType::Magical;
+                    let main = target.unwrap();
+                    let profile = crate::brawl::melee_for(def);
+                    // from behind (assassins most): the dive's reward
+                    let mut dmg = dmg;
+                    if let (Some(m), TargetRef::God(j)) = (profile, main) {
+                        if self.from_behind(i, j) {
+                            dmg *= m.backstab;
+                        }
+                    }
+                    let extra = profile.map(|m| self.cleave_targets(i, main, def.auto_range * 1.15, m)).unwrap_or_default();
+                    self.siphon_off = true;
+                    self.deal_damage(main, dmg, magic, Some(i), pen_pct, pen_flat);
+                    // the sweep or cleave catches those beside it
+                    let splash = profile.map_or(0.0, |m| m.splash);
+                    for t in extra {
+                        self.deal_damage(t, dmg * splash, magic, Some(i), pen_pct, pen_flat);
+                    }
+                    self.siphon_off = false;
                 }
                 AutoKind::Ranged => {
                     let to = self.target_pos(target.unwrap());
@@ -906,7 +931,7 @@ impl Game {
         let mut hits: Vec<TargetRef> = Vec::new();
         for gi in 0..self.gods.len() {
             let g = &self.gods[gi];
-            if g.team != team && g.respawn_t <= 0.0 && crate::hitbox::cat(g.pos, g.yaw, false).in_disc(center, radius + 0.2) {
+            if g.team != team && g.respawn_t <= 0.0 && (g.pos.y - center.y).abs() < crate::brawl::AOE_REACH_Y && crate::hitbox::cat(g.pos, g.yaw, false).in_disc(center, radius + 0.2) {
                 hits.push(TargetRef::God(gi));
             }
         }
@@ -933,8 +958,13 @@ impl Game {
                 hits.push(TargetRef::Boss(bi));
             }
         }
+        // a crowd thins it: each extra cat caught lowers every cat's share
+        // (brawl::aoe_falloff); minions and structures take it whole
+        let cats = hits.iter().filter(|h| matches!(h, TargetRef::God(_))).count();
+        let thin = crate::brawl::aoe_falloff(cats);
         for h in hits {
-            self.deal_damage(h, dmg, true, if owner == usize::MAX { None } else { Some(owner) }, pen_pct, pen_flat);
+            let d = if matches!(h, TargetRef::God(_)) { dmg * thin } else { dmg };
+            self.deal_damage(h, d, true, if owner == usize::MAX { None } else { Some(owner) }, pen_pct, pen_flat);
         }
     }
 

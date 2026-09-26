@@ -38,6 +38,8 @@ pub mod cues;
 pub mod voicescript;
 /// Who the ancestors are: species, age, land, gender, story, music; checked against the game.
 pub mod lore;
+/// Brawls: body collision, melee identity, area falloff, siphon, winded.
+pub mod brawl;
 /// The generated preparation documents in dev/ (cue cards, recording sheet, cue sheet).
 pub mod devdocs;
 /// Character voxels as smooth surfaces with fur lengths, for the ultra preview.

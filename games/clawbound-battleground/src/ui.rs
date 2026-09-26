@@ -436,7 +436,7 @@ pub fn draw_select(ctx: &egui::Context, ui_state: &mut UiState, locked: &mut boo
 
 // --- HUD ----------------------------------------------------------------------
 
-pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f32, h: f32, ui_state: &mut UiState) {
+pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f32, h: f32, ui_state: &mut UiState, eye: Vec3) {
     // Project into egui's OWN screen, in logical points. The caller passes
     // the render surface's size, in physical pixels; on a display scaled
     // 1.25x, 2x (Retina), 3x (phones) every world-anchored bar, name and
@@ -632,7 +632,7 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
 
     // world-space: hp bars + damage floaters
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("world")));
-    draw_god_bars(&painter, game, Some(player), vp, w, h);
+    draw_god_bars(&painter, game, Some(player), vp, w, h, eye);
     // minions hp bars (only when damaged)
     for m in &game.minions {
         if m.hp < m.max_hp {
@@ -1250,7 +1250,7 @@ mod hidpi_tests {
                 time: Some(k as f64 * 0.016),
                 ..Default::default()
             };
-            shapes = ctx.run(raw, |c| draw_hud(c, &game, 0, vp, pw, ph, &mut st)).shapes;
+            shapes = ctx.run(raw, |c| draw_hud(c, &game, 0, vp, pw, ph, &mut st, cam.eye)).shapes;
         }
         // the player's bar: a 64-point-wide dark rect
         let bar = shapes
@@ -1295,23 +1295,42 @@ mod hidpi_tests {
 
 /// Every living cat's health bar, shield and name, over its head; the
 /// player (if any) marked. Shared by the player's HUD and the spectator's.
-pub fn draw_god_bars(painter: &egui::Painter, game: &Game, player: Option<usize>, vp: Mat4, w: f32, h: f32) {
+pub fn draw_god_bars(painter: &egui::Painter, game: &Game, player: Option<usize>, vp: Mat4, w: f32, h: f32, eye: Vec3) {
     for i in 0..game.gods.len() {
         let gg = &game.gods[i];
         if gg.respawn_t > 0.0 {
             continue;
         }
-        if let Some((sp, _depth)) = project(vp, gg.pos + Vec3::Y * 2.6, w, h) {
-            let bw = if Some(i) == player { 64.0 } else { 52.0 };
-            let r = Rect::from_min_size(sp - Vec2::new(bw / 2.0, 10.0), Vec2::new(bw, 7.0));
-            painter.rect_filled(r, 2.0, Color32::from_rgb(15, 14, 20));
-            painter.rect_filled(Rect::from_min_size(r.left_top(), Vec2::new(r.width() * (gg.hp / gg.max_hp).clamp(0.0, 1.0), 7.0)), 2.0, col(gg.team));
+        let head = gg.pos + Vec3::Y * 2.6;
+        let mine = Some(i) == player;
+        // Size and presence by distance and sight: the pass's long views
+        // put thirty full-size bars on screen, and bars showed THROUGH rock.
+        // Far bars shrink (to 55% by 90 u) and fade out (gone at 120 u); a
+        // cat behind terrain keeps a faint bar and no name.
+        let dist = head.distance(eye);
+        let far = ((dist - 20.0) / 70.0).clamp(0.0, 1.0);
+        let scale = 1.0 - 0.45 * far;
+        let fade = 1.0 - ((dist - 80.0) / 40.0).clamp(0.0, 1.0);
+        let seen = mine || crate::map::line_clear(eye, head);
+        let alpha = if mine { 1.0 } else { fade * if seen { 1.0 } else { 0.28 } };
+        if alpha < 0.03 {
+            continue;
+        }
+        let a = |c: Color32| c.gamma_multiply(alpha);
+        if let Some((sp, _depth)) = project(vp, head, w, h) {
+            let bw = if mine { 64.0 } else { 52.0 * scale };
+            let bh = if mine { 7.0 } else { (7.0 * scale).max(4.5) };
+            let r = Rect::from_min_size(sp - Vec2::new(bw / 2.0, 10.0), Vec2::new(bw, bh));
+            painter.rect_filled(r, 2.0, a(Color32::from_rgb(15, 14, 20)));
+            painter.rect_filled(Rect::from_min_size(r.left_top(), Vec2::new(r.width() * (gg.hp / gg.max_hp).clamp(0.0, 1.0), bh)), 2.0, a(col(gg.team)));
             if gg.shield > 0.0 {
-                painter.rect_filled(Rect::from_min_size(r.left_top(), Vec2::new(r.width() * (gg.shield / gg.max_hp).clamp(0.0, 1.0), 3.5)), 2.0, Color32::from_rgb(160, 220, 255));
+                painter.rect_filled(Rect::from_min_size(r.left_top(), Vec2::new(r.width() * (gg.shield / gg.max_hp).clamp(0.0, 1.0), bh * 0.5)), 2.0, a(Color32::from_rgb(160, 220, 255)));
             }
-            let name = game.god_name(i);
-            painter.text(sp + Vec2::new(0.0, -16.0), Align2::CENTER_CENTER, name, FontId::proportional(11.0), col(gg.team));
-            if Some(i) == player {
+            if mine || (seen && dist < 45.0) {
+                let name = game.god_name(i);
+                painter.text(sp + Vec2::new(0.0, -16.0), Align2::CENTER_CENTER, name, FontId::proportional(11.0 * scale.max(0.8)), a(col(gg.team)));
+            }
+            if mine {
                 painter.circle_stroke(sp + Vec2::new(0.0, 8.0), 3.0, Stroke::new(1.5_f32, GOLD));
             }
         }
@@ -1320,11 +1339,11 @@ pub fn draw_god_bars(painter: &egui::Painter, game: &Game, player: Option<usize>
 
 /// The spectator's overlay: every cat's bar, the minimap, the mode and who
 /// is watched, and the keys. Nothing of any one cat's own HUD.
-pub fn draw_spectator_hud(ctx: &egui::Context, game: &Game, vp: Mat4, label: &str) {
+pub fn draw_spectator_hud(ctx: &egui::Context, game: &Game, vp: Mat4, label: &str, eye: Vec3) {
     setup_style(ctx);
     let r = ctx.screen_rect();
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("spectator_world")));
-    draw_god_bars(&painter, game, None, vp, r.width(), r.height());
+    draw_god_bars(&painter, game, None, vp, r.width(), r.height(), eye);
     draw_minimap(ctx, game, 0);
     let top = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("spectator")));
     top.text(egui::pos2(r.center().x, r.top() + 18.0), Align2::CENTER_TOP, label, FontId::proportional(20.0), GOLD);

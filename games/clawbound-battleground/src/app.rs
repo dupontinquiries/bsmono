@@ -795,18 +795,23 @@ fn compute_aim(s: &AppState) -> Vec3 {
     let player = &s.game.as_ref().unwrap().gods[0];
     let dir = cam_dir(s.cam_yaw, s.cam_pitch);
     let eye = player.pos + Vec3::Y * 1.5 - dir * s.cam_dist;
-    if dir.y < -0.02 {
-        let t = -eye.y / dir.y;
-        let hit = eye + dir * t;
-        let d = Vec3::new(hit.x, 0.0, hit.z) - Vec3::new(player.pos.x, 0.0, player.pos.z);
-        if d.length() > 30.0 {
-            player.pos + d.normalize() * 30.0
-        } else {
-            Vec3::new(hit.x, 0.0, hit.z)
+    // the camera ray against the REAL surface (the pass has a shelf and
+    // slopes; the plane y = 0 put the aim somewhere else), clamped to 30 u
+    // and set down on the ground there
+    let on_ground = |p: Vec3| Vec3::new(p.x, crate::map::surface_y(p.x, p.z), p.z);
+    match crate::map::ray_ground(eye, dir, 400.0) {
+        Some(hit) => {
+            let d = Vec3::new(hit.x - player.pos.x, 0.0, hit.z - player.pos.z);
+            if d.length() > 30.0 {
+                on_ground(player.pos + d.normalize() * 30.0)
+            } else {
+                hit
+            }
         }
-    } else {
-        let f = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
-        player.pos + f * 14.0
+        None => {
+            let f = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
+            on_ground(player.pos + f * 14.0)
+        }
     }
 }
 
@@ -1399,6 +1404,8 @@ fn render(s: &mut AppState) {
     let mut open_controls = false;
     let mut panel = ui::ControlsPanel { close: false, capture: None, clear: None, scheme: None, reset: false };
     let (show_fps, frame_s) = (s.cfg.settings.show_fps, s.frame_s);
+    // where the camera is: bars fade with distance and behind terrain
+    let cam_eye = s.renderer.camera.eye;
     let output = s.egui_ctx.run(raw_input, |ctx| {
         if show_fps {
             ui::draw_fps(ctx, 1.0 / frame_s.max(1e-4), frame_s * 1000.0);
@@ -1420,11 +1427,11 @@ fn render(s: &mut AppState) {
                     if let Some(it) = s.intro.as_ref() {
                         ui::draw_intro_overlay(ctx, &it.frame().overlay);
                     } else if let Some(sp) = s.spectator.as_ref() {
-                        ui::draw_spectator_hud(ctx, g, vp, &sp.label(g));
+                        ui::draw_spectator_hud(ctx, g, vp, &sp.label(g), cam_eye);
                     } else if s.ui.shop_open {
                         ui::draw_shop(ctx, g, 0, &mut s.ui);
                     } else {
-                        ui::draw_hud(ctx, g, 0, vp, s.renderer.width as f32, s.renderer.height as f32, &mut s.ui);
+                        ui::draw_hud(ctx, g, 0, vp, s.renderer.width as f32, s.renderer.height as f32, &mut s.ui, cam_eye);
                         if s.cfg.settings.touch_enabled {
                             ui::draw_touch_pad(ctx, &s.touch, g, s.renderer.width as f32, s.renderer.height as f32);
                         } else {

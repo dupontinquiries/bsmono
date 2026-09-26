@@ -258,3 +258,129 @@ mod tests {
         });
     }
 }
+
+/// The visible surface's height here: the terrain (rock included) or the
+/// walkable floor, whichever is higher.
+pub fn surface_y(x: f32, z: f32) -> f32 {
+    crate::render::terrain_height(x, z).max(ground_y(x, z))
+}
+
+/// Where a ray from `eye` along `dir` first meets the surface, within
+/// `max_t`: marched in steps, the crossing then bisected. Aiming used the
+/// plane y = 0 -- on the pass's shelf (9 u up) and slopes the aim landed
+/// somewhere else entirely.
+pub fn ray_ground(eye: Vec3, dir: Vec3, max_t: f32) -> Option<Vec3> {
+    if !(eye.is_finite() && dir.is_finite()) || dir.length_squared() < 1e-8 {
+        return None;
+    }
+    let dir = dir.normalize();
+    let above = |t: f32| {
+        let p = eye + dir * t;
+        p.y - surface_y(p.x, p.z)
+    };
+    if above(0.0) < 0.0 {
+        return None; // the eye is inside the ground
+    }
+    let (mut lo, mut t) = (0.0f32, 0.4f32);
+    while t <= max_t {
+        if above(t) <= 0.0 {
+            let mut hi = t;
+            for _ in 0..10 {
+                let mid = (lo + hi) * 0.5;
+                if above(mid) > 0.0 {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            let p = eye + dir * hi;
+            return Some(Vec3::new(p.x, surface_y(p.x, p.z), p.z));
+        }
+        lo = t;
+        t += 0.4 + t * 0.01;
+    }
+    None
+}
+
+/// Is the straight line from `a` to `b` clear of the terrain? Sampled
+/// along its length (the ends excluded, so a point ON the ground still
+/// sees). For health bars behind rock, and cameras looking at a fight.
+pub fn line_clear(a: Vec3, b: Vec3) -> bool {
+    let n = ((b - a).length() / 1.5).ceil().clamp(4.0, 120.0) as usize;
+    (1..n).all(|k| {
+        let p = a.lerp(b, k as f32 / n as f32);
+        p.y > surface_y(p.x, p.z) - 0.2
+    })
+}
+
+#[cfg(test)]
+mod ray_tests {
+    use super::*;
+
+    /// On flat ground the march agrees with the plane; on the pass's shelf
+    /// it finds the shelf (9 u up), where the plane found a point far past it.
+    #[test]
+    fn the_aim_ray_meets_the_real_ground() {
+        with(MapId::Jungle, || {
+            let eye = Vec3::new(3.0, 12.0, -60.0);
+            let dir = Vec3::new(0.0, -0.6, 1.0);
+            let hit = ray_ground(eye, dir, 200.0).unwrap();
+            let t = -(eye.y - surface_y(hit.x, hit.z)) / dir.normalize().y;
+            assert!((hit - (eye + dir.normalize() * t)).length() < 0.6, "flat: agrees with the plane: {hit}");
+        });
+        with(MapId::Pass, || {
+            // a point on the Top lane's raised shelf
+            let pts = crate::pass::lane_polyline(crate::consts::Lane::Top);
+            let mut shelf = None;
+            let n = pts.len();
+            for k in 0..n * 20 {
+                let a = pts[(k / 20).min(n - 2)];
+                let b = pts[(k / 20 + 1).min(n - 1)];
+                let p = a.lerp(b, (k % 20) as f32 / 20.0);
+                if ground_y(p.x, p.z) > 8.0 {
+                    shelf = Some(p);
+                    break;
+                }
+            }
+            let target = shelf.expect("a shelf point");
+            let target = Vec3::new(target.x, ground_y(target.x, target.z), target.z);
+            let eye = target + Vec3::new(0.0, 14.0, -10.0);
+            let hit = ray_ground(eye, target - eye, 200.0).unwrap();
+            assert!((hit - target).length() < 1.0, "on the shelf: {hit} vs {target}");
+            // the old plane intersection: far off
+            let d = (target - eye).normalize();
+            let plane = eye + d * (-eye.y / d.y);
+            assert!((plane - target).length() > 5.0, "the plane missed by {}", (plane - target).length());
+        });
+    }
+
+    #[test]
+    fn a_line_through_rock_is_not_clear() {
+        with(MapId::Pass, || {
+            // from open floor, through the massif at the centre of the map
+            let f = crate::pass::floor();
+            let mut open = None;
+            for x in (-150..=150).step_by(5) {
+                for z in (-150..=150).step_by(5) {
+                    if open.is_none() && f.sdf(x as f32, z as f32) < -8.0 {
+                        open = Some(Vec3::new(x as f32, ground_y(x as f32, z as f32) + 1.5, z as f32));
+                    }
+                }
+            }
+            let a = open.unwrap();
+            assert!(line_clear(a, a + Vec3::new(0.0, 0.0, 0.5)), "a short open line");
+            // straight at a point deep in rock: a peak's height
+            let peak = Vec3::new(0.0, 1.0, 0.0);
+            let mut into_rock = None;
+            for x in (-200..=200).step_by(4) {
+                for z in (-200..=200).step_by(4) {
+                    if into_rock.is_none() && surface_y(x as f32, z as f32) > 40.0 {
+                        into_rock = Some(Vec3::new(x as f32, 1.0, z as f32));
+                    }
+                }
+            }
+            let _ = peak;
+            assert!(!line_clear(a, into_rock.expect("a peak")), "a line into a peak is blocked");
+        });
+    }
+}

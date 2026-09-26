@@ -306,6 +306,9 @@ pub struct Game {
     pub cast_queue: Vec<(usize, u32, Vec3)>, // (god idx, slot, aim)
     /// Leap requests: (god idx, aim direction). Drained by `move_gods`.
     pub leap_queue: Vec<(usize, Vec3)>,
+    /// Set around a basic attack's damage: the siphon (brawl) pays back
+    /// ability damage only.
+    pub siphon_off: bool,
     /// The river crossings. See `logs`.
     pub logs: Vec<crate::logs::RollingLog>,
     pub(crate) logs_seen: usize,
@@ -473,6 +476,7 @@ impl Game {
             rng,
             cast_queue: Vec::new(),
             leap_queue: Vec::new(),
+            siphon_off: false,
             logs: crate::logs::crossings().iter().map(crate::logs::RollingLog::across).collect(),
             logs_seen: 0,
             tower_alive: [6, 6],
@@ -702,6 +706,15 @@ impl Game {
                 }
                 g.hp -= dmg;
                 g.last_dmg_t = self.t;
+                // the siphon: ability damage from an enemy CAT returns a share
+                // as mana to the one who took it (brawl)
+                let from_enemy_cat = !self.siphon_off && source.is_some_and(|s| s != ti && s < self.gods.len());
+                let g = &mut self.gods[ti];
+                if from_enemy_cat && g.hp > 0.0 {
+                    let pct = crate::brawl::siphon_pct(&g.items);
+                    g.mana = (g.mana + dmg * pct).min(g.max_mana);
+                }
+                let g = &mut self.gods[ti];
                 if let Some(s) = source {
                     if s != ti {
                         g.recent_damagers.retain(|(idx, t)| *idx != s && self.t - *t < 8.0);

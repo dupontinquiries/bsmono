@@ -57,6 +57,14 @@ the single highest-value thing anyone can do with this repo next.
 
 ## Known gaps
 
+- **Brawl balance numbers are first guesses, untuned by play** (src/brawl.rs):
+  AoE falloff 0.12 per extra cat (half at nine), Siphon 10% base (18/30%
+  with the items), Winded 2.5 s (Dota's Blink Dagger uses 3 s), melee arcs
+  150/100/50 deg, assassin backstab x1.35, ally push 0.3, tackle knock 0.9 u.
+  Next: a 15-v-15 bot match measuring AoE's share of all damage before and
+  after, and a player's feel. Body collision is cats-only (minions do not
+  collide with cats).
+
 - **Ultra graphics: a PREVIEW** (`--ultra` / `CLAWBOUND_QUALITY=ultra`).
   Characters only: smoothed (smoothvox), shell fur with manes, GGX PBR in
   the game's lighting model, coloured lights from ability effects, and

@@ -321,7 +321,7 @@ pub fn run() -> Result<(), String> {
         };
         let vp = cam.view_proj(W as f32 / H as f32);
         let output = egui_ctx.run(raw, |ctx| {
-            ui::draw_hud(ctx, &game, 0, vp, W as f32, H as f32, &mut ui_state);
+            ui::draw_hud(ctx, &game, 0, vp, W as f32, H as f32, &mut ui_state, renderer.camera.eye);
             if captures[next_capture].1.contains("orbit") {
                 ui::draw_scoreboard(ctx, &game);
             }
@@ -1053,7 +1053,7 @@ pub fn run_pass_shots() -> Result<(), String> {
                 ..Default::default()
             };
             let o = ctx.run(raw, |c| {
-                ui::draw_hud(c, &game, 0, vp, W as f32, H as f32, &mut st);
+                ui::draw_hud(c, &game, 0, vp, W as f32, H as f32, &mut st, renderer.camera.eye);
                 ui::draw_scoreboard(c, &game);
             });
             textures.append(o.textures_delta.clone());
@@ -1477,7 +1477,12 @@ pub fn run_spectate() -> Result<(), String> {
         game.tick(dt);
         let ev: Vec<crate::sim::Event> = game.events.drain(..).collect();
         vfx.update(dt, &ev, &game);
+        let cuts_before = sp.cuts;
         let shot = sp.update(&game, if k == 0 { Input { director: true, ..Default::default() } } else { Input::default() }, dt);
+        // a deliberate cut is not a jerk: measure the moves between cuts
+        if sp.cuts != cuts_before {
+            prev = None;
+        }
         if let Some(p) = prev {
             worst_turn = worst_turn.max((p.target - p.eye).normalize().dot((shot.target - shot.eye).normalize()).clamp(-1.0, 1.0).acos().to_degrees());
             worst_step = worst_step.max((shot.eye - p.eye).length());
@@ -1488,7 +1493,7 @@ pub fn run_spectate() -> Result<(), String> {
         }
         prev = Some(shot);
     }
-    println!("director, 20 s: {} focus changes; worst view turn {:.2} deg/frame, worst eye travel {:.2} u/frame", switches - 1, worst_turn, worst_step);
+    println!("director, 20 s: {} focus changes, {} cuts; between cuts: worst view turn {:.2} deg/frame, worst eye travel {:.2} u/frame", switches - 1, sp.cuts, worst_turn, worst_step);
     let ctx = egui::Context::default();
     let mut shoot = |renderer: &mut Renderer, vfx: &mut Vfx, game: &Game, sp: &Spectator, shot: crate::intro::Shot, name: &str| -> Result<(), String> {
         let cam = Camera { eye: shot.eye, target: shot.target, fov_y: shot.fov_y };
@@ -1506,7 +1511,7 @@ pub fn run_spectate() -> Result<(), String> {
                 time: Some(k as f64 * 0.016),
                 ..Default::default()
             };
-            let o = ctx.run(raw, |c| ui::draw_spectator_hud(c, game, vp, &label));
+            let o = ctx.run(raw, |c| ui::draw_spectator_hud(c, game, vp, &label, cam.eye));
             textures.append(o.textures_delta.clone());
             out = Some(o);
         }
