@@ -58,6 +58,10 @@ pub mod ferry;
 pub mod moonwell;
 /// The Moonwyrm's flights over the sky map, and the stars it lets fall.
 pub mod wyrmflight;
+/// The Moonwyrm's 400 u body: where each part of it is, coiled or flying.
+pub mod wyrmbody;
+/// Floating stone and drifting cloud round the sky map's islands.
+pub mod skydrift;
 /// The generated preparation documents in dev/ (cue cards, recording sheet, cue sheet).
 pub mod devdocs;
 /// Character voxels as smooth surfaces with fur lengths, for the ultra preview.

@@ -116,6 +116,32 @@ pub struct Vfx {
     pub puppets: crate::puppet::Troupe,
     /// Blast fronts and broken ground. Ticked here, where the weather is.
     pub ground: crate::groundfx::GroundFx,
+    /// The sky map's mist: tiny trails curling over the stone and ice round
+    /// the player, and mist spilling off the islands' edges (`tick_wisps`).
+    pub wisps: Vec<Wisp>,
+    wisp_seed: u64,
+}
+
+/// One trail of mist: a point that wanders a curling path, leaving a
+/// thread of tiny motes behind it.
+pub struct Wisp {
+    pub pos: Vec3,
+    pub age: f32,
+    pub life: f32,
+    pub seed: f32,
+    /// Spilling off an island's edge (outward and down), not curling over it.
+    pub spill: Option<Vec3>,
+}
+
+/// Wisps alive at once round the player.
+pub const WISPS: usize = 45;
+
+/// Where a wisp of mist drifts at `p`, `age` into its life: a slowly
+/// turning field, and the wisp's own curl tightening as it ages, so each
+/// trail is a spiral, not a line.
+pub fn wisp_vel(p: Vec3, t: f32, age: f32, seed: f32) -> Vec3 {
+    let a = (p.x * 0.21 + t * 0.3).sin() * 2.0 + (p.z * 0.17 - t * 0.25).cos() * 2.0 + seed + age * 1.8;
+    Vec3::new(a.cos(), 0.0, a.sin()) * 1.3
 }
 
 /// A handful of small birds pecking at a jungle spot. When flushed they burst
@@ -415,6 +441,69 @@ impl Vfx {
         self.rings.push(Ring { pos: at + Vec3::Y * 0.08, r0: 0.3, r1: 2.8, until: 0.28, dur: 0.28, color: [color[0] * 0.5 + 0.5, color[1] * 0.5 + 0.5, 1.0], thick: 0.2 });
     }
 
+    /// Mist on the sky map (nothing elsewhere): keeps [`WISPS`] trails alive
+    /// within 35 u of the player's cat -- most curling low over the floor,
+    /// some spilling off a nearby edge, out and down into the sky -- and
+    /// lays a thread of tiny motes behind each.
+    pub fn tick_wisps(&mut self, dt: f32, game: &Game) {
+        if crate::map::active() != crate::map::MapId::Sky || game.gods.is_empty() || dt <= 0.0 {
+            self.wisps.clear();
+            return;
+        }
+        let focus = game.gods[0].pos;
+        let floor = crate::sky::floor();
+        let mut rnd = |s: &mut u64| {
+            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((*s >> 33) as f32) / (1u64 << 31) as f32
+        };
+        let mut seed = self.wisp_seed | 1;
+        // retire the old and the strayed; top up
+        self.wisps.retain(|w| w.age < w.life && Vec3::new(w.pos.x - focus.x, 0.0, w.pos.z - focus.z).length() < 45.0);
+        let mut tries = 0;
+        while self.wisps.len() < WISPS && tries < 12 {
+            tries += 1;
+            let a = rnd(&mut seed) * std::f32::consts::TAU;
+            let r = 4.0 + rnd(&mut seed).sqrt() * 31.0;
+            let p = Vec3::new(focus.x + a.cos() * r, 0.0, focus.z + a.sin() * r);
+            let d = floor.sdf(p.x, p.z);
+            let wseed = rnd(&mut seed) * 6.28;
+            if (-1.5..1.0).contains(&d) && rnd(&mut seed) < 0.5 {
+                // at an edge: spill outward (down the distance gradient) and down
+                let e = 0.5;
+                let out = Vec3::new(floor.sdf(p.x + e, p.z) - floor.sdf(p.x - e, p.z), 0.0, floor.sdf(p.x, p.z + e) - floor.sdf(p.x, p.z - e)).normalize_or_zero();
+                self.wisps.push(Wisp { pos: p + Vec3::Y * 0.4, age: 0.0, life: 5.0 + rnd(&mut seed) * 3.0, seed: wseed, spill: Some(out) });
+            } else if d < -0.5 {
+                self.wisps.push(Wisp { pos: p + Vec3::Y * 0.2, age: 0.0, life: 2.5 + rnd(&mut seed) * 2.5, seed: wseed, spill: None });
+            }
+        }
+        self.wisp_seed = seed;
+        let t = self.time;
+        let emit = (t * 60.0) as i64 % 2 == 0;
+        let mut motes = Vec::new();
+        for w in self.wisps.iter_mut() {
+            w.age += dt;
+            match w.spill {
+                Some(out) => {
+                    // over the lip, then falling away and curling as it goes
+                    let fall = (w.age - 0.8).max(0.0);
+                    w.pos += (out * 1.4 + wisp_vel(w.pos, t, w.age, w.seed) * 0.4 - Vec3::Y * fall * 0.9) * dt;
+                }
+                None => {
+                    let v = wisp_vel(w.pos, t, w.age, w.seed);
+                    w.pos.x += v.x * dt;
+                    w.pos.z += v.z * dt;
+                    w.pos.y = 0.18 + 0.22 * (w.age * 2.1 + w.seed).sin().abs();
+                }
+            }
+            if emit {
+                // fade in and out over the wisp's life
+                let k = (w.age / 0.6).min(1.0) * ((w.life - w.age) / 0.8).clamp(0.0, 1.0);
+                motes.push(Particle { pos: w.pos, vel: Vec3::Y * 0.05, life: 1.1, max_life: 1.1, size: 0.09, color: [0.92, 0.95, 1.0], alpha: 0.75 * k, gravity: 0.0, drag: 0.0 });
+            }
+        }
+        self.particles.extend(motes);
+    }
+
     /// A star the Moonwyrm let fall lands: a straight column of white light
     /// out of the sky, a flash ring thrown out to the edge of the burn, and
     /// a spray of sparks.
@@ -563,6 +652,7 @@ impl Vfx {
         self.tick_afterimages(dt, game);
         self.tick_trails(game);
         self.tick_channels(dt, events, game);
+        self.tick_wisps(dt, game);
         self.time += dt;
         let atm = game.weather.atmosphere();
         self.ground.tick(dt, atm.rain, atm.wetness);

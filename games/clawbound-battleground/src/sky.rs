@@ -295,10 +295,27 @@ fn hash2(x: f32, z: f32) -> f32 {
     v - v.floor()
 }
 
-/// The cloud sea's surface.
-pub const CLOUD_SEA_Y: f32 = -34.0;
+/// Far below the islands, the cloud deck (drawn by the sky shader: there is
+/// no ground under Starwell Glacier, only mist, floating stone and cloud).
+pub const DECK_Y: f32 = -260.0;
+/// An island's underside: a cliff of rock and ice this wide past the lip,
+/// falling [`underside_depth`] before it frays out into mist.
+pub const SKIRT_W: f32 = 9.0;
+
+/// How far an island's underside hangs at (x, z): ragged, 14 to 38 u.
+pub fn underside_depth(x: f32, z: f32) -> f32 {
+    14.0 + 24.0 * crate::pass::vnoise(x * 0.06 + 5.3, z.abs() * 0.06 - 2.1)
+}
+
+/// Open sky: past every island's underside, with nothing below but cloud
+/// (the terrain mesh has no triangles here).
+pub fn in_void(x: f32, z: f32) -> bool {
+    floor().sdf(x, z) > RIM_W + SKIRT_W
+}
 /// The icy lip round every island: it rises this high just past the edge.
-pub const RIM_H: f32 = 2.2;
+// (2.2 until the ground below was taken away: from the game's own camera,
+// 8.5 u behind a cat, a lip that high was a wall that hid the drop)
+pub const RIM_H: f32 = 0.8;
 /// ...over this width, then the island's underside falls away.
 pub const RIM_W: f32 = 3.0;
 
@@ -321,17 +338,11 @@ pub fn terrain_height(x: f32, z: f32) -> f32 {
         let n = 0.6 + 0.8 * hash2((x * 0.5).floor(), (z.abs() * 0.5).floor());
         return RIM_H * n * (t * std::f32::consts::PI).sin();
     }
-    // the island's underside: a steep fall of ice, down into the cloud sea
-    let t = ((d - RIM_W) / 12.0).clamp(0.0, 1.0);
+    // the island's underside: a cliff of rock and ice, hanging a ragged
+    // depth into the sky (past it, nothing: `in_void`)
+    let t = ((d - RIM_W) / SKIRT_W).clamp(0.0, 1.0);
     let fall = t * t * (3.0 - 2.0 * t);
-    fall * cloud_sea(x, z)
-}
-
-/// The cloud sea far below: billows, not a plane. Its height at (x, z).
-pub fn cloud_sea(x: f32, z: f32) -> f32 {
-    let v = crate::pass::vnoise;
-    let b = v(x * 0.035, z.abs() * 0.035) * 0.6 + v(x * 0.09 + 3.1, z.abs() * 0.09 + 1.7) * 0.3 + v(x * 0.21, z.abs() * 0.21) * 0.1;
-    CLOUD_SEA_Y + 9.0 * b * b
+    -fall * underside_depth(x, z)
 }
 
 #[cfg(test)]
@@ -450,8 +461,8 @@ mod tests {
             }
             let mid = a.lerp(b, 0.5);
             assert!(f.sdf(mid.x, mid.z) > 6.0, "the middle of {a}-{b} is open sky: {}", f.sdf(mid.x, mid.z));
-            let h = terrain_height(mid.x, mid.z);
-            assert!(h < CLOUD_SEA_Y + 10.0 && h >= CLOUD_SEA_Y - 0.01, "and far below is cloud: {h}");
+            assert!(in_void(mid.x, mid.z), "and nothing below it but cloud");
+            assert!(terrain_height(mid.x, mid.z) < -12.0);
         }
     }
 
@@ -461,6 +472,6 @@ mod tests {
         assert!(in_pool(3.0, 4.0) && !in_pool(POOL_R + 1.0, 0.0));
         // between the terrace and the Moonwell: open sky down to the clouds
         assert!(floor().sdf(0.0, -95.0) > 20.0);
-        assert!(terrain_height(0.0, -95.0) < CLOUD_SEA_Y + 10.0);
+        assert!(in_void(0.0, -95.0) && terrain_height(0.0, -95.0) < -12.0);
     }
 }

@@ -2016,13 +2016,22 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
     }
 
     let mut idx = Vec::with_capacity((n_side - 1) * (n_side - 1) * 6);
+    // the sky map has no ground under its islands: a cell whose four corners
+    // are all open sky is left out, and the sky shader's cloud deck shows
+    let sky = crate::map::active() == crate::map::MapId::Sky;
+    let void: Vec<bool> = if sky { verts.iter().map(|v| crate::sky::in_void(v.pos[0], v.pos[2])).collect() } else { Vec::new() };
     for iz in 0..n_side - 1 {
         for ix in 0..n_side - 1 {
             let a = (ix + n_side * iz) as u32;
             let b = (ix + 1 + n_side * iz) as u32;
             let c = (ix + n_side * (iz + 1)) as u32;
             let d = (ix + 1 + n_side * (iz + 1)) as u32;
-            idx.extend_from_slice(&[a, c, b, b, c, d]);
+            for tri in [[a, c, b], [b, c, d]] {
+                if sky && tri.iter().all(|&k| void[k as usize]) {
+                    continue;
+                }
+                idx.extend_from_slice(&tri);
+            }
         }
     }
     (verts, idx)
@@ -2122,16 +2131,14 @@ fn sky_ground_color(x: f32, z: f32, h: f32, slope: f32, n1: f32, n2: f32, nm: f3
         // the lip: blue glacier ice
         return ([0.52 + n1 * 0.08, 0.76 + n2 * 0.06, 0.92 + n1 * 0.04], 6.0);
     }
-    if h > sky::CLOUD_SEA_Y + 11.0 {
-        // the underside: dark blue rock, streaked with ice
-        let rock = [0.14 + n1 * 0.04, 0.17 + n1 * 0.04, 0.26 + n2 * 0.05];
-        let ice = [0.40, 0.62, 0.80];
-        let streak = smoothstep(0.6, 0.8, vnoise(x * 0.4, h * 0.3));
-        return (lerp(rock, ice, streak * 0.6 * (1.0 - slope.min(1.0) * 0.3)), 5.0);
-    }
-    // the cloud sea: lavender-white billows, bluer in the troughs
-    let crest = ((h - sky::CLOUD_SEA_Y) / 9.0).clamp(0.0, 1.0);
-    (lerp([0.46, 0.50, 0.70], [0.88, 0.87, 0.96], crest), 6.0)
+    // the underside: dark blue rock, streaked with ice, fraying into
+    // mist toward its ragged foot (there is no ground below it)
+    let rock = [0.14 + n1 * 0.04, 0.17 + n1 * 0.04, 0.26 + n2 * 0.05];
+    let ice = [0.40, 0.62, 0.80];
+    let streak = smoothstep(0.6, 0.8, vnoise(x * 0.4, h * 0.3));
+    let c = lerp(rock, ice, streak * 0.6 * (1.0 - slope.min(1.0) * 0.3));
+    let foot = smoothstep(0.45, 1.0, -h / sky::underside_depth(x, z));
+    (lerp(c, [0.78, 0.80, 0.92], foot * 0.85), 5.0)
 }
 
 /// Distance from (x, z) to the nearest lane centre-line on the active map
@@ -2316,6 +2323,23 @@ fn build_flood_plane() -> (Vec<WaterVert>, Vec<u32>) {
 #[cfg(test)]
 mod depth_tests {
     use super::*;
+
+    /// The sky map has no ground under its islands: the terrain mesh leaves
+    /// out every cell that is all open sky (the cloud deck is the sky
+    /// shader's), and keeps the islands and their undersides.
+    #[test]
+    fn the_sky_map_has_no_ground_below() {
+        crate::map::with(crate::map::MapId::Sky, || {
+            let (v, idx) = build_terrain();
+            let tris = idx.len() / 3;
+            let n_side = (v.len() as f32).sqrt() as usize;
+            let full = (n_side - 1) * (n_side - 1) * 2;
+            assert!(tris < full / 2, "most of the square is sky: {tris} of {full}");
+            assert!(tris > full / 20, "the islands are there: {tris}");
+            let void = |i: u32| crate::sky::in_void(v[i as usize].pos[0], v[i as usize].pos[2]);
+            assert!(idx.chunks(3).all(|t| !t.iter().all(|&i| void(i))), "no triangle lies wholly in the open sky");
+        });
+    }
 
     /// The river painted over canopies twice (see `depth_state`). This is the
     /// check that was missing both times: no GPU needed, so it runs anywhere.

@@ -86,6 +86,44 @@ pub fn run() -> Result<(), String> {
     shoot(&mut renderer, &game, &mut vfx, "sky_bridge.png", cam(p0 + Vec3::new(-6.0, 7.0, 3.0), p0.lerp(p1, 0.6) + Vec3::Y * 2.0, 1.0))?;
     // from the edge of the world, looking out and down at the cloud sea
     shoot(&mut renderer, &game, &mut vfx, "sky_edge.png", cam(Vec3::new(-245.0, 5.0, -135.0), Vec3::new(-320.0, -30.0, -110.0), 1.05))?;
+    // the game's own camera (app.rs: 8.5 u behind, pitched 0.38, fov 0.95)
+    // at an island's edge, looking out: the horizon and the drop as played
+    let play = |at: Vec3, yaw: f32| {
+        let dir = Vec3::new(yaw.sin() * 0.38f32.cos(), -0.38f32.sin(), yaw.cos() * 0.38f32.cos());
+        let target = at + Vec3::Y * 1.5;
+        cam(target - dir * 8.5, target, 0.95)
+    };
+    {
+        let glade = Vec3::new(-104.0, 0.0, -96.0);
+        let out = (Vec3::new(0.0, 0.0, -150.0) - glade).normalize();
+        let at = glade + out * 23.0;
+        shoot(&mut renderer, &game, &mut vfx, "sky_play_edge.png", play(at, out.x.atan2(out.z)))?;
+        // looking straight out past the map's rim, over nothing
+        let out = Vec3::new(-0.8, 0.0, -0.6).normalize();
+        let mut r = 0.0;
+        for k in 0..400 {
+            let p = out * k as f32;
+            if sky::floor().sdf(p.x, p.z) < -3.0 {
+                r = k as f32;
+            }
+        }
+        shoot(&mut renderer, &game, &mut vfx, "sky_play_rim.png", play(out * r, out.x.atan2(out.z)))?;
+    }
+    // mist curling over the stone and ice, and spilling off an edge: the
+    // player's cat at a glade's rim, four seconds of wisps gathered round it
+    {
+        let keep = game.gods[0].pos;
+        let glade = Vec3::new(-104.0, 0.0, -96.0);
+        let out = (Vec3::new(0.0, 0.0, -150.0) - glade).normalize();
+        let at = glade + out * 22.0;
+        game.gods[0].pos = at;
+        for _ in 0..240 {
+            vfx.update(1.0 / 60.0, &[], &game);
+        }
+        let side = Vec3::new(-out.z, 0.0, out.x);
+        shoot(&mut renderer, &game, &mut vfx, "sky_mist.png", cam(at - out * 6.0 + side * 5.0 + Vec3::Y * 3.5, at + out * 4.0 - Vec3::Y * 1.0, 1.0))?;
+        game.gods[0].pos = keep;
+    }
     // a glade with its larches
     shoot(&mut renderer, &game, &mut vfx, "sky_glade.png", cam(Vec3::new(-80.0, 8.0, -120.0), Vec3::new(-104.0, 3.0, -96.0), 1.0))?;
     // Cometail, close, on the well island's rim
@@ -99,6 +137,8 @@ pub fn run() -> Result<(), String> {
     }
     // the Moonwyrm in its well, from the rim, its stars about it
     shoot(&mut renderer, &game, &mut vfx, "sky_wyrm.png", cam(Vec3::new(10.0, 9.0, 40.0), Vec3::new(0.0, 10.0, 0.0), 0.95))?;
+    // ...and all of it: the coil climbing ninety units over the well
+    shoot(&mut renderer, &game, &mut vfx, "sky_wyrmtower.png", cam(Vec3::new(70.0, 22.0, 120.0), Vec3::new(0.0, 42.0, 0.0), 1.1))?;
     // ...and throwing them: a cat on the rim, a star or two in flight
     {
         let keep = (game.gods[0].pos, game.t, game.gods[0].hp);
@@ -145,7 +185,7 @@ pub fn run() -> Result<(), String> {
         let (p, dir, _) = crate::wyrmflight::pose(b.home, b.flight.unwrap_or(secs));
         let side = Vec3::new(-dir.z, 0.0, dir.x).normalize_or_zero();
         let ground = Vec3::new(p.x, 0.0, p.z);
-        shoot(&mut renderer, &game, &mut vfx, "sky_wyrmflight.png", cam(ground + side * 70.0 - dir * 25.0 + Vec3::Y * 12.0, p.lerp(ground, 0.35), 1.15))?;
+        shoot(&mut renderer, &game, &mut vfx, "sky_wyrmflight.png", cam(ground + side * 120.0 - dir * 60.0 + Vec3::Y * 25.0, p - dir * 60.0, 1.15))?;
         let mut hit = None;
         for _ in 0..(6 * 60) {
             let ev = step(&mut game, &mut vfx);
