@@ -314,6 +314,19 @@ pub fn load(conn: &rusqlite::Connection) -> rusqlite::Result<Library> {
     Ok(lib)
 }
 
+/// A cheap fingerprint of the `files` table, for a viewer polling for new
+/// photos: (row count, newest `modified_at`, sum of `created_at`). An import
+/// adds a row; a re-import of a changed file bumps `modified_at`; a removal
+/// drops the count; a re-dated photo moves the sum. One scan, no index needed
+/// — cheaper than reloading the library to find out nothing changed.
+pub fn files_stamp(conn: &rusqlite::Connection) -> rusqlite::Result<(i64, i64, i64)> {
+    conn.query_row(
+        "SELECT count(*), coalesce(max(modified_at), 0), coalesce(sum(created_at), 0) FROM files",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+}
+
 /// Replace `lib`'s albums with the ones stored in `conn`. Returns whether the
 /// database had album tables at all.
 ///
@@ -483,6 +496,27 @@ mod tests {
         save_albums(&albums, &Library::new(vec![])).unwrap();
         assert!(load_albums(&albums, &mut lib).unwrap());
         assert!(lib.album_names().is_empty());
+    }
+
+    #[test]
+    fn the_files_stamp_changes_on_add_remove_and_redate_and_not_otherwise() {
+        let c = memdb();
+        let s0 = files_stamp(&c).unwrap();
+        assert_eq!(files_stamp(&c).unwrap(), s0, "stable when nothing changed");
+        c.execute("INSERT INTO files (path, size, created_at, modified_at) VALUES ('/p/n.jpg', 1, 5, 6)", []).unwrap();
+        let s1 = files_stamp(&c).unwrap();
+        assert_ne!(s1, s0, "a new photo");
+        c.execute("UPDATE files SET created_at = created_at + 1 WHERE path = '/p/n.jpg'", []).unwrap();
+        let s2 = files_stamp(&c).unwrap();
+        assert_ne!(s2, s1, "a re-dated photo");
+        c.execute("DELETE FROM files WHERE path = '/p/n.jpg'", []).unwrap();
+        assert_ne!(files_stamp(&c).unwrap(), s2, "a removed photo");
+        // Albums are not files: changing them leaves the stamp alone.
+        let before = files_stamp(&c).unwrap();
+        let mut lib = load(&c).unwrap();
+        lib.create_album("A");
+        save_albums(&c, &lib).unwrap();
+        assert_eq!(files_stamp(&c).unwrap(), before);
     }
 
     #[test]
