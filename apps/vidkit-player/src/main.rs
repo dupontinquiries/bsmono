@@ -332,6 +332,9 @@ impl Player {
         // conversion (+29% CPU on 4K60 VP9, measured). Set before the first
         // decoder opens.
         decode::set_prefer_planar(gpu.is_some());
+        // ...and synthesises AV1 film grain, so software AV1 exports the
+        // grain instead of dav1d adding it on the CPU.
+        decode::set_gpu_grain(gpu.is_some());
         let opened = file.as_ref().map(|p| open_local(p));
 
         // Try to decode it for real. A failure is not fatal: the file still
@@ -543,6 +546,10 @@ impl Player {
                 Some(e) => {
                     self.gpu_error = Some(format!("GPU upload failed, using the CPU path: {e}"));
                     self.gpu = None;
+                    // The CPU presenter adds no grain: dav1d applies it again
+                    // from the next open (a seek). Until then the film is
+                    // shown without grain -- rare, and said above.
+                    decode::set_gpu_grain(false);
                 }
             }
         }

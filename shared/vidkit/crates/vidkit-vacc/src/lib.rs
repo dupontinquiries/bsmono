@@ -211,6 +211,7 @@ impl StreamDecoder {
             pts,
             duration: None,
             recycle: None,
+            grain: None,
         }))
     }
 }

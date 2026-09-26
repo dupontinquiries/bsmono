@@ -78,24 +78,42 @@ impl GrainTracker {
     }
 }
 
-/// Grain parameters for every SHOWN frame of an AV1 IVF file, in display
-/// order.
-pub fn params_from_ivf(ivf: &[u8]) -> Result<Vec<Option<GrainParams>>, String> {
-    let (_, frames) = crate::rap::ivf_frames(ivf).ok_or("not IVF")?;
-    let mut parser = Av1Parser::new();
-    let mut sps = None;
-    let mut tracker = GrainTracker::default();
-    let mut out = Vec::new();
-    for tu in frames {
+/// Streaming form of [`params_from_ivf`]: one temporal unit at a time, as a
+/// demuxer delivers them. Holds the parser state (sequence header, reference
+/// order hints) and the grain reference slots across units.
+pub struct GrainStream {
+    parser: Av1Parser,
+    sps: Option<vacc_core::picture::Av1Sps>,
+    tracker: GrainTracker,
+    /// Whether the sequence header says grain can appear at all; `None`
+    /// before the first sequence header.
+    pub present: Option<bool>,
+}
+
+impl Default for GrainStream {
+    fn default() -> Self {
+        Self { parser: Av1Parser::new(), sps: None, tracker: GrainTracker::default(), present: None }
+    }
+}
+
+impl GrainStream {
+    /// One temporal unit in. `Some(p)` for the unit's shown frame (`p` is
+    /// `None` for a frame without grain); `None` if the unit shows nothing.
+    pub fn push_tu(&mut self, tu: &[u8]) -> Result<Option<Option<GrainParams>>, String> {
+        let mut shown = None;
         let mut off = 0;
         while off < tu.len() {
-            let Some((hdr, start, size)) = parser.read_obu(&tu[off..]).map_err(|e| format!("{e:?}"))? else { break };
+            let Some((hdr, start, size)) = self.parser.read_obu(&tu[off..]).map_err(|e| format!("{e:?}"))? else { break };
             let data = &tu[off + start..(off + start + size).min(tu.len())];
             match hdr.obu_type {
-                ObuType::SequenceHeader => sps = Some(parser.parse_sequence_header_obu(data).map_err(|e| format!("{e:?}"))?),
+                ObuType::SequenceHeader => {
+                    let s = self.parser.parse_sequence_header_obu(data).map_err(|e| format!("{e:?}"))?;
+                    self.present = Some(s.film_grain_params_present);
+                    self.sps = Some(s);
+                }
                 ObuType::FrameHeader | ObuType::Frame => {
-                    let s = sps.as_ref().ok_or("frame before sequence header")?;
-                    let fh = parser.parse_frame_header(data, s, hdr.temporal_id, hdr.spatial_id).map_err(|e| format!("{e:?}"))?;
+                    let s = self.sps.as_ref().ok_or("frame before sequence header")?;
+                    let fh = self.parser.parse_frame_header(data, s, hdr.temporal_id, hdr.spatial_id).map_err(|e| format!("{e:?}"))?;
                     // The parser's per-slot order hints are updated only by
                     // commit_decoded(), which vacc's decode backends call
                     // after each frame. Used alone, the parser saw order hint
@@ -104,18 +122,69 @@ pub fn params_from_ivf(ivf: &[u8]) -> Result<Vec<Option<GrainParams>>, String> {
                     // later field -- film_grain_params() is the last one
                     // (found by comparing with ffmpeg's trace_headers).
                     if !fh.show_existing_frame {
-                        parser.dpb_mut().commit_decoded(0, &fh, s.order_hint_bits_minus1 as u32);
+                        self.parser.dpb_mut().commit_decoded(0, &fh, s.order_hint_bits_minus1 as u32);
                     }
-                    if let Some(p) = tracker.frame(&fh) {
-                        out.push(p);
+                    if let Some(p) = self.tracker.frame(&fh) {
+                        shown = Some(p);
                     }
                 }
                 _ => {}
             }
             off += start + size;
         }
+        Ok(shown)
+    }
+}
+
+/// Grain parameters for every SHOWN frame of an AV1 IVF file, in display
+/// order.
+pub fn params_from_ivf(ivf: &[u8]) -> Result<Vec<Option<GrainParams>>, String> {
+    let (_, frames) = crate::rap::ivf_frames(ivf).ok_or("not IVF")?;
+    let mut st = GrainStream::default();
+    let mut out = Vec::new();
+    for tu in frames {
+        if let Some(p) = st.push_tu(tu)? {
+            out.push(p);
+        }
     }
     Ok(out)
+}
+
+/// An IVF stream read as it arrives (a pipe from `ffmpeg -c copy -f ivf`):
+/// the header's time base, then (pts in seconds, temporal unit) per frame.
+pub struct IvfReader<R> {
+    r: R,
+    /// Seconds per pts tick.
+    pub tick: f64,
+}
+
+impl<R: std::io::Read> IvfReader<R> {
+    pub fn new(mut r: R) -> Result<Self, String> {
+        let mut h = [0u8; 32];
+        r.read_exact(&mut h).map_err(|e| format!("IVF header: {e}"))?;
+        if &h[..4] != b"DKIF" {
+            return Err("not IVF".into());
+        }
+        let hlen = u16::from_le_bytes([h[6], h[7]]) as usize;
+        if hlen > 32 {
+            std::io::copy(&mut std::io::Read::take(r.by_ref(), (hlen - 32) as u64), &mut std::io::sink()).map_err(|e| e.to_string())?;
+        }
+        // Header bytes 16..24: time base as rate (denominator) then scale.
+        let rate = u32::from_le_bytes([h[16], h[17], h[18], h[19]]).max(1);
+        let scale = u32::from_le_bytes([h[20], h[21], h[22], h[23]]).max(1);
+        Ok(Self { r, tick: scale as f64 / rate as f64 })
+    }
+
+    /// The next (pts seconds, unit); `None` at the end.
+    pub fn next_unit(&mut self, buf: &mut Vec<u8>) -> Option<f64> {
+        let mut fh = [0u8; 12];
+        self.r.read_exact(&mut fh).ok()?;
+        let n = u32::from_le_bytes([fh[0], fh[1], fh[2], fh[3]]) as usize;
+        let pts = u64::from_le_bytes(fh[4..12].try_into().ok()?);
+        buf.resize(n, 0);
+        self.r.read_exact(buf).ok()?;
+        Some(pts as f64 * self.tick)
+    }
 }
 
 #[cfg(test)]
@@ -145,7 +214,21 @@ mod tests {
         for (out, fg) in [(&ng, "0"), (&gr, "1")] {
             assert!(Command::new("dav1d").args(["-q", "--threads", "1", "--muxer", "yuv", "--filmgrain", fg, "-i"]).arg(&ivf).arg("-o").arg(out).status().unwrap().success());
         }
-        let params = params_from_ivf(&std::fs::read(&ivf).unwrap()).unwrap();
+        let bytes = std::fs::read(&ivf).unwrap();
+        let params = params_from_ivf(&bytes).unwrap();
+        // The streaming reader (the player's path) agrees with the whole-file
+        // one, and the IVF clock is 30 fps from zero.
+        let mut rd = IvfReader::new(&bytes[..]).unwrap();
+        let (mut st, mut buf, mut streamed, mut times) = (GrainStream::default(), Vec::new(), Vec::new(), Vec::new());
+        while let Some(t) = rd.next_unit(&mut buf) {
+            if let Some(p) = st.push_tu(&buf).unwrap() {
+                streamed.push(p);
+                times.push(t);
+            }
+        }
+        assert_eq!(st.present, Some(true));
+        assert_eq!(streamed, params);
+        assert!(times.iter().enumerate().all(|(i, t)| (t * 30.0 - i as f64).abs() < 0.05), "{times:?}");
         let (ng, gr) = (std::fs::read(&ng).unwrap(), std::fs::read(&gr).unwrap());
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let fs = w * h + 2 * cw * ch;

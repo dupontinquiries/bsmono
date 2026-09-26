@@ -145,6 +145,7 @@ impl<D: SegmentDecoder> GopBatcher<D> {
                 pts,
                 duration: None,
                 recycle: None,
+                grain: None,
             })
             .collect())
     }

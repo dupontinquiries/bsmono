@@ -374,6 +374,7 @@ mod tests {
             pts,
             duration: None,
             recycle: token.map(RecycleToken),
+            grain: None,
         }
     }
 

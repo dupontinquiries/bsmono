@@ -121,6 +121,10 @@ pub struct Frame {
     /// token. `None` means the frame owns its memory outright (software decode
     /// into a fresh allocation) and nothing needs returning.
     pub recycle: Option<RecycleToken>,
+    /// AV1 film grain the decoder did NOT apply, for the presenter to
+    /// synthesise (on the GPU) at source resolution. `None`: the picture is
+    /// final -- no grain, or the decoder already applied it.
+    pub grain: Option<std::sync::Arc<crate::av1_grain::GrainParams>>,
 }
 
 /// Index into a decoder's buffer pool. Deliberately not `Copy`: it should be

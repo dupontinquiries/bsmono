@@ -38,6 +38,7 @@ fn nv12(w: u32, h: u32, y: impl Fn(u32, u32) -> u8) -> Frame {
         pts: std::time::Duration::ZERO,
         duration: None,
         recycle: None,
+        grain: None,
     }
 }
 
@@ -251,6 +252,7 @@ fn p010(w: u32, h: u32, transfer: vidkit_core::codec::Transfer) -> Frame {
         pts: std::time::Duration::ZERO,
         duration: None,
         recycle: None,
+        grain: None,
     }
 }
 
@@ -270,7 +272,14 @@ fn i420(w: u32, h: u32) -> Frame {
         pts: std::time::Duration::ZERO,
         duration: None,
         recycle: None,
+        grain: None,
     }
+}
+
+/// The frame carrying its grain, as a decoder exporting grain delivers it.
+fn with_grain(mut f: Frame) -> Frame {
+    f.grain = Some(Arc::new(grain_params()));
+    f
 }
 
 /// Film grain parameters shaped like SVT-AV1's (lag 3, overlap, all planes).
@@ -391,7 +400,7 @@ fn cases() -> Vec<Case> {
         },
         Case { two_pass: false, grain: None, name: "HDR10 PQ, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Pq), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
         Case { two_pass: false, grain: None, name: "HLG, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Hlg), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
-        Case { two_pass: false, grain: Some(grain_params()), name: "AV1 film grain", history: vec![], frame: i420(256, 160), enhance: Enhance::default(), out: (256, 160), check: check_grain },
+        Case { two_pass: false, grain: Some(grain_params()), name: "AV1 film grain", history: vec![], frame: with_grain(i420(256, 160)), enhance: Enhance::default(), out: (256, 160), check: check_grain },
         Case { two_pass: false, grain: None, name: "I420, three planes", history: vec![], frame: i420(64, 48), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
         Case { two_pass: false, grain: None, name: "plain conversion", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance::default(), out: (64, 48), check: check_plain },
         Case { two_pass: true, grain: None, name: "RCAS two-pass (offscreen)", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
@@ -455,7 +464,9 @@ impl eframe::App for SelfTest {
             if let (Ok(mut g), Some(gl)) = (gpu.lock(), frame.gl()) {
                 g.enhance = c.enhance;
                 g.fused_rcas = !c.two_pass;
-                g.grain_params = c.grain.clone();
+                // The grain arrives ON THE FRAME, as the decoder delivers it
+                // (Frame::grain); the presenter's override stays off.
+                g.grain_params = None;
                 if let Err(e) = unsafe { g.upload(gl, f) } {
                     println!("GPU SELFTEST FAIL: upload: {e}");
                     std::process::exit(1);

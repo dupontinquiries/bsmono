@@ -600,8 +600,8 @@ pub struct Nv12Gpu {
     pub fused_rcas: bool,
     temporal_prog: glow::Program,
     grain_prog: glow::Program,
-    /// AV1 film grain for the NEXT uploaded frame (8-bit); None = no grain.
-    /// Set by the caller from the stream's frame headers.
+    /// AV1 film grain for every uploaded frame without its own
+    /// (`Frame::grain`) -- a test and debugging override; None = no grain.
     pub grain_params: Option<vidkit_core::av1_grain::GrainParams>,
     /// Tables (lut, scaling, offsets) and targets (grained luma, grained
     /// chroma) with their size, created on first use.
@@ -803,7 +803,8 @@ impl Nv12Gpu {
         self.layout = frame.layout;
         self.color = frame.color;
         self.grain_valid = false;
-        if let Some(p) = self.grain_params.clone() {
+        // The frame's own grain (the decoder exported it), else the override.
+        if let Some(p) = frame.grain.as_deref().or(self.grain_params.as_ref()).cloned() {
             if matches!(frame.layout, PlaneLayout::Nv12 | PlaneLayout::I420) {
                 self.grain_pass(gl, &p, w, h);
             }

@@ -22,6 +22,9 @@ egui = "0.34"
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
 
 vidkit-core = { path = "../../shared/vidkit/crates/vidkit-core" }
+# AV1 film grain parameters from the bitstream (vacc's header parser), for
+# the GPU grain stage. Pure Rust; only its parser is used here.
+vidkit-vacc = { path = "../../shared/vidkit/crates/vidkit-vacc" }
 # fcntl(F_SETPIPE_SZ / F_GETPIPE_SZ) on the audio player's stdin: Linux's
 # default 64 KB pipe holds ~340 ms of 48 kHz stereo, all of it "written" but not
 # yet heard. Already in the lockfile transitively.

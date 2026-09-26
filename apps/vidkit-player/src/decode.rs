@@ -54,6 +54,9 @@ pub struct Probe {
     pub color_space: String,
     pub color_range: String,
     pub color_transfer: String,
+    /// The container's start time in seconds (ffmpeg's `-ss` is relative to
+    /// it); 0 when unknown.
+    pub start_time: f64,
 }
 
 impl Probe {
@@ -99,7 +102,7 @@ impl Probe {
 
 /// The ffprobe arguments shared by the file and URL probes. `codec_name` is
 /// asked for because hardware decode is chosen per codec.
-const PROBE_ENTRIES: &str = "stream=codec_name,width,height,r_frame_rate,pix_fmt,color_space,color_range,color_transfer";
+const PROBE_ENTRIES: &str = "stream=codec_name,width,height,r_frame_rate,pix_fmt,color_space,color_range,color_transfer:format=start_time";
 
 /// Parse `ffprobe -show_entries stream=...` output.
 ///
@@ -112,6 +115,7 @@ pub fn parse_probe(text: &str) -> Option<Probe> {
     let mut h = None;
     let mut fps = None;
     let mut codec = String::new();
+    let mut start_time = 0.0;
     let (mut pix_fmt, mut color_space, mut color_range, mut color_transfer) = (String::new(), String::new(), String::new(), String::new());
     let tag = |v: &str| {
         let v = v.trim();
@@ -123,6 +127,7 @@ pub fn parse_probe(text: &str) -> Option<Probe> {
             "width" => w = v.trim().parse().ok(),
             "height" => h = v.trim().parse().ok(),
             "codec_name" => codec = v.trim().to_string(),
+            "start_time" => start_time = v.trim().parse::<f64>().ok().filter(|t| t.is_finite()).unwrap_or(0.0),
             "pix_fmt" => pix_fmt = tag(v),
             "color_space" => color_space = tag(v),
             "color_range" => color_range = tag(v),
@@ -151,6 +156,7 @@ pub fn parse_probe(text: &str) -> Option<Probe> {
         color_space,
         color_range,
         color_transfer,
+        start_time,
     })
 }
 
@@ -856,6 +862,9 @@ pub struct FfmpegFrames {
     /// Why a fallback happened, once, for the UI.
     pub note: Option<String>,
     pool: Arc<PlanePool>,
+    /// AV1 film grain parameters for the frames, when the decoder was told
+    /// to export grain instead of applying it (see [`grain_on_gpu`]).
+    grain: Option<GrainFeed>,
 }
 
 /// Grow a pipe's kernel buffer. The default is 64 KiB: a 4K NV12 frame
@@ -1011,8 +1020,17 @@ impl FfmpegFrames {
         let scale_to = worth_scaling((p.width, p.height), fit_long_edge(p.width, p.height, max_long_edge), TEXTURE_LIMIT.load(Ordering::Relaxed));
         let (w, h) = scale_to.unwrap_or((p.width, p.height));
         let layout = output_layout(p.layout(), &p.pix_fmt, !accel.is_hardware(), PREFER_PLANAR.load(Ordering::Relaxed));
-        let args = video_args_fmt(src, from, &accel, scale_to, layout);
+        let mut args = video_args_fmt(src, from, &accel, scale_to, layout);
         let fallback = accel.is_hardware().then(|| video_args_fmt(src, from, &Accel::Software, scale_to, layout));
+        // Grain on the GPU: the feed starts first (it only demuxes), and the
+        // decoder is told to export grain only once the feed is running --
+        // otherwise a failed feed would show the film with no grain at all.
+        let grain = grain_on_gpu(p, src, &accel, scale_to, layout)
+            .then(|| GrainFeed::spawn(src, from, p.start_time))
+            .and_then(|r| r.map_err(|e| eprintln!("vidkit: GPU film grain off: {e}")).ok());
+        if grain.is_some() {
+            args = with_grain_export(args);
+        }
         let child = spawn_ffmpeg(&args)?;
         Ok(Self {
             child,
@@ -1032,6 +1050,7 @@ impl FfmpegFrames {
             fallback,
             note: None,
             pool: PlanePool::new(),
+            grain,
         })
     }
 
@@ -1080,6 +1099,7 @@ impl FfmpegFrames {
                     let pts = self.frame_interval.mul_f64(self.index as f64);
                     self.index += 1;
                     self.frames_read += 1;
+                    let grain = self.grain_for(pts);
                     return Some(Frame {
                         data: FrameData::Cpu(CpuPlanes { data: vec![y, u, v], strides: vec![self.width, cw as u32, cw as u32] }),
                         width: self.width,
@@ -1089,6 +1109,7 @@ impl FfmpegFrames {
                         pts,
                         duration: Some(self.frame_interval),
                         recycle: None,
+                        grain,
                     });
                 }
                 self.pool.put(y);
@@ -1102,6 +1123,7 @@ impl FfmpegFrames {
                 let pts = self.frame_interval.mul_f64(self.index as f64);
                 self.index += 1;
                 self.frames_read += 1;
+                let grain = self.grain_for(pts);
                 return Some(Frame {
                     // Strides in BYTES: two per sample for P010.
                     data: FrameData::Cpu(CpuPlanes { data: vec![luma, chroma], strides: vec![self.width * bps as u32; 2] }),
@@ -1112,6 +1134,7 @@ impl FfmpegFrames {
                     pts,
                     duration: Some(self.frame_interval),
                     recycle: None,
+                    grain,
                 });
             }
             self.pool.put(luma);
@@ -1138,6 +1161,198 @@ impl FfmpegFrames {
             }
             return None;
         }
+    }
+}
+
+static GPU_GRAIN: AtomicBool = AtomicBool::new(false);
+
+/// Whether the presenter synthesises AV1 film grain itself (the GPU
+/// presenter does; the CPU one does not). Takes effect at the next open.
+pub fn set_gpu_grain(on: bool) {
+    GPU_GRAIN.store(on, Ordering::Relaxed);
+}
+
+/// Whether to have the decoder EXPORT film grain instead of applying it,
+/// so the GPU synthesises it at present time. Pure but for the global and
+/// `VIDKIT_GRAIN_CPU=1` (keep dav1d's grain, for A/B).
+///
+/// Only where the GPU stage is exact: AV1, 8-bit NV12/I420, decoded in
+/// software at source size (grain is defined on the source grid -- on a
+/// frame ffmpeg scaled, 32x32 grain blocks would land on the wrong
+/// pixels), from a local file (the feed demuxes the input a second time;
+/// for a stream that would be a second download).
+pub fn grain_on_gpu(p: &Probe, src: &VideoInput, accel: &Accel, scale_to: Option<(u32, u32)>, layout: PlaneLayout) -> bool {
+    GPU_GRAIN.load(Ordering::Relaxed)
+        && std::env::var("VIDKIT_GRAIN_CPU").as_deref() != Ok("1")
+        && grain_eligible(p, src, accel, scale_to, layout)
+}
+
+/// [`grain_on_gpu`] without the switches. Pure.
+pub fn grain_eligible(p: &Probe, src: &VideoInput, accel: &Accel, scale_to: Option<(u32, u32)>, layout: PlaneLayout) -> bool {
+    p.codec == "av1" && !src.network && !accel.is_hardware() && scale_to.is_none() && matches!(layout, PlaneLayout::Nv12 | PlaneLayout::I420)
+}
+
+/// Decoder arguments with grain exported, not applied: an input (decoder)
+/// option, so before `-i`. libdav1d and ffmpeg's native AV1 decoder both
+/// honour it. Pure.
+pub fn with_grain_export(mut a: Vec<String>) -> Vec<String> {
+    let i = a.iter().position(|x| x == "-i").unwrap_or(a.len());
+    a.splice(i..i, ["-export_side_data".to_string(), "film_grain".to_string()]);
+    a
+}
+
+/// ffmpeg arguments for the grain feed: the video stream copied (demux
+/// only, no decode) as IVF, from the same seek point as the decoder, with
+/// the file's own timestamps (`-copyts`) so its units can be matched to
+/// decoded frames by time. Pure.
+pub fn grain_feed_args(src: &VideoInput, from: Duration) -> Vec<String> {
+    let mut a: Vec<String> = ["-v", "error", "-nostdin"].iter().map(|s| s.to_string()).collect();
+    if !from.is_zero() {
+        a.push("-ss".into());
+        a.push(format!("{:.3}", from.as_secs_f64()));
+    }
+    a.push("-i".into());
+    a.push(src.input.clone());
+    a.extend(["-map", "0:v:0", "-c", "copy", "-copyts", "-f", "ivf", "-"].iter().map(|s| s.to_string()));
+    a
+}
+
+/// Film grain parameters per shown frame, read from the bitstream by a
+/// second ffmpeg that only demuxes. The decoder's pixel pipe cannot carry
+/// side data, so the parameters come from vacc's AV1 header parser
+/// (byte-exact against dav1d: vidkit-vacc's grain oracle test).
+struct GrainFeed {
+    child: Child,
+    units: GrainUnits,
+}
+
+type GrainUnit = (f64, Option<Arc<vidkit_core::av1_grain::GrainParams>>);
+
+/// The feed's units, matched to decoded frames by time.
+struct GrainUnits {
+    /// (media time of the frame in seconds, its grain), in display order.
+    rx: std::sync::mpsc::Receiver<GrainUnit>,
+    /// A unit read ahead of the frame being matched.
+    pending: Option<GrainUnit>,
+    misses: u64,
+    ended: bool,
+}
+
+impl GrainFeed {
+    fn spawn(src: &VideoInput, from: Duration, start_time: f64) -> Result<Self, String> {
+        let mut child = Command::new("ffmpeg")
+            .args(grain_feed_args(src, from))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("grain feed: {e}"))?;
+        let out = child.stdout.take().ok_or("grain feed: no stdout")?;
+        // Bounded: the demuxer is far faster than the decoder, and the pipe
+        // filling up is what holds it back rather than a film's worth of
+        // parameters in memory.
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        std::thread::Builder::new()
+            .name("vidkit-grain".into())
+            .spawn(move || {
+                let Ok(mut rd) = vidkit_vacc::grain::IvfReader::new(std::io::BufReader::with_capacity(1 << 16, out)) else { return };
+                let mut st = vidkit_vacc::grain::GrainStream::default();
+                let mut buf = Vec::new();
+                while let Some(t) = rd.next_unit(&mut buf) {
+                    match st.push_tu(&buf) {
+                        Ok(Some(p)) => {
+                            if tx.send((t - start_time, p.map(Arc::new))).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            eprintln!("vidkit: grain feed stopped: {e}");
+                            return;
+                        }
+                    }
+                    if st.present == Some(false) {
+                        return; // no grain in this stream: nothing to feed
+                    }
+                }
+            })
+            .map_err(|e| format!("grain feed thread: {e}"))?;
+        Ok(Self { child, units: GrainUnits::new(rx) })
+    }
+
+}
+
+impl GrainUnits {
+    fn new(rx: std::sync::mpsc::Receiver<GrainUnit>) -> Self {
+        Self { rx, pending: None, misses: 0, ended: false }
+    }
+
+    /// The grain for the frame at media time `t` (`half`: half a frame
+    /// interval). Units before the frame are skipped (the demuxer starts at
+    /// the keyframe before the seek point; the decoder drops those frames);
+    /// a unit after it is kept for a later frame. Waits a little for a unit
+    /// that has not arrived: the demuxer normally runs far ahead.
+    fn take(&mut self, t: f64, half: f64) -> Option<Arc<vidkit_core::av1_grain::GrainParams>> {
+        loop {
+            let item = match self.pending.take() {
+                Some(i) => i,
+                None if self.ended => return None,
+                None => match self.rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(i) => i,
+                    // Ended (no grain in the stream, the end of the file, a
+                    // parse error): stop asking, or every later frame waits.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        self.ended = true;
+                        return None;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        self.misses += 1;
+                        return None;
+                    }
+                },
+            };
+            match match_unit(item.0, t, half) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Equal => return item.1,
+                std::cmp::Ordering::Greater => {
+                    self.pending = Some(item);
+                    self.misses += 1;
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Where a feed unit at `unit` seconds sits against a frame at `frame`:
+/// before it, on it (within half an interval), or after it. Pure.
+pub fn match_unit(unit: f64, frame: f64, half: f64) -> std::cmp::Ordering {
+    if unit < frame - half {
+        std::cmp::Ordering::Less
+    } else if unit <= frame + half {
+        std::cmp::Ordering::Equal
+    } else {
+        std::cmp::Ordering::Greater
+    }
+}
+
+impl Drop for GrainFeed {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl FfmpegFrames {
+    /// The film grain for the frame at `pts`, if grain is being fed.
+    fn grain_for(&mut self, pts: Duration) -> Option<Arc<vidkit_core::av1_grain::GrainParams>> {
+        let half = self.frame_interval.as_secs_f64() / 2.0;
+        self.grain.as_mut()?.units.take(pts.as_secs_f64(), half)
+    }
+
+    /// Whether the decoder is exporting grain for the presenter.
+    pub fn grain_on_gpu(&self) -> bool {
+        self.grain.is_some()
     }
 }
 
@@ -1170,6 +1385,134 @@ mod tests {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn the_container_start_time_is_read() {
+        let p = parse_probe("width=64\nheight=64\nr_frame_rate=30/1\nstart_time=0.080000\n").unwrap();
+        assert!((p.start_time - 0.08).abs() < 1e-9);
+        let q = parse_probe("width=64\nheight=64\nstart_time=N/A\n").unwrap();
+        assert_eq!(q.start_time, 0.0);
+    }
+
+    /// Exporting grain is a decoder option (before -i); the feed copies the
+    /// same seek window with the file's own timestamps.
+    #[test]
+    fn grain_arguments_sit_on_the_right_side_of_the_input() {
+        let src = VideoInput::file(Path::new("/f.mkv"));
+        let a = with_grain_export(video_args_fmt(&src, Duration::from_millis(1500), &Accel::Software, None, PlaneLayout::I420));
+        let at = |a: &[String], x: &str| a.iter().position(|y| y == x).unwrap();
+        assert!(at(&a, "-export_side_data") < at(&a, "-i") && a[at(&a, "-export_side_data") + 1] == "film_grain");
+        let f = grain_feed_args(&src, Duration::from_millis(1500));
+        assert!(at(&f, "-ss") < at(&f, "-i") && f[at(&f, "-ss") + 1] == "1.500");
+        assert!(at(&f, "-copyts") > at(&f, "-i") && at(&f, "copy") > at(&f, "-i"));
+        assert_eq!(f[at(&f, "-f") + 1], "ivf");
+        assert!(!grain_feed_args(&src, Duration::ZERO).contains(&"-ss".to_string()));
+    }
+
+    #[test]
+    fn grain_moves_to_the_gpu_only_where_it_is_exact() {
+        let p = parse_probe("codec_name=av1\nwidth=64\nheight=64\npix_fmt=yuv420p\n").unwrap();
+        let file = VideoInput::file(Path::new("/f.mkv"));
+        let sw = Accel::Software;
+        assert!(grain_eligible(&p, &file, &sw, None, PlaneLayout::I420));
+        assert!(grain_eligible(&p, &file, &sw, None, PlaneLayout::Nv12));
+        assert!(!grain_eligible(&p, &file, &sw, Some((32, 32)), PlaneLayout::I420), "scaled");
+        assert!(!grain_eligible(&p, &file, &sw, None, PlaneLayout::P010), "10-bit");
+        assert!(!grain_eligible(&p, &VideoInput::url("https://x/v", &[]), &sw, None, PlaneLayout::I420), "a stream");
+        let hw = Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "av1".into(), vpp: false };
+        assert!(!grain_eligible(&p, &file, &hw, None, PlaneLayout::I420), "hardware");
+        let vp9 = parse_probe("codec_name=vp9\nwidth=64\nheight=64\n").unwrap();
+        assert!(!grain_eligible(&vp9, &file, &sw, None, PlaneLayout::I420));
+    }
+
+    #[test]
+    fn feed_units_match_frames_within_half_an_interval() {
+        use std::cmp::Ordering::*;
+        let h = 1.0 / 60.0;
+        assert_eq!(match_unit(1.0, 1.5, h), Less);
+        assert_eq!(match_unit(1.5 + 0.001, 1.5, h), Equal);
+        assert_eq!(match_unit(1.5 - 0.016, 1.5, h), Equal);
+        assert_eq!(match_unit(1.5 + 0.034, 1.5, h), Greater);
+    }
+
+    /// Units before a frame are skipped, a unit past a missing frame is kept
+    /// for its own frame, and a closed feed stops being waited on.
+    #[test]
+    fn grain_units_skip_behind_and_hold_ahead() {
+        let g = |seed| Some(Arc::new(vidkit_core::av1_grain::GrainParams { seed, ..Default::default() }));
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        for (t, s) in [(0.9, 1), (1.0, 2), (1.1, 3), (1.3, 4)] {
+            tx.send((t, g(s))).unwrap();
+        }
+        drop(tx);
+        let mut u = GrainUnits::new(rx);
+        let h = 0.05;
+        assert_eq!(u.take(1.0, h).unwrap().seed, 2, "0.9 skipped");
+        assert_eq!(u.take(1.1, h).unwrap().seed, 3);
+        assert!(u.take(1.2, h).is_none(), "no unit for 1.2 (1.3 is ahead)");
+        assert_eq!(u.take(1.3, h).unwrap().seed, 4, "1.3 was held, not lost");
+        let t0 = std::time::Instant::now();
+        assert!(u.take(1.4, h).is_none() && u.take(1.5, h).is_none());
+        assert!(u.ended && t0.elapsed() < Duration::from_millis(150), "waited on a closed feed");
+    }
+
+    /// End to end against ffmpeg's own dav1d: a seeked decode with grain
+    /// EXPORTED, plus our grain from the feed's parameters, gives exactly the
+    /// picture ffmpeg shows with dav1d applying the grain -- every byte of
+    /// every frame, from mid-GOP (the feed starts at the keyframe before the
+    /// seek point and must skip to the decoder's first frame).
+    #[test]
+    fn exported_grain_plus_ours_is_dav1ds_picture() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let enc = Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output().map(|o| String::from_utf8_lossy(&o.stdout).contains("libsvtav1")).unwrap_or(false);
+        if !enc {
+            eprintln!("no libsvtav1; skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("vk-grainfeed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("g.mkv");
+        let (w, h) = (352usize, 198usize);
+        assert!(Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", &format!("testsrc2=size={w}x{h}:rate=30:duration=3,noise=alls=14:allf=t"),
+            "-c:v", "libsvtav1", "-preset", "10", "-g", "30", "-svtav1-params", "film-grain=10", "-pix_fmt", "yuv420p"]).arg(&f).stderr(Stdio::null()).status().unwrap().success());
+        let from = Duration::from_millis(1500);
+        let reference = Command::new("ffmpeg").args(["-v", "error", "-ss", "1.500", "-i"]).arg(&f).args(["-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"]).output().unwrap().stdout;
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let fs = w * h + 2 * cw * ch;
+        assert!(reference.len() >= fs * 30, "reference too short: {}", reference.len() / fs);
+
+        set_gpu_grain(true);
+        let p = probe(&f).unwrap();
+        let mut d = FfmpegFrames::open_probed(&VideoInput::file(&f), &p, None, from, Accel::Software).unwrap();
+        assert!(d.grain_on_gpu(), "grain not moved to the GPU");
+        let (mut n, mut grained) = (0, 0);
+        while let Some(fr) = d.next_frame() {
+            let FrameData::Cpu(pl) = &fr.data else { panic!() };
+            let (mut y, mut u, mut v) = (pl.data[0][..w * h].to_vec(), Vec::new(), Vec::new());
+            if fr.layout == PlaneLayout::I420 {
+                u = pl.data[1][..cw * ch].to_vec();
+                v = pl.data[2][..cw * ch].to_vec();
+            } else {
+                for i in 0..cw * ch {
+                    u.push(pl.data[1][2 * i]);
+                    v.push(pl.data[1][2 * i + 1]);
+                }
+            }
+            let g = fr.grain.as_ref().unwrap_or_else(|| panic!("frame {n}: no grain parameters"));
+            vidkit_core::av1_grain::apply_i420(g, &mut y, &mut u, &mut v, w, h, false);
+            grained += 1;
+            let want = &reference[n * fs..(n + 1) * fs];
+            let got: Vec<u8> = [y, u, v].concat();
+            let bad = got.iter().zip(want).filter(|(a, b)| a != b).count();
+            assert_eq!(bad, 0, "frame {n} (seed {}): {bad} bytes differ from ffmpeg+dav1d", g.seed);
+            n += 1;
+        }
+        assert_eq!(n * fs, reference.len(), "frame count differs from ffmpeg's");
+        eprintln!("DIAG {n} frames from 1.5 s, {grained} grained on our side, byte-identical to ffmpeg+dav1d");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `30000/1001` is 29.97 and `30/1` is 30. A parser that splits on `/` and

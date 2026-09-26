@@ -129,6 +129,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "175571dd1d178ced59193a6fc02dde1b972eb0bc56c892cde9beeceac5bf0f6b"
 
 [[package]]
+name = "ash"
+version = "0.38.0+1.3.281"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3028,6 +3037,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5772d71c9be8a8a6ac2117d949c5b224c1b72241bb611d9a3012edcf8af7812"
 
 [[package]]
+name = "vacc-common"
+version = "0.1.1"
+
+[[package]]
+name = "vacc-core"
+version = "0.1.1"
+dependencies = [
+ "ash",
+ "bitflags 2.13.1",
+ "bytemuck",
+ "log",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "vacc-parser"
+version = "0.1.1"
+dependencies = [
+ "bitflags 2.13.1",
+ "bytemuck",
+ "log",
+ "thiserror 2.0.20",
+ "vacc-core",
+]
+
+[[package]]
+name = "vacc-software-decode"
+version = "0.1.1"
+dependencies = [
+ "log",
+ "rayon",
+ "thiserror 2.0.20",
+ "vacc-common",
+ "vacc-core",
+ "vacc-parser",
+]
+
+[[package]]
 name = "vello_common"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3107,6 +3154,7 @@ dependencies = [
  "vidkit-stream",
  "vidkit-transcribe",
  "vidkit-v4l2",
+ "vidkit-vacc",
  "vidkit-webm",
  "vidkit-ytdlp",
 ]
@@ -3139,6 +3187,16 @@ name = "vidkit-v4l2"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "vidkit-core",
+]
+
+[[package]]
+name = "vidkit-vacc"
+version = "0.1.0"
+dependencies = [
+ "vacc-core",
+ "vacc-parser",
+ "vacc-software-decode",
  "vidkit-core",
 ]
 

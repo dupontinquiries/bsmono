@@ -784,7 +784,7 @@ mod tests {
         Frame {
             data: FrameData::Cpu(CpuPlanes { data: vec![vec![0; 4], vec![0; 2]], strides: vec![2, 2] }),
             width: 2, height: 2, layout: PlaneLayout::Nv12, color: ColorInfo::default(),
-            pts: Duration::from_millis(ms), duration: Some(Duration::from_millis(33)), recycle: None,
+            pts: Duration::from_millis(ms), duration: Some(Duration::from_millis(33)), recycle: None, grain: None,
         }
     }
     fn q(pts: &[u64]) -> VecDeque<Frame> { pts.iter().map(|&p| f(p)).collect() }
