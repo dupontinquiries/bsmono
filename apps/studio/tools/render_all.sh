@@ -9,7 +9,9 @@
 # next by ear: a render is only turned DOWN, and only if its peak is above
 # -1 dBFS (to avoid clipping the encode). Never normalized up.
 #
-# Songs render JOBS at a time (default: the core count), one core each.
+# Songs render one at a time, each on every core (render_project's segment-
+# parallel mixdown); JOBS > 1 renders songs side by side instead, with
+# THREADS cores each (default: cores / JOBS).
 #
 # BIN_DIR holds flp-batch and examples/render_project (a release build):
 #   CARGO_TARGET_DIR=... cargo build --release -p studio-app \
@@ -25,7 +27,7 @@ render_one() {
   proj=$1; out=$2; bin=$3
   name=$(basename "$proj" .studio)
   raw=$(mktemp --suffix=.f32)
-  ( cd "$(dirname "$proj")" && "$bin/examples/render_project" "$(basename "$proj")" "$raw" ) 2>&1 | grep '^timing' | sed "s/^/$name: /" || true
+  ( cd "$(dirname "$proj")" && "$bin/examples/render_project" "$(basename "$proj")" "$raw" --threads "$THREADS" ) 2>&1 | grep -a '^timing' | sed "s/^/$name: /" || true
   stats=$(ffmpeg -nostdin -f f32le -ar 48000 -ac 2 -i "$raw" -af astats -f null - 2>&1)
   peak=$(grep 'Peak level dB' <<< "$stats" | tail -1 | awk '{print $NF}')
   rms=$(grep 'RMS level dB' <<< "$stats" | tail -1 | awk '{print $NF}')
@@ -35,7 +37,8 @@ render_one() {
   printf '%-40s peak %7s dBFS  rms %7s dBFS  encode gain %s dB\n' "$name" "$peak" "$rms" "$gain" >> "$out/levels.txt"
 }
 export -f render_one
-jobs=${JOBS:-$(nproc)}
+jobs=${JOBS:-1}
+export THREADS=${THREADS:-$(( $(nproc) / jobs > 0 ? $(nproc) / jobs : 1 ))}
 printf '%s\0' "$work"/*/*.studio | xargs -0 -P "$jobs" -I{} bash -c 'render_one "$1" "$2" "$3"' _ {} "$out" "$bin"
 sort -o "$out/levels.txt" "$out/levels.txt"
 cat "$out/levels.txt"

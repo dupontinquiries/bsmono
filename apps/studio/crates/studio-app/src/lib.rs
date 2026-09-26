@@ -28,6 +28,7 @@ use studio_live::transport::Transport;
 /// The part of an Ozone-style display that is not drawing: meter ballistics,
 /// a log frequency axis, and a rolling trace. The analysis existed; nothing
 /// turned it into something an eye can read.
+pub mod load;
 pub mod meter;
 pub mod take_report;
 pub mod stems_dme;

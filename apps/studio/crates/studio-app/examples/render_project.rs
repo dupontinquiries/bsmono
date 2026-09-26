@@ -19,6 +19,11 @@
 //!                            a band-limited resampler (studio_audio::resample)
 //!                            -- the mixdown's own linear reader would fold a
 //!                            downsample. The raw output is at HZ.
+//!   --threads N              render on N cores (default: all): the span cut
+//!                            into segments, each rendered from 6 s before
+//!                            its start (discarded) so effects have settled
+//!                            -- studio_audio::mixdown_parallel. 1 = the
+//!                            serial render, bit-exact with before.
 //!   --dry-master             bypass the "Master" bus's chain: the MIX, from the
 //!                            same project that renders the master -- one project,
 //!                            both deliverables, no re-export between them
@@ -45,21 +50,13 @@ fn main() {
         }
     }
     let base = path.parent().unwrap();
-    let mut audio: BTreeMap<studio_core::SourceId, studio_audio::SourceAudio> = BTreeMap::new();
-    for s in project.sources.values().filter(|s| !s.is_generator()) {
-        if let Ok(x) = studio_media::decode_file(&base.join(&s.path)) { audio.insert(s.id, x); }
-        else { eprintln!("cannot decode {}", s.path); }
-    }
     let rate: u32 = opt("--rate").and_then(|v| v.parse().ok()).unwrap_or(48_000);
     assert!((8_000..=192_000).contains(&rate), "--rate: 8000 .. 192000");
-    if rate != 48_000 || audio.values().any(|a| a.sample_rate != rate) {
-        let t = std::time::Instant::now();
-        let mut n = 0;
-        for a in audio.values_mut() {
-            if a.sample_rate != rate { *a = studio_audio::resample::resample_audio(a, rate); n += 1; }
-        }
-        if n > 0 { eprintln!("resampled {n} source(s) to {rate} Hz in {:.1} s", t.elapsed().as_secs_f64()); }
-    }
+    // decoded, and converted to `rate`, on every core (studio_app::load)
+    let t = std::time::Instant::now();
+    let (mut audio, failed) = studio_app::load::load_sources(&project, base, Some(rate), 0);
+    for f in &failed { eprintln!("cannot decode {f}"); }
+    eprintln!("decoded {} source(s) at {rate} Hz in {:.1} s", audio.len(), t.elapsed().as_secs_f64());
     let mut stamps = BTreeMap::new();
     studio_app::pattern_clips::refresh_at(&project, &rack, &mut audio, &mut stamps, rate);
     let fades: BTreeMap<studio_core::ClipId, studio_audio::Fades> = project.fades.iter()
@@ -81,12 +78,22 @@ fn main() {
         None => Vec::new(),
     };
     let (mut t, step, mut peak) = (start, studio_core::Ticks::from_seconds(5.0), 0.0f32);
-    while t < end {
-        let to = t.saturating_add(step).min(end);
-        let mix = studio_audio::mixdown_with_cache(&project, &audio, &fades, t, to, rate, &solo, &[], &mut cache);
-        for x in &mix { peak = peak.max(x.abs()); out.write_all(&x.to_le_bytes()).unwrap(); }
-        t = to;
-        eprint!("\r{:.0} / {:.0} s", t.to_seconds(), end.to_seconds());
+    let threads: usize = opt("--threads").and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    if threads > 1 {
+        let mix = studio_audio::mixdown_parallel(&project, &audio, &fades, start, end, rate, &solo, threads,
+                                                 studio_core::Ticks::from_seconds(6.0), step);
+        let mut bytes = Vec::with_capacity(mix.len() * 4);
+        for x in &mix { peak = peak.max(x.abs()); bytes.extend_from_slice(&x.to_le_bytes()); }
+        out.write_all(&bytes).unwrap();
+    } else {
+        while t < end {
+            let to = t.saturating_add(step).min(end);
+            let mix = studio_audio::mixdown_with_cache(&project, &audio, &fades, t, to, rate, &solo, &[], &mut cache);
+            for x in &mix { peak = peak.max(x.abs()); out.write_all(&x.to_le_bytes()).unwrap(); }
+            t = to;
+            eprint!("\r{:.0} / {:.0} s", t.to_seconds(), end.to_seconds());
+        }
     }
     eprintln!("\npeak {:.2} ({:+.1} dBFS)", peak, 20.0 * peak.max(1e-9).log10());
     let (mix_s, song_s) = (t_mix.elapsed().as_secs_f64(), end.saturating_sub(start).to_seconds());

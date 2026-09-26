@@ -897,6 +897,78 @@ fn zero_resize(v: &mut Vec<f32>, len: usize) {
     v.resize(len, 0.0);
 }
 
+/// A whole span rendered on `threads` cores: the span is cut into segments,
+/// each rendered by its own worker from `preroll` BEFORE its start -- output
+/// discarded -- so every effect's state (a reverb's tail, a compressor's
+/// envelope, a delay's buffer) has settled into what a serial render would
+/// hold by the time the segment's own audio begins. Not bit-identical to
+/// the serial render at the joins; the difference is measured by a test
+/// (and by the caller, if it cares). Chunks of `chunk` are rendered through
+/// one cache per worker, as a serial export does. Returns interleaved
+/// stereo for [from, to).
+#[allow(clippy::too_many_arguments)]
+pub fn mixdown_parallel(
+    project: &Project,
+    audio: &BTreeMap<SourceId, SourceAudio>,
+    fades: &BTreeMap<studio_core::ClipId, Fades>,
+    from: Ticks,
+    to: Ticks,
+    rate: u32,
+    solo: &[studio_core::TrackId],
+    threads: usize,
+    preroll: Ticks,
+    chunk: Ticks,
+) -> Vec<f32> {
+    let total = (to.to_samples(rate) - from.to_samples(rate)).max(0) as usize;
+    let threads = threads.max(1);
+    // about two segments per worker (a heavy section does not leave one core
+    // doing all the late work), none shorter than eight pre-rolls
+    let min_seg = preroll.to_samples(rate).max(1) as usize * 8;
+    let segs = (threads * 2).min((total / min_seg.max(1)).max(1));
+    let bounds: Vec<(usize, usize)> = (0..segs).map(|k| (total * k / segs, total * (k + 1) / segs)).collect();
+    let mut out = vec![0.0f32; total * 2];
+    let slots: Vec<std::sync::Mutex<&mut [f32]>> = {
+        let mut rest: &mut [f32] = &mut out;
+        let mut v = Vec::with_capacity(segs);
+        for (a, b) in &bounds {
+            let (head, tail) = rest.split_at_mut((b - a) * 2);
+            v.push(std::sync::Mutex::new(head));
+            rest = tail;
+        }
+        v
+    };
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let at = |s: usize| Ticks::from_samples(from.to_samples(rate) + s as i64, rate);
+    std::thread::scope(|sc| {
+        for _ in 0..threads.min(segs) {
+            sc.spawn(|| loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(&(a, b)) = bounds.get(k) else { break };
+                let mut cache = EffectCache::new();
+                let seg_start = at(a);
+                let warm = if k == 0 { seg_start } else { seg_start.saturating_sub(preroll).max(from) };
+                let mut t = warm;
+                let mut dst = slots[k].lock().expect("a segment");
+                let mut written = 0usize;
+                let end = at(b);
+                while t < end {
+                    let u = t.saturating_add(chunk).min(end);
+                    // the pre-roll ends exactly at the segment start
+                    let u = if t < seg_start { u.min(seg_start) } else { u };
+                    let mix = mixdown_with_cache(project, audio, fades, t, u, rate, solo, &[], &mut cache);
+                    if t >= seg_start {
+                        let n = mix.len().min(dst.len() - written);
+                        dst[written..written + n].copy_from_slice(&mix[..n]);
+                        written += n;
+                    }
+                    t = u;
+                }
+            });
+        }
+    });
+    out
+}
+
 /// [`mixdown`]'s actual logic, parameterised over the [`EffectCache`] that
 /// backs every clip's and bus's effect instances — `mixdown` itself is a
 /// two-line wrapper handing this a cache nobody keeps, and
@@ -1358,6 +1430,60 @@ pub fn bus_signal(
 pub fn peak_dbfs(samples: &[f32]) -> f32 {
     let peak = samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));
     if peak <= 0.0 { f32::NEG_INFINITY } else { 20.0 * peak.log10() }
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    use studio_core::{Bus, BusId, Clip, ClipId, Op, Source, Track, TrackId, TrackKind};
+
+    /// 40 s of noise bursts (0.15 s every 0.9 s) through a bus with reverb,
+    /// compressor and delay -- the stateful effects the pre-roll must settle.
+    fn busy_project(rate: u32, secs: f64) -> (Project, BTreeMap<SourceId, SourceAudio>) {
+        let mut p = Project::default();
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), parent: None, gain: 1.0, silent: false, muted: false, sends: vec![],
+            chain: ["reverb", "compressor", "delay"].iter().map(|k| studio_core::Effect { kind: (*k).into(), enabled: true, params: Default::default() }).collect() } }).unwrap();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "A".into(), muted: false, locked: false, gain: 1.0, route: Some(BusId(1)) }, at: 0 }).unwrap();
+        let n = (rate as f64 * secs) as usize;
+        let mut st = 0x1234_5678u32;
+        let sig: Vec<f32> = (0..n).map(|i| {
+            st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+            let t = i as f64 / rate as f64;
+            if t % 0.9 < 0.15 { (st as f32 / u32::MAX as f32 - 0.5) * 0.8 } else { 0.0 }
+        }).collect();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "n".into(), len: Ticks::from_seconds(secs), sample_rate: rate, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO, len: Ticks::from_seconds(secs), gain: 1.0, effects: vec![] } }).unwrap();
+        let mut audio = BTreeMap::new();
+        audio.insert(SourceId(1), SourceAudio { sample_rate: rate, channels: vec![sig] });
+        (p, audio)
+    }
+
+    /// The parallel render matches the serial one: exactly in the first
+    /// segment (it has no pre-roll), and across a join -- 80 s, a 4 s
+    /// pre-roll, so two segments -- within -60 dB of the peak at the worst
+    /// sample and -80 dB of the signal in RMS (measured: see the print).
+    #[test]
+    fn the_parallel_render_matches_the_serial_one() {
+        let rate = 16_000;
+        let (p, audio) = busy_project(rate, 80.0);
+        let (from, to, chunk) = (Ticks::ZERO, Ticks::from_seconds(80.0), Ticks::from_seconds(5.0));
+        let mut serial = Vec::new();
+        let mut cache = EffectCache::new();
+        let mut t = from;
+        while t < to { let u = t.saturating_add(chunk).min(to); serial.extend(mixdown_with_cache(&p, &audio, &BTreeMap::new(), t, u, rate, &[], &[], &mut cache)); t = u; }
+        let par = mixdown_parallel(&p, &audio, &BTreeMap::new(), from, to, rate, &[], 3, Ticks::from_seconds(4.0), chunk);
+        assert_eq!(par.len(), serial.len());
+        let peak = serial.iter().fold(0.0f32, |m, x| m.max(x.abs())) as f64;
+        let sig = (serial.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / serial.len() as f64).sqrt();
+        let d: Vec<f64> = par.iter().zip(&serial).map(|(a, b)| (*a - *b) as f64).collect();
+        let worst = d.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        let rms = (d.iter().map(|x| x * x).sum::<f64>() / d.len() as f64).sqrt();
+        eprintln!("PARALLEL vs serial: worst {:.1} dB re peak, rms {:.1} dB re signal", 20.0 * (worst / peak).log10(), 20.0 * (rms / sig).max(1e-12).log10());
+        assert!(worst > 0.0, "two segments: a join exists, or this test measures nothing");
+        assert!(20.0 * (worst / peak).log10() < -60.0 && 20.0 * (rms / sig).log10() < -80.0);
+        let half = serial.len() / 2;
+        assert!(par[..half].iter().zip(&serial[..half]).all(|(a, b)| a == b), "segment one is the serial render exactly");
+    }
 }
 
 #[cfg(test)]

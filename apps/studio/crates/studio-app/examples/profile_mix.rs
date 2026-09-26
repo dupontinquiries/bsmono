@@ -16,10 +16,7 @@ fn main() {
     let project = save.to_project();
     let base = path.parent().unwrap();
     let t = Instant::now();
-    let mut audio = BTreeMap::new();
-    for s in project.sources.values().filter(|s| !s.is_generator()) {
-        if let Ok(x) = studio_media::decode_file(&base.join(&s.path)) { audio.insert(s.id, x); }
-    }
+    let (mut audio, _) = studio_app::load::load_sources(&project, base, Some(48_000), 0);
     println!("decode {} media files: {:.1} s", audio.len(), t.elapsed().as_secs_f64());
     let t = Instant::now();
     let mut st = BTreeMap::new();
