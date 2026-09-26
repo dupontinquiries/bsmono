@@ -170,8 +170,11 @@ pub fn summarize(before: &Project, ops: &[Op]) -> String {
     s
 }
 
-#[derive(Debug, Clone)]
-pub struct Entry {
+/// What one change was, in words: the part of an undo entry a person reads.
+/// Separate from [`Entry`] so a shell that undoes some other way (the app
+/// routes inverses through its collab op log) can keep the same notes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Note {
     /// What the caller called it ("nudge", "paste", "import").
     pub label: String,
     /// What it did, from the ops (see [`summarize`]).
@@ -185,6 +188,43 @@ pub struct Entry {
     pub fixed: Vec<Finding>,
     /// A small change that left the project with NO findings: known good.
     pub restore_point: bool,
+}
+
+impl Note {
+    /// Describe `ops` as applied to `before` (whose findings were
+    /// `before_findings`), leaving findings `after`.
+    pub fn describe(label: &str, before: &Project, before_findings: &[Finding], ops: &[Op], after: &[Finding], now_ms: u64) -> Note {
+        let size = flat_len(ops);
+        let (b, a): (BTreeSet<&Finding>, BTreeSet<&Finding>) = (before_findings.iter().collect(), after.iter().collect());
+        Note { label: label.into(), summary: summarize(before, ops), size, at_ms: now_ms,
+            broke: a.difference(&b).map(|f| (*f).clone()).collect(),
+            fixed: b.difference(&a).map(|f| (*f).clone()).collect(),
+            restore_point: size <= LARGE_CHANGE && after.is_empty() }
+    }
+
+    /// One palette line: "undo to before: LABEL -- SUMMARY (AGO) | BROKE ..."
+    pub fn line(&self, now_ms: u64, last_known_good: bool) -> String {
+        let ago = now_ms.saturating_sub(self.at_ms) / 1000;
+        let when = if ago < 60 { format!("{ago} s ago") } else if ago < 3600 { format!("{} min ago", ago / 60) } else { format!("{} h ago", ago / 3600) };
+        let mut s = format!("undo to before: {} -- {} ({when})", self.label, self.summary);
+        if !self.broke.is_empty() { s.push_str(&format!(" | BROKE {}: {}", self.broke.len(), self.broke[0].text)); }
+        if !self.fixed.is_empty() { s.push_str(&format!(" | fixed {}", self.fixed.len())); }
+        if last_known_good { s.push_str(" | last known good"); }
+        s
+    }
+}
+
+/// Palette lines for a stack of notes, oldest first in `notes`: newest-first
+/// lines, where line k means "undo k + 1 steps". The newest restore point is
+/// marked as the last known good.
+pub fn palette_lines(notes: &[Note], now_ms: u64) -> Vec<String> {
+    let good = notes.iter().rposition(|n| n.restore_point);
+    (0..notes.len()).rev().map(|i| notes[i].line(now_ms, Some(i) == good)).collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub note: Note,
     forward: Vec<Op>,
     inverse: Vec<Op>,
 }
@@ -200,6 +240,8 @@ pub struct Journal {
 
 fn flat_len(ops: &[Op]) -> usize { ops.iter().map(|o| if let Op::Group { ops } = o { flat_len(ops) } else { 1 }).sum() }
 
+impl std::ops::Deref for Entry { type Target = Note; fn deref(&self) -> &Note { &self.note } }
+
 impl Journal {
     pub fn new() -> Journal { Journal::default() }
     pub fn entries(&self) -> &[Entry] { &self.entries }
@@ -209,9 +251,9 @@ impl Journal {
     /// Apply `ops` as ONE change named `label`, all or nothing, and record it.
     pub fn commit(&mut self, project: &mut Project, label: &str, ops: &[Op], now_ms: u64) -> Result<&Entry, EditError> {
         let before_findings = check(project);
-        let summary = summarize(project, ops);
+        let before = project.clone();
         let size = flat_len(ops);
-        let snapshot = (size > LARGE_CHANGE).then(|| project.clone());
+        let snapshot = (size > LARGE_CHANGE).then(|| before.clone());
         let mut inverse = Vec::with_capacity(ops.len());
         for op in ops {
             match project.apply(op) {
@@ -223,16 +265,12 @@ impl Journal {
             }
         }
         inverse.reverse();
-        let after = check(project);
-        let (b, a): (BTreeSet<&Finding>, BTreeSet<&Finding>) = (before_findings.iter().collect(), after.iter().collect());
-        let broke = a.difference(&b).map(|f| (*f).clone()).collect();
-        let fixed = b.difference(&a).map(|f| (*f).clone()).collect();
+        let note = Note::describe(label, &before, &before_findings, ops, &check(project), now_ms);
         // a new change drops the redo tail, and any snapshot taken for it
         self.entries.truncate(self.applied);
         self.snapshots.retain(|k, _| *k < self.applied);
         if let Some(s) = snapshot { self.snapshots.insert(self.applied, s); }
-        self.entries.push(Entry { label: label.into(), summary, size, at_ms: now_ms, broke, fixed,
-            restore_point: size <= LARGE_CHANGE && after.is_empty(), forward: ops.to_vec(), inverse });
+        self.entries.push(Entry { note, forward: ops.to_vec(), inverse });
         self.applied += 1;
         Ok(&self.entries[self.applied - 1])
     }
@@ -280,16 +318,7 @@ impl Journal {
     /// how long ago, what it broke -- and which one is the last known-good.
     pub fn palette(&self, now_ms: u64) -> Vec<(usize, String)> {
         let good = self.last_restore_point();
-        (0..self.applied).rev().map(|i| {
-            let e = &self.entries[i];
-            let ago = now_ms.saturating_sub(e.at_ms) / 1000;
-            let when = if ago < 60 { format!("{ago} s ago") } else if ago < 3600 { format!("{} min ago", ago / 60) } else { format!("{} h ago", ago / 3600) };
-            let mut s = format!("undo to before: {} -- {} ({when})", e.label, e.summary);
-            if !e.broke.is_empty() { s.push_str(&format!(" | BROKE {}: {}", e.broke.len(), e.broke[0].text)); }
-            if !e.fixed.is_empty() { s.push_str(&format!(" | fixed {}", e.fixed.len())); }
-            if Some(i) == good { s.push_str(" | last known good"); }
-            (i, s)
-        }).collect()
+        (0..self.applied).rev().map(|i| (i, self.entries[i].line(now_ms, Some(i) == good))).collect()
     }
 }
 
@@ -344,6 +373,28 @@ mod tests {
         // a fade on either side clears it
         p.apply(&Op::SetClipFade { id: ClipId(21), fade_in: Ticks::from_seconds(0.005), fade_out: Ticks::ZERO }).unwrap();
         assert!(cuts(&p).is_empty());
+    }
+    #[test]
+    fn notes_alone_give_the_same_palette_as_the_journal() {
+        // the app keeps notes beside its own undo stack; its palette must read
+        // exactly like the journal's for the same history
+        let mut p = with_stems();
+        let mut j = Journal::new();
+        let mut notes = Vec::new();
+        for (k, by) in [(3u64, 0.012), (3, -0.012), (2, 0.2)].into_iter().enumerate() {
+            let before = p.clone();
+            let bf = check(&p);
+            let o = nudge(&[by.0], &p, by.1);
+            j.commit(&mut p, "nudge", &o, k as u64 * 1000).unwrap();
+            notes.push(Note::describe("nudge", &before, &bf, &o, &check(&p), k as u64 * 1000));
+        }
+        let lines = palette_lines(&notes, 5_000);
+        let from_journal: Vec<String> = j.palette(5_000).into_iter().map(|x| x.1).collect();
+        assert_eq!(lines, from_journal);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].ends_with("| last known good"), "{}", lines[0]);
+        assert_eq!(lines.iter().filter(|l| l.contains("last known good")).count(), 1);
+        assert!(lines[2].contains("BROKE 1"), "{}", lines[2]);
     }
     fn with_stems() -> Project {
         let mut p = project();

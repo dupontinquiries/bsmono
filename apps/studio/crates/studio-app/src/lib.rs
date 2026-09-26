@@ -134,6 +134,13 @@ pub struct Studio {
     /// door.)
     undo_stack: Vec<studio_core::Op>,
     redo_stack: Vec<studio_core::Op>,
+    /// What each undo step WAS, in words, index for index with
+    /// `undo_stack` / `redo_stack`: the summary, what it broke or fixed
+    /// (`studio_core::journal::check`), and whether it was known good. The
+    /// palette's "undo to before…" lists these, so finding a change does not
+    /// mean counting undos in your head.
+    undo_notes: Vec<studio_core::journal::Note>,
+    redo_notes: Vec<studio_core::journal::Note>,
     /// Packets produced by local activity — stamped ops (including undos)
     /// and rack syncs — waiting for whatever carrier exists to drain them.
     /// The shell is transport-agnostic on purpose: this Vec IS the seam.
@@ -393,6 +400,8 @@ impl Studio {
             selection: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            undo_notes: Vec::new(),
+            redo_notes: Vec::new(),
             outbox: Vec::new(),
             voice_inbox: Vec::new(),
             manifests: Default::default(),
@@ -479,6 +488,8 @@ impl Studio {
     /// whole group back, the way `History::apply_group` does for the
     /// collab path: half a mastering pass is worse than none.
     pub fn edit_group(&mut self, ops: Vec<studio_core::Op>, what: &str) {
+        let (before, before_findings) = self.note_start();
+        let described = ops.clone();
         let mut applied = Vec::new();
         for op in ops {
             match self.edit_inner(op) {
@@ -502,15 +513,19 @@ impl Studio {
         self.undo_stack.push(studio_core::Op::Group {
             ops: applied.into_iter().rev().collect() });
         self.redo_stack.clear();
+        self.note_finish(what, &before, &before_findings, &described);
         self.status = format!("{what} — one undo reverses all {count}");
         self.arrangement_dirty = true;
     }
 
     pub fn edit(&mut self, op: studio_core::Op, what: &str) {
+        let (before, before_findings) = self.note_start();
+        let described = [op.clone()];
         match self.edit_inner(op) {
             Ok(inverse) => {
                 self.undo_stack.push(inverse);
                 self.redo_stack.clear();
+                self.note_finish(what, &before, &before_findings, &described);
                 self.status = what.into();
                 self.arrangement_dirty = true;
             }
@@ -526,6 +541,78 @@ impl Studio {
     /// gesture, the same per-edit cost `studio-engine`'s snapshot swap
     /// already accepts, bought here for the property that the log and the
     /// project can never disagree about what happened.
+    fn note_start(&self) -> (studio_core::Project, Vec<studio_core::journal::Finding>) {
+        let p = &self.session.doc.project;
+        (p.clone(), studio_core::journal::check(p))
+    }
+
+    /// Record the note for the undo step just pushed; says in the status
+    /// line when the change broke something.
+    fn note_finish(&mut self, what: &str, before: &studio_core::Project, before_findings: &[studio_core::journal::Finding], ops: &[studio_core::Op]) {
+        let after = studio_core::journal::check(&self.session.doc.project);
+        let note = studio_core::journal::Note::describe(what, before, before_findings, ops, &after, wall_ms());
+        self.undo_notes.push(note);
+        self.redo_notes.clear();
+    }
+
+    /// The named undo history, newest first: line k is k + 1 undos away.
+    pub fn history_lines(&self) -> Vec<String> {
+        studio_core::journal::palette_lines(&self.undo_notes, wall_ms())
+    }
+
+    /// The newest note's breakage, if the last change broke something.
+    pub fn last_broke(&self) -> Option<&studio_core::journal::Finding> {
+        self.undo_notes.last().and_then(|n| n.broke.first())
+    }
+
+    /// Undo once through the stamping door. `Ok(false)`: nothing to undo.
+    fn undo_once(&mut self) -> Result<bool, studio_core::EditError> {
+        let Some(inv) = self.undo_stack.pop() else { return Ok(false) };
+        match self.edit_inner(inv) {
+            Ok(redo) => {
+                self.redo_stack.push(redo);
+                if let Some(n) = self.undo_notes.pop() { self.redo_notes.push(n); }
+                self.arrangement_dirty = true;
+                Ok(true)
+            }
+            // as before: a refused inverse is dropped (retrying cannot
+            // succeed once the state moved), and its note with it
+            Err(e) => { self.undo_notes.pop(); Err(e) }
+        }
+    }
+
+    fn redo_once(&mut self) -> Result<bool, studio_core::EditError> {
+        let Some(op) = self.redo_stack.pop() else { return Ok(false) };
+        match self.edit_inner(op) {
+            Ok(undo) => {
+                self.undo_stack.push(undo);
+                if let Some(n) = self.redo_notes.pop() { self.undo_notes.push(n); }
+                self.arrangement_dirty = true;
+                Ok(true)
+            }
+            Err(e) => { self.redo_notes.pop(); Err(e) }
+        }
+    }
+
+    /// Undo `n` steps (the palette's "undo to before…"). Stops at the first
+    /// refusal and says how far it got.
+    pub fn undo_steps(&mut self, n: usize) {
+        let target = self.undo_notes.get(self.undo_notes.len().wrapping_sub(n)).map(|x| x.label.clone());
+        let mut done = 0;
+        while done < n {
+            match self.undo_once() {
+                Ok(true) => done += 1,
+                Ok(false) => break,
+                Err(e) => { self.status = format!("undo stopped after {done} of {n} (state moved): {e:?}"); return; }
+            }
+        }
+        self.status = match (done, target) {
+            (0, _) => "nothing to undo".into(),
+            (d, Some(l)) if d == n => format!("undid {d} -- back to before: {l}"),
+            (d, _) => format!("undid {d}"),
+        };
+    }
+
     fn edit_inner(&mut self, op: studio_core::Op)
         -> Result<studio_core::Op, studio_core::EditError>
     {
@@ -1637,29 +1724,23 @@ impl Studio {
                         // door, so peers see the undo as the edit it is. If
                         // the state has moved under it (a peer's conflicting
                         // op), the refusal is said out loud, not swallowed.
-                        self.status = match self.undo_stack.pop() {
-                            None => "nothing to undo".into(),
-                            Some(inv) => match self.edit_inner(inv) {
-                                Ok(redo) => {
-                                    self.redo_stack.push(redo);
-                                    self.arrangement_dirty = true;
-                                    "undo".into()
-                                }
-                                Err(e) => format!("undo refused (state moved): {e:?}"),
+                        self.status = match self.undo_once() {
+                            Ok(false) => "nothing to undo".into(),
+                            Ok(true) => match self.redo_notes.last() {
+                                Some(n) => format!("undo: {} -- {}", n.label, n.summary),
+                                None => "undo".into(),
                             },
+                            Err(e) => format!("undo refused (state moved): {e:?}"),
                         };
                     }
                     Action::Redo => {
-                        self.status = match self.redo_stack.pop() {
-                            None => "nothing to redo".into(),
-                            Some(op) => match self.edit_inner(op) {
-                                Ok(undo) => {
-                                    self.undo_stack.push(undo);
-                                    self.arrangement_dirty = true;
-                                    "redo".into()
-                                }
-                                Err(e) => format!("redo refused (state moved): {e:?}"),
+                        self.status = match self.redo_once() {
+                            Ok(false) => "nothing to redo".into(),
+                            Ok(true) => match self.undo_notes.last() {
+                                Some(n) => format!("redo: {} -- {}", n.label, n.summary),
+                                None => "redo".into(),
                             },
+                            Err(e) => format!("redo refused (state moved): {e:?}"),
                         };
                     }
                     Action::Delete => {
@@ -3333,6 +3414,55 @@ mod tests {
     }
 
     #[test]
+    fn the_palette_undoes_to_a_named_change_and_says_what_it_broke() {
+        use studio_core::{Clip, ClipId, Op, Source, SourceId, TrackId};
+        let mut s = Studio::demo();
+        let aligned = |s: &Studio| (s.undo_notes.len(), s.redo_notes.len()) == (s.undo_stack.len(), s.redo_stack.len());
+        // a second stem of the same length as the demo take, lined up with clip 2
+        s.edit_group(vec![
+            Op::AddSource { source: Source { id: SourceId(2), path: "takes/stem.wav".into(), len: Ticks::from_seconds(600.0),
+                sample_rate: 48_000, channels: 2, has_video: false, kind: studio_core::SourceKind::File } },
+            Op::AddClip { clip: Clip { id: ClipId(100), source: SourceId(2), track: TrackId(3), pos: Ticks::from_seconds(3.5),
+                src_in: Ticks::from_seconds(2.0), len: Ticks::from_seconds(3.0), gain: 1.0, effects: Vec::new() } },
+        ], "add stem");
+        s.edit(Op::MoveClip { id: ClipId(100), pos: Ticks::from_seconds(3.51), track: TrackId(3) }, "nudge");
+        s.edit_group(vec![Op::SetGain { id: ClipId(1), gain: 2.0 }, Op::SetGain { id: ClipId(4), gain: 2.0 }], "louder");
+        assert!(aligned(&s));
+        let lines = s.history_lines();
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(lines[0].starts_with("undo to before: louder -- gain on 2 clips"), "{}", lines[0]);
+        assert!(lines[1].starts_with("undo to before: nudge -- moved 1 clip by +0.01 s on A2"), "{}", lines[1]);
+        assert!(lines[1].contains("BROKE 1: A1 and A2 are stems out of sync by -10.0 ms"), "{}", lines[1]);
+        assert!(lines[2].contains("add stem") && lines[2].ends_with("| last known good"), "{}", lines[2]);
+        assert_eq!(s.last_broke(), None, "the newest change broke nothing new");
+
+        // the palette offers the lines under "undo to before…", each k + 1 undos away
+        let mut pal = palette::Palette::open();
+        pal.history = std::sync::Arc::new(lines);
+        let root = pal.choices(&s.session.doc.project);
+        let ask = palette::filter(&root, "undo to before").first().copied().cloned().expect("offered");
+        assert_eq!(pal.choose(&ask), None, "asks which change");
+        let offered = pal.choices(&s.session.doc.project);
+        assert_eq!(offered.len(), 3);
+        let pick = palette::filter(&offered, "nudge").first().copied().cloned().unwrap();
+        let act = pal.choose(&pick).unwrap();
+        assert_eq!(act, palette::Act::Shell(palette::ShellVerb::UndoSteps(2)));
+
+        s.undo_steps(2);
+        assert_eq!(s.session.doc.project.clips[&ClipId(100)].pos, Ticks::from_seconds(3.5), "back before the nudge");
+        assert_eq!(s.session.doc.project.clips[&ClipId(1)].gain, 1.0, "and before the gain");
+        assert!(s.status.contains("back to before: nudge"), "{}", s.status);
+        assert!(aligned(&s) && s.history_lines().len() == 1);
+        s.key(Key::c('U'));
+        assert!(s.status.starts_with("redo: nudge -- moved 1 clip"), "{}", s.status);
+        assert_eq!(s.last_broke().map(|f| f.key.starts_with("stem-drift")), Some(true));
+        assert!(aligned(&s));
+        // a new edit drops the redo notes with the redo stack
+        s.edit(Op::SetGain { id: ClipId(2), gain: 0.5 }, "quieter");
+        assert!(aligned(&s) && s.redo_notes.is_empty());
+    }
+
+    #[test]
     fn a_refused_edit_reports_rather_than_vanishing() {
         // The worst failure an editor has is a silently dropped edit: the user
         // believes it worked.
@@ -3886,12 +4016,12 @@ impl eframe::App for App {
             }
         }
         if std::mem::take(&mut self.studio.palette_requested) && self.palette.is_none() {
-            self.palette = Some(palette::Palette::open_with(self.words_raw.clone()));
+            self.palette = Some(self.open_palette());
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
             self.palette = match self.palette {
                 Some(_) => None, // C-p again closes: a toggle, not a stack
-                None => Some(palette::Palette::open_with(self.words_raw.clone())),
+                None => Some(self.open_palette()),
             };
         }
         // C-1..C-4: the workspaces. One keypress per room, the kdenlive
@@ -6248,6 +6378,7 @@ impl App {
                     self.studio.status = format!("resync requested — {n} ops locally");
                 }
                 palette::ShellVerb::RecordTake => { self.toggle_take(); }
+                palette::ShellVerb::UndoSteps(n) => self.studio.undo_steps(n as usize),
                 palette::ShellVerb::CallToggle => { self.toggle_call(); }
                 palette::ShellVerb::LoopSelection => { self.studio.loop_selection(); }
                 palette::ShellVerb::Harmonize(d) => { self.studio.harmonize_roll(d as i32); }
@@ -7695,6 +7826,13 @@ impl App {
     }
 
     /// Open the palette straight at one of its questions.
+    /// The palette as C-p opens it: transcripts and the named undo history.
+    fn open_palette(&self) -> palette::Palette {
+        let mut p = palette::Palette::open_with(self.words_raw.clone());
+        p.history = std::sync::Arc::new(self.studio.history_lines());
+        p
+    }
+
     fn open_palette_at(&mut self, ask: palette::Ask, crumb: &str) {
         self.palette = Some(palette::Palette { pending: Some(ask), path: vec![crumb.to_string()], ..Default::default() });
     }
@@ -11094,4 +11232,10 @@ mod arrange_key_tests {
         assert!((clip(&s, 902).gain - 0.891_250_9 / 0.8).abs() < 1e-4, "{}", clip(&s, 902).gain);
         assert!(s.status.contains("capped"), "0.89/0.21 > 1.5 is capped and said: {}", s.status);
     }
+}
+
+/// Wall clock in ms, for undo notes ("2 min ago"). Not gated on the `app`
+/// feature like `now_ms`, because the headless shell keeps notes too.
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
