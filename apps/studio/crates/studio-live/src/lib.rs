@@ -93,6 +93,12 @@ impl Tempo {
 /// What a channel is playing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SynthKind {
+    /// A compact POLY synth: everything generated, nothing sampled -- a patch
+    /// is ~60 bytes where a sample-library synth is gigabytes. Built for the
+    /// imports first (a plugin synth's part becomes notes + a patch instead of
+    /// a sine), and for a phone, where 50 GB of library is not an option.
+    /// `hz` is the pitch at the pattern's origin, retuned per note like `Sine`.
+    Poly { hz: f32, patch: PolyPatch },
     /// A plain sine — always available, so a rack is playable with no plugins.
     Sine { hz: f32 },
     /// A one-shot sample from a project source (the classic drum rack channel).
@@ -775,6 +781,7 @@ pub trait Synth {
                 sub_voice(*note, *glide_from, *glide_ms, *drive, *decay_ms,
                           rate, out, Some(hold.min(out.len())));
             }
+            SynthKind::Poly { hz, patch } => poly_voice(*hz, patch, rate, out, Some(hold.min(out.len()))),
             SynthKind::Sine { hz } => {
                 let hold = hold.min(out.len()).max(1);
                 let attack = (rate as usize / 500).max(1).min(hold);
@@ -799,6 +806,104 @@ pub trait Synth {
     }
 }
 
+/// A Poly patch. Every field a number: small on the wire, diffable, and
+/// editable as knobs.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PolyPatch {
+    /// 0 sine, 1 triangle, 2 saw, 3 square (saw and square band-limited).
+    pub wave: u8,
+    /// Unison voices, 1..=7, spread over `detune` cents.
+    pub voices: u8,
+    pub detune: f32,
+    /// A sine an octave down, 0..=1.
+    pub sub: f32,
+    pub attack_ms: f32,
+    pub decay_ms: f32,
+    /// 0..=1
+    pub sustain: f32,
+    pub release_ms: f32,
+    /// Low-pass cutoff (Hz) and resonance (0..=1).
+    pub cutoff: f32,
+    pub resonance: f32,
+    /// How far the amp envelope opens the filter, in octaves.
+    pub env_amount: f32,
+    /// Vibrato depth, cents (5 Hz).
+    pub vibrato: f32,
+    pub gain: f32,
+}
+
+impl Default for PolyPatch {
+    fn default() -> PolyPatch {
+        PolyPatch { wave: 2, voices: 2, detune: 8.0, sub: 0.0, attack_ms: 5.0, decay_ms: 300.0, sustain: 0.7, release_ms: 250.0,
+                    cutoff: 3000.0, resonance: 0.2, env_amount: 1.0, vibrato: 0.0, gain: 0.5 }
+    }
+}
+
+/// PolyBLEP: the correction that band-limits a naive saw/square edge.
+fn poly_blep(t: f32, dt: f32) -> f32 {
+    if t < dt { let x = t / dt; x + x - x * x - 1.0 }
+    else if t > 1.0 - dt { let x = (t - 1.0) / dt; x * x + x + x + 1.0 }
+    else { 0.0 }
+}
+
+/// Render one Poly note into `out`: held for `hold` samples (the gate), then
+/// released; `None` = a hit (the gate closes after attack + decay).
+pub fn poly_voice(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], hold: Option<usize>) {
+    let r = rate as f32;
+    let ms = |x: f32| ((x.max(0.0) * 0.001 * r) as usize).max(1);
+    let (att, dec, rel) = (ms(p.attack_ms), ms(p.decay_ms), ms(p.release_ms));
+    let gate = hold.unwrap_or(att + dec).min(out.len());
+    let voices = p.voices.clamp(1, 7) as usize;
+    let mut phase: Vec<f32> = (0..voices).map(|k| (k as f32 * 0.618_034).fract()).collect();
+    let spread = |k: usize| if voices == 1 { 0.0 } else { (k as f32 / (voices - 1) as f32 - 0.5) * p.detune };
+    let mut sub_phase = 0.0f32;
+    // TPT state-variable low-pass
+    let (mut ic1, mut ic2) = (0.0f32, 0.0f32);
+    let k_res = 2.0 - 1.9 * p.resonance.clamp(0.0, 1.0);
+    let norm = 1.0 / (voices as f32).sqrt();
+    let mut level_at_gate = 0.0f32;
+    for (i, s) in out.iter_mut().enumerate() {
+        // envelope
+        let env = if i < gate {
+            let e = if i < att { i as f32 / att as f32 }
+                    else { let d = (i - att) as f32 / dec as f32; p.sustain + (1.0 - p.sustain) * (1.0 - d.min(1.0)).powi(2) };
+            level_at_gate = e;
+            e
+        } else {
+            let d = (i - gate) as f32 / rel as f32;
+            if d >= 1.0 { 0.0 } else { level_at_gate * (1.0 - d).powi(2) }
+        };
+        let vib = if p.vibrato > 0.0 { 2f32.powf(p.vibrato / 1200.0 * (i as f32 / r * 5.0 * std::f32::consts::TAU).sin()) } else { 1.0 };
+        let mut x = 0.0f32;
+        for (k, ph) in phase.iter_mut().enumerate() {
+            let f = hz * vib * 2f32.powf(spread(k) / 1200.0);
+            let dt = (f / r).min(0.49);
+            let v = match p.wave {
+                0 => (*ph * std::f32::consts::TAU).sin(),
+                1 => 1.0 - 4.0 * (*ph - 0.5).abs(),
+                3 => { let sq = if *ph < 0.5 { 1.0 } else { -1.0 }; sq + poly_blep(*ph, dt) - poly_blep((*ph + 0.5).fract(), dt) }
+                _ => 2.0 * *ph - 1.0 - poly_blep(*ph, dt),
+            };
+            x += v;
+            *ph = (*ph + dt).fract();
+        }
+        x *= norm;
+        if p.sub > 0.0 {
+            x += p.sub * (sub_phase * std::f32::consts::TAU).sin();
+            sub_phase = (sub_phase + hz * 0.5 / r).fract();
+        }
+        // filter, opened by the envelope
+        let fc = (p.cutoff * 2f32.powf(p.env_amount * env)).clamp(20.0, 0.45 * r);
+        let g = (std::f32::consts::PI * fc / r).tan();
+        let a1 = 1.0 / (1.0 + g * (g + k_res));
+        let v1 = a1 * (ic1 + g * (x - ic2));
+        let v2 = ic2 + g * v1;
+        ic1 = 2.0 * v1 - ic1;
+        ic2 = 2.0 * v2 - ic2;
+        *s = v2 * env * p.gain;
+    }
+}
+
 /// The always-available synth: sine tones and sample playback. A rack made only
 /// of these needs no plugins at all, which is what keeps a project openable.
 pub struct BuiltinSynth<'a> {
@@ -808,6 +913,7 @@ pub struct BuiltinSynth<'a> {
 impl Synth for BuiltinSynth<'_> {
     fn render(&mut self, kind: &SynthKind, rate: u32, out: &mut [f32]) {
         match kind {
+            SynthKind::Poly { hz, patch } => poly_voice(*hz, patch, rate, out, None),
             SynthKind::Sine { hz } => {
                 // a short percussive envelope, so a step reads as a hit rather
                 // than a drone that never stops
@@ -1081,6 +1187,7 @@ pub fn apply_step_mod(kind: &SynthKind, m: &StepMod, prev_note: Option<i8>) -> S
             decay_ms: *decay_ms,
         },
         SynthKind::Sine { hz } => SynthKind::Sine { hz: hz * 2f32.powf(m.tune as f32 / 12.0) },
+        SynthKind::Poly { hz, patch } => SynthKind::Poly { hz: hz * 2f32.powf(m.tune as f32 / 12.0), patch: *patch },
         // The roll's key and the step's tune fold into the transpose, so
         // a host's sf2 engine reads ONE number: the semitones above the
         // roll's origin (`studio_core::KEY_ZERO_MIDI`) to play. Before
@@ -3028,5 +3135,46 @@ mod rhythm_tests {
         // And the downbeat rule holds regardless of who is asking.
         assert_eq!(t.swing_delay_samples_at(0, 48_000, 1.0), 0,
             "even steps are never moved, whatever the channel wants");
+    }
+}
+
+#[cfg(test)]
+mod poly_tests {
+    use super::*;
+
+    fn zero_crossings(v: &[f32]) -> usize { v.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count() }
+
+    #[test]
+    fn a_poly_sine_plays_at_pitch_and_its_envelope_holds_then_releases() {
+        let p = PolyPatch { wave: 0, voices: 1, detune: 0.0, sub: 0.0, attack_ms: 1.0, decay_ms: 10.0, sustain: 1.0, release_ms: 100.0,
+                            cutoff: 20000.0, resonance: 0.0, env_amount: 0.0, vibrato: 0.0, gain: 1.0 };
+        let mut out = vec![0.0f32; 48_000];
+        poly_voice(220.0, &p, 48_000, &mut out, Some(24_000));
+        let held = &out[1000..23_000];
+        let hz = zero_crossings(held) as f32 / (held.len() as f32 / 48_000.0);
+        assert!((hz - 220.0).abs() < 2.0, "pitch {hz}");
+        let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+        assert!(rms(&out[20_000..23_000]) > 0.6, "sustained while held");
+        assert!(rms(&out[30_000..]).abs() < 1e-6, "silent after the 100 ms release");
+        assert!(out.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn the_filter_darkens_a_saw_and_unison_widens_nothing_it_should_not() {
+        let bright = PolyPatch { cutoff: 18_000.0, env_amount: 0.0, voices: 1, ..Default::default() };
+        let dark = PolyPatch { cutoff: 300.0, ..bright };
+        let (mut a, mut b) = (vec![0.0f32; 24_000], vec![0.0f32; 24_000]);
+        poly_voice(220.0, &bright, 48_000, &mut a, Some(20_000));
+        poly_voice(220.0, &dark, 48_000, &mut b, Some(20_000));
+        // high-frequency energy: the first difference
+        let hf = |v: &[f32]| v.windows(2).skip(2000).take(15_000).map(|w| (w[1] - w[0]).powi(2)).sum::<f32>();
+        assert!(hf(&b) < 0.1 * hf(&a), "a 300 Hz cutoff removes most of the saw's highs: {} vs {}", hf(&b), hf(&a));
+    }
+
+    #[test]
+    fn a_note_retunes_a_poly_like_a_sine() {
+        let k = SynthKind::Poly { hz: 261.63, patch: PolyPatch::default() };
+        let m = StepMod { tune: 12, ..Default::default() };
+        match apply_step_mod(&k, &m, None) { SynthKind::Poly { hz, .. } => assert!((hz - 523.26).abs() < 0.01), other => panic!("{other:?}") }
     }
 }

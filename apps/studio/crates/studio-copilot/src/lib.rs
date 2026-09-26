@@ -431,7 +431,8 @@ pub fn change_song_key(rack: &studio_live::Rack, from: studio_fx::retune::Scale,
             studio_live::SynthKind::Sub { note, .. } => {
                 *note = note.saturating_add(delta as i8);
             }
-            studio_live::SynthKind::Sine { hz } => {
+            // melodic, like the sine: transposed with the song
+            studio_live::SynthKind::Sine { hz } | studio_live::SynthKind::Poly { hz, .. } => {
                 *hz *= 2f32.powf(delta as f32 / 12.0);
             }
             // TRANSPOSED, because a soundfont is a melodic instrument.

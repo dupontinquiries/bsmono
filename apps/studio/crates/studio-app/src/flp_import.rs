@@ -217,6 +217,40 @@ fn auto_value(segs: &[AutoSeg], t: f64) -> Option<f64> {
     pts.last().map(|p| p.1)
 }
 
+/// A plugin synth's stand-in: a POLY patch guessed from the channel's name
+/// (Omnisphere and VST channels are usually named for their patch --
+/// "pain_bass", "batman_strings", "lotusflute"), or a bass when every note sits
+/// below C4. A few dozen bytes instead of a sample library; a guess by name,
+/// to be tuned against the artist's renders. Returns (family, patch).
+pub fn patch_for(name: &str, all_low: bool) -> (&'static str, studio_live::PolyPatch) {
+    use studio_live::PolyPatch as P;
+    let n = name.to_lowercase();
+    let has = |ws: &[&str]| ws.iter().any(|w| n.contains(w));
+    let base = P { gain: 1.0, ..P::default() };
+    if all_low || has(&["bass", "808", "sub"]) {
+        ("bass", P { wave: 2, voices: 1, detune: 0.0, sub: 0.5, attack_ms: 3.0, decay_ms: 250.0, sustain: 0.8, release_ms: 120.0,
+                     cutoff: 350.0, resonance: 0.15, env_amount: 1.5, ..base })
+    } else if has(&["flute", "whistle", "ocarina"]) {
+        ("flute", P { wave: 0, voices: 1, detune: 0.0, attack_ms: 60.0, decay_ms: 200.0, sustain: 0.9, release_ms: 200.0,
+                      cutoff: 6000.0, env_amount: 0.0, vibrato: 15.0, ..base })
+    } else if has(&["pluck", "guitar", "harp", "bell", "bottle", "kalimba", "marimba", "mallet"]) {
+        ("pluck", P { wave: 3, voices: 2, detune: 4.0, attack_ms: 2.0, decay_ms: 350.0, sustain: 0.0, release_ms: 200.0,
+                      cutoff: 1500.0, resonance: 0.3, env_amount: 2.5, ..base })
+    } else if has(&["key", "piano", "rhodes", "wurli", "organ"]) {
+        ("keys", P { wave: 1, voices: 2, detune: 4.0, attack_ms: 3.0, decay_ms: 900.0, sustain: 0.3, release_ms: 400.0,
+                     cutoff: 4000.0, env_amount: 1.0, ..base })
+    } else if has(&["string", "choir", "vox", "voice", "violin", "cello"]) {
+        ("strings", P { wave: 2, voices: 5, detune: 12.0, attack_ms: 250.0, decay_ms: 600.0, sustain: 0.85, release_ms: 700.0,
+                        cutoff: 2600.0, env_amount: 0.5, vibrato: 8.0, ..base })
+    } else if has(&["pad", "atmos", "ambient", "space", "transmission", "dystopian", "desert", "echo", "drone", "texture"]) {
+        ("pad", P { wave: 2, voices: 5, detune: 16.0, attack_ms: 400.0, decay_ms: 800.0, sustain: 0.8, release_ms: 900.0,
+                    cutoff: 1800.0, resonance: 0.1, env_amount: 0.8, ..base })
+    } else {
+        ("lead", P { wave: 2, voices: 3, detune: 10.0, attack_ms: 20.0, decay_ms: 400.0, sustain: 0.6, release_ms: 400.0,
+                     cutoff: 2500.0, env_amount: 1.0, ..base })
+    }
+}
+
 /// Steps per pattern at most (the rack rows are a u64 bitmask).
 const MAX_STEPS: u32 = 64;
 
@@ -365,10 +399,9 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
             }
         } else {
             let low = keys.get(fl).is_some_and(|k| !k.is_empty() && k.iter().all(|k| *k < 48));
-            stand_ins.push(format!("{} ({}) -> {}", ch_name(c), if plugin.is_empty() { "plugin" } else { &plugin },
-                                   if low { "Sub" } else { "Sine" }));
-            if low { SynthKind::Sub { note: 0, glide_from: None, glide_ms: 0.0, drive: 0.0, decay_ms: 400.0 } }
-            else { SynthKind::Sine { hz: 261.63 } }
+            let (family, patch) = patch_for(&ch_name(c), low);
+            stand_ins.push(format!("{} ({}) -> Poly {family}", ch_name(c), if plugin.is_empty() { "plugin" } else { &plugin }));
+            SynthKind::Poly { hz: 261.63, patch }
         };
         rack_ix.insert(*fl, rack.channels.len());
         let pan = fl_pan(f(&c["pan"]).unwrap_or(6400.0));
@@ -377,14 +410,19 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         // vocal chop (an idea the artist never committed to) through its
         // busiest pattern on a full-level stand-in: the loudest thing in the mix.
         let off = c["enabled"].as_bool() == Some(false);
-        let is_stand_in = matches!(kind, SynthKind::Sine { .. } | SynthKind::Sub { .. });
-        let trim = if is_stand_in { 10f32.powf(STAND_IN_TRIM_DB / 20.0) } else { 1.0 };
+        let is_stand_in = matches!(kind, SynthKind::Sine { .. } | SynthKind::Sub { .. } | SynthKind::Poly { .. });
+        // Poly patches are already quieter than a full-scale sine (filter,
+        // envelope, unison normalisation): with the sine's -10 dB trim too, A
+        // Top A Tower's synths-only stretch (5:18-5:40) read -29.5 dB against
+        // the artist's -19.6; untrimmed, ~-19.5. So Poly: 0 dB; the legacy
+        // Sine / Sub stand-ins keep STAND_IN_TRIM_DB.
+        let trim = if matches!(kind, SynthKind::Poly { .. }) { 1.0 } else if is_stand_in { 10f32.powf(STAND_IN_TRIM_DB / 20.0) } else { 1.0 };
         if off { switched_off.push(ch_name(c)); }
         rack.channels.push(Channel { name: ch_name(c), kind, gain: (channel_gain(c, media) * trim).clamp(0.0, 64.0),
                                      pan, muted: off, choke_group: None });
     }
     if !stand_ins.is_empty() {
-        report.push(format!("{} plugin synth{} cannot be hosted and their sound is not in the file -- STAND-INS at {STAND_IN_TRIM_DB} dB (the patches' level is unknown; calibrated on one song where only synths play), notes kept: {}",
+        report.push(format!("{} plugin synth{} cannot be hosted and their sound is not in the file -- STAND-INS, Poly patches guessed by name (level calibrated on one song where only synths play), notes kept: {}",
             stand_ins.len(), if stand_ins.len() == 1 { "" } else { "s" }, stand_ins.join("; ")));
     }
 
@@ -991,9 +1029,15 @@ mod tests {
         let omni = im.rack.channels.iter().position(|c| c.name == "Omnisphere").unwrap();
         assert_eq!(beat.roll(omni)[0].key, 7, "G5 is 7 above C5");
         assert_eq!(beat.roll(omni)[0].len, 4);
-        assert!(matches!(im.rack.channels[omni].kind, SynthKind::Sine { .. }));
+        assert!(matches!(im.rack.channels[omni].kind, SynthKind::Poly { .. }), "a plugin synth: a Poly stand-in");
         let bass = im.rack.channels.iter().position(|c| c.name == "Bass").unwrap();
-        assert!(matches!(im.rack.channels[bass].kind, SynthKind::Sub { .. }), "all notes below C4: a Sub stand-in");
+        assert!(matches!(im.rack.channels[bass].kind, SynthKind::Poly { patch, .. } if patch.sub > 0.0 && patch.cutoff < 500.0),
+                "all notes below C4 (and named Bass): the bass patch");
+        assert_eq!(patch_for("batman_strings", false).0, "strings");
+        assert_eq!(patch_for("lotusflute #2", false).0, "flute");
+        assert_eq!(patch_for("pain_bass", false).0, "bass");
+        assert_eq!(patch_for("dystopian_hemmorag", false).0, "pad");
+        assert_eq!(patch_for("Omnisphere #7", false).0, "lead", "a name that says nothing: the default");
         assert!(im.rack.channels[bass].muted, "switched off in FL: muted here, not dropped");
         assert!(!im.rack.channels[omni].muted);
         assert!(im.report.iter().any(|r| r.contains("switched off in FL: Bass")), "{:?}", im.report);
