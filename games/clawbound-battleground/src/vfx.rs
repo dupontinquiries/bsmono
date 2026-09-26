@@ -132,6 +132,8 @@ pub struct Vfx {
     pub gusts: Vec<Gust>,
     crumble_t: f32,
     crumble_seed: u64,
+    /// Seconds to the next mote of starlight up each lift (`lift`).
+    lift_mote_t: f32,
 }
 
 /// A dash's wake through cloud: from `from` to `to`, `age` seconds ago.
@@ -609,6 +611,48 @@ impl Vfx {
                         drag: 1.6,
                     });
                 }
+            }
+        }
+        // the lifts: a column of starlight motes rising off every pad --
+        // the tall one up from the islands to over the Aerie, a short one
+        // from each top pad -- and a trail streaming off anyone riding
+        self.lift_mote_t -= dt;
+        while self.lift_mote_t <= 0.0 {
+            self.lift_mote_t += 0.03;
+            let top = crate::sky::UPPER_Y + crate::lift::CREST;
+            for (k, (lo, hi)) in crate::sky::lifts().into_iter().enumerate() {
+                for (pad, low) in [(lo, true), (lo, true), (hi, false)] {
+                    let a = self.perturb(3.0 + k as f32 * 0.7) * 3.1416;
+                    let r = crate::lift::PAD_R * (0.3 + 0.35 * (self.perturb(1.0 + k as f32 * 0.3) + 1.0));
+                    let speed = 6.5 + self.perturb(1.5);
+                    let life = if low { (top - lo.y) / speed } else { 1.4 };
+                    let gold = self.perturb(1.0 + k as f32 * 1.3) > 0.4;
+                    self.particles.push(Particle {
+                        pos: pad + Vec3::new(a.cos() * r, 0.2, a.sin() * r),
+                        vel: Vec3::new(-a.sin(), 0.0, a.cos()) * 0.8 + Vec3::Y * speed,
+                        life,
+                        max_life: life,
+                        size: if gold { 0.3 } else { 0.4 },
+                        color: if gold { [1.0, 0.9, 0.62] } else { [0.8, 0.9, 1.0] },
+                        alpha: 0.75,
+                        gravity: 0.0,
+                        drag: 0.0,
+                    });
+                }
+            }
+            for g in game.gods.iter().filter(|g| g.lift.is_some() && g.respawn_t <= 0.0) {
+                let j = self.perturb(0.6);
+                self.particles.push(Particle {
+                    pos: g.pos + Vec3::new(j, 0.4 + j.abs(), -j),
+                    vel: Vec3::new(j * 2.0, -1.0, -j * 2.0),
+                    life: 0.8,
+                    max_life: 0.8,
+                    size: 0.3,
+                    color: [1.0, 0.94, 0.75],
+                    alpha: 0.8,
+                    gravity: 0.0,
+                    drag: 1.0,
+                });
             }
         }
         // crumbling: now and then a piece of an island's edge near the

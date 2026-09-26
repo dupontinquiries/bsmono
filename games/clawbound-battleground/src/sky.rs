@@ -239,10 +239,84 @@ pub fn islands() -> Vec<Island> {
     v
 }
 
-/// The walkable floor.
+/// The Aerie: the upper layer, [`UPPER_Y`] above the islands, over the
+/// inner chasms between the Moonwell, the glades and the terrace. Small on
+/// purpose -- three islets a half -- and every islet joined to both others
+/// by a sky-bridge and served by its own lift, so there are always three
+/// ways up and a fight can come from any side: a lookout, not a fortress.
+/// Nothing of it lies over the lower floor (the two layers never touch in
+/// plan: `tests::the_aerie_floats_clear_of_the_islands`).
+pub const UPPER_Y: f32 = 20.0;
+/// The Aerie's islets (blue half, mirrored): x, z, radius.
+// (The side islets sat at (+-45, -80) first, in the chasm the Moonwyrm's
+// loop dives through; `wyrmflight`'s test keeps the loop wide of them.)
+pub const AERIE: [(f32, f32, f32); 3] = [(0.0, -100.0, 13.0), (-21.0, -72.0, 10.0), (21.0, -72.0, 10.0)];
+/// Its sky-bridges, islet to islet: every pair.
+pub const AERIE_BRIDGES: [(usize, usize); 3] = [(0, 1), (0, 2), (1, 2)];
+pub const AERIE_BRIDGE_R: f32 = 3.0;
+/// The lifts (blue half, mirrored): a pad on the islands below and one on
+/// an islet of the Aerie above (`lift`).
+pub const LIFTS: [((f32, f32), (f32, f32)); 3] = [((0.0, -134.0), (0.0, -106.0)), ((-92.0, -104.0), (-26.0, -76.0)), ((92.0, -104.0), (26.0, -76.0))];
+
+/// The Aerie's walkable shapes, both halves, at plan level (their height is
+/// `floor_height`).
+fn aerie_shapes() -> Vec<Shape> {
+    let mut s = Vec::new();
+    let isle = |k: usize| at(AERIE[k].0, AERIE[k].1);
+    for zs in [1.0f32, -1.0] {
+        for (x, z, r) in AERIE {
+            s.push(Shape::Circle { x, z: z * zs, r });
+        }
+        for (k, &(a, b)) in AERIE_BRIDGES.iter().enumerate() {
+            // a gentle bend, like the causeways below: laid for the blue
+            // half and mirrored point for point, so both halves are one walk
+            let w = causeway_way(isle(a), isle(b), AERIE_BRIDGE_R, k + 1);
+            let w = Way { pts: w.pts.iter().map(|p| Vec3::new(p.x, p.y, p.z * zs)).collect(), r: w.r };
+            for i in 0..w.pts.len() - 1 {
+                s.push(Shape::Segment { x0: w.pts[i].x, z0: w.pts[i].z, x1: w.pts[i + 1].x, z1: w.pts[i + 1].z, r: (w.r[i] + w.r[i + 1]) * 0.5 });
+            }
+        }
+    }
+    s
+}
+
+/// The Aerie's floor alone.
+pub fn upper_floor() -> &'static FloorPlan {
+    static F: OnceLock<FloorPlan> = OnceLock::new();
+    F.get_or_init(|| FloorPlan::new(aerie_shapes()))
+}
+
+/// The islands' floor alone (everything below the Aerie).
+pub fn lower_floor() -> &'static FloorPlan {
+    static F: OnceLock<FloorPlan> = OnceLock::new();
+    F.get_or_init(|| FloorPlan::new(lower_shapes()))
+}
+
+/// Every lift, both halves: (pad below, pad above).
+pub fn lifts() -> Vec<(Vec3, Vec3)> {
+    let mut v = Vec::new();
+    for zs in [1.0f32, -1.0] {
+        for &((ax, az), (bx, bz)) in &LIFTS {
+            v.push((at(ax, az * zs), Vec3::new(bx, UPPER_Y, bz * zs)));
+        }
+    }
+    v
+}
+
+/// The walkable floor: the islands and the Aerie together (they never
+/// touch in plan, so walking cannot get from one to the other; the lifts
+/// do that, and a leap down).
 pub fn floor() -> &'static FloorPlan {
     static F: OnceLock<FloorPlan> = OnceLock::new();
     F.get_or_init(|| {
+        let mut s = lower_shapes();
+        s.extend(aerie_shapes());
+        FloorPlan::new(s)
+    })
+}
+
+fn lower_shapes() -> Vec<Shape> {
+    {
         let mut s = Vec::new();
         let seg = |a: Vec3, b: Vec3, r: f32| Shape::Segment { x0: a.x, z0: a.z, x1: b.x, z1: b.z, r };
         for lane in [Lane::Top, Lane::Bot] {
@@ -271,13 +345,22 @@ pub fn floor() -> &'static FloorPlan {
                 s.push(Shape::Circle { x: p.x, z: p.z, r: *r });
             }
         }
-        FloorPlan::new(s)
-    })
+        s
+    }
 }
 
-/// Everything walkable is level.
-pub fn floor_height(_x: f32, _z: f32) -> f32 {
-    0.0
+/// Is (x, z) the Aerie's (nearer its floor than the islands')?
+pub fn on_aerie(x: f32, z: f32) -> bool {
+    upper_floor().sdf(x, z) < lower_floor().sdf(x, z)
+}
+
+/// The walkable floor's height: the islands at 0, the Aerie at `UPPER_Y`.
+pub fn floor_height(x: f32, z: f32) -> f32 {
+    if on_aerie(x, z) {
+        UPPER_Y
+    } else {
+        0.0
+    }
 }
 
 /// The two wild beasts' grounds (`bosses`): on the west glade of the blue
@@ -406,7 +489,11 @@ pub const RIM_W: f32 = 3.0;
 /// well, an ice lip at the edge, then the drop into the sky.
 pub fn terrain_height(x: f32, z: f32) -> f32 {
     let d = floor().sdf(x, z);
+    let base = floor_height(x, z);
     if d <= 0.0 {
+        if base > 0.0 {
+            return base + 0.1 * (crate::pass::vnoise(x * 0.35, z.abs() * 0.35) - 0.5);
+        }
         let r = x.hypot(z);
         if r < POOL_R + 1.5 {
             let t = 1.0 - ((r - POOL_R + 1.5).max(0.0) / 3.0).clamp(0.0, 1.0);
@@ -419,12 +506,36 @@ pub fn terrain_height(x: f32, z: f32) -> f32 {
         // the lip: up and over, a little broken
         let t = d / RIM_W;
         let n = 0.6 + 0.8 * hash2((x * 0.5).floor(), (z.abs() * 0.5).floor());
-        return RIM_H * n * (t * std::f32::consts::PI).sin();
+        return base + RIM_H * n * (t * std::f32::consts::PI).sin();
     }
     // past the lip, open sky: nothing is drawn there (`in_void`); the
     // height only says "far down" (the Moonwyrm's chasm dives read it)
+    void_depth(d)
+}
+
+fn void_depth(d: f32) -> f32 {
     let t = ((d - RIM_W) / 3.0).clamp(0.0, 1.0);
     -40.0 * t * t * (3.0 - 2.0 * t)
+}
+
+/// [`terrain_height`] of the islands alone, as if the Aerie were not
+/// there: what lies under the Aerie's bridges (the Moonwyrm dives beneath
+/// them). The islands' floor is at 0, so only the lip and the pool matter.
+pub fn islands_height(x: f32, z: f32) -> f32 {
+    let d = lower_floor().sdf(x, z);
+    if d <= 0.0 {
+        let r = x.hypot(z);
+        if r < POOL_R + 1.5 {
+            return terrain_height(x, z);
+        }
+        return 0.1 * (crate::pass::vnoise(x * 0.35, z.abs() * 0.35) - 0.5);
+    }
+    if d < RIM_W {
+        let t = d / RIM_W;
+        let n = 0.6 + 0.8 * hash2((x * 0.5).floor(), (z.abs() * 0.5).floor());
+        return RIM_H * n * (t * std::f32::consts::PI).sin();
+    }
+    void_depth(d)
 }
 
 #[cfg(test)]
@@ -580,12 +691,67 @@ mod tests {
         assert!(floor().sdf(mid.x, mid.z) < -2.0);
     }
 
+    /// The Aerie floats: none of it over or touching the islands in plan
+    /// (so no one walks up into it), it is small, its islets are all joined
+    /// to each other, both halves are the same, and every lift runs from
+    /// floor below to floor above.
+    #[test]
+    fn the_aerie_floats_clear_of_the_islands() {
+        let (up, low) = (upper_floor(), lower_floor());
+        let (mut up_n, mut low_n) = (0usize, 0usize);
+        let mut x = -320.0;
+        while x < 320.0 {
+            let mut z = -320.0;
+            while z < 320.0 {
+                if up.sdf(x, z) < 0.0 {
+                    up_n += 1;
+                    assert!(low.sdf(x, z) > 4.0, "the Aerie at ({x}, {z}) comes within 4 u of the islands in plan");
+                    assert!((floor_height(x, z) - UPPER_Y).abs() < 1e-3);
+                    assert!(up.sdf(x, -z) < 0.5, "mirrored");
+                }
+                if low.sdf(x, z) < 0.0 {
+                    low_n += 1;
+                    assert_eq!(floor_height(x, z), 0.0);
+                }
+                z += 2.0;
+            }
+            x += 2.0;
+        }
+        assert!(up_n > 0 && up_n * 12 < low_n, "small: {up_n} cells up, {low_n} below");
+        // every islet reaches both others over its sky-bridges
+        let links = up.links();
+        for zs in [1.0f32, -1.0] {
+            let ids: Vec<usize> = AERIE.iter().map(|&(x, z, _)| up.shape_at(x, z * zs).unwrap()).collect();
+            for &a in &ids {
+                let mut seen = vec![false; links.len()];
+                let mut stack = vec![a];
+                while let Some(u) = stack.pop() {
+                    if !std::mem::replace(&mut seen[u], true) {
+                        stack.extend(links[u].iter().map(|l| l.to));
+                    }
+                }
+                assert!(ids.iter().all(|&b| seen[b]), "islets joined");
+            }
+        }
+        // lifts: a pad on the islands, a pad on the Aerie, one per islet
+        let ls = lifts();
+        assert_eq!(ls.len(), 2 * AERIE.len());
+        for (lo, hi) in &ls {
+            assert!(low.sdf(lo.x, lo.z) < -2.5 && lo.y == 0.0, "pad below at {lo} on the islands");
+            assert!(up.sdf(hi.x, hi.z) < -2.5 && hi.y == UPPER_Y, "pad above at {hi} on the Aerie");
+        }
+        for &(x, z, _) in &AERIE {
+            assert!(ls.iter().any(|(_, hi)| Vec3::new(hi.x - x, 0.0, hi.z - z).length() < 13.0), "a lift up to the islet at ({x}, {z})");
+        }
+    }
+
     #[test]
     fn the_pool_is_shallow_and_the_sky_is_deep() {
         assert!(terrain_height(0.0, 0.0) < -0.4 && terrain_height(0.0, 0.0) > -1.0);
         assert!(in_pool(3.0, 4.0) && !in_pool(POOL_R + 1.0, 0.0));
         // between the terrace and the Moonwell: open sky down to the clouds
-        assert!(floor().sdf(0.0, -95.0) > 20.0);
-        assert!(in_void(0.0, -95.0) && terrain_height(0.0, -95.0) < -12.0);
+        assert!(lower_floor().sdf(0.0, -95.0) > 20.0);
+        // (and at (0, -120), between the terrace and the Aerie above it)
+        assert!(in_void(0.0, -120.0) && terrain_height(0.0, -120.0) < -12.0);
     }
 }

@@ -2152,7 +2152,8 @@ fn sky_underside(verts: &mut Vec<TerrainVert>, idx: &mut Vec<u32>, void: &[bool]
             let up = Vec3::new(dl - dr, 2.0 * step, dd - du).normalize_or(Vec3::Y);
             let n = Vec3::new(up.x, -up.y, up.z).normalize_or(-Vec3::Y);
             remap[k] = verts.len() as u32;
-            verts.push(TerrainVert { pos: [x, if rim { y } else { -d }, z], normal: n.to_array(), color: sky_underside_color(x, z, d), mat: 5.0 });
+            // (the Aerie's islets hang from their own height)
+            verts.push(TerrainVert { pos: [x, if rim { y } else { crate::sky::floor_height(x, z) - d }, z], normal: n.to_array(), color: sky_underside_color(x, z, d), mat: 5.0 });
         }
     }
     for t in 0..top_idx / 3 {
@@ -2241,7 +2242,8 @@ fn sky_ground_color(x: f32, z: f32, h: f32, slope: f32, n1: f32, n2: f32, nm: f3
         let snow = [0.86 + n2 * 0.05, 0.89 + n2 * 0.05, 0.95 + n2 * 0.03];
         // alpine meadow: sage, frosted (a saturated teal read as water)
         let meadow = [0.40 + n1 * 0.05, 0.52 + n2 * 0.05, 0.38 + n1 * 0.04];
-        if road < sky::LANE_R - 1.5 {
+        // (the lanes run under the Aerie, not over it)
+        if road < sky::LANE_R - 1.5 && !sky::on_aerie(x, z) {
             // flagstones: faint joints every ~3 u
             let joint = ((x * 0.33).fract() < 0.06) as i32 as f32 * 0.5 + ((z * 0.33).fract() < 0.06) as i32 as f32 * 0.5;
             let c = lerp(stone, [0.52, 0.55, 0.62], joint.min(1.0) * 0.5);

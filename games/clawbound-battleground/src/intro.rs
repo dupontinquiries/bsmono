@@ -317,8 +317,11 @@ impl Intro {
                 };
                 let (p, ahead) = (smooth_at(d), smooth_at(d + 22.0));
                 let side = { let f = (ahead - p).normalize_or_zero(); Vec3::new(-f.z, 0.0, f.x) };
-                let shot = Shot { eye: p + Vec3::Y * 7.0 + side * 3.0, target: ahead + Vec3::Y * 2.0, fov_y: 0.95 };
                 let sky = crate::map::active() == crate::map::MapId::Sky;
+                // Starwell's route to the well runs under the Aerie: that
+                // run is flown over it instead
+                let over = if sky && lane == Lane::Mid { crate::sky::UPPER_Y + 6.0 } else { 0.0 };
+                let shot = Shot { eye: p + Vec3::Y * (7.0 + over) + side * 3.0, target: ahead + Vec3::Y * (2.0 + over * 0.7), fov_y: 0.95 };
                 o.caption = Some(match (lane, sky) {
                     (Lane::Top, false) => "TOP LANE",
                     (Lane::Mid, false) => "MID LANE",

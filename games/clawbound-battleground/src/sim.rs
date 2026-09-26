@@ -211,6 +211,10 @@ pub struct GodUnit {
     /// Falling into the cloud sea: seconds until the Starwell sets the cat
     /// down at home.
     pub skyfall: Option<f32>,
+    /// On a starlight lift between the islands and the Aerie (`lift`), and
+    /// the pad it is standing on (it rides again only once off it).
+    pub lift: Option<crate::lift::Ride>,
+    pub lift_pad: Option<u8>,
     /// A Moonwell boon (`moonwell`) and the seconds it has left, and the
     /// number of the claim it came from (one per cat per claim).
     pub boon: Option<(crate::moonwell::Boon, f32)>,
@@ -517,6 +521,8 @@ impl Game {
                 riding: None,
                 ride_plan: None,
                 skyfall: None,
+                lift: None,
+                lift_pad: None,
                 boon: None,
                 boon_claim: 0,
                 fall: None,
@@ -819,7 +825,7 @@ impl Game {
                     }
                     let near = |v: &GodUnit| v.team == team && v.respawn_t <= 0.0 && v.pos.distance(e.pos) <= crate::skycloud::SIGHT_RANGE;
                     let by_cat = self.gods.iter().any(|v| near(v) && crate::skycloud::sees(&cs, v.pos, e.pos));
-                    let open_air = crate::skycloud::density(&cs, e.pos.x, e.pos.z) < 0.4 && !self.gods.iter().any(|v| near(v));
+                    let open_air = crate::skycloud::density_at(&cs, e.pos) < 0.4 && !self.gods.iter().any(|v| near(v));
                     let by_tower = self.towers.iter().any(|t| t.team == team && t.hp > 0.0 && t.pos.distance(e.pos) < crate::consts::TOWER_RANGE + 2.0);
                     let at_base = team.base_pos().distance(e.pos) < 40.0;
                     seen[j] = by_cat || open_air || by_tower || at_base;

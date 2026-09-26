@@ -2103,3 +2103,150 @@ mod elder {
         }
     }
 }
+
+mod lifts {
+    use clawbound::lift::{CREST, PAD_R, RIDE_SECS};
+    use clawbound::map::{self, MapId};
+    use clawbound::sim::Game;
+    use clawbound::sky::{self, UPPER_Y};
+    use glam::Vec3;
+
+    fn quiet(g: &mut Game) {
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+            c.is_player = false;
+            c.move_dir = Vec3::ZERO;
+        }
+        g.minions.clear();
+    }
+
+    /// Walk cat 0 toward `to` for at most `secs`, stopping when a ride
+    /// starts; returns whether one did.
+    fn walk_onto(g: &mut Game, to: Vec3, secs: f32) -> bool {
+        for _ in 0..(secs * 60.0) as usize {
+            let d = Vec3::new(to.x - g.gods[0].pos.x, 0.0, to.z - g.gods[0].pos.z);
+            g.gods[0].move_dir = if d.length() > 0.3 { d.normalize() } else { Vec3::ZERO };
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+            if g.gods[0].lift.is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns the highest point of the ride.
+    fn ride(g: &mut Game) -> f32 {
+        let mut top = f32::MIN;
+        for _ in 0..((RIDE_SECS + 0.5) * 60.0) as usize {
+            g.gods[0].move_dir = Vec3::X; // steering does nothing
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+            top = top.max(g.gods[0].pos.y);
+            match g.gods[0].lift {
+                // on the updraft's path, whatever the stick says, and not
+                // falling (it is over the sky for most of the way)
+                Some(r) => assert!(g.gods[0].pos.distance(r.at(r.t)) < 1e-3 && g.gods[0].fall.is_none(), "carried: {} vs {}", g.gods[0].pos, r.at(r.t)),
+                None => break,
+            }
+        }
+        g.gods[0].move_dir = Vec3::ZERO;
+        top
+    }
+
+    /// Up: step on a pad on the islands, ride the updraft over the Aerie
+    /// and down onto its pad; stand there without being taken again; walk
+    /// the Aerie at its height; step off and back on and ride down.
+    #[test]
+    fn an_updraft_takes_a_cat_up_to_the_aerie_and_back() {
+        map::with(MapId::Sky, || {
+            let mut g = Game::new_teams(&[0], &[1]);
+            quiet(&mut g);
+            g.gods[1].pos = Vec3::new(0.0, 0.0, 150.0);
+            let (lo, hi) = sky::lifts()[1];
+            // walk in from a few paces off
+            let start = lo + (Vec3::new(0.0, 0.0, 0.0) - lo).normalize() * 6.0;
+            g.gods[0].pos = Vec3::new(start.x, map::ground_y(start.x, start.z), start.z);
+            assert!(walk_onto(&mut g, lo, 4.0), "the pad takes a cat that steps onto it");
+            let top = ride(&mut g);
+            let p = g.gods[0].pos;
+            assert!(g.gods[0].lift.is_none(), "set down");
+            assert!(Vec3::new(p.x - hi.x, 0.0, p.z - hi.z).length() < PAD_R && (p.y - UPPER_Y).abs() < 0.2, "on the Aerie's pad: {p}");
+            assert!(top > UPPER_Y + CREST * 0.8, "up over the Aerie on the way: {top}");
+            // standing on the pad it arrived on: not taken back down
+            for _ in 0..120 {
+                g.tick(1.0 / 60.0);
+                g.events.clear();
+            }
+            assert!(g.gods[0].lift.is_none() && (g.gods[0].pos.y - UPPER_Y).abs() < 0.2, "stays up: {}", g.gods[0].pos);
+            // walk the Aerie to the next islet: at the Aerie's height all the way
+            let (x, z, _) = sky::AERIE[0];
+            let other = Vec3::new(x, UPPER_Y, z);
+            for _ in 0..(3 * 60) {
+                let d = Vec3::new(other.x - g.gods[0].pos.x, 0.0, other.z - g.gods[0].pos.z);
+                g.gods[0].move_dir = d.normalize_or_zero();
+                g.tick(1.0 / 60.0);
+                g.events.clear();
+                let q = g.gods[0].pos;
+                assert!(sky::on_aerie(q.x, q.z) && (q.y - UPPER_Y).abs() < 0.3, "walking the Aerie: {q}");
+            }
+            // back onto the top pad and down
+            assert!(walk_onto(&mut g, hi, 6.0), "the top pad takes it down");
+            ride(&mut g);
+            let p = g.gods[0].pos;
+            assert!(Vec3::new(p.x - lo.x, 0.0, p.z - lo.z).length() < PAD_R && p.y.abs() < 0.3, "back on the islands' pad: {p}");
+        });
+    }
+
+    /// A star burns its own layer: one landing on a lift's lower pad burns
+    /// a cat standing beside the pad, not the cat riding the updraft high
+    /// over it. (The Aerie lies farther than a star's reach from the
+    /// islands in plan, `sky` tests, so riders are where it matters.)
+    #[test]
+    fn a_star_burns_only_its_own_layer() {
+        use clawbound::wyrmflight::Starfall;
+        map::with(MapId::Sky, || {
+            let mut g = Game::new_teams(&[0], &[1]);
+            quiet(&mut g);
+            let (lo, _) = sky::lifts()[0];
+            let start = lo + Vec3::new(0.0, 0.0, -5.0);
+            g.gods[0].pos = Vec3::new(start.x, map::ground_y(start.x, start.z), start.z);
+            // red waits by the pad, out of the pad's reach
+            let by = lo + Vec3::new(3.5, 0.0, 0.0);
+            g.gods[1].pos = Vec3::new(by.x, map::ground_y(by.x, by.z), by.z);
+            assert!(walk_onto(&mut g, lo, 3.0));
+            while g.gods[0].pos.y < 14.0 {
+                g.tick(1.0 / 60.0);
+                g.events.clear();
+            }
+            let rider = g.gods[0].pos;
+            assert!(Vec3::new(rider.x - lo.x, 0.0, rider.z - lo.z).length() < 4.0, "still over the pad: {rider}");
+            g.starfalls.push(Starfall { at: lo, from: lo + Vec3::Y * 60.0, left: 0.001, dmg: 150.0 });
+            let hp = [g.gods[0].hp, g.gods[1].hp];
+            g.tick(1.0 / 60.0);
+            assert!(g.gods[1].hp < hp[1] - 50.0, "the cat beside the pad is burned");
+            assert!(g.gods[0].hp >= hp[0] - 1e-3, "the rider high above is not");
+        });
+    }
+
+    /// Bots keep to their lanes: one standing on a pad is not taken.
+    /// And the other maps have no lifts.
+    #[test]
+    fn bots_do_not_ride_and_other_maps_have_no_lifts() {
+        map::with(MapId::Sky, || {
+            let mut g = Game::new_teams(&[0], &[1]);
+            quiet(&mut g);
+            g.gods[1].pos = Vec3::new(0.0, 0.0, 150.0);
+            let (lo, _) = sky::lifts()[0];
+            g.gods[0].ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Top, 0.5));
+            g.gods[0].pos = lo;
+            for _ in 0..60 {
+                g.gods[0].move_dir = Vec3::ZERO;
+                g.tick(1.0 / 60.0);
+                g.events.clear();
+            }
+            assert!(g.gods[0].lift.is_none() && g.gods[0].pos.y < 1.0);
+        });
+        assert!(clawbound::lift::pads().is_empty());
+    }
+}

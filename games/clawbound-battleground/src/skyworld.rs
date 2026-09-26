@@ -35,6 +35,8 @@ pub enum Item {
     /// A nook in a cliff face under an island's lip, a tiny scene on its
     /// shelf (`skyprops::cliff_nook`), facing out along `facing`.
     Nook { at: Vec3, facing: Vec3, kind: u8, variant: i32 },
+    /// A lift pad (`lift`), at its floor's height.
+    Pad { at: Vec3, variant: i32 },
     /// A star lantern at a road's edge.
     Lantern { at: Vec3, variant: i32 },
     /// A broken marble column of the old ones.
@@ -68,7 +70,9 @@ pub fn placements() -> Vec<Item> {
 }
 
 fn placements_here() -> Vec<Item> {
-    let f = sky::floor();
+    // the islands' dressing is laid on the islands' floor alone: the Aerie
+    // (`sky::AERIE`) is dressed on its own below
+    let f = sky::lower_floor();
     let mut rng = Rng::new(0x5CA1_AB1E);
     let mut out = Vec::new();
     let mut both = |out: &mut Vec<Item>, it: Item| {
@@ -82,6 +86,7 @@ fn placements_here() -> Vec<Item> {
             Item::Nook { at, facing, kind, variant } => Item::Nook { at: flip(at), facing: flip(facing), kind, variant },
             Item::Lantern { at, variant } => Item::Lantern { at: flip(at), variant },
             Item::Column { at, variant } => Item::Column { at: flip(at), variant },
+            Item::Pad { at, variant } => Item::Pad { at: flip(at), variant },
         };
         let on_axis = item_at(&it).z.abs() < 0.5;
         out.push(it);
@@ -206,6 +211,33 @@ fn placements_here() -> Vec<Item> {
             }
         }
     }
+
+    // The lift pads, both ends of every lift (`sky::lifts` is already
+    // both halves).
+    for (k, (lo, hi)) in sky::lifts().into_iter().enumerate() {
+        out.push(Item::Pad { at: lo, variant: k as i32 * 2 });
+        out.push(Item::Pad { at: hi, variant: k as i32 * 2 + 1 });
+    }
+
+    // The Aerie: star lanterns round each islet's rim and a broken column
+    // on the big one -- kept off its bridges' ends and its lift pad, which
+    // is where the walking goes.
+    let up = sky::upper_floor();
+    let pads: Vec<Vec3> = sky::lifts().into_iter().map(|(_, hi)| hi).collect();
+    for (k, &(x, z, r)) in sky::AERIE.iter().enumerate() {
+        for j in 0..8 {
+            let a = j as f32 / 8.0 * std::f32::consts::TAU + 0.3;
+            let at = Vec3::new(x + a.cos() * (r - 1.2), sky::UPPER_Y, z + a.sin() * (r - 1.2));
+            // off a bridge: a bridge end widens the floor past the rim
+            let open = up.sdf(at.x + a.cos() * 2.5, at.z + a.sin() * 2.5) < 0.0;
+            if !open && pads.iter().all(|p| p.distance(at) > crate::lift::PAD_R + 2.0) {
+                both(&mut out, Item::Lantern { at, variant: 40 + (k * 8 + j) as i32 });
+            }
+        }
+        if r > 12.0 {
+            both(&mut out, Item::Column { at: Vec3::new(x + 4.5, sky::UPPER_Y, z + 3.0), variant: 5 });
+        }
+    }
     out
 }
 
@@ -218,7 +250,8 @@ fn item_at(it: &Item) -> Vec3 {
         | Item::Shard { at, .. }
         | Item::Nook { at, .. }
         | Item::Lantern { at, .. }
-        | Item::Column { at, .. } => at,
+        | Item::Column { at, .. }
+        | Item::Pad { at, .. } => at,
     }
 }
 
@@ -275,12 +308,15 @@ pub fn build() -> (Vec<Piece>, Blockers) {
                 pieces.push(Piece { mesh: turned(skyprops::cliff_nook(kind, variant), yaw), pos: at, quarter: 0, vsize: skyprops::NOOK_VOX, sway: 0.0 });
             }
             Item::Lantern { at, variant } => {
-                blockers.push(Blocker { shape: Shape::Circle { x: at.x, z: at.z, r: 0.45 }, top: 2.8, cover: Cover::NONE });
+                blockers.push(Blocker { shape: Shape::Circle { x: at.x, z: at.z, r: 0.45 }, top: at.y + 2.8, cover: Cover::NONE });
                 pieces.push(Piece { mesh: skyprops::star_lantern(variant), pos: at, quarter: (variant % 4) as u8, vsize: 0.12, sway: 0.0 });
             }
             Item::Column { at, variant } => {
-                blockers.push(Blocker { shape: Shape::Circle { x: at.x, z: at.z, r: 1.3 }, top: 6.0, cover: Cover::NONE });
+                blockers.push(Blocker { shape: Shape::Circle { x: at.x, z: at.z, r: 1.3 }, top: at.y + 6.0, cover: Cover::NONE });
                 pieces.push(Piece { mesh: skyprops::marble(crate::props::ruin_pillar(1.0, variant), variant as f32 * 0.9), pos: at, quarter: (variant % 4) as u8, vsize: V_MED, sway: 0.0 });
+            }
+            Item::Pad { at, variant } => {
+                pieces.push(Piece { mesh: skyprops::lift_pad(crate::lift::PAD_R, variant), pos: at, quarter: 0, vsize: 0.15, sway: 0.0 });
             }
         }
     }
@@ -333,6 +369,24 @@ mod tests {
                 }
                 if let Item::Lantern { at, .. } | Item::Column { at, .. } = it {
                     assert!(sky::floor().fits(at.x, at.z, 0.8), "on the floor at {at}");
+                    // standing at its own floor's height, not the islands'
+                    // under an Aerie islet or the Aerie's over the islands
+                    assert!((at.y - sky::floor_height(at.x, at.z)).abs() < 1e-3, "at its floor's height: {at}");
+                }
+            }
+            // a pad on every lift end, level with its floor, and nothing
+            // solid on it or crowding it
+            let pads: Vec<Vec3> = items.iter().filter_map(|i| if let Item::Pad { at, .. } = i { Some(*at) } else { None }).collect();
+            assert_eq!(pads.len(), sky::lifts().len() * 2);
+            let aerie_lanterns = items.iter().filter(|i| matches!(i, Item::Lantern { at, .. } if at.y > 10.0)).count();
+            assert!((12..=48).contains(&aerie_lanterns), "lanterns on the Aerie {aerie_lanterns}");
+            for p in &pads {
+                assert!((p.y - sky::floor_height(p.x, p.z)).abs() < 1e-3, "a pad at its floor's height: {p}");
+                for it in &items {
+                    if matches!(it, Item::Lantern { .. } | Item::Column { .. } | Item::Statue { .. } | Item::Larch { .. } | Item::Arch { .. }) {
+                        let q = at(it);
+                        assert!(Vec3::new(q.x - p.x, 0.0, q.z - p.z).length() > crate::lift::PAD_R + 1.0 || (q.y - p.y).abs() > 10.0, "{it:?} crowds the pad at {p}");
+                    }
                 }
             }
         });
