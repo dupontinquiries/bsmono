@@ -219,6 +219,12 @@ struct Player {
     video_rect: Option<egui::Rect>,
     /// Why frames are not going to the plane (said once per change).
     scanout_why: String,
+    /// Mouse jitter guard (Settings > controls): motion must be deliberate
+    /// to bring the controls back.
+    deadzone: vidkit_egui::chrome::PointerDeadzone,
+    /// Height of the bottom controls overlay last frame (subtitles sit
+    /// above it while it shows).
+    chrome_overlay_h: f32,
     /// The dma-buf frame on screen (zero-copy), returned to its decoder when
     /// the next frame replaces it.
     held: Option<vidkit_core::Frame>,
@@ -453,6 +459,8 @@ impl Player {
             scanout_why: String::new(),
             present_log: vidkit_wayland::cadence::PresentLog::new(240),
             last_grain: false,
+            deadzone: vidkit_egui::chrome::PointerDeadzone::new(6.0),
+            chrome_overlay_h: 0.0,
             held: None,
             latency: vidkit_wayland::cadence::LatencyTracker::new(15, 100_000_000),
             pip: Default::default(),
@@ -468,6 +476,7 @@ impl Player {
             analysis_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         me.wl = wayland_link(cc);
+        me.settings.pointer_deadzone = me.prefs.pointer_deadzone as f32;
         // The video plane, when asked for (VIDKIT_SCANOUT=1|force) and the
         // GL presenter is up (it paints the hole).
         if me.gpu.is_some() && vidkit_wayland::scanout::Mode::parse(std::env::var("VIDKIT_SCANOUT").ok().as_deref()) != vidkit_wayland::scanout::Mode::Off {
@@ -836,9 +845,22 @@ impl eframe::App for Player {
         // what happened, and only a screenshot showed it: the policy had the
         // rule and the player never asked.
         let tap_only_reveals = self.chrome.tap_reveals();
-        let moved = ctx.input(|i| {
-            i.pointer.velocity().length() > 0.5 || i.pointer.any_down() || !i.events.is_empty()
+        // Buttons, touches, scrolling and keys always count; bare pointer
+        // motion only past the jitter guard (a bumped couch mouse or a
+        // brushed trackpad moved a few pixels and brought the controls back
+        // over the film). Pointer-move events used to count as "events".
+        let (pos, intent) = ctx.input(|i| {
+            let intent = i.pointer.any_down()
+                || i.events.iter().any(|e| !matches!(e, egui::Event::PointerMoved(_) | egui::Event::MouseMoved(_) | egui::Event::PointerGone | egui::Event::WindowFocused(_)));
+            (i.pointer.latest_pos().map(|p| [p.x, p.y]), intent)
         });
+        self.deadzone.px = self.settings.pointer_deadzone;
+        let moved = self.deadzone.moved(now, pos) || intent;
+        let dz = self.settings.pointer_deadzone.round().clamp(0.0, 40.0) as u8;
+        if dz != self.prefs.pointer_deadzone {
+            self.prefs.pointer_deadzone = dz;
+            self.prefs.save();
+        }
         if moved {
             self.chrome.wake(now);
         }
@@ -860,60 +882,97 @@ impl eframe::App for Player {
             self.settings_open = !self.settings_open;
         }
 
+        // The bottom controls FLOAT over the picture. As panels they took
+        // height from the central area whenever they appeared, so every
+        // mouse move that woke them re-fitted (reframed) the video, and the
+        // fade-out reframed it back. As overlays the video's rectangle never
+        // depends on whether the controls show.
+        self.chrome_overlay_h = 0.0;
         if !self.chrome.hidden() {
-        egui::TopBottomPanel::bottom("transport").show(ctx, |ui| {
-            ui.set_opacity(chrome_alpha);
-            let adaptive = Adaptive::detect(ui.ctx());
-            let act = bottom_bar(
-                ui,
-                &mut self.transport,
-                self.view.fit,
-                &self.colors,
-                &self.skin,
-                &adaptive,
-            );
-            if act.toggle_play {
-                self.transport.playing = !self.transport.playing;
-            }
-            if let Some(to) = act.seek_to {
-                self.seek_to(to);
-            }
-            if act.rotate {
-                // Through settings, not straight onto the transport: two
-                // places holding rotation means the popup shows one value and
-                // the picture another.
-                self.settings.rotation = (self.settings.rotation + 1).rem_euclid(4);
-            }
-            if act.cycle_fit {
-                self.settings.fill = vidkit_egui::FillMode::from_fit(next_fit(self.view.fit));
-            }
-            if ui.small_button("⚙").on_hover_text("settings (Ctrl+,)").clicked() {
-                self.settings_open = !self.settings_open;
-            }
-            if act.reset_view {
-                self.transport.zoom = 1.0;
-                self.transport.rotation = 0;
-            }
-        });
-        }
-
-        if !Adaptive::detect(ctx).is_compact() && !self.chrome.hidden() {
-            egui::TopBottomPanel::bottom("hints").show(ctx, |ui| {
-                ui.set_opacity(chrome_alpha);
-                ui.horizontal_wrapped(|ui| {
-                    ui.small("drag ↔ scrub (higher = faster)");
-                    ui.separator();
-                    ui.small("left ↕ volume");
-                    ui.separator();
-                    ui.small("right ↕ speed");
-                    ui.separator();
-                    ui.small("right edge ↕ rotate");
-                    ui.separator();
-                    ui.small("pinch: 5% zoom, far = fit/fill");
-                    ui.separator();
-                    ui.small("tap: play/pause");
+            let screen = ctx.content_rect();
+            let fill = ctx.style().visuals.panel_fill.gamma_multiply(0.82);
+            let frame = egui::Frame::side_top_panel(&ctx.style()).fill(fill);
+            let bar = egui::Area::new(egui::Id::new("vidkit-transport"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    frame.show(ui, |ui| {
+                        let w = screen.width() - frame.total_margin().sum().x;
+                        ui.set_min_width(w);
+                        ui.set_max_width(w);
+                        ui.set_opacity(chrome_alpha);
+                        let adaptive = Adaptive::detect(ui.ctx());
+                        let act = bottom_bar(
+                            ui,
+                            &mut self.transport,
+                            self.view.fit,
+                            &self.colors,
+                            &self.skin,
+                            &adaptive,
+                        );
+                        if act.toggle_play {
+                            self.transport.playing = !self.transport.playing;
+                        }
+                        if let Some(to) = act.seek_to {
+                            self.seek_to(to);
+                        }
+                        if act.rotate {
+                            // Through settings, not straight onto the transport: two
+                            // places holding rotation means the popup shows one value and
+                            // the picture another.
+                            self.settings.rotation = (self.settings.rotation + 1).rem_euclid(4);
+                        }
+                        if act.cycle_fit {
+                            self.settings.fill = vidkit_egui::FillMode::from_fit(next_fit(self.view.fit));
+                        }
+                        ui.horizontal(|ui| {
+                            // Big enough for a thumb: on a phone the clipboard
+                            // is how a video arrives (share -> copy link).
+                            let h = if adaptive.is_compact() { 40.0 } else { 24.0 };
+                            if ui.add(egui::Button::new("Play clipboard").min_size(egui::vec2(0.0, h))).on_hover_text("play the link or file path on the clipboard").clicked() {
+                                self.play_clipboard();
+                            }
+                            if ui.add(egui::Button::new("Open…").min_size(egui::vec2(0.0, h))).on_hover_text("open a file (Ctrl+O)").clicked() {
+                                self.open_picker();
+                            }
+                            if ui.add(egui::Button::new("⚙").min_size(egui::vec2(h, h))).on_hover_text("settings (Ctrl+,)").clicked() {
+                                self.settings_open = !self.settings_open;
+                            }
+                        });
+                        if act.reset_view {
+                            self.transport.zoom = 1.0;
+                            self.transport.rotation = 0;
+                        }
+                    });
                 });
-            });
+            self.chrome_overlay_h = bar.response.rect.height();
+            if !Adaptive::detect(ctx).is_compact() {
+                let hints = egui::Area::new(egui::Id::new("vidkit-hints"))
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(0.0, -self.chrome_overlay_h))
+                    .show(ctx, |ui| {
+                        frame.show(ui, |ui| {
+                            let w = screen.width() - frame.total_margin().sum().x;
+                            ui.set_min_width(w);
+                            ui.set_max_width(w);
+                            ui.set_opacity(chrome_alpha);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.small("drag ↔ scrub (higher = faster)");
+                                ui.separator();
+                                ui.small("left ↕ volume");
+                                ui.separator();
+                                ui.small("right ↕ speed");
+                                ui.separator();
+                                ui.small("right edge ↕ rotate");
+                                ui.separator();
+                                ui.small("pinch: 5% zoom, far = fit/fill");
+                                ui.separator();
+                                ui.small("tap: play/pause");
+                            });
+                        });
+                    });
+                self.chrome_overlay_h += hints.response.rect.height();
+            }
         }
 
         // What is playing, always visible.
@@ -932,6 +991,7 @@ impl eframe::App for Player {
         self.watch_pinned_drops();
 
         let mut want_analysis = false;
+        let (mut want_clipboard, mut want_open) = (false, false);
         egui::TopBottomPanel::top("what").show(ctx, |ui| match &self.opened {
             Some(Err(e)) => {
                 ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
@@ -942,11 +1002,12 @@ impl eframe::App for Player {
                     ui.separator();
                     // Said plainly rather than left to be inferred from a
                     // picture that does not match the file's dimensions.
-                    ui.small(if self.engine.is_some() {
-                        "decoding via ffmpeg"
-                    } else {
-                        "not decoding — showing the test pattern"
-                    });
+                    // The decoder actually in use (in process, V4L2, the
+                    // ffmpeg child...): "via ffmpeg" was true once.
+                    match &self.engine {
+                        Some(e) => ui.small(e.decoder()),
+                        None => ui.small("not decoding — showing the test pattern"),
+                    };
                     ui.separator();
                     if ui.selectable_label(self.sections_open, "Sections").clicked() {
                         self.sections_open = !self.sections_open;
@@ -968,11 +1029,28 @@ impl eframe::App for Player {
                 });
             }
             None => {
-                ui.small("test pattern — pass a .mp4 or .webm to open one");
+                ui.horizontal_wrapped(|ui| {
+                    ui.small("nothing open —");
+                    // The first thing a phone user needs: a copied link or a
+                    // file, without a keyboard for Ctrl+O or the palette.
+                    let h = if Adaptive::detect(ui.ctx()).is_compact() { 40.0 } else { 24.0 };
+                    if ui.add(egui::Button::new("▶ Play clipboard").min_size(egui::vec2(0.0, h))).clicked() {
+                        want_clipboard = true;
+                    }
+                    if ui.add(egui::Button::new("Open file…").min_size(egui::vec2(0.0, h))).clicked() {
+                        want_open = true;
+                    }
+                });
             }
         });
         if want_analysis {
             self.start_analysis();
+        }
+        if want_clipboard {
+            self.play_clipboard();
+        }
+        if want_open {
+            self.open_picker();
         }
 
         // After the top bar, so the panel sits beside the picture rather than
@@ -1019,6 +1097,9 @@ impl eframe::App for Player {
                 if r.width() > 0.0 {
                     let ppp = ui.ctx().pixels_per_point();
                     self.apply_enhance(((r.width() * ppp) as u32, (r.height() * ppp) as u32));
+                    if std::env::var_os("VIDKIT_LAYOUT_DEBUG").is_some() && self.video_rect != Some(r) {
+                        eprintln!("LAYOUT video rect {r:?} (controls {})", if self.chrome.hidden() { "hidden" } else { "shown" });
+                    }
                     self.video_rect = Some(r);
                     if self.plane_on {
                         // The video is on the subsurface below: see through.
@@ -1042,7 +1123,10 @@ impl eframe::App for Player {
             }
         });
 
-        self.subtitle_overlay(ctx, central.response.rect);
+        // Above the controls while they show (they overlay the picture now).
+        let mut sub_area = central.response.rect;
+        sub_area.max.y -= self.chrome_overlay_h;
+        self.subtitle_overlay(ctx, sub_area);
 
         // Overlays after the page, so they draw on top of it.
         self.palette_ui(ctx);
@@ -1559,7 +1643,14 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             // An app id, or Wayland shows the binary name and no icon.
             .with_app_id("vidkit-player")
-            .with_inner_size([960.0, 640.0])
+            // VIDKIT_WINDOW=WxH: a phone-shaped window on a desktop (layout
+            // checks, screenshots).
+            .with_inner_size(
+                std::env::var("VIDKIT_WINDOW")
+                    .ok()
+                    .and_then(|v| v.split_once('x').and_then(|(w, h)| Some([w.parse::<f32>().ok()?, h.parse::<f32>().ok()?])))
+                    .unwrap_or([960.0, 640.0]),
+            )
             // A video plane BELOW the window shows through a hole, which
             // needs an alpha channel. Only when asked for: a transparent
             // window costs the compositor blending where it did not.

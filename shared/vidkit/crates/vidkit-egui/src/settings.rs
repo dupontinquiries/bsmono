@@ -89,6 +89,10 @@ pub struct Settings {
     pub save_data_on_battery: bool,
     /// Upload planes and convert on the GPU rather than converting on the CPU.
     pub gpu_convert: bool,
+    /// Pointer travel (points, within 0.3 s) before motion brings the
+    /// controls back: ignores a bumped couch mouse or a brushed trackpad.
+    /// 0 = any motion.
+    pub pointer_deadzone: f32,
 }
 
 impl Default for Settings {
@@ -105,6 +109,7 @@ impl Default for Settings {
             save_data_on_battery: true,
             // Off until it has run on real hardware; llvmpipe is not turnip.
             gpu_convert: false,
+            pointer_deadzone: 6.0,
         }
     }
 }
@@ -113,6 +118,7 @@ impl Default for Settings {
 pub mod limits {
     pub const HIDE_AFTER: (f32, f32) = (1.0, 30.0);
     pub const SENSITIVITY: (f32, f32) = (0.5, 3.0);
+    pub const DEADZONE: (f32, f32) = (0.0, 40.0);
 }
 
 impl Settings {
@@ -128,6 +134,7 @@ impl Settings {
             .gesture_sensitivity
             .clamp(limits::SENSITIVITY.0, limits::SENSITIVITY.1);
         self.rotation = self.rotation.rem_euclid(4);
+        self.pointer_deadzone = if self.pointer_deadzone.is_finite() { self.pointer_deadzone.clamp(limits::DEADZONE.0, limits::DEADZONE.1) } else { 6.0 };
         if !self.hide_after_secs.is_finite() {
             self.hide_after_secs = Self::default().hide_after_secs;
         }
@@ -394,6 +401,12 @@ fn panel_body(ui: &mut egui::Ui, s: &mut Settings, glass: &crate::glass::GlassSt
     );
     ui.checkbox(&mut s.edge_rotate, "right edge rotates")
         .on_hover_text("off gives the whole right half to speed");
+    ui.add(
+        egui::Slider::new(&mut s.pointer_deadzone, limits::DEADZONE.0..=limits::DEADZONE.1)
+            .step_by(1.0)
+            .text("mouse jitter guard (px)"),
+    )
+    .on_hover_text("how far the pointer must move, quickly, before the controls come back -- for a mouse on the couch or a bumped trackpad; 0 = any movement");
 
     ui.separator();
     ui.label("power");
