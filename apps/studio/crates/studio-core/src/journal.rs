@@ -69,6 +69,18 @@ pub fn check(p: &Project) -> Vec<Finding> {
                 out.push(Finding { key: format!("overlap:{}:{}", w[0].id.0, w[1].id.0),
                     text: format!("two clips overlap on {} at {:.2} s", tname(*t), w[1].pos.to_seconds()) });
             }
+            // a butt join that jumps in the audio with no fade on either
+            // side clicks; a split (same source, contiguous) does not
+            let (a, b) = (w[0], w[1]);
+            let gen = |c: &crate::Clip| p.sources.get(&c.source).map_or(true, |s| s.is_generator());
+            let touching = b.pos >= a.end() && b.pos.to_seconds() - a.end().to_seconds() < 0.001;
+            let split = a.source == b.source && (a.src_in.saturating_add(a.len).to_seconds() - b.src_in.to_seconds()).abs() < 0.0005;
+            let fo = p.fades.get(&a.id).map_or(Ticks::ZERO, |f| f.1);
+            let fi = p.fades.get(&b.id).map_or(Ticks::ZERO, |f| f.0);
+            if touching && !split && !gen(a) && !gen(b) && fo == Ticks::ZERO && fi == Ticks::ZERO {
+                out.push(Finding { key: format!("hard-cut:{}:{}", a.id.0, b.id.0),
+                    text: format!("an unfaded cut on {} at {:.2} s may click", tname(*t), b.pos.to_seconds()) });
+            }
         }
     }
     // stems out of sync
@@ -315,6 +327,24 @@ mod tests {
 
     /// Drums: stems of the same song (a source of the same 10 s), clip k+10
     /// exactly under Vox clip k.
+    #[test]
+    fn an_unfaded_jump_is_a_hard_cut_and_a_split_or_a_fade_is_not() {
+        let mut p = project();
+        let clip = |id: u64, pos: f64, src_in: f64| Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(1), track: TrackId(1),
+            pos: Ticks::from_seconds(pos), src_in: Ticks::from_seconds(src_in), len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } };
+        let cuts = |p: &Project| check(p).into_iter().filter(|f| f.key.starts_with("hard-cut")).map(|f| f.key).collect::<Vec<_>>();
+        assert!(cuts(&p).is_empty(), "gapped clips are not cuts");
+        // clip 4 is 6.0..7.5 playing 0..1.5: continuing at 1.5 is a split
+        p.apply(&clip(20, 7.5, 1.5)).unwrap();
+        assert!(cuts(&p).is_empty(), "{:?}", cuts(&p));
+        // jumping back to 0 at 8.5 is a cut
+        p.apply(&clip(21, 8.5, 0.0)).unwrap();
+        assert_eq!(cuts(&p), vec!["hard-cut:20:21".to_string()]);
+        assert!(check(&p).iter().any(|f| f.text == "an unfaded cut on Vox at 8.50 s may click"));
+        // a fade on either side clears it
+        p.apply(&Op::SetClipFade { id: ClipId(21), fade_in: Ticks::from_seconds(0.005), fade_out: Ticks::ZERO }).unwrap();
+        assert!(cuts(&p).is_empty());
+    }
     fn with_stems() -> Project {
         let mut p = project();
         p.apply(&Op::AddSource { source: Source::file(SourceId(2), "drums.wav", Ticks::from_seconds(10.0), 48_000, 2, false) }).unwrap();
