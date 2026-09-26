@@ -830,12 +830,31 @@ pub struct PolyPatch {
     /// Vibrato depth, cents (5 Hz).
     pub vibrato: f32,
     pub gain: f32,
+    /// TEXTURE (c20): a HARMONIC PROFILE -- the level of harmonics 1..=16,
+    /// 0..=255. All zero: `wave` is the oscillator. Otherwise each note builds
+    /// one band-limited cycle from these and plays it: the timbre, in 16 bytes,
+    /// and FITTABLE from a render (studio-app's synth_fit).
+    #[serde(default)]
+    pub partials: [u8; 16],
+    /// A noise layer (air, breath, grit), 0..=1, through the same filter.
+    #[serde(default)]
+    pub noise: f32,
+    /// 2-operator FM: the modulator at `fm_ratio` x the note, depth `fm_index`
+    /// (radians) -- metallic and bell edges. 0 = off.
+    #[serde(default)]
+    pub fm_ratio: f32,
+    #[serde(default)]
+    pub fm_index: f32,
+    /// Saturation before the filter, 0..=1 -- thickness.
+    #[serde(default)]
+    pub drive: f32,
 }
 
 impl Default for PolyPatch {
     fn default() -> PolyPatch {
         PolyPatch { wave: 2, voices: 2, detune: 8.0, sub: 0.0, attack_ms: 5.0, decay_ms: 300.0, sustain: 0.7, release_ms: 250.0,
-                    cutoff: 3000.0, resonance: 0.2, env_amount: 1.0, vibrato: 0.0, gain: 0.5 }
+                    cutoff: 3000.0, resonance: 0.2, env_amount: 1.0, vibrato: 0.0, gain: 0.5,
+                    partials: [0; 16], noise: 0.0, fm_ratio: 0.0, fm_index: 0.0, drive: 0.0 }
     }
 }
 
@@ -862,6 +881,26 @@ pub fn poly_voice(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], hold: Opti
     let k_res = 2.0 - 1.9 * p.resonance.clamp(0.0, 1.0);
     let norm = 1.0 / (voices as f32).sqrt();
     let mut level_at_gate = 0.0f32;
+    // the additive cycle, if the patch has a harmonic profile: harmonics above
+    // ~0.45 x the rate are left out (band-limited for THIS note), peak -> 1
+    const TABLE: usize = 2048;
+    let table: Option<Vec<f32>> = if p.partials.iter().any(|a| *a > 0) {
+        let mut t = vec![0.0f32; TABLE];
+        for (k, a) in p.partials.iter().enumerate() {
+            let h = (k + 1) as f32;
+            if *a == 0 || h * hz > 0.45 * r { continue; }
+            let amp = *a as f32 / 255.0;
+            for (i, v) in t.iter_mut().enumerate() { *v += amp * (std::f32::consts::TAU * h * i as f32 / TABLE as f32).sin(); }
+        }
+        let peak = t.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+        for v in t.iter_mut() { *v /= peak; }
+        Some(t)
+    } else { None };
+    let read = |t: &[f32], ph: f32| { let x = ph.rem_euclid(1.0) * TABLE as f32; let i = x as usize % TABLE; let f = x - x.floor();
+                                     t[i] * (1.0 - f) + t[(i + 1) % TABLE] * f };
+    let mut fm_phase = 0.0f32;
+    let mut noise_state = 0x2545_f491_u32;
+    let drive_k = 1.0 + p.drive.clamp(0.0, 1.0) * 4.0;
     for (i, s) in out.iter_mut().enumerate() {
         // envelope
         let env = if i < gate {
@@ -875,15 +914,20 @@ pub fn poly_voice(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], hold: Opti
         };
         let vib = if p.vibrato > 0.0 { 2f32.powf(p.vibrato / 1200.0 * (i as f32 / r * 5.0 * std::f32::consts::TAU).sin()) } else { 1.0 };
         let mut x = 0.0f32;
+        let fm = if p.fm_index > 0.0 && p.fm_ratio > 0.0 {
+            let m = p.fm_index * (fm_phase * std::f32::consts::TAU).sin();
+            fm_phase = (fm_phase + hz * p.fm_ratio / r).fract();
+            m / std::f32::consts::TAU
+        } else { 0.0 };
         for (k, ph) in phase.iter_mut().enumerate() {
             let f = hz * vib * 2f32.powf(spread(k) / 1200.0);
             let dt = (f / r).min(0.49);
-            let v = match p.wave {
+            let v = if let Some(t) = &table { read(t, *ph + fm) } else if fm != 0.0 { (((*ph + fm) * std::f32::consts::TAU).sin()) } else { match p.wave {
                 0 => (*ph * std::f32::consts::TAU).sin(),
                 1 => 1.0 - 4.0 * (*ph - 0.5).abs(),
                 3 => { let sq = if *ph < 0.5 { 1.0 } else { -1.0 }; sq + poly_blep(*ph, dt) - poly_blep((*ph + 0.5).fract(), dt) }
                 _ => 2.0 * *ph - 1.0 - poly_blep(*ph, dt),
-            };
+            } };
             x += v;
             *ph = (*ph + dt).fract();
         }
@@ -892,6 +936,11 @@ pub fn poly_voice(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], hold: Opti
             x += p.sub * (sub_phase * std::f32::consts::TAU).sin();
             sub_phase = (sub_phase + hz * 0.5 / r).fract();
         }
+        if p.noise > 0.0 {
+            noise_state ^= noise_state << 13; noise_state ^= noise_state >> 17; noise_state ^= noise_state << 5;
+            x += p.noise * (noise_state as f32 / u32::MAX as f32 * 2.0 - 1.0);
+        }
+        if p.drive > 0.0 { x = (x * drive_k).tanh() / drive_k.tanh(); }
         // filter, opened by the envelope
         let fc = (p.cutoff * 2f32.powf(p.env_amount * env)).clamp(20.0, 0.45 * r);
         let g = (std::f32::consts::PI * fc / r).tan();
@@ -3147,7 +3196,7 @@ mod poly_tests {
     #[test]
     fn a_poly_sine_plays_at_pitch_and_its_envelope_holds_then_releases() {
         let p = PolyPatch { wave: 0, voices: 1, detune: 0.0, sub: 0.0, attack_ms: 1.0, decay_ms: 10.0, sustain: 1.0, release_ms: 100.0,
-                            cutoff: 20000.0, resonance: 0.0, env_amount: 0.0, vibrato: 0.0, gain: 1.0 };
+                            cutoff: 20000.0, resonance: 0.0, env_amount: 0.0, vibrato: 0.0, gain: 1.0, ..Default::default() };
         let mut out = vec![0.0f32; 48_000];
         poly_voice(220.0, &p, 48_000, &mut out, Some(24_000));
         let held = &out[1000..23_000];
@@ -3169,6 +3218,44 @@ mod poly_tests {
         // high-frequency energy: the first difference
         let hf = |v: &[f32]| v.windows(2).skip(2000).take(15_000).map(|w| (w[1] - w[0]).powi(2)).sum::<f32>();
         assert!(hf(&b) < 0.1 * hf(&a), "a 300 Hz cutoff removes most of the saw's highs: {} vs {}", hf(&b), hf(&a));
+    }
+
+    /// Goertzel magnitude of `f` in `v` (for the texture tests).
+    fn mag(v: &[f32], f: f32, rate: f32) -> f32 {
+        let w = std::f32::consts::TAU * f / rate;
+        let (c, mut s1, mut s2) = (2.0 * w.cos(), 0.0f32, 0.0f32);
+        for x in v { let s0 = x + c * s1 - s2; s2 = s1; s1 = s0; }
+        (s1 * s1 + s2 * s2 - c * s1 * s2).sqrt() / v.len() as f32
+    }
+
+    /// A harmonic profile IS the timbre: 1 : 0.5 at harmonics 1 and 3 comes out
+    /// with the 3rd at half the 1st, the 2nd absent -- and an all-zero profile
+    /// leaves the old oscillator alone.
+    #[test]
+    fn a_harmonic_profile_sets_the_timbre() {
+        let mut partials = [0u8; 16];
+        partials[0] = 255; partials[2] = 128;
+        let p = PolyPatch { voices: 1, detune: 0.0, attack_ms: 1.0, sustain: 1.0, cutoff: 20_000.0, env_amount: 0.0, gain: 1.0, partials, ..Default::default() };
+        let mut out = vec![0.0f32; 48_000];
+        poly_voice(200.0, &p, 48_000, &mut out, Some(40_000));
+        let body = &out[4_800..38_400];
+        let (h1, h2, h3) = (mag(body, 200.0, 48_000.0), mag(body, 400.0, 48_000.0), mag(body, 600.0, 48_000.0));
+        assert!((h3 / h1 - 0.5).abs() < 0.08, "3rd at half the 1st: {}", h3 / h1);
+        assert!(h2 / h1 < 0.05, "no 2nd: {}", h2 / h1);
+    }
+
+    #[test]
+    fn noise_fm_and_drive_add_what_they_say() {
+        let base = PolyPatch { wave: 0, voices: 1, detune: 0.0, attack_ms: 1.0, sustain: 1.0, cutoff: 20_000.0, env_amount: 0.0, gain: 1.0, ..Default::default() };
+        let render = |p: &PolyPatch| { let mut o = vec![0.0f32; 24_000]; poly_voice(220.0, p, 48_000, &mut o, Some(20_000)); o };
+        let hf = |v: &[f32]| v.windows(2).skip(2000).take(15_000).map(|w| (w[1] - w[0]).powi(2)).sum::<f32>();
+        let (plain, noisy) = (render(&base), render(&PolyPatch { noise: 0.3, ..base }));
+        assert!(hf(&noisy) > 5.0 * hf(&plain), "noise adds highs");
+        let fm = render(&PolyPatch { fm_ratio: 2.0, fm_index: 2.0, ..base });
+        let body = &fm[2_000..18_000];
+        assert!(mag(body, 220.0 * 3.0, 48_000.0) > 5.0 * mag(&plain[2_000..18_000], 660.0, 48_000.0), "FM makes a sideband at 220 + 2x220");
+        let driven = render(&PolyPatch { drive: 1.0, ..base });
+        assert!(mag(&driven[2_000..18_000], 660.0, 48_000.0) > 5.0 * mag(&plain[2_000..18_000], 660.0, 48_000.0), "drive makes a 3rd harmonic");
     }
 
     #[test]

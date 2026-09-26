@@ -115,7 +115,8 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// change, so a bump: tag 0 File, 1 Pattern (u64 pattern, str name).
 /// v21: `Op::SetBusPan` (tag 47) -- Studio's first pan in the timeline mix.
 /// v22: `SynthKind::Poly` (tag 6) -- the compact generated synth.
-pub const WIRE_VERSION: u8 = 22;
+/// v23: a Poly patch's TEXTURE -- harmonic profile, noise, FM, drive.
+pub const WIRE_VERSION: u8 = 23;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -820,6 +821,10 @@ fn put_synthkind(o: &mut Vec<u8>, k: &SynthKind) {
             for v in [p.detune, p.sub, p.attack_ms, p.decay_ms, p.sustain, p.release_ms, p.cutoff, p.resonance, p.env_amount, p.vibrato, p.gain] {
                 put_f32(o, v);
             }
+            if enc_v() >= 23 {
+                o.extend_from_slice(&p.partials);
+                for v in [p.noise, p.fm_ratio, p.fm_index, p.drive] { put_f32(o, v); }
+            }
         }
         SynthKind::Sine { hz } => { put_u8(o, 0); put_f32(o, *hz); }
         SynthKind::Sampler { source } => { put_u8(o, 1); put_u64(o, source.0); }
@@ -886,8 +891,13 @@ fn get_synthkind(r: &mut R) -> Option<SynthKind> {
             let (wave, voices) = (r.u8()?, r.u8()?);
             let mut f = [0f32; 11];
             for v in f.iter_mut() { *v = r.f32()?; }
-            SynthKind::Poly { hz, patch: studio_live::PolyPatch { wave, voices, detune: f[0], sub: f[1], attack_ms: f[2], decay_ms: f[3],
-                sustain: f[4], release_ms: f[5], cutoff: f[6], resonance: f[7], env_amount: f[8], vibrato: f[9], gain: f[10] } }
+            let mut patch = studio_live::PolyPatch { wave, voices, detune: f[0], sub: f[1], attack_ms: f[2], decay_ms: f[3],
+                sustain: f[4], release_ms: f[5], cutoff: f[6], resonance: f[7], env_amount: f[8], vibrato: f[9], gain: f[10], ..Default::default() };
+            if r.v >= 23 {
+                patch.partials.copy_from_slice(r.take(16)?);
+                patch.noise = r.f32()?; patch.fm_ratio = r.f32()?; patch.fm_index = r.f32()?; patch.drive = r.f32()?;
+            }
+            SynthKind::Poly { hz, patch }
         }
         5 => SynthKind::Sf2 {
             path: std::path::PathBuf::from(r.str()?),
@@ -1621,7 +1631,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 22, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 23, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]
@@ -1882,10 +1892,13 @@ mod poly_wire_tests {
     /// A Poly patch round-trips exactly, and is SMALL: the point of it.
     #[test]
     fn a_poly_patch_round_trips_and_fits_in_a_few_dozen_bytes() {
-        let k = SynthKind::Poly { hz: 261.63, patch: studio_live::PolyPatch { wave: 3, voices: 5, detune: 14.0, sub: 0.3, cutoff: 900.0, ..Default::default() } };
+        let mut partials = [0u8; 16];
+        partials[0] = 255; partials[4] = 90;
+        let k = SynthKind::Poly { hz: 261.63, patch: studio_live::PolyPatch { wave: 3, voices: 5, detune: 14.0, sub: 0.3, cutoff: 900.0,
+            partials, noise: 0.1, fm_ratio: 2.0, fm_index: 1.5, drive: 0.4, ..Default::default() } };
         let mut o = Vec::new();
         put_synthkind(&mut o, &k);
-        assert!(o.len() <= 64, "{} bytes", o.len());
+        assert!(o.len() <= 100, "a patch WITH its texture: {} bytes", o.len());
         let mut r = R { b: &o, i: 0, v: WIRE_VERSION };
         assert_eq!(get_synthkind(&mut r), Some(k));
     }
