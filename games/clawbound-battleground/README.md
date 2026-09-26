@@ -126,6 +126,15 @@ what else is known-but-unresolved.
   shaders bend the canopy by height with a travelling gust wave and tip
   flutter, so trees, palms, bamboo, ferns and vine curtains lean and shiver
   together (rocks and ruins stay put). Big gusts tear leaves loose.
+- **Recorded voices** (`assets/audio/voice/<ancestor>/<line>.opus`, the
+  lines in `dev/voice_script/recording_sheet.tsv`): Goldenmane, Oldroar,
+  Twofang and Windclaw, voiced by Kessler, one performer given four chains
+  (Goldenmane a touch lower and warm with a hall; Oldroar down a major third
+  with the formants, slowed, sub and grit, a cave; Twofang dry, bitten and
+  hard-compressed; Windclaw up, quicker, bright and airy).
+  `dev/voice_script/master_take.py` cuts, cleans and masters a session;
+  `tests/voice_assets.rs` checks every recorded ancestor is complete,
+  trimmed and levelled. The other ancestors are still unvoiced.
 - **Procedural ambience** (`src/audio.rs`, cpal, feature `audio`, on by
   default) — no samples: a wind body, a place-shaped howl (the resonant band
   the wind excites depends on where you stand — a whistle over the river, a
