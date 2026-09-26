@@ -167,6 +167,7 @@ pub mod stature;
 pub mod lightning;
 pub mod armor;
 pub mod item_entity;
+pub mod thrown_weapon;
 pub mod item_brain;
 pub mod emission;
 pub mod column_memo;
