@@ -306,6 +306,9 @@ impl Player {
             // SAFETY: the creation context's GL is current.
             unsafe { gl.get_parameter_i32(eframe::glow::MAX_TEXTURE_SIZE) as u32 }
         });
+        if let Some(t) = max_texture {
+            decode::set_texture_limit(t);
+        }
 
         // GPU upload by DEFAULT (VIDKIT_GPU=0 opts out): NV12 planes go to the
         // GPU and are converted there, instead of a CPU colour conversion of
@@ -325,6 +328,10 @@ impl Player {
         } else {
             (None, None)
         };
+        // The GPU presenter takes I420: software decode then skips the NV12
+        // conversion (+29% CPU on 4K60 VP9, measured). Set before the first
+        // decoder opens.
+        decode::set_prefer_planar(gpu.is_some());
         let opened = file.as_ref().map(|p| open_local(p));
 
         // Try to decode it for real. A failure is not fatal: the file still

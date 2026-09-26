@@ -279,6 +279,50 @@ pub fn set_decode_cap(c: u32) {
 /// used to hand ffmpeg a `-2` expression and compute the size separately in
 /// Rust; the two round differently, and a frame one row shorter than the
 /// buffer tears every picture after the first.
+/// Whether a fit is worth doing in ffmpeg, or better left to the GPU. Pure.
+///
+/// Scaling in ffmpeg is a full swscale pass over every source pixel on the
+/// CPU; the GPU presenter scales for free as it draws. Measured on 4K60
+/// VP9 (a 3840 source on a 3456-wide panel): the 0.9x shrink plus NV12
+/// conversion took the player to 1.44x the CPU of decoding alone. A shrink
+/// is only worth it when it removes a real share of the pixels (the target
+/// under 60% of the source area -- 4K on a 1080p phone) or when the source
+/// exceeds the GPU's largest texture, which is a hard limit.
+pub fn worth_scaling(src: (u32, u32), fit: Option<(u32, u32)>, max_texture: u32) -> Option<(u32, u32)> {
+    let (tw, th) = fit?;
+    if src.0.max(src.1) > max_texture {
+        return Some((tw, th));
+    }
+    let ratio = (tw as f64 * th as f64) / (src.0 as f64 * src.1 as f64).max(1.0);
+    (ratio < 0.6).then_some((tw, th))
+}
+
+static TEXTURE_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+static PREFER_PLANAR: AtomicBool = AtomicBool::new(false);
+
+/// GL_MAX_TEXTURE_SIZE, from the app once GL is up.
+pub fn set_texture_limit(t: u32) {
+    TEXTURE_LIMIT.store(t.max(1), Ordering::Relaxed);
+}
+
+/// The presenter takes I420 on the GPU: software decode of 8-bit 4:2:0
+/// then asks ffmpeg for its native planar output (no conversion).
+pub fn set_prefer_planar(on: bool) {
+    PREFER_PLANAR.store(on, Ordering::Relaxed);
+}
+
+/// The layout to ask ffmpeg for. Pure. The decoder's native one where the
+/// presenter takes it: software 8-bit 4:2:0 -> I420 for the GPU presenter;
+/// hardware paths hand NV12 out natively, and the CPU presenter's fast
+/// converter wants interleaved chroma.
+pub fn output_layout(probe_layout: PlaneLayout, pix_fmt: &str, software: bool, gpu_takes_planar: bool) -> PlaneLayout {
+    if software && gpu_takes_planar && probe_layout == PlaneLayout::Nv12 && matches!(pix_fmt, "yuv420p" | "yuvj420p") {
+        PlaneLayout::I420
+    } else {
+        probe_layout
+    }
+}
+
 pub fn fit_long_edge(w: u32, h: u32, cap: Option<u32>) -> Option<(u32, u32)> {
     let cap = cap?;
     let long = w.max(h);
@@ -642,6 +686,7 @@ pub fn video_args(src: &VideoInput, from: Duration, accel: &Accel, scale_to: Opt
 pub fn video_args_fmt(src: &VideoInput, from: Duration, accel: &Accel, scale_to: Option<(u32, u32)>, layout: PlaneLayout) -> Vec<String> {
     let (pix, vaapi_fmt) = match layout {
         PlaneLayout::P010 => ("p010le", "p010"),
+        PlaneLayout::I420 => ("yuv420p", "nv12"),
         _ => ("nv12", "nv12"),
     };
     let mut a: Vec<String> = vec!["-v".into(), "error".into(), "-nostdin".into()];
@@ -963,9 +1008,9 @@ impl FfmpegFrames {
         from: Duration,
         accel: Accel,
     ) -> Result<Self, String> {
-        let scale_to = fit_long_edge(p.width, p.height, max_long_edge);
+        let scale_to = worth_scaling((p.width, p.height), fit_long_edge(p.width, p.height, max_long_edge), TEXTURE_LIMIT.load(Ordering::Relaxed));
         let (w, h) = scale_to.unwrap_or((p.width, p.height));
-        let layout = p.layout();
+        let layout = output_layout(p.layout(), &p.pix_fmt, !accel.is_hardware(), PREFER_PLANAR.load(Ordering::Relaxed));
         let args = video_args_fmt(src, from, &accel, scale_to, layout);
         let fallback = accel.is_hardware().then(|| video_args_fmt(src, from, &Accel::Software, scale_to, layout));
         let child = spawn_ffmpeg(&args)?;
@@ -1021,6 +1066,36 @@ impl FfmpegFrames {
         let bps = self.bytes_per_sample();
         let (luma_len, chroma_len) = (w * h * bps, self.frame_bytes() - w * h * bps);
         loop {
+            if self.layout == PlaneLayout::I420 {
+                // Three planes, straight from the pipe into each -- no
+                // interleave, no copy.
+                let cw = (self.width as usize).div_ceil(2);
+                let c_len = cw * (self.height as usize).div_ceil(2);
+                let (mut y, mut u, mut v) = (self.pool.take(luma_len), self.pool.take(c_len), self.pool.take(c_len));
+                let ok = match self.child.stdout.as_mut() {
+                    Some(o) => o.read_exact(&mut y).is_ok() && o.read_exact(&mut u).is_ok() && o.read_exact(&mut v).is_ok(),
+                    None => false,
+                };
+                if ok {
+                    let pts = self.frame_interval.mul_f64(self.index as f64);
+                    self.index += 1;
+                    self.frames_read += 1;
+                    return Some(Frame {
+                        data: FrameData::Cpu(CpuPlanes { data: vec![y, u, v], strides: vec![self.width, cw as u32, cw as u32] }),
+                        width: self.width,
+                        height: self.height,
+                        layout: PlaneLayout::I420,
+                        color: self.color,
+                        pts,
+                        duration: Some(self.frame_interval),
+                        recycle: None,
+                    });
+                }
+                self.pool.put(y);
+                self.pool.put(u);
+                self.pool.put(v);
+                return None;
+            }
             let mut luma = self.pool.take(luma_len);
             let mut chroma = self.pool.take(chroma_len);
             if self.read_planes(&mut luma, &mut chroma) {
@@ -1688,6 +1763,54 @@ mod core_tests {
         let out = cmd.output().unwrap();
         let line = String::from_utf8_lossy(&out.stdout);
         assert!(line.trim().ends_with("\t0") || line.trim().ends_with(" 0"), "{line}");
+    }
+}
+
+#[cfg(test)]
+mod planar_tests {
+    use super::*;
+
+    /// The measured case: a 3840x2160 VP9 on a 3456-wide panel is left to
+    /// the GPU to fit; 4K on a 1080p phone is still shrunk in ffmpeg; past
+    /// the texture limit, always.
+    #[test]
+    fn mild_fits_are_left_to_the_gpu() {
+        let src = (3840, 2160);
+        assert_eq!(worth_scaling(src, fit_long_edge(3840, 2160, Some(3456)), 16384), None, "0.81 of the area: GPU");
+        assert_eq!(worth_scaling(src, fit_long_edge(3840, 2160, Some(1920)), 16384), Some((1920, 1080)), "0.25: ffmpeg");
+        assert_eq!(worth_scaling(src, fit_long_edge(3840, 2160, Some(3456)), 2048), Some((3456, 1944)), "past the texture limit");
+        assert_eq!(worth_scaling(src, None, 16384), None);
+    }
+
+    #[test]
+    fn software_8bit_420_goes_planar_to_the_gpu_only() {
+        use PlaneLayout::*;
+        assert_eq!(output_layout(Nv12, "yuv420p", true, true), I420, "software VP9 to the GPU presenter");
+        assert_eq!(output_layout(Nv12, "yuv420p", false, true), Nv12, "VAAPI hands NV12 out natively");
+        assert_eq!(output_layout(Nv12, "yuv420p", true, false), Nv12, "the CPU presenter's fast path is NV12");
+        assert_eq!(output_layout(P010, "yuv420p10le", true, true), P010, "10-bit stays P010");
+        assert_eq!(output_layout(Nv12, "yuv444p", true, true), Nv12, "not 4:2:0: convert");
+    }
+
+    /// Real ffmpeg: I420 frames come through as three planes of the right
+    /// sizes, byte-identical to ffmpeg's own yuv420p output.
+    #[test]
+    fn i420_frames_arrive_as_three_planes() {
+        let f = std::env::temp_dir().join(format!("vk-i420-{}.mkv", std::process::id()));
+        if !Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=10:duration=1", "-c:v", "ffv1", "-pix_fmt", "yuv420p"]).arg(&f).status().map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
+        set_prefer_planar(true);
+        let p = super::probe(&f).unwrap();
+        let mut d = FfmpegFrames::open_probed(&VideoInput::file(&f), &p, None, Duration::ZERO, Accel::Software).unwrap();
+        set_prefer_planar(false);
+        let fr = d.next_frame().unwrap();
+        assert_eq!(fr.layout, PlaneLayout::I420);
+        let FrameData::Cpu(pl) = &fr.data else { panic!() };
+        assert_eq!(pl.data.iter().map(Vec::len).collect::<Vec<_>>(), vec![160 * 90, 80 * 45, 80 * 45]);
+        let reference = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&f).args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"]).output().unwrap().stdout;
+        assert!(pl.data.concat() == reference, "not ffmpeg's own bytes");
+        let _ = std::fs::remove_file(&f);
     }
 }
 

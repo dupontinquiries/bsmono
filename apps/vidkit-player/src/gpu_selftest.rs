@@ -250,6 +250,25 @@ fn p010(w: u32, h: u32, transfer: vidkit_core::codec::Transfer) -> Frame {
     }
 }
 
+/// An 8-bit I420 frame (three planes), luma and chroma varied in both axes:
+/// the layout software VP9/AV1 decode now hands the GPU unconverted.
+fn i420(w: u32, h: u32) -> Frame {
+    let luma: Vec<u8> = (0..h).flat_map(|y| (0..w).map(move |x| (16 + (x * 219) / (w - 1) - (y % 3)) as u8)).collect();
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let u: Vec<u8> = (0..ch).flat_map(|_| (0..cw).map(move |x| (128 + x as i32 * 150 / cw as i32 - 75) as u8)).collect();
+    let v: Vec<u8> = (0..ch).flat_map(|y| (0..cw).map(move |_| (128 + y as i32 * 150 / ch as i32 - 75) as u8)).collect();
+    Frame {
+        data: FrameData::Cpu(CpuPlanes { data: vec![luma, u, v], strides: vec![w, cw, cw] }),
+        width: w,
+        height: h,
+        layout: PlaneLayout::I420,
+        color: ColorInfo::default(),
+        pts: std::time::Duration::ZERO,
+        duration: None,
+        recycle: None,
+    }
+}
+
 /// GPU vs vidkit-core's CPU converter on the whole frame.
 fn check_vs_cpu(f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String, String> {
     let FrameData::Cpu(pl) = &f.data else { return Err("not cpu".into()) };
@@ -300,6 +319,7 @@ fn cases() -> Vec<Case> {
         },
         Case { name: "HDR10 PQ, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Pq), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
         Case { name: "HLG, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Hlg), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
+        Case { name: "I420, three planes", history: vec![], frame: i420(64, 48), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
         Case { name: "plain conversion", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance::default(), out: (64, 48), check: check_plain },
         Case { name: "RCAS offscreen pass", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
         Case { name: "bicubic 2x on a ramp", history: vec![], frame: nv12(32, 16, |x, _| (40 + x * 4) as u8), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_ramp },

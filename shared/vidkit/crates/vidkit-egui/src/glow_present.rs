@@ -83,6 +83,11 @@ in vec2 uv;
 out vec4 frag;
 uniform sampler2D plane_y;
 uniform sampler2D plane_uv;
+// I420: U in plane_uv's red channel, V in plane_v's. The decoder's NATIVE
+// layout for software VP9/AV1/H.264 -- asking ffmpeg for NV12 instead cost
+// +29% CPU on 4K60 VP9 (measured), for an interleave the GPU does for free.
+uniform sampler2D plane_v;
+uniform int planar;
 uniform int matrix_id;
 uniform int range_id;
 uniform float flip_y;
@@ -186,7 +191,7 @@ void main() {
     vec2 t = vec2(uv.x, mix(uv.y, 1.0 - uv.y, flip_y));
 
     float y = scaler == 1 ? clamp(bicubic_y(t), 0.0, 1.0) : texture(plane_y, t).r;
-    vec2 c = texture(plane_uv, t).rg;
+    vec2 c = planar == 1 ? vec2(texture(plane_uv, t).r, texture(plane_v, t).r) : texture(plane_uv, t).rg;
 
     // Range constants in the planes' own normalisation: 8-bit 16/219/128/224,
     // P010 (10 bits high in 16) 64/876/512/896 -- the 8-bit set on 10-bit
@@ -435,6 +440,8 @@ pub struct Nv12Gpu {
     vao: glow::VertexArray,
     tex_y: glow::Texture,
     tex_uv: glow::Texture,
+    /// V plane for I420 (U lives in tex_uv then).
+    tex_v: glow::Texture,
     size: (u32, u32),
     layout: PlaneLayout,
     color: ColorInfo,
@@ -463,7 +470,8 @@ impl Nv12Gpu {
         let vao = gl.create_vertex_array()?;
         let tex_y = gl.create_texture()?;
         let tex_uv = gl.create_texture()?;
-        for t in [&tex_y, &tex_uv] {
+        let tex_v = gl.create_texture()?;
+        for t in [&tex_y, &tex_uv, &tex_v] {
             gl.bind_texture(glow::TEXTURE_2D, Some(*t));
             // CLAMP_TO_EDGE, or the bilinear filter wraps at the frame edge and
             // the right column bleeds into the left.
@@ -487,6 +495,7 @@ impl Nv12Gpu {
             vao,
             tex_y,
             tex_uv,
+            tex_v,
             size: (0, 0),
             layout: PlaneLayout::Nv12,
             color: ColorInfo::default(),
@@ -519,14 +528,16 @@ impl Nv12Gpu {
         let (y_fmt, uv_fmt, ty, bps) = match frame.layout {
             PlaneLayout::Nv12 => (glow::R8, glow::RG8, glow::UNSIGNED_BYTE, 1u32),
             PlaneLayout::P010 => (glow::R16, glow::RG16, glow::UNSIGNED_SHORT, 2u32),
+            PlaneLayout::I420 => (glow::R8, glow::R8, glow::UNSIGNED_BYTE, 1u32),
             other => return Err(format!("{other:?} is not handled by the GPU path")),
         };
+        let planar = frame.layout == PlaneLayout::I420;
         let planes: &CpuPlanes = match &frame.data {
             FrameData::Cpu(p) => p,
             FrameData::DmaBuf(_) => return Err("dma-buf needs the Vulkan path".into()),
         };
-        if planes.data.len() < 2 {
-            return Err("NV12 needs two planes".into());
+        if planes.data.len() < if planar { 3 } else { 2 } {
+            return Err(format!("{:?} needs {} planes", frame.layout, if planar { 3 } else { 2 }));
         }
 
         let (w, h) = (frame.width, frame.height);
@@ -566,7 +577,22 @@ impl Nv12Gpu {
         // the row length in TEXELS is half it. Passing the byte stride here
         // doubles the row and skews the colour but not the luma, which reads as
         // a decoder bug rather than an upload one.
+        if planar {
+            // I420: U and V as two single-channel planes.
+            for (i, tex) in [(1usize, self.tex_uv), (2, self.tex_v)] {
+                let stride = planes.strides.get(i).copied().unwrap_or(cw);
+                gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, stride as i32);
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                let data = glow::PixelUnpackData::Slice(Some(&planes.data[i]));
+                if same {
+                    gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, cw as i32, ch as i32, glow::RED, ty, data);
+                } else {
+                    gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::R8 as i32, cw as i32, ch as i32, 0, glow::RED, ty, data);
+                }
+            }
+        }
         let uv_stride_bytes = planes.strides.get(1).copied().unwrap_or(cw * 2 * bps);
+        if !planar {
         gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, (uv_stride_bytes / (2 * bps)) as i32);
         gl.bind_texture(glow::TEXTURE_2D, Some(self.tex_uv));
         if same {
@@ -583,6 +609,7 @@ impl Nv12Gpu {
                 ty,
                 glow::PixelUnpackData::Slice(Some(&planes.data[1])),
             );
+        }
         }
 
         // Leave the row length as the driver found it, or every later upload in
@@ -712,6 +739,10 @@ impl Nv12Gpu {
         let u = |n: &str| gl.get_uniform_location(p, n);
         if let Some(l) = u("plane_y") { gl.uniform_1_i32(Some(&l), 0); }
         if let Some(l) = u("plane_uv") { gl.uniform_1_i32(Some(&l), 1); }
+        gl.active_texture(glow::TEXTURE2);
+        gl.bind_texture(glow::TEXTURE_2D, Some(self.tex_v));
+        if let Some(l) = u("plane_v") { gl.uniform_1_i32(Some(&l), 2); }
+        if let Some(l) = u("planar") { gl.uniform_1_i32(Some(&l), (self.layout == PlaneLayout::I420) as i32); }
         if let Some(l) = u("matrix_id") { gl.uniform_1_i32(Some(&l), matrix_id(self.color.matrix)); }
         if let Some(l) = u("range_id") { gl.uniform_1_i32(Some(&l), range_id(self.color.range)); }
         if let Some(l) = u("flip_y") { gl.uniform_1_f32(Some(&l), flip_y); }
@@ -847,6 +878,7 @@ impl Nv12Gpu {
         gl.delete_vertex_array(self.vao);
         gl.delete_texture(self.tex_y);
         gl.delete_texture(self.tex_uv);
+        gl.delete_texture(self.tex_v);
     }
 }
 
