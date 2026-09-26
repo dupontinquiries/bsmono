@@ -199,6 +199,54 @@ fn tension_shape(u: f64, tension: f64) -> f64 { u.clamp(0.0, 1.0).powf(2f64.powf
 /// straight line and 0.11-0.12 curved the other way. One curve, one song.
 pub const FL_TENSION_K: f64 = 3.0;
 
+/// FL's automation of a FRUITY BALANCE's volume on a mixer insert, by the
+/// name FL gives the clip: "<label>[ (Slot n)] - <insert> - Volume[ #k]" --
+/// "Balance - SubBass1 - Volume", "Balance (Slot 10) - VTrim - Volume",
+/// "rise_drums_into_echo - drum_echo_chan - Volume" (a renamed one). Returns
+/// (label, slot index 0-based when named, insert name). The label is
+/// checked against the insert's slots later: this only reads the shape.
+pub fn balance_volume_target(name: &str) -> Option<(String, Option<usize>, String)> {
+    let base = match name.rfind(" #") { Some(i) if name[i + 2..].chars().all(|c| c.is_ascii_digit()) && i + 2 < name.len() => &name[..i], _ => name };
+    let parts: Vec<&str> = base.split(" - ").collect();
+    if parts.len() < 3 || *parts.last()? != "Volume" { return None; }
+    let insert = parts[parts.len() - 2].to_string();
+    let head = parts[..parts.len() - 2].join(" - ");
+    let (label, slot) = match head.rfind(" (Slot ") {
+        Some(i) if head.ends_with(')') => (head[..i].to_string(), head[i + 7..head.len() - 1].parse::<usize>().ok().and_then(|n| n.checked_sub(1))),
+        _ => (head, None),
+    };
+    Some((label, slot, insert))
+}
+
+/// A slot's name as the chain builder reads it (a VST by its slot name).
+fn slot_plugin_name(slot: &Value) -> &str {
+    let plug = s(&slot["plugin"]).unwrap_or("");
+    if plug == "Fruity Wrapper" { s(&slot["name"]).unwrap_or("a plugin") } else { plug }
+}
+
+/// Where the Fruity Balance `label` (in `slot`, when the name said) sits in
+/// the Studio chain built from insert `m` -- counting only the slots that map
+/// to an effect, exactly as the chain is built. `None`: no such Balance.
+pub fn balance_chain_index(m: &Value, label: &str, slot: Option<usize>) -> Option<u8> {
+    let mut at = 0u8;
+    for (k, sl) in m["slots"].as_array().into_iter().flatten().enumerate() {
+        let mapped = effect_for(slot_plugin_name(sl)).is_some();
+        let idx = sl["index"].as_u64().map(|x| x as usize).unwrap_or(k);
+        let is_it = s(&sl["plugin"]) == Some("Fruity Balance")
+            && slot.is_none_or(|n| n == idx)
+            && match s(&sl["name"]) { Some(n) => n == label, None => label == "Balance" };
+        if is_it && mapped { return Some(at); }
+        if mapped { at = at.checked_add(1)?; }
+    }
+    None
+}
+
+/// A Fruity Balance volume knob (0..1 of its travel) as a linear level:
+/// ASSUMED to follow the mixer fader's law, 0.8 of the travel = unity --
+/// what both of Balance's unautomated starting points (0.8) and FL's 125%
+/// knob top agree with; 0 is silence either way.
+pub fn fl_balance_level(knob: f64) -> f32 { fl_fader_gain(knob.clamp(0.0, 1.0) * 16_000.0) }
+
 /// The automated value at `t` (song seconds) from time-ordered segments:
 /// before the first, its first value; inside one, its points; between or
 /// after, the last value reached -- a parameter HOLDS where automation left it.
@@ -1030,6 +1078,71 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
             ops.push(Op::SetBusPan { id: *bus, pan: (pan / 6400.0).clamp(-1.0, 1.0) as f32 });
         }
     }
+    // ── MIXER AUTOMATION: a Fruity Balance's volume on an insert ─────────
+    // A lane on the bus chain's gain effect's LINEAR `level` (studio-fx: a
+    // lane multiplies the stored value, and level's is 1, so the lane IS the
+    // gain -- 0 silences). At the Balance's own place in the chain, so a
+    // reverb after it keeps its tail as in FL. Sampled every BAKE_STEP inside
+    // each clip (FL's tension curve), held between clips as FL holds.
+    let mut bal_segs: BTreeMap<(BusId, u8), (Vec<AutoSeg>, (f64, f64))> = BTreeMap::new();
+    let (mut bal_applied, mut bal_unresolved) = (0usize, BTreeMap::<String, usize>::new());
+    if let Some(arr) = inv["arrangements"].as_array().and_then(|a| a.first()) {
+        for t in arr["tracks"].as_array().into_iter().flatten() {
+            if t["enabled"].as_bool() == Some(false) { continue; }
+            for it in t["items"].as_array().into_iter().flatten() {
+                if s(&it["kind"]) != Some("ChannelPLItem") || it["flags"].as_u64().is_some_and(|f| f & FL_ITEM_MUTED != 0) { continue; }
+                let Some(c) = i(&it["channel"]).and_then(|c| chans.get(&c)) else { continue };
+                if s(&c["kind"]) != Some("Automation") { continue; }
+                let name = s(&c["name"]).unwrap_or("");
+                let Some((label, slot, insert)) = balance_volume_target(name) else { continue };
+                let iid = mixer.iter().find(|(_, m)| s(&m["name"]) == Some(insert.as_str())).map(|(k, _)| *k)
+                    .or_else(|| insert.strip_prefix("Insert ").and_then(|n| n.parse().ok()))
+                    .or_else(|| (insert == "Master").then_some(0));
+                let target = iid.and_then(|iid| Some((*busses.get(&iid)?, balance_chain_index(mixer.get(&iid)?, &label, slot)?)));
+                let Some(key) = target else { *bal_unresolved.entry(name.to_string()).or_default() += 1; continue };
+                let pts: Vec<(f64, f64, f64)> = c["points"].as_array().into_iter().flatten()
+                    .filter_map(|p| Some((p[0].as_f64()? * beat, p[1].as_f64()?, p[2].as_f64().unwrap_or(0.0)))).collect();
+                if pts.is_empty() { continue; }
+                let t0 = at(i(&it["pos"]).unwrap_or(0)).to_seconds();
+                let t1 = t0 + at(i(&it["len"]).unwrap_or(0)).to_seconds();
+                let r = c["auto_range"].as_array().map(|r| (r[0].as_f64().unwrap_or(0.0) / 12800.0, r[1].as_f64().unwrap_or(12800.0) / 12800.0)).unwrap_or((0.0, 1.0));
+                let e = bal_segs.entry(key).or_insert_with(|| (Vec::new(), r));
+                e.0.push(AutoSeg { t0, t1, pts });
+                bal_applied += 1;
+            }
+        }
+    }
+    let mut bal_lanes = 0usize;
+    for ((bus, ix), (mut segs, r)) in bal_segs {
+        segs.sort_by(|a, b| a.t0.total_cmp(&b.t0));
+        let target = studio_core::AutoTarget::BusParam { bus, effect: ix, key: studio_core::ParamKey::new("level").expect("a short key") };
+        let level = |t: f64| auto_value(&segs, t).map(|v| fl_balance_level(r.0 + v * (r.1 - r.0))).unwrap_or(1.0);
+        let mut times: Vec<f64> = Vec::new();
+        for sg in &segs {
+            if sg.t0 > 0.002 { times.push(sg.t0 - 0.001); } // the value HELD up to this clip
+            let n = ((sg.t1 - sg.t0) / BAKE_STEP).ceil() as usize;
+            times.extend((0..=n).map(|k| (sg.t0 + k as f64 * BAKE_STEP).min(sg.t1)));
+        }
+        times.sort_by(|a, b| a.total_cmp(b));
+        times.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+        let vals: Vec<(f64, f32)> = times.iter().map(|t| (*t, level(*t))).collect();
+        // a flat run needs only its ends: the lane is linear between points
+        for (k, (t, v)) in vals.iter().enumerate() {
+            let same = |j: usize| vals.get(j).is_some_and(|x| (x.1 - v).abs() < 1e-5);
+            if k > 0 && same(k - 1) && same(k + 1) { continue; }
+            ops.push(Op::SetAutoPoint { target, at: Ticks::from_seconds(*t), value: *v });
+        }
+        bal_lanes += 1;
+    }
+    if bal_applied > 0 {
+        automation_clips = automation_clips.saturating_sub(bal_applied);
+        report.push(format!("MIXER AUTOMATION applied: {bal_applied} Fruity Balance volume clip{} as {bal_lanes} lane{} on the bus's gain effect, at its place in the chain (knob law ASSUMED = the fader's: 0.8 of the travel = unity)",
+            if bal_applied == 1 { "" } else { "s" }, if bal_lanes == 1 { "" } else { "s" }));
+    }
+    if !bal_unresolved.is_empty() {
+        report.push(format!("Balance volume automation with no bus or slot to land on (insert unused, or no such Balance there): {}",
+            bal_unresolved.iter().map(|(k, n)| format!("{k} x{n}")).collect::<Vec<_>>().join(", ")));
+    }
     // ── apply, through the model's own checks ───────────────────────────
     let mut refused = 0;
     for op in ops {
@@ -1461,6 +1574,65 @@ mod tests {
         assert_eq!(whole.rack.channels.len(), 1);
         assert!(whole.slices.is_empty());
         assert!(whole.report.iter().any(|r| r.contains("plays its whole recording")), "{:?}", whole.report);
+    }
+
+    #[test]
+    fn balance_volume_names_are_read_and_resolved_to_the_chain() {
+        assert_eq!(balance_volume_target("Balance - SubBass1 - Volume"), Some(("Balance".into(), None, "SubBass1".into())));
+        assert_eq!(balance_volume_target("Balance (Slot 10) - VTrim - Volume #2"), Some(("Balance".into(), Some(9), "VTrim".into())));
+        assert_eq!(balance_volume_target("rise_drums_into_echo - drum_echo_chan - Volume"), Some(("rise_drums_into_echo".into(), None, "drum_echo_chan".into())));
+        assert_eq!(balance_volume_target("Vox - Volume"), None, "two parts: not a plugin on an insert");
+        assert_eq!(balance_volume_target("Chorus - Mix level"), None);
+        assert_eq!(balance_volume_target("Nifty4 - 2021-May-02_5 - Volume multiplier"), None);
+        // VTrim's shape: EQ (off, still in the chain), a VST, Maximus, Balance
+        // at slot 3, EQ, an unmapped VST, Balance at slot 9
+        let m = json!({"slots": [
+            {"index": 0, "plugin": "Fruity Parametric EQ 2"}, {"index": 1, "plugin": "Fruity Wrapper", "name": "Ozone 8 Dynamics"},
+            {"index": 2, "plugin": "Maximus"}, {"index": 3, "plugin": "Fruity Balance"}, {"index": 4, "plugin": "Fruity Parametric EQ 2"},
+            {"index": 6, "plugin": "Fruity Wrapper", "name": "Some Unknown VST"}, {"index": 9, "plugin": "Fruity Balance"}]});
+        assert_eq!(balance_chain_index(&m, "Balance", None), Some(3), "the first Balance, counted among MAPPED slots");
+        assert_eq!(balance_chain_index(&m, "Balance", Some(9)), Some(5), "slot 10 -> index 9, past the unmapped VST");
+        assert_eq!(balance_chain_index(&m, "Balance", Some(4)), None, "slot 5 is an EQ");
+        assert_eq!(balance_chain_index(&m, "renamed", None), None);
+        assert!((fl_balance_level(0.8) - 1.0).abs() < 1e-6 && fl_balance_level(0.0) == 0.0 && fl_balance_level(1.0) > 1.8);
+    }
+
+    /// End to end: a Balance ride from 0.8 (unity) to 0 (silence) over two
+    /// beats lands as a lane on the bus chain's gain effect (after an EQ:
+    /// index 1), `level`; one naming an insert not in the file is reported,
+    /// not applied; a "<channel> - Volume" clip is still counted unapplied.
+    #[test]
+    fn a_balance_volume_ride_becomes_a_level_lane_at_its_place_in_the_chain() {
+        let inv = json!({
+            "project": {"ppq": 96, "tempo": 120.0},
+            "channels": [{"iid": 0, "kind": "Sampler", "name": "Kick", "sample_file": "kick.wav", "insert": 1},
+                         {"iid": 1, "kind": "Automation", "name": "Balance - Vox - Volume", "auto_range": [0, 12800],
+                          "points": [[0.0, 0.8, 0.0], [2.0, 0.0, 0.0]]},
+                         {"iid": 2, "kind": "Automation", "name": "Balance - Nowhere - Volume", "points": [[0.0, 0.5, 0.0]]},
+                         {"iid": 3, "kind": "Automation", "name": "Kick - Volume", "points": [[0.0, 0.5, 0.0]]}],
+            "patterns": [{"iid": 1, "name": "Beat", "notes": [{"rack": 0, "pos": 0, "len": 24, "key": 60}]}],
+            "arrangements": [{"tracks": [
+                {"iid": 1, "name": "Beat", "items": [{"kind": "PatternPLItem", "pattern": 1, "pos": 0, "len": 768}]},
+                {"iid": 2, "name": "Auto", "items": [{"kind": "ChannelPLItem", "channel": 1, "pos": 192, "len": 384},
+                                                     {"kind": "ChannelPLItem", "channel": 2, "pos": 0, "len": 96},
+                                                     {"kind": "ChannelPLItem", "channel": 3, "pos": 0, "len": 96}]}]}],
+            "mixer": [{"iid": 0, "name": null, "slots": []},
+                      {"iid": 1, "name": "Vox", "slots": [{"index": 0, "plugin": "Fruity Parametric EQ 2"}, {"index": 1, "plugin": "Fruity Balance"}]}]
+        });
+        let im = import(&inv, "ride", &probe).unwrap();
+        let bus = im.project.busses.values().find(|b| b.name == "Vox").expect("the Vox bus");
+        assert_eq!(bus.chain.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), vec!["eq", "gain"]);
+        let target = studio_core::AutoTarget::BusParam { bus: bus.id, effect: 1, key: studio_core::ParamKey::new("level").unwrap() };
+        let lane = im.project.automation.get(&target).unwrap_or_else(|| panic!("a level lane; report {:?}", im.report));
+        let v = |sec: f64| studio_core::eval_lane(lane, Ticks::from_seconds(sec));
+        // the clip starts at beat 2 (1.0 s): unity held before, silence from 2 beats in (2.0 s)
+        assert!((v(0.5) - 1.0).abs() < 1e-3, "held at the first value before the clip: {}", v(0.5));
+        assert!((v(1.0) - 1.0).abs() < 1e-3 && v(2.0) < 1e-3 && v(3.5) < 1e-3, "{} {} {}", v(1.0), v(2.0), v(3.5));
+        assert!(v(1.5) > 0.05 && v(1.5) < 0.95, "a ramp between: {}", v(1.5));
+        assert!(im.report.iter().any(|r| r.starts_with("MIXER AUTOMATION applied: 1 Fruity Balance volume clip as 1 lane")), "{:?}", im.report);
+        assert!(im.report.iter().any(|r| r.contains("no bus or slot to land on") && r.contains("Balance - Nowhere - Volume x1")), "{:?}", im.report);
+        assert!(im.report.iter().any(|r| r.starts_with("2 automation clips not applied")), "Nowhere + Kick - Volume: {:?}", im.report);
+        assert!(!im.report.iter().any(|r| r.starts_with("refused")), "{:?}", im.report);
     }
 
     #[test]
