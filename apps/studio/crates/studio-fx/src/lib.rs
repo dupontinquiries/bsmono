@@ -624,6 +624,13 @@ impl Instance {
     /// delay's time, a limiter's lookahead, a grain length, a channel
     /// count — buffer sizes, not values. `rate` is needed only by the
     /// delay's damping; every other setter is rate-free.
+    /// Tell an instance the song position (in frames) of the first sample it
+    /// is about to receive. Only effects whose decisions run on a grid of
+    /// their own need it (the autotune's analysis hops); for the rest, a no-op.
+    pub fn align(&mut self, at: i64) {
+        if let Instance::RealTune(t) = self { t.align(at); }
+    }
+
     pub fn set_param(&mut self, key: &str, v: f32, rate: f32) -> bool {
         match self {
             Instance::Gain(db, level) => match key {

@@ -310,6 +310,30 @@ impl RealtimeTune {
     /// instance, so a caller can compensate elsewhere if it needs to.
     pub fn latency_samples(&self) -> usize { self.shifters[0].buf.len() / 2 }
 
+    /// Put the analysis grid on the SONG's sample positions: the next input
+    /// frame is song frame `at`. A render started anywhere -- a seek, a
+    /// parallel export's segment -- then analyses at the same instants as a
+    /// render from the start. (Counted from the instance's creation, the grid
+    /// moved with every start, and so did every decision after it.)
+    pub fn align(&mut self, at: i64) {
+        let h = self.hop as i64;
+        let r = at.rem_euclid(h);
+        self.hop_countdown = if r == 0 { self.hop } else { (h - r) as usize };
+    }
+
+    /// Back to the state of a fresh instance -- at digital SILENCE, where there
+    /// is nothing to correct and nothing to remember: after any silent gap the
+    /// tuner is in the same state however the render began.
+    fn rest(&mut self) {
+        self.cents = 0.0;
+        self.last_target = None;
+        self.ratio = 1.0;
+        self.ratio_target = 1.0;
+        self.ratio_step = 0.0;
+        self.period = None;
+        for sh in self.shifters.iter_mut() { sh.frac = 0.0; sh.off = [0.0; 2]; sh.buf.fill(0.0); sh.write = 0; }
+    }
+
     /// The correction being applied right now, in cents.
     pub fn correction_cents(&self) -> f32 { self.cents }
 
@@ -376,6 +400,7 @@ impl RealtimeTune {
         // (mean square 1e-20), which only a filter's decaying ring reaches.
         let energy: f32 = dec.iter().map(|v| v * v).sum();
         let silent = energy <= 1e-20 * dec.len() as f32;
+        if silent { self.rest(); return; }
         let detected = if silent { None } else { yin_pitch(dec, dec_rate, self.lo_hz, self.hi_hz.min(dec_rate * 0.4), 0.15) }
             .map(|p| crate::retune::Pitch {
                 hz: refine_period(&self.frame, self.sample_rate / p.hz)
@@ -746,6 +771,29 @@ mod level_tests {
         let dec_rate = 48_000.0 / DECIMATION as f32;
         assert!(yin_pitch(&[0.0f32; 700], dec_rate, 70.0, 1_000.0, 0.15).is_none());
         assert!(yin_pitch(&[1e-12f32; 700], dec_rate, 70.0, 1_000.0, 0.15).is_none(), "a DC floor either");
+    }
+
+    /// A render that starts mid-song (a seek, a parallel export's segment)
+    /// must end up where one from the start is: aligned to the song position,
+    /// and past a silent gap, the two tuners' outputs are bit-identical.
+    #[test]
+    fn after_a_silence_a_tuner_started_mid_song_matches_one_from_the_start() {
+        let rate = 48_000usize;
+        let x: Vec<f32> = (0..rate * 5).map(|i| {
+            let t = i as f32 / rate as f32;
+            if (2.0..2.5).contains(&t) { 0.0 } else { 0.3 * (std::f32::consts::TAU * 213.0 * t).sin() }
+        }).collect();
+        let mut whole = RealtimeTune::new(Target::Notes(vec![]), rate as f32, 1);
+        whole.align(0);
+        let a: Vec<f32> = x.iter().map(|v| whole.process(*v)).collect();
+        let start = rate + 777; // mid-song, off the hop grid
+        let mut late = RealtimeTune::new(Target::Notes(vec![]), rate as f32, 1);
+        late.align(start as i64);
+        let b: Vec<f32> = x[start..].iter().map(|v| late.process(*v)).collect();
+        let from = rate * 5 / 2 + rate / 10; // 2.6 s: past the silence
+        assert!(a[from..].iter().zip(&b[from - start..]).all(|(p, q)| p.to_bits() == q.to_bits()), "identical after the gap");
+        // (and before the gap they are allowed to differ: different histories)
+        assert!(a[start + 4_800..rate * 2].iter().zip(&b[4_800..rate * 2 - start]).any(|(p, q)| p != q), "the test sees a difference before the gap");
     }
 
     /// Records the measured loss per pitch (always passes; prints).

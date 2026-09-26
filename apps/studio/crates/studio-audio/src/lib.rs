@@ -516,10 +516,10 @@ pub fn flush_denormals_to_zero() {
 /// like `imager`. Params: `amount` (0..1, 0.5), `spread` (0..1, 0.8),
 /// `detune` (cents, 8), `delay` (ms, 18; the second voice at 1.3x).
 #[derive(Debug, Clone)]
-pub struct Doubler { buf: Vec<f32>, pos: usize, phase: [f64; 2] }
+pub struct Doubler { buf: Vec<f32>, pos: usize }
 
 impl Doubler {
-    pub fn new(rate: u32) -> Doubler { Doubler { buf: vec![0.0; rate as usize / 10 + 4], pos: 0, phase: [0.0, 0.5] } }
+    pub fn new(rate: u32) -> Doubler { Doubler { buf: vec![0.0; rate as usize / 10 + 4], pos: 0 } }
 
     fn read(&self, delay: f64) -> f32 {
         let n = self.buf.len();
@@ -531,8 +531,14 @@ impl Doubler {
         at(i0) * (1.0 - t) + at(i0 + 1.0) * t
     }
 
-    /// Process stereo frames in place.
-    pub fn process(&mut self, frames: &mut [f32], p: &studio_core::Effect, rate: u32) {
+    /// Process stereo frames in place; `at` is the song position (in frames)
+    /// of the first one. The wobble's phase is a function of the song
+    /// position, not an accumulator from wherever the render began: a render
+    /// started mid-song -- a playback seek, a parallel export's segment --
+    /// wobbles exactly as the whole-song render does there. (Accumulated, it
+    /// differed forever after the start: a parallel export of A Top A Tower
+    /// came out -7 dB different from the serial one, sample for sample.)
+    pub fn process(&mut self, frames: &mut [f32], p: &studio_core::Effect, rate: u32, at: i64) {
         let q = |k: &str, d: f32| p.params.get(k).copied().unwrap_or(d);
         let (amount, spread) = (q("amount", 0.5).clamp(0.0, 1.0), q("spread", 0.8).clamp(0.0, 1.0));
         let (cents, delay_ms) = (q("detune", 8.0).clamp(0.0, 50.0) as f64, q("delay", 18.0).clamp(5.0, 45.0) as f64);
@@ -542,14 +548,16 @@ impl Doubler {
         let depth: [f64; 2] = rates.map(|f| (2f64.powf(cents / 1200.0) - 1.0) / (std::f64::consts::TAU * f) * r);
         let base = [delay_ms * 0.001 * r, delay_ms * 1.3 * 0.001 * r];
         let (near, far) = (0.5 + 0.5 * spread, 0.5 - 0.5 * spread);
-        for fr in frames.chunks_exact_mut(2) {
+        let offset = [0.0f64, 0.5];
+        for (i, fr) in frames.chunks_exact_mut(2).enumerate() {
             let n = self.buf.len();
             self.buf[self.pos] = 0.5 * (fr[0] + fr[1]);
             let mut v = [0.0f32; 2];
+            let song = (at + i as i64) as f64 / r;
             for k in 0..2 {
-                let d = base[k] + depth[k] * (std::f64::consts::TAU * self.phase[k]).sin() + depth[k];
+                let phase = (offset[k] + rates[k] * song).fract();
+                let d = base[k] + depth[k] * (std::f64::consts::TAU * phase).sin() + depth[k];
                 v[k] = self.read(d);
-                self.phase[k] = (self.phase[k] + rates[k] / r).fract();
             }
             self.pos = (self.pos + 1) % n;
             fr[0] += amount * (v[0] * near + v[1] * far);
@@ -669,20 +677,24 @@ impl EffectCache {
             .collect()
     }
 
-    fn clip_instances(&mut self, id: studio_core::ClipId, chain: &[studio_core::Effect], rate: f32) -> &mut [(usize, studio_fx::Instance)] {
+    /// `at`: the song frame of the first sample these instances will get --
+    /// fresh instances are aligned to it (studio_fx::Instance::align).
+    fn clip_instances(&mut self, id: studio_core::ClipId, chain: &[studio_core::Effect], rate: f32, at: i64) -> &mut [(usize, studio_fx::Instance)] {
         let entry = self.clip.entry(id).or_default();
         if entry.0 != chain {
             entry.0 = chain.to_vec();
             entry.1 = Self::build(chain, rate);
+            for (_, i) in entry.1.iter_mut() { i.align(at); }
         }
         &mut entry.1
     }
 
-    fn bus_instances(&mut self, id: studio_core::BusId, chain: &[studio_core::Effect], rate: f32) -> &mut [(usize, studio_fx::Instance)] {
+    fn bus_instances(&mut self, id: studio_core::BusId, chain: &[studio_core::Effect], rate: f32, at: i64) -> &mut [(usize, studio_fx::Instance)] {
         let entry = self.bus.entry(id).or_default();
         if entry.0 != chain {
             entry.0 = chain.to_vec();
             entry.1 = Self::build(chain, rate);
+            for (_, i) in entry.1.iter_mut() { i.align(at); }
         }
         &mut entry.1
     }
@@ -939,9 +951,16 @@ pub fn mixdown_parallel(
     };
     let next = std::sync::atomic::AtomicUsize::new(0);
     let at = |s: usize| Ticks::from_samples(from.to_samples(rate) + s as i64, rate);
-    std::thread::scope(|sc| {
-        for _ in 0..threads.min(segs) {
-            sc.spawn(|| loop {
+    // the JOIN: each later segment's worker keeps the last XF frames of its
+    // pre-roll -- the same instants as the previous segment's last XF -- and
+    // the output crossfades from one into the other there, so a join cannot
+    // step even where an effect's state never converges (the autotune's
+    // shifter position is the integral of its whole history)
+    let xf = ((rate as usize) / 20).min(preroll.to_samples(rate).max(0) as usize); // 50 ms
+    let tails: Vec<(usize, Vec<f32>)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..threads.min(segs)).map(|_| sc.spawn(|| {
+            let mut mine: Vec<(usize, Vec<f32>)> = Vec::new();
+            loop {
                 let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(&(a, b)) = bounds.get(k) else { break };
                 let mut cache = EffectCache::new();
@@ -951,6 +970,7 @@ pub fn mixdown_parallel(
                 let mut dst = slots[k].lock().expect("a segment");
                 let mut written = 0usize;
                 let end = at(b);
+                let mut pre: Vec<f32> = Vec::new();
                 while t < end {
                     let u = t.saturating_add(chunk).min(end);
                     // the pre-roll ends exactly at the segment start
@@ -960,12 +980,31 @@ pub fn mixdown_parallel(
                         let n = mix.len().min(dst.len() - written);
                         dst[written..written + n].copy_from_slice(&mix[..n]);
                         written += n;
+                    } else if k > 0 {
+                        pre.extend_from_slice(&mix);
+                        let keep = xf * 2;
+                        if pre.len() > keep { pre.drain(..pre.len() - keep); }
                     }
                     t = u;
                 }
-            });
-        }
+                if k > 0 && pre.len() == xf * 2 { mine.push((k, pre)); }
+            }
+            mine
+        })).collect();
+        hs.into_iter().flat_map(|h| h.join().expect("a render thread")).collect()
     });
+    drop(slots);
+    for (k, tail) in tails {
+        let join = bounds[k].0; // frames
+        if join < xf { continue; }
+        for i in 0..xf {
+            let w = (i + 1) as f32 / (xf + 1) as f32; // 0 -> 1: previous segment -> this one's pre-roll
+            for c in 0..2 {
+                let o = (join - xf + i) * 2 + c;
+                out[o] = out[o] * (1.0 - w) + tail[i * 2 + c] * w;
+            }
+        }
+    }
     out
 }
 
@@ -1104,7 +1143,7 @@ pub fn mixdown_into(
             // pattern rather than introducing a different one here. An
             // unknown effect kind is silently skipped via `instantiate`'s
             // `None`.
-            let clip_fx = cache.clip_instances(clip.id, &clip.effects, rate as f32);
+            let clip_fx = cache.clip_instances(clip.id, &clip.effects, rate as f32, clip.pos.max(from).to_samples(rate));
             // Parameter rides on this clip's chain, applied every
             // PARAM_BLOCK frames below. Empty for almost every clip.
             let clip_targets = project.clip_param_targets(clip.id);
@@ -1280,7 +1319,7 @@ pub fn mixdown_into(
         // `instantiate`'s `None`, the same "opens without the plugin"
         // behaviour every other effect host in this codebase has.
         if !bus.chain.is_empty() {
-            let instances = cache.bus_instances(id, &bus.chain, rate as f32);
+            let instances = cache.bus_instances(id, &bus.chain, rate as f32, from.to_samples(rate));
             let targets = project.bus_param_targets(id);
             let mut rides = ParamRide::resolve(project, &bus.chain, &targets);
             if rides.is_empty() {
@@ -1306,7 +1345,7 @@ pub fn mixdown_into(
             }
         }
         if let Some(fx) = doubler_of(bus) {
-            cache.doublers.entry(id).or_insert_with(|| Doubler::new(rate)).process(&mut buf, fx, rate);
+            cache.doublers.entry(id).or_insert_with(|| Doubler::new(rate)).process(&mut buf, fx, rate, from.to_samples(rate));
         }
         if let Some(widths) = imager_of(bus) {
             let entry = cache.imagers.entry(id).or_insert_with(|| (widths, studio_fx::imager::Imager::new(rate as f32, &IMAGER_SPLITS)));
@@ -1437,12 +1476,13 @@ mod parallel_tests {
     use super::*;
     use studio_core::{Bus, BusId, Clip, ClipId, Op, Source, Track, TrackId, TrackKind};
 
-    /// 40 s of noise bursts (0.15 s every 0.9 s) through a bus with reverb,
-    /// compressor and delay -- the stateful effects the pre-roll must settle.
+    /// Noise bursts (0.15 s every 0.9 s) through a bus with reverb,
+    /// compressor, delay and the DOUBLER -- stateful effects the pre-roll must
+    /// settle, and one whose wobble must follow the song position.
     fn busy_project(rate: u32, secs: f64) -> (Project, BTreeMap<SourceId, SourceAudio>) {
         let mut p = Project::default();
         p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), parent: None, gain: 1.0, silent: false, muted: false, sends: vec![],
-            chain: ["reverb", "compressor", "delay"].iter().map(|k| studio_core::Effect { kind: (*k).into(), enabled: true, params: Default::default() }).collect() } }).unwrap();
+            chain: ["reverb", "compressor", "delay", "doubler"].iter().map(|k| studio_core::Effect { kind: (*k).into(), enabled: true, params: Default::default() }).collect() } }).unwrap();
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "A".into(), muted: false, locked: false, gain: 1.0, route: Some(BusId(1)) }, at: 0 }).unwrap();
         let n = (rate as f64 * secs) as usize;
         let mut st = 0x1234_5678u32;
@@ -1481,8 +1521,10 @@ mod parallel_tests {
         eprintln!("PARALLEL vs serial: worst {:.1} dB re peak, rms {:.1} dB re signal", 20.0 * (worst / peak).log10(), 20.0 * (rms / sig).max(1e-12).log10());
         assert!(worst > 0.0, "two segments: a join exists, or this test measures nothing");
         assert!(20.0 * (worst / peak).log10() < -60.0 && 20.0 * (rms / sig).log10() < -80.0);
-        let half = serial.len() / 2;
-        assert!(par[..half].iter().zip(&serial[..half]).all(|(a, b)| a == b), "segment one is the serial render exactly");
+        // segment one is the serial render exactly, up to the 50 ms crossfade
+        // into segment two at its end
+        let exact = serial.len() / 2 - (rate as usize / 20) * 2;
+        assert!(par[..exact].iter().zip(&serial[..exact]).all(|(a, b)| a == b), "segment one is the serial render exactly");
     }
 }
 
@@ -3439,10 +3481,10 @@ mod duck_tests {
         let voice: Vec<f32> = (0..rate as usize).flat_map(|i| { let x = 0.3 * ((i as f32) * 0.037).sin() * ((i as f32) * 0.0011).sin(); [x, x] }).collect();
         let fx = |amt: f32| Effect { kind: "doubler".into(), enabled: true, params: [("amount".to_string(), amt)].into() };
         let mut zero = voice.clone();
-        Doubler::new(rate).process(&mut zero, &fx(0.0), rate);
+        Doubler::new(rate).process(&mut zero, &fx(0.0), rate, 0);
         assert_eq!(zero, voice, "amount 0 changes nothing");
         let mut wet = voice.clone();
-        Doubler::new(rate).process(&mut wet, &fx(0.5), rate);
+        Doubler::new(rate).process(&mut wet, &fx(0.5), rate, 0);
         assert_eq!(&wet[..2 * 700], &voice[..2 * 700], "the copies are late: nothing added in the first 14 ms");
         let side = wet.chunks(2).skip(4800).map(|f| (f[0] - f[1]).powi(2)).sum::<f32>();
         let e = |v: &[f32]| v.iter().skip(9600).map(|x| x * x).sum::<f32>();
