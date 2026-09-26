@@ -71,14 +71,33 @@ pub struct Imported {
 /// until c20, which put every channel of Blue Moon hard right.
 pub fn fl_pan(v: f64) -> f32 { ((v - 6400.0) / 6400.0).clamp(-1.0, 1.0) as f32 }
 
-/// A channel's level on what it plays: its volume (10000 = unity, FL's
-/// default) times, when the sample is NORMALIZEd in FL, the gain that brings
-/// the file's peak to full scale -- FL applies that before the channel.
-pub fn channel_gain(c: &Value, m: Option<Media>) -> f32 {
-    let vol = (c["volume"].as_f64().unwrap_or(10000.0) / 10000.0) as f32;
+/// FL's volume LAWS -- not linear; read as linear until c20, which made every
+/// low fader far too loud (a fader at 0.30 read -10.5 dB; this law, -30).
+/// From Image-Line's own numbers: the CHANNEL knob at 100% (12800) is 0 dB
+/// and at its default 78% (10000) -5.2 dB; the MIXER fader at its default 80%
+/// (12800) is 0 dB and at 100% (16000) +5.6 dB. Between those points a power
+/// law through them -- an ASSUMPTION about the curve's shape, close, not
+/// FL's exact table.
+pub const FL_KNOB_EXP: f64 = 2.425;   // (10000/12800)^n = -5.2 dB
+pub const FL_FADER_EXP: f64 = 2.890;  // (16000/12800)^n = +5.6 dB
+/// Audio clips play at 0 dB with the knob at its -5.2 dB default (Image-Line):
+/// a clip's level is the knob's, +5.2 dB.
+pub const FL_CLIP_OFFSET_DB: f64 = 5.2;
+pub fn fl_knob_gain(v: f64) -> f32 { (v.max(0.0) / 12800.0).powf(FL_KNOB_EXP) as f32 }
+pub fn fl_fader_gain(v: f64) -> f32 { (v.max(0.0) / 12800.0).powf(FL_FADER_EXP) as f32 }
+
+/// A channel's level on what it plays: its volume by FL's knob law (and, for
+/// an AUDIO CLIP, the +5.2 dB FL gives clips) times, when the sample is
+/// NORMALIZEd in FL, the gain that brings the file's peak to full scale.
+pub fn channel_gain_for(c: &Value, m: Option<Media>, clip: bool) -> f32 {
+    let knob = fl_knob_gain(c["volume"].as_f64().unwrap_or(10000.0));
+    let vol = if clip { knob * 10f32.powf(FL_CLIP_OFFSET_DB as f32 / 20.0) } else { knob };
     let norm = match m { Some(m) if c["normalize"].as_bool() == Some(true) && m.peak > 1e-4 => 1.0 / m.peak, _ => 1.0 };
     vol * norm
 }
+
+/// As played by notes (a rack channel).
+pub fn channel_gain(c: &Value, m: Option<Media>) -> f32 { channel_gain_for(c, m, false) }
 
 /// A Pitcher slot's settings as Studio autotune params, and a line saying
 /// what was read. The NOTE MASK is decoded (twelve switches, C first); it maps
@@ -276,7 +295,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         // busiest pattern on a full-level stand-in: the loudest thing in the mix.
         let off = c["enabled"].as_bool() == Some(false);
         if off { switched_off.push(ch_name(c)); }
-        rack.channels.push(Channel { name: ch_name(c), kind, gain: channel_gain(c, media).clamp(0.0, 16.0),
+        rack.channels.push(Channel { name: ch_name(c), kind, gain: channel_gain(c, media).clamp(0.0, 64.0),
                                      pan, muted: off, choke_group: None });
     }
     if !stand_ins.is_empty() {
@@ -371,7 +390,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         let id = BusId(1);
         busses.insert(0, id);
         ops.push(Op::AddBus { bus: Bus { id, name: "Master".into(), parent: None,
-            gain: (f(&m["volume"]).unwrap_or(12800.0) / 12800.0) as f32, chain, sends: Vec::new(), muted: false, silent: false } });
+            gain: fl_fader_gain(f(&m["volume"]).unwrap_or(12800.0)), chain, sends: Vec::new(), muted: false, silent: false } });
     }
     let mut sidechains: Vec<(i64, i64)> = Vec::new();
     // Create the bus for `insert` -- its destinations FIRST, so a parent
@@ -386,7 +405,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         if insert <= 0 || depth > 32 { return None; }
         let m = *mixer.get(&insert)?;
         let routes: Vec<(i64, f32)> = m["routes"].as_array().into_iter().flatten()
-            .filter_map(|r| Some((i(&r["to"])?, (f(&r["level"]).unwrap_or(12800.0) / 12800.0) as f32))).collect();
+            .filter_map(|r| Some((i(&r["to"])?, fl_fader_gain(f(&r["level"]).unwrap_or(12800.0))))).collect();
         // FL: an insert whose routing is KNOWN and routes nowhere outputs
         // nothing -- Blue Moon's "LowMeter", fed the kick and the 808 at full
         // level for a peak controller, was sent to the master until c20 and
@@ -416,7 +435,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         let label = s(&m["name"]).map(str::to_string).unwrap_or_else(|| format!("Insert {insert}"));
         let chain = chain_of(m, &label, unmapped, approx);
         let name = s(&m["name"]).map(str::to_string).unwrap_or_else(|| format!("Insert {insert}"));
-        let gain = (f(&m["volume"]).unwrap_or(12800.0) / 12800.0) as f32;
+        let gain = fl_fader_gain(f(&m["volume"]).unwrap_or(12800.0));
         ops.push(Op::AddBus { bus: Bus { id, name, parent, gain, chain,
             sends: sends.into_iter().filter(|(_, level)| *level > 0.0)
                 .map(|(to, level)| studio_core::Send { to, level, pre_fader: false }).collect(),
@@ -476,11 +495,11 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                         if let Some(mode) = i(&c["stretch_mode"]) { stretch_modes.insert(ch_name(c), mode); }
                         let src_in = Ticks::from_seconds(off.max(0.0) / 1000.0 / r);
                         let len = len_t.min(Ticks::from_seconds(m.len.to_seconds() / r).saturating_sub(src_in));
-                        if len > Ticks::ZERO { clips.push((sid, pos, src_in, len, channel_gain(c, Some(m)))); }
+                        if len > Ticks::ZERO { clips.push((sid, pos, src_in, len, channel_gain_for(c, Some(m), true))); }
                     } else {
                     let src_in = if off > 0.0 { Ticks::from_seconds(off / 1000.0) } else { Ticks::ZERO };
                     let len = len_t.min(m.len.saturating_sub(src_in));
-                    if len > Ticks::ZERO { clips.push((id, pos, src_in, len, channel_gain(c, Some(m)))); }
+                    if len > Ticks::ZERO { clips.push((id, pos, src_in, len, channel_gain_for(c, Some(m), true))); }
                     }
                     first_insert = first_insert.or(i(&c["insert"]));
                     label.get_or_insert_with(|| ch_name(c));
@@ -645,7 +664,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     }
     let panned = mixer.values().filter(|m| f(&m["pan"]).is_some_and(|p| p != 0.0) && busses.contains_key(&i(&m["iid"]).unwrap_or(-1))).count();
     if panned > 0 { report.push(format!("{panned} insert pan{} imported as bus balance", if panned == 1 { "" } else { "s" })); }
-    report.push("faders are FL's value / 12800 as linear gain: FL's fader law is not linear, so levels are close, not exact".into());
+    report.push(format!("levels by FL's volume laws: channel knob (v/12800)^{FL_KNOB_EXP} (78% = -5.2 dB; audio clips +{FL_CLIP_OFFSET_DB} dB), mixer fader and sends (v/12800)^{FL_FADER_EXP} (80% = 0 dB, 100% = +5.6 dB) -- through Image-Line's published points; the curve between them is assumed, so close, not exact"));
     if !missing.is_empty() { report.push(format!("media not found beside the project: {}", missing.join(", "))); }
     Ok(Imported { project: p, rack, report, stretches })
 }
@@ -755,18 +774,20 @@ mod tests {
     }
 
     /// Blue Moon's female lead: a quiet take (peak -18 dB here), FL channel
-    /// at half volume, NORMALIZE on. The clip carries 0.5 x 1/0.125 = 4.
+    /// knob at 5000, NORMALIZE on: knob law x clip offset x 1/0.125.
     #[test]
     fn a_normalized_quiet_take_is_brought_up_as_fl_does_and_centre_pan_is_centre() {
         let im = import(&inventory(), "demo", &probe).unwrap();
         let vt = im.project.tracks.iter().find(|t| t.name == "Vocals").unwrap();
         let clip = &im.project.track_clips(vt.id)[0];
-        assert!((clip.gain - 4.0).abs() < 1e-5, "volume 0.5 x normalize 8 = 4, got {}", clip.gain);
+        let want = fl_knob_gain(5000.0) * 10f32.powf(5.2 / 20.0) * 8.0;
+        assert!((clip.gain - want).abs() < 1e-4, "knob law x clip offset x normalize 8 = {want}, got {}", clip.gain);
         assert_eq!(fl_pan(6400.0), 0.0);
         assert_eq!(fl_pan(0.0), -1.0);
         assert_eq!(fl_pan(12800.0), 1.0);
         let kick = im.rack.channels.iter().find(|c| c.name == "Kick").unwrap();
-        assert!((kick.gain - 1.0).abs() < 1e-6, "not normalized: its volume alone");
+        assert!((20.0 * kick.gain.log10() + 5.2).abs() < 0.05, "a rack channel at the default knob is -5.2 dB, as FL says: {}", kick.gain);
+        assert!((fl_knob_gain(12800.0) - 1.0).abs() < 1e-6 && (20.0 * fl_fader_gain(16000.0).log10() - 5.6).abs() < 0.05, "the published points");
     }
 
     #[test]
@@ -828,9 +849,9 @@ mod tests {
         let meter = by("Meter");
         assert!(meter.silent, "routing known, no route out: silent in FL, silent here");
         assert_eq!(drums.sends.len(), 2, "the reverb and the meter; the level-0 sidechain route is not a send: {:?}", drums.sends);
-        assert_eq!((drums.sends[0].to, drums.sends[0].level), (verb.id, 0.5), "and sends to the reverb at half");
+        assert_eq!((drums.sends[0].to, drums.sends[0].level), (verb.id, fl_fader_gain(6400.0)), "and sends to the reverb, by the fader law");
         assert_eq!(vox.parent, Some(group.id), "no master route: its first destination is its output");
-        assert_eq!((vox.sends[0].to, vox.sends[0].level), (verb.id, 0.25));
+        assert_eq!((vox.sends[0].to, vox.sends[0].level), (verb.id, fl_fader_gain(3200.0)));
         assert_eq!(group.parent, Some(master.id));
         let duck = group.chain.iter().find(|e| e.kind == "duck").expect("the level-0 route Drums -> Vocal group is a sidechain duck");
         assert_eq!(duck.params["key"] as u64, drums.id.0, "keyed by the source");
@@ -851,7 +872,7 @@ mod tests {
         let im = import(&inventory(), "demo", &probe).unwrap();
         let p = &im.project;
         let vox = p.busses.values().find(|b| b.name == "Vox bus").expect("a bus per used insert");
-        assert!((vox.gain - 0.5).abs() < 1e-6);
+        assert!((vox.gain - fl_fader_gain(6400.0)).abs() < 1e-6 && vox.gain < 0.2, "fader 6400 by the fader law, not 0.5: {}", vox.gain);
         assert_eq!(vox.chain.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), vec!["autotune", "saturation"],
                    "a VST by its slot name: the Ozone exciter as saturation");
         assert!((vox.chain[1].params["drive"] - 0.15).abs() < 1e-6, "gentle, not the full drive");
