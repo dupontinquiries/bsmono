@@ -77,20 +77,23 @@ const SWAY_MAX: f32 = 0.06; // sway clamp (m)
 const SWAY_ROLL: f32 = 0.5; // look-delta → roll gain (rad)
 const ROLL_MAX: f32 = 0.18; // roll clamp (rad)
 
-/// Per-form base pose (offset, orientation, scale) before bob/sway. Items are
+/// Per-form base pose (offset, orientation, scale) before bob/sway. The grip
+/// must sit inside the game camera's frame (60° vertical field of view, 16:9):
+/// the first offsets here put it 45-50° off-axis, below the bottom edge, so
+/// nothing held was ever on screen (`the_grip_is_inside_the_game_cameras_frame`). Items are
 /// modelled along +Z and yawed ≈π so their length points into the screen (−Z
 /// view = forward), angled slightly across the view for the held look.
 fn base_pose(form: ItemForm) -> ViewmodelPose {
     const PI: f32 = std::f32::consts::PI;
     match form {
         // long staff held more upright, pushed forward
-        ItemForm::Staff => ViewmodelPose { offset: [0.24, -0.26, -0.30], yaw: PI - 0.10, pitch: 0.18, roll: 0.05, scale: 1.0 },
+        ItemForm::Staff => ViewmodelPose { offset: [0.24, -0.22, -0.55], yaw: PI - 0.30, pitch: 0.40, roll: 0.10, scale: 0.8 },
         // axe: heavier, lower, canted
-        ItemForm::Axe => ViewmodelPose { offset: [0.30, -0.34, -0.30], yaw: PI - 0.25, pitch: 0.05, roll: 0.18, scale: 1.0 },
+        ItemForm::Axe => ViewmodelPose { offset: [0.26, -0.22, -0.52], yaw: PI - 0.55, pitch: 0.45, roll: 0.25, scale: 0.8 },
         // blade: angled across, forward
-        ItemForm::Blade => ViewmodelPose { offset: [0.28, -0.30, -0.32], yaw: PI - 0.35, pitch: 0.10, roll: 0.12, scale: 1.0 },
+        ItemForm::Blade => ViewmodelPose { offset: [0.26, -0.22, -0.52], yaw: PI - 0.50, pitch: 0.40, roll: 0.20, scale: 0.8 },
         // tool: small, close, low
-        ItemForm::Tool => ViewmodelPose { offset: [0.26, -0.32, -0.30], yaw: PI - 0.18, pitch: 0.00, roll: 0.08, scale: 0.85 },
+        ItemForm::Tool => ViewmodelPose { offset: [0.24, -0.20, -0.48], yaw: PI - 0.35, pitch: 0.30, roll: 0.12, scale: 0.75 },
     }
 }
 
@@ -422,6 +425,22 @@ mod tests {
                     assert!(c[2] < 0.0, "held item sits in front of the camera (view z<0), got z={}", c[2]);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_grip_is_inside_the_game_cameras_frame() {
+        // render::camera's fov_y is π/3; a 16:9 window. Keep a margin so bob
+        // and sway (bounded above) never push it out.
+        let half_v = (std::f32::consts::FRAC_PI_3 * 0.5).tan();
+        let half_h = half_v * 16.0 / 9.0;
+        for f in FORMS {
+            let o = base_pose(f).offset;
+            let depth = -o[2];
+            assert!(depth > 0.3, "{f:?}: far enough to be drawn whole ({depth})");
+            assert!(o[0].abs() / depth < half_h * 0.8, "{f:?}: inside horizontally");
+            assert!(o[1].abs() / depth < half_v * 0.85, "{f:?}: inside vertically ({:.2} vs {:.2})", o[1].abs() / depth, half_v);
+            assert!(o[0] > 0.0 && o[1] < 0.0, "{f:?}: low and to the right");
         }
     }
 

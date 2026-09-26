@@ -101,7 +101,11 @@ void main() {
     // as it approaches the eye instead of hard-popping at one distance.
     const float NEAR_CUTOUT_START = 1.35; // world units; solid outside this
     const float NEAR_CUTOUT_FULL  = 0.30; // world units; fully gone inside this
-    if (dist < NEAR_CUTOUT_START) {
+    // A vertex alpha above 1 marks geometry that is MEANT to sit at the eye:
+    // the first-person viewmodel (the item in hand, 0.3-0.8 m away). It is
+    // opaque and exempt from the cutout, which otherwise discarded it whole.
+    bool at_eye = v_alpha > 1.5;
+    if (dist < NEAR_CUTOUT_START && !at_eye) {
         float cutout = clamp(
             (NEAR_CUTOUT_START - dist) / (NEAR_CUTOUT_START - NEAR_CUTOUT_FULL),
             0.0, 1.0);
@@ -146,5 +150,5 @@ void main() {
     if (v_alpha < 0.03) {
         discard;
     }
-    out_color = vec4(color, v_alpha);
+    out_color = vec4(color, at_eye ? 1.0 : v_alpha);
 }
