@@ -125,6 +125,25 @@ pub fn v4l2_names(root: &Path) -> Vec<String> {
     out
 }
 
+/// Stateful decoder nodes: (`/dev/videoN`, name) for every V4L2 node whose
+/// name says decoder (Venus: "qcom-venus-decoder"), sorted.
+pub fn decoder_nodes(root: &Path) -> Vec<(String, String)> {
+    let dir = root.join("sys/class/video4linux");
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for p in paths {
+            let (Some(node), Ok(name)) = (p.file_name().map(|n| n.to_string_lossy().into_owned()), std::fs::read_to_string(p.join("name"))) else { continue };
+            let name = name.trim().to_string();
+            if name.to_ascii_lowercase().contains("decoder") {
+                out.push((format!("/dev/{node}"), name));
+            }
+        }
+    }
+    out
+}
+
 /// The bound DRM driver, if any.
 pub fn gpu_driver(root: &Path) -> Option<String> {
     let dir = root.join("sys/class/drm");
@@ -463,5 +482,13 @@ mod tests {
         let r = FakeRoot::new("order");
         r.v4l2("video3", "third").v4l2("video1", "first").v4l2("video2", "second");
         assert_eq!(v4l2_names(r.path()), vec!["first", "second", "third"]);
+    }
+
+    /// The Fairphone 5 shape: Venus registers an encoder and a decoder node.
+    #[test]
+    fn the_decoder_node_is_found_by_name() {
+        let r = FakeRoot::new("venus-nodes");
+        r.v4l2("video1", "qcom-venus-encoder").v4l2("video0", "qcom-venus-decoder").v4l2("video2", "camss");
+        assert_eq!(decoder_nodes(r.path()), vec![("/dev/video0".to_string(), "qcom-venus-decoder".to_string())]);
     }
 }

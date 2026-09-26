@@ -33,6 +33,8 @@ mod audio_out;
 mod gpu_selftest;
 #[cfg(feature = "libav")]
 mod inproc;
+#[cfg(feature = "libav")]
+mod v4l2src;
 mod enhance_plan;
 mod decode;
 mod export;
@@ -1829,7 +1831,7 @@ fn file_opener(p: PathBuf) -> playback::Opener {
         let pr = probed(&cache, || decode::probe(&p))?;
         let accel = decode::accel_for(&pr.codec);
         #[cfg(feature = "libav")]
-        let inproc = inproc::open(&p, &pr, from, &accel);
+        let inproc = v4l2src::open(&p.to_string_lossy(), &[], &pr, from).or_else(|| inproc::open(&p, &pr, from, &accel));
         #[cfg(not(feature = "libav"))]
         let inproc: Option<Box<dyn decode::VideoSource>> = None;
         let v: Box<dyn decode::VideoSource> = match inproc {
@@ -1849,7 +1851,7 @@ fn stream_opener(input: decode::StreamingInput, _format_cap: Option<u32>) -> pla
         let pr = probed(&cache, || decode::probe_input(&input.video_url, &input.headers))?;
         let accel = decode::accel_for(&pr.codec);
         #[cfg(feature = "libav")]
-        let inproc = inproc::open_input(&input.video_url, &input.headers, &pr, from, &accel);
+        let inproc = v4l2src::open(&input.video_url, &input.headers, &pr, from).or_else(|| inproc::open_input(&input.video_url, &input.headers, &pr, from, &accel));
         #[cfg(not(feature = "libav"))]
         let inproc: Option<Box<dyn decode::VideoSource>> = None;
         let v: Box<dyn decode::VideoSource> = match inproc {

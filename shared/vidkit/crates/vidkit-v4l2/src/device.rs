@@ -154,6 +154,15 @@ impl Device {
     /// vendor-specific tiled format such as `V4L2_PIX_FMT_QC08C`, which maps to
     /// a Qualcomm compressed modifier. Defaulting to linear is safe only for
     /// the former — see the warning in `vidkit-vk`.
+    /// Sleep until the device has something (a decoded frame, a free input
+    /// buffer, an event) or `timeout_ms` passes. The fd is non-blocking, so
+    /// without this a caller can only spin.
+    pub fn wait(&self, timeout_ms: i32) {
+        let mut p = libc::pollfd { fd: self.fd.as_raw_fd(), events: libc::POLLIN | libc::POLLOUT | libc::POLLPRI, revents: 0 };
+        // SAFETY: one pollfd on the stack.
+        unsafe { libc::poll(&mut p, 1, timeout_ms) };
+    }
+
     pub fn set_modifier(&mut self, modifier: u64) {
         self.modifier = modifier;
     }

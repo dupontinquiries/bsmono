@@ -190,14 +190,20 @@ mod tests {
     fn this_process_is_measurable() {
         let t = thread_ticks();
         assert!(t.contains_key("children"));
-        let total: u64 = t.values().sum();
+        // THIS thread's ticks: the process total is not monotonic while the
+        // parallel suite runs -- other test threads and their ffmpeg
+        // children exit between the two samples and take their ticks with
+        // them (why this failed now and then under load).
+        let tid = unsafe { libc::gettid() };
+        let mine = || std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok().as_deref().and_then(stat_ticks).map(|s| s.1).unwrap();
+        let total = mine();
         let spin = Instant::now();
         let mut x = 0u64;
         while spin.elapsed().as_millis() < 120 {
             x = x.wrapping_mul(31).wrapping_add(7);
         }
         std::hint::black_box(x);
-        let after: u64 = thread_ticks().values().sum();
+        let after = mine();
         assert!(after > total, "120 ms of spinning did not show up");
     }
 }

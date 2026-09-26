@@ -22,6 +22,8 @@ use std::time::Duration;
 use ffmpeg_sys_next as ff;
 use vidkit_core::frame::{BufferOwner, DmaBufImage, DmaBufPlane, Frame, FrameData, PlaneLayout};
 
+pub mod bitstream;
+pub mod demux;
 pub mod frame_out;
 pub mod grain;
 
