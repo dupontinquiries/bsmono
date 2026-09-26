@@ -3829,8 +3829,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // "1" = create a world AND walk; "walk" = walk only once InGame (the
     // JOINER's mode in dual-process soaks — its world comes from the host).
     let fg_autoplay_raw = std::env::var("UNENDLICH_AUTOPLAY").unwrap_or_default();
-    let fg_autoplay: bool = fg_autoplay_raw == "1";
+    let fg_autoplay: bool = fg_autoplay_raw == "1" || fg_autoplay_raw == "fight";
     let fg_autoplay_walk: bool = fg_autoplay || fg_autoplay_raw == "walk";
+    // UNENDLICH_AUTOPLAY=fight: a soak DRIVER, not a player -- it knows where the
+    // nearest dragon truly is, walks to it, faces it and swings. Exists to put
+    // the real melee path (swing_touches, item vs genome, the dragon's memory,
+    // a hit ending its shell game) through the running game.
+    let fg_autoplay_fight: bool = fg_autoplay_raw == "fight";
+    let mut autoplay_swing: bool;
     // 0 = idle, 1 = wizard requested (waiting for the panel to show it),
     // 2 = spree armed. Two stages because the panel reflects the app ONE
     // frame late and the spree self-cancels when the panel lags (each frame
@@ -8875,6 +8881,34 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             move_local.x += 1.0; // forward
             local_player.view.yaw += 0.25 * dt; // ~14°/s — a lazy arc
         }
+        autoplay_swing = false;
+        if fg_autoplay_fight
+            && matches!(fg_app.state(), unendlich_engine::sim::game_flow::AppState::InGame)
+            && !game_paused
+        {
+            let pp = local_player.view.position;
+            let target = roamers
+                .iter()
+                .filter(|r| r.duel.is_some() && r.hp > 0 && r.rig.dying.is_none())
+                .map(|r| (r.creature.body.position, r.creature.body.half_extents))
+                .min_by(|a, b| {
+                    let d = |p: [f32; 3]| (p[0] - pp.x).powi(2) + (p[2] - pp.z).powi(2);
+                    d(a.0).partial_cmp(&d(b.0)).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            if let Some((tp, he)) = target {
+                let (dx, dy, dz) = (tp[0] - pp.x, tp[1] - pp.y, tp[2] - pp.z);
+                let horiz = (dx * dx + dz * dz).sqrt();
+                local_player.view.yaw = dz.atan2(dx);
+                local_player.view.pitch = dy.atan2(horiz.max(0.1)).clamp(-1.2, 1.2);
+                let r = he[0].max(he[2]);
+                // Press in to arm's length; the dragon keeps its gap just outside
+                // a bare hand's reach, so hits land when it commits to a lunge.
+                if horiz > r + 0.3 {
+                    move_local.x += 1.0;
+                }
+                autoplay_swing = horiz < r + 4.0;
+            }
+        }
 
         match body.as_mut() {
             None => {
@@ -11423,7 +11457,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     .surface_y_at(dp[0].floor() as i32, dp[2].floor() as i32, probe_y_min, probe_y_max)
                                     .map(|y| y as f32 + 1.0)
                                     .unwrap_or(dp[1]);
-                                cr.body.position = [dp[0], gy + cr.body.half_extents[1], dp[2]];
+                                // Circling, it stands on the ground under its draft. Striking,
+                                // it comes down to YOUR level (a soak had it bite from a
+                                // hillside 17 m above the player).
+                                let y = if tick.strike_in.is_some() || tick.struck {
+                                    (pp.y - 1.6).min(gy) + cr.body.half_extents[1]
+                                } else {
+                                    gy + cr.body.half_extents[1]
+                                };
+                                cr.body.position = [dp[0], y, dp[2]];
                                 cr.yaw = (pp.z - dp[2]).atan2(pp.x - dp[0]);
                                 *flying = false;
                                 for v in sh.volumes(d.id) {
@@ -11444,8 +11486,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     eye_view_t = unendlich_engine::sim::smoke_wall::transmittance(&smoke_all, pv.eye, head, 1.0);
                                 }
                                 if tick.struck {
-                                    let reach = dbody.radius() + dd::LUNGE_REACH + sh.radius * 0.6;
-                                    let dist = ((pp.x - dp[0]).powi(2) + (pp.z - dp[2]).powi(2)).sqrt();
+                                    let reach = dbody.radius() + dd::LUNGE_REACH;
+                                    let c = cr.body.position;
+                                    let dist = ((pp.x - c[0]).powi(2) + (pp.y - 1.0 - c[1]).powi(2) + (pp.z - c[2]).powi(2)).sqrt();
                                     if dist <= reach {
                                         if survival_mode {
                                             fg_app.vitality_mut().tick(1.0, d.profile.bite_damage * 0.004 * player_dmg_resist);
@@ -12062,7 +12105,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // edge detection alone would only do one edit per click — fine for
         // building, frustrating for breaking through walls. Cooldown is the
         // middle ground.
-        let mouse_left_held = input.is_mouse_button_pressed(MouseBtn::Left);
+        let mouse_left_held = input.is_mouse_button_pressed(MouseBtn::Left) || autoplay_swing;
         let mouse_right_held = input.is_mouse_button_pressed(MouseBtn::Right);
         // r486: snapshot so we can detect when an action actually fires (any of
         // the break/place/use sites resets last_block_action) → swing the hand.
@@ -12087,7 +12130,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // r573: PLACE sphere is HALF the mining sphere (operator) — building reads as a
         // mound, not a crater-sized blob.
         let place_radius: i32 = (dig_radius / 2).max(if dig_radius > 0 { 1 } else { 0 });
-        if mouse_captured && cooldown_ok && (break_allowed || place_allowed) {
+        if (mouse_captured || autoplay_swing) && cooldown_ok && (break_allowed || place_allowed) {
             let cam_forward = local_player.forward();
             // v0.24.23 propagation: route the player block-selection
             // raycast through the octree-backed hierarchical raycast
@@ -12262,6 +12305,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // A swing that found no creature with a dragon close by is
                     // a whiff; next frame's roamer loop hands it to the duel.
                     last_swing_whiffed = best.is_none() && dragon_near;
+                    // Fight-driver diagnostics only (autoplay_swing is set only by
+                    // UNENDLICH_AUTOPLAY=fight); hits are logged anyway.
+                    if autoplay_swing && best.is_none() {
+                        let near_dragon = roamers.iter().filter(|r| r.duel.is_some()).map(|r| {
+                            let p = r.creature.body.position;
+                            (((p[0] - eye.x).powi(2) + (p[2] - eye.z).powi(2)).sqrt(), p[1] - eye.y, r.creature.body.half_extents)
+                        }).min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                        log::info!(
+                            "[autoplay-fight] swing: reach {:.1}, dragon near {}, hit {} (dragon {:?} = horiz m, dy m, half-extents)",
+                            attack_reach, dragon_near, best.is_some(), near_dragon
+                        );
+                    }
                     if let Some((ri, _)) = best {
                         // r-weapon-fix: was a fixed `{ element: Earth, magnitude: 12 }`
                         // regardless of what was equipped, so every attack — bare
@@ -12337,9 +12392,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         );
                         let dmg_dealt = if let Some(d) = target.duel.as_mut() {
                             use unendlich_engine::sim::dragon_duel as dd;
-                            let threat = player_item_threat(
+                            let mut threat = player_item_threat(
                                 survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
                             );
+                            // The same test override the dragons' senses see.
+                            if player_element_override.is_some() {
+                                threat.element = player_element_override;
+                            }
                             let body = dd::DragonBody { pos: dp, yaw: dyaw, half_extents: he };
                             let (zone, h) = dd::take_hit(&d.profile, &mut d.state, &body, [eye.x, eye.y, eye.z], &threat);
                             if d.shells.take().is_some() {

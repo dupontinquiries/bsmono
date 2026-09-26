@@ -50,6 +50,9 @@ pub struct Shells {
     /// Draft radius and height (m): big enough to swallow this dragon.
     pub radius: f32,
     pub height: f32,
+    /// The dragon's own body radius: a strike closes to within reach of it,
+    /// so a strike is also your opening to hit back.
+    pub body_radius: f32,
     pub left: f32,
     pub strike: Strike,
     cunning: f32,
@@ -121,6 +124,7 @@ impl Shells {
             hidden,
             radius,
             height,
+            body_radius: body_radius.max(0.5),
             left: duration.max(0.0),
             strike: Strike::Idle { next_in: 6.0 + 4.0 * h01(seed, 998) },
             cunning,
@@ -156,11 +160,19 @@ impl Shells {
             if darting {
                 // The striking draft leaves its orbit toward the player.
                 let k = match self.strike {
-                    Strike::Dart { t, dur } => (t / dur).clamp(0.0, 1.0),
+                    // Arrives at 80% of the dart and holds: the blow lands
+                    // from full reach, not from where it was a tick earlier.
+                    Strike::Dart { t, dur } => (t / (dur * 0.8)).clamp(0.0, 1.0),
                     Strike::Recover { t } => (1.0 - t / 1.5).clamp(0.0, 1.0),
                     Strike::Idle { .. } => 0.0,
                 };
-                let reach = 1.0 - (self.radius * 0.6 + 2.0) / (dist2(orbit, center).sqrt().max(1.0));
+                // Close until its body's edge is ~0.8 m from you: in its bite
+                // reach, and in yours. (Stopping at the DRAFT's edge left it
+                // 6 m out -- it could bite from there and nothing could hit it.)
+                // 0.8 m, not more: a size-3 dragon is ~19 m long (body radius
+                // 9.5), and at 1.5 m past it a bare hand (1.2 m) could not
+                // reach back -- a fight-driver soak swung at air for minutes.
+                let reach = 1.0 - (self.body_radius + 0.8) / (dist2(orbit, center).sqrt().max(1.0));
                 let e = k * reach.clamp(0.0, 1.0);
                 for a in 0..3 {
                     d.pos[a] = orbit[a] + (center[a] - orbit[a]) * e;
@@ -354,7 +366,7 @@ mod tests {
             closest = closest.min(dist2(s.dragon_pos(), [0.0, 64.0, 0.0]).sqrt());
             if t.struck {
                 assert!(warned, "struck without a warning window");
-                assert!(closest < s.radius + 3.0, "struck from {closest:.1} m");
+                assert!(closest < s.body_radius + 2.0, "struck from {closest:.1} m (body {})", s.body_radius);
                 return;
             }
         }
