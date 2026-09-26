@@ -3462,7 +3462,13 @@ fn top_subdivision_for_block(pos: [f32; 3]) -> i32 {
 /// by detected hardware tier (mirroring `device_budget::recommend_preset`) is
 /// a reasonable follow-up once real numbers from a running session are in
 /// hand; not done here to keep this change to the one thing it's for.
-const MAX_PLANT_STAMPS_PER_CHUNK_DEFAULT: u32 = 512;
+/// Plant stamps per chunk at full detail (the view-cone scale thins chunks the
+/// player is not facing). 512 let one forest chunk reach ~410K triangles of
+/// foliage at ~800 per leaf; with merged templates (~320 per leaf) 150 caps
+/// foliage near 48K, inside the 90K tripwire with room for the terrain. A
+/// canopy's CORE is not a stamp (foliage_depth) and is not capped by this.
+/// UNENDLICH_MAX_PLANT_STAMPS overrides it.
+const MAX_PLANT_STAMPS_PER_CHUNK_DEFAULT: u32 = 150;
 
 fn max_plant_stamps_per_chunk() -> u32 {
     use std::sync::OnceLock;

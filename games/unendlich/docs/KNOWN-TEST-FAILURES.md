@@ -21,8 +21,11 @@ Four failures on first run, all fixed:
 
 ### Update (c20unified, leaf templates merged): 9372 passed, 3 failed (default features)
 
-- `world::mesh_tri_regression::sample_grid_worst_case_stays_under_budget` -- still over, much
-  less: the worst sample chunk was 443,922 triangles; canopy depth (`e92b8b962`) and merged
+- `world::mesh_tri_regression::sample_grid_worst_case_stays_under_budget` -- FOLIAGE DONE,
+  TERRAIN LEFT. With the plant-stamp cap at 150 (was 512) the old worst forest chunk is
+  78,964 triangles, under the 90K budget. What still exceeds it is terrain: chunk (-2,2,1)
+  145,324 and (0,2,0) 124,816, dominated by weathered-top subdivision (55,296 quads, ~110K
+  triangles, in (0,2,0)). Before the cap: the worst sample chunk was 443,922 triangles; canopy depth (`e92b8b962`) and merged
   leaf templates (411 -> 160 quads per leaf block, no visual change) bring that chunk to
   181,430, and the grid's worst is now 213,550. Two sources remain: leaf stamps (512 x ~320)
   and, independently, weathered-top subdivision (chunk (0,2,0): 55,296 quads, ~110K triangles,
