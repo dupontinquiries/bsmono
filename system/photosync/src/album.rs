@@ -310,23 +310,31 @@ pub fn load(conn: &rusqlite::Connection) -> rusqlite::Result<Library> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut lib = Library::new(items);
-    // Albums may not exist yet on a database written before this feature; an
-    // absent table is an empty gallery, not an error.
-    if conn
-        .prepare("SELECT name FROM albums ORDER BY name")
-        .and_then(|mut s| {
-            let names = s.query_map([], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(names)
-        })
-        .map(|names| {
-            for n in names {
-                lib.albums.insert(n.clone(), Album { name: n, ..Default::default() });
-            }
-        })
-        .is_err()
-    {
-        return Ok(lib);
+    load_albums(conn, &mut lib)?;
+    Ok(lib)
+}
+
+/// Replace `lib`'s albums with the ones stored in `conn`. Returns whether the
+/// database had album tables at all.
+///
+/// Separate from `load` because the albums need not live in the same database
+/// as the files: the daemon's store is typically the service's (root-owned,
+/// opened read-only by a viewer), while albums are the viewing user's, kept
+/// wherever that user can write (the gallery's own albums file).
+///
+/// Albums may not exist yet on a database written before this feature; an
+/// absent table is no albums, not an error — and `lib` is left as it was, so a
+/// caller can tell "no albums file yet" from "an albums file with none".
+pub fn load_albums(conn: &rusqlite::Connection, lib: &mut Library) -> rusqlite::Result<bool> {
+    let names = match conn.prepare("SELECT name FROM albums ORDER BY name").and_then(|mut s| {
+        s.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()
+    }) {
+        Ok(n) => n,
+        Err(_) => return Ok(false),
+    };
+    lib.albums.clear();
+    for n in names {
+        lib.albums.insert(n.clone(), Album { name: n, ..Default::default() });
     }
     let mut st = conn.prepare("SELECT album, path FROM album_items")?;
     let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
@@ -336,7 +344,7 @@ pub fn load(conn: &rusqlite::Connection) -> rusqlite::Result<Library> {
             a.items.insert(path);
         }
     }
-    Ok(lib)
+    Ok(true)
 }
 
 /// Write the albums back. The `files` table is NOT touched.
@@ -345,6 +353,14 @@ pub fn load(conn: &rusqlite::Connection) -> rusqlite::Result<Library> {
 /// is more code than the write, and the failure mode of a wrong diff (a
 /// membership silently dropped) is much worse than the cost of rewriting.
 pub fn save_albums(conn: &rusqlite::Connection, lib: &Library) -> rusqlite::Result<()> {
+    // One transaction: the delete-then-reinsert below must never be seen, or
+    // survive a crash, half done — that would be every album emptied.
+    let tx = conn.unchecked_transaction()?;
+    save_albums_in(&tx, lib)?;
+    tx.commit()
+}
+
+fn save_albums_in(conn: &rusqlite::Connection, lib: &Library) -> rusqlite::Result<()> {
     create_album_schema(conn)?;
     // REDUNDANT while foreign keys are on — `DELETE FROM albums` below already
     // cascades, which is why breaking this line fails no test. Kept, and
@@ -445,6 +461,28 @@ mod tests {
             load(&c).unwrap().album("Trip").unwrap().items.is_empty(),
             "a removed membership was left behind in album_items"
         );
+    }
+
+    #[test]
+    fn albums_kept_in_another_database_load_onto_the_library() {
+        // The gallery keeps albums in the viewing user's own file, apart from
+        // the service's (read-only) store: the two must combine.
+        let files = memdb();
+        let mut lib = load(&files).unwrap();
+        let albums = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(!load_albums(&albums, &mut lib).unwrap(), "no tables yet: says so");
+        let mut other = lib.clone();
+        other.create_album("Trip");
+        other.add_to_album("Trip", &["/p/a.jpg".to_string()]);
+        save_albums(&albums, &other).unwrap();
+        assert!(load_albums(&albums, &mut lib).unwrap());
+        assert_eq!(lib.album_names(), vec!["Trip"]);
+        assert_eq!(lib.album_items("Trip").len(), 1);
+        // An album file with NO albums replaces, rather than merges into, what
+        // was loaded: deleting the last album must stick.
+        save_albums(&albums, &Library::new(vec![])).unwrap();
+        assert!(load_albums(&albums, &mut lib).unwrap());
+        assert!(lib.album_names().is_empty());
     }
 
     #[test]
