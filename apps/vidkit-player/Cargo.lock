@@ -3248,6 +3248,7 @@ name = "vidkit-wayland"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "vidkit-core",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",

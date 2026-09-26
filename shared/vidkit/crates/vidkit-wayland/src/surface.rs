@@ -163,6 +163,26 @@ impl SurfaceLink {
         }
     }
 
+    /// Feedback for the next commit of ANOTHER surface of this window (the
+    /// video subsurface, which commits on its own).
+    pub fn feedback_on(&mut self, surface: &WlSurface, target_ns: Option<u64>) {
+        if let (Some(p), true) = (&self.presentation, self.pending < 16) {
+            p.feedback(surface, &self.queue.handle(), target_ns);
+            self.pending += 1;
+        }
+    }
+
+    /// The connection (shared with a [`crate::plane::VideoPlane`]) and
+    /// whether it is someone else's.
+    pub fn connection(&self) -> (&Connection, bool) {
+        (&self.conn, self.foreign)
+    }
+
+    /// The window's surface.
+    pub fn surface(&self) -> &WlSurface {
+        &self.surface
+    }
+
     /// Outcomes that arrived since the last call. Never blocks.
     pub fn poll(&mut self) -> Vec<Outcome> {
         let _ = self.conn.flush();

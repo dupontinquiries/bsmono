@@ -17,4 +17,6 @@
 //! shown as a steady 3:2 on 60 Hz or with the odd 4 -- visible judder.
 
 pub mod cadence;
+pub mod plane;
+pub mod scanout;
 pub mod surface;

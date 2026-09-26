@@ -207,6 +207,16 @@ struct Player {
     /// The display pipeline's latency, learned from the feedback; frames
     /// are picked for when they will be seen.
     latency: vidkit_wayland::cadence::LatencyTracker,
+    /// The video subsurface (VIDKIT_SCANOUT): frames handed to the
+    /// compositor as they are. `plane_on`: the current frame is there, and
+    /// the window paints a transparent hole over it.
+    plane: Option<vidkit_wayland::plane::VideoPlane>,
+    plane_on: bool,
+    plane_size: (u32, u32),
+    /// Where the video was last drawn (points = surface-local logical px).
+    video_rect: Option<egui::Rect>,
+    /// Why frames are not going to the plane (said once per change).
+    scanout_why: String,
     /// The dma-buf frame on screen (zero-copy), returned to its decoder when
     /// the next frame replaces it.
     held: Option<vidkit_core::Frame>,
@@ -433,7 +443,12 @@ impl Player {
             cores_gave_up: false,
             core_check: None,
             profiler: profile::Profiler::from_env(),
-            wl: wayland_link(cc),
+            wl: None,
+            plane: None,
+            plane_on: false,
+            plane_size: (0, 0),
+            video_rect: None,
+            scanout_why: String::new(),
             present_log: vidkit_wayland::cadence::PresentLog::new(240),
             last_grain: false,
             held: None,
@@ -450,6 +465,18 @@ impl Player {
             analysis_status: Arc::new(Mutex::new(String::new())),
             analysis_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
+        me.wl = wayland_link(cc);
+        // The video plane, when asked for (VIDKIT_SCANOUT=1|force) and the
+        // GL presenter is up (it paints the hole).
+        if me.gpu.is_some() && vidkit_wayland::scanout::Mode::parse(std::env::var("VIDKIT_SCANOUT").ok().as_deref()) != vidkit_wayland::scanout::Mode::Off {
+            if let Some(wl) = &me.wl {
+                let (conn, foreign) = wl.connection();
+                match vidkit_wayland::plane::VideoPlane::new(conn, wl.surface(), foreign, true) {
+                    Ok(p) => me.plane = Some(p),
+                    Err(e) => eprintln!("vidkit: no video plane: {e}"),
+                }
+            }
+        }
         // The software presenter converts and uploads only what changed
         // (vidkit_core::damage). VIDKIT_DAMAGE=0 turns it off for comparison;
         // VIDKIT_SW_BUDGET (0..1 of a frame) caps conversions and lets the
@@ -526,6 +553,14 @@ impl Player {
         }
         match tick {
             playback::Tick::Show { frame, next } => {
+                // The compositor takes the frame as it is, when it can.
+                let frame = match self.to_plane(frame, lead) {
+                    None => {
+                        self.presenter.set_deadline(Some(Instant::now() + next));
+                        return;
+                    }
+                    Some(f) => f,
+                };
                 // Feedback for this frame's commit, and (with commit timing)
                 // its target: the time it was picked for.
                 if let Some(wl) = self.wl.as_mut() {
@@ -626,6 +661,80 @@ impl Player {
             return;
         }
         self.presenter.show(frame);
+    }
+
+    /// Hand `frame` to the video plane if it can go there: `None` when it
+    /// was taken, `Some(frame)` to present it the usual way. Says once, on
+    /// stderr, each time the reason for NOT scanning out changes.
+    fn to_plane(&mut self, frame: vidkit_core::Frame, lead: Duration) -> Option<vidkit_core::Frame> {
+        use vidkit_wayland::scanout::{decide, Inputs, Mode};
+        let Some(plane) = self.plane.as_mut() else { return Some(frame) };
+        plane.poll();
+        let verdict = match (&frame.data, self.video_rect) {
+            (vidkit_core::frame::FrameData::DmaBuf(img), Some(_)) => {
+                let enh_changes = self.gpu.as_ref().and_then(|g| g.lock().ok()).is_some_and(|g| {
+                    g.enhance.sharpen.is_some() || g.enhance.temporal || g.enhance.scaler == vidkit_egui::glow_present::Scaler::Bicubic
+                });
+                decide(&Inputs {
+                    mode: Mode::parse(std::env::var("VIDKIT_SCANOUT").ok().as_deref()),
+                    nv12: frame.layout == vidkit_core::frame::PlaneLayout::Nv12,
+                    format_supported: plane.supports(img.fourcc, img.modifier),
+                    we_change_pixels: enh_changes || frame.grain.is_some(),
+                    can_say_matrix: plane.can_say(&frame.color),
+                    content_is_bt601_limited: frame.color.matrix == vidkit_core::frame::Matrix::Bt601 && frame.color.range == vidkit_core::frame::Range::Limited,
+                    protocols: true,
+                })
+            }
+            (vidkit_core::frame::FrameData::Cpu(_), _) => Err("frames are CPU planes (software decode)"),
+            (_, None) => Err("video not laid out yet"),
+        };
+        let why = match verdict {
+            Ok(()) => {
+                let r = self.video_rect.unwrap_or(egui::Rect::NOTHING);
+                let rect = (r.min.x.round() as i32, r.min.y.round() as i32, r.width().round() as i32, r.height().round() as i32);
+                let size = (frame.width, frame.height);
+                let target = self.wl.as_ref().and_then(|wl| wl.clock_now_ns()).map(|n| n + lead.as_nanos() as u64 + self.latency.comp_ns() as u64);
+                if let Some(wl) = self.wl.as_mut() {
+                    wl.feedback_on(plane.surface(), target);
+                }
+                match plane.show(frame, rect) {
+                    Ok(()) => {
+                        self.plane_on = true;
+                        self.plane_size = size;
+                        // The GL textures no longer show the held frame.
+                        if let (Some(old), Some(e)) = (self.held.take(), self.engine.as_ref()) {
+                            e.recycle(old);
+                        }
+                        if !self.scanout_why.is_empty() {
+                            eprintln!("vidkit: scanout on (video on its own subsurface)");
+                            self.scanout_why.clear();
+                        }
+                        return None;
+                    }
+                    Err((f, why)) => {
+                        if self.plane_on {
+                            plane.hide();
+                            self.plane_on = false;
+                        }
+                        if why != self.scanout_why {
+                            eprintln!("vidkit: scanout off this frame: {why}");
+                            self.scanout_why = why.to_string();
+                        }
+                        return Some(f);
+                    }
+                }
+            }
+            Err(why) => why,
+        };
+        if self.plane_on {
+            plane.hide();
+            self.plane_on = false;
+        }
+        if why != self.scanout_why {
+            eprintln!("vidkit: scanout off: {why}");
+            self.scanout_why = why.to_string();
+        }
+        Some(frame)
     }
 
     /// The decoder is being replaced: the held frame's buffer belongs to
@@ -896,7 +1005,7 @@ impl eframe::App for Player {
             }
             if let Some(gpu) = self.gpu.clone() {
                 let surface = ui.available_rect_before_wrap();
-                let (w, h) = gpu.lock().map(|g| g.size()).unwrap_or((0, 0));
+                let (w, h) = if self.plane_on { self.plane_size } else { gpu.lock().map(|g| g.size()).unwrap_or((0, 0)) };
                 ui.painter()
                     .rect_filled(surface, 0.0, egui::Color32::from_rgb(28, 24, 38));
                 let r = vidkit_egui::fit_rect(
@@ -908,7 +1017,13 @@ impl eframe::App for Player {
                 if r.width() > 0.0 {
                     let ppp = ui.ctx().pixels_per_point();
                     self.apply_enhance(((r.width() * ppp) as u32, (r.height() * ppp) as u32));
-                    ui.painter().add(vidkit_egui::glow_present::callback(r, gpu));
+                    self.video_rect = Some(r);
+                    if self.plane_on {
+                        // The video is on the subsurface below: see through.
+                        ui.painter().add(vidkit_egui::glow_present::hole_callback(r));
+                    } else {
+                        ui.painter().add(vidkit_egui::glow_present::callback(r, gpu));
+                    }
                 }
                 return;
             }
@@ -1442,7 +1557,11 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             // An app id, or Wayland shows the binary name and no icon.
             .with_app_id("vidkit-player")
-            .with_inner_size([960.0, 640.0]),
+            .with_inner_size([960.0, 640.0])
+            // A video plane BELOW the window shows through a hole, which
+            // needs an alpha channel. Only when asked for: a transparent
+            // window costs the compositor blending where it did not.
+            .with_transparent(std::env::var("VIDKIT_SCANOUT").map(|v| v != "0").unwrap_or(false)),
         ..Default::default()
     };
     eframe::run_native(
@@ -2102,11 +2221,14 @@ impl Player {
     /// it off a side hides it behind a tab while the sound carries on.
     fn pip_ui(&mut self, ctx: &egui::Context, screen: egui::Rect) {
         let size = match &self.gpu {
+            Some(_) if self.plane_on => egui::Vec2::new(self.plane_size.0 as f32, self.plane_size.1 as f32),
             Some(g) => g.lock().map(|g| g.size()).map(|(w, h)| egui::Vec2::new(w as f32, h as f32)).unwrap_or_default(),
             None => self.presenter.frame_size(),
         };
         let aspect = if size.y > 0.0 { size.x / size.y } else { 16.0 / 9.0 };
         let (gpu, fit) = (self.gpu.clone(), self.view.fit);
+        let plane_on = self.plane_on;
+        let video_rect = &mut self.video_rect;
         let tex = self.presenter.texture().map(|t| t.id());
         if std::env::var_os("VIDKIT_PIP_DEBUG").is_some() {
             // Read the pointer, THEN ask the context: calling ctx inside
@@ -2120,7 +2242,12 @@ impl Player {
             let v = vidkit_egui::fit_rect(r, size, vidkit_egui::PixelAspect::SQUARE, fit);
             match (&gpu, tex) {
                 (Some(g), _) if v.width() > 0.0 => {
-                    ui.painter().add(vidkit_egui::glow_present::callback(v, g.clone()));
+                    if plane_on {
+                        ui.painter().add(vidkit_egui::glow_present::hole_callback(v));
+                    } else {
+                        ui.painter().add(vidkit_egui::glow_present::callback(v, g.clone()));
+                    }
+                    *video_rect = Some(v);
                 }
                 (None, Some(id)) => {
                     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
@@ -2486,6 +2613,7 @@ impl Player {
         let fps = self.engine.as_ref().map(|e| 1.0 / e.frame_interval().as_secs_f64().max(1e-3));
         p.acc.display = if self.wl.is_some() { format!("{} · comp {:.1} ms", self.present_log.summary(fps), self.latency.comp_ns() as f64 / 1e6) } else { String::new() };
         p.acc.presenter = match &self.gpu {
+            Some(_) if self.plane_on => "plane".into(),
             Some(_) => format!("gpu{}{}", if self.held.is_some() { "+zerocopy" } else { "" }, if self.last_grain { "+grain" } else { "" }),
             None if self.presenter.damage_rendering() => format!("cpu-damage@{:.2}", self.presenter.damage_budget),
             None => "cpu-whole".into(),

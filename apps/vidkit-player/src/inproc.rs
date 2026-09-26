@@ -26,6 +26,21 @@ pub struct LibavSource {
     interval: Duration,
     note: Option<String>,
     failed: bool,
+    /// VIDKIT_DMABUF_EMULATE=1: software frames re-wrapped as memfd-backed
+    /// NV12 "dma-bufs", so the zero-copy and scanout paths can be driven on
+    /// a machine with no hardware decoder (llvmpipe and weston's GL
+    /// renderer map memfds). A test knob: it adds a copy.
+    emulate_dmabuf: Option<EmuRing>,
+}
+
+/// The emulated decoder's buffer pool: a ring of memfds, reused like a
+/// real decoder's surfaces (so buffer caches see a pool, not a stream of
+/// new buffers). Test-only: a slot is rewritten when its turn comes,
+/// whether or not the compositor still holds it.
+#[derive(Default)]
+pub struct EmuRing {
+    fds: Vec<std::os::fd::OwnedFd>,
+    next: usize,
 }
 
 /// Policy, pure: whether to decode in process.
@@ -75,6 +90,7 @@ pub fn open(path: &Path, p: &Probe, from: Duration, accel: &Accel) -> Option<Box
             interval: Duration::from_secs_f64(1.0 / p.fps.max(1.0)),
             note: None,
             failed: false,
+            emulate_dmabuf: (std::env::var("VIDKIT_DMABUF_EMULATE").as_deref() == Ok("1")).then(EmuRing::default),
         })),
         Err(e) => {
             eprintln!("vidkit: in-process decode unavailable ({e}); using ffmpeg");
@@ -112,6 +128,9 @@ impl VideoSource for LibavSource {
         match self.dec.next_frame(&mut |n| pool.take(n)) {
             Ok(Some(mut f)) => {
                 f.color = self.color;
+                if let Some(ring) = self.emulate_dmabuf.as_mut() {
+                    f = emulate_dmabuf(f, ring);
+                }
                 if self.dec.hw_requested && !self.dec.hw_frames && self.note.is_none() && self.dec.zero_copy == 0 {
                     self.note = Some("VAAPI declined this stream; decoding in software".into());
                 }
@@ -143,6 +162,62 @@ impl VideoSource for LibavSource {
     }
     fn take_note(&mut self) -> Option<String> {
         self.note.take()
+    }
+}
+
+/// A CPU I420/NV12 frame as a LINEAR NV12 memfd "dma-buf" (see
+/// `emulate_dmabuf` on LibavSource).
+pub fn emulate_dmabuf(f: Frame, ring: &mut EmuRing) -> Frame {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use vidkit_core::frame::{DmaBufImage, DmaBufPlane, FrameData, PlaneLayout};
+    let FrameData::Cpu(p) = &f.data else { return f };
+    let (w, h) = (f.width as usize, f.height as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let mut buf = Vec::with_capacity(w * h + cw * ch * 2);
+    let row = |plane: &[u8], stride: usize, y: usize, n: usize| plane[y * stride..y * stride + n].to_vec();
+    for y in 0..h {
+        buf.extend(row(&p.data[0], p.strides[0] as usize, y, w));
+    }
+    match f.layout {
+        PlaneLayout::I420 => {
+            for y in 0..ch {
+                for x in 0..cw {
+                    buf.push(p.data[1][y * p.strides[1] as usize + x]);
+                    buf.push(p.data[2][y * p.strides[2] as usize + x]);
+                }
+            }
+        }
+        PlaneLayout::Nv12 => {
+            for y in 0..ch {
+                buf.extend(row(&p.data[1], p.strides[1] as usize, y, cw * 2));
+            }
+        }
+        _ => return f,
+    }
+    const SLOTS: usize = 6;
+    if ring.fds.len() < SLOTS {
+        // SAFETY: a new fd we own.
+        ring.fds.push(unsafe { OwnedFd::from_raw_fd(libc::memfd_create(c"vk-emulated".as_ptr(), 0)) });
+    }
+    let slot = ring.next % ring.fds.len();
+    ring.next += 1;
+    let Ok(fd) = ring.fds[slot].try_clone() else { return f };
+    use std::io::{Seek, Write};
+    let mut file = std::fs::File::from(fd.try_clone().expect("dup"));
+    if file.seek(std::io::SeekFrom::Start(0)).and_then(|_| file.write_all(&buf)).is_err() {
+        return f;
+    }
+    Frame {
+        data: FrameData::DmaBuf(DmaBufImage {
+            planes: vec![DmaBufPlane { fd, offset: 0, stride: w as u32 }],
+            modifier: vidkit_core::dmabuf::DRM_FORMAT_MOD_LINEAR,
+            fourcc: vidkit_core::dmabuf::DRM_FORMAT_NV12,
+            owner: None,
+        }),
+        layout: PlaneLayout::Nv12,
+        grain: None,
+        recycle: None,
+        ..f
     }
 }
 
@@ -191,5 +266,30 @@ mod tests {
         assert_eq!(n, 25);
         assert!((last.unwrap().as_secs_f64() - 0.96).abs() < 0.002);
         assert!(v.label().starts_with("software (in process) vp9 160x90"), "{}", v.label());
+    }
+
+    /// The emulated buffer reads back (through the presenter's own mmap
+    /// path) as the frame it was made from, and the ring reuses its slots.
+    #[test]
+    fn emulated_dmabufs_carry_the_frame_and_cycle_a_pool() {
+        use vidkit_core::frame::{CpuPlanes, FrameData, PlaneLayout};
+        let mk = |k: u8| Frame {
+            data: FrameData::Cpu(CpuPlanes { data: vec![(0..24u8).map(|i| i + k).collect(), vec![1, 2, 3, 4, 5, 6], vec![7, 8, 9, 10, 11, 12]], strides: vec![6, 3, 3] }),
+            width: 6, height: 4, layout: PlaneLayout::I420, color: Default::default(), pts: Duration::ZERO, duration: None, recycle: None, grain: None,
+        };
+        let mut ring = EmuRing::default();
+        let mut inodes = std::collections::BTreeSet::new();
+        for k in 0..8u8 {
+            let f = emulate_dmabuf(mk(k), &mut ring);
+            let FrameData::DmaBuf(img) = &f.data else { panic!("not emulated") };
+            let (layout, p) = vidkit_egui::dmabuf_gl::map_linear(img, 6, 4).unwrap();
+            assert_eq!(layout, PlaneLayout::Nv12);
+            assert_eq!(p.data[0], (0..24u8).map(|i| i + k).collect::<Vec<_>>());
+            assert_eq!(p.data[1], vec![1, 7, 2, 8, 3, 9, 4, 10, 5, 11, 6, 12]);
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            unsafe { libc::fstat(std::os::fd::AsRawFd::as_raw_fd(&img.planes[0].fd), &mut st) };
+            inodes.insert(st.st_ino);
+        }
+        assert_eq!(inodes.len(), 6, "a pool of six buffers, reused");
     }
 }

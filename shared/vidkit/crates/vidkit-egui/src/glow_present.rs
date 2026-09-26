@@ -1402,6 +1402,23 @@ pub fn callback(rect: Rect, gpu: Arc<std::sync::Mutex<Nv12Gpu>>) -> egui::PaintC
     }
 }
 
+/// A paint callback that makes `rect` fully TRANSPARENT: the window's hole
+/// over a video subsurface stacked below it (vidkit-wayland's plane). egui
+/// has set the scissor to the callback's clip, so the clear stays inside.
+pub fn hole_callback(rect: Rect) -> egui::PaintCallback {
+    egui::PaintCallback {
+        rect,
+        callback: Arc::new(egui_glow::CallbackFn::new(move |_info, painter| {
+            let gl = painter.gl();
+            // SAFETY: inside a paint callback, so the context is current.
+            unsafe {
+                gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+        })),
+    }
+}
+
 /// The colour this path should produce, mirroring `convert_cpu` and
 /// `convert.wgsl`.
 ///
