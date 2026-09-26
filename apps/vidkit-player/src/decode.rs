@@ -54,6 +54,9 @@ pub struct Probe {
     pub color_space: String,
     pub color_range: String,
     pub color_transfer: String,
+    /// The container's start time in seconds (ffmpeg's `-ss` is relative to
+    /// it); 0 when unknown.
+    pub start_time: f64,
 }
 
 impl Probe {
@@ -99,7 +102,7 @@ impl Probe {
 
 /// The ffprobe arguments shared by the file and URL probes. `codec_name` is
 /// asked for because hardware decode is chosen per codec.
-const PROBE_ENTRIES: &str = "stream=codec_name,width,height,r_frame_rate,pix_fmt,color_space,color_range,color_transfer";
+const PROBE_ENTRIES: &str = "stream=codec_name,width,height,r_frame_rate,pix_fmt,color_space,color_range,color_transfer:format=start_time";
 
 /// Parse `ffprobe -show_entries stream=...` output.
 ///
@@ -112,6 +115,7 @@ pub fn parse_probe(text: &str) -> Option<Probe> {
     let mut h = None;
     let mut fps = None;
     let mut codec = String::new();
+    let mut start_time = 0.0;
     let (mut pix_fmt, mut color_space, mut color_range, mut color_transfer) = (String::new(), String::new(), String::new(), String::new());
     let tag = |v: &str| {
         let v = v.trim();
@@ -123,6 +127,7 @@ pub fn parse_probe(text: &str) -> Option<Probe> {
             "width" => w = v.trim().parse().ok(),
             "height" => h = v.trim().parse().ok(),
             "codec_name" => codec = v.trim().to_string(),
+            "start_time" => start_time = v.trim().parse::<f64>().ok().filter(|t| t.is_finite()).unwrap_or(0.0),
             "pix_fmt" => pix_fmt = tag(v),
             "color_space" => color_space = tag(v),
             "color_range" => color_range = tag(v),
@@ -151,6 +156,7 @@ pub fn parse_probe(text: &str) -> Option<Probe> {
         color_space,
         color_range,
         color_transfer,
+        start_time,
     })
 }
 
@@ -279,6 +285,59 @@ pub fn set_decode_cap(c: u32) {
 /// used to hand ffmpeg a `-2` expression and compute the size separately in
 /// Rust; the two round differently, and a frame one row shorter than the
 /// buffer tears every picture after the first.
+/// Whether a fit is worth doing in ffmpeg, or better left to the GPU. Pure.
+///
+/// Scaling in ffmpeg is a full swscale pass over every source pixel on the
+/// CPU; the GPU presenter scales for free as it draws. Measured on 4K60
+/// VP9 (a 3840 source on a 3456-wide panel): the 0.9x shrink plus NV12
+/// conversion took the player to 1.44x the CPU of decoding alone. A shrink
+/// is only worth it when it removes a real share of the pixels (the target
+/// under 60% of the source area -- 4K on a 1080p phone) or when the source
+/// exceeds the GPU's largest texture, which is a hard limit.
+pub fn worth_scaling(src: (u32, u32), fit: Option<(u32, u32)>, max_texture: u32) -> Option<(u32, u32)> {
+    let (tw, th) = fit?;
+    if src.0.max(src.1) > max_texture {
+        return Some((tw, th));
+    }
+    let ratio = (tw as f64 * th as f64) / (src.0 as f64 * src.1 as f64).max(1.0);
+    (ratio < 0.6).then_some((tw, th))
+}
+
+/// The size ffmpeg would scale `p` to at the current cap, or `None`.
+pub fn scale_plan(p: &Probe) -> Option<(u32, u32)> {
+    worth_scaling((p.width, p.height), fit_long_edge(p.width, p.height, Some(decode_cap())), texture_limit())
+}
+
+pub fn texture_limit() -> u32 {
+    TEXTURE_LIMIT.load(Ordering::Relaxed)
+}
+
+static TEXTURE_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+static PREFER_PLANAR: AtomicBool = AtomicBool::new(false);
+
+/// GL_MAX_TEXTURE_SIZE, from the app once GL is up.
+pub fn set_texture_limit(t: u32) {
+    TEXTURE_LIMIT.store(t.max(1), Ordering::Relaxed);
+}
+
+/// The presenter takes I420 on the GPU: software decode of 8-bit 4:2:0
+/// then asks ffmpeg for its native planar output (no conversion).
+pub fn set_prefer_planar(on: bool) {
+    PREFER_PLANAR.store(on, Ordering::Relaxed);
+}
+
+/// The layout to ask ffmpeg for. Pure. The decoder's native one where the
+/// presenter takes it: software 8-bit 4:2:0 -> I420 for the GPU presenter;
+/// hardware paths hand NV12 out natively, and the CPU presenter's fast
+/// converter wants interleaved chroma.
+pub fn output_layout(probe_layout: PlaneLayout, pix_fmt: &str, software: bool, gpu_takes_planar: bool) -> PlaneLayout {
+    if software && gpu_takes_planar && probe_layout == PlaneLayout::Nv12 && matches!(pix_fmt, "yuv420p" | "yuvj420p") {
+        PlaneLayout::I420
+    } else {
+        probe_layout
+    }
+}
+
 pub fn fit_long_edge(w: u32, h: u32, cap: Option<u32>) -> Option<(u32, u32)> {
     let cap = cap?;
     let long = w.max(h);
@@ -303,7 +362,13 @@ pub enum Accel {
     Software,
     /// VAAPI through a DRM render node — Intel and AMD desktops. Scaling runs
     /// on the GPU too, so a 4K source crosses the bus at the display size.
-    Vaapi { device: String },
+    /// `vpp`: the driver has video processing, so scale_vaapi can shrink
+    /// frames before the download. Asahi's VA layer does not.
+    Vaapi { device: String, codec: String, vpp: bool },
+    /// Vulkan Video (VK_KHR_video_decode_*): Mesa RADV/ANV, NVK and NVIDIA's
+    /// driver. The route NVIDIA has, which has no native VA-API.
+    /// `device`: the Vulkan device index -- the integrated GPU when it can.
+    Vulkan { codec: String, device: usize },
     /// A V4L2 memory-to-memory decoder (`vp9_v4l2m2m`...) — Venus on the
     /// Fairphone. An INPUT option: it replaces the software decoder.
     V4l2m2m { decoder: String },
@@ -314,6 +379,7 @@ impl Accel {
         match self {
             Accel::Software => "software".into(),
             Accel::Vaapi { .. } => "VAAPI".into(),
+            Accel::Vulkan { .. } => "Vulkan Video".into(),
             Accel::V4l2m2m { decoder } => decoder.clone(),
         }
     }
@@ -334,6 +400,81 @@ pub struct Machine {
     pub decoders: Vec<String>,
     /// `ffmpeg -hwaccels`.
     pub hwaccels: Vec<String>,
+    /// What the VAAPI driver really decodes, from `vainfo`; `None` when
+    /// vainfo is not installed (then the driver name is all there is).
+    pub vaapi: Option<Vec<(vidkit_core::codec::Codec, u8)>>,
+    /// The VA driver offers video processing (scale_vaapi).
+    pub vaapi_vpp: bool,
+    /// Codecs some device decodes through Vulkan Video, from `vulkaninfo`.
+    pub vulkan: Option<Vec<vidkit_core::codec::Codec>>,
+    /// Each Vulkan device's type and decode codecs, to pick the iGPU.
+    pub vulkan_devices: Vec<vidkit_core::caps::VkVideoDevice>,
+}
+
+/// `vulkaninfo`'s Vulkan Video decode codecs for device 0, once. `None` when
+/// vulkaninfo is missing or lists none.
+pub fn vulkan_video_codecs() -> Option<Vec<vidkit_core::codec::Codec>> {
+    let mut all: Vec<vidkit_core::codec::Codec> = Vec::new();
+    for d in vulkan_devices() {
+        for c in &d.codecs {
+            if !all.contains(c) {
+                all.push(*c);
+            }
+        }
+    }
+    (!all.is_empty()).then_some(all)
+}
+
+/// Every Vulkan device with its type and decode codecs, once.
+pub fn vulkan_devices() -> &'static [vidkit_core::caps::VkVideoDevice] {
+    static V: OnceLock<Vec<vidkit_core::caps::VkVideoDevice>> = OnceLock::new();
+    V.get_or_init(|| {
+        Command::new("vulkaninfo")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map(|o| vidkit_core::caps::parse_vulkaninfo_devices(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or_default()
+    })
+}
+
+/// ffprobe's codec name as vidkit's codec.
+pub fn codec_of(name: &str) -> Option<vidkit_core::codec::Codec> {
+    use vidkit_core::codec::Codec;
+    Some(match name {
+        "h264" => Codec::H264,
+        "hevc" => Codec::Hevc,
+        "vp8" => Codec::Vp8,
+        "vp9" => Codec::Vp9,
+        "av1" => Codec::Av1,
+        _ => return None,
+    })
+}
+
+/// `vainfo`'s decode profiles, run once per process. `None` if vainfo is
+/// missing or found no driver.
+pub fn vaapi_profiles() -> Option<Vec<(vidkit_core::codec::Codec, u8)>> {
+    vainfo().as_ref().map(|(p, _)| p.clone())
+}
+
+/// `vainfo`, once: (decode profiles, has video processing). The DRM display
+/// first, as Asahi's AVD instructions use it: under Wayland, X or headless
+/// the default display can be absent or the wrong one. The environment is
+/// inherited, so a session's LIBVA_DRIVER_NAME (Asahi's v4l2_request layer)
+/// applies.
+fn vainfo() -> &'static Option<(Vec<(vidkit_core::codec::Codec, u8)>, bool)> {
+    static P: OnceLock<Option<(Vec<(vidkit_core::codec::Codec, u8)>, bool)>> = OnceLock::new();
+    P.get_or_init(|| {
+        for args in [&["--display", "drm"][..], &[][..]] {
+            let Ok(out) = Command::new("vainfo").args(args).stdin(Stdio::null()).stderr(Stdio::null()).output() else { return None };
+            let text = String::from_utf8_lossy(&out.stdout);
+            let p = vidkit_core::caps::parse_vainfo(&text);
+            if !p.is_empty() {
+                return Some((p, vidkit_core::caps::vainfo_has_video_proc(&text)));
+            }
+        }
+        None
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -384,14 +525,49 @@ pub fn choose_accel(codec: &str, m: &Machine, pref: AccelPref) -> Accel {
     if m.kind == MachineKind::QualcommVenus && m.decoders.iter().any(|d| *d == m2m) {
         return Accel::V4l2m2m { decoder: m2m };
     }
+    // Hardware decode goes only through ffmpeg's NATIVE decoder. Fedora's
+    // ffmpeg-free has no native h264/hevc (patents; H.264 only as
+    // OpenH264, software): asking VAAPI for them fails, so don't.
+    if !m.decoders.is_empty() {
+        if let Some(c) = codec_of(codec) {
+            if !m.decoders.iter().any(|d| d == vidkit_core::caps::native_decoder(c)) {
+                return Accel::Software;
+            }
+        }
+    }
     if m.kind == MachineKind::Asahi {
-        return Accel::Software;
+        // AVD is a V4L2 STATELESS decoder, which stock ffmpeg cannot drive.
+        // It is reachable only through the VA-API layer (libva-v4l2_request,
+        // sofus13's fork), and only for what that layer lists. The DRM node
+        // is AGX's; the VA driver is the V4L2 one, so no GPU-driver check.
+        let listed = matches!((&m.vaapi, codec_of(codec)), (Some(list), Some(c)) if list.iter().any(|(lc, _)| *lc == c));
+        return match (&m.render_node, listed && m.hwaccels.iter().any(|h| h == "vaapi")) {
+            (Some(node), true) => Accel::Vaapi { device: node.clone(), codec: codec.to_string(), vpp: m.vaapi_vpp },
+            _ => Accel::Software,
+        };
     }
     let vaapi_driver = m.gpu_driver.as_deref().is_some_and(|d| VAAPI_DRIVERS.contains(&d));
     if let (true, Some(node)) = (vaapi_driver, &m.render_node) {
-        if m.hwaccels.iter().any(|h| h == "vaapi") && VAAPI_CODECS.contains(&codec) {
-            return Accel::Vaapi { device: node.clone() };
+        // Only a codec the driver lists. Asked for one it cannot do, ffmpeg
+        // falls back to software INSIDE the process: frames arrive, the
+        // status says VAAPI, and the CPU decodes -- 1080p AV1 on a laptop
+        // without AV1 hardware, which is what heated one.
+        let listed = match (&m.vaapi, codec_of(codec)) {
+            (Some(list), Some(c)) => list.iter().any(|(lc, _)| *lc == c),
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if listed && m.hwaccels.iter().any(|h| h == "vaapi") && VAAPI_CODECS.contains(&codec) {
+            return Accel::Vaapi { device: node.clone(), codec: codec.to_string(), vpp: m.vaapi_vpp || m.vaapi.is_none() };
         }
+    }
+    // Vulkan Video where VAAPI does not cover it: NVIDIA (no native VA-API),
+    // and Intel/AMD for a codec their VA driver lacks. ffmpeg must have the
+    // vulkan hwaccel and device 0 must list the codec.
+    let vk_dev = codec_of(codec).and_then(|c| vidkit_core::caps::pick_vulkan_decoder(&m.vulkan_devices, Some(c)).map(|d| d.index));
+    let vk_listed = matches!((&m.vulkan, codec_of(codec)), (Some(list), Some(c)) if list.contains(&c));
+    if vk_listed && m.hwaccels.iter().any(|h| h == "vulkan") {
+        return Accel::Vulkan { codec: codec.to_string(), device: vk_dev.unwrap_or(0) };
     }
     Accel::Software
 }
@@ -440,15 +616,31 @@ pub fn machine() -> &'static Machine {
             Detected::QualcommVenus { .. } => MachineKind::QualcommVenus,
             _ => MachineKind::Other,
         };
-        let render_node = (128..136)
-            .map(|n| format!("/dev/dri/renderD{n}"))
-            .find(|p| Path::new(p).exists());
+        // The INTEGRATED GPU's node on a hybrid laptop: decoding on the
+        // discrete one keeps a second GPU powered for the whole video.
+        let nodes: Vec<vidkit_core::caps::RenderNode> = (128..136)
+            .map(|n| format!("renderD{n}"))
+            .filter(|n| Path::new("/dev/dri").join(n).exists())
+            .map(|n| {
+                let dev = Path::new("/sys/class/drm").join(&n).join("device");
+                vidkit_core::caps::RenderNode {
+                    path: format!("/dev/dri/{n}"),
+                    driver: std::fs::read_link(dev.join("driver")).ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned())).unwrap_or_default(),
+                    vram: std::fs::read_to_string(dev.join("mem_info_vram_total")).ok().and_then(|v| v.trim().parse().ok()),
+                }
+            })
+            .collect();
+        let render_node = vidkit_core::caps::pick_render_node(&nodes).map(|n| n.path.clone());
         Machine {
             kind,
             gpu_driver: p.gpu_driver,
             render_node,
             decoders: parse_decoders(&run(&["-hide_banner", "-decoders"])),
             hwaccels: parse_hwaccels(&run(&["-hide_banner", "-hwaccels"])),
+            vaapi: vaapi_profiles(),
+            vaapi_vpp: vainfo().as_ref().is_some_and(|(_, v)| *v),
+            vulkan: vulkan_video_codecs(),
+            vulkan_devices: vulkan_devices().to_vec(),
         }
     })
 }
@@ -509,6 +701,7 @@ pub fn video_args(src: &VideoInput, from: Duration, accel: &Accel, scale_to: Opt
 pub fn video_args_fmt(src: &VideoInput, from: Duration, accel: &Accel, scale_to: Option<(u32, u32)>, layout: PlaneLayout) -> Vec<String> {
     let (pix, vaapi_fmt) = match layout {
         PlaneLayout::P010 => ("p010le", "p010"),
+        PlaneLayout::I420 => ("yuv420p", "nv12"),
         _ => ("nv12", "nv12"),
     };
     let mut a: Vec<String> = vec!["-v".into(), "error".into(), "-nostdin".into()];
@@ -516,15 +709,35 @@ pub fn video_args_fmt(src: &VideoInput, from: Duration, accel: &Accel, scale_to:
 
     match accel {
         Accel::Software => {}
-        Accel::Vaapi { device } => {
+        Accel::Vaapi { device, codec, vpp } => {
             push(&mut a, &["-hwaccel", "vaapi", "-hwaccel_device", device]);
-            if scale_to.is_some() {
+            // ffmpeg's DEFAULT AV1 decoder is libdav1d (registered first),
+            // a software decoder that ignores -hwaccel: without naming the
+            // native decoder, "VAAPI" AV1 was dav1d on the CPU even on
+            // hardware that decodes AV1. VP9/HEVC/H.264 default to the native
+            // decoders already.
+            if codec == "av1" {
+                push(&mut a, &["-c:v", "av1"]);
+            }
+            if scale_to.is_some() && *vpp {
                 // Keep frames on the GPU so scale_vaapi can shrink them before
                 // the download; without this ffmpeg downloads full size.
                 push(&mut a, &["-hwaccel_output_format", "vaapi"]);
             }
         }
         Accel::V4l2m2m { decoder } => push(&mut a, &["-c:v", decoder]),
+        Accel::Vulkan { codec, device } => {
+            // Frames are downloaded to system memory by ffmpeg (no
+            // hwaccel_output_format) and scaled in software after. The
+            // device is named: ffmpeg's default is device 0, which on a
+            // hybrid laptop is often the discrete GPU.
+            push(&mut a, &["-init_hw_device", &format!("vulkan=vk:{device}"), "-hwaccel", "vulkan", "-hwaccel_device", "vk"]);
+            // Same trap as VAAPI: the default AV1 decoder is libdav1d, which
+            // never touches the hardware.
+            if codec == "av1" {
+                push(&mut a, &["-c:v", "av1"]);
+            }
+        }
     }
     if src.network {
         if !src.headers.is_empty() {
@@ -547,7 +760,7 @@ pub fn video_args_fmt(src: &VideoInput, from: Duration, accel: &Accel, scale_to:
 
     if let Some((w, h)) = scale_to {
         let vf = match accel {
-            Accel::Vaapi { .. } => format!("scale_vaapi=w={w}:h={h}:format={vaapi_fmt},hwdownload,format={vaapi_fmt}"),
+            Accel::Vaapi { vpp: true, .. } => format!("scale_vaapi=w={w}:h={h}:format={vaapi_fmt},hwdownload,format={vaapi_fmt}"),
             // Bilinear, not swscale's bicubic default: for a downscale of two
             // or less the difference is invisible at arm's length and it is
             // roughly half the work per pixel, which on a phone core is the
@@ -636,6 +849,209 @@ impl PlanePool {
     }
 }
 
+/// What the engine's video thread pulls frames from: the ffmpeg child
+/// process ([`FfmpegFrames`]) or an in-process decoder.
+pub trait VideoSource: Send {
+    fn next_frame(&mut self) -> Option<Frame>;
+    fn frame_interval(&self) -> Duration;
+    fn hdr_peak(&self) -> Option<f32>;
+    /// Share the consumer's plane pool.
+    fn set_pool(&mut self, pool: Arc<PlanePool>);
+    /// "software 1920x1080", "VAAPI zero-copy 3840x2160"... for the status.
+    fn label(&self) -> String;
+    /// Bytes of one CPU frame (queue sizing); a dma-buf source still says
+    /// what the frame would weigh, since the pool of surfaces is what bounds
+    /// its queue.
+    fn frame_bytes(&self) -> usize;
+    /// A one-off note (a fallback happened), taken once.
+    fn take_note(&mut self) -> Option<String>;
+}
+
+static AI_FRAMES: AtomicBool = AtomicBool::new(false);
+
+/// AI in-between frames (experimental): decoders skip AV1's non-reference
+/// frames and the presenter synthesises them. Read at open, like the cap.
+pub fn set_ai_frames(on: bool) {
+    AI_FRAMES.store(on, Ordering::Relaxed);
+}
+
+pub fn ai_frames() -> bool {
+    AI_FRAMES.load(Ordering::Relaxed)
+}
+
+/// Whether an in-process decode of this stream skips non-reference frames
+/// for AI in-between frames: 8-bit AV1 in software, at a rate where half
+/// is still smooth to synthesise between (>= 45 fps), onto the GPU
+/// presenter. Pure. (Film grain is not exported then: the synthesised
+/// frames would be grainless, flickering at half the rate.)
+pub fn ai_skips(ai: bool, gpu: bool, software: bool, codec: &str, fps: f64, high_bit_depth: bool) -> bool {
+    ai && gpu && software && codec == "av1" && fps >= 45.0 && !high_bit_depth
+}
+
+static FPS_CAP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The frame rate to show at most (the viewer's cap, or the battery
+/// policy's); `None`: every frame. Read per frame by [`RateCapped`], and at
+/// open by decoders that can skip work for it.
+pub fn set_fps_cap(cap: Option<u32>) {
+    FPS_CAP.store(cap.unwrap_or(0), Ordering::Relaxed);
+}
+
+pub fn fps_cap() -> Option<u32> {
+    Some(FPS_CAP.load(Ordering::Relaxed)).filter(|&c| c > 0)
+}
+
+/// Whether a frame at `pts` is shown under `cap`, the last shown being at
+/// `last`. A tenth of an interval of slack, so 60 -> 30 keeps every other
+/// frame rather than drifting to every third on timestamp rounding. Pure.
+pub fn keep_frame(pts: Duration, last: Option<Duration>, cap: Option<u32>) -> bool {
+    match (cap, last) {
+        (Some(c), Some(l)) if pts > l => (pts - l).as_secs_f64() >= 0.9 / c as f64,
+        _ => true,
+    }
+}
+
+/// Frames above the cap never reach the queue: no upload, no conversion,
+/// no composite, no wakeup for them. (Decoding them is the decoder's
+/// business: in process, AV1 skips non-reference frames outright.)
+pub struct RateCapped {
+    inner: Box<dyn VideoSource>,
+    pool: Option<Arc<PlanePool>>,
+    last: Option<Duration>,
+    pub skipped: u64,
+}
+
+impl RateCapped {
+    pub fn new(inner: Box<dyn VideoSource>) -> Self {
+        Self { inner, pool: None, last: None, skipped: 0 }
+    }
+}
+
+impl VideoSource for RateCapped {
+    fn next_frame(&mut self) -> Option<Frame> {
+        loop {
+            let f = self.inner.next_frame()?;
+            // A seek or a loop goes backwards: start over.
+            if self.last.is_some_and(|l| f.pts < l) {
+                self.last = None;
+            }
+            if keep_frame(f.pts, self.last, fps_cap()) {
+                self.last = Some(f.pts);
+                return Some(f);
+            }
+            self.skipped += 1;
+            match &self.pool {
+                Some(p) => p.recycle(f),
+                None => drop(f),
+            }
+        }
+    }
+    fn frame_interval(&self) -> Duration {
+        let i = self.inner.frame_interval();
+        match fps_cap() {
+            Some(c) => i.max(Duration::from_secs_f64(1.0 / c as f64)),
+            None => i,
+        }
+    }
+    fn hdr_peak(&self) -> Option<f32> {
+        self.inner.hdr_peak()
+    }
+    fn set_pool(&mut self, pool: Arc<PlanePool>) {
+        self.pool = Some(pool.clone());
+        self.inner.set_pool(pool)
+    }
+    fn label(&self) -> String {
+        match fps_cap() {
+            Some(c) => format!("{} @≤{c} fps", self.inner.label()),
+            None => self.inner.label(),
+        }
+    }
+    fn frame_bytes(&self) -> usize {
+        self.inner.frame_bytes()
+    }
+    fn take_note(&mut self) -> Option<String> {
+        self.inner.take_note()
+    }
+}
+
+/// A source that hands over to another if it ends before its first frame:
+/// a hardware path that opened but cannot decode this stream (a pixel
+/// format it will not give, a profile it refuses) falls back instead of
+/// playing nothing. The fallback is opened only when needed.
+pub struct FallbackSource {
+    current: Box<dyn VideoSource>,
+    fallback: Option<Box<dyn FnOnce() -> Option<Box<dyn VideoSource>> + Send>>,
+    got_frame: bool,
+    note: Option<String>,
+}
+
+impl FallbackSource {
+    pub fn new(primary: Box<dyn VideoSource>, fallback: Box<dyn FnOnce() -> Option<Box<dyn VideoSource>> + Send>) -> Self {
+        Self { current: primary, fallback: Some(fallback), got_frame: false, note: None }
+    }
+}
+
+impl VideoSource for FallbackSource {
+    fn next_frame(&mut self) -> Option<Frame> {
+        loop {
+            if let Some(f) = self.current.next_frame() {
+                self.got_frame = true;
+                return Some(f);
+            }
+            if self.got_frame {
+                return None;
+            }
+            let fb = self.fallback.take()?;
+            let why = self.current.take_note().unwrap_or_else(|| "no frames".into());
+            let was = self.current.label();
+            self.current = fb()?;
+            self.note = Some(format!("{was} failed ({why}); now {}", self.current.label()));
+        }
+    }
+    fn frame_interval(&self) -> Duration {
+        self.current.frame_interval()
+    }
+    fn hdr_peak(&self) -> Option<f32> {
+        self.current.hdr_peak()
+    }
+    fn set_pool(&mut self, pool: Arc<PlanePool>) {
+        self.current.set_pool(pool)
+    }
+    fn label(&self) -> String {
+        self.current.label()
+    }
+    fn frame_bytes(&self) -> usize {
+        self.current.frame_bytes()
+    }
+    fn take_note(&mut self) -> Option<String> {
+        self.note.take().or_else(|| self.current.take_note())
+    }
+}
+
+impl VideoSource for FfmpegFrames {
+    fn next_frame(&mut self) -> Option<Frame> {
+        FfmpegFrames::next_frame(self)
+    }
+    fn frame_interval(&self) -> Duration {
+        self.frame_interval
+    }
+    fn hdr_peak(&self) -> Option<f32> {
+        self.hdr_peak
+    }
+    fn set_pool(&mut self, pool: Arc<PlanePool>) {
+        FfmpegFrames::set_pool(self, pool)
+    }
+    fn label(&self) -> String {
+        format!("{} {}x{}", self.accel.label(), self.width, self.height)
+    }
+    fn frame_bytes(&self) -> usize {
+        FfmpegFrames::frame_bytes(self)
+    }
+    fn take_note(&mut self) -> Option<String> {
+        self.note.take()
+    }
+}
+
 /// A running ffmpeg, yielding NV12 frames.
 pub struct FfmpegFrames {
     child: Child,
@@ -658,6 +1074,9 @@ pub struct FfmpegFrames {
     /// Why a fallback happened, once, for the UI.
     pub note: Option<String>,
     pool: Arc<PlanePool>,
+    /// AV1 film grain parameters for the frames, when the decoder was told
+    /// to export grain instead of applying it (see [`grain_on_gpu`]).
+    grain: Option<GrainFeed>,
 }
 
 /// Grow a pipe's kernel buffer. The default is 64 KiB: a 4K NV12 frame
@@ -676,9 +1095,82 @@ pub fn grow_pipe(fd: std::os::fd::RawFd, want: usize) -> Option<usize> {
 /// The pipe size for frames of `frame_bytes`: a frame's worth, capped.
 pub const PIPE_WANT: usize = 1 << 20;
 
+/// The efficiency cores of a big.LITTLE machine: the CPUs in the LOWEST
+/// `cpu_capacity` tier, when capacities differ at all. Pure.
+///
+/// Measured on a 720p SVT-AV1 stream (rav1d, callgrind): 73% of AV1 decode
+/// is entropy decoding, serial and CPU-only, so a GPU decoder could take at
+/// most ~a quarter off the CPU. On an M2 (no AV1 block) the lever is the
+/// other way round: run the software decoder on the cores that do a unit of
+/// work for the least energy. M2 Max: 4 efficiency + 8 performance cores;
+/// Fairphone 5: A55 / A78 / X1, three tiers -- the A55s are the lowest.
+/// A symmetric machine returns nothing: nothing to pin to.
+pub fn efficiency_cpus(capacities: &[(usize, u32)]) -> Vec<usize> {
+    let (Some(min), Some(max)) = (capacities.iter().map(|c| c.1).min(), capacities.iter().map(|c| c.1).max()) else { return Vec::new() };
+    if min == max {
+        return Vec::new();
+    }
+    capacities.iter().filter(|c| c.1 == min).map(|c| c.0).collect()
+}
+
+/// `/sys/devices/system/cpu/cpu*/cpu_capacity`.
+pub fn cpu_capacities() -> Vec<(usize, u32)> {
+    let Ok(rd) = std::fs::read_dir("/sys/devices/system/cpu") else { return Vec::new() };
+    let mut v: Vec<(usize, u32)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().strip_prefix("cpu")?.parse::<usize>().ok()?;
+            let c = std::fs::read_to_string(e.path().join("cpu_capacity")).ok()?.trim().parse().ok()?;
+            Some((n, c))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+static DECODE_CPUS: Mutex<Option<Vec<usize>>> = Mutex::new(None);
+
+/// Pin every ffmpeg the player starts from now on to these CPUs (`None`:
+/// anywhere). Takes effect at the next (re)open.
+pub fn set_decode_cpus(cpus: Option<Vec<usize>>) {
+    if let Ok(mut c) = DECODE_CPUS.lock() {
+        *c = cpus.filter(|v| !v.is_empty());
+    }
+}
+
+pub fn decode_cpus() -> Option<Vec<usize>> {
+    DECODE_CPUS.lock().ok().and_then(|c| c.clone())
+}
+
+/// Restrict a child to `cpus` before it execs, and size ffmpeg's threads to
+/// match (more threads than cores only adds switching).
+fn pin(cmd: &mut Command, cpus: &[usize]) {
+    use std::os::unix::process::CommandExt;
+    let cpus = cpus.to_vec();
+    // SAFETY: sched_setaffinity on the calling (child) thread between fork
+    // and exec touches no locks or allocations beyond the stack set.
+    unsafe {
+        cmd.pre_exec(move || {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            for &c in &cpus {
+                libc::CPU_SET(c, &mut set);
+            }
+            if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 fn spawn_ffmpeg(args: &[String]) -> Result<Child, String> {
-    Command::new("ffmpeg")
-        .args(args)
+    let mut cmd = Command::new("ffmpeg");
+    let pinned = decode_cpus();
+    if let Some(cpus) = &pinned {
+        pin(&mut cmd, cpus);
+        cmd.args(["-threads", &cpus.len().to_string()]);
+    }
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Inherited stderr would scribble over the UI; ffmpeg is chatty even
@@ -737,11 +1229,20 @@ impl FfmpegFrames {
         from: Duration,
         accel: Accel,
     ) -> Result<Self, String> {
-        let scale_to = fit_long_edge(p.width, p.height, max_long_edge);
+        let scale_to = worth_scaling((p.width, p.height), fit_long_edge(p.width, p.height, max_long_edge), TEXTURE_LIMIT.load(Ordering::Relaxed));
         let (w, h) = scale_to.unwrap_or((p.width, p.height));
-        let layout = p.layout();
-        let args = video_args_fmt(src, from, &accel, scale_to, layout);
+        let layout = output_layout(p.layout(), &p.pix_fmt, !accel.is_hardware(), PREFER_PLANAR.load(Ordering::Relaxed));
+        let mut args = video_args_fmt(src, from, &accel, scale_to, layout);
         let fallback = accel.is_hardware().then(|| video_args_fmt(src, from, &Accel::Software, scale_to, layout));
+        // Grain on the GPU: the feed starts first (it only demuxes), and the
+        // decoder is told to export grain only once the feed is running --
+        // otherwise a failed feed would show the film with no grain at all.
+        let grain = grain_on_gpu(p, src, &accel, scale_to, layout)
+            .then(|| GrainFeed::spawn(src, from, p.start_time))
+            .and_then(|r| r.map_err(|e| eprintln!("vidkit: GPU film grain off: {e}")).ok());
+        if grain.is_some() {
+            args = with_grain_export(args);
+        }
         let child = spawn_ffmpeg(&args)?;
         Ok(Self {
             child,
@@ -761,6 +1262,7 @@ impl FfmpegFrames {
             fallback,
             note: None,
             pool: PlanePool::new(),
+            grain,
         })
     }
 
@@ -795,12 +1297,45 @@ impl FfmpegFrames {
         let bps = self.bytes_per_sample();
         let (luma_len, chroma_len) = (w * h * bps, self.frame_bytes() - w * h * bps);
         loop {
+            if self.layout == PlaneLayout::I420 {
+                // Three planes, straight from the pipe into each -- no
+                // interleave, no copy.
+                let cw = (self.width as usize).div_ceil(2);
+                let c_len = cw * (self.height as usize).div_ceil(2);
+                let (mut y, mut u, mut v) = (self.pool.take(luma_len), self.pool.take(c_len), self.pool.take(c_len));
+                let ok = match self.child.stdout.as_mut() {
+                    Some(o) => o.read_exact(&mut y).is_ok() && o.read_exact(&mut u).is_ok() && o.read_exact(&mut v).is_ok(),
+                    None => false,
+                };
+                if ok {
+                    let pts = self.frame_interval.mul_f64(self.index as f64);
+                    self.index += 1;
+                    self.frames_read += 1;
+                    let grain = self.grain_for(pts);
+                    return Some(Frame {
+                        data: FrameData::Cpu(CpuPlanes { data: vec![y, u, v], strides: vec![self.width, cw as u32, cw as u32] }),
+                        width: self.width,
+                        height: self.height,
+                        layout: PlaneLayout::I420,
+                        color: self.color,
+                        pts,
+                        duration: Some(self.frame_interval),
+                        recycle: None,
+                        grain,
+                    });
+                }
+                self.pool.put(y);
+                self.pool.put(u);
+                self.pool.put(v);
+                return None;
+            }
             let mut luma = self.pool.take(luma_len);
             let mut chroma = self.pool.take(chroma_len);
             if self.read_planes(&mut luma, &mut chroma) {
                 let pts = self.frame_interval.mul_f64(self.index as f64);
                 self.index += 1;
                 self.frames_read += 1;
+                let grain = self.grain_for(pts);
                 return Some(Frame {
                     // Strides in BYTES: two per sample for P010.
                     data: FrameData::Cpu(CpuPlanes { data: vec![luma, chroma], strides: vec![self.width * bps as u32; 2] }),
@@ -811,6 +1346,7 @@ impl FfmpegFrames {
                     pts,
                     duration: Some(self.frame_interval),
                     recycle: None,
+                    grain,
                 });
             }
             self.pool.put(luma);
@@ -837,6 +1373,209 @@ impl FfmpegFrames {
             }
             return None;
         }
+    }
+}
+
+static GPU_GRAIN: AtomicBool = AtomicBool::new(false);
+static GPU_PRESENTER: AtomicBool = AtomicBool::new(false);
+
+/// Whether frames go to the GL presenter (which imports dma-bufs). Set by
+/// the app at startup and cleared if the GPU path fails.
+pub fn set_gpu_presenter(on: bool) {
+    GPU_PRESENTER.store(on, Ordering::Relaxed);
+}
+
+pub fn gpu_presenter() -> bool {
+    GPU_PRESENTER.load(Ordering::Relaxed)
+}
+
+/// Whether the presenter synthesises AV1 film grain itself (the GPU
+/// presenter does; the CPU one does not). Takes effect at the next open.
+pub fn set_gpu_grain(on: bool) {
+    GPU_GRAIN.store(on, Ordering::Relaxed);
+}
+
+/// Whether to have the decoder EXPORT film grain instead of applying it,
+/// so the GPU synthesises it at present time. Pure but for the global and
+/// `VIDKIT_GRAIN_CPU=1` (keep dav1d's grain, for A/B).
+///
+/// Only where the GPU stage is exact: AV1, 8-bit NV12/I420, decoded in
+/// software at source size (grain is defined on the source grid -- on a
+/// frame ffmpeg scaled, 32x32 grain blocks would land on the wrong
+/// pixels), from a local file (the feed demuxes the input a second time;
+/// for a stream that would be a second download).
+pub fn grain_on_gpu(p: &Probe, src: &VideoInput, accel: &Accel, scale_to: Option<(u32, u32)>, layout: PlaneLayout) -> bool {
+    GPU_GRAIN.load(Ordering::Relaxed)
+        && std::env::var("VIDKIT_GRAIN_CPU").as_deref() != Ok("1")
+        && grain_eligible(p, src, accel, scale_to, layout)
+}
+
+/// [`grain_on_gpu`] without the switches. Pure.
+pub fn grain_eligible(p: &Probe, src: &VideoInput, accel: &Accel, scale_to: Option<(u32, u32)>, layout: PlaneLayout) -> bool {
+    p.codec == "av1" && !src.network && !accel.is_hardware() && scale_to.is_none() && matches!(layout, PlaneLayout::Nv12 | PlaneLayout::I420)
+}
+
+/// Decoder arguments with grain exported, not applied: an input (decoder)
+/// option, so before `-i`. libdav1d and ffmpeg's native AV1 decoder both
+/// honour it. Pure.
+pub fn with_grain_export(mut a: Vec<String>) -> Vec<String> {
+    let i = a.iter().position(|x| x == "-i").unwrap_or(a.len());
+    a.splice(i..i, ["-export_side_data".to_string(), "film_grain".to_string()]);
+    a
+}
+
+/// ffmpeg arguments for the grain feed: the video stream copied (demux
+/// only, no decode) as IVF, from the same seek point as the decoder, with
+/// the file's own timestamps (`-copyts`) so its units can be matched to
+/// decoded frames by time. Pure.
+pub fn grain_feed_args(src: &VideoInput, from: Duration) -> Vec<String> {
+    let mut a: Vec<String> = ["-v", "error", "-nostdin"].iter().map(|s| s.to_string()).collect();
+    if !from.is_zero() {
+        a.push("-ss".into());
+        a.push(format!("{:.3}", from.as_secs_f64()));
+    }
+    a.push("-i".into());
+    a.push(src.input.clone());
+    a.extend(["-map", "0:v:0", "-c", "copy", "-copyts", "-f", "ivf", "-"].iter().map(|s| s.to_string()));
+    a
+}
+
+/// Film grain parameters per shown frame, read from the bitstream by a
+/// second ffmpeg that only demuxes. The decoder's pixel pipe cannot carry
+/// side data, so the parameters come from vacc's AV1 header parser
+/// (byte-exact against dav1d: vidkit-vacc's grain oracle test).
+struct GrainFeed {
+    child: Child,
+    units: GrainUnits,
+}
+
+type GrainUnit = (f64, Option<Arc<vidkit_core::av1_grain::GrainParams>>);
+
+/// The feed's units, matched to decoded frames by time.
+struct GrainUnits {
+    /// (media time of the frame in seconds, its grain), in display order.
+    rx: std::sync::mpsc::Receiver<GrainUnit>,
+    /// A unit read ahead of the frame being matched.
+    pending: Option<GrainUnit>,
+    misses: u64,
+    ended: bool,
+}
+
+impl GrainFeed {
+    fn spawn(src: &VideoInput, from: Duration, start_time: f64) -> Result<Self, String> {
+        let mut child = Command::new("ffmpeg")
+            .args(grain_feed_args(src, from))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("grain feed: {e}"))?;
+        let out = child.stdout.take().ok_or("grain feed: no stdout")?;
+        // Bounded: the demuxer is far faster than the decoder, and the pipe
+        // filling up is what holds it back rather than a film's worth of
+        // parameters in memory.
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        std::thread::Builder::new()
+            .name("vidkit-grain".into())
+            .spawn(move || {
+                let Ok(mut rd) = vidkit_vacc::grain::IvfReader::new(std::io::BufReader::with_capacity(1 << 16, out)) else { return };
+                let mut st = vidkit_vacc::grain::GrainStream::default();
+                let mut buf = Vec::new();
+                while let Some(t) = rd.next_unit(&mut buf) {
+                    match st.push_tu(&buf) {
+                        Ok(Some(p)) => {
+                            if tx.send((t - start_time, p.map(Arc::new))).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            eprintln!("vidkit: grain feed stopped: {e}");
+                            return;
+                        }
+                    }
+                    if st.present == Some(false) {
+                        return; // no grain in this stream: nothing to feed
+                    }
+                }
+            })
+            .map_err(|e| format!("grain feed thread: {e}"))?;
+        Ok(Self { child, units: GrainUnits::new(rx) })
+    }
+
+}
+
+impl GrainUnits {
+    fn new(rx: std::sync::mpsc::Receiver<GrainUnit>) -> Self {
+        Self { rx, pending: None, misses: 0, ended: false }
+    }
+
+    /// The grain for the frame at media time `t` (`half`: half a frame
+    /// interval). Units before the frame are skipped (the demuxer starts at
+    /// the keyframe before the seek point; the decoder drops those frames);
+    /// a unit after it is kept for a later frame. Waits a little for a unit
+    /// that has not arrived: the demuxer normally runs far ahead.
+    fn take(&mut self, t: f64, half: f64) -> Option<Arc<vidkit_core::av1_grain::GrainParams>> {
+        loop {
+            let item = match self.pending.take() {
+                Some(i) => i,
+                None if self.ended => return None,
+                None => match self.rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(i) => i,
+                    // Ended (no grain in the stream, the end of the file, a
+                    // parse error): stop asking, or every later frame waits.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        self.ended = true;
+                        return None;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        self.misses += 1;
+                        return None;
+                    }
+                },
+            };
+            match match_unit(item.0, t, half) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Equal => return item.1,
+                std::cmp::Ordering::Greater => {
+                    self.pending = Some(item);
+                    self.misses += 1;
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Where a feed unit at `unit` seconds sits against a frame at `frame`:
+/// before it, on it (within half an interval), or after it. Pure.
+pub fn match_unit(unit: f64, frame: f64, half: f64) -> std::cmp::Ordering {
+    if unit < frame - half {
+        std::cmp::Ordering::Less
+    } else if unit <= frame + half {
+        std::cmp::Ordering::Equal
+    } else {
+        std::cmp::Ordering::Greater
+    }
+}
+
+impl Drop for GrainFeed {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl FfmpegFrames {
+    /// The film grain for the frame at `pts`, if grain is being fed.
+    fn grain_for(&mut self, pts: Duration) -> Option<Arc<vidkit_core::av1_grain::GrainParams>> {
+        let half = self.frame_interval.as_secs_f64() / 2.0;
+        self.grain.as_mut()?.units.take(pts.as_secs_f64(), half)
+    }
+
+    /// Whether the decoder is exporting grain for the presenter.
+    pub fn grain_on_gpu(&self) -> bool {
+        self.grain.is_some()
     }
 }
 
@@ -869,6 +1608,189 @@ mod tests {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn the_container_start_time_is_read() {
+        let p = parse_probe("width=64\nheight=64\nr_frame_rate=30/1\nstart_time=0.080000\n").unwrap();
+        assert!((p.start_time - 0.08).abs() < 1e-9);
+        let q = parse_probe("width=64\nheight=64\nstart_time=N/A\n").unwrap();
+        assert_eq!(q.start_time, 0.0);
+    }
+
+    /// Exporting grain is a decoder option (before -i); the feed copies the
+    /// same seek window with the file's own timestamps.
+    #[test]
+    fn grain_arguments_sit_on_the_right_side_of_the_input() {
+        let src = VideoInput::file(Path::new("/f.mkv"));
+        let a = with_grain_export(video_args_fmt(&src, Duration::from_millis(1500), &Accel::Software, None, PlaneLayout::I420));
+        let at = |a: &[String], x: &str| a.iter().position(|y| y == x).unwrap();
+        assert!(at(&a, "-export_side_data") < at(&a, "-i") && a[at(&a, "-export_side_data") + 1] == "film_grain");
+        let f = grain_feed_args(&src, Duration::from_millis(1500));
+        assert!(at(&f, "-ss") < at(&f, "-i") && f[at(&f, "-ss") + 1] == "1.500");
+        assert!(at(&f, "-copyts") > at(&f, "-i") && at(&f, "copy") > at(&f, "-i"));
+        assert_eq!(f[at(&f, "-f") + 1], "ivf");
+        assert!(!grain_feed_args(&src, Duration::ZERO).contains(&"-ss".to_string()));
+    }
+
+    #[test]
+    fn grain_moves_to_the_gpu_only_where_it_is_exact() {
+        let p = parse_probe("codec_name=av1\nwidth=64\nheight=64\npix_fmt=yuv420p\n").unwrap();
+        let file = VideoInput::file(Path::new("/f.mkv"));
+        let sw = Accel::Software;
+        assert!(grain_eligible(&p, &file, &sw, None, PlaneLayout::I420));
+        assert!(grain_eligible(&p, &file, &sw, None, PlaneLayout::Nv12));
+        assert!(!grain_eligible(&p, &file, &sw, Some((32, 32)), PlaneLayout::I420), "scaled");
+        assert!(!grain_eligible(&p, &file, &sw, None, PlaneLayout::P010), "10-bit");
+        assert!(!grain_eligible(&p, &VideoInput::url("https://x/v", &[]), &sw, None, PlaneLayout::I420), "a stream");
+        let hw = Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "av1".into(), vpp: false };
+        assert!(!grain_eligible(&p, &file, &hw, None, PlaneLayout::I420), "hardware");
+        let vp9 = parse_probe("codec_name=vp9\nwidth=64\nheight=64\n").unwrap();
+        assert!(!grain_eligible(&vp9, &file, &sw, None, PlaneLayout::I420));
+    }
+
+    #[test]
+    fn feed_units_match_frames_within_half_an_interval() {
+        use std::cmp::Ordering::*;
+        let h = 1.0 / 60.0;
+        assert_eq!(match_unit(1.0, 1.5, h), Less);
+        assert_eq!(match_unit(1.5 + 0.001, 1.5, h), Equal);
+        assert_eq!(match_unit(1.5 - 0.016, 1.5, h), Equal);
+        assert_eq!(match_unit(1.5 + 0.034, 1.5, h), Greater);
+    }
+
+    /// Units before a frame are skipped, a unit past a missing frame is kept
+    /// for its own frame, and a closed feed stops being waited on.
+    #[test]
+    fn grain_units_skip_behind_and_hold_ahead() {
+        let g = |seed| Some(Arc::new(vidkit_core::av1_grain::GrainParams { seed, ..Default::default() }));
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        for (t, s) in [(0.9, 1), (1.0, 2), (1.1, 3), (1.3, 4)] {
+            tx.send((t, g(s))).unwrap();
+        }
+        drop(tx);
+        let mut u = GrainUnits::new(rx);
+        let h = 0.05;
+        assert_eq!(u.take(1.0, h).unwrap().seed, 2, "0.9 skipped");
+        assert_eq!(u.take(1.1, h).unwrap().seed, 3);
+        assert!(u.take(1.2, h).is_none(), "no unit for 1.2 (1.3 is ahead)");
+        assert_eq!(u.take(1.3, h).unwrap().seed, 4, "1.3 was held, not lost");
+        let t0 = std::time::Instant::now();
+        assert!(u.take(1.4, h).is_none() && u.take(1.5, h).is_none());
+        assert!(u.ended && t0.elapsed() < Duration::from_millis(150), "waited on a closed feed");
+    }
+
+    /// End to end against ffmpeg's own dav1d: a seeked decode with grain
+    /// EXPORTED, plus our grain from the feed's parameters, gives exactly the
+    /// picture ffmpeg shows with dav1d applying the grain -- every byte of
+    /// every frame, from mid-GOP (the feed starts at the keyframe before the
+    /// seek point and must skip to the decoder's first frame).
+    #[test]
+    fn exported_grain_plus_ours_is_dav1ds_picture() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let enc = Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output().map(|o| String::from_utf8_lossy(&o.stdout).contains("libsvtav1")).unwrap_or(false);
+        if !enc {
+            eprintln!("no libsvtav1; skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("vk-grainfeed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("g.mkv");
+        let (w, h) = (352usize, 198usize);
+        assert!(Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", &format!("testsrc2=size={w}x{h}:rate=30:duration=3,noise=alls=14:allf=t"),
+            "-c:v", "libsvtav1", "-preset", "10", "-g", "30", "-svtav1-params", "film-grain=10", "-pix_fmt", "yuv420p"]).arg(&f).stderr(Stdio::null()).status().unwrap().success());
+        let from = Duration::from_millis(1500);
+        let reference = Command::new("ffmpeg").args(["-v", "error", "-ss", "1.500", "-i"]).arg(&f).args(["-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"]).output().unwrap().stdout;
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let fs = w * h + 2 * cw * ch;
+        assert!(reference.len() >= fs * 30, "reference too short: {}", reference.len() / fs);
+
+        set_gpu_grain(true);
+        let p = probe(&f).unwrap();
+        let mut d = FfmpegFrames::open_probed(&VideoInput::file(&f), &p, None, from, Accel::Software).unwrap();
+        assert!(d.grain_on_gpu(), "grain not moved to the GPU");
+        let (mut n, mut grained) = (0, 0);
+        while let Some(fr) = d.next_frame() {
+            let FrameData::Cpu(pl) = &fr.data else { panic!() };
+            let (mut y, mut u, mut v) = (pl.data[0][..w * h].to_vec(), Vec::new(), Vec::new());
+            if fr.layout == PlaneLayout::I420 {
+                u = pl.data[1][..cw * ch].to_vec();
+                v = pl.data[2][..cw * ch].to_vec();
+            } else {
+                for i in 0..cw * ch {
+                    u.push(pl.data[1][2 * i]);
+                    v.push(pl.data[1][2 * i + 1]);
+                }
+            }
+            let g = fr.grain.as_ref().unwrap_or_else(|| panic!("frame {n}: no grain parameters"));
+            vidkit_core::av1_grain::apply_i420(g, &mut y, &mut u, &mut v, w, h, false);
+            grained += 1;
+            let want = &reference[n * fs..(n + 1) * fs];
+            let got: Vec<u8> = [y, u, v].concat();
+            let bad = got.iter().zip(want).filter(|(a, b)| a != b).count();
+            assert_eq!(bad, 0, "frame {n} (seed {}): {bad} bytes differ from ffmpeg+dav1d", g.seed);
+            n += 1;
+        }
+        assert_eq!(n * fs, reference.len(), "frame count differs from ffmpeg's");
+        eprintln!("DIAG {n} frames from 1.5 s, {grained} grained on our side, byte-identical to ffmpeg+dav1d");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct Fake {
+        n: u32,
+        name: &'static str,
+        note: Option<String>,
+    }
+    impl VideoSource for Fake {
+        fn next_frame(&mut self) -> Option<Frame> {
+            (self.n > 0).then(|| {
+                self.n -= 1;
+                crate::pattern::bars(0.0)
+            })
+        }
+        fn frame_interval(&self) -> Duration { Duration::from_millis(40) }
+        fn hdr_peak(&self) -> Option<f32> { None }
+        fn set_pool(&mut self, _: Arc<PlanePool>) {}
+        fn label(&self) -> String { self.name.into() }
+        fn frame_bytes(&self) -> usize { 0 }
+        fn take_note(&mut self) -> Option<String> { self.note.take() }
+    }
+
+    #[test]
+    fn a_cap_keeps_every_other_frame_of_sixty() {
+        let ms = |n: u64| Duration::from_micros(n * 16_667);
+        let mut last = None;
+        let mut kept = 0;
+        for k in 0..60 {
+            if keep_frame(ms(k), last, Some(30)) {
+                last = Some(ms(k));
+                kept += 1;
+            }
+        }
+        assert_eq!(kept, 30);
+        assert!(keep_frame(ms(1), Some(ms(0)), None), "no cap, every frame");
+        assert!(keep_frame(ms(0), Some(ms(5)), Some(30)), "backwards (a seek) is shown");
+        // 24 fps content under a 30 cap: nothing dropped.
+        let f24 = |n: u64| Duration::from_micros(n * 41_667);
+        assert!((1..48).all(|k| keep_frame(f24(k), Some(f24(k - 1)), Some(30))));
+    }
+
+    /// A hardware path that opens but gives nothing hands over; one that
+    /// played and ended does not (that is the end of the film).
+    #[test]
+    fn a_source_that_gives_nothing_falls_back_once() {
+        let mut s = FallbackSource::new(Box::new(Fake { n: 0, name: "V4L2", note: Some("pixel format QC08C".into()) }), Box::new(|| Some(Box::new(Fake { n: 3, name: "libav", note: None }) as Box<dyn VideoSource>)));
+        let mut n = 0;
+        while s.next_frame().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 3);
+        let note = s.take_note().unwrap();
+        assert!(note.contains("V4L2 failed (pixel format QC08C); now libav"), "{note}");
+        let mut t = FallbackSource::new(Box::new(Fake { n: 2, name: "V4L2", note: None }), Box::new(|| panic!("must not fall back after frames")));
+        assert!(t.next_frame().is_some() && t.next_frame().is_some() && t.next_frame().is_none());
     }
 
     /// `30000/1001` is 29.97 and `30/1` is 30. A parser that splits on `/` and
@@ -1127,6 +2049,7 @@ mod tests {
 /// Video and audio arrive as separate URLs. ffmpeg takes both as inputs and
 /// maps one stream from each — the same muxing yt-dlp would have done, done
 /// while playing instead of before it.
+#[derive(Clone)]
 pub struct StreamingInput {
     pub video_url: String,
     /// Separate audio, when the site serves it that way.
@@ -1173,7 +2096,7 @@ mod color_tests {
         assert_eq!(p.layout(), PlaneLayout::P010);
         let a = video_args_fmt(&VideoInput::file(Path::new("x")), Duration::ZERO, &Accel::Software, None, p.layout());
         assert!(a.windows(2).any(|w| w[0] == "-pix_fmt" && w[1] == "p010le"), "{a:?}");
-        let v = video_args_fmt(&VideoInput::file(Path::new("x")), Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into() }, Some((1920, 1080)), PlaneLayout::P010);
+        let v = video_args_fmt(&VideoInput::file(Path::new("x")), Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "hevc".into(), vpp: true }, Some((1920, 1080)), PlaneLayout::P010);
         assert!(v.iter().any(|x| x.contains("format=p010,hwdownload,format=p010")), "{v:?}");
     }
 
@@ -1238,6 +2161,277 @@ mod peak_tests {
             .arg(&f).status().map(|s| s.success()).unwrap_or(false);
         if !ok { eprintln!("no libx265; skipping"); return; }
         assert_eq!(probe_hdr_peak(&f.to_string_lossy()), Some(4000.0));
+        let _ = std::fs::remove_file(&f);
+    }
+}
+
+#[cfg(test)]
+mod vaapi_tests {
+    use super::*;
+    use vidkit_core::codec::Codec;
+
+    /// The heat bug, pinned: a driver that does not list AV1 gets software
+    /// for AV1 (honestly labelled) and VAAPI for what it does list.
+    #[test]
+    fn vaapi_is_only_asked_for_codecs_the_driver_lists() {
+        let m = Machine {
+            kind: MachineKind::Other,
+            gpu_driver: Some("i915".into()),
+            render_node: Some("/dev/dri/renderD128".into()),
+            decoders: vec![],
+            hwaccels: vec!["vaapi".into()],
+            vaapi: Some(vec![(Codec::H264, 8), (Codec::Vp9, 10)]),
+            vaapi_vpp: true,
+            vulkan: None,
+            vulkan_devices: vec![],
+        };
+        assert_eq!(choose_accel("av1", &m, AccelPref::Auto), Accel::Software);
+        assert!(matches!(choose_accel("vp9", &m, AccelPref::Auto), Accel::Vaapi { .. }));
+        assert_eq!(choose_accel("hevc", &m, AccelPref::Auto), Accel::Software, "not listed");
+        // Without vainfo, the old behaviour: trust the driver name.
+        let unknown = Machine { vaapi: None, ..m };
+        assert!(matches!(choose_accel("av1", &unknown, AccelPref::Auto), Accel::Vaapi { .. }));
+    }
+}
+
+#[cfg(test)]
+mod av1_tests {
+    use super::*;
+
+    /// VAAPI AV1 must name the native decoder, BEFORE -i: ffmpeg's default
+    /// AV1 decoder is libdav1d, which never touches the hardware.
+    #[test]
+    fn vaapi_av1_names_the_native_decoder() {
+        let src = VideoInput::file(Path::new("x.webm"));
+        let a = video_args(&src, Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "av1".into(), vpp: true }, None);
+        let (cv, i) = (a.windows(2).position(|w| w[0] == "-c:v" && w[1] == "av1"), a.iter().position(|x| x == "-i"));
+        assert!(cv.is_some() && cv < i, "{a:?}");
+        // VP9 needs nothing: the native vp9 decoder is the default.
+        let v = video_args(&src, Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "vp9".into(), vpp: true }, None);
+        assert!(!v.iter().any(|x| x == "-c:v"), "{v:?}");
+        // Software AV1 is left to ffmpeg's default -- libdav1d, the fastest.
+        let sw = video_args(&src, Duration::ZERO, &Accel::Software, None);
+        assert!(!sw.iter().any(|x| x == "-c:v"));
+    }
+}
+
+#[cfg(test)]
+mod asahi_tests {
+    use super::*;
+    use vidkit_core::codec::Codec;
+
+    fn asahi(vaapi: Option<Vec<(Codec, u8)>>) -> Machine {
+        Machine {
+            kind: MachineKind::Asahi,
+            gpu_driver: Some("asahi".into()),
+            render_node: Some("/dev/dri/renderD128".into()),
+            decoders: vec![],
+            hwaccels: vec!["vaapi".into()],
+            vaapi,
+            vaapi_vpp: false,
+            vulkan: None,
+            vulkan_devices: vec![],
+        }
+    }
+
+    /// With the VA layer (the published M2 vainfo: H.264, HEVC, VP9), VP9
+    /// goes to VAAPI; AV1 on an M2 is software; without the layer, all is.
+    #[test]
+    fn asahi_uses_the_va_layer_for_what_it_lists() {
+        let with = asahi(Some(vec![(Codec::H264, 8), (Codec::Hevc, 10), (Codec::Vp9, 10)]));
+        assert!(matches!(choose_accel("vp9", &with, AccelPref::Auto), Accel::Vaapi { vpp: false, .. }));
+        assert_eq!(choose_accel("av1", &with, AccelPref::Auto), Accel::Software);
+        assert_eq!(choose_accel("vp9", &asahi(None), AccelPref::Auto), Accel::Software);
+    }
+
+    /// No video processing: a downscale must not go through scale_vaapi
+    /// (the filter fails on Asahi's VA layer); decode on the VA side, let
+    /// ffmpeg download, scale in software.
+    #[test]
+    fn without_video_processing_scaling_is_done_in_software() {
+        let src = VideoInput::file(Path::new("x.webm"));
+        let a = video_args(&src, Duration::ZERO, &Accel::Vaapi { device: "/dev/dri/renderD128".into(), codec: "vp9".into(), vpp: false }, Some((1280, 720)));
+        assert!(a.iter().any(|x| x == "-hwaccel"), "still hardware decode: {a:?}");
+        assert!(!a.iter().any(|x| x.contains("scale_vaapi") || x == "-hwaccel_output_format"), "{a:?}");
+        assert!(a.iter().any(|x| x.starts_with("scale=1280:720")), "{a:?}");
+    }
+}
+
+#[cfg(test)]
+mod vulkan_tests {
+    use super::*;
+    use vidkit_core::codec::Codec;
+
+    fn nvidia() -> Machine {
+        Machine {
+            kind: MachineKind::Other,
+            gpu_driver: Some("nvidia".into()),
+            render_node: Some("/dev/dri/renderD128".into()),
+            decoders: vec![],
+            hwaccels: vec!["vaapi".into(), "vulkan".into(), "cuda".into()],
+            vaapi: None,
+            vaapi_vpp: false,
+            vulkan: Some(vec![Codec::Av1, Codec::H264, Codec::Hevc, Codec::Vp9]),
+            vulkan_devices: vec![vidkit_core::caps::VkVideoDevice { index: 0, integrated: false, codecs: vec![Codec::Av1, Codec::H264, Codec::Hevc, Codec::Vp9] }],
+        }
+    }
+
+    /// The gaming PC: NVIDIA was software before (no VA driver in the
+    /// list); with Vulkan Video it decodes in hardware.
+    #[test]
+    fn nvidia_decodes_through_vulkan_video() {
+        assert_eq!(choose_accel("av1", &nvidia(), AccelPref::Auto), Accel::Vulkan { codec: "av1".into(), device: 0 });
+        let no_vk = Machine { vulkan: None, ..nvidia() };
+        assert_eq!(choose_accel("av1", &no_vk, AccelPref::Auto), Accel::Software);
+        let no_hwaccel = Machine { hwaccels: vec!["vaapi".into()], ..nvidia() };
+        assert_eq!(choose_accel("vp9", &no_hwaccel, AccelPref::Auto), Accel::Software, "an ffmpeg built without vulkan");
+    }
+
+    /// Intel with a VA driver lacking AV1 but Vulkan having it: VAAPI for
+    /// VP9, Vulkan for AV1.
+    #[test]
+    fn vaapi_first_vulkan_fills_the_gap() {
+        let m = Machine {
+            gpu_driver: Some("i915".into()),
+            vaapi: Some(vec![(Codec::H264, 8), (Codec::Vp9, 10)]),
+            vaapi_vpp: true,
+            vulkan: Some(vec![Codec::Av1, Codec::H264, Codec::Hevc]),
+            vulkan_devices: vec![vidkit_core::caps::VkVideoDevice { index: 0, integrated: true, codecs: vec![Codec::Av1, Codec::H264, Codec::Hevc] }],
+            ..nvidia()
+        };
+        assert!(matches!(choose_accel("vp9", &m, AccelPref::Auto), Accel::Vaapi { .. }));
+        assert_eq!(choose_accel("av1", &m, AccelPref::Auto), Accel::Vulkan { codec: "av1".into(), device: 0 });
+    }
+
+    /// A hybrid laptop, dGPU as device 0: H.264 decodes on the iGPU
+    /// (device 1), and that index reaches ffmpeg.
+    #[test]
+    fn hybrid_decode_goes_to_the_igpu_and_ffmpeg_is_told() {
+        let m = Machine {
+            vulkan: Some(vec![Codec::Av1, Codec::H264]),
+            vulkan_devices: vec![
+                vidkit_core::caps::VkVideoDevice { index: 0, integrated: false, codecs: vec![Codec::Av1, Codec::H264] },
+                vidkit_core::caps::VkVideoDevice { index: 1, integrated: true, codecs: vec![Codec::H264] },
+            ],
+            ..nvidia()
+        };
+        let acc = choose_accel("h264", &m, AccelPref::Auto);
+        assert_eq!(acc, Accel::Vulkan { codec: "h264".into(), device: 1 });
+        let a = video_args(&VideoInput::file(Path::new("x.mp4")), Duration::ZERO, &acc, None);
+        assert!(a.windows(2).any(|w| w[0] == "-init_hw_device" && w[1] == "vulkan=vk:1"), "{a:?}");
+        assert_eq!(choose_accel("av1", &m, AccelPref::Auto), Accel::Vulkan { codec: "av1".into(), device: 0 }, "only the dGPU has AV1");
+    }
+
+    #[test]
+    fn vulkan_args_name_the_native_av1_decoder_and_scale_in_software() {
+        let src = VideoInput::file(Path::new("x.webm"));
+        let a = video_args(&src, Duration::ZERO, &Accel::Vulkan { codec: "av1".into(), device: 0 }, Some((1280, 720)));
+        let (hw, cv, i) = (a.iter().position(|x| x == "vulkan"), a.windows(2).position(|w| w[0] == "-c:v" && w[1] == "av1"), a.iter().position(|x| x == "-i"));
+        assert!(hw < i && cv.is_some() && cv < i, "{a:?}");
+        assert!(a.iter().any(|x| x.starts_with("scale=1280:720")), "{a:?}");
+        assert!(!a.iter().any(|x| x == "-hwaccel_output_format"));
+    }
+}
+
+#[cfg(test)]
+mod fedora_tests {
+    use super::*;
+    use vidkit_core::codec::Codec;
+
+    /// Asahi with the VA layer listing H.264, but Fedora's ffmpeg-free has
+    /// no native h264 decoder: software (OpenH264), not a VAAPI that fails.
+    #[test]
+    fn no_native_decoder_no_hardware_path() {
+        let m = Machine {
+            kind: MachineKind::Asahi,
+            gpu_driver: Some("asahi".into()),
+            render_node: Some("/dev/dri/renderD128".into()),
+            decoders: ["vp9", "av1", "libdav1d", "libopenh264"].iter().map(|s| s.to_string()).collect(),
+            hwaccels: vec!["vaapi".into()],
+            vaapi: Some(vec![(Codec::H264, 8), (Codec::Hevc, 10), (Codec::Vp9, 10)]),
+            vaapi_vpp: false,
+            vulkan: None,
+            vulkan_devices: vec![],
+        };
+        assert_eq!(choose_accel("h264", &m, AccelPref::Auto), Accel::Software);
+        assert!(matches!(choose_accel("vp9", &m, AccelPref::Auto), Accel::Vaapi { .. }));
+    }
+}
+
+#[cfg(test)]
+mod core_tests {
+    use super::*;
+
+    #[test]
+    fn the_lowest_capacity_tier_is_the_efficiency_cores() {
+        // M2 Max-shaped: 4 efficiency, 8 performance (capacities invented;
+        // the SHAPE is the point).
+        let m2max: Vec<(usize, u32)> = (0..4).map(|c| (c, 380)).chain((4..12).map(|c| (c, 1024))).collect();
+        assert_eq!(efficiency_cpus(&m2max), vec![0, 1, 2, 3]);
+        // Fairphone 5-shaped: 4 x A55, 3 x A78, 1 x X1.
+        let fp5: Vec<(usize, u32)> = (0..4).map(|c| (c, 260)).chain((4..7).map(|c| (c, 870))).chain([(7, 1024)]).collect();
+        assert_eq!(efficiency_cpus(&fp5), vec![0, 1, 2, 3]);
+        let x86: Vec<(usize, u32)> = (0..8).map(|c| (c, 1024)).collect();
+        assert!(efficiency_cpus(&x86).is_empty(), "symmetric: nothing to pin to");
+        assert!(efficiency_cpus(&[]).is_empty());
+    }
+
+    /// The mechanics, for real: a child pinned to CPU 0 is allowed only CPU 0.
+    #[test]
+    fn a_pinned_child_really_is_pinned() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "grep Cpus_allowed_list /proc/self/status"]);
+        pin(&mut cmd, &[0]);
+        let out = cmd.output().unwrap();
+        let line = String::from_utf8_lossy(&out.stdout);
+        assert!(line.trim().ends_with("\t0") || line.trim().ends_with(" 0"), "{line}");
+    }
+}
+
+#[cfg(test)]
+mod planar_tests {
+    use super::*;
+
+    /// The measured case: a 3840x2160 VP9 on a 3456-wide panel is left to
+    /// the GPU to fit; 4K on a 1080p phone is still shrunk in ffmpeg; past
+    /// the texture limit, always.
+    #[test]
+    fn mild_fits_are_left_to_the_gpu() {
+        let src = (3840, 2160);
+        assert_eq!(worth_scaling(src, fit_long_edge(3840, 2160, Some(3456)), 16384), None, "0.81 of the area: GPU");
+        assert_eq!(worth_scaling(src, fit_long_edge(3840, 2160, Some(1920)), 16384), Some((1920, 1080)), "0.25: ffmpeg");
+        assert_eq!(worth_scaling(src, fit_long_edge(3840, 2160, Some(3456)), 2048), Some((3456, 1944)), "past the texture limit");
+        assert_eq!(worth_scaling(src, None, 16384), None);
+    }
+
+    #[test]
+    fn software_8bit_420_goes_planar_to_the_gpu_only() {
+        use PlaneLayout::*;
+        assert_eq!(output_layout(Nv12, "yuv420p", true, true), I420, "software VP9 to the GPU presenter");
+        assert_eq!(output_layout(Nv12, "yuv420p", false, true), Nv12, "VAAPI hands NV12 out natively");
+        assert_eq!(output_layout(Nv12, "yuv420p", true, false), Nv12, "the CPU presenter's fast path is NV12");
+        assert_eq!(output_layout(P010, "yuv420p10le", true, true), P010, "10-bit stays P010");
+        assert_eq!(output_layout(Nv12, "yuv444p", true, true), Nv12, "not 4:2:0: convert");
+    }
+
+    /// Real ffmpeg: I420 frames come through as three planes of the right
+    /// sizes, byte-identical to ffmpeg's own yuv420p output.
+    #[test]
+    fn i420_frames_arrive_as_three_planes() {
+        let f = std::env::temp_dir().join(format!("vk-i420-{}.mkv", std::process::id()));
+        if !Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=10:duration=1", "-c:v", "ffv1", "-pix_fmt", "yuv420p"]).arg(&f).status().map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
+        set_prefer_planar(true);
+        let p = super::probe(&f).unwrap();
+        let mut d = FfmpegFrames::open_probed(&VideoInput::file(&f), &p, None, Duration::ZERO, Accel::Software).unwrap();
+        set_prefer_planar(false);
+        let fr = d.next_frame().unwrap();
+        assert_eq!(fr.layout, PlaneLayout::I420);
+        let FrameData::Cpu(pl) = &fr.data else { panic!() };
+        assert_eq!(pl.data.iter().map(Vec::len).collect::<Vec<_>>(), vec![160 * 90, 80 * 45, 80 * 45]);
+        let reference = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&f).args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"]).output().unwrap().stdout;
+        assert!(pl.data.concat() == reference, "not ffmpeg's own bytes");
         let _ = std::fs::remove_file(&f);
     }
 }

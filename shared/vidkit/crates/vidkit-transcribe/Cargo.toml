@@ -19,3 +19,7 @@ whisper-rs = { version = "0.16", optional = true }
 [features]
 default = []
 whisper = ["dep:whisper-rs"]
+# Offload whisper to the GPU through Vulkan (a laptop iGPU included). Needs
+# the Vulkan headers and glslc at build time. NOT built or run in the sandbox
+# this was written in: no Vulkan device, no SDK.
+whisper-vulkan = ["whisper", "whisper-rs/vulkan"]

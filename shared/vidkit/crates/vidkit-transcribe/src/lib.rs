@@ -53,6 +53,30 @@ pub trait CueSource: Send {
     }
 }
 
+/// Share of 20 ms windows with speech-level energy (above -45 dBFS RMS).
+/// Pure.
+///
+/// A lecture's pauses, a video's silent stretches, music beds at the noise
+/// floor: whisper runs its full 30 s encoder on them anyway and then invents
+/// "Thank you." for the silence. Gating first costs one pass over the
+/// samples (microseconds) against seconds of encoder.
+pub fn speech_fraction(pcm: &[f32]) -> f32 {
+    const WIN: usize = (SAMPLE_RATE as usize) / 50; // 20 ms
+    const FLOOR: f32 = 0.005_6; // -45 dBFS
+    let wins = pcm.len() / WIN;
+    if wins == 0 {
+        return 0.0;
+    }
+    let loud = pcm
+        .chunks_exact(WIN)
+        .filter(|w| (w.iter().map(|s| s * s).sum::<f32>() / WIN as f32).sqrt() > FLOOR)
+        .count();
+    loud as f32 / wins as f32
+}
+
+/// Below this share of speech-level windows a chunk is not worth whisper.
+pub const MIN_SPEECH_FRACTION: f32 = 0.03;
+
 /// Clean one segment of whisper output, or drop it.
 ///
 /// Whisper fills silence with "Thank you." and `[BLANK_AUDIO]`, and in a
@@ -93,6 +117,21 @@ mod tests {
         );
         // Long thanks is speech, not the canned filler.
         assert!(clean_text("thank you very much for the question about entropy").is_some());
+    }
+
+    #[test]
+    fn silence_and_noise_floor_are_not_speech() {
+        let rate = SAMPLE_RATE as usize;
+        assert_eq!(speech_fraction(&vec![0.0; rate * 30]), 0.0);
+        let hiss: Vec<f32> = (0..rate * 30).map(|i| ((i * 7919 % 101) as f32 / 101.0 - 0.5) * 0.004).collect();
+        assert!(speech_fraction(&hiss) < MIN_SPEECH_FRACTION, "hiss at ~-55 dBFS");
+        // One second of talk-level tone in 30 s of silence: 3.3%, kept.
+        let mut one_sec = vec![0.0f32; rate * 30];
+        for (i, s) in one_sec.iter_mut().take(rate).enumerate() {
+            *s = (i as f32 * 0.05).sin() * 0.1;
+        }
+        assert!(speech_fraction(&one_sec) >= MIN_SPEECH_FRACTION);
+        assert_eq!(speech_fraction(&[]), 0.0);
     }
 }
 

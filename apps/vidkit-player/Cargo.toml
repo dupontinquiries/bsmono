@@ -22,6 +22,9 @@ egui = "0.34"
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
 
 vidkit-core = { path = "../../shared/vidkit/crates/vidkit-core" }
+# AV1 film grain parameters from the bitstream (vacc's header parser), for
+# the GPU grain stage. Pure Rust; only its parser is used here.
+vidkit-vacc = { path = "../../shared/vidkit/crates/vidkit-vacc" }
 # fcntl(F_SETPIPE_SZ / F_GETPIPE_SZ) on the audio player's stdin: Linux's
 # default 64 KB pipe holds ~340 ms of 48 kHz stereo, all of it "written" but not
 # yet heard. Already in the lockfile transitively.
@@ -46,6 +49,13 @@ vidkit-stream = { path = "../../shared/vidkit/crates/vidkit-stream" }
 # all. Reading /etc/ssl/certs is also what every other Linux client does.
 ureq = { version = "2", optional = true, features = ["native-certs"] }
 vidkit-egui = { path = "../../shared/vidkit/crates/vidkit-egui", features = ["glow-upload"] }
+# Presentation feedback / content type / commit timing on the window's own
+# wl_surface, reached through eframe's raw handles (same major as winit's).
+vidkit-wayland = { path = "../../shared/vidkit/crates/vidkit-wayland", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+# In-process libavcodec (no pipe; VAAPI frames as dma-bufs). Optional: it
+# needs the FFmpeg development headers and libclang at build time.
+vidkit-libav = { path = "../../shared/vidkit/crates/vidkit-libav", optional = true }
 vidkit-mp4 = { path = "../../shared/vidkit/crates/vidkit-mp4" }
 vidkit-webm = { path = "../../shared/vidkit/crates/vidkit-webm" }
 # Section watching: chapters, search and plans (pure), and the transcript
@@ -54,6 +64,9 @@ vidkit-relevance = { path = "../../shared/vidkit/crates/vidkit-relevance" }
 vidkit-transcribe = { path = "../../shared/vidkit/crates/vidkit-transcribe" }
 # tideshell's living palette, followed when the shell publishes it.
 ambient-palette = { path = "../../shared/ambient-palette" }
+# Where whisper models live (~/models/whisper and the legacy places), for
+# choosing a model by tier.
+models-kit = { path = "../../shared/models-kit" }
 # bscale's headless engine: stage A analysis (which blocks the CNN would
 # run on) and the reference RCAS. An app depending on an app's crate, as
 # studio does with d2x-job; the shared vidkit kits stay clear of it.
@@ -67,8 +80,12 @@ snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
 # Default-on, matching the other -egui apps: `cargo build --release` in this
 # directory produces the deployable binary with no feature incantation. Off is
 # for a headless build that only wants the library half.
-default = ["app", "https", "whisper", "alsa", "bscale"]
-app = ["dep:eframe"]
+default = ["app", "https", "whisper", "alsa", "bscale", "libav"]
+app = ["dep:eframe", "dep:vidkit-wayland", "dep:raw-window-handle"]
+# In-process decode + VAAPI zero copy (vidkit-libav). Build deps: libavcodec,
+# libavformat, libavutil headers (Fedora: ffmpeg-free-devel; Debian:
+# libav*-dev; postmarketOS: ffmpeg-dev) and clang.
+libav = ["dep:vidkit-libav"]
 # HTTPS range fetching. Separate from `app` so a headless build that only wants
 # the demuxers does not pull rustls.
 https = ["dep:ureq"]
@@ -77,6 +94,9 @@ https = ["dep:ureq"]
 # builds without it, and section watching then works from sidecar subtitles
 # only.
 whisper = ["vidkit-transcribe/whisper"]
+# Whisper on the GPU through Vulkan (laptop iGPUs included). Needs the Vulkan
+# headers and glslc. Untested: no Vulkan device where this was written.
+whisper-vulkan = ["whisper", "vidkit-transcribe/whisper-vulkan"]
 # In-process audio output through cpal (ALSA; PipeWire via pipewire-alsa).
 # Needs alsa-lib headers (libasound2-dev / alsa-lib-dev). Without it, audio
 # goes through pw-play / paplay / aplay as before.

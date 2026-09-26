@@ -1088,6 +1088,12 @@ impl vidkit_stream::TransportFactory<Box<dyn HttpTransport + Send>> for SchemeFa
 /// the decoder cannot manage, so it is one function to replace rather than a
 /// choice scattered through the app.
 pub fn assumed_caps() -> vidkit_core::caps::DeviceCaps {
+    // ...and never a stream the installed ffmpeg cannot decode (Fedora's
+    // ffmpeg-free: no H.264/HEVC code).
+    vidkit_core::caps::restrict_to_decoders(probed_caps(), &crate::decode::machine().decoders)
+}
+
+fn probed_caps() -> vidkit_core::caps::DeviceCaps {
     // Probed, not guessed. `sysprobe` reads the device-tree SoC id, the V4L2
     // driver names and the bound DRM driver, all of which the kernel already
     // knows — where the target triple could not tell an M1 from an M3 from a
@@ -1095,13 +1101,23 @@ pub fn assumed_caps() -> vidkit_core::caps::DeviceCaps {
     // this player targets.
     let p = vidkit_v4l2::sysprobe::probe(std::path::Path::new("/"));
     if let Some(caps) = vidkit_v4l2::sysprobe::caps_for(&p) {
-        return caps;
+        // What THIS player can use of it: a stateless decoder (Asahi's AVD)
+        // only through a VA-API layer that vainfo lists.
+        return vidkit_core::caps::usable_by_ffmpeg(caps, crate::decode::vaapi_profiles().as_deref());
     }
     // Unidentified. The probe refuses to guess and so does this: a desktop
     // profile is the safe default because it assumes the least about what is
     // present, and the evidence goes in the name so a bug report is one paste.
+    // A laptop or desktop: ask the VAAPI driver what it decodes rather than
+    // assume everything (see desktop_from_vaapi for what assuming cost).
+    // ...and the Vulkan driver: Vulkan Video covers NVIDIA, which has no
+    // native VA-API, and codecs an Intel/AMD VA driver lacks.
+    let (va, vk) = (crate::decode::vaapi_profiles(), crate::decode::vulkan_video_codecs());
+    if va.is_some() || vk.is_some() {
+        return vidkit_core::caps::desktop_from_probes(va.as_deref(), vk.as_deref());
+    }
     let mut fallback = vidkit_core::caps::desktop_full_hw();
-    fallback.name = format!("unrecognised device ({:?})", p.detected);
+    fallback.name = format!("unrecognised device ({:?}); ASSUMED full hardware decode -- install vainfo (libva-utils) or vulkaninfo (vulkan-tools) to check", p.detected);
     fallback
 }
 

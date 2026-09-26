@@ -44,6 +44,9 @@ mod ev {
     pub const LISTEN: &str = "listen_only";
     pub const QUALITY_FULL: &str = "quality_full";
     pub const SAVER: &str = "battery_saver";
+    pub const BETTER_TRANSCRIPT: &str = "better_transcript";
+    pub const MULTILINGUAL: &str = "multilingual";
+    pub const HELP: &str = "palette_help";
     pub const SETTINGS: &str = "settings";
     pub const QUIT: &str = "quit";
     pub const BACK: &str = "back";
@@ -74,6 +77,9 @@ pub fn phrases() -> Vec<(&'static str, &'static str)> {
         (ev::QUALITY_FULL, "full quality"),
         (ev::SAVER, "battery saver"),
         (ev::SAVER, "save battery"),
+        (ev::BETTER_TRANSCRIPT, "better transcript"),
+        (ev::MULTILINGUAL, "multilingual"),
+        (ev::HELP, "what can I type"),
         (ev::SUBTITLES, "captions"),
         (ev::SETTINGS, "settings"),
         (ev::QUIT, "quit"),
@@ -162,6 +168,9 @@ pub fn route(event_type: &str, slots: &[String]) -> Command {
         ev::LISTEN => Command::Do(Action::ToggleListenOnly),
         ev::QUALITY_FULL => Command::Do(Action::SetSwBudget(1.0)),
         ev::SAVER => Command::Do(Action::SetSwBudget(0.25)),
+        ev::BETTER_TRANSCRIPT => Command::Do(Action::TranscribeModel(1)),
+        ev::MULTILINGUAL => Command::Do(Action::TranscribeLanguage(2)),
+        ev::HELP => Command::Do(Action::PaletteHelp),
         ev::SETTINGS => Command::Do(Action::OpenSettings),
         ev::QUIT => Command::Do(Action::Quit),
         ev::OPEN_CLIP => Command::Do(Action::PlayClipboard),
@@ -234,6 +243,9 @@ mod tests {
             ("audio only", Action::ToggleListenOnly),
             ("battery saver", Action::SetSwBudget(0.25)),
             ("full quality", Action::SetSwBudget(1.0)),
+            ("better transcript", Action::TranscribeModel(1)),
+            ("multilingual", Action::TranscribeLanguage(2)),
+            ("what can I type", Action::PaletteHelp),
             ("settings", Action::OpenSettings),
             ("reset the view", Action::ResetView),
         ] {

@@ -31,7 +31,9 @@
 //! `Decoder`, and this app decodes in an ffmpeg process that emits finished
 //! frames. Its clocks and sync policy are exactly what is needed, and are.
 
-use crate::decode::{AudioSink, AudioStream, FfmpegFrames, PlanePool};
+use crate::decode::{AudioSink, AudioStream, PlanePool, VideoSource};
+#[cfg(test)]
+use crate::decode::FfmpegFrames;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -316,7 +318,7 @@ impl Master {
 /// A closure so a file and a network stream take the same path, and so a
 /// seek or a speed change can reopen both.
 /// Called with the media position and the playback speed.
-pub type Opener = Box<dyn Fn(Duration, f64) -> Result<(FfmpegFrames, Option<AudioStream>), String> + Send>;
+pub type Opener = Box<dyn Fn(Duration, f64) -> Result<(Box<dyn VideoSource>, Option<AudioStream>), String> + Send>;
 /// Makes a fresh audio sink. Fresh per (re)start: dropping the old one kills
 /// the player process, so audio buffered before a seek is not heard after it.
 pub type SinkMaker = Box<dyn Fn() -> Box<dyn AudioSink> + Send>;
@@ -367,6 +369,9 @@ pub struct Engine {
     audio_error: Arc<Mutex<Option<String>>>,
     paused: bool,
     frame_interval: Duration,
+    /// How long after its commit a frame reaches the screen (learned from
+    /// presentation feedback): frames are picked for then.
+    display_latency: Duration,
     /// Frames shown and dropped since the last (re)start.
     pub shown: u64,
     pub dropped: u64,
@@ -400,6 +405,7 @@ impl Engine {
             audio_error: Arc::new(Mutex::new(None)),
             paused: false,
             frame_interval: Duration::from_millis(33),
+            display_latency: Duration::ZERO,
             shown: 0,
             dropped: 0,
             audio_note: String::new(),
@@ -427,12 +433,12 @@ impl Engine {
         self.dropped = 0;
 
         let (mut video, audio) = (self.opener)(from, self.speed)?;
-        self.frame_interval = video.frame_interval;
-        self.hdr_peak = video.hdr_peak;
+        self.frame_interval = video.frame_interval();
+        self.hdr_peak = video.hdr_peak();
         if self.video_enabled {
         video.set_pool(self.pool.clone());
         if let Ok(mut d) = self.decoder.lock() {
-            *d = format!("{} {}x{}", video.accel.label(), video.width, video.height);
+            *d = video.label();
         }
         let fb = video.frame_bytes();
         self.depth = queue_depth(fb);
@@ -443,9 +449,9 @@ impl Engine {
             let mut video = video;
             while !stop.load(Ordering::Relaxed) {
                 let Some(f) = video.next_frame() else { break };
-                if let Some(note) = video.note.take() {
+                if let Some(note) = video.take_note() {
                     if let Ok(mut d) = decoder.lock() {
-                        *d = format!("{} {}x{} ({note})", video.accel.label(), video.width, video.height);
+                        *d = format!("{} ({note})", video.label());
                     }
                 }
                 if tx.send(f).is_err() {
@@ -628,7 +634,9 @@ impl Engine {
             return Tick::Wait(Duration::from_millis(250));
         }
         let pool = self.pool.clone();
-        let at = self.master.now() + lead;
+        // Seen at: now + the wake's lead + the compositor's pipeline. The
+        // audio clock is what is HEARD, so the picture must be what is SEEN.
+        let at = self.master.now() + lead + self.display_latency;
         match pick(&mut self.queue, at, &self.policy, &mut |f| pool.recycle(f)) {
             Pick::Show { frame, dropped } => {
                 self.dropped += dropped as u64;
@@ -637,7 +645,7 @@ impl Engine {
                 // the current instant for its deadline. Only the pick uses
                 // the presentation time.
                 let next = self.queue.front()
-                    .map(|n| n.pts.saturating_sub(self.master.now()))
+                    .map(|n| n.pts.saturating_sub(self.master.now() + self.display_latency))
                     .unwrap_or(self.frame_interval);
                 Tick::Show { frame, next: next.max(Duration::from_millis(1)) }
             }
@@ -691,6 +699,18 @@ impl Engine {
         self.hdr_peak
     }
 
+    /// The next queued frame, without taking it (AI in-between frames
+    /// need it before it is due). Call after a tick, which fills the queue.
+    pub fn peek_front(&self) -> Option<&Frame> {
+        self.queue.front()
+    }
+
+    /// The media time a frame drawn now is SEEN at: what tick_ahead picks
+    /// for, with the same lead cap.
+    pub fn seen_at(&self, lead: Duration) -> Duration {
+        self.master.now() + lead.min(self.max_lead()) + self.display_latency
+    }
+
     /// Hand a presented frame's planes back for reuse.
     pub fn recycle(&self, frame: Frame) {
         self.pool.recycle(frame);
@@ -725,6 +745,17 @@ impl Engine {
     /// effect from the next (re)start of the decoder thread.
     pub fn set_waker(&mut self, w: Waker) {
         self.waker = Some(w);
+    }
+
+    /// Pick frames for `d` after their commit: the display pipeline's
+    /// latency, measured by the app from presentation feedback.
+    pub fn set_display_latency(&mut self, d: Duration) {
+        self.display_latency = d.min(Duration::from_millis(150));
+    }
+
+    /// The video's nominal frame interval (33 ms until the decoder says).
+    pub fn frame_interval(&self) -> Duration {
+        self.frame_interval
     }
 
     /// The display's refresh rate: the sync slack is half its interval. It
@@ -784,7 +815,7 @@ mod tests {
         Frame {
             data: FrameData::Cpu(CpuPlanes { data: vec![vec![0; 4], vec![0; 2]], strides: vec![2, 2] }),
             width: 2, height: 2, layout: PlaneLayout::Nv12, color: ColorInfo::default(),
-            pts: Duration::from_millis(ms), duration: Some(Duration::from_millis(33)), recycle: None,
+            pts: Duration::from_millis(ms), duration: Some(Duration::from_millis(33)), recycle: None, grain: None,
         }
     }
     fn q(pts: &[u64]) -> VecDeque<Frame> { pts.iter().map(|&p| f(p)).collect() }
@@ -846,7 +877,7 @@ mod tests {
 
     fn opener(p: std::path::PathBuf) -> Opener {
         Box::new(move |from, speed| {
-            let v = if from.is_zero() { FfmpegFrames::open(&p, None)? } else { FfmpegFrames::open_at(&p, None, from)? };
+            let v: Box<dyn VideoSource> = Box::new(if from.is_zero() { FfmpegFrames::open(&p, None)? } else { FfmpegFrames::open_at(&p, None, from)? });
             let a = AudioStream::open(&p.to_string_lossy(), 48_000, 2, from, speed).ok();
             Ok((v, a))
         })

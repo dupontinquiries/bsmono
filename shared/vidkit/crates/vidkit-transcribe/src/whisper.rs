@@ -39,10 +39,22 @@ pub struct WhisperSource {
     state: WhisperState,
     model: PathBuf,
     threads: i32,
+    /// The language whisper is told. `None` = detect, which runs an extra
+    /// encoder pass; so it is detected ONCE, on the first chunk, and pinned.
     language: Option<String>,
-    multilingual: bool,
+    /// Keep the language detected on the first chunk. False for videos that
+    /// switch language: detect on every chunk, at an encoder pass each.
+    pin_detected: bool,
 }
 
+/// An English-only model (`ggml-base.en.bin`) needs no detection at all.
+pub fn language_for_model(model: &Path, requested: Option<String>) -> Option<String> {
+    requested.or_else(|| {
+        let name = model.file_name()?.to_string_lossy().to_ascii_lowercase();
+        // `ggml-base.en.bin`, and the quantized `ggml-tiny.en-q5_1.bin`.
+        (name.contains(".en.") || name.contains(".en-")).then(|| "en".to_string())
+    })
+}
 
 impl WhisperSource {
     /// Load `model`. `threads`: whisper scales well to the big cores and
@@ -51,8 +63,15 @@ impl WhisperSource {
         let ctx = WhisperContext::new_with_params(model, WhisperContextParameters::default())
             .map_err(|e| format!("{}: {e:?}", model.display()))?;
         let state = ctx.create_state().map_err(|e| format!("whisper state: {e:?}"))?;
-        let multilingual = ctx.is_multilingual();
-        Ok(Self { _ctx: ctx, state, model: model.to_path_buf(), threads: threads.max(1), language, multilingual })
+        let language = language_for_model(model, language);
+        Ok(Self { _ctx: ctx, state, model: model.to_path_buf(), threads: threads.max(1), language, pin_detected: true })
+    }
+
+    /// Detect the language on every chunk instead of pinning the first.
+    pub fn detect_every_chunk(mut self) -> Self {
+        self.pin_detected = false;
+        self.language = None;
+        self
     }
 
     /// Find a model in the shared store (`~/models/whisper`, or the legacy
@@ -85,8 +104,14 @@ impl CueSource for WhisperSource {
         // voice-kit's filter exists for, fed by the previous chunk.
         p.set_no_context(true);
         p.set_suppress_blank(true);
-        p.set_language(Some(crate::effective_language(self.language.as_deref(), self.multilingual)));
+        // "auto" runs language detection -- an extra encoder pass -- on
+        // EVERY chunk. Detected once below and pinned after that.
+        p.set_language(self.language.as_deref().or(Some("auto")));
         self.state.full(p, pcm).map_err(|e| format!("whisper: {e:?}"))?;
+        if self.language.is_none() && self.pin_detected {
+            let id = self.state.full_lang_id_from_state();
+            self.language = whisper_rs::get_lang_str(id).map(str::to_string);
+        }
         let n = self.state.full_n_segments();
         let mut out = Vec::new();
         for i in 0..n {
@@ -126,4 +151,15 @@ mod tests {
     fn inverted_or_negative_stamps_are_clamped() {
         let c = segment_cue(Duration::from_secs(1), -5, -10, "x y z", 0.0).unwrap();
         assert_eq!((c.start, c.end), (Duration::from_secs(1), Duration::from_secs(1)));
-    }}
+    }
+
+    #[test]
+    fn english_only_models_skip_language_detection() {
+        assert_eq!(language_for_model(Path::new("/m/ggml-base.en.bin"), None).as_deref(), Some("en"));
+        assert_eq!(language_for_model(Path::new("/m/ggml-tiny.en-q5_1.bin"), None).as_deref(), Some("en"), "quantized English models too");
+        assert_eq!(language_for_model(Path::new("/m/ggml-small.en-q8_0.bin"), None).as_deref(), Some("en"));
+        assert_eq!(language_for_model(Path::new("/m/ggml-medium-q5_0.bin"), None), None);
+        assert_eq!(language_for_model(Path::new("/m/ggml-base.bin"), None), None, "multilingual: detect once");
+        assert_eq!(language_for_model(Path::new("/m/ggml-base.en.bin"), Some("de".into())).as_deref(), Some("de"), "asked wins");
+    }
+}

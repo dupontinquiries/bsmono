@@ -298,6 +298,7 @@ impl<A: V4l2Api> StatefulDecoder<A> {
                 pts: buf.pts,
                 duration: None,
                 recycle: Some(pack_token(self.generation, index)),
+                grain: None,
             })
         } else {
             // Errored or empty: straight back into the pool.

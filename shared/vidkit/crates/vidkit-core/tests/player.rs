@@ -177,6 +177,7 @@ impl Decoder for DecoderHandle {
             pts,
             duration: Some(ms(33)),
             recycle: Some(RecycleToken(token)),
+            grain: None,
         }))
     }
     fn recycle(&mut self, token: RecycleToken) -> Result<()> {

@@ -87,6 +87,22 @@ pub struct DmaBufImage {
     /// DRM fourcc (`DRM_FORMAT_NV12` etc). Kept raw so the Vulkan layer owns
     /// the fourcc -> VkFormat mapping.
     pub fourcc: u32,
+    /// The producer's reference to the buffer, released when the image is
+    /// dropped. A dup'd fd keeps the MEMORY alive but not the producer from
+    /// reusing it: a VA surface returned to libavcodec's pool is decoded
+    /// into again while we still show it. Refcounted producers (libavcodec)
+    /// hand their frame reference over here; pool-and-token producers
+    /// (V4L2) use `Frame::recycle` instead and leave this `None`.
+    pub owner: Option<BufferOwner>,
+}
+
+/// An opaque producer reference; dropping it releases the buffer.
+pub struct BufferOwner(pub Box<dyn Send + Sync>);
+
+impl std::fmt::Debug for BufferOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BufferOwner(..)")
+    }
 }
 
 #[derive(Debug)]
@@ -121,6 +137,10 @@ pub struct Frame {
     /// token. `None` means the frame owns its memory outright (software decode
     /// into a fresh allocation) and nothing needs returning.
     pub recycle: Option<RecycleToken>,
+    /// AV1 film grain the decoder did NOT apply, for the presenter to
+    /// synthesise (on the GPU) at source resolution. `None`: the picture is
+    /// final -- no grain, or the decoder already applied it.
+    pub grain: Option<std::sync::Arc<crate::av1_grain::GrainParams>>,
 }
 
 /// Index into a decoder's buffer pool. Deliberately not `Copy`: it should be

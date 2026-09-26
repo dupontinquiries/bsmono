@@ -40,6 +40,12 @@ pub enum Action {
     /// Software presenter conversion budget, 0..1 of a frame
     /// (vidkit_core::damage); NaN = follow the power policy.
     SetSwBudget(f32),
+    /// Whisper model tier: 0 quick (tiny), 1 better (base), 2 best (small).
+    TranscribeModel(u8),
+    /// 0 English, 1 detect once, 2 detect every chunk (multilingual).
+    TranscribeLanguage(u8),
+    /// Show what can be typed into the palette, with examples.
+    PaletteHelp,
     OpenSettings,
     Quit,
 }
@@ -67,6 +73,9 @@ pub fn commands() -> Vec<Command> {
         Command { name: "subtitles", aliases: &["captions", "cc", "transcribe"], hint: "transcribe as it plays", action: Action::ToggleSubtitles },
         Command { name: "software quality: full", aliases: &["budget", "damage", "lossless"], hint: "convert every changed tile at full detail", action: Action::SetSwBudget(1.0) },
         Command { name: "software quality: battery saver", aliases: &["budget", "damage", "save", "energy"], hint: "a quarter of a frame's conversions; motion goes soft", action: Action::SetSwBudget(0.25) },
+        Command { name: "better transcript", aliases: &["whisper", "model", "base", "accuracy"], hint: "transcribe again with the base model", action: Action::TranscribeModel(1) },
+        Command { name: "multilingual transcript", aliases: &["language", "detect", "languages"], hint: "detect the language on every chunk", action: Action::TranscribeLanguage(2) },
+        Command { name: "what can i type", aliases: &["help", "examples", "?"], hint: "watch, find, budget, ? -- with examples", action: Action::PaletteHelp },
         Command { name: "listen only", aliases: &["audio only", "sound only", "video off", "battery", "podcast"], hint: "stop decoding video; the sound carries on", action: Action::ToggleListenOnly },
         Command { name: "rotate", aliases: &["turn", "orientation"], hint: "90 degrees, or swipe the right edge", action: Action::Rotate },
         Command { name: "cycle fit", aliases: &["zoom", "fill", "letterbox", "bleed"], hint: "fit, fill, stretch", action: Action::CycleFit },
@@ -110,7 +119,10 @@ pub fn available(commands: Vec<Command>, has_video: bool, clipboard: &ClipboardS
             | Action::ScrubToSections
             | Action::ToggleSubtitles
             | Action::ToggleListenOnly
-            | Action::SetSwBudget(_) => has_video,
+            | Action::SetSwBudget(_)
+            | Action::TranscribeModel(_)
+            | Action::TranscribeLanguage(_) => has_video,
+            Action::PaletteHelp => true,
             Action::PlayClipboard => clipboard.playable,
             Action::BrowseClipboard => clipboard.browsable,
             _ => true,
@@ -212,6 +224,9 @@ pub fn icon_for(action: &Action) -> &'static str {
         Action::ToggleSubtitles => "💬",
         Action::ToggleListenOnly => "🎧",
         Action::SetSwBudget(_) => "▦",
+        Action::TranscribeModel(_) => "✎",
+        Action::TranscribeLanguage(_) => "🌐",
+        Action::PaletteHelp => "❔",
         Action::OpenSettings => "⚙",
         Action::Quit => "✕",
     }

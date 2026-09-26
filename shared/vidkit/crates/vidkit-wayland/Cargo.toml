@@ -1,0 +1,20 @@
+[package]
+name = "vidkit-wayland"
+version = "0.1.0"
+edition = "2021"
+description = "Presentation feedback, content-type and commit timing on a Wayland surface someone else owns (eframe/winit's), plus the pure cadence model that reads the feedback."
+license = "MPL-2.0"
+
+[dependencies]
+# Versions pinned to what winit 0.30 already locks, so the player links ONE
+# libwayland-client binding. client_system: a connection over the C
+# wl_display that winit/EGL own (from_foreign_display).
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+libc = "0.2"
+vidkit-core = { path = "../vidkit-core" }
+
+[dev-dependencies]
+# Decode weston-screenshooter's PNG in the plane test.
+png = "0.18"

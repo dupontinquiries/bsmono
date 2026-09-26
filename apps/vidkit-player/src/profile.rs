@@ -67,11 +67,19 @@ fn thread_ticks() -> BTreeMap<&'static str, u64> {
     m
 }
 
+fn page_size() -> u64 {
+    // SAFETY: sysconf with a constant.
+    let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if p > 0 { p as u64 } else { 4096 }
+}
+
 fn rss_mb() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
         .ok()
         .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .map(|pages| pages * 4096 / (1 << 20))
+        // The real page size: Asahi kernels use 16 KiB pages, and a fixed
+        // 4096 read a quarter of the true RSS there.
+        .map(|pages| pages * page_size() / (1 << 20))
         .unwrap_or(0)
 }
 
@@ -90,6 +98,9 @@ pub struct Sample {
     pub enhance: String,
     pub power: String,
     pub presenter: String,
+    /// What presentation feedback says about the display (vidkit-wayland's
+    /// PresentLog summary); "-" without it.
+    pub display: String,
 }
 
 pub struct Profiler {
@@ -109,7 +120,7 @@ impl Profiler {
         let mut header = vec!["t_s", "repaints", "shown", "dropped", "upload_kb", "damaged_pct", "conv_kpx", "lod_max"];
         let cpu_cols: Vec<String> = GROUPS.iter().map(|g| format!("cpu_{g}")).collect();
         header.extend(cpu_cols.iter().map(String::as_str));
-        header.extend(["rss_mb", "presenter", "decoder", "enhance", "power"]);
+        header.extend(["rss_mb", "presenter", "decoder", "enhance", "power", "display"]);
         let _ = writeln!(out, "{}", header.join("\t"));
         // SAFETY: sysconf with a constant.
         let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
@@ -143,13 +154,13 @@ impl Profiler {
             a.lod_max_seen.to_string(),
         ];
         cols.extend(GROUPS.iter().map(|g| format!("{:.1}", cpu(g))));
-        cols.extend([rss_mb().to_string(), a.presenter.clone(), a.decoder.clone(), a.enhance.clone(), a.power.clone()]);
+        cols.extend([rss_mb().to_string(), a.presenter.clone(), a.decoder.clone(), a.enhance.clone(), a.power.clone(), if a.display.is_empty() { "-".into() } else { a.display.clone() }]);
         let _ = writeln!(self.out, "{}", cols.join("\t"));
         self.last = Instant::now();
         self.last_ticks = ticks;
         self.last_totals = (shown_total, dropped_total, uploaded_total);
-        let keep = (a.decoder.clone(), a.enhance.clone(), a.power.clone(), a.presenter.clone());
-        self.acc = Sample { decoder: keep.0, enhance: keep.1, power: keep.2, presenter: keep.3, ..Sample::default() };
+        let keep = (a.decoder.clone(), a.enhance.clone(), a.power.clone(), a.presenter.clone(), a.display.clone());
+        self.acc = Sample { decoder: keep.0, enhance: keep.1, power: keep.2, presenter: keep.3, display: keep.4, ..Sample::default() };
     }
 }
 
@@ -179,14 +190,20 @@ mod tests {
     fn this_process_is_measurable() {
         let t = thread_ticks();
         assert!(t.contains_key("children"));
-        let total: u64 = t.values().sum();
+        // THIS thread's ticks: the process total is not monotonic while the
+        // parallel suite runs -- other test threads and their ffmpeg
+        // children exit between the two samples and take their ticks with
+        // them (why this failed now and then under load).
+        let tid = unsafe { libc::gettid() };
+        let mine = || std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok().as_deref().and_then(stat_ticks).map(|s| s.1).unwrap();
+        let total = mine();
         let spin = Instant::now();
         let mut x = 0u64;
         while spin.elapsed().as_millis() < 120 {
             x = x.wrapping_mul(31).wrapping_add(7);
         }
         std::hint::black_box(x);
-        let after: u64 = thread_ticks().values().sum();
+        let after = mine();
         assert!(after > total, "120 ms of spinning did not show up");
     }
 }

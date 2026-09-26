@@ -542,6 +542,312 @@ pub fn fairphone_no_venus() -> DeviceCaps {
 }
 
 /// Desktop AMD RDNA2+ / Intel Arc / recent iGPU: everything in fixed function.
+/// Decode profiles from `vainfo`: (codec, max bit depth) for every profile
+/// with a VLD (decode) entrypoint. Pure.
+///
+/// ```text
+///       VAProfileH264High               :	VAEntrypointVLD
+///       VAProfileHEVCMain10             :	VAEntrypointVLD
+///       VAProfileVP9Profile2            :	VAEntrypointVLD
+///       VAProfileAV1Profile0            :	VAEntrypointVLD
+///       VAProfileH264High               :	VAEntrypointEncSlice   <- encode, ignored
+/// ```
+pub fn parse_vainfo(text: &str) -> Vec<(Codec, u8)> {
+    let mut out: Vec<(Codec, u8)> = Vec::new();
+    for line in text.lines() {
+        let Some((prof, entry)) = line.split_once(':') else { continue };
+        if entry.trim() != "VAEntrypointVLD" {
+            continue;
+        }
+        let prof = prof.trim();
+        let found = match prof {
+            p if p.starts_with("VAProfileH264") => Some((Codec::H264, 8)),
+            "VAProfileHEVCMain" => Some((Codec::Hevc, 8)),
+            p if p.starts_with("VAProfileHEVCMain10") => Some((Codec::Hevc, 10)),
+            "VAProfileVP9Profile0" => Some((Codec::Vp9, 8)),
+            "VAProfileVP9Profile2" => Some((Codec::Vp9, 10)),
+            "VAProfileVP8Version0_3" => Some((Codec::Vp8, 8)),
+            // AV1 Main (Profile0) is 8- and 10-bit 4:2:0.
+            "VAProfileAV1Profile0" => Some((Codec::Av1, 10)),
+            _ => None,
+        };
+        if let Some((c, d)) = found {
+            match out.iter_mut().find(|(oc, _)| *oc == c) {
+                Some(e) => e.1 = e.1.max(d),
+                None => out.push((c, d)),
+            }
+        }
+    }
+    out
+}
+
+/// Whether the VA driver offers video processing (`VAProfileNone :
+/// VAEntrypointVideoProc`) -- what `scale_vaapi` needs. Pure.
+///
+/// Intel and AMD drivers list it; Asahi's VA-API-over-V4L2-stateless layer
+/// (libva-v4l2_request, sofus13's AVD fork) does not: its published vainfo
+/// has decode profiles only. Scaling on the VA side there fails outright.
+pub fn vainfo_has_video_proc(text: &str) -> bool {
+    text.lines().any(|l| {
+        let mut p = l.split(':').map(str::trim);
+        matches!((p.next(), p.next()), (Some("VAProfileNone"), Some("VAEntrypointVideoProc")))
+    })
+}
+
+/// What an ffmpeg-based player can actually USE of a device's decoders.
+/// Pure.
+///
+/// Stock ffmpeg cannot drive a V4L2 STATELESS decoder (Asahi's AVD; the
+/// Request API) without out-of-tree patches -- Asahi's own August 2026
+/// report says so. Such a decoder is usable here only through a VA-API
+/// translation layer (libva-v4l2_request), i.e. when `vainfo` lists the
+/// codec: then it becomes a VAAPI path. Otherwise it is software, costed as
+/// software, so the selector's cost-first order stops choosing streams as
+/// if they were hardware-decoded. Stateful V4L2 (Qualcomm Venus/Iris) is
+/// untouched: ffmpeg's *_v4l2m2m decoders drive it.
+pub fn usable_by_ffmpeg(mut caps: DeviceCaps, vaapi: Option<&[(Codec, u8)]>) -> DeviceCaps {
+    for cap in caps.caps.iter_mut().filter(|c| c.backend == Backend::V4l2Stateless) {
+        match vaapi.and_then(|v| v.iter().find(|(c, _)| *c == cap.codec)) {
+            Some(&(_, depth)) => {
+                cap.backend = Backend::Vaapi;
+                cap.max_bit_depth = cap.max_bit_depth.min(depth);
+            }
+            None => {
+                cap.cost = Cost::SoftwareSimd;
+                cap.delivery = Delivery::CpuPlanes;
+                cap.backend = if cap.codec == Codec::Av1 { Backend::Dav1d } else { Backend::FfmpegSw };
+            }
+        }
+    }
+    // vainfo is authoritative over the static table: a codec the VA layer
+    // lists is hardware here even where the table only knows software.
+    // (asahi_m_series predates AVD's HEVC and VP9 support, which Asahi's
+    // August 2026 report calls "mostly reliable on all machines", and which
+    // the published M2 vainfo lists.)
+    for &(codec, depth) in vaapi.unwrap_or(&[]) {
+        let has_hw = caps.caps.iter().any(|c| c.codec == codec && c.cost == Cost::Fixed);
+        if let (false, Some(tpl)) = (has_hw, caps.caps.iter().find(|c| c.codec == codec).cloned()) {
+            caps.caps.push(DecodeCap { cost: Cost::Fixed, backend: Backend::Vaapi, delivery: Delivery::CpuPlanes, max_bit_depth: depth, ..tpl });
+        }
+    }
+    let how = match vaapi {
+        Some(v) if !v.is_empty() => "stateless decode via VA-API",
+        _ => "no VA-API layer: stateless decode unusable, software",
+    };
+    caps.name = format!("{} [{how}]", caps.name);
+    caps
+}
+
+/// Codecs a Vulkan device decodes, from `vulkaninfo` device extensions
+/// (`VK_KHR_video_decode_h264` ...). Pure.
+///
+/// Vulkan Video decode, as of Sept 2026: Mesa RADV and ANV (H.264, H.265,
+/// AV1, VP9), NVIDIA's driver and NVK; FFmpeg decodes H.264/H.265/AV1 from
+/// 6.1 and VP9 from 8.0. Not on the targets' mobile GPUs: Turnip (Adreno)
+/// and Honeykrisp (Asahi) expose none -- their video blocks are separate
+/// V4L2 devices. Only the first device's list is taken: vulkaninfo prints
+/// one block per GPU and the player decodes on device 0.
+pub fn parse_vulkaninfo_video(text: &str) -> Vec<Codec> {
+    let devs = parse_vulkaninfo_devices(text);
+    pick_vulkan_decoder(&devs, None).map(|d| d.codecs.clone()).unwrap_or_default()
+}
+
+/// One Vulkan device as `vulkaninfo` describes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VkVideoDevice {
+    /// The index ffmpeg's `-init_hw_device vulkan=vk:N` takes.
+    pub index: usize,
+    pub integrated: bool,
+    pub codecs: Vec<Codec>,
+}
+
+/// Every device `vulkaninfo` lists, with its type and decode codecs. Pure.
+/// Blocks start at `GPU id : N (...)` (or `GPUN:`); the type is the
+/// `deviceType = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU` line.
+pub fn parse_vulkaninfo_devices(text: &str) -> Vec<VkVideoDevice> {
+    let mut out: Vec<VkVideoDevice> = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        let new_block = l.starts_with("GPU id") || (l.starts_with("GPU") && l.ends_with(':') && l[3..l.len() - 1].chars().all(|c| c.is_ascii_digit()) && l.len() > 4);
+        if new_block {
+            out.push(VkVideoDevice { index: out.len(), integrated: false, codecs: Vec::new() });
+            continue;
+        }
+        let Some(d) = out.last_mut() else { continue };
+        if l.starts_with("deviceType") && l.contains("INTEGRATED_GPU") {
+            d.integrated = true;
+        }
+        let c = if l.starts_with("VK_KHR_video_decode_h264") {
+            Codec::H264
+        } else if l.starts_with("VK_KHR_video_decode_h265") {
+            Codec::Hevc
+        } else if l.starts_with("VK_KHR_video_decode_av1") {
+            Codec::Av1
+        } else if l.starts_with("VK_KHR_video_decode_vp9") {
+            Codec::Vp9
+        } else {
+            continue;
+        };
+        if !d.codecs.contains(&c) {
+            d.codecs.push(c);
+        }
+    }
+    out
+}
+
+/// The device to decode on: an INTEGRATED GPU that decodes the codec, else
+/// any device that does. On a hybrid laptop decoding on the discrete GPU
+/// keeps a whole second GPU powered for the length of the video. `None`
+/// codec: the first integrated device with any decode, else any. Pure.
+pub fn pick_vulkan_decoder(devs: &[VkVideoDevice], codec: Option<Codec>) -> Option<&VkVideoDevice> {
+    let can = |d: &&VkVideoDevice| match codec {
+        Some(c) => d.codecs.contains(&c),
+        None => !d.codecs.is_empty(),
+    };
+    devs.iter().filter(can).find(|d| d.integrated).or_else(|| devs.iter().find(can))
+}
+
+/// A DRM render node, for choosing where VA-API decodes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderNode {
+    pub path: String,
+    pub driver: String,
+    /// Dedicated VRAM, where the driver reports it (amdgpu).
+    pub vram: Option<u64>,
+}
+
+/// The render node to decode on: an integrated GPU (Intel i915/xe, or
+/// amdgpu with an APU-sized carve-out of 2 GiB or less) before a discrete
+/// one, else the first. Pure.
+pub fn pick_render_node(nodes: &[RenderNode]) -> Option<&RenderNode> {
+    let integrated = |n: &&RenderNode| matches!(n.driver.as_str(), "i915" | "xe") || (n.driver == "amdgpu" && n.vram.is_some_and(|v| v <= 2 << 30));
+    nodes.iter().find(integrated).or_else(|| nodes.first())
+}
+
+/// ffmpeg's native decoder for a codec -- the only kind hwaccel (VAAPI,
+/// Vulkan, VideoToolbox...) works through.
+pub fn native_decoder(c: Codec) -> &'static str {
+    match c {
+        Codec::H264 => "h264",
+        Codec::Hevc => "hevc",
+        Codec::Vp8 => "vp8",
+        Codec::Vp9 => "vp9",
+        Codec::Av1 => "av1",
+    }
+}
+
+/// Any software decoder ffmpeg might have for a codec, native or library.
+fn any_decoder(c: Codec) -> &'static [&'static str] {
+    match c {
+        Codec::H264 => &["h264", "libopenh264"],
+        Codec::Hevc => &["hevc"],
+        Codec::Vp8 => &["vp8", "libvpx"],
+        Codec::Vp9 => &["vp9", "libvpx-vp9"],
+        Codec::Av1 => &["libdav1d", "libaom-av1", "av1"],
+    }
+}
+
+/// Keep only what the installed ffmpeg can actually decode. Pure.
+///
+/// Fedora's default `ffmpeg-free` has VP9 and AV1 but the H.264 and HEVC
+/// code physically removed; H.264 comes only through OpenH264
+/// (`libopenh264`), a software library hwaccel cannot use. So: a codec with
+/// no decoder at all loses every path (the selector must never pick it);
+/// a codec without its NATIVE decoder keeps its software paths and loses
+/// its hardware ones.
+pub fn restrict_to_decoders(mut caps: DeviceCaps, decoders: &[String]) -> DeviceCaps {
+    if decoders.is_empty() {
+        return caps; // no information: leave it alone
+    }
+    let has = |n: &str| decoders.iter().any(|d| d == n);
+    caps.caps.retain(|cap| {
+        let any = any_decoder(cap.codec).iter().any(|n| has(n));
+        let hw = !matches!(cap.backend, Backend::Dav1d | Backend::FfmpegSw);
+        any && (!hw || has(native_decoder(cap.codec)))
+    });
+    // A codec with a software library but no software entry left (its only
+    // entry was a hardware one): give it a software path back.
+    for c in [Codec::H264, Codec::Hevc, Codec::Vp9, Codec::Av1] {
+        let listed = caps.caps.iter().any(|x| x.codec == c);
+        if !listed && any_decoder(c).iter().any(|n| has(n)) {
+            if let Some(tpl) = desktop_full_hw().caps.into_iter().find(|x| x.codec == c) {
+                caps.caps.push(DecodeCap {
+                    cost: if c == Codec::H264 && !has("h264") { Cost::SoftwareSlow } else { Cost::SoftwareSimd },
+                    delivery: Delivery::CpuPlanes,
+                    backend: if c == Codec::Av1 { Backend::Dav1d } else { Backend::FfmpegSw },
+                    max_width: 3840,
+                    max_height: 2160,
+                    max_fps_at_max_size: 30,
+                    ..tpl
+                });
+            }
+        }
+    }
+    caps
+}
+
+/// Desktop caps from what the machine's decode APIs report: a codec listed
+/// by VAAPI or by Vulkan Video is fixed-function (VAAPI named when both, the
+/// more mature path on Intel/AMD); the rest is software. With neither
+/// probe available, the old full-hardware assumption. Pure.
+pub fn desktop_from_probes(vaapi: Option<&[(Codec, u8)]>, vulkan: Option<&[Codec]>) -> DeviceCaps {
+    if vaapi.is_none() && vulkan.is_none() {
+        return desktop_full_hw();
+    }
+    let mut caps = desktop_from_vaapi(vaapi.unwrap_or(&[]));
+    for cap in caps.caps.iter_mut() {
+        if cap.cost != Cost::Fixed && vulkan.is_some_and(|v| v.contains(&cap.codec)) {
+            cap.cost = Cost::Fixed;
+            cap.backend = Backend::VulkanVideo;
+            cap.delivery = Delivery::CpuPlanes;
+            cap.max_width = 7680;
+            cap.max_height = 4320;
+            cap.max_fps_at_max_size = 60;
+            // Vulkan Video profiles carry 10-bit for HEVC/VP9/AV1 on every
+            // driver listed above; H.264 is 8-bit everywhere.
+            cap.max_bit_depth = if cap.codec == Codec::H264 { 8 } else { 10 };
+        }
+    }
+    if let Some(v) = vulkan.filter(|v| !v.is_empty()) {
+        caps.name = format!("{} + Vulkan Video: {}", caps.name, v.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(", "));
+    }
+    caps
+}
+
+/// A desktop/laptop's caps from what its VAAPI driver really decodes.
+///
+/// `desktop_full_hw` ASSUMES fixed-function AV1, VP9, HEVC and H.264. Most
+/// laptops older than Intel's 11th generation (and AMD before RDNA2) have no
+/// AV1 decoder, so the picker chose YouTube's AV1 stream, VAAPI init failed
+/// inside ffmpeg, and ffmpeg fell back to software decode in the same
+/// process -- frames still came, the status still said VAAPI, and the CPU
+/// decoded 1080p AV1. Here: what `vainfo` lists is Fixed; every other codec
+/// is software (dav1d for AV1, libavcodec otherwise) -- still playable, but
+/// the selector's cost-first ordering now prefers the hardware ones.
+pub fn desktop_from_vaapi(profiles: &[(Codec, u8)]) -> DeviceCaps {
+    let mut caps = desktop_full_hw();
+    caps.name = format!(
+        "Desktop (VAAPI: {})",
+        if profiles.is_empty() { "no decode profiles".to_string() } else { profiles.iter().map(|(c, d)| format!("{c:?} {d}-bit")).collect::<Vec<_>>().join(", ") }
+    );
+    for cap in caps.caps.iter_mut() {
+        match profiles.iter().find(|(c, _)| *c == cap.codec) {
+            Some(&(_, depth)) => cap.max_bit_depth = depth,
+            None => {
+                cap.cost = Cost::SoftwareSimd;
+                cap.delivery = Delivery::CpuPlanes;
+                cap.backend = if cap.codec == Codec::Av1 { Backend::Dav1d } else { Backend::FfmpegSw };
+                // Software 1080p60 is realistic on a laptop; 4K is where the
+                // fans start. The picker compares cost first anyway.
+                cap.max_width = 3840;
+                cap.max_height = 2160;
+                cap.max_fps_at_max_size = 30;
+            }
+        }
+    }
+    caps
+}
+
 pub fn desktop_full_hw() -> DeviceCaps {
     let mk = |codec, depth| DecodeCap {
         codec,
@@ -945,5 +1251,179 @@ mod tests {
             level: None,
         };
         assert!(d.best_path(&p, 1920, 1080, 30).is_none());
+    }
+
+    const VAINFO_KABY_LAKE: &str = "vainfo: Driver version: Intel iHD driver
+vainfo: Supported profile and entrypoints
+      VAProfileNone                   :	VAEntrypointVideoProc
+      VAProfileMPEG2Main              :	VAEntrypointVLD
+      VAProfileH264Main               :	VAEntrypointVLD
+      VAProfileH264High               :	VAEntrypointVLD
+      VAProfileH264High               :	VAEntrypointEncSlice
+      VAProfileHEVCMain               :	VAEntrypointVLD
+      VAProfileHEVCMain10             :	VAEntrypointVLD
+      VAProfileVP9Profile0            :	VAEntrypointVLD
+      VAProfileVP9Profile2            :	VAEntrypointVLD
+";
+
+    #[test]
+    fn vainfo_decode_profiles_are_read_and_encode_ignored() {
+        let p = parse_vainfo(VAINFO_KABY_LAKE);
+        assert_eq!(p, vec![(Codec::H264, 8), (Codec::Hevc, 10), (Codec::Vp9, 10)]);
+        let tgl = format!("{VAINFO_KABY_LAKE}      VAProfileAV1Profile0            :	VAEntrypointVLD\n");
+        assert!(parse_vainfo(&tgl).contains(&(Codec::Av1, 10)));
+        assert!(parse_vainfo("libva error: vaGetDriverNameByIndex() failed").is_empty());
+    }
+
+    /// A laptop without AV1 decode: AV1 stays playable but costs software,
+    /// so the selector's cost-first order picks VP9/H.264 over it.
+    #[test]
+    fn a_laptop_without_av1_hardware_prefers_what_it_can_decode() {
+        let caps = desktop_from_vaapi(&parse_vainfo(VAINFO_KABY_LAKE));
+        let cost = |c: Codec| caps.caps.iter().find(|x| x.codec == c).map(|x| x.cost);
+        assert_eq!(cost(Codec::Av1), Some(Cost::SoftwareSimd));
+        assert_eq!(cost(Codec::Vp9), Some(Cost::Fixed));
+        assert_eq!(cost(Codec::H264), Some(Cost::Fixed));
+        assert!(Cost::Fixed < Cost::SoftwareSimd, "the selector's order relies on this");
+        assert!(caps.name.contains("Vp9 10-bit") && !caps.name.contains("Av1"), "{}", caps.name);
+    }
+
+    /// Verbatim from nixos-apple-silicon PR #544 (2026-09-09): an M2 MacBook
+    /// Air (t8112-j413) with the sofus13 libva-v4l2_request layer. Note the
+    /// missing space before the colon on the first profile line, and no
+    /// VideoProc entrypoint at all.
+    const VAINFO_ASAHI_M2: &str = "Trying display: wayland
+libva info: VA-API version 1.24.0
+libva info: User environment variable requested driver 'v4l2_request-sofus13'
+libva info: Trying to open /run/opengl-driver/lib/dri/v4l2_request-sofus13_drv_video.so
+libva info: Found init function __vaDriverInit_1_24
+libva-v4l2request: detected 1 Request API decoder
+libva info: va_openDriver() returns 0
+vainfo: VA-API version: 1.24 (libva 2.24.0)
+vainfo: Driver version: v4l2-request
+vainfo: Supported profile and entrypoints
+      VAProfileH264ConstrainedBaseline: VAEntrypointVLD
+      VAProfileH264Main               : VAEntrypointVLD
+      VAProfileH264High               : VAEntrypointVLD
+      VAProfileHEVCMain               : VAEntrypointVLD
+      VAProfileHEVCMain10             : VAEntrypointVLD
+      VAProfileVP9Profile0            : VAEntrypointVLD
+      VAProfileVP9Profile2            : VAEntrypointVLD
+";
+
+    #[test]
+    fn the_real_asahi_vainfo_parses_and_has_no_video_processing() {
+        let p = parse_vainfo(VAINFO_ASAHI_M2);
+        assert_eq!(p, vec![(Codec::H264, 8), (Codec::Hevc, 10), (Codec::Vp9, 10)]);
+        assert!(!vainfo_has_video_proc(VAINFO_ASAHI_M2), "no scale_vaapi on Asahi");
+        let intel = format!("{VAINFO_KABY_LAKE}      VAProfileNone                   :\tVAEntrypointVideoProc\n");
+        assert!(vainfo_has_video_proc(&intel));
+    }
+
+    /// Asahi without the VA-API layer: every stateless codec is software for
+    /// an ffmpeg player. With it: exactly the listed ones are hardware.
+    #[test]
+    fn stateless_decoders_count_only_through_va_api() {
+        // The cheapest path per codec -- what the selector uses; caps list a
+        // hardware path and a software fallback side by side.
+        let cost = |c: &DeviceCaps, k: Codec| c.caps.iter().filter(|x| x.codec == k).min_by_key(|x| x.cost).map(|x| (x.cost, x.backend));
+        let bare = usable_by_ffmpeg(asahi_m_series(), None);
+        assert_eq!(cost(&bare, Codec::H264), Some((Cost::SoftwareSimd, Backend::FfmpegSw)));
+        assert!(bare.name.contains("no VA-API layer"));
+        let with = usable_by_ffmpeg(asahi_m_series(), Some(&parse_vainfo(VAINFO_ASAHI_M2)));
+        assert_eq!(cost(&with, Codec::H264), Some((Cost::Fixed, Backend::Vaapi)));
+        assert_eq!(cost(&with, Codec::Vp9), Some((Cost::Fixed, Backend::Vaapi)));
+        // Stateful (the FP5's Venus/Iris) is left alone: v4l2m2m drives it.
+        let fp5 = usable_by_ffmpeg(fairphone_venus(), None);
+        assert_eq!(cost(&fp5, Codec::Vp9), Some((Cost::Fixed, Backend::V4l2Stateful)));
+    }
+
+    /// CONSTRUCTED, not captured: the shape of `vulkaninfo`'s device
+    /// extension list (names are the Khronos ones) for an NVIDIA GPU with
+    /// no VA-API driver. Replace with a real capture when one is to hand.
+    const VULKANINFO_SHAPE: &str = "GPU id : 0 (NVIDIA GeForce RTX 4070):
+Device Extensions: count = 220
+	VK_KHR_video_decode_av1                     : extension revision 1
+	VK_KHR_video_decode_h264                    : extension revision 9
+	VK_KHR_video_decode_h265                    : extension revision 8
+	VK_KHR_video_decode_queue                   : extension revision 8
+	VK_KHR_video_decode_vp9                     : extension revision 1
+	VK_KHR_video_encode_h264                    : extension revision 14
+GPU id : 1 (llvmpipe (LLVM 19.1.7, 256 bits)):
+Device Extensions: count = 150
+	VK_KHR_swapchain                            : extension revision 70
+";
+
+    #[test]
+    fn vulkan_video_decoders_are_read_from_device_zero_only() {
+        let v = parse_vulkaninfo_video(VULKANINFO_SHAPE);
+        assert_eq!(v, vec![Codec::Av1, Codec::H264, Codec::Hevc, Codec::Vp9]);
+        assert!(parse_vulkaninfo_video("GPU id : 0 (llvmpipe):\n\tVK_KHR_swapchain : 70\n").is_empty());
+    }
+
+    /// The gaming PC: NVIDIA, no VA-API. Vulkan Video makes its codecs
+    /// fixed-function; without any probe, the old assumption stands.
+    #[test]
+    fn an_nvidia_machine_gets_hardware_through_vulkan_video() {
+        let caps = desktop_from_probes(None, Some(&parse_vulkaninfo_video(VULKANINFO_SHAPE)));
+        let best = |k: Codec| caps.caps.iter().filter(|x| x.codec == k).min_by_key(|x| x.cost).map(|x| (x.cost, x.backend));
+        assert_eq!(best(Codec::Av1), Some((Cost::Fixed, Backend::VulkanVideo)));
+        assert_eq!(best(Codec::Vp9), Some((Cost::Fixed, Backend::VulkanVideo)));
+        // A laptop whose VA driver lacks AV1 but whose Vulkan driver has it:
+        // VAAPI for what VA lists, Vulkan fills the gap.
+        let mix = desktop_from_probes(Some(&parse_vainfo(VAINFO_KABY_LAKE)), Some(&[Codec::Av1]));
+        let b = |k: Codec| mix.caps.iter().filter(|x| x.codec == k).min_by_key(|x| x.cost).map(|x| x.backend);
+        assert_eq!(b(Codec::Vp9), Some(Backend::Vaapi));
+        assert_eq!(b(Codec::Av1), Some(Backend::VulkanVideo));
+        assert_eq!(desktop_from_probes(None, None).name, desktop_full_hw().name);
+    }
+
+    /// A hybrid laptop: NVIDIA first (device 0), Intel second. Decode goes
+    /// to the Intel iGPU when it has the codec; to NVIDIA for what only it
+    /// has. CONSTRUCTED from vulkaninfo's field names, like the fixture
+    /// above.
+    #[test]
+    fn hybrid_laptops_decode_on_the_integrated_gpu() {
+        let text = "GPU id : 0 (NVIDIA GeForce RTX 4060 Laptop GPU):
+	deviceType        = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+	VK_KHR_video_decode_av1 : extension revision 1
+	VK_KHR_video_decode_h264 : extension revision 9
+GPU id : 1 (Intel(R) Graphics (ADL GT2)):
+	deviceType        = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+	VK_KHR_video_decode_h264 : extension revision 9
+	VK_KHR_video_decode_h265 : extension revision 8
+";
+        let devs = parse_vulkaninfo_devices(text);
+        assert_eq!(devs.len(), 2);
+        assert!(!devs[0].integrated && devs[1].integrated);
+        assert_eq!(pick_vulkan_decoder(&devs, Some(Codec::H264)).unwrap().index, 1, "the iGPU, not device 0");
+        assert_eq!(pick_vulkan_decoder(&devs, Some(Codec::Av1)).unwrap().index, 0, "only the dGPU has AV1");
+        assert_eq!(pick_vulkan_decoder(&devs, Some(Codec::Vp9)), None);
+        let nodes = [
+            RenderNode { path: "/dev/dri/renderD128".into(), driver: "nvidia".into(), vram: None },
+            RenderNode { path: "/dev/dri/renderD129".into(), driver: "i915".into(), vram: None },
+        ];
+        assert_eq!(pick_render_node(&nodes).unwrap().path, "/dev/dri/renderD129");
+        let amd = [
+            RenderNode { path: "/dev/dri/renderD128".into(), driver: "amdgpu".into(), vram: Some(8 << 30) },
+            RenderNode { path: "/dev/dri/renderD129".into(), driver: "amdgpu".into(), vram: Some(512 << 20) },
+        ];
+        assert_eq!(pick_render_node(&amd).unwrap().path, "/dev/dri/renderD129", "the APU");
+    }
+
+    /// Fedora's ffmpeg-free on an Asahi Mac with the AVD VA layer: VP9 stays
+    /// hardware, AV1 is dav1d, H.264 exists only as OpenH264 in software,
+    /// HEVC not at all -- even though vainfo lists both.
+    #[test]
+    fn fedora_ffmpeg_free_cannot_decode_what_it_lacks() {
+        let decoders: Vec<String> = ["vp9", "libvpx-vp9", "av1", "libdav1d", "libopenh264", "vp8"].iter().map(|s| s.to_string()).collect();
+        let caps = restrict_to_decoders(usable_by_ffmpeg(asahi_m_series(), Some(&parse_vainfo(VAINFO_ASAHI_M2))), &decoders);
+        let best = |k: Codec| caps.caps.iter().filter(|x| x.codec == k).min_by_key(|x| x.cost).map(|x| (x.cost, x.backend));
+        assert_eq!(best(Codec::Vp9), Some((Cost::Fixed, Backend::Vaapi)), "YouTube VP9 on AVD");
+        assert_eq!(best(Codec::Av1).map(|b| b.1), Some(Backend::Dav1d), "M2: no AV1 block");
+        assert_eq!(best(Codec::H264).map(|b| b.1), Some(Backend::FfmpegSw), "OpenH264 only, no hwaccel");
+        assert_eq!(best(Codec::Hevc), None, "no HEVC decoder at all: never selected");
+        // No information: unchanged.
+        assert_eq!(restrict_to_decoders(desktop_full_hw(), &[]).caps.len(), desktop_full_hw().caps.len());
     }
 }

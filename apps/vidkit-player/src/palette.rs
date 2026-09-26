@@ -36,6 +36,13 @@ pub enum Command {
     SwSaver,
     SwMinimum,
     SwFollowPower,
+    TranscribeQuick,
+    TranscribeBetter,
+    TranscribeBest,
+    LangEnglish,
+    LangDetectOnce,
+    LangEveryChunk,
+    Help,
     ScrubToSections,
     PlayClipboard,
     Quit,
@@ -64,10 +71,48 @@ impl Command {
         Command::SwSaver,
         Command::SwMinimum,
         Command::SwFollowPower,
+        Command::TranscribeQuick,
+        Command::TranscribeBetter,
+        Command::TranscribeBest,
+        Command::LangEnglish,
+        Command::LangDetectOnce,
+        Command::LangEveryChunk,
+        Command::Help,
         Command::ScrubToSections,
         Command::PlayClipboard,
         Command::Quit,
     ];
+
+    /// What the command does, in words, for the right-hand column. A
+    /// newcomer reads this, not the label, to decide.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Command::OpenFile => "pick a video file",
+            Command::PlayPause => "play or pause",
+            Command::Rotate => "turn the picture a quarter",
+            Command::CycleFit => "fit, fill, or stretch",
+            Command::ResetView => "undo zoom and pan",
+            Command::SpeedUp => "play faster",
+            Command::SpeedDown => "play slower",
+            Command::VolumeUp => "louder",
+            Command::VolumeDown => "quieter",
+            Command::Settings => "all the options",
+            Command::Subtitles => "show what is being said",
+            Command::ListenOnly => "sound only; saves battery",
+            Command::SwFull | Command::SwBalanced | Command::SwSaver | Command::SwMinimum => "software rendering: detail vs battery",
+            Command::SwFollowPower => "let the battery decide",
+            Command::TranscribeQuick => "fast; whole video; the default",
+            Command::TranscribeBetter => "slower; catches more words",
+            Command::TranscribeBest => "slowest; for when base misses",
+            Command::LangEnglish => "English videos: fastest",
+            Command::LangDetectOnce => "one other language",
+            Command::LangEveryChunk => "videos that switch language",
+            Command::Help => "watch, find, budget, ? -- examples",
+            Command::ScrubToSections => "chapters and search",
+            Command::PlayClipboard => "play the link you copied",
+            Command::Quit => "close the player",
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -88,6 +133,13 @@ impl Command {
             Command::SwSaver => "Software quality: battery saver (¼)",
             Command::SwMinimum => "Software quality: minimum (1/16)",
             Command::SwFollowPower => "Software quality: follow power",
+            Command::TranscribeQuick => "Transcription model: quick (tiny)",
+            Command::TranscribeBetter => "Transcription model: better (base)",
+            Command::TranscribeBest => "Transcription model: best (small)",
+            Command::LangEnglish => "Transcription language: English",
+            Command::LangDetectOnce => "Transcription language: detect once",
+            Command::LangEveryChunk => "Transcription language: every chunk (multilingual)",
+            Command::Help => "What can I type here?",
             Command::ScrubToSections => "Scrub to sections…",
             Command::PlayClipboard => "Play from clipboard",
             Command::Quit => "Quit",
@@ -128,6 +180,9 @@ impl Command {
             Command::SwFull | Command::SwBalanced | Command::SwSaver | Command::SwMinimum | Command::SwFollowPower => {
                 "budget damage energy battery quality lod blur cpu software"
             }
+            Command::TranscribeQuick | Command::TranscribeBetter | Command::TranscribeBest => "whisper model transcript transcription accuracy tiny base small better",
+            Command::LangEnglish | Command::LangDetectOnce | Command::LangEveryChunk => "language languages multilingual whisper english detect transcript",
+            Command::Help => "help examples how type syntax commands ?",
             Command::PlayClipboard => "paste url link youtube open video",
             Command::Quit => "exit close",
         }
@@ -139,6 +194,42 @@ impl Command {
 /// Scores the label and the aliases and keeps the better of the two, so
 /// "louder" finds Volume +5% without "louder" appearing on the row. An empty
 /// query returns everything in declaration order.
+/// What a typed query asks for, beyond picking a command. Pure.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Typed {
+    /// `watch goes down`: play only the moments that mention it.
+    Watch(String),
+    /// `find goes down`: jump to a moment that mentions it.
+    Find(String),
+    /// `budget 30%`.
+    Budget(f32),
+}
+
+pub fn parse_typed(query: &str) -> Option<Typed> {
+    let q = query.trim_start();
+    let lower = q.to_ascii_lowercase();
+    for (k, mk) in [("watch ", Typed::Watch as fn(String) -> Typed), ("find ", Typed::Find), ("search ", Typed::Find)] {
+        if lower.starts_with(k) {
+            let rest = q[k.len()..].trim();
+            // Quotes are fine and not needed: watch "goes down" == watch goes down.
+            let rest = rest.trim_matches(|c| c == '"' || c == '\u{201c}' || c == '\u{201d}').trim();
+            return (!rest.is_empty()).then(|| mk(rest.to_string()));
+        }
+    }
+    parse_budget(q).map(Typed::Budget)
+}
+
+/// Worked examples for "What can I type?": (what to type, what it does).
+/// Choosing one puts it in the box to edit rather than running it.
+pub const EXAMPLES: [(&str, &str); 6] = [
+    ("watch goes down", "play only the moments that say it, back to back"),
+    ("find goes down", "list the moments that say it; pick one to jump"),
+    ("?goes down", "search every video you have watched"),
+    ("budget 30%", "software rendering: convert 30% of a frame"),
+    ("listen", "any word finds commands: listen, quality, language"),
+    ("rotate", "commands run straight away when picked"),
+];
+
 /// A typed budget: "budget 30", "budget 30%", "budget 0.3", "sw 25%",
 /// "quality 0.5". Percent when > 1 or with %, a fraction otherwise; clamped
 /// to 1..100%. Pure.
@@ -362,6 +453,13 @@ impl Command {
             Command::SwSaver => A::SetSwBudget(0.25),
             Command::SwMinimum => A::SetSwBudget(1.0 / 16.0),
             Command::SwFollowPower => A::SetSwBudget(f32::NAN),
+            Command::TranscribeQuick => A::TranscribeModel(0),
+            Command::TranscribeBetter => A::TranscribeModel(1),
+            Command::TranscribeBest => A::TranscribeModel(2),
+            Command::LangEnglish => A::TranscribeLanguage(0),
+            Command::LangDetectOnce => A::TranscribeLanguage(1),
+            Command::LangEveryChunk => A::TranscribeLanguage(2),
+            Command::Help => A::PaletteHelp,
             Command::ScrubToSections => A::ScrubToSections,
             Command::PlayClipboard => A::PlayClipboard,
             Command::Quit => A::Quit,
@@ -393,7 +491,7 @@ mod action_bridge_tests {
         for a in [
             A::TogglePlay, A::Rotate, A::CycleFit, A::ResetView, A::OpenFile,
             A::SetSpeed(1.0), A::SetVolume(1.0), A::OpenSettings,
-            A::ToggleSubtitles, A::ToggleListenOnly, A::SetSwBudget(1.0), A::ScrubToSections, A::PlayClipboard, A::Quit,
+            A::ToggleSubtitles, A::ToggleListenOnly, A::SetSwBudget(1.0), A::TranscribeModel(0), A::TranscribeLanguage(0), A::PaletteHelp, A::ScrubToSections, A::PlayClipboard, A::Quit,
         ] {
             assert!(has(&a), "{a:?} has no palette row");
         }
@@ -440,6 +538,34 @@ mod budget_tests {
     fn the_tiers_are_found_by_what_people_type() {
         for q in ["battery", "quality", "budget", "saver"] {
             assert!(rank(q).iter().any(|c| matches!(c, Command::SwSaver)), "{q} did not find the saver tier");
+        }
+    }
+}
+
+#[cfg(test)]
+mod typed_tests {
+    use super::*;
+
+    #[test]
+    fn typed_commands_say_what_they_are() {
+        assert_eq!(parse_typed("watch goes down"), Some(Typed::Watch("goes down".into())));
+        assert_eq!(parse_typed("Watch \"goes down\""), Some(Typed::Watch("goes down".into())), "quotes optional");
+        assert_eq!(parse_typed("find laplace"), Some(Typed::Find("laplace".into())));
+        assert_eq!(parse_typed("search laplace"), Some(Typed::Find("laplace".into())));
+        assert_eq!(parse_typed("budget 30%"), Some(Typed::Budget(0.3)));
+        assert_eq!(parse_typed("watch "), None, "nothing to watch for yet");
+        assert_eq!(parse_typed("watchlist"), None, "a word, not the command");
+        assert_eq!(parse_typed("rotate"), None);
+    }
+
+    #[test]
+    fn every_command_explains_itself() {
+        for c in Command::ALL {
+            assert!(!c.hint().is_empty(), "{c:?}");
+            assert!(c.hint().len() <= 40, "keep it glanceable: {c:?} {}", c.hint());
+        }
+        for (typed, _) in EXAMPLES.iter().filter(|(t, _)| t.starts_with("watch") || t.starts_with("find") || t.starts_with("budget")) {
+            assert!(parse_typed(typed).is_some(), "an example that does not parse: {typed}");
         }
     }
 }

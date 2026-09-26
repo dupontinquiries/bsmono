@@ -168,6 +168,7 @@ impl Decoder for StubDecoder {
             pts,
             duration: Some(Duration::from_millis(33)),
             recycle: Some(RecycleToken(token)),
+            grain: None,
         }))
     }
 

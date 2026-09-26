@@ -211,6 +211,7 @@ mod tests {
             pts: Duration::from_millis(ms),
             duration: Some(Duration::from_millis(16)),
             recycle: None,
+            grain: None,
         }
     }
 

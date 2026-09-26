@@ -38,10 +38,15 @@ fn nv12(w: u32, h: u32, y: impl Fn(u32, u32) -> u8) -> Frame {
         pts: std::time::Duration::ZERO,
         duration: None,
         recycle: None,
+        grain: None,
     }
 }
 
 struct Case {
+    /// Run sharpening as the old two-pass (offscreen) path, for comparison.
+    two_pass: bool,
+    /// AV1 film grain to apply on the GPU before conversion.
+    grain: Option<vidkit_core::av1_grain::GrainParams>,
     name: &'static str,
     /// The frame checked against. Multi-frame cases upload `history` first,
     /// one per update, then this.
@@ -51,6 +56,12 @@ struct Case {
     /// Output size in pixels.
     out: (u32, u32),
     check: fn(&Frame, &[[u8; 3]], (u32, u32)) -> Result<String, String>,
+    /// AI half-rate: after `frame`, `show_between` this next frame (and,
+    /// with `promote`, then promote it: the check then gets the next frame).
+    ai_next: Option<Frame>,
+    promote: bool,
+    /// The presenter's cut threshold for this case (None: its default).
+    cut: Option<f32>,
 }
 
 fn luma_of(f: &Frame, x: u32, y: u32) -> u8 {
@@ -247,13 +258,152 @@ fn p010(w: u32, h: u32, transfer: vidkit_core::codec::Transfer) -> Frame {
         pts: std::time::Duration::ZERO,
         duration: None,
         recycle: None,
+        grain: None,
+    }
+}
+
+/// An 8-bit I420 frame (three planes), luma and chroma varied in both axes:
+/// the layout software VP9/AV1 decode now hands the GPU unconverted.
+fn i420(w: u32, h: u32) -> Frame {
+    let luma: Vec<u8> = (0..h).flat_map(|y| (0..w).map(move |x| (16 + (x * 219) / (w - 1) - (y % 3)) as u8)).collect();
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let u: Vec<u8> = (0..ch).flat_map(|_| (0..cw).map(move |x| (128 + x as i32 * 150 / cw as i32 - 75) as u8)).collect();
+    let v: Vec<u8> = (0..ch).flat_map(|y| (0..cw).map(move |_| (128 + y as i32 * 150 / ch as i32 - 75) as u8)).collect();
+    Frame {
+        data: FrameData::Cpu(CpuPlanes { data: vec![luma, u, v], strides: vec![w, cw, cw] }),
+        width: w,
+        height: h,
+        layout: PlaneLayout::I420,
+        color: ColorInfo::default(),
+        pts: std::time::Duration::ZERO,
+        duration: None,
+        recycle: None,
+        grain: None,
+    }
+}
+
+/// The I420 pattern as a single-fd, padded-stride NV12 "dma-buf" -- a memfd,
+/// since this machine has no dma-buf exporter (no /dev/dri, no udmabuf).
+/// EGL refuses to import it, which exercises the path a real driver takes
+/// when it cannot import: the mmap fallback, then an upload.
+fn dmabuf_nv12(w: u32, h: u32) -> Frame {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let src = i420(w, h);
+    let FrameData::Cpu(p) = &src.data else { unreachable!() };
+    let (cw, ch) = (w.div_ceil(2) as usize, h.div_ceil(2) as usize);
+    let stride = (w as usize + 32 + 63) & !63;
+    let mut buf = vec![0u8; stride * h as usize + stride * ch];
+    for y in 0..h as usize {
+        buf[y * stride..y * stride + w as usize].copy_from_slice(&p.data[0][y * w as usize..(y + 1) * w as usize]);
+    }
+    for y in 0..ch {
+        for x in 0..cw {
+            let o = stride * h as usize + y * stride + 2 * x;
+            buf[o] = p.data[1][y * cw + x];
+            buf[o + 1] = p.data[2][y * cw + x];
+        }
+    }
+    // SAFETY: memfd_create returns a new fd we own.
+    let fd = unsafe { OwnedFd::from_raw_fd(libc::memfd_create(c"vk-selftest".as_ptr(), 0)) };
+    std::io::Write::write_all(&mut std::fs::File::from(fd.try_clone().expect("dup")), &buf).expect("memfd write");
+    Frame {
+        data: FrameData::DmaBuf(vidkit_core::frame::DmaBufImage {
+            planes: vec![vidkit_core::frame::DmaBufPlane { fd, offset: 0, stride: stride as u32 }],
+            modifier: vidkit_core::dmabuf::DRM_FORMAT_MOD_LINEAR,
+            fourcc: vidkit_core::dmabuf::DRM_FORMAT_NV12,
+            owner: None,
+        }),
+        layout: PlaneLayout::Nv12,
+        ..src
+    }
+}
+
+/// The frame carrying its grain, as a decoder exporting grain delivers it.
+fn with_grain(mut f: Frame) -> Frame {
+    f.grain = Some(Arc::new(grain_params()));
+    f
+}
+
+/// Film grain parameters shaped like SVT-AV1's (lag 3, overlap, all planes).
+fn grain_params() -> vidkit_core::av1_grain::GrainParams {
+    let mut y = [0i8; 24];
+    for (i, c) in y.iter_mut().enumerate() {
+        *c = ((i as i32 * 7) % 19 - 9) as i8;
+    }
+    let mut uv = [[0i8; 25]; 2];
+    for i in 0..25 {
+        uv[0][i] = ((i as i32 * 5) % 17 - 8) as i8;
+        uv[1][i] = ((i as i32 * 3) % 13 - 6) as i8;
+    }
+    vidkit_core::av1_grain::GrainParams {
+        seed: 20915,
+        // Strong grain: at weak amplitudes a wrong overlap weight rarely
+        // flips a rounded sample, and the test could not see it.
+        y_points: vec![[0, 180], [54, 200], [134, 220], [255, 255]],
+        cb_points: vec![[0, 200], [81, 230], [255, 255]],
+        cr_points: vec![[0, 190], [134, 210], [255, 240]],
+        chroma_scaling_from_luma: false,
+        scaling_shift: 8,
+        ar_coeff_lag: 3,
+        ar_coeffs_y: y,
+        ar_coeffs_uv: uv,
+        ar_coeff_shift: 7,
+        grain_scale_shift: 0,
+        uv_mult: [0, 0],
+        uv_luma_mult: [64, 64],
+        uv_offset: [0, 0],
+        overlap: true,
+        clip_to_restricted_range: false,
+    }
+}
+
+/// GPU-grained output vs the CPU reference: grain applied by vidkit-core
+/// (byte-identical to dav1d), then the CPU converter.
+fn check_grain(f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String, String> {
+    let FrameData::Cpu(pl) = &f.data else { return Err("not cpu".into()) };
+    let (mut y, mut u, mut v) = (pl.data[0].clone(), pl.data[1].clone(), pl.data[2].clone());
+    vidkit_core::av1_grain::apply_i420(&grain_params(), &mut y, &mut u, &mut v, w as usize, h as usize, false);
+    let grained = CpuPlanes { data: vec![y, u, v], strides: pl.strides.clone() };
+    let cpu = vidkit_core::planes_to_rgba8(&grained, f.layout, f.color, w as usize, h as usize).map_err(|e| e.to_string())?;
+    let plain = vidkit_core::planes_to_rgba8(pl, f.layout, f.color, w as usize, h as usize).map_err(|e| e.to_string())?;
+    let mut worst = 0u8;
+    for (i, p) in got.iter().enumerate() {
+        for c in 0..3 {
+            worst = worst.max(p[c].abs_diff(cpu[i * 4 + c]));
+        }
+    }
+    let changed = (0..got.len()).filter(|&i| (0..3).any(|c| cpu[i * 4 + c] != plain[i * 4 + c])).count();
+    // A COARSE wiring check (the grained textures reach the conversion),
+    // not the grain check: the grain itself is compared EXACTLY on the
+    // planes ("grain planes exact"). Here the texture unit's fixed-point
+    // bilinear chroma weights meet strong, high-frequency grained chroma --
+    // measured 3/255 on correct planes -- and one chroma code becomes ~2 RGB
+    // codes through the x2.02 blue coefficient.
+    if worst > 4 {
+        Err(format!("max error {worst}/255 against the CPU grain reference"))
+    } else if changed * 2 < got.len() {
+        Err(format!("grain changed only {changed} of {} pixels: the fixture is not exercising it", got.len()))
+    } else {
+        Ok(format!("max error {worst}/255, grain on {changed} of {} pixels", got.len()))
     }
 }
 
 /// GPU vs vidkit-core's CPU converter on the whole frame.
 fn check_vs_cpu(f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String, String> {
+    // A dma-buf is checked against the pattern it was built from, NOT read
+    // back through the same plane mapping the import used (a wrong chroma
+    // offset would then agree with itself -- it did, until this).
+    let source;
+    let f = match &f.data {
+        FrameData::DmaBuf(_) => {
+            source = i420(f.width, f.height);
+            &source
+        }
+        _ => f,
+    };
     let FrameData::Cpu(pl) = &f.data else { return Err("not cpu".into()) };
-    let cpu = vidkit_core::planes_to_rgba8(pl, f.layout, f.color, w as usize, h as usize).map_err(|e| e.to_string())?;
+    let layout = f.layout;
+    let cpu = vidkit_core::planes_to_rgba8(pl, layout, f.color, w as usize, h as usize).map_err(|e| e.to_string())?;
     let mut worst = 0u8;
     let mut at = 0usize;
     for (i, p) in got.iter().enumerate() {
@@ -275,6 +425,98 @@ fn check_vs_cpu(f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String
     }
 }
 
+/// Chroma planes (U, V) for a fixture luma plane: derived from the luma so
+/// they move with the picture -- neutral chroma would let a shader that
+/// never warps chroma pass.
+fn fixture_chroma(w: usize, h: usize, y: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let (cw, ch) = (w / 2, h / 2);
+    let u = (0..cw * ch).map(|i| 64 + y[(i / cw) * 2 * w + (i % cw) * 2] / 2).collect();
+    let v = (0..cw * ch).map(|i| 191 - y[((i / cw) * 2 + 1) * w + (i % cw) * 2 + 1] / 2).collect();
+    (u, v)
+}
+
+/// The AI fixture's previous (0), real middle (1) or next (2) frame as NV12,
+/// 1/60 s apart.
+fn fixture_frame(k: usize) -> Frame {
+    let (w, h, p, m, q, _) = vidkit_core::aiframes::fixture();
+    let y = [p, m, q][k].clone();
+    let mut f = nv12(w as u32, h as u32, |x, yy| y[yy as usize * w + x as usize]);
+    let (u, v) = fixture_chroma(w, h, &y);
+    if let FrameData::Cpu(pl) = &mut f.data {
+        pl.data[1] = u.iter().zip(&v).flat_map(|(a, b)| [*a, *b]).collect();
+    }
+    f.pts = std::time::Duration::from_micros(16_667 * k as u64);
+    f
+}
+
+/// Expected RGB of a frame given as float planes (luma full size, chroma
+/// half, sampled bilinearly at the luma pixel's centre as the GPU does),
+/// through the CPU colour conversion at 8 bits.
+fn rgb_of<'a>(w: usize, y: &'a [f32], u: &'a [f32], v: &'a [f32]) -> impl Fn(usize) -> [u8; 3] + 'a {
+    use vidkit_core::aiframes::Plane;
+    let q = |x: f32| (x * 255.0).round().clamp(0.0, 255.0) as u8;
+    let (cw, ch) = (w / 2, u.len() / (w / 2));
+    let (up, vp) = (Plane { w: cw, h: ch, px: u.to_vec() }, Plane { w: cw, h: ch, px: v.to_vec() });
+    move |i| {
+        let (cx, cy) = (((i % w) as f32 + 0.5) / 2.0 - 0.5, ((i / w) as f32 + 0.5) / 2.0 - 0.5);
+        expected_rgb(q(y[i]), q(up.sample(cx, cy)), q(vp.sample(cx, cy)), ColorInfo::default())
+    }
+}
+
+fn psnr_rgb(got: &[[u8; 3]], want: &dyn Fn(usize) -> [u8; 3]) -> f64 {
+    let mse = got.iter().enumerate().map(|(i, g)| {
+        let e = want(i);
+        (0..3).map(|c| (g[c] as f64 - e[c] as f64).powi(2)).sum::<f64>()
+    }).sum::<f64>() / (got.len() * 3) as f64;
+    10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
+}
+
+/// The fixture as float planes: (w, h, [prev, middle, next] x [y, u, v]).
+fn fixture_planes() -> (usize, usize, Vec<[vidkit_core::aiframes::Plane; 3]>, Vec<f32>) {
+    use vidkit_core::aiframes::{fixture, Plane};
+    let (w, h, p, m, q, py) = fixture();
+    let planes = [p, m, q].iter().map(|y| {
+        let (u, v) = fixture_chroma(w, h, y);
+        [Plane::from_u8(w, h, y), Plane::from_u8(w / 2, h / 2, &u), Plane::from_u8(w / 2, h / 2, &v)]
+    }).collect();
+    (w, h, planes, py)
+}
+
+/// The cut fallback: the in-between frame is the plain blend.
+fn check_ai_blend(_f: &Frame, got: &[[u8; 3]], _out: (u32, u32)) -> Result<String, String> {
+    let (w, _, f, _) = fixture_planes();
+    let mix = |k: usize| f[0][k].px.iter().zip(&f[2][k].px).map(|(a, b)| (a + b) / 2.0).collect::<Vec<f32>>();
+    let (y, u, v) = (mix(0), mix(1), mix(2));
+    let want = rgb_of(w, &y, &u, &v);
+    let worst = got.iter().enumerate().map(|(i, g)| (0..3).map(|c| g[c].abs_diff(want(i)[c])).max().unwrap_or(0)).max().unwrap_or(255);
+    let msg = format!("max {worst}/255 from the blend (colour)");
+    if worst <= 3 { Ok(msg) } else { Err(msg) }
+}
+
+/// The presenter's in-between frame (conversion shader, synth branch)
+/// against the synthesised frame: PyTorch's own luma, and chroma from
+/// vidkit-core's reference (which matches PyTorch at 120 dB) -- through the
+/// same colour conversion.
+fn check_ai_between(_f: &Frame, got: &[[u8; 3]], (w, h): (u32, u32)) -> Result<String, String> {
+    use vidkit_core::aiframes::{model_flow, synth};
+    let (fw, fh, f, py) = fixture_planes();
+    if (w as usize, h as usize) != (fw, fh) {
+        return Err("output size is not the fixture's".into());
+    }
+    let out = model_flow(&f[0][0], &f[2][0]);
+    let (su, sv) = (synth(&out, &f[0][1], &f[2][1]), synth(&out, &f[0][2], &f[2][2]));
+    let agree = psnr_rgb(got, &rgb_of(fw, &py, &su.px, &sv.px));
+    let real = psnr_rgb(got, &rgb_of(fw, &f[1][0].px, &f[1][1].px, &f[1][2].px));
+    let mix = |k: usize| f[0][k].px.iter().zip(&f[2][k].px).map(|(a, b)| (a + b) / 2.0).collect::<Vec<f32>>();
+    let (by, bu, bv) = (mix(0), mix(1), mix(2));
+    let blend = psnr_rgb(&(0..got.len()).map(rgb_of(fw, &by, &bu, &bv)).collect::<Vec<_>>(), &rgb_of(fw, &f[1][0].px, &f[1][1].px, &f[1][2].px));
+    let msg = format!("vs the model {agree:.1} dB (colour); vs the real middle {real:.2} dB, where a blend scores {blend:.2}");
+    // 8-bit output of a limited-range expansion: ~45 dB is exact here.
+    // Breaks measured: offsets or mask wrong 21-32 dB, chroma not warped
+    // (see the commit).
+    if agree > 38.0 && real > blend + 0.5 { Ok(msg) } else { Err(msg) }
+}
+
 fn cases() -> Vec<Case> {
     // 2-D pattern: soft diagonal field plus a bright square near the TOP-LEFT,
     // so a vertical or horizontal flip anywhere shows as a large error.
@@ -283,6 +525,8 @@ fn cases() -> Vec<Case> {
     };
     vec![
         Case {
+            two_pass: false, ai_next: None, promote: false, cut: None,
+            grain: None,
             name: "temporal denoise, board",
             frame: at_pts(noisy_board(9), 9),
             history: (0..9).map(|i| at_pts(noisy_board(i), i as usize)).collect(),
@@ -291,6 +535,8 @@ fn cases() -> Vec<Case> {
             check: check_denoise,
         },
         Case {
+            two_pass: false, ai_next: None, promote: false, cut: None,
+            grain: None,
             name: "temporal, no ghosting",
             frame: at_pts(square_at(40), 8),
             history: (0..8).map(|i| at_pts(square_at(8), i)).collect(),
@@ -298,13 +544,129 @@ fn cases() -> Vec<Case> {
             out: (64, 48),
             check: check_no_ghost,
         },
-        Case { name: "HDR10 PQ, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Pq), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
-        Case { name: "HLG, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Hlg), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
-        Case { name: "plain conversion", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance::default(), out: (64, 48), check: check_plain },
-        Case { name: "RCAS offscreen pass", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
-        Case { name: "bicubic 2x on a ramp", history: vec![], frame: nv12(32, 16, |x, _| (40 + x * 4) as u8), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_ramp },
-        Case { name: "bicubic 2x on a step", history: vec![], frame: nv12(32, 16, |x, _| if x < 16 { 60 } else { 200 }), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_step_overshoot },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "HDR10 PQ, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Pq), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "HLG, P010, BT.2020", history: vec![], frame: p010(64, 48, vidkit_core::codec::Transfer::Hlg), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: Some(grain_params()), name: "AV1 film grain", history: vec![], frame: with_grain(i420(256, 160)), enhance: Enhance::default(), out: (256, 160), check: check_grain },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "dma-buf NV12", history: vec![], frame: dmabuf_nv12(66, 48), enhance: Enhance::default(), out: (66, 48), check: check_vs_cpu },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "I420, three planes", history: vec![], frame: i420(64, 48), enhance: Enhance::default(), out: (64, 48), check: check_vs_cpu },
+        // This crop's residual is 0.024, over the whole-frame cut threshold
+        // (0.02): at the default the shader must show the blend...
+        Case { two_pass: false, ai_next: Some(fixture_frame(2)), promote: false, cut: None, grain: None, name: "AI cut falls back", history: vec![], frame: fixture_frame(0), enhance: Enhance::default(), out: (256, 144), check: check_ai_blend },
+        // ...and with the threshold raised, the synthesised frame.
+        Case { two_pass: false, ai_next: Some(fixture_frame(2)), promote: false, cut: Some(1.0), grain: None, name: "AI in-between frame", history: vec![], frame: fixture_frame(0), enhance: Enhance::default(), out: (256, 144), check: check_ai_between },
+        Case { two_pass: false, ai_next: Some(fixture_frame(2)), promote: true, cut: None, grain: None, name: "AI next promoted", history: vec![], frame: fixture_frame(0), enhance: Enhance::default(), out: (256, 144), check: check_vs_cpu },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "plain conversion", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance::default(), out: (64, 48), check: check_plain },
+        Case { two_pass: true, ai_next: None, promote: false, cut: None, grain: None, name: "RCAS two-pass (offscreen)", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "RCAS fused (one pass)", history: vec![], frame: nv12(64, 48, pattern), enhance: Enhance { scaler: Scaler::Bilinear, sharpen: Some(0.2), temporal: false }, out: (64, 48), check: check_rcas },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "bicubic 2x on a ramp", history: vec![], frame: nv12(32, 16, |x, _| (40 + x * 4) as u8), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_ramp },
+        Case { two_pass: false, ai_next: None, promote: false, cut: None, grain: None, name: "bicubic 2x on a step", history: vec![], frame: nv12(32, 16, |x, _| if x < 16 { 60 } else { 200 }), enhance: Enhance { scaler: Scaler::Bicubic, sharpen: None, temporal: false }, out: (64, 32), check: check_step_overshoot },
     ]
+}
+
+/// The AI half-rate synthesiser's GLSL against PyTorch's own output on the
+/// committed fixture (a held-out, high-motion 256x144 crop), and against
+/// the real middle frame: parity first, then that it still beats a blend.
+fn ai_frames_parity(gl: &eframe::glow::Context) -> Result<String, String> {
+    use eframe::glow::{self, HasContext};
+    use vidkit_core::aiframes::{fixture, psnr, Plane};
+    let (w, h, p, m, q, want) = fixture();
+    unsafe {
+        let up = |d: &[u8]| -> Result<glow::Texture, String> {
+            let t = gl.create_texture()?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(t));
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::R8 as i32, w as i32, h as i32, 0, glow::RED, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(d)));
+            for (k, v) in [(glow::TEXTURE_MIN_FILTER, glow::LINEAR), (glow::TEXTURE_MAG_FILTER, glow::LINEAR), (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE), (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE)] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, k, v as i32);
+            }
+            Ok(t)
+        };
+        let (t0, t2) = (up(&p)?, up(&q)?);
+        let mut ai = vidkit_egui::aiframes_gl::AiFramesGl::new(gl)?;
+        let t = std::time::Instant::now();
+        ai.run(gl, t0, t2, w as u32, h as u32)?;
+        let got = ai.synth_luma_readback(gl, t0, t2, w as u32, h as u32)?;
+        gl.finish();
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let resid = ai.mean_residual(gl).unwrap_or(f32::NAN);
+        if std::env::var_os("VIDKIT_AI_DEBUG").is_some() {
+            ai_debug(gl, &ai, w, h, &p, &q);
+        }
+        let passes = ai.passes;
+        ai.release(gl);
+        gl.delete_texture(t0);
+        gl.delete_texture(t2);
+        let got = Plane { w, h, px: got };
+        let py = Plane { w, h, px: want };
+        let real = Plane::from_u8(w, h, &m);
+        let (y0, y2) = (Plane::from_u8(w, h, &p), Plane::from_u8(w, h, &q));
+        let blend = Plane { w, h, px: y0.px.iter().zip(&y2.px).map(|(a, b)| (a + b) / 2.0).collect() };
+        let (agree, vs_real, vs_blend) = (psnr(&got, &py), psnr(&got, &real), psnr(&blend, &real));
+        let max = got.px.iter().zip(&py.px).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let line = format!("GLSL vs PyTorch {agree:.1} dB (max |d| {max:.4}); vs real {vs_real:.2} dB, blend {vs_blend:.2} dB; residual {resid:.4}; {passes} passes, {ms:.1} ms");
+        // The cut test's input, against the CPU reference. (Not against
+        // CUT_RESIDUAL: this crop is the fixture's highest-motion 256x144,
+        // and its residual, 0.024, is above the whole-frame threshold.)
+        let cpu_resid = vidkit_core::aiframes::residual(&y0, &y2, &vidkit_core::aiframes::model_flow(&y0, &y2));
+        let line = format!("{line}; CPU residual {cpu_resid:.4}");
+        // fp16 intermediates: measured 50.6 dB (llvmpipe). Break-tested:
+        // dilation ignored 38.5, regularizer 1e-5 39.2, mask ignored 38.6,
+        // coarse flow not doubled 24.9, LK sign 18.2 -- all fail at 45.
+        // NOT caught: leaky slope 0.1 -> 0 (46.7; the CNN adds ~0.1-0.3 dB
+        // over plain LK, so its internals barely move the output). The CPU
+        // reference's own test does catch that one.
+        if agree > 45.0 && vs_real > vs_blend + 1.0 && (resid - cpu_resid).abs() < 0.002 {
+            Ok(line)
+        } else {
+            Err(line)
+        }
+    }
+}
+
+/// Stage-by-stage GLSL vs the CPU reference (VIDKIT_AI_DEBUG=1).
+unsafe fn ai_debug(gl: &eframe::glow::Context, ai: &vidkit_egui::aiframes_gl::AiFramesGl, w: usize, h: usize, p: &[u8], q: &[u8]) {
+    use vidkit_core::aiframes::{lk_flow, model_flow, pool, Plane};
+    let (y0, y2) = (Plane::from_u8(w, h, p), Plane::from_u8(w, h, q));
+    let cmp = |name: &str, got: Option<(i32, i32, Vec<[f32; 4]>)>, want: &[&Plane]| {
+        let Some((gw, gh, px)) = got else { return println!("   {name}: no readback") };
+        let ok = gw as usize == want[0].w && gh as usize == want[0].h;
+        let mut max = 0.0f32;
+        let mut sum = 0.0f64;
+        let mut at = (0, 0, 0);
+        if ok {
+            for (ch, pl) in want.iter().enumerate() {
+                for (i, v) in pl.px.iter().enumerate() {
+                    let d = (px[i][ch] - v).abs();
+                    sum += d as f64;
+                    if d > max {
+                        max = d;
+                        at = (ch, i % pl.w, i / pl.w);
+                    }
+                }
+            }
+        }
+        println!("   {name}: {gw}x{gh} (want {}x{}) max |d| {max:.5} mean {:.5} at ch{} ({},{})", want[0].w, want[0].h, sum / (want.len() * want[0].px.len()) as f64, at.0, at.1, at.2);
+    };
+    for (li, &lv) in vidkit_core::aiframes_weights::LEVELS.iter().enumerate() {
+        let (a, c) = (pool(&y0, lv), pool(&y2, lv));
+        cmp(&format!("a 1/{lv}"), ai.debug_read(gl, "a", li), &[&a]);
+        cmp(&format!("c 1/{lv}"), ai.debug_read(gl, "c", li), &[&c]);
+    }
+    let lk = lk_flow(&y0, &y2);
+    cmp("lk 1/4", ai.debug_read(gl, "lk", vidkit_core::aiframes_weights::LEVELS.len() - 1), &[&lk[0], &lk[1], &lk[2], &lk[3]]);
+    let m = model_flow(&y0, &y2);
+    cmp("flow", ai.debug_read(gl, "flow", 0), &[&m[0], &m[1], &m[2], &m[3]]);
+    cmp("mask", ai.debug_read(gl, "mask", 0), &[&m[4]]);
+    println!("   CPU residual {:.4} (cut above {})", vidkit_core::aiframes::residual(&y0, &y2, &m), vidkit_core::aiframes::CUT_RESIDUAL);
+    // The full-size synthesis alone: the CPU synth from the GPU's own flow.
+    if let (Some((fw, fh, f)), Some((_, _, mk))) = (ai.debug_read(gl, "flow", 0), ai.debug_read(gl, "mask", 0)) {
+        let (fw, fh) = (fw as usize, fh as usize);
+        let ch = |k: usize| Plane { w: fw, h: fh, px: f.iter().map(|v| v[k]).collect() };
+        let out = vec![ch(0), ch(1), ch(2), ch(3), Plane { w: fw, h: fh, px: mk.iter().map(|v| v[0]).collect() }];
+        let cpu = vidkit_core::aiframes::synth(&out, &y0, &y2);
+        let want = vidkit_core::aiframes::synth(&m, &y0, &y2);
+        println!("   synth from GPU flow vs from CPU flow: {:.1} dB", vidkit_core::aiframes::psnr(&cpu, &want));
+    }
 }
 
 pub struct SelfTest {
@@ -319,7 +681,16 @@ pub struct SelfTest {
 impl SelfTest {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let gpu = cc.gl.as_ref().and_then(|gl| unsafe { Nv12Gpu::new(gl) }.map_err(|e| eprintln!("GPU SELFTEST: shader build failed: {e}")).ok());
-        Self { gpu: gpu.map(|g| Arc::new(Mutex::new(g))), cases: cases(), at: 0, shown: 0, readback: Arc::new(Mutex::new(None)), failed: false }
+        let mut failed = false;
+        match cc.gl.as_ref().map(|gl| ai_frames_parity(gl)) {
+            Some(Ok(m)) => println!("  ok   {:<24} {m}", "AI half-rate synth"),
+            Some(Err(m)) => {
+                println!("  FAIL {:<24} {m}", "AI half-rate synth");
+                failed = true;
+            }
+            None => {}
+        }
+        Self { gpu: gpu.map(|g| Arc::new(Mutex::new(g))), cases: cases(), at: 0, shown: 0, readback: Arc::new(Mutex::new(None)), failed }
     }
 }
 
@@ -340,7 +711,8 @@ impl eframe::App for SelfTest {
         }
         if let Some(px) = self.readback.lock().ok().and_then(|mut r| r.take()) {
             let c = &self.cases[self.at];
-            match (c.check)(&c.frame, &px, c.out) {
+            let checked = c.ai_next.as_ref().filter(|_| c.promote).unwrap_or(&c.frame);
+            match (c.check)(checked, &px, c.out) {
                 Ok(m) => println!("  ok   {:<24} {m}", c.name),
                 Err(m) => {
                     println!("  FAIL {:<24} {m}", c.name);
@@ -360,9 +732,55 @@ impl eframe::App for SelfTest {
             let f = if self.shown < n { &c.history[self.shown as usize] } else { &c.frame };
             if let (Ok(mut g), Some(gl)) = (gpu.lock(), frame.gl()) {
                 g.enhance = c.enhance;
+                g.fused_rcas = !c.two_pass;
+                // The grain arrives ON THE FRAME, as the decoder delivers it
+                // (Frame::grain); the presenter's override stays off.
+                g.grain_params = None;
                 if let Err(e) = unsafe { g.upload(gl, f) } {
                     println!("GPU SELFTEST FAIL: upload: {e}");
                     std::process::exit(1);
+                }
+                if f.is_zero_copy() {
+                    println!("       dma-buf: {} zero-copy frames; import: {}", g.zero_copy_frames, g.import_note.as_deref().unwrap_or("ok"));
+                }
+                if let (true, Some(next)) = (self.shown == n, c.ai_next.as_ref()) {
+                    let before = g.uploads();
+                    g.ai_cut_residual = c.cut.unwrap_or(vidkit_core::aiframes::CUT_RESIDUAL);
+                    if let Err(e) = unsafe { g.show_between(gl, next) } {
+                        println!("  FAIL {:<24} show_between: {e}", c.name);
+                        self.failed = true;
+                    }
+                    if c.promote {
+                        let ok = unsafe { g.promote(gl, next) };
+                        if !ok || g.uploads() != before + 1 || g.synth_pts().is_some() {
+                            println!("  FAIL {:<24} promote: {ok}, {} uploads (want 1), synth {:?}", c.name, g.uploads() - before, g.synth_pts());
+                            self.failed = true;
+                        }
+                    } else if g.synth_pts() != Some(next.pts) {
+                        println!("  FAIL {:<24} no in-between frame pending", c.name);
+                        self.failed = true;
+                    }
+                }
+                // The grain stage itself, exactly: the GPU's grained planes
+                // against vidkit-core's reference (byte-identical to dav1d).
+                if c.grain.is_some() {
+                    if let (Some((gy, gc)), FrameData::Cpu(pl)) = (unsafe { g.read_grain_planes(gl) }, &f.data) {
+                        let (w, h) = (f.width as usize, f.height as usize);
+                        let (mut y, mut u, mut v) = (pl.data[0].clone(), pl.data[1].clone(), pl.data[2].clone());
+                        vidkit_core::av1_grain::apply_i420(c.grain.as_ref().unwrap(), &mut y, &mut u, &mut v, w, h, false);
+                        let bad_y: Vec<(usize, usize, u8, u8)> = (0..w * h).filter(|&i| gy[i] != y[i]).map(|i| (i % w, i / w, gy[i], y[i])).collect();
+                        let cw = w.div_ceil(2);
+                        let bad_c: Vec<(usize, usize, usize, u8, u8)> = (0..u.len()).flat_map(|i| [(0, i), (1, i)]).filter(|&(k, i)| gc[i * 2 + k] != if k == 0 { u[i] } else { v[i] }).map(|(k, i)| (k, i % cw, i / cw, gc[i * 2 + k], if k == 0 { u[i] } else { v[i] })).collect();
+                        if bad_y.is_empty() && bad_c.is_empty() {
+                            println!("  ok   grain planes exact      {}x{} luma + chroma byte-identical to the CPU reference", w, h);
+                        } else {
+                            println!("  FAIL grain planes exact      luma {} / chroma {} samples differ; first {:?} {:?}", bad_y.len(), bad_c.len(), bad_y.first(), bad_c.first());
+                            self.failed = true;
+                        }
+                    } else {
+                        println!("  FAIL grain planes exact      the GPU grain pass did not run");
+                        self.failed = true;
+                    }
                 }
             }
         }

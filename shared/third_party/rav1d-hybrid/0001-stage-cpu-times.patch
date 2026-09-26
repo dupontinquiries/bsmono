@@ -1,0 +1,141 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 1a50fce..974cab8 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -143,6 +143,7 @@ mod refmvs;
+ pub mod rust_api;
+ mod scan;
+ mod tables;
++pub mod stage_time;
+ mod thread_task;
+ mod warpmv;
+ mod wedge;
+diff --git a/src/stage_time.rs b/src/stage_time.rs
+new file mode 100644
+index 0000000..20715d9
+--- /dev/null
++++ b/src/stage_time.rs
+@@ -0,0 +1,45 @@
++//! Per-stage CPU time for the hybrid-decoder work (vidkit): how much of
++//! decoding is entropy (pass 1, CPU forever) and how much is reconstruction
++//! and filtering (pass 2 onward, what a GPU could take). Thread CPU time
++//! (CLOCK_THREAD_CPUTIME_ID), so oversubscribed threads do not count their
++//! waiting. Off unless RAV1D_STAGE_TIMES is set; then the CLI prints it.
++use std::sync::atomic::{AtomicU64, Ordering};
++
++pub const NAMES: [&str; 8] = ["entropy (pass 1)", "reconstruction (pass 2)", "deblock", "cdef", "superres", "loop restoration", "film grain", "single-pass parse+recon"];
++pub static NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
++
++pub fn enabled() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("RAV1D_STAGE_TIMES").is_some())
++}
++
++pub fn thread_ns() -> u64 {
++    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++    // SAFETY: clock_gettime into a local.
++    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
++    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
++}
++
++pub struct Guard(usize, u64);
++
++pub fn start(stage: usize) -> Option<Guard> {
++    enabled().then(|| Guard(stage, thread_ns()))
++}
++
++impl Drop for Guard {
++    fn drop(&mut self) {
++        NS[self.0].fetch_add(thread_ns().saturating_sub(self.1), Ordering::Relaxed);
++    }
++}
++
++pub fn report() -> String {
++    let v: Vec<u64> = NS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
++    let total: u64 = v.iter().sum::<u64>().max(1);
++    let mut s = String::from("stage CPU time (thread clocks):\n");
++    for (n, t) in NAMES.iter().zip(&v) {
++        if *t > 0 {
++            s += &format!("  {:26} {:9.1} ms  {:5.1}%\n", n, *t as f64 / 1e6, *t as f64 / total as f64 * 100.0);
++        }
++    }
++    s
++}
+diff --git a/src/thread_task.rs b/src/thread_task.rs
+index 9caf374..054e5ea 100644
+--- a/src/thread_task.rs
++++ b/src/thread_task.rs
+@@ -794,7 +794,10 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
+         merge_pending(c);
+         if ttd.delayed_fg_exec.get() != 0 {
+             // run delayed film grain first
+-            delayed_fg_task(ttd, &mut task_thread_lock);
++            {
++                let _st = crate::stage_time::start(6);
++                delayed_fg_task(ttd, &mut task_thread_lock);
++            }
+             continue 'outer;
+         }
+ 
+@@ -1108,6 +1111,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
+                             1 as c_int + (t.type_0 == TaskType::TileReconstruction) as c_int
+                         };
+                         if error_0 == 0 {
++                            let _st = crate::stage_time::start(match tc.frame_thread.pass { 1 => 0, 2 => 1, _ => 7 });
+                             error_0 = match rav1d_decode_tile_sbrow(c, &mut tc, &f) {
+                                 Ok(()) => 0,
+                                 Err(()) => 1,
+@@ -1197,6 +1201,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
+                         {
+                             let f = fc.data.try_read().unwrap();
+                             if fc.task_thread.error.load(Ordering::SeqCst) == 0 {
++                                let _st = crate::stage_time::start(2);
+                                 (f.bd_fn().filter_sbrow_deblock_cols)(c, &f, &mut tc, sby);
+                             }
+                         }
+@@ -1217,6 +1222,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
+                     TaskType::DeblockRows => {
+                         let f = fc.data.try_read().unwrap();
+                         if fc.task_thread.error.load(Ordering::SeqCst) == 0 {
++                            let _st = crate::stage_time::start(2);
+                             (f.bd_fn().filter_sbrow_deblock_rows)(c, &f, &mut tc, sby);
+                         }
+                         // signal deblock progress
+@@ -1265,6 +1271,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
+                         let seq_hdr = &***f.seq_hdr.as_ref().unwrap();
+                         if seq_hdr.cdef != 0 {
+                             if fc.task_thread.error.load(Ordering::SeqCst) == 0 {
++                                let _st = crate::stage_time::start(3);
+                                 (f.bd_fn().filter_sbrow_cdef)(c, &f, &mut tc, sby);
+                             }
+                             drop(f);
+@@ -1281,6 +1288,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
+                         let frame_hdr = &***f.frame_hdr.as_ref().unwrap();
+                         if frame_hdr.size.width[0] != frame_hdr.size.width[1] {
+                             if fc.task_thread.error.load(Ordering::SeqCst) == 0 {
++                                let _st = crate::stage_time::start(4);
+                                 (f.bd_fn().filter_sbrow_resize)(c, &f, &mut tc, sby);
+                             }
+                         }
+@@ -1292,6 +1300,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
+                         if fc.task_thread.error.load(Ordering::SeqCst) == 0
+                             && !f.lf.restore_planes.is_empty()
+                         {
++                            let _st = crate::stage_time::start(5);
+                             (f.bd_fn().filter_sbrow_lr)(c, &f, &mut tc, sby);
+                         }
+                         task_type = TaskType::ReconstructionProgress;
+diff --git a/tools/dav1d.rs b/tools/dav1d.rs
+index b554a61..b5848b0 100644
+--- a/tools/dav1d.rs
++++ b/tools/dav1d.rs
+@@ -623,6 +623,9 @@ unsafe fn main_0(argc: c_int, argv: *const *mut c_char) -> c_int {
+         res = 1 as c_int;
+     }
+     dav1d_close(NonNull::new(&mut c));
++    if rav1d::stage_time::enabled() {
++        eprint!("{}", rav1d::stage_time::report());
++    }
+     return if res == 0 { 0 as c_int } else { 1 as c_int };
+ }
+ 

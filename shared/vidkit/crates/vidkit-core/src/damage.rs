@@ -394,4 +394,38 @@ mod tests {
         assert!((0..4).all(|y| (0..4).all(|x| px(x, y) == px(0, 0))), "a 4x4 block is one sample");
         assert_eq!(px(0, 0), whole[0], "the sample is the block's corner pixel, converted");
     }
+
+    /// `cargo test --release -p vidkit-core --lib damage_bench -- --ignored --nocapture`
+    /// Where the damage path spends its time, per stage, at three sizes.
+    #[test]
+    #[ignore]
+    fn damage_bench() {
+        use std::time::Instant;
+        for (w, h) in [(640u32, 360u32), (1920, 1080), (3840, 2160)] {
+            let mk = |k: u32| frame(w, h, |x, y| ((x.wrapping_mul(7) ^ y.wrapping_mul(13)).wrapping_add(k)) as u8);
+            let (a, b) = (mk(0), mk(1));
+            let mut t = TileTree::new(w, h);
+            let reps = (40_000_000 / (w * h)).max(3);
+            let time = |f: &mut dyn FnMut()| {
+                f();
+                let s = Instant::now();
+                for _ in 0..reps { f(); }
+                s.elapsed().as_secs_f64() / reps as f64 * 1e3
+            };
+            let hash_ms = time(&mut || { std::hint::black_box(t.hash_frame(&a, 1)); });
+            let hb = t.hash_frame(&b, 1);
+            let plan_ms = time(&mut || { t.leaves.iter_mut().for_each(|l| l.shown = NEVER); std::hint::black_box(t.plan(&hb, u64::MAX)); });
+            let mut out = vec![0u8; (w * h * 4) as usize];
+            let full = Op { x: 0, y: 0, w, h, lod: 0 };
+            let conv0 = time(&mut || { convert_region(&a, PlaneLayout::Nv12, ColorInfo::default(), w, full, &mut out).unwrap(); });
+            let conv1 = time(&mut || { convert_region(&a, PlaneLayout::Nv12, ColorInfo::default(), w, Op { lod: 1, ..full }, &mut out).unwrap(); });
+            let whole = time(&mut || { std::hint::black_box(crate::convert_cpu::planes_to_rgba8(&a, PlaneLayout::Nv12, ColorInfo::default(), w as usize, h as usize).unwrap()); });
+            // Tiled conversion: the same frame as one op per 16x16 tile.
+            let tiles: Vec<Op> = (0..h.div_ceil(TILE)).flat_map(|r| (0..w.div_ceil(TILE)).map(move |c| (c, r)))
+                .map(|(c, r)| Op { x: c * TILE, y: r * TILE, w: TILE.min(w - c * TILE), h: TILE.min(h - r * TILE), lod: 0 }).collect();
+            let conv_tiles = time(&mut || { for op in &tiles { convert_region(&a, PlaneLayout::Nv12, ColorInfo::default(), w, *op, &mut out).unwrap(); } });
+            let mpx = (w * h) as f64 / 1e6;
+            eprintln!("DIAG {w}x{h}: hash {hash_ms:.2} ms ({:.2} ns/px) | plan {plan_ms:.2} | whole-frame convert {whole:.2} | region LOD0 {conv0:.2} | LOD1 {conv1:.2} | per-tile ops {conv_tiles:.2} ({} ops)", hash_ms * 1e6 / (mpx * 1e6), tiles.len());
+        }
+    }
 }

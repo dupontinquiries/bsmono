@@ -29,8 +29,13 @@ use vidkit_egui::{bottom_bar, next_fit, EguiPresenter, Fit, Transport, VideoView
 mod filepick;
 #[cfg(feature = "bscale")]
 mod analysis;
+mod aimode;
 mod audio_out;
 mod gpu_selftest;
+#[cfg(feature = "libav")]
+mod inproc;
+#[cfg(feature = "libav")]
+mod v4l2src;
 mod enhance_plan;
 mod decode;
 mod export;
@@ -44,6 +49,7 @@ mod palette;
 mod pattern;
 mod playback;
 mod power;
+mod prefs;
 mod profile;
 
 /// What we managed to learn about the file the user named.
@@ -178,12 +184,57 @@ struct Player {
     /// Software presenter budget chosen in the palette; None follows the
     /// power policy (or VIDKIT_SW_BUDGET).
     sw_budget_user: Option<f32>,
+    /// The palette is showing "What can I type?" examples.
+    palette_help: bool,
+    /// Transcription model and language, persisted.
+    prefs: prefs::Prefs,
+    /// The current whisper transcription's inputs, to restart it with a
+    /// bigger model: (file, audio, total, cache).
+    transcribe_args: Option<(Option<PathBuf>, transcribe::AudioIn, Option<Duration>, Option<PathBuf>)>,
+    /// A transcription scope chosen in the Sections panel: kept, and the
+    /// power policy leaves it alone.
+    scope_user: bool,
     /// What background work the power supply allows, and when it was read.
     energy: power::EnergyPolicy,
     energy_read: Option<Instant>,
     power_state: power::PowerState,
+    /// Software decode unpinned from the efficiency cores because frames
+    /// dropped there; stays off for the session.
+    cores_gave_up: bool,
+    core_check: Option<(Instant, u64, u64)>,
     /// VIDKIT_PROFILE: one line a second of what playback costs.
     profiler: Option<profile::Profiler>,
+    /// Presentation feedback and hints on the window's wl_surface (Wayland
+    /// only; None on X11 or when the compositor offers nothing).
+    wl: Option<vidkit_wayland::surface::SurfaceLink>,
+    /// What the feedback says: refresh, holds per frame, lateness, discards.
+    present_log: vidkit_wayland::cadence::PresentLog,
+    /// The display pipeline's latency, learned from the feedback; frames
+    /// are picked for when they will be seen.
+    latency: vidkit_wayland::cadence::LatencyTracker,
+    /// The video subsurface (VIDKIT_SCANOUT): frames handed to the
+    /// compositor as they are. `plane_on`: the current frame is there, and
+    /// the window paints a transparent hole over it.
+    plane: Option<vidkit_wayland::plane::VideoPlane>,
+    plane_on: bool,
+    plane_size: (u32, u32),
+    /// Where the video was last drawn (points = surface-local logical px).
+    video_rect: Option<egui::Rect>,
+    /// Why frames are not going to the plane (said once per change).
+    scanout_why: String,
+    /// Mouse jitter guard (Settings > controls): motion must be deliberate
+    /// to bring the controls back.
+    deadzone: vidkit_egui::chrome::PointerDeadzone,
+    /// Height of the bottom controls overlay last frame (subtitles sit
+    /// above it while it shows).
+    chrome_overlay_h: f32,
+    /// The dma-buf frame on screen (zero-copy), returned to its decoder when
+    /// the next frame replaces it.
+    held: Option<vidkit_core::Frame>,
+    /// The last frame shown carried film grain for the GPU to add.
+    last_grain: bool,
+    /// AI in-between frames: which gap gets one, and when.
+    ai: aimode::Schedule,
     /// Picture-in-picture: the video floats, the chapters take the screen.
     pip: vidkit_egui::Pip,
     pip_on: bool,
@@ -293,6 +344,9 @@ impl Player {
             // SAFETY: the creation context's GL is current.
             unsafe { gl.get_parameter_i32(eframe::glow::MAX_TEXTURE_SIZE) as u32 }
         });
+        if let Some(t) = max_texture {
+            decode::set_texture_limit(t);
+        }
 
         // GPU upload by DEFAULT (VIDKIT_GPU=0 opts out): NV12 planes go to the
         // GPU and are converted there, instead of a CPU colour conversion of
@@ -312,6 +366,14 @@ impl Player {
         } else {
             (None, None)
         };
+        // The GPU presenter takes I420: software decode then skips the NV12
+        // conversion (+29% CPU on 4K60 VP9, measured). Set before the first
+        // decoder opens.
+        decode::set_prefer_planar(gpu.is_some());
+        // ...and synthesises AV1 film grain, so software AV1 exports the
+        // grain instead of dav1d adding it on the CPU.
+        decode::set_gpu_grain(gpu.is_some());
+        decode::set_gpu_presenter(gpu.is_some());
         let opened = file.as_ref().map(|p| open_local(p));
 
         // Try to decode it for real. A failure is not fatal: the file still
@@ -384,10 +446,29 @@ impl Player {
             seen_hits: Vec::new(),
             listen_only: false,
             sw_budget_user: None,
+            palette_help: false,
+            prefs: prefs::Prefs::load(),
+            transcribe_args: None,
+            scope_user: false,
             energy: power::policy(power::current()),
             energy_read: None,
             power_state: power::current(),
+            cores_gave_up: false,
+            core_check: None,
             profiler: profile::Profiler::from_env(),
+            wl: None,
+            plane: None,
+            plane_on: false,
+            plane_size: (0, 0),
+            video_rect: None,
+            scanout_why: String::new(),
+            present_log: vidkit_wayland::cadence::PresentLog::new(240),
+            last_grain: false,
+            ai: aimode::Schedule::default(),
+            deadzone: vidkit_egui::chrome::PointerDeadzone::new(6.0),
+            chrome_overlay_h: 0.0,
+            held: None,
+            latency: vidkit_wayland::cadence::LatencyTracker::new(15, 100_000_000),
             pip: Default::default(),
             pip_on: false,
             max_texture,
@@ -400,12 +481,27 @@ impl Player {
             analysis_status: Arc::new(Mutex::new(String::new())),
             analysis_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
+        me.wl = wayland_link(cc);
+        me.settings.pointer_deadzone = me.prefs.pointer_deadzone as f32;
+        me.settings.ai_frames = me.prefs.ai_frames;
+        // The video plane, when asked for (VIDKIT_SCANOUT=1|force) and the
+        // GL presenter is up (it paints the hole).
+        if me.gpu.is_some() && vidkit_wayland::scanout::Mode::parse(std::env::var("VIDKIT_SCANOUT").ok().as_deref()) != vidkit_wayland::scanout::Mode::Off {
+            if let Some(wl) = &me.wl {
+                let (conn, foreign) = wl.connection();
+                match vidkit_wayland::plane::VideoPlane::new(conn, wl.surface(), foreign, true) {
+                    Ok(p) => me.plane = Some(p),
+                    Err(e) => eprintln!("vidkit: no video plane: {e}"),
+                }
+            }
+        }
         // The software presenter converts and uploads only what changed
         // (vidkit_core::damage). VIDKIT_DAMAGE=0 turns it off for comparison;
         // VIDKIT_SW_BUDGET (0..1 of a frame) caps conversions and lets the
         // picture degrade under motion; else the power policy's budget.
         me.presenter.set_damage_rendering(std::env::var("VIDKIT_DAMAGE").as_deref() != Ok("0"));
         me.presenter.damage_budget = sw_budget_override().unwrap_or(me.energy.sw_budget);
+        me.apply_core_policy(false);
         if let Some(url) = PENDING_URL.get().cloned() {
             me.open_url(url);
         }
@@ -475,7 +571,33 @@ impl Player {
         }
         match tick {
             playback::Tick::Show { frame, next } => {
-                self.present(eframe_frame, &frame);
+                // The compositor takes the frame as it is, when it can.
+                let frame = match self.to_plane(frame, lead) {
+                    None => {
+                        self.presenter.set_deadline(Some(Instant::now() + next));
+                        return;
+                    }
+                    Some(f) => f,
+                };
+                // Feedback for this frame's commit, and (with commit timing)
+                // its target: the time it was picked for.
+                if let Some(wl) = self.wl.as_mut() {
+                    let target = wl.clock_now_ns().map(|n| n + lead.as_nanos() as u64 + self.latency.comp_ns() as u64);
+                    wl.before_commit(target);
+                }
+                self.last_grain = frame.grain.is_some();
+                // The in-between frame's right-hand neighbour is already on
+                // the GPU: promote it rather than upload it again.
+                let promoted = decode::ai_frames()
+                    && match (&self.gpu, eframe_frame.gl()) {
+                        // SAFETY: eframe's glow context is current on the UI thread.
+                        (Some(g), Some(gl)) => g.lock().map(|mut g| unsafe { g.promote(gl, &frame) }).unwrap_or(false),
+                        _ => false,
+                    };
+                if !promoted {
+                    self.present(eframe_frame, &frame);
+                }
+                self.ai.shown_real(frame.pts);
                 if let Some(e) = self.engine.as_ref() {
                     // The content peak for the GPU's BT.2390 EETF.
                     if let Some(g) = &self.gpu {
@@ -483,17 +605,65 @@ impl Player {
                             g.hdr_peak_nits = e.hdr_peak().unwrap_or(vidkit_core::convert_cpu::DEFAULT_HDR_PEAK_NITS);
                         }
                     }
-                    e.recycle(frame);
+                    // A dma-buf frame on the GPU path is ON SCREEN until the
+                    // next one: its textures alias the decoder's buffer, and
+                    // every repaint samples it. Returned when replaced.
+                    if frame.is_zero_copy() && self.gpu.is_some() {
+                        if let Some(old) = self.held.replace(frame) {
+                            e.recycle(old);
+                        }
+                    } else {
+                        e.recycle(frame);
+                        if let Some(old) = self.held.take() {
+                            e.recycle(old);
+                        }
+                    }
                 }
+                let next = self.ai_between(eframe_frame, lead).map_or(next, |w| w.min(next));
                 self.presenter.set_deadline(Some(Instant::now() + next));
             }
-            playback::Tick::Wait(d) => self.presenter.set_deadline(Some(Instant::now() + d)),
+            playback::Tick::Wait(d) => {
+                let d = self.ai_between(eframe_frame, lead).map_or(d, |w| w.min(d));
+                self.presenter.set_deadline(Some(Instant::now() + d));
+            }
             playback::Tick::Ended => {
                 // Dropped rather than left to fall back to the test pattern:
                 // a clip that has finished must not look like a broken decoder.
+                self.drop_held();
                 self.engine = None;
                 self.transport.playing = false;
                 self.presenter.idle();
+            }
+        }
+    }
+
+    /// AI in-between frames: show the synthesised frame between the one on
+    /// screen and the next queued one when its time has come; else how
+    /// long until it will (None: nothing to do for this gap).
+    fn ai_between(&mut self, eframe_frame: &eframe::Frame, lead: Duration) -> Option<Duration> {
+        if !decode::ai_frames() {
+            return None;
+        }
+        let (Some(engine), Some(gpu), Some(gl)) = (self.engine.as_ref(), self.gpu.as_ref(), eframe_frame.gl()) else { return None };
+        if engine.is_paused() || self.plane_on {
+            return None;
+        }
+        let front = engine.peek_front()?;
+        match aimode::step(&self.ai, front.pts, engine.frame_interval(), engine.seen_at(lead)) {
+            aimode::Step::None => None,
+            // `d` is from the time a frame drawn now is seen; deadlines
+            // are set as tick_ahead's are, from now (egui wakes `lead` early).
+            aimode::Step::WakeIn(d) => Some((d + lead.min(engine.max_lead())).max(Duration::from_millis(1))),
+            aimode::Step::ShowNow => {
+                let t = Instant::now();
+                // SAFETY: eframe's glow context is current on the UI thread.
+                let r = gpu.lock().map_err(|_| "GPU state poisoned".to_string()).and_then(|mut g| unsafe { g.show_between(gl, front) });
+                let (pts, native) = (front.pts, engine.frame_interval());
+                if r.is_ok() {
+                    self.ai.record_cost(t.elapsed(), native);
+                }
+                self.ai.attempted(pts, r);
+                None
             }
         }
     }
@@ -508,7 +678,16 @@ impl Player {
         if let (Some(gpu), Some(gl)) = (&self.gpu, eframe_frame.gl()) {
             let failed = match gpu.lock() {
                 // SAFETY: eframe's glow context is current on the UI thread.
-                Ok(mut g) => unsafe { g.upload(gl, frame) }.err(),
+                Ok(mut g) => {
+                    let r = unsafe { g.upload(gl, frame) }.err();
+                    // Why a dma-buf was NOT imported (read back through mmap
+                    // instead), once: the first thing to know on new hardware.
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    if let Some(n) = g.import_note.take() {
+                        SAID.call_once(|| eprintln!("vidkit: dma-buf import failed, mmap fallback: {n}"));
+                    }
+                    r
+                }
                 Err(_) => Some("GPU state poisoned".to_string()),
             };
             match failed {
@@ -516,10 +695,122 @@ impl Player {
                 Some(e) => {
                     self.gpu_error = Some(format!("GPU upload failed, using the CPU path: {e}"));
                     self.gpu = None;
+                    // The CPU presenter adds no grain: dav1d applies it again
+                    // from the next open (a seek). Until then the film is
+                    // shown without grain -- rare, and said above.
+                    decode::set_gpu_grain(false);
+                    decode::set_gpu_presenter(false);
                 }
             }
         }
+        // The CPU presenter reads planes: a LINEAR dma-buf through mmap.
+        if let vidkit_core::frame::FrameData::DmaBuf(img) = &frame.data {
+            match vidkit_egui::dmabuf_gl::map_linear(img, frame.width, frame.height) {
+                Ok((layout, planes)) => {
+                    let cpu = vidkit_core::Frame {
+                        data: vidkit_core::frame::FrameData::Cpu(planes),
+                        width: frame.width,
+                        height: frame.height,
+                        layout,
+                        color: frame.color,
+                        pts: frame.pts,
+                        duration: frame.duration,
+                        recycle: None,
+                        grain: None,
+                    };
+                    self.presenter.show(&cpu);
+                }
+                Err(e) => self.gpu_error = Some(format!("cannot show a dma-buf frame on the CPU path: {e}")),
+            }
+            return;
+        }
         self.presenter.show(frame);
+    }
+
+    /// Hand `frame` to the video plane if it can go there: `None` when it
+    /// was taken, `Some(frame)` to present it the usual way. Says once, on
+    /// stderr, each time the reason for NOT scanning out changes.
+    fn to_plane(&mut self, frame: vidkit_core::Frame, lead: Duration) -> Option<vidkit_core::Frame> {
+        use vidkit_wayland::scanout::{decide, Inputs, Mode};
+        let Some(plane) = self.plane.as_mut() else { return Some(frame) };
+        plane.poll();
+        let verdict = match (&frame.data, self.video_rect) {
+            (vidkit_core::frame::FrameData::DmaBuf(img), Some(_)) => {
+                let enh_changes = self.gpu.as_ref().and_then(|g| g.lock().ok()).is_some_and(|g| {
+                    g.enhance.sharpen.is_some() || g.enhance.temporal || g.enhance.scaler == vidkit_egui::glow_present::Scaler::Bicubic
+                });
+                decide(&Inputs {
+                    mode: Mode::parse(std::env::var("VIDKIT_SCANOUT").ok().as_deref()),
+                    nv12: frame.layout == vidkit_core::frame::PlaneLayout::Nv12,
+                    format_supported: plane.supports(img.fourcc, img.modifier),
+                    we_change_pixels: enh_changes || frame.grain.is_some(),
+                    can_say_matrix: plane.can_say(&frame.color),
+                    content_is_bt601_limited: frame.color.matrix == vidkit_core::frame::Matrix::Bt601 && frame.color.range == vidkit_core::frame::Range::Limited,
+                    protocols: true,
+                })
+            }
+            (vidkit_core::frame::FrameData::Cpu(_), _) => Err("frames are CPU planes (software decode)"),
+            (_, None) => Err("video not laid out yet"),
+        };
+        let why = match verdict {
+            Ok(()) => {
+                let r = self.video_rect.unwrap_or(egui::Rect::NOTHING);
+                let rect = (r.min.x.round() as i32, r.min.y.round() as i32, r.width().round() as i32, r.height().round() as i32);
+                let size = (frame.width, frame.height);
+                let target = self.wl.as_ref().and_then(|wl| wl.clock_now_ns()).map(|n| n + lead.as_nanos() as u64 + self.latency.comp_ns() as u64);
+                if let Some(wl) = self.wl.as_mut() {
+                    wl.feedback_on(plane.surface(), target);
+                }
+                match plane.show(frame, rect) {
+                    Ok(()) => {
+                        self.plane_on = true;
+                        self.plane_size = size;
+                        // The GL textures no longer show the held frame.
+                        if let (Some(old), Some(e)) = (self.held.take(), self.engine.as_ref()) {
+                            e.recycle(old);
+                        }
+                        if !self.scanout_why.is_empty() {
+                            eprintln!("vidkit: scanout on (video on its own subsurface)");
+                            self.scanout_why.clear();
+                        }
+                        return None;
+                    }
+                    Err((f, why)) => {
+                        if self.plane_on {
+                            plane.hide();
+                            self.plane_on = false;
+                        }
+                        if why != self.scanout_why {
+                            eprintln!("vidkit: scanout off this frame: {why}");
+                            self.scanout_why = why.to_string();
+                        }
+                        return Some(f);
+                    }
+                }
+            }
+            Err(why) => why,
+        };
+        if self.plane_on {
+            plane.hide();
+            self.plane_on = false;
+        }
+        if why != self.scanout_why {
+            eprintln!("vidkit: scanout off: {why}");
+            self.scanout_why = why.to_string();
+        }
+        Some(frame)
+    }
+
+    /// The decoder is being replaced: the held frame's buffer belongs to
+    /// the old one (dropped, not recycled), and the GPU's cached imports of
+    /// its pool go at the next upload.
+    fn drop_held(&mut self) {
+        self.held = None;
+        if let Some(g) = &self.gpu {
+            if let Ok(mut g) = g.lock() {
+                g.drop_imports = true;
+            }
+        }
     }
 }
 
@@ -531,6 +822,17 @@ impl eframe::App for Player {
         // A whisper model nobody has borrowed for two minutes is let go.
         transcribe::trim_idle_model();
         stats_tick(ctx);
+        if let Some(wl) = self.wl.as_mut() {
+            for o in wl.poll() {
+                self.latency.observe(&o);
+                self.present_log.push(o);
+            }
+            // Every update, not on change: a seek or a new file is a new
+            // engine, which starts at zero.
+            if let Some(e) = self.engine.as_mut() {
+                e.set_display_latency(Duration::from_nanos(self.latency.comp_ns() as u64));
+            }
+        }
         self.profile_frame();
         stats_note(if ctx.current_pass_index() > 0 { "pass>0" } else { "pass0" });
         if self.quit {
@@ -598,9 +900,23 @@ impl eframe::App for Player {
         // what happened, and only a screenshot showed it: the policy had the
         // rule and the player never asked.
         let tap_only_reveals = self.chrome.tap_reveals();
-        let moved = ctx.input(|i| {
-            i.pointer.velocity().length() > 0.5 || i.pointer.any_down() || !i.events.is_empty()
+        // Buttons, touches, scrolling and keys always count; bare pointer
+        // motion only past the jitter guard (a bumped couch mouse or a
+        // brushed trackpad moved a few pixels and brought the controls back
+        // over the film). Pointer-move events used to count as "events".
+        let (pos, intent) = ctx.input(|i| {
+            let intent = i.pointer.any_down()
+                || i.events.iter().any(|e| !matches!(e, egui::Event::PointerMoved(_) | egui::Event::MouseMoved(_) | egui::Event::PointerGone | egui::Event::WindowFocused(_)));
+            (i.pointer.latest_pos().map(|p| [p.x, p.y]), intent)
         });
+        self.deadzone.px = self.settings.pointer_deadzone;
+        let moved = self.deadzone.moved(now, pos) || intent;
+        let dz = self.settings.pointer_deadzone.round().clamp(0.0, 40.0) as u8;
+        if dz != self.prefs.pointer_deadzone || self.settings.ai_frames != self.prefs.ai_frames {
+            self.prefs.pointer_deadzone = dz;
+            self.prefs.ai_frames = self.settings.ai_frames;
+            self.prefs.save();
+        }
         if moved {
             self.chrome.wake(now);
         }
@@ -622,60 +938,97 @@ impl eframe::App for Player {
             self.settings_open = !self.settings_open;
         }
 
+        // The bottom controls FLOAT over the picture. As panels they took
+        // height from the central area whenever they appeared, so every
+        // mouse move that woke them re-fitted (reframed) the video, and the
+        // fade-out reframed it back. As overlays the video's rectangle never
+        // depends on whether the controls show.
+        self.chrome_overlay_h = 0.0;
         if !self.chrome.hidden() {
-        egui::TopBottomPanel::bottom("transport").show(ctx, |ui| {
-            ui.set_opacity(chrome_alpha);
-            let adaptive = Adaptive::detect(ui.ctx());
-            let act = bottom_bar(
-                ui,
-                &mut self.transport,
-                self.view.fit,
-                &self.colors,
-                &self.skin,
-                &adaptive,
-            );
-            if act.toggle_play {
-                self.transport.playing = !self.transport.playing;
-            }
-            if let Some(to) = act.seek_to {
-                self.seek_to(to);
-            }
-            if act.rotate {
-                // Through settings, not straight onto the transport: two
-                // places holding rotation means the popup shows one value and
-                // the picture another.
-                self.settings.rotation = (self.settings.rotation + 1).rem_euclid(4);
-            }
-            if act.cycle_fit {
-                self.settings.fill = vidkit_egui::FillMode::from_fit(next_fit(self.view.fit));
-            }
-            if ui.small_button("⚙").on_hover_text("settings (Ctrl+,)").clicked() {
-                self.settings_open = !self.settings_open;
-            }
-            if act.reset_view {
-                self.transport.zoom = 1.0;
-                self.transport.rotation = 0;
-            }
-        });
-        }
-
-        if !Adaptive::detect(ctx).is_compact() && !self.chrome.hidden() {
-            egui::TopBottomPanel::bottom("hints").show(ctx, |ui| {
-                ui.set_opacity(chrome_alpha);
-                ui.horizontal_wrapped(|ui| {
-                    ui.small("drag ↔ scrub (higher = faster)");
-                    ui.separator();
-                    ui.small("left ↕ volume");
-                    ui.separator();
-                    ui.small("right ↕ speed");
-                    ui.separator();
-                    ui.small("right edge ↕ rotate");
-                    ui.separator();
-                    ui.small("pinch: 5% zoom, far = fit/fill");
-                    ui.separator();
-                    ui.small("tap: play/pause");
+            let screen = ctx.content_rect();
+            let fill = ctx.style().visuals.panel_fill.gamma_multiply(0.82);
+            let frame = egui::Frame::side_top_panel(&ctx.style()).fill(fill);
+            let bar = egui::Area::new(egui::Id::new("vidkit-transport"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    frame.show(ui, |ui| {
+                        let w = screen.width() - frame.total_margin().sum().x;
+                        ui.set_min_width(w);
+                        ui.set_max_width(w);
+                        ui.set_opacity(chrome_alpha);
+                        let adaptive = Adaptive::detect(ui.ctx());
+                        let act = bottom_bar(
+                            ui,
+                            &mut self.transport,
+                            self.view.fit,
+                            &self.colors,
+                            &self.skin,
+                            &adaptive,
+                        );
+                        if act.toggle_play {
+                            self.transport.playing = !self.transport.playing;
+                        }
+                        if let Some(to) = act.seek_to {
+                            self.seek_to(to);
+                        }
+                        if act.rotate {
+                            // Through settings, not straight onto the transport: two
+                            // places holding rotation means the popup shows one value and
+                            // the picture another.
+                            self.settings.rotation = (self.settings.rotation + 1).rem_euclid(4);
+                        }
+                        if act.cycle_fit {
+                            self.settings.fill = vidkit_egui::FillMode::from_fit(next_fit(self.view.fit));
+                        }
+                        ui.horizontal(|ui| {
+                            // Big enough for a thumb: on a phone the clipboard
+                            // is how a video arrives (share -> copy link).
+                            let h = if adaptive.is_compact() { 40.0 } else { 24.0 };
+                            if ui.add(egui::Button::new("Play clipboard").min_size(egui::vec2(0.0, h))).on_hover_text("play the link or file path on the clipboard").clicked() {
+                                self.play_clipboard();
+                            }
+                            if ui.add(egui::Button::new("Open…").min_size(egui::vec2(0.0, h))).on_hover_text("open a file (Ctrl+O)").clicked() {
+                                self.open_picker();
+                            }
+                            if ui.add(egui::Button::new("⚙").min_size(egui::vec2(h, h))).on_hover_text("settings (Ctrl+,)").clicked() {
+                                self.settings_open = !self.settings_open;
+                            }
+                        });
+                        if act.reset_view {
+                            self.transport.zoom = 1.0;
+                            self.transport.rotation = 0;
+                        }
+                    });
                 });
-            });
+            self.chrome_overlay_h = bar.response.rect.height();
+            if !Adaptive::detect(ctx).is_compact() {
+                let hints = egui::Area::new(egui::Id::new("vidkit-hints"))
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(0.0, -self.chrome_overlay_h))
+                    .show(ctx, |ui| {
+                        frame.show(ui, |ui| {
+                            let w = screen.width() - frame.total_margin().sum().x;
+                            ui.set_min_width(w);
+                            ui.set_max_width(w);
+                            ui.set_opacity(chrome_alpha);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.small("drag ↔ scrub (higher = faster)");
+                                ui.separator();
+                                ui.small("left ↕ volume");
+                                ui.separator();
+                                ui.small("right ↕ speed");
+                                ui.separator();
+                                ui.small("right edge ↕ rotate");
+                                ui.separator();
+                                ui.small("pinch: 5% zoom, far = fit/fill");
+                                ui.separator();
+                                ui.small("tap: play/pause");
+                            });
+                        });
+                    });
+                self.chrome_overlay_h += hints.response.rect.height();
+            }
         }
 
         // What is playing, always visible.
@@ -690,9 +1043,13 @@ impl eframe::App for Player {
         self.follow_display(ctx);
         self.follow_visibility(ctx);
         self.follow_power();
+        self.follow_fps_cap();
+        self.follow_ai_frames();
         self.measure_refresh();
+        self.watch_pinned_drops();
 
         let mut want_analysis = false;
+        let (mut want_clipboard, mut want_open) = (false, false);
         egui::TopBottomPanel::top("what").show(ctx, |ui| match &self.opened {
             Some(Err(e)) => {
                 ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
@@ -703,11 +1060,12 @@ impl eframe::App for Player {
                     ui.separator();
                     // Said plainly rather than left to be inferred from a
                     // picture that does not match the file's dimensions.
-                    ui.small(if self.engine.is_some() {
-                        "decoding via ffmpeg"
-                    } else {
-                        "not decoding — showing the test pattern"
-                    });
+                    // The decoder actually in use (in process, V4L2, the
+                    // ffmpeg child...): "via ffmpeg" was true once.
+                    match &self.engine {
+                        Some(e) => ui.small(e.decoder()),
+                        None => ui.small("not decoding — showing the test pattern"),
+                    };
                     ui.separator();
                     if ui.selectable_label(self.sections_open, "Sections").clicked() {
                         self.sections_open = !self.sections_open;
@@ -729,11 +1087,28 @@ impl eframe::App for Player {
                 });
             }
             None => {
-                ui.small("test pattern — pass a .mp4 or .webm to open one");
+                ui.horizontal_wrapped(|ui| {
+                    ui.small("nothing open —");
+                    // The first thing a phone user needs: a copied link or a
+                    // file, without a keyboard for Ctrl+O or the palette.
+                    let h = if Adaptive::detect(ui.ctx()).is_compact() { 40.0 } else { 24.0 };
+                    if ui.add(egui::Button::new("▶ Play clipboard").min_size(egui::vec2(0.0, h))).clicked() {
+                        want_clipboard = true;
+                    }
+                    if ui.add(egui::Button::new("Open file…").min_size(egui::vec2(0.0, h))).clicked() {
+                        want_open = true;
+                    }
+                });
             }
         });
         if want_analysis {
             self.start_analysis();
+        }
+        if want_clipboard {
+            self.play_clipboard();
+        }
+        if want_open {
+            self.open_picker();
         }
 
         // After the top bar, so the panel sits beside the picture rather than
@@ -768,7 +1143,7 @@ impl eframe::App for Player {
             }
             if let Some(gpu) = self.gpu.clone() {
                 let surface = ui.available_rect_before_wrap();
-                let (w, h) = gpu.lock().map(|g| g.size()).unwrap_or((0, 0));
+                let (w, h) = if self.plane_on { self.plane_size } else { gpu.lock().map(|g| g.size()).unwrap_or((0, 0)) };
                 ui.painter()
                     .rect_filled(surface, 0.0, egui::Color32::from_rgb(28, 24, 38));
                 let r = vidkit_egui::fit_rect(
@@ -780,7 +1155,16 @@ impl eframe::App for Player {
                 if r.width() > 0.0 {
                     let ppp = ui.ctx().pixels_per_point();
                     self.apply_enhance(((r.width() * ppp) as u32, (r.height() * ppp) as u32));
-                    ui.painter().add(vidkit_egui::glow_present::callback(r, gpu));
+                    if std::env::var_os("VIDKIT_LAYOUT_DEBUG").is_some() && self.video_rect != Some(r) {
+                        eprintln!("LAYOUT video rect {r:?} (controls {})", if self.chrome.hidden() { "hidden" } else { "shown" });
+                    }
+                    self.video_rect = Some(r);
+                    if self.plane_on {
+                        // The video is on the subsurface below: see through.
+                        ui.painter().add(vidkit_egui::glow_present::hole_callback(r));
+                    } else {
+                        ui.painter().add(vidkit_egui::glow_present::callback(r, gpu));
+                    }
                 }
                 return;
             }
@@ -797,7 +1181,10 @@ impl eframe::App for Player {
             }
         });
 
-        self.subtitle_overlay(ctx, central.response.rect);
+        // Above the controls while they show (they overlay the picture now).
+        let mut sub_area = central.response.rect;
+        sub_area.max.y -= self.chrome_overlay_h;
+        self.subtitle_overlay(ctx, sub_area);
 
         // Overlays after the page, so they draw on top of it.
         self.palette_ui(ctx);
@@ -880,6 +1267,17 @@ impl Player {
             C::PlayClipboard => self.play_clipboard(),
             C::Subtitles => self.subtitles = !self.subtitles,
             C::ListenOnly => self.listen_only = !self.listen_only,
+            C::TranscribeQuick => self.transcribe_with(prefs::ModelTier::Quick),
+            C::TranscribeBetter => self.transcribe_with(prefs::ModelTier::Better),
+            C::TranscribeBest => self.transcribe_with(prefs::ModelTier::Best),
+            C::LangEnglish => self.set_language_mode(prefs::LanguageMode::English),
+            C::LangDetectOnce => self.set_language_mode(prefs::LanguageMode::DetectOnce),
+            C::LangEveryChunk => self.set_language_mode(prefs::LanguageMode::EveryChunk),
+            C::Help => {
+                // Stays open, showing worked examples instead of commands.
+                self.palette_help = true;
+                self.palette.open();
+            }
             C::SwFull | C::SwBalanced | C::SwSaver | C::SwMinimum | C::SwFollowPower => {
                 if let vidkit_egui::Action::SetSwBudget(b) = c.action() {
                     self.set_sw_budget(if b.is_nan() { None } else { Some(b) });
@@ -926,6 +1324,7 @@ impl Player {
         // Now an engine: video and audio on their own threads, the audio clock
         // as master. A failure is REPORTED -- `.ok()` here used to leave a file
         // that would not decode showing nothing and saying nothing.
+        self.drop_held();
         self.engine = match start_file(path.clone()) {
             Ok(e) => { self.transport.playing = true; Some(e) }
             Err(e) => { self.gpu_error = Some(format!("cannot play {}: {e}", path.display())); None }
@@ -982,20 +1381,60 @@ impl Player {
                 self.seen_hits = if sq.chars().count() >= min { idx.search(&sq, if seen_only { 20 } else { 5 }, 2) } else { Vec::new() };
                 self.seen_query = sq;
             }
-        } else if self.seen_index.is_some() {
+        } else if self.seen_index.is_some() || self.palette_help {
+            self.palette_help = false;
             self.seen_index = None;
             self.seen_query.clear();
             self.seen_hits.clear();
         }
-        let matches = if seen_only { Vec::new() } else { self.palette.matches() };
-        // "budget 30%" typed: a live row at the top that sets exactly that.
-        let typed_budget = if seen_only { None } else { palette::parse_budget(&query) };
+        let matches = if seen_only || self.palette_help { Vec::new() } else { self.palette.matches() };
+        // Typed commands get live rows at the top that say, in words, what
+        // Enter will do -- "watch goes down" is not a command name anyone
+        // could guess, so the palette spells out what it understood.
+        let typed = if seen_only || self.palette_help { None } else { palette::parse_typed(&query) };
         let mut rows: Vec<uikit_egui::command_bar::Row> = Vec::new();
-        if let Some(b) = typed_budget {
-            rows.push(uikit_egui::command_bar::Row::new(
-                format!("Software budget: {:.0}% of a frame", b * 100.0),
-                self.sw_budget_note(),
-            ));
+        let mut typed_actions: Vec<TypedPick> = Vec::new();
+        if self.palette_help {
+            for (ex, what) in palette::EXAMPLES {
+                rows.push(uikit_egui::command_bar::Row::new(ex, what));
+                typed_actions.push(TypedPick::Fill(ex.to_string()));
+            }
+        }
+        match &typed {
+            Some(palette::Typed::Budget(b)) => {
+                rows.push(uikit_egui::command_bar::Row::new(format!("Software budget: {:.0}% of a frame", b * 100.0), self.sw_budget_note()));
+                typed_actions.push(TypedPick::Budget(*b));
+            }
+            Some(palette::Typed::Watch(p)) | Some(palette::Typed::Find(p)) => {
+                let hits = vidkit_relevance::sections::search(&self.windows, p, 8);
+                let watch = matches!(typed, Some(palette::Typed::Watch(_)));
+                if watch {
+                    let n = hits.len();
+                    rows.push(uikit_egui::command_bar::Row::new(
+                        format!("\u{25b6} Play only the moments that mention \u{201c}{p}\u{201d}, back to back"),
+                        if n == 0 { "no matches yet".to_string() } else { format!("{n} moment{}", if n == 1 { "" } else { "s" }) },
+                    ));
+                    typed_actions.push(TypedPick::Watch(p.clone()));
+                } else {
+                    for h in hits.iter().take(6) {
+                        let snip: String = h.text.chars().take(60).collect();
+                        rows.push(uikit_egui::command_bar::Row::new(format!("\u{201c}{}\u{2026}\u{201d}", snip.trim()), vidkit_egui::format_time(h.at)));
+                        typed_actions.push(TypedPick::Seek(h.at));
+                    }
+                }
+                // Nothing found: offer the bigger model, when there is one and
+                // this transcript is whisper's (not the page's captions).
+                if hits.is_empty() && self.transcribe_args.is_some() {
+                    if let Some(bigger) = self.prefs.model.bigger() {
+                        rows.push(uikit_egui::command_bar::Row::new(
+                            format!("No match in the {} transcript \u{2014} transcribe again with {}", self.prefs.model.name(), bigger.name()),
+                            "slower; catches more words",
+                        ));
+                        typed_actions.push(TypedPick::Upgrade(bigger));
+                    }
+                }
+            }
+            None => {}
         }
         let head = rows.len();
         rows.extend(matches.iter().map(|c| {
@@ -1012,7 +1451,8 @@ impl Player {
                         false => mark.to_string(),
                     }
                 }
-                _ => c.shortcut().unwrap_or("").to_string(),
+                // The shortcut if there is one, else what it does in words.
+                _ => c.shortcut().map(str::to_string).unwrap_or_else(|| c.hint().to_string()),
             };
             uikit_egui::command_bar::Row::new(c.label(), detail)
         }));
@@ -1028,15 +1468,36 @@ impl Player {
             "vidkit-palette",
             &mut self.palette.bar,
             &rows,
-            "type a command, or ? to search what you watched",
+            "a command, or: watch goes down \u{b7} find goes down \u{b7} help",
             &self.colors,
             &adaptive,
             |_| {},
         );
         if let Some(i) = out.chosen {
-            if let (Some(b), 0) = (typed_budget, i) {
-                self.palette.close();
-                self.set_sw_budget(Some(b));
+            if let Some(pick) = typed_actions.get(i).cloned() {
+                match pick {
+                    TypedPick::Fill(q) => {
+                        // An example: into the box to edit, not run.
+                        self.palette_help = false;
+                        self.palette.bar.query = q;
+                    }
+                    TypedPick::Budget(b) => {
+                        self.palette.close();
+                        self.set_sw_budget(Some(b));
+                    }
+                    TypedPick::Watch(p) => {
+                        self.palette.close();
+                        self.section_action(vidkit_egui::SectionAction::WatchMatching(p));
+                    }
+                    TypedPick::Seek(t) => {
+                        self.palette.close();
+                        self.seek_to(t);
+                    }
+                    TypedPick::Upgrade(t) => {
+                        self.palette.close();
+                        self.transcribe_with(t);
+                    }
+                }
             } else if let Some(c) = matches.get(i - head).copied() {
                 self.palette.close();
                 self.run(c);
@@ -1215,7 +1676,8 @@ fn main() -> eframe::Result<()> {
 
     if first.as_deref() == Some("--gpu-selftest") {
         let opts = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([200.0, 140.0]),
+            // Room for the largest case (256x160 grain) at (20, 20).
+            viewport: egui::ViewportBuilder::default().with_inner_size([300.0, 200.0]),
             renderer: eframe::Renderer::Glow,
             ..Default::default()
         };
@@ -1239,7 +1701,18 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             // An app id, or Wayland shows the binary name and no icon.
             .with_app_id("vidkit-player")
-            .with_inner_size([960.0, 640.0]),
+            // VIDKIT_WINDOW=WxH: a phone-shaped window on a desktop (layout
+            // checks, screenshots).
+            .with_inner_size(
+                std::env::var("VIDKIT_WINDOW")
+                    .ok()
+                    .and_then(|v| v.split_once('x').and_then(|(w, h)| Some([w.parse::<f32>().ok()?, h.parse::<f32>().ok()?])))
+                    .unwrap_or([960.0, 640.0]),
+            )
+            // A video plane BELOW the window shows through a hole, which
+            // needs an alpha channel. Only when asked for: a transparent
+            // window costs the compositor blending where it did not.
+            .with_transparent(std::env::var("VIDKIT_SCANOUT").map(|v| v != "0").unwrap_or(false)),
         ..Default::default()
     };
     eframe::run_native(
@@ -1444,6 +1917,7 @@ impl Player {
             ),
             duration: resolved.duration,
         }));
+        self.drop_held();
         self.engine = Some(engine);
         // Transcribe from the audio URL (the video URL when muxed). No cache:
         // the signed URL expires and is no key for anything.
@@ -1452,7 +1926,7 @@ impl Player {
         let audio = transcribe::AudioIn { input: audio_url, headers: headers.clone() };
         // The page's own captions when it has them: YouTube's cost nothing,
         // whisper costs minutes of CPU per hour of lecture on a phone.
-        let factory = resolved.captions.clone().map(|c| transcribe::caption_factory(c, headers));
+        let factory = resolved.captions.clone().map(|c| transcribe::caption_factory(c, headers, self.prefs));
         self.transport.duration = resolved.duration;
         self.start_transcription(url.to_string(), resolved.title.clone(), None, audio, resolved.duration, factory);
         self.path = None;
@@ -1472,6 +1946,7 @@ impl Player {
     /// nothing, which is worse than a control that is visibly disabled.
     fn seek_to(&mut self, to: Duration) {
         self.transport.position = to;
+        self.ai.reset();
         if let Some(engine) = self.engine.as_mut() {
             if let Err(e) = engine.seek(to) {
                 // A failed seek leaves the decoder where it was rather than
@@ -1504,15 +1979,27 @@ fn file_opener(p: PathBuf) -> playback::Opener {
     let cache = std::sync::OnceLock::new();
     Box::new(move |from, speed| {
         let pr = probed(&cache, || decode::probe(&p))?;
-        let v = decode::FfmpegFrames::open_probed(
-            &decode::VideoInput::file(&p),
-            &pr,
-            Some(decode::decode_cap()),
-            from,
-            decode::accel_for(&pr.codec),
-        )?;
+        let accel = decode::accel_for(&pr.codec);
+        #[cfg(feature = "libav")]
+        let inproc = match v4l2src::open(&p.to_string_lossy(), &[], &pr, from) {
+            // A decoder that opens but gives nothing falls back to the
+            // other paths instead of ending the film.
+            Some(v) => {
+                let (p2, pr2, accel2) = (p.clone(), pr.clone(), accel.clone());
+                Some(Box::new(decode::FallbackSource::new(v, Box::new(move || {
+                    inproc::open(&p2, &pr2, from, &accel2).or_else(|| decode::FfmpegFrames::open_probed(&decode::VideoInput::file(&p2), &pr2, Some(decode::decode_cap()), from, accel2).ok().map(|f| Box::new(f) as Box<dyn decode::VideoSource>))
+                }))) as Box<dyn decode::VideoSource>)
+            }
+            None => inproc::open(&p, &pr, from, &accel),
+        };
+        #[cfg(not(feature = "libav"))]
+        let inproc: Option<Box<dyn decode::VideoSource>> = None;
+        let v: Box<dyn decode::VideoSource> = match inproc {
+            Some(v) => v,
+            None => Box::new(decode::FfmpegFrames::open_probed(&decode::VideoInput::file(&p), &pr, Some(decode::decode_cap()), from, accel)?),
+        };
         let a = decode::AudioStream::open(&p.to_string_lossy(), 48_000, 2, from, speed).ok();
-        Ok((v, a))
+        Ok((Box::new(decode::RateCapped::new(v)) as Box<dyn decode::VideoSource>, a))
     })
 }
 
@@ -1522,17 +2009,33 @@ fn stream_opener(input: decode::StreamingInput, _format_cap: Option<u32>) -> pla
     let cache = std::sync::OnceLock::new();
     Box::new(move |from, speed| {
         let pr = probed(&cache, || decode::probe_input(&input.video_url, &input.headers))?;
-        let v = decode::FfmpegFrames::open_probed(
-            &decode::VideoInput::url(&input.video_url, &input.headers),
-            &pr,
-            // The format was already chosen at the preset's height; this is
-            // the decode size, which follows the display like a file's.
-            Some(decode::decode_cap()),
-            from,
-            decode::accel_for(&pr.codec),
-        )?;
+        let accel = decode::accel_for(&pr.codec);
+        #[cfg(feature = "libav")]
+        let inproc = match v4l2src::open(&input.video_url, &input.headers, &pr, from) {
+            Some(v) => {
+                let (i2, pr2, accel2) = (input.clone(), pr.clone(), accel.clone());
+                Some(Box::new(decode::FallbackSource::new(v, Box::new(move || {
+                    inproc::open_input(&i2.video_url, &i2.headers, &pr2, from, &accel2).or_else(|| decode::FfmpegFrames::open_probed(&decode::VideoInput::url(&i2.video_url, &i2.headers), &pr2, Some(decode::decode_cap()), from, accel2).ok().map(|f| Box::new(f) as Box<dyn decode::VideoSource>))
+                }))) as Box<dyn decode::VideoSource>)
+            }
+            None => inproc::open_input(&input.video_url, &input.headers, &pr, from, &accel),
+        };
+        #[cfg(not(feature = "libav"))]
+        let inproc: Option<Box<dyn decode::VideoSource>> = None;
+        let v: Box<dyn decode::VideoSource> = match inproc {
+            Some(v) => v,
+            None => Box::new(decode::FfmpegFrames::open_probed(
+                &decode::VideoInput::url(&input.video_url, &input.headers),
+                &pr,
+                // The format was already chosen at the preset's height; this
+                // is the decode size, which follows the display like a file's.
+                Some(decode::decode_cap()),
+                from,
+                accel,
+            )?),
+        };
         let a = decode::AudioStream::open_streaming(&input, 48_000, 2, from, speed).ok();
-        Ok((v, a))
+        Ok((Box::new(decode::RateCapped::new(v)) as Box<dyn decode::VideoSource>, a))
     })
 }
 
@@ -1572,7 +2075,10 @@ impl Player {
         let cache = seen::dir()
             .and_then(|d| seen::record(&d, &url, title.as_deref(), key_file))
             .or_else(|| file.as_deref().and_then(transcribe::cache_path));
-        let factory = factory.unwrap_or_else(|| transcribe::source_factory(file));
+        // Remembered for "transcribe again with a bigger model" (not for page
+        // captions: those are the page's own transcript).
+        self.transcribe_args = factory.is_none().then(|| (file.clone(), audio.clone(), total, cache.clone()));
+        let factory = factory.unwrap_or_else(|| transcribe::source_factory(file, self.prefs));
         self.worker = Some(transcribe::Worker::start(factory, audio, total, cache));
         self.apply_transcribe_policy();
         self.reset_sections();
@@ -1639,6 +2145,7 @@ impl Player {
         let (status, progress, transcribed, total, mode) = match &self.worker {
             Some(w) => w.with(|s| {
                 let rtf = s.realtime_factor.map(|r| format!(" · {r:.2}× realtime")).unwrap_or_default();
+                let rtf = if s.skipped_silent > 0 { format!("{rtf} · {} silent skipped", s.skipped_silent) } else { rtf };
                 (format!("{}{rtf}", s.status), s.coverage.progress(), s.coverage.spans(), s.coverage.total(), s.coverage.mode)
             }),
             None => ("nothing open".into(), None, Vec::new(), None, vidkit_transcribe::coverage::Mode::Paused),
@@ -1736,6 +2243,7 @@ impl Player {
                 });
             }
             A::SetScope(scope) => {
+                self.scope_user = true;
                 if let Some(w) = &self.worker {
                     w.set_mode(match scope {
                         vidkit_egui::Scope::Paused => vidkit_transcribe::coverage::Mode::Paused,
@@ -1819,6 +2327,7 @@ impl Player {
                 let opened = open_local(&path);
                 self.transport.duration = opened.as_ref().ok().and_then(|o| o.duration);
                 self.opened = Some(opened);
+                self.drop_held();
                 self.engine = Some(e);
                 // Held (a lock eviction respects) so the file outlives the
                 // decoder reading it.
@@ -1890,11 +2399,14 @@ impl Player {
     /// it off a side hides it behind a tab while the sound carries on.
     fn pip_ui(&mut self, ctx: &egui::Context, screen: egui::Rect) {
         let size = match &self.gpu {
+            Some(_) if self.plane_on => egui::Vec2::new(self.plane_size.0 as f32, self.plane_size.1 as f32),
             Some(g) => g.lock().map(|g| g.size()).map(|(w, h)| egui::Vec2::new(w as f32, h as f32)).unwrap_or_default(),
             None => self.presenter.frame_size(),
         };
         let aspect = if size.y > 0.0 { size.x / size.y } else { 16.0 / 9.0 };
         let (gpu, fit) = (self.gpu.clone(), self.view.fit);
+        let plane_on = self.plane_on;
+        let video_rect = &mut self.video_rect;
         let tex = self.presenter.texture().map(|t| t.id());
         if std::env::var_os("VIDKIT_PIP_DEBUG").is_some() {
             // Read the pointer, THEN ask the context: calling ctx inside
@@ -1908,7 +2420,12 @@ impl Player {
             let v = vidkit_egui::fit_rect(r, size, vidkit_egui::PixelAspect::SQUARE, fit);
             match (&gpu, tex) {
                 (Some(g), _) if v.width() > 0.0 => {
-                    ui.painter().add(vidkit_egui::glow_present::callback(v, g.clone()));
+                    if plane_on {
+                        ui.painter().add(vidkit_egui::glow_present::hole_callback(v));
+                    } else {
+                        ui.painter().add(vidkit_egui::glow_present::callback(v, g.clone()));
+                    }
+                    *video_rect = Some(v);
                 }
                 (None, Some(id)) => {
                     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
@@ -2077,7 +2594,13 @@ impl Player {
         }
         if self.frame_dts.len() >= 120 {
             let v: Vec<f64> = self.frame_dts.drain(..).collect();
-            if let Some(hz) = playback::estimate_refresh(&v) {
+            // Presentation feedback, when there is any, is the display's own
+            // word. The repaint intervals stopped being the refresh when the
+            // player stopped repainting between frames: they are now the
+            // CONTENT's interval (24 fps read as "24 Hz"). Without feedback
+            // (X11) that is still what is used -- a known inaccuracy.
+            let fed = self.present_log.refresh_ns().filter(|_| self.present_log.variable() != Some(true)).map(|r| (1e9 / r as f64).round() as u32);
+            if let Some(hz) = fed.or_else(|| playback::estimate_refresh(&v)) {
                 if hz != playback::refresh_hz() {
                     playback::set_refresh_hz(hz);
                     if let Some(e) = self.engine.as_mut() {
@@ -2110,6 +2633,40 @@ fn stats_note(kind: &'static str) {
 
 /// `VIDKIT_STATS=1`: repaints per second to stderr, once a second. For
 /// measuring what the UI costs in each state; off, it is one relaxed load.
+/// Presentation feedback on the window's own wl_surface, when on Wayland.
+/// Says "video" to compositors that take a content-type hint (KWin,
+/// wlroots). Commit timing is opt-in (VIDKIT_COMMIT_TIMING=1): a surface
+/// takes one timer and a second is a fatal protocol error -- see
+/// vidkit-wayland's surface module.
+fn wayland_link(cc: &eframe::CreationContext<'_>) -> Option<vidkit_wayland::surface::SurfaceLink> {
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+    if std::env::var("VIDKIT_WAYLAND_FEEDBACK").as_deref() == Ok("0") {
+        return None;
+    }
+    let (RawDisplayHandle::Wayland(d), RawWindowHandle::Wayland(w)) = (cc.display_handle().ok()?.as_raw(), cc.window_handle().ok()?.as_raw()) else {
+        return None;
+    };
+    // SAFETY: winit's live display and surface; the link lives in the
+    // Player, which eframe drops before the window.
+    let mut link = match unsafe { vidkit_wayland::surface::SurfaceLink::from_raw(d.display.as_ptr(), w.surface.as_ptr()) } {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("vidkit: no presentation feedback: {e}");
+            return None;
+        }
+    };
+    let caps = link.caps();
+    link.set_content(vidkit_wayland::surface::Content::Video);
+    let timing = std::env::var("VIDKIT_COMMIT_TIMING").as_deref() == Ok("1") && link.enable_commit_timing();
+    eprintln!(
+        "vidkit: wayland presentation {} · content-type {} · commit timing {}",
+        if caps.presentation { "yes" } else { "no" },
+        if caps.content_type { "video" } else { "unsupported" },
+        if timing { "on" } else if caps.commit_timing { "available (VIDKIT_COMMIT_TIMING=1)" } else { "unsupported" },
+    );
+    Some(link)
+}
+
 fn stats_tick(ctx: &egui::Context) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2165,6 +2722,50 @@ impl Player {
 
 impl Player {
     /// Re-read the power supply every 30 s and apply what changed.
+    /// The frame-rate cap: the viewer's (Settings > fps) under the battery
+    /// policy's. A change reopens the decoder at the current position,
+    /// since whether it skips non-reference frames is fixed at open.
+    fn follow_fps_cap(&mut self) {
+        // VIDKIT_FPS_CAP=N overrides the setting (profiling runs).
+        let setting = std::env::var("VIDKIT_FPS_CAP").ok().and_then(|v| v.parse().ok()).or(self.settings.fps_cap.hz());
+        let cap = match (setting, self.energy.max_fps) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if cap == decode::fps_cap() {
+            return;
+        }
+        decode::set_fps_cap(cap);
+        if self.engine.is_some() {
+            let at = self.transport.position;
+            self.seek_to(at);
+        }
+    }
+
+    /// AI in-between frames (Settings, or VIDKIT_AI_FRAMES=1/0): on only
+    /// with the GPU presenter. A change reopens the decoder at the current
+    /// position, since the non-reference skip is fixed at open.
+    fn follow_ai_frames(&mut self) {
+        let want = match std::env::var("VIDKIT_AI_FRAMES").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => self.settings.ai_frames,
+        } && self.gpu.is_some()
+            && !self.ai.too_slow;
+        if want == decode::ai_frames() {
+            return;
+        }
+        if self.ai.too_slow {
+            self.gpu_error = Some(format!("AI in-between frames off: {:.0} ms each on this GPU, over half a frame -- decoding every frame again", self.ai.cost.as_secs_f64() * 1e3));
+        }
+        decode::set_ai_frames(want);
+        self.ai.reset();
+        if self.engine.is_some() {
+            let at = self.transport.position;
+            self.seek_to(at);
+        }
+    }
+
     fn follow_power(&mut self) {
         if self.energy_read.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
             return;
@@ -2178,6 +2779,7 @@ impl Player {
         let enhance_changed = p.enhance != self.energy.enhance;
         self.energy = p;
         self.presenter.damage_budget = self.effective_sw_budget();
+        self.apply_core_policy(true);
         self.apply_transcribe_policy();
         if enhance_changed {
             // Recompute the plan at the next paint under the new allowance.
@@ -2189,6 +2791,9 @@ impl Player {
     /// On battery, whisper works only ahead of the playhead, or not at all.
     fn apply_transcribe_policy(&mut self) {
         use vidkit_transcribe::coverage::Mode;
+        if self.scope_user {
+            return;
+        }
         if let Some(w) = &self.worker {
             let mode = match self.energy.transcribe_ahead {
                 None => Mode::All,
@@ -2227,8 +2832,27 @@ impl Player {
             None => self.presenter.uploaded_bytes(),
         };
         p.acc.decoder = decoder;
+        let fps = self.engine.as_ref().map(|e| 1.0 / e.frame_interval().as_secs_f64().max(1e-3));
+        p.acc.display = if self.wl.is_some() { format!("{} · comp {:.1} ms", self.present_log.summary(fps), self.latency.comp_ns() as f64 / 1e6) } else { String::new() };
         p.acc.presenter = match &self.gpu {
-            Some(_) => "gpu".into(),
+            Some(_) if self.plane_on => "plane".into(),
+            Some(_) => format!(
+                "gpu{}{}{}",
+                if self.held.is_some() { "+zerocopy" } else { "" },
+                if self.last_grain { "+grain" } else { "" },
+                if decode::ai_frames() || self.ai.too_slow {
+                    format!(
+                        "+ai({} synth {:.1}ms, {} refused{}{})",
+                        self.ai.shown,
+                        self.ai.cost.as_secs_f64() * 1e3,
+                        self.ai.refused,
+                        self.ai.last_refusal.as_deref().map(|r| format!(": {r}")).unwrap_or_default(),
+                        if self.ai.too_slow { ", OFF: too slow" } else { "" }
+                    )
+                } else {
+                    String::new()
+                }
+            ),
             None if self.presenter.damage_rendering() => format!("cpu-damage@{:.2}", self.presenter.damage_budget),
             None => "cpu-whole".into(),
         };
@@ -2237,6 +2861,9 @@ impl Player {
         // waste this is measuring.
         let pw = self.power_state;
         p.acc.power = if pw.on_battery { format!("battery{}", pw.percent.map(|x| format!("@{x}")).unwrap_or_default()) } else { "mains".into() };
+        if let Some(c) = decode::decode_cpus() {
+            p.acc.power.push_str(&format!("+ecores{}", c.len()));
+        }
         p.frame(shown, dropped, uploaded);
     }
 }
@@ -2264,5 +2891,94 @@ impl Player {
     fn sw_budget_note(&self) -> String {
         let now = format!("now {:.0}%", self.effective_sw_budget() * 100.0);
         if self.gpu.is_some() { format!("{now} · GPU presenter: no effect") } else { now }
+    }
+}
+
+impl Player {
+    /// Re-transcribe the current video with `tier`, keeping what is there
+    /// for search meanwhile; each chunk is replaced as the new model reaches
+    /// it. Saved as the preference, so the next video starts with it too.
+    fn transcribe_with(&mut self, tier: prefs::ModelTier) {
+        self.prefs.model = tier;
+        self.prefs.save();
+        let Some((file, audio, total, cache)) = self.transcribe_args.clone() else {
+            self.gpu_error = Some(format!("transcription model set to {}; this video's transcript came from the page", tier.name()));
+            return;
+        };
+        let factory = transcribe::source_factory(file, self.prefs);
+        self.worker = Some(transcribe::Worker::start_with(factory, audio, total, cache, true));
+        self.apply_transcribe_policy();
+        self.seen_version = 0;
+        self.gpu_error = Some(format!("transcribing again with the {} model; the current transcript stays searchable meanwhile", tier.name()));
+    }
+
+    fn set_language_mode(&mut self, mode: prefs::LanguageMode) {
+        self.prefs.language = mode;
+        self.prefs.save();
+        let tier = self.prefs.model;
+        self.transcribe_with(tier);
+    }
+}
+
+/// What choosing a typed row does.
+#[derive(Clone, Debug)]
+enum TypedPick {
+    Fill(String),
+    Budget(f32),
+    Watch(String),
+    Seek(Duration),
+    Upgrade(prefs::ModelTier),
+}
+
+impl Player {
+    /// Software decode on the efficiency cores when the policy (or
+    /// VIDKIT_DECODE_CORES=efficiency|all) says so and the machine has them.
+    /// `restart`: reopen the decoder now rather than at the next open.
+    fn apply_core_policy(&mut self, restart: bool) {
+        let want = match std::env::var("VIDKIT_DECODE_CORES").as_deref() {
+            Ok("efficiency") => true,
+            Ok("all") => false,
+            _ => self.energy.efficiency_cores,
+        } && !self.cores_gave_up;
+        let cpus = if want { decode::efficiency_cpus(&decode::cpu_capacities()) } else { Vec::new() };
+        let next = (!cpus.is_empty()).then_some(cpus);
+        if next != decode::decode_cpus() {
+            decode::set_decode_cpus(next);
+            self.core_check = None;
+            if restart && self.engine.is_some() {
+                let at = self.transport.position;
+                self.seek_to(at);
+            }
+        }
+    }
+
+    /// Pinned and dropping frames: the little cores cannot keep up with this
+    /// stream. Unpin (for the session), reopen, and say so.
+    fn watch_pinned_drops(&mut self) {
+        let (Some(cpus), Some(e)) = (decode::decode_cpus(), self.engine.as_ref()) else {
+            self.core_check = None;
+            return;
+        };
+        let now = Instant::now();
+        let (shown, dropped) = (e.shown, e.dropped);
+        match self.core_check {
+            None => self.core_check = Some((now, shown, dropped)),
+            Some((t, s0, d0)) if now.duration_since(t) >= Duration::from_secs(5) => {
+                let (ds, dd) = (shown.saturating_sub(s0), dropped.saturating_sub(d0));
+                self.core_check = Some((now, shown, dropped));
+                if ds + dd >= 30 && dd * 20 > ds + dd {
+                    self.cores_gave_up = true;
+                    decode::set_decode_cpus(None);
+                    let at = self.transport.position;
+                    self.seek_to(at);
+                    self.gpu_error = Some(format!(
+                        "decode moved off the {} efficiency cores: {dd} of {} frames dropped there",
+                        cpus.len(),
+                        ds + dd
+                    ));
+                }
+            }
+            _ => {}
+        }
     }
 }

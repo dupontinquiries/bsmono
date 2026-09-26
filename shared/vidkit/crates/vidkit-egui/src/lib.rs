@@ -37,6 +37,10 @@ pub mod voice;
 /// traffic than the RGBA8 upload in [`presenter`]. Needs a glow context.
 #[cfg(feature = "glow-upload")]
 pub mod glow_present;
+#[cfg(feature = "glow-upload")]
+pub mod dmabuf_gl;
+#[cfg(feature = "glow-upload")]
+pub mod aiframes_gl;
 pub mod gestures;
 pub mod presenter;
 pub mod pip;

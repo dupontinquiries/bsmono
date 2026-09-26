@@ -175,6 +175,50 @@ impl Chrome {
     }
 }
 
+/// Whether pointer motion is the viewer meaning it, or a bump.
+///
+/// A mouse on a couch cushion or a trackpad brushed by a sleeve moves a few
+/// pixels, and every one of those used to bring the controls back over the
+/// film. Motion counts only when the pointer travels more than `px` within
+/// `window` -- a deliberate move covers that in a blink; jitter never does,
+/// and slow drift over minutes never does either (a plain anchor would
+/// accumulate drift until it woke anyway). Buttons, scrolling and keys
+/// always count. `px = 0` restores "any motion".
+#[derive(Clone, Debug)]
+pub struct PointerDeadzone {
+    pub px: f32,
+    pub window: Duration,
+    recent: std::collections::VecDeque<(Instant, [f32; 2])>,
+}
+
+impl PointerDeadzone {
+    pub fn new(px: f32) -> Self {
+        Self { px, window: Duration::from_millis(300), recent: Default::default() }
+    }
+
+    /// One frame's pointer position; `true` when it is a deliberate move.
+    pub fn moved(&mut self, now: Instant, pos: Option<[f32; 2]>) -> bool {
+        let Some(p) = pos else {
+            self.recent.clear();
+            return false;
+        };
+        while self.recent.front().is_some_and(|(t, _)| now.duration_since(*t) > self.window) {
+            self.recent.pop_front();
+        }
+        let moved = if self.px <= 0.0 {
+            // Any motion since the last frame.
+            self.recent.back().is_some_and(|(_, q)| *q != p)
+        } else {
+            self.recent.iter().any(|(_, q)| {
+                let (dx, dy) = (p[0] - q[0], p[1] - q[1]);
+                (dx * dx + dy * dy).sqrt() > self.px
+            })
+        };
+        self.recent.push_back((now, p));
+        moved
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +391,34 @@ mod tests {
         playing(&mut c, 3000);
         playing(&mut c, 3100);
         assert!(c.next_repaint().is_some(), "a fade needs repaints to animate");
+    }
+
+    #[test]
+    fn jitter_and_drift_do_not_wake_but_a_move_does() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut d = PointerDeadzone::new(6.0);
+        // A couch bump: +-3 px at 60 Hz for a second.
+        for k in 0..60u64 {
+            let j = if k % 2 == 0 { 3.0 } else { -3.0 };
+            assert!(!d.moved(ms(k * 16), Some([100.0 + j, 100.0])), "jitter woke at {k}");
+        }
+        // Slow drift: 40 px over 10 s (2 px per 500 ms).
+        let mut d = PointerDeadzone::new(6.0);
+        for k in 0..20u64 {
+            assert!(!d.moved(ms(k * 500), Some([100.0 + 2.0 * k as f32, 100.0])), "drift woke at {k}");
+        }
+        // A deliberate flick: 30 px in 100 ms.
+        let mut d = PointerDeadzone::new(6.0);
+        let mut woke = false;
+        for k in 0..6u64 {
+            woke |= d.moved(ms(k * 16), Some([100.0 + 6.0 * k as f32, 100.0]));
+        }
+        assert!(woke);
+        // Zero: any motion, as before.
+        let mut d = PointerDeadzone::new(0.0);
+        assert!(!d.moved(ms(0), Some([1.0, 1.0])));
+        assert!(d.moved(ms(16), Some([2.0, 1.0])));
+        assert!(!d.moved(ms(32), Some([2.0, 1.0])), "no motion, no wake");
     }
 }

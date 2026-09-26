@@ -66,6 +66,9 @@ pub struct Device {
     /// guessed stride to the Vulkan importer produces a diagonally smeared
     /// image, which is a memorable way to learn this.
     capture_strides: Vec<u32>,
+    /// The ALLOCATED height from G_FMT (Venus pads luma to 32 lines);
+    /// `format` carries the visible size from G_SELECTION.
+    alloc_height: u32,
     format: Option<CaptureFormat>,
     /// Sequence counter used as the buffer timestamp, because `struct timeval`
     /// is what V4L2 offers and we want monotonic PTS passthrough.
@@ -124,6 +127,7 @@ impl Device {
             capture_buffers: Vec::new(),
             capture_planes: 0,
             capture_strides: Vec::new(),
+            alloc_height: 0,
             format: None,
             modifier: 0,
         };
@@ -154,6 +158,15 @@ impl Device {
     /// vendor-specific tiled format such as `V4L2_PIX_FMT_QC08C`, which maps to
     /// a Qualcomm compressed modifier. Defaulting to linear is safe only for
     /// the former — see the warning in `vidkit-vk`.
+    /// Sleep until the device has something (a decoded frame, a free input
+    /// buffer, an event) or `timeout_ms` passes. The fd is non-blocking, so
+    /// without this a caller can only spin.
+    pub fn wait(&self, timeout_ms: i32) {
+        let mut p = libc::pollfd { fd: self.fd.as_raw_fd(), events: libc::POLLIN | libc::POLLOUT | libc::POLLPRI, revents: 0 };
+        // SAFETY: one pollfd on the stack.
+        unsafe { libc::poll(&mut p, 1, timeout_ms) };
+    }
+
     pub fn set_modifier(&mut self, modifier: u64) {
         self.modifier = modifier;
     }
@@ -270,6 +283,22 @@ impl Device {
     }
 }
 
+/// The visible size from a COMPOSE rectangle, if it is a sane crop of the
+/// allocation (at the origin, inside it); else the allocation. Pure.
+pub fn visible_size(alloc: (u32, u32), r: (i32, i32, u32, u32)) -> (u32, u32) {
+    let (l, t, w, h) = r;
+    if l == 0 && t == 0 && w > 0 && h > 0 && w <= alloc.0 && h <= alloc.1 {
+        (w, h)
+    } else {
+        alloc
+    }
+}
+
+/// (luma offset, chroma offset) of single-planar NV12 in one buffer. Pure.
+pub fn nv12_planes(offset: u32, stride: u32, alloc_height: u32) -> (u32, u32) {
+    (offset, offset + stride * alloc_height)
+}
+
 impl V4l2Api for Device {
     fn set_output_format(&mut self, fourcc: u32, width: u32, height: u32) -> ApiResult<()> {
         let mut fmt = v4l2_format::new_mplane(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
@@ -368,6 +397,16 @@ impl V4l2Api for Device {
             let bpl = unsafe { fmt.fmt.pix_mp.plane_fmt[i].bytesperline };
             self.capture_strides.push(bpl);
         }
+        self.alloc_height = height;
+        // The visible picture: a decoder pads the buffer (Venus: luma to 32
+        // lines, 1080 -> 1088) and says what is real through COMPOSE. Not
+        // every driver implements it; then the format is the picture.
+        let mut sel = v4l2_selection { type_: V4L2_BUF_TYPE_VIDEO_CAPTURE, target: V4L2_SEL_TGT_COMPOSE, ..Default::default() };
+        // SAFETY: correct struct for VIDIOC_G_SELECTION.
+        let (width, height) = match unsafe { xioctl(self.fd.as_raw_fd(), VIDIOC_G_SELECTION, &mut sel, "G_SELECTION") } {
+            Ok(()) => visible_size((width, height), (sel.r.left, sel.r.top, sel.r.width, sel.r.height)),
+            Err(_) => (width, height),
+        };
         let f = CaptureFormat {
             width,
             height,
@@ -506,7 +545,7 @@ impl V4l2Api for Device {
             .get(buf.index as usize)
             .ok_or(ApiError::Unsupported("dequeued an unknown capture index"))?;
 
-        let mut dma_planes = Vec::with_capacity(exported.fds.len());
+        let mut dma_planes = Vec::with_capacity(exported.fds.len().max(2));
         for (i, fd) in exported.fds.iter().enumerate() {
             // dup because the Frame owns its fds and may outlive the pool entry
             // if the caller holds it across a reconfiguration. The original
@@ -522,12 +561,22 @@ impl V4l2Api for Device {
         }
 
         let fourcc = self.format.map(|f| f.fourcc).unwrap_or(0);
+        // Single-planar NV12: chroma follows luma in the same buffer at the
+        // ALLOCATED height, which the importer cannot know from the visible
+        // size it is given -- so both planes are listed explicitly.
+        if dma_planes.len() == 1 && fourcc == crate::api::pixfmt::NV12 {
+            let (y, uv) = nv12_planes(dma_planes[0].offset, dma_planes[0].stride, self.alloc_height);
+            let fd = dma_planes[0].fd.try_clone().map_err(|e| ApiError::Ioctl("dup", e.raw_os_error().unwrap_or(0)))?;
+            dma_planes[0].offset = y;
+            dma_planes.push(DmaBufPlane { fd, offset: uv, stride: dma_planes[0].stride });
+        }
         Ok(Some(DequeuedCapture {
             index: buf.index,
             data: FrameData::DmaBuf(DmaBufImage {
                 planes: dma_planes,
                 modifier: self.modifier,
                 fourcc,
+                owner: None,
             }),
             pts: Duration::new(
                 buf.timestamp.tv_sec.max(0) as u64,
@@ -599,3 +648,19 @@ impl V4l2Api for Device {
 // `&mut self`, so there is no shared access to the raw pointers. It is not
 // `Sync` and must not be made so.
 unsafe impl Send for Device {}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::*;
+
+    /// Venus-shaped 1080p: 1920x1088 allocated, 1920x1080 composed; the
+    /// chroma is after 1088 rows, the picture is 1080.
+    #[test]
+    fn padded_nv12_is_cropped_and_its_chroma_found() {
+        assert_eq!(visible_size((1920, 1088), (0, 0, 1920, 1080)), (1920, 1080));
+        assert_eq!(nv12_planes(0, 1920, 1088), (0, 1920 * 1088));
+        assert_eq!(visible_size((1920, 1088), (8, 0, 1920, 1080)), (1920, 1088), "an offset crop is not a crop we can express");
+        assert_eq!(visible_size((1920, 1088), (0, 0, 4096, 1080)), (1920, 1088));
+        assert_eq!(visible_size((1920, 1088), (0, 0, 0, 0)), (1920, 1088));
+    }
+}

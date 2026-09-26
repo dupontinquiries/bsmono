@@ -84,6 +84,7 @@ fn nv12_bars(phase: f32) -> Frame {
         pts: Duration::ZERO,
         duration: Some(Duration::from_millis(33)),
         recycle: None,
+        grain: None,
     }
 }
 

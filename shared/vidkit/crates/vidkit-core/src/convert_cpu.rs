@@ -299,6 +299,149 @@ fn sample_bilinear(
     top * (1.0 - fy) + bot * fy
 }
 
+thread_local! {
+    /// Tests set this to run the per-pixel reference loop as the oracle.
+    static REFERENCE_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the per-pixel reference converter forced. For parity tests.
+pub fn with_reference_converter<T>(f: impl FnOnce() -> T) -> T {
+    REFERENCE_ONLY.with(|r| r.set(true));
+    let out = f();
+    REFERENCE_ONLY.with(|r| r.set(false));
+    out
+}
+
+/// Bilinear sample positions along one axis, for every output coordinate:
+/// `(i0, i1, f)` computed with EXACTLY `sample_bilinear`'s expressions, so a
+/// sample built from them is bit-identical to the reference.
+fn axis(n_out: usize, n_tex: usize) -> Vec<(usize, usize, f32)> {
+    (0..n_out)
+        .map(|p| {
+            let u = (p as f32 + 0.5) / n_out as f32;
+            let x = u * n_tex as f32 - 0.5;
+            let x0 = x.floor();
+            let f = x - x0;
+            let clampi = |i: f32, n: usize| -> usize { (i.max(0.0) as usize).min(n.saturating_sub(1)) };
+            (clampi(x0, n_tex), clampi(x0 + 1.0, n_tex), f)
+        })
+        .collect()
+}
+
+/// NV12 / P010 conversion, row-streaming. The same arithmetic as the
+/// per-pixel reference, in the same order, so the bytes are identical; what
+/// goes is the per-pixel coordinate maths (three floor/clamp bilinear
+/// setups a pixel), done once per column and once per row instead.
+///
+/// Measured before (release, x86_64): ~52 ns a pixel -- 18.9 ms a 640x360
+/// frame, 679 ms a 4K one -- against 0.3 ns a pixel for the damage tree's
+/// hashing. The converter, not the temporal tracking, was the cost.
+#[allow(clippy::too_many_arguments)]
+fn fast_interleaved(
+    planes: &CpuPlanes,
+    fmt: SampleFormat,
+    color: ColorInfo,
+    coeffs: [[f32; 3]; 3],
+    width: usize,
+    height: usize,
+    cw: usize,
+    ch: usize,
+    y_stride: usize,
+    c_stride: usize,
+    out: &mut [u8],
+) {
+    let bps = fmt.bytes();
+    // 8-bit samples through a 256-entry table holding exactly v / 255.0:
+    // bit-identical to the division, 1 KB, resident in L1 for the whole
+    // frame, and no divide on the hot path (twelve reads a pixel).
+    let lut: [f32; 256] = std::array::from_fn(|v| v as f32 / 255.0);
+    let read = |data: &[u8], ix: usize| -> f32 {
+        match fmt {
+            SampleFormat::U8 => lut[data.get(ix).copied().unwrap_or(0) as usize],
+            _ => fmt.read(data, ix),
+        }
+    };
+    let (lx, ly) = (axis(width, width), axis(height, height));
+    let (cx, cy) = (axis(width, cw), axis(height, ch));
+    let (luma, chroma) = (&planes.data[0][..], &planes.data[1][..]);
+    let (black, ys, mid, cs) = fmt.limited();
+    let centre = fmt.centre();
+    let hdr = color.transfer != Transfer::Sdr;
+    let bt2020 = color.matrix == Matrix::Bt2020Ncl;
+    // The HORIZONTAL half of each chroma sample -- `c(x0)*(1-fx) + c(x1)*fx`
+    // on one chroma row -- depends only on that row and the output column,
+    // and consecutive output rows share chroma rows. So each chroma row is
+    // blended horizontally ONCE, in one sequential pass, into a cached row
+    // of (cb, cr) pairs, and the output rows that use it read it back
+    // sequentially. Same floats, same order as the reference: bit-identical.
+    let hrow = |r: usize, buf: &mut Vec<f32>| {
+        buf.clear();
+        let base = r * c_stride;
+        for &(cx0, cx1, cfx) in cx.iter() {
+            for comp in 0..2 {
+                let a = read(chroma, base + (cx0 * 2 + comp) * bps);
+                let b = read(chroma, base + (cx1 * 2 + comp) * bps);
+                buf.push(a * (1.0 - cfx) + b * cfx);
+            }
+        }
+    };
+    // Two slots: the chroma rows the current output row blends between.
+    let mut cache: [(usize, Vec<f32>); 2] = [(usize::MAX, Vec::with_capacity(width * 2)), (usize::MAX, Vec::with_capacity(width * 2))];
+    let _ = ch;
+    for py in 0..height {
+        let (ly0, ly1, lfy) = ly[py];
+        let (cy0, cy1, cfy) = cy[py];
+        let (lr0, lr1) = (ly0 * y_stride, ly1 * y_stride);
+        // Fill the slots for rows cy0 and cy1, reusing whichever is cached.
+        for want in [cy0, cy1] {
+            if cache[0].0 != want && cache[1].0 != want {
+                // Evict the slot NOT holding the other row we need.
+                let keep = if want == cy0 { cy1 } else { cy0 };
+                let slot = if cache[0].0 == keep { 1 } else { 0 };
+                hrow(want, &mut cache[slot].1);
+                cache[slot].0 = want;
+            }
+        }
+        let h0 = if cache[0].0 == cy0 { &cache[0].1 } else { &cache[1].1 };
+        let h1 = if cache[0].0 == cy1 { &cache[0].1 } else { &cache[1].1 };
+        let row = &mut out[py * width * 4..(py + 1) * width * 4];
+        for (px, o) in row.chunks_exact_mut(4).enumerate() {
+            let (lx0, lx1, lfx) = lx[px];
+            let at = |base: usize, xi: usize| read(luma, base + xi * bps);
+            // Where both weights are EXACTLY zero -- 1:1 output, which is
+            // what the player asks for -- the bilinear blend is a*1 + b*0 = a
+            // in IEEE arithmetic, so reading one texel is bit-identical.
+            let y_raw = if lfx == 0.0 && lfy == 0.0 {
+                at(lr0, lx0)
+            } else {
+                let top = at(lr0, lx0) * (1.0 - lfx) + at(lr0, lx1) * lfx;
+                let bot = at(lr1, lx0) * (1.0 - lfx) + at(lr1, lx1) * lfx;
+                top * (1.0 - lfy) + bot * lfy
+            };
+
+            let samp = |comp: usize| h0[px * 2 + comp] * (1.0 - cfy) + h1[px * 2 + comp] * cfy;
+            let (cb_raw, cr_raw) = (samp(0), samp(1));
+
+            let (yv, cb, cr) = match color.range {
+                Range::Limited => ((y_raw - black) * ys, (cb_raw - mid) * cs, (cr_raw - mid) * cs),
+                Range::Full => (y_raw, cb_raw - centre, cr_raw - centre),
+            };
+            let mut rgb = [
+                coeffs[0][0] * yv + coeffs[0][1] * cb + coeffs[0][2] * cr,
+                coeffs[1][0] * yv + coeffs[1][1] * cb + coeffs[1][2] * cr,
+                coeffs[2][0] * yv + coeffs[2][1] * cb + coeffs[2][2] * cr,
+            ];
+            if hdr {
+                rgb = hdr_to_sdr(rgb, color.transfer, bt2020);
+            }
+            for k in 0..3 {
+                o[k] = (rgb[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            }
+            o[3] = 255;
+        }
+    }
+}
+
 /// Chroma plane dimensions for a layout at a given luma size.
 fn chroma_dims(layout: PlaneLayout, w: usize, h: usize) -> (usize, usize) {
     match layout {
@@ -438,6 +581,11 @@ pub fn planes_to_rgba8_into(
 
     out.clear();
     out.resize(width * height * 4, 0);
+
+    if interleaved_chroma && !REFERENCE_ONLY.with(|r| r.get()) {
+        fast_interleaved(planes, fmt, color, coeffs, width, height, cw, ch, y_stride, c0_stride, out);
+        return Ok(());
+    }
 
     for py in 0..height {
         for px in 0..width {
@@ -874,5 +1022,74 @@ mod tests {
         }
         assert!((bt2390(1000.0, 1000.0, 203.0) - 203.0).abs() < 1.0, "peak onto peak");
         assert_eq!(bt2390(150.0, 180.0, 203.0), 150.0, "content under the display peak is left alone");
+    }
+
+    /// The row-streaming fast path against the per-pixel reference: the SAME
+    /// bytes, for every layout it takes, matrix, range and transfer, at odd
+    /// and even sizes. Anything less and the GPU parity tests (which use this
+    /// converter as ground truth) would be checking against a moved target.
+    #[test]
+    fn the_fast_path_is_byte_identical_to_the_reference() {
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut compared = 0usize;
+        for &(w, h) in &[(2usize, 2usize), (7, 5), (16, 9), (33, 17), (64, 36)] {
+            for layout in [PlaneLayout::Nv12, PlaneLayout::P010] {
+                let bps = if layout == PlaneLayout::P010 { 2 } else { 1 };
+                let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+                let mut luma = vec![0u8; w * h * bps];
+                let mut chroma = vec![0u8; cw * ch * 2 * bps];
+                for b in luma.iter_mut().chain(chroma.iter_mut()) {
+                    *b = rnd() as u8;
+                }
+                if bps == 2 {
+                    // P010: low 6 bits zero.
+                    for pair in luma.chunks_exact_mut(2).chain(chroma.chunks_exact_mut(2)) {
+                        pair[0] &= 0xC0;
+                    }
+                }
+                let planes = CpuPlanes { data: vec![luma, chroma], strides: vec![(w * bps) as u32, (cw * 2 * bps) as u32] };
+                for matrix in [Matrix::Bt601, Matrix::Bt709, Matrix::Bt2020Ncl] {
+                    for range in [Range::Limited, Range::Full] {
+                        for transfer in [Transfer::Sdr, Transfer::Pq, Transfer::Hlg] {
+                            let c = ColorInfo { matrix, transfer, range };
+                            let fast = planes_to_rgba8(&planes, layout, c, w, h).unwrap();
+                            let reference = with_reference_converter(|| planes_to_rgba8(&planes, layout, c, w, h).unwrap());
+                            assert_eq!(fast, reference, "{layout:?} {w}x{h} {c:?}");
+                            compared += fast.len();
+                        }
+                    }
+                }
+            }
+        }
+        assert!(compared > 100_000, "the sweep did not run: {compared}");
+    }
+
+    /// `cargo test --release -p vidkit-core --lib converter_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn converter_bench() {
+        for (w, h) in [(640usize, 360usize), (1920, 1080), (3840, 2160)] {
+            let luma: Vec<u8> = (0..w * h).map(|i| (i * 7 % 251) as u8).collect();
+            let chroma: Vec<u8> = (0..w.div_ceil(2) * h.div_ceil(2) * 2).map(|i| (i * 13 % 251) as u8).collect();
+            let planes = CpuPlanes { data: vec![luma, chroma], strides: vec![w as u32, w as u32] };
+            let c = ColorInfo::default();
+            let reps = (20_000_000 / (w * h)).max(2);
+            let time = |reference: bool| {
+                let run = || { std::hint::black_box(planes_to_rgba8(&planes, PlaneLayout::Nv12, c, w, h).unwrap()); };
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    if reference { with_reference_converter(run) } else { run() }
+                }
+                t.elapsed().as_secs_f64() / reps as f64 * 1e3
+            };
+            let (r, f) = (time(true), time(false));
+            eprintln!("DIAG {w}x{h}: reference {r:.2} ms ({:.1} ns/px), fast {f:.2} ms ({:.1} ns/px), {:.1}x", r * 1e6 / (w * h) as f64, f * 1e6 / (w * h) as f64, r / f);
+        }
     }
 }

@@ -3136,6 +3136,7 @@ dependencies = [
  "irc-kit",
  "libc",
  "llama-cpp-2",
+ "models-kit",
  "net-kit",
  "nifty-core",
  "pane-kit",
