@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+  <!-- a strict grid: every column lines up (ortholinear) -->
+  <rect x="2" y="3" width="4" height="4" rx="1"/>
+  <rect x="7.3" y="3" width="4" height="4" rx="1"/>
+  <rect x="12.7" y="3" width="4" height="4" rx="1"/>
+  <rect x="18" y="3" width="4" height="4" rx="1"/>
+  <rect x="2" y="10" width="4" height="4" rx="1"/>
+  <rect x="7.3" y="10" width="4" height="4" rx="1"/>
+  <rect x="12.7" y="10" width="4" height="4" rx="1"/>
+  <rect x="18" y="10" width="4" height="4" rx="1"/>
+  <rect x="2" y="17" width="4" height="4" rx="1"/>
+  <rect x="7.3" y="17" width="4" height="4" rx="1"/>
+  <rect x="12.7" y="17" width="4" height="4" rx="1"/>
+  <rect x="18" y="17" width="4" height="4" rx="1"/>
+</svg>

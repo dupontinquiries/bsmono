@@ -101,6 +101,11 @@ fn a_compacted_board_draws_its_keys_on_the_chosen_side() {
 /// The space zones must reach the frame. `springboard::zones` computed them for a commit
 /// with nothing drawing them, which is the failure this crate keeps producing — a strip the
 /// user cannot see is not a spacebar.
+///
+/// And they must not lie ON the keys. The full-width board used to show one bottom zone,
+/// drawn over its own bottom row, and a tap on ⌫ there typed ⌫ and a space. The board now
+/// occupies exactly its rows, so a full-width board has no room for a bottom zone and gets
+/// none; the compacted board still gets the strip its compaction freed.
 #[test]
 fn the_space_zones_are_painted_and_the_compacted_one_appears_beside_the_keys() {
     let size = egui::vec2(500.0, 300.0);
@@ -123,10 +128,10 @@ fn the_space_zones_are_painted_and_the_compacted_one_appears_beside_the_keys() {
     };
 
     let full = marks(halfboard::Side::Off);
-    assert_eq!(full.len(), 1, "a full-width board has one space zone, saw {}", full.len());
+    assert_eq!(full.len(), 0, "a full-width board has no room under its keys for a zone, saw {}", full.len());
 
     let left = marks(halfboard::Side::Left);
-    assert_eq!(left.len(), 2, "a compacted board adds the freed strip, saw {}", left.len());
+    assert_eq!(left.len(), 1, "a compacted board gets the freed strip, saw {}", left.len());
     // The added one is the tall thin strip, not a second bottom bar.
     let strip = left.iter().max_by(|a, b| a.center().x.partial_cmp(&b.center().x).unwrap()).unwrap();
     assert!(strip.center().x > size.x * 0.6, "the strip is not on the freed side: {strip:?}");
@@ -186,14 +191,25 @@ fn the_thumb_arc_widens_the_rows_nearest_the_anchor() {
             });
         });
         // Group the painted glyphs into rows by y, then take each row's horizontal span.
-        let mut by_row: std::collections::BTreeMap<i32, (f32, f32)> = Default::default();
-        for t in uikit_egui::layout_probe::texts(&out.shapes) {
-            let key = (t.rect.center().y / 10.0) as i32;
-            let e = by_row.entry(key).or_insert((f32::MAX, f32::MIN));
-            e.0 = e.0.min(t.rect.left());
-            e.1 = e.1.max(t.rect.right());
+        // CLUSTERED, not bucketed: fixed 10pt buckets split one row's glyphs across two
+        // buckets whenever the row's centre landed near a bucket edge (the label and a
+        // key's corner hint sit a few points apart), and a one-glyph "row" made the flat
+        // board's spread look like 450pt. A new row starts at a vertical gap larger than
+        // any within-key offset and smaller than the row pitch.
+        let mut ts: Vec<egui::Rect> = uikit_egui::layout_probe::texts(&out.shapes).iter().map(|t| t.rect).collect();
+        ts.sort_by(|a, b| a.center().y.partial_cmp(&b.center().y).unwrap());
+        let mut rows: Vec<(f32, f32, f32)> = Vec::new(); // (last y, left, right)
+        for r in ts {
+            match rows.last_mut() {
+                Some(row) if r.center().y - row.0 < 14.0 => {
+                    row.0 = r.center().y;
+                    row.1 = row.1.min(r.left());
+                    row.2 = row.2.max(r.right());
+                }
+                _ => rows.push((r.center().y, r.left(), r.right())),
+            }
         }
-        by_row.into_values().collect()
+        rows.into_iter().map(|(_, l, r)| (l, r)).collect()
     };
 
     let arced = row_spans(Style { half: halfboard::Side::Right, arc: true, ..Style::default() });

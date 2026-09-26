@@ -45,6 +45,9 @@ pub mod thumbcal;
 pub mod topedge;
 /// Swipe out of the letters and back to type a space (`single-hand-mode.md` §3).
 pub mod springboard;
+/// The layout switcher's icons (an SVG subset drawn as strokes) and the rail that shows them.
+pub mod layout_icons;
+pub mod layout_rail;
 /// Full / Tray / Dismissed and every way between them (`docs/single-hand-mode.md`).
 pub mod visible_mode;
 pub mod microterm;
@@ -847,18 +850,20 @@ pub fn keyboard_ui_styled(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, pal
     let colors = uikit_egui::palette_colors(palette);
     let glass = palette == "system"; // the shared system-utilities look (gitmind/rusty-board): glass keys
     let gutter = adaptive.gutter;
-    let key_h = adaptive.min_touch_target; // 44pt touch / 28pt pointer, from the adaptive layer
     // ONE-HANDED COMPACTION. The keys are laid into a narrower rect anchored to one side;
     // everything else about the layout is unchanged, so every key keeps its relative place
     // and the far edge comes within a thumb's reach. `Side::Off` returns the full rect, so
     // this is a no-op for every caller that has not asked for it. See `halfboard`.
     let full_rect = ui.max_rect();
-    let keys_rect = style.half.board_rect(full_rect);
-    let total_w = if keys_rect == full_rect { ui.available_width() } else { keys_rect.width() };
-    // The left inset for a right-anchored board. Added at the start of each row rather than
-    // by shrinking the Ui, because the rows compute their key widths from `total_w` and a
-    // shrunken Ui would fight that arithmetic instead of moving it.
-    let row_inset = keys_rect.min.x - full_rect.min.x;
+    // WHERE EVERY KEY GOES, decided once by a pure function that `hit_test` and the swipe
+    // recognizer's hitboxes also use -- see `key_rects`.
+    let rects = key_rects(layout, full_rect, adaptive, &style);
+    let board_bottom = rects
+        .iter()
+        .rev()
+        .find_map(|r| r.first())
+        .map(|r| r.bottom() + gutter)
+        .unwrap_or(full_rect.top());
 
     if glass {
         // Glass root surface: high-alpha tinted fill + a single top hairline highlight, matching the
@@ -888,11 +893,75 @@ pub fn keyboard_ui_styled(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, pal
         uikit_egui::paint_top_hairline(ui, board_rect);
     }
 
-    // THE REACH POLYGON, per row. `halfboard` insets every row equally, which brings the
-    // board within reach and gives away the shape — the bottom row loses width it did not
-    // need to. The doc's algorithm is per-ROW ("only the row's outer bounds shift; muscle
-    // memory is preserved"), so each row is laid out inside the polygon's x-range at its own
-    // vertical centre. Off, or with no compaction, this is the uniform inset as before.
+    let mut emitted = None;
+    for (row_i, row) in layout.rows.iter().enumerate() {
+        for (col, key) in row.keys.iter().enumerate() {
+            let rect = rects[row_i][col];
+            if let Some(e) = paint_key(ui, key, rect, (row_i, col), row_i == 0, &colors, glass, layout.hints, style) {
+                emitted = Some(e);
+            }
+        }
+    }
+    // The board occupies exactly its rows. Nothing below the last row is claimed, so a
+    // caller that stacks something under the keys starts where the keys end.
+    ui.advance_cursor_after_rect(Rect::from_min_max(full_rect.min, egui::pos2(full_rect.max.x, board_bottom)));
+    emitted
+}
+
+/// The widest the keys get, in points. `MAX_KEYBOARD_WIDTH` in the GTK keyboard
+/// (`src/ui/keyboard_view.rs`): wider screens centre a 720pt board instead of stretching
+/// every key into a flat slab. The egui port stretched to the window, which on a desktop
+/// window made the board read as a different keyboard from the GTK one.
+pub const MAX_BOARD_W: f32 = 720.0;
+
+/// GTK's default key height (`keyboard_view.rs`: `key_h = 46`), used for every input
+/// modality. See [`board_adaptive`].
+pub const KEY_H: f32 = 46.0;
+
+/// GTK's gap between keys (`Box::spacing(4)`), used between rows as well.
+pub const KEY_GAP: f32 = 4.0;
+
+/// The adaptive profile the KEYBOARD is laid out with: the detected device, with the key
+/// height and gap pinned to GTK's.
+///
+/// Pinned because the detected target depends on input modality -- 28pt for a pointer,
+/// 44pt for touch -- and a keyboard whose key height changes with how you touch it is two
+/// keyboards. That was the "rows move on tap" report: on a tablet-width screen the rows
+/// grew when a finger landed. `Adaptive::detect` now latches touch, but even latched the
+/// FIRST tap would reflow the board, and on a desktop the 28pt keys were the other half of
+/// "the layout feels strange" next to GTK's 46.
+pub fn board_adaptive(ctx: &egui::Context) -> Adaptive {
+    let mut a = Adaptive::detect(ctx);
+    a.min_touch_target = KEY_H;
+    a.gutter = KEY_GAP;
+    a
+}
+
+/// Every key's rect, `[row][col]`, for a board drawn into `full` -- THE geometry.
+///
+/// One function for the painter ([`keyboard_ui_styled`]), the tap hit-test ([`hit_test`]) and
+/// the swipe recognizer's hitboxes (`swipe::SwipeTracker::hitboxes`). Before this the painter
+/// laid keys out with egui's flow layout and the other two re-derived the walk by hand, and
+/// they had drifted: the hand walks advanced `x += w` with no gap between keys, and did not
+/// know about the parent's `item_spacing.y` between rows, so the swipe decoder's idea of
+/// where a key was slid a gutter further off per key and ~3pt per row. Placing keys at
+/// computed rects makes the three agree by construction.
+///
+/// Rules: the board is centred at no more than [`MAX_BOARD_W`]; a one-handed style narrows
+/// each row (per row, when the thumb arc is on); rows are `key_h` tall and `key_h + gutter`
+/// apart from the top; each row has a gutter at both ends and between keys, and the keys
+/// share the rest by weight.
+pub fn key_rects(layout: &Layout, full: Rect, adaptive: &Adaptive, style: &Style) -> Vec<Vec<Rect>> {
+    let gutter = adaptive.gutter;
+    let key_h = adaptive.min_touch_target;
+    let full = board_area(full);
+    // ONE-HANDED COMPACTION. The keys are laid into a narrower rect anchored to one side;
+    // every key keeps its relative place and the far edge comes within a thumb's reach.
+    // `Side::Off` returns the full rect. See `halfboard`.
+    let keys_rect = style.half.board_rect(full);
+    // THE REACH POLYGON, per row. `halfboard` insets every row equally, which gives away
+    // the shape -- the bottom row loses width it did not need to. The doc's algorithm is
+    // per-ROW ("only the row's outer bounds shift; muscle memory is preserved").
     let arc = if style.arc {
         style
             .half
@@ -900,67 +969,58 @@ pub fn keyboard_ui_styled(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, pal
             .then(|| crate::thumbarc::Corner::from_side(style.half))
             .flatten()
             .and_then(|c| match style.calibrated_reach {
-                // MEASURED BEATS ESTIMATED. `default_for` reads the board's width and guesses
-                // a hand from it; a calibration read the hand.
+                // MEASURED BEATS ESTIMATED.
                 Some(r) => Some(crate::thumbarc::Arc::default_shape(c, r)),
-                None => crate::thumbarc::Arc::default_for(full_rect.width(), c),
+                None => crate::thumbarc::Arc::default_for(full.width(), c),
             })
     } else {
         None
     };
     let rows_n = layout.rows.len();
-
-    let mut emitted = None;
-    for (row_i, row) in layout.rows.iter().enumerate() {
-        let total_weight: f32 = row.keys.iter().map(|k| k.weight).sum::<f32>().max(0.001);
-        // Per-row bounds when there is an arc; the board-wide inset otherwise.
-        let (row_left, row_w) = match &arc {
-            Some(a) => {
-                let (lo, hi) = a.row_bounds(row_i, rows_n);
-                (full_rect.width() * lo, full_rect.width() * (hi - lo))
-            }
-            None => (row_inset, total_w),
-        };
-        let usable = row_w - gutter * (row.keys.len() as f32 + 1.0);
-        ui.horizontal(|ui| {
-            // THE ROW MUST SPEND EXACTLY WHAT IT BUDGETED.
-            //
-            // `usable` above reserves `gutter * (n + 1)` for the spaces, but
-            // egui inserts `spacing.item_spacing.x` between items on its own,
-            // and that defaults to 8.0 while the COMPACT gutter is 6.0. A
-            // ten-key row therefore budgeted 66pt of gap and spent 86, and the
-            // surplus pushed the right-hand keys off the screen — worse on a
-            // phone, which is both the narrow case and the one using the
-            // smaller gutter.
-            //
-            // Making egui's spacing BE the gutter closes it: one leading
-            // add_space plus n keys is n+1 items with n gaps between them, so
-            // gutter*(n+1) is spent exactly. The y is zeroed because rows do
-            // their own `add_space(gutter)` below and would otherwise be
-            // double-spaced.
-            //
-            // The test rig sets item_spacing to ZERO before measuring, which
-            // is why this never failed a test: the harness removed the very
-            // term that was wrong. The rig is left alone -- its `key_rect`
-            // sums widths without gutters, so zero spacing is what makes its
-            // arithmetic right, and it exercises gesture routing rather than
-            // pixel layout. The row arithmetic below is covered by
-            // `row_spending` instead, which needs no egui at all.
-            ui.spacing_mut().item_spacing = Vec2::new(gutter, 0.0);
-            // Leading space keeps the count at gutter*(n+1): one before the
-            // first key, then n gaps between the n+1 items. Dropping it leaves
-            // the row a gutter short of its own budget.
-            ui.add_space(gutter + row_left);
-            for key in &row.keys {
-                let w = (usable * (key.weight / total_weight)).max(8.0);
-                if let Some(e) = paint_key(ui, key, Vec2::new(w, key_h), gutter, &colors, glass, layout.hints, style) {
-                    emitted = Some(e);
+    layout
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(row_i, row)| {
+            let (left, row_w) = match &arc {
+                Some(a) => {
+                    let (lo, hi) = a.row_bounds(row_i, rows_n);
+                    (full.left() + full.width() * lo, full.width() * (hi - lo))
                 }
-            }
-        });
-        ui.add_space(gutter);
+                None => (keys_rect.left(), keys_rect.width()),
+            };
+            let total_weight: f32 = row.keys.iter().map(|k| k.weight).sum::<f32>().max(0.001);
+            let usable = (row_w - gutter * (row.keys.len() as f32 + 1.0)).max(0.0);
+            let y = full.top() + row_i as f32 * (key_h + gutter);
+            let mut x = left + gutter;
+            row.keys
+                .iter()
+                .map(|key| {
+                    let w = (usable * (key.weight / total_weight)).max(8.0);
+                    let r = Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, key_h));
+                    x += w + gutter;
+                    r
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The part of `full` the keys are laid out in: all of it, or a [`MAX_BOARD_W`] column
+/// centred in it. Anything that places things AROUND the keys (the space zones) uses this
+/// rather than the raw rect, or on a wide window it would put them under keys.
+pub fn board_area(full: Rect) -> Rect {
+    if full.width() > MAX_BOARD_W {
+        Rect::from_center_size(full.center(), Vec2::new(MAX_BOARD_W, full.height()))
+    } else {
+        full
     }
-    emitted
+}
+
+/// The height [`keyboard_ui_styled`] occupies for `layout`: every row plus a gutter under
+/// each. What a shell sizes its surface to, so no strip of dead space sits under the keys.
+pub fn board_height(layout: &Layout, adaptive: &Adaptive) -> f32 {
+    layout.rows.len() as f32 * (adaptive.min_touch_target + adaptive.gutter)
 }
 
 /// Same as `keyboard_ui`, but also routes the tapped key's emit code through `registry` under the
@@ -1088,11 +1148,17 @@ fn key_deadzone(size: Vec2) -> f32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool, hints: bool, style: Style) -> Option<String> {
+fn paint_key(ui: &mut Ui, key: &Key, rect: Rect, at: (usize, usize), top_row: bool, c: &PaletteColors, glass: bool, hints: bool, style: Style) -> Option<String> {
     // CLICK AND DRAG. This was `Sense::click()`, which is why cardinal swipes
     // did nothing: a key that only senses clicks never sees a drag, so the
     // direction could not be measured however good the classifier was.
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    //
+    // AT A COMPUTED RECT, under an id from the key's (row, col). Allocated by egui's flow
+    // layout, a key's place depended on everything the Ui had laid out before it; placed,
+    // it is exactly where `key_rects` -- and therefore `hit_test` and the swipe hitboxes --
+    // say it is.
+    let size = rect.size();
+    let resp = ui.interact(rect, ui.id().with(("key", at.0, at.1)), Sense::click_and_drag());
     // PAINT, then DISPATCH — two steps, and the first has no return in it.
     //
     // The glass recipe used to be a control-flow branch that painted the key
@@ -1103,7 +1169,7 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
     // experimental keyboards": the classifier, the widget and the layouts
     // were all fine, and none of them was being called. A palette chooses
     // how a key LOOKS; it never gets to decide what a gesture MEANS.
-    paint_key_face(ui, key, rect, size, gutter, c, glass, hints, &resp, style);
+    paint_key_face(ui, key, rect, size, top_row, c, glass, hints, &resp, style);
     dispatch_key(ui, key, rect, size, &resp)
 }
 
@@ -1209,7 +1275,7 @@ fn paint_cap_label(
 
 /// The visual half of a key: glass or carved-tile, pressed/hovered/at-rest. No gesture logic.
 #[allow(clippy::too_many_arguments)]
-fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool, hints: bool, resp: &egui::Response, style: Style) {
+fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, top_row: bool, c: &PaletteColors, glass: bool, hints: bool, resp: &egui::Response, style: Style) {
     // What the in-flight swipe (if any) is currently arming. Peeked, not
     // driven: `dispatch_key` still owns the press state, and it runs after
     // this. On the first frame of a press there is nothing to peek yet and the
@@ -1227,6 +1293,10 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
         let s = key.cardinal.iter().find(|(k, _)| *k == d).map(|(_, s)| s.as_str())?;
         Some((d, s, p.progress))
     });
+    // What the incoming glyph SHOWS: a value can be an action token (the spacebar's
+    // arrows), which is for the dispatcher and must never be painted as text.
+    let morph_label = morph.map(|(d, s, p)| (d, real_layout::display_label(s), p));
+    let morph = morph_label.as_ref().map(|(d, s, p)| (*d, s.as_ref(), *p));
     let painter = ui.painter();
     let pressed = resp.is_pointer_button_down_on();
     // `--rb-key-radius`, when the operator has set one. The proportional default stays
@@ -1239,18 +1309,26 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
     // re-rasterise the whole alphabet whenever a key changed height by a fraction, since
     // its glyph atlas is keyed on the exact size. See `uikit_egui::crisp`.
     let ppp = ui.ctx().pixels_per_point();
+    // `.key-label { font-size: 16px }` on GTK's 46px key: 0.35 of the height. This was
+    // 0.42 (19.3pt on a 46pt key), which is most of why the port's caps looked heavier
+    // than GTK's side by side.
     let font = FontId::proportional(uikit_egui::crisp::snap_font_pt(
-        (size.y * 0.42).clamp(11.0, 26.0),
+        (size.y * 0.35).clamp(11.0, 26.0),
         ppp,
     ));
     // And the cap itself: a 1px border at x = 40.3 covers 70% of one column and 30% of the
     // next — two grey columns instead of one line, on every key at once.
     let rect = uikit_egui::crisp::snap_rect(rect, ppp);
-    // THE PRESS SCALES, as the GTK cap does. `.key-button:active { transform: scale(0.94) }`
-    // with a bouncy release — the port only changed colour, and on a phone a cap that does
-    // not move under the thumb reads as a key that did not register. The rect shrinks about
-    // its own centre so neighbours do not shift.
-    let rect = if pressed { shrink_about_centre(rect, PRESS_SCALE) } else { rect };
+    // THE PRESS SCALES on the carved cap, as GTK's `.key-button:active { transform:
+    // scale(0.94) }` does -- about its own centre so neighbours do not shift. NOT under
+    // glass: GTK's glass rules (`keyboard.css`, the glass-mode block) set no transform, the
+    // cap only flips colour, and glass is this port's default palette. And never on a
+    // cardinal key, in either palette: its cap is something you READ while dragging (the
+    // label slides, see `paint_cardinal_morph`), and a cap that shrinks under the finger
+    // and grows back on release was the "cardinal keys change size on tap and on flick"
+    // report.
+    let scales = pressed && !glass && key.cardinal.is_empty();
+    let rect = if scales { shrink_about_centre(rect, PRESS_SCALE) } else { rect };
     if glass {
         // THE ROLE, from the layout file, not from the label's length. `.key-action` is
         // accent-filled with white text (Enter, the key that commits — findable without
@@ -1290,7 +1368,10 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
             (if resp.hovered() { uikit_egui::key_fill_hover(c.bg_card) } else { uikit_egui::key_fill(c.bg_card) }, uikit_egui::key_border(c.border))
         };
         painter.rect(rect, rounding, fill, stroke, egui::StrokeKind::Inside);
-        if rect.top() <= gutter + 1.0 {
+        // The top row, by index: this compared `rect.top()` to the gutter, which is only the
+        // top row when the board is drawn at y = 0 -- under a panel or a status strip it was
+        // no row at all.
+        if top_row {
             uikit_egui::paint_top_hairline(ui, rect);
         }
         // .key-action's label is white at rest too — that is what makes it read as the
@@ -1360,7 +1441,8 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
         // 10pt floor: nothing on a cap is smaller (every_cap_label_is_rasterised_on_the_pixel_grid).
         // Snapped to whole device pixels, and the floor applied AFTER snapping: 10pt at 1.25x is
         // 12.5px, which snaps down to 12px = 9.6pt -- so round up to the next whole pixel.
-        let pt = uikit_egui::crisp::snap_font_pt((size.y * 0.2).clamp(10.0, 12.0), ppp);
+        // GTK's hint labels are 11px (`theme.rs`): 0.24 of a 46pt key.
+        let pt = uikit_egui::crisp::snap_font_pt((size.y * 0.24).clamp(10.0, 12.0), ppp);
         let pt = if pt < 10.0 { (10.0 * ppp).ceil() / ppp } else { pt };
         let hint = FontId::proportional(pt);
         painter.text(
@@ -1376,7 +1458,7 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
     // four cardinals ride the edges; diagonals sit in their corners.
     if hints && !key.cardinal.is_empty() {
         let hint = FontId::proportional(uikit_egui::crisp::snap_font_pt(
-            (size.y * 0.22).clamp(8.0, 13.0),
+            (size.y * 0.24).clamp(8.0, 13.0),
             ppp,
         ));
         let hint_color = c.text.gamma_multiply(0.55);
@@ -1397,7 +1479,7 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
             }
             let off = d.offset();
             let anchor = rect.center() + Vec2::new(off.x * (rect.width() * 0.5 - inset), off.y * (rect.height() * 0.5 - inset));
-            painter.text(anchor, Align2::CENTER_CENTER, s, hint.clone(), hint_color.gamma_multiply(dim));
+            painter.text(anchor, Align2::CENTER_CENTER, real_layout::display_label(s), hint.clone(), hint_color.gamma_multiply(dim));
         }
     }
 }
@@ -1552,27 +1634,10 @@ fn dispatch_key(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, resp: &egui::Res
 /// laid-out board of `board` rect. Pure geometry, no egui context needed — lets the layout
 /// math be unit-tested without a live UI.
 pub fn hit_test(layout: &Layout, board: Rect, adaptive: &Adaptive, pos: egui::Pos2) -> Option<String> {
-    let gutter = adaptive.gutter;
-    let key_h = adaptive.min_touch_target;
-    let mut y = board.top();
-    for row in &layout.rows {
-        let total_weight: f32 = row.keys.iter().map(|k| k.weight).sum::<f32>().max(0.001);
-        let usable = board.width() - gutter * (row.keys.len() as f32 + 1.0);
-        let mut x = board.left() + gutter;
-        let row_rect = Rect::from_min_size(egui::pos2(board.left(), y), Vec2::new(board.width(), key_h));
-        if row_rect.contains(pos) {
-            for key in &row.keys {
-                let w = (usable * (key.weight / total_weight)).max(8.0);
-                let krect = Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, key_h));
-                if krect.contains(pos) {
-                    return Some(key.emit.clone());
-                }
-                x += w;
-            }
-        }
-        y += key_h + gutter;
-    }
-    None
+    let rects = key_rects(layout, board, adaptive, &Style::default());
+    layout.rows.iter().zip(&rects).find_map(|(row, rs)| {
+        row.keys.iter().zip(rs).find(|(_, r)| r.contains(pos)).map(|(k, _)| k.emit.clone())
+    })
 }
 
 /// Accessibility: a stable id for the key at (row, col), so voice focus survives re-layout.
@@ -1975,20 +2040,11 @@ mod swipe_delivery_tests {
             out
         }
 
-        /// Where key (row, col) is on screen under the test panel.
+        /// Where key (row, col) is on screen under the test panel -- from `key_rects`, the
+        /// function the painter places keys with.
         fn key_rect(&self, row: usize, col: usize) -> Rect {
-            let r = &self.layout.rows[row];
-            let total_weight: f32 = r.keys.iter().map(|k| k.weight).sum();
-            let usable = W - GUTTER * (r.keys.len() as f32 + 1.0);
-            let mut x = GUTTER;
-            for (c, k) in r.keys.iter().enumerate() {
-                let w = usable * (k.weight / total_weight);
-                if c == col {
-                    return Rect::from_min_size(Pos2::new(x, row as f32 * (KEY_H + GUTTER)), Vec2::new(w, KEY_H));
-                }
-                x += w;
-            }
-            panic!("no key at ({row},{col})");
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(W, 300.0));
+            key_rects(&self.layout, screen, &self.adaptive, &Style::default())[row][col]
         }
 
         /// Press at `from`, drag through `via`, release at `to`. Returns everything emitted
@@ -2896,61 +2952,183 @@ mod gtk_parity_tests {
         );
     }
 
-/// The row-width arithmetic, without egui.
+/// The key geometry, without egui: `key_rects` is what the painter, `hit_test` and the
+/// swipe hitboxes all read, so its arithmetic is pinned here directly.
 ///
-/// `keyboard_ui_styled` reserves `gutter * (n + 1)` for gaps and then relies
-/// on egui to insert them. That only holds if egui's `item_spacing.x` IS the
-/// gutter -- and it defaults to 8.0 while `Adaptive`'s compact gutter is 6.0,
-/// so every row on a phone overspent by `n * 2`pt and ran off the right edge.
-///
-/// Extracted as a pure function because the egui test rig zeroes
-/// `item_spacing` before measuring, which removed the term that was wrong. A
-/// harness cannot catch a bug it has configured away.
+/// Replaces `row_spending`, which modelled the egui flow layout's budget (`gutter * (n+1)`
+/// reserved, egui's `item_spacing.x` actually spent). Keys are placed at computed rects
+/// now, so there is no second quantity for the budget to disagree with.
 #[cfg(test)]
-mod row_spending {
-    /// What a row actually consumes: one leading gutter, then `n` gaps
-    /// between the `n + 1` items (the leading space plus `n` keys), plus the
-    /// keys themselves.
-    fn spent(row_w: f32, row_left: f32, gutter: f32, item_spacing: f32, n: usize) -> f32 {
-        let usable = row_w - gutter * (n as f32 + 1.0);
-        (gutter + row_left) + n as f32 * item_spacing + usable
+mod key_geometry {
+    use super::*;
+
+    fn ad(key_h: f32, gutter: f32) -> Adaptive {
+        Adaptive { min_touch_target: key_h, gutter, ..Adaptive::default() }
     }
 
-    /// With the spacing set to the gutter, a row spends exactly its width.
+    /// Every row spends exactly its width: a gutter at each end and between every pair.
     #[test]
-    fn a_row_spends_exactly_what_it_budgeted() {
-        for n in [1usize, 3, 10, 12] {
-            for gutter in [6.0f32, 8.0, 12.0] {
-                let got = spent(1080.0, 0.0, gutter, gutter, n);
-                assert!((got - 1080.0).abs() < 1e-3,
-                    "n={n} gutter={gutter}: spent {got}, had 1080");
+    fn every_row_spends_exactly_its_width_with_a_gutter_everywhere() {
+        let full = Rect::from_min_size(egui::pos2(10.0, 20.0), Vec2::new(600.0, 300.0));
+        for layout in [Layout::qwerty(), Layout::cardinal8(), Layout::symbols()] {
+            for g in [4.0f32, 6.0, 8.0] {
+                let rects = key_rects(&layout, full, &ad(46.0, g), &Style::default());
+                assert_eq!(rects.len(), layout.rows.len());
+                for rs in &rects {
+                    assert!(!rs.is_empty());
+                    assert!((rs[0].left() - (full.left() + g)).abs() < 1e-3, "left gutter");
+                    assert!((full.right() - rs.last().unwrap().right() - g).abs() < 1e-3, "right gutter: {rs:?}");
+                    for w in rs.windows(2) {
+                        assert!((w[1].left() - w[0].right() - g).abs() < 1e-3, "gap between keys");
+                    }
+                }
             }
         }
     }
 
-    /// THE BUG. egui's default 8.0 against the compact 6.0 gutter overruns by
-    /// 2pt per key -- 20pt on a ten-key row, off the right edge of a phone.
+    /// Rows are `key_h` tall and `key_h + gutter` apart, from the top of the board.
     #[test]
-    fn the_default_spacing_overruns_a_compact_row() {
-        let over = spent(1080.0, 0.0, 6.0, 8.0, 10) - 1080.0;
-        assert!((over - 20.0).abs() < 1e-3, "expected 20pt of overflow, got {over}");
-        // ...and it scales with the key count, so the widest rows are worst.
-        assert!(spent(1080.0, 0.0, 6.0, 8.0, 12) > spent(1080.0, 0.0, 6.0, 8.0, 10));
+    fn rows_are_key_high_and_a_gutter_apart() {
+        let full = Rect::from_min_size(egui::pos2(0.0, 7.0), Vec2::new(500.0, 400.0));
+        let a = ad(46.0, 4.0);
+        let rects = key_rects(&Layout::qwerty(), full, &a, &Style::default());
+        for (i, rs) in rects.iter().enumerate() {
+            for r in rs {
+                assert!((r.top() - (7.0 + i as f32 * 50.0)).abs() < 1e-3);
+                assert!((r.height() - 46.0).abs() < 1e-3);
+            }
+        }
+        let last = rects.last().unwrap()[0];
+        assert!((board_height(&Layout::qwerty(), &a) - (last.bottom() + 4.0 - 7.0)).abs() < 1e-3,
+            "board_height must be exactly what the rows occupy");
     }
 
-    /// A gutter WIDER than egui's default underspends rather than overflowing,
-    /// which is why this only ever looked like a phone bug.
+    /// Wider than GTK's MAX_KEYBOARD_WIDTH, the board is centred at that width; narrower,
+    /// it uses all of it.
     #[test]
-    fn a_wide_gutter_underspends_instead_of_overflowing() {
-        assert!(spent(1080.0, 0.0, 12.0, 8.0, 10) < 1080.0);
+    fn a_wide_window_centres_a_720pt_board() {
+        let a = ad(46.0, 4.0);
+        let wide = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1200.0, 300.0));
+        let rs = &key_rects(&Layout::qwerty(), wide, &a, &Style::default())[0];
+        let (l, r) = (rs[0].left() - 4.0, rs.last().unwrap().right() + 4.0);
+        assert!(((r - l) - MAX_BOARD_W).abs() < 1e-3, "board width {}", r - l);
+        assert!(((l + r) * 0.5 - 600.0).abs() < 1e-3, "not centred: {l}..{r}");
+        let narrow = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(400.0, 300.0));
+        let rs = &key_rects(&Layout::qwerty(), narrow, &a, &Style::default())[0];
+        assert!((rs.last().unwrap().right() - 396.0).abs() < 1e-3);
     }
 
-    /// An inset row (the thumb arc) still ends inside its own bounds.
+    /// The tap hit-test answers from the same rects: every key's centre hits that key, and
+    /// a point in the gap between two keys hits neither.
     #[test]
-    fn an_inset_row_stays_within_its_bounds() {
-        let (row_left, row_w) = (120.0, 700.0);
-        let got = spent(row_w, row_left, 6.0, 6.0, 8);
-        assert!((got - (row_left + row_w)).abs() < 1e-3, "got {got}");
+    fn hit_test_answers_from_the_painted_rects() {
+        let a = ad(46.0, 6.0);
+        let full = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(480.0, 300.0));
+        let layout = Layout::qwerty();
+        let rects = key_rects(&layout, full, &a, &Style::default());
+        let mut n = 0;
+        for (row, rs) in layout.rows.iter().zip(&rects) {
+            for (k, r) in row.keys.iter().zip(rs) {
+                assert_eq!(hit_test(&layout, full, &a, r.center()).as_deref(), Some(k.emit.as_str()));
+                n += 1;
+            }
+            let gap = egui::pos2((rs[0].right() + rs[1].left()) * 0.5, rs[0].center().y);
+            assert_eq!(hit_test(&layout, full, &a, gap), None, "the gap is not a key");
+        }
+        assert!(n > 25, "the scan found {n} keys");
+    }
+
+    /// A one-handed, arced board keeps every row inside the (centred) board.
+    #[test]
+    fn an_arced_row_stays_inside_the_board() {
+        let a = ad(46.0, 6.0);
+        let full = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(700.0, 300.0));
+        let style = Style { half: crate::halfboard::Side::Left, arc: true, ..Style::default() };
+        let rects = key_rects(&Layout::qwerty(), full, &a, &style);
+        for rs in &rects {
+            assert!(rs[0].left() >= full.left() - 1e-3 && rs.last().unwrap().right() <= full.right() + 1e-3);
+        }
     }
 }
+}
+
+
+/// What a pressed cap looks like: its SIZE, across a tap and a drag.
+#[cfg(test)]
+mod press_face_tests {
+    use super::*;
+    use egui::{Event, Modifiers, PointerButton, Pos2, RawInput};
+
+    /// The painted cap rect under `probe`, each frame of press -> drag -> release.
+    fn cap_sizes(layout: &Layout, palette: &str, probe: Pos2, drag_to: Pos2) -> Vec<Vec2> {
+        let ctx = egui::Context::default();
+        let adaptive = Adaptive { min_touch_target: KEY_H, gutter: KEY_GAP, ..Adaptive::default() };
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 300.0));
+        let key = key_rects(layout, screen, &adaptive, &Style::default())
+            .into_iter()
+            .flatten()
+            .find(|r| r.contains(probe))
+            .expect("a key under the probe");
+        let mut t = 0.0;
+        let mut run = |events: Vec<Event>| {
+            t += 0.03;
+            let raw = RawInput { events, time: Some(t), screen_rect: Some(screen), ..Default::default() };
+            let out = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                    let _ = keyboard_ui(ui, layout, &adaptive, palette);
+                });
+            });
+            // The cap: the rect shape centred on the key, about its size.
+            out.shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Rect(r) => Some(r.rect),
+                    _ => None,
+                })
+                .filter(|r| (r.center() - key.center()).length() < 2.0 && r.width() > key.width() * 0.8 && r.width() <= key.width() + 1.0)
+                .map(|r| r.size())
+                .next()
+                .expect("the cap was painted")
+        };
+        let btn = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::default() };
+        let mut sizes = vec![run(vec![]), run(vec![])];
+        sizes.push(run(vec![Event::PointerMoved(probe), btn(probe, true)]));
+        sizes.push(run(vec![]));
+        let mid = probe + (drag_to - probe) * 0.5;
+        sizes.push(run(vec![Event::PointerMoved(mid)]));
+        sizes.push(run(vec![Event::PointerMoved(drag_to)]));
+        sizes.push(run(vec![btn(drag_to, false)]));
+        sizes.push(run(vec![]));
+        sizes
+    }
+
+    /// "The swipe cardinal keys change size on tap and on flick/drag": a cardinal cap is the
+    /// same size at rest, pressed, and mid-flick, in both palettes.
+    #[test]
+    fn a_cardinal_cap_holds_its_size_through_a_tap_and_a_flick() {
+        let layout = Layout::cardinal8();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 300.0));
+        let adaptive = Adaptive { min_touch_target: KEY_H, gutter: KEY_GAP, ..Adaptive::default() };
+        let k = key_rects(&layout, screen, &adaptive, &Style::default())[1][1];
+        for palette in ["system", "dark"] {
+            let s = cap_sizes(&layout, palette, k.center(), k.center() + Vec2::new(0.0, 30.0));
+            assert!(s.iter().all(|v| (*v - s[0]).length() < 0.01), "{palette}: the cap changed size: {s:?}");
+        }
+    }
+
+    /// Plain keys: glass flips colour only (GTK's glass rules set no transform); the carved
+    /// palette keeps GTK's `scale(0.94)`. Pins both halves, so dropping the scale everywhere
+    /// is caught as surely as keeping it on glass.
+    #[test]
+    fn a_plain_cap_scales_only_on_the_carved_palette() {
+        let layout = Layout::qwerty();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 300.0));
+        let adaptive = Adaptive { min_touch_target: KEY_H, gutter: KEY_GAP, ..Adaptive::default() };
+        let k = key_rects(&layout, screen, &adaptive, &Style::default())[1][2];
+        let glass = cap_sizes(&layout, "system", k.center(), k.center());
+        assert!(glass.iter().all(|v| (*v - glass[0]).length() < 0.01), "glass cap changed size: {glass:?}");
+        let carved = cap_sizes(&layout, "dark", k.center(), k.center());
+        let pressed = carved[3];
+        assert!((pressed.x / carved[0].x - PRESS_SCALE).abs() < 0.02, "carved cap did not press-scale: {carved:?}");
+    }
 }

@@ -95,6 +95,16 @@ use crate::platform::Placement;
 /// use, so the three placements agree about how much of the screen a keyboard is.
 pub const HEIGHT: u32 = 340;
 
+/// The layer height for a content height in points: whole points, never below a floor a
+/// thumb can use (GTK's own minimum is 120) and never absurd. Pure so the rounding and the
+/// clamp are testable without a compositor.
+pub fn surface_height(content: f32) -> u32 {
+    if !content.is_finite() {
+        return HEIGHT;
+    }
+    content.ceil().clamp(120.0, 1600.0) as u32
+}
+
 /// Poll timeout while nothing is animating. Bounds the Activate→shown latency when idle; the
 /// GTK backend's SLOW_MS is in the same range.
 const IDLE_POLL: Duration = Duration::from_millis(50);
@@ -142,6 +152,9 @@ struct State {
     layer: LayerSurface,
     /// Logical size the compositor last configured. `None` until the first configure.
     size: Option<(u32, u32)>,
+    /// The height we ask for: [`HEIGHT`] until the first frame says what the content needs
+    /// (`Feel::desired_height`), then that -- see [`surface_height`].
+    height: u32,
     /// Integer buffer scale the compositor prefers for our surface (its `wl_output` scale).
     scale: i32,
     /// A `configure` arrived that we have not painted for yet.
@@ -164,7 +177,7 @@ struct State {
 
 impl State {
     fn logical_size(&self) -> (u32, u32) {
-        self.size.unwrap_or((0, HEIGHT))
+        self.size.unwrap_or((0, self.height))
     }
 
     fn pixel_size(&self) -> [u32; 2] {
@@ -188,10 +201,10 @@ impl State {
 /// commit) returns the surface to its freshly-created state, anchor included. Bottom edge, full
 /// width (width 0 = stretch between the two side anchors), a strip HEIGHT tall that other
 /// windows must make room for, and NO keyboard focus — the text goes to whoever had it.
-fn apply_layer_state(layer: &LayerSurface) {
+fn apply_layer_state(layer: &LayerSurface, height: u32) {
     layer.set_anchor(Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-    layer.set_size(0, HEIGHT);
-    layer.set_exclusive_zone(HEIGHT as i32);
+    layer.set_size(0, height);
+    layer.set_exclusive_zone(height as i32);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
 }
 
@@ -208,7 +221,7 @@ pub fn run(title: &str) -> Result<(), LayerError> {
 
     let surface = compositor.create_surface(&qh);
     let layer = layer_shell.create_layer_surface(&qh, surface, layer_from_env(), Some(title.to_string()), None);
-    apply_layer_state(&layer);
+    apply_layer_state(&layer, HEIGHT);
     // Initial commit without a buffer: this is what asks for the first configure.
     layer.commit();
 
@@ -220,6 +233,7 @@ pub fn run(title: &str) -> Result<(), LayerError> {
         touch: None,
         layer,
         size: None,
+        height: HEIGHT,
         scale: 1,
         needs_paint: false,
         configured: false,
@@ -335,12 +349,30 @@ pub fn run(title: &str) -> Result<(), LayerError> {
                 //   its anchor doesn't include the left and the right screen edge
                 // which is how every hide→show cycle on a strict compositor (KDE, sway) killed
                 // the shell. Phones that never hide the board never saw it.
-                apply_layer_state(&state.layer);
+                apply_layer_state(&state.layer, state.height);
                 state.layer.wl_surface().commit();
                 mapped = true;
                 tracing::debug!("layer: map requested");
             }
             _ => {}
+        }
+
+        // ---- 2b. the surface is as tall as its content. A fixed 340 left a strip of nothing
+        //          under the keys (and reserved it from the app above, via the exclusive
+        //          zone). GTK resizes its layer surface to the computed height on every
+        //          rebuild; this does the same from what the frame measured. Only on change,
+        //          so a steady board costs no requests; the configure that answers it resizes
+        //          the next frame's screen_rect.
+        if let Some(h) = feel.desired_height().map(surface_height) {
+            if h != state.height {
+                state.height = h;
+                if mapped {
+                    state.layer.set_size(0, h);
+                    state.layer.set_exclusive_zone(h as i32);
+                    state.layer.wl_surface().commit();
+                    tracing::debug!(height = h, "layer: resized to content");
+                }
+            }
         }
 
         // ---- 3. paint if the compositor has said we may. Every frame that ran is painted
@@ -602,9 +634,9 @@ impl LayerShellHandler for State {
         // sctk acks the configure for us. A zero dimension means "you choose": keep the
         // height we asked for and, for width, what we last knew (or the ask).
         let (w, h) = configure.new_size;
-        let prev = self.size.unwrap_or((0, HEIGHT));
+        let prev = self.size.unwrap_or((0, self.height));
         let w = if w == 0 { prev.0.max(1) } else { w };
-        let h = if h == 0 { HEIGHT } else { h };
+        let h = if h == 0 { self.height } else { h };
         self.size = Some((w, h));
         self.configured = true;
         self.needs_paint = true;
@@ -861,5 +893,21 @@ mod merge_tests {
         merge_textures(&mut p, delta(vec![full(5, 8)], vec![]));
         assert_eq!(p.set.len(), 1);
         assert!(!p.free.contains(&TextureId::Managed(5)), "not freed after being re-created");
+    }
+}
+
+#[cfg(test)]
+mod height_tests {
+    use super::{surface_height, HEIGHT};
+
+    /// Whole points, rounded UP (a half-point short clips the bottom row's border), floored
+    /// at GTK's 120 and capped; a NaN from an empty first frame keeps the default.
+    #[test]
+    fn the_surface_height_follows_the_content_within_bounds() {
+        assert_eq!(surface_height(216.2), 217);
+        assert_eq!(surface_height(216.0), 216);
+        assert_eq!(surface_height(40.0), 120);
+        assert_eq!(surface_height(9000.0), 1600);
+        assert_eq!(surface_height(f32::NAN), HEIGHT);
     }
 }

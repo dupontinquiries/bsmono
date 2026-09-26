@@ -331,11 +331,15 @@ pub struct Zone {
 pub const BOTTOM_H: f32 = 36.0;
 /// `~24px wide` (§4).
 pub const SIDE_W: f32 = 24.0;
+/// The thinnest bottom zone worth offering.
+pub const MIN_ZONE_H: f32 = 12.0;
 
 /// The space zones for a board, given where the letters are and which side (if any) the
 /// board is compacted to.
 ///
-/// The bottom zone is always there. A side zone appears only on the side the compaction
+/// The bottom zone is there when the surface has room under the keys (a trimmed surface
+/// has none, and then the bottom row's own space bar is the space). A side zone appears
+/// only on the side the compaction
 /// FREED — which is the job the freed strip has been waiting for since `halfboard` landed,
 /// and the reason that module returns it rather than leaving a gap.
 ///
@@ -345,14 +349,19 @@ pub const SIDE_W: f32 = 24.0;
 /// left. Following the doc's geometry rather than its wording here, because a space zone
 /// under the palm is not a space zone.
 pub fn zones(board: Rect, letters: Rect, half: crate::halfboard::Side) -> Vec<Zone> {
-    let mut out = vec![Zone {
-        rect: Rect::from_min_max(
-            Pos2::new(board.left(), letters.bottom()),
-            Pos2::new(board.right(), (letters.bottom() + BOTTOM_H).min(board.bottom())),
-        ),
-        edge: Edge::Bottom,
-        live_while_swiping: true,
-    }];
+    let mut out = Vec::new();
+    // BELOW THE KEYS, and only where there is room. `letters` must be the rect the keys
+    // occupy: the demo once passed "the board minus one key height", which put this zone
+    // on top of the bottom row, so ⌫ / ⏎ / space typed their key and a space. A zone
+    // thinner than MIN_ZONE_H is not offered -- a sliver along the screen edge is a
+    // mis-tap waiting to happen, not a spacebar.
+    let bottom = Rect::from_min_max(
+        Pos2::new(board.left(), letters.bottom()),
+        Pos2::new(board.right(), (letters.bottom() + BOTTOM_H).min(board.bottom())),
+    );
+    if bottom.height() >= MIN_ZONE_H {
+        out.push(Zone { rect: bottom, edge: Edge::Bottom, live_while_swiping: true });
+    }
     if let Some(free) = half.free_zone(board) {
         let (rect, edge) = match half {
             // Anchored left: the strip is on the right.
@@ -455,6 +464,28 @@ mod zone_tests {
         // And with the FULL BOARD as the letter region — the bug — the same path is one word.
         let whole = Rect::from_min_max(board.min, egui::pos2(board.max.x, board.max.y - 40.0));
         assert_eq!(segment(&path, whole).ranges.len(), 1, "the premise: the old rect swallowed it");
+    }
+
+    /// THE DOUBLE-FIRE. When the keys reach the bottom of the board there is no bottom zone
+    /// at all, and no zone ever contains a point inside the letters rect -- a tap on the
+    /// bottom row's ⌫ must not also be a tap on a space zone.
+    #[test]
+    fn no_zone_lies_on_the_keys() {
+        let b = board();
+        // Keys fill the board: nothing below them.
+        assert!(zones(b, b, Side::Off).is_empty(), "a zone with no room under the keys");
+        // A sliver under the keys is not a zone either.
+        let l = Rect::from_min_max(b.min, Pos2::new(b.max.x, b.max.y - 6.0));
+        assert!(zones(b, l, Side::Off).is_empty(), "a 6pt sliver was offered as a zone");
+        // With room, the zone starts exactly where the keys end.
+        for side in [Side::Off, Side::Left, Side::Right] {
+            let keys = side.board_rect(b);
+            let l = Rect::from_min_max(Pos2::new(keys.left(), 0.0), Pos2::new(keys.right(), 200.0));
+            for z in zones(b, l, side) {
+                let inner = z.rect.shrink(0.01);
+                assert!(!inner.intersects(l), "{side:?}: zone {:?} overlaps the keys {l:?}", z.rect);
+            }
+        }
     }
 
     /// The freed strip finally has a job — this is what `halfboard::free_zone` was returning

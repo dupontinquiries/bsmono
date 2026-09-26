@@ -106,20 +106,15 @@ impl SwipeState {
         self.path.len()
     }
 
-    /// Project the rendered layout into recognizer hitboxes. Deliberately the same walk as
-    /// [`crate::hit_test`]: if these two ever disagree, a swipe would decode against a
-    /// different keyboard than the one under the finger.
+    /// Project the rendered layout into recognizer hitboxes -- from [`crate::key_rects`], the
+    /// same function that places the painted keys, so a swipe decodes against the keyboard
+    /// under the finger. This used to be its own copy of the walk, which had drifted from
+    /// the painter (no gap between keys, rows ~3pt short each).
     pub fn hitboxes(layout: &Layout, board: Rect, adaptive: &Adaptive) -> Vec<KeyHitbox> {
-        let gutter = adaptive.gutter;
-        let key_h = adaptive.min_touch_target;
+        let rects = crate::key_rects(layout, board, adaptive, &crate::Style::default());
         let mut out = Vec::new();
-        let mut y = board.top();
-        for row in &layout.rows {
-            let total_weight: f32 = row.keys.iter().map(|k| k.weight).sum::<f32>().max(0.001);
-            let usable = board.width() - gutter * (row.keys.len() as f32 + 1.0);
-            let mut x = board.left() + gutter;
-            for key in &row.keys {
-                let w = (usable * (key.weight / total_weight)).max(8.0);
+        for (row, rs) in layout.rows.iter().zip(&rects) {
+            for (key, r) in row.keys.iter().zip(rs) {
                 // Only single-character keys are swipe targets — space, shift, backspace and
                 // the layout switchers must never swallow a pivot, or every word would decode
                 // with a modifier wedged into the middle of it.
@@ -128,14 +123,12 @@ impl SwipeState {
                 out.push(KeyHitbox {
                     label: key.emit.clone(),
                     swipe_target,
-                    x: x as f64,
-                    y: y as f64,
-                    width: w as f64,
-                    height: key_h as f64,
+                    x: r.left() as f64,
+                    y: r.top() as f64,
+                    width: r.width() as f64,
+                    height: r.height() as f64,
                 });
-                x += w;
             }
-            y += key_h + gutter;
         }
         out
     }

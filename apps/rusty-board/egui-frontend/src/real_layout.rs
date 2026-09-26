@@ -158,6 +158,16 @@ impl Arrow {
         }
     }
 
+    /// What a key shows for this arrow.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Arrow::Left => "←",
+            Arrow::Right => "→",
+            Arrow::Up => "↑",
+            Arrow::Down => "↓",
+        }
+    }
+
     /// The token a spacebar swipe emits.
     pub fn token(self) -> String {
         format!("{ACT}{}", match self {
@@ -194,6 +204,31 @@ pub fn attach_space_arrows(layout: &mut crate::Layout) {
             ];
         }
     }
+}
+
+/// What a key SHOWS for a gesture value. Most values are their own label ("é", "1"), but an
+/// action token is `\0act:<name>` -- a string for the dispatcher, not for a person. The
+/// spacebar's arrow swipes are the case that reached the screen: the cardinal boards
+/// printed `act:down` (with a missing-glyph box for the NUL) around their spacebar, and
+/// every board slid the raw token onto the spacebar during an arrow swipe.
+pub fn display_label(value: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if !value.starts_with(ACT) {
+        return Cow::Borrowed(value);
+    }
+    Cow::Borrowed(match classify(value) {
+        Press::Arrow(a) => a.glyph(),
+        Press::Backspace => "⌫",
+        Press::Return => "⏎",
+        Press::Shift => "⇧",
+        Press::Text(t) if t == " " => "␣",
+        Press::Text(t) if t == "\t" => "⇥",
+        Press::SymbolsToggle => "?123",
+        Press::Voice => "🎤",
+        // An action this function has no glyph for is shown as its name, never as the
+        // token with its NUL.
+        _ => value.trim_start_matches(ACT),
+    })
 }
 
 /// Turn a `keyboard_ui` emission back into a typed [`Press`].
@@ -482,6 +517,37 @@ impl Default for RealBoard {
 
 #[cfg(test)]
 mod tests {
+    /// Action tokens are for the dispatcher: what a key SHOWS for one is a glyph, never
+    /// the token with its NUL.
+    #[test]
+    fn action_tokens_display_as_glyphs() {
+        assert_eq!(display_label(&Arrow::Left.token()), "←");
+        assert_eq!(display_label(&Arrow::Down.token()), "↓");
+        assert_eq!(display_label("é"), "é", "a plain value is its own label");
+        assert!(!display_label(&format!("{ACT}frobnicate")).contains('\u{0}'));
+        // Every gesture value on every board in the app displays without a NUL.
+        let mut n = 0;
+        let mut boards: Vec<crate::Layout> = crate::Board::new().layout_names().iter().enumerate().map(|(i, _)| {
+            let mut b = crate::Board::new();
+            b.set_layout(i);
+            b.rendered().into_owned()
+        }).collect();
+        boards.extend(RealBoard::new().files.iter().map(|f| {
+            let mut l = to_render(f, Shift::Off);
+            attach_space_arrows(&mut l);
+            l
+        }));
+        for l in &boards {
+            for k in l.rows.iter().flat_map(|r| &r.keys) {
+                for (_, v) in &k.cardinal {
+                    assert!(!display_label(v).contains('\u{0}'), "{:?} on {} shows a raw token", v, l.name);
+                    n += 1;
+                }
+            }
+        }
+        assert!(n > 20, "the scan found {n} gesture values");
+    }
+
 
     #[test]
     fn a_letter_with_accents_reaches_them_by_swipe() {

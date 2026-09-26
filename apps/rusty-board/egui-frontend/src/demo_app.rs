@@ -44,6 +44,14 @@ pub struct Feel {
     reveal: crate::animations::OneShot,
     /// Last frame's visibility, to detect the hidden→shown edge that starts the reveal.
     was_visible: bool,
+    /// The layout rail folded to a sliver, so the keys get the full width.
+    pub rail_collapsed: bool,
+    /// The surface height this frame's content needs -- the keys plus whatever panels are
+    /// open, and nothing under them. See [`Feel::desired_height`].
+    desired_h: Option<f32>,
+    /// The last height asked of the window, so it is asked once per change rather than
+    /// every frame (which would also undo a user's manual resize every frame).
+    asked_h: Option<f32>,
     /// The accessibility scene widgets register with. Held here rather
     /// than built per frame because `A11yScene` remembers focus BY ID
     /// between frames; a per-frame scene forgets, which presents as
@@ -173,6 +181,12 @@ impl Feel {
     /// ONE place, so a key path added later cannot quietly skip the sink
     /// the way the direct `self.typed.push_str` calls did. The preview
     /// is a mirror of what was sent, never the destination.
+    /// What this screen has sent, mirrored -- the on-screen preview's text. Read-only; the
+    /// tests use it to see what a tap actually produced.
+    pub fn typed(&self) -> &str {
+        &self.typed
+    }
+
     fn emit_text(&mut self, text: &str) {
         if let Err(e) = self.sink.commit_text(text) {
             self.sink_error = Some(e);
@@ -319,6 +333,9 @@ impl Feel {
             placement: crate::platform::placement(),
             reveal: Default::default(),
             was_visible: false,
+            rail_collapsed: false,
+            desired_h: None,
+            asked_h: None,
             a11y: uikit_egui::a11y::A11yScene::new(),
             trail_style: TrailStyle::Solid,
             board: Board::new(),
@@ -643,7 +660,7 @@ impl Feel {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("layout: {}", self.board.current().name)).strong());
                 ui.separator();
-                ui.label("hold a key for accents · drag across letters to swipe-type · tap a sidebar tab to switch layout");
+                ui.label("hold a key for accents · drag across letters to swipe-type · tap an icon at the left to switch layout");
                 // The service's commit count, shown because a silent
                 // pass-through is indistinguishable from one that is not wired
                 // — which is exactly how this module sat unreached with 19
@@ -963,23 +980,39 @@ impl Feel {
         }
 
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let adaptive = Adaptive::detect(ctx);
+        let mut board_h = 0.0f32;
+        let mut inner_top = 0.0f32;
+        let central = egui::CentralPanel::default().show(ctx, |ui| {
+            inner_top = ui.max_rect().top();
+            // THE KEYBOARD'S profile, not the detected one: key height and gap pinned to
+            // GTK's, the same for a pointer and a finger. See `board_adaptive`.
+            let adaptive = crate::board_adaptive(ctx);
             // Layout switching lives in its OWN strip (the sidebar), never contested with a key's
             // gesture space — a whole-board swipe used to race per-key cardinal swipes (see
             // Board::poll_swipe's doc comment) and intermittently "eat" a key's swipe on real touch
             // hardware. A sidebar tap has no such race.
-            ui.horizontal(|ui| {
-                let sidebar_w = 64.0_f32.max(adaptive.min_touch_target * 1.3);
-                ui.allocate_ui(egui::vec2(sidebar_w, ui.available_height()), |ui| {
+            // The height the keys will take, known before they are drawn -- the rail is
+            // capped to it so the switcher can never be what sets the board's height.
+            board_h = if self.real_active {
+                crate::board_height(&self.real.render_rc(), &adaptive)
+            } else {
+                crate::board_height(&self.board.rendered(), &adaptive)
+            };
+            ui.horizontal_top(|ui| {
+                let rail_w = crate::layout_rail::width(self.rail_collapsed);
+                ui.allocate_ui(egui::vec2(rail_w, board_h), |ui| {
                     // demo layouts first, then the REAL layout files (shift/symbols live)
-                    let mut names: Vec<String> = self.board.layout_names().iter().map(|s| s.to_string()).collect();
-                    let demo_n = names.len();
+                    let mut entries: Vec<crate::layout_rail::Entry> = self
+                        .board
+                        .layout_names()
+                        .iter()
+                        .map(|n| crate::layout_rail::Entry::new(n, false))
+                        .collect();
+                    let demo_n = entries.len();
                     let tab_files = self.real.tab_files();
                     for &fi in &tab_files {
-                        names.push(format!("{} ⌨", self.real.files[fi].display_name));
+                        entries.push(crate::layout_rail::Entry::new(&self.real.files[fi].display_name, true));
                     }
-                    let tabs: Vec<uikit_egui::vertical_tabs::Tab> = names.iter().map(|n| uikit_egui::vertical_tabs::Tab::new(n)).collect();
                     let sel = if self.real_active {
                         // While on the symbols page (no tab of its own) keep the previous tab lit.
                         demo_n + tab_files.iter().position(|&fi| fi == self.real.active).unwrap_or(0)
@@ -987,7 +1020,7 @@ impl Feel {
                         self.board.layout_index()
                     };
                     let colors = uikit_egui::palette_colors(self.board.palette());
-                    if let Some(i) = uikit_egui::vertical_tabs::show(ui, &tabs, sel, adaptive.min_touch_target, &colors) {
+                    if let Some(i) = crate::layout_rail::show(ui, &entries, sel, &mut self.rail_collapsed, &colors) {
                         if i < demo_n {
                             self.real_active = false;
                             self.board.set_layout(i);
@@ -998,7 +1031,6 @@ impl Feel {
                         }
                     }
                 });
-                ui.separator();
                 ui.vertical(|ui| {
                     // The reveal: content settles up from 12px low and fades in, inside the
                     // panel. `set_opacity` scopes to this Ui, so the sidebar and status strip
@@ -1007,11 +1039,15 @@ impl Feel {
                     ui.add_space(crate::platform::reveal_offset(t, 12.0));
                     ui.set_opacity(0.15 + 0.85 * crate::platform::reveal_progress(t));
                     let board_top = ui.cursor().min;
+                    // Whether a KEY produced something this frame. A space zone must never
+                    // fire on the same release as a key -- see the zone tap below.
+                    let mut key_fired = false;
                     if self.real_active {
                         // the real layout files: render via the projection, feed emissions through
                         // the board's state machine (shift/symbols absorbed), act on the rest
                         let render = self.real.render_rc();
                         if let Some(e) = keyboard_ui_styled(ui, &render, &adaptive, self.board.palette(), self.style) {
+                            key_fired = true;
                             // THROUGH THE SINK, not straight into the
                             // preview string. These wrote to `self.typed`
                             // directly, which is the same bug as the
@@ -1062,6 +1098,7 @@ impl Feel {
                         self.board.set_voice_active(self.dictation.is_active());
                         keyboard_ui_styled(ui, &self.board.rendered(), &adaptive, self.board.palette(), self.style)
                     } {
+                        key_fired = true;
                         // Same decoder as the real layouts, so a mic key or an action token
                         // on a code-built board means the same thing it means on a JSON one.
                         match crate::real_layout::classify(&e) {
@@ -1157,13 +1194,13 @@ impl Feel {
                     // the last commit and nothing drew or tapped them, so the strip a
                     // compacted board frees was a live region with no visible job — and the
                     // bottom zone, which every board has, was invisible too.
-                    let letters = egui::Rect::from_min_max(
-                        board_rect.min,
-                        egui::pos2(
-                            board_rect.max.x,
-                            (board_rect.max.y - adaptive.min_touch_target).max(board_rect.min.y),
-                        ),
-                    );
+                    // The zones are laid around the KEYS, which is all of `board_rect` now that
+                    // the board occupies exactly its rows. This subtracted one key height and
+                    // called the rest "letters", so the bottom zone sat ON the bottom row: a tap
+                    // on ⌫, space or ⏎ there typed the key AND a space from the zone under it --
+                    // the "delete gives delete plus space" report. With the keys as the letters
+                    // rect the bottom zone only exists where no key is (`springboard::zones`).
+                    let letters = crate::board_area(board_rect);
                     // THE CALIBRATION TAKES THE BOARD while it is open: the overlay measures
                     // a reach against these keys, and letting a sweep also type would give the
                     // operator a screen full of letters at the moment they are concentrating
@@ -1199,7 +1236,7 @@ impl Feel {
                         }
                         return;
                     }
-                    let zones = crate::springboard::zones(board_rect, letters, self.style.half);
+                    let zones = crate::springboard::zones(crate::board_area(board_rect), letters, self.style.half);
                     let swiping = self.swipe.is_active();
                     {
                         let colors = uikit_egui::palette_colors(self.board.palette());
@@ -1272,13 +1309,17 @@ impl Feel {
                             ctx.request_repaint();
                         }
                     }
-                    // A tap in a live zone is a plain space. Read before the words below so
-                    // a tap and a swipe-commit in the same frame stay in the order they
-                    // happened.
+                    // A tap in a live zone is a plain space -- only when the press STARTED in
+                    // the zone as well, and never on a frame a key fired. Either guard alone
+                    // closes the double-fire; both, because a zone is exactly the kind of
+                    // region that ends up under a key again after the next layout change.
                     if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
                         self.last_touch = Some(p);
-                        if ui.input(|i| i.pointer.primary_released())
+                        let origin = ui.input(|i| i.pointer.press_origin());
+                        if !key_fired
+                            && ui.input(|i| i.pointer.primary_released())
                             && crate::springboard::zone_at(&zones, p, swiping).is_some()
+                            && origin.is_some_and(|o| crate::springboard::zone_at(&zones, o, swiping).is_some())
                         {
                             self.emit_text(" ");
                         }
@@ -1315,6 +1356,38 @@ impl Feel {
                 });
             });
         });
+
+        // TRIM THE SURFACE TO THE CONTENT. The window was a fixed 340pt and the board is
+        // four or five 50pt rows, so a strip of nothing sat under the keys. GTK sizes its
+        // surface to `rows * key_h + gaps + chrome` on every rebuild
+        // (`keyboard_view.rs`); this is the same, measured: whatever the panels above and
+        // below take, the central panel's own margins, and the board's height -- never the
+        // reveal's transient offset, which would ask for a taller window for 200ms.
+        let panel = central.response.rect;
+        let screen = ctx.content_rect();
+        let margin = (inner_top - panel.top()).max(0.0);
+        let above = panel.top() - screen.top();
+        let below = screen.bottom() - panel.bottom();
+        let want = (above + margin + board_h + margin + below).ceil();
+        self.desired_h = Some(want);
+        // Floating / ruled windows are resized through eframe; the layer-shell host reads
+        // `desired_height` and resizes its surface itself (the command is not delivered
+        // there). Asked once per change, so a user who drags the window taller keeps it
+        // until the content changes again.
+        if self.placement != crate::platform::Placement::LayerShell
+            && self.asked_h.is_none_or(|a| (a - want).abs() > 0.5)
+            && (screen.height() - want).abs() > 0.5
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(screen.width(), want)));
+            self.asked_h = Some(want);
+        }
+    }
+
+    /// The surface height the last frame's content needed: the keys and any open panels,
+    /// nothing under them. `None` before the first frame. The layer-shell host sizes its
+    /// surface (and exclusive zone) from this, as GTK's does from its computed height.
+    pub fn desired_height(&self) -> Option<f32> {
+        self.desired_h
     }
 }
 
