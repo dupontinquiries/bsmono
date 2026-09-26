@@ -475,6 +475,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     // ── patterns, on 16th steps, cut into 64-step parts ──────────────────
     let mut parts: BTreeMap<i64, Vec<(usize, u32)>> = BTreeMap::new(); // FL pattern -> (rack pattern, start step)
     let (mut off_grid, mut collided) = (0usize, 0usize);
+    let mut rolls_kept: BTreeMap<u8, usize> = BTreeMap::new();
     for pat in &patterns {
         let Some(pid) = i(&pat["iid"]) else { continue };
         let notes: Vec<&Value> = pat["notes"].as_array().into_iter().flatten().collect();
@@ -489,15 +490,48 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
             let steps = (total - from).min(MAX_STEPS);
             let label = if n_parts > 1 { format!("{pname} ({}/{n_parts})", k + 1) } else { pname.clone() };
             let mut rp = Pattern::new(&label, steps, rack.channels.len());
+            // ROLLS inside a step: a sampler's hits at evenly spaced offsets within
+            // one 16th -- {0, 1/2}, {0, 1/3, 2/3} (the trap hi-hat's 16th-note
+            // TRIPLETS: Goat's closed hat, 8 and 16 ticks into 24-tick steps), or
+            // quarters -- are ONE hit with a RATCHET of 2 / 3 / 4, which puts the
+            // retriggers exactly there. Snapped to the grid they collapsed.
+            let mut by_step: BTreeMap<(usize, i64), Vec<f64>> = BTreeMap::new();
+            for n in &notes {
+                let Some(&ch) = i(&n["rack"]).and_then(|r| rack_ix.get(&r)) else { continue };
+                if !matches!(rack.channels[ch].kind, SynthKind::Sampler { .. }) || key_of(&n["key"]).unwrap_or(60) != 60 { continue; }
+                let pos = i(&n["pos"]).unwrap_or(0) as f64;
+                let base = (pos / step_ticks + 1e-9).floor() as i64;
+                by_step.entry((ch, base)).or_default().push(pos - base as f64 * step_ticks);
+            }
+            let mut ratchet_of: BTreeMap<(usize, i64), u8> = BTreeMap::new();
+            for (k, offs) in by_step.iter_mut() {
+                offs.sort_by(|a, b| a.total_cmp(b));
+                offs.dedup_by(|a, b| (*a - *b).abs() < 0.5);
+                for r in [2u8, 3, 4] {
+                    if offs.len() == r as usize && offs.iter().enumerate().all(|(j, o)| (o - j as f64 * step_ticks / r as f64).abs() <= 1.0) {
+                        ratchet_of.insert(*k, r);
+                    }
+                }
+            }
             for n in &notes {
                 let Some(&ch) = i(&n["rack"]).and_then(|r| rack_ix.get(&r)) else { continue };
                 let pos = i(&n["pos"]).unwrap_or(0) as f64;
                 let step_f = pos / step_ticks;
                 let step = step_f.round() as i64 - from as i64;
                 if step < 0 || step >= steps as i64 { continue; }
-                if (step_f - step_f.round()).abs() > 1e-6 { off_grid += 1; }
                 let key = key_of(&n["key"]).unwrap_or(60);
                 let is_sampler = matches!(rack.channels[ch].kind, SynthKind::Sampler { .. });
+                if (step_f - step_f.round()).abs() > 1e-6 && !(is_sampler && key == 60 && ratchet_of.contains_key(&(ch, (pos / step_ticks + 1e-9).floor() as i64))) { off_grid += 1; }
+                let base = (pos / step_ticks + 1e-9).floor() as i64;
+                if is_sampler && key == 60 && ratchet_of.contains_key(&(ch, base)) {
+                    let (r, st) = (ratchet_of[&(ch, base)], (base - from as i64) as u32);
+                    if st < steps && !rp.is_set(ch, st) {
+                        rp.set(ch, st, true);
+                        rp.set_mod(ch, st, studio_live::StepMod { ratchet: r, ..Default::default() });
+                        *rolls_kept.entry(r).or_default() += 1;
+                    }
+                    continue; // the roll's other hits ARE the ratchet
+                }
                 if is_sampler && key == 60 {
                     if rp.is_set(ch, step as u32) { collided += 1; }
                     rp.set(ch, step as u32, true);
@@ -511,6 +545,10 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
             parts.entry(pid).or_default().push((rack.patterns.len(), from));
             rack.patterns.push(rp);
         }
+    }
+    if !rolls_kept.is_empty() {
+        report.push(format!("ROLLS inside a step kept as RATCHETS: {}",
+            rolls_kept.iter().map(|(r, n)| format!("{n} x{r}{}", if *r == 3 { " (16th-note triplets)" } else { "" })).collect::<Vec<_>>().join(", ")));
     }
     if off_grid > 0 || collided > 0 {
         report.push(format!("patterns are on 16th steps: {off_grid} note{} off the grid moved to the nearest step, {collided} hit{} landed on an already-set step (merged)",
@@ -1277,6 +1315,30 @@ mod tests {
         assert_eq!(g("Open hat"), g("808 C"), "cuts 9: joins group 9");
         assert!(im.report.iter().any(|r| r.contains("APPROXIMATED") && r.contains("Open hat")), "{:?}", im.report);
         assert!(im.report.iter().any(|r| r.contains("FADES not honoured") && r.contains("808 A (300)")), "{:?}", im.report);
+    }
+
+    /// A trap hat roll: hits at 0, 8, 16 ticks of a 24-tick step (16th-note
+    /// triplets) become ONE hit with ratchet 3; a plain hit elsewhere stays
+    /// plain; a lone off-grid hit is still snapped and counted.
+    #[test]
+    fn a_hat_roll_inside_a_step_is_a_ratchet() {
+        let inv = json!({
+            "project": {"ppq": 96, "tempo": 120.0},
+            "channels": [{"iid": 0, "kind": "Sampler", "name": "Hat", "sample_file": "kick.wav"}],
+            "patterns": [{"iid": 1, "name": "Hats", "notes": [
+                {"rack": 0, "pos": 0, "len": 0, "key": 60}, {"rack": 0, "pos": 8, "len": 0, "key": 60}, {"rack": 0, "pos": 16, "len": 0, "key": 60},
+                {"rack": 0, "pos": 48, "len": 0, "key": 60}, {"rack": 0, "pos": 77, "len": 0, "key": 60}]}],
+            "arrangements": [{"tracks": [{"iid": 1, "name": "Hats", "items": [{"kind": "PatternPLItem", "pattern": 1, "pos": 0, "len": 384}]}]}],
+            "mixer": []
+        });
+        let im = import(&inv, "roll", &probe).unwrap();
+        let p = &im.rack.patterns[0];
+        assert!(p.is_set(0, 0) && p.mod_at(0, 0).ratchet == 3, "the roll is a ratchet 3: {:?}", p.mod_at(0, 0));
+        assert!(!p.is_set(0, 1), "its other hits are not separate steps");
+        assert!(p.is_set(0, 2) && p.mod_at(0, 2).ratchet <= 1, "the plain hit stays plain");
+        assert!(p.is_set(0, 3), "the lone off-grid hit (77 ticks) snaps to step 3");
+        assert!(im.report.iter().any(|r| r.contains("1 x3 (16th-note triplets)")), "{:?}", im.report);
+        assert!(im.report.iter().any(|r| r.contains("1 note off the grid")), "only the lone hit counts as off-grid: {:?}", im.report);
     }
 
     #[test]
