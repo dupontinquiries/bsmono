@@ -1,5 +1,5 @@
 // Clawbound — Battleground · Rust + wgpu Microvoxel Edition
-// A 5v5 three-lane arena for the thirteen legendary ancestors of Clawbound,
+// An arena for the fourteen legendary ancestors of Clawbound,
 // with dynamic weather and map events, everything rendered as instanced
 // microvoxels.
 //
@@ -22,8 +22,60 @@ pub mod floor;
 pub mod map;
 /// The match opening as a timeline: pan, lanes, spawns, versus card.
 pub mod intro;
+/// Watching a match: a director, a chase-cam, free flight, all eased.
+pub mod spectator;
 /// The intro's fanfare, synthesized brass.
 pub mod brass;
+/// Loaded clips played in the audio callback: realtime-safe, three buses, ducking.
+pub mod mixer;
+/// The space sounds happen in: stereo reverb and echo, set by place.
+pub mod reverb;
+/// Music, sfx and voices loaded from .opus/.wav in the background.
+pub mod soundbank;
+/// Which sounds a game event asks for; placement; voice gating.
+pub mod cues;
+/// Every line the game voices, as data: the recording script.
+pub mod voicescript;
+/// Who the ancestors are: species, age, land, gender, story, music; checked against the game.
+pub mod lore;
+/// Brawls: body collision, melee identity, area falloff, siphon, winded.
+pub mod brawl;
+/// Fight decisions (stances), the playbook of team styles, and the arena
+/// league that breeds new pages for it.
+pub mod tactics;
+pub mod playbook;
+pub mod arena;
+/// Lane minions: what they fight and when they change their mind.
+pub mod minionai;
+/// Starwell Glacier: the sky map's geometry.
+pub mod sky;
+/// What stands on Starwell Glacier, and its meshes.
+pub mod skyworld;
+pub mod skyprops;
+/// Cloud ferries across the sky map's chasms.
+pub mod ferry;
+/// The Moonwell: healing water, the Moonwyrm's claim, and its boons.
+pub mod moonwell;
+/// The Moonwyrm's flights over the sky map, and the stars it lets fall.
+pub mod wyrmflight;
+/// The Moonwyrm's 400 u body: where each part of it is, coiled or flying.
+pub mod wyrmbody;
+/// Floating stone and drifting cloud round the sky map's islands.
+pub mod skydrift;
+/// Snow that lies, drifts and keeps prints (ultra; presentation only).
+pub mod snowpack;
+/// Cloud banks and wisps drifting over the sky map, and who they hide.
+pub mod skycloud;
+/// A clan's camp at each home base: leader's rock, dens, brambles.
+pub mod clancamp;
+/// The generated preparation documents in dev/ (cue cards, recording sheet, cue sheet).
+pub mod devdocs;
+/// Character voxels as smooth surfaces with fur lengths, for the ultra preview.
+pub mod smoothvox;
+/// The announcer: game-state calls, prioritized, never overlapping.
+pub mod announcer;
+/// The game's sound effects, designed in code (rendered by examples/gen_sfx).
+pub mod sfxgen;
 /// Twinfang Pass: the mountain canyon map, 15 a side.
 pub mod pass;
 /// The pass's world: where its rocks, scrub, pines and waterfalls stand.
@@ -34,6 +86,8 @@ pub mod going;
 pub mod lanlobby;
 /// Input-only lockstep: the rule that lets two machines play one match.
 pub mod lockstep;
+/// The lockstep wire: redundant inputs, adaptive delay, time dilation, a network simulator.
+pub mod netplay;
 /// Oriented capsule hit tests for the cats.
 pub mod hitbox;
 /// The river crossings: fallen logs that can be worked loose and roll.
@@ -98,6 +152,8 @@ pub mod abilities;
 pub mod ai;
 /// A bot's last look at the ground: skirt small thickets, turn from walls.
 pub mod steer;
+/// Prepare an ability, see its guide on the ground, fire with the attack button.
+pub mod targeting;
 pub mod vfx;
 /// Per-ancestor elemental motifs thrown on every cast.
 pub mod signature;
@@ -113,3 +169,5 @@ pub mod shopui;
 pub mod launch;
 pub mod app;
 pub mod headless;
+/// Headless screenshots of Starwell Glacier (`CLAWBOUND_SHOTS=sky`).
+pub mod skyshots;

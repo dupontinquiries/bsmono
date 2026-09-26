@@ -257,7 +257,7 @@ impl Game {
 
     pub fn end_map_event(&mut self, kind: MapEventKind) {
         if kind == MapEventKind::LongNight {
-            self.weather.night_target = 0.0;
+            self.weather.night_target = crate::weather::base_night();
         }
         self.map_events.active = None;
         self.map_events.next_t = self.t + self.rng.range(75.0, 110.0);

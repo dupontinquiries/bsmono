@@ -393,7 +393,7 @@ impl Game {
             }
             DisasterKind::Tempest => {
                 self.weather.force(WeatherKind::Storm, now + kind.duration());
-                self.weather.night_target = 0.6;
+                self.weather.night_target = crate::weather::base_night().max(0.6);
             }
             DisasterKind::Earthquake => {
                 self.disasters.shake = 1.0;
@@ -417,7 +417,7 @@ impl Game {
         self.disasters.active = None;
         self.disasters.tornado = None;
         if kind == DisasterKind::Tempest {
-            self.weather.night_target = if self.map_events.is(crate::map_events::MapEventKind::LongNight) { 1.0 } else { 0.0 };
+            self.weather.night_target = if self.map_events.is(crate::map_events::MapEventKind::LongNight) { 1.0 } else { crate::weather::base_night() };
         }
         self.events.push(Event::DisasterEnd { kind });
         self.events.push(Event::Announce { text: match kind {

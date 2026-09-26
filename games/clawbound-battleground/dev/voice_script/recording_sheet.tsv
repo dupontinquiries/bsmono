@@ -1,0 +1,156 @@
+file	voice	line	direction	energy	plays when
+voice/goldenmane/select.opus	goldenmane	The pride rides with me!	rallying call, chest out	4	locked in on the select screen
+voice/goldenmane/cast1.opus	goldenmane	Sunstrike!	a pounce -- sharp, leaping upward	4	winds up Sunstrike Pounce
+voice/goldenmane/cast2.opus	goldenmane	Behind my mane!	protective, planting your feet	3	winds up Mane of Dawn
+voice/goldenmane/cast3.opus	goldenmane	As one, pride!	a battle cry to the team	4	winds up Pride's Warmth
+voice/goldenmane/cast4.opus	goldenmane	Hear me ROAR!	build to a full roar on the last word	5	winds up The Great Roar
+voice/goldenmane/kill.1.opus	goldenmane	A whisker, alone.	quiet satisfaction, almost kind	2	takes down an enemy ancestor
+voice/goldenmane/kill.2.opus	goldenmane	The pride feeds.	low, pleased growl	3	takes down an enemy ancestor
+voice/goldenmane/death.1.opus	goldenmane	The pride... endures...	wounded, proud to the last	2	falls
+voice/goldenmane/death.2.opus	goldenmane	Not... alone...	fading breath	1	falls
+voice/duskstripe/select.opus	duskstripe	You never looked.	a whisper right in the ear	2	locked in on the select screen
+voice/duskstripe/cast1.opus	duskstripe	Maul.	one heavy word, a blow	3	winds up Shadow Maul
+voice/duskstripe/cast2.opus	duskstripe	Into the reeds.	breathy, vanishing	1	winds up Stripes in the Reeds
+voice/duskstripe/cast3.opus	duskstripe	Hungry.	a purr with teeth	2	winds up Night's Hunger
+voice/duskstripe/cast4.opus	duskstripe	Let dusk fall.	slow, final, sinking pitch	3	winds up Long Shadows
+voice/duskstripe/kill.1.opus	duskstripe	Once was enough.	matter-of-fact	2	takes down an enemy ancestor
+voice/duskstripe/kill.2.opus	duskstripe	From behind.	a smile you can hear	2	takes down an enemy ancestor
+voice/duskstripe/death.1.opus	duskstripe	Seen... at last...	surprised, then resigned	2	falls
+voice/duskstripe/death.2.opus	duskstripe	Too... bright...	fading hiss	1	falls
+voice/rainspots/select.opus	rainspots	Around, and through.	light and knowing	3	locked in on the select screen
+voice/rainspots/cast1.opus	rainspots	Flow!	quick burst, forward motion	4	winds up Spotted Blur
+voice/rainspots/cast2.opus	rainspots	Mend, like water.	gentle, soothing	2	winds up Fisher's Mercy
+voice/rainspots/cast3.opus	rainspots	Riverborn!	proud, rising	4	winds up Riverborn
+voice/rainspots/cast4.opus	rainspots	The flood comes!	swelling, unstoppable	5	winds up Floodrush
+voice/rainspots/kill.1.opus	rainspots	Washed away.	breezy	2	takes down an enemy ancestor
+voice/rainspots/kill.2.opus	rainspots	The river wins.	calm certainty	3	takes down an enemy ancestor
+voice/rainspots/death.1.opus	rainspots	Back... to the river...	peaceful, drifting off	2	falls
+voice/rainspots/death.2.opus	rainspots	Still... flowing...	a last smile	1	falls
+voice/nightpelt/select.opus	nightpelt	Where you run, I am.	soft, inevitable	2	locked in on the select screen
+voice/nightpelt/cast1.opus	nightpelt	Midnight.	a single struck bell of a word	3	winds up Pounce of Midnight
+voice/nightpelt/cast2.opus	nightpelt	Veil.	barely voiced	1	winds up Veilwalker
+voice/nightpelt/cast3.opus	nightpelt	Hush...	a breath out	1	winds up Silent Footfall
+voice/nightpelt/cast4.opus	nightpelt	ECLIPSE!	the one time the woods scream	5	winds up Eclipse Hunt
+voice/nightpelt/kill.1.opus	nightpelt	You ran to me.	gentle, almost sorry	2	takes down an enemy ancestor
+voice/nightpelt/kill.2.opus	nightpelt	Sleep.	a lullaby of one word	1	takes down an enemy ancestor
+voice/nightpelt/death.1.opus	nightpelt	The moon... rises...	wonder, fading	2	falls
+voice/nightpelt/death.2.opus	nightpelt	Found...	a sigh	1	falls
+voice/windclaw/select.opus	windclaw	The sky is prey!	exuberant, head thrown back	4	locked in on the select screen
+voice/windclaw/cast1.opus	windclaw	Snap!	a clipped bark	4	winds up Sky Snap
+voice/windclaw/cast2.opus	windclaw	Sand!	spat out mid-sprint	3	winds up Sand Dash
+voice/windclaw/cast3.opus	windclaw	Up, up!	eager, climbing	3	winds up Skyward Hunger
+voice/windclaw/cast4.opus	windclaw	A hundred leaps!	joyful frenzy	5	winds up Hundred Leaps
+voice/windclaw/kill.1.opus	windclaw	Caught on the wind!	gleeful	4	takes down an enemy ancestor
+voice/windclaw/kill.2.opus	windclaw	Plucked!	a laugh in it	3	takes down an enemy ancestor
+voice/windclaw/death.1.opus	windclaw	The ground... again...	disgusted	2	falls
+voice/windclaw/death.2.opus	windclaw	Grounded...	deflated	1	falls
+voice/faryowl/select.opus	faryowl	Hear me across the clearing!	project to the back row	4	locked in on the select screen
+voice/faryowl/cast1.opus	faryowl	YOWL!	a piercing sung note	5	winds up Piercing Yowl
+voice/faryowl/cast2.opus	faryowl	Wall of sound!	big and round	4	winds up Wall of Sound
+voice/faryowl/cast3.opus	faryowl	Sing, far!	lilting, a phrase of song	3	winds up The Far Song
+voice/faryowl/cast4.opus	faryowl	The Great Caterwaul!	an operatic swell	5	winds up The Great Caterwaul
+voice/faryowl/kill.1.opus	faryowl	Heard that?	cheeky	3	takes down an enemy ancestor
+voice/faryowl/kill.2.opus	faryowl	Silenced.	a sung falling third	3	takes down an enemy ancestor
+voice/faryowl/death.1.opus	faryowl	My... song...	a note that breaks	2	falls
+voice/faryowl/death.2.opus	faryowl	...quiet...	almost nothing	1	falls
+voice/oldroar/select.opus	oldroar	The old world... wakes.	deep, slow, a long pause	3	locked in on the select screen
+voice/oldroar/cast1.opus	oldroar	Boulder!	a grunt of effort	4	winds up Boulder Paw
+voice/oldroar/cast2.opus	oldroar	Shatter!	cracking, harsh	4	winds up Shatter Ground
+voice/oldroar/cast3.opus	oldroar	Wounds... fury!	pain turning to rage	4	winds up Deep Wounds, Deep Fury
+voice/oldroar/cast4.opus	oldroar	EARTH -- SHAKE!	two huge beats	5	winds up Earthshaker
+voice/oldroar/kill.1.opus	oldroar	Back to the ice.	rumbling	3	takes down an enemy ancestor
+voice/oldroar/kill.2.opus	oldroar	Old. And stronger.	slow pride	3	takes down an enemy ancestor
+voice/oldroar/death.1.opus	oldroar	Sleep... again...	a glacier settling	2	falls
+voice/oldroar/death.2.opus	oldroar	The ice... takes me...	fading rumble	1	falls
+voice/twofang/select.opus	twofang	Claws begin. Fangs end.	two cold statements	3	locked in on the select screen
+voice/twofang/cast1.opus	twofang	Lunge!	explosive	4	winds up Saber Lunge
+voice/twofang/cast2.opus	twofang	Hamstring.	precise, surgical	3	winds up Hamstring
+voice/twofang/cast3.opus	twofang	Finish it.	impatient	3	winds up The Saber Finishes
+voice/twofang/cast4.opus	twofang	The killing bite!	a snarl on 'bite'	5	winds up The Killing Bite
+voice/twofang/kill.1.opus	twofang	Ended.	flat	2	takes down an enemy ancestor
+voice/twofang/kill.2.opus	twofang	Two fangs. One end.	grim relish	3	takes down an enemy ancestor
+voice/twofang/death.1.opus	twofang	Dull... fangs...	bitter	2	falls
+voice/twofang/death.2.opus	twofang	Not... the end...	defiant, fading	1	falls
+voice/suneye/select.opus	suneye	The sun keeps no secrets.	a proclamation	3	locked in on the select screen
+voice/suneye/cast1.opus	suneye	Sunspear!	a thrown command	4	winds up Sunspear
+voice/suneye/cast2.opus	suneye	Noon!	blazing, held	4	winds up Noon Blaze
+voice/suneye/cast3.opus	suneye	By the sun's favor.	a blessing	2	winds up The Sun's Favor
+voice/suneye/cast4.opus	suneye	The Eye opens!	awe and fury	5	winds up The Eye of the Sun
+voice/suneye/kill.1.opus	suneye	Burned clean.	serene	2	takes down an enemy ancestor
+voice/suneye/kill.2.opus	suneye	Nothing hides.	judgement	3	takes down an enemy ancestor
+voice/suneye/death.1.opus	suneye	Sunset...	a benediction	2	falls
+voice/suneye/death.2.opus	suneye	So... dark...	fear, at the very end	1	falls
+voice/snowhush/select.opus	snowhush	Here. The fight happens here.	calm, absolute	3	locked in on the select screen
+voice/snowhush/cast1.opus	snowhush	Snowbind.	crisp	3	winds up Snowbind
+voice/snowhush/cast2.opus	snowhush	Hush.	a command, not a request	2	winds up White Silence
+voice/snowhush/cast3.opus	snowhush	Snow, cover us.	protective	2	winds up Hush of Snows
+voice/snowhush/cast4.opus	snowhush	The long winter comes.	slow, spreading	4	winds up The Long Winter
+voice/snowhush/kill.1.opus	snowhush	Silence.	satisfied	2	takes down an enemy ancestor
+voice/snowhush/kill.2.opus	snowhush	Snowed under.	dry humour	2	takes down an enemy ancestor
+voice/snowhush/death.1.opus	snowhush	Cold... at last...	relief	2	falls
+voice/snowhush/death.2.opus	snowhush	The snow... keeps me...	drifting	1	falls
+voice/riptail/select.opus	riptail	The river gathers.	low and certain	3	locked in on the select screen
+voice/riptail/cast1.opus	riptail	Undertow!	a heave	4	winds up Undertow
+voice/riptail/cast2.opus	riptail	Jaws!	a snap	4	winds up Crushing Jaws
+voice/riptail/cast3.opus	riptail	Remember.	ominous	3	winds up The River Remembers
+voice/riptail/cast4.opus	riptail	The river TAKES!	a roar on 'takes'	5	winds up The River Takes
+voice/riptail/kill.1.opus	riptail	Drowned.	cold	2	takes down an enemy ancestor
+voice/riptail/kill.2.opus	riptail	Gathered.	patient pleasure	2	takes down an enemy ancestor
+voice/riptail/death.1.opus	riptail	The current... turns...	surprised	2	falls
+voice/riptail/death.2.opus	riptail	Pulled... under...	sinking	1	falls
+voice/stillsmoke/select.opus	stillsmoke	Sit. The storm will come.	tranquil	2	locked in on the select screen
+voice/stillsmoke/cast1.opus	stillsmoke	Breathe.	a slow exhale	1	winds up Cloud Breath
+voice/stillsmoke/cast2.opus	stillsmoke	Sweet rain.	kind	2	winds up Sweetrain
+voice/stillsmoke/cast3.opus	stillsmoke	The mountain sits.	immovable	3	winds up The Seated Mountain
+voice/stillsmoke/cast4.opus	stillsmoke	NINTH THUNDER!	all the calm breaks at once	5	winds up The Ninth Thunder
+voice/stillsmoke/kill.1.opus	stillsmoke	The storm asked leave.	gently wry	2	takes down an enemy ancestor
+voice/stillsmoke/kill.2.opus	stillsmoke	Still.	a single settled word	1	takes down an enemy ancestor
+voice/stillsmoke/death.1.opus	stillsmoke	Smoke... clears...	unbothered	1	falls
+voice/stillsmoke/death.2.opus	stillsmoke	The thunder... waits...	a promise	2	falls
+voice/stonewhisper/select.opus	stonewhisper	Never late.	understated	2	locked in on the select screen
+voice/stonewhisper/cast1.opus	stonewhisper	Crag!	a leap	4	winds up Crag Leap
+voice/stonewhisper/cast2.opus	stonewhisper	Stone.	unmoved	2	winds up Stone Patience
+voice/stonewhisper/cast3.opus	stonewhisper	Steady.	reassuring	2	winds up Sure-Footed
+voice/stonewhisper/cast4.opus	stonewhisper	The crags answer!	an echoing call	5	winds up The Crags Answer
+voice/stonewhisper/kill.1.opus	stonewhisper	On time.	dry	2	takes down an enemy ancestor
+voice/stonewhisper/kill.2.opus	stonewhisper	The mountain waited.	patient	2	takes down an enemy ancestor
+voice/stonewhisper/death.1.opus	stonewhisper	Crumble...	a rockfall of a word	2	falls
+voice/stonewhisper/death.2.opus	stonewhisper	Stone... sleeps...	settling	1	falls
+voice/cometail/select.opus	cometail	Look up. I'm already falling.	grinning, a little breathless	3	locked in on the select screen
+voice/cometail/cast1.opus	cometail	Starshot!	a flick of the paw, sharp	4	winds up Starshot
+voice/cometail/cast2.opus	cometail	Pounce!	a leap -- up on the vowel	4	winds up Meteor Pounce
+voice/cometail/cast3.opus	cometail	Flare!	a bright burst, eyes shut	4	winds up Flare
+voice/cometail/cast4.opus	cometail	Watch the SKY!	from far above, rising to a shout	5	winds up Falling Star
+voice/cometail/kill.1.opus	cometail	Never saw me coming. Nobody does.	light, teasing	3	takes down an enemy ancestor
+voice/cometail/kill.2.opus	cometail	Burned out.	quiet, almost gentle	2	takes down an enemy ancestor
+voice/cometail/death.1.opus	cometail	Just... a shooting star...	fading, wistful	2	falls
+voice/cometail/death.2.opus	cometail	Back... to the sky...	a last breath, looking up	1	falls
+narrator/prologue1.opus	narrator	Before any word was written, the world belonged to the clans.	hushed, as if starting an old story	2	the prologue opens, line 1 of 8 (first match of a session)
+narrator/prologue2.opus	narrator	No hand raised a wall. No fire burned but the lightning's.	slow, each sentence its own image	2	the prologue, line 2 of 8
+narrator/prologue3.opus	narrator	From the frozen long-ago to the endless dunes, the great cats kept it.	growing, sweeping	3	the prologue, line 3 of 8
+narrator/prologue4.opus	narrator	Lions of the golden plains. Tigers of the dusk. Sabre-fangs of the elder dawn.	a roll-call, each name a beat	3	the prologue, line 4 of 8
+narrator/prologue5.opus	narrator	Their bones are ice and sand now. Their stories never were.	quiet, then warm on the last phrase	2	the prologue, line 5 of 8
+narrator/prologue6.opus	narrator	When a thing cannot be divided, and must not be warred over, the clans hold the Gathering.	measured, the law of the clans	3	the prologue, line 6 of 8
+narrator/prologue7.opus	narrator	They split by lot -- Frostfang and Emberclaw -- and call their ancestors home.	rising, naming the two halves with weight	4	the prologue, line 7 of 8
+narrator/prologue8.opus	narrator	Beasts of power. Beasts of glory. Let the ages meet.	the peak: full voice on the last four words	5	line 8 of 8: the prologue ends, the world comes into view
+announcer/match_start.opus	announcer	The clans are loosed!	the opening bell	5	the intro ends and play begins
+announcer/first_blood.opus	announcer	First blood!	electric	5	the first ancestor falls
+announcer/kill.opus	announcer	An ancestor has fallen!	dramatic	3	any other kill (when nothing bigger applies)
+announcer/double_kill.opus	announcer	Double kill!	rising	4	two kills in quick succession
+announcer/triple_kill.opus	announcer	Triple kill!	higher still	5	three in quick succession
+announcer/rampage.opus	announcer	RAMPAGE!	lose control a little	5	four or more in quick succession
+announcer/spree.opus	announcer	On the prowl!	impressed	4	three kills without dying
+announcer/unstoppable.opus	announcer	Unstoppable!	awed	5	six kills without dying
+announcer/shutdown.opus	announcer	Shut down!	a hard stop	4	a cat on a spree is taken down
+announcer/ace.opus	announcer	Ace! The whole clan has fallen!	the crowd goes wild	5	every cat of one team is dead at once
+announcer/tower_down_frostfang.opus	announcer	A Frostfang tower falls!	news of the front	4	a Frostfang (blue) tower is destroyed
+announcer/tower_down_emberclaw.opus	announcer	An Emberclaw tower falls!	news of the front	4	an Emberclaw (red) tower is destroyed
+announcer/titan_frostfang.opus	announcer	The Frostfang Elder stands unshielded!	urgent	5	the blue Elder can be struck
+announcer/titan_emberclaw.opus	announcer	The Emberclaw Elder stands unshielded!	urgent	5	the red Elder can be struck
+announcer/boss_spawn.opus	announcer	Something stirs in the deep...	hushed suspense	3	a great beast appears
+announcer/boss_down.opus	announcer	The great beast is slain!	triumphant	4	a great beast is killed
+announcer/disaster.opus	announcer	The land turns against you -- take cover!	alarm	5	a disaster is about to strike
+announcer/victory.opus	announcer	Victory!	pure joy	5	your team wins
+announcer/defeat.opus	announcer	Defeat.	sombre, respectful	2	your team loses
+announcer/frostfang_win.opus	announcer	Frostfang are victorious!	the big finish	5	Frostfang win (spectating)
+announcer/emberclaw_win.opus	announcer	Emberclaw are victorious!	the big finish	5	Emberclaw win (spectating)

@@ -1,0 +1,10 @@
+# League pages bred by the arena (cargo run --release --example arena).
+# name|lore|commit give retreat leash tower strafe reach focus group rally objective hold
+# elo 1340 over 34 games, generation 4
+Pride Hunt strain 4.4|Bred in the arena from Pride Hunt.|1.168 0.804 0.332 18.000 0.902 0.569 0.826 0.667 0.977 0.908 0.500 2.500
+# elo 1275 over 40 games, generation 3
+Pride Hunt strain 3.2|Bred in the arena from Pride Hunt.|1.150 0.713 0.260 18.000 1.039 0.569 0.826 0.746 0.900 0.908 0.500 2.590
+# elo 1267 over 30 games, generation 3
+Moonwatch strain 3.1|Bred in the arena from Moonwatch.|1.200 0.826 0.342 16.000 1.031 0.800 1.000 0.332 0.600 0.841 1.000 2.235
+# elo 1257 over 26 games, generation 5
+Moonwatch strain 5.2|Bred in the arena from Moonwatch.|1.323 0.826 0.287 16.000 1.031 0.800 1.000 0.102 0.600 0.664 0.946 2.235

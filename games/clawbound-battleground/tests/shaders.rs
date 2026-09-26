@@ -11,12 +11,13 @@ fn check(name: &str, src: &str) {
 
 #[test]
 fn all_shaders_validate() {
-    check("voxel", include_str!("../shaders/voxel.wgsl"));
+    check("voxel", clawbound::render::shader_src::VOXEL);
     check("shadow", include_str!("../shaders/shadow.wgsl"));
-    check("terrain", include_str!("../shaders/terrain.wgsl"));
+    check("terrain", clawbound::render::shader_src::TERRAIN);
     check("water", include_str!("../shaders/water.wgsl"));
     check("sky", include_str!("../shaders/sky.wgsl"));
-    check("post", include_str!("../shaders/post.wgsl"));
+    check("post", clawbound::render::shader_src::POST);
+    check("smooth", clawbound::render::shader_src::SMOOTH);
 }
 
 /// The frame uniform must be exactly the size WGSL expects (3 mat4 + 8 vec4).

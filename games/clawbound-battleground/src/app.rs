@@ -35,6 +35,10 @@ struct AppState {
     window: &'static Window,
     surface: wgpu::Surface<'static>,
     surface_format: wgpu::TextureFormat,
+    /// The present modes the surface offers, and the one in use (vsync on:
+    /// Fifo; off: `present_mode_for`).
+    present_modes: Vec<wgpu::PresentMode>,
+    present: wgpu::PresentMode,
     renderer: Renderer,
     scene: Option<Scene>,
     egui_ctx: egui::Context,
@@ -78,6 +82,41 @@ struct AppState {
     skip_intro: bool,
     /// Counter the audio synth watches: a change starts the fanfare.
     fanfare_count: u32,
+    /// The ambience's last params, faded to silence out of a match.
+    #[cfg(feature = "audio")]
+    audio_last: crate::audio::AudioParams,
+    /// Loaded audio (`soundbank`), decoding in the background.
+    bank: Option<crate::soundbank::Bank>,
+    /// This tick's events, for the audio cues.
+    audio_events: Vec<crate::sim::Event>,
+    voice_gate: crate::cues::VoiceGate,
+    /// Whether this match's music has been started.
+    music_on: bool,
+    /// The game-state announcer (`announcer`).
+    announcer: crate::announcer::Announcer,
+    /// Frames since the listener's space was last sent to the mixer.
+    space_tick: u32,
+    /// The volumes last sent to the mixer (master, music, sfx, voice).
+    vol_sent: [f32; 4],
+    /// Smoothed frame time, seconds (the frame-rate readout).
+    frame_s: f32,
+    /// Intros played this session: the first is the full, narrated one.
+    intros_played: u32,
+    /// A scored intro track is playing (it replaces the synthesized fanfare).
+    intro_music: bool,
+    /// Watching an all-bot match (`spectator`); None when playing.
+    spectator: Option<crate::spectator::Spectator>,
+    /// Spectator switches pressed since last frame (Tab, Z, X).
+    spec_cycle: i32,
+    spec_director: bool,
+    spec_free: bool,
+    /// A prepared ability awaiting the attack button (`targeting`).
+    targeting: crate::targeting::Targeting,
+    /// The attack button as last frame saw it (for its press edge), and
+    /// whether the current press belongs to the targeting (fired an
+    /// ability) so it must not also start auto-attacks until released.
+    attack_was: bool,
+    attack_eaten: bool,
     thunder_dist: f32,
     launch: crate::launch::LaunchOptions,
 }
@@ -313,12 +352,17 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
             }
         }
     }
-    let GpuInit { surface, device, queue, format, .. } = gpu.ok_or_else(|| {
+    let GpuInit { surface, device, queue, format, adapter, .. } = gpu.ok_or_else(|| {
         format!(
             "no usable GPU backend (tried {}). Set WGPU_BACKEND=metal|vulkan|dx12|gl|all to override, and update your GPU drivers.",
             errors.join(" | ")
         )
     })?;
+    // the present modes this surface offers (vsync off picks from these)
+    let present_modes = surface.get_capabilities(&adapter).present_modes;
+    let cfg0 = Config::load();
+    let present = present_mode_for(cfg0.settings.vsync, &present_modes);
+    eprintln!("[clawbound] present modes {present_modes:?}; using {present:?}");
 
     surface.configure(
         &device,
@@ -327,7 +371,7 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode: present,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -343,6 +387,8 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         window,
         surface,
         surface_format: format,
+        present_modes,
+        present,
         renderer,
         scene: None,
         egui_ctx,
@@ -381,6 +427,26 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         intro: None,
         skip_intro: false,
         fanfare_count: 0,
+        #[cfg(feature = "audio")]
+        // silent until a match: the menu has no wind to fade from
+        audio_last: crate::audio::AudioParams { master: 0.0, ..crate::audio::AudioParams::default() },
+        bank: None,
+        audio_events: Vec::new(),
+        voice_gate: Default::default(),
+        music_on: false,
+        announcer: Default::default(),
+        space_tick: 0,
+        vol_sent: [-1.0; 4],
+        frame_s: 1.0 / 60.0,
+        intros_played: 0,
+        intro_music: false,
+        spectator: None,
+        spec_cycle: 0,
+        spec_director: false,
+        spec_free: false,
+        targeting: Default::default(),
+        attack_was: false,
+        attack_eaten: false,
         thunder_dist: 1.0,
         launch: crate::launch::LaunchOptions::default(),
     })
@@ -484,7 +550,7 @@ fn handle_window_event(s: &mut AppState, event: WindowEvent) {
                     format: s.surface_format,
                     width: size.width.max(1),
                     height: size.height.max(1),
-                    present_mode: wgpu::PresentMode::Fifo,
+                    present_mode: s.present,
                     alpha_mode: wgpu::CompositeAlphaMode::Auto,
                     view_formats: vec![],
                     desired_maximum_frame_latency: 2,
@@ -528,6 +594,24 @@ fn handle_window_event(s: &mut AppState, event: WindowEvent) {
             if state == ElementState::Pressed && !repeat && s.intro.is_some() {
                 s.skip_intro = true;
                 return;
+            }
+            if state == ElementState::Pressed && !repeat && s.spectator.is_some() {
+                use winit::keyboard::{Key, NamedKey};
+                match &logical_key {
+                    Key::Named(NamedKey::Tab) => {
+                        s.spec_cycle += 1;
+                        return;
+                    }
+                    Key::Character(c) if c.eq_ignore_ascii_case("z") => {
+                        s.spec_director = true;
+                        return;
+                    }
+                    Key::Character(c) if c.eq_ignore_ascii_case("x") => {
+                        s.spec_free = true;
+                        return;
+                    }
+                    _ => {}
+                }
             }
             let Some(b) = bind_of_key(&logical_key) else { return };
             match state {
@@ -615,7 +699,17 @@ fn gather_controls(s: &mut AppState, dt: f32) {
         return;
     }
     if c.menu && s.capturing.is_none() {
-        if s.ui.shop_open {
+        if s.spectator.is_some() {
+            // Esc leaves the match being watched
+            s.spectator = None;
+            s.game = None;
+            s.intro = None;
+            s.screen = Screen::Menu;
+            return;
+        } else if s.targeting.slot.is_some() {
+            // Esc puts a prepared ability away before it opens anything
+            s.targeting.slot = None;
+        } else if s.ui.shop_open {
             s.ui.shop_open = false;
             s.ui.sell_armed = None;
         } else if s.controls_open {
@@ -701,18 +795,23 @@ fn compute_aim(s: &AppState) -> Vec3 {
     let player = &s.game.as_ref().unwrap().gods[0];
     let dir = cam_dir(s.cam_yaw, s.cam_pitch);
     let eye = player.pos + Vec3::Y * 1.5 - dir * s.cam_dist;
-    if dir.y < -0.02 {
-        let t = -eye.y / dir.y;
-        let hit = eye + dir * t;
-        let d = Vec3::new(hit.x, 0.0, hit.z) - Vec3::new(player.pos.x, 0.0, player.pos.z);
-        if d.length() > 30.0 {
-            player.pos + d.normalize() * 30.0
-        } else {
-            Vec3::new(hit.x, 0.0, hit.z)
+    // the camera ray against the REAL surface (the pass has a shelf and
+    // slopes; the plane y = 0 put the aim somewhere else), clamped to 30 u
+    // and set down on the ground there
+    let on_ground = |p: Vec3| Vec3::new(p.x, crate::map::surface_y(p.x, p.z), p.z);
+    match crate::map::ray_ground(eye, dir, 400.0) {
+        Some(hit) => {
+            let d = Vec3::new(hit.x - player.pos.x, 0.0, hit.z - player.pos.z);
+            if d.length() > 30.0 {
+                on_ground(player.pos + d.normalize() * 30.0)
+            } else {
+                hit
+            }
         }
-    } else {
-        let f = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
-        player.pos + f * 14.0
+        None => {
+            let f = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
+            on_ground(player.pos + f * 14.0)
+        }
     }
 }
 
@@ -730,12 +829,45 @@ fn switch_map(s: &mut AppState, m: crate::map::MapId) {
     eprintln!("[clawbound] switched to {} in {:.1} s ({} meshes resident)", m.name(), t.elapsed().as_secs_f32(), s.renderer.mesh_count());
 }
 
+/// Watch a match: every cat a bot, on the map picked on the select screen,
+/// the intro first, then the director. Esc leaves.
+fn start_spectate(s: &mut AppState) {
+    s.spectator = None;
+    start_game(s);
+    if let Some(g) = s.game.as_mut() {
+        let lane = g.gods[0].ai.as_ref().map(|b| b.lane).unwrap_or(crate::consts::Lane::Mid);
+        g.gods[0].ai = Some({ let mut b = crate::sim::AiBrain::new(lane, 0.8); b.buy_t = 1.0; b });
+        g.gods[0].is_player = false;
+    }
+    s.spectator = Some(crate::spectator::Spectator::new());
+    s.screen = Screen::Playing;
+}
+
+/// The scene fits the graphics setting: Ultra needs smooth parts built (and
+/// built for the chosen fur -- the face's fur differs); switching Ultra off
+/// only turns it off.
+fn fit_scene_to_quality(s: &mut AppState) {
+    let want = crate::quality::Quality::effective().smooth_characters();
+    let fur = crate::render::FurStyle::from_env();
+    s.renderer.set_fur_style(fur);
+    let rebuild = s.scene.as_ref().is_some_and(|sc| want && (sc.god_smooth.is_empty() || sc.fur_built != fur));
+    if rebuild {
+        let old = s.scene.take().expect("scene");
+        s.renderer.free_meshes_from(old.first_mesh);
+        s.scene = Some(Scene::new(&mut s.renderer));
+    }
+    if let Some(sc) = s.scene.as_mut() {
+        sc.ultra = want && !sc.god_smooth.is_empty();
+    }
+}
+
 fn start_game(s: &mut AppState) {
     // The map the select screen chose -- except with a LAN lobby open,
     // where both peers must be on the same map and the picker is not synced
     // between them: that match stays on the launch map.
     let want = if s.lan.is_some() { s.launch.map } else { s.ui.map_choice };
     switch_map(s, want);
+    fit_scene_to_quality(s);
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -743,7 +875,9 @@ fn start_game(s: &mut AppState) {
     let mut rng = crate::sim::Rng::new(0xBEEF ^ seed);
     if crate::map::active() != crate::map::MapId::Jungle {
         let (blue, red) = crate::map::team_picks(s.ui.selected as u32, &mut rng);
-        s.game = Some(Game::new_teams(&blue, &red));
+        let mut game = Game::new_teams(&blue, &red);
+        open_playbook(s, &mut game, &mut rng);
+        s.game = Some(game);
         finish_start(s);
         return;
     }
@@ -758,8 +892,33 @@ fn start_game(s: &mut AppState) {
         let k = (rng.next_u() % pool.len() as u64) as usize;
         *e = pool.remove(k.min(pool.len() - 1));
     }
-    s.game = Some(Game::new(s.ui.selected as u32, allies, enemies));
+    let mut game = Game::new(s.ui.selected as u32, allies, enemies);
+    open_playbook(s, &mut game, &mut rng);
+    s.game = Some(game);
     finish_start(s);
+}
+
+/// Each side opens the playbook: a fresh draw every match. In a LAN match
+/// both peers must agree, so the draw comes from the game's own
+/// (deterministic) generator rather than the clock.
+fn open_playbook(s: &AppState, game: &mut Game, rng: &mut crate::sim::Rng) {
+    if s.lan.is_some() {
+        let mut own = game.rng.clone();
+        game.open_playbook(&mut own);
+        game.rng = own;
+    } else {
+        game.open_playbook(rng);
+    }
+    if let Ok(v) = std::env::var("CLAWBOUND_PLAYBOOK") {
+        // "Pride Hunt,Storm Front": force the pages (blue, red) by name
+        let book = crate::playbook::booklet();
+        let names: Vec<&str> = v.split(',').map(str::trim).collect();
+        let find = |n: &str| book.iter().find(|p| p.name.eq_ignore_ascii_case(n)).cloned();
+        if let (Some(a), Some(b)) = (names.first().and_then(|n| find(n)), names.get(1).and_then(|n| find(n))) {
+            game.set_styles([a, b], rng);
+        }
+    }
+    eprintln!("playbook: blue plays {}, red plays {}", game.styles[0].name, game.styles[1].name);
 }
 
 /// Everything after the rosters are drawn: shared by every map.
@@ -778,6 +937,12 @@ fn finish_start(s: &mut AppState) {
     #[cfg(feature = "audio")]
     if s.ambience.is_none() {
         s.ambience = crate::audio::output::Ambience::start();
+        #[cfg(feature = "audio")]
+        if let Some(amb) = s.ambience.as_ref() {
+            let root = crate::soundbank::default_root();
+            eprintln!("[clawbound] audio: {} Hz, buffer {:?} frames; loading {}", amb.sample_rate, amb.buffer_frames, root.display());
+            s.bank = Some(crate::soundbank::Bank::loading(crate::soundbank::Loader::start(root, amb.sample_rate)));
+        }
     }
     s.ui.floaters.clear();
     s.ui.announce = None;
@@ -796,7 +961,10 @@ fn finish_start(s: &mut AppState) {
         let dir = cam_dir(s.cam_yaw, s.cam_pitch);
         let target = p0 + Vec3::Y * 1.5;
         let play = crate::intro::Shot { eye: target - dir * s.cam_dist, target, fov_y: 0.95 };
-        s.intro = Some(crate::intro::Intro::new(&teams, p0, play));
+        // the session's first match opens with the narrated prologue
+        s.intro = Some(if s.intros_played == 0 { crate::intro::Intro::full(&teams, p0, play) } else { crate::intro::Intro::new(&teams, p0, play) });
+        s.intros_played += 1;
+        s.intro_music = false;
         s.skip_intro = false;
     }
     s.controls_open = false;
@@ -853,7 +1021,10 @@ fn render(s: &mut AppState) {
             s.stalk_on = !s.stalk_on;
         }
         let stalk_on = s.stalk_on;
+        let attack_eaten = s.attack_eaten || s.targeting.eats_attack();
         if let Some(g) = s.game.as_mut() {
+            let spectating = s.spectator.is_some();
+            if !spectating {
             // A leap goes where the cat is being steered; standing still,
             // where the camera looks. `leap::plan` turns that direction into
             // a place -- the rock ahead, if there is one.
@@ -862,9 +1033,28 @@ fn render(s: &mut AppState) {
                 let dir = if c.mv.length_squared() > 0.04 { fwd * c.mv.y + right * c.mv.x } else { fwd };
                 g.leap_queue.push((0, dir));
             }
-            // casts are edges: queue them once, outside the step loop
+            // Casts: an ability key PREPARES the ability (its guide shows);
+            // the attack button fires it at the current aim (`targeting`).
+            // A touch drag-to-aim is its own two-step gesture and fires on
+            // release, as before.
+            // the facing cone couples the cat to where the camera looks
+            g.gods[0].face_ref = input::camera_basis(yaw).0;
+            let attack_edge = c.attack && !s.attack_was;
+            let keys: [bool; 4] = std::array::from_fn(|k| c.cast[k] && c.cast_dir[k].is_none());
+            let out = s.targeting.step(crate::targeting::Press { cast: keys, attack: attack_edge, cancel: false });
+            if let crate::targeting::Outcome::Fire(slot) = out {
+                g.cast_queue.push((0, slot, aim));
+                s.attack_eaten = true;
+            }
+            if s.targeting.eats_attack() && c.attack {
+                s.attack_eaten = true;
+            }
+            if !c.attack {
+                s.attack_eaten = false;
+            }
+            s.attack_was = c.attack;
             for slot in 0..4u32 {
-                if c.cast[slot as usize] {
+                if c.cast[slot as usize] && c.cast_dir[slot as usize].is_some() {
                     let cast_aim = if let Some(dir) = c.cast_dir[slot as usize] {
                         // a committed touch drag-to-aim: rotate its screen-
                         // space direction (x right, y up) onto the camera's
@@ -880,6 +1070,7 @@ fn render(s: &mut AppState) {
                     g.cast_queue.push((0, slot, cast_aim));
                 }
             }
+            } // !spectating
             // The intro runs instead of the sim: cats appear on its beats,
             // the fanfare starts on the first spawn, and play begins when
             // it ends or is skipped.
@@ -894,11 +1085,47 @@ fn render(s: &mut AppState) {
                         s.vfx.star_burst(g.gods[gi].pos, c, gi as f32);
                     }
                 }
-                if before < crate::intro::FANFARE_AT && it.t >= crate::intro::FANFARE_AT && !s.skip_intro {
-                    s.fanfare_count = s.fanfare_count.wrapping_add(1);
+                // The intro's score and narration (studio files, if loaded):
+                // `music/intro_full` for the narrated intro, `music/intro` for
+                // the short one, from its first frame; the narrator's lines
+                // on their schedule. A skip silences both.
+                #[cfg(feature = "audio")]
+                if let (Some(amb), Some(bank)) = (s.ambience.as_mut(), s.bank.as_mut()) {
+                    use crate::mixer::{Bus, Cmd, Play};
+                    if before == 0.0 {
+                        let key = if it.is_full() { "music/intro_full" } else { "music/intro" };
+                        if let Some(id) = bank.pick(key) {
+                            s.intro_music = amb.mixer.play(Play { clip: id, bus: Bus::Music, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: None });
+                        }
+                    }
+                    for key in it.narration_due(before, it.t) {
+                        if let Some(id) = bank.pick(&format!("narrator/{key}")) {
+                            amb.mixer.play(Play { clip: id, bus: Bus::Voice, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: Some(u16::MAX - 1) });
+                        }
+                    }
+                    if s.skip_intro {
+                        amb.mixer.send(Cmd::StopBus(Bus::Music));
+                        amb.mixer.send(Cmd::StopBus(Bus::Voice));
+                        s.intro_music = false;
+                    }
+                }
+                if before < it.fanfare_at() && it.t >= it.fanfare_at() && !s.skip_intro && !s.intro_music {
+                    // a studio fanfare, if one is loaded; else the synthesized one
+                    let mut played = false;
+                    #[cfg(feature = "audio")]
+                    if let (Some(amb), Some(bank)) = (s.ambience.as_mut(), s.bank.as_mut()) {
+                        if let Some(id) = bank.pick("music/fanfare") {
+                            played = amb.mixer.play(crate::mixer::Play { clip: id, bus: crate::mixer::Bus::Music, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: None });
+                        }
+                    }
+                    if !played {
+                        s.fanfare_count = s.fanfare_count.wrapping_add(1);
+                    }
                 }
                 s.vfx.update(dt_frame, &[], g);
                 if it.done {
+                    s.announcer = Default::default();
+                    s.announcer.start(g.t);
                     s.intro = None;
                     s.skip_intro = false;
                     s.accumulator = 0.0;
@@ -924,12 +1151,17 @@ fn render(s: &mut AppState) {
                 // analogue input the magnitude IS the intent, and the sim is
                 // about to throw it away by normalising.
                 let gentle = walk_to.is_none() && c.mv.length() > 0.08 && c.mv.length() < 0.5;
-                let gi = &mut g.gods[0];
-                gi.sneak = stalk_on || c.sneak_held || gentle;
-                gi.move_dir = mv;
-                gi.attack_held = c.attack;
+                // a spectated match's god 0 is a bot like the rest
+                if s.spectator.is_none() {
+                    let gi = &mut g.gods[0];
+                    gi.sneak = stalk_on || c.sneak_held || gentle;
+                    gi.move_dir = mv;
+                    // the click that fired a prepared ability is not an attack
+                    gi.attack_held = c.attack && !attack_eaten;
+                }
                 g.tick(1.0 / 60.0);
                 let events: Vec<crate::sim::Event> = g.events.drain(..).collect();
+                s.audio_events.extend(events.iter().cloned());
                 for e in &events {
                     match e {
                         crate::sim::Event::Damage { pos, amount, big } => {
@@ -979,6 +1211,19 @@ fn render(s: &mut AppState) {
                     let f = it.frame();
                     Camera { eye: f.shot.eye, target: f.shot.target, fov_y: f.shot.fov_y }
                 }
+                None if s.spectator.is_some() => {
+                    let inp = crate::spectator::Input {
+                        cycle: std::mem::take(&mut s.spec_cycle),
+                        director: std::mem::take(&mut s.spec_director),
+                        free: std::mem::take(&mut s.spec_free),
+                        mv: s.controls.mv,
+                        rise: -s.controls.zoom,
+                        look: glam::Vec2::new(s.controls.look.x, -s.controls.look.y),
+                    };
+                    let g = s.game.as_ref().unwrap();
+                    let shot = s.spectator.as_mut().unwrap().update(g, inp, dt_frame);
+                    Camera { eye: shot.eye, target: shot.target, fov_y: shot.fov_y }
+                }
                 None => Camera {
                     eye: target - dir * s.cam_dist + jolt * 0.5,
                     target,
@@ -989,12 +1234,136 @@ fn render(s: &mut AppState) {
     };
     let vp = cam.view_proj(s.renderer.width as f32 / s.renderer.height as f32);
 
+    // the player's settings, applied: quality and fur (a command-line or
+    // environment override still wins), volumes when they change
+    {
+        let st = &s.cfg.settings;
+        crate::quality::Quality::set_chosen(st.quality);
+        crate::render::FurStyle::set_chosen(st.fur);
+        s.renderer.quality = crate::quality::Quality::effective();
+        // vsync follows the setting: the surface is reconfigured on change
+        let want = present_mode_for(s.cfg.settings.vsync, &s.present_modes);
+        if want != s.present {
+            s.present = want;
+            s.surface.configure(
+                &s.renderer.device,
+                &wgpu::SurfaceConfiguration {
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    format: s.surface_format,
+                    width: s.renderer.width.max(1),
+                    height: s.renderer.height.max(1),
+                    present_mode: want,
+                    alpha_mode: wgpu::CompositeAlphaMode::Auto,
+                    view_formats: vec![],
+                    desired_maximum_frame_latency: 2,
+                },
+            );
+            eprintln!("[clawbound] present mode -> {want:?}");
+        }
+        // the shadow map follows the quality (rebuilt only when it changes)
+        let size = s.renderer.quality.shadow_size();
+        s.renderer.set_shadow_size(size);
+        let vols = [st.vol_master, st.vol_music, st.vol_sfx, st.vol_voice];
+        #[cfg(feature = "audio")]
+        if vols != s.vol_sent {
+            if let Some(amb) = s.ambience.as_mut() {
+                use crate::mixer::{Bus, Cmd};
+                // the mixer's own balance, times the player's volumes
+                amb.mixer.send(Cmd::BusGain(Bus::Music, 0.55 * vols[1] * vols[0]));
+                amb.mixer.send(Cmd::BusGain(Bus::Sfx, 0.9 * vols[2] * vols[0]));
+                amb.mixer.send(Cmd::BusGain(Bus::Voice, 1.0 * vols[3] * vols[0]));
+                s.vol_sent = vols;
+            }
+        }
+        let _ = vols;
+        s.frame_s += (dt_frame.clamp(0.0, 0.5) - s.frame_s) * 0.08;
+    }
+
     // ambience: the listener is the player; the wind pans with the camera
+    // Out of a match -- the menu, the select screen, after a match -- the
+    // ambience fades to silence (`audio::fade_out`) instead of holding the
+    // last match's wind.
     #[cfg(feature = "audio")]
-    if let (Some(g), Some(amb)) = (s.game.as_ref(), s.ambience.as_ref()) {
-        let mut p = crate::audio::params_for(g, g.gods[0].pos, s.cam_yaw, s.thunder_count, s.thunder_dist);
-        p.fanfare_count = s.fanfare_count;
+    if let Some(amb) = s.ambience.as_ref() {
+        let p = match s.game.as_ref() {
+            Some(g) if s.screen == Screen::Playing => {
+                let mut p = crate::audio::params_for(g, g.gods[0].pos, s.cam_yaw, s.thunder_count, s.thunder_dist);
+                p.fanfare_count = s.fanfare_count;
+                p
+            }
+            _ => crate::audio::fade_out(s.audio_last, dt_frame),
+        };
+        // the master volume scales the synthesized ambience too
+        let mut p = p;
+        s.audio_last = p;
+        p.master *= s.cfg.settings.vol_master;
         amb.set(p);
+    }
+
+    // Loaded audio: take what the loader has finished, and play this frame's
+    // cues -- placed round the listener (the player's cat, or where the
+    // spectator looks), voice lines gated per cat. Music loops per map.
+    #[cfg(feature = "audio")]
+    if let (Some(amb), Some(bank)) = (s.ambience.as_mut(), s.bank.as_mut()) {
+        use crate::mixer::{Bus, Cmd, Play};
+        bank.poll(&mut amb.mixer);
+        match s.game.as_ref() {
+            Some(g) if s.screen == Screen::Playing => {
+                // the map's music waits for the intro (and its score) to end
+                if !s.music_on && s.intro.is_none() {
+                    if let Some(id) = bank.pick(&format!("music/{}", crate::map::active().key())) {
+                        amb.mixer.play(Play { clip: id, bus: Bus::Music, gain: 0.8, pan: 0.0, priority: 9, looped: true, speaker: None });
+                    }
+                    s.music_on = true;
+                }
+                let f = cam.target - cam.eye;
+                let right = Vec3::new(f.x, 0.0, f.z).normalize_or_zero().cross(Vec3::Y).normalize_or_zero();
+                let ear = if s.spectator.is_some() { cam.target } else { g.gods[0].pos };
+                // the space the listener is in: reverb and echo, a few times
+                // a second (it glides between places on its own)
+                s.space_tick = s.space_tick.wrapping_add(1);
+                if s.space_tick % 6 == 0 {
+                    amb.mixer.send(Cmd::Space(crate::reverb::space_at(ear)));
+                }
+                if let Some(w) = g.over {
+                    let me = if s.spectator.is_some() { None } else { Some(g.gods[0].team) };
+                    s.announcer.end(w, me, g.t);
+                }
+                for ev in s.audio_events.iter() {
+                    s.announcer.hear(ev, g);
+                }
+                if let Some(call) = s.announcer.next(g.t) {
+                    let key = format!("announcer/{}", call.key);
+                    let secs = match bank.pick(&key) {
+                        Some(id) => {
+                            amb.mixer.play(Play { clip: id, bus: Bus::Voice, gain: 1.0, pan: 0.0, priority: 10, looped: false, speaker: Some(u16::MAX) });
+                            bank.secs(id, amb.sample_rate)
+                        }
+                        None => 1.2, // unrecorded: keep the pacing anyway
+                    };
+                    s.announcer.playing(g.t, secs);
+                }
+                for ev in s.audio_events.drain(..) {
+                    for cue in crate::cues::cues_for(&ev, g) {
+                        let Some((gain, pan)) = crate::cues::place(&cue, ear, right) else { continue };
+                        if !s.voice_gate.allow(&cue, g.t) {
+                            continue;
+                        }
+                        if let Some(id) = bank.first(&cue.keys) {
+                            amb.mixer.play(Play { clip: id, bus: cue.bus, gain, pan, priority: cue.priority, looped: false, speaker: cue.speaker.map(|x| x as u16) });
+                        }
+                    }
+                }
+            }
+            _ => {
+                s.audio_events.clear();
+                if s.music_on {
+                    amb.mixer.send(Cmd::StopBus(Bus::Music));
+                    amb.mixer.send(Cmd::StopBus(Bus::Voice));
+                    s.music_on = false;
+                }
+            }
+        }
     }
 
     // world draws (+ this frame's sky state)
@@ -1007,6 +1376,14 @@ fn render(s: &mut AppState) {
         let mut vfx = std::mem::take(&mut s.vfx);
         scene.draw(&mut s.renderer, g, &mut vfx, cam);
         s.vfx = vfx;
+        // the prepared ability's guide, where the camera aims
+        if let Some(slot) = s.targeting.slot {
+            if s.screen == Screen::Playing && g.gods[0].respawn_t <= 0.0 {
+                let ab = g.def(0).abilities[slot as usize];
+                let guide = crate::targeting::guide_for(&ab, g.gods[0].pos, compute_aim(s));
+                scene.draw_guide(&mut s.renderer, &crate::targeting::guide_points(&guide, 1.1), ab.color);
+            }
+        }
     } else {
         s.renderer.atmosphere = crate::weather::Weather::new().atmosphere();
         s.renderer.clear_queues();
@@ -1023,7 +1400,7 @@ fn render(s: &mut AppState) {
                     format: s.surface_format,
                     width: s.renderer.width,
                     height: s.renderer.height,
-                    present_mode: wgpu::PresentMode::Fifo,
+                    present_mode: s.present,
                     alpha_mode: wgpu::CompositeAlphaMode::Auto,
                     view_formats: vec![],
                     desired_maximum_frame_latency: 2,
@@ -1046,16 +1423,23 @@ fn render(s: &mut AppState) {
     let mut play = false;
     let mut quit = false;
     let mut open_lan = false;
+    let mut spectate = false;
     let mut lan_action = crate::lanlobby::Action::None;
     let mut locked_in = false;
     let mut again = false;
     let mut menu = false;
     let mut open_controls = false;
     let mut panel = ui::ControlsPanel { close: false, capture: None, clear: None, scheme: None, reset: false };
+    let (show_fps, frame_s) = (s.cfg.settings.show_fps, s.frame_s);
+    // where the camera is: bars fade with distance and behind terrain
+    let cam_eye = s.renderer.camera.eye;
     let output = s.egui_ctx.run(raw_input, |ctx| {
+        if show_fps {
+            ui::draw_fps(ctx, 1.0 / frame_s.max(1e-4), frame_s * 1000.0);
+        }
         match s.screen {
             Screen::Menu => {
-                ui::draw_menu(ctx, &mut play, &mut quit, &mut open_lan);
+                ui::draw_menu(ctx, &mut play, &mut quit, &mut open_lan, &mut spectate);
                 ui::draw_controls_button(ctx, &mut open_controls);
             }
             Screen::Select => ui::draw_select(ctx, &mut s.ui, &mut locked_in),
@@ -1069,10 +1453,12 @@ fn render(s: &mut AppState) {
                 if let Some(g) = s.game.as_mut() {
                     if let Some(it) = s.intro.as_ref() {
                         ui::draw_intro_overlay(ctx, &it.frame().overlay);
+                    } else if let Some(sp) = s.spectator.as_ref() {
+                        ui::draw_spectator_hud(ctx, g, vp, &sp.label(g), cam_eye);
                     } else if s.ui.shop_open {
                         ui::draw_shop(ctx, g, 0, &mut s.ui);
                     } else {
-                        ui::draw_hud(ctx, g, 0, vp, s.renderer.width as f32, s.renderer.height as f32, &mut s.ui);
+                        ui::draw_hud(ctx, g, 0, vp, s.renderer.width as f32, s.renderer.height as f32, &mut s.ui, cam_eye);
                         if s.cfg.settings.touch_enabled {
                             ui::draw_touch_pad(ctx, &s.touch, g, s.renderer.width as f32, s.renderer.height as f32);
                         } else {
@@ -1174,6 +1560,9 @@ fn render(s: &mut AppState) {
         }
         crate::lanlobby::Action::None => {}
     }
+    if spectate {
+        start_spectate(s);
+    }
     if play {
         s.screen = Screen::Select;
     }
@@ -1181,6 +1570,17 @@ fn render(s: &mut AppState) {
         s.exiting = true;
     }
     if locked_in || again {
+        // the chosen ancestor answers the lock-in (voicescript: "select")
+        #[cfg(feature = "audio")]
+        if locked_in {
+            if let (Some(amb), Some(bank)) = (s.ambience.as_mut(), s.bank.as_mut()) {
+                let def = &crate::gods::ROSTER[(s.ui.selected as usize).min(crate::gods::ROSTER.len() - 1)];
+                let who = def.name.to_ascii_lowercase().replace([' ', '\''], "");
+                if let Some(id) = bank.pick(&format!("voice/{who}/select")) {
+                    amb.mixer.play(crate::mixer::Play { clip: id, bus: crate::mixer::Bus::Voice, gain: 1.0, pan: 0.0, priority: 9, looped: false, speaker: None });
+                }
+            }
+        }
         start_game(s);
     }
     if menu {
@@ -1198,5 +1598,30 @@ fn render_portraits(s: &mut AppState) {
         let image = egui::ColorImage::from_rgba_unmultiplied([128, 128], &pixels);
         let tid = s.egui_ctx.load_texture(format!("ancestor{}", i), image, egui::TextureOptions::LINEAR);
         s.ui.portraits.insert(i as u32, tid.id());
+    }
+}
+
+/// The present mode for the vsync setting: on, Fifo (always offered); off,
+/// uncapped -- Immediate if the surface offers it (Metal does), else
+/// Mailbox, else Fifo after all.
+pub fn present_mode_for(vsync: bool, offered: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    use wgpu::PresentMode::*;
+    if vsync {
+        return Fifo;
+    }
+    [Immediate, Mailbox].into_iter().find(|m| offered.contains(m)).unwrap_or(Fifo)
+}
+
+#[cfg(test)]
+mod present_tests {
+    use super::present_mode_for;
+    use wgpu::PresentMode::*;
+
+    #[test]
+    fn vsync_off_uncaps_where_the_surface_allows() {
+        assert_eq!(present_mode_for(true, &[Fifo, Immediate]), Fifo);
+        assert_eq!(present_mode_for(false, &[Fifo, Immediate, Mailbox]), Immediate);
+        assert_eq!(present_mode_for(false, &[Fifo, Mailbox]), Mailbox);
+        assert_eq!(present_mode_for(false, &[Fifo]), Fifo, "nothing better offered");
     }
 }

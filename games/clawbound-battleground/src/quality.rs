@@ -29,14 +29,68 @@ pub enum Quality {
     Medium,
     /// For phones. No bloom, no god rays, quarter-area shadow map.
     Low,
+    /// High, plus the ultra preview: characters as smooth, furred surfaces
+    /// with physically based shading, coloured lights from abilities, and
+    /// ray-traced soft shadows between the cats (smoothvox, smooth.wgsl).
+    Ultra,
 }
 
+/// The player's chosen quality (an index into `Quality::ALL`; High).
+static CHOSEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
 impl Quality {
-    pub const ALL: [Quality; 3] = [Quality::High, Quality::Medium, Quality::Low];
+    pub const ALL: [Quality; 4] = [Quality::Ultra, Quality::High, Quality::Medium, Quality::Low];
+
+    /// Its name in the config file.
+    pub fn key(self) -> &'static str {
+        match self {
+            Quality::Ultra => "ultra",
+            Quality::High => "high",
+            Quality::Medium => "medium",
+            Quality::Low => "low",
+        }
+    }
+
+    pub fn from_key(k: &str) -> Option<Quality> {
+        Quality::ALL.into_iter().find(|q| q.key() == k)
+    }
+
+    /// The quality in effect: `--ultra` or CLAWBOUND_QUALITY if given, else
+    /// the player's setting (`set_chosen`).
+    pub fn effective() -> Quality {
+        Quality::requested().unwrap_or_else(|| Quality::ALL[CHOSEN.load(std::sync::atomic::Ordering::Relaxed) as usize % Quality::ALL.len()])
+    }
+
+    /// The player's setting, from the config (the app sets it).
+    pub fn set_chosen(q: Quality) {
+        let i = Quality::ALL.iter().position(|x| *x == q).unwrap_or(1) as u8;
+        CHOSEN.store(i, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The ultra preview's smooth, furred characters.
+    pub fn smooth_characters(self) -> bool {
+        self == Quality::Ultra
+    }
+
+    /// `--ultra` on the command line or `CLAWBOUND_QUALITY=ultra`
+    /// (`high`, `medium`, `low` also read); None if neither says.
+    pub fn requested() -> Option<Quality> {
+        if std::env::args().any(|a| a == "--ultra") {
+            return Some(Quality::Ultra);
+        }
+        match std::env::var("CLAWBOUND_QUALITY").ok()?.to_ascii_lowercase().as_str() {
+            "ultra" => Some(Quality::Ultra),
+            "high" => Some(Quality::High),
+            "medium" => Some(Quality::Medium),
+            "low" => Some(Quality::Low),
+            _ => None,
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
             Quality::High => "High",
+            Quality::Ultra => "Ultra (preview)",
             Quality::Medium => "Medium",
             Quality::Low => "Low (mobile)",
         }
@@ -50,7 +104,7 @@ impl Quality {
     /// phone screen is most of the way to invisible.
     pub fn shadow_size(self) -> u32 {
         match self {
-            Quality::High => 2048,
+            Quality::High | Quality::Ultra => 2048,
             Quality::Medium => 1024,
             Quality::Low => 1024,
         }
@@ -64,7 +118,7 @@ impl Quality {
     /// making this a slider instead of a switch.
     pub fn bloom_scale(self) -> f32 {
         match self {
-            Quality::High => 1.0,
+            Quality::High | Quality::Ultra => 1.0,
             Quality::Medium => 1.0,
             Quality::Low => 0.0,
         }
@@ -74,7 +128,7 @@ impl Quality {
     /// that pass already did on its own.
     pub fn ray_scale(self) -> f32 {
         match self {
-            Quality::High => 1.0,
+            Quality::High | Quality::Ultra => 1.0,
             Quality::Medium => 0.5,
             Quality::Low => 0.0,
         }
@@ -97,7 +151,7 @@ impl Quality {
     /// one.
     pub fn particle_scale(self) -> f32 {
         match self {
-            Quality::High => 1.0,
+            Quality::High | Quality::Ultra => 1.0,
             Quality::Medium => 0.7,
             Quality::Low => 0.4,
         }
@@ -221,5 +275,18 @@ mod tests {
         assert_eq!(default_for_display(1600, 2560), Quality::High, "a tablet at 1.6");
         // A degenerate size must not panic or divide by zero.
         assert_eq!(default_for_display(0, 0), Quality::High);
+    }
+
+    /// Ultra is High plus the preview: every setting High pays for, it pays
+    /// for too; only it draws smooth characters.
+    #[test]
+    fn ultra_is_high_plus_the_preview() {
+        let (u, h) = (Quality::Ultra, Quality::High);
+        assert_eq!(u.shadow_size(), h.shadow_size());
+        assert_eq!(u.bloom_scale(), h.bloom_scale());
+        assert_eq!(u.particle_scale(), h.particle_scale());
+        assert!(u.smooth_characters());
+        assert!(Quality::ALL.iter().filter(|q| q.smooth_characters()).count() == 1);
+        assert_eq!(u.label(), "Ultra (preview)");
     }
 }

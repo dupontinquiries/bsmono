@@ -1,10 +1,22 @@
-// AI for the 9 non-player gods: lane pushing, target selection, strafing,
+// AI for the non-player gods: lane pushing, target selection, strafing,
 // ability heuristics per archetype, retreat + fountain heal, auto-buy.
+//
+// A fight against an enemy god is fought in a stance (`tactics`): the bot
+// reads the local fight (`read_fight`), `tactics::decide` picks dive / hold
+// / regroup / retreat under the team's page of the playbook, and the
+// movement below carries it out -- with the sidestep kept in every stance
+// but the run home.
 
 use crate::consts::*;
 use crate::gods::Archetype;
 use crate::sim::*;
+use crate::tactics::{Genes, Read, Stance};
 use glam::Vec3;
+
+/// How long a teammate's dive call stands.
+pub const CALL_FOR: f32 = 4.0;
+/// Radius of "the fight" around a bot and its target.
+pub const FIGHT_R: f32 = 14.0;
 
 impl Game {
     pub fn ai_move_target(&self, gi: usize) -> Vec3 {
@@ -19,6 +31,7 @@ impl Game {
                 // handled directly via move_dir (orbit strafe)
                 g.pos
             }
+            AiState::Push if brain.goal.is_some() => brain.goal.unwrap(),
             AiState::Push => {
                 let path = brain.lane.path_for(g.team);
                 let mut wp = brain.wp.min(path.len() - 1);
@@ -38,13 +51,17 @@ pub fn think(game: &mut Game, gi: usize) {
     let team = g.team;
     let def = game.def(gi);
     let hp_frac = g.hp / g.max_hp;
-    let retreat_at = 0.30 - g.ai.as_ref().unwrap().aggression * 0.06;
+    let genes = bot_genes(game, gi);
+    let retreat_at = genes.retreat;
 
     let brain_state = g.ai.as_ref().unwrap().state;
     let mut state = brain_state;
 
     // --- state transitions -----------------------------------------------------
-    if brain_state != AiState::Retreat && hp_frac < retreat_at {
+    // (in a fight with a god the stance decides when to go home, so a kill
+    // in reach can keep a hurt cat in it -- `tactics::decide`)
+    let dueling = brain_state == AiState::Fight && matches!(g.ai.as_ref().unwrap().target, Some(TargetRef::God(_)));
+    if brain_state != AiState::Retreat && hp_frac < retreat_at && !dueling {
         state = AiState::Retreat;
     }
     if brain_state == AiState::Retreat {
@@ -60,12 +77,29 @@ pub fn think(game: &mut Game, gi: usize) {
     let mut target: Option<TargetRef> = None;
     let mut best_score = f32::MIN;
 
+    // Score: near and weak, leaning by the page's `focus`; the current
+    // target is kept unless another is clearly better (a bot flipping
+    // between two targets is half of what looked like circling); a
+    // teammate's dive pulls the team onto the same cat; a cat sheltering
+    // under its tower is worth less to a style that respects towers.
+    let prev_target = g.ai.as_ref().unwrap().target;
+    let call = game.calls[team as usize].filter(|&(_, at)| t - at < CALL_FOR);
     for j in 0..game.gods.len() {
         let e = &game.gods[j];
-        if e.team != team && e.respawn_t <= 0.0 {
+        // a bot cannot go for what the cloud hides from its team
+        if e.team != team && e.respawn_t <= 0.0 && game.sees(team, j) {
             let d = e.pos.distance(g.pos);
             if d < aggro {
-                let score = 100.0 - d - (e.hp / e.max_hp) * 60.0 + if e.is_player { 15.0 } else { 0.0 };
+                let mut score = 100.0 - d * (1.0 - genes.focus * 0.5) - (e.hp / e.max_hp) * 60.0 * (0.5 + genes.focus) + if e.is_player { 15.0 } else { 0.0 };
+                if prev_target == Some(TargetRef::God(j)) {
+                    score += 12.0;
+                }
+                if call.is_some_and(|(c, _)| c == j) {
+                    score += 30.0 * genes.rally;
+                }
+                if enemy_tower_over(game, team, e.pos).is_some() {
+                    score -= 12.0 * genes.tower;
+                }
                 if score > best_score {
                     best_score = score;
                     target = Some(TargetRef::God(j));
@@ -120,6 +154,10 @@ pub fn think(game: &mut Game, gi: usize) {
     let mut new_wp = game.gods[gi].ai.as_ref().unwrap().wp;
     let mut strafe_dir = game.gods[gi].ai.as_ref().unwrap().strafe_dir;
     let mut strafe_t = game.gods[gi].ai.as_ref().unwrap().strafe_t;
+    let mut stance = Stance::Hold;
+    let mut new_anchor: Option<Vec3> = None;
+    let mut new_call: Option<(usize, f32)> = None;
+    let mut goal: Option<Vec3> = None;
 
     match state {
         AiState::Retreat => {
@@ -132,30 +170,67 @@ pub fn think(game: &mut Game, gi: usize) {
                 let to = Vec3::new(tpos.x - g.pos.x, 0.0, tpos.z - g.pos.z);
                 let d = to.length();
                 let ideal = (def.auto_range * 0.8).max(2.4);
-                let vs_god = matches!(tg, TargetRef::God(_));
-                if vs_god {
-                    // strafe orbit
-                    strafe_t -= 1.0 / 60.0;
-                    if strafe_t <= 0.0 {
-                        strafe_t = 0.9 + game.rng.f32() * 1.2;
-                        if game.rng.f32() < 0.5 {
-                            strafe_dir = -strafe_dir;
-                        }
+                // the sidestep: a new direction every second or so (the dodging)
+                strafe_t -= 1.0 / 60.0;
+                if strafe_t <= 0.0 {
+                    strafe_t = 0.9 + game.rng.f32() * 1.2;
+                    if game.rng.f32() < 0.5 {
+                        strafe_dir = -strafe_dir;
                     }
-                    let perp = Vec3::new(-to.z, 0.0, to.x).normalize_or_zero() * strafe_dir;
-                    if d > ideal + 1.5 {
-                        move_dir = to.normalize_or_zero() + perp * 0.35;
-                    } else if d < ideal - 1.5 {
-                        move_dir = -to.normalize_or_zero() + perp * 0.5;
-                    } else {
-                        move_dir = perp;
-                    }
-                } else if d > ideal + 1.0 {
-                    // hold ground vs minions — just close the gap a bit
-                    move_dir = to.normalize_or_zero() * 0.6;
                 }
-                // ability heuristics
-                cast_req = choose_cast(game, gi, tg, d);
+                let perp = Vec3::new(-to.z, 0.0, to.x).normalize_or_zero() * strafe_dir;
+                if let TargetRef::God(j) = tg {
+                    let b = g.ai.as_ref().unwrap();
+                    let anchor = b.anchor.unwrap_or(g.pos);
+                    new_anchor = Some(anchor);
+                    let mut r = read_fight(game, gi, j);
+                    r.target_dist = d;
+                    r.ideal = ideal;
+                    r.from_anchor = Vec3::new(g.pos.x - anchor.x, 0.0, g.pos.z - anchor.z).length();
+                    r.called = call.is_some_and(|(c, _)| c == j);
+                    r.stance = b.stance;
+                    r.stance_t = b.stance_t;
+                    stance = crate::tactics::decide(&r, &genes);
+                    let want = ideal * crate::tactics::distance_for(stance, &genes);
+                    let side = perp * crate::tactics::strafe_for(stance, &genes);
+                    move_dir = match stance {
+                        Stance::Dive | Stance::Hold => {
+                            if d > want + 1.5 {
+                                to.normalize_or_zero() + side * 0.4
+                            } else if d < want - 1.5 {
+                                -to.normalize_or_zero() + side * 0.6
+                            } else {
+                                side.normalize_or_zero() * side.length().min(1.0)
+                            }
+                        }
+                        Stance::Regroup => {
+                            let safe = regroup_point(game, gi, anchor);
+                            let back = Vec3::new(safe.x - g.pos.x, 0.0, safe.z - g.pos.z);
+                            if back.length() > 2.0 {
+                                back.normalize_or_zero() + side * 0.5
+                            } else if d < want {
+                                -to.normalize_or_zero() * 0.6 + side
+                            } else {
+                                side
+                            }
+                        }
+                        Stance::Retreat => {
+                            new_state = AiState::Retreat;
+                            let f = team.fountain();
+                            Vec3::new(f.x - g.pos.x, 0.0, f.z - g.pos.z).normalize_or_zero()
+                        }
+                    };
+                    if stance == Stance::Dive && b.stance != Stance::Dive {
+                        new_call = Some((j, t));
+                    }
+                    cast_req = choose_cast(game, gi, tg, d, stance);
+                } else {
+                    if d > ideal + 1.0 {
+                        // hold ground vs minions and structures -- just close the gap a bit
+                        move_dir = to.normalize_or_zero() * 0.6;
+                    }
+                    cast_req = choose_cast(game, gi, tg, d, Stance::Hold);
+                }
             } else {
                 new_state = AiState::Push;
             }
@@ -234,7 +309,7 @@ pub fn think(game: &mut Game, gi: usize) {
                 }
                 new_state = AiState::Push;
                 target = Some(st);
-                cast_req = choose_cast(game, gi, st, d.length());
+                cast_req = choose_cast(game, gi, st, d.length(), Stance::Hold);
             }
         }
     }
@@ -247,8 +322,10 @@ pub fn think(game: &mut Game, gi: usize) {
             if let Some(bi) = game.contestable_boss(g.pos, team, hp_frac) {
                 let b = &game.bosses.list[bi];
                 let engaged = b.last_hit_team == Some(team) && t - b.last_dmg_t < 6.0;
-                let reach_ok = engaged || b.pos.distance(g.pos) < 28.0 + g.ai.as_ref().unwrap().aggression * 20.0;
+                let far = if b.kind == crate::bosses::BossKind::Moonwyrm { 4.0 } else { 1.0 };
+                let reach_ok = engaged || b.pos.distance(g.pos) < (14.0 + genes.objective * 28.0 + g.ai.as_ref().unwrap().aggression * 12.0) * far;
                 if reach_ok {
+                    goal = Some(b.pos);
                     let d = Vec3::new(b.pos.x - g.pos.x, 0.0, b.pos.z - g.pos.z);
                     if d.length() > def.auto_range * 0.8 {
                         move_dir = d.normalize_or_zero();
@@ -257,10 +334,26 @@ pub fn think(game: &mut Game, gi: usize) {
                     }
                     target = Some(TargetRef::Boss(bi));
                     if cast_req.is_none() {
-                        cast_req = choose_cast(game, gi, TargetRef::Boss(bi), d.length());
+                        cast_req = choose_cast(game, gi, TargetRef::Boss(bi), d.length(), Stance::Dive);
                     }
                 }
             }
+        }
+    }
+
+    // The Moonwell: the team holds a claim and this cat has not had its
+    // boon -- go and wade in (sky map). Not with enemies close; not when a
+    // fight or a boss already has it.
+    if state == AiState::Push && goal.is_none() && crate::map::active() == crate::map::MapId::Sky {
+        let ti = team as usize;
+        let me = &game.gods[gi];
+        let owed = crate::moonwell::grants(game.bosses.claim_t[ti], game.bosses.claim_id[ti], me.boon_claim, me.boon.is_some());
+        let enemy_near = (0..game.gods.len()).any(|j| game.gods[j].team != team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(me.pos) < 14.0);
+        if owed && !enemy_near {
+            let well = crate::sky::well_pos();
+            let d = Vec3::new(well.x - me.pos.x, 0.0, well.z - me.pos.z);
+            move_dir = d.normalize_or_zero();
+            goal = Some(well);
         }
     }
 
@@ -294,6 +387,74 @@ pub fn think(game: &mut Game, gi: usize) {
         }
     }
 
+    // Tower discipline. An enemy tower with none of our minions under it
+    // shoots the nearest cat, ramping. Outside a committed dive, a bot does
+    // not stand in that range: it backs out, and it does not walk in to
+    // siege until minions arrive to take the shots -- unless the tower is
+    // nearly down (sooner for a page that respects towers less). This is
+    // where most of the "went too deep" deaths were: bots sieging alone
+    // (Push/tower) and fights that drifted under a tower before the run home.
+    let mut backing_off = false;
+    if new_state != AiState::Retreat {
+        let pos = g.pos;
+        let near = (0..game.towers.len())
+            .filter(|&ti| {
+                let tw = &game.towers[ti];
+                tw.team != team && tw.hp > 0.0 && tw.pos.distance(pos) < TOWER_RANGE + 2.5
+            })
+            .min_by(|&a, &b| game.towers[a].pos.distance(pos).total_cmp(&game.towers[b].pos.distance(pos)));
+        if let Some(ti) = near {
+            let tw = &game.towers[ti];
+            let uncovered = !tower_covered(game, team, tw.pos);
+            let finishing = tw.hp / tw.max_hp < 0.1 + (1.5 - genes.tower) * 0.15 && hp_frac > 0.5;
+            let kill_dive = stance == Stance::Dive && matches!(target, Some(TargetRef::God(j)) if game.gods[j].hp / game.gods[j].max_hp < 0.22);
+            let committed = stance == Stance::Dive && matches!(target, Some(TargetRef::God(_))) && hp_frac > 0.4;
+            let shot_at = tw.aim == Some(TargetRef::God(gi));
+            if uncovered && !finishing && !kill_dive && !(committed && !shot_at) {
+                let away = Vec3::new(pos.x - tw.pos.x, 0.0, pos.z - tw.pos.z).normalize_or_zero();
+                let d = Vec3::new(pos.x - tw.pos.x, 0.0, pos.z - tw.pos.z).length();
+                if d < TOWER_RANGE + 1.0 {
+                    let side = Vec3::new(-away.z, 0.0, away.x) * strafe_dir * 0.3;
+                    move_dir = away + side;
+                    backing_off = true;
+                    if matches!(target, Some(TargetRef::Tower(_)) | Some(TargetRef::Titan(_))) {
+                        target = None;
+                        cast_req = None;
+                    }
+                } else {
+                    // at the edge: no step further in
+                    let inward = -move_dir.dot(away);
+                    if inward > 0.0 {
+                        move_dir += away * inward;
+                    }
+                    if matches!(target, Some(TargetRef::Tower(_))) {
+                        target = None;
+                        cast_req = None;
+                    }
+                }
+            }
+        }
+    }
+
+    // the escape: running home with an enemy on its heels, a dash or blink
+    // goes toward home instead of into the fight
+    if new_state == AiState::Retreat && cast_req.is_none() {
+        let close = (0..game.gods.len()).any(|j| game.gods[j].team != team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(g.pos) < 7.0);
+        if close {
+            for slot in 0..4usize {
+                let ab = &def.abilities[slot];
+                if let Archetype::Dash { dist, .. } | Archetype::Blink { dist, .. } = ab.arch {
+                    if game.gods[gi].cds[slot] <= 0.0 && game.gods[gi].mana >= ab.cost && !ab.ult {
+                        let f = team.fountain();
+                        let home = Vec3::new(f.x - g.pos.x, 0.0, f.z - g.pos.z).normalize_or_zero();
+                        cast_req = Some((slot as u32, g.pos + home * dist));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     // avoid enemy fountain when retreating through
     let enemy_f = team.other().fountain();
     if g.pos.distance(enemy_f) < FOUNTAIN_RADIUS + 6.0 {
@@ -306,7 +467,7 @@ pub fn think(game: &mut Game, gi: usize) {
     // of its shapes; head for the first portal on the route. Not in a
     // fight -- strafing is meant to be local.
     let move_dir = match crate::map::floor() {
-        Some(f) if move_dir.length_squared() > 1e-6 && !matches!(game.gods[gi].ai.as_ref().map(|b| b.state), Some(AiState::Fight)) => {
+        Some(f) if move_dir.length_squared() > 1e-6 && !backing_off && !matches!(game.gods[gi].ai.as_ref().map(|b| b.state), Some(AiState::Fight)) => {
             let pos = game.gods[gi].pos;
             if game.steer_mem.len() <= gi {
                 game.steer_mem.resize(gi + 1, Default::default());
@@ -353,12 +514,25 @@ pub fn think(game: &mut Game, gi: usize) {
         g.move_dir = move_dir;
         g.attack_held = target.is_some() || state == AiState::Push;
         if let Some(b) = &mut g.ai {
+            let fighting_god = new_state == AiState::Fight && matches!(target, Some(TargetRef::God(_)));
+            let st = if fighting_god { stance } else if new_state == AiState::Retreat { Stance::Retreat } else { Stance::Hold };
+            if st == b.stance {
+                b.stance_t += 1.0 / 60.0;
+            } else {
+                b.stance = st;
+                b.stance_t = 0.0;
+            }
+            b.anchor = if fighting_god { new_anchor } else { None };
+            b.goal = goal;
             b.state = new_state;
             b.target = target;
             b.wp = new_wp;
             b.strafe_dir = strafe_dir;
             b.strafe_t = strafe_t;
         }
+    }
+    if let Some(c) = new_call {
+        game.calls[team as usize] = Some(c);
     }
     if let Some((slot, aim)) = cast_req {
         game.cast_queue.push((gi, slot, aim));
@@ -367,7 +541,10 @@ pub fn think(game: &mut Game, gi: usize) {
 }
 
 /// Choose an ability cast for the current target based on archetype heuristics.
-fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32) -> Option<(u32, Vec3)> {
+/// Only a Dive spends the engage abilities (dash, blink, pull) on closing
+/// in; the other stances keep them.
+fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Stance) -> Option<(u32, Vec3)> {
+    let engage = stance == Stance::Dive;
     let g = &game.gods[gi];
     let def = game.def(gi);
     let tpos = game.target_pos(target);
@@ -390,6 +567,7 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32) -> Option<(
             Archetype::Blink { dist: dd, .. } => if dist > 9.0 { dd } else { 0.0 },
             Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } => f32::INFINITY,
             Archetype::Pull { radius, .. } => radius + 4.0,
+            Archetype::Meteor { range, .. } => range,
         };
         let pri = match ab.arch {
             Archetype::Nova { .. } => {
@@ -405,13 +583,17 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32) -> Option<(
                 if is_god_target && dist < range { 0.9 } else { 0.0 }
             }
             Archetype::Dash { .. } => {
-                if dist > 8.0 && dist < range && is_god_target { 0.5 } else { 0.0 }
+                if engage && dist > 8.0 && dist < range && is_god_target { 0.5 } else { 0.0 }
             }
             Archetype::Blink { .. } => {
-                if dist > 9.0 && dist < range && is_god_target { 0.55 } else { 0.0 }
+                if engage && dist > 9.0 && dist < range && is_god_target { 0.55 } else { 0.0 }
             }
             Archetype::Pull { .. } => {
-                if is_god_target && dist < range { 0.85 } else { 0.0 }
+                if engage && is_god_target && dist < range { 0.85 } else { 0.0 }
+            }
+            // a falling star on a fight worth it: a dive on a god
+            Archetype::Meteor { .. } => {
+                if engage && is_god_target && dist < range { 0.92 } else { 0.0 }
             }
             Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } => {
                 let hurt = g.hp / g.max_hp;
@@ -432,4 +614,128 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32) -> Option<(
         _ => tpos,
     };
     best.map(|(slot, _)| (slot, aim))
+}
+
+/// The team's page, bent a little by this bot's own temper (the old
+/// per-bot `aggression`, 0.45..0.95): bolder cats commit earlier and go
+/// home later.
+pub fn bot_genes(game: &Game, gi: usize) -> Genes {
+    let g = &game.gods[gi];
+    let mut genes = game.styles[g.team as usize].genes;
+    let a = g.ai.as_ref().map_or(0.7, |b| b.aggression) - 0.7;
+    genes.commit = (genes.commit - a * 0.3).max(0.75);
+    genes.retreat = (genes.retreat - a * 0.08).max(0.08);
+    genes
+}
+
+/// A god's weight in a fight: (health, damage). Damage is a unitless
+/// proxy -- level and items -- because only ratios between sides matter.
+fn god_weight(g: &GodUnit) -> (f32, f32) {
+    (g.hp + g.shield, 1.0 + 0.15 * (g.level as f32 - 1.0) + 0.12 * g.items.len() as f32)
+}
+
+/// Minions of `team` under an enemy tower at `tower`, enough of them to
+/// hold its fire for a while (a tower shoots minions before gods --
+/// `systems::tower_attacks` -- and one minion does not last).
+pub fn tower_covered(game: &Game, team: Team, tower: Vec3) -> bool {
+    game.minions.iter().filter(|m| m.team == team && m.hp > 0.0 && m.pos.distance(tower) < TOWER_RANGE - 1.0).count() >= 2
+}
+
+/// The enemy tower whose range covers `pos`, if one does and it is not
+/// covered by `team`'s minions.
+pub fn enemy_tower_over(game: &Game, team: Team, pos: Vec3) -> Option<usize> {
+    let ti = (0..game.towers.len()).find(|&ti| {
+        let tw = &game.towers[ti];
+        tw.team != team && tw.hp > 0.0 && tw.pos.distance(pos) < TOWER_RANGE
+    })?;
+    (!tower_covered(game, team, game.towers[ti].pos)).then_some(ti)
+}
+
+/// Read the fight between bot `gi` and enemy god `j`: both sides' weight
+/// near it, an enemy tower over it, health and readiness. The distance,
+/// anchor, call and stance fields are the caller's.
+pub fn read_fight(game: &Game, gi: usize, j: usize) -> Read {
+    let me = &game.gods[gi];
+    let foe = &game.gods[j];
+    let team = me.team;
+    let mid = (me.pos + foe.pos) * 0.5;
+    let (mut ours, mut theirs) = ((0.0f32, 0.0f32), (0.0f32, 0.0f32));
+    for g in &game.gods {
+        if g.respawn_t > 0.0 {
+            continue;
+        }
+        let near = if g.team == team { g.pos.distance(me.pos) < FIGHT_R } else { g.pos.distance(foe.pos) < FIGHT_R || g.pos.distance(mid) < FIGHT_R };
+        if near {
+            let (h, d) = god_weight(g);
+            let side = if g.team == team { &mut ours } else { &mut theirs };
+            side.0 += h;
+            side.1 += d;
+        }
+    }
+    for m in &game.minions {
+        if m.hp > 0.0 && m.pos.distance(mid) < FIGHT_R * 0.7 {
+            let side = if m.team == team { &mut ours } else { &mut theirs };
+            side.0 += m.hp * 0.3;
+            side.1 += 0.15;
+        }
+    }
+    // a tower over the target or over me: worth about a cat and a half
+    let tower = if enemy_tower_over(game, team, foe.pos).or_else(|| enemy_tower_over(game, team, me.pos)).is_some() {
+        (me.max_hp * 1.5, 1.5)
+    } else {
+        (0.0, 0.0)
+    };
+    // our own tower over us: on our side of the scale
+    let own = game.towers.iter().any(|tw| tw.team == team && tw.hp > 0.0 && tw.pos.distance(me.pos) < TOWER_RANGE * 0.9);
+    if own {
+        ours.0 += me.max_hp;
+        ours.1 += 1.2;
+    }
+    let def = game.def(gi);
+    let (mut ready, mut total) = (0.0f32, 0.0f32);
+    for (k, ab) in def.abilities.iter().enumerate() {
+        if matches!(ab.arch, Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. }) {
+            continue;
+        }
+        total += 1.0;
+        if me.cds[k] <= 0.0 && me.mana >= ab.cost {
+            ready += 1.0;
+        }
+    }
+    Read {
+        my_hp: me.hp / me.max_hp,
+        ours,
+        theirs,
+        tower,
+        target_hp: foe.hp / foe.max_hp,
+        target_dist: me.pos.distance(foe.pos),
+        ideal: (def.auto_range * 0.8).max(2.4),
+        from_anchor: 0.0,
+        ready: if total > 0.0 { ready / total } else { 1.0 },
+        called: false,
+        stance: Stance::Hold,
+        stance_t: 0.0,
+    }
+}
+
+/// Where a regrouping bot heads: back to where the fight began if it has
+/// chased away from there, else to the allies near it (pulled harder by a
+/// page that groups), else toward home.
+fn regroup_point(game: &Game, gi: usize, anchor: Vec3) -> Vec3 {
+    let me = &game.gods[gi];
+    if Vec3::new(me.pos.x - anchor.x, 0.0, me.pos.z - anchor.z).length() > 3.0 {
+        return anchor;
+    }
+    let (mut sum, mut n) = (Vec3::ZERO, 0.0);
+    for (k, g) in game.gods.iter().enumerate() {
+        if k != gi && g.team == me.team && g.respawn_t <= 0.0 && g.pos.distance(me.pos) < 22.0 {
+            sum += g.pos;
+            n += 1.0;
+        }
+    }
+    if n > 0.0 {
+        return sum / n;
+    }
+    let f = me.team.fountain();
+    me.pos + Vec3::new(f.x - me.pos.x, 0.0, f.z - me.pos.z).normalize_or_zero() * 8.0
 }

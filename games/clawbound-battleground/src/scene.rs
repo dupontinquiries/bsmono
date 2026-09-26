@@ -36,6 +36,16 @@ pub const TOWER_CULL_R: f32 = 5.0;
 pub struct Scene {
     /// Ancestors cut into posable parts: `[ancestor][team][slot]`.
     pub god_parts: Vec<[[u64; SLOTS]; 2]>,
+    /// The same parts as smooth, furred surfaces (the ultra preview;
+    /// `smoothvox`); empty unless ultra was asked for at build.
+    pub god_smooth: Vec<[[u64; SLOTS]; 2]>,
+    /// Draw the ancestors smooth and furred, with coloured lights and
+    /// traced shadows (`quality::Quality::Ultra`). A plain flag, so a
+    /// harness can compare the two on one frame.
+    pub ultra: bool,
+    /// The fur style the smooth parts were built for (the face's fur
+    /// depends on it): a different one needs a rebuild.
+    pub fur_built: crate::render::FurStyle,
     /// One rig per ancestor (teams share anatomy).
     pub god_rig: Vec<QuadRig>,
     /// The uncut body. Still what the portrait renderer draws.
@@ -53,6 +63,8 @@ pub struct Scene {
     /// (`Renderer::free_meshes_from` gives its meshes back on a switch).
     pub map: crate::map::MapId,
     pub first_mesh: u64,
+    /// A small flat tile: the dots a targeting guide is drawn with.
+    pub guide_dot: u64,
     pub gate: [u64; 2],
     pub fountain: [u64; 2],
     pub pedestal: [u64; 2],
@@ -67,6 +79,19 @@ pub struct Scene {
     pub orb: u64,
     pub arrow: [u64; 2],
     pub boulder: u64,
+    /// A sky-map ferry cloud, and the height of its deck above the mesh's
+    /// feet (`skyprops::ferry_cloud`).
+    pub cloud: u64,
+    pub cloud_top: f32,
+    /// The Moonwyrm (sky map), and one of its stars.
+    pub moonwyrm: u64,
+    /// Its body's segments: [with a crest fin?][variant].
+    pub wyrm_seg: [[u64; 2]; 2],
+    pub star: u64,
+    /// The sky map's drifting stone and cloud (`skydrift`), and their meshes
+    /// by kind (anchor, fragment, puff) and variant.
+    pub drift: Vec<crate::skydrift::Drift>,
+    pub drift_mesh: [[u64; DRIFT_VARIANTS]; 3],
     /// The crossing log: `props::fallen_log`, drawn per frame because it rolls.
     pub river_log: u64,
     pub total_voxels: usize,
@@ -75,6 +100,9 @@ pub struct Scene {
     /// `Game::blockers`.
     pub blockers: std::sync::Arc<Blockers>,
 }
+
+/// Mesh variants per kind of drifting piece.
+pub const DRIFT_VARIANTS: usize = 6;
 
 /// One frustum-cullable batch of static world voxels.
 /// A cave roof (`pass::caves`): drawn on its own, not batched, because it
@@ -129,6 +157,8 @@ pub fn chunk_choice(ch: &PropChunk, eye: Vec3) -> Option<(u64, f32)> {
 struct WorldProbe<'a> {
     blockers: &'a Blockers,
     logs: &'a [crate::logs::RollingLog],
+    /// Ultra's snowpack, if any: how much loose snow a paw is in.
+    snow: Option<&'a crate::snowpack::Snowpack>,
 }
 
 impl Probe for WorldProbe<'_> {
@@ -152,6 +182,9 @@ impl Probe for WorldProbe<'_> {
     }
     fn water(&self, x: f32, z: f32) -> f32 {
         consts::water_depth(x, z)
+    }
+    fn snow(&self, x: f32, z: f32) -> f32 {
+        self.snow.map_or(0.0, |s| s.surface_at(x, z))
     }
     fn stem(&self, x: f32, z: f32, within: f32) -> Option<(f32, f32)> {
         self.blockers.nearest_stem(x, z, within)
@@ -201,6 +234,27 @@ impl Scene {
             god_parts.push(parts);
         }
         assert_eq!((god_parts.len(), god_rig.len()), (ROSTER_LEN, ROSTER_LEN), "one cut body and one rig per ancestor");
+        // the ultra preview: every part smoothed and furred, once
+        let ultra = crate::quality::Quality::effective().smooth_characters();
+        let mut god_smooth = Vec::new();
+        if ultra {
+            let t = std::time::Instant::now();
+            let mut tris = 0;
+            for def in ROSTER.iter() {
+                let mut parts = [[0u64; SLOTS]; 2];
+                for team in [Team::Blue, Team::Red] {
+                    let rigged = models::build_god_rigged(def, team);
+                    for (s, m) in rigged.meshes.iter().enumerate() {
+                        let mut sm = crate::smoothvox::smooth(m, models::GOD_DRAW_VOXEL, 2);
+                        crate::smoothvox::fur_for_part(def, s, &mut sm, crate::render::FurStyle::from_env() == crate::render::FurStyle::Locks);
+                        tris += sm.tris();
+                        parts[team as usize][s] = r.upload_smooth(&sm);
+                    }
+                }
+                god_smooth.push(parts);
+            }
+            eprintln!("[clawbound] ultra preview: {tris} smooth triangles built in {:.1} s", t.elapsed().as_secs_f32());
+        }
 
         let mut minion_melee = [0u64; 2];
         let mut minion_caster = [0u64; 2];
@@ -262,6 +316,11 @@ impl Scene {
         }
         total += bird_mesh.inst.len();
         let bird = r.upload_mesh(&bird_mesh);
+        let guide_dot = {
+            let mut g = crate::voxel::Grid::new(3, 1, 3);
+            g.filled_box(0, 0, 0, 2, 0, 2, [1.0, 1.0, 1.0, 1.0]);
+            r.upload_mesh(&g.mesh(0.12, true))
+        };
         let caves: Vec<CaveDraw> = if crate::map::active() == crate::map::MapId::Pass {
             crate::pass::caves()
                 .into_iter()
@@ -299,12 +358,41 @@ impl Scene {
         let boulder = models::build_boulder();
         total += boulder.inst.len();
         let boulder = r.upload_mesh(&boulder);
+        let (cloud_m, cloud_top) = crate::skyprops::ferry_cloud(crate::ferry::CLOUD_R, 1);
+        total += cloud_m.inst.len();
+        let cloud = r.upload_mesh(&cloud_m);
+        let wyrm_m = crate::skyprops::moonwyrm();
+        total += wyrm_m.inst.len();
+        let moonwyrm = r.upload_mesh(&wyrm_m);
+        let mut wyrm_seg = [[0u64; 2]; 2];
+        for fin in [false, true] {
+            for v in 0..2 {
+                let m = crate::skyprops::wyrm_segment(fin, v as i32);
+                total += m.inst.len();
+                wyrm_seg[fin as usize][v] = r.upload_mesh(&m);
+            }
+        }
+        let star = r.upload_mesh(&crate::skyprops::star_mote());
+        let sky = crate::map::active() == crate::map::MapId::Sky;
+        let drift = if sky { crate::skydrift::placements() } else { Vec::new() };
+        let mut drift_mesh = [[0u64; DRIFT_VARIANTS]; 3];
+        if sky {
+            for v in 0..DRIFT_VARIANTS {
+                for (k, m) in [crate::skyprops::anchor_tile(v as i32), crate::skyprops::edge_fragment(v as i32), crate::skyprops::cloud_puff(v as i32)].iter().enumerate() {
+                    total += m.inst.len();
+                    drift_mesh[k][v] = r.upload_mesh(m);
+                }
+            }
+        }
         let river_log_mesh = props::crossing_log();
         total += river_log_mesh.inst.len();
         let river_log = r.upload_mesh(&river_log_mesh);
 
         Scene {
             god_parts,
+            god_smooth,
+            ultra,
+            fur_built: crate::render::FurStyle::from_env(),
             god_rig,
             god_body,
             god_weapon,
@@ -318,6 +406,7 @@ impl Scene {
             caves,
             map: crate::map::active(),
             first_mesh,
+            guide_dot,
             gate,
             fountain,
             pedestal,
@@ -332,6 +421,13 @@ impl Scene {
             orb,
             arrow,
             boulder,
+            cloud,
+            cloud_top,
+            moonwyrm,
+            wyrm_seg,
+            star,
+            drift,
+            drift_mesh,
             river_log,
             total_voxels: total,
             blockers: std::sync::Arc::new(blockers),
@@ -339,6 +435,17 @@ impl Scene {
     }
 
     pub fn draw(&self, r: &mut Renderer, game: &Game, vfx: &mut Vfx, cam: Camera) {
+        // the ultra preview's coloured lights (ability effects, the ones
+        // brightest where the camera looks) and the spheres their shadows
+        // are traced against (every cat standing)
+        r.ultra_post = self.ultra;
+        if self.ultra {
+            r.lights = vfx.lights(cam.target, 8);
+            r.occluders = game.gods.iter().filter(|g| g.respawn_t <= 0.0).map(|g| [g.pos.x, g.pos.y + 0.9, g.pos.z, 0.95]).collect();
+        } else {
+            r.lights.clear();
+            r.occluders.clear();
+        }
         r.clear_queues();
 
         // static world chunks — frustum culled. Snow cover frosts the flora
@@ -384,15 +491,79 @@ impl Scene {
             let (mesh, vs) = match b.kind {
                 crate::bosses::BossKind::Boar => (self.boar, models::BOAR_VOXEL),
                 crate::bosses::BossKind::Drake => (self.drake, models::DRAKE_VOXEL),
+                crate::bosses::BossKind::Moonwyrm => (self.moonwyrm, crate::skyprops::WYRM_VOX),
             };
             let breathe = (b.anim * 0.7).sin() * 0.03;
             let lunge = b.atk_anim * 0.8;
-            let hover = if b.kind == crate::bosses::BossKind::Drake { 0.4 + (b.anim * 0.5).sin() * 0.25 } else { 0.0 };
+            let hover = match b.kind {
+                crate::bosses::BossKind::Drake => 0.4 + (b.anim * 0.5).sin() * 0.25,
+                // sunk to the water line, rising and settling as it breathes
+                crate::bosses::BossKind::Moonwyrm => -0.2 + (b.anim * 0.4).sin() * 0.25,
+                crate::bosses::BossKind::Boar => 0.0,
+            };
             let fwd = Vec3::new(b.yaw.cos(), 0.0, b.yaw.sin());
+            if b.kind == crate::bosses::BossKind::Moonwyrm {
+                // 400 u of it: the head, then the body laid along its spine
+                // (coiled over the well, or streaming behind the head in
+                // flight -- wyrmbody.rs)
+                let since_land = game.t - (b.next_flight_t - crate::wyrmflight::FLIGHT_EVERY);
+                let segs = crate::wyrmbody::segments(b.home, b.flight, since_land, fwd, game.t);
+                let glow = 0.06 + atm.night * 0.08;
+                let frame = |f: Vec3| {
+                    let z = f.normalize_or(Vec3::Z);
+                    let x = Vec3::Y.cross(z).normalize_or(Vec3::X);
+                    (x, z.cross(x), z)
+                };
+                for (i, sg) in segs.iter().enumerate().skip(1) {
+                    let rad = crate::wyrmbody::BODY_R * sg.r;
+                    if !sg.shown || !sphere_in_frustum(&vp, sg.pos, rad + 3.5) {
+                        continue;
+                    }
+                    let (x, y, z) = frame(sg.fwd);
+                    let m = Mat4::from_cols((x * sg.r).extend(0.0), (y * sg.r).extend(0.0), z.extend(0.0), sg.pos.extend(1.0));
+                    r.queue_draw(self.wyrm_seg[(i % 3 == 0) as usize][i % 2], m, [1.0; 4], glow, crate::skyprops::WYRM_SEG_VOX, false);
+                }
+                if let Some(h) = segs.first().filter(|h| h.shown) {
+                    // at rest it looks where it is angry, lunging when it bites;
+                    // in flight, where it is going
+                    let look = if b.flight.is_some() { h.fwd } else { fwd };
+                    let (x, y, z) = frame(look);
+                    let pos = h.pos + z * lunge + Vec3::Y * (breathe * 8.0);
+                    let m = Mat4::from_cols(x.extend(0.0), y.extend(0.0), z.extend(0.0), pos.extend(1.0));
+                    r.queue_draw(mesh, m, [1.0; 4], glow, vs, false);
+                }
+                continue;
+            }
+            let _ = hover;
             let m = Mat4::from_translation(b.pos + fwd * lunge + Vec3::Y * (breathe + hover))
                 * Mat4::from_axis_angle(Vec3::Y, -b.yaw + std::f32::consts::FRAC_PI_2)
                 * Mat4::from_scale(Vec3::splat(1.0 + breathe));
-            r.queue_draw(mesh, m, [1.0; 4], if b.kind == crate::bosses::BossKind::Drake { 0.25 } else { 0.0 }, vs, false);
+            let glow = match b.kind {
+                crate::bosses::BossKind::Drake => 0.25,
+                _ => 0.0,
+            };
+            r.queue_draw(mesh, m, [1.0; 4], glow, vs, false);
+        }
+
+        // the Moonwyrm's stars: the ring it has ready, turning round it, and
+        // the ones it has thrown, spinning in flight
+        for b in game.bosses.list.iter().filter(|b| b.alive && b.kind == crate::bosses::BossKind::Moonwyrm) {
+            // round its head: aloft, the ring flies with it
+            let centre = if b.flight.is_some() { b.pos - Vec3::Y * 6.0 } else { b.home + crate::wyrmbody::REST_HEAD - Vec3::Y * 4.0 };
+            for k in 0..b.stars as usize {
+                let p = crate::moonwell::orbit_star(centre, game.t, k, crate::moonwell::STARS as usize);
+                let m = Mat4::from_translation(p) * Mat4::from_axis_angle(Vec3::Y, game.t * 2.0 + k as f32) * Mat4::from_scale(Vec3::splat(1.0 + 0.15 * (game.t * 5.0 + k as f32).sin()));
+                r.queue_draw(self.star, m, [1.0; 4], 1.2, crate::skyprops::STAR_VOX, false);
+            }
+        }
+        // the stars it lets fall as it flies, dropping onto their marks
+        for s in &game.starfalls {
+            let m = Mat4::from_translation(s.pos()) * Mat4::from_axis_angle(Vec3::Y, game.t * 7.0) * Mat4::from_scale(Vec3::splat(2.0));
+            r.queue_draw(self.star, m, [1.0; 4], 2.0, crate::skyprops::STAR_VOX, false);
+        }
+        for s in &game.star_bolts {
+            let m = Mat4::from_translation(s.pos) * Mat4::from_axis_angle(s.vel.normalize_or_zero().cross(Vec3::Y).normalize_or(Vec3::X), game.t * 9.0) * Mat4::from_scale(Vec3::splat(1.3));
+            r.queue_draw(self.star, m, [1.0; 4], 1.6, crate::skyprops::STAR_VOX, false);
         }
 
         // heal trees: the crown frosts like the rest, the fruit glows —
@@ -428,9 +599,17 @@ impl Scene {
         }
         for team in [Team::Blue, Team::Red] {
             let ti = team as usize;
-            r.queue_draw(self.gate[ti], Mat4::IDENTITY, [1.0; 4], 0.0, 0.24, false);
-            r.queue_draw(self.fountain[ti], Mat4::IDENTITY, [1.0; 4], 0.25, 0.2, false);
-            r.queue_draw(self.pedestal[ti], Mat4::IDENTITY, [1.0; 4], 0.0, 0.22, false);
+            // At the base, not the origin: all three were drawn with the
+            // identity matrix from the first commit, so both teams' gates,
+            // fountains and pedestals stood stacked at the map's centre (on
+            // the sky map, in the middle of the Moonwell). The gate faces
+            // down the lanes, a little past the Elder; the mesh faces +z.
+            let face = if team == Team::Blue { 0.0 } else { std::f32::consts::PI };
+            let gate_at = team.titan_pos() + Vec3::new(0.0, 0.0, team.push_z() * 12.0);
+            let ground = |p: Vec3| Vec3::new(p.x, crate::map::ground_y(p.x, p.z), p.z);
+            r.queue_draw(self.gate[ti], Mat4::from_translation(ground(gate_at)) * Mat4::from_axis_angle(Vec3::Y, face), [1.0; 4], 0.0, 0.24, false);
+            r.queue_draw(self.fountain[ti], Mat4::from_translation(ground(team.fountain())), [1.0; 4], 0.25, 0.2, false);
+            r.queue_draw(self.pedestal[ti], Mat4::from_translation(ground(team.titan_pos())), [1.0; 4], 0.0, 0.22, false);
         }
 
         // birds circling high above the valley + the ziggurats
@@ -498,17 +677,58 @@ impl Scene {
                 continue;
             }
             let ti = titan.team as usize;
-            let flip = if titan.team == Team::Blue { 0.0 } else { std::f32::consts::PI };
-            let base = Mat4::from_translation(titan.pos)
-                * Mat4::from_axis_angle(Vec3::Y, flip)
-                * Mat4::from_axis_angle(Vec3::Z, (vfx.time * 1.1).sin() * 0.02);
+            // Its walk: a heavy rolling gait -- a bob with each footfall, a
+            // sway side to side, a lean into the stride -- and at rest,
+            // breathing and a slow look round. It leans into a blow as it
+            // swings. (The model faces +z: turn by pi/2 - yaw.)
+            let go = (titan.stride / crate::consts::TITAN_SPEED).clamp(0.0, 1.0);
+            let bob = titan.walk.sin().abs() * 0.35 * go;
+            let sway = titan.walk.cos() * 0.05 * go;
+            let look = (1.0 - go) * (vfx.time * 0.23 + ti as f32).sin() * 0.12 * (1.0 - titan.atk_anim);
+            let breathe = (vfx.time * 1.1).sin() * 0.02 * (1.0 - go);
+            let lean = 0.08 * go + 0.18 * titan.atk_anim;
+            let base = Mat4::from_translation(titan.pos + Vec3::Y * bob)
+                * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - titan.yaw + look)
+                * Mat4::from_axis_angle(Vec3::X, lean)
+                * Mat4::from_axis_angle(Vec3::Z, breathe + sway);
             r.queue_draw(self.titan_body[ti], base, [1.0; 4], 0.0, 0.145, false);
-            let swing = -titan.atk_anim * 1.6;
+            let swing = -titan.atk_anim * 1.6 - (titan.walk.sin() * 0.25 * go);
             let wm = base
                 * Mat4::from_translation(Vec3::new(1.85, 2.4, 0.0))
                 * Mat4::from_axis_angle(Vec3::X, swing)
                 * Mat4::from_translation(Vec3::new(0.0, 0.6, 0.0));
             r.queue_draw(self.titan_weapon[ti], wm, [1.0; 4], 0.0, 0.145, false);
+
+            // its ground (systems::titan_zone), marked faintly with stones
+            // of light: the circle round the pedestal and the push lane
+            // out toward the enemy -- step inside and it comes for you
+            {
+                let (home, pz) = (titan.home, titan.team.push_z());
+                let c = titan.team.rgb();
+                let mut mark = |p: Vec3| {
+                    if crate::systems::titan_zone(home, titan.team, p - Vec3::new(0.0, 0.0, pz * 0.01)) {
+                        r.queue_draw(self.orb, Mat4::from_translation(Vec3::new(p.x, crate::map::ground_y(p.x, p.z) + 0.12, p.z)), alpha_tint(c, 0.35), 1.0, 0.06, true);
+                    }
+                };
+                let rr = crate::consts::TITAN_MOVE_R;
+                for k in 0..36 {
+                    let a = k as f32 / 36.0 * std::f32::consts::TAU;
+                    let p = home + Vec3::new(a.cos(), 0.0, a.sin()) * rr;
+                    // only where the circle is the edge (not inside the lane)
+                    if (p.z - home.z) * pz <= 0.0 || (p.x - home.x).abs() > crate::consts::TITAN_PUSH_HALF - 0.5 {
+                        mark(p);
+                    }
+                }
+                let (hx, len) = (crate::consts::TITAN_PUSH_HALF, crate::consts::TITAN_PUSH);
+                let n = 12;
+                for k in 0..=n {
+                    let f = k as f32 / n as f32;
+                    for side in [-1.0f32, 1.0] {
+                        mark(home + Vec3::new(side * hx, 0.0, pz * (rr * 0.5 + f * (len - rr * 0.5))));
+                    }
+                    mark(home + Vec3::new((f * 2.0 - 1.0) * hx, 0.0, pz * len));
+                }
+            }
 
             // invulnerability shell
             if game.titan_shielded(titan.team) {
@@ -530,7 +750,7 @@ impl Scene {
 
         // gods — posed per part. `puppet` decides what the body is doing,
         // `creature-rig` poses the boxes, `rigged` turns boxes into matrices.
-        let world = WorldProbe { blockers: &game.blockers, logs: &game.logs };
+        let world = WorldProbe { blockers: &game.blockers, logs: &game.logs, snow: vfx.snow.as_ref() };
         let dt = (vfx.time - vfx.puppets.last_time).clamp(0.0, 0.1);
         vfx.puppets.last_time = vfx.time;
         vfx.puppets.ensure(game.gods.len());
@@ -543,11 +763,15 @@ impl Scene {
         // the body. A god culled by their own bounds takes their ability's
         // visuals with them, and an ability that stops rendering while it is
         // still hitting you is worse than ten extra draw calls.
+        // an enemy the cloud hides from the player's team is not drawn
+        // (skycloud.rs; spectators and bot-only matches see everyone)
+        let viewer = game.gods.iter().find(|g| g.is_player).map(|g| g.team);
         for i in 0..game.gods.len() {
             let g = &game.gods[i];
             if g.respawn_t > 0.0 {
                 continue;
             }
+            let hidden = viewer.is_some_and(|t| !game.sees(t, i));
             let ti = g.team as usize;
             let def = game.def(i);
             let di = g.def_id as usize;
@@ -571,7 +795,14 @@ impl Scene {
                 quiet: game.quiet(i),
             };
             let puppet = &mut vfx.puppets.puppets[i];
+            let before = pevents.len();
             puppet.advance(dt, &inp, rig, &world, &mut pevents);
+            // hidden: its body keeps moving (so it is not stale when it
+            // steps out), but nothing of it is drawn and it leaves no marks
+            if hidden {
+                pevents.truncate(before);
+                continue;
+            }
             let pose = puppet.pose(&inp, rig);
             creature_rig::pose(rig.parts(), rig.torso_half, &pose.motion, None, &mut posed);
             // wading: sink toward the bed (capped so the head stays clear)
@@ -590,8 +821,25 @@ impl Scene {
                 l.plant = f.map(|p| crate::rigged::world_to_rig(rig, base, p - Vec3::Y * sink));
             }
             let mats = slot_transforms(rig, &posed, &legs, &pose.body);
+            let smooth = self.ultra && di < self.god_smooth.len();
             for (s, m) in mats.iter().enumerate() {
-                r.queue_draw(self.god_parts[di][ti][s], base * *m, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
+                if smooth {
+                    // smooth and furred; the voxel part casts its shadow
+                    r.queue_smooth(self.god_smooth[di][ti][s], base * *m, [1.0; 4]);
+                    r.queue_shadow_only(self.god_parts[di][ti][s], base * *m, models::GOD_DRAW_VOXEL);
+                } else {
+                    r.queue_draw(self.god_parts[di][ti][s], base * *m, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
+                }
+            }
+            // afterimages of a dash or a blink: this pose, where the cat
+            // just was, transparent and fading in its accent colour
+            for gh in vfx.afterimages.iter().filter(|a| a.god == i) {
+                let k = (gh.life / gh.max).clamp(0.0, 1.0);
+                let ghost = Mat4::from_translation(gh.pos + Vec3::Y * (pose.lift - sink)) * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - gh.yaw);
+                let tint = [gh.color[0] * 1.3, gh.color[1] * 1.3, gh.color[2] * 1.3, 0.42 * k];
+                for (s, m) in mats.iter().enumerate() {
+                    r.queue_draw(self.god_parts[di][ti][s], ghost * *m, tint, 0.8 * k, models::GOD_DRAW_VOXEL, true);
+                }
             }
 
             if self.god_weapon[di][ti] != 0 {
@@ -618,6 +866,90 @@ impl Scene {
         vfx.puppets.events = pevents;
 
         // the crossing logs: on the lane, or wherever the river left them
+        // the sky map's clouds, drifting over the chasms on their timetable;
+        // a slow bob and turn so they read as cloud, not platform
+        for (k, f) in game.ferries.iter().enumerate() {
+            let at = f.at(game.t).pos;
+            if !sphere_in_frustum(&vp, at, crate::ferry::CLOUD_R + 3.0) {
+                continue;
+            }
+            let bob = (vfx.time * 0.9 + k as f32 * 1.7).sin() * 0.06;
+            let m = Mat4::from_translation(at + Vec3::Y * (bob - self.cloud_top))
+                * Mat4::from_axis_angle(Vec3::Y, vfx.time * 0.05 + k as f32);
+            r.queue_draw(self.cloud, m, [1.0; 4], 0.35 + atm.night * 0.25, crate::skyprops::CLOUD_VOX, false);
+        }
+        // ultra's snowpack, for the terrain to draw (snowpack.rs)
+        r.snow = vfx.snow.as_ref().map(|s| {
+            let (pack, marks) = s.upload();
+            (pack, marks, s.params())
+        });
+        // the sky map's drifting cloud banks and wisps (skycloud.rs) -- the
+        // ones that hide cats. Soft, see-through billows; thinned near the
+        // camera and round the player's own cat, so a cat in a bank still
+        // sees what is at arm's length.
+        if crate::map::active() == crate::map::MapId::Sky {
+            let me = game.gods.iter().find(|g| g.is_player).map(|g| g.pos);
+            for c in crate::skycloud::clouds(game.cloud_seed, game.t) {
+                if c.thick < 0.02 || !sphere_in_frustum(&vp, c.pos + Vec3::Y * 3.0, c.r + 12.0) {
+                    continue;
+                }
+                let yaw = c.dir.z.atan2(c.dir.x);
+                // forming: each billow condenses on its own (staggered), small
+                // at first; dissipating: they spread, rise and thin. Both from
+                // the cloud's own clock.
+                let smooth = |x: f32| {
+                    let x = x.clamp(0.0, 1.0);
+                    x * x * (3.0 - 2.0 * x)
+                };
+                let leaving = smooth((c.age - (c.life - 20.0)) / 20.0);
+                for (k, (off, scale, edge)) in crate::skycloud::puffs(&c).into_iter().enumerate() {
+                    let stagger = ((k as f32 * 0.618 + c.seed as f32 * 0.001).fract()) * 0.5;
+                    let formed = if leaving > 0.0 { 1.0 } else { smooth((c.thick - stagger) / (1.0 - stagger).max(0.2)) };
+                    let grow = 0.35 + 0.65 * formed + 0.45 * leaving;
+                    // a dash through it pushes the billows aside (vfx::Gust)
+                    let mut at = c.pos + off + Vec3::Y * (1.5 * leaving);
+                    let mut parted = 0.0f32;
+                    for gu in &vfx.gusts {
+                        let d = gu.push(at);
+                        parted = parted.max(d.length() / 8.0);
+                        at += d;
+                    }
+                    let near_cam = ((at.distance(cam.eye) - 4.0) / 10.0).clamp(0.0, 1.0);
+                    let near_me = me.map_or(1.0, |p| ((Vec3::new(at.x - p.x, 0.0, at.z - p.z).length() - 3.0) / 9.0).clamp(0.0, 1.0));
+                    let scale = scale * grow;
+                    let a = c.thick * edge * 0.75 * near_cam * near_me * formed.max(0.2) * (1.0 - 0.5 * parted.min(1.0));
+                    if a < 0.02 {
+                        continue;
+                    }
+                    let m = Mat4::from_translation(at) * Mat4::from_axis_angle(Vec3::Y, -yaw + k as f32 * 0.7) * Mat4::from_scale(scale);
+                    r.queue_draw(self.drift_mesh[2][(c.seed as usize + k) % DRIFT_VARIANTS], m, [1.0, 1.0, 1.0, a], 0.3 + atm.night * 0.2, crate::skyprops::PUFF_VOX, true);
+                }
+            }
+        }
+        // the sky map's drifting stone and cloud, rising and falling on the
+        // slow air (skydrift.rs); an anchor stone rests on a little cloud
+        for d in &self.drift {
+            use crate::skydrift::DriftKind;
+            let at = d.at(vfx.time);
+            let (k, vox, reach) = match d.kind {
+                DriftKind::Anchor => (0, crate::skyprops::DRIFT_VOX, 4.0),
+                DriftKind::Fragment => (1, crate::skyprops::DRIFT_VOX, 3.0),
+                DriftKind::Puff => (2, crate::skyprops::PUFF_VOX, 8.0),
+            };
+            if !sphere_in_frustum(&vp, at.pos, reach * at.scale.max_element() + 2.0) {
+                continue;
+            }
+            let mesh = self.drift_mesh[k][d.variant.rem_euclid(DRIFT_VARIANTS as i32) as usize];
+            let m = Mat4::from_translation(at.pos) * Mat4::from_axis_angle(Vec3::Y, at.yaw) * Mat4::from_scale(at.scale);
+            let glow = if d.kind == DriftKind::Puff { 0.25 + atm.night * 0.2 } else { 0.0 };
+            r.queue_draw(mesh, m, [1.0; 4], glow, vox, false);
+            if d.kind == DriftKind::Anchor {
+                let under = Mat4::from_translation(at.pos - Vec3::Y * 3.2 * at.scale.y)
+                    * Mat4::from_axis_angle(Vec3::Y, at.yaw * 0.5 + 1.0)
+                    * Mat4::from_scale(at.scale * Vec3::new(0.55, 0.4, 0.55));
+                r.queue_draw(self.drift_mesh[2][(d.variant as usize + 1) % DRIFT_VARIANTS], under, [1.0; 4], 0.25 + atm.night * 0.2, crate::skyprops::PUFF_VOX, false);
+            }
+        }
         for l in &game.logs {
             use crate::logs::{LOG_RADIUS, LOG_TOP};
             let c = l.centre();
@@ -868,9 +1200,16 @@ pub fn world_blockers() -> Blockers {
 }
 
 fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
-    if crate::map::active() == crate::map::MapId::Pass {
-        let (pieces, blockers) = crate::passworld::build();
-        return batch(pieces, blockers);
+    match crate::map::active() {
+        crate::map::MapId::Pass => {
+            let (pieces, blockers) = crate::passworld::build();
+            return batch(pieces, blockers);
+        }
+        crate::map::MapId::Sky => {
+            let (pieces, blockers) = crate::skyworld::build();
+            return batch(pieces, blockers);
+        }
+        crate::map::MapId::Jungle => {}
     }
     const TAU: f32 = std::f32::consts::TAU;
     let mut pieces: Vec<Piece> = Vec::new();
@@ -1244,7 +1583,9 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
 
 /// Batch placed pieces into spatial chunks per voxel-size class: what the
 /// renderer uploads. Shared by every map's world builder.
-fn batch(pieces: Vec<Piece>, blockers: Blockers) -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
+fn batch(mut pieces: Vec<Piece>, mut blockers: Blockers) -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
+    // every map: the clans' camps behind the bases (clancamp.rs)
+    crate::clancamp::build(&mut pieces, &mut blockers);
     // Ordered, not hashed: a HashMap iterates in a fresh random order per
     // build, so chunks came out -- and drew -- in a different order every
     // time the world was built, and z-fighting between coplanar voxels
@@ -1507,6 +1848,17 @@ mod plan_tests {
     fn plan_of_the_centre() {
         let (_, _, b) = build_world();
         println!("{}", plan(&b, 62.0, 2.0));
+    }
+}
+
+impl Scene {
+    /// Draw a targeting guide: glowing dots on the terrain at `points`
+    /// (ground plane positions), in the ability's colour.
+    pub fn draw_guide(&self, r: &mut Renderer, points: &[Vec3], color: [f32; 3]) {
+        for p in points {
+            let y = crate::render::terrain_height(p.x, p.z).max(crate::map::ground_y(p.x, p.z)) + 0.06;
+            r.queue_draw(self.guide_dot, Mat4::from_translation(Vec3::new(p.x, y, p.z)), [color[0], color[1], color[2], 1.0], 1.6, 0.12, false);
+        }
     }
 }
 

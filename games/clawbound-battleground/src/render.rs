@@ -76,12 +76,77 @@ pub struct Camera {
 impl Camera {
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         let view = Mat4::look_at_rh(self.eye, self.target, Vec3::Y);
-        let proj = Mat4::perspective_rh(self.fov_y, aspect, 0.25, 500.0);
+        // the sky map's cloud sea runs to the horizon: at 500 u it ended in
+        // a straight cut across the view
+        let far = if crate::map::active() == crate::map::MapId::Sky { 950.0 } else { 500.0 };
+        let proj = Mat4::perspective_rh(self.fov_y, aspect, 0.25, far);
         proj * view
     }
 }
 
 // --- mesh cache ----------------------------------------------------------------
+
+/// Shader sources as compiled: shared parts prepended -- the sun's
+/// contact-hardening shadow (common_shadow.wgsl) and the ground's height
+/// field (common_surface.wgsl). tests/shaders.rs validates exactly these.
+pub mod shader_src {
+    pub const VOXEL: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/voxel.wgsl"));
+    pub const TERRAIN: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/common_surface.wgsl"), include_str!("../shaders/terrain.wgsl"));
+    pub const SMOOTH: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/smooth.wgsl"));
+    pub const POST: &str = concat!(include_str!("../shaders/common_surface.wgsl"), include_str!("../shaders/post.wgsl"));
+}
+
+/// A smooth mesh on the GPU (`smoothvox`): vertices and triangle indices.
+struct SmoothGpu {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    count: u32,
+}
+
+/// Bytes in the smooth pipeline's `Lights` uniform (smooth.wgsl).
+const LIGHTS_BYTES: u64 = 16 + 16 * 8 + 16 * 8 + 16 * 32 + 16;
+
+/// How the ultra preview's fur is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FurStyle {
+    /// Flat square strands standing straight out (the default: the look
+    /// the player liked best -- 10 shells, 55 cells a unit).
+    Tape,
+    /// Chunky tapered locks combed toward the tail, two-tone (7 shells,
+    /// 24 cells a unit). `CLAWBOUND_FUR=locks`.
+    Locks,
+}
+
+/// The player's chosen fur (0 tape, 1 locks).
+static FUR_CHOSEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+impl FurStyle {
+    /// CLAWBOUND_FUR if given, else the player's setting (`set_chosen`).
+    pub fn from_env() -> FurStyle {
+        match std::env::var("CLAWBOUND_FUR").ok().as_deref() {
+            Some("locks") => FurStyle::Locks,
+            Some("tape") => FurStyle::Tape,
+            _ => {
+                if FUR_CHOSEN.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+                    FurStyle::Locks
+                } else {
+                    FurStyle::Tape
+                }
+            }
+        }
+    }
+
+    pub fn set_chosen(f: FurStyle) {
+        FUR_CHOSEN.store((f == FurStyle::Locks) as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// (shells, cells per unit)
+    pub fn shells_density(self) -> (u32, f32) {
+        match self {
+            FurStyle::Tape => (10, 55.0),
+            FurStyle::Locks => (7, 24.0),
+        }
+    }
+}
 
 pub struct GpuMesh {
     buf: wgpu::Buffer,
@@ -196,6 +261,8 @@ pub struct Renderer {
     shadow_tex: wgpu::Texture,
     shadow_view: wgpu::TextureView,
     shadow_sampler: wgpu::Sampler,
+    /// The shadow map's side, texels (`Quality::shadow_size`; `set_shadow_size`).
+    pub shadow_size: u32,
 
     terrain_vbuf: wgpu::Buffer,
     terrain_ibuf: wgpu::Buffer,
@@ -219,7 +286,38 @@ pub struct Renderer {
     transparent: Vec<(u64, u32)>,
     draws: Vec<DrawData>,
     particles: Vec<VoxInst>,
-    camera: Camera,
+    // --- ultra preview: smooth, furred, PBR characters ------------------
+    smooth_pipe: wgpu::RenderPipeline,
+    lights_buf: wgpu::Buffer,
+    lights_bind: wgpu::BindGroup,
+    snow_pack_tex: wgpu::Texture,
+    snow_mark_tex: wgpu::Texture,
+    snow_params: wgpu::Buffer,
+    /// Ultra's snowpack for this frame, set by the scene: the pack's depth
+    /// and the marks as texture bytes, and where they sit
+    /// (`snowpack::Snowpack::upload` / `params`). None: no snow drawn.
+    pub snow: Option<(Vec<u8>, Vec<u8>, [[f32; 4]; 2])>,
+    smooth_meshes: HashMap<u64, SmoothGpu>,
+    smooth_queue: Vec<(u64, u32)>,
+    /// Voxel draws that only cast shadows (an ultra cat's shadow is its
+    /// voxel parts': the same shape, and no second shadow pipeline).
+    shadow_only: Vec<(u64, u32)>,
+    /// Coloured point lights this frame: (xyz, radius), (rgb * intensity).
+    pub lights: Vec<([f32; 4], [f32; 4])>,
+    /// Spheres the coloured lights' shadows are traced against (the cats).
+    pub occluders: Vec<[f32; 4]>,
+    /// The graphics quality in effect (the app sets it each frame): scales
+    /// bloom and god rays; Ultra's own effects are `ultra_post` and the
+    /// scene's smooth characters.
+    pub quality: crate::quality::Quality,
+    /// The ultra post effects: wet ground as a mirror, sky-occluded god rays.
+    pub ultra_post: bool,
+    /// The fur's look (shells and density follow it: `set_fur_style`).
+    pub fur_style: FurStyle,
+    /// Fur shells per smooth draw, and strands per unit of model space.
+    pub fur_shells: u32,
+    pub fur_density: f32,
+    pub camera: Camera,
     time: f32,
     pub exposure: f32,
     /// Sky state for this frame — set by the caller each frame (see weather.rs).
@@ -356,12 +454,22 @@ impl Renderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: true,
+                    },
+                    count: None,
+                },
             ],
         });
 
         let voxel_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("voxel.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/voxel.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::render::shader_src::VOXEL.into()),
         });
         let shadow_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadow.wgsl"),
@@ -369,7 +477,7 @@ impl Renderer {
         });
         let terrain_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("terrain.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/terrain.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::render::shader_src::TERRAIN.into()),
         });
         let water_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("water"),
@@ -381,7 +489,7 @@ impl Renderer {
         });
         let post_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("post.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/post.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::render::shader_src::POST.into()),
         });
 
         let voxel_vbl = wgpu::VertexBufferLayout {
@@ -495,9 +603,44 @@ impl Renderer {
             multiview: None,
         });
 
+        // the terrain receives the coloured point lights too (ultra), so it
+        // shares the lights layout with the smooth characters
+        // ...and ultra's snowpack (snowpack.rs): the pack's depth and the
+        // marks, sampled by the terrain's vertex and fragment stages
+        let snow_tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+            count: None,
+        };
+        let lights_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lights bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                snow_tex_entry(1),
+                snow_tex_entry(2),
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+            ],
+        });
+        let lit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("lit layout"),
+            bind_group_layouts: &[&main_bgl, &lights_bgl],
+            push_constant_ranges: &[],
+        });
         let terrain_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("terrain"),
-            layout: Some(&main_pl),
+            layout: Some(&lit_pl),
             vertex: wgpu::VertexState { module: &terrain_module, entry_point: "vs_main", buffers: &[terrain_vbl] },
             fragment: Some(wgpu::FragmentState {
                 module: &terrain_module,
@@ -548,6 +691,84 @@ impl Renderer {
             }),
             primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
             depth_stencil: Some(depth_state_ro),
+            multisample: msaa,
+            multiview: None,
+        });
+
+        // the ultra preview's smooth characters (smooth.wgsl): the world's
+        // bind group, plus the coloured lights and their occluders
+        let smooth_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("smooth"),
+            source: wgpu::ShaderSource::Wgsl(crate::render::shader_src::SMOOTH.into()),
+        });
+        let lights_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lights"),
+            size: LIGHTS_BYTES,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let snow_tex = |label: &str, n: usize| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: n as u32, height: n as u32, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        let snow_pack_tex = snow_tex("snow pack", crate::snowpack::N);
+        let snow_mark_tex = snow_tex("snow marks", crate::snowpack::FN);
+        let snow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("snow"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let snow_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("snow params"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let (pack_view, mark_view) = (snow_pack_tex.create_view(&Default::default()), snow_mark_tex.create_view(&Default::default()));
+        let lights_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lights bind"),
+            layout: &lights_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: lights_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&pack_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&mark_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&snow_sampler) },
+                wgpu::BindGroupEntry { binding: 4, resource: snow_params.as_entire_binding() },
+            ],
+        });
+        let smooth_pl = &lit_pl;
+        let smooth_vbl = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<crate::smoothvox::SmoothVert>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 24, shader_location: 2 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 40, shader_location: 3 },
+            ],
+        };
+        let smooth_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("smooth"),
+            layout: Some(smooth_pl),
+            vertex: wgpu::VertexState { module: &smooth_module, entry_point: "vs_main", buffers: &[smooth_vbl] },
+            fragment: Some(wgpu::FragmentState {
+                module: &smooth_module,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
+            depth_stencil: Some(depth_state_write.clone()),
             multisample: msaa,
             multiview: None,
         });
@@ -654,7 +875,9 @@ impl Renderer {
 
         let post_params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("post params"),
-            size: 48 + 16 * crate::groundfx::MAX_RINGS as u64,
+            // 3 vec4, view-proj, its inverse, the camera, and per blast a
+            // world centre+radius and a strength+thickness
+            size: 64 + 64 * 2 + 16 + 32 * crate::groundfx::MAX_RINGS as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -688,6 +911,7 @@ impl Renderer {
             shadow_tex,
             shadow_view,
             shadow_sampler,
+            shadow_size: SHADOW_SIZE,
             terrain_vbuf,
             terrain_ibuf,
             terrain_count,
@@ -709,6 +933,23 @@ impl Renderer {
             dropped_draws: 0,
             stats: FrameStats::default(),
             particles: Vec::new(),
+            smooth_pipe,
+            lights_buf,
+            lights_bind,
+            snow_pack_tex,
+            snow_mark_tex,
+            snow_params,
+            snow: None,
+            smooth_meshes: HashMap::new(),
+            smooth_queue: Vec::new(),
+            shadow_only: Vec::new(),
+            lights: Vec::new(),
+            occluders: Vec::new(),
+            quality: crate::quality::Quality::High,
+            ultra_post: false,
+            fur_style: FurStyle::from_env(),
+            fur_shells: FurStyle::from_env().shells_density().0,
+            fur_density: FurStyle::from_env().shells_density().1,
             camera: Camera { eye: Vec3::ZERO, target: Vec3::Y, fov_y: 1.05 },
             time: 0.0,
             exposure: 0.92,
@@ -761,10 +1002,11 @@ impl Renderer {
     /// order): how a scene gives its GPU memory back on a map switch.
     pub fn free_meshes_from(&mut self, mark: u64) {
         self.meshes.retain(|&id, _| id < mark);
+        self.smooth_meshes.retain(|&id, _| id < mark);
     }
 
     pub fn mesh_count(&self) -> usize {
-        self.meshes.len()
+        self.meshes.len() + self.smooth_meshes.len()
     }
 
     pub fn upload_mesh(&mut self, mesh: &VoxelMesh) -> u64 {
@@ -831,14 +1073,16 @@ impl Renderer {
             sample_count: 4,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // sampled by the post pass: blast fronts are occluded by what
+            // stands in front of them (post.wgsl)
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let depth_view = depth_tex.create_view(&Default::default());
         self.hdr_msaa = Some((msaa_tex, msaa_view));
         self.hdr_resolve = Some((resolve_tex, resolve_view));
         self.depth = Some((depth_tex, depth_view));
-        if let Some((_, rview)) = &self.hdr_resolve {
+        if let (Some((_, rview)), Some((_, dview))) = (&self.hdr_resolve, &self.depth) {
             self.post_bind = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("post bind"),
                 layout: &self.post_bgl,
@@ -846,6 +1090,7 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(rview) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
                     wgpu::BindGroupEntry { binding: 2, resource: self.post_params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(dview) },
                 ],
             }));
         }
@@ -868,9 +1113,86 @@ impl Renderer {
         out
     }
 
+    /// Resize the shadow map (the quality setting): a new texture, and the
+    /// main bind group that samples it, rebuilt. A no-op at the same size.
+    pub fn set_shadow_size(&mut self, size: u32) {
+        let size = size.clamp(256, 4096);
+        if size == self.shadow_size {
+            return;
+        }
+        self.shadow_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow map"),
+            size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.shadow_view = self.shadow_tex.create_view(&Default::default());
+        self.main_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("main bind"),
+            layout: &self.main_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.frame_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &self.draw_buf, offset: 0, size: std::num::NonZeroU64::new(std::mem::size_of::<DrawData>() as u64) }),
+                },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.shadow_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.shadow_sampler) },
+            ],
+        });
+        self.shadow_size = size;
+    }
+
+    pub fn set_fur_style(&mut self, s: FurStyle) {
+        self.fur_style = s;
+        (self.fur_shells, self.fur_density) = s.shells_density();
+    }
+
+    /// Upload a smooth mesh (ultra preview); ids share the voxel meshes'
+    /// counter, so `free_meshes_from` frees these too.
+    pub fn upload_smooth(&mut self, m: &crate::smoothvox::SmoothMesh) -> u64 {
+        let id = self.next_mesh_id;
+        self.next_mesh_id += 1;
+        if m.indices.is_empty() {
+            return id;
+        }
+        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("smooth vbuf"), contents: bytemuck::cast_slice(&m.verts), usage: wgpu::BufferUsages::VERTEX });
+        let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("smooth ibuf"), contents: bytemuck::cast_slice(&m.indices), usage: wgpu::BufferUsages::INDEX });
+        self.smooth_meshes.insert(id, SmoothGpu { vbuf, ibuf, count: m.indices.len() as u32 });
+        id
+    }
+
+    /// Queue a smooth, furred draw (ultra preview).
+    pub fn queue_smooth(&mut self, mesh: u64, model: Mat4, tint: [f32; 4]) {
+        if self.draws.len() >= MAX_DRAWS - 1 {
+            self.dropped_draws += 1;
+            return;
+        }
+        let idx = self.draws.len() as u32;
+        self.draws.push(DrawData { model: model.to_cols_array_2d(), tint, params: [0.0, 0.0, 0.0, 0.0] });
+        self.smooth_queue.push((mesh, idx));
+    }
+
+    /// Queue a voxel draw that only casts a shadow.
+    pub fn queue_shadow_only(&mut self, mesh: u64, model: Mat4, voxel: f32) {
+        if self.draws.len() >= MAX_DRAWS - 1 {
+            self.dropped_draws += 1;
+            return;
+        }
+        let idx = self.draws.len() as u32;
+        self.draws.push(DrawData { model: model.to_cols_array_2d(), tint: [1.0; 4], params: [0.0, voxel, 0.0, 0.0] });
+        self.shadow_only.push((mesh, idx));
+    }
+
     pub fn clear_queues(&mut self) {
         self.opaque.clear();
         self.transparent.clear();
+        self.smooth_queue.clear();
+        self.shadow_only.clear();
         self.draws.clear();
         if self.dropped_draws > 0 {
             eprintln!("[clawbound] {} draws dropped last frame (MAX_DRAWS {})", self.dropped_draws, MAX_DRAWS);
@@ -901,6 +1223,15 @@ impl Renderer {
     }
 
     pub fn set_particles(&mut self, p: Vec<VoxInst>) {
+        // the quality setting thins the particles: every Nth kept, so each
+        // effect keeps its shape with fewer cubes (Low: a third)
+        let keep = self.quality.particle_scale().clamp(0.05, 1.0);
+        let p: Vec<VoxInst> = if keep >= 0.999 {
+            p
+        } else {
+            let step = (1.0 / keep).round().max(1.0) as usize;
+            p.into_iter().enumerate().filter(|(k, _)| k % step == 0).map(|(_, v)| v).collect()
+        };
         self.particles = p;
     }
 
@@ -933,14 +1264,16 @@ impl Renderer {
         // texel, a third of a voxel, so every shadow was a blob. It is now
         // aimed at what the camera is looking at and sized to the view.
         let half = crate::groundfx::shadow_half_extent(cam.eye.distance(cam.target));
-        let lvp = crate::groundfx::fit_shadow(cam.target, sun, half, SHADOW_SIZE);
+        let lvp = crate::groundfx::fit_shadow(cam.target, sun, half, self.shadow_size);
 
         let fog_color = [atm.fog_color[0], atm.fog_color[1], atm.fog_color[2], 1.0];
         let frame = FrameUniform {
             view_proj: vp.to_cols_array_2d(),
             inv_view_proj: inv.to_cols_array_2d(),
             light_view_proj: lvp.to_cols_array_2d(),
-            sun_dir: [sun.x, sun.y, sun.z, 0.0],
+            // w: the spirit sky (Starwell Glacier) -- no mountains on the
+            // horizon, aurora, stars to the horizon (sky.wgsl)
+            sun_dir: [sun.x, sun.y, sun.z, if crate::map::active() == crate::map::MapId::Sky { 1.0 } else { 0.0 }],
             cam_pos: [cam.eye.x, cam.eye.y, cam.eye.z, 1.0],
             fog_color,
             params: [time, atm.fog_density, self.exposure, atm.night],
@@ -996,30 +1329,82 @@ impl Renderer {
                 } else {
                     ([0.5, 0.5], 0.0)
                 };
-                let cam_right = (cam.target - cam.eye).cross(Vec3::Y);
-                let rings = crate::groundfx::screen_rings(&self.blast_a, &self.blast_b, vp, cam_right, aspect);
+                let (shell_a, shell_b) = crate::groundfx::shell_blasts(&self.blast_a, &self.blast_b);
+                let _ = aspect;
                 post_data.clear();
                 post_data.extend_from_slice(&[
                     self.exposure * (1.0 + atm.night * 0.35),
                     0.55 + atm.night * 0.2,
                     time,
                     atm.lightning,
-                    0.55 + atm.night * 0.3,
+                    // bloom, by the quality setting (Low: none)
+                    (0.55 + atm.night * 0.3) * self.quality.bloom_scale(),
                     atm.night,
                     atm.rain,
                     // heat shimmer: fire near the camera (the wildfire's glow)
                     self.event.2.clamp(0.0, 1.0),
                     sun_uv[0],
                     sun_uv[1],
-                    ray,
+                    ray * self.quality.ray_scale(),
                     0.22,
+                    // d: wetness, the ultra reflections and god rays
+                    atm.wetness,
+                    self.ultra_post as u32 as f32,
+                    self.ultra_post as u32 as f32,
+                    0.0,
                 ]);
-                for r in rings {
+                post_data.extend_from_slice(&vp.to_cols_array());
+                post_data.extend_from_slice(&vp.inverse().to_cols_array());
+                post_data.extend_from_slice(&[cam.eye.x, cam.eye.y, cam.eye.z, 0.0]);
+                for r in shell_a {
+                    post_data.extend_from_slice(&r);
+                }
+                for r in shell_b {
                     post_data.extend_from_slice(&r);
                 }
                 bytemuck::cast_slice(&post_data)
             },
         );
+
+        // the coloured lights and occluders (smooth.wgsl / terrain.wgsl
+        // `Lights`): written every frame -- the terrain reads them too, and
+        // outside ultra they are empty
+        {
+            let mut l = vec![0.0f32; (LIGHTS_BYTES / 4) as usize];
+            let nl = self.lights.len().min(8);
+            let no = self.occluders.len().min(32);
+            l[0..4].copy_from_slice(&[nl as f32, no as f32, self.fur_shells as f32, self.fur_density]);
+            for (k, (p, c)) in self.lights.iter().take(8).enumerate() {
+                l[4 + k * 4..8 + k * 4].copy_from_slice(p);
+                l[36 + k * 4..40 + k * 4].copy_from_slice(c);
+            }
+            for (k, o) in self.occluders.iter().take(32).enumerate() {
+                l[68 + k * 4..72 + k * 4].copy_from_slice(o);
+            }
+            l[196] = (self.fur_style == FurStyle::Locks) as u32 as f32;
+            self.queue.write_buffer(&self.lights_buf, 0, bytemuck::cast_slice(&l));
+        }
+        // the snowpack (ultra): both fields, every frame it is there; the
+        // params' `on` flag off otherwise
+        {
+            let mut p = [[0.0f32; 4]; 2];
+            if let Some((pack, marks, params)) = self.snow.as_ref() {
+                let put = |tex: &wgpu::Texture, bytes: &[u8], n: usize| {
+                    self.queue.write_texture(
+                        wgpu::ImageCopyTexture { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                        bytes,
+                        wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(n as u32), rows_per_image: Some(n as u32) },
+                        wgpu::Extent3d { width: n as u32, height: n as u32, depth_or_array_layers: 1 },
+                    );
+                };
+                if pack.len() == crate::snowpack::N * crate::snowpack::N && marks.len() == crate::snowpack::FN * crate::snowpack::FN {
+                    put(&self.snow_pack_tex, pack, crate::snowpack::N);
+                    put(&self.snow_mark_tex, marks, crate::snowpack::FN);
+                    p = *params;
+                }
+            }
+            self.queue.write_buffer(&self.snow_params, 0, bytemuck::cast_slice(&p));
+        }
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
@@ -1055,7 +1440,7 @@ impl Renderer {
             // what the camera looks at, and drawing every chunk the CAMERA
             // sees into it doubled the voxel work of every frame
             // (CLAWBOUND_SHOTS=perf: "shadow" == "instances" everywhere).
-            for (mesh_id, di) in &self.opaque {
+            for (mesh_id, di) in self.opaque.iter().chain(self.shadow_only.iter()) {
                 if let Some(m) = self.meshes.get(mesh_id) {
                     let model = Mat4::from_cols_array_2d(&self.draws[*di as usize].model);
                     let c = model.transform_point3(m.bound.0);
@@ -1108,6 +1493,7 @@ impl Renderer {
             // terrain
             rp.set_pipeline(&self.terrain_pipe);
             rp.set_bind_group(0, &self.main_bind, &[0]);
+            rp.set_bind_group(1, &self.lights_bind, &[]);
             rp.set_vertex_buffer(0, self.terrain_vbuf.slice(..));
             rp.set_index_buffer(self.terrain_ibuf.slice(..), wgpu::IndexFormat::Uint32);
             rp.draw_indexed(0..self.terrain_count, 0, 0..1);
@@ -1121,6 +1507,21 @@ impl Renderer {
                     rp.set_bind_group(0, &self.main_bind, &[(*di as u32) * DYN_ALIGN as u32]);
                     rp.set_vertex_buffer(1, m.buf.slice(..));
                     rp.draw_indexed(0..36, 0, 0..m.count);
+                }
+            }
+
+            // the ultra preview's smooth, furred characters: the skin and
+            // `fur_shells` shells in one instanced draw per part
+            if !self.smooth_queue.is_empty() {
+                rp.set_pipeline(&self.smooth_pipe);
+                rp.set_bind_group(1, &self.lights_bind, &[]);
+                for (mesh_id, di) in &self.smooth_queue {
+                    if let Some(m) = self.smooth_meshes.get(mesh_id) {
+                        rp.set_bind_group(0, &self.main_bind, &[(*di as u32) * DYN_ALIGN as u32]);
+                        rp.set_vertex_buffer(0, m.vbuf.slice(..));
+                        rp.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.draw_indexed(0..m.count, 0, 0..(1 + self.fur_shells));
+                    }
                 }
             }
 
@@ -1473,8 +1874,10 @@ pub fn sort_far_to_near<T>(items: &mut [(f32, T)]) {
 /// beyond the arena bounds, a mountain rim at the horizon, and river valleys
 /// that dip under the lanes (roads stay solid — bridges span the crossings).
 pub fn terrain_height(x: f32, z: f32) -> f32 {
-    if crate::map::active() == crate::map::MapId::Pass {
-        return crate::pass::terrain_height(x, z);
+    match crate::map::active() {
+        crate::map::MapId::Pass => return crate::pass::terrain_height(x, z),
+        crate::map::MapId::Sky => return crate::sky::terrain_height(x, z),
+        crate::map::MapId::Jungle => {}
     }
     use crate::consts::{river_dist, GROUND_HALF, RIVER_HALF_WIDTH, RIVER_DEPTH, ARENA_RADIUS, RIM_RADIUS};
     let r = (x * x + z * z).sqrt();
@@ -1601,6 +2004,8 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
             let mut mat = 0.0f32;
             if crate::map::active() == crate::map::MapId::Pass {
                 (color, mat) = pass_ground_color(x, z, h, slope, n1, n2, nm);
+            } else if crate::map::active() == crate::map::MapId::Sky {
+                (color, mat) = sky_ground_color(x, z, h, slope, n1, n2, nm);
             } else if r > crate::consts::RIM_RADIUS + 3.0 && h > 14.0 {
                 // mountain rim: dark jungle rock with forest ledges
                 let rock = [0.24 + n1 * 0.05, 0.24 + n2 * 0.04, 0.22 + n1 * 0.03];
@@ -1697,16 +2102,67 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
     }
 
     let mut idx = Vec::with_capacity((n_side - 1) * (n_side - 1) * 6);
+    // The sky map's islands float: the top surface stops at each island's
+    // edge (a triangle with any corner in open sky is left out, so no skirt
+    // hangs down from the rim), and `sky_underside` hangs a keel beneath.
+    let sky = crate::map::active() == crate::map::MapId::Sky;
+    let void: Vec<bool> = if sky { verts.iter().map(|v| crate::sky::in_void(v.pos[0], v.pos[2])).collect() } else { Vec::new() };
     for iz in 0..n_side - 1 {
         for ix in 0..n_side - 1 {
             let a = (ix + n_side * iz) as u32;
             let b = (ix + 1 + n_side * iz) as u32;
             let c = (ix + n_side * (iz + 1)) as u32;
             let d = (ix + 1 + n_side * (iz + 1)) as u32;
-            idx.extend_from_slice(&[a, c, b, b, c, d]);
+            for tri in [[a, c, b], [b, c, d]] {
+                if sky && tri.iter().any(|&k| void[k as usize]) {
+                    continue;
+                }
+                idx.extend_from_slice(&tri);
+            }
         }
     }
+    if sky {
+        sky_underside(&mut verts, &mut idx, &void, n_side, STEP);
+    }
     (verts, idx)
+}
+
+/// The sky map's island undersides, appended to the terrain mesh: under
+/// every top triangle, one facing down, at `sky::underside` below the floor.
+/// The boundary vertices (a neighbour in open sky) are shared in height with
+/// the top, so the rim is closed and the surface curls from the lip straight
+/// down and back in under the island to its keel.
+fn sky_underside(verts: &mut Vec<TerrainVert>, idx: &mut Vec<u32>, void: &[bool], n_side: usize, step: f32) {
+    let top_len = verts.len();
+    let top_idx = idx.len();
+    let at = |ix: usize, iz: usize| ix + n_side * iz;
+    let depth = |x: f32, z: f32| crate::sky::underside(x, z);
+    let mut remap = vec![u32::MAX; top_len];
+    for iz in 0..n_side {
+        for ix in 0..n_side {
+            let k = at(ix, iz);
+            if void[k] {
+                continue;
+            }
+            let rim = [(ix.wrapping_sub(1), iz), (ix + 1, iz), (ix, iz.wrapping_sub(1)), (ix, iz + 1)].iter().any(|&(a, b)| a >= n_side || b >= n_side || void[at(a, b)]);
+            let [x, y, z] = verts[k].pos;
+            let d = if rim { 0.0 } else { depth(x, z) };
+            // the downward normal, from the underside's own slope
+            let (dl, dr, dd, du) = (depth(x - step, z), depth(x + step, z), depth(x, z - step), depth(x, z + step));
+            let up = Vec3::new(dl - dr, 2.0 * step, dd - du).normalize_or(Vec3::Y);
+            let n = Vec3::new(up.x, -up.y, up.z).normalize_or(-Vec3::Y);
+            remap[k] = verts.len() as u32;
+            verts.push(TerrainVert { pos: [x, if rim { y } else { -d }, z], normal: n.to_array(), color: sky_underside_color(x, z, d), mat: 5.0 });
+        }
+    }
+    for t in 0..top_idx / 3 {
+        let (a, b, c) = (idx[t * 3], idx[t * 3 + 1], idx[t * 3 + 2]);
+        let (ra, rb, rc) = (remap[a as usize], remap[b as usize], remap[c as usize]);
+        if ra != u32::MAX && rb != u32::MAX && rc != u32::MAX {
+            // reversed winding: seen from below
+            idx.extend_from_slice(&[ra, rc, rb]);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1762,6 +2218,81 @@ fn pass_ground_color(x: f32, z: f32, h: f32, slope: f32, n1: f32, n2: f32, nm: f
     (lerp(c, snow, snow_t), if snow_t > 0.5 { 6.0 } else { 4.0 })
 }
 
+/// Starwell Glacier ground. The lanes are old pale stone, almost marble,
+/// worn smooth; the islands are snow over glacier ice with alpine meadow
+/// breaking through in the sheltered middles (spirit-teal, not green); the
+/// Moonwell's floor is pale silt; the lip at every edge is blue ice; the
+/// island undersides are dark blue rock and ice falling away; the cloud sea
+/// far below is soft lavender-white. Cold and luminous: the only warm light
+/// on this map is starfire and a cat.
+fn sky_ground_color(x: f32, z: f32, h: f32, slope: f32, n1: f32, n2: f32, nm: f32) -> ([f32; 3], f32) {
+    use crate::sky;
+    let d = sky::floor().sdf(x, z);
+    let lerp = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    if d <= 0.3 {
+        let r = x.hypot(z);
+        if r < sky::POOL_R + 1.5 {
+            // the Moonwell's bed: pale silt, faintly silver
+            return ([0.62 + n1 * 0.05, 0.68 + n1 * 0.05, 0.74 + n2 * 0.04], 3.0);
+        }
+        // on a lane? the old road
+        let road = crate::render::lane_road(x, z);
+        let stone = [0.70 + n1 * 0.05, 0.72 + n1 * 0.05, 0.76 + n2 * 0.04];
+        let snow = [0.86 + n2 * 0.05, 0.89 + n2 * 0.05, 0.95 + n2 * 0.03];
+        // alpine meadow: sage, frosted (a saturated teal read as water)
+        let meadow = [0.40 + n1 * 0.05, 0.52 + n2 * 0.05, 0.38 + n1 * 0.04];
+        if road < sky::LANE_R - 1.5 {
+            // flagstones: faint joints every ~3 u
+            let joint = ((x * 0.33).fract() < 0.06) as i32 as f32 * 0.5 + ((z * 0.33).fract() < 0.06) as i32 as f32 * 0.5;
+            let c = lerp(stone, [0.52, 0.55, 0.62], joint.min(1.0) * 0.5);
+            // snow drifting in at the road's edge
+            let drift = smoothstep(sky::LANE_R - 5.0, sky::LANE_R - 1.5, road) * smoothstep(0.4, 0.7, nm);
+            return (lerp(c, snow, drift), 4.0);
+        }
+        // islands: snow, with meadow in the sheltered middles
+        let inner = smoothstep(-4.0, -12.0, d);
+        let meadow_t = (smoothstep(0.52, 0.72, nm) * inner).clamp(0.0, 1.0);
+        let c = lerp(snow, meadow, meadow_t);
+        return (c, if meadow_t > 0.5 { 0.0 } else { 6.0 });
+    }
+    if h > -2.0 {
+        // the lip: blue glacier ice
+        return ([0.52 + n1 * 0.08, 0.76 + n2 * 0.06, 0.92 + n1 * 0.04], 6.0);
+    }
+    // (past the edge: open sky, never drawn)
+    let _ = slope;
+    ([0.2, 0.24, 0.34], 5.0)
+}
+
+/// An island's underside at (x, z), `depth` below the floor: blue glacier
+/// ice where it curls under the lip, dark rock streaked with ice below, and
+/// paler, misty rock toward the keel, where the cloud takes it.
+fn sky_underside_color(x: f32, z: f32, depth: f32) -> [f32; 3] {
+    let lerp = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    let n1 = vnoise(x * 0.11, z * 0.11);
+    let rock = [0.16 + n1 * 0.05, 0.19 + n1 * 0.05, 0.29 + n1 * 0.05];
+    let ice = [0.45, 0.68, 0.86];
+    let streak = smoothstep(0.55, 0.8, vnoise(x * 0.3 + depth * 0.05, z * 0.3 - depth * 0.08));
+    let lip = 1.0 - smoothstep(1.0, 6.0, depth);
+    let c = lerp(lerp(rock, ice, streak * 0.55), [0.60, 0.80, 0.95], lip);
+    lerp(c, [0.72, 0.74, 0.88], smoothstep(30.0, 90.0, depth) * 0.7)
+}
+
+/// Distance from (x, z) to the nearest lane centre-line on the active map
+/// (the sky's two; the others' three).
+pub fn lane_road(x: f32, z: f32) -> f32 {
+    let p = Vec3::new(x, 0.0, z);
+    let mut best = f32::MAX;
+    for &lane in crate::map::lanes() {
+        for w in lane.polyline().windows(2) {
+            let ab = w[1] - w[0];
+            let t = ((p - w[0]).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+            best = best.min((w[0] + ab * t - p).length());
+        }
+    }
+    best
+}
+
 /// The pass's streams: a strip of water over each, 0.5 u cells, cut to the
 /// wet part like the jungle's rivers. The lip-to-pool stretch is the
 /// waterfall and is a prop, not a strip.
@@ -1812,9 +2343,40 @@ fn build_pass_water() -> (Vec<WaterVert>, Vec<u32>) {
     (verts, idx)
 }
 
+/// The Moonwell: a disc of shallow water, 0.5 u cells, slowly turning.
+fn build_sky_water() -> (Vec<WaterVert>, Vec<u32>) {
+    use crate::consts::WATER_LEVEL;
+    const STEP: f32 = 0.5;
+    let r = crate::sky::POOL_R + 1.2;
+    let n = (r * 2.0 / STEP) as usize + 1;
+    let mut verts = Vec::with_capacity(n * n);
+    let mut idx = Vec::new();
+    for iz in 0..n {
+        for ix in 0..n {
+            let (x, z) = (-r + ix as f32 * STEP, -r + iz as f32 * STEP);
+            // a slow swirl round the middle
+            let tang = glam::Vec2::new(-z, x).normalize_or_zero() * 0.4;
+            verts.push(WaterVert { pos: [x, WATER_LEVEL, z], bed: terrain_height(x, z), flow: tang.to_array(), uv: [x / r, z / r] });
+        }
+    }
+    for iz in 0..n - 1 {
+        for ix in 0..n - 1 {
+            let i = |a: usize, b: usize| (a + n * b) as u32;
+            let (qa, qb, qc, qd) = (i(ix, iz), i(ix + 1, iz), i(ix, iz + 1), i(ix + 1, iz + 1));
+            let dry = [qa, qb, qc, qd].iter().all(|&k| verts[k as usize].bed > WATER_LEVEL + 0.05);
+            if !dry {
+                idx.extend_from_slice(&[qa, qc, qb, qb, qc, qd]);
+            }
+        }
+    }
+    (verts, idx)
+}
+
 fn build_water() -> (Vec<WaterVert>, Vec<u32>) {
-    if crate::map::active() == crate::map::MapId::Pass {
-        return build_pass_water();
+    match crate::map::active() {
+        crate::map::MapId::Pass => return build_pass_water(),
+        crate::map::MapId::Sky => return build_sky_water(),
+        crate::map::MapId::Jungle => {}
     }
     use crate::consts::{river_x, GROUND_HALF, RIVER_HALF_WIDTH, WATER_LEVEL};
     const STEP: f32 = 1.0;
@@ -1898,6 +2460,35 @@ fn build_flood_plane() -> (Vec<WaterVert>, Vec<u32>) {
 #[cfg(test)]
 mod depth_tests {
     use super::*;
+
+    /// The sky map has no ground under its islands: the terrain mesh leaves
+    /// out every cell that is all open sky (the cloud deck is the sky
+    /// shader's), and keeps the islands and their undersides.
+    #[test]
+    fn the_sky_map_has_no_ground_below() {
+        crate::map::with(crate::map::MapId::Sky, || {
+            let (v, idx) = build_terrain();
+            let tris = idx.len() / 3;
+            let n_side = (v.len() as f32).sqrt() as usize;
+            let full = (n_side - 1) * (n_side - 1) * 2;
+            assert!(tris < full / 2, "most of the square is sky: {tris} of {full}");
+            assert!(tris > full / 20, "the islands are there: {tris}");
+            let void = |i: u32| crate::sky::in_void(v[i as usize].pos[0], v[i as usize].pos[2]);
+            assert!(idx.chunks(3).all(|t| !t.iter().any(|&i| void(i))), "no triangle reaches into the open sky: no skirt hangs off the rim");
+            // and the islands float: a keel hangs under them, facing down,
+            // deepest under the middle of the widest island
+            let under: Vec<&[u32]> = idx.chunks(3).filter(|t| t.iter().all(|&i| v[i as usize].pos[1] < -2.0)).collect();
+            assert!(under.len() * 4 > tris, "an underside under the islands: {} of {tris}", under.len());
+            assert!(under.iter().all(|t| t.iter().all(|&i| v[i as usize].normal[1] < 0.2)), "facing down");
+            // (only what is drawn: the grid's vertices out in open sky are
+            // never indexed)
+            let drawn: Vec<&TerrainVert> = idx.iter().map(|&i| &v[i as usize]).collect();
+            let deepest = drawn.iter().map(|p| p.pos[1]).fold(0.0f32, f32::min);
+            assert!((-125.0..-60.0).contains(&deepest), "a keel, not a slab: {deepest}");
+            let well = drawn.iter().filter(|p| p.pos[0].hypot(p.pos[2]) < 10.0).map(|p| p.pos[1]).fold(0.0f32, f32::min);
+            assert!(well < -60.0, "deep under the Moonwell's island: {well}");
+        });
+    }
 
     /// The river painted over canopies twice (see `depth_state`). This is the
     /// check that was missing both times: no GPU needed, so it runs anywhere.

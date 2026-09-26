@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Clawbound — Battleground: the thirteen legendary ancestors in a microvoxel 5v5 arena, Rust + wgpu"
 license = "MIT"
+# Two binaries (the game and lanbot): plain `cargo run` runs the game.
+default-run = "clawbound-battleground"
 
 [lib]
 name = "clawbound"
@@ -37,6 +39,12 @@ wildkit = { path = "../shared/wildkit" }
 bytemuck = { version = "1.15", features = ["derive"] }
 pollster = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Loaded audio (music, sfx, character voices): a pure-Rust Opus decoder --
+# no C, no FFI, cross-compiles for ARM like the rest -- and a realtime-safe
+# ring buffer for commands into the audio callback. Headless and always on:
+# the bank and mixer are tested without an audio device.
+opus-pure = "0.2"
+rtrb = "0.4"
 cpal = { version = "0.15", optional = true }
 gilrs = { version = "0.11", optional = true }
 

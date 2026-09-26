@@ -9,7 +9,7 @@ use crate::sim::{Game, Rng, Team};
 use crate::ui::{self, UiState};
 use crate::vfx::Vfx;
 
-fn make_device() -> Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+pub(crate) fn make_device() -> Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
     // Metal on macOS, then Vulkan → GL elsewhere; never fail with a panic.
     let mut masks = Vec::new();
     if cfg!(target_os = "macos") {
@@ -79,6 +79,39 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("select") {
         return run_select_shot();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("aim") {
+        return run_aim_shots();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("blast") {
+        return run_blast_shots();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("ultra") {
+        return run_ultra_shots();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("thunder") {
+        return run_thunder_shots();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("wet") {
+        return run_wet_shots();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("surface") {
+        return run_surface_shots();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("settings") {
+        return run_settings_shot();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("abilityfx") {
+        return run_abilityfx_shots();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("quality") {
+        return run_quality_shots();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("spectate") {
+        return run_spectate();
+    }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("sky") {
+        return crate::skyshots::run();
+    }
     let (_instance, _adapter, device, queue) =
         make_device().ok_or_else(|| "No suitable GPU backend found (install mesa-vulkan-drivers for lavapipe)".to_string())?;
     let adapter_info = {
@@ -123,16 +156,8 @@ pub fn run() -> Result<(), String> {
     game.blockers = scene.blockers.clone();
     // drive the player slot with AI for the demo
     let lane = crate::consts::Lane::Mid;
-    game.gods[0].ai = Some(crate::sim::AiBrain {
-        lane,
-        aggression: 0.9,
-        state: crate::sim::AiState::Push,
-        target: None,
-        strafe_dir: 1.0,
-        strafe_t: 0.0,
-        buy_t: 1.0,
-        wp: 0,
-    });
+    game.gods[0].ai = Some({ let mut b = crate::sim::AiBrain::new(lane, 0.9); b.buy_t = 1.0; b });
+    game.open_playbook(&mut Rng::new(0x9A6F));
 
     // egui for HUD in screenshots
     let egui_ctx = egui::Context::default();
@@ -291,7 +316,7 @@ pub fn run() -> Result<(), String> {
         };
         let vp = cam.view_proj(W as f32 / H as f32);
         let output = egui_ctx.run(raw, |ctx| {
-            ui::draw_hud(ctx, &game, 0, vp, W as f32, H as f32, &mut ui_state);
+            ui::draw_hud(ctx, &game, 0, vp, W as f32, H as f32, &mut ui_state, renderer.camera.eye);
             if captures[next_capture].1.contains("orbit") {
                 ui::draw_scoreboard(ctx, &game);
             }
@@ -319,7 +344,7 @@ pub fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn draw_egui(
+pub(crate) fn draw_egui(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     egui_renderer: &mut egui_wgpu::Renderer,
@@ -360,7 +385,7 @@ fn draw_egui(
     }
 }
 
-fn save_shot(device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::Texture, path: &str) -> Result<(), String> {
+pub(crate) fn save_shot(device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::Texture, path: &str) -> Result<(), String> {
     let (w, h) = (target.width(), target.height());
     let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("shot read"),
@@ -561,7 +586,7 @@ pub fn run_rig_sheet() -> Result<(), String> {
                     let from = row + Vec3::X * 9.7;
                     let to = from + Vec3::X * 6.0;
                     let a = 0.3;
-                    game.gods[5].dash = Some(DashState { from, to, t: a * 0.4, dur: 0.4, dmg: 0.0 });
+                    game.gods[5].dash = Some(DashState { from, to, t: a * 0.4, dur: 0.4, dmg: 0.0, arc: 0.35, blast: None });
                     game.gods[5].pos = from.lerp(to, a) + Vec3::Y * (a * (1.0 - a) * 4.0 * 0.35);
                 }
                 1 => {
@@ -863,16 +888,7 @@ pub fn run_pass_shots() -> Result<(), String> {
     let (blue, red) = crate::map::team_picks(3, &mut rng);
     let mut game = Game::new_teams(&blue, &red);
     game.blockers = scene.blockers.clone();
-    game.gods[0].ai = Some(crate::sim::AiBrain {
-        lane: crate::consts::Lane::Mid,
-        aggression: 0.9,
-        state: crate::sim::AiState::Push,
-        target: None,
-        strafe_dir: 1.0,
-        strafe_t: 0.0,
-        buy_t: 1.0,
-        wp: 0,
-    });
+    game.gods[0].ai = Some({ let mut b = crate::sim::AiBrain::new(crate::consts::Lane::Mid, 0.9); b.buy_t = 1.0; b });
     let mut vfx = Vfx::default();
     let only: Vec<String> = std::env::var("CLAWBOUND_SHEET").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default();
     let want = |n: &str| only.is_empty() || only.iter().any(|o| n.contains(o.as_str()));
@@ -1023,7 +1039,7 @@ pub fn run_pass_shots() -> Result<(), String> {
                 ..Default::default()
             };
             let o = ctx.run(raw, |c| {
-                ui::draw_hud(c, &game, 0, vp, W as f32, H as f32, &mut st);
+                ui::draw_hud(c, &game, 0, vp, W as f32, H as f32, &mut st, renderer.camera.eye);
                 ui::draw_scoreboard(c, &game);
             });
             textures.append(o.textures_delta.clone());
@@ -1069,11 +1085,18 @@ pub fn run_intro_shots() -> Result<(), String> {
     let teams: Vec<Team> = game.gods.iter().map(|g| g.team).collect();
     let p0 = game.gods[0].pos;
     let play = intro::Shot { eye: p0 + Vec3::new(0.0, 6.5, -9.0), target: p0 + Vec3::Y * 1.5, fov_y: 0.95 };
-    let mut it = Intro::new(&teams, p0, play);
+    // CLAWBOUND_INTRO_FULL=1: the narrated first-match intro
+    let full = std::env::var("CLAWBOUND_INTRO_FULL").is_ok();
+    let mut it = if full { Intro::full(&teams, p0, play) } else { Intro::new(&teams, p0, play) };
+    let lead = if full { intro::PROLOGUE } else { 0.0 };
     let mut vfx = Vfx::default();
     let ctx = egui::Context::default();
     let dt = 1.0 / 60.0;
-    let caps = [
+    let mut caps: Vec<(f32, &str)> = Vec::new();
+    if full {
+        caps.extend([(3.0, "intro_0a_prologue.png"), (17.0, "intro_0b_prologue.png"), (30.0, "intro_0c_prologue.png"), (42.5, "intro_0d_prologue.png")]);
+    }
+    let short = [
         (2.2, "intro_1_pan.png"),
         (intro::PAN + 0.9, "intro_2_lane_top.png"),
         (intro::PAN + intro::LANE + 0.9, "intro_3_lane_mid.png"),
@@ -1082,6 +1105,7 @@ pub fn run_intro_shots() -> Result<(), String> {
         (intro::FANFARE_AT + 2.0 * intro::SPAWN + intro::VERSUS * 0.5, "intro_6_versus.png"),
         (intro::total() - 0.35, "intro_7_settle.png"),
     ];
+    caps.extend(short.iter().map(|(t, n)| (t + lead, *n)));
     let mut next = 0;
     while !it.done && next < caps.len() {
         for gi in it.advance(dt) {
@@ -1307,7 +1331,8 @@ pub fn run_select_shot() -> Result<(), String> {
     let view = target.create_view(&Default::default());
     let ctx = egui::Context::default();
     let mut st = UiState::new();
-    st.map_choice = crate::map::MapId::Pass;
+    st.map_choice = crate::map::MapId::Sky;
+    st.selected = crate::gods::ROSTER_LEN - 1; // the newest ancestor
     clear(&renderer.device, &renderer.queue, &view);
     let mut textures = egui::TexturesDelta::default();
     let mut out = None;
@@ -1327,5 +1352,680 @@ pub fn run_select_shot() -> Result<(), String> {
     draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
     save_shot(&renderer.device, &renderer.queue, &target, "select_map_picker.png")?;
     println!("saved select_map_picker.png");
+    Ok(())
+}
+
+/// Targeting and the cat's new body language, through the real draw path:
+/// each of a cat's four abilities prepared with its guide showing, then the
+/// shoulder shuffle (the attack button with nothing in range) frame by
+/// frame, and a standing cat for the bent-knee stance.
+/// `CLAWBOUND_SHOTS=aim clawbound-battleground --screenshot`
+pub fn run_aim_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("aim"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let god: u32 = std::env::var("CLAWBOUND_AIM_GOD").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut game = Game::new_teams(&[god], &[(god + 1) % 13]);
+    game.blockers = scene.blockers.clone();
+    game.gods[1].respawn_t = 999.0;
+    game.gods[0].ai = None;
+    let at = Vec3::new(0.0, 0.0, -36.0);
+    game.gods[0].pos = at;
+    game.gods[0].yaw = std::f32::consts::FRAC_PI_2; // facing +z
+    let mut vfx = Vfx::default();
+    for _ in 0..30 {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+        vfx.update(1.0 / 60.0, &[], &game);
+    }
+    let cam = Camera { eye: at + Vec3::new(0.0, 9.0, -11.0), target: at + Vec3::new(0.0, 0.0, 6.0), fov_y: 1.0 };
+    let aim = at + Vec3::new(4.0, 0.0, 12.0);
+    let mut shoot = |renderer: &mut Renderer, vfx: &mut Vfx, game: &Game, name: &str, guide: Option<u32>, cam: Camera| -> Result<(), String> {
+        renderer.clear_queues();
+        scene.draw(renderer, game, vfx, cam);
+        if let Some(slot) = guide {
+            let ab = game.def(0).abilities[slot as usize];
+            let g = crate::targeting::guide_for(&ab, game.gods[0].pos, aim);
+            scene.draw_guide(renderer, &crate::targeting::guide_points(&g, 1.1), ab.color);
+        }
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+        Ok(())
+    };
+    for slot in 0..4u32 {
+        let name = format!("aim_slot{slot}_{}.png", game.def(0).abilities[slot as usize].name.replace(' ', "_"));
+        shoot(&mut renderer, &mut vfx, &game, &name, Some(slot), cam)?;
+    }
+    // the shoulder shuffle, close
+    let close = Camera { eye: at + Vec3::new(3.2, 1.6, 3.4), target: at + Vec3::Y * 0.9, fov_y: 0.8 };
+    shoot(&mut renderer, &mut vfx, &game, "whiff_0_stand.png", None, close)?;
+    vfx.puppets.on_whiff(0);
+    for (k, steps) in [(1, 8), (2, 8), (3, 8)] {
+        for _ in 0..steps {
+            game.tick(1.0 / 60.0);
+            game.events.clear();
+            vfx.update(1.0 / 60.0, &[], &game);
+        }
+        shoot(&mut renderer, &mut vfx, &game, &format!("whiff_{k}.png"), None, close)?;
+    }
+    Ok(())
+}
+
+/// The spectator on an all-bot match through the real draw path: 20 s of
+/// the director (reporting how smooth the camera was and how often it
+/// changed fights), then frames of the director, a followed cat and the
+/// free camera, with the spectator overlay.
+/// `CLAWBOUND_SHOTS=spectate clawbound-battleground --screenshot [--map pass]`
+pub fn run_spectate() -> Result<(), String> {
+    use crate::spectator::{Input, Spectator};
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut egui_renderer = egui_wgpu::Renderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, None, 1);
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("spectate"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let (blue, red) = crate::map::team_picks(4, &mut Rng::new(0x5EC7));
+    let mut game = Game::new_teams(&blue, &red);
+    game.blockers = scene.blockers.clone();
+    game.gods[0].ai = Some({ let mut b = crate::sim::AiBrain::new(crate::consts::Lane::Mid, 0.8); b.buy_t = 1.0; b });
+    game.open_playbook(&mut Rng::new(0x9A6E));
+    let mut vfx = Vfx::default();
+    for _ in 0..(70 * 60) {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+    }
+    let mut sp = Spectator::new();
+    let dt = 1.0 / 60.0;
+    let (mut worst_turn, mut worst_step, mut switches) = (0.0f32, 0.0f32, 0);
+    let mut prev: Option<crate::intro::Shot> = None;
+    let mut focus = usize::MAX;
+    for k in 0..(20 * 60) {
+        game.tick(dt);
+        let ev: Vec<crate::sim::Event> = game.events.drain(..).collect();
+        vfx.update(dt, &ev, &game);
+        let cuts_before = sp.cuts;
+        let shot = sp.update(&game, if k == 0 { Input { director: true, ..Default::default() } } else { Input::default() }, dt);
+        // a deliberate cut is not a jerk: measure the moves between cuts
+        if sp.cuts != cuts_before {
+            prev = None;
+        }
+        if let Some(p) = prev {
+            worst_turn = worst_turn.max((p.target - p.eye).normalize().dot((shot.target - shot.eye).normalize()).clamp(-1.0, 1.0).acos().to_degrees());
+            worst_step = worst_step.max((shot.eye - p.eye).length());
+        }
+        if sp.focus != focus {
+            switches += 1;
+            focus = sp.focus;
+        }
+        prev = Some(shot);
+    }
+    println!("director, 20 s: {} focus changes, {} cuts; between cuts: worst view turn {:.2} deg/frame, worst eye travel {:.2} u/frame", switches - 1, sp.cuts, worst_turn, worst_step);
+    let ctx = egui::Context::default();
+    let mut shoot = |renderer: &mut Renderer, vfx: &mut Vfx, game: &Game, sp: &Spectator, shot: crate::intro::Shot, name: &str| -> Result<(), String> {
+        let cam = Camera { eye: shot.eye, target: shot.target, fov_y: shot.fov_y };
+        renderer.clear_queues();
+        scene.draw(renderer, game, vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        let vp = cam.view_proj(W as f32 / H as f32);
+        let label = sp.label(game);
+        let mut textures = egui::TexturesDelta::default();
+        let mut out = None;
+        for k in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W as f32, H as f32))),
+                time: Some(k as f64 * 0.016),
+                ..Default::default()
+            };
+            let o = ctx.run(raw, |c| ui::draw_spectator_hud(c, game, vp, &label, cam.eye));
+            textures.append(o.textures_delta.clone());
+            out = Some(o);
+        }
+        let mut out = out.expect("ran");
+        out.textures_delta = textures;
+        draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name} ({})", label);
+        Ok(())
+    };
+    let shot = sp.update(&game, Input::default(), dt);
+    shoot(&mut renderer, &mut vfx, &game, &sp, shot, "spectate_director.png")?;
+    sp.update(&game, Input { cycle: 3, ..Default::default() }, dt);
+    let mut shot = shot;
+    for _ in 0..150 {
+        game.tick(dt);
+        game.events.clear();
+        vfx.update(dt, &[], &game);
+        shot = sp.update(&game, Input::default(), dt);
+    }
+    shoot(&mut renderer, &mut vfx, &game, &sp, shot, "spectate_follow.png")?;
+    sp.update(&game, Input { free: true, ..Default::default() }, dt);
+    for _ in 0..90 {
+        shot = sp.update(&game, Input { rise: 1.0, look: glam::Vec2::new(0.0, -0.004), ..Default::default() }, dt);
+    }
+    shoot(&mut renderer, &mut vfx, &game, &sp, shot, "spectate_free.png")?;
+    Ok(())
+}
+
+/// A blast front behind a cat, rendered with and without it, so the
+/// difference shows exactly which pixels the shell bends: a dome of air
+/// round the blast, and the cat standing in front of it untouched.
+/// `CLAWBOUND_SHOTS=blast clawbound-battleground --screenshot`
+pub fn run_blast_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("blast"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let mut game = Game::new_teams(&[0], &[1]);
+    game.blockers = scene.blockers.clone();
+    game.gods[1].respawn_t = 999.0;
+    let cat = Vec3::new(0.0, 0.0, -40.0);
+    game.gods[0].pos = cat;
+    game.gods[0].yaw = -std::f32::consts::FRAC_PI_2;
+    let mut vfx = Vfx::default();
+    for _ in 0..20 {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+        vfx.update(1.0 / 60.0, &[], &game);
+    }
+    let cam = Camera { eye: cat + Vec3::new(0.0, 3.2, -9.0), target: cat + Vec3::new(0.0, 2.0, 12.0), fov_y: 0.95 };
+    for (name, strength) in [("blast_off.png", 0.0f32), ("blast_on.png", 1.0)] {
+        renderer.clear_queues();
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        // a nova 11 u behind the cat, its front 7 u out
+        renderer.blast_a = Default::default();
+        renderer.blast_b = Default::default();
+        renderer.blast_a[0] = [cat.x, 0.0, cat.z + 11.0, 7.0];
+        renderer.blast_b[0] = [strength, 0.0, 0.0, 0.0];
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, 1.0);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+    }
+    Ok(())
+}
+
+/// The ultra preview beside today's look: four ancestors (two maned) on
+/// one frame drawn as voxels, then smooth and furred, then under a coloured
+/// ability light with a cat between it and another (the traced shadow), and
+/// a close-up of the manes.
+/// `CLAWBOUND_SHOTS=ultra clawbound-battleground --screenshot`
+pub fn run_ultra_shots() -> Result<(), String> {
+    std::env::set_var("CLAWBOUND_QUALITY", "ultra");
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ultra"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let mut scene = Scene::new(&mut renderer);
+    let id = |n: &str| crate::gods::ROSTER.iter().position(|d| d.name == n).unwrap() as u32;
+    let mut game = Game::new_teams(&[id("Goldenmane"), id("Duskstripe")], &[id("Oldroar"), id("Faryowl")]);
+    game.blockers = scene.blockers.clone();
+    let spot = Vec3::new(0.0, 0.0, -40.0);
+    for (k, g) in game.gods.iter_mut().enumerate() {
+        g.ai = None;
+        g.pos = spot + Vec3::new(k as f32 * 2.6 - 3.9, 0.0, 0.0);
+        g.yaw = -std::f32::consts::FRAC_PI_2 + 0.5; // three-quarters to camera
+    }
+    let mut vfx = Vfx::default();
+    for _ in 0..30 {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+        vfx.update(1.0 / 60.0, &[], &game);
+    }
+    let wide = Camera { eye: spot + Vec3::new(0.5, 2.6, -7.5), target: spot + Vec3::Y * 0.8, fov_y: 0.8 };
+    let close = Camera { eye: game.gods[0].pos + Vec3::new(1.2, 1.5, -2.6), target: game.gods[0].pos + Vec3::new(0.3, 1.1, 0.0), fov_y: 0.7 };
+    let mut shoot = |renderer: &mut Renderer, scene: &Scene, vfx: &mut Vfx, name: &str, cam: Camera| -> Result<(), String> {
+        scene.draw(renderer, &game, vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, 1.0);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name} ({} coloured lights, {} occluders)", renderer.lights.len(), renderer.occluders.len());
+        Ok(())
+    };
+    scene.ultra = false;
+    shoot(&mut renderer, &scene, &mut vfx, "ultra_0_voxel.png", wide)?;
+    scene.ultra = true;
+    shoot(&mut renderer, &scene, &mut vfx, "ultra_1_smooth.png", wide)?;
+    // a violet ability light beyond the right-hand cat, a little low: the
+    // cat between it and the next one casts a traced shadow onto it
+    let right = game.gods[3].pos;
+    vfx.glows.push(crate::vfx::Glow { pos: right + Vec3::new(1.6, 0.9, 0.4), color: [0.7, 0.35, 1.0], radius: 9.0, life: 1.0, max: 1.0, power: 9.0 });
+    vfx.glows.push(crate::vfx::Glow { pos: game.gods[0].pos + Vec3::new(-1.5, 1.4, -1.0), color: [1.0, 0.55, 0.15], radius: 7.0, life: 1.0, max: 1.0, power: 5.0 });
+    shoot(&mut renderer, &scene, &mut vfx, "ultra_2_lit.png", wide)?;
+    // the traced shadow, measured: the same lit frame with the cats'
+    // spheres taken away (no occluders: the light passes through)
+    scene.draw(&mut renderer, &game, &mut vfx, wide);
+    renderer.occluders.clear();
+    renderer.atmosphere = game.weather.atmosphere();
+    renderer.render_frame(&view, wide, 1.0);
+    save_shot(&renderer.device, &renderer.queue, &target, "ultra_2b_lit_no_occluders.png")?;
+    println!("saved ultra_2b_lit_no_occluders.png");
+    vfx.glows.clear();
+    shoot(&mut renderer, &scene, &mut vfx, "ultra_3_mane.png", close)?;
+    scene.ultra = false;
+    shoot(&mut renderer, &scene, &mut vfx, "ultra_3b_mane_voxel.png", close)?;
+    scene.ultra = true;
+    // the other fur style, for comparison
+    let mine = renderer.fur_style;
+    let other = if mine == crate::render::FurStyle::Tape { crate::render::FurStyle::Locks } else { crate::render::FurStyle::Tape };
+    renderer.set_fur_style(other);
+    shoot(&mut renderer, &scene, &mut vfx, "ultra_3c_mane_other_style.png", close)?;
+    renderer.set_fur_style(mine);
+    // what it costs: the wide frame, voxel against ultra, best of 4
+    for ultra in [false, true] {
+        scene.ultra = ultra;
+        let mut best = f32::MAX;
+        for _ in 0..4 {
+            scene.draw(&mut renderer, &game, &mut vfx, wide);
+            let t = std::time::Instant::now();
+            renderer.render_frame(&view, wide, 1.0);
+            renderer.device.poll(wgpu::Maintain::Wait);
+            best = best.min(t.elapsed().as_secs_f32() * 1000.0);
+        }
+        println!("frame, 4 cats, {}: {best:.0} ms (lavapipe)", if ultra { "ultra" } else { "voxel" });
+    }
+    Ok(())
+}
+
+/// Stillsmoke's Ninth Thunder among three other cats, in the ultra preview:
+/// the channel mid-gather (motes, sigil, column), then a lightning strike
+/// landing (the bolt, and its light throwing the cats' traced shadows),
+/// and the same strike as voxels.
+/// `CLAWBOUND_SHOTS=thunder clawbound-battleground --screenshot`
+pub fn run_thunder_shots() -> Result<(), String> {
+    std::env::set_var("CLAWBOUND_QUALITY", "ultra");
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("thunder"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let mut scene = Scene::new(&mut renderer);
+    let id = |n: &str| crate::gods::ROSTER.iter().position(|d| d.name == n).unwrap() as u32;
+    let mut game = Game::new_teams(&[id("Stillsmoke"), id("Goldenmane")], &[id("Duskstripe"), id("Faryowl")]);
+    game.blockers = scene.blockers.clone();
+    let spot = Vec3::new(0.0, 0.0, -40.0);
+    let aim = spot + Vec3::new(0.0, 0.0, 6.0);
+    let places = [spot, spot + Vec3::new(-2.5, 0.0, 1.0), aim + Vec3::new(1.4, 0.0, 0.3), aim + Vec3::new(-1.6, 0.0, 1.2)];
+    for (g, p) in game.gods.iter_mut().zip(places) {
+        g.ai = None;
+        g.pos = p;
+        g.yaw = std::f32::consts::FRAC_PI_2; // facing +z, toward the storm
+        g.mana = 10_000.0;
+    }
+    let mut vfx = Vfx::default();
+    let step = |game: &mut Game, vfx: &mut Vfx| -> Vec<crate::sim::Event> {
+        game.tick(1.0 / 60.0);
+        let ev: Vec<crate::sim::Event> = game.events.drain(..).collect();
+        vfx.update(1.0 / 60.0, &ev, game);
+        ev
+    };
+    for _ in 0..20 {
+        step(&mut game, &mut vfx);
+    }
+    let def = &crate::gods::ROSTER[game.gods[0].def_id as usize];
+    let slot = (0..4).find(|&s| def.abilities[s].ult).unwrap() as u32;
+    game.cast_queue.push((0, slot, aim));
+    let cam = Camera { eye: spot + Vec3::new(5.5, 4.2, -6.5), target: spot + Vec3::new(-0.3, 1.2, 3.5), fov_y: 0.95 };
+    let mut shoot = |renderer: &mut Renderer, scene: &Scene, vfx: &mut Vfx, game: &Game, name: &str| -> Result<(), String> {
+        scene.draw(renderer, game, vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name} ({} lights)", renderer.lights.len());
+        Ok(())
+    };
+    // mid-channel: 60% of the wind-up
+    let wind = crate::abilities::cast_timing(&def.abilities[slot as usize]).0;
+    for _ in 0..((wind * 0.6) * 60.0) as usize {
+        step(&mut game, &mut vfx);
+    }
+    shoot(&mut renderer, &scene, &mut vfx, &game, "thunder_1_channel.png")?;
+    // then on to the first strike that lands, a beat into the storm
+    let mut seen = 0;
+    for _ in 0..600 {
+        let ev = step(&mut game, &mut vfx);
+        if ev.iter().any(|e| matches!(e, crate::sim::Event::StrikeFx { .. })) {
+            seen += 1;
+            if seen == 3 {
+                break;
+            }
+        }
+    }
+    shoot(&mut renderer, &scene, &mut vfx, &game, "thunder_2_strike.png")?;
+    // the strike's shadows, measured: the same frame without the cats'
+    // spheres (nothing to trace against)
+    scene.draw(&mut renderer, &game, &mut vfx, cam);
+    renderer.occluders.clear();
+    renderer.atmosphere = game.weather.atmosphere();
+    renderer.render_frame(&view, cam, game.t);
+    save_shot(&renderer.device, &renderer.queue, &target, "thunder_2b_no_occluders.png")?;
+    scene.ultra = false;
+    shoot(&mut renderer, &scene, &mut vfx, &game, "thunder_3_strike_voxel.png")?;
+    Ok(())
+}
+
+/// After rain, a low sun ahead: the path and flagstones wet, High beside
+/// Ultra (ground as a mirror; god rays through the canopy's gaps).
+/// `CLAWBOUND_SHOTS=wet clawbound-battleground --screenshot`
+pub fn run_wet_shots() -> Result<(), String> {
+    std::env::set_var("CLAWBOUND_QUALITY", "ultra");
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("wet"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let mut scene = Scene::new(&mut renderer);
+    let mut game = Game::new_teams(&[0], &[1]);
+    game.blockers = scene.blockers.clone();
+    let spot = Vec3::new(0.0, 0.0, -40.0);
+    game.gods[0].pos = spot + Vec3::new(0.8, 0.0, 3.0);
+    game.gods[0].yaw = std::f32::consts::FRAC_PI_2;
+    game.gods[1].respawn_t = 999.0;
+    game.gods[0].ai = None;
+    let mut vfx = Vfx::default();
+    for _ in 0..20 {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+        vfx.update(1.0 / 60.0, &[], &game);
+    }
+    let mut atm = game.weather.atmosphere();
+    atm.wetness = 1.0;
+    atm.rain = 0.0;
+    atm.cloud_cover = 0.25;
+    atm.sun_dir = Vec3::new(0.15, 0.2, 1.0).normalize();
+    let cam = Camera { eye: spot + Vec3::new(0.0, 1.5, -6.0), target: spot + Vec3::new(0.0, 3.2, 12.0), fov_y: 1.0 };
+    for (ultra, name) in [(false, "wet_high.png"), (true, "wet_ultra.png")] {
+        scene.ultra = ultra;
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = atm;
+        renderer.render_frame(&view, cam, 1.0);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+    }
+    Ok(())
+}
+
+/// The ground's surface: a cat at a lane's edge, a low sun. Dry (material
+/// borders, contact-hardening shadows), light rain (water in the cracks and
+/// hollows), heavy rain (more floods; in ultra, puddles reflect), and a
+/// close-up of the paws.
+/// `CLAWBOUND_SHOTS=surface clawbound-battleground --screenshot`
+pub fn run_surface_shots() -> Result<(), String> {
+    std::env::set_var("CLAWBOUND_QUALITY", "ultra");
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("surface"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let mut game = Game::new_teams(&[0], &[1]);
+    game.blockers = scene.blockers.clone();
+    // the mid lane's edge: the path at x ~ 0, grass beyond ~ +7
+    let spot = Vec3::new(5.5, 0.0, -30.0);
+    game.gods[0].pos = spot;
+    game.gods[0].yaw = 0.3;
+    game.gods[1].respawn_t = 999.0;
+    game.gods[0].ai = None;
+    let mut vfx = Vfx::default();
+    for _ in 0..20 {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+        vfx.update(1.0 / 60.0, &[], &game);
+    }
+    // diagnostics: CLAWBOUND_SURFACE_NOCAT renders the scene without the cat
+    if std::env::var("CLAWBOUND_SURFACE_NOCAT").is_ok() {
+        game.gods[0].respawn_t = 999.0;
+    }
+    let mut atm = game.weather.atmosphere();
+    atm.rain = 0.0;
+    atm.cloud_cover = 0.1;
+    atm.sun_dir = Vec3::new(-0.7, 0.45, 0.35).normalize();
+    let wide = Camera { eye: spot + Vec3::new(-3.0, 4.0, -7.0), target: spot + Vec3::new(0.5, 0.3, 2.0), fov_y: 1.0 };
+    let close = Camera { eye: spot + Vec3::new(-1.2, 1.1, -2.2), target: spot + Vec3::new(0.3, 0.2, 0.3), fov_y: 0.8 };
+    for (wet, cam, name) in [(0.0f32, wide, "surface_dry.png"), (0.35, wide, "surface_rain_light.png"), (0.9, wide, "surface_rain_heavy.png"), (0.0, close, "surface_paws.png")] {
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        atm.wetness = wet;
+        renderer.atmosphere = atm;
+        renderer.render_frame(&view, cam, 1.0);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+    }
+    Ok(())
+}
+
+/// The controls and settings panel, Ultra selected (so the fur choice and
+/// its note show). `CLAWBOUND_SHOTS=settings clawbound-battleground --screenshot`
+pub fn run_settings_shot() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut egui_renderer = egui_wgpu::Renderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, None, 1);
+    let renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("settings"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let ctx = egui::Context::default();
+    let mut cfg = crate::input::Config::default();
+    cfg.settings.quality = crate::quality::Quality::Ultra;
+    cfg.settings.show_fps = true;
+    clear(&renderer.device, &renderer.queue, &view);
+    let mut textures = egui::TexturesDelta::default();
+    let mut out = None;
+    for k in 0..3 {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W as f32, H as f32))),
+            time: Some(k as f64 * 0.016),
+            ..Default::default()
+        };
+        let mut panel = ui::ControlsPanel { close: false, capture: None, clear: None, scheme: None, reset: false };
+        let o = ctx.run(raw, |c| {
+            ui::draw_fps(c, 60.0, 16.7);
+            ui::draw_controls(c, &mut cfg, None, false, &mut panel);
+        });
+        textures.append(o.textures_delta.clone());
+        out = Some(o);
+    }
+    let mut out = out.expect("ran");
+    out.textures_delta = textures;
+    draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
+    save_shot(&renderer.device, &renderer.queue, &target, "settings_panel.png")?;
+    println!("saved settings_panel.png");
+    Ok(())
+}
+
+/// The upgraded ability effects: a dash's afterimages, a nova's dust wave,
+/// a bolt's trail. `CLAWBOUND_SHOTS=abilityfx clawbound-battleground --screenshot`
+pub fn run_abilityfx_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("abilityfx"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let spot = Vec3::new(0.0, 0.0, -40.0);
+    let run = |renderer: &mut Renderer, who: &str, arch: fn(&crate::gods::Archetype) -> bool, frames: usize, name: &str, cam: Camera| -> Result<(), String> {
+        let id = crate::gods::ROSTER.iter().position(|d| d.name == who).unwrap() as u32;
+        let mut game = Game::new_teams(&[id], &[(id + 1) % 13]);
+        game.blockers = scene.blockers.clone();
+        game.gods[1].respawn_t = 999.0;
+        game.gods[0].ai = None;
+        game.gods[0].pos = spot;
+        game.gods[0].yaw = 0.0;
+        game.gods[0].mana = 10_000.0;
+        let mut vfx = Vfx::default();
+        for _ in 0..10 {
+            game.tick(1.0 / 60.0);
+            game.events.clear();
+            vfx.update(1.0 / 60.0, &[], &game);
+        }
+        let def = &crate::gods::ROSTER[id as usize];
+        let slot = (0..4).find(|&s| arch(&def.abilities[s].arch)).expect("archetype") as u32;
+        game.cast_queue.push((0, slot, spot + Vec3::X * 9.0));
+        for _ in 0..frames {
+            game.tick(1.0 / 60.0);
+            let ev: Vec<crate::sim::Event> = game.events.drain(..).collect();
+            vfx.update(1.0 / 60.0, &ev, &game);
+        }
+        scene.draw(renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name} ({} afterimages, {} particles; caster shield {:.0})", vfx.afterimages.len(), vfx.particles.len(), game.gods[0].shield);
+        // and the same frame without the dust, to find it by difference
+        if !vfx.dust.is_empty() {
+            let mut nodust = std::mem::take(&mut vfx.dust);
+            scene.draw(renderer, &game, &mut vfx, cam);
+            renderer.render_frame(&view, cam, game.t);
+            save_shot(&renderer.device, &renderer.queue, &target, &name.replace(".png", "_nodust.png"))?;
+            println!("  ({} dust)", nodust.len());
+            std::mem::swap(&mut vfx.dust, &mut nodust);
+        }
+        // and without the rings, to identify what is left
+        if name.contains("nova") {
+            let rings = std::mem::take(&mut vfx.rings);
+            let n_rings = rings.len();
+            scene.draw(renderer, &game, &mut vfx, cam);
+            renderer.render_frame(&view, cam, game.t);
+            save_shot(&renderer.device, &renderer.queue, &target, &name.replace(".png", "_norings.png"))?;
+            println!("  ({n_rings} rings)");
+            vfx.rings = rings;
+        }
+        Ok(())
+    };
+    let side = Camera { eye: spot + Vec3::new(4.5, 3.0, -7.5), target: spot + Vec3::new(4.5, 0.8, 0.0), fov_y: 0.9 };
+    run(&mut renderer, "Goldenmane", |a| matches!(a, crate::gods::Archetype::Dash { .. }), 12, "abilityfx_dash.png", side)?;
+    run(&mut renderer, "Oldroar", |a| matches!(a, crate::gods::Archetype::Nova { .. }), 42, "abilityfx_nova.png", side)?;
+    run(&mut renderer, "Suneye", |a| matches!(a, crate::gods::Archetype::Bolt { .. }), 22, "abilityfx_bolt.png", side)?;
+    // whoever has each of these (the first ancestor with one)
+    let who = |f: fn(&crate::gods::Archetype) -> bool| crate::gods::ROSTER.iter().find(|d| d.abilities.iter().any(|a| f(&a.arch))).map(|d| d.name).unwrap();
+    let close = Camera { eye: spot + Vec3::new(2.5, 2.4, -5.0), target: spot + Vec3::new(0.3, 0.9, 0.0), fov_y: 0.9 };
+    run(&mut renderer, who(|a| matches!(a, crate::gods::Archetype::Shield { .. })), |a| matches!(a, crate::gods::Archetype::Shield { .. }), 40, "abilityfx_shield.png", close)?;
+    run(&mut renderer, who(|a| matches!(a, crate::gods::Archetype::Heal { .. })), |a| matches!(a, crate::gods::Archetype::Heal { .. }), 34, "abilityfx_heal.png", close)?;
+    Ok(())
+}
+
+/// One scene at each quality: the shadow map rebuilt as the quality
+/// changes (in one run -- the rebuild is what could go wrong), bloom and
+/// particles scaled. `CLAWBOUND_SHOTS=quality clawbound-battleground --screenshot`
+pub fn run_quality_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("quality"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let mut game = Game::new_teams(&[0, 1], &[2, 3]);
+    game.blockers = scene.blockers.clone();
+    let spot = Vec3::new(0.0, 0.0, -40.0);
+    for (k, g) in game.gods.iter_mut().enumerate() {
+        g.ai = None;
+        g.pos = spot + Vec3::new(k as f32 * 2.2 - 3.3, 0.0, 0.0);
+        g.yaw = -1.1;
+    }
+    let mut vfx = Vfx::default();
+    for _ in 0..20 {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+        vfx.update(1.0 / 60.0, &[], &game);
+    }
+    vfx.update(0.0, &[crate::sim::Event::NovaFx { pos: spot + Vec3::Z * 3.0, radius: 5.0, color: [1.0, 0.6, 0.2] }], &game);
+    let cam = Camera { eye: spot + Vec3::new(0.5, 3.0, -7.5), target: spot + Vec3::Y * 0.8, fov_y: 0.9 };
+    for q in [crate::quality::Quality::High, crate::quality::Quality::Medium, crate::quality::Quality::Low, crate::quality::Quality::High] {
+        renderer.quality = q;
+        renderer.set_shadow_size(q.shadow_size());
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, 1.0);
+        let name = format!("quality_{}.png", q.key());
+        save_shot(&renderer.device, &renderer.queue, &target, &name)?;
+        println!("saved {name}: shadow map {} px", renderer.shadow_size);
+    }
     Ok(())
 }

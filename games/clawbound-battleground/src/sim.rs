@@ -39,11 +39,21 @@ impl Rng {
 #[derive(Clone, Debug)]
 pub enum Event {
     Cast { god: usize, slot: u32, aim: Vec3 },
+    /// A cast began its wind-up (`abilities::cast_timing`); it fires as a
+    /// `Cast` after `dur` seconds unless interrupted. For the anticipation
+    /// pose and anyone watching.
+    CastStart { god: usize, slot: u32, aim: Vec3, dur: f32 },
+    /// The attack button pressed with nothing in range: an acknowledgement,
+    /// not an attack (the cat's shoulder shuffle).
+    Whiff { god: usize },
     Damage { pos: Vec3, amount: f32, big: bool },
     Kill { killer: String, victim: String, victim_team: Team, is_god: bool },
     LevelUp { pos: Vec3 },
     Explosion { pos: Vec3, radius: f32, color: [f32; 3] },
     BoltFx { from: Vec3, to: Vec3, color: [f32; 3], thick: f32 },
+    /// A storm's lightning strike landing at `at` (a storm zone's strikes:
+    /// jagged, forked, a blinding light that throws shadows).
+    StrikeFx { at: Vec3, color: [f32; 3] },
     BeamFx { from: Vec3, dir: Vec3, length: f32, width: f32, color: [f32; 3], dur: f32 },
     ShieldFx { pos: Vec3, dur: f32, color: [f32; 3] },
     DashFx { pos: Vec3, dir: Vec3, color: [f32; 3] },
@@ -51,6 +61,8 @@ pub enum Event {
     PullFx { pos: Vec3, radius: f32, color: [f32; 3] },
     HealFx { pos: Vec3, radius: f32 },
     NovaFx { pos: Vec3, radius: f32, color: [f32; 3] },
+    /// A star the flying Moonwyrm let fall has landed (`wyrmflight`).
+    StarfallFx { at: Vec3, radius: f32 },
     StormFx { pos: Vec3, radius: f32, color: [f32; 3], dur: f32 },
     TowerDown { pos: Vec3, team: Team },
     TitanVulnerable { team: Team },
@@ -104,6 +116,48 @@ pub struct AiBrain {
     pub strafe_t: f32,
     pub buy_t: f32,
     pub wp: usize,
+    /// How the current fight is being fought (`tactics`), and for how long.
+    pub stance: crate::tactics::Stance,
+    pub stance_t: f32,
+    /// Where the current fight began: the leash is measured from here.
+    pub anchor: Option<Vec3>,
+    /// Somewhere it is walking to off its lane this tick (a boss, the
+    /// Moonwell): what the floor router routes to, instead of the lane.
+    pub goal: Option<Vec3>,
+}
+
+impl AiBrain {
+    pub fn new(lane: Lane, aggression: f32) -> AiBrain {
+        // a lane the active map does not have (Mid on the sky) is the
+        // map's first
+        let lanes = crate::map::lanes();
+        let lane = if lanes.contains(&lane) { lane } else { lanes[0] };
+        AiBrain {
+            lane,
+            aggression,
+            state: AiState::Push,
+            target: None,
+            strafe_dir: 1.0,
+            strafe_t: 0.0,
+            buy_t: 1.5,
+            wp: 0,
+            stance: crate::tactics::Stance::Hold,
+            stance_t: 0.0,
+            anchor: None,
+            goal: None,
+        }
+    }
+}
+
+/// A cast in its wind-up or channel (`GodUnit::casting`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Casting {
+    pub slot: u32,
+    pub aim: Vec3,
+    pub t: f32,
+    pub dur: f32,
+    /// Movement multiplier while it lasts (0 = rooted: a channel).
+    pub move_mul: f32,
 }
 
 pub struct GodUnit {
@@ -150,6 +204,17 @@ pub struct GodUnit {
     pub perch_narrow: bool,
     /// HP last tick, to notice a hit big enough to take a cat's footing.
     pub perch_hp: f32,
+    /// Riding a cloud ferry (`ferry`): which one (`Game::ferries`).
+    pub riding: Option<u8>,
+    /// The cloud the leap under way is aimed at.
+    pub ride_plan: Option<u8>,
+    /// Falling into the cloud sea: seconds until the Starwell sets the cat
+    /// down at home.
+    pub skyfall: Option<f32>,
+    /// A Moonwell boon (`moonwell`) and the seconds it has left, and the
+    /// number of the claim it came from (one per cat per claim).
+    pub boon: Option<(crate::moonwell::Boon, f32)>,
+    pub boon_claim: u32,
     /// Airborne without a leap: stepped, dragged or knocked off something.
     pub fall: Option<crate::leap::Fall>,
     pub recent_damagers: Vec<(usize, f32)>, // (god idx, time)
@@ -160,6 +225,17 @@ pub struct GodUnit {
     pub sneak: bool,
     /// Seconds of ability-granted quiet left: full speed, low and silent.
     pub hush_t: f32,
+    /// A cast winding up or channelling: fires when `t` reaches `dur`.
+    pub casting: Option<Casting>,
+    /// Seconds during which movement does not turn the cat: after a cast
+    /// turns it to its aim, running on must not swing it straight back.
+    pub face_hold: f32,
+    /// The direction the player is looking (the camera's forward, flat).
+    /// Movement turns the cat only within a cone round it; zero for bots,
+    /// which face where they go.
+    pub face_ref: Vec3,
+    /// When the last whiff acknowledgement played, to rate-limit it.
+    pub whiff_t: f32,
     /// When this cat last attacked or cast.
     pub last_act_t: f32,
     pub ai: Option<AiBrain>,
@@ -178,7 +254,13 @@ pub struct DashState {
     pub to: Vec3,
     pub t: f32,
     pub dur: f32,
+    /// Damage to everything along the path, dealt as the dash ends.
     pub dmg: f32,
+    /// Height of the hop at the middle (0.35 for a dash; a meteor's vault
+    /// is far higher).
+    pub arc: f32,
+    /// A blast where it lands: (radius, damage). A meteor's.
+    pub blast: Option<(f32, f32)>,
 }
 
 pub struct Minion {
@@ -194,6 +276,18 @@ pub struct Minion {
     pub wp: usize,
     pub last_hit: Option<usize>,
     pub yaw: f32,
+    /// Stable identity (ids only grow, and removal keeps order, so the
+    /// `minions` Vec is sorted by id). Targets hold this, not the index.
+    pub id: u32,
+    /// What it is fighting (`minionai`), when it re-thinks next, and where
+    /// it stepped off its lane to do so.
+    pub foe: Option<crate::minionai::Foe>,
+    pub think_t: f32,
+    pub left_at: Option<Vec3>,
+    /// Its place across the lane, u from the centre-line: a wave keeps its
+    /// ranks down the lane instead of threading onto one line of
+    /// waypoints (thirty-two a side on the sky map became a single file).
+    pub lane_off: f32,
 }
 
 pub struct Tower {
@@ -220,6 +314,26 @@ pub struct Titan {
     pub hp: f32,
     pub atk_timer: f32,
     pub atk_anim: f32,
+    /// Its pedestal: where it stands guard and goes back to (`titan_zone`).
+    pub home: Vec3,
+    /// Facing (radians, 0 = +x), and how fast it is walking now (u/s).
+    pub yaw: f32,
+    pub stride: f32,
+    /// The walk cycle's phase (radians), for the scene.
+    pub walk: f32,
+}
+
+impl Titan {
+    pub fn new(team: Team, hp: f32) -> Titan {
+        let home = team.titan_pos();
+        // it stands facing the enemy
+        let yaw = if team.push_z() > 0.0 { std::f32::consts::FRAC_PI_2 } else { -std::f32::consts::FRAC_PI_2 };
+        Titan { team, pos: home, hp, atk_timer: 0.0, atk_anim: 0.0, home, yaw, stride: 0.0, walk: 0.0 }
+    }
+    /// The way it faces.
+    pub fn fwd(&self) -> Vec3 {
+        Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin())
+    }
 }
 
 pub struct Projectile {
@@ -274,6 +388,9 @@ pub struct Game {
     pub cast_queue: Vec<(usize, u32, Vec3)>, // (god idx, slot, aim)
     /// Leap requests: (god idx, aim direction). Drained by `move_gods`.
     pub leap_queue: Vec<(usize, Vec3)>,
+    /// Set around a basic attack's damage: the siphon (brawl) pays back
+    /// ability damage only.
+    pub siphon_off: bool,
     /// The river crossings. See `logs`.
     pub logs: Vec<crate::logs::RollingLog>,
     pub(crate) logs_seen: usize,
@@ -296,6 +413,24 @@ pub struct Game {
     pub steer_mem: Vec<crate::steer::Memory>,
     /// Plans made this tick, against `steer::PLANS_PER_TICK`.
     pub plans_this_tick: u32,
+    /// Each side's page of the playbook (`playbook`), indexed by team.
+    pub styles: [crate::playbook::Page; 2],
+    /// Stars the Moonwyrm has thrown, in flight (`moonwell`).
+    pub star_bolts: Vec<crate::moonwell::StarBolt>,
+    /// Stars the flying Moonwyrm let fall, on their way down (`wyrmflight`).
+    pub starfalls: Vec<crate::wyrmflight::Starfall>,
+    /// The sky map's drifting cloud (`skycloud`): its seed, and who each
+    /// team can see through it.
+    pub cloud_seed: u64,
+    pub vision: crate::skycloud::Vision,
+    /// The sky map's cloud ferries (`ferry`); empty elsewhere.
+    pub ferries: Vec<crate::ferry::Ferry>,
+    /// Minion ids handed out so far, and waves spawned (`minionai::wave_for`).
+    pub next_minion_id: u32,
+    pub waves: u32,
+    /// A bot's dive on an enemy god, for its teammates to answer:
+    /// (target god, when). Indexed by the diving team.
+    pub calls: [Option<(usize, f32)>; 2],
 }
 
 impl Game {
@@ -321,19 +456,22 @@ impl Game {
         let mut gods = Vec::with_capacity(total);
 
         // lanes: player mid by default, allies top/bot/mid, enemies top/mid/bot/mid/bot
-        let ally_lanes = [Lane::Top, Lane::Mid, Lane::Bot, Lane::Mid];
-        let enemy_lanes = [Lane::Top, Lane::Mid, Lane::Bot, Lane::Mid, Lane::Bot];
-        let round = [Lane::Top, Lane::Mid, Lane::Bot];
+        // (the map's own lanes only: the sky map has no Mid for minions)
+        let map_lanes = crate::map::lanes();
+        let three = map_lanes.len() == 3;
+        let ally_lanes: &[Lane] = if three { &[Lane::Top, Lane::Mid, Lane::Bot, Lane::Mid] } else { &[] };
+        let enemy_lanes: &[Lane] = if three { &[Lane::Top, Lane::Mid, Lane::Bot, Lane::Mid, Lane::Bot] } else { &[] };
+        let round = map_lanes;
 
         for i in 0..total {
             let (def_id, team, is_player, lane) = if i == 0 {
                 (player_god, Team::Blue, true, Lane::Mid)
             } else if i < blue.len() {
                 let k = i - 1;
-                (blue[i], Team::Blue, false, ally_lanes.get(k).copied().unwrap_or(round[k % 3]))
+                (blue[i], Team::Blue, false, ally_lanes.get(k).copied().unwrap_or(round[k % round.len()]))
             } else {
                 let k = i - blue.len();
-                (red[k], Team::Red, false, enemy_lanes.get(k).copied().unwrap_or(round[k % 3]))
+                (red[k], Team::Red, false, enemy_lanes.get(k).copied().unwrap_or(round[k % round.len()]))
             };
             let def = gods::god(def_id);
             let (hp, mana, _, _, prot) = def.at_level(1);
@@ -376,14 +514,23 @@ impl Game {
                 perch: None,
                 perch_narrow: false,
                 perch_hp: 0.0,
+                riding: None,
+                ride_plan: None,
+                skyfall: None,
+                boon: None,
+                boon_claim: 0,
                 fall: None,
                 recent_damagers: Vec::new(),
                 move_dir: Vec3::ZERO,
                 attack_held: false,
+                casting: None,
+                face_hold: 0.0,
+                face_ref: Vec3::ZERO,
+                whiff_t: -10.0,
                 sneak: false,
                 hush_t: 0.0,
                 last_act_t: -99.0,
-                ai: if is_player { None } else { Some(AiBrain { lane, aggression: 0.45 + rng.f32() * 0.5, state: AiState::Push, target: None, strafe_dir: 1.0, strafe_t: 0.0, buy_t: 1.5, wp: 0 }) },
+                ai: if is_player { None } else { Some(AiBrain::new(lane, 0.45 + rng.f32() * 0.5)) },
                 prot,
                 pen_pct: 0.0,
                 pen_flat: 0.0,
@@ -396,7 +543,7 @@ impl Game {
 
         // towers
         let mut towers = Vec::new();
-        for lane in LANES {
+        for &lane in crate::map::lanes() {
             for team in [Team::Blue, Team::Red] {
                 for inner in [false, true] {
                     towers.push(Tower {
@@ -404,8 +551,8 @@ impl Game {
                         lane,
                         inner,
                         pos: tower_pos(lane, team, inner),
-                        hp: TOWER_HP,
-                        max_hp: TOWER_HP,
+                        hp: TOWER_HP * crate::map::active().structure_hp_mul(),
+                        max_hp: TOWER_HP * crate::map::active().structure_hp_mul(),
                         atk_timer: 0.0,
                         ramp: 0,
                         last_target: None,
@@ -417,8 +564,8 @@ impl Game {
         }
 
         let titans = [
-            Titan { team: Team::Blue, pos: Team::Blue.titan_pos(), hp: TITAN_HP, atk_timer: 0.0, atk_anim: 0.0 },
-            Titan { team: Team::Red, pos: Team::Red.titan_pos(), hp: TITAN_HP, atk_timer: 0.0, atk_anim: 0.0 },
+            Titan::new(Team::Blue, TITAN_HP * crate::map::active().structure_hp_mul()),
+            Titan::new(Team::Red, TITAN_HP * crate::map::active().structure_hp_mul()),
         ];
 
         let wild = crate::wild::Wild::new(&mut rng);
@@ -437,9 +584,10 @@ impl Game {
             rng,
             cast_queue: Vec::new(),
             leap_queue: Vec::new(),
+            siphon_off: false,
             logs: crate::logs::crossings().iter().map(crate::logs::RollingLog::across).collect(),
             logs_seen: 0,
-            tower_alive: [6, 6],
+            tower_alive: [0, 0], // counted below
             titan_vuln_announced: [false, false],
             weather: crate::weather::Weather::new(),
             map_events: crate::map_events::MapEvents::new(),
@@ -449,7 +597,21 @@ impl Game {
             blockers: std::sync::Arc::new(crate::blockers::Blockers::default()),
             steer_mem: vec![crate::steer::Memory::default(); total],
             plans_this_tick: 0,
+            styles: [crate::playbook::even_keel(), crate::playbook::even_keel()],
+            calls: [None, None],
+            ferries: crate::ferry::for_map(),
+            star_bolts: Vec::new(),
+            starfalls: Vec::new(),
+            // from the match's own seed, without drawing on `rng` (so every
+            // other random thing in the match stays as it was)
+            cloud_seed: (player_god as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xC10D,
+            vision: Default::default(),
+            next_minion_id: 0,
+            waves: 0,
         };
+        for t in &g.towers {
+            g.tower_alive[t.team as usize] += 1;
+        }
         // starter items for AI gods (player buys via shop)
         for i in 0..total {
             if !g.gods[i].is_player {
@@ -468,6 +630,36 @@ impl Game {
             Lane::Mid => Vec3::ZERO,
         };
         base + jitter + lane_off
+    }
+
+    /// Give each side its page of the playbook, and move the bots to the
+    /// lanes the page plays (`playbook::lanes_for`). Announced at the start.
+    pub fn set_styles(&mut self, pages: [crate::playbook::Page; 2], rng: &mut Rng) {
+        for team in [Team::Blue, Team::Red] {
+            let genes = pages[team as usize].genes;
+            let bots: Vec<usize> = (0..self.gods.len()).filter(|&i| self.gods[i].team == team && self.gods[i].ai.is_some() && !self.gods[i].is_player).collect();
+            let now: Vec<Lane> = bots.iter().map(|&i| self.gods[i].ai.as_ref().unwrap().lane).collect();
+            let want = crate::playbook::lanes_for(&genes, &now, rng);
+            for (k, &i) in bots.iter().enumerate() {
+                let b = self.gods[i].ai.as_mut().unwrap();
+                if b.lane != want[k] {
+                    b.lane = want[k];
+                    b.wp = 0;
+                }
+            }
+        }
+        self.styles = pages;
+    }
+
+    /// Draw both sides' pages from the booklet.
+    pub fn open_playbook(&mut self, rng: &mut Rng) {
+        let pages = crate::playbook::draw_pair(rng);
+        self.set_styles(pages, rng);
+    }
+
+    /// An Elder's full health on this map.
+    pub fn titan_max_hp(&self) -> f32 {
+        TITAN_HP * crate::map::active().structure_hp_mul()
     }
 
     pub fn def(&self, i: usize) -> &'static GodDef {
@@ -583,6 +775,61 @@ impl Game {
     /// fighting by what it is tied to: intent that a fight interrupts, a
     /// window some abilities grant (the fast low run before a pounce, at
     /// full speed), and the way a badly hurt animal slinks.
+    /// Can `team` see cat `j`? Always, off the sky map, for its own cats,
+    /// and before the first cloud refresh (`vision_tick`).
+    pub fn sees(&self, team: Team, j: usize) -> bool {
+        self.vision.seen[team as usize].get(j).copied().unwrap_or(true)
+    }
+
+    /// Who each team can see through the sky map's clouds, refreshed
+    /// `skycloud::VISION_HZ` times a second. Only cloud hides: there is no
+    /// fog of war in clear air. So a team sees an enemy cat
+    ///
+    /// * if one of its own living cats within `skycloud::SIGHT_RANGE` has
+    ///   a clear line to it (`skycloud::sees`); or
+    /// * if it stands in clear air and none of the team's cats is that
+    ///   close (far off in the open, it is seen as it always was); or
+    /// * inside one of the team's standing towers' reach, or its base
+    ///   (towers and Elders see through cloud: no base is taken blind).
+    ///
+    /// So a cat in a bank is hidden from everyone outside it, and a wisp
+    /// between two groups hides each from the other while it is thick.
+    /// Minions give no sight: with 32 a side in every lane, they would see
+    /// everything and the cloud nothing.
+    pub fn vision_tick(&mut self) {
+        if crate::map::active() != crate::map::MapId::Sky {
+            if !self.vision.seen[0].is_empty() {
+                self.vision = Default::default();
+            }
+            return;
+        }
+        if self.t < self.vision.next_t && self.vision.seen[0].len() == self.gods.len() {
+            return;
+        }
+        self.vision.next_t = self.t + 1.0 / crate::skycloud::VISION_HZ;
+        let cs = crate::skycloud::clouds(self.cloud_seed, self.t);
+        let n = self.gods.len();
+        for team in [Team::Blue, Team::Red] {
+            let mut seen = vec![true; n];
+            if !cs.is_empty() {
+                for j in 0..n {
+                    let e = &self.gods[j];
+                    if e.team == team || e.respawn_t > 0.0 {
+                        continue;
+                    }
+                    let near = |v: &GodUnit| v.team == team && v.respawn_t <= 0.0 && v.pos.distance(e.pos) <= crate::skycloud::SIGHT_RANGE;
+                    let by_cat = self.gods.iter().any(|v| near(v) && crate::skycloud::sees(&cs, v.pos, e.pos));
+                    let open_air = crate::skycloud::density(&cs, e.pos.x, e.pos.z) < 0.4 && !self.gods.iter().any(|v| near(v));
+                    let by_tower = self.towers.iter().any(|t| t.team == team && t.hp > 0.0 && t.pos.distance(e.pos) < crate::consts::TOWER_RANGE + 2.0);
+                    let at_base = team.base_pos().distance(e.pos) < 40.0;
+                    seen[j] = by_cat || open_air || by_tower || at_base;
+                }
+            }
+            self.vision.seen[team as usize] = seen;
+        }
+        self.vision.clouds = cs;
+    }
+
     pub fn quiet(&self, i: usize) -> f32 {
         let g = &self.gods[i];
         let mut q: f32 = 0.0;
@@ -615,7 +862,8 @@ impl Game {
         } else {
             self.blockers.going_at(g.pos.x, g.pos.z, crate::going::Carriage { stalking })
         };
-        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk * going
+        let boon = crate::moonwell::move_mul(g.boon.map(|b| b.0));
+        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk * going * boon
     }
 
     pub fn auto_interval(&self, i: usize) -> f32 {
@@ -642,10 +890,16 @@ impl Game {
             if s < self.gods.len() {
                 let team = self.gods[s].team;
                 dmg *= self.bosses.dmg_mul(team);
+                // Wyrmfang (the Moonwell)
+                dmg *= crate::moonwell::dealt_mul(self.gods[s].boon.map(|b| b.0));
                 if matches!(target, TargetRef::Tower(_) | TargetRef::Titan(_)) {
                     dmg += self.bosses.struct_bonus(team);
                 }
             }
+        }
+        // overtime (the sky map): structures give way as the match runs long
+        if matches!(target, TargetRef::Tower(_) | TargetRef::Titan(_)) {
+            dmg *= crate::map::active().overtime(self.t);
         }
         match target {
             TargetRef::Boss(bi) => {
@@ -658,6 +912,8 @@ impl Game {
                 }
                 let eff = (g.prot * (1.0 - pen_pct) - pen_flat).max(0.0);
                 dmg *= 100.0 / (100.0 + eff);
+                // Moonshell (the Moonwell): nine-tenths of every blow turned
+                dmg *= crate::moonwell::taken_mul(g.boon.map(|b| b.0));
                 let pre = g.hp + g.shield;
                 if g.shield > 0.0 {
                     let absorbed = g.shield.min(dmg);
@@ -666,6 +922,15 @@ impl Game {
                 }
                 g.hp -= dmg;
                 g.last_dmg_t = self.t;
+                // the siphon: ability damage from an enemy CAT returns a share
+                // as mana to the one who took it (brawl)
+                let from_enemy_cat = !self.siphon_off && source.is_some_and(|s| s != ti && s < self.gods.len());
+                let g = &mut self.gods[ti];
+                if from_enemy_cat && g.hp > 0.0 {
+                    let pct = crate::brawl::siphon_pct(&g.items);
+                    g.mana = (g.mana + dmg * pct).min(g.max_mana);
+                }
+                let g = &mut self.gods[ti];
                 if let Some(s) = source {
                     if s != ti {
                         g.recent_damagers.retain(|(idx, t)| *idx != s && self.t - *t < 8.0);
@@ -725,7 +990,7 @@ impl Game {
     }
 
     pub fn titan_shielded(&self, team: Team) -> bool {
-        self.tower_alive[team as usize] >= TITAN_TOWERS_REQ
+        self.tower_alive[team as usize] >= crate::map::active().titan_towers_req()
     }
 
     fn on_minion_death(&mut self, mi: usize) {
@@ -790,7 +1055,9 @@ impl Game {
         {
             let g = &mut self.gods[gi];
             g.deaths += 1;
-            g.respawn_t = respawn_time(g.level);
+            // overtime (the sky map) stretches the wait too: a won fight then
+            // opens the base long enough for a wave to reach the Elder
+            g.respawn_t = respawn_time(g.level) * crate::map::active().overtime(self.t).min(2.0);
             g.hp = 0.0;
             g.shield = 0.0;
             g.dash = None;

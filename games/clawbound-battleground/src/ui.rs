@@ -235,14 +235,14 @@ pub fn draw_lan(ctx: &egui::Context, lobby: &mut crate::lanlobby::LanLobby) -> c
     action
 }
 
-pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool, lan: &mut bool) {
+pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool, lan: &mut bool, spectate: &mut bool) {
     setup_style(ctx);
     egui::Area::new(egui::Id::new("menu")).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space(30.0);
             ui.heading(egui::RichText::new("CLAWBOUND").size(74.0).color(GOLD).strong());
             ui.label(egui::RichText::new("B A T T L E G R O U N D").size(30.0).color(Color32::from_rgb(200, 195, 180)));
-            ui.label(egui::RichText::new("Rust · wgpu · Microvoxels — the thirteen legendary ancestors").size(15.0).color(Color32::from_rgb(150, 148, 140)));
+            ui.label(egui::RichText::new("Rust · wgpu · Microvoxels — the fourteen legendary ancestors").size(15.0).color(Color32::from_rgb(150, 148, 140)));
             ui.add_space(28.0);
             let play_btn = ui.add_sized([260.0, 52.0], egui::Button::new(egui::RichText::new("▶  PLAY").size(24.0).color(Color32::BLACK).strong()).fill(GOLD));
             let t = hover_t(ctx, play_btn.id, play_btn.hovered());
@@ -260,6 +260,12 @@ pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool, lan: &mu
                 *lan = true;
             }
             ui.add_space(8.0);
+            let spec_btn = ui.add_sized([260.0, 42.0], egui::Button::new(egui::RichText::new("SPECTATE").size(18.0)));
+            glow_hover(ui, &spec_btn, GOLD, 5.0);
+            if spec_btn.clicked() {
+                *spectate = true;
+            }
+            ui.add_space(8.0);
             let quit_btn = ui.add_sized([260.0, 34.0], egui::Button::new(egui::RichText::new("Quit").size(16.0)));
             glow_hover(ui, &quit_btn, Color32::from_rgb(200, 90, 80), 5.0);
             if quit_btn.clicked() {
@@ -267,7 +273,7 @@ pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool, lan: &mu
             }
             ui.add_space(20.0);
             ui.label(egui::RichText::new("Move · Mouse look · Attack · 1-4 abilities · Shop · Scoreboard — all rebindable in CONTROLS; gamepad and touch supported").size(13.0).color(Color32::from_rgb(160, 158, 150)));
-            ui.label(egui::RichText::new("5v5 · three lanes · destroy towers to unshield the enemy Elder · watch the sky").size(13.0).color(Color32::from_rgb(160, 158, 150)));
+            ui.label(egui::RichText::new("three maps · destroy towers to unshield the enemy Elder · watch the sky").size(13.0).color(Color32::from_rgb(160, 158, 150)));
         });
     });
 }
@@ -430,7 +436,18 @@ pub fn draw_select(ctx: &egui::Context, ui_state: &mut UiState, locked: &mut boo
 
 // --- HUD ----------------------------------------------------------------------
 
-pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f32, h: f32, ui_state: &mut UiState) {
+pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f32, h: f32, ui_state: &mut UiState, eye: Vec3) {
+    // Project into egui's OWN screen, in logical points. The caller passes
+    // the render surface's size, in physical pixels; on a display scaled
+    // 1.25x, 2x (Retina), 3x (phones) every world-anchored bar, name and
+    // floater landed that factor too far down and right -- following its
+    // cat, below it ("healthbars underground, but attached"). The headless
+    // renders run at 1x, which is why they never showed it.
+    let _ = (w, h);
+    let (w, h) = {
+        let r = ctx.screen_rect();
+        (r.width(), r.height())
+    };
     setup_style(ctx);
     let g = &game.gods[player];
     let def = game.def(player);
@@ -580,8 +597,10 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
             line = format!("{}   ·   RIVERBLESSED {:.0}s", line, g.blessing_t);
         }
         for b in &game.bosses.list {
-            let short = match b.kind { crate::bosses::BossKind::Boar => "BOAR", crate::bosses::BossKind::Drake => "DRAKE" };
-            if b.alive {
+            let short = match b.kind { crate::bosses::BossKind::Boar => "BOAR", crate::bosses::BossKind::Drake => "DRAKE", crate::bosses::BossKind::Moonwyrm => "WYRM" };
+            if b.flight.is_some() {
+                line = format!("{}   ·   {} ALOFT", line, short);
+            } else if b.alive {
                 line = format!("{}   ·   {} {:.0}%", line, short, b.hp / b.max_hp * 100.0);
             } else {
                 let left = (b.spawn_t - game.t).max(0.0);
@@ -591,6 +610,12 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
         let ti = g.team as usize;
         if game.bosses.bounty_t[ti] > 0.0 {
             line = format!("{}   ·   BOUNTY {:.0}s", line, game.bosses.bounty_t[ti]);
+        }
+        if game.bosses.claim_t[ti] > 0.0 {
+            line = format!("{}   ·   MOONWELL CLAIMED {:.0}s", line, game.bosses.claim_t[ti]);
+        }
+        if let Some((b, left)) = g.boon {
+            line = format!("{}   ·   {} ({}) {:.0}s", line, b.name(), b.what(), left);
         }
         if game.bosses.stormfire_t[ti] > 0.0 {
             line = format!("{}   ·   STORMFIRE {:.0}s", line, game.bosses.stormfire_t[ti]);
@@ -615,27 +640,7 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
 
     // world-space: hp bars + damage floaters
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("world")));
-    // gods hp bars
-    for i in 0..game.gods.len() {
-        let gg = &game.gods[i];
-        if gg.respawn_t > 0.0 {
-            continue;
-        }
-        if let Some((sp, _depth)) = project(vp, gg.pos + Vec3::Y * 2.6, w, h) {
-            let bw = if i == player { 64.0 } else { 52.0 };
-            let r = Rect::from_min_size(sp - Vec2::new(bw / 2.0, 10.0), Vec2::new(bw, 7.0));
-            painter.rect_filled(r, 2.0, Color32::from_rgb(15, 14, 20));
-            painter.rect_filled(Rect::from_min_size(r.left_top(), Vec2::new(r.width() * (gg.hp / gg.max_hp).clamp(0.0, 1.0), 7.0)), 2.0, col(gg.team));
-            if gg.shield > 0.0 {
-                painter.rect_filled(Rect::from_min_size(r.left_top(), Vec2::new(r.width() * (gg.shield / gg.max_hp).clamp(0.0, 1.0), 3.5)), 2.0, Color32::from_rgb(160, 220, 255));
-            }
-            let name = game.god_name(i);
-            painter.text(sp + Vec2::new(0.0, -16.0), Align2::CENTER_CENTER, name, FontId::proportional(11.0), col(gg.team));
-            if i == player {
-                painter.circle_stroke(sp + Vec2::new(0.0, 8.0), 3.0, Stroke::new(1.5_f32, GOLD));
-            }
-        }
-    }
+    draw_god_bars(&painter, game, Some(player), vp, w, h, eye);
     // minions hp bars (only when damaged)
     for m in &game.minions {
         if m.hp < m.max_hp {
@@ -709,7 +714,11 @@ fn draw_minimap(ctx: &egui::Context, game: &Game, player: usize) {
             let c = b.kind.color();
             let cc = Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8);
             let pts = vec![s + Vec2::new(0.0, -7.0), s + Vec2::new(7.0, 0.0), s + Vec2::new(0.0, 7.0), s + Vec2::new(-7.0, 0.0)];
-            if b.alive {
+            if b.flight.is_some() {
+                // the Moonwyrm aloft: its home hollow, and where it flies
+                p.add(egui::Shape::closed_line(pts, Stroke::new(1.5_f32, cc.gamma_multiply(0.6))));
+                p.circle(to_map(b.pos), 5.0, cc, Stroke::new(1.5_f32, Color32::WHITE));
+            } else if b.alive {
                 p.add(egui::Shape::convex_polygon(pts, cc, Stroke::new(1.5_f32, Color32::BLACK)));
             } else {
                 p.add(egui::Shape::closed_line(pts, Stroke::new(1.5_f32, cc.gamma_multiply(0.6))));
@@ -736,7 +745,8 @@ fn draw_minimap(ctx: &egui::Context, game: &Game, player: usize) {
         // gods
         for i in 0..game.gods.len() {
             let gg = &game.gods[i];
-            if gg.respawn_t > 0.0 {
+            // hidden in cloud from the player's team: not on the map
+            if gg.respawn_t > 0.0 || !game.sees(game.gods[player].team, i) {
                 continue;
             }
             let s = to_map(gg.pos);
@@ -792,6 +802,8 @@ pub fn draw_scoreboard_labelled(ctx: &egui::Context, game: &Game, ui_label: Opti
             egui::ScrollArea::vertical().id_source("board_scroll").max_height(max_h - 64.0).show(ui, |ui| {
             for team in [Team::Blue, Team::Red] {
                 ui.label(egui::RichText::new(format!("— {} —", team.name())).size(15.0).color(col(team)));
+                let page = &game.styles[team as usize];
+                ui.label(egui::RichText::new(format!("playing {} — {}", page.name, page.lore)).size(12.0).italics().color(Color32::from_rgb(200, 190, 160)));
                 ui.label(egui::RichText::new(format!("hunt: {} animals caught", game.wild.caught[team as usize])).size(12.0).color(Color32::from_rgb(170, 168, 158)));
                 egui::Grid::new(format!("grid{}", team as usize)).num_columns(7).spacing([14.0, 3.0]).show(ui, |ui| {
                     ui.monospace("Ancestor");
@@ -826,7 +838,10 @@ pub fn draw_scoreboard_labelled(ctx: &egui::Context, game: &Game, ui_label: Opti
                         ui.monospace(match &g.ai {
                             Some(b) => match b.state {
                                 AiState::Push => "pushing".to_string(),
-                                AiState::Fight => "fighting".to_string(),
+                                AiState::Fight => match b.target {
+                                    Some(crate::sim::TargetRef::God(_)) => format!("fighting: {}", b.stance.label()),
+                                    _ => "fighting".to_string(),
+                                },
                                 AiState::Retreat => "retreating".to_string(),
                             },
                             None => String::new(),
@@ -922,7 +937,10 @@ pub fn draw_crosshair(ctx: &egui::Context, locked: bool, w: f32, h: f32) {
     }
     egui::Area::new(egui::Id::new("crosshair")).fixed_pos(Pos2::ZERO).interactable(false).show(ctx, |ui| {
         let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("crosshair_layer")));
-        let c = Pos2::new(w * 0.5, h * 0.5);
+        // the centre of egui's screen, in logical points: w/h are the
+        // surface's physical pixels, and at 2x their half is the far corner
+        let _ = (w, h);
+        let c = ui.ctx().screen_rect().center();
         let a = (t * 220.0) as u8;
         let col = Color32::from_rgba_premultiplied(230, 226, 216, a);
         painter.line_segment([c + Vec2::new(-6.0, 0.0), c + Vec2::new(-2.0, 0.0)], Stroke::new(1.4_f32, col));
@@ -941,9 +959,13 @@ pub fn draw_controls(ctx: &egui::Context, cfg: &mut crate::input::Config, captur
     setup_style(ctx);
     egui::Area::new(egui::Id::new("controls")).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
         egui::Frame::default().fill(PANEL).stroke(Stroke::new(1.5_f32, GOLD)).inner_margin(16.0).show(ui, |ui| {
+            // scrolls when the screen is short (a phone in landscape): the
+            // graphics and audio settings made it taller than 720 px
+            let max_h = (ctx.screen_rect().height() - 48.0).max(200.0);
+            egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
             ui.set_width(560.0);
             ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new("CONTROLS").size(22.0).color(GOLD));
+                ui.heading(egui::RichText::new("CONTROLS & SETTINGS").size(22.0).color(GOLD));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("  ✕  ").clicked() {
                         out.close = true;
@@ -999,10 +1021,35 @@ pub fn draw_controls(ctx: &egui::Context, cfg: &mut crate::input::Config, captur
                 changed |= ui.checkbox(&mut st.touch_enabled, "on-screen touch controls").changed();
                 changed |= ui.add(egui::Slider::new(&mut st.touch_scale, 0.6..=1.8).text("size")).changed();
             });
+            // graphics and audio
+            ui.add_space(8.0);
+            ui.separator();
+            ui.label(egui::RichText::new("GRAPHICS & AUDIO").size(15.0).color(GOLD));
+            ui.label(egui::RichText::new("Esc opens this panel during a match too.").size(11.0).color(Color32::from_rgb(170, 166, 156)));
+            egui::ComboBox::from_label("graphics").selected_text(st.quality.label()).show_ui(ui, |ui| {
+                for q in crate::quality::Quality::ALL {
+                    changed |= ui.selectable_value(&mut st.quality, q, q.label()).changed();
+                }
+            });
+            if st.quality == crate::quality::Quality::Ultra {
+                ui.horizontal(|ui| {
+                    ui.label("fur");
+                    changed |= ui.radio_value(&mut st.fur, crate::render::FurStyle::Tape, "tape").changed();
+                    changed |= ui.radio_value(&mut st.fur, crate::render::FurStyle::Locks, "locks").changed();
+                });
+                ui.label(egui::RichText::new("Ultra is a preview: smooth, furred cats, coloured light, traced shadows, wet reflections. Applies from the next match.").size(11.0).color(Color32::from_rgb(170, 166, 156)));
+            }
+            changed |= ui.add(egui::Slider::new(&mut st.vol_master, 0.0..=1.0).text("master volume")).changed();
+            changed |= ui.add(egui::Slider::new(&mut st.vol_music, 0.0..=1.0).text("music")).changed();
+            changed |= ui.add(egui::Slider::new(&mut st.vol_sfx, 0.0..=1.0).text("effects")).changed();
+            changed |= ui.add(egui::Slider::new(&mut st.vol_voice, 0.0..=1.0).text("voices")).changed();
+            changed |= ui.checkbox(&mut st.show_fps, "show frame rate").changed();
+            changed |= ui.checkbox(&mut st.vsync, "vsync (off: uncapped, to measure the machine)").changed();
             if changed {
                 cfg.save();
             }
             let _ = Action::Menu;
+            });
         });
     });
 }
@@ -1152,7 +1199,10 @@ pub fn draw_intro_overlay(ctx: &egui::Context, o: &crate::intro::Overlay) {
     }
     if let Some(line) = o.line {
         if o.line_alpha > 0.01 {
-            let y = screen.max.y - bar.max(h * 0.06) - 26.0;
+            // inside the bottom bar when it is there (legible over any
+            // scene: pale subtitles over the pass's snow could not be read);
+            // just above the edge when it is not
+            let y = if bar > 30.0 { screen.max.y - bar * 0.5 + 12.0 } else { screen.max.y - h * 0.06 - 26.0 };
             p.text(Pos2::new(screen.center().x + 1.5, y + 1.5), Align2::CENTER_BOTTOM, line, FontId::proportional((h * 0.034).clamp(16.0, 30.0)), Color32::from_black_alpha(a(o.line_alpha * 0.7)));
             p.text(Pos2::new(screen.center().x, y), Align2::CENTER_BOTTOM, line, FontId::proportional((h * 0.034).clamp(16.0, 30.0)), Color32::from_rgba_unmultiplied(240, 232, 214, a(o.line_alpha)));
         }
@@ -1167,17 +1217,22 @@ pub fn map_blurb(m: crate::map::MapId) -> &'static str {
     match m {
         crate::map::MapId::Jungle => "the valley: three lanes through deep jungle",
         crate::map::MapId::Pass => "the mountains: a canyon between twin peaks",
+        crate::map::MapId::Sky => "the spirit sky: two wide lanes, glacier islands, clouds to ride",
     }
 }
 
 /// The map picker on the select screen: a card per map, the chosen one lit.
 pub fn map_picker(ui: &mut egui::Ui, choice: &mut crate::map::MapId) {
     ui.label(egui::RichText::new("BATTLEGROUND").size(16.0).color(GOLD));
+    // as many cards as there are maps, sharing the panel's width (three at
+    // a fixed 236 ran off the right edge); the blurb wraps onto two lines
+    let n_maps = crate::map::MapId::ALL.len() as f32;
+    let gap = 6.0 + 2.0 * ui.spacing().item_spacing.x;
+    let w = ((ui.available_width() - gap * (n_maps - 1.0) - 4.0) / n_maps).clamp(150.0, 236.0);
     ui.horizontal(|ui| {
         for m in crate::map::MapId::ALL {
             let sel = *choice == m;
-            // wide enough for the blurb (210 overflowed it)
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(236.0, 58.0), Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 66.0), Sense::click());
             let t = hover_t(ui.ctx(), egui::Id::new("map_card").with(m.key()), resp.hovered());
             let p = ui.painter();
             p.rect_filled(rect, 8.0, if sel { Color32::from_rgb(58, 52, 36) } else { Color32::from_rgb(34, 33, 40).linear_multiply(1.0 + 0.3 * t) });
@@ -1185,11 +1240,145 @@ pub fn map_picker(ui: &mut egui::Ui, choice: &mut crate::map::MapId) {
             let n = m.team_size();
             p.text(rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, m.name(), FontId::proportional(15.0), if sel { GOLD } else { Color32::from_rgb(220, 216, 205) });
             p.text(rect.right_top() + Vec2::new(-10.0, 9.0), Align2::RIGHT_TOP, format!("{n} v {n}"), FontId::proportional(12.0), Color32::from_rgb(180, 176, 165));
-            p.text(rect.left_top() + Vec2::new(10.0, 32.0), Align2::LEFT_TOP, map_blurb(m), FontId::proportional(10.5), Color32::from_rgb(160, 156, 146));
+            let blurb = p.layout(map_blurb(m).to_string(), FontId::proportional(10.5), Color32::from_rgb(160, 156, 146), w - 20.0);
+            p.galley(rect.left_top() + Vec2::new(10.0, 30.0), blurb, Color32::from_rgb(160, 156, 146));
             if resp.clicked() {
                 *choice = m;
             }
             ui.add_space(6.0);
         }
     });
+}
+
+#[cfg(test)]
+mod hidpi_tests {
+    use super::*;
+
+    /// At 2x (a Retina display), a cat in the middle of the view has its
+    /// health bar in the middle of the screen -- in egui's logical points,
+    /// whatever size in physical pixels the caller passes.
+    #[test]
+    fn health_bars_sit_over_their_cats_on_a_scaled_display() {
+        let game = Game::new_teams(&[0], &[1]);
+        let cat = game.gods[0].pos;
+        let cam = crate::render::Camera { eye: cat + Vec3::new(0.0, 8.0, -12.0), target: cat + Vec3::Y * 2.6, fov_y: 1.0 };
+        let (pw, ph) = (1280.0f32, 720.0f32); // physical pixels
+        let vp = cam.view_proj(pw / ph);
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(2.0);
+        let mut st = UiState::new();
+        let mut shapes = Vec::new();
+        for k in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(pw / 2.0, ph / 2.0))),
+                time: Some(k as f64 * 0.016),
+                ..Default::default()
+            };
+            shapes = ctx.run(raw, |c| draw_hud(c, &game, 0, vp, pw, ph, &mut st, cam.eye)).shapes;
+        }
+        // the player's bar: a 64-point-wide dark rect
+        let bar = shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Rect(r) if (r.rect.width() - 64.0).abs() < 0.5 && (r.rect.height() - 7.0).abs() < 0.5 => Some(r.rect),
+                _ => None,
+            })
+            .expect("the player's health bar was drawn");
+        let centre = egui::pos2(pw / 4.0, ph / 4.0); // the middle of the LOGICAL screen
+        assert!((bar.center().x - centre.x).abs() < 4.0, "bar at x {} -- the middle is {}", bar.center().x, centre.x);
+        assert!((bar.center().y - centre.y).abs() < 12.0, "bar at y {} -- the middle is {}", bar.center().y, centre.y);
+    }
+
+    /// The crosshair marks the middle of the screen at 2x too.
+    #[test]
+    fn the_crosshair_is_centred_on_a_scaled_display() {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(2.0);
+        let (pw, ph) = (1280.0f32, 720.0f32);
+        let mut shapes = Vec::new();
+        for k in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(pw / 2.0, ph / 2.0))),
+                time: Some(k as f64 * 0.016),
+                ..Default::default()
+            };
+            shapes = ctx.run(raw, |c| draw_crosshair(c, true, pw, ph)).shapes;
+        }
+        let pts: Vec<egui::Pos2> = shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::LineSegment { points, .. } => Some(points[0].lerp(points[1], 0.5)),
+                _ => None,
+            })
+            .collect();
+        assert!(!pts.is_empty(), "no crosshair drawn");
+        let mid = pts.iter().fold(egui::Vec2::ZERO, |a, p| a + p.to_vec2()) / pts.len() as f32;
+        assert!((mid.x - pw / 4.0).abs() < 2.0 && (mid.y - ph / 4.0).abs() < 2.0, "crosshair at {mid:?}, screen middle ({}, {})", pw / 4.0, ph / 4.0);
+    }
+}
+
+/// Every living cat's health bar, shield and name, over its head; the
+/// player (if any) marked. Shared by the player's HUD and the spectator's.
+pub fn draw_god_bars(painter: &egui::Painter, game: &Game, player: Option<usize>, vp: Mat4, w: f32, h: f32, eye: Vec3) {
+    for i in 0..game.gods.len() {
+        let gg = &game.gods[i];
+        if gg.respawn_t > 0.0 || player.is_some_and(|p| !game.sees(game.gods[p].team, i)) {
+            continue;
+        }
+        let head = gg.pos + Vec3::Y * 2.6;
+        let mine = Some(i) == player;
+        // Size and presence by distance and sight: the pass's long views
+        // put thirty full-size bars on screen, and bars showed THROUGH rock.
+        // Far bars shrink (to 55% by 90 u) and fade out (gone at 120 u); a
+        // cat behind terrain keeps a faint bar and no name.
+        let dist = head.distance(eye);
+        let far = ((dist - 20.0) / 70.0).clamp(0.0, 1.0);
+        let scale = 1.0 - 0.45 * far;
+        let fade = 1.0 - ((dist - 80.0) / 40.0).clamp(0.0, 1.0);
+        let seen = mine || crate::map::line_clear(eye, head);
+        let alpha = if mine { 1.0 } else { fade * if seen { 1.0 } else { 0.28 } };
+        if alpha < 0.03 {
+            continue;
+        }
+        let a = |c: Color32| c.gamma_multiply(alpha);
+        if let Some((sp, _depth)) = project(vp, head, w, h) {
+            let bw = if mine { 64.0 } else { 52.0 * scale };
+            let bh = if mine { 7.0 } else { (7.0 * scale).max(4.5) };
+            let r = Rect::from_min_size(sp - Vec2::new(bw / 2.0, 10.0), Vec2::new(bw, bh));
+            painter.rect_filled(r, 2.0, a(Color32::from_rgb(15, 14, 20)));
+            painter.rect_filled(Rect::from_min_size(r.left_top(), Vec2::new(r.width() * (gg.hp / gg.max_hp).clamp(0.0, 1.0), bh)), 2.0, a(col(gg.team)));
+            if gg.shield > 0.0 {
+                painter.rect_filled(Rect::from_min_size(r.left_top(), Vec2::new(r.width() * (gg.shield / gg.max_hp).clamp(0.0, 1.0), bh * 0.5)), 2.0, a(Color32::from_rgb(160, 220, 255)));
+            }
+            if mine || (seen && dist < 45.0) {
+                let name = game.god_name(i);
+                painter.text(sp + Vec2::new(0.0, -16.0), Align2::CENTER_CENTER, name, FontId::proportional(11.0 * scale.max(0.8)), a(col(gg.team)));
+            }
+            if mine {
+                painter.circle_stroke(sp + Vec2::new(0.0, 8.0), 3.0, Stroke::new(1.5_f32, GOLD));
+            }
+        }
+    }
+}
+
+/// The spectator's overlay: every cat's bar, the minimap, the mode and who
+/// is watched, and the keys. Nothing of any one cat's own HUD.
+pub fn draw_spectator_hud(ctx: &egui::Context, game: &Game, vp: Mat4, label: &str, eye: Vec3) {
+    setup_style(ctx);
+    let r = ctx.screen_rect();
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("spectator_world")));
+    draw_god_bars(&painter, game, None, vp, r.width(), r.height(), eye);
+    draw_minimap(ctx, game, 0);
+    let top = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("spectator")));
+    top.text(egui::pos2(r.center().x, r.top() + 18.0), Align2::CENTER_TOP, label, FontId::proportional(20.0), GOLD);
+    let plays = format!("{} plays {}   ·   {} plays {}", Team::Blue.name(), game.styles[0].name, Team::Red.name(), game.styles[1].name);
+    top.text(egui::pos2(r.center().x, r.top() + 64.0), Align2::CENTER_TOP, plays, FontId::proportional(13.0), Color32::from_rgb(200, 190, 160));
+    top.text(egui::pos2(r.center().x, r.top() + 44.0), Align2::CENTER_TOP, "Tab next cat  ·  Z director  ·  X free camera (WASD, mouse, wheel)  ·  Esc leave", FontId::proportional(12.5), Color32::from_rgb(190, 186, 176));
+}
+
+/// The frame-rate readout (a setting).
+pub fn draw_fps(ctx: &egui::Context, fps: f32, ms: f32) {
+    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("fps")));
+    let r = ctx.screen_rect();
+    p.text(r.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, format!("{fps:.0} fps  {ms:.1} ms"), FontId::monospace(13.0), Color32::from_rgb(220, 230, 200));
 }

@@ -1,6 +1,6 @@
 # Clawbound — Battleground · Rust + wgpu Microvoxel Edition
 
-A 5v5 three-lane arena for the **thirteen legendary ancestors of Clawbound**,
+A three-map arena for the **fourteen legendary ancestors of Clawbound**,
 built as a native Linux game in Rust + wgpu. No engine, no assets — every
 ancestor, minion, tower, Elder, projectile and ability effect is procedurally
 generated microvoxels: tens of thousands of instanced cubes with baked ambient
@@ -21,10 +21,46 @@ what else is known-but-unresolved.
 ## Features
 
 - **5v5, three lanes** — TOP / MID / BOT with waypoint pathing, per-lane minion
-  waves (melee + casters), 12 towers, two Elders gated behind tower kills.
-- **13 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
+  waves of four (five every third: 3 melee + 1–2 casters) that hold targets,
+  answer a hit on their cats, and chase within a leash; 12 towers, two Elders
+  gated behind tower kills.
+- **Three maps** — the jungle valley (5v5, three lanes), Twinfang Pass (15v15
+  mountain canyon), and **Starwell Glacier** (15v15): two wide lanes over
+  glacier islands in a starlit sky, waves of 32 minions a side in each lane
+  (64 when they meet), cloud ferries you leap onto to ride across the chasms (miss, and the
+  Starwell carries you home), and the Moonwell at the centre -- healing water
+  where the Moonwyrm -- a sky-serpent with a cat's head -- coils, hurling the
+  stars that circle it at anyone who comes near; kill it and your team claims the well for two
+  minutes of random boons (90% less damage taken, halved cooldowns, +40%
+  speed, +50% damage). Every few minutes, if left alone, it takes wing and
+  flies a loop over the whole map, over the islands and down through the
+  chasms, untouchable, letting stars fall on marked spots (a ring of light,
+  then a column of it that burns either side). From 18 minutes, overtime:
+  towers and Elders take 12% more damage a minute, and deaths last longer.
+- **Cloud cover** (Starwell, every preset -- it is gameplay): from the first
+  minute, great cloud banks drift in over the rim and cross the map, and thin
+  wisps blow through, thickening and thinning every few seconds. A cat in a
+  bank is hidden from enemies outside it (not drawn, not on the map, cannot
+  be auto-attacked, bots do not go for it); a thick wisp between two groups
+  hides each from the other. Towers and bases see through cloud; minions
+  give no sight.
+- **The Elders move**: each guards its ground -- a circle round its pedestal
+  and a push lane out toward the enemy, marked with faint stones of light.
+  It turns to face what steps onto its ground, strides out to meet it,
+  strikes only what it faces, and walks home to its pedestal when the ground
+  is clear.
+- **Clan camps** behind every base, on every map: a leader's rock, a
+  medicine den with its pool and herbs, warriors', apprentices' and elders'
+  dens, a mossy nursery, a fresh-kill pile, and a bramble wall round the back.
+- **Ultra snow** (Ultra preset only; looks, not rules): snow lies on the snowy
+  maps, deep in the sheltered hollows and blown thin where the wind scours;
+  it keeps falling, the wind drifts it from the blown stretches into the lee,
+  cats bound through drifts ploughing a trench and leave separate prints on
+  powder, and blasts throw craters, fire melts it, frost lays more.
+- **14 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
   Windclaw, Faryowl, Oldroar, Twofang, Suneye, Snowhush, Riptail, Stillsmoke,
-  Stonewhisper — across 5 roles (Warrior / Guardian / Mage / Hunter / Assassin).
+  Stonewhisper, Cometail (the star-fallen caracal: Starshot, Meteor Pounce,
+  Flare, and the Falling Star ultimate) — across 5 roles (Warrior / Guardian / Mage / Hunter / Assassin).
   Each is a quadruped feline voxel body with a pelt signature (mane, stripes,
   rosettes, saber fangs, antlers, sun disc, ear tufts…) and its crest colour,
   plus **4 mechanical abilities** (52 total) built from 13 archetype systems.
@@ -100,7 +136,7 @@ what else is known-but-unresolved.
 - **Ambient life** — ground-bird flocks that flush when you come near and
   settle elsewhere, glow-moths around the heal trees at night, fireflies that
   come out under cloud, sky birds that scatter at lightning and roost at night.
-- **100-item shop** in 8 stat categories, three tiers, 8 stacking items,
+- **102-item shop** in 8 stat categories (100, plus the two Siphon items that raise every cat's base Siphon defence), three tiers, 8 stacking items,
   searchable (type to filter, arrow keys + Enter to buy), with hover-lift and
   a green purchase flash on item cards, a gold dot marking categories
   recommended for your role, and sell-back (click an owned slot to arm it,
@@ -125,9 +161,50 @@ what else is known-but-unresolved.
 
 ## Build & Run
 
-Requirements: Rust 1.75+, a GPU with Vulkan (or GL). For audio on Linux,
-ALSA headers (`libasound2-dev`) at build time — or build with
-`--no-default-features` for a silent binary.
+Requirements: Rust (stable, via rustup), a GPU with Metal (macOS), Vulkan
+or GL. For audio on Linux, ALSA headers (`libasound2-dev`) at build time —
+or build with `--no-default-features` for a silent binary. macOS needs
+nothing extra (CoreAudio, Metal).
+
+### Bot styles and the arena
+
+Each match, both sides draw a page from the playbook (Pride Hunt, Shadow
+Stalk, Thornwall, ...); the scoreboard and the spectator HUD say which.
+Force a pairing with `CLAWBOUND_PLAYBOOK="Pride Hunt,Storm Front"` (blue, red).
+
+```bash
+cargo run --release --example arena -- 10 10 --write   # 10 generations, 10-min cap
+cargo run --release --example aiprobe -- 12 8          # circling / tower-death / retreat counts
+```
+
+`--write` puts the league's best strains into `dev/arena/booklet.txt`,
+which the playbook reads at build time.
+
+### A high-end test (e.g. an M2 Ultra)
+
+```bash
+cd games/clawbound-battleground
+cargo run --release                       # then set things in the game
+cargo run --release -- --ultra --map pass # or force Ultra on the 15-v-15 map
+```
+
+- **Settings** (Controls & Settings: the button on the main menu, or **Esc**
+  during a match): graphics **Ultra (preview)** / High / Medium / Low, fur
+  (tape / locks), volumes, **show frame rate**, and **vsync** — turn it off
+  to see uncapped frame times. Saved between runs.
+- **Ultra** applies from the next match (it builds the smooth, furred
+  characters: ~2 s); the rest applies at once. `CLAWBOUND_QUALITY=ultra|
+  high|medium|low` and `CLAWBOUND_FUR=tape|locks` override the settings.
+- **What Ultra adds:** smooth furred cats with PBR shading; coloured light
+  from abilities, channels and lightning, with ray-traced shadows between
+  the cats and onto the ground; wet ground as a mirror; god rays the canopy
+  blocks. Good things to look at: Stillsmoke's ultimate (lightning), any
+  cast in the rain, the pass at a low sun.
+- **Numbers:** the frame-rate readout shows fps and ms. For a repeatable
+  benchmark: `CLAWBOUND_SHOTS=perf cargo run --release -- --screenshot
+  --map pass` (draws, instances and frame times per shot, headless).
+- On startup the log prints the GPU backend and the present modes the
+  display offers (`[clawbound] present modes ...`).
 
 ```bash
 cargo run --release          # windowed game
@@ -175,7 +252,7 @@ input model the monorepo's other games (skydribble, unendlich) use.
 | `Space` / pad `A` / touch `^` | Leap: onto the rock, log, wall top or pillar cap you are steering at (up to 5.5 u above your paws), else up to 9 u forward. From a perch the next leap is free |
 | `1 2 3 4` or `Q E R F` | Cast abilities at crosshair ground point (4 = ultimate) |
 | `Z` / pad `LB` / a gentle stick | Stalk: a quarter speed, low, silent, threading between stems. A toggle, and deliberately not a held modifier. Attacking, casting or being hit suspends it for 1.5 s; dashes, blinks and buffs grant a hush at full speed; under 35% HP a cat slinks on its own |
-| `B` | Toggle the 100-item shop |
+| `B` | Toggle the shop |
 | `Tab` / `C` (hold) | Scoreboard |
 | Mouse wheel / `PgUp` `PgDn` | Zoom |
 | `X` | Camera behind me |
@@ -239,7 +316,7 @@ Headless core first, GPU shell on top — everything above the line runs under
 src/
 ├── consts.rs      arena layout (3-lane polylines, 12 towers), tuning, XP curve
 ├── gods.rs        13-ancestor roster (from Clawbound), 52 ability defs over 13 archetypes
-├── items.rs       the 100-item catalog, stat model, stacking rules, AI builds
+├── items.rs       the 102-item catalog, stat model, stacking rules, AI builds
 ├── weather.rs     weather state machine → `Atmosphere` sample (plain numbers)
 ├── map_events.rs  event scheduler + effects; `speed_mul` / `gold_mul` hooks
 ├── wild.rs        heal trees, prey (hare / stag / glowfish), the hunt, Riverblessing
@@ -258,7 +335,10 @@ src/
 ├── sim.rs         entities, economy, damage pipeline, kills
 ├── systems.rs     tick: waves, movement, auto-attacks, projectiles, zones, sky
 ├── abilities.rs   cast execution for all 13 archetypes
-├── ai.rs          9 AI ancestors: lane push, orbit fights, sieging, retreat, buys
+├── ai.rs          AI ancestors: lane push, fights in stances, tower discipline, retreat, buys
+├── tactics.rs     fight decisions: dive / hold / regroup / retreat from a Lanchester edge
+├── playbook.rs    the booklet of team styles each side draws per match (+ dev/arena/booklet.txt)
+├── arena.rs       league: styles play headless, Elo, PFSP matchmaking, mutation
 ── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
 ├── voxel.rs       microvoxel core: dense grids → instanced cubes + baked AO
 ├── models.rs      procedural feline ancestor / minion / tower / Elder builders
