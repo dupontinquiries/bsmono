@@ -179,6 +179,9 @@ pub fn inventory(b: &[u8]) -> Result<Value, FlpError> {
                 let c = channels.last_mut().unwrap();
                 if let Some(p) = i32at(d, 0) { c.insert("pan".into(), json!(p)); }
                 if let Some(v) = u32at(d, 4) { c.insert("volume".into(), json!(v)); }
+                // a sampler's fixed PITCH SHIFT, cents (A Top A Tower's "Pattern 2":
+                // -560, which FL plays as varispeed -- slower and lower together)
+                if let Some(v) = i32at(d, 8) { c.insert("pitch_shift".into(), json!(v)); }
             }
             // ── arrangements ──
             Ev::Num(99, v) => {

@@ -63,6 +63,18 @@ fn main() {
             .status().map(|s| s.success()).unwrap_or(false);
         if !ok { im.report.push(format!("could not make the stretched copy {variant}")); }
     }
+    // VARISPEED copies: pitch and speed together (asetrate), as FL plays a
+    // pitch-shifted sampler
+    for (file, r, variant) in &im.varispeeds {
+        let out = media.join(variant);
+        if out.is_file() { continue; }
+        let input = media.join(opus_for(file).unwrap_or_else(|| file.clone()));
+        let rate = probe(file).map(|m| m.rate).unwrap_or(48_000) as f64;
+        let ok = std::process::Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-y", "-i"]).arg(&input)
+            .args(["-af", &format!("asetrate={},aresample=48000", (rate * r).round()), "-c:a", "libopus", "-b:a", "48k"]).arg(&out)
+            .status().map(|s| s.success()).unwrap_or(false);
+        if !ok { im.report.push(format!("could not make the varispeed copy {variant}")); }
+    }
     let mut swapped = 0;
     for src in im.project.sources.values_mut() {
         if let Some(o) = opus_for(&src.path) { src.path = o; src.sample_rate = 48_000; swapped += 1; }

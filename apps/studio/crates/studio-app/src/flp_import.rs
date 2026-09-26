@@ -63,6 +63,10 @@ pub struct Imported {
     /// (the example uses ffmpeg `atempo`, pitch kept) -- FL keeps such a
     /// cache too. Ratio = source seconds played per timeline second.
     pub stretches: Vec<(String, f64, String)>,
+    /// Audio FL plays VARISPEED (pitch and speed together): a sampler channel's
+    /// fixed pitch shift, as (file FL named, speed ratio, the copy to read). The
+    /// caller makes each (the example: ffmpeg `asetrate`).
+    pub varispeeds: Vec<(String, f64, String)>,
     /// Everything approximated, skipped or refused, grouped, for a person.
     pub report: Vec<String>,
 }
@@ -473,6 +477,16 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     let mut pattern_sources: BTreeMap<usize, SourceId> = BTreeMap::new();
     let (mut automation_clips, mut placed, mut overflowed, mut declicked) = (0usize, 0usize, 0usize, 0usize);
     let mut stretches: Vec<(String, f64, String)> = Vec::new();
+    let mut varispeeds: Vec<(String, f64, String)> = Vec::new();
+    // channels whose pitch has an automation clip ("<channel> - Channel pitch[ #n]")
+    let pitch_automated: std::collections::BTreeSet<String> = chans.values()
+        .filter(|c| s(&c["kind"]) == Some("Automation"))
+        .filter_map(|c| s(&c["name"])?.split(" - Channel pitch").next().filter(|n| s(&c["name"]).is_some_and(|x| x.contains(" - Channel pitch"))).map(str::to_string))
+        .collect();
+    if !pitch_automated.is_empty() {
+        report.push(format!("PITCH AUTOMATION not applied yet (played at native speed; the saved pitch is only where the automation left it): {}",
+            pitch_automated.iter().cloned().collect::<Vec<_>>().join(", ")));
+    }
     let mut off_clips = 0usize;
     let (mut muted_items, mut flag_1000) = (0usize, 0usize);
     let mut stretch_modes: BTreeMap<String, i64> = BTreeMap::new();
@@ -521,6 +535,27 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                         let src_in = Ticks::from_seconds(off.max(0.0) / 1000.0 / r);
                         let len = len_t.min(Ticks::from_seconds(m.len.to_seconds() / r).saturating_sub(src_in));
                         if len > Ticks::ZERO { clips.push((sid, pos, src_in, len, channel_gain_for(c, Some(m), true))); }
+                    } else if let Some(cents) = i(&c["pitch_shift"]).filter(|p| *p != 0 && off < 0.0 && !pitch_automated.contains(&ch_name(c))) {
+                        // (Not when the channel's pitch is AUTOMATED: then the saved
+                        // shift is only where the automation left the knob -- A Top A
+                        // Tower's "Pattern 2" saved -560 cents, the end of its dive,
+                        // and a constant -560 took the intro's bars 1-8 from 0.61
+                        // correlation with the artist's mix to 0.09. The intro plays
+                        // at native speed, then the curve dives. The time-varying
+                        // curve is not applied yet; the report says so.)
+                        // VARISPEED: no file span given, a fixed pitch shift on the
+                        // channel -- FL plays the sample slower-and-lower (or
+                        // faster-and-higher) together. A Top A Tower's "Pattern 2":
+                        // -560 cents; a 50.99 s file fills a 70.45 s clip, 0.7237 =
+                        // 2^(-560/1200). Played at native speed it was fast, high,
+                        // and ran out at 0:51.
+                        let r = 2f64.powf(cents as f64 / 1200.0);
+                        let stem = std::path::Path::new(&file).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|| file.clone());
+                        let variant = format!("{stem}.varispeed{cents:+}c.opus");
+                        let Some((sid, _)) = source_for(&file, &mut ops, &mut missing, Some((&variant, r))) else { continue };
+                        if !varispeeds.iter().any(|(_, _, v)| *v == variant) { varispeeds.push((file.clone(), r, variant.clone())); }
+                        let len = len_t.min(Ticks::from_seconds(m.len.to_seconds() / r));
+                        if len > Ticks::ZERO { clips.push((sid, pos, Ticks::ZERO, len, channel_gain_for(c, Some(m), true))); }
                     } else {
                     let src_in = if off > 0.0 { Ticks::from_seconds(off / 1000.0) } else { Ticks::ZERO };
                     let len = len_t.min(m.len.saturating_sub(src_in));
@@ -662,6 +697,10 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         report.push(format!("{muted_items} clips muted in FL's playlist (item flag 0x2000) -- placed on MUTED lanes \"(muted in FL)\", kept, a mute away{}",
             if flag_1000 > 0 { format!("; {flag_1000} items also carry flag 0x1000, meaning not known") } else { String::new() }));
     }
+    if !varispeeds.is_empty() {
+        report.push(format!("VARISPEED (a sampler's fixed pitch shift, pitch and speed together, as FL plays it): {}",
+            varispeeds.iter().map(|(f, r, _)| format!("{} x{r:.4}", std::path::Path::new(f).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default())).collect::<Vec<_>>().join(", ")));
+    }
     if declicked > 0 { report.push(format!("{declicked} audio clips declicked: {:.0} ms fades at each edge, as FL does by default", DECLICK * 1000.0)); }
     if automation_clips > 0 { report.push(format!("{automation_clips} automation clip{} not imported (their points are not read yet)", if automation_clips == 1 { "" } else { "s" })); }
     if !approx.is_empty() { report.push(format!("effects read or approximated: {}", approx.join("; "))); }
@@ -705,7 +744,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     if panned > 0 { report.push(format!("{panned} insert pan{} imported as bus balance", if panned == 1 { "" } else { "s" })); }
     report.push(format!("levels by FL's volume laws: channel knob (v/12800)^{FL_KNOB_EXP} (78% = -5.2 dB; audio clips +{FL_CLIP_OFFSET_DB} dB), mixer fader and sends (v/12800)^{FL_FADER_EXP} (80% = 0 dB, 100% = +5.6 dB) -- through Image-Line's published points; the curve between them is assumed, so close, not exact"));
     if !missing.is_empty() { report.push(format!("media not found beside the project: {}", missing.join(", "))); }
-    Ok(Imported { project: p, rack, report, stretches })
+    Ok(Imported { project: p, rack, report, stretches, varispeeds })
 }
 
 #[cfg(test)]
@@ -731,7 +770,10 @@ mod tests {
                 {"iid": 1, "kind": "Instrument", "name": "Omnisphere", "plugin": "Fruity Wrapper", "plugin_name": "Omnisphere", "insert": 2, "volume": 10000},
                 {"iid": 2, "kind": "Instrument", "name": "Bass", "plugin": "Fruity Wrapper", "plugin_name": "Omnisphere", "insert": 0, "volume": 10000, "enabled": false},
                 {"iid": 3, "kind": "Sampler", "name": "Vox", "sample_file": "vox.wav", "insert": 2, "volume": 5000, "pan": 6400, "normalize": true},
-                {"iid": 4, "kind": "Automation", "name": "Vox - Volume"}
+                {"iid": 4, "kind": "Automation", "name": "Vox - Volume"},
+                {"iid": 5, "kind": "Sampler", "name": "Beat", "sample_file": "vox.wav", "insert": 1, "pitch_shift": -1200},
+                {"iid": 6, "kind": "Sampler", "name": "Dive", "sample_file": "kick.wav", "insert": 1, "pitch_shift": -560},
+                {"iid": 7, "kind": "Automation", "name": "Dive - Channel pitch"}
             ],
             "patterns": [
                 {"iid": 1, "name": "Beat", "notes": [
@@ -750,6 +792,7 @@ mod tests {
                 {"iid": 3, "items": [{"kind": "PatternPLItem", "pattern": 2, "pos": 0, "len": 1728}]},
                 {"iid": 4, "name": "Loops", "items": [{"kind": "ChannelPLItem", "channel": 3, "pos": 0, "len": 1152, "offsets": [1000.0, 13000.0]},
                     {"kind": "ChannelPLItem", "channel": 3, "pos": 0, "len": 384, "offsets": [-1.0, -1.0], "flags": 8256}]},
+                {"iid": 7, "name": "Slowed", "items": [{"kind": "ChannelPLItem", "channel": 5, "pos": 0, "len": 4800, "offsets": [-1.0, -1.0]}]},
                 {"iid": 5, "name": "Beat x3", "items": [{"kind": "PatternPLItem", "pattern": 1, "pos": 0, "len": 1152}]},
                 {"iid": 6, "name": "Cut beat", "items": [{"kind": "PatternPLItem", "pattern": 2, "pos": 384, "len": 1536, "start_ticks": 1344, "end_ticks": 2880}]}
             ]}],
@@ -890,6 +933,24 @@ mod tests {
         let (a, b) = (&clips[0], &clips[1]);
         assert!((a.pos.to_seconds() - 2.0).abs() < 1e-6 && (a.src_in.to_seconds() - 7.0).abs() < 1e-6 && (a.len.to_seconds() - 1.0).abs() < 1e-6, "{a:?}");
         assert!((b.pos.to_seconds() - 3.0).abs() < 1e-6 && b.src_in == Ticks::ZERO && (b.len.to_seconds() - 2.0).abs() < 1e-6, "{b:?}");
+    }
+
+    /// A sampler with a fixed -1200 cent shift and no file span plays an
+    /// octave down AND at half speed: a varispeed copy, 30 s of file filling
+    /// 60 s -- A Top A Tower's intro beat, in miniature.
+    #[test]
+    fn a_pitch_shifted_sampler_plays_varispeed() {
+        let im = import(&inventory(), "demo", &probe).unwrap();
+        assert_eq!(im.varispeeds, vec![("vox.wav".to_string(), 0.5, "vox.varispeed-1200c.opus".to_string())]);
+        let t = im.project.tracks.iter().find(|t| t.name == "Slowed").unwrap();
+        let c = &im.project.track_clips(t.id)[0];
+        assert_eq!(im.project.sources[&c.source].path, "vox.varispeed-1200c.opus");
+        assert!((im.project.sources[&c.source].len.to_seconds() - 60.0).abs() < 1e-6, "30 s at half speed");
+        assert!((c.len.to_seconds() - 25.0).abs() < 1e-6, "the clip's own 4800 ticks (25 s at 120 BPM / 96 PPQ)");
+        assert!(im.report.iter().any(|r| r.contains("VARISPEED") && r.contains("x0.5000")), "{:?}", im.report);
+        // a channel whose pitch is AUTOMATED keeps native speed: its saved shift is automation state
+        assert!(!im.varispeeds.iter().any(|(f, _, _)| f == "kick.wav"), "{:?}", im.varispeeds);
+        assert!(im.report.iter().any(|r| r.contains("PITCH AUTOMATION not applied yet") && r.contains("Dive")), "{:?}", im.report);
     }
 
     #[test]
