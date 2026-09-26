@@ -62,6 +62,26 @@ pub struct Pitch {
 /// frame is too short for `lo_hz`'s period to fit, or when the CMND never
 /// dips below `threshold` anywhere in range — a frame with no periodic
 /// content at all, not merely a bad estimate.
+/// sum of (a[i] - b[i])^2 in eight independent lanes: one long chain of
+/// float adds cannot be reordered, so it cannot use SIMD; eight can (SSE /
+/// AVX / NEON). The difference function is YIN's whole cost -- run every 5 ms
+/// by every live autotune. Summation order differs from a single chain:
+/// float rounding only.
+#[inline]
+pub fn sq_diff_sum(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let mut acc = [0.0f32; 8];
+    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
+    let (ra, rb) = (ca.remainder(), cb.remainder());
+    for (x, y) in ca.zip(cb) {
+        for k in 0..8 { let d = x[k] - y[k]; acc[k] += d * d; }
+    }
+    let mut tail = 0.0f32;
+    for (x, y) in ra.iter().zip(rb) { let d = x - y; tail += d * d; }
+    acc.iter().sum::<f32>() + tail
+}
+
 pub fn yin_pitch(frame: &[f32], sample_rate: f32, lo_hz: f32, hi_hz: f32, threshold: f32) -> Option<Pitch> {
     let max_lag = (sample_rate / lo_hz.max(1.0)) as usize;
     let min_lag = ((sample_rate / hi_hz.max(1.0)) as usize).max(1);
@@ -73,12 +93,7 @@ pub fn yin_pitch(frame: &[f32], sample_rate: f32, lo_hz: f32, hi_hz: f32, thresh
     let mut d = vec![0.0f32; max_lag + 1];
     let usable = frame.len() - max_lag;
     for tau in 1..=max_lag {
-        let mut sum = 0.0f32;
-        for i in 0..usable {
-            let diff = frame[i] - frame[i + tau];
-            sum += diff * diff;
-        }
-        d[tau] = sum;
+        d[tau] = sq_diff_sum(&frame[..usable], &frame[tau..tau + usable]);
     }
 
     // Cumulative mean normalized difference: d(tau) scaled by tau over the
@@ -293,6 +308,18 @@ pub fn hop_ms(hop_frames: usize, sample_rate: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// The eight-lane sum is the plain sum of squared differences, to float
+    /// rounding, at every remainder length (0..7 past a multiple of eight).
+    #[test]
+    fn the_lane_sum_is_the_sum_of_squared_differences() {
+        let x: Vec<f32> = (0..300).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect();
+        for n in [0usize, 1, 7, 8, 9, 63, 64, 65, 250] {
+            let want: f64 = (0..n).map(|i| ((x[i] - x[i + 37]) as f64).powi(2)).sum();
+            let got = sq_diff_sum(&x[..n], &x[37..37 + n]) as f64;
+            assert!((got - want).abs() <= 1e-5 * want.max(1.0), "n {n}: {got} vs {want}");
+        }
+    }
+
     use super::*;
 
     fn sine(hz: f32, sr: f32, n: usize) -> Vec<f32> {

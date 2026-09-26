@@ -58,21 +58,24 @@ impl Imager {
         if n >= 3 { self.widths[n - 1] = 1.35; }   // air wider
     }
 
+    /// Mid is left alone; only side scales, per band. Everything here is
+    /// linear, so it runs in M/S: the MID's bands, untouched, sum to the
+    /// crossovers' allpass cascade (Splitter::through); only the SIDE is split
+    /// and weighted -- and when every band has the same width, the side is
+    /// that cascade times the width too. Was two full splits (L and R) per
+    /// sample: a third of Blue Moon's render, for four imagers.
     #[inline]
     pub fn process(&mut self, l: f32, r: f32) -> (f32, f32) {
-        let n = self.bands();
-        self.left.split(l, &mut self.scratch_l);
-        self.right.split(r, &mut self.scratch_r);
-        let (mut ol, mut or) = (0.0f32, 0.0f32);
-        for i in 0..n {
-            let (bl, br) = (self.scratch_l[i], self.scratch_r[i]);
-            // mid is left alone; only side scales. This is the whole design.
-            let mid = (bl + br) * 0.5;
-            let side = (bl - br) * 0.5 * self.widths[i].max(0.0);
-            ol += mid + side;
-            or += mid - side;
-        }
-        (ol, or)
+        let mid = self.left.through((l + r) * 0.5);
+        let s = (l - r) * 0.5;
+        let w0 = self.widths[0].max(0.0);
+        let side = if self.widths.iter().all(|w| w.max(0.0) == w0) {
+            w0 * self.right.through(s)
+        } else {
+            self.right.split(s, &mut self.scratch_r);
+            self.scratch_r.iter().zip(&self.widths).map(|(b, w)| b * w.max(0.0)).sum()
+        };
+        (mid + side, mid - side)
     }
 
     pub fn reset(&mut self) { self.left.reset(); self.right.reset(); }
@@ -125,6 +128,35 @@ pub fn band_correlation(imager: &mut Imager, left: &[f32], right: &[f32]) -> Vec
 
 #[cfg(test)]
 mod tests {
+    /// The M/S form returns what the original L/R form did -- both split,
+    /// per-band mid kept and side scaled, summed -- for per-band widths and
+    /// for equal ones, on independent noise in L and R.
+    #[test]
+    fn the_mid_side_form_equals_splitting_left_and_right() {
+        let mut st = 0x9E3779B9u32;
+        let mut rnd = || { st ^= st << 13; st ^= st >> 17; st ^= st << 5; (st as f32 / u32::MAX as f32) * 2.0 - 1.0 };
+        for widths in [vec![0.0f32, 1.0, 1.35], vec![1.0, 1.0, 1.0], vec![0.6, 0.6, 0.6], vec![2.0, 0.0, 0.5]] {
+            let freqs = [200.0f32, 4_000.0];
+            let mut im = Imager::new(48_000.0, &freqs);
+            im.widths = widths.clone();
+            let (mut sl, mut sr) = (Splitter::new(48_000.0, &freqs), Splitter::new(48_000.0, &freqs));
+            let (mut bl, mut br) = (vec![0.0; 3], vec![0.0; 3]);
+            let mut worst = 0.0f32;
+            for _ in 0..48_000 {
+                let (l, r) = (rnd(), rnd());
+                sl.split(l, &mut bl); sr.split(r, &mut br);
+                let (mut ol, mut or) = (0.0f32, 0.0f32);
+                for k in 0..3 {
+                    let (m, s) = ((bl[k] + br[k]) * 0.5, (bl[k] - br[k]) * 0.5 * widths[k]);
+                    ol += m + s; or += m - s;
+                }
+                let (nl, nr) = im.process(l, r);
+                worst = worst.max((nl - ol).abs()).max((nr - or).abs());
+            }
+            assert!(worst < 2e-4, "{widths:?}: {worst}");
+        }
+    }
+
     use super::*;
     use std::f32::consts::TAU;
 

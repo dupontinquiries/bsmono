@@ -99,9 +99,7 @@ fn refine_period(x: &[f32], coarse: f32) -> Option<f32> {
     if span < centre as usize { return None; }
     let diff = |l: isize| -> f32 {
         let l = l as usize;
-        let mut d = 0.0;
-        for i in 0..span { let t = x[i] - x[i + l]; d += t * t; }
-        d
+        crate::retune::sq_diff_sum(&x[..span], &x[l..l + span])
     };
     let mut best = lo;
     let mut best_d = f32::INFINITY;
@@ -372,7 +370,13 @@ impl RealtimeTune {
             *out = acc / DECIMATION as f32;
         }
         let dec_rate = self.sample_rate / DECIMATION as f32;
-        let detected = yin_pitch(dec, dec_rate, self.lo_hz, self.hi_hz.min(dec_rate * 0.4), 0.15)
+        // SILENCE skips the search: YIN cannot find a pitch in it (every
+        // difference 0, the normalized curve flat at 1, no dip), and a vocal
+        // bus is silent between phrases -- most of a song. Below -200 dB
+        // (mean square 1e-20), which only a filter's decaying ring reaches.
+        let energy: f32 = dec.iter().map(|v| v * v).sum();
+        let silent = energy <= 1e-20 * dec.len() as f32;
+        let detected = if silent { None } else { yin_pitch(dec, dec_rate, self.lo_hz, self.hi_hz.min(dec_rate * 0.4), 0.15) }
             .map(|p| crate::retune::Pitch {
                 hz: refine_period(&self.frame, self.sample_rate / p.hz)
                     .map(|period| self.sample_rate / period)
@@ -733,6 +737,15 @@ mod level_tests {
             eprintln!("CLICK {hz} Hz: output d2 {dy:.2e}, input {dx:.2e} ({:.2}x)", dy / dx);
             assert!(dy < 3.0 * dx, "{hz} Hz: output second difference {dy:.2e} vs input {dx:.2e} -- a click");
         }
+    }
+
+    /// The silence shortcut in `analyse` rests on this: YIN finds no pitch
+    /// in silence, so skipping it there changes nothing.
+    #[test]
+    fn yin_finds_no_pitch_in_silence() {
+        let dec_rate = 48_000.0 / DECIMATION as f32;
+        assert!(yin_pitch(&[0.0f32; 700], dec_rate, 70.0, 1_000.0, 0.15).is_none());
+        assert!(yin_pitch(&[1e-12f32; 700], dec_rate, 70.0, 1_000.0, 0.15).is_none(), "a DC floor either");
     }
 
     /// Records the measured loss per pitch (always passes; prints).
