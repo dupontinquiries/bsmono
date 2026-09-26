@@ -175,6 +175,7 @@ pub mod mesh_tri_regression;
 pub mod batch_mesh_tier;
 pub mod ridge_noise;
 pub mod strata;
+pub mod underground; // strata, ore veins, cave dressing, indicator plants: post-pass after both terrain backends
 pub mod terrace;
 pub mod terrain_warp;
 pub mod thermal_erosion;

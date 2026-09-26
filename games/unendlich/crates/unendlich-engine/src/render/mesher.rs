@@ -4838,11 +4838,16 @@ mod tests {
         // was ≥2×, but that was aspirational, not an invariant: greedy efficiency
         // depends on the chunk's block layout. The reference surface chunk
         // (seed 0xCAFE, ChunkCoord(0,1,0)) measures naive=25192 greedy=14284 — a
-        // 1.76× win. Assert a solid ≥1.5× reduction, which still catches greedy
-        // regressing toward the naive count without flaking on layout variance.
+        // 1.76× win. The underground pass (world::underground: rock strata, ore
+        // veins, moss, cave floors and dripstone) gives this chunk — y 32..63, mostly
+        // below the surface — more distinct block types on its cave walls, and
+        // distinct neighbours do not merge: it measures naive=26376 greedy=17693,
+        // 1.49×. That is a real cost of the variety (about +24% vertices here), not
+        // a greedy regression, so the bar is ≥1.4×, which still catches greedy
+        // sliding toward the naive count.
         if naive.vertex_count() > 1000 {
-            assert!(greedy.vertex_count() * 3 < naive.vertex_count() * 2,
-                "greedy on surface chunk should be ≥1.5× win: naive={}, greedy={}",
+            assert!(greedy.vertex_count() * 7 < naive.vertex_count() * 5,
+                "greedy on surface chunk should be ≥1.4× win: naive={}, greedy={}",
                 naive.vertex_count(), greedy.vertex_count());
         }
     }
