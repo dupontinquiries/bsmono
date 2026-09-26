@@ -67,6 +67,9 @@ pub enum GameAction {
     /// so the F4 wind arrow visibly tilts up where fires were placed.
     /// Will be replaced by proper inventory + flint-and-steel later.
     LightFire,
+    /// Throw the weapon in hand (an axe, a dagger, a spear, the Flying Sword);
+    /// with it already out, call it back. Middle mouse or `X` by default.
+    ThrowItem,
 }
 
 #[derive(Debug, Clone)]
@@ -272,7 +275,10 @@ impl KeyBindings {
         b.insert(GameAction::ToggleThirdPerson, Key::F5);
         b.insert(GameAction::ToggleCinematicCam, Key::Y);
         b.insert(GameAction::Bend, Key::B); // r528: rebindable bending cast (hold)
+        // X is free in every preset (no movement cluster uses it).
+        b.insert(GameAction::ThrowItem, Key::X);
         let mut kb = Self::from_single_key_map(b);
+        kb.bind_mouse(GameAction::ThrowItem, MouseButton::Middle);
         // `I` stays as a secondary alias for the inventory (P is primary).
         kb.add_key(GameAction::OpenInventory, Key::I);
         kb

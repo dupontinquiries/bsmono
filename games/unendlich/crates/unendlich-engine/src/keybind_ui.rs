@@ -38,6 +38,7 @@ pub fn rebindable_actions() -> &'static [(GameAction, &'static str)] {
         (ToggleThirdPerson, "Third-Person View"),
         (ToggleCinematicCam, "Cinematic Camera"),
         (Bend, "Bending (hold to cast)"),
+        (ThrowItem, "Throw / Recall Weapon"),
         (Screenshot, "Screenshot"),
         (ToggleFullscreen, "Toggle Fullscreen"),
     ]
