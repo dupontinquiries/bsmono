@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 mod curves;
+pub mod journal;
 mod grouping;
 pub use grouping::GroupTangle;
 pub use curves::{Binding, Curve, Gate, Opening, Response, Sweep};
