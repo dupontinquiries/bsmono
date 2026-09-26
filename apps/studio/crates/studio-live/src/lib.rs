@@ -93,6 +93,12 @@ impl Tempo {
 /// What a channel is playing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SynthKind {
+    /// A compact POLY synth: everything generated, nothing sampled -- a patch
+    /// is ~60 bytes where a sample-library synth is gigabytes. Built for the
+    /// imports first (a plugin synth's part becomes notes + a patch instead of
+    /// a sine), and for a phone, where 50 GB of library is not an option.
+    /// `hz` is the pitch at the pattern's origin, retuned per note like `Sine`.
+    Poly { hz: f32, patch: PolyPatch },
     /// A plain sine — always available, so a rack is playable with no plugins.
     Sine { hz: f32 },
     /// A one-shot sample from a project source (the classic drum rack channel).
@@ -225,6 +231,13 @@ pub struct Channel {
     /// cut, and which one "wins" would otherwise be channel-order trivia.
     #[serde(default)]
     pub choke_group: Option<u8>,
+    /// A ONE-SHOT sampler plays its whole sample from each hit -- a note's
+    /// length does not cut it, only its choke group does. FL's sampler does
+    /// this with its envelope off (Goat's 808s: 0.17 s notes on 1.38 s
+    /// samples, ringing in full). `false` (Studio's own default, and every
+    /// older rack): the note's gate is the sample's window.
+    #[serde(default)]
+    pub one_shot: bool,
 }
 
 /// A pattern: for each channel, which steps fire.
@@ -289,11 +302,18 @@ pub struct StepMod {
     /// other bar," "the 3rd of 4." `None` (the common case) fires on every
     /// pass, subject to `prob`.
     pub every: Option<(u8, u8)>,
+    /// MICRO-TIMING: where the hit sits relative to its step, as a fraction of
+    /// a step, -0.5..0.5 (0 = on the grid). An FL hit between 16ths -- a 32nd,
+    /// a triplet, a part played in by hand -- keeps its place instead of being
+    /// snapped (Balance's lead: 209 of 237 notes off the grid, heard as the
+    /// loop "just off beat"). `serde(default)`: older racks are on the grid.
+    #[serde(default)]
+    pub nudge: f32,
 }
 
 impl Default for StepMod {
     fn default() -> StepMod {
-        StepMod { vel: 1.0, ratchet: 1, tune: 0, slide: false, prob: 1.0, every: None }
+        StepMod { vel: 1.0, ratchet: 1, tune: 0, slide: false, prob: 1.0, every: None, nudge: 0.0 }
     }
 }
 
@@ -326,6 +346,11 @@ pub struct Note {
     /// property, which is where FL puts it. A channel's first roll note
     /// ignores it, same as [`StepMod::slide`].
     pub slide: bool,
+    /// MICRO-TIMING, as [`StepMod::nudge`]: the note starts this fraction of a
+    /// step after (or before) `start`. Two notes on one key within one step
+    /// (a 32nd pair, a triplet) are two notes: identity is (start, nudge, key).
+    #[serde(default)]
+    pub nudge: f32,
 }
 
 /// The order an arpeggio runs its chord in.
@@ -471,9 +496,9 @@ impl Pattern {
     pub fn add_note(&mut self, ch: usize, mut n: Note) {
         n.len = n.len.max(1);
         let notes = self.rolls.entry(ch).or_default();
-        notes.retain(|m| !(m.start == n.start && m.key == n.key));
+        notes.retain(|m| !(m.start == n.start && m.key == n.key && m.nudge == n.nudge));
         notes.push(n);
-        notes.sort_by_key(|m| (m.start, m.key));
+        notes.sort_by(|a, b| (a.start, a.key).cmp(&(b.start, b.key)).then(a.nudge.total_cmp(&b.nudge)));
     }
     /// Remove the note at (start, key). Returns whether one was there. An
     /// emptied channel drops its map entry, keeping `rolls` sparse the way
@@ -510,6 +535,18 @@ impl Pattern {
     pub fn start_vel(&self, ch: usize, start: u32) -> Option<f32> {
         self.roll(ch).iter().filter(|n| n.start == start)
             .map(|n| n.vel).fold(None, |a, v| Some(a.map_or(v, |m: f32| m.max(v))))
+    }
+    /// Move the note at (start, key) to (to_start, to_key), keeping its
+    /// length, velocity and slide. A note already at the destination is
+    /// REPLACED (`add_note`'s rule: one placement, one note). Returns whether
+    /// there was a note to move. One edit for a drag-and-drop, not a remove
+    /// and an add a collaborator could see half of.
+    pub fn move_note(&mut self, ch: usize, start: u32, key: i8, to_start: u32, to_key: i8) -> bool {
+        let Some(n) = self.roll(ch).iter().copied().find(|m| m.start == start && m.key == key) else { return false };
+        if (to_start, to_key) == (start, key) { return true; }
+        self.remove_note(ch, start, key);
+        self.add_note(ch, Note { start: to_start, key: to_key, ..n });
+        true
     }
     /// Flip the slide flag of the note at (start, key).
     pub fn toggle_note_slide(&mut self, ch: usize, start: u32, key: i8) {
@@ -589,7 +626,7 @@ impl Pattern {
             let mut i = 0;
             while t < span {
                 let len = note_len.min(span - t);
-                self.add_note(ch, Note { key: keys[i % keys.len()], start: start + t, len, vel, slide: false });
+                self.add_note(ch, Note { key: keys[i % keys.len()], start: start + t, len, vel, slide: false, nudge: 0.0 });
                 t += note_len;
                 i += 1;
             }
@@ -697,7 +734,7 @@ impl Rack {
     /// a broken one. 140 BPM, light swing, an 808 that slides.
     pub fn trap_kit() -> Rack {
         let ch = |name: &str, kind: SynthKind, gain: f32| Channel {
-            name: name.into(), kind, gain, pan: 0.0, muted: false, choke_group: None,
+            name: name.into(), kind, gain, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         };
         let channels = vec![
             ch("808",   SynthKind::Sub { note: 0, glide_from: None, glide_ms: 70.0,
@@ -751,6 +788,10 @@ pub trait Synth {
     /// wants to ring longer is cut off, which is the caller's decision.
     fn render(&mut self, kind: &SynthKind, rate: u32, out: &mut [f32]);
 
+    /// How long `kind` naturally sounds at `rate`, if the synth knows (a
+    /// sampler: its sample) -- what a one-shot hit's window is.
+    fn natural_len(&self, _kind: &SynthKind, _rate: u32) -> Option<usize> { None }
+
     /// Render with a GATE, for a piano-roll note: the tonal kinds — `Sub`
     /// and `Sine` — sustain while `hold` samples last and release into the
     /// rest of `out`; everything else delegates to [`Synth::render`],
@@ -763,6 +804,7 @@ pub trait Synth {
                 sub_voice(*note, *glide_from, *glide_ms, *drive, *decay_ms,
                           rate, out, Some(hold.min(out.len())));
             }
+            SynthKind::Poly { hz, patch } => poly_voice(*hz, patch, rate, out, Some(hold.min(out.len()))),
             SynthKind::Sine { hz } => {
                 let hold = hold.min(out.len()).max(1);
                 let attack = (rate as usize / 500).max(1).min(hold);
@@ -787,6 +829,316 @@ pub trait Synth {
     }
 }
 
+/// A Poly patch. Every field a number: small on the wire, diffable, and
+/// editable as knobs.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PolyPatch {
+    /// 0 sine, 1 triangle, 2 saw, 3 square (saw and square band-limited).
+    pub wave: u8,
+    /// Unison voices, 1..=7, spread over `detune` cents.
+    pub voices: u8,
+    pub detune: f32,
+    /// A sine an octave down, 0..=1.
+    pub sub: f32,
+    pub attack_ms: f32,
+    pub decay_ms: f32,
+    /// 0..=1
+    pub sustain: f32,
+    pub release_ms: f32,
+    /// Low-pass cutoff (Hz) and resonance (0..=1).
+    pub cutoff: f32,
+    pub resonance: f32,
+    /// How far the amp envelope opens the filter, in octaves.
+    pub env_amount: f32,
+    /// Vibrato depth, cents (5 Hz).
+    pub vibrato: f32,
+    pub gain: f32,
+    /// TEXTURE (c20): a HARMONIC PROFILE -- the level of harmonics 1..=16,
+    /// 0..=255. All zero: `wave` is the oscillator. Otherwise each note builds
+    /// one band-limited cycle from these and plays it: the timbre, in 16 bytes,
+    /// and FITTABLE from a render (studio-app's synth_fit).
+    #[serde(default)]
+    pub partials: [u8; 16],
+    /// A noise layer (air, breath, grit), 0..=1, through the same filter.
+    #[serde(default)]
+    pub noise: f32,
+    /// 2-operator FM: the modulator at `fm_ratio` x the note, depth `fm_index`
+    /// (radians) -- metallic and bell edges. 0 = off.
+    #[serde(default)]
+    pub fm_ratio: f32,
+    #[serde(default)]
+    pub fm_index: f32,
+    /// Saturation before the filter, 0..=1 -- thickness.
+    #[serde(default)]
+    pub drive: f32,
+    /// IMAGE (c20): the unison voices spread across left..right, 0..=1 --
+    /// detuned copies, decorrelated: out of the listener's skull.
+    #[serde(default)]
+    pub width: f32,
+    /// How much of `width` survives BELOW ~250 Hz, 0..=1: 0 folds the lows
+    /// toward mono, 1 keeps them as wide (and as out of phase) as the rest --
+    /// the artist's wide textural bass "tapers closer on the low but still out
+    /// of phase": a lever, not a rule.
+    #[serde(default)]
+    pub low_width: f32,
+    /// Pan by pitch: -1..=1 of pan per OCTAVE from middle C (FL Keys' own
+    /// behaviour -- low notes one side, high the other).
+    #[serde(default)]
+    pub key_pan: f32,
+    /// Stereo TRAVEL: the note's pan moves, `pan_lfo_depth` (0..=1) at
+    /// `pan_lfo_hz` -- the bowed-violin drift from left-centre to the right.
+    #[serde(default)]
+    pub pan_lfo_hz: f32,
+    #[serde(default)]
+    pub pan_lfo_depth: f32,
+    /// PHASE, 0..=1: mid traded for side at constant power -- 0 changes
+    /// nothing; toward 1 the L/R correlation goes NEGATIVE (the artist's
+    /// mids read -0.05..-0.48 in Blue Moon; a mono render reads +1: "inside
+    /// my skull"); at 1 it is pure side, out of phase, and CANCELS in mono --
+    /// the headphones-vs-mono trade the artist makes deliberately. Needs
+    /// width (a side to boost).
+    #[serde(default)]
+    pub phase: f32,
+    /// A PAN ENVELOPE per trigger: the note starts at `pan_start` and drifts
+    /// to `pan_end` over `pan_time_ms` (-1..=1) -- Blue Moon's element swings
+    /// right at each onset and back to centre over ~1.5 s, repeating with the
+    /// triggers: in the sound, not a free-running LFO. Both 0: centred.
+    #[serde(default)]
+    pub pan_start: f32,
+    #[serde(default)]
+    pub pan_end: f32,
+    #[serde(default)]
+    pub pan_time_ms: f32,
+    /// BODY (c20): three resonances at FIXED frequencies (Hz, gain dB, shared
+    /// Q) -- a violin's air and wood modes, its bridge hill: the part of an
+    /// acoustic timbre that does NOT move with the note (the harmonic profile
+    /// does). 0 Hz = off.
+    #[serde(default)]
+    pub body_hz: [f32; 3],
+    #[serde(default)]
+    pub body_db: [f32; 3],
+    #[serde(default)]
+    pub body_q: f32,
+    /// Vibrato that ARRIVES: it fades in over 300 ms after this delay (a
+    /// player's held note), at `vib_rate` Hz (0 = 5 Hz).
+    #[serde(default)]
+    pub vib_delay_ms: f32,
+    #[serde(default)]
+    pub vib_rate: f32,
+    /// Each unison voice WANDERS, slowly, this many cents -- players are not
+    /// a fixed detune.
+    #[serde(default)]
+    pub drift: f32,
+    /// Bow / breath noise through the body, strongest at the attack.
+    #[serde(default)]
+    pub bow_noise: f32,
+}
+
+/// An RBJ peaking biquad (the body's resonances).
+#[derive(Clone, Copy)]
+struct Peak { b0: f32, b1: f32, b2: f32, a1: f32, a2: f32, z1: f32, z2: f32 }
+impl Peak {
+    fn new(f: f32, db: f32, q: f32, rate: f32) -> Peak {
+        let a = 10f32.powf(db / 40.0);
+        let w = std::f32::consts::TAU * f.clamp(20.0, 0.45 * rate) / rate;
+        let al = w.sin() / (2.0 * q.max(0.3));
+        let a0 = 1.0 + al / a;
+        Peak { b0: (1.0 + al * a) / a0, b1: -2.0 * w.cos() / a0, b2: (1.0 - al * a) / a0, a1: -2.0 * w.cos() / a0, a2: (1.0 - al / a) / a0, z1: 0.0, z2: 0.0 }
+    }
+    fn run(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        y
+    }
+}
+
+impl Default for PolyPatch {
+    fn default() -> PolyPatch {
+        PolyPatch { wave: 2, voices: 2, detune: 8.0, sub: 0.0, attack_ms: 5.0, decay_ms: 300.0, sustain: 0.7, release_ms: 250.0,
+                    cutoff: 3000.0, resonance: 0.2, env_amount: 1.0, vibrato: 0.0, gain: 0.5,
+                    partials: [0; 16], noise: 0.0, fm_ratio: 0.0, fm_index: 0.0, drive: 0.0,
+                    width: 0.0, low_width: 1.0, key_pan: 0.0, pan_lfo_hz: 0.0, pan_lfo_depth: 0.0,
+                    phase: 0.0, pan_start: 0.0, pan_end: 0.0, pan_time_ms: 0.0,
+                    body_hz: [0.0; 3], body_db: [0.0; 3], body_q: 0.0, vib_delay_ms: 0.0, vib_rate: 0.0, drift: 0.0, bow_noise: 0.0 }
+    }
+}
+
+/// PolyBLEP: the correction that band-limits a naive saw/square edge.
+fn poly_blep(t: f32, dt: f32) -> f32 {
+    if t < dt { let x = t / dt; x + x - x * x - 1.0 }
+    else if t > 1.0 - dt { let x = (t - 1.0) / dt; x * x + x + x + 1.0 }
+    else { 0.0 }
+}
+
+/// Render one Poly note into `out`: held for `hold` samples (the gate), then
+/// released; `None` = a hit (the gate closes after attack + decay).
+pub fn poly_voice(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], hold: Option<usize>) {
+    // the MONO voice is the stereo one folded: for a centred, un-widened patch
+    // (L = R = x / sqrt2) this is exactly the old mono voice
+    let mut r = vec![0.0f32; out.len()];
+    poly_voice_st(hz, p, rate, out, &mut r, hold);
+    for (l, r) in out.iter_mut().zip(&r) { *l = (*l + r) * std::f32::consts::FRAC_1_SQRT_2; }
+}
+
+/// Constant-power gains for pan `x` in -1..=1: (left, right), each 1/sqrt2 at 0.
+pub fn pan_gains(x: f32) -> (f32, f32) {
+    let a = (x.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
+    (a.cos(), a.sin())
+}
+
+/// A Poly note in STEREO: unison voices spread by `width`, the whole note
+/// panned by `key_pan` (octaves from middle C) and moved by the pan LFO, the
+/// side signal's lows kept by `low_width`.
+pub fn poly_voice_st(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], out_r: &mut [f32], hold: Option<usize>) {
+    let r = rate as f32;
+    let ms = |x: f32| ((x.max(0.0) * 0.001 * r) as usize).max(1);
+    let (att, dec, rel) = (ms(p.attack_ms), ms(p.decay_ms), ms(p.release_ms));
+    let gate = hold.unwrap_or(att + dec).min(out.len());
+    let voices = p.voices.clamp(1, 7) as usize;
+    let mut phase: Vec<f32> = (0..voices).map(|k| (k as f32 * 0.618_034).fract()).collect();
+    let spread = |k: usize| if voices == 1 { 0.0 } else { (k as f32 / (voices - 1) as f32 - 0.5) * p.detune };
+    let mut sub_phase = 0.0f32;
+    // TPT state-variable low-pass
+    let (mut ic1, mut ic2) = (0.0f32, 0.0f32);
+    let k_res = 2.0 - 1.9 * p.resonance.clamp(0.0, 1.0);
+    let norm = 1.0 / (voices as f32).sqrt();
+    let mut level_at_gate = 0.0f32;
+    // the additive cycle, if the patch has a harmonic profile: harmonics above
+    // ~0.45 x the rate are left out (band-limited for THIS note), peak -> 1
+    const TABLE: usize = 2048;
+    let table: Option<Vec<f32>> = if p.partials.iter().any(|a| *a > 0) {
+        let mut t = vec![0.0f32; TABLE];
+        for (k, a) in p.partials.iter().enumerate() {
+            let h = (k + 1) as f32;
+            if *a == 0 || h * hz > 0.45 * r { continue; }
+            let amp = *a as f32 / 255.0;
+            for (i, v) in t.iter_mut().enumerate() { *v += amp * (std::f32::consts::TAU * h * i as f32 / TABLE as f32).sin(); }
+        }
+        let peak = t.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+        for v in t.iter_mut() { *v /= peak; }
+        Some(t)
+    } else { None };
+    let read = |t: &[f32], ph: f32| { let x = ph.rem_euclid(1.0) * TABLE as f32; let i = x as usize % TABLE; let f = x - x.floor();
+                                     t[i] * (1.0 - f) + t[(i + 1) % TABLE] * f };
+    let mut fm_phase = 0.0f32;
+    // stereo: each unison voice's pan, and a second filter state
+    let width = p.width.clamp(0.0, 1.0);
+    let vpan: Vec<(f32, f32)> = (0..voices).map(|k| pan_gains(if voices == 1 { 0.0 } else { (k as f32 / (voices - 1) as f32 * 2.0 - 1.0) * width })).collect();
+    let (mut jc1, mut jc2) = (0.0f32, 0.0f32);
+    let note_pan = (p.key_pan * (hz / 261.63).log2()).clamp(-1.0, 1.0);
+    let side_hp = (-std::f32::consts::TAU * 250.0 / r).exp(); // one-pole: side's lows
+    let mut side_lp = 0.0f32;
+    let mk_body = || -> Vec<Peak> { (0..3).filter(|k| p.body_hz[*k] > 0.0 && p.body_db[*k] != 0.0)
+        .map(|k| Peak::new(p.body_hz[k], p.body_db[k], if p.body_q > 0.0 { p.body_q } else { 4.0 }, r)).collect() };
+    let (mut body_l, mut body_r) = (mk_body(), mk_body());
+    let vib_hz = if p.vib_rate > 0.0 { p.vib_rate } else { 5.0 };
+    let mut noise_state = 0x2545_f491_u32;
+    let drive_k = 1.0 + p.drive.clamp(0.0, 1.0) * 4.0;
+    for (i, s) in out.iter_mut().enumerate() {
+        // envelope
+        let env = if i < gate {
+            let e = if i < att { i as f32 / att as f32 }
+                    else { let d = (i - att) as f32 / dec as f32; p.sustain + (1.0 - p.sustain) * (1.0 - d.min(1.0)).powi(2) };
+            level_at_gate = e;
+            e
+        } else {
+            let d = (i - gate) as f32 / rel as f32;
+            if d >= 1.0 { 0.0 } else { level_at_gate * (1.0 - d).powi(2) }
+        };
+        let t = i as f32 / r;
+        let vib_amt = if p.vib_delay_ms > 0.0 { ((t - p.vib_delay_ms * 0.001) / 0.3).clamp(0.0, 1.0) } else { 1.0 };
+        let vib = if p.vibrato > 0.0 { 2f32.powf(p.vibrato * vib_amt / 1200.0 * (t * vib_hz * std::f32::consts::TAU).sin()) } else { 1.0 };
+        let (mut x, mut xr) = (0.0f32, 0.0f32);
+        let fm = if p.fm_index > 0.0 && p.fm_ratio > 0.0 {
+            let m = p.fm_index * (fm_phase * std::f32::consts::TAU).sin();
+            fm_phase = (fm_phase + hz * p.fm_ratio / r).fract();
+            m / std::f32::consts::TAU
+        } else { 0.0 };
+        for (k, ph) in phase.iter_mut().enumerate() {
+            let wander = if p.drift > 0.0 { p.drift * (t * (0.13 + 0.07 * k as f32) * std::f32::consts::TAU + k as f32 * 1.7).sin() } else { 0.0 };
+            let f = hz * vib * 2f32.powf((spread(k) + wander) / 1200.0);
+            let dt = (f / r).min(0.49);
+            let v = if let Some(t) = &table { read(t, *ph + fm) } else if fm != 0.0 { (((*ph + fm) * std::f32::consts::TAU).sin()) } else { match p.wave {
+                0 => (*ph * std::f32::consts::TAU).sin(),
+                1 => 1.0 - 4.0 * (*ph - 0.5).abs(),
+                3 => { let sq = if *ph < 0.5 { 1.0 } else { -1.0 }; sq + poly_blep(*ph, dt) - poly_blep((*ph + 0.5).fract(), dt) }
+                _ => 2.0 * *ph - 1.0 - poly_blep(*ph, dt),
+            } };
+            x += v * vpan[k].0;
+            xr += v * vpan[k].1;
+            *ph = (*ph + dt).fract();
+        }
+        x *= norm;
+        xr *= norm;
+        let c = std::f32::consts::FRAC_1_SQRT_2; // centred content, as a centred voice
+        if p.sub > 0.0 {
+            let v = p.sub * (sub_phase * std::f32::consts::TAU).sin();
+            x += v * c; xr += v * c;
+            sub_phase = (sub_phase + hz * 0.5 / r).fract();
+        }
+        if p.noise > 0.0 {
+            noise_state ^= noise_state << 13; noise_state ^= noise_state >> 17; noise_state ^= noise_state << 5;
+            let v = p.noise * (noise_state as f32 / u32::MAX as f32 * 2.0 - 1.0);
+            x += v * c; xr += v * c;
+        }
+        if p.bow_noise > 0.0 {
+            noise_state ^= noise_state << 13; noise_state ^= noise_state >> 17; noise_state ^= noise_state << 5;
+            let v = p.bow_noise * (1.0 + 2.0 * (-t / 0.08).exp()) * (noise_state as f32 / u32::MAX as f32 * 2.0 - 1.0);
+            x += v * c; xr += v * c;
+        }
+        if p.drive > 0.0 {
+            let k = drive_k * std::f32::consts::SQRT_2;
+            // /tanh(drive_k), not /tanh(k): the fold (L+R)/sqrt2 stays exactly the old mono voice
+            x = (x * k).tanh() / drive_k.tanh() * c; xr = (xr * k).tanh() / drive_k.tanh() * c;
+        }
+        // filter, opened by the envelope
+        let fc = (p.cutoff * 2f32.powf(p.env_amount * env)).clamp(20.0, 0.45 * r);
+        let g = (std::f32::consts::PI * fc / r).tan();
+        let a1 = 1.0 / (1.0 + g * (g + k_res));
+        let v1 = a1 * (ic1 + g * (x - ic2));
+        let v2 = ic2 + g * v1;
+        ic1 = 2.0 * v1 - ic1;
+        ic2 = 2.0 * v2 - ic2;
+        let w1 = a1 * (jc1 + g * (xr - jc2));
+        let w2 = jc2 + g * w1;
+        jc1 = 2.0 * w1 - jc1;
+        jc2 = 2.0 * w2 - jc2;
+        let (mut l, mut rr) = (v2 * env * p.gain, w2 * env * p.gain);
+        for b in body_l.iter_mut() { l = b.run(l); }
+        for b in body_r.iter_mut() { rr = b.run(rr); }
+        // the side's LOWS, kept by low_width
+        if p.low_width < 1.0 {
+            let (m, side) = ((l + rr) * 0.5, (l - rr) * 0.5);
+            side_lp = side_hp * side_lp + (1.0 - side_hp) * side;
+            let side2 = side - (1.0 - p.low_width.clamp(0.0, 1.0)) * side_lp;
+            l = m + side2; rr = m - side2;
+        }
+        // PHASE: mid traded for side, constant power (a = 1 - phase, b = 1 + phase)
+        if p.phase > 0.0 {
+            let ph = p.phase.clamp(0.0, 1.0);
+            let (a, b) = (1.0 - ph, 1.0 + ph);
+            let k = (2.0 / (a * a + b * b)).sqrt();
+            let (m, sd) = ((l + rr) * 0.5, (l - rr) * 0.5);
+            let (m2, s2) = (m * a * k, sd * b * k);
+            l = m2 + s2; rr = m2 - s2;
+        }
+        // the note's pan: by key, the per-trigger envelope, the LFO -- a balance
+        let env_pan = if p.pan_time_ms > 0.0 {
+            let u = (i as f32 / (p.pan_time_ms * 0.001 * r)).min(1.0);
+            p.pan_start + (p.pan_end - p.pan_start) * u
+        } else { p.pan_start };
+        let pan = (note_pan + env_pan + p.pan_lfo_depth * (std::f32::consts::TAU * p.pan_lfo_hz * i as f32 / r).sin()).clamp(-1.0, 1.0);
+        if pan != 0.0 {
+            let (gl, gr) = pan_gains(pan);
+            let k = std::f32::consts::SQRT_2;
+            l *= gl * k; rr *= gr * k;
+        }
+        *s = l;
+        out_r[i] = rr;
+    }
+}
+
 /// The always-available synth: sine tones and sample playback. A rack made only
 /// of these needs no plugins at all, which is what keeps a project openable.
 pub struct BuiltinSynth<'a> {
@@ -794,8 +1146,14 @@ pub struct BuiltinSynth<'a> {
 }
 
 impl Synth for BuiltinSynth<'_> {
+    fn natural_len(&self, kind: &SynthKind, rate: u32) -> Option<usize> {
+        let SynthKind::Sampler { source } = kind else { return None };
+        let a = self.sources.get(source)?;
+        Some((a.frames() as u64 * rate as u64 / a.sample_rate.max(1) as u64) as usize)
+    }
     fn render(&mut self, kind: &SynthKind, rate: u32, out: &mut [f32]) {
         match kind {
+            SynthKind::Poly { hz, patch } => poly_voice(*hz, patch, rate, out, None),
             SynthKind::Sine { hz } => {
                 // a short percussive envelope, so a step reads as a hit rather
                 // than a drone that never stops
@@ -1069,6 +1427,7 @@ pub fn apply_step_mod(kind: &SynthKind, m: &StepMod, prev_note: Option<i8>) -> S
             decay_ms: *decay_ms,
         },
         SynthKind::Sine { hz } => SynthKind::Sine { hz: hz * 2f32.powf(m.tune as f32 / 12.0) },
+        SynthKind::Poly { hz, patch } => SynthKind::Poly { hz: hz * 2f32.powf(m.tune as f32 / 12.0), patch: *patch },
         // The roll's key and the step's tune fold into the transpose, so
         // a host's sf2 engine reads ONE number: the semitones above the
         // roll's origin (`studio_core::KEY_ZERO_MIDI`) to play. Before
@@ -1104,6 +1463,13 @@ fn strip_glide(kind: &SynthKind) -> SynthKind {
     }
 }
 
+/// A grid position moved by a step fraction (clamped to +-0.5, and never
+/// before the pattern's first sample).
+fn nudged(at: usize, nudge: f32, step: usize) -> usize {
+    if nudge == 0.0 { return at; }
+    (at as i64 + (nudge.clamp(-0.5, 0.5) as f64 * step as f64).round() as i64).max(0) as usize
+}
+
 /// Render a pattern to mono samples — the bounce that turns a rack into a clip.
 ///
 /// `pass` is which loop iteration this bounce represents (0 for a one-shot
@@ -1124,6 +1490,22 @@ pub fn render_pattern(
     rate: u32,
     pass: u32,
 ) -> Vec<f32> {
+    // the MONO render is the stereo one folded -- for centred, un-widened
+    // voices exactly the renderer as it was (L = R = v / sqrt2)
+    let (l, r) = render_pattern_stereo(pattern, rack, synth, tempo, rate, pass);
+    l.iter().zip(&r).map(|(a, b)| (a + b) * std::f32::consts::FRAC_1_SQRT_2).collect()
+}
+
+/// The pattern in STEREO: each voice at its channel's pan (constant power); a
+/// Poly voice rendered in stereo itself (width, pan by key, travel).
+pub fn render_pattern_stereo(
+    pattern: &Pattern,
+    rack: &Rack,
+    synth: &mut dyn Synth,
+    tempo: &Tempo,
+    rate: u32,
+    pass: u32,
+) -> (Vec<f32>, Vec<f32>) {
     let step = tempo.step_len().to_samples(rate).max(1) as usize;
     let total = step * pattern.steps as usize;
     let mut out = vec![0.0f32; total];
@@ -1141,6 +1523,8 @@ pub fn render_pattern(
     // are cut.
     struct Placed {
         at: usize,
+        /// The channel's pan, -1..=1 (constant power in the stereo render).
+        pan: f32,
         kind: SynthKind,
         amp: f32,
         group: Option<u8>,
@@ -1199,14 +1583,19 @@ pub fn render_pattern(
         // output — the grid's pitch lane stops being a documented no-op for
         // sample channels.
         let pitch = if matches!(ch.kind, SynthKind::Sampler { .. }) { m.tune } else { 0 };
+        // a ONE-SHOT hit rings its whole sample (repitched: consumed faster up)
+        let hit_window = if ch.one_shot {
+            synth.natural_len(&ch.kind, rate).map(|n| ((n as f64 / 2f64.powf(pitch as f64 / 12.0)) as usize).max(1)).unwrap_or(voice_len)
+        } else { voice_len };
         for r in 0..ratchet {
             let this_kind = if r == 0 { kind.clone() } else { strip_glide(&kind) };
             placed.push(Placed {
-                at: step_i as usize * step + swing + r * sub_step,
+                pan: ch.pan,
+                at: nudged(step_i as usize * step + swing + r * sub_step, m.nudge, step),
                 kind: this_kind,
                 amp: ch.gain * m.vel,
                 group: ch.choke_group,
-                window: voice_len,
+                window: hit_window,
                 gate: false,
                 hold: None,
                 pitch,
@@ -1248,15 +1637,31 @@ pub fn render_pattern(
                     (gate_len + tail, Some(gate_len))
                 }
                 SynthKind::Sine { .. } => (gate_len + rate as usize / 8, Some(gate_len)),
+                // HELD, then released past the gate with its own release. Missing
+                // until c20: a Poly roll note fell to `_` -- placed as a HIT and
+                // cut dead at its gate, so a pad never sustained past attack +
+                // decay and no release tail ever sounded (every synth score
+                // measured before this was of truncated notes).
+                SynthKind::Poly { patch, .. } => {
+                    let tail = ((patch.release_ms.max(1.0) * 1.5 / 1000.0) * rate as f32) as usize;
+                    (gate_len + tail, Some(gate_len))
+                }
+                // a ONE-SHOT sampler's note: the whole sample, whatever its length
+                SynthKind::Sampler { .. } if ch.one_shot => {
+                    let n = synth.natural_len(&ch.kind, rate).map(|n| ((n as f64 / 2f64.powf(pitch as f64 / 12.0)) as usize).max(1));
+                    (n.unwrap_or(gate_len), None)
+                }
                 _ => (gate_len, None),
             };
             placed.push(Placed {
-                at: n.start as usize * step + swing,
+                pan: ch.pan,
+                at: nudged(n.start as usize * step + swing, n.nudge, step),
                 kind,
                 amp: ch.gain * n.vel.clamp(0.0, 1.0),
                 group: ch.choke_group,
                 window,
-                gate: true,
+                // a one-shot's end is its sample's, not a musical decision: no gate fade
+                gate: !(ch.one_shot && matches!(ch.kind, SynthKind::Sampler { .. })),
                 hold,
                 pitch,
             });
@@ -1268,7 +1673,9 @@ pub fn render_pattern(
     // placement knows the answer.
     let scratch_len = placed.iter().map(|p| p.window).max().unwrap_or(voice_len).max(1);
     let mut scratch = vec![0.0f32; scratch_len];
+    let mut scratch_r = vec![0.0f32; scratch_len];
     let mut pitched = vec![0.0f32; scratch_len];
+    let mut out_r = vec![0.0f32; out.len()];
 
     // Every group's hit-start list, sorted, so "when does the group fire
     // next" is a partition-point lookup per voice.
@@ -1310,10 +1717,18 @@ pub fn render_pattern(
         // the longest voice in the pattern happened to be.
         let sw = p.window.min(scratch.len());
         scratch[..sw].fill(0.0);
-        match p.hold {
-            Some(h) => synth.render_gated(&p.kind, rate, &mut scratch[..sw], h.min(sw)),
-            None => synth.render(&p.kind, rate, &mut scratch[..sw]),
-        }
+        // a Poly voice renders its own stereo; everything else mono, then panned
+        let stereo_voice = if let SynthKind::Poly { hz, patch } = &p.kind {
+            scratch_r[..sw].fill(0.0);
+            poly_voice_st(*hz, patch, rate, &mut scratch[..sw], &mut scratch_r[..sw], p.hold.map(|h| h.min(sw)));
+            true
+        } else {
+            match p.hold {
+                Some(h) => synth.render_gated(&p.kind, rate, &mut scratch[..sw], h.min(sw)),
+                None => synth.render(&p.kind, rate, &mut scratch[..sw]),
+            }
+            false
+        };
         let voice: &[f32] = if p.pitch != 0 {
             // Repitch by reading the rendered voice at a fractional rate —
             // up consumes the material sooner (silence after), down means
@@ -1333,17 +1748,27 @@ pub fn render_pattern(
             &scratch[..sw]
         };
         let choked = allowed < natural;
+        let (gl, gr) = pan_gains(p.pan);
         for (i, v) in voice[..allowed.min(sw)].iter().enumerate() {
-            let mut v = *v;
+            let mut k = p.amp;
             if (choked || p.gate) && allowed >= fade && i >= allowed - fade {
                 // Linear ramp over the last ~2ms before the cut: choke's cut
                 // and a note's gate must not click.
-                v *= (allowed - i) as f32 / fade as f32;
+                k *= (allowed - i) as f32 / fade as f32;
             }
-            out[p.at + i] += v * p.amp;
+            if stereo_voice {
+                // already stereo (centred = 1/sqrt2 each side): the channel pan
+                // as a balance on it
+                let s2 = std::f32::consts::SQRT_2;
+                out[p.at + i] += v * k * gl * s2;
+                out_r[p.at + i] += scratch_r[i] * k * gr * s2;
+            } else {
+                out[p.at + i] += v * k * gl;
+                out_r[p.at + i] += v * k * gr;
+            }
         }
     }
-    out
+    (out, out_r)
 }
 
 /// The ops that land a pattern's render onto the timeline as a clip —
@@ -1477,17 +1902,29 @@ impl Recorder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_moved_note_keeps_its_length_velocity_and_slide_and_replaces_what_it_lands_on() {
+        let mut p = Pattern::new("m", 16, 1);
+        p.add_note(0, Note { key: 3, start: 2, len: 4, vel: 0.4, slide: true, nudge: 0.0 });
+        p.add_note(0, Note { key: 5, start: 8, len: 1, vel: 1.0, slide: false, nudge: 0.0 });
+        assert!(p.move_note(0, 2, 3, 8, 5));
+        assert_eq!(p.roll(0), &[Note { key: 5, start: 8, len: 4, vel: 0.4, slide: true, nudge: 0.0 }]);
+        assert!(!p.move_note(0, 2, 3, 0, 0), "nothing left at the old place");
+        assert!(p.move_note(0, 8, 5, 8, 5), "a move to where it is, is a no-op that found the note");
+        assert_eq!(p.roll(0).len(), 1);
+    }
+
     use super::*;
     use studio_core::{ClipId, Op, SourceId, TrackId};
 
     fn rack() -> Rack {
         Rack {
             channels: vec![
-                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
-                Channel { name: "hat".into(), kind: SynthKind::Sine { hz: 8000.0 }, gain: 0.6, pan: 0.0, muted: false, choke_group: None },
+                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false },
+                Channel { name: "hat".into(), kind: SynthKind::Sine { hz: 8000.0 }, gain: 0.6, pan: 0.0, muted: false, choke_group: None, one_shot: false },
                 Channel { name: "beatspace".into(),
                           kind: SynthKind::Beatspace { z: [0.1, -0.4, 0.0], crossfade: 0.5 },
-                          gain: 1.0, pan: 0.0, muted: false, choke_group: None },
+                          gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false },
             ],
             patterns: vec![],
             tempo_bpm: 120.0, swing: 0.0, ..Default::default() }
@@ -1835,7 +2272,7 @@ mod tests {
         rack.channels.push(Channel {
             name: "808".into(),
             kind: SynthKind::Sub { note: -5, glide_from: None, glide_ms: 0.0, drive: 0.3, decay_ms: 300.0 },
-            gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         });
         let mut pattern = Pattern::new("beat", 16, rack.channels.len());
         pattern.toggle(3, 0); // the new 808 channel, on step 0
@@ -1859,12 +2296,12 @@ mod tests {
         rack.channels.push(Channel {
             name: "piano".into(),
             kind: SynthKind::Sf2 { path: "/nowhere.sf2".into(), bank: 0, preset: 0, transpose: 12 },
-            gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         });
         let ch = rack.channels.len() - 1;
         let mut pattern = Pattern::new("keys", 16, rack.channels.len());
-        pattern.add_note(ch, Note { key: 3, start: 0, len: 4, vel: 0.9, slide: false });  // C2 on the roll
-        pattern.add_note(ch, Note { key: 7, start: 4, len: 4, vel: 0.9, slide: false });  // E2
+        pattern.add_note(ch, Note { key: 3, start: 0, len: 4, vel: 0.9, slide: false, nudge: 0.0 });  // C2 on the roll
+        pattern.add_note(ch, Note { key: 7, start: 4, len: 4, vel: 0.9, slide: false, nudge: 0.0 });  // E2
         pattern.toggle(ch, 8);
         pattern.set_mod(ch, 8, StepMod { tune: -5, ..StepMod::default() });                  // a step hit, tuned
         let tempo = Tempo { bpm: 120.0, steps_per_beat: 4, swing: 0.0 };
@@ -2024,7 +2461,7 @@ mod tests {
             channels: vec![Channel {
                 name: "808".into(),
                 kind: SynthKind::Sub { note: 0, glide_from: None, glide_ms: 30.0, drive: 0.0, decay_ms: 2000.0 },
-                gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
             }],
             patterns: vec![], tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
         let mut pattern = Pattern::new("beat", 16, 1);
@@ -2267,7 +2704,7 @@ mod trap_tests {
             channels: vec![Channel { name: "hat".into(),
                 kind: SynthKind::Drum { voice: DrumVoice::HatClosed, tone: 0.5,
                                         decay_ms: 40.0, tune: 0 },
-                gain: 1.0, pan: 0.0, muted: false, choke_group: None }],
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false }],
             patterns: vec![], tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
         let mut p = Pattern::new("A", 4, 1);
         p.set(0, 0, true);
@@ -2347,7 +2784,7 @@ mod import_tests {
         let ch = rack.add_channel(Channel {
             name: "snap".into(),
             kind: SynthKind::Sampler { source: studio_core::SourceId(7) },
-            gain: 0.9, pan: 0.0, muted: false, choke_group: None,
+            gain: 0.9, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         });
         for p in &rack.patterns {
             assert_eq!(p.rows.len(), rack.channels.len(), "'{}' kept up", p.name);
@@ -2386,7 +2823,7 @@ mod choke_tests {
         let ch = |name: &str, voice: DrumVoice, decay: f32, grp: Option<u8>| Channel {
             name: name.into(),
             kind: SynthKind::Drum { voice, tone: 0.5, decay_ms: decay, tune: 0 },
-            gain: 1.0, pan: 0.0, muted: false, choke_group: grp,
+            gain: 1.0, pan: 0.0, muted: false, choke_group: grp, one_shot: false,
         };
         Rack {
             channels: vec![
@@ -2495,7 +2932,7 @@ mod choke_tests {
 mod roll_tests {
     use super::*;
 
-    fn note(key: i8, start: u32, len: u32) -> Note { Note { key, start, len, vel: 0.8, slide: false } }
+    fn note(key: i8, start: u32, len: u32) -> Note { Note { key, start, len, vel: 0.8, slide: false, nudge: 0.0 } }
 
     #[test]
     fn harmonize_adds_the_interval_in_key_and_never_stacks() {
@@ -2560,7 +2997,7 @@ mod roll_tests {
             channels: vec![Channel {
                 name: "808".into(),
                 kind: SynthKind::Sub { note: 12, glide_from: None, glide_ms, drive: 0.0, decay_ms },
-                gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
             }],
             patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0, ..Default::default() }
     }
@@ -2587,7 +3024,7 @@ mod roll_tests {
         // 808 must stop at 2 steps, faded, not ring out its whole decay.
         let rack = sub_rack(2000.0, 0.0);
         let mut p = Pattern::new("A", 6, 1);
-        p.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false });
+        p.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
         let (out, step) = render(&rack, &p);
         let sounding = energy(&out, 0, step);
         let after = energy(&out, step * 3, step * 4);
@@ -2602,7 +3039,7 @@ mod roll_tests {
         // also pins the scratch buffer actually growing past `voice_len`.
         let rack = sub_rack(2000.0, 0.0);
         let mut held = Pattern::new("held", 8, 1);
-        held.add_note(0, Note { key: 0, start: 0, len: 8, vel: 1.0, slide: false });
+        held.add_note(0, Note { key: 0, start: 0, len: 8, vel: 1.0, slide: false, nudge: 0.0 });
         let mut hit = Pattern::new("hit", 8, 1);
         hit.set(0, 0, true);
         let (held_out, step) = render(&rack, &held);
@@ -2620,12 +3057,12 @@ mod roll_tests {
         // must layer, not interact. Compared sample-for-sample, not by energy.
         let rack = sub_rack(400.0, 0.0);
         let mut chord = Pattern::new("chord", 4, 1);
-        chord.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false });
-        chord.add_note(0, Note { key: 7, start: 0, len: 2, vel: 1.0, slide: false });
+        chord.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
+        chord.add_note(0, Note { key: 7, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
         let mut root = Pattern::new("root", 4, 1);
-        root.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false });
+        root.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
         let mut fifth = Pattern::new("fifth", 4, 1);
-        fifth.add_note(0, Note { key: 7, start: 0, len: 2, vel: 1.0, slide: false });
+        fifth.add_note(0, Note { key: 7, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
         let (c, _) = render(&rack, &chord);
         let (r, _) = render(&rack, &root);
         let (f, _) = render(&rack, &fifth);
@@ -2643,8 +3080,8 @@ mod roll_tests {
         // instrument-blind yardstick the realtune tests use.
         let rack = sub_rack(2000.0, 200.0);
         let mut slid = Pattern::new("slide", 4, 1);
-        slid.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false });
-        slid.add_note(0, Note { key: 12, start: 2, len: 2, vel: 1.0, slide: true });
+        slid.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
+        slid.add_note(0, Note { key: 12, start: 2, len: 2, vel: 1.0, slide: true, nudge: 0.0 });
         let mut plain = slid.clone();
         plain.toggle_note_slide(0, 2, 12);
         let (s, step) = render(&rack, &slid);
@@ -2664,10 +3101,10 @@ mod roll_tests {
         rack.channels.push(Channel {
             name: "hat".into(),
             kind: SynthKind::Drum { voice: DrumVoice::HatClosed, tone: 0.5, decay_ms: 80.0, tune: 0 },
-            gain: 1.0, pan: 0.0, muted: false, choke_group: Some(1),
+            gain: 1.0, pan: 0.0, muted: false, choke_group: Some(1), one_shot: false,
         });
         let mut cut = Pattern::new("cut", 8, 2);
-        cut.add_note(0, Note { key: 0, start: 0, len: 8, vel: 1.0, slide: false });
+        cut.add_note(0, Note { key: 0, start: 0, len: 8, vel: 1.0, slide: false, nudge: 0.0 });
         cut.set(1, 2, true);
         let mut free = cut.clone();
         free.set(1, 2, false);
@@ -2686,7 +3123,7 @@ mod roll_tests {
         // but survives, so shorten-then-lengthen round-trips.
         let rack = sub_rack(400.0, 0.0);
         let mut p = Pattern::new("A", 16, 1);
-        p.add_note(0, Note { key: 0, start: 12, len: 2, vel: 1.0, slide: false });
+        p.add_note(0, Note { key: 0, start: 12, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
         p.steps = 8;
         let (short, _) = render(&rack, &p);
         assert!(short.iter().all(|s| s.abs() < 1e-6), "a hidden note renders nothing");
@@ -2699,13 +3136,13 @@ mod roll_tests {
     #[test]
     fn adding_at_the_same_start_and_key_replaces_rather_than_stacks() {
         let mut p = Pattern::new("A", 16, 1);
-        p.add_note(0, Note { key: 0, start: 0, len: 1, vel: 1.0, slide: false });
-        p.add_note(0, Note { key: 0, start: 0, len: 4, vel: 0.5, slide: false });
+        p.add_note(0, Note { key: 0, start: 0, len: 1, vel: 1.0, slide: false, nudge: 0.0 });
+        p.add_note(0, Note { key: 0, start: 0, len: 4, vel: 0.5, slide: false, nudge: 0.0 });
         assert_eq!(p.roll(0).len(), 1, "one intention, one note");
         assert_eq!(p.roll(0)[0].len, 4);
         assert!((p.roll(0)[0].vel - 0.5).abs() < 1e-6);
         // A different key at the same start is a chord, not a replacement.
-        p.add_note(0, Note { key: 7, start: 0, len: 1, vel: 1.0, slide: false });
+        p.add_note(0, Note { key: 7, start: 0, len: 1, vel: 1.0, slide: false, nudge: 0.0 });
         assert_eq!(p.roll(0).len(), 2);
         // And removing the last note drops the channel's entry entirely,
         // keeping `rolls` sparse the way `set_mod` keeps `mods` sparse.
@@ -2727,6 +3164,71 @@ mod roll_tests {
     }
 
     #[test]
+    fn a_nudged_hit_and_a_nudged_note_start_off_the_grid() {
+        // a click (one sample at 1.0) as the sample, so a voice's start is
+        // the index of its first nonzero sample
+        let mut click = vec![0.0f32; 4_800];
+        click[0] = 1.0;
+        let mut sources = std::collections::BTreeMap::new();
+        sources.insert(studio_core::SourceId(1), SourceAudio { sample_rate: 48_000, channels: vec![click] });
+        let rack = Rack {
+            channels: vec![Channel { name: "hat".into(), kind: SynthKind::Sampler { source: studio_core::SourceId(1) },
+                                     gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false }],
+            patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
+        let mut synth = BuiltinSynth { sources: &sources };
+        let step = rack.tempo().step_len().to_samples(48_000) as usize; // 6000 at 120 BPM
+        let mut starts = |p: &Pattern| -> Vec<usize> {
+            let out = render_pattern(p, &rack, &mut synth, &rack.tempo(), 48_000, 0);
+            (0..out.len()).filter(|&i| out[i].abs() > 0.1 && (i == 0 || out[i - 1].abs() <= 0.1)).collect()
+        };
+        let mut p = Pattern::new("t", 16, 1);
+        p.set(0, 2, true);
+        p.set_mod(0, 2, StepMod { nudge: 1.0 / 3.0, ..Default::default() });
+        p.set(0, 5, true);
+        p.set_mod(0, 5, StepMod { nudge: -0.25, ..Default::default() });
+        p.add_note(0, Note { key: 0, start: 8, len: 1, vel: 1.0, slide: false, nudge: 0.5 });
+        assert_eq!(starts(&p), vec![2 * step + step / 3, 5 * step - step / 4, 8 * step + step / 2]);
+        // before the first sample: clamped to it, not wrapped or dropped
+        let mut q = Pattern::new("t", 16, 1);
+        q.set(0, 0, true);
+        q.set_mod(0, 0, StepMod { nudge: -0.5, ..Default::default() });
+        assert_eq!(starts(&q), vec![0]);
+        // a 32nd pair on ONE key in ONE step: two notes, both heard
+        let mut r = Pattern::new("t", 16, 1);
+        r.add_note(0, Note { key: 0, start: 4, len: 1, vel: 1.0, slide: false, nudge: 0.0 });
+        r.add_note(0, Note { key: 0, start: 4, len: 1, vel: 1.0, slide: false, nudge: 0.5 });
+        assert_eq!(r.roll(0).len(), 2);
+        assert_eq!(starts(&r), vec![4 * step, 4 * step + step / 2]);
+    }
+
+    #[test]
+    fn one_shot_note_rings_its_whole_sample_and_a_gated_one_does_not() {
+        // a 1 s tone, a 1-step note (125 ms at 120 BPM): gated, silent after
+        // the step; ONE-SHOT, still ringing at 0.5 s -- FL's sampler, envelope off
+        let tone: Vec<f32> = (0..48_000).map(|i| (i as f32 / 48_000.0 * 110.0 * std::f32::consts::TAU).sin()).collect();
+        let mut sources = std::collections::BTreeMap::new();
+        sources.insert(studio_core::SourceId(1), SourceAudio { sample_rate: 48_000, channels: vec![tone] });
+        let rack_with = |one_shot: bool| Rack {
+            channels: vec![Channel { name: "808".into(), kind: SynthKind::Sampler { source: studio_core::SourceId(1) },
+                                     gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot }],
+            patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
+        let mut p = Pattern::new("808", 16, 1);
+        p.add_note(0, Note { key: 0, start: 0, len: 1, vel: 1.0, slide: false, nudge: 0.0 });
+        let mut synth = BuiltinSynth { sources: &sources };
+        let (g, o) = (rack_with(false), rack_with(true));
+        let gated = render_pattern(&p, &g, &mut synth, &g.tempo(), 48_000, 0);
+        let shot = render_pattern(&p, &o, &mut synth, &o.tempo(), 48_000, 0);
+        let e = |v: &[f32], a: usize, b: usize| v[a..b.min(v.len())].iter().map(|x| x * x).sum::<f32>();
+        assert!(e(&gated, 12_000, 30_000) < 1e-6, "gated: silent past the note");
+        assert!(e(&shot, 22_000, 26_000) > 100.0, "one-shot: still ringing at 0.5 s");
+        // and a STEP hit (normally 4 steps, 0.5 s) rings the whole second too
+        let mut s = Pattern::new("808 step", 16, 1);
+        s.set(0, 0, true);
+        let hit = render_pattern(&s, &o, &mut synth, &o.tempo(), 48_000, 0);
+        assert!(e(&hit, 36_000, 44_000) > 100.0, "a one-shot step hit is not capped at four steps");
+    }
+
+    #[test]
     fn a_sampler_roll_note_plays_the_chop_at_pitch() {
         // +12 semitones reads the rendered voice twice as fast — roughly
         // double the zero crossings in the note window. This is what makes
@@ -2741,14 +3243,14 @@ mod roll_tests {
             channels: vec![Channel {
                 name: "chop".into(),
                 kind: SynthKind::Sampler { source: studio_core::SourceId(1) },
-                gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
             }],
             patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
         let t = rack.tempo();
         let mut up = Pattern::new("up", 4, 1);
-        up.add_note(0, Note { key: 12, start: 0, len: 2, vel: 1.0, slide: false });
+        up.add_note(0, Note { key: 12, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
         let mut flat = Pattern::new("flat", 4, 1);
-        flat.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false });
+        flat.add_note(0, Note { key: 0, start: 0, len: 2, vel: 1.0, slide: false, nudge: 0.0 });
         let mut synth = BuiltinSynth { sources: &sources };
         let u = render_pattern(&up, &rack, &mut synth, &t, 48_000, 0);
         let f = render_pattern(&flat, &rack, &mut synth, &t, 48_000, 0);
@@ -2772,7 +3274,7 @@ mod roll_tests {
             channels: vec![Channel {
                 name: "chop".into(),
                 kind: SynthKind::Sampler { source: studio_core::SourceId(1) },
-                gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
             }],
             patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
         let t = rack.tempo();
@@ -2837,7 +3339,7 @@ mod gated_synth_tests {
             name: "808".into(),
             kind: SynthKind::Sub { note: 0, glide_from: None, glide_ms: 0.0,
                                    drive: 0.0, decay_ms },
-            gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         }];
         for p in &mut r.patterns { p.rows = vec![0]; p.mods.clear(); p.rolls.clear(); }
         r
@@ -2857,7 +3359,7 @@ mod gated_synth_tests {
         // release.
         let rack = sub_rack_decay(120.0);
         let mut p = Pattern::new("hold", 8, 1);
-        p.add_note(0, Note { key: 0, start: 0, len: 6, vel: 1.0, slide: false });
+        p.add_note(0, Note { key: 0, start: 0, len: 6, vel: 1.0, slide: false, nudge: 0.0 });
         let sources = std::collections::BTreeMap::new();
         let mut synth = BuiltinSynth { sources: &sources };
         let tempo = rack.tempo();
@@ -2874,6 +3376,29 @@ mod gated_synth_tests {
     }
 
     #[test]
+    fn a_held_poly_note_sustains_then_releases_past_its_gate() {
+        let mut rack = Rack::trap_kit();
+        rack.channels[0].kind = SynthKind::Poly { hz: 220.0, patch: PolyPatch { wave: 0, voices: 1, attack_ms: 20.0, decay_ms: 50.0,
+            sustain: 0.8, release_ms: 300.0, cutoff: 20_000.0, env_amount: 0.0, gain: 1.0, ..Default::default() } };
+        rack.channels[0].choke_group = None;
+        let mut p = Pattern::new("pad", 16, rack.channels.len());
+        p.add_note(0, Note { key: 0, start: 0, len: 6, vel: 1.0, slide: false, nudge: 0.0 });
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let tempo = rack.tempo();
+        let out = render_pattern(&p, &rack, &mut synth, &tempo, 48_000, 0);
+        let step = tempo.step_len().to_samples(48_000).max(1) as usize;
+        let early = rms(&out, step / 2, step);
+        let late = rms(&out, step * 5, step * 11 / 2);
+        assert!(late > early * 0.7, "HELD: step-5 {late} vs step-0 {early}");
+        let rel = (0.3 * 48_000.0) as usize;
+        let just_after = rms(&out, step * 6 + rel / 10, step * 6 + rel / 5);
+        assert!(just_after > early * 0.1, "the RELEASE sounds past the gate: {just_after} vs {early}");
+        let end = (step * 6 + rel + rel / 5).min(out.len().saturating_sub(10));
+        assert!(rms(&out, end, (end + rel / 5).min(out.len())) < early * 0.01, "and reaches silence");
+    }
+
+    #[test]
     fn the_rolls_key_is_the_synths_pitch() {
         // key +12 through the tune mod must land exactly an octave up —
         // pinned by zero-crossing count over the sustained region, where
@@ -2881,7 +3406,7 @@ mod gated_synth_tests {
         let rack = sub_rack_decay(200.0);
         let zc_of = |key: i8| {
             let mut p = Pattern::new("k", 8, 1);
-            p.add_note(0, Note { key, start: 0, len: 8, vel: 1.0, slide: false });
+            p.add_note(0, Note { key, start: 0, len: 8, vel: 1.0, slide: false, nudge: 0.0 });
             let sources = std::collections::BTreeMap::new();
         let mut synth = BuiltinSynth { sources: &sources };
             let tempo = rack.tempo();
@@ -3004,5 +3529,187 @@ mod rhythm_tests {
         // And the downbeat rule holds regardless of who is asking.
         assert_eq!(t.swing_delay_samples_at(0, 48_000, 1.0), 0,
             "even steps are never moved, whatever the channel wants");
+    }
+}
+
+#[cfg(test)]
+mod poly_tests {
+    use super::*;
+
+    fn zero_crossings(v: &[f32]) -> usize { v.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count() }
+
+    #[test]
+    fn a_poly_sine_plays_at_pitch_and_its_envelope_holds_then_releases() {
+        let p = PolyPatch { wave: 0, voices: 1, detune: 0.0, sub: 0.0, attack_ms: 1.0, decay_ms: 10.0, sustain: 1.0, release_ms: 100.0,
+                            cutoff: 20000.0, resonance: 0.0, env_amount: 0.0, vibrato: 0.0, gain: 1.0, ..Default::default() };
+        let mut out = vec![0.0f32; 48_000];
+        poly_voice(220.0, &p, 48_000, &mut out, Some(24_000));
+        let held = &out[1000..23_000];
+        let hz = zero_crossings(held) as f32 / (held.len() as f32 / 48_000.0);
+        assert!((hz - 220.0).abs() < 2.0, "pitch {hz}");
+        let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+        assert!(rms(&out[20_000..23_000]) > 0.6, "sustained while held");
+        assert!(rms(&out[30_000..]).abs() < 1e-6, "silent after the 100 ms release");
+        assert!(out.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn the_filter_darkens_a_saw_and_unison_widens_nothing_it_should_not() {
+        let bright = PolyPatch { cutoff: 18_000.0, env_amount: 0.0, voices: 1, ..Default::default() };
+        let dark = PolyPatch { cutoff: 300.0, ..bright };
+        let (mut a, mut b) = (vec![0.0f32; 24_000], vec![0.0f32; 24_000]);
+        poly_voice(220.0, &bright, 48_000, &mut a, Some(20_000));
+        poly_voice(220.0, &dark, 48_000, &mut b, Some(20_000));
+        // high-frequency energy: the first difference
+        let hf = |v: &[f32]| v.windows(2).skip(2000).take(15_000).map(|w| (w[1] - w[0]).powi(2)).sum::<f32>();
+        assert!(hf(&b) < 0.1 * hf(&a), "a 300 Hz cutoff removes most of the saw's highs: {} vs {}", hf(&b), hf(&a));
+    }
+
+    /// Goertzel magnitude of `f` in `v` (for the texture tests).
+    fn mag(v: &[f32], f: f32, rate: f32) -> f32 {
+        let w = std::f32::consts::TAU * f / rate;
+        let (c, mut s1, mut s2) = (2.0 * w.cos(), 0.0f32, 0.0f32);
+        for x in v { let s0 = x + c * s1 - s2; s2 = s1; s1 = s0; }
+        (s1 * s1 + s2 * s2 - c * s1 * s2).sqrt() / v.len() as f32
+    }
+
+    /// A harmonic profile IS the timbre: 1 : 0.5 at harmonics 1 and 3 comes out
+    /// with the 3rd at half the 1st, the 2nd absent -- and an all-zero profile
+    /// leaves the old oscillator alone.
+    #[test]
+    fn a_harmonic_profile_sets_the_timbre() {
+        let mut partials = [0u8; 16];
+        partials[0] = 255; partials[2] = 128;
+        let p = PolyPatch { voices: 1, detune: 0.0, attack_ms: 1.0, sustain: 1.0, cutoff: 20_000.0, env_amount: 0.0, gain: 1.0, partials, ..Default::default() };
+        let mut out = vec![0.0f32; 48_000];
+        poly_voice(200.0, &p, 48_000, &mut out, Some(40_000));
+        let body = &out[4_800..38_400];
+        let (h1, h2, h3) = (mag(body, 200.0, 48_000.0), mag(body, 400.0, 48_000.0), mag(body, 600.0, 48_000.0));
+        assert!((h3 / h1 - 0.5).abs() < 0.08, "3rd at half the 1st: {}", h3 / h1);
+        assert!(h2 / h1 < 0.05, "no 2nd: {}", h2 / h1);
+    }
+
+    #[test]
+    fn noise_fm_and_drive_add_what_they_say() {
+        let base = PolyPatch { wave: 0, voices: 1, detune: 0.0, attack_ms: 1.0, sustain: 1.0, cutoff: 20_000.0, env_amount: 0.0, gain: 1.0, ..Default::default() };
+        let render = |p: &PolyPatch| { let mut o = vec![0.0f32; 24_000]; poly_voice(220.0, p, 48_000, &mut o, Some(20_000)); o };
+        let hf = |v: &[f32]| v.windows(2).skip(2000).take(15_000).map(|w| (w[1] - w[0]).powi(2)).sum::<f32>();
+        let (plain, noisy) = (render(&base), render(&PolyPatch { noise: 0.3, ..base }));
+        assert!(hf(&noisy) > 5.0 * hf(&plain), "noise adds highs");
+        let fm = render(&PolyPatch { fm_ratio: 2.0, fm_index: 2.0, ..base });
+        let body = &fm[2_000..18_000];
+        assert!(mag(body, 220.0 * 3.0, 48_000.0) > 5.0 * mag(&plain[2_000..18_000], 660.0, 48_000.0), "FM makes a sideband at 220 + 2x220");
+        let driven = render(&PolyPatch { drive: 1.0, ..base });
+        assert!(mag(&driven[2_000..18_000], 660.0, 48_000.0) > 5.0 * mag(&plain[2_000..18_000], 660.0, 48_000.0), "drive makes a 3rd harmonic");
+    }
+
+    fn st(hz: f32, p: &PolyPatch, n: usize) -> (Vec<f32>, Vec<f32>) {
+        let (mut l, mut r) = (vec![0.0f32; n], vec![0.0f32; n]);
+        poly_voice_st(hz, p, 48_000, &mut l, &mut r, Some(n * 3 / 4));
+        (l, r)
+    }
+    fn e(v: &[f32]) -> f32 { v.iter().map(|x| x * x).sum::<f32>() }
+
+    /// IMAGE: width 0 is centred (L = R); width spreads the unison voices so
+    /// the SIDE carries energy; pan by key sends a note two octaves up to the
+    /// right; travel moves the balance over the note; low_width 0 empties the
+    /// side's lows.
+    #[test]
+    fn width_key_pan_travel_and_low_width_shape_the_image() {
+        let base = PolyPatch { wave: 2, voices: 5, detune: 14.0, attack_ms: 5.0, sustain: 1.0, cutoff: 8000.0, env_amount: 0.0, gain: 1.0, ..Default::default() };
+        let (l, r) = st(220.0, &base, 24_000);
+        assert!(l.iter().zip(&r).all(|(a, b)| (a - b).abs() < 1e-6), "width 0: centred");
+        let (l, r) = st(220.0, &PolyPatch { width: 1.0, ..base }, 24_000);
+        let side: Vec<f32> = l.iter().zip(&r).map(|(a, b)| a - b).collect();
+        let mid: Vec<f32> = l.iter().zip(&r).map(|(a, b)| a + b).collect();
+        assert!(e(&side) > 0.05 * e(&mid), "wide: the side carries energy ({} vs {})", e(&side), e(&mid));
+        let (l, r) = st(1046.5, &PolyPatch { key_pan: 0.5, ..base }, 24_000);
+        assert!(e(&r) > 3.0 * e(&l), "two octaves above middle C, key_pan 0.5/oct: right");
+        let (l, r) = st(220.0, &PolyPatch { pan_lfo_hz: 1.0, pan_lfo_depth: 0.8, ..base }, 48_000);
+        let bal = |a: usize, b: usize| (e(&r[a..b]) - e(&l[a..b])) / (e(&r[a..b]) + e(&l[a..b]));
+        assert!(bal(9_000, 15_000) - bal(33_000, 39_000) > 0.5, "travel: right at 1/4 s, left at 3/4 s");
+        // low_width: a wide LOW note -- the side's energy mostly gone at 0
+        let low = PolyPatch { width: 1.0, wave: 0, cutoff: 400.0, ..base };
+        let side_of = |p: &PolyPatch| { let (l, r) = st(80.0, p, 24_000); e(&l.iter().zip(&r).map(|(a, b)| a - b).collect::<Vec<_>>()) };
+        assert!(side_of(&PolyPatch { low_width: 0.0, ..low }) < 0.3 * side_of(&PolyPatch { low_width: 1.0, ..low }), "the lows fold toward mono");
+    }
+
+    fn corr(l: &[f32], r: &[f32]) -> f32 {
+        let (a, b, c) = l.iter().zip(r).fold((0.0f32, 0.0f32, 0.0f32), |(a, b, c), (x, y)| (a + x * y, b + x * x, c + y * y));
+        a / (b * c).sqrt().max(1e-12)
+    }
+
+    /// PHASE pushes a wide note's L/R correlation below zero (at 0 it is
+    /// untouched); the PAN ENVELOPE starts the note where it says and drifts
+    /// to where it says.
+    #[test]
+    fn phase_goes_below_zero_and_the_pan_envelope_travels() {
+        let wide = PolyPatch { wave: 2, voices: 5, detune: 14.0, attack_ms: 5.0, sustain: 1.0, cutoff: 8000.0, env_amount: 0.0, gain: 1.0, width: 1.0, ..Default::default() };
+        let (l0, r0) = st(330.0, &wide, 24_000);
+        let (l1, r1) = st(330.0, &PolyPatch { phase: 0.8, ..wide }, 24_000);
+        assert!(corr(&l0[2000..], &r0[2000..]) > corr(&l1[2000..], &r1[2000..]) + 0.3, "phase lowers the correlation");
+        assert!(corr(&l1[2000..], &r1[2000..]) < -0.3, "below zero: {}", corr(&l1[2000..], &r1[2000..]));
+        let (l2, r2) = st(330.0, &PolyPatch { phase: 0.0, ..wide }, 24_000);
+        assert_eq!((l0, r0), (l2, r2), "phase 0 changes nothing");
+        let travel = PolyPatch { pan_start: 0.8, pan_end: -0.2, pan_time_ms: 400.0, ..PolyPatch { width: 0.0, ..wide } };
+        let (l, r) = st(330.0, &travel, 36_000);
+        let bal = |a: usize, b: usize| (e(&r[a..b]) - e(&l[a..b])) / (e(&r[a..b]) + e(&l[a..b]));
+        assert!(bal(500, 2_000) > 0.6, "starts right: {}", bal(500, 2_000));
+        assert!(bal(24_000, 26_000) < -0.1, "ends left of centre: {}", bal(24_000, 26_000));
+    }
+
+    /// A BODY resonance is fixed in Hz: +12 dB at 1 kHz lifts the harmonic
+    /// NEAREST 1 kHz whatever the note (the 5th of 200 Hz, the 4th of 250 Hz),
+    /// relative to the same note without it; with no body, nothing changes.
+    #[test]
+    fn a_body_resonance_stays_at_its_frequency_across_notes() {
+        let saw = PolyPatch { wave: 2, voices: 1, detune: 0.0, attack_ms: 2.0, sustain: 1.0, cutoff: 20_000.0, env_amount: 0.0, gain: 1.0, ..Default::default() };
+        let body = PolyPatch { body_hz: [1000.0, 0.0, 0.0], body_db: [12.0, 0.0, 0.0], body_q: 6.0, ..saw };
+        for (hz, near) in [(200.0f32, 5.0f32), (250.0, 4.0)] {
+            let (a, _) = st(hz, &saw, 24_000);
+            let (b, _) = st(hz, &body, 24_000);
+            let m = |v: &[f32], f: f32| mag(&v[4_000..20_000], f, 48_000.0);
+            let lift = |k: f32| m(&b, hz * k) / m(&a, hz * k);
+            assert!(lift(near) > 2.5, "{hz} Hz: harmonic {near} (~1 kHz) lifted x{}", lift(near));
+            assert!(lift(1.0) < 1.3, "{hz} Hz: the fundamental is not: x{}", lift(1.0));
+        }
+        let (a, _) = st(220.0, &saw, 12_000);
+        let (b, _) = st(220.0, &PolyPatch { body_q: 5.0, ..saw }, 12_000);
+        assert_eq!(a, b, "no resonance set: identity");
+    }
+
+    /// Vibrato that ARRIVES: none in the first 200 ms of a 400 ms-delayed
+    /// vibrato, plenty after 700 ms.
+    #[test]
+    fn a_delayed_vibrato_arrives() {
+        let p = PolyPatch { wave: 0, voices: 1, detune: 0.0, attack_ms: 2.0, sustain: 1.0, cutoff: 20_000.0, env_amount: 0.0, gain: 1.0,
+                            vibrato: 60.0, vib_delay_ms: 400.0, vib_rate: 6.0, ..Default::default() };
+        let (l, _) = st(440.0, &p, 60_000);
+        // instantaneous frequency spread via zero-crossing intervals
+        let spread = |a: usize, b: usize| {
+            let z: Vec<usize> = (a..b).filter(|i| l[*i - 1] <= 0.0 && l[*i] > 0.0).collect();
+            let d: Vec<f32> = z.windows(2).map(|w| (w[1] - w[0]) as f32).collect();
+            d.iter().cloned().fold(0.0, f32::max) - d.iter().cloned().fold(f32::MAX, f32::min)
+        };
+        assert!(spread(1_000, 9_600) <= 1.0, "steady before the delay: {}", spread(1_000, 9_600));
+        assert!(spread(34_000, 44_000) >= 2.0, "vibrato after it: {}", spread(34_000, 44_000));
+    }
+
+    /// The mono voice is the stereo one folded: for a centred patch the fold
+    /// is exactly L * sqrt2 (L = R).
+    #[test]
+    fn the_mono_voice_is_the_centred_stereo_one_folded() {
+        let p = PolyPatch { voices: 3, drive: 0.5, sub: 0.3, noise: 0.05, ..Default::default() };
+        let mut m = vec![0.0f32; 12_000];
+        poly_voice(220.0, &p, 48_000, &mut m, Some(9_000));
+        let (l, _) = st(220.0, &p, 12_000);
+        assert!(m.iter().zip(&l).all(|(a, b)| (a - b * std::f32::consts::SQRT_2).abs() < 1e-4));
+    }
+
+    #[test]
+    fn a_note_retunes_a_poly_like_a_sine() {
+        let k = SynthKind::Poly { hz: 261.63, patch: PolyPatch::default() };
+        let m = StepMod { tune: 12, ..Default::default() };
+        match apply_step_mod(&k, &m, None) { SynthKind::Poly { hz, .. } => assert!((hz - 523.26).abs() < 0.01), other => panic!("{other:?}") }
     }
 }

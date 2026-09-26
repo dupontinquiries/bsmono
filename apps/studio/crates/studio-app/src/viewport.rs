@@ -44,15 +44,19 @@ pub fn video_at(project: &Project, playhead: Ticks) -> Option<(String, Ticks)> {
 
 /// The coarse cache key: half-second steps, so scrubbing repaints at 2 fps
 /// while a paused playhead costs zero subprocesses per frame.
-/// EVERY video clip under the playhead, one per video track, in track
-/// order — the stack the compositor paints bottom to top. Each carries its
+/// EVERY video clip under the playhead, one per video track, in PAINT
+/// order: bottom first, so the compositor (which paints its slice bottom to
+/// top) ends on the FIRST video track -- the topmost, as `video_at`, the
+/// export and the timeline all have it. This returned track order until
+/// c20, which painted the top track UNDER the others: a full-frame clip on a
+/// lower track hid the one the caption named. Each carries its
 /// source path, media time, the clip's transform (from a `transform`
 /// effect, identity otherwise) and its blend (from a `blend` effect,
 /// Normal at full opacity otherwise). `video_at` is the first of these;
 /// it stays because the cache key and the caption use it.
 pub fn layers_at(project: &Project, playhead: Ticks) -> Vec<LayerSpec> {
     let mut out = Vec::new();
-    for t in project.tracks.iter().filter(|t| t.kind == TrackKind::Video) {
+    for t in project.tracks.iter().rev().filter(|t| t.kind == TrackKind::Video) {
         for c in project.clips.values().filter(|c| c.track == t.id) {
             if c.pos <= playhead && playhead < c.end() {
                 let Some(src) = project.sources.get(&c.source) else { continue };
@@ -96,12 +100,15 @@ pub struct LayerSpec {
     pub kaleido: Option<studio_video::kaleido::Kaleido>,
     /// The clip's style transfer, applied as its LUT after the grade.
     pub style: Option<studio_video::style::Transfer>,
-    /// The clip's fade at the playhead: 1.0 full picture, 0.0 black.
+    /// The clip's fade at the playhead: 1.0 fully there, 0.0 gone. An
+    /// OPACITY, multiplied into the layer's when it is painted
+    /// ([`LayerSpec::paint_opacity`]): over nothing that fades to black, over
+    /// a lower track's clip it dissolves into it -- the export's rule.
     pub fade: f32,
 }
 
-/// Brightness of a clip at `t` under its fade in / out to black: linear, as
-/// ffmpeg's `fade` filter is, so the preview dims exactly as the file does.
+/// A clip's opacity at `t` under its fade in / out: linear, as ffmpeg's
+/// `fade` filter is, so the preview fades exactly as the file does.
 pub fn fade_gain(pos: Ticks, end: Ticks, fade_in: Ticks, fade_out: Ticks, t: Ticks) -> f32 {
     let mut g = 1.0f64;
     if fade_in.0 > 0 {
@@ -114,17 +121,15 @@ pub fn fade_gain(pos: Ticks, end: Ticks, fade_in: Ticks, fade_out: Ticks, t: Tic
 }
 
 impl LayerSpec {
-    /// Grade a fetched frame in place.
+    /// The opacity this layer is painted with: the blend dial times the fade.
+    /// (The transform's own opacity the compositor multiplies in itself.)
+    pub fn paint_opacity(&self) -> f32 { self.opacity * self.fade }
+
+    /// Grade a fetched frame in place. The fade is NOT applied here: it is an
+    /// opacity, applied when the graded layer is painted -- the export's order
+    /// since c20, so a faded-out clip is black even under a grade that lifts
+    /// blacks (before c20 both lifted it; now neither does).
     pub fn grade(&self, px: &mut [u8]) {
-        // THE FADE FIRST, as the export does it: there it runs on the source
-        // before trim (so a clip split by a higher track fades correctly),
-        // which puts it before the grade. The consequence is shared by both,
-        // and stated: a grade that lifts blacks lifts a faded-out picture too.
-        if self.fade < 1.0 {
-            for v in px.iter_mut() {
-                *v = (*v as f32 * self.fade + 0.5) as u8;
-            }
-        }
         if let Some(c) = &self.color {
             for p in px.chunks_mut(3) {
                 let o = c.apply([p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0]);
@@ -295,7 +300,7 @@ pub fn show(ui: &mut egui::Ui, project: &Project, playhead: Ticks,
         match err {
             None => {
                 let stack: Vec<studio_fx::compositor::Layer<'_>> = frames.iter().map(|(px, l)| studio_fx::compositor::Layer {
-                    rgb: px, w: W, h: H, transform: l.transform, mode: l.mode, opacity: l.opacity }).collect();
+                    rgb: px, w: W, h: H, transform: l.transform, mode: l.mode, opacity: l.paint_opacity() }).collect();
                 let px = studio_fx::compositor::composite(W, H, [0, 0, 0], &stack);
                 let img = egui::ColorImage::from_rgb([W as usize, H as usize], px.as_slice());
                 cache.tex = Some(ui.ctx().load_texture(
@@ -356,7 +361,17 @@ mod tests {
         assert!((l.fade - 0.25).abs() < 1e-3, "{}", l.fade);
         let mut px = vec![200u8; 12];
         l.grade(&mut px);
-        assert!(px.iter().all(|&v| v == 50), "a quarter of 200: {px:?}");
+        assert!(px.iter().all(|&v| v == 200), "the grade leaves the fade to painting: {px:?}");
+        let paint = |under: Option<&[u8]>| {
+            let mut stack = Vec::new();
+            if let Some(u) = under { stack.push(studio_fx::compositor::Layer { rgb: u, w: 2, h: 2,
+                transform: Default::default(), mode: studio_fx::compositor::BlendMode::Normal, opacity: 1.0 }); }
+            stack.push(studio_fx::compositor::Layer { rgb: &px, w: 2, h: 2, transform: l.transform, mode: l.mode,
+                opacity: l.paint_opacity() });
+            studio_fx::compositor::composite(2, 2, [0, 0, 0], &stack)[0]
+        };
+        assert_eq!(paint(None), 50, "over nothing: a quarter of 200, the old fade to black");
+        assert_eq!(paint(Some(&[100u8; 12])), 125, "over a lower clip: a dissolve, 0.25*200 + 0.75*100");
         assert_eq!(layers_at(&p, secs(3.0))[0].fade, 1.0);
     }
 
@@ -413,6 +428,31 @@ mod tests {
         assert_ne!(coarse(Ticks::from_seconds(1.4)), coarse(Ticks::from_seconds(1.6)),
                    "crossing it: a new frame");
     }
+    /// The compositor paints its slice bottom to top, so the LAST layer is
+    /// the one on top -- and that must be the clip `video_at` (and the
+    /// export, and the timeline) call the topmost: the FIRST video track.
+    #[test]
+    fn the_stack_is_painted_so_the_first_video_track_ends_on_top() {
+        let mut p = Project::default();
+        for (i, name) in ["top", "bottom"].iter().enumerate() {
+            p.apply(&Op::AddTrack { track: Track { id: TrackId(10 + i as u64), kind: TrackKind::Video, name: (*name).into(),
+                muted: false, locked: false, gain: 1.0, route: None }, at: i }).unwrap();
+            p.apply(&Op::AddSource { source: Source { id: SourceId(20 + i as u64), path: format!("{name}.mp4"),
+                len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2, has_video: true, kind: studio_core::SourceKind::File } }).unwrap();
+            p.apply(&Op::AddClip { clip: Clip { id: ClipId(30 + i as u64), source: SourceId(20 + i as u64), track: TrackId(10 + i as u64),
+                pos: Ticks::ZERO, src_in: Ticks::ZERO, len: Ticks::from_seconds(5.0), gain: 1.0, effects: vec![] } }).unwrap();
+        }
+        let layers = layers_at(&p, Ticks::from_seconds(1.0));
+        assert_eq!(layers.iter().map(|l| l.path.as_str()).collect::<Vec<_>>(), ["bottom.mp4", "top.mp4"]);
+        assert_eq!(layers.last().unwrap().path, video_at(&p, Ticks::from_seconds(1.0)).unwrap().0);
+        // and through the compositor itself: two opaque full frames, the top one is what shows
+        let (red, blue) = ([255u8, 0, 0].repeat(4), [0u8, 0, 255].repeat(4));
+        let frame = |l: &LayerSpec| if l.path == "top.mp4" { &red } else { &blue };
+        let stack: Vec<_> = layers.iter().map(|l| studio_fx::compositor::Layer { rgb: frame(l), w: 2, h: 2,
+            transform: l.transform, mode: l.mode, opacity: l.opacity }).collect();
+        assert_eq!(&studio_fx::compositor::composite(2, 2, [0, 0, 0], &stack)[..3], &[255, 0, 0]);
+    }
+
     #[test]
     fn a_second_video_track_is_a_second_layer_with_its_blend_and_transform() {
         let mut p = Project::default();
@@ -436,11 +476,12 @@ mod tests {
         }
         let layers = layers_at(&p, Ticks::from_seconds(1.0));
         assert_eq!(layers.len(), 2);
-        assert_eq!(layers[0].path, "v1.mp4");
-        assert_eq!(layers[0].mode, studio_fx::compositor::BlendMode::Normal);
-        assert_eq!(layers[1].mode, studio_fx::compositor::BlendMode::Multiply);
-        assert!((layers[1].opacity - 0.5).abs() < 1e-6);
-        assert!((layers[1].transform.x - 0.25).abs() < 1e-6);
+        // paint order: v2 (the lower track) first, v1 last
+        assert_eq!(layers[1].path, "v1.mp4");
+        assert_eq!(layers[1].mode, studio_fx::compositor::BlendMode::Normal);
+        assert_eq!(layers[0].mode, studio_fx::compositor::BlendMode::Multiply);
+        assert!((layers[0].opacity - 0.5).abs() < 1e-6);
+        assert!((layers[0].transform.x - 0.25).abs() < 1e-6);
         assert!(layers_at(&p, Ticks::from_seconds(7.0)).is_empty());
     }
 

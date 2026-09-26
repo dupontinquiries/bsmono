@@ -28,6 +28,7 @@ use studio_live::transport::Transport;
 /// The part of an Ozone-style display that is not drawing: meter ballistics,
 /// a log frequency axis, and a rolling trace. The analysis existed; nothing
 /// turned it into something an eye can read.
+pub mod load;
 pub mod meter;
 pub mod take_report;
 pub mod stems_dme;
@@ -88,6 +89,17 @@ pub mod rebinds;
 pub mod scroll_edge;
 pub mod pattern_pack;
 pub mod rack_panel;
+pub mod seq_header;
+pub mod assembly;
+pub mod deliver;
+pub mod story_check;
+pub mod vfx_setup;
+pub mod flp_import;
+pub mod flp_read;
+pub mod flp_batch;
+pub mod synth_fit;
+pub mod reference_check;
+pub mod note_stacks;
 
 /// Everything the running editor holds.
 pub struct Studio {
@@ -122,6 +134,13 @@ pub struct Studio {
     /// door.)
     undo_stack: Vec<studio_core::Op>,
     redo_stack: Vec<studio_core::Op>,
+    /// What each undo step WAS, in words, index for index with
+    /// `undo_stack` / `redo_stack`: the summary, what it broke or fixed
+    /// (`studio_core::journal::check`), and whether it was known good. The
+    /// palette's "undo to before…" lists these, so finding a change does not
+    /// mean counting undos in your head.
+    undo_notes: Vec<studio_core::journal::Note>,
+    redo_notes: Vec<studio_core::journal::Note>,
     /// Packets produced by local activity — stamped ops (including undos)
     /// and rack syncs — waiting for whatever carrier exists to drain them.
     /// The shell is transport-agnostic on purpose: this Vec IS the seam.
@@ -188,6 +207,9 @@ pub struct Studio {
     /// "S-space menu" and the key did nothing, leaving Ctrl+P — shown
     /// nowhere — as the only way in.
     pub palette_requested: bool,
+    /// Set by the `r` key; the shell starts or stops a take (it owns the
+    /// microphone), as it does for C-r.
+    pub take_requested: bool,
     /// Set by any rack edit; the shell re-renders the loop and clears it.
     pub loop_dirty: bool,
     /// Set by any PROJECT edit (including undo/redo and a bounce); the shell
@@ -231,7 +253,13 @@ pub struct Studio {
     pub clip_gain_drag: Option<(studio_core::ClipId, f32)>,
     /// The piano roll's resize-in-progress (a fresh note being drawn out,
     /// or an existing one grabbed by its edge).
-    pub roll_drag: Option<studio_egui::roll::NoteDrag>,
+    pub roll: studio_egui::roll::RollState,
+    /// The step grid's and the piano roll's shared horizontal scroll, so a
+    /// switch between the two views of a pattern keeps the same steps under
+    /// your eye. `seq_scroll_owner` is the view that last wrote it; the other
+    /// adopts it on the frame it appears (see `seq_header::adopt_scroll`).
+    pub seq_scroll_x: f32,
+    pub seq_scroll_owner: Option<Panel>,
     /// Which lane the automation strip under the timeline shows, or `None`
     /// for no strip. Local monitoring-adjacent state like `solo`: what you
     /// are LOOKING at is not a project fact.
@@ -372,6 +400,8 @@ impl Studio {
             selection: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            undo_notes: Vec::new(),
+            redo_notes: Vec::new(),
             outbox: Vec::new(),
             voice_inbox: Vec::new(),
             manifests: Default::default(),
@@ -390,6 +420,7 @@ impl Studio {
             paint: studio_egui::grid::Paint::default(),
             rack_playing: false,
             palette_requested: false,
+            take_requested: false,
             loop_dirty: true,
             arrangement_dirty: true,
             seek_pending: false,
@@ -399,7 +430,9 @@ impl Studio {
             solo: Vec::new(),
             mixer_drag: None,
             clip_gain_drag: None,
-            roll_drag: None,
+            roll: Default::default(),
+            seq_scroll_x: 0.0,
+            seq_scroll_owner: None,
             auto_target: None,
             auto_binding: None,
             auto_drag: None,
@@ -455,6 +488,8 @@ impl Studio {
     /// whole group back, the way `History::apply_group` does for the
     /// collab path: half a mastering pass is worse than none.
     pub fn edit_group(&mut self, ops: Vec<studio_core::Op>, what: &str) {
+        let (before, before_findings) = self.note_start();
+        let described = ops.clone();
         let mut applied = Vec::new();
         for op in ops {
             match self.edit_inner(op) {
@@ -478,15 +513,19 @@ impl Studio {
         self.undo_stack.push(studio_core::Op::Group {
             ops: applied.into_iter().rev().collect() });
         self.redo_stack.clear();
+        self.note_finish(what, &before, &before_findings, &described);
         self.status = format!("{what} — one undo reverses all {count}");
         self.arrangement_dirty = true;
     }
 
     pub fn edit(&mut self, op: studio_core::Op, what: &str) {
+        let (before, before_findings) = self.note_start();
+        let described = [op.clone()];
         match self.edit_inner(op) {
             Ok(inverse) => {
                 self.undo_stack.push(inverse);
                 self.redo_stack.clear();
+                self.note_finish(what, &before, &before_findings, &described);
                 self.status = what.into();
                 self.arrangement_dirty = true;
             }
@@ -502,6 +541,78 @@ impl Studio {
     /// gesture, the same per-edit cost `studio-engine`'s snapshot swap
     /// already accepts, bought here for the property that the log and the
     /// project can never disagree about what happened.
+    fn note_start(&self) -> (studio_core::Project, Vec<studio_core::journal::Finding>) {
+        let p = &self.session.doc.project;
+        (p.clone(), studio_core::journal::check(p))
+    }
+
+    /// Record the note for the undo step just pushed; says in the status
+    /// line when the change broke something.
+    fn note_finish(&mut self, what: &str, before: &studio_core::Project, before_findings: &[studio_core::journal::Finding], ops: &[studio_core::Op]) {
+        let after = studio_core::journal::check(&self.session.doc.project);
+        let note = studio_core::journal::Note::describe(what, before, before_findings, ops, &after, wall_ms());
+        self.undo_notes.push(note);
+        self.redo_notes.clear();
+    }
+
+    /// The named undo history, newest first: line k is k + 1 undos away.
+    pub fn history_lines(&self) -> Vec<String> {
+        studio_core::journal::palette_lines(&self.undo_notes, wall_ms())
+    }
+
+    /// The newest note's breakage, if the last change broke something.
+    pub fn last_broke(&self) -> Option<&studio_core::journal::Finding> {
+        self.undo_notes.last().and_then(|n| n.broke.first())
+    }
+
+    /// Undo once through the stamping door. `Ok(false)`: nothing to undo.
+    fn undo_once(&mut self) -> Result<bool, studio_core::EditError> {
+        let Some(inv) = self.undo_stack.pop() else { return Ok(false) };
+        match self.edit_inner(inv) {
+            Ok(redo) => {
+                self.redo_stack.push(redo);
+                if let Some(n) = self.undo_notes.pop() { self.redo_notes.push(n); }
+                self.arrangement_dirty = true;
+                Ok(true)
+            }
+            // as before: a refused inverse is dropped (retrying cannot
+            // succeed once the state moved), and its note with it
+            Err(e) => { self.undo_notes.pop(); Err(e) }
+        }
+    }
+
+    fn redo_once(&mut self) -> Result<bool, studio_core::EditError> {
+        let Some(op) = self.redo_stack.pop() else { return Ok(false) };
+        match self.edit_inner(op) {
+            Ok(undo) => {
+                self.undo_stack.push(undo);
+                if let Some(n) = self.redo_notes.pop() { self.undo_notes.push(n); }
+                self.arrangement_dirty = true;
+                Ok(true)
+            }
+            Err(e) => { self.redo_notes.pop(); Err(e) }
+        }
+    }
+
+    /// Undo `n` steps (the palette's "undo to before…"). Stops at the first
+    /// refusal and says how far it got.
+    pub fn undo_steps(&mut self, n: usize) {
+        let target = self.undo_notes.get(self.undo_notes.len().wrapping_sub(n)).map(|x| x.label.clone());
+        let mut done = 0;
+        while done < n {
+            match self.undo_once() {
+                Ok(true) => done += 1,
+                Ok(false) => break,
+                Err(e) => { self.status = format!("undo stopped after {done} of {n} (state moved): {e:?}"); return; }
+            }
+        }
+        self.status = match (done, target) {
+            (0, _) => "nothing to undo".into(),
+            (d, Some(l)) if d == n => format!("undid {d} -- back to before: {l}"),
+            (d, _) => format!("undid {d}"),
+        };
+    }
+
     fn edit_inner(&mut self, op: studio_core::Op)
         -> Result<studio_core::Op, studio_core::EditError>
     {
@@ -1613,29 +1724,23 @@ impl Studio {
                         // door, so peers see the undo as the edit it is. If
                         // the state has moved under it (a peer's conflicting
                         // op), the refusal is said out loud, not swallowed.
-                        self.status = match self.undo_stack.pop() {
-                            None => "nothing to undo".into(),
-                            Some(inv) => match self.edit_inner(inv) {
-                                Ok(redo) => {
-                                    self.redo_stack.push(redo);
-                                    self.arrangement_dirty = true;
-                                    "undo".into()
-                                }
-                                Err(e) => format!("undo refused (state moved): {e:?}"),
+                        self.status = match self.undo_once() {
+                            Ok(false) => "nothing to undo".into(),
+                            Ok(true) => match self.redo_notes.last() {
+                                Some(n) => format!("undo: {} -- {}", n.label, n.summary),
+                                None => "undo".into(),
                             },
+                            Err(e) => format!("undo refused (state moved): {e:?}"),
                         };
                     }
                     Action::Redo => {
-                        self.status = match self.redo_stack.pop() {
-                            None => "nothing to redo".into(),
-                            Some(op) => match self.edit_inner(op) {
-                                Ok(undo) => {
-                                    self.undo_stack.push(undo);
-                                    self.arrangement_dirty = true;
-                                    "redo".into()
-                                }
-                                Err(e) => format!("redo refused (state moved): {e:?}"),
+                        self.status = match self.redo_once() {
+                            Ok(false) => "nothing to redo".into(),
+                            Ok(true) => match self.undo_notes.last() {
+                                Some(n) => format!("redo: {} -- {}", n.label, n.summary),
+                                None => "redo".into(),
                             },
+                            Err(e) => format!("redo refused (state moved): {e:?}"),
                         };
                     }
                     Action::Delete => {
@@ -1666,13 +1771,254 @@ impl Studio {
                         let d = self.session.doc.project.duration();
                         self.seek(d);
                     }
-                    _ => {}
+                    // Everything below was parsed by the keymap and then
+                    // dropped here by a `_ => {}` until c20 -- the HUD taught
+                    // `x select` and `w/b extend` and neither did anything.
+                    // The match is exhaustive now, so the next Action added
+                    // to the keymap does not compile until it does something.
+                    Action::NextEdit { count, extend } => self.goto_edit(count, true, extend),
+                    Action::PrevEdit { count, extend } => self.goto_edit(count, false, extend),
+                    Action::ClipEnd { extend } => self.goto_clip_end(extend),
+                    Action::GotoPlayhead => self.reveal_playhead(),
+                    Action::SelectClip { extend } => self.select_clip_at_playhead(extend),
+                    Action::AddSelectionBelow => self.add_selection_beside(1),
+                    Action::AddSelectionAbove => self.add_selection_beside(-1),
+                    Action::SetGain { delta } => self.nudge_gain(delta),
+                    Action::ToggleMute => self.toggle_track_flag(true),
+                    Action::ToggleLock => self.toggle_track_flag(false),
+                    Action::ToggleRecord => self.take_requested = true,
+                    Action::ToggleLoop => {
+                        if self.transport.loop_range.is_some() { self.loop_off() } else { self.loop_selection() }
+                    }
+                    Action::EnterMode(m) => self.status = format!("{} mode", m.label()),
+                    // Insert mode is for text fields, which take their own
+                    // input; a literal char reaching here has nowhere to go.
+                    Action::Insert(_) => {}
                 }
                 true
             }
             Resolution::Pending(p) => { self.status = format!("…{p}"); true }
             Resolution::None => false,
         }
+    }
+
+    /// The track motions and selection work on: the last selected clip's,
+    /// else the topmost track with a clip under the playhead, else the first.
+    pub fn focus_track(&self) -> Option<studio_core::TrackId> {
+        let p = &self.session.doc.project;
+        let at = self.transport.position();
+        self.selection.iter().rev().find_map(|id| p.clips.get(id)).map(|c| c.track)
+            .or_else(|| p.tracks.iter()
+                .find(|t| p.track_clips(t.id).iter().any(|c| c.pos <= at && at < c.end())).map(|t| t.id))
+            .or_else(|| p.tracks.first().map(|t| t.id))
+    }
+
+    /// The clip on `track` under `at`, if any.
+    fn clip_at(&self, track: studio_core::TrackId, at: Ticks) -> Option<studio_core::ClipId> {
+        self.session.doc.project.track_clips(track).iter()
+            .find(|c| c.pos <= at && at < c.end()).map(|c| c.id)
+    }
+
+    /// What a clip action applies to: the selection, else the focus track's
+    /// clip under the playhead.
+    fn targets(&self) -> Vec<studio_core::ClipId> {
+        if !self.selection.is_empty() { return self.selection.clone(); }
+        self.focus_track().and_then(|t| self.clip_at(t, self.transport.position())).into_iter().collect()
+    }
+
+    fn select_add(&mut self, id: studio_core::ClipId) {
+        if !self.selection.contains(&id) { self.selection.push(id); }
+    }
+
+    /// `w` / `b`: the playhead to the next / previous cut on the focus track;
+    /// in Select mode the clips passed over join the selection.
+    pub fn goto_edit(&mut self, count: u32, forward: bool, extend: bool) {
+        let Some(track) = self.focus_track() else { self.status = "no tracks".into(); return };
+        let from = self.transport.position();
+        let p = &self.session.doc.project;
+        let to = studio_egui::keys::next_edit(&studio_egui::keys::edit_points(p, track), from, count, forward);
+        if to == from {
+            self.status = format!("no cut {} on this track", if forward { "after" } else { "before" } );
+            return;
+        }
+        if extend {
+            for id in studio_egui::keys::clips_in_span(p, track, from, to) { self.select_add(id); }
+        }
+        self.seek(to);
+        self.status = format!("cut at {:.2}s{}", to.to_seconds(),
+            if extend { format!(" · {} selected", self.selection.len()) } else { String::new() });
+    }
+
+    /// `e`: to the end of the focus track's clip under the playhead.
+    pub fn goto_clip_end(&mut self, extend: bool) {
+        let at = self.transport.position();
+        let Some(id) = self.focus_track().and_then(|t| self.clip_at(t, at)) else {
+            self.status = "no clip under the playhead".into(); return };
+        let end = self.session.doc.project.clips[&id].end();
+        if extend { self.select_add(id); }
+        self.seek(end);
+        self.status = format!("clip end {:.2}s", end.to_seconds());
+    }
+
+    /// `g c`: scroll the timeline so the playhead is in view, a little in
+    /// from the left edge.
+    pub fn reveal_playhead(&mut self) {
+        let at = self.transport.position();
+        let margin = Ticks::from_seconds(80.0 / self.view.px_per_sec.max(1.0) as f64);
+        self.view.scroll = at.saturating_sub(margin);
+        self.status = format!("playhead {:.2}s", at.to_seconds());
+    }
+
+    /// `x`: select the focus track's clip under the playhead. Pressed again
+    /// (or in Select mode) it extends to the next clip on that track, as
+    /// Helix's `x` extends line by line.
+    pub fn select_clip_at_playhead(&mut self, extend: bool) {
+        let Some(track) = self.focus_track() else { self.status = "no tracks".into(); return };
+        let at = self.transport.position();
+        let under = self.clip_at(track, at);
+        let p = &self.session.doc.project;
+        match under {
+            Some(id) if !self.selection.contains(&id) => {
+                if !extend { self.selection.clear(); }
+                self.selection.push(id);
+            }
+            _ => {
+                // repeat: the next clip on this track after the selected ones
+                let after = self.selection.iter().filter_map(|id| p.clips.get(id))
+                    .filter(|c| c.track == track).map(|c| c.end()).max().unwrap_or(at);
+                let next = p.track_clips(track).iter().filter(|c| c.pos >= after)
+                    .min_by_key(|c| c.pos).map(|c| c.id);
+                match next {
+                    Some(id) => self.selection.push(id),
+                    None => { self.status = if under.is_none() { "no clip under the playhead".into() }
+                                            else { "no further clip on this track".into() }; return; }
+                }
+            }
+        }
+        self.status = format!("{} selected", self.selection.len());
+    }
+
+    /// `C` / `alt-C`: add the clip on the track below (`dir` 1) or above
+    /// (-1) that overlaps the last selected clip most -- multi-track selection
+    /// from the keyboard, as Helix's `C` adds a cursor on the next line.
+    pub fn add_selection_beside(&mut self, dir: i32) {
+        let p = &self.session.doc.project;
+        let anchor = self.selection.last().and_then(|id| p.clips.get(id)).cloned()
+            .or_else(|| self.focus_track().and_then(|t| self.clip_at(t, self.transport.position()))
+                .and_then(|id| p.clips.get(&id).cloned()));
+        let Some(a) = anchor else { self.status = "select a clip first (x)".into(); return };
+        let Some(ti) = p.tracks.iter().position(|t| t.id == a.track) else { return };
+        let Some(other) = ti.checked_add_signed(dir as isize).and_then(|i| p.tracks.get(i)) else {
+            self.status = format!("no track {}", if dir > 0 { "below" } else { "above" }); return };
+        let overlap = |c: &studio_core::Clip| c.end().min(a.end()).0 - c.pos.max(a.pos).0;
+        let best = p.track_clips(other.id).into_iter().filter(|c| overlap(c) > 0)
+            .max_by_key(|c| overlap(c)).map(|c| c.id);
+        match best {
+            Some(id) => {
+                self.selection.retain(|x| *x != id);
+                self.selection.push(id); // last = the new anchor, so C repeats downward
+                self.status = format!("{} selected", self.selection.len());
+            }
+            None => self.status = format!("nothing on {} under the selection", other.name),
+        }
+    }
+
+    /// `=` / `-`: clip gain up or down, over the inspector's 0..=1.5 range.
+    /// One undo for the whole selection.
+    pub fn nudge_gain(&mut self, delta: f32) {
+        let ids = self.targets();
+        if ids.is_empty() { self.status = "gain: nothing selected or under the playhead".into(); return; }
+        let p = &self.session.doc.project;
+        let ops: Vec<_> = ids.iter().filter_map(|id| p.clips.get(id))
+            .map(|c| studio_core::Op::SetGain { id: c.id, gain: (c.gain + delta).clamp(0.0, 1.5) }).collect();
+        let shown = match &ops[..] { [studio_core::Op::SetGain { gain, .. }] => format!("gain {gain:.2}"),
+                                     _ => format!("gain {:+.2} on {}", delta, ops.len()) };
+        self.edit_group(ops, &shown);
+    }
+
+    /// `m` / `l`: flip mute (or lock) on the tracks of the target clips.
+    pub fn toggle_track_flag(&mut self, mute: bool) {
+        let p = &self.session.doc.project;
+        let mut tracks: Vec<studio_core::TrackId> = self.targets().iter()
+            .filter_map(|id| p.clips.get(id)).map(|c| c.track).collect();
+        if tracks.is_empty() { tracks.extend(self.focus_track()); }
+        tracks.dedup();
+        let ops: Vec<_> = tracks.iter().filter_map(|id| p.tracks.iter().find(|t| t.id == *id)).map(|t| {
+            let (muted, locked) = if mute { (!t.muted, t.locked) } else { (t.muted, !t.locked) };
+            studio_core::Op::SetTrackFlags { id: t.id, muted, locked }
+        }).collect();
+        if ops.is_empty() { self.status = "no track".into(); return; }
+        let now = match &ops[0] { studio_core::Op::SetTrackFlags { muted, locked, .. } => if mute { *muted } else { *locked }, _ => false };
+        let what = format!("{} {}", if mute { if now { "muted" } else { "unmuted" } } else if now { "locked" } else { "unlocked" },
+                           tracks.iter().filter_map(|id| p.tracks.iter().find(|t| t.id == *id)).map(|t| t.name.clone()).collect::<Vec<_>>().join(", "));
+        self.edit_group(ops, &what);
+    }
+
+    /// `D`: a copy of the selection straight after it -- the arranging move
+    /// (the next four bars are the last four, then change them). Goes through
+    /// `paste_at` so compositions and automation come along; the clipboard is
+    /// left as it was.
+    pub fn duplicate_selected(&mut self) {
+        let p = &self.session.doc.project;
+        let Some(end) = self.selection.iter().filter_map(|id| p.clips.get(id)).map(|c| c.end()).max() else {
+            self.status = "duplicate: nothing selected".into(); return };
+        let saved = std::mem::replace(&mut self.clipboard, self.selection.clone());
+        self.paste_at(end);
+        self.clipboard = saved;
+    }
+
+    /// `[` / `]`: fade the target clips in up to the playhead, or out from
+    /// it -- a fade drawn by standing where it should end. The other fade is
+    /// kept. On a video clip over a lower track this is a dissolve.
+    pub fn fade_to_playhead(&mut self, fade_in: bool) {
+        let at = self.transport.position();
+        let p = &self.session.doc.project;
+        let ops: Vec<_> = self.targets().iter().filter_map(|id| p.clips.get(id))
+            .filter(|c| c.pos < at && at < c.end())
+            .map(|c| {
+                let (fi, fo) = p.fades.get(&c.id).copied().unwrap_or((Ticks::ZERO, Ticks::ZERO));
+                let (fi, fo) = if fade_in { (at.saturating_sub(c.pos), fo.min(c.end().saturating_sub(at))) }
+                               else { (fi.min(at.saturating_sub(c.pos)), c.end().saturating_sub(at)) };
+                studio_core::Op::SetClipFade { id: c.id, fade_in: fi, fade_out: fo }
+            }).collect();
+        if ops.is_empty() {
+            self.status = format!("fade {}: put the playhead inside a selected clip", if fade_in { "in" } else { "out" });
+            return;
+        }
+        let n = ops.len();
+        self.edit_group(ops, &format!("fade {} {:.2}s on {n} clip{}", if fade_in { "in to" } else { "out from" },
+                                      at.to_seconds(), if n == 1 { "" } else { "s" }));
+    }
+
+    /// `n`: set each target clip's gain so its loudest sample -- over the part
+    /// of the source the clip plays -- sits at -1 dBFS, capped at the
+    /// inspector's 1.5 (said out loud when the cap bites). `audio` is the
+    /// shell's decoded sources; a clip whose audio is not decoded is skipped
+    /// and counted.
+    pub fn normalize_selected(&mut self, audio: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>) {
+        const TARGET: f32 = 0.891_250_9; // -1 dBFS
+        let p = &self.session.doc.project;
+        let (mut ops, mut missing, mut capped) = (Vec::new(), 0, 0);
+        for c in self.targets().iter().filter_map(|id| p.clips.get(id)) {
+            let Some(a) = audio.get(&c.source) else { missing += 1; continue };
+            let rate = a.sample_rate.max(1);
+            let from = (c.src_in.to_samples(rate).max(0) as usize).min(a.frames());
+            let to = (from + c.len.to_samples(rate).max(0) as usize).min(a.frames());
+            let peak = a.channels.iter().flat_map(|ch| ch[from..to].iter()).fold(0.0f32, |m, v| m.max(v.abs()));
+            if peak <= 1e-6 { missing += 1; continue; }
+            let g = TARGET / peak;
+            if g > 1.5 { capped += 1; }
+            ops.push(studio_core::Op::SetGain { id: c.id, gain: g.min(1.5) });
+        }
+        if ops.is_empty() {
+            self.status = if missing > 0 { "normalize: no decoded audio under the selection".into() }
+                          else { "normalize: nothing selected or under the playhead".into() };
+            return;
+        }
+        let n = ops.len();
+        self.edit_group(ops, &format!("normalized {n} clip{} to -1 dBFS{}{}", if n == 1 { "" } else { "s" },
+            if capped > 0 { format!(" ({capped} capped at gain 1.5 -- too quiet to reach it)") } else { String::new() },
+            if missing > 0 { format!(" ({missing} skipped: silent or not decoded)") } else { String::new() }));
     }
 
     fn split_at_playhead(&mut self) {
@@ -2444,7 +2790,7 @@ impl Studio {
         let ch = self.rack.add_channel(studio_live::Channel {
             name: name.into(),
             kind: studio_live::SynthKind::Sampler { source: id },
-            gain: 0.9, pan: 0.0, muted: false, choke_group: None,
+            gain: 0.9, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         });
         self.selected_channel = ch;
         self.loop_dirty = true;
@@ -2820,7 +3166,7 @@ mod tests {
         a.rack.channels.push(studio_live::Channel {
             name: "clap".into(),
             kind: studio_live::SynthKind::Sampler { source: sid },
-            gain: 1.0, pan: 0.0, muted: false, choke_group: None });
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false });
         let clap_ix = a.rack.channels.len() - 1;
         let pat_ix = a.rack.patterns.len() - 1;
         {
@@ -3068,6 +3414,55 @@ mod tests {
     }
 
     #[test]
+    fn the_palette_undoes_to_a_named_change_and_says_what_it_broke() {
+        use studio_core::{Clip, ClipId, Op, Source, SourceId, TrackId};
+        let mut s = Studio::demo();
+        let aligned = |s: &Studio| (s.undo_notes.len(), s.redo_notes.len()) == (s.undo_stack.len(), s.redo_stack.len());
+        // a second stem of the same length as the demo take, lined up with clip 2
+        s.edit_group(vec![
+            Op::AddSource { source: Source { id: SourceId(2), path: "takes/stem.wav".into(), len: Ticks::from_seconds(600.0),
+                sample_rate: 48_000, channels: 2, has_video: false, kind: studio_core::SourceKind::File } },
+            Op::AddClip { clip: Clip { id: ClipId(100), source: SourceId(2), track: TrackId(3), pos: Ticks::from_seconds(3.5),
+                src_in: Ticks::from_seconds(2.0), len: Ticks::from_seconds(3.0), gain: 1.0, effects: Vec::new() } },
+        ], "add stem");
+        s.edit(Op::MoveClip { id: ClipId(100), pos: Ticks::from_seconds(3.51), track: TrackId(3) }, "nudge");
+        s.edit_group(vec![Op::SetGain { id: ClipId(1), gain: 2.0 }, Op::SetGain { id: ClipId(4), gain: 2.0 }], "louder");
+        assert!(aligned(&s));
+        let lines = s.history_lines();
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(lines[0].starts_with("undo to before: louder -- gain on 2 clips"), "{}", lines[0]);
+        assert!(lines[1].starts_with("undo to before: nudge -- moved 1 clip by +0.01 s on A2"), "{}", lines[1]);
+        assert!(lines[1].contains("BROKE 1: A1 and A2 are stems out of sync by -10.0 ms"), "{}", lines[1]);
+        assert!(lines[2].contains("add stem") && lines[2].ends_with("| last known good"), "{}", lines[2]);
+        assert_eq!(s.last_broke(), None, "the newest change broke nothing new");
+
+        // the palette offers the lines under "undo to before…", each k + 1 undos away
+        let mut pal = palette::Palette::open();
+        pal.history = std::sync::Arc::new(lines);
+        let root = pal.choices(&s.session.doc.project);
+        let ask = palette::filter(&root, "undo to before").first().copied().cloned().expect("offered");
+        assert_eq!(pal.choose(&ask), None, "asks which change");
+        let offered = pal.choices(&s.session.doc.project);
+        assert_eq!(offered.len(), 3);
+        let pick = palette::filter(&offered, "nudge").first().copied().cloned().unwrap();
+        let act = pal.choose(&pick).unwrap();
+        assert_eq!(act, palette::Act::Shell(palette::ShellVerb::UndoSteps(2)));
+
+        s.undo_steps(2);
+        assert_eq!(s.session.doc.project.clips[&ClipId(100)].pos, Ticks::from_seconds(3.5), "back before the nudge");
+        assert_eq!(s.session.doc.project.clips[&ClipId(1)].gain, 1.0, "and before the gain");
+        assert!(s.status.contains("back to before: nudge"), "{}", s.status);
+        assert!(aligned(&s) && s.history_lines().len() == 1);
+        s.key(Key::c('U'));
+        assert!(s.status.starts_with("redo: nudge -- moved 1 clip"), "{}", s.status);
+        assert_eq!(s.last_broke().map(|f| f.key.starts_with("stem-drift")), Some(true));
+        assert!(aligned(&s));
+        // a new edit drops the redo notes with the redo stack
+        s.edit(Op::SetGain { id: ClipId(2), gain: 0.5 }, "quieter");
+        assert!(aligned(&s) && s.redo_notes.is_empty());
+    }
+
+    #[test]
     fn a_refused_edit_reports_rather_than_vanishing() {
         // The worst failure an editor has is a silently dropped edit: the user
         // believes it worked.
@@ -3128,6 +3523,8 @@ struct ProvenanceJobResult {
 
 #[cfg(feature = "app")]
 pub struct App {
+    /// A Tab taken out of the input by `raw_input_hook`, for `ui()` to act on.
+    tab_flip: bool,
     pub studio: Studio,
     peaks: std::collections::BTreeMap<studio_core::SourceId, studio_audio::Peaks>,
     /// Background provenance/fingerprint jobs for freshly-imported video
@@ -3510,7 +3907,7 @@ impl App {
               passes: looping::Passes::default(),
               take_from: studio_core::Ticks::ZERO,
               settings_open: false, group_graph_open: false, library_open: ws.library_open,
-              rebinds: rebinds::Rebinds::decode(&ws.rebinds), rebind_capture: None,
+              rebinds: rebinds::Rebinds::decode(&ws.rebinds), rebind_capture: None, tab_flip: false,
               panel_nav: Default::default(),
               zones: studio_egui::playkeys::Zones::decode(&ws.piano_zones),
               piano_cal: None,
@@ -3560,6 +3957,17 @@ impl App {
 
 #[cfg(feature = "app")]
 impl eframe::App for App {
+    /// Tab on the two views of a pattern flips between them. Taken here,
+    /// before egui begins the frame, because egui moves keyboard focus on Tab
+    /// at that point (see `seq_header::take_tab`). Only there, and only with
+    /// nothing focused: in a text field, or on any other tab, Tab keeps its
+    /// meaning of moving focus.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if seq_header::other_view(self.studio.panel).is_some() && ctx.memory(|m| m.focused().is_none()) {
+            self.tab_flip |= seq_header::take_tab(&mut raw_input.events);
+        }
+    }
+
     // eframe 0.34's App trait is `ui(&mut self, ui, frame)`, not the `update(ctx, frame)`
     // of earlier versions — the panels come from the Ui's context.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -3598,13 +4006,22 @@ impl eframe::App for App {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::R)) {
             self.toggle_take();
         }
+        // Tab flips a pattern between its two views (Steps / Notes); the key
+        // was taken out of the input in `raw_input_hook`, before egui could
+        // move focus with it.
+        if std::mem::take(&mut self.tab_flip) {
+            if let Some(other) = seq_header::other_view(self.studio.panel) {
+                self.studio.panel = other;
+                self.studio.status = format!("{} view", seq_header::view_name(other));
+            }
+        }
         if std::mem::take(&mut self.studio.palette_requested) && self.palette.is_none() {
-            self.palette = Some(palette::Palette::open_with(self.words_raw.clone()));
+            self.palette = Some(self.open_palette());
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
             self.palette = match self.palette {
                 Some(_) => None, // C-p again closes: a toggle, not a stack
-                None => Some(palette::Palette::open_with(self.words_raw.clone())),
+                None => Some(self.open_palette()),
             };
         }
         // C-1..C-4: the workspaces. One keypress per room, the kdenlive
@@ -3658,6 +4075,10 @@ impl eframe::App for App {
             let ms = studio_core::Ticks::from_seconds(0.001);
             match ch {
                 'A' => { self.studio.align_selected(&self.audio); continue; }
+                'n' => { self.studio.normalize_selected(&self.audio); continue; }
+                'D' => { self.studio.duplicate_selected(); continue; }
+                '[' => { self.studio.fade_to_playhead(true); continue; }
+                ']' => { self.studio.fade_to_playhead(false); continue; }
                 'Q' => { self.studio.quantize_selected(); continue; }
                 ',' => { self.studio.nudge_selected(studio_core::Ticks(-step.0)); continue; }
                 '.' => { self.studio.nudge_selected(step); continue; }
@@ -3692,6 +4113,10 @@ impl eframe::App for App {
                 _ => {}
             }
             self.studio.key(studio_egui::keys::Key::c(ch));
+        }
+        // `r` in the keymap: the take lives here, with the microphone.
+        if std::mem::take(&mut self.studio.take_requested) {
+            self.toggle_take();
         }
 
         // ctx variant: same colours, plus the symbol fonts. studio draws a
@@ -5953,6 +6378,7 @@ impl App {
                     self.studio.status = format!("resync requested — {n} ops locally");
                 }
                 palette::ShellVerb::RecordTake => { self.toggle_take(); }
+                palette::ShellVerb::UndoSteps(n) => self.studio.undo_steps(n as usize),
                 palette::ShellVerb::CallToggle => { self.toggle_call(); }
                 palette::ShellVerb::LoopSelection => { self.studio.loop_selection(); }
                 palette::ShellVerb::Harmonize(d) => { self.studio.harmonize_roll(d as i32); }
@@ -6054,6 +6480,58 @@ impl App {
                     self.studio.status = if self.words_raw.is_empty() {
                         "no transcripts loaded yet — the filter applies once they are".into()
                     } else { self.refilter_words() };
+                }
+                palette::ShellVerb::VfxSurvey => {
+                    let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                    let s = vfx_setup::survey(&self.studio.session.doc.project, &base);
+                    let n = s.problems();
+                    let shots = s.shots.len();
+                    let failed = s.failed.clone();
+                    let written = vfx_setup::write_list(&s, &self.project_path);
+                    if !s.ops.is_empty() { self.studio.edit_group(s.ops, "vfx survey"); }
+                    self.studio.status = format!("vfx: {shots} shot{} surveyed, {n} problem{}{}{}",
+                        if shots == 1 { "" } else { "s" }, if n == 1 { "" } else { "s" },
+                        match written { Ok(f) => format!(" -- list in {}, markers \"vfx:\"", f.file_name().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default()),
+                                        Err(e) => format!(" -- {e}") },
+                        if failed.is_empty() { String::new() } else { format!(" -- could not measure: {}", failed.join("; ")) });
+                }
+                palette::ShellVerb::CheckStory => {
+                    let project = &self.studio.session.doc.project;
+                    let (cs, unread) = story_check::gather(project, &self.words_raw, &self.project_path);
+                    if cs.is_empty() {
+                        self.studio.status = "constraints: nothing to check against -- outline.txt, constraints.txt, a .lrc, or loaded transcripts".into();
+                    } else {
+                        let (report, ops) = story_check::check(project, &cs, &self.words_raw);
+                        if !ops.is_empty() { self.studio.edit_group(ops, "constraints checked"); }
+                        self.studio.status = format!("constraints ({}): {}{}", cs.len(), report.summary(),
+                            if unread.is_empty() { String::new() } else { format!(" -- could not read: {}", unread.join("; ")) });
+                    }
+                }
+                palette::ShellVerb::DraftStory => {
+                    self.studio.status = match assembly::draft_story(&self.studio.session.doc.project, &self.words_raw, &self.project_path) {
+                        Ok((file, story)) => format!("drafted {}: {} scene{}, {} lines, {} -- edit it, then \"assemble\"{}",
+                            file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                            story.scenes.len(), if story.scenes.len() == 1 { "" } else { "s" }, story.line_count(), story.order,
+                            if story.reviews.is_empty() { String::new() } else { format!(" ({} to check, listed at its top)", story.reviews.len()) }),
+                        Err(e) => e,
+                    };
+                }
+                palette::ShellVerb::Assemble => {
+                    let outline = assembly::outline_beside(&self.project_path);
+                    let (from, lines) = match outline {
+                        Some((name, lines)) => (format!("{name}, {} lines", lines.len()), lines),
+                        None => ("no outline: shot order".into(), Vec::new()),
+                    };
+                    let at = self.studio.playhead();
+                    match assembly::plan(&self.studio.session.doc.project, &self.words_raw, &lines, at) {
+                        Ok((asm, ops)) => {
+                            let reviews = asm.reviews.len();
+                            self.studio.edit_group(ops, "assembled");
+                            self.studio.status = format!("assembled ({from}): {}{}", asm.summary(),
+                                if reviews > 0 { " -- palette: jump to marker, type \"review\"" } else { "" });
+                        }
+                        Err(e) => self.studio.status = e,
+                    }
                 }
                 palette::ShellVerb::StyleCopy => {
                     let project = &self.studio.session.doc.project;
@@ -7348,6 +7826,13 @@ impl App {
     }
 
     /// Open the palette straight at one of its questions.
+    /// The palette as C-p opens it: transcripts and the named undo history.
+    fn open_palette(&self) -> palette::Palette {
+        let mut p = palette::Palette::open_with(self.words_raw.clone());
+        p.history = std::sync::Arc::new(self.studio.history_lines());
+        p
+    }
+
     fn open_palette_at(&mut self, ask: palette::Ask, crumb: &str) {
         self.palette = Some(palette::Palette { pending: Some(ask), path: vec![crumb.to_string()], ..Default::default() });
     }
@@ -9613,7 +10098,7 @@ mod chord_tool_tests {
         let mut s = Studio::demo();
         let ch = s.selected_channel;
         let pat = s.current_pattern;
-        let note = |key: i8, start: u32| studio_live::Note { key, start, len: 4, vel: 0.8, slide: false };
+        let note = |key: i8, start: u32| studio_live::Note { key, start, len: 4, vel: 0.8, slide: false, nudge: 0.0 };
         s.rack.patterns[pat].add_note(ch, note(3, 0));
         s.rack.patterns[pat].add_note(ch, note(3, 8));
         s.loop_dirty = false;
@@ -10390,7 +10875,7 @@ mod alignment_tests {
         // shipped — the tooltip and the behavior are one source of truth.
         use studio_egui::keys::{Key, Keymap, Resolution};
         let hints = studio_egui::CLIP_HINTS.join(" ");
-        for ch in ['A', 'Q', ',', '.', '<', '>'] {
+        for ch in ['A', 'Q', ',', '.', '<', '>', 'n', 'D', '[', ']'] {
             let mut k = Keymap::new();
             assert!(!matches!(k.feed(Key::c(ch)), Resolution::Act(_)),
                     "'{ch}' must stay free in the keymap");
@@ -10415,7 +10900,7 @@ mod layer_tests {
         let ix = s.layer_channel(from, studio_live::Channel {
             name: "kick-tone".into(),
             kind: s.rack.channels[from].kind.clone(),
-            gain: 0.9, pan: 0.0, muted: false, choke_group: None,
+            gain: 0.9, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         });
         assert_eq!(s.rack.patterns[0].rows[ix], steps_before,
                    "the layer fires in lockstep with its source");
@@ -10586,4 +11071,171 @@ mod comp_split_tests {
         }
     }
 }
+}
+
+
+/// The timeline's keys, fed through `Studio::key` -- the SHELL, not the
+/// keymap. The keymap's own tests proved every hinted key parsed; eleven of
+/// them then fell into a `_ => {}` here and did nothing (c20).
+#[cfg(test)]
+mod arrange_key_tests {
+    use super::*;
+    use studio_egui::keys::Key;
+    use studio_core::{Clip, ClipId, Op, Source, SourceId, Track, TrackId, TrackKind};
+
+    fn secs(x: f64) -> Ticks { Ticks::from_seconds(x) }
+
+    /// Two tracks far to the right of the demo's content:
+    /// A: 200-202 (#901), 202-204 (#902), 205-206 (#903); B: 201-203 (#904).
+    fn arranged() -> Studio {
+        let mut s = Studio::demo();
+        for (i, (id, name)) in [(900u64, "arr A"), (901, "arr B")].into_iter().enumerate() {
+            let at = s.session.doc.project.tracks.len();
+            s.edit(Op::AddTrack { track: Track { id: TrackId(id), kind: TrackKind::Audio, name: name.into(),
+                muted: false, locked: false, gain: 1.0, route: None }, at }, "t");
+            let _ = i;
+        }
+        s.edit(Op::AddSource { source: Source { id: SourceId(900), path: "arr.wav".into(), len: secs(60.0),
+            sample_rate: 48_000, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }, "src");
+        for (id, track, pos, len) in [(901u64, 900u64, 200.0, 2.0), (902, 900, 202.0, 2.0), (903, 900, 205.0, 1.0), (904, 901, 201.0, 2.0)] {
+            s.edit(Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(900), track: TrackId(track),
+                pos: secs(pos), src_in: secs(pos - 200.0), len: secs(len), gain: 1.0, effects: vec![] } }, "c");
+        }
+        s.selection.clear();
+        s
+    }
+    fn at(s: &mut Studio, x: f64) { s.transport.set_position(secs(x)); }
+    fn clip(s: &Studio, id: u64) -> &Clip { &s.session.doc.project.clips[&ClipId(id)] }
+
+    #[test]
+    fn x_selects_the_clip_under_the_playhead_and_again_extends_along_the_track() {
+        let mut s = arranged();
+        at(&mut s, 200.5);
+        s.key(Key::c('x'));
+        assert_eq!(s.selection, vec![ClipId(901)], "{}", s.status);
+        s.key(Key::c('x'));
+        assert_eq!(s.selection, vec![ClipId(901), ClipId(902)], "{}", s.status);
+        s.key(Key::c('x'));
+        assert_eq!(s.selection, vec![ClipId(901), ClipId(902), ClipId(903)]);
+        s.key(Key::c(';'));
+        assert!(s.selection.is_empty());
+    }
+
+    #[test]
+    fn w_b_and_e_walk_the_cuts_and_select_mode_gathers_what_they_pass() {
+        let mut s = arranged();
+        at(&mut s, 200.5);
+        s.key(Key::c('x'));                       // focus: track A
+        s.key(Key::c('w'));
+        assert_eq!(s.transport.position(), secs(202.0), "{}", s.status);
+        s.key(Key::c('2')); s.key(Key::c('w'));   // a count: two cuts on
+        assert_eq!(s.transport.position(), secs(205.0));
+        s.key(Key::c('b'));
+        assert_eq!(s.transport.position(), secs(204.0));
+        s.key(Key::c('e'));
+        assert_eq!(s.transport.position(), secs(204.0), "no clip under 204: stays, says so ({})", s.status);
+        at(&mut s, 202.5);
+        s.key(Key::c('e'));
+        assert_eq!(s.transport.position(), secs(204.0));
+        // Select mode: w extends over what it passes
+        s.selection.clear();
+        at(&mut s, 200.0);
+        s.selection.push(ClipId(901));
+        s.key(Key::c('v'));
+        s.key(Key::c('w')); s.key(Key::c('w'));
+        assert!(s.selection.contains(&ClipId(902)), "{:?}", s.selection);
+    }
+
+    #[test]
+    fn c_adds_the_overlapping_clip_on_the_track_below() {
+        let mut s = arranged();
+        at(&mut s, 202.5);
+        s.key(Key::c('x'));
+        assert_eq!(s.selection, vec![ClipId(902)]);
+        s.key(Key::shift('c'));
+        assert_eq!(s.selection, vec![ClipId(902), ClipId(904)], "{}", s.status);
+    }
+
+    #[test]
+    fn gain_mute_and_lock_act_on_the_selection_and_undo_in_one() {
+        let mut s = arranged();
+        s.selection = vec![ClipId(901), ClipId(904)];
+        s.key(Key::c('-'));
+        assert!((clip(&s, 901).gain - 0.95).abs() < 1e-6 && (clip(&s, 904).gain - 0.95).abs() < 1e-6);
+        s.key(Key::c('u'));
+        assert_eq!(clip(&s, 901).gain, 1.0, "one undo for the whole selection");
+        s.key(Key::c('m'));
+        let tr = |s: &Studio, id: u64| s.session.doc.project.tracks.iter().find(|t| t.id == TrackId(id)).unwrap().clone();
+        assert!(tr(&s, 900).muted && tr(&s, 901).muted, "{}", s.status);
+        s.key(Key::c('m'));
+        assert!(!tr(&s, 900).muted);
+        s.key(Key::c('l'));
+        assert!(tr(&s, 900).locked && !tr(&s, 900).muted);
+    }
+
+    #[test]
+    fn loop_record_and_goto_playhead_do_what_they_say() {
+        let mut s = arranged();
+        s.selection = vec![ClipId(901), ClipId(902)];
+        s.key(Key::shift('l'));
+        assert_eq!(s.transport.loop_range, Some((secs(200.0), secs(204.0))), "{}", s.status);
+        s.key(Key::shift('l'));
+        assert_eq!(s.transport.loop_range, None);
+        s.key(Key::c('r'));
+        assert!(s.take_requested, "r asks the shell for a take");
+        at(&mut s, 150.0);
+        s.view.scroll = Ticks::ZERO;
+        s.key(Key::c('g')); s.key(Key::c('c'));
+        assert!(s.view.scroll > secs(140.0) && s.view.scroll < secs(150.0), "{:?}", s.view.scroll);
+    }
+
+    #[test]
+    fn duplicate_lands_right_after_the_selection_and_leaves_the_clipboard() {
+        let mut s = arranged();
+        s.clipboard = vec![ClipId(903)];
+        s.selection = vec![ClipId(901), ClipId(902)];
+        s.duplicate_selected();
+        let p = &s.session.doc.project;
+        let copies: Vec<_> = s.selection.iter().map(|id| (p.clips[id].pos, p.clips[id].track)).collect();
+        // the copy of 901 lands at 204 -- where 903 is not (205), so no room needed
+        assert!(copies.contains(&(secs(204.0), TrackId(900))), "{copies:?} ({})", s.status);
+        assert_eq!(s.clipboard, vec![ClipId(903)], "D is not a yank");
+    }
+
+    #[test]
+    fn brackets_fade_in_to_and_out_from_the_playhead() {
+        let mut s = arranged();
+        s.selection = vec![ClipId(902)];          // 202-204
+        at(&mut s, 202.5);
+        s.fade_to_playhead(true);
+        assert_eq!(s.session.doc.project.fades.get(&ClipId(902)), Some(&(secs(0.5), Ticks::ZERO)), "{}", s.status);
+        at(&mut s, 203.25);
+        s.fade_to_playhead(false);
+        assert_eq!(s.session.doc.project.fades.get(&ClipId(902)), Some(&(secs(0.5), secs(0.75))), "the fade-in is kept");
+        at(&mut s, 210.0);
+        s.fade_to_playhead(true);
+        assert!(s.status.contains("inside"), "{}", s.status);
+    }
+
+    #[test]
+    fn normalize_brings_the_played_part_of_the_source_to_minus_one_dbfs() {
+        let mut s = arranged();
+        // the source: 0.25 peak for the first 2 s, 0.8 after -- clip 901
+        // plays 0-2 s, clip 902 plays 2-4 s
+        let rate = 1000;
+        let ch: Vec<f32> = (0..6000).map(|i| if i < 2000 { 0.25 * ((i % 7) as f32 / 7.0) } else { -0.8 }).collect();
+        let peak_a = ch[..2000].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let audio = [(SourceId(900), studio_audio::SourceAudio { sample_rate: rate, channels: vec![ch] })].into();
+        s.selection = vec![ClipId(901), ClipId(902)];
+        s.normalize_selected(&audio);
+        assert!((clip(&s, 901).gain - (0.891_250_9 / peak_a).min(1.5)).abs() < 1e-4, "{} {}", clip(&s, 901).gain, s.status);
+        assert!((clip(&s, 902).gain - 0.891_250_9 / 0.8).abs() < 1e-4, "{}", clip(&s, 902).gain);
+        assert!(s.status.contains("capped"), "0.89/0.21 > 1.5 is capped and said: {}", s.status);
+    }
+}
+
+/// Wall clock in ms, for undo notes ("2 min ago"). Not gated on the `app`
+/// feature like `now_ms`, because the headless shell keeps notes too.
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }

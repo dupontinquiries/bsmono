@@ -1,0 +1,102 @@
+//! Render a Studio project's full mix to raw 48 kHz stereo f32 (little-endian,
+//! interleaved), the way Studio hears it: file clips, pattern clips from the
+//! rack, the busses. Encode it with ffmpeg:
+//!     cargo run -p studio-app --example render_project -- song.studio out.f32
+//!     ffmpeg -f f32le -ar 48000 -ac 2 -i out.f32 -c:a libopus -b:a 128k out.opus
+//! Rendered in 5 s chunks through one effect cache (the export's way). Prints
+//! the peak so a render over full scale is said, not heard first.
+//!
+//! For bisecting a fault (a crackle, say), after the two paths:
+//!   --from S --to S          render only that window
+//!   --bypass kind,kind       remove those effect kinds from every bus and clip
+//!   --mute-synths            mute the rack's stand-in synths (Sine / Sub)
+//!   --solo TEXT[,TEXT]       only the tracks whose name contains any TEXT
+//!                            (through their busses and the master, as heard
+//!                            soloed); the matches are printed
+//!   --rate HZ                render at HZ (8000 .. 192000; default 48000):
+//!                            low for quick iteration, high to look for
+//!                            aliasing. Media is converted once at load with
+//!                            a band-limited resampler (studio_audio::resample)
+//!                            -- the mixdown's own linear reader would fold a
+//!                            downsample. The raw output is at HZ.
+//!   --threads N              render on N cores (default: all): the span cut
+//!                            into segments, each rendered from 6 s before
+//!                            its start (discarded) so effects have settled
+//!                            -- studio_audio::mixdown_parallel. 1 = the
+//!                            serial render, bit-exact with before.
+//!   --dry-master             bypass the "Master" bus's chain: the MIX, from the
+//!                            same project that renders the master -- one project,
+//!                            both deliverables, no re-export between them
+use std::collections::BTreeMap;
+use std::io::Write;
+
+fn main() {
+    let a: Vec<String> = std::env::args().collect();
+    let path = std::path::PathBuf::from(&a[1]);
+    let opt = |k: &str| a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).cloned();
+    let bypass: Vec<String> = opt("--bypass").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default();
+    let t_load = std::time::Instant::now();
+    let save = studio_collab::file::SaveFile::decode(&std::fs::read(&path).unwrap()).expect("project");
+    let mut rack = save.rack.clone().unwrap_or_else(studio_live::Rack::trap_kit);
+    let mut project = save.to_project();
+    for b in project.busses.values_mut() { b.chain.retain(|e| !bypass.contains(&e.kind)); }
+    if a.iter().any(|x| x == "--dry-master") {
+        for b in project.busses.values_mut().filter(|b| b.name == "Master") { b.chain.clear(); }
+    }
+    for c in project.clips.values_mut() { c.effects.retain(|e| !bypass.contains(&e.kind)); }
+    if a.iter().any(|x| x == "--mute-synths") {
+        for ch in rack.channels.iter_mut() {
+            if matches!(ch.kind, studio_live::SynthKind::Sine { .. } | studio_live::SynthKind::Sub { .. }) { ch.muted = true; }
+        }
+    }
+    let base = path.parent().unwrap();
+    let rate: u32 = opt("--rate").and_then(|v| v.parse().ok()).unwrap_or(48_000);
+    assert!((8_000..=192_000).contains(&rate), "--rate: 8000 .. 192000");
+    // decoded, and converted to `rate`, on every core (studio_app::load)
+    let t = std::time::Instant::now();
+    let (mut audio, failed) = studio_app::load::load_sources(&project, base, Some(rate), 0);
+    for f in &failed { eprintln!("cannot decode {f}"); }
+    eprintln!("decoded {} source(s) at {rate} Hz in {:.1} s", audio.len(), t.elapsed().as_secs_f64());
+    let mut stamps = BTreeMap::new();
+    studio_app::pattern_clips::refresh_at(&project, &rack, &mut audio, &mut stamps, rate);
+    let fades: BTreeMap<studio_core::ClipId, studio_audio::Fades> = project.fades.iter()
+        .map(|(id, (i, o))| (*id, studio_audio::Fades { fade_in: *i, fade_out: *o })).collect();
+    let end = opt("--to").and_then(|v| v.parse().ok()).map(studio_core::Ticks::from_seconds).unwrap_or(project.duration());
+    let mut out = std::io::BufWriter::new(std::fs::File::create(&a[2]).unwrap());
+    let load_s = t_load.elapsed().as_secs_f64();
+    let t_mix = std::time::Instant::now();
+    let mut cache = studio_audio::EffectCache::new();
+    let start = opt("--from").and_then(|v| v.parse().ok()).map(studio_core::Ticks::from_seconds).unwrap_or(studio_core::Ticks::ZERO);
+    let solo: Vec<studio_core::TrackId> = match opt("--solo") {
+        Some(v) => {
+            let want: Vec<&str> = v.split(',').collect();
+            let hit: Vec<&studio_core::Track> = project.tracks.iter().filter(|t| want.iter().any(|w| t.name.contains(w))).collect();
+            eprintln!("solo: {}", hit.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(" | "));
+            assert!(!hit.is_empty(), "--solo matched no track");
+            hit.iter().map(|t| t.id).collect()
+        }
+        None => Vec::new(),
+    };
+    let (mut t, step, mut peak) = (start, studio_core::Ticks::from_seconds(5.0), 0.0f32);
+    let threads: usize = opt("--threads").and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    if threads > 1 {
+        let mix = studio_audio::mixdown_parallel(&project, &audio, &fades, start, end, rate, &solo, threads,
+                                                 studio_core::Ticks::from_seconds(6.0), step);
+        let mut bytes = Vec::with_capacity(mix.len() * 4);
+        for x in &mix { peak = peak.max(x.abs()); bytes.extend_from_slice(&x.to_le_bytes()); }
+        out.write_all(&bytes).unwrap();
+    } else {
+        while t < end {
+            let to = t.saturating_add(step).min(end);
+            let mix = studio_audio::mixdown_with_cache(&project, &audio, &fades, t, to, rate, &solo, &[], &mut cache);
+            for x in &mix { peak = peak.max(x.abs()); out.write_all(&x.to_le_bytes()).unwrap(); }
+            t = to;
+            eprint!("\r{:.0} / {:.0} s", t.to_seconds(), end.to_seconds());
+        }
+    }
+    eprintln!("\npeak {:.2} ({:+.1} dBFS)", peak, 20.0 * peak.max(1e-9).log10());
+    let (mix_s, song_s) = (t_mix.elapsed().as_secs_f64(), end.saturating_sub(start).to_seconds());
+    eprintln!("timing: load {load_s:.1} s (decode + patterns), mix {mix_s:.1} s for {song_s:.1} s of song = {:.2}x real time",
+              song_s / mix_s.max(1e-9));
+}

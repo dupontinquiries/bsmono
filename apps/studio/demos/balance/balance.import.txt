@@ -1,0 +1,16 @@
+1660 clips on 65 tracks, 21 rack channels, 67 rack patterns, 31 busses; 160 BPM
+9 plugin synths cannot be hosted and their sound is not in the file -- STAND-INS, notes kept: Omnisphere #15 (VST) -> Sine; Omnisphere #18 (VST) -> Sine; looperman-l-1994078-0217096-djrellruger-yeezy-choir-rellruger-soul-sample #2 (Slicex) -> Sine; Omnisphere #2 (VST) -> Sine; Omnisphere #10 (VST) -> Sine; Omnisphere #3 (VST) -> Sine; Omnisphere #4 (VST) -> Sine; Omnisphere #8 (VST) -> Sub; Omnisphere #7 (VST) -> Sine
+patterns are on 16th steps: 286 notes off the grid moved to the nearest step, 0 hits landed on an already-set step (merged)
+master: FL's master insert is the bus "Master" (chain: gain -> eq -> limiter -> limiter); every bus that fed it feeds this
+SIDECHAIN (FL's level-0 routes) as a duck keyed by the source: KckTrans ducks under 808, 808 ducks under KckLo, VMain ducks under Snr -- at Studio's defaults (threshold -24 dB, depth 10 dB, attack 5 / release 150 ms): FL's compressor settings on the destination are not decoded
+27 clips overlapped another on its FL track (FL allows it) -- moved to an overflow track, marked (2)
+243 audio clips declicked: 3 ms fades at each edge, as FL does by default
+190 automation clips not imported (their points are not read yet)
+effects read or approximated: Fruity Balance: exact kind (pan not kept); Pitcher on VMain: key C major / A minor (read from Pitcher's note switches); speed 191 ms, sliding into each note (INFERRED from Pitcher's knob 0.523); Soundgoodizer: approximate: Soundgoodizer is a Maximus preset
+autotune on VMain tunes: Balance_V3ish_2, Balance_V3ish_2 (2), Balance_V3ish_2 #4, Balance_V3ish_2 #6, Balance_V2
+every mapped effect is at Studio's DEFAULT settings -- the plugin parameters are not decoded
+effects with no Studio counterpart, left out: Edison, Fruity Chorus, Fruity Flangus x2, Fruity Love Philter, Fruity PanOMatic, Fruity Peak Controller x4, Fruity Stereo Enhancer x6, Fruity Stereo Shaper x4, Master, Neutron 3 x6, Neutron 3 Transient Shaper x3, Ozone 8 x2, Ozone 8 Dynamic EQ, Ozone 8 Dynamics, Ozone 8 Equalizer, Ozone 8 Exciter x14, Ozone 8 Imager x6, Ozone 8 Spectral Shaper, Ozone 8 Vintage Limiter, Ozone 8 Vintage Tape x3, Vocal Doubler x2, a plugin x3, color, out of way, tonal specific
+routing: 21 busses output into another bus, 6 sends at FL's send levels; the rest feed the master
+4 insert pans not imported (Studio busses have no pan)
+faders are FL's value / 12800 as linear gain: FL's fader law is not linear, so levels are close, not exact
+media: 33 files as Opus (the .wav names FL used map to the .opus beside them)

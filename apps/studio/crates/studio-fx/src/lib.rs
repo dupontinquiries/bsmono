@@ -100,6 +100,21 @@ impl Biquad {
                  x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0 }
     }
 
+    /// The RBJ second-order ALLPASS: unity magnitude, a phase turn about
+    /// `freq`. At Q = 1/sqrt(2) it is EXACTLY an LR4 crossover's low + high
+    /// halves summed (analog: (s^4 + 1)/(s^2 + sqrt2 s + 1)^2 = (s^2 - sqrt2 s
+    /// + 1)/(s^2 + sqrt2 s + 1); the bilinear transform keeps it) -- one
+    /// section where the multiband ran four.
+    pub fn allpass(rate: f32, freq: f32, q: f32) -> Biquad {
+        let f = freq.clamp(1.0, rate * 0.49);
+        let w = std::f32::consts::TAU * f / rate;
+        let (sn, cs) = (w.sin(), w.cos());
+        let alpha = sn / (2.0 * q.max(0.01));
+        let a0 = 1.0 + alpha;
+        Biquad { b0: (1.0 - alpha) / a0, b1: -2.0 * cs / a0, b2: 1.0, a1: -2.0 * cs / a0, a2: (1.0 - alpha) / a0,
+                 x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0 }
+    }
+
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
@@ -126,6 +141,10 @@ impl Biquad {
     }
 
     pub fn reset(&mut self) { self.x1 = 0.0; self.x2 = 0.0; self.y1 = 0.0; self.y2 = 0.0; }
+    /// Advance the memory as an identity filter would (y = x), without the
+    /// arithmetic: what a flat band does instead of `process`.
+    #[inline]
+    pub fn pass(&mut self, x: f32) { self.x2 = self.x1; self.x1 = x; self.y2 = self.y1; self.y1 = x; }
     /// These coefficients with `old`'s memory — a redesign that does not
     /// restart the filter.
     pub fn with_state_of(mut self, old: &Biquad) -> Biquad {
@@ -137,6 +156,13 @@ impl Biquad {
 /// What a band was designed from, kept so it can be redesigned live.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BandDesign { pub kind: BandKind, pub freq: f32, pub q: f32, pub gain_db: f32 }
+
+impl BandDesign {
+    /// A band that does nothing: a bell or shelf at 0 dB.
+    pub fn is_flat(&self) -> bool {
+        self.gain_db == 0.0 && matches!(self.kind, BandKind::Peaking | BandKind::LowShelf | BandKind::HighShelf)
+    }
+}
 
 /// A stack of bands. `designs` and `rate` are filled by `instantiate` so
 /// a band can be redesigned in place (`set_band`); an `Eq` built by hand
@@ -150,9 +176,20 @@ pub struct Eq {
 }
 
 impl Eq {
+    /// A FLAT band -- peaking or shelf at 0 dB -- is the identity (at A = 1
+    /// the RBJ numerator and denominator are the same floats; computing it
+    /// only adds the rounding of its five-term sum, ~2e-6 at 0.5), so it is not
+    /// computed: it only records its input as its history, which is
+    /// what it would have held (y = x), so a ride that later gives it gain
+    /// picks up seamlessly. Every imported FL EQ starts flat (its settings
+    /// are not decoded): 49 of them were a third of Balance's render.
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
-        self.bands.iter_mut().fold(x, |acc, b| b.process(acc))
+        let mut acc = x;
+        for (i, b) in self.bands.iter_mut().enumerate() {
+            if self.designs.get(i).is_some_and(BandDesign::is_flat) { b.pass(acc); } else { acc = b.process(acc); }
+        }
+        acc
     }
     /// Redesign band `i` around one changed value, keeping the filter's
     /// memory: a transposed-direct-form biquad takes new coefficients
@@ -254,9 +291,13 @@ pub struct Limiter {
     release_c: f32,
     gain_db: f32,
     delay: Vec<f32>,
-    /// Gain required by each sample in the lookahead window, parallel to `delay`.
-    need: Vec<f32>,
     head: usize,
+    /// The lookahead window's gain needs as a MONOTONIC DEQUE (index, need),
+    /// needs increasing from the front: the front is the window's minimum.
+    /// Was an O(window) scan per sample -- on Balance, twelve limiters were
+    /// 76% of the whole render (examples/profile_mix). Same answer, exactly.
+    win: std::collections::VecDeque<(u64, f32)>,
+    count: u64,
 }
 
 impl Limiter {
@@ -267,8 +308,9 @@ impl Limiter {
             release_c: time_const(release_ms, rate),
             gain_db: 0.0,
             delay: vec![0.0; n],
-            need: vec![0.0; n],
             head: 0,
+            win: std::collections::VecDeque::with_capacity(n + 1),
+            count: 0,
         }
     }
 
@@ -288,14 +330,17 @@ impl Limiter {
         };
         let delayed = self.delay[self.head];
         self.delay[self.head] = x;
-        self.need[self.head] = need;
         self.head = (self.head + 1) % self.delay.len();
 
-        // Required gain over the whole lookahead window. O(window) per sample —
-        // a monotonic deque would make it O(1), and is the right optimisation
-        // later; being audibly correct first is worth more than being fast at
-        // letting samples through.
-        let target = self.need.iter().copied().fold(0.0f32, f32::min);
+        // Required gain over the whole lookahead window (the last n needs,
+        // this one included): the deque's front, amortised O(1). Slots not
+        // yet filled count as 0 dB, as the zeroed window did before.
+        while self.win.back().is_some_and(|b| b.1 >= need) { self.win.pop_back(); }
+        self.win.push_back((self.count, need));
+        let n = self.delay.len() as u64;
+        while self.win.front().is_some_and(|f| f.0 + n <= self.count) { self.win.pop_front(); }
+        self.count += 1;
+        let target = self.win.front().map_or(0.0, |f| f.1).min(0.0);
         self.gain_db = if target < self.gain_db {
             target // attack is instant: that is what "brickwall" means
         } else {
@@ -478,7 +523,7 @@ pub enum Instance {
     /// codebase's own README describes) had no way to land anywhere in
     /// `Bus.chain` at all — mirrors `chain::Module::Gain`, the same concept
     /// `Chain`'s own strip already has.
-    Gain(f32),
+    Gain(f32, f32),
     Transform(Transform),
     Color(Color),
     /// A feedback comb whose loop is low-passed — the tuned-comb voice, not a
@@ -526,7 +571,7 @@ impl Instance {
             Instance::Limiter(l) => l.process(x),
             Instance::Multiband(m) => m.process(x),
             Instance::Saturator(s) => s.process(x),
-            Instance::Gain(db) => x * from_db_pub(*db),
+            Instance::Gain(db, level) => x * from_db_pub(*db) * *level,
             Instance::Blend(..) => x, // a layer instruction: silence for audio, per the doc above
             Instance::RealTune(t) => t.process(x),
             Instance::AdaptiveSat(a) => a.process(x),
@@ -553,7 +598,7 @@ impl Instance {
     pub fn is_live_param(kind: &str, key: &str) -> bool {
         let stem = key.trim_end_matches(|c: char| c.is_ascii_digit());
         let live: &[&str] = match kind {
-            "gain" => &["db"],
+            "gain" => &["db", "level"],
             "eq" => return key != stem && matches!(stem, "freq" | "q" | "gain"),
             "compressor" => &["threshold", "ratio", "knee", "makeup"],
             "limiter" => &["ceiling"],
@@ -579,9 +624,20 @@ impl Instance {
     /// delay's time, a limiter's lookahead, a grain length, a channel
     /// count — buffer sizes, not values. `rate` is needed only by the
     /// delay's damping; every other setter is rate-free.
+    /// Tell an instance the song position (in frames) of the first sample it
+    /// is about to receive. Only effects whose decisions run on a grid of
+    /// their own need it (the autotune's analysis hops); for the rest, a no-op.
+    pub fn align(&mut self, at: i64) {
+        if let Instance::RealTune(t) = self { t.align(at); }
+    }
+
     pub fn set_param(&mut self, key: &str, v: f32, rate: f32) -> bool {
         match self {
-            Instance::Gain(db) => { if key == "db" { *db = v; true } else { false } }
+            Instance::Gain(db, level) => match key {
+                "db" => { *db = v; true }
+                "level" => { *level = v.max(0.0); true }
+                _ => false,
+            },
             Instance::Eq(eq) => {
                 let (which, i) = match key.find(|c: char| c.is_ascii_digit()) {
                     Some(n) => (&key[..n], key[n..].parse::<usize>().ok()),
@@ -754,7 +810,7 @@ pub fn instantiate(effect: &studio_core::Effect, rate: f32) -> Option<Instance> 
             sat.auto_gain = p(q, "auto_gain", 1.0) > 0.5;
             Instance::Saturator(sat)
         }
-        "gain" => Instance::Gain(p(q, "db", 0.0)),
+        "gain" => Instance::Gain(p(q, "db", 0.0), p(q, "level", 1.0).max(0.0)),
         "transform" => Instance::Transform(Transform {
             x: p(q, "x", 0.0), y: p(q, "y", 0.0),
             scale_x: p(q, "scale_x", 1.0), scale_y: p(q, "scale_y", 1.0),
@@ -810,6 +866,9 @@ pub fn instantiate(effect: &studio_core::Effect, rate: f32) -> Option<Instance> 
                 target, rate, p(q, "channels", 2.0).clamp(1.0, 8.0) as usize);
             t.retune_speed_ms = p(q, "speed", 30.0).max(0.0);
             t.voiced_threshold = p(q, "voiced", 0.15).clamp(0.0, 1.0);
+            t.slide = p(q, "slide", 0.0) >= 0.5;
+            t.amount = p(q, "amount", 1.0).clamp(0.0, 1.0);
+            t.tolerance_cents = p(q, "tolerance", 0.0).clamp(0.0, 100.0);
             Instance::RealTune(Box::new(t))
         }
         "tapestop" => Instance::TapeStop(playrate::TapeStop::new(
@@ -843,6 +902,43 @@ pub fn instantiate(effect: &studio_core::Effect, rate: f32) -> Option<Instance> 
         }),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod limiter_deque_tests {
+    use super::*;
+
+    /// The limiter as it was: an O(window) scan per sample.
+    struct Naive { ceiling_db: f32, release_c: f32, gain_db: f32, delay: Vec<f32>, need: Vec<f32>, head: usize }
+    impl Naive {
+        fn process(&mut self, x: f32) -> f32 {
+            let need = { let over = to_db(x) - self.ceiling_db; if over > 0.0 { -over } else { 0.0 } };
+            let delayed = self.delay[self.head];
+            self.delay[self.head] = x;
+            self.need[self.head] = need;
+            self.head = (self.head + 1) % self.delay.len();
+            let target = self.need.iter().copied().fold(0.0f32, f32::min);
+            self.gain_db = if target < self.gain_db { target } else { target + self.release_c * (self.gain_db - target) };
+            delayed * from_db(self.gain_db)
+        }
+    }
+
+    #[test]
+    fn the_deque_limiter_is_bit_identical_to_the_scan_it_replaced() {
+        let rate = 48_000.0;
+        let mut fast = Limiter::new(rate, -0.3, 5.0, 60.0);
+        let n = fast.lookahead_samples();
+        let mut slow = Naive { ceiling_db: -0.3, release_c: time_const(60.0, rate), gain_db: 0.0, delay: vec![0.0; n], need: vec![0.0; n], head: 0 };
+        let mut x = 99u64;
+        let mut rnd = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x % 20_000) as f32 / 10_000.0 - 1.0 };
+        for i in 0..200_000 {
+            // quiet stretches, loud bursts, lone spikes: every path of the deque
+            let amp = if (i / 3000) % 3 == 0 { 0.2 } else if i % 997 == 0 { 4.0 } else { 1.6 };
+            let s = rnd() * amp;
+            let (a, b) = (fast.process(s), slow.process(s));
+            assert_eq!(a.to_bits(), b.to_bits(), "sample {i}: {a} vs {b}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1059,6 +1155,33 @@ mod tests {
         }
     }
 
+    /// A flat band is the identity to float rounding (the premise of skipping
+    /// it; NOT to the bit -- the five-term sum rounds, which this test found),
+    /// and an EQ that skipped its flat band, then had it raised by a ride,
+    /// matches one that computed the band all along.
+    #[test]
+    fn a_flat_band_is_skipped_and_a_later_ride_picks_up_seamlessly() {
+        let x: Vec<f32> = (0..4_000).map(|i| ((i * 7919 % 1000) as f32 / 500.0 - 1.0) * 0.5).collect();
+        for kind in [BandKind::Peaking, BandKind::LowShelf, BandKind::HighShelf] {
+            let mut b = Biquad::design(kind, 48_000.0, 700.0, 0.9, 0.0);
+            let worst = x.iter().map(|v| (b.process(*v) - v).abs()).fold(0.0f32, f32::max);
+            assert!(worst < 1e-5, "{kind:?} at 0 dB is the identity to rounding: {worst}");
+        }
+        let e = studio_core::Effect { kind: "eq".into(), enabled: true,
+            params: [("bands".to_string(), 1.0), ("freq0".to_string(), 700.0), ("gain0".to_string(), 0.0)].into() };
+        let Some(Instance::Eq(mut eq)) = instantiate(&e, 48_000.0) else { panic!("an eq") };
+        let mut reference = Biquad::design(BandKind::Peaking, 48_000.0, 700.0, 0.707, 0.0);
+        let mut worst = 0.0f32;
+        for (i, v) in x.iter().enumerate() {
+            if i == 2_000 {
+                eq.set_band(0, None, None, Some(6.0));
+                reference = Biquad::design(BandKind::Peaking, 48_000.0, 700.0, 0.707, 6.0).with_state_of(&reference);
+            }
+            worst = worst.max((eq.process(*v) - reference.process(*v)).abs());
+        }
+        assert!(worst < 1e-5, "skipped-then-ridden vs computed throughout (a seam would be ~1e-2): {worst}");
+    }
+
     #[test]
     fn process_audio_dispatches_to_the_right_audio_effect_and_passes_video_kinds_through() {
         let mut params = std::collections::BTreeMap::new();
@@ -1199,6 +1322,13 @@ mod live_param_tests {
         // EQ with three bands, so the digit rule is exercised past 0).
         let mut live_seen = 0;
         for (kind, _) in schema::KINDS {
+            if schema::BUS_STEREO_KINDS.contains(kind) {
+                // stereo, run by the mixdown on a bus: must NOT be buildable
+                // here, or the mono chain would take it and do it wrong
+                let e = studio_core::Effect { kind: (*kind).into(), params: schema::defaults(kind), enabled: true };
+                assert!(instantiate(&e, 48_000.0).is_none(), "{kind} is stereo: not a per-sample instance");
+                continue;
+            }
             let mut params = schema::defaults(kind);
             if *kind == "eq" { params.insert("bands".into(), 3.0); }
             let e = studio_core::Effect { kind: (*kind).into(), params, enabled: true };
@@ -1403,5 +1533,61 @@ mod adaptive_sat_registry_tests {
     fn tied_is_reachable_from_params() {
         let a = instantiate(&fx("adaptivesat", &[("tied", 1.0)]), 48_000.0);
         assert!(matches!(a, Some(Instance::AdaptiveSat(_))));
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    /// A master-chain stage driven hard by a loud passage must let go: after
+    /// its release, a quiet signal passes at (near) unity. Goat's whole-song
+    /// render lost ~10 dB of low end at 3:04 (peaks -16.6 dBFS) that a render
+    /// STARTED at 3:04 did not -- gain reduction carried from the loud intro?
+    /// (gain reduction during the loud passage, gain on the quiet tail), dB.
+    /// The first must be real, or "it recovered" says nothing: a stage that
+    /// never engaged recovers trivially.
+    fn recovers(kind: &str) -> (f32, f32) {
+        let rate = 48_000u32;
+        let mut params = std::collections::BTreeMap::new();
+        // a default multiband has every band BYPASSED (crossovers only), so it
+        // cannot hold gain; engage its bands, or the test measures a split-and-sum
+        if kind == "multiband" { for i in 0..3 { params.insert(format!("band{i}_bypass"), 0.0f32); } }
+        let e = studio_core::Effect { kind: kind.into(), enabled: true, params };
+        let mut fx = instantiate(&e, rate as f32).expect("an instance");
+        let tone = |i: usize, a: f32| a * (i as f32 / rate as f32 * 60.0 * std::f32::consts::TAU).sin();
+        // 2 s at +12 dBFS (a float master bus goes over 0; Goat's intro did)
+        let loud = 4.0f32;
+        let hot: Vec<f32> = (0..rate as usize * 2).map(|i| fx.process_audio(tone(i, loud))).collect();
+        let hot_rms = (hot[rate as usize..].iter().map(|x| x * x).sum::<f32>() / rate as f32).sqrt();
+        let reduction = 20.0 * (hot_rms / (loud / std::f32::consts::SQRT_2)).log10();
+        let quiet = 0.03f32;                                                        // -30 dBFS
+        let n = rate as usize * 6;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n { out.push(fx.process_audio(tone(i, quiet))); }
+        let tail = &out[rate as usize * 4..];                                      // after 4 s of quiet
+        let rms = (tail.iter().map(|x| x * x).sum::<f32>() / tail.len() as f32).sqrt();
+        (reduction, 20.0 * (rms / (quiet / std::f32::consts::SQRT_2)).log10())
+    }
+
+    #[test]
+    fn the_limiter_lets_go_after_a_loud_passage() {
+        let (red, g) = recovers("limiter");
+        assert!(red < -3.0, "limiter must engage on the loud passage: {red:+.1} dB");
+        assert!(g.abs() < 1.0, "limiter still {g:+.1} dB after 4 s of quiet");
+    }
+
+    #[test]
+    fn the_compressor_lets_go_after_a_loud_passage() {
+        let (red, g) = recovers("compressor");
+        assert!(red < -3.0, "compressor must engage on the loud passage: {red:+.1} dB");
+        assert!(g.abs() < 1.0, "compressor still {g:+.1} dB after 4 s of quiet");
+    }
+
+    #[test]
+    fn the_multiband_lets_go_after_a_loud_passage() {
+        let (red, g) = recovers("multiband");
+        assert!(red < -3.0, "multiband must engage on the loud passage: {red:+.1} dB");
+        assert!(g.abs() < 1.0, "multiband still {g:+.1} dB after 4 s of quiet");
     }
 }

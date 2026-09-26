@@ -421,11 +421,40 @@ pub fn timeline(
         }
     }
     let rows = track_rows(&doc.project);
-    let height = RULER_H + rows.len().max(1) as f32 * view.track_h;
+    // + the mode HUD's own strip under the last track (see the HUD below)
+    let height = RULER_H + rows.len().max(1) as f32 * view.track_h + HUD_H;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click_and_drag());
     let origin = rect.min;
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, colors.bg_base);
+
+    // ── markers, in the ruler ──────────────────────────────────────────────
+    // They were in the project and reachable from the palette, and drawn
+    // NOWHERE: the assembly's review markers, the constraint check's and the
+    // vfx survey's were invisible on the timeline they were about (c20).
+    // A tick down the ruler and the name beside it, coloured by what made
+    // it; a name longer than the gap to the next marker is cut short.
+    {
+        let mut ms: Vec<&studio_core::Marker> = doc.project.markers.iter().collect();
+        ms.sort_by_key(|m| m.at);
+        for (i, m) in ms.iter().enumerate() {
+            let x = view.time_to_x(m.at, origin.x);
+            if x < origin.x + view.gutter || x > rect.max.x { continue; }
+            let col = match marker_kind(&m.name) {
+                MarkerKind::Review => colors.warning,
+                MarkerKind::Constraint => colors.danger,
+                MarkerKind::Vfx => colors.accent,
+                MarkerKind::Plain => colors.text_weak,
+            };
+            painter.line_segment([Pos2::new(x, origin.y), Pos2::new(x, origin.y + RULER_H)], Stroke::new(2.0_f32, col));
+            let room = ms.get(i + 1).map(|n| view.time_to_x(n.at, origin.x) - x - 6.0).unwrap_or(rect.max.x - x - 6.0);
+            let chars = ((room / 6.0).floor() as usize).clamp(0, 48);
+            if chars >= 4 {
+                let label: String = if m.name.chars().count() > chars { format!("{}…", m.name.chars().take(chars - 1).collect::<String>()) } else { m.name.clone() };
+                painter.text(Pos2::new(x + 3.0, origin.y + RULER_H - 2.0), Align2::LEFT_BOTTOM, label, FontId::proportional(10.0), col);
+            }
+        }
+    }
 
     // ── ruler ──────────────────────────────────────────────────────────────
     if let Some(map) = tempo {
@@ -560,6 +589,19 @@ pub fn timeline(
                     }
                 }
             }
+            // Fades, drawn the way every editor draws them: the part the fade
+            // takes away shaded, and the ramp on top. They were in the model
+            // and in the render and invisible here -- `[` made a fade and the
+            // clip looked untouched (seen under Xvfb, c20).
+            if let Some((fi, fo)) = doc.project.fades.get(&clip.id) {
+                let px = |t: Ticks| t.to_seconds() as f32 * view.px_per_sec;
+                let fade_painter = painter.with_clip_rect(r.intersect(Rect::from_min_max(
+                    Pos2::new(origin.x + view.gutter, r.min.y), Pos2::new(rect.max.x, r.max.y))));
+                for (tri, ramp) in fade_triangles(r, px(*fi), px(*fo)) {
+                    fade_painter.add(egui::Shape::convex_polygon(tri.to_vec(), colors.bg_base.gamma_multiply(0.55), Stroke::NONE));
+                    fade_painter.line_segment(ramp, Stroke::new(1.5_f32, colors.text));
+                }
+            }
             // What is being said, along the clip's bottom edge — the gutter
             // between this lane and the next. Laid out by
             // `studio_voice::gutter_words`, so zoomed out it is an occasional
@@ -602,7 +644,7 @@ pub fn timeline(
         let x = view.time_to_x(peer.playhead, origin.x);
         if x < origin.x + view.gutter || x > rect.max.x { continue; }
         let tint = peer_color(peer.site.0);
-        painter.line_segment([Pos2::new(x, origin.y + RULER_H), Pos2::new(x, rect.max.y)],
+        painter.line_segment([Pos2::new(x, origin.y + RULER_H), Pos2::new(x, hud_band(rect).top())],
                              Stroke::new(1.5_f32, tint));
         // the name rides at the top so several peers stay readable
         // A live take is said in the label itself: the one thing a
@@ -615,7 +657,8 @@ pub fn timeline(
     // ── our own playhead, last, so it is never hidden by a peer's ──────────
     let px = view.time_to_x(playhead, origin.x);
     if px >= origin.x + view.gutter {
-        painter.line_segment([Pos2::new(px, origin.y), Pos2::new(px, rect.max.y)],
+        // down to the last track, not through the HUD strip under it
+        painter.line_segment([Pos2::new(px, origin.y), Pos2::new(px, hud_band(rect).top())],
                              Stroke::new(2.0_f32, colors.danger));
     }
 
@@ -806,35 +849,68 @@ pub fn timeline(
         } else {
             mode.hints()
         };
-        let pad = 6.0_f32;
-        let line_h = 13.0_f32;
+        // ONE LINE in a strip of its own under the last track. It was a box
+        // pinned to the bottom-left of the tracks, which is the track
+        // headers: with three tracks it hid the second's name and the whole
+        // of the third's header (seen under Xvfb, c20). Here it covers
+        // nothing, and is where it always was relative to the tracks.
+        let band = hud_band(rect);
+        painter.rect_filled(band, 0.0, colors.bg_raised.gamma_multiply(0.6));
         let font_label = egui::FontId::proportional(11.0);
-        let font_hint = egui::FontId::monospace(9.0);
-        let label_w = painter.layout_no_wrap(label.clone(), font_label.clone(), colors.text)
-            .rect.width();
-        let hint_w = hints.iter()
-            .map(|h| painter.layout_no_wrap((*h).to_string(), font_hint.clone(), colors.text_weak)
-                .rect.width())
-            .fold(0.0_f32, f32::max);
-        let w = label_w.max(hint_w) + pad * 2.0;
-        let h = line_h * (1 + hints.len()) as f32 + pad * 2.0;
-        let hud = Rect::from_min_size(
-            Pos2::new(rect.left() + 4.0, rect.bottom() - h - 4.0), egui::vec2(w, h));
-        // Never over the ruler-seek or a clip a person is trying to reach:
-        // clamp to the visible band rather than letting a short, zoomed-out
-        // timeline push it off the top.
-        let hud = hud.translate(egui::vec2(0.0,
-            (origin.y + RULER_H - hud.top()).max(0.0)));
-        painter.rect_filled(hud, 4.0, colors.bg_raised.gamma_multiply(0.85));
-        painter.rect_stroke(hud, 4.0, Stroke::new(1.0, colors.border), egui::StrokeKind::Inside);
-        painter.text(Pos2::new(hud.left() + pad, hud.top() + pad), Align2::LEFT_TOP,
-                     &label, font_label, colors.accent);
-        for (i, h) in hints.iter().enumerate() {
-            painter.text(Pos2::new(hud.left() + pad, hud.top() + pad + line_h * (i + 1) as f32),
-                         Align2::LEFT_TOP, *h, font_hint.clone(), colors.text_weak);
+        let font_hint = egui::FontId::monospace(10.0);
+        let label_gal = painter.layout_no_wrap(label.clone(), font_label, colors.accent);
+        let mut x = band.left() + 8.0;
+        painter.galley(Pos2::new(x, band.center().y - label_gal.rect.height() * 0.5), label_gal.clone(), colors.accent);
+        x += label_gal.rect.width() + 12.0;
+        for h in hints {
+            let g = painter.layout_no_wrap((*h).to_string(), font_hint.clone(), colors.text_weak);
+            // drop what does not fit rather than clip a hint mid-word
+            if x + g.rect.width() > band.right() - 4.0 { break; }
+            painter.galley(Pos2::new(x, band.center().y - g.rect.height() * 0.5), g.clone(), colors.text_weak);
+            x += g.rect.width() + 14.0;
         }
     }
     out
+}
+
+/// The shaded triangle and the ramp line for each of a clip's fades on its
+/// rect `r`, given the fade lengths in pixels (clamped to the clip). The
+/// shaded part is what the fade takes away: the top-left corner for a fade
+/// in, cut by the ramp from the bottom-left up to where the fade ends; the
+/// top-right corner for a fade out, mirrored. Under a pixel: nothing drawn.
+pub fn fade_triangles(r: Rect, in_px: f32, out_px: f32) -> Vec<([Pos2; 3], [Pos2; 2])> {
+    let mut v = Vec::new();
+    let w = r.width();
+    let (fi, fo) = (in_px.clamp(0.0, w), out_px.clamp(0.0, w));
+    if fi >= 1.0 {
+        let top = Pos2::new(r.left() + fi, r.top());
+        v.push(([r.left_top(), top, r.left_bottom()], [r.left_bottom(), top]));
+    }
+    if fo >= 1.0 {
+        let top = Pos2::new(r.right() - fo, r.top());
+        v.push(([top, r.right_top(), r.right_bottom()], [top, r.right_bottom()]));
+    }
+    v
+}
+
+/// What made a marker, by its name's prefix -- the prefixes the tools write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerKind { Review, Constraint, Vfx, Plain }
+
+pub fn marker_kind(name: &str) -> MarkerKind {
+    if name.starts_with("review ") { MarkerKind::Review }
+    else if name.starts_with("constraint: ") { MarkerKind::Constraint }
+    else if name.starts_with("vfx: ") { MarkerKind::Vfx }
+    else { MarkerKind::Plain }
+}
+
+/// Height of the mode HUD's strip under the last track.
+pub const HUD_H: f32 = 22.0;
+
+/// Where the mode HUD draws inside the timeline's rect: the strip below the
+/// tracks, which the timeline allocates for it and nothing else uses.
+pub fn hud_band(rect: Rect) -> Rect {
+    Rect::from_min_max(Pos2::new(rect.left(), rect.bottom() - HUD_H), rect.max)
 }
 
 /// What hovering a clip teaches. One source of truth: the shell's key
@@ -845,6 +921,9 @@ pub const CLIP_HINTS: &[&str] = &[
     "Q: quantize selected clip starts to the beat grid",
     ", / . : nudge selected by one step · < / > : by 1 ms",
     "g: group selection into a composition · G: ungroup",
+    "D: duplicate selection after itself · n: normalize to -1 dBFS",
+    "[ / ] : fade in to / out from the playhead (over a lower video track: a dissolve)",
+    "= / - : clip gain · m: mute track · l: lock track",
     "C-r: record a take from the microphone at the playhead",
 ];
 
@@ -1459,5 +1538,47 @@ mod pattern_drop_tests {
         let mut only_video = Project::default();
         only_video.apply(&studio_core::Op::AddTrack { track: track(1, TrackKind::Video), at: 0 }).unwrap();
         assert!(pattern_drop_target(&only_video, &view, Pos2::new(50.0, 50.0), origin, Ticks::ZERO).is_none());
+    }
+}
+
+#[cfg(test)]
+mod fade_and_hud_tests {
+    use super::*;
+
+    #[test]
+    fn a_fade_shades_the_corner_it_takes_away_and_the_ramp_rises_toward_full() {
+        let r = Rect::from_min_size(Pos2::new(100.0, 10.0), Vec2::new(200.0, 40.0));
+        let f = fade_triangles(r, 50.0, 20.0);
+        assert_eq!(f.len(), 2);
+        let (tri, ramp) = f[0];
+        assert_eq!(tri, [Pos2::new(100.0, 10.0), Pos2::new(150.0, 10.0), Pos2::new(100.0, 50.0)]);
+        assert_eq!(ramp, [Pos2::new(100.0, 50.0), Pos2::new(150.0, 10.0)], "fade in: silent bottom-left up to full");
+        let (tri, ramp) = f[1];
+        assert_eq!(tri, [Pos2::new(280.0, 10.0), Pos2::new(300.0, 10.0), Pos2::new(300.0, 50.0)]);
+        assert_eq!(ramp, [Pos2::new(280.0, 10.0), Pos2::new(300.0, 50.0)], "fade out: full down to silent bottom-right");
+        // longer than the clip: clamped to it; under a pixel: nothing
+        assert_eq!(fade_triangles(r, 900.0, 0.0)[0].1[1].x, 300.0);
+        assert!(fade_triangles(r, 0.4, 0.0).is_empty());
+    }
+
+    #[test]
+    fn markers_are_coloured_by_the_tool_that_wrote_them() {
+        assert_eq!(marker_kind("review 1: missing: \"x\""), MarkerKind::Review);
+        assert_eq!(marker_kind("constraint: 2 violated by 1.0 s"), MarkerKind::Constraint);
+        assert_eq!(marker_kind("vfx: 1 A001_wide: shake"), MarkerKind::Vfx);
+        assert_eq!(marker_kind("the argument"), MarkerKind::Plain);
+        assert_eq!(marker_kind("reviewed by jo"), MarkerKind::Plain, "a word, not the prefix");
+    }
+
+    #[test]
+    fn the_hud_has_its_own_strip_below_every_track() {
+        let (p, view) = (Project::default(), View::default());
+        let _ = p;
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, RULER_H + 3.0 * view.track_h + HUD_H));
+        let band = hud_band(rect);
+        assert_eq!(band.height(), HUD_H);
+        assert!(band.top() >= RULER_H + 3.0 * view.track_h - 1e-3, "starts below the third track: {band:?}");
+        // and no track row maps into it
+        assert_eq!(view.row_at(band.center().y, 0.0, 3), None);
     }
 }

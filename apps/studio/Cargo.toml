@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/studio-core", "crates/studio-collab", "crates/studio-egui", "crates/studio-audio", "crates/studio-live", "crates/studio-voice", "crates/studio-fx", "crates/studio-app", "crates/studio-command", "crates/studio-engine", "crates/studio-io", "crates/studio-copilot", "crates/studio-media", "crates/studio-video"]
+members = ["crates/studio-core", "crates/studio-collab", "crates/studio-egui", "crates/studio-audio", "crates/studio-live", "crates/studio-voice", "crates/studio-fx", "crates/studio-app", "crates/studio-command", "crates/studio-engine", "crates/studio-io", "crates/studio-copilot", "crates/studio-media", "crates/studio-video", "crates/studio-assemble"]
 resolver = "2"
 
 # Monorepo compile-speed/disk policy (see apps/beatspace/Cargo.toml for the

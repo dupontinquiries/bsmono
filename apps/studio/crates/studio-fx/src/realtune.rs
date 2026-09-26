@@ -20,7 +20,11 @@
 //! **Resynthesis** is a two-tap crossfading delay line, not PSOLA: a delay
 //! that ramps at rate `1 - ratio` shifts pitch by `ratio`, and the ramp is
 //! wrapped by crossfading two taps a half-window apart under Hann windows,
-//! which sum to unity at 50% overlap. It is the classic varispeed shifter —
+//! which sum to unity at 50% overlap. Unity for the WINDOWS is not unity
+//! for a periodic voice: taps a fixed half-window apart are usually out of
+//! phase and partly cancel (up to ~3 dB on tones, 8 dB on Goat's vocal), so
+//! each tap is re-seated at its zero-weight wrap a whole number of detected
+//! periods from the other (see [`Shifter`]). It is the classic varispeed shifter —
 //! cheaper than PSOLA, works sample-by-sample with no lookahead, and its
 //! artifact (a faint doubling on large shifts) is the honest trade for
 //! being able to run live at all. Corrections in the few-semitone range
@@ -95,9 +99,7 @@ fn refine_period(x: &[f32], coarse: f32) -> Option<f32> {
     if span < centre as usize { return None; }
     let diff = |l: isize| -> f32 {
         let l = l as usize;
-        let mut d = 0.0;
-        for i in 0..span { let t = x[i] - x[i + l]; d += t * t; }
-        d
+        crate::retune::sq_diff_sum(&x[..span], &x[l..l + span])
     };
     let mut best = lo;
     let mut best_d = f32::INFINITY;
@@ -145,16 +147,30 @@ impl Target {
 }
 
 /// A two-tap crossfading delay line: the resynthesis half.
+///
+/// Tap i reads at `phase_i * w + off[i]`, phase_0 = `frac`, phase_1 =
+/// `frac + 0.5`, weighted hann(phase_i) (the weights sum to 1). With `off`
+/// zero the taps sit a FIXED half-window apart -- and for a periodic voice
+/// that spacing is rarely a whole number of periods, so the crossfade
+/// partly CANCELS: measured 0 to -2.9 dB on steady tones while correcting,
+/// 8 dB on Goat's tuned vocal. So each time a tap wraps (its weight is zero
+/// there: moving it is inaudible), its offset is re-chosen in [0, period)
+/// to put it a whole number of periods from the other tap. In phase, the
+/// weights' unity sum is the output's. Delays stay in [0, w + period), which
+/// the 2w buffer holds for any period below w. No period known (unvoiced,
+/// not locked): offset 0, the fixed-spacing shifter exactly.
 struct Shifter {
     buf: Vec<f32>,
     write: usize,
     /// Ramp position through the window, 0..1.
     frac: f32,
+    /// Each tap's offset past `phase * w`, samples: 0 or in [0, period).
+    off: [f32; 2],
 }
 
 impl Shifter {
     fn new(window: usize) -> Shifter {
-        Shifter { buf: vec![0.0; window.max(4) * 2], write: 0, frac: 0.0 }
+        Shifter { buf: vec![0.0; window.max(4) * 2], write: 0, frac: 0.0, off: [0.0; 2] }
     }
     fn window(&self) -> f32 { (self.buf.len() / 2) as f32 }
 
@@ -167,19 +183,32 @@ impl Shifter {
         self.buf[i0] * (1.0 - f) + self.buf[i1] * f
     }
 
-    fn process(&mut self, x: f32, ratio: f32) -> f32 {
+    /// `period`: the input's period in samples, when voiced -- what the
+    /// taps are kept in phase with.
+    fn process(&mut self, x: f32, ratio: f32, period: Option<f32>) -> f32 {
         let w = self.window();
         self.buf[self.write] = x;
         self.write = (self.write + 1) % self.buf.len();
         // Delay ramping at (1 - ratio) samples per sample IS the pitch
         // shift; the wrap is hidden by the second tap half a window away.
-        self.frac += (1.0 - ratio) / w;
-        self.frac = self.frac.rem_euclid(1.0);
+        let (p0, p1) = (self.frac, (self.frac + 0.5).rem_euclid(1.0));
+        self.frac = (self.frac + (1.0 - ratio) / w).rem_euclid(1.0);
         let f0 = self.frac;
         let f1 = (self.frac + 0.5).rem_euclid(1.0);
+        // a tap WRAPPED when its phase jumped by more than half a cycle
+        let wrapped = |a: f32, b: f32| (a - b).abs() > 0.5;
+        let period = period.filter(|t| *t >= 2.0 && *t < w);
+        for (i, (before, now, other_ph)) in [(p0, f0, f1), (p1, f1, f0)].into_iter().enumerate() {
+            if wrapped(before, now) {
+                self.off[i] = match period {
+                    Some(t) => (other_ph * w + self.off[1 - i] - now * w).rem_euclid(t),
+                    None => 0.0,
+                };
+            }
+        }
         let hann = |f: f32| 0.5 - 0.5 * (std::f32::consts::TAU * f).cos();
         // Hann at 50% overlap sums to unity, so no gain is lost at the seam.
-        self.read_at(f0 * w) * hann(f0) + self.read_at(f1 * w) * hann(f1)
+        self.read_at(f0 * w + self.off[0]) * hann(f0) + self.read_at(f1 * w + self.off[1]) * hann(f1)
     }
 }
 
@@ -204,13 +233,30 @@ pub struct RealtimeTune {
     ring_write: usize,
     hop_countdown: usize,
     hop: usize,
+    /// SLIDE: each new note (a change of target note, or the first voiced
+    /// moment after a breath) starts UNCORRECTED and glides into key at
+    /// `retune_speed_ms` -- the "slide into key" feel. Off, the correction
+    /// runs continuously and a new note inherits the last one's (the hard,
+    /// held feel at speed 0). Until c20 there was only the latter.
+    pub slide: bool,
+    /// How much of the correction to apply, 0..=1: less than 1 leaves some of
+    /// the singer's own pitch in the note.
+    pub amount: f32,
+    /// A note already within this many cents of its target is left alone.
+    pub tolerance_cents: f32,
     /// Current correction in cents, smoothed; ratio is derived from it.
     cents: f32,
+    /// The target note being corrected toward (for SLIDE's new-note test);
+    /// `None` after a breath.
+    last_target: Option<f32>,
     /// The ratio actually applied this sample, ramped toward `ratio_target`
     /// across the hop that follows each analysis.
     ratio: f32,
     ratio_target: f32,
     ratio_step: f32,
+    /// The input's period (samples) at the last voiced analysis; `None`
+    /// unvoiced. Keeps the shifter's taps in phase (see [`Shifter`]).
+    period: Option<f32>,
     lo_hz: f32,
     hi_hz: f32,
     /// Preallocated analysis scratch. Allocating per hop — which the first
@@ -245,9 +291,14 @@ impl RealtimeTune {
             hop_countdown: hop,
             hop: hop.max(1),
             cents: 0.0,
+            slide: false,
+            amount: 1.0,
+            tolerance_cents: 0.0,
+            last_target: None,
             ratio: 1.0,
             ratio_target: 1.0,
             ratio_step: 0.0,
+            period: None,
             frame: vec![0.0; ring_len],
             coarse: vec![0.0; ring_len / DECIMATION + 1],
             lo_hz: crate::retune::DEFAULT_MIN_HZ,
@@ -258,6 +309,37 @@ impl RealtimeTune {
     /// The monitoring delay this adds, in samples. Fixed for the life of the
     /// instance, so a caller can compensate elsewhere if it needs to.
     pub fn latency_samples(&self) -> usize { self.shifters[0].buf.len() / 2 }
+
+    /// Put the analysis grid on the SONG's sample positions: the next input
+    /// frame is song frame `at`. A render started anywhere -- a seek, a
+    /// parallel export's segment -- then analyses at the same instants as a
+    /// render from the start. (Counted from the instance's creation, the grid
+    /// moved with every start, and so did every decision after it.)
+    pub fn align(&mut self, at: i64) {
+        let h = self.hop as i64;
+        let r = at.rem_euclid(h);
+        self.hop_countdown = if r == 0 { self.hop } else { (h - r) as usize };
+    }
+
+    /// Back to the state of a fresh instance -- at digital SILENCE, where there
+    /// is nothing to correct and nothing to remember: after any silent gap the
+    /// tuner is in the same state however the render began.
+    fn rest(&mut self) {
+        self.cents = 0.0;
+        self.last_target = None;
+        self.ratio = 1.0;
+        self.ratio_target = 1.0;
+        self.ratio_step = 0.0;
+        self.period = None;
+        for sh in self.shifters.iter_mut() { sh.frac = 0.0; sh.off = [0.0; 2]; sh.buf.fill(0.0); sh.write = 0; }
+    }
+
+    /// The correction being applied right now, in cents.
+    pub fn correction_cents(&self) -> f32 { self.cents }
+
+    /// The input period (samples) the shifter's taps are kept in phase with:
+    /// the last voiced analysis, `None` while unvoiced.
+    pub fn period_samples(&self) -> Option<f32> { self.period }
 
     /// One interleaved sample. Channel 0's stream drives detection; every
     /// channel gets the same ratio.
@@ -286,7 +368,7 @@ impl RealtimeTune {
                 if done { self.ratio = self.ratio_target; self.ratio_step = 0.0; }
             }
         }
-        self.shifters[ch].process(x, self.ratio)
+        self.shifters[ch].process(x, self.ratio, self.period)
     }
 
     fn analyse(&mut self) {
@@ -312,7 +394,14 @@ impl RealtimeTune {
             *out = acc / DECIMATION as f32;
         }
         let dec_rate = self.sample_rate / DECIMATION as f32;
-        let detected = yin_pitch(dec, dec_rate, self.lo_hz, self.hi_hz.min(dec_rate * 0.4), 0.15)
+        // SILENCE skips the search: YIN cannot find a pitch in it (every
+        // difference 0, the normalized curve flat at 1, no dip), and a vocal
+        // bus is silent between phrases -- most of a song. Below -200 dB
+        // (mean square 1e-20), which only a filter's decaying ring reaches.
+        let energy: f32 = dec.iter().map(|v| v * v).sum();
+        let silent = energy <= 1e-20 * dec.len() as f32;
+        if silent { self.rest(); return; }
+        let detected = if silent { None } else { yin_pitch(dec, dec_rate, self.lo_hz, self.hi_hz.min(dec_rate * 0.4), 0.15) }
             .map(|p| crate::retune::Pitch {
                 hz: refine_period(&self.frame, self.sample_rate / p.hz)
                     .map(|period| self.sample_rate / period)
@@ -325,10 +414,18 @@ impl RealtimeTune {
             // it. (Same call Retune makes; see its docs.)
             self.ratio_target = 1.0;
             self.ratio_step = (1.0 - self.ratio) / self.hop as f32;
+            self.last_target = None;
+            self.period = None;
             return;
         };
+        self.period = Some(self.sample_rate / p.hz);
         let target_hz = self.target.nearest_hz(p.hz);
-        let want_cents = 1200.0 * (target_hz / p.hz).log2();
+        let raw = 1200.0 * (target_hz / p.hz).log2();
+        if self.slide && self.last_target.is_none_or(|t| (t - target_hz).abs() > 0.5) {
+            self.cents = 0.0; // a new note starts as sung, then slides in
+        }
+        self.last_target = Some(target_hz);
+        let want_cents = if raw.abs() <= self.tolerance_cents { 0.0 } else { raw * self.amount.clamp(0.0, 1.0) };
         let hop_ms = self.hop as f32 / self.sample_rate * 1000.0;
         let a = if self.retune_speed_ms <= 0.0 {
             1.0
@@ -531,5 +628,180 @@ mod tests {
         let t = Target::Notes(Vec::new());
         let got = t.nearest_hz(452.0);
         assert!((got - 440.0).abs() < 1.0, "fell back to the nearest semitone, got {got}");
+    }
+
+    fn run(t: &mut RealtimeTune, hz: f32, secs: f32) {
+        for x in sine(hz, secs, 48_000.0) { t.process(x); }
+    }
+    fn chromatic(speed: f32) -> RealtimeTune {
+        let mut t = RealtimeTune::new(Target::Scale(crate::retune::Scale { root: 0, mode: Mode::Chromatic }), 48_000.0, 1);
+        t.retune_speed_ms = speed;
+        t
+    }
+
+    #[test]
+    fn slide_starts_each_new_note_as_sung_and_glides_in_hard_carries_on() {
+        // 452 Hz wants about -47 cents (to A4); 485 Hz about +31 (to B4) -- a different
+        // note. (479 Hz was the first choice: it is nearest A#4, ALSO -47 -- no change to see.)
+        let (mut slide, mut held) = (chromatic(150.0), chromatic(150.0));
+        slide.slide = true;
+        for t in [&mut slide, &mut held] { run(t, 452.0, 1.0); }
+        assert!((slide.correction_cents() + 47.0).abs() < 10.0, "settled on the first note: {}", slide.correction_cents());
+        for t in [&mut slide, &mut held] { run(t, 485.0, 0.06); }
+        assert!(slide.correction_cents().abs() < 25.0, "just after the change the new note is barely corrected: {}", slide.correction_cents());
+        assert!(held.correction_cents() < -10.0, "without slide the OLD correction is still pulling: {}", held.correction_cents());
+        run(&mut slide, 485.0, 1.0);
+        assert!((slide.correction_cents() - 31.0).abs() < 10.0, "and then it glides into key: {}", slide.correction_cents());
+    }
+
+    #[test]
+    fn tolerance_leaves_close_notes_alone_and_amount_corrects_part_way() {
+        let mut t = chromatic(0.0);
+        t.tolerance_cents = 30.0;
+        run(&mut t, 445.0, 0.5); // ~ +20 cents off A4
+        assert!(t.correction_cents().abs() < 1e-3, "{}", t.correction_cents());
+        let mut u = chromatic(0.0);
+        run(&mut u, 445.0, 0.5);
+        assert!((u.correction_cents() + 20.0).abs() < 8.0, "no tolerance: corrected, {}", u.correction_cents());
+        let mut h = chromatic(0.0);
+        h.amount = 0.5;
+        run(&mut h, 452.0, 0.5);
+        assert!((h.correction_cents() + 23.5).abs() < 6.0, "half of -47: {}", h.correction_cents());
+    }
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    /// CORRECTING must not cost level. A tone 40 cents flat of a C-major note,
+    /// held 3 s: once the tuner is correcting, the output RMS should match the
+    /// input's. Found through Goat: its "voxmel" vocal came out 8 dB quieter
+    /// in a whole-song render (tuner locked and correcting) than in a render
+    /// started mid-song (not locked yet, passing dry). The shifter's two taps
+    /// sit a FIXED half-window (11 ms) apart; for a periodic voice they are
+    /// often out of phase and cancel. Returns the level change, dB.
+    pub fn correction_level_db(hz: f32) -> f32 {
+        let rate = 48_000.0f32;
+        let x: Vec<f32> = (0..(rate * 3.0) as usize).map(|i| 0.3 * (std::f32::consts::TAU * hz * i as f32 / rate).sin()).collect();
+        level_while_correcting(&x, rate).0
+    }
+
+    /// (level change dB over the last third, mean |correction| in cents over
+    /// that third) -- the second so a test can prove the tuner WAS
+    /// correcting: an idle tuner keeps the level trivially.
+    fn level_while_correcting(x: &[f32], rate: f32) -> (f32, f32) {
+        let mut t = RealtimeTune::new(Target::Notes(vec![]), rate, 1);
+        let n = x.len();
+        let (mut c, mut m) = (0.0f64, 0usize);
+        let y: Vec<f32> = x.iter().enumerate().map(|(i, v)| {
+            let o = t.process(*v);
+            if i >= n * 2 / 3 { c += t.correction_cents().abs() as f64; m += 1; }
+            o
+        }).collect();
+        let tail = |v: &[f32]| (v[n * 2 / 3..].iter().map(|s| s * s).sum::<f32>() / (n - n * 2 / 3) as f32).sqrt();
+        (20.0 * (tail(&y) / tail(x)).log10(), (c / m.max(1) as f64) as f32)
+    }
+
+    /// 3 s of a voice-like note 30 cents flat of `base`: eight harmonics (1/k),
+    /// 5 Hz +-15 cent vibrato.
+    fn vibrato_note(base: f32, rate: f32) -> Vec<f32> {
+        let hz0 = base * 2f32.powf(-0.3 / 12.0);
+        let mut ph = 0.0f32;
+        (0..(rate * 3.0) as usize).map(|i| {
+            let t = i as f32 / rate;
+            ph += hz0 * 2f32.powf(15.0 / 1200.0 * (std::f32::consts::TAU * 5.0 * t).sin()) / rate;
+            (1..=8).map(|k| 0.15 / k as f32 * (std::f32::consts::TAU * ph * k as f32).sin()).sum::<f32>()
+        }).collect()
+    }
+
+    /// A VOICE-like note: eight harmonics (1/k), 30 cents flat, with a 5 Hz
+    /// +-15 cent vibrato (inside one note's catchment, so the target holds)
+    /// -- each harmonic cancels at its own phase under a fixed tap spacing,
+    /// and the period keeps moving. Level held to 1.5 dB, and the tuner
+    /// provably correcting (mean > 15 cents applied).
+    #[test]
+    fn a_harmonic_note_with_vibrato_keeps_its_level_while_corrected() {
+        let rate = 48_000.0f32;
+        for base in [196.0f32, 247.0, 311.0] {
+            let x = vibrato_note(base, rate);
+            let (g, cents) = level_while_correcting(&x, rate);
+            eprintln!("VOICE {base} Hz: {g:+.2} dB, mean correction {cents:.0} cents");
+            assert!(cents > 15.0, "{base} Hz: the tuner must be correcting (mean {cents:.0} cents)");
+            assert!(g.abs() < 1.5, "{base} Hz voice-like note: {g:+.1} dB while correcting");
+        }
+    }
+
+    #[test]
+    fn correcting_keeps_the_level_across_pitches() {
+        for semis in [0.0f32, 2.0, 4.0, 7.0, 9.0, 11.0, 14.0] {
+            let hz = 220.0 * 2f32.powf((semis - 0.4) / 12.0);
+            let x: Vec<f32> = (0..144_000).map(|i| 0.3 * (std::f32::consts::TAU * hz * i as f32 / 48_000.0).sin()).collect();
+            let (g, cents) = level_while_correcting(&x, 48_000.0);
+            assert!((30.0..50.0).contains(&cents), "{hz:.1} Hz: correcting the 40 cents ({cents:+.1})");
+            assert!(g.abs() < 1.5, "{hz:.1} Hz: {g:+.1} dB while correcting");
+        }
+    }
+
+    /// Re-seating a tap happens only where its weight is zero, so a note
+    /// corrected across many wraps stays click-free: the output's largest
+    /// second difference (where a click shows) stays near the input's. The
+    /// signal is the VIBRATO note: on a steady tone a wrap jumps a whole
+    /// number of periods and is seamless even unweighted, so a steady tone
+    /// cannot show a click here (the break test found that).
+    #[test]
+    fn re_seating_the_taps_does_not_click() {
+        let rate = 48_000.0f32;
+        for base in [196.0f32, 247.0, 311.0] {
+            let x = vibrato_note(base, rate);
+            let hz = base;
+            let mut t = RealtimeTune::new(Target::Notes(vec![]), rate, 1);
+            let y: Vec<f32> = x.iter().map(|v| t.process(*v)).collect();
+            let d2 = |v: &[f32]| v.windows(3).skip(rate as usize / 2).map(|w| (w[0] - 2.0 * w[1] + w[2]).abs()).fold(0.0f32, f32::max);
+            let (dx, dy) = (d2(&x), d2(&y));
+            eprintln!("CLICK {hz} Hz: output d2 {dy:.2e}, input {dx:.2e} ({:.2}x)", dy / dx);
+            assert!(dy < 3.0 * dx, "{hz} Hz: output second difference {dy:.2e} vs input {dx:.2e} -- a click");
+        }
+    }
+
+    /// The silence shortcut in `analyse` rests on this: YIN finds no pitch
+    /// in silence, so skipping it there changes nothing.
+    #[test]
+    fn yin_finds_no_pitch_in_silence() {
+        let dec_rate = 48_000.0 / DECIMATION as f32;
+        assert!(yin_pitch(&[0.0f32; 700], dec_rate, 70.0, 1_000.0, 0.15).is_none());
+        assert!(yin_pitch(&[1e-12f32; 700], dec_rate, 70.0, 1_000.0, 0.15).is_none(), "a DC floor either");
+    }
+
+    /// A render that starts mid-song (a seek, a parallel export's segment)
+    /// must end up where one from the start is: aligned to the song position,
+    /// and past a silent gap, the two tuners' outputs are bit-identical.
+    #[test]
+    fn after_a_silence_a_tuner_started_mid_song_matches_one_from_the_start() {
+        let rate = 48_000usize;
+        let x: Vec<f32> = (0..rate * 5).map(|i| {
+            let t = i as f32 / rate as f32;
+            if (2.0..2.5).contains(&t) { 0.0 } else { 0.3 * (std::f32::consts::TAU * 213.0 * t).sin() }
+        }).collect();
+        let mut whole = RealtimeTune::new(Target::Notes(vec![]), rate as f32, 1);
+        whole.align(0);
+        let a: Vec<f32> = x.iter().map(|v| whole.process(*v)).collect();
+        let start = rate + 777; // mid-song, off the hop grid
+        let mut late = RealtimeTune::new(Target::Notes(vec![]), rate as f32, 1);
+        late.align(start as i64);
+        let b: Vec<f32> = x[start..].iter().map(|v| late.process(*v)).collect();
+        let from = rate * 5 / 2 + rate / 10; // 2.6 s: past the silence
+        assert!(a[from..].iter().zip(&b[from - start..]).all(|(p, q)| p.to_bits() == q.to_bits()), "identical after the gap");
+        // (and before the gap they are allowed to differ: different histories)
+        assert!(a[start + 4_800..rate * 2].iter().zip(&b[4_800..rate * 2 - start]).any(|(p, q)| p != q), "the test sees a difference before the gap");
+    }
+
+    /// Records the measured loss per pitch (always passes; prints).
+    #[test]
+    fn measure_the_correction_level_loss() {
+        for semis in [0.0f32, 2.0, 4.0, 7.0, 9.0, 11.0, 14.0] {
+            let hz = 220.0 * 2f32.powf((semis - 0.4) / 12.0);
+            eprintln!("LOSS {hz:7.1} Hz: {:+.1} dB", correction_level_db(hz));
+        }
     }
 }

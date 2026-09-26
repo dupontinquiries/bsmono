@@ -40,16 +40,22 @@ pub fn render(rack: &studio_live::Rack, ix: usize, audio: &BTreeMap<SourceId, So
     let pat = rack.patterns.get(ix)?;
     let tempo = rack.tempo();
     let mut synth = studio_live::BuiltinSynth { sources: audio };
-    let mut mono: Vec<f32> = Vec::with_capacity(frames);
+    let (mut l, mut r): (Vec<f32>, Vec<f32>) = (Vec::with_capacity(frames), Vec::with_capacity(frames));
     let mut pass = 0u32;
-    while mono.len() < frames.max(1) {
-        let lp = studio_live::render_pattern(pat, rack, &mut synth, &tempo, rate, pass);
-        if lp.is_empty() { break; }
-        mono.extend_from_slice(&lp);
+    while l.len() < frames.max(1) {
+        // STEREO (c20: the rack rendered mono, duplicated into both channels --
+        // every pan, width and pan-by-key was centred). Scaled by sqrt2 so a
+        // centred voice is exactly the level it was (L = R = v): nothing
+        // calibrated on the mono render moves.
+        let (pl, pr) = studio_live::render_pattern_stereo(pat, rack, &mut synth, &tempo, rate, pass);
+        if pl.is_empty() { break; }
+        l.extend(pl.iter().map(|v| v * std::f32::consts::SQRT_2));
+        r.extend(pr.iter().map(|v| v * std::f32::consts::SQRT_2));
         pass += 1;
     }
-    mono.truncate(frames.max(1));
-    Some(SourceAudio { sample_rate: rate, channels: vec![mono.clone(), mono] })
+    l.truncate(frames.max(1));
+    r.truncate(frames.max(1));
+    Some(SourceAudio { sample_rate: rate, channels: vec![l, r] })
 }
 
 /// What a cache was rendered from; a different stamp means render again.
@@ -76,9 +82,17 @@ pub fn stale(project: &Project, rack: &studio_live::Rack, stamps: &BTreeMap<Sour
 /// does nothing unless the rack or the clips changed.
 pub fn refresh(project: &Project, rack: &studio_live::Rack, audio: &mut BTreeMap<SourceId, SourceAudio>,
                stamps: &mut BTreeMap<SourceId, Stamp>) -> Vec<SourceId> {
+    refresh_at(project, rack, audio, stamps, RATE)
+}
+
+/// [`refresh`] at `rate`: a render at another sample rate renders its
+/// patterns at that rate, so the mixdown reads them sample for sample.
+/// (A rate change changes every pattern's frame count, which makes it stale.)
+pub fn refresh_at(project: &Project, rack: &studio_live::Rack, audio: &mut BTreeMap<SourceId, SourceAudio>,
+                  stamps: &mut BTreeMap<SourceId, Stamp>, rate: u32) -> Vec<SourceId> {
     let mut done = Vec::new();
-    for (sid, ix, need) in stale(project, rack, stamps, RATE) {
-        match render(rack, ix, audio, need, RATE) {
+    for (sid, ix, need) in stale(project, rack, stamps, rate) {
+        match render(rack, ix, audio, need, rate) {
             Some(a) => { audio.insert(sid, a); }
             None => { audio.remove(&sid); }
         }

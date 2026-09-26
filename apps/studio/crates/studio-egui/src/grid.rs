@@ -98,8 +98,14 @@ pub const CELL: f32 = 22.0;
 pub const LABEL_W: f32 = 96.0;
 
 /// Draw the grid. Returns edits for the host to apply.
+///
+/// `selected` is the channel the piano roll edits: its row is marked, so the
+/// two views of a pattern agree about which channel you are on. Where a
+/// channel has piano-roll notes, a small dot sits under each step a note
+/// STARTS on -- the roll's content seen from here, so switching views never
+/// reveals notes you did not know were there.
 pub fn grid(ui: &mut egui::Ui, pattern: &Pattern, channels: &[studio_live::Channel],
-            paint: &mut Paint, playhead: Option<u32>,
+            paint: &mut Paint, playhead: Option<u32>, selected: Option<usize>,
             c: &uikit_egui::PaletteColors) -> Vec<GridEdit> {
     let mut edits = Vec::new();
     if pattern.steps == 0 || channels.is_empty() {
@@ -120,7 +126,13 @@ pub fn grid(ui: &mut egui::Ui, pattern: &Pattern, channels: &[studio_live::Chann
         // A muted channel dims its whole row rather than hiding it: you still
         // need to see the pattern you are about to unmute.
         let name_col = if ch.muted { c.text_weak } else { c.text };
-        painter.text(egui::pos2(rect.left() + 4.0, y + cell * 0.5),
+        if selected == Some(ci) {
+            painter.rect_filled(egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::vec2(label_w - 2.0, cell)),
+                                3.0, c.accent.gamma_multiply(0.25));
+            painter.rect_filled(egui::Rect::from_min_size(egui::pos2(rect.left(), y + 2.0), egui::vec2(3.0, cell - 4.0)),
+                                1.0, c.accent);
+        }
+        painter.text(egui::pos2(rect.left() + 6.0, y + cell * 0.5),
                      egui::Align2::LEFT_CENTER, &ch.name,
                      egui::FontId::proportional(12.0), name_col);
 
@@ -134,6 +146,10 @@ pub fn grid(ui: &mut egui::Ui, pattern: &Pattern, channels: &[studio_live::Chann
                        else if is_beat(s) { c.bg_raised }
                        else { c.bg_base };
             painter.rect_filled(cr, 3.0, fill);
+            if pattern.roll(ci).iter().any(|n| n.start == s) {
+                painter.circle_filled(egui::pos2(cr.center().x, cr.bottom() - 3.5), 2.0,
+                                      if set { c.bg_base } else { c.text_weak });
+            }
             if playhead == Some(s) {
                 // The playhead is a column outline, not a fill: filling would
                 // hide whether the step under it is set, which is the one thing
@@ -144,17 +160,28 @@ pub fn grid(ui: &mut egui::Ui, pattern: &Pattern, channels: &[studio_live::Chann
         }
     }
 
-    if let Some(pos) = resp.interact_pointer_pos() {
+    let cell_at = |pos: egui::Pos2| -> Option<(usize, u32)> {
         let rel = pos - rect.min;
-        if rel.x >= label_w {
-            let s = ((rel.x - label_w) / cell) as u32;
-            let ci = (rel.y / cell) as usize;
-            if s < pattern.steps && ci < channels.len() {
-                if resp.drag_started() || (resp.clicked() && !paint.active()) {
-                    paint.begin(pattern.is_set(ci, s));
-                }
+        if rel.x < label_w || rel.y < 0.0 { return None; }
+        let (s, ci) = (((rel.x - label_w) / cell) as u32, (rel.y / cell) as usize);
+        (s < pattern.steps && ci < channels.len()).then_some((ci, s))
+    };
+    if let Some(pos) = resp.interact_pointer_pos() {
+        if resp.drag_started() {
+            // Begin where the PRESS was: egui only calls it a drag once the
+            // pointer has moved past its threshold, and until c20 the paint
+            // began at THAT cell -- a quick stroke skipped the cell it started
+            // on and took its on/off from the wrong one.
+            let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
+            if let Some((ci, s)) = cell_at(origin) {
+                paint.begin(pattern.is_set(ci, s));
                 if let Some(e) = paint.touch(ci, s) { edits.push(e); }
             }
+        } else if resp.clicked() && !paint.active() {
+            if let Some((ci, s)) = cell_at(pos) { paint.begin(pattern.is_set(ci, s)); }
+        }
+        if let Some((ci, s)) = cell_at(pos) {
+            if let Some(e) = paint.touch(ci, s) { edits.push(e); }
         }
     }
     if resp.drag_stopped() || (!resp.dragged() && !resp.is_pointer_button_down_on()) {
@@ -284,5 +311,77 @@ mod tests {
         assert!(is_beat(4));
         assert!(!is_beat(1));
         assert!(!is_beat(7));
+    }
+}
+
+
+/// The grid driven through egui with real pointer events.
+#[cfg(test)]
+mod gesture_tests {
+    use super::*;
+    use egui::{Pos2, Rect, Vec2};
+
+    fn channels(n: usize) -> Vec<studio_live::Channel> {
+        let rack = studio_live::Rack::trap_kit();
+        rack.channels.into_iter().cycle().take(n).collect()
+    }
+
+    /// Press on `from`'s cell, move fast to `to` (past egui's drag threshold
+    /// in one frame), release; returns every edit.
+    fn stroke(p: &mut Pattern, from: (usize, u32), to: (usize, u32)) -> Vec<GridEdit> {
+        let ctx = egui::Context::default();
+        let chans = channels(4);
+        let mut paint = Paint::default();
+        let colors = uikit_egui::PaletteColors::from_palette(&snapclone_theme::palette::DARK);
+        let at = |(ci, s): (usize, u32)| Pos2::new(LABEL_W + (s as f32 + 0.5) * CELL, (ci as f32 + 0.5) * CELL);
+        let mut all = Vec::new();
+        let mut t = 0.0;
+        let mut frame = |p: &mut Pattern, ev: Vec<egui::Event>, pointer: Pos2| {
+            t += 0.05;
+            let mut events = vec![egui::Event::PointerMoved(pointer)];
+            events.extend(ev);
+            let input = egui::RawInput { events, time: Some(t),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))), ..Default::default() };
+            let snapshot = p.clone();
+            let mut out = Vec::new();
+            let _ = ctx.run(input, |ctx| {
+                egui::Area::new(egui::Id::new("grid")).fixed_pos(Pos2::ZERO).show(ctx, |ui| {
+                    out = grid(ui, &snapshot, &chans, &mut paint, None, None, &colors);
+                });
+            });
+            for e in &out { if let GridEdit::SetStep { channel, step, on } = *e { p.set(channel, step, on); } }
+            all.extend(out);
+        };
+        for _ in 0..3 { frame(p, vec![], Pos2::new(1.0, 1.0)); } // an Area's sizing pass
+        let press = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed,
+                                                               modifiers: Default::default() };
+        frame(p, vec![press(at(from), true)], at(from));
+        frame(p, vec![], at(to));
+        frame(p, vec![], at(to));
+        frame(p, vec![press(at(to), false)], at(to));
+        all
+    }
+
+    #[test]
+    fn a_quick_stroke_paints_the_cell_it_started_on() {
+        let mut p = Pattern::new("g", 16, 4);
+        let e = stroke(&mut p, (1, 3), (1, 4));
+        assert!(p.is_set(1, 3), "the pressed cell: {e:?}");
+        assert!(p.is_set(1, 4));
+    }
+
+    #[test]
+    fn a_quick_stroke_takes_its_on_or_off_from_the_cell_it_started_on() {
+        // starts on an EMPTY cell, runs onto a set one: paints on, keeps it on
+        let mut p = Pattern::new("g", 16, 4);
+        p.set(2, 5, true);
+        stroke(&mut p, (2, 4), (2, 5));
+        assert!(p.is_set(2, 4) && p.is_set(2, 5), "on, decided by the start cell");
+        // starts on a SET cell: erases
+        let mut q = Pattern::new("g", 16, 4);
+        q.set(0, 7, true);
+        q.set(0, 8, true);
+        stroke(&mut q, (0, 7), (0, 8));
+        assert!(!q.is_set(0, 7) && !q.is_set(0, 8));
     }
 }

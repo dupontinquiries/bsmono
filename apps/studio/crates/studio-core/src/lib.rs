@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 mod curves;
+pub mod journal;
 mod grouping;
 pub use grouping::GroupTangle;
 pub use curves::{Binding, Curve, Gate, Opening, Response, Sweep};
@@ -264,6 +265,14 @@ pub struct Project {
     /// about the edit, not about this device's playback.
     #[serde(default)]
     pub fades: BTreeMap<ClipId, (Ticks, Ticks)>,
+    /// Each bus's pan, -1 (left) ..= 1 (right); absent = centre. A BALANCE,
+    /// as an FL mixer insert's pan is on a stereo signal: right turns the left
+    /// side down, never the right up, so centre changes nothing. Kept beside
+    /// `Bus` (like `fades` beside clips) so a pan is its own op and every
+    /// place that builds a `Bus` is untouched. Studio had no pan at all in its
+    /// timeline mix before c20.
+    #[serde(default)]
+    pub bus_pans: BTreeMap<BusId, f32>,
     #[serde(default)]
     pub curves: BTreeMap<CurveId, Curve>,
     /// Which curves drive which targets through which gates. Multiplied
@@ -964,6 +973,8 @@ pub enum Op {
     /// a crossfade. `(0, 0)` removes the entry rather than storing a no-op
     /// fade, which keeps the map sparse and makes "has a fade" a real question.
     SetClipFade { id: ClipId, fade_in: Ticks, fade_out: Ticks },
+    /// A bus's pan (see `Project::bus_pans`); 0 = centre.
+    SetBusPan { id: BusId, pan: f32 },
     SetMarker { at: Ticks, name: String },
     RemoveMarker { name: String },
     /// Both communities ask for this by name ("Delete All Timeline
@@ -1045,6 +1056,13 @@ pub enum EditError {
     /// A comp span that no single take on `lane` covers whole — see
     /// `Project::comp_ops`.
     NoTakeOver { lane: TrackId, from: Ticks, to: Ticks },
+}
+
+/// The (left, right) gains of a balance at `pan` (-1..=1): the far side is
+/// turned down linearly, the near side left alone.
+pub fn balance_gains(pan: f32) -> (f32, f32) {
+    let p = pan.clamp(-1.0, 1.0);
+    ((1.0 - p).min(1.0), (1.0 + p).min(1.0))
 }
 
 impl Project {
@@ -1321,6 +1339,7 @@ impl Project {
                     return Err(EditError::BusInUse(*id));
                 }
                 self.busses.remove(id);
+                self.bus_pans.remove(id);
                 Ok(Op::AddBus { bus })
             }
             Op::SetBusGain { id, gain } => {
@@ -1449,6 +1468,13 @@ impl Project {
                 let inv = Op::SetGroupActive { id: *id, active: g.active };
                 g.active = *active;
                 Ok(inv)
+            }
+            Op::SetBusPan { id, pan } => {
+                if !self.busses.contains_key(id) { return Err(EditError::NoSuchBus(*id)); }
+                let prev = self.bus_pans.get(id).copied().unwrap_or(0.0);
+                let pan = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
+                if pan == 0.0 { self.bus_pans.remove(id); } else { self.bus_pans.insert(*id, pan); }
+                Ok(Op::SetBusPan { id: *id, pan: prev })
             }
             Op::SetClipFade { id, fade_in, fade_out } => {
                 if !self.clips.contains_key(id) {

@@ -28,6 +28,7 @@ pub mod boom;
 pub mod format;
 pub mod stems;
 pub mod block;
+pub mod resample;
 pub mod destructive;
 
 use std::collections::BTreeMap;
@@ -473,6 +474,181 @@ pub struct EffectCache {
     /// shorter than the chain, and a parameter ride addresses the chain.
     clip: BTreeMap<studio_core::ClipId, (Vec<studio_core::Effect>, Vec<(usize, studio_fx::Instance)>)>,
     bus: BTreeMap<studio_core::BusId, (Vec<studio_core::Effect>, Vec<(usize, studio_fx::Instance)>)>,
+    /// Each ducked bus's follower state, kept across contiguous calls like
+    /// every other effect's (a duck that re-armed per buffer would click).
+    ducks: BTreeMap<studio_core::BusId, Duck>,
+    /// Each bus's doubler state.
+    doublers: BTreeMap<studio_core::BusId, Doubler>,
+    /// Each bus's stereo imager, with the widths it was built for.
+    imagers: BTreeMap<studio_core::BusId, ([f32; 3], studio_fx::imager::Imager)>,
+}
+
+/// Set this thread's float unit to FLUSH SUBNORMALS TO ZERO (x86_64: MXCSR
+/// FTZ + DAZ; aarch64: FPCR.FZ). A reverb whose input went quiet decays
+/// toward zero through the subnormal range (< 1.2e-38), where x86 float math
+/// runs 10-100x slower: A Top A Tower's whole-song render fell from 7x to
+/// 0.7x real time within six minutes, every reverb that had ever played
+/// crawling through its own tail (gdb: 7 of 10 samples in Reverb::process),
+/// while a render STARTED late ran at 9x. Called at the top of every
+/// mixdown, so exports and playback both get it; one register write. The
+/// values it zeroes are below -760 dBFS.
+#[inline]
+pub fn flush_denormals_to_zero() {
+    #[cfg(target_arch = "x86_64")]
+    #[allow(deprecated)]
+    unsafe {
+        use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+        _mm_setcsr(_mm_getcsr() | 0x8040); // FTZ (bit 15) | DAZ (bit 6)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let mut fpcr: u64;
+        std::arch::asm!("mrs {}, fpcr", out(reg) fpcr);
+        std::arch::asm!("msr fpcr, {}", in(reg) fpcr | (1 << 24)); // FZ
+    }
+}
+
+/// DOUBLER -- a stand-in for iZotope Vocal Doubler (on all of A Top A
+/// Tower's vocal chains, where its absence left the vocals thin and low):
+/// two copies of the (mono-summed) voice at short delays, each detuned a few
+/// cents by a slow wobble of its delay time, one mostly left and one mostly
+/// right, under the dry signal. STEREO, so it runs on the bus's stereo path
+/// like `imager`. Params: `amount` (0..1, 0.5), `spread` (0..1, 0.8),
+/// `detune` (cents, 8), `delay` (ms, 18; the second voice at 1.3x).
+#[derive(Debug, Clone)]
+pub struct Doubler { buf: Vec<f32>, pos: usize }
+
+impl Doubler {
+    pub fn new(rate: u32) -> Doubler { Doubler { buf: vec![0.0; rate as usize / 10 + 4], pos: 0 } }
+
+    fn read(&self, delay: f64) -> f32 {
+        let n = self.buf.len();
+        let d = delay.clamp(1.0, (n - 3) as f64);
+        let back = self.pos as f64 - d;
+        let i0 = back.floor();
+        let t = (back - i0) as f32;
+        let at = |k: f64| self.buf[((k as i64).rem_euclid(n as i64)) as usize];
+        at(i0) * (1.0 - t) + at(i0 + 1.0) * t
+    }
+
+    /// Process stereo frames in place; `at` is the song position (in frames)
+    /// of the first one. The wobble's phase is a function of the song
+    /// position, not an accumulator from wherever the render began: a render
+    /// started mid-song -- a playback seek, a parallel export's segment --
+    /// wobbles exactly as the whole-song render does there. (Accumulated, it
+    /// differed forever after the start: a parallel export of A Top A Tower
+    /// came out -7 dB different from the serial one, sample for sample.)
+    pub fn process(&mut self, frames: &mut [f32], p: &studio_core::Effect, rate: u32, at: i64) {
+        let q = |k: &str, d: f32| p.params.get(k).copied().unwrap_or(d);
+        let (amount, spread) = (q("amount", 0.5).clamp(0.0, 1.0), q("spread", 0.8).clamp(0.0, 1.0));
+        let (cents, delay_ms) = (q("detune", 8.0).clamp(0.0, 50.0) as f64, q("delay", 18.0).clamp(5.0, 45.0) as f64);
+        let r = rate as f64;
+        let rates = [0.31f64, 0.23];
+        // a delay swinging +-A seconds at f Hz shifts pitch by ~ 2*pi*f*A: A for `cents`
+        let depth: [f64; 2] = rates.map(|f| (2f64.powf(cents / 1200.0) - 1.0) / (std::f64::consts::TAU * f) * r);
+        let base = [delay_ms * 0.001 * r, delay_ms * 1.3 * 0.001 * r];
+        let (near, far) = (0.5 + 0.5 * spread, 0.5 - 0.5 * spread);
+        let offset = [0.0f64, 0.5];
+        for (i, fr) in frames.chunks_exact_mut(2).enumerate() {
+            let n = self.buf.len();
+            self.buf[self.pos] = 0.5 * (fr[0] + fr[1]);
+            let mut v = [0.0f32; 2];
+            let song = (at + i as i64) as f64 / r;
+            for k in 0..2 {
+                let phase = (offset[k] + rates[k] * song).fract();
+                let d = base[k] + depth[k] * (std::f64::consts::TAU * phase).sin() + depth[k];
+                v[k] = self.read(d);
+            }
+            self.pos = (self.pos + 1) % n;
+            fr[0] += amount * (v[0] * near + v[1] * far);
+            fr[1] += amount * (v[0] * far + v[1] * near);
+        }
+    }
+}
+
+/// A bus's enabled `doubler`, if any.
+pub fn doubler_of(bus: &studio_core::Bus) -> Option<&studio_core::Effect> {
+    bus.chain.iter().find(|e| e.kind == "doubler" && e.enabled)
+}
+
+/// The imager's crossovers: below 200 Hz, 200 Hz - 4 kHz, above 4 kHz.
+pub const IMAGER_SPLITS: [f32; 2] = [200.0, 4000.0];
+
+/// A bus's `imager` effect, if it has an enabled one: widths (low, mid,
+/// high) -- 0 mono, 1 as is, >1 wider. STEREO: it needs L and R together,
+/// which the per-sample effect chain cannot give (see `studio_fx::instantiate`),
+/// so, like `duck`, it runs here, after the chain.
+pub fn imager_of(bus: &studio_core::Bus) -> Option<[f32; 3]> {
+    bus.chain.iter().find(|e| e.kind == "imager" && e.enabled).map(|e| {
+        let w = |k: &str| e.params.get(k).copied().unwrap_or(1.0).clamp(0.0, 2.0);
+        [w("low"), w("mid"), w("high")]
+    })
+}
+
+/// SIDECHAIN DUCK: a bus turned down while ANOTHER bus (the key) is loud --
+/// the kick pulling the 808 and the reverb down on every hit, so the low end
+/// stays tight and the listener does not hear anything leave. Written as
+/// effect kind `duck` in a bus's chain, params:
+///
+/// * `key`: the key bus's id; `threshold` dBFS (-24); `depth` dB, the most it
+///   will take away (12); `ratio` (4); `attack` / `release` ms (1 / 120).
+///
+/// The key is the key bus's FINISHED output (post chain, post fader) -- what
+/// FL's "sidechain to this track" hands a compressor. Applied after the
+/// ducked bus's own chain, before its fader. Not in `studio_fx::instantiate`
+/// on purpose: it needs another bus's signal, which only the mixdown has.
+#[derive(Debug, Clone, Default)]
+pub struct Duck { env: f32, gain_db: f32 }
+
+impl Duck {
+    /// Per-frame gains for `key` (interleaved stereo), continuing the state.
+    pub fn gains(&mut self, key: &[f32], p: &studio_core::Effect, rate: u32) -> Vec<f32> {
+        let q = |k: &str, d: f32| p.params.get(k).copied().unwrap_or(d);
+        let (thr, depth, ratio) = (q("threshold", -24.0), q("depth", 12.0).max(0.0), q("ratio", 4.0).max(1.0));
+        let coef = |ms: f32| (-1.0 / (ms.max(0.05) * 0.001 * rate as f32)).exp();
+        let (att, rel) = (coef(q("attack", 1.0)), coef(q("release", 120.0)));
+        key.chunks(2).map(|fr| {
+            let x = fr.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            // peak follower: rises at attack, falls at release
+            let c = if x > self.env { att } else { rel };
+            self.env = x + (self.env - x) * c;
+            let lvl = 20.0 * self.env.max(1e-9).log10();
+            let want = if lvl > thr { ((lvl - thr) * (1.0 - 1.0 / ratio)).min(depth) } else { 0.0 };
+            // the reduction itself eases the same way, so it pumps, not clicks
+            let c = if want > self.gain_db { att } else { rel };
+            self.gain_db = want + (self.gain_db - want) * c;
+            10f32.powf(-self.gain_db / 20.0)
+        }).collect()
+    }
+}
+
+/// The key bus a bus's `duck` effect listens to, if it has an enabled one.
+pub fn duck_of(bus: &studio_core::Bus) -> Option<(studio_core::BusId, &studio_core::Effect)> {
+    bus.chain.iter().find(|e| e.kind == "duck" && e.enabled)
+        .and_then(|e| e.params.get("key").map(|k| (studio_core::BusId(*k as u64), e)))
+}
+
+/// `order` with every ducked bus moved to just after its key -- keys are
+/// usually siblings (the kick and the 808 both feed the master) and siblings
+/// come in no particular order. A move that would put a bus after its own
+/// parent is not made (that duck then reads silence and does nothing).
+pub fn order_for_ducks(project: &Project, mut order: Vec<studio_core::BusId>) -> Vec<studio_core::BusId> {
+    for _ in 0..order.len() {
+        let mut moved = false;
+        for b in project.busses.values() {
+            let Some((key, _)) = duck_of(b) else { continue };
+            let (Some(pb), Some(pk)) = (order.iter().position(|x| *x == b.id), order.iter().position(|x| *x == key)) else { continue };
+            if pb > pk { continue; }
+            // parent must stay after the moved bus
+            if let Some(par) = b.parent { if order.iter().position(|x| *x == par).is_some_and(|pp| pp <= pk) { continue; } }
+            let id = order.remove(pb);
+            let pk = order.iter().position(|x| *x == key).unwrap();
+            order.insert(pk + 1, id);
+            moved = true;
+        }
+        if !moved { break; }
+    }
+    order
 }
 
 impl EffectCache {
@@ -489,6 +665,9 @@ impl EffectCache {
     pub fn reset(&mut self) {
         self.clip.clear();
         self.bus.clear();
+        self.ducks.clear();
+        self.imagers.clear();
+        self.doublers.clear();
     }
 
     fn build(chain: &[studio_core::Effect], rate: f32) -> Vec<(usize, studio_fx::Instance)> {
@@ -498,20 +677,24 @@ impl EffectCache {
             .collect()
     }
 
-    fn clip_instances(&mut self, id: studio_core::ClipId, chain: &[studio_core::Effect], rate: f32) -> &mut [(usize, studio_fx::Instance)] {
+    /// `at`: the song frame of the first sample these instances will get --
+    /// fresh instances are aligned to it (studio_fx::Instance::align).
+    fn clip_instances(&mut self, id: studio_core::ClipId, chain: &[studio_core::Effect], rate: f32, at: i64) -> &mut [(usize, studio_fx::Instance)] {
         let entry = self.clip.entry(id).or_default();
         if entry.0 != chain {
             entry.0 = chain.to_vec();
             entry.1 = Self::build(chain, rate);
+            for (_, i) in entry.1.iter_mut() { i.align(at); }
         }
         &mut entry.1
     }
 
-    fn bus_instances(&mut self, id: studio_core::BusId, chain: &[studio_core::Effect], rate: f32) -> &mut [(usize, studio_fx::Instance)] {
+    fn bus_instances(&mut self, id: studio_core::BusId, chain: &[studio_core::Effect], rate: f32, at: i64) -> &mut [(usize, studio_fx::Instance)] {
         let entry = self.bus.entry(id).or_default();
         if entry.0 != chain {
             entry.0 = chain.to_vec();
             entry.1 = Self::build(chain, rate);
+            for (_, i) in entry.1.iter_mut() { i.align(at); }
         }
         &mut entry.1
     }
@@ -726,6 +909,105 @@ fn zero_resize(v: &mut Vec<f32>, len: usize) {
     v.resize(len, 0.0);
 }
 
+/// A whole span rendered on `threads` cores: the span is cut into segments,
+/// each rendered by its own worker from `preroll` BEFORE its start -- output
+/// discarded -- so every effect's state (a reverb's tail, a compressor's
+/// envelope, a delay's buffer) has settled into what a serial render would
+/// hold by the time the segment's own audio begins. Not bit-identical to
+/// the serial render at the joins; the difference is measured by a test
+/// (and by the caller, if it cares). Chunks of `chunk` are rendered through
+/// one cache per worker, as a serial export does. Returns interleaved
+/// stereo for [from, to).
+#[allow(clippy::too_many_arguments)]
+pub fn mixdown_parallel(
+    project: &Project,
+    audio: &BTreeMap<SourceId, SourceAudio>,
+    fades: &BTreeMap<studio_core::ClipId, Fades>,
+    from: Ticks,
+    to: Ticks,
+    rate: u32,
+    solo: &[studio_core::TrackId],
+    threads: usize,
+    preroll: Ticks,
+    chunk: Ticks,
+) -> Vec<f32> {
+    let total = (to.to_samples(rate) - from.to_samples(rate)).max(0) as usize;
+    let threads = threads.max(1);
+    // about two segments per worker (a heavy section does not leave one core
+    // doing all the late work), none shorter than eight pre-rolls
+    let min_seg = preroll.to_samples(rate).max(1) as usize * 8;
+    let segs = (threads * 2).min((total / min_seg.max(1)).max(1));
+    let bounds: Vec<(usize, usize)> = (0..segs).map(|k| (total * k / segs, total * (k + 1) / segs)).collect();
+    let mut out = vec![0.0f32; total * 2];
+    let slots: Vec<std::sync::Mutex<&mut [f32]>> = {
+        let mut rest: &mut [f32] = &mut out;
+        let mut v = Vec::with_capacity(segs);
+        for (a, b) in &bounds {
+            let (head, tail) = rest.split_at_mut((b - a) * 2);
+            v.push(std::sync::Mutex::new(head));
+            rest = tail;
+        }
+        v
+    };
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let at = |s: usize| Ticks::from_samples(from.to_samples(rate) + s as i64, rate);
+    // the JOIN: each later segment's worker keeps the last XF frames of its
+    // pre-roll -- the same instants as the previous segment's last XF -- and
+    // the output crossfades from one into the other there, so a join cannot
+    // step even where an effect's state never converges (the autotune's
+    // shifter position is the integral of its whole history)
+    let xf = ((rate as usize) / 20).min(preroll.to_samples(rate).max(0) as usize); // 50 ms
+    let tails: Vec<(usize, Vec<f32>)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..threads.min(segs)).map(|_| sc.spawn(|| {
+            let mut mine: Vec<(usize, Vec<f32>)> = Vec::new();
+            loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(&(a, b)) = bounds.get(k) else { break };
+                let mut cache = EffectCache::new();
+                let seg_start = at(a);
+                let warm = if k == 0 { seg_start } else { seg_start.saturating_sub(preroll).max(from) };
+                let mut t = warm;
+                let mut dst = slots[k].lock().expect("a segment");
+                let mut written = 0usize;
+                let end = at(b);
+                let mut pre: Vec<f32> = Vec::new();
+                while t < end {
+                    let u = t.saturating_add(chunk).min(end);
+                    // the pre-roll ends exactly at the segment start
+                    let u = if t < seg_start { u.min(seg_start) } else { u };
+                    let mix = mixdown_with_cache(project, audio, fades, t, u, rate, solo, &[], &mut cache);
+                    if t >= seg_start {
+                        let n = mix.len().min(dst.len() - written);
+                        dst[written..written + n].copy_from_slice(&mix[..n]);
+                        written += n;
+                    } else if k > 0 {
+                        pre.extend_from_slice(&mix);
+                        let keep = xf * 2;
+                        if pre.len() > keep { pre.drain(..pre.len() - keep); }
+                    }
+                    t = u;
+                }
+                if k > 0 && pre.len() == xf * 2 { mine.push((k, pre)); }
+            }
+            mine
+        })).collect();
+        hs.into_iter().flat_map(|h| h.join().expect("a render thread")).collect()
+    });
+    drop(slots);
+    for (k, tail) in tails {
+        let join = bounds[k].0; // frames
+        if join < xf { continue; }
+        for i in 0..xf {
+            let w = (i + 1) as f32 / (xf + 1) as f32; // 0 -> 1: previous segment -> this one's pre-roll
+            for c in 0..2 {
+                let o = (join - xf + i) * 2 + c;
+                out[o] = out[o] * (1.0 - w) + tail[i * 2 + c] * w;
+            }
+        }
+    }
+    out
+}
+
 /// [`mixdown`]'s actual logic, parameterised over the [`EffectCache`] that
 /// backs every clip's and bus's effect instances — `mixdown` itself is a
 /// two-line wrapper handing this a cache nobody keeps, and
@@ -777,6 +1059,7 @@ pub fn mixdown_into(
     scratch: &mut RenderScratch,
     out: &mut [f32],
 ) {
+    flush_denormals_to_zero();
     let frames = (to.to_samples(rate) - from.to_samples(rate)).max(0) as usize;
     assert_eq!(out.len(), frames * 2, "mixdown_into: out.len() must equal frames * 2");
     out.fill(0.0);
@@ -860,7 +1143,7 @@ pub fn mixdown_into(
             // pattern rather than introducing a different one here. An
             // unknown effect kind is silently skipped via `instantiate`'s
             // `None`.
-            let clip_fx = cache.clip_instances(clip.id, &clip.effects, rate as f32);
+            let clip_fx = cache.clip_instances(clip.id, &clip.effects, rate as f32, clip.pos.max(from).to_samples(rate));
             // Parameter rides on this clip's chain, applied every
             // PARAM_BLOCK frames below. Empty for almost every clip.
             let clip_targets = project.clip_param_targets(clip.id);
@@ -992,8 +1275,11 @@ pub fn mixdown_into(
     // the refusal belongs at load time (where the caller can tell the user),
     // not buried in a pure render function with no error channel to report
     // it through.
-    let order = project.bus_order().unwrap_or_default();
+    let order = order_for_ducks(project, project.bus_order().unwrap_or_default());
     let audible = solo_audible_bus_set(project, bus_solo);
+    // finished outputs of busses something ducks under, for this call
+    let key_ids: Vec<studio_core::BusId> = project.busses.values().filter_map(|b| duck_of(b).map(|(k, _)| k)).collect();
+    let mut keys: BTreeMap<studio_core::BusId, Vec<f32>> = BTreeMap::new();
     for id in order {
         let Some(bus) = project.busses.get(&id) else { continue };
         // Removed (not merely borrowed) from `bus_buf` for the rest of
@@ -1033,7 +1319,7 @@ pub fn mixdown_into(
         // `instantiate`'s `None`, the same "opens without the plugin"
         // behaviour every other effect host in this codebase has.
         if !bus.chain.is_empty() {
-            let instances = cache.bus_instances(id, &bus.chain, rate as f32);
+            let instances = cache.bus_instances(id, &bus.chain, rate as f32, from.to_samples(rate));
             let targets = project.bus_param_targets(id);
             let mut rides = ParamRide::resolve(project, &bus.chain, &targets);
             if rides.is_empty() {
@@ -1058,6 +1344,26 @@ pub fn mixdown_into(
                 }
             }
         }
+        if let Some(fx) = doubler_of(bus) {
+            cache.doublers.entry(id).or_insert_with(|| Doubler::new(rate)).process(&mut buf, fx, rate, from.to_samples(rate));
+        }
+        if let Some(widths) = imager_of(bus) {
+            let entry = cache.imagers.entry(id).or_insert_with(|| (widths, studio_fx::imager::Imager::new(rate as f32, &IMAGER_SPLITS)));
+            if entry.0 != widths { *entry = (widths, studio_fx::imager::Imager::new(rate as f32, &IMAGER_SPLITS)); }
+            entry.1.widths = widths.to_vec();
+            for fr in buf.chunks_exact_mut(2) {
+                let (l, r) = entry.1.process(fr[0], fr[1]);
+                fr[0] = l; fr[1] = r;
+            }
+        }
+        if let Some((key, fx)) = duck_of(bus) {
+            // a key not yet heard in this call (a cycle, or a key that is this
+            // bus's own descendant... not reachable by FL) reads as silence
+            let silence;
+            let k: &[f32] = match keys.get(&key) { Some(k) => k, None => { silence = vec![0.0; buf.len()]; &silence } };
+            let g = cache.ducks.entry(id).or_default().gains(k, fx, rate);
+            for (fr, gi) in buf.chunks_exact_mut(2).zip(g) { fr[0] *= gi; fr[1] *= gi; }
+        }
         zero_resize(&mut scratch.pre, buf.len());
         scratch.pre.copy_from_slice(&buf);
         let bus_lane = project.automation.get(&AutoTarget::BusGain(id));
@@ -1079,7 +1385,14 @@ pub fn mixdown_into(
         } else {
             for s in buf.iter_mut() { *s *= bus.gain; }
         }
+        // PAN, as a balance on the stereo bus, with the fader (pre-fader
+        // sends heard it before either, as a desk's do)
+        if let Some(pan) = project.bus_pans.get(&id) {
+            let (gl, gr) = studio_core::balance_gains(*pan);
+            for fr in buf.chunks_exact_mut(2) { fr[0] *= gl; fr[1] *= gr; }
+        }
 
+        if key_ids.contains(&id) { keys.insert(id, buf.clone()); }
         // A silent bus stops here: it has been summed, processed and faded
         // (so `bus_signal` can read a finished signal), and now feeds
         // nothing — not its sends, not its parent. Without this a control
@@ -1156,6 +1469,76 @@ pub fn bus_signal(
 pub fn peak_dbfs(samples: &[f32]) -> f32 {
     let peak = samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));
     if peak <= 0.0 { f32::NEG_INFINITY } else { 20.0 * peak.log10() }
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    use studio_core::{Bus, BusId, Clip, ClipId, Op, Source, Track, TrackId, TrackKind};
+
+    /// Noise bursts (0.15 s every 0.9 s) through a bus with reverb,
+    /// compressor, delay and the DOUBLER -- stateful effects the pre-roll must
+    /// settle, and one whose wobble must follow the song position.
+    fn busy_project(rate: u32, secs: f64) -> (Project, BTreeMap<SourceId, SourceAudio>) {
+        let mut p = Project::default();
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), parent: None, gain: 1.0, silent: false, muted: false, sends: vec![],
+            chain: ["reverb", "compressor", "delay", "doubler"].iter().map(|k| studio_core::Effect { kind: (*k).into(), enabled: true, params: Default::default() }).collect() } }).unwrap();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "A".into(), muted: false, locked: false, gain: 1.0, route: Some(BusId(1)) }, at: 0 }).unwrap();
+        let n = (rate as f64 * secs) as usize;
+        let mut st = 0x1234_5678u32;
+        let sig: Vec<f32> = (0..n).map(|i| {
+            st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+            let t = i as f64 / rate as f64;
+            if t % 0.9 < 0.15 { (st as f32 / u32::MAX as f32 - 0.5) * 0.8 } else { 0.0 }
+        }).collect();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "n".into(), len: Ticks::from_seconds(secs), sample_rate: rate, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO, len: Ticks::from_seconds(secs), gain: 1.0, effects: vec![] } }).unwrap();
+        let mut audio = BTreeMap::new();
+        audio.insert(SourceId(1), SourceAudio { sample_rate: rate, channels: vec![sig] });
+        (p, audio)
+    }
+
+    /// The parallel render matches the serial one: exactly in the first
+    /// segment (it has no pre-roll), and across a join -- 80 s, a 4 s
+    /// pre-roll, so two segments -- within -60 dB of the peak at the worst
+    /// sample and -80 dB of the signal in RMS (measured: see the print).
+    #[test]
+    fn the_parallel_render_matches_the_serial_one() {
+        let rate = 16_000;
+        let (p, audio) = busy_project(rate, 80.0);
+        let (from, to, chunk) = (Ticks::ZERO, Ticks::from_seconds(80.0), Ticks::from_seconds(5.0));
+        let mut serial = Vec::new();
+        let mut cache = EffectCache::new();
+        let mut t = from;
+        while t < to { let u = t.saturating_add(chunk).min(to); serial.extend(mixdown_with_cache(&p, &audio, &BTreeMap::new(), t, u, rate, &[], &[], &mut cache)); t = u; }
+        let par = mixdown_parallel(&p, &audio, &BTreeMap::new(), from, to, rate, &[], 3, Ticks::from_seconds(4.0), chunk);
+        assert_eq!(par.len(), serial.len());
+        let peak = serial.iter().fold(0.0f32, |m, x| m.max(x.abs())) as f64;
+        let sig = (serial.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / serial.len() as f64).sqrt();
+        let d: Vec<f64> = par.iter().zip(&serial).map(|(a, b)| (*a - *b) as f64).collect();
+        let worst = d.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        let rms = (d.iter().map(|x| x * x).sum::<f64>() / d.len() as f64).sqrt();
+        eprintln!("PARALLEL vs serial: worst {:.1} dB re peak, rms {:.1} dB re signal", 20.0 * (worst / peak).log10(), 20.0 * (rms / sig).max(1e-12).log10());
+        assert!(worst > 0.0, "two segments: a join exists, or this test measures nothing");
+        assert!(20.0 * (worst / peak).log10() < -60.0 && 20.0 * (rms / sig).log10() < -80.0);
+        // segment one is the serial render exactly, up to the 50 ms crossfade
+        // into segment two at its end
+        let exact = serial.len() / 2 - (rate as usize / 20) * 2;
+        assert!(par[..exact].iter().zip(&serial[..exact]).all(|(a, b)| a == b), "segment one is the serial render exactly");
+    }
+}
+
+#[cfg(test)]
+mod denormal_tests {
+    /// After the flush is set, a product that would be subnormal is zero
+    /// (and a normal one is untouched) -- on this thread, as the mixdown sets it.
+    #[test]
+    fn subnormal_results_flush_to_zero() {
+        super::flush_denormals_to_zero();
+        let tiny = std::hint::black_box(f32::MIN_POSITIVE);
+        assert_eq!(std::hint::black_box(tiny * 0.25), 0.0, "subnormal product flushed");
+        assert_eq!(std::hint::black_box(1.5f32) * 2.0, 3.0);
+    }
 }
 
 #[cfg(test)]
@@ -2339,6 +2722,30 @@ mod automation_render_tests {
         for i in 0..plain.len() { assert!((plain[i] - same[i]).abs() < 1e-6, "unity ride is transparent at {i}"); }
     }
 
+    /// A lane on a gain effect's LINEAR `level` is the gain itself: 0 is
+    /// silence and 1 unity, which a lane on `db` cannot reach (it
+    /// multiplies the stored dB: 0 dB x anything is 0 dB). FL's Fruity
+    /// Balance volume rides -- mutes included -- land here.
+    #[test]
+    fn a_level_lane_on_a_gain_effect_reaches_silence_and_unity() {
+        use studio_core::ParamKey;
+        let (mut p, audio) = one_clip_project();
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0, silent: false, muted: false,
+            chain: vec![effect("gain", &[("db", 0.0)])], sends: vec![], parent: None } }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        let plain = render(&p, &audio);
+        let level = AutoTarget::BusParam { bus: BusId(1), effect: 0, key: ParamKey::new("level").unwrap() };
+        let mut ridden = p.clone();
+        ridden.apply(&Op::SetAutoPoint { target: level, at: Ticks::ZERO, value: 0.0 }).unwrap();
+        ridden.apply(&Op::SetAutoPoint { target: level, at: Ticks::from_seconds(0.5), value: 0.0 }).unwrap();
+        ridden.apply(&Op::SetAutoPoint { target: level, at: Ticks::from_seconds(0.5).saturating_add(Ticks(1)), value: 1.0 }).unwrap();
+        let out = render(&ridden, &audio);
+        assert!(plain[1000].abs() > 0.1, "the clip is audible unridden: {}", plain[1000]);
+        assert_eq!(out[1000], 0.0, "level 0: silence");
+        let n = out.len();
+        assert!((out[n - 1000] - plain[n - 1000]).abs() < 1e-6, "level 1: exactly as unridden");
+    }
+
     #[test]
     fn a_dangling_or_unknown_parameter_target_changes_nothing() {
         use studio_core::ParamKey;
@@ -2957,5 +3364,154 @@ mod band_peak_tests {
         assert!(full > 0.45 && mid > 0.3, "the voice dominates everywhere else: {full} / {mid}");
         assert!(low < 0.12, "the low band must not just be the voice again: {low}");
         assert!(low > 0.01, "and the rumble must actually show: {low}");
+    }
+}
+
+#[cfg(test)]
+mod duck_tests {
+    use super::*;
+    use studio_core::{Bus, BusId, Clip, ClipId, Effect, Op, Source, SourceId, Track, TrackId, TrackKind};
+
+    fn s(x: f64) -> Ticks { Ticks::from_seconds(x) }
+
+    /// A kick (a 60 ms burst every 0.5 s) and a steady bass, each on its own
+    /// bus; the BASS bus ducks keyed by the KICK bus. The bass bus has the
+    /// LOWER id, so a plain bus order would fold it before its key.
+    fn project(duck: bool) -> (Project, BTreeMap<SourceId, SourceAudio>) { project_ids(duck, 1, 2) }
+
+    /// Bass on bus `bass_bus`, kick on `kick_bus`: both ways round, because
+    /// the plain bus order puts ONE of them first and the reorder must
+    /// matter in the other (the first version only built one, where the
+    /// kick happened to come first and the reorder was never needed).
+    fn project_ids(duck: bool, bass_bus: u64, kick_bus: u64) -> (Project, BTreeMap<SourceId, SourceAudio>) {
+        let rate = 48_000u32;
+        let n = rate as usize * 2;
+        let kick: Vec<f32> = (0..n).map(|i| if i % (rate as usize / 2) < rate as usize * 6 / 100 { 0.9 * ((i as f32) * 0.2).sin() } else { 0.0 }).collect();
+        let bass: Vec<f32> = (0..n).map(|i| 0.3 * ((i as f32) * 0.01).sin()).collect();
+        let mut p = Project::default();
+        let mut chain = Vec::new();
+        if duck {
+            chain.push(Effect { kind: "duck".into(), enabled: true,
+                params: [("key".to_string(), kick_bus as f32), ("threshold".to_string(), -30.0), ("depth".to_string(), 12.0),
+                         ("ratio".to_string(), 20.0), ("attack".to_string(), 0.5), ("release".to_string(), 80.0)].into() });
+        }
+        // the kick bus is SILENT: a sidechain-only dummy kick, heard by the
+        // duck and by nobody else -- so the mix is the bass alone
+        for (id, name, ch, silent) in [(bass_bus, "Bass", chain.clone(), false), (kick_bus, "Kick", Vec::new(), true)] {
+            p.apply(&Op::AddBus { bus: Bus { id: BusId(id), name: name.into(), parent: None, gain: 1.0, chain: ch, sends: vec![], muted: false, silent } }).unwrap();
+        }
+        let mut audio = BTreeMap::new();
+        for (id, bus, data) in [(1u64, bass_bus, bass), (2, kick_bus, kick)] {
+            p.apply(&Op::AddTrack { track: Track { id: TrackId(id), kind: TrackKind::Audio, name: format!("t{id}"), muted: false, locked: false,
+                gain: 1.0, route: Some(BusId(bus)) }, at: 0 }).unwrap();
+            p.apply(&Op::AddSource { source: Source::file(SourceId(id), format!("{id}.wav"), s(2.0), rate, 1, false) }).unwrap();
+            p.apply(&Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(id), track: TrackId(id), pos: Ticks::ZERO,
+                src_in: Ticks::ZERO, len: s(2.0), gain: 1.0, effects: vec![] } }).unwrap();
+            audio.insert(SourceId(id), SourceAudio { sample_rate: rate, channels: vec![data] });
+        }
+        (p, audio)
+    }
+
+    fn bass_rms(p: &Project, audio: &BTreeMap<SourceId, SourceAudio>, from: f64, to: f64) -> f32 {
+        // no solo: soloing the bass would stop the kick reaching its bus, and
+        // the key with it (the first version of this test did, and read 0 dB)
+        let out = mixdown(p, audio, &BTreeMap::new(), s(from), s(to), 48_000, &[], &[]);
+        (out.iter().map(|x| x * x).sum::<f32>() / out.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn the_bass_ducks_on_each_kick_and_comes_back_between_them() {
+        for (bb, kb) in [(1u64, 2u64), (2, 1)] {
+        let (dry, audio) = project_ids(false, bb, kb);
+        let (wet, _) = project_ids(true, bb, kb);
+        let plain = wet.bus_order().unwrap();
+        eprintln!("ids bass {bb} kick {kb}: plain order {plain:?}");
+        // inside a kick (0.51-0.55 s) and well after it (0.40-0.48 s: 340 ms on)
+        let (under, between) = (bass_rms(&wet, &audio, 0.51, 0.55), bass_rms(&wet, &audio, 0.40, 0.48));
+        let (d_under, d_between) = (bass_rms(&dry, &audio, 0.51, 0.55), bass_rms(&dry, &audio, 0.40, 0.48));
+        let db = |a: f32, b: f32| 20.0 * (a / b).log10();
+        assert!(db(under, d_under) < -9.0, "ducked on the hit: {:.1} dB", db(under, d_under));
+        assert!(db(between, d_between) > -1.0, "back between hits: {:.1} dB", db(between, d_between));
+        }
+    }
+
+    /// The imager on a bus: width 0 everywhere folds the bus to mono (L == R),
+    /// and the MONO fold-down is the same with and without it -- the
+    /// imager's own invariant, now through the mixdown.
+    #[test]
+    fn a_bus_imager_at_zero_width_is_mono_and_never_changes_the_fold_down() {
+        let (mut p, _) = project(false);
+        // a stereo source with different L and R
+        let rate = 48_000u32;
+        let n = rate as usize;
+        let l: Vec<f32> = (0..n).map(|i| 0.3 * ((i as f32) * 0.05).sin()).collect();
+        let r: Vec<f32> = (0..n).map(|i| 0.3 * ((i as f32) * 0.031).sin()).collect();
+        let mut audio = BTreeMap::new();
+        audio.insert(SourceId(1), SourceAudio { sample_rate: rate, channels: vec![l, r] });
+        audio.insert(SourceId(2), SourceAudio { sample_rate: rate, channels: vec![vec![0.0; n]] });
+        // The baseline is a NEUTRAL imager (widths 1), not no imager: the
+        // crossovers rotate phase, so the fold-down only matches sample for
+        // sample through the same filters -- the imager's own test compares
+        // two imagers for this reason (the first version of this one did not,
+        // and read a 0.94 error for a fold-down that sounds the same).
+        let set = |p: &mut Project, w: f32| {
+            let chain = vec![Effect { kind: "imager".into(), enabled: true,
+                params: [("low".to_string(), w), ("mid".to_string(), w), ("high".to_string(), w)].into() }];
+            p.apply(&Op::SetBusChain { id: BusId(1), chain }).unwrap();
+        };
+        set(&mut p, 1.0);
+        let plain = mixdown(&p, &audio, &BTreeMap::new(), s(0.2), s(0.6), rate, &[], &[]);
+        set(&mut p, 0.0);
+        let mono = mixdown(&p, &audio, &BTreeMap::new(), s(0.2), s(0.6), rate, &[], &[]);
+        let side = mono.chunks(2).map(|f| (f[0] - f[1]).abs()).fold(0.0f32, f32::max);
+        assert!(side < 1e-4, "width 0: L == R, side {side}");
+        let fold = |v: &[f32]| v.chunks(2).map(|f| f[0] + f[1]).collect::<Vec<f32>>();
+        let (a, b) = (fold(&plain), fold(&mono));
+        let err = a.iter().zip(&b).skip(4800).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let peak = a.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(err < 0.02 * peak, "the mono fold-down is unchanged (after the crossovers settle): {err} of {peak}");
+    }
+
+    /// The doubler at amount 0 is exact silence of the wet part; at 0.5 on a
+    /// MONO voice it adds width (L != R) and level, and its copies are late
+    /// (no wet signal in the first ~15 ms).
+    #[test]
+    fn the_doubler_widens_a_mono_voice_and_at_zero_does_nothing() {
+        let rate = 48_000u32;
+        let voice: Vec<f32> = (0..rate as usize).flat_map(|i| { let x = 0.3 * ((i as f32) * 0.037).sin() * ((i as f32) * 0.0011).sin(); [x, x] }).collect();
+        let fx = |amt: f32| Effect { kind: "doubler".into(), enabled: true, params: [("amount".to_string(), amt)].into() };
+        let mut zero = voice.clone();
+        Doubler::new(rate).process(&mut zero, &fx(0.0), rate, 0);
+        assert_eq!(zero, voice, "amount 0 changes nothing");
+        let mut wet = voice.clone();
+        Doubler::new(rate).process(&mut wet, &fx(0.5), rate, 0);
+        assert_eq!(&wet[..2 * 700], &voice[..2 * 700], "the copies are late: nothing added in the first 14 ms");
+        let side = wet.chunks(2).skip(4800).map(|f| (f[0] - f[1]).powi(2)).sum::<f32>();
+        let e = |v: &[f32]| v.iter().skip(9600).map(|x| x * x).sum::<f32>();
+        assert!(side > 0.01 * e(&voice), "a mono voice is WIDER doubled: side energy {side}");
+        assert!(e(&wet) > e(&voice), "and fuller");
+    }
+
+    /// Bus pan is a balance: hard left silences the right side and leaves the
+    /// left exactly as it was; centre changes nothing.
+    #[test]
+    fn a_bus_panned_hard_left_keeps_its_left_and_loses_its_right() {
+        let (mut p, audio) = project(false);
+        let centre = mixdown(&p, &audio, &BTreeMap::new(), s(0.40), s(0.48), 48_000, &[], &[]);
+        p.apply(&Op::SetBusPan { id: BusId(1), pan: -1.0 }).unwrap();
+        let left = mixdown(&p, &audio, &BTreeMap::new(), s(0.40), s(0.48), 48_000, &[], &[]);
+        let (l0, l1): (Vec<f32>, Vec<f32>) = (centre.iter().step_by(2).copied().collect(), left.iter().step_by(2).copied().collect());
+        assert_eq!(l0, l1, "the near side is untouched");
+        assert!(left.iter().skip(1).step_by(2).all(|x| *x == 0.0), "the far side is gone");
+        assert!(centre.iter().skip(1).step_by(2).any(|x| *x != 0.0), "and was there at centre");
+    }
+
+    #[test]
+    fn a_key_folded_after_its_ducked_bus_is_moved_ahead_of_it() {
+        let (p, _) = project(true);
+        let plain = p.bus_order().unwrap();
+        let ordered = order_for_ducks(&p, plain.clone());
+        let pos = |o: &[BusId], b: u64| o.iter().position(|x| *x == BusId(b)).unwrap();
+        assert!(pos(&ordered, 2) < pos(&ordered, 1), "kick before the bass it keys: {ordered:?} (plain {plain:?})");
     }
 }

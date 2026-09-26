@@ -33,10 +33,11 @@ use crate::{BandKind, Biquad, Compressor};
 pub struct Crossover {
     lp: [Biquad; 2],
     hp: [Biquad; 2],
-    /// LR4 allpass, built as lp+hp of a matching pair — used to phase-align the
-    /// bands below this crossover.
-    ap_lp: [Biquad; 2],
-    ap_hp: [Biquad; 2],
+    /// LR4's allpass -- lp + hp of the pair, summed -- as the ONE second-order
+    /// allpass section it equals (Biquad::allpass): phase-aligns the bands
+    /// below this crossover. Was the four sections themselves: a third of the
+    /// multiband's filtering, for the same response.
+    ap: Biquad,
     pub freq: f32,
 }
 
@@ -47,8 +48,7 @@ impl Crossover {
         Crossover {
             lp: [Biquad::design(BandKind::LowPass, rate, freq, q, 0.0); 2],
             hp: [Biquad::design(BandKind::HighPass, rate, freq, q, 0.0); 2],
-            ap_lp: [Biquad::design(BandKind::LowPass, rate, freq, q, 0.0); 2],
-            ap_hp: [Biquad::design(BandKind::HighPass, rate, freq, q, 0.0); 2],
+            ap: Biquad::allpass(rate, freq, q),
             freq,
         }
     }
@@ -72,17 +72,11 @@ impl Crossover {
     /// Allpass: unity magnitude, the phase this crossover imposes. Applied to
     /// bands BELOW it so everything lines up when the bands are summed.
     #[inline]
-    pub fn allpass(&mut self, x: f32) -> f32 {
-        let mut lo = x;
-        for s in self.ap_lp.iter_mut() { lo = s.process(lo); }
-        let mut hi = x;
-        for s in self.ap_hp.iter_mut() { hi = s.process(hi); }
-        lo + hi
-    }
+    pub fn allpass(&mut self, x: f32) -> f32 { self.ap.process(x) }
 
     pub fn reset(&mut self) {
-        for s in self.lp.iter_mut().chain(&mut self.hp)
-            .chain(&mut self.ap_lp).chain(&mut self.ap_hp) { s.reset(); }
+        for s in self.lp.iter_mut().chain(&mut self.hp) { s.reset(); }
+        self.ap.reset();
     }
 }
 
@@ -99,6 +93,13 @@ pub struct Splitter {
     /// passed; four-band came out 1.7 dB off at 400 Hz, which is exactly the
     /// kind of small, plausible error that ships.
     aps: Vec<Vec<Crossover>>,
+    /// The TRANSPARENT path's filters: one allpass per crossover. With every
+    /// band untouched the bands sum to exactly the cascade of the crossovers'
+    /// allpasses (band 0 = LR_lo1 AP2, band 1 = LR_hi1 LR_lo2, band 2 = LR_hi1
+    /// LR_hi2: sum = (LR_lo1 + LR_hi1) AP2 = AP1 AP2), so that is what runs --
+    /// N sections instead of 6N (every imported FL multiband: its bands
+    /// bypassed, their settings not decoded).
+    through: Vec<Biquad>,
 }
 
 impl Splitter {
@@ -108,7 +109,8 @@ impl Splitter {
         let aps = (0..xs.len())
             .map(|b| freqs[b + 1..].iter().map(|f| Crossover::new(rate, *f)).collect())
             .collect();
-        Splitter { xs, aps }
+        let through = freqs.iter().map(|f| Biquad::allpass(rate, *f, std::f32::consts::FRAC_1_SQRT_2)).collect();
+        Splitter { xs, aps, through }
     }
 
     pub fn bands(&self) -> usize { self.xs.len() + 1 }
@@ -134,9 +136,18 @@ impl Splitter {
         }
     }
 
+    /// The sum of every band, untouched: the crossovers' allpasses in turn.
+    #[inline]
+    pub fn through(&mut self, x: f32) -> f32 {
+        let mut y = x;
+        for a in self.through.iter_mut() { y = a.process(y); }
+        y
+    }
+
     pub fn reset(&mut self) {
         for x in self.xs.iter_mut() { x.reset(); }
         for row in self.aps.iter_mut() { for a in row.iter_mut() { a.reset(); } }
+        for a in self.through.iter_mut() { a.reset(); }
     }
 }
 
@@ -157,6 +168,20 @@ pub struct Band {
     /// Bypassed bands still pass through the splitter, so soloing one band and
     /// bypassing another cannot change the crossover behaviour of the rest.
     pub bypass: bool,
+    /// `gain_db` as a factor, and the dB it was computed for: a powf per band
+    /// per SAMPLE was a fifth of the multiband's time, for a value that only
+    /// changes when someone moves it.
+    gain_lin: f32,
+    gain_for: f32,
+}
+
+impl Band {
+    #[inline]
+    fn gain(&mut self) -> f32 {
+        if self.gain_db != self.gain_for { self.gain_for = self.gain_db; self.gain_lin = crate::from_db_pub(self.gain_db); }
+        self.gain_lin
+    }
+    fn untouched(&self) -> bool { self.bypass && self.gain_db == 0.0 && !self.muted && !self.soloed }
 }
 
 impl Multiband {
@@ -166,7 +191,7 @@ impl Multiband {
             splitter: Splitter::new(rate, freqs),
             bands: (0..n).map(|_| Band {
                 comp: Compressor::new(rate, -18.0, 3.0, 10.0, 120.0),
-                gain_db: 0.0, muted: false, soloed: false, bypass: true,
+                gain_db: 0.0, muted: false, soloed: false, bypass: true, gain_lin: 1.0, gain_for: 0.0,
             }).collect(),
             scratch: vec![0.0; n],
         }
@@ -174,6 +199,10 @@ impl Multiband {
 
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
+        // every band untouched: the bands' sum, computed as what it equals.
+        // (Switching paths mid-stream -- a band engaged by automation -- starts
+        // the other path's filters from where they last were: a brief seam.)
+        if self.bands.iter().all(Band::untouched) { return self.splitter.through(x); }
         let n = self.splitter.bands();
         self.splitter.split(x, &mut self.scratch);
         let any_solo = self.bands.iter().any(|b| b.soloed);
@@ -182,7 +211,7 @@ impl Multiband {
             let b = &mut self.bands[i];
             let mut v = self.scratch[i];
             if !b.bypass { v = b.comp.process(v); }
-            v *= crate::from_db_pub(b.gain_db);
+            v *= b.gain();
             // Solo wins over mute, and silences everything not soloed — the
             // rule every mixer shares and every reimplementation inverts once.
             let audible = if any_solo { b.soloed } else { !b.muted };
@@ -204,6 +233,75 @@ impl Multiband {
 
 #[cfg(test)]
 mod tests {
+    fn noise(n: usize) -> Vec<f32> {
+        let mut st = 0x2545F491u32;
+        (0..n).map(|_| { st ^= st << 13; st ^= st >> 17; st ^= st << 5; (st as f32 / u32::MAX as f32) * 2.0 - 1.0 }).collect()
+    }
+
+    /// The one allpass section IS an LR4 pair's low + high -- checked against
+    /// the pair computed in f64 (the reference): the single f32 section is no
+    /// further from it than the four f32 sections it replaced, and both are
+    /// under -70 dB. (Straight f32 against f32 the two differ by ~1e-4 at 120
+    /// Hz: rounding in the four-section cascade, poles near the unit circle.)
+    #[test]
+    fn the_allpass_section_equals_an_lr4_pair_summed() {
+        #[derive(Clone, Copy)]
+        struct B64 { b: [f64; 3], a: [f64; 2], x: [f64; 2], y: [f64; 2] }
+        impl B64 {
+            fn new(lowpass: bool, f: f64) -> B64 {
+                let w = std::f64::consts::TAU * f / 48_000.0;
+                let (sn, cs) = (w.sin(), w.cos());
+                let al = sn / (2.0 * std::f64::consts::FRAC_1_SQRT_2);
+                let a0 = 1.0 + al;
+                let b = if lowpass { [(1.0 - cs) / 2.0, 1.0 - cs, (1.0 - cs) / 2.0] } else { [(1.0 + cs) / 2.0, -(1.0 + cs), (1.0 + cs) / 2.0] };
+                B64 { b: [b[0] / a0, b[1] / a0, b[2] / a0], a: [-2.0 * cs / a0, (1.0 - al) / a0], x: [0.0; 2], y: [0.0; 2] }
+            }
+            fn process(&mut self, x: f64) -> f64 {
+                let y = self.b[0] * x + self.b[1] * self.x[0] + self.b[2] * self.x[1] - self.a[0] * self.y[0] - self.a[1] * self.y[1];
+                self.x = [x, self.x[0]]; self.y = [y, self.y[0]]; y
+            }
+        }
+        let q = std::f32::consts::FRAC_1_SQRT_2;
+        for f in [120.0f32, 1_000.0, 9_000.0] {
+            let (mut lp, mut hp) = ([Biquad::design(BandKind::LowPass, 48_000.0, f, q, 0.0); 2], [Biquad::design(BandKind::HighPass, 48_000.0, f, q, 0.0); 2]);
+            let (mut rl, mut rh) = ([B64::new(true, f as f64); 2], [B64::new(false, f as f64); 2]);
+            let mut ap = Biquad::allpass(48_000.0, f, q);
+            let (mut e_four, mut e_one) = (0.0f64, 0.0f64);
+            for x in noise(48_000) {
+                let (mut l, mut h) = (x, x);
+                for s in lp.iter_mut() { l = s.process(l); }
+                for s in hp.iter_mut() { h = s.process(h); }
+                let (mut l64, mut h64) = (x as f64, x as f64);
+                for s in rl.iter_mut() { l64 = s.process(l64); }
+                for s in rh.iter_mut() { h64 = s.process(h64); }
+                let r = l64 + h64;
+                e_four = e_four.max(((l + h) as f64 - r).abs());
+                e_one = e_one.max((ap.process(x) as f64 - r).abs());
+            }
+            eprintln!("ALLPASS {f} Hz vs f64: one section {e_one:.2e}, four sections {e_four:.2e}");
+            assert!(e_one < 3e-4 && e_one <= e_four * 1.5, "{f} Hz: one section {e_one:.2e}, four {e_four:.2e}");
+        }
+    }
+
+    /// The transparent path returns what the full split summed returns (every
+    /// band untouched), for three and four bands.
+    #[test]
+    fn the_transparent_path_equals_the_bands_summed() {
+        for freqs in [vec![200.0f32, 2_000.0], vec![150.0, 900.0, 5_000.0]] {
+            let (mut full, mut fast) = (Splitter::new(48_000.0, &freqs), Splitter::new(48_000.0, &freqs));
+            let mut out = vec![0.0; full.bands()];
+            let worst = noise(48_000).into_iter().map(|x| {
+                full.split(x, &mut out);
+                (out.iter().sum::<f32>() - fast.through(x)).abs()
+            }).fold(0.0f32, f32::max);
+            assert!(worst < 1e-4, "{freqs:?}: {worst}");
+        }
+        // and a Multiband with its bands untouched takes it
+        let mut m = Multiband::new(48_000.0, &[200.0, 2_000.0]);
+        let mut s = Splitter::new(48_000.0, &[200.0, 2_000.0]);
+        for x in noise(4_800) { assert_eq!(m.process(x), s.through(x)); }
+    }
+
     use super::*;
     use crate::analysis::Spectrum;
     use std::f32::consts::TAU;

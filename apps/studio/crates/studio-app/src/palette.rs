@@ -60,6 +60,8 @@ pub enum ShellVerb {
     AddTrack { video: bool },
     /// Open the native file picker for a project.
     OpenProjectBrowse,
+    /// Undo this many steps at once (from the named undo history).
+    UndoSteps(u16),
     /// Open the project at this place in `open_project::nearby()`.
     OpenProjectFound(u16),
     /// With unsaved changes: save, then open the waiting project.
@@ -121,6 +123,15 @@ pub enum ShellVerb {
     StageBind { bus: BusId, preset: u8 },
     /// Measure the look of the picture under the playhead and hold it.
     StyleCopy,
+    /// A first cut from the transcripts (`assembly`), at the playhead, on a
+    /// new track, reviews as markers.
+    Assemble,
+    /// Draft outline.txt from the footage (`assembly::draft_story`).
+    DraftStory,
+    /// Check the timeline against its documents and footage (`story_check`).
+    CheckStory,
+    /// Survey the video on the timeline for touch-up (`vfx_setup`).
+    VfxSurvey,
     /// Give the selected clips the held look, at `pct`% strength.
     StylePaste(u32),
     /// What the selected clips' effects do after the clips end: `ring_ms` of
@@ -281,6 +292,8 @@ pub enum Ask {
     KaleidoChoice,
     /// Which project to open: the picker, or one found nearby.
     OpenProjectPick,
+    /// Which change in the undo history to go back to before.
+    UndoTo,
     /// Audio or video, for a new track.
     AddTrackKind,
     /// The live project has unsaved changes: what to do before opening another.
@@ -377,6 +390,18 @@ pub fn root() -> Vec<Choice> {
         c("show transcripts under clips (load a folder of .srt)",
           Some("what is being said, in the gutter under each clip"),
           Then::Do(Act::Shell(ShellVerb::LoadTranscripts))),
+        c("story: draft an outline from the footage",
+          Some("scenes from what is said; edit outline.txt, then assemble"),
+          Then::Do(Act::Shell(ShellVerb::DraftStory))),
+        c("vfx: survey the video on the timeline",
+          Some("shake, flicker, short handles -> vfx.md and markers"),
+          Then::Do(Act::Shell(ShellVerb::VfxSurvey))),
+        c("constraints: check the timeline against its documents",
+          Some("outline, constraints.txt, .lrc, and what the takes rule out"),
+          Then::Do(Act::Shell(ShellVerb::CheckStory))),
+        c("assemble a first cut from the transcripts",
+          Some("order from outline.txt / script.txt; reviews as markers"),
+          Then::Do(Act::Shell(ShellVerb::Assemble))),
         c("insert a clip at the playhead by what is said (or a time range)",
           Some("search the transcripts, or type C0057 12.5-18"),
           Then::Ask(Ask::InsertFind)),
@@ -473,6 +498,7 @@ pub fn root() -> Vec<Choice> {
         c("playhead to end", Some("g e"), Then::Do(Act::Shell(ShellVerb::GotoEnd))),
         c("undo", Some("u"), Then::Do(Act::Key('u'))),
         c("redo", Some("U"), Then::Do(Act::Key('U'))),
+        c("undo to before…", Some("pick a change from the named history"), Then::Ask(Ask::UndoTo)),
         c("track volume up 3 dB", None, Then::Ask(Ask::TrackGain(3))),
         c("track volume down 3 dB", None, Then::Ask(Ask::TrackGain(-3))),
         c("add a track below", Some("under the selected clip's track, or at the bottom"), Then::Ask(Ask::AddTrackKind)),
@@ -742,6 +768,8 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
             Choice { label: "audio track".into(), hint: None, then: Then::Do(Act::Shell(ShellVerb::AddTrack { video: false })) },
             Choice { label: "video track".into(), hint: None, then: Then::Do(Act::Shell(ShellVerb::AddTrack { video: true })) },
         ],
+        // the history is the palette's, not the project's: see `choices`
+        Ask::UndoTo => Vec::new(),
         Ask::OpenProjectPick => {
             let mut v = vec![Choice { label: "browse… (file picker)".into(), hint: Some("the desktop's own file dialog".into()),
                 then: Then::Do(Act::Shell(ShellVerb::OpenProjectBrowse)) }];
@@ -962,6 +990,9 @@ pub struct Palette {
     /// The transcripts, snapshotted when the palette opens — the one input
     /// the project does not hold. Shared, not copied per keystroke.
     pub words: std::sync::Arc<std::collections::BTreeMap<studio_core::SourceId, Vec<studio_voice::Segment>>>,
+    /// The undo history as named lines, newest first (line k is k + 1
+    /// undos away) -- snapshotted at open, like `words`.
+    pub history: std::sync::Arc<Vec<String>>,
 }
 
 /// The find step: a typed time range first (it is exactly what was asked
@@ -1021,6 +1052,16 @@ fn insert_to(project: &Project, words: &std::collections::BTreeMap<studio_core::
     })
 }
 
+/// The named undo history as choices: line k undoes k + 1 steps.
+fn undo_to(history: &[String]) -> Vec<Choice> {
+    if history.is_empty() {
+        return vec![Choice { label: "nothing to undo".into(), hint: None, then: Then::Do(Act::Shell(ShellVerb::UndoSteps(0))) }];
+    }
+    history.iter().enumerate().map(|(k, line)| Choice { label: line.clone(),
+        hint: Some(if k == 0 { "1 undo".into() } else { format!("{} undos", k + 1) }),
+        then: Then::Do(Act::Shell(ShellVerb::UndoSteps((k + 1).min(u16::MAX as usize) as u16))) }).collect()
+}
+
 impl Palette {
     pub fn open() -> Palette { Palette::default() }
 
@@ -1034,6 +1075,7 @@ impl Palette {
             None => root(),
             Some(Ask::InsertFind) => insert_find(project, &self.words, &self.query),
             Some(Ask::InsertTo { source, start_ms }) => insert_to(project, &self.words, source, start_ms),
+            Some(Ask::UndoTo) => undo_to(&self.history),
             Some(ask) => candidates(ask, project),
         }
     }
@@ -1461,7 +1503,7 @@ mod tests {
         // diverge from the keyboard.
         // And every hint that exists must be a key the keymap or the
         // shell's own interception actually handles — one source of truth.
-        let intercepted = ['A', 'Q', ',', '.', '<', '>', 'g', 'G'];
+        let intercepted = ['A', 'Q', ',', '.', '<', '>', 'g', 'G', 'n', 'D', '[', ']'];
         for c in &r {
             let Some(Act::Key(ch)) = (match &c.then {
                 Then::Do(a) => Some(a.clone()), _ => None }) else { continue };

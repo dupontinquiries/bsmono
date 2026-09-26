@@ -371,7 +371,8 @@ pub fn start_arrangement(
 }
 
 /// The music video: every video clip on the timeline cut into one mp4
-/// (top video track on top, black where none) over the arrangement's
+/// (top video track on top, lower tracks composited through blends,
+/// opacity and reframes as the viewport shows them, black where none) over the arrangement's
 /// mixdown. Video sources whose files are not on disk are gaps; a
 /// timeline with no video at all is refused, since black over audio is
 /// not a video anyone asked for. Synchronous — the shell runs it on a
@@ -392,7 +393,7 @@ pub fn render_music_video(
         .collect();
     let end = studio_audio::audible_end(project); // tails ring past the last clip
     let list = studio_video::edit::edit_list(project, &paths, Some(end));
-    if !list.iter().any(|s| matches!(s, studio_video::edit::Segment::Cut(_))) {
+    if !list.iter().any(studio_video::edit::Segment::has_picture) {
         return Err(if paths.is_empty() {
             "no video on the timeline (or its files are not where the project says)".into()
         } else { "no video clip on a video track".into() });
@@ -410,7 +411,7 @@ pub fn render_music_video(
 }
 
 /// What the video export will not reproduce from the viewport (rotation,
-/// layer blends, retiming — see `studio_video::edit::Picture`), one line per
+/// retiming — see `studio_video::edit::Picture`), one line per
 /// affected cut. The export still runs; these go to the tracker as notes so
 /// a file that differs from the preview says so instead of surprising.
 pub fn video_warnings(project: &Project) -> Vec<String> {
@@ -861,4 +862,11 @@ mod tests {
         assert_eq!(back.channels.len(), 2);
         assert!(back.channels[0].iter().any(|s| s.abs() > 0.01), "the kit is in the file");
     }
+}
+
+/// Run ffmpeg for a test, panicking with its error text on failure.
+#[cfg(test)]
+pub(crate) fn tests_support_run(args: &[&str]) {
+    let o = std::process::Command::new("ffmpeg").args(args).output().expect("ffmpeg runs");
+    assert!(o.status.success(), "ffmpeg {:?}: {}", args, String::from_utf8_lossy(&o.stderr));
 }

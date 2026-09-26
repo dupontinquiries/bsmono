@@ -27,9 +27,17 @@ pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Opti
     // 16-step kit plus the channel strip overruns the height. auto_shrink
     // off so the scroll region is the panel, not the content — otherwise
     // the area collapses to fit and nothing scrolls at all.
-    let out = egui::ScrollArea::both()
-        .auto_shrink([false, false])
-        .show(ui, |ui| show_inner(ui, s, c, playhead));
+    //
+    // The "where you are" strip sits ABOVE the scroll area, as on the
+    // Program tab, so scrolling right through a long pattern never scrolls
+    // away the pattern's and the channel's names.
+    crate::seq_header::show(ui, s, c, studio_egui::touch::Panel::Rack);
+    let mut area = egui::ScrollArea::both().auto_shrink([false, false]).id_salt("seq-rack");
+    if let Some(x) = crate::seq_header::adopt_scroll(s, studio_egui::touch::Panel::Rack) {
+        area = area.horizontal_scroll_offset(x);
+    }
+    let out = area.show(ui, |ui| show_inner(ui, s, c, playhead));
+    crate::seq_header::record_scroll(s, studio_egui::touch::Panel::Rack, out.state.offset.x);
     crate::scroll_edge::report(ui, &out)
 }
 
@@ -51,17 +59,9 @@ fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Op
         ui.label(format!("{:.0}%", s.rack.swing * 100.0));
         ui.separator();
 
+        // (the pattern's ◀ name ▶ moved to seq_header, shared with Notes)
         let n = s.rack.patterns.len();
-        if ui.button("◀").clicked() && n > 0 {
-            s.current_pattern = (s.current_pattern + n - 1) % n;
-        }
-        let name = s.rack.patterns.get(s.current_pattern)
-            .map(|p| p.name.clone()).unwrap_or_else(|| "—".into());
-        ui.label(name);
-        if ui.button("▶").clicked() && n > 0 {
-            s.current_pattern = (s.current_pattern + 1) % n;
-        }
-        if ui.button("+").clicked() {
+        if ui.button("+").on_hover_text("a new empty pattern").clicked() {
             let ch = s.rack.channels.len();
             s.rack.patterns.push(studio_live::Pattern::new(&format!("Pat {}", n + 1), 16, ch));
             s.current_pattern = s.rack.patterns.len() - 1;
@@ -96,7 +96,7 @@ fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Op
     let pattern = pattern.clone(); // the views take &Pattern; edits come back as values
 
     // ── the grid ────────────────────────────────────────────────────────
-    let edits = grid::grid(ui, &pattern, &s.rack.channels, &mut s.paint, playhead, c);
+    let edits = grid::grid(ui, &pattern, &s.rack.channels, &mut s.paint, playhead, Some(s.selected_channel), c);
     if let Some(p) = s.rack.patterns.get_mut(s.current_pattern) {
         for e in edits {
             match e {

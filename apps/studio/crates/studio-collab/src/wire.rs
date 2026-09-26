@@ -107,7 +107,22 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// field and desynchronise the whole stream.
 /// v19: `Binding` gained `response` and `fit_span` (a scene's stage signal
 /// driving several targets differently, and surviving a re-trim).
-pub const WIRE_VERSION: u8 = 19;
+/// v20: `Source` carries its KIND. Until now `put_source` wrote no kind and
+/// `get_source` rebuilt every source as `SourceKind::File`, so a linked
+/// pattern clip's source came back from a saved file -- or a peer -- as a
+/// file with an empty path: "missing or undecodable", silent (found when an
+/// FL import saved 51 pattern sources and reopened with 51 missing). A shape
+/// change, so a bump: tag 0 File, 1 Pattern (u64 pattern, str name).
+/// v21: `Op::SetBusPan` (tag 47) -- Studio's first pan in the timeline mix.
+/// v22: `SynthKind::Poly` (tag 6) -- the compact generated synth.
+/// v23: a Poly patch's TEXTURE -- harmonic profile, noise, FM, drive.
+/// v24: a Poly patch's IMAGE -- width, low width, pan by key, pan LFO.
+/// v25: PHASE and the per-trigger PAN ENVELOPE on a Poly patch.
+/// v26: a Poly patch's BODY (fixed-Hz resonances) and its human motion --
+/// delayed vibrato, drift, bow noise.
+/// v27: a rack channel's ONE-SHOT flag.
+/// v28: a step modifier's and a roll note's MICRO-TIMING (nudge).
+pub const WIRE_VERSION: u8 = 28;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -422,12 +437,25 @@ fn get_track(r: &mut R) -> Option<Track> {
 fn put_source(o: &mut Vec<u8>, s: &Source) {
     put_u64(o, s.id.0); put_str(o, &s.path); put_ticks(o, s.len);
     put_u32(o, s.sample_rate); put_u16(o, s.channels); put_u8(o, s.has_video as u8);
+    if enc_v() >= 20 {
+        match &s.kind {
+            studio_core::SourceKind::File => put_u8(o, 0),
+            studio_core::SourceKind::Pattern { pattern, name } => { put_u8(o, 1); put_u64(o, *pattern as u64); put_str(o, name); }
+        }
+    }
 }
 fn get_source(r: &mut R) -> Option<Source> {
-    Some(Source {
-        id: SourceId(r.u64()?), path: r.str()?, len: r.ticks()?,
-        sample_rate: r.u32()?, channels: r.u16()?, has_video: r.u8()? != 0, kind: studio_core::SourceKind::File,
-    })
+    let (id, path, len, sample_rate, channels, has_video) =
+        (SourceId(r.u64()?), r.str()?, r.ticks()?, r.u32()?, r.u16()?, r.u8()? != 0);
+    // before v20 no kind was written: every source read as a file (the bug above)
+    let kind = if r.v >= 20 {
+        match r.u8()? {
+            0 => studio_core::SourceKind::File,
+            1 => studio_core::SourceKind::Pattern { pattern: r.u64()? as usize, name: r.str()? },
+            _ => return None,
+        }
+    } else { studio_core::SourceKind::File };
+    Some(Source { id, path, len, sample_rate, channels, has_video, kind })
 }
 
 /// `Option<String>`: 0 = None, 1 + the string = Some. Shared because
@@ -541,6 +569,7 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
         Op::SetBusFlags { id, muted } => { put_u8(o, 17); put_u64(o, id.0); put_u8(o, *muted as u8); }
         Op::SetBusSilent { id, silent } => { put_u8(o, 45); put_u64(o, id.0); put_u8(o, *silent as u8); }
         Op::SetSourcePath { id, path } => { put_u8(o, 46); put_u64(o, id.0); put_str(o, path); }
+        Op::SetBusPan { id, pan } => { put_u8(o, 47); put_u64(o, id.0); put_f32(o, *pan); }
         Op::SetBusChain { id, chain } => { put_u8(o, 14); put_u64(o, id.0); put_effects(o, chain); }
         Op::SetBusSends { id, sends } => { put_u8(o, 15); put_u64(o, id.0); put_sends(o, sends); }
         Op::SetRoute { track, bus } => { put_u8(o, 16); put_u64(o, track.0); put_opt_bus_id(o, *bus); }
@@ -761,6 +790,7 @@ fn get_op(r: &mut R) -> Option<Op> {
         }
         45 => Op::SetBusSilent { id: BusId(r.u64()?), silent: r.u8()? != 0 },
         46 => Op::SetSourcePath { id: SourceId(r.u64()?), path: r.str()? },
+        47 => Op::SetBusPan { id: BusId(r.u64()?), pan: r.f32()? },
         44 => Op::SetClipFade {
             id: ClipId(r.u64()?),
             fade_in: Ticks(r.i64()?),
@@ -790,6 +820,28 @@ fn get_stamped(r: &mut R) -> Option<StampedOp> {
 
 fn put_synthkind(o: &mut Vec<u8>, k: &SynthKind) {
     match k {
+        SynthKind::Poly { hz, patch: p } => {
+            put_u8(o, 6);
+            put_f32(o, *hz);
+            put_u8(o, p.wave); put_u8(o, p.voices);
+            for v in [p.detune, p.sub, p.attack_ms, p.decay_ms, p.sustain, p.release_ms, p.cutoff, p.resonance, p.env_amount, p.vibrato, p.gain] {
+                put_f32(o, v);
+            }
+            if enc_v() >= 23 {
+                o.extend_from_slice(&p.partials);
+                for v in [p.noise, p.fm_ratio, p.fm_index, p.drive] { put_f32(o, v); }
+            }
+            if enc_v() >= 24 {
+                for v in [p.width, p.low_width, p.key_pan, p.pan_lfo_hz, p.pan_lfo_depth] { put_f32(o, v); }
+            }
+            if enc_v() >= 25 {
+                for v in [p.phase, p.pan_start, p.pan_end, p.pan_time_ms] { put_f32(o, v); }
+            }
+            if enc_v() >= 26 {
+                for v in p.body_hz.iter().chain(p.body_db.iter()) { put_f32(o, *v); }
+                for v in [p.body_q, p.vib_delay_ms, p.vib_rate, p.drift, p.bow_noise] { put_f32(o, v); }
+            }
+        }
         SynthKind::Sine { hz } => { put_u8(o, 0); put_f32(o, *hz); }
         SynthKind::Sampler { source } => { put_u8(o, 1); put_u64(o, source.0); }
         SynthKind::Beatspace { z, crossfade } => {
@@ -850,6 +902,31 @@ fn get_synthkind(r: &mut R) -> Option<SynthKind> {
     Some(match r.u8()? {
         0 => SynthKind::Sine { hz: r.f32()? },
         1 => SynthKind::Sampler { source: SourceId(r.u64()?) },
+        6 => {
+            let hz = r.f32()?;
+            let (wave, voices) = (r.u8()?, r.u8()?);
+            let mut f = [0f32; 11];
+            for v in f.iter_mut() { *v = r.f32()?; }
+            let mut patch = studio_live::PolyPatch { wave, voices, detune: f[0], sub: f[1], attack_ms: f[2], decay_ms: f[3],
+                sustain: f[4], release_ms: f[5], cutoff: f[6], resonance: f[7], env_amount: f[8], vibrato: f[9], gain: f[10], ..Default::default() };
+            if r.v >= 23 {
+                patch.partials.copy_from_slice(r.take(16)?);
+                patch.noise = r.f32()?; patch.fm_ratio = r.f32()?; patch.fm_index = r.f32()?; patch.drive = r.f32()?;
+            }
+            if r.v >= 24 {
+                patch.width = r.f32()?; patch.low_width = r.f32()?; patch.key_pan = r.f32()?;
+                patch.pan_lfo_hz = r.f32()?; patch.pan_lfo_depth = r.f32()?;
+            }
+            if r.v >= 25 {
+                patch.phase = r.f32()?; patch.pan_start = r.f32()?; patch.pan_end = r.f32()?; patch.pan_time_ms = r.f32()?;
+            }
+            if r.v >= 26 {
+                for k in 0..3 { patch.body_hz[k] = r.f32()?; }
+                for k in 0..3 { patch.body_db[k] = r.f32()?; }
+                patch.body_q = r.f32()?; patch.vib_delay_ms = r.f32()?; patch.vib_rate = r.f32()?; patch.drift = r.f32()?; patch.bow_noise = r.f32()?;
+            }
+            SynthKind::Poly { hz, patch }
+        }
         5 => SynthKind::Sf2 {
             path: std::path::PathBuf::from(r.str()?),
             bank: r.u16()?,
@@ -888,6 +965,7 @@ fn put_channel(o: &mut Vec<u8>, c: &Channel) {
     put_u8(o, c.muted as u8);
     put_u8(o, c.choke_group.is_some() as u8);
     put_u8(o, c.choke_group.unwrap_or(0));
+    if enc_v() >= 27 { put_u8(o, c.one_shot as u8); }
 }
 fn get_channel(r: &mut R) -> Option<Channel> {
     let name = r.str()?;
@@ -897,8 +975,9 @@ fn get_channel(r: &mut R) -> Option<Channel> {
     let muted = r.u8()? != 0;
     let has_choke = r.u8()? != 0;
     let choke = r.u8()?;
+    let one_shot = if r.v >= 27 { r.u8()? != 0 } else { false };
     Some(Channel { name, kind, gain, pan, muted,
-                   choke_group: has_choke.then_some(choke) })
+                   choke_group: has_choke.then_some(choke), one_shot })
 }
 
 fn put_stepmod(o: &mut Vec<u8>, m: &StepMod) {
@@ -911,6 +990,7 @@ fn put_stepmod(o: &mut Vec<u8>, m: &StepMod) {
     let (n, k) = m.every.unwrap_or((0, 0));
     put_u8(o, n);
     put_u8(o, k);
+    if enc_v() >= 28 { put_f32(o, m.nudge); }
 }
 fn get_stepmod(r: &mut R) -> Option<StepMod> {
     let vel = r.f32()?;
@@ -921,7 +1001,8 @@ fn get_stepmod(r: &mut R) -> Option<StepMod> {
     let has_every = r.u8()? != 0;
     let n = r.u8()?;
     let k = r.u8()?;
-    Some(StepMod { vel, ratchet, tune, slide, prob, every: has_every.then_some((n, k)) })
+    let nudge = if r.v >= 28 { r.f32()? } else { 0.0 };
+    Some(StepMod { vel, ratchet, tune, slide, prob, every: has_every.then_some((n, k)), nudge })
 }
 
 fn put_pattern(o: &mut Vec<u8>, pat: &Pattern) {
@@ -947,6 +1028,7 @@ fn put_pattern(o: &mut Vec<u8>, pat: &Pattern) {
             put_u32(o, n.len);
             put_f32(o, n.vel);
             put_u8(o, n.slide as u8);
+            if enc_v() >= 28 { put_f32(o, n.nudge); }
         }
     }
 }
@@ -971,13 +1053,9 @@ fn get_pattern(r: &mut R) -> Option<Pattern> {
         let nn = r.u16()? as usize;
         let mut notes = Vec::with_capacity(nn.min(4096));
         for _ in 0..nn {
-            notes.push(Note {
-                key: r.u8()? as i8,
-                start: r.u32()?,
-                len: r.u32()?,
-                vel: r.f32()?,
-                slide: r.u8()? != 0,
-            });
+            let (key, start, len, vel, slide) = (r.u8()? as i8, r.u32()?, r.u32()?, r.f32()?, r.u8()? != 0);
+            let nudge = if r.v >= 28 { r.f32()? } else { 0.0 };
+            notes.push(Note { key, start, len, vel, slide, nudge });
         }
         rolls.insert(ch, notes);
     }
@@ -1442,17 +1520,17 @@ mod tests {
         let mut pattern = Pattern::new("beat", 16, 3);
         pattern.toggle(0, 0);
         pattern.toggle(1, 4);
-        pattern.set_mod(1, 4, StepMod { vel: 0.7, ratchet: 4, tune: -5, slide: true, prob: 0.8, every: Some((1, 2)) });
+        pattern.set_mod(1, 4, StepMod { vel: 0.7, ratchet: 4, tune: -5, slide: true, prob: 0.8, every: Some((1, 2)), nudge: -0.25 });
         // v9: a roll with the awkward parts — a negative key, a chord, and
         // a slide — so every rack round trip exercises the note codec.
-        pattern.add_note(1, Note { key: -12, start: 0, len: 4, vel: 0.9, slide: false });
-        pattern.add_note(1, Note { key: 7, start: 0, len: 2, vel: 0.5, slide: false });
-        pattern.add_note(1, Note { key: 3, start: 6, len: 1, vel: 1.0, slide: true });
+        pattern.add_note(1, Note { key: -12, start: 0, len: 4, vel: 0.9, slide: false, nudge: 0.0 });
+        pattern.add_note(1, Note { key: 7, start: 0, len: 2, vel: 0.5, slide: false, nudge: 0.0 });
+        pattern.add_note(1, Note { key: 3, start: 6, len: 1, vel: 1.0, slide: true, nudge: 1.0 / 3.0 });
         Rack {
             channels: vec![
-                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: Some(2) },
-                Channel { name: "808".into(), kind: SynthKind::Sub { note: -5, glide_from: Some(0), glide_ms: 40.0, drive: 0.3, decay_ms: 300.0 }, gain: 0.9, pan: -0.1, muted: false, choke_group: None },
-                Channel { name: "hat".into(), kind: SynthKind::Sampler { source: SourceId(3) }, gain: 0.6, pan: 0.2, muted: true, choke_group: Some(0) },
+                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: Some(2), one_shot: false },
+                Channel { name: "808".into(), kind: SynthKind::Sub { note: -5, glide_from: Some(0), glide_ms: 40.0, drive: 0.3, decay_ms: 300.0 }, gain: 0.9, pan: -0.1, muted: false, choke_group: None, one_shot: false },
+                Channel { name: "hat".into(), kind: SynthKind::Sampler { source: SourceId(3) }, gain: 0.6, pan: 0.2, muted: true, choke_group: Some(0), one_shot: false },
             ],
             patterns: vec![pattern],
             tempo_bpm: 140.0, swing: 0.11, ..Default::default() }
@@ -1467,12 +1545,56 @@ mod tests {
         rack.channels.push(Channel {
             name: "gan".into(),
             kind: SynthKind::Beatspace { z: [0.25, -0.5, 0.9], crossfade: 0.4 },
-            gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         });
         let p = Packet::Rack(RackSync { rack, seq: 12, site: SiteId(3) });
         let bytes = p.encode();
         let back = Packet::decode(&bytes).expect("decodes");
         assert_eq!(p, back, "round-trip changed the rack");
+    }
+
+    /// v27: a ONE-SHOT sampler stays one-shot through the wire, and a v26
+    /// rack (which had no such flag) opens with every channel gated -- the
+    /// behaviour it was saved with -- and nothing else changed.
+    #[test]
+    fn a_one_shot_channel_round_trips_and_a_v26_rack_opens_gated() {
+        let mut rack = sample_rack();
+        rack.channels[2].one_shot = true;
+        let p = Packet::Rack(RackSync { rack: rack.clone(), seq: 5, site: SiteId(2) });
+        let back = Packet::decode(&p.encode()).expect("decodes");
+        assert_eq!(back, p, "the one-shot flag round-trips");
+        let Packet::Rack(RackSync { rack: r, .. }) = &back else { panic!("a rack packet") };
+        assert!(r.channels[2].one_shot && !r.channels[0].one_shot);
+
+        ENCODE_AS.with(|c| c.set(26));
+        let old = p.encode();
+        ENCODE_AS.with(|c| c.set(WIRE_VERSION));
+        let Some(Packet::Rack(RackSync { rack: r, .. })) = Packet::decode_stored(&old) else { panic!("a v26 rack opens") };
+        assert!(r.channels.iter().all(|c| !c.one_shot), "v26 knew no one-shots");
+        let mut expect = rack;
+        expect.channels[2].one_shot = false;
+        // (nor did v26 know nudges, v28's)
+        for m in expect.patterns[0].mods.values_mut() { m.nudge = 0.0; }
+        for ns in expect.patterns[0].rolls.values_mut() { for n in ns.iter_mut() { n.nudge = 0.0; } }
+        assert_eq!(r, expect, "and nothing else moved");
+    }
+
+    /// v28: nudges round-trip (the sample rack carries a -0.25 step mod and
+    /// a +1/3 note); a v27 rack opens with everything on the grid, the rest
+    /// unchanged.
+    #[test]
+    fn nudges_round_trip_and_a_v27_rack_opens_on_the_grid() {
+        let rack = sample_rack();
+        let p = Packet::Rack(RackSync { rack: rack.clone(), seq: 7, site: SiteId(2) });
+        assert_eq!(Packet::decode(&p.encode()), Some(p.clone()));
+        ENCODE_AS.with(|c| c.set(27));
+        let old = p.encode();
+        ENCODE_AS.with(|c| c.set(WIRE_VERSION));
+        let Some(Packet::Rack(RackSync { rack: r, .. })) = Packet::decode_stored(&old) else { panic!("a v27 rack opens") };
+        let mut want = rack;
+        for m in want.patterns[0].mods.values_mut() { m.nudge = 0.0; }
+        for ns in want.patterns[0].rolls.values_mut() { for n in ns.iter_mut() { n.nudge = 0.0; } }
+        assert_eq!(r, want);
     }
 
     #[test]
@@ -1582,7 +1704,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 19, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 28, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]
@@ -1836,3 +1958,25 @@ mod group_key_wire_tests {
     }
 }
 
+#[cfg(test)]
+mod poly_wire_tests {
+    use super::*;
+
+    /// A Poly patch round-trips exactly, and is SMALL: the point of it.
+    #[test]
+    fn a_poly_patch_round_trips_and_fits_in_a_few_dozen_bytes() {
+        let mut partials = [0u8; 16];
+        partials[0] = 255; partials[4] = 90;
+        let k = SynthKind::Poly { hz: 261.63, patch: studio_live::PolyPatch { wave: 3, voices: 5, detune: 14.0, sub: 0.3, cutoff: 900.0,
+            partials, noise: 0.1, fm_ratio: 2.0, fm_index: 1.5, drive: 0.4,
+            width: 0.7, low_width: 0.3, key_pan: 0.25, pan_lfo_hz: 0.2, pan_lfo_depth: 0.4,
+            phase: 0.6, pan_start: 0.5, pan_end: 0.0, pan_time_ms: 1500.0,
+            body_hz: [290.0, 470.0, 2600.0], body_db: [6.0, 4.0, 8.0], body_q: 4.0, vib_delay_ms: 300.0, vib_rate: 5.5, drift: 6.0, bow_noise: 0.03,
+            ..Default::default() } };
+        let mut o = Vec::new();
+        put_synthkind(&mut o, &k);
+        assert!(o.len() <= 200, "a patch WITH texture, image and body: {} bytes", o.len());
+        let mut r = R { b: &o, i: 0, v: WIRE_VERSION };
+        assert_eq!(get_synthkind(&mut r), Some(k));
+    }
+}

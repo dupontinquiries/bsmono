@@ -178,10 +178,10 @@ mod tests {
                 channels: vec![
                     Channel { name: "kick".into(),
                         kind: SynthKind::Sine { hz: 55.0 },
-                        gain: 1.0, pan: 0.0, muted: false, choke_group: None },
+                        gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false },
                     Channel { name: "snap".into(),
                         kind: SynthKind::Sampler { source: studio_core::SourceId(7) },
-                        gain: 0.9, pan: 0.1, muted: false, choke_group: Some(1) },
+                        gain: 0.9, pan: 0.1, muted: false, choke_group: Some(1), one_shot: false },
                 ],
                 pattern: PatternFlat::from_pattern(&pattern),
                 media: vec![(7, "snap.opus".into())],

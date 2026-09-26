@@ -437,7 +437,7 @@ mod tests {
         sent_rack.tempo_bpm = 174.0;
         let mut pattern = studio_live::Pattern::new("beat", 16, 1);
         pattern.toggle(0, 0);
-        pattern.set_mod(0, 0, studio_live::StepMod { vel: 0.8, ratchet: 3, tune: -2, slide: true, prob: 0.9, every: Some((0, 2)) });
+        pattern.set_mod(0, 0, studio_live::StepMod { vel: 0.8, ratchet: 3, tune: -2, slide: true, prob: 0.9, every: Some((0, 2)), nudge: 0.0 });
         sent_rack.patterns.push(pattern);
         let expected = sent_rack.clone();
 

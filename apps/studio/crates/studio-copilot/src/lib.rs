@@ -431,7 +431,8 @@ pub fn change_song_key(rack: &studio_live::Rack, from: studio_fx::retune::Scale,
             studio_live::SynthKind::Sub { note, .. } => {
                 *note = note.saturating_add(delta as i8);
             }
-            studio_live::SynthKind::Sine { hz } => {
+            // melodic, like the sine: transposed with the song
+            studio_live::SynthKind::Sine { hz } | studio_live::SynthKind::Poly { hz, .. } => {
                 *hz *= 2f32.powf(delta as f32 / 12.0);
             }
             // TRANSPOSED, because a soundfont is a melodic instrument.
@@ -494,7 +495,7 @@ mod tests {
         use studio_live::Channel;
         let ch = |name: &str, kind| Channel {
             name: name.into(), kind, gain: 1.0, pan: 0.0,
-            muted: false, choke_group: None,
+            muted: false, choke_group: None, one_shot: false,
         };
         let rack = studio_live::Rack {
             channels: vec![ch("piano", piano), ch("kit", kit)],
@@ -787,9 +788,9 @@ mod tests {
         pattern.toggle(1, 4);
         studio_live::Rack {
             channels: vec![
-                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
-                Channel { name: "snare".into(), kind: SynthKind::Sampler { source: studio_core::SourceId(1) }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
-                Channel { name: "gan".into(), kind: SynthKind::Beatspace { z: [0.0, 0.0, 0.0], crossfade: 0.5 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
+                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false },
+                Channel { name: "snare".into(), kind: SynthKind::Sampler { source: studio_core::SourceId(1) }, gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false },
+                Channel { name: "gan".into(), kind: SynthKind::Beatspace { z: [0.0, 0.0, 0.0], crossfade: 0.5 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false },
             ],
             patterns: vec![pattern],
             tempo_bpm: 140.0, swing: 0.0,
@@ -893,10 +894,10 @@ mod tests {
         use studio_live::{Channel, SynthKind};
         studio_live::Rack {
             channels: vec![
-                Channel { name: "808".into(), kind: SynthKind::Sub { note: 0, glide_from: None, glide_ms: 0.0, drive: 0.0, decay_ms: 300.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
-                Channel { name: "lead".into(), kind: SynthKind::Sine { hz: 440.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
-                Channel { name: "snare".into(), kind: SynthKind::Sampler { source: studio_core::SourceId(1) }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
-                Channel { name: "gan".into(), kind: SynthKind::Beatspace { z: [0.1, 0.2, 0.3], crossfade: 0.5 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
+                Channel { name: "808".into(), kind: SynthKind::Sub { note: 0, glide_from: None, glide_ms: 0.0, drive: 0.0, decay_ms: 300.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false },
+                Channel { name: "lead".into(), kind: SynthKind::Sine { hz: 440.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false },
+                Channel { name: "snare".into(), kind: SynthKind::Sampler { source: studio_core::SourceId(1) }, gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false },
+                Channel { name: "gan".into(), kind: SynthKind::Beatspace { z: [0.1, 0.2, 0.3], crossfade: 0.5 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false },
             ],
             patterns: vec![],
             tempo_bpm: 140.0, swing: 0.0,

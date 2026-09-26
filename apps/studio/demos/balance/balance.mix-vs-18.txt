@@ -1,0 +1,23 @@
+duration: render 198.52 s, ours 192.77 s (-5.75 s)
+timing, whole song: ours is -20 ms against the render (onset correlation 0.18)
+level: ours is +13.5 dB against the render (median over sections)
+
+section            lag      corr   level   
+bars   1-8         +460 ms   0.07   +17.1 dB  little shared rhythm
+bars   9-16        -400 ms   0.24   +14.1 dB  
+bars  17-24         -20 ms   0.33   +12.4 dB  
+bars  25-32        -400 ms   0.16   +13.6 dB  little shared rhythm
+bars  33-40        -210 ms   0.19   +14.1 dB  little shared rhythm
+bars  41-48        +170 ms   0.14   +13.5 dB  little shared rhythm
+bars  49-56        -400 ms   0.22   +12.9 dB  
+bars  57-64         -20 ms   0.24   +13.5 dB  
+bars  65-72         -20 ms   0.32   +12.3 dB  
+bars  73-80         -30 ms   0.15   +13.6 dB  little shared rhythm
+bars  81-88        -210 ms   0.11   +10.9 dB  little shared rhythm
+bars  89-96         -20 ms   0.32   +11.4 dB  
+bars  97-104       -210 ms   0.12   +11.5 dB  little shared rhythm
+bars 105-112       -210 ms   0.21   +13.8 dB  
+bars 113-120        -20 ms   0.33   +18.0 dB  level +4.4 dB off the song
+bars 121-128        -20 ms   0.32   +13.7 dB  
+bars 129-136       +450 ms   0.37    +9.0 dB  timing +470 ms off the song; level -4.6 dB off the song
+

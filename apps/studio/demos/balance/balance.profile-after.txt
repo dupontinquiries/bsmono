@@ -1,0 +1,16 @@
+decode 33 media files: 5.3 s
+render 28 pattern clips: 0.4 s
+
+mixdown of 5 s (60-65 s): 4.68 s with everything = 1.07x real time
+  with NO effects: 0.70 s -- effects cost 3.98 s (85%)
+
+  kind            n     saves   share
+  eq             47     0.98s     21%
+  reverb          8     0.81s     17%
+  autotune        1     0.67s     14%
+  multiband       5     0.62s     13%
+  limiter        12     0.48s     10%
+  delay           5     0.17s      4%
+  duck            3     0.14s      3%
+  compressor      5     0.12s      3%
+  gain            5     0.05s      1%

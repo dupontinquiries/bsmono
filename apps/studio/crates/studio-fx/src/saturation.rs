@@ -167,6 +167,11 @@ pub struct Saturator {
     /// everything downstream while being completely inaudible on its own.
     dc_x1: f32,
     dc_y1: f32,
+    /// `compensation()` for (profile, drive, auto_gain) as last computed: it
+    /// runs the curve (a tanh for most profiles) and was evaluated EVERY
+    /// sample -- half the cost of a lightly driven stage, for a value that
+    /// only changes when a knob does.
+    comp: Option<(Profile, f32, bool, f32)>,
 }
 
 /// Below this drive the curve is close enough to linear that the harmonics it
@@ -177,7 +182,7 @@ impl Saturator {
     pub fn new(profile: Profile) -> Saturator {
         Saturator {
             profile, drive: 0.0, bias: 0.0, mix: 1.0, auto_gain: true,
-            up: [0.0; 4], dn: [0.0; 4], dc_x1: 0.0, dc_y1: 0.0,
+            up: [0.0; 4], dn: [0.0; 4], dc_x1: 0.0, dc_y1: 0.0, comp: None,
         }
     }
 
@@ -239,7 +244,12 @@ impl Saturator {
         let y = wet - self.dc_x1 + 0.9995 * self.dc_y1;
         self.dc_x1 = wet;
         self.dc_y1 = y;
-        let wet = y * self.compensation();
+        let key = (self.profile, self.drive, self.auto_gain);
+        let comp = match self.comp {
+            Some((p, d, a, c)) if (p, d, a) == key => c,
+            _ => { let c = self.compensation(); self.comp = Some((key.0, key.1, key.2, c)); c }
+        };
+        let wet = y * comp;
         x * (1.0 - self.mix) + wet * self.mix
     }
 
@@ -275,6 +285,22 @@ pub fn harmonic_profile(samples: &[f32], rate: f32, fundamental: f32, count: usi
 
 #[cfg(test)]
 mod tests {
+    /// The cached compensation follows the knobs: after a drive change the
+    /// output is bit-equal to a saturator that recomputes it.
+    #[test]
+    fn the_cached_compensation_follows_a_drive_change() {
+        let mut s = Saturator::new(Profile::Tape);
+        s.drive = 0.3;
+        for i in 0..100 { s.process((i as f32 * 0.07).sin() * 0.5); }
+        for (k, d) in [0.6f32, 0.05, 0.0].into_iter().enumerate() {
+            s.drive = d;
+            let mut fresh = s.clone();
+            fresh.comp = None;
+            let x = 0.4 - k as f32 * 0.1;
+            assert_eq!(s.process(x).to_bits(), fresh.process(x).to_bits(), "drive {d}");
+        }
+    }
+
     use super::*;
     use std::f32::consts::TAU;
 
