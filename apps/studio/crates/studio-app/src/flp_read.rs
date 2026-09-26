@@ -110,6 +110,58 @@ pub fn vst_name_from_path(d: &[u8]) -> Option<String> {
 
 /// The inventory, in `flp_dump.py`'s shape (mixer inserts in FL numbering,
 /// with real `routes`: `[{to, level}]`).
+/// Fruity Slicer's SLICE MAP, from its saved state (channel plugin data,
+/// event 213). Decoded from Goat's two slicers (FL 24.2):
+///
+/// ```text
+///   0..32   header (u32 15, f32 256, f32 tempo?, ...)
+///   32..    the sample path: a 7-bit varint length, then bytes
+///   u32     slice count
+///   each:   name (varint length + bytes), u32 START, i32 -1, f32 -1.0, u8
+///   then    u8, u32 ROOT key (60), u8, u32 RATE of the start positions
+/// ```
+///
+/// START is in samples at RATE -- 44100 there, while the file is 48 kHz:
+/// read at 44.1 kHz, 14 of Goat's 17 slice points sit on an onset (+10.8 dB
+/// median rise across the point); read at 48 kHz, 1 of 17, as random points
+/// do. Slice i is played by key ROOT + i, from its start to the next one.
+/// Strict: anything off this layout is `None` (the caller plays the whole
+/// recording, and says so), never a guessed map.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlicerMap { pub file: String, pub starts: Vec<u32>, pub root: u8, pub rate: u32 }
+
+pub fn slicer_map(d: &[u8]) -> Option<SlicerMap> {
+    let mut i = 32usize;
+    let varint = |i: &mut usize| -> Option<usize> {
+        let (mut n, mut sh) = (0usize, 0u32);
+        loop {
+            let b = *d.get(*i)?; *i += 1;
+            n |= ((b & 0x7F) as usize) << sh; sh += 7;
+            if b & 0x80 == 0 { return Some(n); }
+            if sh > 28 { return None; }
+        }
+    };
+    let u32_at = |i: usize| -> Option<u32> { Some(u32::from_le_bytes(d.get(i..i + 4)?.try_into().ok()?)) };
+    let plen = varint(&mut i)?;
+    let path = String::from_utf8_lossy(d.get(i..i + plen)?).into_owned();
+    i += plen;
+    let count = u32_at(i)? as usize; i += 4;
+    if count == 0 || count > 1024 { return None; }
+    let mut starts = Vec::with_capacity(count);
+    for _ in 0..count {
+        let nlen = varint(&mut i)?; i += nlen;
+        starts.push(u32_at(i)?);
+        if d.get(i + 12).is_none() { return None; }
+        i += 13;
+    }
+    if starts.windows(2).any(|w| w[1] < w[0]) { return None; }
+    let root = u32_at(i + 1)?;
+    let rate = u32_at(i + 6)?;
+    if root > 127 || !(8_000..=192_000).contains(&rate) { return None; }
+    let file = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string();
+    Some(SlicerMap { file, starts, root: root as u8, rate })
+}
+
 pub fn inventory(b: &[u8]) -> Result<Value, FlpError> {
     let (ppq, evs) = events(b)?;
     let mut proj = Map::new();
@@ -167,6 +219,14 @@ pub fn inventory(b: &[u8]) -> Result<Value, FlpError> {
                 channels.last_mut().unwrap().insert("name".into(), json!(text(d)));
             }
             Ev::Data(201, d) if !mixer_on && !channels.is_empty() => { channels.last_mut().unwrap().insert("plugin".into(), json!(text(d))); }
+            // a Fruity Slicer's slice map (see slicer_map)
+            Ev::Data(213, d) if !mixer_on && !channels.is_empty()
+                && channels.last().unwrap().get("plugin").and_then(Value::as_str).is_some_and(|p| p.eq_ignore_ascii_case("fruity slicer")) => {
+                if let Some(m) = slicer_map(d) {
+                    channels.last_mut().unwrap().insert("slices".into(), json!({
+                        "file": m.file, "starts": m.starts, "root": m.root, "rate": m.rate }));
+                }
+            }
             Ev::Data(196, d) if !mixer_on && !channels.is_empty() => {
                 let p = text(d);
                 let file = p.rsplit(['\\', '/']).next().unwrap_or(&p).to_string();
@@ -486,5 +546,40 @@ mod tests {
         assert!(inventory(b"RIFF....WAVE").unwrap_err().0.contains("FLhd"));
         let mut t = tiny(); t.truncate(t.len() - 3);
         assert!(inventory(&t).is_err(), "a truncated event is an error, not a silent stop");
+    }
+
+    /// A slicer blob in the layout Goat's (FL 24.2) have: header, path,
+    /// count, 14-byte slices (one with a NAME, which Goat's lack), trailer.
+    pub(crate) fn slicer_blob(path: &str, starts: &[u32], root: u32, rate: u32) -> Vec<u8> {
+        let mut d = vec![0u8; 32];
+        d[0] = 15;
+        d.push(path.len() as u8); d.extend_from_slice(path.as_bytes());
+        d.extend_from_slice(&(starts.len() as u32).to_le_bytes());
+        for (k, s) in starts.iter().enumerate() {
+            if k == 1 { d.push(3); d.extend_from_slice(b"hey"); } else { d.push(0); }
+            d.extend_from_slice(&s.to_le_bytes());
+            d.extend_from_slice(&(-1i32).to_le_bytes());
+            d.extend_from_slice(&(-1.0f32).to_le_bytes());
+            d.push(0);
+        }
+        d.push(1); d.extend_from_slice(&root.to_le_bytes()); d.push(0); d.extend_from_slice(&rate.to_le_bytes());
+        d.extend_from_slice(&[1, 1, 1, 0, 0, 0, 0]);
+        d
+    }
+
+    #[test]
+    fn a_slicer_blob_gives_its_slice_map_and_anything_off_layout_gives_none() {
+        let d = slicer_blob("/tmp/Zip/Goat - 2020-May-18_5.wav", &[0, 5267, 727_954, 978_844], 60, 44_100);
+        assert_eq!(slicer_map(&d), Some(SlicerMap { file: "Goat - 2020-May-18_5.wav".into(),
+            starts: vec![0, 5267, 727_954, 978_844], root: 60, rate: 44_100 }));
+        // a Windows path names the same file
+        assert_eq!(slicer_map(&slicer_blob("C:\\Samples\\take.wav", &[0, 10], 48, 48_000)).unwrap().file, "take.wav");
+        // truncated anywhere: None, not a partial map
+        for cut in [20, 40, d.len() - 30, d.len() - 12] { assert_eq!(slicer_map(&d[..cut]), None, "cut at {cut}"); }
+        // starts out of order, an absurd count, an unlikely rate or root: None
+        assert_eq!(slicer_map(&slicer_blob("a.wav", &[0, 900, 800], 60, 44_100)), None);
+        assert_eq!(slicer_map(&slicer_blob("a.wav", &[], 60, 44_100)), None);
+        assert_eq!(slicer_map(&slicer_blob("a.wav", &[0, 10], 60, 7)), None);
+        assert_eq!(slicer_map(&slicer_blob("a.wav", &[0, 10], 300, 44_100)), None);
     }
 }

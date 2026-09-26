@@ -77,7 +77,19 @@ pub fn materialize(im: &mut Imported, media: &Path, probe: &dyn Fn(&str) -> Opti
             .status().map(|s| s.success()).unwrap_or(false);
         if !ok { im.report.push(format!("could not make the varispeed copy {variant}")); }
     }
-    // AUTOMATED clips: render each through its curves -- varispeed (the file
+    // SLICES of a Fruity Slicer's recording: each trimmed exactly (atrim is
+    // sample-accurate where -ss seeking in Opus is not), 96 kbps -- these are
+    // the vocal phrases, not a stretched loop
+    for (file, a, b, variant) in &im.slices {
+        let out = media.join(variant);
+        if out.is_file() { continue; }
+        let input = media.join(opus_for(media, file).unwrap_or_else(|| file.clone()));
+        let ok = std::process::Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-y", "-i"]).arg(&input)
+            .args(["-af", &format!("atrim=start={a:.6}:end={b:.6},asetpts=N/SR/TB,aresample=48000"), "-c:a", "libopus", "-b:a", "96k"]).arg(&out)
+            .status().map(|s| s.success()).unwrap_or(false);
+        if !ok { im.report.push(format!("could not make the slice copy {variant}")); }
+    }
+        // AUTOMATED clips: render each through its curves -- varispeed (the file
     // advances 2^(cents/1200) per output second) and gain -- into its own copy.
     // Always regenerated: the copy depends on the curve, not only the name.
     for b in &im.bakes {

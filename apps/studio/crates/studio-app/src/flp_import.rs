@@ -70,6 +70,9 @@ pub struct Imported {
     /// Clips rendered THROUGH their channel's automation (a pitch curve as
     /// varispeed, a volume curve as gain): the caller makes each copy.
     pub bakes: Vec<Bake>,
+    /// A Fruity Slicer's SLICES played, as (file FL named, start s, end s, the
+    /// copy to read): the caller trims each copy (flp_batch: ffmpeg atrim).
+    pub slices: Vec<(String, f64, f64, String)>,
     /// Everything approximated, skipped or refused, grouped, for a person.
     pub report: Vec<String>,
 }
@@ -397,6 +400,11 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     rack.channels.clear();
     rack.patterns.clear();
     let mut rack_ix: BTreeMap<i64, usize> = BTreeMap::new();
+    // a SLICED channel's notes: (FL channel, key) -> its slice's rack channel
+    let mut slice_ix: BTreeMap<(i64, i64), usize> = BTreeMap::new();
+    let mut slices: Vec<(String, f64, f64, String)> = Vec::new();
+    let mut sliced: BTreeMap<i64, (i64, usize)> = BTreeMap::new(); // FL channel -> (root, slice count)
+    let mut slice_notes: Vec<String> = Vec::new();
     let mut switched_off: Vec<String> = Vec::new();
     let mut choke_ids: BTreeMap<u64, u8> = BTreeMap::new();
     let (mut choke_approx, mut choke_fades): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
@@ -413,7 +421,49 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         // slicer" (20.x), "Fruity Slicer" (24.x -- missed until c20, which made A
         // Top A Tower's sliced beat a bright "lead" synth), Slicex
         let is_slicer = { let l = internal.to_lowercase(); l == "fruity slicer" || l == "slicex" };
-        let kind = if kind_s == "Sampler" || is_slicer {
+        // a Fruity Slicer whose SLICE MAP was read (flp_read::slicer_map): one
+        // sampler channel per slice the patterns play, each on a trimmed copy
+        // of its slice -- key root+i plays slice i, from its start to the next
+        // slice's, gated by the note (the whole recording from EVERY note
+        // until c20: Goat's "voxmel" sang the recording's first second over
+        // and over instead of its phrases)
+        let mut entries: Vec<(String, SynthKind, Option<i64>)> = Vec::new();
+        if is_slicer {
+            if let Some(sm) = c["slices"].as_object() {
+                let file = s(&sm["file"]).map(str::to_string).or_else(|| file_of(c));
+                let starts: Vec<f64> = sm["starts"].as_array().into_iter().flatten().filter_map(Value::as_f64).collect();
+                let (root, rate) = (i(&sm["root"]).unwrap_or(60), f(&sm["rate"]).unwrap_or(44_100.0));
+                if let Some(m) = file.as_deref().and_then(probe) {
+                    let file = file.clone().unwrap();
+                    let stem = std::path::Path::new(&file).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|| file.clone());
+                    let whole = m.len.to_seconds();
+                    let mut ks: Vec<i64> = keys.get(fl).cloned().unwrap_or_default();
+                    ks.sort(); ks.dedup();
+                    for k in ks {
+                        let ix = k - root;
+                        if ix < 0 || ix as usize >= starts.len() { continue; }
+                        let a = starts[ix as usize] / rate;
+                        let b = starts.get(ix as usize + 1).map(|x| x / rate).unwrap_or(whole).min(whole);
+                        if b - a < 0.005 { continue; }
+                        let variant = format!("{stem}.slice{:02}.opus", ix + 1);
+                        // a slice is a copy of a different LENGTH, at 48 kHz: the
+                        // stretched-copy registration, with the ratio that length gives
+                        if let Some((id, _)) = source_for(&file, &mut ops, &mut missing, Some((&variant, whole / (b - a)))) {
+                            if !slices.iter().any(|x| x.3 == variant) { slices.push((file.clone(), a, b, variant)); }
+                            entries.push((format!("{} / slice {}", ch_name(c), ix + 1), SynthKind::Sampler { source: id }, Some(k)));
+                        }
+                    }
+                    if !entries.is_empty() {
+                        media = Some(m);
+                        sliced.insert(*fl, (root, starts.len()));
+                        slice_notes.push(format!("{} ({} of {} slices)", ch_name(c), entries.len(), starts.len()));
+                    }
+                }
+            }
+        }
+        let kind = if !entries.is_empty() {
+            entries[0].1.clone()
+        } else if kind_s == "Sampler" || is_slicer {
             match file_of(c).and_then(|f| source_for(&f, &mut ops, &mut missing, None)) {
                 Some((id, m)) => {
                     media = Some(m);
@@ -430,7 +480,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
             stand_ins.push(format!("{} ({}) -> Poly {family}", ch_name(c), if plugin.is_empty() { "plugin" } else { &plugin }));
             SynthKind::Poly { hz: 261.63, patch }
         };
-        rack_ix.insert(*fl, rack.channels.len());
+        if entries.is_empty() { entries.push((ch_name(c), kind.clone(), None)); }
         let pan = fl_pan(f(&c["pan"]).unwrap_or(6400.0));
         // FL's channel on/off switch: OFF comes in MUTED -- still there, a mute
         // away. Ignored until c20, which played Balance's switched-off Slicex
@@ -462,9 +512,29 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         // playlist clips only, leaving every pattern-played drum 5.2 dB short.
         // Stand-in synths keep the knob's own law: their level is a guess anyway.
         let sample_level = matches!(kind, SynthKind::Sampler { .. });
-        rack.channels.push(Channel { name: ch_name(c), kind, gain: (channel_gain_for(c, media, sample_level) * trim).clamp(0.0, 64.0),
-                                     pan, muted: off, choke_group: choke, one_shot: false });
+        let gain = (channel_gain_for(c, media, sample_level) * trim).clamp(0.0, 64.0);
+        for (name, kind, key) in entries {
+            match key {
+                Some(k) => { slice_ix.insert((*fl, k), rack.channels.len()); }
+                None => { rack_ix.insert(*fl, rack.channels.len()); }
+            }
+            rack.channels.push(Channel { name, kind, gain, pan, muted: off, choke_group: choke, one_shot: false });
+        }
     }
+    if !slice_notes.is_empty() {
+        report.push(format!("Fruity Slicer SLICE MAPS read: {} -- one sampler channel per slice played, each on a trimmed copy; a note plays its slice from the slice's start for the note's length (gated: FL's default envelope, assumed)",
+            slice_notes.join(", ")));
+    }
+    // where a note goes: (rack channel, key, KEEP AS A NOTE). A sliced channel's
+    // key picks the slice, played at its own pitch, as a note (its length gates
+    // it; a step hit would cap a 10 s phrase at four steps); a key with no
+    // slice plays nothing, as in FL.
+    let route = |n: &Value| -> Option<(usize, i64, bool)> {
+        let fl = i(&n["rack"])?;
+        let key = key_of(&n["key"]).unwrap_or(60);
+        if sliced.contains_key(&fl) { return slice_ix.get(&(fl, key)).map(|&ch| (ch, 60, true)); }
+        rack_ix.get(&fl).map(|&ch| (ch, key, false))
+    };
     if !choke_ids.is_empty() {
         report.push(format!("CUT GROUPS -> choke groups: {} FL group{} (a new hit stops what the group still rings -- the 808s)",
             choke_ids.len(), if choke_ids.len() == 1 { "" } else { "s" }));
@@ -503,8 +573,8 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
             // retriggers exactly there. Snapped to the grid they collapsed.
             let mut by_step: BTreeMap<(usize, i64), Vec<f64>> = BTreeMap::new();
             for n in &notes {
-                let Some(&ch) = i(&n["rack"]).and_then(|r| rack_ix.get(&r)) else { continue };
-                if !matches!(rack.channels[ch].kind, SynthKind::Sampler { .. }) || key_of(&n["key"]).unwrap_or(60) != 60 { continue; }
+                let Some((ch, key, as_note)) = route(n) else { continue };
+                if !matches!(rack.channels[ch].kind, SynthKind::Sampler { .. }) || key != 60 || as_note { continue; }
                 let pos = i(&n["pos"]).unwrap_or(0) as f64;
                 let base = (pos / step_ticks + 1e-9).floor() as i64;
                 by_step.entry((ch, base)).or_default().push(pos - base as f64 * step_ticks);
@@ -520,13 +590,12 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                 }
             }
             for n in &notes {
-                let Some(&ch) = i(&n["rack"]).and_then(|r| rack_ix.get(&r)) else { continue };
+                let Some((ch, key, as_note)) = route(n) else { continue };
                 let pos = i(&n["pos"]).unwrap_or(0) as f64;
                 let step_f = pos / step_ticks;
                 let step = step_f.round() as i64 - from as i64;
                 if step < 0 || step >= steps as i64 { continue; }
-                let key = key_of(&n["key"]).unwrap_or(60);
-                let is_sampler = matches!(rack.channels[ch].kind, SynthKind::Sampler { .. });
+                let is_sampler = matches!(rack.channels[ch].kind, SynthKind::Sampler { .. }) && !as_note;
                 if (step_f - step_f.round()).abs() > 1e-6 && !(is_sampler && key == 60 && ratchet_of.contains_key(&(ch, (pos / step_ticks + 1e-9).floor() as i64))) { off_grid += 1; }
                 let base = (pos / step_ticks + 1e-9).floor() as i64;
                 if is_sampler && key == 60 && ratchet_of.contains_key(&(ch, base)) {
@@ -1042,7 +1111,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         report.push(format!("AUTOMATION rendered into {} clip{} (varispeed pitch, gain): {}", bakes.len(), if bakes.len() == 1 { "" } else { "s" },
             if range_notes.is_empty() { "volume only".to_string() } else { range_notes.join("; ") }));
     }
-    Ok(Imported { project: p, rack, report, stretches, varispeeds, bakes })
+    Ok(Imported { project: p, rack, report, stretches, varispeeds, bakes, slices })
 }
 
 #[cfg(test)]
@@ -1349,6 +1418,49 @@ mod tests {
         assert!(p.is_set(0, 3), "the lone off-grid hit (77 ticks) snaps to step 3");
         assert!(im.report.iter().any(|r| r.contains("1 x3 (16th-note triplets)")), "{:?}", im.report);
         assert!(im.report.iter().any(|r| r.contains("1 note off the grid")), "only the lone hit counts as off-grid: {:?}", im.report);
+    }
+
+    /// A Fruity Slicer with its slice map read: keys root+2 and root+4 play
+    /// slices 3 and 5 -- each its own sampler channel on a trimmed copy of
+    /// exactly that stretch (positions at the map's 44.1 kHz, not the file's
+    /// 48), as NOTES with their lengths, sharing the slicer's cut group; a key
+    /// past the last slice plays nothing. Without a map (the complement): one
+    /// channel, the whole recording, and the report says so.
+    #[test]
+    fn a_slicer_with_its_map_plays_its_slices_and_one_without_plays_the_recording() {
+        let inv = |slices: Value| json!({
+            "project": {"ppq": 96, "tempo": 120.0},
+            "channels": [{"iid": 0, "kind": "Instrument", "plugin": "Fruity Slicer", "name": "vox #3", "cut": [4, 4], "slices": slices}],
+            "patterns": [{"iid": 1, "name": "Chops", "notes": [
+                {"rack": 0, "pos": 0, "len": 96, "key": 62}, {"rack": 0, "pos": 192, "len": 48, "key": 64},
+                {"rack": 0, "pos": 288, "len": 24, "key": 90}]}],
+            "arrangements": [{"tracks": [{"iid": 1, "name": "Chops", "items": [{"kind": "PatternPLItem", "pattern": 1, "pos": 0, "len": 384}]}]}],
+            "mixer": []
+        });
+        let starts = [0u32, 44_100, 88_200, 132_300, 220_500, 441_000];
+        let im = import(&inv(json!({"file": "vox.wav", "starts": starts, "root": 60, "rate": 44_100})), "slices", &probe).unwrap();
+        let names: Vec<&str> = im.rack.channels.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["vox #3 / slice 3", "vox #3 / slice 5"], "one channel per slice PLAYED");
+        assert_eq!(im.slices, vec![("vox.wav".to_string(), 2.0, 3.0, "vox.slice03.opus".to_string()),
+                                   ("vox.wav".to_string(), 5.0, 10.0, "vox.slice05.opus".to_string())]);
+        for (ch, want) in [(0usize, 1.0f64), (1, 5.0)] {
+            let SynthKind::Sampler { source } = im.rack.channels[ch].kind else { panic!("a sampler") };
+            let src = &im.project.sources[&source];
+            assert!((src.len.to_seconds() - want).abs() < 1e-3 && src.path.ends_with(&format!("slice0{}.opus", ch * 2 + 3)),
+                    "slice copy {} is {} s", src.path, src.len.to_seconds());
+        }
+        let g = im.rack.channels[0].choke_group;
+        assert!(g.is_some() && im.rack.channels[1].choke_group == g, "the slicer's cut group, shared");
+        let p = &im.rack.patterns[0];
+        assert!(!p.is_set(0, 0), "a slice is played as a NOTE, not a step hit (a step caps it at four steps)");
+        let notes: Vec<(usize, i8, u32, u32)> = (0..2).flat_map(|ch| p.roll(ch).iter().map(move |n| (ch, n.key, n.start, n.len))).collect();
+        assert_eq!(notes, vec![(0, 0, 0, 4), (1, 0, 8, 2)], "each slice at its own pitch, with the note's length; key 90 dropped");
+        assert!(im.report.iter().any(|r| r.contains("SLICE MAPS read: vox #3 (2 of 6 slices)")), "{:?}", im.report);
+
+        let whole = import(&inv(Value::Null), "whole", &probe).unwrap();
+        assert_eq!(whole.rack.channels.len(), 1);
+        assert!(whole.slices.is_empty());
+        assert!(whole.report.iter().any(|r| r.contains("plays its whole recording")), "{:?}", whole.report);
     }
 
     #[test]
