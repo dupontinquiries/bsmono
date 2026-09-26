@@ -30,7 +30,7 @@ pub struct NoteAt { pub start: f64, pub end: f64, pub hz: f32 }
 /// notes. Channels with none are listed with none.
 pub fn solo_notes(project: &studio_core::Project, rack: &studio_live::Rack) -> Vec<(usize, Vec<NoteAt>)> {
     notes_with_company(project, rack).into_iter()
-        .map(|(ch, v)| (ch, v.into_iter().filter(|(_, others)| others.is_empty()).map(|(n, _)| n).collect()))
+        .map(|(ch, v)| (ch, v.into_iter().filter(|c| c.others.is_empty()).map(|c| c.note).collect()))
         .collect()
 }
 
@@ -40,11 +40,44 @@ pub fn solo_notes(project: &studio_core::Project, rack: &studio_live::Rack) -> V
 /// its first "fit" scored 15.6 -> 6.4 dB against sound that was not it.)
 pub const INAUDIBLE_GAIN: f32 = 0.01;
 
-/// Every Poly channel's notes, each with the PITCHES of the other synth notes
-/// sounding with it (empty = alone). A note that overlaps a DRUM hit or an
-/// AUDIO clip is left out: their spectra are broad and cannot be masked
-/// harmonic by harmonic. Channels below `INAUDIBLE_GAIN` are left out.
-pub fn notes_with_company(project: &studio_core::Project, rack: &studio_live::Rack) -> Vec<(usize, Vec<(NoteAt, Vec<f32>)>)> {
+/// A note and what sounds with it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Company {
+    pub note: NoteAt,
+    /// Pitches of the other SYNTH notes sounding with it (empty = alone).
+    pub others: Vec<f32>,
+    /// Time BLOCKED by drum / sampler hits: their spectra are broad and cannot
+    /// be masked harmonic by harmonic, so those stretches are not measured.
+    pub blocked: Vec<(f64, f64)>,
+}
+
+/// How long a short hit (kick, snare, hat -- a sample under
+/// `LONG_SAMPLE` s, or a built-in drum voice) blocks from its onset: its
+/// energy is in the attack. A LONG sample (an 808, a loop -- tonal, and
+/// long) blocks its whole length. (Excluding whole notes that met any drum
+/// hit left four of seven songs -- beats -- with nothing to measure.)
+pub const HIT_BLOCK: f64 = 0.12;
+pub const LONG_SAMPLE: f64 = 0.6;
+
+/// The longest stretch of `c.note` (from its start, at most `max` s) not
+/// blocked by a hit; `None` if under 0.16 s (the measurement skips 60 ms).
+pub fn clean_window(c: &Company, max: f64) -> Option<(f64, f64)> {
+    let (a, b) = (c.note.start, c.note.end.min(c.note.start + max));
+    let mut cuts: Vec<(f64, f64)> = c.blocked.iter().filter(|x| x.0 < b && x.1 > a).copied().collect();
+    cuts.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let (mut best, mut from) = (None::<(f64, f64)>, a);
+    for (x0, x1) in cuts.iter().chain(std::iter::once(&(b, b))) {
+        let seg = (from, x0.min(b));
+        if seg.1 - seg.0 > best.map(|w| w.1 - w.0).unwrap_or(0.0) { best = Some(seg); }
+        from = from.max(*x1);
+    }
+    best.filter(|w| w.1 - w.0 >= 0.16)
+}
+
+/// Every Poly channel's notes, each with its `Company`. A note that overlaps
+/// an AUDIO clip is left out (a vocal is broadband and long). Channels below
+/// `INAUDIBLE_GAIN` are left out.
+pub fn notes_with_company(project: &studio_core::Project, rack: &studio_live::Rack) -> Vec<(usize, Vec<Company>)> {
     use studio_core::SourceKind;
     let step = 60.0 / rack.tempo_bpm as f64 / 4.0;
     let muted: std::collections::BTreeSet<_> = project.tracks.iter().filter(|t| t.muted).map(|t| t.id).collect();
@@ -72,19 +105,32 @@ pub fn notes_with_company(project: &studio_core::Project, rack: &studio_live::Ra
         studio_live::SynthKind::Poly { hz, .. } | studio_live::SynthKind::Sine { hz } => Some(hz * 2f32.powf(key as f32 / 12.0)),
         _ => None, // a drum / sampler: broadband
     };
+    // how long a hit of channel `o` blocks
+    let block_len = |o: usize| match &rack.channels[o].kind {
+        studio_live::SynthKind::Sampler { source } => {
+            let len = project.sources.get(source).map(|s| s.len.to_seconds()).unwrap_or(HIT_BLOCK);
+            if len > LONG_SAMPLE { len } else { HIT_BLOCK }
+        }
+        studio_live::SynthKind::Sub { decay_ms, .. } => (*decay_ms as f64 / 1000.0).max(HIT_BLOCK),
+        _ => HIT_BLOCK,
+    };
     (0..rack.channels.len()).filter_map(|ch| {
         let studio_live::SynthKind::Poly { hz, .. } = rack.channels[ch].kind else { return None };
         if rack.channels[ch].gain < INAUDIBLE_GAIN { return None; }
         let v = notes[ch].iter().filter_map(|n| {
             if audio_busy.iter().any(|b| overlaps((n.0, n.1), *b)) { return None; }
-            let mut others = Vec::new();
+            let (mut others, mut blocked) = (Vec::new(), Vec::new());
             for (o, list) in notes.iter().enumerate() {
                 if o == ch { continue; }
-                for m in list.iter().filter(|m| overlaps((n.0, n.1), (m.0, m.1))) {
-                    match pitch(o, m.2) { Some(p) => others.push(p), None => return None }
+                let bl = block_len(o);
+                for m in list.iter() {
+                    match pitch(o, m.2) {
+                        Some(p) => if overlaps((n.0, n.1), (m.0, m.1)) { others.push(p) },
+                        None => if overlaps((n.0, n.1), (m.0, m.0 + bl)) { blocked.push((m.0, m.0 + bl)) },
+                    }
                 }
             }
-            Some((NoteAt { start: n.0, end: n.1, hz: hz * 2f32.powf(n.2 as f32 / 12.0) }, others))
+            Some(Company { note: NoteAt { start: n.0, end: n.1, hz: hz * 2f32.powf(n.2 as f32 / 12.0) }, others, blocked })
         }).collect();
         Some((ch, v))
     }).collect()
@@ -247,6 +293,20 @@ mod tests {
         assert!(profile_error_db(&p, &want) < 3.0, "{p:?}");
         // and a harmonic that collides with the other note's is NOT counted
         assert!(!clear_of(660.0, &[330.0], 0.015) && clear_of(440.0, &[330.0], 0.015));
+    }
+
+    /// A kick in the middle of a note: the note still counts, measured in its
+    /// longest stretch clear of the hit's 120 ms; a note hit every 150 ms has
+    /// no stretch long enough.
+    #[test]
+    fn a_drum_hit_blocks_a_stretch_not_the_note() {
+        let n = NoteAt { start: 10.0, end: 11.0, hz: 220.0 };
+        let c = Company { note: n, others: vec![], blocked: vec![(10.3, 10.42)] };
+        let w = clean_window(&c, 0.8).expect("a window");
+        assert!((w.0 - 10.42).abs() < 1e-9 && (w.1 - 10.8).abs() < 1e-9, "after the hit, to the 0.8 s limit: {w:?}");
+        let busy = Company { note: n, others: vec![], blocked: (0..7).map(|k| (10.0 + 0.15 * k as f64, 10.0 + 0.15 * k as f64 + 0.12)).collect() };
+        assert_eq!(clean_window(&busy, 0.8), None, "hats every 150 ms: nothing clean long enough");
+        assert_eq!(clean_window(&Company { note: n, others: vec![], blocked: vec![] }, 0.8), Some((10.0, 10.8)));
     }
 
     #[test]

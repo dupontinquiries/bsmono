@@ -398,6 +398,8 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     rack.patterns.clear();
     let mut rack_ix: BTreeMap<i64, usize> = BTreeMap::new();
     let mut switched_off: Vec<String> = Vec::new();
+    let mut choke_ids: BTreeMap<u64, u8> = BTreeMap::new();
+    let (mut choke_approx, mut choke_fades): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
     let mut stand_ins: Vec<String> = Vec::new();
     for fl in &used {
         let Some(c) = chans.get(fl) else { continue };
@@ -443,8 +445,27 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         // Sine / Sub stand-ins keep STAND_IN_TRIM_DB.
         let trim = if matches!(kind, SynthKind::Poly { .. }) { 1.0 } else if is_stand_in { 10f32.powf(STAND_IN_TRIM_DB / 20.0) } else { 1.0 };
         if off { switched_off.push(ch_name(c)); }
+        // FL's CUT GROUP -> a choke group (numbered by first appearance)
+        let cut = c["cut"].as_array().map(|a| (a[0].as_u64().unwrap_or(0), a[1].as_u64().unwrap_or(0))).unwrap_or((0, 0));
+        let choke = if cut.0 > 0 || cut.1 > 0 {
+            let g = if cut.0 > 0 { cut.0 } else { cut.1 };
+            if cut.0 != cut.1 { choke_approx.push(format!("{} (cuts {}, cut by {})", ch_name(c), cut.0, cut.1)); }
+            let next = choke_ids.len() as u8 + 1;
+            Some(*choke_ids.entry(g).or_insert(next))
+        } else { None };
+        if choke.is_some() && c["fade_out"].as_u64().unwrap_or(0) > 0 {
+            choke_fades.push(format!("{} ({})", ch_name(c), c["fade_out"].as_u64().unwrap_or(0)));
+        }
         rack.channels.push(Channel { name: ch_name(c), kind, gain: (channel_gain(c, media) * trim).clamp(0.0, 64.0),
-                                     pan, muted: off, choke_group: None });
+                                     pan, muted: off, choke_group: choke });
+    }
+    if !choke_ids.is_empty() {
+        report.push(format!("CUT GROUPS -> choke groups: {} FL group{} (a new hit stops what the group still rings -- the 808s)",
+            choke_ids.len(), if choke_ids.len() == 1 { "" } else { "s" }));
+    }
+    if !choke_approx.is_empty() { report.push(format!("one-way cuts APPROXIMATED as shared groups: {}", choke_approx.join(", "))); }
+    if !choke_fades.is_empty() {
+        report.push(format!("choke FADES not honoured yet (Studio's choke fades in ~2 ms; FL's quick fade-out, 0-1024, makes these cuts soft): {}", choke_fades.join(", ")));
     }
     if !stand_ins.is_empty() {
         report.push(format!("{} plugin synth{} cannot be hosted and their sound is not in the file -- STAND-INS, Poly patches guessed by name (level calibrated on one song where only synths play), notes kept: {}",
@@ -1224,6 +1245,38 @@ mod tests {
         assert!((src.len.to_seconds() - 10.0).abs() < 1e-6, "the rendered copy is the clip's length, not the file's: {}", src.len.to_seconds());
         assert!(!im.varispeeds.iter().any(|(f, _, _)| f == "vox.wav" && im.bakes.iter().any(|b| b.file == *f) && false));
         assert!(im.report.iter().any(|r| r.contains("AUTOMATION rendered into 2 clips") && r.contains("+-560 cents")), "{:?}", im.report);
+    }
+
+    /// FL's CUT GROUPS become choke groups: two 808s sharing group 5 choke
+    /// together (one Studio group), a third 808 in group 9 gets its own, the
+    /// hat with none gets none; a one-way cut is approximated and SAID, and a
+    /// cut 808 with a quick fade-out is named (not honoured yet).
+    #[test]
+    fn fl_cut_groups_become_choke_groups() {
+        let inv = json!({
+            "project": {"ppq": 96, "tempo": 120.0},
+            "channels": [
+                {"iid": 0, "kind": "Sampler", "name": "808 A", "sample_file": "kick.wav", "cut": [5, 5], "fade_out": 300},
+                {"iid": 1, "kind": "Sampler", "name": "808 B", "sample_file": "kick.wav", "cut": [5, 5]},
+                {"iid": 2, "kind": "Sampler", "name": "808 C", "sample_file": "kick.wav", "cut": [9, 9]},
+                {"iid": 3, "kind": "Sampler", "name": "Hat", "sample_file": "kick.wav"},
+                {"iid": 4, "kind": "Sampler", "name": "Open hat", "sample_file": "kick.wav", "cut": [9, 2]}
+            ],
+            "patterns": [{"iid": 1, "name": "Beat", "notes": [
+                {"rack": 0, "pos": 0, "len": 24, "key": 60}, {"rack": 1, "pos": 24, "len": 24, "key": 60},
+                {"rack": 2, "pos": 48, "len": 24, "key": 60}, {"rack": 3, "pos": 72, "len": 24, "key": 60},
+                {"rack": 4, "pos": 96, "len": 24, "key": 60}]}],
+            "arrangements": [{"tracks": [{"iid": 1, "name": "Beat", "items": [{"kind": "PatternPLItem", "pattern": 1, "pos": 0, "len": 384}]}]}],
+            "mixer": []
+        });
+        let im = import(&inv, "cut", &probe).unwrap();
+        let g = |n: &str| im.rack.channels.iter().find(|c| c.name == n).unwrap().choke_group;
+        assert!(g("808 A").is_some() && g("808 A") == g("808 B"), "same FL group, one choke group");
+        assert!(g("808 C").is_some() && g("808 C") != g("808 A"));
+        assert_eq!(g("Hat"), None);
+        assert_eq!(g("Open hat"), g("808 C"), "cuts 9: joins group 9");
+        assert!(im.report.iter().any(|r| r.contains("APPROXIMATED") && r.contains("Open hat")), "{:?}", im.report);
+        assert!(im.report.iter().any(|r| r.contains("FADES not honoured") && r.contains("808 A (300)")), "{:?}", im.report);
     }
 
     #[test]

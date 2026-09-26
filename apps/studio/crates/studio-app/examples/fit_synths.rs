@@ -22,7 +22,9 @@ fn main() {
     let fitted: Vec<usize> = notes_with_company(&project, &rack).iter().map(|(c, _)| *c).collect();
     for (ch, items) in notes_with_company(&project, &rack) {
         let studio_live::SynthKind::Poly { hz, patch } = rack.channels[ch].kind.clone() else { continue };
-        let mut use_items: Vec<_> = items.iter().filter(|(n, _)| n.end - n.start >= 0.2).collect();
+        // each note measured in its longest stretch clear of drum hits
+        let mut use_items: Vec<(studio_app::synth_fit::NoteAt, Vec<f32>)> = items.iter().filter_map(|c|
+            studio_app::synth_fit::clean_window(c, 0.8).map(|(a, b)| (studio_app::synth_fit::NoteAt { start: a, end: b, hz: c.note.hz }, c.others.clone()))).collect();
         use_items.sort_by(|a, b| a.1.len().cmp(&b.1.len()).then((b.0.end - b.0.start).total_cmp(&(a.0.end - a.0.start))));
         use_items.truncate(40);
         let (solo, layered) = (use_items.iter().filter(|(_, o)| o.is_empty()).count(), use_items.iter().filter(|(_, o)| !o.is_empty()).count());

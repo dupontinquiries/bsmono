@@ -152,6 +152,15 @@ pub fn inventory(b: &[u8]) -> Result<Value, FlpError> {
                 cur_pat = None;
             }
             Ev::Num(21, v) if !mixer_on && !channels.is_empty() => { *ch_type.last_mut().unwrap() = *v; }
+            // CUT GROUPS (132: cut in the low 16 bits, cut-by in the high) -- in
+            // every song surveyed, on the 808s, each cutting ITSELF: a new 808
+            // stops the one still ringing; and the quick FADES (75 out, 76 in,
+            // 0..1024) that make a cut soft
+            Ev::Num(132, v) if !mixer_on && !channels.is_empty() => {
+                channels.last_mut().unwrap().insert("cut".into(), json!([*v & 0xFFFF, *v >> 16]));
+            }
+            Ev::Num(75, v) if !mixer_on && !channels.is_empty() => { channels.last_mut().unwrap().insert("fade_out".into(), json!(*v)); }
+            Ev::Num(76, v) if !mixer_on && !channels.is_empty() => { channels.last_mut().unwrap().insert("fade_in".into(), json!(*v)); }
             Ev::Num(22, v) if !mixer_on && !channels.is_empty() => { channels.last_mut().unwrap().insert("insert".into(), json!(*v as u8 as i8)); }
             Ev::Num(0, v) if !mixer_on && !channels.is_empty() => { channels.last_mut().unwrap().insert("enabled".into(), json!(*v != 0)); }
             Ev::Data(192, d) | Ev::Data(203, d) if !mixer_on && !channels.is_empty() => {
