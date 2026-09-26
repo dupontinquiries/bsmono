@@ -28,6 +28,7 @@ pub mod boom;
 pub mod format;
 pub mod stems;
 pub mod block;
+pub mod resample;
 pub mod destructive;
 
 use std::collections::BTreeMap;

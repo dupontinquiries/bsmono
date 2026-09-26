@@ -82,9 +82,17 @@ pub fn stale(project: &Project, rack: &studio_live::Rack, stamps: &BTreeMap<Sour
 /// does nothing unless the rack or the clips changed.
 pub fn refresh(project: &Project, rack: &studio_live::Rack, audio: &mut BTreeMap<SourceId, SourceAudio>,
                stamps: &mut BTreeMap<SourceId, Stamp>) -> Vec<SourceId> {
+    refresh_at(project, rack, audio, stamps, RATE)
+}
+
+/// [`refresh`] at `rate`: a render at another sample rate renders its
+/// patterns at that rate, so the mixdown reads them sample for sample.
+/// (A rate change changes every pattern's frame count, which makes it stale.)
+pub fn refresh_at(project: &Project, rack: &studio_live::Rack, audio: &mut BTreeMap<SourceId, SourceAudio>,
+                  stamps: &mut BTreeMap<SourceId, Stamp>, rate: u32) -> Vec<SourceId> {
     let mut done = Vec::new();
-    for (sid, ix, need) in stale(project, rack, stamps, RATE) {
-        match render(rack, ix, audio, need, RATE) {
+    for (sid, ix, need) in stale(project, rack, stamps, rate) {
+        match render(rack, ix, audio, need, rate) {
             Some(a) => { audio.insert(sid, a); }
             None => { audio.remove(&sid); }
         }

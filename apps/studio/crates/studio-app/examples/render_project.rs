@@ -13,6 +13,12 @@
 //!   --solo TEXT[,TEXT]       only the tracks whose name contains any TEXT
 //!                            (through their busses and the master, as heard
 //!                            soloed); the matches are printed
+//!   --rate HZ                render at HZ (8000 .. 192000; default 48000):
+//!                            low for quick iteration, high to look for
+//!                            aliasing. Media is converted once at load with
+//!                            a band-limited resampler (studio_audio::resample)
+//!                            -- the mixdown's own linear reader would fold a
+//!                            downsample. The raw output is at HZ.
 //!   --dry-master             bypass the "Master" bus's chain: the MIX, from the
 //!                            same project that renders the master -- one project,
 //!                            both deliverables, no re-export between them
@@ -44,11 +50,20 @@ fn main() {
         if let Ok(x) = studio_media::decode_file(&base.join(&s.path)) { audio.insert(s.id, x); }
         else { eprintln!("cannot decode {}", s.path); }
     }
+    let rate: u32 = opt("--rate").and_then(|v| v.parse().ok()).unwrap_or(48_000);
+    assert!((8_000..=192_000).contains(&rate), "--rate: 8000 .. 192000");
+    if rate != 48_000 || audio.values().any(|a| a.sample_rate != rate) {
+        let t = std::time::Instant::now();
+        let mut n = 0;
+        for a in audio.values_mut() {
+            if a.sample_rate != rate { *a = studio_audio::resample::resample_audio(a, rate); n += 1; }
+        }
+        if n > 0 { eprintln!("resampled {n} source(s) to {rate} Hz in {:.1} s", t.elapsed().as_secs_f64()); }
+    }
     let mut stamps = BTreeMap::new();
-    studio_app::pattern_clips::refresh(&project, &rack, &mut audio, &mut stamps);
+    studio_app::pattern_clips::refresh_at(&project, &rack, &mut audio, &mut stamps, rate);
     let fades: BTreeMap<studio_core::ClipId, studio_audio::Fades> = project.fades.iter()
         .map(|(id, (i, o))| (*id, studio_audio::Fades { fade_in: *i, fade_out: *o })).collect();
-    let rate = 48_000;
     let end = opt("--to").and_then(|v| v.parse().ok()).map(studio_core::Ticks::from_seconds).unwrap_or(project.duration());
     let mut out = std::io::BufWriter::new(std::fs::File::create(&a[2]).unwrap());
     let load_s = t_load.elapsed().as_secs_f64();
