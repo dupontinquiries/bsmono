@@ -599,3 +599,44 @@ mod tests {
         assert!((h.correction_cents() + 23.5).abs() < 6.0, "half of -47: {}", h.correction_cents());
     }
 }
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    /// CORRECTING must not cost level. A tone 40 cents flat of a C-major note,
+    /// held 3 s: once the tuner is correcting, the output RMS should match the
+    /// input's. Found through Goat: its "voxmel" vocal came out 8 dB quieter
+    /// in a whole-song render (tuner locked and correcting) than in a render
+    /// started mid-song (not locked yet, passing dry). The shifter's two taps
+    /// sit a FIXED half-window (11 ms) apart; for a periodic voice they are
+    /// often out of phase and cancel. Returns the level change, dB.
+    pub fn correction_level_db(hz: f32) -> f32 {
+        let rate = 48_000.0f32;
+        let mut t = RealtimeTune::new(Target::Notes(vec![]), rate, 1);
+        let n = (rate * 3.0) as usize;
+        let x: Vec<f32> = (0..n).map(|i| 0.3 * (std::f32::consts::TAU * hz * i as f32 / rate).sin()).collect();
+        let y: Vec<f32> = x.iter().map(|v| t.process(*v)).collect();
+        let tail = |v: &[f32]| (v[n * 2 / 3..].iter().map(|s| s * s).sum::<f32>() / (n / 3) as f32).sqrt();
+        20.0 * (tail(&y) / tail(&x)).log10()
+    }
+
+    #[test]
+    #[ignore = "KNOWN BUG, measured: the fixed-spacing shifter cancels while correcting -- the fix is period-aligned tap spacing"]
+    fn correcting_keeps_the_level_across_pitches() {
+        for semis in [0.0f32, 2.0, 4.0, 7.0, 9.0, 11.0, 14.0] {
+            let hz = 220.0 * 2f32.powf((semis - 0.4) / 12.0);
+            let g = correction_level_db(hz);
+            assert!(g.abs() < 1.5, "{hz:.1} Hz: {g:+.1} dB while correcting");
+        }
+    }
+
+    /// Records the measured loss per pitch (always passes; prints).
+    #[test]
+    fn measure_the_correction_level_loss() {
+        for semis in [0.0f32, 2.0, 4.0, 7.0, 9.0, 11.0, 14.0] {
+            let hz = 220.0 * 2f32.powf((semis - 0.4) / 12.0);
+            eprintln!("LOSS {hz:7.1} Hz: {:+.1} dB", correction_level_db(hz));
+        }
+    }
+}
