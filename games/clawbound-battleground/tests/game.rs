@@ -1886,3 +1886,120 @@ mod wide_waves {
         });
     }
 }
+
+mod clouds {
+    use clawbound::gods::ROSTER;
+    use clawbound::map::{self, MapId};
+    use clawbound::sim::{Game, Team};
+    use clawbound::skycloud::{self, Kind};
+    use glam::Vec3;
+
+    /// A bank well away from both bases and every tower, thick, and when.
+    fn a_bank(g: &Game) -> (f32, skycloud::Cloud) {
+        let mut t = skycloud::FIRST_CLOUD;
+        loop {
+            t += 5.0;
+            assert!(t < 3600.0, "no bank in an hour");
+            let found = skycloud::clouds(g.cloud_seed, t).into_iter().find(|c| {
+                c.kind == Kind::Bank
+                    && c.thick > 0.95
+                    && c.pos.length() < 250.0
+                    && [Team::Blue, Team::Red].iter().all(|tm| tm.base_pos().distance(c.pos) > c.r + 60.0)
+                    && g.towers.iter().all(|tw| tw.pos.distance(c.pos) > 40.0)
+            });
+            if let Some(c) = found {
+                return (t, c);
+            }
+        }
+    }
+
+    /// A cat in a bank cannot be seen or auto-attacked from outside it, nor
+    /// from across it; at arm's length it can; stepping out into clear air
+    /// it is seen again. Only on the sky map.
+    #[test]
+    fn a_cloud_bank_hides_a_cat_from_the_other_team() {
+        // a blue cat that attacks from range
+        let ranged = ROSTER.iter().position(|d| d.auto_range > 8.0).expect("a ranged cat") as u32;
+        map::with(MapId::Sky, || {
+            let mut g = Game::new_teams(&[ranged], &[1]);
+            for c in g.gods.iter_mut() {
+                c.ai = None;
+                c.is_player = false;
+            }
+            let (t, bank) = a_bank(&g);
+            g.t = t;
+            let (blue, red) = (0usize, 1usize);
+            let range = g.def(blue).auto_range;
+            // red in the heart of the bank, blue just inside its reach but
+            // well past arm's length
+            g.gods[red].pos = bank.pos;
+            g.gods[blue].pos = bank.pos + Vec3::X * (range - 1.0).max(skycloud::CLOSE + 2.0);
+            g.vision_tick();
+            assert!(!g.sees(Team::Blue, red), "hidden in the bank");
+            assert!(g.sees(Team::Blue, blue) && g.sees(Team::Red, red), "a team always sees its own");
+            // blue swings at the cloud: nothing to lock onto
+            let hp = g.gods[red].hp;
+            g.gods[blue].attack_held = true;
+            for _ in 0..90 {
+                g.gods[red].pos = bank.pos;
+                g.gods[blue].pos = bank.pos + Vec3::X * (range - 1.0).max(skycloud::CLOSE + 2.0);
+                g.tick(1.0 / 60.0);
+                g.events.clear();
+            }
+            assert_eq!(g.gods[red].hp, hp, "no auto-attack on what cannot be seen");
+            // arm's length: seen
+            g.gods[blue].pos = bank.pos + Vec3::X * 2.0;
+            g.vision.next_t = 0.0;
+            g.vision_tick();
+            assert!(g.sees(Team::Blue, red), "at arm's length, seen");
+            // out in clear air, beside blue: seen
+            let out = bank.pos + Vec3::Z * (bank.r * 1.5 + 30.0);
+            assert!(skycloud::density(&skycloud::clouds(g.cloud_seed, g.t), out.x, out.z) < 0.1, "the test's clear air is clear");
+            g.gods[red].pos = out;
+            g.gods[blue].pos = out + Vec3::X * 20.0;
+            g.vision.next_t = 0.0;
+            g.vision_tick();
+            assert!(g.sees(Team::Blue, red), "in clear air, seen");
+        });
+        // the jungle has no such cloud
+        let mut g = Game::new_teams(&[0], &[1]);
+        g.t = 1000.0;
+        g.vision_tick();
+        assert!(g.sees(Team::Blue, 1) && g.sees(Team::Red, 0));
+    }
+
+    /// Bots do not go for a cat the cloud hides.
+    #[test]
+    fn a_bot_does_not_chase_what_it_cannot_see() {
+        map::with(MapId::Sky, || {
+            let mut g = Game::new_teams(&[0], &[1]);
+            let (t, bank) = a_bank(&g);
+            g.t = t;
+            g.gods[0].is_player = false;
+            g.gods[0].ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Top, 1.0));
+            g.gods[1].ai = None;
+            g.gods[1].pos = bank.pos;
+            g.gods[0].pos = bank.pos + Vec3::X * 12.0;
+            g.vision_tick();
+            assert!(!g.sees(Team::Blue, 1));
+            clawbound::ai::think(&mut g, 0);
+            let tgt = g.gods[0].ai.as_ref().unwrap().target;
+            assert_ne!(tgt, Some(clawbound::sim::TargetRef::God(1)), "the bot did not pick the hidden cat");
+            // the same, in clear air: it does
+            g.gods[1].pos = g.gods[0].pos + Vec3::X * 6.0 + Vec3::Z * 0.0;
+            // beside one of blue's own towers, in clear air
+            let cs = skycloud::clouds(g.cloud_seed, g.t);
+            let clear = g.towers.iter().filter(|tw| tw.team == Team::Blue).flat_map(|tw| [tw.pos + Vec3::X * 8.0, tw.pos - Vec3::X * 8.0, tw.pos + Vec3::Z * 8.0, tw.pos - Vec3::Z * 8.0]).find(|p| skycloud::density(&cs, p.x, p.z) < 0.01 && clawbound::sky::floor().sdf(p.x, p.z) < -2.0 && clawbound::sky::floor().sdf(p.x + 6.0, p.z) < -2.0);
+            {
+                let p = clear.expect("clear air somewhere");
+                g.gods[0].pos = p;
+                g.gods[1].pos = p + Vec3::X * 6.0;
+                g.vision.next_t = 0.0;
+                g.vision_tick();
+                assert!(g.sees(Team::Blue, 1));
+                clawbound::ai::think(&mut g, 0);
+                assert_eq!(g.gods[0].ai.as_ref().unwrap().target, Some(clawbound::sim::TargetRef::God(1)), "in clear air it goes for it");
+            }
+        });
+    }
+}

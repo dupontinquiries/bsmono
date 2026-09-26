@@ -399,6 +399,10 @@ pub struct Game {
     pub star_bolts: Vec<crate::moonwell::StarBolt>,
     /// Stars the flying Moonwyrm let fall, on their way down (`wyrmflight`).
     pub starfalls: Vec<crate::wyrmflight::Starfall>,
+    /// The sky map's drifting cloud (`skycloud`): its seed, and who each
+    /// team can see through it.
+    pub cloud_seed: u64,
+    pub vision: crate::skycloud::Vision,
     /// The sky map's cloud ferries (`ferry`); empty elsewhere.
     pub ferries: Vec<crate::ferry::Ferry>,
     /// Minion ids handed out so far, and waves spawned (`minionai::wave_for`).
@@ -578,6 +582,10 @@ impl Game {
             ferries: crate::ferry::for_map(),
             star_bolts: Vec::new(),
             starfalls: Vec::new(),
+            // from the match's own seed, without drawing on `rng` (so every
+            // other random thing in the match stays as it was)
+            cloud_seed: (player_god as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xC10D,
+            vision: Default::default(),
             next_minion_id: 0,
             waves: 0,
         };
@@ -747,6 +755,61 @@ impl Game {
     /// fighting by what it is tied to: intent that a fight interrupts, a
     /// window some abilities grant (the fast low run before a pounce, at
     /// full speed), and the way a badly hurt animal slinks.
+    /// Can `team` see cat `j`? Always, off the sky map, for its own cats,
+    /// and before the first cloud refresh (`vision_tick`).
+    pub fn sees(&self, team: Team, j: usize) -> bool {
+        self.vision.seen[team as usize].get(j).copied().unwrap_or(true)
+    }
+
+    /// Who each team can see through the sky map's clouds, refreshed
+    /// `skycloud::VISION_HZ` times a second. Only cloud hides: there is no
+    /// fog of war in clear air. So a team sees an enemy cat
+    ///
+    /// * if one of its own living cats within `skycloud::SIGHT_RANGE` has
+    ///   a clear line to it (`skycloud::sees`); or
+    /// * if it stands in clear air and none of the team's cats is that
+    ///   close (far off in the open, it is seen as it always was); or
+    /// * inside one of the team's standing towers' reach, or its base
+    ///   (towers and Elders see through cloud: no base is taken blind).
+    ///
+    /// So a cat in a bank is hidden from everyone outside it, and a wisp
+    /// between two groups hides each from the other while it is thick.
+    /// Minions give no sight: with 32 a side in every lane, they would see
+    /// everything and the cloud nothing.
+    pub fn vision_tick(&mut self) {
+        if crate::map::active() != crate::map::MapId::Sky {
+            if !self.vision.seen[0].is_empty() {
+                self.vision = Default::default();
+            }
+            return;
+        }
+        if self.t < self.vision.next_t && self.vision.seen[0].len() == self.gods.len() {
+            return;
+        }
+        self.vision.next_t = self.t + 1.0 / crate::skycloud::VISION_HZ;
+        let cs = crate::skycloud::clouds(self.cloud_seed, self.t);
+        let n = self.gods.len();
+        for team in [Team::Blue, Team::Red] {
+            let mut seen = vec![true; n];
+            if !cs.is_empty() {
+                for j in 0..n {
+                    let e = &self.gods[j];
+                    if e.team == team || e.respawn_t > 0.0 {
+                        continue;
+                    }
+                    let near = |v: &GodUnit| v.team == team && v.respawn_t <= 0.0 && v.pos.distance(e.pos) <= crate::skycloud::SIGHT_RANGE;
+                    let by_cat = self.gods.iter().any(|v| near(v) && crate::skycloud::sees(&cs, v.pos, e.pos));
+                    let open_air = crate::skycloud::density(&cs, e.pos.x, e.pos.z) < 0.4 && !self.gods.iter().any(|v| near(v));
+                    let by_tower = self.towers.iter().any(|t| t.team == team && t.hp > 0.0 && t.pos.distance(e.pos) < crate::consts::TOWER_RANGE + 2.0);
+                    let at_base = team.base_pos().distance(e.pos) < 40.0;
+                    seen[j] = by_cat || open_air || by_tower || at_base;
+                }
+            }
+            self.vision.seen[team as usize] = seen;
+        }
+        self.vision.clouds = cs;
+    }
+
     pub fn quiet(&self, i: usize) -> f32 {
         let g = &self.gods[i];
         let mut q: f32 = 0.0;

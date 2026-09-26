@@ -37,6 +37,13 @@ what else is known-but-unresolved.
   chasms, untouchable, letting stars fall on marked spots (a ring of light,
   then a column of it that burns either side). From 18 minutes, overtime:
   towers and Elders take 12% more damage a minute, and deaths last longer.
+- **Cloud cover** (Starwell, every preset -- it is gameplay): from the first
+  minute, great cloud banks drift in over the rim and cross the map, and thin
+  wisps blow through, thickening and thinning every few seconds. A cat in a
+  bank is hidden from enemies outside it (not drawn, not on the map, cannot
+  be auto-attacked, bots do not go for it); a thick wisp between two groups
+  hides each from the other. Towers and bases see through cloud; minions
+  give no sight.
 - **Ultra snow** (Ultra preset only; looks, not rules): snow lies on the snowy
   maps, deep in the sheltered hollows and blown thin where the wind scours;
   it keeps falling, the wind drifts it from the blown stretches into the lee,
