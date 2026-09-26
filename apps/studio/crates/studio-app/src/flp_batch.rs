@@ -51,6 +51,17 @@ pub fn media_probe(media: PathBuf) -> impl Fn(&str) -> Option<Media> {
     }
 }
 
+/// ffmpeg's `atempo` takes 0.5..=100 per stage: a ratio outside that is a
+/// CHAIN of stages whose product is the ratio (pianovibes' cool-riff, stretched
+/// 0.424 in FL, was refused outright and went missing from the song).
+pub fn atempo_chain(r: f64) -> String {
+    let (mut r, mut parts) = (r, Vec::new());
+    while r < 0.5 { parts.push("atempo=0.5".to_string()); r /= 0.5; }
+    while r > 100.0 { parts.push("atempo=100".to_string()); r /= 100.0; }
+    parts.push(format!("atempo={r}"));
+    parts.join(",")
+}
+
 /// Make every copy the import asked for, and point sources at the .opus
 /// beside any name FL used. Problems go into the report.
 pub fn materialize(im: &mut Imported, media: &Path, probe: &dyn Fn(&str) -> Option<Media>) {
@@ -61,7 +72,7 @@ pub fn materialize(im: &mut Imported, media: &Path, probe: &dyn Fn(&str) -> Opti
         if out.is_file() { continue; }
         let input = media.join(opus_for(media, file).unwrap_or_else(|| file.clone()));
         let ok = std::process::Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-y", "-i"]).arg(&input)
-            .args(["-filter:a", &format!("atempo={r}"), "-c:a", "libopus", "-b:a", "48k"]).arg(&out)
+            .args(["-filter:a", &atempo_chain(*r), "-c:a", "libopus", "-b:a", "48k"]).arg(&out)
             .status().map(|s| s.success()).unwrap_or(false);
         if !ok { im.report.push(format!("could not make the stretched copy {variant}")); }
     }
@@ -374,6 +385,20 @@ pub fn summary(outcomes: &[Outcome]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Every stage inside ffmpeg's 0.5..=100 and the product the ratio -- the
+    /// 0.424 that was refused, an in-range one untouched, a huge one.
+    #[test]
+    fn atempo_stages_stay_in_range_and_multiply_to_the_ratio() {
+        for r in [0.424f64, 0.2, 0.5, 1.0, 1.37, 100.0, 450.0] {
+            let c = atempo_chain(r);
+            let stages: Vec<f64> = c.split(',').map(|x| x.trim_start_matches("atempo=").parse().unwrap()).collect();
+            assert!(stages.iter().all(|x| (0.5..=100.0).contains(x)), "{r}: {c}");
+            assert!((stages.iter().product::<f64>() - r).abs() < 1e-9, "{r}: {c}");
+        }
+        assert_eq!(atempo_chain(1.37), "atempo=1.37");
+        assert_eq!(atempo_chain(0.424).matches("atempo").count(), 2);
+    }
+
     use super::*;
     use std::io::Write;
 
