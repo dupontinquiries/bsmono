@@ -58,6 +58,8 @@ pub mod netshare;
 pub mod ops;
 pub mod packaging;
 pub mod patchset;
+/// COSMIC session onto a postmarketOS phone over ssh, beside its UI, gated, with rollback.
+pub mod cosmic_setup;
 pub mod places;
 pub mod preview;
 pub mod rendezvous;

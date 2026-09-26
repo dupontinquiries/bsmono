@@ -97,6 +97,7 @@ pub fn run() -> i32 {
         "zip" => cmd_zip(rest),
         "fleet" => cmd_fleet(rest),
         "patchset" => cmd_patchset(rest),
+        "cosmic" => cmd_cosmic(rest),
         "depot" => cmd_depot(rest),
         "eink" => cmd_eink(rest),
         "bridge" => cmd_bridge(rest),
@@ -1471,6 +1472,52 @@ fn cmd_depot(rest: &[String]) -> i32 {
 
 /// `gitmind patchset <show|apkbuild|freeze|rollout|bump> <patchset.txt> [args]`:
 /// the frozen package base, its patches, and the fleet rollout as text.
+/// `gitmind cosmic plan | install USER@HOST | remove USER@HOST`: the COSMIC
+/// session onto a postmarketOS phone over ssh, beside its current UI
+/// (cockpit::cosmic_setup). `plan` prints the steps and changes nothing.
+fn cmd_cosmic(rest: &[String]) -> i32 {
+    use cockpit::cosmic_setup::{install_plan, remove_plan, run_over_ssh, Root};
+    // The bootstrap account's password (root work goes through `sudo -S`; the
+    // key-only fleet account has no root): $GITMIND_SUDO_PASSWORD, or one line
+    // on stdin with --password-stdin. Never an argument.
+    let password: Option<String> = if rest.iter().any(|a| a == "--password-stdin") {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        Some(line.trim_end_matches(['\n', '\r']).to_string())
+    } else {
+        std::env::var("GITMIND_SUDO_PASSWORD").ok()
+    };
+    let root = if password.is_some() { Root::PasswordOnStdin } else { Root::NoPrompt };
+    let print = |steps: &[cockpit::patchset::Step]| {
+        for (i, s) in steps.iter().enumerate() {
+            println!("{:>2}. {}\n    $ {}\n    gate: {:?}{}", i + 1, s.what, s.cmd, s.gate,
+                s.rollback.as_ref().map(|r| format!("\n    on failure: {r}")).unwrap_or_default());
+        }
+    };
+    let target = |a: Option<&String>| a.and_then(|t| t.split_once('@')).map(|(u, h)| (u.to_string(), h.to_string()));
+    match rest.first().map(String::as_str) {
+        Some("plan") => { print(&install_plan(root)); 0 }
+        Some(verb @ ("install" | "remove")) => {
+            let Some((user, host)) = target(rest.get(1)) else {
+                eprintln!("usage: gitmind cosmic {verb} USER@HOST");
+                return 2;
+            };
+            let steps = if verb == "install" { install_plan(root) } else { remove_plan(root) };
+            match run_over_ssh(&steps, &user, &host, password.as_deref(), &mut |l| println!("{l}")) {
+                Ok(()) => {
+                    if verb == "install" {
+                        println!("COSMIC is installed beside the current UI. Choose the COSMIC session at the login screen; \
+                                  `gitmind cosmic remove {user}@{host}` undoes it.");
+                    }
+                    0
+                }
+                Err(e) => { eprintln!("gitmind cosmic {verb}: {e}"); 1 }
+            }
+        }
+        _ => { eprintln!("usage: gitmind cosmic plan | install USER@HOST | remove USER@HOST [--password-stdin]\n  root: the bootstrap account (user@phone) with its password via --password-stdin or $GITMIND_SUDO_PASSWORD;\n  or an account with passwordless doas/sudo, or root"); 2 }
+    }
+}
+
 fn cmd_patchset(rest: &[String]) -> i32 {
     use cockpit::patchset::{apkbuild_source, rollout, Freeze, Patchset, Where};
     let usage = "usage: gitmind patchset show <patchset.txt>\n       gitmind patchset apkbuild <patchset.txt> [arch]\n       gitmind patchset freeze <patchset.txt> <repo-url> [more pkgs...]\n       gitmind patchset rollout <patchset.txt> <repo-url> <builder-aports-dir> [--untested]\n       gitmind patchset bump <patchset.txt> <new-version> [base-pkgrel]";
