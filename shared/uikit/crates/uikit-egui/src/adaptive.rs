@@ -105,7 +105,23 @@ impl Adaptive {
         let w = screen.width();
         let h = screen.height();
         let class = DeviceClass::from_width(w);
-        let touch = ctx.input(|i| i.any_touches() || i.pointer.has_pointer() && i.pointer.is_moving() && has_touch_hint(i));
+        // STICKY. `any_touches()` is true only while a finger is DOWN, so reading it per
+        // frame made every touch-driven layout two layouts: 28pt targets at rest, 44pt the
+        // moment a finger landed, 28pt again on lift. On a tablet-width screen (600-1024pt,
+        // which a phone in landscape or at 2x scale is) rusty-board's rows grew under the
+        // thumb on every tap, pushing the rows below down -- and the release could land on
+        // a different key than the press. A device that has been touched once is a touch
+        // device for the rest of the session, so the answer is latched in egui memory.
+        //
+        // (The old expression also OR-ed in `has_pointer && is_moving && has_touch_hint`,
+        // and `has_touch_hint` is `!has_pointer || any_touches`, so that arm reduced to
+        // `any_touches` again: it never added a case.)
+        let touching = ctx.input(|i| i.any_touches());
+        let touch = ctx.data_mut(|d| {
+            let seen = d.get_temp_mut_or_default::<bool>(egui::Id::new(TOUCH_SEEN));
+            *seen |= touching;
+            *seen
+        });
         // touch surfaces get a 44pt min target (Apple/Material guidance); pointer gets 28.
         let min_touch_target = if touch || class == DeviceClass::Phone { 44.0 } else { 28.0 };
         let scale = match class {
@@ -240,14 +256,42 @@ impl Adaptive {
     }
 }
 
-/// Heuristic: some backends don't surface touch as `any_touches`; treat a coarse pointer
-/// with no hover as a touch hint. Kept tiny and conservative.
-fn has_touch_hint(i: &egui::InputState) -> bool {
-    !i.pointer.has_pointer() || i.any_touches()
-}
+/// egui-memory key for "a touch has been seen in this context" -- see `Adaptive::detect`.
+const TOUCH_SEEN: &str = "uikit_egui::adaptive::touch_seen";
 
 #[cfg(test)]
 mod tests {
+    /// A finger landing must not change the layout, and lifting it must not change it back.
+    /// This is the per-frame flip that made rusty-board's rows jump under every tap.
+    #[test]
+    fn touch_is_latched_not_read_per_frame() {
+        use super::Adaptive;
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 340.0)); // tablet width
+        let touch = |phase| egui::Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(1),
+            phase,
+            pos: egui::pos2(100.0, 100.0),
+            force: None,
+        };
+        let mut frame = |events: Vec<egui::Event>| {
+            let mut got = None;
+            let input = egui::RawInput { events, screen_rect: Some(screen), ..Default::default() };
+            let _ = ctx.run(input, |ctx| got = Some(Adaptive::detect(ctx)));
+            got.unwrap()
+        };
+        let before = frame(vec![]);
+        assert!(!before.touch, "no touch yet on a tablet-width pointer screen");
+        assert_eq!(before.min_touch_target, 28.0);
+        let down = frame(vec![touch(egui::TouchPhase::Start)]);
+        assert!(down.touch && down.min_touch_target == 44.0, "a touch was not seen");
+        let _ = frame(vec![touch(egui::TouchPhase::End)]);
+        let after = frame(vec![]);
+        assert!(after.touch, "lifting the finger turned touch back off");
+        assert_eq!(after.min_touch_target, 44.0, "the targets shrank again after the tap");
+    }
+
     #[test]
     fn insets_were_settable_and_never_applied() {
         // with_safe_area has existed since this struct was written and NOTHING
