@@ -6,7 +6,7 @@ fn main() {
     let seed: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
     let mut game = Game::new((seed % 13) as u32, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
     game.rng = Rng::new(0xC0FFEE ^ seed.wrapping_mul(7919));
-    game.gods[0].ai = Some(AiBrain { lane: Lane::Mid, aggression: 0.9, state: AiState::Push, target: None, strafe_dir: 1.0, strafe_t: 0.0, buy_t: 1.0, wp: 0 });
+    game.gods[0].ai = Some({ let mut b = AiBrain::new(Lane::Mid, 0.9); b.buy_t = 1.0; b });
     for step in 0..(720 * 60) {
         game.tick(1.0 / 60.0);
         for e in game.events.drain(..) {

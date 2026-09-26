@@ -40,6 +40,9 @@ pub mod voicescript;
 pub mod lore;
 /// Brawls: body collision, melee identity, area falloff, siphon, winded.
 pub mod brawl;
+/// Fight decisions (stances) and the playbook of team styles.
+pub mod tactics;
+pub mod playbook;
 /// The generated preparation documents in dev/ (cue cards, recording sheet, cue sheet).
 pub mod devdocs;
 /// Character voxels as smooth surfaces with fur lengths, for the ultra preview.

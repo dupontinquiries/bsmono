@@ -26,7 +26,7 @@ fn main() {
     };
     game.rng = Rng::new(0xC0FFEE ^ seed.wrapping_mul(7919));
     game.blockers = blockers.clone();
-    game.gods[0].ai = Some(AiBrain { lane: clawbound::consts::Lane::Mid, aggression: 0.9, state: AiState::Push, target: None, strafe_dir: 1.0, strafe_t: 0.0, buy_t: 1.0, wp: 0 });
+    game.gods[0].ai = Some({ let mut b = AiBrain::new(clawbound::consts::Lane::Mid, 0.9); b.buy_t = 1.0; b });
     let n = game.gods.len();
     let (mut windows, mut stalls) = (0usize, 0usize);
     let mut stall_at: Vec<Vec3> = Vec::new();

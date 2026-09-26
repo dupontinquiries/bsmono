@@ -789,6 +789,8 @@ pub fn draw_scoreboard_labelled(ctx: &egui::Context, game: &Game, ui_label: Opti
             egui::ScrollArea::vertical().id_source("board_scroll").max_height(max_h - 64.0).show(ui, |ui| {
             for team in [Team::Blue, Team::Red] {
                 ui.label(egui::RichText::new(format!("— {} —", team.name())).size(15.0).color(col(team)));
+                let page = &game.styles[team as usize];
+                ui.label(egui::RichText::new(format!("playing {} — {}", page.name, page.lore)).size(12.0).italics().color(Color32::from_rgb(200, 190, 160)));
                 ui.label(egui::RichText::new(format!("hunt: {} animals caught", game.wild.caught[team as usize])).size(12.0).color(Color32::from_rgb(170, 168, 158)));
                 egui::Grid::new(format!("grid{}", team as usize)).num_columns(7).spacing([14.0, 3.0]).show(ui, |ui| {
                     ui.monospace("Ancestor");
@@ -823,7 +825,10 @@ pub fn draw_scoreboard_labelled(ctx: &egui::Context, game: &Game, ui_label: Opti
                         ui.monospace(match &g.ai {
                             Some(b) => match b.state {
                                 AiState::Push => "pushing".to_string(),
-                                AiState::Fight => "fighting".to_string(),
+                                AiState::Fight => match b.target {
+                                    Some(crate::sim::TargetRef::God(_)) => format!("fighting: {}", b.stance.label()),
+                                    _ => "fighting".to_string(),
+                                },
                                 AiState::Retreat => "retreating".to_string(),
                             },
                             None => String::new(),
@@ -1347,6 +1352,8 @@ pub fn draw_spectator_hud(ctx: &egui::Context, game: &Game, vp: Mat4, label: &st
     draw_minimap(ctx, game, 0);
     let top = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("spectator")));
     top.text(egui::pos2(r.center().x, r.top() + 18.0), Align2::CENTER_TOP, label, FontId::proportional(20.0), GOLD);
+    let plays = format!("{} plays {}   ·   {} plays {}", Team::Blue.name(), game.styles[0].name, Team::Red.name(), game.styles[1].name);
+    top.text(egui::pos2(r.center().x, r.top() + 64.0), Align2::CENTER_TOP, plays, FontId::proportional(13.0), Color32::from_rgb(200, 190, 160));
     top.text(egui::pos2(r.center().x, r.top() + 44.0), Align2::CENTER_TOP, "Tab next cat  ·  Z director  ·  X free camera (WASD, mouse, wheel)  ·  Esc leave", FontId::proportional(12.5), Color32::from_rgb(190, 186, 176));
 }
 

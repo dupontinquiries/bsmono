@@ -1,0 +1,2 @@
+# League pages bred by the arena (cargo run --release --example arena).
+# name|lore|commit give retreat leash tower strafe reach focus group rally objective hold
