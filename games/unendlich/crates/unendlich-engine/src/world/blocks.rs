@@ -105,13 +105,21 @@ pub enum BlockId {
     Sulfur = 95,
     Magma = 96,
     GlowCrystal = 97,
+    // Underground pass (world::underground): named flora from the design
+    // library. Glowshroom lights cave floors below the limestone zone; Iron
+    // Root Fern and Stone Flower grow over iron and over copper/gold veins
+    // (prospecting by reading plants); Cattail rings still water.
+    Glowshroom = 98,
+    IronRootFern = 99,
+    StoneFlower = 100,
+    Cattail = 101,
 }
 
 impl BlockId {
     /// Every block variant, in declaration order. Lets tests and tooling
     /// quantify invariants over the whole palette (e.g. "every gate-skippable
     /// block is non-solid"). Kept exhaustive by `all_const_is_exhaustive`.
-    pub const ALL: [BlockId; 76] = [
+    pub const ALL: [BlockId; 80] = [
         BlockId::Air, BlockId::Stone, BlockId::Grass, BlockId::Dirt,
         BlockId::Cobblestone, BlockId::Bedrock, BlockId::Water, BlockId::Lava,
         BlockId::Sand, BlockId::Gravel, BlockId::GoldOre, BlockId::IronOre,
@@ -133,6 +141,7 @@ impl BlockId {
         BlockId::Carrot, BlockId::Potato, BlockId::Cabbage, BlockId::Sprout,
         BlockId::Selenite, BlockId::Gypsum, BlockId::Dolomite, BlockId::Sulfur,
         BlockId::Magma, BlockId::GlowCrystal,
+        BlockId::Glowshroom, BlockId::IronRootFern, BlockId::StoneFlower, BlockId::Cattail,
     ];
 
     pub const fn is_air(self) -> bool {
@@ -161,7 +170,9 @@ impl BlockId {
         !matches!(self, BlockId::Air | BlockId::Water | BlockId::Lava
             | BlockId::Flower | BlockId::TallGrass | BlockId::Fern
             | BlockId::DeadBush | BlockId::Vine | BlockId::Cobweb
-            | BlockId::Mushroom | BlockId::Lichen)
+            | BlockId::Mushroom | BlockId::Lichen
+            | BlockId::Glowshroom | BlockId::IronRootFern | BlockId::StoneFlower
+            | BlockId::Cattail)
     }
 
     /// Does this block stop a body's translational motion (collision)?
@@ -263,13 +274,16 @@ impl BlockId {
             // Crystal and amber are translucent natural materials.
             | BlockId::Crystal | BlockId::Amber
             | BlockId::Selenite | BlockId::GlowCrystal
+            | BlockId::Glowshroom | BlockId::IronRootFern | BlockId::StoneFlower
+            | BlockId::Cattail
             | BlockId::Glass)
     }
 
     pub fn is_replaceable(self) -> bool {
         matches!(self, BlockId::Air | BlockId::Water | BlockId::Lava
             | BlockId::TallGrass | BlockId::Flower | BlockId::Fern
-            | BlockId::Snow | BlockId::DeadBush | BlockId::Vine)
+            | BlockId::Snow | BlockId::DeadBush | BlockId::Vine
+            | BlockId::IronRootFern | BlockId::StoneFlower)
     }
 
     pub fn is_fluid(self) -> bool {
@@ -312,7 +326,8 @@ impl BlockId {
         match self {
             BlockId::Water => 0.45,
             BlockId::Lava => 0.20,
-            BlockId::TallGrass | BlockId::Fern => 0.85,
+            BlockId::TallGrass | BlockId::Fern | BlockId::IronRootFern => 0.85,
+            BlockId::Cattail => 0.75,
             BlockId::Cobweb => 0.10,
             _ => 1.0,
         }
@@ -415,6 +430,10 @@ impl BlockId {
             BlockId::Sulfur              => [222, 201, 62],
             BlockId::Magma               => [182, 60, 30],
             BlockId::GlowCrystal         => [120, 202, 232],
+            BlockId::Glowshroom          => [96, 196, 184],  // teal cap
+            BlockId::IronRootFern        => [128, 124, 70],  // rust-olive fronds
+            BlockId::StoneFlower         => [176, 170, 196], // pale lilac-grey
+            BlockId::Cattail             => [112, 138, 72],
         }
     }
 
@@ -497,7 +516,13 @@ impl BlockId {
             | BlockId::OakLeaves   // canopy detail — clusters of mini-leaves
             | BlockId::BirchLeaves
             // r513: crops render as small plant shapes, not cubes.
-            | BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
+            | BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout
+            // Non-cube plants and cave dressing. Before these arms they were
+            // non-solid with no sub-grid, so the chunk mesher drew nothing for
+            // them: a generated vine, mushroom or cobweb was invisible.
+            | BlockId::Mushroom | BlockId::Vine | BlockId::DeadBush | BlockId::Cobweb
+            | BlockId::Glowshroom | BlockId::IronRootFern | BlockId::StoneFlower
+            | BlockId::Cattail)
     }
 
     /// **Sub-voxel-only** blocks: the sub-voxel grid IS the entire visual.
@@ -666,6 +691,10 @@ impl BlockId {
             "flower"         => BlockId::Flower,
             "tall_grass"     => BlockId::TallGrass,
             "fern"           => BlockId::Fern,
+            "glowshroom"     => BlockId::Glowshroom,
+            "iron_root_fern" => BlockId::IronRootFern,
+            "stone_flower"   => BlockId::StoneFlower,
+            "cattail"        => BlockId::Cattail,
             "dead_bush"      => BlockId::DeadBush,
             "vine"           => BlockId::Vine,
             "dripstone"      => BlockId::Dripstone,
@@ -787,6 +816,10 @@ impl TryFrom<u8> for BlockId {
             95 => Ok(BlockId::Sulfur),
             96 => Ok(BlockId::Magma),
             97 => Ok(BlockId::GlowCrystal),
+            98 => Ok(BlockId::Glowshroom),
+            99 => Ok(BlockId::IronRootFern),
+            100 => Ok(BlockId::StoneFlower),
+            101 => Ok(BlockId::Cattail),
             other => Err(other),
         }
     }
@@ -831,6 +864,8 @@ mod tests {
                 | BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout => {}
                 BlockId::Selenite | BlockId::Gypsum | BlockId::Dolomite
                 | BlockId::Sulfur | BlockId::Magma | BlockId::GlowCrystal => {}
+                BlockId::Glowshroom | BlockId::IronRootFern | BlockId::StoneFlower
+                | BlockId::Cattail => {}
             }
         }
         for b in BlockId::ALL { _forces_update(b); }

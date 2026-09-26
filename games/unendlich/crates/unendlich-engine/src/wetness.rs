@@ -32,7 +32,7 @@ pub fn absorbency(block: BlockId) -> u8 {
         Dirt | Grass | Sand | Gravel | Clay | Moss => 220, // porous ground soaks
         Snow | SnowBlock => 120,
         OakLog | BirchLog | OakPlanks | Bookshelf | DarkOakPlanks => 180, // wood drinks
-        OakLeaves | BirchLeaves | Cactus | Pumpkin | Flower | TallGrass | Fern | DeadBush
+        OakLeaves | BirchLeaves | Cactus | Pumpkin | Flower | TallGrass | Fern | IronRootFern | StoneFlower | Cattail | Glowshroom | DeadBush
         | Vine | Mushroom | Cobweb | Lichen | Carrot | Potato | Cabbage | Sprout => 90, // foliage holds droplets
         Stone | Cobblestone | Bedrock | RedSandstone | Dripstone | Limestone | Basalt | Tuff
         | Granite | Slate | Andesite | Schist | Sandstone | StoneBricks | Bricks | CoalBlock

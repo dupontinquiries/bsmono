@@ -46,7 +46,7 @@ pub fn proper_tool(block: BlockId) -> Option<ToolKind> {
 
         // Hand: fluids, air, decorative plants, foliage, cactus, bedrock.
         Air | Water | Lava | OakLeaves | BirchLeaves | Cactus | Flower | TallGrass
-        | Fern | DeadBush | Vine | Cobweb | Mushroom | Lichen | Bedrock
+        | Fern | IronRootFern | StoneFlower | Cattail | Glowshroom | DeadBush | Vine | Cobweb | Mushroom | Lichen | Bedrock
         | Carrot | Potato | Cabbage | Sprout => None,
     }
 }
@@ -76,7 +76,7 @@ pub fn required_tier(block: BlockId) -> u8 {
 
         // Tier 0: hand-harvestable.
         Air | Water | Lava | OakLeaves | BirchLeaves | Cactus | Flower | TallGrass
-        | Fern | DeadBush | Vine | Cobweb | Mushroom | Lichen | Carrot | Potato | Cabbage | Sprout => 0,
+        | Fern | IronRootFern | StoneFlower | Cattail | Glowshroom | DeadBush | Vine | Cobweb | Mushroom | Lichen | Carrot | Potato | Cabbage | Sprout => 0,
     }
 }
 
@@ -131,7 +131,7 @@ pub fn base_hardness(block: BlockId) -> u16 {
     const VERYHARD: u16 = 90;
     match block {
         // Fluids + decorative plants: snap / no resistance.
-        Air | Water | Lava | Flower | TallGrass | Fern | DeadBush | Vine | Cobweb
+        Air | Water | Lava | Flower | TallGrass | Fern | IronRootFern | StoneFlower | Cattail | Glowshroom | DeadBush | Vine | Cobweb
         | Mushroom | Lichen | Carrot | Potato | Cabbage | Sprout => INSTANT,
         // Leaves + loose ground: soft.
         OakLeaves | BirchLeaves | Dirt | Grass | Sand | Gravel | Clay | Snow | SnowBlock

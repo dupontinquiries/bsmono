@@ -475,7 +475,10 @@ impl Chunk {
             if matches!(b,
                 BlockId::Grass | BlockId::TallGrass | BlockId::Fern | BlockId::Flower
                 | BlockId::OakLeaves | BlockId::BirchLeaves
-                | BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
+                | BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout
+                | BlockId::Mushroom | BlockId::Vine | BlockId::DeadBush | BlockId::Cobweb
+                | BlockId::Glowshroom | BlockId::IronRootFern | BlockId::StoneFlower
+                | BlockId::Cattail)
             { f |= 1; }
             if matches!(b, BlockId::OakLog | BlockId::BirchLog) { f |= 2; }
             if b.is_air() { f |= 4; }

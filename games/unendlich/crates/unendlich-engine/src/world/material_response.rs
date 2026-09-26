@@ -420,7 +420,7 @@ pub fn for_block(block: BlockId, world_y: i32) -> MaterialResponse {
         | Slate | Calcite | Andesite | Schist | Bone | Amber | Crystal
         | OakLog | BirchLog
         | RedSandstone | Cactus | Dripstone | Ice
-        | Flower | TallGrass | Fern | DeadBush | Vine | Mushroom
+        | Flower | TallGrass | Fern | IronRootFern | StoneFlower | Cattail | Glowshroom | DeadBush | Vine | Mushroom
         | Cobweb | Lichen
         | Water | Lava
         | Sandstone | Obsidian | CopperOre | Quartz
