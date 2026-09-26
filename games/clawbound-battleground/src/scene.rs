@@ -157,6 +157,8 @@ pub fn chunk_choice(ch: &PropChunk, eye: Vec3) -> Option<(u64, f32)> {
 struct WorldProbe<'a> {
     blockers: &'a Blockers,
     logs: &'a [crate::logs::RollingLog],
+    /// Ultra's snowpack, if any: how much loose snow a paw is in.
+    snow: Option<&'a crate::snowpack::Snowpack>,
 }
 
 impl Probe for WorldProbe<'_> {
@@ -180,6 +182,9 @@ impl Probe for WorldProbe<'_> {
     }
     fn water(&self, x: f32, z: f32) -> f32 {
         consts::water_depth(x, z)
+    }
+    fn snow(&self, x: f32, z: f32) -> f32 {
+        self.snow.map_or(0.0, |s| s.surface_at(x, z))
     }
     fn stem(&self, x: f32, z: f32, within: f32) -> Option<(f32, f32)> {
         self.blockers.nearest_stem(x, z, within)
@@ -704,7 +709,7 @@ impl Scene {
 
         // gods — posed per part. `puppet` decides what the body is doing,
         // `creature-rig` poses the boxes, `rigged` turns boxes into matrices.
-        let world = WorldProbe { blockers: &game.blockers, logs: &game.logs };
+        let world = WorldProbe { blockers: &game.blockers, logs: &game.logs, snow: vfx.snow.as_ref() };
         let dt = (vfx.time - vfx.puppets.last_time).clamp(0.0, 0.1);
         vfx.puppets.last_time = vfx.time;
         vfx.puppets.ensure(game.gods.len());
@@ -821,6 +826,11 @@ impl Scene {
                 * Mat4::from_axis_angle(Vec3::Y, vfx.time * 0.05 + k as f32);
             r.queue_draw(self.cloud, m, [1.0; 4], 0.35 + atm.night * 0.25, crate::skyprops::CLOUD_VOX, false);
         }
+        // ultra's snowpack, for the terrain to draw (snowpack.rs)
+        r.snow = vfx.snow.as_ref().map(|s| {
+            let (pack, marks) = s.upload();
+            (pack, marks, s.params())
+        });
         // the sky map's drifting stone and cloud, rising and falling on the
         // slow air (skydrift.rs); an anchor stone rests on a little cloud
         for d in &self.drift {

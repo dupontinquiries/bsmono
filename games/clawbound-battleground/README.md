@@ -37,6 +37,11 @@ what else is known-but-unresolved.
   chasms, untouchable, letting stars fall on marked spots (a ring of light,
   then a column of it that burns either side). From 18 minutes, overtime:
   towers and Elders take 12% more damage a minute, and deaths last longer.
+- **Ultra snow** (Ultra preset only; looks, not rules): snow lies on the snowy
+  maps, deep in the sheltered hollows and blown thin where the wind scours;
+  it keeps falling, the wind drifts it from the blown stretches into the lee,
+  cats bound through drifts ploughing a trench and leave separate prints on
+  powder, and blasts throw craters, fire melts it, frost lays more.
 - **14 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
   Windclaw, Faryowl, Oldroar, Twofang, Suneye, Snowhush, Riptail, Stillsmoke,
   Stonewhisper, Cometail (the star-fallen caracal: Starshot, Meteor Pounce,

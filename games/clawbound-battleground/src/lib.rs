@@ -62,6 +62,8 @@ pub mod wyrmflight;
 pub mod wyrmbody;
 /// Floating stone and drifting cloud round the sky map's islands.
 pub mod skydrift;
+/// Snow that lies, drifts and keeps prints (ultra; presentation only).
+pub mod snowpack;
 /// The generated preparation documents in dev/ (cue cards, recording sheet, cue sheet).
 pub mod devdocs;
 /// Character voxels as smooth surfaces with fur lengths, for the ultra preview.

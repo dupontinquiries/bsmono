@@ -120,6 +120,13 @@ pub struct Vfx {
     /// the player, and mist spilling off the islands' edges (`tick_wisps`).
     pub wisps: Vec<Wisp>,
     wisp_seed: u64,
+    /// Snow on the ground, drifting and keeping prints (ultra only;
+    /// `snowpack`), the map it was laid for, where each cat was last
+    /// frame (for the trenches), and the wind last seen.
+    pub snow: Option<crate::snowpack::Snowpack>,
+    snow_map: Option<crate::map::MapId>,
+    snow_last: Vec<Vec3>,
+    snow_wind: Vec3,
 }
 
 /// One trail of mist: a point that wanders a curling path, leaving a
@@ -131,6 +138,9 @@ pub struct Wisp {
     pub seed: f32,
     /// Spilling off an island's edge (outward and down), not curling over it.
     pub spill: Option<Vec3>,
+    /// Spindrift: powder the wind is skimming off a blown stretch of snow
+    /// (ultra's snowpack), running low and fast downwind.
+    pub drift: bool,
 }
 
 /// Wisps alive at once round the player.
@@ -446,12 +456,14 @@ impl Vfx {
     /// some spilling off a nearby edge, out and down into the sky -- and
     /// lays a thread of tiny motes behind each.
     pub fn tick_wisps(&mut self, dt: f32, game: &Game) {
-        if crate::map::active() != crate::map::MapId::Sky || game.gods.is_empty() || dt <= 0.0 {
+        let sky = crate::map::active() == crate::map::MapId::Sky;
+        if !(sky || self.snow.is_some()) || game.gods.is_empty() || dt <= 0.0 {
             self.wisps.clear();
             return;
         }
         let focus = game.gods[0].pos;
         let floor = crate::sky::floor();
+        let wind = game.weather.atmosphere().wind;
         let mut rnd = |s: &mut u64| {
             *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             ((*s >> 33) as f32) / (1u64 << 31) as f32
@@ -465,15 +477,20 @@ impl Vfx {
             let a = rnd(&mut seed) * std::f32::consts::TAU;
             let r = 4.0 + rnd(&mut seed).sqrt() * 31.0;
             let p = Vec3::new(focus.x + a.cos() * r, 0.0, focus.z + a.sin() * r);
-            let d = floor.sdf(p.x, p.z);
+            let d = if sky { floor.sdf(p.x, p.z) } else { -5.0 };
             let wseed = rnd(&mut seed) * 6.28;
-            if (-1.5..1.0).contains(&d) && rnd(&mut seed) < 0.5 {
+            let blown = self.snow.as_ref().map_or(0.0, |s| if s.depth_at(p.x, p.z) > 0.02 { s.blow_at(p.x, p.z) } else { 0.0 });
+            if blown > 0.55 && wind.length() > 1.0 && d < -0.5 {
+                self.wisps.push(Wisp { pos: p + Vec3::Y * 0.1, age: 0.0, life: 1.2 + rnd(&mut seed) * 1.3, seed: wseed, spill: None, drift: true });
+            } else if !sky {
+                continue;
+            } else if (-1.5..1.0).contains(&d) && rnd(&mut seed) < 0.5 {
                 // at an edge: spill outward (down the distance gradient) and down
                 let e = 0.5;
                 let out = Vec3::new(floor.sdf(p.x + e, p.z) - floor.sdf(p.x - e, p.z), 0.0, floor.sdf(p.x, p.z + e) - floor.sdf(p.x, p.z - e)).normalize_or_zero();
-                self.wisps.push(Wisp { pos: p + Vec3::Y * 0.4, age: 0.0, life: 5.0 + rnd(&mut seed) * 3.0, seed: wseed, spill: Some(out) });
+                self.wisps.push(Wisp { pos: p + Vec3::Y * 0.4, age: 0.0, life: 5.0 + rnd(&mut seed) * 3.0, seed: wseed, spill: Some(out), drift: false });
             } else if d < -0.5 {
-                self.wisps.push(Wisp { pos: p + Vec3::Y * 0.2, age: 0.0, life: 2.5 + rnd(&mut seed) * 2.5, seed: wseed, spill: None });
+                self.wisps.push(Wisp { pos: p + Vec3::Y * 0.2, age: 0.0, life: 2.5 + rnd(&mut seed) * 2.5, seed: wseed, spill: None, drift: false });
             }
         }
         self.wisp_seed = seed;
@@ -483,6 +500,12 @@ impl Vfx {
         for w in self.wisps.iter_mut() {
             w.age += dt;
             match w.spill {
+                None if w.drift => {
+                    let v = wind * 1.3 + wisp_vel(w.pos, t, w.age, w.seed) * 0.3;
+                    w.pos.x += v.x * dt;
+                    w.pos.z += v.z * dt;
+                    w.pos.y = 0.08 + 0.14 * (w.age * 5.0 + w.seed).sin().abs();
+                }
                 Some(out) => {
                     // over the lip, then falling away and curling as it goes
                     let fall = (w.age - 0.8).max(0.0);
@@ -502,6 +525,102 @@ impl Vfx {
             }
         }
         self.particles.extend(motes);
+    }
+
+    /// The snowpack (ultra): laid when the map changes, stepped (fall,
+    /// drift, marks filling), ploughed by cats wading drifts, and struck by
+    /// what abilities do to the ground -- a blast throws a crater, heat
+    /// melts a pan, frost lays fresh snow -- each throwing up snow in
+    /// proportion to what was there.
+    pub fn tick_snow(&mut self, dt: f32, events: &[Event], game: &Game) {
+        use crate::snowpack::Hit;
+        let map = crate::map::active();
+        if self.snow_map != Some(map) {
+            self.snow = crate::snowpack::Snowpack::for_map();
+            self.snow_map = Some(map);
+            self.snow_last.clear();
+        }
+        let Some(s) = self.snow.as_mut() else { return };
+        let atm = game.weather.atmosphere();
+        self.snow_wind = atm.wind;
+        if let Some(g) = game.gods.first() {
+            s.follow(g.pos);
+        }
+        s.tick(dt, crate::snowpack::snowfall(atm.snow), atm.wind);
+        let mut sprays: Vec<(Vec3, f32, f32)> = Vec::new();
+        // bodies wading through drifts leave a trench
+        self.snow_last.resize(game.gods.len(), Vec3::NAN);
+        for (i, g) in game.gods.iter().enumerate() {
+            let free = g.respawn_t <= 0.0 && g.leap.is_none() && g.dash.is_none() && g.riding.is_none() && g.skyfall.is_none();
+            let prev = self.snow_last[i];
+            if free && prev.is_finite() && prev.distance(g.pos) < 3.0 && prev.distance(g.pos) > 1e-3 {
+                if s.is_deep(g.pos.x, g.pos.z) {
+                    s.plough(prev, g.pos, 1.3);
+                    if (self.time * 5.0 + i as f32 * 0.31).fract() < dt * 5.0 {
+                        sprays.push((g.pos + g.move_dir * 0.6, 0.5, 0.25));
+                    }
+                }
+            }
+            self.snow_last[i] = if free { g.pos } else { Vec3::NAN };
+        }
+        // what abilities do to it
+        let kind = |c: [f32; 3]| {
+            if c[0] > 0.8 && c[2] < 0.5 {
+                Hit::Heat
+            } else if c[2] > 0.85 && c[0] < 0.75 {
+                Hit::Frost
+            } else {
+                Hit::Blast
+            }
+        };
+        for e in events {
+            let (pos, r, k) = match *e {
+                Event::Explosion { pos, radius, color } | Event::NovaFx { pos, radius, color } => (pos, radius, kind(color)),
+                Event::StrikeFx { at, .. } => (at, 1.6, Hit::Blast),
+                Event::StarfallFx { at, radius } => (at, radius, Hit::Heat),
+                Event::DashFx { pos, dir, .. } => {
+                    s.plough(pos - dir * 2.6, pos, 1.2);
+                    continue;
+                }
+                Event::BeamFx { from, dir, length, width, color, .. } if from.y < 4.0 => {
+                    // a beam along the ground scours a furrow
+                    let n = (length / 2.0).ceil().clamp(1.0, 20.0) as usize;
+                    for q in 0..=n {
+                        let p = from + dir * (length * q as f32 / n as f32);
+                        s.hit(Vec3::new(p.x, 0.0, p.z), width * 0.5, kind(color));
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            if !pos.is_finite() || pos.y > 4.0 {
+                continue;
+            }
+            let there = s.depth_at(pos.x, pos.z);
+            s.hit(pos, r, k);
+            if there > 0.05 && k != Hit::Frost {
+                sprays.push((pos, r, there));
+            }
+        }
+        for (pos, r, amount) in sprays {
+            let n = ((amount * r * 12.0) as usize).clamp(3, 70);
+            for q in 0..n {
+                let a = q as f32 / n as f32 * std::f32::consts::TAU + self.perturb(0.3);
+                let out = r * (0.6 + self.perturb(0.4).abs());
+                let up = 2.5 + self.perturb(1.5).abs() * 2.0 + amount * 3.0;
+                self.dust.push(Particle {
+                    pos: pos + Vec3::new(a.cos(), 0.0, a.sin()) * r * 0.4 + Vec3::Y * 0.2,
+                    vel: Vec3::new(a.cos() * out, up, a.sin() * out) + atm.wind * 0.3,
+                    life: 1.0,
+                    max_life: 1.0,
+                    size: 0.12 + 0.1 * (q % 3) as f32 * 0.5,
+                    color: [0.94, 0.96, 1.0],
+                    alpha: 0.95,
+                    gravity: 7.0,
+                    drag: 1.2,
+                });
+            }
+        }
     }
 
     /// A star the Moonwyrm let fall lands: a straight column of white light
@@ -653,6 +772,7 @@ impl Vfx {
         self.tick_trails(game);
         self.tick_channels(dt, events, game);
         self.tick_wisps(dt, game);
+        self.tick_snow(dt, events, game);
         self.time += dt;
         let atm = game.weather.atmosphere();
         self.ground.tick(dt, atm.rain, atm.wetness);
@@ -1247,6 +1367,27 @@ impl Vfx {
                         });
                     }
                 }
+                E::PawDown { pos, speed } => {
+                    let wind = self.snow_wind;
+                    let Some(s) = self.snow.as_mut() else { continue };
+                    let deep = s.is_deep(pos.x, pos.z);
+                    let print = s.paw(pos);
+                    if print <= 0.0 || speed < 1.0 {
+                        continue;
+                    }
+                    let n = if deep { 4 } else { 3 };
+                    for k in 0..n {
+                        let j = Vec3::new(self.perturb(0.3 + k as f32), 0.0, self.perturb(0.7 + k as f32));
+                        // a drift throws clods up and they fall back; powder
+                        // is kicked low and the wind takes it
+                        let (vel, grav, life) = if deep {
+                            (Vec3::new(j.x * 2.0, 2.2 + j.z.abs() * 2.0, j.z * 2.0), 9.0, 0.5)
+                        } else {
+                            (wind * 0.8 + Vec3::new(j.x, 0.4, j.z), 0.4, 1.1)
+                        };
+                        self.dust.push(Particle { pos: pos + Vec3::Y * 0.15, vel, life, max_life: life, size: if deep { 0.13 } else { 0.08 }, color: [0.93, 0.95, 1.0], alpha: 0.9, gravity: grav, drag: if deep { 1.0 } else { 1.8 } });
+                    }
+                }
                 E::PawSlam { pos } => {
                     self.ground.strike(pos, 1.6, 0.5);
                     for i in 0..14 {
@@ -1812,8 +1953,11 @@ impl Vfx {
                 }
             }
         }
-        if atm.snow > 0.02 {
-            let n = (1800.0 * atm.snow) as usize;
+        // (on ultra it snows a little all the time over the snowy maps:
+        // `snowpack::snowfall`)
+        let fall_snow = crate::snowpack::snowfall(atm.snow);
+        if fall_snow > 0.02 {
+            let n = (1800.0 * fall_snow) as usize;
             let (half, height) = (20.0f32, 18.0f32);
             let speed = 1.7;
             for i in 0..n {
@@ -1831,7 +1975,7 @@ impl Vfx {
                 if (x - eye.x).abs() > half || (z - eye.z).abs() > half {
                     continue;
                 }
-                out.push(VoxInst { off_ao: [x, y, z, 1.0], color: [0.95, 0.97, 1.0, 0.85 * atm.snow], misc: [0.11, 0.0, 0.0, 0.0] });
+                out.push(VoxInst { off_ao: [x, y, z, 1.0], color: [0.95, 0.97, 1.0, 0.85 * (0.5 + 0.5 * fall_snow)], misc: [0.11, 0.0, 0.0, 0.0] });
             }
         }
     }
@@ -2145,5 +2289,51 @@ mod more_fx_tests {
         let mut v = Vfx::default();
         v.update(1.0 / 60.0, &[Event::Explosion { pos: Vec3::ZERO, radius: 3.0, color: [1.0, 0.5, 0.2] }], &game);
         assert!(v.dust.len() >= 12, "impact dust: {}", v.dust.len());
+    }
+}
+
+#[cfg(test)]
+mod snow_tests {
+    use super::*;
+
+    /// On the snowpack: a blast throws a crater and a spray of snow; a
+    /// fire nova melts; a cat wading a drift ploughs a trench behind it.
+    #[test]
+    fn abilities_and_cats_work_the_snow() {
+        crate::map::with(crate::map::MapId::Sky, || {
+            let mut game = Game::new_teams(&[0], &[1]);
+            let mut v = Vfx::default();
+            v.snow = Some(crate::snowpack::Snowpack::new());
+            v.snow_map = Some(crate::map::MapId::Sky);
+            let s = v.snow.as_ref().unwrap();
+            // a deep spot, and another, on the floor
+            let spots: Vec<Vec3> = (0..crate::snowpack::N * crate::snowpack::N)
+                .filter(|&k| s.holds[k] && s.depth[k] > 0.8)
+                .map(|k| Vec3::new(s.x0 + ((k % crate::snowpack::N) as f32 + 0.5) * s.cell, 0.0, s.z0 + ((k / crate::snowpack::N) as f32 + 0.5) * s.cell))
+                .filter(|p| (0..6).all(|q| s.depth_at(p.x + q as f32, p.z) > 0.6))
+                .take(400)
+                .collect();
+            let (a, b) = (spots[0], *spots.iter().find(|p| p.distance(spots[0]) > 40.0).unwrap());
+            game.gods[0].pos = a;
+            let d0 = v.snow.as_ref().unwrap().depth_at(a.x, a.z);
+            let dust0 = v.dust.len();
+            v.tick_snow(1.0 / 60.0, &[Event::Explosion { pos: a, radius: 4.0, color: [0.8, 0.8, 0.9] }], &game);
+            assert!(v.snow.as_ref().unwrap().depth_at(a.x, a.z) < d0 * 0.5, "a crater");
+            assert!(v.dust.len() > dust0 + 10, "and a spray of snow");
+            // fire melts: the snow is gone, not thrown aside (a blast keeps
+            // the total, throwing it onto the rim)
+            let (db, t0) = (v.snow.as_ref().unwrap().depth_at(b.x, b.z), v.snow.as_ref().unwrap().total());
+            v.tick_snow(1.0 / 60.0, &[Event::NovaFx { pos: b, radius: 3.0, color: [1.0, 0.45, 0.15] }], &game);
+            let s = v.snow.as_ref().unwrap();
+            assert!(s.depth_at(b.x, b.z) < db * 0.8 && s.total() < t0 - 0.3, "fire melts: {t0} -> {}", s.total());
+            // wading: walk the cat across a fresh drift
+            let c = *spots.iter().find(|p| p.distance(a) > 20.0 && p.distance(b) > 20.0).unwrap();
+            for k in 0..60 {
+                game.gods[0].pos = c + Vec3::X * (k as f32 * 0.08);
+                v.tick_snow(1.0 / 60.0, &[], &game);
+            }
+            let s = v.snow.as_ref().unwrap();
+            assert!(s.press_at(c.x + 2.5, c.z) > 0.6, "a trench behind it: {}", s.press_at(c.x + 2.5, c.z));
+        });
     }
 }

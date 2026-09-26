@@ -46,6 +46,11 @@ pub trait Probe {
     fn cover(&self, x: f32, z: f32) -> f32;
     /// Water depth, world units.
     fn water(&self, x: f32, z: f32) -> f32;
+    /// Loose snow standing here, world units (`snowpack`; ultra only, 0
+    /// elsewhere). Deeper than `snowpack::DEEP` a cat wades and bounds.
+    fn snow(&self, _x: f32, _z: f32) -> f32 {
+        0.0
+    }
     /// The nearest stem of something LIGHT -- a fern, a bush, a hanging
     /// vine -- within `within` of the point. Not rocks or trunks: those are
     /// collision, and the sim has already kept the cat out of them. These
@@ -129,6 +134,9 @@ pub enum PuppetEvent {
     Droplets { pos: Vec3 },
     /// A forepaw came down hard (stomp / rear landing).
     PawSlam { pos: Vec3 },
+    /// A paw came down at a walk or run (where it planted), and how fast
+    /// the cat was going. The snow keeps the print (`snowpack`).
+    PawDown { pos: Vec3, speed: f32 },
 }
 
 /// Everything the draw path needs for one cat, one frame.
@@ -222,6 +230,8 @@ pub struct Puppet {
     /// velocity. Kicked down by each paw that lands, it rebounds -- the
     /// give in a cat's step.
     spring: (f32, f32),
+    /// Loose snow round the body, smoothed (`Probe::snow`), u.
+    snow: f32,
 }
 
 /// How far the body sits below straight legs, standing, as a fraction of
@@ -269,6 +279,7 @@ impl Puppet {
             windup: None,
             whiff: None,
             spring: (0.0, 0.0),
+            snow: 0.0,
         }
     }
 
@@ -418,7 +429,12 @@ impl Puppet {
             // The same table `pose` will hand the rig, so the paws lift in
             // the pattern the body is moving to.
             let moving = self.speed > 0.3;
-            let table = if self.crouch > 0.5 && moving && self.anim.gait() != Gait::Bound {
+            // Deep snow: a cat bounds through a drift -- both hind paws
+            // together, plunging -- rather than walking in it.
+            let deep = self.snow > crate::snowpack::DEEP;
+            let table = if deep && moving {
+                Gait::Bound.leg_phases()
+            } else if self.crouch > 0.5 && moving && self.anim.gait() != Gait::Bound {
                 Gait::Pace.leg_phases()
             } else if self.wet > 0.5 && moving {
                 Gait::Walk.leg_phases()
@@ -435,12 +451,19 @@ impl Puppet {
                 gait_phase: self.anim.gait_phase,
                 offsets: table,
                 hz: self.anim.build.stride_hz(self.anim.smoothed_speed()),
-                lift: creature_rig::anim_rig::SWING_LIFT,
+                // lifted clear of the snow each step: in a drift, a high
+                // plunging step; in powder, a little higher than on stone
+                lift: creature_rig::anim_rig::SWING_LIFT + (self.snow / leg).min(0.9) * 0.9,
             };
             let before: [bool; 4] = std::array::from_fn(|i| matches!(self.feet.paws[i].phase, crate::footfall::Phase::Swing { .. }));
             self.feet.advance(dt, &body, world);
             // each paw that lands kicks the spring down, by how fast we go
             let landed = (0..4).filter(|&i| before[i] && matches!(self.feet.paws[i].phase, crate::footfall::Phase::Stance { .. })).count();
+            for i in 0..4 {
+                if let (true, crate::footfall::Phase::Stance { at }) = (before[i], self.feet.paws[i].phase) {
+                    events.push(PuppetEvent::PawDown { pos: at, speed: self.speed });
+                }
+            }
             self.spring.1 += landed as f32 * SPRING_KICK * self.speed.min(12.0);
         } else {
             self.feet.release();
@@ -504,6 +527,10 @@ impl Puppet {
             self.give[k] += (want - self.give[k]) * (dt * 7.0).min(1.0);
         }
 
+        // ── snow ──────────────────────────────────────────────────────
+        let under = if grounded { finite_or(world.snow(pos.x, pos.z), 0.0).clamp(0.0, 2.0) } else { self.snow };
+        self.snow += (under - self.snow) * (dt * 5.0).min(1.0);
+
         // ── water ─────────────────────────────────────────────────────
         let depth = finite_or(world.water(pos.x, pos.z), 0.0).max(0.0);
         if depth > 0.25 {
@@ -538,6 +565,17 @@ impl Puppet {
         // Knees bent, and the give of the step (see KNEE_BEND, SPRING_*).
         if !inp.perched && inp.leap.is_none() {
             drop += (KNEE_BEND + self.spring.0) * leg_len;
+            // In a drift the body settles into the snow and rocks with each
+            // plunge; in powder it barely notices.
+            if self.snow > crate::snowpack::DEEP {
+                let k = ((self.snow - crate::snowpack::DEEP) / 0.4).clamp(0.0, 1.0);
+                drop += 0.18 * leg_len * k;
+                if moving {
+                    let ph = self.anim.gait_phase; // radians
+                    body.pitch += 0.12 * k * ph.sin();
+                    body.tail_lift += 0.35 * k;
+                }
+            }
         }
         // The wind-up: gather -- lower, weight back, tail up -- over the
         // wind-up, and hold it until the cast releases.
@@ -1035,6 +1073,44 @@ mod tests {
         let hip = r.hip(i);
         let tilt = (hip[0] - pose.body.pivot[0]) * pose.body.pitch.sin() - hip[2] * pose.body.roll.sin();
         pose.lift - pose.body.drop + tilt + pose.legs[i].fold * len
+    }
+
+    struct Snowy(f32);
+    impl Probe for Snowy {
+        fn ground(&self, _: f32, _: f32) -> f32 { 0.0 }
+        fn step_top(&self, _: f32, _: f32) -> Option<f32> { None }
+        fn cover(&self, _: f32, _: f32) -> f32 { 0.0 }
+        fn water(&self, _: f32, _: f32) -> f32 { 0.0 }
+        fn snow(&self, _: f32, _: f32) -> f32 { self.0 }
+    }
+
+    /// Through a drift a cat plunges -- paws lifted high out of the snow,
+    /// the body settled into it -- where on powder it walks as on stone;
+    /// and every paw that lands says so, for the snow to keep the print.
+    #[test]
+    fn deep_snow_is_waded_and_every_landing_is_reported() {
+        let r = rig();
+        let run = |depth: f32| {
+            let mut p = Puppet::new(Build::feline());
+            let (mut ev, mut arc, mut drop) = (Vec::new(), 0.0f32, 0.0f32);
+            for k in 0..180 {
+                let inp = input(Vec3::new(k as f32 / 60.0 * 4.0, 0.0, 0.0));
+                p.advance(1.0 / 60.0, &inp, &r, &Snowy(depth), &mut ev);
+                arc = arc.max(p.feet.paws.iter().map(|w| w.arc).fold(0.0, f32::max));
+                if k > 60 {
+                    drop = drop.max(p.pose(&inp, &r).body.drop);
+                }
+            }
+            let downs = ev.iter().filter(|e| matches!(e, PuppetEvent::PawDown { .. })).count();
+            (downs, arc, drop)
+        };
+        let (d_bare, a_bare, h_bare) = run(0.0);
+        let (d_powder, a_powder, _) = run(0.1);
+        let (d_deep, a_deep, h_deep) = run(0.8);
+        assert!(d_bare >= 8 && d_powder >= 8 && d_deep >= 6, "paws land and say so: {d_bare} {d_powder} {d_deep}");
+        assert!(a_deep > a_bare * 1.4, "high plunging steps in a drift: arc {a_deep} vs {a_bare}");
+        assert!(a_powder < a_bare * 1.3, "powder hardly changes the step: {a_powder} vs {a_bare}");
+        assert!(h_deep > h_bare + 0.05, "the body settles into the drift: drop {h_deep} vs {h_bare}");
     }
 
     /// yaw 0 faces +X and right is +Z, so the front-LEFT paw is at +x, -z.
