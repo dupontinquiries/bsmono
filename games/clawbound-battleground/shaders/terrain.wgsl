@@ -26,6 +26,18 @@ fn hash21(p: vec2<f32>) -> f32 {
     q = q + dot(q, q + 45.32);
     return fract(q.x * q.y);
 }
+// An integer hash of a cell, 0..1. `hash21` works in f32 and loses its
+// low bits on cell indices in the thousands (world x 40 for the snow's
+// glitter): the sparkles came out in dotted lines.
+fn hash_cell(c: vec2<i32>) -> f32 {
+    var h = u32(c.x) * 0x8da6b343u ^ u32(c.y) * 0xd8163841u;
+    h = h ^ (h >> 16u);
+    h = h * 0x7feb352du;
+    h = h ^ (h >> 15u);
+    h = h * 0x846ca68bu;
+    h = h ^ (h >> 16u);
+    return f32(h >> 8u) / 16777216.0;
+}
 @group(0) @binding(2) var shadow_map: texture_depth_2d;
 @group(0) @binding(3) var shadow_sampler: sampler_comparison;
 
@@ -70,6 +82,14 @@ fn snow_press(xz: vec2<f32>) -> f32 {
         return 0.0;
     }
     return textureSampleLevel(snow_marks, snow_samp, uv, 0.0).r;
+}
+
+// How much of the snowpack a surface facing `ny` up carries: all on the
+// flat and gentle slopes, none on steep faces or anything facing down.
+// (Without it the pack's depth, sampled by x-z alone, was drawn down every
+// cliff face and keel under snowy ground, in 8-bit contour bands.)
+fn snow_facing(ny: f32) -> f32 {
+    return smoothstep(0.55, 0.8, ny);
 }
 
 // Loose snow standing here: the pack less what has been pushed aside.
@@ -217,8 +237,10 @@ fn tri_detail(w: vec3<f32>, n: vec3<f32>, m: f32, dist: f32) -> vec4<f32> {
 @vertex
 fn vs_main(in: VSIn) -> VSOut {
     var out: VSOut;
-    // the snowpack lifts the ground it lies on
-    let w = vec4<f32>(in.pos + vec3(0.0, snow_surface(in.pos.xz), 0.0), 1.0);
+    // the snowpack lifts the ground it lies on -- only ground that faces
+    // up: the pack is a 2D field, and a cliff face or an island's keel
+    // under snowy ground must not be lifted (or painted) by it
+    let w = vec4<f32>(in.pos + vec3(0.0, snow_surface(in.pos.xz) * snow_facing(in.normal.y), 0.0), 1.0);
     out.clip = frame.view_proj * w;
     out.world = w.xyz;
     out.normal = in.normal;
@@ -399,15 +421,26 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // The snowpack: its surface's own normal, from the fine marks, so a
     // paw print or a trench is a dent the light falls into. `lying` is
     // how much snow is here at all; `loose` how much is still standing.
-    let sd = snow_depth(in.world.xz);
+    let sd = snow_depth(in.world.xz) * snow_facing(normalize(in.normal).y);
     let spress = snow_press(in.world.xz);
     let lying = smoothstep(0.02, 0.08, sd);
     let loose = smoothstep(0.0, 0.05, sd * (1.0 - spress));
     if (lying > 0.0) {
+        // the surface is depth x (1 - press): the pack's slope over a wide
+        // step (its texels are ~2.6 u, and a narrow difference showed their
+        // bilinear seams as straight creases across the snow), the marks'
+        // over a narrow one (a print is a few of their 0.2 u cells)
+        let xz = in.world.xz;
+        let E = 1.3;
         let e = 0.1;
-        let hx = snow_surface(in.world.xz + vec2(e, 0.0)) - snow_surface(in.world.xz - vec2(e, 0.0));
-        let hz = snow_surface(in.world.xz + vec2(0.0, e)) - snow_surface(in.world.xz - vec2(0.0, e));
-        let ns = normalize(vec3(-hx, 2.0 * e, -hz));
+        let fy = snow_facing(normalize(in.normal).y);
+        let dx = (snow_depth(xz + vec2(E, 0.0)) - snow_depth(xz - vec2(E, 0.0))) / (2.0 * E) * fy;
+        let dz = (snow_depth(xz + vec2(0.0, E)) - snow_depth(xz - vec2(0.0, E))) / (2.0 * E) * fy;
+        let px = (snow_press(xz + vec2(e, 0.0)) - snow_press(xz - vec2(e, 0.0))) / (2.0 * e);
+        let pz = (snow_press(xz + vec2(0.0, e)) - snow_press(xz - vec2(0.0, e))) / (2.0 * e);
+        let hx = dx * (1.0 - spress) - sd * px;
+        let hz = dz * (1.0 - spress) - sd * pz;
+        let ns = normalize(vec3(-hx, 1.0, -hz));
         N = normalize(mix(N, ns, lying));
     }
     let sun = normalize(frame.sun_dir.xyz);
@@ -464,7 +497,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let floor_col = mix(albedo * vec3(0.62, 0.70, 0.88), vec3(0.66, 0.76, 0.95), smoothstep(0.15, 0.35, sd));
     albedo = mix(albedo, mix(floor_col, vec3(0.93, 0.95, 1.0), loose), lying);
     // a glitter of crystals, fine and sparse, near the camera only
-    let glit = step(0.996, hash21(floor(in.world.xz * 40.0) + floor(frame.params.x * 0.7))) * loose * (1.0 - smoothstep(3.0, 16.0, cam_d));
+    let glit = step(0.996, hash_cell(vec2<i32>(floor(in.world.xz * 40.0)) + vec2<i32>(i32(floor(frame.params.x * 0.7)) * 7919, 0))) * loose * (1.0 - smoothstep(3.0, 16.0, cam_d));
     var lit = albedo * (sun_col * mix(wrap * wrap, ndl, 0.7) * shadow + hemi * 0.9 + sky * 0.2 * (1.0 - shadow));
     lit = lit + albedo * point_lights(in.world, N);
     lit = lit + vec3(1.4, 1.5, 1.7) * glit * (0.4 + shadow * 0.6);
@@ -480,6 +513,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // Tower lines, last, so neither fog nor night hides them: this is
     // information, not scenery.
     let ring = tower_ring(in.world.xz);
-    lit = mix(lit, ring.rgb, ring.a);
+    // the towers stand on the ground layer: their lines are not drawn on
+    // Starwell's Aerie 20 u above (they were, as a tinted patch)
+    lit = mix(lit, ring.rgb, ring.a * (1.0 - smoothstep(6.0, 10.0, in.world.y)));
     return vec4(lit, 1.0);
 }

@@ -632,7 +632,7 @@ impl Vfx {
                         vel: Vec3::new(-a.sin(), 0.0, a.cos()) * 0.8 + Vec3::Y * speed,
                         life,
                         max_life: life,
-                        size: if gold { 0.3 } else { 0.4 },
+                        size: if gold { 0.14 } else { 0.19 },
                         color: if gold { [1.0, 0.9, 0.62] } else { [0.8, 0.9, 1.0] },
                         alpha: 0.75,
                         gravity: 0.0,
@@ -776,7 +776,7 @@ impl Vfx {
                     s.plough(pos - dir * 2.6, pos, 1.2);
                     continue;
                 }
-                Event::BeamFx { from, dir, length, width, color, .. } if from.y < 4.0 => {
+                Event::BeamFx { from, dir, length, width, color, .. } if from.y - crate::map::ground_y(from.x, from.z) < 4.0 => {
                     // a beam along the ground scours a furrow
                     let n = (length / 2.0).ceil().clamp(1.0, 20.0) as usize;
                     for q in 0..=n {
@@ -787,7 +787,8 @@ impl Vfx {
                 }
                 _ => continue,
             };
-            if !pos.is_finite() || pos.y > 4.0 {
+            // near the ground it stands over (the islands, or the Aerie)
+            if !pos.is_finite() || pos.y - crate::map::ground_y(pos.x, pos.z) > 4.0 {
                 continue;
             }
             let there = s.depth_at(pos.x, pos.z);
