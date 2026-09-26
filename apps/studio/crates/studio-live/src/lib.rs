@@ -1416,6 +1416,15 @@ pub fn render_pattern(
                     (gate_len + tail, Some(gate_len))
                 }
                 SynthKind::Sine { .. } => (gate_len + rate as usize / 8, Some(gate_len)),
+                // HELD, then released past the gate with its own release. Missing
+                // until c20: a Poly roll note fell to `_` -- placed as a HIT and
+                // cut dead at its gate, so a pad never sustained past attack +
+                // decay and no release tail ever sounded (every synth score
+                // measured before this was of truncated notes).
+                SynthKind::Poly { patch, .. } => {
+                    let tail = ((patch.release_ms.max(1.0) * 1.5 / 1000.0) * rate as f32) as usize;
+                    (gate_len + tail, Some(gate_len))
+                }
                 _ => (gate_len, None),
             };
             placed.push(Placed {
@@ -3051,6 +3060,29 @@ mod gated_synth_tests {
         // the roll's oldest pin, restated against the sustaining envelope.
         assert!(rms(&out, step * 13 / 2, step * 7) < early * 0.01,
                 "note-off is a cut with a fade, not a second decay");
+    }
+
+    #[test]
+    fn a_held_poly_note_sustains_then_releases_past_its_gate() {
+        let mut rack = Rack::trap_kit();
+        rack.channels[0].kind = SynthKind::Poly { hz: 220.0, patch: PolyPatch { wave: 0, voices: 1, attack_ms: 20.0, decay_ms: 50.0,
+            sustain: 0.8, release_ms: 300.0, cutoff: 20_000.0, env_amount: 0.0, gain: 1.0, ..Default::default() } };
+        rack.channels[0].choke_group = None;
+        let mut p = Pattern::new("pad", 16, rack.channels.len());
+        p.add_note(0, Note { key: 0, start: 0, len: 6, vel: 1.0, slide: false });
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let tempo = rack.tempo();
+        let out = render_pattern(&p, &rack, &mut synth, &tempo, 48_000, 0);
+        let step = tempo.step_len().to_samples(48_000).max(1) as usize;
+        let early = rms(&out, step / 2, step);
+        let late = rms(&out, step * 5, step * 11 / 2);
+        assert!(late > early * 0.7, "HELD: step-5 {late} vs step-0 {early}");
+        let rel = (0.3 * 48_000.0) as usize;
+        let just_after = rms(&out, step * 6 + rel / 10, step * 6 + rel / 5);
+        assert!(just_after > early * 0.1, "the RELEASE sounds past the gate: {just_after} vs {early}");
+        let end = (step * 6 + rel + rel / 5).min(out.len().saturating_sub(10));
+        assert!(rms(&out, end, (end + rel / 5).min(out.len())) < early * 0.01, "and reaches silence");
     }
 
     #[test]
