@@ -34,6 +34,17 @@ fn main() {
         m
     };
     let mut im = studio_app::flp_import::import(&inv, &a[3], &probe).expect("import");
+    // FL's time-stretched audio: make each stretched copy once (atempo keeps
+    // pitch; FL's modes here are the pitch-keeping ones -- the report says).
+    for (file, r, variant) in &im.stretches {
+        let out = media.join(variant);
+        if out.is_file() { continue; }
+        let input = media.join(opus_for(file).unwrap_or_else(|| file.clone()));
+        let ok = std::process::Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-y", "-i"]).arg(&input)
+            .args(["-filter:a", &format!("atempo={r}"), "-c:a", "libopus", "-b:a", "48k"]).arg(&out)
+            .status().map(|s| s.success()).unwrap_or(false);
+        if !ok { im.report.push(format!("could not make the stretched copy {variant}")); }
+    }
     let mut swapped = 0;
     for src in im.project.sources.values_mut() {
         if let Some(o) = opus_for(&src.path) { src.path = o; src.sample_rate = 48_000; swapped += 1; }

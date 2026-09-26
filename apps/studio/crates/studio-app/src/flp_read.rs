@@ -154,6 +154,10 @@ pub fn inventory(b: &[u8]) -> Result<Value, FlpError> {
             // with it; reading it is the difference between her there or not.
             Ev::Data(215, d) if !mixer_on && !channels.is_empty() => {
                 if let Some(n) = d.get(80) { channels.last_mut().unwrap().insert("normalize".into(), json!(*n != 0)); }
+                // time-stretch mode (PyFLP: -1 stretch, 0 RESAMPLE -- the one
+                // that shifts pitch -- 1.. the elastique modes; FL 20.7 also
+                // writes 12, which PyFLP's list does not name)
+                if let Some(m) = i32at(d, 112) { channels.last_mut().unwrap().insert("stretch_mode".into(), json!(m)); }
             }
             Ev::Data(219, d) if !mixer_on && !channels.is_empty() => {
                 let c = channels.last_mut().unwrap();

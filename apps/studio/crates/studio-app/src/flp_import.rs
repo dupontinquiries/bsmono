@@ -58,6 +58,11 @@ pub struct Media {
 pub struct Imported {
     pub project: Project,
     pub rack: Rack,
+    /// Audio FL time-stretched to tempo, as (file FL named, ratio, the file
+    /// the project reads instead): the caller makes each stretched copy
+    /// (the example uses ffmpeg `atempo`, pitch kept) -- FL keeps such a
+    /// cache too. Ratio = source seconds played per timeline second.
+    pub stretches: Vec<(String, f64, String)>,
     /// Everything approximated, skipped or refused, grouped, for a person.
     pub report: Vec<String>,
 }
@@ -193,13 +198,19 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     let mut sources: BTreeMap<String, SourceId> = BTreeMap::new();
     let mut missing: Vec<String> = Vec::new();
     let mut next_source = 1u64;
-    let mut source_for = |file: &str, ops: &mut Vec<Op>, missing: &mut Vec<String>| -> Option<(SourceId, Media)> {
+    // `stretched`: Some((copy's name, ratio)) for FL's time-stretched audio --
+    // a source of its own, the copy the caller makes (see `Imported::stretches`).
+    let mut source_for = |file: &str, ops: &mut Vec<Op>, missing: &mut Vec<String>, stretched: Option<(&str, f64)>| -> Option<(SourceId, Media)> {
         let m = probe(file);
         let Some(m) = m else { if !missing.contains(&file.to_string()) { missing.push(file.to_string()); } return None };
-        let id = *sources.entry(file.to_string()).or_insert_with(|| {
+        let (key, len, rate) = match stretched {
+            Some((name, r)) => (name.to_string(), Ticks::from_seconds(m.len.to_seconds() / r), 48_000),
+            None => (file.to_string(), m.len, m.rate),
+        };
+        let id = *sources.entry(key.clone()).or_insert_with(|| {
             let id = SourceId(next_source);
             next_source += 1;
-            ops.push(Op::AddSource { source: Source { id, path: file.to_string(), len: m.len, sample_rate: m.rate,
+            ops.push(Op::AddSource { source: Source { id, path: key.clone(), len, sample_rate: rate,
                 channels: m.channels, has_video: false, kind: SourceKind::File } });
             id
         });
@@ -239,7 +250,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         let plugin = if internal == "Fruity Wrapper" { "VST".to_string() } else { internal.clone() };
         let mut media: Option<Media> = None;
         let kind = if kind_s == "Sampler" || internal == "Fruity slicer" {
-            match file_of(c).and_then(|f| source_for(&f, &mut ops, &mut missing)) {
+            match file_of(c).and_then(|f| source_for(&f, &mut ops, &mut missing, None)) {
                 Some((id, m)) => {
                     media = Some(m);
                     if internal == "Fruity slicer" {
@@ -415,6 +426,8 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     let mut next_clip = 1u64;
     let mut pattern_sources: BTreeMap<usize, SourceId> = BTreeMap::new();
     let (mut automation_clips, mut placed, mut overflowed, mut declicked) = (0usize, 0usize, 0usize, 0usize);
+    let mut stretches: Vec<(String, f64, String)> = Vec::new();
+    let mut stretch_modes: BTreeMap<String, i64> = BTreeMap::new();
     let mut track_at = 0usize;
     for t in arr["tracks"].as_array().into_iter().flatten() {
         let items: Vec<&Value> = t["items"].as_array().into_iter().flatten().collect();
@@ -435,17 +448,45 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                     let Some(c) = i(&it["channel"]).and_then(|c| chans.get(&c)) else { continue };
                     if s(&c["kind"]) == Some("Automation") { automation_clips += 1; continue; }
                     let Some(file) = file_of(c) else { continue };
-                    let Some((id, m)) = source_for(&file, &mut ops, &mut missing) else { continue };
-                    let off = it["offsets"].as_array().and_then(|o| o.first()).and_then(|v| v.as_f64()).unwrap_or(-1.0);
+                    let Some((id, m)) = source_for(&file, &mut ops, &mut missing, None) else { continue };
+                    let offs: Vec<f64> = it["offsets"].as_array().into_iter().flatten().map(|v| v.as_f64().unwrap_or(-1.0)).collect();
+                    let off = offs.first().copied().unwrap_or(-1.0);
+                    // FL TIME-STRETCH: the file span a clip plays (its offsets, ms)
+                    // against its length on the timeline. Balance's "WHAM 100bpm"
+                    // plays 19.2 s of file in 12 s -- 100 -> 160 BPM.
+                    let ratio = match offs.as_slice() {
+                        [a, b] if *a >= 0.0 && *b > *a && len_t > Ticks::from_seconds(0.05) => (b - a) / 1000.0 / len_t.to_seconds(),
+                        _ => 1.0,
+                    };
+                    if (ratio - 1.0).abs() > 0.02 && (0.25..=4.0).contains(&ratio) {
+                        let r = (ratio * 1000.0).round() / 1000.0;
+                        let stem = std::path::Path::new(&file).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|| file.clone());
+                        let variant = format!("{stem}.stretch{r:.3}.opus");
+                        let Some((sid, _)) = source_for(&file, &mut ops, &mut missing, Some((&variant, r))) else { continue };
+                        if !stretches.iter().any(|(_, _, v)| *v == variant) { stretches.push((file.clone(), r, variant.clone())); }
+                        if let Some(mode) = i(&c["stretch_mode"]) { stretch_modes.insert(ch_name(c), mode); }
+                        let src_in = Ticks::from_seconds(off.max(0.0) / 1000.0 / r);
+                        let len = len_t.min(Ticks::from_seconds(m.len.to_seconds() / r).saturating_sub(src_in));
+                        if len > Ticks::ZERO { clips.push((sid, pos, src_in, len, channel_gain(c, Some(m)))); }
+                    } else {
                     let src_in = if off > 0.0 { Ticks::from_seconds(off / 1000.0) } else { Ticks::ZERO };
                     let len = len_t.min(m.len.saturating_sub(src_in));
                     if len > Ticks::ZERO { clips.push((id, pos, src_in, len, channel_gain(c, Some(m)))); }
+                    }
                     first_insert = first_insert.or(i(&c["insert"]));
                     label.get_or_insert_with(|| ch_name(c));
                 }
                 Some("PatternPLItem") => {
                     let Some(pid) = i(&it["pattern"]) else { continue };
-                    for (rp, from) in parts.get(&pid).into_iter().flatten() {
+                    // ONE pass. An FL pattern clip longer than its pattern does NOT
+                    // repeat it: c20 tried repeating (Balance's "kick" item runs to
+                    // 195 s) and the artist's render is SILENT from 192 s (-46.5 dB)
+                    // where the repeat played at -16 dB. The item's extra length is
+                    // silence. (Kept as a pass count, should a pattern ever say loop.)
+                    let cycle = parts.get(&pid).map(|v| v.iter().map(|(rp, _)| rack.patterns[*rp].steps).sum::<u32>()).unwrap_or(0);
+                    let passes = if cycle == 0 { 0 } else { 1 };
+                    let seq: Vec<(usize, u32)> = (0..passes).flat_map(|k| parts.get(&pid).into_iter().flatten().map(move |(rp, from)| (*rp, from + k * cycle))).collect();
+                    for (rp, from) in seq.iter() {
                         let part_at = at((*from as f64 * step_ticks) as i64);
                         if part_at >= len_t { continue; }
                         let part_len = at((rack.patterns[*rp].steps as f64 * step_ticks) as i64).min(len_t.saturating_sub(part_at));
@@ -544,6 +585,12 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     report.insert(0, format!("{placed} clips on {} tracks, {} rack channels, {} rack patterns, {} busses; {:.0} BPM",
         p.tracks.len(), rack.channels.len(), rack.patterns.len(), p.busses.len(), bpm));
     if overflowed > 0 { report.push(format!("{overflowed} clip{} overlapped another on its FL track (FL allows it) -- moved to an overflow track, marked (2)", if overflowed == 1 { "" } else { "s" })); }
+    if !stretches.is_empty() {
+        let mut by: BTreeMap<String, usize> = BTreeMap::new();
+        for (f, r, _) in &stretches { *by.entry(format!("{} x{r:.3}", std::path::Path::new(f).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default())).or_default() += 1; }
+        report.push(format!("time-stretched in FL (fit to tempo), played from stretched copies, pitch kept: {} -- FL's stretch modes here {:?} (0 would be Resample, which shifts pitch)",
+            by.keys().cloned().collect::<Vec<_>>().join(", "), stretch_modes.values().collect::<std::collections::BTreeSet<_>>()));
+    }
     if declicked > 0 { report.push(format!("{declicked} audio clips declicked: {:.0} ms fades at each edge, as FL does by default", DECLICK * 1000.0)); }
     if automation_clips > 0 { report.push(format!("{automation_clips} automation clip{} not imported (their points are not read yet)", if automation_clips == 1 { "" } else { "s" })); }
     if !approx.is_empty() { report.push(format!("effects read or approximated: {}", approx.join("; "))); }
@@ -587,7 +634,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     if panned > 0 { report.push(format!("{panned} insert pan{} imported as bus balance", if panned == 1 { "" } else { "s" })); }
     report.push("faders are FL's value / 12800 as linear gain: FL's fader law is not linear, so levels are close, not exact".into());
     if !missing.is_empty() { report.push(format!("media not found beside the project: {}", missing.join(", "))); }
-    Ok(Imported { project: p, rack, report })
+    Ok(Imported { project: p, rack, report, stretches })
 }
 
 #[cfg(test)]
@@ -629,7 +676,9 @@ mod tests {
                     {"kind": "ChannelPLItem", "channel": 3, "pos": 384, "len": 1152, "offsets": [2000.0, 8000.0]},
                     {"kind": "ChannelPLItem", "channel": 3, "pos": 768, "len": 192, "offsets": [-1.0, -1.0]},
                     {"kind": "ChannelPLItem", "channel": 4, "pos": 0, "len": 192}]},
-                {"iid": 3, "items": [{"kind": "PatternPLItem", "pattern": 2, "pos": 0, "len": 1728}]}
+                {"iid": 3, "items": [{"kind": "PatternPLItem", "pattern": 2, "pos": 0, "len": 1728}]},
+                {"iid": 4, "name": "Loops", "items": [{"kind": "ChannelPLItem", "channel": 3, "pos": 0, "len": 1152, "offsets": [1000.0, 13000.0]}]},
+                {"iid": 5, "name": "Beat x3", "items": [{"kind": "PatternPLItem", "pattern": 1, "pos": 0, "len": 1152}]}
             ]}],
             "mixer": [
                 {"iid": 0, "slots": [{"plugin": "Fruity Limiter"}, {"plugin": "Fruity Wrapper", "name": "Ozone 8"}]},
@@ -718,6 +767,27 @@ mod tests {
         assert_eq!(q["slide"], 0.0, "{} ms is a hold", q["speed"]);
         let odd = json!({"notes": [true, true, false, false, false, false, false, false, false, false, false, false]});
         assert_eq!(pitcher_params(&odd).0["mode"], 2.0, "not a scale Studio has: chromatic, and said");
+    }
+
+    /// A clip FL stretched: 12 s of file (offsets 1000..13000 ms) in 6 s of
+    /// timeline -- ratio 2. It plays from a stretched copy, from 0.5 s in.
+    /// And a pattern item three times its pattern's length plays it ONCE:
+    /// FL does not repeat it (Balance's render is silent where a repeat was).
+    #[test]
+    fn a_stretched_clip_reads_a_stretched_copy_and_a_long_pattern_item_repeats() {
+        let im = import(&inventory(), "demo", &probe).unwrap();
+        assert_eq!(im.stretches, vec![("vox.wav".to_string(), 2.0, "vox.stretch2.000.opus".to_string())]);
+        let t = im.project.tracks.iter().find(|t| t.name == "Loops").unwrap();
+        let c = &im.project.track_clips(t.id)[0];
+        let src = &im.project.sources[&c.source];
+        assert_eq!(src.path, "vox.stretch2.000.opus");
+        assert!((src.len.to_seconds() - 15.0).abs() < 1e-6, "30 s at ratio 2");
+        assert!((c.src_in.to_seconds() - 0.5).abs() < 1e-6 && (c.len.to_seconds() - 6.0).abs() < 1e-6, "{:?}", c);
+        assert!(im.report.iter().any(|r| r.contains("vox x2.000")), "{:?}", im.report);
+        let b = im.project.tracks.iter().find(|t| t.name == "Beat x3").unwrap();
+        let clips = im.project.track_clips(b.id);
+        assert_eq!(clips.len(), 1, "one pass, not three: {clips:?}");
+        assert!((clips[0].len.to_seconds() - 2.0).abs() < 1e-6, "the pattern's own length");
     }
 
     #[test]
