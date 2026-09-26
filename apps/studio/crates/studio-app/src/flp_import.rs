@@ -607,6 +607,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     }
     for v in pitch_segs.values_mut().chain(vol_segs.values_mut()) { v.sort_by(|a, b| a.t0.total_cmp(&b.t0)); }
     let mut bakes: Vec<Bake> = Vec::new();
+    let mut stretched_automated = 0usize;
     let mut range_notes: Vec<String> = Vec::new();
     // channels whose pitch has an automation clip ("<channel> - Channel pitch[ #n]")
     let pitch_automated: std::collections::BTreeSet<String> = chans.values()
@@ -659,7 +660,25 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                     let cname = ch_name(c);
                     let (t0, t1) = (pos.to_seconds(), pos.to_seconds() + len_t.to_seconds());
                     let touches = |segs: Option<&Vec<AutoSeg>>| segs.is_some_and(|v| v.iter().any(|s| s.t0 < t1) );
-                    let baked = (touches(pitch_segs.get(&cname)) || touches(vol_segs.get(&cname))) && offs.iter().all(|o| *o < 0.0);
+                    // A clip that starts PARTWAY into its file bakes from there, when it
+                    // is not time-stretched (its file span equals its length) -- A Top
+                    // A Tower's burning_fire rides and later Pattern 2 dives. Stretched
+                    // AND automated is not baked yet (counted, said).
+                    let span_ratio = match offs.as_slice() {
+                        [a, b] if *a >= 0.0 && *b > *a && len_t > Ticks::from_seconds(0.05) => (b - a) / 1000.0 / len_t.to_seconds(),
+                        _ => 1.0,
+                    };
+                    let automated = touches(pitch_segs.get(&cname)) || touches(vol_segs.get(&cname));
+                    // On a PITCH-automated channel an off-1 span is not a stretch: it is
+                    // the varispeed of the pitch the automation holds there -- A Top A
+                    // Tower's later Pattern 2 clips read 0.724 of their length = 2^(-560
+                    // /1200), the -560 cents the intro's dive left the knob at. The curve
+                    // plays them at exactly that speed, so they bake. (First read as
+                    // "stretched and automated" -- 33 clips left unbaked.)
+                    let pitch_automated_here = pitch_segs.contains_key(&cname);
+                    let is_stretch = (span_ratio - 1.0).abs() > 0.02 && !pitch_automated_here;
+                    if automated && is_stretch { stretched_automated += 1; }
+                    let baked = automated && !is_stretch;
                     if baked {
                         // pitch: the automation's slice of the knob, times the bend range --
                         // inferred as the one that puts the SAVED pitch on an extreme of
@@ -694,7 +713,8 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                         // decoded, 50.98 s declared): pass the ratio that makes it so
                         let as_long = (m.len.to_seconds() / len_t.to_seconds().max(1e-6)).max(1e-9);
                         let Some((sid, _)) = source_for(&file, &mut ops, &mut missing, Some((&variant, as_long))) else { continue };
-                        bakes.push(Bake { file: file.clone(), variant, start: 0.0, len: len_t.to_seconds(), cents, gain });
+                        bakes.push(Bake { file: file.clone(), variant, start: offs.first().copied().unwrap_or(-1.0).max(0.0) / 1000.0,
+                                          len: len_t.to_seconds(), cents, gain });
                         clips.push((sid, pos, Ticks::ZERO, len_t, channel_gain_for(c, Some(m), true)));
                         first_insert = first_insert.or(i(&c["insert"]));
                         label.get_or_insert_with(|| ch_name(c));
@@ -924,6 +944,10 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
     if panned > 0 { report.push(format!("{panned} insert pan{} imported as bus balance", if panned == 1 { "" } else { "s" })); }
     report.push(format!("levels by FL's volume laws: channel knob (v/12800)^{FL_KNOB_EXP} (78% = -5.2 dB; audio clips +{FL_CLIP_OFFSET_DB} dB), mixer fader and sends (v/12800)^{FL_FADER_EXP} (80% = 0 dB, 100% = +5.6 dB) -- through Image-Line's published points; the curve between them is assumed, so close, not exact"));
     if !missing.is_empty() { report.push(format!("media not found beside the project: {}", missing.join(", "))); }
+    if stretched_automated > 0 {
+        report.push(format!("{stretched_automated} clip{} both time-stretched and automated: played stretched, automation NOT applied yet",
+            if stretched_automated == 1 { "" } else { "s" }));
+    }
     if !bakes.is_empty() {
         report.push(format!("AUTOMATION rendered into {} clip{} (varispeed pitch, gain): {}", bakes.len(), if bakes.len() == 1 { "" } else { "s" },
             if range_notes.is_empty() { "volume only".to_string() } else { range_notes.join("; ") }));
@@ -981,7 +1005,8 @@ mod tests {
                     {"kind": "ChannelPLItem", "channel": 3, "pos": 0, "len": 384, "offsets": [-1.0, -1.0], "flags": 8256}]},
                 {"iid": 7, "name": "Slowed", "items": [{"kind": "ChannelPLItem", "channel": 5, "pos": 0, "len": 4800, "offsets": [-1.0, -1.0]}]},
                 {"iid": 8, "name": "Tape", "items": [{"kind": "ChannelPLItem", "channel": 8, "pos": 0, "len": 1920, "offsets": [-1.0, -1.0]},
-                                                     {"kind": "ChannelPLItem", "channel": 9, "pos": 384, "len": 768}]},
+                                                     {"kind": "ChannelPLItem", "channel": 9, "pos": 384, "len": 768},
+                                                     {"kind": "ChannelPLItem", "channel": 8, "pos": 2400, "len": 384, "offsets": [5000.0, 7000.0]}]},
                 {"iid": 5, "name": "Beat x3", "items": [{"kind": "PatternPLItem", "pattern": 1, "pos": 0, "len": 1152}]},
                 {"iid": 6, "name": "Cut beat", "items": [{"kind": "PatternPLItem", "pattern": 2, "pos": 384, "len": 1536, "start_ticks": 1344, "end_ticks": 2880}]}
             ]}],
@@ -1156,7 +1181,12 @@ mod tests {
     #[test]
     fn an_automated_clip_is_baked_through_its_pitch_curve() {
         let im = import(&inventory(), "demo", &probe).unwrap();
-        assert_eq!(im.bakes.len(), 1, "{:?}", im.bakes.iter().map(|b| &b.variant).collect::<Vec<_>>());
+        assert_eq!(im.bakes.len(), 2, "{:?}", im.bakes.iter().map(|b| &b.variant).collect::<Vec<_>>());
+        // the second: a clip reading 5-7 s of its file, after the automation
+        // ended -- baked FROM 5 s, at the held -560 cents (the tape-stop case)
+        let late = &im.bakes[1];
+        assert!((late.start - 5.0).abs() < 1e-9 && (late.len - 2.0).abs() < 1e-9, "{} {}", late.start, late.len);
+        assert!(late.cents.iter().all(|c| (c.1 + 560.0).abs() < 1.0), "held where the dive left it");
         let b = &im.bakes[0];
         assert_eq!(b.variant, "vox.auto1.opus");
         assert!((b.len - 10.0).abs() < 1e-9);
@@ -1168,7 +1198,7 @@ mod tests {
         let src = im.project.sources.values().find(|s| s.path == "vox.auto1.opus").unwrap();
         assert!((src.len.to_seconds() - 10.0).abs() < 1e-6, "the rendered copy is the clip's length, not the file's: {}", src.len.to_seconds());
         assert!(!im.varispeeds.iter().any(|(f, _, _)| f == "vox.wav" && im.bakes.iter().any(|b| b.file == *f) && false));
-        assert!(im.report.iter().any(|r| r.contains("AUTOMATION rendered into 1 clip") && r.contains("+-560 cents")), "{:?}", im.report);
+        assert!(im.report.iter().any(|r| r.contains("AUTOMATION rendered into 2 clips") && r.contains("+-560 cents")), "{:?}", im.report);
     }
 
     #[test]
