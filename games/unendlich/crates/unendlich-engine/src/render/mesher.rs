@@ -3430,6 +3430,67 @@ fn top_subdivision() -> i32 {
 /// `player_view_for_plant_lod` once this consumer made the old name
 /// inaccurate -- see git history for the plant-only version this started
 /// as).
+/// Weathered-top LOD for one block: `(nsub, blend)`. Levels NEST (the base,
+/// then halved: 8, 4, 2, 1) so a coarser level's vertices are a subset of the
+/// finer one's; `blend` (0..1) is how far this block has morphed toward the
+/// next coarser level (`morph_toward_coarser`), so the surface changes
+/// smoothly with distance instead of stepping where the level drops. No player
+/// view (tests, headless tools): full detail, blend 0 -- as before.
+fn top_lod_for_block(pos: [f32; 3]) -> (i32, f32) {
+    let base = top_subdivision();
+    let Some((eye, yaw)) = player_view_for_decoration_lod::get() else {
+        return (base, 0.0);
+    };
+    let d = ((pos[0] - eye[0]).powi(2) + (pos[1] - eye[1]).powi(2) + (pos[2] - eye[2]).powi(2)).sqrt();
+    let to = [pos[0] - eye[0], pos[2] - eye[2]];
+    let len = (to[0] * to[0] + to[1] * to[1]).sqrt().max(1e-3);
+    let facing = (yaw.cos() * to[0] + yaw.sin() * to[1]) / len; // 1 ahead, -1 behind
+    lod_for(base, d, facing)
+}
+
+/// Near this distance (blocks) the top keeps full detail.
+const TOP_LOD_NEAR: f32 = 16.0;
+
+/// The continuous weathered-top level for a block `d` blocks away, `facing`
+/// (1 straight ahead .. -1 behind): 0 = the base subdivision, rising smoothly
+/// to the coarsest level at DECORATION_LOD_RANGE, plus up to one level more
+/// behind the player (smoothly by angle). Returns (nsub, blend).
+fn lod_for(base: i32, d: f32, facing: f32) -> (i32, f32) {
+    let levels = (base.max(1) as f32).log2(); // 8 -> 3 levels down to 1
+    let t = ((d - TOP_LOD_NEAR) / (DECORATION_LOD_RANGE - TOP_LOD_NEAR)).clamp(0.0, 1.0);
+    let smooth = t * t * (3.0 - 2.0 * t);
+    let behind = (1.0 - facing.clamp(-1.0, 1.0)) * 0.5; // 0 ahead .. 1 behind
+    let l = (smooth * levels + behind).clamp(0.0, levels);
+    let level = l.floor();
+    let nsub = (base >> (level as i32)).max(1);
+    let blend = if nsub <= 1 { 0.0 } else { l - level };
+    (nsub, blend)
+}
+
+/// Geomorph: move the vertices that exist only at this level toward where the
+/// next coarser level (half the subdivisions) interpolates them. At blend 1
+/// the surface IS the coarser one, so dropping a level changes nothing.
+/// `h` is the (nsub+1)^2 height grid, index i*(nsub+1)+j; even-indexed
+/// vertices are shared with the coarser level and never move.
+fn morph_toward_coarser(h: &mut [f32], nsub: usize, blend: f32) {
+    if blend <= 0.0 || nsub < 2 || nsub % 2 != 0 { return; }
+    let st = nsub + 1;
+    let orig = h.to_vec();
+    let at = |i: usize, j: usize| orig[i * st + j];
+    for i in 0..=nsub {
+        for j in 0..=nsub {
+            let coarse = match (i % 2, j % 2) {
+                (0, 0) => continue,
+                (1, 0) => 0.5 * (at(i - 1, j) + at(i + 1, j)),
+                (0, _) => 0.5 * (at(i, j - 1) + at(i, j + 1)),
+                _ => 0.25 * (at(i - 1, j - 1) + at(i + 1, j - 1) + at(i - 1, j + 1) + at(i + 1, j + 1)),
+            };
+            h[i * st + j] = orig[i * st + j] + (coarse - orig[i * st + j]) * blend.clamp(0.0, 1.0);
+        }
+    }
+}
+
+#[allow(dead_code)] // superseded by top_lod_for_block (nesting levels + blend)
 fn top_subdivision_for_block(pos: [f32; 3]) -> i32 {
     let base = top_subdivision();
     let Some((eye, yaw)) = player_view_for_decoration_lod::get() else {
@@ -3700,7 +3761,7 @@ pub(crate) fn emit_subdivided_top(
     // view has been published (tests, headless tools). Index: i × (nsub+1) + j.
     // (named `nsub`, not `N`, because a module-level `const N: usize`
     // is in scope and `let N` would be read as a const-pattern.)
-    let nsub: i32 = top_subdivision_for_block([block_wx as f32, block_wy as f32, block_wz as f32]);
+    let (nsub, lod_blend): (i32, f32) = top_lod_for_block([block_wx as f32, block_wy as f32, block_wz as f32]);
     // r-mesh-diag: count this call and its quad output. See the
     // MeshDiagCounts doc for why this is safe to add unconditionally
     // (thread-local, read-only observer, zero behavior change).
@@ -3709,7 +3770,7 @@ pub(crate) fn emit_subdivided_top(
 
     let inv_n = 1.0 / (nsub as f32);
     let base_idx = mesh.vertices.len() as u32;
-
+    let mut heights: Vec<f32> = Vec::with_capacity(((nsub + 1) * (nsub + 1)) as usize);
     for i in 0..=nsub {
         for j in 0..=nsub {
             let s = i as f32 * inv_n; // 0..1 along X
@@ -3747,11 +3808,17 @@ pub(crate) fn emit_subdivided_top(
                 (edge_min * 4.0).clamp(0.0, 1.0)
             };
             let detail = bumpy_height(wx, wz, softness, weathering) * corner_mask;
-            let dy = corner_lerp + detail;
-            mesh.vertices.push(Vertex::new(
-                [wx, block_wy_f + dy, wz],
-                color,
-            ));
+            heights.push(corner_lerp + detail);
+        }
+    }
+    // The distance blend (top_lod_for_block): odd vertices slide toward the
+    // next coarser level's surface as the block nears that level's distance.
+    morph_toward_coarser(&mut heights, nsub as usize, lod_blend);
+    for i in 0..=nsub {
+        for j in 0..=nsub {
+            let (wx, wz) = (block_wx as f32 + i as f32 * inv_n, block_wz as f32 + j as f32 * inv_n);
+            let dy = heights[(i * (nsub + 1) + j) as usize];
+            mesh.vertices.push(Vertex::new([wx, block_wy_f + dy, wz], color));
         }
     }
 
@@ -5298,6 +5365,32 @@ mod tests {
     /// soft block's top face is 4 verts; with it, 81. The dispatch
     /// chooses subdivision when weathering > 0.05 (which is true for
     /// world-generated soft blocks).
+    #[test]
+    fn the_weathered_top_blend_is_seamless_across_levels() {
+        let h8: Vec<f32> = (0..81).map(|k| ((k * 37 % 11) as f32) * 0.01).collect();
+        let mut same = h8.clone();
+        morph_toward_coarser(&mut same, 8, 0.0);
+        assert_eq!(same, h8, "blend 0: untouched");
+        let mut full = h8.clone();
+        morph_toward_coarser(&mut full, 8, 1.0);
+        // Blend 1 IS the 4x4 surface: shared vertices keep their heights, the
+        // rest lie on its bilinear interpolation.
+        for i in (0..=8).step_by(2) { for j in (0..=8).step_by(2) { assert_eq!(full[i * 9 + j], h8[i * 9 + j]); } }
+        assert!((full[9] - 0.5 * (h8[0] + h8[18])).abs() < 1e-6);
+        assert!((full[10] - 0.25 * (h8[0] + h8[18] + h8[2] + h8[20])).abs() < 1e-6);
+        assert_eq!(lod_for(8, 5.0, 1.0), (8, 0.0), "full detail near");
+        let mut last = (8, 0.0f32);
+        for d in (0..=110).step_by(5) {
+            let (n, b) = lod_for(8, d as f32, 1.0);
+            assert!([8, 4, 2, 1].contains(&n), "nesting levels only: {n}");
+            assert!(n < last.0 || (n == last.0 && b >= last.1 - 1e-6), "coarser or equal with distance at {d}: {last:?} -> {:?}", (n, b));
+            last = (n, b);
+        }
+        assert_eq!(lod_for(8, 200.0, 1.0).0, 1, "coarsest past the range");
+        let back = lod_for(8, 5.0, -1.0);
+        assert!(back.0 == 4 && back.1 < 1e-6, "behind: one level coarser: {back:?}");
+    }
+
     #[test]
     fn subdivided_top_emits_grid_for_soft_block() {
         use crate::world::chunk::{Chunk, ChunkCoord};
