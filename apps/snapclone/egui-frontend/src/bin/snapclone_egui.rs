@@ -254,6 +254,10 @@ struct App {
     sending: Vec<std::thread::JoinHandle<()>>,
     /// Results from those threads.
     send_results: Arc<Mutex<Vec<(String, Result<(), String>)>>>,
+    /// An export running on its own thread, and where it reports. Archiving a
+    /// month of photos takes seconds; the UI thread must not wait for zip.
+    export_result: Arc<Mutex<Option<snapclone_egui::snap_export::Outcome>>>,
+    exporting: Option<std::thread::JoinHandle<()>>,
     rig: CaptureRig,
     /// The plan is printed once per start, not per frame: the pipeline
     /// strings are the debuggable artifact, and a log that repeats them at
@@ -261,6 +265,8 @@ struct App {
     plan_logged: bool,
     /// Last reported focus, so the change is sent once rather than every frame.
     focused: bool,
+    /// When stored snaps were last swept against retention.
+    last_sweep: Option<i64>,
     /// The discovery socket, or None when the port was unavailable. Absent
     /// rather than fatal: an app that refuses to start because something else
     /// holds 9877 is worse than one that runs without discovery and says so.
@@ -384,9 +390,10 @@ impl App {
             }
         };
 
-        Self { snap, ime_repair: Default::default(), snaps_in, accel: None, glove_probed: false,
+        Self { snap, ime_repair: Default::default(), last_sweep: None, snaps_in, accel: None, glove_probed: false,
                last_snap: None, last_live: None, scan_frames: 0, sending: Vec::new(),
                send_results: Arc::new(Mutex::new(Vec::new())),
+               export_result: Arc::new(Mutex::new(None)), exporting: None,
                voice: VoiceRig::idle(), rig: CaptureRig::idle(),
                nat: snapclone_egui::nat_traversal::Traversal::new(""), nat_id: String::new(),
                last_stun_ms: None, stun_resolve: None,
@@ -927,6 +934,68 @@ impl App {
     ///
     /// Attribution happens HERE rather than on the listener thread, because
     /// it needs the peer list and that thread must not borrow the app.
+    /// Delete stored snaps older than the retention window (Settings >
+    /// Storage > keep days / keep everything). Hourly: retention is measured in
+    /// days, and a directory listing a minute is battery for nothing. The file
+    /// names carry the capture time (`save_snap`), and only names of that form
+    /// are ever candidates (`snap_expiry::due_for_purge`).
+    fn sweep_snaps(&mut self, now_secs: i64) {
+        const EVERY_SECS: i64 = 3600;
+        if self.last_sweep.is_some_and(|t| now_secs - t < EVERY_SECS) {
+            return;
+        }
+        self.last_sweep = Some(now_secs);
+        let dir = config_kit::data_dir("snapclone").join("snaps");
+        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        let names: Vec<String> = entries.filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok()).collect();
+        let due = snapclone_egui::snap_expiry::due_for_purge(
+            names.iter().map(|n| n.as_str()), now_secs.max(0) as u64, &self.snap.retention());
+        let mut removed = 0;
+        for n in &due {
+            match std::fs::remove_file(dir.join(n)) {
+                Ok(()) => removed += 1,
+                Err(e) => eprintln!("snapclone: could not delete expired snap {n}: {e}"),
+            }
+        }
+        if removed > 0 {
+            eprintln!("snapclone: deleted {removed} snap(s) past the retention window");
+        }
+    }
+
+    /// Run the export the user asked for. This command reached the binary's
+    /// catch-all ("unhandled host command") -- the Storage page's Export button
+    /// logged a line and did nothing. `snap_export` had the plan, the argv and the
+    /// outcome messages all along; this is the host that runs them.
+    fn start_export(&mut self, dest_dir: String) {
+        if self.exporting.as_ref().is_some_and(|h| !h.is_finished()) {
+            return; // one at a time; a second tap while zip runs is not a second archive
+        }
+        let snaps = config_kit::data_dir("snapclone").join("snaps");
+        let home = std::env::var("HOME").unwrap_or_default();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs()).unwrap_or(0);
+        let slot = self.export_result.clone();
+        self.exporting = Some(std::thread::spawn(move || {
+            let on_path = |prog: &str| std::env::var_os("PATH").is_some_and(|p| {
+                std::env::split_paths(&p).any(|d| d.join(prog).is_file())
+            });
+            let outcome = snapclone_egui::snap_export::run(
+                &snaps, &dest_dir, &home, now, on_path("zip"), on_path("tar"));
+            if let Ok(mut r) = slot.lock() { *r = Some(outcome); }
+        }));
+    }
+
+    /// Hand a finished export's outcome to the app (it shows the message).
+    fn pump_export(&mut self) {
+        let done = self.export_result.lock().ok().and_then(|mut r| r.take());
+        if let Some(o) = done {
+            eprintln!("snapclone: export: {}", o.message());
+            let cmds = self.snap.apply(HostEvent::ExportFinished(o));
+            self.handle(cmds);
+        }
+    }
+
     fn pump_snaps(&mut self) {
         let Some(l) = self.snaps_in.as_ref() else { return };
         let arrivals = l.inbox.drain();
@@ -1316,6 +1385,7 @@ impl App {
                                    viewed snaps may reappear after a restart");
                     }
                 }
+                HostCommand::ExportSnaps { dest_dir } => self.start_export(dest_dir),
                 other => eprintln!("snapclone: unhandled host command: {other:?}"),
             }
         }
@@ -1398,6 +1468,8 @@ impl eframe::App for App {
         self.pump_voice();
         self.pump_snaps();
         self.pump_sends();
+        self.sweep_snaps(now_secs);
+        self.pump_export();
 
         // Discovery is time-driven, not input-driven, so the frame has to
         // come round on its own or an idle window never polls the socket —

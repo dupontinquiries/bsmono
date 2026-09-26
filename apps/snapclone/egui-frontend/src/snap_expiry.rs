@@ -140,8 +140,63 @@ impl KnownHashes {
     }
 }
 
+/// The capture time and kind of a stored snap, from its file name.
+///
+/// The app writes its snaps as `snap-<unix ms>.<ext>` (`save_snap` in the
+/// binary), so the name carries the one fact retention needs. Anything else in
+/// the directory -- the exported code SVG, a user's own file -- is `None` and is
+/// never a purge candidate: a sweep that deletes by pattern must only ever
+/// match the pattern it wrote.
+pub fn stored_snap(name: &str) -> Option<(u64, MediaType)> {
+    let rest = name.strip_prefix("snap-")?;
+    let (ms, ext) = rest.split_once('.')?;
+    if ms.is_empty() || !ms.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let media = match ext.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" | "png" | "webp" | "ppm" | "avif" => MediaType::Image,
+        "mp4" | "webm" | "mkv" | "ivf" | "y4m" => MediaType::Video,
+        _ => return None,
+    };
+    Some((ms.parse().ok()?, media))
+}
+
+/// Which stored snaps retention says to delete now. Names not written by the
+/// app are never returned; with `keep_everything` nothing is.
+pub fn due_for_purge<'a>(names: impl IntoIterator<Item = &'a str>, now_secs: u64, r: &Retention) -> Vec<String> {
+    names.into_iter()
+        .filter(|n| stored_snap(n).is_some_and(|(ms, media)| is_expired(expiry_at(ms / 1000, media, r), now_secs)))
+        .map(|n| n.to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    /// Only the app's own snap files, only once they are older than the window,
+    /// never with keep_everything, and never the code SVG beside them.
+    #[test]
+    fn the_sweep_deletes_only_expired_snaps_the_app_wrote() {
+        let day = 24 * 3600u64;
+        let now = 1000 * day;
+        let at = |days_ago: u64| (now - days_ago * day) * 1000;
+        let names = vec![
+            format!("snap-{}.jpg", at(31)),
+            format!("snap-{}.jpg", at(29)),
+            format!("snap-{}.mp4", at(40)),
+            "sc-aabbccdd.svg".to_string(),
+            "snap-notanumber.jpg".to_string(),
+            format!("snap-{}.txt", at(400)),
+            "holiday.jpg".to_string(),
+        ];
+        let r = Retention { days: 30, ..Retention::default() };
+        let due = due_for_purge(names.iter().map(|s| s.as_str()), now, &r);
+        assert_eq!(due, vec![names[0].clone(), names[2].clone()]);
+        let keep = Retention { keep_everything: true, ..r };
+        assert!(due_for_purge(names.iter().map(|s| s.as_str()), now, &keep).is_empty());
+        let week = Retention { days: 7, ..r };
+        assert_eq!(due_for_purge(names.iter().map(|s| s.as_str()), now, &week).len(), 3, "the day count is honoured");
+    }
+
     use super::*;
 
     const DAY: u64 = 24 * 3600;

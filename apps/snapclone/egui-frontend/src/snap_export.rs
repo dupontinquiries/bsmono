@@ -133,8 +133,98 @@ pub fn plan(file_count: usize, requested: &str, has_zip: bool, has_tar: bool)
     }
 }
 
+/// The archive path to ask for: `<dest>/snapclone-snaps-<epoch>.zip`, where
+/// `dest` is the chosen export folder or, when none is set, `home`. The epoch
+/// keeps two exports on one day from overwriting each other; the extension is
+/// corrected to the tool that actually runs by [`output_path`].
+///
+/// The destination must not be the snaps directory itself: the archiver runs
+/// from inside it and would try to add the archive to itself.
+pub fn requested_path(dest_dir: &str, home: &str, snaps_dir: &str, now_secs: u64) -> Result<String, Outcome> {
+    let dest = if dest_dir.trim().is_empty() { home } else { dest_dir.trim() };
+    let dest = dest.trim_end_matches('/');
+    if dest.is_empty() {
+        return Err(Outcome::Failed("no export folder and no home directory".into()));
+    }
+    if dest == snaps_dir.trim_end_matches('/') {
+        return Err(Outcome::Failed("the export folder is the snaps folder itself — choose another".into()));
+    }
+    Ok(format!("{dest}/snapclone-snaps-{now_secs}.zip"))
+}
+
+/// Run a whole export: count the app's snap files in `snaps`, plan, run the
+/// archiver from inside `snaps`, report. Blocking -- the host calls it on its own
+/// thread. `has_zip` / `has_tar` are the host's PATH probe, passed in so a test
+/// can choose the tool.
+///
+/// Only files the app wrote (`snap_expiry::stored_snap`) are COUNTED; the
+/// archivers take the directory, which also holds the code SVG -- harmless in a
+/// backup, and filtering the argv per file would hit argument limits on a year
+/// of snaps.
+pub fn run(snaps: &std::path::Path, dest_dir: &str, home: &str, now_secs: u64,
+           has_zip: bool, has_tar: bool) -> Outcome {
+    let go = || -> Result<Outcome, Outcome> {
+        let files = std::fs::read_dir(snaps).map(|it| it.filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_str().is_some_and(|n| crate::snap_expiry::stored_snap(n).is_some()))
+            .count()).unwrap_or(0);
+        let requested = requested_path(dest_dir, home, &snaps.display().to_string(), now_secs)?;
+        let (tool, out) = plan(files, &requested, has_zip, has_tar)?;
+        if let Some(parent) = std::path::Path::new(&out).parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Outcome::Failed(format!("{}: {e}", parent.display())))?;
+        }
+        let status = std::process::Command::new(tool.program())
+            .args(argv(tool, &out))
+            .current_dir(snaps)
+            .status()
+            .map_err(|e| Outcome::Failed(format!("{}: {e}", tool.program())))?;
+        if status.success() {
+            Ok(Outcome::Wrote { path: out, files })
+        } else {
+            Err(Outcome::Failed(format!("{} exited with {status}", tool.program())))
+        }
+    };
+    go().unwrap_or_else(|e| e)
+}
+
 #[cfg(test)]
 mod tests {
+    /// End to end with the real `tar`: two snaps in, an archive out in the chosen
+    /// folder holding them; an empty folder is Empty, not an archive.
+    #[test]
+    fn an_export_really_writes_an_archive_with_the_snaps_in_it() {
+        let has_tar = std::process::Command::new("tar").arg("--version").output().is_ok();
+        assert!(has_tar, "this test needs tar on PATH");
+        let root = std::env::temp_dir().join(format!("snapclone-export-{}", std::process::id()));
+        let snaps = root.join("snaps");
+        let dest = root.join("out");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&snaps).unwrap();
+        assert_eq!(run(&snaps, dest.to_str().unwrap(), "/nonexistent", 5, false, true), Outcome::Empty);
+        std::fs::write(snaps.join("snap-1000.jpg"), b"one").unwrap();
+        std::fs::write(snaps.join("snap-2000.jpg"), b"two").unwrap();
+        match run(&snaps, dest.to_str().unwrap(), "/nonexistent", 5, false, true) {
+            Outcome::Wrote { path, files } => {
+                assert_eq!(files, 2);
+                assert!(path.ends_with("snapclone-snaps-5.tar.gz"), "{path}");
+                let list = std::process::Command::new("tar").args(["-tzf", &path]).output().unwrap();
+                let list = String::from_utf8_lossy(&list.stdout);
+                assert!(list.contains("snap-1000.jpg") && list.contains("snap-2000.jpg"), "archive holds: {list}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(run(&snaps, dest.to_str().unwrap(), "/x", 5, false, false), Outcome::NoTool);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_archive_goes_to_the_chosen_folder_or_home_never_into_itself() {
+        assert_eq!(requested_path("/media/sd/", "/home/kd", "/home/kd/.local/share/snapclone/snaps", 7).unwrap(),
+                   "/media/sd/snapclone-snaps-7.zip");
+        assert_eq!(requested_path("  ", "/home/kd", "/x/snaps", 7).unwrap(), "/home/kd/snapclone-snaps-7.zip");
+        assert!(requested_path("/x/snaps/", "/home/kd", "/x/snaps", 7).is_err(), "archiving into the source folder");
+        assert!(requested_path("", "", "/x/snaps", 7).is_err());
+    }
+
     use super::*;
 
     #[test]

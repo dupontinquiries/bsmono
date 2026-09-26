@@ -263,8 +263,11 @@ pub enum HostEvent {
 pub enum HostCommand {
     /// Capture a frame — the shutter was pressed.
     CaptureSnap,
-    /// Run the export the user asked for.
-    ExportSnaps,
+    /// Run the export the user asked for, into `dest_dir` (Settings >
+    /// Storage > export folder; empty means the host's default, the home
+    /// directory). The destination travels with the command so the host does
+    /// not read the settings page's state behind the app's back.
+    ExportSnaps { dest_dir: String },
     /// Retry the sends that failed.
     RetryFailedSends,
     /// Write these snaps out; the user chose to keep them.
@@ -730,7 +733,9 @@ impl Snapclone {
         if std::mem::take(&mut self.contacts_dirty) {
             out.push(HostCommand::SaveContacts(Box::new(self.contact_book.clone())));
         }
-        if std::mem::take(&mut self.export_requested) { out.push(HostCommand::ExportSnaps); }
+        if std::mem::take(&mut self.export_requested) {
+            out.push(HostCommand::ExportSnaps { dest_dir: self.settings.saved().storage.export_dir.clone() });
+        }
         if std::mem::take(&mut self.retry_requested) { out.push(HostCommand::RetryFailedSends); }
         out
     }
@@ -866,8 +871,19 @@ mod tests {
         s.snaps_saved.push("snap-1".into());
         let out = s.apply(HostEvent::Tick { now_secs: 1 });
         assert!(out.contains(&HostCommand::CaptureSnap));
-        assert!(out.contains(&HostCommand::ExportSnaps));
+        assert!(out.iter().any(|c| matches!(c, HostCommand::ExportSnaps { .. })));
         assert!(out.contains(&HostCommand::KeepSnap("snap-1".into())));
+    }
+
+    /// The export goes where Settings > Storage says -- the saved value, which
+    /// is what the user confirmed.
+    #[test]
+    fn the_export_carries_the_folder_the_settings_chose() {
+        let mut s = app();
+        s.settings.persist_field(|x| x.storage.export_dir = "/media/sd/backup".into());
+        s.export_requested = true;
+        let out = s.drain_commands();
+        assert!(out.contains(&HostCommand::ExportSnaps { dest_dir: "/media/sd/backup".into() }), "{out:?}");
     }
 
     #[test]
@@ -880,7 +896,7 @@ mod tests {
         s.export_requested = true;
         let out = s.drain_commands();
         let cap = out.iter().position(|c| *c == HostCommand::CaptureSnap).unwrap();
-        let exp = out.iter().position(|c| *c == HostCommand::ExportSnaps).unwrap();
+        let exp = out.iter().position(|c| matches!(c, HostCommand::ExportSnaps { .. })).unwrap();
         assert!(cap < exp, "{out:?}");
     }
 

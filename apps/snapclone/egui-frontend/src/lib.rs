@@ -5487,6 +5487,18 @@ impl Snapclone {
         }
     }
 
+    /// Retention as the user set it (Settings > Storage): the window stored
+    /// snaps are swept against. `keep_days` 0 with keep-everything off is refused
+    /// by the page's validation; `media_secs` floors it at a day regardless.
+    pub fn retention(&self) -> crate::snap_expiry::Retention {
+        let st = &self.settings.saved().storage;
+        crate::snap_expiry::Retention {
+            days: st.keep_days,
+            keep_everything: st.keep_everything,
+            ..Default::default()
+        }
+    }
+
     /// The palette the app draws with: this app's own choice (Settings > General >
     /// palette, live while it is being picked, so the picker previews), else the
     /// cross-app `settings_kit` palette.
@@ -6810,6 +6822,12 @@ mod tests {
         s.settings.persist_field(|x| x.general.proximity_screensaver = true);
         s.refresh_posture_arming(0);
         assert!(s.posture.armed(), "the screensaver did not arm with the setting on");
+
+        // Retention comes from Storage, for the stored-snap sweep.
+        s.settings.persist_field(|x| { x.storage.keep_days = 7; x.storage.keep_everything = false; });
+        assert_eq!((s.retention().days, s.retention().keep_everything), (7, false));
+        s.settings.persist_field(|x| x.storage.keep_everything = true);
+        assert!(s.retention().keep_everything);
     }
 
     #[test]
