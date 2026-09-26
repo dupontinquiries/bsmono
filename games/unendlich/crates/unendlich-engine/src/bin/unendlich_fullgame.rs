@@ -2956,6 +2956,19 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     };
     let mut hand_pose_debug: Option<(unendlich_engine::sim::weapon_motion::Motion, f32)> =
         std::env::var("UNENDLICH_HAND_POSE").ok().and_then(|v| parse_hand_pose(&v));
+    // UNENDLICH_VIEW=<x>,<y>,<z>,<yaw°>,<pitch°> pins the eye at a world position and
+    // gaze (creative, no body), for screenshots of a particular hillside or cave.
+    // UNENDLICH_VIEW=file:<path> re-reads that line every frame, so one soak can be
+    // moved around without a restart.
+    let view_pin_file: Option<String> = std::env::var("UNENDLICH_VIEW")
+        .ok()
+        .and_then(|v| v.strip_prefix("file:").map(|p| p.to_string()));
+    let parse_view_pin = |v: &str| -> Option<[f32; 5]> {
+        let f: Vec<f32> = v.trim().split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        (f.len() == 5).then(|| [f[0], f[1], f[2], f[3].to_radians(), f[4].to_radians()])
+    };
+    let mut view_pin: Option<[f32; 5]> =
+        std::env::var("UNENDLICH_VIEW").ok().and_then(|v| parse_view_pin(&v));
     // r534: third-person / cinematic camera-distance zoom (+/- keys). 1.0 = default
     // pull-back; clamped so the camera can't clip into the player or fly too far.
     let mut cam_zoom: f32 = 1.0;
@@ -13143,6 +13156,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     local_player.view.pitch = 0.0;
                 }
             }
+            if let Some(path) = view_pin_file.as_ref() {
+                view_pin = std::fs::read_to_string(path).ok().and_then(|v| parse_view_pin(&v));
+            }
+            if let (Some(v), None) = (view_pin, body.as_ref()) {
+                local_player.view.position.x = v[0];
+                local_player.view.position.y = v[1];
+                local_player.view.position.z = v[2];
+                local_player.view.yaw = v[3];
+                local_player.view.pitch = v[4];
+            }
             if let Some((m, u)) = hand_pose_debug {
                 let mut sw = wm::Swing::of(class, m, 1.0, 0);
                 sw.t = u * sw.dur;
@@ -15793,7 +15816,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // at the player's feet and turned to face the look yaw.
             // r490/r515: the player's own character — shown in third-person and cinematic
             // views, and in first-person when `fp_body` is on (look down to see your body).
-            if camera_mode != 0 || fp_body {
+            // A pinned view (UNENDLICH_VIEW) is a camera, not a body: no first-person body
+            // across the bottom of the shot.
+            let view_pinned = view_pin.is_some();
+            if camera_mode != 0 || (fp_body && !view_pinned) {
                 if self_avatar_dirty || self_avatar.is_none() {
                     let p = local_player.view.position;
                     // r561: recompute the stature profile for the (possibly new)
@@ -18150,7 +18176,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         // Posing (UNENDLICH_HAND_POSE=file:..) wants a steady
                         // shot: creative, hovering where the world put the eye,
                         // clear of water and slopes.
-                        if hand_pose_file.is_some() {
+                        if hand_pose_file.is_some() || view_pin.is_some() || view_pin_file.is_some() {
                             survival_mode = false;
                         }
                         local_player.permissions.can_toggle_flight = !survival_mode;
@@ -18176,7 +18202,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             log::info!("[mode] menu launch set {} mode",
                                 if survival_mode { "SURVIVAL" } else { "CREATIVE" });
                         }
-                        let seed = init.seed;
+                        // UNENDLICH_WORLD_SEED=<u64> overrides the wizard's seed, so two soaks
+                        // (an A/B of a render or worldgen switch) look at the same world.
+                        let seed = std::env::var("UNENDLICH_WORLD_SEED")
+                            .ok()
+                            .and_then(|v| v.trim().parse::<u64>().ok())
+                            .unwrap_or(init.seed);
                         // r163: PER-WORLD PERSISTENCE — save the outgoing
                         // world's edited chunks, then re-root storage under
                         // worlds/<name>/ so each world keeps its OWN edits
