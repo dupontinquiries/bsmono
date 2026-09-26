@@ -141,6 +141,10 @@ impl Biquad {
     }
 
     pub fn reset(&mut self) { self.x1 = 0.0; self.x2 = 0.0; self.y1 = 0.0; self.y2 = 0.0; }
+    /// Advance the memory as an identity filter would (y = x), without the
+    /// arithmetic: what a flat band does instead of `process`.
+    #[inline]
+    pub fn pass(&mut self, x: f32) { self.x2 = self.x1; self.x1 = x; self.y2 = self.y1; self.y1 = x; }
     /// These coefficients with `old`'s memory — a redesign that does not
     /// restart the filter.
     pub fn with_state_of(mut self, old: &Biquad) -> Biquad {
@@ -152,6 +156,13 @@ impl Biquad {
 /// What a band was designed from, kept so it can be redesigned live.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BandDesign { pub kind: BandKind, pub freq: f32, pub q: f32, pub gain_db: f32 }
+
+impl BandDesign {
+    /// A band that does nothing: a bell or shelf at 0 dB.
+    pub fn is_flat(&self) -> bool {
+        self.gain_db == 0.0 && matches!(self.kind, BandKind::Peaking | BandKind::LowShelf | BandKind::HighShelf)
+    }
+}
 
 /// A stack of bands. `designs` and `rate` are filled by `instantiate` so
 /// a band can be redesigned in place (`set_band`); an `Eq` built by hand
@@ -165,9 +176,20 @@ pub struct Eq {
 }
 
 impl Eq {
+    /// A FLAT band -- peaking or shelf at 0 dB -- is the identity (at A = 1
+    /// the RBJ numerator and denominator are the same floats; computing it
+    /// only adds the rounding of its five-term sum, ~2e-6 at 0.5), so it is not
+    /// computed: it only records its input as its history, which is
+    /// what it would have held (y = x), so a ride that later gives it gain
+    /// picks up seamlessly. Every imported FL EQ starts flat (its settings
+    /// are not decoded): 49 of them were a third of Balance's render.
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
-        self.bands.iter_mut().fold(x, |acc, b| b.process(acc))
+        let mut acc = x;
+        for (i, b) in self.bands.iter_mut().enumerate() {
+            if self.designs.get(i).is_some_and(BandDesign::is_flat) { b.pass(acc); } else { acc = b.process(acc); }
+        }
+        acc
     }
     /// Redesign band `i` around one changed value, keeping the filter's
     /// memory: a transposed-direct-form biquad takes new coefficients
@@ -1124,6 +1146,33 @@ mod tests {
             Some(Instance::Transform(t)) => assert!(t.is_identity()),
             _ => panic!("transform should default to identity"),
         }
+    }
+
+    /// A flat band is the identity to float rounding (the premise of skipping
+    /// it; NOT to the bit -- the five-term sum rounds, which this test found),
+    /// and an EQ that skipped its flat band, then had it raised by a ride,
+    /// matches one that computed the band all along.
+    #[test]
+    fn a_flat_band_is_skipped_and_a_later_ride_picks_up_seamlessly() {
+        let x: Vec<f32> = (0..4_000).map(|i| ((i * 7919 % 1000) as f32 / 500.0 - 1.0) * 0.5).collect();
+        for kind in [BandKind::Peaking, BandKind::LowShelf, BandKind::HighShelf] {
+            let mut b = Biquad::design(kind, 48_000.0, 700.0, 0.9, 0.0);
+            let worst = x.iter().map(|v| (b.process(*v) - v).abs()).fold(0.0f32, f32::max);
+            assert!(worst < 1e-5, "{kind:?} at 0 dB is the identity to rounding: {worst}");
+        }
+        let e = studio_core::Effect { kind: "eq".into(), enabled: true,
+            params: [("bands".to_string(), 1.0), ("freq0".to_string(), 700.0), ("gain0".to_string(), 0.0)].into() };
+        let Some(Instance::Eq(mut eq)) = instantiate(&e, 48_000.0) else { panic!("an eq") };
+        let mut reference = Biquad::design(BandKind::Peaking, 48_000.0, 700.0, 0.707, 0.0);
+        let mut worst = 0.0f32;
+        for (i, v) in x.iter().enumerate() {
+            if i == 2_000 {
+                eq.set_band(0, None, None, Some(6.0));
+                reference = Biquad::design(BandKind::Peaking, 48_000.0, 700.0, 0.707, 6.0).with_state_of(&reference);
+            }
+            worst = worst.max((eq.process(*v) - reference.process(*v)).abs());
+        }
+        assert!(worst < 1e-5, "skipped-then-ridden vs computed throughout (a seam would be ~1e-2): {worst}");
     }
 
     #[test]
