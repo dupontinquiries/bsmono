@@ -1,5 +1,5 @@
 // Clawbound — Battleground · Rust + wgpu Microvoxel Edition
-// A 5v5 three-lane arena for the thirteen legendary ancestors of Clawbound,
+// An arena for the fourteen legendary ancestors of Clawbound,
 // with dynamic weather and map events, everything rendered as instanced
 // microvoxels.
 //
@@ -47,6 +47,15 @@ pub mod playbook;
 pub mod arena;
 /// Lane minions: what they fight and when they change their mind.
 pub mod minionai;
+/// Starwell Glacier: the sky map's geometry.
+pub mod sky;
+/// What stands on Starwell Glacier, and its meshes.
+pub mod skyworld;
+pub mod skyprops;
+/// Cloud ferries across the sky map's chasms.
+pub mod ferry;
+/// The Moonwell: healing water, the Moonwyrm's claim, and its boons.
+pub mod moonwell;
 /// The generated preparation documents in dev/ (cue cards, recording sheet, cue sheet).
 pub mod devdocs;
 /// Character voxels as smooth surfaces with fur lengths, for the ultra preview.
@@ -148,3 +157,5 @@ pub mod shopui;
 pub mod launch;
 pub mod app;
 pub mod headless;
+/// Headless screenshots of Starwell Glacier (`CLAWBOUND_SHOTS=sky`).
+pub mod skyshots;

@@ -29,6 +29,8 @@ pub fn cast_timing(ab: &crate::gods::AbilityDef) -> (f32, f32) {
         Archetype::Pull { .. } => (0.40, 0.4),
         Archetype::Beam { .. } => (0.45, 0.0),
         Archetype::Storm { .. } => (0.55, 0.0),
+        // the crouch before the vault
+        Archetype::Meteor { .. } => (0.3, 0.3),
     };
     if ab.ult && w > 0.0 {
         ((w * 1.5).max(0.45), 0.0)
@@ -53,7 +55,7 @@ impl Game {
     /// it when the wind-up ends (`tick_casting`). Cooldown and mana are spent
     /// when it FIRES, so an interrupted cast costs nothing.
     pub fn begin_cast(&mut self, gi: usize, slot: u32, aim: Vec3) {
-        if self.over.is_some() || self.gods[gi].respawn_t > 0.0 || self.gods[gi].casting.is_some() {
+        if self.over.is_some() || self.gods[gi].respawn_t > 0.0 || self.gods[gi].casting.is_some() || self.gods[gi].skyfall.is_some() {
             return;
         }
         let ab = self.def(gi).abilities[slot as usize];
@@ -143,7 +145,7 @@ impl Game {
         g.hush_t = g.hush_t.max(match ab.arch {
             Archetype::Buff { duration, .. } => duration,
             Archetype::Blink { .. } => crate::consts::HUSH_BLINK_SECS,
-            Archetype::Dash { .. } => crate::consts::HUSH_DASH_SECS,
+            Archetype::Dash { .. } | Archetype::Meteor { .. } => crate::consts::HUSH_DASH_SECS,
             _ => 0.0,
         });
 
@@ -295,7 +297,17 @@ impl Game {
                 let d = if dmg > 0.0 { dmg_scale(dmg, ab.power_scale) } else { 0.0 };
                 let dest = clamp_arena(from + dir * dd);
                 self.events.push(Event::DashFx { pos: from + Vec3::Y * 1.0, dir, color: ab.color });
-                self.gods[gi].dash = Some(DashState { from, to: dest, t: 0.0, dur: 0.28, dmg: d });
+                self.gods[gi].dash = Some(DashState { from, to: dest, t: 0.0, dur: 0.28, dmg: d, arc: 0.35, blast: None });
+            }
+            Archetype::Meteor { range, radius, dmg, vault } => {
+                // up into the sky, and down as a falling star where aimed
+                let d = dmg_scale(dmg, ab.power_scale);
+                let dest = clamp_arena(from + dir * dist.min(range));
+                let dest = crate::map::onto_floor(dest, crate::consts::GOD_RADIUS);
+                let dest = Vec3::new(dest.x, crate::map::ground_y(dest.x, dest.z), dest.z);
+                self.events.push(Event::NovaFx { pos: from, radius: 2.5, color: ab.color });
+                self.events.push(Event::RingTelegraph { pos: dest, radius, delay: vault, color: ab.color });
+                self.gods[gi].dash = Some(DashState { from, to: dest, t: 0.0, dur: vault, dmg: 0.0, arc: 16.0, blast: Some((radius, d)) });
             }
             Archetype::Blink { dist: dd, dmg } => {
                 let d = if dmg > 0.0 { dmg_scale(dmg, ab.power_scale) } else { 0.0 };
@@ -375,6 +387,54 @@ impl Game {
                     }
                 }
             }
+        }
+    }
+
+    /// What a finished dash deals. A dash "damaging enemies passed
+    /// through" (`Archetype::Dash`) carried its damage in `DashState::dmg`
+    /// and nothing ever dealt it -- every dash in the roster hit for 0.
+    /// Now: everything within 2 u of the path, once, as the dash ends. And
+    /// a meteor's blast where it lands: damage, a slow, and the flash.
+    pub fn dash_strikes(&mut self, gi: usize, team: Team, from: Vec3, to: Vec3, dmg: f32, blast: Option<(f32, f32)>) {
+        let mut hits: Vec<TargetRef> = Vec::new();
+        if dmg > 0.0 {
+            for k in 0..=4 {
+                for t in self.aoe_targets(from.lerp(to, k as f32 / 4.0), 2.0, team) {
+                    if !hits.contains(&t) {
+                        hits.push(t);
+                    }
+                }
+            }
+            self.deal_all(hits, dmg, false, gi);
+        }
+        if let Some((radius, bdmg)) = blast {
+            let color = [1.0, 0.92, 0.62];
+            self.events.push(Event::Explosion { pos: to, radius, color });
+            self.events.push(Event::NovaFx { pos: to, radius, color });
+            self.events.push(Event::StrikeFx { at: to, color });
+            let targets = self.aoe_targets(to, radius, team);
+            for t in &targets {
+                if let TargetRef::God(j) = *t {
+                    let g = &mut self.gods[j];
+                    g.slow = g.slow.max(0.45);
+                    g.slow_t = g.slow_t.max(1.5);
+                }
+            }
+            self.deal_all(targets, bdmg, true, gi);
+        }
+    }
+
+    /// Deal `dmg` to each target. Minions last and highest index first: a
+    /// minion that dies is REMOVED, which shifts every later index, so in
+    /// any other order a kill makes the next hit land on the wrong minion.
+    pub fn deal_all(&mut self, mut targets: Vec<TargetRef>, dmg: f32, magic: bool, gi: usize) {
+        targets.sort_by_key(|t| match *t {
+            TargetRef::Minion(i) => (1, usize::MAX - i),
+            _ => (0, 0),
+        });
+        let (pp, pf) = (self.gods[gi].pen_pct, self.gods[gi].pen_flat);
+        for t in targets {
+            self.deal_damage(t, dmg, magic, Some(gi), pp, pf);
         }
     }
 

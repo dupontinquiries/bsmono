@@ -140,6 +140,19 @@ pub fn climate() -> &'static [WeatherKind] {
     match crate::map::active() {
         crate::map::MapId::Jungle => &ALL_KINDS,
         crate::map::MapId::Pass => &[Overcast, Overcast, Overcast, Fog, Fog, Fog, Snow, Snow, Clear, Rain],
+        // above the cloud sea: mostly clear starlight, a drift of snow, a
+        // spirit-mist now and then; no rain up here
+        crate::map::MapId::Sky => &[Clear, Clear, Clear, Clear, Snow, Snow, Fog],
+    }
+}
+
+/// How dark the map is when nothing else is happening: the sky map's night
+/// never ends (0.6: moonlit, stars to the horizon, still readable).
+/// Events that darken the sky raise it; ending them returns here.
+pub fn base_night() -> f32 {
+    match crate::map::active() {
+        crate::map::MapId::Sky => 0.6,
+        _ => 0.0,
     }
 }
 
@@ -148,6 +161,7 @@ pub fn opening() -> WeatherKind {
     match crate::map::active() {
         crate::map::MapId::Jungle => WeatherKind::Clear,
         crate::map::MapId::Pass => WeatherKind::Overcast,
+        crate::map::MapId::Sky => WeatherKind::Clear,
     }
 }
 
@@ -162,8 +176,8 @@ impl Weather {
             wetness: 0.0,
             lightning: 0.0,
             strike_t: 4.0,
-            night: 0.0,
-            night_target: 0.0,
+            night: base_night(),
+            night_target: base_night(),
             wind_phase: 0.0,
             clock: 0.0,
             gust: 0.0,

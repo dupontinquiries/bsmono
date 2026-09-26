@@ -24,6 +24,7 @@ pub fn arena_radius() -> f32 {
     match crate::map::active() {
         crate::map::MapId::Jungle => ARENA_RADIUS,
         crate::map::MapId::Pass => crate::pass::ARENA_RADIUS,
+        crate::map::MapId::Sky => crate::sky::ARENA_RADIUS,
     }
 }
 
@@ -32,6 +33,7 @@ pub fn ground_half() -> f32 {
     match crate::map::active() {
         crate::map::MapId::Jungle => GROUND_HALF,
         crate::map::MapId::Pass => crate::pass::GROUND_HALF,
+        crate::map::MapId::Sky => crate::sky::GROUND_HALF,
     }
 }
 
@@ -88,8 +90,10 @@ pub fn river_x(side: f32, z: f32) -> f32 {
 
 /// Distance from (x, z) to the nearest river centerline (both rivers).
 pub fn river_dist(x: f32, z: f32) -> f32 {
-    if crate::map::active() == crate::map::MapId::Pass {
-        return crate::pass::river_dist(x, z);
+    match crate::map::active() {
+        crate::map::MapId::Pass => return crate::pass::river_dist(x, z),
+        crate::map::MapId::Sky => return crate::sky::river_dist(x, z),
+        crate::map::MapId::Jungle => {}
     }
     (x - river_x(-1.0, z)).abs().min((x - river_x(1.0, z)).abs())
 }
@@ -102,6 +106,11 @@ pub const RIVER_DEPTH: f32 = 2.1;
 
 /// How deep the water is at (x, z), in world units (0 on dry ground).
 pub fn water_depth(x: f32, z: f32) -> f32 {
+    // over the sky map's void the "terrain" is the cloud sea, thirty units
+    // down: that is not water. Only the Moonwell is.
+    if crate::map::active() == crate::map::MapId::Sky && !crate::sky::in_pool(x, z) {
+        return 0.0;
+    }
     (WATER_LEVEL - crate::render::terrain_height(x, z)).max(0.0)
 }
 
@@ -139,8 +148,10 @@ impl Team {
     }
     /// Fountain (heal / respawn) position.
     pub fn fountain(self) -> Vec3 {
-        if crate::map::active() == crate::map::MapId::Pass {
-            return crate::pass::fountain(self);
+        match crate::map::active() {
+            crate::map::MapId::Pass => return crate::pass::fountain(self),
+            crate::map::MapId::Sky => return crate::sky::fountain(self),
+            crate::map::MapId::Jungle => {}
         }
         match self {
             Team::Blue => Vec3::new(0.0, 0.0, -88.0 * MAP_SCALE),
@@ -148,8 +159,10 @@ impl Team {
         }
     }
     pub fn titan_pos(self) -> Vec3 {
-        if crate::map::active() == crate::map::MapId::Pass {
-            return crate::pass::titan_pos(self);
+        match crate::map::active() {
+            crate::map::MapId::Pass => return crate::pass::titan_pos(self),
+            crate::map::MapId::Sky => return crate::sky::titan_pos(self),
+            crate::map::MapId::Jungle => {}
         }
         match self {
             Team::Blue => Vec3::new(0.0, 0.0, -74.0 * MAP_SCALE),
@@ -157,8 +170,10 @@ impl Team {
         }
     }
     pub fn base_pos(self) -> Vec3 {
-        if crate::map::active() == crate::map::MapId::Pass {
-            return crate::pass::base_pos(self);
+        match crate::map::active() {
+            crate::map::MapId::Pass => return crate::pass::base_pos(self),
+            crate::map::MapId::Sky => return crate::sky::base_pos(self),
+            crate::map::MapId::Jungle => {}
         }
         match self {
             Team::Blue => Vec3::new(0.0, 0.0, -82.0 * MAP_SCALE),
@@ -204,6 +219,14 @@ impl Lane {
         self as usize
     }
     pub fn name(self) -> &'static str {
+        if crate::map::active() == crate::map::MapId::Sky {
+            // the sky map's two lanes run west and east
+            match self {
+                Lane::Top => return "WEST",
+                Lane::Bot => return "EAST",
+                Lane::Mid => return "WELL",
+            }
+        }
         match self {
             Lane::Top => "TOP",
             Lane::Mid => "MID",
@@ -212,8 +235,10 @@ impl Lane {
     }
     /// Canonical polyline from Blue base toward Red base.
     pub fn polyline(self) -> Vec<Vec3> {
-        if crate::map::active() == crate::map::MapId::Pass {
-            return crate::pass::lane_polyline(self);
+        match crate::map::active() {
+            crate::map::MapId::Pass => return crate::pass::lane_polyline(self),
+            crate::map::MapId::Sky => return crate::sky::lane_polyline(self),
+            crate::map::MapId::Jungle => {}
         }
         match self {
             Lane::Mid => vec![
@@ -284,7 +309,7 @@ fn push_sampled(out: &mut Vec<Vec3>, from: Vec3, to: Vec3, step: f32) {
 pub fn lane_path(lane: Lane, team: Team) -> &'static [Vec3] {
     use std::sync::OnceLock;
     // One cache per map: the paths are the map's.
-    static PATHS: [OnceLock<Vec<Vec<Vec3>>>; 2] = [OnceLock::new(), OnceLock::new()];
+    static PATHS: [OnceLock<Vec<Vec<Vec3>>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
     let all = PATHS[crate::map::active() as usize].get_or_init(|| {
         let mut v = Vec::new();
         for lane in LANES {
@@ -304,8 +329,10 @@ pub fn lane_path(lane: Lane, team: Team) -> &'static [Vec3] {
 
 /// (lane, team) → tower world position. Two towers per lane per team.
 pub fn tower_pos(lane: Lane, team: Team, inner: bool) -> Vec3 {
-    if crate::map::active() == crate::map::MapId::Pass {
-        return crate::pass::tower_pos(lane, team, inner);
+    match crate::map::active() {
+        crate::map::MapId::Pass => return crate::pass::tower_pos(lane, team, inner),
+        crate::map::MapId::Sky => return crate::sky::tower_pos(lane, team, inner),
+        crate::map::MapId::Jungle => {}
     }
     use Lane::*;
     let zflip = |v: Vec3| -> Vec3 {
@@ -379,7 +406,7 @@ pub const TOWER_SLOW_SECS: f32 = 1.2;
 
 /// Inside some tower's cleared ground?
 pub fn in_tower_clearing(x: f32, z: f32) -> bool {
-    [Lane::Top, Lane::Mid, Lane::Bot].iter().any(|l| {
+    crate::map::lanes().iter().any(|l| {
         [Team::Blue, Team::Red].iter().any(|t| [false, true].iter().any(|i| {
             let p = tower_pos(*l, *t, *i);
             (p.x - x).hypot(p.z - z) < TOWER_CLEARING
@@ -409,7 +436,7 @@ pub const RESPAWN_PER_LEVEL: f32 = 2.2;
 pub fn lane_clearance(x: f32, z: f32) -> f32 {
     let p = Vec3::new(x, 0.0, z);
     let mut best = f32::MAX;
-    for lane in [Lane::Top, Lane::Mid, Lane::Bot] {
+    for &lane in crate::map::lanes() {
         let pts = lane.polyline();
         for w in pts.windows(2) {
             let (a, b) = (w[0], w[1]);

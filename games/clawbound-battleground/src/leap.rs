@@ -210,6 +210,53 @@ pub fn plan(pos: Vec3, dir: Vec3, standing_on: Option<f32>, blockers: &Blockers)
     None
 }
 
+/// As [`plan`], with moving platforms too (the sky map's clouds, at where
+/// each WILL be when a leap from here lands -- the caller predicts that):
+/// marching out along the aim, a cloud's deck met before anything else
+/// that can be landed on is the landing, at the point of the aim nearest
+/// the deck's middle (not its near rim). Returns the plan and which
+/// platform it lands on.
+pub fn plan_onto(pos: Vec3, dir: Vec3, standing_on: Option<f32>, blockers: &Blockers, platforms: &[crate::ferry::Platform]) -> Option<(Plan, Option<usize>)> {
+    let fixed = plan(pos, dir, standing_on, blockers);
+    let d = Vec3::new(dir.x, 0.0, dir.z);
+    if platforms.is_empty() || !(d.length() > 1e-4) || !pos.is_finite() {
+        return fixed.map(|p| (p, None));
+    }
+    let d = d.normalize();
+    // how far along the aim the fixed plan lands (a perch or open ground)
+    let fixed_s = fixed.map_or(f32::MAX, |p| Vec3::new(p.to.x - pos.x, 0.0, p.to.z - pos.z).length());
+    let mut best: Option<(f32, f32, usize)> = None; // (off-centre, s, platform)
+    let mut s = LEAP_MIN;
+    while s <= LEAP_RANGE {
+        let (x, z) = (pos.x + d.x * s, pos.z + d.z * s);
+        for (k, p) in platforms.iter().enumerate() {
+            let off = (x - p.at.x).hypot(z - p.at.z);
+            if off <= p.r - 1.2 && best.map_or(true, |b| off < b.0) {
+                best = Some((off, s, k));
+            }
+        }
+        s += 0.25;
+    }
+    match best {
+        // a cloud on the aim beats open ground (from a pier, open ground
+        // is the pier's own edge: the leap would stop short of the cloud);
+        // only a perch nearer along the aim beats the cloud
+        Some((_, bs, k)) if fixed.map_or(true, |p| p.perch.is_none() || bs <= fixed_s + 0.5) => {
+            let (x, z) = (pos.x + d.x * bs, pos.z + d.z * bs);
+            Some((Plan { to: Vec3::new(x, platforms[k].at.y, z), perch: None, narrow: false }, Some(k)))
+        }
+        _ => fixed.map(|p| (p, None)),
+    }
+}
+
+/// Seconds from pressing leap to landing, for a leap of `run` (ground
+/// distance) that is `chained` or not: what a platform's position must be
+/// predicted for (mirrors [`LeapState::begin`]).
+pub fn time_to_land(run: f32, chained: bool) -> f32 {
+    let gather = if chained { CHAIN_GATHER_SECS } else { GATHER_SECS };
+    gather + (run / LEAP_SPEED).clamp(0.28, 0.75)
+}
+
 impl LeapState {
     pub fn begin(from: Vec3, plan: Plan, chained: bool) -> LeapState {
         let run = Vec3::new(plan.to.x - from.x, 0.0, plan.to.z - from.z).length();

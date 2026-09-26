@@ -40,8 +40,8 @@ fn stacking_items_declare_rules() {
 }
 
 #[test]
-fn roster_is_13_ancestors_with_4_abilities_each() {
-    assert_eq!(ROSTER.len(), 13);
+fn roster_is_14_ancestors_with_4_abilities_each() {
+    assert_eq!(ROSTER.len(), 14);
     let roles: std::collections::HashSet<_> = ROSTER.iter().map(|g| g.role).collect();
     assert!(roles.len() >= 4, "roster should span multiple roles");
     for g in &ROSTER {
@@ -91,9 +91,11 @@ fn simulation_runs_three_minutes_without_panic_and_progresses() {
     // give the player slot an AI brain so it fights too
     game.gods[0].ai = Some({ let mut b = clawbound::sim::AiBrain::new(Lane::Mid, 0.9); b.buy_t = 1.0; b });
     // Three minutes, not two: since bots stopped sieging towers alone
-    // (ai.rs, tower discipline) this roster's first tower falls at 163 s
-    // rather than 72 s -- though the AI-only average across six other
-    // rosters barely moved (examples/aiprobe: 116 s before, 120 s after).
+    // (ai.rs, tower discipline) this roster's first tower falls at 2-3
+    // minutes rather than 72 s (163 s measured at 041, 141 s at 043, with
+    // the minion changes between) -- though the AI-only average across six
+    // other rosters barely moved (examples/aiprobe: 116 s before, 120 s
+    // after).
     for step in 0..(180 * 120) {
         game.tick(1.0 / 120.0);
         if game.over.is_some() {
@@ -1399,5 +1401,326 @@ mod minions {
         assert!(far < LEASH + 1.0, "but not past the leash: {far}");
         let m = &g.minions[0];
         assert!(m.foe != Some(Foe::God(0)), "and gave the cat up");
+    }
+}
+
+/// Cloud ferries on Starwell Glacier (`ferry`): leap on, ride, walk off at
+/// the far pier; a fall into the cloud sea is a trip home, not a death.
+mod ferries {
+    use clawbound::ferry::{CLOUD_R, SKYFALL_COST, SKYFALL_SECS};
+    use clawbound::map::{self, MapId};
+    use clawbound::sim::Game;
+    use glam::Vec3;
+
+    fn sky_game() -> Game {
+        let mut g = Game::new_teams(&[0], &[1]);
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+            c.move_dir = Vec3::ZERO;
+            c.attack_held = false;
+        }
+        // the real floor as collision: the sky map's edges are what stops a
+        // cat walking into the sky
+        let mut b = clawbound::blockers::Blockers::new(400.0, 6.0);
+        b.set_floor(clawbound::sky::floor());
+        g.blockers = std::sync::Arc::new(b);
+        // the red cat far away at home
+        let f = g.gods[1].team.fountain();
+        g.gods[1].pos = f;
+        g
+    }
+
+    fn tick(g: &mut Game, secs: f32) {
+        for _ in 0..(secs * 60.0).round() as usize {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+        }
+    }
+
+    #[test]
+    fn leap_on_ride_across_walk_off() {
+        map::with(MapId::Sky, || {
+            let mut g = sky_game();
+            let f = g.ferries[0];
+            let (a, b) = (f.a, f.b);
+            let dir = (b - a).normalize();
+            // wait on the pier, a little back from the edge, until the cloud
+            // has just docked here
+            g.gods[0].pos = a - dir * 2.5;
+            while !(f.at(g.t).docked == Some(0) && f.at(g.t - 0.1).docked.is_none()) {
+                tick(&mut g, 1.0 / 60.0);
+                g.gods[0].pos = a - dir * 2.5;
+            }
+            // walking at it does not board: the floor ends at the pier
+            g.gods[0].move_dir = dir;
+            tick(&mut g, 0.6);
+            assert!(g.gods[0].riding.is_none(), "walked onto a cloud");
+            g.gods[0].move_dir = Vec3::ZERO;
+            // leap
+            g.leap_queue.push((0, dir));
+            tick(&mut g, 1.0);
+            assert_eq!(g.gods[0].riding, Some(0), "the leap landed on the cloud");
+            // ride it: standing still, carried with it -- where it stands on
+            // the deck does not change as the cloud drifts
+            while f.at(g.t).docked.is_some() {
+                tick(&mut g, 1.0 / 60.0);
+            }
+            let spot = g.gods[0].pos - f.at(g.t).pos;
+            tick(&mut g, 1.5);
+            let drift = (g.gods[0].pos - f.at(g.t).pos - spot).length();
+            assert!(drift < 0.2, "carried, not dragged: moved {drift} on the deck");
+            // then stays on the deck while trying to walk off the side into
+            // the sky
+            let side = Vec3::new(-dir.z, 0.0, dir.x);
+            g.gods[0].move_dir = side;
+            let mut far = 0.0f32;
+            while f.at(g.t).docked != Some(1) {
+                tick(&mut g, 1.0 / 60.0);
+                let deck = f.at(g.t).pos;
+                far = far.max(Vec3::new(g.gods[0].pos.x - deck.x, 0.0, g.gods[0].pos.z - deck.z).length());
+                assert_eq!(g.gods[0].riding, Some(0), "thrown off mid-crossing at t {}", g.t);
+                assert!(g.t < 200.0);
+            }
+            assert!(far <= CLOUD_R + 1e-3, "kept on the deck: {far}");
+            assert!((g.gods[0].pos - b).length() < CLOUD_R * 2.0, "carried to the far pier: {}", g.gods[0].pos);
+            // walk off onto the far island
+            g.gods[0].move_dir = dir;
+            tick(&mut g, 1.5);
+            assert!(g.gods[0].riding.is_none(), "stepped off at the dock");
+            assert!(clawbound::sky::floor().fits(g.gods[0].pos.x, g.gods[0].pos.z, 0.3), "on the island: {}", g.gods[0].pos);
+        });
+    }
+
+    #[test]
+    fn no_leap_into_empty_sky() {
+        map::with(MapId::Sky, || {
+            let mut g = sky_game();
+            let f = g.ferries[0];
+            let dir = (f.b - f.a).normalize();
+            // wait until the cloud is away at the far pier
+            while f.at(g.t).docked != Some(1) {
+                tick(&mut g, 0.1);
+            }
+            g.gods[0].pos = f.a - dir * 1.5;
+            g.leap_queue.push((0, dir));
+            tick(&mut g, 1.2);
+            assert!(g.gods[0].skyfall.is_none() && g.gods[0].riding.is_none());
+            assert!(clawbound::sky::floor().fits(g.gods[0].pos.x, g.gods[0].pos.z, 0.3), "still on the island");
+        });
+    }
+
+    #[test]
+    fn a_fall_into_the_clouds_is_a_trip_home_not_a_death() {
+        map::with(MapId::Sky, || {
+            let mut g = sky_game();
+            g.gods[0].pos = Vec3::new(0.0, 0.0, -95.0); // over the chasm
+            g.gods[0].skyfall = Some(SKYFALL_SECS);
+            let hp0 = g.gods[0].hp;
+            tick(&mut g, SKYFALL_SECS * 0.5);
+            assert!(g.gods[0].pos.y < -5.0, "falling: {}", g.gods[0].pos.y);
+            tick(&mut g, SKYFALL_SECS * 0.5 + 0.1);
+            let home = g.gods[0].team.fountain();
+            assert!(g.gods[0].skyfall.is_none());
+            assert!(Vec3::new(g.gods[0].pos.x - home.x, 0.0, g.gods[0].pos.z - home.z).length() < 3.0, "home: {}", g.gods[0].pos);
+            let lost = (hp0 - g.gods[0].hp) / g.gods[0].max_hp;
+            assert!(lost > SKYFALL_COST - 0.05 && lost < SKYFALL_COST + 0.05, "lost {lost}");
+            assert_eq!(g.gods[0].deaths, 0);
+            assert_eq!(g.gods[1].kills, 0);
+        });
+    }
+}
+
+/// The Moonwell (`moonwell`): kill the Moonwyrm, claim the well, wade in
+/// for a boon; everyone who wades mends.
+mod moonwell {
+    use clawbound::bosses::BossKind;
+    use clawbound::map::{self, MapId};
+    use clawbound::moonwell::{Boon, BOON_SECS, CLAIM_SECS};
+    use clawbound::sim::{Game, TargetRef, Team};
+    use glam::Vec3;
+
+    fn sky_game() -> Game {
+        let mut g = Game::new_teams(&[0, 2], &[1]);
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+            c.move_dir = Vec3::ZERO;
+            c.attack_held = false;
+        }
+        for i in 0..g.gods.len() {
+            let f = g.gods[i].team.fountain();
+            g.gods[i].pos = f;
+        }
+        g
+    }
+    fn tick(g: &mut Game, secs: f32) {
+        for _ in 0..(secs * 60.0).round() as usize {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+        }
+    }
+    fn wyrm(g: &Game) -> usize {
+        g.bosses.list.iter().position(|b| b.kind == BossKind::Moonwyrm).expect("the sky map has a Moonwyrm")
+    }
+
+    #[test]
+    fn only_the_sky_has_a_moonwyrm() {
+        let g = Game::new_teams(&[0], &[1]);
+        assert!(g.bosses.list.iter().all(|b| b.kind != BossKind::Moonwyrm));
+        map::with(MapId::Sky, || {
+            let g = sky_game();
+            assert!(g.bosses.list[wyrm(&g)].home.length() < 1e-3, "in the middle of the well");
+        });
+    }
+
+    #[test]
+    fn kill_the_wyrm_claim_the_well_wade_for_a_boon() {
+        map::with(MapId::Sky, || {
+            let mut g = sky_game();
+            let w = wyrm(&g);
+            g.bosses.list[w].spawn_t = g.t;
+            tick(&mut g, 0.1);
+            assert!(g.bosses.list[w].alive);
+            // the blue cat lands the killing blow
+            g.bosses.list[w].hp = 10.0;
+            g.deal_damage(TargetRef::Boss(w), 50.0, false, Some(0), 0.0, 0.0);
+            assert!(!g.bosses.list[w].alive);
+            assert!((g.bosses.claim_t[Team::Blue as usize] - CLAIM_SECS).abs() < 1e-3);
+            assert_eq!(g.bosses.claim_t[Team::Red as usize], 0.0);
+            // wade in, hurt: mend, and a boon
+            g.gods[0].pos = Vec3::new(3.0, 0.0, 2.0);
+            g.gods[0].hp = g.gods[0].max_hp * 0.5;
+            // the red cat wades too: mends, no boon
+            g.gods[2].pos = Vec3::new(-3.0, 0.0, 2.0);
+            g.gods[2].hp = g.gods[2].max_hp * 0.5;
+            // (the wyrm is gone; nothing else in the water hurts)
+            tick(&mut g, 2.0);
+            let (b, left) = g.gods[0].boon.expect("a boon for the claimer");
+            assert!(left > BOON_SECS - 2.5 && left <= BOON_SECS);
+            assert!(g.gods[0].hp > g.gods[0].max_hp * 0.55, "the claimer mends fast");
+            assert!(g.gods[2].boon.is_none(), "no boon for the other side");
+            assert!(g.gods[2].hp > g.gods[2].max_hp * 0.52, "but the water mends anyone");
+            // once per claim: out, boon runs out, back in -- nothing new
+            g.gods[0].boon = None;
+            tick(&mut g, 1.0);
+            assert!(g.gods[0].boon.is_none(), "one boon per cat per claim (had {b:?})");
+            // the second blue cat still gets its own
+            g.gods[1].pos = Vec3::new(0.0, 0.0, -3.0);
+            tick(&mut g, 0.5);
+            assert!(g.gods[1].boon.is_some());
+        });
+    }
+
+    #[test]
+    fn moonshell_turns_nine_tenths_and_quickening_halves_cooldowns() {
+        map::with(MapId::Sky, || {
+            let mut g = sky_game();
+            let hp = g.gods[0].hp;
+            g.deal_damage(TargetRef::God(0), 100.0, false, None, 0.0, 0.0);
+            let plain = hp - g.gods[0].hp;
+            g.gods[0].hp = hp;
+            g.gods[0].boon = Some((Boon::Moonshell, 60.0));
+            g.deal_damage(TargetRef::God(0), 100.0, false, None, 0.0, 0.0);
+            let shelled = hp - g.gods[0].hp;
+            assert!((shelled / plain - 0.1).abs() < 0.01, "{shelled} of {plain}");
+            // cooldowns
+            g.gods[0].boon = Some((Boon::Quickening, 60.0));
+            g.gods[1].boon = None;
+            g.gods[0].cds = [10.0; 4];
+            g.gods[1].cds = [10.0; 4];
+            tick(&mut g, 2.0);
+            let (q, p) = (10.0 - g.gods[0].cds[0], 10.0 - g.gods[1].cds[0]);
+            assert!((q / p - 2.0).abs() < 0.05, "twice as fast: {q} vs {p}");
+        });
+    }
+
+    /// A bot whose team holds the claim walks to the well for its boon.
+    #[test]
+    fn a_bot_goes_to_the_well_for_its_boon() {
+        map::with(MapId::Sky, || {
+            let mut b = clawbound::blockers::Blockers::new(400.0, 6.0);
+            b.set_floor(clawbound::sky::floor());
+            let mut g = sky_game();
+            g.blockers = std::sync::Arc::new(b);
+            let lane = clawbound::consts::Lane::Top;
+            g.gods[1].ai = Some(clawbound::sim::AiBrain::new(lane, 0.7));
+            // on the west lane, level with the well, beside its star-bridge
+            g.gods[1].pos = Vec3::new(-205.0, 0.0, 8.0);
+            g.bosses.claims = 1;
+            g.bosses.claim_id[0] = 1;
+            g.bosses.claim_t[0] = CLAIM_SECS;
+            let d0 = g.gods[1].pos.length();
+            tick(&mut g, 20.0);
+            let d1 = g.gods[1].pos.length();
+            assert!(d1 < d0 - 60.0, "headed for the well: {d0} -> {d1}");
+        });
+    }
+}
+
+/// Cometail's Falling Star (`Archetype::Meteor`) and the dash damage that
+/// every Dash in the roster described and none dealt.
+mod cometail {
+    use clawbound::gods::{Archetype, ROSTER};
+    use clawbound::sim::Game;
+    use glam::Vec3;
+
+    fn quiet(g: &mut Game) {
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+            c.move_dir = Vec3::ZERO;
+            c.attack_held = false;
+        }
+    }
+    fn run(g: &mut Game, secs: f32) {
+        for _ in 0..(secs * 60.0) as usize {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+        }
+    }
+    fn cometail() -> u32 {
+        ROSTER.iter().position(|d| d.name == "Cometail").expect("Cometail is on the roster") as u32
+    }
+    fn slot(id: u32, f: impl Fn(&Archetype) -> bool) -> u32 {
+        (0..4).find(|&s| f(&ROSTER[id as usize].abilities[s].arch)).unwrap() as u32
+    }
+
+    #[test]
+    fn the_falling_star_vaults_high_and_lands_where_aimed_in_a_blast() {
+        let c = cometail();
+        let mut g = Game::new_teams(&[c], &[0, 1]);
+        quiet(&mut g);
+        g.gods[0].pos = Vec3::ZERO;
+        g.gods[0].mana = 9999.0;
+        // two enemies at the mark, one well outside it
+        let mark = Vec3::new(0.0, 0.0, 16.0);
+        g.gods[1].pos = mark + Vec3::new(1.5, 0.0, 0.0);
+        g.gods[2].pos = mark + Vec3::new(14.0, 0.0, 0.0);
+        let (h1, h2) = (g.gods[1].hp, g.gods[2].hp);
+        let s = slot(c, |a| matches!(a, Archetype::Meteor { .. }));
+        g.cast_queue.push((0, s, mark));
+        let mut top = 0.0f32;
+        for _ in 0..(2.5 * 60.0) as usize {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+            top = top.max(g.gods[0].pos.y);
+        }
+        assert!(top > 10.0, "up into the sky: {top}");
+        assert!((g.gods[0].pos - mark).length() < 1.5, "down on the mark: {}", g.gods[0].pos);
+        assert!(g.gods[1].hp < h1 - 150.0, "the blast: {} -> {}", h1, g.gods[1].hp);
+        assert_eq!(g.gods[2].hp, h2, "outside the blast, untouched");
+    }
+
+    #[test]
+    fn a_dash_hurts_what_it_passes_through() {
+        let c = cometail();
+        let mut g = Game::new_teams(&[c], &[0]);
+        quiet(&mut g);
+        g.gods[0].pos = Vec3::ZERO;
+        g.gods[0].mana = 9999.0;
+        g.gods[1].pos = Vec3::new(0.0, 0.0, 6.0);
+        let h = g.gods[1].hp;
+        let s = slot(c, |a| matches!(a, Archetype::Dash { .. }));
+        g.cast_queue.push((0, s, Vec3::new(0.0, 0.0, 20.0)));
+        run(&mut g, 1.0);
+        assert!(g.gods[1].hp < h - 50.0, "the pounce scorched what it passed: {} -> {}", h, g.gods[1].hp);
     }
 }

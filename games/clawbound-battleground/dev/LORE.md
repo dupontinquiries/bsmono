@@ -80,6 +80,7 @@ voice note contradicts its ancestor. Seven are female, six male.
 | Riptail | jaguar | the green ages | the drowned forest | he |
 | Stillsmoke | dragon-cat, son of the storm-dragon | the age of storms | the far-east thunder mountains | he |
 | Stonewhisper | snow leopard | the long winters | the high crags | she |
+| Cometail | caracal | the elder dawn | the glacier-sky above the cloud sea | he |
 
 **Goldenmane.** First of the lion-clan to lead a pride that was not his by
 birth. He taught that a cat alone is a whisker and a pride is a storm, and
@@ -135,6 +136,12 @@ east; one of them, lion-like, loves to sit among incense smoke.)
 She crossed the high passes in every weather; the mountain taught her not to
 hurry.
 
+**Cometail.** A caracal who leapt so high after the birds that he caught the
+tail of a falling comet, and came down with it onto the glacier. Where he
+landed, the Starwell opened -- the spirit-sky of Starwell Glacier, where the
+Moonwyrm sleeps in the healing water -- and he has been a little made of
+starlight ever since. He never once asked where he might land.
+
 ## The music of the clans
 
 For scoring and sound design: each clan's culture has a sound, and the two
@@ -157,6 +164,7 @@ side.
 | Riptail | rainstick, panpipes, water percussion, slit drum | rain, floodwater |
 | Stillsmoke | guqin, dizi, temple bells, great barrel drums | mountain rain, far thunder |
 | Stonewhisper | long mountain horns, singing bowls, damaru, low chant | high wind, falling scree |
+| Cometail | glass harmonica, crystal bowls, frame drum, overtone singing | the hiss of a meteor, ice cracking in the cold |
 
 **Frostfang** colours: long horns, hardanger fiddle and nyckelharpa, kulning,
 bone flute, singing bowls, wind over ice. **Emberclaw** colours: kora,

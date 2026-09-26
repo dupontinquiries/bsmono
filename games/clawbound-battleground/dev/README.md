@@ -7,13 +7,13 @@ generated from the game's own data, so they always say what the game does.
 | | |
 |---|---|
 | `LORE.md` | The world: the clans, the Gathering, Frostfang and Emberclaw, the old grounds, every ancestor (kind, age, land, gender, story), and the music of each clan's culture. |
-| `voice_script/01_goldenmane.svg` … `15_announcer.svg` | One cue card per voice, to read at the mic: every line in large type, the file to save it as, how to say it, an energy meter (1 murmur … 5 full shout), and when the game plays it. |
+| `voice_script/01_goldenmane.svg` … `16_announcer.svg` | One cue card per voice, to read at the mic: every line in large type, the file to save it as, how to say it, an energy meter (1 murmur … 5 full shout), and when the game plays it. |
 | `voice_script/recording_sheet.tsv` | The same, as a spreadsheet: one row per file. |
 | `music/intro_cue_sheet.svg` | The intro's timeline for scoring: sections, the narrator's eight lines, numbered sync points, a 90 BPM bar grid, and instrumentation notes per section. |
 
 ## Recording voices
 
-- 146 lines: 13 ancestors × 9 (a select line, one per ability, two kills,
+- 155 lines: 14 ancestors × 9 (a select line, one per ability, two kills,
   two deaths), the narrator's 8-line prologue, and 21 announcer calls.
 - Record 48 kHz mono; leave about 0.2 s of silence before and after each
   line; export **Opus** (~96 kbps). WAV (16-bit or float) also works.

@@ -693,6 +693,14 @@ impl Blockers {
         }
     }
 
+    /// As [`Self::resolve_at`] without the floor: props still push, the
+    /// floor's edge does not. For a cat off the floor ON PURPOSE -- riding a
+    /// sky-map cloud across a chasm, or in the air over one -- whom the
+    /// floor would otherwise drag back to the nearest island.
+    pub fn resolve_free(&self, pos: Vec3, radius: f32, feet_y: f32) -> Vec3 {
+        self.resolve_props(pos, radius, feet_y)
+    }
+
     fn resolve_props(&self, pos: Vec3, radius: f32, feet_y: f32) -> Vec3 {
         if self.all.is_empty() {
             return pos;

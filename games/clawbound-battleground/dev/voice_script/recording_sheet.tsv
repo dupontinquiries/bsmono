@@ -116,6 +116,15 @@ voice/stonewhisper/kill.1.opus	stonewhisper	On time.	dry	2	takes down an enemy a
 voice/stonewhisper/kill.2.opus	stonewhisper	The mountain waited.	patient	2	takes down an enemy ancestor
 voice/stonewhisper/death.1.opus	stonewhisper	Crumble...	a rockfall of a word	2	falls
 voice/stonewhisper/death.2.opus	stonewhisper	Stone... sleeps...	settling	1	falls
+voice/cometail/select.opus	cometail	Look up. I'm already falling.	grinning, a little breathless	3	locked in on the select screen
+voice/cometail/cast1.opus	cometail	Starshot!	a flick of the paw, sharp	4	winds up Starshot
+voice/cometail/cast2.opus	cometail	Pounce!	a leap -- up on the vowel	4	winds up Meteor Pounce
+voice/cometail/cast3.opus	cometail	Flare!	a bright burst, eyes shut	4	winds up Flare
+voice/cometail/cast4.opus	cometail	Watch the SKY!	from far above, rising to a shout	5	winds up Falling Star
+voice/cometail/kill.1.opus	cometail	Never saw me coming. Nobody does.	light, teasing	3	takes down an enemy ancestor
+voice/cometail/kill.2.opus	cometail	Burned out.	quiet, almost gentle	2	takes down an enemy ancestor
+voice/cometail/death.1.opus	cometail	Just... a shooting star...	fading, wistful	2	falls
+voice/cometail/death.2.opus	cometail	Back... to the sky...	a last breath, looking up	1	falls
 narrator/prologue1.opus	narrator	Before any word was written, the world belonged to the clans.	hushed, as if starting an old story	2	the prologue opens, line 1 of 8 (first match of a session)
 narrator/prologue2.opus	narrator	No hand raised a wall. No fire burned but the lightning's.	slow, each sentence its own image	2	the prologue, line 2 of 8
 narrator/prologue3.opus	narrator	From the frozen long-ago to the endless dunes, the great cats kept it.	growing, sweeping	3	the prologue, line 3 of 8

@@ -292,6 +292,16 @@ pub fn ability(def: &GodDef, slot: usize) -> Vec<f32> {
                 *o = drive(lp * 2.5 + sub + bp * 0.9, fl.grit) * (u * 6.0).min(1.0) * (1.0 - u).powf(0.6);
             }
         }
+        Archetype::Meteor { .. } => {
+            // a rising shriek, then the impact: a long whoosh falling in
+            // pitch, a deep thud and a crackle of starfire
+            let w = whoosh(0.7, 3200.0, 500.0, 1.8, &mut n);
+            mix_at(&mut x, &w, 0.0, 0.9);
+            let t = thud(0.5, b * 0.9, b * 0.3, fl.grit + 0.3, &mut n);
+            mix_at(&mut x, &t, 0.62, 1.2);
+            let c = zap(0.35, b * 9.0, b * 2.0, fl, &mut n);
+            mix_at(&mut x, &c, 0.64, 0.6);
+        }
         Archetype::Dash { .. } => {
             let w = whoosh(0.3, 300.0, 2600.0, 1.4, &mut n);
             mix_at(&mut x, &w, 0.0, 1.0);

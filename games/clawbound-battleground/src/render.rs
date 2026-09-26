@@ -76,7 +76,10 @@ pub struct Camera {
 impl Camera {
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         let view = Mat4::look_at_rh(self.eye, self.target, Vec3::Y);
-        let proj = Mat4::perspective_rh(self.fov_y, aspect, 0.25, 500.0);
+        // the sky map's cloud sea runs to the horizon: at 500 u it ended in
+        // a straight cut across the view
+        let far = if crate::map::active() == crate::map::MapId::Sky { 950.0 } else { 500.0 };
+        let proj = Mat4::perspective_rh(self.fov_y, aspect, 0.25, far);
         proj * view
     }
 }
@@ -1203,7 +1206,9 @@ impl Renderer {
             view_proj: vp.to_cols_array_2d(),
             inv_view_proj: inv.to_cols_array_2d(),
             light_view_proj: lvp.to_cols_array_2d(),
-            sun_dir: [sun.x, sun.y, sun.z, 0.0],
+            // w: the spirit sky (Starwell Glacier) -- no mountains on the
+            // horizon, aurora, stars to the horizon (sky.wgsl)
+            sun_dir: [sun.x, sun.y, sun.z, if crate::map::active() == crate::map::MapId::Sky { 1.0 } else { 0.0 }],
             cam_pos: [cam.eye.x, cam.eye.y, cam.eye.z, 1.0],
             fog_color,
             params: [time, atm.fog_density, self.exposure, atm.night],
@@ -1783,8 +1788,10 @@ pub fn sort_far_to_near<T>(items: &mut [(f32, T)]) {
 /// beyond the arena bounds, a mountain rim at the horizon, and river valleys
 /// that dip under the lanes (roads stay solid — bridges span the crossings).
 pub fn terrain_height(x: f32, z: f32) -> f32 {
-    if crate::map::active() == crate::map::MapId::Pass {
-        return crate::pass::terrain_height(x, z);
+    match crate::map::active() {
+        crate::map::MapId::Pass => return crate::pass::terrain_height(x, z),
+        crate::map::MapId::Sky => return crate::sky::terrain_height(x, z),
+        crate::map::MapId::Jungle => {}
     }
     use crate::consts::{river_dist, GROUND_HALF, RIVER_HALF_WIDTH, RIVER_DEPTH, ARENA_RADIUS, RIM_RADIUS};
     let r = (x * x + z * z).sqrt();
@@ -1911,6 +1918,8 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
             let mut mat = 0.0f32;
             if crate::map::active() == crate::map::MapId::Pass {
                 (color, mat) = pass_ground_color(x, z, h, slope, n1, n2, nm);
+            } else if crate::map::active() == crate::map::MapId::Sky {
+                (color, mat) = sky_ground_color(x, z, h, slope, n1, n2, nm);
             } else if r > crate::consts::RIM_RADIUS + 3.0 && h > 14.0 {
                 // mountain rim: dark jungle rock with forest ledges
                 let rock = [0.24 + n1 * 0.05, 0.24 + n2 * 0.04, 0.22 + n1 * 0.03];
@@ -2072,6 +2081,74 @@ fn pass_ground_color(x: f32, z: f32, h: f32, slope: f32, n1: f32, n2: f32, nm: f
     (lerp(c, snow, snow_t), if snow_t > 0.5 { 6.0 } else { 4.0 })
 }
 
+/// Starwell Glacier ground. The lanes are old pale stone, almost marble,
+/// worn smooth; the islands are snow over glacier ice with alpine meadow
+/// breaking through in the sheltered middles (spirit-teal, not green); the
+/// Moonwell's floor is pale silt; the lip at every edge is blue ice; the
+/// island undersides are dark blue rock and ice falling away; the cloud sea
+/// far below is soft lavender-white. Cold and luminous: the only warm light
+/// on this map is starfire and a cat.
+fn sky_ground_color(x: f32, z: f32, h: f32, slope: f32, n1: f32, n2: f32, nm: f32) -> ([f32; 3], f32) {
+    use crate::sky;
+    let d = sky::floor().sdf(x, z);
+    let lerp = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    if d <= 0.3 {
+        let r = x.hypot(z);
+        if r < sky::POOL_R + 1.5 {
+            // the Moonwell's bed: pale silt, faintly silver
+            return ([0.62 + n1 * 0.05, 0.68 + n1 * 0.05, 0.74 + n2 * 0.04], 3.0);
+        }
+        // on a lane? the old road
+        let road = crate::render::lane_road(x, z);
+        let stone = [0.70 + n1 * 0.05, 0.72 + n1 * 0.05, 0.76 + n2 * 0.04];
+        let snow = [0.86 + n2 * 0.05, 0.89 + n2 * 0.05, 0.95 + n2 * 0.03];
+        // alpine meadow: sage, frosted (a saturated teal read as water)
+        let meadow = [0.40 + n1 * 0.05, 0.52 + n2 * 0.05, 0.38 + n1 * 0.04];
+        if road < sky::LANE_R - 1.5 {
+            // flagstones: faint joints every ~3 u
+            let joint = ((x * 0.33).fract() < 0.06) as i32 as f32 * 0.5 + ((z * 0.33).fract() < 0.06) as i32 as f32 * 0.5;
+            let c = lerp(stone, [0.52, 0.55, 0.62], joint.min(1.0) * 0.5);
+            // snow drifting in at the road's edge
+            let drift = smoothstep(sky::LANE_R - 5.0, sky::LANE_R - 1.5, road) * smoothstep(0.4, 0.7, nm);
+            return (lerp(c, snow, drift), 4.0);
+        }
+        // islands: snow, with meadow in the sheltered middles
+        let inner = smoothstep(-4.0, -12.0, d);
+        let meadow_t = (smoothstep(0.52, 0.72, nm) * inner).clamp(0.0, 1.0);
+        let c = lerp(snow, meadow, meadow_t);
+        return (c, if meadow_t > 0.5 { 0.0 } else { 6.0 });
+    }
+    if h > -2.0 {
+        // the lip: blue glacier ice
+        return ([0.52 + n1 * 0.08, 0.76 + n2 * 0.06, 0.92 + n1 * 0.04], 6.0);
+    }
+    if h > sky::CLOUD_SEA_Y + 11.0 {
+        // the underside: dark blue rock, streaked with ice
+        let rock = [0.14 + n1 * 0.04, 0.17 + n1 * 0.04, 0.26 + n2 * 0.05];
+        let ice = [0.40, 0.62, 0.80];
+        let streak = smoothstep(0.6, 0.8, vnoise(x * 0.4, h * 0.3));
+        return (lerp(rock, ice, streak * 0.6 * (1.0 - slope.min(1.0) * 0.3)), 5.0);
+    }
+    // the cloud sea: lavender-white billows, bluer in the troughs
+    let crest = ((h - sky::CLOUD_SEA_Y) / 9.0).clamp(0.0, 1.0);
+    (lerp([0.46, 0.50, 0.70], [0.88, 0.87, 0.96], crest), 6.0)
+}
+
+/// Distance from (x, z) to the nearest lane centre-line on the active map
+/// (the sky's two; the others' three).
+pub fn lane_road(x: f32, z: f32) -> f32 {
+    let p = Vec3::new(x, 0.0, z);
+    let mut best = f32::MAX;
+    for &lane in crate::map::lanes() {
+        for w in lane.polyline().windows(2) {
+            let ab = w[1] - w[0];
+            let t = ((p - w[0]).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+            best = best.min((w[0] + ab * t - p).length());
+        }
+    }
+    best
+}
+
 /// The pass's streams: a strip of water over each, 0.5 u cells, cut to the
 /// wet part like the jungle's rivers. The lip-to-pool stretch is the
 /// waterfall and is a prop, not a strip.
@@ -2122,9 +2199,40 @@ fn build_pass_water() -> (Vec<WaterVert>, Vec<u32>) {
     (verts, idx)
 }
 
+/// The Moonwell: a disc of shallow water, 0.5 u cells, slowly turning.
+fn build_sky_water() -> (Vec<WaterVert>, Vec<u32>) {
+    use crate::consts::WATER_LEVEL;
+    const STEP: f32 = 0.5;
+    let r = crate::sky::POOL_R + 1.2;
+    let n = (r * 2.0 / STEP) as usize + 1;
+    let mut verts = Vec::with_capacity(n * n);
+    let mut idx = Vec::new();
+    for iz in 0..n {
+        for ix in 0..n {
+            let (x, z) = (-r + ix as f32 * STEP, -r + iz as f32 * STEP);
+            // a slow swirl round the middle
+            let tang = glam::Vec2::new(-z, x).normalize_or_zero() * 0.4;
+            verts.push(WaterVert { pos: [x, WATER_LEVEL, z], bed: terrain_height(x, z), flow: tang.to_array(), uv: [x / r, z / r] });
+        }
+    }
+    for iz in 0..n - 1 {
+        for ix in 0..n - 1 {
+            let i = |a: usize, b: usize| (a + n * b) as u32;
+            let (qa, qb, qc, qd) = (i(ix, iz), i(ix + 1, iz), i(ix, iz + 1), i(ix + 1, iz + 1));
+            let dry = [qa, qb, qc, qd].iter().all(|&k| verts[k as usize].bed > WATER_LEVEL + 0.05);
+            if !dry {
+                idx.extend_from_slice(&[qa, qc, qb, qb, qc, qd]);
+            }
+        }
+    }
+    (verts, idx)
+}
+
 fn build_water() -> (Vec<WaterVert>, Vec<u32>) {
-    if crate::map::active() == crate::map::MapId::Pass {
-        return build_pass_water();
+    match crate::map::active() {
+        crate::map::MapId::Pass => return build_pass_water(),
+        crate::map::MapId::Sky => return build_sky_water(),
+        crate::map::MapId::Jungle => {}
     }
     use crate::consts::{river_x, GROUND_HALF, RIVER_HALF_WIDTH, WATER_LEVEL};
     const STEP: f32 = 1.0;

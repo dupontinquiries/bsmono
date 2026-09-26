@@ -81,7 +81,7 @@ pub fn play(spec: &MatchSpec) -> Outcome {
     let blue = match game.over {
         Some(Team::Blue) => 1.0,
         Some(Team::Red) => 0.0,
-        None => grade([game.titans[0].hp / crate::consts::TITAN_HP, game.titans[1].hp / crate::consts::TITAN_HP], towers, kills),
+        None => grade([game.titans[0].hp / game.titan_max_hp(), game.titans[1].hp / game.titan_max_hp()], towers, kills),
     };
     Outcome { blue, winner: game.over, t: game.t, kills, towers }
 }

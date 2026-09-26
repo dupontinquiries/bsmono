@@ -240,6 +240,21 @@ pub const PARTS: &[Part] = &[
         ],
     },
     Part {
+        who: "cometail",
+        voice: "Bright, quick tenor with a spark of laughter under it: a young daredevil who has already jumped. Fast in, fast out -- then one huge call for the falling star.",
+        lines: &[
+            l("select", "Look up. I'm already falling.", "grinning, a little breathless", 3, SELECT),
+            l("cast1", "Starshot!", "a flick of the paw, sharp", 4, "winds up Starshot"),
+            l("cast2", "Pounce!", "a leap -- up on the vowel", 4, "winds up Meteor Pounce"),
+            l("cast3", "Flare!", "a bright burst, eyes shut", 4, "winds up Flare"),
+            l("cast4", "Watch the SKY!", "from far above, rising to a shout", 5, "winds up Falling Star"),
+            l("kill.1", "Never saw me coming. Nobody does.", "light, teasing", 3, KILL),
+            l("kill.2", "Burned out.", "quiet, almost gentle", 2, KILL),
+            l("death.1", "Just... a shooting star...", "fading, wistful", 2, DEATH),
+            l("death.2", "Back... to the sky...", "a last breath, looking up", 1, DEATH),
+        ],
+    },
+    Part {
         who: "narrator",
         voice: "The storyteller of the clans, over the first match's prologue: unhurried, weighty, a little in awe. Let each line breathe; the music leaves room between them. Record each as its own file.",
         lines: &[

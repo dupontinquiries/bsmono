@@ -81,6 +81,9 @@ pub enum Archetype {
     Heal { amount: f32, radius: f32 },
     /// Drag enemies in radius toward the center point, damaging them.
     Pull { radius: f32, dmg: f32 },
+    /// Vault into the sky and come down as a falling star at the aim
+    /// (within `range`), `vault` seconds later: a blast of `radius`.
+    Meteor { range: f32, radius: f32, dmg: f32, vault: f32 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -161,6 +164,7 @@ pub enum PeltKind {
     SunDisc,   // Suneye — a floating sun disc above the brow
     Antlers,   // Stillsmoke — antlered, scaled, saber-fanged
     Crag,      // Stonewhisper — thick grey pelt, no markings
+    Comet,     // Cometail — night-blue, starred back, a tail that streams light
 }
 
 impl GodDef {
@@ -190,7 +194,7 @@ const fn ab(
     AbilityDef { name, desc, arch, cooldown: cd, cost, color, key, ult, power_scale: scale }
 }
 
-pub const ROSTER_LEN: usize = 13;
+pub const ROSTER_LEN: usize = 14;
 
 pub const ROSTER: [GodDef; ROSTER_LEN] = [
     // ── GOLDENMANE — the lion-clan of legend ──
@@ -412,6 +416,23 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
             ab("Stone Patience", "Settle like bedrock — blows glance away.", Archetype::Shield { amount: 260.0, duration: 5.5 }, 16.0, 80.0, [0.75, 0.70, 0.60], 1, false, 0.35),
             ab("Sure-Footed", "Patient weight — a stamp that quakes the scree.", Archetype::Nova { radius: 6.5, dmg: 95.0, slow: 0.4 }, 10.0, 65.0, [0.65, 0.60, 0.50], 2, false, 0.45),
             ab("The Crags Answer", "The scree comes down — everything near is buried and battered.", Archetype::Ring { radius: 9.0, delay: 0.9, dmg: 250.0 }, 76.0, 120.0, [0.80, 0.72, 0.58], 3, true, 0.70),
+        ],
+    },
+    // ── COMETAIL — the star-fallen, who came down with the comet ──
+    GodDef {
+        id: 13, name: "Cometail", title: "the star-fallen, who came down with the comet over the glacier",
+        philosophy: "What falls from the sky does not ask where it may land.",
+        role: Role::Assassin, auto: AutoKind::Melee, dmg_type: DmgType::Magical,
+        palette: [[0.16, 0.20, 0.42], [0.10, 0.12, 0.26], [0.78, 0.82, 0.95], [1.00, 0.86, 0.46]],
+        weapon: WeaponKind::None, pelt: PeltKind::Comet,
+        hp: 590.0, hp_growth: 94.0, mana: 330.0, mana_growth: 38.0,
+        auto_dmg: 50.0, auto_growth: 3.6, power: 11.0, power_growth: 3.0,
+        protection: 21.0, prot_growth: 2.5, move_speed: 12.8, auto_range: 3.4, auto_cd: 0.95,
+        abilities: [
+            ab("Starshot", "A shard of the comet flung from the paw — it streaks, and it burns.", Archetype::Bolt { speed: 40.0, dmg: 95.0, radius: 0.7 }, 5.5, 55.0, [1.00, 0.92, 0.60], 0, false, 0.50),
+            ab("Meteor Pounce", "He leaps and comes down burning — everything under the arc is scorched.", Archetype::Dash { dist: 12.0, dmg: 110.0 }, 9.0, 65.0, [1.00, 0.78, 0.40], 1, false, 0.50),
+            ab("Flare", "His whole coat lights at once — a white blast that blinds and staggers.", Archetype::Nova { radius: 6.5, dmg: 105.0, slow: 0.35 }, 10.0, 70.0, [1.00, 0.97, 0.85], 2, false, 0.50),
+            ab("Falling Star", "He vaults into the night and is gone — then he is the star, and he is falling.", Archetype::Meteor { range: 22.0, radius: 8.5, dmg: 300.0, vault: 1.1 }, 80.0, 130.0, [1.00, 0.88, 0.55], 3, true, 0.75),
         ],
     },
 ];

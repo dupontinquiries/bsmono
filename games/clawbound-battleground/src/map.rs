@@ -29,15 +29,19 @@ pub enum MapId {
     Jungle,
     /// Twinfang Pass: the mountain canyon map, 15 a side.
     Pass,
+    /// Starwell Glacier: two wide lanes over glacier islands in the sky,
+    /// 15 a side (`sky`).
+    Sky,
 }
 
 impl MapId {
-    pub const ALL: [MapId; 2] = [MapId::Jungle, MapId::Pass];
+    pub const ALL: [MapId; 3] = [MapId::Jungle, MapId::Pass, MapId::Sky];
 
     pub fn name(self) -> &'static str {
         match self {
             MapId::Jungle => "The Jungle",
             MapId::Pass => "Twinfang Pass",
+            MapId::Sky => "Starwell Glacier",
         }
     }
     /// Command-line / config key.
@@ -45,6 +49,7 @@ impl MapId {
         match self {
             MapId::Jungle => "jungle",
             MapId::Pass => "pass",
+            MapId::Sky => "starwell",
         }
     }
     pub fn from_key(s: &str) -> Option<MapId> {
@@ -55,8 +60,51 @@ impl MapId {
         match self {
             MapId::Jungle => 5,
             MapId::Pass => crate::pass::TEAM_SIZE,
+            MapId::Sky => crate::sky::TEAM_SIZE,
         }
     }
+    /// The lanes minions walk and towers stand on. The sky map has two:
+    /// `Lane::Mid` exists there only as a camera route.
+    pub fn lanes(self) -> &'static [crate::consts::Lane] {
+        use crate::consts::Lane;
+        match self {
+            MapId::Jungle | MapId::Pass => &crate::consts::LANES,
+            MapId::Sky => &[Lane::Top, Lane::Bot],
+        }
+    }
+    /// Minions per side in each lane's wave, (melee, casters), for wave
+    /// number `n` (`minionai::wave_for` on the smaller maps).
+    pub fn wave(self, n: u32) -> (usize, usize) {
+        match self {
+            MapId::Jungle | MapId::Pass => crate::minionai::wave_for(n),
+            // sixteen a side: thirty-two in each lane when the waves meet
+            MapId::Sky => (12, 4),
+        }
+    }
+    /// Towers and Elders are this much tougher than `TOWER_HP`/`TITAN_HP`.
+    /// The sky map's waves are four times the jungle's (sixteen a side):
+    /// at x1 a broken lane let one wave kill the Elder, and AI-only matches
+    /// ended at three minutes.
+    pub fn structure_hp_mul(self) -> f32 {
+        match self {
+            MapId::Jungle | MapId::Pass => 1.0,
+            MapId::Sky => 3.0,
+        }
+    }
+    /// A team's Elder is shielded while it has at least this many towers
+    /// standing: all but three of six on the three-lane maps, all but two
+    /// of four on the sky.
+    pub fn titan_towers_req(self) -> usize {
+        match self {
+            MapId::Jungle | MapId::Pass => crate::consts::TITAN_TOWERS_REQ,
+            MapId::Sky => 3,
+        }
+    }
+}
+
+/// The active map's lanes (`MapId::lanes`).
+pub fn lanes() -> &'static [crate::consts::Lane] {
+    active().lanes()
 }
 
 thread_local! {
@@ -96,6 +144,7 @@ pub fn open_ground(x: f32, z: f32, margin: f32) -> bool {
     match active() {
         MapId::Jungle => true,
         MapId::Pass => crate::pass::floor().fits(x, z, margin),
+        MapId::Sky => crate::sky::floor().fits(x, z, margin),
     }
 }
 
@@ -106,6 +155,7 @@ pub fn ground_y(x: f32, z: f32) -> f32 {
     match active() {
         MapId::Jungle => 0.0,
         MapId::Pass => crate::pass::floor_height(x, z),
+        MapId::Sky => crate::sky::floor_height(x, z),
     }
 }
 
@@ -114,7 +164,7 @@ pub fn ground_y(x: f32, z: f32) -> f32 {
 /// anything above the floor falls).
 pub fn step_down() -> f32 {
     match active() {
-        MapId::Jungle => 0.0,
+        MapId::Jungle | MapId::Sky => 0.0,
         MapId::Pass => 0.8,
     }
 }
@@ -124,6 +174,7 @@ pub fn floor() -> Option<&'static crate::floor::FloorPlan> {
     match active() {
         MapId::Jungle => None,
         MapId::Pass => Some(crate::pass::floor()),
+        MapId::Sky => Some(crate::sky::floor()),
     }
 }
 
@@ -212,6 +263,27 @@ mod tests {
         assert_eq!(MapId::from_key(" PASS "), Some(MapId::Pass));
         assert_eq!(MapId::from_key("moon"), None);
         assert_eq!(active(), MapId::Jungle);
+    }
+
+    /// The sky map: two lanes, four towers a side that take three times the
+    /// beating, an Elder that opens when two fall, and waves of sixteen.
+    #[test]
+    fn the_sky_map_has_its_own_rules() {
+        use crate::consts::{Lane, TITAN_HP, TOWER_HP};
+        with(MapId::Sky, || {
+            let g = crate::sim::Game::new_teams(&[0], &[1]);
+            assert_eq!(lanes(), &[Lane::Top, Lane::Bot]);
+            assert_eq!(g.towers.len(), 8);
+            assert_eq!(g.tower_alive, [4, 4]);
+            assert!(g.towers.iter().all(|t| (t.max_hp - TOWER_HP * 3.0).abs() < 1e-3));
+            assert!((g.titans[0].hp - TITAN_HP * 3.0).abs() < 1e-3 && (g.titan_max_hp() - TITAN_HP * 3.0).abs() < 1e-3);
+            let (m, c) = MapId::Sky.wave(0);
+            assert_eq!(m + c, 16, "sixteen a side: thirty-two in a lane");
+            assert!(g.titan_shielded(crate::consts::Team::Blue));
+        });
+        let g = crate::sim::Game::new_teams(&[0], &[1]);
+        assert_eq!((g.towers.len(), g.tower_alive), (12, [6, 6]), "the jungle is unchanged");
+        assert!((g.titans[0].hp - crate::consts::TITAN_HP).abs() < 1e-3);
     }
 
     #[test]

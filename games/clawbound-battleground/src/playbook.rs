@@ -128,8 +128,9 @@ pub fn draw_pair(rng: &mut Rng) -> [Page; 2] {
 /// assignment; with probability `group` x 0.8 a bot joins the middle
 /// lane, and a page with almost no `group` spreads the bots evenly.
 pub fn lanes_for(genes: &Genes, lanes: &[Lane], rng: &mut Rng) -> Vec<Lane> {
-    let spread = [Lane::Top, Lane::Mid, Lane::Bot];
-    let main = Lane::Mid;
+    // the map's own lanes: two on the sky, where the "main" lane is the west
+    let spread = crate::map::lanes();
+    let main = spread[(spread.len() - 1) / 2];
     lanes
         .iter()
         .enumerate()
@@ -137,7 +138,7 @@ pub fn lanes_for(genes: &Genes, lanes: &[Lane], rng: &mut Rng) -> Vec<Lane> {
             if rng.f32() < genes.group * 0.8 {
                 main
             } else if genes.group < 0.2 {
-                spread[k % 3]
+                spread[k % spread.len()]
             } else {
                 l
             }
