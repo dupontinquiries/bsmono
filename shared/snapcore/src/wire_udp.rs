@@ -102,6 +102,14 @@ use std::time::{Duration, Instant};
 /// tried.
 pub const REPLY_TIMEOUT: Duration = Duration::from_millis(1_500);
 
+/// Sends per query within [`REPLY_TIMEOUT`]. The reference retries a request
+/// that has not been answered after half of `MAX_RESPONSE_TIME` (1 s), three
+/// attempts in all (`Request::MAX_ATTEMPT_COUNT`); one lost datagram -- routine on
+/// a phone radio waking up -- no longer costs the whole query. Same `tid` on every
+/// attempt, so whichever copy is answered first is the answer and the rest are
+/// late replies the tid check discards.
+pub const ATTEMPTS: u32 = 3;
+
 /// Bigger than any reply the reference sends, and bounded so a hostile
 /// datagram cannot make us allocate.
 pub const MAX_DATAGRAM: usize = 8 * 1024;
@@ -207,15 +215,29 @@ impl WireUdpTransport {
             // arrive with nobody expecting it.
             let (tx, rx) = mpsc::channel();
             self.pending.lock().ok()?.insert(tid, Pending { addr: to.addr, tx });
-            let sent = self.sock.send_to(&msg.encode(), to.addr).is_ok();
-            let got = if sent { rx.recv_timeout(REPLY_TIMEOUT).ok() } else { None };
+            let bytes = msg.encode();
+            let per_attempt = REPLY_TIMEOUT / ATTEMPTS;
+            let mut got = None;
+            for _ in 0..ATTEMPTS {
+                if self.sock.send_to(&bytes, to.addr).is_err() {
+                    break;
+                }
+                if let Ok(m) = rx.recv_timeout(per_attempt) {
+                    got = Some(m);
+                    break;
+                }
+            }
             if let Ok(mut p) = self.pending.lock() { p.remove(&tid); }
             return match got {
                 Some(Msg::Error { .. }) | None => None,
                 other => other,
             };
         }
-        self.sock.send_to(&msg.encode(), to.addr).ok()?;
+        let bytes = msg.encode();
+        self.sock.send_to(&bytes, to.addr).ok()?;
+        let per_attempt = REPLY_TIMEOUT / ATTEMPTS;
+        let mut sent = 1;
+        let mut resend_at = Instant::now() + per_attempt;
         // KEEP READING UNTIL THE DEADLINE rather than treating the first
         // datagram as the answer. One socket receives replies, unsolicited
         // queries from other nodes, and late answers to queries that
@@ -225,15 +247,24 @@ impl WireUdpTransport {
         let deadline = Instant::now() + REPLY_TIMEOUT;
         let mut buf = [0u8; MAX_DATAGRAM];
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            let now = Instant::now();
+            if now >= deadline {
                 return None;
             }
-            // Shrink the socket timeout to what is left, so the loop cannot
-            // outlive the deadline by one full timeout per stray datagram.
+            if now >= resend_at && sent < ATTEMPTS {
+                let _ = self.sock.send_to(&bytes, to.addr);
+                sent += 1;
+                resend_at = now + per_attempt;
+            }
+            // Wake for the next resend or the deadline, whichever is first, so
+            // the loop cannot outlive either by one full timeout per stray
+            // datagram.
+            let wake = if sent < ATTEMPTS { resend_at.min(deadline) } else { deadline };
+            let left = wake.saturating_duration_since(now).max(Duration::from_millis(1));
             self.sock.set_read_timeout(Some(left)).ok()?;
             let (n, from) = match self.sock.recv_from(&mut buf) {
                 Ok(v) => v,
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
                 Err(_) => return None,
             };
             // A reply from an address we did not ask is dropped. UDP has no
@@ -474,23 +505,51 @@ impl Transport for WireUdpTransport {
         }
     }
 
-    fn store(&self, _from: &Contact, to: &Contact, key: Key, value: Vec<u8>, _ttl: u64) {
-        if value.len() > dht_kit::MAX_VALUE_SIZE {
-            // The reference refuses it; sending it would be a timeout with
-            // extra steps.
-            return;
+    fn store(&self, from: &Contact, to: &Contact, key: Key, value: Vec<u8>, ttl: u64) {
+        // One implementation: `store_acked` below. The value id comes from the
+        // bytes so republishing the same record does not accumulate duplicates
+        // under one key, and the token is the one this peer handed us during
+        // the lookup -- or, if the lookup only heard of this peer from a third
+        // party, a `get` is sent first to earn one (the reference does a `get`
+        // to every announce target for the same reason; a put without a token
+        // is refused with 401).
+        let _ = self.store_acked(from, to, key, value, ttl);
+    }
+
+    fn ping(&self, _from: &Contact, to: &Contact) -> bool {
+        let (tid, msg) = self.query(Query::Ping, &NodeId([0; 20]), Vec::new(), Vec::new());
+        matches!(self.round_trip(to, tid, &msg), Some(Msg::Reply { .. }))
+    }
+
+    // A reply always names its responder (`contacts_of` puts it first), so an
+    // empty list from `find_node` already meant "no answer" -- but the lookup
+    // driver could not know that. These say it.
+
+    fn query_nodes(&self, _from: &Contact, to: &Contact, target: &NodeId) -> Option<Vec<Contact>> {
+        let (tid, msg) = self.query(Query::Find, target, Vec::new(), Vec::new());
+        self.round_trip(to, tid, &msg).map(|reply| contacts_of(&reply, to.addr, 0))
+    }
+
+    fn query_value(&self, _from: &Contact, to: &Contact, key: &Key) -> Option<FindValue> {
+        let (tid, msg) = self.query(Query::Get, key, Vec::new(), Vec::new());
+        match self.round_trip(to, tid, &msg)? {
+            reply @ Msg::Reply { .. } => {
+                let Msg::Reply { values, .. } = &reply else { unreachable!() };
+                Some(if values.is_empty() {
+                    FindValue::Closest(contacts_of(&reply, to.addr, 0))
+                } else {
+                    FindValue::Values(values.iter().map(|v| v.data.clone()).collect())
+                })
+            }
+            _ => None,
         }
-        // The value id is derived from the bytes so republishing the same
-        // record does not accumulate duplicates under one key — OpenDHT
-        // holds a SET per key, and a fresh random id every hour would fill
-        // it with copies of us.
+    }
+
+    fn store_acked(&self, _from: &Contact, to: &Contact, key: Key, value: Vec<u8>, _ttl: u64) -> bool {
+        if value.len() > dht_kit::MAX_VALUE_SIZE {
+            return false;
+        }
         let v = Value::new(content_id(&value), value);
-        // The token this peer handed us during the lookup that found it —
-        // or, if the lookup learned of this peer from a third party and
-        // never asked it anything, ask it now. A lookup's final shortlist
-        // is the k CLOSEST, not the k QUERIED, and a put to a peer we have
-        // not spoken to is refused with 401 by the reference. It does a
-        // `get` to every announce target for the same reason.
         let mut token = self.token_for(to.addr);
         if token.is_empty() {
             let (tid, get) = self.query(Query::Get, &key, Vec::new(), Vec::new());
@@ -498,15 +557,33 @@ impl Transport for WireUdpTransport {
             token = self.token_for(to.addr);
         }
         let (tid, msg) = self.query(Query::Put, &key, vec![v], token);
-        // Fire and forget: `store` returns nothing, so there is no way to
-        // report a refusal; the reply is still awaited so a token in it is
-        // remembered and an error is not mistaken for the next answer.
-        let _ = self.round_trip(to, tid, &msg);
+        // A Reply is the reference's acceptance; an Error (401 bad token, 413
+        // too big, ...) or silence is not.
+        matches!(self.round_trip(to, tid, &msg), Some(Msg::Reply { .. }))
     }
 
-    fn ping(&self, _from: &Contact, to: &Contact) -> bool {
-        let (tid, msg) = self.query(Query::Ping, &NodeId([0; 20]), Vec::new(), Vec::new());
-        matches!(self.round_trip(to, tid, &msg), Some(Msg::Reply { .. }))
+    fn query_nodes_many(&self, from: &Contact, to: &[Contact], target: &NodeId) -> Vec<Option<Vec<Contact>>> {
+        self.fan_out(to, |c| self.query_nodes(from, c, target))
+    }
+
+    fn query_value_many(&self, from: &Contact, to: &[Contact], key: &Key) -> Vec<Option<FindValue>> {
+        self.fan_out(to, |c| self.query_value(from, c, key))
+    }
+}
+
+impl WireUdpTransport {
+    /// Run `f` for each contact -- concurrently when a serving thread owns the
+    /// read side (round trips then wait on their own tid and cannot steal each
+    /// other's replies), sequentially otherwise (each round trip reads the
+    /// socket itself, so two at once would take each other's answers).
+    fn fan_out<R: Send>(&self, to: &[Contact], f: impl Fn(&Contact) -> R + Sync) -> Vec<R> {
+        if to.len() <= 1 || !self.served.load(Ordering::Acquire) {
+            return to.iter().map(&f).collect();
+        }
+        std::thread::scope(|s| {
+            let handles: Vec<_> = to.iter().map(|c| { let f = &f; s.spawn(move || f(c)) }).collect();
+            handles.into_iter().map(|h| h.join().expect("a lookup query panicked")).collect()
+        })
     }
 }
 
@@ -590,6 +667,91 @@ mod tests {
         assert_eq!(got[0].addr, addr, "the responder is not first");
         assert_eq!(got[0].id, crate::wire::from_hash(&peer_id), "the responder's real id was not learned");
         assert_eq!(got[1].addr, "10.0.0.4:4222".parse::<SocketAddr>().unwrap());
+    }
+
+    /// ONE LOST DATAGRAM IS NOT A DEAD PEER. The responder ignores the first copy
+    /// of the query and answers the second: the query succeeds, and both copies
+    /// carried the same tid (so a late answer to either is the answer).
+    #[test]
+    fn a_dropped_query_is_retransmitted_under_the_same_tid() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let addr = sock.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, _) = sock.recv_from(&mut buf).ok()?;
+            let Some(Msg::Query { tid: first, .. }) = Msg::decode(&buf[..n]) else { return None };
+            let (n, from) = sock.recv_from(&mut buf).ok()?; // the retransmission
+            let Some(Msg::Query { tid: second, .. }) = Msg::decode(&buf[..n]) else { return None };
+            sock.send_to(&reply(second, peer3()).encode(), from).ok()?;
+            Some((first, second))
+        });
+        let t = transport();
+        let got = t.query_nodes(&contact(addr), &contact(addr), &id(2));
+        let (first, second) = h.join().unwrap().expect("the query was never resent");
+        assert_eq!(first, second, "a retransmission must reuse the tid");
+        assert!(got.is_some(), "the answer to the retransmission was not taken");
+        // And a peer that never answers is None -- not an empty answer.
+        let dead = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let da = dead.local_addr().unwrap();
+        assert!(t.query_nodes(&contact(da), &contact(da), &id(2)).is_none());
+    }
+
+    /// A put the peer REFUSES is not a store. `store` could not say so, and the
+    /// publish count was "peers asked".
+    #[test]
+    fn store_acked_reports_acceptance_and_refusal() {
+        let serve = |accept: bool| {
+            let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let addr = sock.local_addr().unwrap();
+            let h = std::thread::spawn(move || {
+                let mut buf = [0u8; MAX_DATAGRAM];
+                loop {
+                    let Ok((n, from)) = sock.recv_from(&mut buf) else { return };
+                    match Msg::decode(&buf[..n]) {
+                        Some(Msg::Query { tid, query: Query::Get, .. }) => {
+                            let _ = sock.send_to(&rep(tid, peer3(), vec![], vec![], vec![1], None).encode(), from);
+                        }
+                        Some(Msg::Query { tid, query: Query::Put, .. }) => {
+                            let answer = if accept { reply(tid, peer3()) }
+                                else { Msg::Error { tid, code: 401, from: None } };
+                            let _ = sock.send_to(&answer.encode(), from);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            (addr, h)
+        };
+        let t = transport();
+        let (a, h) = serve(true);
+        assert!(t.store_acked(&contact(a), &contact(a), id(2), b"v".to_vec(), 600));
+        h.join().unwrap();
+        let (a, h) = serve(false);
+        assert!(!t.store_acked(&contact(a), &contact(a), id(2), b"v".to_vec(), 600), "a 401 counted as stored");
+        h.join().unwrap();
+    }
+
+    /// A lookup round against dead peers costs ONE timeout on a served socket, not
+    /// one per peer. Serial, four silent peers were six seconds of a frozen lookup.
+    #[test]
+    fn a_served_round_asks_its_peers_concurrently() {
+        let t = std::sync::Arc::new(transport());
+        let node = std::sync::Arc::new(Mutex::new(Node::new(id(1), t.local_addr().unwrap())));
+        let serving = t.serve(node).unwrap();
+        let silent: Vec<UdpSocket> = (0..4).map(|_| UdpSocket::bind("127.0.0.1:0").unwrap()).collect();
+        let to: Vec<Contact> = silent.iter().map(|s| contact(s.local_addr().unwrap())).collect();
+        let started = Instant::now();
+        let got = t.query_nodes_many(&to[0], &to, &id(2));
+        let took = started.elapsed();
+        assert_eq!(got.len(), 4);
+        assert!(got.iter().all(|g| g.is_none()));
+        assert!(took < REPLY_TIMEOUT * 2, "four silent peers took {took:?}: asked one after another");
+        assert!(took >= REPLY_TIMEOUT - Duration::from_millis(100), "returned before the timeout: {took:?}");
+        t.stop_serving();
+        let _ = serving.join();
     }
 
     #[test]

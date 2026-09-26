@@ -250,10 +250,16 @@ impl RoutingTable {
     /// The `count` known contacts closest to `target` by XOR distance — the core
     /// query for iterative lookup and for answering an inbound FIND_NODE.
     pub fn closest(&self, target: &NodeId, count: usize) -> Vec<Contact> {
+        // BAD CONTACTS ARE NOT OFFERED. A contact stays in its bucket after it goes
+        // Bad (it is only evicted when a replacement is waiting), and `closest`
+        // used to return it anyway -- so every lookup kept spending a full reply
+        // timeout on the same dead nodes, and every FIND_NODE we answered handed
+        // them to other nodes too. OpenDHT never returns an expired node.
+        let bad = self.params.bad_after_failures;
         let mut all: Vec<Contact> = self
             .buckets
             .iter()
-            .flat_map(|b| b.live_contacts().iter().cloned())
+            .flat_map(|b| b.live_contacts().iter().filter(|c| c.failed < bad).cloned())
             .collect();
         all.sort_by(|a, c| a.id.distance(target).cmp(&c.id.distance(target)));
         all.truncate(count);
@@ -268,6 +274,21 @@ impl RoutingTable {
 
     pub fn len(&self) -> usize {
         self.buckets.iter().map(|b| b.live_contacts().len()).sum()
+    }
+
+    /// Contacts that are not Bad -- the ones a lookup can use. `len` counts every
+    /// contact held, including dead ones waiting for a replacement.
+    pub fn usable(&self) -> usize {
+        let bad = self.params.bad_after_failures;
+        self.buckets.iter().map(|b| b.live_contacts().iter().filter(|c| c.failed < bad).count()).sum()
+    }
+
+    /// Every held contact's `(id, consecutive failures)`, Bad ones included. For a
+    /// caller that ran a lookup on a COPY of the table and has to merge the
+    /// failures it observed back (see `snapclone-presence::node_host::with_rt`):
+    /// `closest` hides Bad contacts, so it cannot carry them.
+    pub fn failures(&self) -> Vec<(NodeId, u32)> {
+        self.buckets.iter().flat_map(|b| b.live_contacts().iter().map(|c| (c.id, c.failed))).collect()
     }
 
     pub fn is_empty(&self) -> bool {

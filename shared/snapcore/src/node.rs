@@ -23,6 +23,45 @@ pub trait Transport {
     fn find_value(&self, from: &Contact, to: &Contact, key: &Key) -> FindValue;
     fn store(&self, from: &Contact, to: &Contact, key: Key, value: Vec<u8>, ttl: u64);
     fn ping(&self, from: &Contact, to: &Contact) -> bool;
+
+    // ── The checked surface. Defaults wrap the four above, so a transport that
+    //    cannot tell "no answer" from "an empty answer" (the in-memory sims)
+    //    keeps working unchanged; a real network transport overrides them. ──
+
+    /// `find_node`, with `None` when the peer did not answer at all. The lookup
+    /// driver needs the difference: an empty answer is a live node that knows
+    /// nobody closer, and no answer is a strike against that node. The plain
+    /// method returns an empty list for both, and the driver used to count a
+    /// timeout as the node having responded -- dead nodes never aged out.
+    fn query_nodes(&self, from: &Contact, to: &Contact, target: &NodeId) -> Option<Vec<Contact>> {
+        Some(self.find_node(from, to, target))
+    }
+
+    /// `find_value`, with `None` for no answer. See [`Transport::query_nodes`].
+    fn query_value(&self, from: &Contact, to: &Contact, key: &Key) -> Option<FindValue> {
+        Some(self.find_value(from, to, key))
+    }
+
+    /// `store`, reporting whether the peer ACCEPTED it. `store` is fire and
+    /// forget, so a publish could only count the peers it asked, and a publish
+    /// every peer refused looked like a success.
+    fn store_acked(&self, from: &Contact, to: &Contact, key: Key, value: Vec<u8>, ttl: u64) -> bool {
+        self.store(from, to, key, value, ttl);
+        true
+    }
+
+    /// One round of a lookup: ask each of `to`. Sequential by default; a
+    /// transport whose round trips can overlap (the served UDP socket) asks them
+    /// concurrently, as OpenDHT does (`MAX_REQUESTED_SEARCH_NODES`), so a round
+    /// costs one timeout rather than one per dead node.
+    fn query_nodes_many(&self, from: &Contact, to: &[Contact], target: &NodeId) -> Vec<Option<Vec<Contact>>> {
+        to.iter().map(|c| self.query_nodes(from, c, target)).collect()
+    }
+
+    /// [`Transport::query_nodes_many`] for `find_value`.
+    fn query_value_many(&self, from: &Contact, to: &[Contact], key: &Key) -> Vec<Option<FindValue>> {
+        to.iter().map(|c| self.query_value(from, c, key)).collect()
+    }
 }
 
 /// A DHT node.
