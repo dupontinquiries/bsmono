@@ -298,19 +298,29 @@ fn hash2(x: f32, z: f32) -> f32 {
 /// Far below the islands, the cloud deck (drawn by the sky shader: there is
 /// no ground under Starwell Glacier, only mist, floating stone and cloud).
 pub const DECK_Y: f32 = -260.0;
-/// An island's underside: a cliff of rock and ice this wide past the lip,
-/// falling [`underside_depth`] before it frays out into mist.
-pub const SKIRT_W: f32 = 9.0;
+/// Where an island ends: just past the outside of its icy lip. Beyond it
+/// is open sky (the terrain mesh's top has no triangles there).
+pub const EDGE: f32 = RIM_W + 0.6;
 
-/// How far an island's underside hangs at (x, z): ragged, 14 to 38 u.
-pub fn underside_depth(x: f32, z: f32) -> f32 {
-    14.0 + 24.0 * crate::pass::vnoise(x * 0.06 + 5.3, z.abs() * 0.06 - 2.1)
+/// Open sky: past every island's edge, with nothing below but cloud.
+pub fn in_void(x: f32, z: f32) -> bool {
+    floor().sdf(x, z) > EDGE
 }
 
-/// Open sky: past every island's underside, with nothing below but cloud
-/// (the terrain mesh has no triangles here).
-pub fn in_void(x: f32, z: f32) -> bool {
-    floor().sdf(x, z) > RIM_W + SKIRT_W
+/// How far below its floor an island's UNDERSIDE hangs at (x, z), for a
+/// point over the island (inside its edge). The underside is its own
+/// surface (`render::build_terrain` hangs it under the top): from the lip
+/// it curls straight down and back in under the island, then keeps
+/// deepening toward the middle -- an inverted mountain, a keel of rock and
+/// ice, so each island reads as floating, not as a mesa standing on
+/// something. Narrow causeways hang shallow (~30 u); the Moonwell's island
+/// hangs ~80 u. Ragged with drips of ice.
+pub fn underside(x: f32, z: f32) -> f32 {
+    let inside = (EDGE - floor().sdf(x, z)).max(0.0);
+    let v = crate::pass::vnoise;
+    let keel = 3.6 * inside.sqrt() + 1.1 * inside * (0.8 + 0.4 * v(x * 0.02 + 7.1, z.abs() * 0.02));
+    let drips = 4.0 * v(x * 0.35 + 2.3, z.abs() * 0.35 - 1.1).powi(3) * (inside / 5.0).min(1.0);
+    (keel + drips).min(120.0)
 }
 /// The icy lip round every island: it rises this high just past the edge.
 // (2.2 until the ground below was taken away: from the game's own camera,
@@ -338,11 +348,10 @@ pub fn terrain_height(x: f32, z: f32) -> f32 {
         let n = 0.6 + 0.8 * hash2((x * 0.5).floor(), (z.abs() * 0.5).floor());
         return RIM_H * n * (t * std::f32::consts::PI).sin();
     }
-    // the island's underside: a cliff of rock and ice, hanging a ragged
-    // depth into the sky (past it, nothing: `in_void`)
-    let t = ((d - RIM_W) / SKIRT_W).clamp(0.0, 1.0);
-    let fall = t * t * (3.0 - 2.0 * t);
-    -fall * underside_depth(x, z)
+    // past the lip, open sky: nothing is drawn there (`in_void`); the
+    // height only says "far down" (the Moonwyrm's chasm dives read it)
+    let t = ((d - RIM_W) / 3.0).clamp(0.0, 1.0);
+    -40.0 * t * t * (3.0 - 2.0 * t)
 }
 
 #[cfg(test)]

@@ -109,7 +109,7 @@ fn placements_here() -> Vec<Drift> {
             let (phase, yaw) = (rng.f32() * std::f32::consts::TAU, rng.f32() * std::f32::consts::TAU);
             // fragments just past the lip, a little below the floor (or,
             // now and then, a little above it); never where a ferry docks
-            if d > sky::RIM_W + 1.5 && d < sky::RIM_W + sky::SKIRT_W + 6.0 && roll < 0.16 && !near_ferry(jx, jz) {
+            if d > sky::RIM_W + 1.5 && d < sky::RIM_W + 15.0 && roll < 0.16 && !near_ferry(jx, jz) {
                 out.push(Drift {
                     kind: DriftKind::Fragment,
                     home: Vec3::new(jx, rng.range(-12.0, 1.5), jz),
