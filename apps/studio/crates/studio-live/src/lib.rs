@@ -868,6 +868,24 @@ pub struct PolyPatch {
     pub pan_lfo_hz: f32,
     #[serde(default)]
     pub pan_lfo_depth: f32,
+    /// PHASE, 0..=1: mid traded for side at constant power -- 0 changes
+    /// nothing; toward 1 the L/R correlation goes NEGATIVE (the artist's
+    /// mids read -0.05..-0.48 in Blue Moon; a mono render reads +1: "inside
+    /// my skull"); at 1 it is pure side, out of phase, and CANCELS in mono --
+    /// the headphones-vs-mono trade the artist makes deliberately. Needs
+    /// width (a side to boost).
+    #[serde(default)]
+    pub phase: f32,
+    /// A PAN ENVELOPE per trigger: the note starts at `pan_start` and drifts
+    /// to `pan_end` over `pan_time_ms` (-1..=1) -- Blue Moon's element swings
+    /// right at each onset and back to centre over ~1.5 s, repeating with the
+    /// triggers: in the sound, not a free-running LFO. Both 0: centred.
+    #[serde(default)]
+    pub pan_start: f32,
+    #[serde(default)]
+    pub pan_end: f32,
+    #[serde(default)]
+    pub pan_time_ms: f32,
 }
 
 impl Default for PolyPatch {
@@ -875,7 +893,8 @@ impl Default for PolyPatch {
         PolyPatch { wave: 2, voices: 2, detune: 8.0, sub: 0.0, attack_ms: 5.0, decay_ms: 300.0, sustain: 0.7, release_ms: 250.0,
                     cutoff: 3000.0, resonance: 0.2, env_amount: 1.0, vibrato: 0.0, gain: 0.5,
                     partials: [0; 16], noise: 0.0, fm_ratio: 0.0, fm_index: 0.0, drive: 0.0,
-                    width: 0.0, low_width: 1.0, key_pan: 0.0, pan_lfo_hz: 0.0, pan_lfo_depth: 0.0 }
+                    width: 0.0, low_width: 1.0, key_pan: 0.0, pan_lfo_hz: 0.0, pan_lfo_depth: 0.0,
+                    phase: 0.0, pan_start: 0.0, pan_end: 0.0, pan_time_ms: 0.0 }
     }
 }
 
@@ -1015,8 +1034,21 @@ pub fn poly_voice_st(hz: f32, p: &PolyPatch, rate: u32, out: &mut [f32], out_r: 
             let side2 = side - (1.0 - p.low_width.clamp(0.0, 1.0)) * side_lp;
             l = m + side2; rr = m - side2;
         }
-        // the note's pan: by key, plus travel -- a balance on the stereo pair
-        let pan = (note_pan + p.pan_lfo_depth * (std::f32::consts::TAU * p.pan_lfo_hz * i as f32 / r).sin()).clamp(-1.0, 1.0);
+        // PHASE: mid traded for side, constant power (a = 1 - phase, b = 1 + phase)
+        if p.phase > 0.0 {
+            let ph = p.phase.clamp(0.0, 1.0);
+            let (a, b) = (1.0 - ph, 1.0 + ph);
+            let k = (2.0 / (a * a + b * b)).sqrt();
+            let (m, sd) = ((l + rr) * 0.5, (l - rr) * 0.5);
+            let (m2, s2) = (m * a * k, sd * b * k);
+            l = m2 + s2; rr = m2 - s2;
+        }
+        // the note's pan: by key, the per-trigger envelope, the LFO -- a balance
+        let env_pan = if p.pan_time_ms > 0.0 {
+            let u = (i as f32 / (p.pan_time_ms * 0.001 * r)).min(1.0);
+            p.pan_start + (p.pan_end - p.pan_start) * u
+        } else { p.pan_start };
+        let pan = (note_pan + env_pan + p.pan_lfo_depth * (std::f32::consts::TAU * p.pan_lfo_hz * i as f32 / r).sin()).clamp(-1.0, 1.0);
         if pan != 0.0 {
             let (gl, gr) = pan_gains(pan);
             let k = std::f32::consts::SQRT_2;
@@ -3433,6 +3465,30 @@ mod poly_tests {
         let low = PolyPatch { width: 1.0, wave: 0, cutoff: 400.0, ..base };
         let side_of = |p: &PolyPatch| { let (l, r) = st(80.0, p, 24_000); e(&l.iter().zip(&r).map(|(a, b)| a - b).collect::<Vec<_>>()) };
         assert!(side_of(&PolyPatch { low_width: 0.0, ..low }) < 0.3 * side_of(&PolyPatch { low_width: 1.0, ..low }), "the lows fold toward mono");
+    }
+
+    fn corr(l: &[f32], r: &[f32]) -> f32 {
+        let (a, b, c) = l.iter().zip(r).fold((0.0f32, 0.0f32, 0.0f32), |(a, b, c), (x, y)| (a + x * y, b + x * x, c + y * y));
+        a / (b * c).sqrt().max(1e-12)
+    }
+
+    /// PHASE pushes a wide note's L/R correlation below zero (at 0 it is
+    /// untouched); the PAN ENVELOPE starts the note where it says and drifts
+    /// to where it says.
+    #[test]
+    fn phase_goes_below_zero_and_the_pan_envelope_travels() {
+        let wide = PolyPatch { wave: 2, voices: 5, detune: 14.0, attack_ms: 5.0, sustain: 1.0, cutoff: 8000.0, env_amount: 0.0, gain: 1.0, width: 1.0, ..Default::default() };
+        let (l0, r0) = st(330.0, &wide, 24_000);
+        let (l1, r1) = st(330.0, &PolyPatch { phase: 0.8, ..wide }, 24_000);
+        assert!(corr(&l0[2000..], &r0[2000..]) > corr(&l1[2000..], &r1[2000..]) + 0.3, "phase lowers the correlation");
+        assert!(corr(&l1[2000..], &r1[2000..]) < -0.3, "below zero: {}", corr(&l1[2000..], &r1[2000..]));
+        let (l2, r2) = st(330.0, &PolyPatch { phase: 0.0, ..wide }, 24_000);
+        assert_eq!((l0, r0), (l2, r2), "phase 0 changes nothing");
+        let travel = PolyPatch { pan_start: 0.8, pan_end: -0.2, pan_time_ms: 400.0, ..PolyPatch { width: 0.0, ..wide } };
+        let (l, r) = st(330.0, &travel, 36_000);
+        let bal = |a: usize, b: usize| (e(&r[a..b]) - e(&l[a..b])) / (e(&r[a..b]) + e(&l[a..b]));
+        assert!(bal(500, 2_000) > 0.6, "starts right: {}", bal(500, 2_000));
+        assert!(bal(24_000, 26_000) < -0.1, "ends left of centre: {}", bal(24_000, 26_000));
     }
 
     /// The mono voice is the stereo one folded: for a centred patch the fold

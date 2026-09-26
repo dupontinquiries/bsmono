@@ -341,12 +341,17 @@ pub struct Image {
     pub travel: f32,
     /// Pan per octave from middle C (least squares over the notes).
     pub key_pan: f32,
+    /// The PER-TRIGGER pan envelope: the balance just after onsets (0.06-0.4 s)
+    /// and at the end of notes at least 1 s long -- equal when nothing travels.
+    pub pan_start: f32,
+    pub pan_end: f32,
     pub notes: usize,
 }
 
 /// Measure the image from stereo windows (left, right, rate, pitch, others).
 pub fn stereo_image(windows: &[(Vec<f32>, Vec<f32>, u32, f32, Vec<f32>)]) -> Option<Image> {
     let (mut pans, mut octs, mut travel) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut starts, mut ends) = (Vec::new(), Vec::new());
     let (mut sh, mut mh, mut sl, mut ml) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for (l, r, rate, hz, others) in windows {
         let skip = (*rate as usize * 6 / 100).min(l.len());
@@ -365,6 +370,12 @@ pub fn stereo_image(windows: &[(Vec<f32>, Vec<f32>, u32, f32, Vec<f32>)]) -> Opt
         };
         let Some(p) = bal(l, r) else { continue };
         if let (Some(a), Some(b)) = (bal(&l[..half], &r[..half]), bal(&l[half..], &r[half..])) { travel.push((b - a).abs()); }
+        // the envelope: onset (first 0.34 s after the skip) vs end (last 0.3 s), notes >= 1 s
+        let sr = *rate as usize;
+        if l.len() >= sr {
+            let (a0, a1, b0) = (0, sr * 34 / 100, l.len() - sr * 3 / 10);
+            if let (Some(a), Some(b)) = (bal(&l[a0..a1], &r[a0..a1]), bal(&l[b0..], &r[b0..])) { starts.push(a); ends.push(b); }
+        }
         for k in 1..=8 {
             let f = hz * k as f32;
             if f >= 0.45 * *rate as f32 || !clear_of(f, others, 0.015) { continue; }
@@ -384,8 +395,10 @@ pub fn stereo_image(windows: &[(Vec<f32>, Vec<f32>, u32, f32, Vec<f32>)]) -> Opt
     // all side and no mid (fully out of phase -- the artist's wide bass
     // texture) is not "mono": capped at 100, not 0
     let w = |s: f64, m: f64| if m > 1e-18 { ((s / m).sqrt() as f32).min(100.0) } else if s > 1e-18 { 100.0 } else { 0.0 };
+    let mean = |v: &Vec<f32>| if v.is_empty() { mp } else { v.iter().sum::<f32>() / v.len() as f32 };
     Some(Image { pan: mp, width_high: w(sh, mh), width_low: w(sl, ml),
-                 travel: if travel.is_empty() { 0.0 } else { travel.iter().sum::<f32>() / travel.len() as f32 }, key_pan, notes: pans.len() })
+                 travel: if travel.is_empty() { 0.0 } else { travel.iter().sum::<f32>() / travel.len() as f32 }, key_pan,
+                 pan_start: mean(&starts), pan_end: mean(&ends), notes: pans.len() })
 }
 
 #[cfg(test)]
