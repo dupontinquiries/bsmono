@@ -20,6 +20,7 @@ impl Game {
                     self.spawn_wave(lane, team);
                 }
             }
+            self.waves += 1;
         }
 
         // 2. AI decisions
@@ -74,15 +75,26 @@ impl Game {
         let path = lane.path_for(team);
         let scale = 1.0 + (self.t / 60.0).min(15.0) * 0.07;
         let hp = MINION_HP * scale;
-        let offs = [[0.0f32, 0.0], [1.6, 0.4], [0.8, -1.4]];
-        for k in 0..WAVE_MELEE {
-            let _ = k;
-            let o = offs[k % 3];
+        // melee in a loose front of three, casters behind them
+        let front = [[0.0f32, 0.0], [1.3, 0.9], [1.3, -0.9]];
+        let back = [[-1.6f32, 0.5], [-1.6, -0.5]];
+        let (melee, casters) = crate::minionai::wave_for(self.waves);
+        let ahead = {
+            let d = path[1.min(path.len() - 1)] - path[0];
+            Vec3::new(d.x, 0.0, d.z).normalize_or(Vec3::Z)
+        };
+        let side = Vec3::new(-ahead.z, 0.0, ahead.x);
+        for k in 0..melee + casters {
+            let caster = k >= melee;
+            let o = if caster { back[(k - melee) % 2] } else { front[k % 3] };
+            let id = self.next_minion_id;
+            self.next_minion_id += 1;
+            let think_t = self.rng.f32() * crate::minionai::THINK_EVERY;
             self.minions.push(Minion {
                 team,
                 lane,
-                caster: false,
-                pos: path[0] + Vec3::new(o[0], 0.0, o[1]),
+                caster,
+                pos: path[0] + ahead * o[0] + side * o[1],
                 hp,
                 max_hp: hp,
                 atk_timer: 0.0,
@@ -91,23 +103,150 @@ impl Game {
                 wp: 1.min(path.len() - 1),
                 last_hit: None,
                 yaw: 0.0,
+                id,
+                foe: None,
+                think_t,
+                left_at: None,
             });
         }
-        let o = offs[2];
-        self.minions.push(Minion {
-            team,
-            lane,
-            caster: true,
-            pos: path[0] + Vec3::new(o[0] + 1.0, 0.0, o[1]),
-            hp,
-            max_hp: hp,
-            atk_timer: 0.0,
-            atk_anim: 0.0,
-            walk_anim: self.rng.f32() * 6.0,
-            wp: 1.min(path.len() - 1),
-            last_hit: None,
-            yaw: 0.0,
-        });
+    }
+
+    /// The index of the minion with this id (the Vec is sorted by id).
+    pub fn minion_index(&self, id: u32) -> Option<usize> {
+        self.minions.binary_search_by_key(&id, |m| m.id).ok()
+    }
+
+    /// A minion's foe as a `TargetRef` and a position, if it is still there
+    /// and still fightable.
+    pub fn resolve_foe(&self, foe: crate::minionai::Foe) -> Option<(TargetRef, Vec3)> {
+        use crate::minionai::Foe;
+        match foe {
+            Foe::God(i) => {
+                let g = self.gods.get(i)?;
+                (g.respawn_t <= 0.0).then_some((TargetRef::God(i), g.pos))
+            }
+            Foe::Minion(id) => {
+                let i = self.minion_index(id)?;
+                Some((TargetRef::Minion(i), self.minions[i].pos))
+            }
+            Foe::Tower(i) => {
+                let t = self.towers.get(i)?;
+                (t.hp > 0.0).then_some((TargetRef::Tower(i), t.pos))
+            }
+            Foe::Titan(team) => {
+                let t = &self.titans[team as usize];
+                (t.hp > 0.0 && !self.titan_shielded(team)).then_some((TargetRef::Titan(team), t.pos))
+            }
+        }
+    }
+
+    /// Attack reach of minion `m` against a foe: structures are big, so a
+    /// minion hits them from a little further off.
+    fn minion_reach(m: &Minion, foe: crate::minionai::Foe) -> f32 {
+        use crate::minionai::Foe;
+        let base = if m.caster { MINION_RANGE_CASTER } else { MINION_RANGE_MELEE + 0.4 };
+        match foe {
+            Foe::Tower(_) => base + if m.caster { 0.0 } else { 1.0 },
+            Foe::Titan(_) => base + 2.5,
+            _ => base,
+        }
+    }
+
+    /// Re-think minion targets (`minionai`): drop the ones that died or got
+    /// away, and every `THINK_EVERY` seconds pick again from what is near.
+    fn minion_think(&mut self, dt: f32) {
+        use crate::minionai::{pick, Class, Foe, Seen, AGGRO_CASTER, AGGRO_MELEE, CALL_FOR, LEASH, THINK_EVERY};
+        let now = self.t;
+        let mut out: Vec<(Option<Foe>, f32, Option<Vec3>)> = Vec::with_capacity(self.minions.len());
+        for m in &self.minions {
+            let aggro = if m.caster { AGGRO_CASTER } else { AGGRO_MELEE };
+            let mut think_t = m.think_t - dt;
+            let mut left_at = m.left_at;
+            // the held target, if it is still there, near, and inside the leash
+            let current = m.foe.and_then(|f| {
+                let (_, p) = self.resolve_foe(f)?;
+                let d = flat(p - m.pos);
+                let leashed = left_at.is_some_and(|l| flat(m.pos - l) > LEASH) && !matches!(f, Foe::Tower(_) | Foe::Titan(_));
+                (d < aggro + 2.0 && !leashed).then_some((f, d))
+            });
+            if m.foe.is_some() && current.is_none() {
+                think_t = 0.0;
+            }
+            let mut foe = current.map(|c| c.0);
+            if think_t <= 0.0 {
+                think_t = THINK_EVERY;
+                let mut seen: Vec<Seen> = Vec::new();
+                for (gi, g) in self.gods.iter().enumerate() {
+                    if g.team == m.team || g.respawn_t > 0.0 {
+                        continue;
+                    }
+                    let d = flat(g.pos - m.pos);
+                    if d < aggro {
+                        seen.push(Seen { foe: Foe::God(gi), class: Class::God, dist: d });
+                    }
+                }
+                // calls for help: an enemy god that hit an allied god near us
+                for a in &self.gods {
+                    if a.team != m.team || a.respawn_t > 0.0 || flat(a.pos - m.pos) > aggro + 4.0 {
+                        continue;
+                    }
+                    for &(s, t) in &a.recent_damagers {
+                        if now - t < CALL_FOR {
+                            if let Some(e) = self.gods.get(s) {
+                                let d = flat(e.pos - m.pos);
+                                if e.team != m.team && e.respawn_t <= 0.0 && d < aggro + 2.0 {
+                                    seen.push(Seen { foe: Foe::God(s), class: Class::Call, dist: d });
+                                }
+                            }
+                        }
+                    }
+                }
+                for e in &self.minions {
+                    if e.team != m.team {
+                        let d = flat(e.pos - m.pos);
+                        if d < aggro {
+                            seen.push(Seen { foe: Foe::Minion(e.id), class: Class::Minion, dist: d });
+                        }
+                    }
+                }
+                for (ti, tw) in self.towers.iter().enumerate() {
+                    if tw.team != m.team && tw.hp > 0.0 {
+                        let d = flat(tw.pos - m.pos);
+                        if d < aggro {
+                            seen.push(Seen { foe: Foe::Tower(ti), class: Class::Structure, dist: d });
+                        }
+                    }
+                }
+                let et = m.team.other();
+                let tp = &self.titans[et as usize];
+                if tp.hp > 0.0 && !self.titan_shielded(et) {
+                    let d = flat(tp.pos - m.pos);
+                    if d < aggro + 2.5 {
+                        seen.push(Seen { foe: Foe::Titan(et), class: Class::Structure, dist: d });
+                    }
+                }
+                // a minion walking back from a chase does not re-engage a god
+                // it was leashed off, only what is in its lane
+                let returning = m.foe.is_some() && current.is_none() && left_at.is_some_and(|l| flat(m.pos - l) > LEASH);
+                if returning {
+                    seen.retain(|s| s.class != Class::God && s.class != Class::Call);
+                }
+                let cur = current.map(|(f, d)| {
+                    let class = seen.iter().find(|s| s.foe == f).map_or(Class::God, |s| s.class);
+                    Seen { foe: f, class, dist: d }
+                });
+                foe = pick(cur, &seen);
+            }
+            if foe.is_some() && left_at.is_none() {
+                left_at = Some(m.pos);
+            }
+            out.push((foe, think_t, left_at));
+        }
+        for (m, (foe, think_t, left_at)) in self.minions.iter_mut().zip(out) {
+            m.foe = foe;
+            m.think_t = think_t;
+            m.left_at = left_at;
+        }
     }
 
     // --- movement ---------------------------------------------------------------
@@ -315,45 +454,61 @@ impl Game {
     }
 
     fn move_minions(&mut self, dt: f32) {
+        self.minion_think(dt);
         let blockers = self.blockers.clone();
         for mi in 0..self.minions.len() {
-            // engage scan (immutable first)
-            let (mteam, mpos, mwp, mlane) = {
-                let m = &self.minions[mi];
-                (m.team, m.pos, m.wp, m.lane)
+            let (mteam, mlane, foe) = (self.minions[mi].team, self.minions[mi].lane, self.minions[mi].foe);
+            // where to walk: to the foe until in reach; back to where it left
+            // the lane; else on down the lane
+            let goal: Option<Vec3> = match foe.and_then(|f| self.resolve_foe(f).map(|(_, p)| (f, p))) {
+                Some((f, p)) => {
+                    let m = &self.minions[mi];
+                    let reach = Self::minion_reach(m, f);
+                    // casters stand a little inside their reach
+                    let want = if m.caster { reach * 0.85 } else { reach - 0.3 };
+                    (flat(p - m.pos) > want).then_some(p)
+                }
+                None => {
+                    let m = &mut self.minions[mi];
+                    match m.left_at {
+                        Some(l) if flat(l - m.pos) > 1.5 => Some(l),
+                        _ => {
+                            m.left_at = None;
+                            let path = crate::consts::lane_path(mlane, mteam);
+                            let target = path[m.wp.min(path.len() - 1)];
+                            if flat(target - m.pos) < 1.5 && m.wp + 1 < path.len() {
+                                m.wp += 1;
+                            }
+                            Some(path[m.wp.min(path.len() - 1)])
+                        }
+                    }
+                }
             };
-            let mut engaged = false;
-            for gi in 0..self.gods.len() {
-                let g = &self.gods[gi];
-                if g.team != mteam && g.respawn_t <= 0.0 && g.pos.distance(mpos) < 5.5 {
-                    engaged = true;
-                    break;
-                }
-            }
-            if !engaged && self.enemy_in_minion_range(mi, 5.0).is_some() {
-                engaged = true;
-            }
             let m = &mut self.minions[mi];
-            if !engaged {
-                let path = crate::consts::lane_path(mlane, mteam);
-                let target = path[mwp.min(path.len() - 1)];
-                let d = Vec3::new(target.x - m.pos.x, 0.0, target.z - m.pos.z);
-                if d.length() < 1.5 && m.wp + 1 < path.len() {
-                    m.wp += 1;
-                } else if d.length_squared() > 0.001 {
-                    let step = 7.4 * dt;
-                    m.pos += d.normalize() * step;
-                    m.yaw = d.z.atan2(d.x);
-                    m.walk_anim += dt * 10.0;
-                    // Minions path down a lane and will walk into anything the
-                    // lane clips. Resolving here rather than only for gods
-                    // matters because a wave piling into a trunk is what makes
-                    // props read as solid from across the map.
-                    m.pos = blockers.resolve(m.pos, MINION_RADIUS);
-                    m.pos.y = crate::map::ground_y(m.pos.x, m.pos.z);
+            match goal {
+                Some(target) => {
+                    let d = Vec3::new(target.x - m.pos.x, 0.0, target.z - m.pos.z);
+                    if d.length_squared() > 0.001 {
+                        let step = (7.4 * dt).min(d.length());
+                        m.pos += d.normalize() * step;
+                        m.yaw = d.z.atan2(d.x);
+                        m.walk_anim += dt * 10.0;
+                        // Minions path down a lane and will walk into anything the
+                        // lane clips. Resolving here rather than only for gods
+                        // matters because a wave piling into a trunk is what makes
+                        // props read as solid from across the map.
+                        m.pos = blockers.resolve(m.pos, MINION_RADIUS);
+                        m.pos.y = crate::map::ground_y(m.pos.x, m.pos.z);
+                    }
                 }
-            } else {
-                m.walk_anim += dt * 2.0;
+                None => {
+                    // in reach: stand and face the foe
+                    if let Some(p) = foe.and_then(|f| self.resolve_foe(f)).map(|(_, p)| p) {
+                        let m = &mut self.minions[mi];
+                        m.yaw = (p.z - m.pos.z).atan2(p.x - m.pos.x);
+                        m.walk_anim += dt * 2.0;
+                    }
+                }
             }
         }
         // minion separation (cheap: sample pairs)
@@ -369,27 +524,6 @@ impl Game {
                 }
             }
         }
-    }
-
-    fn enemy_in_minion_range(&self, mi: usize, range: f32) -> Option<TargetRef> {
-        let m = &self.minions[mi];
-        let mut best: Option<TargetRef> = None;
-        let mut bd = range;
-        for (ti, tw) in self.towers.iter().enumerate() {
-            if tw.team != m.team {
-                let d = tw.pos.distance(m.pos);
-                if d < bd {
-                    bd = d;
-                    best = Some(TargetRef::Tower(ti));
-                }
-            }
-        }
-        let et = m.team.other();
-        let tp = &self.titans[et as usize];
-        if tp.hp > 0.0 && !self.titan_shielded(et) && tp.pos.distance(m.pos) < range + 2.0 {
-            best = Some(TargetRef::Titan(et));
-        }
-        best
     }
 
     // --- auto attacks -------------------------------------------------------------
@@ -566,52 +700,14 @@ impl Game {
             if mi >= self.minions.len() {
                 break; // earlier kill shifted indices
             }
-            let m = &self.minions[mi];
-            // target: nearest enemy god/minion in range
-            let range = if m.caster { MINION_RANGE_CASTER } else { MINION_RANGE_MELEE + 0.4 };
-            let mut target: Option<TargetRef> = None;
-            let mut bd = range;
-            for gi in 0..self.gods.len() {
-                let g = &self.gods[gi];
-                if g.team != m.team && g.respawn_t <= 0.0 {
-                    let d = g.pos.distance(m.pos);
-                    if d < bd {
-                        bd = d;
-                        target = Some(TargetRef::God(gi));
-                    }
-                }
-            }
-            if target.is_none() {
-                for om in 0..self.minions.len() {
-                    let e = &self.minions[om];
-                    if e.team != m.team {
-                        let d = e.pos.distance(m.pos);
-                        if d < bd {
-                            bd = d;
-                            target = Some(TargetRef::Minion(om));
-                        }
-                    }
-                }
-            }
-            // towers block path — attack them while marching
-            if target.is_none() {
-                let twr = if m.caster { range } else { range + 1.0 };
-                for ti in 0..self.towers.len() {
-                    let tw = &self.towers[ti];
-                    if tw.team != m.team && tw.pos.distance(m.pos) < twr {
-                        target = Some(TargetRef::Tower(ti));
-                        break;
-                    }
-                }
-            }
-            // vulnerable titan in reach
-            if target.is_none() {
-                let et = m.team.other();
-                let tp = &self.titans[et as usize];
-                if tp.hp > 0.0 && !self.titan_shielded(et) && tp.pos.distance(m.pos) < range + 2.5 {
-                    target = Some(TargetRef::Titan(et));
-                }
-            }
+            // the held foe (`minion_think`), if it is in reach
+            let target: Option<TargetRef> = {
+                let m = &self.minions[mi];
+                m.foe.and_then(|f| {
+                    let (t, p) = self.resolve_foe(f)?;
+                    (flat(p - m.pos) < Self::minion_reach(m, f)).then_some(t)
+                })
+            };
             let m = &mut self.minions[mi];
             m.atk_timer -= dt;
             m.atk_anim = (m.atk_anim - dt * 4.0).max(0.0);
@@ -626,8 +722,6 @@ impl Game {
             if matches!(target.unwrap(), TargetRef::Tower(_) | TargetRef::Titan(_)) {
                 dmg *= 2.4;
             }
-            let magic = m.caster;
-            let _ = magic;
             match target.unwrap() {
                 TargetRef::God(gi) => {
                     if m.caster {
@@ -1207,4 +1301,10 @@ pub fn facing_yaw(move_dir: Vec3, view: Vec3) -> f32 {
     } else {
         v + d.clamp(-FACE_CONE, FACE_CONE)
     }
+}
+
+/// Horizontal length: minions and their targets stand at different
+/// heights on sloped ground, and reach is measured across the ground.
+fn flat(v: Vec3) -> f32 {
+    Vec3::new(v.x, 0.0, v.z).length()
 }

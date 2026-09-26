@@ -1284,3 +1284,120 @@ mod fights {
         assert!(closest < TOWER_RANGE - 4.0, "behind its minions it sieges: closest {closest:.1}");
     }
 }
+
+/// Lane minions (`minionai`): waves of four or five that hold a target,
+/// walk to it, and turn on a cat that hurts one of theirs.
+mod minions {
+    use clawbound::consts::{Lane, Team};
+    use clawbound::minionai::{Foe, LEASH};
+    use clawbound::sim::Game;
+    use glam::Vec3;
+
+    fn quiet(g: &mut Game) {
+        for c in g.gods.iter_mut() {
+            c.ai = None;
+            c.move_dir = Vec3::ZERO;
+            c.attack_held = false;
+        }
+    }
+    fn run(g: &mut Game, secs: f32, mut each: impl FnMut(&Game)) {
+        for _ in 0..(secs * 60.0) as usize {
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+            each(g);
+        }
+    }
+    /// One wave spawned, then only the minions of `keep` survive, moved
+    /// round `at` in a line along x.
+    fn wave(g: &mut Game, keep: &[(Team, Lane)], at: Vec3) {
+        g.next_wave_t = g.t;
+        run(g, 1.0 / 60.0, |_| {});
+        g.minions.retain(|m| keep.contains(&(m.team, m.lane)));
+        for (k, m) in g.minions.iter_mut().enumerate() {
+            m.pos = at + Vec3::new(k as f32 * 0.9, 0.0, 0.0);
+            m.left_at = None;
+        }
+    }
+
+    #[test]
+    fn a_wave_is_four_every_third_five() {
+        let mut g = Game::new_teams(&[0], &[1]);
+        quiet(&mut g);
+        let mut sizes = Vec::new();
+        for _ in 0..3 {
+            let before: Vec<u32> = g.minions.iter().map(|m| m.id).collect();
+            g.next_wave_t = g.t;
+            run(&mut g, 1.0 / 60.0, |_| {});
+            let fresh = g.minions.iter().filter(|m| !before.contains(&m.id) && m.team == Team::Blue && m.lane == Lane::Mid).count();
+            sizes.push(fresh);
+        }
+        assert_eq!(sizes, vec![4, 4, 5]);
+        let ids: Vec<u32> = g.minions.iter().map(|m| m.id).collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "the Vec stays sorted by id");
+    }
+
+    /// The old minion stood still once a god was within 5.5 u and could
+    /// only hit what was within 2.6: a cat poking from 4 u was never hit.
+    #[test]
+    fn a_melee_minion_walks_to_a_cat_poking_it() {
+        let mut g = Game::new_teams(&[0], &[1]);
+        quiet(&mut g);
+        wave(&mut g, &[(Team::Red, Lane::Mid)], Vec3::new(0.0, 0.0, 0.0));
+        g.minions.retain(|m| !m.caster);
+        g.minions.truncate(1);
+        g.gods[0].pos = Vec3::new(4.0, 0.0, 0.0);
+        let hp0 = g.gods[0].hp;
+        run(&mut g, 3.0, |_| {});
+        assert!(g.gods[0].hp < hp0, "the minion reached the cat and bit: {} -> {}", hp0, g.gods[0].hp);
+    }
+
+    /// Minions fight the wave, but hurt a cat of theirs and they turn on you.
+    #[test]
+    fn a_call_for_help_retargets_the_wave() {
+        let mut g = Game::new_teams(&[0], &[1]);
+        quiet(&mut g);
+        wave(&mut g, &[(Team::Blue, Lane::Mid), (Team::Red, Lane::Mid)], Vec3::new(0.0, 0.0, 0.0));
+        // blue and red minions side by side: they pick each other
+        run(&mut g, 0.5, |_| {});
+        let blue: Vec<usize> = (0..g.minions.len()).filter(|&i| g.minions[i].team == Team::Blue).collect();
+        assert!(blue.iter().all(|&i| matches!(g.minions[i].foe, Some(Foe::Minion(_)))), "the wave fights the wave");
+        // the red cat (god 1) hits the blue cat (god 0) beside the minions
+        g.gods[0].pos = Vec3::new(2.0, 0.0, 3.0);
+        g.gods[1].pos = Vec3::new(3.0, 0.0, 4.5);
+        g.gods[0].recent_damagers.push((1, g.t));
+        let mut turned = 0;
+        run(&mut g, 0.5, |g| {
+            turned = turned.max(g.minions.iter().filter(|m| m.team == Team::Blue && m.foe == Some(Foe::God(1))).count());
+        });
+        assert!(turned >= 3, "most of the blue wave turned on the red cat: {turned}");
+    }
+
+    /// A minion chases a cat only so far from its lane, then walks back.
+    #[test]
+    fn a_chase_ends_at_the_leash() {
+        let mut g = Game::new_teams(&[0], &[1]);
+        quiet(&mut g);
+        wave(&mut g, &[(Team::Red, Lane::Mid)], Vec3::new(0.0, 0.0, 0.0));
+        g.minions.retain(|m| !m.caster);
+        g.minions.truncate(1);
+        let start = g.minions[0].pos;
+        g.gods[0].pos = Vec3::new(3.0, 0.0, 0.0);
+        // the cat walks steadily away along +x, a little slower than a
+        // minion walks (so only the leash ends the chase)
+        let mut far = 0.0f32;
+        for _ in 0..(8.0 * 60.0) as usize {
+            g.gods[0].pos.x += 5.0 / 60.0;
+            g.tick(1.0 / 60.0);
+            g.events.clear();
+            // measured while it still holds the cat (afterwards it walks on
+            // down its lane, which may well lead the same way)
+            if let Some(m) = g.minions.first().filter(|m| m.foe == Some(Foe::God(0))) {
+                far = far.max(Vec3::new(m.pos.x - start.x, 0.0, m.pos.z - start.z).length());
+            }
+        }
+        assert!(far > 4.0, "it did chase: {far}");
+        assert!(far < LEASH + 1.0, "but not past the leash: {far}");
+        let m = &g.minions[0];
+        assert!(m.foe != Some(Foe::God(0)), "and gave the cat up");
+    }
+}

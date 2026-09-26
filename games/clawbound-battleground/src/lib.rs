@@ -45,6 +45,8 @@ pub mod brawl;
 pub mod tactics;
 pub mod playbook;
 pub mod arena;
+/// Lane minions: what they fight and when they change their mind.
+pub mod minionai;
 /// The generated preparation documents in dev/ (cue cards, recording sheet, cue sheet).
 pub mod devdocs;
 /// Character voxels as smooth surfaces with fur lengths, for the ultra preview.

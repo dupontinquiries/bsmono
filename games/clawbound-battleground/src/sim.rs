@@ -249,6 +249,14 @@ pub struct Minion {
     pub wp: usize,
     pub last_hit: Option<usize>,
     pub yaw: f32,
+    /// Stable identity (ids only grow, and removal keeps order, so the
+    /// `minions` Vec is sorted by id). Targets hold this, not the index.
+    pub id: u32,
+    /// What it is fighting (`minionai`), when it re-thinks next, and where
+    /// it stepped off its lane to do so.
+    pub foe: Option<crate::minionai::Foe>,
+    pub think_t: f32,
+    pub left_at: Option<Vec3>,
 }
 
 pub struct Tower {
@@ -356,6 +364,9 @@ pub struct Game {
     pub plans_this_tick: u32,
     /// Each side's page of the playbook (`playbook`), indexed by team.
     pub styles: [crate::playbook::Page; 2],
+    /// Minion ids handed out so far, and waves spawned (`minionai::wave_for`).
+    pub next_minion_id: u32,
+    pub waves: u32,
     /// A bot's dive on an enemy god, for its teammates to answer:
     /// (target god, when). Indexed by the diving team.
     pub calls: [Option<(usize, f32)>; 2],
@@ -519,6 +530,8 @@ impl Game {
             plans_this_tick: 0,
             styles: [crate::playbook::even_keel(), crate::playbook::even_keel()],
             calls: [None, None],
+            next_minion_id: 0,
+            waves: 0,
         };
         // starter items for AI gods (player buys via shop)
         for i in 0..total {

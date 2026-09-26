@@ -331,20 +331,21 @@ pub fn tower_pos(lane: Lane, team: Team, inner: bool) -> Vec3 {
 
 pub const WAVE_FIRST: f32 = 12.0;
 pub const WAVE_INTERVAL: f32 = 30.0;
-pub const WAVE_MELEE: usize = 2;
-pub const WAVE_CASTER: usize = 1;
 
 pub const START_GOLD: f32 = 700.0;
 pub const PASSIVE_GOLD: f32 = 1.9;
-pub const GOLD_MELEE: f32 = 21.0;
-pub const GOLD_CASTER: f32 = 27.0;
+// Waves went from three minions to four (five every third, `minionai::
+// wave_for`): per-minion gold and XP were cut by 0.7 so a wave is worth
+// what it was (69 gold / 204 XP on average, before and after).
+pub const GOLD_MELEE: f32 = 15.0;
+pub const GOLD_CASTER: f32 = 19.0;
 pub const GOLD_GOD: f32 = 300.0;
 pub const GOLD_TOWER: f32 = 250.0;
 /// Fraction of an item's cost refunded by `Game::sell_item`.
 pub const SELL_REFUND: f32 = 0.7;
 
-pub const XP_MELEE: f32 = 62.0;
-pub const XP_CASTER: f32 = 80.0;
+pub const XP_MELEE: f32 = 43.0;
+pub const XP_CASTER: f32 = 56.0;
 pub const XP_GOD: f32 = 340.0;
 pub const XP_SHARE_RADIUS: f32 = 14.0;
 pub const MAX_LEVEL: u32 = 20;
