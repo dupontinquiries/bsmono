@@ -239,6 +239,8 @@ struct App {
     /// send. Held by the HOST and not by the app: the controller has no
     /// business carrying a photo in memory purely to hand it back.
     last_snap: Option<Vec<u8>>,
+    /// The composition of the last send, for Retry.
+    last_composition: Option<snapclone_egui::composer::Snap>,
     /// The frame most recently handed to the pump — what the viewfinder is
     /// showing. The shutter reads THIS. `peek_frame` on the capture slot
     /// only sees a frame that arrived since the last `take_frame`, and the
@@ -391,7 +393,7 @@ impl App {
         };
 
         Self { snap, ime_repair: Default::default(), last_sweep: None, snaps_in, accel: None, glove_probed: false,
-               last_snap: None, last_live: None, scan_frames: 0, sending: Vec::new(),
+               last_snap: None, last_composition: None, last_live: None, scan_frames: 0, sending: Vec::new(),
                send_results: Arc::new(Mutex::new(Vec::new())),
                export_result: Arc::new(Mutex::new(None)), exporting: None,
                voice: VoiceRig::idle(), rig: CaptureRig::idle(),
@@ -1230,6 +1232,9 @@ impl App {
                 // and doing that inline would freeze the UI for twenty
                 // seconds per person.
                 HostCommand::SendSnap { to, snap } => {
+                    // Remembered for Retry: a retried send carries the same
+                    // timer the person chose, not the composer's default.
+                    if snap.is_some() { self.last_composition = snap.clone(); }
                     // THE TIMER GOES ON THE WIRE. `duration_secs` was a literal
                     // 0 here — on this wire "never vanishes" — while the
                     // composer's timer defaulted to five seconds and was shown
@@ -1386,6 +1391,53 @@ impl App {
                     }
                 }
                 HostCommand::ExportSnaps { dest_dir } => self.start_export(dest_dir),
+                // Notifications: `notify::send` (notify-send) existed and nothing
+                // called it -- the app decided a notification was warranted and
+                // the binary dropped it in the catch-all. Off-thread, because it
+                // waits for the notifier process.
+                HostCommand::Notify(r) => {
+                    std::thread::spawn(move || {
+                        if !uikit_egui::notify::send(&r, APP_ID) {
+                            eprintln!("snapclone: notification not shown (is notify-send installed?)");
+                        }
+                    });
+                }
+                // Retry: the failed rows go back to Pending and the last
+                // composition is sent to them again through the ordinary send
+                // path. Was a catch-all line: the Retry button did nothing.
+                HostCommand::RetryFailedSends => {
+                    let who = self.snap.begin_retry(wall_ms());
+                    if !who.is_empty() {
+                        let snap = self.last_composition.clone();
+                        let cmds = vec![HostCommand::SendSnap { to: who, snap }];
+                        self.handle(cmds);
+                    }
+                }
+                // Keep a received snap: written beside the app's own, under a
+                // name retention never sweeps. Was a catch-all line: the feed
+                // menu's Save did nothing.
+                HostCommand::KeepSnap(id) => {
+                    let r = match self.snap.kept_file(&id) {
+                        None => Err("it has already been opened, and a view-once snap is gone after viewing".to_string()),
+                        Some((name, bytes)) => {
+                            let dir = config_kit::data_dir("snapclone").join("snaps");
+                            std::fs::create_dir_all(&dir)
+                                .and_then(|_| std::fs::write(dir.join(&name), &bytes))
+                                .map(|_| dir.join(&name).display().to_string())
+                                .map_err(|e| e.to_string())
+                        }
+                    };
+                    pending.push(HostEvent::SnapKept(r));
+                }
+                // Status results with nothing to do on success; the failures
+                // are worth a line.
+                HostCommand::NatClassified(ok) => if !ok {
+                    eprintln!("snapclone: NAT classification failed: the two probes disagreed about the local port");
+                },
+                HostCommand::QrLatched(_) => {}
+                HostCommand::DhtFinished(first) => if !first {
+                    eprintln!("snapclone: a DHT lookup reported done twice");
+                },
                 other => eprintln!("snapclone: unhandled host command: {other:?}"),
             }
         }

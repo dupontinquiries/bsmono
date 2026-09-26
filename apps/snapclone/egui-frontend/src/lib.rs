@@ -5499,6 +5499,40 @@ impl Snapclone {
         }
     }
 
+    /// Mark every failed send for retry and return who to send to again. The
+    /// rows go back to Pending (`SendRow::retry` owns that transition), so the
+    /// outbox shows the retry in progress rather than the old failure.
+    pub fn begin_retry(&mut self, now_ms: u64) -> Vec<String> {
+        let mut who = Vec::new();
+        for r in self.sends.rows_mut() {
+            if r.state.can_retry() && r.retry(now_ms) {
+                who.push(r.id.clone());
+            }
+        }
+        who
+    }
+
+    /// A received snap the user chose to keep: its bytes and the file name to
+    /// keep it under. `kept-<id>.<ext>` -- deliberately NOT the `snap-<ms>`
+    /// pattern retention sweeps, so a kept snap is never auto-deleted (the
+    /// retention rule's own definition of kept). `None` once the bytes are gone
+    /// (a view-once snap that has been opened).
+    pub fn kept_file(&self, id: &str) -> Option<(String, Vec<u8>)> {
+        let snap = self.received.iter().find(|s| s.id == id)?;
+        if snap.bytes.is_empty() {
+            return None;
+        }
+        let ext = match snap.media {
+            crate::snaps::Media::Image if snap.bytes.starts_with(&[0xff, 0xd8]) => "jpg",
+            crate::snaps::Media::Image if snap.bytes.starts_with(b"\x89PNG") => "png",
+            crate::snaps::Media::Image => "img",
+            crate::snaps::Media::Video => "mp4",
+            crate::snaps::Media::Audio => "opus",
+        };
+        let safe: String = id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+        Some((format!("kept-{safe}.{ext}"), snap.bytes.clone()))
+    }
+
     /// The palette the app draws with: this app's own choice (Settings > General >
     /// palette, live while it is being picked, so the picker previews), else the
     /// cross-app `settings_kit` palette.
@@ -6828,6 +6862,59 @@ mod tests {
         assert_eq!((s.retention().days, s.retention().keep_everything), (7, false));
         s.settings.persist_field(|x| x.storage.keep_everything = true);
         assert!(s.retention().keep_everything);
+    }
+
+    /// Retry marks the failed rows Pending and names them; a delivered or
+    /// pending row is not retried.
+    #[test]
+    fn retry_sends_again_to_exactly_the_failed_recipients() {
+        let mut s = app();
+        s.sends.push("sc-aaaaaaaa", 0);
+        s.sends.push("sc-bbbbbbbb", 0);
+        s.sends.push("sc-cccccccc", 0);
+        s.sends.get_mut("sc-aaaaaaaa").unwrap().failed(10);
+        s.sends.get_mut("sc-cccccccc").unwrap().delivered(10);
+        assert_eq!(s.begin_retry(20), vec!["sc-aaaaaaaa".to_string()]);
+        assert_eq!(s.sends.rows()[0].state, crate::send_state::SendState::Pending);
+        assert!(s.begin_retry(30).is_empty(), "a row already retrying was retried again");
+    }
+
+    /// A kept snap is written under a name retention never sweeps, with an
+    /// extension from its bytes; an opened view-once snap cannot be kept.
+    #[test]
+    fn a_kept_snap_is_named_outside_the_retention_sweep() {
+        let mut s = app();
+        s.received.push(crate::snaps::Snap { id: "abc/../x".into(), sender_id: "sc-a".into(), sender_name: "A".into(),
+            sent_at: 0, media: crate::snaps::Media::Image, duration_secs: 5, bytes: vec![0xff, 0xd8, 1, 2] });
+        let (name, bytes) = s.kept_file("abc/../x").expect("keepable");
+        assert_eq!(name, "kept-abcx.jpg", "the id must not steer the path");
+        assert_eq!(bytes, vec![0xff, 0xd8, 1, 2]);
+        assert!(crate::snap_expiry::stored_snap(&name).is_none(), "retention would delete a kept snap");
+        s.received[0].bytes.clear();
+        assert!(s.kept_file("abc/../x").is_none());
+    }
+
+    /// Every command the app emits has an arm in the binary. `ExportSnaps`,
+    /// `Notify`, `RetryFailedSends` and `KeepSnap` all fell into the catch-all
+    /// ("unhandled host command") -- buttons that logged a line and did nothing.
+    /// `ApplyDictation` is the one known gap: no text field registers as a
+    /// dictation target yet.
+    #[test]
+    fn the_binary_handles_every_host_command() {
+        let host = include_str!("host.rs");
+        let bin = include_str!("bin/snapclone_egui.rs");
+        let a = host.find("pub enum HostCommand {").unwrap();
+        let body = &host[a..a + host[a..].find("\n}\n").unwrap()];
+        let variants: Vec<&str> = body.lines()
+            .map(|l| l.trim_start())
+            .filter(|l| l.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && !l.starts_with("//"))
+            .map(|l| l.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap())
+            .collect();
+        assert!(variants.len() >= 20, "the scan found {} variants", variants.len());
+        let missing: Vec<&&str> = variants.iter()
+            .filter(|v| **v != "ApplyDictation" && !bin.contains(&format!("HostCommand::{v}")))
+            .collect();
+        assert!(missing.is_empty(), "commands with no arm in the binary: {missing:?}");
     }
 
     #[test]

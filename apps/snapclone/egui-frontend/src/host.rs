@@ -231,6 +231,10 @@ pub enum HostEvent {
     /// The host wrote (or could not write) my code's SVG. Its own event, NOT `SnapSaved`:
     /// that one moves the send flow to Compose, and a saved SVG is not a captured photo.
     CodeSvgSaved(Result<String, String>),
+    /// The host wrote (or could not write) a RECEIVED snap the user chose to
+    /// keep. Not `SnapSaved`, which is the capture flow's step one and moves it
+    /// to Compose -- keeping a friend's snap must not open the composer.
+    SnapKept(Result<String, String>),
     /// The host encoded the shutter's frame for the wire: the bytes that will
     /// go out. Feeds the pre-send receipt's Size facet, which showed
     /// "Sending 0 B" for every snap because nothing told the app what the
@@ -480,6 +484,12 @@ impl Snapclone {
                 self.feed_note = match r {
                     Ok(p) => format!("my code saved: {}", p.rsplit('/').next().unwrap_or(&p)),
                     Err(e) => e,
+                };
+            }
+            HostEvent::SnapKept(r) => {
+                self.feed_note = match r {
+                    Ok(p) => format!("kept: {}", p.rsplit('/').next().unwrap_or(&p)),
+                    Err(e) => format!("could not keep that snap: {e}"),
                 };
             }
             HostEvent::SnapSaved(r) => {
