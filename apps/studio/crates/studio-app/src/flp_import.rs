@@ -145,6 +145,13 @@ pub const DECLICK: f64 = 0.003;
 /// PyFLP's `muted` never decoded this (it reads a field its struct lacks).
 pub const FL_ITEM_MUTED: u64 = 0x2000;
 
+/// A plugin synth's stand-in plays this much below the channel's level. The
+/// patch's own output is unknown; a stand-in at full scale was ~10 dB louder
+/// than the artist's patches where only synths play (A Top A Tower, 5:18-5:27:
+/// Studio -10.2 dB, the artist's render -20.4 dB). One song's measurement,
+/// said in the report; a guess better than full scale.
+pub const STAND_IN_TRIM_DB: f32 = -10.0;
+
 /// Steps per pattern at most (the rack rows are a u64 bitmask).
 const MAX_STEPS: u32 = 64;
 
@@ -156,6 +163,7 @@ pub fn default_params(slot_name: &str) -> BTreeMap<String, f32> {
         "Ozone 8 Exciter" => kv(&[("profile", 0.0), ("drive", 0.15), ("mix", 0.35)]),
         "Ozone 8 Vintage Tape" => kv(&[("profile", 1.0), ("drive", 0.2), ("mix", 0.5)]),
         "Ozone 8 Imager" => kv(&[("low", 0.0), ("mid", 1.0), ("high", 1.3)]),
+        "Fruity Fast Dist" => kv(&[("profile", 0.0), ("drive", 0.15), ("mix", 0.35)]),
         _ => BTreeMap::new(),
     }
 }
@@ -184,6 +192,8 @@ pub fn effect_for(plugin: &str) -> Option<(&'static str, &'static str)> {
         "Neutron 3" => ("compressor", "approximate: Neutron's channel strip as a compressor"),
         // stereo width, run on the bus's stereo path (studio-audio)
         "Ozone 8 Imager" => ("imager", "approximate: the mastering move (lows mono, air wider)"),
+        "Vocal Doubler" => ("doubler", "approximate: two detuned copies left and right, iZotope's own settings not decoded"),
+        "Fruity Fast Dist" => ("saturation", "approximate: gentle drive, FL's settings not decoded"),
         "Fruity Stereo Enhancer" | "Fruity Stereo Shaper" => ("imager", "approximate: width only, neutral until set"),
         "Fruity Multiband Compressor" => ("multiband", "exact kind"),
         _ => return None,
@@ -302,12 +312,14 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
         // vocal chop (an idea the artist never committed to) through its
         // busiest pattern on a full-level stand-in: the loudest thing in the mix.
         let off = c["enabled"].as_bool() == Some(false);
+        let is_stand_in = matches!(kind, SynthKind::Sine { .. } | SynthKind::Sub { .. });
+        let trim = if is_stand_in { 10f32.powf(STAND_IN_TRIM_DB / 20.0) } else { 1.0 };
         if off { switched_off.push(ch_name(c)); }
-        rack.channels.push(Channel { name: ch_name(c), kind, gain: channel_gain(c, media).clamp(0.0, 64.0),
+        rack.channels.push(Channel { name: ch_name(c), kind, gain: (channel_gain(c, media) * trim).clamp(0.0, 64.0),
                                      pan, muted: off, choke_group: None });
     }
     if !stand_ins.is_empty() {
-        report.push(format!("{} plugin synth{} cannot be hosted and their sound is not in the file -- STAND-INS, notes kept: {}",
+        report.push(format!("{} plugin synth{} cannot be hosted and their sound is not in the file -- STAND-INS at {STAND_IN_TRIM_DB} dB (the patches' level is unknown; calibrated on one song where only synths play), notes kept: {}",
             stand_ins.len(), if stand_ins.len() == 1 { "" } else { "s" }, stand_ins.join("; ")));
     }
 

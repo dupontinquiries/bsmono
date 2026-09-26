@@ -476,8 +476,65 @@ pub struct EffectCache {
     /// Each ducked bus's follower state, kept across contiguous calls like
     /// every other effect's (a duck that re-armed per buffer would click).
     ducks: BTreeMap<studio_core::BusId, Duck>,
+    /// Each bus's doubler state.
+    doublers: BTreeMap<studio_core::BusId, Doubler>,
     /// Each bus's stereo imager, with the widths it was built for.
     imagers: BTreeMap<studio_core::BusId, ([f32; 3], studio_fx::imager::Imager)>,
+}
+
+/// DOUBLER -- a stand-in for iZotope Vocal Doubler (on all of A Top A
+/// Tower's vocal chains, where its absence left the vocals thin and low):
+/// two copies of the (mono-summed) voice at short delays, each detuned a few
+/// cents by a slow wobble of its delay time, one mostly left and one mostly
+/// right, under the dry signal. STEREO, so it runs on the bus's stereo path
+/// like `imager`. Params: `amount` (0..1, 0.5), `spread` (0..1, 0.8),
+/// `detune` (cents, 8), `delay` (ms, 18; the second voice at 1.3x).
+#[derive(Debug, Clone)]
+pub struct Doubler { buf: Vec<f32>, pos: usize, phase: [f64; 2] }
+
+impl Doubler {
+    pub fn new(rate: u32) -> Doubler { Doubler { buf: vec![0.0; rate as usize / 10 + 4], pos: 0, phase: [0.0, 0.5] } }
+
+    fn read(&self, delay: f64) -> f32 {
+        let n = self.buf.len();
+        let d = delay.clamp(1.0, (n - 3) as f64);
+        let back = self.pos as f64 - d;
+        let i0 = back.floor();
+        let t = (back - i0) as f32;
+        let at = |k: f64| self.buf[((k as i64).rem_euclid(n as i64)) as usize];
+        at(i0) * (1.0 - t) + at(i0 + 1.0) * t
+    }
+
+    /// Process stereo frames in place.
+    pub fn process(&mut self, frames: &mut [f32], p: &studio_core::Effect, rate: u32) {
+        let q = |k: &str, d: f32| p.params.get(k).copied().unwrap_or(d);
+        let (amount, spread) = (q("amount", 0.5).clamp(0.0, 1.0), q("spread", 0.8).clamp(0.0, 1.0));
+        let (cents, delay_ms) = (q("detune", 8.0).clamp(0.0, 50.0) as f64, q("delay", 18.0).clamp(5.0, 45.0) as f64);
+        let r = rate as f64;
+        let rates = [0.31f64, 0.23];
+        // a delay swinging +-A seconds at f Hz shifts pitch by ~ 2*pi*f*A: A for `cents`
+        let depth: [f64; 2] = rates.map(|f| (2f64.powf(cents / 1200.0) - 1.0) / (std::f64::consts::TAU * f) * r);
+        let base = [delay_ms * 0.001 * r, delay_ms * 1.3 * 0.001 * r];
+        let (near, far) = (0.5 + 0.5 * spread, 0.5 - 0.5 * spread);
+        for fr in frames.chunks_exact_mut(2) {
+            let n = self.buf.len();
+            self.buf[self.pos] = 0.5 * (fr[0] + fr[1]);
+            let mut v = [0.0f32; 2];
+            for k in 0..2 {
+                let d = base[k] + depth[k] * (std::f64::consts::TAU * self.phase[k]).sin() + depth[k];
+                v[k] = self.read(d);
+                self.phase[k] = (self.phase[k] + rates[k] / r).fract();
+            }
+            self.pos = (self.pos + 1) % n;
+            fr[0] += amount * (v[0] * near + v[1] * far);
+            fr[1] += amount * (v[0] * far + v[1] * near);
+        }
+    }
+}
+
+/// A bus's enabled `doubler`, if any.
+pub fn doubler_of(bus: &studio_core::Bus) -> Option<&studio_core::Effect> {
+    bus.chain.iter().find(|e| e.kind == "doubler" && e.enabled)
 }
 
 /// The imager's crossovers: below 200 Hz, 200 Hz - 4 kHz, above 4 kHz.
@@ -576,6 +633,7 @@ impl EffectCache {
         self.bus.clear();
         self.ducks.clear();
         self.imagers.clear();
+        self.doublers.clear();
     }
 
     fn build(chain: &[studio_core::Effect], rate: f32) -> Vec<(usize, studio_fx::Instance)> {
@@ -1147,6 +1205,9 @@ pub fn mixdown_into(
                     }
                 }
             }
+        }
+        if let Some(fx) = doubler_of(bus) {
+            cache.doublers.entry(id).or_insert_with(|| Doubler::new(rate)).process(&mut buf, fx, rate);
         }
         if let Some(widths) = imager_of(bus) {
             let entry = cache.imagers.entry(id).or_insert_with(|| (widths, studio_fx::imager::Imager::new(rate as f32, &IMAGER_SPLITS)));
@@ -3177,6 +3238,26 @@ mod duck_tests {
         let err = a.iter().zip(&b).skip(4800).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         let peak = a.iter().fold(0.0f32, |m, x| m.max(x.abs()));
         assert!(err < 0.02 * peak, "the mono fold-down is unchanged (after the crossovers settle): {err} of {peak}");
+    }
+
+    /// The doubler at amount 0 is exact silence of the wet part; at 0.5 on a
+    /// MONO voice it adds width (L != R) and level, and its copies are late
+    /// (no wet signal in the first ~15 ms).
+    #[test]
+    fn the_doubler_widens_a_mono_voice_and_at_zero_does_nothing() {
+        let rate = 48_000u32;
+        let voice: Vec<f32> = (0..rate as usize).flat_map(|i| { let x = 0.3 * ((i as f32) * 0.037).sin() * ((i as f32) * 0.0011).sin(); [x, x] }).collect();
+        let fx = |amt: f32| Effect { kind: "doubler".into(), enabled: true, params: [("amount".to_string(), amt)].into() };
+        let mut zero = voice.clone();
+        Doubler::new(rate).process(&mut zero, &fx(0.0), rate);
+        assert_eq!(zero, voice, "amount 0 changes nothing");
+        let mut wet = voice.clone();
+        Doubler::new(rate).process(&mut wet, &fx(0.5), rate);
+        assert_eq!(&wet[..2 * 700], &voice[..2 * 700], "the copies are late: nothing added in the first 14 ms");
+        let side = wet.chunks(2).skip(4800).map(|f| (f[0] - f[1]).powi(2)).sum::<f32>();
+        let e = |v: &[f32]| v.iter().skip(9600).map(|x| x * x).sum::<f32>();
+        assert!(side > 0.01 * e(&voice), "a mono voice is WIDER doubled: side energy {side}");
+        assert!(e(&wet) > e(&voice), "and fuller");
     }
 
     /// Bus pan is a balance: hard left silences the right side and leaves the

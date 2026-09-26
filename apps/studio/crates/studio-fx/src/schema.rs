@@ -114,7 +114,7 @@ const NOTE_NAMES: &[&str] = &["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "
 /// (studio-audio), not through `instantiate`'s per-sample chain -- listed so
 /// the schema can offer their controls while the chain contract stays exact.
 /// On a clip they do nothing (clips are processed per sample).
-pub const BUS_STEREO_KINDS: &[&str] = &["imager"];
+pub const BUS_STEREO_KINDS: &[&str] = &["imager", "doubler"];
 
 pub const KINDS: &[(&str, &str)] = &[
     ("gain", "level, in dB"),
@@ -127,6 +127,7 @@ pub const KINDS: &[(&str, &str)] = &[
     ("adaptivesat", "saturation that follows notes and sibilance"),
     ("autotune", "pitch correction to a scale"),
     ("imager", "stereo width in three bands (busses)"),
+    ("doubler", "doubled voice: two detuned copies left and right (busses)"),
     ("comb", "comb delay: metallic resonance"),
     ("sub", "sub-octave"),
     ("shift", "pitch shift, granular"),
@@ -182,6 +183,12 @@ pub fn schema(kind: &str) -> Option<Vec<ParamSpec>> {
             b("tied", "tie channels", false),
             f("bias", "bias", -1.0, 1.0, "", 0.0),
             f("mix", "mix", 0.0, 1.0, "%", 1.0),
+        ],
+        "doubler" => vec![
+            f("amount", "amount", 0.0, 1.0, "%", 0.5),
+            f("spread", "spread", 0.0, 1.0, "%", 0.8),
+            f("detune", "detune", 0.0, 50.0, "cents", 8.0),
+            f("delay", "delay", 5.0, 45.0, "ms", 18.0),
         ],
         "imager" => vec![
             f("low", "width below 200 Hz", 0.0, 2.0, "", 1.0),

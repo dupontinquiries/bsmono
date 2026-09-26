@@ -210,10 +210,11 @@ pub fn inventory(b: &[u8]) -> Result<Value, FlpError> {
                     "notes": d[144..156].iter().map(|b| *b != 0).collect::<Vec<bool>>(),
                 }));
             }
-            // A VST's wrapper state (212) carries its install path; when FL stored
+            // A VST's wrapper state (212) or plugin data (213 -- where Vocal Doubler's
+            // path turned out to be) carries its install path; when FL stored
             // no display name, the path's file stem names it ("…/Vocal Doubler.vst3"
             // was "a plugin" on all three of A Top A Tower's vocal chains).
-            Ev::Data(212, d) if mixer_on && !slot.contains_key("name") => {
+            Ev::Data(212, d) | Ev::Data(213, d) if mixer_on && !slot.contains_key("name") && slot.get("plugin").and_then(Value::as_str) == Some("Fruity Wrapper") => {
                 if let Some(n) = vst_name_from_path(d) { slot.insert("name".into(), json!(n)); }
             }
             Ev::Num(98, v) if mixer_on => {
