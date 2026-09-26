@@ -15,5 +15,7 @@ pub mod device_picker;
 pub mod peek_viewer;
 pub mod status_rows;
 pub mod show;
+/// The app catalog as a searchable, finger-sized list (Fleet, Push).
+pub mod app_list;
 pub mod task;
 pub mod fleet_actions;

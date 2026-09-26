@@ -30,6 +30,10 @@ pub struct State {
     /// The entry the primary port replaced, kept so "use the original instead" can put it
     /// back. A default you cannot undo is a trap.
     pub legacy: Option<SuiteApp>,
+    /// The catalog is showing although an app is chosen ("change app").
+    pub list_open: bool,
+    /// The catalog's search text.
+    pub query: String,
 
     // ── the reroll section ──
     /// The remembered fleet. Lives here rather than being rediscovered each
@@ -339,29 +343,23 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.label(egui::RichText::new("build + install BigSilicon apps from the catalog").weak().small());
     ui.separator();
 
-    uikit_egui::scroll::bounded(ui, 280.0, |ui| {
-        for suite in cockpit::flow::store_groups() {
-            egui::CollapsingHeader::new(format!("{}  ·  {}", suite.name, suite.description))
-                .default_open(suite.name == "coding")
-                .show(ui, |ui| {
-                    for a in &suite.apps {
-                        let sel = app.fleet.selected.as_ref().is_some_and(|s| s.name == a.name);
-                        ui.horizontal(|ui| {
-                            // deterministic identicon tile (ported from the Qt MonoTile), not an emoji
-                            uikit_egui::mono_tile::mono_tile(ui, &a.name, 22.0);
-                            ui.add_space(6.0);
-                            if ui.selectable_label(sel, &a.name).clicked() {
-                                app.fleet.selected = Some(a.clone());
-                            }
-                        });
-                    }
-                });
+    // THE CATALOG: part of the page's scroll (it was a 280 px box scrolling
+    // inside it), searchable, and folded to the chosen app once one is
+    // picked so the build controls are right below — see `app_list`.
+    let listing = app.fleet.selected.is_none() || app.fleet.list_open;
+    if listing {
+        let current = app.fleet.selected.as_ref().map(|s| s.name.clone());
+        if let Some(a) = crate::app_list::list_ui(ui, "fleet", &mut app.fleet.query, current.as_deref()) {
+            app.fleet.selected = Some(a);
+            app.fleet.list_open = false;
         }
-    });
+    }
 
     ui.separator();
     if let Some(sel) = app.fleet.selected.clone() {
-        ui.label(format!("selected: {}  ({})", sel.name, sel.path));
+        if !listing && crate::app_list::chosen_ui(ui, &sel, &sel.path) {
+            app.fleet.list_open = true;
+        }
         // When the manifest's primary port replaced the selection, say so plainly and keep
         // the original one click away — a default that cannot be undone is a trap, and the
         // Qt shell is still the parity reference for the port.

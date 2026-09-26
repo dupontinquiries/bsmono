@@ -6,6 +6,10 @@ use cockpit::suite::SuiteApp;
 
 pub struct State {
     pub selected: Option<SuiteApp>,
+    /// The catalog is showing although an app is chosen ("change app").
+    pub list_open: bool,
+    /// The catalog's search text.
+    pub query: String,
     pub user: String,
     pub host: String,
     pub target: String,
@@ -36,6 +40,8 @@ impl Default for State {
     fn default() -> Self {
         Self {
             selected: None,
+            list_open: false,
+            query: String::new(),
             user: "user".to_string(),
             host: String::new(),
             target: "aarch64-unknown-linux-musl".to_string(),
@@ -60,16 +66,21 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.label(egui::RichText::new("build here for the device's target, send the binary, install it").weak().small());
     ui.separator();
 
-    let cur = app.push.selected.as_ref().map(|s| s.name.clone()).unwrap_or_else(|| "(pick an app)".to_string());
-    egui::ComboBox::from_label("app").selected_text(cur).show_ui(ui, |ui| {
-        for suite in cockpit::flow::store_groups() {
-            for a in suite.apps {
-                if ui.selectable_label(false, &a.name).clicked() {
-                    app.push.selected = Some(a);
-                }
-            }
+    // The same catalog list as Fleet (`app_list`), in place of a combo box
+    // whose popup showed a handful of rows at a time in its own scroll.
+    match app.push.selected.clone() {
+        Some(sel) if !app.push.list_open => {
+            if crate::app_list::chosen_ui(ui, &sel, &sel.path) { app.push.list_open = true; }
         }
-    });
+        current => {
+            ui.label(egui::RichText::new("app").strong());
+            if let Some(a) = crate::app_list::list_ui(ui, "push", &mut app.push.query, current.as_ref().map(|s| s.name.as_str())) {
+                app.push.selected = Some(a);
+                app.push.list_open = false;
+            }
+            ui.separator();
+        }
+    }
 
     // discover devices on the LAN and pick one (fills host), instead of typing it
     egui::CollapsingHeader::new("discover devices").show(ui, |ui| {
