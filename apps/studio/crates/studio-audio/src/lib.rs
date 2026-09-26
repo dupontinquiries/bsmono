@@ -482,6 +482,31 @@ pub struct EffectCache {
     imagers: BTreeMap<studio_core::BusId, ([f32; 3], studio_fx::imager::Imager)>,
 }
 
+/// Set this thread's float unit to FLUSH SUBNORMALS TO ZERO (x86_64: MXCSR
+/// FTZ + DAZ; aarch64: FPCR.FZ). A reverb whose input went quiet decays
+/// toward zero through the subnormal range (< 1.2e-38), where x86 float math
+/// runs 10-100x slower: A Top A Tower's whole-song render fell from 7x to
+/// 0.7x real time within six minutes, every reverb that had ever played
+/// crawling through its own tail (gdb: 7 of 10 samples in Reverb::process),
+/// while a render STARTED late ran at 9x. Called at the top of every
+/// mixdown, so exports and playback both get it; one register write. The
+/// values it zeroes are below -760 dBFS.
+#[inline]
+pub fn flush_denormals_to_zero() {
+    #[cfg(target_arch = "x86_64")]
+    #[allow(deprecated)]
+    unsafe {
+        use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+        _mm_setcsr(_mm_getcsr() | 0x8040); // FTZ (bit 15) | DAZ (bit 6)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let mut fpcr: u64;
+        std::arch::asm!("mrs {}, fpcr", out(reg) fpcr);
+        std::arch::asm!("msr fpcr, {}", in(reg) fpcr | (1 << 24)); // FZ
+    }
+}
+
 /// DOUBLER -- a stand-in for iZotope Vocal Doubler (on all of A Top A
 /// Tower's vocal chains, where its absence left the vocals thin and low):
 /// two copies of the (mono-summed) voice at short delays, each detuned a few
@@ -922,6 +947,7 @@ pub fn mixdown_into(
     scratch: &mut RenderScratch,
     out: &mut [f32],
 ) {
+    flush_denormals_to_zero();
     let frames = (to.to_samples(rate) - from.to_samples(rate)).max(0) as usize;
     assert_eq!(out.len(), frames * 2, "mixdown_into: out.len() must equal frames * 2");
     out.fill(0.0);
@@ -1331,6 +1357,19 @@ pub fn bus_signal(
 pub fn peak_dbfs(samples: &[f32]) -> f32 {
     let peak = samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));
     if peak <= 0.0 { f32::NEG_INFINITY } else { 20.0 * peak.log10() }
+}
+
+#[cfg(test)]
+mod denormal_tests {
+    /// After the flush is set, a product that would be subnormal is zero
+    /// (and a normal one is untouched) -- on this thread, as the mixdown sets it.
+    #[test]
+    fn subnormal_results_flush_to_zero() {
+        super::flush_denormals_to_zero();
+        let tiny = std::hint::black_box(f32::MIN_POSITIVE);
+        assert_eq!(std::hint::black_box(tiny * 0.25), 0.0, "subnormal product flushed");
+        assert_eq!(std::hint::black_box(1.5f32) * 2.0, 3.0);
+    }
 }
 
 #[cfg(test)]
