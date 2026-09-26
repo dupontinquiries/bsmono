@@ -1460,3 +1460,59 @@ mod adaptive_sat_registry_tests {
         assert!(matches!(a, Some(Instance::AdaptiveSat(_))));
     }
 }
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    /// A master-chain stage driven hard by a loud passage must let go: after
+    /// its release, a quiet signal passes at (near) unity. Goat's whole-song
+    /// render lost ~10 dB of low end at 3:04 (peaks -16.6 dBFS) that a render
+    /// STARTED at 3:04 did not -- gain reduction carried from the loud intro?
+    /// (gain reduction during the loud passage, gain on the quiet tail), dB.
+    /// The first must be real, or "it recovered" says nothing: a stage that
+    /// never engaged recovers trivially.
+    fn recovers(kind: &str) -> (f32, f32) {
+        let rate = 48_000u32;
+        let mut params = std::collections::BTreeMap::new();
+        // a default multiband has every band BYPASSED (crossovers only), so it
+        // cannot hold gain; engage its bands, or the test measures a split-and-sum
+        if kind == "multiband" { for i in 0..3 { params.insert(format!("band{i}_bypass"), 0.0f32); } }
+        let e = studio_core::Effect { kind: kind.into(), enabled: true, params };
+        let mut fx = instantiate(&e, rate as f32).expect("an instance");
+        let tone = |i: usize, a: f32| a * (i as f32 / rate as f32 * 60.0 * std::f32::consts::TAU).sin();
+        // 2 s at +12 dBFS (a float master bus goes over 0; Goat's intro did)
+        let loud = 4.0f32;
+        let hot: Vec<f32> = (0..rate as usize * 2).map(|i| fx.process_audio(tone(i, loud))).collect();
+        let hot_rms = (hot[rate as usize..].iter().map(|x| x * x).sum::<f32>() / rate as f32).sqrt();
+        let reduction = 20.0 * (hot_rms / (loud / std::f32::consts::SQRT_2)).log10();
+        let quiet = 0.03f32;                                                        // -30 dBFS
+        let n = rate as usize * 6;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n { out.push(fx.process_audio(tone(i, quiet))); }
+        let tail = &out[rate as usize * 4..];                                      // after 4 s of quiet
+        let rms = (tail.iter().map(|x| x * x).sum::<f32>() / tail.len() as f32).sqrt();
+        (reduction, 20.0 * (rms / (quiet / std::f32::consts::SQRT_2)).log10())
+    }
+
+    #[test]
+    fn the_limiter_lets_go_after_a_loud_passage() {
+        let (red, g) = recovers("limiter");
+        assert!(red < -3.0, "limiter must engage on the loud passage: {red:+.1} dB");
+        assert!(g.abs() < 1.0, "limiter still {g:+.1} dB after 4 s of quiet");
+    }
+
+    #[test]
+    fn the_compressor_lets_go_after_a_loud_passage() {
+        let (red, g) = recovers("compressor");
+        assert!(red < -3.0, "compressor must engage on the loud passage: {red:+.1} dB");
+        assert!(g.abs() < 1.0, "compressor still {g:+.1} dB after 4 s of quiet");
+    }
+
+    #[test]
+    fn the_multiband_lets_go_after_a_loud_passage() {
+        let (red, g) = recovers("multiband");
+        assert!(red < -3.0, "multiband must engage on the loud passage: {red:+.1} dB");
+        assert!(g.abs() < 1.0, "multiband still {g:+.1} dB after 4 s of quiet");
+    }
+}
