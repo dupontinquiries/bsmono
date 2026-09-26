@@ -1,0 +1,14 @@
+# hatch-egui's build image for the phone: Alpine aarch64 -- the same musl,
+# libwayland and libEGL as postmarketOS. hatch's eframe build enables
+# `wayland`, whose wayland-sys needs the target's libwayland at build time,
+# which the generic musl cross image does not have.
+#
+# gitmind uses this automatically (cockpit::podman::app_containerfile finds
+# deploy/Containerfile.<arch> beside the app): built once as
+# localhost/hatch-build-aarch64, then cargo runs natively inside it --
+# natively on an aarch64 host (Asahi), under qemu elsewhere.
+# By hand:
+#   podman build --platform linux/arm64 -t localhost/hatch-build-aarch64 -f Containerfile.aarch64 .
+FROM --platform=linux/arm64 docker.io/alpine:edge
+RUN apk add --no-cache cargo rust wayland-dev mesa-dev pkgconf libxkbcommon-dev musl-dev
+WORKDIR /src
