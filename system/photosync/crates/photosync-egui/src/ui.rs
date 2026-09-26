@@ -1,13 +1,9 @@
 //! The frame loop. Grouping is `Library::by_day`; column/row placement is
-//! `gallery_grid::grid_for` + `cell_pos`; this file only paints.
+//! `gallery_grid::grid_for` + `cell_pos`; what a press means is `selection`;
+//! album changes are `App`'s methods. This file paints and routes input.
 //!
-//! No thumbnail decoder is wired in yet — tiles are painted as deterministic
-//! colour swatches (same seed/hue trick `mono_tile` uses for app icons) so
-//! the grid, the grouping and the selection model can be seen and used
-//! before that lands. Swapping in real bitmaps means loading a `TextureId`
-//! per `Item::thumbnail` and drawing it in place of `paint_tile`'s
-//! `painter.rect_filled` — everything else here is already the shape that
-//! needs.
+//! Tiles show decoded thumbnails (`thumbs`); until one arrives a tile is a
+//! placeholder in the style Settings picks (`settings::ThumbStyle`).
 
 use crate::{App, View};
 use egui::{Color32, Context, CornerRadius, Pos2, Rect, ScrollArea, Sense, Stroke, Vec2};
@@ -44,6 +40,49 @@ pub fn draw(app: &mut App, ctx: &Context) {
                 }
             });
         });
+    if app.new_album_open {
+        new_album_dialog(app, ctx);
+    }
+}
+
+/// Name a new album. A modal rather than a field in the rail: the rail
+/// collapses to icons on a phone, and the field it held was not focused
+/// when "New album…" opened it, so typing went nowhere.
+fn new_album_dialog(app: &mut App, ctx: &Context) {
+    let n = app.selected.len();
+    let modal = egui::Modal::new(egui::Id::new("photosync-new-album")).show(ctx, |ui| {
+        ui.set_width(280.0_f32.min(ctx.content_rect().width() - 48.0));
+        ui.heading("New album");
+        if n > 0 {
+            ui.label(format!("With the {n} selected photo{}.", if n == 1 { "" } else { "s" }));
+        }
+        ui.add_space(6.0);
+        let resp = ui.add(egui::TextEdit::singleline(&mut app.new_album_name)
+            .id_salt("photosync-new_album").hint_text("Album name").desired_width(f32::INFINITY));
+        if !resp.has_focus() && !resp.lost_focus() { resp.request_focus(); }
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        ui.add_space(8.0);
+        let mut done = None;
+        let taken = app.library.album(app.new_album_name.trim()).is_some();
+        if taken {
+            ui.colored_label(ui.visuals().warn_fg_color, "There is already an album with that name.");
+        }
+        ui.horizontal(|ui| {
+            let ok = !app.new_album_name.trim().is_empty() && !taken;
+            if ui.add_enabled(ok, egui::Button::new("Create")).clicked() || (enter && ok) { done = Some(true); }
+            if ui.button("Cancel").clicked() { done = Some(false); }
+        });
+        done
+    });
+    let outcome = if modal.should_close() { Some(false) } else { modal.inner };
+    match outcome {
+        Some(true) => {
+            let name = std::mem::take(&mut app.new_album_name);
+            if app.new_album(&name) { app.new_album_open = false; } else { app.new_album_name = name; }
+        }
+        Some(false) => { app.new_album_open = false; app.new_album_name.clear(); }
+        None => {}
+    }
 }
 
 fn rail_body(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
@@ -73,25 +112,12 @@ fn rail_body(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColor
     }
 
     ui.add_space(6.0);
-    if app.new_album_open {
+    {
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            let resp = ui.add(egui::TextEdit::singleline(&mut app.new_album_name).id_salt("photosync-new_album"));
-            if ui.button("Add").clicked() || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                if app.library.create_album(&app.new_album_name) {
-                    app.view = View::Album(app.new_album_name.trim().to_string());
-                    app.status = format!("Created album \"{}\"", app.new_album_name.trim());
-                } else {
-                    app.status = "Album name already taken, or blank".into();
-                }
-                app.new_album_name.clear();
-                app.new_album_open = false;
-            }
-        });
-    } else {
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            if ui.button("+ New album").clicked() {
+            let label = if app.selected.is_empty() { "+ New album".to_string() }
+                        else { format!("+ New album from {}", app.selected.len()) };
+            if ui.button(label).clicked() {
                 app.new_album_open = true;
             }
         });
@@ -154,15 +180,16 @@ fn header(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) 
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(16.0);
-            if !app.selected.is_empty() {
-                ui.label(egui::RichText::new(format!("{} selected", app.selected.len())).color(colors.text_weak));
-                if ui.button("Clear").clicked() {
-                    app.selected.clear();
+            if app.selected.is_empty() {
+                ui.label(egui::RichText::new("Tile size").color(colors.text_weak).size(11.0));
+                ui.add(egui::Slider::new(&mut app.tile_target, gallery_grid::MIN_CELL..=280.0).show_value(false));
+                if let View::Album(name) = app.view.clone() {
+                    ui.add_space(12.0);
+                    album_delete(app, ui, colors, &name);
                 }
+            } else {
+                selection_bar(app, ui, colors);
             }
-            ui.add_space(12.0);
-            ui.label(egui::RichText::new("Tile size").color(colors.text_weak).size(11.0));
-            ui.add(egui::Slider::new(&mut app.tile_target, gallery_grid::MIN_CELL..=280.0).show_value(false));
         });
     });
     if !app.status.is_empty() {
@@ -173,35 +200,91 @@ fn header(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) 
     }
 }
 
+/// What can be done with a selection. Drawn right to left, so the first
+/// control added is the rightmost: Clear sits at the edge, where a thumb or
+/// the pointer finds it.
+fn selection_bar(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
+    if ui.button("Clear").on_hover_text("Deselect all (Esc)").clicked() {
+        app.selected.clear();
+    }
+    if ui.button("Select all").clicked() {
+        let all = app.visible_order();
+        app.selected.set(all);
+    }
+    if let View::Album(name) = app.view.clone() {
+        if ui.button("Remove from album").on_hover_text("The photos stay in the library").clicked() {
+            app.remove_selection_from(&name);
+        }
+    }
+    let names: Vec<String> = app.library.album_names().into_iter().map(String::from).collect();
+    ui.menu_button("Add to album", |ui| {
+        for name in &names {
+            if app.view == View::Album(name.clone()) { continue; }
+            if ui.button(name).clicked() {
+                app.add_selection_to(name);
+                ui.close();
+            }
+        }
+        if !names.is_empty() { ui.separator(); }
+        if ui.button("New album…").clicked() {
+            app.new_album_open = true;
+            ui.close();
+        }
+    });
+    ui.label(egui::RichText::new(format!("{} selected", app.selected.len())).color(colors.text));
+}
+
+/// Delete the open album, in two presses: the first arms, the second deletes.
+/// Photos are never touched, but an album is someone's curation and one
+/// stray tap should not undo it.
+fn album_delete(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors, name: &str) {
+    if app.confirm_delete.as_deref() == Some(name) {
+        if ui.button("Cancel").clicked() { app.confirm_delete = None; }
+        let confirm = egui::Button::new(egui::RichText::new("Delete it").color(Color32::WHITE)).fill(colors.danger);
+        if ui.add(confirm).on_hover_text("The photos stay in the library").clicked() {
+            app.delete_album(name);
+        }
+    } else if ui.button("Delete album").clicked() {
+        app.confirm_delete = Some(name.to_string());
+    }
+}
+
 fn gallery(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
     const GAP: f32 = 6.0;
     const GROUP_GAP: f32 = 22.0;
 
     let groups: Vec<(String, Vec<&Item>)> = match &app.view {
         View::Library => app.library.by_day(),
+        // An album by day too (it was one group headed "Selected"), in the
+        // same newest-first order `visible_order` walks.
         View::Album(name) => {
-            let items = app.library.album_items(name);
-            if items.is_empty() {
-                Vec::new()
-            } else {
-                vec![("Selected".to_string(), items)]
+            let mut out: Vec<(String, Vec<&Item>)> = Vec::new();
+            for i in app.library.album_items(name) {
+                match out.last_mut() {
+                    Some((d, v)) if *d == i.day() => v.push(i),
+                    _ => out.push((i.day(), vec![i])),
+                }
             }
+            out
         }
         View::Settings => Vec::new(), // unreachable: draw() routes Settings to settings_view instead
     };
 
-    if app.library.is_empty() {
+    if app.library.is_empty() || groups.is_empty() {
+        let msg = if app.library.is_empty() { "No photos yet" }
+                  else { "This album is empty. In the Library, long-press (or right-click) photos to select them, then Add to album." };
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
-            ui.label(egui::RichText::new("No photos yet").color(colors.text_weak));
+            ui.label(egui::RichText::new(msg).color(colors.text_weak));
         });
         return;
     }
 
     let width = ui.available_width() - 32.0;
     let target = app.tile_target;
-    let mut toggled: Option<String> = None;
-    let mut open: Option<String> = None;
+    app.last_tiles.clear();
+    let mut pressed: Option<(String, crate::selection::Press)> = None;
+    let mods = ui.input(|i| i.modifiers);
 
     ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         ui.add_space(8.0);
@@ -237,14 +320,16 @@ fn gallery(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors)
                     // texture once it has been uploaded.
                     if let Some(t) = &app.thumbs { let _ = t.get(&item.path); }
                     let thumb = app.textures.get(&item.path).map(|h| (h.id(), h.size_vec2()));
+                    app.last_tiles.push((item.path.clone(), cell_rect));
                     let hit = paint_tile(ui, cell_rect, item, thumb, app.selected.contains(&item.path), colors, app.settings.thumb_style);
-                    if hit.double_clicked() {
-                        // Open it. The double-click's FIRST click already toggled
-                        // the selection; toggling again leaves it as it was.
-                        open = Some(item.path.clone());
-                        toggled = Some(item.path.clone());
+                    // Long-press on a touch screen and right-click both arrive
+                    // as secondary_clicked, and neither as clicked() (checked:
+                    // swapping these two tests fails nothing).
+                    if hit.secondary_clicked() {
+                        pressed = Some((item.path.clone(), crate::selection::Press::Secondary));
                     } else if hit.clicked() {
-                        toggled = Some(item.path.clone());
+                        pressed = Some((item.path.clone(), crate::selection::Press::Primary {
+                            ctrl: mods.command, shift: mods.shift }));
                     }
                 }
             }
@@ -252,13 +337,14 @@ fn gallery(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors)
         }
     });
 
-    if let Some(path) = open {
-        app.viewing = Some(path);
-    }
-    if let Some(path) = toggled {
-        if !app.selected.remove(&path) {
-            app.selected.insert(path);
+    if let Some((path, press)) = pressed {
+        let order = app.visible_order();
+        if let Some(open) = app.selected.press(&order, &path, press) {
+            app.viewing = Some(open);
         }
+    }
+    if !app.selected.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        app.selected.clear();
     }
 }
 
@@ -374,7 +460,7 @@ fn settings_view(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteC
         ui.horizontal(|ui| {
             ui.add_space(16.0);
             ui.label(
-                egui::RichText::new("This build has no daemon behind it yet — these edit the config a future sync would run with, the same as toggling a setting before the first run.")
+                egui::RichText::new("The gallery only reads the service's library. The sync settings below are not sent to the service: they edit this window's copy, for a sync started from here in future.")
                     .color(colors.text_weak)
                     .small(),
             );
@@ -388,7 +474,7 @@ fn settings_view(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteC
                 ui.add_space(6.0);
                 ui.label("Thumbnail style");
                 ui.label(
-                    egui::RichText::new("Procedural, not decoded — there's no thumbnail cache on disk to grow over time.")
+                    egui::RichText::new("What a tile shows until its thumbnail has loaded. Thumbnails are held in memory only — nothing is cached on disk.")
                         .color(colors.text_weak)
                         .small(),
                 );
@@ -500,7 +586,8 @@ fn viewer(app: &mut App, ctx: &Context) {
             }
         }
     }
-    let order: Vec<String> = app.library.by_day().into_iter().flat_map(|(_, items)| items.into_iter().map(|i| i.path.clone())).collect();
+    // The view's own order: stepping through an album stays in the album.
+    let order = app.visible_order();
     let (esc, left, right) = ctx.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight)));
     let mut close = esc;
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::from_black_alpha(245))).show(ctx, |ui| {
@@ -619,6 +706,164 @@ mod draw_tests {
             let s = tex.size();
             assert!(s[0].max(s[1]) <= THUMB_SIDE as usize && s[0].max(s[1]) > 0, "{path}: {s:?}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A library the way the service writes one: PNGs imported by
+    /// `PhotoSyncDB::import_photo`, dated by mtime a day apart.
+    fn service_library(tag: &str, n: usize) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("photosync-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("blocks")).unwrap();
+        let db_path = dir.join("photosync.db");
+        let mut db = photosync::PhotoSyncDB::new(&db_path, &dir.join("blocks")).unwrap();
+        for i in 0..n {
+            let p = dir.join(format!("s{i}.png"));
+            image::RgbImage::from_pixel(120, 90, image::Rgb([30 * i as u8, 120, 200])).save(&p).unwrap();
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_750_000_000 + i as u64 * 86_400);
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
+            db.import_photo(&p, "test", 64).unwrap();
+        }
+        (dir, db_path)
+    }
+
+    struct Frames { ctx: egui::Context, t: f64 }
+    impl Frames {
+        fn new() -> Self { Frames { ctx: egui::Context::default(), t: 0.0 } }
+        fn run(&mut self, app: &mut App, events: Vec<egui::Event>) {
+            self.t += 0.05;
+            let _ = self.ctx.run(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1040.0, 720.0))),
+                time: Some(self.t), events, ..Default::default() }, |ctx| draw(app, ctx));
+        }
+        fn click(&mut self, app: &mut App, at: Pos2, button: egui::PointerButton) {
+            let b = |pressed| egui::Event::PointerButton { pos: at, button, pressed, modifiers: Default::default() };
+            // Move in its own frame: a move and a press in one frame is a
+            // drag of that distance, which scrolls the grid under the press.
+            self.run(app, vec![egui::Event::PointerMoved(at)]);
+            self.run(app, vec![b(true)]);
+            self.run(app, vec![b(false)]);
+            self.run(app, vec![]);
+        }
+        fn tile(&self, app: &App, path: &str) -> Pos2 {
+            app.last_tiles.iter().find(|(p, _)| p == path).map(|(_, r)| r.center())
+                .unwrap_or_else(|| panic!("{path} not drawn: {:?}", app.last_tiles.iter().map(|t| &t.0).collect::<Vec<_>>()))
+        }
+    }
+
+    /// Through the real draw: a tap opens, a right-click starts selecting and
+    /// then taps toggle, "Add to album" (App::new_album here, which the rail
+    /// and the menu both call) keeps the selection in the new album — and
+    /// the album is in the user's albums file when the library is opened
+    /// again, while the service's database is not written.
+    #[test]
+    fn select_by_long_press_then_tap_and_the_album_survives_a_restart() {
+        let (dir, db) = service_library("albums", 4);
+        let albums = dir.join("user").join("albums.db");
+        let before = std::fs::metadata(&db).unwrap().modified().unwrap();
+        let mut app = App::from_path(&db).unwrap();
+        app.open_albums(&albums).unwrap();
+        let mut f = Frames::new();
+        f.run(&mut app, vec![]);
+        let order = app.visible_order();
+        assert_eq!(order.len(), 4);
+
+        // A tap opens the photo (no double-click needed).
+        let at = f.tile(&app, &order[0]);
+        f.click(&mut app, at, egui::PointerButton::Primary);
+        assert_eq!(app.viewing.as_deref(), Some(order[0].as_str()), "a tap opens");
+        assert!(app.selected.is_empty(), "and selects nothing");
+        f.run(&mut app, vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+        assert_eq!(app.viewing, None);
+        f.run(&mut app, vec![]);
+
+        // Right-click (the desktop's long-press) selects; taps then toggle.
+        let a = f.tile(&app, &order[1]);
+        f.click(&mut app, a, egui::PointerButton::Secondary);
+        assert!(app.selected.contains(&order[1]) && app.viewing.is_none());
+        let b = f.tile(&app, &order[0]); // the two newest days are what fits on screen
+        f.click(&mut app, b, egui::PointerButton::Primary);
+        assert_eq!(app.selected.paths().len(), 2, "a tap while selecting adds");
+        assert!(app.viewing.is_none(), "and does not open");
+
+        assert!(app.new_album("Trip"));
+        assert_eq!(app.view, View::Album("Trip".into()));
+        assert!(app.selected.is_empty());
+        f.run(&mut app, vec![]);
+        assert_eq!(app.last_tiles.len(), 2, "the album shows its two photos");
+
+        // Opened again: the album is there, from the user's file.
+        let mut again = App::from_path(&db).unwrap();
+        assert!(again.library.album_names().is_empty(), "not in the service's store");
+        again.open_albums(&albums).unwrap();
+        assert_eq!(again.library.album_items("Trip").len(), 2);
+        assert_eq!(std::fs::metadata(&db).unwrap().modified().unwrap(), before, "the service's database was not written");
+
+        // Remove one, delete the album: both persist; the photos stay.
+        again.view = View::Album("Trip".into());
+        again.selected.set([order[1].clone()]);
+        assert_eq!(again.remove_selection_from("Trip"), 1);
+        let mut third = App::from_path(&db).unwrap();
+        third.open_albums(&albums).unwrap();
+        assert_eq!(third.library.album_items("Trip").len(), 1);
+        assert!(third.delete_album("Trip"));
+        assert_eq!(third.view, View::Library);
+        let mut fourth = App::from_path(&db).unwrap();
+        fourth.open_albums(&albums).unwrap();
+        assert!(fourth.library.album_names().is_empty(), "deleting the last album sticks");
+        assert_eq!(fourth.library.len(), 4, "and the photos are all still there");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On a touch screen, as egui-winit reports one (a Touch event beside the
+    /// emulated pointer): holding a tile selects it and does NOT open it; a
+    /// short tap afterwards adds to the selection.
+    #[test]
+    fn a_long_press_on_a_touch_screen_selects() {
+        let (dir, db) = service_library("touch", 3);
+        let mut app = App::from_path(&db).unwrap();
+        let mut f = Frames::new();
+        f.run(&mut app, vec![]);
+        let order = app.visible_order();
+        let touch = |at: Pos2, phase| egui::Event::Touch { device_id: egui::TouchDeviceId(1), id: egui::TouchId(1),
+            phase, pos: at, force: None };
+        let btn = |at: Pos2, pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary,
+            pressed, modifiers: Default::default() };
+        let hold = |f: &mut Frames, app: &mut App, at: Pos2, frames: usize| {
+            f.run(app, vec![egui::Event::PointerMoved(at)]);
+            f.run(app, vec![touch(at, egui::TouchPhase::Start), btn(at, true)]);
+            for _ in 0..frames { f.run(app, vec![touch(at, egui::TouchPhase::Move)]); }
+            f.run(app, vec![touch(at, egui::TouchPhase::End), btn(at, false), egui::Event::PointerGone]);
+            f.run(app, vec![]);
+        };
+        let a = f.tile(&app, &order[0]);
+        hold(&mut f, &mut app, a, 24); // 1.2 s
+        assert!(app.selected.contains(&order[0]), "a long press selects");
+        assert_eq!(app.viewing, None, "and does not open");
+        let b = f.tile(&app, &order[1]);
+        hold(&mut f, &mut app, b, 1); // a tap
+        assert_eq!(app.selected.len(), 2, "a tap while selecting adds");
+        assert_eq!(app.viewing, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// In an album the viewer's arrows stay in the album; they used to walk
+    /// the whole library.
+    #[test]
+    fn the_viewer_steps_through_the_album_it_was_opened_from() {
+        let (dir, db) = service_library("albumview", 5);
+        let mut app = App::from_path(&db).unwrap();
+        let order = app.visible_order();
+        app.library.create_album("Two");
+        app.library.add_to_album("Two", &[order[0].clone(), order[3].clone()]);
+        app.view = View::Album("Two".into());
+        let mut f = Frames::new();
+        f.run(&mut app, vec![]);
+        let first = f.tile(&app, &order[0]);
+        f.click(&mut app, first, egui::PointerButton::Primary);
+        assert_eq!(app.viewing.as_deref(), Some(order[0].as_str()));
+        let key = |k| egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        f.run(&mut app, vec![key(egui::Key::ArrowRight)]);
+        assert_eq!(app.viewing.as_deref(), Some(order[3].as_str()), "the album's next photo, not the library's");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

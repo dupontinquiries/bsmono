@@ -17,9 +17,10 @@ pub mod ui;
 /// Real thumbnails, decoded off the UI thread (headless; ui.rs uploads and draws).
 pub mod thumbs;
 pub mod settings;
+/// What a press on a tile means (tap opens, long-press selects) — headless.
+pub mod selection;
 
 use photosync::album::{Item, Library};
-use std::collections::BTreeSet;
 
 /// Which rail entry is selected. `Settings` sits in this same list, as a
 /// normal destination — not a gear icon that opens a separate preferences
@@ -38,9 +39,9 @@ pub struct App {
     pub backdrop: uikit_egui::Backdrop,
     pub library: Library,
     pub view: View,
-    /// Selected paths, for "add to album" / share. A set: the grid toggles
-    /// membership on click, so a path can only ever be selected once.
-    pub selected: BTreeSet<String>,
+    /// Selected photos, for "add to album" / share. See `selection` for what
+    /// a tap, a long-press and the modifiers do.
+    pub selected: selection::Selection,
     /// New-album name field, shown while `new_album_open` is true.
     pub new_album_name: String,
     pub new_album_open: bool,
@@ -67,6 +68,24 @@ pub struct App {
     /// The service's database this library came from (`from_path`), whose
     /// stored thumbnails the grid uses; None for the demo.
     pub db_path: Option<std::path::PathBuf>,
+    /// Where albums are kept (`open_albums`): the viewing user's own file,
+    /// since the service's store is opened read-only. None: albums live for
+    /// this run only (the demo), and the status line says so on a change.
+    pub albums_db: Option<std::path::PathBuf>,
+    /// "Delete album" asks once: the album awaiting the second press.
+    pub confirm_delete: Option<String>,    /// The tiles drawn last frame and where: what a press can land on. Read
+    /// by tests driving real input, and the basis for keyboard focus later.
+    pub last_tiles: Vec<(String, egui::Rect)>,
+}
+
+fn plural(n: usize) -> &'static str { if n == 1 { "" } else { "s" } }
+
+/// Where the gallery keeps albums by default: `$XDG_DATA_HOME/photosync/albums.db`,
+/// else `~/.local/share/photosync/albums.db`.
+pub fn default_albums_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()).map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")))?;
+    Some(base.join("photosync").join("albums.db"))
 }
 
 /// The photo `delta` steps from `current` in `order`, clamped at the ends;
@@ -83,7 +102,7 @@ impl App {
             backdrop: uikit_egui::Backdrop::for_app("photosync"),
             library,
             view: View::Library,
-            selected: BTreeSet::new(),
+            selected: selection::Selection::default(),
             new_album_name: String::new(),
             new_album_open: false,
             tile_target: 168.0,
@@ -98,7 +117,10 @@ impl App {
             viewing: None,
             full: None,
             full_tex: None,
-            db_path: None
+            db_path: None,
+            albums_db: None,
+            confirm_delete: None,
+            last_tiles: Vec::new(),
         }
     }
 
@@ -120,6 +142,95 @@ impl App {
         let mut app = App::new(lib);
         app.db_path = Some(db.to_path_buf());
         Ok(app)
+    }
+
+    /// Keep albums in `path` (created if missing — it is the user's file, not
+    /// the service's). Albums already in it replace the ones the library
+    /// loaded; a file with no album tables yet keeps those (albums from an
+    /// older gallery that wrote into the service's database) and they are
+    /// written here on the first change.
+    pub fn open_albums(&mut self, path: &std::path::Path) -> Result<(), String> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        let conn = rusqlite::Connection::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        photosync::album::load_albums(&conn, &mut self.library).map_err(|e| format!("{}: {e}", path.display()))?;
+        self.albums_db = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    /// Write the albums to `albums_db`. A failure is said on the status line:
+    /// the change stays on screen, and the user is told it will not survive.
+    fn persist_albums(&mut self) {
+        let Some(path) = &self.albums_db else {
+            self.status = format!("{} (albums are not saved in the demo)", self.status);
+            return;
+        };
+        let r = rusqlite::Connection::open(path)
+            .and_then(|c| photosync::album::save_albums(&c, &self.library));
+        if let Err(e) = r {
+            self.status = format!("Albums not saved: {}: {e}", path.display());
+        }
+    }
+
+    /// The photos the grid shows now, in its order: the library by day, or
+    /// the open album. Shift-selection ranges and the viewer's arrows walk
+    /// this — so stepping through an album stays in the album.
+    pub fn visible_order(&self) -> Vec<String> {
+        match &self.view {
+            View::Album(name) => self.library.album_items(name).into_iter().map(|i| i.path.clone()).collect(),
+            _ => self.library.by_day().into_iter().flat_map(|(_, v)| v.into_iter().map(|i| i.path.clone())).collect(),
+        }
+    }
+
+    /// Make an album, with the selection in it if there is one, and show it.
+    pub fn new_album(&mut self, name: &str) -> bool {
+        let name = name.trim().to_string();
+        if !self.library.create_album(&name) {
+            self.status = "Album name already taken, or blank".into();
+            return false;
+        }
+        let n = self.library.add_to_album(&name, &self.selected.paths());
+        self.selected.clear();
+        self.status = if n > 0 { format!("Created album \"{name}\" with {n} photo{}", plural(n)) }
+                      else { format!("Created album \"{name}\"") };
+        self.view = View::Album(name);
+        self.persist_albums();
+        true
+    }
+
+    /// Add the selection to an existing album. Returns how many were new to it.
+    pub fn add_selection_to(&mut self, album: &str) -> usize {
+        let asked = self.selected.len();
+        let n = self.library.add_to_album(album, &self.selected.paths());
+        self.selected.clear();
+        self.status = match (n, asked - n) {
+            (n, 0) => format!("Added {n} photo{} to \"{album}\"", plural(n)),
+            (n, already) => format!("Added {n} to \"{album}\" ({already} already in it)"),
+        };
+        self.persist_albums();
+        n
+    }
+
+    /// Take the selection out of an album. The photos are not touched —
+    /// membership is a reference (see `photosync::album`).
+    pub fn remove_selection_from(&mut self, album: &str) -> usize {
+        let n = self.selected.paths().iter().filter(|p| self.library.remove_from_album(album, p)).count();
+        self.selected.clear();
+        self.status = format!("Removed {n} photo{} from \"{album}\" (the photos are kept)", plural(n));
+        self.persist_albums();
+        n
+    }
+
+    /// Delete an album — never its photos — and go back to the library.
+    pub fn delete_album(&mut self, album: &str) -> bool {
+        if !self.library.delete_album(album) { return false; }
+        self.confirm_delete = None;
+        self.selected.clear();
+        if self.view == View::Album(album.to_string()) { self.view = View::Library; }
+        self.status = format!("Deleted album \"{album}\" (its photos are still in the library)");
+        self.persist_albums();
+        true
     }
 
     /// A library with no real store behind it — see `from_db` for the real

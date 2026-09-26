@@ -27,7 +27,19 @@ fn main() -> eframe::Result<()> {
         photosync_egui::App::demo()
     } else {
         match photosync_egui::App::from_path(std::path::Path::new(&db)) {
-            Ok(app) => app,
+            Ok(mut app) => {
+                // Albums are the viewing user's: kept in their own file
+                // (--albums PATH, else the XDG data dir), never in the
+                // service's store, which this window opens read-only.
+                let albums = flag("--albums").map(std::path::PathBuf::from)
+                    .or_else(photosync_egui::default_albums_path);
+                match albums.map(|p| app.open_albums(&p)) {
+                    Some(Err(why)) => app.status = format!("Albums will not be saved: {why}"),
+                    None => app.status = "Albums will not be saved: no home directory".into(),
+                    Some(Ok(())) => {}
+                }
+                app
+            }
             Err(why) => {
                 eprintln!("photosync: {why}; showing a demo library (--db PATH to choose one)");
                 let mut app = photosync_egui::App::demo();
