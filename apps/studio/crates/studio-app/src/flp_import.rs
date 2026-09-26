@@ -527,17 +527,24 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
                     let cycle = parts.get(&pid).map(|v| v.iter().map(|(rp, _)| rack.patterns[*rp].steps).sum::<u32>()).unwrap_or(0);
                     let passes = if cycle == 0 { 0 } else { 1 };
                     let seq: Vec<(usize, u32)> = (0..passes).flat_map(|k| parts.get(&pid).into_iter().flatten().map(move |(rp, from)| (*rp, from + k * cycle))).collect();
+                    // where in the pattern this clip starts (a clip cut mid-pattern)
+                    let start = i(&it["start_ticks"]).unwrap_or(0).max(0) as f64;
                     for (rp, from) in seq.iter() {
-                        let part_at = at((*from as f64 * step_ticks) as i64);
+                        let (p0, p1) = (*from as f64 * step_ticks, (*from + rack.patterns[*rp].steps) as f64 * step_ticks);
+                        // the part's span on the timeline, relative to the clip
+                        let (v0, v1) = (p0.max(start), p1);
+                        if v1 <= v0 { continue; }
+                        let part_at = at((v0 - start) as i64);
                         if part_at >= len_t { continue; }
-                        let part_len = at((rack.patterns[*rp].steps as f64 * step_ticks) as i64).min(len_t.saturating_sub(part_at));
+                        let part_len = at((v1 - v0) as i64).min(len_t.saturating_sub(part_at));
+                        let part_in = at((v0 - p0) as i64);
                         let id = *pattern_sources.entry(*rp).or_insert_with(|| {
                             let id = SourceId(10_000 + *rp as u64);
                             ops.push(Op::AddSource { source: Source { id, path: String::new(), len: Ticks::ZERO, sample_rate: 48_000,
                                 channels: 2, has_video: false, kind: SourceKind::Pattern { pattern: *rp, name: rack.patterns[*rp].name.clone() } } });
                             id
                         });
-                        clips.push((id, pos.saturating_add(part_at), Ticks::ZERO, part_len, 1.0));
+                        clips.push((id, pos.saturating_add(part_at), part_in, part_len, 1.0));
                     }
                     if first_insert.is_none() {
                         let first_ch = patterns.iter().find(|p| i(&p["iid"]) == Some(pid))
@@ -731,7 +738,8 @@ mod tests {
                 {"iid": 3, "items": [{"kind": "PatternPLItem", "pattern": 2, "pos": 0, "len": 1728}]},
                 {"iid": 4, "name": "Loops", "items": [{"kind": "ChannelPLItem", "channel": 3, "pos": 0, "len": 1152, "offsets": [1000.0, 13000.0]},
                     {"kind": "ChannelPLItem", "channel": 3, "pos": 0, "len": 384, "offsets": [-1.0, -1.0], "flags": 8256}]},
-                {"iid": 5, "name": "Beat x3", "items": [{"kind": "PatternPLItem", "pattern": 1, "pos": 0, "len": 1152}]}
+                {"iid": 5, "name": "Beat x3", "items": [{"kind": "PatternPLItem", "pattern": 1, "pos": 0, "len": 1152}]},
+                {"iid": 6, "name": "Cut beat", "items": [{"kind": "PatternPLItem", "pattern": 2, "pos": 384, "len": 1536, "start_ticks": 1344, "end_ticks": 2880}]}
             ]}],
             "mixer": [
                 {"iid": 0, "slots": [{"plugin": "Fruity Limiter"}, {"plugin": "Fruity Wrapper", "name": "Ozone 8"}]},
@@ -852,6 +860,24 @@ mod tests {
         let clips = im.project.track_clips(b.id);
         assert_eq!(clips.len(), 1, "one pass, not three: {clips:?}");
         assert!((clips[0].len.to_seconds() - 2.0).abs() < 1e-6, "the pattern's own length");
+    }
+
+    /// A pattern clip CUT to start mid-pattern (Balance's chopped drum reuse):
+    /// "Long" is 80 steps: part 1 of 64 (8 s at 120 BPM, 96 PPQ: 24 ticks a
+    /// step) and part 2 of 16 (2 s). The clip starts at tick 1344 (step 56,
+    /// 7 s in): the last 1 s of part 1 from 7 s in, then all 2 s of part 2,
+    /// then silence to the clip's end (a pattern is not repeated).
+    #[test]
+    fn a_pattern_clip_cut_mid_pattern_plays_from_its_cut() {
+        let im = import(&inventory(), "demo", &probe).unwrap();
+        let t = im.project.tracks.iter().find(|t| t.name.starts_with("Cut beat") || t.name.starts_with("Long")
+            && im.project.track_clips(t.id).iter().any(|c| (c.pos.to_seconds() - 2.0).abs() < 1e-6)).expect("the cut clip's track");
+        let mut clips = im.project.track_clips(t.id);
+        clips.sort_by_key(|c| c.pos);
+        assert_eq!(clips.len(), 2, "{clips:?}");
+        let (a, b) = (&clips[0], &clips[1]);
+        assert!((a.pos.to_seconds() - 2.0).abs() < 1e-6 && (a.src_in.to_seconds() - 7.0).abs() < 1e-6 && (a.len.to_seconds() - 1.0).abs() < 1e-6, "{a:?}");
+        assert!((b.pos.to_seconds() - 3.0).abs() < 1e-6 && b.src_in == Ticks::ZERO && (b.len.to_seconds() - 2.0).abs() < 1e-6, "{b:?}");
     }
 
     #[test]

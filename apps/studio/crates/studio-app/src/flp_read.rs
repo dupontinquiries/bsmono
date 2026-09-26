@@ -92,6 +92,22 @@ fn i32at(d: &[u8], o: usize) -> Option<i32> { u32at(d, o).map(|v| v as i32) }
 fn u16at(d: &[u8], o: usize) -> Option<u16> { d.get(o..o + 2).map(|x| u16::from_le_bytes([x[0], x[1]])) }
 fn f32at(d: &[u8], o: usize) -> Option<f32> { u32at(d, o).map(f32::from_bits) }
 
+/// The plugin's name from an install path inside a wrapper blob: the file
+/// stem of the first ".vst3" / ".vst" / ".dll" / ".component" path found.
+pub fn vst_name_from_path(d: &[u8]) -> Option<String> {
+    let text: String = d.iter().map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '\n' }).collect();
+    for run in text.split('\n') {
+        for ext in [".vst3", ".vst", ".dll", ".component"] {
+            if let Some(i) = run.find(ext) {
+                let path = &run[..i];
+                let stem = path.rsplit(['/', '\\']).next().unwrap_or(path).trim();
+                if !stem.is_empty() { return Some(stem.to_string()); }
+            }
+        }
+    }
+    None
+}
+
 /// The inventory, in `flp_dump.py`'s shape (mixer inserts in FL numbering,
 /// with real `routes`: `[{to, level}]`).
 pub fn inventory(b: &[u8]) -> Result<Value, FlpError> {
@@ -194,6 +210,12 @@ pub fn inventory(b: &[u8]) -> Result<Value, FlpError> {
                     "notes": d[144..156].iter().map(|b| *b != 0).collect::<Vec<bool>>(),
                 }));
             }
+            // A VST's wrapper state (212) carries its install path; when FL stored
+            // no display name, the path's file stem names it ("…/Vocal Doubler.vst3"
+            // was "a plugin" on all three of A Top A Tower's vocal chains).
+            Ev::Data(212, d) if mixer_on && !slot.contains_key("name") => {
+                if let Some(n) = vst_name_from_path(d) { slot.insert("name".into(), json!(n)); }
+            }
             Ev::Num(98, v) if mixer_on => {
                 let mut s = std::mem::take(&mut slot);
                 s.insert("index".into(), json!(v));
@@ -259,7 +281,18 @@ pub fn inventory(b: &[u8]) -> Result<Value, FlpError> {
                                "offsets": [f32at(it, 24).map(|x| x as f64).filter(|x| x.is_finite()), f32at(it, 28).map(|x| x as f64).filter(|x| x.is_finite())]});
             let o = v.as_object_mut().unwrap();
             if idx <= base { o.insert("kind".into(), json!("ChannelPLItem")); o.insert("channel".into(), json!(idx)); }
-            else { o.insert("kind".into(), json!("PatternPLItem")); o.insert("pattern".into(), json!(idx - base)); }
+            else {
+                o.insert("kind".into(), json!("PatternPLItem"));
+                o.insert("pattern".into(), json!(idx - base));
+                // A PATTERN clip's start/end are INTEGER TICKS in the same slots an
+                // audio clip keeps float milliseconds (read as floats they are
+                // denormals: 1536 ticks = 2.15e-42); -1 = none. A clip cut to start
+                // mid-pattern -- the artist's chopped drum reuse in Balance, 275
+                // such clips -- plays from there.
+                let (s, e) = (i32at(it, 24).unwrap_or(-1), i32at(it, 28).unwrap_or(-1));
+                if s >= 0 { o.insert("start_ticks".into(), json!(s)); }
+                if e >= 0 { o.insert("end_ticks".into(), json!(e)); }
+            }
             by_track.entry(track).or_default().push(v);
         }
         let tracks: Vec<Value> = ts.into_iter().filter_map(|mut t| {
@@ -385,6 +418,16 @@ mod tests {
         assert_eq!(m[2]["routes"], json!([{"to": 0, "level": 12800}]));
         assert_eq!(m[1]["slots"][0]["plugin"], json!("Fruity Parametric EQ 2"));
         assert_eq!(m[2]["slots"][0]["enabled"], json!(false), "slot 0 of insert 2 switched off in the params");
+    }
+
+    #[test]
+    fn a_vst_with_no_display_name_is_named_by_its_install_path() {
+        let mut blob = vec![1u8, 0, 0, 0, 57, 0];
+        blob.extend(b"/Library/Audio/Plug-Ins/VST3/Vocal Doubler.vst3");
+        blob.extend([0, 8, 0, 0]);
+        assert_eq!(vst_name_from_path(&blob).as_deref(), Some("Vocal Doubler"));
+        assert_eq!(vst_name_from_path(b"C:\\VST\\Serum_x64.dll\0").as_deref(), Some("Serum_x64"));
+        assert_eq!(vst_name_from_path(b"no path here"), None);
     }
 
     #[test]
