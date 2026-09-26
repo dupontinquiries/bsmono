@@ -86,7 +86,8 @@ pub fn think(game: &mut Game, gi: usize) {
     let call = game.calls[team as usize].filter(|&(_, at)| t - at < CALL_FOR);
     for j in 0..game.gods.len() {
         let e = &game.gods[j];
-        if e.team != team && e.respawn_t <= 0.0 {
+        // a bot cannot go for what the cloud hides from its team
+        if e.team != team && e.respawn_t <= 0.0 && game.sees(team, j) {
             let d = e.pos.distance(g.pos);
             if d < aggro {
                 let mut score = 100.0 - d * (1.0 - genes.focus * 0.5) - (e.hp / e.max_hp) * 60.0 * (0.5 + genes.focus) + if e.is_player { 15.0 } else { 0.0 };

@@ -550,8 +550,10 @@ impl Vfx {
         let mut sprays: Vec<(Vec3, f32, f32)> = Vec::new();
         // bodies wading through drifts leave a trench
         self.snow_last.resize(game.gods.len(), Vec3::NAN);
+        let viewer = game.gods.iter().find(|g| g.is_player).map(|g| g.team);
         for (i, g) in game.gods.iter().enumerate() {
-            let free = g.respawn_t <= 0.0 && g.leap.is_none() && g.dash.is_none() && g.riding.is_none() && g.skyfall.is_none();
+            // a hidden cat leaves no trench the player can watch being dug
+            let free = viewer.is_none_or(|t| game.sees(t, i)) && g.respawn_t <= 0.0 && g.leap.is_none() && g.dash.is_none() && g.riding.is_none() && g.skyfall.is_none();
             let prev = self.snow_last[i];
             if free && prev.is_finite() && prev.distance(g.pos) < 3.0 && prev.distance(g.pos) > 1e-3 {
                 if s.is_deep(g.pos.x, g.pos.z) {
@@ -866,8 +868,10 @@ impl Vfx {
             } else {
                 ([0.55, 0.47, 0.34], 0.14, 0.9)
             };
+            let viewer = game.gods.iter().find(|g| g.is_player).map(|g| g.team);
             for (i, g) in game.gods.iter().enumerate() {
-                if g.respawn_t > 0.0 || g.move_dir.length_squared() < 0.01 {
+                // (no dust from a cat the cloud hides: it would give it away)
+                if g.respawn_t > 0.0 || g.move_dir.length_squared() < 0.01 || viewer.is_some_and(|t| !game.sees(t, i)) {
                     continue;
                 }
                 // ~6 puffs/s per moving ancestor, staggered by index

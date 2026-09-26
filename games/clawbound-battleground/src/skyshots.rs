@@ -311,5 +311,26 @@ pub fn run() -> Result<(), String> {
     let clash = ms.iter().copied().max_by_key(|p| ms.iter().filter(|q| (**q - *p).length() < 12.0).count()).unwrap_or(Vec3::ZERO);
     let out = Vec3::new(clash.x, 0.0, clash.z).normalize_or(Vec3::Z);
     shoot(&mut renderer, &game, &mut vfx, "sky_clash.png", cam(clash - out * 34.0 + Vec3::Y * 30.0, clash, 1.0))?;
+    // the clouds that hide cats (skycloud.rs): run on until a bank is well
+    // over the islands and a wisp is thick, and look at each
+    if want("cloudbank") || want("wisp") {
+        let over_floor = |c: &crate::skycloud::Cloud| sky::floor().sdf(c.pos.x, c.pos.z) < 0.0 && c.thick > 0.8;
+        let mut k = 0;
+        while k < 60 * 240 && !crate::skycloud::clouds(game.cloud_seed, game.t).iter().any(|c| c.kind == crate::skycloud::Kind::Bank && over_floor(c)) {
+            game.tick(1.0 / 60.0);
+            let ev: Vec<crate::sim::Event> = game.events.drain(..).collect();
+            vfx.update(1.0 / 60.0, &ev, &game);
+            k += 1;
+        }
+        let cs = crate::skycloud::clouds(game.cloud_seed, game.t);
+        if let Some(b) = cs.iter().find(|c| c.kind == crate::skycloud::Kind::Bank && over_floor(c)) {
+            shoot(&mut renderer, &game, &mut vfx, "sky_cloudbank.png", cam(b.pos + Vec3::new(0.0, 70.0, 95.0), b.pos, 1.05))?;
+        }
+        if let Some(w) = cs.iter().filter(|c| c.kind == crate::skycloud::Kind::Wisp && over_floor(c)).max_by(|a, b| a.thick.total_cmp(&b.thick)) {
+            let side = Vec3::new(-w.dir.z, 0.0, w.dir.x).normalize_or_zero();
+            shoot(&mut renderer, &game, &mut vfx, "sky_wisp.png", cam(w.pos + side * 30.0 + Vec3::Y * 9.0, w.pos + Vec3::Y * 2.0, 1.1))?;
+        }
+        println!("clouds at {:.0} s: {} banks, {} wisps", game.t, cs.iter().filter(|c| c.kind == crate::skycloud::Kind::Bank).count(), cs.iter().filter(|c| c.kind == crate::skycloud::Kind::Wisp).count());
+    }
     Ok(())
 }

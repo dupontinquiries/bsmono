@@ -47,6 +47,8 @@ impl Game {
         self.resolve_bodies();
         self.move_minions(dt);
         self.logs_tick(dt);
+        // who can see whom through the sky map's cloud (skycloud.rs)
+        self.vision_tick();
 
         // 5. auto-attacks
         self.god_autoattacks(dt);
@@ -688,7 +690,8 @@ impl Game {
             let mut bd = range;
             for j in 0..self.gods.len() {
                 let e = &self.gods[j];
-                if e.team != g.team && e.respawn_t <= 0.0 {
+                // a cat hidden in cloud cannot be locked onto
+                if e.team != g.team && e.respawn_t <= 0.0 && self.sees(g.team, j) {
                     let d = e.pos.distance(g.pos);
                     if d < bd {
                         bd = d;

@@ -722,11 +722,15 @@ impl Scene {
         // the body. A god culled by their own bounds takes their ability's
         // visuals with them, and an ability that stops rendering while it is
         // still hitting you is worse than ten extra draw calls.
+        // an enemy the cloud hides from the player's team is not drawn
+        // (skycloud.rs; spectators and bot-only matches see everyone)
+        let viewer = game.gods.iter().find(|g| g.is_player).map(|g| g.team);
         for i in 0..game.gods.len() {
             let g = &game.gods[i];
             if g.respawn_t > 0.0 {
                 continue;
             }
+            let hidden = viewer.is_some_and(|t| !game.sees(t, i));
             let ti = g.team as usize;
             let def = game.def(i);
             let di = g.def_id as usize;
@@ -750,7 +754,14 @@ impl Scene {
                 quiet: game.quiet(i),
             };
             let puppet = &mut vfx.puppets.puppets[i];
+            let before = pevents.len();
             puppet.advance(dt, &inp, rig, &world, &mut pevents);
+            // hidden: its body keeps moving (so it is not stale when it
+            // steps out), but nothing of it is drawn and it leaves no marks
+            if hidden {
+                pevents.truncate(before);
+                continue;
+            }
             let pose = puppet.pose(&inp, rig);
             creature_rig::pose(rig.parts(), rig.torso_half, &pose.motion, None, &mut posed);
             // wading: sink toward the bed (capped so the head stays clear)
@@ -831,6 +842,30 @@ impl Scene {
             let (pack, marks) = s.upload();
             (pack, marks, s.params())
         });
+        // the sky map's drifting cloud banks and wisps (skycloud.rs) -- the
+        // ones that hide cats. Soft, see-through billows; thinned near the
+        // camera and round the player's own cat, so a cat in a bank still
+        // sees what is at arm's length.
+        if crate::map::active() == crate::map::MapId::Sky {
+            let me = game.gods.iter().find(|g| g.is_player).map(|g| g.pos);
+            for c in crate::skycloud::clouds(game.cloud_seed, game.t) {
+                if c.thick < 0.02 || !sphere_in_frustum(&vp, c.pos + Vec3::Y * 3.0, c.r + 12.0) {
+                    continue;
+                }
+                let yaw = c.dir.z.atan2(c.dir.x);
+                for (k, (off, scale, edge)) in crate::skycloud::puffs(&c).into_iter().enumerate() {
+                    let at = c.pos + off;
+                    let near_cam = ((at.distance(cam.eye) - 4.0) / 10.0).clamp(0.0, 1.0);
+                    let near_me = me.map_or(1.0, |p| ((Vec3::new(at.x - p.x, 0.0, at.z - p.z).length() - 3.0) / 9.0).clamp(0.0, 1.0));
+                    let a = c.thick * edge * 0.75 * near_cam * near_me;
+                    if a < 0.02 {
+                        continue;
+                    }
+                    let m = Mat4::from_translation(at) * Mat4::from_axis_angle(Vec3::Y, -yaw + k as f32 * 0.7) * Mat4::from_scale(scale);
+                    r.queue_draw(self.drift_mesh[2][(c.seed as usize + k) % DRIFT_VARIANTS], m, [1.0, 1.0, 1.0, a], 0.3 + atm.night * 0.2, crate::skyprops::PUFF_VOX, true);
+                }
+            }
+        }
         // the sky map's drifting stone and cloud, rising and falling on the
         // slow air (skydrift.rs); an anchor stone rests on a little cloud
         for d in &self.drift {

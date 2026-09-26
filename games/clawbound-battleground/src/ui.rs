@@ -745,7 +745,8 @@ fn draw_minimap(ctx: &egui::Context, game: &Game, player: usize) {
         // gods
         for i in 0..game.gods.len() {
             let gg = &game.gods[i];
-            if gg.respawn_t > 0.0 {
+            // hidden in cloud from the player's team: not on the map
+            if gg.respawn_t > 0.0 || !game.sees(game.gods[player].team, i) {
                 continue;
             }
             let s = to_map(gg.pos);
@@ -1321,7 +1322,7 @@ mod hidpi_tests {
 pub fn draw_god_bars(painter: &egui::Painter, game: &Game, player: Option<usize>, vp: Mat4, w: f32, h: f32, eye: Vec3) {
     for i in 0..game.gods.len() {
         let gg = &game.gods[i];
-        if gg.respawn_t > 0.0 {
+        if gg.respawn_t > 0.0 || player.is_some_and(|p| !game.sees(game.gods[p].team, i)) {
             continue;
         }
         let head = gg.pos + Vec3::Y * 2.6;

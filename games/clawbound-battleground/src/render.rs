@@ -2102,8 +2102,9 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
     }
 
     let mut idx = Vec::with_capacity((n_side - 1) * (n_side - 1) * 6);
-    // the sky map has no ground under its islands: a cell whose four corners
-    // are all open sky is left out, and the sky shader's cloud deck shows
+    // The sky map's islands float: the top surface stops at each island's
+    // edge (a triangle with any corner in open sky is left out, so no skirt
+    // hangs down from the rim), and `sky_underside` hangs a keel beneath.
     let sky = crate::map::active() == crate::map::MapId::Sky;
     let void: Vec<bool> = if sky { verts.iter().map(|v| crate::sky::in_void(v.pos[0], v.pos[2])).collect() } else { Vec::new() };
     for iz in 0..n_side - 1 {
@@ -2113,14 +2114,55 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
             let c = (ix + n_side * (iz + 1)) as u32;
             let d = (ix + 1 + n_side * (iz + 1)) as u32;
             for tri in [[a, c, b], [b, c, d]] {
-                if sky && tri.iter().all(|&k| void[k as usize]) {
+                if sky && tri.iter().any(|&k| void[k as usize]) {
                     continue;
                 }
                 idx.extend_from_slice(&tri);
             }
         }
     }
+    if sky {
+        sky_underside(&mut verts, &mut idx, &void, n_side, STEP);
+    }
     (verts, idx)
+}
+
+/// The sky map's island undersides, appended to the terrain mesh: under
+/// every top triangle, one facing down, at `sky::underside` below the floor.
+/// The boundary vertices (a neighbour in open sky) are shared in height with
+/// the top, so the rim is closed and the surface curls from the lip straight
+/// down and back in under the island to its keel.
+fn sky_underside(verts: &mut Vec<TerrainVert>, idx: &mut Vec<u32>, void: &[bool], n_side: usize, step: f32) {
+    let top_len = verts.len();
+    let top_idx = idx.len();
+    let at = |ix: usize, iz: usize| ix + n_side * iz;
+    let depth = |x: f32, z: f32| crate::sky::underside(x, z);
+    let mut remap = vec![u32::MAX; top_len];
+    for iz in 0..n_side {
+        for ix in 0..n_side {
+            let k = at(ix, iz);
+            if void[k] {
+                continue;
+            }
+            let rim = [(ix.wrapping_sub(1), iz), (ix + 1, iz), (ix, iz.wrapping_sub(1)), (ix, iz + 1)].iter().any(|&(a, b)| a >= n_side || b >= n_side || void[at(a, b)]);
+            let [x, y, z] = verts[k].pos;
+            let d = if rim { 0.0 } else { depth(x, z) };
+            // the downward normal, from the underside's own slope
+            let (dl, dr, dd, du) = (depth(x - step, z), depth(x + step, z), depth(x, z - step), depth(x, z + step));
+            let up = Vec3::new(dl - dr, 2.0 * step, dd - du).normalize_or(Vec3::Y);
+            let n = Vec3::new(up.x, -up.y, up.z).normalize_or(-Vec3::Y);
+            remap[k] = verts.len() as u32;
+            verts.push(TerrainVert { pos: [x, if rim { y } else { -d }, z], normal: n.to_array(), color: sky_underside_color(x, z, d), mat: 5.0 });
+        }
+    }
+    for t in 0..top_idx / 3 {
+        let (a, b, c) = (idx[t * 3], idx[t * 3 + 1], idx[t * 3 + 2]);
+        let (ra, rb, rc) = (remap[a as usize], remap[b as usize], remap[c as usize]);
+        if ra != u32::MAX && rb != u32::MAX && rc != u32::MAX {
+            // reversed winding: seen from below
+            idx.extend_from_slice(&[ra, rc, rb]);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2217,14 +2259,23 @@ fn sky_ground_color(x: f32, z: f32, h: f32, slope: f32, n1: f32, n2: f32, nm: f3
         // the lip: blue glacier ice
         return ([0.52 + n1 * 0.08, 0.76 + n2 * 0.06, 0.92 + n1 * 0.04], 6.0);
     }
-    // the underside: dark blue rock, streaked with ice, fraying into
-    // mist toward its ragged foot (there is no ground below it)
-    let rock = [0.14 + n1 * 0.04, 0.17 + n1 * 0.04, 0.26 + n2 * 0.05];
-    let ice = [0.40, 0.62, 0.80];
-    let streak = smoothstep(0.6, 0.8, vnoise(x * 0.4, h * 0.3));
-    let c = lerp(rock, ice, streak * 0.6 * (1.0 - slope.min(1.0) * 0.3));
-    let foot = smoothstep(0.45, 1.0, -h / sky::underside_depth(x, z));
-    (lerp(c, [0.78, 0.80, 0.92], foot * 0.85), 5.0)
+    // (past the edge: open sky, never drawn)
+    let _ = slope;
+    ([0.2, 0.24, 0.34], 5.0)
+}
+
+/// An island's underside at (x, z), `depth` below the floor: blue glacier
+/// ice where it curls under the lip, dark rock streaked with ice below, and
+/// paler, misty rock toward the keel, where the cloud takes it.
+fn sky_underside_color(x: f32, z: f32, depth: f32) -> [f32; 3] {
+    let lerp = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    let n1 = vnoise(x * 0.11, z * 0.11);
+    let rock = [0.16 + n1 * 0.05, 0.19 + n1 * 0.05, 0.29 + n1 * 0.05];
+    let ice = [0.45, 0.68, 0.86];
+    let streak = smoothstep(0.55, 0.8, vnoise(x * 0.3 + depth * 0.05, z * 0.3 - depth * 0.08));
+    let lip = 1.0 - smoothstep(1.0, 6.0, depth);
+    let c = lerp(lerp(rock, ice, streak * 0.55), [0.60, 0.80, 0.95], lip);
+    lerp(c, [0.72, 0.74, 0.88], smoothstep(30.0, 90.0, depth) * 0.7)
 }
 
 /// Distance from (x, z) to the nearest lane centre-line on the active map
@@ -2423,7 +2474,19 @@ mod depth_tests {
             assert!(tris < full / 2, "most of the square is sky: {tris} of {full}");
             assert!(tris > full / 20, "the islands are there: {tris}");
             let void = |i: u32| crate::sky::in_void(v[i as usize].pos[0], v[i as usize].pos[2]);
-            assert!(idx.chunks(3).all(|t| !t.iter().all(|&i| void(i))), "no triangle lies wholly in the open sky");
+            assert!(idx.chunks(3).all(|t| !t.iter().any(|&i| void(i))), "no triangle reaches into the open sky: no skirt hangs off the rim");
+            // and the islands float: a keel hangs under them, facing down,
+            // deepest under the middle of the widest island
+            let under: Vec<&[u32]> = idx.chunks(3).filter(|t| t.iter().all(|&i| v[i as usize].pos[1] < -2.0)).collect();
+            assert!(under.len() * 4 > tris, "an underside under the islands: {} of {tris}", under.len());
+            assert!(under.iter().all(|t| t.iter().all(|&i| v[i as usize].normal[1] < 0.2)), "facing down");
+            // (only what is drawn: the grid's vertices out in open sky are
+            // never indexed)
+            let drawn: Vec<&TerrainVert> = idx.iter().map(|&i| &v[i as usize]).collect();
+            let deepest = drawn.iter().map(|p| p.pos[1]).fold(0.0f32, f32::min);
+            assert!((-125.0..-60.0).contains(&deepest), "a keel, not a slab: {deepest}");
+            let well = drawn.iter().filter(|p| p.pos[0].hypot(p.pos[2]) < 10.0).map(|p| p.pos[1]).fold(0.0f32, f32::min);
+            assert!(well < -60.0, "deep under the Moonwell's island: {well}");
         });
     }
 
