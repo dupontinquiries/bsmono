@@ -19,19 +19,32 @@ pub fn draw(app: &mut App, ctx: &Context) {
     let colors = uikit_egui::apply_palette(ctx, snapclone_theme::palette_by_id("minimal"));
     app.backdrop.paint(ctx, &colors);
 
+    app.compact = crate::is_compact(ctx.content_rect().width());
+    if !app.compact { app.drawer_open = false; }
+
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show(ctx, |ui| {
-            // `Sidebar` owns its width as a plain field (see `sidebar.rs`'s
-            // module note on why); clone it out so the closure below can
-            // still borrow `app` for the rail's contents, then write any
-            // drag/collapse change back.
-            let mut rail = app.rail.clone();
-            let (_resp, _) = rail.show_inside(ui, "rail", |ui| rail_body(app, ui, &colors));
-            app.rail = rail;
+            // A phone has no room for the rail beside the grid: it becomes
+            // the drawer (`drawer`), opened from the header's menu button.
+            if !app.compact {
+                // `Sidebar` owns its width as a plain field (see `sidebar.rs`'s
+                // module note on why); clone it out so the closure below can
+                // still borrow `app` for the rail's contents, then write any
+                // drag/collapse change back.
+                let mut rail = app.rail.clone();
+                let (_resp, _) = rail.show_inside(ui, "rail", |ui| rail_body(app, ui, &colors));
+                app.rail = rail;
+            }
 
-            egui::CentralPanel::default().show_inside(ui, |ui| {
-                if app.view == View::Settings {
+            let frame = if app.compact { egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(2, 4)) }
+                        else { egui::Frame::central_panel(ui.style()) };
+            egui::CentralPanel::default().frame(frame).show_inside(ui, |ui| {
+                if app.compact {
+                    compact_header(app, ui, &colors);
+                    ui.separator();
+                    if app.view == View::Settings { settings_view(app, ui, &colors); } else { gallery(app, ui, &colors); }
+                } else if app.view == View::Settings {
                     settings_view(app, ui, &colors);
                 } else {
                     header(app, ui, &colors);
@@ -40,8 +53,108 @@ pub fn draw(app: &mut App, ctx: &Context) {
                 }
             });
         });
+    if app.compact && app.drawer_open {
+        drawer(app, ctx, &colors);
+    }
     if app.new_album_open {
         new_album_dialog(app, ctx);
+    }
+}
+
+/// The rail's contents as a drawer over the page, from the left, with a
+/// scrim that closes it. Choosing anything in it closes it too.
+fn drawer(app: &mut App, ctx: &Context, colors: &uikit_egui::PaletteColors) {
+    let screen = ctx.content_rect();
+    let scrim = egui::Area::new(egui::Id::new("photosync-drawer-scrim"))
+        .order(egui::Order::Middle).fixed_pos(screen.min).constrain(false)
+        .show(ctx, |ui| {
+            ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(110));
+            ui.allocate_rect(screen, Sense::click())
+        });
+    let width = 280.0_f32.min(screen.width() - 56.0);
+    let panel = Rect::from_min_size(screen.min, Vec2::new(width, screen.height()));
+    let (before_view, before_new) = (app.view.clone(), app.new_album_open);
+    egui::Area::new(egui::Id::new("photosync-drawer")).order(egui::Order::Foreground)
+        .fixed_pos(screen.min).constrain(false)
+        .show(ctx, |ui| {
+            ui.painter().rect_filled(panel, 0.0, colors.bg_base);
+            ui.allocate_rect(panel, Sense::click()); // presses on its empty parts are the drawer's
+            let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(panel.shrink2(Vec2::new(8.0, 12.0))));
+            rail_body(app, &mut inner, colors);
+        });
+    let back = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    if scrim.inner.clicked() || back || app.view != before_view || app.new_album_open != before_new {
+        app.drawer_open = false;
+    }
+}
+
+/// The header on a phone: one row. Menu button and title; while selecting,
+/// a close button, the count and the actions, the way a phone gallery's
+/// action bar replaces its title bar. Buttons are 40 px tall — a finger,
+/// not a pointer.
+fn compact_header(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
+    let big = Vec2::new(40.0, 40.0);
+    ui.horizontal(|ui| {
+        if app.selected.is_empty() {
+            if ui.add(egui::Button::new("☰").frame(false).min_size(big)).on_hover_text("Albums and settings").clicked() {
+                app.drawer_open = true;
+            }
+            let title = match &app.view {
+                View::Library => "Library".to_string(),
+                View::Album(name) => name.clone(),
+                View::Settings => "Settings".to_string(),
+            };
+            ui.label(egui::RichText::new(title).color(colors.text).size(18.0).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                if let View::Album(name) = app.view.clone() {
+                    album_delete(app, ui, colors, &name);
+                } else if app.view == View::Library {
+                    ui.label(egui::RichText::new(format!("{}", app.library.len())).color(colors.text_weak));
+                }
+            });
+        } else {
+            if ui.add(egui::Button::new("✕").frame(false).min_size(big)).on_hover_text("Deselect all").clicked() {
+                app.selected.clear();
+                return;
+            }
+            ui.label(egui::RichText::new(format!("{} selected", app.selected.len())).color(colors.text).size(16.0).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                let names: Vec<String> = app.library.album_names().into_iter().map(String::from).collect();
+                let in_album = if let View::Album(n) = &app.view { Some(n.clone()) } else { None };
+                ui.menu_button(egui::RichText::new("⋮").size(18.0), |ui| {
+                    if ui.button("Select all").clicked() {
+                        let all = app.visible_order();
+                        app.selected.set(all);
+                        ui.close();
+                    }
+                    if let Some(name) = &in_album {
+                        if ui.button("Remove from album").clicked() {
+                            app.remove_selection_from(name);
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Add to album", |ui| {
+                    for name in &names {
+                        if in_album.as_deref() == Some(name.as_str()) { continue; }
+                        if ui.button(name).clicked() {
+                            app.add_selection_to(name);
+                            ui.close();
+                        }
+                    }
+                    if !names.is_empty() { ui.separator(); }
+                    if ui.button("New album…").clicked() {
+                        app.new_album_open = true;
+                        ui.close();
+                    }
+                });
+            });
+        }
+    });
+    if !app.status.is_empty() {
+        ui.label(egui::RichText::new(&app.status).color(colors.text_weak).size(11.0));
     }
 }
 
@@ -251,7 +364,7 @@ fn album_delete(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteCo
 
 fn gallery(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
     const GAP: f32 = 6.0;
-    const GROUP_GAP: f32 = 22.0;
+    let group_gap: f32 = if app.compact { 12.0 } else { 22.0 };
 
     let groups: Vec<(String, Vec<&Item>)> = match &app.view {
         View::Library => app.library.by_day(),
@@ -280,8 +393,12 @@ fn gallery(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors)
         return;
     }
 
-    let width = ui.available_width() - 32.0;
-    let target = app.tile_target;
+    // A phone spends its width on photos: 2 px margins and the tile size
+    // from the screen (three or four across), not the desktop's slider.
+    let margin = if app.compact { 2.0 } else { 16.0 };
+    let gap = if app.compact { 3.0 } else { GAP };
+    let width = ui.available_width() - 2.0 * margin;
+    let target = if app.compact { crate::compact_tile_target(width, gap) } else { app.tile_target };
     app.last_tiles.clear();
     let mut pressed: Option<(String, crate::selection::Press)> = None;
     let mods = ui.input(|i| i.modifiers);
@@ -290,15 +407,15 @@ fn gallery(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors)
         ui.add_space(8.0);
         for (day, items) in &groups {
             ui.horizontal(|ui| {
-                ui.add_space(16.0);
+                ui.add_space(margin + 4.0);
                 ui.label(egui::RichText::new(day).color(colors.text_weak).size(12.0).strong());
             });
             ui.add_space(6.0);
 
-            let grid = gallery_grid::grid_for(width, target, GAP);
+            let grid = gallery_grid::grid_for(width, target, gap);
             let height = gallery_grid::grid_height(&grid, items.len());
             let (rect, _resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
-            let origin = Pos2::new(rect.min.x + 16.0, rect.min.y);
+            let origin = Pos2::new(rect.min.x + margin, rect.min.y);
 
             // Only paint what's actually in the visible band — the point of
             // `visible_range` is that this stays cheap into the thousands.
@@ -333,7 +450,7 @@ fn gallery(app: &mut App, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors)
                     }
                 }
             }
-            ui.add_space(GROUP_GAP);
+            ui.add_space(group_gap);
         }
     });
 
@@ -590,8 +707,20 @@ fn viewer(app: &mut App, ctx: &Context) {
     let order = app.visible_order();
     let (esc, left, right) = ctx.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight)));
     let mut close = esc;
+    let mut step: i32 = if right { 1 } else if left { -1 } else { 0 };
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::from_black_alpha(245))).show(ctx, |ui| {
         let area = ui.max_rect();
+        // SWIPE to the neighbours: the photo follows the finger, and the
+        // release decides (`crate::swipe_step`). Registered before the
+        // buttons so they, drawn later, win their own presses.
+        let swipe = ui.interact(area, ui.id().with("viewer-swipe"), Sense::drag());
+        if swipe.dragged() { app.viewer_dx += swipe.drag_delta().x; }
+        if swipe.drag_stopped() {
+            let vx = ui.input(|i| i.pointer.velocity().x);
+            step = crate::swipe_step(app.viewer_dx, area.width(), vx);
+            app.viewer_dx = 0.0;
+        }
+        let dx = app.viewer_dx;
         let tex = match &app.full_tex {
             Some((p, t)) if *p == path => Some((t.id(), t.size_vec2())),
             _ => app.textures.get(&path).map(|t| (t.id(), t.size_vec2())),
@@ -599,7 +728,7 @@ fn viewer(app: &mut App, ctx: &Context) {
         match tex {
             Some((id, size)) => {
                 let fit = (area.width() / size.x).min(area.height() / size.y);
-                let r = Rect::from_center_size(area.center(), size * fit);
+                let r = Rect::from_center_size(area.center() + Vec2::new(dx, 0.0), size * fit);
                 ui.painter().image(id, r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
             }
             None => {
@@ -609,15 +738,28 @@ fn viewer(app: &mut App, ctx: &Context) {
         let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         ui.painter().text(area.left_top() + Vec2::new(16.0, 14.0), egui::Align2::LEFT_TOP, name, egui::FontId::proportional(14.0), Color32::from_gray(210));
         let close_rect = Rect::from_min_size(area.right_top() + Vec2::new(-52.0, 8.0), Vec2::splat(44.0));
-        if ui.put(close_rect, egui::Button::new("✕").frame(false)).on_hover_text("Back to the grid (Esc)").clicked() {
+        if ui.put(close_rect, egui::Button::new(egui::RichText::new("✕").size(20.0).color(Color32::from_gray(230))).frame(false))
+            .on_hover_text("Back to the grid (Esc)").clicked() {
             close = true;
+        }
+        // Previous / next for a pointer (a finger swipes). Only where there
+        // is a neighbour, so a dead button never shows.
+        let at = order.iter().position(|p| *p == path);
+        let side = |x: f32| Rect::from_center_size(Pos2::new(x, area.center().y), Vec2::new(44.0, 88.0));
+        let arrow = |t: &str| egui::Button::new(egui::RichText::new(t).size(28.0).color(Color32::from_gray(220))).frame(false);
+        if at.is_some_and(|i| i > 0) && ui.put(side(area.left() + 30.0), arrow("‹")).on_hover_text("Previous (←)").clicked() {
+            step = -1;
+        }
+        if at.is_some_and(|i| i + 1 < order.len()) && ui.put(side(area.right() - 30.0), arrow("›")).on_hover_text("Next (→)").clicked() {
+            step = 1;
         }
     });
     if close {
         app.viewing = None;
         app.full_tex = None;
-    } else if left || right {
-        if let Some(next) = crate::step(&order, &path, if right { 1 } else { -1 }) {
+        app.viewer_dx = 0.0;
+    } else if step != 0 {
+        if let Some(next) = crate::step(&order, &path, step) {
             app.viewing = Some(next);
         }
     }
@@ -843,6 +985,82 @@ mod draw_tests {
         hold(&mut f, &mut app, b, 1); // a tap
         assert_eq!(app.selected.len(), 2, "a tap while selecting adds");
         assert_eq!(app.viewing, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn run_at(f: &mut Frames, app: &mut App, size: Vec2, events: Vec<egui::Event>) {
+        f.t += 0.05;
+        let _ = f.ctx.run(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+            time: Some(f.t), events, ..Default::default() }, |ctx| draw(app, ctx));
+    }
+
+    /// At a phone's width the rail is gone (it took 160 px of 380), tiles
+    /// are three across from the edge, and the drawer opens over the page
+    /// and closes from its scrim.
+    #[test]
+    fn on_a_phone_the_rail_is_a_drawer_and_tiles_are_three_across() {
+        let (dir, db) = service_library("phone", 1);
+        // Four photos on one day: one full row of three and one more.
+        let mut app = App::from_path(&db).unwrap();
+        let p0 = app.visible_order()[0].clone();
+        let items: Vec<photosync::album::Item> = (0..4).map(|i| photosync::album::Item { path: format!("{p0}#{i}"),
+            taken_at: 1_750_000_000 + i, thumbnail: None, bytes: 1, metadata_json: None }).collect();
+        app.library = photosync::album::Library::new(items);
+        let phone = Vec2::new(380.0, 740.0);
+        let mut f = Frames::new();
+        run_at(&mut f, &mut app, phone, vec![]);
+        run_at(&mut f, &mut app, phone, vec![]);
+        assert!(app.compact);
+        let top = app.last_tiles.iter().map(|(_, r)| r.min.y).fold(f32::INFINITY, f32::min);
+        let row: Vec<&Rect> = app.last_tiles.iter().filter(|(_, r)| (r.min.y - top).abs() < 1.0).map(|(_, r)| r).collect();
+        assert_eq!(row.len(), 3, "three across: {:?}", app.last_tiles);
+        assert!(row.iter().all(|r| r.width() > 100.0), "and big enough to see: {row:?}");
+        assert!(app.last_tiles.iter().all(|(_, r)| r.min.x < 380.0 && r.min.x >= 0.0));
+        assert!(row.iter().map(|r| r.min.x).fold(f32::INFINITY, f32::min) < 20.0, "from the edge: no rail beside them");
+
+        app.drawer_open = true;
+        run_at(&mut f, &mut app, phone, vec![]);
+        let scrim = Pos2::new(360.0, 400.0); // right of the 280 px drawer
+        let b = |pressed| egui::Event::PointerButton { pos: scrim, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        run_at(&mut f, &mut app, phone, vec![egui::Event::PointerMoved(scrim)]);
+        run_at(&mut f, &mut app, phone, vec![b(true)]);
+        run_at(&mut f, &mut app, phone, vec![b(false)]);
+        assert!(!app.drawer_open, "a tap on the scrim closes the drawer");
+        assert!(app.viewing.is_none(), "and does not reach the tile under it");
+
+        // Wide again: the rail is back and a drawer cannot be left open.
+        app.drawer_open = true;
+        run_at(&mut f, &mut app, Vec2::new(1040.0, 720.0), vec![]);
+        assert!(!app.compact && !app.drawer_open);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A finger dragged across the viewer moves to the next photo; a short
+    /// drag springs back.
+    #[test]
+    fn swiping_the_viewer_steps_and_a_short_drag_does_not() {
+        let (dir, db) = service_library("swipe", 3);
+        let mut app = App::from_path(&db).unwrap();
+        let order = app.visible_order();
+        app.viewing = Some(order[0].clone());
+        let mut f = Frames::new();
+        f.run(&mut app, vec![]);
+        let drag = |f: &mut Frames, app: &mut App, from: f32, to: f32| {
+            let y = 360.0;
+            let b = |x: f32, pressed| egui::Event::PointerButton { pos: Pos2::new(x, y), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+            f.run(app, vec![egui::Event::PointerMoved(Pos2::new(from, y))]);
+            f.run(app, vec![b(from, true)]);
+            for k in 1..=8 { f.run(app, vec![egui::Event::PointerMoved(Pos2::new(from + (to - from) * k as f32 / 8.0, y))]); }
+            f.run(app, vec![b(to, false)]);
+            f.run(app, vec![]);
+        };
+        drag(&mut f, &mut app, 520.0, 480.0);
+        assert_eq!(app.viewing.as_deref(), Some(order[0].as_str()), "40 px, slowly: springs back");
+        assert_eq!(app.viewer_dx, 0.0);
+        drag(&mut f, &mut app, 800.0, 300.0);
+        assert_eq!(app.viewing.as_deref(), Some(order[1].as_str()), "dragged left across: the next photo");
+        drag(&mut f, &mut app, 300.0, 800.0);
+        assert_eq!(app.viewing.as_deref(), Some(order[0].as_str()), "and back");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

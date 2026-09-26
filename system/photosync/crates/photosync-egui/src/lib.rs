@@ -76,6 +76,41 @@ pub struct App {
     pub confirm_delete: Option<String>,    /// The tiles drawn last frame and where: what a press can land on. Read
     /// by tests driving real input, and the basis for keyboard focus later.
     pub last_tiles: Vec<(String, egui::Rect)>,
+    /// This frame's shape (`is_compact` of the window width), set by the
+    /// frame loop: a phone gets a drawer and a condensed header.
+    pub compact: bool,
+    /// The drawer (the rail's contents, on a phone) is open.
+    pub drawer_open: bool,    /// The viewer's photo, dragged sideways this far (px) by a swipe in progress.
+    pub viewer_dx: f32,
+}
+
+/// Below this window width the rail becomes a drawer, the header condenses
+/// and tiles size themselves to the screen. The rail (200) beside two
+/// comfortable columns needs about this much; under it the rail took 160 px
+/// of a 380 px phone and left one column of small tiles.
+pub const COMPACT_BELOW: f32 = 600.0;
+
+pub fn is_compact(window_width: f32) -> bool {
+    window_width < COMPACT_BELOW
+}
+
+/// On a phone the tile size follows the screen rather than the (desktop)
+/// slider: three across in portrait, four once there is room, the way a
+/// camera roll looks. Returns a target for `gallery_grid::grid_for` that
+/// lands on exactly that many columns for `width` and `gap`.
+pub fn compact_tile_target(width: f32, gap: f32) -> f32 {
+    let cols = if width >= 480.0 { 4.0 } else { 3.0 };
+    (((width - gap) / cols) - gap).floor().max(photosync::gallery_grid::MIN_CELL)
+}
+
+/// A sideways swipe in the viewer, decided at release: 1 for the next photo
+/// (dragged left), -1 for the previous, 0 to spring back. Far enough (a fifth
+/// of the width) or a flick (fast, in the same direction, past a small
+/// distance so a tap's jitter is not one) both count.
+pub fn swipe_step(dx: f32, width: f32, velocity_x: f32) -> i32 {
+    let far = dx.abs() > 0.2 * width;
+    let flick = velocity_x.abs() > 500.0 && dx.abs() > 24.0 && dx.signum() == velocity_x.signum();
+    if far || flick { if dx < 0.0 { 1 } else { -1 } } else { 0 }
 }
 
 fn plural(n: usize) -> &'static str { if n == 1 { "" } else { "s" } }
@@ -121,6 +156,9 @@ impl App {
             albums_db: None,
             confirm_delete: None,
             last_tiles: Vec::new(),
+            compact: false,
+            drawer_open: false,
+            viewer_dx: 0.0,
         }
     }
 
@@ -290,3 +328,28 @@ mod from_path_tests {
     }
 }
 
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn a_swipe_steps_when_far_or_flicked_and_springs_back_otherwise() {
+        assert_eq!(swipe_step(-120.0, 400.0, 0.0), 1, "dragged left a fifth: next");
+        assert_eq!(swipe_step(120.0, 400.0, 0.0), -1, "right: previous");
+        assert_eq!(swipe_step(-60.0, 400.0, 0.0), 0, "short and slow: back");
+        assert_eq!(swipe_step(-40.0, 400.0, -900.0), 1, "a flick");
+        assert_eq!(swipe_step(-40.0, 400.0, 900.0), 0, "moving back the other way is not a flick");
+        assert_eq!(swipe_step(-10.0, 400.0, -2000.0), 0, "jitter is not a flick");
+    }
+
+    #[test]
+    fn a_phone_is_compact_and_gets_three_or_four_columns() {
+        assert!(is_compact(360.0) && is_compact(599.0) && !is_compact(600.0) && !is_compact(1040.0));
+        for (w, cols) in [(352.0, 3), (400.0, 3), (479.0, 3), (480.0, 4), (592.0, 4)] {
+            let g = photosync::gallery_grid::grid_for(w, compact_tile_target(w, 3.0), 3.0);
+            assert_eq!(g.columns, cols, "width {w}");
+            assert!(g.cell * cols as f32 + 3.0 * (cols + 1) as f32 <= w + 0.01, "fits: {w} {g:?}");
+        }
+    }
+}
