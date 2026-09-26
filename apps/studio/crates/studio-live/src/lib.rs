@@ -231,6 +231,13 @@ pub struct Channel {
     /// cut, and which one "wins" would otherwise be channel-order trivia.
     #[serde(default)]
     pub choke_group: Option<u8>,
+    /// A ONE-SHOT sampler plays its whole sample from each hit -- a note's
+    /// length does not cut it, only its choke group does. FL's sampler does
+    /// this with its envelope off (Goat's 808s: 0.17 s notes on 1.38 s
+    /// samples, ringing in full). `false` (Studio's own default, and every
+    /// older rack): the note's gate is the sample's window.
+    #[serde(default)]
+    pub one_shot: bool,
 }
 
 /// A pattern: for each channel, which steps fire.
@@ -715,7 +722,7 @@ impl Rack {
     /// a broken one. 140 BPM, light swing, an 808 that slides.
     pub fn trap_kit() -> Rack {
         let ch = |name: &str, kind: SynthKind, gain: f32| Channel {
-            name: name.into(), kind, gain, pan: 0.0, muted: false, choke_group: None,
+            name: name.into(), kind, gain, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         };
         let channels = vec![
             ch("808",   SynthKind::Sub { note: 0, glide_from: None, glide_ms: 70.0,
@@ -768,6 +775,10 @@ pub trait Synth {
     /// how much room the caller has, not how long the sound is — a synth that
     /// wants to ring longer is cut off, which is the caller's decision.
     fn render(&mut self, kind: &SynthKind, rate: u32, out: &mut [f32]);
+
+    /// How long `kind` naturally sounds at `rate`, if the synth knows (a
+    /// sampler: its sample) -- what a one-shot hit's window is.
+    fn natural_len(&self, _kind: &SynthKind, _rate: u32) -> Option<usize> { None }
 
     /// Render with a GATE, for a piano-roll note: the tonal kinds — `Sub`
     /// and `Sine` — sustain while `hold` samples last and release into the
@@ -1123,6 +1134,11 @@ pub struct BuiltinSynth<'a> {
 }
 
 impl Synth for BuiltinSynth<'_> {
+    fn natural_len(&self, kind: &SynthKind, rate: u32) -> Option<usize> {
+        let SynthKind::Sampler { source } = kind else { return None };
+        let a = self.sources.get(source)?;
+        Some((a.frames() as u64 * rate as u64 / a.sample_rate.max(1) as u64) as usize)
+    }
     fn render(&mut self, kind: &SynthKind, rate: u32, out: &mut [f32]) {
         match kind {
             SynthKind::Poly { hz, patch } => poly_voice(*hz, patch, rate, out, None),
@@ -1548,6 +1564,10 @@ pub fn render_pattern_stereo(
         // output — the grid's pitch lane stops being a documented no-op for
         // sample channels.
         let pitch = if matches!(ch.kind, SynthKind::Sampler { .. }) { m.tune } else { 0 };
+        // a ONE-SHOT hit rings its whole sample (repitched: consumed faster up)
+        let hit_window = if ch.one_shot {
+            synth.natural_len(&ch.kind, rate).map(|n| ((n as f64 / 2f64.powf(pitch as f64 / 12.0)) as usize).max(1)).unwrap_or(voice_len)
+        } else { voice_len };
         for r in 0..ratchet {
             let this_kind = if r == 0 { kind.clone() } else { strip_glide(&kind) };
             placed.push(Placed {
@@ -1556,7 +1576,7 @@ pub fn render_pattern_stereo(
                 kind: this_kind,
                 amp: ch.gain * m.vel,
                 group: ch.choke_group,
-                window: voice_len,
+                window: hit_window,
                 gate: false,
                 hold: None,
                 pitch,
@@ -1607,6 +1627,11 @@ pub fn render_pattern_stereo(
                     let tail = ((patch.release_ms.max(1.0) * 1.5 / 1000.0) * rate as f32) as usize;
                     (gate_len + tail, Some(gate_len))
                 }
+                // a ONE-SHOT sampler's note: the whole sample, whatever its length
+                SynthKind::Sampler { .. } if ch.one_shot => {
+                    let n = synth.natural_len(&ch.kind, rate).map(|n| ((n as f64 / 2f64.powf(pitch as f64 / 12.0)) as usize).max(1));
+                    (n.unwrap_or(gate_len), None)
+                }
                 _ => (gate_len, None),
             };
             placed.push(Placed {
@@ -1616,7 +1641,8 @@ pub fn render_pattern_stereo(
                 amp: ch.gain * n.vel.clamp(0.0, 1.0),
                 group: ch.choke_group,
                 window,
-                gate: true,
+                // a one-shot's end is its sample's, not a musical decision: no gate fade
+                gate: !(ch.one_shot && matches!(ch.kind, SynthKind::Sampler { .. })),
                 hold,
                 pitch,
             });
@@ -1875,11 +1901,11 @@ mod tests {
     fn rack() -> Rack {
         Rack {
             channels: vec![
-                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None },
-                Channel { name: "hat".into(), kind: SynthKind::Sine { hz: 8000.0 }, gain: 0.6, pan: 0.0, muted: false, choke_group: None },
+                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false },
+                Channel { name: "hat".into(), kind: SynthKind::Sine { hz: 8000.0 }, gain: 0.6, pan: 0.0, muted: false, choke_group: None, one_shot: false },
                 Channel { name: "beatspace".into(),
                           kind: SynthKind::Beatspace { z: [0.1, -0.4, 0.0], crossfade: 0.5 },
-                          gain: 1.0, pan: 0.0, muted: false, choke_group: None },
+                          gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false },
             ],
             patterns: vec![],
             tempo_bpm: 120.0, swing: 0.0, ..Default::default() }
@@ -2227,7 +2253,7 @@ mod tests {
         rack.channels.push(Channel {
             name: "808".into(),
             kind: SynthKind::Sub { note: -5, glide_from: None, glide_ms: 0.0, drive: 0.3, decay_ms: 300.0 },
-            gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         });
         let mut pattern = Pattern::new("beat", 16, rack.channels.len());
         pattern.toggle(3, 0); // the new 808 channel, on step 0
@@ -2251,7 +2277,7 @@ mod tests {
         rack.channels.push(Channel {
             name: "piano".into(),
             kind: SynthKind::Sf2 { path: "/nowhere.sf2".into(), bank: 0, preset: 0, transpose: 12 },
-            gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         });
         let ch = rack.channels.len() - 1;
         let mut pattern = Pattern::new("keys", 16, rack.channels.len());
@@ -2416,7 +2442,7 @@ mod tests {
             channels: vec![Channel {
                 name: "808".into(),
                 kind: SynthKind::Sub { note: 0, glide_from: None, glide_ms: 30.0, drive: 0.0, decay_ms: 2000.0 },
-                gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
             }],
             patterns: vec![], tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
         let mut pattern = Pattern::new("beat", 16, 1);
@@ -2659,7 +2685,7 @@ mod trap_tests {
             channels: vec![Channel { name: "hat".into(),
                 kind: SynthKind::Drum { voice: DrumVoice::HatClosed, tone: 0.5,
                                         decay_ms: 40.0, tune: 0 },
-                gain: 1.0, pan: 0.0, muted: false, choke_group: None }],
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false }],
             patterns: vec![], tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
         let mut p = Pattern::new("A", 4, 1);
         p.set(0, 0, true);
@@ -2739,7 +2765,7 @@ mod import_tests {
         let ch = rack.add_channel(Channel {
             name: "snap".into(),
             kind: SynthKind::Sampler { source: studio_core::SourceId(7) },
-            gain: 0.9, pan: 0.0, muted: false, choke_group: None,
+            gain: 0.9, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         });
         for p in &rack.patterns {
             assert_eq!(p.rows.len(), rack.channels.len(), "'{}' kept up", p.name);
@@ -2778,7 +2804,7 @@ mod choke_tests {
         let ch = |name: &str, voice: DrumVoice, decay: f32, grp: Option<u8>| Channel {
             name: name.into(),
             kind: SynthKind::Drum { voice, tone: 0.5, decay_ms: decay, tune: 0 },
-            gain: 1.0, pan: 0.0, muted: false, choke_group: grp,
+            gain: 1.0, pan: 0.0, muted: false, choke_group: grp, one_shot: false,
         };
         Rack {
             channels: vec![
@@ -2952,7 +2978,7 @@ mod roll_tests {
             channels: vec![Channel {
                 name: "808".into(),
                 kind: SynthKind::Sub { note: 12, glide_from: None, glide_ms, drive: 0.0, decay_ms },
-                gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
             }],
             patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0, ..Default::default() }
     }
@@ -3056,7 +3082,7 @@ mod roll_tests {
         rack.channels.push(Channel {
             name: "hat".into(),
             kind: SynthKind::Drum { voice: DrumVoice::HatClosed, tone: 0.5, decay_ms: 80.0, tune: 0 },
-            gain: 1.0, pan: 0.0, muted: false, choke_group: Some(1),
+            gain: 1.0, pan: 0.0, muted: false, choke_group: Some(1), one_shot: false,
         });
         let mut cut = Pattern::new("cut", 8, 2);
         cut.add_note(0, Note { key: 0, start: 0, len: 8, vel: 1.0, slide: false });
@@ -3119,6 +3145,33 @@ mod roll_tests {
     }
 
     #[test]
+    fn one_shot_note_rings_its_whole_sample_and_a_gated_one_does_not() {
+        // a 1 s tone, a 1-step note (125 ms at 120 BPM): gated, silent after
+        // the step; ONE-SHOT, still ringing at 0.5 s -- FL's sampler, envelope off
+        let tone: Vec<f32> = (0..48_000).map(|i| (i as f32 / 48_000.0 * 110.0 * std::f32::consts::TAU).sin()).collect();
+        let mut sources = std::collections::BTreeMap::new();
+        sources.insert(studio_core::SourceId(1), SourceAudio { sample_rate: 48_000, channels: vec![tone] });
+        let rack_with = |one_shot: bool| Rack {
+            channels: vec![Channel { name: "808".into(), kind: SynthKind::Sampler { source: studio_core::SourceId(1) },
+                                     gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot }],
+            patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
+        let mut p = Pattern::new("808", 16, 1);
+        p.add_note(0, Note { key: 0, start: 0, len: 1, vel: 1.0, slide: false });
+        let mut synth = BuiltinSynth { sources: &sources };
+        let (g, o) = (rack_with(false), rack_with(true));
+        let gated = render_pattern(&p, &g, &mut synth, &g.tempo(), 48_000, 0);
+        let shot = render_pattern(&p, &o, &mut synth, &o.tempo(), 48_000, 0);
+        let e = |v: &[f32], a: usize, b: usize| v[a..b.min(v.len())].iter().map(|x| x * x).sum::<f32>();
+        assert!(e(&gated, 12_000, 30_000) < 1e-6, "gated: silent past the note");
+        assert!(e(&shot, 22_000, 26_000) > 100.0, "one-shot: still ringing at 0.5 s");
+        // and a STEP hit (normally 4 steps, 0.5 s) rings the whole second too
+        let mut s = Pattern::new("808 step", 16, 1);
+        s.set(0, 0, true);
+        let hit = render_pattern(&s, &o, &mut synth, &o.tempo(), 48_000, 0);
+        assert!(e(&hit, 36_000, 44_000) > 100.0, "a one-shot step hit is not capped at four steps");
+    }
+
+    #[test]
     fn a_sampler_roll_note_plays_the_chop_at_pitch() {
         // +12 semitones reads the rendered voice twice as fast — roughly
         // double the zero crossings in the note window. This is what makes
@@ -3133,7 +3186,7 @@ mod roll_tests {
             channels: vec![Channel {
                 name: "chop".into(),
                 kind: SynthKind::Sampler { source: studio_core::SourceId(1) },
-                gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
             }],
             patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
         let t = rack.tempo();
@@ -3164,7 +3217,7 @@ mod roll_tests {
             channels: vec![Channel {
                 name: "chop".into(),
                 kind: SynthKind::Sampler { source: studio_core::SourceId(1) },
-                gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
             }],
             patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
         let t = rack.tempo();
@@ -3229,7 +3282,7 @@ mod gated_synth_tests {
             name: "808".into(),
             kind: SynthKind::Sub { note: 0, glide_from: None, glide_ms: 0.0,
                                    drive: 0.0, decay_ms },
-            gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         }];
         for p in &mut r.patterns { p.rows = vec![0]; p.mods.clear(); p.rolls.clear(); }
         r

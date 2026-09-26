@@ -457,7 +457,7 @@ pub fn import(inv: &Value, name: &str, probe: &dyn Fn(&str) -> Option<Media>) ->
             choke_fades.push(format!("{} ({})", ch_name(c), c["fade_out"].as_u64().unwrap_or(0)));
         }
         rack.channels.push(Channel { name: ch_name(c), kind, gain: (channel_gain(c, media) * trim).clamp(0.0, 64.0),
-                                     pan, muted: off, choke_group: choke });
+                                     pan, muted: off, choke_group: choke, one_shot: false });
     }
     if !choke_ids.is_empty() {
         report.push(format!("CUT GROUPS -> choke groups: {} FL group{} (a new hit stops what the group still rings -- the 808s)",

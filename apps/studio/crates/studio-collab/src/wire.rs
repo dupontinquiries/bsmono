@@ -120,7 +120,8 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// v25: PHASE and the per-trigger PAN ENVELOPE on a Poly patch.
 /// v26: a Poly patch's BODY (fixed-Hz resonances) and its human motion --
 /// delayed vibrato, drift, bow noise.
-pub const WIRE_VERSION: u8 = 26;
+/// v27: a rack channel's ONE-SHOT flag.
+pub const WIRE_VERSION: u8 = 27;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -963,6 +964,7 @@ fn put_channel(o: &mut Vec<u8>, c: &Channel) {
     put_u8(o, c.muted as u8);
     put_u8(o, c.choke_group.is_some() as u8);
     put_u8(o, c.choke_group.unwrap_or(0));
+    if enc_v() >= 27 { put_u8(o, c.one_shot as u8); }
 }
 fn get_channel(r: &mut R) -> Option<Channel> {
     let name = r.str()?;
@@ -972,8 +974,9 @@ fn get_channel(r: &mut R) -> Option<Channel> {
     let muted = r.u8()? != 0;
     let has_choke = r.u8()? != 0;
     let choke = r.u8()?;
+    let one_shot = if r.v >= 27 { r.u8()? != 0 } else { false };
     Some(Channel { name, kind, gain, pan, muted,
-                   choke_group: has_choke.then_some(choke) })
+                   choke_group: has_choke.then_some(choke), one_shot })
 }
 
 fn put_stepmod(o: &mut Vec<u8>, m: &StepMod) {
@@ -1525,9 +1528,9 @@ mod tests {
         pattern.add_note(1, Note { key: 3, start: 6, len: 1, vel: 1.0, slide: true });
         Rack {
             channels: vec![
-                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: Some(2) },
-                Channel { name: "808".into(), kind: SynthKind::Sub { note: -5, glide_from: Some(0), glide_ms: 40.0, drive: 0.3, decay_ms: 300.0 }, gain: 0.9, pan: -0.1, muted: false, choke_group: None },
-                Channel { name: "hat".into(), kind: SynthKind::Sampler { source: SourceId(3) }, gain: 0.6, pan: 0.2, muted: true, choke_group: Some(0) },
+                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false, choke_group: Some(2), one_shot: false },
+                Channel { name: "808".into(), kind: SynthKind::Sub { note: -5, glide_from: Some(0), glide_ms: 40.0, drive: 0.3, decay_ms: 300.0 }, gain: 0.9, pan: -0.1, muted: false, choke_group: None, one_shot: false },
+                Channel { name: "hat".into(), kind: SynthKind::Sampler { source: SourceId(3) }, gain: 0.6, pan: 0.2, muted: true, choke_group: Some(0), one_shot: false },
             ],
             patterns: vec![pattern],
             tempo_bpm: 140.0, swing: 0.11, ..Default::default() }
@@ -1542,12 +1545,35 @@ mod tests {
         rack.channels.push(Channel {
             name: "gan".into(),
             kind: SynthKind::Beatspace { z: [0.25, -0.5, 0.9], crossfade: 0.4 },
-            gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         });
         let p = Packet::Rack(RackSync { rack, seq: 12, site: SiteId(3) });
         let bytes = p.encode();
         let back = Packet::decode(&bytes).expect("decodes");
         assert_eq!(p, back, "round-trip changed the rack");
+    }
+
+    /// v27: a ONE-SHOT sampler stays one-shot through the wire, and a v26
+    /// rack (which had no such flag) opens with every channel gated -- the
+    /// behaviour it was saved with -- and nothing else changed.
+    #[test]
+    fn a_one_shot_channel_round_trips_and_a_v26_rack_opens_gated() {
+        let mut rack = sample_rack();
+        rack.channels[2].one_shot = true;
+        let p = Packet::Rack(RackSync { rack: rack.clone(), seq: 5, site: SiteId(2) });
+        let back = Packet::decode(&p.encode()).expect("decodes");
+        assert_eq!(back, p, "the one-shot flag round-trips");
+        let Packet::Rack(RackSync { rack: r, .. }) = &back else { panic!("a rack packet") };
+        assert!(r.channels[2].one_shot && !r.channels[0].one_shot);
+
+        ENCODE_AS.with(|c| c.set(26));
+        let old = p.encode();
+        ENCODE_AS.with(|c| c.set(WIRE_VERSION));
+        let Some(Packet::Rack(RackSync { rack: r, .. })) = Packet::decode_stored(&old) else { panic!("a v26 rack opens") };
+        assert!(r.channels.iter().all(|c| !c.one_shot), "v26 knew no one-shots");
+        let mut expect = rack;
+        expect.channels[2].one_shot = false;
+        assert_eq!(r, expect, "and nothing else moved");
     }
 
     #[test]
@@ -1657,7 +1683,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 26, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 27, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]

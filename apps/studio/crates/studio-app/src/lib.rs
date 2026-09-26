@@ -2708,7 +2708,7 @@ impl Studio {
         let ch = self.rack.add_channel(studio_live::Channel {
             name: name.into(),
             kind: studio_live::SynthKind::Sampler { source: id },
-            gain: 0.9, pan: 0.0, muted: false, choke_group: None,
+            gain: 0.9, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         });
         self.selected_channel = ch;
         self.loop_dirty = true;
@@ -3084,7 +3084,7 @@ mod tests {
         a.rack.channels.push(studio_live::Channel {
             name: "clap".into(),
             kind: studio_live::SynthKind::Sampler { source: sid },
-            gain: 1.0, pan: 0.0, muted: false, choke_group: None });
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false });
         let clap_ix = a.rack.channels.len() - 1;
         let pat_ix = a.rack.patterns.len() - 1;
         {
@@ -10761,7 +10761,7 @@ mod layer_tests {
         let ix = s.layer_channel(from, studio_live::Channel {
             name: "kick-tone".into(),
             kind: s.rack.channels[from].kind.clone(),
-            gain: 0.9, pan: 0.0, muted: false, choke_group: None,
+            gain: 0.9, pan: 0.0, muted: false, choke_group: None, one_shot: false,
         });
         assert_eq!(s.rack.patterns[0].rows[ix], steps_before,
                    "the layer fires in lockstep with its source");

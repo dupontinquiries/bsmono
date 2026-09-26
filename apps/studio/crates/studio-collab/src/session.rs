@@ -474,7 +474,7 @@ mod tests {
         let rack = studio_live::Rack {
             channels: vec![studio_live::Channel {
                 name: "kick".into(), kind: studio_live::SynthKind::Sine { hz: 60.0 },
-                gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+                gain: 1.0, pan: 0.0, muted: false, choke_group: None, one_shot: false,
             }],
             patterns: vec![pattern],
             tempo_bpm: 140.0, swing: 0.11, ..Default::default() };
