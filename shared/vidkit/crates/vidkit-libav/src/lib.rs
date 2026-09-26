@@ -43,6 +43,9 @@ pub struct Options {
     /// AV1: have the decoder export film grain instead of synthesising it,
     /// and attach it to 8-bit frames as `Frame::grain` (the GPU adds it).
     pub export_grain: bool,
+    /// libavformat input options (`headers`, `reconnect`, `user_agent`...):
+    /// what a signed stream URL needs to be fetched at all.
+    pub input_options: Vec<(String, String)>,
 }
 
 fn err(code: i32) -> String {
@@ -146,9 +149,18 @@ impl Decoder {
                 grain_frames: 0,
                 counter: 0,
             };
-            let r = ff::avformat_open_input(&mut d.fmt, c_path.as_ptr(), ptr::null(), ptr::null_mut());
+            let mut dict: *mut ff::AVDictionary = ptr::null_mut();
+            for (k, v) in &opts.input_options {
+                let (k, v) = (CString::new(k.as_str()).map_err(|_| "option has a NUL")?, CString::new(v.as_str()).map_err(|_| "option has a NUL")?);
+                ff::av_dict_set(&mut dict, k.as_ptr(), v.as_ptr(), 0);
+            }
+            let r = ff::avformat_open_input(&mut d.fmt, c_path.as_ptr(), ptr::null(), &mut dict);
+            // Options the demuxer did not consume stay in the dictionary.
+            ff::av_dict_free(&mut dict);
             if r < 0 {
-                return Err(format!("{path}: {}", err(r)));
+                // Never echo a signed URL's query string into logs.
+                let shown = path.split('?').next().unwrap_or(path);
+                return Err(format!("{shown}: {}", err(r)));
             }
             let r = ff::avformat_find_stream_info(d.fmt, ptr::null_mut());
             if r < 0 {

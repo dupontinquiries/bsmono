@@ -1847,15 +1847,23 @@ fn stream_opener(input: decode::StreamingInput, _format_cap: Option<u32>) -> pla
     let cache = std::sync::OnceLock::new();
     Box::new(move |from, speed| {
         let pr = probed(&cache, || decode::probe_input(&input.video_url, &input.headers))?;
-        let v: Box<dyn decode::VideoSource> = Box::new(decode::FfmpegFrames::open_probed(
-            &decode::VideoInput::url(&input.video_url, &input.headers),
-            &pr,
-            // The format was already chosen at the preset's height; this is
-            // the decode size, which follows the display like a file's.
-            Some(decode::decode_cap()),
-            from,
-            decode::accel_for(&pr.codec),
-        )?);
+        let accel = decode::accel_for(&pr.codec);
+        #[cfg(feature = "libav")]
+        let inproc = inproc::open_input(&input.video_url, &input.headers, &pr, from, &accel);
+        #[cfg(not(feature = "libav"))]
+        let inproc: Option<Box<dyn decode::VideoSource>> = None;
+        let v: Box<dyn decode::VideoSource> = match inproc {
+            Some(v) => v,
+            None => Box::new(decode::FfmpegFrames::open_probed(
+                &decode::VideoInput::url(&input.video_url, &input.headers),
+                &pr,
+                // The format was already chosen at the preset's height; this
+                // is the decode size, which follows the display like a file's.
+                Some(decode::decode_cap()),
+                from,
+                accel,
+            )?),
+        };
         let a = decode::AudioStream::open_streaming(&input, 48_000, 2, from, speed).ok();
         Ok((v, a))
     })

@@ -60,9 +60,29 @@ pub fn wanted(mode: Option<&str>, accel: &Accel, scale: Option<(u32, u32)>, gpu:
     }
 }
 
-/// Open in process when the policy says so; `None` (with a note on
-/// stderr) means "use the ffmpeg process".
+/// Open a local file in process when the policy says so; `None` (with a
+/// note on stderr) means "use the ffmpeg process".
 pub fn open(path: &Path, p: &Probe, from: Duration, accel: &Accel) -> Option<Box<dyn VideoSource>> {
+    open_input(&path.to_string_lossy(), &[], p, from, accel)
+}
+
+/// libavformat options for an HTTP(S) stream: the headers it is signed
+/// against, and reconnection (a CDN closing an idle socket mid-film is
+/// routine) -- the same as the ffmpeg child is given. Pure.
+pub fn stream_options(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let mut o = Vec::new();
+    if !headers.is_empty() {
+        o.push(("headers".to_string(), headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect()));
+    }
+    for (k, v) in [("reconnect", "1"), ("reconnect_streamed", "1"), ("reconnect_delay_max", "5")] {
+        o.push((k.to_string(), v.to_string()));
+    }
+    o
+}
+
+/// [`open`] for a path or URL (`headers` only for URLs).
+pub fn open_input(input: &str, headers: &[(String, String)], p: &Probe, from: Duration, accel: &Accel) -> Option<Box<dyn VideoSource>> {
+    let network = input.starts_with("http://") || input.starts_with("https://");
     let gpu = decode::gpu_presenter();
     let hw = wanted(std::env::var("VIDKIT_DECODE").ok().as_deref(), accel, decode::scale_plan(p), gpu)?;
     if p.width.max(p.height) > decode::texture_limit() {
@@ -72,12 +92,13 @@ pub fn open(path: &Path, p: &Probe, from: Duration, accel: &Accel) -> Option<Box
     // AV1 grain for the GPU, as the ffmpeg path does with its feed -- here
     // the decoder hands the parameters over itself.
     let export_grain = gpu && hw == Hw::Software && p.codec == "av1" && !p.high_bit_depth() && std::env::var("VIDKIT_GRAIN_CPU").as_deref() != Ok("1");
-    let opts = Options { hw: hw.clone(), from, threads, export_grain };
+    let input_options = if network { stream_options(headers) } else { Vec::new() };
+    let opts = Options { hw: hw.clone(), from, threads, export_grain, input_options };
     // libavcodec's worker threads are created in open and inherit the
     // opening thread's affinity: pin this thread around it, as the ffmpeg
     // child was pinned, and put it back.
     let saved = decode::decode_cpus().map(|c| pin_this_thread(&c));
-    let r = Decoder::open(&path.to_string_lossy(), &opts);
+    let r = Decoder::open(input, &opts);
     if let Some(Some(old)) = saved {
         restore_this_thread(&old);
     }
@@ -86,7 +107,9 @@ pub fn open(path: &Path, p: &Probe, from: Duration, accel: &Accel) -> Option<Box
             dec,
             pool: PlanePool::new(),
             color: p.color(),
-            hdr_peak: (p.color().transfer == vidkit_core::codec::Transfer::Pq).then(|| decode::probe_hdr_peak(&path.to_string_lossy())).flatten(),
+            // ffprobe of a URL would need the headers too; the stream path
+            // takes the EETF default, as the ffmpeg child's did not ask.
+            hdr_peak: (!network && p.color().transfer == vidkit_core::codec::Transfer::Pq).then(|| decode::probe_hdr_peak(input)).flatten(),
             interval: Duration::from_secs_f64(1.0 / p.fps.max(1.0)),
             note: None,
             failed: false,
@@ -291,5 +314,85 @@ mod tests {
             inodes.insert(st.st_ino);
         }
         assert_eq!(inodes.len(), 6, "a pool of six buffers, reused");
+    }
+
+    /// A signed-URL stand-in: an HTTP server with byte ranges that answers
+    /// 403 without the header. In process, the stream opens only with the
+    /// headers, seeks by range, and decodes the same pictures as the CLI
+    /// does from the file.
+    #[test]
+    fn a_stream_opens_with_its_headers_and_seeks() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let dir = std::env::temp_dir().join(format!("vk-inproc-http-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("s.webm");
+        let ok = std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25:duration=4", "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-g", "25", "-pix_fmt", "yuv420p"]).arg(&f).status().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            return;
+        }
+        let body = std::fs::read(&f).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ranged = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r2 = ranged.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut c) = conn else { continue };
+                let (body, ranged) = (body.clone(), r2.clone());
+                std::thread::spawn(move || loop {
+                    let mut rd = BufReader::new(c.try_clone().unwrap());
+                    let mut lines = Vec::new();
+                    loop {
+                        let mut l = String::new();
+                        if rd.read_line(&mut l).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if l == "\r\n" {
+                            break;
+                        }
+                        lines.push(l.to_ascii_lowercase());
+                    }
+                    let signed = lines.iter().any(|l| l.starts_with("x-vidkit: yes"));
+                    if !signed {
+                        let _ = c.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+                        continue;
+                    }
+                    let start = lines.iter().find_map(|l| l.strip_prefix("range: bytes=")).and_then(|r| r.split('-').next()?.trim().parse::<usize>().ok());
+                    let from = start.unwrap_or(0).min(body.len());
+                    if from > 0 {
+                        ranged.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let head = if start.is_some() {
+                        format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nAccept-Ranges: bytes\r\n\r\n", body.len() - from, from, body.len() - 1, body.len())
+                    } else {
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\n\r\n", body.len())
+                    };
+                    if c.write_all(head.as_bytes()).and_then(|_| c.write_all(&body[from..])).is_err() {
+                        return;
+                    }
+                    let _ = rd.read(&mut [0u8; 0]);
+                });
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/s.webm?sig=secret");
+        let p = decode::probe(&f).unwrap();
+        let headers = vec![("X-Vidkit".to_string(), "yes".to_string())];
+        assert!(open_input(&url, &[], &p, Duration::ZERO, &Accel::Software).is_none(), "403 without the header");
+        let mut v = open_input(&url, &headers, &p, Duration::from_millis(1500), &Accel::Software).expect("opens with the header");
+        let mut got = Vec::new();
+        let mut first = None;
+        while let Some(fr) = v.next_frame() {
+            first.get_or_insert(fr.pts);
+            let vidkit_core::frame::FrameData::Cpu(pl) = fr.data else { panic!() };
+            for d in pl.data {
+                got.extend(d);
+            }
+        }
+        let want = std::process::Command::new("ffmpeg").args(["-v", "error", "-ss", "1.5", "-i"]).arg(&f).args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"]).output().unwrap().stdout;
+        let t = first.unwrap().as_secs_f64();
+        assert!((1.5..1.54).contains(&t), "first frame at or just after 1.5 s (25 fps: 1.52): {t}");
+        assert_eq!(got.len(), want.len(), "frame count after the seek");
+        assert!(got == want, "stream pictures differ from the file's");
+        assert!(ranged.load(std::sync::atomic::Ordering::SeqCst) > 0, "the seek was a range request, not a read from the start");
     }
 }
