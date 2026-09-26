@@ -577,6 +577,9 @@ pub struct Snapclone {
     /// Our own position, when the device has a fix. `None` is a real state, not
     /// a placeholder: without it nobody can be placed geographically.
     pub self_fix: Option<crate::wayfinder::Fix>,
+    /// `self_fix` came from the manual-location setting, so a later Save may
+    /// replace it (a real fix is never overwritten by the setting).
+    self_fix_is_manual: bool,
     /// Contacts as the wayfinder sees them — id, name, online, position.
     pub wayfinder_contacts: Vec<crate::wayfinder::Contact>,
     /// Named places you can be resolved to — "my apartment", "the studio" — so
@@ -933,6 +936,7 @@ impl Snapclone {
                 r
             },
             self_fix: None,
+            self_fix_is_manual: false,
             wayfinder_contacts: Vec::new(),
             landmarks: Vec::new(),
             add_landmark: None,
@@ -3098,7 +3102,10 @@ impl Snapclone {
         let recent_voice = self.last_voice_at
             .map(|t| now_secs.saturating_sub(t) <= VOICE_WINDOW_SECS)
             .unwrap_or(false);
-        self.posture.set_armed(on_inbox || recent_voice);
+        // The setting gates the whole feature: off means the screensaver never
+        // arms, whatever the page or the voice activity.
+        self.posture.set_armed(self.settings.current.general.proximity_screensaver
+                               && (on_inbox || recent_voice));
         self.posture.set_in_call(self.group_voice.joined);
     }
 
@@ -4037,7 +4044,12 @@ impl Snapclone {
         // The camera page is on screen, so the driver may run; leaving it
         // started when the page is not visible is the Backgrounded case it
         // exists to refuse.
-        self.ambient_camera.start();
+        // Settings > Storage > ambient: off means the ambient driver never starts.
+        if self.settings.saved().storage.ambient_enabled {
+            self.ambient_camera.start();
+        } else {
+            self.ambient_camera.stop();
+        }
         self.ambient_camera.set_app_active(true);
         if self.ambient_camera_tick(now_ms) == crate::ambient_camera::Tick::Derive {
             // No pixel access in this build: complete with nothing usable,
@@ -4285,14 +4297,14 @@ impl Snapclone {
                         }
                     });
                     if let Some(id) = pick {
-                        self.cam_selection = Some(crate::camera_select::select(&self.cameras, &id, true));
+                        self.cam_selection = Some(crate::camera_select::select(&self.cameras, &id, self.settings.current.camera.mirror_front));
                     }
                 } else {
                     for d in &self.cameras {
                         let on = d.id == current;
                         if ui.selectable_label(on, &d.label).clicked() {
                             self.cam_selection = Some(crate::camera_select::select(
-                                &self.cameras, &d.id, true));
+                                &self.cameras, &d.id, self.settings.current.camera.mirror_front));
                         }
                     }
                 }
@@ -4303,7 +4315,7 @@ impl Snapclone {
                                       Some(crate::camera_select::Selection::Pip { .. }));
                     if ui.selectable_label(on, "both").clicked() {
                         self.cam_selection = Some(crate::camera_select::select(
-                            &self.cameras, crate::camera_select::PIP_ID, true));
+                            &self.cameras, crate::camera_select::PIP_ID, self.settings.current.camera.mirror_front));
                     }
                 }
             });
@@ -4881,7 +4893,7 @@ impl Snapclone {
         };
         let Some(other) = crate::camera_select::other_facing(&self.cameras, &current) else { return false };
         let id = other.id.clone();
-        self.cam_selection = Some(crate::camera_select::select(&self.cameras, &id, true));
+        self.cam_selection = Some(crate::camera_select::select(&self.cameras, &id, self.settings.current.camera.mirror_front));
         true
     }
 
@@ -5434,11 +5446,44 @@ impl Snapclone {
             return;
         }
         match crate::settings_store::store(self.settings.saved()) {
-            Ok(()) => self.settings_error = None,
+            Ok(()) => {
+                self.settings_error = None;
+                self.apply_live_settings();
+            }
             // SHOWN, not swallowed -- a read-only config dir is a real thing on
             // locked-down devices, and a Save that silently fails is the same lie as
             // one that never wrote.
             Err(e) => self.settings_error = Some(format!("could not save: {e}")),
+        }
+    }
+
+    /// Push the saved settings that are applied ONCE (at load and after each
+    /// Save) into the subsystems that use them. The settings read at their point
+    /// of use (mirroring, the screensaver gate, the ambient driver) need nothing
+    /// here. Before this, these were saved and never reached anything, which a
+    /// user reads as "the setting did not save".
+    pub fn apply_live_settings(&mut self) {
+        let s = self.settings.saved().clone();
+        // About > debug trace: every channel; the legacy mobile display debug
+        // switch maps onto the Layout channel (see trace_channels).
+        for ch in crate::trace_channels::Channel::ALL {
+            self.trace.set_channel(ch, s.about.debug_trace);
+        }
+        if !s.about.debug_trace {
+            self.trace.set_mobile_display_debug(s.about.mobile_display_debug);
+        }
+        // Storage > auto-sync path: a synced folder means the export reminder
+        // has nothing to remind about.
+        self.reminder.auto_sync_path = s.storage.auto_sync_path.clone();
+        // General > manual location: the position used when nothing better is
+        // known. A live fix, once there is one, is not overwritten.
+        if let (Ok(lat), Ok(lon)) = (s.general.manual_lat.trim().parse::<f64>(), s.general.manual_lon.trim().parse::<f64>()) {
+            if (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)
+                && (self.self_fix.is_none() || self.self_fix_is_manual)
+            {
+                self.self_fix = Some(crate::wayfinder::Fix { lat, lon });
+                self.self_fix_is_manual = true;
+            }
         }
     }
 
@@ -6731,6 +6776,40 @@ mod tests {
         bad.x_public = Some(planted);
         b.learn_mailbox_key(&ida.sc_id, &[bad]);
         assert_eq!(b.contact_book.get(&ida.sc_id).unwrap().mailbox, Some(ida.x_public), "a planted key replaced the real one");
+    }
+
+    /// Settings that used to be saved and read by nothing now reach their
+    /// subsystems -- each one checked in both states, so a hard-coded value on
+    /// either side would fail.
+    #[test]
+    fn saved_settings_reach_the_subsystems_that_use_them() {
+        use crate::trace_channels::Channel;
+        let mut s = app();
+        s.settings.persist_field(|x| {
+            x.about.debug_trace = false;
+            x.about.mobile_display_debug = true;
+            x.storage.auto_sync_path = "/sdcard/Sync".into();
+            x.general.manual_lat = "43.65".into();
+            x.general.manual_lon = "-79.38".into();
+        });
+        s.apply_live_settings();
+        assert!(s.trace.is_enabled(Channel::Layout), "mobile display debug did not reach the Layout channel");
+        assert!(!s.trace.is_enabled(Channel::Dht));
+        assert_eq!(s.reminder.auto_sync_path, "/sdcard/Sync");
+        assert_eq!(s.self_fix, Some(crate::wayfinder::Fix { lat: 43.65, lon: -79.38 }));
+        s.settings.persist_field(|x| { x.about.debug_trace = true; x.general.manual_lat = "91".into(); });
+        s.apply_live_settings();
+        assert!(Channel::ALL.iter().all(|c| s.trace.is_enabled(*c)), "debug trace did not enable every channel");
+        assert_eq!(s.self_fix, Some(crate::wayfinder::Fix { lat: 43.65, lon: -79.38 }), "an out-of-range latitude was taken");
+
+        // The screensaver gate, on the Inbox where it would otherwise arm.
+        s.nav.go_page(1);
+        s.settings.persist_field(|x| x.general.proximity_screensaver = false);
+        s.refresh_posture_arming(0);
+        assert!(!s.posture.armed(), "the screensaver armed with the setting off");
+        s.settings.persist_field(|x| x.general.proximity_screensaver = true);
+        s.refresh_posture_arming(0);
+        assert!(s.posture.armed(), "the screensaver did not arm with the setting on");
     }
 
     #[test]

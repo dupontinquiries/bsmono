@@ -372,6 +372,7 @@ impl Snapclone {
                 // page reporting unsaved changes against a default it never
                 // showed, and the Save button lit on a fresh start.
                 self.settings = settings_page::SettingsPage::new(*s);
+                self.apply_live_settings();
             }
             HostEvent::LoggedIn => self.login_succeeded(),
             HostEvent::IdentityLoaded(loaded) => {
