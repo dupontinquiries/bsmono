@@ -290,6 +290,13 @@ pub struct Renderer {
     smooth_pipe: wgpu::RenderPipeline,
     lights_buf: wgpu::Buffer,
     lights_bind: wgpu::BindGroup,
+    snow_pack_tex: wgpu::Texture,
+    snow_mark_tex: wgpu::Texture,
+    snow_params: wgpu::Buffer,
+    /// Ultra's snowpack for this frame, set by the scene: the pack's depth
+    /// and the marks as texture bytes, and where they sit
+    /// (`snowpack::Snowpack::upload` / `params`). None: no snow drawn.
+    pub snow: Option<(Vec<u8>, Vec<u8>, [[f32; 4]; 2])>,
     smooth_meshes: HashMap<u64, SmoothGpu>,
     smooth_queue: Vec<(u64, u32)>,
     /// Voxel draws that only cast shadows (an ultra cat's shadow is its
@@ -598,14 +605,33 @@ impl Renderer {
 
         // the terrain receives the coloured point lights too (ultra), so it
         // shares the lights layout with the smooth characters
+        // ...and ultra's snowpack (snowpack.rs): the pack's depth and the
+        // marks, sampled by the terrain's vertex and fragment stages
+        let snow_tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+            count: None,
+        };
         let lights_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("lights bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                count: None,
-            }],
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                snow_tex_entry(1),
+                snow_tex_entry(2),
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+            ],
         });
         let lit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("lit layout"),
@@ -681,10 +707,45 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let snow_tex = |label: &str, n: usize| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: n as u32, height: n as u32, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        let snow_pack_tex = snow_tex("snow pack", crate::snowpack::N);
+        let snow_mark_tex = snow_tex("snow marks", crate::snowpack::FN);
+        let snow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("snow"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let snow_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("snow params"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let (pack_view, mark_view) = (snow_pack_tex.create_view(&Default::default()), snow_mark_tex.create_view(&Default::default()));
         let lights_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lights bind"),
             layout: &lights_bgl,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: lights_buf.as_entire_binding() }],
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: lights_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&pack_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&mark_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&snow_sampler) },
+                wgpu::BindGroupEntry { binding: 4, resource: snow_params.as_entire_binding() },
+            ],
         });
         let smooth_pl = &lit_pl;
         let smooth_vbl = wgpu::VertexBufferLayout {
@@ -875,6 +936,10 @@ impl Renderer {
             smooth_pipe,
             lights_buf,
             lights_bind,
+            snow_pack_tex,
+            snow_mark_tex,
+            snow_params,
+            snow: None,
             smooth_meshes: HashMap::new(),
             smooth_queue: Vec::new(),
             shadow_only: Vec::new(),
@@ -1318,6 +1383,27 @@ impl Renderer {
             }
             l[196] = (self.fur_style == FurStyle::Locks) as u32 as f32;
             self.queue.write_buffer(&self.lights_buf, 0, bytemuck::cast_slice(&l));
+        }
+        // the snowpack (ultra): both fields, every frame it is there; the
+        // params' `on` flag off otherwise
+        {
+            let mut p = [[0.0f32; 4]; 2];
+            if let Some((pack, marks, params)) = self.snow.as_ref() {
+                let put = |tex: &wgpu::Texture, bytes: &[u8], n: usize| {
+                    self.queue.write_texture(
+                        wgpu::ImageCopyTexture { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                        bytes,
+                        wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(n as u32), rows_per_image: Some(n as u32) },
+                        wgpu::Extent3d { width: n as u32, height: n as u32, depth_or_array_layers: 1 },
+                    );
+                };
+                if pack.len() == crate::snowpack::N * crate::snowpack::N && marks.len() == crate::snowpack::FN * crate::snowpack::FN {
+                    put(&self.snow_pack_tex, pack, crate::snowpack::N);
+                    put(&self.snow_mark_tex, marks, crate::snowpack::FN);
+                    p = *params;
+                }
+            }
+            self.queue.write_buffer(&self.snow_params, 0, bytemuck::cast_slice(&p));
         }
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

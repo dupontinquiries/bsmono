@@ -124,6 +124,64 @@ pub fn run() -> Result<(), String> {
         shoot(&mut renderer, &game, &mut vfx, "sky_mist.png", cam(at - out * 6.0 + side * 5.0 + Vec3::Y * 3.5, at + out * 4.0 - Vec3::Y * 1.0, 1.0))?;
         game.gods[0].pos = keep;
     }
+    // ultra's snow (CLAWBOUND_QUALITY=ultra; skipped otherwise): a cat
+    // bounding through a drift, one padding over blown powder, and a
+    // blast's crater -- a few seconds of each, drawn every frame so the
+    // paws really land
+    if vfx.snow.is_some() && (want("snow_deep") || want("snow_thin") || want("snow_blast")) {
+        let keep = (game.gods[0].pos, game.gods[0].yaw, game.gods[0].move_dir);
+        let find = |vfx: &Vfx, deep: bool| -> Option<Vec3> {
+            let s = vfx.snow.as_ref()?;
+            let mut best = None;
+            for k in 0..4000 {
+                let a = k as f32 * 2.399;
+                let r = 30.0 + (k as f32).sqrt() * 4.0;
+                let p = Vec3::new(a.cos() * r, 0.0, a.sin() * r);
+                let ok = (0..8).all(|q| {
+                    let o = p + Vec3::X * q as f32;
+                    let d = s.depth_at(o.x, o.z);
+                    sky::floor().sdf(o.x, o.z) < -3.0 && if deep { d > 0.75 } else { (0.04..0.2).contains(&d) && s.blow_at(o.x, o.z) > 0.6 }
+                });
+                if ok {
+                    best = Some(p);
+                    break;
+                }
+            }
+            best
+        };
+        let mut walk = |renderer: &mut Renderer, game: &mut Game, vfx: &mut Vfx, from: Vec3, secs: f32, events: Vec<crate::sim::Event>| {
+            game.gods[0].yaw = 0.0;
+            game.gods[0].move_dir = Vec3::X;
+            let n = (secs * 60.0) as usize;
+            for k in 0..n {
+                game.gods[0].pos = from + Vec3::X * (k as f32 / 60.0 * 4.5);
+                game.t += 1.0 / 60.0;
+                let ev = if k == n / 2 { events.clone() } else { Vec::new() };
+                vfx.update(1.0 / 60.0, &ev, game);
+                renderer.clear_queues();
+                scene.draw(renderer, game, vfx, cam(Vec3::ZERO + Vec3::new(0.0, 30.0, 0.0), Vec3::ZERO, 1.0));
+            }
+        };
+        if let Some(p) = find(&vfx, true) {
+            walk(&mut renderer, &mut game, &mut vfx, p, 3.0, Vec::new());
+            let at = game.gods[0].pos;
+            shoot(&mut renderer, &game, &mut vfx, "sky_snow_deep.png", cam(at + Vec3::new(-5.5, 3.2, 4.0), at + Vec3::new(-2.5, 0.2, 0.0), 0.9))?;
+        }
+        if let Some(p) = find(&vfx, false) {
+            walk(&mut renderer, &mut game, &mut vfx, p, 3.0, Vec::new());
+            let at = game.gods[0].pos;
+            shoot(&mut renderer, &game, &mut vfx, "sky_snow_thin.png", cam(at + Vec3::new(-5.5, 3.2, 4.0), at + Vec3::new(-2.5, 0.2, 0.0), 0.9))?;
+        }
+        if let Some(p) = find(&vfx, true) {
+            let blast = p + Vec3::new(5.0, 0.0, 0.0);
+            let ev = vec![crate::sim::Event::Explosion { pos: blast, radius: 4.0, color: [0.8, 0.8, 0.9] }];
+            walk(&mut renderer, &mut game, &mut vfx, p, 1.4, ev);
+            shoot(&mut renderer, &game, &mut vfx, "sky_snow_blast.png", cam(blast + Vec3::new(-3.0, 15.0, 9.0), blast, 1.0))?;
+        }
+        game.gods[0].pos = keep.0;
+        game.gods[0].yaw = keep.1;
+        game.gods[0].move_dir = keep.2;
+    }
     // a glade with its larches
     shoot(&mut renderer, &game, &mut vfx, "sky_glade.png", cam(Vec3::new(-80.0, 8.0, -120.0), Vec3::new(-104.0, 3.0, -96.0), 1.0))?;
     // Cometail, close, on the well island's rim

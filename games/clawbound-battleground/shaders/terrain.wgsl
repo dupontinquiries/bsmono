@@ -41,6 +41,42 @@ struct Lights {
 };
 @group(1) @binding(0) var<uniform> lights: Lights;
 
+// Ultra's snowpack (snowpack.rs): the pack's depth over the whole map, and
+// the marks -- the share pushed aside by paws, trenches, craters -- in a
+// window round the player. `pack.w` is 0 when there is no snow to draw.
+@group(1) @binding(1) var snow_pack: texture_2d<f32>;
+@group(1) @binding(2) var snow_marks: texture_2d<f32>;
+@group(1) @binding(3) var snow_samp: sampler;
+struct SnowParams {
+    pack: vec4<f32>,   // origin x, z, span, on
+    marks: vec4<f32>,  // origin x, z, span, depth scale of the pack texture
+};
+@group(1) @binding(4) var<uniform> snowp: SnowParams;
+
+fn snow_depth(xz: vec2<f32>) -> f32 {
+    if (snowp.pack.w < 0.5) {
+        return 0.0;
+    }
+    let uv = (xz - snowp.pack.xy) / snowp.pack.z;
+    return textureSampleLevel(snow_pack, snow_samp, uv, 0.0).r * snowp.marks.w;
+}
+
+fn snow_press(xz: vec2<f32>) -> f32 {
+    if (snowp.pack.w < 0.5) {
+        return 0.0;
+    }
+    let uv = (xz - snowp.marks.xy) / snowp.marks.z;
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
+        return 0.0;
+    }
+    return textureSampleLevel(snow_marks, snow_samp, uv, 0.0).r;
+}
+
+// Loose snow standing here: the pack less what has been pushed aside.
+fn snow_surface(xz: vec2<f32>) -> f32 {
+    return snow_depth(xz) * (1.0 - snow_press(xz));
+}
+
 fn sphere_soft_shadow(ro: vec3<f32>, rd: vec3<f32>, sph: vec4<f32>, k: f32, t_max: f32) -> f32 {
     let oc = ro - sph.xyz;
     let b = dot(oc, rd);
@@ -181,9 +217,10 @@ fn tri_detail(w: vec3<f32>, n: vec3<f32>, m: f32, dist: f32) -> vec4<f32> {
 @vertex
 fn vs_main(in: VSIn) -> VSOut {
     var out: VSOut;
-    let w = vec4<f32>(in.pos, 1.0);
+    // the snowpack lifts the ground it lies on
+    let w = vec4<f32>(in.pos + vec3(0.0, snow_surface(in.pos.xz), 0.0), 1.0);
     out.clip = frame.view_proj * w;
-    out.world = in.pos;
+    out.world = w.xyz;
     out.normal = in.normal;
     out.color = in.color;
     out.shadow_pos = frame.light_view_proj * w;
@@ -359,6 +396,20 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let pud = water_fill(h_wet, wet, n0.y);
     var N = normalize(in.normal + det.yzw);
     N = normalize(mix(N, vec3(0.0, 1.0, 0.0), pud * 0.9));
+    // The snowpack: its surface's own normal, from the fine marks, so a
+    // paw print or a trench is a dent the light falls into. `lying` is
+    // how much snow is here at all; `loose` how much is still standing.
+    let sd = snow_depth(in.world.xz);
+    let spress = snow_press(in.world.xz);
+    let lying = smoothstep(0.02, 0.08, sd);
+    let loose = smoothstep(0.0, 0.05, sd * (1.0 - spress));
+    if (lying > 0.0) {
+        let e = 0.1;
+        let hx = snow_surface(in.world.xz + vec2(e, 0.0)) - snow_surface(in.world.xz - vec2(e, 0.0));
+        let hz = snow_surface(in.world.xz + vec2(0.0, e)) - snow_surface(in.world.xz - vec2(0.0, e));
+        let ns = normalize(vec3(-hx, 2.0 * e, -hz));
+        N = normalize(mix(N, ns, lying));
+    }
     let sun = normalize(frame.sun_dir.xyz);
     let ndl = max(dot(N, sun), 0.0);
 
@@ -401,11 +452,22 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     albedo = albedo * mix(vec3(1.05, 1.0, 0.90), vec3(0.93, 1.0, 1.04), broad);
     albedo = albedo * (1.0 - 0.45 * broken.y) * (1.0 - 0.9 * broken.x);
     // snow cover settles on up-facing ground, patchy by the same noise as the puddles
-    let snow = frame.weather.y;
+    // (not where the snowpack draws the snow itself)
+    let snow = frame.weather.y * (1.0 - step(0.5, snowp.pack.w));
     let snow_cov = snow * smoothstep(0.35, 0.9, N.y) * (0.6 + 0.4 * (1.0 - pud));
     albedo = mix(albedo, vec3(0.88, 0.92, 0.98), snow_cov * 0.85);
+    // the snowpack: fresh snow white; where it has been pushed aside,
+    // packed snow, bluer and a little darker (the floor of a print or a
+    // trench, cold in its own shade); a glitter of crystals on the loose
+    // The floor of a print: packed snow if the snow was deep enough to
+    // pack, the ground itself where a paw brushed thin powder aside.
+    let floor_col = mix(albedo * vec3(0.62, 0.70, 0.88), vec3(0.66, 0.76, 0.95), smoothstep(0.15, 0.35, sd));
+    albedo = mix(albedo, mix(floor_col, vec3(0.93, 0.95, 1.0), loose), lying);
+    // a glitter of crystals, fine and sparse, near the camera only
+    let glit = step(0.996, hash21(floor(in.world.xz * 40.0) + floor(frame.params.x * 0.7))) * loose * (1.0 - smoothstep(3.0, 16.0, cam_d));
     var lit = albedo * (sun_col * mix(wrap * wrap, ndl, 0.7) * shadow + hemi * 0.9 + sky * 0.2 * (1.0 - shadow));
     lit = lit + albedo * point_lights(in.world, N);
+    lit = lit + vec3(1.4, 1.5, 1.7) * glit * (0.4 + shadow * 0.6);
     let V = normalize(frame.cam_pos.xyz - in.world);
     let Hv = normalize(V + sun);
     let fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
