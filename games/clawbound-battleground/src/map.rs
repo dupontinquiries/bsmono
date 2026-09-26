@@ -81,6 +81,16 @@ impl MapId {
             MapId::Sky => (12, 4),
         }
     }
+    /// Towers and Elders are this much tougher than `TOWER_HP`/`TITAN_HP`.
+    /// The sky map's waves are four times the jungle's (sixteen a side):
+    /// at x1 a broken lane let one wave kill the Elder, and AI-only matches
+    /// ended at three minutes.
+    pub fn structure_hp_mul(self) -> f32 {
+        match self {
+            MapId::Jungle | MapId::Pass => 1.0,
+            MapId::Sky => 3.0,
+        }
+    }
     /// A team's Elder is shielded while it has at least this many towers
     /// standing: all but three of six on the three-lane maps, all but two
     /// of four on the sky.
@@ -253,6 +263,27 @@ mod tests {
         assert_eq!(MapId::from_key(" PASS "), Some(MapId::Pass));
         assert_eq!(MapId::from_key("moon"), None);
         assert_eq!(active(), MapId::Jungle);
+    }
+
+    /// The sky map: two lanes, four towers a side that take three times the
+    /// beating, an Elder that opens when two fall, and waves of sixteen.
+    #[test]
+    fn the_sky_map_has_its_own_rules() {
+        use crate::consts::{Lane, TITAN_HP, TOWER_HP};
+        with(MapId::Sky, || {
+            let g = crate::sim::Game::new_teams(&[0], &[1]);
+            assert_eq!(lanes(), &[Lane::Top, Lane::Bot]);
+            assert_eq!(g.towers.len(), 8);
+            assert_eq!(g.tower_alive, [4, 4]);
+            assert!(g.towers.iter().all(|t| (t.max_hp - TOWER_HP * 3.0).abs() < 1e-3));
+            assert!((g.titans[0].hp - TITAN_HP * 3.0).abs() < 1e-3 && (g.titan_max_hp() - TITAN_HP * 3.0).abs() < 1e-3);
+            let (m, c) = MapId::Sky.wave(0);
+            assert_eq!(m + c, 16, "sixteen a side: thirty-two in a lane");
+            assert!(g.titan_shielded(crate::consts::Team::Blue));
+        });
+        let g = crate::sim::Game::new_teams(&[0], &[1]);
+        assert_eq!((g.towers.len(), g.tower_alive), (12, [6, 6]), "the jungle is unchanged");
+        assert!((g.titans[0].hp - crate::consts::TITAN_HP).abs() < 1e-3);
     }
 
     #[test]

@@ -517,8 +517,8 @@ impl Game {
                         lane,
                         inner,
                         pos: tower_pos(lane, team, inner),
-                        hp: TOWER_HP,
-                        max_hp: TOWER_HP,
+                        hp: TOWER_HP * crate::map::active().structure_hp_mul(),
+                        max_hp: TOWER_HP * crate::map::active().structure_hp_mul(),
                         atk_timer: 0.0,
                         ramp: 0,
                         last_target: None,
@@ -530,8 +530,8 @@ impl Game {
         }
 
         let titans = [
-            Titan { team: Team::Blue, pos: Team::Blue.titan_pos(), hp: TITAN_HP, atk_timer: 0.0, atk_anim: 0.0 },
-            Titan { team: Team::Red, pos: Team::Red.titan_pos(), hp: TITAN_HP, atk_timer: 0.0, atk_anim: 0.0 },
+            Titan { team: Team::Blue, pos: Team::Blue.titan_pos(), hp: TITAN_HP * crate::map::active().structure_hp_mul(), atk_timer: 0.0, atk_anim: 0.0 },
+            Titan { team: Team::Red, pos: Team::Red.titan_pos(), hp: TITAN_HP * crate::map::active().structure_hp_mul(), atk_timer: 0.0, atk_anim: 0.0 },
         ];
 
         let wild = crate::wild::Wild::new(&mut rng);
@@ -615,6 +615,11 @@ impl Game {
     pub fn open_playbook(&mut self, rng: &mut Rng) {
         let pages = crate::playbook::draw_pair(rng);
         self.set_styles(pages, rng);
+    }
+
+    /// An Elder's full health on this map.
+    pub fn titan_max_hp(&self) -> f32 {
+        TITAN_HP * crate::map::active().structure_hp_mul()
     }
 
     pub fn def(&self, i: usize) -> &'static GodDef {
