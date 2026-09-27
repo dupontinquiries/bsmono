@@ -1429,7 +1429,7 @@ fn render(s: &mut AppState) {
     let mut again = false;
     let mut menu = false;
     let mut open_controls = false;
-    let mut panel = ui::ControlsPanel { close: false, capture: None, clear: None, scheme: None, reset: false };
+    let mut panel = ui::ControlsPanel { in_match: s.screen == Screen::Playing && s.game.is_some() && s.spectator.is_none(), leave: false, close: false, capture: None, clear: None, scheme: None, reset: false };
     let (show_fps, frame_s) = (s.cfg.settings.show_fps, s.frame_s);
     // where the camera is: bars fade with distance and behind terrain
     let cam_eye = s.renderer.camera.eye;
@@ -1483,6 +1483,19 @@ fn render(s: &mut AppState) {
     });
     if open_controls {
         s.controls_open = true;
+    }
+    if panel.leave {
+        // leave the match: the same way out as the end screen's "Main
+        // Menu", and the cursor let go
+        s.controls_open = false;
+        s.capturing = None;
+        s.ui.shop_open = false;
+        s.ui.sell_armed = None;
+        s.targeting.slot = None;
+        s.intro = None;
+        s.game = None;
+        s.screen = Screen::Menu;
+        set_locked(s, false);
     }
     if panel.close {
         s.controls_open = false;

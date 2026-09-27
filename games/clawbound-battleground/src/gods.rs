@@ -179,9 +179,15 @@ pub enum PeltKind {
     Kit,       // Sproutkit — a kitten: round head, huge eyes, a sprout on the brow
 }
 
+/// Each level's growth in base stats, as a multiple of the per-level
+/// growth written in the roster. Levels stop at 15 (they went to 20), and
+/// grow half as much again each: level 15 is 21 old levels' worth, where
+/// the old cap was 19.
+pub const LEVEL_GROWTH: f32 = 1.5;
+
 impl GodDef {
     pub fn at_level(&self, level: u32) -> (f32, f32, f32, f32, f32) {
-        let l = (level - 1) as f32;
+        let l = (level.max(1) - 1) as f32 * LEVEL_GROWTH;
         (
             self.hp + self.hp_growth * l,
             self.mana + self.mana_growth * l,

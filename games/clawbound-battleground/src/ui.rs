@@ -84,6 +84,11 @@ pub struct UiState {
     pub sell_armed: Option<usize>,
     /// On a phone the shop shows its shelves OR the build; which one.
     pub shop_phone_tab: crate::shopui::PhoneTab,
+    /// The item the shop's study pane explains: the last card pointed at.
+    pub shop_study: Option<u16>,
+    /// The level the HUD last saw, and when it last went up (the toast).
+    pub level_seen: u32,
+    pub level_toast_t: f64,
 }
 
 impl UiState {
@@ -481,31 +486,129 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
         }
     });
 
-    // ability bar bottom-center
+    // ability bar bottom-center, and the level bar over it (`ranks`)
+    let now = ctx.input(|i| i.time);
+    if g.level > ui_state.level_seen {
+        if ui_state.level_seen > 0 {
+            ui_state.level_toast_t = now;
+        }
+        ui_state.level_seen = g.level;
+    }
+    // the toast: what the last level brought, for a few seconds, over the bar
+    let toast = (now - ui_state.level_toast_t) as f32;
+    if ui_state.level_toast_t > 0.0 && toast < 4.5 {
+        let a = (1.0 - (toast - 3.5).max(0.0)).clamp(0.0, 1.0);
+        egui::Area::new(egui::Id::new("level_toast")).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -130.0]).interactable(false).show(ctx, |ui| {
+            // a fixed width, so the anchor centres it from the first frame
+            ui.set_width(460.0);
+            egui::Frame::none().fill(Color32::from_black_alpha((150.0 * a) as u8)).rounding(10.0).inner_margin(8.0).show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new(format!("LEVEL {}", g.level)).size(24.0).color(GOLD.gamma_multiply(a)).strong());
+                    for line in crate::ranks::gains_at(&def.abilities, g.level) {
+                        ui.label(egui::RichText::new(line).size(14.0).color(Color32::from_rgb(236, 228, 206).gamma_multiply(a)));
+                    }
+                });
+            });
+        });
+    }
     egui::Area::new(egui::Id::new("abilities")).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -14.0]).show(ctx, |ui| {
+        let slot_w = 62.0;
+        let gap = ui.spacing().item_spacing.x;
+        let bar_w = slot_w * 4.0 + gap * 3.0;
+        ui.set_width(bar_w);
+        // the level bar: level, progress, and what the next one brings
+        {
+            let (r, _) = ui.allocate_exact_size(Vec2::new(bar_w, 20.0), Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(r, 6.0, Color32::from_rgb(24, 22, 30));
+            let capped = g.level >= consts::MAX_LEVEL;
+            let frac = if capped { 1.0 } else { (g.xp / consts::xp_for_level(g.level)).clamp(0.0, 1.0) };
+            // the whole track, 1 to 15: a cell per level, those reached
+            // full, the current one filled by its XP -- the way to 15 at a
+            // glance
+            let n = consts::MAX_LEVEL as f32;
+            let cw = r.width() / n;
+            for k in 0..consts::MAX_LEVEL {
+                let cell = Rect::from_min_size(Pos2::new(r.left() + cw * k as f32, r.top()), Vec2::new(cw - 1.0, r.height())).shrink2(Vec2::new(0.5, 2.0));
+                let fill = if k + 1 < g.level { 1.0 } else if k + 1 == g.level { frac } else { 0.0 };
+                // an ultimate rank's level is marked gold
+                let ult_step = crate::ranks::RANK_UP[3].contains(&(k + 1));
+                p.rect_filled(cell, 2.0, if ult_step { Color32::from_rgb(60, 50, 26) } else { Color32::from_rgb(40, 36, 52) });
+                if fill > 0.0 {
+                    let col = if ult_step { GOLD } else { Color32::from_rgb(150, 110, 220) };
+                    p.rect_filled(Rect::from_min_size(cell.min, Vec2::new(cell.width() * fill, cell.height())), 2.0, col);
+                }
+            }
+            p.rect_stroke(r, 6.0, Stroke::new(1.0, Color32::from_rgb(190, 160, 240)));
+            let next = if capped {
+                "every ability at its top".to_string()
+            } else {
+                let gains = crate::ranks::gains_at(&def.abilities, g.level + 1);
+                format!("next: {}", gains.join(", "))
+            };
+            let label = if capped {
+                format!("LV {} · {}", g.level, next)
+            } else {
+                format!("LV {} · {:.0}/{:.0} · {}", g.level, g.xp, consts::xp_for_level(g.level), next)
+            };
+            let galley = p.layout_no_wrap(label.clone(), FontId::proportional(11.0), Color32::WHITE);
+            let text = if galley.size().x > r.width() - 10.0 { format!("LV {} · {}", g.level, next) } else { label };
+            p.text(r.left_center() + Vec2::new(7.0, 1.0), Align2::LEFT_CENTER, text.clone(), FontId::proportional(11.0), Color32::from_black_alpha(220));
+            p.text(r.left_center() + Vec2::new(6.0, 0.0), Align2::LEFT_CENTER, text, FontId::proportional(11.0), Color32::WHITE);
+        }
+        ui.add_space(3.0);
         ui.horizontal(|ui| {
             for slot in 0..4u32 {
-                let ab = &def.abilities[slot as usize];
-                let cd_frac = (g.cds[slot as usize] / (ab.cooldown * (1.0 - g.cdr))).clamp(0.0, 1.0);
+                let base = &def.abilities[slot as usize];
+                let rank = crate::ranks::rank(slot, g.level);
+                let top = crate::ranks::top(base.ult);
+                // the ability at its rank: the cooldown and cost the cat pays
+                let ab = crate::ranks::ranked(*base, rank).unwrap_or(*base);
+                let cd_frac = (g.cds[slot as usize] / (ab.cooldown * (1.0 - g.cdr)).max(0.01)).clamp(0.0, 1.0);
                 let no_mana = g.mana < ab.cost;
-                let (r, _) = ui.allocate_exact_size(Vec2::new(62.0, 62.0), Sense::hover());
+                let (r, resp) = ui.allocate_exact_size(Vec2::new(slot_w, slot_w), Sense::hover());
                 let c = Color32::from_rgb((ab.color[0] * 255.0) as u8, (ab.color[1] * 255.0) as u8, (ab.color[2] * 255.0) as u8);
-                ui.painter().rect_filled(r, 8.0, c.linear_multiply(0.42));
-                // cooldown sweep from top
-                if cd_frac > 0.0 {
+                let p = ui.painter();
+                p.rect_filled(r, 8.0, c.linear_multiply(if rank == 0 { 0.15 } else { 0.42 }));
+                if rank == 0 {
+                    // locked: the level it opens at
+                    let at = crate::ranks::level_for(slot, 1).unwrap_or(1);
+                    p.text(r.center() - Vec2::new(0.0, 6.0), Align2::CENTER_CENTER, "LOCKED", FontId::proportional(10.0), Color32::from_rgb(170, 165, 160));
+                    p.text(r.center() + Vec2::new(0.0, 9.0), Align2::CENTER_CENTER, format!("LV {at}"), FontId::proportional(15.0), GOLD.linear_multiply(0.8));
+                } else if cd_frac > 0.0 {
                     let h = r.height() * cd_frac;
-                    ui.painter().rect_filled(Rect::from_min_max(r.left_top(), Pos2::new(r.right(), r.top() + h)), 8.0, Color32::from_rgba_premultiplied(8, 8, 10, 190));
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, format!("{:.1}", g.cds[slot as usize]), FontId::proportional(17.0), Color32::WHITE);
+                    p.rect_filled(Rect::from_min_max(r.left_top(), Pos2::new(r.right(), r.top() + h)), 8.0, Color32::from_rgba_premultiplied(8, 8, 10, 190));
+                    p.text(r.center(), Align2::CENTER_CENTER, format!("{:.1}", g.cds[slot as usize]), FontId::proportional(17.0), Color32::WHITE);
                 } else {
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, format!("{}", slot + 1), FontId::proportional(24.0), Color32::WHITE);
+                    p.text(r.center(), Align2::CENTER_CENTER, format!("{}", slot + 1), FontId::proportional(24.0), Color32::WHITE);
                 }
                 let border = if ab.ult { Stroke::new(3.0_f32, GOLD) } else { Stroke::new(2.0_f32, c) };
-                ui.painter().rect_stroke(r, 8.0, border);
-                if no_mana {
-                    ui.painter().rect_filled(r, 8.0, Color32::from_rgba_premultiplied(20, 20, 60, 90));
+                p.rect_stroke(r, 8.0, border);
+                if no_mana && rank > 0 {
+                    p.rect_filled(r, 8.0, Color32::from_rgba_premultiplied(20, 20, 60, 90));
                 }
-                // mana cost
-                ui.painter().text(r.left_bottom() + Vec2::new(4.0, -3.0), Align2::LEFT_BOTTOM, format!("{}", ab.cost), FontId::proportional(10.0), Color32::from_rgb(130, 170, 255));
+                if rank > 0 {
+                    p.text(r.left_bottom() + Vec2::new(4.0, -3.0), Align2::LEFT_BOTTOM, format!("{:.0}", ab.cost), FontId::proportional(10.0), Color32::from_rgb(130, 170, 255));
+                }
+                // rank pips along the top; the last one gold (mastery)
+                for k in 0..top {
+                    let x = r.center().x + (k as f32 - (top as f32 - 1.0) * 0.5) * 9.0;
+                    let at = Pos2::new(x, r.top() + 6.0);
+                    let lit = k < rank;
+                    let col = if k + 1 == top { GOLD } else { Color32::from_rgb(200, 190, 255) };
+                    if lit {
+                        p.circle_filled(at, 3.0, col);
+                    } else {
+                        p.circle_stroke(at, 2.6, Stroke::new(1.0, col.linear_multiply(0.45)));
+                    }
+                }
+                let tip = if rank == 0 {
+                    format!("{} -- unlocks at level {}\n{}", base.name, crate::ranks::level_for(slot, 1).unwrap_or(1), base.desc)
+                } else {
+                    let nxt = crate::ranks::level_for(slot, rank + 1).map_or("its top rank".to_string(), |l| format!("rank {} at level {l}", rank + 1));
+                    format!("{} -- rank {rank} of {top} ({nxt})\n{}\n{}", base.name, base.desc, crate::ranks::mastery_text(&base.arch))
+                };
+                resp.on_hover_text(tip);
             }
         });
     });
@@ -526,9 +629,15 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
                         let tier_mark = "●".repeat(item.tier as usize);
                         ui.painter().text(r.center(), Align2::CENTER_CENTER, format!("{}", item.name.chars().next().unwrap_or('?')), FontId::proportional(18.0), Color32::WHITE);
                         ui.painter().text(r.right_bottom() + Vec2::new(-2.0, -2.0), Align2::RIGHT_BOTTOM, tier_mark, FontId::proportional(7.0), GOLD);
+                        // a trophy shows what it has grown; the Ninth Life, its recharge
                         let stack_count = g.stacks.get(i).copied().unwrap_or(0.0);
-                        if stack_count > 0.0 {
-                            ui.painter().text(r.left_top() + Vec2::new(3.0, 2.0), Align2::LEFT_TOP, format!("{:.0}", stack_count), FontId::proportional(10.0), Color32::from_rgb(120, 255, 140));
+                        let grown = item.stack.map_or(0.0, |s| s.gained(stack_count));
+                        if grown > 0.0 {
+                            ui.painter().text(r.left_top() + Vec2::new(3.0, 2.0), Align2::LEFT_TOP, format!("+{grown:.0}"), FontId::proportional(10.0), Color32::from_rgb(120, 255, 140));
+                        }
+                        if matches!(item.passive, Some(items::Passive::NinthLife { .. })) && g.curio.ninth_cd > 0.0 {
+                            ui.painter().rect_filled(r, 6.0, Color32::from_black_alpha(140));
+                            ui.painter().text(r.center(), Align2::CENTER_CENTER, format!("{:.0}", g.curio.ninth_cd.ceil()), FontId::proportional(13.0), Color32::from_rgb(230, 220, 200));
                         }
                     } else {
                         ui.painter().rect_filled(r, 6.0, Color32::from_rgb(26, 25, 33));
@@ -892,11 +1001,53 @@ pub fn roster_len() -> usize {
 
 /// What the controls panel asked for this frame; app.rs applies it.
 pub struct ControlsPanel {
+    /// In: the panel is open over a match (so it offers to leave it).
+    pub in_match: bool,
+    /// Out: leave the match for the main menu (confirmed).
+    pub leave: bool,
     pub close: bool,
     pub capture: Option<crate::input::Action>,
     pub clear: Option<crate::input::Action>,
     pub scheme: Option<crate::input::Scheme>,
     pub reset: bool,
+}
+
+/// The leave-match button's two taps: the first arms it, the second leaves;
+/// "stay" (or closing the panel) disarms. Returns (armed, leave).
+pub fn leave_step(armed: bool, tapped: bool, stay: bool) -> (bool, bool) {
+    match (armed, tapped, stay) {
+        (_, _, true) => (false, false),
+        (false, true, _) => (true, false),
+        (true, true, _) => (false, true),
+        (a, false, _) => (a, false),
+    }
+}
+
+/// "Leave match", confirmed by a second tap (armed state kept in egui's
+/// memory so the panel needs no new state of its own).
+fn leave_row(ui: &mut egui::Ui, out: &mut ControlsPanel) {
+    let id = egui::Id::new("leave_armed");
+    let armed = ui.ctx().data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    let mut tapped = false;
+    let mut stay = false;
+    ui.horizontal(|ui| {
+        let (text, fill) = if armed {
+            ("LEAVE -- tap again", Color32::from_rgb(170, 60, 50))
+        } else {
+            ("LEAVE MATCH", Color32::from_rgb(70, 40, 38))
+        };
+        let b = ui.add_sized([190.0, 34.0], egui::Button::new(egui::RichText::new(text).size(15.0).color(Color32::WHITE).strong()).fill(fill));
+        tapped = b.clicked();
+        if armed {
+            stay = ui.add_sized([90.0, 34.0], egui::Button::new(egui::RichText::new("stay").size(14.0))).clicked();
+            ui.label(egui::RichText::new("back to the main menu; the match is lost to you").size(11.5).color(Color32::from_rgb(200, 150, 140)));
+        } else {
+            ui.label(egui::RichText::new("quit this match and return to the main menu").size(11.5).color(Color32::from_rgb(160, 156, 146)));
+        }
+    });
+    let (armed, leave) = leave_step(armed, tapped, stay || out.close);
+    ui.ctx().data_mut(|d| d.insert_temp(id, armed));
+    out.leave |= leave;
 }
 
 pub fn draw_controls_button(ctx: &egui::Context, open: &mut bool) {
@@ -967,12 +1118,16 @@ pub fn draw_controls(ctx: &egui::Context, cfg: &mut crate::input::Config, captur
             ui.horizontal(|ui| {
                 ui.heading(egui::RichText::new("CONTROLS & SETTINGS").size(22.0).color(GOLD));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("  ✕  ").clicked() {
+                    if ui.button("  close  ").clicked() {
                         out.close = true;
                     }
                 });
             });
             ui.add_space(6.0);
+            if out.in_match {
+                leave_row(ui, out);
+                ui.add_space(8.0);
+            }
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Scheme").size(13.0).color(Color32::from_rgb(170, 168, 158)));
                 for sc in [Scheme::Classic, Scheme::Dvorak] {
@@ -1381,4 +1536,21 @@ pub fn draw_fps(ctx: &egui::Context, fps: f32, ms: f32) {
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("fps")));
     let r = ctx.screen_rect();
     p.text(r.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, format!("{fps:.0} fps  {ms:.1} ms"), FontId::monospace(13.0), Color32::from_rgb(220, 230, 200));
+}
+
+#[cfg(test)]
+mod leave_tests {
+    use super::leave_step;
+
+    /// One tap arms, a second leaves; "stay" or closing disarms; nothing
+    /// happens without a tap.
+    #[test]
+    fn leaving_takes_two_taps_and_can_be_called_off() {
+        assert_eq!(leave_step(false, false, false), (false, false));
+        assert_eq!(leave_step(false, true, false), (true, false), "first tap arms");
+        assert_eq!(leave_step(true, false, false), (true, false), "armed waits");
+        assert_eq!(leave_step(true, true, false), (false, true), "second tap leaves");
+        assert_eq!(leave_step(true, false, true), (false, false), "stay disarms");
+        assert_eq!(leave_step(true, true, true), (false, false), "stay wins over a tap");
+    }
 }

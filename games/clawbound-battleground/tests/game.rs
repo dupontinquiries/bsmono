@@ -4,14 +4,14 @@ use clawbound::items;
 use clawbound::sim::{Game, Team};
 
 #[test]
-fn catalog_has_exactly_102_items() {
-    // 100 across the stat categories, and the two Siphon items (brawl)
+fn catalog_has_exactly_110_items() {
+    // 100 across the stat categories, the two Siphon items (brawl), 8 Curios
     let cat = items::all();
-    assert_eq!(cat.len(), 102, "item catalog must have exactly 102 items");
+    assert_eq!(cat.len(), 110, "item catalog must have exactly 110 items");
     let mut ids: Vec<u16> = cat.iter().map(|i| i.id).collect();
     ids.sort();
     ids.dedup();
-    assert_eq!(ids.len(), 102, "item ids must be unique");
+    assert_eq!(ids.len(), 110, "item ids must be unique");
     for it in cat {
         assert!(it.cost > 0.0, "item {} must cost something", it.name);
         assert!(it.tier >= 1 && it.tier <= 3);
@@ -20,7 +20,7 @@ fn catalog_has_exactly_102_items() {
 
 #[test]
 fn catalog_categories_match_user_spec() {
-    // All 8 requested categories must exist with items
+    // All 9 shelves must exist with items
     let cat = items::all();
     for c in items::CATS {
         let n = cat.iter().filter(|it| it.cat == c).count();
@@ -36,6 +36,60 @@ fn stacking_items_declare_rules() {
     for it in cat.iter().filter(|it| it.stack.is_some()) {
         let st = it.stack.unwrap();
         assert!(st.per > 0.0 && st.max > st.per, "stacking rule for {}", it.name);
+    }
+}
+
+/// The shop charges 85% of the list price, to 5 gold: the cheapest
+/// Sapling (listed at 500) is 425, and every price is a round number.
+#[test]
+fn the_shop_charges_fifteen_percent_less() {
+    assert_eq!(items::PRICE_CUT, 0.85);
+    assert_eq!(items::price(500.0), 425.0);
+    assert_eq!(items::price(3300.0), 2805.0);
+    let cleaver = items::all().iter().find(|i| i.name == "Wooden Cleaver").unwrap();
+    assert_eq!(cleaver.cost, 425.0);
+    for it in items::all() {
+        assert_eq!(it.cost % 5.0, 0.0, "{} costs {}", it.name, it.cost);
+    }
+    let dearest = items::all().iter().map(|i| i.cost).fold(0.0, f32::max);
+    assert!((2700.0..=2850.0).contains(&dearest), "dearest item {dearest}");
+}
+
+/// Every trophy's growth reaches the stat it names, up to its most.
+/// (Every one sat on the Stacking shelf, which the stat match skipped, so
+/// none ever grew anything; and the per-minute ones never counted.)
+#[test]
+fn trophies_grow_the_stat_they_name_up_to_their_most() {
+    for it in items::all().iter().filter(|i| i.stack.is_some()) {
+        let st = it.stack.unwrap();
+        let mut g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        g.gods[0].gold = 1e6;
+        assert!(g.buy_item(0, it.id));
+        let before = Game::item_stats(&g.gods[0]);
+        if st.kind == items::StackKind::Time {
+            // two intervals held
+            for _ in 0..((st.interval * 2.0 + 1.0) * 10.0) as usize {
+                g.curios_tick(0, 0.1);
+            }
+        } else {
+            g.add_stacks(0, st.kind, 2.0);
+        }
+        let grew = |a: &items::Stats, b: &items::Stats| match st.grows {
+            items::Grow::Strength => b.strength - a.strength,
+            items::Grow::Intelligence => b.intelligence - a.intelligence,
+            items::Grow::Power => b.power - a.power,
+            items::Grow::Protection => b.protection - a.protection,
+            items::Grow::Health => b.health - a.health,
+        };
+        let two = grew(&before, &Game::item_stats(&g.gods[0]));
+        assert!((two - 2.0 * st.per).abs() < 1e-3, "{}: two stacks grew {two}, not {}", it.name, 2.0 * st.per);
+        // and it reached the cat: recalc ran
+        if st.grows == items::Grow::Health {
+            assert!(g.gods[0].max_hp > 0.0);
+        }
+        g.add_stacks(0, st.kind, 10_000.0);
+        let full = grew(&before, &Game::item_stats(&g.gods[0]));
+        assert!((full - st.max).abs() < 1e-3, "{}: full at {full}, not {}", it.name, st.max);
     }
 }
 
@@ -124,6 +178,20 @@ fn damage_mitigation_order_pen_then_flat() {
     let expected = hp0 - 100.0 * 100.0 / (100.0 + prot * 0.5);
     game.deal_damage(clawbound::sim::TargetRef::God(enemy), 100.0, false, None, 0.5, 0.0);
     assert!((game.gods[enemy].hp - expected).abs() < 0.01);
+}
+
+/// The buffs asked for: towers +25% health and damage, Elders +75%, and
+/// the game builds them at those numbers.
+#[test]
+fn towers_and_elders_are_buffed() {
+    assert_eq!(TOWER_HP, 1450.0 * 1.25);
+    assert_eq!(TOWER_DMG, 168.0 * 1.25);
+    assert_eq!(TITAN_HP, 4600.0 * 1.75);
+    assert_eq!(TITAN_DMG, 260.0 * 1.75);
+    let g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    let mul = clawbound::map::active().structure_hp_mul();
+    assert!(g.towers.iter().all(|t| (t.max_hp - 1812.5 * mul).abs() < 1e-2));
+    assert!((g.titans[0].hp - 8050.0 * mul).abs() < 1e-2);
 }
 
 #[test]
@@ -686,6 +754,7 @@ fn firing_range_every_ability_goes_where_it_is_aimed_and_turns_the_cat() {
     for (god, def) in ROSTER.iter().enumerate() {
         for slot in 0..4u32 {
             let mut game = Game::new_teams(&[god as u32], &[(god as u32 + 1) % 13]);
+            game.set_level(0, 5); // every ability unlocked (`ranks`)
             game.gods[1].respawn_t = 999.0; // an empty range
             game.gods[0].ai = None;
             let start = Vec3::new(0.0, 0.0, -40.0);
@@ -1791,6 +1860,7 @@ mod cometail {
     fn the_falling_star_vaults_high_and_lands_where_aimed_in_a_blast() {
         let c = cometail();
         let mut g = Game::new_teams(&[c], &[0, 1]);
+        g.set_level(0, 5); // the kit unlocked (`ranks`)
         quiet(&mut g);
         g.gods[0].pos = Vec3::ZERO;
         g.gods[0].mana = 9999.0;
@@ -1817,6 +1887,7 @@ mod cometail {
     fn a_dash_hurts_what_it_passes_through() {
         let c = cometail();
         let mut g = Game::new_teams(&[c], &[0]);
+        g.set_level(0, 5); // the kit unlocked (`ranks`)
         quiet(&mut g);
         g.gods[0].pos = Vec3::ZERO;
         g.gods[0].mana = 9999.0;
@@ -2287,6 +2358,8 @@ mod sproutkit {
     fn game(red: &[u32]) -> Game {
         let mut g = Game::new_teams(&[kit()], red);
         quiet(&mut g);
+        // every ability unlocked (`ranks`); the ultimate at rank 1
+        g.set_level(0, 5);
         g.gods[0].pos = Vec3::ZERO;
         g.gods[0].mana = 9999.0;
         g
@@ -2427,6 +2500,7 @@ mod sproutkit {
     fn minions_dance_too() {
         let mut g = Game::new_teams(&[kit()], &[0]);
         quiet(&mut g);
+        g.set_level(0, 5); // the ultimate unlocked (`ranks`)
         g.gods[1].pos = Vec3::new(80.0, 0.0, 80.0);
         g.next_wave_t = 0.0;
         g.tick(1.0 / 60.0);
@@ -2480,6 +2554,10 @@ mod sproutkit {
         for c in g.gods.iter_mut() {
             c.ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
         }
+        // the kit unlocked from the start (`ranks`): this is about using it
+        for i in 0..g.gods.len() {
+            g.set_level(i, 5);
+        }
         let mut used = [false; 4];
         for _ in 0..(240 * 30) {
             g.tick(1.0 / 30.0);
@@ -2491,4 +2569,52 @@ mod sproutkit {
         }
         assert!(used[0] && used[1] && used[3], "litter, giggles and the party in four minutes: {used:?}");
     }
+}
+
+/// Levels 1-15 (`ranks`): a fresh cat casts its first ability only; the
+/// ultimate opens at 5; the level carries through to stronger stats, and a
+/// ranked ability hits harder than rank 1.
+#[test]
+fn levels_unlock_the_kit_and_rank_it_up() {
+    use clawbound::gods::ROSTER;
+    use glam::Vec3;
+    assert_eq!(MAX_LEVEL, 15);
+    let mut g = Game::new_teams(&[0], &[1]);
+    g.gods[1].respawn_t = 999.0;
+    for c in g.gods.iter_mut() {
+        c.ai = None;
+        c.mana = 1e5;
+    }
+    assert_eq!(g.gods[0].level, 1);
+    let fired = |g: &mut Game, slot: u32| {
+        let p = g.gods[0].pos;
+        g.cast_queue.push((0, slot, p + Vec3::Z * 6.0));
+        let mut f = false;
+        for _ in 0..90 {
+            g.tick(1.0 / 60.0);
+            for e in g.events.drain(..) {
+                if let clawbound::sim::Event::Cast { god: 0, slot: s, .. } = e {
+                    f |= s == slot;
+                }
+            }
+        }
+        g.gods[0].cds = [0.0; 4];
+        g.gods[0].mana = 1e5;
+        f
+    };
+    assert!(fired(&mut g, 0), "level 1: the first ability");
+    assert!(!fired(&mut g, 1) && !fired(&mut g, 3), "level 1: the rest locked");
+    g.set_level(0, 4);
+    assert!(fired(&mut g, 1) && fired(&mut g, 2) && !fired(&mut g, 3), "level 4: all but the ultimate");
+    g.set_level(0, 5);
+    assert!(fired(&mut g, 3), "level 5: the ultimate");
+    // stats climb with the level, at LEVEL_GROWTH a level
+    let def = &ROSTER[0];
+    g.set_level(0, 15);
+    let want = def.hp + def.hp_growth * 14.0 * clawbound::gods::LEVEL_GROWTH;
+    assert!((g.gods[0].max_hp - want).abs() < 1e-2, "{} vs {want}", g.gods[0].max_hp);
+    // ranked: the cooldown the cat pays is shorter at 15 than at 1
+    let one = clawbound::ranks::ranked(def.abilities[0], 1).unwrap();
+    let top = g.ability(0, 0).unwrap();
+    assert!(top.cooldown < one.cooldown);
 }

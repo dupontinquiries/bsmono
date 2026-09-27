@@ -2364,6 +2364,7 @@ mod lightning_tests {
     #[test]
     fn storms_strike_with_lightning() {
         let mut game = Game::new_teams(&[11], &[0]); // Stillsmoke
+        game.set_level(0, 5); // every ability unlocked (`ranks`)
         game.gods[1].respawn_t = 999.0;
         game.gods[0].ai = None;
         game.gods[0].mana = 10_000.0;

@@ -59,6 +59,12 @@ impl Game {
     /// and either fires it (no wind-up) or starts the wind-up; `cast` fires
     /// it when the wind-up ends (`tick_casting`). Cooldown and mana are spent
     /// when it FIRES, so an interrupted cast costs nothing.
+    /// Slot `slot` of cat `gi` as its level ranks it; None while locked.
+    pub fn ability(&self, gi: usize, slot: u32) -> Option<crate::gods::AbilityDef> {
+        let ab = self.def(gi).abilities[slot.min(3) as usize];
+        crate::ranks::ranked(ab, crate::ranks::rank(slot, self.gods[gi].level))
+    }
+
     pub fn begin_cast(&mut self, gi: usize, slot: u32, aim: Vec3) {
         if self.over.is_some() || self.gods[gi].respawn_t > 0.0 || self.gods[gi].casting.is_some() || self.gods[gi].skyfall.is_some() {
             return;
@@ -67,7 +73,8 @@ impl Game {
         if !self.kit_free(gi) {
             return;
         }
-        let ab = self.def(gi).abilities[slot as usize];
+        // locked until its level (`ranks`)
+        let Some(ab) = self.ability(gi, slot) else { return };
         let g = &self.gods[gi];
         if g.cds[slot as usize] > 0.0 || g.mana < ab.cost {
             return;
@@ -116,8 +123,8 @@ impl Game {
         if self.over.is_some() || self.gods[gi].respawn_t > 0.0 {
             return;
         }
-        let def = self.def(gi);
-        let ab = def.abilities[slot as usize];
+        // the ability at the rank the cat's level gives it (`ranks`)
+        let Some(ab) = self.ability(gi, slot) else { return };
         let g = &self.gods[gi];
         if g.cds[slot as usize] > 0.0 || g.mana < ab.cost {
             return;
@@ -178,6 +185,7 @@ impl Game {
                     pen_pct,
                     pen_flat,
                     color: ab.color,
+                    auto: false,
                 });
                 self.events.push(Event::BeamFx { from: pos_y, dir, length: 1.2, width: 0.4, color: ab.color, dur: 0.12 });
             }
@@ -200,6 +208,7 @@ impl Game {
                         pen_pct,
                         pen_flat,
                         color: ab.color,
+                        auto: false,
                     });
                 }
             }
@@ -218,6 +227,7 @@ impl Game {
                     pen_pct,
                     pen_flat,
                     color: ab.color,
+                    auto: false,
                 });
                 self.events.push(Event::RingTelegraph { pos: clamped, radius, delay: 0.75, color: ab.color });
             }
