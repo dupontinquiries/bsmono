@@ -90,7 +90,7 @@ fn vertex_inputs(vert_src: &str) -> Vec<(u32, String)> {
 ///
 /// `expected_bindings`: the set 0 descriptor bindings the renderer declares; a
 /// shader using a binding outside this set is a crash waiting to happen.
-const EXPECTED_BINDINGS: &[u32] = &[0, 1, 2, 3];
+const EXPECTED_BINDINGS: &[u32] = &[0, 1, 2, 3, 4]; // 4: light volume (render::light_volume_gpu)
 /// `expected_vertex_inputs`: the packed vertex attributes. The alpha-id texturing
 /// path deliberately does NOT add an attribute, so this stays at two.
 const EXPECTED_VERTEX_INPUTS: &[(u32, &str)] = &[(0, "in_pos_packed"), (1, "in_color_unorm")]; // r349: R32_UINT manual unpack

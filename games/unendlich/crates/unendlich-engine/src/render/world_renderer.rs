@@ -196,6 +196,9 @@ struct CameraUbo {
     /// x = live disturber count (0..=8); count 0 ⇒ chunk.vert falls back to
     /// the r591 camera-only disturbance so the F3 slider still demos alone.
     disturber_meta: [f32; 4],
+    /// Light volume (binding 4): xyz = world position of the window's lowest
+    /// corner, w = enable. Appended last; w = 0 renders exactly as before.
+    light_volume: [f32; 4],
 }
 
 /// Per-frame atmosphere/climate state, sampled by the bin and passed to
@@ -823,6 +826,10 @@ pub struct WorldRenderer {
     /// color pass; sampled by the chunk fragment shader to provide
     /// shadowed in-scattered fog with structure.
     froxel: FroxelVolume,
+    light_volume: crate::render::light_volume_gpu::LightVolumeGpu,
+    /// UBO `light_volume`: window corner + enable (see `set_light_volume`).
+    light_volume_params: [f32; 4],
+    light_debug: u8,
     /// Compute pipeline that fills the froxel volume each frame.
     froxel_fill_pipeline: FroxelFillPipeline,
     /// One descriptor set per frame-in-flight for the compute pass.
@@ -1343,7 +1350,8 @@ impl WorldRenderer {
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                    descriptor_count: (MAX_FRAMES_IN_FLIGHT * 3) as u32,
+                    // shadow + froxel + light volume (graphics), shadow (compute)
+                    descriptor_count: (MAX_FRAMES_IN_FLIGHT * 4) as u32,
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::STORAGE_IMAGE,
@@ -1394,6 +1402,19 @@ impl WorldRenderer {
         // before the main color pass to write per-froxel scattering
         // into the volume's storage image.
         let froxel_fill_pipeline = FroxelFillPipeline::new(&ctx.device)?;
+
+        // Light volume (binding 4): sky + block light around the player,
+        // fed by world::light_volume::LightVolumeSys through queue_light_uploads.
+        let light_volume = crate::render::light_volume_gpu::LightVolumeGpu::new(
+            &ctx.instance, &ctx.device, ctx.physical_device, command_pool, ctx.graphics_queue,
+            [
+                crate::world::light_volume::SIZE[0] as u32,
+                crate::world::light_volume::SIZE[1] as u32,
+                crate::world::light_volume::SIZE[2] as u32,
+            ],
+            MAX_FRAMES_IN_FLIGHT,
+            8,
+        )?;
 
         // Allocate compute descriptor sets — one per frame-in-flight.
         let compute_dsl = froxel_fill_pipeline.descriptor_set_layout;
@@ -1448,6 +1469,11 @@ impl WorldRenderer {
                 .sampler(froxel.sampler)
                 .image_layout(vk::ImageLayout::GENERAL);
             let froxel_image_infos = [*froxel_image_info];
+            let light_image_info = vk::DescriptorImageInfo::builder()
+                .image_view(light_volume.view)
+                .sampler(light_volume.sampler)
+                .image_layout(vk::ImageLayout::GENERAL);
+            let light_image_infos = [*light_image_info];
 
             let writes = [
                 vk::WriteDescriptorSet::builder()
@@ -1467,6 +1493,12 @@ impl WorldRenderer {
                     .dst_binding(2)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&froxel_image_infos)
+                    .build(),
+                vk::WriteDescriptorSet::builder()
+                    .dst_set(descriptor_sets[i])
+                    .dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&light_image_infos)
                     .build(),
             ];
             unsafe { ctx.device.update_descriptor_sets(&writes, &[]); }
@@ -1940,6 +1972,9 @@ impl WorldRenderer {
             shadow,
             shadow_pipeline,
             froxel,
+            light_volume,
+            light_volume_params: [0.0; 4],
+            light_debug: 0,
             froxel_fill_pipeline,
             froxel_compute_descriptor_sets,
             last_cascade: None,
@@ -3572,6 +3607,34 @@ impl WorldRenderer {
     /// r427: set the underwater screen-FX state for the next frame (submerged 0/1, time s).
     pub fn set_underwater(&mut self, submerged: f32, time: f32) {
         self.fx_params = [submerged, time, 0.0, 0.0];
+    }
+
+    /// Queue light boxes from `world::light_volume::LightVolumeSys::tick`.
+    pub fn queue_light_uploads(&mut self, ups: Vec<crate::world::light_volume::Upload>) {
+        self.light_volume.queue(ups);
+    }
+
+    /// Point the shader at the light window (its lowest corner in blocks) and
+    /// turn the light volume on or off. Off renders exactly as before.
+    pub fn set_light_volume(&mut self, origin: [i32; 3], enable: bool) {
+        let w = if !enable { 0.0 } else { 1.0 + self.light_debug as u8 as f32 };
+        self.light_volume_params = [origin[0] as f32, origin[1] as f32, origin[2] as f32, w];
+    }
+
+    /// Show the light inputs instead of the scene (UNENDLICH_LIGHT_DEBUG=1).
+    pub fn set_light_debug(&mut self, mode: u8) {
+        self.light_debug = mode;
+    }
+
+    /// The chunk whose light was last copied into the box at `texel`, and a
+    /// hash of the copied data (trace line; compare `LightVolumeSys::lit_hash`).
+    pub fn light_box_owner(&self, texel: [u32; 3]) -> Option<([i32; 3], u64)> {
+        self.light_volume.owners.get(&texel).copied()
+    }
+
+    /// (boxes waiting, boxes copied so far) for the trace line.
+    pub fn light_upload_stats(&self) -> (usize, u64) {
+        (self.light_volume.pending(), self.light_volume.uploaded)
     }
 
     /// r595: this frame's foliage disturbers (nearest-first from
@@ -6323,6 +6386,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             water_depth_grid: *self.water_depth_grid,
             disturbers: self.foliage_disturbers,
             disturber_meta: [self.foliage_disturber_count as f32, 0.0, 0.0, 0.0],
+            light_volume: self.light_volume_params,
         };
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -6358,6 +6422,9 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             // v0.21.0: GPU timestamp — frame start. Resets the
             // pool slice for this frame and writes Marker::FrameStart.
             self.gpu_timer.begin_frame(cmd, frame_idx as u32);
+
+            // Light volume copies (world::light_volume), before any pass reads it.
+            self.light_volume.record(&ctx.device, cmd, frame_idx);
 
             // c.13-instrumentation: also reset the shadow bucket
             // timer's slice if active. Must happen before any bucket
@@ -7619,6 +7686,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             self.shadow.destroy(&ctx.device);
             self.froxel_fill_pipeline.destroy(&ctx.device);
             self.froxel.destroy(&ctx.device);
+            self.light_volume.destroy(&ctx.device);
             self.depth.destroy(&ctx.device);
             self.swapchain.destroy(ctx);
             ctx.device.destroy_render_pass(self.render_pass, None);

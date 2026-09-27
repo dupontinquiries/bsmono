@@ -236,6 +236,14 @@ impl ChunkPipeline {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::VERTEX)
                 .build(),
+            // binding 4 — combined image sampler (3D light volume,
+            //             render::light_volume_gpu). Fragment-only.
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
         ];
         let dsl_info = vk::DescriptorSetLayoutCreateInfo::builder()
             .bindings(&dsl_bindings);

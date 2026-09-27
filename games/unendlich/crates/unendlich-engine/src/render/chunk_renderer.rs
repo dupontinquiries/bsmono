@@ -131,6 +131,7 @@ pub struct ChunkRenderer {
     /// fallback path runs (per-fragment march) — same visual behavior
     /// as in the world bin.
     froxel: FroxelVolume,
+    light_volume: crate::render::light_volume_gpu::LightVolumeGpu,
 
     /// v0.24.20-vertex-pack: minimal chunks-metadata SSBO with exactly
     /// one entry. The vertex shader reads `chunks[gl_InstanceIndex]`
@@ -205,7 +206,8 @@ impl ChunkRenderer {
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                    descriptor_count: (MAX_FRAMES_IN_FLIGHT * 2) as u32,
+                    // shadow + froxel + light-volume placeholder
+                    descriptor_count: (MAX_FRAMES_IN_FLIGHT * 3) as u32,
                 },
                 vk::DescriptorPoolSize {
                     // v0.24.20-vertex-pack: binding 3 = chunks SSBO.
@@ -247,6 +249,13 @@ impl ChunkRenderer {
         // fragment shader's fallback (per-fragment march) runs.
         let froxel = FroxelVolume::new(&ctx.instance, &ctx.device, ctx.physical_device)?;
         froxel.clear_to_sentinel(&ctx.device, command_pool, ctx.graphics_queue)?;
+        // Placeholder light volume for binding 4: one texel of open sky. The
+        // UBO here stops short of `light_volume`, so the shader's enable flag
+        // is not set by this renderer; the placeholder keeps the binding valid.
+        let light_volume = crate::render::light_volume_gpu::LightVolumeGpu::new(
+            &ctx.instance, &ctx.device, ctx.physical_device, command_pool, ctx.graphics_queue,
+            [1, 1, 1], 1, 0,
+        )?;
 
         // v0.24.20-vertex-pack: tiny chunks-metadata SSBO with exactly
         // one entry (sizeof(ChunkDraw) = 64 bytes). The single-chunk
@@ -302,6 +311,11 @@ impl ChunkRenderer {
                 .sampler(froxel.sampler)
                 .image_layout(vk::ImageLayout::GENERAL);
             let froxel_image_infos = [*froxel_image_info];
+            let light_image_info = vk::DescriptorImageInfo::builder()
+                .image_view(light_volume.view)
+                .sampler(light_volume.sampler)
+                .image_layout(vk::ImageLayout::GENERAL);
+            let light_image_infos = [*light_image_info];
 
             // v0.24.20-vertex-pack: binding 3 (chunks SSBO). The buffer
             // was allocated above; here we just describe it for the
@@ -341,6 +355,12 @@ impl ChunkRenderer {
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(&chunks_buffer_infos)
                     .build(),
+                vk::WriteDescriptorSet::builder()
+                    .dst_set(descriptor_sets[i])
+                    .dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&light_image_infos)
+                    .build(),
             ];
             unsafe { ctx.device.update_descriptor_sets(&writes, &[]); }
 
@@ -360,6 +380,7 @@ impl ChunkRenderer {
             start_time: Instant::now(),
             shadow,
             froxel,
+            light_volume,
             chunks_buffer, chunks_memory, chunks_ptr,
             mesh: None,
         })
@@ -705,6 +726,7 @@ impl ChunkRenderer {
             self.pipeline.destroy(&ctx.device);
             self.shadow.destroy(&ctx.device);
             self.froxel.destroy(&ctx.device);
+            self.light_volume.destroy(&ctx.device);
             self.depth.destroy(&ctx.device);
             self.swapchain.destroy(ctx);
             ctx.device.destroy_render_pass(self.render_pass, None);
