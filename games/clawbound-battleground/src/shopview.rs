@@ -289,6 +289,7 @@ pub fn explain(game: &Game, player: usize, item: &Item) -> Vec<Part> {
         (crate::gods::Role::Guardian, "Guardians"),
         (crate::gods::Role::Mage, "Mages"),
         (crate::gods::Role::Hunter, "Hunters"),
+        (crate::gods::Role::Sentinel, "Sentinels"),
     ]
     .iter()
     .filter(|(r, _)| items::role_build_order(*r)[..2].contains(&item.cat))

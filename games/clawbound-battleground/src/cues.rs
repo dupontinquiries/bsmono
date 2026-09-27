@@ -66,6 +66,13 @@ pub fn cues_for(ev: &Event, game: &Game) -> Vec<Cue> {
             let a = ancestor_key(game, *god);
             let arch = archetype_key(&game.def(*god).abilities[*slot as usize].arch);
             let mut v = vec![Cue { keys: vec![format!("sfx/cast/{a}/{}", slot + 1), format!("sfx/cast/{arch}"), "sfx/cast".into()], bus: Bus::Sfx, gain: 0.9, pos: god_pos(*god), speaker: None, priority: 5 }];
+            // An ability with no wind-up never sends a CastStart, which is
+            // where the line is spoken: speak it here instead. (Every
+            // Blink, Buff and Shield was silent -- Brasshowl's "Sit by the
+            // fire." among them -- and every Sentinel coat would be.)
+            if crate::abilities::cast_timing(&game.def(*god).abilities[*slot as usize]).0 <= 0.0 {
+                v.push(Cue { keys: vec![format!("voice/{a}/cast{}", slot + 1), format!("voice/{a}/cast")], bus: Bus::Voice, gain: 1.0, pos: god_pos(*god), speaker: Some(*god), priority: 6 });
+            }
             if let Some(at) = god_pos(*god) {
                 // the ring turned to a new angle each cast (from the clock:
                 // replays agree), so a swarm -- Sproutkit's babies,
@@ -114,6 +121,8 @@ pub fn cues_for(ev: &Event, game: &Game) -> Vec<Cue> {
         Event::SwapFx { from, .. } => vec![Cue { keys: vec!["sfx/stalker/swap".into()], bus: Bus::Sfx, gain: 0.9, pos: Some(*from), speaker: None, priority: 4 }],
         // a shadow torn out of Brasshowl's light: the air closing on it
         Event::ShadowDriven { pos } => vec![Cue { keys: vec!["sfx/stalker/swap".into()], bus: Bus::Sfx, gain: 0.8, pos: Some(*pos), speaker: None, priority: 3 }],
+        // a Sentinel (`sentinel`): the ground taking her weight
+        Event::Tread { pos } => vec![Cue { keys: vec!["sfx/sentinel/tread".into()], bus: Bus::Sfx, gain: 0.85, pos: Some(*pos), speaker: None, priority: 2 }],
         Event::Heartbeat { god, fear } => vec![Cue { keys: vec!["sfx/stalker/heart".into()], bus: Bus::Sfx, gain: 0.45 + 0.55 * fear, pos: god_pos(*god), speaker: None, priority: 4 }],
         _ => Vec::new(),
     }
@@ -204,6 +213,25 @@ mod tests {
         let c = cues_for(&Event::Cast { god: 0, slot: 0, aim: Vec3::ZERO }, &g);
         assert_eq!(c[0].keys[0], format!("sfx/cast/{a}/1"));
         assert!(c[0].keys[1].starts_with("sfx/cast/") && c[0].keys[2] == "sfx/cast");
+    }
+
+    /// Every cast is spoken exactly once: an ability with a wind-up on its
+    /// CastStart, one without (a shield, a coat) on its Cast. Brasshowl's
+    /// Watchfire (a Shield, instant) was never heard.
+    #[test]
+    fn every_cast_is_spoken_once() {
+        let g = Game::new_teams(&[16], &[0]);
+        let voiced = |c: &[Cue]| c.iter().filter(|c| c.bus == Bus::Voice).count();
+        let brass = crate::gods::god(16);
+        for slot in 0..4u32 {
+            let instant = crate::abilities::cast_timing(&brass.abilities[slot as usize]).0 <= 0.0;
+            let at_start = voiced(&cues_for(&Event::CastStart { god: 0, slot, aim: Vec3::ZERO, dur: 0.3 }, &g));
+            let at_cast = voiced(&cues_for(&Event::Cast { god: 0, slot, aim: Vec3::ZERO }, &g));
+            // an instant ability never sends a CastStart
+            let heard = if instant { at_cast } else { at_start + at_cast };
+            assert_eq!(heard, 1, "{} (instant: {instant}) is spoken {heard} times", brass.abilities[slot as usize].name);
+        }
+        assert!(brass.abilities.iter().any(|a| crate::abilities::cast_timing(a).0 <= 0.0), "no instant ability to test");
     }
 
     /// The swarm's ring turns cast to cast: Hollowstep's phantoms (and

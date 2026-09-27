@@ -613,10 +613,16 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
                 }
                 let border = if ab.ult { Stroke::new(3.0_f32, GOLD) } else { Stroke::new(2.0_f32, c) };
                 p.rect_stroke(r, 8.0, border);
+                // a Sentinel's coat she is wearing: a bright outer frame and
+                // WORN under it (`sentinel`) -- the field is on, not cooling
+                if g.field_slot == Some(slot) {
+                    p.rect_stroke(r.expand(3.0), 10.0, Stroke::new(2.5_f32, Color32::WHITE));
+                    p.text(r.center_bottom() + Vec2::new(0.0, -3.0), Align2::CENTER_BOTTOM, "WORN", FontId::proportional(10.0), Color32::WHITE);
+                }
                 if no_mana && rank > 0 {
                     p.rect_filled(r, 8.0, Color32::from_rgba_premultiplied(20, 20, 60, 90));
                 }
-                if rank > 0 {
+                if rank > 0 && ab.cost > 0.0 {
                     p.text(r.left_bottom() + Vec2::new(4.0, -3.0), Align2::LEFT_BOTTOM, format!("{:.0}", ab.cost), FontId::proportional(10.0), Color32::from_rgb(130, 170, 255));
                 }
                 // rank pips along the top; the last one gold (mastery)
@@ -1299,6 +1305,10 @@ pub fn draw_touch_pad(ctx: &egui::Context, pad: &crate::touch::TouchPad, game: &
         };
         let r = r_px(crate::touch::BTN_R) * (1.0 + press_t * 0.1 + flash * 0.12);
         painter.circle(to_px(*c), r, fill, Stroke::new(2.0 + flash * 1.5, if ab.ult { GOLD } else { ring }));
+        // the coat she is wearing (`sentinel`): a white ring outside it
+        if g.field_slot == Some(i as u32) {
+            painter.circle_stroke(to_px(*c), r * 1.16, Stroke::new(2.5, Color32::WHITE));
+        }
         let label = if cd > 0.0 { format!("{:.0}", cd.ceil()) } else { format!("{}", i + 1) };
         painter.text(to_px(*c), Align2::CENTER_CENTER, label, FontId::proportional(r_px(0.05)), Color32::WHITE);
         // drag-to-aim: only ever drawn for a mobility ability (never an

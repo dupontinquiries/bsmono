@@ -60,6 +60,10 @@ CAST = {
     # the lamp-keeper: a big warm voice (a stand-in for all but his
     # bellow, which Nelson recorded: nelson_bellow001.json)
     'brasshowl': ('am_michael', 1.0),
+    # the mountain's grandmother: the best-graded voice not yet cast,
+    # slowed to the floor this cast allows, and taken down in pitch with
+    # her formants kept in master_take (oremantle's chain)
+    'oremantle': ('af_bella', 0.9),
 }
 
 

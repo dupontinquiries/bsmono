@@ -581,6 +581,8 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             Archetype::Send { .. } => f32::INFINITY,
             Archetype::Echoes { .. } => 12.0,
             Archetype::Lantern { radius, .. } => radius * 0.8,
+            // a coat is worn wherever she is (`sentinel::coat_for` decides)
+            Archetype::Field { .. } => f32::INFINITY,
         };
         let pri = match ab.arch {
             Archetype::Nova { .. } => {
@@ -640,6 +642,9 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             Archetype::Lantern { radius, .. } => {
                 let shadow = game.others.iter().any(|o| o.team != g.team && o.pos.distance(g.pos) < radius * 0.8);
                 if (is_god_target && dist < range) || shadow { 0.95 } else { 0.0 }
+            }
+            Archetype::Field { .. } => {
+                if game.coat_for(gi) == Some(slot as u32) { 0.9 } else { 0.0 }
             }
             Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } => {
                 let hurt = g.hp / g.max_hp;

@@ -75,6 +75,7 @@ pub mod kit;
 pub mod stalker;
 /// Brasshowl: the lamp, the flight from it, the shown-up.
 pub mod lantern;
+pub mod sentinel;
 /// The Curio shelf's passives, worked (items::Passive).
 pub mod curios;
 /// Levels 1-15: when abilities unlock, what each rank and mastery adds.

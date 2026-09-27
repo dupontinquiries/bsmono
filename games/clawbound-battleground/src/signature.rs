@@ -74,12 +74,16 @@ pub enum Motif {
     /// Brasshowl -- lamplight: a ring of warm light thrown out flat and
     /// fast, and sparks from the wick climbing slowly out of it.
     Lamplight,
+    /// Oremantle -- strata: big slabs of stone heaved slowly up out of the
+    /// ground in rings, one band inside another, hanging there and settling
+    /// back: heavy, low, and in no hurry.
+    Strata,
 }
 
-pub const MOTIFS: [Motif; 17] = [
+pub const MOTIFS: [Motif; 18] = [
     Motif::Sunroar, Motif::Rake, Motif::Rainfall, Motif::Umbra, Motif::Gyre, Motif::Yowl, Motif::Rime,
     Motif::Fangs, Motif::Halo, Motif::Hush, Motif::Lash, Motif::Thunderhead, Motif::Scree, Motif::Starfall,
-    Motif::Bloom, Motif::Fog, Motif::Lamplight,
+    Motif::Bloom, Motif::Fog, Motif::Lamplight, Motif::Strata,
 ];
 
 impl Motif {
@@ -108,6 +112,7 @@ impl Motif {
             Motif::Bloom => [[1.0, 0.70, 0.85], [0.55, 0.92, 0.45], [1.0, 0.92, 0.55]],
             Motif::Fog => [[0.46, 0.48, 0.53], [0.30, 0.32, 0.36], [0.15, 0.16, 0.19]],
             Motif::Lamplight => [[1.0, 0.92, 0.65], [1.0, 0.65, 0.22], [0.75, 0.30, 0.08]],
+            Motif::Strata => [[0.90, 0.84, 0.70], [0.62, 0.54, 0.42], [0.42, 0.36, 0.30]],
         }
     }
 }
@@ -132,7 +137,7 @@ impl Gesture {
             A::Nova { .. } | A::Storm { .. } | A::Pull { .. } | A::Giggle { .. } | A::Echoes { .. } | A::Lantern { .. } => Gesture::Burst,
             A::Bolt { .. } | A::Volley { .. } | A::Beam { .. } | A::Dash { .. } | A::Litter { .. } | A::Send { .. } => Gesture::Line,
             A::Lob { .. } | A::Ring { .. } | A::Blink { .. } | A::Meteor { .. } | A::DanceParty { .. } | A::Swap { .. } => Gesture::Mark,
-            A::Shield { .. } | A::Buff { .. } | A::Heal { .. } => Gesture::Mantle,
+            A::Shield { .. } | A::Buff { .. } | A::Heal { .. } | A::Field { .. } => Gesture::Mantle,
         }
     }
 }
@@ -307,6 +312,13 @@ pub fn emit(motif: Motif, gesture: Gesture, origin: Vec3, aim: Vec3, ult: bool, 
                     push(base + Vec3::Y * 0.9 + out * 0.4, out * (10.0 + 4.0 * rng.f()), 0.4, 0.16, 0, 0.9, 0.0, 3.5);
                 }
             }
+            Motif::Strata => {
+                // Heaved up in three rings (bands, not a spray), big and
+                // slow, hanging, settling back gently.
+                let band = (i % 3) as f32;
+                let base = if gesture == Gesture::Line { origin + dir * (u * span) + side * (band - 1.0) * 0.9 } else { centre + ring * (0.8 + band * 1.3) * (span / 4.5) };
+                push(Vec3::new(base.x, 0.05, base.z), Vec3::new(0.0, 1.3 + 0.4 * band, 0.0), 2.4, 0.26 + 0.08 * rng.f(), (i % 3).min(2), 1.0, 0.9, 1.6);
+            }
             Motif::Fog => {
                 // Low and flat, creeping OUT slowly along the ground, and
                 // slow to go: height is what it does not have.
@@ -401,7 +413,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(pairs, 2 * 17 * 16 / 2);
+        assert_eq!(pairs, 2 * 18 * 17 / 2);
         eprintln!("closest pair: {closest:?}");
     }
 
@@ -440,7 +452,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(total, 17 * 4 * 2);
+        assert_eq!(total, 18 * 4 * 2);
         // Aim on top of the caster, and garbage: no panic, no NaN.
         assert!(emit(Motif::Yowl, Gesture::Line, o, o, false, &mut Rng(1)).iter().all(|p| p.pos.is_finite()));
         assert!(emit(Motif::Rake, Gesture::Line, Vec3::splat(f32::NAN), o, false, &mut Rng(1)).is_empty());

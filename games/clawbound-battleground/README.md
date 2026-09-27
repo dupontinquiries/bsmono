@@ -65,7 +65,7 @@ what else is known-but-unresolved.
   it keeps falling, the wind drifts it from the blown stretches into the lee,
   cats bound through drifts ploughing a trench and leave separate prints on
   powder, and blasts throw craters, fire melts it, frost lays more.
-- **17 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
+- **18 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
   Windclaw, Faryowl, Oldroar, Twofang, Suneye, Snowhush, Riptail, Stillsmoke,
   Stonewhisper, Cometail (the star-fallen caracal: Starshot, Meteor Pounce,
   Flare, and the Falling Star ultimate), Sproutkit (the ever-young kitten,
@@ -88,10 +88,18 @@ what else is known-but-unresolved.
   ultimate -- he raises the lamp and bellows, and every enemy in its light is
   struck, runs from him unable to act, and is shown up (seen through cloud,
   no stalking) for 6 s, while no shadow of Hollowstep's can stand in it;
-  `src/lantern.rs`) — across 5 roles (Warrior / Guardian / Mage / Hunter / Assassin).
+  `src/lantern.rs`) and Oremantle (Stonewhisper's grandmother, the first
+  **Sentinel**: drawn and struck 1.4x the size of any other cat, the slowest
+  on the field, and she casts nothing -- each key shifts what her coat is made
+  of, and that material's field is always on around her: **Granite** spares
+  friends in it a share of every blow, **Rime** slows enemies, **Lodestone**
+  drags them in to arm's length, and the **Mountain's Heart** ultimate is
+  magma that burns everything near her for 7 s before she cools back to the
+  coat she wore; `src/sentinel.rs`) — across 6 roles (Warrior / Guardian /
+  Mage / Hunter / Assassin / Sentinel).
   Each is a quadruped feline voxel body with a pelt signature (mane, stripes,
   rosettes, saber fangs, antlers, sun disc, ear tufts…) and its crest colour,
-  plus **4 mechanical abilities** (68 total) built from 21 archetype systems.
+  plus **4 mechanical abilities** (72 total) built from 22 archetype systems.
   Clawbound kits are a passive + two techniques + an ultimate; here the passive
   is reforged as a third short-cooldown technique (see `src/gods.rs`).
 - **Dynamic weather** (`src/weather.rs`) — Clear / Overcast / Rain / Storm /
@@ -380,6 +388,7 @@ src/
 ├── kit.rs         Sproutkit's litter (kitten doubles), giggles and dance party
 ├── stalker.rs     Hollowstep's other, the terror radius, the step and every shadow
 ├── lantern.rs     Brasshowl's lamp: the flight from it, the shown-up, no shadows in it
+├── sentinel.rs    the Sentinel role: coats instead of casts, the four fields, the bot's choice
 ├── bosses.rs      the Elder Boar + Storm Drake: pits, AI, rewards, TargetRef::Boss
 ├── disasters.rs   wildfire / tempest / earthquake / flood / tornado + map scars
 ├── audio.rs       acoustics_at(pos) → howl/reverb voicing; WindSynth DSP; cpal shell

@@ -92,6 +92,7 @@ pub fn mastery_text(arch: &Archetype) -> &'static str {
         Archetype::Send { .. } => "Mastery: the other goes 40% farther, and faster",
         Archetype::Echoes { .. } => "Mastery: the echoes linger 30% longer",
         Archetype::Lantern { .. } => "Mastery: the light reaches 25% further",
+        Archetype::Field { .. } => "Mastery: the field reaches 20% further",
     }
 }
 
@@ -120,6 +121,7 @@ pub fn mastery(arch: Archetype) -> Archetype {
         Send { range, speed } => Send { range: range * 1.4, speed: speed * 1.25 },
         Echoes { each, life, dmg } => Echoes { each, life: life * 1.3, dmg },
         Lantern { radius, dmg, flee, reveal } => Lantern { radius: radius * 1.25, dmg, flee, reveal },
+        Field { material, radius, amount, secs } => Field { material, radius: radius * 1.2, amount, secs },
     }
 }
 
@@ -151,6 +153,9 @@ fn scale_amounts(arch: Archetype, m: f32) -> Archetype {
         Send { range, speed } => Send { range, speed: speed * (1.0 + (m - 1.0) * 0.5) },
         Echoes { each, life, dmg } => Echoes { each, life, dmg: dmg * m },
         Lantern { radius, dmg, flee, reveal } => Lantern { radius, dmg: dmg * m, flee, reveal },
+        // a field's strength grows with its rank (the sentinel caps what
+        // granite and rime may reach)
+        Field { material, radius, amount, secs } => Field { material, radius, amount: amount * m, secs },
     }
 }
 
@@ -225,7 +230,8 @@ mod tests {
                 let t = top(ab.ult);
                 let full = ranked(ab, t).unwrap();
                 assert_eq!(format!("{:?}", one.arch), format!("{:?}", ab.arch), "{}: rank 1 is the ability as written", ab.name);
-                assert!(full.cooldown < one.cooldown && full.cost < one.cost, "{}", ab.name);
+                // (a Sentinel's coats cost nothing, so they cannot get cheaper)
+                assert!(full.cooldown < one.cooldown && (full.cost < one.cost || one.cost == 0.0), "{}", ab.name);
                 // the top rank is more than the amounts: its shape changed
                 let amounts_only = scale_amounts(ab.arch, amount_mul(t, ab.ult));
                 assert_ne!(format!("{:?}", full.arch), format!("{:?}", amounts_only), "{}: no mastery", ab.name);

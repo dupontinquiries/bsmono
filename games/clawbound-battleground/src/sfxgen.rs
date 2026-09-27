@@ -69,6 +69,8 @@ impl Flavor {
             Role::Assassin => (160.0, 0.35),
             Role::Hunter => (220.0, 0.3),
             Role::Mage => (300.0, 0.15),
+            // the biggest cat: the lowest voice, and stone in it
+            Role::Sentinel => (55.0, 0.8),
         };
         let a = def.palette[3];
         let bright = (0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2]).clamp(0.0, 1.0);
@@ -441,6 +443,63 @@ pub fn ability(def: &GodDef, slot: usize) -> Vec<f32> {
             let warm = tones(1.2, &[b * 2.0, b * 2.5, b * 3.0], 0.12, 0.7, 0.1, 0.2);
             mix_at(&mut x, &warm, 0.1, 0.6);
         }
+        Archetype::Field { material, .. } => {
+            use crate::gods::Material;
+            match material {
+                Material::Granite => {
+                    // stone grinding shut: a low thud, then a crunching roll
+                    let t = thud(0.4, 80.0, 34.0, 0.9, &mut n);
+                    mix_at(&mut x, &t, 0.0, 0.9);
+                    let len = 0.6;
+                    let mut gr = vec![0.0; secs(len)];
+                    let mut lp = Svf::default();
+                    for (i, o) in gr.iter_mut().enumerate() {
+                        let tt = i as f32 / RATE;
+                        let tick = if n.next() > 0.97 { n.next() * 2.5 } else { 0.0 };
+                        let (l, _, _) = lp.run(tick + n.next() * 0.3, 700.0, 1.2);
+                        *o = drive(l * 2.0, 0.6) * env(tt, 0.05, 0.4);
+                    }
+                    mix_at(&mut x, &gr, 0.05, 0.8);
+                }
+                Material::Rime => {
+                    // the air freezing: glassy partials, and ice cracking
+                    let glass = tones(0.9, &[b * 12.0, b * 12.0 * 1.5, b * 12.0 * 2.2], 0.02, 0.6, 0.3, 0.0);
+                    mix_at(&mut x, &glass, 0.0, 0.45);
+                    for k in 0..7 {
+                        let c = zap(0.05, 5200.0 - 400.0 * k as f32, 1900.0, fl, &mut n);
+                        mix_at(&mut x, &c, 0.04 + k as f32 * 0.07 + 0.02 * (k % 3) as f32, 0.45);
+                    }
+                    let w = whoosh(0.7, 3000.0, 7000.0, 1.6, &mut n);
+                    mix_at(&mut x, &w, 0.0, 0.35);
+                }
+                Material::Lodestone => {
+                    // a magnet waking: a low hum that beats, and a struck
+                    // iron ring over it
+                    let hum = tones(1.0, &[b, b * 1.01, b * 2.0], 0.15, 0.7, 0.0, 0.5);
+                    mix_at(&mut x, &hum, 0.0, 0.8);
+                    let ring = tones(0.8, &[b * 6.0, b * 6.0 * 2.4, b * 6.0 * 3.9], 0.003, 0.45, 0.05, 0.0);
+                    mix_at(&mut x, &ring, 0.08, 0.35);
+                }
+                Material::Magma => {
+                    // the mountain's heart: a rumble swelling up, a roar of
+                    // heat rising, and a low burning chord under it
+                    let len = 1.15;
+                    let mut rum = vec![0.0; secs(len)];
+                    let mut lp = Svf::default();
+                    for (i, o) in rum.iter_mut().enumerate() {
+                        let tt = i as f32 / RATE;
+                        let u = tt / len;
+                        let (l, _, _) = lp.run(n.next(), 90.0 + 60.0 * u, 0.9);
+                        *o = drive(l * 3.5, 0.8) * (u * 3.0).min(1.0) * (1.0 - u).powf(0.6);
+                    }
+                    mix_at(&mut x, &rum, 0.0, 1.0);
+                    let heat = whoosh(0.85, 300.0, 3800.0, 1.1, &mut n);
+                    mix_at(&mut x, &heat, 0.12, 0.7);
+                    let chord = tones(1.05, &[b * 1.0, b * 1.5, b * 2.25], 0.2, 0.7, 0.1, 0.3);
+                    mix_at(&mut x, &chord, 0.1, 0.55);
+                }
+            }
+        }
         Archetype::Echoes { .. } => {
             // a low cluster a semitone apart, trembling, and heavy steps
             // coming from everywhere at once
@@ -468,11 +527,13 @@ pub fn ability(def: &GodDef, slot: usize) -> Vec<f32> {
 }
 
 /// The shared sounds, by bank key.
-pub const GENERIC: [&str; 9] = [
+pub const GENERIC: [&str; 10] = [
     "sfx/hit", "sfx/hit_big", "sfx/whiff", "sfx/levelup", "sfx/tower_down", "sfx/cast",
     // Hollowstep's world (`stalker`): a pounding heart, his heavy tread,
     // and the air closing where he left
     "sfx/stalker/heart", "sfx/stalker/step", "sfx/stalker/swap",
+    // a Sentinel's footfall (`sentinel`): the ground takes her weight
+    "sfx/sentinel/tread",
 ];
 
 pub fn generic(key: &str) -> Vec<f32> {
@@ -532,6 +593,24 @@ pub fn generic(key: &str) -> Vec<f32> {
                 *o = l * env(t, 0.02, 0.12) * 0.8;
             }
             mix_at(&mut x, &sc, 0.03, 0.6);
+            x
+        }
+        "sfx/sentinel/tread" => {
+            // a very heavy paw: a sub thump, the ground answering a beat
+            // later, and gravel shifting under it
+            let mut x = thud(0.45, 62.0, 26.0, 0.7, &mut n);
+            let answer = thud(0.35, 41.0, 24.0, 0.3, &mut n);
+            mix_at(&mut x, &answer, 0.06, 0.6);
+            let len = 0.4;
+            let mut gr = vec![0.0; secs(len)];
+            let mut bp = Svf::default();
+            for (i, o) in gr.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let tick = if n.next() > 0.985 { n.next() * 2.0 } else { 0.0 };
+                let (_, b, _) = bp.run(tick + n.next() * 0.15, 1800.0, 2.5);
+                *o = b * env(t, 0.01, 0.2);
+            }
+            mix_at(&mut x, &gr, 0.02, 0.5);
             x
         }
         "sfx/stalker/swap" => {

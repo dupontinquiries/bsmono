@@ -178,6 +178,13 @@ CHAINS = {
  'brasshowl':  "equalizer=f=180:t=q:w=1:g=2,equalizer=f=2600:t=q:w=1.2:g=1.5,"
                "acompressor=threshold=-22dB:ratio=3:attack=8:release=160:makeup=2,"
                "aecho=0.8:0.5:130|260:0.16|0.08",
+ # the mountain's grandmother: old, huge and slow -- down in pitch with the
+ # formants kept (a big chest, not a chipmunk in reverse), a low shelf of
+ # weight, and a cave's long answer
+ 'oremantle':  "rubberband=pitch=0.87:formant=preserved:pitchq=quality,"
+               "highpass=f=70,lowshelf=f=160:g=3,equalizer=f=2400:t=q:w=1:g=1,"
+               "acompressor=threshold=-24dB:ratio=3:attack=10:release=200:makeup=2,"
+               "aecho=0.8:0.5:150|300:0.06|0.03",
  # a young daredevil: bright and quick, a short slap
  'cometail':   "rubberband=pitch=1.04:tempo=1.03:formant=preserved:pitchq=quality,"
                "highpass=f=120,treble=g=4:f=6000,"
@@ -369,6 +376,11 @@ def snowhush_layers(c, key):
     return c + hiss + B.at(-18, B.octave(c, 2.0), c)
 
 
+def oremantle_layers(c, key):
+    # the mountain under her voice: an octave of stone beneath, faint
+    return c + B.at(-19, B.octave(c, 0.5), c)
+
+
 def stonewhisper_layers(c, key):
     # a ghost of the crags: half whisper, half voice, and a stone-deep
     # shadow
@@ -425,7 +437,7 @@ def sproutkit_layers(c, key):
 
 PRE = {'sproutkit': sproutkit_layers, 'goldenmane': goldenmane_layers, 'oldroar': oldroar_layers, 'twofang': twofang_layers, 'windclaw': windclaw_layers,
        'duskstripe': duskstripe_layers, 'rainspots': rainspots_layers, 'nightpelt': nightpelt_layers, 'faryowl': faryowl_layers,
-       'suneye': suneye_layers, 'snowhush': snowhush_layers, 'stonewhisper': stonewhisper_layers, 'riptail': riptail_layers,
+       'suneye': suneye_layers, 'snowhush': snowhush_layers, 'stonewhisper': stonewhisper_layers, 'oremantle': oremantle_layers, 'riptail': riptail_layers,
        'stillsmoke': stillsmoke_layers, 'cometail': cometail_layers,
        'hollowstep': hollowstep_layers}
 sheet = {}

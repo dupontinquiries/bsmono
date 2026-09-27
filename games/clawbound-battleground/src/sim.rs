@@ -97,6 +97,11 @@ pub enum Event {
     LanternFx { pos: Vec3, radius: f32 },
     /// A shadow of Hollowstep's was driven out of the light.
     ShadowDriven { pos: Vec3 },
+    /// A Sentinel's coat changed (`sentinel`): to what, and how far its
+    /// field reaches.
+    CoatShift { god: usize, pos: Vec3, material: crate::gods::Material, radius: f32 },
+    /// A Sentinel's footfall.
+    Tread { pos: Vec3 },
 }
 
 #[derive(Clone, Debug)]
@@ -267,6 +272,16 @@ pub struct GodUnit {
     pub flee_from: Vec3,
     /// Shown up by the lamp: seconds left (seen through cloud, no stalking).
     pub revealed_t: f32,
+    /// A Sentinel's coat (`sentinel`): the key she wears, the one a lasting
+    /// coat goes back to, and how long the lasting one has left.
+    pub field_slot: Option<u32>,
+    pub field_back: Option<u32>,
+    pub field_t: f32,
+    /// Seconds toward her next magma burn.
+    pub burn_t: f32,
+    /// The share of each blow this cat takes, this tick: under 1 inside a
+    /// friend's granite (`sentinel`), 1 otherwise.
+    pub ward: f32,
     /// A cast winding up or channelling: fires when `t` reaches `dur`.
     pub casting: Option<Casting>,
     /// Seconds during which movement does not turn the cat: after a cast
@@ -599,6 +614,11 @@ impl Game {
                 flee_t: 0.0,
                 flee_from: Vec3::ZERO,
                 revealed_t: 0.0,
+                field_slot: None,
+                field_back: None,
+                field_t: 0.0,
+                burn_t: 0.0,
+                ward: 1.0,
                 last_act_t: -99.0,
                 ai: if is_player { None } else { Some(AiBrain::new(lane, 0.45 + rng.f32() * 0.5)) },
                 prot,
@@ -994,6 +1014,8 @@ impl Game {
                 dmg *= 100.0 / (100.0 + eff);
                 // Moonshell (the Moonwell): nine-tenths of every blow turned
                 dmg *= crate::moonwell::taken_mul(g.boon.map(|b| b.0));
+                // a friend's granite (`sentinel`)
+                dmg *= g.ward.clamp(0.0, 1.0);
                 let pre = g.hp + g.shield;
                 if g.shield > 0.0 {
                     let absorbed = g.shield.min(dmg);

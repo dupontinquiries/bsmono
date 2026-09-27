@@ -152,6 +152,15 @@ voice/brasshowl/kill.1.opus	brasshowl	Out you go.	brisk	3	takes down an enemy an
 voice/brasshowl/kill.2.opus	brasshowl	The road is clear.	satisfied, to the caravan	3	takes down an enemy ancestor
 voice/brasshowl/death.1.opus	brasshowl	The lamp... is out...	surprised, quiet	2	falls
 voice/brasshowl/death.2.opus	brasshowl	Keep... it... lit...	a last instruction	1	falls
+voice/oremantle/select.opus	oremantle	The mountain is here.	slow, settling in	2	locked in on the select screen
+voice/oremantle/cast1.opus	oremantle	Stand behind me.	firm, protective	3	shifts to Granite
+voice/oremantle/cast2.opus	oremantle	Cold, now.	quiet, breath misting	2	shifts to Rime
+voice/oremantle/cast3.opus	oremantle	Come here, child.	patient, drawing someone in	2	shifts to Lodestone
+voice/oremantle/cast4.opus	oremantle	The mountain has a HEART!	from a rumble to a roar on 'heart'	5	shifts to The Mountain's Heart
+voice/oremantle/kill.1.opus	oremantle	Rest now.	grandmotherly, almost kind	2	takes down an enemy ancestor
+voice/oremantle/kill.2.opus	oremantle	Stone outlasts.	flat, certain	2	takes down an enemy ancestor
+voice/oremantle/death.1.opus	oremantle	Even mountains... fall...	surprised, slow	1	falls
+voice/oremantle/death.2.opus	oremantle	Back... to the rock...	content, going home	1	falls
 narrator/prologue1.opus	narrator	Before any word was written, the world belonged to the clans.	hushed, as if starting an old story	2	the prologue opens, line 1 of 8 (first match of a session)
 narrator/prologue2.opus	narrator	No hand raised a wall. No fire burned but the lightning's.	slow, each sentence its own image	2	the prologue, line 2 of 8
 narrator/prologue3.opus	narrator	From the frozen long-ago to the endless dunes, the great cats kept it.	growing, sweeping	3	the prologue, line 3 of 8

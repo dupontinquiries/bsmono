@@ -34,6 +34,36 @@ pub fn cat(pos: Vec3, yaw: f32, stalking: bool) -> Capsule {
     Capsule { a: pos + f * REAR + up, b: pos + f * FRONT + up, r: GIRTH }
 }
 
+/// The capsule for a cat drawn `size` times the usual (`Role::size`: a
+/// Sentinel is bigger, so she is struck bigger). Everything scales from the
+/// feet: the body is longer, wider and higher by the same factor.
+pub fn cat_sized(pos: Vec3, yaw: f32, stalking: bool, size: f32) -> Capsule {
+    let s = if size.is_finite() && size > 0.0 { size } else { 1.0 };
+    let c = cat(pos, yaw, stalking);
+    Capsule { a: pos + (c.a - pos) * s, b: pos + (c.b - pos) * s, r: c.r * s }
+}
+
+#[cfg(test)]
+mod sized_tests {
+    use super::*;
+
+    /// A bigger cat is a bigger target: a bolt passing wide of an ordinary
+    /// cat's flank hits a Sentinel's, and at size 1 nothing changes.
+    #[test]
+    fn a_bigger_cat_is_struck_bigger() {
+        let (pos, yaw) = (Vec3::ZERO, 0.0);
+        assert_eq!(cat_sized(pos, yaw, false, 1.0), cat(pos, yaw, false));
+        let s = crate::gods::SENTINEL_SIZE;
+        // a ball going by the flank, 1.1 of an ordinary girth out
+        let wide = Vec3::new(0.0, SPINE_Y * s, GIRTH * 1.1 + 0.1);
+        assert!(!cat(pos, yaw, false).hit_by_sphere(wide, 0.1));
+        assert!(cat_sized(pos, yaw, false, s).hit_by_sphere(wide, 0.1));
+        // and past the ordinary muzzle
+        assert!(cat_sized(pos, yaw, false, s).in_disc(Vec3::new(FRONT * s, 0.0, 0.0), 0.1));
+        assert!(!cat(pos, yaw, false).in_disc(Vec3::new(FRONT * s + GIRTH, 0.0, 0.0), 0.1));
+    }
+}
+
 /// A minion: the same animal at about six tenths the size.
 pub fn minion(pos: Vec3, yaw: f32) -> Capsule {
     let yaw = if yaw.is_finite() { yaw } else { 0.0 };
