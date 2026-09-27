@@ -1742,11 +1742,12 @@ void main() {
         color *= 1.0 - smoothstep(0.2, 1.7, vignette_dist) * 0.35; // murk at edges
     }
 
-    // UNENDLICH_LIGHT_DEBUG=2 (w = 3): r = final colour is NaN, g = sky,
-    // b = final brightness.
+    // UNENDLICH_LIGHT_DEBUG=2 (w = 3): r = water (1) / cloud (0.5), g = sky,
+    // b = final colour is NaN.
     if (ubo.light_volume.w > 2.5) {
         bool bad = !(color.r == color.r) || !(color.g == color.g) || !(color.b == color.b);
-        out_color = vec4(bad ? 1.0 : 0.0, lv_sky, clamp(dot(color, vec3(0.333)), 0.0, 1.0), 1.0);
+        float mat = is_water(v_color) ? 1.0 : (is_cloud(v_color) ? 0.5 : 0.0);
+        out_color = vec4(mat, lv_sky, bad ? 1.0 : 0.0, 1.0);
         return;
     }
     out_color = vec4(color, 1.0);

@@ -17002,9 +17002,28 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         let cs = unendlich_engine::constants::CHUNK_SIZE;
                         let ac = [above[0].div_euclid(cs), above[1].div_euclid(cs), above[2].div_euclid(cs)];
                         let tx = unendlich_engine::world::light_volume::chunk_texel_origin(ac);
+                        // What is above the aimed cell, chunk by chunk: the first
+                        // light-blocking block, if any (why a column is shaded).
+                        let mut above_col = Vec::new();
+                        for k in 0..8 {
+                            let cy = ac[1] + k;
+                            match chunk_manager.get_chunk(ChunkCoord::new(ac[0], cy, ac[2])) {
+                                None => { above_col.push(format!("{cy}:unloaded")); break; }
+                                Some(ch) => {
+                                    let lx = hx.rem_euclid(cs);
+                                    let lz = hz.rem_euclid(cs);
+                                    let from = if k == 0 { (hy + 1).rem_euclid(cs) } else { 0 };
+                                    let hit_b = (from..cs).find_map(|ly| {
+                                        let b = ch.blocks[unendlich_engine::world::chunk::Chunk::block_index(lx, ly, lz)];
+                                        unendlich_engine::world::light_volume::blocks_light(b).then(|| format!("{:?}@{}", b, cy * cs + ly))
+                                    });
+                                    above_col.push(format!("{cy}:{}", hit_b.unwrap_or_else(|| "open".into())));
+                                }
+                            }
+                        }
                         format!(
-                            "{:?} ({},{},{}) around[+y,-y,+x,-x,+z,-z] {} | box {:?} of chunk {:?} holds {:?} cpu {:?}",
-                            hit.block, hx, hy, hz, around.join(" "), tx, ac, renderer.light_box_owner(tx), light_sys.lit_hash(ac)
+                            "{:?} ({},{},{}) around[+y,-y,+x,-x,+z,-z] {} | box {:?} of chunk {:?} holds {:?} cpu {:?} | above {}",
+                            hit.block, hx, hy, hz, around.join(" "), tx, ac, renderer.light_box_owner(tx), light_sys.lit_hash(ac), above_col.join(" ")
                         )
                     })
                     .unwrap_or_else(|| "nothing".into());
