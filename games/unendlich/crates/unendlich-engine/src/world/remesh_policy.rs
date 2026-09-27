@@ -44,6 +44,7 @@ pub fn is_micro_detail(b: BlockId) -> bool {
             | BlockId::IronRootFern
             | BlockId::StoneFlower
             | BlockId::Cattail
+            | BlockId::Torch
     )
 }
 

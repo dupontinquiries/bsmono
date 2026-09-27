@@ -68,7 +68,7 @@ pub fn tab_of(b: BlockId) -> Option<CreativeTab> {
             T::Wood
         }
         StoneBricks | Bricks | Glass | IronBlock | GoldBlock | CoalBlock | Pumpkin
-        | SmoothSandstone | Terracotta | ChiseledStoneBricks => T::Building,
+        | SmoothSandstone | Terracotta | ChiseledStoneBricks | Torch => T::Building,
         Flower | TallGrass | Fern | IronRootFern | StoneFlower | Cattail | Glowshroom | DeadBush | Vine | Cactus | Mushroom | Cobweb | Lichen
         | Carrot | Potato | Cabbage | Sprout => {
             T::Plants

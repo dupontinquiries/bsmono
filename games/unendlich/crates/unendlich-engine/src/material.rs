@@ -69,7 +69,7 @@ pub fn material_for(b: BlockId) -> Material {
         Bone => Material::polished(0.6, 0.05),
         // Vegetation / organics — fully diffuse, matte.
         Grass | Moss | OakLeaves | BirchLeaves | Cactus | OakLog | BirchLog
-        | Flower | TallGrass | Fern | IronRootFern | StoneFlower | Cattail | Glowshroom | DeadBush | Vine | Lichen | Mushroom | Cobweb | DarkOakPlanks
+        | Flower | TallGrass | Fern | IronRootFern | StoneFlower | Cattail | Glowshroom | Torch | DeadBush | Vine | Lichen | Mushroom | Cobweb | DarkOakPlanks
         | Carrot | Potato | Cabbage | Sprout => {
             Material::diffuse(0.95)
         }

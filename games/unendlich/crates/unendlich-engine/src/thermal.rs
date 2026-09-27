@@ -79,7 +79,7 @@ fn class(b: BlockId) -> Class {
         Air | Water | Cobweb => Class::Inert,
         IronBlock | GoldBlock => Class::Metal,
         Grass | OakLog | OakLeaves | BirchLog | BirchLeaves | Cactus | Moss | Flower
-        | TallGrass | Fern | IronRootFern | StoneFlower | Cattail | Glowshroom | DeadBush | Vine | Mushroom | Lichen | OakPlanks | Bookshelf
+        | TallGrass | Fern | IronRootFern | StoneFlower | Cattail | Glowshroom | Torch | DeadBush | Vine | Mushroom | Lichen | OakPlanks | Bookshelf
         | Pumpkin | DarkOakPlanks | Carrot | Potato | Cabbage | Sprout => Class::Organic,
         Stone | Dirt | Cobblestone | Bedrock | Sand | Gravel | GoldOre | IronOre | CoalOre
         | Clay | RedSandstone | Dripstone | Limestone | Marble | Basalt | Tuff | Granite

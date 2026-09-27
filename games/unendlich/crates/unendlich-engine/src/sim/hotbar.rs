@@ -52,7 +52,7 @@ pub fn ability_of(b: BlockId) -> HeldAbility {
         Water | Lava => HeldAbility::PlaceFluid,
         CoalOre | IronOre | GoldOre | CopperOre | DiamondOre => HeldAbility::Mineable,
         Amber | Crystal => HeldAbility::PlaceLight,
-        Flower | TallGrass | Fern | IronRootFern | StoneFlower | Cattail | Glowshroom | DeadBush | Vine | Mushroom | Lichen | Moss => {
+        Flower | TallGrass | Fern | IronRootFern | StoneFlower | Cattail | Glowshroom | Torch | DeadBush | Vine | Mushroom | Lichen | Moss => {
             HeldAbility::PlaceDecoration
         }
         _ => HeldAbility::PlaceBlock,
