@@ -3403,6 +3403,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // O2 at the head last frame (the bending fields read it before the air
     // block runs), how muffled the world sounds, and when the earth last spoke.
     let mut o2_head_last = unendlich_engine::world::cave_gas::O2_AIR;
+    let mut o2_co2_head_last = unendlich_engine::world::cave_gas::O2_AIR;
     // HUD notices (sim::notices): short messages under the status lines.
     let mut notices = unendlich_engine::sim::notices::Notices::new();
     let mut notices_shown_rev = 0u64;
@@ -8628,7 +8629,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // CO2 basins (cave_biomes.docx): no fire below 16% O2, no
                 // wind, little water, no light or life to draw on. After the canopy
                 // and artifact boosts: an attuned ingot does not make fire burn in CO2.
-                unendlich_engine::sim::cave_air::gas_fields(&mut fields, o2_head_last);
+                unendlich_engine::sim::cave_air::gas_fields(&mut fields, o2_co2_head_last);
+                // Fire needs air whatever took it (a basin or the deep band).
+                if o2_head_last < unendlich_engine::sim::cave_air::FLAME_O2_MIN {
+                    fields.r = 0.0;
+                }
                 // fly mode <=> no physics body attached (see flight toggle docs).
                 let airborne_now = body.is_none() || fg_app.swimming();
                 let stance = if airborne_now {
@@ -17156,16 +17161,21 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             let seed = chunk_manager.model_arc().seed();
             let gas = cave_gas_enabled.then_some(seed);
             light_sys.gas_seed = gas;
-            let o2_at = |p: [f32; 3]| -> f32 {
+            // O2 from every cause (CO2 basins and the geothermal band's thin
+            // air): what breathing and fire use. `co2_only` is the basins'
+            // share alone, for what only CO2 does (the hush, the bending caps).
+            let o2_of = |p: [f32; 3], co2_only: bool| -> f32 {
                 let Some(seed) = gas else { return cg::O2_AIR };
                 // Gas is only breathed (or burned) in open cells.
                 if chunk_manager.block_at(p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32).is_solid() {
                     return cg::O2_AIR;
                 }
-                cg::o2_at(p[0], p[1], p[2], seed)
+                if co2_only { cg::o2_at(p[0], p[1], p[2], seed) } else { cg::o2_air_at(p[0], p[1], p[2], seed) }
             };
+            let o2_at = |p: [f32; 3]| o2_of(p, false);
             let e = local_player.view.position;
             let o2_head = o2_at([e.x, e.y, e.z]);
+            let o2_co2_head = o2_of([e.x, e.y, e.z], true);
             let nb = ca::breath_for(o2_head);
             if nb != breath {
                 log::info!("[air] O2 {:.1}% at the head: {:?} -> {:?}", o2_head * 100.0, breath, nb);
@@ -17212,11 +17222,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
             renderer.set_air_vignette(air_fx.vignette.max(heat_fx.vignette));
             o2_head_last = o2_head;
+            o2_co2_head_last = o2_co2_head;
             // Dead silence (docx): below the surface the gas swallows sound.
             // Eased so crossing the surface is a fade, not a click. This game
             // has no drip/insect bed yet, so what goes quiet is the effects
             // bus (roars and the like).
-            let hush_target = ca::hush_for(o2_head);
+            let hush_target = ca::hush_for(o2_co2_head);
             air_hush += (hush_target - air_hush) * (dt * 2.0).min(1.0);
             #[cfg(feature = "audio")]
             if lifetime_frame % 6 == 0 {
