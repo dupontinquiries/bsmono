@@ -8568,6 +8568,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     vegetation_mass: 0.4,
                 };
                 let mut fields = unendlich_engine::sim::bending_field::sample(&raw_env);
+                // Caves have their own bending fields (sim::cave_fields,
+                // cave_biomes.docx property signatures), blended in as the
+                // cave closes over you. Zone and enclosure come from the
+                // exposure block (off with UNENDLICH_CAVE_CLIMATE=0).
+                {
+                    use unendlich_engine::sim::cave_fields as cf;
+                    let t01 = unendlich_engine::world::noise::noise_2d(
+                        pp.x as f64 / 149.0, pp.z as f64 / 149.0, m.seed() ^ 0x0F1E,
+                    ) as f32;
+                    fields = cf::blend(fields, cf::cave_fields(cave_zone_last, t01), enclosure_last);
+                }
                 // r139: ARTIFACT IMBUE — holding an INGOT (ItemId 1000/1001)
                 // attunes it: progress scales with how well the environment
                 // matches its element (heat for the fire-leaning default).
