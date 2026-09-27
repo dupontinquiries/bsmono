@@ -153,6 +153,18 @@ pub fn light_chunk(
     block: &dyn Fn([i32; 3]) -> Option<BlockId>,
     open_above: &dyn Fn(i32, i32, i32) -> bool,
 ) -> Vec<[u8; 4]> {
+    light_chunk_with(chunk, block, open_above, &|_, b| b.light_emission())
+}
+
+/// [`light_chunk`] with the emission decided per cell: `emit(w, b)` is what
+/// block `b` at world cell `w` gives off (a torch in a CO₂ basin gives off
+/// nothing, see [`gas_aware_emission`]).
+pub fn light_chunk_with(
+    chunk: [i32; 3],
+    block: &dyn Fn([i32; 3]) -> Option<BlockId>,
+    open_above: &dyn Fn(i32, i32, i32) -> bool,
+    emit: &dyn Fn([i32; 3], BlockId) -> [u8; 3],
+) -> Vec<[u8; 4]> {
     let r = (CS + 2 * APRON) as usize;
     let min = [chunk[0] * CS - APRON, chunk[1] * CS - APRON, chunk[2] * CS - APRON];
     let ri = |x: usize, y: usize, z: usize| x + r * (y + r * z);
@@ -175,7 +187,7 @@ pub fn light_chunk(
                     Some(b) => {
                         opaque[i] = blocks_light(b);
                         loss[i] = extra_loss(b);
-                        let e = b.light_emission();
+                        let e = emit(w, b);
                         if e != [0, 0, 0] {
                             emitters.push(([x, y, z], e));
                         }
@@ -337,7 +349,24 @@ pub fn light_signature(blocks: &[BlockId]) -> u64 {
     h | 1
 }
 
+/// Emission with fire put out by bad air: a torch whose cell is in a CO₂
+/// basin (world::cave_gas) too deep for combustion (sim::cave_air) gives no
+/// light. The glows (crystal, glowshroom, the basin's lichen) and lava do not
+/// need air.
+pub fn gas_aware_emission(w: [i32; 3], b: BlockId, gas_seed: Option<u32>) -> [u8; 3] {
+    if b == BlockId::Torch {
+        if let Some(seed) = gas_seed {
+            let d = super::cave_gas::co2_density(w[0], w[1], w[2], seed);
+            if super::cave_gas::o2_for_density(d) < crate::sim::cave_air::FLAME_O2_MIN {
+                return [0, 0, 0];
+            }
+        }
+    }
+    b.light_emission()
+}
+
 struct Job {
+    gas_seed: Option<u32>,
     chunk: [i32; 3],
     chunks: HashMap<[i32; 3], Arc<Chunk>>,
 }
@@ -366,7 +395,8 @@ fn light_from_snapshot(job: &Job) -> Vec<[u8; 4]> {
             from = 0;
         }
     };
-    light_chunk(job.chunk, &get, &open_above)
+    let gas_seed = job.gas_seed;
+    light_chunk_with(job.chunk, &get, &open_above, &|w, b| gas_aware_emission(w, b, gas_seed))
 }
 
 /// The chunks a relight of `c` reads: its 3 x 3 x 3 neighbourhood (whatever
@@ -416,6 +446,9 @@ pub struct LightVolumeSys {
     /// CPU copy of every relit chunk in the window, for `light_at` (gameplay
     /// that needs the light level, and the trace line).
     lit: HashMap<[i32; 3], Arc<Vec<[u8; 4]>>>,
+    /// World seed for CO₂ basins (torches in them do not burn); `None`
+    /// ignores the gas. Changing it relights nothing by itself.
+    pub gas_seed: Option<u32>,
 }
 
 impl Default for LightVolumeSys {
@@ -450,6 +483,7 @@ impl LightVolumeSys {
             stats: LightStats::default(),
             max_in_flight: 4,
             lit: HashMap::new(),
+            gas_seed: None,
         }
     }
 
@@ -463,7 +497,7 @@ impl LightVolumeSys {
         let Some(w) = self.window else { return bad };
         for c in w.chunks() {
             let Some(stored) = self.lit.get(&c) else { continue };
-            let job = Job { chunk: c, chunks: snapshot(c, get) };
+            let job = Job { gas_seed: self.gas_seed, chunk: c, chunks: snapshot(c, get) };
             let fresh = light_from_snapshot(&job);
             let n = fresh.iter().zip(stored.iter()).filter(|(a, b)| a != b).count();
             if n > 0 {
@@ -602,7 +636,7 @@ impl LightVolumeSys {
                     continue; // nothing to draw there; it relights when it loads
                 }
                 let chunks = snapshot(c, get);
-                if self.job_tx.send(Job { chunk: c, chunks }).is_ok() {
+                if self.job_tx.send(Job { gas_seed: self.gas_seed, chunk: c, chunks }).is_ok() {
                     self.in_flight.insert(c);
                 }
             }
@@ -730,6 +764,21 @@ mod tests {
         assert!(under < 15, "under the middle of the roof: {under}");
         assert!(edge > under, "brighter near the roof's edge: {edge} vs {under}");
         assert_eq!(out[box_index(2, 5, 2)][0], 255, "open sky beside it");
+    }
+
+    #[test]
+    fn a_torch_in_a_co2_basin_gives_no_light_and_one_above_it_does() {
+        let seed = 77;
+        let b = (0..40)
+            .flat_map(|rx| (0..40).map(move |rz| (rx, rz)))
+            .find_map(|(rx, rz)| crate::world::cave_gas::basin(rx, rz, seed))
+            .expect("a basin");
+        let deep = [b.center[0], b.surface_y - 2, b.center[1]];
+        let high = [b.center[0], b.surface_y + 3, b.center[1]];
+        assert_eq!(gas_aware_emission(deep, BlockId::Torch, Some(seed)), [0, 0, 0]);
+        assert_eq!(gas_aware_emission(high, BlockId::Torch, Some(seed)), BlockId::Torch.light_emission());
+        assert_eq!(gas_aware_emission(deep, BlockId::Torch, None), BlockId::Torch.light_emission(), "gas off");
+        assert_eq!(gas_aware_emission(deep, BlockId::Glowshroom, Some(seed)), BlockId::Glowshroom.light_emission(), "glows need no air");
     }
 
     #[test]

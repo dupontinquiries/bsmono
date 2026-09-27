@@ -527,7 +527,9 @@ impl BlockId {
             // them: a generated vine, mushroom or cobweb was invisible.
             | BlockId::Mushroom | BlockId::Vine | BlockId::DeadBush | BlockId::Cobweb
             | BlockId::Glowshroom | BlockId::IronRootFern | BlockId::StoneFlower
-            | BlockId::Cattail | BlockId::Torch)
+            | BlockId::Cattail | BlockId::Torch
+            // The CO₂ basin's microbial ring (world::cave_gas); drew nothing before.
+            | BlockId::Lichen)
     }
 
     /// Light this block gives off, per channel 0..=15 (world::light_volume).
@@ -541,6 +543,9 @@ impl BlockId {
             BlockId::Magma => [8, 3, 1],
             BlockId::GlowCrystal => [3, 7, 9],
             BlockId::Glowshroom => [2, 6, 5],
+            // cave_biomes.docx: "the microbial ring glows ... emits LL 1" — a
+            // faint green, just enough to see the gas line in the dark.
+            BlockId::Lichen => [1, 4, 2],
             _ => [0, 0, 0],
         }
     }

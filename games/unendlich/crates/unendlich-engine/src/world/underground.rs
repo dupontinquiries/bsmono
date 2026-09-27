@@ -256,6 +256,8 @@ pub struct Report {
     pub moss: u32,
     pub indicators: u32,
     pub shore: u32,
+    /// Lichen placed on the gas surface of a CO₂ basin.
+    pub ring: u32,
 }
 
 /// Run the underground pass over one chunk's blocks.
@@ -372,7 +374,19 @@ pub fn decorate(
                         blocks[fi] = fl;
                         rep.floors += 1;
                     }
-                    rep.ornaments += floor_ornament(blocks, lx, ly, lz, zone, patch, x, y, z, depth, seed);
+                    // CO₂ basins (world::cave_gas): the microbial ring glows on
+                    // the floor at the gas surface; below it nothing grows
+                    // ("the death of any organisms below the level"), only the
+                    // odd bone.
+                    if super::cave_gas::on_surface(x, y, z, seed) {
+                        rep.ring += set_if_air(blocks, lx, ly, lz, BlockId::Lichen);
+                    } else if super::cave_gas::co2_density(x, y, z, seed) > 0.0 {
+                        if roll(x, y, z, seed, 9) < 8 {
+                            rep.ornaments += set_if_air(blocks, lx, ly, lz, BlockId::Bone);
+                        }
+                    } else {
+                        rep.ornaments += floor_ornament(blocks, lx, ly, lz, zone, patch, x, y, z, depth, seed);
+                    }
                 }
                 if ceiling && blocks[idx(lx, ly, lz)] == BlockId::Air {
                     rep.ornaments += ceiling_ornament(blocks, lx, ly, lz, zone, x, y, z, depth, seed);
@@ -755,6 +769,53 @@ mod tests {
         }
         assert!(up > 0 && down > 0, "stalagmites {up} stalactites {down}");
         assert!(up + down < 28 * 28 / 4, "dripstone everywhere: {}", up + down);
+    }
+
+    #[test]
+    fn a_co2_basin_gets_a_glowing_ring_at_its_surface_and_a_dead_floor_below() {
+        let b = (0..40)
+            .flat_map(|rx| (0..40).map(move |rz| (rx, rz)))
+            .find_map(|(rx, rz)| super::super::cave_gas::basin(rx, rz, SEED))
+            .expect("a basin");
+        // A chunk-sized cave around the basin centre: a floor that steps down
+        // from above the gas surface to below it along x.
+        let origin = (b.center[0] - 16, b.surface_y - 16, b.center[1] - 16);
+        let mut blocks = vec![BlockId::Stone; (CS * CS * CS) as usize];
+        for lz in 1..CS - 1 {
+            for lx in 1..CS - 1 {
+                let floor = 12 + lx / 4; // local floor height: 12..19, gas surface at local 16
+                for ly in floor + 1..CS - 2 {
+                    blocks[idx(lx, ly, lz)] = BlockId::Air;
+                }
+            }
+        }
+        let rep = decorate(&mut blocks, origin, SEED, &|_, _| 90);
+        assert!(rep.ring > 0, "no ring placed");
+        // What grew into the carved air, split by whether the cell is in the
+        // gas. Only bone lies below the surface; above it the normal floor
+        // life grows (the complement: without it this test would pass on a
+        // cave where nothing grows at all).
+        let (mut grown_in_gas, mut grown_above) = (Vec::new(), 0);
+        for i in 0..blocks.len() {
+            let (lx, ly, lz) = (i as i32 % CS, i as i32 / (CS * CS), (i as i32 / CS) % CS);
+            let (x, y, z) = (origin.0 + lx, origin.1 + ly, origin.2 + lz);
+            if blocks[i] == BlockId::Lichen {
+                assert_eq!(y, b.surface_y, "lichen off the gas line at y {y}");
+            }
+            let carved = (1..CS - 1).contains(&lx) && (1..CS - 1).contains(&lz) && ly > 12 + lx / 4 && ly < CS - 2;
+            if !carved || matches!(blocks[i], BlockId::Air | BlockId::Lichen) {
+                continue;
+            }
+            if super::super::cave_gas::co2_density(x, y, z, SEED) > 0.0 {
+                if blocks[i] != BlockId::Bone {
+                    grown_in_gas.push(blocks[i]);
+                }
+            } else {
+                grown_above += 1;
+            }
+        }
+        assert!(grown_in_gas.is_empty(), "something grows in the gas: {grown_in_gas:?}");
+        assert!(grown_above > 0, "nothing grew above the gas either, so this proves nothing");
     }
 
     #[test]

@@ -146,6 +146,7 @@ pub fn procedural_subgrid(host_id: BlockId, world_x: i32, world_y: i32, world_z:
         BlockId::StoneFlower  => recipes::stone_flower(rng01, rng_int),
         BlockId::Cattail      => recipes::cattail(rng01, rng_int),
         BlockId::Torch        => recipes::torch(),
+        BlockId::Lichen       => recipes::lichen(rng_int),
         // Default for any other host: empty grid (no decoration).
         _ => SubVoxelGrid::empty(),
     })
@@ -397,6 +398,22 @@ mod recipes {
         grid
     }
 
+    /// Lichen: flat, pale green-grey patches hugging the floor of the cell.
+    pub fn lichen(rng_int: u32) -> SubVoxelGrid {
+        let mut grid = SubVoxelGrid::empty();
+        let a = [0.42, 0.62, 0.46];
+        let b = [0.55, 0.72, 0.52];
+        for x in 0..8u8 {
+            for z in 0..8u8 {
+                let h = (rng_int ^ (x as u32 * 73856093) ^ (z as u32 * 19349663)).wrapping_mul(0x9e37_79b9) >> 27;
+                if h % 3 == 0 {
+                    cell(&mut grid, x, 0, z, if h % 2 == 0 { a } else { b });
+                }
+            }
+        }
+        grid
+    }
+
     /// Torch: a dark stick with a bright ember and flame on top.
     pub fn torch() -> SubVoxelGrid {
         let mut grid = SubVoxelGrid::empty();
@@ -568,7 +585,7 @@ mod tests {
     fn new_plant_recipes_are_nonempty_in_bounds_and_unique() {
         use crate::world::blocks::BlockId as B;
         for b in [B::Mushroom, B::Glowshroom, B::Vine, B::DeadBush, B::Cobweb,
-                  B::IronRootFern, B::StoneFlower, B::Cattail, B::Torch] {
+                  B::IronRootFern, B::StoneFlower, B::Cattail, B::Torch, B::Lichen] {
             for (x, y, z) in [(0, 0, 0), (5, 9, -3), (-17, 40, 22), (123, 64, 7), (8, 8, 8)] {
                 let g = super::procedural_subgrid(b, x, y, z).expect("has_subvoxels");
                 assert!(g.cell_count() >= 4, "{b:?} draws {} cells", g.cell_count());
