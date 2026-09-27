@@ -118,6 +118,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("flare") {
         return run_flare_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("glades") {
+        return run_glade_shots();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("hud") {
         return run_hud_shots();
     }
@@ -2286,6 +2289,61 @@ pub fn run_flare_shots() -> Result<(), String> {
         scene.draw(&mut renderer, &game, &mut vfx, cam);
         renderer.atmosphere = atm2;
         renderer.render_frame(&view, cam, 3.0);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+    }
+    Ok(())
+}
+
+/// The jungle's glades (`glades`), from a cat's height and from above: a
+/// Ring, and the Steps up to a pit. `CLAWBOUND_SHOTS=glades`.
+pub fn run_glade_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("glades"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let mut scene = Scene::new(&mut renderer);
+    let mut game = Game::new_teams(&[0], &[1]);
+    game.blockers = scene.blockers.clone();
+    let (rx, rz) = crate::glades::RING;
+    game.gods[0].pos = Vec3::new(rx + 0.8, 1.4, rz + 1.2);
+    game.gods[1].respawn_t = 999.0;
+    game.gods[0].ai = None;
+    let mut vfx = Vfx::default();
+    for _ in 0..20 {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+        vfx.update(1.0 / 60.0, &[], &game);
+    }
+    let mut atm = game.weather.atmosphere();
+    atm.wetness = 0.0;
+    atm.rain = 0.0;
+    atm.cloud_cover = 0.2;
+    atm.night = 0.0;
+    atm.sun_dir = Vec3::new(0.3, 0.8, 0.4).normalize();
+    renderer.atmosphere = atm;
+    let pit = crate::bosses::pit_positions()[1];
+    let steps_mid = Vec3::new(pit.x * 0.62, 0.0, pit.z * 0.62);
+    let shots: [(&str, Camera); 3] = [
+        ("glade_ring_above.png", Camera { eye: Vec3::new(rx - 14.0, 26.0, rz - 16.0), target: Vec3::new(rx, 0.0, rz), fov_y: 0.9 }),
+        ("glade_ring_ground.png", Camera { eye: Vec3::new(rx - 13.0, 3.0, rz - 9.0), target: Vec3::new(rx + 2.0, 1.5, rz + 2.0), fov_y: 1.0 }),
+        ("glade_steps.png", Camera { eye: steps_mid + Vec3::new(-16.0, 16.0, -14.0), target: steps_mid + Vec3::new(6.0, 0.0, 0.0), fov_y: 1.0 }),
+    ];
+    renderer.quality = crate::quality::Quality::High;
+    renderer.set_shadow_size(crate::quality::Quality::High.shadow_size());
+    for (name, cam) in shots {
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = atm;
+        renderer.render_frame(&view, cam, 1.0);
         save_shot(&renderer.device, &renderer.queue, &target, name)?;
         println!("saved {name}");
     }
