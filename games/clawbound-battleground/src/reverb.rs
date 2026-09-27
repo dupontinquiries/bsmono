@@ -187,7 +187,16 @@ pub fn space_at(pos: Vec3) -> Space {
         crate::map::MapId::Jungle => jungle_space(pos),
         crate::map::MapId::Sky => sky_space(pos),
         crate::map::MapId::Atlantis => drowned_space(pos),
+        crate::map::MapId::Maze => maze_space(pos),
     }
+}
+
+/// The Thornmaze: bare stone close on both sides, open to the sky. A
+/// short, bright slap off the near wall in the corridors; in a chamber
+/// (far from any wall) a bigger room and a later answer.
+fn maze_space(pos: Vec3) -> Space {
+    let open = (-crate::maze::floor().sdf(pos.x, pos.z) / 10.0).clamp(0.0, 1.0);
+    Space { room: 0.62 + 0.2 * open, damp: 0.4, wet: 0.34 + 0.1 * open, echo_time: 0.07 + 0.12 * open, echo_fb: 0.28, echo_wet: 0.24 - 0.06 * open }
 }
 
 /// The Drowned Halls: stone and glass all round, under the weight of the

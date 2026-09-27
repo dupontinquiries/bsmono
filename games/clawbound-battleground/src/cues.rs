@@ -122,6 +122,10 @@ pub fn cues_for(ev: &Event, game: &Game) -> Vec<Cue> {
         // a shadow torn out of Brasshowl's light: the air closing on it
         Event::ShadowDriven { pos } => vec![Cue { keys: vec!["sfx/stalker/swap".into()], bus: Bus::Sfx, gain: 0.8, pos: Some(*pos), speaker: None, priority: 3 }],
         // a Sentinel (`sentinel`): the ground taking her weight
+        // the Thornmaze's thorns: louder when it is the heavy bite (alone)
+        Event::ThornBite { pos, alone } => vec![Cue { keys: vec!["sfx/maze/thorns".into()], bus: Bus::Sfx, gain: if *alone { 0.85 } else { 0.55 }, pos: Some(*pos), speaker: None, priority: 3 }],
+        // the labyrinth turning: heard everywhere
+        Event::LabyrinthTurns => vec![Cue { keys: vec!["sfx/maze/turn".into()], bus: Bus::Sfx, gain: 0.8, pos: None, speaker: None, priority: 5 }],
         Event::Tread { pos } => vec![Cue { keys: vec!["sfx/sentinel/tread".into()], bus: Bus::Sfx, gain: 0.85, pos: Some(*pos), speaker: None, priority: 2 }],
         Event::Heartbeat { god, fear } => vec![Cue { keys: vec!["sfx/stalker/heart".into()], bus: Bus::Sfx, gain: 0.45 + 0.55 * fear, pos: god_pos(*god), speaker: None, priority: 4 }],
         _ => Vec::new(),

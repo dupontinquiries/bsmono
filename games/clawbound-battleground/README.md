@@ -1,6 +1,6 @@
 # Clawbound — Battleground · Rust + wgpu Microvoxel Edition
 
-A three-map arena for the **fifteen legendary ancestors of Clawbound**,
+A five-map arena for the **legendary ancestors of Clawbound**,
 built as a native Linux game in Rust + wgpu. No engine, no assets — every
 ancestor, minion, tower, Elder, projectile and ability effect is procedurally
 generated microvoxels: tens of thousands of instanced cubes with baked ambient
@@ -24,7 +24,23 @@ what else is known-but-unresolved.
   waves of four (five every third: 3 melee + 1–2 casters) that hold targets,
   answer a hit on their cats, and chase within a leash; 12 towers, two Elders
   gated behind tower kills.
-- **Three maps** — the jungle valley (5v5, three lanes), Twinfang Pass (15v15
+- **The Thornmaze** (5v5, `--map thornmaze`; `src/maze.rs`): a great walled
+  labyrinth of fifteen rooms -- courtyards, colonnades, the round Heart with
+  its stone cat, the beasts' pits -- joined by short passages. Two lanes wind
+  room to room down the west and east sides through passages that never
+  shut; every other passage is a GATE, and every 40 s **the labyrinth
+  turns**: a fresh pattern of stone slabs rises and sinks (a gate glows red
+  for 5 s before it moves; a gate and its mirror move together; no room is
+  ever cut off). From 75 s, every 50 s two sections (a room and its mirror)
+  **wake**: they stir for 8 s, then the thorns close for 36 s -- a cat alone
+  there loses a twentieth of its health a second and is slowed, with one
+  friend close a fiftieth, with two or more nothing. Anywhere on the map, a
+  cat with two friends within 10 u takes 10% less from every blow. Bots
+  route round shut gates, walk out of waking rooms they are alone in, and
+  hold at the edge rather than walk into one alone.
+- **The Drowned Halls** (3v3, `--map atlantis`): one colonnaded hall and a
+  domed library on the sea floor.
+- **The first three maps** — the jungle valley (5v5, three lanes), Twinfang Pass (15v15
   mountain canyon), and **Starwell Glacier** (15v15): two wide lanes over
   glacier islands in a starlit sky, waves of 32 minions a side in each lane
   (64 when they meet), cloud ferries you leap onto to ride across the chasms (miss, and the
@@ -389,6 +405,8 @@ src/
 ├── stalker.rs     Hollowstep's other, the terror radius, the step and every shadow
 ├── lantern.rs     Brasshowl's lamp: the flight from it, the shown-up, no shadows in it
 ├── sentinel.rs    the Sentinel role: coats instead of casts, the four fields, the bot's choice
+├── maze.rs        the Thornmaze: rooms and gates, the labyrinth turning, the waking, the thorns, the pack
+├── mazeworld.rs   the Thornmaze's dressing, gate slabs (collision + mesh), thorn spots
 ├── bosses.rs      the Elder Boar + Storm Drake: pits, AI, rewards, TargetRef::Boss
 ├── disasters.rs   wildfire / tempest / earthquake / flood / tornado + map scars
 ├── audio.rs       acoustics_at(pos) → howl/reverb voicing; WindSynth DSP; cpal shell

@@ -1924,6 +1924,7 @@ pub fn terrain_height(x: f32, z: f32) -> f32 {
         crate::map::MapId::Pass => return crate::pass::terrain_height(x, z),
         crate::map::MapId::Sky => return crate::sky::terrain_height(x, z),
         crate::map::MapId::Atlantis => return crate::atlantis::terrain_height(x, z),
+        crate::map::MapId::Maze => return crate::maze::terrain_height(x, z),
         crate::map::MapId::Jungle => {}
     }
     use crate::consts::{river_dist, GROUND_HALF, RIVER_HALF_WIDTH, RIVER_DEPTH, ARENA_RADIUS, RIM_RADIUS};
@@ -2055,6 +2056,8 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
                 (color, mat) = sky_ground_color(x, z, h, slope, n1, n2, nm);
             } else if crate::map::active() == crate::map::MapId::Atlantis {
                 (color, mat) = atlantis_ground_color(x, z, h, n1, n2, nm);
+            } else if crate::map::active() == crate::map::MapId::Maze {
+                (color, mat) = maze_ground_color(x, z, h, n1, n2, nm);
             } else if r > crate::consts::RIM_RADIUS + 3.0 && h > 14.0 {
                 // mountain rim: dark jungle rock with forest ledges
                 let rock = [0.24 + n1 * 0.05, 0.24 + n2 * 0.04, 0.22 + n1 * 0.03];
@@ -2337,6 +2340,63 @@ pub fn cavity_ao(h: f32, ring: f32) -> f32 {
 /// the Library; a medallion in each base), teal basalt walls laid in
 /// courses with a pale coping, and outside them the sea floor -- sand in
 /// dunes, dark rock.
+/// The Thornmaze: worn flagstones with moss in the joints and grass at the
+/// wall's foot; the walls old grey stone; their crown a dark thorn hedge,
+/// berried; the Heart's floor a ring of pale stone; beyond the outer wall,
+/// the hills' rock and heather.
+fn maze_ground_color(x: f32, z: f32, h: f32, n1: f32, n2: f32, nm: f32) -> ([f32; 3], f32) {
+    use crate::maze as mz;
+    let lerp = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    let d = mz::floor().sdf(x, z);
+    // the wall's stone: its face rises inside one terrain cell and has no
+    // vertices of its own, so it is drawn in the colours of the floor's last
+    // cell and the wall's first -- both are the wall's stone, or the face
+    // came out hedge green (the Drowned Halls' basalt skirting, the same way)
+    let wall_stone = |x: f32, z: f32| {
+        let course = ((z * 0.37 + x * 0.21).sin() > 0.9) as i32 as f32;
+        lerp([0.36 + n1 * 0.06, 0.35 + n1 * 0.05, 0.32 + n2 * 0.05], [0.20, 0.19, 0.18], course * 0.6)
+    };
+    if d > -1.7 && d <= 2.6 && !(mz::beyond(x, z) && h > mz::WALL_H + 2.0) {
+        return (wall_stone(x, z), 5.0);
+    }
+    if d <= 0.2 {
+        // flagstones (the detail shader draws the joints: sampled here at
+        // the 1.6 u vertices, joint lines were moss on random vertices,
+        // smeared green over the whole floor), and broad moss patches
+        let stone = [0.46 + n1 * 0.06, 0.44 + n1 * 0.05, 0.40 + n2 * 0.05];
+        let moss = [0.24 + n2 * 0.05, 0.30 + n1 * 0.05, 0.16];
+        let c = lerp(stone, moss, smoothstep(0.6, 0.8, nm) * 0.45);
+        // the Heart: a ring of pale stone round a dark centre stone
+        let hr = Vec3::new(x, 0.0, z).length();
+        if hr < mz::HEART_R - 1.5 {
+            if hr < 2.5 {
+                return ([0.16, 0.14, 0.13], 4.0);
+            }
+            let ring = ((hr - 2.5) / 2.6).fract();
+            if ring < 0.1 {
+                return ([0.64, 0.60, 0.52], 4.0);
+            }
+        }
+        return (c, 4.0);
+    }
+    if mz::beyond(x, z) && h > mz::WALL_H + 2.0 {
+        // the hills round the maze
+        let heather = [0.22 + n1 * 0.05, 0.24 + n2 * 0.05, 0.15 + n1 * 0.04];
+        let rock = [0.34 + n1 * 0.05, 0.33 + n1 * 0.05, 0.31 + n2 * 0.04];
+        return (if n2 > 0.55 { rock } else { heather }, 5.0);
+    }
+    if h < mz::WALL_H - 0.05 {
+        return (wall_stone(x, z), 5.0);
+    }
+    // the crown: a thorn hedge, dark green and black, red berries here and
+    // there
+    let hedge = [0.07 + n1 * 0.04, 0.16 + n2 * 0.06, 0.07 + n1 * 0.02];
+    let thorn = [0.08, 0.07, 0.06];
+    let berry = (vnoise(x * 1.7, z.abs() * 1.7) > 0.86) as i32 as f32;
+    let c = lerp(hedge, thorn, (n2 > 0.6) as i32 as f32 * 0.5);
+    (lerp(c, [0.55, 0.08, 0.10], berry), 0.0)
+}
+
 fn atlantis_ground_color(x: f32, z: f32, h: f32, n1: f32, n2: f32, nm: f32) -> ([f32; 3], f32) {
     use crate::atlantis as at;
     let lerp = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
@@ -2525,6 +2585,8 @@ fn build_water() -> (Vec<WaterVert>, Vec<u32>) {
         // the halls are dry; the sea is the whole world, drawn by the
         // renderer's sea grade, not a surface
         crate::map::MapId::Atlantis => return (Vec::new(), Vec::new()),
+        // the maze is dry
+        crate::map::MapId::Maze => return (Vec::new(), Vec::new()),
         crate::map::MapId::Jungle => {}
     }
     use crate::consts::{river_x, GROUND_HALF, RIVER_HALF_WIDTH, WATER_LEVEL};

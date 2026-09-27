@@ -764,7 +764,7 @@ fn ground_point_from_screen(s: &AppState, p: Vec2) -> Option<Vec3> {
     let player = &g.gods[0];
     let dir = cam_dir(s.cam_yaw, s.cam_pitch);
     let target = player.pos + Vec3::Y * 1.5;
-    let cam = Camera { eye: target - dir * s.cam_dist, target, fov_y: 0.95 };
+    let cam = Camera { eye: target - dir * crate::map::camera_boom(target, dir, s.cam_dist), target, fov_y: 0.95 };
     let aspect = s.renderer.width as f32 / s.renderer.height.max(1) as f32;
     let vp = cam.view_proj(aspect);
     let inv = vp.inverse();
@@ -794,7 +794,7 @@ fn cam_dir(yaw: f32, pitch: f32) -> Vec3 {
 fn compute_aim(s: &AppState) -> Vec3 {
     let player = &s.game.as_ref().unwrap().gods[0];
     let dir = cam_dir(s.cam_yaw, s.cam_pitch);
-    let eye = player.pos + Vec3::Y * 1.5 - dir * s.cam_dist;
+    let eye = player.pos + Vec3::Y * 1.5 - dir * crate::map::camera_boom(player.pos + Vec3::Y * 1.5, dir, s.cam_dist);
     // the camera ray against the REAL surface (the pass has a shelf and
     // slopes; the plane y = 0 put the aim somewhere else), clamped to 30 u
     // and set down on the ground there
@@ -948,7 +948,7 @@ fn finish_start(s: &mut AppState) {
     s.ui.announce = None;
     s.ui.shop_open = false;
     s.cam_yaw = std::f32::consts::PI;
-    s.cam_pitch = 0.38;
+    s.cam_pitch = crate::map::active().cam_pitch();
     s.walk_to = None;
     // The opening: every cat held out of the world until the intro brings
     // it in, and the intro ends on exactly the camera play starts with.
@@ -960,7 +960,7 @@ fn finish_start(s: &mut AppState) {
         let p0 = g.gods[0].pos;
         let dir = cam_dir(s.cam_yaw, s.cam_pitch);
         let target = p0 + Vec3::Y * 1.5;
-        let play = crate::intro::Shot { eye: target - dir * s.cam_dist, target, fov_y: 0.95 };
+        let play = crate::intro::Shot { eye: target - dir * crate::map::camera_boom(target, dir, s.cam_dist), target, fov_y: 0.95 };
         // the session's first match opens with the narrated prologue
         s.intro = Some(if s.intros_played == 0 { crate::intro::Intro::full(&teams, p0, play) } else { crate::intro::Intro::new(&teams, p0, play) });
         s.intros_played += 1;
@@ -1225,7 +1225,9 @@ fn render(s: &mut AppState) {
                     Camera { eye: shot.eye, target: shot.target, fov_y: shot.fov_y }
                 }
                 None => Camera {
-                    eye: target - dir * s.cam_dist + jolt * 0.5,
+                    // the boom comes in over the cat rather than sit in a
+                    // wall (`map::camera_boom`: the Thornmaze's corridors)
+                    eye: target - dir * crate::map::camera_boom(target, dir, s.cam_dist) + jolt * 0.5,
                     target,
                     fov_y: 0.95,
                 },

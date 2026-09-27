@@ -93,6 +93,12 @@ pub struct Scene {
     pub kitling: [u64; 2],
     /// Hollowstep's body, by team, for the others of him (`stalker`).
     pub hollow: [u64; 2],
+    /// The Thornmaze's thorns (three clumps), and where they rise, by the
+    /// class of section (`mazeworld::thorn_spots`); empty on other maps.
+    pub thorns: [u64; 3],
+    pub thorn_spots: Vec<(u8, Vec3, f32)>,
+    /// The Thornmaze's gate slab (one mesh, turned across each passage).
+    pub maze_gate: u64,
     pub disco: u64,
     /// The sky map's drifting stone and cloud (`skydrift`), and their meshes
     /// by kind (anchor, fragment, puff) and variant.
@@ -384,6 +390,9 @@ impl Scene {
         let disco = r.upload_mesh(&models::disco_ball());
         let hollow_def = ROSTER.iter().find(|d| matches!(d.pelt, crate::gods::PeltKind::Hollow)).expect("Hollowstep on the roster");
         let hollow = [r.upload_mesh(&models::build_god(hollow_def, Team::Blue)), r.upload_mesh(&models::build_god(hollow_def, Team::Red))];
+        let thorns = [0, 1, 2].map(|v| r.upload_mesh(&crate::mazeworld::thorn_mesh(v)));
+        let thorn_spots = if crate::map::active() == crate::map::MapId::Maze { crate::mazeworld::thorn_spots() } else { Vec::new() };
+        let maze_gate = r.upload_mesh(&crate::mazeworld::gate_mesh());
         let sky = crate::map::active() == crate::map::MapId::Sky;
         let drift = if sky { crate::skydrift::placements() } else { Vec::new() };
         let mut drift_mesh = [[0u64; DRIFT_VARIANTS]; 3];
@@ -439,6 +448,9 @@ impl Scene {
             star,
             kitling,
             hollow,
+            thorns,
+            thorn_spots,
+            maze_gate,
             disco,
             drift,
             drift_mesh,
@@ -1070,6 +1082,50 @@ impl Scene {
                 r.queue_draw(mesh, m, [0.78, 0.78, 0.82, 1.0], 0.0, models::GOD_DRAW_VOXEL, false);
             }
         }
+        // The Thornmaze's gates: each slab at the height the clock gives it
+        // (sunk into the floor when open), glowing red while it is about to
+        // move (a lane's never shuts and is never drawn up)
+        if crate::map::active() == crate::map::MapId::Maze {
+            let pulse = 0.5 + 0.5 * (vfx.time * 6.0).sin();
+            for (g, (h, warn)) in game.wake.gates_at(game.t).into_iter().enumerate() {
+                let p = crate::maze::passages()[g];
+                let mid = p.mid();
+                if (h <= 0.001 && !warn) || !sphere_in_frustum(&vp, mid, 8.0) {
+                    continue;
+                }
+                let d = p.dir();
+                // the mesh is built across x: turn x onto the passage's side
+                let yaw = d.x.atan2(d.z);
+                let sink = (1.0 - h) * crate::maze::WALL_H + if h <= 0.001 { crate::maze::WALL_H - 0.6 } else { 0.0 };
+                let m = Mat4::from_translation(mid - Vec3::Y * sink.min(crate::maze::WALL_H - 0.6)) * Mat4::from_axis_angle(Vec3::Y, yaw);
+                let (tint, glow) = if warn { ([1.3 + 0.5 * pulse, 0.55, 0.45, 1.0], 0.3 * pulse) } else { ([1.0; 4], 0.0) };
+                r.queue_draw(self.maze_gate, m, tint, glow, 0.5, false);
+            }
+        }
+        // The Thornmaze (`maze`): thorns rise along the walls of a waking
+        // section -- small and pulsing red while it stirs (the warning),
+        // full grown while it bites, sinking as it quiets
+        if !self.thorn_spots.is_empty() {
+            let moods: Vec<crate::maze::Mood> = (0..crate::maze::CLASSES).map(|c| game.wake.class_mood(c, game.t)).collect();
+            let pulse = 0.5 + 0.5 * (vfx.time * 7.0).sin();
+            for (k, (class, p, yaw)) in self.thorn_spots.iter().enumerate() {
+                let (scale, tint, glow) = match moods[*class as usize] {
+                    crate::maze::Mood::Calm => continue,
+                    crate::maze::Mood::Stirring(f) => (0.2 + 0.4 * f, [1.4 + 0.6 * pulse, 0.45, 0.4, 1.0], 0.25 + 0.35 * pulse),
+                    crate::maze::Mood::Hostile(f) => {
+                        let grow = (f / 0.04).min(1.0) * ((1.0 - f) / 0.08).min(1.0);
+                        (0.6 + 0.5 * grow, [1.0; 4], 0.0)
+                    }
+                };
+                if !sphere_in_frustum(&vp, *p, 2.5) {
+                    continue;
+                }
+                // (the clump is ~1.8 u; grown to ~3 u it reads against a
+                // 9.5 u wall)
+                let m = Mat4::from_translation(*p) * Mat4::from_axis_angle(Vec3::Y, *yaw) * Mat4::from_scale(Vec3::splat(scale * 1.7));
+                r.queue_draw(self.thorns[k % 3], m, tint, glow, 0.12, false);
+            }
+        }
         // Sproutkit's litter: his own body, small, hopping as it runs
         for k in &game.kitlings {
             if !sphere_in_frustum(&vp, k.pos, ACTOR_CULL_R) {
@@ -1327,6 +1383,10 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
         }
         crate::map::MapId::Atlantis => {
             let (pieces, blockers) = crate::atlantisworld::build();
+            return batch(pieces, blockers);
+        }
+        crate::map::MapId::Maze => {
+            let (pieces, blockers) = crate::mazeworld::build();
             return batch(pieces, blockers);
         }
         crate::map::MapId::Jungle => {}

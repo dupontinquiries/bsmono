@@ -146,6 +146,9 @@ pub fn climate() -> &'static [WeatherKind] {
         // under the sea there is no weather: the light from above only
         // clears and dims as the surface far overhead does
         crate::map::MapId::Atlantis => &[Clear, Clear, Overcast],
+        // an old labyrinth in a hollow of the hills: grey and misty more
+        // often than not, and rain; no snow
+        crate::map::MapId::Maze => &[Overcast, Overcast, Fog, Fog, Clear, Rain],
     }
 }
 
@@ -166,6 +169,7 @@ pub fn opening() -> WeatherKind {
         crate::map::MapId::Pass => WeatherKind::Overcast,
         crate::map::MapId::Sky => WeatherKind::Clear,
         crate::map::MapId::Atlantis => WeatherKind::Clear,
+        crate::map::MapId::Maze => WeatherKind::Overcast,
     }
 }
 

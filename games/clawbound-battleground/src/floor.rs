@@ -179,7 +179,13 @@ impl FloorPlan {
     /// did exactly that. `None` when the goal is in plain sight or no
     /// route exists.
     pub fn next_waypoint(&self, from: Vec3, to: Vec3, margin: f32) -> Option<Vec3> {
-        let route = self.route(from, to);
+        self.next_waypoint_with(from, to, margin, &|_| true)
+    }
+
+    /// As [`next_waypoint`](Self::next_waypoint), routing only through the
+    /// shapes `open` allows.
+    pub fn next_waypoint_with(&self, from: Vec3, to: Vec3, margin: f32, open: &dyn Fn(usize) -> bool) -> Option<Vec3> {
+        let route = self.route_with(from, to, open);
         if route.len() <= 1 {
             return None;
         }
@@ -209,6 +215,12 @@ impl FloorPlan {
     /// distance between successive points -- short routes, not optimal
     /// ones, and cheap: a hundred-odd nodes.
     pub fn route(&self, from: Vec3, to: Vec3) -> Vec<Vec3> {
+        self.route_with(from, to, &|_| true)
+    }
+
+    /// As [`route`](Self::route), through only the shapes `open` allows (a
+    /// shut gate's passage is not a way: the Thornmaze).
+    pub fn route_with(&self, from: Vec3, to: Vec3, open: &dyn Fn(usize) -> bool) -> Vec<Vec3> {
         let (Some(s), Some(g)) = (self.shape_at(from.x, from.z), self.shape_at(to.x, to.z)) else { return vec![to] };
         if s == g {
             return vec![to];
@@ -235,6 +247,9 @@ impl FloorPlan {
             }
             done[u] = true;
             for l in &links[u] {
+                if !open(l.to) {
+                    continue;
+                }
                 let c = cost[u] + (l.portal - at[u]).length();
                 if c < cost[l.to] {
                     cost[l.to] = c;

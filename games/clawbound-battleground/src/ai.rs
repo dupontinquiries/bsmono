@@ -357,6 +357,17 @@ pub fn think(game: &mut Game, gi: usize) {
         }
     }
 
+    // The Thornmaze: alone (or one of two) in ground that is waking, get
+    // out of it -- to a friend close enough to reach, else to calm ground
+    // (`maze::bot_goal`). Not mid-fight: the stance decides that.
+    if state == AiState::Push && goal.is_none() {
+        if let Some(p) = crate::maze::bot_goal(game, gi) {
+            let me = &game.gods[gi];
+            move_dir = Vec3::new(p.x - me.pos.x, 0.0, p.z - me.pos.z).normalize_or_zero();
+            goal = Some(p);
+        }
+    }
+
     // the hunt: hurt, with no enemy ancestor in sight and prey close by,
     // an ancestor breaks off to chase it (a mouthful of health + gold). If a
     // dash is off cooldown and the animal is in range, pounce with it.
@@ -477,7 +488,8 @@ pub fn think(game: &mut Game, gi: usize) {
             let reached = m.route_wp.is_some_and(|w| Vec3::new(w.x - pos.x, 0.0, w.z - pos.z).length() < 1.5);
             if !(now - m.route_t < crate::steer::ROUTE_EVERY) || reached {
                 let tgt = game.ai_move_target(gi);
-                let wp = f.next_waypoint(pos, tgt, 0.5);
+                // (not through a shut gate: the Thornmaze -- `route_open`)
+                let wp = f.next_waypoint_with(game.route_from(pos), tgt, 0.5, &|s| game.route_open(s));
                 let m = &mut game.steer_mem[gi];
                 m.route_wp = wp;
                 m.route_t = now;

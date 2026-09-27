@@ -38,10 +38,14 @@ pub enum MapId {
     /// The Drowned Halls: 3 a side on the sea floor, one lane hall and one
     /// jungle rotunda, walled and domed (`atlantis`).
     Atlantis,
+    /// The Thornmaze: 5 a side in a great walled labyrinth, two winding
+    /// lanes, and sections that wake and turn on whoever walks them alone
+    /// (`maze`).
+    Maze,
 }
 
 impl MapId {
-    pub const ALL: [MapId; 4] = [MapId::Jungle, MapId::Pass, MapId::Sky, MapId::Atlantis];
+    pub const ALL: [MapId; 5] = [MapId::Jungle, MapId::Pass, MapId::Sky, MapId::Atlantis, MapId::Maze];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -49,6 +53,7 @@ impl MapId {
             MapId::Pass => "Twinfang Pass",
             MapId::Sky => "Starwell Glacier",
             MapId::Atlantis => "The Drowned Halls",
+            MapId::Maze => "The Thornmaze",
         }
     }
     /// Command-line / config key.
@@ -58,6 +63,7 @@ impl MapId {
             MapId::Pass => "pass",
             MapId::Sky => "starwell",
             MapId::Atlantis => "atlantis",
+            MapId::Maze => "thornmaze",
         }
     }
     pub fn from_key(s: &str) -> Option<MapId> {
@@ -70,6 +76,7 @@ impl MapId {
             MapId::Pass => crate::pass::TEAM_SIZE,
             MapId::Sky => crate::sky::TEAM_SIZE,
             MapId::Atlantis => crate::atlantis::TEAM_SIZE,
+            MapId::Maze => crate::maze::TEAM_SIZE,
         }
     }
     /// The lanes minions walk and towers stand on. The sky map has two:
@@ -78,7 +85,7 @@ impl MapId {
         use crate::consts::Lane;
         match self {
             MapId::Jungle | MapId::Pass => &crate::consts::LANES,
-            MapId::Sky => &[Lane::Top, Lane::Bot],
+            MapId::Sky | MapId::Maze => &[Lane::Top, Lane::Bot],
             MapId::Atlantis => &[Lane::Mid],
         }
     }
@@ -86,7 +93,7 @@ impl MapId {
     /// number `n` (`minionai::wave_for` on the smaller maps).
     pub fn wave(self, n: u32) -> (usize, usize) {
         match self {
-            MapId::Jungle | MapId::Pass | MapId::Atlantis => crate::minionai::wave_for(n),
+            MapId::Jungle | MapId::Pass | MapId::Atlantis | MapId::Maze => crate::minionai::wave_for(n),
             // thirty-two a side in each lane (sixty-four when the waves meet)
             MapId::Sky => (24, 8),
         }
@@ -98,7 +105,7 @@ impl MapId {
     /// three stalled to the cap.
     pub fn structure_hp_mul(self) -> f32 {
         match self {
-            MapId::Jungle | MapId::Pass | MapId::Atlantis => 1.0,
+            MapId::Jungle | MapId::Pass | MapId::Atlantis | MapId::Maze => 1.0,
             MapId::Sky => 2.0,
         }
     }
@@ -109,7 +116,7 @@ impl MapId {
     /// wave does, against twice the health.
     pub fn minion_structure_mul(self) -> f32 {
         match self {
-            MapId::Jungle | MapId::Pass | MapId::Atlantis => 1.0,
+            MapId::Jungle | MapId::Pass | MapId::Atlantis | MapId::Maze => 1.0,
             MapId::Sky => 0.3,
         }
     }
@@ -120,7 +127,7 @@ impl MapId {
     /// standing (the super-minion answer, cut down). 0 elsewhere.
     pub fn siege_surge(self) -> f32 {
         match self {
-            MapId::Jungle | MapId::Pass | MapId::Atlantis => 0.0,
+            MapId::Jungle | MapId::Pass | MapId::Atlantis | MapId::Maze => 0.0,
             MapId::Sky => 0.4,
         }
     }
@@ -131,8 +138,18 @@ impl MapId {
     /// `OVERTIME_AT` the multiplier climbs 12% a minute, to x4. 1 elsewhere.
     pub fn overtime(self, t: f32) -> f32 {
         match self {
-            MapId::Jungle | MapId::Pass | MapId::Atlantis => 1.0,
+            MapId::Jungle | MapId::Pass | MapId::Atlantis | MapId::Maze => 1.0,
             MapId::Sky => (1.0 + (t - OVERTIME_AT).max(0.0) / 60.0 * 0.12).min(4.0),
+        }
+    }
+    /// The play camera's pitch at the start of a match (radians down from
+    /// level). Steeper in the Thornmaze: at the usual 0.38 the camera sat
+    /// in its walls whenever a cat backed toward one; from higher it looks
+    /// down into the rooms and over the walls (`camera_boom` does the rest).
+    pub fn cam_pitch(self) -> f32 {
+        match self {
+            MapId::Maze => 0.62,
+            _ => 0.38,
         }
     }
     /// A team's Elder is shielded while it has at least this many towers
@@ -141,7 +158,8 @@ impl MapId {
     pub fn titan_towers_req(self) -> usize {
         match self {
             MapId::Jungle | MapId::Pass => crate::consts::TITAN_TOWERS_REQ,
-            MapId::Sky => 3,
+            // two lanes, two towers a side each: open when two fall
+            MapId::Sky | MapId::Maze => 3,
             // one lane, two towers a side: the Elder opens when both fall
             MapId::Atlantis => 1,
         }
@@ -192,6 +210,7 @@ pub fn open_ground(x: f32, z: f32, margin: f32) -> bool {
         MapId::Pass => crate::pass::floor().fits(x, z, margin),
         MapId::Sky => crate::sky::floor().fits(x, z, margin),
         MapId::Atlantis => crate::atlantis::floor().fits(x, z, margin),
+        MapId::Maze => crate::maze::floor().fits(x, z, margin),
     }
 }
 
@@ -204,6 +223,7 @@ pub fn ground_y(x: f32, z: f32) -> f32 {
         MapId::Pass => crate::pass::floor_height(x, z),
         MapId::Sky => crate::sky::floor_height(x, z),
         MapId::Atlantis => crate::atlantis::floor_height(x, z),
+        MapId::Maze => crate::maze::floor_height(x, z),
     }
 }
 
@@ -212,7 +232,7 @@ pub fn ground_y(x: f32, z: f32) -> f32 {
 /// anything above the floor falls).
 pub fn step_down() -> f32 {
     match active() {
-        MapId::Jungle | MapId::Sky | MapId::Atlantis => 0.0,
+        MapId::Jungle | MapId::Sky | MapId::Atlantis | MapId::Maze => 0.0,
         MapId::Pass => 0.8,
     }
 }
@@ -224,6 +244,7 @@ pub fn floor() -> Option<&'static crate::floor::FloorPlan> {
         MapId::Pass => Some(crate::pass::floor()),
         MapId::Sky => Some(crate::sky::floor()),
         MapId::Atlantis => Some(crate::atlantis::floor()),
+        MapId::Maze => Some(crate::maze::floor()),
     }
 }
 
@@ -452,6 +473,31 @@ pub fn ray_ground(eye: Vec3, dir: Vec3, max_t: f32) -> Option<Vec3> {
     None
 }
 
+/// How far behind the cat the play camera may sit: `dist`, or less if the
+/// terrain rises between the cat's head (`target`) and the camera, so the
+/// camera comes in over the cat rather than sitting inside a wall. `dir` is
+/// the view direction (from the camera to the target). Never nearer than
+/// [`BOOM_MIN`].
+pub fn camera_boom(target: Vec3, dir: Vec3, dist: f32) -> f32 {
+    if !(target.is_finite() && dir.is_finite()) || dist <= BOOM_MIN {
+        return dist;
+    }
+    let back = -dir.normalize_or_zero();
+    let mut d = 0.3;
+    while d <= dist {
+        let p = target + back * d;
+        if p.y < surface_y(p.x, p.z) + BOOM_CLEAR {
+            return (d - 0.6).max(BOOM_MIN);
+        }
+        d += 0.25;
+    }
+    dist
+}
+
+/// The camera boom's shortest, and how far it keeps above the surface.
+pub const BOOM_MIN: f32 = 2.5;
+pub const BOOM_CLEAR: f32 = 0.5;
+
 /// Is the straight line from `a` to `b` clear of the terrain? Sampled
 /// along its length (the ends excluded, so a point ON the ground still
 /// sees). For health bars behind rock, and cameras looking at a fight.
@@ -501,6 +547,37 @@ mod ray_tests {
             let d = (target - eye).normalize();
             let plane = eye + d * (-eye.y / d.y);
             assert!((plane - target).length() > 5.0, "the plane missed by {}", (plane - target).length());
+        });
+    }
+
+    /// The camera boom: out in the open it keeps its length; with a
+    /// maze wall behind the cat it comes in short of the wall, and no
+    /// nearer than its minimum.
+    #[test]
+    fn the_camera_does_not_sit_in_a_wall() {
+        with(MapId::Maze, || {
+            let f = crate::maze::floor();
+            // a spot on the floor with a wall close behind it along -z
+            let mut found = None;
+            'scan: for x in (-200..=200).step_by(2) {
+                for z in (-200..=200).step_by(2) {
+                    let (x, z) = (x as f32, z as f32);
+                    if f.sdf(x, z) < -2.0 && f.sdf(x, z - 5.0) > 1.0 {
+                        found = Some(Vec3::new(x, 1.5, z));
+                        break 'scan;
+                    }
+                }
+            }
+            let target = found.expect("a wall behind some floor");
+            let dir = Vec3::new(0.0, -0.38f32.sin(), 0.38f32.cos()); // looking +z
+            let d = camera_boom(target, dir, 8.5);
+            assert!(d < 5.0 && d >= BOOM_MIN, "boom {d} with a wall 5 u behind");
+            let eye = target - dir.normalize() * d;
+            assert!(eye.y > surface_y(eye.x, eye.z), "the camera is in the wall at {eye}");
+        });
+        with(MapId::Jungle, || {
+            let dir = Vec3::new(0.0, -0.38f32.sin(), 0.38f32.cos());
+            assert_eq!(camera_boom(Vec3::new(0.0, 1.5, 0.0), dir, 8.5), 8.5, "open ground: full length");
         });
     }
 

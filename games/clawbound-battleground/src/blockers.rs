@@ -363,6 +363,14 @@ pub struct Blockers {
     /// On a map carved out of rock (`floor`), the edge of the floor is a
     /// wall too: a cliff. `None` on the open jungle.
     floor: Option<&'static crate::floor::FloorPlan>,
+    /// Gates: blockers that come and go while a match runs (the Thornmaze's
+    /// labyrinth turning). `gate_of[i]` is blocker `i`'s gate (u16::MAX:
+    /// not a gate); an OPEN gate is skipped by every query, at `near`, the
+    /// one door they all come through. The flags are shared by every clone
+    /// of this set (the scene's and the match's are the same walls) and set
+    /// by the sim from match time, so they are a function of the clock.
+    gate_of: Vec<u16>,
+    gates: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>>,
 }
 
 impl Blockers {
@@ -382,7 +390,42 @@ impl Blockers {
             half_extent,
             going: crate::going::Going::new(half_extent, cell),
             floor: None,
+            gate_of: Vec::new(),
+            gates: Default::default(),
         }
+    }
+
+    /// Add a gate: a blocker that is there only while it is closed. Gates
+    /// start OPEN. Returns the gate's id. Only while the set is being built
+    /// (before it is shared).
+    pub fn push_gate(&mut self, b: Blocker) -> usize {
+        let id = self.gates.len();
+        std::sync::Arc::get_mut(&mut self.gates).expect("gates are added while the set is built, before it is shared").push(std::sync::atomic::AtomicBool::new(true));
+        let idx = self.all.len();
+        self.push(b);
+        self.gate_of.resize(self.all.len(), u16::MAX);
+        self.gate_of[idx] = id as u16;
+        id
+    }
+
+    /// Open or close gate `id` (for every clone of this set).
+    pub fn set_gate(&self, id: usize, open: bool) {
+        if let Some(g) = self.gates.get(id) {
+            g.store(open, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn gate_open(&self, id: usize) -> bool {
+        self.gates.get(id).is_none_or(|g| g.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn gate_count(&self) -> usize {
+        self.gates.len()
+    }
+
+    /// Is blocker `i` an open gate (and so not there)?
+    fn open_gate(&self, i: u32) -> bool {
+        self.gate_of.get(i as usize).is_some_and(|&g| g != u16::MAX && self.gate_open(g as usize))
     }
 
     /// Make the edge of `floor` a wall: everything off it is cliff.
@@ -709,7 +752,7 @@ impl Blockers {
         for gz in z0..=z1 {
             for gx in x0..=x1 {
                 for &i in &self.cells[(gz * self.dim + gx) as usize] {
-                    if !out.contains(&i) {
+                    if !out.contains(&i) && !self.open_gate(i) {
                         out.push(i);
                     }
                 }
@@ -900,6 +943,30 @@ impl Blockers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gate is a wall while shut and nothing while open, to every query
+    /// (collision, `blocked`); the flag is shared by every clone of the set
+    /// (the scene's walls and the match's are one); and the ordinary
+    /// blockers round it are untouched either way.
+    #[test]
+    fn a_gate_is_a_wall_only_while_shut() {
+        let mut b = Blockers::new(100.0, 4.0);
+        let wall = Blocker { shape: Shape::Segment { x0: -5.0, z0: 0.0, x1: 5.0, z1: 0.0, r: 1.0 }, top: 9.0, cover: Cover::NONE };
+        let g = b.push_gate(wall);
+        b.push(Blocker { shape: Shape::Circle { x: 20.0, z: 0.0, r: 1.0 }, top: 3.0, cover: Cover::NONE });
+        let shared = std::sync::Arc::new(b);
+        let other = shared.clone();
+        let on = Vec3::new(0.0, 0.0, 0.3);
+        assert!(shared.gate_open(g), "gates start open");
+        assert!(!shared.blocked(on.x, on.z, 0.5));
+        assert_eq!(shared.resolve(on, 0.5), on, "open: no push");
+        other.set_gate(g, false);
+        assert!(shared.blocked(on.x, on.z, 0.5), "shut, seen through the other clone");
+        assert!(shared.resolve(on, 0.5).z > 1.4, "shut: pushed out of the slab");
+        assert!(shared.blocked(20.0, 0.0, 0.5) && !shared.blocked(20.0, 5.0, 0.5), "the ordinary blocker, either way");
+        shared.set_gate(g, true);
+        assert!(!shared.blocked(on.x, on.z, 0.5));
+    }
 
     fn one(shape: Shape) -> Blockers {
         let mut b = Blockers::new(100.0, 4.0);
