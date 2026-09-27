@@ -100,7 +100,7 @@ pub fn mastery_text(arch: &Archetype) -> &'static str {
         Archetype::Remold { .. } => "Mastery: a quarter more clay pressed back",
         Archetype::Quicken { .. } => "Mastery: quick 40% longer",
         Archetype::Spin { .. } => "Mastery: spins 20% further, a wider slick",
-        Archetype::Mudslide { .. } => "Mastery: two more kittens in the mud",
+        Archetype::Mudslide { .. } => "Mastery: two more kittens, and the mud runs 20% further",
     }
 }
 
@@ -138,7 +138,7 @@ pub fn mastery(arch: Archetype) -> Archetype {
         Remold { heal } => Remold { heal: heal * 1.25 },
         Quicken { secs } => Quicken { secs: secs * 1.4 },
         Spin { dist, dmg, radius, secs } => Spin { dist: dist * 1.2, dmg, radius: radius * 1.25, secs },
-        Mudslide { len, width, push, secs, kits } => Mudslide { len, width, push, secs, kits: kits + 2 },
+        Mudslide { len, width, speed, dmg, kits } => Mudslide { len: len * 1.2, width, speed, dmg, kits: kits + 2 },
     }
 }
 
@@ -182,7 +182,7 @@ fn scale_amounts(arch: Archetype, m: f32) -> Archetype {
         Remold { heal } => Remold { heal: heal * m },
         Quicken { secs } => Quicken { secs: secs * (1.0 + (m - 1.0) * 0.5) },
         Spin { dist, dmg, radius, secs } => Spin { dist, dmg: dmg * m, radius, secs },
-        Mudslide { len, width, push, secs, kits } => Mudslide { len, width, push, secs: secs * (1.0 + (m - 1.0) * 0.5), kits },
+        Mudslide { len, width, speed, dmg, kits } => Mudslide { len, width, speed, dmg: dmg * m, kits },
     }
 }
 

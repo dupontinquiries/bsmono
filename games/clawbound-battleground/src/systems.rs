@@ -142,6 +142,7 @@ impl Game {
                 lane_off: o[1] * if melee + casters > 5 { 1.6 } else { 1.0 },
                 giggle_t: 0.0,
                 dance_t: 0.0,
+                clay: None,
             });
         }
     }
@@ -658,6 +659,12 @@ impl Game {
                     let want = if m.caster { reach * 0.85 } else { reach - 0.3 };
                     (flat(p - m.pos) > want).then_some(p)
                 }
+                // a mudslide kitten with no one in reach runs on the way the
+                // mud carried it (`clay`)
+                None if self.minions[mi].clay.is_some() => {
+                    let m = &self.minions[mi];
+                    Some(m.pos + m.clay.unwrap().heading * 4.0)
+                }
                 None => {
                     let m = &mut self.minions[mi];
                     match m.left_at {
@@ -687,7 +694,8 @@ impl Game {
                     let d = Vec3::new(target.x - m.pos.x, 0.0, target.z - m.pos.z);
                     if d.length_squared() > 0.001 {
                         let shuffle = if m.dance_t > 0.0 { crate::kit::DANCE_MOVE } else { 1.0 };
-                        let step = (7.4 * shuffle * dt).min(d.length());
+                        let pace = if m.clay.is_some() { crate::clay::SLIDE_KIT_SPEED } else { 7.4 };
+                        let step = (pace * shuffle * dt).min(d.length());
                         m.pos += d.normalize() * step;
                         m.yaw = d.z.atan2(d.x);
                         m.walk_anim += dt * 10.0;
@@ -920,9 +928,15 @@ impl Game {
             }
             m.atk_timer = MINION_ATK_CD;
             m.atk_anim = 1.0;
-            let mut dmg = if m.caster { MINION_CASTER_DMG } else { MINION_DMG };
-            dmg *= 1.0 + (self.t / 60.0).min(15.0) * 0.08;
-            dmg *= surge;
+            // a mudslide kitten (`clay`) bites as hard as it was made to,
+            // and its bites are its maker's
+            let clay = m.clay;
+            let mut dmg = if let Some(c) = clay { c.dmg } else if m.caster { MINION_CASTER_DMG } else { MINION_DMG };
+            if clay.is_none() {
+                dmg *= 1.0 + (self.t / 60.0).min(15.0) * 0.08;
+                dmg *= surge;
+            }
+            let src = clay.map(|c| c.owner);
             // structures take bonus minion damage so lanes actually fall
             if matches!(target.unwrap(), TargetRef::Tower(_) | TargetRef::Titan(_)) {
                 dmg *= 2.4 * crate::map::active().minion_structure_mul();
@@ -932,18 +946,18 @@ impl Game {
                     if m.caster {
                         self.spawn_minion_bolt(mi, TargetRef::God(gi));
                     } else {
-                        self.deal_damage(TargetRef::God(gi), dmg, false, None, 0.0, 0.0);
+                        self.deal_damage(TargetRef::God(gi), dmg, false, src, 0.0, 0.0);
                     }
                 }
                 TargetRef::Minion(oi) => {
                     if m.caster {
                         self.spawn_minion_bolt(mi, TargetRef::Minion(oi));
                     } else {
-                        self.deal_damage(TargetRef::Minion(oi), dmg, false, None, 0.0, 0.0);
+                        self.deal_damage(TargetRef::Minion(oi), dmg, false, src, 0.0, 0.0);
                     }
                 }
-                TargetRef::Tower(ti) => self.deal_damage(TargetRef::Tower(ti), dmg, false, None, 0.0, 0.0),
-                TargetRef::Titan(team) => self.deal_damage(TargetRef::Titan(team), dmg, false, None, 0.0, 0.0),
+                TargetRef::Tower(ti) => self.deal_damage(TargetRef::Tower(ti), dmg, false, src, 0.0, 0.0),
+                TargetRef::Titan(team) => self.deal_damage(TargetRef::Titan(team), dmg, false, src, 0.0, 0.0),
                 TargetRef::Boss(_) => {} // minions never fight the beasts
             }
         }

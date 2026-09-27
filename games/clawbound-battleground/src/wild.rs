@@ -396,6 +396,8 @@ impl Game {
                 continue;
             }
             let p = self.wild.prey.remove(pi);
+            // a jungle kill: a kitten, if Claypaw's mudslide is running (`clay`)
+            self.clay_kill_credit(hi, crate::clay::KITS_PER_SMALL_KILL, p.pos);
             let gold = p.kind.gold() * self.map_events.gold_mul();
             let team = self.gods[hi].team;
             let name = self.god_name(hi);

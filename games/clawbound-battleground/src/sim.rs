@@ -128,6 +128,11 @@ pub enum Event {
     ClayShaped { pos: Vec3, n: u32 },
     ClayRemold { pos: Vec3 },
     SlickFx { a: Vec3, b: Vec3, r: f32 },
+    /// A mudslide's front crushing through a plant, and sloshing off a wall.
+    Smush { pos: Vec3 },
+    /// The bank giving way: a mudslide set running from `pos` along `dir`.
+    MudslideFx { pos: Vec3, dir: Vec3 },
+    Slosh { pos: Vec3 },
 }
 
 #[derive(Clone, Debug)]
@@ -313,6 +318,9 @@ pub struct GodUnit {
     pub clay_wet: f32,
     pub clay_quick_t: f32,
     pub clay_kit_t: f32,
+    /// Claypaw's mudslide surge: seconds left in which his kills shape more
+    /// kittens.
+    pub clay_surge_t: f32,
     /// The way it is sliding on a mud slick (`clay`); zero off one.
     pub slide: Vec3,
     /// A Sentinel's coat (`sentinel`): the key she wears, the one a lasting
@@ -396,6 +404,9 @@ pub struct Minion {
     /// Giggling / dancing (Sproutkit, `kit`): no attacks; a dancer shuffles.
     pub giggle_t: f32,
     pub dance_t: f32,
+    /// One of Claypaw's mudslide kittens (`clay`): not a lane minion but
+    /// his, for a while -- and worth a bounty to whoever breaks it.
+    pub clay: Option<crate::clay::ClayKit>,
 }
 
 pub struct Tower {
@@ -495,8 +506,9 @@ pub struct Game {
     pub zones: Vec<Zone>,
     /// Sproutkit's litters, running (`kit`), and Claypaw's clay kittens.
     pub kitlings: Vec<crate::kit::Kitling>,
-    /// Claypaw's mud slicks (`clay`).
+    /// Claypaw's mud slicks, and his mudslides running (`clay`).
     pub slicks: Vec<crate::clay::Slick>,
+    pub mudslides: Vec<crate::clay::Wave>,
     /// Hollowstep's others -- his standing one and his echoes (`stalker`).
     pub others: Vec<crate::stalker::Other>,
     pub events: Vec<Event>,
@@ -674,6 +686,7 @@ impl Game {
                 clay_wet: 1.0,
                 clay_quick_t: 0.0,
                 clay_kit_t: crate::clay::KIT_EVERY,
+                clay_surge_t: 0.0,
                 slide: Vec3::ZERO,
                 field_slot: None,
                 field_back: None,
@@ -732,6 +745,7 @@ impl Game {
             zones: Vec::new(),
             kitlings: Vec::new(),
             slicks: Vec::new(),
+            mudslides: Vec::new(),
             others: Vec::new(),
             events: Vec::new(),
             killfeed: Vec::new(),
@@ -1187,7 +1201,9 @@ impl Game {
 
     fn on_minion_death(&mut self, mi: usize) {
         let m = &self.minions[mi];
-        let gold = if m.caster { GOLD_CASTER } else { GOLD_MELEE };
+        // (one of Claypaw's mudslide kittens: its bounty, the price of his
+        // gamble -- `clay`)
+        let gold = if m.clay.is_some() { crate::clay::SLIDE_KIT_GOLD } else if m.caster { GOLD_CASTER } else { GOLD_MELEE };
         let xp = if m.caster { XP_CASTER } else { XP_MELEE };
         let pos = m.pos;
         let enemy_team = m.team.other();
@@ -1197,6 +1213,7 @@ impl Game {
                 let team = self.gods[killer].team;
                 self.gods[killer].gold += gold * self.map_events.gold_mul() * self.bosses.gold_mul(team);
                 self.add_stacks(killer, StackKind::MinionKill, 1.0);
+                self.clay_kill_credit(killer, crate::clay::KITS_PER_SMALL_KILL, pos);
             }
         }
         for i in 0..self.gods.len() {
@@ -1266,6 +1283,7 @@ impl Game {
                 kg.gold += GOLD_GOD * self.map_events.gold_mul() * self.bosses.gold_mul(kt);
                 self.add_stacks(k, StackKind::GodKill, 1.0);
                 self.grant_xp(k, XP_GOD);
+                self.clay_kill_credit(k, crate::clay::KITS_PER_GOD_KILL, pos);
                 kill_text = format!("{} slew {}", self.god_name(k), name);
             }
         }

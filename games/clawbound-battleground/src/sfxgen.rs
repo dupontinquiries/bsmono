@@ -624,7 +624,7 @@ pub fn ability(def: &GodDef, slot: usize) -> Vec<f32> {
 }
 
 /// The shared sounds, by bank key.
-pub const GENERIC: [&str; 15] = [
+pub const GENERIC: [&str; 17] = [
     "sfx/hit", "sfx/hit_big", "sfx/whiff", "sfx/levelup", "sfx/tower_down", "sfx/cast",
     // Hollowstep's world (`stalker`): a pounding heart, his heavy tread,
     // and the air closing where he left
@@ -639,6 +639,8 @@ pub const GENERIC: [&str; 15] = [
     "sfx/maze/boulder",
     // a stone landing off its chute; a lock's pad swinging open
     "sfx/maze/land", "sfx/maze/trapdoor",
+    // Claypaw's mudslide (`clay`): a plant crushed; a wall sloshed off
+    "sfx/clay/smush", "sfx/clay/slosh",
 ];
 
 pub fn generic(key: &str) -> Vec<f32> {
@@ -760,6 +762,30 @@ pub fn generic(key: &str) -> Vec<f32> {
                 mix_at(&mut x, &bump, b, 0.5 * (1.0 - b / len));
                 b += 0.36;
             }
+            x
+        }
+        "sfx/clay/smush" => {
+            // wood and stems giving way under mud: splintering crackles
+            // over a wet crunch
+            let mut x = thud(0.25, 180.0, 90.0, 0.9, &mut n);
+            let len = 0.35;
+            let mut cr = vec![0.0; secs(len)];
+            let mut bp = Svf::default();
+            for (i, o) in cr.iter_mut().enumerate() {
+                let t = i as f32 / RATE;
+                let snap = if n.next() > 0.985 { n.next() * 3.0 } else { 0.0 };
+                let (_, b2, _) = bp.run(snap, 2200.0, 2.0);
+                *o = b2 * env(t, 0.005, 0.25);
+            }
+            mix_at(&mut x, &cr, 0.0, 0.7);
+            x
+        }
+        "sfx/clay/slosh" => {
+            // a wave of mud hitting stone and falling back: a heavy slap,
+            // then a sucking, sliding hiss
+            let mut x = thud(0.3, 110.0, 50.0, 0.6, &mut n);
+            let w = whoosh(0.7, 2000.0, 400.0, 0.7, &mut n);
+            mix_at(&mut x, &w, 0.05, 0.7);
             x
         }
         "sfx/maze/land" => {

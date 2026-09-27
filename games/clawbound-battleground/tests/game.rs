@@ -843,6 +843,7 @@ fn firing_range_every_ability_goes_where_it_is_aimed_and_turns_the_cat() {
                     }
                     // Claypaw's mud (`clay`): the way its slick runs
                     Event::SlickFx { a, b, .. } => dirs.push(Vec3::new(b.x - a.x, 0.0, b.z - a.z).normalize_or_zero()),
+                    Event::MudslideFx { dir, .. } => dirs.push(Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero()),
                     _ => {}
                 }
             }

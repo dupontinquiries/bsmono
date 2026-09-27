@@ -473,6 +473,10 @@ impl Game {
                 b.kills += 1;
             }
             self.events.push(Event::BossDown { kind, pos, team });
+            // a jungle kill: a kitten, if Claypaw's mudslide is running (`clay`)
+            if let Some(s) = source {
+                self.clay_kill_credit(s, crate::clay::KITS_PER_SMALL_KILL, pos);
+            }
             if let Some(team) = team {
                 let ti = team as usize;
                 match kind {

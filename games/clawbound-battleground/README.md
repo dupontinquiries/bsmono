@@ -152,8 +152,15 @@ what else is known-but-unresolved.
   his speed over 20 s. **Remold** presses 22% of his health back;
   **Quicken** wets him again -- 20% faster, kittens every 2.5 s, for 6 s;
   **Spin** is a spinning dash that leaves a MUD SLICK down its line, and
-  **Mudslide** (ultimate) a long slick that carries everything on it along
-  the aim, and 4 kittens. On a slick, friend or foe keeps going the way it
+  **Mudslide** (ultimate) is a wave of mud 16 u wide running 40 u down the
+  aim: it strikes every enemy in its front (280 + power) and carries every
+  cat in it, crushes through plants (15% weaker for each, to no less than
+  35%) and sloshes back off walls like water (60% as strong, up to three
+  times, able to strike again), leaving mud where it ran. Eight KILLABLE
+  kittens tumble out of it -- fighters that bite hard and soak tower shots
+  -- and for 6 s after, each god he kills shapes three more and each minion
+  or jungle beast one. Every mudslide kitten broken is 40 gold to whoever
+  breaks it: a push that works snowballs, and one that fails feeds them. On a slick, friend or foe keeps going the way it
   was going, 30% faster, and turns slowly; `src/clay.rs`) — across 6 roles (Warrior / Guardian /
   Mage / Hunter / Assassin / Sentinel).
   Each is a quadruped feline voxel body with a pelt signature (mane, stripes,

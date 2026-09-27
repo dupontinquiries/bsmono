@@ -996,6 +996,15 @@ impl Vfx {
             }
         }
         self.time += dt;
+        // a running mudslide throws mud off its front
+        for w in &game.mudslides {
+            let side = Vec3::new(-w.dir.z, 0.0, w.dir.x);
+            for k in 0..3 {
+                let u = ((self.time * 13.7 + k as f32 * 0.37).fract()) - 0.5;
+                let p = w.pos + side * (u * w.width) + Vec3::Y * 1.0;
+                self.dust.push(Particle { pos: p, vel: w.dir * (w.speed * 0.8) + side * (u * 3.0) + Vec3::Y * 3.5, life: 0.6, max_life: 0.6, size: 0.2, color: [0.42, 0.29, 0.18], alpha: 1.0, gravity: 14.0, drag: 0.5 });
+            }
+        }
         if crate::map::active() == crate::map::MapId::Maze {
             self.machine_turn += dt * 1.6 * crate::machine::drive(game.wake.seed, game.t);
         }
@@ -1358,6 +1367,29 @@ impl Vfx {
                     for k in 0..14 {
                         let a = k as f32 * 2.399;
                         self.dust.push(Particle { pos: *pos + Vec3::new(a.cos() * 0.6, 0.5 + (k % 3) as f32 * 0.3, a.sin() * 0.6), vel: Vec3::new(a.cos() * 1.8, 1.2, a.sin() * 1.8), life: 0.6, max_life: 0.6, size: 0.14, color: [0.62, 0.42, 0.30], alpha: 0.9, gravity: 6.0, drag: 1.2 });
+                    }
+                }
+                // the mudslide: a plant crushed (leaves and splinters thrown
+                // up), a wall sloshed off (mud flung high and back)
+                Event::Smush { pos } => {
+                    for k in 0..14 {
+                        let a = k as f32 * 2.399;
+                        let col = if k % 3 == 0 { [0.35, 0.25, 0.15] } else { [0.25, 0.45, 0.18] };
+                        self.dust.push(Particle { pos: *pos + Vec3::new(a.cos() * 1.5, 0.8 + (k % 4) as f32 * 0.4, a.sin() * 1.5), vel: Vec3::new(a.cos() * 3.0, 4.0 + (k % 3) as f32, a.sin() * 3.0), life: 0.9, max_life: 0.9, size: 0.17, color: col, alpha: 1.0, gravity: 9.0, drag: 1.0 });
+                    }
+                }
+                Event::MudslideFx { pos, dir } => {
+                    for k in 0..30 {
+                        let a = k as f32 * 2.399;
+                        let d = (*dir + Vec3::new(a.cos(), 0.0, a.sin()) * 0.6).normalize_or_zero();
+                        self.dust.push(Particle { pos: *pos + Vec3::Y * 0.5, vel: d * (5.0 + (k % 5) as f32) + Vec3::Y * 4.0, life: 0.9, max_life: 0.9, size: 0.25, color: [0.40, 0.27, 0.17], alpha: 1.0, gravity: 12.0, drag: 0.5 });
+                    }
+                }
+                Event::Slosh { pos } => {
+                    for k in 0..36 {
+                        let a = k as f32 * 2.399;
+                        let d = Vec3::new(a.cos(), 0.0, a.sin());
+                        self.dust.push(Particle { pos: *pos + d * 1.0 + Vec3::Y * 0.6, vel: d * (4.0 + (k % 4) as f32) + Vec3::Y * (5.0 + (k % 5) as f32), life: 1.0, max_life: 1.0, size: 0.22, color: [0.40, 0.27, 0.17], alpha: 1.0, gravity: 14.0, drag: 0.4 });
                     }
                 }
                 Event::SlickFx { a, b, .. } => {
