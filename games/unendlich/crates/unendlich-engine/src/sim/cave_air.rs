@@ -161,6 +161,54 @@ impl Flame {
     }
 }
 
+/// Heat stress from the air temperature (`cave_biomes.docx`, Geothermal
+/// Deep: "Heat II at 60°C, Heat III at 75°C+"; Steam Caverns: "At 40°C:
+/// Heat I (fatigue, reduced sprint)").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Heat {
+    None,
+    /// >= 40 °C: fatigue, reduced sprint.
+    I,
+    /// >= 60 °C.
+    II,
+    /// >= 75 °C: sprint disabled, vision impaired by heat haze.
+    III,
+}
+
+pub fn heat_for(air_c: f32) -> Heat {
+    if air_c >= 75.0 {
+        Heat::III
+    } else if air_c >= 60.0 {
+        Heat::II
+    } else if air_c >= 40.0 {
+        Heat::I
+    } else {
+        Heat::None
+    }
+}
+
+/// What a heat stage does. No vitality term on purpose: the body-temperature
+/// model (sim::survival_exposure) already drains vitality in hot air, and the
+/// docx's per-stage HP drain on top of it would count the same heat twice.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeatEffects {
+    pub move_mult: f32,
+    /// Sprint speed multiplier applies only when this is true.
+    pub sprint: bool,
+    pub stamina_regen_mult: f32,
+    /// 0..1 edge darkening (the haze).
+    pub vignette: f32,
+}
+
+pub fn heat_effects(h: Heat) -> HeatEffects {
+    match h {
+        Heat::None => HeatEffects { move_mult: 1.0, sprint: true, stamina_regen_mult: 1.0, vignette: 0.0 },
+        Heat::I => HeatEffects { move_mult: 1.0, sprint: true, stamina_regen_mult: 0.5, vignette: 0.0 },
+        Heat::II => HeatEffects { move_mult: 0.9, sprint: true, stamina_regen_mult: 0.25, vignette: 0.2 },
+        Heat::III => HeatEffects { move_mult: 0.8, sprint: false, stamina_regen_mult: 0.0, vignette: 0.45 },
+    }
+}
+
 /// Share of the world's sound the gas swallows at full concentration (the
 /// docx's `sound_absorption`).
 pub const SOUND_ABSORPTION: f32 = 0.85;
@@ -299,6 +347,30 @@ mod tests {
         let mut f = rich;
         gas_fields(&mut f, 0.18);
         assert!(f.r > 0.15 && f.r < rich.r, "{}", f.r);
+    }
+
+    #[test]
+    fn heat_stages_follow_the_docx_and_only_worsen() {
+        assert_eq!(heat_for(39.9), Heat::None);
+        assert_eq!(heat_for(40.0), Heat::I);
+        assert_eq!(heat_for(59.9), Heat::I);
+        assert_eq!(heat_for(60.0), Heat::II);
+        assert_eq!(heat_for(74.9), Heat::II);
+        assert_eq!(heat_for(75.0), Heat::III);
+        assert!(!heat_effects(Heat::III).sprint, "Heat III: no sprint");
+        assert!(heat_effects(Heat::II).sprint);
+        assert!(heat_effects(Heat::I).stamina_regen_mult < 1.0, "Heat I: fatigue");
+        let order = [Heat::None, Heat::I, Heat::II, Heat::III];
+        for w in order.windows(2) {
+            let (a, b) = (heat_effects(w[0]), heat_effects(w[1]));
+            assert!(b.move_mult <= a.move_mult && b.stamina_regen_mult <= a.stamina_regen_mult && b.vignette >= a.vignette);
+        }
+        let mut prev = Heat::None;
+        for c in 0..120 {
+            let h = heat_for(c as f32);
+            assert!(h >= prev, "{c}");
+            prev = h;
+        }
     }
 
     #[test]
