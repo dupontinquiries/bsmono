@@ -61,6 +61,9 @@ pub struct FrameUniform {
     /// height (river beds under it take caustics), w how far under the sea
     /// the camera is. terrain.wgsl, voxel.wgsl.
     pub sea: [f32; 4],
+    /// The ground's look by quality: x how far its fine detail carries
+    /// (u), y the strength of the dry sheen. terrain.wgsl.
+    pub look: [f32; 4],
 }
 
 #[repr(C)]
@@ -1320,6 +1323,7 @@ impl Renderer {
             cracks: self.cracks,
             towers: self.towers,
             sea: [self.sea_map, self.caustics, crate::consts::WATER_LEVEL, self.underwater],
+            look: self.quality.ground_look(),
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 
@@ -1697,6 +1701,7 @@ impl Renderer {
             cracks: self.cracks,
             towers: self.towers,
             sea: [0.0; 4],
+            look: [120.0, 1.0, 0.0, 0.0],
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 
@@ -2136,6 +2141,13 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
                 }
                 color = g;
             }
+            // Cavity occlusion, baked: ground lower than its surroundings
+            // (a hollow, a stream bed, the foot of a cliff) sees less sky.
+            // The mean height a ring of 2.5 cells out, against this one.
+            let far = STEP * 2.5;
+            let ring = (terrain_height(x - far, z) + terrain_height(x + far, z) + terrain_height(x, z - far) + terrain_height(x, z + far) + hl + hr + hd + hu) / 8.0;
+            let ao = cavity_ao(h, ring);
+            let color = [color[0] * ao, color[1] * ao, color[2] * ao];
             verts.push(TerrainVert {
                 pos: [x, h, z],
                 normal: n.to_array(),
@@ -2260,7 +2272,7 @@ fn pass_ground_color(x: f32, z: f32, h: f32, slope: f32, n1: f32, n2: f32, nm: f
     let snowline = 44.0 + n1 * 10.0;
     let patchy = smoothstep(20.0, 30.0, h) * smoothstep(0.72, 0.88, nm) * (1.0 - smoothstep(0.1, 0.3, slope));
     let snow_t = smoothstep(snowline - 6.0, snowline + 4.0, h).max(patchy) * (1.0 - smoothstep(0.35, 0.6, slope) * 0.6);
-    (lerp(c, snow, snow_t), if snow_t > 0.5 { 6.0 } else { 4.0 })
+    (lerp(c, snow, snow_t), if snow_t > 0.5 { 7.0 } else { 4.0 })
 }
 
 /// Starwell Glacier ground. The lanes are old pale stone, almost marble,
@@ -2299,15 +2311,25 @@ fn sky_ground_color(x: f32, z: f32, h: f32, slope: f32, n1: f32, n2: f32, nm: f3
         let inner = smoothstep(-4.0, -12.0, d);
         let meadow_t = (smoothstep(0.52, 0.72, nm) * inner).clamp(0.0, 1.0);
         let c = lerp(snow, meadow, meadow_t);
-        return (c, if meadow_t > 0.5 { 0.0 } else { 6.0 });
+        return (c, if meadow_t > 0.5 { 0.0 } else { 7.0 });
     }
     if h > -2.0 {
         // the lip: blue glacier ice
-        return ([0.52 + n1 * 0.08, 0.76 + n2 * 0.06, 0.92 + n1 * 0.04], 6.0);
+        return ([0.52 + n1 * 0.08, 0.76 + n2 * 0.06, 0.92 + n1 * 0.04], 7.0);
     }
     // (past the edge: open sky, never drawn)
     let _ = slope;
     ([0.2, 0.24, 0.34], 5.0)
+}
+
+/// How much sky a point of ground at height `h` sees, from the mean height
+/// `ring` of the ground a few units round it: 1 on the level or a rise, down
+/// toward 0.62 in a deep hollow or at a wall's foot. Soft (a hollow a unit
+/// deep loses 13%), so the jungle's gentle ground barely changes and a
+/// canyon floor under its cliffs darkens.
+pub fn cavity_ao(h: f32, ring: f32) -> f32 {
+    let deep = (ring - h).max(0.0);
+    (1.0 - deep * 0.13 / (1.0 + deep * 0.12)).clamp(0.62, 1.0)
 }
 
 /// The Drowned Halls' ground: sea-marble floors with mosaics (a blue
@@ -2643,5 +2665,23 @@ mod depth_tests {
         sort_far_to_near(&mut v);
         let order: Vec<char> = v.iter().filter(|e| e.1 != 'x').map(|e| e.1).collect();
         assert_eq!(order, vec!['f', 'm', 'n']);
+    }
+}
+
+#[cfg(test)]
+mod cavity_tests {
+    use super::cavity_ao;
+
+    /// Level ground and rises are untouched; hollows darken with depth,
+    /// softly, and never below the floor.
+    #[test]
+    fn hollows_see_less_sky_and_rises_see_it_all() {
+        assert_eq!(cavity_ao(0.0, 0.0), 1.0);
+        assert_eq!(cavity_ao(3.0, 1.0), 1.0, "a rise");
+        let one = cavity_ao(0.0, 1.0);
+        assert!((0.85..0.9).contains(&one), "a unit-deep hollow: {one}");
+        let deep = cavity_ao(0.0, 6.0);
+        assert!(deep < one && deep >= 0.62, "{deep}");
+        assert_eq!(cavity_ao(0.0, 1000.0), 0.62);
     }
 }
