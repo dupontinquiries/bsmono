@@ -209,6 +209,29 @@ pub fn heat_effects(h: Heat) -> HeatEffects {
     }
 }
 
+/// The HUD line for moving into breath stage `now` from `prev`: `None` when
+/// nothing should be said (still normal). Recovering to normal is said only
+/// after it was bad enough to have been warned about.
+pub fn breath_notice(prev: Breath, now: Breath) -> Option<&'static str> {
+    match now {
+        Breath::Normal => (prev > Breath::Normal).then_some("You can breathe again"),
+        Breath::Weak => Some("The air is thin"),
+        Breath::Faint => Some("You are short of breath; the edges go dark"),
+        Breath::Unconscious => Some("You are blacking out"),
+        Breath::Dying => Some("You are suffocating"),
+    }
+}
+
+/// The HUD line for heat stage `now` (`None` once it is no longer hot).
+pub fn heat_notice(now: Heat) -> Option<&'static str> {
+    match now {
+        Heat::None => None,
+        Heat::I => Some("The heat saps your strength"),
+        Heat::II => Some("The heat is punishing"),
+        Heat::III => Some("Scorching air; you cannot run"),
+    }
+}
+
 /// Share of the world's sound the gas swallows at full concentration (the
 /// docx's `sound_absorption`).
 pub const SOUND_ABSORPTION: f32 = 0.85;
@@ -347,6 +370,21 @@ mod tests {
         let mut f = rich;
         gas_fields(&mut f, 0.18);
         assert!(f.r > 0.15 && f.r < rich.r, "{}", f.r);
+    }
+
+    #[test]
+    fn every_bad_stage_is_announced_and_recovery_only_after_a_warning() {
+        use Breath::*;
+        for b in [Weak, Faint, Unconscious, Dying] {
+            assert!(breath_notice(Normal, b).is_some(), "{b:?}");
+            assert_eq!(breath_notice(b, Normal), Some("You can breathe again"));
+        }
+        assert_eq!(breath_notice(Normal, Normal), None);
+        for h in [Heat::I, Heat::II, Heat::III] {
+            assert!(heat_notice(h).is_some(), "{h:?}");
+        }
+        assert_eq!(heat_notice(Heat::None), None);
+        assert!(heat_notice(Heat::III).unwrap().contains("cannot run"), "says sprint is off");
     }
 
     #[test]
