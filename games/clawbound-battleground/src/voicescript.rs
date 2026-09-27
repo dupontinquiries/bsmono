@@ -300,6 +300,21 @@ pub const PARTS: &[Part] = &[
         ],
     },
     Part {
+        who: "oremantle",
+        voice: "A very old, very big grandmother: low, slow and unbothered, every word set down like a stone. She is never in a hurry and never unkind. Chest voice, room left between words. Only the ultimate rises -- from a rumble to a roar.",
+        lines: &[
+            l("select", "The mountain is here.", "slow, settling in", 2, SELECT),
+            l("cast1", "Stand behind me.", "firm, protective", 3, "shifts to Granite"),
+            l("cast2", "Cold, now.", "quiet, breath misting", 2, "shifts to Rime"),
+            l("cast3", "Come here, child.", "patient, drawing someone in", 2, "shifts to Lodestone"),
+            l("cast4", "The mountain has a HEART!", "from a rumble to a roar on 'heart'", 5, "shifts to The Mountain's Heart"),
+            l("kill.1", "Rest now.", "grandmotherly, almost kind", 2, KILL),
+            l("kill.2", "Stone outlasts.", "flat, certain", 2, KILL),
+            l("death.1", "Even mountains... fall...", "surprised, slow", 1, DEATH),
+            l("death.2", "Back... to the rock...", "content, going home", 1, DEATH),
+        ],
+    },
+    Part {
         who: "narrator",
         voice: "The storyteller of the clans, over the first match's prologue: unhurried, weighty, a little in awe. Let each line breathe; the music leaves room between them. Record each as its own file.",
         lines: &[
@@ -389,7 +404,7 @@ mod tests {
                 assert_eq!(crate::cues::ancestor_key(&game, g), who);
             }
         }
-        assert_eq!(PARTS.len(), ROSTER.len() + 2, "13 ancestors, the narrator and the announcer");
+        assert_eq!(PARTS.len(), ROSTER.len() + 2, "every ancestor, the narrator and the announcer");
     }
 
     #[test]

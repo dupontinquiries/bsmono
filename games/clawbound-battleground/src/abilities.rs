@@ -43,6 +43,9 @@ pub fn cast_timing(ab: &crate::gods::AbilityDef) -> (f32, f32) {
         Archetype::Echoes { .. } => (0.35, 0.0),
         // the lamp goes up with the breath for the bellow
         Archetype::Lantern { .. } => (0.4, 0.0),
+        // a coat is not cast, it is worn: the shift is at once, and she
+        // keeps walking (`sentinel`)
+        Archetype::Field { .. } => (0.0, 1.0),
     };
     if ab.ult && w > 0.0 {
         ((w * 1.5).max(0.45), 0.0)
@@ -248,7 +251,7 @@ impl Game {
                 for j in 0..self.gods.len() {
                     let e = &self.gods[j];
                     if e.team != team && e.respawn_t <= 0.0 {
-                        if crate::hitbox::cat(e.pos, e.yaw, false).hit_by_beam(pos_y, end, width + 0.2) {
+                        if crate::hitbox::cat_sized(e.pos, e.yaw, false, self.def(j).role.size()).hit_by_beam(pos_y, end, width + 0.2) {
                             hits.push(TargetRef::God(j));
                         }
                     }
@@ -366,6 +369,9 @@ impl Game {
             Archetype::Lantern { radius, dmg, flee, reveal } => {
                 let d = dmg_scale(dmg, ab.power_scale);
                 self.raise_the_lamp(gi, radius, d, flee, reveal);
+            }
+            Archetype::Field { .. } => {
+                self.shift_coat(gi, slot);
             }
             Archetype::Blink { dist: dd, dmg } => {
                 let d = if dmg > 0.0 { dmg_scale(dmg, ab.power_scale) } else { 0.0 };
@@ -500,7 +506,7 @@ impl Game {
         let mut out = Vec::new();
         for gi in 0..self.gods.len() {
             let g = &self.gods[gi];
-            if g.team != team && g.respawn_t <= 0.0 && crate::hitbox::cat(g.pos, g.yaw, false).in_disc(center, radius + 0.2) {
+            if g.team != team && g.respawn_t <= 0.0 && crate::hitbox::cat_sized(g.pos, g.yaw, false, self.def(gi).role.size()).in_disc(center, radius + 0.2) {
                 out.push(TargetRef::God(gi));
             }
         }

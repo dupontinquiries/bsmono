@@ -50,7 +50,7 @@ pub struct Ancestor {
     pub instruments: &'static str,
 }
 
-pub const ANCESTORS: [Ancestor; 17] = [
+pub const ANCESTORS: [Ancestor; 18] = [
     Ancestor {
         name: "Goldenmane",
         species: "lion",
@@ -204,6 +204,15 @@ pub const ANCESTORS: [Ancestor; 17] = [
         story: "The smallest of the ancestors, with the biggest voice. He walked ahead of the caravans on the salt roads at night with a brass lantern, and when something moved at the edge of its light he raised the lamp and bellowed, and whatever it was did not come in. It is said that Hollowstep has never once stood in Brasshowl's light, and that the two of them know exactly why.",
         instruments: "frame drum, oud, a brass bell, clapping hands, a caravan's camel bells; desert wind, a crackling lamp",
     },
+    Ancestor {
+        name: "Oremantle",
+        species: "snow leopard -- the old kind, half as big again as any cat living",
+        age: "the first winters",
+        land: "the roots of the high crags",
+        gender: Gender::Female,
+        story: "Stonewhisper's grandmother, of the old snow leopards that were half as big again as any cat since. She lay so long on the roots of the crags that the mountain forgot she was not part of it, and when she rose, its stuff came with her: granite in the thaw, rime in the long dark, lodestone where the iron veins run, and once, when the clans needed it, the molten heart itself. She never went to a fight in her life. She became what the fight was standing on.",
+        instruments: "the deepest mountain horns, stone chimes, a slow frame drum like footfalls, overtone throat-singing; wind in a cave mouth, rock settling",
+    },
 ];
 
 pub fn of(name: &str) -> Option<&'static Ancestor> {
@@ -301,6 +310,7 @@ mod tests {
     #[test]
     fn the_cast_is_balanced() {
         let f = ANCESTORS.iter().filter(|a| a.gender == Gender::Female).count();
-        assert!((6..=8).contains(&f) && (f as i32 - (ANCESTORS.len() - f) as i32).abs() <= 1, "{f} of {} female", ANCESTORS.len());
+        // as even as the count allows (it read 6..=8, which was that for 17)
+        assert!(f >= 6 && (f as i32 - (ANCESTORS.len() - f) as i32).abs() <= 1, "{f} of {} female", ANCESTORS.len());
     }
 }

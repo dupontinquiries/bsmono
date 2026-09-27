@@ -251,7 +251,7 @@ impl Scene {
                 for team in [Team::Blue, Team::Red] {
                     let rigged = models::build_god_rigged(def, team);
                     for (s, m) in rigged.meshes.iter().enumerate() {
-                        let mut sm = crate::smoothvox::smooth(m, models::GOD_DRAW_VOXEL, 2);
+                        let mut sm = crate::smoothvox::smooth(m, models::draw_voxel(def), 2);
                         crate::smoothvox::fur_for_part(def, s, &mut sm, crate::render::FurStyle::from_env() == crate::render::FurStyle::Locks);
                         tris += sm.tris();
                         parts[team as usize][s] = r.upload_smooth(&sm);
@@ -847,13 +847,31 @@ impl Scene {
             }
             let mats = slot_transforms(rig, &posed, &legs, &pose.body);
             let smooth = self.ultra && di < self.god_smooth.len();
+            // a Sentinel is built bigger (`models::body_voxel`), and her coat
+            // is whatever she is wearing (`sentinel`)
+            let vox = models::draw_voxel(def);
+            let (coat, glow) = game.worn(i).map_or(([1.0; 4], 0.0), |w| w.material.tint());
+            let glow = if glow > 0.0 { glow * (0.8 + 0.2 * (vfx.time * 2.3 + i as f32).sin()) } else { 0.0 };
             for (s, m) in mats.iter().enumerate() {
                 if smooth {
                     // smooth and furred; the voxel part casts its shadow
-                    r.queue_smooth(self.god_smooth[di][ti][s], base * *m, [1.0; 4]);
-                    r.queue_shadow_only(self.god_parts[di][ti][s], base * *m, models::GOD_DRAW_VOXEL);
+                    r.queue_smooth(self.god_smooth[di][ti][s], base * *m, coat);
+                    r.queue_shadow_only(self.god_parts[di][ti][s], base * *m, vox);
                 } else {
-                    r.queue_draw(self.god_parts[di][ti][s], base * *m, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
+                    r.queue_draw(self.god_parts[di][ti][s], base * *m, coat, glow, vox, false);
+                }
+            }
+            // her field's edge on the ground, in its colour, turning slowly
+            if let Some(w) = game.worn(i) {
+                let col = w.material.edge();
+                let n = ((w.radius * std::f32::consts::TAU) / 1.4).round().max(12.0) as usize;
+                let turn = vfx.time * 0.25 * if w.material == crate::gods::Material::Lodestone { -1.0 } else { 1.0 };
+                for k in 0..n {
+                    let a = k as f32 / n as f32 * std::f32::consts::TAU + turn;
+                    let (x, z) = (g.pos.x + a.cos() * w.radius, g.pos.z + a.sin() * w.radius);
+                    let p = Vec3::new(x, crate::map::ground_y(x, z) + 0.12, z);
+                    let pulse = 0.5 + 0.5 * (vfx.time * 2.0 + k as f32 * 0.7).sin();
+                    r.queue_draw(self.orb, Mat4::from_translation(p) * Mat4::from_scale(Vec3::splat(1.1)), [col[0], col[1], col[2], 0.6 + 0.3 * pulse], 0.5, 0.05, true);
                 }
             }
             // afterimages of a dash or a blink: this pose, where the cat
@@ -863,7 +881,7 @@ impl Scene {
                 let ghost = Mat4::from_translation(gh.pos + Vec3::Y * (pose.lift - sink)) * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - gh.yaw);
                 let tint = [gh.color[0] * 1.3, gh.color[1] * 1.3, gh.color[2] * 1.3, 0.42 * k];
                 for (s, m) in mats.iter().enumerate() {
-                    r.queue_draw(self.god_parts[di][ti][s], ghost * *m, tint, 0.8 * k, models::GOD_DRAW_VOXEL, true);
+                    r.queue_draw(self.god_parts[di][ti][s], ghost * *m, tint, 0.8 * k, vox, true);
                 }
             }
 

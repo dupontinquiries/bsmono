@@ -382,5 +382,8 @@ pub fn role_build_order(role: crate::gods::Role) -> [Cat; 5] {
         Guardian => [Cat::Protection, Cat::Health, Cat::Strength, Cat::Intelligence, Cat::Scaling],
         Mage => [Cat::Scaling, Cat::Intelligence, Cat::Penetration, Cat::Health, Cat::Protection],
         Hunter => [Cat::AttackSpeed, Cat::Strength, Cat::Penetration, Cat::Health, Cat::Protection],
+        // she stands in the middle of it: bulk first, then the power her
+        // magma burns with
+        Sentinel => [Cat::Health, Cat::Protection, Cat::Scaling, Cat::Strength, Cat::Intelligence],
     }
 }

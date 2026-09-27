@@ -127,6 +127,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("brass") {
         return run_brass_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("ore") {
+        return run_ore_shots();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("hud") {
         return run_hud_shots();
     }
@@ -2168,7 +2171,11 @@ fn run_hud_shots() -> Result<(), String> {
     });
     let view = target.create_view(&Default::default());
     let scene = Scene::new(&mut renderer);
-    let mut game = Game::new(14, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    // CLAWBOUND_HUD_GOD=<id> puts another ancestor in the player's seat
+    // (Oremantle, 17, to see her WORN coat); the shots are then prefixed
+    // with the id
+    let who: u32 = std::env::var("CLAWBOUND_HUD_GOD").ok().and_then(|v| v.parse().ok()).filter(|&i: &u32| (i as usize) < crate::gods::ROSTER_LEN).unwrap_or(14);
+    let mut game = Game::new(who, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
     game.blockers = scene.blockers.clone();
     let mut vfx = Vfx::default();
     for _ in 0..60 {
@@ -2209,7 +2216,8 @@ fn run_hud_shots() -> Result<(), String> {
         let mut out = out.expect("ran");
         out.textures_delta = textures;
         draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
-        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        let name = if who == 14 { name.to_string() } else { format!("hud_{who}_{}", &name[4..]) };
+        save_shot(&renderer.device, &renderer.queue, &target, &name)?;
         println!("saved {name}");
     }
     Ok(())
@@ -2452,6 +2460,75 @@ pub fn run_hollow_shots() -> Result<(), String> {
     game.gods[0].beat_t = crate::stalker::beat_every(game.gods[0].fear);
     let p = game.gods[0].pos;
     shoot(&mut renderer, &game, &mut vfx, "hollow_afraid_hud.png", Camera { eye: p + Vec3::new(0.0, 5.0, 9.0), target: p + Vec3::new(0.0, 1.0, -4.0), fov_y: 0.95 }, true)?;
+    Ok(())
+}
+
+/// Oremantle (`sentinel`): beside her granddaughter Stonewhisper for size,
+/// then in each of her four coats on the lane, an enemy in the field.
+/// `CLAWBOUND_SHOTS=ore`.
+pub fn run_ore_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ore"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let scene = Scene::new(&mut renderer);
+    let id = |n: &str| crate::gods::ROSTER.iter().position(|d| d.name == n).unwrap() as u32;
+    let mut game = Game::new_teams(&[id("Oremantle"), id("Stonewhisper")], &[id("Goldenmane")]);
+    game.blockers = scene.blockers.clone();
+    game.next_wave_t = 1e9;
+    for i in 0..game.gods.len() {
+        game.set_level(i, 5);
+        game.gods[i].ai = None;
+        game.gods[i].mana = 9999.0;
+    }
+    let at = Vec3::new(0.0, 0.0, -24.0);
+    game.gods[0].pos = at;
+    game.gods[0].yaw = std::f32::consts::FRAC_PI_2;
+    game.gods[1].pos = at + Vec3::new(3.2, 0.0, 0.0);
+    game.gods[1].yaw = std::f32::consts::FRAC_PI_2;
+    game.gods[2].pos = at + Vec3::new(-40.0, 0.0, 0.0);
+    let mut vfx = Vfx::default();
+    let step = |game: &mut Game, vfx: &mut Vfx, secs: f32| {
+        for _ in 0..(secs * 60.0) as usize {
+            game.tick(1.0 / 60.0);
+            let ev = std::mem::take(&mut game.events);
+            vfx.update(1.0 / 60.0, &ev, game);
+        }
+    };
+    let mut shoot = |renderer: &mut Renderer, game: &Game, vfx: &mut Vfx, name: &str, cam: Camera| -> Result<(), String> {
+        renderer.clear_queues();
+        scene.draw(renderer, game, vfx, cam);
+        renderer.atmosphere = game.weather.atmosphere();
+        renderer.render_frame(&view, cam, game.t);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+        Ok(())
+    };
+    step(&mut game, &mut vfx, 0.5);
+    shoot(&mut renderer, &game, &mut vfx, "ore_size.png", Camera { eye: at + Vec3::new(1.6, 1.8, 7.5), target: at + Vec3::new(1.6, 1.2, 0.0), fov_y: 0.8 })?;
+    // the enemy steps into her field, her granddaughter out of shot
+    game.gods[1].pos = at + Vec3::new(20.0, 0.0, -6.0);
+    game.gods[2].pos = at + Vec3::new(-2.5, 0.0, 5.0);
+    game.gods[2].yaw = -std::f32::consts::FRAC_PI_2;
+    let cam = Camera { eye: at + Vec3::new(-9.0, 9.0, -9.0), target: at + Vec3::new(0.0, 0.5, 1.5), fov_y: 1.0 };
+    for m in [crate::gods::Material::Granite, crate::gods::Material::Rime, crate::gods::Material::Lodestone, crate::gods::Material::Magma] {
+        let k = game.coat_key(0, m).ok_or("coat locked")?;
+        game.gods[0].cds[k as usize] = 0.0;
+        game.cast_queue.push((0, k, at + Vec3::Z));
+        step(&mut game, &mut vfx, 1.0);
+        game.gods[2].hp = game.gods[2].max_hp;
+        shoot(&mut renderer, &game, &mut vfx, &format!("ore_{}.png", m.name()), cam)?;
+        step(&mut game, &mut vfx, 0.5);
+    }
     Ok(())
 }
 

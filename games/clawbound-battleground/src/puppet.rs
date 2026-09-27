@@ -979,7 +979,7 @@ pub fn cast_style(arch: &crate::gods::Archetype, ult: bool) -> CastStyle {
         _ if ult => CastStyle::Rear,
         A::Bolt { .. } | A::Volley { .. } | A::Beam { .. } | A::Litter { .. } => CastStyle::Spit,
         A::Lob { .. } | A::Ring { .. } | A::Pull { .. } | A::DanceParty { .. } | A::Send { .. } => CastStyle::Stomp,
-        A::Nova { .. } | A::Storm { .. } | A::Shield { .. } | A::Heal { .. } | A::Buff { .. } | A::Giggle { .. } | A::Echoes { .. } | A::Lantern { .. } => CastStyle::Arch,
+        A::Nova { .. } | A::Storm { .. } | A::Shield { .. } | A::Heal { .. } | A::Buff { .. } | A::Giggle { .. } | A::Echoes { .. } | A::Lantern { .. } | A::Field { .. } => CastStyle::Arch,
     }
 }
 

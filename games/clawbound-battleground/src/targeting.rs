@@ -123,6 +123,8 @@ pub fn guide_for(ab: &AbilityDef, from: Vec3, aim: Vec3) -> Guide {
         Archetype::Send { range, .. } => Guide::Circle { at: at(range), radius: 1.2 },
         Archetype::Echoes { .. } => Guide::Around { at: from, radius: crate::stalker::ECHO_HUNT },
         Archetype::Lantern { radius, .. } => Guide::Around { at: from, radius },
+        // a coat is worn, not aimed: the guide is the field it will be
+        Archetype::Field { radius, .. } => Guide::Around { at: from, radius },
         Archetype::Nova { radius, .. } | Archetype::Heal { radius, .. } => Guide::Around { at: from, radius },
         Archetype::Shield { .. } | Archetype::Buff { .. } => Guide::Around { at: from, radius: 1.6 },
     }

@@ -62,6 +62,7 @@ impl Game {
         self.kit_tick(dt);
         self.stalker_tick(dt);
         self.lantern_tick(dt);
+        self.sentinel_tick(dt);
 
         // 6b. sky + map events (weather.rs / map_events.rs)
         self.atmosphere_tick(dt);
@@ -728,7 +729,8 @@ impl Game {
                 let e = &self.gods[j];
                 // a cat hidden in cloud cannot be locked onto
                 if e.team != g.team && e.respawn_t <= 0.0 && self.sees(g.team, j) {
-                    let d = e.pos.distance(g.pos);
+                    // a bigger cat is reached sooner (`Role::extra_reach`)
+                    let d = e.pos.distance(g.pos) - self.def(j).role.extra_reach();
                     if d < bd {
                         bd = d;
                         target = Some(TargetRef::God(j));
@@ -1185,7 +1187,7 @@ impl Game {
                 let g = &self.gods[gi];
                 if g.team != p.team && g.respawn_t <= 0.0 {
                     // The body, not a ball over the feet: see `hitbox`.
-                    if crate::hitbox::cat(g.pos, g.yaw, g.sneak && g.hush_t <= 0.0).hit_by_moving_sphere(p.pos - p.vel * dt, p.pos, p.radius + 0.2) {
+                    if crate::hitbox::cat_sized(g.pos, g.yaw, g.sneak && g.hush_t <= 0.0, self.def(gi).role.size()).hit_by_moving_sphere(p.pos - p.vel * dt, p.pos, p.radius + 0.2) {
                         hit = Some(TargetRef::God(gi));
                         break;
                     }
@@ -1259,7 +1261,7 @@ impl Game {
         let mut hits: Vec<TargetRef> = Vec::new();
         for gi in 0..self.gods.len() {
             let g = &self.gods[gi];
-            if g.team != team && g.respawn_t <= 0.0 && (g.pos.y - center.y).abs() < crate::brawl::AOE_REACH_Y && crate::hitbox::cat(g.pos, g.yaw, false).in_disc(center, radius + 0.2) {
+            if g.team != team && g.respawn_t <= 0.0 && (g.pos.y - center.y).abs() < crate::brawl::AOE_REACH_Y && crate::hitbox::cat_sized(g.pos, g.yaw, false, self.def(gi).role.size()).in_disc(center, radius + 0.2) {
                 hits.push(TargetRef::God(gi));
             }
         }

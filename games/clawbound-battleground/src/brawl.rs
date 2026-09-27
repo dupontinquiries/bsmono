@@ -53,6 +53,8 @@ pub fn melee_for(def: &GodDef) -> Option<Melee> {
         Role::Guardian => Melee { arc: 150f32.to_radians(), targets: 3, splash: 0.6, backstab: 1.0 },
         Role::Warrior => Melee { arc: 100f32.to_radians(), targets: 2, splash: 0.75, backstab: 1.1 },
         Role::Assassin => Melee { arc: 50f32.to_radians(), targets: 1, splash: 0.0, backstab: 1.35 },
+        // the biggest cat sweeps nearly all the way round her
+        Role::Sentinel => Melee { arc: 200f32.to_radians(), targets: 3, splash: 0.7, backstab: 1.0 },
         _ => Melee { arc: 80f32.to_radians(), targets: 1, splash: 0.0, backstab: 1.15 },
     })
 }

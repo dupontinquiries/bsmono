@@ -24,6 +24,10 @@ pub enum Role {
     Mage,
     Hunter,
     Assassin,
+    /// Bigger and slower than any other cat, and casts nothing: each of
+    /// her keys shifts what she is made of, and what she is made of is a
+    /// field that is always on around her (`sentinel`).
+    Sentinel,
 }
 
 impl Role {
@@ -34,6 +38,76 @@ impl Role {
             Role::Hunter => "Hunter",
             Role::Mage => "Mage",
             Role::Assassin => "Assassin",
+            Role::Sentinel => "Sentinel",
+        }
+    }
+
+    /// How big a cat of this role is drawn and struck, as a multiple of
+    /// every other cat. Its paws path at the ordinary radius all the same
+    /// (`consts::GOD_RADIUS`), so it still fits the jungle's runs.
+    pub fn size(self) -> f32 {
+        match self {
+            Role::Sentinel => SENTINEL_SIZE,
+            _ => 1.0,
+        }
+    }
+}
+
+impl Role {
+    /// How much further a claw reaches this cat than an ordinary one: the
+    /// extra body a bigger cat has out past its middle (`hitbox::FRONT`).
+    pub fn extra_reach(self) -> f32 {
+        (self.size() - 1.0) * crate::hitbox::FRONT
+    }
+}
+
+/// A Sentinel's size (`Role::size`).
+pub const SENTINEL_SIZE: f32 = 1.4;
+
+/// What a Sentinel's coat can be made of, and so which field is around her
+/// (`sentinel`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Material {
+    /// Friends in the field take less from every blow.
+    Granite,
+    /// Enemies in the field are slowed.
+    Rime,
+    /// Enemies in the field are dragged toward her.
+    Lodestone,
+    /// Enemies in the field burn (the ultimate: for a while, then she
+    /// goes back to what she was).
+    Magma,
+}
+
+impl Material {
+    pub fn name(self) -> &'static str {
+        match self {
+            Material::Granite => "granite",
+            Material::Rime => "rime",
+            Material::Lodestone => "lodestone",
+            Material::Magma => "magma",
+        }
+    }
+
+    /// The colour of her field's edge on the ground: saturated, so the
+    /// four read apart at a glance (the abilities' pale colours all bloomed
+    /// to white).
+    pub fn edge(self) -> [f32; 3] {
+        match self {
+            Material::Granite => [0.78, 0.60, 0.36],
+            Material::Rime => [0.35, 0.80, 1.00],
+            Material::Lodestone => [0.55, 0.30, 0.95],
+            Material::Magma => [1.00, 0.38, 0.08],
+        }
+    }
+
+    /// Her coat's tint while she wears it, and how much it glows.
+    pub fn tint(self) -> ([f32; 4], f32) {
+        match self {
+            Material::Granite => ([1.0, 1.0, 1.0, 1.0], 0.0),
+            Material::Rime => ([0.82, 0.95, 1.25, 1.0], 0.12),
+            Material::Lodestone => ([0.62, 0.62, 0.72, 1.0], 0.0),
+            Material::Magma => ([1.35, 0.72, 0.45, 1.0], 0.45),
         }
     }
 }
@@ -114,6 +188,13 @@ pub enum Archetype {
     /// through cloud, no stalking); any shadow of Hollowstep's in the light
     /// is driven off to the far side of the map (`lantern`).
     Lantern { radius: f32, dmg: f32, flee: f32, reveal: f32 },
+    /// A Sentinel's coat: casting it shifts her into `material`, and its
+    /// field is on around her (`radius`) for as long as she wears it --
+    /// always, or `secs` seconds and then back to what she wore before.
+    /// `amount` is the field's strength: granite, the share of each blow
+    /// her friends are spared; rime, the slow; lodestone, the drag in u/s;
+    /// magma, the burn per second (`sentinel`).
+    Field { material: Material, radius: f32, amount: f32, secs: f32 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -200,6 +281,7 @@ pub enum PeltKind {
     Kit,       // Sproutkit — a kitten: round head, huge eyes, a sprout on the brow
     Hollow,    // Hollowstep — gaunt ash-grey, a dark hood of fur over the eyes, notched ears
     Lamp,      // Brasshowl — a sand cat: pale, broad low ears, a brass lantern at the breast
+    Mantle,    // Oremantle — the old snow leopard: huge, a ridge of stone along the spine
 }
 
 /// Each level's growth in base stats, as a multiple of the per-level
@@ -235,7 +317,7 @@ const fn ab(
     AbilityDef { name, desc, arch, cooldown: cd, cost, color, key, ult, power_scale: scale }
 }
 
-pub const ROSTER_LEN: usize = 17;
+pub const ROSTER_LEN: usize = 18;
 
 pub const ROSTER: [GodDef; ROSTER_LEN] = [
     // ── GOLDENMANE — the lion-clan of legend ──
@@ -532,6 +614,27 @@ pub const ROSTER: [GodDef; ROSTER_LEN] = [
             ab("SHADOWS!", "He raises the lamp and bellows: everything in its light is struck, runs from him, and is shown up for all to see -- and no shadow can stand in it.", Archetype::Lantern { radius: 13.0, dmg: 130.0, flee: 1.6, reveal: 6.0 }, 80.0, 120.0, [1.00, 0.85, 0.50], 3, true, 0.50),
         ],
     },
+    // ── OREMANTLE — the mountain's grandmother, the first Sentinel ──
+    // Stonewhisper's grandmother, of the old kind of snow leopard, half as
+    // big again as any cat living. She casts nothing: each key shifts what
+    // her coat is made of, and what it is made of is a field that is
+    // always on around her (`sentinel`).
+    GodDef {
+        id: 17, name: "Oremantle", title: "the mountain's grandmother, whose coat is whatever the mountain is made of",
+        philosophy: "I do not go to the fight. I become what the fight is standing on.",
+        role: Role::Sentinel, auto: AutoKind::Melee, dmg_type: DmgType::Physical,
+        palette: [[0.66, 0.63, 0.58], [0.30, 0.28, 0.26], [0.86, 0.84, 0.80], [0.55, 0.78, 0.86]],
+        weapon: WeaponKind::None, pelt: PeltKind::Mantle,
+        hp: 790.0, hp_growth: 124.0, mana: 280.0, mana_growth: 30.0,
+        auto_dmg: 52.0, auto_growth: 3.8, power: 9.0, power_growth: 2.6,
+        protection: 33.0, prot_growth: 3.6, move_speed: 10.4, auto_range: 4.0, auto_cd: 1.25,
+        abilities: [
+            ab("Granite", "Her coat goes to granite: every friend near her, and she, is spared a share of every blow.", Archetype::Field { material: Material::Granite, radius: 7.0, amount: 0.15, secs: 0.0 }, 3.0, 0.0, [0.72, 0.70, 0.66], 0, false, 0.0),
+            ab("Rime", "Her coat goes to rime: the air around her freezes, and every enemy in it wades.", Archetype::Field { material: Material::Rime, radius: 7.5, amount: 0.25, secs: 0.0 }, 3.0, 0.0, [0.62, 0.85, 1.00], 1, false, 0.0),
+            ab("Lodestone", "Her coat goes to lodestone: every enemy near her is drawn in, step by step, whether it likes it or not.", Archetype::Field { material: Material::Lodestone, radius: 8.0, amount: 2.2, secs: 0.0 }, 3.0, 0.0, [0.45, 0.45, 0.62], 2, false, 0.0),
+            ab("The Mountain's Heart", "For a while her coat is the mountain's molten heart: everything near her burns. Then it cools back to what it was.", Archetype::Field { material: Material::Magma, radius: 9.0, amount: 55.0, secs: 7.0 }, 75.0, 0.0, [1.00, 0.45, 0.15], 3, true, 0.30),
+        ],
+    },
 ];
 
 pub fn god(id: u32) -> &'static GodDef {
@@ -566,7 +669,10 @@ mod quick_aim_tests {
         // not a hard requirement of the game design, but worth knowing if a
         // future ancestor ships with no dash/blink at all — touch's quick
         // aim would then just never activate for them, silently
-        let with_mobility = ROSTER.iter().filter(|d| d.abilities.iter().any(|a| a.quick_aimable())).count();
-        assert!(with_mobility > ROSTER.len() / 2, "expected most ancestors to have a drag-aimable mobility skill, found {with_mobility}/{}", ROSTER.len());
+        // A Sentinel aims nothing at all (her keys are coats: `sentinel`),
+        // so she is not counted either way.
+        let casters: Vec<&GodDef> = ROSTER.iter().filter(|d| d.role != Role::Sentinel).collect();
+        let with_mobility = casters.iter().filter(|d| d.abilities.iter().any(|a| a.quick_aimable())).count();
+        assert!(with_mobility > casters.len() / 2, "expected most ancestors to have a drag-aimable mobility skill, found {with_mobility}/{}", casters.len());
     }
 }
