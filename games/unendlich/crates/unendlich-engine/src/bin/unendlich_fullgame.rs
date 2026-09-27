@@ -157,6 +157,10 @@ struct Roamer {
     /// This is a FAST per-individual path-dependent channel that runs against the
     /// SLOW population-genetic trend (see sim_vectors doc). 0 = naive.
     combat_habit: f32,
+    /// Object permanence (sim::object_permanence, mob_brain_object_permanence
+    /// .docx): where this creature believes the player is after losing them.
+    /// Created on first use, when the creature's kind sets how long it holds.
+    player_memory: Option<unendlich_engine::sim::object_permanence::Tracker>,
     /// r300: cached expressed disposition. Disposition is a pure function of the
     /// genome, which is fixed for life, so `express_disposition` need only run
     /// once per individual instead of every tick (the loop re-derived it each
@@ -502,6 +506,7 @@ fn build_roamer(kind: unendlich_engine::item::CreatureKind, pos: [f32; 3], wseed
         aggro: 0.0,
         prev_behavior: 0,
         combat_habit: 0.0,
+        player_memory: None,
         disposition_cache: None,
         graze_target: None,
         graze_cell: (i32::MIN, i32::MIN),
@@ -2329,6 +2334,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // the player is moving — what creatures hear.
     let mut last_player_xz: Option<(f32, f32)> = None;
     let mut roamer_tick: u32 = 0;
+    // Seconds of play the roamer loop has run (the clock object permanence
+    // ages its ghosts by). UNENDLICH_PERMANENCE=0 turns the memory off.
+    let mut roam_clock: f32 = 0.0;
+    let permanence_enabled = std::env::var("UNENDLICH_PERMANENCE").map_or(true, |v| v != "0");
     const ROAMER_CAP: usize = 96;
     // r139: population dynamics — sim::popdyn's grazing colony models the
     // land's carrying capacity; breeding is gated on it and overshoot culls.
@@ -7086,6 +7095,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         aggro: 0.0,
                         prev_behavior: 0,
                         combat_habit: 0.0,
+                        player_memory: None,
                         disposition_cache: None,
                         graze_target: None,
                         graze_cell: (i32::MIN, i32::MIN),
@@ -8053,6 +8063,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         aggro: 0.0,
                         prev_behavior: 0,
                         combat_habit: 0.0,
+                        player_memory: None,
                         disposition_cache: None,
                         graze_target: None,
                         graze_cell: (i32::MIN, i32::MIN),
@@ -10220,6 +10231,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             aggro: 0.0,
                             prev_behavior: 0,
                             combat_habit: 0.0,
+                            player_memory: None,
                             disposition_cache: None,
                             graze_target: None,
                             graze_cell: (i32::MIN, i32::MIN),
@@ -10254,6 +10266,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             let player_speed = match last_player_xz {
                 Some((lx, lz)) if dt > 1e-4 => ((pp.x - lx).powi(2) + (pp.z - lz).powi(2)).sqrt() / dt,
                 _ => 0.0,
+            };
+            // Horizontal velocity, for a ghost's dead-reckoning.
+            let player_vel3 = match last_player_xz {
+                Some((lx, lz)) if dt > 1e-4 => [(pp.x - lx) / dt, 0.0, (pp.z - lz) / dt],
+                _ => [0.0; 3],
             };
             last_player_xz = Some(player_xz);
             let player_speed_milli = (player_speed * 50.0) as u32;
@@ -10296,6 +10313,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     )
             };
             roamer_tick = roamer_tick.wrapping_add(1);
+            roam_clock += dt;
             // r134: AI BUDGET (operator: mob lag) — distance tick-bands from
             // the REAL sim::ai_budget: distant brains run every 2/4/8 frames,
             // staggered by a per-individual id hash so full-ticks spread out.
@@ -10406,6 +10424,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 Vec::new()
             };
             roamer_budget.begin();
+            // Object-permanence census for the periodic log: creatures that
+            // see the player this frame, and ones acting on a ghost.
+            let (mut perm_seeing, mut perm_ghosting) = (0u32, 0u32);
+            let mut perm_nearest = f32::MAX;
             for r in roamers.iter_mut() {
                 // r265: catch-up count carried from the gate to the tick body.
                 let mut mob_band_catch_up: u32 = 1;
@@ -10493,6 +10515,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     aggro,
                     prev_behavior,
                     combat_habit,
+                    player_memory,
                     genome,
                     disposition_cache,
                     graze_target,
@@ -10840,6 +10863,43 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     } else {
                         None
                     };
+                // Object permanence (sim::object_permanence): a sighting sets
+                // the ghost, a heard footstep nudges it (it cannot start one),
+                // and while neither reaches the creature it keeps acting on the
+                // ghost -- prey stays spooked, a provoked animal keeps coming --
+                // until the trail goes cold, instead of forgetting the player
+                // the moment they step behind a rock.
+                // This roamer's tick length (distant brains tick every few frames).
+                let tick_dt_perm = dt * mob_band_catch_up as f32;
+                let perceived = if permanence_enabled {
+                    use unendlich_engine::sim::object_permanence as op;
+                    let mem = player_memory.get_or_insert_with(|| {
+                        op::Tracker::new(op::PLAYER_MAX_SPEED, 1.0, op::memory_seconds(*kind))
+                    });
+                    let sight = (seen && !player_hidden).then_some((player_pos3, player_vel3));
+                    if sight.is_some() {
+                        perm_seeing += 1;
+                    }
+                    perm_nearest = perm_nearest.min(player_dist);
+                    let heard = if sight.is_none() { perceived.map(|(hx, hz)| [hx, pp.y, hz]) } else { None };
+                    let (act_on, ev) = op::sense_step(mem, sight, heard, roam_clock, tick_dt_perm);
+                    match ev {
+                        op::SenseEvent::LostSight => log::info!(
+                            "[permanence] {:?} lost sight of the player, acting on its belief ({:.0},{:.0})",
+                            kind, act_on.map_or(0.0, |p| p[0]), act_on.map_or(0.0, |p| p[2])
+                        ),
+                        op::SenseEvent::GaveUp(secs) => {
+                            log::info!("[permanence] {:?} gave up on the player after {:.0} s", kind, secs)
+                        }
+                        op::SenseEvent::None => {}
+                    }
+                    if sight.is_none() && heard.is_none() && act_on.is_some() {
+                        perm_ghosting += 1;
+                    }
+                    act_on.map(|p| (p[0], p[2]))
+                } else {
+                    perceived
+                };
                 // Flight-initiation distance: a creature may *notice* the player far
                 // off (and we could surface that as wariness later), but it only
                 // BOLTS once the threat is within a flight distance. Without this,
@@ -12402,6 +12462,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             if let Some(line) = roamer_budget.report() {
                 log::debug!("{line}");
             }
+            if permanence_enabled && lifetime_frame % 120 == 0 && perm_nearest < 64.0 {
+                log::info!(
+                    "[permanence] {} creature(s) see the player, {} act on a lost sighting (nearest ticked {:.0} blocks)",
+                    perm_seeing, perm_ghosting, perm_nearest
+                );
+            }
             if profile_on {
                 prof.record("roamer_blockscan", _t_blockscan_us as f64 / 1000.0);
                 prof.record("roamer_herdscan", _t_herdscan_us as f64 / 1000.0);
@@ -12562,6 +12628,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 aggro: 0.0,
                                 prev_behavior: 0,
                                 combat_habit: 0.0,
+                                player_memory: None,
                                 disposition_cache: None,
                                 graze_target: None,
                                 graze_cell: (i32::MIN, i32::MIN),
