@@ -16,9 +16,19 @@ struct FrameData {
     weather: vec4<f32>,  // x rain, y snow, z wetness, w lightning
     wind: vec4<f32>,
     event: vec4<f32>,    // x flood rise, y quake shake, z fire glow, w unused
+    brush: array<vec4<f32>, 8>,
+    blast_a: array<vec4<f32>, 4>,
+    blast_b: array<vec4<f32>, 4>,
+    cracks: array<vec4<f32>, 8>,
+    towers: array<vec4<f32>, 12>,
+    sea: vec4<f32>,               // y: caustic strength (render.rs FrameUniform)
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameData;
+
+fn frame_caustics() -> f32 {
+    return frame.sea.y;
+}
 @group(0) @binding(2) var shadow_map: texture_depth_2d;
 @group(0) @binding(3) var shadow_sampler: sampler_comparison;
 
@@ -126,28 +136,56 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let shallow = mix(vec3(0.30, 0.62, 0.62), vec3(0.42, 0.38, 0.26), silt);
     let deep = mix(vec3(0.03, 0.18, 0.24), vec3(0.16, 0.13, 0.08), silt);
     var col = mix(shallow, deep, smoothstep(0.0, 1.6, d));
-    // the bed shows through the shallows: fade alpha with depth (Beer-ish)
-    var alpha = 1.0 - exp(-d * 1.9) * 0.85;
-    alpha = clamp(alpha + 0.12, 0.0, 0.92);
+    // the bed shows through: alpha by depth (Beer), and more of it looking
+    // straight down than across -- the light's path through the water is
+    // shorter (the bed, and its caustics, show under a steep view)
+    let steep = max(V.y, 0.05);
+    var alpha = 1.0 - exp(-d * 0.45 / steep) * 0.95;
+    alpha = clamp(alpha + 0.25, 0.0, 0.82);
 
     // --- lighting
     let ndl = max(dot(N, sun), 0.0);
     let sun_col = frame.sun_col.xyz;
     let sky = mix(vec3(0.62, 0.66, 0.80), vec3(0.06, 0.07, 0.16), night) * mix(1.0, 0.75, frame.sun_col.w);
-    let fres = pow(1.0 - max(dot(N, V), 0.0), 4.0);
-    var lit = col * (sun_col * (0.35 + 0.65 * ndl) + sky * 0.6);
-    lit = mix(lit, sky * 0.9, fres * 0.55);
+    // Schlick's Fresnel for water (F0 = 0.02): almost clear looking down,
+    // a mirror at a glance
+    // (on the swell's normal with a third of the ripple: the full ripple
+    // tipped whole patches to a grazing angle and they read as white
+    // blotches, not water)
+    let Nf = normalize(mix(normalize(in.wave_n), N, 0.35));
+    let cosv = max(dot(Nf, V), 0.0);
+    let fres = 0.02 + 0.98 * pow(1.0 - cosv, 5.0);
+    // what the surface reflects: the sky as it is in that direction -- the
+    // haze at the horizon, the deeper blue overhead, and the sun's glow
+    let R = reflect(-V, Nf);
+    let zen = sky * vec3(0.78, 0.9, 1.15);
+    let hor = mix(frame.fog_color.xyz * 1.1, sky, 0.35);
+    var refl = mix(hor, zen, smoothstep(-0.05, 0.6, R.y));
+    refl = refl + sun_col * (pow(max(dot(R, sun), 0.0), 12.0) * 0.35) * (1.0 - frame.sun_col.w * 0.8);
+    // light scattered up out of the body of the water, greenest where the
+    // sun comes through a wave toward the eye
+    let through = pow(max(dot(-V, sun) * 0.5 + 0.5, 0.0), 3.0) * (1.0 - cosv);
+    var lit = col * (sun_col * (0.25 + 0.45 * ndl) + sky * 0.38) + col * sun_col * through * 0.6;
+    // the caustic web on the bed, seen through the water's body: the bed
+    // itself takes it (terrain.wgsl), and the water in front of it glows
+    // with the same pattern, bent a little by the surface
+    let bent = p + N.xz * d * 0.6;
+    lit = lit + sun_col * vec3(0.85, 1.0, 0.95) * caustic(bent, t) * 0.55 * exp(-d * 0.5) * (1.0 - night) * frame_caustics();
+    lit = mix(lit, refl, fres);
+    alpha = max(alpha, fres);
     // sun glint: tight lobe broken up by the ripple field so it sparkles
     let Hv = normalize(V + sun);
-    let spec = pow(max(dot(N, Hv), 0.0), 140.0);
-    lit = lit + sun_col * spec * 1.8 * (1.0 - frame.sun_col.w * 0.7);
+    let spec = pow(max(dot(N, Hv), 0.0), 220.0) * 2.4;
+    lit = lit + sun_col * spec * (1.0 - frame.sun_col.w * 0.7);
     // lightning + moon
     lit = lit + vec3(0.7, 0.75, 1.0) * flash * 0.6;
 
     // --- foam: banks, wave crests, and the wakes of rain
-    let bank = smoothstep(0.32, 0.0, d);
+    // (only the true edge: at 0.32 u every shallow rise mid-river foamed,
+    // and read as white blotches on the water)
+    let bank = smoothstep(0.12, 0.0, d);
     let crest_n = noise2(p * 3.0 - drift * 2.0 + vec2(t * 0.3, 0.0));
-    let crest = smoothstep(0.55, 0.85, crest_n) * smoothstep(0.4, 1.2, d) * 0.35;
+    let crest = smoothstep(0.74, 0.92, crest_n) * smoothstep(0.4, 1.2, d) * 0.18;
     let foam = clamp(bank * (0.5 + 0.5 * noise2(p * 5.0 - drift * 3.0)) + crest, 0.0, 1.0);
     lit = mix(lit, vec3(0.9, 0.95, 0.95) * (sun_col.g * 0.7 + 0.3), foam * 0.85);
     alpha = max(alpha, foam * 0.9);

@@ -73,6 +73,7 @@ pub mod lift;
 pub mod kit;
 pub mod curios;
 pub mod ranks;
+pub mod lensflare;
 /// The generated preparation documents in dev/ (cue cards, recording sheet, cue sheet).
 pub mod devdocs;
 /// Character voxels as smooth surfaces with fur lengths, for the ultra preview.

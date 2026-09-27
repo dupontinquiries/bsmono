@@ -56,6 +56,11 @@ pub struct FrameUniform {
     /// Tower range rings as the player should see them: x, z, range, state.
     /// terrain.wgsl. See `Game::tower_rings`.
     pub towers: [[f32; 4]; MAX_TOWER_RINGS],
+    /// The sea: x the whole map lies under it (Atlantis: every floor takes
+    /// caustics), y caustic strength (by quality), z the water surface's
+    /// height (river beds under it take caustics), w how far under the sea
+    /// the camera is. terrain.wgsl, voxel.wgsl.
+    pub sea: [f32; 4],
 }
 
 #[repr(C)]
@@ -90,10 +95,11 @@ impl Camera {
 /// contact-hardening shadow (common_shadow.wgsl) and the ground's height
 /// field (common_surface.wgsl). tests/shaders.rs validates exactly these.
 pub mod shader_src {
-    pub const VOXEL: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/voxel.wgsl"));
-    pub const TERRAIN: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/common_surface.wgsl"), include_str!("../shaders/terrain.wgsl"));
+    pub const VOXEL: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/common_sea.wgsl"), include_str!("../shaders/voxel.wgsl"));
+    pub const TERRAIN: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/common_surface.wgsl"), include_str!("../shaders/common_sea.wgsl"), include_str!("../shaders/terrain.wgsl"));
     pub const SMOOTH: &str = concat!(include_str!("../shaders/common_shadow.wgsl"), include_str!("../shaders/smooth.wgsl"));
     pub const POST: &str = concat!(include_str!("../shaders/common_surface.wgsl"), include_str!("../shaders/post.wgsl"));
+    pub const WATER: &str = concat!(include_str!("../shaders/common_sea.wgsl"), include_str!("../shaders/water.wgsl"));
 }
 
 /// A smooth mesh on the GPU (`smoothvox`): vertices and triangle indices.
@@ -312,6 +318,12 @@ pub struct Renderer {
     pub quality: crate::quality::Quality,
     /// The ultra post effects: wet ground as a mirror, sky-occluded god rays.
     pub ultra_post: bool,
+    /// How far the view is under the sea, 0..1 (the Atlantis map: set by
+    /// the scene each frame), and how strongly light ripples on the floors.
+    pub underwater: f32,
+    pub caustics: f32,
+    /// 1 on a map that lies wholly under the sea (Atlantis).
+    pub sea_map: f32,
     /// The fur's look (shells and density follow it: `set_fur_style`).
     pub fur_style: FurStyle,
     /// Fur shells per smooth draw, and strands per unit of model space.
@@ -481,7 +493,7 @@ impl Renderer {
         });
         let water_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("water"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/water.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_src::WATER.into()),
         });
         let sky_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sky.wgsl"),
@@ -877,7 +889,7 @@ impl Renderer {
             label: Some("post params"),
             // 3 vec4, view-proj, its inverse, the camera, and per blast a
             // world centre+radius and a strength+thickness
-            size: 64 + 64 * 2 + 16 + 32 * crate::groundfx::MAX_RINGS as u64,
+            size: 64 + 64 * 2 + 16 + 32 * crate::groundfx::MAX_RINGS as u64 + 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -947,6 +959,9 @@ impl Renderer {
             occluders: Vec::new(),
             quality: crate::quality::Quality::High,
             ultra_post: false,
+            underwater: 0.0,
+            caustics: 0.0,
+            sea_map: 0.0,
             fur_style: FurStyle::from_env(),
             fur_shells: FurStyle::from_env().shells_density().0,
             fur_density: FurStyle::from_env().shells_density().1,
@@ -1267,6 +1282,14 @@ impl Renderer {
         let lvp = crate::groundfx::fit_shadow(cam.target, sun, half, self.shadow_size);
 
         let fog_color = [atm.fog_color[0], atm.fog_color[1], atm.fog_color[2], 1.0];
+        // caustics by the quality setting (Low: none; they are a per-pixel
+        // loop on every lit river bed and sea floor)
+        self.caustics = match self.quality {
+            crate::quality::Quality::Low => 0.0,
+            crate::quality::Quality::Medium => 0.45,
+            crate::quality::Quality::High => 0.75,
+            crate::quality::Quality::Ultra => 1.0,
+        };
         let frame = FrameUniform {
             view_proj: vp.to_cols_array_2d(),
             inv_view_proj: inv.to_cols_array_2d(),
@@ -1286,6 +1309,7 @@ impl Renderer {
             blast_b: self.blast_b,
             cracks: self.cracks,
             towers: self.towers,
+            sea: [self.sea_map, self.caustics, crate::consts::WATER_LEVEL, self.underwater],
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 
@@ -1319,6 +1343,8 @@ impl Renderer {
             {
                 // project the sun (a far point along its direction) to screen uv
                 let sp = vp * (cam.eye + sun * 400.0).extend(1.0);
+                let sun_ndc = (sp.w > 0.0).then(|| [sp.x / sp.w, sp.y / sp.w]);
+                let flare = crate::lensflare::strength(sun_ndc, atm.cloud_cover, atm.night, self.underwater, self.quality);
                 let (sun_uv, ray) = if sp.w > 0.0 {
                     let n = sp.truncate() / sp.w;
                     let uv = [n.x * 0.5 + 0.5, 0.5 - n.y * 0.5];
@@ -1362,6 +1388,10 @@ impl Renderer {
                 for r in shell_b {
                     post_data.extend_from_slice(&r);
                 }
+                // the lens flare (lensflare.rs), in the sun's colour
+                post_data.extend_from_slice(&[flare, atm.sun_col[0], atm.sun_col[1], atm.sun_col[2]]);
+                // the sea (atlantis): how far under it the view is, caustics
+                post_data.extend_from_slice(&[self.underwater, self.caustics, 0.0, 0.0]);
                 bytemuck::cast_slice(&post_data)
             },
         );
@@ -1656,6 +1686,7 @@ impl Renderer {
             blast_b: self.blast_b,
             cracks: self.cracks,
             towers: self.towers,
+            sea: [0.0; 4],
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 

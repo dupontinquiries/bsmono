@@ -17,6 +17,7 @@ struct FrameData {
     blast_b: array<vec4<f32>, 4>, // x strength, y width
     cracks: array<vec4<f32>, 8>,  // x, z, radius, how open
     towers: array<vec4<f32>, 12>, // x, z, range, state (see Game::tower_rings)
+    sea: vec4<f32>,               // x all under the sea, y caustic strength, z water surface y, w camera underwater
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameData;
@@ -500,12 +501,27 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let glit = step(0.996, hash_cell(vec2<i32>(floor(in.world.xz * 40.0)) + vec2<i32>(i32(floor(frame.params.x * 0.7)) * 7919, 0))) * loose * (1.0 - smoothstep(3.0, 16.0, cam_d));
     var lit = albedo * (sun_col * mix(wrap * wrap, ndl, 0.7) * shadow + hemi * 0.9 + sky * 0.2 * (1.0 - shadow));
     lit = lit + albedo * point_lights(in.world, N);
+    // caustics: the sun through moving water. Under a river's surface (the
+    // shallows most, fading with depth), or everywhere on a sea-floor map;
+    // strongest on ground facing up at the light
+    if (frame.sea.y > 0.001) {
+        let depth = frame.sea.z - in.world.y;
+        let river = smoothstep(0.03, 0.25, depth) * exp(-max(depth, 0.0) * 0.35);
+        let amount = max(river, frame.sea.x) * frame.sea.y * (0.25 + 0.75 * max(N.y, 0.0)) * (1.0 - smoothstep(60.0, 140.0, cam_d));
+        if (amount > 0.001) {
+            lit = lit + albedo * sun_col * caustic(in.world.xz, frame.params.x) * amount * 3.0 * (0.3 + 0.7 * shadow) * (1.0 - night);
+        }
+    }
     lit = lit + vec3(1.4, 1.5, 1.7) * glit * (0.4 + shadow * 0.6);
     let V = normalize(frame.cam_pos.xyz - in.world);
     let Hv = normalize(V + sun);
     let fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
     let glint = pow(max(dot(N, Hv), 0.0), 90.0) * shadow;
-    lit = lit + (hemi * fres * 0.6 + sun_col * glint * 0.9) * wetness;
+    // (not under water: a river bed does not glint -- the surface above
+    // it does, in water.wgsl; the bed's glints read as white blotches
+    // through it)
+    let submerged = smoothstep(0.02, 0.12, frame.sea.z - in.world.y) * (1.0 - frame.sea.x);
+    lit = lit + (hemi * fres * 0.6 + sun_col * glint * 0.9) * wetness * (1.0 - submerged);
     let lum = dot(in.color, vec3(0.299, 0.587, 0.114));
     let haze = frame.fog_color.xyz * (0.45 + 0.55 * lum);
     lit = mix(lit, haze, fog * 0.9);
