@@ -17068,7 +17068,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 breath = nb;
             }
             air_fx = ca::effects(if survival_mode { breath } else { ca::Breath::Normal });
-            if survival_mode && air_fx.vitality_drain > 0.0 {
+            // Only while the world is being played, like the other survival
+            // ticks (stamina, hunger, exposure): not in a menu or paused.
+            let playing = mouse_captured && !game_paused;
+            if survival_mode && playing && air_fx.vitality_drain > 0.0 {
                 fg_app.vitality_mut().tick(dt, air_fx.vitality_drain);
             }
             // Heat stress from the air the exposure block computed.
@@ -17081,11 +17084,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
             heat_fx = ca::heat_effects(if survival_mode { heat } else { ca::Heat::None });
             let regen = air_fx.stamina_regen_mult.min(heat_fx.stamina_regen_mult);
-            if survival_mode && regen < 1.0 {
-                // Fatigue: bad air or heat eats into the stamina the meter
-                // would recover.
+            if survival_mode && playing && regen < 1.0 && !fg_app.stamina().sprinting {
+                // Fatigue: bad air or heat takes back that share of what the
+                // meter recovered this frame (stamina::tick ran earlier), so
+                // regen 0 means no recovery at all. The earlier fixed 0.08/s
+                // was under the meter's 0.18/s regen and left it recovering
+                // even at regen 0.
                 let s = fg_app.stamina_mut();
-                s.level = (s.level - (1.0 - regen) * 0.08 * dt).max(0.0);
+                s.level = (s.level - (1.0 - regen) * unendlich_engine::sim::stamina::REGEN_PER_SEC * dt).max(0.0);
             }
             renderer.set_air_vignette(air_fx.vignette.max(heat_fx.vignette));
             o2_head_last = o2_head;
@@ -18535,7 +18541,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         // Posing (UNENDLICH_HAND_POSE=file:..) wants a steady
                         // shot: creative, hovering where the world put the eye,
                         // clear of water and slopes.
-                        if hand_pose_file.is_some() || view_pin.is_some() || view_pin_file.is_some() {
+                        // UNENDLICH_PIN_SURVIVAL=1 keeps the survival ruleset
+                        // under a pinned view (no physics body, so the pin
+                        // still holds the eye): soaks can then see breath,
+                        // heat and vitality at a fixed spot.
+                        let pinned = hand_pose_file.is_some() || view_pin.is_some() || view_pin_file.is_some();
+                        let pin_survival = pinned && std::env::var("UNENDLICH_PIN_SURVIVAL").map_or(false, |v| v == "1");
+                        if pinned && !pin_survival {
                             survival_mode = false;
                         }
                         local_player.permissions.can_toggle_flight = !survival_mode;
@@ -18548,7 +18560,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         // it off"). Mirror the F6 path: attach a physics body so
                         // gravity applies immediately. Creative leaves body as-is
                         // (None = free flight), matching its ruleset.
-                        if survival_mode && body.is_none() {
+                        if survival_mode && body.is_none() && !pin_survival {
                             body = Some(unendlich_engine::physics::PhysicsBody::new_player([
                                 local_player.view.position.x,
                                 local_player.view.position.y,
