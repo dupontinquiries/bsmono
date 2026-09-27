@@ -143,7 +143,17 @@ what else is known-but-unresolved.
   call, after his kills and on "Up, up!".
   `dev/voice_script/master_take.py` cuts, cleans and masters a session;
   `tests/voice_assets.rs` checks every recorded ancestor is complete,
-  trimmed and levelled. The other ancestors are still unvoiced.
+  trimmed and levelled. The other ten speak with stand-in voices until they
+  are recorded: `dev/voice_script/synth_session.py` speaks their lines with
+  the Kokoro-82M text-to-speech model (one speaker per ancestor, cast from
+  the recording sheets) and `master_take.py` gives them their own layers and
+  chains the same way (a tiger's breath and chuff for Duskstripe, a
+  leopard's rasp for Rainspots, a whispered double for Nightpelt, a singing
+  fifth and octave for Faryowl, a choir for Suneye, a lynx's hiss for
+  Snowhush, the crags answering Stonewhisper, a flooded jaguar's growl for
+  Riptail, thunder under Stillsmoke, a comet's streak after Cometail). A
+  real session replaces them file for file. Bots speak their lines like the
+  player does (`tests/voice_assets.rs`, `the_bots_speak_their_own_lines`).
 - **Procedural ambience** (`src/audio.rs`, cpal, feature `audio`, on by
   default) — no samples: a wind body, a place-shaped howl (the resonant band
   the wind excites depends on where you stand — a whistle over the river, a
