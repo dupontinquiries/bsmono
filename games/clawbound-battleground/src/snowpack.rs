@@ -94,6 +94,8 @@ fn holds_snow(x: f32, z: f32) -> bool {
         crate::map::MapId::Sky => crate::sky::floor().sdf(x, z) < crate::sky::RIM_W * 0.5 && !crate::sky::in_pool(x, z),
         crate::map::MapId::Pass => crate::consts::water_depth(x, z) < 0.05,
         crate::map::MapId::Jungle => crate::consts::water_depth(x, z) < 0.05,
+        // under the sea: no snow
+        crate::map::MapId::Atlantis => false,
     }
 }
 
@@ -119,7 +121,7 @@ fn initial_depth(x: f32, z: f32, blow: f32) -> f32 {
     let base = match crate::map::active() {
         crate::map::MapId::Sky => 1.0,
         crate::map::MapId::Pass => 0.7,
-        crate::map::MapId::Jungle => 0.0,
+        crate::map::MapId::Jungle | crate::map::MapId::Atlantis => 0.0,
     };
     if base == 0.0 {
         return 0.0;
@@ -142,7 +144,7 @@ pub fn snowfall(weather_snow: f32) -> f32 {
     let ambient = match crate::map::active() {
         crate::map::MapId::Sky => 0.3,
         crate::map::MapId::Pass => 0.25,
-        crate::map::MapId::Jungle => 0.0,
+        crate::map::MapId::Jungle | crate::map::MapId::Atlantis => 0.0,
     };
     weather_snow.max(ambient)
 }

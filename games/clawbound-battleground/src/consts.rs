@@ -25,6 +25,7 @@ pub fn arena_radius() -> f32 {
         crate::map::MapId::Jungle => ARENA_RADIUS,
         crate::map::MapId::Pass => crate::pass::ARENA_RADIUS,
         crate::map::MapId::Sky => crate::sky::ARENA_RADIUS,
+        crate::map::MapId::Atlantis => crate::atlantis::ARENA_RADIUS,
     }
 }
 
@@ -34,6 +35,7 @@ pub fn ground_half() -> f32 {
         crate::map::MapId::Jungle => GROUND_HALF,
         crate::map::MapId::Pass => crate::pass::GROUND_HALF,
         crate::map::MapId::Sky => crate::sky::GROUND_HALF,
+        crate::map::MapId::Atlantis => crate::atlantis::GROUND_HALF,
     }
 }
 
@@ -93,6 +95,7 @@ pub fn river_dist(x: f32, z: f32) -> f32 {
     match crate::map::active() {
         crate::map::MapId::Pass => return crate::pass::river_dist(x, z),
         crate::map::MapId::Sky => return crate::sky::river_dist(x, z),
+        crate::map::MapId::Atlantis => return crate::atlantis::river_dist(x, z),
         crate::map::MapId::Jungle => {}
     }
     (x - river_x(-1.0, z)).abs().min((x - river_x(1.0, z)).abs())
@@ -109,6 +112,11 @@ pub fn water_depth(x: f32, z: f32) -> f32 {
     // over the sky map's void the "terrain" is the cloud sea, thirty units
     // down: that is not water. Only the Moonwell is.
     if crate::map::active() == crate::map::MapId::Sky && !crate::sky::in_pool(x, z) {
+        return 0.0;
+    }
+    // the Drowned Halls are dry inside; the sea floor beyond the walls is
+    // not walked
+    if crate::map::active() == crate::map::MapId::Atlantis {
         return 0.0;
     }
     (WATER_LEVEL - crate::render::terrain_height(x, z)).max(0.0)
@@ -151,6 +159,7 @@ impl Team {
         match crate::map::active() {
             crate::map::MapId::Pass => return crate::pass::fountain(self),
             crate::map::MapId::Sky => return crate::sky::fountain(self),
+            crate::map::MapId::Atlantis => return crate::atlantis::fountain(self),
             crate::map::MapId::Jungle => {}
         }
         match self {
@@ -162,6 +171,7 @@ impl Team {
         match crate::map::active() {
             crate::map::MapId::Pass => return crate::pass::titan_pos(self),
             crate::map::MapId::Sky => return crate::sky::titan_pos(self),
+            crate::map::MapId::Atlantis => return crate::atlantis::titan_pos(self),
             crate::map::MapId::Jungle => {}
         }
         match self {
@@ -173,6 +183,7 @@ impl Team {
         match crate::map::active() {
             crate::map::MapId::Pass => return crate::pass::base_pos(self),
             crate::map::MapId::Sky => return crate::sky::base_pos(self),
+            crate::map::MapId::Atlantis => return crate::atlantis::base_pos(self),
             crate::map::MapId::Jungle => {}
         }
         match self {
@@ -238,6 +249,7 @@ impl Lane {
         match crate::map::active() {
             crate::map::MapId::Pass => return crate::pass::lane_polyline(self),
             crate::map::MapId::Sky => return crate::sky::lane_polyline(self),
+            crate::map::MapId::Atlantis => return crate::atlantis::lane_polyline(self),
             crate::map::MapId::Jungle => {}
         }
         match self {
@@ -309,7 +321,7 @@ fn push_sampled(out: &mut Vec<Vec3>, from: Vec3, to: Vec3, step: f32) {
 pub fn lane_path(lane: Lane, team: Team) -> &'static [Vec3] {
     use std::sync::OnceLock;
     // One cache per map: the paths are the map's.
-    static PATHS: [OnceLock<Vec<Vec<Vec3>>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    static PATHS: [OnceLock<Vec<Vec<Vec3>>>; 4] = [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
     let all = PATHS[crate::map::active() as usize].get_or_init(|| {
         let mut v = Vec::new();
         for lane in LANES {
@@ -332,6 +344,7 @@ pub fn tower_pos(lane: Lane, team: Team, inner: bool) -> Vec3 {
     match crate::map::active() {
         crate::map::MapId::Pass => return crate::pass::tower_pos(lane, team, inner),
         crate::map::MapId::Sky => return crate::sky::tower_pos(lane, team, inner),
+        crate::map::MapId::Atlantis => return crate::atlantis::tower_pos(lane, team, inner),
         crate::map::MapId::Jungle => {}
     }
     use Lane::*;

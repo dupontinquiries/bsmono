@@ -1263,6 +1263,10 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
             let (pieces, blockers) = crate::skyworld::build();
             return batch(pieces, blockers);
         }
+        crate::map::MapId::Atlantis => {
+            let (pieces, blockers) = crate::atlantisworld::build();
+            return batch(pieces, blockers);
+        }
         crate::map::MapId::Jungle => {}
     }
     const TAU: f32 = std::f32::consts::TAU;
@@ -1648,15 +1652,11 @@ fn batch(mut pieces: Vec<Piece>, mut blockers: Blockers) -> (Vec<(VoxelMesh, Vec
     // rebuild by 0).
     let mut cells: std::collections::BTreeMap<(i32, i32, u32), Vec<&Piece>> = std::collections::BTreeMap::new();
     for p in &pieces {
-        let cls = if p.vsize == V_SM {
-            0u32
-        } else if p.vsize == V_MED {
-            1
-        } else if p.vsize == V_BIG {
-            2
-        } else {
-            3
-        };
+        // one chunk per voxel size: a chunk is drawn at its FIRST piece's
+        // size, so two sizes sharing a chunk drew one of them wrong (every
+        // size outside the three named ones shared class 3)
+        let cls = p.vsize.to_bits();
+        let _ = (V_SM, V_MED, V_BIG);
         let key = ((p.pos.x / 34.0).floor() as i32, (p.pos.z / 34.0).floor() as i32, cls);
         cells.entry(key).or_default().push(p);
     }

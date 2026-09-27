@@ -2618,3 +2618,48 @@ fn levels_unlock_the_kit_and_rank_it_up() {
     let top = g.ability(0, 0).unwrap();
     assert!(top.cooldown < one.cooldown);
 }
+
+/// The Drowned Halls: 3 a side, one lane with two towers a side; bots stay
+/// on the halls' floor (never in a wall or out on the sea floor), leave
+/// their bases, take the Library by its passages, and over eight minutes
+/// the lane moves -- a tower falls.
+#[test]
+fn the_drowned_halls_play_three_a_side_in_one_lane() {
+    use clawbound::map::{self, MapId};
+    map::with(MapId::Atlantis, || {
+        assert_eq!(MapId::Atlantis.team_size(), 3);
+        assert_eq!(map::lanes(), &[clawbound::consts::Lane::Mid]);
+        let blockers = std::sync::Arc::new(clawbound::scene::world_blockers());
+        let (b, r) = map::team_picks(4, &mut clawbound::sim::Rng::new(9));
+        let mut game = Game::new_teams(&b, &r);
+        assert_eq!(game.gods.len(), 6);
+        assert_eq!(game.towers.len(), 4, "two towers a side in the one lane");
+        game.blockers = blockers;
+        // the player's cat plays too
+        game.gods[0].ai = Some(clawbound::sim::AiBrain::new(clawbound::consts::Lane::Mid, 0.9));
+        let f = map::floor().unwrap();
+        let mut in_library = [false; 6];
+        let mut left_base = [false; 6];
+        for _ in 0..(8 * 60 * 30) {
+            game.tick(1.0 / 30.0);
+            game.events.clear();
+            for (i, g) in game.gods.iter().enumerate() {
+                if g.respawn_t <= 0.0 {
+                    assert!(f.sdf(g.pos.x, g.pos.z) <= 0.05, "cat {i} in the wall at {} (sdf {})", g.pos, f.sdf(g.pos.x, g.pos.z));
+                    in_library[i] |= glam::Vec3::new(g.pos.x - clawbound::atlantis::LIBRARY_X, 0.0, g.pos.z).length() < clawbound::atlantis::LIBRARY_R;
+                    left_base[i] |= (g.pos - g.team.base_pos()).length() > 30.0;
+                }
+            }
+            for m in &game.minions {
+                assert!(f.sdf(m.pos.x, m.pos.z) <= 0.3, "a minion in the wall at {}", m.pos);
+            }
+            if game.over.is_some() {
+                break;
+            }
+        }
+        assert!(left_base.iter().all(|x| *x), "every cat leaves its base: {left_base:?}");
+        assert!(in_library.iter().any(|x| *x), "nobody went into the Library in eight minutes");
+        let standing: usize = game.tower_alive.iter().sum();
+        assert!(standing < 4 || game.over.is_some(), "no tower fell in eight minutes");
+    });
+}

@@ -35,16 +35,20 @@ pub enum MapId {
     /// Starwell Glacier: two wide lanes over glacier islands in the sky,
     /// 15 a side (`sky`).
     Sky,
+    /// The Drowned Halls: 3 a side on the sea floor, one lane hall and one
+    /// jungle rotunda, walled and domed (`atlantis`).
+    Atlantis,
 }
 
 impl MapId {
-    pub const ALL: [MapId; 3] = [MapId::Jungle, MapId::Pass, MapId::Sky];
+    pub const ALL: [MapId; 4] = [MapId::Jungle, MapId::Pass, MapId::Sky, MapId::Atlantis];
 
     pub fn name(self) -> &'static str {
         match self {
             MapId::Jungle => "The Jungle",
             MapId::Pass => "Twinfang Pass",
             MapId::Sky => "Starwell Glacier",
+            MapId::Atlantis => "The Drowned Halls",
         }
     }
     /// Command-line / config key.
@@ -53,6 +57,7 @@ impl MapId {
             MapId::Jungle => "jungle",
             MapId::Pass => "pass",
             MapId::Sky => "starwell",
+            MapId::Atlantis => "atlantis",
         }
     }
     pub fn from_key(s: &str) -> Option<MapId> {
@@ -64,6 +69,7 @@ impl MapId {
             MapId::Jungle => 5,
             MapId::Pass => crate::pass::TEAM_SIZE,
             MapId::Sky => crate::sky::TEAM_SIZE,
+            MapId::Atlantis => crate::atlantis::TEAM_SIZE,
         }
     }
     /// The lanes minions walk and towers stand on. The sky map has two:
@@ -73,13 +79,14 @@ impl MapId {
         match self {
             MapId::Jungle | MapId::Pass => &crate::consts::LANES,
             MapId::Sky => &[Lane::Top, Lane::Bot],
+            MapId::Atlantis => &[Lane::Mid],
         }
     }
     /// Minions per side in each lane's wave, (melee, casters), for wave
     /// number `n` (`minionai::wave_for` on the smaller maps).
     pub fn wave(self, n: u32) -> (usize, usize) {
         match self {
-            MapId::Jungle | MapId::Pass => crate::minionai::wave_for(n),
+            MapId::Jungle | MapId::Pass | MapId::Atlantis => crate::minionai::wave_for(n),
             // thirty-two a side in each lane (sixty-four when the waves meet)
             MapId::Sky => (24, 8),
         }
@@ -91,7 +98,7 @@ impl MapId {
     /// three stalled to the cap.
     pub fn structure_hp_mul(self) -> f32 {
         match self {
-            MapId::Jungle | MapId::Pass => 1.0,
+            MapId::Jungle | MapId::Pass | MapId::Atlantis => 1.0,
             MapId::Sky => 2.0,
         }
     }
@@ -102,7 +109,7 @@ impl MapId {
     /// wave does, against twice the health.
     pub fn minion_structure_mul(self) -> f32 {
         match self {
-            MapId::Jungle | MapId::Pass => 1.0,
+            MapId::Jungle | MapId::Pass | MapId::Atlantis => 1.0,
             MapId::Sky => 0.3,
         }
     }
@@ -113,7 +120,7 @@ impl MapId {
     /// standing (the super-minion answer, cut down). 0 elsewhere.
     pub fn siege_surge(self) -> f32 {
         match self {
-            MapId::Jungle | MapId::Pass => 0.0,
+            MapId::Jungle | MapId::Pass | MapId::Atlantis => 0.0,
             MapId::Sky => 0.4,
         }
     }
@@ -124,7 +131,7 @@ impl MapId {
     /// `OVERTIME_AT` the multiplier climbs 12% a minute, to x4. 1 elsewhere.
     pub fn overtime(self, t: f32) -> f32 {
         match self {
-            MapId::Jungle | MapId::Pass => 1.0,
+            MapId::Jungle | MapId::Pass | MapId::Atlantis => 1.0,
             MapId::Sky => (1.0 + (t - OVERTIME_AT).max(0.0) / 60.0 * 0.12).min(4.0),
         }
     }
@@ -135,6 +142,8 @@ impl MapId {
         match self {
             MapId::Jungle | MapId::Pass => crate::consts::TITAN_TOWERS_REQ,
             MapId::Sky => 3,
+            // one lane, two towers a side: the Elder opens when both fall
+            MapId::Atlantis => 1,
         }
     }
 }
@@ -182,6 +191,7 @@ pub fn open_ground(x: f32, z: f32, margin: f32) -> bool {
         MapId::Jungle => true,
         MapId::Pass => crate::pass::floor().fits(x, z, margin),
         MapId::Sky => crate::sky::floor().fits(x, z, margin),
+        MapId::Atlantis => crate::atlantis::floor().fits(x, z, margin),
     }
 }
 
@@ -193,6 +203,7 @@ pub fn ground_y(x: f32, z: f32) -> f32 {
         MapId::Jungle => 0.0,
         MapId::Pass => crate::pass::floor_height(x, z),
         MapId::Sky => crate::sky::floor_height(x, z),
+        MapId::Atlantis => crate::atlantis::floor_height(x, z),
     }
 }
 
@@ -201,7 +212,7 @@ pub fn ground_y(x: f32, z: f32) -> f32 {
 /// anything above the floor falls).
 pub fn step_down() -> f32 {
     match active() {
-        MapId::Jungle | MapId::Sky => 0.0,
+        MapId::Jungle | MapId::Sky | MapId::Atlantis => 0.0,
         MapId::Pass => 0.8,
     }
 }
@@ -212,6 +223,7 @@ pub fn floor() -> Option<&'static crate::floor::FloorPlan> {
         MapId::Jungle => None,
         MapId::Pass => Some(crate::pass::floor()),
         MapId::Sky => Some(crate::sky::floor()),
+        MapId::Atlantis => Some(crate::atlantis::floor()),
     }
 }
 

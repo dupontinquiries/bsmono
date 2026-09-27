@@ -94,17 +94,29 @@ impl Game {
     pub fn giggle(&mut self, gi: usize, radius: f32, dmg: f32, secs: f32) {
         let g = &self.gods[gi];
         let (from, team, pen_pct, pen_flat) = (g.pos, g.team, g.pen_pct, g.pen_flat);
-        for t in self.aoe_targets(from, radius, team) {
+        // Everyone giggles first, then the damage lands, minions from the
+        // highest index down: a minion the damage kills is REMOVED, shifting
+        // every later index, and the loop that set the giggle as it dealt
+        // the damage indexed past the end (a 3v3 on the Drowned Halls found
+        // it: "index out of bounds: the len is 2 but the index is 2").
+        let mut targets = self.aoe_targets(from, radius, team);
+        for &t in &targets {
             match t {
                 TargetRef::God(j) => {
                     self.gods[j].giggle_t = self.gods[j].giggle_t.max(secs);
                     // a laugh breaks a wind-up
                     self.gods[j].casting = None;
                 }
-                TargetRef::Minion(m) => self.minions[m].giggle_t = self.minions[m].giggle_t.max(secs),
+                TargetRef::Minion(m) if m < self.minions.len() => self.minions[m].giggle_t = self.minions[m].giggle_t.max(secs),
                 _ => {}
             }
-            if dmg > 0.0 {
+        }
+        if dmg > 0.0 {
+            targets.sort_by_key(|t| std::cmp::Reverse(match t {
+                TargetRef::Minion(m) => *m as i64,
+                _ => -1,
+            }));
+            for t in targets {
                 self.deal_damage(t, dmg, true, Some(gi), pen_pct, pen_flat);
             }
         }
@@ -234,6 +246,28 @@ fn flat(v: Vec3) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A giggle that kills some of the minions it catches: the dead are
+    /// removed mid-loop, and the rest still giggle (it indexed past the end).
+    #[test]
+    fn a_killing_giggle_does_not_lose_count_of_the_minions() {
+        let mut g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        g.next_wave_t = 0.0;
+        g.tick(1.0 / 60.0);
+        g.next_wave_t = 1e9;
+        let red: Vec<usize> = (0..g.minions.len()).filter(|&m| g.minions[m].team == Team::Red).collect();
+        assert!(red.len() >= 3);
+        let at = g.gods[0].pos;
+        for (k, &m) in red.iter().enumerate() {
+            g.minions[m].pos = at + Vec3::new(1.0 + k as f32 * 0.3, 0.0, 0.0);
+            // every other one dies to the laugh
+            g.minions[m].hp = if k % 2 == 0 { 1.0 } else { 1e6 };
+        }
+        g.giggle(0, 6.0, 50.0, 2.0);
+        let survivors: Vec<_> = g.minions.iter().filter(|m| m.team == Team::Red && m.pos.distance(at) < 6.0).collect();
+        assert!(!survivors.is_empty());
+        assert!(survivors.iter().all(|m| m.giggle_t > 0.0 && m.hp < 1e6), "every survivor giggles and was hurt");
+    }
 
     #[test]
     fn a_giggling_cat_wanders_both_ways_and_a_sober_one_goes_straight() {
