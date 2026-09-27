@@ -610,6 +610,10 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             Archetype::Lantern { radius, .. } => radius * 0.8,
             // a coat is worn wherever she is (`sentinel::coat_for` decides)
             Archetype::Field { .. } => f32::INFINITY,
+            // Hourwatch (`hours`)
+            Archetype::Rewind { .. } | Archetype::WindForward { .. } => f32::INFINITY,
+            Archetype::SendBack { range, .. } => range,
+            Archetype::LongLook { range, .. } => range,
         };
         let pri = match ab.arch {
             Archetype::Nova { .. } => {
@@ -672,6 +676,23 @@ fn choose_cast(game: &Game, gi: usize, target: TargetRef, dist: f32, stance: Sta
             }
             Archetype::Field { .. } => {
                 if game.coat_for(gi) == Some(slot as u32) { 0.9 } else { 0.0 }
+            }
+            // Hourwatch (`hours`): turn back a bad few seconds (a quarter of
+            // her health lost in them); send back an enemy in reach; wind
+            // on friends waiting on their keys; look long on a fight ahead
+            Archetype::Rewind { secs } => {
+                let then = crate::hours::past(&g.trail, game.t, secs).map_or(0.0, |m| m.hp);
+                if then - g.hp > g.max_hp * 0.25 { 0.97 } else { 0.0 }
+            }
+            Archetype::SendBack { .. } => {
+                if is_god_target && dist < range { 0.75 } else { 0.0 }
+            }
+            Archetype::WindForward { radius, .. } => {
+                let waiting = game.gods.iter().enumerate().any(|(j, o)| j != gi && o.team == g.team && o.respawn_t <= 0.0 && o.pos.distance(g.pos) < radius && o.cds.iter().sum::<f32>() > 10.0);
+                if waiting { 0.6 } else { 0.0 }
+            }
+            Archetype::LongLook { .. } => {
+                if is_god_target && dist > 10.0 && dist < range { 0.5 } else { 0.0 }
             }
             Archetype::Shield { .. } | Archetype::Buff { .. } | Archetype::Heal { .. } => {
                 let hurt = g.hp / g.max_hp;

@@ -46,6 +46,12 @@ pub fn cast_timing(ab: &crate::gods::AbilityDef) -> (f32, f32) {
         // a coat is not cast, it is worn: the shift is at once, and she
         // keeps walking (`sentinel`)
         Archetype::Field { .. } => (0.0, 1.0),
+        // Hourwatch (`hours`): turning her own hour back is at once (it is
+        // an escape); pointing at someone else's takes a moment; winding
+        // her friends' on is a gesture; the leap is a crouch
+        Archetype::Rewind { .. } | Archetype::WindForward { .. } => (0.0, 1.0),
+        Archetype::SendBack { .. } => (0.2, 0.6),
+        Archetype::LongLook { .. } => (0.3, 0.3),
     };
     if ab.ult && w > 0.0 {
         ((w * 1.5).max(0.45), 0.0)
@@ -372,6 +378,22 @@ impl Game {
             }
             Archetype::Field { .. } => {
                 self.shift_coat(gi, slot);
+            }
+            Archetype::Rewind { secs } => {
+                self.turn_back(gi, secs);
+            }
+            Archetype::SendBack { range, dmg, secs } => {
+                let d = dmg_scale(dmg, ab.power_scale);
+                self.send_back(gi, aim_flat, range, d, secs);
+            }
+            Archetype::WindForward { radius, secs } => {
+                self.wind_forward(gi, radius, secs);
+            }
+            Archetype::LongLook { range, flight, reveal, exposed } => {
+                let dest = clamp_arena(from + dir * dist.min(range));
+                let dest = crate::map::onto_floor(dest, crate::consts::GOD_RADIUS);
+                let dest = Vec3::new(dest.x, crate::map::ground_y(dest.x, dest.z), dest.z);
+                self.long_look(gi, dest, flight, reveal, exposed);
             }
             Archetype::Blink { dist: dd, dmg } => {
                 let d = if dmg > 0.0 { dmg_scale(dmg, ab.power_scale) } else { 0.0 };

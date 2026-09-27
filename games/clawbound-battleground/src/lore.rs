@@ -50,7 +50,7 @@ pub struct Ancestor {
     pub instruments: &'static str,
 }
 
-pub const ANCESTORS: [Ancestor; 18] = [
+pub const ANCESTORS: [Ancestor; 19] = [
     Ancestor {
         name: "Goldenmane",
         species: "lion",
@@ -212,6 +212,15 @@ pub const ANCESTORS: [Ancestor; 18] = [
         gender: Gender::Female,
         story: "The first of the Sentinels, the great cats the Geartooth engineers built of stone and ore to keep their works when they were gone. They made her in the likeness of Stonewhisper's grandmother, who lay so long on the roots of the crags that they could quarry her shape from the mountain, and they gave her the grandmother's voice. Her coat turns on the machine's axles to show what the mountain is made of: granite in the thaw, rime in the long dark, lodestone where the iron veins run, and once, when the clans needed it, the molten heart itself. She never went to a fight in her life. She became what the fight was standing on.",
         instruments: "the deepest mountain horns, stone chimes, a slow frame drum like footfalls, overtone throat-singing; wind in a cave mouth, rock settling",
+    },
+    Ancestor {
+        name: "Hourwatch",
+        species: "Pallas's cat",
+        age: "the long nights",
+        land: "the high steppe, where the sky is widest",
+        gender: Gender::Female,
+        story: "The Watcher. A Pallas's cat of the high steppe, who sat out whole nights on the rocks counting the stars round until she knew the sky's clock better than her own heartbeat -- and found that an hour, once you have watched enough of them, can be turned like any other thing. She turns her own back when it goes badly, her enemies' when they get ahead of themselves, and her friends' forward when they are waiting. When the clans need to know what is coming, she leaps into the stars and looks back at the whole field, and everything behind her is seen. Nobody has ever surprised her. She says.",
+        instruments: "a music box's comb, ticking clocks, a glass harmonica, a high drone of steppe throat-singing, a single temple bell; wind over grass at night",
     },
 ];
 

@@ -96,6 +96,7 @@ voice note contradicts its ancestor. Seven are female, six male.
 | Hollowstep | wildcat | the long nights | the fog moors | he |
 | Brasshowl | sand cat | the caravan years | the salt roads | he |
 | Oremantle | a Sentinel: a snow leopard of stone and ore, built by the Geartooth clan | the first winters | the roots of the high crags | she |
+| Hourwatch | Pallas's cat | the long nights | the high steppe, where the sky is widest | she |
 
 **Goldenmane.** First of the lion-clan to lead a pride that was not his by
 birth. He taught that a cat alone is a whisker and a pride is a storm, and
@@ -189,6 +190,16 @@ iron veins run, and once, when the clans needed it, the molten heart
 itself. She never went to a fight in her life. She became what the fight
 was standing on. The Geartooth machines know her as their own.
 
+**Hourwatch.** The Watcher. A Pallas's cat of the high steppe, who sat out
+whole nights on the rocks counting the stars round until she knew the sky's
+clock better than her own heartbeat -- and found that an hour, once you
+have watched enough of them, can be turned like any other thing. She turns
+her own back when it goes badly, her enemies' when they get ahead of
+themselves, and her friends' forward when they are waiting. When the clans
+need to know what is coming, she leaps into the stars and looks back at the
+whole field, and everything behind her is seen. Nobody has ever surprised
+her. She says.
+
 ## The music of the clans
 
 For scoring and sound design: each clan's culture has a sound, and the two
@@ -216,6 +227,7 @@ side.
 | Hollowstep | bowed saw, low cello drones, a slow bass drum like a heartbeat, held breath | wind over heather, a curlew far off |
 | Brasshowl | frame drum, oud, a brass bell, clapping hands, a caravan's camel bells | desert wind, a crackling lamp |
 | Oremantle | the deepest mountain horns, stone chimes, a slow frame drum like footfalls, overtone throat-singing | wind in a cave mouth, rock settling |
+| Hourwatch | a music box's comb, ticking clocks, a glass harmonica, steppe throat-singing, a single temple bell | wind over grass at night |
 
 **Frostfang** colours: long horns, hardanger fiddle and nyckelharpa, kulning,
 bone flute, singing bowls, wind over ice. **Emberclaw** colours: kora,

@@ -127,6 +127,12 @@ pub fn guide_for(ab: &AbilityDef, from: Vec3, aim: Vec3) -> Guide {
         Archetype::Field { radius, .. } => Guide::Around { at: from, radius },
         Archetype::Nova { radius, .. } | Archetype::Heal { radius, .. } => Guide::Around { at: from, radius },
         Archetype::Shield { .. } | Archetype::Buff { .. } => Guide::Around { at: from, radius: 1.6 },
+        // Hourwatch (`hours`): her own hour, round her; the enemy by the aim
+        // (5 u of it); her friends in reach; where she will come down
+        Archetype::Rewind { .. } => Guide::Around { at: from, radius: 1.6 },
+        Archetype::SendBack { range, .. } => Guide::Circle { at: at(range), radius: 5.0 },
+        Archetype::WindForward { radius, .. } => Guide::Around { at: from, radius },
+        Archetype::LongLook { range, .. } => Guide::Circle { at: at(range), radius: 2.0 },
     }
 }
 
@@ -220,6 +226,7 @@ mod tests {
                             Archetype::Send { range, .. } => range.min((aim - from).length()),
                             // the stagger ring is drawn at the aim itself
                             Archetype::Swap { .. } => (aim - from).length(),
+                            Archetype::SendBack { range, .. } | Archetype::LongLook { range, .. } => range.min((aim - from).length()),
                             _ => unreachable!(),
                         };
                         let v = at - from;

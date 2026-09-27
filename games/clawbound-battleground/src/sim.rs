@@ -115,6 +115,14 @@ pub enum Event {
     PadDrop { pos: Vec3 },
     /// A cat falling through an open pad.
     CatFell { pos: Vec3 },
+    /// Hourwatch (`hours`): a cat turned back in time (`back`: she turned
+    /// herself; else she sent an enemy back), where from and to.
+    TimeTurned { god: usize, from: Vec3, to: Vec3, back: bool },
+    /// Her friends' hours wound forward, round her.
+    WindFx { pos: Vec3, radius: f32 },
+    /// The long look: up into the stars, and down where she lands.
+    LookUp { god: usize, pos: Vec3, to: Vec3 },
+    LookLand { god: usize, pos: Vec3 },
 }
 
 #[derive(Clone, Debug)]
@@ -285,6 +293,13 @@ pub struct GodUnit {
     pub flee_from: Vec3,
     /// Shown up by the lamp: seconds left (seen through cloud, no stalking).
     pub revealed_t: f32,
+    /// Where it has been, the last few seconds (`hours`).
+    pub trail: std::collections::VecDeque<crate::hours::Mark>,
+    /// Hourwatch's long look (`hours`): seconds left aloft (out of reach),
+    /// and what it shows up (for how long) and how long she is seen after.
+    pub aloft_t: f32,
+    pub look_reveal: f32,
+    pub look_exposed: f32,
     /// A Sentinel's coat (`sentinel`): the key she wears, the one a lasting
     /// coat goes back to, and how long the lasting one has left.
     pub field_slot: Option<u32>,
@@ -634,6 +649,10 @@ impl Game {
                 flee_t: 0.0,
                 flee_from: Vec3::ZERO,
                 revealed_t: 0.0,
+                trail: Default::default(),
+                aloft_t: 0.0,
+                look_reveal: 0.0,
+                look_exposed: 0.0,
                 field_slot: None,
                 field_back: None,
                 field_t: 0.0,
@@ -890,8 +909,9 @@ impl Game {
     /// fighting by what it is tied to: intent that a fight interrupts, a
     /// window some abilities grant (the fast low run before a pounce, at
     /// full speed), and the way a badly hurt animal slinks.
-    /// Can `team` see cat `j`? Always, off the sky map, for its own cats,
-    /// and before the first cloud refresh (`vision_tick`).
+    /// Can `team` see cat `j`? Always for its own cats, on the open maps,
+    /// and before the first refresh (`vision_tick`); through the sky map's
+    /// clouds and the Quarry's walls, only as `vision_tick` found.
     pub fn sees(&self, team: Team, j: usize) -> bool {
         // shown up by Brasshowl's lamp (`lantern`): seen by everyone
         if self.gods.get(j).is_some_and(|g| g.revealed_t > 0.0) {
@@ -916,6 +936,15 @@ impl Game {
     /// Minions give no sight: with 32 a side in every lane, they would see
     /// everything and the cloud nothing.
     pub fn vision_tick(&mut self) {
+        // the Quarry: its walls and shut gates hide (`maze::sight`)
+        if crate::map::active() == crate::map::MapId::Maze {
+            if self.t < self.vision.next_t && self.vision.seen[0].len() == self.gods.len() {
+                return;
+            }
+            self.vision.next_t = self.t + 1.0 / crate::skycloud::VISION_HZ;
+            self.vision.seen = [Team::Blue, Team::Red].map(|team| crate::maze::seen_by(self, team));
+            return;
+        }
         if crate::map::active() != crate::map::MapId::Sky {
             if !self.vision.seen[0].is_empty() {
                 self.vision = Default::default();
@@ -1030,6 +1059,8 @@ impl Game {
             TargetRef::Boss(bi) => {
                 self.boss_take_damage(bi, dmg, source);
             }
+            // up in the stars (Hourwatch's long look): out of reach
+            TargetRef::God(ti) if self.gods.get(ti).is_some_and(|g| g.aloft_t > 0.0) => {}
             TargetRef::God(ti) => {
                 let g = &mut self.gods[ti];
                 if g.respawn_t > 0.0 {

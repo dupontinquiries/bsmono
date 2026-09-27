@@ -50,7 +50,11 @@ what else is known-but-unresolved.
   armed -- swing open as the stone passes, and a cat standing on an open
   pad falls to its death. Bots leave a lock the machine is working and step
   off a track when a ball is due within 1.5 s. The machine knows its own: a
-  Sentinel is hurt by a stone but not thrown, and braces across a pad.
+  Sentinel is hurt by a stone but not thrown, and braces across a pad. The
+  Quarry has LINE OF SIGHT: a cat sees 55 u down open floor, not through a
+  wall or a shut gate; an enemy nobody on your team sees (and no tower of
+  yours reaches) is not drawn, not on the minimap, and not targeted by
+  bots.
 - **The Drowned Halls** (3v3, `--map atlantis`): one colonnaded hall and a
   domed library on the sea floor.
 - **The first three maps** — the jungle valley (5v5, three lanes), Twinfang Pass (15v15
@@ -94,7 +98,7 @@ what else is known-but-unresolved.
   it keeps falling, the wind drifts it from the blown stretches into the lee,
   cats bound through drifts ploughing a trench and leave separate prints on
   powder, and blasts throw craters, fire melts it, frost lays more.
-- **18 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
+- **19 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
   Windclaw, Faryowl, Oldroar, Twofang, Suneye, Snowhush, Riptail, Stillsmoke,
   Stonewhisper, Cometail (the star-fallen caracal: Starshot, Meteor Pounce,
   Flare, and the Falling Star ultimate), Sproutkit (the ever-young kitten,
@@ -125,11 +129,19 @@ what else is known-but-unresolved.
   friends in it a share of every blow, **Rime** slows enemies, **Lodestone**
   drags them in to arm's length, and the **Mountain's Heart** ultimate is
   magma that burns everything near her for 7 s before she cools back to the
-  coat she wore; `src/sentinel.rs`) — across 6 roles (Warrior / Guardian /
+  coat she wore; `src/sentinel.rs`) and Hourwatch (the Watcher, a Pallas's
+  cat of the high steppe who keeps the hours: **Turn Back** puts her where
+  she was 3 s ago with the health she had then, if it was more; **Send
+  Back** does it to the enemy she aims at, its wind-up lost; **Wind
+  Forward** winds nearby friends' cooldowns on 4 s; and **The Long Look**
+  ultimate leaps her into the stars for 2.6 s, out of reach, and shows up
+  every enemy on her own side of the line across the field where she is --
+  offside-style: the further forward she flies, the more is behind her --
+  for 6 s, and her too, for 4 s, where she lands; `src/hours.rs`) — across 6 roles (Warrior / Guardian /
   Mage / Hunter / Assassin / Sentinel).
   Each is a quadruped feline voxel body with a pelt signature (mane, stripes,
   rosettes, saber fangs, antlers, sun disc, ear tufts…) and its crest colour,
-  plus **4 mechanical abilities** (72 total) built from 22 archetype systems.
+  plus **4 mechanical abilities** (76 total) built from 26 archetype systems.
   Clawbound kits are a passive + two techniques + an ultimate; here the passive
   is reforged as a third short-cooldown technique (see `src/gods.rs`).
 - **Dynamic weather** (`src/weather.rs`) — Clear / Overcast / Rain / Storm /
@@ -421,6 +433,7 @@ src/
 ├── sentinel.rs    the Sentinel role: coats instead of casts, the four fields, the bot's choice
 ├── maze.rs        the Quarry: rooms and gates, the labyrinth turning, the waking, the thorns, the pack
 ├── mazeworld.rs   the Quarry's dressing, gate slabs (collision + mesh), thorn spots, gear trains, screws, chutes, pads, boulder
+├── hours.rs       Hourwatch: every cat's trail; turning back, sending back, winding forward, the long look
 ├── machine.rs     the Quarry's machine: tracks from hopper to chute to floor, which pair runs each turn, the locks and their pads, the roll, the hit, the fall, the bots' dodge
 ├── bosses.rs      the Elder Boar + Storm Drake: pits, AI, rewards, TargetRef::Boss
 ├── disasters.rs   wildfire / tempest / earthquake / flood / tornado + map scars

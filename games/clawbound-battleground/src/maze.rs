@@ -633,6 +633,70 @@ impl Wake {
     }
 }
 
+// --- sight -------------------------------------------------------------------
+
+/// How far a cat sees down the Quarry's halls.
+pub const SIGHT: f32 = 55.0;
+
+/// Can a cat at `a` see one at `b` in the Quarry? Within [`SIGHT`], along a
+/// line that stays on the floor (no wall between) and crosses no shut
+/// gate. Close enough to touch, always.
+pub fn sight(game: &Game, a: Vec3, b: Vec3) -> bool {
+    let (fa, fb) = (Vec3::new(a.x, 0.0, a.z), Vec3::new(b.x, 0.0, b.z));
+    let len = fa.distance(fb);
+    if len < 3.0 {
+        return true;
+    }
+    if len > SIGHT {
+        return false;
+    }
+    let f = floor();
+    let n = (len / 1.0).ceil() as usize;
+    for k in 1..n {
+        let p = fa + (fb - fa) * (k as f32 / n as f32);
+        if f.sdf(p.x, p.z) > 0.3 {
+            return false;
+        }
+    }
+    // a shut gate's slab across the line
+    for (g, p) in passages().iter().enumerate() {
+        if game.gate_open(g) {
+            continue;
+        }
+        let (m, d) = (p.mid(), p.dir());
+        let side = Vec3::new(-d.z, 0.0, d.x) * (PASSAGE_R + 1.5);
+        if segments_cross(fa, fb, m - side, m + side) {
+            return false;
+        }
+    }
+    true
+}
+
+fn segments_cross(a: Vec3, b: Vec3, c: Vec3, d: Vec3) -> bool {
+    let cross = |o: Vec3, p: Vec3, q: Vec3| (p.x - o.x) * (q.z - o.z) - (p.z - o.z) * (q.x - o.x);
+    let (d1, d2) = (cross(c, d, a), cross(c, d, b));
+    let (d3, d4) = (cross(a, b, c), cross(a, b, d));
+    d1 * d2 < 0.0 && d3 * d4 < 0.0
+}
+
+/// Which cats `team` can see in the Quarry: its own; any enemy one of its
+/// living cats has [`sight`] of; any in reach of its standing towers or at
+/// its base. Minions give no sight (as on the sky map).
+pub fn seen_by(game: &Game, team: crate::consts::Team) -> Vec<bool> {
+    (0..game.gods.len())
+        .map(|j| {
+            let e = &game.gods[j];
+            if e.team == team || e.respawn_t > 0.0 {
+                return true;
+            }
+            let by_cat = game.gods.iter().any(|v| v.team == team && v.respawn_t <= 0.0 && sight(game, v.pos, e.pos));
+            let by_tower = game.towers.iter().any(|t| t.team == team && t.hp > 0.0 && t.pos.distance(e.pos) < crate::consts::TOWER_RANGE + 2.0);
+            let at_base = team.base_pos().distance(e.pos) < 40.0;
+            by_cat || by_tower || at_base
+        })
+        .collect()
+}
+
 /// A slab this far up blocks.
 pub const GATE_BLOCKS: f32 = 0.5;
 
@@ -817,6 +881,11 @@ pub fn bot_goal(game: &Game, gi: usize) -> Option<Vec3> {
         let p = room_pos(rm);
         matches!(game.wake.mood_at(p.x, p.z, t + 2.0), Mood::Calm) && !crate::machine::locked(game.wake.seed, t, p.x, p.z)
     };
+    // A room with a standing enemy tower in it is no refuge and no way
+    // through: a bot sent past one stood at the tower's edge, stepping in
+    // for the refuge and backing out for the tower, alone in the thorns for
+    // 20 s (seed 5).
+    let towered = |rm: Room| game.towers.iter().any(|tw| tw.team != me.team && tw.hp > 0.0 && section_at(tw.pos.x, tw.pos.z).is_some_and(|s| s.room() == rm));
     let friend_in = |rm: Room| {
         game.gods.iter().enumerate().any(|(k, o)| k != gi && o.team == me.team && o.respawn_t <= 0.0 && section_at(o.pos.x, o.pos.z).is_some_and(|s| s.room() == rm))
     };
@@ -832,7 +901,10 @@ pub fn bot_goal(game: &Game, gi: usize) -> Option<Vec3> {
                 continue;
             }
             let n = if p.a == rm { p.b } else { p.a };
-            if seen.insert(n) {
+            // (nor a passage an enemy tower covers: the same standoff, one
+            // room on -- Twofang, seed 9, 15 s)
+            let covered = game.towers.iter().any(|tw| tw.team != me.team && tw.hp > 0.0 && [p.p0, p.mid(), p.p1].iter().any(|q| tw.pos.distance(*q) < crate::consts::TOWER_RANGE + 2.0));
+            if !towered(n) && !covered && seen.insert(n) {
                 q.push_back(n);
             }
         }
@@ -1129,6 +1201,91 @@ mod tests {
         assert!((one - 0.04).abs() < 0.01, "with one friend: {one}");
         assert_eq!(two, 0.0, "with two friends");
         assert!((far - alone).abs() < 0.01, "friends out of reach: {far} vs {alone}");
+    }
+
+    /// Sight in the Quarry: across a room, yes; through a wall, no; down an
+    /// open passage, yes; through the same passage with its gate shut, no;
+    /// past SIGHT, no. And the team's view follows: an enemy behind a wall
+    /// is hidden unless a tower or another cat sees it.
+    #[test]
+    fn walls_and_shut_gates_hide() {
+        within(|| {
+            let mut g = scene(&[]);
+            let a = room_pos((0, 0));
+            assert!(sight(&g, a + Vec3::new(-10.0, 0.0, 0.0), a + Vec3::new(10.0, 0.0, 5.0)), "across a room");
+            // (0,0) to (0,-1): a wall between the rooms' middles unless a
+            // passage lines up
+            // (one far from every tower: towers see through walls)
+            let gp = (0..passages().len())
+                .find(|&k| passages()[k].lane.is_none() && g.towers.iter().all(|t| t.pos.distance(passages()[k].mid()) > crate::consts::TOWER_RANGE + 30.0))
+                .unwrap();
+            let p = passages()[gp];
+            let (x0, x1) = (p.p0 - p.dir() * 6.0, p.p1 + p.dir() * 6.0);
+            assert!(sight(&g, x0, x1), "down an open passage");
+            // a line parallel to it, well off to the side, through the wall
+            let off = Vec3::new(-p.dir().z, 0.0, p.dir().x) * 14.0;
+            assert!(!sight(&g, x0 + off, x1 + off), "through a wall");
+            let mut b = crate::blockers::Blockers::new(300.0, 6.0);
+            for k in 0..passages().len() {
+                b.push_gate(crate::mazeworld::gate_slab(k));
+            }
+            b.set_gate(gp, false);
+            g.blockers = std::sync::Arc::new(b);
+            assert!(!sight(&g, x0, x1), "through a shut gate");
+            // range, across one open room (no wall to do the hiding)
+            let x = Vec3::X * (SIGHT * 0.5);
+            assert!(sight(&g, a - x * 0.98, a + x * 0.98), "just within SIGHT");
+            assert!(!sight(&g, a - x * 1.02, a + x * 1.02), "past SIGHT");
+            // the team's view: the enemy (last cat) put behind a wall from
+            // cat 0, far from any tower
+            let e = g.gods.len() - 1;
+            g.gods[0].pos = x0 + off;
+            g.gods[e].pos = x1 + off;
+            let blue = g.gods[0].team;
+            let seen = seen_by(&g, blue);
+            let towers = g.towers.iter().filter(|t| t.team == blue && t.pos.distance(x1 + off) < crate::consts::TOWER_RANGE + 2.0).count();
+            assert!(!seen[e], "seen through the wall (towers near: {towers}, at {})", x1 + off);
+            g.gods[e].pos = x0 + p.dir() * 3.0;
+            assert!(seen_by(&g, blue)[e]);
+        });
+    }
+
+    /// A bot alone in a biting room is never sent to refuge in a room with
+    /// a standing enemy tower, nor through one: over many wakings, both
+    /// sides, every biting room.
+    #[test]
+    fn the_escape_does_not_run_under_an_enemy_tower() {
+        within(|| {
+            let mut tried = 0;
+            for seed in 0..24u64 {
+                for who in [0usize, 1] {
+                    let mut g = Game::new_teams(&[0], &[2]);
+                    g.wake = Wake::new(&mut Rng::new(seed));
+                    g.t = FIRST_WAKE + WARN + 1.0;
+                    let class = g.wake.classes(0)[0];
+                    let other = 1 - who;
+                    g.gods[other].pos = Vec3::new(0.0, 0.0, 400.0);
+                    g.gods[who].ai = Some(crate::sim::AiBrain::new(Lane::Top, 0.9));
+                    let team = g.gods[who].team;
+                    for rm in rooms() {
+                        let at = room_pos(rm);
+                        if !section_at(at.x, at.z).is_some_and(|s| s.class() == class) {
+                            continue;
+                        }
+                        g.gods[who].pos = at;
+                        let Some(goal) = bot_goal(&g, who) else { continue };
+                        if goal.distance(team.fountain()) < 1.0 {
+                            continue;
+                        }
+                        let groom = section_at(goal.x, goal.z).map(|s| s.room());
+                        let towered = g.towers.iter().any(|tw| tw.team != team && tw.hp > 0.0 && section_at(tw.pos.x, tw.pos.z).map(|s| s.room()) == groom);
+                        assert!(!towered, "seed {seed}: sent from {rm:?} to {groom:?}, under an enemy tower");
+                        tried += 1;
+                    }
+                }
+            }
+            assert!(tried > 40, "only {tried} escapes");
+        });
     }
 
     /// Nothing bites on calm ground, or before the first waking.
