@@ -3412,6 +3412,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let cave_climate_enabled = std::env::var("UNENDLICH_CAVE_CLIMATE").map_or(true, |v| v != "0");
     let mut cave_zone_last = unendlich_engine::world::underground::Zone::Soil;
     let mut ambient_c_last = f32::NAN;
+    // How closed-in the player is (world::cave_climate::enclosure), from the
+    // exposure block; drives the cave drips (sim::cave_sound).
+    let mut enclosure_last = 0.0f32;
+    let mut drip_clock = unendlich_engine::sim::cave_sound::DripClock::new(0xD21F);
+    let mut cave_sound_clock = 0.0f32;
+    // UNENDLICH_CAVE_DRIPS=0 turns the drips off; a number > 1 is a drips-
+    // per-minute override for every wet cave zone (to hear one sooner).
+    let cave_drips_raw = std::env::var("UNENDLICH_CAVE_DRIPS").ok().and_then(|v| v.trim().parse::<f32>().ok());
+    let cave_drips_enabled = cave_drips_raw.map_or(true, |v| v != 0.0);
+    let cave_drips_override = cave_drips_raw.filter(|v| *v > 1.0);
     let mut gas_sensed: Option<[i32; 2]> = None;
     let mut held_flame = unendlich_engine::sim::cave_air::Flame::default();
     let hold_block: Option<BlockId> = std::env::var("UNENDLICH_HOLD").ok().and_then(|v| BlockId::from_id_str(v.trim()));
@@ -8361,6 +8371,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         );
                         cave_zone_last = zone;
                     }
+                    enclosure_last = cc::enclosure(depth as f32, sky01);
                     cc::ambient_c(surface_c, cave, depth as f32, sky01)
                 } else {
                     surface_c
@@ -17200,9 +17211,53 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             if lifetime_frame % 6 == 0 {
                 fg_sfx.set_master_volume(fg_sfx_vol * (1.0 - air_hush));
             }
+            // Cave drips (sim::cave_sound, cave_biomes.docx): in a closed-in
+            // wet cave a drop falls now and then from the ceiling somewhere
+            // near, and the cave's RT60 rings it out. Not in the gas (its dead
+            // silence is the point), not under open sky.
+            cave_sound_clock += dt;
+            #[cfg(feature = "audio")]
+            {
+                use unendlich_engine::sim::cave_sound as cs;
+                let wet = cave_drips_enabled && enclosure_last > 0.8 && air_hush < 0.2;
+                let zone_rate = cs::drips_per_minute(cave_zone_last);
+                let rate = if !wet || zone_rate <= 0.0 { 0.0 } else { cave_drips_override.unwrap_or(zone_rate) };
+                if let Some(ds) = drip_clock.due(cave_sound_clock, rate) {
+                    let [ox, oz] = cs::drip_offset(ds);
+                    let (bx, bz) = ((e.x + ox).floor() as i32, (e.z + oz).floor() as i32);
+                    // The drop falls from a real ceiling: the first solid block
+                    // over open air above that column, within 16 of the ear.
+                    let by = e.y.floor() as i32;
+                    let ceiling = (-2..16).find(|dy| {
+                        chunk_manager.block_at(bx, by + dy + 1, bz).is_solid()
+                            && !chunk_manager.block_at(bx, by + dy, bz).is_solid()
+                    });
+                    if let Some(dy) = ceiling {
+                        let src = [bx as f32 + 0.5, (by + dy) as f32 + 0.9, bz as f32 + 0.5];
+                        let seed = chunk_manager.model_arc().seed();
+                        let t01 = unendlich_engine::world::noise::noise_2d(e.x as f64 / 131.0, e.z as f64 / 131.0, seed ^ 0x0D21) as f32;
+                        if let Some(rt) = cs::rt60_s(cave_zone_last, t01) {
+                            let f = local_player.forward();
+                            let (ear, fwd) = ([e.x, e.y, e.z], [f.x, f.y, f.z]);
+                            let dist = ((src[0] - ear[0]).powi(2) + (src[1] - ear[1]).powi(2) + (src[2] - ear[2]).powi(2)).sqrt();
+                            let label = format!("drip_{:?}_{}m_rt{:.1}", cave_zone_last, dist as i32, rt);
+                            fg_sfx.submit(unendlich_engine::audio::SfxJob {
+                                label,
+                                render: Box::new(move || {
+                                    use unendlich_engine::sim::sound_render;
+                                    const RATE: u32 = 24_000;
+                                    let dry = cs::drip(RATE, ds);
+                                    let plan = cs::drip_plan(src, ear, fwd, rt);
+                                    Some((sound_render::render(&dry, RATE, &plan, cs::render_opts()), RATE))
+                                }),
+                            });
+                        }
+                    }
+                }
+            }
             // Earth sensing (docx): an earth-attuned player feels the gas in
-            // the rock pores before walking into it. There is no HUD text
-            // channel yet, so it speaks through the log.
+            // the rock pores before walking into it; the HUD notice and the
+            // log both say so.
             let earth_attuned = fg_imbue.element == 3 && fg_imbue.counter > 0.5;
             if let (true, Some(seed)) = (earth_attuned, gas) {
                 let s = cg::sense(e.x, e.y, e.z, seed, 24.0);
