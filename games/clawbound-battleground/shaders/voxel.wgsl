@@ -16,6 +16,8 @@ struct FrameData {
     blast_a: array<vec4<f32>, 4>, // xyz centre, w ring radius
     blast_b: array<vec4<f32>, 4>, // x strength, y width
     cracks: array<vec4<f32>, 8>,  // x, z, radius, how open
+    towers: array<vec4<f32>, 12>, // (terrain.wgsl's; declared to reach `sea`)
+    sea: vec4<f32>,               // x all under the sea, y caustic strength, z water surface y, w camera underwater
 };
 
 fn hash21(p: vec2<f32>) -> f32 {
@@ -290,6 +292,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     // baked AO: stronger in the crevices, let the key light punch through it a little
     let ao = mix(in.ao, 1.0, 0.18 * ndl * shadow);
     var lit = albedo * light * ao;
+    // caustics on a sea-floor map (Atlantis): the halls' stone and statues
+    // ripple with light from above, most on their tops
+    if (frame.sea.x > 0.5 && frame.sea.y > 0.001) {
+        let amount = frame.sea.y * (0.2 + 0.8 * max(N.y, 0.0)) * (1.0 - smoothstep(60.0, 140.0, dist));
+        lit = lit + albedo * sun_col * caustic(in.world.xz + vec2(in.world.y * 0.35), frame.params.x) * amount * (0.35 + 0.65 * shadow) * ao;
+    }
     let lum = dot(albedo, vec3(0.299, 0.587, 0.114));
     let haze = frame.fog_color.xyz * (0.45 + 0.55 * lum);
     lit = mix(lit, haze, fog * 0.9);

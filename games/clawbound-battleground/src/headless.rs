@@ -112,6 +112,9 @@ pub fn run() -> Result<(), String> {
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("sprout") {
         return run_sprout_shots();
     }
+    if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("flare") {
+        return run_flare_shots();
+    }
     if std::env::var("CLAWBOUND_SHOTS").as_deref() == Ok("hud") {
         return run_hud_shots();
     }
@@ -2194,6 +2197,92 @@ fn run_hud_shots() -> Result<(), String> {
         let mut out = out.expect("ran");
         out.textures_delta = textures;
         draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &ctx, out, W, H);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+    }
+    Ok(())
+}
+
+
+/// The lens flare (`lensflare`, post.wgsl): a low sun in frame on a clear
+/// day, looked at from the lane at High and Ultra, and with the sun behind
+/// a trunk (the flare must go out), and the same view on Low (none).
+/// `CLAWBOUND_SHOTS=flare clawbound-battleground --screenshot`
+pub fn run_flare_shots() -> Result<(), String> {
+    let (_i, _a, device, queue) = make_device().ok_or_else(|| "No suitable GPU backend".to_string())?;
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("flare"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let mut scene = Scene::new(&mut renderer);
+    let mut game = Game::new_teams(&[0], &[1]);
+    game.blockers = scene.blockers.clone();
+    let spot = Vec3::new(0.0, 0.0, -40.0);
+    game.gods[0].pos = spot + Vec3::new(0.8, 0.0, 3.0);
+    game.gods[1].respawn_t = 999.0;
+    game.gods[0].ai = None;
+    let mut vfx = Vfx::default();
+    for _ in 0..20 {
+        game.tick(1.0 / 60.0);
+        game.events.clear();
+        vfx.update(1.0 / 60.0, &[], &game);
+    }
+    let mut atm = game.weather.atmosphere();
+    atm.wetness = 0.0;
+    atm.rain = 0.0;
+    atm.cloud_cover = 0.05;
+    atm.night = 0.0;
+    atm.sun_dir = Vec3::new(0.35, 0.42, 1.0).normalize();
+    let eye = spot + Vec3::new(0.0, 2.2, -6.0);
+    let sun_x = atm.sun_dir.x;
+    let sun_z = atm.sun_dir.z;
+    let look = |yaw_off: f32, pitch: f32| {
+        let d = Vec3::new(sun_x + yaw_off, pitch, sun_z).normalize();
+        Camera { eye, target: eye + d * 20.0, fov_y: 1.0 }
+    };
+    let shots: [(&str, crate::quality::Quality, Camera); 4] = [
+        ("flare_high.png", crate::quality::Quality::High, look(-0.3, 0.3)),
+        ("flare_ultra_offaxis.png", crate::quality::Quality::Ultra, look(0.3, 0.2)),
+        ("flare_low.png", crate::quality::Quality::Low, look(-0.3, 0.3)),
+        // the sun low, behind the ruined pillar on the lane: no flare
+        ("flare_occluded.png", crate::quality::Quality::High, look(-0.35, 0.02)),
+    ];
+    for (name, q, cam) in shots {
+        let mut atm = atm;
+        if name == "flare_occluded.png" {
+            atm.sun_dir = Vec3::new(0.35, 0.16, 1.0).normalize();
+        }
+        renderer.quality = q;
+        renderer.set_shadow_size(q.shadow_size());
+        scene.ultra = q == crate::quality::Quality::Ultra && scene.ultra;
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = atm;
+        renderer.render_frame(&view, cam, 1.0);
+        save_shot(&renderer.device, &renderer.queue, &target, name)?;
+        println!("saved {name}");
+    }
+    // Caustics on a river bed (common_sea.wgsl): a high sun over the
+    // western river, looked down at, on High and on Low (none).
+    let rx = crate::consts::river_x(-1.0, 10.0);
+    let bed = Vec3::new(rx, 0.0, 10.0);
+    let mut atm2 = atm;
+    // the sun behind the camera: its glitter off the surface out of view
+    atm2.sun_dir = Vec3::new(-0.35, 0.85, -0.45).normalize();
+    for (name, q) in [("river_caustics_high.png", crate::quality::Quality::High), ("river_caustics_low.png", crate::quality::Quality::Low)] {
+        renderer.quality = q;
+        renderer.set_shadow_size(q.shadow_size());
+        let cam = Camera { eye: bed + Vec3::new(-5.0, 6.5, -7.0), target: bed, fov_y: 0.9 };
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.atmosphere = atm2;
+        renderer.render_frame(&view, cam, 3.0);
         save_shot(&renderer.device, &renderer.queue, &target, name)?;
         println!("saved {name}");
     }
